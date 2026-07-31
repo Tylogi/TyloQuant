@@ -1,0 +1,258 @@
+"""FlashInfer MLA decode 的可选适配层。
+
+适配层直接复用 TPQ 原有的分离 cKV/kPE 缓冲。依赖缺失、显式关闭或运行
+失败时返回 ``None``，调用方继续执行原 PyTorch MLA 路径。
+"""
+
+from __future__ import annotations
+
+import math
+import os
+
+import torch
+
+
+_WRAPPER_CLS = None
+_LAST_ERROR: Exception | None = None
+
+
+def _wrapper_cls():
+    global _WRAPPER_CLS, _LAST_ERROR
+    if os.environ.get("TPQ_FLASHINFER_MLA", "1") == "0":
+        return None
+    if _WRAPPER_CLS is False:
+        return None
+    if _WRAPPER_CLS is None:
+        try:
+            from flashinfer.mla import BatchMLAPagedAttentionWrapper
+
+            _WRAPPER_CLS = BatchMLAPagedAttentionWrapper
+        except Exception as exc:
+            _LAST_ERROR = exc
+            _WRAPPER_CLS = False
+            return None
+    return _WRAPPER_CLS
+
+
+class FlashInferMLADecode:
+    """batch=1、query=1 的固定地址 FlashInfer MLA 执行器。"""
+
+    page_size = 64
+
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        max_ctx: int,
+        heads: int,
+        ckv_dim: int,
+        kpe_dim: int,
+        dtype: torch.dtype,
+        softmax_scale: float,
+    ) -> None:
+        wrapper_cls = _wrapper_cls()
+        if wrapper_cls is None:
+            raise RuntimeError("FlashInfer MLA 不可用")
+        self.device = device
+        self.max_ctx = max_ctx
+        self.heads = heads
+        self.ckv_dim = ckv_dim
+        self.kpe_dim = kpe_dim
+        self.dtype = dtype
+        self.softmax_scale = softmax_scale
+        self.max_blocks = (
+            max_ctx + self.page_size - 1
+        ) // self.page_size
+
+        # FlashInfer 建议 128 MiB split-K workspace。只有显式启用时分配。
+        workspace = torch.empty(
+            128 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=device,
+        )
+        self._qo_gpu = torch.empty(
+            2, dtype=torch.int32, device=device
+        )
+        self._kv_indptr_gpu = torch.empty(
+            2, dtype=torch.int32, device=device
+        )
+        self._kv_indices_gpu = torch.empty(
+            self.max_blocks,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._kv_len_gpu = torch.empty(
+            1, dtype=torch.int32, device=device
+        )
+        self._qo_cpu = torch.tensor(
+            [0, 1], dtype=torch.int32
+        ).pin_memory()
+        # A device-token decode loop can enqueue several complete tokens
+        # without a CPU synchronization.  Keep one pinned metadata source per
+        # context length so an async H2D copy is never fed from a CPU buffer
+        # that the next token has already overwritten.
+        self._kv_indptr_cpu_ring = torch.empty(
+            max_ctx + 1,
+            2,
+            dtype=torch.int32,
+            pin_memory=True,
+        )
+        self._kv_indices_cpu = torch.arange(
+            self.max_blocks, dtype=torch.int32
+        ).pin_memory()
+        self._kv_len_cpu_ring = torch.empty(
+            max_ctx + 1,
+            1,
+            dtype=torch.int32,
+            pin_memory=True,
+        )
+        self._out = torch.empty(
+            1,
+            heads,
+            ckv_dim,
+            dtype=dtype,
+            device=device,
+        )
+        self._wrapper = wrapper_cls(
+            workspace,
+            use_cuda_graph=True,
+            qo_indptr=self._qo_gpu,
+            kv_indptr=self._kv_indptr_gpu,
+            kv_indices=self._kv_indices_gpu,
+            kv_len_arr=self._kv_len_gpu,
+            backend=os.environ.get(
+                "TPQ_FLASHINFER_BACKEND",
+                "auto",
+            ),
+        )
+        self._prepared_blocks = 0
+        self._plan_initialized = False
+
+    def prepare(self, length: int) -> None:
+        if length <= 0 or length > self.max_ctx:
+            raise ValueError(
+                f"FlashInfer MLA length={length} 超出 1..{self.max_ctx}"
+            )
+        blocks = (
+            length + self.page_size - 1
+        ) // self.page_size
+        kv_indptr_cpu = self._kv_indptr_cpu_ring[length]
+        kv_len_cpu = self._kv_len_cpu_ring[length]
+        kv_indptr_cpu[0] = 0
+        kv_indptr_cpu[1] = blocks
+        kv_len_cpu[0] = length
+        gpu_plan = False
+        if self._plan_initialized and self.heads == 64:
+            from .fusedext import (
+                flashinfer_mla_batch1_plan_fused,
+            )
+
+            gpu_plan = flashinfer_mla_batch1_plan_fused(
+                self._wrapper._int_workspace_buffer,
+                self._kv_indptr_gpu,
+                self._kv_indices_gpu,
+                self._kv_len_gpu,
+                length,
+                self.page_size,
+                self.heads,
+                self._wrapper._plan_info,
+            )
+        if not gpu_plan:
+            self._wrapper.plan(
+                self._qo_cpu,
+                kv_indptr_cpu,
+                self._kv_indices_cpu[:blocks],
+                kv_len_cpu,
+                num_heads=self.heads,
+                head_dim_ckv=self.ckv_dim,
+                head_dim_kpe=self.kpe_dim,
+                page_size=self.page_size,
+                causal=False,
+                sm_scale=self.softmax_scale,
+                q_data_type=self.dtype,
+                kv_data_type=self.dtype,
+            )
+            self._plan_initialized = True
+        self._prepared_blocks = blocks
+
+    def run(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        ckv_cache: torch.Tensor,
+        kpe_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        if self._prepared_blocks == 0:
+            raise RuntimeError("FlashInfer MLA 尚未 prepare")
+        return self._wrapper.run(
+            q_nope,
+            q_pe,
+            ckv_cache[:self._prepared_blocks],
+            kpe_cache[:self._prepared_blocks],
+            out=self._out,
+        )
+
+
+def create_runner(
+    *,
+    device: torch.device,
+    max_ctx: int,
+    heads: int,
+    ckv_dim: int,
+    kpe_dim: int,
+    dtype: torch.dtype,
+    qk_head_dim: int,
+) -> FlashInferMLADecode | None:
+    global _LAST_ERROR
+    if _wrapper_cls() is None:
+        return None
+    try:
+        return FlashInferMLADecode(
+            device=device,
+            max_ctx=max_ctx,
+            heads=heads,
+            ckv_dim=ckv_dim,
+            kpe_dim=kpe_dim,
+            dtype=dtype,
+            softmax_scale=1.0 / math.sqrt(qk_head_dim),
+        )
+    except Exception as exc:
+        _LAST_ERROR = exc
+        return None
+
+
+def prepare_runner(
+    runner: FlashInferMLADecode,
+    length: int,
+) -> bool:
+    global _LAST_ERROR
+    try:
+        runner.prepare(length)
+        return True
+    except Exception as exc:
+        _LAST_ERROR = exc
+        return False
+
+
+def decode(
+    runner: FlashInferMLADecode,
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    ckv_cache: torch.Tensor,
+    kpe_cache: torch.Tensor,
+) -> torch.Tensor | None:
+    global _LAST_ERROR
+    try:
+        return runner.run(
+            q_nope,
+            q_pe,
+            ckv_cache,
+            kpe_cache,
+        )
+    except Exception as exc:
+        _LAST_ERROR = exc
+        return None
+
+
+def last_error() -> Exception | None:
+    return _LAST_ERROR
