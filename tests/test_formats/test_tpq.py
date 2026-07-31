@@ -1,0 +1,352 @@
+from __future__ import annotations
+
+import inspect
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from mfq.calibration.artifact import ExpertPrecision
+from mfq.calibration.artifact import load_scheme
+from mfq.calibration.tpq import (
+    allocate_cccp_tiers,
+    build_cccp_expert_selection,
+    load_cccp_tier_profile,
+)
+from mfq.formats.tpq import (
+    CCCP_V,
+    CCCP_VV,
+    CCCP_W,
+    CCCP_X,
+    CccpPqSpec,
+    pack_cccp_indices,
+    pack_cccp_int4,
+    pack_cccp_pq,
+    unpack_cccp_indices,
+    unpack_cccp_int4,
+    unpack_cccp_pq,
+)
+from mfq.formats.io import pack_nint_moe, unpack_nint_moe
+from mfq.quantize.tpq import (
+    CccpKmeansConfig,
+    assign_cccp_codebook,
+    cccp_reconstruction_sums,
+    dequantize_cccp_int4,
+    dequantize_cccp_pq,
+    quantize_cccp_int4,
+    quantize_cccp_pq_fixed,
+    train_cccp_codebook,
+    train_cccp_expert_codebook,
+    train_cccp_pq,
+)
+from mfq.quantize.expert_nint import (
+    dequantize_expertwise,
+    quantize_expertwise,
+)
+from mfq.tools.quantize_hf_to_mfq import _write_flat_family_axis0_blob
+from mfq.tools.prepare_tpq_scheme import prepare
+from mfq.tools.train_tpq_v4f_codebooks import train as train_tpq_v4f
+
+
+@pytest.mark.parametrize(
+    ("entries", "expected_bits", "dtype"),
+    ((80, 8, np.uint8), (4096, 16, np.uint16)),
+)
+def test_cccp_indices_follow_source_storage_dtype(
+    entries: int,
+    expected_bits: int,
+    dtype,
+) -> None:
+    spec = CccpPqSpec("w", 4, entries)
+    values = np.asarray([0, 1, entries - 1], dtype=dtype)
+    payload = pack_cccp_indices(values, spec.index_bits)
+    restored, offset = unpack_cccp_indices(
+        payload,
+        0,
+        values.size,
+        spec.index_bits,
+    )
+    assert spec.index_bits == expected_bits
+    assert len(payload) == values.size * np.dtype(dtype).itemsize
+    assert offset == len(payload)
+    np.testing.assert_array_equal(restored, values)
+
+
+def test_cccp_pq_roundtrip_all_tiers() -> None:
+    rng = np.random.default_rng(20260726)
+    for spec in (CCCP_X, CCCP_W, CCCP_V, CCCP_VV):
+        weight = rng.normal(size=(3, 24)).astype(np.float32)
+        codebook = rng.normal(
+            size=(spec.codebook_entries, spec.vector_size)
+        ).astype(np.float32)
+        tensor = quantize_cccp_pq_fixed(
+            weight,
+            spec,
+            codebook,
+            device="cpu",
+            distance_bytes=1 << 20,
+        )
+        payload = pack_cccp_pq(tensor)
+        restored = unpack_cccp_pq(payload)
+        assert len(payload) == tensor.payload_nbytes
+        assert restored.spec == spec
+        np.testing.assert_array_equal(restored.indices, tensor.indices)
+        np.testing.assert_array_equal(restored.codebook, tensor.codebook)
+        np.testing.assert_array_equal(
+            dequantize_cccp_pq(restored),
+            dequantize_cccp_pq(tensor),
+        )
+
+
+def test_cccp_pq_roundtrip_historical_k80_tier() -> None:
+    rng = np.random.default_rng(80)
+    spec = CccpPqSpec("w", 4, 80)
+    weight = rng.normal(size=(3, 24)).astype(np.float32)
+    codebook = rng.normal(size=(80, 4)).astype(np.float32)
+    tensor = quantize_cccp_pq_fixed(weight, spec, codebook, device="cpu")
+    restored = unpack_cccp_pq(pack_cccp_pq(tensor))
+    assert restored.spec == spec
+    np.testing.assert_array_equal(restored.indices, tensor.indices)
+
+
+def test_cccp_int4_matches_reference_equations() -> None:
+    rng = np.random.default_rng(19)
+    weight = rng.normal(size=(7, 128)).astype(np.float32)
+    tensor = quantize_cccp_int4(weight)
+    restored = unpack_cccp_int4(pack_cccp_int4(tensor))
+    np.testing.assert_array_equal(restored.packed, tensor.packed)
+    np.testing.assert_array_equal(restored.scales, tensor.scales)
+    np.testing.assert_array_equal(
+        dequantize_cccp_int4(restored),
+        dequantize_cccp_int4(tensor),
+    )
+
+
+def test_cccp_int4_accepts_zero_scale_from_fp16_underflow() -> None:
+    weight = np.zeros((1, 64), dtype=np.float32)
+    tensor = quantize_cccp_int4(weight)
+    assert tensor.scales.tolist() == [[0.0]]
+    restored = unpack_cccp_int4(pack_cccp_int4(tensor))
+    np.testing.assert_array_equal(
+        dequantize_cccp_int4(restored),
+        weight,
+    )
+
+
+def test_cccp_assignment_uses_euclidean_objective() -> None:
+    point = np.asarray([[4.0, 6.0]], dtype=np.float32)
+    codebook = np.asarray([[0.0, 0.0], [10.0, 10.0]], dtype=np.float32)
+    assigned = assign_cccp_codebook(point, codebook, device="cpu")
+    assert assigned.tolist() == [0]
+
+
+def test_cccp_production_apis_cannot_accept_imatrix_weights() -> None:
+    for function in (
+        assign_cccp_codebook,
+        quantize_cccp_pq_fixed,
+        train_cccp_codebook,
+        train_cccp_expert_codebook,
+        train_cccp_pq,
+        train_tpq_v4f,
+    ):
+        parameters = inspect.signature(function).parameters
+        assert "importance" not in parameters
+        assert "input_importance" not in parameters
+        assert "imatrix_path" not in parameters
+
+
+def test_cccp_kmeans_trains_exact_point_codebook() -> None:
+    rng = np.random.default_rng(5)
+    points = rng.normal(size=(256, 8)).astype(np.float32)
+    result = train_cccp_codebook(
+        points,
+        CCCP_X,
+        config=CccpKmeansConfig(
+            iterations=1,
+            restarts=1,
+            sample_points=256,
+            seed=11,
+            distance_bytes=1 << 20,
+        ),
+        device="cpu",
+    )
+    assert result.codebook.shape == (256, 8)
+    assert result.sse < 1e-4
+
+
+def test_cccp_audit_sums_match_materialized_reconstruction() -> None:
+    rng = np.random.default_rng(44)
+    weight = rng.normal(size=(5, 24)).astype(np.float32)
+    codebook = rng.normal(size=(256, 8)).astype(np.float32)
+    tensor = quantize_cccp_pq_fixed(
+        weight,
+        CCCP_X,
+        codebook,
+        device="cpu",
+    )
+    reconstruction = dequantize_cccp_pq(tensor)
+    sse, signal = cccp_reconstruction_sums(
+        weight,
+        CCCP_X,
+        codebook,
+        device="cpu",
+    )
+    assert sse == pytest.approx(float(np.square(weight - reconstruction).sum()))
+    assert signal == pytest.approx(float(np.square(weight).sum()))
+
+
+def test_cccp_tiers_and_nintm_roundtrip() -> None:
+    allocation = allocate_cccp_tiers(
+        [70.0, 26.6, 3.2, 0.2],
+        vv_share=0.5,
+    )
+    assert allocation.tiers == ("vv", "v", "w", "x")
+    selection = build_cccp_expert_selection(
+        name="blk.0.ffn_gate_up_exps.weight",
+        group="gate_up",
+        allocation=allocation,
+        rows_per_expert=2,
+        columns=24,
+        artifacts={
+            "vv": "vv.npz",
+            "v": "v.npz",
+            "w": "w.npz",
+            "x": "x.npz",
+        },
+    )
+    assert tuple(item.descriptor.family for item in selection.selections) == (
+        "TPQ-VV",
+        "TPQ-V",
+        "TPQ-W",
+        "TPQ-X",
+    )
+
+    rng = np.random.default_rng(81)
+    weight = rng.normal(size=(4, 2, 24)).astype(np.float32)
+    codebooks = {
+        family: rng.normal(
+            size=(spec.codebook_entries, spec.vector_size)
+        ).astype(np.float32)
+        for family, spec in {
+            "TPQ-X": CCCP_X,
+            "TPQ-W": CCCP_W,
+            "TPQ-V": CCCP_V,
+            "TPQ-VV": CCCP_VV,
+        }.items()
+    }
+    tensor = quantize_expertwise(
+        weight,
+        selection.precisions,
+        artifacts=codebooks,
+        device="cpu",
+    )
+    with_generic_importance = quantize_expertwise(
+        weight,
+        selection.precisions,
+        artifacts=codebooks,
+        importance=rng.uniform(0.1, 10.0, size=weight.shape).astype(np.float32),
+        device="cpu",
+    )
+    assert with_generic_importance.expert_profiles == tensor.expert_profiles
+    for plain_pool, calibrated_pool in zip(
+        tensor.pools,
+        with_generic_importance.pools,
+    ):
+        np.testing.assert_array_equal(
+            plain_pool.tensor.indices,
+            calibrated_pool.tensor.indices,
+        )
+    restored = unpack_nint_moe(pack_nint_moe(tensor))
+    assert restored.expert_profiles == tensor.expert_profiles
+    np.testing.assert_array_equal(
+        dequantize_expertwise(restored),
+        dequantize_expertwise(tensor),
+    )
+
+
+def test_cccp_streaming_writer_uses_native_payload(tmp_path: Path) -> None:
+    rng = np.random.default_rng(92)
+    weight = rng.normal(size=(6, 24)).astype(np.float32)
+    codebook = rng.normal(size=(256, 8)).astype(np.float32)
+    artifact = tmp_path / "cccp-x.npz"
+    np.savez(artifact, family=np.asarray("CCCP-X"), codebook=codebook)
+    precision = ExpertPrecision(
+        family="CCCP-X",
+        artifact=artifact.name,
+        options=(("distance_bytes", 1 << 20),),
+    )
+    output = tmp_path / "cccp-x.blob"
+    written = _write_flat_family_axis0_blob(
+        weight,
+        weight.shape,
+        precision,
+        output,
+        row_chunk=2,
+        quant_backend="cpu",
+        device="cpu",
+        artifact_root=tmp_path,
+    )
+    restored = unpack_cccp_pq(output.read_bytes())
+    assert written == output.stat().st_size == restored.payload_nbytes
+    expected = quantize_cccp_pq_fixed(
+        weight,
+        CCCP_X,
+        codebook,
+        device="cpu",
+    )
+    np.testing.assert_array_equal(restored.indices, expected.indices)
+
+
+def test_prepare_tpq_scheme_is_consumable(tmp_path: Path) -> None:
+    profile = tmp_path / "profile.json"
+    profile.write_text(
+        '{"counts":{"0":{"0":70.0,"1":26.6,"2":3.2,"3":0.2}}}',
+        encoding="utf-8",
+    )
+    output = tmp_path / "scheme.json"
+    prepared = prepare(
+        profile_path=profile,
+        output_path=output,
+        rows_gate_up=4,
+        columns_gate_up=24,
+        rows_down=3,
+        columns_down=24,
+        vv_share=0.5,
+    )
+    restored = load_scheme(output)
+    assert restored.target_storage_bits == prepared.storage_bits
+    assert set(restored.expert_selections) == {
+        "blk.0.ffn_gate_up_exps.weight",
+        "blk.0.ffn_down_exps.weight",
+    }
+    assert restored.require_expert(
+        "blk.0.ffn_gate_up_exps.weight"
+    ).precisions[0].family == "TPQ-VV"
+
+
+def test_prepare_tpq_scheme_accepts_fixed_tier_fragment(tmp_path: Path) -> None:
+    profile = tmp_path / "tiers.json"
+    profile.write_text(
+        '"tiers_per_layer":{"0":"Vvwx"},',
+        encoding="utf-8",
+    )
+    assert load_cccp_tier_profile(profile) == {
+        0: ("vv", "v", "w", "x")
+    }
+    output = tmp_path / "scheme.json"
+    prepare(
+        profile_path=profile,
+        output_path=output,
+        rows_gate_up=4,
+        columns_gate_up=24,
+        rows_down=3,
+        columns_down=24,
+    )
+    restored = load_scheme(output)
+    assert restored.metadata["tier_source"] == "fixed_tiers_per_layer"
+    assert tuple(
+        precision.family
+        for precision in restored.require_expert(
+            "blk.0.ffn_gate_up_exps.weight"
+        ).precisions
+    ) == ("TPQ-VV", "TPQ-V", "TPQ-W", "TPQ-X")
