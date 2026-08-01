@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A/B-test MoEQuant AGQ on real DeepSeek-V4-Flash layer-0 experts.
+"""A/B-test MoEQuant AGQ on real DeepSeek-V4-Flash experts.
 
 The probe keeps calibration tokens, routed experts, source weights, Q4 format,
 and model volume fixed.  It changes only the diagonal calibration objective:
@@ -32,6 +32,7 @@ from mfq._vendor.tpq.dsv4 import (
     DSV4Checkpoint,
     RopeCache,
     attn_prefill,
+    block_forward,
     gate_route,
     hc_post,
     hc_pre,
@@ -57,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--artifact-dir", type=Path)
+    parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--sequence-length", type=int, default=128)
     parser.add_argument("--train-sequences", type=int, default=4)
     parser.add_argument("--test-sequences", type=int, default=4)
@@ -99,43 +101,129 @@ def _load_tokens(options: argparse.Namespace, vocab: int) -> torch.Tensor:
     return torch.from_numpy(values.astype(np.int64).reshape(sequences, -1))
 
 
-@torch.inference_mode()
-def _layer0_ffn_inputs(
-    checkpoint: DSV4Checkpoint,
+def _layer_state(
     config: DSV4Config,
-    tokens: torch.Tensor,
+    *,
+    batch: int,
+    sequence_length: int,
+    ratio: int,
     device: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the real embedding and attention path up to layer-0 MoE routing."""
-
-    ids = tokens.to(device=device, dtype=torch.int64)
-    embedding = checkpoint.embed()
-    hidden = embedding[ids].unsqueeze(2).repeat(1, 1, config.hc_mult, 1)
-    del embedding
-    weights = checkpoint.layer(0)
-    cache = RopeCache(
-        config.qk_rope_head_dim,
-        int(tokens.shape[1]),
-        config.rope_theta,
-        None,
-    )
-    cache.cos = cache.cos.to(device)
-    cache.sin = cache.sin.to(device)
+) -> dict[str, torch.Tensor]:
+    compressed = sequence_length // ratio + 1 if ratio else 0
     state = {
         "kv": torch.zeros(
-            int(tokens.shape[0]),
-            config.sliding_window,
+            batch,
+            config.sliding_window + compressed,
             config.head_dim,
             dtype=torch.float32,
             device=device,
         ),
         "win_pos": torch.full(
-            (int(tokens.shape[0]), config.sliding_window),
+            (batch, config.sliding_window),
             -1,
             dtype=torch.int64,
             device=device,
         ),
     }
+    if ratio:
+        compressor_width = 2 if ratio == 4 else 1
+        state["ckv"] = torch.zeros(
+            batch,
+            compressor_width * ratio,
+            compressor_width * config.head_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        state["cscore"] = torch.full(
+            (
+                batch,
+                compressor_width * ratio,
+                compressor_width * config.head_dim,
+            ),
+            float("-inf"),
+            dtype=torch.float32,
+            device=device,
+        )
+    return state
+
+
+@torch.inference_mode()
+def _target_ffn_inputs(
+    checkpoint: DSV4Checkpoint,
+    config: DSV4Config,
+    tokens: torch.Tensor,
+    target_layer: int,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Stream the real prefix and stop immediately before one layer's experts."""
+
+    ids = tokens.to(device=device, dtype=torch.int64)
+    embedding = checkpoint.embed()
+    hidden = embedding[ids].unsqueeze(2).repeat(1, 1, config.hc_mult, 1)
+    del embedding
+    sequence_length = int(tokens.shape[1])
+    base_cache = RopeCache(
+        config.qk_rope_head_dim,
+        sequence_length,
+        config.rope_theta,
+        None,
+    )
+    compressed_cache = RopeCache(
+        config.qk_rope_head_dim,
+        sequence_length,
+        config.compress_rope_theta,
+        config.rope_scaling or None,
+    )
+    for cache in (base_cache, compressed_cache):
+        cache.cos = cache.cos.to(device)
+        cache.sin = cache.sin.to(device)
+    ratios = (list(config.compress_ratios) + [0] * config.n_layers)[: config.n_layers]
+    batch = int(tokens.shape[0])
+
+    for layer in range(target_layer):
+        layer_started = time.perf_counter()
+        ratio = ratios[layer]
+        state = _layer_state(
+            config,
+            batch=batch,
+            sequence_length=sequence_length,
+            ratio=ratio,
+            device=device,
+        )
+        hidden = block_forward(
+            hidden,
+            checkpoint.layer(layer),
+            state,
+            config,
+            compressed_cache if ratio else base_cache,
+            ratio,
+            ids,
+            0,
+            checkpoint.expert,
+            layer,
+        )
+        print(
+            json.dumps(
+                {
+                    "prefix_layer": layer,
+                    "ratio": ratio,
+                    "seconds": time.perf_counter() - layer_started,
+                }
+            ),
+            flush=True,
+        )
+        del state
+        torch.cuda.empty_cache()
+
+    weights = checkpoint.layer(target_layer)
+    ratio = ratios[target_layer]
+    state = _layer_state(
+        config,
+        batch=batch,
+        sequence_length=sequence_length,
+        ratio=ratio,
+        device=device,
+    )
 
     residual = hidden
     value, post, combine = hc_pre(
@@ -146,7 +234,14 @@ def _layer0_ffn_inputs(
         config,
     )
     value = rmsnorm(value, weights["attn_norm"], config.rms_eps)
-    attention = attn_prefill(value, weights, state, config, cache, ratio=0)
+    attention = attn_prefill(
+        value,
+        weights,
+        state,
+        config,
+        compressed_cache if ratio else base_cache,
+        ratio=ratio,
+    )
     hidden = hc_post(attention, residual, post, combine)
     value, _post, _combine = hc_pre(
         hidden,
@@ -299,10 +394,12 @@ def main() -> int:
     torch.set_default_device(options.device)
     torch.backends.cuda.matmul.allow_tf32 = False
     config = DSV4Config.from_hf(str(options.model))
+    if options.layer < 0 or options.layer >= config.n_layers:
+        raise ValueError(f"layer must be in [0,{config.n_layers - 1}]")
     checkpoint = DSV4Checkpoint(str(options.model), device=options.device, cache_layers=1)
     tokens = _load_tokens(options, config.vocab)
-    inputs, affinities, expert_ids = _layer0_ffn_inputs(
-        checkpoint, config, tokens, options.device
+    inputs, affinities, expert_ids = _target_ffn_inputs(
+        checkpoint, config, tokens, options.layer, options.device
     )
     split = options.train_sequences * options.sequence_length
     train_inputs, test_inputs = inputs[:split], inputs[split:]
@@ -339,11 +436,11 @@ def main() -> int:
 
     artifact_dir = options.artifact_dir or options.output.parent / (options.output.stem + "-stats")
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    gate_artifact = artifact_dir / "layer0-gate-up-agq.npz"
+    gate_artifact = artifact_dir / f"layer{options.layer}-gate-up-agq.npz"
     gate_accumulator.save(
         gate_artifact,
         metadata={
-            "layer": 0,
+            "layer": options.layer,
             "projection": "gate_up",
             "train_tokens": int(train_inputs.shape[0]),
             "top_k": config.top_k,
@@ -369,7 +466,7 @@ def main() -> int:
         test_x, test_c = _selected_routes(
             test_inputs, test_affinity, test_ids, expert, options.device
         )
-        gate_weight, up_weight, down_weight = checkpoint.expert(0, expert)
+        gate_weight, up_weight, down_weight = checkpoint.expert(options.layer, expert)
         train_hidden = _intermediate(
             train_x, gate_weight, up_weight, config.swiglu_limit
         )
@@ -474,11 +571,11 @@ def main() -> int:
         )
         torch.cuda.empty_cache()
 
-    down_artifact = artifact_dir / "layer0-down-agq.npz"
+    down_artifact = artifact_dir / f"layer{options.layer}-down-agq.npz"
     down_accumulator.save(
         down_artifact,
         metadata={
-            "layer": 0,
+            "layer": options.layer,
             "projection": "down",
             "selected_experts": selected_experts,
             "source": str(options.model),
@@ -500,7 +597,10 @@ def main() -> int:
     report = {
         "format": "mfq.v4f-moequant-agq-probe.v1",
         "status": "completed",
-        "scope": "real layer-0 weights and activations; selected routed experts",
+        "scope": (
+            f"real layer-{options.layer} weights and streamed-prefix activations; "
+            "selected routed experts"
+        ),
         "source_precision": "official FP4 checkpoint",
         "target_quantization": {
             "format": spec.profile_label,
@@ -519,8 +619,9 @@ def main() -> int:
         "model_config_sha256": _sha256(options.model / "config.json"),
         "token_ids": str(options.token_ids.resolve()),
         "token_ids_sha256": _sha256(options.token_ids),
-        "layer": 0,
-        "hash_routed_layer": True,
+        "layer": options.layer,
+        "prefix_layers": options.layer,
+        "hash_routed_layer": options.layer < config.n_hash_layers,
         "sequence_length": options.sequence_length,
         "train_sequences": options.train_sequences,
         "test_sequences": options.test_sequences,
@@ -544,7 +645,11 @@ def main() -> int:
         "elapsed_seconds": time.perf_counter() - started,
         "limitations": [
             "This is an expert-output distortion probe, not full-model KLD.",
-            "Layer 0 uses token-ID hash routing; gate affinity still controls contribution weight.",
+            (
+                "The target layer uses token-ID hash routing."
+                if options.layer < config.n_hash_layers
+                else "The target layer uses score-based dynamic routing."
+            ),
             "The source routed weights are official FP4, so this measures Q4 re-quantization.",
             "Bootstrap units are routed expert samples and are exploratory, not independent tokens.",
         ],
