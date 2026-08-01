@@ -1,0 +1,1395 @@
+#include "mfq_server.h"
+
+#include "httplib.h"
+#include "json.hpp"
+#include "gguf.h"
+#include "llama.h"
+#include "common/chat.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <exception>
+#include <filesystem>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <random>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+namespace {
+
+class ApiError final : public std::runtime_error {
+public:
+    ApiError(int status, std::string type, std::string message, std::string param = {})
+        : std::runtime_error(std::move(message)), status(status), type(std::move(type)), param(std::move(param)) {}
+
+    int status;
+    std::string type;
+    std::string param;
+};
+
+static json error_body(const std::string & message, const std::string & type, const std::string & param = {}) {
+    return {
+        {"error", {
+            {"message", message},
+            {"type", type},
+            {"param", param.empty() ? json(nullptr) : json(param)},
+            {"code", json(nullptr)},
+        }},
+    };
+}
+
+static void set_json(httplib::Response & res, const json & body, int status = 200) {
+    res.status = status;
+    res.set_content(body.dump(), "application/json; charset=utf-8");
+}
+
+static int64_t unix_time_seconds() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+static std::string request_id(const char * prefix) {
+    static std::atomic<uint64_t> sequence{0};
+    const uint64_t n = sequence.fetch_add(1, std::memory_order_relaxed);
+    return std::string(prefix) + std::to_string(unix_time_seconds()) + "-" + std::to_string(n);
+}
+
+static void llama_log_quiet(ggml_log_level level, const char * text, void *) {
+    if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
+        std::cerr << "llama-tokenizer: " << text;
+    }
+}
+
+class LlamaTokenizer {
+public:
+    explicit LlamaTokenizer(const std::string & path) {
+        load_from_file(path);
+        finish_init();
+    }
+
+    explicit LlamaTokenizer(const std::vector<uint8_t> & gguf) {
+        if (gguf.empty()) {
+            throw std::runtime_error("embedded tokenizer GGUF is empty");
+        }
+        llama_log_set(llama_log_quiet, nullptr);
+        gguf_init_params metadata_params = {
+            /*.no_alloc = */ true,
+            /*.ctx      = */ nullptr,
+        };
+        metadata_ = gguf_init_from_buffer(
+            gguf.data(), gguf.size(), metadata_params);
+        if (metadata_ == nullptr) {
+            throw std::runtime_error(
+                "cannot parse embedded tokenizer GGUF metadata");
+        }
+        auto params = llama_model_default_params();
+        params.vocab_only = true;
+        params.use_mmap = false;
+        params.progress_callback = [](float, void *) { return true; };
+        model_ = llama_model_init_from_user(
+            metadata_, nullptr, nullptr, params);
+        if (model_ == nullptr) {
+            gguf_free(metadata_);
+            metadata_ = nullptr;
+            throw std::runtime_error(
+                "cannot initialize tokenizer from embedded GGUF metadata");
+        }
+        finish_init();
+    }
+
+    ~LlamaTokenizer() {
+        if (model_ != nullptr) llama_model_free(model_);
+        if (metadata_ != nullptr) gguf_free(metadata_);
+    }
+
+    LlamaTokenizer(const LlamaTokenizer &) = delete;
+    LlamaTokenizer & operator=(const LlamaTokenizer &) = delete;
+
+    int32_t vocab_size() const {
+        return llama_vocab_n_tokens(vocab_);
+    }
+
+    std::string chat_template() const {
+        const char * value = llama_model_chat_template(model_, nullptr);
+        return value == nullptr ? std::string() : std::string(value);
+    }
+
+    const llama_model * model() const {
+        return model_;
+    }
+
+    int32_t bos_token() const {
+        return llama_vocab_bos(vocab_);
+    }
+
+    int32_t eos_token() const {
+        return llama_vocab_eos(vocab_);
+    }
+
+    int32_t eot_token() const {
+        return llama_vocab_eot(vocab_);
+    }
+
+    int32_t pad_token() const {
+        return llama_vocab_pad(vocab_);
+    }
+
+    std::vector<int64_t> tokenize(const std::string & text, bool parse_special) const {
+        int32_t n = llama_tokenize(vocab_, text.data(), static_cast<int32_t>(text.size()),
+                                   nullptr, 0, false, parse_special);
+        if (n == std::numeric_limits<int32_t>::min()) {
+            throw std::runtime_error("tokenized prompt exceeds the tokenizer limit");
+        }
+        if (n == 0) return {};
+        if (n > 0) {
+            throw std::runtime_error("tokenizer returned an invalid sizing result");
+        }
+        std::vector<llama_token> tokens(static_cast<size_t>(-n));
+        n = llama_tokenize(vocab_, text.data(), static_cast<int32_t>(text.size()),
+                           tokens.data(), static_cast<int32_t>(tokens.size()), false, parse_special);
+        if (n < 0) throw std::runtime_error("tokenizer buffer sizing changed unexpectedly");
+        std::vector<int64_t> out;
+        out.reserve(static_cast<size_t>(n));
+        for (int32_t i = 0; i < n; ++i) out.push_back(tokens[static_cast<size_t>(i)]);
+        return out;
+    }
+
+    bool is_eog(int64_t token) const {
+        return llama_vocab_is_eog(vocab_, static_cast<llama_token>(token));
+    }
+
+    std::string piece(int64_t token, bool special = false) const {
+        char local[128];
+        int32_t n = llama_token_to_piece(vocab_, static_cast<llama_token>(token),
+                                         local, static_cast<int32_t>(sizeof(local)), 0, special);
+        if (n >= 0) return std::string(local, local + n);
+        std::string out(static_cast<size_t>(-n), '\0');
+        n = llama_token_to_piece(vocab_, static_cast<llama_token>(token),
+                                 out.data(), static_cast<int32_t>(out.size()), 0, special);
+        if (n < 0) throw std::runtime_error("token piece buffer sizing changed unexpectedly");
+        out.resize(static_cast<size_t>(n));
+        return out;
+    }
+
+private:
+    void load_from_file(const std::string & path) {
+        llama_log_set(llama_log_quiet, nullptr);
+        auto params = llama_model_default_params();
+        params.vocab_only = true;
+        params.use_mmap = true;
+        params.progress_callback = [](float, void *) { return true; };
+        model_ = llama_model_load_from_file(path.c_str(), params);
+        if (model_ == nullptr) {
+            throw std::runtime_error(
+                "cannot load tokenizer metadata from GGUF: " + path);
+        }
+    }
+
+    void finish_init() {
+        vocab_ = llama_model_get_vocab(model_);
+        if (vocab_ == nullptr) {
+            llama_model_free(model_);
+            model_ = nullptr;
+            if (metadata_ != nullptr) {
+                gguf_free(metadata_);
+                metadata_ = nullptr;
+            }
+            throw std::runtime_error(
+                "GGUF does not contain a tokenizer vocabulary");
+        }
+    }
+
+    llama_model * model_ = nullptr;
+    const llama_vocab * vocab_ = nullptr;
+    gguf_context * metadata_ = nullptr;
+};
+
+static bool request_enable_thinking(const json & body) {
+    if (body.contains("enable_thinking") && !body["enable_thinking"].is_null()) {
+        if (!body["enable_thinking"].is_boolean()) {
+            throw ApiError(400, "invalid_request_error", "enable_thinking must be boolean", "enable_thinking");
+        }
+        return body["enable_thinking"].get<bool>();
+    }
+    if (body.contains("chat_template_kwargs") && !body["chat_template_kwargs"].is_null()) {
+        const auto & kwargs = body["chat_template_kwargs"];
+        if (!kwargs.is_object()) {
+            throw ApiError(400, "invalid_request_error", "chat_template_kwargs must be an object", "chat_template_kwargs");
+        }
+        if (kwargs.contains("enable_thinking")) {
+            if (!kwargs["enable_thinking"].is_boolean()) {
+                throw ApiError(400, "invalid_request_error", "enable_thinking must be boolean",
+                               "chat_template_kwargs.enable_thinking");
+            }
+            return kwargs["enable_thinking"].get<bool>();
+        }
+    }
+    return true;
+}
+
+static common_reasoning_format request_reasoning_format(const json & body) {
+    if (!body.contains("reasoning_format") || body["reasoning_format"].is_null()) {
+        return COMMON_REASONING_FORMAT_AUTO;
+    }
+    if (!body["reasoning_format"].is_string()) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "reasoning_format must be a string", "reasoning_format");
+    }
+    try {
+        return common_reasoning_format_from_name(
+            body["reasoning_format"].get<std::string>());
+    } catch (const std::exception & error) {
+        throw ApiError(
+            400, "invalid_request_error", error.what(), "reasoning_format");
+    }
+}
+
+static bool boolean_field(
+        const json & body, const char * name, bool fallback) {
+    if (!body.contains(name) || body[name].is_null()) return fallback;
+    if (!body[name].is_boolean()) {
+        throw ApiError(
+            400, "invalid_request_error",
+            std::string(name) + " must be boolean", name);
+    }
+    return body[name].get<bool>();
+}
+
+static common_chat_params apply_chat_template(
+        const json & body, const common_chat_templates * templates) {
+    if (!body.contains("messages") || !body["messages"].is_array() ||
+        body["messages"].empty()) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "messages must be a non-empty array", "messages");
+    }
+
+    try {
+        common_chat_templates_inputs inputs;
+        inputs.messages =
+            common_chat_msgs_parse_oaicompat(body["messages"]);
+        inputs.reasoning_format = request_reasoning_format(body);
+        inputs.enable_thinking = request_enable_thinking(body);
+        inputs.use_jinja = true;
+        inputs.add_generation_prompt =
+            boolean_field(body, "add_generation_prompt", true);
+
+        if (body.contains("continue_final_message") &&
+            !body["continue_final_message"].is_null()) {
+            inputs.continue_final_message =
+                common_chat_continuation_parse(
+                    body["continue_final_message"]);
+        }
+        if (inputs.continue_final_message !=
+                COMMON_CHAT_CONTINUATION_NONE &&
+            inputs.add_generation_prompt) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "add_generation_prompt and continue_final_message "
+                "cannot both be enabled",
+                "continue_final_message");
+        }
+
+        const auto caps =
+            common_chat_templates_get_caps(templates);
+        inputs.parallel_tool_calls = boolean_field(
+            body, "parallel_tool_calls",
+            caps.at("supports_parallel_tool_calls"));
+
+        if (body.contains("tools") && !body["tools"].is_null()) {
+            inputs.tools =
+                common_chat_tools_parse_oaicompat(body["tools"]);
+        }
+        const std::string tool_choice =
+            body.contains("tool_choice") &&
+                    !body["tool_choice"].is_null()
+                ? body["tool_choice"].get<std::string>()
+                : "auto";
+        inputs.tool_choice =
+            common_chat_tool_choice_parse_oaicompat(tool_choice);
+
+        if (body.contains("chat_template_kwargs") &&
+            !body["chat_template_kwargs"].is_null()) {
+            if (!body["chat_template_kwargs"].is_object()) {
+                throw ApiError(
+                    400, "invalid_request_error",
+                    "chat_template_kwargs must be an object",
+                    "chat_template_kwargs");
+            }
+            for (const auto & item :
+                 body["chat_template_kwargs"].items()) {
+                inputs.chat_template_kwargs[item.key()] =
+                    item.value().dump();
+            }
+        }
+        return common_chat_templates_apply(templates, inputs);
+    } catch (const ApiError &) {
+        throw;
+    } catch (const std::exception & error) {
+        throw ApiError(
+            400, "invalid_request_error",
+            std::string("chat template application failed: ") +
+                error.what(),
+            "messages");
+    }
+}
+
+static int64_t integer_field(const json & body, const char * name, int64_t fallback) {
+    if (!body.contains(name) || body[name].is_null()) return fallback;
+    if (!body[name].is_number_integer()) {
+        throw ApiError(400, "invalid_request_error", std::string(name) + " must be an integer", name);
+    }
+    return body[name].get<int64_t>();
+}
+
+static double number_field(const json & body, const char * name, double fallback) {
+    if (!body.contains(name) || body[name].is_null()) return fallback;
+    if (!body[name].is_number()) {
+        throw ApiError(400, "invalid_request_error", std::string(name) + " must be a number", name);
+    }
+    return body[name].get<double>();
+}
+
+static std::vector<std::string> parse_stops(const json & body) {
+    std::vector<std::string> stops;
+    if (!body.contains("stop") || body["stop"].is_null()) return stops;
+    if (body["stop"].is_string()) {
+        stops.push_back(body["stop"].get<std::string>());
+    } else if (body["stop"].is_array()) {
+        if (body["stop"].size() > 16) {
+            throw ApiError(400, "invalid_request_error", "stop accepts at most 16 strings", "stop");
+        }
+        for (const auto & stop : body["stop"]) {
+            if (!stop.is_string()) {
+                throw ApiError(400, "invalid_request_error", "stop entries must be strings", "stop");
+            }
+            stops.push_back(stop.get<std::string>());
+        }
+    } else {
+        throw ApiError(400, "invalid_request_error", "stop must be a string or an array of strings", "stop");
+    }
+    for (const auto & stop : stops) {
+        if (stop.empty()) throw ApiError(400, "invalid_request_error", "stop strings cannot be empty", "stop");
+    }
+    return stops;
+}
+
+struct RequestWork {
+    bool chat = true;
+    bool stream = false;
+    bool include_usage = false;
+    common_chat_parser_params chat_parser;
+    std::unordered_set<int64_t> preserved_tokens;
+    std::vector<int64_t> prompt;
+    std::vector<std::string> stops;
+    MfqSamplingParams sampling;
+};
+
+static RequestWork parse_work(const json & body, bool chat, const LlamaTokenizer & tokenizer,
+                              const common_chat_templates * templates,
+                              const MfqServerConfig & config) {
+    if (!body.is_object()) throw ApiError(400, "invalid_request_error", "request body must be a JSON object");
+    if (integer_field(body, "n", 1) != 1) {
+        throw ApiError(400, "unsupported_parameter", "only n=1 is supported", "n");
+    }
+    if (body.contains("logprobs") && !body["logprobs"].is_null()) {
+        if (!body["logprobs"].is_boolean()) {
+            throw ApiError(400, "invalid_request_error", "logprobs must be boolean", "logprobs");
+        }
+        if (body["logprobs"].get<bool>()) {
+            throw ApiError(400, "unsupported_parameter", "logprobs are not implemented", "logprobs");
+        }
+    }
+    if (number_field(body, "min_p", 0.0) != 0.0) {
+        throw ApiError(400, "unsupported_parameter", "min_p is not implemented", "min_p");
+    }
+
+    RequestWork work;
+    work.chat = chat;
+    if (body.contains("stream") && !body["stream"].is_null() && !body["stream"].is_boolean()) {
+        throw ApiError(400, "invalid_request_error", "stream must be boolean", "stream");
+    }
+    work.stream = body.contains("stream") && !body["stream"].is_null()
+        ? body["stream"].get<bool>()
+        : false;
+    if (body.contains("stream_options") && !body["stream_options"].is_null()) {
+        if (!body["stream_options"].is_object()) {
+            throw ApiError(400, "invalid_request_error", "stream_options must be an object", "stream_options");
+        }
+        const auto & stream_options = body["stream_options"];
+        if (stream_options.contains("include_usage") && !stream_options["include_usage"].is_null() &&
+            !stream_options["include_usage"].is_boolean()) {
+            throw ApiError(400, "invalid_request_error", "include_usage must be boolean",
+                           "stream_options.include_usage");
+        }
+        work.include_usage = stream_options.contains("include_usage") && !stream_options["include_usage"].is_null()
+            ? stream_options["include_usage"].get<bool>()
+            : false;
+    }
+
+    const int64_t max_tokens = body.contains("max_completion_tokens")
+        ? integer_field(body, "max_completion_tokens", 256)
+        : integer_field(body, "max_tokens", 256);
+    if (max_tokens < 1 || max_tokens > std::numeric_limits<int32_t>::max()) {
+        throw ApiError(400, "invalid_request_error", "max_tokens must be positive", "max_tokens");
+    }
+    work.sampling.max_tokens = static_cast<int32_t>(max_tokens);
+    work.sampling.temperature = number_field(body, "temperature", 1.0);
+    work.sampling.top_p = number_field(body, "top_p", 0.95);
+    work.sampling.top_k = static_cast<int32_t>(integer_field(body, "top_k", 20));
+    work.sampling.presence_penalty = number_field(body, "presence_penalty", 0.0);
+    work.sampling.frequency_penalty = number_field(body, "frequency_penalty", 0.0);
+    work.sampling.repetition_penalty = number_field(body, "repetition_penalty", 1.0);
+    if (work.sampling.temperature < 0.0 || work.sampling.temperature > 10.0) {
+        throw ApiError(400, "invalid_request_error", "temperature must be in [0, 10]", "temperature");
+    }
+    if (work.sampling.top_p <= 0.0 || work.sampling.top_p > 1.0) {
+        throw ApiError(400, "invalid_request_error", "top_p must be in (0, 1]", "top_p");
+    }
+    if (work.sampling.top_k < 0 || work.sampling.top_k > 1024) {
+        throw ApiError(400, "invalid_request_error", "top_k must be in [0, 1024]", "top_k");
+    }
+    if (work.sampling.temperature > 0.0 && work.sampling.top_k == 0 && work.sampling.top_p < 1.0) {
+        throw ApiError(400, "invalid_request_error", "top_p below 1 requires top_k above 0 in this sampler", "top_p");
+    }
+    if (work.sampling.presence_penalty < -2.0 || work.sampling.presence_penalty > 2.0) {
+        throw ApiError(400, "invalid_request_error", "presence_penalty must be in [-2, 2]", "presence_penalty");
+    }
+    if (work.sampling.frequency_penalty < -2.0 || work.sampling.frequency_penalty > 2.0) {
+        throw ApiError(400, "invalid_request_error", "frequency_penalty must be in [-2, 2]", "frequency_penalty");
+    }
+    if (work.sampling.repetition_penalty <= 0.0 || work.sampling.repetition_penalty > 10.0) {
+        throw ApiError(400, "invalid_request_error", "repetition_penalty must be in (0, 10]", "repetition_penalty");
+    }
+    if (body.contains("seed") && !body["seed"].is_null()) {
+        const int64_t seed = integer_field(body, "seed", 0);
+        work.sampling.seed = static_cast<uint64_t>(seed);
+    } else {
+        std::random_device device;
+        work.sampling.seed = (static_cast<uint64_t>(device()) << 32) ^ device();
+    }
+
+    std::string prompt;
+    bool parse_special = false;
+    if (chat) {
+        const common_chat_params chat_params =
+            apply_chat_template(body, templates);
+        prompt = chat_params.prompt;
+        parse_special = true;
+        work.chat_parser.format = chat_params.format;
+        work.chat_parser.reasoning_format =
+            request_reasoning_format(body);
+        work.chat_parser.reasoning_in_content =
+            work.stream &&
+            work.chat_parser.reasoning_format ==
+                COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY;
+        work.chat_parser.generation_prompt =
+            chat_params.generation_prompt;
+        work.chat_parser.parse_tool_calls = true;
+        if (!chat_params.parser.empty()) {
+            work.chat_parser.parser.load(chat_params.parser);
+        }
+        if (body.contains("continue_final_message") &&
+            !body["continue_final_message"].is_null()) {
+            work.chat_parser.is_continuation =
+                common_chat_continuation_parse(
+                    body["continue_final_message"]) !=
+                COMMON_CHAT_CONTINUATION_NONE;
+        }
+        for (const auto & text : chat_params.preserved_tokens) {
+            const auto tokens = tokenizer.tokenize(text, true);
+            work.preserved_tokens.insert(tokens.begin(), tokens.end());
+        }
+        work.stops.insert(
+            work.stops.end(), chat_params.additional_stops.begin(),
+            chat_params.additional_stops.end());
+    } else {
+        if (!body.contains("prompt") || !body["prompt"].is_string()) {
+            throw ApiError(400, "invalid_request_error", "prompt must be a string", "prompt");
+        }
+        prompt = body["prompt"].get<std::string>();
+    }
+    work.prompt = tokenizer.tokenize(prompt, parse_special);
+    if (work.prompt.empty()) throw ApiError(400, "invalid_request_error", "prompt tokenized to an empty sequence", "prompt");
+    if (config.max_context > 0 && static_cast<int64_t>(work.prompt.size()) + max_tokens > config.max_context) {
+        throw ApiError(400, "context_length_exceeded",
+                       "prompt tokens plus max_tokens exceed the model context window", "max_tokens");
+    }
+    const auto requested_stops = parse_stops(body);
+    work.stops.insert(
+        work.stops.end(), requested_stops.begin(),
+        requested_stops.end());
+    std::vector<std::string> unique_stops;
+    unique_stops.reserve(work.stops.size());
+    for (const auto & stop : work.stops) {
+        if (std::find(
+                unique_stops.begin(), unique_stops.end(), stop) ==
+            unique_stops.end()) {
+            unique_stops.push_back(stop);
+        }
+    }
+    work.stops = std::move(unique_stops);
+    return work;
+}
+
+static size_t complete_utf8_prefix(const std::string & value, size_t limit) {
+    size_t i = 0;
+    size_t complete = 0;
+    limit = std::min(limit, value.size());
+    while (i < limit) {
+        const unsigned char lead = static_cast<unsigned char>(value[i]);
+        size_t width = 1;
+        if ((lead & 0x80u) == 0) width = 1;
+        else if ((lead & 0xE0u) == 0xC0u) width = 2;
+        else if ((lead & 0xF0u) == 0xE0u) width = 3;
+        else if ((lead & 0xF8u) == 0xF0u) width = 4;
+        else break;
+        if (i + width > limit) break;
+        bool valid = true;
+        for (size_t j = 1; j < width; ++j) {
+            if ((static_cast<unsigned char>(value[i + j]) & 0xC0u) != 0x80u) {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) break;
+        i += width;
+        complete = i;
+    }
+    return complete;
+}
+
+class TextEmitter {
+public:
+    using Emit = std::function<bool(const std::string &)>;
+
+    TextEmitter(std::vector<std::string> stops, Emit emit)
+        : stops_(std::move(stops)), emit_(std::move(emit)) {}
+
+    bool append(const std::string & piece) {
+        pending_ += piece;
+        size_t stop_pos = std::string::npos;
+        for (const auto & stop : stops_) {
+            const size_t pos = pending_.find(stop);
+            if (pos != std::string::npos && (stop_pos == std::string::npos || pos < stop_pos)) stop_pos = pos;
+        }
+        if (stop_pos != std::string::npos) {
+            if (!emit_prefix(stop_pos)) return false;
+            pending_.clear();
+            stopped_ = true;
+            return false;
+        }
+
+        size_t retain = 0;
+        for (const auto & stop : stops_) {
+            const size_t max_prefix = std::min(stop.size() - 1, pending_.size());
+            for (size_t n = 1; n <= max_prefix; ++n) {
+                if (pending_.compare(pending_.size() - n, n, stop, 0, n) == 0) retain = std::max(retain, n);
+            }
+        }
+        return emit_prefix(pending_.size() - retain);
+    }
+
+    bool flush() {
+        const size_t complete = complete_utf8_prefix(pending_, pending_.size());
+        if (complete > 0 && !emit_bytes(complete)) return false;
+        if (!pending_.empty()) {
+            pending_.clear();
+            return emit_("\xEF\xBF\xBD");
+        }
+        return true;
+    }
+
+    bool stopped() const { return stopped_; }
+
+private:
+    bool emit_prefix(size_t limit) {
+        const size_t complete = complete_utf8_prefix(pending_, limit);
+        return complete == 0 || emit_bytes(complete);
+    }
+
+    bool emit_bytes(size_t count) {
+        std::string text = pending_.substr(0, count);
+        pending_.erase(0, count);
+        return text.empty() || emit_(text);
+    }
+
+    std::vector<std::string> stops_;
+    Emit emit_;
+    std::string pending_;
+    bool stopped_ = false;
+};
+
+class ChatOutputParser {
+public:
+    using Emit = std::function<bool(const common_chat_msg_diff &)>;
+
+    ChatOutputParser(
+            const common_chat_parser_params & params, Emit emit)
+        : params_(params), emit_(std::move(emit)) {
+        if (params_.is_continuation && !params_.echo) {
+            message_ = common_chat_parse("", true, params_);
+        }
+    }
+
+    bool append(const std::string & piece) {
+        generated_ += piece;
+        return update(true);
+    }
+
+    bool flush() { return update(false); }
+
+    const common_chat_msg & message() const {
+        return message_;
+    }
+
+private:
+    bool update(bool partial) {
+        common_chat_msg parsed =
+            common_chat_parse(generated_, partial, params_);
+        if (parsed.empty()) return true;
+        parsed.set_tool_call_ids(
+            tool_call_ids_,
+            []() { return request_id("call_"); });
+        const auto diffs =
+            common_chat_msg_diff::compute_diffs(message_, parsed);
+        message_ = std::move(parsed);
+        for (const auto & diff : diffs) {
+            if (!emit_(diff)) return false;
+        }
+        return true;
+    }
+
+    common_chat_parser_params params_;
+    Emit emit_;
+    std::string generated_;
+    common_chat_msg message_;
+    std::vector<std::string> tool_call_ids_;
+};
+
+struct RequestMetrics {
+    using Clock = std::chrono::steady_clock;
+
+    Clock::time_point started = Clock::now();
+    Clock::time_point first_token;
+    size_t prefill_tokens = 0;
+    double prefill_ms = 0.0;
+    bool saw_token = false;
+    bool saw_prefill = false;
+
+    void mark_prefill(size_t prompt_token_count, double elapsed_ms) {
+        prefill_tokens = prompt_token_count;
+        prefill_ms = elapsed_ms;
+        saw_prefill = elapsed_ms > 0.0;
+    }
+
+    void mark_token() {
+        if (saw_token) return;
+        first_token = Clock::now();
+        saw_token = true;
+    }
+};
+
+struct CompletionResult {
+    std::string text;
+    std::string reasoning_text;
+    std::vector<common_chat_tool_call> tool_calls;
+    std::string finish_reason = "length";
+    int32_t completion_tokens = 0;
+    bool client_connected = true;
+};
+
+struct RequestMetricValues {
+    double generation_ms = 0.0;
+    double ttft_ms = 0.0;
+    double prefill_ms = 0.0;
+    double prefill_tps = 0.0;
+    double decode_ms = 0.0;
+    double generation_tps = 0.0;
+    double decode_tps = 0.0;
+};
+
+static RequestMetricValues request_metric_values(
+        const CompletionResult & result, const RequestMetrics & metrics) {
+    const auto finished = RequestMetrics::Clock::now();
+    RequestMetricValues values;
+    values.generation_ms =
+        std::chrono::duration<double, std::milli>(finished - metrics.started).count();
+    values.ttft_ms = metrics.saw_token
+        ? std::chrono::duration<double, std::milli>(
+              metrics.first_token - metrics.started).count()
+        : values.generation_ms;
+    values.prefill_ms = metrics.saw_prefill ? metrics.prefill_ms : 0.0;
+    values.prefill_tps = metrics.saw_prefill && metrics.prefill_ms > 0.0
+        ? 1000.0 * metrics.prefill_tokens / metrics.prefill_ms
+        : 0.0;
+    values.decode_ms = metrics.saw_token
+        ? std::chrono::duration<double, std::milli>(
+              finished - metrics.first_token).count()
+        : 0.0;
+    values.generation_tps = values.generation_ms > 0.0
+        ? 1000.0 * result.completion_tokens / values.generation_ms
+        : 0.0;
+    values.decode_tps =
+        result.completion_tokens > 1 && values.decode_ms > 0.0
+        ? 1000.0 * (result.completion_tokens - 1) / values.decode_ms
+        : 0.0;
+    return values;
+}
+
+static void log_request_metrics(const std::string & id, bool chat, bool stream,
+                                size_t prompt_tokens, const MfqSamplingParams & sampling,
+                                const CompletionResult & result,
+                                const RequestMetricValues & values) {
+    const char * enabled = std::getenv("MFQ_SERVER_REQUEST_METRICS");
+    if (enabled != nullptr && std::atoi(enabled) == 0) return;
+
+    const bool penalties = sampling.presence_penalty != 0.0 ||
+        sampling.frequency_penalty != 0.0 || sampling.repetition_penalty != 1.0;
+
+    std::ostringstream line;
+    line << std::fixed << std::setprecision(3)
+         << "request_metrics"
+         << " id=" << id
+         << " endpoint=" << (chat ? "chat" : "completion")
+         << " stream=" << (stream ? 1 : 0)
+         << " prompt_tokens=" << prompt_tokens
+         << " completion_tokens=" << result.completion_tokens
+         << " max_tokens=" << sampling.max_tokens
+         << " ttft_ms=" << values.ttft_ms
+         << " prefill_ms=" << values.prefill_ms
+         << " prefill_tps=" << values.prefill_tps
+         << " decode_ms=" << values.decode_ms
+         << " decode_tps=" << values.decode_tps
+         << " generation_ms=" << values.generation_ms
+         << " generation_tps=" << values.generation_tps
+         << " temperature=" << sampling.temperature
+         << " top_k=" << sampling.top_k
+         << " top_p=" << sampling.top_p
+         << " presence_penalty=" << sampling.presence_penalty
+         << " frequency_penalty=" << sampling.frequency_penalty
+         << " repetition_penalty=" << sampling.repetition_penalty
+         << " penalties=" << (penalties ? 1 : 0)
+         << " finish_reason=" << result.finish_reason
+         << " client_connected=" << (result.client_connected ? 1 : 0);
+    static std::mutex log_mutex;
+    std::lock_guard<std::mutex> lock(log_mutex);
+    std::cout << line.str() << std::endl;
+}
+
+class ServerMetrics {
+public:
+    ServerMetrics()
+        : started_steady_(std::chrono::steady_clock::now()),
+          started_unix_(unix_time_seconds()) {}
+
+    void begin() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++total_requests_;
+        ++active_requests_;
+    }
+
+    void complete(
+            const std::string & id, bool chat, bool stream,
+            size_t prompt_tokens, const CompletionResult & result,
+            const RequestMetricValues & values) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (active_requests_ > 0) --active_requests_;
+        total_prompt_tokens_ += prompt_tokens;
+        total_completion_tokens_ +=
+            static_cast<uint64_t>(std::max<int32_t>(result.completion_tokens, 0));
+        last_request_ = {
+            {"id", id},
+            {"endpoint", chat ? "chat" : "completion"},
+            {"stream", stream},
+            {"prompt_tokens", prompt_tokens},
+            {"completion_tokens", result.completion_tokens},
+            {"ttft_ms", values.ttft_ms},
+            {"prefill_ms", values.prefill_ms},
+            {"prefill_tps", values.prefill_tps},
+            {"decode_ms", values.decode_ms},
+            {"decode_tps", values.decode_tps},
+            {"generation_ms", values.generation_ms},
+            {"generation_tps", values.generation_tps},
+            {"finish_reason", result.finish_reason},
+            {"client_connected", result.client_connected},
+            {"completed_at", unix_time_seconds()},
+        };
+    }
+
+    void fail() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (active_requests_ > 0) --active_requests_;
+        ++failed_requests_;
+    }
+
+    json snapshot(const MfqServerConfig & config) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const double uptime_seconds =
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started_steady_).count();
+        return {
+            {"status", "ok"},
+            {"model", config.model_name},
+            {"model_type", config.model_type},
+            {"max_context", config.max_context},
+            {"vocab_size", config.vocab_size},
+            {"started_at", started_unix_},
+            {"uptime_seconds", uptime_seconds},
+            {"active_requests", active_requests_},
+            {"total_requests", total_requests_},
+            {"failed_requests", failed_requests_},
+            {"total_prompt_tokens", total_prompt_tokens_},
+            {"total_completion_tokens", total_completion_tokens_},
+            {"last_request", last_request_},
+        };
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::chrono::steady_clock::time_point started_steady_;
+    int64_t started_unix_ = 0;
+    uint64_t active_requests_ = 0;
+    uint64_t total_requests_ = 0;
+    uint64_t failed_requests_ = 0;
+    uint64_t total_prompt_tokens_ = 0;
+    uint64_t total_completion_tokens_ = 0;
+    json last_request_ = nullptr;
+};
+
+class ActiveRequest {
+public:
+    explicit ActiveRequest(ServerMetrics & metrics)
+        : metrics_(metrics) {
+        metrics_.begin();
+    }
+
+    ~ActiveRequest() {
+        if (!completed_) metrics_.fail();
+    }
+
+    void complete(
+            const std::string & id, bool chat, bool stream,
+            size_t prompt_tokens, const CompletionResult & result,
+            const RequestMetricValues & values) {
+        metrics_.complete(
+            id, chat, stream, prompt_tokens, result, values);
+        completed_ = true;
+    }
+
+private:
+    ServerMetrics & metrics_;
+    bool completed_ = false;
+};
+
+static CompletionResult generate_text(const RequestWork & work, const LlamaTokenizer & tokenizer,
+                                      const MfqGenerateFn & generate,
+                                      const std::function<bool(const common_chat_msg_diff &)> & emit,
+                                      RequestMetrics * metrics) {
+    CompletionResult result;
+    auto emit_parsed = [&](const common_chat_msg_diff & diff) {
+        result.client_connected = emit(diff);
+        return result.client_connected;
+    };
+    std::unique_ptr<ChatOutputParser> chat_parser;
+    if (work.chat) {
+        chat_parser = std::make_unique<ChatOutputParser>(
+            work.chat_parser, emit_parsed);
+    }
+    TextEmitter emitter(work.stops, [&](const std::string & text) {
+        if (chat_parser) {
+            return chat_parser->append(text);
+        }
+        result.text += text;
+        common_chat_msg_diff diff;
+        diff.content_delta = text;
+        return emit_parsed(diff);
+    });
+
+    result.completion_tokens = generate(
+        work.prompt, work.sampling,
+        [&](int64_t token) {
+            if (metrics != nullptr) metrics->mark_token();
+            if (tokenizer.is_eog(token)) {
+                result.finish_reason = "stop";
+                return false;
+            }
+            const bool preserve =
+                work.preserved_tokens.find(token) !=
+                work.preserved_tokens.end();
+            if (!emitter.append(tokenizer.piece(token, preserve))) {
+                if (emitter.stopped()) result.finish_reason = "stop";
+                return false;
+            }
+            return true;
+        },
+        [&](size_t prompt_tokens, double prefill_ms) {
+            if (metrics != nullptr) {
+                metrics->mark_prefill(prompt_tokens, prefill_ms);
+            }
+        });
+    if (result.client_connected && !emitter.stopped()) emitter.flush();
+    if (result.client_connected && chat_parser) {
+        chat_parser->flush();
+        const auto & message = chat_parser->message();
+        result.text = message.content;
+        result.reasoning_text = message.reasoning_content;
+        result.tool_calls = message.tool_calls;
+    }
+    if (emitter.stopped()) result.finish_reason = "stop";
+    if (!result.tool_calls.empty()) result.finish_reason = "tool_calls";
+    return result;
+}
+
+static json usage_json(size_t prompt_tokens, int32_t completion_tokens) {
+    return {
+        {"prompt_tokens", prompt_tokens},
+        {"completion_tokens", completion_tokens},
+        {"total_tokens", prompt_tokens + static_cast<size_t>(completion_tokens)},
+    };
+}
+
+static json chat_chunk(const std::string & id, int64_t created, const std::string & model,
+                       json delta, json finish_reason, json usage = nullptr) {
+    json out = {
+        {"id", id},
+        {"object", "chat.completion.chunk"},
+        {"created", created},
+        {"model", model},
+        {"choices", json::array({{
+            {"index", 0},
+            {"delta", std::move(delta)},
+            {"logprobs", nullptr},
+            {"finish_reason", std::move(finish_reason)},
+        }})},
+    };
+    if (!usage.is_null()) out["usage"] = std::move(usage);
+    return out;
+}
+
+static json completion_chunk(const std::string & id, int64_t created, const std::string & model,
+                             const std::string & text, json finish_reason, json usage = nullptr) {
+    json out = {
+        {"id", id},
+        {"object", "text_completion"},
+        {"created", created},
+        {"model", model},
+        {"choices", json::array({{
+            {"index", 0},
+            {"text", text},
+            {"logprobs", nullptr},
+            {"finish_reason", std::move(finish_reason)},
+        }})},
+    };
+    if (!usage.is_null()) out["usage"] = std::move(usage);
+    return out;
+}
+
+static json chat_diff_json(const common_chat_msg_diff & diff) {
+    json delta = json::object();
+    if (!diff.reasoning_content_delta.empty()) {
+        delta["reasoning_content"] = diff.reasoning_content_delta;
+    }
+    if (!diff.content_delta.empty()) {
+        delta["content"] = diff.content_delta;
+    }
+    if (diff.tool_call_index != std::string::npos) {
+        json tool_call = {{"index", diff.tool_call_index}};
+        if (!diff.tool_call_delta.id.empty()) {
+            tool_call["id"] = diff.tool_call_delta.id;
+            tool_call["type"] = "function";
+        }
+        if (!diff.tool_call_delta.name.empty() ||
+            !diff.tool_call_delta.arguments.empty()) {
+            json function = json::object();
+            if (!diff.tool_call_delta.name.empty()) {
+                function["name"] = diff.tool_call_delta.name;
+            }
+            if (!diff.tool_call_delta.arguments.empty()) {
+                function["arguments"] =
+                    diff.tool_call_delta.arguments;
+            }
+            tool_call["function"] = std::move(function);
+        }
+        delta["tool_calls"] =
+            json::array({std::move(tool_call)});
+    }
+    return delta;
+}
+
+static json chat_tool_calls_json(
+        const std::vector<common_chat_tool_call> & tool_calls) {
+    json out = json::array();
+    for (const auto & tool_call : tool_calls) {
+        out.push_back({
+            {"id", tool_call.id},
+            {"type", "function"},
+            {"function", {
+                {"name", tool_call.name},
+                {"arguments", tool_call.arguments},
+            }},
+        });
+    }
+    return out;
+}
+
+static json stream_usage_chunk(const std::string & id, int64_t created, const std::string & model,
+                               bool chat, json usage) {
+    return {
+        {"id", id},
+        {"object", chat ? "chat.completion.chunk" : "text_completion"},
+        {"created", created},
+        {"model", model},
+        {"choices", json::array()},
+        {"usage", std::move(usage)},
+    };
+}
+
+static bool write_sse(httplib::DataSink & sink, const json & value) {
+    const std::string event = "data: " + value.dump() + "\n\n";
+    return sink.write(event.data(), event.size());
+}
+
+static bool authorized(const httplib::Request & req, httplib::Response & res, const std::string & api_key) {
+    if (api_key.empty()) return true;
+    const std::string expected = "Bearer " + api_key;
+    if (req.get_header_value("Authorization") == expected) return true;
+    res.set_header("WWW-Authenticate", "Bearer");
+    set_json(res, error_body("invalid API key", "authentication_error"), 401);
+    return false;
+}
+
+static json parse_body(const httplib::Request & req) {
+    try {
+        return json::parse(req.body);
+    } catch (const json::parse_error & error) {
+        throw ApiError(400, "invalid_request_error", std::string("invalid JSON: ") + error.what());
+    }
+}
+
+static void handle_api_error(httplib::Response & res, const ApiError & error) {
+    set_json(res, error_body(error.what(), error.type, error.param), error.status);
+}
+
+} // namespace
+
+MfqTokenizerProbe probe_mfq_tokenizer(
+        const std::vector<uint8_t> & tokenizer_gguf,
+        const std::string & text) {
+    LlamaTokenizer tokenizer(tokenizer_gguf);
+    return {
+        tokenizer.vocab_size(),
+        tokenizer.bos_token(),
+        tokenizer.eos_token(),
+        tokenizer.eot_token(),
+        tokenizer.pad_token(),
+        tokenizer.chat_template(),
+        tokenizer.tokenize(text, true),
+    };
+}
+
+MfqTokenizerProbe probe_mfq_tokenizer(
+        const std::string & tokenizer_model,
+        const std::string & text) {
+    LlamaTokenizer tokenizer(tokenizer_model);
+    return {
+        tokenizer.vocab_size(),
+        tokenizer.bos_token(),
+        tokenizer.eos_token(),
+        tokenizer.eot_token(),
+        tokenizer.pad_token(),
+        tokenizer.chat_template(),
+        tokenizer.tokenize(text, true),
+    };
+}
+
+int run_mfq_server(const MfqServerConfig & config, const MfqGenerateFn & generate) {
+    if (config.tokenizer_gguf.empty() &&
+        config.tokenizer_model.empty()) {
+        throw std::runtime_error(
+            "MFQ server requires an embedded or external tokenizer GGUF");
+    }
+    if (!config.tokenizer_gguf.empty() &&
+        !config.tokenizer_model.empty()) {
+        throw std::runtime_error(
+            "MFQ server tokenizer source is ambiguous");
+    }
+    if (config.port < 1 || config.port > 65535) throw std::runtime_error("server port must be in [1, 65535]");
+
+    std::unique_ptr<LlamaTokenizer> tokenizer =
+        config.tokenizer_gguf.empty()
+        ? std::make_unique<LlamaTokenizer>(
+              config.tokenizer_model)
+        : std::make_unique<LlamaTokenizer>(
+              config.tokenizer_gguf);
+    if (config.vocab_size > 0 && tokenizer->vocab_size() != config.vocab_size) {
+        throw std::runtime_error("tokenizer/model vocabulary mismatch: tokenizer=" +
+                                 std::to_string(tokenizer->vocab_size()) + " model=" +
+                                 std::to_string(config.vocab_size));
+    }
+    if (tokenizer->chat_template().empty()) {
+        throw std::runtime_error(
+            "MFQ server requires tokenizer.chat_template");
+    }
+    common_chat_templates_ptr chat_templates =
+        common_chat_templates_init(tokenizer->model(), "");
+    if (!chat_templates) {
+        throw std::runtime_error(
+            "cannot initialize tokenizer.chat_template");
+    }
+
+    httplib::Server server;
+    ServerMetrics server_metrics;
+    server.set_payload_max_length(16 * 1024 * 1024);
+    server.set_read_timeout(300, 0);
+    server.set_write_timeout(300, 0);
+    server.set_keep_alive_max_count(100);
+    server.set_default_headers({
+        {"Access-Control-Allow-Origin", "*"},
+        {"Access-Control-Allow-Headers", "Authorization, Content-Type"},
+        {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"},
+        {"X-Content-Type-Options", "nosniff"},
+    });
+
+    server.Options(R"(.*)", [](const httplib::Request &, httplib::Response & res) {
+        res.status = 204;
+    });
+
+    bool web_ui_available = false;
+    if (!config.web_root.empty()) {
+        std::error_code error;
+        const auto web_root = std::filesystem::absolute(
+            std::filesystem::path(config.web_root), error);
+        if (!error &&
+            std::filesystem::is_regular_file(web_root / "index.html", error)) {
+            web_ui_available = server.set_mount_point(
+                "/admin", web_root.string(), {
+                    {"Cache-Control", "no-cache"},
+                    {"Referrer-Policy", "no-referrer"},
+                    {"X-Frame-Options", "DENY"},
+                });
+        }
+        if (!web_ui_available) {
+            std::cerr << "MFQ web UI disabled: cannot read "
+                      << config.web_root << "/index.html" << std::endl;
+        }
+    }
+
+    server.Get("/admin", [web_ui_available](
+            const httplib::Request &, httplib::Response & res) {
+        if (web_ui_available) {
+            res.set_redirect("/admin/");
+        } else {
+            set_json(res, error_body(
+                "MFQ web UI assets are unavailable", "not_found"), 404);
+        }
+    });
+
+    server.Get("/", [&](const httplib::Request & req, httplib::Response & res) {
+        if (!authorized(req, res, config.api_key)) return;
+        if (web_ui_available &&
+            req.get_header_value("Accept").find("text/html") !=
+                std::string::npos) {
+            res.set_redirect("/admin/");
+            return;
+        }
+        set_json(res, {
+            {"name", "MFQ C++ inference server"},
+            {"model", config.model_name},
+            {"endpoints", {
+                "/v1/chat/completions", "/v1/completions", "/v1/models",
+                "/health", "/api/status", "/admin/",
+            }},
+        });
+    });
+
+    server.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
+        set_json(res, {{"status", "ok"}, {"model", config.model_name}});
+    });
+
+    server.Get("/api/status", [&](const httplib::Request & req, httplib::Response & res) {
+        if (!authorized(req, res, config.api_key)) return;
+        set_json(res, server_metrics.snapshot(config));
+    });
+
+    server.Get("/v1/models", [&](const httplib::Request & req, httplib::Response & res) {
+        if (!authorized(req, res, config.api_key)) return;
+        set_json(res, {
+            {"object", "list"},
+            {"data", json::array({{
+                {"id", config.model_name},
+                {"object", "model"},
+                {"created", 0},
+                {"owned_by", "mfq"},
+            }})},
+        });
+    });
+
+    auto completion_handler = [&](bool chat, const httplib::Request & req, httplib::Response & res) {
+        if (!authorized(req, res, config.api_key)) return;
+        try {
+            const json body = parse_body(req);
+            RequestWork work = parse_work(
+                body, chat, *tokenizer, chat_templates.get(), config);
+            const std::string id = request_id(chat ? "chatcmpl-" : "cmpl-");
+            const int64_t created = unix_time_seconds();
+
+            if (!work.stream) {
+                ActiveRequest active_request(server_metrics);
+                RequestMetrics metrics;
+                CompletionResult result = generate_text(
+                    work, *tokenizer, generate,
+                    [](const common_chat_msg_diff &) {
+                        return true;
+                    },
+                    &metrics);
+                const RequestMetricValues metric_values =
+                    request_metric_values(result, metrics);
+                log_request_metrics(
+                    id, chat, false, work.prompt.size(), work.sampling,
+                    result, metric_values);
+                active_request.complete(
+                    id, chat, false, work.prompt.size(), result, metric_values);
+                json response;
+                if (chat) {
+                    json message = {{"role", "assistant"}, {"content", result.text}};
+                    if (!result.reasoning_text.empty()) {
+                        message["reasoning_content"] = result.reasoning_text;
+                    }
+                    if (!result.tool_calls.empty()) {
+                        message["tool_calls"] =
+                            chat_tool_calls_json(result.tool_calls);
+                    }
+                    response = {
+                        {"id", id},
+                        {"object", "chat.completion"},
+                        {"created", created},
+                        {"model", config.model_name},
+                        {"choices", json::array({{
+                            {"index", 0},
+                            {"message", std::move(message)},
+                            {"logprobs", nullptr},
+                            {"finish_reason", result.finish_reason},
+                        }})},
+                        {"usage", usage_json(work.prompt.size(), result.completion_tokens)},
+                    };
+                } else {
+                    response = completion_chunk(id, created, config.model_name, result.text,
+                                                result.finish_reason,
+                                                usage_json(work.prompt.size(), result.completion_tokens));
+                }
+                set_json(res, response);
+                return;
+            }
+
+            res.set_header("Cache-Control", "no-cache");
+            res.set_header("X-Accel-Buffering", "no");
+            res.set_chunked_content_provider(
+                "text/event-stream; charset=utf-8",
+                [work = std::move(work), id, created, &tokenizer, &generate,
+                 &config, &server_metrics, chat]
+                (size_t offset, httplib::DataSink & sink) mutable -> bool {
+                    if (offset != 0) {
+                        sink.done();
+                        return false;
+                    }
+                    try {
+                        ActiveRequest active_request(server_metrics);
+                        if (chat && !write_sse(sink, chat_chunk(id, created, config.model_name,
+                                                                {{"role", "assistant"}, {"content", ""}}, nullptr))) {
+                            return false;
+                        }
+                        RequestMetrics metrics;
+                        CompletionResult result = generate_text(
+                            work, *tokenizer, generate,
+                            [&](const common_chat_msg_diff & diff) {
+                                if (!chat) {
+                                    if (diff.content_delta.empty()) {
+                                        return true;
+                                    }
+                                    return write_sse(
+                                        sink, completion_chunk(
+                                            id, created, config.model_name,
+                                            diff.content_delta, nullptr));
+                                }
+                                json delta = chat_diff_json(diff);
+                                return delta.empty() ||
+                                    write_sse(
+                                        sink, chat_chunk(
+                                            id, created, config.model_name,
+                                            std::move(delta), nullptr));
+                        }, &metrics);
+                        const RequestMetricValues metric_values =
+                            request_metric_values(result, metrics);
+                        log_request_metrics(
+                            id, chat, true, work.prompt.size(), work.sampling,
+                            result, metric_values);
+                        active_request.complete(
+                            id, chat, true, work.prompt.size(), result,
+                            metric_values);
+                        if (!result.client_connected) return false;
+                        const json final_chunk = chat
+                            ? chat_chunk(id, created, config.model_name, json::object(), result.finish_reason)
+                            : completion_chunk(id, created, config.model_name, "", result.finish_reason);
+                        if (!write_sse(sink, final_chunk)) return false;
+                        if (work.include_usage) {
+                            const json usage = usage_json(work.prompt.size(), result.completion_tokens);
+                            const json usage_chunk = stream_usage_chunk(
+                                id, created, config.model_name, chat, usage);
+                            if (!write_sse(sink, usage_chunk)) return false;
+                        }
+                        static constexpr char done[] = "data: [DONE]\n\n";
+                        if (!sink.write(done, sizeof(done) - 1)) return false;
+                    } catch (const std::exception & error) {
+                        write_sse(sink, error_body(error.what(), "server_error"));
+                    }
+                    sink.done();
+                    return false;
+                });
+        } catch (const ApiError & error) {
+            handle_api_error(res, error);
+        } catch (const std::exception & error) {
+            set_json(res, error_body(error.what(), "server_error"), 500);
+        }
+    };
+
+    server.Post("/v1/chat/completions", [&](const httplib::Request & req, httplib::Response & res) {
+        completion_handler(true, req, res);
+    });
+    server.Post("/v1/completions", [&](const httplib::Request & req, httplib::Response & res) {
+        completion_handler(false, req, res);
+    });
+
+    server.set_exception_handler([](const httplib::Request &, httplib::Response & res, std::exception_ptr ep) {
+        std::string message = "unhandled server exception";
+        try {
+            if (ep) std::rethrow_exception(ep);
+        } catch (const std::exception & error) {
+            message = error.what();
+        }
+        set_json(res, error_body(message, "server_error"), 500);
+    });
+
+    if (!server.bind_to_port(config.host, config.port)) {
+        throw std::runtime_error("failed to bind " + config.host + ":" + std::to_string(config.port));
+    }
+    std::cout << "MFQ server ready: http://" << config.host << ":" << config.port
+              << " model=" << config.model_name
+              << " context=" << config.max_context
+              << " vocab=" << tokenizer->vocab_size() << std::endl;
+    if (!server.listen_after_bind()) {
+        throw std::runtime_error("server stopped after binding " + config.host + ":" + std::to_string(config.port));
+    }
+    return 0;
+}

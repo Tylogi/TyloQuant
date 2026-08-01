@@ -1,0 +1,129 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="620" viewBox="0 0 960 620" role="img" aria-labelledby="title desc">
+  <title id="title">Qwen3.5-9B disk size versus raw Mean KLD</title>
+  <desc id="desc">MFQ and Unsloth Dynamic quantization results on WikiText-2. Lower and farther left is better.</desc>
+  <defs>
+    <style>
+      .title { font: 700 24px Inter, "Segoe UI", Arial, sans-serif; fill: #172033; }
+      .subtitle { font: 13px Inter, "Segoe UI", Arial, sans-serif; fill: #687386; }
+      .axis { font: 13px Inter, "Segoe UI", Arial, sans-serif; fill: #536074; }
+      .tick { font: 12px Inter, "Segoe UI", Arial, sans-serif; fill: #687386; }
+      .label { font: 600 11.5px Inter, "Segoe UI", Arial, sans-serif; paint-order: stroke; stroke: #fff; stroke-width: 3px; stroke-linejoin: round; }
+      .legend { font: 600 12px Inter, "Segoe UI", Arial, sans-serif; fill: #38465a; }
+      .grid { stroke: #dce2ea; stroke-width: 1; }
+      .pair { stroke: #b8c1ce; stroke-width: 1.5; stroke-dasharray: 4 4; }
+      .ud-line { fill: none; stroke: #e07a2e; stroke-width: 2.2; opacity: .82; }
+      .mfq-line { fill: none; stroke: #2477d4; stroke-width: 2.6; opacity: .9; }
+      .ud-point { fill: #fff; stroke: #e07a2e; stroke-width: 2.6; }
+      .mfq-point { fill: #2477d4; stroke: #fff; stroke-width: 1.4; }
+      .ud-text { fill: #b55a18; }
+      .mfq-text { fill: #155ca9; }
+    </style>
+  </defs>
+
+  <rect width="960" height="620" rx="16" fill="#fff"/>
+  <text class="title" x="105" y="34">Qwen3.5-9B: Disk Size vs. Raw Mean KLD</text>
+  <text class="subtitle" x="105" y="55">WikiText-2 · 145 chunks · 148,335 scored tokens · lower-left is better</text>
+
+  <!-- Horizontal logarithmic grid -->
+  <g>
+    <line class="grid" x1="105" y1="70" x2="905" y2="70"/>
+    <line class="grid" x1="105" y1="142" x2="905" y2="142"/>
+    <line class="grid" x1="105" y1="214" x2="905" y2="214"/>
+    <line class="grid" x1="105" y1="309" x2="905" y2="309"/>
+    <line class="grid" x1="105" y1="381" x2="905" y2="381"/>
+    <line class="grid" x1="105" y1="453" x2="905" y2="453"/>
+    <line class="grid" x1="105" y1="525" x2="905" y2="525"/>
+  </g>
+
+  <!-- Vertical grid -->
+  <g>
+    <line class="grid" x1="120" y1="70" x2="120" y2="525"/>
+    <line class="grid" x1="271" y1="70" x2="271" y2="525"/>
+    <line class="grid" x1="422" y1="70" x2="422" y2="525"/>
+    <line class="grid" x1="573" y1="70" x2="573" y2="525"/>
+    <line class="grid" x1="724" y1="70" x2="724" y2="525"/>
+    <line class="grid" x1="875" y1="70" x2="875" y2="525"/>
+  </g>
+
+  <!-- Matched recipes -->
+  <g>
+    <line class="pair" x1="181.2" y1="91.2" x2="160.3" y2="101.8"/>
+    <line class="pair" x1="159.3" y1="132.6" x2="142.1" y2="138.7"/>
+    <line class="pair" x1="302.1" y1="204.7" x2="287.1" y2="219.2"/>
+    <line class="pair" x1="437.0" y1="297.1" x2="420.9" y2="318.2"/>
+    <line class="pair" x1="548.6" y1="354.5" x2="530.1" y2="386.7"/>
+    <line class="pair" x1="867.5" y1="447.4" x2="841.9" y2="516.5"/>
+  </g>
+
+  <!-- Trend lines -->
+  <polyline class="ud-line" points="181.2,91.2 159.3,132.6 302.1,204.7 437.0,297.1 548.6,354.5 867.5,447.4"/>
+  <polyline class="mfq-line" points="160.3,101.8 142.1,138.7 287.1,219.2 420.9,318.2 530.1,386.7 841.9,516.5"/>
+
+  <!-- UD points -->
+  <g>
+    <circle class="ud-point" cx="181.2" cy="91.2" r="5.5"/>
+    <circle class="ud-point" cx="159.3" cy="132.6" r="5.5"/>
+    <circle class="ud-point" cx="302.1" cy="204.7" r="5.5"/>
+    <circle class="ud-point" cx="437.0" cy="297.1" r="5.5"/>
+    <circle class="ud-point" cx="548.6" cy="354.5" r="5.5"/>
+    <circle class="ud-point" cx="867.5" cy="447.4" r="5.5"/>
+  </g>
+
+  <!-- MFQ points -->
+  <g>
+    <path class="mfq-point" d="M160.3 94.8l7 7-7 7-7-7z"/>
+    <path class="mfq-point" d="M142.1 131.7l7 7-7 7-7-7z"/>
+    <path class="mfq-point" d="M287.1 212.2l7 7-7 7-7-7z"/>
+    <path class="mfq-point" d="M420.9 311.2l7 7-7 7-7-7z"/>
+    <path class="mfq-point" d="M530.1 379.7l7 7-7 7-7-7z"/>
+    <path class="mfq-point" d="M841.9 509.5l7 7-7 7-7-7z"/>
+  </g>
+
+  <!-- Direct labels -->
+  <g>
+    <text class="label ud-text" x="190" y="87">UD-Q2_K_XL · 0.1631</text>
+    <text class="label mfq-text" x="170" y="112">S2-L · 0.1472</text>
+    <text class="label ud-text" x="168" y="129">UD-IQ3_XXS · 0.1094</text>
+    <text class="label mfq-text" x="130" y="157" text-anchor="end">V3-XXS · 0.1032</text>
+    <text class="label ud-text" x="310" y="198">UD-Q3_K_XL · 0.05467</text>
+    <text class="label mfq-text" x="296" y="235">S3-L · 0.04754</text>
+    <text class="label ud-text" x="445" y="290">UD-Q4_K_XL · 0.02246</text>
+    <text class="label mfq-text" x="430" y="335">S4-L · 0.01833</text>
+    <text class="label ud-text" x="557" y="347">UD-Q5_K_XL · 0.01292</text>
+    <text class="label mfq-text" x="539" y="403">S5-L · 0.00947</text>
+    <text class="label ud-text" x="859" y="437" text-anchor="end">UD-Q6_K_XL · 0.00528</text>
+    <text class="label mfq-text" x="833" y="507" text-anchor="end">S6-L · 0.00272</text>
+  </g>
+
+  <!-- Y ticks -->
+  <g class="tick" text-anchor="end">
+    <text x="94" y="74">0.20</text>
+    <text x="94" y="146">0.10</text>
+    <text x="94" y="218">0.05</text>
+    <text x="94" y="313">0.02</text>
+    <text x="94" y="385">0.01</text>
+    <text x="94" y="457">0.005</text>
+    <text x="94" y="529">0.0025</text>
+  </g>
+
+  <!-- X ticks -->
+  <g class="tick" text-anchor="middle">
+    <text x="120" y="548">4</text>
+    <text x="271" y="548">5</text>
+    <text x="422" y="548">6</text>
+    <text x="573" y="548">7</text>
+    <text x="724" y="548">8</text>
+    <text x="875" y="548">9</text>
+  </g>
+
+  <text class="axis" x="505" y="582" text-anchor="middle">Disk size (GB)</text>
+  <text class="axis" x="30" y="298" text-anchor="middle" transform="rotate(-90 30 298)">Raw Mean KLD (log scale)</text>
+
+  <!-- Legend -->
+  <g transform="translate(665 22)">
+    <circle class="ud-point" cx="0" cy="0" r="5"/>
+    <text class="legend" x="11" y="4">Unsloth Dynamic</text>
+    <path class="mfq-point" d="M135 -6l6 6-6 6-6-6z"/>
+    <text class="legend" x="147" y="4">MFQ</text>
+  </g>
+</svg>

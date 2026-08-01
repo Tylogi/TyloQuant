@@ -1,0 +1,113 @@
+#pragma once
+
+#include "mfq_container.h"
+#include "mlx_cccp.h"
+#include "mlx_grouped_linear.h"
+#include "mlx_nint.h"
+#include "mlx_nint8_zero.h"
+#include "mlx_vq.h"
+
+#include <optional>
+#include <string>
+#include <variant>
+#include <vector>
+
+#include <mlx/mlx.h>
+
+namespace mfq::metal {
+
+mlx::core::array load_dense_array(
+    const std::string& dtype,
+    const std::vector<std::uint8_t>& blob);
+
+class MlxLinear {
+public:
+    static MlxLinear load(
+        const MfqContainer& model,
+        const std::string& name);
+
+    explicit MlxLinear(MlxNintWeight weight);
+    explicit MlxLinear(MlxNint8ZeroWeight weight);
+    explicit MlxLinear(MlxVqWeight weight);
+    explicit MlxLinear(MlxCccpInt4Weight weight);
+    explicit MlxLinear(MlxCccpPqWeight weight);
+    explicit MlxLinear(mlx::core::array weight);
+
+    mlx::core::array operator()(const mlx::core::array& input) const;
+
+    // DeepSeek-V4 O-LoRA layout:
+    // input [...,groups,K] -> [...,groups,OUT/groups].
+    // CCCP-I4G64 uses its dedicated Metal kernel; every other supported
+    // linear format takes the exact packed/dense fallback without changing
+    // model semantics.
+    mlx::core::array grouped_row_matmul(
+        const mlx::core::array& input,
+        int group_count) const;
+
+    int input_size() const noexcept {
+        return input_size_;
+    }
+    int output_size() const noexcept {
+        return output_size_;
+    }
+    bool packed() const noexcept {
+        return !std::holds_alternative<mlx::core::array>(weight_);
+    }
+    std::optional<MlxGroupedLinearWeightRef>
+    grouped_weight_ref() const noexcept;
+    const MlxNintWeight* nint_weight_ref() const noexcept;
+    const mlx::core::array* dense_weight_ref() const noexcept;
+
+private:
+    std::variant<
+        MlxNintWeight,
+        MlxNint8ZeroWeight,
+        MlxVqWeight,
+        MlxCccpInt4Weight,
+        MlxCccpPqWeight,
+        mlx::core::array> weight_;
+    int input_size_ = 0;
+    int output_size_ = 0;
+};
+
+class MlxEmbedding {
+public:
+    static MlxEmbedding load(
+        const MfqContainer& model,
+        const std::string& name);
+
+    explicit MlxEmbedding(MlxNintWeight weight);
+    explicit MlxEmbedding(MlxNint8ZeroWeight weight);
+    explicit MlxEmbedding(MlxVqWeight weight);
+    explicit MlxEmbedding(MlxCccpInt4Weight weight);
+    explicit MlxEmbedding(mlx::core::array weight);
+
+    mlx::core::array operator()(
+        const mlx::core::array& token_ids,
+        mlx::core::Dtype dtype = mlx::core::float16) const;
+
+    // Apply the embedding table as an LM-head projection. This executes
+    // directly against this embedding's dense or packed storage, so tied
+    // embeddings do not require a second weight object or dequantized copy.
+    mlx::core::array project(
+        const mlx::core::array& input) const;
+
+    int vocabulary_size() const noexcept {
+        return vocabulary_size_;
+    }
+    int hidden_size() const noexcept {
+        return hidden_size_;
+    }
+
+private:
+    std::variant<
+        MlxNintWeight,
+        MlxNint8ZeroWeight,
+        MlxVqWeight,
+        MlxCccpInt4Weight,
+        mlx::core::array> weight_;
+    int vocabulary_size_ = 0;
+    int hidden_size_ = 0;
+};
+
+} // namespace mfq::metal

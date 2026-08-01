@@ -1,0 +1,75 @@
+# ---- 外部参考仓库（仅本地查阅，不入库）----
+references/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+develop-eggs/
+pip-wheel-metadata/
+wheels/
+MANIFEST
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- 测试 / 类型 / 覆盖率 ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# ---- 编辑器 / IDE ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 构建产物（C++/CUDA/Metal 扩展）----
+*.obj
+*.o
+*.a
+*.lib
+*.dll
+*.dylib
+*.so
+*.metallib
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# ---- 日志 / 临时 ----
+*.log
+tmp/
+runs/
+.remote_modelscope_parallel_download.sh
+.transfer_*
+
+# ---- 模型、校准数据与实验工件 ----
+data/
+*.gguf
+*.mfq
+*.safetensors
+*.logits
+*.sqlite
+*.pt
+*.pth

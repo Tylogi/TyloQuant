@@ -1,0 +1,363 @@
+#include "mlx_deepseek_v4_hc.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include <mlx/mlx.h>
+
+namespace {
+
+constexpr int kBatch = 1;
+constexpr int kTokens = 2;
+constexpr int kConnections = 4;
+constexpr int kHidden = 4096;
+constexpr int kMixWidth = 24;
+constexpr float kEps = 1e-6f;
+
+void require(bool condition, const std::string& message) {
+    if (!condition) {
+        throw std::runtime_error(message);
+    }
+}
+
+float sigmoid(float value) {
+    return 1.0f / (1.0f + std::exp(-value));
+}
+
+std::vector<float> evaluated_float(mlx::core::array value) {
+    if (value.dtype() != mlx::core::float32) {
+        value = mlx::core::astype(
+            value,
+            mlx::core::float32);
+    }
+    value.eval();
+    return {
+        value.data<float>(),
+        value.data<float>() + value.size(),
+    };
+}
+
+void require_close(
+    const std::vector<float>& actual,
+    const std::vector<float>& expected,
+    float tolerance,
+    const std::string& label) {
+    require(
+        actual.size() == expected.size(),
+        label + " size mismatch");
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+        if (std::fabs(actual[index] - expected[index]) >
+            tolerance) {
+            throw std::runtime_error(
+                label + " mismatch at " +
+                std::to_string(index) + ": actual=" +
+                std::to_string(actual[index]) +
+                " expected=" +
+                std::to_string(expected[index]));
+        }
+    }
+}
+
+std::array<float, 16> sinkhorn(
+    const float* values) {
+    std::array<float, 16> result{};
+    for (int source = 0; source < kConnections; ++source) {
+        float maximum = values[source * kConnections];
+        for (int destination = 1;
+             destination < kConnections;
+             ++destination) {
+            maximum = std::max(
+                maximum,
+                values[source * kConnections + destination]);
+        }
+        float denominator = kEps;
+        for (int destination = 0;
+             destination < kConnections;
+             ++destination) {
+            const float probability = std::exp(
+                values[source * kConnections + destination]
+                - maximum);
+            result[source * kConnections + destination] =
+                probability;
+            denominator += probability;
+        }
+        for (int destination = 0;
+             destination < kConnections;
+             ++destination) {
+            result[source * kConnections + destination] =
+                result[source * kConnections + destination]
+                    / denominator
+                + kEps;
+        }
+    }
+    for (int destination = 0;
+         destination < kConnections;
+         ++destination) {
+        float denominator = kEps;
+        for (int source = 0;
+             source < kConnections;
+             ++source) {
+            denominator +=
+                result[source * kConnections + destination];
+        }
+        for (int source = 0;
+             source < kConnections;
+             ++source) {
+            result[source * kConnections + destination] /=
+                denominator;
+        }
+    }
+    for (int iteration = 1; iteration < 20; ++iteration) {
+        for (int source = 0;
+             source < kConnections;
+             ++source) {
+            float denominator = kEps;
+            for (int destination = 0;
+                 destination < kConnections;
+                 ++destination) {
+                denominator += result[
+                    source * kConnections + destination];
+            }
+            for (int destination = 0;
+                 destination < kConnections;
+                 ++destination) {
+                result[
+                    source * kConnections + destination] /=
+                    denominator;
+            }
+        }
+        for (int destination = 0;
+             destination < kConnections;
+             ++destination) {
+            float denominator = kEps;
+            for (int source = 0;
+                 source < kConnections;
+                 ++source) {
+                denominator += result[
+                    source * kConnections + destination];
+            }
+            for (int source = 0;
+                 source < kConnections;
+                 ++source) {
+                result[
+                    source * kConnections + destination] /=
+                    denominator;
+            }
+        }
+    }
+    return result;
+}
+
+void test_hc_pre_post() {
+    constexpr int rows = kBatch * kTokens;
+    std::vector<float> residual(
+        rows * kConnections * kHidden);
+    for (std::size_t index = 0;
+         index < residual.size();
+         ++index) {
+        residual[index] =
+            static_cast<float>(
+                static_cast<int>(index % 29) - 14)
+            * 0.03125f;
+    }
+    std::vector<float> mixes(rows * kMixWidth);
+    for (std::size_t index = 0;
+         index < mixes.size();
+         ++index) {
+        mixes[index] =
+            static_cast<float>(
+                static_cast<int>((index * 7) % 31) - 15)
+            * 0.025f;
+    }
+    const std::vector<float> scale{
+        0.9f,
+        1.1f,
+        0.7f,
+    };
+    std::vector<float> base(kMixWidth);
+    for (int index = 0; index < kMixWidth; ++index) {
+        base[index] =
+            static_cast<float>((index % 9) - 4) * 0.015f;
+    }
+
+    const mlx::core::array residual_array(
+        residual.begin(),
+        mlx::core::Shape{
+            kBatch,
+            kTokens,
+            kConnections,
+            kHidden,
+        });
+    const mlx::core::array mixes_array(
+        mixes.begin(),
+        mlx::core::Shape{kBatch, kTokens, kMixWidth});
+    const mlx::core::array scale_array(
+        scale.begin(),
+        mlx::core::Shape{3});
+    const mlx::core::array base_array(
+        base.begin(),
+        mlx::core::Shape{kMixWidth});
+
+    auto actual = mfq::metal::deepseek_v4_hc_pre(
+        residual_array,
+        mixes_array,
+        scale_array,
+        base_array,
+        20,
+        kEps);
+    std::vector<float> expected_reduced(rows * kHidden);
+    std::vector<float> expected_post(rows * kConnections);
+    std::vector<float> expected_combination(
+        rows * kConnections * kConnections);
+    for (int row = 0; row < rows; ++row) {
+        std::array<float, kConnections> pre{};
+        for (int connection = 0;
+             connection < kConnections;
+             ++connection) {
+            pre[connection] = sigmoid(
+                mixes[row * kMixWidth + connection]
+                    * scale[0]
+                + base[connection]) + kEps;
+            expected_post[row * kConnections + connection] =
+                2.0f * sigmoid(
+                    mixes[
+                        row * kMixWidth
+                        + kConnections + connection]
+                        * scale[1]
+                    + base[kConnections + connection]);
+        }
+        std::array<float, 16> affine{};
+        for (int index = 0; index < 16; ++index) {
+            affine[index] =
+                mixes[row * kMixWidth + 8 + index]
+                    * scale[2]
+                + base[8 + index];
+        }
+        const auto combination = sinkhorn(affine.data());
+        std::copy(
+            combination.begin(),
+            combination.end(),
+            expected_combination.begin() + row * 16);
+        for (int feature = 0; feature < kHidden; ++feature) {
+            float value = 0.0f;
+            for (int connection = 0;
+                 connection < kConnections;
+                 ++connection) {
+                value += pre[connection] * residual[
+                    (row * kConnections + connection)
+                        * kHidden + feature];
+            }
+            expected_reduced[row * kHidden + feature] = value;
+        }
+    }
+    require_close(
+        evaluated_float(actual.reduced),
+        expected_reduced,
+        8e-4f,
+        "HC pre reduced");
+    require_close(
+        evaluated_float(actual.post),
+        expected_post,
+        2e-4f,
+        "HC pre post-gates");
+    require_close(
+        evaluated_float(actual.combination),
+        expected_combination,
+        3e-4f,
+        "HC pre Sinkhorn");
+
+    std::vector<float> branch(rows * kHidden);
+    for (std::size_t index = 0;
+         index < branch.size();
+         ++index) {
+        branch[index] =
+            static_cast<float>(
+                static_cast<int>((index * 5) % 23) - 11)
+            * 0.04f;
+    }
+    const mlx::core::array branch_array(
+        branch.begin(),
+        mlx::core::Shape{kBatch, kTokens, kHidden});
+    auto expanded = mfq::metal::deepseek_v4_hc_post(
+        branch_array,
+        residual_array,
+        actual.post,
+        actual.combination);
+    std::vector<float> expected_expanded(
+        rows * kConnections * kHidden);
+    for (int row = 0; row < rows; ++row) {
+        for (int destination = 0;
+             destination < kConnections;
+             ++destination) {
+            for (int feature = 0;
+                 feature < kHidden;
+                 ++feature) {
+                float value =
+                    expected_post[
+                        row * kConnections + destination]
+                    * branch[row * kHidden + feature];
+                for (int source = 0;
+                     source < kConnections;
+                     ++source) {
+                    value += expected_combination[
+                        (row * kConnections + source)
+                            * kConnections + destination]
+                        * residual[
+                            (row * kConnections + source)
+                                * kHidden + feature];
+                }
+                expected_expanded[
+                    (row * kConnections + destination)
+                        * kHidden + feature] = value;
+            }
+        }
+    }
+    require_close(
+        evaluated_float(std::move(expanded)),
+        expected_expanded,
+        1.5e-3f,
+        "HC post");
+}
+
+void test_invalid_shapes() {
+    bool rejected = false;
+    try {
+        (void)mfq::metal::deepseek_v4_hc_pre(
+            mlx::core::zeros(
+                {1, 1, 3, 64},
+                mlx::core::float16),
+            mlx::core::zeros(
+                {1, 1, 24},
+                mlx::core::float32),
+            mlx::core::zeros(
+                {3},
+                mlx::core::float32),
+            mlx::core::zeros(
+                {24},
+                mlx::core::float32));
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    require(rejected, "invalid HC connection count was accepted");
+}
+
+} // namespace
+
+int main() {
+    try {
+        test_hc_pre_post();
+        test_invalid_shapes();
+        std::cout
+            << "MFQ C++ DeepSeek-V4 hyper-connection "
+               "Metal tests passed\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << "\n";
+        return 1;
+    }
+}
