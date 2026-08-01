@@ -153,15 +153,25 @@ def test_quantize_rejects_gguf_without_recipe(tmp_path: Path) -> None:
         cli.main(["quantize", str(source), str(tmp_path / "model.mfq")])
 
 
-def test_quantize_rejects_hf_imatrix_until_names_are_supported(tmp_path: Path) -> None:
+def test_quantize_routes_hf_imatrix(tmp_path: Path, monkeypatch) -> None:
     source = _hf_source(tmp_path)
-    with pytest.raises(ValueError, match="requires a BF16 GGUF source"):
+    imatrix = tmp_path / "imatrix.gguf"
+    captured: list[argparse.Namespace] = []
+    monkeypatch.setattr(
+        "mfq.tools.quantize_hf_to_mfq.convert", captured.append
+    )
+
+    assert (
         cli.main(
             [
                 "quantize",
                 str(source),
                 str(tmp_path / "model.mfq"),
                 "--imatrix",
-                str(tmp_path / "imatrix.gguf"),
+                str(imatrix),
             ]
         )
+        == 0
+    )
+    assert len(captured) == 1
+    assert captured[0].imatrix == str(imatrix)

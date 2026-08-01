@@ -15,7 +15,7 @@ import shutil
 import struct
 import time
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -128,6 +128,7 @@ from mfq.quantize.expert_nint import (
     quantize_flat_cohort,
     resolve_precision_artifact,
 )
+from mfq.quantize.imatrix import ImportanceMatrix, load_importance_matrix
 from mfq.quantize.tpq import quantize_tpq_pq_fixed
 from mfq.quantize.nepq import NepqQuantConfig, quantize_nepq_fixed
 from mfq.quantize.nint_quant import quantize as nint_quantize
@@ -372,6 +373,8 @@ _NVQ_SPECS = {
     "NVQ3J-512": NVQ3_D4_512,
     "NVQ3J-L": NVQ3_D4_1024,
 }
+_IMATRIX_NINT_DTYPES = {"NINT2", "NINT3", "NINT4", "NINT5", "NINT6"}
+_IMATRIX_OPTIONAL_TENSORS = {"token_embd.weight", "output.weight"}
 _NEPQ_SPECS = {
     "NEPQ0-S": NEPQ0_S,
     "NEPQ0-L": NEPQ0_L,
@@ -470,6 +473,161 @@ def _hf_to_gguf_name(name: str) -> str | None:
         mapped = _LAYER_NAME_MAP.get(suffix)
         return f"blk.40.{mapped}" if mapped is not None else None
     return None
+
+
+ImportanceRows = Callable[[int, int], np.ndarray | None]
+ImportanceSelection = Callable[[np.ndarray], np.ndarray]
+
+
+@dataclass(frozen=True)
+class HfImatrixBinding:
+    entry_name: str
+    rows: ImportanceRows
+    selected: ImportanceSelection
+
+
+def _hf_imatrix_names(item: TensorPlan) -> tuple[str, ...]:
+    """Return canonical and compatibility names for one HF tensor plan."""
+
+    candidates: list[str] = []
+
+    def append(name: str | None) -> None:
+        if name and name not in candidates:
+            candidates.append(name)
+
+    # Prefer the tensor's own canonical name over a recipe-group anchor.  Q/K
+    # and gate/up may share one recipe precision, but an imatrix can still
+    # carry distinct entries for those projections.
+    append(_hf_to_gguf_name(item.name))
+    if item.source_name is not None and item.transform is None:
+        append(_hf_to_gguf_name(item.source_name))
+    append(item.gguf_name)
+    # Accept imatrix artifacts produced in an HF namespace as well as the
+    # canonical llama.cpp GGUF namespace.
+    append(item.name)
+    if item.source_name is not None and item.transform is None:
+        append(item.source_name)
+    return tuple(candidates)
+
+
+def _hf_imatrix_shapes(
+    item: TensorPlan,
+) -> tuple[tuple[int, ...], tuple[int, int]]:
+    original_shape = item.expert_shape or item.shape
+    if len(original_shape) < 2:
+        raise ValueError(
+            f"imatrix binding requires a matrix tensor: {item.name} {original_shape}"
+        )
+    storage_shape = (
+        int(np.prod(original_shape[:-1])),
+        int(original_shape[-1]),
+    )
+    return original_shape, storage_shape
+
+
+def _hf_plan_supports_imatrix(item: TensorPlan) -> bool:
+    if item.target_dtype in _IMATRIX_NINT_DTYPES:
+        return True
+    return bool(
+        item.target_dtype == "NINTM"
+        and item.expert_precisions is not None
+        and any(
+            precision.family in _IMATRIX_NINT_DTYPES
+            or precision.family.startswith("NVQ")
+            or precision.family.startswith("NEPQ")
+            for precision in item.expert_precisions
+        )
+    )
+
+
+def _bind_hf_imatrix(
+    imatrix: ImportanceMatrix,
+    plan: list[TensorPlan],
+) -> dict[str, HfImatrixBinding]:
+    """Bind a llama.cpp or HF-namespaced imatrix to an HF conversion plan."""
+
+    bindings: dict[str, HfImatrixBinding] = {}
+    missing: list[str] = []
+    for item in plan:
+        if not _hf_plan_supports_imatrix(item):
+            continue
+        names = _hf_imatrix_names(item)
+        original_shape, storage_shape = _hf_imatrix_shapes(item)
+        match = imatrix.for_rows(
+            names,
+            original_shape,
+            storage_shape,
+            slice(0, min(1, storage_shape[0])),
+        )
+        if match is None:
+            if not any(name in _IMATRIX_OPTIONAL_TENSORS for name in names):
+                missing.append(names[0] if names else item.name)
+            continue
+        entry_name, _ = match
+
+        def rows(
+            start: int,
+            end: int,
+            *,
+            _names=names,
+            _original_shape=original_shape,
+            _storage_shape=storage_shape,
+            _item=item,
+        ) -> np.ndarray:
+            resolved = imatrix.for_rows(
+                _names,
+                _original_shape,
+                _storage_shape,
+                slice(start, end),
+            )
+            if resolved is None:
+                raise RuntimeError(
+                    f"imatrix binding disappeared for {_item.name}"
+                )
+            return resolved[1]
+
+        def selected(
+            row_ids: np.ndarray,
+            *,
+            _names=names,
+            _original_shape=original_shape,
+            _storage_shape=storage_shape,
+            _item=item,
+        ) -> np.ndarray:
+            resolved = imatrix.for_rows(
+                _names,
+                _original_shape,
+                _storage_shape,
+                np.asarray(row_ids, dtype=np.int64),
+            )
+            if resolved is None:
+                raise RuntimeError(
+                    f"imatrix binding disappeared for {_item.name}"
+                )
+            return resolved[1]
+
+        bindings[item.name] = HfImatrixBinding(entry_name, rows, selected)
+    if missing:
+        preview = ", ".join(missing[:8])
+        suffix = "" if len(missing) <= 8 else f" ... ({len(missing)} total)"
+        raise ValueError(
+            f"imatrix is missing required HF NINT/NINTM tensors: {preview}{suffix}"
+        )
+    return bindings
+
+
+def _hf_expert_importance(
+    item: TensorPlan,
+    binding: HfImatrixBinding | None,
+) -> np.ndarray | None:
+    if binding is None:
+        return None
+    if item.expert_shape is None:
+        raise ValueError(f"NINTM plan lacks expert shape: {item.name}")
+    n_experts, rows_per_expert, _ = item.expert_shape
+    return binding.selected(
+        np.arange(n_experts, dtype=np.int64) * rows_per_expert
+    )
 
 
 def _dtype_for_recipe_type(gguf_type: str, dense_dtype: str) -> str:
@@ -2342,6 +2500,15 @@ def convert(args: argparse.Namespace) -> None:
     )
     if args.limit_tensors:
         plan = plan[: args.limit_tensors]
+    imatrix_path_arg = getattr(args, "imatrix", "")
+    imatrix = (
+        load_importance_matrix(Path(imatrix_path_arg).resolve())
+        if imatrix_path_arg
+        else None
+    )
+    imatrix_bindings = (
+        {} if imatrix is None else _bind_hf_imatrix(imatrix, plan)
+    )
     nint_est, dense_est = _estimate_bytes(plan, spec, artifact_root)
     total_src = sum(int(np.prod(p.shape)) * 2 for p in plan)
     target_counts: dict[str, int] = {}
@@ -2364,6 +2531,19 @@ def convert(args: argparse.Namespace) -> None:
                 "recipe": str(Path(recipe_gguf).resolve()) if recipe_gguf else None,
                 "calibration_scheme": (
                     str(Path(calibration_scheme_path).resolve()) if calibration_scheme_path else None
+                ),
+                "imatrix": (
+                    None
+                    if imatrix is None
+                    else {
+                        "path": str(imatrix.path),
+                        "entries": len(imatrix.entries),
+                        "bound_tensors": len(imatrix_bindings),
+                        "datasets": list(imatrix.datasets),
+                        "chunk_count": imatrix.chunk_count,
+                        "chunk_size": imatrix.chunk_size,
+                        "legacy": imatrix.legacy,
+                    }
                 ),
                 "quant_backend": quant_backend,
                 "device": args.device if quant_backend == "cuda" else "cpu",
@@ -2443,6 +2623,9 @@ def convert(args: argparse.Namespace) -> None:
                         item.expert_source_shards,
                     )
                     try:
+                        expert_importance = _hf_expert_importance(
+                            item, imatrix_bindings.get(item.name)
+                        )
                         flattened_shape = (
                             item.expert_shape[0] * item.expert_shape[1],
                             item.expert_shape[2],
@@ -2457,6 +2640,7 @@ def convert(args: argparse.Namespace) -> None:
                             quant_backend,
                             args.device,
                             artifact_root,
+                            importance=expert_importance,
                         )
                     finally:
                         source.close()
@@ -2473,6 +2657,9 @@ def convert(args: argparse.Namespace) -> None:
                             )
                         else:
                             source = raw_source
+                        expert_importance = _hf_expert_importance(
+                            item, imatrix_bindings.get(item.name)
+                        )
                         nbytes = _write_mixed_moe_axis0_blob(
                             source,
                             item.shape,
@@ -2483,6 +2670,7 @@ def convert(args: argparse.Namespace) -> None:
                             quant_backend,
                             args.device,
                             artifact_root,
+                            importance=expert_importance,
                         )
                     elif item.target_dtype.startswith("NINT"):
                         item_spec = _spec_for_plan(item, spec)
@@ -2499,6 +2687,11 @@ def convert(args: argparse.Namespace) -> None:
                             args.row_chunk,
                             quant_backend,
                             args.device,
+                            importance_rows=(
+                                None
+                                if item.name not in imatrix_bindings
+                                else imatrix_bindings[item.name].rows
+                            ),
                         )
                     else:
                         source = raw_source.tensor()
@@ -2572,6 +2765,22 @@ def convert(args: argparse.Namespace) -> None:
                 "recipe": str(Path(recipe_gguf).resolve()) if recipe_gguf else None,
                 "calibration_scheme": (
                     str(Path(calibration_scheme_path).resolve()) if calibration_scheme_path else None
+                ),
+                "imatrix": (
+                    None
+                    if imatrix is None
+                    else {
+                        "file": imatrix.path.name,
+                        "entries": len(imatrix.entries),
+                        "bindings": {
+                            name: binding.entry_name
+                            for name, binding in sorted(imatrix_bindings.items())
+                        },
+                        "datasets": list(imatrix.datasets),
+                        "chunk_count": imatrix.chunk_count,
+                        "chunk_size": imatrix.chunk_size,
+                        "legacy": imatrix.legacy,
+                    }
                 ),
                 "fused_layout": {
                     "full_attention": "qk_group,v_separate",
@@ -2653,6 +2862,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--calibration-scheme",
         default="",
         help="calibration scheme whose per-tensor NINT specs override the recipe",
+    )
+    parser.add_argument(
+        "--imatrix",
+        default="",
+        help=(
+            "optional llama.cpp GGUF or legacy importance matrix for "
+            "HF NINT/NINTM calibration"
+        ),
     )
     parser.add_argument("--dense-dtype", choices=("f16", "f32"), default="f32", help="dense dtype for non-quantized recipe tensors")
     parser.add_argument("--limit-tensors", type=int, default=0, help="debug/smoke: convert first N planned tensors")

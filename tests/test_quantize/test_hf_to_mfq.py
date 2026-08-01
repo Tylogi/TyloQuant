@@ -3,16 +3,21 @@ from __future__ import annotations
 import argparse
 import json
 
+import numpy as np
 import pytest
 import torch
 from safetensors.torch import save_file
 
+import mfq.tools.quantize_hf_to_mfq as hf_to_mfq
+from mfq.calibration.artifact import ExpertPrecision
 from mfq.formats.nint import NintSpec
 from mfq.formats.io import load_mmap
 from mfq.formats.shards import format_shard_path
 from mfq.formats.assets import is_asset_record
+from mfq.quantize.imatrix import ImportanceEntry, ImportanceMatrix
 from mfq.tools.quantize_hf_to_mfq import (
     TensorPlan,
+    _bind_hf_imatrix,
     _dtype_for_recipe_type,
     _GlmExpertRowSource,
     _hf_to_gguf_name,
@@ -170,6 +175,154 @@ def test_q3_k_recipe_maps_to_nint3():
 
 def test_q2_k_recipe_maps_to_nint2():
     assert _dtype_for_recipe_type("Q2_K", "F32") == "NINT2"
+
+
+def test_hf_imatrix_prefers_the_tensor_canonical_name_over_recipe_anchor(
+    tmp_path,
+):
+    item = TensorPlan(
+        name="model.language_model.layers.3.self_attn.k_proj.weight",
+        shard="model.safetensors",
+        shape=(2, 4),
+        source_dtype="BF16",
+        target_dtype="NINT4",
+        gguf_name="blk.3.attn_q.weight",
+    )
+    values = np.asarray([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32)
+    imatrix = ImportanceMatrix(
+        path=tmp_path / "imatrix.gguf",
+        entries={
+            "blk.3.attn_k.weight": ImportanceEntry(
+                values=values,
+                counts=np.asarray([8], dtype=np.int64),
+            )
+        },
+        datasets=("test",),
+        chunk_count=1,
+        chunk_size=4,
+        legacy=False,
+    )
+
+    binding = _bind_hf_imatrix(imatrix, [item])[item.name]
+
+    assert binding.entry_name == "blk.3.attn_k.weight"
+    np.testing.assert_array_equal(binding.rows(0, 2), values[0])
+
+
+def test_hf_imatrix_binds_expert_wise_entries(tmp_path):
+    item = TensorPlan(
+        name="model.language_model.layers.4.mlp.experts.down_proj",
+        shard="model.safetensors",
+        shape=(2, 3, 4),
+        source_dtype="BF16",
+        target_dtype="NINTM",
+        gguf_name="blk.4.ffn_down_exps.weight",
+        expert_shape=(2, 3, 4),
+        expert_precisions=(
+            ExpertPrecision("NINT4", nint_spec=NintSpec(4, 24, 6)),
+            ExpertPrecision("NINT8", nint_spec=NintSpec(8, 48, 7)),
+        ),
+    )
+    values = np.asarray(
+        [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
+        dtype=np.float32,
+    )
+    imatrix = ImportanceMatrix(
+        path=tmp_path / "imatrix.gguf",
+        entries={
+            "blk.4.ffn_down_exps.weight": ImportanceEntry(
+                values=values,
+                counts=np.asarray([8, 8], dtype=np.int64),
+            )
+        },
+        datasets=(),
+        chunk_count=1,
+        chunk_size=4,
+        legacy=False,
+    )
+
+    binding = _bind_hf_imatrix(imatrix, [item])[item.name]
+
+    np.testing.assert_array_equal(binding.rows(2, 5), values[[0, 1, 1]])
+    np.testing.assert_array_equal(
+        binding.selected(np.asarray([0, 3], dtype=np.int64)), values
+    )
+
+
+def test_hf_convert_passes_imatrix_rows_to_nint_writer(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "hf"
+    root.mkdir()
+    tensor_name = "model.language_model.layers.0.mlp.down_proj.weight"
+    save_file(
+        {
+            tensor_name: torch.linspace(
+                -2.0, 2.0, steps=4 * 24, dtype=torch.float32
+            ).reshape(4, 24)
+        },
+        root / "model.safetensors",
+    )
+    (root / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5"}), encoding="utf-8"
+    )
+    imatrix_path = tmp_path / "imatrix.gguf"
+    imatrix_path.write_bytes(b"test")
+    importance = np.linspace(0.25, 2.0, 24, dtype=np.float32).reshape(1, 24)
+    imatrix = ImportanceMatrix(
+        path=imatrix_path,
+        entries={
+            "blk.0.ffn_down.weight": ImportanceEntry(
+                values=importance,
+                counts=np.asarray([16], dtype=np.int64),
+            )
+        },
+        datasets=("unit-test",),
+        chunk_count=1,
+        chunk_size=24,
+        legacy=False,
+    )
+    monkeypatch.setattr(hf_to_mfq, "load_importance_matrix", lambda _path: imatrix)
+    original_writer = hf_to_mfq._write_nint_axis0_blob
+    captured: list[np.ndarray] = []
+
+    def recording_writer(*args, **kwargs):
+        importance_rows = kwargs.get("importance_rows")
+        assert importance_rows is not None
+        captured.append(np.asarray(importance_rows(0, 1)).copy())
+        return original_writer(*args, **kwargs)
+
+    monkeypatch.setattr(hf_to_mfq, "_write_nint_axis0_blob", recording_writer)
+    output = tmp_path / "model.mfq"
+    args = hf_to_mfq.build_parser().parse_args(
+        [
+            "--input",
+            str(root),
+            "--output",
+            str(output),
+            "--imatrix",
+            str(imatrix_path),
+            "--quant-backend",
+            "cpu",
+            "--device",
+            "cpu",
+            "--row-chunk",
+            "4",
+        ]
+    )
+
+    convert(args)
+
+    assert len(captured) == 1
+    np.testing.assert_array_equal(captured[0], importance[0])
+    header, store = load_mmap(output)
+    try:
+        assert header.extra["imatrix"]["bindings"] == {
+            tensor_name: "blk.0.ffn_down.weight"
+        }
+    finally:
+        store.close()
 
 
 def test_glm_dsa_plan_derives_headwise_mla_and_streamed_experts(tmp_path):

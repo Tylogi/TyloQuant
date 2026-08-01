@@ -250,6 +250,7 @@ def _hf_arguments(args: argparse.Namespace, output: Path) -> argparse.Namespace:
     _append_value(argv, "--tokenizer-gguf", args.tokenizer)
     _append_value(argv, "--model-config", args.model_config)
     _append_value(argv, "--calibration-scheme", args.scheme)
+    _append_value(argv, "--imatrix", args.imatrix)
     _append_value(argv, "--split-max-size", args.split_max_size)
     _append_value(argv, "--split-max-tensors", args.split_max_tensors)
     _append_value(argv, "--temp-dir", args.temp_dir)
@@ -310,8 +311,6 @@ def _validate(args: argparse.Namespace, source_format: str) -> None:
         raise ValueError("--temp-dir is only valid for an HF source")
     if source_format == "gguf" and args.resume and not args.important_neurons:
         raise ValueError("GGUF resume requires --resume-completed N")
-    if source_format == "hf" and args.imatrix:
-        raise ValueError("direct imatrix binding currently requires a BF16 GGUF source")
     if source_format == "hf" and args.tensor_overrides:
         raise ValueError("--tensor-overrides currently requires a BF16 GGUF source")
     if source_format == "hf" and args.exclude_mtp:
