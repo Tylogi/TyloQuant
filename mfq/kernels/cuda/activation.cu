@@ -5,6 +5,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 #include <algorithm>
+#include <type_traits>
 #include <vector>
 
 #include "glu.cuh"
@@ -75,7 +76,11 @@ __global__ void gelu_mul_kernel(
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
          i < n;
          i += (size_t)gridDim.x * blockDim.x) {
-        out[i] = (scalar_t)mfq_glu<true>((float)gate[i], (float)up[i]);
+        float value = mfq_glu<true>((float)gate[i], (float)up[i]);
+        if constexpr (std::is_same_v<scalar_t, at::Half>) {
+            value = fminf(65504.0f, fmaxf(-65504.0f, value));
+        }
+        out[i] = (scalar_t)value;
     }
 }
 

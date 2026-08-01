@@ -1555,6 +1555,21 @@ def test_gelu_mul_matches_tanh_approximation(dtype):
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
 
 
+def test_gelu_mul_saturates_f16_overflow_without_nonfinite_values():
+    gate = torch.tensor(
+        [[200.0, 200.0, -200.0]], device=DEV, dtype=torch.float16
+    )
+    up = torch.tensor(
+        [[400.0, -400.0, 400.0]], device=DEV, dtype=torch.float16
+    )
+    actual = gelu_mul(gate, up)
+    expected = torch.tensor(
+        [[65504.0, -65504.0, -0.0]], device=DEV, dtype=torch.float16
+    )
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+
+
 @pytest.mark.parametrize(
     "spec",
     [NintSpec(3, 24, 5), NintSpec(4, 24, 6), NintSpec(6, 24, 6)],

@@ -368,6 +368,295 @@ def _importance_as_rows(
     return rows.contiguous()
 
 
+def _refine_imatrix_final_encoding_torch(
+    groups: torch.Tensor,
+    weights: torch.Tensor,
+    q: torch.Tensor,
+    neuron_scale: torch.Tensor,
+    neuron_min: torch.Tensor,
+    sub_scale: torch.Tensor,
+    sub_min: torch.Tensor,
+    nmax: int,
+    sub_nmax: int,
+    passes: int = 2,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Refine the final stored NINT reconstruction under imatrix weights."""
+
+    values = groups.to(torch.float32)
+    objective_weight = weights.to(torch.float32)
+    levels = q.to(torch.int32).clone()
+    row_scale = neuron_scale.to(torch.float32).clone()
+    row_min = neuron_min.to(torch.float32).clone()
+    scale_levels = sub_scale.to(torch.int32).clone()
+    min_levels = sub_min.to(torch.int32).clone()
+
+    def statistics(current_levels: torch.Tensor):
+        levels_f = current_levels.to(torch.float32)
+        sum_w = objective_weight.sum(dim=-1)
+        sum_x = (objective_weight * values).sum(dim=-1)
+        sum_x2 = (objective_weight * values.square()).sum(dim=-1)
+        sum_q = (objective_weight * levels_f).sum(dim=-1)
+        sum_q2 = (objective_weight * levels_f.square()).sum(dim=-1)
+        sum_qx = (objective_weight * levels_f * values).sum(dim=-1)
+        return sum_w, sum_x, sum_x2, sum_q, sum_q2, sum_qx
+
+    def group_error(
+        stats,
+        candidate_scale: torch.Tensor,
+        candidate_min: torch.Tensor,
+        candidate_scale_levels: torch.Tensor,
+        candidate_min_levels: torch.Tensor,
+    ) -> torch.Tensor:
+        sum_w, sum_x, sum_x2, sum_q, sum_q2, sum_qx = stats
+        effective_scale = (
+            candidate_scale.unsqueeze(-1)
+            * candidate_scale_levels.to(torch.float32)
+        )
+        effective_min = (
+            candidate_min.unsqueeze(-1)
+            * candidate_min_levels.to(torch.float32)
+        )
+        return (
+            effective_scale.square() * sum_q2
+            + effective_min.square() * sum_w
+            + sum_x2
+            - 2.0 * effective_scale * effective_min * sum_q
+            - 2.0 * effective_scale * sum_qx
+            + 2.0 * effective_min * sum_x
+        )
+
+    def fp16_round(values_: torch.Tensor) -> torch.Tensor:
+        return torch.clamp(
+            torch.nan_to_num(values_, nan=0.0, posinf=65504.0, neginf=0.0),
+            min=0.0,
+            max=65504.0,
+        ).to(torch.float16).to(torch.float32)
+
+    stats = statistics(levels)
+    best_error = group_error(
+        stats, row_scale, row_min, scale_levels, min_levels
+    ).sum(dim=-1)
+
+    for _ in range(max(0, int(passes))):
+        candidate_levels = levels.clone()
+        candidate_scale = row_scale.clone()
+        candidate_min = row_min.clone()
+        candidate_scale_levels = scale_levels.clone()
+        candidate_min_levels = min_levels.clone()
+        candidate_stats = stats
+
+        for _coordinate_pass in range(2):
+            sum_w, sum_x, _, sum_q, sum_q2, sum_qx = candidate_stats
+            effective_min = (
+                candidate_min.unsqueeze(-1)
+                * candidate_min_levels.to(torch.float32)
+            )
+            scale_denominator = candidate_scale.unsqueeze(-1) * sum_q2
+            valid_scale = scale_denominator > 0.0
+            proposed_scale_levels = torch.clamp(
+                torch.round(
+                    (sum_qx + effective_min * sum_q)
+                    / torch.where(
+                        valid_scale,
+                        scale_denominator,
+                        torch.ones_like(scale_denominator),
+                    )
+                ),
+                0,
+                sub_nmax,
+            ).to(torch.int32)
+            proposed_scale_levels = torch.where(
+                valid_scale, proposed_scale_levels, candidate_scale_levels
+            )
+            old_group_error = group_error(
+                candidate_stats,
+                candidate_scale,
+                candidate_min,
+                candidate_scale_levels,
+                candidate_min_levels,
+            )
+            proposed_group_error = group_error(
+                candidate_stats,
+                candidate_scale,
+                candidate_min,
+                proposed_scale_levels,
+                candidate_min_levels,
+            )
+            better = proposed_group_error < old_group_error
+            candidate_scale_levels = torch.where(
+                better, proposed_scale_levels, candidate_scale_levels
+            )
+
+            effective_scale = (
+                candidate_scale.unsqueeze(-1)
+                * candidate_scale_levels.to(torch.float32)
+            )
+            min_denominator = candidate_min.unsqueeze(-1) * sum_w
+            valid_min = min_denominator > 0.0
+            proposed_min_levels = torch.clamp(
+                torch.round(
+                    (effective_scale * sum_q - sum_x)
+                    / torch.where(
+                        valid_min,
+                        min_denominator,
+                        torch.ones_like(min_denominator),
+                    )
+                ),
+                0,
+                sub_nmax,
+            ).to(torch.int32)
+            proposed_min_levels = torch.where(
+                valid_min, proposed_min_levels, candidate_min_levels
+            )
+            old_group_error = group_error(
+                candidate_stats,
+                candidate_scale,
+                candidate_min,
+                candidate_scale_levels,
+                candidate_min_levels,
+            )
+            proposed_group_error = group_error(
+                candidate_stats,
+                candidate_scale,
+                candidate_min,
+                candidate_scale_levels,
+                proposed_min_levels,
+            )
+            better = proposed_group_error < old_group_error
+            candidate_min_levels = torch.where(
+                better, proposed_min_levels, candidate_min_levels
+            )
+
+        sum_w, sum_x, _, sum_q, sum_q2, sum_qx = candidate_stats
+        scale_level_f = candidate_scale_levels.to(torch.float32)
+        min_level_f = candidate_min_levels.to(torch.float32)
+        sum_aa = (scale_level_f.square() * sum_q2).sum(dim=-1)
+        sum_mm = (min_level_f.square() * sum_w).sum(dim=-1)
+        sum_am = (scale_level_f * min_level_f * sum_q).sum(dim=-1)
+        sum_ax = (scale_level_f * sum_qx).sum(dim=-1)
+        sum_mx = (min_level_f * sum_x).sum(dim=-1)
+        determinant = sum_aa * sum_mm - sum_am.square()
+
+        row_best_error = group_error(
+            candidate_stats,
+            candidate_scale,
+            candidate_min,
+            candidate_scale_levels,
+            candidate_min_levels,
+        ).sum(dim=-1)
+        row_best_scale = candidate_scale.clone()
+        row_best_min = candidate_min.clone()
+
+        def consider(
+            scale_value: torch.Tensor,
+            min_value: torch.Tensor,
+            current_stats=candidate_stats,
+            current_scale_levels=candidate_scale_levels,
+            current_min_levels=candidate_min_levels,
+        ) -> None:
+            nonlocal row_best_error, row_best_scale, row_best_min
+            scale_value = fp16_round(scale_value)
+            min_value = fp16_round(min_value)
+            error = group_error(
+                current_stats,
+                scale_value,
+                min_value,
+                current_scale_levels,
+                current_min_levels,
+            ).sum(dim=-1)
+            improve = error < row_best_error
+            row_best_error = torch.where(improve, error, row_best_error)
+            row_best_scale = torch.where(
+                improve, scale_value, row_best_scale
+            )
+            row_best_min = torch.where(improve, min_value, row_best_min)
+
+        valid_joint = determinant > 0.0
+        safe_determinant = torch.where(
+            valid_joint, determinant, torch.ones_like(determinant)
+        )
+        joint_scale = (
+            sum_mm * sum_ax - sum_am * sum_mx
+        ) / safe_determinant
+        joint_min = (
+            sum_am * sum_ax - sum_aa * sum_mx
+        ) / safe_determinant
+        joint_scale = torch.where(valid_joint, joint_scale, row_best_scale)
+        joint_min = torch.where(valid_joint, joint_min, row_best_min)
+        consider(joint_scale, joint_min)
+        consider(
+            sum_ax
+            / torch.where(sum_aa > 0.0, sum_aa, torch.ones_like(sum_aa)),
+            torch.zeros_like(sum_ax),
+        )
+        consider(
+            torch.zeros_like(sum_mx),
+            -sum_mx
+            / torch.where(sum_mm > 0.0, sum_mm, torch.ones_like(sum_mm)),
+        )
+        candidate_scale = row_best_scale
+        candidate_min = row_best_min
+
+        effective_scale = (
+            candidate_scale.unsqueeze(-1)
+            * candidate_scale_levels.to(torch.float32)
+        )
+        effective_min = (
+            candidate_min.unsqueeze(-1)
+            * candidate_min_levels.to(torch.float32)
+        )
+        safe_effective_scale = torch.where(
+            effective_scale > 0.0,
+            effective_scale,
+            torch.ones_like(effective_scale),
+        )
+        candidate_levels = torch.clamp(
+            torch.round(
+                (values + effective_min.unsqueeze(-1))
+                / safe_effective_scale.unsqueeze(-1)
+            ),
+            0,
+            nmax,
+        ).to(torch.int32)
+        candidate_levels = torch.where(
+            (effective_scale > 0.0).unsqueeze(-1),
+            candidate_levels,
+            torch.zeros_like(candidate_levels),
+        )
+        candidate_stats = statistics(candidate_levels)
+        candidate_error = group_error(
+            candidate_stats,
+            candidate_scale,
+            candidate_min,
+            candidate_scale_levels,
+            candidate_min_levels,
+        ).sum(dim=-1)
+        improve = candidate_error < best_error
+        if not bool(improve.any().item()):
+            break
+        best_error = torch.where(improve, candidate_error, best_error)
+        levels = torch.where(
+            improve[:, None, None], candidate_levels, levels
+        )
+        row_scale = torch.where(improve, candidate_scale, row_scale)
+        row_min = torch.where(improve, candidate_min, row_min)
+        scale_levels = torch.where(
+            improve[:, None], candidate_scale_levels, scale_levels
+        )
+        min_levels = torch.where(
+            improve[:, None], candidate_min_levels, min_levels
+        )
+        stats = statistics(levels)
+
+    return levels, row_scale, row_min, scale_levels, min_levels
+
+
 def quantize_axis0(
     weight: torch.Tensor,
     spec: NintSpec,
@@ -460,6 +749,20 @@ def quantize_axis0(
     m_eff = neu_dm.unsqueeze(-1) * sub_min
     de = torch.where(d_eff > 0, d_eff, torch.ones_like(d_eff))
     q = torch.clamp(torch.round((grps + m_eff.unsqueeze(-1)) / de.unsqueeze(-1)), 0, nmax)
+    if importance is not None:
+        q, neu_d, neu_dm, sub_scale, sub_min = (
+            _refine_imatrix_final_encoding_torch(
+                grps,
+                ww,
+                q,
+                neu_d,
+                neu_dm,
+                sub_scale,
+                sub_min,
+                nmax=nmax,
+                sub_nmax=K,
+            )
+        )
 
     sub_dtype = _uint_dtype(K)
     q_dtype = _uint_dtype(nmax)

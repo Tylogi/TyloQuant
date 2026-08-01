@@ -270,6 +270,307 @@ def _make_qp(
     return scale.astype(np.float32), levels
 
 
+def _refine_imatrix_final_encoding(
+    groups: np.ndarray,
+    weights: np.ndarray,
+    q: np.ndarray,
+    neuron_scale: np.ndarray,
+    neuron_min: np.ndarray,
+    sub_scale: np.ndarray,
+    sub_min: np.ndarray,
+    nmax: int,
+    sub_nmax: int,
+    passes: int = 2,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Minimize weighted SSE for the values that are actually stored.
+
+    The first-stage affine fit produces one floating-point scale/minimum per
+    group.  NINT then stores those values through a second integer level plus
+    one fp16 row scale/minimum.  Optimizing the two stages independently does
+    not minimize the reconstruction emitted by the final format.  This
+    routine performs monotonic coordinate descent directly on
+
+    ``neuron_scale * sub_scale * q - neuron_min * sub_min``.
+
+    It is intentionally used only for the imatrix path so the historical
+    weight-only encoding remains byte-for-byte unchanged.
+    """
+
+    values = np.asarray(groups, dtype=np.float32)
+    objective_weight = np.asarray(weights, dtype=np.float32)
+    levels = np.asarray(q, dtype=np.int32).copy()
+    row_scale = np.asarray(neuron_scale, dtype=np.float32).copy()
+    row_min = np.asarray(neuron_min, dtype=np.float32).copy()
+    scale_levels = np.asarray(sub_scale, dtype=np.int32).copy()
+    min_levels = np.asarray(sub_min, dtype=np.int32).copy()
+
+    def statistics(current_levels: np.ndarray):
+        levels_f = current_levels.astype(np.float32)
+        sum_w = objective_weight.sum(axis=-1, dtype=np.float64)
+        sum_x = (objective_weight * values).sum(axis=-1, dtype=np.float64)
+        sum_x2 = (
+            objective_weight * values * values
+        ).sum(axis=-1, dtype=np.float64)
+        sum_q = (
+            objective_weight * levels_f
+        ).sum(axis=-1, dtype=np.float64)
+        sum_q2 = (
+            objective_weight * levels_f * levels_f
+        ).sum(axis=-1, dtype=np.float64)
+        sum_qx = (
+            objective_weight * levels_f * values
+        ).sum(axis=-1, dtype=np.float64)
+        return sum_w, sum_x, sum_x2, sum_q, sum_q2, sum_qx
+
+    def group_error(
+        stats,
+        candidate_scale: np.ndarray,
+        candidate_min: np.ndarray,
+        candidate_scale_levels: np.ndarray,
+        candidate_min_levels: np.ndarray,
+    ) -> np.ndarray:
+        sum_w, sum_x, sum_x2, sum_q, sum_q2, sum_qx = stats
+        effective_scale = (
+            candidate_scale[:, None].astype(np.float64)
+            * candidate_scale_levels.astype(np.float64)
+        )
+        effective_min = (
+            candidate_min[:, None].astype(np.float64)
+            * candidate_min_levels.astype(np.float64)
+        )
+        return (
+            effective_scale * effective_scale * sum_q2
+            + effective_min * effective_min * sum_w
+            + sum_x2
+            - 2.0 * effective_scale * effective_min * sum_q
+            - 2.0 * effective_scale * sum_qx
+            + 2.0 * effective_min * sum_x
+        )
+
+    def fp16_round(values_: np.ndarray) -> np.ndarray:
+        finite = np.where(np.isfinite(values_), values_, 0.0)
+        return np.maximum(
+            finite, 0.0
+        ).astype(np.float16).astype(np.float32)
+
+    stats = statistics(levels)
+    best_error = group_error(
+        stats, row_scale, row_min, scale_levels, min_levels
+    ).sum(axis=-1)
+
+    for _ in range(max(0, int(passes))):
+        candidate_levels = levels.copy()
+        candidate_scale = row_scale.copy()
+        candidate_min = row_min.copy()
+        candidate_scale_levels = scale_levels.copy()
+        candidate_min_levels = min_levels.copy()
+        candidate_stats = stats
+
+        # With q fixed, each group's integer scale/minimum pair is a convex
+        # two-variable problem.  Alternating its exact one-dimensional
+        # minimizers is inexpensive and directly targets the final format.
+        for _coordinate_pass in range(2):
+            sum_w, sum_x, _, sum_q, sum_q2, sum_qx = candidate_stats
+            effective_min = (
+                candidate_min[:, None].astype(np.float64)
+                * candidate_min_levels.astype(np.float64)
+            )
+            scale_denominator = (
+                candidate_scale[:, None].astype(np.float64) * sum_q2
+            )
+            valid_scale = scale_denominator > 0.0
+            proposed_scale_levels = np.clip(
+                np.rint(
+                    np.divide(
+                        sum_qx + effective_min * sum_q,
+                        np.where(valid_scale, scale_denominator, 1.0),
+                    )
+                ),
+                0,
+                sub_nmax,
+            ).astype(np.int32)
+            proposed_scale_levels = np.where(
+                valid_scale, proposed_scale_levels, candidate_scale_levels
+            )
+            old_group_error = group_error(
+                candidate_stats,
+                candidate_scale,
+                candidate_min,
+                candidate_scale_levels,
+                candidate_min_levels,
+            )
+            proposed_group_error = group_error(
+                candidate_stats,
+                candidate_scale,
+                candidate_min,
+                proposed_scale_levels,
+                candidate_min_levels,
+            )
+            better = proposed_group_error < old_group_error
+            candidate_scale_levels = np.where(
+                better, proposed_scale_levels, candidate_scale_levels
+            )
+
+            effective_scale = (
+                candidate_scale[:, None].astype(np.float64)
+                * candidate_scale_levels.astype(np.float64)
+            )
+            min_denominator = (
+                candidate_min[:, None].astype(np.float64) * sum_w
+            )
+            valid_min = min_denominator > 0.0
+            proposed_min_levels = np.clip(
+                np.rint(
+                    np.divide(
+                        effective_scale * sum_q - sum_x,
+                        np.where(valid_min, min_denominator, 1.0),
+                    )
+                ),
+                0,
+                sub_nmax,
+            ).astype(np.int32)
+            proposed_min_levels = np.where(
+                valid_min, proposed_min_levels, candidate_min_levels
+            )
+            old_group_error = group_error(
+                candidate_stats,
+                candidate_scale,
+                candidate_min,
+                candidate_scale_levels,
+                candidate_min_levels,
+            )
+            proposed_group_error = group_error(
+                candidate_stats,
+                candidate_scale,
+                candidate_min,
+                candidate_scale_levels,
+                proposed_min_levels,
+            )
+            better = proposed_group_error < old_group_error
+            candidate_min_levels = np.where(
+                better, proposed_min_levels, candidate_min_levels
+            )
+
+        sum_w, sum_x, _, sum_q, sum_q2, sum_qx = candidate_stats
+        scale_level_f = candidate_scale_levels.astype(np.float64)
+        min_level_f = candidate_min_levels.astype(np.float64)
+        sum_aa = (scale_level_f * scale_level_f * sum_q2).sum(axis=-1)
+        sum_mm = (min_level_f * min_level_f * sum_w).sum(axis=-1)
+        sum_am = (scale_level_f * min_level_f * sum_q).sum(axis=-1)
+        sum_ax = (scale_level_f * sum_qx).sum(axis=-1)
+        sum_mx = (min_level_f * sum_x).sum(axis=-1)
+        determinant = sum_aa * sum_mm - sum_am * sum_am
+
+        row_best_error = group_error(
+            candidate_stats,
+            candidate_scale,
+            candidate_min,
+            candidate_scale_levels,
+            candidate_min_levels,
+        ).sum(axis=-1)
+        row_best_scale = candidate_scale.copy()
+        row_best_min = candidate_min.copy()
+
+        def consider(
+            scale_value: np.ndarray,
+            min_value: np.ndarray,
+            current_stats=candidate_stats,
+            current_scale_levels=candidate_scale_levels,
+            current_min_levels=candidate_min_levels,
+        ) -> None:
+            nonlocal row_best_error, row_best_scale, row_best_min
+            scale_value = fp16_round(scale_value)
+            min_value = fp16_round(min_value)
+            error = group_error(
+                current_stats,
+                scale_value,
+                min_value,
+                current_scale_levels,
+                current_min_levels,
+            ).sum(axis=-1)
+            improve = error < row_best_error
+            row_best_error = np.where(improve, error, row_best_error)
+            row_best_scale = np.where(
+                improve, scale_value, row_best_scale
+            )
+            row_best_min = np.where(improve, min_value, row_best_min)
+
+        valid_joint = determinant > 0.0
+        safe_determinant = np.where(valid_joint, determinant, 1.0)
+        joint_scale = (
+            sum_mm * sum_ax - sum_am * sum_mx
+        ) / safe_determinant
+        joint_min = (
+            sum_am * sum_ax - sum_aa * sum_mx
+        ) / safe_determinant
+        joint_scale = np.where(valid_joint, joint_scale, row_best_scale)
+        joint_min = np.where(valid_joint, joint_min, row_best_min)
+        consider(joint_scale, joint_min)
+        consider(
+            np.divide(
+                sum_ax,
+                np.where(sum_aa > 0.0, sum_aa, 1.0),
+            ),
+            np.zeros_like(sum_ax),
+        )
+        consider(
+            np.zeros_like(sum_mx),
+            np.divide(
+                -sum_mx,
+                np.where(sum_mm > 0.0, sum_mm, 1.0),
+            ),
+        )
+        candidate_scale = row_best_scale
+        candidate_min = row_best_min
+
+        effective_scale = (
+            candidate_scale[:, None]
+            * candidate_scale_levels.astype(np.float32)
+        )
+        effective_min = (
+            candidate_min[:, None]
+            * candidate_min_levels.astype(np.float32)
+        )
+        safe_effective_scale = np.where(
+            effective_scale > 0.0, effective_scale, 1.0
+        )
+        candidate_levels = np.clip(
+            np.rint(
+                (values + effective_min[..., None])
+                / safe_effective_scale[..., None]
+            ),
+            0,
+            nmax,
+        ).astype(np.int32)
+        candidate_levels = np.where(
+            (effective_scale > 0.0)[..., None], candidate_levels, 0
+        )
+        candidate_stats = statistics(candidate_levels)
+        candidate_error = group_error(
+            candidate_stats,
+            candidate_scale,
+            candidate_min,
+            candidate_scale_levels,
+            candidate_min_levels,
+        ).sum(axis=-1)
+        improve = candidate_error < best_error
+        if not np.any(improve):
+            break
+        best_error = np.where(improve, candidate_error, best_error)
+        levels = np.where(improve[:, None, None], candidate_levels, levels)
+        row_scale = np.where(improve, candidate_scale, row_scale)
+        row_min = np.where(improve, candidate_min, row_min)
+        scale_levels = np.where(
+            improve[:, None], candidate_scale_levels, scale_levels
+        )
+        min_levels = np.where(
+            improve[:, None], candidate_min_levels, min_levels
+        )
+        stats = statistics(levels)
+
+    return levels, row_scale, row_min, scale_levels, min_levels
+
+
 def quantize(
     weight: np.ndarray,
     spec: NintSpec,
@@ -348,6 +649,20 @@ def quantize(
     m_eff = neu_dm[:, None] * sub_min.astype(np.float32)
     de = np.where(d_eff > 0, d_eff, 1.0)
     q = np.clip(np.rint((grps + m_eff[..., None]) / de[..., None]), 0, nmax)
+    if importance is not None:
+        q, neu_d, neu_dm, sub_scale, sub_min = (
+            _refine_imatrix_final_encoding(
+                grps,
+                w,
+                q,
+                neu_d,
+                neu_dm,
+                sub_scale,
+                sub_min,
+                nmax=nmax,
+                sub_nmax=K,
+            )
+        )
 
     return NintTensor(
         spec=spec,

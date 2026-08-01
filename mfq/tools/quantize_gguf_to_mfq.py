@@ -192,6 +192,9 @@ def _hf_output_name_map(
     hf_names: list[str],
 ) -> dict[str, str]:
     inverse: dict[str, str] = {}
+    hf_model_names = {
+        hf_name for hf_name in hf_names if not is_asset_record(hf_name)
+    }
     for hf_name in hf_names:
         if is_asset_record(hf_name):
             continue
@@ -212,7 +215,7 @@ def _hf_output_name_map(
     ]
     if unmapped != ["rope_freqs.weight"]:
         raise ValueError(f"unexpected unmapped GGUF tensors: {unmapped}")
-    if set(mapped.values()) != set(hf_names):
+    if set(mapped.values()) != hf_model_names:
         raise ValueError("GGUF tensors do not exactly cover the HF template")
     return mapped
 
@@ -425,6 +428,70 @@ def _load_gguf():
         from gguf import GGUFReader  # type: ignore
         from gguf.quants import dequantize  # type: ignore
     return GGUFReader, dequantize
+
+
+_GGUF_SPLIT_PATH_RE = re.compile(
+    r"^(?P<prefix>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})(?P<suffix>\.gguf)$",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class GgufSourceSet:
+    paths: tuple[Path, ...]
+    readers: tuple[Any, ...]
+    tensors: tuple[Any, ...]
+    fields: Any
+    tensor_source_paths: dict[str, Path]
+
+
+def _resolve_gguf_source_paths(path: Path) -> tuple[Path, ...]:
+    resolved = path.resolve()
+    match = _GGUF_SPLIT_PATH_RE.match(resolved.name)
+    if match is None:
+        return (resolved,)
+
+    count = int(match.group("count"))
+    index = int(match.group("index"))
+    if count < 1 or not 1 <= index <= count:
+        raise ValueError(f"invalid GGUF split path: {resolved}")
+
+    prefix = match.group("prefix")
+    suffix = match.group("suffix")
+    paths = tuple(
+        resolved.with_name(f"{prefix}-{part:05d}-of-{count:05d}{suffix}")
+        for part in range(1, count + 1)
+    )
+    missing = [candidate for candidate in paths if not candidate.is_file()]
+    if missing:
+        preview = ", ".join(str(candidate) for candidate in missing[:4])
+        suffix_text = "" if len(missing) <= 4 else f" ... ({len(missing)} missing)"
+        raise FileNotFoundError(f"missing GGUF source shard(s): {preview}{suffix_text}")
+    return paths
+
+
+def _open_gguf_source(GGUFReader: Any, path: Path) -> GgufSourceSet:
+    paths = _resolve_gguf_source_paths(path)
+    readers = tuple(GGUFReader(str(candidate), "r") for candidate in paths)
+    tensors: list[Any] = []
+    tensor_source_paths: dict[str, Path] = {}
+    for candidate, reader in zip(paths, readers):
+        for tensor in reader.tensors:
+            name = str(tensor.name)
+            previous = tensor_source_paths.get(name)
+            if previous is not None:
+                raise ValueError(
+                    f"duplicate GGUF source tensor {name}: {previous} and {candidate}"
+                )
+            tensor_source_paths[name] = candidate
+            tensors.append(tensor)
+    return GgufSourceSet(
+        paths=paths,
+        readers=readers,
+        tensors=tuple(tensors),
+        fields=readers[0].fields,
+        tensor_source_paths=tensor_source_paths,
+    )
 
 
 def _logical_shape(tensor: Any) -> tuple[int, ...]:
@@ -1976,7 +2043,7 @@ def convert(args: argparse.Namespace) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
 
     GGUFReader, dequantize = _load_gguf()
-    source_reader = GGUFReader(str(source_path), "r")
+    source_reader = _open_gguf_source(GGUFReader, source_path)
     recipe_reader = GGUFReader(str(recipe_path), "r")
     excluded_recipe_tensors: list[str] = []
     plan = _build_plan(
@@ -2181,6 +2248,7 @@ def convert(args: argparse.Namespace) -> None:
     required_peak = 2 * estimated_bytes + 1024**3
     contract = {
         "input_bf16_gguf": str(source_path),
+        "input_bf16_gguf_shards": [str(path) for path in source_reader.paths],
         "recipe_gguf": str(recipe_path),
         "hf_name_template": (
             None if hf_name_template is None else str(hf_name_template)
@@ -2565,7 +2633,7 @@ def convert(args: argparse.Namespace) -> None:
                     "r",
                 )
                 if getattr(args, "tokenizer_gguf", "")
-                else source_reader
+                else source_reader.readers[0]
             )
         ]
         config_path = discover_model_config(
@@ -2603,6 +2671,7 @@ def convert(args: argparse.Namespace) -> None:
             num_tensors=len(records),
             extra={
                 "source": str(source_path),
+                "source_shards": [str(path) for path in source_reader.paths],
                 "recipe": str(recipe_path),
                 "tensor_name_namespace": (
                     "gguf" if hf_name_template is None else "huggingface"

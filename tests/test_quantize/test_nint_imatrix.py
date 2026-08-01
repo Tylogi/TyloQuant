@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from mfq.formats.nint import NintSpec
+from mfq.quantize import nint_quant
 from mfq.quantize.nint_quant import (
     _imatrix_element_weights,
     _make_qp,
@@ -131,3 +132,64 @@ def test_weighted_neuron_scale_search_protects_important_groups():
     fitted_error = np.sum(group_weights * (scales - fitted) ** 2)
     baseline_error = np.sum(group_weights * (scales - baseline) ** 2)
     assert fitted_error < baseline_error * 0.001
+
+
+@pytest.mark.parametrize(
+    "spec",
+    (
+        NintSpec(2, 16, 5),
+        NintSpec(3, 24, 5),
+        NintSpec(4, 24, 6),
+        NintSpec(5, 28, 7),
+        NintSpec(6, 26, 7),
+    ),
+)
+def test_final_two_level_refinement_is_monotonic_on_long_rows(
+    spec: NintSpec,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    rng = np.random.default_rng(20260802 + spec.bits)
+    weight = rng.normal(0, 0.06, size=(3, 5376)).astype(np.float32)
+    importance = np.geomspace(0.001, 1000.0, weight.shape[1]).astype(
+        np.float32
+    )
+    refine = nint_quant._refine_imatrix_final_encoding
+
+    def no_refine(
+        groups,
+        weights,
+        q,
+        neuron_scale,
+        neuron_min,
+        sub_scale,
+        sub_min,
+        **_kwargs,
+    ):
+        return q, neuron_scale, neuron_min, sub_scale, sub_min
+
+    monkeypatch.setattr(
+        nint_quant, "_refine_imatrix_final_encoding", no_refine
+    )
+    initial = nint_quant.quantize(
+        weight, spec, axis=0, importance=importance
+    )
+    monkeypatch.setattr(
+        nint_quant, "_refine_imatrix_final_encoding", refine
+    )
+    refined = nint_quant.quantize(
+        weight, spec, axis=0, importance=importance
+    )
+
+    pad = (-weight.shape[1]) % spec.groupsize
+    padded = np.pad(weight, ((0, 0), (0, pad))) if pad else weight
+    importance_rows = np.broadcast_to(importance, weight.shape)
+    objective_weight = _imatrix_element_weights(
+        padded, importance_rows, weight.shape[1]
+    )[:, : weight.shape[1]]
+    initial_error = float(
+        np.sum(objective_weight * (dequantize(initial) - weight) ** 2)
+    )
+    refined_error = float(
+        np.sum(objective_weight * (dequantize(refined) - weight) ** 2)
+    )
+    assert refined_error <= initial_error * (1.0 + 1e-7)
