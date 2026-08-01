@@ -311,6 +311,7 @@ if(NOT APPLE)
 
 add_executable(mfq-decode
     mfq_decode.cpp
+    ggml_cuda_compat.cu
     ../mfq/kernels/cuda/acc.cu
     ../mfq/kernels/cuda/activation.cu
     ../mfq/kernels/cuda/attention.cu
@@ -347,6 +348,7 @@ target_include_directories(mfq-decode PRIVATE
 target_link_libraries(mfq-decode PRIVATE
     ${TORCH_LIBRARIES}
     Python::Python
+    CUDA::cuda_driver
     CUDA::cudart
     CUDA::cublas
     mfq-server

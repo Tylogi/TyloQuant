@@ -21,6 +21,14 @@ __device__ __forceinline__ float warp_sum(float value) {
     return value;
 }
 
+__device__ __forceinline__ double warp_sum(double value) {
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffff, value, offset);
+    }
+    return value;
+}
+
 __device__ __forceinline__ float warp_min(float value) {
 #pragma unroll
     for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
@@ -218,14 +226,20 @@ __global__ void nint_make_qp_kernel(
         static_cast<float>(nmax) * reciprocal_maximum;
     float scale = __fdividef(1.0f, iscale);
 
-    float local_error = 0.0f;
+    // Long rows can contain hundreds of second-level groups.  Float32 warp
+    // reductions lose enough low bits here to change the subsequent
+    // order-dependent coordinate search.  Keep the stored representation in
+    // float32/fp16, but evaluate its optimizer in float64.
+    double local_error = 0.0;
     for (int index = lane; index < width; index += kWarpSize) {
         const float value = x[row_offset + index];
         const float level = positive_quant_level(value, iscale, nmax);
         const float difference = value - scale * level;
-        local_error += weight[row_offset + index] * difference * difference;
+        local_error += static_cast<double>(weight[row_offset + index])
+            * static_cast<double>(difference)
+            * static_cast<double>(difference);
     }
-    float best_error = warp_sum(local_error);
+    double best_error = warp_sum(local_error);
 
     for (int offset = -4; offset <= 4; ++offset) {
         if (offset == 0) {
@@ -236,16 +250,18 @@ __global__ void nint_make_qp_kernel(
         const float candidate_iscale =
             candidate_numerator * reciprocal_maximum;
         const float candidate_scale = __fdividef(1.0f, candidate_iscale);
-        float candidate_local_error = 0.0f;
+        double candidate_local_error = 0.0;
         for (int index = lane; index < width; index += kWarpSize) {
             const float value = x[row_offset + index];
             const float level =
                 positive_quant_level(value, candidate_iscale, nmax);
             const float difference = value - candidate_scale * level;
             candidate_local_error +=
-                weight[row_offset + index] * difference * difference;
+                static_cast<double>(weight[row_offset + index])
+                * static_cast<double>(difference)
+                * static_cast<double>(difference);
         }
-        const float candidate_error = warp_sum(candidate_local_error);
+        const double candidate_error = warp_sum(candidate_local_error);
         if (lane == 0 && active && candidate_error < best_error) {
             best_error = candidate_error;
             iscale = candidate_iscale;
@@ -253,8 +269,8 @@ __global__ void nint_make_qp_kernel(
         iscale = __shfl_sync(0xffffffff, iscale, 0);
     }
 
-    float local_lx = 0.0f;
-    float local_l2 = 0.0f;
+    double local_lx = 0.0;
+    double local_l2 = 0.0;
     for (int index = lane; index < width; index += kWarpSize) {
         const int64_t position = row_offset + index;
         const float value = x[position];
@@ -263,11 +279,15 @@ __global__ void nint_make_qp_kernel(
             : 0;
         levels[position] = level;
         const float level_f = static_cast<float>(level);
-        local_lx += weight[position] * value * level_f;
-        local_l2 += weight[position] * level_f * level_f;
+        local_lx += static_cast<double>(weight[position])
+            * static_cast<double>(value)
+            * static_cast<double>(level_f);
+        local_l2 += static_cast<double>(weight[position])
+            * static_cast<double>(level_f)
+            * static_cast<double>(level_f);
     }
-    float sum_lx = warp_sum(local_lx);
-    float sum_l2 = warp_sum(local_l2);
+    double sum_lx = warp_sum(local_lx);
+    double sum_l2 = warp_sum(local_l2);
     __syncwarp();
 
     if (lane == 0) {
@@ -275,27 +295,30 @@ __global__ void nint_make_qp_kernel(
             for (int index = 0; index < width; ++index) {
                 const int64_t position = row_offset + index;
                 const int32_t old_level = levels[position];
-                const float old_level_f = static_cast<float>(old_level);
-                const float objective_weight = weight[position];
-                const float value = x[position];
-                const float candidate_lx =
+                const double old_level_f = static_cast<double>(old_level);
+                const double objective_weight =
+                    static_cast<double>(weight[position]);
+                const double value = static_cast<double>(x[position]);
+                const double candidate_lx =
                     sum_lx - objective_weight * value * old_level_f;
-                const float candidate_l2 =
+                const double candidate_l2 =
                     sum_l2 - objective_weight * old_level_f * old_level_f;
-                if (candidate_lx <= 0.0f || candidate_l2 <= 0.0f) {
+                if (candidate_lx <= 0.0 || candidate_l2 <= 0.0) {
                     continue;
                 }
                 const int32_t new_level = static_cast<int32_t>(
                     positive_quant_level(
-                        value, candidate_l2 / candidate_lx, nmax));
+                        static_cast<float>(value),
+                        static_cast<float>(candidate_l2 / candidate_lx),
+                        nmax));
                 if (new_level == old_level) {
                     continue;
                 }
-                const float new_level_f = static_cast<float>(new_level);
-                const float updated_lx =
+                const double new_level_f = static_cast<double>(new_level);
+                const double updated_lx =
                     candidate_lx
                     + objective_weight * value * new_level_f;
-                const float updated_l2 =
+                const double updated_l2 =
                     candidate_l2
                     + objective_weight * new_level_f * new_level_f;
                 if (
@@ -308,7 +331,9 @@ __global__ void nint_make_qp_kernel(
             }
         }
         out_scale[row] =
-            active && sum_l2 > 0.0f ? sum_lx / sum_l2 : 0.0f;
+            active && sum_l2 > 0.0
+            ? static_cast<float>(sum_lx / sum_l2)
+            : 0.0f;
     }
 }
 

@@ -19,6 +19,8 @@ from mfq.quantize.nint_quant_torch import (  # noqa: E402
     _importance_as_rows,
     make_qkx3_cuda,
     make_qkx3_torch,
+    make_qp_cuda,
+    make_qp_torch,
     quantize_axis0 as quantize_gpu,
 )
 from mfq.tools.quantize_hf_to_mfq import convert  # noqa: E402
@@ -171,6 +173,29 @@ def test_nint_qkx3_fused_cuda_matches_halfway_rounding_objective():
     )
     fused_error = weighted_error(fused_scale, fused_minimum)
     assert float(fused_error) <= float(reference_error) * 1.000001 + 1e-8
+
+
+@pytest.mark.parametrize("width", (224, 896))
+def test_nint_qp_fused_cuda_long_rows_match_reference_objective(width: int):
+    torch.manual_seed(20260802 + width)
+    values = torch.rand(7, width, device="cuda", dtype=torch.float32) * 0.08
+    objective_weight = torch.exp(
+        torch.linspace(-6.0, 6.0, width, device="cuda")
+    ).unsqueeze(0).expand_as(values).contiguous()
+    reference_scale, reference_levels = make_qp_torch(
+        values, objective_weight, 127
+    )
+    fused_scale, fused_levels = make_qp_cuda(
+        values, objective_weight, 127
+    )
+
+    def weighted_error(scale, levels):
+        difference = values - scale.unsqueeze(-1) * levels
+        return (objective_weight * difference.square()).sum(dtype=torch.float64)
+
+    reference_error = weighted_error(reference_scale, reference_levels)
+    fused_error = weighted_error(fused_scale, fused_levels)
+    assert float(fused_error) <= float(reference_error) * 1.0001 + 1e-10
 
 
 def test_hf_to_mfq_cuda_backend_smoke(tmp_path: Path):

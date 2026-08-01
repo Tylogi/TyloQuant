@@ -17,7 +17,12 @@ from mfq.formats import io
 from mfq.formats.moe import expert_tensor_family
 from mfq.formats.nepq import NEPQ0_L, NEPQ0_S, NEPQ1_L, NEPQ1_S
 from mfq.formats.nint import NintSpec
-from mfq.quantize.expert_nint import dequantize_expertwise, quantize_expertwise
+from mfq.quantize.expert_nint import (
+    dequantize_expertwise,
+    quantize_expertwise,
+    quantize_flat_cohort,
+)
+from mfq.quantize.nint_quant import quantize as quantize_nint
 from mfq.quantize.npq0_l import Npq0LTables
 from mfq.quantize.npq0_s import Npq0STables
 from mfq.quantize.nvq_jsc import NvqJscTables
@@ -359,3 +364,66 @@ def test_mixed_nint_imatrix_changes_nint4_and_leaves_nint8_unchanged(tmp_path):
     assert io.pack_nint(plain.pools[1].tensor) == io.pack_nint(
         weighted.pools[1].tensor
     )
+
+
+def test_flat_nint_cohort_forwards_imatrix_to_nint_solver():
+    rng = np.random.default_rng(20260802)
+    rows = rng.normal(0, 0.08, size=(7, 113)).astype(np.float32)
+    importance = np.geomspace(0.001, 1000.0, rows.shape[1]).astype(
+        np.float32
+    )
+    precision = ExpertPrecision(
+        "NINT4", nint_spec=NintSpec(4, 24, 6)
+    )
+
+    cohort = quantize_flat_cohort(
+        rows,
+        precision,
+        importance=importance,
+        device="cpu",
+    )
+    direct = quantize_nint(
+        rows,
+        precision.nint_spec,
+        axis=0,
+        importance=importance,
+    )
+
+    for field in (
+        "q",
+        "neuron_scale",
+        "neuron_min",
+        "sub_scale",
+        "sub_min",
+    ):
+        np.testing.assert_array_equal(
+            getattr(cohort, field), getattr(direct, field)
+        )
+
+
+def test_flat_nint8_cohort_does_not_consume_imatrix():
+    rng = np.random.default_rng(20260803)
+    rows = rng.normal(0, 0.08, size=(7, 113)).astype(np.float32)
+    importance = np.geomspace(0.001, 1000.0, rows.shape[1]).astype(
+        np.float32
+    )
+    precision = ExpertPrecision(
+        "NINT8", nint_spec=NintSpec(8, 48, 7)
+    )
+    plain = quantize_flat_cohort(rows, precision, device="cpu")
+    weighted = quantize_flat_cohort(
+        rows,
+        precision,
+        importance=importance,
+        device="cpu",
+    )
+    for field in (
+        "q",
+        "neuron_scale",
+        "neuron_min",
+        "sub_scale",
+        "sub_min",
+    ):
+        np.testing.assert_array_equal(
+            getattr(plain, field), getattr(weighted, field)
+        )

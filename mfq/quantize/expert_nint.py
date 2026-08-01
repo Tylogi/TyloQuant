@@ -340,7 +340,16 @@ def _quantize_flat_cohort(
         assert precision.nint_spec is not None
         if artifact is not None:
             raise ValueError(f"{family} does not consume a quantizer artifact")
-        return quantize_nint(rows, precision.nint_spec, axis=0)
+        return quantize_nint(
+            rows,
+            precision.nint_spec,
+            axis=0,
+            importance=(
+                _numpy_importance(importance)
+                if precision.nint_spec.bits in {2, 3, 4, 5, 6}
+                else None
+            ),
+        )
     if family in {"NVQ2", "NVQ3"}:
         codebook = None if artifact is None else np.asarray(artifact)
         return quantize_nvq(

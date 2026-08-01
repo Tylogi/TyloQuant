@@ -9902,6 +9902,7 @@ struct GlmDsaSharedState {
 struct FullBlock : Block {
     int layer = -1;
     bool gemma4 = false;
+    bool gemma4_moe = false;
     bool sliding = false;
     bool value_equals_key = false;
     int64_t attention_heads = 0;
@@ -10136,7 +10137,8 @@ struct FullBlock : Block {
         }
         if (gemma4) {
             trace_gemma_stage(layer, "attention_output", oo);
-            const bool fused_norms = gemma4_fused_norms_enabled() &&
+            const bool fused_norms = gemma4_moe &&
+                gemma4_fused_norms_enabled() &&
                 g_gemma_stage_trace == nullptr && layer_scale.defined();
             torch::Tensor dense_input;
             torch::Tensor router_input;
@@ -10167,19 +10169,44 @@ struct FullBlock : Block {
                     return gemma_rms_norm_f16(
                         x.reshape({B * T, H}), ffn_norm, c);
                 });
-                router_input = g_profiler.measure("gemma.router_norm", [&]() {
-                    return qwen_rms_norm(
-                        x.reshape({B * T, H}).to(torch::kFloat32),
-                        gemma_router_norm_scale, c);
-                });
-                moe_input = g_profiler.measure("gemma.ffn_pre_norm_2", [&]() {
-                    return gemma_rms_norm_f16(
-                        x.reshape({B * T, H}), ffn_pre_norm_2, c);
-                });
+                if (gemma4_moe) {
+                    router_input = g_profiler.measure("gemma.router_norm", [&]() {
+                        return qwen_rms_norm(
+                            x.reshape({B * T, H}).to(torch::kFloat32),
+                            gemma_router_norm_scale, c);
+                    });
+                    moe_input = g_profiler.measure("gemma.ffn_pre_norm_2", [&]() {
+                        return gemma_rms_norm_f16(
+                            x.reshape({B * T, H}), ffn_pre_norm_2, c);
+                    });
+                }
             }
             auto dense_output = g_profiler.measure("gemma.ffn_dense", [&]() {
                 return ffn.forward(dense_input).reshape({B * T, H});
             });
+            if (!gemma4_moe) {
+                auto dense_post = g_profiler.measure("gemma.ffn_post_norm", [&]() {
+                    return dense_output.scalar_type() == torch::kFloat16
+                        ? gemma_rms_norm_f16(dense_output, ffn_post_norm, c)
+                        : qwen_rms_norm(
+                            dense_output.to(torch::kFloat32),
+                            ffn_post_norm, c)
+                            .to(torch::kFloat16)
+                            .contiguous();
+                });
+                auto result = g_profiler.measure("gemma.ffn_residual", [&]() {
+                    return acc_cuda(
+                        residual.reshape({B * T, H}), dense_post)
+                        .reshape({B, T, H});
+                });
+                if (layer_scale.defined()) {
+                    result = g_profiler.measure("gemma.layer_scale", [&]() {
+                        return result * layer_scale;
+                    });
+                }
+                trace_gemma_stage(layer, "layer_output", result);
+                return result;
+            }
             if (!fused_norms) {
                 dense_output = g_profiler.measure("gemma.ffn_post_norm_1", [&]() {
                     return gemma_rms_norm_f16(
@@ -11359,6 +11386,7 @@ static std::unique_ptr<Block> load_block(
         auto b = std::make_unique<FullBlock>();
         b->layer = i;
         b->gemma4 = true;
+        b->gemma4_moe = c.num_experts > 0;
         b->sliding = type == "sliding_attention";
         b->value_equals_key = !b->sliding && c.attention_k_eq_v;
         b->attention_heads = c.num_attention_heads;
@@ -11392,14 +11420,16 @@ static std::unique_ptr<Block> load_block(
             mfq, lp + "pre_feedforward_layernorm.weight");
         b->ffn_post_norm = load_dense_gpu(
             mfq, lp + "post_feedforward_layernorm.weight");
-        b->ffn_post_norm_1 = load_dense_gpu(
-            mfq, lp + "post_feedforward_layernorm_1.weight");
-        b->ffn_pre_norm_2 = load_dense_gpu(
-            mfq, lp + "pre_feedforward_layernorm_2.weight");
-        b->ffn_post_norm_2 = load_dense_gpu(
-            mfq, lp + "post_feedforward_layernorm_2.weight");
         b->layer_scale = load_dense_gpu(mfq, lp + "layer_scalar")
             .to(torch::kFloat16).contiguous();
+        if (b->gemma4_moe) {
+            b->ffn_post_norm_1 = load_dense_gpu(
+                mfq, lp + "post_feedforward_layernorm_1.weight");
+            b->ffn_pre_norm_2 = load_dense_gpu(
+                mfq, lp + "pre_feedforward_layernorm_2.weight");
+            b->ffn_post_norm_2 = load_dense_gpu(
+                mfq, lp + "post_feedforward_layernorm_2.weight");
+        }
 
         const std::string mp = lp + "mlp.";
         b->ffn.geglu = true;
@@ -11408,6 +11438,8 @@ static std::unique_ptr<Block> load_block(
             mp + "gate_proj.weight", mp + "up_proj.weight"},
             b->ffn.down);
         prepare_ffn_workspaces(b->ffn);
+
+        if (!b->gemma4_moe) return b;
 
         b->gemma_moe_gate_up = load_nint_moe_gpu(
             mfq, lp + "experts.gate_up_proj",
