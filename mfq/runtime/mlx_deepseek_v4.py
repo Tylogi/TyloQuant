@@ -54,6 +54,7 @@ from mfq.runtime.mlx_linear import (
     MlxDenseLinear,
     MlxLinearGroup,
     MlxNintModel,
+    mlx_dense_array,
 )
 from mfq.runtime.mlx_moe import MlxRoutedLinear
 
@@ -297,7 +298,7 @@ def _array(
         raise TypeError(
             f"DeepSeek-V4 tensor {name!r} must be stored densely, received {type(value).__name__}"
         )
-    return mx.contiguous(mx.array(np.ascontiguousarray(value)).astype(dtype))
+    return mx.contiguous(mlx_dense_array(value, dtype=dtype))
 
 
 def _yarn_tables(

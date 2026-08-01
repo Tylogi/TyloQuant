@@ -343,7 +343,7 @@ std::int64_t shape_product_except_axis(
 }
 
 bool is_dense_float_dtype(const std::string& dtype) {
-    return dtype == "F16" || dtype == "F32";
+    return dtype == "BF16" || dtype == "F16" || dtype == "F32";
 }
 
 bool is_supported_linear_dtype(const std::string& dtype) {
@@ -428,9 +428,9 @@ array load_norm_weight(
     const MfqContainer& model,
     const std::string& name) {
     const auto& record = model.record(name);
-    if (record.dtype != "F16" && record.dtype != "F32") {
+    if (!is_dense_float_dtype(record.dtype)) {
         throw std::runtime_error(
-            "RMSNorm requires a dense F16/F32 tensor: " + name);
+            "RMSNorm requires a dense BF16/F16/F32 tensor: " + name);
     }
     auto weight = load_dense_array(record.dtype, model.read(name));
     if (weight.ndim() != 1) {

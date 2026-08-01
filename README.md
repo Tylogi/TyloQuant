@@ -94,10 +94,19 @@ python -m mfq.tools.split_mfq --help
 ### Quantization
 
 `mfq quantize` is the stable quantization entry point. It auto-detects an HF
-safetensors directory or a BF16 GGUF file and calls the existing production
-converter directly:
+safetensors directory, a full-precision MFQ, or a full-precision GGUF and calls
+the existing production converter directly:
 
 ```bash
+# Copy HF native storage exactly into a full-precision MFQ. BF16 stays BF16;
+# block FP8/MXFP4 values and their E8M0 scales remain self-contained and exact.
+# This command performs no MFQ quantization.
+mfq quantize model-hf model-full.mfq --full-precision
+
+# Quantize that full-precision MFQ through the same NINT/VQ/NPQ/NEPQ/TPQ path.
+mfq quantize model-full.mfq model-NINT3.mfq \
+  --bits 3 --groupsize 24 --sub-bits 5 --backend cpu --device cpu
+
 # Mixed recipe from a BF16 GGUF source
 mfq quantize model-bf16.gguf model-S4-L.mfq \
   --recipe UD-Q4_K_XL.gguf --imatrix imatrix.gguf \

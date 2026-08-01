@@ -28,7 +28,7 @@ from mfq.kernels.metal.kimi_k3 import (
     situ_mul,
 )
 from mfq.kernels.metal.sampling import sample as _sample
-from mfq.runtime.mlx_linear import MlxLinearGroup, MlxNintModel
+from mfq.runtime.mlx_linear import MlxLinearGroup, MlxNintModel, mlx_dense_array
 from mfq.runtime.mlx_moe import MlxRoutedSiTUFFN
 from mfq.runtime.mlx_ops import MlxRMSNorm
 
@@ -167,7 +167,7 @@ def _dense_array(model: MlxNintModel, name: str) -> mx.array:
     value = model.tensors[name]
     if not isinstance(value, np.ndarray):
         raise TypeError(f"Kimi state tensor {name!r} must be dense")
-    return mx.array(np.ascontiguousarray(value))
+    return mlx_dense_array(value)
 
 
 def _dense_vector(model: MlxNintModel, name: str) -> mx.array:

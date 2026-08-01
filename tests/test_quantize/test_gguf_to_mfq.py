@@ -177,7 +177,7 @@ def test_iq_recipe_maps_to_supported_nint_profiles():
     assert _target_dtype("Q6_K") == "NINT6"
     assert _target_dtype("Q8_0") == "NINT8"
     assert _target_dtype("F32") == "F32"
-    assert _target_dtype("BF16") == "F16"
+    assert _target_dtype("BF16") == "BF16"
 
 
 def test_imatrix_binds_nint3_to_nint6_but_not_nint8(tmp_path):

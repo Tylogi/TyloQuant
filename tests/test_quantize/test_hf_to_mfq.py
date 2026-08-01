@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -10,10 +11,10 @@ from safetensors.torch import save_file
 
 import mfq.tools.quantize_hf_to_mfq as hf_to_mfq
 from mfq.calibration.artifact import ExpertPrecision
-from mfq.formats.nint import NintSpec
-from mfq.formats.io import load_mmap
-from mfq.formats.shards import format_shard_path
 from mfq.formats.assets import is_asset_record
+from mfq.formats.io import is_bfloat16_array, load_mmap
+from mfq.formats.nint import NintSpec
+from mfq.formats.shards import format_shard_path
 from mfq.quantize.imatrix import ImportanceEntry, ImportanceMatrix
 from mfq.tools.quantize_hf_to_mfq import (
     TensorPlan,
@@ -21,11 +22,13 @@ from mfq.tools.quantize_hf_to_mfq import (
     _dtype_for_recipe_type,
     _GlmExpertRowSource,
     _hf_to_gguf_name,
-    _plan as build_hf_plan,
     _RawSafeTensorSlice,
     _transform_glm_kv_b,
     _validate_runtime_fused_pairs,
     convert,
+)
+from mfq.tools.quantize_hf_to_mfq import (
+    _plan as build_hf_plan,
 )
 
 
@@ -135,11 +138,61 @@ def test_qwen35_mtp_hf_to_gguf_name_mapping(name, gguf_name):
     assert _hf_to_gguf_name(name) == gguf_name
 
 
-def test_recipe_dense_types_preserve_f32_and_store_bf16_as_f16():
+def test_recipe_dense_types_preserve_bf16_separately_from_f16():
     assert _dtype_for_recipe_type("F32", "F32") == "F32"
-    assert _dtype_for_recipe_type("F32", "F16") == "F16"
+    assert _dtype_for_recipe_type("F32", "F16") == "F32"
     assert _dtype_for_recipe_type("F16", "F32") == "F16"
-    assert _dtype_for_recipe_type("BF16", "F32") == "F16"
+    assert _dtype_for_recipe_type("BF16", "F32") == "BF16"
+
+
+@pytest.mark.parametrize(
+    "recipe_type,target",
+    [
+        ("IQ1_M", "NVQ1-L"),
+        ("IQ2_S", "NVQ2J-XL"),
+        ("IQ2_XS", "NVQ2J-L"),
+        ("IQ2_XXS", "NVQ2J"),
+        ("IQ3_S", "NVQ3J-L"),
+        ("IQ3_XXS", "NVQ3"),
+        ("Q8_0", "NINT8"),
+    ],
+)
+def test_hf_recipe_uses_the_same_compact_family_mapping_as_gguf(
+    recipe_type,
+    target,
+):
+    assert _dtype_for_recipe_type(recipe_type, "F32") == target
+
+
+def test_hf_recipe_plan_keeps_iq_tensor_as_vq(tmp_path):
+    root = tmp_path / "hf-recipe-vq"
+    root.mkdir()
+    name = "model.language_model.layers.0.mlp.down_proj.weight"
+    save_file(
+        {name: torch.zeros((8, 24), dtype=torch.bfloat16)},
+        root / "model.safetensors",
+    )
+    (root / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5"}),
+        encoding="utf-8",
+    )
+
+    plan = build_hf_plan(
+        root,
+        False,
+        {"blk.0.ffn_down.weight": "IQ2_XXS"},
+        "F32",
+    )
+
+    assert len(plan) == 1
+    assert plan[0].target_dtype == "NVQ2J"
+    assert plan[0].gguf_type == "IQ2_XXS"
+
+
+def test_hf_and_gguf_recipe_family_tables_cannot_diverge():
+    from mfq.tools import quantize_gguf_to_mfq as gguf_to_mfq
+
+    assert hf_to_mfq._RECIPE_TARGETS == gguf_to_mfq._RECIPE_TARGETS
 
 
 @pytest.mark.parametrize(
@@ -249,6 +302,37 @@ def test_hf_imatrix_binds_expert_wise_entries(tmp_path):
     )
 
 
+def test_hf_imatrix_binds_an_ordinary_vq_tensor(tmp_path):
+    item = TensorPlan(
+        name="model.language_model.layers.2.mlp.down_proj.weight",
+        shard="model.safetensors",
+        shape=(4, 24),
+        source_dtype="BF16",
+        target_dtype="NVQ2J",
+        gguf_name="blk.2.ffn_down.weight",
+        gguf_type="IQ2_XXS",
+    )
+    values = np.linspace(0.25, 2.0, 24, dtype=np.float32).reshape(1, 24)
+    imatrix = ImportanceMatrix(
+        path=tmp_path / "imatrix.gguf",
+        entries={
+            "blk.2.ffn_down.weight": ImportanceEntry(
+                values=values,
+                counts=np.asarray([32], dtype=np.int64),
+            )
+        },
+        datasets=("test",),
+        chunk_count=1,
+        chunk_size=24,
+        legacy=False,
+    )
+
+    binding = _bind_hf_imatrix(imatrix, [item])[item.name]
+
+    assert binding.entry_name == "blk.2.ffn_down.weight"
+    np.testing.assert_array_equal(binding.rows(0, 4), values[0])
+
+
 def test_hf_convert_passes_imatrix_rows_to_nint_writer(
     tmp_path,
     monkeypatch,
@@ -260,7 +344,7 @@ def test_hf_convert_passes_imatrix_rows_to_nint_writer(
         {
             tensor_name: torch.linspace(
                 -2.0, 2.0, steps=4 * 24, dtype=torch.float32
-            ).reshape(4, 24)
+            ).reshape(4, 24).to(torch.bfloat16)
         },
         root / "model.safetensors",
     )
@@ -321,6 +405,217 @@ def test_hf_convert_passes_imatrix_rows_to_nint_writer(
         assert header.extra["imatrix"]["bindings"] == {
             tensor_name: "blk.0.ffn_down.weight"
         }
+    finally:
+        store.close()
+
+
+def test_hf_convert_writes_an_ordinary_vq_tensor_via_precision_override(
+    tmp_path,
+):
+    root = tmp_path / "hf-vq"
+    root.mkdir()
+    tensor_name = "model.language_model.layers.0.mlp.down_proj.weight"
+    save_file(
+        {
+            tensor_name: torch.linspace(
+                -2.0,
+                2.0,
+                steps=8 * 24,
+                dtype=torch.float32,
+            ).reshape(8, 24).to(torch.bfloat16)
+        },
+        root / "model.safetensors",
+    )
+    (root / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5"}),
+        encoding="utf-8",
+    )
+    overrides = tmp_path / "overrides.json"
+    overrides.write_text(
+        json.dumps({"blk.0.ffn_down.weight": "NVQ2"}),
+        encoding="utf-8",
+    )
+    output = tmp_path / "model-vq.mfq"
+    args = hf_to_mfq.build_parser().parse_args(
+        [
+            "--input",
+            str(root),
+            "--output",
+            str(output),
+            "--tensor-precision-overrides",
+            str(overrides),
+            "--nvq-codebook-scope",
+            "fixed",
+            "--quant-backend",
+            "cpu",
+            "--device",
+            "cpu",
+            "--row-chunk",
+            "8",
+        ]
+    )
+
+    convert(args)
+
+    header, store = load_mmap(output)
+    try:
+        assert store.records[tensor_name].dtype == "NVQ2"
+        assert header.extra["target_counts"] == {"NVQ2": 1}
+        assert header.extra["tensor_precision_overrides"] == {
+            "blk.0.ffn_down.weight": "NVQ2"
+        }
+    finally:
+        store.close()
+
+
+def test_hf_convert_trains_and_writes_tensorwise_jsc_vq(tmp_path):
+    root = tmp_path / "hf-jsc"
+    root.mkdir()
+    tensor_name = "model.language_model.layers.0.mlp.down_proj.weight"
+    generator = torch.Generator().manual_seed(17)
+    save_file(
+        {
+            tensor_name: torch.randn(
+                (16, 24), generator=generator, dtype=torch.float32
+            ).to(torch.bfloat16)
+        },
+        root / "model.safetensors",
+    )
+    (root / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5"}),
+        encoding="utf-8",
+    )
+    overrides = tmp_path / "jsc-overrides.json"
+    overrides.write_text(
+        json.dumps({"blk.0.ffn_down.weight": "NVQ2J"}),
+        encoding="utf-8",
+    )
+    output = tmp_path / "model-jsc.mfq"
+    args = hf_to_mfq.build_parser().parse_args(
+        [
+            "--input",
+            str(root),
+            "--output",
+            str(output),
+            "--tensor-precision-overrides",
+            str(overrides),
+            "--quant-backend",
+            "cpu",
+            "--device",
+            "cpu",
+            "--row-chunk",
+            "8",
+            "--nvq-jsc-banks",
+            "1",
+            "--nvq-jsc-iterations",
+            "1",
+            "--nvq-codebook-train-rows",
+            "8",
+            "--nvq-codebook-validation-rows",
+            "4",
+        ]
+    )
+
+    convert(args)
+
+    header, store = load_mmap(output)
+    try:
+        assert store.records[tensor_name].dtype == "NVQ2J"
+        result = header.extra["nvq_codebooks"][tensor_name]
+        assert result["loaded"] is False
+        assert Path(result["artifact"]).is_file()
+    finally:
+        store.close()
+
+
+def test_hf_convert_matches_llamacpp_mostly_bf16_policy(tmp_path):
+    root = tmp_path / "hf-bf16"
+    root.mkdir()
+    f32_matrix = torch.tensor(
+        [[1.00390625, 1.01171875], [-2.0078125, 3.1415927]],
+        dtype=torch.float32,
+    )
+    tensors = {
+        "model.language_model.embed_tokens.weight": torch.tensor(
+            [[1.0, -2.5], [3.25, 0.125]], dtype=torch.bfloat16
+        ),
+        "model.language_model.norm.weight": torch.tensor(
+            [0.75, 1.5], dtype=torch.float32
+        ),
+        "lm_head.weight": f32_matrix,
+        "model.language_model.layers.0.linear_attn.conv1d.weight": torch.tensor(
+            [[0.125, -0.25], [0.5, 2.0]], dtype=torch.float32
+        ),
+        "model.language_model.position_ids": torch.tensor(
+            [0, 1], dtype=torch.int64
+        ),
+    }
+    save_file(tensors, root / "model.safetensors")
+    (root / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5"}), encoding="utf-8"
+    )
+    output = tmp_path / "model-bf16.mfq"
+    args = hf_to_mfq.build_parser().parse_args(
+        [
+            "--input",
+            str(root),
+            "--output",
+            str(output),
+            "--bf16",
+        ]
+    )
+
+    convert(args)
+
+    header, store = load_mmap(output)
+    try:
+        assert header.model_arch == "qwen3_5-hf-mfq-bf16"
+        assert header.extra["policy"] == "mostly-BF16;1d-and-special=F32"
+        assert header.extra["mostly_bf16"] is True
+        assert header.extra["quant_backend"] == "cpu"
+        assert header.extra["target_counts"] == {"BF16": 2, "F32": 2, "I64": 1}
+        assert store.records["model.language_model.embed_tokens.weight"].dtype == "BF16"
+        assert store.records["lm_head.weight"].dtype == "BF16"
+        assert store.records["model.language_model.norm.weight"].dtype == "F32"
+        assert (
+            store.records[
+                "model.language_model.layers.0.linear_attn.conv1d.weight"
+            ].dtype
+            == "F32"
+        )
+        assert store.records["model.language_model.position_ids"].dtype == "I64"
+        restored = store["model.language_model.embed_tokens.weight"]
+        assert is_bfloat16_array(restored)
+        np.testing.assert_array_equal(
+            restored,
+            tensors["model.language_model.embed_tokens.weight"].view(torch.uint16).numpy(),
+        )
+        # Match ggml_compute_fp32_to_bf16: quiet NaNs and round-to-nearest-even.
+        source_bits = f32_matrix.numpy().view(np.uint32)
+        source_bits = np.where(
+            (source_bits & 0x7FFFFFFF) > 0x7F800000,
+            (source_bits & np.uint32(0xFFFF0000)) | np.uint32(64 << 16),
+            source_bits,
+        )
+        expected_bf16 = (
+            (
+                source_bits.astype(np.uint64)
+                + np.uint64(0x7FFF)
+                + ((source_bits >> 16) & 1)
+            )
+            >> 16
+        ).astype(np.uint16)
+        np.testing.assert_array_equal(store["lm_head.weight"], expected_bf16)
+        np.testing.assert_array_equal(
+            store["model.language_model.norm.weight"],
+            tensors["model.language_model.norm.weight"].numpy(),
+        )
+        np.testing.assert_array_equal(
+            store["model.language_model.layers.0.linear_attn.conv1d.weight"],
+            tensors[
+                "model.language_model.layers.0.linear_attn.conv1d.weight"
+            ].numpy(),
+        )
     finally:
         store.close()
 

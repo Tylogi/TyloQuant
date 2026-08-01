@@ -159,14 +159,33 @@ class TorchNvqLinear:
         return self.forward(x)
 
 
+def _torch_dense_tensor(
+    tensor: np.ndarray,
+    device: str | torch.device,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    if io.is_bfloat16_array(tensor):
+        value = torch.from_numpy(
+            np.ascontiguousarray(tensor, dtype=np.uint16)
+        ).view(torch.bfloat16)
+    else:
+        value = torch.from_numpy(np.ascontiguousarray(tensor))
+    if dtype is None:
+        dtype = (
+            torch.bfloat16
+            if io.is_bfloat16_array(tensor)
+            else torch.float32 if tensor.dtype == np.float32 else torch.float16
+        )
+    return value.to(device=device, dtype=dtype).contiguous()
+
+
 class TorchDenseLinear:
-    """Dense GPU linear layer used for recipe tensors kept as F16/F32."""
+    """Dense GPU linear layer used for recipe tensors kept as BF16/F16/F32."""
 
     def __init__(self, tensor: np.ndarray, device: str | torch.device = "cuda") -> None:
         if tensor.ndim != 2:
             raise ValueError(f"TorchDenseLinear expects a 2D tensor, got {tensor.shape}")
-        dtype = torch.float32 if tensor.dtype == np.float32 else torch.float16
-        self.weight = torch.as_tensor(tensor, device=device, dtype=dtype).contiguous()
+        self.weight = _torch_dense_tensor(tensor, device)
         self.device = device
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -258,10 +277,18 @@ class TorchLinearGroup:
         self.nvq_pair = False
         if all(isinstance(t, np.ndarray) and t.ndim == 2 for t in tensors):
             arrays = [t for t in tensors if isinstance(t, np.ndarray)]
-            dtype = torch.float32 if any(getattr(t, "dtype", None) == np.float32 for t in arrays) else torch.float16
+            dtypes = [
+                torch.bfloat16
+                if io.is_bfloat16_array(t)
+                else torch.float32 if t.dtype == np.float32 else torch.float16
+                for t in arrays
+            ]
+            dtype = dtypes[0]
+            for value in dtypes[1:]:
+                dtype = torch.promote_types(dtype, value)
             self.out_sizes = [int(t.shape[0]) for t in arrays]
             self.dense_weight = torch.cat(
-                [torch.as_tensor(t, device=device, dtype=dtype) for t in arrays],
+                [_torch_dense_tensor(t, device, dtype=dtype) for t in arrays],
                 dim=0,
             ).contiguous()
             self.layers = []

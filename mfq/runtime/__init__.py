@@ -9,6 +9,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from mfq.runtime.dequantize import clear_backends, dequantize, register_backend
+from mfq.runtime.ffn import SwiGLUFFN, silu
+from mfq.runtime.linear import NintLinear
+from mfq.runtime.model import NintModel
 from mfq.runtime.tpq import (
     CCCPArtifact,
     TPQArtifact,
@@ -21,22 +25,12 @@ from mfq.runtime.tpq import (
     run_cccp_chat,
     run_tpq_chat,
 )
-from mfq.runtime.dequantize import clear_backends, dequantize, register_backend
-from mfq.runtime.ffn import SwiGLUFFN, silu
-from mfq.runtime.linear import NintLinear
-from mfq.runtime.model import NintModel
 
 if TYPE_CHECKING:
     from mfq.runtime.causal_lm import (
         TorchNintCausalLM,
         TorchNintCausalLMConfig,
         TorchNintCausalLMNames,
-    )
-    from mfq.runtime.tpq_mfq import (
-        MfqCccpStore,
-        MfqTpqStore,
-        NativeCCCPArtifact,
-        NativeTPQArtifact,
     )
     from mfq.runtime.mlx_attention import MlxKVCache, MlxSlidingWindowKVCache
     from mfq.runtime.mlx_causal_lm import (
@@ -45,14 +39,6 @@ if TYPE_CHECKING:
         MlxCausalLMNames,
         MlxFullAttentionBlock,
         MlxQwen35LinearAttentionBlock,
-    )
-    from mfq.runtime.mlx_tpq import (
-        MlxCccpInt4Embedding,
-        MlxCccpInt4Linear,
-        MlxCccpPqLinear,
-        MlxTpqInt4Embedding,
-        MlxTpqInt4Linear,
-        MlxTpqPqLinear,
     )
     from mfq.runtime.mlx_deepseek_v4 import (
         MlxDeepseekV4,
@@ -91,6 +77,8 @@ if TYPE_CHECKING:
         MlxDenseEmbedding,
         MlxDenseLinear,
         MlxLinearGroup,
+        MlxMxEmbedding,
+        MlxMxLinear,
         MlxNint8ZeroEmbedding,
         MlxNint8ZeroLinear,
         MlxNintEmbedding,
@@ -104,7 +92,21 @@ if TYPE_CHECKING:
         MlxRoutedSwiGLUFFN,
     )
     from mfq.runtime.mlx_ops import MlxRMSNorm, MlxRoPE
+    from mfq.runtime.mlx_tpq import (
+        MlxCccpInt4Embedding,
+        MlxCccpInt4Linear,
+        MlxCccpPqLinear,
+        MlxTpqInt4Embedding,
+        MlxTpqInt4Linear,
+        MlxTpqPqLinear,
+    )
     from mfq.runtime.mlx_vq import MlxVqEmbedding, MlxVqLinear
+    from mfq.runtime.tpq_mfq import (
+        MfqCccpStore,
+        MfqTpqStore,
+        NativeCCCPArtifact,
+        NativeTPQArtifact,
+    )
 
 
 _TORCH_EXPORTS = {
@@ -127,12 +129,11 @@ _MLX_EXPORTS = {
     "MlxTpqInt4Embedding",
     "MlxTpqInt4Linear",
     "MlxTpqPqLinear",
-    "MlxTpqInt4Embedding",
-    "MlxTpqInt4Linear",
-    "MlxTpqPqLinear",
     "MlxDenseEmbedding",
     "MlxDenseLinear",
     "MlxLinearGroup",
+    "MlxMxEmbedding",
+    "MlxMxLinear",
     "MlxNint8ZeroEmbedding",
     "MlxNint8ZeroLinear",
     "MlxNintEmbedding",
@@ -287,6 +288,9 @@ __all__ = [
     "MlxCccpInt4Embedding",
     "MlxCccpInt4Linear",
     "MlxCccpPqLinear",
+    "MlxTpqInt4Embedding",
+    "MlxTpqInt4Linear",
+    "MlxTpqPqLinear",
     "MlxDenseEmbedding",
     "MlxDenseLinear",
     "MlxDeepseekV4",
@@ -321,6 +325,8 @@ __all__ = [
     "MlxKimiMoE",
     "MlxKimiSiTUFFN",
     "MlxLinearGroup",
+    "MlxMxEmbedding",
+    "MlxMxLinear",
     "MlxNint8ZeroEmbedding",
     "MlxNint8ZeroLinear",
     "MlxNintEmbedding",

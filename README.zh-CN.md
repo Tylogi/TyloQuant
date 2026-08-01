@@ -74,10 +74,18 @@ mfq quantize --help
 
 ### 量化
 
-`mfq quantize` 是稳定的统一量化入口。它会自动识别 HF safetensors 目录或
-BF16 GGUF 文件，并直接调用现有生产量化器：
+`mfq quantize` 是稳定的统一量化入口。它会自动识别 HF safetensors 目录、
+满精度 MFQ 或满精度 GGUF，并直接调用现有生产量化器：
 
 ```bash
+# 把 HF 原生存储逐字节写入满精度 MFQ：BF16 仍是 BF16，
+# block FP8/MXFP4 及其 E8M0 scale 自包含保留。这一步不做 MFQ 量化。
+mfq quantize model-hf model-full.mfq --full-precision
+
+# 满精度 MFQ 再复用同一套 NINT/VQ/NPQ/NEPQ/TPQ 量化路径
+mfq quantize model-full.mfq model-NINT3.mfq \
+  --bits 3 --groupsize 24 --sub-bits 5 --backend cpu --device cpu
+
 # BF16 GGUF，按混合精度 recipe 量化
 mfq quantize model-bf16.gguf model-S4-L.mfq \
   --recipe UD-Q4_K_XL.gguf --imatrix imatrix.gguf \

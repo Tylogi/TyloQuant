@@ -175,3 +175,107 @@ def test_quantize_routes_hf_imatrix(tmp_path: Path, monkeypatch) -> None:
     )
     assert len(captured) == 1
     assert captured[0].imatrix == str(imatrix)
+
+
+def test_quantize_routes_hf_vq_options_and_overrides(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _hf_source(tmp_path)
+    overrides = tmp_path / "overrides.json"
+    captured: list[argparse.Namespace] = []
+    monkeypatch.setattr(
+        "mfq.tools.quantize_hf_to_mfq.convert", captured.append
+    )
+
+    assert (
+        cli.main(
+            [
+                "quantize",
+                str(source),
+                str(tmp_path / "model.mfq"),
+                "--tensor-overrides",
+                str(overrides),
+                "--nvq-codebook-scope",
+                "fixed",
+                "--nvq-calibration",
+                "none",
+                "--nvq3-jsc-512",
+                "--q8-mode",
+                "nint8-0",
+            ]
+        )
+        == 0
+    )
+    assert len(captured) == 1
+    args = captured[0]
+    assert args.tensor_precision_overrides == str(overrides)
+    assert args.nvq_codebook_scope == "fixed"
+    assert args.nvq_calibration == "none"
+    assert args.nvq3_jsc_512 is True
+    assert args.q8_to_nint8_zero is True
+
+
+def test_quantize_routes_hf_bf16(tmp_path: Path, monkeypatch) -> None:
+    source = _hf_source(tmp_path)
+    captured: list[argparse.Namespace] = []
+    monkeypatch.setattr(
+        "mfq.tools.convert_hf_to_full_mfq.convert", captured.append
+    )
+
+    assert (
+        cli.main(
+            [
+                "quantize",
+                str(source),
+                str(tmp_path / "model.mfq"),
+                "--full-precision",
+            ]
+        )
+        == 0
+    )
+
+    assert len(captured) == 1
+    assert captured[0].input == str(source.resolve())
+
+
+def test_quantize_auto_detects_and_routes_full_precision_mfq(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "full.mfq"
+    source.write_bytes(b"MFQ1")
+    captured: list[argparse.Namespace] = []
+    monkeypatch.setattr(
+        "mfq.tools.quantize_hf_to_mfq.convert", captured.append
+    )
+
+    assert (
+        cli.main(
+            [
+                "quantize",
+                str(source),
+                str(tmp_path / "low.mfq"),
+                "--bits",
+                "3",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    assert captured[0].input_mfq == str(source.resolve())
+    assert captured[0].bits == 3
+
+
+def test_quantize_rejects_bf16_with_quantization_recipe(tmp_path: Path) -> None:
+    source = _hf_source(tmp_path)
+    with pytest.raises(ValueError, match="cannot be combined"):
+        cli.main(
+            [
+                "quantize",
+                str(source),
+                str(tmp_path / "model.mfq"),
+                "--bf16",
+                "--recipe",
+                str(tmp_path / "recipe.gguf"),
+            ]
+        )

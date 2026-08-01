@@ -81,6 +81,24 @@ def test_pack_roundtrip_dequant():
     np.testing.assert_allclose(nint_quant.dequantize(t2), nint_quant.dequantize(t))
 
 
+def test_dense_bfloat16_roundtrip_preserves_raw_bits():
+    bits = np.asarray(
+        [[0x3F80, 0xC020], [0x0000, 0x7F80]],
+        dtype="<u2",
+    ).view(io.BFloat16Array)
+
+    dtype, blob = io.pack_dense(bits)
+    restored = io.unpack_dense(dtype, blob)
+
+    assert dtype == "BF16"
+    assert io.is_bfloat16_array(restored)
+    np.testing.assert_array_equal(np.asarray(restored), np.asarray(bits))
+    np.testing.assert_array_equal(
+        io.bfloat16_to_float32(restored),
+        np.asarray([[1.0, -2.5], [0.0, np.inf]], dtype=np.float32),
+    )
+
+
 def test_pack_nint_uses_bitpacked_payload():
     t = _mk(6, (128, 5120))
     blob = io.pack_nint(t)

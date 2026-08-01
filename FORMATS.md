@@ -245,7 +245,9 @@ native C++ loader及整模 KLD，因此不计入当前16种正式格式。
 | Expert-Wise Precision | 为每个 routed expert 独立选择任一正式精度家族 | 否 |
 | NINTM | 在一个 MoE tensor 中保存多个同质 precision cohort | 否，属于容器 |
 
-F16/F32 小参数是未量化保留精度，也不计入 17 种自定义格式。
+BF16/F16/F32 小参数和权重，以及模型原生的 block-FP8/MXFP4 权重，
+都属于未经 MFQ 量化的保留精度，不计入上述自定义量化格式。MXFP8/MXFP4 在 MFQ 中
+将原始 value 字节和 E8M0 scale 封装为一个自包含记录，不做 FP16 降精度。
 
 ## 单文件运行附件
 

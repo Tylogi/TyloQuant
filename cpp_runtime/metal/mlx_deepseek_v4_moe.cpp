@@ -39,7 +39,9 @@ array load_dense(
         dtype == mlx::core::int32;
     const bool supported = integer_target
         ? (record.dtype == "I32" || record.dtype == "I64")
-        : (record.dtype == "F16" || record.dtype == "F32");
+        : (record.dtype == "BF16" ||
+           record.dtype == "F16" ||
+           record.dtype == "F32");
     if (!supported) {
         throw std::runtime_error(
             "DeepSeek-V4 dense tensor has incompatible dtype: "

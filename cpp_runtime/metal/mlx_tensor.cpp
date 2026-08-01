@@ -44,6 +44,9 @@ private:
 };
 
 std::pair<Dtype, std::size_t> dense_dtype(const std::string& name) {
+    if (name == "BF16") {
+        return {mlx::core::bfloat16, 2};
+    }
     if (name == "F16") {
         return {mlx::core::float16, 2};
     }
@@ -63,9 +66,11 @@ array load_weight(
     const MfqContainer& model,
     const std::string& name) {
     const auto& record = model.record(name);
-    if (record.dtype != "F16" && record.dtype != "F32") {
+    if (record.dtype != "BF16" &&
+        record.dtype != "F16" &&
+        record.dtype != "F32") {
         throw std::runtime_error(
-            "dense linear/embedding requires F16 or F32 tensor: " + name);
+            "dense linear/embedding requires BF16, F16, or F32 tensor: " + name);
     }
     auto result = load_dense_array(record.dtype, model.read(name));
     if (result.ndim() != 2) {
@@ -144,6 +149,10 @@ MlxLinear MlxLinear::load(
                 record.dtype,
                 model.read(name)));
     }
+    if (is_mx_dtype(record.dtype)) {
+        return MlxLinear(
+            MlxMxWeight::from_blob(record.dtype, model.read(name)));
+    }
     return MlxLinear(load_weight(model, name));
 }
 
@@ -168,6 +177,11 @@ MlxLinear::MlxLinear(MlxCccpInt4Weight weight)
       weight_(std::move(weight)) {}
 
 MlxLinear::MlxLinear(MlxCccpPqWeight weight)
+    : input_size_(weight.input_size()),
+      output_size_(weight.output_size()),
+      weight_(std::move(weight)) {}
+
+MlxLinear::MlxLinear(MlxMxWeight weight)
     : input_size_(weight.input_size()),
       output_size_(weight.output_size()),
       weight_(std::move(weight)) {}
@@ -202,6 +216,9 @@ array MlxLinear::operator()(const array& input) const {
     }
     if (const auto* packed =
             std::get_if<MlxCccpPqWeight>(&weight_)) {
+        return packed->matmul(input);
+    }
+    if (const auto* packed = std::get_if<MlxMxWeight>(&weight_)) {
         return packed->matmul(input);
     }
     const auto& dense = std::get<array>(weight_);
@@ -340,6 +357,10 @@ MlxEmbedding MlxEmbedding::load(
             "CCCP learned-PQ tensors do not support embedding lookup: " +
             name);
     }
+    if (is_mx_dtype(record.dtype)) {
+        return MlxEmbedding(
+            MlxMxWeight::from_blob(record.dtype, model.read(name)));
+    }
     return MlxEmbedding(load_weight(model, name));
 }
 
@@ -359,6 +380,11 @@ MlxEmbedding::MlxEmbedding(MlxVqWeight weight)
       weight_(std::move(weight)) {}
 
 MlxEmbedding::MlxEmbedding(MlxCccpInt4Weight weight)
+    : vocabulary_size_(weight.output_size()),
+      hidden_size_(weight.input_size()),
+      weight_(std::move(weight)) {}
+
+MlxEmbedding::MlxEmbedding(MlxMxWeight weight)
     : vocabulary_size_(weight.output_size()),
       hidden_size_(weight.input_size()),
       weight_(std::move(weight)) {}
@@ -388,6 +414,9 @@ array MlxEmbedding::operator()(
     }
     if (const auto* packed =
             std::get_if<MlxCccpInt4Weight>(&weight_)) {
+        return packed->embedding(token_ids, dtype);
+    }
+    if (const auto* packed = std::get_if<MlxMxWeight>(&weight_)) {
         return packed->embedding(token_ids, dtype);
     }
     auto ids = token_ids;
@@ -422,6 +451,9 @@ array MlxEmbedding::project(const array& input) const {
     }
     if (const auto* packed =
             std::get_if<MlxCccpInt4Weight>(&weight_)) {
+        return packed->matmul(input);
+    }
+    if (const auto* packed = std::get_if<MlxMxWeight>(&weight_)) {
         return packed->matmul(input);
     }
     const auto& dense = std::get<array>(weight_);

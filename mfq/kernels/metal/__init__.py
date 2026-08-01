@@ -2,30 +2,6 @@
 
 from __future__ import annotations
 
-from mfq.kernels.metal.tpq import (
-    MetalCccpInt4Weight,
-    MetalCccpMoeWeight,
-    MetalCccpPqWeight,
-    MetalTpqInt4Weight,
-    MetalTpqMoeWeight,
-    MetalTpqPqWeight,
-    cccp_grouped_moe_matmul,
-    cccp_int4_dequantize,
-    cccp_int4_embedding,
-    cccp_int4_grouped_row_matmul,
-    cccp_int4_matmul,
-    cccp_pq_dequantize,
-    cccp_pq_matmul,
-    cccp_pq_routed_matmul,
-    tpq_grouped_moe_matmul,
-    tpq_int4_dequantize,
-    tpq_int4_embedding,
-    tpq_int4_grouped_row_matmul,
-    tpq_int4_matmul,
-    tpq_pq_dequantize,
-    tpq_pq_matmul,
-    tpq_pq_routed_matmul,
-)
 from mfq.kernels.metal.deepseek_v4 import (
     Dsv4PoolStep,
     Dsv4PoolUpdate,
@@ -87,6 +63,12 @@ from mfq.kernels.metal.moe_ops import (
     weighted_reduce,
     weighted_reduce_shared_gate,
 )
+from mfq.kernels.metal.mx import (
+    MetalMxWeight,
+    mx_dequantize,
+    mx_embedding,
+    mx_matmul,
+)
 from mfq.kernels.metal.nint import (
     MetalNintWeight,
     nint_dequantize,
@@ -131,6 +113,30 @@ from mfq.kernels.metal.sampling import (
     sample_token_counts_add,
     sample_top_k_top_p,
 )
+from mfq.kernels.metal.tpq import (
+    MetalCccpInt4Weight,
+    MetalCccpMoeWeight,
+    MetalCccpPqWeight,
+    MetalTpqInt4Weight,
+    MetalTpqMoeWeight,
+    MetalTpqPqWeight,
+    cccp_grouped_moe_matmul,
+    cccp_int4_dequantize,
+    cccp_int4_embedding,
+    cccp_int4_grouped_row_matmul,
+    cccp_int4_matmul,
+    cccp_pq_dequantize,
+    cccp_pq_matmul,
+    cccp_pq_routed_matmul,
+    tpq_grouped_moe_matmul,
+    tpq_int4_dequantize,
+    tpq_int4_embedding,
+    tpq_int4_grouped_row_matmul,
+    tpq_int4_matmul,
+    tpq_pq_dequantize,
+    tpq_pq_matmul,
+    tpq_pq_routed_matmul,
+)
 from mfq.kernels.metal.vq import (
     MetalVqWeight,
     signed_hadamard,
@@ -154,6 +160,7 @@ __all__ = [
     "MetalCccpPqWeight",
     "MetalLinearGroupWeight",
     "MetalMoeWeight",
+    "MetalMxWeight",
     "MetalNint8ZeroWeight",
     "MetalNint8OneBlocks",
     "MetalNintWeight",
@@ -214,6 +221,9 @@ __all__ = [
     "kimi_route_experts",
     "kimi_short_conv3",
     "moe_topk",
+    "mx_dequantize",
+    "mx_embedding",
+    "mx_matmul",
     "nint_dequantize",
     "nint_dequantize_matmul",
     "nint_embedding",

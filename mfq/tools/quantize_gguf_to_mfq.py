@@ -236,7 +236,7 @@ _RECIPE_TARGETS = {
     "Q8_0": "NINT8",
     "F32": "F32",
     "F16": "F16",
-    "BF16": "F16",
+    "BF16": "BF16",
 }
 
 _NINT_SPECS = {

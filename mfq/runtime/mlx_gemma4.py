@@ -37,7 +37,7 @@ from mfq.runtime.mlx_attention import (
     MlxSlidingWindowKVCache,
     attention,
 )
-from mfq.runtime.mlx_linear import MlxLinearGroup, MlxNintModel
+from mfq.runtime.mlx_linear import MlxLinearGroup, MlxNintModel, mlx_dense_array
 from mfq.runtime.mlx_moe import MlxRoutedLinear
 from mfq.runtime.mlx_ops import MlxRMSNorm, MlxRoPE
 
@@ -187,7 +187,7 @@ def _dense_array(model: MlxNintModel, name: str) -> mx.array:
     value = model.tensors[name]
     if not isinstance(value, np.ndarray):
         raise TypeError(f"Gemma4 tensor {name!r} must be dense")
-    return mx.array(np.ascontiguousarray(value))
+    return mlx_dense_array(value)
 
 
 def _dense_vector(model: MlxNintModel, name: str) -> mx.array:

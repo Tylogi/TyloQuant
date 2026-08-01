@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 from mfq.formats.shards import parse_size
@@ -17,14 +18,15 @@ from mfq.formats.shards import parse_size
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser(
         "quantize",
-        help="quantize an HF or BF16 GGUF model to MFQ",
+        help="convert or quantize HF, GGUF, and full-precision MFQ models",
         description=(
-            "Quantize an HF safetensors directory or a BF16 GGUF file. "
+            "Quantize an HF safetensors directory, a full-precision MFQ, "
+            "or a full-precision GGUF. "
             "A GGUF recipe defines mixed tensor precision; --scheme adds "
             "per-tensor or expert-wise (EW) overrides."
         ),
     )
-    parser.add_argument("input", help="HF checkpoint directory or BF16 GGUF file")
+    parser.add_argument("input", help="HF checkpoint directory, GGUF, or MFQ file")
     parser.add_argument("output", help="output .mfq path")
     source = parser.add_argument_group("source")
     precision = parser.add_argument_group("precision and metadata")
@@ -33,9 +35,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     output = parser.add_argument_group("output and restart")
     source.add_argument(
         "--source-format",
-        choices=("auto", "hf", "gguf"),
+        choices=("auto", "hf", "gguf", "mfq"),
         default="auto",
-        help="source layout; auto detects a directory as HF and a .gguf file as GGUF",
+        help="source layout; auto detects HF directories and .gguf/.mfq files",
     )
     precision.add_argument(
         "--recipe",
@@ -79,10 +81,37 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="mapping for recipe Q8_0 tensors",
     )
     precision.add_argument(
+        "--nvq-calibration",
+        choices=("auto", "none", "gain", "group24"),
+        default="auto",
+    )
+    precision.add_argument("--nvq3-jsc", action="store_true")
+    precision.add_argument("--nvq3-jsc-512", action="store_true")
+    precision.add_argument("--nvq3-to-nint3", action="store_true")
+    precision.add_argument("--iq2-s-to-nint2", action="store_true")
+    precision.add_argument("--npq0-l", action="store_true")
+    precision.add_argument(
+        "--nvq-codebook-scope",
+        choices=("fixed", "tensor"),
+        default="tensor",
+    )
+    precision.add_argument("--nvq-codebook-artifact-dir", default="")
+    precision.add_argument("--nvq-jsc-row-importance", default="")
+    precision.add_argument(
         "--dense-dtype",
         choices=("f16", "f32"),
         default="f32",
         help="HF dtype for recipe tensors left unquantized",
+    )
+    precision.add_argument(
+        "--full-precision",
+        "--bf16",
+        dest="bf16",
+        action="store_true",
+        help=(
+            "copy HF native BF16, block-FP8, and MXFP4 tensors into a "
+            "full-precision MFQ without MFQ quantization (--bf16 is a legacy alias)"
+        ),
     )
     source.add_argument("--text-only", action="store_true", help="omit non-language tensors")
     source.add_argument("--exclude-mtp", action="store_true", help="omit recipe-only MTP blocks")
@@ -119,6 +148,40 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="IN output byte budget; defaults to recipe file size",
     )
     execution.add_argument("--row-chunk", type=int, default=1024)
+    execution.add_argument("--nvq-group-chunk", type=int, default=32768)
+    execution.add_argument("--nvq-search-steps", type=int, default=19)
+    execution.add_argument(
+        "--nvq-assignment", choices=("native", "torch"), default="native"
+    )
+    execution.add_argument("--nvq-jsc-banks", type=int, choices=(1, 2, 4), default=4)
+    execution.add_argument("--nvq-jsc-iterations", type=int, default=4)
+    execution.add_argument("--nvq-jsc-assignment-refine-steps", type=int, default=2)
+    execution.add_argument("--nvq-jsc-raw-multiplier", type=int, default=8)
+    execution.add_argument("--nvq3-jsc-banks", type=int, choices=(1, 2, 4), default=2)
+    execution.add_argument("--nvq3-jsc-learned-scale", action="store_true")
+    execution.add_argument("--npq0-l-iterations", type=int, default=4)
+    execution.add_argument("--npq0-l-assignment-refine-steps", type=int, default=2)
+    execution.add_argument("--npq0-l-fixed-refine-steps", type=int, default=3)
+    execution.add_argument("--npq0-l-kmeans-iterations", type=int, default=8)
+    execution.add_argument("--npq0-l-group-chunk", type=int, default=512)
+    execution.add_argument("--nvq1-l-candidates", type=int, default=0)
+    execution.add_argument(
+        "--nvq1-l-anchor-multipliers",
+        type=float,
+        nargs="+",
+        default=(0.75,),
+    )
+    execution.add_argument("--nvq1-l-refine-steps", type=int, default=2)
+    execution.add_argument(
+        "--nvq1-l-assignment", choices=("native", "torch"), default="native"
+    )
+    execution.add_argument("--nvq-codebook-train-rows", type=int, default=2048)
+    execution.add_argument("--nvq-codebook-validation-rows", type=int, default=512)
+    execution.add_argument("--nvq-codebook-row-chunk", type=int, default=512)
+    execution.add_argument("--nvq-codebook-iterations", type=int, default=4)
+    execution.add_argument("--nvq-codebook-projection-candidates", type=int, default=48)
+    execution.add_argument("--nvq-codebook-min-improvement", type=float, default=0.0)
+    execution.add_argument("--nvq-codebook-seed", type=int, default=20260716)
     execution.add_argument("--backend", choices=("auto", "cuda", "cpu"), default="cuda")
     execution.add_argument("--device", default="cuda")
     split = output.add_mutually_exclusive_group()
@@ -165,6 +228,11 @@ def _detect_source(path: Path, requested: str) -> str:
         raise ValueError(f"cannot detect an HF safetensors checkpoint under {path}")
     if path.is_file() and path.suffix.lower() == ".gguf":
         return "gguf"
+    if path.is_file() and (
+        path.suffix.lower() == ".mfq"
+        or re.search(r"-[0-9]{5}-of-[0-9]{5}\.mfq$", path.name)
+    ):
+        return "mfq"
     raise ValueError(f"cannot detect source format for {path}")
 
 
@@ -178,11 +246,65 @@ def _append_flag(argv: list[str], option: str, enabled: bool) -> None:
         argv.append(option)
 
 
+def _append_vq_arguments(argv: list[str], args: argparse.Namespace) -> None:
+    for option, value in (
+        ("--nvq-calibration", args.nvq_calibration),
+        ("--nvq-codebook-scope", args.nvq_codebook_scope),
+        ("--nvq-codebook-artifact-dir", args.nvq_codebook_artifact_dir),
+        ("--nvq-jsc-row-importance", args.nvq_jsc_row_importance),
+        ("--nvq-group-chunk", args.nvq_group_chunk),
+        ("--nvq-search-steps", args.nvq_search_steps),
+        ("--nvq-assignment", args.nvq_assignment),
+        ("--nvq-jsc-banks", args.nvq_jsc_banks),
+        ("--nvq-jsc-iterations", args.nvq_jsc_iterations),
+        (
+            "--nvq-jsc-assignment-refine-steps",
+            args.nvq_jsc_assignment_refine_steps,
+        ),
+        ("--nvq-jsc-raw-multiplier", args.nvq_jsc_raw_multiplier),
+        ("--nvq3-jsc-banks", args.nvq3_jsc_banks),
+        ("--npq0-l-iterations", args.npq0_l_iterations),
+        (
+            "--npq0-l-assignment-refine-steps",
+            args.npq0_l_assignment_refine_steps,
+        ),
+        ("--npq0-l-fixed-refine-steps", args.npq0_l_fixed_refine_steps),
+        ("--npq0-l-kmeans-iterations", args.npq0_l_kmeans_iterations),
+        ("--npq0-l-group-chunk", args.npq0_l_group_chunk),
+        ("--nvq1-l-candidates", args.nvq1_l_candidates),
+        ("--nvq1-l-refine-steps", args.nvq1_l_refine_steps),
+        ("--nvq1-l-assignment", args.nvq1_l_assignment),
+        ("--nvq-codebook-train-rows", args.nvq_codebook_train_rows),
+        ("--nvq-codebook-validation-rows", args.nvq_codebook_validation_rows),
+        ("--nvq-codebook-row-chunk", args.nvq_codebook_row_chunk),
+        ("--nvq-codebook-iterations", args.nvq_codebook_iterations),
+        (
+            "--nvq-codebook-projection-candidates",
+            args.nvq_codebook_projection_candidates,
+        ),
+        ("--nvq-codebook-min-improvement", args.nvq_codebook_min_improvement),
+        ("--nvq-codebook-seed", args.nvq_codebook_seed),
+    ):
+        _append_value(argv, option, value)
+    if args.nvq1_l_anchor_multipliers:
+        argv.append("--nvq1-l-anchor-multipliers")
+        argv.extend(str(value) for value in args.nvq1_l_anchor_multipliers)
+    for option, enabled in (
+        ("--nvq3-jsc", args.nvq3_jsc),
+        ("--nvq3-jsc-512", args.nvq3_jsc_512),
+        ("--nvq3-to-nint3", args.nvq3_to_nint3),
+        ("--iq2-s-to-nint2", args.iq2_s_to_nint2),
+        ("--npq0-l", args.npq0_l),
+        ("--nvq3-jsc-learned-scale", args.nvq3_jsc_learned_scale),
+    ):
+        _append_flag(argv, option, enabled)
+
+
 def _infer_in_layers(recipe: Path) -> int:
     from mfq.tools.quantize_gguf_to_mfq import _field_value, _load_gguf
 
-    GGUFReader, _dequantize = _load_gguf()
-    reader = GGUFReader(str(recipe), "r")
+    gguf_reader_class, _dequantize = _load_gguf()
+    reader = gguf_reader_class(str(recipe), "r")
     architecture = _field_value(reader, "general.architecture", "")
     value = _field_value(reader, f"{architecture}.block_count", None)
     if not isinstance(value, int) or value <= 0:
@@ -217,17 +339,23 @@ def _gguf_arguments(args: argparse.Namespace, output: Path) -> argparse.Namespac
     _append_value(argv, "--split-max-tensors", args.split_max_tensors)
     _append_flag(argv, "--exclude-mtp", args.exclude_mtp)
     _append_flag(argv, "--q8-to-nint8-zero", args.q8_mode == "nint8-0")
+    _append_vq_arguments(argv, args)
     _append_flag(argv, "--dry-run", args.dry_run)
     _append_flag(argv, "--overwrite", args.overwrite)
     _append_flag(argv, "--keep-temp", args.keep_temp)
     return build_parser().parse_args(argv)
 
 
-def _hf_arguments(args: argparse.Namespace, output: Path) -> argparse.Namespace:
+def _hf_arguments(
+    args: argparse.Namespace,
+    output: Path,
+    *,
+    input_option: str = "--input",
+) -> argparse.Namespace:
     from mfq.tools.quantize_hf_to_mfq import build_parser
 
     argv = [
-        "--input",
+        input_option,
         str(Path(args.input).resolve()),
         "--output",
         str(output),
@@ -250,12 +378,44 @@ def _hf_arguments(args: argparse.Namespace, output: Path) -> argparse.Namespace:
     _append_value(argv, "--tokenizer-gguf", args.tokenizer)
     _append_value(argv, "--model-config", args.model_config)
     _append_value(argv, "--calibration-scheme", args.scheme)
+    _append_value(argv, "--tensor-precision-overrides", args.tensor_overrides)
     _append_value(argv, "--imatrix", args.imatrix)
     _append_value(argv, "--split-max-size", args.split_max_size)
     _append_value(argv, "--split-max-tensors", args.split_max_tensors)
     _append_value(argv, "--temp-dir", args.temp_dir)
     _append_flag(argv, "--text-only", args.text_only)
+    _append_flag(argv, "--bf16", args.bf16)
+    _append_flag(argv, "--q8-to-nint8-zero", args.q8_mode == "nint8-0")
+    _append_vq_arguments(argv, args)
     _append_flag(argv, "--resume-temp", args.resume)
+    _append_flag(argv, "--dry-run", args.dry_run)
+    _append_flag(argv, "--overwrite", args.overwrite)
+    _append_flag(argv, "--keep-temp", args.keep_temp)
+    return build_parser().parse_args(argv)
+
+
+def _mfq_arguments(args: argparse.Namespace, output: Path) -> argparse.Namespace:
+    return _hf_arguments(args, output, input_option="--input-mfq")
+
+
+def _full_precision_arguments(
+    args: argparse.Namespace,
+    output: Path,
+) -> argparse.Namespace:
+    from mfq.tools.convert_hf_to_full_mfq import build_parser
+
+    argv = [
+        "--input",
+        str(Path(args.input).resolve()),
+        "--output",
+        str(output),
+    ]
+    _append_value(argv, "--tokenizer-gguf", args.tokenizer)
+    _append_value(argv, "--model-config", args.model_config)
+    _append_value(argv, "--split-max-size", args.split_max_size)
+    _append_value(argv, "--split-max-tensors", args.split_max_tensors)
+    _append_value(argv, "--temp-dir", args.temp_dir)
+    _append_flag(argv, "--resume", args.resume)
     _append_flag(argv, "--dry-run", args.dry_run)
     _append_flag(argv, "--overwrite", args.overwrite)
     _append_flag(argv, "--keep-temp", args.keep_temp)
@@ -297,6 +457,24 @@ def _run_in(args: argparse.Namespace, baseline: Path, output: Path) -> None:
 
 
 def _validate(args: argparse.Namespace, source_format: str) -> None:
+    if args.bf16 and source_format != "hf":
+        raise ValueError("--full-precision requires an HF safetensors source")
+    if args.bf16 and (args.recipe or args.scheme or args.imatrix):
+        raise ValueError(
+            "--full-precision cannot be combined with --recipe, --scheme, or --imatrix"
+        )
+    if args.bf16 and args.tensor_overrides:
+        raise ValueError("--tensor-overrides do not apply to --full-precision")
+    if args.bf16 and args.important_neurons:
+        raise ValueError(
+            "--full-precision cannot be combined with important-neuron quantization"
+        )
+    if args.bf16 and (args.bits, args.groupsize, args.sub_bits) != (4, 24, 6):
+        raise ValueError(
+            "--bits, --groupsize, and --sub-bits do not apply to --full-precision"
+        )
+    if args.bf16 and args.dense_dtype != "f32":
+        raise ValueError("--dense-dtype does not apply to --full-precision")
     if source_format == "gguf" and not args.recipe:
         raise ValueError("GGUF quantization requires --recipe")
     if source_format == "gguf" and args.text_only:
@@ -311,12 +489,8 @@ def _validate(args: argparse.Namespace, source_format: str) -> None:
         raise ValueError("--temp-dir is only valid for an HF source")
     if source_format == "gguf" and args.resume and not args.important_neurons:
         raise ValueError("GGUF resume requires --resume-completed N")
-    if source_format == "hf" and args.tensor_overrides:
-        raise ValueError("--tensor-overrides currently requires a BF16 GGUF source")
-    if source_format == "hf" and args.exclude_mtp:
-        raise ValueError("--exclude-mtp currently requires a BF16 GGUF source")
-    if source_format == "hf" and args.q8_mode != "nint8":
-        raise ValueError("--q8-mode is only valid for a GGUF recipe conversion")
+    if source_format in {"hf", "mfq"} and args.exclude_mtp:
+        raise ValueError("--exclude-mtp currently requires a GGUF source")
     if args.resume_completed and source_format != "gguf":
         raise ValueError("--resume-completed is only valid for GGUF quantization")
     if args.important_neurons < 0:
@@ -349,6 +523,7 @@ def run(args: argparse.Namespace) -> int:
                 "recipe": str(Path(args.recipe).resolve()) if args.recipe else None,
                 "scheme": str(Path(args.scheme).resolve()) if args.scheme else None,
                 "imatrix": str(Path(args.imatrix).resolve()) if args.imatrix else None,
+                "full_precision": args.bf16,
                 "important_neurons": args.important_neurons or None,
             },
             ensure_ascii=False,
@@ -357,9 +532,20 @@ def run(args: argparse.Namespace) -> int:
     )
 
     if source_format == "hf":
+        if args.bf16:
+            from mfq.tools.convert_hf_to_full_mfq import convert
+
+            convert(_full_precision_arguments(args, output))
+            return 0
         from mfq.tools.quantize_hf_to_mfq import convert
 
         convert(_hf_arguments(args, output))
+        return 0
+
+    if source_format == "mfq":
+        from mfq.tools.quantize_hf_to_mfq import convert
+
+        convert(_mfq_arguments(args, output))
         return 0
 
     from mfq.tools.quantize_gguf_to_mfq import convert

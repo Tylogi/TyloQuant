@@ -27,9 +27,11 @@ array load_dense(
     const MfqContainer& model,
     const std::string& name) {
     const auto& record = model.record(name);
-    if (record.dtype != "F16" && record.dtype != "F32") {
+    if (record.dtype != "BF16" &&
+        record.dtype != "F16" &&
+        record.dtype != "F32") {
         throw std::runtime_error(
-            "Qwen3.5 linear-attention tensor must be dense: " +
+            "Qwen3.5 linear-attention tensor must be dense BF16/F16/F32: " +
             name);
     }
     return load_dense_array(record.dtype, model.read(name));

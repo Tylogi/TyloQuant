@@ -500,11 +500,15 @@ std::uint64_t checked_multiply(
 }
 
 bool is_dense_float_dtype(std::string_view dtype) {
-    return dtype == "F16" || dtype == "F32";
+    return dtype == "BF16" || dtype == "F16" || dtype == "F32";
 }
 
 bool is_dense_integer_dtype(std::string_view dtype) {
     return dtype == "I32" || dtype == "I64";
+}
+
+bool is_mx_dtype(std::string_view dtype) {
+    return dtype == "MXFP4" || dtype == "MXFP8";
 }
 
 bool is_nint_dtype(std::string_view dtype) {
@@ -543,6 +547,7 @@ bool is_tpq_tier(
 
 bool is_linear_dtype(std::string_view dtype) {
     return is_dense_float_dtype(dtype) ||
+        is_mx_dtype(dtype) ||
         is_nint_dtype(dtype) ||
         dtype == "NINT8-0" ||
         is_tpq_int4_dtype(dtype) ||
@@ -551,6 +556,7 @@ bool is_linear_dtype(std::string_view dtype) {
 
 bool is_embedding_dtype(std::string_view dtype) {
     return is_dense_float_dtype(dtype) ||
+        is_mx_dtype(dtype) ||
         is_nint_dtype(dtype) ||
         dtype == "NINT8-0" ||
         is_tpq_int4_dtype(dtype);
@@ -1224,6 +1230,7 @@ inspect_deepseek_v4_tensor_metadata(
                 "dense dimension count"),
             name);
         const std::uint64_t item_size =
+            record.dtype == "BF16" ? 2u :
             record.dtype == "F16" ? 2u :
             record.dtype == "F32" ? 4u :
             record.dtype == "I32" ? 4u : 8u;
@@ -1239,6 +1246,64 @@ inspect_deepseek_v4_tensor_metadata(
             throw std::runtime_error(
                 "invalid dense DeepSeek-V4 tensor length: " +
                 name);
+        }
+        return result;
+    }
+
+    if (is_mx_dtype(record.dtype)) {
+        result.packed = true;
+        if (cursor.bytes(4, "MX magic") != "MXT1" ||
+            cursor.scalar<std::uint8_t>("MX version") != 1) {
+            throw std::runtime_error(
+                "invalid DeepSeek-V4 MX header: " + name);
+        }
+        const auto kind = cursor.scalar<std::uint8_t>("MX kind");
+        const auto reserved = cursor.scalar<std::uint16_t>("MX reserved");
+        const auto rows = cursor.scalar<std::uint64_t>("MX rows");
+        const auto columns = cursor.scalar<std::uint64_t>("MX columns");
+        const auto storage_rows =
+            cursor.scalar<std::uint64_t>("MX storage rows");
+        const auto storage_columns =
+            cursor.scalar<std::uint64_t>("MX storage columns");
+        const auto scale_rows =
+            cursor.scalar<std::uint64_t>("MX scale rows");
+        const auto scale_columns =
+            cursor.scalar<std::uint64_t>("MX scale columns");
+        const auto bits = record.dtype == "MXFP4" ? 4u : 8u;
+        const auto expected_storage_columns =
+            bits == 4 ? columns / 2 : columns;
+        const auto expected_scale_rows =
+            bits == 4 ? rows : (rows + 127) / 128;
+        const auto expected_scale_columns =
+            bits == 4 ? columns / 32 : columns / 128;
+        if (kind != bits || reserved != 0 || rows == 0 || columns == 0 ||
+            rows > static_cast<std::uint64_t>(
+                std::numeric_limits<std::int32_t>::max()) ||
+            columns > static_cast<std::uint64_t>(
+                std::numeric_limits<std::int32_t>::max()) ||
+            (bits == 4 && columns % 32 != 0) ||
+            (bits == 8 && columns % 128 != 0) ||
+            storage_rows != rows ||
+            storage_columns != expected_storage_columns ||
+            scale_rows != expected_scale_rows ||
+            scale_columns != expected_scale_columns) {
+            throw std::runtime_error(
+                "inconsistent DeepSeek-V4 MX geometry: " + name);
+        }
+        result.shape = {
+            static_cast<std::int64_t>(rows),
+            static_cast<std::int64_t>(columns),
+        };
+        const auto expected = checked_add(
+            checked_add(
+                static_cast<std::uint64_t>(cursor.offset()),
+                checked_multiply(storage_rows, storage_columns, name),
+                name),
+            checked_multiply(scale_rows, scale_columns, name),
+            name);
+        if (expected != record.nbytes) {
+            throw std::runtime_error(
+                "invalid DeepSeek-V4 MX tensor length: " + name);
         }
         return result;
     }
