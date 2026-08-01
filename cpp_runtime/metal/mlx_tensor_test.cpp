@@ -32,6 +32,20 @@ std::vector<std::uint8_t> dense_blob() {
     return result;
 }
 
+std::vector<std::uint8_t> dense_bf16_blob() {
+    std::vector<std::uint8_t> result;
+    append<std::uint32_t>(result, 2);
+    append<std::int64_t>(result, 3);
+    append<std::int64_t>(result, 2);
+    for (const std::uint16_t value : {
+             std::uint16_t{0x3f80}, std::uint16_t{0x4000},
+             std::uint16_t{0x4040}, std::uint16_t{0x4080},
+             std::uint16_t{0x40a0}, std::uint16_t{0x40c0}}) {
+        append<std::uint16_t>(result, value);
+    }
+    return result;
+}
+
 std::vector<std::uint8_t> pack_values(
     const std::vector<std::uint8_t>& values,
     int bits) {
@@ -263,6 +277,20 @@ int main() {
         require_close(tied_projected_values[0], 0.0f);
         require_close(tied_projected_values[1], 2.0f);
         require_close(tied_projected_values[2], 4.0f);
+
+        const auto dense_bf16 =
+            mfq::metal::load_dense_array(
+                "BF16", dense_bf16_blob());
+        require(
+            dense_bf16.dtype() == bfloat16,
+            "BF16 dense tensor dtype mismatch");
+        const mfq::metal::MlxLinear bf16_linear(dense_bf16);
+        auto bf16_projected = astype(bf16_linear(input), float32);
+        bf16_projected.eval();
+        const auto* bf16_values = bf16_projected.data<float>();
+        require_close(bf16_values[0], 0.0f);
+        require_close(bf16_values[1], 2.0f);
+        require_close(bf16_values[2], 4.0f);
 
         const array grouped_weight(
             {

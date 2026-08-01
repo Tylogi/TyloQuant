@@ -60,6 +60,7 @@ add_library(mfq-metal-runtime STATIC
     mlx_deepseek_v4_sparse.cpp
     mlx_moe.cpp
     mlx_moe_ops.cpp
+    mlx_mx.cpp
     mlx_nint.cpp
     mlx_nint8_zero.cpp
     mlx_vq.cpp
@@ -175,6 +176,18 @@ set_target_properties(mfq-metal-nint-test PROPERTIES
     BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
 )
 add_test(NAME mfq-metal-nint-test COMMAND mfq-metal-nint-test)
+
+add_executable(mfq-metal-mx-test
+    mlx_mx_test.cpp
+)
+target_link_libraries(mfq-metal-mx-test PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(mfq-metal-mx-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-mx-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+add_test(NAME mfq-metal-mx-test COMMAND mfq-metal-mx-test)
 
 add_executable(mfq-metal-nint-benchmark
     mlx_nint_benchmark.cpp

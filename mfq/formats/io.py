@@ -44,19 +44,10 @@ from typing import TypeAlias
 
 import numpy as np
 
-from mfq.formats.tpq import (
-    TPQ_PQ_SPECS,
-    TpqInt4Tensor,
-    TpqPqTensor,
-    normalize_tpq_dtype,
-    pack_tpq_int4,
-    pack_tpq_pq,
-    unpack_tpq_int4,
-    unpack_tpq_pq,
-)
 from mfq.formats.assets import ASSET_DTYPE
 from mfq.formats.header import MFQ_MAGIC, FileHeader
 from mfq.formats.moe import NintMoePool, NintMoeTensor
+from mfq.formats.mx import MX_DTYPES, MxTensor, pack_mx, unpack_mx
 from mfq.formats.nepq import NepqTensor, pack_nepq, rotation_signs, unpack_nepq
 from mfq.formats.nint import NintSpec, _uint_dtype
 from mfq.formats.nint8_zero import (
@@ -69,6 +60,16 @@ from mfq.formats.npq0_s import Npq0STensor, pack_npq0_s, unpack_npq0_s
 from mfq.formats.nvq import NvqJscTensor, NvqTensor, pack_nvq, unpack_nvq
 from mfq.formats.nvq1_l import Nvq1LTensor, pack_nvq1_l, unpack_nvq1_l
 from mfq.formats.nvq1_s import Nvq1STensor, pack_nvq1_s, unpack_nvq1_s
+from mfq.formats.tpq import (
+    TPQ_PQ_SPECS,
+    TpqInt4Tensor,
+    TpqPqTensor,
+    normalize_tpq_dtype,
+    pack_tpq_int4,
+    pack_tpq_pq,
+    unpack_tpq_int4,
+    unpack_tpq_pq,
+)
 from mfq.quantize.nint_quant import NintTensor
 
 MfqTensor: TypeAlias = (
@@ -84,9 +85,31 @@ MfqTensor: TypeAlias = (
     | NepqTensor
     | TpqPqTensor
     | TpqInt4Tensor
+    | MxTensor
     | np.ndarray
     | bytes
 )
+
+
+class BFloat16Array(np.ndarray):
+    """NumPy-compatible view of raw little-endian BF16 storage.
+
+    NumPy does not provide a native BF16 dtype.  Keeping the payload as a
+    tagged ``uint16`` ndarray preserves the exact on-disk bits while allowing
+    the Torch and MLX runtimes to reinterpret them without a float32 staging
+    copy.
+    """
+
+
+def is_bfloat16_array(value: object) -> bool:
+    return isinstance(value, BFloat16Array)
+
+
+def bfloat16_to_float32(value: np.ndarray) -> np.ndarray:
+    """Decode a tagged/raw BF16 array into numerically exact float32 values."""
+
+    bits = np.asarray(value, dtype="<u2")
+    return (bits.astype(np.uint32) << 16).view(np.float32)
 
 
 @dataclass(frozen=True)
@@ -387,7 +410,7 @@ def _unpack_nint_moe_v2(
         runtime_payload = bytes(blob[off:runtime_end])
         off = runtime_end
         tensor = _unpack_tensor(dtype, blob[off:payload_end])
-        if isinstance(tensor, NintMoeTensor) or isinstance(tensor, np.ndarray):
+        if isinstance(tensor, (NintMoeTensor, np.ndarray)):
             raise ValueError(f"unsupported nested NINTM cohort dtype: {dtype}")
         _validate_nint_moe_runtime(tensor, runtime_payload)
         off = payload_end
@@ -424,19 +447,23 @@ def unpack_nint_moe(blob: bytes | memoryview) -> NintMoeTensor:
 
 
 _DENSE_DTYPES = {
+    "BF16": np.dtype("<u2"),
     "F16": np.dtype(np.float16),
     "F32": np.dtype(np.float32),
     "I32": np.dtype(np.int32),
     "I64": np.dtype(np.int64),
 }
-_DENSE_NAMES = {v: k for k, v in _DENSE_DTYPES.items()}
+_DENSE_NAMES = {
+    value: name for name, value in _DENSE_DTYPES.items() if name != "BF16"
+}
 
 
 def pack_dense(tensor: np.ndarray) -> tuple[str, bytes]:
     """Pack a small dense tensor, used for norm weights and metadata-like arrays."""
 
+    bfloat16 = is_bfloat16_array(tensor)
     arr = np.ascontiguousarray(tensor)
-    dtype = _DENSE_NAMES.get(arr.dtype)
+    dtype = "BF16" if bfloat16 else _DENSE_NAMES.get(arr.dtype)
     if dtype is None:
         raise ValueError(f"unsupported dense dtype: {arr.dtype}")
     parts = [struct.pack("<I", arr.ndim)]
@@ -454,12 +481,15 @@ def unpack_dense(dtype: str, blob: bytes) -> np.ndarray:
     shape = struct.unpack_from(f"<{ndim}q", blob, off)
     off += 8 * ndim
     arr = np.frombuffer(blob, dtype=_DENSE_DTYPES[dtype], offset=off).copy()
-    return arr.reshape(shape)
+    result = arr.reshape(shape)
+    return result.view(BFloat16Array) if dtype == "BF16" else result
 
 
 def _unpack_tensor(dtype: str, blob: bytes | memoryview) -> MfqTensor:
     if dtype == ASSET_DTYPE:
         return bytes(blob)
+    if dtype in MX_DTYPES:
+        return unpack_mx(dtype, blob)
     dtype = {
         "NIQ2": "NVQ2",
         "NIQ2J": "NVQ2J",
@@ -557,6 +587,8 @@ def _pack_tensor(tensor: MfqTensor, *, allow_moe: bool = True) -> tuple[str, byt
 
     if isinstance(tensor, bytes):
         return ASSET_DTYPE, tensor
+    if isinstance(tensor, MxTensor):
+        return tensor.dtype, pack_mx(tensor)
     if isinstance(tensor, Nint8ZeroTensor):
         return "NINT8-0", pack_nint8_zero(tensor)
     if isinstance(tensor, TpqInt4Tensor):
@@ -640,7 +672,7 @@ def save(path: str | Path, header: FileHeader, tensors: dict[str, MfqTensor]) ->
                 f.write(_u32(len(vb)))
                 f.write(vb)
         f.write(_u32(len(tensors)))
-        for name, t in tensors.items():
+        for name in tensors:
             name_b = name.encode("utf-8")
             dtype, blob = packed[name]
             dtype_b = dtype.encode("utf-8")
@@ -740,7 +772,7 @@ class MMapTensorStore(Mapping[str, MfqTensor]):
         for file_obj in self._files:
             file_obj.close()
 
-    def __enter__(self) -> "MMapTensorStore":
+    def __enter__(self) -> MMapTensorStore:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

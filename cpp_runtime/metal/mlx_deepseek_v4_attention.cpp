@@ -215,10 +215,11 @@ array load_float_array(
     const MfqContainer& model,
     const std::string& name) {
     const auto& record = model.record(name);
-    if (record.dtype != "F16" &&
+    if (record.dtype != "BF16" &&
+        record.dtype != "F16" &&
         record.dtype != "F32") {
         throw std::runtime_error(
-            "DeepSeek-V4 attention tensor must be F16/F32: " +
+            "DeepSeek-V4 attention tensor must be BF16/F16/F32: " +
             name);
     }
     return typed_contiguous(

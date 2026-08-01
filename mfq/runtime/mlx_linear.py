@@ -20,8 +20,8 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
     ) from exc
 
 from mfq.formats import io
-from mfq.formats.tpq import CccpInt4Tensor, CccpPqTensor
 from mfq.formats.io import MfqTensor
+from mfq.formats.mx import MxTensor
 from mfq.formats.nepq import NepqTensor
 from mfq.formats.nint8_zero import Nint8ZeroTensor
 from mfq.formats.npq0_l import Npq0LTensor
@@ -29,14 +29,17 @@ from mfq.formats.npq0_s import Npq0STensor
 from mfq.formats.nvq import NvqJscTensor, NvqTensor
 from mfq.formats.nvq1_l import Nvq1LTensor
 from mfq.formats.nvq1_s import Nvq1STensor
-from mfq.kernels.metal.tpq import (
-    MetalCccpInt4Weight,
-    MetalCccpPqWeight,
-)
+from mfq.formats.tpq import CccpInt4Tensor, CccpPqTensor
 from mfq.kernels.metal.grouped_linear import (
     MetalLinearGroupWeight,
     PackedLinearWeight,
     grouped_linear_matmul,
+)
+from mfq.kernels.metal.mx import (
+    MetalMxWeight,
+    mx_dequantize,
+    mx_embedding,
+    mx_matmul,
 )
 from mfq.kernels.metal.nint import (
     MetalNintWeight,
@@ -51,6 +54,10 @@ from mfq.kernels.metal.nint8_zero import (
     nint8_zero_matmul,
 )
 from mfq.kernels.metal.ops import silu_mul
+from mfq.kernels.metal.tpq import (
+    MetalCccpInt4Weight,
+    MetalCccpPqWeight,
+)
 from mfq.kernels.metal.vq import (
     MetalVqWeight,
     vq_swiglu,
@@ -93,6 +100,22 @@ _VQ_DTYPES = {
 }
 
 
+def mlx_dense_array(
+    tensor: np.ndarray,
+    *,
+    dtype: mx.Dtype | None = None,
+) -> mx.array:
+    """Create an MLX dense array while preserving tagged MFQ BF16 bits."""
+
+    if io.is_bfloat16_array(tensor):
+        bits = mx.array(np.ascontiguousarray(tensor, dtype=np.uint16))
+        value = bits.view(mx.bfloat16)
+    else:
+        source_dtype = mx.float32 if tensor.dtype == np.float32 else mx.float16
+        value = mx.array(np.ascontiguousarray(tensor)).astype(source_dtype)
+    return value if dtype is None or value.dtype == dtype else value.astype(dtype)
+
+
 class MlxNintLinear:
     """A packed NINT linear layer executed by a custom Metal kernel."""
 
@@ -128,13 +151,12 @@ class MlxNintLinear:
 
 
 class MlxDenseLinear:
-    """Dense F16/F32 projection used for unquantized MFQ tensors."""
+    """Dense BF16/F16/F32 projection used for unquantized MFQ tensors."""
 
     def __init__(self, tensor: np.ndarray) -> None:
         if tensor.ndim != 2:
             raise ValueError(f"MlxDenseLinear expects a 2D tensor, got {tensor.shape}")
-        dtype = mx.float32 if tensor.dtype == np.float32 else mx.float16
-        self.weight = mx.array(np.ascontiguousarray(tensor)).astype(dtype)
+        self.weight = mlx_dense_array(tensor)
 
     def forward(self, x: mx.array | np.ndarray) -> mx.array:
         source = x if isinstance(x, mx.array) else mx.array(x)
@@ -145,17 +167,67 @@ class MlxDenseLinear:
 
 
 class MlxDenseEmbedding:
-    """Dense F16/F32 embedding for unquantized TPQ2 model tables."""
+    """Dense BF16/F16/F32 embedding for unquantized MFQ model tables."""
 
     def __init__(self, tensor: np.ndarray) -> None:
         if tensor.ndim != 2:
             raise ValueError(f"MlxDenseEmbedding expects a 2D tensor, got {tensor.shape}")
-        dtype = mx.float32 if tensor.dtype == np.float32 else mx.float16
-        self.weight = mx.array(np.ascontiguousarray(tensor)).astype(dtype)
+        self.weight = mlx_dense_array(tensor)
 
     def forward(self, token_ids: mx.array | np.ndarray) -> mx.array:
         ids = token_ids if isinstance(token_ids, mx.array) else mx.array(token_ids)
         return self.weight[ids.astype(mx.int32)]
+
+    def __call__(self, token_ids: mx.array | np.ndarray) -> mx.array:
+        return self.forward(token_ids)
+
+
+class MlxMxLinear:
+    """Native OCP MXFP4/MXFP8 projection backed by packed Metal kernels."""
+
+    def __init__(self, tensor: MxTensor) -> None:
+        self.packed_weight = MetalMxWeight.from_tensor(tensor)
+
+    @classmethod
+    def from_packed_weight(cls, weight: MetalMxWeight) -> MlxMxLinear:
+        result = object.__new__(cls)
+        result.packed_weight = weight
+        return result
+
+    @property
+    def packed_nbytes(self) -> int:
+        return self.packed_weight.packed_nbytes
+
+    @property
+    def weight(self) -> mx.array:
+        return mx_dequantize(self.packed_weight)
+
+    def forward(self, x: mx.array | np.ndarray) -> mx.array:
+        return mx_matmul(self.packed_weight, x)
+
+    def __call__(self, x: mx.array | np.ndarray) -> mx.array:
+        return self.forward(x)
+
+
+class MlxMxEmbedding:
+    """Embedding lookup for native OCP MXFP4/MXFP8 tensors."""
+
+    def __init__(self, tensor: MxTensor) -> None:
+        self.packed_weight = MetalMxWeight.from_tensor(tensor)
+
+    @classmethod
+    def from_packed_weight(cls, weight: MetalMxWeight) -> MlxMxEmbedding:
+        result = object.__new__(cls)
+        result.packed_weight = weight
+        return result
+
+    def forward(
+        self,
+        token_ids: mx.array | np.ndarray,
+        *,
+        dtype: mx.Dtype = mx.float16,
+    ) -> mx.array:
+        return mx_embedding(self.packed_weight, token_ids, dtype=dtype)
 
     def __call__(self, token_ids: mx.array | np.ndarray) -> mx.array:
         return self.forward(token_ids)
@@ -258,6 +330,7 @@ class MlxLinearGroup:
             | MlxVqLinear
             | MlxCccpInt4Linear
             | MlxCccpPqLinear
+            | MlxMxLinear
             | MlxDenseLinear
         ],
         *,
@@ -371,8 +444,12 @@ class MlxNintModel:
         | MlxVqLinear
         | MlxCccpInt4Linear
         | MlxCccpPqLinear
+        | MlxMxLinear
         | MlxDenseLinear
     ):
+        packed_mx = self._packed_mx(name)
+        if packed_mx is not None:
+            return MlxMxLinear.from_packed_weight(packed_mx)
         packed = self._packed_nint(name)
         if packed is not None:
             return MlxNintLinear.from_packed_weight(packed)
@@ -392,8 +469,12 @@ class MlxNintModel:
         | MlxNint8ZeroEmbedding
         | MlxVqEmbedding
         | MlxCccpInt4Embedding
+        | MlxMxEmbedding
         | MlxDenseEmbedding
     ):
+        packed_mx = self._packed_mx(name)
+        if packed_mx is not None:
+            return MlxMxEmbedding.from_packed_weight(packed_mx)
         packed = self._packed_nint(name)
         if packed is not None:
             return MlxNintEmbedding.from_packed_weight(packed)
@@ -412,6 +493,8 @@ class MlxNintModel:
             return MlxVqEmbedding(tensor)
         if isinstance(tensor, CccpInt4Tensor):
             return MlxCccpInt4Embedding(tensor)
+        if isinstance(tensor, MxTensor):
+            return MlxMxEmbedding(tensor)
         if isinstance(tensor, np.ndarray):
             return MlxDenseEmbedding(tensor)
         raise TypeError(f"tensor {name!r} is not a packed embedding weight")
@@ -460,6 +543,16 @@ class MlxNintModel:
             return None
         return MetalNintWeight.from_blob(self.tensors.read_blob(name))
 
+    def _packed_mx(self, name: str) -> MetalMxWeight | None:
+        if not isinstance(self.tensors, io.MMapTensorStore):
+            return None
+        if name not in self.tensors.records:
+            raise KeyError(f"tensor {name!r} is not present in the MFQ model")
+        record = self.tensors.records[name]
+        if record.dtype not in {"MXFP4", "MXFP8"}:
+            return None
+        return MetalMxWeight.from_blob(record.dtype, self.tensors.read_blob(name))
+
     def _packed_nint8_zero(
         self,
         name: str,
@@ -491,8 +584,8 @@ class MlxNintModel:
 
 def _unsupported_tensor(tensor: object):
     raise TypeError(
-        "the MLX runtime supports NINT, NINT8-0, NVQ, NPQ, NEPQ, CCCP, "
-        "and dense tensors; "
+        "the MLX runtime supports MXFP4, MXFP8, NINT, NINT8-0, NVQ, NPQ, "
+        "NEPQ, CCCP, and dense tensors; "
         f"received {type(tensor).__name__}"
     )
 
@@ -505,6 +598,7 @@ def _linear(
         | MlxVqLinear
         | MlxCccpInt4Linear
         | MlxCccpPqLinear
+        | MlxMxLinear
         | MlxDenseLinear
     ),
 ) -> (
@@ -513,6 +607,7 @@ def _linear(
     | MlxVqLinear
     | MlxCccpInt4Linear
     | MlxCccpPqLinear
+    | MlxMxLinear
     | MlxDenseLinear
 ):
     if isinstance(
@@ -523,6 +618,7 @@ def _linear(
             MlxVqLinear,
             MlxCccpInt4Linear,
             MlxCccpPqLinear,
+            MlxMxLinear,
             MlxDenseLinear,
         ),
     ):
@@ -537,6 +633,8 @@ def _linear(
         return MlxCccpInt4Linear(tensor)
     if isinstance(tensor, CccpPqTensor):
         return MlxCccpPqLinear(tensor)
+    if isinstance(tensor, MxTensor):
+        return MlxMxLinear(tensor)
     if isinstance(tensor, np.ndarray):
         return MlxDenseLinear(tensor)
     return _unsupported_tensor(tensor)
@@ -549,6 +647,8 @@ __all__ = [
     "MlxDenseEmbedding",
     "MlxDenseLinear",
     "MlxLinearGroup",
+    "MlxMxEmbedding",
+    "MlxMxLinear",
     "MlxNintEmbedding",
     "MlxNint8ZeroEmbedding",
     "MlxNint8ZeroLinear",
@@ -557,4 +657,5 @@ __all__ = [
     "MlxSwiGLUFFN",
     "MlxVqLinear",
     "MlxVqEmbedding",
+    "mlx_dense_array",
 ]

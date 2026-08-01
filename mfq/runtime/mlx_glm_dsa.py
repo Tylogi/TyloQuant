@@ -35,7 +35,7 @@ from mfq.kernels.metal.moe_ops import (
 )
 from mfq.kernels.metal.ops import residual_add, residual_rms_norm, rope_tables
 from mfq.kernels.metal.sampling import sample as _sample
-from mfq.runtime.mlx_linear import MlxLinearGroup, MlxNintModel
+from mfq.runtime.mlx_linear import MlxLinearGroup, MlxNintModel, mlx_dense_array
 from mfq.runtime.mlx_moe import MlxRoutedLinear
 from mfq.runtime.mlx_ops import MlxRMSNorm
 
@@ -205,7 +205,7 @@ def _dense_array(model: MlxNintModel, name: str) -> mx.array:
     value = model.tensors[name]
     if not isinstance(value, np.ndarray):
         raise TypeError(f"GLM DSA tensor {name!r} must be dense")
-    return mx.array(np.ascontiguousarray(value))
+    return mlx_dense_array(value)
 
 
 def _dense_vector(model: MlxNintModel, name: str) -> mx.array:

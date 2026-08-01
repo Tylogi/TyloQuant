@@ -28,6 +28,7 @@ from mfq.runtime.mlx_linear import (
     MlxLinearGroup,
     MlxNintLinear,
     MlxNintModel,
+    mlx_dense_array,
 )
 from mfq.runtime.mlx_ops import MlxRMSNorm, MlxRoPE
 
@@ -205,7 +206,7 @@ def _dense_vector(model: MlxNintModel, name: str) -> mx.array:
     value = model.tensors[name]
     if not isinstance(value, np.ndarray) or value.ndim != 1:
         raise TypeError(f"runtime tensor {name!r} must be a dense vector")
-    return mx.array(np.ascontiguousarray(value, dtype=np.float32))
+    return mlx_dense_array(value, dtype=mx.float32)
 
 
 def _dense_array(model: MlxNintModel, name: str) -> mx.array:
@@ -214,7 +215,7 @@ def _dense_array(model: MlxNintModel, name: str) -> mx.array:
     value = model.tensors[name]
     if not isinstance(value, np.ndarray):
         raise TypeError(f"runtime tensor {name!r} must be a dense array")
-    return mx.array(np.ascontiguousarray(value, dtype=np.float32))
+    return mlx_dense_array(value, dtype=mx.float32)
 
 
 def _optional_norm(

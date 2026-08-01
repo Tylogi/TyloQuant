@@ -45,7 +45,7 @@ llama/ggml dylib、`mlx.metallib` 和 WebUI 一并复制到可执行文件旁，
 
 当前原生 target 已覆盖：
 
-- dense F16/F32、NINT1–NINT8、NINT8-0；
+- dense BF16/F16/F32、native MXFP4/MXFP8、NINT1–NINT8、NINT8-0；
 - NVQ、NPQ、NEPQ 全部公开格式及 HSG1 rotation；
 - TPQ-I4G64 与 TPQ-X/W/V/VV 各自合法的 8/12/14/16-bit index storage
   （读取器继续兼容旧 CCCP 标签）；

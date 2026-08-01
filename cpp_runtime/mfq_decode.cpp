@@ -6415,6 +6415,8 @@ static torch::Tensor load_dense_gpu(const MfqFile & mfq, const std::string & nam
     torch::Tensor t;
     if (rec.dtype == "F32") {
         t = torch::from_blob(blob.data() + off, shape, torch::TensorOptions().dtype(torch::kFloat32)).clone();
+    } else if (rec.dtype == "BF16") {
+        t = torch::from_blob(blob.data() + off, shape, torch::TensorOptions().dtype(torch::kBFloat16)).clone().to(torch::kFloat32);
     } else if (rec.dtype == "F16") {
         t = torch::from_blob(blob.data() + off, shape, torch::TensorOptions().dtype(torch::kFloat16)).clone().to(torch::kFloat32);
     } else if (rec.dtype == "I64") {

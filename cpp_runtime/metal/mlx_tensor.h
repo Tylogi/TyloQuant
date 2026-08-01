@@ -3,6 +3,7 @@
 #include "mfq_container.h"
 #include "mlx_cccp.h"
 #include "mlx_grouped_linear.h"
+#include "mlx_mx.h"
 #include "mlx_nint.h"
 #include "mlx_nint8_zero.h"
 #include "mlx_vq.h"
@@ -31,6 +32,7 @@ public:
     explicit MlxLinear(MlxVqWeight weight);
     explicit MlxLinear(MlxCccpInt4Weight weight);
     explicit MlxLinear(MlxCccpPqWeight weight);
+    explicit MlxLinear(MlxMxWeight weight);
     explicit MlxLinear(mlx::core::array weight);
 
     mlx::core::array operator()(const mlx::core::array& input) const;
@@ -65,6 +67,7 @@ private:
         MlxVqWeight,
         MlxCccpInt4Weight,
         MlxCccpPqWeight,
+        MlxMxWeight,
         mlx::core::array> weight_;
     int input_size_ = 0;
     int output_size_ = 0;
@@ -80,6 +83,7 @@ public:
     explicit MlxEmbedding(MlxNint8ZeroWeight weight);
     explicit MlxEmbedding(MlxVqWeight weight);
     explicit MlxEmbedding(MlxCccpInt4Weight weight);
+    explicit MlxEmbedding(MlxMxWeight weight);
     explicit MlxEmbedding(mlx::core::array weight);
 
     mlx::core::array operator()(
@@ -105,6 +109,7 @@ private:
         MlxNint8ZeroWeight,
         MlxVqWeight,
         MlxCccpInt4Weight,
+        MlxMxWeight,
         mlx::core::array> weight_;
     int vocabulary_size_ = 0;
     int hidden_size_ = 0;
