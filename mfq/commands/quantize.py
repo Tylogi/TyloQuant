@@ -211,6 +211,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         metavar="N",
         help="GGUF: reuse the first N completed, validated tensor blobs",
     )
+    output.add_argument(
+        "--reuse-unweighted-from",
+        default="",
+        help="GGUF: reuse raw blobs for tensors without an imatrix binding",
+    )
     output.add_argument("--dry-run", action="store_true")
     output.add_argument("--overwrite", action="store_true")
     output.add_argument("--keep-temp", action="store_true")
@@ -335,6 +340,7 @@ def _gguf_arguments(args: argparse.Namespace, output: Path) -> argparse.Namespac
     _append_value(argv, "--tensor-precision-overrides", args.tensor_overrides)
     _append_value(argv, "--imatrix", args.imatrix)
     _append_value(argv, "--resume-completed", args.resume_completed)
+    _append_value(argv, "--reuse-unweighted-from", args.reuse_unweighted_from)
     _append_value(argv, "--split-max-size", args.split_max_size)
     _append_value(argv, "--split-max-tensors", args.split_max_tensors)
     _append_flag(argv, "--exclude-mtp", args.exclude_mtp)

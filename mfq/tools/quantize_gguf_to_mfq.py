@@ -437,6 +437,15 @@ _GGUF_SPLIT_PATH_RE = re.compile(
 
 
 @dataclass(frozen=True)
+class ReusedBlobRecord:
+    name: str
+    dtype: str
+    nbytes: int
+    path: Path
+    offset: int
+
+
+@dataclass(frozen=True)
 class GgufSourceSet:
     paths: tuple[Path, ...]
     readers: tuple[Any, ...]
@@ -2155,6 +2164,8 @@ def convert(args: argparse.Namespace) -> None:
         load_importance_matrix(Path(imatrix_path_arg)) if imatrix_path_arg else None
     )
     imatrix_bindings = {} if imatrix is None else _bind_imatrix(imatrix, plan)
+    reuse_path_arg = getattr(args, "reuse_unweighted_from", "")
+    reuse_store = open_mmap(Path(reuse_path_arg).resolve()) if reuse_path_arg else None
     row_importance_path_arg = getattr(args, "nvq_jsc_row_importance", "")
     row_importance = (
         load_row_importance(Path(row_importance_path_arg))
@@ -2366,7 +2377,7 @@ def convert(args: argparse.Namespace) -> None:
         if tmp_root.exists():
             raise FileExistsError(f"temporary directory exists: {tmp_root}")
         tmp_root.mkdir()
-    records: list[BlobRecord] = []
+    records: list[BlobRecord | ReusedBlobRecord] = []
     codebook_results: dict[str, dict[str, Any]] = {}
     gain_results: dict[str, dict[str, Any]] = {}
     started = time.time()
@@ -2398,6 +2409,40 @@ def convert(args: argparse.Namespace) -> None:
                             "name": item.name,
                             "dtype": item.target_dtype,
                             "blob_mb": round(nbytes / 1e6, 2),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+                continue
+            output_name = output_name_by_gguf[item.name]
+            if reuse_store is not None and item.name not in imatrix_bindings:
+                if output_name not in reuse_store.records:
+                    raise KeyError(f"reuse MFQ lacks tensor: {output_name}")
+                reused = reuse_store.records[output_name]
+                if reused.dtype != item.target_dtype:
+                    raise ValueError(
+                        f"reuse MFQ dtype mismatch for {output_name}: "
+                        f"{reused.dtype} != {item.target_dtype}"
+                    )
+                records.append(
+                    ReusedBlobRecord(
+                        output_name,
+                        reused.dtype,
+                        reused.nbytes,
+                        reuse_store.paths[reused.source_index],
+                        reused.offset,
+                    )
+                )
+                print(
+                    json.dumps(
+                        {
+                            "event": "tensor_reused_unweighted",
+                            "done": done,
+                            "total": len(plan),
+                            "name": item.name,
+                            "dtype": item.target_dtype,
+                            "blob_mb": round(reused.nbytes / 1e6, 2),
                         },
                         ensure_ascii=False,
                     ),
@@ -2799,6 +2844,8 @@ def convert(args: argparse.Namespace) -> None:
             flush=True,
         )
     finally:
+        if reuse_store is not None:
+            reuse_store.close()
         if not args.keep_temp and tmp_root.exists():
             shutil.rmtree(tmp_root)
 
@@ -2954,6 +3001,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="reuse this many contiguous completed blobs from the existing temp directory",
+    )
+    parser.add_argument(
+        "--reuse-unweighted-from",
+        default="",
+        help=(
+            "reuse raw blobs for tensors without an imatrix binding from an "
+            "existing layout-compatible MFQ"
+        ),
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite", action="store_true")

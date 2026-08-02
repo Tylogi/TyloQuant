@@ -18,6 +18,10 @@ from mfq.formats.nint import NintSpec, _uint_dtype, make_qkx2
 
 
 _IMATRIX_SUPERBLOCK = 256
+_IMATRIX_PRIORITY_GROUPS = 64
+_IMATRIX_PRIORITY_RADIUS = 8
+_IMATRIX_PRIORITY_ROW_CHUNK = 64
+_IMATRIX_PRIORITY_PAIR_CHUNK = 64
 
 
 @dataclass
@@ -571,11 +575,179 @@ def _refine_imatrix_final_encoding(
     return levels, row_scale, row_min, scale_levels, min_levels
 
 
+def _refine_imatrix_priority_groups(
+    groups: np.ndarray,
+    weights: np.ndarray,
+    q: np.ndarray,
+    neuron_scale: np.ndarray,
+    neuron_min: np.ndarray,
+    sub_scale: np.ndarray,
+    sub_min: np.ndarray,
+    nmax: int,
+    sub_nmax: int,
+    *,
+    priority_groups: int = _IMATRIX_PRIORITY_GROUPS,
+    radius: int = _IMATRIX_PRIORITY_RADIUS,
+    row_chunk: int = _IMATRIX_PRIORITY_ROW_CHUNK,
+    pair_chunk: int = _IMATRIX_PRIORITY_PAIR_CHUNK,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Exactly refine the most important groups at the final NINT lattice.
+
+    The general coordinate descent above updates scale and minimum levels one
+    coordinate at a time.  With highly concentrated imatrix weights, changing
+    either coordinate alone can be rejected even though changing the pair and
+    recomputing the weight codes is strongly beneficial.  This pass selects the
+    groups with the largest final objective mass in every row, enumerates a
+    bounded two-dimensional neighborhood of the stored scale/minimum levels,
+    and chooses the exact best weight codes for every candidate pair.
+
+    Row anchors and the on-disk representation remain unchanged.  The current
+    pair is part of the candidate set, so the weighted objective is monotonic.
+    """
+
+    values = np.asarray(groups, dtype=np.float32)
+    objective_weight = np.asarray(weights, dtype=np.float32)
+    levels = np.asarray(q, dtype=np.int32).copy()
+    scale_levels = np.asarray(sub_scale, dtype=np.int32).copy()
+    min_levels = np.asarray(sub_min, dtype=np.int32).copy()
+    row_scale = np.asarray(neuron_scale, dtype=np.float32)
+    row_min = np.asarray(neuron_min, dtype=np.float32)
+    rows, group_count, group_size = values.shape
+    selected_count = min(max(0, int(priority_groups)), group_count)
+    if selected_count == 0 or radius < 0:
+        return levels, scale_levels, min_levels
+
+    offsets = np.arange(-radius, radius + 1, dtype=np.int32)
+    scale_offsets = np.repeat(offsets, offsets.size)
+    min_offsets = np.tile(offsets, offsets.size)
+    row_chunk = max(1, int(row_chunk))
+    pair_chunk = max(1, int(pair_chunk))
+
+    for row_begin in range(0, rows, row_chunk):
+        row_end = min(row_begin + row_chunk, rows)
+        chunk_values = values[row_begin:row_end]
+        chunk_weights = objective_weight[row_begin:row_end]
+        group_mass = chunk_weights.sum(axis=-1)
+        if selected_count == group_count:
+            selected = np.broadcast_to(
+                np.arange(group_count, dtype=np.int64),
+                (row_end - row_begin, group_count),
+            )
+        else:
+            selected = np.argpartition(
+                group_mass, group_count - selected_count, axis=1
+            )[:, -selected_count:]
+        local_rows = np.arange(row_end - row_begin, dtype=np.int64)[:, None]
+        global_rows = np.arange(row_begin, row_end, dtype=np.int64)[:, None]
+        flat_values = chunk_values[local_rows, selected].reshape(-1, group_size)
+        flat_weights = chunk_weights[local_rows, selected].reshape(-1, group_size)
+        flat_rows = np.broadcast_to(
+            global_rows, (row_end - row_begin, selected_count)
+        ).reshape(-1)
+        flat_q = levels[global_rows, selected].reshape(-1, group_size).copy()
+        flat_scale_levels = scale_levels[global_rows, selected].reshape(-1).copy()
+        flat_min_levels = min_levels[global_rows, selected].reshape(-1).copy()
+        base_scale_levels = flat_scale_levels.copy()
+        base_min_levels = flat_min_levels.copy()
+        flat_row_scale = row_scale[flat_rows]
+        flat_row_min = row_min[flat_rows]
+        effective_scale = flat_row_scale * flat_scale_levels
+        effective_min = flat_row_min * flat_min_levels
+        reconstruction = (
+            effective_scale[:, None] * flat_q.astype(np.float32)
+            - effective_min[:, None]
+        )
+        best_error = (
+            flat_weights * (reconstruction - flat_values) ** 2
+        ).sum(axis=-1)
+
+        for pair_begin in range(0, scale_offsets.size, pair_chunk):
+            pair_end = min(pair_begin + pair_chunk, scale_offsets.size)
+            candidate_scale_levels = np.clip(
+                base_scale_levels[:, None]
+                + scale_offsets[None, pair_begin:pair_end],
+                0,
+                sub_nmax,
+            )
+            candidate_min_levels = np.clip(
+                base_min_levels[:, None]
+                + min_offsets[None, pair_begin:pair_end],
+                0,
+                sub_nmax,
+            )
+            candidate_scale = (
+                flat_row_scale[:, None]
+                * candidate_scale_levels.astype(np.float32)
+            )
+            candidate_min = (
+                flat_row_min[:, None]
+                * candidate_min_levels.astype(np.float32)
+            )
+            safe_scale = np.where(
+                candidate_scale > 0.0, candidate_scale, 1.0
+            )
+            candidate_q = np.clip(
+                np.rint(
+                    (flat_values[:, None, :] + candidate_min[:, :, None])
+                    / safe_scale[:, :, None]
+                ),
+                0,
+                nmax,
+            ).astype(np.int32)
+            candidate_q = np.where(
+                (candidate_scale > 0.0)[:, :, None], candidate_q, 0
+            )
+            candidate_reconstruction = (
+                candidate_scale[:, :, None] * candidate_q.astype(np.float32)
+                - candidate_min[:, :, None]
+            )
+            candidate_error = (
+                flat_weights[:, None, :]
+                * (candidate_reconstruction - flat_values[:, None, :]) ** 2
+            ).sum(axis=-1)
+            chunk_index = candidate_error.argmin(axis=1)
+            chunk_error = candidate_error[
+                np.arange(candidate_error.shape[0]), chunk_index
+            ]
+            improve = chunk_error < best_error
+            if np.any(improve):
+                chosen_q = candidate_q[
+                    np.arange(candidate_q.shape[0]), chunk_index
+                ]
+                chosen_scale_levels = candidate_scale_levels[
+                    np.arange(candidate_scale_levels.shape[0]), chunk_index
+                ]
+                chosen_min_levels = candidate_min_levels[
+                    np.arange(candidate_min_levels.shape[0]), chunk_index
+                ]
+                best_error = np.where(improve, chunk_error, best_error)
+                flat_q = np.where(improve[:, None], chosen_q, flat_q)
+                flat_scale_levels = np.where(
+                    improve, chosen_scale_levels, flat_scale_levels
+                )
+                flat_min_levels = np.where(
+                    improve, chosen_min_levels, flat_min_levels
+                )
+
+        levels[global_rows, selected] = flat_q.reshape(
+            row_end - row_begin, selected_count, group_size
+        )
+        scale_levels[global_rows, selected] = flat_scale_levels.reshape(
+            row_end - row_begin, selected_count
+        )
+        min_levels[global_rows, selected] = flat_min_levels.reshape(
+            row_end - row_begin, selected_count
+        )
+
+    return levels, scale_levels, min_levels
+
+
 def quantize(
     weight: np.ndarray,
     spec: NintSpec,
     axis: int = 0,
     importance: np.ndarray | None = None,
+    use_priority_group_refinement: bool = True,
 ) -> NintTensor:
     """沿 ``axis`` 把 ``weight`` 切成 neuron 行，批量 neuron-anchored 量化。
 
@@ -663,7 +835,51 @@ def quantize(
                 sub_nmax=K,
             )
         )
-
+        if use_priority_group_refinement:
+            base_q = np.asarray(q).copy()
+            base_sub_scale = np.asarray(sub_scale).copy()
+            base_sub_min = np.asarray(sub_min).copy()
+            candidate_q, candidate_sub_scale, candidate_sub_min = (
+                _refine_imatrix_priority_groups(
+                grps,
+                w,
+                q,
+                neu_d,
+                neu_dm,
+                sub_scale,
+                sub_min,
+                nmax=nmax,
+                sub_nmax=K,
+                )
+            )
+            base_reconstruction = (
+                neu_d[:, None, None]
+                * base_sub_scale[:, :, None].astype(np.float32)
+                * base_q.astype(np.float32)
+                - neu_dm[:, None, None]
+                * base_sub_min[:, :, None].astype(np.float32)
+            )
+            candidate_reconstruction = (
+                neu_d[:, None, None]
+                * candidate_sub_scale[:, :, None].astype(np.float32)
+                * candidate_q.astype(np.float32)
+                - neu_dm[:, None, None]
+                * candidate_sub_min[:, :, None].astype(np.float32)
+            )
+            base_error = (
+                w * (base_reconstruction - grps) ** 2
+            ).sum(axis=(1, 2))
+            candidate_error = (
+                w * (candidate_reconstruction - grps) ** 2
+            ).sum(axis=(1, 2))
+            accept = candidate_error <= base_error * (1.0 + 1.0e-7)
+            q = np.where(accept[:, None, None], candidate_q, base_q)
+            sub_scale = np.where(
+                accept[:, None], candidate_sub_scale, base_sub_scale
+            )
+            sub_min = np.where(
+                accept[:, None], candidate_sub_min, base_sub_min
+            )
     return NintTensor(
         spec=spec,
         shape=shape,
