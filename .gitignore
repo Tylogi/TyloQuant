@@ -65,7 +65,11 @@ runs/
 .transfer_*
 
 # ---- 模型、校准数据与实验工件 ----
-data/
+data/*
+!data/wikitext-2-raw/
+data/wikitext-2-raw/*
+!data/wikitext-2-raw/README.md
+!data/wikitext-2-raw/wiki.test.raw
 *.gguf
 *.mfq
 *.safetensors
