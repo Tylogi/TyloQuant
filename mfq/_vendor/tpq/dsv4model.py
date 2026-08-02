@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import copy
 import time
+import gc
 from dataclasses import dataclass
 
 import torch
@@ -1453,6 +1454,17 @@ class DSV4TPQModel:
                 tuple(route_weights),
                 tuple(route_ids),
             )
+        # TP metadata owns every layer-local tensor needed by the TP decode
+        # path.  Drop the construction caches so rank 0 does not retain a
+        # second complete copy of sharded Attention/MLP/Router weights.
+        self._layers.clear()
+        for name in tuple(self._w):
+            if name.startswith("layers."):
+                self._w.pop(name, None)
+        gc.collect()
+        for device in self.devices:
+            with torch.cuda.device(device):
+                torch.cuda.empty_cache()
         print(
             "[tpq] DSV4 公共真 TP decode 元数据完成："
             f"Head-TP + shared Dense Column/Row-TP + packed MoE TP，"
@@ -2641,6 +2653,20 @@ class DSV4TPQModel:
         cfg = self._cfg_obj()
         ids = ids.to(self.device).long()
         B, T = ids.shape
+        if self._tp_attention_contexts is not None:
+            if B != 1:
+                raise ValueError("DSV4 TP prefill currently requires batch=1")
+            self._alloc(B)
+            self._tp_states_ready = False
+            outputs = [
+                self._decode_tp(ids[:, position], position)
+                for position in range(T)
+            ]
+            return (
+                torch.stack(outputs, dim=1)
+                if full_logits
+                else outputs[-1]
+            )
         if T > 512:
             if full_logits:
                 raise RuntimeError(

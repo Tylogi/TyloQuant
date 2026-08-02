@@ -252,6 +252,18 @@ def _no_owner_rank_order(executor, state) -> tuple[int, ...]:
     )
 
 
+def _has_full_peer_access(devices: tuple[torch.device, ...]) -> bool:
+    return all(
+        left == right
+        or torch.cuda.can_device_access_peer(
+            int(devices[left].index),
+            int(devices[right].index),
+        )
+        for left in range(len(devices))
+        for right in range(len(devices))
+    )
+
+
 def _compose_normalize_prelude(
     executor,
     layer: int,
@@ -1076,6 +1088,14 @@ class TensorParallelGatedMLP:
             raise ValueError(
                 "TP gated MLP input must use captured fixed addresses"
             )
+        if not _has_full_peer_access(self.devices):
+            partials = self.launch_partials(layer, hidden)
+            for device, event in zip(
+                partials.devices, partials.ready_events
+            ):
+                with torch.cuda.device(device):
+                    torch.cuda.current_stream(device).wait_event(event)
+            return output.reduce_from(partials.contributions)
         rank_order = _no_owner_rank_order(self, state)
         state.graph_batch.launch_all_rank_from_events(
             [
@@ -1696,6 +1716,14 @@ class TensorParallelRowLinear:
             raise ValueError(
                 "row-parallel input must use captured fixed addresses"
             )
+        if not _has_full_peer_access(self.devices):
+            partials = self.launch_partials(layer, sharded)
+            for device, event in zip(
+                partials.devices, partials.ready_events
+            ):
+                with torch.cuda.device(device):
+                    torch.cuda.current_stream(device).wait_event(event)
+            return output.reduce_from(partials.contributions)
         rank_order = _no_owner_rank_order(self, state)
         state.graph_batch.launch_all_rank_from_events(
             [

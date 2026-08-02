@@ -111,6 +111,16 @@ def build_kimi_layer_plan(store, tp_size: int) -> KimiLayerPlan:
     for layer, filename in store.man.expert_files.items():
         if not 0 <= int(layer) < n_layers:
             continue
+        native_residency = getattr(store, "packed_expert_residency", None)
+        if callable(native_residency):
+            file_nbytes, payloads, aux_nbytes = native_residency(layer)
+            expert_file_by_layer[layer] = int(file_nbytes)
+            expert_payload_by_expert[layer] = tuple(
+                int(value) for value in payloads
+            )
+            expert_payload_by_layer[layer] = sum(payloads)
+            expert_aux_by_layer[layer] = int(aux_nbytes)
+            continue
         expert_file_by_layer[layer] = os.path.getsize(
             os.path.join(store.root, filename)
         )
@@ -478,14 +488,13 @@ class PackedExpertPool:
             # a conservative 512 MiB for KDA state, router FP32 promotion and
             # decode workspaces on each rank.
             if self.parallelism == "pipeline":
-                required = self.plan.bytes_by_rank[rank]
+                required = self._rank_payload_bytes[rank]
             else:
-                # Dense remains continuously layer-placed in this stage, while
-                # every rank owns one quarter of every layer's experts and a
-                # local copy of the small per-layer codebooks.
+                # Capacity is checked after the parent model has already
+                # materialized Dense tensors.  Count only allocations that
+                # this method will add: expert payload and local codebooks.
                 required = (
-                    self.plan.dense_bytes_by_rank[rank]
-                    + self._rank_payload_bytes[rank]
+                    self._rank_payload_bytes[rank]
                     + sum(self.plan.expert_aux_by_layer)
                 )
             required += 512 * 2**20
@@ -923,7 +932,9 @@ class PackedExpertPool:
                 os.environ.get("TPQ_KIMI_TP_GRAPH", "1"),
             ) != "0":
                 self._prepare_expert_graphs()
-        self.store._cb_cache.clear()
+        codebook_cache = getattr(self.store, "_cb_cache", None)
+        if codebook_cache is not None:
+            codebook_cache.clear()
         gc.collect()
         self.active = True
         print(
@@ -1311,6 +1322,40 @@ class PackedExpertPool:
                 raise ValueError(
                     "packed MoE route replica layout mismatch"
                 )
+        peer_access = all(
+            left == right
+            or torch.cuda.can_device_access_peer(
+                int(self.devices[left].index),
+                int(self.devices[right].index),
+            )
+            for left in range(len(self.devices))
+            for right in range(len(self.devices))
+        )
+        if not peer_access:
+            graph_batch.launch_from_events(
+                [
+                    value.ready_events[rank].cuda_event
+                    for rank in range(len(self.devices))
+                ]
+            )
+            contributions = [
+                self._workspaces[rank][2]
+                for rank in range(len(self.devices))
+            ]
+            for rank, device in enumerate(self.devices):
+                with torch.cuda.device(device):
+                    torch.cuda.current_stream(device).wait_event(
+                        self._done_events[rank][layer]
+                    )
+            self.hits += int(routes[0][1].numel())
+            return TPHidden(
+                self.devices,
+                tuple(outputs),
+                tuple(
+                    self._output_events[rank][layer]
+                    for rank in range(len(self.devices))
+                ),
+            ).reduce_from(contributions)
         with torch.cuda.device(self.devices[0]):
             graph_batch.launch_all_rank_from_events(
                 [

@@ -178,14 +178,40 @@ class TPHidden:
             raise RuntimeError(
                 "TPHidden all-rank reduction currently requires CUDA"
             )
-        from ..fusedext import tp_all_rank_reduce_fused
-
-        result = tp_all_rank_reduce_fused(
-            list(contributions),
-            list(self.replicas),
+        values = list(contributions)
+        peer_access = all(
+            left == right
+            or torch.cuda.can_device_access_peer(
+                int(self.devices[left].index),
+                int(self.devices[right].index),
+            )
+            for left in range(len(self.devices))
+            for right in range(len(self.devices))
         )
-        if result is None:
-            raise RuntimeError("TPHidden all-rank reduction was rejected")
+        if peer_access:
+            from ..fusedext import tp_all_rank_reduce_fused
+
+            result = tp_all_rank_reduce_fused(values, list(self.replicas))
+            if result is None:
+                raise RuntimeError("TPHidden all-rank reduction was rejected")
+        else:
+            streams = []
+            for device in self.devices:
+                with torch.cuda.device(device):
+                    streams.append(torch.cuda.current_stream(device))
+            if not torch.cuda.nccl.is_available(values):
+                raise RuntimeError(
+                    "TPHidden requires CUDA P2P or NCCL all-reduce"
+                )
+            torch.cuda.nccl.all_reduce(
+                values,
+                streams=streams,
+            )
+            for device, contribution, output in zip(
+                self.devices, values, self.replicas
+            ):
+                with torch.cuda.device(device):
+                    output.copy_(contribution)
         if self.ready_events is not None:
             for device, event in zip(self.devices, self.ready_events):
                 with torch.cuda.device(device):
