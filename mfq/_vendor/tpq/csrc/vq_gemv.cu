@@ -20,7 +20,7 @@
 // lane-strided dot, warp reduce via __shfl_down_sync. x batch broadcast is
 // supported (xStrideN==0: all N experts share one input row at T=1 decode).
 //
-// hc_sinkhorn math (per row of mixes [N,24], hc=4; mirrors CCCP/dsv4.hc_split):
+// hc_sinkhorn math (per row of mixes [N,24], hc=4; mirrors tpq/dsv4.hc_split):
 //   pre[j]  = sigmoid(m[j]*scale[0] + base[j]) + eps
 //   post[j] = 2*sigmoid(m[4+j]*scale[1] + base[4+j])
 //   comb[j][k] = m[8+4j+k]*scale[2] + base[8+4j+k]
@@ -30,7 +30,6 @@
 //   pre | post | comb(row-major).
 //
 // Build: python -c "from tpq import fusedext; fusedext.prebuild()"
-//        (needs CUDA Toolkit + MSVC Build Tools + ninja).
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -915,14 +914,19 @@ __global__ void gated_activation_bf16_kernel(
     const int count,
     const int activation,
     const float beta,
-    const float linear_beta)
+    const float linear_beta,
+    const float limit)
 {
     const int item = blockIdx.x * blockDim.x + threadIdx.x;
     if (item >= count)
         return;
-    const float gate_value = __bfloat162float(gate[item]);
-    const float up_value = __bfloat162float(up[item]);
+    float gate_value = __bfloat162float(gate[item]);
+    float up_value = __bfloat162float(up[item]);
     if (activation == 0) {
+        if (limit > 0.0f) {
+            gate_value = fminf(gate_value, limit);
+            up_value = fminf(fmaxf(up_value, -limit), limit);
+        }
         const __nv_bfloat16 silu = __float2bfloat16_rn(
             gate_value / (1.0f + expf(-gate_value)));
         output[item] = __float2bfloat16_rn(
@@ -945,6 +949,7 @@ torch::Tensor gated_activation_bf16(
     long activation,
     double beta,
     double linear_beta,
+    double limit,
     c10::optional<torch::Tensor> output_buffer)
 {
     TORCH_CHECK(
@@ -987,7 +992,8 @@ torch::Tensor gated_activation_bf16(
             count,
             static_cast<int>(activation),
             static_cast<float>(beta),
-            static_cast<float>(linear_beta));
+            static_cast<float>(linear_beta),
+            static_cast<float>(limit));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
@@ -1581,6 +1587,44 @@ __device__ __forceinline__ int routed_index_value(
         return static_cast<int>(
             (bytes[base + 1] >> 4) | (bytes[base + 2] << 4));
     }
+    if (dtype_tag == 5) {
+        // Consecutive little-endian 9-bit indices.  Reading two bytes is
+        // sufficient because the bit offset within the first byte is 0..7.
+        const long bit_offset = offset * 9;
+        const long base = bit_offset >> 3;
+        const int shift = static_cast<int>(bit_offset & 7);
+        const unsigned word =
+            static_cast<unsigned>(bytes[base]) |
+            (static_cast<unsigned>(bytes[base + 1]) << 8);
+        return static_cast<int>((word >> shift) & 0x1ffu);
+    }
+    if (dtype_tag >= 6 && dtype_tag <= 8) {
+        // New projection archives use every odd width through p15.  Decode
+        // directly from the little-endian bit stream; the final index reads
+        // only two bytes when its 15 bits end exactly on the payload edge.
+        const int bits = 2 * dtype_tag - 1;
+        const long bit_offset = offset * bits;
+        const long base = bit_offset >> 3;
+        const int shift = static_cast<int>(bit_offset & 7);
+        unsigned word =
+            static_cast<unsigned>(bytes[base]) |
+            (static_cast<unsigned>(bytes[base + 1]) << 8);
+        if (shift + bits > 16)
+            word |= static_cast<unsigned>(bytes[base + 2]) << 16;
+        return static_cast<int>(
+            (word >> shift) & ((1u << bits) - 1u));
+    }
+    if (dtype_tag == 4) {
+        // Four little-endian 10-bit indices are stored in five bytes.
+        const long base = (offset >> 2) * 5;
+        unsigned long long word = 0;
+        #pragma unroll
+        for (int byte = 0; byte < 5; ++byte)
+            word |= static_cast<unsigned long long>(bytes[base + byte])
+                    << (8 * byte);
+        return static_cast<int>(
+            (word >> (10 * (offset & 3))) & 0x3ffu);
+    }
     // Four little-endian 14-bit indices are stored in seven bytes.  Assemble
     // explicitly so the read remains valid for arbitrary byte alignment.
     const long base = (offset >> 2) * 7;
@@ -1608,6 +1652,106 @@ __device__ __forceinline__ float vq_block_dot4_bf16(
     part = fmaf(cv1.x, xv1.x, part);
     part = fmaf(cv1.y, xv1.y, part);
     return part;
+}
+
+constexpr int TPQ_PROJECTION_P10_SHARED_STRIDE = 10;
+constexpr int TPQ_PROJECTION_P8_SHARED_STRIDE = 6;
+
+__device__ __forceinline__ void vq_block_dot8_pair_bf16(
+    const __nv_bfloat16* gate_cb,
+    const __nv_bfloat16* up_cb,
+    const __nv_bfloat16* input,
+    float& gate_value,
+    float& up_value)
+{
+    const auto* gate2 = reinterpret_cast<const __nv_bfloat162*>(gate_cb);
+    const auto* up2 = reinterpret_cast<const __nv_bfloat162*>(up_cb);
+    const auto* input2 = reinterpret_cast<const __nv_bfloat162*>(input);
+    #pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+        const float2 x = __bfloat1622float2(input2[pair]);
+        const float2 gate = __bfloat1622float2(gate2[pair]);
+        const float2 up = __bfloat1622float2(up2[pair]);
+        gate_value = fmaf(gate.x, x.x, gate_value);
+        gate_value = fmaf(gate.y, x.y, gate_value);
+        up_value = fmaf(up.x, x.x, up_value);
+        up_value = fmaf(up.y, x.y, up_value);
+    }
+}
+
+__device__ __forceinline__ void vq_gemv_routed_p10_pair(
+    const int64_t gate_index_address,
+    const int64_t up_index_address,
+    const __nv_bfloat16* __restrict__ gate_codebook,
+    const __nv_bfloat16* __restrict__ up_codebook,
+    const __nv_bfloat16* __restrict__ input,
+    const int blocks,
+    const long index_row,
+    float& gate_value,
+    float& up_value)
+{
+    const auto* gate_indices = reinterpret_cast<const uint8_t*>(
+        static_cast<uintptr_t>(gate_index_address));
+    const auto* up_indices = reinterpret_cast<const uint8_t*>(
+        static_cast<uintptr_t>(up_index_address));
+    gate_value = 0.f;
+    up_value = 0.f;
+    for (int block = threadIdx.x; block < blocks; block += 32) {
+        const unsigned active = __activemask();
+        const int sublane = threadIdx.x & 3;
+        const long base = ((index_row + block) >> 2) * 5;
+        const unsigned gate_byte = gate_indices[base + sublane];
+        const unsigned up_byte = up_indices[base + sublane];
+        unsigned gate_next = __shfl_down_sync(
+            active, gate_byte, 1, 4);
+        unsigned up_next = __shfl_down_sync(
+            active, up_byte, 1, 4);
+        if (sublane == 3) {
+            gate_next = gate_indices[base + 4];
+            up_next = up_indices[base + 4];
+        }
+        const int following_bits = 2 * (sublane + 1);
+        const unsigned following_mask =
+            (1u << following_bits) - 1u;
+        const int left_shift = 8 - 2 * sublane;
+        const int gate_code = static_cast<int>(
+            (gate_byte >> (2 * sublane)) |
+            ((gate_next & following_mask) << left_shift));
+        const int up_code = static_cast<int>(
+            (up_byte >> (2 * sublane)) |
+            ((up_next & following_mask) << left_shift));
+        vq_block_dot8_pair_bf16(
+            gate_codebook +
+                static_cast<long>(gate_code) *
+                    TPQ_PROJECTION_P10_SHARED_STRIDE,
+            up_codebook +
+                static_cast<long>(up_code) *
+                    TPQ_PROJECTION_P10_SHARED_STRIDE,
+            input + block * 8,
+            gate_value,
+            up_value);
+    }
+}
+
+__device__ __forceinline__ float vq_gemv_routed_p8_shared(
+    const int64_t index_address,
+    const __nv_bfloat16* __restrict__ codebook,
+    const __nv_bfloat16* __restrict__ input,
+    const int blocks,
+    const long index_row)
+{
+    const auto* indices = reinterpret_cast<const uint8_t*>(
+        static_cast<uintptr_t>(index_address));
+    float value = 0.f;
+    for (int block = threadIdx.x; block < blocks; block += 32) {
+        const int code = static_cast<int>(indices[index_row + block]);
+        value += vq_block_dot4_bf16(
+            codebook +
+                static_cast<long>(code) *
+                    TPQ_PROJECTION_P8_SHARED_STRIDE,
+            input + block * 4);
+    }
+    return value;
 }
 
 __device__ __forceinline__ float vq_gemv_routed_row(
@@ -1649,6 +1793,40 @@ __device__ __forceinline__ float vq_gemv_routed_row(
             packed = __shfl_sync(active, packed, leader);
             const int code = static_cast<int>(
                 (packed >> ((threadIdx.x & 1) * 12)) & 0xfffu);
+            value += vq_block_dot(
+                codebook + (long)code * vector,
+                input + block * vector,
+                vector);
+        }
+    } else if (dtype_tag == 4 && (blocks & 3) == 0) {
+        // Packed-10 stores four adjacent indices in five bytes. One lane
+        // loads the 40-bit group and broadcasts it to the four consumers.
+        const auto* indices = reinterpret_cast<const uint8_t*>(
+            static_cast<uintptr_t>(index_address));
+        for (int block = threadIdx.x; block < blocks; block += 32) {
+            const unsigned active = __activemask();
+            const int leader = threadIdx.x & ~3;
+            unsigned low = 0;
+            unsigned high = 0;
+            if ((threadIdx.x & 3) == 0) {
+                const long base = ((index_row + block) >> 2) * 5;
+                unsigned long long packed = 0;
+                #pragma unroll
+                for (int byte = 0; byte < 5; ++byte)
+                    packed |=
+                        static_cast<unsigned long long>(
+                            indices[base + byte])
+                        << (8 * byte);
+                low = static_cast<unsigned>(packed);
+                high = static_cast<unsigned>(packed >> 32);
+            }
+            low = __shfl_sync(active, low, leader);
+            high = __shfl_sync(active, high, leader);
+            const unsigned long long packed =
+                static_cast<unsigned long long>(low) |
+                (static_cast<unsigned long long>(high) << 32);
+            const int code = static_cast<int>(
+                (packed >> (10 * (threadIdx.x & 3))) & 0x3ffu);
             value += vq_block_dot(
                 codebook + (long)code * vector,
                 input + block * vector,
@@ -1842,6 +2020,521 @@ inline void launch_vq_gemv_routed(
             skip_p12,
             route_offset,
             vector_input_copy);
+}
+
+constexpr int TPQ_PROJECTION_ROWS_PER_WARP = 4;
+constexpr int TPQ_PROJECTION_P10_CODES = 1024;
+constexpr int TPQ_PROJECTION_P10_VECTOR = 8;
+constexpr int TPQ_PROJECTION_P8_CODES = 256;
+constexpr int TPQ_PROJECTION_P8_VECTOR = 4;
+
+// Activation is part of the public operator capability, not a model switch.
+// 0 = SiTU (Kimi), 1 = clamped SiLU/SwiGLU (DeepSeek/GLM).
+__device__ __forceinline__ float projection_gate_up_activation(
+    float gate,
+    float up,
+    const int activation_kind,
+    const float beta,
+    const float linear_beta,
+    const float limit)
+{
+    if (activation_kind == 1) {
+        if (limit > 0.f) {
+            gate = fminf(gate, limit);
+            up = fminf(fmaxf(up, -limit), limit);
+        }
+        return (gate / (1.f + expf(-gate))) * up;
+    }
+    const float nonlinear =
+        beta * tanhf(gate / beta) / (1.f + expf(-gate));
+    if (linear_beta > 0.f)
+        up = linear_beta * tanhf(up / linear_beta);
+    return nonlinear * up;
+}
+
+// Common three-projection decode path. Gate and Up share the same input, so
+// compute both in one CTA and apply the registered gated activation before
+// writing the BF16 workspace.
+// For p10/d8-k1024, each 16 KiB codebook is staged with a two-BF16 pad per
+// entry. The resulting 20-byte stride distributes random lookup rows across
+// all shared-memory banks instead of only eight starting banks. Other layouts
+// remain correct through the generic packed row decoder, without a
+// model-specific kernel or a dequantized matrix.
+template <int WARPS>
+__global__ void vq_projection_gate_up_situ_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    const int64_t* __restrict__ route_ids,
+    const int64_t* __restrict__ metadata,
+    __nv_bfloat16* __restrict__ activated,
+    const int top_k,
+    const int expert_count,
+    const int output_rows,
+    const int input_cols,
+    const int activation_kind,
+    const float beta,
+    const float linear_beta,
+    const float limit,
+    const bool stage_p10)
+{
+    const int position = blockIdx.y;
+    if (position >= top_k)
+        return;
+    const int expert = static_cast<int>(route_ids[position]);
+    const int linear_thread = threadIdx.y * 32 + threadIdx.x;
+    constexpr int block_threads = 32 * WARPS;
+    extern __shared__ unsigned char raw_shared[];
+    auto* shared_input =
+        reinterpret_cast<__nv_bfloat16*>(raw_shared);
+    auto* shared_gate_codebook = shared_input + input_cols;
+    auto* shared_up_codebook =
+        shared_gate_codebook +
+        TPQ_PROJECTION_P10_CODES *
+            TPQ_PROJECTION_P10_SHARED_STRIDE;
+    __shared__ RoutedBlockMetadata gate_meta;
+    __shared__ RoutedBlockMetadata up_meta;
+    __shared__ int shared_p10;
+
+    if (linear_thread == 0) {
+        gate_meta.valid = 0;
+        up_meta.valid = 0;
+        shared_p10 = 0;
+        if (expert >= 0 && expert < expert_count) {
+            gate_meta.index_address =
+                metadata[(long)0 * expert_count + expert];
+            gate_meta.codebook_address =
+                metadata[(long)1 * expert_count + expert];
+            gate_meta.blocks = static_cast<int>(
+                metadata[(long)2 * expert_count + expert]);
+            gate_meta.vector = static_cast<int>(
+                metadata[(long)3 * expert_count + expert]);
+            gate_meta.dtype_tag = static_cast<int>(
+                metadata[(long)4 * expert_count + expert]);
+            gate_meta.valid = (
+                gate_meta.index_address != 0 &&
+                gate_meta.codebook_address != 0 &&
+                gate_meta.blocks > 0
+            );
+            up_meta.index_address =
+                metadata[(long)5 * expert_count + expert];
+            up_meta.codebook_address =
+                metadata[(long)6 * expert_count + expert];
+            up_meta.blocks = static_cast<int>(
+                metadata[(long)7 * expert_count + expert]);
+            up_meta.vector = static_cast<int>(
+                metadata[(long)8 * expert_count + expert]);
+            up_meta.dtype_tag = static_cast<int>(
+                metadata[(long)9 * expert_count + expert]);
+            up_meta.valid = (
+                up_meta.index_address != 0 &&
+                up_meta.codebook_address != 0 &&
+                up_meta.blocks > 0
+            );
+            shared_p10 = (
+                stage_p10 &&
+                gate_meta.valid &&
+                up_meta.valid &&
+                gate_meta.dtype_tag == 4 &&
+                up_meta.dtype_tag == 4 &&
+                gate_meta.vector == TPQ_PROJECTION_P10_VECTOR &&
+                up_meta.vector == TPQ_PROJECTION_P10_VECTOR &&
+                gate_meta.blocks * gate_meta.vector == input_cols &&
+                up_meta.blocks * up_meta.vector == input_cols
+            );
+        }
+    }
+    const auto* input4 = reinterpret_cast<const uint4*>(input);
+    auto* shared_input4 = reinterpret_cast<uint4*>(shared_input);
+    for (
+        int item = linear_thread;
+        item < input_cols / 8;
+        item += block_threads
+    )
+        shared_input4[item] = input4[item];
+    __syncthreads();
+    if (!gate_meta.valid || !up_meta.valid)
+        return;
+
+    const auto* gate_global =
+        reinterpret_cast<const __nv_bfloat16*>(
+            static_cast<uintptr_t>(gate_meta.codebook_address));
+    const auto* up_global =
+        reinterpret_cast<const __nv_bfloat16*>(
+            static_cast<uintptr_t>(up_meta.codebook_address));
+    if (shared_p10) {
+        for (
+            int item = linear_thread;
+            item < TPQ_PROJECTION_P10_CODES *
+                TPQ_PROJECTION_P10_VECTOR;
+            item += block_threads
+        ) {
+            const int code = item / TPQ_PROJECTION_P10_VECTOR;
+            const int component = item % TPQ_PROJECTION_P10_VECTOR;
+            const int target =
+                code * TPQ_PROJECTION_P10_SHARED_STRIDE + component;
+            shared_gate_codebook[target] = gate_global[item];
+            shared_up_codebook[target] = up_global[item];
+        }
+    }
+    __syncthreads();
+
+    const auto* gate_codebook = (
+        shared_p10 ? shared_gate_codebook : gate_global
+    );
+    const auto* up_codebook = (
+        shared_p10 ? shared_up_codebook : up_global
+    );
+    float gate_values[TPQ_PROJECTION_ROWS_PER_WARP] = {};
+    float up_values[TPQ_PROJECTION_ROWS_PER_WARP] = {};
+    #pragma unroll
+    for (
+        int item = 0;
+        item < TPQ_PROJECTION_ROWS_PER_WARP;
+        ++item
+    ) {
+        const int row =
+            blockIdx.x *
+                (WARPS * TPQ_PROJECTION_ROWS_PER_WARP) +
+            threadIdx.y +
+            item * WARPS;
+        if (row < output_rows) {
+            if (shared_p10) {
+                vq_gemv_routed_p10_pair(
+                    gate_meta.index_address,
+                    up_meta.index_address,
+                    gate_codebook,
+                    up_codebook,
+                    shared_input,
+                    gate_meta.blocks,
+                    (long)row * gate_meta.blocks,
+                    gate_values[item],
+                    up_values[item]);
+            } else {
+                gate_values[item] = vq_gemv_routed_row(
+                    gate_meta.index_address,
+                    gate_codebook,
+                    shared_input,
+                    gate_meta.blocks,
+                    gate_meta.vector,
+                    gate_meta.dtype_tag,
+                    (long)row * gate_meta.blocks);
+                up_values[item] = vq_gemv_routed_row(
+                    up_meta.index_address,
+                    up_codebook,
+                    shared_input,
+                    up_meta.blocks,
+                    up_meta.vector,
+                    up_meta.dtype_tag,
+                    (long)row * up_meta.blocks);
+            }
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (
+            int item = 0;
+            item < TPQ_PROJECTION_ROWS_PER_WARP;
+            ++item
+        ) {
+            gate_values[item] += __shfl_down_sync(
+                0xffffffffu,
+                gate_values[item],
+                offset);
+            up_values[item] += __shfl_down_sync(
+                0xffffffffu,
+                up_values[item],
+                offset);
+        }
+    }
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (
+            int item = 0;
+            item < TPQ_PROJECTION_ROWS_PER_WARP;
+            ++item
+        ) {
+            const int row =
+                blockIdx.x *
+                    (WARPS * TPQ_PROJECTION_ROWS_PER_WARP) +
+                threadIdx.y +
+                item * WARPS;
+            if (row < output_rows) {
+                const float gate = __bfloat162float(
+                    __float2bfloat16_rn(gate_values[item]));
+                const float up = __bfloat162float(
+                    __float2bfloat16_rn(up_values[item]));
+                activated[(long)position * output_rows + row] =
+                    __float2bfloat16_rn(projection_gate_up_activation(
+                        gate,
+                        up,
+                        activation_kind,
+                        beta,
+                        linear_beta,
+                        limit));
+            }
+        }
+    }
+}
+
+template <int WARPS>
+inline void launch_vq_projection_gate_up_situ(
+    const __nv_bfloat16* input,
+    const int64_t* route_ids,
+    const int64_t* metadata,
+    __nv_bfloat16* activated,
+    const int top_k,
+    const int expert_count,
+    const int output_rows,
+    const int input_cols,
+    const int activation_kind,
+    const float beta,
+    const float linear_beta,
+    const float limit,
+    const bool stage_p10,
+    cudaStream_t stream)
+{
+    const size_t shared_bytes = static_cast<size_t>(
+        input_cols +
+        (
+            stage_p10
+                ? 2 * TPQ_PROJECTION_P10_CODES *
+                    TPQ_PROJECTION_P10_SHARED_STRIDE
+                : 0
+        )
+    ) * sizeof(__nv_bfloat16);
+    if (shared_bytes > 48 * 1024) {
+        const auto status = cudaFuncSetAttribute(
+            vq_projection_gate_up_situ_kernel<WARPS>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(shared_bytes));
+        TORCH_CHECK(
+            status == cudaSuccess,
+            "failed to configure p10 projection shared memory: ",
+            cudaGetErrorString(status));
+    }
+    vq_projection_gate_up_situ_kernel<WARPS><<<
+        dim3(
+            (unsigned)(
+                (
+                    output_rows +
+                    WARPS * TPQ_PROJECTION_ROWS_PER_WARP - 1
+                ) /
+                (WARPS * TPQ_PROJECTION_ROWS_PER_WARP)
+            ),
+            (unsigned)top_k),
+        dim3(32, WARPS),
+        shared_bytes,
+        stream>>>(
+            input,
+            route_ids,
+            metadata,
+            activated,
+            top_k,
+            expert_count,
+            output_rows,
+            input_cols,
+            activation_kind,
+            beta,
+            linear_beta,
+            limit,
+            stage_p10);
+}
+
+// Down keeps the same registered output workspace, but p8/d4-k256 stages its
+// complete padded codebook and computes four rows per warp. Padding d4 rows
+// from four to six BF16 values changes the shared-memory row stride from
+// eight to twelve bytes, distributing random lookup starts over all 32 banks.
+// Other formats use the common packed row decoder in the same kernel.
+template <int WARPS>
+__global__ void vq_projection_down_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    const int64_t* __restrict__ route_ids,
+    const int64_t* __restrict__ metadata,
+    __nv_bfloat16* __restrict__ output,
+    const int top_k,
+    const int expert_count,
+    const int output_rows,
+    const int input_cols)
+{
+    const int position = blockIdx.y;
+    if (position >= top_k)
+        return;
+    const int expert = static_cast<int>(route_ids[position]);
+    const int linear_thread = threadIdx.y * 32 + threadIdx.x;
+    constexpr int block_threads = 32 * WARPS;
+    extern __shared__ unsigned char raw_shared[];
+    auto* shared_input =
+        reinterpret_cast<__nv_bfloat16*>(raw_shared);
+    auto* shared_codebook = shared_input + input_cols;
+    __shared__ RoutedBlockMetadata down_meta;
+    __shared__ int shared_p8;
+
+    if (linear_thread == 0) {
+        down_meta.valid = 0;
+        shared_p8 = 0;
+        if (expert >= 0 && expert < expert_count) {
+            down_meta.index_address =
+                metadata[(long)10 * expert_count + expert];
+            down_meta.codebook_address =
+                metadata[(long)11 * expert_count + expert];
+            down_meta.blocks = static_cast<int>(
+                metadata[(long)12 * expert_count + expert]);
+            down_meta.vector = static_cast<int>(
+                metadata[(long)13 * expert_count + expert]);
+            down_meta.dtype_tag = static_cast<int>(
+                metadata[(long)14 * expert_count + expert]);
+            down_meta.valid = (
+                down_meta.index_address != 0 &&
+                down_meta.codebook_address != 0 &&
+                down_meta.blocks > 0
+            );
+            shared_p8 = (
+                down_meta.valid &&
+                down_meta.dtype_tag == 0 &&
+                down_meta.vector == TPQ_PROJECTION_P8_VECTOR &&
+                down_meta.blocks * down_meta.vector == input_cols
+            );
+        }
+    }
+    const __nv_bfloat16* input_row =
+        input + (long)position * input_cols;
+    const auto* input4 =
+        reinterpret_cast<const uint4*>(input_row);
+    auto* shared_input4 =
+        reinterpret_cast<uint4*>(shared_input);
+    for (
+        int item = linear_thread;
+        item < input_cols / 8;
+        item += block_threads
+    )
+        shared_input4[item] = input4[item];
+    __syncthreads();
+    if (!down_meta.valid)
+        return;
+
+    const auto* global_codebook =
+        reinterpret_cast<const __nv_bfloat16*>(
+            static_cast<uintptr_t>(down_meta.codebook_address));
+    if (shared_p8) {
+        const int codebook_items =
+            TPQ_PROJECTION_P8_CODES * TPQ_PROJECTION_P8_VECTOR;
+        for (
+            int item = linear_thread;
+            item < codebook_items;
+            item += block_threads
+        ) {
+            const int code = item / TPQ_PROJECTION_P8_VECTOR;
+            const int component = item % TPQ_PROJECTION_P8_VECTOR;
+            shared_codebook[
+                code * TPQ_PROJECTION_P8_SHARED_STRIDE + component
+            ] = global_codebook[item];
+        }
+    }
+    __syncthreads();
+    const auto* codebook = (
+        shared_p8 ? shared_codebook : global_codebook
+    );
+    float values[TPQ_PROJECTION_ROWS_PER_WARP] = {};
+    #pragma unroll
+    for (
+        int item = 0;
+        item < TPQ_PROJECTION_ROWS_PER_WARP;
+        ++item
+    ) {
+        const int row =
+            blockIdx.x *
+                (WARPS * TPQ_PROJECTION_ROWS_PER_WARP) +
+            threadIdx.y +
+            item * WARPS;
+        if (row < output_rows) {
+            values[item] = (
+                shared_p8
+                ? vq_gemv_routed_p8_shared(
+                    down_meta.index_address,
+                    codebook,
+                    shared_input,
+                    down_meta.blocks,
+                    (long)row * down_meta.blocks)
+                : vq_gemv_routed_row(
+                    down_meta.index_address,
+                    codebook,
+                    shared_input,
+                    down_meta.blocks,
+                    down_meta.vector,
+                    down_meta.dtype_tag,
+                    (long)row * down_meta.blocks)
+            );
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (
+            int item = 0;
+            item < TPQ_PROJECTION_ROWS_PER_WARP;
+            ++item
+        )
+            values[item] += __shfl_down_sync(
+                0xffffffffu,
+                values[item],
+                offset);
+    }
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (
+            int item = 0;
+            item < TPQ_PROJECTION_ROWS_PER_WARP;
+            ++item
+        ) {
+            const int row =
+                blockIdx.x *
+                    (WARPS * TPQ_PROJECTION_ROWS_PER_WARP) +
+                threadIdx.y +
+                item * WARPS;
+            if (row < output_rows)
+                output[(long)position * output_rows + row] =
+                    __float2bfloat16_rn(values[item]);
+        }
+    }
+}
+
+template <int WARPS>
+inline void launch_vq_projection_down(
+    const __nv_bfloat16* input,
+    const int64_t* route_ids,
+    const int64_t* metadata,
+    __nv_bfloat16* output,
+    const int top_k,
+    const int expert_count,
+    const int output_rows,
+    const int input_cols,
+    cudaStream_t stream)
+{
+    const size_t shared_bytes = static_cast<size_t>(
+        input_cols +
+        TPQ_PROJECTION_P8_CODES * TPQ_PROJECTION_P8_SHARED_STRIDE
+    ) * sizeof(__nv_bfloat16);
+    vq_projection_down_kernel<WARPS><<<
+        dim3(
+            (unsigned)(
+                (
+                    output_rows +
+                    WARPS * TPQ_PROJECTION_ROWS_PER_WARP - 1
+                ) /
+                (WARPS * TPQ_PROJECTION_ROWS_PER_WARP)
+            ),
+            (unsigned)top_k),
+        dim3(32, WARPS),
+        shared_bytes,
+        stream>>>(
+            input,
+            route_ids,
+            metadata,
+            output,
+            top_k,
+            expert_count,
+            output_rows,
+            input_cols);
 }
 
 constexpr int TPQ_P12_CODES = 4096;
@@ -2152,6 +2845,39 @@ __global__ void routed_situ_bf16_inplace_kernel(
         __float2bfloat16_rn(activated * up);
 }
 
+__global__ void routed_situ_planar_bf16_inplace_kernel(
+    __nv_bfloat16* __restrict__ hidden,
+    const int64_t* __restrict__ route_ids,
+    const int64_t* __restrict__ metadata,
+    const int top_k,
+    const int expert_count,
+    const int intermediate,
+    const int activation_kind,
+    const float beta,
+    const float linear_beta,
+    const float limit)
+{
+    const int item = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = top_k * intermediate;
+    if (item >= total) return;
+    const int position = item / intermediate;
+    const int expert = static_cast<int>(route_ids[position]);
+    if (
+        expert < 0 || expert >= expert_count ||
+        metadata[expert] == 0
+    ) return;
+    const float gate = __bfloat162float(hidden[item]);
+    const float up = __bfloat162float(hidden[total + item]);
+    const float activated = projection_gate_up_activation(
+        gate,
+        up,
+        activation_kind,
+        beta,
+        linear_beta,
+        limit);
+    hidden[item] = __float2bfloat16_rn(activated);
+}
+
 __global__ void routed_weighted_sum_f32_kernel(
     const __nv_bfloat16* __restrict__ rows,
     const int64_t* __restrict__ route_ids,
@@ -2161,6 +2887,7 @@ __global__ void routed_weighted_sum_f32_kernel(
     const int K,
     const int E,
     const int D,
+    const int dtype_filter,
     const bool accumulate);
 
 constexpr int TPQ_DOWN_REDUCE_ROWS = 1;
@@ -2311,12 +3038,15 @@ torch::Tensor packed_moe_topk(
     torch::Tensor route_ids,
     torch::Tensor weights,
     torch::Tensor metadata,
+    int64_t activation_kind_value,
     double beta,
     double linear_beta,
+      double limit,
       torch::Tensor hidden_workspace,
       torch::Tensor out_workspace,
       torch::Tensor result,
-      int64_t p12_count_value)
+      int64_t p12_count_value,
+      int64_t projection_layout_tag_value)
 {
     TORCH_CHECK(
         input.is_cuda() && input.scalar_type() == at::kBFloat16 &&
@@ -2328,11 +3058,19 @@ torch::Tensor packed_moe_topk(
         "packed MoE route IDs must be CUDA int64 [K]");
       const int top_k = static_cast<int>(route_ids.numel());
     TORCH_CHECK(
+          activation_kind_value >= 0 && activation_kind_value <= 1,
+          "packed MoE activation kind must be 0 (SiTU) or 1 (SwiGLU)");
+      const int activation_kind = static_cast<int>(activation_kind_value);
+    TORCH_CHECK(
           top_k > 0 && top_k <= MAX_SLOT_EXPERTS,
           "packed MoE Top-K must be in [1,16]");
       TORCH_CHECK(
           p12_count_value >= -1 && p12_count_value <= top_k,
           "packed MoE p12 count must be -1 or in [0,Top-K]");
+      TORCH_CHECK(
+          projection_layout_tag_value >= 0 &&
+          projection_layout_tag_value <= 2,
+          "packed MoE projection layout tag must be 0, 1 or 2");
       const int p12_count = static_cast<int>(p12_count_value);
       const bool p12_grouped = p12_count >= 0;
       const char* p12_setting = std::getenv("TPQ_P12_SHARED");
@@ -2397,8 +3135,12 @@ torch::Tensor packed_moe_topk(
     TORCH_CHECK(
         metadata.is_cuda() && metadata.scalar_type() == at::kLong &&
         metadata.is_contiguous() && metadata.dim() == 2 &&
-        metadata.size(0) == ROUTED_META_ROWS,
-        "packed MoE metadata must be CUDA int64 [10,E]");
+        (
+            metadata.size(0) == ROUTED_META_ROWS ||
+            metadata.size(0) == 15
+        ),
+        "packed MoE metadata must be CUDA int64 [10,E] or [15,E]");
+    const bool projection_vq = metadata.size(0) == 15;
     TORCH_CHECK(
         input.get_device() == route_ids.get_device() &&
         input.get_device() == weights.get_device() &&
@@ -2429,8 +3171,8 @@ torch::Tensor packed_moe_topk(
         result.numel() == hidden,
         "packed MoE result must be float32 [D]");
     TORCH_CHECK(
-        beta > 0.0,
-        "packed MoE activation beta must be positive");
+        activation_kind != 0 || beta > 0.0,
+        "packed MoE SiTU beta must be positive");
 
     int current = -1;
     C10_CUDA_CHECK(cudaGetDevice(&current));
@@ -2444,6 +3186,264 @@ torch::Tensor packed_moe_topk(
               "packed MoE direct result");
       dim3 p12_block(32, TPQ_P12_WARPS);
       auto stream = at::cuda::getCurrentCUDAStream();
+      if (projection_vq) {
+          const auto* input_pointer =
+              reinterpret_cast<const __nv_bfloat16*>(
+                  input.data_ptr<at::BFloat16>());
+          auto* hidden_pointer =
+              reinterpret_cast<__nv_bfloat16*>(
+                  hidden_workspace.data_ptr<at::BFloat16>());
+          auto* output_pointer =
+              reinterpret_cast<__nv_bfloat16*>(
+                  out_workspace.data_ptr<at::BFloat16>());
+          const char* projection_fused_setting =
+              std::getenv("TPQ_PROJECTION_FUSED");
+          const bool use_projection_fused = (
+              projection_layout_tag_value >= 1 &&
+              (
+                  projection_fused_setting == nullptr ||
+                  std::string(projection_fused_setting) != "0"
+              )
+          );
+          const char* projection_warps_setting =
+              std::getenv("TPQ_PROJECTION_WARPS");
+          const char* p10_shared_setting =
+              std::getenv("TPQ_P10_SHARED");
+          const bool p10_shared = (
+              projection_layout_tag_value == 2 &&
+              (
+                  p10_shared_setting == nullptr ||
+                  std::atoi(p10_shared_setting) != 0
+              )
+          );
+          int projection_warps = (
+              projection_warps_setting == nullptr
+              ? 32
+              : std::atoi(projection_warps_setting)
+          );
+          if (
+              projection_warps != 8 &&
+              projection_warps != 16 &&
+              projection_warps != 32
+          )
+              projection_warps = 32;
+          if (use_projection_fused) {
+              if (projection_warps == 8) {
+                  launch_vq_projection_gate_up_situ<8>(
+                      input_pointer,
+                      route_ids.data_ptr<int64_t>(),
+                      metadata.data_ptr<int64_t>(),
+                      hidden_pointer,
+                      top_k,
+                      expert_count,
+                      intermediate,
+                      hidden,
+                      activation_kind,
+                      static_cast<float>(beta),
+                      static_cast<float>(linear_beta),
+                      static_cast<float>(limit),
+                      p10_shared,
+                      stream);
+                  launch_vq_projection_down<8>(
+                      hidden_pointer,
+                      route_ids.data_ptr<int64_t>(),
+                      metadata.data_ptr<int64_t>(),
+                      output_pointer,
+                      top_k,
+                      expert_count,
+                      hidden,
+                      intermediate,
+                      stream);
+              } else if (projection_warps == 32) {
+                  launch_vq_projection_gate_up_situ<32>(
+                      input_pointer,
+                      route_ids.data_ptr<int64_t>(),
+                      metadata.data_ptr<int64_t>(),
+                      hidden_pointer,
+                      top_k,
+                      expert_count,
+                      intermediate,
+                      hidden,
+                      activation_kind,
+                      static_cast<float>(beta),
+                      static_cast<float>(linear_beta),
+                      static_cast<float>(limit),
+                      p10_shared,
+                      stream);
+                  launch_vq_projection_down<32>(
+                      hidden_pointer,
+                      route_ids.data_ptr<int64_t>(),
+                      metadata.data_ptr<int64_t>(),
+                      output_pointer,
+                      top_k,
+                      expert_count,
+                      hidden,
+                      intermediate,
+                      stream);
+              } else {
+                  launch_vq_projection_gate_up_situ<16>(
+                      input_pointer,
+                      route_ids.data_ptr<int64_t>(),
+                      metadata.data_ptr<int64_t>(),
+                      hidden_pointer,
+                      top_k,
+                      expert_count,
+                      intermediate,
+                      hidden,
+                      activation_kind,
+                      static_cast<float>(beta),
+                      static_cast<float>(linear_beta),
+                      static_cast<float>(limit),
+                      p10_shared,
+                      stream);
+                  launch_vq_projection_down<16>(
+                      hidden_pointer,
+                      route_ids.data_ptr<int64_t>(),
+                      metadata.data_ptr<int64_t>(),
+                      output_pointer,
+                      top_k,
+                      expert_count,
+                      hidden,
+                      intermediate,
+                      stream);
+              }
+              routed_weighted_sum_f32_kernel<<<
+                  (hidden + 255) / 256,
+                  256,
+                  0,
+                  stream>>>(
+                      output_pointer,
+                      route_ids.data_ptr<int64_t>(),
+                      weights.data_ptr<float>(),
+                      metadata.data_ptr<int64_t>() +
+                          (long)5 * expert_count,
+                      result.data_ptr<float>(),
+                      top_k,
+                      expert_count,
+                      hidden,
+                      -1,
+                      false);
+              C10_CUDA_KERNEL_LAUNCH_CHECK();
+              return result;
+          }
+          const auto launch_projection = [&](
+              const __nv_bfloat16* projection_input,
+              __nv_bfloat16* projection_output,
+              const int metadata_base,
+              const int output_rows,
+              const int input_columns,
+              const long input_stride) {
+              if (routed_warps == 8)
+                  launch_vq_gemv_routed<8>(
+                      projection_input,
+                      route_ids.data_ptr<int64_t>(),
+                      metadata.data_ptr<int64_t>(),
+                      projection_output,
+                      top_k,
+                      expert_count,
+                      metadata_base,
+                      output_rows,
+                      input_columns,
+                      input_stride,
+                      false,
+                      0,
+                      top_k,
+                      vector_input_copy,
+                      stream);
+              else if (routed_warps == 16)
+                  launch_vq_gemv_routed<16>(
+                      projection_input,
+                      route_ids.data_ptr<int64_t>(),
+                      metadata.data_ptr<int64_t>(),
+                      projection_output,
+                      top_k,
+                      expert_count,
+                      metadata_base,
+                      output_rows,
+                      input_columns,
+                      input_stride,
+                      false,
+                      0,
+                      top_k,
+                      vector_input_copy,
+                      stream);
+              else
+                  launch_vq_gemv_routed<32>(
+                      projection_input,
+                      route_ids.data_ptr<int64_t>(),
+                      metadata.data_ptr<int64_t>(),
+                      projection_output,
+                      top_k,
+                      expert_count,
+                      metadata_base,
+                      output_rows,
+                      input_columns,
+                      input_stride,
+                      false,
+                      0,
+                      top_k,
+                      vector_input_copy,
+                      stream);
+          };
+          // Planar workspace: [all gate rows][all up rows].  This lets both
+          // independent codebooks use the common contiguous VQ GEMV kernel.
+          launch_projection(
+              input_pointer,
+              hidden_pointer,
+              0,
+              intermediate,
+              hidden,
+              0);
+          launch_projection(
+              input_pointer,
+              hidden_pointer + (long)top_k * intermediate,
+              5,
+              intermediate,
+              hidden,
+              0);
+          routed_situ_planar_bf16_inplace_kernel<<<
+              (top_k * intermediate + 255) / 256,
+              256,
+              0,
+              stream>>>(
+                  hidden_pointer,
+                  route_ids.data_ptr<int64_t>(),
+                  metadata.data_ptr<int64_t>(),
+                  top_k,
+                  expert_count,
+                  intermediate,
+                  activation_kind,
+                  static_cast<float>(beta),
+                  static_cast<float>(linear_beta),
+                  static_cast<float>(limit));
+          launch_projection(
+              hidden_pointer,
+              output_pointer,
+              10,
+              hidden,
+              intermediate,
+              intermediate);
+          // The existing reducer expects down metadata at rows 5..9.  Shift
+          // the base by one projection so it sees rows 10..14.
+          routed_weighted_sum_f32_kernel<<<
+              (hidden + 255) / 256,
+              256,
+              0,
+              stream>>>(
+                  output_pointer,
+                  route_ids.data_ptr<int64_t>(),
+                  weights.data_ptr<float>(),
+                  metadata.data_ptr<int64_t>() +
+                      (long)5 * expert_count,
+                  result.data_ptr<float>(),
+                  top_k,
+                  expert_count,
+                  hidden,
+                  -1,
+                  false);
+          C10_CUDA_KERNEL_LAUNCH_CHECK();
+          return result;
+      }
       const size_t gu_p12_shared = static_cast<size_t>(
           hidden + (
               use_p12_shared
@@ -2745,6 +3745,7 @@ torch::Tensor packed_moe_topk(
             top_k,
             expert_count,
             hidden,
+            -1,
             false);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
@@ -2759,6 +3760,7 @@ __global__ void routed_weighted_sum_f32_kernel(
     const int K,
     const int E,
     const int D,
+    const int dtype_filter,
     const bool accumulate)
 {
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2770,7 +3772,11 @@ __global__ void routed_weighted_sum_f32_kernel(
         const int expert_id = static_cast<int>(route_ids[n]);
         if (
             expert_id >= 0 && expert_id < E &&
-            metadata[(long)5 * E + expert_id] != 0
+            metadata[(long)5 * E + expert_id] != 0 &&
+            (
+                dtype_filter < 0 ||
+                metadata[(long)9 * E + expert_id] == dtype_filter
+            )
         ) {
             acc = fmaf(
                 __bfloat162float(rows[(long)n * D + d]),
@@ -2907,7 +3913,7 @@ torch::Tensor moe_mlp_routed_slots(
             weights.data_ptr<float>(),
             metadata.data_ptr<int64_t>(),
             result.data_ptr<float>(),
-            K, E, hidden, accumulate);
+            K, E, hidden, -1, accumulate);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
 }
@@ -3203,6 +4209,7 @@ torch::Tensor moe_mlp_routed_vv(
             top_k,
             expert_count,
             hidden,
+            1,
             accumulate);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
@@ -5184,9 +6191,9 @@ __global__ void dsv4_hc_post_bf16_kernel(
     }
 }
 
-torch::Tensor dsv4_hc_post(
+void dsv4_hc_post_into(
     torch::Tensor out, torch::Tensor residual,
-    torch::Tensor post, torch::Tensor comb)
+    torch::Tensor post, torch::Tensor comb, torch::Tensor result)
 {
     TORCH_CHECK(
         out.is_cuda() && residual.is_cuda() && post.is_cuda() && comb.is_cuda(),
@@ -5207,12 +6214,19 @@ torch::Tensor dsv4_hc_post(
     TORCH_CHECK(out.numel() == (long)N * D, "out must contain N*D values");
     TORCH_CHECK(post.numel() == (long)N * 4, "post must contain N*4 values");
     TORCH_CHECK(comb.numel() == (long)N * 16, "comb must contain N*16 values");
+    TORCH_CHECK(
+        result.is_cuda() && result.scalar_type() == at::kBFloat16 &&
+        result.device() == residual.device() && result.is_contiguous() &&
+        result.numel() == residual.numel(),
+        "HC result buffer must be contiguous BF16 with residual shape/device");
+    TORCH_CHECK(
+        result.data_ptr() != residual.data_ptr(),
+        "HC result buffer must not alias residual");
 
     auto oc = out.contiguous();
     auto rc = residual.contiguous();
     auto pc = post.contiguous();
     auto cc = comb.contiguous();
-    auto result = torch::empty_like(rc);
     auto stream = at::cuda::getCurrentCUDAStream();
     const int blocks = N * 4;
     if (out.scalar_type() == at::kBFloat16) {
@@ -5242,6 +6256,143 @@ torch::Tensor dsv4_hc_post(
             D);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+torch::Tensor dsv4_hc_post(
+    torch::Tensor out, torch::Tensor residual,
+    torch::Tensor post, torch::Tensor comb)
+{
+    auto result = torch::empty_like(residual);
+    dsv4_hc_post_into(out, residual, post, comb, result);
+    return result.view(residual.sizes());
+}
+
+torch::Tensor dsv4_hc_post_out(
+    torch::Tensor out, torch::Tensor residual,
+    torch::Tensor post, torch::Tensor comb, torch::Tensor result)
+{
+    dsv4_hc_post_into(out, residual, post, comb, result);
+    return result.view(residual.sizes());
+}
+
+// Batch-1 MoE decode reaches HC post with a FP32 routed result and a BF16
+// shared-expert result.  Folding their BF16 merge into HC post removes the
+// intermediate cast and add tensors while preserving the reference rounding.
+__global__ void dsv4_hc_post_moe_bf16_kernel(
+    const float* __restrict__ routed,              // [N,D]
+    const __nv_bfloat16* __restrict__ shared,      // [N,D]
+    const __nv_bfloat16* __restrict__ residual,    // [N,4,D]
+    const __nv_bfloat16* __restrict__ post,        // [N,4]
+    const __nv_bfloat16* __restrict__ comb,        // [N,4,4]
+    __nv_bfloat16* __restrict__ result,            // [N,4,D]
+    const int D)
+{
+    const int n = blockIdx.x >> 2;
+    const int k = blockIdx.x & 3;
+    __shared__ float coeff[5];
+    if (threadIdx.x == 0) {
+        coeff[0] = __bfloat162float(post[(long)n * 4 + k]);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            coeff[1 + j] =
+                __bfloat162float(comb[(long)n * 16 + 4 * j + k]);
+    }
+    __syncthreads();
+
+    const float* routed_n = routed + (long)n * D;
+    const __nv_bfloat16* shared_n = shared + (long)n * D;
+    const __nv_bfloat16* residual_n = residual + (long)n * 4 * D;
+    __nv_bfloat16* dst = result + ((long)n * 4 + k) * D;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        const __nv_bfloat16 routed_bf16 =
+            __float2bfloat16_rn(routed_n[d]);
+        const __nv_bfloat16 merged_bf16 = __float2bfloat16_rn(
+            __bfloat162float(routed_bf16) +
+            __bfloat162float(shared_n[d]));
+        float acc = coeff[0] * __bfloat162float(merged_bf16);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            acc = fmaf(
+                coeff[1 + j],
+                __bfloat162float(residual_n[(long)j * D + d]),
+                acc);
+        dst[d] = __float2bfloat16_rn(acc);
+    }
+}
+
+void dsv4_hc_post_moe_into(
+    torch::Tensor routed, torch::Tensor shared, torch::Tensor residual,
+    torch::Tensor post, torch::Tensor comb, torch::Tensor result)
+{
+    TORCH_CHECK(
+        routed.is_cuda() && shared.is_cuda() && residual.is_cuda() &&
+        post.is_cuda() && comb.is_cuda(),
+        "all tensors must be CUDA");
+    TORCH_CHECK(
+        routed.scalar_type() == at::kFloat &&
+        shared.scalar_type() == at::kBFloat16 &&
+        residual.scalar_type() == at::kBFloat16 &&
+        post.scalar_type() == at::kBFloat16 &&
+        comb.scalar_type() == at::kBFloat16,
+        "routed must be float32; shared/residual/post/comb must be bfloat16");
+    TORCH_CHECK(
+        residual.dim() >= 2 && residual.size(-2) == 4,
+        "residual must end in [4,D]");
+    const int D = (int)residual.size(-1);
+    const int N = (int)(residual.numel() / (4L * D));
+    TORCH_CHECK(
+        routed.numel() == (long)N * D &&
+        shared.numel() == (long)N * D,
+        "routed/shared must contain N*D values");
+    TORCH_CHECK(post.numel() == (long)N * 4, "post must contain N*4 values");
+    TORCH_CHECK(comb.numel() == (long)N * 16, "comb must contain N*16 values");
+    TORCH_CHECK(
+        result.is_cuda() && result.scalar_type() == at::kBFloat16 &&
+        result.device() == residual.device() && result.is_contiguous() &&
+        result.numel() == residual.numel(),
+        "HC result buffer must be contiguous BF16 with residual shape/device");
+    TORCH_CHECK(
+        result.data_ptr() != residual.data_ptr(),
+        "HC result buffer must not alias residual");
+
+    auto routed_c = routed.contiguous();
+    auto shared_c = shared.contiguous();
+    auto residual_c = residual.contiguous();
+    auto post_c = post.contiguous();
+    auto comb_c = comb.contiguous();
+    auto stream = at::cuda::getCurrentCUDAStream();
+    dsv4_hc_post_moe_bf16_kernel<<<N * 4, 256, 0, stream>>>(
+        routed_c.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16*>(
+            shared_c.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(
+            residual_c.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(
+            post_c.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(
+            comb_c.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(
+            result.data_ptr<at::BFloat16>()),
+        D);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+torch::Tensor dsv4_hc_post_moe(
+    torch::Tensor routed, torch::Tensor shared, torch::Tensor residual,
+    torch::Tensor post, torch::Tensor comb)
+{
+    auto result = torch::empty_like(residual);
+    dsv4_hc_post_moe_into(
+        routed, shared, residual, post, comb, result);
+    return result.view(residual.sizes());
+}
+
+torch::Tensor dsv4_hc_post_moe_out(
+    torch::Tensor routed, torch::Tensor shared, torch::Tensor residual,
+    torch::Tensor post, torch::Tensor comb, torch::Tensor result)
+{
+    dsv4_hc_post_moe_into(
+        routed, shared, residual, post, comb, result);
     return result.view(residual.sizes());
 }
 
@@ -5714,9 +6865,10 @@ void launch_dsv4_hc_pre_norm_bf16(
         D, iters, eps);
 }
 
-std::vector<torch::Tensor> dsv4_hc_pre_norm(
+void dsv4_hc_pre_norm_into(
     torch::Tensor x, torch::Tensor fn, torch::Tensor scale,
-    torch::Tensor base, torch::Tensor norm, long iters, double eps)
+    torch::Tensor base, torch::Tensor norm, torch::Tensor y,
+    torch::Tensor post, torch::Tensor comb, long iters, double eps)
 {
     TORCH_CHECK(
         x.is_cuda() && fn.is_cuda() && scale.is_cuda() &&
@@ -5739,16 +6891,31 @@ std::vector<torch::Tensor> dsv4_hc_pre_norm(
     TORCH_CHECK(norm.numel() == D, "norm must be [D]");
     TORCH_CHECK(scale.numel() == 3 && base.numel() == 24,
                 "HC parameter size mismatch");
+    TORCH_CHECK(
+        y.is_cuda() && post.is_cuda() && comb.is_cuda(),
+        "HC output buffers must be CUDA tensors");
+    TORCH_CHECK(
+        y.device() == x.device() && post.device() == x.device() &&
+        comb.device() == x.device(),
+        "HC output buffers must share the input device");
+    TORCH_CHECK(
+        y.scalar_type() == at::kBFloat16 &&
+        post.scalar_type() == at::kBFloat16 &&
+        comb.scalar_type() == at::kBFloat16,
+        "HC output buffers must be bfloat16");
+    TORCH_CHECK(
+        y.is_contiguous() && post.is_contiguous() && comb.is_contiguous(),
+        "HC output buffers must be contiguous");
+    TORCH_CHECK(
+        y.numel() == (long)N * D && post.numel() == (long)N * 4 &&
+        comb.numel() == (long)N * 16,
+        "HC output buffer size mismatch");
 
     auto xc = x.contiguous();
     auto fc = fn.contiguous();
     auto sc = scale.contiguous();
     auto bc = base.contiguous();
     auto nc = norm.contiguous();
-    auto y = torch::empty({N, D}, x.options());
-    auto post = torch::empty({N, 4}, x.options());
-    auto comb = torch::empty({N, 16}, x.options());
-
     if (fn.scalar_type() == at::kBFloat16 &&
         norm.scalar_type() == at::kBFloat16 && D >= 48) {
         launch_dsv4_hc_pre_norm_bf16_parallel(
@@ -5770,6 +6937,30 @@ std::vector<torch::Tensor> dsv4_hc_pre_norm(
             xc, fc, sc, bc, nc, y, post, comb, N, D, (int)iters, (float)eps);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+std::vector<torch::Tensor> dsv4_hc_pre_norm(
+    torch::Tensor x, torch::Tensor fn, torch::Tensor scale,
+    torch::Tensor base, torch::Tensor norm, long iters, double eps)
+{
+    TORCH_CHECK(x.dim() >= 2, "x must end in [4,D]");
+    const int D = (int)x.size(-1);
+    const int N = (int)(x.numel() / (4L * D));
+    auto y = torch::empty({N, D}, x.options());
+    auto post = torch::empty({N, 4}, x.options());
+    auto comb = torch::empty({N, 16}, x.options());
+    dsv4_hc_pre_norm_into(
+        x, fn, scale, base, norm, y, post, comb, iters, eps);
+    return {y, post, comb};
+}
+
+std::vector<torch::Tensor> dsv4_hc_pre_norm_out(
+    torch::Tensor x, torch::Tensor fn, torch::Tensor scale,
+    torch::Tensor base, torch::Tensor norm, torch::Tensor y,
+    torch::Tensor post, torch::Tensor comb, long iters, double eps)
+{
+    dsv4_hc_pre_norm_into(
+        x, fn, scale, base, norm, y, post, comb, iters, eps);
     return {y, post, comb};
 }
 
@@ -6805,6 +7996,27 @@ __global__ void int4_gemv_packed_f32_kernel(
     }
 }
 
+__device__ __forceinline__ float4 fp8x4_scale_to_f32(
+    const uint32_t packed,
+    const float scale)
+{
+    __nv_fp8x4_e4m3 fp8_values;
+    fp8_values.__x = packed;
+    const float4 values = static_cast<float4>(fp8_values);
+    const __nv_bfloat162 scale_pair = __float2bfloat162_rn(scale);
+    const float2 scaled01 = __bfloat1622float2(__hmul2(
+        __floats2bfloat162_rn(values.x, values.y),
+        scale_pair));
+    const float2 scaled23 = __bfloat1622float2(__hmul2(
+        __floats2bfloat162_rn(values.z, values.w),
+        scale_pair));
+    return make_float4(
+        scaled01.x,
+        scaled01.y,
+        scaled23.x,
+        scaled23.y);
+}
+
 template <typename input_t, int rows_per_block>
 __global__ void block_fp8_gemv_f32_kernel(
     const input_t* __restrict__ input,
@@ -6854,42 +8066,24 @@ __global__ void block_fp8_gemv_f32_kernel(
         const int end = min(begin + 128, cols);
         const int column = begin + lane * 4;
         if (column + 3 < end) {
-            __nv_fp8x4_e4m3 fp8_values;
-            fp8_values.__x = __ldg(
-                reinterpret_cast<const uint32_t*>(
-                    weight_row + column));
-            const float4 values =
-                static_cast<float4>(fp8_values);
-            const float rounded0 = __bfloat162float(
-                __float2bfloat16_rn(values.x));
-            const float rounded1 = __bfloat162float(
-                __float2bfloat16_rn(values.y));
-            const float rounded2 = __bfloat162float(
-                __float2bfloat16_rn(values.z));
-            const float rounded3 = __bfloat162float(
-                __float2bfloat16_rn(values.w));
-            const float scaled0 = __bfloat162float(
-                __float2bfloat16_rn(rounded0 * rounded_scale));
-            const float scaled1 = __bfloat162float(
-                __float2bfloat16_rn(rounded1 * rounded_scale));
-            const float scaled2 = __bfloat162float(
-                __float2bfloat16_rn(rounded2 * rounded_scale));
-            const float scaled3 = __bfloat162float(
-                __float2bfloat16_rn(rounded3 * rounded_scale));
+            const float4 scaled = fp8x4_scale_to_f32(
+                __ldg(reinterpret_cast<const uint32_t*>(
+                    weight_row + column)),
+                scale);
             accumulator = __fmaf_rn(
-                scaled0,
+                scaled.x,
                 __bfloat162float(fp8_shared_input[column]),
                 accumulator);
             accumulator = __fmaf_rn(
-                scaled1,
+                scaled.y,
                 __bfloat162float(fp8_shared_input[column + 1]),
                 accumulator);
             accumulator = __fmaf_rn(
-                scaled2,
+                scaled.z,
                 __bfloat162float(fp8_shared_input[column + 2]),
                 accumulator);
             accumulator = __fmaf_rn(
-                scaled3,
+                scaled.w,
                 __bfloat162float(fp8_shared_input[column + 3]),
                 accumulator);
         } else {
@@ -6912,6 +8106,113 @@ __global__ void block_fp8_gemv_f32_kernel(
     accumulator = warp_sum_f32(accumulator);
     if (lane == 0)
         output[row] = accumulator;
+}
+
+// Logical row concatenation for several independent block-FP8 projections.
+// The pointer/row metadata is persistent device memory owned by the public
+// ProjectionGroup wrapper.  This keeps every source tensor compact, shares
+// one input staging pass, removes per-projection launches and writes directly
+// into the final logical output without torch.cat.
+template <typename input_t, int rows_per_block>
+__global__ void block_fp8_grouped_gemv_f32_kernel(
+    const input_t* __restrict__ input,
+    const int64_t* __restrict__ weight_ptrs,
+    const int64_t* __restrict__ scale_ptrs,
+    const int32_t* __restrict__ row_offsets,
+    float* __restrict__ output,
+    const int groups,
+    const int total_rows,
+    const int cols,
+    const int scale_cols)
+{
+    extern __shared__ unsigned char fp8_grouped_shared_raw[];
+    auto* shared_input =
+        reinterpret_cast<__nv_bfloat16*>(fp8_grouped_shared_raw);
+    const int lane = threadIdx.x;
+    const int linear_thread = threadIdx.y * 32 + lane;
+    for (
+        int column = linear_thread;
+        column < cols;
+        column += 32 * rows_per_block
+    ) {
+        shared_input[column] = __float2bfloat16_rn(
+            vq_scalar_to_float(input + column));
+    }
+    __syncthreads();
+
+    const int output_row =
+        blockIdx.x * rows_per_block + threadIdx.y;
+    if (output_row >= total_rows)
+        return;
+    int group = 0;
+    while (
+        group + 1 < groups &&
+        output_row >= row_offsets[group + 1]
+    ) {
+        ++group;
+    }
+    const int row = output_row - row_offsets[group];
+    const auto* weights = reinterpret_cast<const uint8_t*>(
+        static_cast<uintptr_t>(weight_ptrs[group]));
+    const auto* scales = reinterpret_cast<const float*>(
+        static_cast<uintptr_t>(scale_ptrs[group]));
+    const auto* weight_row =
+        weights + static_cast<long>(row) * cols;
+    const auto* scale_row =
+        scales + static_cast<long>(row / 128) * scale_cols;
+    float accumulator = 0.f;
+    for (
+        int column_block = 0;
+        column_block < scale_cols;
+        ++column_block
+    ) {
+        float scale = lane == 0 ? scale_row[column_block] : 0.f;
+        scale = __shfl_sync(0xffffffffu, scale, 0);
+        const float rounded_scale = __bfloat162float(
+            __float2bfloat16_rn(scale));
+        const int begin = column_block * 128;
+        const int end = min(begin + 128, cols);
+        const int column = begin + lane * 4;
+        if (column + 3 < end) {
+            const float4 scaled = fp8x4_scale_to_f32(
+                __ldg(reinterpret_cast<const uint32_t*>(
+                    weight_row + column)),
+                scale);
+            accumulator = __fmaf_rn(
+                scaled.x,
+                __bfloat162float(shared_input[column]),
+                accumulator);
+            accumulator = __fmaf_rn(
+                scaled.y,
+                __bfloat162float(shared_input[column + 1]),
+                accumulator);
+            accumulator = __fmaf_rn(
+                scaled.z,
+                __bfloat162float(shared_input[column + 2]),
+                accumulator);
+            accumulator = __fmaf_rn(
+                scaled.w,
+                __bfloat162float(shared_input[column + 3]),
+                accumulator);
+        } else {
+            for (int tail = column; tail < end; ++tail) {
+                __nv_fp8_e4m3 fp8_value;
+                fp8_value.__x = weight_row[tail];
+                const float rounded_value = __bfloat162float(
+                    __float2bfloat16_rn(static_cast<float>(fp8_value)));
+                const float scaled_value = __bfloat162float(
+                    __float2bfloat16_rn(
+                        rounded_value * rounded_scale));
+                accumulator = __fmaf_rn(
+                    scaled_value,
+                    __bfloat162float(shared_input[tail]),
+                    accumulator);
+            }
+        }
+    }
+    accumulator = warp_sum_f32(accumulator);
+    if (lane == 0)
+        output[output_row] = accumulator;
 }
 
 // Four G64 groups are consumed per loop. Four 8-lane subgroups load their
@@ -8226,8 +9527,8 @@ torch::Tensor int4_gemv_packed_f32(
     return output;
 }
 
-template <typename input_t>
-void launch_block_fp8_gemv_f32(
+template <typename input_t, int rows_per_block>
+void launch_block_fp8_gemv_f32_rows(
     const input_t* input,
     const uint8_t* weights,
     const float* scales,
@@ -8237,12 +9538,13 @@ void launch_block_fp8_gemv_f32(
     const int scale_cols,
     cudaStream_t stream)
 {
-    constexpr int rows_per_block = 32;
     const size_t shared_bytes =
         static_cast<size_t>(cols) * sizeof(__nv_bfloat16);
     if (shared_bytes > 48 * 1024) {
         const auto status = cudaFuncSetAttribute(
-            block_fp8_gemv_f32_kernel<input_t, rows_per_block>,
+            block_fp8_gemv_f32_kernel<
+                input_t,
+                rows_per_block>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             static_cast<int>(shared_bytes));
         TORCH_CHECK(
@@ -8264,6 +9566,34 @@ void launch_block_fp8_gemv_f32(
                 rows,
                 cols,
                 scale_cols);
+}
+
+template <typename input_t>
+void launch_block_fp8_gemv_f32(
+    const input_t* input,
+    const uint8_t* weights,
+    const float* scales,
+    float* output,
+    const int rows,
+    const int cols,
+    const int scale_cols,
+    cudaStream_t stream)
+{
+    const char* setting = std::getenv("TPQ_FP8_GEMV_WARPS");
+    const int warps = setting == nullptr ? 8 : std::atoi(setting);
+    if (warps <= 8) {
+        launch_block_fp8_gemv_f32_rows<input_t, 8>(
+            input, weights, scales, output,
+            rows, cols, scale_cols, stream);
+    } else if (warps <= 16) {
+        launch_block_fp8_gemv_f32_rows<input_t, 16>(
+            input, weights, scales, output,
+            rows, cols, scale_cols, stream);
+    } else {
+        launch_block_fp8_gemv_f32_rows<input_t, 32>(
+            input, weights, scales, output,
+            rows, cols, scale_cols, stream);
+    }
 }
 
 torch::Tensor block_fp8_gemv_f32(
@@ -8338,6 +9668,174 @@ torch::Tensor block_fp8_gemv_f32(
             contiguous_scales.data_ptr<float>(),
             output.data_ptr<float>(),
             rows,
+            static_cast<int>(cols),
+            scale_cols,
+            stream);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+template <typename input_t, int rows_per_block>
+void launch_block_fp8_grouped_gemv_f32_rows(
+    const input_t* input,
+    const int64_t* weight_ptrs,
+    const int64_t* scale_ptrs,
+    const int32_t* row_offsets,
+    float* output,
+    const int groups,
+    const int total_rows,
+    const int cols,
+    const int scale_cols,
+    cudaStream_t stream)
+{
+    const size_t shared_bytes =
+        static_cast<size_t>(cols) * sizeof(__nv_bfloat16);
+    if (shared_bytes > 48 * 1024) {
+        const auto status = cudaFuncSetAttribute(
+            block_fp8_grouped_gemv_f32_kernel<
+                input_t,
+                rows_per_block>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(shared_bytes));
+        TORCH_CHECK(
+            status == cudaSuccess,
+            "failed to configure grouped block-FP8 GEMV shared memory: ",
+            cudaGetErrorString(status));
+    }
+    block_fp8_grouped_gemv_f32_kernel<
+        input_t,
+        rows_per_block><<<
+            (total_rows + rows_per_block - 1) / rows_per_block,
+            dim3(32, rows_per_block),
+            shared_bytes,
+            stream>>>(
+                input,
+                weight_ptrs,
+                scale_ptrs,
+                row_offsets,
+                output,
+                groups,
+                total_rows,
+                cols,
+                scale_cols);
+}
+
+template <typename input_t>
+void launch_block_fp8_grouped_gemv_f32(
+    const input_t* input,
+    const int64_t* weight_ptrs,
+    const int64_t* scale_ptrs,
+    const int32_t* row_offsets,
+    float* output,
+    const int groups,
+    const int total_rows,
+    const int cols,
+    const int scale_cols,
+    cudaStream_t stream)
+{
+    const char* setting = std::getenv("TPQ_FP8_GEMV_WARPS");
+    const int warps = setting == nullptr ? 8 : std::atoi(setting);
+    if (warps <= 8) {
+        launch_block_fp8_grouped_gemv_f32_rows<
+            input_t, 8>(
+            input, weight_ptrs, scale_ptrs, row_offsets, output,
+            groups, total_rows, cols, scale_cols, stream);
+    } else if (warps <= 16) {
+        launch_block_fp8_grouped_gemv_f32_rows<
+            input_t, 16>(
+            input, weight_ptrs, scale_ptrs, row_offsets, output,
+            groups, total_rows, cols, scale_cols, stream);
+    } else {
+        launch_block_fp8_grouped_gemv_f32_rows<
+            input_t, 32>(
+            input, weight_ptrs, scale_ptrs, row_offsets, output,
+            groups, total_rows, cols, scale_cols, stream);
+    }
+}
+
+torch::Tensor block_fp8_grouped_gemv_f32(
+    torch::Tensor input,
+    torch::Tensor weight_ptrs,
+    torch::Tensor scale_ptrs,
+    torch::Tensor row_offsets,
+    long total_rows_value,
+    long cols,
+    long block_size,
+    c10::optional<torch::Tensor> output_buffer)
+{
+    TORCH_CHECK(
+        input.is_cuda() && weight_ptrs.is_cuda() &&
+        scale_ptrs.is_cuda() && row_offsets.is_cuda(),
+        "grouped block-FP8 GEMV metadata must be CUDA");
+    TORCH_CHECK(
+        input.scalar_type() == at::kFloat ||
+        input.scalar_type() == at::kBFloat16,
+        "grouped block-FP8 input must be float32 or bfloat16");
+    TORCH_CHECK(
+        weight_ptrs.scalar_type() == at::kLong &&
+        scale_ptrs.scalar_type() == at::kLong &&
+        row_offsets.scalar_type() == at::kInt,
+        "grouped block-FP8 pointer/offset metadata dtype mismatch");
+    TORCH_CHECK(
+        input.dim() == 2 && input.size(0) == 1 &&
+        weight_ptrs.dim() == 1 && scale_ptrs.dim() == 1 &&
+        row_offsets.dim() == 1,
+        "grouped block-FP8 GEMV metadata must be one-dimensional");
+    TORCH_CHECK(
+        block_size == 128 && cols > 0 && input.size(1) == cols,
+        "grouped block-FP8 GEMV currently requires 128x128 blocks");
+    const int groups = static_cast<int>(weight_ptrs.numel());
+    TORCH_CHECK(
+        groups > 0 && scale_ptrs.numel() == groups &&
+        row_offsets.numel() == groups + 1,
+        "grouped block-FP8 metadata length mismatch");
+    TORCH_CHECK(
+        input.get_device() == weight_ptrs.get_device() &&
+        input.get_device() == scale_ptrs.get_device() &&
+        input.get_device() == row_offsets.get_device(),
+        "grouped block-FP8 tensors must share one device");
+    auto contiguous_input = input.contiguous();
+    auto contiguous_weight_ptrs = weight_ptrs.contiguous();
+    auto contiguous_scale_ptrs = scale_ptrs.contiguous();
+    auto contiguous_row_offsets = row_offsets.contiguous();
+    const int total_rows = static_cast<int>(total_rows_value);
+    TORCH_CHECK(total_rows > 0, "grouped block-FP8 rows must be positive");
+    auto output = output_buffer.has_value()
+        ? output_buffer.value()
+        : torch::empty(
+            {1, total_rows},
+            input.options().dtype(at::kFloat));
+    TORCH_CHECK(
+        output.is_cuda() && output.scalar_type() == at::kFloat &&
+        output.is_contiguous() &&
+        output.sizes() == torch::IntArrayRef({1, total_rows}) &&
+        output.get_device() == input.get_device(),
+        "grouped block-FP8 output must be contiguous float32 [1,R]");
+    const int scale_cols = (static_cast<int>(cols) + 127) / 128;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (input.scalar_type() == at::kFloat) {
+        launch_block_fp8_grouped_gemv_f32<float>(
+            contiguous_input.data_ptr<float>(),
+            contiguous_weight_ptrs.data_ptr<int64_t>(),
+            contiguous_scale_ptrs.data_ptr<int64_t>(),
+            contiguous_row_offsets.data_ptr<int32_t>(),
+            output.data_ptr<float>(),
+            groups,
+            total_rows,
+            static_cast<int>(cols),
+            scale_cols,
+            stream);
+    } else {
+        launch_block_fp8_grouped_gemv_f32<__nv_bfloat16>(
+            reinterpret_cast<const __nv_bfloat16*>(
+                contiguous_input.data_ptr<at::BFloat16>()),
+            contiguous_weight_ptrs.data_ptr<int64_t>(),
+            contiguous_scale_ptrs.data_ptr<int64_t>(),
+            contiguous_row_offsets.data_ptr<int32_t>(),
+            output.data_ptr<float>(),
+            groups,
+            total_rows,
             static_cast<int>(cols),
             scale_cols,
             stream);
@@ -9058,19 +10556,11 @@ int graph_dispatch_spin_iterations()
     return static_cast<int>(parsed);
 }
 
-using GraphLaunchCallback = cudaError_t (*)(
-    const void* context,
-    size_t rank,
-    cudaEvent_t ready);
-
 struct GraphLaunchTask {
     cudaGraphExec_t graph = nullptr;
     cudaStream_t stream = nullptr;
     cudaEvent_t done = nullptr;
     cudaEvent_t ready = nullptr;
-    GraphLaunchCallback callback = nullptr;
-    const void* callback_context = nullptr;
-    size_t callback_rank = 0;
 };
 
 // vLLM assigns one process to every TP rank, so CUDA graph submission happens
@@ -9156,27 +10646,18 @@ private:
             if (requested != observed) {
                 const GraphLaunchTask task = task_;
                 if (set_device_status_ == cudaSuccess) {
-                    if (task.callback != nullptr) {
-                        wait_status_ = task.callback(
-                            task.callback_context,
-                            task.callback_rank,
-                            task.ready);
-                        launch_status_ = wait_status_;
-                        record_status_ = wait_status_;
-                    } else {
-                        wait_status_ = cudaStreamWaitEvent(
-                            task.stream,
-                            task.ready,
-                            0);
-                        launch_status_ = (
-                            wait_status_ == cudaSuccess
-                                ? cudaGraphLaunch(task.graph, task.stream)
-                                : wait_status_);
-                        record_status_ = (
-                            launch_status_ == cudaSuccess
-                                ? cudaEventRecord(task.done, task.stream)
-                                : launch_status_);
-                    }
+                    wait_status_ = cudaStreamWaitEvent(
+                        task.stream,
+                        task.ready,
+                        0);
+                    launch_status_ = (
+                        wait_status_ == cudaSuccess
+                            ? cudaGraphLaunch(task.graph, task.stream)
+                            : wait_status_);
+                    record_status_ = (
+                        launch_status_ == cudaSuccess
+                            ? cudaEventRecord(task.done, task.stream)
+                            : launch_status_);
                 } else {
                     wait_status_ = set_device_status_;
                     launch_status_ = set_device_status_;
@@ -9662,43 +11143,6 @@ std::vector<torch::Tensor> launch_cuda_graphs_reduce_norm_router(
         residual_output,
         logits_output);
 }
-
-class TPNoOwnerDecodeLayerPlan;
-
-class TPStageBarrier {
-public:
-    explicit TPStageBarrier(size_t participants)
-        : participants_(participants)
-    {
-        TORCH_CHECK(
-            participants_ > 0,
-            "TP stage barrier requires at least one rank");
-    }
-
-    void arrive_and_wait() const
-    {
-        const uint64_t generation =
-            generation_.load(std::memory_order_acquire);
-        if (
-            arrived_.fetch_add(1, std::memory_order_acq_rel) + 1
-            == participants_
-        ) {
-            arrived_.store(0, std::memory_order_release);
-            generation_.fetch_add(1, std::memory_order_acq_rel);
-            return;
-        }
-        while (
-            generation_.load(std::memory_order_acquire)
-            == generation
-        )
-            graph_dispatch_pause();
-    }
-
-private:
-    size_t participants_;
-    mutable std::atomic<size_t> arrived_{0};
-    mutable std::atomic<uint64_t> generation_{0};
-};
 
 class TPGraphLaunchBatch {
 public:
@@ -10378,8 +11822,6 @@ public:
     }
 
 private:
-    friend class TPNoOwnerDecodeLayerPlan;
-
     bool collective_event_barrier_enabled() const
     {
         return collective_event_barrier_enabled_;
@@ -10579,8 +12021,6 @@ public:
     }
 
 private:
-    friend class TPNoOwnerDecodeLayerPlan;
-
     // The Python wrapper retains the four owning TPGraphLaunchBatch objects.
     // These pointers therefore only describe immutable scheduling metadata.
     const TPGraphLaunchBatch* shared_batch_;
@@ -10625,37 +12065,13 @@ public:
             !attention_contributions_.empty() &&
             !attention_outputs_.empty() &&
             attention_outputs_.size()
-                == attention_output_events_.size() &&
-            attention_outputs_.size()
-                == attention_batch_->devices_.size() &&
-            moe_plan_->input_events_.size()
-                == attention_batch_->devices_.size(),
+                == attention_output_events_.size(),
             "no-owner decode plan attention metadata is incomplete");
-        persistent_enabled_ = (
-            tp_environment_enabled(
-                "TPQ_TP_PERSISTENT_LAYER_PLAN") &&
-            moe_plan_->final_batch_
-                ->fused_moe_finalize_enabled_ &&
-            attention_batch_->devices_.size() > 1 &&
-            attention_batch_->devices_.size()
-                <= kMaxGraphDispatchDevices);
-        if (persistent_enabled_) {
-            stage_barrier_ = std::make_unique<TPStageBarrier>(
-                attention_batch_->devices_.size());
-        }
     }
 
     void launch_from_events(
         std::vector<int64_t> input_events) const
     {
-        TORCH_CHECK(
-            input_events.size()
-                == attention_batch_->devices_.size(),
-            "decode layer input events must match TP ranks");
-        if (persistent_enabled_) {
-            launch_persistent(std::move(input_events));
-            return;
-        }
         // One Python→C++ transition now submits the complete routed layer:
         // Attention Column/Head-TP→Row-TP followed by the fixed all-rank
         // MoE plan.  The attention output events are the only dependency
@@ -10669,318 +12085,12 @@ public:
         moe_plan_->launch_from_events(attention_output_events_);
     }
 
-    bool persistent_enabled() const
-    {
-        return persistent_enabled_;
-    }
-
 private:
-    static void merge_status(
-        cudaError_t& status,
-        cudaError_t candidate)
-    {
-        if (status == cudaSuccess && candidate != cudaSuccess)
-            status = candidate;
-    }
-
-    static cudaError_t persistent_rank_callback(
-        const void* context,
-        size_t rank,
-        cudaEvent_t ready)
-    {
-        return static_cast<const TPNoOwnerDecodeLayerPlan*>(
-            context)->launch_persistent_rank(rank, ready);
-    }
-
-    void publish_stage(
-        size_t rank,
-        const std::vector<int64_t>& local_events,
-        cudaEvent_t ready_event,
-        cudaStream_t stream,
-        cudaError_t& status) const
-    {
-        stage_barrier_->arrive_and_wait();
-        if (rank == 0) {
-            for (const auto raw_event : local_events) {
-                merge_status(
-                    status,
-                    cudaStreamWaitEvent(
-                        stream,
-                        reinterpret_cast<cudaEvent_t>(
-                            static_cast<uintptr_t>(raw_event)),
-                        0));
-            }
-            merge_status(
-                status,
-                cudaEventRecord(ready_event, stream));
-        }
-        stage_barrier_->arrive_and_wait();
-        merge_status(
-            status,
-            cudaStreamWaitEvent(stream, ready_event, 0));
-    }
-
-    cudaError_t launch_persistent_rank(
-        size_t rank,
-        cudaEvent_t input_event) const
-    {
-        cudaError_t status = cudaSetDevice(
-            static_cast<int>(
-                attention_batch_->devices_[rank]));
-
-        const auto attention_stream =
-            reinterpret_cast<cudaStream_t>(
-                static_cast<uintptr_t>(
-                    attention_batch_->streams_[rank]));
-        merge_status(
-            status,
-            cudaStreamWaitEvent(
-                attention_stream,
-                input_event,
-                0));
-        merge_status(
-            status,
-            cudaGraphLaunch(
-                reinterpret_cast<cudaGraphExec_t>(
-                    static_cast<uintptr_t>(
-                        attention_batch_->graph_execs_[rank])),
-                attention_stream));
-        merge_status(
-            status,
-            cudaEventRecord(
-                reinterpret_cast<cudaEvent_t>(
-                    static_cast<uintptr_t>(
-                        attention_batch_->done_events_[rank])),
-                attention_stream));
-        publish_stage(
-            rank,
-            attention_batch_->done_events_,
-            attention_batch_->collective_ready_event_,
-            attention_stream,
-            status);
-        launch_tp_all_rank_reduce_one(
-            attention_contributions_,
-            attention_outputs_[rank],
-            attention_stream);
-        merge_status(
-            status,
-            cudaEventRecord(
-                reinterpret_cast<cudaEvent_t>(
-                    static_cast<uintptr_t>(
-                        attention_output_events_[rank])),
-                attention_stream));
-
-        const auto shared_batch = moe_plan_->shared_batch_;
-        const auto route_batch = moe_plan_->route_batch_;
-        const auto shared_stream =
-            reinterpret_cast<cudaStream_t>(
-                static_cast<uintptr_t>(
-                    shared_batch->streams_[rank]));
-        merge_status(
-            status,
-            cudaStreamWaitEvent(
-                shared_stream,
-                reinterpret_cast<cudaEvent_t>(
-                    static_cast<uintptr_t>(
-                        attention_output_events_[rank])),
-                0));
-        merge_status(
-            status,
-            cudaGraphLaunch(
-                reinterpret_cast<cudaGraphExec_t>(
-                    static_cast<uintptr_t>(
-                        shared_batch->graph_execs_[rank])),
-                shared_stream));
-        const auto shared_event =
-            reinterpret_cast<cudaEvent_t>(
-                static_cast<uintptr_t>(
-                    moe_plan_->shared_events_[rank]));
-        merge_status(
-            status,
-            cudaEventRecord(shared_event, shared_stream));
-        if (
-            shared_batch->done_events_[rank]
-            != moe_plan_->shared_events_[rank]
-        ) {
-            merge_status(
-                status,
-                cudaEventRecord(
-                    reinterpret_cast<cudaEvent_t>(
-                        static_cast<uintptr_t>(
-                            shared_batch->done_events_[rank])),
-                    shared_stream));
-        }
-
-        const auto route_stream =
-            reinterpret_cast<cudaStream_t>(
-                static_cast<uintptr_t>(
-                    route_batch->streams_[rank]));
-        publish_stage(
-            rank,
-            moe_plan_->shared_events_,
-            route_batch->collective_ready_event_,
-            route_stream,
-            status);
-        for (
-            size_t group = 0;
-            group < moe_plan_->route_contribution_groups_.size();
-            ++group
-        ) {
-            launch_tp_all_rank_reduce_one(
-                moe_plan_->route_contribution_groups_[group],
-                moe_plan_->route_output_groups_[group][rank],
-                route_stream);
-        }
-        merge_status(
-            status,
-            cudaEventRecord(
-                reinterpret_cast<cudaEvent_t>(
-                    static_cast<uintptr_t>(
-                        moe_plan_->route_output_events_[rank])),
-                route_stream));
-
-        const auto expert_batch = moe_plan_->expert_batch_;
-        const auto expert_stream =
-            reinterpret_cast<cudaStream_t>(
-                static_cast<uintptr_t>(
-                    expert_batch->streams_[rank]));
-        merge_status(
-            status,
-            cudaStreamWaitEvent(
-                expert_stream,
-                reinterpret_cast<cudaEvent_t>(
-                    static_cast<uintptr_t>(
-                        moe_plan_->route_output_events_[rank])),
-                0));
-        merge_status(
-            status,
-            cudaGraphLaunch(
-                reinterpret_cast<cudaGraphExec_t>(
-                    static_cast<uintptr_t>(
-                        expert_batch->graph_execs_[rank])),
-                expert_stream));
-        merge_status(
-            status,
-            cudaEventRecord(
-                reinterpret_cast<cudaEvent_t>(
-                    static_cast<uintptr_t>(
-                        expert_batch->done_events_[rank])),
-                expert_stream));
-        publish_stage(
-            rank,
-            expert_batch->done_events_,
-            expert_batch->collective_ready_event_,
-            expert_stream,
-            status);
-        launch_tp_all_rank_reduce_one(
-            moe_plan_->expert_contributions_,
-            moe_plan_->packed_outputs_[rank],
-            expert_stream);
-        merge_status(
-            status,
-            cudaEventRecord(
-                reinterpret_cast<cudaEvent_t>(
-                    static_cast<uintptr_t>(
-                        moe_plan_->packed_output_events_[rank])),
-                expert_stream));
-
-        const auto final_batch = moe_plan_->final_batch_;
-        const auto final_stream =
-            reinterpret_cast<cudaStream_t>(
-                static_cast<uintptr_t>(
-                    final_batch->streams_[rank]));
-        merge_status(
-            status,
-            cudaStreamWaitEvent(
-                final_stream,
-                reinterpret_cast<cudaEvent_t>(
-                    static_cast<uintptr_t>(
-                        moe_plan_->packed_output_events_[rank])),
-                0));
-        merge_status(
-            status,
-            cudaGraphLaunch(
-                reinterpret_cast<cudaGraphExec_t>(
-                    static_cast<uintptr_t>(
-                        final_batch->graph_execs_[rank])),
-                final_stream));
-        merge_status(
-            status,
-            cudaEventRecord(
-                reinterpret_cast<cudaEvent_t>(
-                    static_cast<uintptr_t>(
-                        final_batch->done_events_[rank])),
-                final_stream));
-        publish_stage(
-            rank,
-            final_batch->done_events_,
-            final_batch->collective_ready_event_,
-            final_stream,
-            status);
-        merge_status(
-            status,
-            cudaStreamWaitEvent(
-                final_stream,
-                reinterpret_cast<cudaEvent_t>(
-                    static_cast<uintptr_t>(
-                        moe_plan_->residual_events_[rank])),
-                0));
-        launch_tp_moe_finalize_one(
-            moe_plan_->routed_contributions_,
-            moe_plan_->shared_contributions_,
-            moe_plan_->residuals_[rank],
-            moe_plan_->routed_workspaces_[rank],
-            moe_plan_->shared_workspaces_[rank],
-            moe_plan_->outputs_[rank],
-            final_stream,
-            true);
-        merge_status(
-            status,
-            cudaEventRecord(
-                reinterpret_cast<cudaEvent_t>(
-                    static_cast<uintptr_t>(
-                        moe_plan_->output_events_[rank])),
-                final_stream));
-        return status;
-    }
-
-    void launch_persistent(
-        std::vector<int64_t> input_events) const
-    {
-        const size_t ranks = input_events.size();
-        std::array<GraphLaunchWorker*, kMaxGraphDispatchDevices>
-            workers{};
-        std::array<uint64_t, kMaxGraphDispatchDevices> sequences{};
-        for (size_t rank = 1; rank < ranks; ++rank) {
-            const int device = static_cast<int>(
-                attention_batch_->devices_[rank]);
-            GraphLaunchWorker& worker =
-                graph_launch_worker(device);
-            workers[rank] = &worker;
-            GraphLaunchTask task;
-            task.ready = reinterpret_cast<cudaEvent_t>(
-                static_cast<uintptr_t>(input_events[rank]));
-            task.callback = &persistent_rank_callback;
-            task.callback_context = this;
-            task.callback_rank = rank;
-            sequences[rank] = worker.submit(task);
-        }
-        const auto primary_status = launch_persistent_rank(
-            0,
-            reinterpret_cast<cudaEvent_t>(
-                static_cast<uintptr_t>(input_events[0])));
-        for (size_t rank = 1; rank < ranks; ++rank)
-            workers[rank]->wait(sequences[rank]);
-        C10_CUDA_CHECK(primary_status);
-    }
-
     const TPGraphLaunchBatch* attention_batch_;
     const TPNoOwnerMoELayerPlan* moe_plan_;
     std::vector<torch::Tensor> attention_contributions_;
     std::vector<torch::Tensor> attention_outputs_;
     std::vector<int64_t> attention_output_events_;
-    bool persistent_enabled_ = false;
-    mutable std::unique_ptr<TPStageBarrier> stage_barrier_;
 };
 
 template <typename output_t>
@@ -11202,6 +12312,8 @@ __global__ void flashinfer_mla_batch1_plan_kernel(
     int length,
     int page_size,
     int heads,
+    int cluster_size,
+    int num_clusters,
     int num_sms,
     int64_t q_indptr_offset,
     int64_t kv_indptr_offset,
@@ -11217,7 +12329,7 @@ __global__ void flashinfer_mla_batch1_plan_kernel(
     int64_t kv_start_offset,
     int64_t kv_end_offset,
     int64_t work_indptr_offset) {
-    int avg_kv = (length + num_sms - 1) / num_sms;
+    int avg_kv = (length + num_clusters - 1) / num_clusters;
     int kv_limit;
     if (avg_kv <= 8) {
         kv_limit = 32;
@@ -11232,8 +12344,8 @@ __global__ void flashinfer_mla_batch1_plan_kernel(
     }
     const bool split = length > kv_limit;
     const int num_works = (length + kv_limit - 1) / kv_limit;
-    const int quotient = max(length / kv_limit, 1);
-    const int row_chunk = (heads + quotient - 1) / quotient;
+    const int qo_chunks = max(length * cluster_size / kv_limit, 1);
+    const int row_chunk = (heads + qo_chunks - 1) / qo_chunks;
     const int merge_count = split
         ? (heads + row_chunk - 1) / row_chunk
         : 0;
@@ -11268,17 +12380,6 @@ __global__ void flashinfer_mla_batch1_plan_kernel(
     int32_t* work_indptr = reinterpret_cast<int32_t*>(
         workspace + work_indptr_offset);
 
-    for (int i = threadIdx.x; i < num_works; i += blockDim.x) {
-        const int start = i * kv_limit;
-        q_indptr_plan[i] = 0;
-        kv_indptr_plan[i] = 0;
-        partial_indptr[i] = split ? i * heads : -1;
-        q_len[i] = 1;
-        kv_len[i] = length;
-        q_start[i] = 0;
-        kv_start[i] = start;
-        kv_end[i] = min(start + kv_limit, length);
-    }
     for (int i = threadIdx.x; i < num_sms; i += blockDim.x) {
         if (i < merge_count) {
             const int start = i * row_chunk;
@@ -11295,8 +12396,90 @@ __global__ void flashinfer_mla_batch1_plan_kernel(
             merge_stride[i] = 0;
         }
     }
-    for (int i = threadIdx.x; i <= num_sms; i += blockDim.x) {
-        work_indptr[i] = min(i, num_works);
+    if (threadIdx.x == 0) {
+        // FlashInfer's MinHeap deliberately has no index tie-break.  With
+        // equal zero costs, std::pop_heap therefore assigns chunks to the
+        // cluster order 0,2,6,... rather than 0,1,2,... .  Reproduce that
+        // exact heap schedule so the dynamic CUDA plan is byte-identical to
+        // the official host planner.  Batch-1 decode always has at most one
+        // work item per cluster because kv_limit >= ceil(length/clusters).
+        int heap[256];
+        int cost[256];
+        int cluster_work[256];
+        for (int cluster = 0; cluster < num_clusters; ++cluster) {
+            heap[cluster] = cluster;
+            cost[cluster] = 0;
+            cluster_work[cluster] = -1;
+        }
+        int heap_size = num_clusters;
+        for (int work = 0; work < num_works; ++work) {
+            const int selected = heap[0];
+            const int value = heap[heap_size - 1];
+            --heap_size;
+
+            if (heap_size > 0) {
+                int hole = 0;
+                int right_child = 2;
+                while (right_child < heap_size) {
+                    // std::adjust_heap chooses the right child on a tie.
+                    if (cost[heap[right_child]] >
+                        cost[heap[right_child - 1]]) {
+                        --right_child;
+                    }
+                    heap[hole] = heap[right_child];
+                    hole = right_child;
+                    right_child = 2 * (hole + 1);
+                }
+                if (right_child == heap_size) {
+                    heap[hole] = heap[right_child - 1];
+                    hole = right_child - 1;
+                }
+                while (hole > 0) {
+                    const int parent = (hole - 1) / 2;
+                    if (!(cost[heap[parent]] > cost[value])) {
+                        break;
+                    }
+                    heap[hole] = heap[parent];
+                    hole = parent;
+                }
+                heap[hole] = value;
+            }
+
+            cluster_work[selected] = work;
+            cost[selected] = 1;
+
+            int hole = heap_size;
+            while (hole > 0) {
+                const int parent = (hole - 1) / 2;
+                if (!(cost[heap[parent]] > cost[selected])) {
+                    break;
+                }
+                heap[hole] = heap[parent];
+                hole = parent;
+            }
+            heap[hole] = selected;
+            ++heap_size;
+        }
+
+        int output_work = 0;
+        for (int cluster = 0; cluster < num_clusters; ++cluster) {
+            work_indptr[cluster] = output_work;
+            const int work = cluster_work[cluster];
+            if (work < 0) {
+                continue;
+            }
+            const int start = work * kv_limit;
+            q_indptr_plan[output_work] = 0;
+            kv_indptr_plan[output_work] = 0;
+            partial_indptr[output_work] = split ? work * heads : -1;
+            q_len[output_work] = 1;
+            kv_len[output_work] = length;
+            q_start[output_work] = 0;
+            kv_start[output_work] = start;
+            kv_end[output_work] = min(start + kv_limit, length);
+            ++output_work;
+        }
+        work_indptr[num_clusters] = output_work;
     }
     for (int i = threadIdx.x; i < blocks; i += blockDim.x) {
         kv_indices[i] = i;
@@ -11346,12 +12529,15 @@ bool flashinfer_mla_batch1_plan(
         heads > 0 &&
         (length + page_size - 1) / page_size <= kv_indices.numel(),
         "FlashInfer MLA batch-1 context length is out of range");
-    const int num_sms = static_cast<int>(plan_info[1]);
+    const int cluster_size = static_cast<int>(plan_info[0]);
+    const int num_clusters = static_cast<int>(plan_info[1]);
+    const int num_sms = cluster_size * num_clusters;
     TORCH_CHECK(
-        plan_info[0] == 1 &&
-        num_sms > 0 &&
+        (cluster_size == 1 || cluster_size == 2) &&
+        num_clusters > 0 &&
+        num_clusters <= 256 &&
         plan_info[15] +
-            static_cast<int64_t>(num_sms + 1) * sizeof(int32_t) <=
+            static_cast<int64_t>(num_clusters + 1) * sizeof(int32_t) <=
             int_workspace.numel(),
         "Unsupported FlashInfer MLA plan layout");
 
@@ -11364,6 +12550,8 @@ bool flashinfer_mla_batch1_plan(
         static_cast<int>(length),
         static_cast<int>(page_size),
         static_cast<int>(heads),
+        cluster_size,
+        num_clusters,
         num_sms,
         plan_info[2],
         plan_info[3],
@@ -11383,6 +12571,81 @@ bool flashinfer_mla_batch1_plan(
     return true;
 }
 
+__global__ void packed_route_slots_kernel(
+    const int64_t* __restrict__ route_ids,
+    const int64_t* __restrict__ directory,
+    int64_t* __restrict__ selected,
+    bool* __restrict__ hit_mask,
+    const int rows,
+    const int experts,
+    const int top_k) {
+    const int item = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * top_k;
+    if (item >= total)
+        return;
+    const int row = item / top_k;
+    const int rank = item - row * top_k;
+    const int64_t expert = route_ids[rank];
+    const bool valid_id = expert >= 0 && expert < experts;
+    const int64_t value = valid_id
+        ? directory[expert * static_cast<int64_t>(rows) + row]
+        : 0;
+    selected[item] = value;
+    if (row == 0)
+        hit_mask[rank] = value != 0;
+}
+
+bool packed_route_slots_out(
+    torch::Tensor route_ids,
+    torch::Tensor directory,
+    torch::Tensor selected,
+    torch::Tensor hit_mask) {
+    TORCH_CHECK(
+        route_ids.is_cuda() && directory.is_cuda() &&
+        selected.is_cuda() && hit_mask.is_cuda(),
+        "packed route-slot tensors must be CUDA");
+    TORCH_CHECK(
+        route_ids.scalar_type() == at::kLong &&
+        directory.scalar_type() == at::kLong &&
+        selected.scalar_type() == at::kLong &&
+        hit_mask.scalar_type() == at::kBool,
+        "packed route-slot tensor dtypes are invalid");
+    TORCH_CHECK(
+        route_ids.is_contiguous() && directory.is_contiguous() &&
+        selected.is_contiguous() && hit_mask.is_contiguous(),
+        "packed route-slot tensors must be contiguous");
+    TORCH_CHECK(
+        route_ids.dim() == 1 && directory.dim() == 2 &&
+        selected.dim() == 2 && hit_mask.dim() == 1 &&
+        selected.size(0) == directory.size(1) &&
+        selected.size(1) == route_ids.numel() &&
+        hit_mask.numel() == route_ids.numel(),
+        "packed route-slot tensor shapes are invalid");
+    TORCH_CHECK(
+        route_ids.get_device() == directory.get_device() &&
+        route_ids.get_device() == selected.get_device() &&
+        route_ids.get_device() == hit_mask.get_device(),
+        "packed route-slot tensors must share one CUDA device");
+    const int experts = static_cast<int>(directory.size(0));
+    const int rows = static_cast<int>(directory.size(1));
+    const int top_k = static_cast<int>(route_ids.numel());
+    TORCH_CHECK(
+        rows > 0 && experts > 0 && top_k > 0 && top_k <= 16,
+        "packed route-slot dimensions are invalid");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int total = rows * top_k;
+    packed_route_slots_kernel<<<(total + 127) / 128, 128, 0, stream>>>(
+        route_ids.data_ptr<int64_t>(),
+        directory.data_ptr<int64_t>(),
+        selected.data_ptr<int64_t>(),
+        hit_mask.data_ptr<bool>(),
+        rows,
+        experts,
+        top_k);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return true;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("vq_gemv", &vq_gemv, "VQ grouped GEMV (fused codebook lookup + dot)");
     m.def("kimi_short_conv3", &kimi_short_conv3,
@@ -11394,7 +12657,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
           "packed_moe_topk",
           &packed_moe_topk,
-          "Packed 8/12/14/16-bit Top-K routed expert MLP");
+          "Packed 8/9/10/12/14/16-bit Top-K routed expert MLP");
+    m.def(
+          "packed_route_slots_out",
+          &packed_route_slots_out,
+          "Gather stable packed expert slot metadata on CUDA");
     m.def(
           "kimi_moe_packed",
           &packed_moe_topk,
@@ -11461,8 +12728,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dsv4_hc_pre", &dsv4_hc_pre, "DSV4 HC pre (fused RMS/GEMV/sinkhorn/reduce)");
     m.def("dsv4_hc_pre_norm", &dsv4_hc_pre_norm,
           "DSV4 BF16 HC pre + RMSNorm (FP32 reductions)");
+    m.def("dsv4_hc_pre_norm_out", &dsv4_hc_pre_norm_out,
+          "DSV4 BF16 HC pre + RMSNorm into caller-owned buffers");
     m.def("dsv4_hc_post", &dsv4_hc_post,
           "DSV4 BF16 HC post residual mix (FP32 accumulation)");
+    m.def("dsv4_hc_post_out", &dsv4_hc_post_out,
+          "DSV4 BF16 HC post into caller-owned hidden buffer");
+    m.def("dsv4_hc_post_moe", &dsv4_hc_post_moe,
+          "DSV4 BF16 routed/shared merge plus HC post");
+    m.def("dsv4_hc_post_moe_out", &dsv4_hc_post_moe_out,
+          "DSV4 routed/shared merge plus HC post into caller buffer");
     m.def("dsv4_route_post", &dsv4_route_post,
           "DSV4 learned-route top-k, gather, normalize and scale");
     m.def("sigmoid_route", &sigmoid_route,
@@ -11490,6 +12765,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Shared-input packed INT4-G64 GEMV for float32 decode");
     m.def("block_fp8_gemv_f32", &block_fp8_gemv_f32,
           "Native E4M3 block-scaled GEMV for float32 decode");
+    m.def("block_fp8_grouped_gemv_f32", &block_fp8_grouped_gemv_f32,
+          "Grouped native E4M3 block-scaled GEMV for decode");
     m.def("int4_glm_qb_split", &int4_glm_qb_split,
           "Packed GLM Q-B GEMV into BF16 no-PE and FP32 RoPE outputs");
     m.def("glm_norm_qkv_int4", &glm_norm_qkv_int4,
@@ -11626,10 +12903,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             pybind11::keep_alive<1, 3>())
         .def(
             "launch_from_events",
-            &TPNoOwnerDecodeLayerPlan::launch_from_events)
-        .def(
-            "persistent_enabled",
-            &TPNoOwnerDecodeLayerPlan::persistent_enabled);
+            &TPNoOwnerDecodeLayerPlan::launch_from_events);
     m.def(
           "bf16_gemv_out",
           &bf16_gemv_out,

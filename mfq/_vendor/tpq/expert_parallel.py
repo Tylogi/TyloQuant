@@ -35,6 +35,11 @@ try:
         if _fusedext.available()
         else None
     )
+    _routed_vv_fused = (
+        _fusedext.moe_mlp_routed_vv_fused
+        if _fusedext.available()
+        else None
+    )
     _pack_codegemm_shard = (
         _fusedext.pack_vq_tensor_shard_codegemm
         if _fusedext.available()
@@ -58,6 +63,7 @@ try:
 except Exception:
     _routed_slots_fused = None
     _routed_codegemm_fused = None
+    _routed_vv_fused = None
     _pack_codegemm_shard = None
     _unpack_codegemm = None
     _expert_dispatch_pack_fused = None
@@ -151,8 +157,10 @@ def _runtime_expert_layers(store) -> list[int]:
     )
 
 
-def _supports_codegemm(store) -> bool:
-    """Whether every routed expert uses the v256/D4 format."""
+def _resident_codebook_profile(
+    store,
+) -> tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...]]:
+    """Describe resident index dtypes and VQ shapes without model names."""
     used: set[str] = set()
     n_experts = int(store.cfg["n_experts"])
     for layer in _runtime_expert_layers(store):
@@ -160,10 +168,35 @@ def _supports_codegemm(store) -> bool:
             kind = store.expert_kind(int(layer), expert_id)
             if kind != "drop":
                 used.add(kind.rstrip("z"))
-    return bool(used) and all(
-        store.man.vq_dims[kind] == (4, 256)
-        for kind in used
+    if not used:
+        return (), (), ()
+    shapes = {store.man.vq_dims[kind] for kind in used}
+    formats = tuple(
+        sorted(
+            {
+                "u16" if codebook_size > 256 else "u8"
+                for _dim, codebook_size in shapes
+            }
+        )
     )
+    return (
+        formats,
+        tuple(sorted({int(dim) for dim, _size in shapes})),
+        tuple(sorted({int(size) for _dim, size in shapes})),
+    )
+
+
+def _codegemm_codebook_sizes(store) -> tuple[int, ...]:
+    """Return the resident D4 codebook profile, or empty when unsupported."""
+    _formats, dims, sizes = _resident_codebook_profile(store)
+    if dims != (4,) or not set(sizes).issubset({256, 4096}):
+        return ()
+    return sizes
+
+
+def _supports_codegemm(store) -> bool:
+    """Whether resident experts use supported D4 u8/u16 codebooks."""
+    return bool(_codegemm_codebook_sizes(store))
 
 
 @dataclass(frozen=True)
@@ -347,7 +380,14 @@ class _ResidentShard:
             key,
             signature_expert,
         )
-        if self.codegemm_enabled:
+        codegemm_weight = (
+            self.codegemm_enabled
+            and gu.idx.dtype == torch.uint8
+            and dn.idx.dtype == torch.uint8
+            and gu.cb.shape == (256, 4)
+            and dn.cb.shape == (256, 4)
+        )
+        if codegemm_weight:
             if (
                 _pack_codegemm_shard is None
                 or not _pack_codegemm_shard(
@@ -389,7 +429,10 @@ class _ResidentShard:
     ) -> tuple[VQWeight, VQWeight]:
         """Return row-major weights, unpacking only for full-GPU prefill."""
         gu, dn = self.experts[key]
-        if not self.codegemm_enabled:
+        if (
+            not self.codegemm_enabled
+            or gu.idx.dtype != torch.uint8
+        ):
             return gu, dn
         if _unpack_codegemm is None:
             raise RuntimeError("CodeGEMM unpack kernel is unavailable")
@@ -440,14 +483,25 @@ class _ResidentShard:
                 gu_codebook,
                 dn_codebook,
             )
-            if self.codegemm_enabled and (
-                gu.idx.dtype != torch.uint8
-                or dn.idx.dtype != torch.uint8
-                or gu_codebook.shape != (256, 4)
-                or dn_codebook.shape != (256, 4)
+            valid_codegemm = (
+                gu.idx.dtype == torch.uint8
+                and dn.idx.dtype == torch.uint8
+                and gu_codebook.shape == (256, 4)
+                and dn_codebook.shape == (256, 4)
+            )
+            valid_vv = (
+                gu.idx.dtype == torch.uint16
+                and dn.idx.dtype == torch.uint16
+                and gu_codebook.shape == (4096, 4)
+                and dn_codebook.shape == (4096, 4)
+            )
+            if (
+                self.codegemm_enabled
+                and not (valid_codegemm or valid_vv)
             ):
                 raise RuntimeError(
-                    "CodeGEMM runtime requires uint8 v256/D4 experts"
+                    "resident mixed CodeGEMM requires D4 "
+                    "u8/K256 or u16/K4096 experts"
                 )
             metadata[layer, 0, expert_id] = gu.idx.data_ptr()
             metadata[layer, 1, expert_id] = gu_codebook.data_ptr()
@@ -565,15 +619,34 @@ class GpuResidentExpertParallel:
         self.layout = requested_layout
         self.tensor_sharded = self.layout == "tensor"
         requested_codegemm = (
-            os.environ.get("TPQ_CODEGEMM_VQ", "1") != "0"
+            os.environ.get("TPQ_CODEGEMM_VQ", "0") == "1"
+        )
+        (
+            self.resident_packed_formats,
+            self.resident_code_dims,
+            self.resident_codebook_sizes,
+        ) = _resident_codebook_profile(store)
+        self.codegemm_codebook_sizes = (
+            self.resident_codebook_sizes
+            if (
+                self.resident_code_dims == (4,)
+                and set(self.resident_codebook_sizes).issubset(
+                    {256, 4096}
+                )
+            )
+            else ()
         )
         self.codegemm_enabled = bool(
             requested_codegemm
             and self.tensor_sharded
             and _routed_codegemm_fused is not None
+            and (
+                4096 not in self.codegemm_codebook_sizes
+                or _routed_vv_fused is not None
+            )
             and _pack_codegemm_shard is not None
             and _unpack_codegemm is not None
-            and _supports_codegemm(store)
+            and self.codegemm_codebook_sizes
         )
         if requested_codegemm and not self.codegemm_enabled:
             print(
@@ -1068,6 +1141,55 @@ class GpuResidentExpertParallel:
             self._dispatch_source_ids.view(1, -1),
         )
 
+    def _run_registered_resident_moe(
+        self,
+        shard: _ResidentShard,
+        value: torch.Tensor,
+        route_ids: torch.Tensor,
+        route_weights: torch.Tensor,
+        metadata: torch.Tensor,
+        result: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Dispatch the resident mixed-codebook kernel by capability."""
+        from .ops import resident_moe_topk
+
+        assert shard.routed_hidden is not None
+        assert shard.routed_output is not None
+        if self.codegemm_enabled:
+            assert shard.codegemm_gu_sum is not None
+            assert shard.codegemm_activation is not None
+            assert shard.codegemm_dn_sum is not None
+            packed_formats = (
+                ("psumbook_u8", "u16")
+                if 4096 in self.codegemm_codebook_sizes
+                else ("psumbook_u8",)
+            )
+        else:
+            packed_formats = self.resident_packed_formats
+        return resident_moe_topk(
+            value,
+            route_ids,
+            route_weights,
+            metadata,
+            activation="swiglu",
+            limit=0.0,
+            codegemm_gu_workspace=shard.codegemm_gu_sum,
+            codegemm_activation_workspace=(
+                shard.codegemm_activation
+            ),
+            codegemm_down_workspace=shard.codegemm_dn_sum,
+            hidden_workspace=shard.routed_hidden,
+            output_workspace=shard.routed_output,
+            result=result,
+            packed_formats=packed_formats,
+            code_dims=self.resident_code_dims,
+            codebook_sizes=(
+                self.codegemm_codebook_sizes
+                if self.codegemm_enabled
+                else self.resident_codebook_sizes
+            ),
+        )
+
     def prepare_codegemm_graphs(self) -> bool:
         """Capture the fixed-buffer routed kernel chain once per layer/rank."""
         if (
@@ -1114,14 +1236,12 @@ class GpuResidentExpertParallel:
                     )
                     assert result_buffer is not None
                     with torch.cuda.stream(shard.stream):
-                        _routed_codegemm_fused(
+                        self._run_registered_resident_moe(
+                            shard,
                             shard.routed_x,
                             shard.routed_ids,
                             shard.routed_weights,
                             shard.routed_metadata[layer],
-                            shard.codegemm_gu_sum,
-                            shard.codegemm_activation,
-                            shard.codegemm_dn_sum,
                             result_buffer,
                         )
                     shard.stream.synchronize()
@@ -1130,14 +1250,12 @@ class GpuResidentExpertParallel:
                         graph,
                         stream=shard.stream,
                     ):
-                        _routed_codegemm_fused(
+                        self._run_registered_resident_moe(
+                            shard,
                             shard.routed_x,
                             shard.routed_ids,
                             shard.routed_weights,
                             shard.routed_metadata[layer],
-                            shard.codegemm_gu_sum,
-                            shard.codegemm_activation,
-                            shard.codegemm_dn_sum,
                             result_buffer,
                         )
                     shard.codegemm_graphs[layer] = graph
@@ -1159,14 +1277,12 @@ class GpuResidentExpertParallel:
                             raise RuntimeError(
                                 "CodeGEMM dispatch graph warmup failed"
                             )
-                        _routed_codegemm_fused(
+                        self._run_registered_resident_moe(
+                            shard,
                             shard.routed_x,
                             shard.routed_ids,
                             shard.routed_weights,
                             shard.routed_metadata[layer],
-                            shard.codegemm_gu_sum,
-                            shard.codegemm_activation,
-                            shard.codegemm_dn_sum,
                             result_buffer,
                         )
                     shard.stream.synchronize()
@@ -1183,14 +1299,12 @@ class GpuResidentExpertParallel:
                             shard.routed_ids,
                             shard.routed_weights,
                         )
-                        _routed_codegemm_fused(
+                        self._run_registered_resident_moe(
+                            shard,
                             shard.routed_x,
                             shard.routed_ids,
                             shard.routed_weights,
                             shard.routed_metadata[layer],
-                            shard.codegemm_gu_sum,
-                            shard.codegemm_activation,
-                            shard.codegemm_dn_sum,
                             result_buffer,
                         )
                     shard.codegemm_dispatch_graphs[layer] = (
@@ -1383,27 +1497,25 @@ class GpuResidentExpertParallel:
                         shard.codegemm_graphs[layer].replay()
                         local_partial = captured_output
                     else:
-                        local_partial = _routed_codegemm_fused(
-                            local_x,
-                            local_ids,
-                            local_weights,
-                            shard.routed_metadata[layer],
-                            shard.codegemm_gu_sum,
-                            shard.codegemm_activation,
-                            shard.codegemm_dn_sum,
-                            result_buffer,
+                        local_partial = (
+                            self._run_registered_resident_moe(
+                                shard,
+                                local_x,
+                                local_ids,
+                                local_weights,
+                                shard.routed_metadata[layer],
+                                result_buffer,
+                            )
                         )
                 else:
                     assert shard.routed_hidden is not None
                     assert shard.routed_output is not None
-                    local_partial = _routed_slots_fused(
+                    local_partial = self._run_registered_resident_moe(
+                        shard,
                         local_x,
                         local_ids,
                         local_weights,
                         shard.routed_metadata[layer],
-                        0.0,
-                        shard.routed_hidden,
-                        shard.routed_output,
                         result_buffer,
                     )
                 if local_partial is None:

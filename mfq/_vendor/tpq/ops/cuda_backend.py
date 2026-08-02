@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 from .registry import OperatorRegistry
 from .spec import OperatorCapability
@@ -11,17 +12,126 @@ from .spec import OperatorCapability
 def _vq_gemv(**kwargs):
     from ..fusedext import vq_gemv_fused
 
-    return vq_gemv_fused(
-        kwargs["x_rows"],
-        kwargs["indices"],
-        kwargs["codebook"],
-    )
+    x_rows = kwargs["x_rows"]
+    # 扩展内部从“当前 CUDA 设备”取得 stream。流水线切到 cuda:1+
+    # 时，张量搬运不会自动修改 Python 当前设备；若不显式守卫，会在
+    # cuda:0 stream 上启动持有其他卡指针的 kernel，造成非法访存。
+    with torch.cuda.device(x_rows.device):
+        return vq_gemv_fused(
+            x_rows,
+            kwargs["indices"],
+            kwargs["codebook"],
+        )
+
+
+def _block_scaled_gemv(**kwargs):
+    from ..fusedext import block_fp8_gemv_fused
+
+    value = kwargs["value"]
+    with torch.cuda.device(value.device):
+        return block_fp8_gemv_fused(
+            value,
+            kwargs["weights"],
+            kwargs["scales"],
+            int(kwargs["cols"]),
+            int(kwargs["block_size"]),
+            output=kwargs.get("output"),
+        )
+
+
+def _block_scaled_grouped_gemv(**kwargs):
+    from ..fusedext import block_fp8_grouped_gemv_fused
+
+    value = kwargs["value"]
+    with torch.cuda.device(value.device):
+        return block_fp8_grouped_gemv_fused(
+            value,
+            kwargs["weight_ptrs"],
+            kwargs["scale_ptrs"],
+            kwargs["row_offsets"],
+            int(kwargs["total_rows"]),
+            int(kwargs["cols"]),
+            int(kwargs["block_size"]),
+            output=kwargs.get("output"),
+        )
 
 
 def _packed_moe_topk(**kwargs):
     from ..fusedext import packed_moe_topk_fused
 
     return packed_moe_topk_fused(**kwargs)
+
+
+def _packed_route_slots(**kwargs):
+    from ..fusedext import packed_route_slots_fused
+
+    route_ids = kwargs["route_ids"]
+    with torch.cuda.device(route_ids.device):
+        return packed_route_slots_fused(
+            route_ids,
+            kwargs["directory"],
+            kwargs["output"],
+            kwargs["hit_mask"],
+        )
+
+
+def _resident_moe_topk(**kwargs):
+    """Compose resident u8 Psumbook and u16/K4096 experts in one call.
+
+    Both kernels consume the same route IDs and metadata.  The CUDA backend
+    filters by metadata dtype tag, so mixed layers need no host-side route
+    split or synchronization.
+    """
+    from ..fusedext import (
+        moe_mlp_routed_codegemm_fused,
+        moe_mlp_routed_vv_fused,
+    )
+
+    value = kwargs["value"]
+    with torch.cuda.device(value.device):
+        output = moe_mlp_routed_codegemm_fused(
+            value,
+            kwargs["route_ids"],
+            kwargs["weights"],
+            kwargs["metadata"],
+            kwargs["codegemm_gu_workspace"],
+            kwargs["codegemm_activation_workspace"],
+            kwargs["codegemm_down_workspace"],
+            kwargs["result"],
+        )
+        if output is None:
+            return None
+        if not kwargs.get("include_k4096", False):
+            return output
+        return moe_mlp_routed_vv_fused(
+            value,
+            kwargs["route_ids"],
+            kwargs["weights"],
+            kwargs["metadata"],
+            float(kwargs["limit"]),
+            kwargs["hidden_workspace"],
+            kwargs["output_workspace"],
+            kwargs["result"],
+            accumulate=True,
+        )
+
+
+def _resident_moe_topk_generic(**kwargs):
+    """Run row-major u8/u16 resident experts through the proven VQ kernel."""
+    from ..fusedext import moe_mlp_routed_slots_fused
+
+    value = kwargs["value"]
+    with torch.cuda.device(value.device):
+        return moe_mlp_routed_slots_fused(
+            value,
+            kwargs["route_ids"],
+            kwargs["weights"],
+            kwargs["metadata"],
+            float(kwargs["limit"]),
+            kwargs["hidden_workspace"],
+            kwargs["output_workspace"],
+            kwargs["result"],
+        )
 
 
 def _create_tensor_parallel(*, kind, devices, spec):
@@ -80,6 +190,34 @@ def _linear_route_topk(**kwargs):
             kwargs["scaling"],
             kwargs["output_buffers"],
         )
+
+
+def _linear_route_topk_sqrtsoftplus(**kwargs):
+    """Source-native sqrt(softplus) router with fixed CLI/Graph buffers."""
+    value = kwargs["value"]
+    weight = kwargs["weight"]
+    bias = kwargs["bias"]
+    mask = kwargs["mask"]
+    logits, output_weights, output_indices = kwargs["output_buffers"]
+    if (
+        not value.is_cuda
+        or value.shape != (1, weight.shape[1])
+        or weight.dtype != torch.float32
+        or bias.dtype != torch.float32
+        or mask.dtype != torch.bool
+    ):
+        return None
+    with torch.cuda.device(value.device):
+        scores = F.softplus(F.linear(value.float(), weight)).sqrt()
+        logits.copy_(scores)
+        choice = scores.add(bias).masked_fill(~mask[None], -1e30)
+        indices = choice.topk(int(kwargs["top_k"]), dim=-1).indices
+        weights = scores.gather(1, indices)
+        weights.div_(weights.sum(dim=-1, keepdim=True) + 1e-20)
+        weights.mul_(float(kwargs["scaling"]))
+        output_indices.copy_(indices)
+        output_weights.copy_(weights)
+    return output_weights, output_indices
 
 
 def _short_conv3(**kwargs):
@@ -148,6 +286,21 @@ def _latent_mla_decode(**kwargs):
     )
 
 
+def _sliding_compressed_mqa_decode(**kwargs):
+    from ..fusedext import dsv4_attn_decode_fused
+
+    return dsv4_attn_decode_fused(
+        kwargs["query"],
+        kwargs["window_kv"],
+        kwargs["window_positions"],
+        kwargs["compressed_kv"],
+        kwargs["sink"],
+        kwargs["cos"],
+        kwargs["sin"],
+        float(kwargs["scale"]),
+    )
+
+
 def _rmsnorm(**kwargs):
     from ..fusedext import rmsnorm_bf16_fused, rmsnorm_fused
 
@@ -178,13 +331,118 @@ def _residual_add3(**kwargs):
     return residual_add3_fused(**kwargs)
 
 
+def _hyper_connection_pre_norm(**kwargs):
+    from ..fusedext import dsv4_hc_pre_norm_fused
+
+    value = kwargs["value"]
+    with torch.cuda.device(value.device):
+        return dsv4_hc_pre_norm_fused(
+            value,
+            kwargs["projection"],
+            kwargs["scale"],
+            kwargs["base"],
+            kwargs["norm_weight"],
+            kwargs["sinkhorn_iters"],
+            kwargs["eps"],
+            output_buffers=kwargs.get("output_buffers"),
+        )
+
+
+def _hyper_connection_post(**kwargs):
+    from ..fusedext import dsv4_hc_post_fused
+
+    residual = kwargs["residual"]
+    with torch.cuda.device(residual.device):
+        return dsv4_hc_post_fused(
+            kwargs["value"],
+            residual,
+            kwargs["post"],
+            kwargs["combine"],
+            output=kwargs.get("output"),
+        )
+
+
+def _hyper_connection_post_moe(**kwargs):
+    from ..fusedext import dsv4_hc_post_moe_fused
+
+    residual = kwargs["residual"]
+    with torch.cuda.device(residual.device):
+        return dsv4_hc_post_moe_fused(
+            kwargs["routed"],
+            kwargs["shared"],
+            residual,
+            kwargs["post"],
+            kwargs["combine"],
+            output=kwargs.get("output"),
+        )
+
+
 def _gated_activation(**kwargs):
     from ..fusedext import gated_activation_bf16_fused
 
     return gated_activation_bf16_fused(**kwargs)
 
 
+def _route_topk_sqrtsoftplus(**kwargs):
+    logits = kwargs["logits"]
+    bias = kwargs["bias"]
+    mask = kwargs["mask"]
+    output_buffers = kwargs.get("output_buffers")
+    if (
+        not logits.is_cuda
+        or logits.dtype != torch.float32
+        or bias.dtype != torch.float32
+        or mask.dtype != torch.bool
+        or output_buffers is None
+    ):
+        return None
+    output_weights, output_indices = output_buffers
+    with torch.cuda.device(logits.device):
+        scores = F.softplus(logits).sqrt()
+        choice = scores.add(bias).masked_fill(~mask[None], -1e30)
+        indices = choice.topk(int(kwargs["top_k"]), dim=-1).indices
+        weights = scores.gather(1, indices)
+        if kwargs["normalize"]:
+            weights.div_(weights.sum(dim=-1, keepdim=True) + 1e-20)
+        weights.mul_(float(kwargs["scaling"]))
+        output_indices.copy_(indices)
+        output_weights.copy_(weights)
+    return output_weights, output_indices
+
+
 def register(registry: OperatorRegistry) -> None:
+    for name, operation, activation, implementation in (
+        (
+            "cuda.hyper_connection.pre_norm.decode",
+            "pre_norm",
+            "rmsnorm",
+            _hyper_connection_pre_norm,
+        ),
+        (
+            "cuda.hyper_connection.post.decode",
+            "post",
+            "none",
+            _hyper_connection_post,
+        ),
+        (
+            "cuda.hyper_connection.post_moe.decode",
+            "post_moe",
+            "none",
+            _hyper_connection_post_moe,
+        ),
+    ):
+        registry.register(
+            name,
+            OperatorCapability(
+                operation=f"hyper_connection:{operation}",
+                device_types=("cuda",),
+                activations=(activation,),
+                max_top_k=1,
+                batch_sizes=tuple(range(1, 257)),
+            ),
+            implementation,
+            priority=100,
+        )
     registry.register(
         "cuda.residual_add.three_way.decode",
         OperatorCapability(
@@ -210,6 +468,18 @@ def register(registry: OperatorRegistry) -> None:
         priority=100,
     )
     registry.register(
+        "cuda.linear_route_topk.sqrtsoftplus.decode",
+        OperatorCapability(
+            operation="linear_route_topk",
+            device_types=("cuda",),
+            activations=("sqrtsoftplus",),
+            max_top_k=16,
+            batch_sizes=(1,),
+        ),
+        _linear_route_topk_sqrtsoftplus,
+        priority=90,
+    )
+    registry.register(
         "cuda.route_topk.sigmoid.decode",
         OperatorCapability(
             operation="route_topk",
@@ -220,6 +490,18 @@ def register(registry: OperatorRegistry) -> None:
         ),
         _route_topk,
         priority=100,
+    )
+    registry.register(
+        "cuda.route_topk.sqrtsoftplus.decode",
+        OperatorCapability(
+            operation="route_topk",
+            device_types=("cuda",),
+            activations=("sqrtsoftplus",),
+            max_top_k=16,
+            batch_sizes=(1,),
+        ),
+        _route_topk_sqrtsoftplus,
+        priority=90,
     )
     for name, kind, implementation in (
         (
@@ -256,6 +538,11 @@ def register(registry: OperatorRegistry) -> None:
             "cuda.attention.compressed_kv.decode",
             "compressed_kv_decode",
             _latent_mla_decode,
+        ),
+        (
+            "cuda.attention.sliding_compressed_mqa.decode",
+            "sliding_compressed_mqa_decode",
+            _sliding_compressed_mqa_decode,
         ),
     ):
         registry.register(
@@ -322,6 +609,20 @@ def register(registry: OperatorRegistry) -> None:
         priority=50,
     )
     registry.register(
+        "cuda.block_scaled_gemv.e4m3fn.b128.decode",
+        OperatorCapability(
+            operation="block_scaled_gemv",
+            device_types=("cuda",),
+            packed_formats=("e4m3fn",),
+            code_dims=(128,),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=(1,),
+        ),
+        _block_scaled_gemv,
+        priority=100,
+    )
+    registry.register(
         "cuda.packed_moe_topk.situ.batch1",
         OperatorCapability(
             operation="moe_topk",
@@ -334,6 +635,80 @@ def register(registry: OperatorRegistry) -> None:
             batch_sizes=(1,),
         ),
         _packed_moe_topk,
+        priority=100,
+    )
+    registry.register(
+        "cuda.packed_route_slots.fixed_metadata.decode",
+        OperatorCapability(
+            operation="packed_route_slots",
+            device_types=("cuda",),
+            activations=("none",),
+            max_top_k=16,
+            batch_sizes=(1,),
+        ),
+        _packed_route_slots,
+        priority=100,
+    )
+    registry.register(
+        "cuda.block_scaled_grouped_gemv.e4m3fn.b128.decode",
+        OperatorCapability(
+            operation="block_scaled_grouped_gemv",
+            device_types=("cuda",),
+            packed_formats=("e4m3fn",),
+            code_dims=(128,),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=(1,),
+        ),
+        _block_scaled_grouped_gemv,
+        priority=110,
+    )
+    registry.register(
+        "cuda.packed_moe_topk.three_projection.mixed.gated",
+        OperatorCapability(
+            operation="moe_topk",
+            device_types=("cuda",),
+            packed_formats=tuple(f"p{bits}" for bits in range(8, 17)),
+            code_dims=(4, 8, 16),
+            codebook_sizes=(
+                256, 512, 1024, 2048, 4096,
+                8192, 16384, 32768, 65536,
+            ),
+            activations=("silu", "swiglu", "situ"),
+            max_top_k=16,
+            batch_sizes=(1,),
+        ),
+        _packed_moe_topk,
+        priority=110,
+    )
+    registry.register(
+        "cuda.resident_moe_topk.row_major_mixed.decode",
+        OperatorCapability(
+            operation="resident_moe_topk",
+            device_types=("cuda",),
+            packed_formats=("u8", "u16"),
+            code_dims=(4, 8, 16),
+            codebook_sizes=(256, 4096),
+            activations=("silu", "swiglu"),
+            max_top_k=8,
+            batch_sizes=(1,),
+        ),
+        _resident_moe_topk_generic,
+        priority=200,
+    )
+    registry.register(
+        "cuda.resident_moe_topk.codegemm_mixed.decode",
+        OperatorCapability(
+            operation="resident_moe_topk",
+            device_types=("cuda",),
+            packed_formats=("psumbook_u8", "u16"),
+            code_dims=(4,),
+            codebook_sizes=(256, 4096),
+            activations=("silu", "swiglu"),
+            max_top_k=8,
+            batch_sizes=(1,),
+        ),
+        _resident_moe_topk,
         priority=100,
     )
     for kind, activations in (

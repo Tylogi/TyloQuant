@@ -353,7 +353,7 @@ def moe_mlp_grouped_partial(
 
 def moe_mlp_grouped_mixed(
     x_rows: torch.Tensor,
-    experts: list[tuple[VQWeight, VQWeight]],
+    experts: list[tuple[VQWeight, ...]],
     weights: torch.Tensor,
     limit: float = 0.0,
     *,
@@ -367,17 +367,32 @@ def moe_mlp_grouped_mixed(
     x_rows: [N, D] 或 [1, D]；experts: top-k 个 (gu, dn)；weights: [K]。
     返回加权和 [D] f32。
     """
-    slotted = moe_mlp_grouped_slots(
-        x_rows,
-        experts,
-        weights,
-        limit,
-        activation=activation,
+    if not experts:
+        raise ValueError("at least one expert is required")
+    arity = len(experts[0])
+    if arity not in (2, 3) or any(
+        len(bundle) != arity for bundle in experts
+    ):
+        raise ValueError("expert projections must consistently be 2 or 3")
+    slotted = (
+        moe_mlp_grouped_slots(
+            x_rows,
+            experts,
+            weights,
+            limit,
+            activation=activation,
+        )
+        if arity == 2
+        else None
     )
     if slotted is not None:
         return slotted
-    packed = bool(experts and hasattr(experts[0][0], "raw"))
-    if any(hasattr(gu, "raw") != packed for gu, _ in experts):
+    packed = hasattr(experts[0][0], "raw")
+    if any(
+        hasattr(weight, "raw") != packed
+        for bundle in experts
+        for weight in bundle
+    ):
         raise ValueError("packed and expanded VQ experts cannot be mixed")
     if (
         packed
@@ -404,6 +419,117 @@ def moe_mlp_grouped_mixed(
                 )
                 _CPU_PACKED_PROFILE["fused_calls"] += 1
             return fused
+    if packed and arity == 3 and not x_rows.is_cuda:
+        from .ops import vq_gemv_packed_list
+
+        gate = experts[0][0]
+        up = experts[0][1]
+        down = experts[0][2]
+        same_layout = all(
+            (
+                current.rows,
+                current.blocks,
+                current.bits,
+                tuple(current.cb.shape),
+                current.cb.data_ptr(),
+            )
+            == (
+                reference.rows,
+                reference.blocks,
+                reference.bits,
+                tuple(reference.cb.shape),
+                reference.cb.data_ptr(),
+            )
+            for bundle in experts
+            for current, reference in zip(
+                bundle,
+                (gate, up, down),
+            )
+        )
+        if same_layout:
+            gate_values = vq_gemv_packed_list(
+                x_rows.float(),
+                [bundle[0].raw for bundle in experts],
+                gate.cb,
+                gate.rows,
+                gate.blocks,
+                gate.bits,
+            )
+            up_values = vq_gemv_packed_list(
+                x_rows.float(),
+                [bundle[1].raw for bundle in experts],
+                up.cb,
+                up.rows,
+                up.blocks,
+                up.bits,
+            )
+            if gate_values is not None and up_values is not None:
+                if limit:
+                    gate_values.clamp_(max=limit)
+                    up_values.clamp_(-limit, limit)
+                activated = activate_gate_up(
+                    gate_values,
+                    up_values,
+                    activation=activation,
+                    situ_beta=situ_beta,
+                    situ_linear_beta=situ_linear_beta,
+                )
+                part = vq_gemv_packed_list(
+                    activated,
+                    [bundle[2].raw for bundle in experts],
+                    down.cb,
+                    down.rows,
+                    down.blocks,
+                    down.bits,
+                    allow_direct=True,
+                )
+                if part is not None:
+                    return (
+                        part
+                        * weights.float().reshape(-1, 1)
+                    ).sum(0)
+
+        # Compiler-less correctness path. Expanded indices and matrices are
+        # temporary and never enter the model cache.
+        result = torch.zeros(
+            x_rows.shape[-1],
+            dtype=torch.float32,
+            device=x_rows.device,
+        )
+        source = x_rows[0].float()
+        for expert, bundle in enumerate(experts):
+            gate_weight, up_weight, down_weight = bundle
+
+            def apply(weight, value):
+                indices = weight.unpack().long()
+                matrix = (
+                    weight.cb[indices]
+                    .reshape(weight.rows, weight.cols)
+                    .float()
+                )
+                return torch.mv(matrix, value)
+
+            gate_value = apply(gate_weight, source)
+            up_value = apply(up_weight, source)
+            if limit:
+                gate_value.clamp_(max=limit)
+                up_value.clamp_(-limit, limit)
+            activated = activate_gate_up(
+                gate_value,
+                up_value,
+                activation=activation,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
+            )
+            result.add_(
+                apply(down_weight, activated.float()),
+                alpha=float(weights[expert]),
+            )
+        return result
+    if arity != 2:
+        raise ValueError(
+            "three-projection experts require packed CPU execution"
+        )
     groups: dict[tuple, list[int]] = {}
     for i, (g, d) in enumerate(experts):
         if packed:
@@ -578,6 +704,28 @@ def moe_mlp_grouped_mixed(
         else:
             y += part.to(y.dtype)
     return y
+
+
+def moe_mlp_grouped_situ(
+    x_rows: torch.Tensor,
+    experts: list[tuple[VQWeight, VQWeight]],
+    weights: torch.Tensor,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float | None = 25.0,
+) -> torch.Tensor:
+    """Kimi/CCCP 的稳定直连入口：混档 VQ MoE + SITU 激活。
+
+    保留简单的位置参数签名，量化器运行时无需了解 TPQ 内部的通用
+    ``activation``/``limit`` 选项，也不会因重构通用分组算子而回退。
+    """
+    return moe_mlp_grouped_mixed(
+        x_rows,
+        experts,
+        weights,
+        activation="situ",
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
 
 
 def expert_mlp_batched(

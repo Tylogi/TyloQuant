@@ -80,6 +80,38 @@ def _int4_gemv_fused():
 _INT4_GEMV_FUSED = None
 
 
+def _block_fp8_gemv_fused():
+    """Lazily resolve the native E4M3 block-scaled decode kernel."""
+    global _BLOCK_FP8_GEMV_FUSED
+    if _BLOCK_FP8_GEMV_FUSED is None:
+        try:
+            from .ops import block_scaled_gemv
+
+            _BLOCK_FP8_GEMV_FUSED = block_scaled_gemv
+        except Exception:
+            _BLOCK_FP8_GEMV_FUSED = False
+    return _BLOCK_FP8_GEMV_FUSED or None
+
+
+_BLOCK_FP8_GEMV_FUSED = None
+
+
+def _block_fp8_grouped_gemv_fused():
+    """Lazily resolve the public grouped block-FP8 decode operation."""
+    global _BLOCK_FP8_GROUPED_GEMV_FUSED
+    if _BLOCK_FP8_GROUPED_GEMV_FUSED is None:
+        try:
+            from .ops import block_scaled_grouped_gemv
+
+            _BLOCK_FP8_GROUPED_GEMV_FUSED = block_scaled_grouped_gemv
+        except Exception:
+            _BLOCK_FP8_GROUPED_GEMV_FUSED = False
+    return _BLOCK_FP8_GROUPED_GEMV_FUSED or None
+
+
+_BLOCK_FP8_GROUPED_GEMV_FUSED = None
+
+
 def _glm_rope_qk_fused():
     """Lazily resolve the GLM Q/K RoPE fusion."""
     global _GLM_ROPE_QK_FUSED
@@ -123,10 +155,41 @@ class RopeCache:
     """RoPE cos/sin 预计算（交错布局，[T, rope_dim//2]）。"""
 
     def __init__(self, rope_dim: int, theta: float, max_len: int = 8192):
-        inv = 1.0 / (theta ** (torch.arange(0, rope_dim, 2, dtype=torch.float32) / rope_dim))
-        freqs = torch.outer(torch.arange(max_len, dtype=torch.float32), inv)
-        self.cos = freqs.cos()
-        self.sin = freqs.sin()
+        self.rope_dim = int(rope_dim)
+        self.theta = float(theta)
+        self.cos, self.sin = self._build(int(max_len))
+
+    def _build(self, max_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+        inv = 1.0 / (
+            self.theta
+            ** (
+                torch.arange(
+                    0,
+                    self.rope_dim,
+                    2,
+                    dtype=torch.float32,
+                )
+                / self.rope_dim
+            )
+        )
+        freqs = torch.outer(
+            torch.arange(max_len, dtype=torch.float32),
+            inv,
+        )
+        return freqs.cos(), freqs.sin()
+
+    def ensure_length(self, required: int) -> bool:
+        """按需扩展 RoPE 表；返回地址是否发生变化。"""
+
+        required = int(required)
+        if required <= self.cos.shape[0]:
+            return False
+        device = self.cos.device
+        capacity = max(required, self.cos.shape[0] * 2)
+        cos, sin = self._build(capacity)
+        self.cos = cos.to(device)
+        self.sin = sin.to(device)
+        return True
 
     def apply(self, q: torch.Tensor, k: torch.Tensor, pos0: int):
         """q: [H, T, D]；k: [1, T, D] → HF apply_rotary_pos_emb_interleave 的 cat 布局。"""
@@ -336,6 +399,110 @@ class BlockFP8Weight:
     def nbytes(self) -> int:
         return self.q.numel() + self.s.numel() * 4
 
+    @property
+    def dtype(self) -> torch.dtype:
+        """Logical compute dtype exposed to generic linear dispatch."""
+        return torch.bfloat16
+
+    @property
+    def device(self) -> torch.device:
+        return self.q.device
+
+    def to(
+        self,
+        device=None,
+        dtype: torch.dtype | None = None,
+        non_blocking: bool = False,
+    ):
+        """Move the compact FP8 payload, or explicitly materialize a dtype.
+
+        A device-only transfer keeps the one-byte weights and FP32 block
+        scales compact.  Supplying a floating dtype is an explicit request
+        used only by a few very small metadata/norm tensors.
+        """
+        if isinstance(device, torch.dtype):
+            dtype = device
+            device = self.q.device
+        if dtype is not None and dtype != torch.uint8:
+            target = self.q.device if device is None else device
+            return self.dequant_rows(0, self.q.shape[0], dtype).to(
+                target,
+                non_blocking=non_blocking,
+            )
+        target = self.q.device if device is None else device
+        return BlockFP8Weight(
+            self.q.to(target, non_blocking=non_blocking),
+            self.s.to(target, non_blocking=non_blocking),
+            self.cols,
+            self.block,
+        )
+
+    def row_slice(self, start: int, stop: int):
+        """Return an aligned compact output-row slice.
+
+        Block-FP8 scales restart every ``block`` rows.  Non-aligned starts
+        cannot be represented by the current public CUDA kernel and are
+        therefore materialized as a small BF16 shard by TP helpers.
+        """
+        if start < 0 or stop < start or stop > self.shape[0]:
+            raise IndexError((start, stop))
+        if start % self.block:
+            raise ValueError("BlockFP8 row slice start must be block-aligned")
+        scale_start = start // self.block
+        scale_stop = (stop + self.block - 1) // self.block
+        return BlockFP8Weight(
+            self.q[start:stop].clone(
+                memory_format=torch.contiguous_format
+            ),
+            self.s[scale_start:scale_stop].clone(
+                memory_format=torch.contiguous_format
+            ),
+            self.cols,
+            self.block,
+        )
+
+    def row_view(self, start: int, stop: int):
+        """Return an aligned zero-copy compact output-row view.
+
+        This is for grouped linear operators which consume the result
+        immediately while the parent weight remains alive.  Unlike
+        :meth:`row_slice`, it neither duplicates FP8 payload bytes nor
+        materializes a floating-point matrix.
+        """
+        if start < 0 or stop < start or stop > self.shape[0]:
+            raise IndexError((start, stop))
+        if start % self.block:
+            raise ValueError("BlockFP8 row view start must be block-aligned")
+        scale_start = start // self.block
+        scale_stop = (stop + self.block - 1) // self.block
+        return BlockFP8Weight(
+            self.q[start:stop],
+            self.s[scale_start:scale_stop],
+            self.cols,
+            self.block,
+        )
+
+    def column_slice(self, start: int, stop: int):
+        """Return an aligned compact input-column slice."""
+        if start < 0 or stop < start or stop > self.cols:
+            raise IndexError((start, stop))
+        if start % self.block:
+            raise ValueError(
+                "BlockFP8 column slice start must be block-aligned"
+            )
+        scale_start = start // self.block
+        scale_stop = (stop + self.block - 1) // self.block
+        return BlockFP8Weight(
+            self.q[:, start:stop].clone(
+                memory_format=torch.contiguous_format
+            ),
+            self.s[:, scale_start:scale_stop].clone(
+                memory_format=torch.contiguous_format
+            ),
+            stop - start,
+            self.block,
+        )
+
     def dequant_rows(
         self,
         r0: int,
@@ -408,6 +575,25 @@ class BlockFP8Weight:
         x: torch.Tensor,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if (
+            x.dim() == 2
+            and x.shape == (1, self.cols)
+            and x.dtype in (torch.float32, torch.bfloat16)
+            and self.q.dtype == torch.uint8
+            and self.s.dtype == torch.float32
+            and self.block == 128
+        ):
+            fn = _block_fp8_gemv_fused()
+            if fn is not None:
+                fused = fn(
+                    x,
+                    self.q,
+                    self.s,
+                    block_size=self.block,
+                    output=output,
+                )
+                if fused is not None:
+                    return fused
         result = self.matmul_T(x)
         if output is not None:
             output.copy_(result)
@@ -416,6 +602,134 @@ class BlockFP8Weight:
 
     def row(self, r: int) -> torch.Tensor:
         return self.dequant_rows(r, r + 1).squeeze(0)
+
+
+class ProjectionGroup:
+    """A logical row-concatenation which keeps each projection compact.
+
+    Separate source tensors have independent 128-row FP8 scale origins.  A
+    physical ``torch.cat`` would either duplicate them as BF16 or corrupt the
+    scale layout at a non-aligned boundary.  This public wrapper selects one
+    registered grouped GEMV when available and otherwise concatenates only
+    the token-sized outputs.
+    """
+
+    __slots__ = ("weights", "cols", "_grouped_meta")
+
+    def __init__(self, weights):
+        values = tuple(weights)
+        if not values:
+            raise ValueError("ProjectionGroup requires at least one weight")
+        cols = int(values[0].shape[1])
+        if any(len(value.shape) != 2 or int(value.shape[1]) != cols
+               for value in values):
+            raise ValueError("ProjectionGroup column widths must match")
+        self.weights = values
+        self.cols = cols
+        self._grouped_meta = {}
+
+    @property
+    def shape(self) -> torch.Size:
+        return torch.Size(
+            [sum(int(value.shape[0]) for value in self.weights), self.cols]
+        )
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return torch.bfloat16
+
+    @property
+    def nbytes(self) -> int:
+        return sum(
+            int(value.nbytes)
+            if hasattr(value, "nbytes")
+            else value.numel() * value.element_size()
+            for value in self.weights
+        )
+
+    def to(self, device, non_blocking: bool = False) -> "ProjectionGroup":
+        return ProjectionGroup(
+            value.to(device, non_blocking=non_blocking)
+            for value in self.weights
+        )
+
+    def matmul_T_decode_fused(
+        self,
+        x: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if (
+            len(self.weights) > 1
+            and x.dim() == 2
+            and x.shape == (1, self.cols)
+            and x.dtype in (torch.float32, torch.bfloat16)
+            and all(
+                isinstance(weight, BlockFP8Weight)
+                and weight.block == 128
+                and weight.cols == self.cols
+                and weight.q.device == x.device
+                and weight.s.device == x.device
+                and weight.q.is_contiguous()
+                and weight.s.is_contiguous()
+                for weight in self.weights
+            )
+        ):
+            fn = _block_fp8_grouped_gemv_fused()
+            if fn is not None:
+                device_key = (x.device.type, int(x.device.index or 0))
+                metadata = self._grouped_meta.get(device_key)
+                if metadata is None:
+                    rows = [int(weight.shape[0]) for weight in self.weights]
+                    offsets = [0]
+                    for count in rows:
+                        offsets.append(offsets[-1] + count)
+                    metadata = (
+                        torch.tensor(
+                            [weight.q.data_ptr() for weight in self.weights],
+                            dtype=torch.int64,
+                            device=x.device,
+                        ),
+                        torch.tensor(
+                            [weight.s.data_ptr() for weight in self.weights],
+                            dtype=torch.int64,
+                            device=x.device,
+                        ),
+                        torch.tensor(
+                            offsets,
+                            dtype=torch.int32,
+                            device=x.device,
+                        ),
+                        offsets[-1],
+                    )
+                    self._grouped_meta[device_key] = metadata
+                fused = fn(
+                    x,
+                    metadata[0],
+                    metadata[1],
+                    metadata[2],
+                    total_rows=metadata[3],
+                    cols=self.cols,
+                    block_size=128,
+                    output=output,
+                )
+                if fused is not None:
+                    return fused
+        outputs = []
+        for weight in self.weights:
+            if isinstance(weight, BlockFP8Weight):
+                outputs.append(weight.matmul_T_decode_fused(x))
+            else:
+                outputs.append(
+                    torch.nn.functional.linear(
+                        x.to(weight.dtype),
+                        weight,
+                    ).float()
+                )
+        result = torch.cat(outputs, dim=-1)
+        if output is not None:
+            output.copy_(result)
+            return output
+        return result
 
 
 class VQWeight:

@@ -190,8 +190,8 @@ fused SSM/GDN kernels, GLM DSA/sparse MLA, DeepSeek-V4 compression/indexer/
 sparse-attention/HC kernels, and a Qwen3.5 full/linear hybrid CausalLM
 prefill/decode/generation runtime are available. Ordinary mixed-format QKV and
 FFN projection groups execute in one heterogeneous Metal dispatch.
-TPQ-I4G64 and TPQ-X/W/V/VV packed kernels (with legacy CCCP label
-compatibility) plus the Kimi-K3 KDA/MLA,
+TPQ-I4G64, TPQ-X/W/V/VV, and three-projection TPQ-P kernels with p8-p16
+indices (with legacy CCCP label compatibility) plus the Kimi-K3 KDA/MLA,
 Attention-Residual,
 SiTU MoE, cache, and generation graph are also wired. DeepSeek-V4 now has
 native MFQ loading, compressed/local/indexer caches, mmap-backed bounded expert

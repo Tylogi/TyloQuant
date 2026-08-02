@@ -7,6 +7,27 @@ import os
 
 import torch
 
+from ..kernels import BlockFP8Weight, ProjectionGroup
+
+
+def _linear_weight_device(weight) -> torch.device:
+    if isinstance(weight, ProjectionGroup):
+        devices = {_linear_weight_device(item) for item in weight.weights}
+        if len(devices) != 1:
+            raise ValueError("projection group weights must share a device")
+        return devices.pop()
+    return weight.device
+
+
+def _is_bf16_linear(weight) -> bool:
+    return (
+        isinstance(weight, (BlockFP8Weight, ProjectionGroup))
+        or (
+            isinstance(weight, torch.Tensor)
+            and weight.dtype == torch.bfloat16
+        )
+    )
+
 
 @dataclass(frozen=True)
 class FixedMoEPreludeSpec:
@@ -29,7 +50,8 @@ class _FixedMoEPreludeLayer:
     gate_weight: torch.Tensor
     correction: torch.Tensor
     available: torch.Tensor
-    down_weight: torch.Tensor
+    down_weight: object
+    down_workspace: torch.Tensor | None
     route_buffers: tuple[
         torch.Tensor,
         torch.Tensor,
@@ -67,7 +89,7 @@ class FixedMoEPrelude:
         gate_weight: torch.Tensor,
         correction: torch.Tensor,
         available: torch.Tensor,
-        down_weight: torch.Tensor,
+        down_weight,
         route_buffers: tuple[
             torch.Tensor,
             torch.Tensor,
@@ -94,8 +116,8 @@ class FixedMoEPrelude:
             or available.device != device
             or available.dtype != torch.bool
             or available.numel() != spec.expert_count
-            or down_weight.device != device
-            or down_weight.dtype != torch.bfloat16
+            or _linear_weight_device(down_weight) != device
+            or not _is_bf16_linear(down_weight)
             or down_weight.shape
             != (spec.routed_hidden_size, spec.hidden_size)
             or logits.device != device
@@ -113,12 +135,26 @@ class FixedMoEPrelude:
         ):
             raise ValueError("fixed MoE prelude tensor layout mismatch")
         with torch.cuda.device(device):
+            down_workspace = (
+                torch.empty(
+                    1,
+                    spec.routed_hidden_size,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                if isinstance(
+                    down_weight,
+                    (BlockFP8Weight, ProjectionGroup),
+                )
+                else None
+            )
             self.layers[int(layer)] = _FixedMoEPreludeLayer(
                 source=source,
                 gate_weight=gate_weight,
                 correction=correction,
                 available=available,
                 down_weight=down_weight,
+                down_workspace=down_workspace,
                 route_buffers=route_buffers,
                 latent=latent,
                 stream=torch.cuda.Stream(device=device),
@@ -126,7 +162,7 @@ class FixedMoEPrelude:
             )
 
     def _execute(self, state: _FixedMoEPreludeLayer) -> None:
-        from .api import linear_route_topk
+        from .api import linear, linear_route_topk
 
         route = linear_route_topk(
             state.source,
@@ -145,11 +181,19 @@ class FixedMoEPrelude:
             raise RuntimeError(
                 "fixed MoE prelude requires a registered fused router"
             )
-        torch.mm(
-            state.source,
-            state.down_weight.t(),
-            out=state.latent,
-        )
+        if state.down_workspace is None:
+            torch.mm(
+                state.source,
+                state.down_weight.t(),
+                out=state.latent,
+            )
+        else:
+            linear(
+                state.source,
+                state.down_weight,
+                output=state.down_workspace,
+            )
+            state.latent.copy_(state.down_workspace)
 
     def capture(self) -> None:
         for state in self.layers.values():

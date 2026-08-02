@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import torch
 
 from .model import GLMModel
+from .presets import load_manifest as _load_tpq_manifest
 
 DEFAULT_EOS = [154820, 154827, 154829]
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -78,9 +79,8 @@ def _make_model(
     vram_cache_gb: float,
     tp_size: int = 1,
 ):
-    """按 cccp.json 的 config 字段分派架构：DSV4（含 hc_mult/compress_ratios）或 GLM。"""
-    with open(os.path.join(model_dir, "cccp.json"), "r", encoding="utf-8") as f:
-        manifest = json.load(f)
+    """按 TPQ 清单字段分派 Kimi、DeepSeek-V4 或 GLM。"""
+    _root, manifest = _load_tpq_manifest(model_dir)
     cfg = manifest["config"]
     if (
         manifest.get("model_family") == "kimi_k3"
@@ -97,11 +97,18 @@ def _make_model(
             tp_size=tp_size,
         ), "kimi_k3"
     if "hc_mult" in cfg or "compress_ratios" in cfg:
-        if tp_size != 1:
-            raise ValueError("--tp currently supports GLM only")
+        projection_vq = bool(
+            manifest.get("quant", {}).get("method") == "projection-vq"
+            and manifest.get("quant", {}).get("projection_layouts")
+        )
+        if tp_size != 1 and not projection_vq:
+            raise ValueError(
+                "--tp > 1 requires a projection-VQ DeepSeek-V4 archive"
+            )
         from .dsv4model import DSV4TPQModel
         return DSV4TPQModel(model_dir, cache_gb=cache_gb, max_ctx=max_ctx,
-                             device=device, vram_cache_gb=vram_cache_gb), "dsv4"
+                             device=device, vram_cache_gb=vram_cache_gb,
+                             tp_size=tp_size), "dsv4"
     return GLMModel(model_dir, cache_gb=cache_gb, max_ctx=max_ctx,
                     device=device, vram_cache_gb=vram_cache_gb,
                     tp_size=tp_size), "glm"
@@ -115,8 +122,7 @@ def _dense_need_gb(model_dir: str, arch_hint: str, kv_gb: float) -> float:
     清单驱动使得任意档位产物（S/M/L）与任意显卡（16GB 起）都能正确自适应。"""
     fallback = (8.2 if arch_hint == "dsv4" else 13.5) + kv_gb
     try:
-        with open(os.path.join(model_dir, "cccp.json"), "r", encoding="utf-8") as f:
-            man = json.load(f)
+        _root, man = _load_tpq_manifest(model_dir)
         cfg = man["config"]
         if arch_hint == "kimi_k3":
             audit_name = man.get("dense_audit_file")
@@ -221,6 +227,41 @@ def _safe_expert_budget(*, limit_bytes: int, allocated_bytes: int,
     return max(int(min_bytes), min(int(requested_bytes), room))
 
 
+def _dense_file_paths(
+    model_dir: str,
+    manifest: dict,
+) -> tuple[str, ...]:
+    """Resolve manifest-declared Dense files without opening tensor bodies."""
+    files = manifest.get("dense_files")
+    if files is None:
+        files = [manifest.get("dense_file", "dense.safetensors")]
+    dense_root = str(
+        (manifest.get("nonexpert") or {}).get("path", "dense")
+    ).strip("/\\")
+    resolved = []
+    for filename in files:
+        value = str(filename).replace("/", os.sep)
+        direct = os.path.join(model_dir, value)
+        nested = os.path.join(model_dir, dense_root, value)
+        resolved.append(direct if os.path.exists(direct) else nested)
+    return tuple(os.path.abspath(path) for path in resolved)
+
+
+def _trim_process_heap() -> None:
+    """Return large transient Dense read buffers to the host OS when possible."""
+    if os.name != "posix":
+        return
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None)
+        malloc_trim = getattr(libc, "malloc_trim", None)
+        if malloc_trim is not None:
+            malloc_trim(0)
+    except (OSError, TypeError):
+        pass
+
+
 class Engine:
     """GLM-5.2-CCCP 的生成引擎（CPU / CUDA，内存显存自动适配）。
 
@@ -242,6 +283,7 @@ class Engine:
         device: str = "cpu",
         vram_cache_gb: float | None = None,
         tp_size: int = 1,
+        dense_residency: str = "auto",
     ):
         import psutil
         t0 = time.time()
@@ -249,26 +291,52 @@ class Engine:
         if tp_size <= 0:
             raise ValueError("tp_size must be positive")
         self.tp_size = int(tp_size)
+        dense_residency = str(dense_residency).strip().lower()
+        if dense_residency not in {"auto", "gpu"}:
+            raise ValueError("dense_residency must be 'auto' or 'gpu'")
+        if dense_residency == "gpu" and device != "cuda":
+            raise ValueError("dense_residency='gpu' requires device='cuda'")
+        self.dense_residency = {
+            "requested": dense_residency,
+            "actual": "host",
+            "host_mirror_bytes": 0,
+        }
         ram_mirror = None
         self._vram_limit_bytes = 0
         self._vram_runtime_reserve_gb = 0.0
-        # 架构判定（先读一次 cccp.json，供 RAM/VRAM 开销与模型分派共用）
+        # 架构判定（先读一次 TPQ 清单，供 RAM/VRAM 开销与模型分派共用）
         arch_hint = "glm"
-        cccp_j = os.path.join(model_dir, "cccp.json")
-        if os.path.exists(cccp_j):
-            with open(cccp_j, "r", encoding="utf-8") as _f:
-                _manifest = json.load(_f)
-                _cfg = _manifest["config"]
-                if (
-                    _manifest.get("model_family") == "kimi_k3"
-                    or (
-                        "kda_layers" in _cfg
-                        and "routed_hidden" in _cfg
-                    )
-                ):
-                    arch_hint = "kimi_k3"
-                elif "hc_mult" in _cfg or "compress_ratios" in _cfg:
-                    arch_hint = "dsv4"
+        _manifest: dict = {}
+        try:
+            _root, _manifest = _load_tpq_manifest(model_dir)
+        except (OSError, ValueError, KeyError, TypeError):
+            _manifest = {}
+        if _manifest:
+            _cfg = _manifest["config"]
+            if (
+                _manifest.get("model_family") == "kimi_k3"
+                or (
+                    "kda_layers" in _cfg
+                    and "routed_hidden" in _cfg
+                )
+            ):
+                arch_hint = "kimi_k3"
+            elif "hc_mult" in _cfg or "compress_ratios" in _cfg:
+                arch_hint = "dsv4"
+        # Tokenizer 是运行时硬依赖，必须在数百 GiB 权重加载之前验证并初始化。
+        # 旧顺序在模型完整 preload 后才 import ``tokenizers``，一旦 Python
+        # 环境缺包，会白白消耗数分钟加载时间和大量磁盘读。Kimi 继续使用其
+        # 自身 tokenizer 适配，GLM/DeepSeek 使用标准 tokenizer.json。
+        if arch_hint == "kimi_k3":
+            from .kimi_tokenizer import KimiTokenizer
+
+            prepared_tokenizer = KimiTokenizer(model_dir)
+        else:
+            from tokenizers import Tokenizer
+
+            prepared_tokenizer = Tokenizer.from_file(
+                os.path.join(model_dir, "tokenizer.json")
+            )
         # RAM 开销按架构：DSV4 的 KV 为环形窗+压缩槽（≈0.2GB 与上下文长度几乎无关），
         # f32 常驻 = head 2.1GB；GLM KV f16 ≈5MB/token、f32 常驻 4.5GB
         if arch_hint == "dsv4":
@@ -294,6 +362,10 @@ class Engine:
         auto_vram = vram_cache_gb
         if device == "cuda":
             if not torch.cuda.is_available():
+                if dense_residency == "gpu":
+                    raise RuntimeError(
+                        "Dense 要求 GPU 常驻，但当前 CUDA 不可用"
+                    )
                 print("[tpq] 无 CUDA，回退 CPU 模式", flush=True)
                 dev = "cpu"
             else:
@@ -304,22 +376,67 @@ class Engine:
                     )
                 if (
                     self.tp_size > 1
-                    and arch_hint == "glm"
+                    and (
+                        arch_hint == "glm"
+                        or (
+                            arch_hint == "kimi_k3"
+                            and os.environ.get(
+                                "TPQ_KIMI_TP_PACKED_HYBRID",
+                                "0",
+                            )
+                            != "0"
+                        )
+                    )
                     and os.environ.get("TPQ_RAM_MIRROR", "0") == "1"
                 ):
                     from .ramcache import ModelRamMirror
 
-                    ram_mirror = ModelRamMirror(model_dir)
+                    ram_mirror = ModelRamMirror(
+                        model_dir,
+                        exclude_paths=_dense_file_paths(
+                            model_dir,
+                            _manifest,
+                        ),
+                    )
                     ram_mirror.start()
-                free_v = torch.cuda.mem_get_info()[0] / 2**30
-                total_v = torch.cuda.get_device_properties(0).total_memory / 2**30
+                visible_ranks = min(
+                    max(1, self.tp_size),
+                    torch.cuda.device_count(),
+                )
+                rank_memory = []
+                for rank in range(visible_ranks):
+                    with torch.cuda.device(rank):
+                        rank_memory.append(torch.cuda.mem_get_info(rank))
+                free_v = min(item[0] for item in rank_memory) / 2**30
+                total_v = min(item[1] for item in rank_memory) / 2**30
                 # 共享显存防线：WDDM 下分配顶满物理显存会被驱动换页到内存（共享显存，
                 # 带宽掉到 PCIe 级，整轮同步卡顿）。给本进程分配器设硬上限 =
                 # 空闲显存 − 系统预留，宁可 OOM 报错也绝不触发共享显存换页。
                 reserve_gb = float(os.environ.get("TPQ_VRAM_RESERVE_GB", "1.25"))
-                frac = max(0.10, min(0.99, (free_v - reserve_gb) / total_v))
-                torch.cuda.set_per_process_memory_fraction(frac, 0)
-                self._vram_limit_bytes = int(frac * total_v * 2**30)
+                fractions = []
+                limits = []
+                for rank, (free_bytes, total_bytes) in enumerate(
+                    rank_memory
+                ):
+                    fraction = max(
+                        0.10,
+                        min(
+                            0.99,
+                            (
+                                free_bytes
+                                - int(reserve_gb * 2**30)
+                            )
+                            / total_bytes,
+                        ),
+                    )
+                    torch.cuda.set_per_process_memory_fraction(
+                        fraction,
+                        rank,
+                    )
+                    fractions.append(fraction)
+                    limits.append(int(fraction * total_bytes))
+                frac = min(fractions)
+                self._vram_limit_bytes = min(limits)
                 if not quiet:
                     print(f"[tpq] 显存适配: 物理 {total_v:.1f}GB / 空闲 {free_v:.1f}GB → "
                           f"本进程上限 {frac * total_v:.1f}GB（预留 {reserve_gb:.2f}GB 防共享显存）",
@@ -333,6 +450,12 @@ class Engine:
                 #（GLM 专家本就走 RAM/磁盘流式，显存缓存价值低）
                 margin = 3.0 if arch_hint == "glm" else 1.0
                 if free_v < dense_need + margin:
+                    if dense_residency == "gpu":
+                        raise RuntimeError(
+                            "Dense 要求 GPU 常驻，但空闲显存 "
+                            f"{free_v:.1f}GB < 需要 "
+                            f"{dense_need + margin:.1f}GB"
+                        )
                     print(f"[tpq] 显存不足（空闲 {free_v:.1f}GB < 需要 {dense_need + margin:.1f}GB），"
                           f"回退 CPU 模式", flush=True)
                     dev = "cpu"
@@ -406,6 +529,51 @@ class Engine:
         full_resident = bool(
             getattr(getattr(self.model, "pool", None), "full_resident", False)
         )
+        if dev == "cuda":
+            released, dense_paths = (
+                self.model.store.release_dense_ram_blob()
+            )
+            mirror_released = (
+                ram_mirror.release_paths(dense_paths)
+                if ram_mirror is not None
+                else 0
+            )
+            import gc as _dense_gc
+
+            _dense_gc.collect()
+            _trim_process_heap()
+            self.dense_residency = {
+                "requested": dense_residency,
+                "actual": "gpu-only",
+                "host_mirror_bytes": max(released, mirror_released),
+            }
+            if not quiet:
+                print(
+                    "[tpq] Dense 驻留：GPU-only；"
+                    "CPU 仅保留启动期流式缓冲，运行期源镜像已释放"
+                    + (
+                        f" {max(released, mirror_released) / 2**30:.2f}GB"
+                        if max(released, mirror_released)
+                        else ""
+                    ),
+                    flush=True,
+                )
+        if (
+            ram_mirror is not None
+            and getattr(
+                getattr(self.model, "pool", None),
+                "retains_store_ram_blobs",
+                False,
+            )
+        ):
+            self._ram_mirror = ram_mirror
+            ram_mirror = None
+            if not quiet:
+                print(
+                    "[tpq] RAM 镜像直接作为 packed 专家常驻存储；"
+                    "不建立第二份专家索引",
+                    flush=True,
+                )
         if ram_mirror is not None:
             self.model.store.release_ram_blobs()
             released = ram_mirror.release()
@@ -434,21 +602,15 @@ class Engine:
             and os.environ.get("TPQ_VRAM_WATCH", "1") != "0"
         ):
             _pool = getattr(self.model, "pool", None)
-            if _pool is not None:
+            if (
+                _pool is not None
+                and getattr(_pool, "supports_vram_watch", True)
+            ):
                 from .vramwatch import VramWatch
                 self._vwatch = VramWatch(
                     _pool, max_budget=_pool.budget, quiet=quiet)
                 self._vwatch.start()
-        if arch_hint == "kimi_k3":
-            from .kimi_tokenizer import KimiTokenizer
-
-            self.tok = KimiTokenizer(model_dir)
-        else:
-            from tokenizers import Tokenizer
-
-            self.tok = Tokenizer.from_file(
-                os.path.join(model_dir, "tokenizer.json")
-            )
+        self.tok = prepared_tokenizer
         gc = os.path.join(model_dir, "generation_config.json")
         self.eos = DEFAULT_EOS
         if os.path.exists(gc):
@@ -484,6 +646,7 @@ class Engine:
         if (
             pool is None
             or getattr(pool, "full_resident", False)
+            or getattr(pool, "manages_per_rank_budget", False)
             or not self._vram_limit_bytes
         ):
             return None
@@ -674,6 +837,59 @@ class Engine:
         for token in suffix[:-1]:
             self.model.forward_hidden([token])
         return self.model.forward(suffix[-1:])
+
+    def _prepare_glm_prompt(self, ids: list[int]) -> torch.Tensor:
+        """Prepare GLM/Kimi prompts and expose exact-prefix reuse metrics.
+
+        Kimi's KDA state is recurrent rather than a conventional prefix-cache
+        object.  When the previous canonical token sequence is an exact
+        prefix, retaining the live model state and evaluating only the suffix
+        is the cache reuse operation.  Report that path through the same
+        ``KVPrefillStats`` contract used by DSV4 without changing its math.
+        """
+        started = time.perf_counter()
+        live = getattr(self, "_cache_ids", None)
+        lcp = _token_lcp(live, ids)
+        skip = self._kv_prefix_len(ids)
+        if skip:
+            mode = "exact-prefix"
+            reason = (
+                "live-kda-kv-prefix"
+                if getattr(self, "arch", "glm") == "kimi_k3"
+                else "live-prefix"
+            )
+        else:
+            mode = "full-prefill"
+            reason = (
+                "no-live-prefix"
+                if live
+                else "empty-cache"
+            )
+            self.reset()
+        logits = self._prefill_glm_suffix(ids, skip)
+        stats = KVPrefillStats(
+            mode=mode,
+            reason=reason,
+            prompt_tokens=len(ids),
+            baseline_tokens=skip,
+            lcp_tokens=lcp,
+            replay_tokens=0,
+            suffix_tokens=len(ids) - skip,
+            processed_tokens=len(ids) - skip,
+            prefill_ms=(time.perf_counter() - started) * 1000.0,
+            snapshot_bytes=0,
+        )
+        self.last_kv_stats = stats
+        if not getattr(self, "quiet", False):
+            print(
+                f"[KV] mode={stats.mode} reason={stats.reason} "
+                f"baseline={stats.baseline_tokens} "
+                f"lcp={stats.lcp_tokens} "
+                f"suffix={stats.suffix_tokens} "
+                f"prefill={stats.prefill_ms:.1f}ms",
+                flush=True,
+            )
+        return logits
 
     @torch.no_grad()
     def _dsv4_prefill_suffix(self, ids: list[int], skip: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1317,12 +1533,7 @@ class Engine:
                 kv_baseline_len,
             )
         else:
-            skip = self._kv_prefix_len(ids)
-            if skip:
-                logits = self._prefill_glm_suffix(ids, skip)
-            else:
-                self.reset()
-                logits = self._prefill_glm_suffix(ids, 0)
+            logits = self._prepare_glm_prompt(ids)
         device_window = self._glm_device_greedy_window(
             temp=temp,
             rep_penalty=rep_penalty,

@@ -1,10 +1,10 @@
 {
   "schema": 1,
   "architecture": "glm",
-  "display_name": "GLM MoE（CCCP）",
+  "display_name": "GLM MoE（TPQ）",
   "supports_parallel": true,
   "tested_tp_min": 2,
-  "tested_tp_max": 7,
+  "tested_tp_max": 8,
   "defaults": {
     "device": "cuda",
     "max_ctx": 4096,
@@ -19,6 +19,8 @@
   },
   "environment": {
     "TPQ_LATENT_KV": "1",
+    "TPQ_FLASHINFER_MLA": "1",
+    "TPQ_ATTENTION_GRAPH": "1",
     "TPQ_VRAM_WATCH": "1",
     "TPQ_CPU_THREADS": "auto",
     "TPQ_CPU_NUMA": "auto",
@@ -26,7 +28,9 @@
     "TPQ_RAM_RESERVE_GB": "32",
     "TPQ_RESIDENT_RESERVE_GB": "32",
     "TPQ_VRAM_RESERVE_GB": "3",
-    "TPQ_VRAM_RUNTIME_GB": "3"
+    "TPQ_VRAM_RUNTIME_GB": "3",
+    "TPQ_ROPE_INITIAL_CTX": "32768",
+    "TPQ_LATENT_KV_GRAPH_INITIAL": "32768"
   },
   "profiles": {
     "ram": {
@@ -40,7 +44,7 @@
       "description": "多卡全显存专家并行；显存不足时引擎回退 RAM 模式",
       "tp": 2,
       "environment": {
-        "TPQ_RAM_MIRROR": "1"
+        "TPQ_RAM_MIRROR": "0"
       }
     }
   }

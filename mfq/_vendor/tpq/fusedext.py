@@ -213,14 +213,17 @@ if _EXT is not None:
         route_ids: torch.Tensor,
         weights: torch.Tensor,
         metadata: torch.Tensor,
+        activation: str,
         beta: float,
         linear_beta: float,
+        limit: float,
         hidden_workspace: torch.Tensor,
         out_workspace: torch.Tensor,
         result: torch.Tensor,
         p12_count: int = 0,
+        projection_layout_tag: int = 0,
     ) -> torch.Tensor | None:
-        """Run Top-16 SiTU directly from packed indices.
+        """Run Top-K gated MLP directly from packed indices.
 
         ``p12_count`` is the grouped p12 prefix length.  ``-1`` scans an
         ungrouped route vector on device, which avoids a GPU→CPU sync in the
@@ -238,21 +241,63 @@ if _EXT is not None:
             or weights.shape != route_ids.shape
             or metadata.dtype != torch.long
             or metadata.ndim != 2
-            or metadata.shape[0] != 10
+            or metadata.shape[0] not in (10, 15)
             or not -1 <= p12_count <= route_ids.numel()
+            or projection_layout_tag not in (0, 1, 2)
         ):
+            return None
+        activation_name = str(activation).strip().lower()
+        activation_kind = {
+            "situ": 0,
+            "silu": 1,
+            "swiglu": 1,
+        }.get(activation_name)
+        if activation_kind is None:
             return None
         return _EXT.packed_moe_topk(
             value.contiguous(),
             route_ids.contiguous(),
             weights.contiguous(),
             metadata.contiguous(),
+            int(activation_kind),
             float(beta),
             float(linear_beta),
+            float(limit),
             hidden_workspace,
             out_workspace,
             result,
             int(p12_count),
+            int(projection_layout_tag),
+        )
+
+    def packed_route_slots_fused(
+        route_ids: torch.Tensor,
+        directory: torch.Tensor,
+        selected: torch.Tensor,
+        hit_mask: torch.Tensor,
+    ) -> bool:
+        """Gather dynamic Top-K expert slot metadata entirely on CUDA."""
+        if (
+            not route_ids.is_cuda
+            or route_ids.dtype != torch.long
+            or route_ids.ndim != 1
+            or not 0 < route_ids.numel() <= 16
+            or directory.dtype != torch.long
+            or directory.ndim != 2
+            or selected.dtype != torch.long
+            or selected.shape
+            != (directory.shape[1], route_ids.numel())
+            or hit_mask.dtype != torch.bool
+            or hit_mask.shape != route_ids.shape
+        ):
+            return False
+        return bool(
+            _EXT.packed_route_slots_out(
+                route_ids.contiguous(),
+                directory.contiguous(),
+                selected,
+                hit_mask,
+            )
         )
 
     def moe_mlp_slots_fused(
@@ -595,7 +640,7 @@ if _EXT is not None:
                        hc: int, iters: int, eps: float):
         """融合 HC sinkhorn：mixes [..., 24] f32 CUDA + hc==4 时返回
         (pre, post, comb)（单次 kernel 完成 softmax + 全部归一化迭代）；
-        不满足条件返回 None（调用方回退 CCCP/dsv4.hc_split 的 torch 循环）。
+        不满足条件返回 None（调用方回退 tpq.dsv4.hc_split 的 torch 循环）。
         数值与 torch 版同序 fp32 计算，差异在 1e-7 量级。"""
         if (hc != 4 or not mixes.is_cuda or mixes.dtype != torch.float32
                 or scale.dtype != torch.float32):
@@ -714,6 +759,7 @@ if _EXT is not None:
         activation: str,
         beta: float,
         linear_beta: float | None,
+        limit: float = 0.0,
         output: torch.Tensor | None = None,
     ):
         normalized = activation.strip().lower()
@@ -731,6 +777,7 @@ if _EXT is not None:
             1 if normalized == "situ" else 0,
             float(beta),
             -1.0 if linear_beta is None else float(linear_beta),
+            float(limit),
             output,
         )
 
@@ -761,7 +808,7 @@ if _EXT is not None:
                     inverse: bool = False):
         """融合 RoPE（交错对）：仅 decode 单相位场景——x [..., rd] f32 CUDA 且
         cos/sin 各 rd/2 个元素（全部行同相位）时生效，否则 None（回退 torch）。
-        数值与 CCCP.dsv4.rope_apply 逐项一致。"""
+        数值与 tpq.dsv4.rope_apply 逐项一致。"""
         if (not x.is_cuda or x.dtype != torch.float32
                 or cos.numel() * 2 != x.shape[-1] or sin.numel() * 2 != x.shape[-1]):
             return None
@@ -849,7 +896,14 @@ if _EXT is not None:
         heads: int,
         plan_info,
     ) -> bool:
-        """Build the exact batch-1 MLA schedule directly on the GPU."""
+        """Build the supported batch-1 MLA schedule directly on the GPU.
+
+        FlashInfer may change the concrete planner layout with the head count.
+        The public TPQ kernel implements FlashInfer's one- and two-CTA
+        cluster layouts.  A future layout is not an error: callers must fall
+        back to FlashInfer's own planner instead of aborting model execution.
+        """
+        normalized_plan = [int(value) for value in plan_info]
         if (
             os.environ.get(
                 "TPQ_FLASHINFER_GPU_PLAN",
@@ -864,6 +918,8 @@ if _EXT is not None:
             or length <= 0
             or page_size <= 0
             or heads <= 0
+            or len(normalized_plan) != 18
+            or normalized_plan[0] not in (1, 2)
         ):
             return False
         return bool(
@@ -875,7 +931,7 @@ if _EXT is not None:
                 int(length),
                 int(page_size),
                 int(heads),
-                [int(value) for value in plan_info],
+                normalized_plan,
             )
         )
 
@@ -980,8 +1036,13 @@ if _EXT is not None:
         norm: torch.Tensor,
         iters: int,
         eps: float,
+        output_buffers: tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ] | None = None,
     ):
-        """BF16 HC pre + RMSNorm；FP32 reduction、BF16 状态输出。"""
+        """BF16 HC pre + RMSNorm；可复用调用方固定输出缓冲。"""
         if (
             not x.is_cuda
             or x.dtype != torch.bfloat16
@@ -996,9 +1057,21 @@ if _EXT is not None:
             or base.dtype != torch.float32
         ):
             return None
-        y, post, comb = _EXT.dsv4_hc_pre_norm(
-            x, fn, scale, base, norm, int(iters), float(eps)
-        )
+        if output_buffers is None:
+            y, post, comb = _EXT.dsv4_hc_pre_norm(
+                x, fn, scale, base, norm, int(iters), float(eps)
+            )
+        else:
+            y, post, comb = _EXT.dsv4_hc_pre_norm_out(
+                x,
+                fn,
+                scale,
+                base,
+                norm,
+                *output_buffers,
+                int(iters),
+                float(eps),
+            )
         lead = x.shape[:-2]
         return (
             y.view(*lead, x.shape[-1]),
@@ -1011,6 +1084,7 @@ if _EXT is not None:
         residual: torch.Tensor,
         post: torch.Tensor,
         comb: torch.Tensor,
+        output: torch.Tensor | None = None,
     ):
         """BF16 HC post residual mix; accumulation stays FP32."""
         if (
@@ -1022,12 +1096,47 @@ if _EXT is not None:
             or residual.shape[-2] != 4
         ):
             return None
-        return _EXT.dsv4_hc_post(
+        arguments = (
             out.contiguous(),
             residual.contiguous(),
             post.contiguous(),
             comb.contiguous(),
         )
+        if output is None:
+            return _EXT.dsv4_hc_post(*arguments)
+        return _EXT.dsv4_hc_post_out(*arguments, output)
+
+    def dsv4_hc_post_moe_fused(
+        routed: torch.Tensor,
+        shared: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ):
+        """Fuse BF16 routed/shared merge with Hyper-Connection post."""
+        if (
+            not routed.is_cuda
+            or routed.dtype != torch.float32
+            or shared.dtype != torch.bfloat16
+            or residual.dtype != torch.bfloat16
+            or post.dtype != torch.bfloat16
+            or comb.dtype != torch.bfloat16
+            or residual.shape[-2] != 4
+            or routed.numel() * 4 != residual.numel()
+            or shared.numel() * 4 != residual.numel()
+        ):
+            return None
+        arguments = (
+            routed.contiguous(),
+            shared.contiguous(),
+            residual.contiguous(),
+            post.contiguous(),
+            comb.contiguous(),
+        )
+        if output is None:
+            return _EXT.dsv4_hc_post_moe(*arguments)
+        return _EXT.dsv4_hc_post_moe_out(*arguments, output)
 
     def dsv4_route_post_fused(
         scores: torch.Tensor,
@@ -1294,6 +1403,47 @@ if _EXT is not None:
             x.contiguous(),
             weights.contiguous(),
             scales.contiguous(),
+            int(cols),
+            int(block_size),
+            output,
+        )
+
+    def block_fp8_grouped_gemv_fused(
+        x: torch.Tensor,
+        weight_ptrs: torch.Tensor,
+        scale_ptrs: torch.Tensor,
+        row_offsets: torch.Tensor,
+        total_rows: int,
+        cols: int,
+        block_size: int,
+        output: torch.Tensor | None = None,
+    ):
+        """Run several compact block-FP8 projections in one CUDA launch."""
+        if (
+            os.environ.get("TPQ_FP8_GROUPED_GEMV", "1") == "0"
+            or not x.is_cuda
+            or x.dtype not in (torch.float32, torch.bfloat16)
+            or x.ndim != 2
+            or x.shape != (1, cols)
+            or weight_ptrs.dtype != torch.int64
+            or scale_ptrs.dtype != torch.int64
+            or row_offsets.dtype != torch.int32
+            or not weight_ptrs.is_cuda
+            or not scale_ptrs.is_cuda
+            or not row_offsets.is_cuda
+            or weight_ptrs.ndim != 1
+            or scale_ptrs.shape != weight_ptrs.shape
+            or row_offsets.shape != (weight_ptrs.numel() + 1,)
+            or total_rows <= 0
+            or block_size != 128
+        ):
+            return None
+        return _EXT.block_fp8_grouped_gemv_f32(
+            x.contiguous(),
+            weight_ptrs.contiguous(),
+            scale_ptrs.contiguous(),
+            row_offsets.contiguous(),
+            int(total_rows),
             int(cols),
             int(block_size),
             output,
@@ -2052,6 +2202,9 @@ else:
     def packed_moe_topk_fused(*args, **kwargs):
         return None
 
+    def packed_route_slots_fused(*args, **kwargs):
+        return False
+
     def moe_mlp_slots_fused(
         x_rows,
         gu_indices,
@@ -2145,10 +2298,35 @@ else:
     def dsv4_hc_pre_fused(x, fn, scale, base, iters, eps):
         return None
 
-    def dsv4_hc_pre_norm_fused(x, fn, scale, base, norm, iters, eps):
+    def dsv4_hc_pre_norm_fused(
+        x,
+        fn,
+        scale,
+        base,
+        norm,
+        iters,
+        eps,
+        output_buffers=None,
+    ):
         return None
 
-    def dsv4_hc_post_fused(out, residual, post, comb):
+    def dsv4_hc_post_fused(
+        out,
+        residual,
+        post,
+        comb,
+        output=None,
+    ):
+        return None
+
+    def dsv4_hc_post_moe_fused(
+        routed,
+        shared,
+        residual,
+        post,
+        comb,
+        output=None,
+    ):
         return None
 
     def dsv4_route_post_fused(
@@ -2185,6 +2363,9 @@ else:
         return None
 
     def block_fp8_gemv_fused(*args, **kwargs):
+        return None
+
+    def block_fp8_grouped_gemv_fused(*args, **kwargs):
         return None
 
     def int4_glm_qb_split_fused(*args, **kwargs):

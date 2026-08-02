@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "architecture": "dsv4",
-  "display_name": "DeepSeek-V4 / DSpark（CCCP）",
+  "display_name": "DeepSeek-V4 / DSpark（TPQ）",
   "supports_parallel": false,
   "defaults": {
     "device": "cuda",

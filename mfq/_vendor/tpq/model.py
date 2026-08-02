@@ -24,7 +24,7 @@ from .kernels import (
     rmsnorm,
 )
 from .precision import compute_dtype
-from .store import CCCPStore, ExpertPool
+from .store import TPQStore, ExpertPool
 
 
 def _linear(
@@ -142,7 +142,7 @@ class GLMModel:
         tp_size: int = 1,
     ):
         self.device = torch.device(device)
-        self.store = CCCPStore(root)
+        self.store = TPQStore(root)
         self.cfg = self.store.cfg
         from .ops import ModelOperatorConfig
 
@@ -179,8 +179,18 @@ class GLMModel:
                 ram_gb=cache_gb - pin_gb if gpu else 0.0,
                 pin_gb=pin_gb,
             )
-        self.rope = RopeCache(self.cfg["qk_rope_head_dim"], self.cfg["rope_theta"],
-                              max_len=max_ctx + 8)
+        # 逻辑上下文可很大，但把整张 RoPE 表一次性放入每层 Graph 的公共
+        # 工作集会拖慢短/中上下文。先固定 32K 地址窗口，跨界时成倍扩展并
+        # 统一重捕获；这不改变 max_ctx 的逻辑准入上限。
+        rope_initial = max(
+            2048,
+            int(os.environ.get("TPQ_ROPE_INITIAL_CTX", "32768")),
+        )
+        self.rope = RopeCache(
+            self.cfg["qk_rope_head_dim"],
+            self.cfg["rope_theta"],
+            max_len=min(max_ctx + 8, rope_initial + 8),
+        )
         if gpu:
             self.rope.cos = self.rope.cos.to(self.device)
             self.rope.sin = self.rope.sin.to(self.device)
@@ -429,11 +439,10 @@ class GLMModel:
         if current is not None and current[0].shape[0] >= required:
             return current
         if current is not None and self._attention_graphs:
-            self._attention_graphs.clear()
-        initial = max(
-            1,
-            int(os.environ.get("TPQ_LATENT_KV_INITIAL", "2048")),
-        )
+            # 每层 Graph 只捕获自己的 KV 地址。某一层扩容不应使其余
+            # 77 层全部失效，否则长上下文边界会退化为逐 token 重捕获。
+            self._attention_graphs.pop(layer, None)
+        initial = self._latent_initial_capacity(layer)
         old_capacity = 0 if current is None else current[0].shape[0]
         capacity = min(
             self.max_ctx,
@@ -461,6 +470,57 @@ class GLMModel:
         result = (ckv, krot)
         self._latent_buffers[layer] = result
         return result
+
+    def _ensure_latent_capacity(self, required: int) -> None:
+        """Safely grow fixed-address latent KV buffers before decode."""
+
+        if self.device.type != "cuda" or not self.latent_kv:
+            return
+        growing = [
+            layer
+            for layer, current in enumerate(self._latent_buffers)
+            if current is not None and current[0].shape[0] < required
+        ]
+        if not growing:
+            return
+        captured_growth = any(
+            layer in self._attention_graphs
+            for layer in growing
+        )
+        if captured_growth:
+            # Graph replay is asynchronous.  Finish all users of the old
+            # addresses before replacing any captured KV buffer.
+            torch.cuda.synchronize(self.device)
+            self._attention_graphs.clear()
+        for layer in growing:
+            ckv, krot = self._latent_buffer(layer, required)
+            used = min(self.pos, required)
+            self.kv[layer] = (ckv[:used], krot[:used])
+
+    def _latent_initial_capacity(self, layer: int) -> int:
+        """Choose a stable KV address window for graph-backed decode."""
+        configured = os.environ.get("TPQ_LATENT_KV_INITIAL")
+        if configured is not None:
+            return max(1, min(self.max_ctx, int(configured)))
+        graph_resident = (
+            self.device.type == "cuda"
+            and layer >= 4
+            and os.environ.get("TPQ_ATTENTION_GRAPH", "1") != "0"
+            and self.expert_parallel is not None
+            and getattr(self.pool, "full_resident", False)
+        )
+        if not graph_resident:
+            return min(self.max_ctx, 2048)
+        graph_window = max(
+            2048,
+            int(
+                os.environ.get(
+                    "TPQ_LATENT_KV_GRAPH_INITIAL",
+                    "32768",
+                )
+            ),
+        )
+        return min(self.max_ctx, graph_window)
 
     def _prepare_flashinfer_mla_decode(self, end: int):
         """单 token 规划一次 FlashInfer MLA，随后 78 层复用。"""
@@ -522,6 +582,17 @@ class GLMModel:
             )
             return None
         return runner
+
+    def _ensure_rope_capacity(self, required: int) -> None:
+        if required <= self.rope.cos.shape[0]:
+            return
+        if self._attention_graphs and self.device.type == "cuda":
+            # Captured kernels may still read the old cos/sin addresses.
+            torch.cuda.synchronize(self.device)
+        if self.rope.ensure_length(min(self.max_ctx + 8, required + 8)):
+            # Attention Graph 直接捕获 cos/sin 地址；扩容后只需在边界
+            # 重捕获一次，不能继续重放旧地址。
+            self._attention_graphs.clear()
 
     # ---- 基本件 ----
     def _decode_workspace(
@@ -1483,6 +1554,8 @@ class GLMModel:
             raise RuntimeError(f"上下文超限（{self.pos + len(ids)} > {self.max_ctx}），"
                                f"请 /clear 或调大 --max-ctx")
         pos0 = self.pos
+        self._ensure_rope_capacity(pos0 + len(ids))
+        self._ensure_latent_capacity(pos0 + len(ids))
         if len(ids) == 1 and self._decode_position is not None:
             self._decode_position.fill_(pos0)
         self._flashinfer_mla_state = (

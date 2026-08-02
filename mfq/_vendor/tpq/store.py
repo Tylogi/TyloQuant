@@ -3,7 +3,9 @@
 目录结构（GLM-5.2-cccp/）：
     cccp.json               清单（config + quant 元信息 + 文件映射）
     dense.safetensors       dense 权重：int4 对（name + name.qs）或 f32 小张量
-    experts.L*.safetensors  每层专家：cb.gu.{v,w,x}/cb.dn.{v,w,x} 码本 +
+    vq-codebooks.safetensors 可选专家级跨层码本池和U8分配表
+    experts.L*.safetensors  每层专家：共享 cb.gu.{档}，或按连续专家分组的
+                            cb.gu.{档}.g{组号} 码本（down 同理）+
                             e{N}.gu{档}(z)/e{N}.dn{档}(z) 索引（z = zlib 熵编码）
 
 为什么不用 safetensors 的 mmap：Windows 下长进程累积大量映射（75 个专家文件 +
@@ -76,16 +78,98 @@ def _unpack_u14(packed: torch.Tensor, count: int) -> torch.Tensor:
     return out[:count]
 
 
+def _unpack_u10(packed: torch.Tensor, count: int) -> torch.Tensor:
+    """Restore four little-endian 10-bit indices from every five bytes."""
+    raw = packed.view(torch.uint8).reshape(-1).to(torch.int64)
+    if raw.numel() % 5:
+        raise ValueError(
+            f"u10 packed bytes must be a multiple of 5, got {raw.numel()}"
+        )
+    group = raw.reshape(-1, 5)
+    word = torch.zeros(group.shape[0], dtype=torch.int64)
+    for byte in range(5):
+        word |= group[:, byte] << (8 * byte)
+    out = torch.empty(group.shape[0] * 4, dtype=torch.uint16)
+    for index in range(4):
+        out[index::4] = (
+            (word >> (10 * index)) & 0x3FF
+        ).to(torch.uint16)
+    if count > out.numel():
+        raise ValueError(
+            f"u10 index count is too small: need={count}, "
+            f"have={out.numel()}"
+        )
+    return out[:count]
+
+
+def _unpack_u9(packed: torch.Tensor, count: int) -> torch.Tensor:
+    """Restore consecutive little-endian 9-bit indices.
+
+    Nine-bit archives pack eight indices into nine bytes.  The vectorized
+    reference path is used by correctness tests and CPU fallbacks; resident
+    inference keeps the payload packed and extracts indices inside the native
+    CPU/CUDA kernels.
+    """
+    raw = packed.view(torch.uint8).reshape(-1).to(torch.int32)
+    if raw.numel() * 8 != int(count) * 9:
+        raise ValueError(
+            "u9 packed bytes do not match the requested index count: "
+            f"bytes={raw.numel()}, count={count}"
+        )
+    bit_offsets = torch.arange(count, dtype=torch.int64) * 9
+    byte_offsets = torch.bitwise_right_shift(bit_offsets, 3)
+    shifts = torch.bitwise_and(bit_offsets, 7).to(torch.int32)
+    # Every valid final index ends at or before the final payload bit.  One
+    # zero pad byte keeps the two-byte gather branch-free at the boundary.
+    padded = torch.cat((raw, torch.zeros(1, dtype=torch.int32)))
+    words = (
+        padded[byte_offsets]
+        | torch.bitwise_left_shift(padded[byte_offsets + 1], 8)
+    )
+    return torch.bitwise_and(
+        torch.bitwise_right_shift(words, shifts),
+        0x1FF,
+    ).to(torch.uint16)
+
+
+def _unpack_odd_width(
+    packed: torch.Tensor,
+    count: int,
+    bits: int,
+) -> torch.Tensor:
+    """Reference unpacker for row-aligned p11/p13/p15 payloads."""
+    if bits not in (11, 13, 15):
+        raise ValueError(f"unsupported odd packed width {bits}")
+    raw = packed.view(torch.uint8).reshape(-1).to(torch.int64)
+    if raw.numel() * 8 != int(count) * bits:
+        raise ValueError(
+            f"u{bits} packed bytes do not match index count: "
+            f"bytes={raw.numel()}, count={count}"
+        )
+    bit_offsets = torch.arange(count, dtype=torch.int64) * bits
+    byte_offsets = torch.bitwise_right_shift(bit_offsets, 3)
+    shifts = torch.bitwise_and(bit_offsets, 7)
+    # At most 22 bits are needed. Two pad bytes keep the final gather valid;
+    # production CPU/CUDA paths read only the bytes actually required.
+    padded = torch.cat((raw, torch.zeros(2, dtype=torch.int64)))
+    words = (
+        padded[byte_offsets]
+        | torch.bitwise_left_shift(padded[byte_offsets + 1], 8)
+        | torch.bitwise_left_shift(padded[byte_offsets + 2], 16)
+    )
+    return torch.bitwise_and(
+        torch.bitwise_right_shift(words, shifts),
+        (1 << bits) - 1,
+    ).to(torch.uint16)
+
+
 def _stored_index_bits(num_bytes: int, count: int) -> int:
     """Infer standard CCCP index width from exact payload length."""
-    if num_bytes == count:
-        return 8
-    if num_bytes * 2 == count * 3:
-        return 12
-    if num_bytes * 4 == count * 7:
-        return 14
-    if num_bytes == count * 2:
-        return 16
+    total_bits = int(num_bytes) * 8
+    if count > 0 and total_bits % int(count) == 0:
+        bits = total_bits // int(count)
+        if 8 <= bits <= 16:
+            return bits
     raise ValueError(
         f"cannot infer VQ index width: bytes={num_bytes}, count={count}"
     )
@@ -158,7 +242,14 @@ class PinnedStage:
     拷贝流尾部事件（前序 DMA 按流序天然先行）。索引张量为 u8（槽也按 u8 存取）。
     """
 
-    def __init__(self, device, n_slots: int = 32, slot_mb: int = 12):
+    def __init__(
+        self,
+        device,
+        n_slots: int = 32,
+        slot_mb: int = 12,
+        *,
+        measure: bool = False,
+    ):
         self.device = device
         self.stream = torch.cuda.Stream(device=device)
         self.slots = [torch.empty(slot_mb * 2**20, dtype=torch.uint8, pin_memory=True)
@@ -169,6 +260,9 @@ class PinnedStage:
         # staging slots. Keep sources alive until their DMA event completes so
         # this remains safe for callers that do not otherwise retain the tensor.
         self._pinned_inflight: list[tuple[torch.cuda.Event, list[torch.Tensor]]] = []
+        self._measure = bool(measure)
+        self._timing: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self.transfer_seconds = 0.0
         self.i = 0
 
     def upload_batch(self, pairs: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
@@ -190,6 +284,12 @@ class PinnedStage:
             item for item in self._pinned_inflight if not item[0].query()
         ]
         self.stream.wait_stream(torch.cuda.current_stream(self.device))
+        timing_start = None
+        timing_end = None
+        if self._measure:
+            timing_start = torch.cuda.Event(enable_timing=True)
+            timing_end = torch.cuda.Event(enable_timing=True)
+            timing_start.record(self.stream)
         views = []
         direct_sources = []
         for src, dst in pairs:
@@ -212,7 +312,12 @@ class PinnedStage:
             ev.record(self.stream)
             views.append((src, dst, slot[:nb]))
             self.i = (self.i + 1) % len(self.slots)
-        self.last.record(self.stream)
+        if timing_end is None:
+            self.last.record(self.stream)
+        else:
+            timing_end.record(self.stream)
+            self.last = timing_end
+            self._timing.append((timing_start, timing_end))
         if direct_sources:
             done = torch.cuda.Event()
             done.record(self.stream)
@@ -240,11 +345,44 @@ class PinnedStage:
         """让当前流等待拷贝流尾部（本批全部 DMA 完成）。"""
         torch.cuda.current_stream().wait_event(self.last)
 
+    def collect_timing(self, *, synchronize: bool = False) -> float:
+        """回收已经完成的 copy-stream 批次，返回累计 staging+H2D 秒数。
+
+        计时事件包住逐段 host staging 形成的提交间隙和实际 H2D，因此用于解释
+        端到端关键路径；默认不阻塞，正式结果收集前可在外部全卡同步后调用。
+        """
+        if not self._measure:
+            return 0.0
+        if synchronize and self._timing:
+            self._timing[-1][1].synchronize()
+        completed = 0
+        for _start, end in self._timing:
+            if not end.query():
+                break
+            completed += 1
+        for start, end in self._timing[:completed]:
+            self.transfer_seconds += start.elapsed_time(end) / 1000.0
+        if completed:
+            del self._timing[:completed]
+        return self.transfer_seconds
+
 
 _DTYPES = {
     "U8": torch.uint8, "I8": torch.int8, "I16": torch.int16, "I32": torch.int32,
     "I64": torch.int64, "F16": torch.float16, "F32": torch.float32,
-    "F64": torch.float64, "BF16": torch.bfloat16,
+    "F64": torch.float64, "BF16": torch.bfloat16, "BOOL": torch.bool,
+    "U16": torch.uint16, "U32": torch.uint32, "U64": torch.uint64,
+    # Safetensors has no raw-byte view mode.  These entries intentionally
+    # expose FP8 payload bytes; the logical Dense decoder applies its scale.
+    "F8_E4M3": torch.uint8, "F8_E5M2": torch.uint8,
+    "F8_E8M0": torch.uint8,
+}
+_DTYPE_NBYTES = {
+    "BOOL": 1, "U8": 1, "I8": 1, "F8_E4M3": 1, "F8_E5M2": 1,
+    "F8_E8M0": 1,
+    "I16": 2, "U16": 2, "F16": 2, "BF16": 2,
+    "I32": 4, "U32": 4, "F32": 4,
+    "I64": 8, "U64": 8, "F64": 8,
 }
 
 
@@ -270,8 +408,14 @@ class SafeFile:
         self.meta = {k: v for k, v in header.items() if k != "__metadata__"}
         self.data_start = 8 + n
 
-    def release_ram_blob(self) -> None:
+    def release_ram_blob(self) -> int:
+        released = 0 if self._ram_blob is None else len(self._ram_blob)
         self._ram_blob = None
+        return released
+
+    @property
+    def ram_blob_nbytes(self) -> int:
+        return 0 if self._ram_blob is None else len(self._ram_blob)
 
     def close(self) -> None:
         with self._handles_lock:
@@ -356,6 +500,7 @@ class SafeTensorCollection:
         self._handles: dict[str, SafeFile] = {}
         self._locations: dict[str, str] = {}
         self._nbytes: dict[str, int] = {}
+        self._logical_entries: dict[str, dict] = {}
 
         if audit_file is not None and os.path.exists(audit_file):
             with open(audit_file, "r", encoding="utf-8") as handle:
@@ -374,6 +519,19 @@ class SafeTensorCollection:
                     self._nbytes[name] = int(
                         item["tensor_audit"][name].get("bytes", 0)
                     )
+            if audit.get("format") == "kimi-k3-dense-audit-v1":
+                for name, entry in audit.get("entries", {}).items():
+                    filename = aliases.get(
+                        str(entry["shard"]).replace("\\", "/")
+                    )
+                    if filename is None:
+                        raise ValueError(
+                            f"dense audit shard is not in manifest: "
+                            f"{entry['shard']}"
+                        )
+                    self._locations[name] = filename
+                    self._nbytes[name] = int(entry["stored_bytes"])
+                    self._logical_entries[name] = entry
 
         # Developer fixtures and legacy manifests may not have an audit.
         # Reading headers is cheap and does not touch tensor payloads.
@@ -404,7 +562,120 @@ class SafeTensorCollection:
         return self._locations.keys()
 
     def get_tensor(self, name: str) -> torch.Tensor:
-        return self._handle(self._locations[name]).get_tensor(name)
+        handle = self._handle(self._locations[name])
+        entry = self._logical_entries.get(name)
+        if entry is None:
+            return handle.get_tensor(name)
+        kind = entry["storage_kind"]
+        if kind == "source":
+            return handle.get_tensor(entry.get("value_key") or name)
+        if kind == "fp8":
+            return self._decode_fp8(handle, entry)
+        if kind == "d3-p12":
+            return self._decode_d3(handle, entry)
+        raise ValueError(f"unknown dense storage kind {kind!r}")
+
+    def get_block_fp8(self, name: str) -> BlockFP8Weight | None:
+        """Return audited block-FP8 without expanding it to BF16."""
+        entry = self._logical_entries.get(name)
+        if entry is None:
+            # Source-exact archives retain an original E4M3 weight plus E8M0
+            # exponent scale pair.  Recognize that pair from the safetensors
+            # header and keep the weight byte-packed in RAM/VRAM.
+            shard = self._locations.get(name)
+            if shard is None or not name.endswith(".weight"):
+                return None
+            handle = self._handle(shard)
+            info = handle.meta[name]
+            scale_name = name[: -len("weight")] + "scale"
+            if (
+                info.get("dtype") != "F8_E4M3"
+                or self._locations.get(scale_name) != shard
+                or handle.meta[scale_name].get("dtype") != "F8_E8M0"
+            ):
+                return None
+            raw = handle.get_tensor(name)
+            scales = handle.get_tensor(scale_name)
+            rows, columns = (int(value) for value in info["shape"])
+        else:
+            if entry["storage_kind"] != "fp8":
+                return None
+            handle = self._handle(self._locations[name])
+            raw = handle.get_tensor(entry["value_key"])
+            scales = handle.get_tensor(entry["scale_key"])
+            rows, columns = (
+                int(value) for value in entry["logical_shape"]
+            )
+        if scales.dtype == torch.uint8:
+            scales = torch.pow(2.0, scales.float() - 127.0)
+        if raw.shape != (rows, columns):
+            raise ValueError(
+                f"dense FP8 payload shape mismatch for {name!r}: "
+                f"{tuple(raw.shape)} != {(rows, columns)}"
+            )
+        return BlockFP8Weight(raw, scales, columns, 128)
+
+    @staticmethod
+    def _logical_dtype(entry: dict) -> torch.dtype:
+        dtype = str(entry["source_dtype"])
+        if dtype not in _DTYPES:
+            raise ValueError(f"unsupported dense logical dtype {dtype!r}")
+        return _DTYPES[dtype]
+
+    @classmethod
+    def _decode_fp8(cls, handle: SafeFile, entry: dict) -> torch.Tensor:
+        raw = handle.get_tensor(entry["value_key"])
+        scales = handle.get_tensor(entry["scale_key"])
+        if scales.dtype == torch.uint8:
+            scales = torch.pow(2.0, scales.float() - 127.0)
+        rows, columns = (int(value) for value in entry["logical_shape"])
+        block = 128
+        dtype = cls._logical_dtype(entry)
+        output = torch.empty((rows, columns), dtype=dtype)
+        for row_start in range(0, rows, block):
+            row_stop = min(row_start + block, rows)
+            for column_start in range(0, columns, block):
+                column_stop = min(column_start + block, columns)
+                values = (
+                    raw[row_start:row_stop, column_start:column_stop]
+                    .view(torch.float8_e4m3fn)
+                    .to(dtype)
+                )
+                output[
+                    row_start:row_stop, column_start:column_stop
+                ] = values * scales[
+                    row_start // block,
+                    column_start // block,
+                ].to(dtype)
+        return output
+
+    @classmethod
+    def _decode_d3(cls, handle: SafeFile, entry: dict) -> torch.Tensor:
+        packed = handle.get_tensor(entry["index_key"]).to(torch.int32)
+        if packed.ndim != 2 or packed.shape[1] % 3:
+            raise ValueError(
+                f"invalid row-aligned p12 dense tensor "
+                f"{entry['logical_name']!r}"
+            )
+        rows, columns = (int(value) for value in entry["logical_shape"])
+        groups = columns // 4
+        tri = packed.reshape(rows, -1, 3)
+        indices = torch.empty(
+            (rows, tri.shape[1] * 2), dtype=torch.int64
+        )
+        indices[:, 0::2] = (
+            tri[:, :, 0] | ((tri[:, :, 1] & 0x0F) << 8)
+        )
+        indices[:, 1::2] = (
+            (tri[:, :, 1] >> 4) | (tri[:, :, 2] << 4)
+        )
+        indices = indices[:, :groups]
+        codebook = handle.get_tensor(entry["codebook_key"]).float()
+        return (
+            codebook[indices.reshape(-1)]
+            .reshape(rows, columns)
+            .to(cls._logical_dtype(entry))
+        )
 
     def nbytes(self, name: str) -> int:
         """Return payload bytes without reading the tensor body."""
@@ -415,9 +686,34 @@ class SafeTensorCollection:
         info = self._handle(shard).meta[name]
         return int(info["data_offsets"][1]) - int(info["data_offsets"][0])
 
-    def release_ram_blob(self) -> None:
+    def resident_nbytes(self, name: str) -> int:
+        """Bytes occupied after decoding one logical Dense tensor."""
+        entry = self._logical_entries.get(name)
+        if entry is None:
+            return self.nbytes(name)
+        if entry["storage_kind"] == "fp8":
+            # The public BlockFP8 operator consumes the audited uint8 payload
+            # and FP32 scales directly on CPU/CUDA.  Placement must therefore
+            # budget the compact resident representation, not a hypothetical
+            # BF16 expansion.
+            return self.nbytes(name)
+        elements = 1
+        for value in entry["logical_shape"]:
+            elements *= int(value)
+        return elements * _DTYPE_NBYTES[str(entry["source_dtype"])]
+
+    def ram_blob_paths(self) -> tuple[str, ...]:
+        return tuple(
+            handle.path
+            for handle in self._handles.values()
+            if handle.ram_blob_nbytes
+        )
+
+    def release_ram_blob(self) -> int:
+        released = 0
         for handle in self._handles.values():
-            handle.release_ram_blob()
+            released += handle.release_ram_blob()
+        return released
 
     def close(self) -> None:
         for handle in self._handles.values():
@@ -425,13 +721,19 @@ class SafeTensorCollection:
 
 
 class Manifest:
-    """cccp.json 解析。"""
+    """Read a canonical ``tpq.json`` or a legacy ``cccp.json`` manifest."""
 
     def __init__(self, root: str):
-        with open(os.path.join(root, "cccp.json"), "r", encoding="utf-8") as f:
+        canonical = os.path.join(root, "tpq.json")
+        legacy = os.path.join(root, "cccp.json")
+        manifest_path = canonical if os.path.isfile(canonical) else legacy
+        with open(manifest_path, "r", encoding="utf-8") as f:
             m = json.load(f)
-        assert m["format"] == "cccp-1", f"不支持的格式: {m['format']}"
+        if m.get("format") not in {"tpq-1", "cccp-1"}:
+            raise ValueError(f"不支持的 TPQ 格式: {m.get('format')!r}")
         self.root = root
+        self.manifest_path = manifest_path
+        self.format = str(m["format"])
         self.config = m["config"]
         self.quant = m["quant"]
         self.model_family = str(m.get("model_family", ""))
@@ -463,17 +765,180 @@ class Manifest:
         self.dense_audit_file = (
             os.path.join(root, audit_name) if audit_name else None
         )
-        self.expert_files = {int(l): v for l, v in m["expert_files"].items()}
-        self.expert_audit_files = {
-            int(layer): value
-            for layer, value in m.get("expert_audit_files", {}).items()
+        routed = m.get("routed_experts") or {}
+        self.routed_layers = int(routed.get("layers", 0) or 0)
+        self.routed_experts_per_layer = int(
+            routed.get("experts_per_layer", 0) or 0
+        )
+        self.no_expert_drop = bool(routed.get("no_expert_drop", False))
+        routed_layers = routed.get("layer_files") or {}
+        # Projection-VQ has two released manifest layouts.  Kimi archives
+        # describe each layer under ``routed_experts.layer_files`` while the
+        # compact DeepSeek-V4 archive keeps the same information in the
+        # top-level ``expert_files``/``layer_audit`` maps and stores the
+        # projection descriptions in ``quant.layouts``.  Normalize both here
+        # so model and operator code never branch on a model-family name.
+        flat_projection_vq = bool(
+            not routed_layers
+            and m.get("expert_files")
+            and self.quant.get("method") == "projection-vq"
+            and self.quant.get("projection_layouts")
+        )
+        self.projection_vq = bool(
+            (routed_layers and self.quant.get("projection_layouts"))
+            or flat_projection_vq
+        )
+        if self.projection_vq:
+            if flat_projection_vq:
+                layer_audit = m.get("layer_audit") or {}
+                self.expert_files = {
+                    int(layer): str(filename)
+                    for layer, filename in m["expert_files"].items()
+                }
+                self.expert_audit_files = {
+                    int(layer): str(item["audit_path"])
+                    for layer, item in layer_audit.items()
+                    if isinstance(item, dict) and item.get("audit_path")
+                }
+                self.projection_layout_by_layer = {
+                    int(layer): {
+                        str(projection): str(layout_name)
+                        for projection, layout_name in layouts.items()
+                    }
+                    for layer, layouts in self.quant[
+                        "projection_layouts"
+                    ].items()
+                }
+                layout_specs = self.quant.get("layouts") or {}
+                self.routed_layers = len(self.expert_files)
+                self.routed_experts_per_layer = int(
+                    self.config.get("n_experts", 0)
+                )
+                self.no_expert_drop = bool(
+                    self.quant.get("no_expert_drop", False)
+                )
+            else:
+                self.expert_files = {
+                    int(layer): str(item["path"])
+                    for layer, item in routed_layers.items()
+                }
+                self.expert_audit_files = {
+                    int(layer): str(item["audit_path"])
+                    for layer, item in routed_layers.items()
+                }
+                self.projection_layout_by_layer = {
+                    int(layer): {
+                        str(projection): str(layout_name)
+                        for projection, layout_name in item[
+                            "projection_layout"
+                        ].items()
+                    }
+                    for layer, item in routed_layers.items()
+                }
+                layout_specs = self.quant["projection_layouts"]
+            self.vq_dims = {
+                str(name): (
+                    int(item["dim"]),
+                    int(item["size"]),
+                )
+                for name, item in layout_specs.items()
+            }
+            self.projection_layout_specs = {
+                str(name): dict(item)
+                for name, item in layout_specs.items()
+            }
+            self.projection_codebook_group_sizes = {
+                name: int(item["group_size"])
+                for name, item in self.projection_layout_specs.items()
+                if item.get("group_size") is not None
+            }
+            self.projection_codebook_group_counts = {
+                name: int(item["groups"])
+                for name, item in self.projection_layout_specs.items()
+                if item.get("groups") is not None
+            }
+            if any(
+                size <= 0
+                for size in self.projection_codebook_group_sizes.values()
+            ):
+                raise ValueError(
+                    "projection VQ codebook group_size must be positive"
+                )
+            self.index_packing = {
+                str(name): str(packing)
+                for name, packing in self.quant.get(
+                    "index_packing", {}
+                ).items()
+            }
+        else:
+            self.expert_files = {
+                int(l): v for l, v in m["expert_files"].items()
+            }
+            self.expert_audit_files = {
+                int(layer): value
+                for layer, value in m.get(
+                    "expert_audit_files", {}
+                ).items()
+            }
+            self.projection_layout_by_layer = {}
+            self.projection_layout_specs = {}
+            self.projection_codebook_group_sizes = {}
+            self.projection_codebook_group_counts = {}
+            self.index_packing = {}
+            self.vq_dims = {
+                k: tuple(v)
+                for k, v in m["quant"]["vq"].items()
+            }  # 档 -> (dim, k)
+        layout = m["quant"].get("vq_codebook_layout") or {}
+        layout_format = layout.get("format")
+        if layout_format not in (
+            None,
+            "cccp-vq-codebook-layout-v1",
+            "expert-assigned-codebook-v1",
+        ):
+            raise ValueError(f"不支持的 VQ 码本布局: {layout_format}")
+        if (
+            layout_format == "cccp-vq-codebook-layout-v1"
+            and layout.get("assignment") != "contiguous-expert-id"
+        ):
+            raise ValueError(
+                f"不支持的 VQ 码本分配规则: {layout.get('assignment')}"
+            )
+        if (
+            layout_format == "expert-assigned-codebook-v1"
+            and layout.get("assignment")
+            != "per-expert-per-projection"
+        ):
+            raise ValueError(
+                f"不支持的 VQ 码本分配规则: {layout.get('assignment')}"
+            )
+        self.vq_codebook_layout = layout
+        self.vq_codebook_layout_format = layout_format
+        self.vq_codebook_group_sizes = {
+            str(kind): int(size)
+            for kind, size in layout.get("group_size", {}).items()
         }
-        self.vq_dims = {k: tuple(v) for k, v in m["quant"]["vq"].items()}  # 档 -> (dim, k)
+        if any(size <= 0 for size in self.vq_codebook_group_sizes.values()):
+            raise ValueError("VQ 码本 group_size 必须大于 0")
+        self.vq_codebook_file = (
+            m["quant"].get("vq_codebook_file")
+            or layout.get("codebook_file")
+        )
         self.int4_group = m["quant"].get("int4_group", 64)
         self.zlib = m["quant"].get("zlib", False)
         # 每层每专家档位串（'v'/'w'/'x'/'d'=drop），量化/repack 时写入；缺省 = 全保留
-        self.tiers_per_layer = {int(l): s for l, s in
-                                m.get("tiers_per_layer", {}).items()}
+        self.tiers_per_layer = {
+            int(l): s
+            for l, s in m.get("tiers_per_layer", {}).items()
+        }
+        if self.projection_vq:
+            self.tiers_per_layer.update(
+                {
+                    int(layer): str(item.get("tier_string", ""))
+                    for layer, item in routed_layers.items()
+                    if item.get("tier_string")
+                }
+            )
         self._audit_tiers: dict[int, str] = {}
 
     def tier_string(self, layer: int) -> str | None:
@@ -498,9 +963,60 @@ class Manifest:
         self._audit_tiers[layer] = tiers
         return tiers
 
+    def projection_operator_capability(
+        self,
+        layer: int,
+    ) -> dict[str, tuple]:
+        """Return the exact public operator key for one projection-VQ layer."""
+        if not self.projection_vq:
+            return {}
+        formats = {
+            "u8": "p8",
+            "u16": "p16",
+        }
+        formats.update(
+            {f"packed-u{bits}": f"p{bits}" for bits in range(8, 17)}
+        )
+        layouts = self.projection_layout_by_layer[int(layer)]
+        packed_formats = []
+        code_dims = []
+        codebook_sizes = []
+        for projection in ("gate", "up", "down"):
+            layout = layouts[projection]
+            packing = self.index_packing.get(layout)
+            dim, size = self.vq_dims[layout]
+            if packing is None:
+                # A few early projection manifests described the exact
+                # codebook but omitted the redundant packing table entry.
+                # A power-of-two codebook has one unambiguous index width.
+                bits = int(size).bit_length() - 1
+                if size <= 0 or (1 << bits) != int(size):
+                    raise ValueError(
+                        f"L{layer} {projection} cannot infer packed width "
+                        f"from non-power-of-two codebook {layout}"
+                    )
+                packing = (
+                    "u8" if bits == 8
+                    else "u16" if bits == 16
+                    else f"packed-u{bits}"
+                )
+            if packing not in formats:
+                raise ValueError(
+                    f"L{layer} {projection} 缺少公共 packed 格式: "
+                    f"{layout} -> {packing!r}"
+                )
+            packed_formats.append(formats[packing])
+            code_dims.append(int(dim))
+            codebook_sizes.append(int(size))
+        return {
+            "packed_formats": tuple(packed_formats),
+            "code_dims": tuple(code_dims),
+            "codebook_sizes": tuple(codebook_sizes),
+        }
+
 
 class CCCPStore:
-    """dense + 专家文件的 mmap 访问。"""
+    """TPQ dense and expert mmap store (legacy class name)."""
 
     def __init__(self, root: str):
         self.root = root
@@ -516,10 +1032,49 @@ class CCCPStore:
         self._expert_keys: dict[int, set[str]] = {}
         self._expert_open_lock = threading.RLock()
         self._cb_cache: dict[
-            tuple[int, str, int | None],
-            tuple[torch.Tensor, torch.Tensor],
+            tuple[str, str, str], torch.Tensor
         ] = {}
         self._cb_lock = threading.RLock()
+        self._vq_codebook_pool: SafeFile | None = None
+        self._vq_codebook_pool_keys: set[str] = set()
+        self._vq_assignments: dict[str, torch.Tensor] = {}
+        if (
+            self.man.vq_codebook_layout_format
+            == "expert-assigned-codebook-v1"
+        ):
+            pool_name = (
+                self.man.vq_codebook_file
+                or "vq-codebooks.safetensors"
+            )
+            self._vq_codebook_pool = SafeFile(
+                os.path.join(self.root, pool_name)
+            )
+            self._vq_codebook_pool_keys = set(
+                self._vq_codebook_pool.keys()
+            )
+            assignment_keys = self.man.vq_codebook_layout.get(
+                "assignment_keys",
+                {
+                    "gu": "assignment.v.gu",
+                    "down": "assignment.v.down",
+                },
+            )
+            for projection in ("gu", "down"):
+                key = str(assignment_keys[projection])
+                if key not in self._vq_codebook_pool_keys:
+                    raise KeyError(f"多码本池缺少分配表: {key}")
+                assignment = self._vq_codebook_pool.get_tensor(key)
+                if (
+                    assignment.dtype != torch.uint8
+                    or tuple(assignment.shape)
+                    != (92, int(self.cfg["n_experts"]))
+                ):
+                    raise ValueError(
+                        f"多码本分配表形状/类型错误: "
+                        f"{key} {assignment.dtype} "
+                        f"{tuple(assignment.shape)}"
+                    )
+                self._vq_assignments[projection] = assignment
         self._mtp: SafeFile | None = None
         # 可选热度档案（模型目录 profile.json 或 TPQ_PROFILE_JSON）：层 → 按路由
         # 命中降序的专家号，供 ExpertPool 把最热专家永久钉进内存（LRU 对冷专家的
@@ -548,6 +1103,8 @@ class CCCPStore:
         self._dense.close()
         for handle in self._expert_handles.values():
             handle.close()
+        if self._vq_codebook_pool is not None:
+            self._vq_codebook_pool.close()
         if self._mtp is not None:
             self._mtp.close()
 
@@ -556,8 +1113,19 @@ class CCCPStore:
         self._dense.release_ram_blob()
         for handle in self._expert_handles.values():
             handle.release_ram_blob()
+        if self._vq_codebook_pool is not None:
+            self._vq_codebook_pool.release_ram_blob()
         if self._mtp is not None:
             self._mtp.release_ram_blob()
+
+    def release_dense_ram_blob(self) -> tuple[int, tuple[str, ...]]:
+        """Detach only Dense RAM images after CUDA weights become permanent.
+
+        Packed expert views are intentionally untouched: RAM+GPU inference
+        may still use them as the source of asynchronous expert DMA.
+        """
+        paths = self._dense.ram_blob_paths()
+        return self._dense.release_ram_blob(), paths
 
     def get_mtp(self, name: str):
         """MTP dense 权重：attn.* 为 int4 对，router 等小张量 f32 原样。"""
@@ -575,7 +1143,16 @@ class CCCPStore:
 
     def dense_names(self) -> list[str]:
         """全部 dense 权重名（不含 .qs 缩放键）。"""
-        return sorted(n for n in self._dense_keys if not n.endswith(".qs"))
+        return sorted(
+            name
+            for name in self._dense_keys
+            if not name.endswith(".qs")
+            and not (
+                name.endswith(".scale")
+                and name[: -len("scale")] + "weight"
+                in self._dense_keys
+            )
+        )
 
     def get_raw(self, name: str) -> torch.Tensor:
         return self._dense.get_tensor(name)
@@ -583,6 +1160,10 @@ class CCCPStore:
     def dense_nbytes(self, name: str) -> int:
         """Return one dense tensor's stored bytes without reading its payload."""
         return self._dense.nbytes(name)
+
+    def dense_resident_nbytes(self, name: str) -> int:
+        """Return decoded in-memory bytes used by placement planning."""
+        return self._dense.resident_nbytes(name)
 
     def get_dense(self, name: str):
         """返回 f32 张量（小权重）或 Int4Weight（打包大权重）。"""
@@ -592,8 +1173,19 @@ class CCCPStore:
             if self.man.quant.get("dense") == "fp8-native":
                 return BlockFP8Weight(q, s, q.shape[1])
             return Int4Weight(q, s, q.shape[1] * 2, self.man.int4_group)
+        audited_fp8 = self._dense.get_block_fp8(name)
+        if audited_fp8 is not None:
+            return audited_fp8
         value = self._dense.get_tensor(name)
-        if self.man.quant.get("dense") == "source-native-uncompressed":
+        if self.man.dense_audit_file is not None:
+            # Audited mixed Dense formats already declare the exact logical
+            # dtype per tensor. New format names must not fall through to the
+            # legacy unconditional FP32 conversion.
+            return value
+        if self.man.quant.get("dense") in (
+            "source-native-uncompressed",
+            "mixed-source-fp8-d3-p12",
+        ):
             return value
         return value.float()
 
@@ -627,6 +1219,14 @@ class CCCPStore:
         if keys is None:
             self._eh(layer)
             keys = self._expert_keys[layer]
+        if self.man.projection_vq:
+            layouts = self.man.projection_layout_by_layer[layer]
+            if all(
+                f"e{eid}.{projection}.{layouts[projection]}" in keys
+                for projection in ("gate", "up", "down")
+            ):
+                return "projection-vq"
+            return "drop"
         for k in self.man.vq_dims:
             if (
                 f"e{eid}.gu.{k}" in keys
@@ -652,8 +1252,135 @@ class CCCPStore:
         E = self.cfg["n_experts"]
         s = self.man.tier_string(layer)
         if s is not None:
-            return torch.tensor([c != "d" for c in s], dtype=torch.bool)
+            if len(s) != E:
+                raise ValueError(
+                    f"L{layer} tier_string 长度 {len(s)} != n_experts {E}"
+                )
+            return torch.tensor(
+                [c.lower() != "d" for c in s],
+                dtype=torch.bool,
+            )
         return torch.ones(E, dtype=torch.bool)  # 清单无档位串 = 全保留（老产物）
+
+    @staticmethod
+    def _down_codebook_stem(
+        keys: set[str],
+        kind: str,
+    ) -> str:
+        standard = f"cb.down.{kind}"
+        return (
+            standard
+            if any(
+                key == standard or key.startswith(standard + ".")
+                for key in keys
+            )
+            else f"cb.dn.{kind}"
+        )
+
+    def _codebook_reference(
+        self,
+        layer: int,
+        kind: str,
+        eid: int | None,
+        projection: str,
+    ) -> tuple[SafeFile, str, str]:
+        """按专属→专家分配→连续分组→共享解析一个投影的码本。"""
+        if projection not in ("gu", "down"):
+            raise ValueError(projection)
+        self._eh(layer)
+        keys = self._expert_keys[layer]
+        stem = (
+            f"cb.gu.{kind}"
+            if projection == "gu"
+            else self._down_codebook_stem(keys, kind)
+        )
+        if (
+            eid is not None
+            and f"{stem}.e{eid}" in keys
+        ):
+            key = f"{stem}.e{eid}"
+            return (
+                self._expert_handles[layer],
+                key,
+                f"L{layer}.e{eid}",
+            )
+        layout = self.man.vq_codebook_layout
+        if (
+            self.man.vq_codebook_layout_format
+            == "expert-assigned-codebook-v1"
+            and kind == str(layout.get("kind", "v"))
+            and eid is not None
+        ):
+            assignment = self._vq_assignments[projection]
+            row = layer - 1
+            if 0 <= row < assignment.shape[0]:
+                codebook = int(assignment[row, eid])
+                sentinel = int(
+                    layout.get("missing_assignment_sentinel", 255)
+                )
+                if codebook != sentinel:
+                    band_size = int(layout["layer_band_size"])
+                    band = row // band_size
+                    key = (
+                        f"cb.{kind}.band{band:02d}."
+                        f"{projection}.{codebook:03d}"
+                    )
+                    if key not in self._vq_codebook_pool_keys:
+                        raise KeyError(
+                            "专家分配表引用了不存在的码本: "
+                            f"L{layer} e{eid} {projection} -> {key}"
+                        )
+                    assert self._vq_codebook_pool is not None
+                    semantic = f"band{band:02d}.cb{codebook:03d}"
+                    return self._vq_codebook_pool, key, semantic
+                if not bool(layout.get("legacy_fallback", True)):
+                    raise KeyError(
+                        f"L{layer} e{eid} {projection} 无多码本分配"
+                    )
+        group_size = self.man.vq_codebook_group_sizes.get(kind)
+        if group_size is not None and eid is not None:
+            variant = f"g{eid // group_size:03d}"
+            key = f"{stem}.{variant}"
+            if key in keys:
+                return (
+                    self._expert_handles[layer],
+                    key,
+                    f"L{layer}.{variant}",
+                )
+        if stem not in keys:
+            raise KeyError(
+                f"L{layer} e{eid} {projection} 缺少可用码本: {stem}"
+            )
+        return (
+            self._expert_handles[layer],
+            stem,
+            f"L{layer}.shared",
+        )
+
+    def codebook_variants(
+        self,
+        layer: int,
+        kind: str,
+        eid: int | None,
+    ) -> tuple[str, str]:
+        """返回GU/Down稳定语义键，用于RAM/GPU码本缓存。"""
+        gu = self._codebook_reference(
+            layer, kind, eid, "gu"
+        )[2]
+        down = self._codebook_reference(
+            layer, kind, eid, "down"
+        )[2]
+        return gu, down
+
+    def codebook_variant(
+        self,
+        layer: int,
+        kind: str,
+        eid: int | None,
+    ) -> str:
+        """旧调用兼容；仅当GU/Down选择相同时返回一个语义键。"""
+        gu, down = self.codebook_variants(layer, kind, eid)
+        return gu if gu == down else f"{gu}|{down}"
 
     def codebooks(
         self,
@@ -661,33 +1388,97 @@ class CCCPStore:
         kind: str,
         eid: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """返回专家专属码本（若存在），否则回退到层共享码本。"""
-        h = self._eh(layer)
-        keys = self._expert_keys[layer]
-        gu_stem = f"cb.gu.{kind}"
-        down_stem = (
-            f"cb.down.{kind}"
-            if f"cb.down.{kind}" in keys
-            else f"cb.dn.{kind}"
+        """依次选择专家专属、自适应分配、连续分组、层共享码本。"""
+        gu_handle, gu_key, gu_variant = self._codebook_reference(
+            layer, kind, eid, "gu"
         )
-        dedicated = None
-        if (
-            eid is not None
-            and f"{gu_stem}.e{eid}" in keys
-            and f"{down_stem}.e{eid}" in keys
-        ):
-            dedicated = eid
-        key = (layer, kind, dedicated)
+        (
+            down_handle,
+            down_key,
+            down_variant,
+        ) = self._codebook_reference(
+            layer, kind, eid, "down"
+        )
         with self._cb_lock:
-            cb = self._cb_cache.get(key)
-            if cb is None:
-                suffix = f".e{dedicated}" if dedicated is not None else ""
-                cb = (
-                    h.get_tensor(f"{gu_stem}{suffix}").float(),
-                    h.get_tensor(f"{down_stem}{suffix}").float(),
+            gu_cache_key = (gu_handle.path, "gu", gu_key)
+            cb_gu = self._cb_cache.get(gu_cache_key)
+            if cb_gu is None:
+                cb_gu = gu_handle.get_tensor(gu_key).float()
+                self._cb_cache[gu_cache_key] = cb_gu
+            down_cache_key = (
+                down_handle.path,
+                "down",
+                down_key,
+            )
+            cb_down = self._cb_cache.get(down_cache_key)
+            if cb_down is None:
+                cb_down = down_handle.get_tensor(down_key).float()
+                self._cb_cache[down_cache_key] = cb_down
+        return cb_gu, cb_down
+
+    def _projection_codebook_key(
+        self,
+        layer: int,
+        projection: str,
+        eid: int | None,
+    ) -> str:
+        layout = self.man.projection_layout_by_layer[layer][projection]
+        key = f"cb.{projection}.{layout}"
+        group_size = self.man.projection_codebook_group_sizes.get(layout)
+        if group_size is None:
+            return key
+        if eid is None:
+            raise ValueError(
+                f"L{layer} {projection} layout {layout} requires expert_id"
+            )
+        group = int(eid) // group_size
+        groups = self.man.projection_codebook_group_counts.get(layout)
+        if group < 0 or (groups is not None and group >= groups):
+            raise ValueError(
+                f"L{layer} e{eid} {projection} codebook group {group} "
+                f"is outside layout {layout}"
+            )
+        return f"{key}.g{group:03d}"
+
+    def projection_codebooks(
+        self,
+        layer: int,
+        eid: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """读取三投影独立码本，不把 gate/up 强行拼成同一码本。"""
+        if not self.man.projection_vq:
+            raise RuntimeError("当前模型不是三投影 VQ 格式")
+        handle = self._eh(layer)
+        result = []
+        with self._cb_lock:
+            for projection in ("gate", "up", "down"):
+                key = self._projection_codebook_key(
+                    layer,
+                    projection,
+                    eid,
                 )
-                self._cb_cache[key] = cb
-        return cb
+                cache_key = (handle.path, projection, key)
+                codebook = self._cb_cache.get(cache_key)
+                if codebook is None:
+                    codebook = handle.get_tensor(key).float()
+                    self._cb_cache[cache_key] = codebook
+                result.append(codebook)
+        return tuple(result)
+
+    def projection_codebook_variants(
+        self,
+        layer: int,
+        eid: int | None = None,
+    ) -> tuple[str, str, str]:
+        """返回稳定的三投影码本语义键，供 RAM/VRAM 缓存隔离。"""
+        return tuple(
+            f"L{layer}." + self._projection_codebook_key(
+                layer,
+                projection,
+                eid,
+            )[3:]
+            for projection in ("gate", "up", "down")
+        )
 
     def load_expert(self, layer: int, eid: int) -> tuple[VQWeight, VQWeight]:
         """加载一个专家的 (gu, dn) VQ 权重；zlib blob 就地解压。
@@ -721,11 +1512,16 @@ class CCCPStore:
                         rows,
                         cols // dim,
                     )
-                unpacked = (
-                    _unpack_u12(raw, count)
-                    if bits == 12
-                    else _unpack_u14(raw, count)
-                )
+                if bits == 9:
+                    unpacked = _unpack_u9(raw, count)
+                elif bits == 10:
+                    unpacked = _unpack_u10(raw, count)
+                elif bits == 12:
+                    unpacked = _unpack_u12(raw, count)
+                elif bits == 14:
+                    unpacked = _unpack_u14(raw, count)
+                else:
+                    unpacked = _unpack_odd_width(raw, count, bits)
                 return unpacked.reshape(rows, cols // dim)
             p14zkey = f"e{eid}.{tag}{base}p14z"
             p14key = f"e{eid}.{tag}{base}p14"
@@ -762,15 +1558,66 @@ class CCCPStore:
         self,
         layer: int,
         eid: int,
-    ) -> tuple["PackedVQWeight", "PackedVQWeight"]:
-        """Load an expert without expanding 12/14-bit on-disk indices.
+    ) -> tuple["PackedVQWeight", ...]:
+        """Load an expert without expanding packed on-disk indices.
 
-        Standard Kimi archives use row-aligned p12/p14 packing to reach their
-        advertised 1.5/1.75-bit tiers.  Expanding these tensors to uint16
-        increases this 480 GiB model to about 595 GiB and makes four-card
-        residency impossible.  The packed representation is consumed directly
-        by the Kimi CUDA GEMV; legacy ``load_expert`` remains unchanged.
+        Projection archives use row-aligned p9/p10/p12/p14 packing. Expanding
+        these tensors to uint16 makes full-VRAM residency impractical. The
+        packed representation is consumed directly by the common CPU/CUDA VQ
+        operators; legacy ``load_expert`` remains unchanged.
         """
+        if self.man.projection_vq:
+            handle = self._eh(layer)
+            layouts = self.man.projection_layout_by_layer[layer]
+            codebooks = self.projection_codebooks(layer, eid)
+            hidden = int(
+                self.cfg.get("routed_hidden", self.cfg["hidden"])
+            )
+            intermediate = int(self.cfg["moe_inter"])
+            shapes = {
+                "gate": (intermediate, hidden),
+                "up": (intermediate, hidden),
+                "down": (hidden, intermediate),
+            }
+            weights = []
+            for projection, codebook in zip(
+                ("gate", "up", "down"),
+                codebooks,
+            ):
+                layout_name = layouts[projection]
+                dim, _codebook_size = self.man.vq_dims[layout_name]
+                rows, cols = shapes[projection]
+                key = f"e{eid}.{projection}.{layout_name}"
+                stored = (
+                    handle.get_tensor(key)
+                    .view(torch.uint8)
+                    .reshape(-1)
+                )
+                count = rows * (cols // dim)
+                bits = _stored_index_bits(stored.numel(), count)
+                declared = self.man.index_packing.get(layout_name)
+                packing_widths = {
+                    f"packed-u{width}": width
+                    for width in range(8, 17)
+                }
+                packing_widths.update({"u8": 8, "u16": 16})
+                expected = packing_widths.get(declared)
+                if expected is not None and bits != expected:
+                    raise ValueError(
+                        f"{key} 索引位宽与清单不符: "
+                        f"{bits} != {expected}"
+                    )
+                weights.append(
+                    PackedVQWeight(
+                        stored,
+                        codebook,
+                        rows,
+                        cols,
+                        bits,
+                    )
+                )
+            return tuple(weights)
+
         kind = self.expert_kind(layer, eid)
         if kind == "drop":
             raise KeyError(f"expert {layer}/{eid} 已被量化丢弃")
@@ -853,12 +1700,17 @@ class CCCPStore:
         )
 
 
+# Canonical name for new callers.  The historical name remains a strict alias
+# so released CCCP artifacts and downstream imports keep working.
+TPQStore = CCCPStore
+
+
 class PackedVQWeight:
     """Byte-exact VQ indices plus logical matrix metadata.
 
-    ``bits`` is 8/16 for ordinary indices and 12/14 for row-aligned packed
-    indices.  Only the byte payload is staged to CUDA; no dequantized expert
-    matrix and no expanded uint16 copy is created.
+    ``bits`` is 8/16 for ordinary indices and 9..15 for row-aligned
+    packed indices.  Only the byte payload is staged to CUDA; no dequantized
+    expert matrix and no expanded uint16 copy is created.
     """
 
     __slots__ = (
@@ -879,7 +1731,7 @@ class PackedVQWeight:
         cols: int,
         bits: int,
     ):
-        if bits not in (8, 12, 14, 16):
+        if not 8 <= bits <= 16:
             raise ValueError(f"unsupported packed VQ width {bits}")
         self.raw = raw.contiguous().view(torch.uint8).reshape(-1)
         self.cb = cb.float()
@@ -907,7 +1759,19 @@ class PackedVQWeight:
 
     @property
     def dtype_tag(self) -> int:
-        return {8: 0, 16: 1, 12: 2, 14: 3}[self.bits]
+        return {
+            8: 0,
+            16: 1,
+            12: 2,
+            14: 3,
+            10: 4,
+            9: 5,
+            11: 6,
+            13: 7,
+            15: 8,
+        }[
+            self.bits
+        ]
 
     def unpack(self) -> torch.Tensor:
         """Reference unpacker used by CPU tests and correctness probes."""
@@ -916,10 +1780,16 @@ class PackedVQWeight:
             result = self.raw
         elif self.bits == 16:
             result = self.raw.view(torch.uint16)
+        elif self.bits == 9:
+            result = _unpack_u9(self.raw, count)
+        elif self.bits == 10:
+            result = _unpack_u10(self.raw, count)
         elif self.bits == 12:
             result = _unpack_u12(self.raw, count)
-        else:
+        elif self.bits == 14:
             result = _unpack_u14(self.raw, count)
+        else:
+            result = _unpack_odd_width(self.raw, count, self.bits)
         return result.reshape(self.rows, self.blocks)
 
 
@@ -927,7 +1797,7 @@ class PackedCpuExpertPool:
     """Generic CPU LRU that keeps VQ expert indices byte-packed.
 
     The pool deliberately mirrors only the small subset of ``ExpertPool`` used
-    by CPU decode.  p12/p14 payloads stay compact in RAM; the common CPU VQ
+    by CPU decode. Packed payloads stay compact in RAM; the common CPU VQ
     backend extracts indices while computing and never creates a resident
     uint16 expansion.
     """
@@ -942,11 +1812,11 @@ class PackedCpuExpertPool:
         self.budget = max(0, int(float(budget_gb) * 2**30))
         self.cache: OrderedDict[
             tuple[int, int],
-            tuple[PackedVQWeight, PackedVQWeight],
+            tuple[PackedVQWeight, ...],
         ] = OrderedDict()
         self.pinned: dict[
             tuple[int, int],
-            tuple[PackedVQWeight, PackedVQWeight],
+            tuple[PackedVQWeight, ...],
         ] = {}
         self.bytes = 0
         self.hits = 0
@@ -955,7 +1825,7 @@ class PackedCpuExpertPool:
 
     @staticmethod
     def _entry_bytes(entry) -> int:
-        return int(entry[0].nbytes + entry[1].nbytes)
+        return sum(int(weight.nbytes) for weight in entry)
 
     def _put(self, key, entry) -> None:
         size = self._entry_bytes(entry)

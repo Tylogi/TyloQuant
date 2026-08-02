@@ -43,6 +43,8 @@ from collections import OrderedDict
 import torch
 import torch.nn.functional as F
 
+from .presets import load_manifest
+
 from .dsv4 import SafeFile, dequant_fp8, rmsnorm, rope_apply, hc_pre, hc_post, hc_head, \
     gate_route, expert_mlp
 
@@ -115,19 +117,17 @@ class FP4Weight:
 
 
 class DSparkStore:
-    """产物目录 dspark.safetensors 的读取（产物自包含：只认 cccp.json 的
+    """产物目录 dspark.safetensors 的读取（产物自包含：读取 TPQ 清单的
     dspark_file 指引，不依赖原始模型目录）。张量名与原始检查点一致（mtp.*），
     FP8 伴生 .scale 由导出器原样保留。产物由 `python -m CCCP dspark-export` 生成。"""
 
     def __init__(self, model_dir: str):
-        man_path = os.path.join(model_dir, "cccp.json")
-        with open(man_path, "r", encoding="utf-8") as f:
-            man = json.load(f)
+        _root, man = load_manifest(model_dir)
         fn = man.get("dspark_file")
         if not fn:
             raise FileNotFoundError(
-                f"{model_dir}/cccp.json 缺少 dspark_file：请先运行 "
-                f"python -m CCCP dspark-export --src <原始模型目录> --out {model_dir}")
+                f"{model_dir} 的 TPQ 清单缺少 dspark_file"
+            )
         self.man = man
         self.sf = SafeFile(os.path.join(model_dir, fn))
         self.keys = set(self.sf.keys())

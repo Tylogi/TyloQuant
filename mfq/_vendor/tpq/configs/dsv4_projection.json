@@ -1,0 +1,99 @@
+{
+  "schema": 1,
+  "architecture": "dsv4_projection",
+  "display_name": "DeepSeek-V4 三投影 TPQ",
+  "supports_parallel": true,
+  "tested_tp_min": 2,
+  "tested_tp_max": 8,
+  "tested_tp_values": [2, 4, 8],
+  "defaults": {
+    "device": "cuda",
+    "max_ctx": 4096,
+    "max_new": 512,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "spec": 0,
+    "reasoning": "chat",
+    "host": "0.0.0.0",
+    "port": 8000,
+    "max_queue": 16
+  },
+  "environment": {
+    "TPQ_COMPUTE_DTYPE": "bf16",
+    "TPQ_DENSE_BF16": "none",
+    "TPQ_FUSED": "1",
+    "TPQ_PROJECTION_FUSED": "1",
+    "TPQ_PROJECTION_WARPS": "16",
+    "TPQ_P10_SHARED": "1",
+    "TPQ_PAGED_KV_FUSED": "1",
+    "TPQ_VRAM_WATCH": "1",
+    "TPQ_CPU_PACKED": "1",
+    "TPQ_CPU_PACKED_DIRECT": "1",
+    "TPQ_CPU_THREADS": "auto",
+    "TPQ_CPU_NUMA": "auto",
+    "TPQ_RAM_RESERVE_GB": "32",
+    "TPQ_RESIDENT_RESERVE_GB": "32",
+    "TPQ_VRAM_RESERVE_GB": "3",
+    "TPQ_VRAM_RUNTIME_GB": "3"
+  },
+  "profiles": {
+    "ram": {
+      "description": "单卡计算；FP8 Dense 常驻 GPU，紧凑三投影专家常驻 RAM 并按需缓存到 VRAM",
+      "tp": 1,
+      "environment": {
+        "TPQ_RAM_MIRROR": "0",
+        "TPQ_FULL_RESIDENT": "1"
+      }
+    },
+    "resident": {
+      "description": "单卡全显存；FP8 Dense 与紧凑三投影专家均驻 GPU，不建立专家 RAM 镜像",
+      "tp": 1,
+      "environment": {
+        "TPQ_PACKED_FULL_GPU": "1",
+        "TPQ_RAM_MIRROR": "0"
+      }
+    },
+    "parallel": {
+      "description": "多卡全显存真TP；Attention Head-TP、共享Dense/Router Row-TP 与 packed routed MoE 跨全部rank计算",
+      "tp": 4,
+      "environment": {
+        "TPQ_MOE_PARALLELISM": "tensor",
+        "TPQ_TP_GRAPH": "1",
+        "TPQ_TP_HIDDEN": "1",
+        "TPQ_TP_NO_OWNER": "1",
+        "TPQ_DSV4_FULL_TP": "1",
+        "TPQ_SHARED_MLP_TP": "1",
+        "TPQ_ROUTED_WARPS": "8",
+        "TPQ_RAM_MIRROR": "0"
+      }
+    },
+    "parallel_tp4": {
+      "description": "四卡全层真TP；全rank直接持有TPHidden，无hidden owner",
+      "tp": 4,
+      "environment": {
+        "TPQ_MOE_PARALLELISM": "tensor",
+        "TPQ_TP_GRAPH": "1",
+        "TPQ_TP_HIDDEN": "1",
+        "TPQ_TP_NO_OWNER": "1",
+        "TPQ_DSV4_FULL_TP": "1",
+        "TPQ_SHARED_MLP_TP": "1",
+        "TPQ_ROUTED_WARPS": "8",
+        "TPQ_RAM_MIRROR": "0"
+      }
+    },
+    "parallel_tp8": {
+      "description": "八卡全层真TP兼容配置；本轮仅回归TP4，使用前先运行tpq check",
+      "tp": 8,
+      "environment": {
+        "TPQ_MOE_PARALLELISM": "tensor",
+        "TPQ_TP_GRAPH": "1",
+        "TPQ_TP_HIDDEN": "1",
+        "TPQ_TP_NO_OWNER": "1",
+        "TPQ_DSV4_FULL_TP": "1",
+        "TPQ_SHARED_MLP_TP": "1",
+        "TPQ_ROUTED_WARPS": "8",
+        "TPQ_RAM_MIRROR": "0"
+      }
+    }
+  }
+}

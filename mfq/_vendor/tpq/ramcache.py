@@ -57,6 +57,7 @@ class ModelRamMirror:
         *,
         reserve_gb: float | None = None,
         available_bytes: int | None = None,
+        exclude_paths: tuple[str | os.PathLike[str], ...] = (),
     ):
         self.root = os.path.abspath(os.fspath(root))
         configured_reserve = (
@@ -66,6 +67,9 @@ class ModelRamMirror:
         )
         self.reserve_bytes = int(max(3.0, configured_reserve) * 2**30)
         self._available_bytes = available_bytes
+        self._exclude_paths = {
+            _file_key(path) for path in exclude_paths
+        }
         self._files: dict[str, bytearray] = {}
         self._thread: threading.Thread | None = None
         self._error: BaseException | None = None
@@ -87,7 +91,11 @@ class ModelRamMirror:
         files = [
             path
             for path in Path(self.root).iterdir()
-            if path.is_file() and path.suffix == ".safetensors"
+            if (
+                path.is_file()
+                and path.suffix == ".safetensors"
+                and _file_key(path) not in self._exclude_paths
+            )
         ]
         return sorted(files, key=_weight_sort_key)
 
@@ -197,4 +205,23 @@ class ModelRamMirror:
                     del _ACTIVE_FILES[key]
         self._active = False
         self._files.clear()
+        return released
+
+    def release_paths(
+        self,
+        paths: tuple[str | os.PathLike[str], ...],
+    ) -> int:
+        """Release selected files while keeping packed expert blobs active."""
+        keys = {_file_key(path) for path in paths}
+        released = 0
+        with _ACTIVE_LOCK:
+            for key in keys:
+                blob = self._files.pop(key, None)
+                if blob is None:
+                    continue
+                released += len(blob)
+                if _ACTIVE_FILES.get(key) is blob:
+                    del _ACTIVE_FILES[key]
+        if not self._files:
+            self._active = False
         return released

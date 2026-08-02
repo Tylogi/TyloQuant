@@ -14,6 +14,8 @@ _linear 分派（F.linear ↔ Int4Weight.matmul_T ↔ VQWeight.matmul_T）。
 from __future__ import annotations
 
 import os
+import copy
+import time
 from dataclasses import dataclass
 
 import torch
@@ -21,9 +23,14 @@ import torch.nn.functional as F
 
 from .dsv4cache import ContextCapacityError, PagedKV
 from .dsv4indexer import IndexerState
-from .kernels import Int4Weight, VQWeight, rmsnorm
+from .kernels import (
+    BlockFP8Weight,
+    Int4Weight,
+    VQWeight,
+    rmsnorm,
+)
 from .precision import compute_dtype
-from .store import CCCPStore, ExpertPool
+from .store import TPQStore, ExpertPool
 
 
 _DENSE_BF16_ELIGIBLE = frozenset({
@@ -145,12 +152,21 @@ def _tpq_lin(x: torch.Tensor, w) -> torch.Tensor:
     权重类的 matmul_T 只收 2D 输入，dsv4 的 3D [B,T,D] 在此压平再还原；
     dense bf16 常驻后：matmul 与层间 hidden 均保持 bf16；需要稳定归约的算子
     在各自内部局部升到 f32。"""
-    if isinstance(w, (Int4Weight, VQWeight)):
+    if isinstance(w, (Int4Weight, BlockFP8Weight, VQWeight)):
         if x.dim() > 2:
             sh = x.shape
-            out = w.matmul_T(x.reshape(-1, sh[-1])).view(*sh[:-1], -1)
+            rows = x.reshape(-1, sh[-1])
+            out = (
+                w.matmul_T_decode_fused(rows)
+                if isinstance(w, BlockFP8Weight)
+                else w.matmul_T(rows)
+            ).view(*sh[:-1], -1)
         else:
-            out = w.matmul_T(x)
+            out = (
+                w.matmul_T_decode_fused(x)
+                if isinstance(w, BlockFP8Weight)
+                else w.matmul_T(x)
+            )
         return out.to(compute_dtype(x.device))
     if x.dtype != w.dtype:
         x = x.to(w.dtype)
@@ -162,7 +178,7 @@ def _o_proj_tpq(o: torch.Tensor, w: dict, cfg) -> torch.Tensor:
     """分组 LoRA O 的实现：Int4Weight 走逐组 dequant_rows；bf16 常驻张量走原生路径
     （dtype 对齐）。数值与 CCCP.dsv4._o_proj 一致。"""
     wo_a = w["wo_a"]
-    if not isinstance(wo_a, Int4Weight):
+    if not isinstance(wo_a, (Int4Weight, BlockFP8Weight)):
         if o.dtype != wo_a.dtype:
             o = o.to(wo_a.dtype)
         return _dsv4._o_proj(o, w, cfg)
@@ -170,6 +186,23 @@ def _o_proj_tpq(o: torch.Tensor, w: dict, cfg) -> torch.Tensor:
     G = cfg.o_groups
     rank = cfg.o_lora_rank
     o = o.reshape(B, T, G, -1)
+    if isinstance(wo_a, BlockFP8Weight):
+        # Each group owns an aligned row range in the compact source tensor.
+        # The public linear operator reads a zero-copy FP8 view directly;
+        # only the token-sized LoRA result is concatenated.
+        from .ops import linear
+
+        groups = []
+        for group in range(G):
+            compact = wo_a.row_view(
+                group * rank,
+                (group + 1) * rank,
+            )
+            value = o[:, :, group].reshape(-1, o.shape[-1])
+            groups.append(
+                linear(value, compact).view(B, T, rank)
+            )
+        return _tpq_lin(torch.cat(groups, dim=-1), w["wo_b"])
     if not o.is_cuda and B * T == 1:
         wo_b = w["wo_b"]
         if isinstance(wo_b, Int4Weight):
@@ -268,9 +301,12 @@ from .fusedext import dsv4_attn_decode_fused as _attn_decode_fused
 _dsv4._attn_decode_core_hook = _attn_decode_fused
 
 from .fusedext import dsv4_hc_pre_fused as _hc_pre_fused
-from .fusedext import dsv4_hc_pre_norm_fused as _hc_pre_norm_fused
-from .fusedext import dsv4_hc_post_fused as _hc_post_fused
 from .fusedext import dsv4_route_post_fused as _route_post_fused
+from .ops import (
+    hyper_connection_post as _hyper_connection_post,
+    hyper_connection_post_moe as _hyper_connection_post_moe,
+    hyper_connection_pre_norm as _hyper_connection_pre_norm,
+)
 
 _hc_pre_orig = _dsv4.hc_pre
 _hc_post_orig = _dsv4.hc_post
@@ -288,14 +324,20 @@ def _hc_pre_tpq(x, fn, scale, base, cfg):
 _dsv4.hc_pre = _hc_pre_tpq
 
 
-def _hc_post_tpq(out, residual, post, comb):
+def _hc_post_tpq(out, residual, post, comb, output=None):
     if not residual.is_cuda:
         from .cpuext import hc_post_cpu
 
         cpu_result = hc_post_cpu(out, residual, post, comb)
         if cpu_result is not None:
             return cpu_result
-    r = _hc_post_fused(out, residual, post, comb)
+    r = _hyper_connection_post(
+        out,
+        residual,
+        post,
+        comb,
+        output=output,
+    )
     if r is not None:
         return r
     return _hc_post_orig(out, residual, post, comb)
@@ -304,7 +346,15 @@ def _hc_post_tpq(out, residual, post, comb):
 _dsv4.hc_post = _hc_post_tpq
 
 
-def _hc_pre_norm_tpq(x, fn, scale, base, norm, cfg):
+def _hc_pre_norm_tpq(
+    x,
+    fn,
+    scale,
+    base,
+    norm,
+    cfg,
+    output_buffers=None,
+):
     """HC pre 与随后 RMSNorm 的 BF16 热路径；归约仍在核内使用 FP32。"""
     if not x.is_cuda and x.shape[0] * x.shape[1] == 1:
         from .cpuext import hc_pre_norm_cpu
@@ -323,7 +373,7 @@ def _hc_pre_norm_tpq(x, fn, scale, base, norm, cfg):
         )
         if cpu_result is not None:
             return cpu_result
-    r = _hc_pre_norm_fused(
+    r = _hyper_connection_pre_norm(
         x,
         fn,
         scale,
@@ -331,6 +381,7 @@ def _hc_pre_norm_tpq(x, fn, scale, base, norm, cfg):
         norm,
         cfg.hc_sinkhorn_iters,
         cfg.rms_eps,
+        output_buffers=output_buffers,
     )
     if r is not None:
         return r
@@ -342,12 +393,21 @@ def _hc_pre_norm_tpq(x, fn, scale, base, norm, cfg):
 
 def _linear(x: torch.Tensor, w) -> torch.Tensor:
     """dense 线性层：Int4Weight 走分块反量化（3D 输入压平再还原），其余按 dtype 对齐 matmul。"""
-    if isinstance(w, Int4Weight):
+    if isinstance(w, (Int4Weight, BlockFP8Weight)):
         if x.dim() > 2:
             sh = x.shape
-            out = w.matmul_T(x.reshape(-1, sh[-1])).view(*sh[:-1], -1)
+            rows = x.reshape(-1, sh[-1])
+            out = (
+                w.matmul_T_decode_fused(rows)
+                if isinstance(w, BlockFP8Weight)
+                else w.matmul_T(rows)
+            ).view(*sh[:-1], -1)
         else:
-            out = w.matmul_T(x)
+            out = (
+                w.matmul_T_decode_fused(x)
+                if isinstance(w, BlockFP8Weight)
+                else w.matmul_T(x)
+            )
         return out.to(compute_dtype(x.device))
     if x.dtype != w.dtype:
         x = x.to(w.dtype)
@@ -537,8 +597,25 @@ class DSV4TPQModel:
     """DeepSeek-V4 CCCP 产物的推理模型（CPU/CUDA，内存显存自动适配由外层 Engine 定）。"""
 
     def __init__(self, root: str, cache_gb: float = 16.0, max_ctx: int = 2048,
-                 device: str = "cpu", vram_cache_gb: float = 4.0):
-        self.device = torch.device(device)
+                 device: str = "cpu", vram_cache_gb: float = 4.0,
+                 tp_size: int = 1):
+        self.tp_size = int(tp_size)
+        if self.tp_size <= 0:
+            raise ValueError("tp_size must be positive")
+        requested = torch.device(device)
+        if requested.type == "cuda" and self.tp_size > 1:
+            if self.tp_size > torch.cuda.device_count():
+                raise ValueError(
+                    f"tp={self.tp_size} exceeds visible CUDA devices"
+                )
+            self.devices = tuple(
+                torch.device("cuda", rank)
+                for rank in range(self.tp_size)
+            )
+            self.device = self.devices[0]
+        else:
+            self.device = requested
+            self.devices = (self.device,)
         self._cpu_numa_interleaved = False
         self._cpu_threads = 0
         if self.device.type == "cpu":
@@ -554,7 +631,7 @@ class DSV4TPQModel:
 
             self._cpu_threads = configure_cpu_threads()
             self._cpu_numa_interleaved = configure_numa_interleave()
-        self.store = CCCPStore(root)
+        self.store = TPQStore(root)
         from .ops import ModelOperatorConfig
 
         self.operator_config = ModelOperatorConfig.from_manifest(
@@ -565,20 +642,145 @@ class DSV4TPQModel:
                 "config": self.store.cfg,
             }
         )
+        self.packed_operator_name: str | None = None
+        if self.store.man.projection_vq:
+            from .ops import packed_moe_operator_name
+
+            capabilities = {
+                tuple(
+                    sorted(
+                        self.store.man.projection_operator_capability(
+                            layer
+                        ).items()
+                    )
+                )
+                for layer in self.store.man.expert_files
+            }
+            names = set()
+            for capability_items in capabilities:
+                capability = dict(capability_items)
+                names.add(
+                    packed_moe_operator_name(
+                        device_type=self.device.type,
+                        activation=(
+                            self.operator_config.expert_activation
+                        ),
+                        top_k=self.operator_config.top_k,
+                        **capability,
+                    )
+                )
+            self.packed_operator_name = ",".join(sorted(names))
+            print(
+                "[tpq] 公共 packed MoE="
+                f"{self.packed_operator_name}；"
+                f"activation={self.operator_config.expert_activation}；"
+                "projection_fused="
+                f"{os.environ.get('TPQ_PROJECTION_FUSED', '1')}",
+                flush=True,
+            )
         self.cfg = self.store.cfg  # dict（DSV4Config.to_json）
         gpu = self.device.type != "cpu"
-        self.pool = ExpertPool(self.store, vram_cache_gb if gpu else cache_gb,
-                               device=device, ram_gb=cache_gb if gpu else 0.0)
+        self._packed_device_pool = False
+        self._packed_full_gpu = False
+        if self.store.man.projection_vq:
+            if not gpu:
+                from .store import PackedCpuExpertPool
+
+                self.pool = PackedCpuExpertPool(
+                    self.store,
+                    budget_gb=cache_gb,
+                )
+            elif (
+                self.tp_size == 1
+                and os.environ.get("TPQ_PACKED_FULL_GPU", "0") != "1"
+            ):
+                from .kimi_hybrid import PackedHybridPool
+
+                self.pool = PackedHybridPool(
+                    self.store,
+                    vram_cache_gb,
+                    device=self.device,
+                    ram_gb=cache_gb,
+                )
+                self._packed_device_pool = True
+            else:
+                from .kimi_experts import (
+                    PackedExpertPool,
+                    build_primary_dense_packed_plan,
+                )
+
+                plan = build_primary_dense_packed_plan(
+                    self.store,
+                    self.tp_size,
+                )
+                self.pool = PackedExpertPool(
+                    self.store,
+                    self.devices,
+                    plan,
+                    parallelism=(
+                        "pipeline" if self.tp_size == 1 else "tensor"
+                    ),
+                )
+                self._packed_device_pool = True
+                self._packed_full_gpu = True
+        else:
+            if self.tp_size != 1:
+                raise ValueError(
+                    "legacy DeepSeek-V4 archives support only tp=1"
+                )
+            self.pool = ExpertPool(
+                self.store,
+                vram_cache_gb if gpu else cache_gb,
+                device=str(self.device),
+                ram_gb=cache_gb if gpu else 0.0,
+            )
+        # Benchmark/API diagnostics must distinguish a real all-rank packed
+        # pool from the legacy or RAM paths.  Multi-card construction has no
+        # silent fallback: preload failure aborts startup before this value can
+        # be reported as a successful run.
+        self.effective_tp_size = (
+            self.tp_size if self._packed_full_gpu else 1
+        )
         self.max_ctx = max_ctx
         self._w: dict[str, object] = {}
         self._layers: dict[int, dict] = {}
         self._dense_bf16 = _parse_dense_bf16()
+        self._hc_decode_workspaces: dict[
+            tuple[torch.device, int],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
+        self._hc_post_workspaces: dict[
+            tuple[torch.device, int],
+            tuple[torch.Tensor, torch.Tensor],
+        ] = {}
         self._prefetch_auto = True
         self._prev_ids: dict[int, list[int]] = {}   # 层 → 上一 token 路由专家（预取用）
+        self._profile_enabled = False
+        self._profile_records: list[
+            tuple[int, tuple[tuple[str, object], ...]]
+        ] = []
+        self._moe_profile_records: list[
+            tuple[int, tuple[tuple[str, object], ...]]
+        ] = []
+        self.last_layer_profile: dict[str, object] = {}
         self._cpu_resident_experts: dict[
             int, tuple[tuple[VQWeight, VQWeight] | None, ...]
         ] = {}
         self._cpu_moe_layers: dict[int, object] = {}
+        self._tp_shared_mlp = None
+        self._tp_router = None
+        self._tp_attention_contexts: tuple[list[dict], ...] | None = None
+        self._tp_route_weights: tuple[list[dict], ...] | None = None
+        self._tp_route_buffers: dict[
+            int,
+            tuple[
+                tuple[torch.Tensor, ...],
+                tuple[torch.Tensor, ...],
+                tuple[torch.Tensor, ...],
+            ],
+        ] = {}
+        self._tp_states_ready = False
+        self.tp_dataflow = "single"
         self.states: list[dict] | None = None
         c = self.cfg
         ratios = (list(c.get("compress_ratios") or []) + [0] * c["n_layers"])[: c["n_layers"]]
@@ -710,27 +912,37 @@ class DSV4TPQModel:
         return self.rope_cmp if self.ratios[i] else self.rope_base
 
     def _alloc(self, B: int) -> None:
+        self.states = self._allocate_states(B, self.device)
+
+    def _allocate_states(
+        self,
+        B: int,
+        device: torch.device,
+    ) -> list[dict]:
+        """Allocate one complete MQA/compressor state replica on a TP rank."""
         c = self.cfg
         win, hd = c["sliding_window"], c["head_dim"]
-        hot_dtype = compute_dtype(self.device)
-        self.states = []
+        hot_dtype = compute_dtype(device)
+        states = []
         for i in range(c["n_layers"]):
             ratio = self.ratios[i]
             st = {
                 # 现有 decode attention 核仍以 FP32 做局部 score/value；
                 # SM120 BF16 sparse kernel 接入后再把窗口状态切回 hot_dtype。
                 "kv": torch.zeros(
-                    B, win, hd, device=self.device, dtype=torch.float32
+                    B, win, hd, device=device, dtype=torch.float32
                 ),
-                "win_pos": torch.full((B, win), -1, dtype=torch.long, device=self.device),
+                "win_pos": torch.full(
+                    (B, win), -1, dtype=torch.long, device=device
+                ),
             }
             if ratio:
                 st["compressed"] = PagedKV(
                     batch=B,
                     page_items=max(1, 4096 // ratio),
                     dim=hd,
-                    device=self.device,
-                    dtype=compute_dtype(self.device),
+                    device=device,
+                    dtype=compute_dtype(device),
                     max_items=(self.max_ctx + ratio - 1) // ratio,
                 )
                 if ratio == 4:
@@ -739,8 +951,8 @@ class DSV4TPQModel:
                         head_dim=c.get("index_head_dim", 128),
                         rope_dim=c["qk_rope_head_dim"],
                         page_items=max(1, 4096 // ratio),
-                        device=self.device,
-                        dtype=compute_dtype(self.device),
+                        device=device,
+                        dtype=compute_dtype(device),
                         max_items=(self.max_ctx + ratio - 1) // ratio,
                     )
                 coff = 2 if ratio == 4 else 1
@@ -748,12 +960,13 @@ class DSV4TPQModel:
                     B,
                     coff * ratio,
                     coff * hd,
-                    device=self.device,
+                    device=device,
                     dtype=hot_dtype,
                 )
                 st["cscore"] = torch.full((B, coff * ratio, coff * hd), float("-inf"),
-                                          device=self.device, dtype=torch.float32)
-            self.states.append(st)
+                                          device=device, dtype=torch.float32)
+            states.append(st)
+        return states
 
     def ensure_position(self, position: int) -> None:
         """Reserve every compressed-layer page before any token state is mutated."""
@@ -930,6 +1143,11 @@ class DSV4TPQModel:
 
     def reset(self) -> None:
         self.states = None
+        if self._tp_attention_contexts is not None:
+            for rank_contexts in self._tp_attention_contexts:
+                for context in rank_contexts:
+                    context["state"] = None
+        self._tp_states_ready = False
         self.pos = 0
         self._spec = None
         self._prev_ids.clear()
@@ -981,6 +1199,8 @@ class DSV4TPQModel:
         names = self.store.dense_names()
         for name in names:
             self.w(name)
+        self._prepare_tp_shared_mlp()
+        self._prepare_tp_decode_metadata()
         vram = torch.cuda.memory_allocated(self.device) / 2**30
         print(f"[tpq] dense 预载完成（{time.time() - t0:.1f}s，显存 {vram:.1f}GB）",
               flush=True)
@@ -990,6 +1210,10 @@ class DSV4TPQModel:
             print(f"[tpq] 分组GEMM: "
                   + ("fused CUDA kernel" if _g._fused is not None else "torch 批量路径"),
                   flush=True)
+        if self._packed_full_gpu:
+            self.pool.preload()
+            self._prefetch_auto = False
+            return
         resident_all = self.pool.preload_all()
         self._prefetch_auto = not resident_all
         if not resident_all:   # 内存够则全量常驻；不够（已警告）回退热钉住+LRU
@@ -1000,6 +1224,241 @@ class DSV4TPQModel:
                 print("[tpq] 全量 RAM 常驻：自动关闭专家预测预取（避免 staging 竞争）",
                       flush=True)
         self.pool.build_gpu_arenas()
+
+    def _prepare_tp_shared_mlp(self) -> None:
+        """Shard every shared expert through the public gated-MLP TP op.
+
+        This is intentionally capability driven: DSV4 only supplies separate
+        Gate/Up weights and the clamped SwiGLU parameters.  Weight slicing,
+        block-FP8 GEMV, activation and Row-TP reduction remain in ``tpq.ops``.
+        """
+        if (
+            self.tp_size <= 1
+            or not self.store.man.projection_vq
+            or os.environ.get("TPQ_SHARED_MLP_TP", "1") == "0"
+        ):
+            return
+        from .kernels import ProjectionGroup
+        from .ops.tensor_parallel import (
+            GatedMLPSpec,
+            TensorParallelGatedMLP,
+        )
+
+        intermediate = int(self.layer(0)["sh_w1"].shape[0])
+        executor = TensorParallelGatedMLP(
+            self.devices,
+            GatedMLPSpec(
+                hidden_size=int(self.cfg["hidden"]),
+                intermediate_size=intermediate,
+                activation=self.operator_config.expert_activation,
+                activation_beta=float(self.cfg.get("situ_beta", 4.0)),
+                activation_linear_beta=self.cfg.get("situ_linear_beta"),
+                activation_limit=float(self.cfg.get("swiglu_limit", 0.0)),
+            ),
+        )
+        for layer in range(int(self.cfg["n_layers"])):
+            weights = self.layer(layer)
+            executor.add_layer(
+                layer,
+                0,
+                ProjectionGroup(
+                    (weights["sh_w1"], weights["sh_w3"])
+                ),
+                weights["sh_w2"],
+            )
+        executor.capture()
+        self._tp_shared_mlp = executor
+        print(
+            "[tpq] 公共共享 Dense MLP Column/Row-TP Graph 完成："
+            f"{self.cfg['n_layers']} 层×TP{self.tp_size}；"
+            "FP8 分片常驻、每层一次 Row 规约",
+            flush=True,
+        )
+
+    @staticmethod
+    def _weight_to_device(weight, device: torch.device):
+        if isinstance(weight, (BlockFP8Weight, Int4Weight)):
+            return weight.to(device)
+        if isinstance(weight, torch.Tensor):
+            return weight.to(device)
+        raise TypeError(f"unsupported TP weight {type(weight)!r}")
+
+    def _prepare_tp_decode_metadata(self) -> None:
+        """Prepare all-rank Head/Dense/MoE decode metadata.
+
+        The model layer only describes the HC and compressed-MQA topology.
+        Compact FP8 slicing, fixed TPHidden buffers, shared Dense TP and packed
+        expert TP are all supplied by the public operator library.
+        """
+        if (
+            self.tp_size <= 1
+            or self._tp_shared_mlp is None
+            or os.environ.get("TPQ_DSV4_FULL_TP", "1") == "0"
+        ):
+            return
+        if os.environ.get("TPQ_TP_HIDDEN", "0") == "0":
+            raise RuntimeError("DSV4 full TP requires TPQ_TP_HIDDEN=1")
+        from .dsv4 import RopeCache
+        from .ops import shard_linear_input, shard_linear_output
+
+        base_cfg = self._cfg_obj()
+        if (
+            int(base_cfg.n_heads) % self.tp_size
+            or int(base_cfg.o_groups) % self.tp_size
+        ):
+            raise ValueError("DSV4 heads/O groups must divide the TP width")
+        attention_by_rank: list[list[dict]] = []
+        route_by_rank: list[list[dict]] = []
+        for rank, device in enumerate(self.devices):
+            local_cfg = copy.copy(base_cfg)
+            local_cfg.n_heads = int(base_cfg.n_heads) // self.tp_size
+            local_cfg.o_groups = int(base_cfg.o_groups) // self.tp_size
+            rope_base = RopeCache(
+                int(base_cfg.qk_rope_head_dim),
+                self.max_ctx + 8,
+                float(base_cfg.rope_theta),
+                None,
+            )
+            rope_cmp = RopeCache(
+                int(base_cfg.qk_rope_head_dim),
+                self.max_ctx + 8,
+                float(getattr(base_cfg, "compress_rope_theta", 160000.0)),
+                getattr(base_cfg, "rope_scaling", None),
+            )
+            for rope in (rope_base, rope_cmp):
+                rope.cos = rope.cos.to(device)
+                rope.sin = rope.sin.to(device)
+            rank_attention = []
+            rank_routes = []
+            for layer in range(int(self.cfg["n_layers"])):
+                source = self.layer(layer)
+                weights = {
+                    key: self._weight_to_device(source[key], device)
+                    for key in ("wq_a", "q_norm", "wkv", "kv_norm")
+                }
+                weights["wq_b"] = shard_linear_output(
+                    source["wq_b"], rank, self.tp_size, device
+                )
+                weights["attn_sink"] = (
+                    source["attn_sink"]
+                    .chunk(self.tp_size, dim=0)[rank]
+                    .to(device)
+                    .contiguous()
+                )
+                weights["wo_a"] = shard_linear_output(
+                    source["wo_a"], rank, self.tp_size, device
+                )
+                weights["wo_b"] = shard_linear_input(
+                    source["wo_b"], rank, self.tp_size, device
+                )
+                for nested in ("cmp", "indexer"):
+                    if nested in source:
+                        weights[nested] = {
+                            key: self._weight_to_device(value, device)
+                            for key, value in source[nested].items()
+                        }
+                rank_attention.append(
+                    {
+                        "cfg": local_cfg,
+                        "weights": weights,
+                        "state": None,
+                        "rope": rope_cmp if self.ratios[layer] else rope_base,
+                        "ratio": int(self.ratios[layer]),
+                    }
+                )
+                route_item = {
+                    key: self._weight_to_device(source[key], device)
+                    for key in (
+                        "hc_attn_fn",
+                        "hc_attn_scale",
+                        "hc_attn_base",
+                        "attn_norm",
+                        "hc_ffn_fn",
+                        "hc_ffn_scale",
+                        "hc_ffn_base",
+                        "ffn_norm",
+                    )
+                }
+                route_item["gate_bias"] = self._weight_to_device(
+                    source.get(
+                        "gate_bias",
+                        torch.zeros(
+                            int(self.cfg["n_experts"]),
+                            dtype=torch.float32,
+                            device=self.device,
+                        ),
+                    ),
+                    device,
+                )
+                route_item["mask"] = self.store.available_mask(layer).to(
+                    device
+                )
+                if "tid2eid" in source:
+                    route_item["tid2eid"] = source["tid2eid"].to(device)
+                rank_routes.append(route_item)
+            attention_by_rank.append(rank_attention)
+            route_by_rank.append(rank_routes)
+        self._tp_attention_contexts = tuple(attention_by_rank)
+        self._tp_route_weights = tuple(route_by_rank)
+        self.tp_dataflow = "all-rank-head-dense-packed"
+
+        from .ops.tensor_parallel import (
+            RowParallelLinearSpec,
+            TensorParallelRowLinear,
+        )
+
+        router = TensorParallelRowLinear(
+            self.devices,
+            RowParallelLinearSpec(
+                in_features=int(self.cfg["hidden"]),
+                out_features=int(self.cfg["n_experts"]),
+                input_dtype=torch.bfloat16,
+                weight_dtype=torch.float32,
+                output_dtype=torch.float32,
+            ),
+        )
+        for layer in range(int(self.cfg["n_layers"])):
+            router.add_layer(layer, 0, self.layer(layer)["gate"])
+            router.bind_input_hidden(
+                layer,
+                self._tp_shared_mlp.input_hidden(layer),
+            )
+        router.capture()
+        self._tp_router = router
+
+        top_k = int(self.cfg["top_k"])
+        experts = int(self.cfg["n_experts"])
+        for layer in range(int(self.cfg["n_layers"])):
+            logits = []
+            route_weights = []
+            route_ids = []
+            for device in self.devices:
+                logits.append(
+                    torch.empty(1, experts, dtype=torch.float32, device=device)
+                )
+                route_weights.append(
+                    torch.empty(1, top_k, dtype=torch.float32, device=device)
+                )
+                route_ids.append(
+                    torch.empty(1, top_k, dtype=torch.long, device=device)
+                )
+            self._tp_route_buffers[layer] = (
+                tuple(logits),
+                tuple(route_weights),
+                tuple(route_ids),
+            )
+            self.pool.bind_hidden_inputs(
+                layer,
+                self._tp_shared_mlp.input_hidden(layer),
+                tuple(route_weights),
+                tuple(route_ids),
+            )
+        print(
+            "[tpq] DSV4 公共真 TP decode 元数据完成："
+            f"Head-TP + shared Dense Column/Row-TP + packed MoE TP，"
+            f"{self.cfg['n_layers']} 层×TP{self.tp_size}",
+            flush=True,
+        )
 
     def forward(self, ids: list[int]) -> torch.Tensor:
         """前向一段 token（prefill 或单步 decode），返回最后位置 logits [vocab]。"""
@@ -1111,7 +1570,14 @@ class DSV4TPQModel:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
         return weights * cfg.routed_scaling, indices
 
-    def _moe(self, x: torch.Tensor, layer: int, ids: torch.Tensor) -> torch.Tensor:
+    def _moe(
+        self,
+        x: torch.Tensor,
+        layer: int,
+        ids: torch.Tensor,
+        *,
+        return_parts: bool = False,
+    ):
         from .dsv4 import expert_mlp
         c = self.cfg
         w = self.layer(layer)
@@ -1120,6 +1586,21 @@ class DSV4TPQModel:
         x_rows = x.reshape(B * T, D)
         xf = x_rows.float()
         cfg_obj = self._cfg_obj()
+        profile_moe = (
+            self._profile_enabled and self.store.man.projection_vq
+        )
+        moe_events: list[tuple[str, object]] = []
+
+        def mark_moe(name: str) -> None:
+            if profile_moe:
+                if x_rows.is_cuda:
+                    event = torch.cuda.Event(enable_timing=True)
+                    event.record(torch.cuda.current_stream(self.device))
+                    moe_events.append((name, event))
+                else:
+                    moe_events.append((name, time.perf_counter()))
+
+        mark_moe("start")
         resident = self._cpu_resident_experts.get(layer)
         cached_layer = None
         if B * T == 1 and not x_rows.is_cuda and resident is not None:
@@ -1177,6 +1658,98 @@ class DSV4TPQModel:
             ids.reshape(-1),
             layer,
         )
+        mark_moe("route")
+        if self.store.man.projection_vq:
+            activation = self.operator_config.expert_activation
+            limit = float(c.get("swiglu_limit", 0.0))
+            shared = (
+                self._tp_shared_mlp.run(layer, x_rows)
+                if self._tp_shared_mlp is not None and B * T == 1
+                else expert_mlp(
+                    x_rows,
+                    w["sh_w1"],
+                    w["sh_w3"],
+                    w["sh_w2"],
+                    limit,
+                )
+            )
+            mark_moe("shared")
+            routed_rows = []
+            for row in range(B * T):
+                if self._packed_device_pool:
+                    routed = self.pool.run(
+                        layer,
+                        x_rows[row : row + 1],
+                        indices[row],
+                        weights[row],
+                        activation=activation,
+                        activation_beta=float(c.get("situ_beta", 4.0)),
+                        activation_linear_beta=c.get(
+                            "situ_linear_beta"
+                        ),
+                        limit=limit,
+                    )
+                else:
+                    selected = self.pool.get_many(
+                        [
+                            (layer, int(expert_id))
+                            for expert_id in indices[row].tolist()
+                        ]
+                    )
+                    experts = [
+                        selected[(layer, int(expert_id))]
+                        for expert_id in indices[row].tolist()
+                    ]
+                    from .ops import packed_moe_selected_topk
+
+                    routed = packed_moe_selected_topk(
+                        x_rows[row : row + 1].float(),
+                        experts,
+                        weights[row].float(),
+                        activation=activation,
+                        activation_beta=float(c.get("situ_beta", 4.0)),
+                        activation_linear_beta=c.get(
+                            "situ_linear_beta"
+                        ),
+                        limit=limit,
+                    )
+                    if routed is None:
+                        raise RuntimeError(
+                            "no public packed CPU MoE operator accepted "
+                            f"DeepSeek-V4 layer {layer}"
+                        )
+                routed_rows.append(routed.reshape(-1))
+            mark_moe("routed")
+            # Full-resident packed experts have nothing to prefetch.  Pulling
+            # route IDs back through ``tolist`` would otherwise insert one
+            # GPU->CPU synchronization per layer and serialize the decode
+            # launch queue.  RAM/LRU profiles retain the exact old behaviour.
+            if not self._packed_full_gpu and self._prefetch_enabled():
+                self._prev_ids[layer] = [
+                    int(expert_id) for expert_id in indices[-1].tolist()
+                ]
+            if return_parts and B * T == 1:
+                mark_moe("merge")
+                if profile_moe:
+                    self._moe_profile_records.append(
+                        (layer, tuple(moe_events))
+                    )
+                return (
+                    routed_rows[0].view(1, D),
+                    shared.reshape(1, D),
+                )
+            routed = (
+                routed_rows[0].view(1, D)
+                if len(routed_rows) == 1
+                else torch.stack(routed_rows)
+            ).to(shared.dtype)
+            output = (routed + shared).view(B, T, D).to(output_dtype)
+            mark_moe("merge")
+            if profile_moe:
+                self._moe_profile_records.append(
+                    (layer, tuple(moe_events))
+                )
+            return output
         if cached_layer is not None:
             fused_cpu = cached_layer.forward(
                 x_rows,
@@ -1283,12 +1856,74 @@ class DSV4TPQModel:
                         c.get("swiglu_limit", 0.0))
         return y.view(B, T, D).to(output_dtype)
 
+    def _hc_decode_workspace(
+        self,
+        hidden: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Return one stream-ordered HC workspace for batch-1 CUDA decode."""
+        if (
+            not hidden.is_cuda
+            or hidden.dtype != torch.bfloat16
+            or hidden.shape[0] * hidden.shape[1] != 1
+        ):
+            return None
+        width = int(hidden.shape[-1])
+        key = (hidden.device, width)
+        buffers = self._hc_decode_workspaces.get(key)
+        if buffers is None:
+            options = {"dtype": hidden.dtype, "device": hidden.device}
+            buffers = (
+                torch.empty((1, width), **options),
+                torch.empty((1, 4), **options),
+                torch.empty((1, 16), **options),
+            )
+            self._hc_decode_workspaces[key] = buffers
+        return buffers
+
+    def _hc_post_workspace(
+        self,
+        hidden: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Return distinct Attention/FFN HC result buffers for decode."""
+        if (
+            not hidden.is_cuda
+            or hidden.dtype != torch.bfloat16
+            or hidden.shape[0] * hidden.shape[1] != 1
+        ):
+            return None
+        width = int(hidden.shape[-1])
+        key = (hidden.device, width)
+        buffers = self._hc_post_workspaces.get(key)
+        if buffers is None:
+            shape = (1, 1, 4, width)
+            buffers = (
+                torch.empty(shape, dtype=hidden.dtype, device=hidden.device),
+                torch.empty(shape, dtype=hidden.dtype, device=hidden.device),
+            )
+            self._hc_post_workspaces[key] = buffers
+        return buffers
+
     def _block(self, h: torch.Tensor, layer: int, ids: torch.Tensor, pos0: int,
                spec: dict | None = None) -> torch.Tensor:
         from .dsv4 import hc_post
         cfg = self._cfg_obj()
         w = self.layer(layer)
         st = self.states[layer]
+        profile = self._profile_enabled
+        events: list[tuple[str, object]] = []
+
+        def mark(name: str) -> None:
+            if profile:
+                if h.is_cuda:
+                    event = torch.cuda.Event(enable_timing=True)
+                    event.record(torch.cuda.current_stream(self.device))
+                    events.append((name, event))
+                else:
+                    events.append((name, time.perf_counter()))
+
+        mark("start")
+        hc_workspace = self._hc_decode_workspace(h)
+        hc_post_workspace = self._hc_post_workspace(h)
         # 跨层专家预取（B2）：用上一 token 本层路由结果提前装填（时序局部性），
         # attention 计算与专家 读盘/DMA 重叠；未命中回退正常加载，无正确性风险
         prev = self._prev_ids.get(layer)
@@ -1302,9 +1937,20 @@ class DSV4TPQModel:
             w["hc_attn_base"],
             w["attn_norm"],
             cfg,
+            output_buffers=hc_workspace,
         )
+        mark("attn_hc_norm")
         a = self._attn_batch(y, layer, pos0, spec)
-        h = hc_post(a, residual, post, comb)
+        mark("attention")
+        h = hc_post(
+            a,
+            residual,
+            post,
+            comb,
+            output=(
+                None if hc_post_workspace is None else hc_post_workspace[0]
+            ),
+        )
         residual = h
         y, post, comb = _hc_pre_norm_tpq(
             h,
@@ -1313,9 +1959,152 @@ class DSV4TPQModel:
             w["hc_ffn_base"],
             w["ffn_norm"],
             cfg,
+            output_buffers=hc_workspace,
         )
-        f = self._moe(y, layer, ids)
-        return hc_post(f, residual, post, comb).to(compute_dtype(h.device))
+        mark("ffn_hc_norm")
+        moe_result = self._moe(
+            y,
+            layer,
+            ids,
+            return_parts=(
+                y.is_cuda
+                and y.shape[0] * y.shape[1] == 1
+                and self.store.man.projection_vq
+            ),
+        )
+        mark("moe")
+        if isinstance(moe_result, tuple):
+            routed, shared = moe_result
+            output = _hyper_connection_post_moe(
+                routed,
+                shared,
+                residual,
+                post,
+                comb,
+                output=(
+                    None
+                    if hc_post_workspace is None
+                    else hc_post_workspace[1]
+                ),
+            )
+            if output is None:
+                combined = (
+                    routed.to(shared.dtype) + shared
+                ).view(1, 1, -1)
+                output = hc_post(
+                    combined,
+                    residual,
+                    post,
+                    comb,
+                    output=(
+                        None
+                        if hc_post_workspace is None
+                        else hc_post_workspace[1]
+                    ),
+                )
+        else:
+            output = hc_post(
+                moe_result,
+                residual,
+                post,
+                comb,
+                output=(
+                    None
+                    if hc_post_workspace is None
+                    else hc_post_workspace[1]
+                ),
+            )
+        output = output.to(compute_dtype(h.device))
+        mark("ffn_hc_post")
+        if profile:
+            self._profile_records.append((layer, tuple(events)))
+        return output
+
+    def start_profile(self) -> None:
+        """Start one-token CPU/CUDA stage profiling for the benchmark CLI."""
+        self._profile_records = []
+        self._moe_profile_records = []
+        self.last_layer_profile = {}
+        if self.device.type == "cpu" and self.store.man.projection_vq:
+            from .cpuext import (
+                reset_block_fp8_gemv_profile,
+                reset_three_projection_phase_profile,
+            )
+
+            reset_three_projection_phase_profile()
+            reset_block_fp8_gemv_profile()
+        self._profile_enabled = True
+
+    def finish_profile(self) -> dict[str, object]:
+        """Finish a CLI stage probe and aggregate primary-stream events."""
+        self._profile_enabled = False
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+        def elapsed_ms(events: tuple, index: int) -> float:
+            current = events[index][1]
+            following = events[index + 1][1]
+            if self.device.type == "cuda":
+                return float(current.elapsed_time(following))
+            return (float(following) - float(current)) * 1000.0
+        stage_names = (
+            "attn_hc_norm",
+            "attention",
+            "ffn_hc_norm",
+            "moe",
+            "ffn_hc_post",
+        )
+        totals = {name: 0.0 for name in stage_names}
+        layers: list[dict[str, float | int]] = []
+        for layer, events in self._profile_records:
+            values: dict[str, float | int] = {"layer": layer}
+            for index, name in enumerate(stage_names):
+                milliseconds = elapsed_ms(events, index)
+                values[f"{name}_ms"] = milliseconds
+                totals[name] += milliseconds
+            values["total_ms"] = sum(
+                float(values[f"{name}_ms"])
+                for name in stage_names
+            )
+            layers.append(values)
+        top_layers = sorted(
+            layers,
+            key=lambda item: float(item["total_ms"]),
+            reverse=True,
+        )[:8]
+        moe_stage_names = ("route", "shared", "routed", "merge")
+        moe_totals = {name: 0.0 for name in moe_stage_names}
+        moe_layers: list[dict[str, float | int]] = []
+        for layer, events in self._moe_profile_records:
+            values: dict[str, float | int] = {"layer": layer}
+            for index, name in enumerate(moe_stage_names):
+                milliseconds = elapsed_ms(events, index)
+                values[f"{name}_ms"] = milliseconds
+                moe_totals[name] += milliseconds
+            moe_layers.append(values)
+        result: dict[str, object] = {
+            "layer_count": len(layers),
+            "totals_ms": totals,
+            "covered_ms": sum(totals.values()),
+            "top_layers": top_layers,
+            "layers": layers,
+            "moe_totals_ms": moe_totals,
+            "moe_layers": moe_layers,
+        }
+        if self.device.type == "cpu" and self.store.man.projection_vq:
+            from .cpuext import (
+                block_fp8_gemv_profile,
+                three_projection_phase_profile,
+            )
+
+            result["packed_three_projection"] = (
+                three_projection_phase_profile()
+            )
+            result["block_fp8_gemv"] = block_fp8_gemv_profile()
+        self.last_layer_profile = result
+        self._profile_records = []
+        self._moe_profile_records = []
+        return result
 
     def _attn_batch(
         self,
@@ -1323,6 +2112,8 @@ class DSV4TPQModel:
         layer: int,
         pos0: int,
         spec: dict | None,
+        *,
+        tp_context: dict | None = None,
     ) -> torch.Tensor:
         """批量增量注意力（投机验证用）：T 个 token（positions pos0..pos0+T-1）一次前向。
 
@@ -1339,11 +2130,31 @@ class DSV4TPQModel:
             select_index_positions,
         )
 
-        cfg = self._cfg_obj()
-        w = self.layer(layer)
-        st = self.states[layer]
-        cache = self._rope(layer)
-        ratio = self.ratios[layer]
+        cfg = (
+            tp_context["cfg"]
+            if tp_context is not None
+            else self._cfg_obj()
+        )
+        w = (
+            tp_context["weights"]
+            if tp_context is not None
+            else self.layer(layer)
+        )
+        st = (
+            tp_context["state"]
+            if tp_context is not None
+            else self.states[layer]
+        )
+        cache = (
+            tp_context["rope"]
+            if tp_context is not None
+            else self._rope(layer)
+        )
+        ratio = (
+            int(tp_context["ratio"])
+            if tp_context is not None
+            else self.ratios[layer]
+        )
         H, hd, rd = cfg.n_heads, cfg.head_dim, cfg.qk_rope_head_dim
         win = cfg.sliding_window
         B, T, _ = y.shape
@@ -1461,7 +2272,7 @@ class DSV4TPQModel:
                 iq[..., cfg.index_head_dim - rd:] = rope_apply(
                     iq[..., cfg.index_head_dim - rd:], cos, sin
                 )
-                iq = hadamard_rotate(iq.to(compute_dtype(self.device)))
+                iq = hadamard_rotate(iq.to(compute_dtype(dev)))
                 if compressed_count <= indexer.keys.page_items:
                     all_index_keys = indexer.keys.contiguous_prefix(
                         compressed_count
@@ -1588,16 +2399,20 @@ class DSV4TPQModel:
                 return _d._o_proj_hook(
                     fused_cpu.unsqueeze(1).flatten(2), w, cfg
                 )
-        if T == 1 and _d._attn_decode_core_hook is not None:
-            fused = _d._attn_decode_core_hook(
-                q[:, 0],
-                st["kv"],
-                st["win_pos"],
-                selected_values[:, 0],
-                w["attn_sink"],
-                out_cos,
-                out_sin,
-                scale,
+        if T == 1 and q.is_cuda:
+            from .ops import attention_step
+
+            fused = attention_step(
+                "sliding_compressed_mqa_decode",
+                q.device.type,
+                query=q[:, 0],
+                window_kv=st["kv"],
+                window_positions=st["win_pos"],
+                compressed_kv=selected_values[:, 0],
+                sink=w["attn_sink"],
+                cos=out_cos,
+                sin=out_sin,
+                scale=scale,
             )
             if fused is not None:
                 return _d._o_proj_hook(
@@ -1872,11 +2687,270 @@ class DSV4TPQModel:
         self.pos = T
         return logits[:, -1], torch.cat(mh, dim=-1)
 
+    @staticmethod
+    def _copy_paged_state(source: PagedKV, target: PagedKV) -> None:
+        for page_index, page in enumerate(source.pages):
+            target.ensure_page(page_index).copy_(page.to(target.device))
+        target.length = int(source.length)
+
+    def _sync_tp_attention_states(self) -> None:
+        if self._tp_attention_contexts is None or self.states is None:
+            raise RuntimeError("DSV4 TP state cannot be initialized")
+        if self._tp_states_ready:
+            return
+        rank_states = [self.states]
+        for rank in range(1, self.tp_size):
+            rank_states.append(self._allocate_states(1, self.devices[rank]))
+        for rank, states in enumerate(rank_states):
+            for layer, state in enumerate(states):
+                self._tp_attention_contexts[rank][layer]["state"] = state
+                if rank == 0:
+                    continue
+                source = self.states[layer]
+                state["kv"].copy_(source["kv"].to(self.devices[rank]))
+                state["win_pos"].copy_(
+                    source["win_pos"].to(self.devices[rank])
+                )
+                if self.ratios[layer]:
+                    self._copy_paged_state(
+                        source["compressed"], state["compressed"]
+                    )
+                    state["ckv"].copy_(
+                        source["ckv"].to(self.devices[rank])
+                    )
+                    state["cscore"].copy_(
+                        source["cscore"].to(self.devices[rank])
+                    )
+                    if self.ratios[layer] == 4:
+                        source_indexer = source["indexer"]
+                        target_indexer = state["indexer"]
+                        self._copy_paged_state(
+                            source_indexer.keys,
+                            target_indexer.keys,
+                        )
+                        target_indexer.ckv.copy_(
+                            source_indexer.ckv.to(self.devices[rank])
+                        )
+                        target_indexer.cscore.copy_(
+                            source_indexer.cscore.to(self.devices[rank])
+                        )
+        self._tp_states_ready = True
+
+    def _ensure_tp_position(self, position: int) -> None:
+        if self._tp_attention_contexts is None:
+            return
+        for rank in range(self.tp_size):
+            for layer, ratio in enumerate(self.ratios):
+                if not ratio:
+                    continue
+                state = self._tp_attention_contexts[rank][layer]["state"]
+                state["compressed"].reserve(position // ratio)
+                indexer = state.get("indexer")
+                if indexer is not None:
+                    indexer.reserve_position(position)
+
+    def _tp_route(
+        self,
+        layer: int,
+        rank: int,
+        router_logits: torch.Tensor,
+        token_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from .ops import route_topk
+
+        assert self._tp_route_weights is not None
+        item = self._tp_route_weights[rank][layer]
+        logits, weights, indices = self._tp_route_buffers[layer]
+        with torch.cuda.device(self.devices[rank]):
+            tid2eid = item.get("tid2eid")
+            if tid2eid is None:
+                routed = route_topk(
+                    router_logits,
+                    item["gate_bias"],
+                    item["mask"],
+                    scoring_func="sqrtsoftplus",
+                    top_k=int(self.cfg["top_k"]),
+                    normalize=bool(self.cfg.get("norm_topk_prob", True)),
+                    scaling=float(self.cfg.get("routed_scaling", 1.0)),
+                    output_buffers=(weights[rank], indices[rank]),
+                )
+                if routed is None:
+                    raise RuntimeError(
+                        "public sqrtsoftplus Router rejected DSV4 TP inputs"
+                    )
+                return routed
+            scores = F.softplus(router_logits).sqrt()
+            selected = tid2eid[token_ids.reshape(-1)].reshape(
+                1, int(self.cfg["top_k"])
+            )
+            selected_weights = scores.gather(1, selected)
+            if self.cfg.get("norm_topk_prob", True):
+                selected_weights = selected_weights / (
+                    selected_weights.sum(dim=-1, keepdim=True) + 1e-20
+                )
+            selected_weights *= float(
+                self.cfg.get("routed_scaling", 1.0)
+            )
+            logits[rank].copy_(scores)
+            weights[rank].copy_(selected_weights)
+            indices[rank].copy_(selected)
+            return weights[rank], indices[rank]
+
+    def _decode_tp(self, ids: torch.Tensor, pos: int) -> torch.Tensor:
+        from .dsv4 import hc_head, hc_post
+        from .ops import TPHidden
+
+        if (
+            self._tp_attention_contexts is None
+            or self._tp_route_weights is None
+            or self._tp_shared_mlp is None
+        ):
+            raise RuntimeError("DSV4 full TP metadata is unavailable")
+        self._sync_tp_attention_states()
+        self._ensure_tp_position(pos)
+        cfg = self._cfg_obj()
+        embedded = (
+            self._embed(ids)
+            .unsqueeze(1)
+            .unsqueeze(2)
+            .repeat(1, 1, cfg.hc_mult, 1)
+        )
+        hidden = TPHidden.empty(
+            self.devices,
+            tuple(embedded.shape),
+            dtype=embedded.dtype,
+        ).copy_from_owner(embedded, 0)
+
+        for layer in range(int(self.cfg["n_layers"])):
+            attention_partials = []
+            attention_events = []
+            attention_aux = []
+            for rank, device in enumerate(self.devices):
+                route_item = self._tp_route_weights[rank][layer]
+                with torch.cuda.device(device):
+                    local = hidden.wait_on(device)
+                    residual = local
+                    y, post, comb = _hc_pre_norm_tpq(
+                        local,
+                        route_item["hc_attn_fn"],
+                        route_item["hc_attn_scale"],
+                        route_item["hc_attn_base"],
+                        route_item["attn_norm"],
+                        cfg,
+                    )
+                    partial = self._attn_batch(
+                        y,
+                        layer,
+                        pos,
+                        None,
+                        tp_context=self._tp_attention_contexts[rank][layer],
+                    ).float().contiguous()
+                    event = torch.cuda.Event()
+                    event.record(torch.cuda.current_stream(device))
+                    attention_partials.append(partial)
+                    attention_events.append(event)
+                    attention_aux.append((residual, post, comb))
+            for device in self.devices:
+                with torch.cuda.device(device):
+                    stream = torch.cuda.current_stream(device)
+                    for event in attention_events:
+                        stream.wait_event(event)
+            attention = TPHidden.empty(
+                self.devices,
+                tuple(attention_partials[0].shape),
+                dtype=compute_dtype(self.devices[0]),
+            ).reduce_from(attention_partials)
+
+            ffn_input = self._tp_shared_mlp.input_hidden(layer)
+            ffn_aux = []
+            for rank, device in enumerate(self.devices):
+                route_item = self._tp_route_weights[rank][layer]
+                with torch.cuda.device(device):
+                    value = attention.wait_on(device)
+                    residual, post, comb = attention_aux[rank]
+                    prefix = hc_post(value, residual, post, comb)
+                    ffn_residual = prefix
+                    normalized, ffn_post, ffn_comb = _hc_pre_norm_tpq(
+                        prefix,
+                        route_item["hc_ffn_fn"],
+                        route_item["hc_ffn_scale"],
+                        route_item["hc_ffn_base"],
+                        route_item["ffn_norm"],
+                        cfg,
+                    )
+                    ffn_input.replicas[rank].copy_(
+                        normalized.reshape(1, -1)
+                    )
+                    ffn_input.ready_events[rank].record(
+                        torch.cuda.current_stream(device)
+                    )
+                    ffn_aux.append(
+                        (ffn_residual, ffn_post, ffn_comb)
+                    )
+
+            shared = self._tp_shared_mlp.run_hidden(layer, ffn_input)
+            if self._tp_router is None:
+                raise RuntimeError("DSV4 TP Router is unavailable")
+            router_logits = self._tp_router.run_sharded(
+                layer,
+                self._tp_router.bound_input_sharded(layer, ffn_input),
+            )
+            routes = tuple(
+                self._tp_route(
+                    layer,
+                    rank,
+                    router_logits.wait_on(self.devices[rank]),
+                    ids.to(self.devices[rank]),
+                )
+                for rank in range(self.tp_size)
+            )
+            routed = self.pool.run_hidden(
+                layer,
+                ffn_input,
+                routes,
+                activation=self.operator_config.expert_activation,
+                activation_beta=float(self.cfg.get("situ_beta", 4.0)),
+                activation_linear_beta=self.cfg.get("situ_linear_beta"),
+            )
+            output = TPHidden.empty(
+                self.devices,
+                tuple(hidden.shape),
+                dtype=hidden.dtype,
+            )
+            for rank, device in enumerate(self.devices):
+                with torch.cuda.device(device):
+                    stream = torch.cuda.current_stream(device)
+                    stream.wait_event(shared.ready_events[rank])
+                    stream.wait_event(routed.ready_events[rank])
+                    ffn_residual, ffn_post, ffn_comb = ffn_aux[rank]
+                    combined = (
+                        routed.replicas[rank]
+                        + shared.replicas[rank]
+                    ).view(1, 1, -1)
+                    output.replicas[rank].copy_(
+                        hc_post(
+                            combined,
+                            ffn_residual,
+                            ffn_post,
+                            ffn_comb,
+                        )
+                    )
+                    output.ready_events[rank].record(stream)
+            hidden = output
+
+        with torch.cuda.device(self.device):
+            final_hidden = hidden.wait_on(self.device)
+            y = hc_head(final_hidden, *self._hc_head_w(), cfg)
+            y = rmsnorm(y, self.w("norm.weight"), cfg.rms_eps)
+            return _linear(y[:, 0], self.w("head.weight")).float()
+
     @torch.inference_mode()
     def decode(self, ids: torch.Tensor, pos: int) -> torch.Tensor:
         from .dsv4 import hc_head
         cfg = self._cfg_obj()
         ids = ids.to(self.device).long()
+        if self._tp_attention_contexts is not None:
+            return self._decode_tp(ids, pos)
         self.ensure_position(pos)
         # token 级全层预取：上一 token 各层路由专家在本 token 计算窗口内并行读盘/DMA
         # （时序局部性 70-90%；逐层预取窗口只有 attention 一段，全层预取窗口是整个 token）
@@ -1902,4 +2976,6 @@ def _f32(w):
     """Int4Weight → 就地反量化 f32（共享专家走 f32 精确路径，体积小）。"""
     if isinstance(w, Int4Weight):
         return w.dequant_rows(0, w.shape[0])
+    if isinstance(w, BlockFP8Weight):
+        return w.dequant_rows(0, w.shape[0], torch.float32)
     return w.float()
