@@ -26,8 +26,7 @@ Qwen3.5-9B-P1-L.mfq
 | `S` | Scalar Quantization，标量量化 | `Q*_K*` |
 
 主位宽低于 2 bit 的型号统一使用 `P`，例如 `P1-L`；2 bit 及以上继续按实际量化
-家族使用 `V` 或 `S`。UD 基线保留其原始名称，例如
-`UD-IQ3_XXS`、`UD-Q4_K_XL`；MFQ 文件名不得继续使用 `UD-*` 作为自身型号。
+家族使用 `V` 或 `S`。
 
 ## Bits 与 Grade
 
