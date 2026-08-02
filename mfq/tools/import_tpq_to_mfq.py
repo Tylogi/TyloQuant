@@ -1,4 +1,4 @@
-"""Stream a legacy cccp-1 TPQ model directory into one native MFQ file."""
+"""Stream a TPQ model directory into one native MFQ file."""
 
 from __future__ import annotations
 
@@ -69,16 +69,32 @@ class _StreamRecord:
     write: Callable[[BinaryIO], None]
 
 
+def _manifest_path(root: Path) -> Path:
+    canonical = root / "tpq.json"
+    if canonical.is_file():
+        return canonical
+    return root / "cccp.json"
+
+
 def _manifest(root: Path) -> dict:
-    path = root / "cccp.json"
+    path = _manifest_path(root)
     document = json.loads(path.read_text(encoding="utf-8"))
-    if document.get("format") != "cccp-1":
+    if document.get("format") not in {"tpq-1", "cccp-1"}:
         raise ValueError(
-            f"unsupported CCCP artifact format: {document.get('format')!r}"
+            f"unsupported TPQ artifact format: {document.get('format')!r}"
         )
     config = document.get("config")
     quant = document.get("quant")
     expert_files = document.get("expert_files")
+    routed_layers = (
+        (document.get("routed_experts") or {}).get("layer_files") or {}
+    )
+    if expert_files is None and routed_layers:
+        expert_files = {
+            str(layer): str(item["path"])
+            for layer, item in routed_layers.items()
+        }
+        document["expert_files"] = expert_files
     if not isinstance(config, dict) or not isinstance(quant, dict):
         raise ValueError("CCCP manifest lacks config or quant metadata")
     if not isinstance(expert_files, dict) or not expert_files:
@@ -94,7 +110,51 @@ def _manifest(root: Path) -> dict:
 
 
 def _manifest_sha256(root: Path) -> str:
-    return hashlib.sha256((root / "cccp.json").read_bytes()).hexdigest()
+    return hashlib.sha256(_manifest_path(root).read_bytes()).hexdigest()
+
+
+def _projection_metadata(
+    manifest: dict,
+) -> tuple[dict[int, dict[str, str]], dict[str, dict]] | None:
+    quant = manifest["quant"]
+    if quant.get("method") != "projection-vq":
+        return None
+    routed_layers = (
+        (manifest.get("routed_experts") or {}).get("layer_files") or {}
+    )
+    if routed_layers:
+        assignments = {
+            int(layer): {
+                str(projection): str(layout)
+                for projection, layout in item["projection_layout"].items()
+            }
+            for layer, item in routed_layers.items()
+        }
+        specs = quant.get("projection_layouts") or {}
+    else:
+        assignments = {
+            int(layer): {
+                str(projection): str(layout)
+                for projection, layout in value.items()
+            }
+            for layer, value in (quant.get("projection_layouts") or {}).items()
+        }
+        specs = quant.get("layouts") or {}
+    if not assignments or not specs:
+        raise ValueError("TPQ projection-VQ manifest lacks layouts")
+    required = {"gate", "up", "down"}
+    for layer, value in assignments.items():
+        if set(value) != required:
+            raise ValueError(
+                f"TPQ projection layout L{layer} must define gate/up/down"
+            )
+        missing = required.difference(value)
+        if missing:
+            raise ValueError(f"TPQ projection layout L{layer} lacks {missing}")
+        unknown = sorted(set(value.values()).difference(specs))
+        if unknown:
+            raise ValueError(f"TPQ projection layout L{layer} is unknown: {unknown}")
+    return assignments, {str(name): dict(value) for name, value in specs.items()}
 
 
 def _manifest_specs(manifest: dict) -> dict[str, CccpPqSpec]:
@@ -582,12 +642,236 @@ def _write_expert_projection(
                             output.write(payload)
 
 
+def _projection_spec(manifest: dict, layout: str, raw: dict) -> CccpPqSpec:
+    dim = int(raw["dim"])
+    entries = int(raw["size"])
+    packing = str(
+        manifest["quant"].get("index_packing", {}).get(layout, "")
+    )
+    if packing in {"u8", "u16"}:
+        bits = 8 if packing == "u8" else 16
+    elif packing.startswith("packed-u"):
+        bits = int(packing.removeprefix("packed-u"))
+    else:
+        bits = entries.bit_length() - 1
+        if entries <= 0 or 1 << bits != entries:
+            raise ValueError(
+                f"TPQ layout {layout} cannot infer index width from {entries}"
+            )
+    return CccpPqSpec("p", dim, entries, bits)
+
+
+def _projection_codebook_key(
+    projection: str,
+    layout: str,
+    spec: dict,
+    expert: int,
+) -> str:
+    key = f"cb.{projection}.{layout}"
+    group_size = spec.get("group_size")
+    if group_size is None:
+        return key
+    group_size = int(group_size)
+    if group_size <= 0:
+        raise ValueError(f"TPQ layout {layout} has invalid group_size")
+    group = int(expert) // group_size
+    groups = spec.get("groups")
+    if groups is not None and group >= int(groups):
+        raise ValueError(f"TPQ layout {layout} codebook group is out of range")
+    return f"{key}.g{group:03d}"
+
+
+def _projection_pools(
+    manifest: dict,
+    *,
+    layer: int,
+    projection: str,
+    n_experts: int,
+    assignments: dict[int, dict[str, str]],
+    layouts: dict[str, dict],
+) -> tuple[tuple[CccpPqSpec, str, tuple[int, ...]], ...]:
+    layout = assignments[layer][projection]
+    raw_spec = layouts[layout]
+    spec = _projection_spec(manifest, layout, raw_spec)
+    grouped: dict[str, list[int]] = {}
+    for expert in range(n_experts):
+        key = _projection_codebook_key(
+            projection, layout, raw_spec, expert
+        )
+        grouped.setdefault(key, []).append(expert)
+    return tuple(
+        (spec, key, tuple(experts))
+        for key, experts in grouped.items()
+    )
+
+
+def _projection_raw_bytes(handle, key: str) -> bytes:
+    tensor = handle.get_tensor(key).detach().cpu().contiguous()
+    return tensor.view(torch.uint8).reshape(-1).numpy().tobytes()
+
+
+def _projection_record_nbytes(
+    pools: tuple[tuple[CccpPqSpec, str, tuple[int, ...]], ...],
+    *,
+    rows_per_expert: int,
+    columns: int,
+) -> int:
+    total = _NINT_MOE_HDR.size
+    for spec, _codebook_key, experts in pools:
+        dtype = spec.label.encode("ascii")
+        payload = cccp_pq_payload_nbytes(
+            (len(experts) * rows_per_expert, columns), spec
+        )
+        total += (
+            _NINT_MOE_POOL_V2_HDR.size
+            + len(experts) * 4
+            + len(dtype)
+            + payload
+        )
+    return total
+
+
+def _write_projection_vq_record(
+    output: BinaryIO,
+    *,
+    shard: Path,
+    projection: str,
+    layout: str,
+    n_experts: int,
+    rows_per_expert: int,
+    columns: int,
+    pools: tuple[tuple[CccpPqSpec, str, tuple[int, ...]], ...],
+) -> None:
+    output.write(
+        _NINT_MOE_HDR.pack(
+            _NINT_MOE_MAGIC_V2,
+            n_experts,
+            rows_per_expert,
+            columns,
+            len(pools),
+        )
+    )
+    with safe_open(str(shard), framework="pt", device="cpu") as handle:
+        keys = set(handle.keys())
+        for spec, codebook_key, expert_ids in pools:
+            dtype = spec.label.encode("ascii")
+            payload_nbytes = cccp_pq_payload_nbytes(
+                (len(expert_ids) * rows_per_expert, columns), spec
+            )
+            output.write(
+                _NINT_MOE_POOL_V2_HDR.pack(
+                    len(expert_ids), len(dtype), payload_nbytes, 0
+                )
+            )
+            output.write(np.asarray(expert_ids, dtype="<i4").tobytes())
+            output.write(dtype)
+            if codebook_key not in keys:
+                raise KeyError(f"TPQ codebook tensor is absent: {codebook_key}")
+            codebook = _numpy(handle.get_tensor(codebook_key)).astype(
+                np.float32, copy=False
+            )
+            output.write(
+                pack_cccp_pq_prefix(
+                    spec,
+                    (len(expert_ids) * rows_per_expert, columns),
+                    codebook,
+                )
+            )
+            blocks = columns // spec.vector_size
+            expected_bits = rows_per_expert * blocks * spec.index_bits
+            if expected_bits % 8:
+                raise ValueError(
+                    f"TPQ {projection}/{layout} expert payload is not byte aligned"
+                )
+            expected_nbytes = expected_bits // 8
+            for expert in expert_ids:
+                key = f"e{expert}.{projection}.{layout}"
+                if key not in keys:
+                    raise KeyError(f"TPQ expert tensor is absent: {key}")
+                raw = _projection_raw_bytes(handle, key)
+                if len(raw) != expected_nbytes:
+                    raise ValueError(
+                        f"TPQ expert payload size mismatch for {key}: "
+                        f"{len(raw)} != {expected_nbytes}"
+                    )
+                output.write(raw)
+
+
+def _projection_expert_records(
+    root: Path,
+    manifest: dict,
+) -> list[_StreamRecord]:
+    metadata = _projection_metadata(manifest)
+    if metadata is None:
+        raise ValueError("TPQ manifest is not projection-VQ")
+    assignments, layouts = metadata
+    config = manifest["config"]
+    n_experts = int(config["n_experts"])
+    hidden = int(config.get("routed_hidden", config["hidden"]))
+    intermediate = int(config["moe_inter"])
+    records: list[_StreamRecord] = []
+    shapes = {
+        "gate": (intermediate, hidden),
+        "up": (intermediate, hidden),
+        "down": (hidden, intermediate),
+    }
+    for layer, layout_by_projection in sorted(assignments.items()):
+        try:
+            shard = root / str(manifest["expert_files"][str(layer)])
+        except KeyError:
+            shard = root / str(manifest["expert_files"][layer])
+        for projection in ("gate", "up", "down"):
+            rows, columns = shapes[projection]
+            layout = layout_by_projection[projection]
+            pools = _projection_pools(
+                manifest,
+                layer=layer,
+                projection=projection,
+                n_experts=n_experts,
+                assignments=assignments,
+                layouts=layouts,
+            )
+            nbytes = _projection_record_nbytes(
+                pools,
+                rows_per_expert=rows,
+                columns=columns,
+            )
+            name = f"layers.{layer}.ffn.experts.{projection}.weight"
+
+            def write_projection(
+                output: BinaryIO,
+                *,
+                _shard=shard,
+                _projection=projection,
+                _layout=layout,
+                _n_experts=n_experts,
+                _rows=rows,
+                _columns=columns,
+                _pools=pools,
+            ) -> None:
+                _write_projection_vq_record(
+                    output,
+                    shard=_shard,
+                    projection=_projection,
+                    layout=_layout,
+                    n_experts=_n_experts,
+                    rows_per_expert=_rows,
+                    columns=_columns,
+                    pools=_pools,
+                )
+
+            records.append(_StreamRecord(name, "NINTM", nbytes, write_projection))
+    return records
+
+
 def _expert_records(
     root: Path,
     manifest: dict,
     *,
     workers: int = 8,
 ) -> list[_StreamRecord]:
+    if _projection_metadata(manifest) is not None:
+        return _projection_expert_records(root, manifest)
     config = manifest["config"]
     n_experts = int(config["n_experts"])
     hidden = int(config.get("routed_hidden", config["hidden"]))
@@ -737,7 +1021,15 @@ def convert(
             raise FileExistsError(f"partial MFQ output already exists: {partial}")
         partial.unlink()
     manifest = _manifest(root)
-    specs = _manifest_specs(manifest)
+    projection = _projection_metadata(manifest)
+    specs = (
+        _manifest_specs(manifest)
+        if projection is None
+        else {
+            name: _projection_spec(manifest, name, raw)
+            for name, raw in projection[1].items()
+        }
+    )
     records = [
         *_dense_records(root, manifest, row_chunk=row_chunk),
         *_expert_records(root, manifest, workers=workers),
@@ -761,20 +1053,24 @@ def convert(
         ),
         num_tensors=len(records),
         extra={
-            # The on-disk directory manifest is still the legacy cccp-1
-            # source format; TPQ is the canonical MFQ dtype/API name.
-            "source_format": "cccp-1",
+            "source_format": str(manifest["format"]),
             "source_manifest_sha256": _manifest_sha256(root),
             "tpq_manifest": manifest,
-            "cccp_manifest": manifest,
             "tpq_index_storage": {
                 tier: spec.index_bits
                 for tier, spec in specs.items()
             },
-            "cccp_index_storage": {
-                tier: spec.index_bits
-                for tier, spec in specs.items()
-            },
+            **(
+                {
+                    "cccp_manifest": manifest,
+                    "cccp_index_storage": {
+                        tier: spec.index_bits
+                        for tier, spec in specs.items()
+                    },
+                }
+                if manifest["format"] == "cccp-1"
+                else {}
+            ),
         },
     )
     try:

@@ -20,11 +20,356 @@ int64_t moe_phase_calls = 0;
 double packed_moe_phase_seconds[6] = {
     0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
 int64_t packed_moe_phase_calls = 0;
+double three_projection_phase_seconds[5] = {
+    0.0, 0.0, 0.0, 0.0, 0.0};
+int64_t three_projection_phase_calls = 0;
+double block_fp8_gemv_seconds = 0.0;
+int64_t block_fp8_gemv_calls = 0;
+int64_t block_fp8_gemv_weight_elements = 0;
 
 inline double wall_seconds() {
   return std::chrono::duration<double>(
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
+}
+
+const float* e4m3fn_table() {
+  alignas(64) static float values[256];
+  static std::once_flag initialized;
+  std::call_once(initialized, []() {
+    for (int raw = 0; raw < 256; ++raw) {
+      const int magnitude = raw & 0x7f;
+      const int exponent = (magnitude >> 3) & 0x0f;
+      const int mantissa = magnitude & 0x07;
+      float value;
+      if (exponent == 0) {
+        value = std::ldexp(static_cast<float>(mantissa), -9);
+      } else if (exponent < 15) {
+        value = std::ldexp(
+            1.0f + static_cast<float>(mantissa) / 8.0f,
+            exponent - 7);
+      } else if (mantissa < 7) {
+        value = std::ldexp(
+            1.0f + static_cast<float>(mantissa) / 8.0f,
+            8);
+      } else {
+        value = std::numeric_limits<float>::quiet_NaN();
+      }
+      values[raw] = (raw & 0x80) ? -value : value;
+    }
+  });
+  return values;
+}
+
+#if defined(__AVX512BF16__) && defined(__AVX512BW__)
+inline __m512i decode_e4m3fn_bf16x32(const uint8_t* source) {
+  // Every finite E4M3FN value is exactly representable as BF16.  Decode 32
+  // bytes in registers; only the eight exponent-zero magnitudes need a tiny
+  // lane permutation table.  No dequantized weight storage is produced.
+  alignas(64) static const uint16_t subnormal_magnitude[32] = {
+      0x0000, 0x3b00, 0x3b80, 0x3bc0,
+      0x3c00, 0x3c20, 0x3c40, 0x3c60,
+      0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0,
+  };
+  const __m512i raw = _mm512_cvtepu8_epi16(_mm256_loadu_si256(
+      reinterpret_cast<const __m256i*>(source)));
+  const __m512i sign = _mm512_slli_epi16(
+      _mm512_and_si512(raw, _mm512_set1_epi16(0x80)), 8);
+  const __m512i exponent = _mm512_and_si512(
+      _mm512_srli_epi16(raw, 3), _mm512_set1_epi16(0x0f));
+  const __m512i mantissa = _mm512_and_si512(
+      raw, _mm512_set1_epi16(0x07));
+  const __m512i normal = _mm512_or_si512(
+      sign,
+      _mm512_or_si512(
+          _mm512_slli_epi16(
+              _mm512_add_epi16(exponent, _mm512_set1_epi16(120)),
+              7),
+          _mm512_slli_epi16(mantissa, 4)));
+  const __m512i subnormal = _mm512_or_si512(
+      sign,
+      _mm512_permutexvar_epi16(
+          mantissa,
+          _mm512_load_si512(
+              reinterpret_cast<const __m512i*>(subnormal_magnitude))));
+  const __mmask32 subnormal_mask = _mm512_cmpeq_epi16_mask(
+      exponent, _mm512_setzero_si512());
+  __m512i decoded = _mm512_mask_blend_epi16(
+      subnormal_mask, normal, subnormal);
+  const __mmask32 nan_mask =
+      _mm512_cmpeq_epi16_mask(
+          exponent, _mm512_set1_epi16(15)) &
+      _mm512_cmpeq_epi16_mask(
+          mantissa, _mm512_set1_epi16(7));
+  const __m512i nan = _mm512_or_si512(
+      sign, _mm512_set1_epi16(0x7fc0));
+  return _mm512_mask_mov_epi16(decoded, nan_mask, nan);
+}
+#endif
+
+inline float block_fp8_row_dot(
+    const float* input_f,
+    const at::BFloat16* input_b,
+    bool input_bf16,
+    const uint8_t* weight_row,
+    const float* scale_row,
+    const float* lut,
+    int64_t cols,
+    int64_t block_size) {
+  const int64_t col_blocks = (cols + block_size - 1) / block_size;
+  float total = 0.0f;
+  for (int64_t col_block = 0; col_block < col_blocks; ++col_block) {
+    const int64_t start = col_block * block_size;
+    const int64_t stop = std::min(start + block_size, cols);
+    float partial = 0.0f;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    int64_t col = start;
+#if defined(__AVX512BF16__)
+    if (input_bf16) {
+      __m512 accumulated = _mm512_setzero_ps();
+      for (; col + 32 <= stop; col += 32) {
+        const __m512i activation = _mm512_loadu_si512(
+            reinterpret_cast<const __m512i*>(input_b + col));
+        const __m512i decoded = decode_e4m3fn_bf16x32(
+            weight_row + col);
+        accumulated = _mm512_dpbf16_ps(
+            accumulated,
+            (__m512bh)activation,
+            (__m512bh)decoded);
+      }
+      partial = _mm512_reduce_add_ps(accumulated);
+    } else
+#endif
+    {
+      __m512 accumulated = _mm512_setzero_ps();
+      for (; col + 16 <= stop; col += 16) {
+        const __m128i packed = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(weight_row + col));
+        const __m512i raw = _mm512_cvtepu8_epi32(packed);
+        // E4M3 has only 256 values.  The 1 KiB table remains resident in L1;
+        // one indexed load replaces exponent/mantissa reconstruction while
+        // preserving the exact scalar fallback, including subnormals/NaN.
+        const __m512 decoded = _mm512_i32gather_ps(raw, lut, 4);
+        const __m512 activation = _mm512_loadu_ps(input_f + col);
+        accumulated = _mm512_fmadd_ps(
+            activation, decoded, accumulated);
+      }
+      partial = _mm512_reduce_add_ps(accumulated);
+    }
+    for (; col < stop; ++col) {
+      const float activation = input_bf16
+          ? static_cast<float>(input_b[col])
+          : input_f[col];
+      partial += activation * lut[weight_row[col]];
+    }
+#else
+    for (int64_t col = start; col < stop; ++col) {
+      const float activation = input_bf16
+          ? static_cast<float>(input_b[col])
+          : input_f[col];
+      partial += activation * lut[weight_row[col]];
+    }
+#endif
+    total += partial * scale_row[col_block];
+  }
+  return total;
+}
+
+torch::Tensor block_fp8_gemv_cpu(
+    torch::Tensor value,
+    torch::Tensor weights,
+    torch::Tensor scales,
+    int64_t cols,
+    int64_t block_size,
+    torch::Tensor output) {
+  const double started = wall_seconds();
+  TORCH_CHECK(
+      !value.is_cuda() && !weights.is_cuda() && !scales.is_cuda() &&
+          !output.is_cuda(),
+      "block FP8 GEMV operands must be on CPU");
+  TORCH_CHECK(
+      value.dim() == 2 && value.size(0) == 1,
+      "block FP8 GEMV requires one input row");
+  TORCH_CHECK(
+      value.scalar_type() == at::kFloat ||
+          value.scalar_type() == at::kBFloat16,
+      "block FP8 GEMV input must be float32 or bfloat16");
+  TORCH_CHECK(
+      weights.dim() == 2 && weights.scalar_type() == at::kByte &&
+          weights.is_contiguous(),
+      "block FP8 weights must be contiguous uint8 [rows,cols]");
+  TORCH_CHECK(
+      scales.dim() == 2 && scales.scalar_type() == at::kFloat &&
+          scales.is_contiguous(),
+      "block FP8 scales must be contiguous float32");
+  TORCH_CHECK(
+      block_size == 128 && cols == weights.size(1) &&
+          value.size(1) == cols,
+      "block FP8 GEMV currently requires block128 matching columns");
+  const int64_t rows = weights.size(0);
+  const int64_t row_blocks = (rows + block_size - 1) / block_size;
+  const int64_t col_blocks = (cols + block_size - 1) / block_size;
+  TORCH_CHECK(
+      scales.size(0) == row_blocks && scales.size(1) == col_blocks,
+      "block FP8 scale grid does not match weight shape");
+  TORCH_CHECK(
+      (output.scalar_type() == at::kFloat ||
+       output.scalar_type() == at::kBFloat16) &&
+          output.is_contiguous() &&
+          output.numel() >= rows,
+      "block FP8 output must be contiguous float32 or bfloat16");
+
+  auto input = value.contiguous();
+  const bool input_bf16 = input.scalar_type() == at::kBFloat16;
+  const float* xp = input_bf16 ? nullptr : input.data_ptr<float>();
+  const at::BFloat16* xb = input_bf16
+      ? input.data_ptr<at::BFloat16>()
+      : nullptr;
+  const uint8_t* wp = weights.data_ptr<uint8_t>();
+  const float* sp = scales.data_ptr<float>();
+  const float* lut = e4m3fn_table();
+  const bool output_bf16 = output.scalar_type() == at::kBFloat16;
+  float* op = output_bf16 ? nullptr : output.data_ptr<float>();
+  at::BFloat16* opb = output_bf16
+      ? output.data_ptr<at::BFloat16>()
+      : nullptr;
+  at::parallel_for(0, rows, 1, [&](int64_t begin, int64_t end) {
+    for (int64_t row = begin; row < end; ++row) {
+      const uint8_t* weight_row = wp + row * cols;
+      const float* scale_row = sp + (row / block_size) * col_blocks;
+      const float value = block_fp8_row_dot(
+          xp, xb, input_bf16, weight_row, scale_row, lut, cols,
+          block_size);
+      if (output_bf16) {
+        opb[row] = at::BFloat16(value);
+      } else {
+        op[row] = value;
+      }
+    }
+  });
+  block_fp8_gemv_seconds += wall_seconds() - started;
+  ++block_fp8_gemv_calls;
+  block_fp8_gemv_weight_elements += rows * cols;
+  return output.narrow(0, 0, rows).reshape({1, rows});
+}
+
+torch::Tensor block_fp8_grouped_gemv_cpu(
+    torch::Tensor value,
+    torch::Tensor weight_ptrs,
+    torch::Tensor scale_ptrs,
+    torch::Tensor row_offsets,
+    int64_t total_rows,
+    int64_t cols,
+    int64_t block_size,
+    torch::Tensor output) {
+  const double started = wall_seconds();
+  TORCH_CHECK(
+      !value.is_cuda() && !weight_ptrs.is_cuda() &&
+          !scale_ptrs.is_cuda() && !row_offsets.is_cuda() &&
+          !output.is_cuda(),
+      "grouped block FP8 operands must be on CPU");
+  TORCH_CHECK(
+      value.dim() == 2 && value.size(0) == 1 && value.size(1) == cols,
+      "grouped block FP8 requires one matching input row");
+  TORCH_CHECK(
+      value.scalar_type() == at::kFloat ||
+          value.scalar_type() == at::kBFloat16,
+      "grouped block FP8 input must be float32 or bfloat16");
+  TORCH_CHECK(
+      weight_ptrs.scalar_type() == at::kLong && weight_ptrs.dim() == 1 &&
+          weight_ptrs.is_contiguous(),
+      "grouped block FP8 weight pointers must be contiguous int64");
+  TORCH_CHECK(
+      scale_ptrs.scalar_type() == at::kLong && scale_ptrs.dim() == 1 &&
+          scale_ptrs.is_contiguous() &&
+          scale_ptrs.numel() == weight_ptrs.numel(),
+      "grouped block FP8 scale pointers must match weights");
+  TORCH_CHECK(
+      row_offsets.scalar_type() == at::kInt && row_offsets.dim() == 1 &&
+          row_offsets.is_contiguous() &&
+          row_offsets.numel() == weight_ptrs.numel() + 1,
+      "grouped block FP8 row offsets must delimit every weight");
+  TORCH_CHECK(
+      block_size == 128 && total_rows > 0 && cols > 0,
+      "grouped block FP8 currently requires block128");
+  TORCH_CHECK(
+      (output.scalar_type() == at::kFloat ||
+       output.scalar_type() == at::kBFloat16) &&
+          output.is_contiguous() &&
+          output.numel() >= total_rows,
+      "grouped block FP8 output must be contiguous float32 or bfloat16");
+
+  auto input = value.contiguous();
+  const bool input_bf16 = input.scalar_type() == at::kBFloat16;
+  const float* xp = input_bf16 ? nullptr : input.data_ptr<float>();
+  const at::BFloat16* xb = input_bf16
+      ? input.data_ptr<at::BFloat16>()
+      : nullptr;
+  const int64_t* wp = weight_ptrs.data_ptr<int64_t>();
+  const int64_t* sp = scale_ptrs.data_ptr<int64_t>();
+  const int32_t* offsets = row_offsets.data_ptr<int32_t>();
+  const int64_t groups = weight_ptrs.numel();
+  TORCH_CHECK(offsets[0] == 0 && offsets[groups] == total_rows,
+              "grouped block FP8 offsets must cover total rows");
+  for (int64_t group = 0; group < groups; ++group) {
+    TORCH_CHECK(offsets[group] <= offsets[group + 1],
+                "grouped block FP8 offsets must be sorted");
+  }
+  const int64_t col_blocks = (cols + block_size - 1) / block_size;
+  const float* lut = e4m3fn_table();
+  const bool output_bf16 = output.scalar_type() == at::kBFloat16;
+  float* op = output_bf16 ? nullptr : output.data_ptr<float>();
+  at::BFloat16* opb = output_bf16
+      ? output.data_ptr<at::BFloat16>()
+      : nullptr;
+  at::parallel_for(0, total_rows, 1, [&](int64_t begin, int64_t end) {
+    int64_t group = std::upper_bound(
+        offsets, offsets + groups + 1, static_cast<int32_t>(begin)) -
+        offsets - 1;
+    group = std::max<int64_t>(0, std::min(group, groups - 1));
+    for (int64_t row = begin; row < end; ++row) {
+      while (group + 1 < groups && row >= offsets[group + 1]) {
+        ++group;
+      }
+      const int64_t local_row = row - offsets[group];
+      const auto* weight = reinterpret_cast<const uint8_t*>(wp[group]);
+      const auto* scale = reinterpret_cast<const float*>(sp[group]);
+      const float value = block_fp8_row_dot(
+          xp,
+          xb,
+          input_bf16,
+          weight + local_row * cols,
+          scale + (local_row / block_size) * col_blocks,
+          lut,
+          cols,
+          block_size);
+      if (output_bf16) {
+        opb[row] = at::BFloat16(value);
+      } else {
+        op[row] = value;
+      }
+    }
+  });
+  block_fp8_gemv_seconds += wall_seconds() - started;
+  ++block_fp8_gemv_calls;
+  block_fp8_gemv_weight_elements += total_rows * cols;
+  return output.narrow(0, 0, total_rows).reshape({1, total_rows});
+}
+
+void reset_block_fp8_gemv_profile_cpu() {
+  block_fp8_gemv_seconds = 0.0;
+  block_fp8_gemv_calls = 0;
+  block_fp8_gemv_weight_elements = 0;
+}
+
+std::vector<double> block_fp8_gemv_profile_cpu() {
+  return {
+      static_cast<double>(block_fp8_gemv_calls),
+      block_fp8_gemv_seconds,
+      static_cast<double>(block_fp8_gemv_weight_elements),
+  };
 }
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
@@ -997,6 +1342,23 @@ torch::Tensor vq_gemv_list_cpu(
   return out;
 }
 
+inline uint16_t read_odd_packed_index(
+    const uint8_t* packed,
+    int64_t index_offset,
+    int64_t bits) {
+  const int64_t bit_offset = index_offset * bits;
+  const int64_t byte_offset = bit_offset >> 3;
+  const int shift = static_cast<int>(bit_offset & 7);
+  uint32_t word =
+      static_cast<uint32_t>(packed[byte_offset]) |
+      (static_cast<uint32_t>(packed[byte_offset + 1]) << 8);
+  if (shift + bits > 16) {
+    word |= static_cast<uint32_t>(packed[byte_offset + 2]) << 16;
+  }
+  return static_cast<uint16_t>(
+      (word >> shift) & ((uint32_t{1} << bits) - 1));
+}
+
 inline float lookup_sum_packed(
     const float* score,
     const uint8_t* packed,
@@ -1017,6 +1379,21 @@ inline float lookup_sum_packed(
       const int64_t offset = index_offset * 2;
       const uint16_t index = static_cast<uint16_t>(packed[offset]) |
           (static_cast<uint16_t>(packed[offset + 1]) << 8);
+      sum += score[block * codes + index];
+    }
+    return sum;
+  }
+  if (bits == 9) {
+    for (int64_t block = 0; block < blocks; ++block) {
+      const int64_t index_offset = start_index + block;
+      const int64_t bit_offset = index_offset * 9;
+      const int64_t byte_offset = bit_offset >> 3;
+      const int shift = static_cast<int>(bit_offset & 7);
+      const uint16_t word =
+          static_cast<uint16_t>(packed[byte_offset]) |
+          (static_cast<uint16_t>(packed[byte_offset + 1]) << 8);
+      const uint16_t index = static_cast<uint16_t>(
+          (word >> shift) & 0x1ff);
       sum += score[block * codes + index];
     }
     return sum;
@@ -1049,7 +1426,37 @@ inline float lookup_sum_packed(
     }
     return sum;
   }
-  if (start_index % 4 == 0 && blocks % 4 == 0) {
+  if (bits == 10) {
+    if (start_index % 4 == 0 && blocks % 4 == 0) {
+      const int64_t start_byte = (start_index / 4) * 5;
+      for (int64_t block = 0; block < blocks; block += 4) {
+        const int64_t offset = start_byte + (block / 4) * 5;
+        uint64_t word = 0;
+        for (int byte = 0; byte < 5; ++byte) {
+          word |= static_cast<uint64_t>(packed[offset + byte])
+              << (8 * byte);
+        }
+        sum += score[block * codes + (word & 0x3ff)];
+        sum += score[(block + 1) * codes + ((word >> 10) & 0x3ff)];
+        sum += score[(block + 2) * codes + ((word >> 20) & 0x3ff)];
+        sum += score[(block + 3) * codes + ((word >> 30) & 0x3ff)];
+      }
+      return sum;
+    }
+    for (int64_t block = 0; block < blocks; ++block) {
+      const int64_t index_offset = start_index + block;
+      const int64_t offset = (index_offset / 4) * 5;
+      uint64_t word = 0;
+      for (int byte = 0; byte < 5; ++byte) {
+        word |= static_cast<uint64_t>(packed[offset + byte])
+            << (8 * byte);
+      }
+      const int64_t shift = (index_offset % 4) * 10;
+      sum += score[block * codes + ((word >> shift) & 0x3ff)];
+    }
+    return sum;
+  }
+  if (bits == 14 && start_index % 4 == 0 && blocks % 4 == 0) {
     const int64_t start_byte = (start_index / 4) * 7;
     for (int64_t block = 0; block < blocks; block += 4) {
       const int64_t offset = start_byte + (block / 4) * 7;
@@ -1064,15 +1471,23 @@ inline float lookup_sum_packed(
     }
     return sum;
   }
-  for (int64_t block = 0; block < blocks; ++block) {
-    const int64_t index_offset = start_index + block;
-    const int64_t offset = (index_offset / 4) * 7;
-    uint64_t word = 0;
-    for (int byte = 0; byte < 7; ++byte) {
-      word |= static_cast<uint64_t>(packed[offset + byte]) << (8 * byte);
+  if (bits == 14) {
+    for (int64_t block = 0; block < blocks; ++block) {
+      const int64_t index_offset = start_index + block;
+      const int64_t offset = (index_offset / 4) * 7;
+      uint64_t word = 0;
+      for (int byte = 0; byte < 7; ++byte) {
+        word |= static_cast<uint64_t>(packed[offset + byte]) << (8 * byte);
+      }
+      const int64_t shift = (index_offset % 4) * 14;
+      sum += score[block * codes + ((word >> shift) & 0x3fff)];
     }
-    const int64_t shift = (index_offset % 4) * 14;
-    sum += score[block * codes + ((word >> shift) & 0x3fff)];
+    return sum;
+  }
+  for (int64_t block = 0; block < blocks; ++block) {
+    const uint16_t index = read_odd_packed_index(
+        packed, start_index + block, bits);
+    sum += score[block * codes + index];
   }
   return sum;
 }
@@ -1089,6 +1504,9 @@ inline uint16_t read_packed_index(
     return static_cast<uint16_t>(packed[offset]) |
         (static_cast<uint16_t>(packed[offset + 1]) << 8);
   }
+  if (bits == 9 || bits == 11 || bits == 13 || bits == 15) {
+    return read_odd_packed_index(packed, index_offset, bits);
+  }
   if (bits == 12) {
     const int64_t offset = (index_offset / 2) * 3;
     return index_offset % 2 == 0
@@ -1096,6 +1514,16 @@ inline uint16_t read_packed_index(
               ((static_cast<uint16_t>(packed[offset + 1]) & 0x0f) << 8)
         : (static_cast<uint16_t>(packed[offset + 1]) >> 4) |
               (static_cast<uint16_t>(packed[offset + 2]) << 4);
+  }
+  if (bits == 10) {
+    const int64_t offset = (index_offset / 4) * 5;
+    uint64_t word = 0;
+    for (int byte = 0; byte < 5; ++byte) {
+      word |= static_cast<uint64_t>(packed[offset + byte])
+          << (8 * byte);
+    }
+    return static_cast<uint16_t>(
+        (word >> ((index_offset % 4) * 10)) & 0x3ff);
   }
   const int64_t offset = (index_offset / 4) * 7;
   uint64_t word = 0;
@@ -1144,6 +1572,28 @@ inline float direct_dot_packed(
     }
     return sum;
   }
+  if (bits == 10 && start_index % 4 == 0 && blocks % 4 == 0) {
+    const uint8_t* row = packed + (start_index / 4) * 5;
+    for (int64_t block = 0; block < blocks; block += 4) {
+      const int64_t offset = (block / 4) * 5;
+      uint64_t word = 0;
+      for (int byte = 0; byte < 5; ++byte) {
+        word |= static_cast<uint64_t>(row[offset + byte])
+            << (8 * byte);
+      }
+      add_code(block, static_cast<uint16_t>(word & 0x3ff));
+      add_code(
+          block + 1,
+          static_cast<uint16_t>((word >> 10) & 0x3ff));
+      add_code(
+          block + 2,
+          static_cast<uint16_t>((word >> 20) & 0x3ff));
+      add_code(
+          block + 3,
+          static_cast<uint16_t>((word >> 30) & 0x3ff));
+    }
+    return sum;
+  }
   if (bits == 14 && start_index % 4 == 0 && blocks % 4 == 0) {
     const uint8_t* row = packed + (start_index / 4) * 7;
     for (int64_t block = 0; block < blocks; block += 4) {
@@ -1186,8 +1636,9 @@ torch::Tensor vq_gemv_packed_list_cpu(
   TORCH_CHECK(x_rows.dim() == 2, "x_rows must be [N|1,C]");
   TORCH_CHECK(codebook.dim() == 2, "codebook must be [K,D]");
   TORCH_CHECK(!packed_list.empty(), "packed VQ list cannot be empty");
-  TORCH_CHECK(bits == 8 || bits == 12 || bits == 14 || bits == 16,
-              "packed VQ width must be 8, 12, 14, or 16");
+  TORCH_CHECK(
+      bits >= 8 && bits <= 16,
+      "packed VQ width must be in [8,16]");
   TORCH_CHECK(rows > 0 && blocks > 0,
               "packed VQ rows and blocks must be positive");
   const int64_t n = static_cast<int64_t>(packed_list.size());
@@ -1221,8 +1672,111 @@ torch::Tensor vq_gemv_packed_list_cpu(
   const int64_t score_n = x.size(0);
   const bool use_direct =
       allow_direct &&
-      score_n == n &&
-      rows * dim < codes * dim + rows;
+      (score_n == 1 || score_n == n) &&
+      n * rows * dim < score_n * codes * dim + n * rows;
+#if defined(__AVX512F__)
+  // Large p14/p16 codebooks are sparse during Top-K decode: only the selected
+  // experts' row indices are needed.  Vectorise over 16 output rows and
+  // gather the referenced transposed code vectors directly.  Keeping one
+  // block-local dot before accumulating preserves the score-then-lookup
+  // floating-point order while avoiding a blocks*K score table.
+  if (use_direct && (bits == 14 || bits == 16)) {
+    auto out = torch::empty(
+        {n, rows},
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+    auto cb_transposed = cached_transposed_codebook(cb);
+    const float* xp = x.data_ptr<float>();
+    const float* cp = cb_transposed.data_ptr<float>();
+    float* op = out.data_ptr<float>();
+    const int64_t row_groups = (rows + 15) / 16;
+    at::parallel_for(0, n * row_groups, 1, [&](int64_t begin, int64_t end) {
+      alignas(64) int32_t gathered_indices[4][16];
+      for (int64_t item = begin; item < end; ++item) {
+        const int64_t batch = item / row_groups;
+        const int64_t row = (item - batch * row_groups) * 16;
+        const int64_t valid = std::min<int64_t>(16, rows - row);
+        const uint8_t* payload = payload_ptrs[batch];
+        const int64_t input_batch = score_n == 1 ? 0 : batch;
+        const float* input = xp + input_batch * blocks * dim;
+        __m512 accumulated = _mm512_setzero_ps();
+        const auto accumulate_block = [&](const int32_t* block_indices,
+                                          int64_t block) {
+          const __m512i indices = _mm512_load_si512(block_indices);
+          __m512 block_score = _mm512_setzero_ps();
+          for (int64_t lane = 0; lane < dim; ++lane) {
+            const __m512 code_values = _mm512_i32gather_ps(
+                indices,
+                cp + lane * codes,
+                sizeof(float));
+            block_score = _mm512_fmadd_ps(
+                _mm512_set1_ps(input[block * dim + lane]),
+                code_values,
+                block_score);
+          }
+          accumulated = _mm512_add_ps(accumulated, block_score);
+        };
+        if (bits == 14 && blocks % 4 == 0) {
+          for (int64_t block = 0; block < blocks; block += 4) {
+            for (int64_t lane = 0; lane < valid; ++lane) {
+              const int64_t index_offset =
+                  (row + lane) * blocks + block;
+              const int64_t offset = (index_offset / 4) * 7;
+              uint64_t word = 0;
+              for (int byte = 0; byte < 7; ++byte) {
+                word |= static_cast<uint64_t>(payload[offset + byte])
+                    << (8 * byte);
+              }
+              gathered_indices[0][lane] =
+                  static_cast<int32_t>(word & 0x3fff);
+              gathered_indices[1][lane] =
+                  static_cast<int32_t>((word >> 14) & 0x3fff);
+              gathered_indices[2][lane] =
+                  static_cast<int32_t>((word >> 28) & 0x3fff);
+              gathered_indices[3][lane] =
+                  static_cast<int32_t>((word >> 42) & 0x3fff);
+            }
+            for (int subblock = 0; subblock < 4; ++subblock) {
+              for (int64_t lane = valid; lane < 16; ++lane) {
+                gathered_indices[subblock][lane] = 0;
+              }
+              accumulate_block(
+                  gathered_indices[subblock], block + subblock);
+            }
+          }
+        } else {
+          for (int64_t block = 0; block < blocks; ++block) {
+            for (int64_t lane = 0; lane < valid; ++lane) {
+              const int64_t index_offset =
+                  (row + lane) * blocks + block;
+              if (bits == 16) {
+                const int64_t offset = index_offset * 2;
+                gathered_indices[0][lane] =
+                    static_cast<int32_t>(payload[offset]) |
+                    (static_cast<int32_t>(payload[offset + 1]) << 8);
+              } else {
+                gathered_indices[0][lane] = static_cast<int32_t>(
+                    read_packed_index(payload, index_offset, bits));
+              }
+            }
+            for (int64_t lane = valid; lane < 16; ++lane) {
+              gathered_indices[0][lane] = 0;
+            }
+            accumulate_block(gathered_indices[0], block);
+          }
+        }
+        if (valid == 16) {
+          _mm512_storeu_ps(op + batch * rows + row, accumulated);
+        } else {
+          const __mmask16 mask =
+              static_cast<__mmask16>((uint32_t{1} << valid) - 1);
+          _mm512_mask_storeu_ps(
+              op + batch * rows + row, mask, accumulated);
+        }
+      }
+    });
+    return out;
+  }
+#endif
   if (use_direct) {
     auto out = torch::empty(
         {n, rows},
@@ -1235,7 +1789,8 @@ torch::Tensor vq_gemv_packed_list_cpu(
         const int64_t batch = item / rows;
         const int64_t row = item - batch * rows;
         const uint8_t* payload = payload_ptrs[batch];
-        const float* input = xp + batch * blocks * dim;
+        const int64_t input_batch = score_n == 1 ? 0 : batch;
+        const float* input = xp + input_batch * blocks * dim;
         op[item] = direct_dot_packed(
             input,
             cp,
@@ -1284,6 +1839,148 @@ torch::Tensor vq_gemv_packed_list_cpu(
     }
   });
   return out;
+}
+
+torch::Tensor moe_packed_three_projection_cpu(
+    torch::Tensor x_row,
+    std::vector<torch::Tensor> gate_payloads,
+    torch::Tensor gate_codebook,
+    int64_t gate_rows,
+    int64_t gate_blocks,
+    int64_t gate_bits,
+    std::vector<torch::Tensor> up_payloads,
+    torch::Tensor up_codebook,
+    int64_t up_rows,
+    int64_t up_blocks,
+    int64_t up_bits,
+    std::vector<torch::Tensor> down_payloads,
+    torch::Tensor down_codebook,
+    int64_t down_rows,
+    int64_t down_blocks,
+    int64_t down_bits,
+    torch::Tensor route_weights,
+    double limit,
+    std::string activation,
+    double beta,
+    double linear_beta,
+    torch::Tensor result) {
+  const int64_t experts =
+      static_cast<int64_t>(gate_payloads.size());
+  TORCH_CHECK(
+      experts > 0 && experts <= 16 &&
+          static_cast<int64_t>(up_payloads.size()) == experts &&
+          static_cast<int64_t>(down_payloads.size()) == experts,
+      "three-projection packed MoE operand counts must match");
+  TORCH_CHECK(
+      !x_row.is_cuda() && x_row.dim() == 2 &&
+          x_row.size(0) == 1,
+      "three-projection packed MoE requires one CPU row");
+  TORCH_CHECK(
+      !route_weights.is_cuda() &&
+          route_weights.numel() == experts,
+      "three-projection route weights must match Top-K");
+  TORCH_CHECK(
+      activation == "situ" || activation == "silu" ||
+          activation == "swiglu",
+      "three-projection activation must be situ, silu, or swiglu");
+  TORCH_CHECK(
+      gate_rows == up_rows &&
+          down_rows == x_row.size(1) &&
+          gate_blocks * gate_codebook.size(1) == x_row.size(1) &&
+          up_blocks * up_codebook.size(1) == x_row.size(1) &&
+          down_blocks * down_codebook.size(1) == gate_rows,
+      "three-projection logical matrix shapes do not match");
+
+  const double gate_started = wall_seconds();
+  auto gate_values = vq_gemv_packed_list_cpu(
+      x_row,
+      std::move(gate_payloads),
+      gate_codebook,
+      gate_rows,
+      gate_blocks,
+      gate_bits,
+      true);
+  const double up_started = wall_seconds();
+  auto up_values = vq_gemv_packed_list_cpu(
+      x_row,
+      std::move(up_payloads),
+      up_codebook,
+      up_rows,
+      up_blocks,
+      up_bits,
+      true);
+  const double activation_started = wall_seconds();
+  if (limit != 0.0) {
+    gate_values.clamp_max_(limit);
+    up_values.clamp_(-limit, limit);
+  }
+  torch::Tensor activated;
+  if (activation == "situ") {
+    activated = gate_values.clone();
+    activated.div_(beta);
+    activated.tanh_();
+    activated.mul_(beta);
+    auto sigmoid = gate_values.sigmoid();
+    activated.mul_(sigmoid);
+    if (linear_beta > 0.0) {
+      up_values.div_(linear_beta);
+      up_values.tanh_();
+      up_values.mul_(linear_beta);
+    }
+    activated.mul_(up_values);
+  } else {
+    activated = gate_values * gate_values.sigmoid();
+    activated.mul_(up_values);
+  }
+  const double down_started = wall_seconds();
+  auto down_values = vq_gemv_packed_list_cpu(
+      activated,
+      std::move(down_payloads),
+      down_codebook,
+      down_rows,
+      down_blocks,
+      down_bits,
+      true);
+  const double reduce_started = wall_seconds();
+  auto reduced = torch::sum(
+      down_values *
+          route_weights.to(torch::kFloat32).reshape({experts, 1}),
+      0);
+  TORCH_CHECK(
+      !result.is_cuda() && result.scalar_type() == at::kFloat &&
+          result.numel() >= down_rows,
+      "three-projection result workspace is invalid");
+  result.narrow(0, 0, down_rows).copy_(reduced);
+  const double finished = wall_seconds();
+  three_projection_phase_seconds[0] += up_started - gate_started;
+  three_projection_phase_seconds[1] +=
+      activation_started - up_started;
+  three_projection_phase_seconds[2] +=
+      down_started - activation_started;
+  three_projection_phase_seconds[3] +=
+      reduce_started - down_started;
+  three_projection_phase_seconds[4] += finished - reduce_started;
+  ++three_projection_phase_calls;
+  return result.narrow(0, 0, down_rows);
+}
+
+void reset_three_projection_phase_profile_cpu() {
+  std::fill(
+      std::begin(three_projection_phase_seconds),
+      std::end(three_projection_phase_seconds),
+      0.0);
+  three_projection_phase_calls = 0;
+}
+
+std::vector<double> three_projection_phase_profile_cpu() {
+  return {
+      static_cast<double>(three_projection_phase_calls),
+      three_projection_phase_seconds[0],
+      three_projection_phase_seconds[1],
+      three_projection_phase_seconds[2],
+      three_projection_phase_seconds[3],
+      three_projection_phase_seconds[4],
+  };
 }
 
 torch::Tensor moe_packed_topk_cpu(
@@ -1379,12 +2076,10 @@ torch::Tensor moe_packed_topk_cpu(
             dn_codebook.dim() == 2 && dn_codebook.is_contiguous(),
         "packed Top-K MoE codebooks must be contiguous CPU float32");
     TORCH_CHECK(
-        gu_bits[expert] == 8 || gu_bits[expert] == 12 ||
-            gu_bits[expert] == 14 || gu_bits[expert] == 16,
+        gu_bits[expert] >= 8 && gu_bits[expert] <= 16,
         "unsupported packed GU width");
     TORCH_CHECK(
-        dn_bits[expert] == 8 || dn_bits[expert] == 12 ||
-            dn_bits[expert] == 14 || dn_bits[expert] == 16,
+        dn_bits[expert] >= 8 && dn_bits[expert] <= 16,
         "unsupported packed Down width");
     const int64_t gu_dim = gu_codebook.size(1);
     const int64_t dn_dim = dn_codebook.size(1);
@@ -4294,13 +4989,41 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       &vq_gemv_cpu,
       "TPQ uint8/uint16 VQ GEMV for CPU");
   module.def(
+      "block_fp8_gemv",
+      &block_fp8_gemv_cpu,
+      "TPQ compact E4M3FN block128 GEMV for CPU");
+  module.def(
+      "block_fp8_grouped_gemv",
+      &block_fp8_grouped_gemv_cpu,
+      "TPQ grouped compact E4M3FN block128 GEMV for CPU");
+  module.def(
+      "reset_block_fp8_gemv_profile",
+      &reset_block_fp8_gemv_profile_cpu,
+      "Reset compact block-FP8 CPU GEMV timers");
+  module.def(
+      "block_fp8_gemv_profile",
+      &block_fp8_gemv_profile_cpu,
+      "Read compact block-FP8 CPU GEMV timers");
+  module.def(
       "vq_gemv_list",
       &vq_gemv_list_cpu,
       "TPQ list-backed uint8/uint16 VQ GEMV for CPU");
   module.def(
       "vq_gemv_packed_list",
       &vq_gemv_packed_list_cpu,
-      "TPQ list-backed packed 8/12/14/16-bit VQ GEMV for CPU");
+      "TPQ list-backed packed 8--16-bit VQ GEMV for CPU");
+  module.def(
+      "moe_packed_three_projection",
+      &moe_packed_three_projection_cpu,
+      "TPQ packed Gate/Up/activation/Down Top-K MoE for CPU");
+  module.def(
+      "reset_three_projection_phase_profile",
+      &reset_three_projection_phase_profile_cpu,
+      "Reset packed three-projection CPU MoE phase timers");
+  module.def(
+      "three_projection_phase_profile",
+      &three_projection_phase_profile_cpu,
+      "Read packed three-projection CPU MoE phase timers");
   module.def(
       "moe_packed_topk",
       &moe_packed_topk_cpu,

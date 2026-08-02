@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
 
-from mfq.formats.tpq import TpqInt4Tensor
+from mfq.formats.tpq import TpqInt4Tensor, pack_tpq_indices
 from mfq.formats.io import load_mmap
 from mfq.formats.moe import NintMoeTensor
 from mfq.quantize.expert_nint import dequantize_expertwise
@@ -92,6 +92,119 @@ def _cccp_artifact(root: Path) -> tuple[Path, dict[str, np.ndarray]]:
     return root, expected
 
 
+def _projection_tpq_artifact(root: Path) -> tuple[Path, dict[tuple[str, int], bytes]]:
+    root.mkdir()
+    save_file(
+        {"norm.weight": torch.arange(8, dtype=torch.float32)},
+        str(root / "dense.safetensors"),
+    )
+    layouts = {
+        "g9": {"dim": 2, "size": 512, "group_size": 1, "groups": 2},
+        "u10": {"dim": 4, "size": 1024},
+        "d11": {"dim": 2, "size": 2048, "group_size": 2, "groups": 1},
+    }
+    projection_layout = {"gate": "g9", "up": "u10", "down": "d11"}
+    shapes = {"gate": (4, 8), "up": (4, 8), "down": (8, 4)}
+    bits = {"gate": 9, "up": 10, "down": 11}
+    rng = np.random.default_rng(1200)
+    tensors: dict[str, torch.Tensor] = {}
+    expected: dict[tuple[str, int], bytes] = {}
+    for projection, layout in projection_layout.items():
+        spec = layouts[layout]
+        codebooks = 2 if spec.get("group_size") == 1 else 1
+        for group in range(codebooks):
+            suffix = f".g{group:03d}" if "group_size" in spec else ""
+            tensors[f"cb.{projection}.{layout}{suffix}"] = torch.from_numpy(
+                rng.normal(size=(spec["size"], spec["dim"])).astype(np.float32)
+            )
+        rows, columns = shapes[projection]
+        for expert in range(2):
+            indices = rng.integers(
+                0,
+                spec["size"],
+                size=(rows, columns // spec["dim"]),
+                dtype=np.uint16,
+            )
+            raw = pack_tpq_indices(indices, bits[projection])
+            tensors[f"e{expert}.{projection}.{layout}"] = torch.from_numpy(
+                np.frombuffer(raw, dtype=np.uint8).copy()
+            )
+            expected[(projection, expert)] = raw
+    save_file(tensors, str(root / "experts.L00.safetensors"))
+    manifest = {
+        "format": "tpq-1",
+        "model_family": "deepseek_v4",
+        "config": {
+            "n_layers": 1,
+            "n_experts": 2,
+            "top_k": 1,
+            "hidden": 8,
+            "moe_inter": 4,
+            "hc_mult": 4,
+        },
+        "quant": {
+            "method": "projection-vq",
+            "layouts": layouts,
+            "projection_layouts": {"0": projection_layout},
+            "index_packing": {
+                "g9": "packed-u9",
+                "u10": "packed-u10",
+                "d11": "packed-u11",
+            },
+        },
+        "dense_file": "dense.safetensors",
+        "expert_files": {"0": "experts.L00.safetensors"},
+        "tokenizer_files": [],
+    }
+    (root / "tpq.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return root, expected
+
+
+def test_import_projection_tpq_preserves_three_packed_projections(
+    tmp_path: Path,
+) -> None:
+    source, expected = _projection_tpq_artifact(tmp_path / "projection")
+    output = convert(source, tmp_path / "projection.mfq")
+    package = load_tpq_package()
+    install_mfq_tpq_store(package)
+    store = MfqTpqStore(output, package)
+    try:
+        assert store.man.projection_vq
+        assert store.man.projection_operator_capability(0) == {
+            "packed_formats": ("p9", "p10", "p11"),
+            "code_dims": (2, 4, 2),
+            "codebook_sizes": (512, 1024, 2048),
+        }
+        for expert in range(2):
+            weights = store.load_expert_packed(0, expert)
+            assert len(weights) == 3
+            for projection, weight in zip(("gate", "up", "down"), weights):
+                assert bytes(weight.raw.numpy()) == expected[(projection, expert)]
+                assert pack_tpq_indices(
+                    weight.unpack().numpy(), weight.bits
+                ) == expected[(projection, expert)]
+        header, mapped = load_mmap(output)
+        try:
+            assert header.extra["source_format"] == "tpq-1"
+            assert "cccp_manifest" not in header.extra
+            assert set(mapped.records).issuperset(
+                {
+                    "layers.0.ffn.experts.gate.weight",
+                    "layers.0.ffn.experts.up.weight",
+                    "layers.0.ffn.experts.down.weight",
+                }
+            )
+            gate = mapped["layers.0.ffn.experts.gate.weight"]
+            assert isinstance(gate, NintMoeTensor)
+            assert {pool.tensor.spec.tier for pool in gate.pools} == {"p"}
+            assert {pool.tensor.spec.index_bits for pool in gate.pools} == {9}
+            del gate
+        finally:
+            mapped.close()
+    finally:
+        store.close()
+
+
 def test_import_cccp_directory_to_native_mfq(tmp_path: Path) -> None:
     source, expected = _cccp_artifact(tmp_path / "cccp")
     output = convert(source, tmp_path / "model.mfq", row_chunk=2)
@@ -143,14 +256,15 @@ def test_import_kimi_tpq2_sharded_dense_and_compact_experts(
     )
     expert_shard = source / "experts.L01.safetensors"
     expert_tensors = load_file(str(expert_shard))
-    save_file(
-        {
-            name: tensor
-            for name, tensor in expert_tensors.items()
-            if not name.startswith("e3.")
-        },
-        str(expert_shard),
-    )
+    # Clone and release the source views before replacing the file: Windows
+    # rejects overwriting a safetensors file with a live mapped section.
+    filtered_experts = {
+        name: tensor.clone()
+        for name, tensor in expert_tensors.items()
+        if not name.startswith("e3.")
+    }
+    del expert_tensors
+    save_file(filtered_experts, str(expert_shard))
     manifest = json.loads((source / "cccp.json").read_text(encoding="utf-8"))
     manifest["model_family"] = "kimi_k3"
     manifest["config"] = {

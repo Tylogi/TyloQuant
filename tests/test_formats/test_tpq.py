@@ -18,6 +18,7 @@ from mfq.formats.tpq import (
     CCCP_VV,
     CCCP_W,
     CCCP_X,
+    CccpPqTensor,
     CccpPqSpec,
     pack_cccp_indices,
     pack_cccp_int4,
@@ -70,6 +71,40 @@ def test_cccp_indices_follow_source_storage_dtype(
     assert len(payload) == values.size * np.dtype(dtype).itemsize
     assert offset == len(payload)
     np.testing.assert_array_equal(restored, values)
+
+
+@pytest.mark.parametrize("bits", range(8, 17))
+def test_tpq_projection_indices_roundtrip_every_packed_width(bits: int) -> None:
+    entries = 1 << min(bits, 9)
+    values = np.arange(32, dtype=np.uint16).reshape(4, 8) % entries
+    payload = pack_cccp_indices(values, bits)
+    restored, offset = unpack_cccp_indices(payload, 0, values.size, bits)
+    assert offset == len(payload) == (values.size * bits + 7) // 8
+    np.testing.assert_array_equal(restored.reshape(values.shape), values)
+
+    spec = CccpPqSpec("p", 2, entries, bits)
+    tensor = CccpPqTensor(
+        spec=spec,
+        shape=(4, 16),
+        axis=0,
+        neuron_len=16,
+        indices=values,
+        codebook=np.arange(entries * 2, dtype=np.float32).reshape(entries, 2),
+    )
+    decoded = unpack_cccp_pq(pack_cccp_pq(tensor))
+    assert decoded.spec == spec
+    decoded_payload = (
+        decoded.indices.tobytes()
+        if bits not in {8, 16}
+        else pack_cccp_indices(decoded.indices, bits)
+    )
+    decoded_values, _ = unpack_cccp_indices(
+        decoded_payload,
+        0,
+        values.size,
+        bits,
+    )
+    np.testing.assert_array_equal(decoded_values.reshape(values.shape), values)
 
 
 def test_cccp_pq_roundtrip_all_tiers() -> None:

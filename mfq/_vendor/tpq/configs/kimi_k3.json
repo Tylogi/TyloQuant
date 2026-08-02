@@ -29,6 +29,7 @@
     "TPQ_SHARED_MLP_TP": "1",
     "TPQ_ATTENTION_TP": "1",
     "TPQ_MLA_TP": "1",
+    "TPQ_FLASHINFER_MLA": "1",
     "TPQ_ROUTED_PROJECTION_TP": "0",
     "TPQ_ROUTED_DOWN_ROW_TP": "0",
     "TPQ_ROUTER_TP": "0",
@@ -46,7 +47,7 @@
     "TPQ_CPU_NUMA": "auto",
     "TPQ_RAM_RESERVE_GB": "32",
     "TPQ_RESIDENT_RESERVE_GB": "32",
-    "TPQ_VRAM_RESERVE_GB": "3",
+    "TPQ_VRAM_RESERVE_GB": "1.25",
     "TPQ_VRAM_RUNTIME_GB": "3"
   },
   "profiles": {
@@ -54,7 +55,15 @@
       "description": "单卡计算；紧凑专家常驻RAM并按需进入显存缓存",
       "tp": 1,
       "environment": {
-        "TPQ_KIMI_PACKED_HYBRID": "1"
+        "TPQ_KIMI_PACKED_HYBRID": "1",
+        "TPQ_SINGLE_GPU_LAYER_GRAPH": "0",
+        "TPQ_TP_HIDDEN": "1",
+        "TPQ_TP_HIDDEN_STATE": "1",
+        "TPQ_TP_NO_OWNER": "0",
+        "TPQ_TP_LAYER_GRAPH": "1",
+        "TPQ_MOE_OWNER_GRAPH": "1",
+        "TPQ_MOE_ROUTE_DOWN_TP": "0",
+        "TPQ_ROUTED_PROJECTION_TP": "1"
       }
     },
     "parallel": {

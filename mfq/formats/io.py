@@ -507,7 +507,7 @@ def _unpack_tensor(dtype: str, blob: bytes | memoryview) -> MfqTensor:
                 f"MFQ dtype/blob mismatch: TPQ-I4G64 contains g{tensor.group_size}"
             )
         return tensor
-    if dtype in TPQ_PQ_SPECS:
+    if dtype in TPQ_PQ_SPECS or dtype == "TPQ-P":
         tensor = unpack_tpq_pq(blob)
         if tensor.spec.label != dtype:
             raise ValueError(

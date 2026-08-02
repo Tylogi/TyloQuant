@@ -1,7 +1,6 @@
 """DeepSeek-V4 official message encoding and completion parsing.
 
-Ported from:
-  DeepSeek-V4-Flash-DSpark/encoding/encoding_dsv4.py
+Ported from the official DeepSeek-V4 Flash message encoder.
 Source SHA-256:
   bdbd57c132a1b3725042323d02b98b9d1df28e5f388f134399555d041f5055e0
 
@@ -242,7 +241,8 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
         Encoded string for this message.
     """
     assert 0 <= index < len(messages)
-    assert thinking_mode in ["chat", "thinking"], f"Invalid thinking_mode `{thinking_mode}`"
+    if thinking_mode not in {"chat", "thinking"}:
+        raise ValueError(f"Invalid thinking_mode `{thinking_mode}`")
 
     prompt = ""
     msg = messages[index]
@@ -262,7 +262,11 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
         tool_calls = tool_calls_from_openai_format(tool_calls)
 
     # Reasoning effort prefix (only at index 0 in thinking mode with max effort)
-    assert reasoning_effort in ['max', None, 'high'], f"Invalid reasoning effort: {reasoning_effort}"
+    if reasoning_effort not in {"max", None, "high"}:
+        raise ValueError(
+            "DeepSeek-V4 reasoning_effort only supports high/max; "
+            f"received {reasoning_effort!r}"
+        )
     if index == 0 and thinking_mode == "thinking" and reasoning_effort == 'max':
         prompt += REASONING_EFFORT_MAX
 

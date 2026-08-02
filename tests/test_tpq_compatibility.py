@@ -123,3 +123,30 @@ def test_legacy_cccp_directory_remains_readable(tmp_path: Path) -> None:
     )
     artifact = TPQArtifact.open(root)
     assert artifact.manifest["format"] == "cccp-1"
+
+
+def test_canonical_tpq_directory_is_preferred(tmp_path: Path) -> None:
+    root = tmp_path / "tpq"
+    root.mkdir()
+    (root / "dense.safetensors").write_bytes(b"dense")
+    (root / "experts.safetensors").write_bytes(b"expert")
+    manifest = {
+        "format": "tpq-1",
+        "config": {
+            "n_layers": 1,
+            "n_experts": 1,
+            "top_k": 1,
+            "hidden": 8,
+            "moe_inter": 8,
+            "hc_mult": 1,
+        },
+        "quant": {"vq": {"x": [8, 256]}},
+        "expert_files": {"0": "experts.safetensors"},
+        "dense_file": "dense.safetensors",
+        "tokenizer_files": [],
+    }
+    (root / "tpq.json").write_text(json.dumps(manifest), encoding="utf-8")
+    legacy = dict(manifest, format="cccp-1")
+    (root / "cccp.json").write_text(json.dumps(legacy), encoding="utf-8")
+    artifact = TPQArtifact.open(root)
+    assert artifact.manifest["format"] == "tpq-1"

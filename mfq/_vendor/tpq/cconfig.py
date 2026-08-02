@@ -12,6 +12,8 @@ import json
 import os
 from dataclasses import dataclass, field, asdict
 
+from .presets import load_manifest as _load_tpq_manifest
+
 
 @dataclass
 class ModelConfig:
@@ -360,10 +362,12 @@ def load_config(path: str):
     arch = detect_arch(path)
     if arch == "kimi_k3":
         root = path if os.path.isdir(path) else os.path.dirname(path)
-        manifest = os.path.join(root, "cccp.json")
-        if os.path.exists(manifest):
-            with open(manifest, "r", encoding="utf-8") as handle:
-                values = json.load(handle)["config"]
+        try:
+            _root, manifest = _load_tpq_manifest(root)
+        except (OSError, ValueError, KeyError, TypeError):
+            manifest = None
+        if manifest is not None:
+            values = manifest["config"]
             return KimiK3Config.from_json(values)
         return KimiK3Config.from_hf(path)
     if arch == "glm":

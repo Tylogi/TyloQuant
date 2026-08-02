@@ -141,7 +141,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", required=True, help="CCCP 模型目录")
     parser.add_argument(
         "--profile",
-        choices=("auto", "ram", "parallel"),
+        choices=("auto", "ram", "resident", "parallel"),
         default="auto",
     )
     parser.add_argument("--tp", type=int)
@@ -155,7 +155,24 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--window", type=int, default=8)
     parser.add_argument("--cache-gb", type=float)
     parser.add_argument("--vram-gb", type=float)
+    parser.add_argument(
+        "--dense-residency",
+        choices=("auto", "gpu"),
+        default="auto",
+        help="auto 自动尝试 Dense GPU-only；gpu 容量不足即失败",
+    )
+    parser.add_argument(
+        "--single-gpu-layer-graph",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="显式启用/禁用单卡固定地址层 Graph",
+    )
     parser.add_argument("--json", help="保存完整结果的 JSON 路径")
+    parser.add_argument(
+        "--probe-stages",
+        action="store_true",
+        help="测量结束后额外执行 1 token 分阶段探针；不计入吞吐",
+    )
     return parser
 
 
@@ -206,6 +223,10 @@ def _apply_preset_environment(args: argparse.Namespace, preset: Any) -> None:
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(devices)
     for key, value in preset.environment.items():
         os.environ.setdefault(key, value)
+    if args.single_gpu_layer_graph is not None:
+        os.environ["TPQ_SINGLE_GPU_LAYER_GRAPH"] = (
+            "1" if args.single_gpu_layer_graph else "0"
+        )
     if preset.ep_layout is not None:
         os.environ.setdefault("TPQ_EP_LAYOUT", preset.ep_layout)
     # 固定输出缓冲可减少 GLM decode 中不必要的临时分配。
@@ -218,6 +239,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--warmup、--steps、--repeat 必须大于 0")
     if args.window < 1:
         raise SystemExit("--window 必须大于 0")
+    if args.dense_residency == "gpu" and args.device != "cuda":
+        raise SystemExit("--dense-residency gpu 需要 --device cuda")
 
     preset = resolve_preset(args.model, profile=args.profile, tp=args.tp)
     _apply_preset_environment(args, preset)
@@ -230,7 +253,11 @@ def main(argv: list[str] | None = None) -> None:
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA 不可用")
 
-    required = args.warmup + args.steps * args.repeat
+    required = (
+        args.warmup
+        + args.steps * args.repeat
+        + int(args.probe_stages)
+    )
     load_started = time.perf_counter()
     engine = Engine(
         str(preset.model_dir),
@@ -239,6 +266,7 @@ def main(argv: list[str] | None = None) -> None:
         device=args.device,
         vram_cache_gb=args.vram_gb,
         tp_size=preset.tp,
+        dense_residency=args.dense_residency,
     )
     load_seconds = time.perf_counter() - load_started
     actual_device = torch.device(
@@ -348,6 +376,31 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     throughputs = [float(run["throughput_tok_s"]) for run in runs]
+    stage_probe = None
+    if args.probe_stages:
+        start_profile = getattr(engine.model, "start_profile", None)
+        finish_profile = getattr(engine.model, "finish_profile", None)
+        if not callable(start_profile) or not callable(finish_profile):
+            raise SystemExit(
+                f"{preset.architecture} 当前没有 CLI 分阶段探针"
+            )
+        start_profile()
+        probe_started = time.perf_counter()
+        logits, probe_tokens = _steps(
+            preset.architecture,
+            engine.model,
+            logits,
+            1,
+            args.window,
+        )
+        if args.device == "cuda":
+            torch.cuda.synchronize()
+        probe_wall_ms = (
+            time.perf_counter() - probe_started
+        ) * 1000.0
+        stage_probe = finish_profile()
+        stage_probe["wall_ms"] = probe_wall_ms
+        stage_probe["tokens"] = probe_tokens
     hardware: dict[str, Any]
     if args.device == "cuda":
         props = torch.cuda.get_device_properties(0)
@@ -376,6 +429,7 @@ def main(argv: list[str] | None = None) -> None:
         "effective_tp": effective_tp,
         "ep_layout": preset.ep_layout,
         "device": args.device,
+        "dense_residency": dict(engine.dense_residency),
         "hardware": hardware,
         "process_memory": _process_memory(),
         "environment": {
@@ -384,6 +438,8 @@ def main(argv: list[str] | None = None) -> None:
                 "TPQ_COMPUTE_DTYPE",
                 "TPQ_DENSE_BF16",
                 "TPQ_FUSED",
+                "TPQ_PROJECTION_FUSED",
+                "TPQ_P10_SHARED",
                 "TPQ_PAGED_KV_FUSED",
                 "TPQ_LATENT_KV",
                 "TPQ_RAM_MIRROR",
@@ -400,6 +456,7 @@ def main(argv: list[str] | None = None) -> None:
                 "TPQ_CPU_QKV_POST",
                 "TPQ_CPU_DN_BLOCK",
                 "TPQ_CPU_VQ_INT8",
+                "TPQ_SINGLE_GPU_LAYER_GRAPH",
             )
             if key in os.environ
         },
@@ -418,6 +475,50 @@ def main(argv: list[str] | None = None) -> None:
         "decoded_measured_text": engine.decode(all_tokens),
         "runs": runs,
     }
+    packed_operator_name = getattr(
+        engine.model, "packed_operator_name", None
+    )
+    if packed_operator_name:
+        result["packed_operator"] = packed_operator_name
+    result["tp_dataflow"] = getattr(
+        engine.model,
+        "tp_dataflow",
+        "model-default",
+    )
+    if stage_probe is not None:
+        result["stage_probe"] = stage_probe
+    pool = getattr(engine.model, "pool", None)
+    if pool is not None:
+        result["expert_cache"] = {
+            "full_resident": bool(
+                getattr(pool, "full_resident", False)
+            ),
+            "host_expert_gib": (
+                getattr(pool, "host_expert_bytes", 0) / 2**30
+            ),
+            "gpu_storage_gib": (
+                getattr(pool, "gpu_storage_bytes", 0) / 2**30
+            ),
+            "gpu_storage_gib_by_rank": [
+                value / 2**30
+                for value in getattr(
+                    pool,
+                    "gpu_storage_bytes_by_rank",
+                    (),
+                )
+            ],
+            "hits": int(getattr(pool, "hits", 0)),
+            "misses": int(getattr(pool, "miss", 0)),
+            "uploaded_gib": (
+                getattr(pool, "uploaded_bytes", 0) / 2**30
+            ),
+            "transfer_seconds": float(
+                getattr(pool, "transfer_seconds", 0.0)
+            ),
+            "host_shard_seconds": float(
+                getattr(pool, "shard_seconds", 0.0)
+            ),
+        }
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
     if args.json:
         output = Path(args.json)

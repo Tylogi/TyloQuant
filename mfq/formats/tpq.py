@@ -23,17 +23,17 @@ class CccpPqSpec:
     storage_bits: int | None = None
 
     def __post_init__(self) -> None:
-        if self.tier not in {"x", "w", "v", "vv"}:
+        if self.tier not in {"x", "w", "v", "vv", "p"}:
             raise ValueError(f"unsupported CCCP tier: {self.tier!r}")
         if self.vector_size <= 0 or self.codebook_entries <= 1:
             raise ValueError("CCCP vector size and codebook size must be positive")
         bits = self.storage_bits
         if bits is not None and (
-            bits not in {8, 12, 14, 16}
+            not 8 <= bits <= 16
             or self.codebook_entries > 1 << bits
         ):
             raise ValueError(
-                "CCCP storage width must be 8/12/14/16 bits and cover "
+                "TPQ storage width must be 8..16 bits and cover "
                 "the complete codebook"
             )
 
@@ -58,6 +58,9 @@ TPQ_X = CccpPqSpec("x", 8, 256)
 TPQ_W = CccpPqSpec("w", 8, 4096)
 TPQ_V = CccpPqSpec("v", 4, 256)
 TPQ_VV = CccpPqSpec("vv", 4, 4096)
+# Projection-VQ carries its exact vector size, codebook size and packed width
+# in every payload.  This object is only the public dtype marker.
+TPQ_P = CccpPqSpec("p", 1, 256, 8)
 
 TPQ_PQ_SPECS = {
     spec.label: spec
@@ -78,9 +81,10 @@ CCCP_X = TPQ_X
 CCCP_W = TPQ_W
 CCCP_V = TPQ_V
 CCCP_VV = TPQ_VV
+CCCP_P = TPQ_P
 
 _SPEC_BY_TIER = {spec.tier: spec for spec in TPQ_PQ_SPECS.values()}
-_TIER_ID = {"x": 1, "w": 2, "v": 3, "vv": 4}
+_TIER_ID = {"x": 1, "w": 2, "v": 3, "vv": 4, "p": 5}
 _TIER_FROM_ID = {value: key for key, value in _TIER_ID.items()}
 
 
@@ -92,7 +96,7 @@ def normalize_tpq_dtype(dtype: str) -> str:
         return "TPQ-I4G64"
     if value.startswith("CCCP-"):
         candidate = "TPQ-" + value[len("CCCP-") :]
-        if candidate in TPQ_PQ_SPECS:
+        if candidate in TPQ_PQ_SPECS or candidate == "TPQ-P":
             return candidate
     return value
 
@@ -103,7 +107,7 @@ def legacy_cccp_dtype(dtype: str) -> str:
     value = normalize_tpq_dtype(dtype)
     if value == "TPQ-I4G64":
         return "CCCP-I4G64"
-    if value in TPQ_PQ_SPECS:
+    if value in TPQ_PQ_SPECS or value == "TPQ-P":
         return "CCCP-" + value[len("TPQ-") :]
     return value
 
@@ -136,7 +140,7 @@ class CccpPqTensor:
         )
         indices = np.ascontiguousarray(self.indices)
         bits = self.spec.index_bits
-        if bits in {12, 14}:
+        if bits not in {8, 16}:
             packed_nbytes = (
                 expected_indices[0] * expected_indices[1] * bits + 7
             ) // 8
@@ -255,10 +259,8 @@ def pack_cccp_indices(values: np.ndarray, bits: int) -> bytes:
         return array.astype(np.uint8, copy=False).tobytes()
     if bits == 16:
         return array.astype("<u2", copy=False).tobytes()
-    if bits not in {12, 14}:
-        raise ValueError(
-            f"CCCP indices require 8/12/14/16-bit storage, got {bits}"
-        )
+    if not 8 <= bits <= 16:
+        raise ValueError(f"TPQ indices require 8..16-bit storage, got {bits}")
     values16 = array.astype(np.uint16, copy=False)
     shifts = np.arange(bits, dtype=np.uint16)
     stream = (
@@ -289,10 +291,8 @@ def unpack_cccp_indices(
             np.frombuffer(blob, dtype="<u2", count=count, offset=offset).copy(),
             end,
         )
-    if bits not in {12, 14}:
-        raise ValueError(
-            f"CCCP indices require 8/12/14/16-bit storage, got {bits}"
-        )
+    if not 8 <= bits <= 16:
+        raise ValueError(f"TPQ indices require 8..16-bit storage, got {bits}")
     packed = np.frombuffer(
         blob,
         dtype=np.uint8,
@@ -367,7 +367,7 @@ def pack_cccp_pq(tensor: CccpPqTensor) -> bytes:
         ),
         (
             np.ascontiguousarray(tensor.indices, dtype=np.uint8).tobytes()
-            if tensor.spec.index_bits in {12, 14}
+            if tensor.spec.index_bits not in {8, 16}
             else pack_cccp_indices(
                 tensor.indices,
                 tensor.spec.index_bits,
@@ -411,7 +411,7 @@ def unpack_cccp_pq(blob: bytes | memoryview) -> CccpPqTensor:
         codebook_entries=int(codebook_entries),
         storage_bits=(
             int(index_bits)
-            if int(index_bits) in {12, 14}
+            if int(index_bits) not in {8, 16} or tier == "p"
             else None
         ),
     )
@@ -436,7 +436,7 @@ def unpack_cccp_pq(blob: bytes | memoryview) -> CccpPqTensor:
     codebook = codebook.reshape(spec.codebook_entries, spec.vector_size)
     offset += codebook_nbytes
     index_count = rows * (shape[1] // spec.vector_size)
-    if spec.index_bits in {12, 14}:
+    if spec.index_bits not in {8, 16}:
         index_nbytes = (index_count * spec.index_bits + 7) // 8
         indices = np.frombuffer(
             blob,
@@ -458,7 +458,7 @@ def unpack_cccp_pq(blob: bytes | memoryview) -> CccpPqTensor:
         neuron_len=int(neuron_len),
         indices=(
             indices
-            if spec.index_bits in {12, 14}
+            if spec.index_bits not in {8, 16}
             else indices.reshape(rows, shape[1] // spec.vector_size)
         ),
         codebook=codebook,
@@ -588,12 +588,14 @@ unpack_tpq_pq = unpack_cccp_pq
 
 __all__ = [
     "CCCP_PQ_SPECS",
+    "CCCP_P",
     "CCCP_V",
     "CCCP_VV",
     "CCCP_W",
     "CCCP_X",
     "TPQ_PQ_SPECS",
     "TPQ_PQ_SPECS_BY_LABEL",
+    "TPQ_P",
     "TPQ_V",
     "TPQ_VV",
     "TPQ_W",

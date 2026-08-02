@@ -14,6 +14,211 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
+from ..kernels import BlockFP8Weight, ProjectionGroup
+
+
+def _weight_shape(weight) -> torch.Size:
+    return torch.Size(weight.shape)
+
+
+def _weight_is_bf16_linear(weight) -> bool:
+    return (
+        isinstance(weight, (BlockFP8Weight, ProjectionGroup))
+        or (
+            isinstance(weight, torch.Tensor)
+            and weight.dtype == torch.bfloat16
+        )
+    )
+
+
+def _linear(
+    value: torch.Tensor,
+    weight,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Public linear dispatch for BF16 and compact audited block-FP8."""
+    if isinstance(weight, (BlockFP8Weight, ProjectionGroup)):
+        result = weight.matmul_T_decode_fused(value)
+    else:
+        result = F.linear(value.to(weight.dtype), weight)
+    return result if output_dtype is None else result.to(output_dtype)
+
+
+def _projection_parts(weight, rows: tuple[int, ...]) -> tuple:
+    if isinstance(weight, ProjectionGroup):
+        values = weight.weights
+        if tuple(int(value.shape[0]) for value in values) != rows:
+            raise ValueError("compact projection group row layout mismatch")
+        return values
+    if int(weight.shape[0]) != sum(rows):
+        raise ValueError("projection row layout mismatch")
+    return tuple(weight.split(rows, dim=0))
+
+
+def _row_slice(weight, start: int, stop: int, device: torch.device):
+    if isinstance(weight, BlockFP8Weight):
+        if start % weight.block:
+            return weight.dequant_rows(
+                start,
+                stop,
+                torch.bfloat16,
+            ).to(device).contiguous()
+        return weight.row_slice(start, stop).to(device)
+    shard = weight[start:stop]
+    if shard.device == device:
+        return shard.clone(memory_format=torch.contiguous_format)
+    return shard.to(device).contiguous()
+
+
+def _column_slice(weight, start: int, stop: int, device: torch.device):
+    if isinstance(weight, BlockFP8Weight):
+        if start % weight.block:
+            # This is reserved for small irregular projections. All major
+            # hidden/intermediate TP widths are block aligned.
+            return weight.dequant_rows(
+                0,
+                weight.shape[0],
+                torch.bfloat16,
+            )[:, start:stop].to(device).contiguous()
+        return weight.column_slice(start, stop).to(device)
+    return weight[:, start:stop].to(device).contiguous()
+
+
+def _combine_projection_parts(values) -> object:
+    parts = tuple(values)
+    if all(isinstance(value, torch.Tensor) for value in parts):
+        return torch.cat(parts, dim=0).contiguous()
+    return ProjectionGroup(parts)
+
+
+def shard_linear_output(weight, rank: int, ranks: int, device):
+    """Return one compact Column-TP output-row shard."""
+    rows = int(weight.shape[0])
+    if ranks <= 0 or rows % ranks:
+        raise ValueError("linear output rows must divide the TP width")
+    local = rows // int(ranks)
+    return _row_slice(
+        weight,
+        int(rank) * local,
+        (int(rank) + 1) * local,
+        torch.device(device),
+    )
+
+
+def shard_linear_input(weight, rank: int, ranks: int, device):
+    """Return one compact Row-TP input-column shard."""
+    columns = int(weight.shape[1])
+    if ranks <= 0 or columns % ranks:
+        raise ValueError("linear input columns must divide the TP width")
+    local = columns // int(ranks)
+    return _column_slice(
+        weight,
+        int(rank) * local,
+        (int(rank) + 1) * local,
+        torch.device(device),
+    )
+
+
+class TensorParallelVocab:
+    """Generic vocabulary-row TP for embedding and output projection."""
+
+    def __init__(
+        self,
+        devices: tuple[torch.device, ...],
+        embedding_shards: tuple[torch.Tensor, ...],
+        output_shards: tuple[torch.Tensor, ...],
+        offsets: tuple[int, ...],
+    ) -> None:
+        ranks = len(devices)
+        if (
+            ranks <= 0
+            or len(embedding_shards) != ranks
+            or len(output_shards) != ranks
+            or len(offsets) != ranks + 1
+        ):
+            raise ValueError("vocabulary TP shard count mismatch")
+        hidden = int(embedding_shards[0].shape[1])
+        if any(
+            shard.device != devices[rank]
+            or shard.dtype != torch.bfloat16
+            or shard.ndim != 2
+            or int(shard.shape[1]) != hidden
+            or output_shards[rank].device != devices[rank]
+            or output_shards[rank].dtype != torch.bfloat16
+            or output_shards[rank].shape != shard.shape
+            or int(shard.shape[0]) != offsets[rank + 1] - offsets[rank]
+            for rank, shard in enumerate(embedding_shards)
+        ):
+            raise ValueError("vocabulary TP shard layout mismatch")
+        self.devices = devices
+        self.embedding_shards = embedding_shards
+        self.output_shards = output_shards
+        self.offsets = offsets
+        self.hidden_size = hidden
+
+    @staticmethod
+    def offsets_for(vocab_size: int, ranks: int) -> tuple[int, ...]:
+        return tuple(
+            (vocab_size * rank) // ranks
+            for rank in range(ranks + 1)
+        )
+
+    def embed(self, ids: list[int] | torch.Tensor) -> torch.Tensor:
+        values = (
+            ids.tolist() if isinstance(ids, torch.Tensor) else list(ids)
+        )
+        if not values:
+            raise ValueError("vocabulary TP embedding requires token ids")
+        ranks = {
+            max(
+                0,
+                min(
+                    len(self.devices) - 1,
+                    next(
+                        rank
+                        for rank in range(len(self.devices))
+                        if token < self.offsets[rank + 1]
+                    ),
+                ),
+            )
+            for token in values
+        }
+        if len(ranks) != 1:
+            # Decode uses one token. Keep the general multi-token error
+            # explicit instead of silently returning mixed-device rows.
+            raise ValueError(
+                "vocabulary TP embedding batch crosses row shards"
+            )
+        rank = ranks.pop()
+        local_ids = torch.as_tensor(
+            [token - self.offsets[rank] for token in values],
+            dtype=torch.long,
+            device=self.devices[rank],
+        )
+        return F.embedding(local_ids, self.embedding_shards[rank])
+
+    def logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        if hidden.shape[-1] != self.hidden_size:
+            raise ValueError("vocabulary TP hidden width mismatch")
+        target = hidden.device
+        partials = []
+        for rank, device in enumerate(self.devices):
+            local_hidden = hidden if target == device else hidden.to(device)
+            partials.append(
+                torch.mm(
+                    local_hidden.to(torch.bfloat16),
+                    self.output_shards[rank].t(),
+                    out_dtype=torch.float32,
+                )
+            )
+        return torch.cat(
+            [
+                partial if partial.device == target else partial.to(target)
+                for partial in partials
+            ],
+            dim=-1,
+        )
+
 
 def _new_cuda_graph() -> torch.cuda.CUDAGraph:
     """Retain graph topology only for fixed-address layer composition."""
@@ -404,6 +609,7 @@ class GatedMLPSpec:
     activation: str
     activation_beta: float
     activation_linear_beta: float | None
+    activation_limit: float = 0.0
 
 
 @dataclass
@@ -444,8 +650,8 @@ class TensorParallelGatedMLP:
         devices: tuple[torch.device, ...],
         spec: GatedMLPSpec,
     ) -> None:
-        if len(devices) <= 1:
-            raise ValueError("tensor-parallel MLP requires at least 2 ranks")
+        if not devices:
+            raise ValueError("gated MLP graph requires at least one rank")
         if spec.intermediate_size % len(devices):
             raise ValueError(
                 "intermediate size must divide the tensor-parallel size"
@@ -464,20 +670,20 @@ class TensorParallelGatedMLP:
         self,
         layer: int,
         owner: int,
-        combined_gate_up: torch.Tensor,
-        down: torch.Tensor,
+        combined_gate_up,
+        down,
     ) -> None:
         if layer in self.layers:
             raise ValueError(f"TP MLP layer {layer} is already registered")
         if (
-            combined_gate_up.dtype != torch.bfloat16
-            or down.dtype != torch.bfloat16
-            or combined_gate_up.shape
+            not _weight_is_bf16_linear(combined_gate_up)
+            or not _weight_is_bf16_linear(down)
+            or _weight_shape(combined_gate_up)
             != (
                 2 * self.spec.intermediate_size,
                 self.spec.hidden_size,
             )
-            or down.shape
+            or _weight_shape(down)
             != (
                 self.spec.hidden_size,
                 self.spec.intermediate_size,
@@ -486,27 +692,47 @@ class TensorParallelGatedMLP:
             raise ValueError(
                 f"TP MLP layer {layer} weight shape/dtype mismatch"
             )
-        gate, up = combined_gate_up.chunk(2, dim=0)
-        gate_parts = gate.chunk(len(self.devices), dim=0)
-        up_parts = up.chunk(len(self.devices), dim=0)
-        down_parts = down.chunk(len(self.devices), dim=1)
+        gate, up = _projection_parts(
+            combined_gate_up,
+            (
+                self.spec.intermediate_size,
+                self.spec.intermediate_size,
+            ),
+        )
+        local_intermediate = (
+            self.spec.intermediate_size // len(self.devices)
+        )
         owner_device = self.devices[owner]
-        gate_up_shards: list[torch.Tensor] = []
-        down_shards: list[torch.Tensor] = []
+        gate_up_shards: list[object] = []
+        down_shards: list[object] = []
         local_inputs: list[torch.Tensor] = []
         for rank, device in enumerate(self.devices):
             with torch.cuda.device(device):
                 gate_up_shards.append(
-                    torch.cat(
+                    _combine_projection_parts(
                         (
-                            gate_parts[rank].to(device),
-                            up_parts[rank].to(device),
-                        ),
-                        dim=0,
-                    ).contiguous()
+                            _row_slice(
+                                gate,
+                                rank * local_intermediate,
+                                (rank + 1) * local_intermediate,
+                                device,
+                            ),
+                            _row_slice(
+                                up,
+                                rank * local_intermediate,
+                                (rank + 1) * local_intermediate,
+                                device,
+                            ),
+                        )
+                    )
                 )
                 down_shards.append(
-                    down_parts[rank].to(device).contiguous()
+                    _column_slice(
+                        down,
+                        rank * local_intermediate,
+                        (rank + 1) * local_intermediate,
+                        device,
+                    )
                 )
                 local_inputs.append(
                     torch.empty(
@@ -583,9 +809,10 @@ class TensorParallelGatedMLP:
                         raise RuntimeError(
                             "TP gated MLP input dispatch was rejected"
                         )
-                    projected = F.linear(
+                    projected = _linear(
                         state.local_inputs[rank],
                         state.gate_up[rank],
+                        torch.bfloat16,
                     )
                     gate, up = projected.chunk(2, dim=-1)
                     activated = gated_activation(
@@ -594,13 +821,14 @@ class TensorParallelGatedMLP:
                         activation=self.spec.activation,
                         beta=self.spec.activation_beta,
                         linear_beta=self.spec.activation_linear_beta,
+                        limit=self.spec.activation_limit,
                         output=gate,
                     )
                     if activated is None:
                         raise RuntimeError(
                             "TP gated MLP activation was rejected"
                         )
-                    return F.linear(
+                    return _linear(
                         activated,
                         state.down[rank],
                     ).float()
@@ -1016,6 +1244,7 @@ class RowParallelLinearSpec:
     out_features: int
     input_dtype: torch.dtype = torch.bfloat16
     weight_dtype: torch.dtype = torch.bfloat16
+    output_dtype: torch.dtype | None = None
     capture_owner_dispatch: bool = False
 
 
@@ -1061,14 +1290,15 @@ class TensorParallelRowLinear:
         devices: tuple[torch.device, ...],
         spec: RowParallelLinearSpec,
     ) -> None:
-        if len(devices) <= 1:
-            raise ValueError("row-parallel linear requires at least 2 ranks")
+        if not devices:
+            raise ValueError("row-linear graph requires at least one rank")
         if spec.in_features % len(devices):
             raise ValueError(
                 "linear input width must divide the tensor-parallel size"
             )
         self.devices = devices
         self.spec = spec
+        self.output_dtype = spec.output_dtype or spec.input_dtype
         self.local_width = spec.in_features // len(devices)
         self.hidden_mode = (
             os.environ.get("TPQ_TP_HIDDEN", "0") != "0"
@@ -1082,15 +1312,18 @@ class TensorParallelRowLinear:
         self,
         layer: int,
         owner: int,
-        weight: torch.Tensor,
+        weight,
     ) -> None:
         if layer in self.layers:
             raise ValueError(
                 f"row-parallel linear layer {layer} is already registered"
             )
         if (
-            weight.dtype != self.spec.weight_dtype
-            or weight.shape
+            (
+                self.spec.weight_dtype == torch.bfloat16
+                and not _weight_is_bf16_linear(weight)
+            )
+            or _weight_shape(weight)
             != (self.spec.out_features, self.spec.in_features)
         ):
             raise ValueError(
@@ -1127,13 +1360,12 @@ class TensorParallelRowLinear:
                     )
                 )
                 weights.append(
-                    weight[
-                        :,
-                        rank * self.local_width:
+                    _column_slice(
+                        weight,
+                        rank * self.local_width,
                         (rank + 1) * self.local_width,
-                    ]
-                    .to(device)
-                    .contiguous()
+                        device,
+                    )
                 )
         self.layers[layer] = _RowParallelLinearLayer(
             owner=owner,
@@ -1248,11 +1480,8 @@ class TensorParallelRowLinear:
                         raise RuntimeError(
                             "row-parallel linear input dispatch was rejected"
                         )
-                    local = state.local_inputs[rank]
-                    if local.dtype != state.weights[rank].dtype:
-                        local = local.to(state.weights[rank].dtype)
-                    return F.linear(
-                        local,
+                    return _linear(
+                        state.local_inputs[rank],
                         state.weights[rank],
                     ).float()
 
@@ -1294,7 +1523,7 @@ class TensorParallelRowLinear:
                         torch.empty(
                             1,
                             self.spec.out_features,
-                            dtype=self.spec.input_dtype,
+                            dtype=self.output_dtype,
                             device=device,
                         )
                     )
@@ -1305,7 +1534,7 @@ class TensorParallelRowLinear:
                         torch.empty(
                             1,
                             self.spec.out_features,
-                            dtype=self.spec.input_dtype,
+                            dtype=self.output_dtype,
                             device=device,
                         )
                     )
@@ -1313,7 +1542,7 @@ class TensorParallelRowLinear:
                         torch.empty(
                             1,
                             self.spec.out_features,
-                            dtype=self.spec.input_dtype,
+                            dtype=self.output_dtype,
                             device=device,
                         )
                     )
@@ -1454,7 +1683,7 @@ class TensorParallelRowLinear:
             or sharded.dtype != self.spec.input_dtype
             or output.shape
             != torch.Size((1, self.spec.out_features))
-            or output.dtype != self.spec.input_dtype
+            or output.dtype != self.output_dtype
             or sharded.ready_events is None
             or output.ready_events is None
         ):
@@ -1743,7 +1972,7 @@ class TensorParallelRouteDown:
         spec: RouteDownSpec,
     ) -> None:
         ranks = len(devices)
-        if ranks <= 1 or spec.hidden_size % ranks:
+        if ranks <= 0 or spec.hidden_size % ranks:
             raise ValueError(
                 "route/down hidden width must divide the TP size"
             )
@@ -1768,7 +1997,7 @@ class TensorParallelRouteDown:
         layer: int,
         owner: int,
         router: torch.Tensor,
-        routed_down: torch.Tensor,
+        routed_down,
     ) -> None:
         spec = self.spec
         if layer in self.layers:
@@ -1776,8 +2005,8 @@ class TensorParallelRouteDown:
         if (
             router.dtype != torch.float32
             or router.shape != (spec.expert_count, spec.hidden_size)
-            or routed_down.dtype != torch.bfloat16
-            or routed_down.shape
+            or not _weight_is_bf16_linear(routed_down)
+            or _weight_shape(routed_down)
             != (spec.routed_hidden_size, spec.hidden_size)
         ):
             raise ValueError(
@@ -1838,9 +2067,12 @@ class TensorParallelRouteDown:
                     .contiguous()
                 )
                 routed_down_weights.append(
-                    routed_down[:, hidden_start:hidden_end]
-                    .to(device)
-                    .contiguous()
+                    _column_slice(
+                        routed_down,
+                        hidden_start,
+                        hidden_end,
+                        device,
+                    )
                 )
         self.layers[layer] = _RouteDownLayer(
             owner=owner,
@@ -1950,11 +2182,10 @@ class TensorParallelRouteDown:
                             :, expert_start:expert_end
                         ],
                     )
-                    latent_contribution = torch.mm(
+                    latent_contribution = _linear(
                         state.down_inputs[rank],
-                        state.routed_down[rank].t(),
-                        out_dtype=torch.float32,
-                    )
+                        state.routed_down[rank],
+                    ).float()
                     return router_contribution, latent_contribution
 
                 with (
@@ -2236,8 +2467,8 @@ class TensorParallelMoEPrelude:
         spec: MoEPreludeSpec,
     ) -> None:
         ranks = len(devices)
-        if ranks <= 1:
-            raise ValueError("MoE prelude requires at least 2 TP ranks")
+        if ranks <= 0:
+            raise ValueError("MoE prelude graph requires at least one rank")
         if (
             spec.hidden_size % ranks
             or spec.shared_intermediate_size % ranks
@@ -2258,9 +2489,9 @@ class TensorParallelMoEPrelude:
         layer: int,
         owner: int,
         router: torch.Tensor,
-        routed_down: torch.Tensor,
-        shared_gate_up: torch.Tensor,
-        shared_down: torch.Tensor,
+        routed_down,
+        shared_gate_up,
+        shared_down,
     ) -> None:
         spec = self.spec
         if layer in self.layers:
@@ -2269,32 +2500,31 @@ class TensorParallelMoEPrelude:
             router.dtype == torch.float32
             and router.shape
             == (spec.expert_count, spec.hidden_size)
-            and routed_down.dtype == torch.bfloat16
-            and routed_down.shape
+            and _weight_is_bf16_linear(routed_down)
+            and _weight_shape(routed_down)
             == (spec.routed_hidden_size, spec.hidden_size)
-            and shared_gate_up.dtype == torch.bfloat16
-            and shared_gate_up.shape
+            and _weight_is_bf16_linear(shared_gate_up)
+            and _weight_shape(shared_gate_up)
             == (2 * spec.shared_intermediate_size, spec.hidden_size)
-            and shared_down.dtype == torch.bfloat16
-            and shared_down.shape
+            and _weight_is_bf16_linear(shared_down)
+            and _weight_shape(shared_down)
             == (spec.hidden_size, spec.shared_intermediate_size)
         )
         if not expected:
             raise ValueError(
                 f"MoE prelude layer {layer} weight shape/dtype mismatch"
             )
-        gate, up = shared_gate_up.chunk(2, dim=0)
-        gate_parts = gate.chunk(len(self.devices), dim=0)
-        up_parts = up.chunk(len(self.devices), dim=0)
-        shared_down_parts = shared_down.chunk(
-            len(self.devices),
-            dim=1,
+        gate, up = _projection_parts(
+            shared_gate_up,
+            (
+                spec.shared_intermediate_size,
+                spec.shared_intermediate_size,
+            ),
+        )
+        local_intermediate = (
+            spec.shared_intermediate_size // len(self.devices)
         )
         router_parts = router.split(self.local_hidden, dim=1)
-        routed_down_parts = routed_down.split(
-            self.local_hidden,
-            dim=1,
-        )
         local_inputs = []
         router_weights = []
         routed_down_weights = []
@@ -2314,19 +2544,38 @@ class TensorParallelMoEPrelude:
                     router_parts[rank].to(device).contiguous()
                 )
                 routed_down_weights.append(
-                    routed_down_parts[rank].to(device).contiguous()
+                    _column_slice(
+                        routed_down,
+                        rank * self.local_hidden,
+                        (rank + 1) * self.local_hidden,
+                        device,
+                    )
                 )
                 shared_gate_up_weights.append(
-                    torch.cat(
+                    _combine_projection_parts(
                         (
-                            gate_parts[rank].to(device),
-                            up_parts[rank].to(device),
-                        ),
-                        dim=0,
-                    ).contiguous()
+                            _row_slice(
+                                gate,
+                                rank * local_intermediate,
+                                (rank + 1) * local_intermediate,
+                                device,
+                            ),
+                            _row_slice(
+                                up,
+                                rank * local_intermediate,
+                                (rank + 1) * local_intermediate,
+                                device,
+                            ),
+                        )
+                    )
                 )
                 shared_down_weights.append(
-                    shared_down_parts[rank].to(device).contiguous()
+                    _column_slice(
+                        shared_down,
+                        rank * local_intermediate,
+                        (rank + 1) * local_intermediate,
+                        device,
+                    )
                 )
         owner_device = self.devices[owner]
         with torch.cuda.device(owner_device):
@@ -2408,13 +2657,14 @@ class TensorParallelMoEPrelude:
                         local_slice.float(),
                         state.router[rank],
                     )
-                    latent_partial = F.linear(
+                    latent_partial = _linear(
                         local_slice,
                         state.routed_down[rank],
                     ).float()
-                    projected = F.linear(
+                    projected = _linear(
                         local,
                         state.shared_gate_up[rank],
+                        torch.bfloat16,
                     )
                     gate, up = projected.chunk(2, dim=-1)
                     activated = gated_activation(
@@ -2429,7 +2679,7 @@ class TensorParallelMoEPrelude:
                         raise RuntimeError(
                             "MoE prelude gated activation was rejected"
                         )
-                    shared_partial = F.linear(
+                    shared_partial = _linear(
                         activated,
                         state.shared_down[rank],
                     ).float()
@@ -2554,7 +2804,7 @@ class TensorParallelKDA:
         devices: tuple[torch.device, ...],
         spec: KDASpec,
     ) -> None:
-        if len(devices) <= 1 or spec.heads % len(devices):
+        if not devices or spec.heads % len(devices):
             raise ValueError("KDA heads must divide the TP size")
         self.devices = devices
         self.spec = spec
@@ -2572,17 +2822,18 @@ class TensorParallelKDA:
         self,
         layer: int,
         owner: int,
-        combined_input: torch.Tensor,
-        gate_projection: torch.Tensor,
+        combined_input,
+        gate_projection,
         conv_weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         a_log: torch.Tensor,
         dt_bias: torch.Tensor,
         norm_weight: torch.Tensor,
-        output_projection: torch.Tensor,
+        output_projection,
     ) -> None:
         spec = self.spec
         total_width = spec.heads * spec.head_dim
-        q, k, v, g, gate_a, beta = combined_input.split(
+        q, k, v, g, gate_a, beta = _projection_parts(
+            combined_input,
             (
                 total_width,
                 total_width,
@@ -2591,26 +2842,12 @@ class TensorParallelKDA:
                 spec.gate_rank,
                 spec.heads,
             ),
-            dim=0,
-        )
-        head_parts = [
-            value.chunk(len(self.devices), dim=0)
-            for value in (q, k, v, g)
-        ]
-        beta_parts = beta.chunk(len(self.devices), dim=0)
-        gate_b_parts = gate_projection.chunk(
-            len(self.devices),
-            dim=0,
         )
         conv_parts = [
             weight.chunk(len(self.devices), dim=0)
             for weight in conv_weights
         ]
         dt_parts = dt_bias.chunk(len(self.devices), dim=0)
-        output_parts = output_projection.chunk(
-            len(self.devices),
-            dim=1,
-        )
         local_inputs: list[torch.Tensor] = []
         input_weights: list[torch.Tensor] = []
         gate_weights: list[torch.Tensor] = []
@@ -2634,20 +2871,38 @@ class TensorParallelKDA:
                     )
                 )
                 input_weights.append(
-                    torch.cat(
+                    _combine_projection_parts(
                         (
-                            head_parts[0][rank].to(device),
-                            head_parts[1][rank].to(device),
-                            head_parts[2][rank].to(device),
-                            head_parts[3][rank].to(device),
-                            gate_a.to(device),
-                            beta_parts[rank].to(device),
-                        ),
-                        dim=0,
-                    ).contiguous()
+                            *(
+                                _row_slice(
+                                    value,
+                                    rank * self.local_width,
+                                    (rank + 1) * self.local_width,
+                                    device,
+                                )
+                                for value in (q, k, v, g)
+                            ),
+                            (
+                                gate_a.to(device)
+                                if isinstance(gate_a, BlockFP8Weight)
+                                else gate_a.to(device).contiguous()
+                            ),
+                            _row_slice(
+                                beta,
+                                rank * self.local_heads,
+                                (rank + 1) * self.local_heads,
+                                device,
+                            ),
+                        )
+                    )
                 )
                 gate_weights.append(
-                    gate_b_parts[rank].to(device).contiguous()
+                    _row_slice(
+                        gate_projection,
+                        rank * self.local_width,
+                        (rank + 1) * self.local_width,
+                        device,
+                    )
                 )
                 local_conv_weights.append(
                     tuple(
@@ -2663,7 +2918,12 @@ class TensorParallelKDA:
                     norm_weight.to(device).contiguous()
                 )
                 local_output_projection.append(
-                    output_parts[rank].to(device).contiguous()
+                    _column_slice(
+                        output_projection,
+                        rank * self.local_width,
+                        (rank + 1) * self.local_width,
+                        device,
+                    )
                 )
                 recurrent_state.append(
                     torch.zeros(
@@ -2782,9 +3042,10 @@ class TensorParallelKDA:
                         raise RuntimeError(
                             "TP KDA input dispatch was rejected"
                         )
-                    projected = F.linear(
+                    projected = _linear(
                         state.local_inputs[rank],
                         state.input_projection[rank],
+                        torch.bfloat16,
                     ).split(split, dim=-1)
                     query, key, value, output_gate = (
                         item.reshape(
@@ -2805,9 +3066,10 @@ class TensorParallelKDA:
                         raise RuntimeError(
                             "TP KDA short convolution was rejected"
                         )
-                    recurrent_gate = F.linear(
+                    recurrent_gate = _linear(
                         projected[4],
                         state.gate_projection[rank],
+                        torch.bfloat16,
                     ).view(self.local_heads, spec.head_dim)
                     recurrent = attention_step(
                         "kda_recurrent",
@@ -2842,7 +3104,7 @@ class TensorParallelKDA:
                         raise RuntimeError(
                             "TP KDA gated RMSNorm was rejected"
                         )
-                    return F.linear(
+                    return _linear(
                         normalized.reshape(1, -1),
                         state.output_projection[rank],
                     ).float()
@@ -3114,7 +3376,7 @@ class TensorParallelMLA:
         devices: tuple[torch.device, ...],
         spec: MLASpec,
     ) -> None:
-        if len(devices) <= 1 or spec.heads % len(devices):
+        if not devices or spec.heads % len(devices):
             raise ValueError("MLA heads must divide the TP size")
         if spec.max_ctx <= 0:
             raise ValueError("MLA max_ctx must be positive")
@@ -3128,18 +3390,126 @@ class TensorParallelMLA:
             torch.cuda.Stream(device=device) for device in devices
         ]
         self.layers: dict[int, _MLALayer] = {}
+        self._paged_runners: list[object] | None = None
+        self._paged_position: int | None = None
+        self._paged_ready_events: list[torch.cuda.Event] | None = None
+        self._paged_init_error: str | None = None
+        self._cache_capacity = spec.max_ctx
+        self._prepare_paged_runners()
+
+    @property
+    def attention_backend(self) -> str:
+        return (
+            "flashinfer-split-kv"
+            if self._paged_runners is not None
+            else "native-serial-kv"
+        )
+
+    def _prepare_paged_runners(self) -> None:
+        """Create one shared split-KV runner per rank, not per layer."""
+        if (
+            os.environ.get("TPQ_FLASHINFER_MLA", "1") == "0"
+            or self.spec.kv_lora_rank != 512
+            or self.spec.qk_rope_head_dim != 64
+        ):
+            return
+        from .api import attention_step
+
+        runners: list[object] = []
+        try:
+            for device in self.devices:
+                with torch.cuda.device(device):
+                    runner = attention_step(
+                        "paged_latent_create",
+                        "cuda",
+                        device=device,
+                        max_ctx=self.spec.max_ctx,
+                        heads=self.local_heads,
+                        ckv_dim=self.spec.kv_lora_rank,
+                        kpe_dim=self.spec.qk_rope_head_dim,
+                        dtype=torch.bfloat16,
+                        qk_head_dim=(
+                            self.spec.qk_nope_head_dim
+                            + self.spec.qk_rope_head_dim
+                        ),
+                    )
+                    if runner is None or not attention_step(
+                        "paged_latent_prepare",
+                        "cuda",
+                        runner=runner,
+                        length=1,
+                    ):
+                        raise RuntimeError(
+                            "FlashInfer MLA runner initialization failed"
+                        )
+                    runners.append(runner)
+            capacities = {
+                int(runner.max_blocks * runner.page_size)
+                for runner in runners
+            }
+            if len(capacities) != 1:
+                raise RuntimeError("FlashInfer MLA rank capacities differ")
+            self._cache_capacity = capacities.pop()
+            self._paged_runners = runners
+            self._paged_position = 0
+        except Exception as exc:
+            self._paged_init_error = f"{type(exc).__name__}: {exc}"
+            self._paged_runners = None
+            self._paged_position = None
+            self._cache_capacity = self.spec.max_ctx
+
+    def _prepare_paged_position(
+        self,
+        position: int,
+    ) -> tuple[torch.cuda.Event, ...] | None:
+        if self._paged_runners is None:
+            return None
+        if (
+            self._paged_position == int(position)
+            and self._paged_ready_events is not None
+        ):
+            return tuple(self._paged_ready_events)
+        from .api import attention_step
+
+        events: list[torch.cuda.Event] = []
+        for rank, device in enumerate(self.devices):
+            with torch.cuda.device(device):
+                if not attention_step(
+                    "paged_latent_prepare",
+                    "cuda",
+                    runner=self._paged_runners[rank],
+                    length=int(position) + 1,
+                ):
+                    from ..flashinfer_mla import last_error
+
+                    cause = last_error()
+                    detail = (
+                        "unknown planner error"
+                        if cause is None
+                        else f"{type(cause).__name__}: {cause}"
+                    )
+                    raise RuntimeError(
+                        "FlashInfer MLA dynamic split-KV plan failed: "
+                        f"{detail}"
+                    )
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(device))
+                events.append(event)
+        self._paged_position = int(position)
+        self._paged_ready_events = events
+        return tuple(events)
 
     def add_layer(
         self,
         layer: int,
         owner: int,
-        combined_input: torch.Tensor,
+        combined_input,
         query_norm: torch.Tensor,
-        query_projection: torch.Tensor,
+        query_projection,
         kv_norm: torch.Tensor,
         key_absorb: torch.Tensor,
         value_absorb: torch.Tensor,
-        output_projection: torch.Tensor,
+        output_projection,
     ) -> None:
         spec = self.spec
         q_width = spec.qk_nope_head_dim + spec.qk_rope_head_dim
@@ -3150,10 +3520,10 @@ class TensorParallelMLA:
             + spec.heads * spec.v_head_dim
         )
         if (
-            combined_input.dtype != torch.bfloat16
-            or combined_input.shape
+            not _weight_is_bf16_linear(combined_input)
+            or _weight_shape(combined_input)
             != (expected_input_rows, spec.hidden_size)
-            or query_projection.shape
+            or _weight_shape(query_projection)
             != (spec.heads * q_width, spec.q_lora_rank)
             or key_absorb.shape
             != (
@@ -3167,7 +3537,7 @@ class TensorParallelMLA:
                 spec.v_head_dim,
                 spec.kv_lora_rank,
             )
-            or output_projection.shape
+            or _weight_shape(output_projection)
             != (
                 spec.hidden_size,
                 spec.heads * spec.v_head_dim,
@@ -3176,29 +3546,18 @@ class TensorParallelMLA:
             raise ValueError(
                 f"TP MLA layer {layer} weight shape/dtype mismatch"
             )
-        query_a, kv_a, gate = combined_input.split(
+        query_a, kv_a, gate = _projection_parts(
+            combined_input,
             (
                 spec.q_lora_rank,
                 spec.kv_lora_rank + spec.qk_rope_head_dim,
                 spec.heads * spec.v_head_dim,
             ),
-            dim=0,
-        )
-        gate_parts = gate.chunk(len(self.devices), dim=0)
-        query_parts = (
-            query_projection.view(
-                spec.heads,
-                q_width,
-                spec.q_lora_rank,
-            )
-            .chunk(len(self.devices), dim=0)
         )
         key_parts = key_absorb.chunk(len(self.devices), dim=0)
         value_parts = value_absorb.chunk(len(self.devices), dim=0)
-        output_parts = output_projection.chunk(
-            len(self.devices),
-            dim=1,
-        )
+        local_gate_width = self.local_heads * spec.v_head_dim
+        local_query_width = self.local_heads * q_width
         local_inputs = []
         local_positions = []
         input_weights = []
@@ -3226,24 +3585,35 @@ class TensorParallelMLA:
                     torch.zeros(1, dtype=torch.long, device=device)
                 )
                 input_weights.append(
-                    torch.cat(
+                    _combine_projection_parts(
                         (
-                            query_a.to(device),
-                            kv_a.to(device),
-                            gate_parts[rank].to(device),
-                        ),
-                        dim=0,
-                    ).contiguous()
+                            (
+                                query_a.to(device)
+                                if isinstance(query_a, BlockFP8Weight)
+                                else query_a.to(device).contiguous()
+                            ),
+                            (
+                                kv_a.to(device)
+                                if isinstance(kv_a, BlockFP8Weight)
+                                else kv_a.to(device).contiguous()
+                            ),
+                            _row_slice(
+                                gate,
+                                rank * local_gate_width,
+                                (rank + 1) * local_gate_width,
+                                device,
+                            ),
+                        )
+                    )
                 )
                 query_norms.append(query_norm.to(device).contiguous())
                 query_weights.append(
-                    query_parts[rank]
-                    .reshape(
-                        self.local_heads * q_width,
-                        spec.q_lora_rank,
+                    _row_slice(
+                        query_projection,
+                        rank * local_query_width,
+                        (rank + 1) * local_query_width,
+                        device,
                     )
-                    .to(device)
-                    .contiguous()
                 )
                 kv_norms.append(kv_norm.to(device).contiguous())
                 key_weights.append(
@@ -3253,11 +3623,16 @@ class TensorParallelMLA:
                     value_parts[rank].to(device).contiguous()
                 )
                 output_weights.append(
-                    output_parts[rank].to(device).contiguous()
+                    _column_slice(
+                        output_projection,
+                        rank * local_gate_width,
+                        (rank + 1) * local_gate_width,
+                        device,
+                    )
                 )
                 latent_cache.append(
                     torch.zeros(
-                        spec.max_ctx,
+                        self._cache_capacity,
                         spec.kv_lora_rank,
                         dtype=torch.bfloat16,
                         device=device,
@@ -3265,7 +3640,7 @@ class TensorParallelMLA:
                 )
                 rope_cache.append(
                     torch.zeros(
-                        spec.max_ctx,
+                        self._cache_capacity,
                         spec.qk_rope_head_dim,
                         dtype=torch.bfloat16,
                         device=device,
@@ -3274,7 +3649,7 @@ class TensorParallelMLA:
                 score_workspace.append(
                     torch.empty(
                         self.local_heads,
-                        spec.max_ctx,
+                        self._cache_capacity,
                         dtype=torch.float32,
                         device=device,
                     )
@@ -3384,9 +3759,10 @@ class TensorParallelMLA:
                         raise RuntimeError(
                             "TP MLA input dispatch was rejected"
                         )
-                    query_source, compressed, output_gate = F.linear(
+                    query_source, compressed, output_gate = _linear(
                         state.local_inputs[rank],
                         state.input_projection[rank],
+                        torch.bfloat16,
                     ).split(split, dim=-1)
                     query_source = rmsnorm(
                         query_source,
@@ -3395,9 +3771,10 @@ class TensorParallelMLA:
                     )
                     if query_source is None:
                         raise RuntimeError("TP MLA query RMSNorm unavailable")
-                    query = F.linear(
+                    query = _linear(
                         query_source,
                         state.query_projection[rank],
+                        torch.bfloat16,
                     ).view(self.local_heads, q_width)
                     query_nope, query_rope = query.split(
                         (
@@ -3434,18 +3811,42 @@ class TensorParallelMLA:
                         query_nope[:, None, :],
                         state.key_absorb[rank],
                     )
-                    context = attention_step(
-                        "compressed_kv_decode",
-                        "cuda",
-                        query_nope=absorbed_query,
-                        query_rope=query_rope[:, None, :],
-                        latent_cache=state.latent_cache[rank],
-                        rope_cache=state.rope_cache[rank],
-                        position=state.local_positions[rank],
-                        scale_denominator=scale_denominator,
-                        score_workspace=state.score_workspace[rank],
-                        output=state.attention_output[rank],
-                    )
+                    if self._paged_runners is not None:
+                        page_size = int(
+                            self._paged_runners[rank].page_size
+                        )
+                        context = attention_step(
+                            "paged_latent_decode",
+                            "cuda",
+                            runner=self._paged_runners[rank],
+                            query_nope=absorbed_query.transpose(0, 1),
+                            query_rope=query_rope[None, :, :],
+                            latent_cache=state.latent_cache[rank].view(
+                                self._cache_capacity // page_size,
+                                page_size,
+                                spec.kv_lora_rank,
+                            ),
+                            rope_cache=state.rope_cache[rank].view(
+                                self._cache_capacity // page_size,
+                                page_size,
+                                spec.qk_rope_head_dim,
+                            ),
+                        )
+                        if context is not None:
+                            context = context.transpose(0, 1)
+                    else:
+                        context = attention_step(
+                            "compressed_kv_decode",
+                            "cuda",
+                            query_nope=absorbed_query,
+                            query_rope=query_rope[:, None, :],
+                            latent_cache=state.latent_cache[rank],
+                            rope_cache=state.rope_cache[rank],
+                            position=state.local_positions[rank],
+                            scale_denominator=scale_denominator,
+                            score_workspace=state.score_workspace[rank],
+                            output=state.attention_output[rank],
+                        )
                     if context is None:
                         raise RuntimeError("TP MLA decode core unavailable")
                     output = torch.bmm(
@@ -3453,7 +3854,7 @@ class TensorParallelMLA:
                         state.value_absorb[rank].transpose(1, 2),
                     ).reshape(1, -1)
                     output.mul_(output_gate.sigmoid())
-                    return F.linear(
+                    return _linear(
                         output,
                         state.output_projection[rank],
                     ).float()
@@ -3525,6 +3926,10 @@ class TensorParallelMLA:
         owner_device = self.devices[state.owner]
         if value.device != owner_device:
             raise ValueError("TP MLA input is not on its owner rank")
+        paged_events = self._prepare_paged_position(position)
+        if paged_events is not None:
+            for device in self.devices:
+                torch.cuda.synchronize(device)
         with torch.cuda.device(owner_device):
             state.source.copy_(value)
             state.source_position.fill_(int(position))
@@ -3606,10 +4011,13 @@ class TensorParallelMLA:
             raise ValueError("CUDA TPHidden requires ready events")
         if state.input_events is None:
             raise RuntimeError("TP MLA input events are unavailable")
+        paged_events = self._prepare_paged_position(int(position))
         for rank, device in enumerate(self.devices):
             with torch.cuda.device(device):
                 stream = torch.cuda.current_stream(device)
                 stream.wait_event(hidden.ready_events[rank])
+                if paged_events is not None:
+                    stream.wait_event(paged_events[rank])
                 state.local_positions[rank].fill_(int(position))
                 state.input_events[rank].record(stream)
         return tuple(state.input_events)
@@ -3683,6 +4091,10 @@ class TensorParallelMLA:
             raise RuntimeError("TP MLA graphs are not captured")
         if not 0 <= int(position) < self.spec.max_ctx:
             raise ValueError("TP MLA position exceeds max_ctx")
+        paged_events = self._prepare_paged_position(position)
+        if paged_events is not None:
+            for device in self.devices:
+                torch.cuda.synchronize(device)
         owner_device = self.devices[state.owner]
         with torch.cuda.device(owner_device):
             state.source_position.fill_(int(position))
@@ -3692,6 +4104,8 @@ class TensorParallelMLA:
             )
 
     def reset(self) -> None:
+        self._paged_position = None
+        self._paged_ready_events = None
         for state in self.layers.values():
             with torch.cuda.device(self.devices[state.owner]):
                 state.source_position.zero_()
@@ -3878,11 +4292,6 @@ class TensorParallelDecodeLayerPlan:
             attention_output,
         )
 
-    @property
-    def persistent_enabled(self) -> bool:
-        capability = getattr(self._plan, "persistent_enabled", None)
-        return bool(capability is not None and capability())
-
     def launch(self, hidden, position: int | None = None):
         input_events = self.attention_executor.prepare_hidden_events(
             self.layer,
@@ -3912,4 +4321,7 @@ __all__ = [
     "TensorParallelMoEPrelude",
     "TensorParallelRouteDown",
     "TensorParallelRowLinear",
+    "TensorParallelVocab",
+    "shard_linear_input",
+    "shard_linear_output",
 ]

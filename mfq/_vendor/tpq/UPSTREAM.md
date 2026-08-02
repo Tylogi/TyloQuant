@@ -1,8 +1,8 @@
 # Vendored TyloQuant PQ runtime
 
-This directory contains the production dependency closure used by MFQ's CCCP
+This directory contains the production dependency closure used by MFQ's TPQ
 runtime integration. It was synchronized from the collaborator-maintained
-snapshot at `references/tpq2` on 2026-07-29.
+TPQ 1.2.0 snapshot on 2026-08-02.
 
 The vendored package keeps the runtime import name `tpq` because its CUDA
 extension and internal relative imports use that package boundary. MFQ loads

@@ -234,6 +234,13 @@ __global__ void tpq_psumbook_routed_kernel(
     if (packed_address == 0) return;
     const int64_t codebook_address =
         metadata[(long)(metadata_base + 1) * expert_count + expert];
+    const int dtype_tag = static_cast<int>(
+        metadata[(long)(metadata_base + 4) * expert_count + expert]);
+    // Mixed-codebook layers keep v256 experts in the CodeGEMM Psumbook
+    // layout and vv/K4096 experts in their native uint16 row-major layout.
+    // Both formats share one metadata table; never reinterpret a uint16
+    // address as four packed uint8 Psumbook codes.
+    if (dtype_tag != 0) return;
     const auto* packed = reinterpret_cast<const uint32_t*>(
         static_cast<uintptr_t>(packed_address));
     const auto* codebook = reinterpret_cast<const __nv_bfloat16*>(

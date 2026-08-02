@@ -123,7 +123,7 @@ def _render(
     segments: list[tuple[str, bool]] = []
     if thinking:
         effort = options.reasoning_effort or "max"
-        if effort not in {"low", "high", "max"}:
+        if effort not in {"low", "medium", "high", "max"}:
             raise UnsupportedChatCapability(
                 "kimi_k3",
                 f"reasoning_effort={effort}",

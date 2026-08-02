@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import os
 import time
+import gc
 from contextlib import nullcontext
 
 import torch
@@ -18,6 +19,7 @@ import torch.nn.functional as F
 
 from .cconfig import KimiK3Config
 from .grouped import activate_gate_up, moe_mlp_grouped_mixed
+from .kernels import BlockFP8Weight, ProjectionGroup
 from .kimi_ops import (
     attention_residual,
     gated_rmsnorm,
@@ -27,10 +29,17 @@ from .kimi_ops import (
     short_conv_step,
 )
 from .precision import compute_dtype
-from .store import CCCPStore, ExpertPool, PackedCpuExpertPool
+from .store import TPQStore, ExpertPool, PackedCpuExpertPool
 
 
 _ROOT = "language_model"
+
+
+def _linear(value: torch.Tensor, weight) -> torch.Tensor:
+    """Preserve the direct path's dtype through the public compact Linear."""
+    from .ops import linear
+
+    return linear(value, weight, output_dtype=value.dtype)
 
 
 class KimiK3TPQModel:
@@ -58,7 +67,7 @@ class KimiK3TPQModel:
 
             self._cpu_threads = configure_cpu_threads()
             self._cpu_numa_interleaved = configure_numa_interleave()
-        self.store = CCCPStore(root)
+        self.store = TPQStore(root)
         self.cfg = self.store.cfg
         self.config = KimiK3Config.from_json(self.cfg)
         from .ops import ModelOperatorConfig
@@ -101,18 +110,38 @@ class KimiK3TPQModel:
                 self.store,
                 self.tp_size,
             )
-            self.pool = PackedExpertPool(
-                self.store,
-                self.devices,
-                self._pipeline_plan,
-                parallelism=os.environ.get(
-                    "TPQ_MOE_PARALLELISM",
-                    "tensor",
-                ),
-                tensor_group_size=int(
-                    os.environ.get("TPQ_MOE_TP_GROUP", "2")
-                ),
+            tp_ram_offload = (
+                os.environ.get(
+                    "TPQ_KIMI_TP_PACKED_HYBRID",
+                    "0",
+                )
+                != "0"
             )
+            if tp_ram_offload:
+                from .kimi_tp_hybrid import (
+                    KimiPackedTensorHybridPool,
+                )
+
+                self.pool = KimiPackedTensorHybridPool(
+                    self.store,
+                    self.devices,
+                    self._pipeline_plan,
+                    vram_cache_gb,
+                    ram_gb=cache_gb,
+                )
+            else:
+                self.pool = PackedExpertPool(
+                    self.store,
+                    self.devices,
+                    self._pipeline_plan,
+                    parallelism=os.environ.get(
+                        "TPQ_MOE_PARALLELISM",
+                        "tensor",
+                    ),
+                    tensor_group_size=int(
+                        os.environ.get("TPQ_MOE_TP_GROUP", "2")
+                    ),
+                )
         else:
             self.devices = (self.device,)
             self._pipeline_plan = None
@@ -145,12 +174,32 @@ class KimiK3TPQModel:
                     device=device,
                     ram_gb=cache_gb if self.device.type != "cpu" else 0.0,
                 )
-        self._weights: dict[str, torch.Tensor] = {}
-        self._kda_input_proj: dict[int, torch.Tensor] = {}
+            if (
+                self.device.type == "cuda"
+                and os.environ.get(
+                    "TPQ_SINGLE_GPU_LAYER_GRAPH",
+                    "0",
+                )
+                != "0"
+            ):
+                from .kimi_experts import build_kimi_layer_plan
+
+                # Reuse the public fixed-address TP graph builders at width
+                # one.  The packed RAM pool remains unchanged; this plan only
+                # describes dense/attention graph ownership and never turns
+                # the single-GPU path into an owner/worker execution system.
+                self._pipeline_plan = build_kimi_layer_plan(
+                    self.store,
+                    1,
+                )
+        self._weights: dict[str, object] = {}
+        self._consumed_dense_names: set[str] = set()
+        self._kda_input_proj: dict[int, object] = {}
         self._kda_gate_rank: dict[int, int] = {}
-        self._mla_input_proj: dict[int, torch.Tensor] = {}
-        self._dense_gate_up: dict[int, torch.Tensor] = {}
-        self._shared_gate_up: dict[int, torch.Tensor] = {}
+        self._mla_input_proj: dict[int, object] = {}
+        self._dense_gate_up: dict[int, object] = {}
+        self._shared_gate_up: dict[int, object] = {}
+        self._moe_input_proj: dict[int, object] = {}
         self._tp_dense_mlp = None
         self._tp_shared_mlp = None
         self._tp_kda = None
@@ -160,6 +209,7 @@ class KimiK3TPQModel:
         self._tp_router = None
         self._tp_route_down = None
         self._tp_moe_prelude = None
+        self._tp_vocab = None
         self._tp_hidden_state_ready = False
         self._tp_token_hidden = None
         self._tp_block_residual = None
@@ -214,6 +264,8 @@ class KimiK3TPQModel:
         self._prev_ids: dict[int, list[int]] = {}
         self.last_layer_profile: list[dict[str, float | int]] = []
         self.last_cuda_profile: dict[str, object] = {}
+        self._profile_enabled = False
+        self._profile_pool_snapshot: dict[str, float | int] = {}
         self.tp_dataflow: dict[str, object] = {}
         self._tp_no_owner_moe_timing: dict[str, float] = {}
         self._tp_async_profile_active = False
@@ -236,15 +288,27 @@ class KimiK3TPQModel:
             return self.devices[0]
         return self.devices[-1]
 
-    def w(self, name: str) -> torch.Tensor:
+    def w(self, name: str):
         cached = self._weights.get(name)
         if cached is not None:
             return cached
         value = self.store.get_dense(name)
-        if not isinstance(value, torch.Tensor):
+        if not isinstance(value, (torch.Tensor, BlockFP8Weight)):
             raise TypeError(
-                f"Kimi dense tensor {name!r} is not source-native"
+                f"Kimi dense tensor {name!r} has unsupported storage"
             )
+        if (
+            isinstance(value, BlockFP8Weight)
+            and (
+                "layernorm.weight" in name
+                or name.endswith(".norm.weight")
+                or name.endswith(".o_norm.weight")
+            )
+        ):
+            # Norm vectors are tiny and consumed by fixed BF16 RMSNorm
+            # kernels. This explicit materialization never applies to a
+            # matrix projection.
+            value = value.to(torch.bfloat16)
         if (
             name.endswith(".block_sparse_moe.gate.weight")
             or name.endswith(
@@ -253,12 +317,45 @@ class KimiK3TPQModel:
         ):
             # Kimi's published router explicitly evaluates in FP32. Convert
             # once while loading instead of allocating a FP32 copy per token.
-            value = value.float()
+            if isinstance(value, BlockFP8Weight):
+                value = value.to(torch.float32)
+            else:
+                value = value.float()
         target = self._weight_device(name)
         if target.type != "cpu":
             value = value.to(target)
         self._weights[name] = value
         return value
+
+    def _take_weight(self, name: str):
+        """Load one source weight lazily and transfer ownership to an op."""
+        value = self.w(name)
+        self._weights.pop(name, None)
+        self._consumed_dense_names.add(name)
+        return value
+
+    def _release_cuda_startup_cache(self, stage: str) -> None:
+        """Release dead owner staging blocks between streamed TP stages."""
+        if self._pipeline_plan is None:
+            return
+        gc.collect()
+        released = []
+        for device in self.devices:
+            with torch.cuda.device(device):
+                torch.cuda.synchronize(device)
+                before = torch.cuda.memory_reserved(device)
+                torch.cuda.empty_cache()
+                after = torch.cuda.memory_reserved(device)
+                released.append(max(0, before - after))
+        if any(released):
+            print(
+                f"[tpq-kimi] {stage} 后释放启动暂存："
+                + "，".join(
+                    f"cuda:{device.index}={value / 2**30:.2f}GiB"
+                    for device, value in zip(self.devices, released)
+                ),
+                flush=True,
+            )
 
     @staticmethod
     def _language_weight(name: str) -> bool:
@@ -286,15 +383,23 @@ class KimiK3TPQModel:
             return
         started = time.time()
         if self._pipeline_plan is not None:
-            self.pool.allocate()
-            placement = (
-                "按层流水线"
-                if self.pool.parallelism == "pipeline"
-                else (
-                    "完整Dense权重仅按层暂存；运行权重已按维度分片到"
-                    "全rank，packed专家同样跨全rank分片"
+            allocate = getattr(self.pool, "allocate", None)
+            if callable(allocate):
+                allocate()
+            if len(self.devices) == 1:
+                placement = (
+                    "单rank固定地址 Graph；Dense 流式落入 GPU，"
+                    "packed 专家继续 RAM+VRAM"
                 )
-            )
+            else:
+                placement = (
+                    "按层流水线"
+                    if self.pool.parallelism == "pipeline"
+                    else (
+                        "完整Dense权重仅按层暂存；运行权重已按维度分片到"
+                        "全rank，packed专家同样跨全rank分片"
+                    )
+                )
             print(
                 f"[tpq-kimi] {placement}："
                 + "，".join(
@@ -310,24 +415,55 @@ class KimiK3TPQModel:
             name for name in self.store.dense_names()
             if self._language_weight(name)
         ]
-        for index, name in enumerate(names, 1):
-            self.w(name)
-            if index % 160 == 0:
-                print(
-                    f"[tpq-kimi] 预载 dense {index}/{len(names)}",
-                    flush=True,
-                )
-        self._combine_dense_projections()
+        if self._pipeline_plan is None:
+            for index, name in enumerate(names, 1):
+                self.w(name)
+                if index % 160 == 0:
+                    print(
+                        f"[tpq-kimi] 预载 dense {index}/{len(names)}",
+                        flush=True,
+                    )
+        else:
+            print(
+                "[tpq-kimi] Dense 流式建图：紧凑源权重读取后立即 TP 分片，"
+                "不保留完整 BF16/FP8 owner 副本",
+                flush=True,
+            )
+        if self._pipeline_plan is None:
+            self._combine_dense_projections()
         self._prepare_tp_kda()
+        self._release_cuda_startup_cache("KDA")
         self._prepare_tp_mla()
+        self._release_cuda_startup_cache("MLA")
         self._prepare_tp_dense_mlp()
+        self._release_cuda_startup_cache("Dense MLP")
         self._prepare_tp_moe_prelude()
         self._prepare_tp_shared_mlp()
+        self._release_cuda_startup_cache("共享 MLP")
         self._prepare_tp_route_down()
         self._prepare_tp_routed_linear()
         self._prepare_tp_router()
+        self._release_cuda_startup_cache("Router/MoE 投影")
         self._prepare_tp_hidden_state()
         self._assert_no_owner_tp_dataflow()
+        self._prepare_tp_vocab()
+        if self._pipeline_plan is not None:
+            remaining = [
+                name
+                for name in names
+                if (
+                    name not in self._consumed_dense_names
+                    and name not in self._weights
+                )
+            ]
+            for index, name in enumerate(remaining, 1):
+                self.w(name)
+                if index % 160 == 0:
+                    print(
+                        f"[tpq-kimi] 预载剩余 dense "
+                        f"{index}/{len(remaining)}",
+                        flush=True,
+                    )
         if self._tp_mla is None:
             for layer in self.config.full_attn_layers:
                 self._absorbed_weights(layer)
@@ -373,7 +509,7 @@ class KimiK3TPQModel:
                     f"{released / 2**30:.1f}GiB",
                     flush=True,
                 )
-        if self._pipeline_plan is not None:
+        if self._pipeline_plan is not None and hasattr(self.pool, "preload"):
             self.pool.preload()
             if (
                 getattr(self.pool, "hidden_mode", False)
@@ -436,15 +572,21 @@ class KimiK3TPQModel:
             return
         resident_all = self.pool.preload_all()
         if resident_all:
+            # Reserve the fixed VRAM arena before cudaHostRegister.  Very large
+            # host mappings consume CUDA driver address-space resources and can
+            # otherwise make the later arena allocation fail even though the
+            # packed archive itself never enters VRAM.
+            self.pool.build_gpu_arenas()
             self.pool.pin_host_resident()
         else:
             self.pool.preload_pinned()
-        self.pool.build_gpu_arenas()
+            self.pool.build_gpu_arenas()
 
     def _assert_no_owner_tp_dataflow(self) -> None:
         """Reject transitional owner compute when formal no-owner TP is on."""
         if (
             self._pipeline_plan is None
+            or len(self.devices) == 1
             or os.environ.get("TPQ_TP_HIDDEN_STATE", "0") == "0"
             or os.environ.get("TPQ_TP_NO_OWNER", "1") == "0"
         ):
@@ -616,73 +758,114 @@ class KimiK3TPQModel:
             flush=True,
         )
 
-    def _combine_dense_projections(self) -> None:
-        """合并数学等价的 BF16 GEMV，减少 decode kernel 提交。"""
-        for layer in self.config.kda_layers:
-            prefix = f"{_ROOT}.model.layers.{layer}.self_attn"
-            names = [
-                f"{prefix}.{projection}.weight"
-                for projection in (
-                    "q_proj",
-                    "k_proj",
-                    "v_proj",
-                    "g_proj",
-                    "f_a_proj",
-                    "b_proj",
-                )
-            ]
-            values = [self._weights.pop(name) for name in names]
-            self._kda_gate_rank[layer] = int(values[4].shape[0])
-            self._kda_input_proj[layer] = torch.cat(values, dim=0)
-            # The published tensor is FP32, while the reference operation
-            # casts it to the activation dtype on every token.  Cache that
-            # mathematically identical BF16 view once so the registered
-            # gated-RMSNorm kernel is selected instead of a seven-kernel
-            # eager fallback.
-            norm_name = f"{prefix}.o_norm.weight"
-            self._weights[norm_name] = self._weights[norm_name].to(
-                torch.bfloat16
+    @staticmethod
+    def _combine_projection_values(values):
+        if all(isinstance(value, torch.Tensor) for value in values):
+            return torch.cat(tuple(values), dim=0)
+        return ProjectionGroup(values)
+
+    def _load_kda_input_projection(self, layer: int) -> None:
+        if layer in self._kda_input_proj:
+            return
+        prefix = f"{_ROOT}.model.layers.{layer}.self_attn"
+        names = [
+            f"{prefix}.{projection}.weight"
+            for projection in (
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "g_proj",
+                "f_a_proj",
+                "b_proj",
             )
-        for layer in self.config.full_attn_layers:
-            prefix = f"{_ROOT}.model.layers.{layer}.self_attn"
-            names = [
-                f"{prefix}.{projection}.weight"
-                for projection in (
-                    "q_a_proj",
-                    "kv_a_proj_with_mqa",
-                    "g_proj",
-                )
-            ]
-            values = [self._weights.pop(name) for name in names]
-            self._mla_input_proj[layer] = torch.cat(values, dim=0)
-        for layer in range(self.config.first_dense_layers):
-            prefix = f"{_ROOT}.model.layers.{layer}.mlp"
-            gate_name = f"{prefix}.gate_proj.weight"
-            up_name = f"{prefix}.up_proj.weight"
-            self._dense_gate_up[layer] = torch.cat(
-                (
-                    self._weights.pop(gate_name),
-                    self._weights.pop(up_name),
+        ]
+        values = [self._take_weight(name) for name in names]
+        self._kda_gate_rank[layer] = int(values[4].shape[0])
+        self._kda_input_proj[layer] = self._combine_projection_values(
+            values
+        )
+        norm_name = f"{prefix}.o_norm.weight"
+        self._weights[norm_name] = self.w(norm_name).to(torch.bfloat16)
+
+    def _load_mla_input_projection(self, layer: int) -> None:
+        if layer in self._mla_input_proj:
+            return
+        prefix = f"{_ROOT}.model.layers.{layer}.self_attn"
+        names = [
+            f"{prefix}.{projection}.weight"
+            for projection in (
+                "q_a_proj",
+                "kv_a_proj_with_mqa",
+                "g_proj",
+            )
+        ]
+        self._mla_input_proj[layer] = self._combine_projection_values(
+            [self._take_weight(name) for name in names]
+        )
+
+    def _load_dense_gate_up(self, layer: int) -> None:
+        if layer in self._dense_gate_up:
+            return
+        prefix = f"{_ROOT}.model.layers.{layer}.mlp"
+        self._dense_gate_up[layer] = self._combine_projection_values(
+            (
+                self._take_weight(f"{prefix}.gate_proj.weight"),
+                self._take_weight(f"{prefix}.up_proj.weight"),
+            )
+        )
+
+    def _load_shared_gate_up(self, layer: int) -> None:
+        if layer in self._shared_gate_up:
+            return
+        prefix = (
+            f"{_ROOT}.model.layers.{layer}."
+            "block_sparse_moe.shared_experts"
+        )
+        self._shared_gate_up[layer] = self._combine_projection_values(
+            (
+                self._take_weight(f"{prefix}.gate_proj.weight"),
+                self._take_weight(f"{prefix}.up_proj.weight"),
+            )
+        )
+
+    def _load_moe_input_projection(self, layer: int) -> None:
+        """Group the block-FP8 projections fed by the same MoE input.
+
+        The public ``ProjectionGroup`` backend preserves the three compact
+        source tensors and emits one logical token-sized output.  This is a
+        generic grouped GEMV capability; only the split sizes come from the
+        model configuration.
+        """
+        if layer in self._moe_input_proj:
+            return
+        prefix = f"{_ROOT}.model.layers.{layer}.block_sparse_moe"
+        shared = f"{prefix}.shared_experts"
+        self._moe_input_proj[layer] = self._combine_projection_values(
+            (
+                self._take_weight(f"{shared}.gate_proj.weight"),
+                self._take_weight(f"{shared}.up_proj.weight"),
+                self._take_weight(
+                    f"{prefix}.routed_expert_down_proj.weight"
                 ),
-                dim=0,
             )
+        )
+
+    def _combine_dense_projections(self) -> None:
+        """Eager compatibility path; TP uses per-layer streaming loaders."""
+        for layer in self.config.kda_layers:
+            self._load_kda_input_projection(layer)
+        for layer in self.config.full_attn_layers:
+            self._load_mla_input_projection(layer)
+        for layer in range(self.config.first_dense_layers):
+            self._load_dense_gate_up(layer)
         for layer in range(
             self.config.first_dense_layers,
             self.config.n_layers,
         ):
-            prefix = (
-                f"{_ROOT}.model.layers.{layer}."
-                "block_sparse_moe.shared_experts"
-            )
-            gate_name = f"{prefix}.gate_proj.weight"
-            up_name = f"{prefix}.up_proj.weight"
-            self._shared_gate_up[layer] = torch.cat(
-                (
-                    self._weights.pop(gate_name),
-                    self._weights.pop(up_name),
-                ),
-                dim=0,
-            )
+            if os.environ.get("TPQ_MOE_INPUT_GROUPED", "1") != "0":
+                self._load_moe_input_projection(layer)
+            else:
+                self._load_shared_gate_up(layer)
 
     def _make_small_tp_executor(self, kind: str, spec):
         from .ops import create_tensor_parallel
@@ -705,10 +888,10 @@ class KimiK3TPQModel:
         )
         while group_size > 1 and len(self.devices) % group_size:
             group_size -= 1
+        if group_size == 1 and len(self.devices) == 1:
+            return factory(self.devices)
         if group_size <= 1:
-            raise ValueError(
-                "no usable small-op TP subgroup for visible devices"
-            )
+            raise ValueError("no usable TP subgroup for visible devices")
         if group_size == len(self.devices):
             return factory(self.devices)
         return OwnerGroupedTensorParallel(
@@ -776,6 +959,7 @@ class KimiK3TPQModel:
         )
 
         first_layer = self.config.first_dense_layers
+        self._load_shared_gate_up(first_layer)
         first_weight = self._shared_gate_up[first_layer]
         intermediate = first_weight.shape[0] // 2
         spec = GatedMLPSpec(
@@ -790,6 +974,7 @@ class KimiK3TPQModel:
             spec,
         )
         for layer in range(first_layer, self.config.n_layers):
+            self._load_shared_gate_up(layer)
             prefix = (
                 f"{_ROOT}.model.layers.{layer}."
                 "block_sparse_moe.shared_experts"
@@ -798,7 +983,7 @@ class KimiK3TPQModel:
                 layer,
                 self._pipeline_plan.owner_by_layer[layer],
                 self._shared_gate_up.pop(layer),
-                self._weights.pop(f"{prefix}.down_proj.weight"),
+                self._take_weight(f"{prefix}.down_proj.weight"),
             )
         executor.capture()
         self._tp_shared_mlp = executor
@@ -819,6 +1004,7 @@ class KimiK3TPQModel:
         from .ops.tensor_parallel import MoEPreludeSpec
 
         first_layer = self.config.first_dense_layers
+        self._load_shared_gate_up(first_layer)
         shared_intermediate = (
             self._shared_gate_up[first_layer].shape[0] // 2
         )
@@ -835,6 +1021,7 @@ class KimiK3TPQModel:
             ),
         )
         for layer in range(first_layer, self.config.n_layers):
+            self._load_shared_gate_up(layer)
             prefix = (
                 f"{_ROOT}.model.layers.{layer}."
                 "block_sparse_moe"
@@ -842,12 +1029,12 @@ class KimiK3TPQModel:
             executor.add_layer(
                 layer,
                 self._pipeline_plan.owner_by_layer[layer],
-                self._weights.pop(f"{prefix}.gate.weight"),
-                self._weights.pop(
+                self._take_weight(f"{prefix}.gate.weight"),
+                self._take_weight(
                     f"{prefix}.routed_expert_down_proj.weight"
                 ),
                 self._shared_gate_up.pop(layer),
-                self._weights.pop(
+                self._take_weight(
                     f"{prefix}.shared_experts.down_proj.weight"
                 ),
             )
@@ -893,8 +1080,8 @@ class KimiK3TPQModel:
             executor.add_layer(
                 layer,
                 self._pipeline_plan.owner_by_layer[layer],
-                self._weights.pop(f"{prefix}.gate.weight"),
-                self._weights.pop(
+                self._take_weight(f"{prefix}.gate.weight"),
+                self._take_weight(
                     f"{prefix}.routed_expert_down_proj.weight"
                 ),
             )
@@ -937,8 +1124,7 @@ class KimiK3TPQModel:
             GatedMLPSpec,
         )
 
-        first_weight = self._dense_gate_up[0]
-        intermediate = first_weight.shape[0] // 2
+        intermediate = self.config.inter_dense
         executor = self._make_small_tp_executor(
             "gated_mlp",
             GatedMLPSpec(
@@ -950,12 +1136,13 @@ class KimiK3TPQModel:
             ),
         )
         for layer in range(self.config.first_dense_layers):
+            self._load_dense_gate_up(layer)
             prefix = f"{_ROOT}.model.layers.{layer}.mlp"
             executor.add_layer(
                 layer,
                 self._pipeline_plan.owner_by_layer[layer],
                 self._dense_gate_up.pop(layer),
-                self._weights.pop(f"{prefix}.down_proj.weight"),
+                self._take_weight(f"{prefix}.down_proj.weight"),
             )
         executor.capture()
         self._tp_dense_mlp = executor
@@ -1032,14 +1219,14 @@ class KimiK3TPQModel:
                 down.add_layer(
                     layer,
                     owner,
-                    self._weights.pop(
+                    self._take_weight(
                         f"{prefix}.routed_expert_down_proj.weight"
                     ),
                 )
             up.add_layer(
                 layer,
                 owner,
-                self._weights.pop(
+                self._take_weight(
                     f"{prefix}.routed_expert_up_proj.weight"
                 ),
             )
@@ -1111,7 +1298,7 @@ class KimiK3TPQModel:
             executor.add_layer(
                 layer,
                 self._pipeline_plan.owner_by_layer[layer],
-                self._weights.pop(f"{prefix}.gate.weight"),
+                self._take_weight(f"{prefix}.gate.weight"),
             )
         executor.capture()
         self._tp_router = executor
@@ -1401,6 +1588,24 @@ class KimiK3TPQModel:
             self._prepare_tp_attention_layer_graph()
             self._prepare_tp_mlp_layer_graph()
         self._tp_hidden_state_ready = True
+        if len(self.devices) == 1:
+            self.tp_dataflow.update(
+                {
+                    "hidden_layout": "single_rank_fixed_address",
+                    "attention_schedule": (
+                        "normalize_to_head_to_row_parent_graph"
+                    ),
+                    "mlp_schedule": (
+                        "residual_to_shared_router_down_parent_graph"
+                    ),
+                    "packed_route_mapping": (
+                        "cuda_fixed_slot_directory"
+                    ),
+                    "packed_moe_compute": "single_fused_cuda_kernel",
+                    "ram_miss_fallback": "compact_staged_h2d",
+                    "expanded_index_bytes": 0,
+                }
+            )
         print(
             "[tpq-kimi] 通用 TPHidden 跨层状态完成："
             f"{len(self.devices)} rank，固定 residual={residual_rows} 行",
@@ -1566,6 +1771,7 @@ class KimiK3TPQModel:
         from .ops.tensor_parallel import KDASpec
 
         first_layer = self.config.kda_layers[0]
+        self._load_kda_input_projection(first_layer)
         gate_rank = self._kda_gate_rank[first_layer]
         executor = self._make_small_tp_executor(
             "kda",
@@ -1585,6 +1791,7 @@ class KimiK3TPQModel:
             ),
         )
         for layer in self.config.kda_layers:
+            self._load_kda_input_projection(layer)
             if self._kda_gate_rank[layer] != gate_rank:
                 raise ValueError("KDA gate rank must be stable across layers")
             prefix = f"{_ROOT}.model.layers.{layer}.self_attn"
@@ -1592,17 +1799,17 @@ class KimiK3TPQModel:
                 layer,
                 self._pipeline_plan.owner_by_layer[layer],
                 self._kda_input_proj.pop(layer),
-                self._weights.pop(f"{prefix}.f_b_proj.weight"),
+                self._take_weight(f"{prefix}.f_b_proj.weight"),
                 tuple(
-                    self._weights.pop(
+                    self._take_weight(
                         f"{prefix}.{name}_conv1d.weight"
                     )
                     for name in ("q", "k", "v")
                 ),
-                self._weights.pop(f"{prefix}.A_log"),
-                self._weights.pop(f"{prefix}.dt_bias"),
-                self._weights.pop(f"{prefix}.o_norm.weight"),
-                self._weights.pop(f"{prefix}.o_proj.weight"),
+                self._take_weight(f"{prefix}.A_log"),
+                self._take_weight(f"{prefix}.dt_bias"),
+                self._take_weight(f"{prefix}.o_norm.weight"),
+                self._take_weight(f"{prefix}.o_proj.weight"),
             )
         executor.capture()
         self._tp_kda = executor
@@ -1640,30 +1847,89 @@ class KimiK3TPQModel:
             ),
         )
         for layer in self.config.full_attn_layers:
+            self._load_mla_input_projection(layer)
             prefix = f"{_ROOT}.model.layers.{layer}.self_attn"
             key_absorb, value_absorb = self._absorbed_weights(layer)
             executor.add_layer(
                 layer,
                 self._pipeline_plan.owner_by_layer[layer],
                 self._mla_input_proj.pop(layer),
-                self._weights.pop(
+                self._take_weight(
                     f"{prefix}.q_a_layernorm.weight"
                 ),
-                self._weights.pop(f"{prefix}.q_b_proj.weight"),
-                self._weights.pop(
+                self._take_weight(f"{prefix}.q_b_proj.weight"),
+                self._take_weight(
                     f"{prefix}.kv_a_layernorm.weight"
                 ),
                 key_absorb,
                 value_absorb,
-                self._weights.pop(f"{prefix}.o_proj.weight"),
+                self._take_weight(f"{prefix}.o_proj.weight"),
             )
             self._absorbed.pop(layer, None)
         executor.capture()
         self._tp_mla = executor
         print(
+            f"[tpq-kimi] MLA backend={executor.attention_backend}",
+            flush=True,
+        )
+        print(
             "[tpq-kimi] 通用 MLA Head-TP Graph 完成："
             f"{len(self.config.full_attn_layers)} 层×"
             f"TP{self._tp_executor_width(executor)}",
+            flush=True,
+        )
+
+    def _prepare_tp_vocab(self) -> None:
+        """Shard the two large BF16 vocabulary matrices across all ranks."""
+        if self._pipeline_plan is None or len(self.devices) == 1:
+            return
+        from .ops import TensorParallelVocab
+
+        embedding_name = f"{_ROOT}.model.embed_tokens.weight"
+        output_name = f"{_ROOT}.lm_head.weight"
+        embedding = self.store.get_dense(embedding_name)
+        if (
+            not isinstance(embedding, torch.Tensor)
+            or embedding.dtype != torch.bfloat16
+        ):
+            raise ValueError("Kimi vocabulary TP requires BF16 embedding rows")
+        offsets = TensorParallelVocab.offsets_for(
+            int(embedding.shape[0]),
+            len(self.devices),
+        )
+
+        def shard(weight):
+            return tuple(
+                weight[offsets[rank]:offsets[rank + 1]]
+                .to(device)
+                .contiguous()
+                for rank, device in enumerate(self.devices)
+            )
+
+        embedding_shape = embedding.shape
+        embedding_shards = shard(embedding)
+        del embedding
+        gc.collect()
+        output = self.store.get_dense(output_name)
+        if (
+            not isinstance(output, torch.Tensor)
+            or output.dtype != torch.bfloat16
+            or output.shape != embedding_shape
+        ):
+            raise ValueError("Kimi vocabulary TP output rows do not match")
+        output_shards = shard(output)
+        del output
+        self._tp_vocab = TensorParallelVocab(
+            self.devices,
+            embedding_shards,
+            output_shards,
+            offsets,
+        )
+        self._consumed_dense_names.update((embedding_name, output_name))
+        self._release_cuda_startup_cache("Vocab TP")
+        print(
+            "[tpq-kimi] 通用 Vocab-TP 完成：Embedding/LM Head "
+            f"按词表行分片到 TP{len(self.devices)}",
             flush=True,
         )
 
@@ -1887,32 +2153,32 @@ class KimiK3TPQModel:
         prefix = f"{_ROOT}.model.layers.{layer}.self_attn"
         combined_input = self._kda_input_proj.get(layer)
         if combined_input is None:
-            query = F.linear(
+            query = _linear(
                 value,
                 self.w(f"{prefix}.q_proj.weight"),
             ).reshape(config.n_heads, config.head_dim)
-            key = F.linear(
+            key = _linear(
                 value,
                 self.w(f"{prefix}.k_proj.weight"),
             ).reshape(config.n_heads, config.head_dim)
-            val = F.linear(
+            val = _linear(
                 value,
                 self.w(f"{prefix}.v_proj.weight"),
             ).reshape(config.n_heads, config.head_dim)
-            output_gate = F.linear(
+            output_gate = _linear(
                 value,
                 self.w(f"{prefix}.g_proj.weight"),
             ).view(config.n_heads, config.head_dim)
-            low_rank_gate = F.linear(
+            low_rank_gate = _linear(
                 value,
                 self.w(f"{prefix}.f_a_proj.weight"),
             )
-            beta = F.linear(
+            beta = _linear(
                 value,
                 self.w(f"{prefix}.b_proj.weight"),
             ).reshape(config.n_heads).float()
         else:
-            projected = F.linear(
+            projected = _linear(
                 value,
                 combined_input,
             ).split(
@@ -1976,7 +2242,7 @@ class KimiK3TPQModel:
         query = query.view(config.n_heads, config.head_dim)
         key = key.view(config.n_heads, config.head_dim)
         val = val.view(config.n_heads, config.head_dim)
-        recurrent_gate = F.linear(
+        recurrent_gate = _linear(
             low_rank_gate,
             self.w(f"{prefix}.f_b_proj.weight"),
         ).view(config.n_heads, config.head_dim)
@@ -2067,7 +2333,7 @@ class KimiK3TPQModel:
                 config.rms_eps,
             )
         )
-        return F.linear(
+        return _linear(
             output.reshape(1, -1),
             self.w(f"{prefix}.o_proj.weight"),
         )
@@ -2082,7 +2348,16 @@ class KimiK3TPQModel:
         config = self.config
         prefix = f"{_ROOT}.model.layers.{layer}.self_attn"
         source_name = f"{prefix}.kv_b_proj.weight"
-        weight = self.w(source_name).view(
+        weight = self.w(source_name)
+        if isinstance(weight, BlockFP8Weight):
+            # MLA consumes smaller absorbed factors. Materialize this source
+            # once and release it immediately; no full matrix remains resident.
+            weight = weight.dequant_rows(
+                0,
+                weight.shape[0],
+                torch.bfloat16,
+            )
+        weight = weight.view(
             config.n_heads,
             config.qk_nope_head_dim + config.v_head_dim,
             config.kv_lora_rank,
@@ -2096,6 +2371,7 @@ class KimiK3TPQModel:
         # representation used by decode.  Releasing the original avoids
         # retaining a duplicate ~25 MiB tensor for each MLA layer.
         self._weights.pop(source_name, None)
+        self._consumed_dense_names.add(source_name)
         return cached
 
     @staticmethod
@@ -2223,20 +2499,20 @@ class KimiK3TPQModel:
         prefix = f"{_ROOT}.model.layers.{layer}.self_attn"
         combined_input = self._mla_input_proj.get(layer)
         if combined_input is None:
-            query_source = F.linear(
+            query_source = _linear(
                 value,
                 self.w(f"{prefix}.q_a_proj.weight"),
             )
-            compressed = F.linear(
+            compressed = _linear(
                 value,
                 self.w(f"{prefix}.kv_a_proj_with_mqa.weight"),
             )
-            output_gate = F.linear(
+            output_gate = _linear(
                 value,
                 self.w(f"{prefix}.g_proj.weight"),
             ).sigmoid()
         else:
-            query_source, compressed, output_gate = F.linear(
+            query_source, compressed, output_gate = _linear(
                 value,
                 combined_input,
             ).split(
@@ -2253,7 +2529,7 @@ class KimiK3TPQModel:
             self.w(f"{prefix}.q_a_layernorm.weight"),
             1e-6,
         )
-        query = F.linear(
+        query = _linear(
             query_residual,
             self.w(f"{prefix}.q_b_proj.weight"),
         ).view(config.n_heads, -1)
@@ -2309,7 +2585,7 @@ class KimiK3TPQModel:
             context,
             value_absorb.transpose(1, 2),
         ).reshape(1, config.n_heads * config.v_head_dim)
-        return F.linear(
+        return _linear(
             output * output_gate,
             self.w(f"{prefix}.o_proj.weight"),
         )
@@ -2341,16 +2617,16 @@ class KimiK3TPQModel:
         prefix = f"{_ROOT}.model.layers.{layer}.mlp"
         combined_gate_up = self._dense_gate_up.get(layer)
         if combined_gate_up is None:
-            gate = F.linear(
+            gate = _linear(
                 value,
                 self.w(f"{prefix}.gate_proj.weight"),
             )
-            up = F.linear(
+            up = _linear(
                 value,
                 self.w(f"{prefix}.up_proj.weight"),
             )
         else:
-            gate, up = F.linear(
+            gate, up = _linear(
                 value,
                 combined_gate_up,
             ).chunk(2, dim=-1)
@@ -2361,7 +2637,7 @@ class KimiK3TPQModel:
             situ_beta=self.config.situ_beta,
             situ_linear_beta=self.config.situ_linear_beta,
         )
-        return F.linear(
+        return _linear(
             activated,
             self.w(f"{prefix}.down_proj.weight"),
         )
@@ -2380,6 +2656,23 @@ class KimiK3TPQModel:
         prelude_logits = None
         prelude_latent = None
         prelude_shared = None
+        prelude_shared_gate = None
+        prelude_shared_up = None
+        grouped_input = self._moe_input_proj.get(layer)
+        if grouped_input is not None:
+            shared_intermediate = config.n_shared * config.moe_inter
+            (
+                prelude_shared_gate,
+                prelude_shared_up,
+                prelude_latent,
+            ) = _linear(value, grouped_input).split(
+                (
+                    shared_intermediate,
+                    shared_intermediate,
+                    config.routed_hidden,
+                ),
+                dim=-1,
+            )
         if self._tp_moe_prelude is not None:
             prelude_event = self._cuda_stage_start(
                 layer,
@@ -2536,7 +2829,7 @@ class KimiK3TPQModel:
                             raise RuntimeError(
                                 "router weight is unavailable"
                             )
-                        logits = F.linear(value.float(), gate_weight)
+                        logits = _linear(value.float(), gate_weight)
                         route = route_topk(
                             logits,
                             correction,
@@ -2593,12 +2886,70 @@ class KimiK3TPQModel:
                 value,
             ).to(value.dtype)
         else:
-            latent = F.linear(
+            latent = _linear(
                 value,
                 self.w(f"{prefix}.routed_expert_down_proj.weight"),
             )
         self._cuda_stage_end(down_event)
         weights, indices = route
+
+        def compute_shared_output() -> torch.Tensor:
+            shared_event = self._cuda_stage_start(
+                layer,
+                "moe_shared",
+                device,
+            )
+            shared_prefix = f"{prefix}.shared_experts"
+            if prelude_shared is not None:
+                shared_output = prelude_shared.to(value.dtype)
+            elif shared_pending is not None:
+                shared_output = self._tp_shared_mlp.finish(
+                    layer,
+                    shared_pending,
+                ).to(value.dtype)
+            else:
+                combined_gate_up = self._shared_gate_up.get(layer)
+                if (
+                    prelude_shared_gate is not None
+                    and prelude_shared_up is not None
+                ):
+                    shared_gate = prelude_shared_gate
+                    shared_up = prelude_shared_up
+                elif combined_gate_up is None:
+                    shared_gate = _linear(
+                        value,
+                        self.w(f"{shared_prefix}.gate_proj.weight"),
+                    )
+                    shared_up = _linear(
+                        value,
+                        self.w(f"{shared_prefix}.up_proj.weight"),
+                    )
+                else:
+                    shared_gate, shared_up = _linear(
+                        value,
+                        combined_gate_up,
+                    ).chunk(2, dim=-1)
+                shared_output = _linear(
+                    activate_gate_up(
+                        shared_gate,
+                        shared_up,
+                        activation=self.operator_config.expert_activation,
+                        situ_beta=config.situ_beta,
+                        situ_linear_beta=config.situ_linear_beta,
+                    ),
+                    self.w(f"{shared_prefix}.down_proj.weight"),
+                )
+            self._cuda_stage_end(shared_event)
+            return shared_output
+
+        overlap_shared = (
+            device.type == "cuda"
+            and os.environ.get("TPQ_KIMI_OVERLAP_SHARED", "1") != "0"
+            and os.environ.get("TPQ_KIMI_LAYER_TIMING", "0") == "0"
+            and hasattr(self.pool, "prepare_run")
+            and hasattr(self.pool, "finish_run")
+        )
+        shared = None
         expert_event = self._cuda_stage_start(
             layer,
             "moe_packed_experts",
@@ -2608,16 +2959,44 @@ class KimiK3TPQModel:
             self._pipeline_plan is not None
             or getattr(self.pool, "device_routed", False)
         ):
-            routed = self.pool.run(
-                layer,
-                latent,
-                indices[0],
-                weights[0],
-                activation=self.operator_config.expert_activation,
-                activation_beta=config.situ_beta,
-                activation_linear_beta=config.situ_linear_beta,
-            ).view(1, config.routed_hidden).to(value.dtype)
-            if getattr(self.pool, "device_routed", False):
+            if overlap_shared:
+                pending = self.pool.prepare_run(
+                    layer,
+                    latent,
+                    indices[0],
+                    weights[0],
+                    activation=self.operator_config.expert_activation,
+                    activation_beta=config.situ_beta,
+                    activation_linear_beta=config.situ_linear_beta,
+                )
+                try:
+                    shared = compute_shared_output()
+                    routed = self.pool.finish_run(pending)
+                except BaseException:
+                    self.pool.cancel_run(pending)
+                    raise
+            else:
+                routed = self.pool.run(
+                    layer,
+                    latent,
+                    indices[0],
+                    weights[0],
+                    activation=self.operator_config.expert_activation,
+                    activation_beta=config.situ_beta,
+                    activation_linear_beta=config.situ_linear_beta,
+                )
+            routed = routed.view(
+                1,
+                config.routed_hidden,
+            ).to(value.dtype)
+            remember_route = os.environ.get(
+                "TPQ_PREFETCH",
+                "1" if getattr(self.pool, "prefetch_default", True) else "0",
+            ) != "0"
+            if (
+                getattr(self.pool, "device_routed", False)
+                and remember_route
+            ):
                 self._prev_ids[layer] = self.pool.last_expert_ids(layer)
         else:
             expert_ids = indices[0].tolist()
@@ -2686,51 +3065,13 @@ class KimiK3TPQModel:
                 routed,
             ).to(value.dtype)
         else:
-            routed = F.linear(
+            routed = _linear(
                 routed,
                 self.w(f"{prefix}.routed_expert_up_proj.weight"),
             )
         self._cuda_stage_end(routed_up_event)
-        shared_event = self._cuda_stage_start(
-            layer,
-            "moe_shared",
-            device,
-        )
-        shared_prefix = f"{prefix}.shared_experts"
-        if prelude_shared is not None:
-            shared = prelude_shared.to(value.dtype)
-        elif shared_pending is not None:
-            shared = self._tp_shared_mlp.finish(
-                layer,
-                shared_pending,
-            ).to(value.dtype)
-        else:
-            combined_gate_up = self._shared_gate_up.get(layer)
-            if combined_gate_up is None:
-                shared_gate = F.linear(
-                    value,
-                    self.w(f"{shared_prefix}.gate_proj.weight"),
-                )
-                shared_up = F.linear(
-                    value,
-                    self.w(f"{shared_prefix}.up_proj.weight"),
-                )
-            else:
-                shared_gate, shared_up = F.linear(
-                    value,
-                    combined_gate_up,
-                ).chunk(2, dim=-1)
-            shared = F.linear(
-                activate_gate_up(
-                    shared_gate,
-                    shared_up,
-                    activation=self.operator_config.expert_activation,
-                    situ_beta=config.situ_beta,
-                    situ_linear_beta=config.situ_linear_beta,
-                ),
-                self.w(f"{shared_prefix}.down_proj.weight"),
-            )
-        self._cuda_stage_end(shared_event)
+        if shared is None:
+            shared = compute_shared_output()
         if residual is not None and device.type == "cuda":
             from .ops import residual_add3
 
@@ -2766,8 +3107,197 @@ class KimiK3TPQModel:
         if event is not None:
             event.record()
 
+    @staticmethod
+    def _pool_profile_counters(pool) -> dict[str, float | int]:
+        """Read monotonic cache counters without depending on one pool type."""
+        return {
+            "hits": int(getattr(pool, "hits", 0)),
+            "misses": int(
+                getattr(pool, "misses", getattr(pool, "miss", 0))
+            ),
+            "prefetch_hits": int(getattr(pool, "prefetch_hits", 0)),
+            "uploaded_bytes": int(getattr(pool, "uploaded_bytes", 0)),
+            "transfer_seconds": float(
+                getattr(pool, "transfer_seconds", 0.0)
+            ),
+            "route_plan_hits": int(
+                getattr(pool, "route_plan_hits", 0)
+            ),
+            "route_plan_misses": int(
+                getattr(pool, "route_plan_misses", 0)
+            ),
+            "device_route_lookups": int(
+                getattr(pool, "device_route_lookups", 0)
+            ),
+            "device_route_full_hits": int(
+                getattr(pool, "device_route_full_hits", 0)
+            ),
+            "device_route_fallbacks": int(
+                getattr(pool, "device_route_fallbacks", 0)
+            ),
+        }
+
+    def start_profile(self) -> None:
+        """Enable the official one-token Kimi CLI stage probe.
+
+        Normal benchmark iterations stay untouched.  The probe token records
+        CUDA events and wall-clock layer envelopes, then resolves them with a
+        single final synchronization through :meth:`finish_profile`.
+        """
+        self.last_layer_profile = []
+        self.last_cuda_profile = {}
+        self._profile_pool_snapshot = self._pool_profile_counters(self.pool)
+        if self.device.type == "cpu":
+            from .cpuext import (
+                reset_block_fp8_gemv_profile,
+                reset_packed_moe_phase_profile,
+                reset_three_projection_phase_profile,
+            )
+
+            reset_block_fp8_gemv_profile()
+            reset_packed_moe_phase_profile()
+            reset_three_projection_phase_profile()
+        self._profile_enabled = True
+
+    def finish_profile(self) -> dict[str, object]:
+        """Finish and aggregate a Kimi probe in JSON-serializable form."""
+        self._profile_enabled = False
+        collect_transfer = getattr(
+            self.pool,
+            "collect_transfer_timing",
+            None,
+        )
+        if callable(collect_transfer):
+            collect_transfer(synchronize=True)
+        elif self.device.type == "cuda":
+            for device in self.devices:
+                torch.cuda.synchronize(device)
+
+        layers = [dict(item) for item in self.last_layer_profile]
+        wall_totals_ms = {
+            "device_transfer_ms": 0.0,
+            "attention_ms": 0.0,
+            "mlp_ms": 0.0,
+            "expert_transfer_wait_ms": 0.0,
+            "layer_envelope_ms": 0.0,
+        }
+        for item in layers:
+            wall_totals_ms["device_transfer_ms"] += (
+                float(item.get("transfer_seconds", 0.0)) * 1000.0
+            )
+            wall_totals_ms["attention_ms"] += (
+                float(item.get("attention_seconds", 0.0)) * 1000.0
+            )
+            wall_totals_ms["mlp_ms"] += (
+                float(item.get("mlp_seconds", 0.0)) * 1000.0
+            )
+            wall_totals_ms["expert_transfer_wait_ms"] += (
+                float(item.get("expert_transfer_seconds", 0.0)) * 1000.0
+            )
+            wall_totals_ms["layer_envelope_ms"] += (
+                float(item.get("layer_seconds", 0.0)) * 1000.0
+            )
+        top_layers = sorted(
+            layers,
+            key=lambda item: float(item.get("layer_seconds", 0.0)),
+            reverse=True,
+        )[:8]
+        cuda_layer_totals: dict[int, dict[str, float | int]] = {}
+        for item in self.last_cuda_profile.get("items", []):
+            layer = int(item.get("layer", -1))
+            if layer < 0:
+                continue
+            elapsed_ms = float(
+                item.get("critical_ms", item.get("elapsed_ms", 0.0))
+            )
+            stage = str(item.get("stage", ""))
+            current_layer = cuda_layer_totals.setdefault(
+                layer,
+                {
+                    "layer": layer,
+                    "attention_ms": 0.0,
+                    "mlp_ms": 0.0,
+                    "total_ms": 0.0,
+                },
+            )
+            if stage.startswith("attention"):
+                current_layer["attention_ms"] += elapsed_ms
+            elif stage in ("dense", "moe"):
+                current_layer["mlp_ms"] += elapsed_ms
+            current_layer["total_ms"] += elapsed_ms
+        cuda_top_layers = sorted(
+            cuda_layer_totals.values(),
+            key=lambda item: float(item["total_ms"]),
+            reverse=True,
+        )[:8]
+
+        current = self._pool_profile_counters(self.pool)
+        before = self._profile_pool_snapshot
+        cache_delta: dict[str, float | int] = {}
+        for name, value in current.items():
+            previous = before.get(name, 0)
+            cache_delta[name] = value - previous
+        cache_delta["uploaded_gib"] = (
+            float(cache_delta["uploaded_bytes"]) / 2**30
+        )
+
+        result: dict[str, object] = {
+            "mode": (
+                "tp_hidden_async_cuda_events"
+                if self._tp_hidden_state_ready
+                else "single_rank_cuda_events_and_layer_envelopes"
+            ),
+            "layer_count": len(layers) or len(cuda_layer_totals),
+            "wall_totals_ms": wall_totals_ms,
+            "top_layers": top_layers or cuda_top_layers,
+            "cuda_top_layers": cuda_top_layers,
+            "layers": layers,
+            "cuda": dict(self.last_cuda_profile),
+            "expert_cache_delta": cache_delta,
+        }
+        if self.device.type == "cpu":
+            from .cpuext import (
+                block_fp8_gemv_profile,
+                packed_moe_phase_profile,
+                three_projection_phase_profile,
+            )
+
+            result["block_fp8_gemv"] = block_fp8_gemv_profile()
+            result["packed_moe"] = packed_moe_phase_profile()
+            result["packed_three_projection"] = (
+                three_projection_phase_profile()
+            )
+        mla_runners = getattr(
+            getattr(self, "_tp_mla", None),
+            "_paged_runners",
+            None,
+        )
+        if mla_runners:
+            result["mla_planner"] = {
+                "gpu_plan_hits": sum(
+                    int(getattr(runner, "gpu_plan_hits", 0))
+                    for runner in mla_runners
+                ),
+                "gpu_plan_rejections": sum(
+                    int(getattr(runner, "gpu_plan_rejections", 0))
+                    for runner in mla_runners
+                ),
+                "cpu_plan_calls": sum(
+                    int(getattr(runner, "cpu_plan_calls", 0))
+                    for runner in mla_runners
+                ),
+                "layouts": [
+                    int(runner._wrapper._plan_info[0])
+                    for runner in mla_runners
+                ],
+            }
+        self._profile_pool_snapshot = {}
+        return result
+
     # ---- public model interface -------------------------------------------
     def embed(self, ids: list[int] | torch.Tensor) -> torch.Tensor:
+        if self._tp_vocab is not None:
+            return self._tp_vocab.embed(ids)
         weight = self.w(f"{_ROOT}.model.embed_tokens.weight")
         index = torch.as_tensor(ids, dtype=torch.long, device=weight.device)
         return F.embedding(
@@ -3186,9 +3716,13 @@ class KimiK3TPQModel:
                     self.config.rms_eps,
                     output=self._tp_routed_norm_buffers[layer],
                 )
-        if getattr(self.pool, "device_routed", False):
+        remember_route = os.environ.get(
+            "TPQ_PREFETCH",
+            "1" if getattr(self.pool, "prefetch_default", True) else "0",
+        ) != "0"
+        if getattr(self.pool, "device_routed", False) and remember_route:
             self._prev_ids[layer] = self.pool.last_expert_ids(layer)
-        else:
+        elif not getattr(self.pool, "device_routed", False):
             self._prev_ids[layer] = indices[0].tolist()
         if layer == trace_layer:
             moe_trace["routed_norm"] = routed.clone()
@@ -3236,7 +3770,7 @@ class KimiK3TPQModel:
         timing_enabled = (
             os.environ.get("TPQ_TP_HIDDEN_TIMING", "0") != "0"
         )
-        cuda_event_profile = (
+        cuda_event_profile = self._profile_enabled or (
             os.environ.get("TPQ_KIMI_CUDA_EVENTS", "0") != "0"
         )
         stage_profiler = None
@@ -3394,6 +3928,7 @@ class KimiK3TPQModel:
                             else "attention_mla"
                         ),
                         attention_source,
+                        layer=layer,
                     )
                 )
             attention = (
@@ -3500,6 +4035,7 @@ class KimiK3TPQModel:
                         else "moe"
                     ),
                     mlp_source,
+                    layer=layer,
                 )
             if layer < self.config.first_dense_layers:
                 mlp = self._tp_dense_mlp.run_hidden(
@@ -3557,6 +4093,7 @@ class KimiK3TPQModel:
             final_source, final_profile = stage_profiler.begin(
                 "final_mix",
                 hidden,
+                layer=-1,
             )
         final_source.residual_mix_to(
             residual,
@@ -3612,9 +4149,14 @@ class KimiK3TPQModel:
         if self._tp_hidden_state_ready:
             return self._forward_token_hidden(token)
         config = self.config
-        profile = os.environ.get("TPQ_KIMI_LAYER_TIMING", "0") != "0"
+        profile = self._profile_enabled or (
+            os.environ.get("TPQ_KIMI_LAYER_TIMING", "0") != "0"
+        )
         cuda_event_profile = (
-            os.environ.get("TPQ_KIMI_CUDA_EVENTS", "0") != "0"
+            (
+                self._profile_enabled
+                or os.environ.get("TPQ_KIMI_CUDA_EVENTS", "0") != "0"
+            )
             and self.device.type == "cuda"
         )
         profile_print = (
@@ -3984,6 +4526,8 @@ class KimiK3TPQModel:
         )
 
     def logits_of(self, hidden: torch.Tensor) -> torch.Tensor:
+        if self._tp_vocab is not None:
+            return self._tp_vocab.logits(hidden)
         weight = self.w(f"{_ROOT}.lm_head.weight")
         if (
             hidden.is_cuda
@@ -3995,7 +4539,7 @@ class KimiK3TPQModel:
                 weight.t(),
                 out_dtype=torch.float32,
             )
-        return F.linear(hidden.to(weight.dtype), weight).float()
+        return _linear(hidden.to(weight.dtype), weight).float()
 
     def forward(
         self,

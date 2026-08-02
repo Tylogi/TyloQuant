@@ -84,6 +84,10 @@ def _gated_activation(**kwargs):
     up = kwargs["up"]
     activation = kwargs["activation"]
     if activation in {"silu", "swiglu"}:
+        limit = float(kwargs.get("limit", 0.0))
+        if limit > 0.0:
+            gate = gate.clamp(max=limit)
+            up = up.clamp(min=-limit, max=limit)
         result = F.silu(gate) * up
     else:
         gate_f = gate.float()
@@ -112,6 +116,34 @@ def _vq_gemv(**kwargs):
         kwargs["x_rows"],
         kwargs["indices"],
         kwargs["codebook"],
+    )
+
+
+def _block_scaled_gemv(**kwargs):
+    from ..cpuext import block_fp8_gemv_cpu
+
+    return block_fp8_gemv_cpu(
+        kwargs["value"],
+        kwargs["weights"],
+        kwargs["scales"],
+        kwargs["cols"],
+        kwargs["block_size"],
+        kwargs.get("output"),
+    )
+
+
+def _block_scaled_grouped_gemv(**kwargs):
+    from ..cpuext import block_fp8_grouped_gemv_cpu
+
+    return block_fp8_grouped_gemv_cpu(
+        kwargs["value"],
+        kwargs["weight_ptrs"],
+        kwargs["scale_ptrs"],
+        kwargs["row_offsets"],
+        kwargs["total_rows"],
+        kwargs["cols"],
+        kwargs["block_size"],
+        kwargs.get("output"),
     )
 
 
@@ -201,6 +233,34 @@ def _route_topk(**kwargs):
 
 def register(registry: OperatorRegistry) -> None:
     registry.register(
+        "cpu.block_scaled_gemv.e4m3fn.b128.decode",
+        OperatorCapability(
+            operation="block_scaled_gemv",
+            device_types=("cpu",),
+            packed_formats=("e4m3fn",),
+            code_dims=(128,),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=(1,),
+        ),
+        _block_scaled_gemv,
+        priority=100,
+    )
+    registry.register(
+        "cpu.block_scaled_grouped_gemv.e4m3fn.b128.decode",
+        OperatorCapability(
+            operation="block_scaled_grouped_gemv",
+            device_types=("cpu",),
+            packed_formats=("e4m3fn",),
+            code_dims=(128,),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=(1,),
+        ),
+        _block_scaled_grouped_gemv,
+        priority=100,
+    )
+    registry.register(
         "cpu.residual_add.three_way.reference",
         OperatorCapability(
             operation="residual_add:three_way",
@@ -266,8 +326,8 @@ def register(registry: OperatorRegistry) -> None:
             operation="vq_gemv",
             device_types=("cpu",),
             packed_formats=("u8", "u16"),
-            code_dims=(4, 8),
-            codebook_sizes=(256, 4096, 16384),
+            code_dims=(4, 8, 16),
+            codebook_sizes=(256, 1024, 4096, 16384, 65536),
             activations=("none",),
             max_top_k=1,
             batch_sizes=tuple(range(1, 17)),
@@ -280,9 +340,12 @@ def register(registry: OperatorRegistry) -> None:
         OperatorCapability(
             operation="vq_gemv:list",
             device_types=("cpu",),
-            packed_formats=("p8", "p12", "p14", "p16"),
-            code_dims=(4, 8),
-            codebook_sizes=(256, 4096, 16384),
+            packed_formats=tuple(f"p{bits}" for bits in range(8, 17)),
+            code_dims=(4, 8, 16),
+            codebook_sizes=(
+                256, 512, 1024, 2048, 4096,
+                8192, 16384, 32768, 65536,
+            ),
             activations=("none",),
             max_top_k=16,
             batch_sizes=tuple(range(1, 17)),
@@ -295,9 +358,12 @@ def register(registry: OperatorRegistry) -> None:
         OperatorCapability(
             operation="moe_topk",
             device_types=("cpu",),
-            packed_formats=("p8", "p12", "p14", "p16"),
-            code_dims=(4, 8),
-            codebook_sizes=(256, 4096, 16384),
+            packed_formats=tuple(f"p{bits}" for bits in range(8, 17)),
+            code_dims=(4, 8, 16),
+            codebook_sizes=(
+                256, 512, 1024, 2048, 4096,
+                8192, 16384, 32768, 65536,
+            ),
             activations=("silu", "swiglu", "situ"),
             max_top_k=16,
             batch_sizes=(1,),

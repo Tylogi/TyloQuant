@@ -1,9 +1,9 @@
 """模型识别与发布预设加载。
 
-发布入口只依赖模型目录中的 ``cccp.json``，不依赖模型文件名：
+发布入口优先读取 ``tpq.json``，并兼容旧 ``cccp.json``：
 
 * 含 ``hc_mult`` 或 ``compress_ratios`` 的模型识别为 DeepSeek-V4；
-* 其他当前 CCCP MoE 模型识别为 GLM。
+* 其他当前 TPQ MoE 模型识别为 GLM。
 """
 
 from __future__ import annotations
@@ -35,19 +35,21 @@ class ResolvedPreset:
 
 def load_manifest(model_dir: str | os.PathLike[str]) -> tuple[Path, dict[str, Any]]:
     root = Path(model_dir).expanduser().resolve()
-    manifest_path = root / "cccp.json"
+    canonical = root / "tpq.json"
+    legacy = root / "cccp.json"
+    manifest_path = canonical if canonical.is_file() else legacy
     if not root.is_dir():
         raise ValueError(f"模型目录不存在：{root}")
     if not manifest_path.is_file():
-        raise ValueError(f"模型目录缺少 cccp.json：{root}")
+        raise ValueError(f"模型目录缺少 tpq.json/cccp.json：{root}")
     with manifest_path.open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
-    if manifest.get("format") != "cccp-1":
+    if manifest.get("format") not in {"tpq-1", "cccp-1"}:
         raise ValueError(
-            f"不支持的模型格式：{manifest.get('format')!r}，需要 'cccp-1'"
+            f"不支持的 TPQ 模型格式：{manifest.get('format')!r}"
         )
     if not isinstance(manifest.get("config"), dict):
-        raise ValueError("cccp.json 缺少 config 对象")
+        raise ValueError("TPQ 清单缺少 config 对象")
     return root, manifest
 
 
@@ -84,10 +86,23 @@ def choose_ep_layout(manifest: dict[str, Any], tp: int) -> str:
         return "tensor"
     config = manifest["config"]
     intermediate = int(config["moe_inter"])
+    quant = manifest.get("quant", {})
     dims = {
         int(value[0])
-        for value in manifest.get("quant", {}).get("vq", {}).values()
+        for value in quant.get("vq", {}).values()
     }
+    if quant.get("method") == "projection-vq":
+        used_layouts = {
+            str(layout)
+            for projections in quant.get(
+                "projection_layouts", {}
+            ).values()
+            for layout in projections.values()
+        }
+        dims.update(
+            int(quant["layouts"][layout]["dim"])
+            for layout in used_layouts
+        )
     tensor_ok = intermediate % tp == 0
     if tensor_ok:
         local = intermediate // tp
@@ -103,10 +118,17 @@ def resolve_preset(
 ) -> ResolvedPreset:
     root, manifest = load_manifest(model_dir)
     architecture = detect_architecture(manifest)
-    config = load_arch_config(architecture)
+    config_architecture = architecture
+    if (
+        architecture == "dsv4"
+        and manifest.get("quant", {}).get("method")
+        == "projection-vq"
+    ):
+        config_architecture = "dsv4_projection"
+    config = load_arch_config(config_architecture)
     supports_parallel = bool(config.get("supports_parallel", False))
 
-    if profile not in {"auto", "ram", "parallel"}:
+    if profile not in {"auto", "ram", "resident", "parallel"}:
         raise ValueError(f"未知 profile：{profile}")
     if profile == "auto":
         profile = (
@@ -128,8 +150,23 @@ def resolve_preset(
         raise ValueError("tp 必须为正整数")
     if profile == "ram" and resolved_tp != 1:
         raise ValueError("RAM profile 固定使用 tp=1；多卡请选择 --profile parallel")
+    if profile == "resident" and resolved_tp != 1:
+        raise ValueError("resident profile 固定使用 tp=1")
     if profile == "parallel" and resolved_tp < 2:
         raise ValueError("parallel profile 要求 tp >= 2")
+    tested_tp_values = config.get("tested_tp_values")
+    if (
+        profile == "parallel"
+        and tested_tp_values is not None
+        and resolved_tp not in {
+            int(value) for value in tested_tp_values
+        }
+    ):
+        allowed = ",".join(str(value) for value in tested_tp_values)
+        raise ValueError(
+            f"{architecture} 当前只发布 TP={allowed}，"
+            f"收到 tp={resolved_tp}"
+        )
 
     config_profile = profile
     if profile == "parallel":

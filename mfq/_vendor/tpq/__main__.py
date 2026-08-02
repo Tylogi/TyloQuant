@@ -5,6 +5,8 @@ from __future__ import annotations
 from importlib import import_module
 import sys
 
+from . import __version__
+
 
 COMMANDS = ("launch", "check", "benchmark", "chat", "serve")
 _COMMAND_DESCRIPTIONS = {
@@ -29,6 +31,9 @@ def _help_text() -> str:
 
 def main() -> None:
     argv = sys.argv[1:]
+    if argv and argv[0] in {"-V", "--version"}:
+        print(f"tpq-inference {__version__}")
+        return
     if not argv or argv[0] in {"-h", "--help"}:
         print(_help_text())
         return

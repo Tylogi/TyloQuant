@@ -1,11 +1,11 @@
-"""TPQ 聊天命令行：CCCP 量化模型的交互式对话（GLM / DeepSeek-V4 双架构自动适配）。
+"""TPQ 聊天命令行：统一适配 GLM、DeepSeek-V4 与 Kimi K3。
 
 对话模板（与模型自带 chat_template 对齐的最小实现，arch 由引擎自动判定）：
     glm:  [gMASK]<sop>[<|system|>Reasoning Effort: Max]<|user|>{问题}\n<|assistant|><think></think>
     dsv4: <｜begin▁of▁sentence｜><｜User｜>{问题}<｜Assistant｜>{<think>|</think>}（on 补 <think>，off 补 </think>）
 DSV4 多轮历史保存主模型实际 token IDs；think 模式按 token 切掉推理段，
 不会通过回答文字 decode→encode 重建 prompt。
-命令：/think 切换思维链；/clear 清空上下文与 KV cache；/stats 专家缓存命中；
+命令：/think [off|low|medium|high|max] 调整思维链；/clear 清空上下文与 KV cache；/stats 专家缓存命中；
 /kv 查看主模型 KV 状态；/exit 退出。
 也可 --prompt "..." 单轮非交互运行（冒烟测试用）。
 采样默认 temperature=1.0、top_p=1.0（DeepSeek-V4 官方推荐）；--temp 0 可切回贪心。
@@ -40,6 +40,7 @@ _warnings.filterwarnings("ignore", message="The given buffer is not writable")
 def _terminal_options(
     *,
     think: bool,
+    reasoning_effort: str | None,
     max_new: int | None,
     temp: float,
     top_p: float,
@@ -48,13 +49,60 @@ def _terminal_options(
 ) -> ChatOptions:
     return ChatOptions(
         thinking_mode="thinking" if think else "chat",
-        reasoning_effort=None,
+        reasoning_effort=reasoning_effort if think else None,
         temperature=temp,
         top_p=top_p,
         max_new=max_new,
         repetition_penalty=rep_penalty,
         no_repeat_ngram_size=no_repeat_ngram,
     )
+
+
+class _TerminalStream:
+    """将 tokenizer 原始流交给架构适配器，绝不显示协议控制标签。"""
+
+    def __init__(
+        self,
+        eng: Engine,
+        adapter,
+        options: ChatOptions,
+        *,
+        write=None,
+    ) -> None:
+        self._eng = eng
+        self._parser = adapter.new_stream_parser(eng, options)
+        self._decoder = eng.new_decode_stream(skip_special_tokens=False)
+        self._thinking = options.thinking_mode == "thinking"
+        self._last_kind: str | None = None
+        self._write = write or (
+            lambda text: print(text, end="", flush=True)
+        )
+
+    def _emit(self, delta) -> None:
+        if not delta.text:
+            return
+        if self._thinking and delta.kind != self._last_kind:
+            if delta.kind == "reasoning":
+                self._write("[思考]\n")
+            elif delta.kind == "content":
+                self._write(
+                    "\n[回答]\n"
+                    if self._last_kind == "reasoning"
+                    else "[回答]\n"
+                )
+        self._write(delta.text)
+        self._last_kind = delta.kind
+
+    def on_token(self, token_id: int, _ignored_piece: str) -> None:
+        chunk = self._decoder.step(self._eng.tok, token_id) or ""
+        for delta in self._parser.feed(chunk):
+            self._emit(delta)
+
+    def finish(self):
+        parsed, final_deltas = self._parser.finish()
+        for delta in final_deltas:
+            self._emit(delta)
+        return parsed
 
 
 def _int_range(values: list[int]) -> str:
@@ -132,6 +180,7 @@ def chat_loop(
     temp: float,
     top_p: float,
     think: bool,
+    reasoning_effort: str | None = None,
     rep_penalty: float = 1.0,
     no_repeat_ngram: int = 0,
     spec: int = 0,
@@ -146,9 +195,11 @@ def chat_loop(
         if arch == "dsv4"
         else ("Kimi K3" if arch == "kimi_k3" else "GLM")
     )
-    print("TPQ 对话已就绪（/stop 停止生成, /think 切换思维链, "
+    effort = reasoning_effort or ("max" if think else None)
+    print("TPQ 对话已就绪（/stop 停止生成, "
+          "/think [off|low|medium|high|max], "
           "/clear 清空, /stats 专家缓存, /kv KV状态, /exit 退出）"
-          f"  当前 think={'ON' if think else 'OFF'}", flush=True)
+          f"  当前 think={effort or 'OFF'}", flush=True)
     while True:
         try:
             q = input("\n你: ").strip()
@@ -170,8 +221,26 @@ def chat_loop(
             continue
         if q.startswith("/think"):
             arg = q[6:].strip().lower()
-            think = (not think) if not arg else arg in ("on", "1", "true", "开")
-            print(f"[think {'ON' if think else 'OFF'}]")
+            supported = {"high", "max"}
+            if arch == "kimi_k3":
+                supported.update({"low", "medium"})
+            if not arg:
+                effort = None if effort is not None else "max"
+            elif arg in {"off", "chat", "0", "false", "关"}:
+                effort = None
+            elif arg in {"on", "1", "true", "开"}:
+                effort = "max"
+            elif arg in supported:
+                effort = arg
+            else:
+                print(
+                    "[用法: /think off|"
+                    + "|".join(sorted(supported))
+                    + "]"
+                )
+                continue
+            think = effort is not None
+            print(f"[think {effort or 'OFF'}]")
             continue
         if q == "/stats":
             p = eng.model.pool
@@ -184,6 +253,7 @@ def chat_loop(
             continue
         options = _terminal_options(
             think=think,
+            reasoning_effort=effort,
             max_new=max_new,
             temp=temp,
             top_p=top_p,
@@ -200,9 +270,7 @@ def chat_loop(
         kv_baseline_len = plan.kv_baseline_len
         print(f"{name}: ", end="", flush=True)
         t0 = time.time()
-
-        def cb(_t, s):
-            print(s, end="", flush=True)
+        stream = _TerminalStream(eng, adapter, options)
 
         try:
             if spec > 0:
@@ -210,7 +278,7 @@ def chat_loop(
                     ids,
                     max_new=max_new,
                     k=spec,
-                    callback=cb,
+                    callback=stream.on_token,
                     should_stop=should_stop,
                     kv_baseline_len=kv_baseline_len,
                 )
@@ -218,9 +286,10 @@ def chat_loop(
                 out = eng.generate(ids, max_new=max_new, temp=temp, top_p=top_p,
                                    rep_penalty=rep_penalty,
                                    no_repeat_ngram=no_repeat_ngram,
-                                   callback=cb, should_stop=should_stop,
+                                   callback=stream.on_token, should_stop=should_stop,
                                    kv_baseline_len=kv_baseline_len)
         except ContextCapacityError as exc:
+            stream.finish()
             print(
                 f"\n[KV cache 扩容失败，已输出 {exc.committed} token；"
                 f"position={exc.position}: {exc.cause}]",
@@ -229,9 +298,9 @@ def chat_loop(
             if arch == "dsv4":
                 eng.reset()
             continue
+        parsed = stream.finish()
         dt = time.time() - t0
         print(f"\n[{len(out)} token, {dt:.1f}s, {len(out) / max(dt, 1e-6):.2f} tok/s]")
-        parsed = adapter.parse_complete(eng, out, options)
         hot_ledger = adapter.commit(eng, plan, out, parsed)
         committed_messages = getattr(hot_ledger, "committed_messages", None)
         if committed_messages is None:
@@ -250,17 +319,34 @@ def chat_loop(
 
 def main(argv=None, should_stop=None) -> None:
     ap = argparse.ArgumentParser(description="TPQ CCCP 量化模型推理聊天")
-    ap.add_argument("--model", required=True, help="GLM/DSV4 CCCP 模型目录")
+    ap.add_argument(
+        "--model",
+        required=True,
+        help="GLM/DeepSeek-V4/Kimi K3 CCCP 模型目录",
+    )
     ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
                     help="cuda=GPU 加速推理（dense 常驻显存，专家流式上卡）")
     ap.add_argument("--cache-gb", type=float, default=None,
                     help="专家缓存预算（缺省自动：可用RAM − 固定开销）")
     ap.add_argument("--vram-gb", type=float, default=None,
                     help="专家显存缓存预算（缺省自动：空闲显存 − dense常驻 − KV）")
-    ap.add_argument("--tp", type=int, default=1,
-                    help="GLM 全显存专家并行卡数（如 2 或 4）")
+    ap.add_argument(
+        "--dense-residency",
+        choices=("auto", "gpu"),
+        default="auto",
+        help=(
+            "auto=CUDA 容量足够时 Dense 仅驻 GPU，否则回退 CPU；"
+            "gpu=强制 Dense 仅驻 GPU"
+        ),
+    )
+    ap.add_argument(
+        "--tp",
+        type=int,
+        default=1,
+        help="GLM 专家并行或 Kimi 张量并行卡数",
+    )
     ap.add_argument("--max-ctx", type=int, default=None,
-                    help="最大上下文（缺省按架构：DSV4 4096 / GLM 1024；GLM latent KV 约 0.09MB/token）")
+                    help="最大上下文；缺省按架构选择，长程部署应显式设置")
     ap.add_argument("--max-new", type=int, default=128)
     ap.add_argument("--no-max-new", action="store_true",
                     help="不设置人为输出 token 上限；仍受 EOS 和模型上下文上限约束")
@@ -273,32 +359,48 @@ def main(argv=None, should_stop=None) -> None:
     ap.add_argument("--spec", type=int, default=0,
                     help="投机解码草稿数（0=关闭；GLM-MTP 建议 2，DSV4-DSpark 建议 5；仅贪心有效）")
     ap.add_argument("--think", action="store_true", help="开启思维链推理")
+    ap.add_argument(
+        "--reasoning",
+        choices=("chat", "low", "medium", "high", "max"),
+        help="CLI Think 级别；chat 关闭，Kimi 支持 low/medium/high/max",
+    )
     ap.add_argument("--prompt", default=None, help="单轮非交互运行")
     a = ap.parse_args(argv)
     if a.tp <= 0:
         ap.error("--tp must be positive")
     if a.tp > 1 and a.device != "cuda":
         ap.error("--tp > 1 requires --device cuda")
+    if a.dense_residency == "gpu" and a.device != "cuda":
+        ap.error("--dense-residency gpu requires --device cuda")
+    if a.think and a.reasoning == "chat":
+        ap.error("--think cannot be combined with --reasoning chat")
+    think = a.think or (
+        a.reasoning is not None and a.reasoning != "chat"
+    )
+    reasoning_effort = (
+        a.reasoning
+        if a.reasoning not in {None, "chat"}
+        else ("max" if a.think else None)
+    )
     max_new = None if a.no_max_new else a.max_new
 
     # GLM 默认使用 MLA latent KV，约 0.09MB/token；缺省仍保持 1024，
     # 长文运行按需显式提高。DSV4 使用环形窗+压缩槽。
     max_ctx = a.max_ctx
     if max_ctx is None:
-        import json as _json
-        import os as _os
         arch_hint = "glm"
         try:
-            with open(_os.path.join(a.model, "cccp.json"), encoding="utf-8") as _f:
-                _manifest = _json.load(_f)
-                _config = _manifest["config"]
-                if (
-                    _manifest.get("model_family") == "kimi_k3"
-                    or "kda_layers" in _config
-                ):
-                    arch_hint = "kimi_k3"
-                elif "hc_mult" in _config:
-                    arch_hint = "dsv4"
+            from .presets import load_manifest
+
+            _root, _manifest = load_manifest(a.model)
+            _config = _manifest["config"]
+            if (
+                _manifest.get("model_family") == "kimi_k3"
+                or "kda_layers" in _config
+            ):
+                arch_hint = "kimi_k3"
+            elif "hc_mult" in _config:
+                arch_hint = "dsv4"
         except Exception:
             pass
         max_ctx = (
@@ -308,21 +410,36 @@ def main(argv=None, should_stop=None) -> None:
         )
         print(f"[chat] max_ctx 按架构缺省: {arch_hint} → {max_ctx}", flush=True)
 
+    if reasoning_effort in {"low", "medium"}:
+        try:
+            from .presets import detect_architecture, load_manifest
+
+            _root, _manifest = load_manifest(a.model)
+            if detect_architecture(_manifest) == "dsv4":
+                ap.error(
+                    "DeepSeek-V4 官方模板只支持 "
+                    "--reasoning chat/high/max；low/medium 是 Kimi 专用档位"
+                )
+        except (OSError, ValueError):
+            pass
+
     eng = Engine(a.model, cache_gb=a.cache_gb, max_ctx=max_ctx,
                  device=a.device, vram_cache_gb=a.vram_gb,
-                 tp_size=a.tp)
+                 tp_size=a.tp, dense_residency=a.dense_residency)
     if a.prompt is not None:
         prompt_options = _terminal_options(
-            think=a.think,
+            think=think,
+            reasoning_effort=reasoning_effort,
             max_new=max_new,
             temp=a.temp,
             top_p=a.top_p,
             rep_penalty=a.rep_penalty,
             no_repeat_ngram=a.no_repeat_ngram,
         )
-        prompt_plan = adapter_for_arch(
+        prompt_adapter = adapter_for_arch(
             getattr(eng, "arch", "glm")
-        ).prepare(
+        )
+        prompt_plan = prompt_adapter.prepare(
             eng,
             [ChatMessage(role="user", content=a.prompt)],
             prompt_options,
@@ -331,9 +448,11 @@ def main(argv=None, should_stop=None) -> None:
         ids = prompt_plan.input_ids
         kv_baseline_len = prompt_plan.kv_baseline_len
         t0 = time.time()
-
-        def cb(_t, s):
-            print(s, end="", flush=True)
+        stream = _TerminalStream(
+            eng,
+            prompt_adapter,
+            prompt_options,
+        )
 
         try:
             if a.spec > 0:
@@ -341,7 +460,7 @@ def main(argv=None, should_stop=None) -> None:
                     ids,
                     max_new=max_new,
                     k=a.spec,
-                    callback=cb,
+                    callback=stream.on_token,
                     should_stop=should_stop,
                     kv_baseline_len=kv_baseline_len,
                 )
@@ -349,15 +468,17 @@ def main(argv=None, should_stop=None) -> None:
                 out = eng.generate(ids, max_new=max_new, temp=a.temp, top_p=a.top_p,
                                    rep_penalty=a.rep_penalty,
                                    no_repeat_ngram=a.no_repeat_ngram,
-                                   callback=cb, should_stop=should_stop,
+                                   callback=stream.on_token, should_stop=should_stop,
                                    kv_baseline_len=kv_baseline_len)
         except ContextCapacityError as exc:
+            stream.finish()
             print(
                 f"\n[KV cache 扩容失败，已输出 {exc.committed} token；"
                 f"position={exc.position}: {exc.cause}]",
                 flush=True,
             )
             return
+        stream.finish()
         dt = time.time() - t0
         print(f"\n[{len(out)} token, {dt:.1f}s, {len(out) / max(dt, 1e-6):.2f} tok/s]")
         return
@@ -366,11 +487,12 @@ def main(argv=None, should_stop=None) -> None:
         max_new,
         a.temp,
         a.top_p,
-        a.think,
-        a.rep_penalty,
-        a.no_repeat_ngram,
-        a.spec,
-        should_stop,
+        think,
+        reasoning_effort=reasoning_effort,
+        rep_penalty=a.rep_penalty,
+        no_repeat_ngram=a.no_repeat_ngram,
+        spec=a.spec,
+        should_stop=should_stop,
     )
 
 

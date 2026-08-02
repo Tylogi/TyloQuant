@@ -8,12 +8,37 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
+import sys
+from pathlib import Path
 
 import torch
 
 
 _WRAPPER_CLS = None
 _LAST_ERROR: Exception | None = None
+
+
+def _ensure_ninja_on_path() -> None:
+    """Expose the venv-bundled ninja to FlashInfer's JIT helper."""
+    if shutil.which("ninja") is not None:
+        return
+    executable = "ninja.exe" if os.name == "nt" else "ninja"
+    # ``venv/bin/python`` 常是指向系统解释器的符号链接；只调用
+    # ``resolve()`` 会跳出虚拟环境并错过同目录安装的 ninja。
+    directories = (
+        Path(sys.executable).parent,
+        Path(sys.executable).resolve().parent,
+    )
+    for directory in dict.fromkeys(directories):
+        candidate = directory / executable
+        if candidate.is_file():
+            os.environ["PATH"] = (
+                str(directory)
+                + os.pathsep
+                + os.environ.get("PATH", "")
+            )
+            return
 
 
 def _wrapper_cls():
@@ -24,6 +49,7 @@ def _wrapper_cls():
         return None
     if _WRAPPER_CLS is None:
         try:
+            _ensure_ninja_on_path()
             from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
             _WRAPPER_CLS = BatchMLAPagedAttentionWrapper
@@ -127,6 +153,9 @@ class FlashInferMLADecode:
         )
         self._prepared_blocks = 0
         self._plan_initialized = False
+        self.gpu_plan_hits = 0
+        self.gpu_plan_rejections = 0
+        self.cpu_plan_calls = 0
 
     def prepare(self, length: int) -> None:
         if length <= 0 or length > self.max_ctx:
@@ -142,21 +171,31 @@ class FlashInferMLADecode:
         kv_indptr_cpu[1] = blocks
         kv_len_cpu[0] = length
         gpu_plan = False
-        if self._plan_initialized and self.heads == 64:
+        if self._plan_initialized:
             from .fusedext import (
                 flashinfer_mla_batch1_plan_fused,
             )
 
-            gpu_plan = flashinfer_mla_batch1_plan_fused(
-                self._wrapper._int_workspace_buffer,
-                self._kv_indptr_gpu,
-                self._kv_indices_gpu,
-                self._kv_len_gpu,
-                length,
-                self.page_size,
-                self.heads,
-                self._wrapper._plan_info,
-            )
+            try:
+                gpu_plan = flashinfer_mla_batch1_plan_fused(
+                    self._wrapper._int_workspace_buffer,
+                    self._kv_indptr_gpu,
+                    self._kv_indices_gpu,
+                    self._kv_len_gpu,
+                    length,
+                    self.page_size,
+                    self.heads,
+                    self._wrapper._plan_info,
+                )
+            except RuntimeError:
+                # An unknown FlashInfer planner layout is a compatibility
+                # miss, not an inference failure.  Its official planner is
+                # the numerical source of truth for this token.
+                gpu_plan = False
+            if gpu_plan:
+                self.gpu_plan_hits += 1
+            else:
+                self.gpu_plan_rejections += 1
         if not gpu_plan:
             self._wrapper.plan(
                 self._qo_cpu,
@@ -172,6 +211,7 @@ class FlashInferMLADecode:
                 q_data_type=self.dtype,
                 kv_data_type=self.dtype,
             )
+            self.cpu_plan_calls += 1
             self._plan_initialized = True
         self._prepared_blocks = blocks
 

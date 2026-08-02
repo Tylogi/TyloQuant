@@ -49,7 +49,7 @@ def _cccp_expert_layers(manifest: dict[str, Any]) -> tuple[int, ...]:
 
 @dataclass(frozen=True)
 class CCCPArtifact:
-    """Validated legacy ``cccp-1`` TPQ model directory."""
+    """Validated TPQ model directory (legacy class name)."""
 
     root: Path
     manifest: dict[str, Any]
@@ -59,16 +59,17 @@ class CCCPArtifact:
     @classmethod
     def open(cls, root: str | os.PathLike[str]) -> CCCPArtifact:
         model_root = Path(root).expanduser().resolve()
-        manifest_path = model_root / "cccp.json"
+        canonical = model_root / "tpq.json"
+        legacy = model_root / "cccp.json"
+        manifest_path = canonical if canonical.is_file() else legacy
         if not manifest_path.is_file():
             raise FileNotFoundError(
-                f"legacy TPQ manifest not found: {manifest_path}"
+                f"TPQ manifest not found: {canonical} or {legacy}"
             )
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("format") != "cccp-1":
+        if manifest.get("format") not in {"tpq-1", "cccp-1"}:
             raise ValueError(
-                f"unsupported TPQ format {manifest.get('format')!r}; "
-                "expected legacy directory format 'cccp-1'"
+                f"unsupported TPQ format {manifest.get('format')!r}"
             )
 
         config = manifest.get("config")
@@ -76,6 +77,15 @@ class CCCPArtifact:
         if not isinstance(config, dict) or not isinstance(quant, dict):
             raise ValueError("CCCP manifest is missing config or quant metadata")
         expert_files = manifest.get("expert_files")
+        routed_layers = (
+            (manifest.get("routed_experts") or {}).get("layer_files") or {}
+        )
+        if expert_files is None and routed_layers:
+            expert_files = {
+                str(layer): str(item["path"])
+                for layer, item in routed_layers.items()
+            }
+            manifest["expert_files"] = expert_files
         expected_layers = _cccp_expert_layers(manifest)
         actual_layers = (
             tuple(sorted(int(layer) for layer in expert_files))

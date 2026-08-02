@@ -18,8 +18,9 @@ import torch
 _EXT = None
 _TRIED = False
 _ERR: str | None = None
-_EXTENSION_NAME = "tpq_cpu_kernels_v62"
+_EXTENSION_NAME = "tpq_cpu_kernels_v86"
 _PACKED_MOE_WORKSPACE: tuple[torch.Tensor, torch.Tensor] | None = None
+_PACKED_THREE_WORKSPACE: tuple[torch.Tensor, ...] | None = None
 _PACKED_MOE_LOCK = threading.Lock()
 
 
@@ -173,6 +174,88 @@ def vq_gemv_list_cpu(
     )
 
 
+def block_fp8_gemv_cpu(
+    value: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    cols: int,
+    block_size: int,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Direct compact E4M3FN block-scaled GEMV for one CPU token."""
+    if (
+        value.is_cuda
+        or value.ndim != 2
+        or value.shape != (1, int(cols))
+        or value.dtype not in (torch.float32, torch.bfloat16)
+        or weights.is_cuda
+        or weights.dtype != torch.uint8
+        or weights.ndim != 2
+        or tuple(weights.shape) != (int(weights.shape[0]), int(cols))
+        or scales.is_cuda
+        or scales.dtype != torch.float32
+        or int(block_size) != 128
+    ):
+        return None
+    extension = _build()
+    if extension is None:
+        return None
+    rows = int(weights.shape[0])
+    if output is None:
+        output = torch.empty(rows, dtype=value.dtype)
+    return extension.block_fp8_gemv(
+        value,
+        weights,
+        scales,
+        int(cols),
+        int(block_size),
+        output,
+    )
+
+
+def block_fp8_grouped_gemv_cpu(
+    value: torch.Tensor,
+    weight_ptrs: torch.Tensor,
+    scale_ptrs: torch.Tensor,
+    row_offsets: torch.Tensor,
+    total_rows: int,
+    cols: int,
+    block_size: int,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Evaluate a logical row-concatenation of compact CPU FP8 weights."""
+    if (
+        value.is_cuda
+        or value.ndim != 2
+        or value.shape != (1, int(cols))
+        or value.dtype not in (torch.float32, torch.bfloat16)
+        or weight_ptrs.is_cuda
+        or weight_ptrs.dtype != torch.int64
+        or scale_ptrs.is_cuda
+        or scale_ptrs.dtype != torch.int64
+        or row_offsets.is_cuda
+        or row_offsets.dtype != torch.int32
+        or int(block_size) != 128
+        or int(total_rows) <= 0
+    ):
+        return None
+    extension = _build()
+    if extension is None:
+        return None
+    if output is None:
+        output = torch.empty(int(total_rows), dtype=value.dtype)
+    return extension.block_fp8_grouped_gemv(
+        value,
+        weight_ptrs.contiguous(),
+        scale_ptrs.contiguous(),
+        row_offsets.contiguous(),
+        int(total_rows),
+        int(cols),
+        int(block_size),
+        output,
+    )
+
+
 def vq_gemv_packed_list_cpu(
     x_rows: torch.Tensor,
     payloads: list[torch.Tensor],
@@ -188,7 +271,7 @@ def vq_gemv_packed_list_cpu(
         x_rows.is_cuda
         or codebook.is_cuda
         or not payloads
-        or bits not in (8, 12, 14, 16)
+        or not 8 <= bits <= 16
         or any(
             payload.is_cuda or payload.dtype != torch.uint8
             for payload in payloads
@@ -209,9 +292,101 @@ def vq_gemv_packed_list_cpu(
     )
 
 
+def _shared_projection_spec(weights: list[object]):
+    """Return common layer metadata or ``None`` for an invalid mixed list."""
+    first = weights[0]
+    if any(
+        int(weight.rows) != int(first.rows)
+        or int(weight.blocks) != int(first.blocks)
+        or int(weight.bits) != int(first.bits)
+        or int(weight.dim) != int(first.dim)
+        or tuple(weight.cb.shape) != tuple(first.cb.shape)
+        or weight.cb.data_ptr() != first.cb.data_ptr()
+        for weight in weights[1:]
+    ):
+        return None
+    return first
+
+
+def _shared_projection(
+    weights: list[object],
+    x_rows: torch.Tensor,
+    *,
+    allow_direct: bool = False,
+) -> torch.Tensor | None:
+    """Run one projection whose selected experts share layer metadata."""
+    first = _shared_projection_spec(weights)
+    if first is None:
+        return None
+    return vq_gemv_packed_list_cpu(
+        x_rows,
+        [weight.raw for weight in weights],
+        first.cb.float().contiguous(),
+        int(first.rows),
+        int(first.blocks),
+        int(first.bits),
+        allow_direct=allow_direct,
+    )
+
+
+def _grouped_projection(
+    weights: list[object],
+    x_rows: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    allow_direct: bool = False,
+) -> torch.Tensor | None:
+    """Evaluate one projection while preserving per-group codebooks.
+
+    Most projection archives share one layer codebook and take the fused
+    single-call path.  Multi-codebook layouts group selected experts by the
+    exact codebook pointer, invoke the same native packed GEMV for each group,
+    and scatter into one persistent Top-K workspace.  Indices stay packed.
+    """
+    if not weights or output.shape[0] < len(weights):
+        return None
+    groups: dict[tuple[int, ...], list[int]] = {}
+    for index, weight in enumerate(weights):
+        key = (
+            int(weight.cb.data_ptr()),
+            int(weight.rows),
+            int(weight.blocks),
+            int(weight.bits),
+            int(weight.dim),
+            int(weight.cb.shape[0]),
+            int(weight.cb.shape[1]),
+        )
+        groups.setdefault(key, []).append(index)
+    for positions in groups.values():
+        group_weights = [weights[index] for index in positions]
+        spec = _shared_projection_spec(group_weights)
+        if spec is None:
+            return None
+        selection = torch.tensor(positions, dtype=torch.long)
+        if x_rows.shape[0] == 1:
+            inputs = x_rows
+        else:
+            inputs = x_rows.index_select(0, selection)
+        values = vq_gemv_packed_list_cpu(
+            inputs,
+            [weight.raw for weight in group_weights],
+            spec.cb.float().contiguous(),
+            int(spec.rows),
+            int(spec.blocks),
+            int(spec.bits),
+            allow_direct=allow_direct,
+        )
+        if values is None:
+            return None
+        # A Python list triggers advanced indexing and returns a temporary;
+        # copying into it would leave the persistent workspace uninitialized.
+        output[:, : int(spec.rows)].index_copy_(0, selection, values)
+    return output[: len(weights), : int(weights[0].rows)]
+
+
 def moe_packed_topk_cpu(
     x_row: torch.Tensor,
-    experts: list[tuple[object, object]],
+    experts: list[tuple[object, ...]],
     route_weights: torch.Tensor,
     limit: float,
     *,
@@ -221,11 +396,12 @@ def moe_packed_topk_cpu(
 ) -> torch.Tensor | None:
     """Run mixed packed Top-K MoE through one native registered invocation.
 
-    The payloads remain p8/p12/p14.  ATen's persistent CPU worker pool executes
-    the dependent phases.  Only one process-wide float workspace is kept
-    because decode executes CPU layers serially; it grows when required and is
-    reused by every later layer and token.
+    The payloads remain p8..p16. Legacy combined Gate+Up experts
+    use the native fused entry below.  Three-projection archives are scheduled
+    through the same registered call as Gate VQ -> Up VQ -> activation -> Down
+    VQ, preserving every projection's own code dimension and codebook.
     """
+    global _PACKED_MOE_WORKSPACE, _PACKED_THREE_WORKSPACE
     if (
         x_row.is_cuda
         or x_row.ndim != 2
@@ -233,21 +409,162 @@ def moe_packed_topk_cpu(
         or not 0 < len(experts) <= 16
         or route_weights.is_cuda
         or route_weights.numel() != len(experts)
+        or len(experts[0]) not in (2, 3)
         or any(
-            not hasattr(gu, "raw")
-            or not hasattr(dn, "raw")
-            for gu, dn in experts
+            len(bundle) != len(experts[0])
+            or any(not hasattr(weight, "raw") for weight in bundle)
+            for bundle in experts
         )
     ):
         return None
     extension = _build()
     if extension is None:
         return None
-    gu = [pair[0] for pair in experts]
-    dn = [pair[1] for pair in experts]
     x_float = x_row.float().contiguous()
     weights = route_weights.float().contiguous()
+    hidden = int(x_float.shape[1])
 
+    if len(experts[0]) == 3:
+        gate = [bundle[0] for bundle in experts]
+        up = [bundle[1] for bundle in experts]
+        dn = [bundle[2] for bundle in experts]
+        intermediate = int(gate[0].rows)
+        if (
+            any(int(weight.rows) != intermediate for weight in up)
+            or any(int(weight.rows) != hidden for weight in dn)
+            or any(int(weight.cols) != hidden for weight in gate + up)
+            or any(int(weight.cols) != intermediate for weight in dn)
+        ):
+            return None
+        gate_spec = _shared_projection_spec(gate)
+        up_spec = _shared_projection_spec(up)
+        down_spec = _shared_projection_spec(dn)
+        with _PACKED_MOE_LOCK:
+            if (
+                _PACKED_MOE_WORKSPACE is None
+                or _PACKED_MOE_WORKSPACE[1].numel() < hidden
+            ):
+                _PACKED_MOE_WORKSPACE = (
+                    torch.empty(1, dtype=torch.float32),
+                    torch.empty(hidden, dtype=torch.float32),
+                )
+            result = _PACKED_MOE_WORKSPACE[1]
+            if (
+                gate_spec is not None
+                and up_spec is not None
+                and down_spec is not None
+            ):
+                return extension.moe_packed_three_projection(
+                    x_float,
+                    [weight.raw for weight in gate],
+                    gate_spec.cb.float().contiguous(),
+                    int(gate_spec.rows),
+                    int(gate_spec.blocks),
+                    int(gate_spec.bits),
+                    [weight.raw for weight in up],
+                    up_spec.cb.float().contiguous(),
+                    int(up_spec.rows),
+                    int(up_spec.blocks),
+                    int(up_spec.bits),
+                    [weight.raw for weight in dn],
+                    down_spec.cb.float().contiguous(),
+                    int(down_spec.rows),
+                    int(down_spec.blocks),
+                    int(down_spec.bits),
+                    weights,
+                    float(limit),
+                    str(activation).strip().lower(),
+                    float(activation_beta),
+                    (
+                        -1.0
+                        if activation_linear_beta is None
+                        else float(activation_linear_beta)
+                    ),
+                    result,
+                )
+
+            # Grouped projection codebooks (for example one codebook per
+            # contiguous expert band) cannot use the one-codebook native fast
+            # path above.  Retain one public operator call and one persistent
+            # workspace while dispatching only the affected projection by
+            # exact codebook group.
+            required_shape = (len(experts), intermediate)
+            down_shape = (len(experts), hidden)
+            if (
+                _PACKED_THREE_WORKSPACE is None
+                or _PACKED_THREE_WORKSPACE[0].shape[0]
+                < required_shape[0]
+                or _PACKED_THREE_WORKSPACE[0].shape[1]
+                < required_shape[1]
+                or _PACKED_THREE_WORKSPACE[3].shape[0]
+                < down_shape[0]
+                or _PACKED_THREE_WORKSPACE[3].shape[1]
+                < down_shape[1]
+            ):
+                _PACKED_THREE_WORKSPACE = (
+                    torch.empty(required_shape, dtype=torch.float32),
+                    torch.empty(required_shape, dtype=torch.float32),
+                    torch.empty(required_shape, dtype=torch.float32),
+                    torch.empty(down_shape, dtype=torch.float32),
+                )
+            gate_workspace, up_workspace, activated_workspace, down_workspace = (
+                _PACKED_THREE_WORKSPACE
+            )
+            gate_values = _grouped_projection(
+                gate,
+                x_float,
+                gate_workspace,
+                allow_direct=True,
+            )
+            up_values = _grouped_projection(
+                up,
+                x_float,
+                up_workspace,
+                allow_direct=True,
+            )
+            if gate_values is None or up_values is None:
+                return None
+            activated = activated_workspace[
+                : len(experts), :intermediate
+            ]
+            if limit != 0.0:
+                gate_values.clamp_max_(float(limit))
+                up_values.clamp_(-float(limit), float(limit))
+            normalized_activation = str(activation).strip().lower()
+            if normalized_activation == "situ":
+                activated.copy_(gate_values)
+                activated.div_(float(activation_beta)).tanh_()
+                activated.mul_(float(activation_beta))
+                activated.mul_(gate_values.sigmoid())
+                if (
+                    activation_linear_beta is not None
+                    and float(activation_linear_beta) > 0.0
+                ):
+                    up_values.div_(float(activation_linear_beta)).tanh_()
+                    up_values.mul_(float(activation_linear_beta))
+                activated.mul_(up_values)
+            elif normalized_activation in {"silu", "swiglu"}:
+                activated.copy_(gate_values)
+                activated.mul_(gate_values.sigmoid()).mul_(up_values)
+            else:
+                return None
+            down_result = _grouped_projection(
+                dn,
+                activated,
+                down_workspace,
+                allow_direct=True,
+            )
+            if down_result is None:
+                return None
+            torch.mv(
+                down_result.transpose(0, 1),
+                weights,
+                out=result[:hidden],
+            )
+            return result[:hidden]
+
+    gu = [pair[0] for pair in experts]
+    dn = [pair[1] for pair in experts]
     unique_gu: dict[tuple[int, int, int, int], object] = {}
     gu_score_count = 0
     for weight in gu:
@@ -263,7 +580,6 @@ def moe_packed_topk_cpu(
                 weight.cb.shape[0]
     )
     intermediate = int(dn[0].cols)
-    hidden = int(x_float.shape[1])
     dn_score_count = sum(
         int(weight.blocks) * int(weight.cb.shape[0])
         for weight in dn
@@ -278,7 +594,6 @@ def moe_packed_topk_cpu(
         + len(experts) * hidden
     )
 
-    global _PACKED_MOE_WORKSPACE
     with _PACKED_MOE_LOCK:
         if (
             _PACKED_MOE_WORKSPACE is None
@@ -339,6 +654,49 @@ def packed_moe_phase_profile() -> dict[str, float | int]:
     return {
         name: int(value) if name == "calls" else float(value)
         for name, value in zip(names, values)
+    }
+
+
+def reset_three_projection_phase_profile() -> None:
+    extension = _build()
+    if extension is not None:
+        extension.reset_three_projection_phase_profile()
+
+
+def three_projection_phase_profile() -> dict[str, float | int]:
+    extension = _build()
+    if extension is None:
+        return {}
+    values = extension.three_projection_phase_profile()
+    names = (
+        "calls",
+        "gate_seconds",
+        "up_seconds",
+        "activation_seconds",
+        "down_seconds",
+        "reduce_seconds",
+    )
+    return {
+        name: int(value) if name == "calls" else float(value)
+        for name, value in zip(names, values)
+    }
+
+
+def reset_block_fp8_gemv_profile() -> None:
+    extension = _build()
+    if extension is not None:
+        extension.reset_block_fp8_gemv_profile()
+
+
+def block_fp8_gemv_profile() -> dict[str, float | int]:
+    extension = _build()
+    if extension is None:
+        return {}
+    values = extension.block_fp8_gemv_profile()
+    return {
+        "calls": int(values[0]),
+        "seconds": float(values[1]),
+        "weight_elements": int(values[2]),
     }
 
 

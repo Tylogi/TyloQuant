@@ -5,13 +5,9 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-
-import uvicorn
-from fastapi import FastAPI
+from typing import Any
 
 from .chat_adapters import adapter_for_arch
-from .chat_service import ChatService
-from .openai_api import create_app
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -26,10 +22,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cache-gb", type=float)
     parser.add_argument("--vram-gb", type=float)
     parser.add_argument(
+        "--dense-residency",
+        choices=("auto", "gpu"),
+        default="auto",
+        help="auto 自动尝试 Dense GPU-only；gpu 容量不足即失败",
+    )
+    parser.add_argument(
         "--tp",
         type=int,
         default=1,
-        help="GPU-resident routed-expert parallel size (GLM only)",
+        help="GPU parallel size (GLM expert parallel or Kimi tensor parallel)",
     )
     parser.add_argument("--max-ctx", type=int, default=32768)
     parser.add_argument(
@@ -51,12 +53,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--tp must be positive")
     if args.tp > 1 and args.device != "cuda":
         parser.error("--tp > 1 requires --device cuda")
+    if args.dense_residency == "gpu" and args.device != "cuda":
+        parser.error("--dense-residency gpu requires --device cuda")
     if args.served_model_name is None:
         args.served_model_name = Path(args.model).resolve().name
     return args
 
 
-def build_service(args: argparse.Namespace) -> tuple[ChatService, FastAPI]:
+def build_service(args: argparse.Namespace) -> tuple[Any, Any]:
+    try:
+        from .chat_service import ChatService
+        from .openai_api import create_app
+    except ModuleNotFoundError as exc:
+        missing = (exc.name or "").split(".", 1)[0]
+        if missing not in {"fastapi", "pydantic", "starlette"}:
+            raise
+        raise RuntimeError(
+            "OpenAI API 依赖未安装；请执行 pip install -e '.[api]'"
+        ) from exc
     from .engine import Engine
 
     engine = Engine(
@@ -66,6 +80,7 @@ def build_service(args: argparse.Namespace) -> tuple[ChatService, FastAPI]:
         device=args.device,
         vram_cache_gb=args.vram_gb,
         tp_size=args.tp,
+        dense_residency=args.dense_residency,
     )
     adapter = adapter_for_arch(engine.arch)
     service = ChatService(
@@ -88,7 +103,16 @@ def build_service(args: argparse.Namespace) -> tuple[ChatService, FastAPI]:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    _service, app = build_service(args)
+    try:
+        import uvicorn
+    except ModuleNotFoundError as exc:
+        raise SystemExit(
+            "OpenAI API 依赖未安装；请执行 pip install -e '.[api]'"
+        ) from exc
+    try:
+        _service, app = build_service(args)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
     uvicorn.run(app, host=args.host, port=args.port)
 
 

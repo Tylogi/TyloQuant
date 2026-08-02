@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from mfq.formats.tpq import CccpInt4Tensor, CccpPqSpec, CccpPqTensor
-from mfq.formats.tpq import normalize_tpq_dtype
+from mfq.formats.tpq import normalize_tpq_dtype, unpack_tpq_indices
 from mfq.formats.io import MMapTensorStore, load_mmap
 from mfq.formats.moe import NintMoePool, NintMoeTensor
 
@@ -42,7 +42,53 @@ class _ManifestView:
     tiers_per_layer: dict[int, str]
     vq_dims: dict[str, tuple[int, int]]
     int4_group: int
+    model_family: str
+    projection_vq: bool
+    projection_layout_by_layer: dict[int, dict[str, str]]
+    projection_layout_specs: dict[str, dict[str, Any]]
+    projection_codebook_group_sizes: dict[str, int]
+    projection_codebook_group_counts: dict[str, int]
+    index_packing: dict[str, str]
     zlib: bool = False
+
+    def tier_string(self, layer: int) -> str | None:
+        return self.tiers_per_layer.get(int(layer))
+
+    def projection_operator_capability(self, layer: int) -> dict[str, tuple]:
+        if not self.projection_vq:
+            return {}
+        formats = {"u8": "p8", "u16": "p16"}
+        formats.update({f"packed-u{bits}": f"p{bits}" for bits in range(8, 17)})
+        packed_formats = []
+        code_dims = []
+        codebook_sizes = []
+        for projection in ("gate", "up", "down"):
+            layout = self.projection_layout_by_layer[int(layer)][projection]
+            dim, size = self.vq_dims[layout]
+            packing = self.index_packing.get(layout)
+            if packing is None:
+                bits = int(size).bit_length() - 1
+                if size <= 0 or 1 << bits != size:
+                    raise ValueError(
+                        f"L{layer} {projection} cannot infer packed width"
+                    )
+                packing = (
+                    "u8" if bits == 8 else "u16" if bits == 16
+                    else f"packed-u{bits}"
+                )
+            try:
+                packed_formats.append(formats[packing])
+            except KeyError as exc:
+                raise ValueError(
+                    f"L{layer} {projection} has unsupported packing {packing!r}"
+                ) from exc
+            code_dims.append(int(dim))
+            codebook_sizes.append(int(size))
+        return {
+            "packed_formats": tuple(packed_formats),
+            "code_dims": tuple(code_dims),
+            "codebook_sizes": tuple(codebook_sizes),
+        }
 
 
 @dataclass(frozen=True)
@@ -134,7 +180,10 @@ class NativeCCCPArtifact:
             "architecture": self.model_arch,
             "layers": int(config["n_layers"]),
             "experts_per_layer": int(config["n_experts"]),
-            "expert_records": 2 * len(self.manifest["expert_files"]),
+            "expert_records": (
+                3 if self.manifest["quant"].get("method") == "projection-vq"
+                else 2
+            ) * len(self.manifest["expert_files"]),
             "index_storage": self.index_storage,
         }
 
@@ -166,6 +215,47 @@ class MfqCccpStore:
         expert_layers = sorted(
             int(layer) for layer in manifest["expert_files"]
         )
+        routed_layers = (
+            (manifest.get("routed_experts") or {}).get("layer_files") or {}
+        )
+        projection_vq = quant.get("method") == "projection-vq"
+        if projection_vq and routed_layers:
+            projection_layout_by_layer = {
+                int(layer): {
+                    str(projection): str(layout)
+                    for projection, layout in item["projection_layout"].items()
+                }
+                for layer, item in routed_layers.items()
+            }
+            projection_layout_specs = {
+                str(name): dict(value)
+                for name, value in (quant.get("projection_layouts") or {}).items()
+            }
+        elif projection_vq:
+            projection_layout_by_layer = {
+                int(layer): {
+                    str(projection): str(layout)
+                    for projection, layout in value.items()
+                }
+                for layer, value in (quant.get("projection_layouts") or {}).items()
+            }
+            projection_layout_specs = {
+                str(name): dict(value)
+                for name, value in (quant.get("layouts") or {}).items()
+            }
+        else:
+            projection_layout_by_layer = {}
+            projection_layout_specs = {}
+        if projection_vq:
+            vq_dims = {
+                name: (int(value["dim"]), int(value["size"]))
+                for name, value in projection_layout_specs.items()
+            }
+        else:
+            vq_dims = {
+                str(name): (int(value[0]), int(value[1]))
+                for name, value in quant["vq"].items()
+            }
         self.man = _ManifestView(
             config=config,
             quant=quant,
@@ -174,11 +264,26 @@ class MfqCccpStore:
                 for layer in expert_layers
             },
             tiers_per_layer=tiers,
-            vq_dims={
-                str(name): (int(value[0]), int(value[1]))
-                for name, value in quant["vq"].items()
-            },
+            vq_dims=vq_dims,
             int4_group=int(quant.get("int4_group", 64)),
+            model_family=str(manifest.get("model_family", "")),
+            projection_vq=projection_vq,
+            projection_layout_by_layer=projection_layout_by_layer,
+            projection_layout_specs=projection_layout_specs,
+            projection_codebook_group_sizes={
+                name: int(value["group_size"])
+                for name, value in projection_layout_specs.items()
+                if value.get("group_size") is not None
+            },
+            projection_codebook_group_counts={
+                name: int(value["groups"])
+                for name, value in projection_layout_specs.items()
+                if value.get("groups") is not None
+            },
+            index_packing={
+                str(name): str(value)
+                for name, value in (quant.get("index_packing") or {}).items()
+            },
         )
         self.cfg = config
         self._tpq = tpq
@@ -200,10 +305,21 @@ class MfqCccpStore:
         self._layer_lock = threading.RLock()
         self._expert_signature_count_cache = None
         self.heat_ranks = None
-        self._direct_maps = {
+        self._record_names = {
             layer: (
-                self._parse_direct_projection(self._gate_name(layer)),
-                self._parse_direct_projection(self._down_name(layer)),
+                tuple(
+                    self._projection_name(layer, projection)
+                    for projection in ("gate", "up", "down")
+                )
+                if projection_vq
+                else (self._gate_name(layer), self._down_name(layer))
+            )
+            for layer in expert_layers
+        }
+        self._direct_maps = {
+            layer: tuple(
+                self._parse_direct_projection(name)
+                for name in self._record_names[layer]
             )
             for layer in expert_layers
         }
@@ -216,12 +332,15 @@ class MfqCccpStore:
     def _down_name(layer: int) -> str:
         return f"layers.{layer}.ffn.experts.down.weight"
 
+    @staticmethod
+    def _projection_name(layer: int, projection: str) -> str:
+        return f"layers.{layer}.ffn.experts.{projection}.weight"
+
     @property
     def expert_bytes(self) -> int:
         return sum(
-            self._store.records[self._gate_name(layer)].nbytes
-            + self._store.records[self._down_name(layer)].nbytes
-            for layer in self.man.expert_files
+            sum(self._store.records[name].nbytes for name in names)
+            for layer, names in self._record_names.items()
         )
 
     def close(self) -> None:
@@ -304,9 +423,7 @@ class MfqCccpStore:
         self._drop_records_file_cache(self._dense_names)
 
     def drop_expert_file_cache(self, layer: int) -> None:
-        self._drop_records_file_cache(
-            (self._gate_name(layer), self._down_name(layer))
-        )
+        self._drop_records_file_cache(self._record_names[int(layer)])
 
     def _parse_direct_projection(
         self,
@@ -391,10 +508,11 @@ class MfqCccpStore:
                 tier=dtype[len(tier_prefix) :].lower(),
                 vector_size=int(vector_size),
                 codebook_entries=int(codebook_entries),
+                storage_bits=int(index_bits),
             )
-            if index_bits != spec.index_bits or index_bits not in {8, 16}:
+            if index_bits != spec.index_bits or not 8 <= index_bits <= 16:
                 raise ValueError(
-                    f"native CCCP indices are not source-byte-aligned: {name}"
+                    f"native TPQ index width is unsupported: {name}"
                 )
             payload_offset = payload_start + _CCCP_PQ_HEADER.size
             shape = tuple(
@@ -434,7 +552,7 @@ class MfqCccpStore:
                 spec.vector_size,
             )
             index_count = shape[0] * (shape[1] // spec.vector_size)
-            expected_end = codebook_end + index_count * (index_bits // 8)
+            expected_end = codebook_end + (index_count * index_bits + 7) // 8
             if expected_end != payload_end:
                 raise ValueError(
                     f"native CCCP index payload size mismatch: {name}"
@@ -470,17 +588,36 @@ class MfqCccpStore:
     ) -> np.ndarray:
         if local < 0 or local >= pool.expert_count:
             raise IndexError(f"native CCCP local expert is out of range: {local}")
-        dtype = np.dtype(np.uint8 if pool.spec.index_bits == 8 else "<u2")
         count = pool.indices_per_expert
-        offset = pool.indices_offset + local * count * dtype.itemsize
-        return np.frombuffer(
+        nbytes = (count * pool.spec.index_bits + 7) // 8
+        offset = pool.indices_offset + local * nbytes
+        values, end = unpack_tpq_indices(
             self._store._mmaps[pool.source_index],
-            dtype=dtype,
-            count=count,
-            offset=offset,
-        ).reshape(
+            offset,
+            count,
+            pool.spec.index_bits,
+        )
+        if end != offset + nbytes:
+            raise ValueError("native TPQ expert index span is inconsistent")
+        return values.reshape(
             pool.rows_per_expert,
             pool.columns // pool.spec.vector_size,
+        )
+
+    def _direct_raw(self, pool: _DirectCccpPool, local: int) -> np.ndarray:
+        if local < 0 or local >= pool.expert_count:
+            raise IndexError(f"native TPQ local expert is out of range: {local}")
+        count = pool.indices_per_expert
+        bits = pool.spec.index_bits
+        total_bits = count * bits
+        if total_bits % 8:
+            raise ValueError("native TPQ expert payload is not byte aligned")
+        nbytes = total_bits // 8
+        return np.frombuffer(
+            self._store._mmaps[pool.source_index],
+            dtype=np.uint8,
+            count=nbytes,
+            offset=pool.indices_offset + local * nbytes,
         )
 
     @staticmethod
@@ -527,6 +664,13 @@ class MfqCccpStore:
             return tensors, maps
 
     def expert_kind(self, layer: int, expert: int) -> str:
+        maps = self._direct_maps[int(layer)]
+        if self.man.projection_vq:
+            return (
+                "projection-vq"
+                if all(int(expert) in projection for projection in maps)
+                else "drop"
+            )
         assignments = self.man.tiers_per_layer.get(int(layer))
         if assignments is not None and int(expert) < len(assignments):
             try:
@@ -535,13 +679,20 @@ class MfqCccpStore:
                 raise ValueError(
                     f"invalid CCCP tier character {assignments[int(expert)]!r}"
                 ) from exc
-        maps = self._direct_maps[int(layer)]
         pair = maps[0].get(int(expert))
         if pair is None:
             return "drop"
         return pair[0].spec.tier
 
     def available_mask(self, layer: int) -> torch.Tensor:
+        assignments = self.man.tier_string(int(layer))
+        if assignments is not None:
+            if len(assignments) != int(self.cfg["n_experts"]):
+                raise ValueError(f"TPQ L{layer} tier string has invalid length")
+            return torch.tensor(
+                [value.lower() != "d" for value in assignments],
+                dtype=torch.bool,
+            )
         return torch.tensor(
             [
                 self.expert_kind(layer, expert) != "drop"
@@ -583,7 +734,46 @@ class MfqCccpStore:
             self._torch_array(down.codebook),
         )
 
+    def projection_codebooks(
+        self,
+        layer: int,
+        eid: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.man.projection_vq:
+            raise RuntimeError("native TPQ model is not projection-VQ")
+        if eid is None:
+            raise ValueError("projection-VQ grouped codebooks require expert_id")
+        maps = self._direct_maps[int(layer)]
+        result = []
+        for projection in maps:
+            try:
+                pool, _local = projection[int(eid)]
+            except KeyError as exc:
+                raise KeyError(f"TPQ expert {layer}/{eid} is absent") from exc
+            result.append(self._torch_array(pool.codebook))
+        return tuple(result)
+
+    def projection_codebook_variants(
+        self,
+        layer: int,
+        eid: int | None = None,
+    ) -> tuple[str, str, str]:
+        if eid is None:
+            raise ValueError("projection-VQ codebook variant requires expert_id")
+        result = []
+        layouts = self.man.projection_layout_by_layer[int(layer)]
+        for projection in ("gate", "up", "down"):
+            layout = layouts[projection]
+            group_size = self.man.projection_codebook_group_sizes.get(layout)
+            suffix = "" if group_size is None else f".g{int(eid) // group_size:03d}"
+            result.append(f"L{layer}.{projection}.{layout}{suffix}")
+        return tuple(result)
+
     def load_expert(self, layer: int, expert: int):
+        if self.man.projection_vq:
+            raise RuntimeError(
+                "projection-VQ uses load_expert_packed with three projections"
+            )
         maps = self._direct_maps[int(layer)]
         if expert not in maps[0] or expert not in maps[1]:
             raise KeyError(f"CCCP expert {layer}/{expert} is absent")
@@ -609,7 +799,44 @@ class MfqCccpStore:
             ),
         )
 
+    def load_expert_packed(self, layer: int, expert: int):
+        maps = self._direct_maps[int(layer)]
+        if self.man.projection_vq:
+            if len(maps) != 3 or not all(int(expert) in value for value in maps):
+                raise KeyError(f"TPQ expert {layer}/{expert} is absent")
+            weight_type = self._tpq.store.PackedVQWeight
+            result = []
+            for projection in maps:
+                pool, local = projection[int(expert)]
+                result.append(
+                    weight_type(
+                        self._torch_array(self._direct_raw(pool, local)),
+                        self._torch_array(pool.codebook),
+                        pool.rows_per_expert,
+                        pool.columns,
+                        pool.spec.index_bits,
+                    )
+                )
+            return tuple(result)
+        gate, down = maps
+        weight_type = self._tpq.store.PackedVQWeight
+        result = []
+        for projection in (gate, down):
+            pool, local = projection[int(expert)]
+            result.append(
+                weight_type(
+                    self._torch_array(self._direct_raw(pool, local)),
+                    self._torch_array(pool.codebook),
+                    pool.rows_per_expert,
+                    pool.columns,
+                    pool.spec.index_bits,
+                )
+            )
+        return tuple(result)
+
     def expert_signature_counts(self):
+        if self.man.projection_vq:
+            return Counter()
         cached = self._expert_signature_count_cache
         if cached is not None:
             return cached.copy()
@@ -641,7 +868,13 @@ def install_mfq_cccp_store(tpq: ModuleType) -> None:
 
     from tpq import dsv4model, store
 
-    current = dsv4model.CCCPStore
+    current = getattr(
+        dsv4model,
+        "TPQStore",
+        getattr(dsv4model, "CCCPStore", None),
+    )
+    if current is None:
+        raise AttributeError("TPQ runtime exposes no store constructor")
     if getattr(current, "_mfq_native_dispatch", False):
         return
     original = current
@@ -655,7 +888,9 @@ def install_mfq_cccp_store(tpq: ModuleType) -> None:
                 return MfqCccpStore(path, tpq)
             return original(root)
 
+    dsv4model.TPQStore = CCCPStoreDispatch
     dsv4model.CCCPStore = CCCPStoreDispatch
+    store.TPQStoreDispatch = CCCPStoreDispatch
     store.CCCPStoreDispatch = CCCPStoreDispatch
 
 

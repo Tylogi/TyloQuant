@@ -1,9 +1,11 @@
-"""Packed full-GPU experts and contiguous layer placement for Kimi K3.
+"""Packed full-GPU experts and contiguous layer placement.
 
-The standard 480 GiB archive stores x/w/vv indices at their real 12/14-bit
-width.  Expanding them to uint16 would make the runtime footprint about
-595 GiB.  This module keeps the byte-exact payload in one stable arena per
+Projection archives store mixed indices at their real 9/10/12/14-bit width.
+Expanding them to uint16 would defeat compact residency. This module keeps
+the byte-exact payload in one stable arena per
 pipeline rank and publishes CUDA pointer metadata for direct packed GEMV.
+The historical filename remains for Kimi import compatibility; the public
+pool is also used by projection-VQ DeepSeek with a configuration-driven plan.
 """
 
 from __future__ import annotations
@@ -88,7 +90,10 @@ def build_kimi_layer_plan(store, tp_size: int) -> KimiLayerPlan:
     for name in store.dense_names():
         if not name.startswith(f"{_ROOT}."):
             continue
-        size = store.dense_nbytes(name)
+        resident_size = getattr(
+            store, "dense_resident_nbytes", store.dense_nbytes
+        )
+        size = resident_size(name)
         if marker in name:
             layer = int(name.split(marker, 1)[1].split(".", 1)[0])
             dense_by_layer[layer] += size
@@ -132,10 +137,17 @@ def build_kimi_layer_plan(store, tp_size: int) -> KimiLayerPlan:
         payloads = [0] * n_experts
         for expert_id, item in experts.items():
             index = int(str(expert_id).lstrip("e"))
-            payloads[index] = (
-                int(item.get("gu_bytes", 0))
-                + int(item.get("down_bytes", 0))
-            )
+            if "gu_bytes" in item or "down_bytes" in item:
+                payloads[index] = (
+                    int(item.get("gu_bytes", 0))
+                    + int(item.get("down_bytes", 0))
+                )
+            else:
+                payloads[index] = sum(
+                    int(projection.get("packed_bytes", 0))
+                    for projection in item.values()
+                    if isinstance(projection, dict)
+                )
         expert_payload_by_expert[layer] = tuple(payloads)
         expert_payload_by_layer[layer] = sum(payloads)
         expert_aux_by_layer[layer] = max(
@@ -181,6 +193,45 @@ def build_kimi_layer_plan(store, tp_size: int) -> KimiLayerPlan:
         expert_payload_by_layer=tuple(expert_payload_by_layer),
         expert_payload_by_expert=tuple(expert_payload_by_expert),
         expert_aux_by_layer=tuple(expert_aux_by_layer),
+    )
+
+
+def build_primary_dense_packed_plan(store, tp_size: int) -> KimiLayerPlan:
+    """Build a tensor-sharded expert plan for a primary-device dense graph.
+
+    This is the transition plan used by architectures whose Attention/Dense
+    graph is not yet represented as ``TPHidden``.  Every routed expert is
+    still column/row sharded across all ranks and no rank stores a complete
+    expert.  Only the comparatively small non-expert graph remains on rank 0.
+    """
+    base = build_kimi_layer_plan(store, int(tp_size))
+    n_layers = int(store.cfg["n_layers"])
+    dense_total = sum(
+        int(
+            getattr(
+                store,
+                "dense_resident_nbytes",
+                store.dense_nbytes,
+            )(name)
+        )
+        for name in store.dense_names()
+    )
+    ranges = ((0, n_layers),) + tuple(
+        (n_layers, n_layers) for _ in range(int(tp_size) - 1)
+    )
+    dense_by_rank = (dense_total,) + (0,) * (int(tp_size) - 1)
+    return KimiLayerPlan(
+        ranges=ranges,
+        owner_by_layer=(0,) * n_layers,
+        bytes_by_rank=tuple(
+            dense_by_rank[rank] + base.expert_bytes_by_rank[rank]
+            for rank in range(int(tp_size))
+        ),
+        dense_bytes_by_rank=dense_by_rank,
+        expert_bytes_by_rank=base.expert_bytes_by_rank,
+        expert_payload_by_layer=base.expert_payload_by_layer,
+        expert_payload_by_expert=base.expert_payload_by_expert,
+        expert_aux_by_layer=base.expert_aux_by_layer,
     )
 
 
@@ -245,7 +296,7 @@ class PackedExpertPool:
         self._arenas: list[torch.Tensor] = []
         self._metadata: dict[int, tuple[torch.Tensor, ...]] = {}
         self._codebooks: dict[
-            tuple[int, int, str, int | None, int], torch.Tensor
+            tuple[int, str, str, int], torch.Tensor
         ] = {}
         self._workspaces: dict[
             int,
@@ -465,7 +516,7 @@ class PackedExpertPool:
                     torch.cuda.empty_cache()
             raise
         print(
-            "[tpq-kimi] packed 专家 arena 已分配："
+            "[tpq-packed] packed 专家 arena 已分配："
             + "，".join(
                 f"cuda:{device.index}={size / 2**30:.2f}GiB"
                 for device, size in zip(
@@ -481,12 +532,12 @@ class PackedExpertPool:
         rank: int,
         layer: int,
         tier: str,
-        dedicated: int | None,
+        variant: str,
         projection: int,
         cb: torch.Tensor,
         device: torch.device,
     ) -> torch.Tensor:
-        key = (rank, layer, tier, dedicated, projection)
+        key = (rank, tier, variant, projection)
         cached = self._codebooks.get(key)
         if cached is None:
             cached = cb.to(
@@ -542,6 +593,50 @@ class PackedExpertPool:
             local_blocks,
         )
 
+    @staticmethod
+    def _tensor_shard_projection_raw(
+        weight,
+        *,
+        projection: int,
+        rank: int,
+        ranks: int,
+        intermediate: int,
+    ) -> tuple[torch.Tensor, int]:
+        """按三投影数学维切分紧凑索引，不展开 p14。
+
+        gate/up 是 Column-TP，沿输出行切；down 是 Row-TP，沿输入块切。
+        """
+        row_bits = weight.blocks * weight.bits
+        if row_bits % 8:
+            raise ValueError("packed expert row is not byte aligned")
+        row_bytes = row_bits // 8
+        rows = weight.raw.view(weight.rows, row_bytes)
+        local_intermediate = intermediate // ranks
+        if projection in (0, 1):
+            start = rank * local_intermediate
+            end = start + local_intermediate
+            return (
+                rows[start:end].contiguous().reshape(-1),
+                weight.blocks,
+            )
+        if projection != 2:
+            raise ValueError(f"invalid expert projection {projection}")
+        if weight.blocks % ranks:
+            raise ValueError("packed Down blocks are not TP divisible")
+        local_blocks = weight.blocks // ranks
+        start_bits = rank * local_blocks * weight.bits
+        shard_bits = local_blocks * weight.bits
+        if start_bits % 8 or shard_bits % 8:
+            raise ValueError(
+                "packed Down shard boundary is not byte aligned"
+            )
+        start_byte = start_bits // 8
+        end_byte = start_byte + shard_bits // 8
+        return (
+            rows[:, start_byte:end_byte].contiguous().reshape(-1),
+            local_blocks,
+        )
+
     def preload(self) -> None:
         """Read each packed expert once and write it directly into its arena."""
         self.allocate()
@@ -549,12 +644,19 @@ class PackedExpertPool:
         n_experts = int(self.store.cfg["n_experts"])
         top_k = int(self.store.cfg["top_k"])
         intermediate = int(self.store.cfg["moe_inter"])
-        routed_hidden = int(self.store.cfg["routed_hidden"])
+        routed_hidden = int(
+            self.store.cfg.get("routed_hidden", self.store.cfg["hidden"])
+        )
         offsets = [0] * len(self.devices)
         loaded = 0
         for layer in sorted(self.store.man.expert_files):
+            projection_vq = bool(self.store.man.projection_vq)
             metadata_by_rank = [
-                torch.zeros(10, n_experts, dtype=torch.long)
+                torch.zeros(
+                    15 if projection_vq else 10,
+                    n_experts,
+                    dtype=torch.long,
+                )
                 for _ in self.devices
             ]
             for expert_id in range(n_experts):
@@ -562,45 +664,62 @@ class PackedExpertPool:
                 if tier == "drop":
                     continue
                 base_tier = tier.rstrip("z")
-                layer_keys = self.store._expert_keys[layer]
-                gu_stem = f"cb.gu.{base_tier}"
-                down_stem = (
-                    f"cb.down.{base_tier}"
-                    if f"cb.down.{base_tier}" in layer_keys
-                    else f"cb.dn.{base_tier}"
-                )
-                dedicated = (
-                    expert_id
-                    if (
-                        f"{gu_stem}.e{expert_id}" in layer_keys
-                        and f"{down_stem}.e{expert_id}" in layer_keys
+                if projection_vq:
+                    codebook_variants = (
+                        self.store.projection_codebook_variants(
+                            layer,
+                            expert_id,
+                        )
                     )
-                    else None
-                )
-                gu, down = self.store.load_expert_packed(
-                    layer,
-                    expert_id,
-                )
+                    weights = self.store.load_expert_packed(
+                        layer,
+                        expert_id,
+                    )
+                    projection_weights = tuple(
+                        zip((0, 5, 10), weights)
+                    )
+                else:
+                    codebook_variants = self.store.codebook_variants(
+                        layer,
+                        base_tier,
+                        expert_id,
+                    )
+                    gu, down = self.store.load_expert_packed(
+                        layer,
+                        expert_id,
+                    )
+                    projection_weights = ((0, gu), (5, down))
                 target_ranks = self.expert_ranks(layer, expert_id)
                 for rank in target_ranks:
                     device = self.devices[rank]
                     arena = self._arenas[rank]
                     metadata = metadata_by_rank[rank]
                     with torch.cuda.device(device):
-                        for base, weight in ((0, gu), (5, down)):
+                        for base, weight in projection_weights:
                             if self.parallelism in {"tensor", "hybrid"}:
                                 group_rank = (
                                     rank
                                     if self.parallelism == "tensor"
                                     else rank % self.tensor_group_size
                                 )
-                                raw, blocks = self._tensor_shard_raw(
-                                    weight,
-                                    projection=base,
-                                    rank=group_rank,
-                                    ranks=self.tensor_group_size,
-                                    intermediate=intermediate,
-                                )
+                                if projection_vq:
+                                    raw, blocks = (
+                                        self._tensor_shard_projection_raw(
+                                            weight,
+                                            projection=base // 5,
+                                            rank=group_rank,
+                                            ranks=self.tensor_group_size,
+                                            intermediate=intermediate,
+                                        )
+                                    )
+                                else:
+                                    raw, blocks = self._tensor_shard_raw(
+                                        weight,
+                                        projection=base,
+                                        rank=group_rank,
+                                        ranks=self.tensor_group_size,
+                                        intermediate=intermediate,
+                                    )
                             else:
                                 raw = weight.raw
                                 blocks = weight.blocks
@@ -617,7 +736,13 @@ class PackedExpertPool:
                                 rank,
                                 layer,
                                 base_tier,
-                                dedicated,
+                                codebook_variants[
+                                    (
+                                        base // 5
+                                        if projection_vq
+                                        else (0 if base == 0 else 1)
+                                    )
+                                ],
                                 base,
                                 weight.cb,
                                 device,
@@ -637,7 +762,7 @@ class PackedExpertPool:
                 loaded += 1
                 if loaded % 2000 == 0:
                     print(
-                        f"[tpq-kimi] packed 专家写入 "
+                        f"[tpq-packed] packed 专家写入 "
                         f"{loaded}",
                         flush=True,
                     )
@@ -651,7 +776,7 @@ class PackedExpertPool:
         for rank, expected in enumerate(self._rank_payload_bytes):
             if offsets[rank] != expected:
                 raise RuntimeError(
-                    f"Kimi rank {rank} packed bytes mismatch: "
+                    f"rank {rank} packed bytes mismatch: "
                     f"{offsets[rank]} != {expected}"
                 )
         workspace_intermediate = (
@@ -802,7 +927,7 @@ class PackedExpertPool:
         gc.collect()
         self.active = True
         print(
-            f"[tpq-kimi] packed 专家全显存完成：{loaded} 个，"
+            f"[tpq-packed] packed 专家全显存完成：{loaded} 个，"
             f"{self.gpu_storage_bytes / 2**30:.2f}GiB，"
             f"{time.time() - started:.1f}s，运行期专家 H2D=0",
             flush=True,
@@ -831,6 +956,9 @@ class PackedExpertPool:
         activation_linear_beta = (
             0.0 if linear_value is None else float(linear_value)
         )
+        activation_limit = float(
+            self.store.cfg.get("swiglu_limit", 0.0)
+        )
         for layer in sorted(self.store.man.expert_files):
             owner = self.plan.owner_by_layer[layer]
             owner_device = self.devices[owner]
@@ -842,7 +970,7 @@ class PackedExpertPool:
             )
             if available.numel() != top_k:
                 raise RuntimeError(
-                    f"Kimi layer {layer} has fewer than Top-K experts"
+                    f"layer {layer} has fewer than Top-K experts"
                 )
             with torch.cuda.device(owner_device):
                 self._source_inputs[owner].zero_()
@@ -921,10 +1049,14 @@ class PackedExpertPool:
                         activation_linear_beta=(
                             activation_linear_beta
                         ),
+                        limit=activation_limit,
                         hidden_workspace=hidden,
                         output_workspace=output,
                         result=result,
                         grouped_prefix=-1,
+                        **self.store.man.projection_operator_capability(
+                            layer
+                        ),
                     )
                     if (
                         not self.hidden_mode
@@ -994,13 +1126,18 @@ class PackedExpertPool:
                         self._output_replicas[layer].append(
                             torch.empty(
                                 1,
-                                int(self.store.cfg["routed_hidden"]),
+                                int(
+                                    self.store.cfg.get(
+                                        "routed_hidden",
+                                        self.store.cfg["hidden"],
+                                    )
+                                ),
                                 dtype=torch.bfloat16,
                                 device=device,
                             )
                         )
         print(
-            f"[tpq-kimi] 通用 packed MoE TP Graph 完成："
+            f"[tpq-packed] 通用 packed MoE TP Graph 完成："
             f"{len(self._graphs)} 层×{len(self.devices)} 卡，"
             f"{time.time() - started:.1f}s",
             flush=True,
@@ -1025,7 +1162,7 @@ class PackedExpertPool:
         The Router/Down collective publishes fixed logits and latent replicas.
         Each rank then performs the same registered Top-K and computes its
         shard of every selected packed expert.  Only graph scheduling changes;
-        packed p8/p12/p14 indices and all-rank expert ownership are unchanged.
+        packed indices and all-rank expert ownership are unchanged.
         """
         if not self.hidden_mode or not self._graphs:
             raise RuntimeError(
@@ -1112,7 +1249,7 @@ class PackedExpertPool:
                 self._source_events[layer],
             )
         print(
-            "[tpq-kimi] 通用 Route TopK→packed MoE 全rank父图完成："
+            "[tpq-packed] 通用 Route TopK→packed MoE 全rank父图完成："
             f"{len(self._route_graphs)} 层×{len(self.devices)} rank",
             flush=True,
         )
@@ -1210,6 +1347,7 @@ class PackedExpertPool:
         activation: str,
         activation_beta: float,
         activation_linear_beta: float | None,
+        limit: float = 0.0,
     ) -> torch.Tensor:
         if not self.active:
             raise RuntimeError("packed experts are not ready")
@@ -1236,6 +1374,10 @@ class PackedExpertPool:
                     output_workspace=output,
                     result=result,
                     grouped_prefix=-1,
+                    **self.store.man.projection_operator_capability(
+                        layer
+                    ),
+                    limit=float(limit),
                 )
 
         owner = self.plan.owner_by_layer[layer]
@@ -1309,6 +1451,10 @@ class PackedExpertPool:
                     output_workspace=output,
                     result=result,
                     grouped_prefix=-1,
+                    **self.store.man.projection_operator_capability(
+                        layer
+                    ),
+                    limit=float(limit),
                 )
                 self._return_buffers[owner][
                     rank, local_layer

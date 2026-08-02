@@ -13,6 +13,7 @@ from .hidden import TPHidden
 @dataclass
 class _TPStageEvents:
     name: str
+    layer: int
     starts: tuple[torch.cuda.Event, ...]
     ends: tuple[torch.cuda.Event, ...] | None = None
 
@@ -34,6 +35,8 @@ class TPHiddenStageProfiler:
         self,
         name: str,
         hidden: TPHidden,
+        *,
+        layer: int = -1,
     ) -> tuple[TPHidden, _TPStageEvents | None]:
         if not self.enabled:
             return hidden, None
@@ -49,7 +52,7 @@ class TPHiddenStageProfiler:
                 event = torch.cuda.Event(enable_timing=True)
                 event.record(stream)
                 starts.append(event)
-        record = _TPStageEvents(str(name), tuple(starts))
+        record = _TPStageEvents(str(name), int(layer), tuple(starts))
         self._records.append(record)
         return (
             TPHidden(hidden.devices, hidden.replicas, tuple(starts)),
@@ -95,6 +98,7 @@ class TPHiddenStageProfiler:
             grouped.setdefault(record.name, []).append(elapsed)
             items.append(
                 {
+                    "layer": record.layer,
                     "stage": record.name,
                     "rank_ms": list(elapsed),
                     "critical_ms": max(elapsed),
