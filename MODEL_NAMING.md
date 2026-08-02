@@ -1,26 +1,32 @@
 # MFQ 模型命名规范
 
-公开模型文件统一使用：
+公开模型文件统一由原模型名直接追加量化后缀：
 
 ```text
-<BaseModel>-MFQ-<Family><Bits>-<Grade>.mfq
+<BaseModel>-<Family><Bits>-<Grade>.mfq
 ```
+
+`BaseModel` 必须保留原模型名称；`<Family><Bits>-<Grade>` 是量化后缀。
+文件扩展名 `.mfq` 已明确表示 MFQ 格式，文件名中不再重复加入 `-MFQ-`。
 
 例如：
 
 ```text
-Qwen3.5-9B-MFQ-V3-XXS.mfq
-Qwen3.5-9B-MFQ-S4-L.mfq
+Qwen3.5-9B-V3-XXS.mfq
+Qwen3.5-9B-S4-L.mfq
+Qwen3.5-9B-P1-L.mfq
 ```
 
 ## Family
 
 | MFQ family | 量化类型 | llama.cpp 对照 |
 |---|---|---|
+| `P` | Product Quantization，乘积量化 | 低于 2 bit 的 PQ 档位 |
 | `V` | Vector Quantization，向量量化 | `IQ*` |
 | `S` | Scalar Quantization，标量量化 | `Q*_K*` |
 
-`V`、`S` 描述 MFQ 模型采用的量化家族。UD 基线保留其原始名称，例如
+主位宽低于 2 bit 的型号统一使用 `P`，例如 `P1-L`；2 bit 及以上继续按实际量化
+家族使用 `V` 或 `S`。UD 基线保留其原始名称，例如
 `UD-IQ3_XXS`、`UD-Q4_K_XL`；MFQ 文件名不得继续使用 `UD-*` 作为自身型号。
 
 ## Bits 与 Grade
@@ -35,24 +41,24 @@ Qwen3.5-9B-MFQ-S4-L.mfq
 
 | UD recipe | MFQ 型号 | Qwen3.5-9B 正式文件名 |
 |---|---|---|
-| `IQ2_M` | `V2-M` | `Qwen3.5-9B-MFQ-V2-M.mfq` |
-| `IQ2_XXS` | `V2-XXS` | `Qwen3.5-9B-MFQ-V2-XXS.mfq` |
-| `IQ3_S` | `V3-S` | `Qwen3.5-9B-MFQ-V3-S.mfq` |
-| `IQ3_XXS` | `V3-XXS` | `Qwen3.5-9B-MFQ-V3-XXS.mfq` |
-| `IQ4_NL` | `V4-NL` | `Qwen3.5-9B-MFQ-V4-NL.mfq` |
-| `IQ4_XS` | `V4-XS` | `Qwen3.5-9B-MFQ-V4-XS.mfq` |
-| `Q2_K_XL` | `S2-L` | `Qwen3.5-9B-MFQ-S2-L.mfq` |
-| `Q3_K_M` | `S3-M` | `Qwen3.5-9B-MFQ-S3-M.mfq` |
-| `Q3_K_XL` | `S3-L` | `Qwen3.5-9B-MFQ-S3-L.mfq` |
-| `Q4_K_M` | `S4-M` | `Qwen3.5-9B-MFQ-S4-M.mfq` |
-| `Q4_K_S` | `S4-S` | `Qwen3.5-9B-MFQ-S4-S.mfq` |
-| `Q4_K_XL` | `S4-L` | `Qwen3.5-9B-MFQ-S4-L.mfq` |
-| `Q5_K_M` | `S5-M` | `Qwen3.5-9B-MFQ-S5-M.mfq` |
-| `Q5_K_S` | `S5-S` | `Qwen3.5-9B-MFQ-S5-S.mfq` |
-| `Q5_K_XL` | `S5-L` | `Qwen3.5-9B-MFQ-S5-L.mfq` |
-| `Q6_K` | `S6` | `Qwen3.5-9B-MFQ-S6.mfq` |
-| `Q6_K_XL` | `S6-L` | `Qwen3.5-9B-MFQ-S6-L.mfq` |
-| `Q8_K_XL` | `S8-L` | `Qwen3.5-9B-MFQ-S8-L.mfq` |
+| `IQ2_M` | `V2-M` | `Qwen3.5-9B-V2-M.mfq` |
+| `IQ2_XXS` | `V2-XXS` | `Qwen3.5-9B-V2-XXS.mfq` |
+| `IQ3_S` | `V3-S` | `Qwen3.5-9B-V3-S.mfq` |
+| `IQ3_XXS` | `V3-XXS` | `Qwen3.5-9B-V3-XXS.mfq` |
+| `IQ4_NL` | `V4-NL` | `Qwen3.5-9B-V4-NL.mfq` |
+| `IQ4_XS` | `V4-XS` | `Qwen3.5-9B-V4-XS.mfq` |
+| `Q2_K_XL` | `S2-L` | `Qwen3.5-9B-S2-L.mfq` |
+| `Q3_K_M` | `S3-M` | `Qwen3.5-9B-S3-M.mfq` |
+| `Q3_K_XL` | `S3-L` | `Qwen3.5-9B-S3-L.mfq` |
+| `Q4_K_M` | `S4-M` | `Qwen3.5-9B-S4-M.mfq` |
+| `Q4_K_S` | `S4-S` | `Qwen3.5-9B-S4-S.mfq` |
+| `Q4_K_XL` | `S4-L` | `Qwen3.5-9B-S4-L.mfq` |
+| `Q5_K_M` | `S5-M` | `Qwen3.5-9B-S5-M.mfq` |
+| `Q5_K_S` | `S5-S` | `Qwen3.5-9B-S5-S.mfq` |
+| `Q5_K_XL` | `S5-L` | `Qwen3.5-9B-S5-L.mfq` |
+| `Q6_K` | `S6` | `Qwen3.5-9B-S6.mfq` |
+| `Q6_K_XL` | `S6-L` | `Qwen3.5-9B-S6-L.mfq` |
+| `Q8_K_XL` | `S8-L` | `Qwen3.5-9B-S8-L.mfq` |
 
 ## 发布名与实验名
 
