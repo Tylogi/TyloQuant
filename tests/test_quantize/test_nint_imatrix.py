@@ -193,3 +193,48 @@ def test_final_two_level_refinement_is_monotonic_on_long_rows(
         np.sum(objective_weight * (dequantize(refined) - weight) ** 2)
     )
     assert refined_error <= initial_error * (1.0 + 1e-7)
+
+
+@pytest.mark.parametrize(
+    "spec",
+    (
+        NintSpec(4, 24, 6),
+        NintSpec(6, 24, 7),
+    ),
+)
+def test_priority_group_joint_search_is_monotonic(spec: NintSpec):
+    rng = np.random.default_rng(20260803 + spec.bits)
+    weight = rng.normal(0, 0.06, size=(5, 768)).astype(np.float32)
+    importance = np.full(weight.shape[1], 0.01, dtype=np.float32)
+    importance[[7, 89, 377, 701]] = np.asarray(
+        [1.0e6, 2.0e5, 8.0e4, 3.0e4], dtype=np.float32
+    )
+
+    local_only = quantize(
+        weight,
+        spec,
+        axis=0,
+        importance=importance,
+        use_priority_group_refinement=False,
+    )
+    priority = quantize(
+        weight,
+        spec,
+        axis=0,
+        importance=importance,
+        use_priority_group_refinement=True,
+    )
+    pad = (-weight.shape[1]) % spec.groupsize
+    padded = np.pad(weight, ((0, 0), (0, pad))) if pad else weight
+    importance_rows = np.broadcast_to(importance, weight.shape)
+    objective_weight = _imatrix_element_weights(
+        padded, importance_rows, weight.shape[1]
+    )[:, : weight.shape[1]]
+    local_error = float(
+        np.sum(objective_weight * (dequantize(local_only) - weight) ** 2)
+    )
+    priority_error = float(
+        np.sum(objective_weight * (dequantize(priority) - weight) ** 2)
+    )
+
+    assert priority_error <= local_error * (1.0 + 1e-7)

@@ -15,6 +15,10 @@ from mfq.quantize.nint_quant import NintTensor
 
 
 _IMATRIX_SUPERBLOCK = 256
+_IMATRIX_PRIORITY_GROUPS = 64
+_IMATRIX_PRIORITY_RADIUS = 8
+_IMATRIX_PRIORITY_ROW_CHUNK = 128
+_IMATRIX_PRIORITY_PAIR_CHUNK = 128
 
 
 def _qkx2_search_params(nmax: int) -> tuple[float, float, int]:
@@ -657,12 +661,185 @@ def _refine_imatrix_final_encoding_torch(
     return levels, row_scale, row_min, scale_levels, min_levels
 
 
+@torch.inference_mode()
+def _refine_imatrix_priority_groups_torch(
+    groups: torch.Tensor,
+    weights: torch.Tensor,
+    q: torch.Tensor,
+    neuron_scale: torch.Tensor,
+    neuron_min: torch.Tensor,
+    sub_scale: torch.Tensor,
+    sub_min: torch.Tensor,
+    nmax: int,
+    sub_nmax: int,
+    *,
+    priority_groups: int = _IMATRIX_PRIORITY_GROUPS,
+    radius: int = _IMATRIX_PRIORITY_RADIUS,
+    row_chunk: int = _IMATRIX_PRIORITY_ROW_CHUNK,
+    pair_chunk: int = _IMATRIX_PRIORITY_PAIR_CHUNK,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Jointly refine the final codes of the highest-mass imatrix groups."""
+
+    values = groups.to(torch.float32)
+    objective_weight = weights.to(torch.float32)
+    levels = q.to(torch.int32).clone()
+    scale_levels = sub_scale.to(torch.int32).clone()
+    min_levels = sub_min.to(torch.int32).clone()
+    row_scale = neuron_scale.to(torch.float32)
+    row_min = neuron_min.to(torch.float32)
+    rows, group_count, group_size = values.shape
+    selected_count = min(max(0, int(priority_groups)), group_count)
+    if selected_count == 0 or radius < 0:
+        return levels, scale_levels, min_levels
+
+    offsets = torch.arange(
+        -radius,
+        radius + 1,
+        device=values.device,
+        dtype=torch.int32,
+    )
+    scale_offsets = offsets[:, None].expand(-1, offsets.numel()).reshape(-1)
+    min_offsets = offsets[None, :].expand(offsets.numel(), -1).reshape(-1)
+    row_chunk = max(1, int(row_chunk))
+    pair_chunk = max(1, int(pair_chunk))
+
+    for row_begin in range(0, rows, row_chunk):
+        row_end = min(row_begin + row_chunk, rows)
+        chunk_values = values[row_begin:row_end]
+        chunk_weights = objective_weight[row_begin:row_end]
+        group_mass = chunk_weights.sum(dim=-1)
+        selected = torch.topk(
+            group_mass, selected_count, dim=-1
+        ).indices
+        local_rows = torch.arange(
+            row_end - row_begin, device=values.device
+        )[:, None].expand_as(selected)
+        global_rows = local_rows + row_begin
+        flat_values = chunk_values[local_rows, selected].reshape(
+            -1, group_size
+        )
+        flat_weights = chunk_weights[local_rows, selected].reshape(
+            -1, group_size
+        )
+        flat_rows = global_rows.reshape(-1)
+        flat_q = levels[global_rows, selected].reshape(
+            -1, group_size
+        ).clone()
+        flat_scale_levels = scale_levels[global_rows, selected].reshape(
+            -1
+        ).clone()
+        flat_min_levels = min_levels[global_rows, selected].reshape(
+            -1
+        ).clone()
+        base_scale_levels = flat_scale_levels.clone()
+        base_min_levels = flat_min_levels.clone()
+        flat_row_scale = row_scale[flat_rows]
+        flat_row_min = row_min[flat_rows]
+        effective_scale = (
+            flat_row_scale * flat_scale_levels.to(torch.float32)
+        )
+        effective_min = flat_row_min * flat_min_levels.to(torch.float32)
+        reconstruction = (
+            effective_scale[:, None] * flat_q.to(torch.float32)
+            - effective_min[:, None]
+        )
+        best_error = (
+            flat_weights * (reconstruction - flat_values).square()
+        ).sum(dim=-1)
+
+        for pair_begin in range(0, scale_offsets.numel(), pair_chunk):
+            pair_end = min(
+                pair_begin + pair_chunk, scale_offsets.numel()
+            )
+            candidate_scale_levels = torch.clamp(
+                base_scale_levels[:, None]
+                + scale_offsets[None, pair_begin:pair_end],
+                0,
+                sub_nmax,
+            )
+            candidate_min_levels = torch.clamp(
+                base_min_levels[:, None]
+                + min_offsets[None, pair_begin:pair_end],
+                0,
+                sub_nmax,
+            )
+            candidate_scale = (
+                flat_row_scale[:, None]
+                * candidate_scale_levels.to(torch.float32)
+            )
+            candidate_min = (
+                flat_row_min[:, None]
+                * candidate_min_levels.to(torch.float32)
+            )
+            safe_scale = torch.where(
+                candidate_scale > 0.0,
+                candidate_scale,
+                torch.ones_like(candidate_scale),
+            )
+            candidate_q = torch.clamp(
+                torch.round(
+                    (flat_values[:, None, :] + candidate_min[:, :, None])
+                    / safe_scale[:, :, None]
+                ),
+                0,
+                nmax,
+            ).to(torch.int32)
+            candidate_q = torch.where(
+                (candidate_scale > 0.0)[:, :, None],
+                candidate_q,
+                torch.zeros_like(candidate_q),
+            )
+            candidate_reconstruction = (
+                candidate_scale[:, :, None]
+                * candidate_q.to(torch.float32)
+                - candidate_min[:, :, None]
+            )
+            candidate_error = (
+                flat_weights[:, None, :]
+                * (candidate_reconstruction - flat_values[:, None, :])
+                .square()
+            ).sum(dim=-1)
+            chunk_error, chunk_index = candidate_error.min(dim=1)
+            improve = chunk_error < best_error
+            gather_rows = torch.arange(
+                candidate_q.shape[0], device=values.device
+            )
+            chosen_q = candidate_q[gather_rows, chunk_index]
+            chosen_scale_levels = candidate_scale_levels[
+                gather_rows, chunk_index
+            ]
+            chosen_min_levels = candidate_min_levels[
+                gather_rows, chunk_index
+            ]
+            best_error = torch.where(improve, chunk_error, best_error)
+            flat_q = torch.where(improve[:, None], chosen_q, flat_q)
+            flat_scale_levels = torch.where(
+                improve, chosen_scale_levels, flat_scale_levels
+            )
+            flat_min_levels = torch.where(
+                improve, chosen_min_levels, flat_min_levels
+            )
+
+        levels[global_rows, selected] = flat_q.reshape(
+            row_end - row_begin, selected_count, group_size
+        )
+        scale_levels[global_rows, selected] = flat_scale_levels.reshape(
+            row_end - row_begin, selected_count
+        )
+        min_levels[global_rows, selected] = flat_min_levels.reshape(
+            row_end - row_begin, selected_count
+        )
+
+    return levels, scale_levels, min_levels
+
+
 def quantize_axis0(
     weight: torch.Tensor,
     spec: NintSpec,
     device: str | torch.device = "cuda",
     importance: np.ndarray | torch.Tensor | None = None,
     use_cuda_imatrix_kernels: bool = True,
+    use_priority_group_refinement: bool = True,
 ) -> NintTensor:
     """Quantize a 2D ``[out, in]`` tensor with axis=0 on GPU."""
 
@@ -763,7 +940,59 @@ def quantize_axis0(
                 sub_nmax=K,
             )
         )
-
+        if use_priority_group_refinement:
+            base_q = q.clone()
+            base_sub_scale = sub_scale.clone()
+            base_sub_min = sub_min.clone()
+            candidate_q, candidate_sub_scale, candidate_sub_min = (
+                _refine_imatrix_priority_groups_torch(
+                    grps,
+                    ww,
+                    q,
+                    neu_d,
+                    neu_dm,
+                    sub_scale,
+                    sub_min,
+                    nmax=nmax,
+                    sub_nmax=K,
+                )
+            )
+            base_reconstruction = (
+                neu_d[:, None, None]
+                * base_sub_scale[:, :, None].to(torch.float32)
+                * base_q.to(torch.float32)
+                - neu_dm[:, None, None]
+                * base_sub_min[:, :, None].to(torch.float32)
+            )
+            candidate_reconstruction = (
+                neu_d[:, None, None]
+                * candidate_sub_scale[:, :, None].to(torch.float32)
+                * candidate_q.to(torch.float32)
+                - neu_dm[:, None, None]
+                * candidate_sub_min[:, :, None].to(torch.float32)
+            )
+            base_error = (
+                ww * (base_reconstruction - grps).square()
+            ).sum(dim=(1, 2))
+            candidate_error = (
+                ww * (candidate_reconstruction - grps).square()
+            ).sum(dim=(1, 2))
+            accept = candidate_error <= base_error * (1.0 + 1.0e-7)
+            q = torch.where(
+                accept[:, None, None],
+                candidate_q,
+                base_q.to(candidate_q.dtype),
+            )
+            sub_scale = torch.where(
+                accept[:, None],
+                candidate_sub_scale,
+                base_sub_scale.to(candidate_sub_scale.dtype),
+            )
+            sub_min = torch.where(
+                accept[:, None],
+                candidate_sub_min,
+                base_sub_min.to(candidate_sub_min.dtype),
+            )
     sub_dtype = _uint_dtype(K)
     q_dtype = _uint_dtype(nmax)
     return NintTensor(

@@ -136,6 +136,45 @@ def test_nint_imatrix_fused_cuda_matches_torch_objective(spec: NintSpec):
     assert int(fused.sub_min.max(initial=0)) <= (1 << spec.sub_bits) - 1
 
 
+def test_nint_priority_group_refinement_improves_spiky_objective():
+    rng = np.random.default_rng(20260803)
+    weight = rng.normal(0, 0.06, size=(17, 768)).astype(np.float32)
+    importance = np.full(weight.shape[1], 0.01, dtype=np.float32)
+    importance[[7, 89, 377, 701]] = np.asarray(
+        [1.0e6, 2.0e5, 8.0e4, 3.0e4], dtype=np.float32
+    )
+    spec = NintSpec(4, 24, 6)
+    local_only = quantize_gpu(
+        torch.from_numpy(weight),
+        spec,
+        device="cuda",
+        importance=importance,
+        use_priority_group_refinement=False,
+    )
+    priority = quantize_gpu(
+        torch.from_numpy(weight),
+        spec,
+        device="cuda",
+        importance=importance,
+        use_priority_group_refinement=True,
+    )
+    weight_cuda = torch.from_numpy(weight).to("cuda")
+    importance_rows = _importance_as_rows(
+        importance, weight.shape[0], weight.shape[1], "cuda"
+    )
+    objective_weight = _imatrix_element_weights(
+        weight_cuda, importance_rows, weight.shape[1]
+    ).cpu().numpy()
+    local_error = float(
+        np.sum(objective_weight * (dequantize(local_only) - weight) ** 2)
+    )
+    priority_error = float(
+        np.sum(objective_weight * (dequantize(priority) - weight) ** 2)
+    )
+
+    assert priority_error <= local_error * (1.0 + 1e-7)
+
+
 def test_nint_qkx3_fused_cuda_matches_halfway_rounding_objective():
     torch.manual_seed(7)
     values = torch.randn(
