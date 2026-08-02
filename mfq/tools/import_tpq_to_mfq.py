@@ -33,6 +33,7 @@ from mfq.formats.io import (
     _NINT_MOE_POOL_V2_HDR,
     _u32,
 )
+from mfq.formats.mx import MXFP8_DTYPE, mx_header_bytes
 
 _TIER_ORDER = ("vv", "v", "w", "x")
 _DROP_TIER = "drop"
@@ -115,7 +116,10 @@ def _manifest_sha256(root: Path) -> str:
 
 def _projection_metadata(
     manifest: dict,
-) -> tuple[dict[int, dict[str, str]], dict[str, dict]] | None:
+) -> tuple[
+    dict[int, dict[str, str | tuple[str, ...]]],
+    dict[str, dict],
+] | None:
     quant = manifest["quant"]
     if quant.get("method") != "projection-vq":
         return None
@@ -132,17 +136,52 @@ def _projection_metadata(
         }
         specs = quant.get("projection_layouts") or {}
     else:
-        assignments = {
-            int(layer): {
-                str(projection): str(layout)
-                for projection, layout in value.items()
+        raw_assignments = quant.get("projection_layouts") or {}
+        if raw_assignments:
+            assignments = {
+                int(layer): {
+                    str(projection): str(layout)
+                    for projection, layout in value.items()
+                }
+                for layer, value in raw_assignments.items()
             }
-            for layer, value in (quant.get("projection_layouts") or {}).items()
-        }
+        else:
+            heterogeneous = quant.get("heterogeneous_expert_tiering") or {}
+            precision_levels = heterogeneous.get("precision_levels") or {}
+            layer_levels = heterogeneous.get("layer_expert_levels") or {}
+            n_experts = int(manifest["config"]["n_experts"])
+            assignments = {}
+            for raw_layer, raw_levels in layer_levels.items():
+                levels = tuple(str(value) for value in raw_levels)
+                if len(levels) != n_experts:
+                    raise ValueError(
+                        f"TPQ projection layout L{raw_layer} has "
+                        f"{len(levels)} expert levels, expected {n_experts}"
+                    )
+                unknown_levels = sorted(set(levels).difference(precision_levels))
+                if unknown_levels:
+                    raise ValueError(
+                        f"TPQ projection layout L{raw_layer} uses unknown "
+                        f"precision levels: {unknown_levels[:8]}"
+                    )
+                assignments[int(raw_layer)] = {
+                    projection: tuple(
+                        str(precision_levels[level][projection])
+                        for level in levels
+                    )
+                    for projection in ("gate", "up", "down")
+                }
         specs = quant.get("layouts") or {}
     if not assignments or not specs:
         raise ValueError("TPQ projection-VQ manifest lacks layouts")
     required = {"gate", "up", "down"}
+    n_experts = int(manifest["config"]["n_experts"])
+    expected_layers = {int(layer) for layer in manifest["expert_files"]}
+    if set(assignments) != expected_layers:
+        raise ValueError(
+            "TPQ projection layout layers differ from expert shards: "
+            f"{sorted(assignments)} != {sorted(expected_layers)}"
+        )
     for layer, value in assignments.items():
         if set(value) != required:
             raise ValueError(
@@ -151,7 +190,18 @@ def _projection_metadata(
         missing = required.difference(value)
         if missing:
             raise ValueError(f"TPQ projection layout L{layer} lacks {missing}")
-        unknown = sorted(set(value.values()).difference(specs))
+        used_layouts: set[str] = set()
+        for projection, layout in value.items():
+            if isinstance(layout, str):
+                used_layouts.add(layout)
+                continue
+            if len(layout) != n_experts:
+                raise ValueError(
+                    f"TPQ projection layout L{layer}/{projection} has "
+                    f"{len(layout)} experts, expected {n_experts}"
+                )
+            used_layouts.update(layout)
+        unknown = sorted(used_layouts.difference(specs))
         if unknown:
             raise ValueError(f"TPQ projection layout L{layer} is unknown: {unknown}")
     return assignments, {str(name): dict(value) for name, value in specs.items()}
@@ -216,6 +266,25 @@ def _stream_slice(
         output.write(np.ascontiguousarray(value).tobytes())
 
 
+def _stream_byte_slice(
+    handle,
+    name: str,
+    output: BinaryIO,
+    *,
+    row_chunk: int,
+) -> None:
+    source = handle.get_slice(name)
+    shape = tuple(int(value) for value in source.get_shape())
+    if not shape:
+        value = source[:].detach().cpu().contiguous().view(torch.uint8)
+        output.write(value.numpy().tobytes())
+        return
+    for start in range(0, shape[0], row_chunk):
+        end = min(start + row_chunk, shape[0])
+        value = source[start:end].detach().cpu().contiguous().view(torch.uint8)
+        output.write(value.numpy().tobytes())
+
+
 def _dense_target_dtype(source_dtype: str) -> tuple[str, np.dtype]:
     mapping = {
         "BF16": ("F16", np.dtype("<f2")),
@@ -241,10 +310,81 @@ def _dense_file_records(
     records: list[_StreamRecord] = []
     with safe_open(str(dense_path), framework="pt", device="cpu") as handle:
         keys = set(handle.keys())
+        mx_pairs: dict[str, str] = {}
+        consumed_scales: set[str] = set()
         for name in sorted(keys):
+            if _slice_dtype(handle, name) not in {"F8_E4M3", "F8_E4M3FN"}:
+                continue
+            if not name.endswith(".weight"):
+                raise ValueError(f"TPQ MXFP8 tensor is not named *.weight: {name}")
+            scale_name = name.removesuffix(".weight") + ".scale"
+            if scale_name not in keys:
+                raise ValueError(f"TPQ MXFP8 tensor has no E8M0 scale: {name}")
+            if _slice_dtype(handle, scale_name) != "F8_E8M0":
+                raise ValueError(
+                    f"TPQ MXFP8 scale {scale_name} is not F8_E8M0"
+                )
+            mx_header_bytes(
+                MXFP8_DTYPE,
+                _slice_shape(handle, name),
+                _slice_shape(handle, name),
+                _slice_shape(handle, scale_name),
+            )
+            mx_pairs[name] = scale_name
+            consumed_scales.add(scale_name)
+        for name in sorted(keys):
+            if name in consumed_scales:
+                continue
             if name.endswith(".qs"):
                 continue
             shape = _slice_shape(handle, name)
+            if name in mx_pairs:
+                scale_name = mx_pairs[name]
+                scale_shape = _slice_shape(handle, scale_name)
+                prefix = mx_header_bytes(
+                    MXFP8_DTYPE,
+                    shape,
+                    shape,
+                    scale_shape,
+                )
+                nbytes = (
+                    len(prefix)
+                    + int(np.prod(shape, dtype=np.int64))
+                    + int(np.prod(scale_shape, dtype=np.int64))
+                )
+
+                def write_mxfp8(
+                    output: BinaryIO,
+                    *,
+                    _path=dense_path,
+                    _name=name,
+                    _scale_name=scale_name,
+                    _prefix=prefix,
+                    _chunk=row_chunk,
+                ) -> None:
+                    with safe_open(
+                        str(_path), framework="pt", device="cpu"
+                    ) as source:
+                        output.write(_prefix)
+                        _stream_byte_slice(
+                            source,
+                            _name,
+                            output,
+                            row_chunk=_chunk,
+                        )
+                        _stream_byte_slice(
+                            source,
+                            _scale_name,
+                            output,
+                            row_chunk=_chunk,
+                        )
+
+                records.append(
+                    _StreamRecord(name, MXFP8_DTYPE, nbytes, write_mxfp8)
+                )
+                continue
+            if _slice_dtype(handle, name) == "F8_E8M0":
+                raise ValueError(f"orphan TPQ E8M0 scale tensor: {name}")
             scale_name = name + ".qs"
             if scale_name in keys:
                 packed_shape = shape
@@ -687,21 +827,34 @@ def _projection_pools(
     layer: int,
     projection: str,
     n_experts: int,
-    assignments: dict[int, dict[str, str]],
+    assignments: dict[int, dict[str, str | tuple[str, ...]]],
     layouts: dict[str, dict],
 ) -> tuple[tuple[CccpPqSpec, str, tuple[int, ...]], ...]:
-    layout = assignments[layer][projection]
-    raw_spec = layouts[layout]
-    spec = _projection_spec(manifest, layout, raw_spec)
-    grouped: dict[str, list[int]] = {}
-    for expert in range(n_experts):
+    assignment = assignments[layer][projection]
+    per_expert = (
+        (assignment,) * n_experts
+        if isinstance(assignment, str)
+        else assignment
+    )
+    if len(per_expert) != n_experts:
+        raise ValueError(
+            f"TPQ projection layout L{layer}/{projection} has "
+            f"{len(per_expert)} experts, expected {n_experts}"
+        )
+    grouped: dict[tuple[str, str], list[int]] = {}
+    for expert, layout in enumerate(per_expert):
+        raw_spec = layouts[layout]
         key = _projection_codebook_key(
             projection, layout, raw_spec, expert
         )
-        grouped.setdefault(key, []).append(expert)
+        grouped.setdefault((layout, key), []).append(expert)
     return tuple(
-        (spec, key, tuple(experts))
-        for key, experts in grouped.items()
+        (
+            _projection_spec(manifest, layout, layouts[layout]),
+            key,
+            tuple(experts),
+        )
+        for (layout, key), experts in grouped.items()
     )
 
 
@@ -736,7 +889,7 @@ def _write_projection_vq_record(
     *,
     shard: Path,
     projection: str,
-    layout: str,
+    layouts: tuple[str, ...],
     n_experts: int,
     rows_per_expert: int,
     columns: int,
@@ -781,10 +934,11 @@ def _write_projection_vq_record(
             expected_bits = rows_per_expert * blocks * spec.index_bits
             if expected_bits % 8:
                 raise ValueError(
-                    f"TPQ {projection}/{layout} expert payload is not byte aligned"
+                    f"TPQ {projection} expert payload is not byte aligned"
                 )
             expected_nbytes = expected_bits // 8
             for expert in expert_ids:
+                layout = layouts[int(expert)]
                 key = f"e{expert}.{projection}.{layout}"
                 if key not in keys:
                     raise KeyError(f"TPQ expert tensor is absent: {key}")
@@ -823,6 +977,16 @@ def _projection_expert_records(
         for projection in ("gate", "up", "down"):
             rows, columns = shapes[projection]
             layout = layout_by_projection[projection]
+            expert_layouts = (
+                (layout,) * n_experts
+                if isinstance(layout, str)
+                else tuple(str(value) for value in layout)
+            )
+            if len(expert_layouts) != n_experts:
+                raise ValueError(
+                    f"TPQ projection layout L{layer}/{projection} has "
+                    f"{len(expert_layouts)} experts, expected {n_experts}"
+                )
             pools = _projection_pools(
                 manifest,
                 layer=layer,
@@ -843,7 +1007,7 @@ def _projection_expert_records(
                 *,
                 _shard=shard,
                 _projection=projection,
-                _layout=layout,
+                _layouts=expert_layouts,
                 _n_experts=n_experts,
                 _rows=rows,
                 _columns=columns,
@@ -853,7 +1017,7 @@ def _projection_expert_records(
                     output,
                     shard=_shard,
                     projection=_projection,
-                    layout=_layout,
+                    layouts=_layouts,
                     n_experts=_n_experts,
                     rows_per_expert=_rows,
                     columns=_columns,

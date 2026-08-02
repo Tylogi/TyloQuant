@@ -314,6 +314,8 @@ def _patch_full_gpu_residency(store) -> None:
             )
         for name in self.store.dense_names():
             self.w(name)
+        self._prepare_tp_shared_mlp()
+        self._prepare_tp_decode_metadata()
         self.store.drop_dense_file_cache()
         import torch
 
@@ -333,10 +335,17 @@ def _patch_full_gpu_residency(store) -> None:
             )
             print(f"[tpq] grouped GEMM: {path}", flush=True)
 
-        self.pool.build_gpu_arenas()
-        if self.pool.preload_gpu_all():
+        if getattr(self, "_packed_full_gpu", False):
+            self.pool.preload()
             self._prefetch_auto = False
             return
+
+        preload_gpu_all = getattr(self.pool, "preload_gpu_all", None)
+        if preload_gpu_all is not None:
+            self.pool.build_gpu_arenas()
+            if preload_gpu_all():
+                self._prefetch_auto = False
+                return
 
         resident_all = self.pool.preload_all()
         self._prefetch_auto = not resident_all
@@ -344,6 +353,8 @@ def _patch_full_gpu_residency(store) -> None:
             self.pool.pin_host_resident()
         else:
             self.pool.preload_pinned()
+        if preload_gpu_all is None:
+            self.pool.build_gpu_arenas()
 
     preload._mfq_gpu_streaming = True
     dsv4model.DSV4TPQModel.preload = preload

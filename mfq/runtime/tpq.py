@@ -394,8 +394,6 @@ def load_cccp_model(
         artifact.path if hasattr(artifact, "path") else artifact.root
     )
     if artifact.architecture == "deepseek_v4":
-        if tp_size != 1:
-            raise ValueError("DeepSeek-V4 CCCP currently requires tp_size=1")
         from tpq.dsv4model import DSV4TPQModel
 
         runtime = DSV4TPQModel(
@@ -404,6 +402,7 @@ def load_cccp_model(
             max_ctx=max_ctx,
             device=device,
             vram_cache_gb=vram_gb,
+            tp_size=tp_size,
         )
     elif artifact.architecture == "kimi_k3":
         if hasattr(artifact, "path"):
@@ -511,8 +510,6 @@ def run_cccp_chat(
         vram_cache_gb: float,
         tp_size: int = 1,
     ):
-        if tp_size != 1:
-            raise ValueError("native DeepSeek-V4 CCCP requires --tp 1")
         from tpq.dsv4model import DSV4TPQModel
 
         return (
@@ -522,6 +519,7 @@ def run_cccp_chat(
                 max_ctx=max_ctx,
                 device=device,
                 vram_cache_gb=vram_cache_gb,
+                tp_size=tp_size,
             ),
             "dsv4",
         )

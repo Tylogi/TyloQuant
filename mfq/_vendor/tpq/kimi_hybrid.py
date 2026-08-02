@@ -726,15 +726,19 @@ class PackedHybridPool:
             reserve_gb = float(
                 os.environ.get("TPQ_RESIDENT_RESERVE_GB", "3.0")
             )
-        expert_files = [
-            os.path.join(self.store.root, filename)
-            for filename in self.store.man.expert_files.values()
-        ]
-        stored_bytes = sum(
-            os.path.getsize(path)
-            for path in expert_files
-            if os.path.exists(path)
-        )
+        native_expert_bytes = getattr(self.store, "expert_bytes", None)
+        if native_expert_bytes is None:
+            expert_files = [
+                os.path.join(self.store.root, filename)
+                for filename in self.store.man.expert_files.values()
+            ]
+            stored_bytes = sum(
+                os.path.getsize(path)
+                for path in expert_files
+                if os.path.exists(path)
+            )
+        else:
+            stored_bytes = int(native_expert_bytes)
         available = psutil.virtual_memory().available
         if stored_bytes + int(reserve_gb * 2**30) > available:
             print(
@@ -804,7 +808,9 @@ class PackedHybridPool:
                         flush=True,
                     )
         # 所有运行时专家都只引用 BF16 码本；释放 store 的 FP32 中间副本。
-        self.store._cb_cache.clear()
+        codebook_cache = getattr(self.store, "_cb_cache", None)
+        if codebook_cache is not None:
+            codebook_cache.clear()
         gc.collect()
         self.ram_bytes = self.host_expert_bytes
         print(
