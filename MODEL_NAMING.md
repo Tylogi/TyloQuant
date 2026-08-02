@@ -34,7 +34,7 @@ Qwen3.5-9B-P1-L.mfq
 - `Grade` 是 MFQ 发布档位，例如 `XXS`、`M`、`L`。
 - `IQ` 对标档沿用可辨识的 grade：`IQ3_XXS` 对应 `V3-XXS`。
 - `Q_K` 对标档使用已注册的 MFQ grade；当前 `Q*_K_XL` 对标模型均为 `S*-L`。
-- 新增档位必须先加入 `mfq/model_naming.py` 的注册表，不能依据 UD 文件名临时拼接。
+- 新增档位必须先加入 `mfq/model_naming.py` 的注册表
 
 ## 当前注册表
 
