@@ -87,11 +87,13 @@ public:
     }
 
 private:
-    MlxDeepseekV4HcPreResult hc_pre(
+    MlxDeepseekV4HcPreResult hc_pre_norm(
         const mlx::core::array& residual,
         const MlxLinear& function,
         const mlx::core::array& scale,
-        const mlx::core::array& base) const;
+        const mlx::core::array& base,
+        const mlx::core::array& norm,
+        const MlxRmsNorm& normalizer) const;
 
     mlx::core::array hc_post(
         const mlx::core::array& branch,

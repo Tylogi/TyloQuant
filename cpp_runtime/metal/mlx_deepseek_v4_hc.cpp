@@ -34,16 +34,53 @@ constexpr const char* kHcPreSource = R"METAL(
         return;
     }
     threadgroup float pre[CONNECTIONS];
+    threadgroup float reductions[8];
+    threadgroup float mix_inverse_shared;
+
+    if (SCALE_MIXES != 0) {
+        float square_sum = 0.0f;
+        constexpr uint HC_WIDTH = CONNECTIONS * uint(HIDDEN);
+        uint residual_base = row * HC_WIDTH;
+        for (uint index = local_thread;
+             index < HC_WIDTH;
+             index += 256u) {
+            float value = float(residual[residual_base + index]);
+            square_sum += value * value;
+        }
+        float subtotal = simd_sum(square_sum);
+        if (lane == 0u) {
+            reductions[simd_group] = subtotal;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (local_thread == 0u) {
+            float total = 0.0f;
+            for (uint group = 0u; group < 8u; ++group) {
+                total += reductions[group];
+            }
+            mix_inverse_shared = rsqrt(
+                total / float(HC_WIDTH) + params[2]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else if (local_thread == 0u) {
+        mix_inverse_shared = 1.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mix_inverse = mix_inverse_shared;
 
     if (simd_group == 0u) {
         uint mix_base = row * MIX_WIDTH;
         float active = lane < CONNECTIONS ? 1.0f : 0.0f;
         uint connection = min(lane, CONNECTIONS - 1u);
+        float pre_mix =
+            mixes[mix_base + connection] * mix_inverse;
+        float post_mix =
+            mixes[mix_base + CONNECTIONS + connection]
+            * mix_inverse;
         float pre_affine =
-            mixes[mix_base + connection] * scale[0]
+            pre_mix * scale[0]
             + base[connection];
         float post_affine =
-            mixes[mix_base + CONNECTIONS + connection] * scale[1]
+            post_mix * scale[1]
             + base[CONNECTIONS + connection];
         float pre_value =
             1.0f / (1.0f + metal::fast::exp(-pre_affine)) + params[0];
@@ -54,11 +91,13 @@ constexpr const char* kHcPreSource = R"METAL(
             post[row * CONNECTIONS + lane] = post_value;
         }
 
-        float4 values =
-            (*(const device float4*)(
+        float4 normalized_values =
+            *(const device float4*)(
                 mixes + mix_base + 2u * CONNECTIONS
                     + connection * CONNECTIONS
-            ) * scale[2]
+            ) * mix_inverse;
+        float4 values =
+            (normalized_values * scale[2]
             + *(const device float4*)(
                 base + 2u * CONNECTIONS
                     + connection * CONNECTIONS
@@ -108,6 +147,7 @@ constexpr const char* kHcPreSource = R"METAL(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    threadgroup half collapsed[HIDDEN];
     constexpr uint HIDDEN4 = uint(HIDDEN) / 4u;
     const device half4* x0 = (const device half4*)(
         residual + (row * CONNECTIONS + 0u) * uint(HIDDEN)
@@ -123,6 +163,9 @@ constexpr const char* kHcPreSource = R"METAL(
     );
     device half4* reduced4 =
         (device half4*)(reduced + row * uint(HIDDEN));
+    threadgroup half4* collapsed4 =
+        (threadgroup half4*)collapsed;
+    float square_sum = 0.0f;
     for (
         uint feature4 = local_thread;
         feature4 < HIDDEN4;
@@ -138,7 +181,44 @@ constexpr const char* kHcPreSource = R"METAL(
                 )
             )
         );
-        reduced4[feature4] = half4(value);
+        half4 rounded = half4(value);
+        if (NORMALIZE != 0) {
+            collapsed4[feature4] = rounded;
+            float4 rounded_float = float4(rounded);
+            square_sum += dot(rounded_float, rounded_float);
+        } else {
+            reduced4[feature4] = rounded;
+        }
+    }
+
+    if (NORMALIZE != 0) {
+        float subtotal = simd_sum(square_sum);
+        if (lane == 0u) {
+            reductions[simd_group] = subtotal;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (local_thread == 0u) {
+            float total = 0.0f;
+            for (uint group = 0u; group < 8u; ++group) {
+                total += reductions[group];
+            }
+            reductions[0] = rsqrt(
+                total / float(HIDDEN) + params[1]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float inverse_rms = reductions[0];
+        const device float4* norm4 =
+            (const device float4*)norm;
+        for (
+            uint feature4 = local_thread;
+            feature4 < HIDDEN4;
+            feature4 += 256u
+        ) {
+            reduced4[feature4] = half4(
+                float4(collapsed4[feature4])
+                * inverse_rms
+                * norm4[feature4]);
+        }
     }
 )METAL";
 
@@ -185,7 +265,7 @@ mlx::core::fast::CustomKernelFunction make_kernel(
 const mlx::core::fast::CustomKernelFunction& hc_pre_kernel() {
     static const auto kernel = make_kernel(
         "mfq_cpp_dsv4_hc_pre",
-        {"residual", "mixes", "scale", "base", "params"},
+        {"residual", "mixes", "scale", "base", "norm", "params"},
         {"reduced", "post", "combination"},
         kHcPreSource);
     return kernel;
@@ -267,12 +347,13 @@ MlxDeepseekV4HcPreResult deepseek_v4_hc_pre(
     const int rows = checked_int(
         static_cast<std::size_t>(batch) * tokens,
         "row count");
-    const array params({eps}, mlx::core::float32);
+    const array params({eps, eps, eps}, mlx::core::float32);
     auto outputs = hc_pre_kernel()(
         {
             residual_values,
             mix_values,
             scale_values,
+            base_values,
             base_values,
             params,
         },
@@ -296,6 +377,103 @@ MlxDeepseekV4HcPreResult deepseek_v4_hc_pre(
         {
             {"ROWS", rows},
             {"HIDDEN", hidden},
+            {"NORMALIZE", 0},
+            {"SCALE_MIXES", 0},
+        },
+        std::nullopt,
+        false,
+        {});
+    return {
+        std::move(outputs.at(0)),
+        std::move(outputs.at(1)),
+        std::move(outputs.at(2)),
+    };
+}
+
+MlxDeepseekV4HcPreResult deepseek_v4_hc_pre_norm(
+    const array& residual,
+    const array& mixes,
+    const array& scale,
+    const array& base,
+    const array& norm,
+    int sinkhorn_iterations,
+    float hc_eps,
+    float norm_eps,
+    bool normalize_mixes_from_residual) {
+    auto residual_values = float16_contiguous(residual);
+    auto mix_values = float32_contiguous(mixes);
+    auto scale_values = float32_contiguous(scale);
+    auto base_values = float32_contiguous(base);
+    auto norm_values = float32_contiguous(norm);
+    if (residual_values.ndim() != 4 ||
+        residual_values.shape(2) != kConnections ||
+        residual_values.shape(3) <= 0 ||
+        residual_values.shape(3) % 4 != 0) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 fused HC/Norm residual must have "
+            "[batch,tokens,4,hidden] shape with hidden divisible by four");
+    }
+    const int batch = residual_values.shape(0);
+    const int tokens = residual_values.shape(1);
+    const int hidden = residual_values.shape(3);
+    if (batch <= 0 || tokens <= 0 ||
+        mix_values.shape() != Shape{batch, tokens, kMixWidth} ||
+        scale_values.size() != 3 ||
+        base_values.size() != kMixWidth ||
+        norm_values.shape() != Shape{hidden} ||
+        sinkhorn_iterations != kSinkhornIterations ||
+        !std::isfinite(hc_eps) || hc_eps <= 0.0f ||
+        !std::isfinite(norm_eps) || norm_eps <= 0.0f) {
+        throw std::invalid_argument(
+            "invalid DeepSeek-V4 fused HC/Norm input");
+    }
+    scale_values = mlx::core::reshape(scale_values, Shape{3});
+    base_values = mlx::core::reshape(
+        base_values,
+        Shape{kMixWidth});
+    norm_values = mlx::core::reshape(
+        norm_values,
+        Shape{hidden});
+    const int rows = checked_int(
+        static_cast<std::size_t>(batch) * tokens,
+        "row count");
+    const array params(
+        {hc_eps, norm_eps, norm_eps},
+        mlx::core::float32);
+    auto outputs = hc_pre_kernel()(
+        {
+            residual_values,
+            mix_values,
+            scale_values,
+            base_values,
+            norm_values,
+            params,
+        },
+        {
+            Shape{batch, tokens, hidden},
+            Shape{batch, tokens, kConnections},
+            Shape{
+                batch,
+                tokens,
+                kConnections,
+                kConnections,
+            },
+        },
+        {
+            mlx::core::float16,
+            mlx::core::float32,
+            mlx::core::float32,
+        },
+        {rows * kThreads, 1, 1},
+        {kThreads, 1, 1},
+        {
+            {"ROWS", rows},
+            {"HIDDEN", hidden},
+            {"NORMALIZE", 1},
+            {
+                "SCALE_MIXES",
+                normalize_mixes_from_residual ? 1 : 0,
+            },
         },
         std::nullopt,
         false,

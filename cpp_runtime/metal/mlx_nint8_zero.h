@@ -24,6 +24,16 @@ public:
     mlx::core::array grouped_row_matmul(
         const mlx::core::array& input,
         int group_count) const;
+    // DeepSeek-V4 decode specialization. The attention output is still in
+    // RoPE space; apply the inverse adjacent-pair RoPE while consuming the
+    // grouped input so no standalone de-rotation tensor is materialized.
+    mlx::core::array grouped_row_matmul_inverse_rope(
+        const mlx::core::array& input,
+        int group_count,
+        const mlx::core::array& cosine,
+        const mlx::core::array& sine,
+        int head_dimension,
+        int rotary_dimension) const;
     mlx::core::array embedding(
         const mlx::core::array& token_ids,
         mlx::core::Dtype dtype = mlx::core::float16) const;

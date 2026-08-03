@@ -588,6 +588,18 @@ void test_pool_and_ratio_schedule() {
     const auto norm = mlx::core::ones(
         Shape{128},
         mlx::core::float32);
+    const auto pool_cosine = mlx::core::contiguous(
+        mlx::core::slice(
+            tables.first,
+            Shape{0, 0},
+            tables.first.shape(),
+            Shape{4, 1}));
+    const auto pool_sine = mlx::core::contiguous(
+        mlx::core::slice(
+            tables.second,
+            Shape{0, 0},
+            tables.second.shape(),
+            Shape{4, 1}));
     for (int length = 1; length <= 4; ++length) {
         pool.update(
             token,
@@ -595,8 +607,8 @@ void test_pool_and_ratio_schedule() {
             ape,
             norm,
             length,
-            tables.first,
-            tables.second,
+            pool_cosine,
+            pool_sine,
             0,
             1e-6f);
     }
@@ -613,8 +625,8 @@ void test_pool_and_ratio_schedule() {
                 ape,
                 norm,
                 6,
-                tables.first,
-                tables.second,
+                pool_cosine,
+                pool_sine,
                 0,
                 1e-6f);
         },

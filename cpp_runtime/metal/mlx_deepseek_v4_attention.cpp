@@ -713,8 +713,15 @@ public:
 
     std::vector<array> operator()(
         const array& input) const {
+        const std::size_t rows =
+            input.ndim() == 0 || input.shape(-1) <= 0
+            ? 0
+            : input.size() /
+                static_cast<std::size_t>(input.shape(-1));
         if (grouped_.has_value() &&
-            grouped_->supports(input)) {
+            grouped_->supports(input) &&
+            (rows > 1 ||
+             grouped_->has_single_row_nint_fast_path())) {
             return (*grouped_)(input);
         }
         std::vector<array> result;
@@ -1018,25 +1025,15 @@ void MlxDeepseekV4PoolState::update(
             "DeepSeek-V4 compressor update is not contiguous "
             "or exceeds capacity");
     }
+    const int required_rows =
+        (length + ratio_ - 1) / ratio_;
     if (cosine.ndim() != 2 ||
         sine.shape() != cosine.shape() ||
-        cosine.shape(0) < length ||
+        cosine.shape(0) < required_rows ||
         cosine.shape(1) < 32) {
         throw std::invalid_argument(
             "DeepSeek-V4 compressor rotary table is too short");
     }
-    auto downsampled_cosine = mlx::core::contiguous(
-        mlx::core::slice(
-            cosine,
-            Shape{0, 0},
-            cosine.shape(),
-            Shape{ratio_, 1}));
-    auto downsampled_sine = mlx::core::contiguous(
-        mlx::core::slice(
-            sine,
-            Shape{0, 0},
-            sine.shape(),
-            Shape{ratio_, 1}));
     auto step = dsv4_decode_pool_step(
         kv_token,
         gate_token,
@@ -1050,8 +1047,8 @@ void MlxDeepseekV4PoolState::update(
             Shape{batch_},
             length,
             mlx::core::int32),
-        downsampled_cosine,
-        downsampled_sine,
+        cosine,
+        sine,
         ratio_,
         overlap_,
         quant_mode,
@@ -1174,6 +1171,7 @@ struct MlxDeepseekV4Attention::Impl {
     int maximum_context;
     MlxDeepseekV4AttentionComponents components;
     std::pair<array, array> rope;
+    std::optional<std::pair<array, array>> pool_rope;
     array rms_params;
     MlxRmsNorm q_norm;
     std::optional<ProjectionGroup> projections;
@@ -1205,6 +1203,22 @@ struct MlxDeepseekV4Attention::Impl {
               components.q_norm,
               static_cast<float>(config.rms_eps)) {
         validate();
+        if (ratio != 0) {
+            const Shape strides{ratio, 1};
+            pool_rope.emplace(
+                mlx::core::contiguous(
+                    mlx::core::slice(
+                        rope.first,
+                        Shape{0, 0},
+                        rope.first.shape(),
+                        strides)),
+                mlx::core::contiguous(
+                    mlx::core::slice(
+                        rope.second,
+                        Shape{0, 0},
+                        rope.second.shape(),
+                        strides)));
+        }
         projections.emplace(projection_list());
     }
 
@@ -1515,7 +1529,9 @@ struct MlxDeepseekV4Attention::Impl {
     }
 
     array output_projection(
-        const array& value) const {
+        const array& value,
+        const array& cosine,
+        const array& sine) const {
         const int batch = value.shape(0);
         const int tokens = value.shape(1);
         const int groups = checked_int(
@@ -1536,6 +1552,12 @@ struct MlxDeepseekV4Attention::Impl {
                 },
                 "attention width") /
             groups;
+        const int head_dim = checked_int(
+            config.head_dim,
+            "head dimension");
+        const int rotary = checked_int(
+            config.qk_rope_head_dim,
+            "rotary dimension");
         auto grouped = mlx::core::reshape(
             value,
             Shape{
@@ -1544,10 +1566,33 @@ struct MlxDeepseekV4Attention::Impl {
                 groups,
                 input_width,
             });
-        auto low_rank = mlx::core::reshape(
-            components.wo_a.grouped_row_matmul(
-                grouped,
-                groups),
+        array low_rank =
+            components.wo_a.nint8_zero_weight_ref()
+            ? components.wo_a.nint8_zero_weight_ref()
+                  ->grouped_row_matmul_inverse_rope(
+                      grouped,
+                      groups,
+                      cosine,
+                      sine,
+                      head_dim,
+                      rotary)
+            : components.wo_a.grouped_row_matmul(
+                  mlx::core::reshape(
+                      replace_last_rope(
+                          value,
+                          rotary,
+                          cosine,
+                          sine,
+                          true),
+                      Shape{
+                          batch,
+                          tokens,
+                          groups,
+                          input_width,
+                      }),
+                  groups);
+        low_rank = mlx::core::reshape(
+            std::move(low_rank),
             Shape{
                 batch,
                 tokens,
@@ -1885,8 +1930,8 @@ array MlxDeepseekV4Attention::operator()(
                 *impl_->components.main_ape,
                 *impl_->components.main_norm,
                 length,
-                impl_->rope.first,
-                impl_->rope.second,
+                impl_->pool_rope->first,
+                impl_->pool_rope->second,
                 0,
                 static_cast<float>(
                     config.rms_eps));
@@ -1905,8 +1950,8 @@ array MlxDeepseekV4Attention::operator()(
                     *impl_->components.index_ape,
                     *impl_->components.index_norm,
                     length,
-                    impl_->rope.first,
-                    impl_->rope.second,
+                    impl_->pool_rope->first,
+                    impl_->pool_rope->second,
                     config.fast_indexer() ? 2 : 0,
                     static_cast<float>(
                         config.rms_eps));
@@ -2134,14 +2179,10 @@ array MlxDeepseekV4Attention::operator()(
             profile_component("sparse_core"),
             attended);
     }
-    attended = replace_last_rope(
-        attended,
-        rotary,
-        q_cosine,
-        q_sine,
-        true);
     auto result = impl_->output_projection(
-        attended);
+        attended,
+        cosine,
+        sine);
     state.position_ += tokens;
     return result;
 }

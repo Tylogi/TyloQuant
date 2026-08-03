@@ -1,4 +1,5 @@
 #include "mlx_deepseek_v4_hc.h"
+#include "mlx_transformer.h"
 
 #include <algorithm>
 #include <array>
@@ -270,6 +271,88 @@ void test_hc_pre_post() {
         expected_combination,
         3e-4f,
         "HC pre Sinkhorn");
+
+    std::vector<float> norm(kHidden);
+    for (int feature = 0; feature < kHidden; ++feature) {
+        norm[feature] =
+            0.9f + 0.01f * static_cast<float>(feature % 17);
+    }
+    const mlx::core::array norm_array(
+        norm.begin(),
+        mlx::core::Shape{kHidden});
+    mfq::metal::MlxRmsNorm separate_norm(norm_array, kEps);
+    auto expected_normalized = separate_norm(actual.reduced);
+    auto fused_normalized = mfq::metal::deepseek_v4_hc_pre_norm(
+        residual_array,
+        mixes_array,
+        scale_array,
+        base_array,
+        norm_array,
+        20,
+        kEps,
+        kEps);
+    require_close(
+        evaluated_float(fused_normalized.reduced),
+        evaluated_float(expected_normalized),
+        1.5e-3f,
+        "fused HC pre RMSNorm");
+    require_close(
+        evaluated_float(fused_normalized.post),
+        evaluated_float(actual.post),
+        2e-4f,
+        "fused HC pre post-gates");
+    require_close(
+        evaluated_float(fused_normalized.combination),
+        evaluated_float(actual.combination),
+        3e-4f,
+        "fused HC pre Sinkhorn");
+
+    auto residual_half = mlx::core::astype(
+        residual_array,
+        mlx::core::float16);
+    auto residual_flat = mlx::core::reshape(
+        residual_half,
+        mlx::core::Shape{
+            kBatch,
+            kTokens,
+            kConnections * kHidden,
+        });
+    auto residual_float = mlx::core::astype(
+        residual_flat,
+        mlx::core::float32);
+    auto residual_inverse = mlx::core::rsqrt(
+        mlx::core::mean(
+            residual_float * residual_float,
+            -1,
+            true) +
+        kEps);
+    auto unnormalized_mixes =
+        mixes_array / residual_inverse;
+    auto fully_fused = mfq::metal::deepseek_v4_hc_pre_norm(
+        residual_array,
+        unnormalized_mixes,
+        scale_array,
+        base_array,
+        norm_array,
+        20,
+        kEps,
+        kEps,
+        true);
+    require_close(
+        evaluated_float(fully_fused.reduced),
+        evaluated_float(expected_normalized),
+        2e-3f,
+        "fused HC input RMS and output RMSNorm");
+    require_close(
+        evaluated_float(fully_fused.post),
+        evaluated_float(actual.post),
+        3e-4f,
+        "fused HC input RMS post-gates");
+    require_close(
+        evaluated_float(fully_fused.combination),
+        evaluated_float(actual.combination),
+        4e-4f,
+        "fused HC input RMS Sinkhorn");
 
     std::vector<float> branch(rows * kHidden);
     for (std::size_t index = 0;
