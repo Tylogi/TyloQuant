@@ -36,6 +36,8 @@ struct MfqTokenizerProbe {
     int32_t eos_token = -1;
     int32_t eot_token = -1;
     int32_t pad_token = -1;
+    bool add_bos = false;
+    bool add_eos = false;
     std::string chat_template;
     std::vector<int64_t> tokens;
 };
@@ -52,7 +54,11 @@ using MfqGenerateFn = std::function<int32_t(
 int run_mfq_server(const MfqServerConfig & config, const MfqGenerateFn & generate);
 MfqTokenizerProbe probe_mfq_tokenizer(
     const std::vector<uint8_t> & tokenizer_gguf,
-    const std::string & text);
+    const std::string & text,
+    bool add_special = false,
+    bool parse_special = true);
 MfqTokenizerProbe probe_mfq_tokenizer(
     const std::string & tokenizer_model,
-    const std::string & text);
+    const std::string & text,
+    bool add_special = false,
+    bool parse_special = true);

@@ -144,9 +144,20 @@ public:
         return llama_vocab_pad(vocab_);
     }
 
-    std::vector<int64_t> tokenize(const std::string & text, bool parse_special) const {
+    bool add_bos() const {
+        return llama_vocab_get_add_bos(vocab_);
+    }
+
+    bool add_eos() const {
+        return llama_vocab_get_add_eos(vocab_);
+    }
+
+    std::vector<int64_t> tokenize(
+            const std::string & text,
+            bool parse_special,
+            bool add_special = false) const {
         int32_t n = llama_tokenize(vocab_, text.data(), static_cast<int32_t>(text.size()),
-                                   nullptr, 0, false, parse_special);
+                                   nullptr, 0, add_special, parse_special);
         if (n == std::numeric_limits<int32_t>::min()) {
             throw std::runtime_error("tokenized prompt exceeds the tokenizer limit");
         }
@@ -156,7 +167,7 @@ public:
         }
         std::vector<llama_token> tokens(static_cast<size_t>(-n));
         n = llama_tokenize(vocab_, text.data(), static_cast<int32_t>(text.size()),
-                           tokens.data(), static_cast<int32_t>(tokens.size()), false, parse_special);
+                           tokens.data(), static_cast<int32_t>(tokens.size()), add_special, parse_special);
         if (n < 0) throw std::runtime_error("tokenizer buffer sizing changed unexpectedly");
         std::vector<int64_t> out;
         out.reserve(static_cast<size_t>(n));
@@ -1086,7 +1097,9 @@ static void handle_api_error(httplib::Response & res, const ApiError & error) {
 
 MfqTokenizerProbe probe_mfq_tokenizer(
         const std::vector<uint8_t> & tokenizer_gguf,
-        const std::string & text) {
+        const std::string & text,
+        bool add_special,
+        bool parse_special) {
     LlamaTokenizer tokenizer(tokenizer_gguf);
     return {
         tokenizer.vocab_size(),
@@ -1094,14 +1107,18 @@ MfqTokenizerProbe probe_mfq_tokenizer(
         tokenizer.eos_token(),
         tokenizer.eot_token(),
         tokenizer.pad_token(),
+        tokenizer.add_bos(),
+        tokenizer.add_eos(),
         tokenizer.chat_template(),
-        tokenizer.tokenize(text, true),
+        tokenizer.tokenize(text, parse_special, add_special),
     };
 }
 
 MfqTokenizerProbe probe_mfq_tokenizer(
         const std::string & tokenizer_model,
-        const std::string & text) {
+        const std::string & text,
+        bool add_special,
+        bool parse_special) {
     LlamaTokenizer tokenizer(tokenizer_model);
     return {
         tokenizer.vocab_size(),
@@ -1109,8 +1126,10 @@ MfqTokenizerProbe probe_mfq_tokenizer(
         tokenizer.eos_token(),
         tokenizer.eot_token(),
         tokenizer.pad_token(),
+        tokenizer.add_bos(),
+        tokenizer.add_eos(),
         tokenizer.chat_template(),
-        tokenizer.tokenize(text, true),
+        tokenizer.tokenize(text, parse_special, add_special),
     };
 }
 
