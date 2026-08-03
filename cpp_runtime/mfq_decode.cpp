@@ -7,6 +7,10 @@
 #include <cuda_profiler_api.h>
 #include <cuda_runtime_api.h>
 
+#ifdef MFQ_HAVE_NCCL
+#include <nccl.h>
+#endif
+
 #include "mfq_server.h"
 #include "moe_cache_policy.h"
 #include "moe_cache_profile.h"
@@ -14,6 +18,7 @@
 #include "nvq_codebooks.generated.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cctype>
@@ -53,6 +58,15 @@
         throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(err__)); \
     } \
 } while (0)
+
+#ifdef MFQ_HAVE_NCCL
+#define MFQ_NCCL_CHECK(expr) do { \
+    ncclResult_t err__ = (expr); \
+    if (err__ != ncclSuccess) { \
+        throw std::runtime_error(std::string("NCCL error: ") + ncclGetErrorString(err__)); \
+    } \
+} while (0)
+#endif
 
 static void mfq_set_env(const char * name, const char * value) {
 #ifdef _WIN32
@@ -712,6 +726,128 @@ struct TensorParallelConfig {
 };
 
 static TensorParallelConfig g_tensor_parallel;
+
+struct TensorParallelCollectiveRuntime {
+    using Stream = decltype(at::cuda::getStreamFromPool(false));
+
+    std::vector<int> devices;
+    std::vector<Stream> streams;
+    std::vector<cudaEvent_t> ready;
+    std::vector<cudaEvent_t> completed;
+    std::vector<torch::Tensor> reduction_buffers;
+#ifdef MFQ_HAVE_NCCL
+    std::vector<ncclComm_t> communicators;
+#endif
+    bool collectives_enabled = false;
+
+    ~TensorParallelCollectiveRuntime() {
+        reset();
+    }
+
+    void reset() noexcept {
+#ifdef MFQ_HAVE_NCCL
+        for (auto communicator : communicators) {
+            if (communicator != nullptr) {
+                (void)ncclCommDestroy(communicator);
+            }
+        }
+        communicators.clear();
+#endif
+        for (size_t index = 0; index < devices.size(); ++index) {
+            (void)cudaSetDevice(devices[index]);
+            if (index < ready.size() && ready[index] != nullptr) {
+                (void)cudaEventDestroy(ready[index]);
+            }
+            if (index < completed.size() && completed[index] != nullptr) {
+                (void)cudaEventDestroy(completed[index]);
+            }
+        }
+        devices.clear();
+        streams.clear();
+        ready.clear();
+        completed.clear();
+        reduction_buffers.clear();
+        collectives_enabled = false;
+    }
+
+    void configure(
+            const std::vector<int> & requested_devices,
+            bool allow_duplicate_devices) {
+        reset();
+        if (requested_devices.size() < 2 || allow_duplicate_devices) {
+            return;
+        }
+        devices = requested_devices;
+        streams.reserve(devices.size());
+        ready.resize(devices.size(), nullptr);
+        completed.resize(devices.size(), nullptr);
+        reduction_buffers.resize(devices.size());
+        for (size_t index = 0; index < devices.size(); ++index) {
+            c10::cuda::CUDAGuard guard(devices[index]);
+            streams.push_back(
+                at::cuda::getStreamFromPool(false, devices[index]));
+            MFQ_CUDA_CHECK(cudaEventCreateWithFlags(
+                &ready[index], cudaEventDisableTiming));
+            MFQ_CUDA_CHECK(cudaEventCreateWithFlags(
+                &completed[index], cudaEventDisableTiming));
+        }
+#ifdef MFQ_HAVE_NCCL
+        communicators.resize(devices.size(), nullptr);
+        MFQ_NCCL_CHECK(ncclCommInitAll(
+            communicators.data(),
+            static_cast<int>(devices.size()),
+            devices.data()));
+        collectives_enabled = true;
+#endif
+    }
+};
+
+static TensorParallelCollectiveRuntime g_tensor_parallel_collectives;
+
+struct LayerPlacementConfig {
+    std::vector<int> devices;
+    std::vector<double> split;
+    std::vector<int> layer_devices;
+    int load_device = -1;
+
+    bool enabled() const {
+        return devices.size() > 1;
+    }
+
+    int primary_device() const {
+        return devices.empty()
+            ? g_tensor_parallel.primary_device()
+            : devices.front();
+    }
+
+    void prepare(int64_t layers) {
+        layer_devices.assign(
+            static_cast<size_t>(layers), primary_device());
+        if (!enabled()) return;
+        const auto slices = mfq::plan_tensor_parallel_slices(
+            layers, 1, devices, split);
+        for (const auto & slice : slices) {
+            for (int64_t layer = slice.begin; layer < slice.end; ++layer) {
+                layer_devices.at(static_cast<size_t>(layer)) = slice.device;
+            }
+        }
+    }
+
+    int device_for_layer(int64_t layer) const {
+        if (layer < 0 || layer >= static_cast<int64_t>(layer_devices.size())) {
+            throw std::runtime_error("layer-placement index is outside the model");
+        }
+        return layer_devices.at(static_cast<size_t>(layer));
+    }
+};
+
+static LayerPlacementConfig g_layer_placement;
+
+static int active_weight_load_device() {
+    return g_layer_placement.load_device >= 0
+        ? g_layer_placement.load_device
+        : g_tensor_parallel.primary_device();
+}
 
 static const char * kl_mmq_mode_name(KlMmqMode mode) {
     switch (mode) {
@@ -2105,9 +2241,12 @@ struct MoeRoutePlan {
     torch::Tensor cursors;
     int n_experts = 0;
     bool map_ready = false;
+    uint64_t generation = 0;
     mutable std::shared_ptr<std::vector<int32_t>>
         host_unique_experts;
 };
+
+static std::atomic<uint64_t> g_moe_route_generation{1};
 
 static torch::Tensor moe_tensor_to_device(
         torch::Tensor value, int device) {
@@ -2122,27 +2261,76 @@ static torch::Tensor moe_tensor_to_device(
         true, false).contiguous();
 }
 
+struct MoeRouteReplicaEntry {
+    uint64_t generation = 0;
+    MoeRoutePlan plan;
+};
+
+class MoeRouteReplicaCache {
+public:
+    const MoeRoutePlan & get(
+            const MoeRoutePlan & source, int device) {
+        auto & entry = entries_[device];
+        if (entry.generation == source.generation &&
+                entry.plan.generation == source.generation) {
+            return entry.plan;
+        }
+        copy_plan(entry.plan, source, device);
+        entry.generation = source.generation;
+        return entry.plan;
+    }
+
+private:
+    static void copy_tensor(
+            torch::Tensor & destination,
+            const torch::Tensor & source,
+            int device) {
+        if (!source.defined()) {
+            destination = torch::Tensor();
+            return;
+        }
+        if (source.is_cuda() && source.get_device() == device) {
+            destination = source.contiguous();
+            return;
+        }
+        c10::cuda::CUDAGuard guard(device);
+        auto options = source.options().device(
+            torch::Device(torch::kCUDA, device));
+        if (!destination.defined() ||
+                destination.sizes() != source.sizes() ||
+                destination.scalar_type() != source.scalar_type() ||
+                !destination.is_cuda() ||
+                destination.get_device() != device) {
+            destination = torch::empty(source.sizes(), options);
+        }
+        destination.copy_(source, true);
+    }
+
+    static void copy_plan(
+            MoeRoutePlan & destination,
+            const MoeRoutePlan & source,
+            int device) {
+        copy_tensor(destination.ids, source.ids, device);
+        copy_tensor(destination.ids_dst, source.ids_dst, device);
+        copy_tensor(destination.expert_bounds, source.expert_bounds, device);
+        copy_tensor(destination.tile_bounds, source.tile_bounds, device);
+        copy_tensor(destination.tile_experts, source.tile_experts, device);
+        copy_tensor(destination.counts, source.counts, device);
+        copy_tensor(destination.cursors, source.cursors, device);
+        destination.n_experts = source.n_experts;
+        destination.map_ready = source.map_ready;
+        destination.generation = source.generation;
+        destination.host_unique_experts = source.host_unique_experts;
+    }
+
+    std::unordered_map<int, MoeRouteReplicaEntry> entries_;
+};
+
+static thread_local MoeRouteReplicaCache g_moe_route_replica_cache;
+
 static MoeRoutePlan moe_route_to_device(
         const MoeRoutePlan & source, int device) {
-    MoeRoutePlan result;
-    result.ids = moe_tensor_to_device(source.ids, device);
-    result.ids_dst =
-        moe_tensor_to_device(source.ids_dst, device);
-    result.expert_bounds =
-        moe_tensor_to_device(source.expert_bounds, device);
-    result.tile_bounds =
-        moe_tensor_to_device(source.tile_bounds, device);
-    result.tile_experts =
-        moe_tensor_to_device(source.tile_experts, device);
-    result.counts =
-        moe_tensor_to_device(source.counts, device);
-    result.cursors =
-        moe_tensor_to_device(source.cursors, device);
-    result.n_experts = source.n_experts;
-    result.map_ready = source.map_ready;
-    result.host_unique_experts =
-        source.host_unique_experts;
-    return result;
+    return g_moe_route_replica_cache.get(source, device);
 }
 
 static MoeRoutePlan build_moe_route_plan(torch::Tensor ids, int n_experts) {
@@ -2150,6 +2338,8 @@ static MoeRoutePlan build_moe_route_plan(torch::Tensor ids, int n_experts) {
         throw std::runtime_error("MoE ids must be CUDA int32 [tokens, routes]");
     }
     MoeRoutePlan result;
+    result.generation = g_moe_route_generation.fetch_add(
+        1, std::memory_order_relaxed);
     result.ids = ids.contiguous();
     result.n_experts = n_experts;
     auto empty = torch::empty({0}, result.ids.options());
@@ -2171,6 +2361,9 @@ static MoeRoutePlan build_moe_route_plan(torch::Tensor ids, int n_experts) {
         result.ids_dst.numel() == result.ids.numel();
     return result;
 }
+
+static torch::Tensor reduce_tensor_parallel_outputs(
+    std::vector<torch::Tensor> outputs);
 
 struct NintMoeWeight {
     struct TensorParallelShard {
@@ -2195,6 +2388,8 @@ struct NintMoeWeight {
     int profile_mask = 0;
     int64_t mixed_weight_bytes = 0;
     bool tensor_parallel_paired_output = false;
+    bool tensor_parallel_experts = false;
+    bool partial_experts = false;
     std::vector<TensorParallelShard>
         tensor_parallel_shards;
     std::function<void(const MoeRoutePlan &)> cache_prefetch;
@@ -2323,6 +2518,19 @@ struct NintMoeWeight {
             torch::Tensor x,
             const MoeRoutePlan & route) const {
         if (tensor_parallel()) {
+            if (tensor_parallel_experts) {
+                std::vector<torch::Tensor> partials;
+                partials.reserve(tensor_parallel_shards.size());
+                for (const auto & shard : tensor_parallel_shards) {
+                    c10::cuda::CUDAGuard guard(shard.device);
+                    auto local_x = moe_tensor_to_device(x, shard.device);
+                    auto local_route = moe_route_to_device(route, shard.device);
+                    partials.push_back(
+                        shard.weight->forward(local_x, local_route));
+                }
+                return reduce_tensor_parallel_outputs(
+                    std::move(partials));
+            }
             return forward_tensor_parallel(
                 x, route,
                 tensor_parallel_paired_output,
@@ -2345,8 +2553,13 @@ struct NintMoeWeight {
             throw std::runtime_error("NINTM input and route shape mismatch");
         }
         int input_rows = x.dim() == 3 ? tokens * routes : tokens;
-        auto output = torch::empty(
-            {tokens, routes, out_per_expert}, x.options().dtype(torch::kFloat16));
+        auto output = partial_experts
+            ? torch::zeros(
+                {tokens, routes, out_per_expert},
+                x.options().dtype(torch::kFloat16))
+            : torch::empty(
+                {tokens, routes, out_per_expert},
+                x.options().dtype(torch::kFloat16));
         if (g_kl_mmq_mode != KlMmqMode::Default) {
             TORCH_CHECK(
                 hetero_supported && route.map_ready &&
@@ -2465,8 +2678,13 @@ struct NintMoeWeight {
         const int tokens = static_cast<int>(x.size(0));
         const int hidden_width = out_per_expert / 2;
         const int routes = static_cast<int>(route.ids.size(1));
-        auto output = torch::empty(
-            {tokens, routes, hidden_width}, x.options().dtype(torch::kFloat16));
+        auto output = partial_experts
+            ? torch::zeros(
+                {tokens, routes, hidden_width},
+                x.options().dtype(torch::kFloat16))
+            : torch::empty(
+                {tokens, routes, hidden_width},
+                x.options().dtype(torch::kFloat16));
         auto & workspace = hetero_workspace(x, tokens);
         if (supports_dual_quant()) {
             nint_moe_quantize_24_28_ws_cuda(
@@ -2519,8 +2737,13 @@ struct NintMoeWeight {
             throw std::runtime_error("fused NINTM GLU only supports M<=8 and up to eight routes");
         }
         const int input_rows = tokens * routes;
-        auto output = torch::empty(
-            {tokens, routes, out_per_expert}, gate_up.options().dtype(torch::kFloat16));
+        auto output = partial_experts
+            ? torch::zeros(
+                {tokens, routes, out_per_expert},
+                gate_up.options().dtype(torch::kFloat16))
+            : torch::empty(
+                {tokens, routes, out_per_expert},
+                gate_up.options().dtype(torch::kFloat16));
         auto & workspace = hetero_workspace(gate_up, input_rows);
         if (supports_dual_quant() && neuron_len <= 4096) {
             if (gelu) {
@@ -4055,19 +4278,25 @@ static NvqCpu select_nvq_cpu_rows(
 static NepqCpu select_nepq_cpu_rows(
         const NepqCpu & source,
         const std::vector<int64_t> & rows,
-        int output_per_expert) {
+        int output_per_expert,
+        int selected_experts = -1) {
+    const int destination_experts = selected_experts < 0
+        ? source.n_experts
+        : selected_experts;
     const int source_rows =
         source.n_experts *
         source.out_per_expert;
     if (rows.empty() ||
         output_per_expert <= 0 ||
+        destination_experts <= 0 ||
         static_cast<int>(rows.size()) !=
-            source.n_experts *
+            destination_experts *
                 output_per_expert) {
         throw std::runtime_error(
             "invalid NEPQ MoE output shard");
     }
     NepqCpu result = source;
+    result.n_experts = destination_experts;
     result.out_per_expert = output_per_expert;
     result.neuron_scale_h.resize(rows.size());
     result.state_packed.assign(
@@ -4203,6 +4432,7 @@ struct MixedMoeRuntime {
     int n_experts = 0;
     int out_per_expert = 0;
     int neuron_len = 0;
+    bool partial_experts = false;
     std::vector<MixedMoePool> pools;
     mutable std::unordered_map<
         MixedMoeActivationKey, MoeActivationWorkspace,
@@ -4237,9 +4467,13 @@ struct MixedMoeRuntime {
             throw std::runtime_error("mixed NINTM input and route shape mismatch");
         }
         const int input_rows = x.dim() == 3 ? tokens * routes : tokens;
-        auto output = torch::empty(
-            {tokens, routes, out_per_expert},
-            x.options().dtype(torch::kFloat16));
+        auto output = partial_experts
+            ? torch::zeros(
+                {tokens, routes, out_per_expert},
+                x.options().dtype(torch::kFloat16))
+            : torch::empty(
+                {tokens, routes, out_per_expert},
+                x.options().dtype(torch::kFloat16));
         std::unordered_map<
             MixedMoeTransformKey, torch::Tensor,
             MixedMoeTransformKeyHash> prepared_inputs;
@@ -4415,9 +4649,13 @@ struct MixedMoeRuntime {
                 "mixed NINTM clamped SwiGLU route shape mismatch");
         }
         const int input_rows = tokens * routes;
-        auto output = torch::empty(
-            {tokens, routes, out_per_expert},
-            gate_up.options().dtype(torch::kFloat16));
+        auto output = partial_experts
+            ? torch::zeros(
+                {tokens, routes, out_per_expert},
+                gate_up.options().dtype(torch::kFloat16))
+            : torch::empty(
+                {tokens, routes, out_per_expert},
+                gate_up.options().dtype(torch::kFloat16));
         const MixedMoeTransformKey identity{};
         std::unordered_set<
             MixedMoeActivationKey, MixedMoeActivationKeyHash> quantized;
@@ -4590,6 +4828,7 @@ static NintMoeWeight wrap_mixed_moe_runtime(
     result.n_experts = runtime->n_experts;
     result.out_per_expert = runtime->out_per_expert;
     result.neuron_len = runtime->neuron_len;
+    result.partial_experts = runtime->partial_experts;
     result.hetero_supported = false;
     result.mixed_weight_bytes = mixed_moe_storage_bytes(*runtime);
     result.mixed_forward = [runtime](
@@ -4723,6 +4962,115 @@ static NintMoeWeight to_cuda_device_moe_output_slice(
         }
         runtime->pools.push_back(
             std::move(pool));
+    }
+    return wrap_mixed_moe_runtime(runtime);
+}
+
+static NintMoeWeight to_cuda_device_moe_expert_slice(
+        const NintMoeCpu & cpu,
+        int64_t expert_begin,
+        int64_t expert_end,
+        int device) {
+    if (expert_begin < 0 || expert_begin >= expert_end ||
+            expert_end > cpu.n_experts) {
+        throw std::runtime_error(
+            "invalid tensor-parallel MoE expert shard");
+    }
+    const bool all_nint = std::all_of(
+        cpu.pools.begin(), cpu.pools.end(),
+        [](const NintMoeCpuPool & pool) {
+            return pool.dtype != "NINTM" &&
+                pool.dtype != "NINT8-0" &&
+                pool.dtype.rfind("NINT", 0) == 0;
+        });
+    c10::cuda::CUDAGuard guard(device);
+    if (all_nint) {
+        NintMoeCpu sliced = cpu;
+        sliced.pools.clear();
+        for (const auto & source : cpu.pools) {
+            NintMoeCpuPool destination = source;
+            destination.expert_ids.clear();
+            std::vector<int64_t> rows;
+            for (size_t local = 0;
+                 local < source.expert_ids.size(); ++local) {
+                const int expert = source.expert_ids[local];
+                if (expert < expert_begin || expert >= expert_end) continue;
+                destination.expert_ids.push_back(expert);
+                for (int row = 0; row < cpu.out_per_expert; ++row) {
+                    rows.push_back(
+                        static_cast<int64_t>(local) * cpu.out_per_expert + row);
+                }
+            }
+            if (rows.empty()) continue;
+            destination.weight = select_nint_cpu_rows(
+                source.weight, rows);
+            sliced.pools.push_back(std::move(destination));
+        }
+        auto result = to_gpu_nint_moe(sliced);
+        result.partial_experts = true;
+        return result;
+    }
+
+    auto runtime = std::make_shared<MixedMoeRuntime>();
+    runtime->n_experts = cpu.n_experts;
+    runtime->out_per_expert = cpu.out_per_expert;
+    runtime->neuron_len = cpu.neuron_len;
+    runtime->partial_experts = true;
+    for (const auto & source : cpu.pools) {
+        std::vector<int> expert_ids;
+        std::vector<int64_t> rows;
+        for (size_t local = 0;
+             local < source.expert_ids.size(); ++local) {
+            const int expert = source.expert_ids[local];
+            if (expert < expert_begin || expert >= expert_end) continue;
+            expert_ids.push_back(expert);
+            for (int row = 0; row < cpu.out_per_expert; ++row) {
+                rows.push_back(
+                    static_cast<int64_t>(local) * cpu.out_per_expert + row);
+            }
+        }
+        if (rows.empty()) continue;
+
+        MixedMoePool pool;
+        pool.local_experts = static_cast<int>(expert_ids.size());
+        std::vector<int32_t> local_map(
+            static_cast<size_t>(cpu.n_experts), -1);
+        for (size_t local = 0; local < expert_ids.size(); ++local) {
+            local_map[static_cast<size_t>(expert_ids[local])] =
+                static_cast<int32_t>(local);
+        }
+        pool.expert_local = torch::from_blob(
+            local_map.data(),
+            {static_cast<int64_t>(local_map.size())},
+            torch::TensorOptions().dtype(torch::kInt32))
+            .clone().to(torch::kCUDA).contiguous();
+        if (source.dtype == "NINT8-0") {
+            pool.family = MixedMoeFamily::Nint8Zero;
+            pool.q8_zero = to_gpu_nint8_zero(
+                select_nint8_zero_cpu_rows(source.q8_zero, rows));
+        } else if (source.dtype != "NINTM" &&
+                source.dtype.rfind("NINT", 0) == 0) {
+            pool.family = MixedMoeFamily::Nint;
+            pool.nint = to_gpu_nint(
+                select_nint_cpu_rows(source.weight, rows));
+        } else if (source.dtype.rfind("NEPQ", 0) == 0) {
+            pool.family = MixedMoeFamily::Nepq;
+            auto parsed = unpack_nepq(
+                source.payload, source.dtype, source.runtime_payload);
+            pool.nepq = to_gpu_nepq(select_nepq_cpu_rows(
+                parsed, rows, cpu.out_per_expert,
+                pool.local_experts));
+        } else {
+            pool.family = MixedMoeFamily::Nvq;
+            auto parsed = unpack_nvq(source.payload, source.dtype);
+            pool.nvq = to_gpu_nvq(
+                select_nvq_cpu_rows(parsed, rows));
+        }
+        runtime->pools.push_back(std::move(pool));
+    }
+    if (runtime->pools.empty()) {
+        throw std::runtime_error(
+            "tensor-parallel MoE expert shard has no owned experts");
     }
     return wrap_mixed_moe_runtime(runtime);
 }
@@ -6361,13 +6709,8 @@ static NintMoeWeight load_nint_moe_gpu(
                 "tensor-parallel gate/up MoE "
                 "width must be even: " + name);
         }
-        const int64_t logical_extent =
-            paired
-            ? cpu.out_per_expert / 2
-            : cpu.out_per_expert;
-        auto slices =
-            plan_moe_tensor_parallel_slices(
-                logical_extent, name);
+        auto slices = plan_moe_tensor_parallel_slices(
+            cpu.n_experts, name);
         NintMoeWeight result;
         result.n_experts = cpu.n_experts;
         result.out_per_expert =
@@ -6376,13 +6719,14 @@ static NintMoeWeight load_nint_moe_gpu(
             cpu.neuron_len;
         result.tensor_parallel_paired_output =
             paired;
+        result.tensor_parallel_experts = true;
         result.hetero_supported = true;
         for (const auto & slice : slices) {
             auto shard =
                 std::make_shared<NintMoeWeight>(
-                    to_cuda_device_moe_output_slice(
+                    to_cuda_device_moe_expert_slice(
                         cpu, slice.begin,
-                        slice.end, paired,
+                        slice.end,
                         slice.device));
             result.hetero_supported =
                 result.hetero_supported &&
@@ -6454,7 +6798,7 @@ static torch::Tensor nvq_dequant(const NvqWeight & w) {
 
 static torch::Tensor load_dense_gpu(const MfqFile & mfq, const std::string & name) {
     c10::cuda::CUDAGuard guard(
-        g_tensor_parallel.primary_device());
+        active_weight_load_device());
     const auto & rec = mfq.record(name);
     auto blob = mfq.read_blob(name);
     size_t off = 0;
@@ -7546,6 +7890,88 @@ static torch::Tensor reduce_tensor_parallel_outputs(
         throw std::runtime_error(
             "cannot reduce an empty tensor-parallel output");
     }
+#ifdef MFQ_HAVE_NCCL
+    if (g_tensor_parallel_collectives.collectives_enabled &&
+            outputs.size() ==
+                g_tensor_parallel_collectives.devices.size()) {
+        auto & runtime = g_tensor_parallel_collectives;
+        const auto shape = outputs.front().sizes().vec();
+        const auto output_dtype = outputs.front().scalar_type();
+        const int64_t elements = outputs.front().numel();
+        for (size_t index = 0; index < outputs.size(); ++index) {
+            const int device = runtime.devices[index];
+            if (!outputs[index].defined() || !outputs[index].is_cuda() ||
+                    outputs[index].get_device() != device ||
+                    outputs[index].sizes().vec() != shape) {
+                throw std::runtime_error(
+                    "NCCL tensor-parallel reduction received mismatched shards");
+            }
+            c10::cuda::CUDAGuard guard(device);
+            const auto producer =
+                at::cuda::getCurrentCUDAStream(device);
+            MFQ_CUDA_CHECK(cudaEventRecord(
+                runtime.ready[index], producer.stream()));
+            const auto communication = runtime.streams[index];
+            MFQ_CUDA_CHECK(cudaStreamWaitEvent(
+                communication.stream(), runtime.ready[index], 0));
+            {
+                c10::cuda::CUDAStreamGuard stream_guard(communication);
+                auto & buffer = runtime.reduction_buffers[index];
+                if (!buffer.defined() || buffer.sizes().vec() != shape ||
+                        buffer.get_device() != device) {
+                    buffer = torch::empty(
+                        shape,
+                        outputs[index].options().dtype(torch::kFloat32));
+                }
+                buffer.copy_(outputs[index], true);
+                c10::cuda::CUDACachingAllocator::recordStream(
+                    outputs[index].storage().data_ptr(), communication);
+            }
+        }
+
+        MFQ_NCCL_CHECK(ncclGroupStart());
+        for (size_t index = 0; index < outputs.size(); ++index) {
+            auto & buffer = runtime.reduction_buffers[index];
+            MFQ_NCCL_CHECK(ncclAllReduce(
+                buffer.data_ptr<float>(),
+                buffer.data_ptr<float>(),
+                static_cast<size_t>(elements),
+                ncclFloat32,
+                ncclSum,
+                runtime.communicators[index],
+                runtime.streams[index].stream()));
+        }
+        MFQ_NCCL_CHECK(ncclGroupEnd());
+
+        torch::Tensor result;
+        const int primary = g_tensor_parallel.primary_device();
+        for (size_t index = 0; index < outputs.size(); ++index) {
+            c10::cuda::CUDAGuard guard(runtime.devices[index]);
+            const auto communication = runtime.streams[index];
+            if (runtime.devices[index] == primary) {
+                c10::cuda::CUDAStreamGuard stream_guard(communication);
+                result = runtime.reduction_buffers[index]
+                    .to(output_dtype).contiguous();
+            }
+            MFQ_CUDA_CHECK(cudaEventRecord(
+                runtime.completed[index], communication.stream()));
+        }
+        if (!result.defined()) {
+            throw std::runtime_error(
+                "tensor-parallel primary device is absent from NCCL ranks");
+        }
+        c10::cuda::CUDAGuard primary_guard(primary);
+        const auto parent = at::cuda::getCurrentCUDAStream(primary);
+        const auto primary_rank = static_cast<size_t>(
+            std::find(runtime.devices.begin(), runtime.devices.end(), primary) -
+            runtime.devices.begin());
+        MFQ_CUDA_CHECK(cudaStreamWaitEvent(
+            parent.stream(), runtime.completed[primary_rank], 0));
+        c10::cuda::CUDACachingAllocator::recordStream(
+            result.storage().data_ptr(), parent);
+        return result;
+    }
+#endif
     const int primary =
         g_tensor_parallel.primary_device();
     c10::cuda::CUDAGuard primary_guard(primary);
@@ -7966,7 +8392,7 @@ static QuantLinear load_quant_linear(
                 }
             } else {
                 c10::cuda::CUDAGuard guard(
-                    g_tensor_parallel.primary_device());
+                    active_weight_load_device());
                 result.nint.w =
                     to_device_nint8_zero(cpu, true);
             }
@@ -8017,7 +8443,7 @@ static QuantLinear load_quant_linear(
                 }
             } else {
                 c10::cuda::CUDAGuard guard(
-                    g_tensor_parallel.primary_device());
+                    active_weight_load_device());
                 result.nint.w =
                     to_device_nint(cpu, true);
             }
@@ -8067,7 +8493,7 @@ static QuantLinear load_quant_linear(
             }
         } else {
             c10::cuda::CUDAGuard guard(
-                g_tensor_parallel.primary_device());
+                active_weight_load_device());
             result.nvq.w = to_device_nvq(cpu, true);
         }
     } else {
@@ -8871,6 +9297,118 @@ struct FFN {
         return output.reshape(shape);
     }
 
+    bool tensor_parallel_moe_compatible() const {
+        if (!is_moe ||
+                !moe_gate_up.tensor_parallel_experts ||
+                !moe_down.tensor_parallel_experts ||
+                moe_gate_up.tensor_parallel_shards.size() !=
+                    moe_down.tensor_parallel_shards.size() ||
+                moe_gate_up.tensor_parallel_shards.empty()) {
+            return false;
+        }
+        for (size_t index = 0;
+             index < moe_gate_up.tensor_parallel_shards.size(); ++index) {
+            const auto & gate = moe_gate_up.tensor_parallel_shards[index];
+            const auto & down = moe_down.tensor_parallel_shards[index];
+            if (!gate.weight || !down.weight ||
+                    gate.device != down.device ||
+                    gate.output_begin != down.output_begin ||
+                    gate.output_end != down.output_end) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    torch::Tensor forward_tensor_parallel_moe(
+            torch::Tensor x,
+            const MoeRoutePlan & route,
+            torch::Tensor route_weights) const {
+        std::vector<torch::Tensor> routed_partials;
+        std::vector<torch::Tensor> down_partials;
+        routed_partials.reserve(
+            moe_gate_up.tensor_parallel_shards.size());
+        const bool collect_output_energy =
+            moe_route_stats_path() != nullptr &&
+            moe_route_output_energy_enabled();
+        if (collect_output_energy) {
+            down_partials.reserve(
+                moe_gate_up.tensor_parallel_shards.size());
+        }
+        static const bool disable_swiglu_quant_fusion = [] {
+            const char * value = std::getenv(
+                "MFQ_DISABLE_MOE_SWIGLU_QUANT_FUSION");
+            return value != nullptr && std::atoi(value) != 0;
+        }();
+        for (size_t index = 0;
+             index < moe_gate_up.tensor_parallel_shards.size(); ++index) {
+            const auto & gate_shard =
+                moe_gate_up.tensor_parallel_shards[index];
+            const auto & down_shard =
+                moe_down.tensor_parallel_shards[index];
+            c10::cuda::CUDAGuard guard(gate_shard.device);
+            auto local_x = tensor_to_cuda_device(x, gate_shard.device);
+            auto local_weights = tensor_to_cuda_device(
+                route_weights, gate_shard.device);
+            auto local_route = moe_route_to_device(
+                route, gate_shard.device);
+            auto gate_up_pair = gate_shard.weight->forward(
+                local_x, local_route);
+            torch::Tensor down_pair;
+            const bool allow_fusion =
+                !g_force_moe_materialized_swiglu &&
+                !disable_swiglu_quant_fusion &&
+                moe_small_hetero_enabled(
+                    static_cast<int>(gate_up_pair.size(0)));
+            if (swiglu_limit <= 0.0 && allow_fusion &&
+                    down_shard.weight->hetero_supported) {
+                down_pair = down_shard.weight->forward_swiglu(
+                    gate_up_pair, local_route);
+            } else if (swiglu_limit > 0.0 && allow_fusion &&
+                    down_shard.weight->supports_clamped_swiglu()) {
+                down_pair = down_shard.weight->forward_clamped_swiglu(
+                    gate_up_pair, local_route, swiglu_limit);
+            } else {
+                torch::Tensor hidden;
+                if (swiglu_limit <= 0.0) {
+                    hidden = moe_swiglu_split_cuda(gate_up_pair);
+                } else {
+                    const int64_t width = gate_up_pair.size(-1) / 2;
+                    auto gate = torch::clamp_max(
+                        gate_up_pair.slice(-1, 0, width)
+                            .to(torch::kFloat32),
+                        swiglu_limit);
+                    auto up = torch::clamp(
+                        gate_up_pair.slice(-1, width, 2 * width)
+                            .to(torch::kFloat32),
+                        -swiglu_limit, swiglu_limit);
+                    hidden = (torch::silu(gate) * up)
+                        .to(torch::kFloat16).contiguous();
+                }
+                down_pair = down_shard.weight->forward(
+                    hidden, local_route);
+            }
+            if (collect_output_energy) {
+                down_partials.push_back(down_pair);
+            }
+            routed_partials.push_back(
+                moe_weighted_reduce_cuda(
+                    down_pair, local_weights));
+        }
+        if (moe_route_stats_path() != nullptr) {
+            torch::Tensor complete_down;
+            if (collect_output_energy) {
+                complete_down = reduce_tensor_parallel_outputs(
+                    std::move(down_partials));
+            }
+            record_moe_route_stats(
+                moe_layer, route.ids, route_weights,
+                complete_down, moe_gate_up.n_experts);
+        }
+        return reduce_tensor_parallel_outputs(
+            std::move(routed_partials));
+    }
+
     torch::Tensor forward_dense_f32_down_kld(
             torch::Tensor xh) const {
         TORCH_CHECK(
@@ -9000,6 +9538,35 @@ struct FFN {
             auto route = g_profiler.measure("moe.route_map", [&]() {
                 return build_moe_route_plan(selected.at(0), moe_gate_up.n_experts);
             });
+            if (tensor_parallel_moe_compatible()) {
+                auto routed = g_profiler.measure(
+                    "moe.tensor_parallel", [&]() {
+                        return forward_tensor_parallel_moe(
+                            xf, route, selected.at(1));
+                    });
+                auto shared_output = shared->forward(xf);
+                auto shared_half = shared_output
+                    .reshape({xf.size(0), xf.size(1)})
+                    .contiguous().to(torch::kFloat16);
+                if (moe_shared_ungated) {
+                    return g_profiler.measure("moe.combine", [&]() {
+                        return acc_cuda(
+                            routed.contiguous(), shared_half);
+                    });
+                }
+                shared_gate_logits = g_profiler.measure(
+                    "moe.shared_gate", [&]() {
+                        return torch::matmul(
+                            xf32,
+                            moe_shared_gate.transpose(0, 1))
+                            .contiguous();
+                    });
+                return g_profiler.measure("moe.combine", [&]() {
+                    return moe_add_shared_gate_cuda(
+                        routed.contiguous(), shared_half,
+                        shared_gate_logits);
+                });
+            }
             std::optional<NintMoeWeight> staged_gate_up;
             const NintMoeWeight * active_gate_up = &moe_gate_up;
             if (cpu_moe_gate_up) {
@@ -9411,6 +9978,7 @@ struct Dsv4SharedState {
 };
 
 struct Block {
+    int cuda_device = 0;
     virtual ~Block() = default;
     virtual void reset(int64_t B) = 0;
     virtual void set_token_ids(const torch::Tensor &) {}
@@ -9493,6 +10061,60 @@ struct Dsv4PoolState {
             previous_kv, previous_gate, pool, length,
             rope.cos, rope.sin, ratio, overlap,
             cache_quant_mode, 1e-6);
+    }
+
+    int64_t prefill(
+        const torch::Tensor & kv,
+        const torch::Tensor & gate,
+        const Dsv4RopeTable & rope) {
+        if (ratio <= 0) return 0;
+        if (kv.dim() != 3 || gate.sizes() != kv.sizes()) {
+            throw std::runtime_error(
+                "DeepSeek V4 compressor prefill expects matching [B,T,D] tensors");
+        }
+        const int64_t batch = kv.size(0);
+        const int64_t tokens = kv.size(1);
+        const int64_t output_dim = overlap ? 2 * head_dim : head_dim;
+        if (kv.size(2) != output_dim) {
+            throw std::runtime_error(
+                "DeepSeek V4 compressor prefill projection width mismatch");
+        }
+        const int64_t windows = tokens / ratio;
+        const int64_t cutoff = windows * ratio;
+        if (windows > 0) {
+            auto grouped_kv = kv.narrow(1, 0, cutoff)
+                .reshape({batch, windows, ratio, output_dim}).contiguous();
+            auto grouped_gate = gate.narrow(1, 0, cutoff)
+                .reshape({batch, windows, ratio, output_dim}).contiguous();
+            auto positions = torch::arange(
+                windows,
+                torch::TensorOptions()
+                    .device(kv.device()).dtype(torch::kInt64))
+                .reshape({1, windows}).expand({batch, windows}).contiguous();
+            auto empty = torch::empty({0}, kv.options());
+            auto compressed = dsv4_compress_cuda(
+                grouped_kv, grouped_gate, ape, norm, empty, empty,
+                positions, rope.cos, rope.sin, ratio, overlap,
+                cache_quant_mode, 1e-6);
+            pool.narrow(1, 0, windows).copy_(compressed);
+
+            state_kv.copy_(
+                kv.narrow(1, cutoff - ratio, ratio).contiguous());
+            state_gate.copy_(
+                gate.narrow(1, cutoff - ratio, ratio).contiguous());
+            if (overlap) {
+                previous_kv.copy_(state_kv.narrow(2, 0, head_dim));
+                previous_gate.copy_(state_gate.narrow(2, 0, head_dim));
+            }
+        }
+        const int64_t remainder = tokens - cutoff;
+        if (remainder > 0) {
+            state_kv.narrow(1, 0, remainder).copy_(
+                kv.narrow(1, cutoff, remainder));
+            state_gate.narrow(1, 0, remainder).copy_(
+                gate.narrow(1, cutoff, remainder));
+        }
+        return windows;
     }
 };
 
@@ -9622,8 +10244,10 @@ struct Dsv4Block : Block {
 
     torch::Tensor output_projection(torch::Tensor attention) const {
         const int64_t batch = attention.size(0);
-        auto grouped = attention.transpose(1, 2).contiguous()
-            .reshape({batch, groups, heads / groups * head_dim})
+        const int64_t tokens = attention.size(1);
+        const int64_t rows = batch * tokens;
+        auto grouped = attention.contiguous()
+            .reshape({rows, groups, heads / groups * head_dim})
             .to(torch::kFloat16);
         static const bool groupwise_enabled = [] {
             const char * value = std::getenv("MFQ_DSV4_GROUPWISE_OUTPUT_A");
@@ -9638,13 +10262,13 @@ struct Dsv4Block : Block {
             });
             return g_profiler.measure("dsv4.output_b", [&]() {
                 return output_b.forward(low_rank)
-                    .reshape({batch, 1, hidden_size});
+                    .reshape({batch, tokens, hidden_size});
             });
         }
         auto expanded = g_profiler.measure("dsv4.output_a", [&]() {
             return output_a.forward(
-                grouped.reshape({batch * groups, grouped.size(-1)}))
-                .reshape({batch, groups, groups, o_rank});
+                grouped.reshape({rows * groups, grouped.size(-1)}))
+                .reshape({rows, groups, groups, o_rank});
         });
         std::vector<torch::Tensor> diagonal;
         diagonal.reserve(static_cast<size_t>(groups));
@@ -9653,11 +10277,11 @@ struct Dsv4Block : Block {
                 expanded.index({Slice(), group, group, Slice()}));
         }
         auto low_rank = torch::stack(diagonal, 1)
-            .reshape({batch, groups * o_rank})
+            .reshape({rows, groups * o_rank})
             .to(torch::kFloat16).contiguous();
         return g_profiler.measure("dsv4.output_b", [&]() {
             return output_b.forward(low_rank)
-                .reshape({batch, 1, hidden_size});
+                .reshape({batch, tokens, hidden_size});
         });
     }
 
@@ -9720,6 +10344,121 @@ struct Dsv4Block : Block {
                 "dsv4.indexer_compressor_proj", [&]() {
                     return indexer_compressor.project(flat, batch, tokens);
                 });
+        }
+
+        if (tokens > 1 && cache_pos == 0 && !seq_len.has_value()) {
+            const int64_t local_tokens = std::min<int64_t>(tokens, 128);
+            auto local_positions = positions.narrow(
+                0, tokens - local_tokens, local_tokens)
+                .remainder(128).to(torch::kInt64).contiguous();
+            g_profiler.measure("dsv4.local_cache_prefill", [&]() {
+                local_cache.index_copy_(
+                    1, local_positions,
+                    values.narrow(1, tokens - local_tokens, local_tokens));
+                return 0;
+            });
+
+            int64_t visible = 0;
+            if (compress_ratio > 0) {
+                visible = g_profiler.measure(
+                    "dsv4.compressor_prefill", [&]() {
+                        return compressor.prefill(
+                            compressor_parts.at(0), compressor_parts.at(1),
+                            attention_rope);
+                    });
+            }
+            if (compress_ratio == 4) {
+                const int64_t index_visible = g_profiler.measure(
+                    "dsv4.indexer_compressor_prefill", [&]() {
+                        return indexer_compressor.prefill(
+                            indexer_parts.at(0), indexer_parts.at(1),
+                            attention_rope);
+                    });
+                if (index_visible != visible) {
+                    throw std::runtime_error(
+                        "DeepSeek V4 compressor/indexer prefill length mismatch");
+                }
+            }
+
+            torch::Tensor selected;
+            auto int_options = torch::TensorOptions()
+                .device(x.device()).dtype(torch::kInt32);
+            if (compress_ratio == 4 && visible > 512) {
+                auto index_query = g_profiler.measure(
+                    "dsv4.indexer_q_prefill", [&]() {
+                        return indexer_q.forward(qr)
+                            .reshape({batch, tokens, heads, 128})
+                            .transpose(1, 2).contiguous();
+                    });
+                index_query = dsv4_rotate_rope_tail(
+                    index_query, positions, attention_rope, false)
+                    .transpose(1, 2).contiguous();
+                index_query = nepq_hadamard_input_cuda(
+                    index_query.reshape({batch * tokens * heads, 128})
+                        .to(torch::kFloat16).contiguous(),
+                    shared_state->hadamard_signs, 128)
+                    .reshape({batch, tokens, heads, 128});
+                index_query = dsv4_fp4_sim_cuda(index_query.contiguous());
+                auto weights = g_profiler.measure(
+                    "dsv4.indexer_weight_prefill", [&]() {
+                        return torch::matmul(
+                            x.reshape({batch * tokens, hidden_size})
+                                .to(torch::kFloat32),
+                            indexer_weight.transpose(0, 1))
+                            .reshape({batch, tokens, heads})
+                            .to(torch::kFloat16).contiguous();
+                    });
+                auto scores = g_profiler.measure(
+                    "dsv4.indexer_scores_prefill", [&]() {
+                        return dsv4_indexer_scores_cuda(
+                            index_query,
+                            indexer_compressor.pool
+                                .narrow(1, 0, visible).contiguous(),
+                            weights, 0, 4);
+                    });
+                selected = g_profiler.measure(
+                    "dsv4.indexer_topk_prefill", [&]() {
+                        return dsv4_topk512_cuda(scores);
+                    });
+            } else if (visible > 0) {
+                selected = torch::arange(visible, int_options)
+                    .reshape({1, 1, visible})
+                    .expand({batch, tokens, visible}).contiguous();
+            } else {
+                selected = torch::zeros({batch, tokens, 1}, int_options);
+            }
+
+            const int64_t plan_ratio =
+                compress_ratio > 0 ? compress_ratio : 1;
+            auto plan = g_profiler.measure(
+                "dsv4.attention_plan_prefill", [&]() {
+                    return dsv4_build_prefill_plan_cuda(
+                        selected, 0, 0, visible, plan_ratio, 128);
+                });
+            auto cache = g_profiler.measure(
+                "dsv4.attention_cache_prefill", [&]() {
+                    return visible > 0
+                        ? torch::cat({
+                            values,
+                            compressor.pool.narrow(1, 0, visible)}, 1)
+                            .contiguous()
+                        : values.contiguous();
+                });
+            auto attention = g_profiler.measure(
+                "dsv4.sparse_attention_prefill", [&]() {
+                    return attention_dsv4_sparse_cuda(
+                        queries, cache, plan.at(0), plan.at(1),
+                        sinks, shared_state->attention_meta,
+                        1.0 / std::sqrt(static_cast<double>(head_dim)));
+                });
+            attention = g_profiler.measure(
+                "dsv4.attention_inverse_rope_prefill", [&]() {
+                    auto transposed = attention.transpose(1, 2).contiguous();
+                    transposed = dsv4_rotate_rope_tail(
+                        transposed, positions, attention_rope, true);
+                    return transposed.transpose(1, 2).contiguous();
+                });
+            return output_projection(attention);
         }
 
         std::vector<torch::Tensor> outputs;
@@ -11706,6 +12445,7 @@ static std::unique_ptr<Block> load_block(
 struct Model {
     Config c;
     RopeCache rope;
+    std::unordered_map<int, RopeCache> device_ropes;
     QuantLinear embed;
     std::vector<std::unique_ptr<Block>> blocks;
     torch::Tensor output_norm;
@@ -11739,7 +12479,10 @@ struct Model {
 
     void reset(int64_t B) {
         cache_pos = 0;
-        for (auto & b : blocks) b->reset(B);
+        for (auto & b : blocks) {
+            c10::cuda::CUDAGuard guard(b->cuda_device);
+            b->reset(B);
+        }
     }
 
     torch::Tensor finalize_hidden(torch::Tensor x, int64_t B, int64_t T) {
@@ -11771,7 +12514,10 @@ struct Model {
                                  c10::optional<torch::Tensor> pos_override = c10::nullopt,
                                  c10::optional<torch::Tensor> seq_len = c10::nullopt,
                                  std::vector<torch::Tensor> * block_trace = nullptr) {
-        ids = ids.to(torch::kCUDA, torch::kInt64);
+        const int primary = g_layer_placement.primary_device();
+        c10::cuda::CUDAGuard primary_guard(primary);
+        ids = tensor_to_cuda_device(
+            ids.to(torch::kInt64), primary);
         if (ids.dim() == 1) ids = ids.unsqueeze(0);
         int64_t B = ids.size(0), T = ids.size(1);
         if (cache_pos == 0) reset(B);
@@ -11791,11 +12537,28 @@ struct Model {
         }
         if (block_trace != nullptr) block_trace->push_back(x.to(torch::kFloat32).clone());
         for (auto & b : blocks) {
-            b->set_token_ids(ids);
-            x = b->forward(x, pos, cache_pos, seq_len, c, rope);
-            if (block_trace != nullptr) block_trace->push_back(x.to(torch::kFloat32).clone());
+            c10::cuda::CUDAGuard block_guard(b->cuda_device);
+            auto local_ids = tensor_to_cuda_device(ids, b->cuda_device);
+            auto local_pos = tensor_to_cuda_device(pos, b->cuda_device);
+            c10::optional<torch::Tensor> local_seq_len = c10::nullopt;
+            if (seq_len.has_value()) {
+                local_seq_len = tensor_to_cuda_device(
+                    seq_len.value(), b->cuda_device);
+            }
+            x = tensor_to_cuda_device(x, b->cuda_device);
+            b->set_token_ids(local_ids);
+            const RopeCache & active_rope = device_ropes.empty()
+                ? rope : device_ropes.at(b->cuda_device);
+            x = b->forward(
+                x, local_pos, cache_pos, local_seq_len, c, active_rope);
+            if (block_trace != nullptr) {
+                block_trace->push_back(
+                    tensor_to_cuda_device(x, primary)
+                        .to(torch::kFloat32).clone());
+            }
         }
         if (!pos_override.has_value()) cache_pos += T;
+        x = tensor_to_cuda_device(x, primary);
         return finalize_hidden(x, B, T);
     }
 
@@ -11908,6 +12671,11 @@ static Model load_model(const std::string & mfq_path, const std::string & config
     Model m;
     MfqFile mfq(mfq_path);
     m.c = load_config(mfq, config_path);
+    g_layer_placement.prepare(m.c.num_hidden_layers);
+    g_layer_placement.load_device =
+        g_layer_placement.primary_device();
+    c10::cuda::CUDAGuard model_guard(
+        g_layer_placement.primary_device());
     if (!g_dsv4_cpu_offload_layers.empty()) {
         if (!m.c.is_dsv4()) {
             throw std::runtime_error(
@@ -11931,6 +12699,12 @@ static Model load_model(const std::string & mfq_path, const std::string & config
     }
     if (!m.c.is_gemma4() && !m.c.is_dsv4()) {
         m.rope = RopeCache(m.c);
+        if (g_layer_placement.enabled()) {
+            for (int device : g_layer_placement.devices) {
+                c10::cuda::CUDAGuard rope_guard(device);
+                m.device_ropes.emplace(device, RopeCache(m.c));
+            }
+        }
     }
     const bool gguf_names = mfq.records.count("token_embd.weight") != 0;
     m.c.norm_weight_offset =
@@ -11988,17 +12762,36 @@ static Model load_model(const std::string & mfq_path, const std::string & config
     }
     if (load_blocks) {
         m.blocks.reserve((size_t)m.c.num_hidden_layers);
-        auto glm_state = m.c.is_glm_dsa()
-            ? std::make_shared<GlmDsaSharedState>() : nullptr;
-        auto dsv4_state = m.c.is_dsv4()
-            ? std::make_shared<Dsv4SharedState>() : nullptr;
+        std::unordered_map<int, std::shared_ptr<GlmDsaSharedState>>
+            glm_states;
+        std::unordered_map<int, std::shared_ptr<Dsv4SharedState>>
+            dsv4_states;
         for (int i = 0; i < m.c.num_hidden_layers; ++i) {
+            const int device = g_layer_placement.device_for_layer(i);
+            g_layer_placement.load_device = device;
+            c10::cuda::CUDAGuard layer_guard(device);
+            std::shared_ptr<GlmDsaSharedState> glm_state;
+            std::shared_ptr<Dsv4SharedState> dsv4_state;
+            if (m.c.is_glm_dsa()) {
+                auto & state = glm_states[device];
+                if (!state) state = std::make_shared<GlmDsaSharedState>();
+                glm_state = state;
+            }
+            if (m.c.is_dsv4()) {
+                auto & state = dsv4_states[device];
+                if (!state) state = std::make_shared<Dsv4SharedState>();
+                dsv4_state = state;
+            }
             std::cerr << "loading layer " << i << " " << m.c.layer_types[(size_t)i] << std::endl;
-            m.blocks.push_back(load_block(
+            auto block = load_block(
                 mfq, m.c, i, m.c.layer_types[(size_t)i], gguf_names,
-                glm_state, dsv4_state));
+                glm_state, dsv4_state);
+            block->cuda_device = device;
+            m.blocks.push_back(std::move(block));
         }
     }
+    g_layer_placement.load_device =
+        g_layer_placement.primary_device();
     if (g_moe_expert_cache &&
             g_moe_expert_cache->has_sources() &&
             !g_moe_expert_cache->finalized()) {
@@ -12050,6 +12843,7 @@ static void configure_tensor_parallel(
         const std::string & devices_arg,
         const std::string & split_arg,
         bool allow_duplicate_devices = false) {
+    g_tensor_parallel_collectives.reset();
     g_tensor_parallel = {};
     if (devices_arg.empty()) {
         if (!split_arg.empty()) {
@@ -12143,6 +12937,9 @@ static void configure_tensor_parallel(
             }
         }
     }
+    g_tensor_parallel_collectives.configure(
+        g_tensor_parallel.devices,
+        allow_duplicate_devices);
     MFQ_CUDA_CHECK(
         cudaSetDevice(
             g_tensor_parallel.primary_device()));
@@ -12160,6 +12957,91 @@ static void configure_tensor_parallel(
              ++index) {
             if (index) std::cerr << ',';
             std::cerr << g_tensor_parallel.split[index];
+        }
+    }
+    std::cerr << " collective_backend="
+              << (g_tensor_parallel_collectives.collectives_enabled
+                  ? "nccl" : "serial")
+              << '\n';
+}
+
+static void configure_layer_placement(
+        const std::string & devices_arg,
+        const std::string & split_arg) {
+    g_layer_placement = {};
+    if (devices_arg.empty()) {
+        if (!split_arg.empty()) {
+            throw std::runtime_error(
+                "--layer-split requires --layer-parallel");
+        }
+        return;
+    }
+    if (g_tensor_parallel.enabled()) {
+        throw std::runtime_error(
+            "--layer-parallel cannot be combined with --tensor-parallel");
+    }
+
+    const auto device_values =
+        split_csv_values(devices_arg, "--layer-parallel");
+    if (device_values.size() == 1 &&
+            devices_arg.find(',') == std::string::npos) {
+        const int count = std::stoi(device_values.front());
+        if (count < 2) {
+            throw std::runtime_error(
+                "--layer-parallel device count must be at least 2");
+        }
+        g_layer_placement.devices.resize(static_cast<size_t>(count));
+        std::iota(
+            g_layer_placement.devices.begin(),
+            g_layer_placement.devices.end(), 0);
+    } else {
+        for (const auto & item : device_values) {
+            g_layer_placement.devices.push_back(std::stoi(item));
+        }
+        if (g_layer_placement.devices.size() < 2) {
+            throw std::runtime_error(
+                "--layer-parallel requires at least two devices");
+        }
+    }
+
+    int available = 0;
+    MFQ_CUDA_CHECK(cudaGetDeviceCount(&available));
+    std::unordered_set<int> unique_devices;
+    for (int device : g_layer_placement.devices) {
+        if (device < 0 || device >= available) {
+            throw std::runtime_error(
+                "layer-placement CUDA device is unavailable: " +
+                std::to_string(device));
+        }
+        if (!unique_devices.insert(device).second) {
+            throw std::runtime_error(
+                "layer-placement CUDA devices must be unique");
+        }
+    }
+    if (!split_arg.empty()) {
+        for (const auto & item :
+             split_csv_values(split_arg, "--layer-split")) {
+            g_layer_placement.split.push_back(std::stod(item));
+        }
+        if (g_layer_placement.split.size() !=
+                g_layer_placement.devices.size()) {
+            throw std::runtime_error(
+                "--layer-split count must match --layer-parallel devices");
+        }
+    }
+    MFQ_CUDA_CHECK(cudaSetDevice(g_layer_placement.primary_device()));
+    std::cerr << "layer_parallel devices=";
+    for (size_t index = 0;
+         index < g_layer_placement.devices.size(); ++index) {
+        if (index) std::cerr << ',';
+        std::cerr << g_layer_placement.devices[index];
+    }
+    if (!g_layer_placement.split.empty()) {
+        std::cerr << " split=";
+        for (size_t index = 0;
+             index < g_layer_placement.split.size(); ++index) {
+            if (index) std::cerr << ',';
+            std::cerr << g_layer_placement.split[index];
         }
     }
     std::cerr << '\n';
@@ -16669,6 +17551,88 @@ static int run_dsv4_attention_check(int reps) {
     }
 
     {
+        constexpr int ID = 128, T = 14, R = 4, OD = 2 * ID;
+        auto index_norm = torch::randn(
+            {ID}, cuda.dtype(torch::kFloat32));
+        auto kv = torch::randn(
+            {B, T, OD}, cuda.dtype(torch::kFloat32));
+        auto gate = torch::randn(
+            {B, T, OD}, cuda.dtype(torch::kFloat32));
+        Dsv4RopeTable rope;
+        rope.cos = torch::ones(
+            {T + 1, RD / 2}, cuda.dtype(torch::kFloat32));
+        rope.sin = torch::zeros_like(rope.cos);
+        rope.negative_sin = -rope.sin;
+
+        Dsv4PoolState batched;
+        batched.ratio = R;
+        batched.head_dim = ID;
+        batched.overlap = true;
+        batched.cache_quant_mode = 2;
+        batched.ape = torch::randn(
+            {R, OD}, cuda.dtype(torch::kFloat32));
+        batched.norm = index_norm;
+        batched.reset(B, T);
+
+        Dsv4PoolState decoded;
+        decoded.ratio = batched.ratio;
+        decoded.head_dim = batched.head_dim;
+        decoded.overlap = batched.overlap;
+        decoded.cache_quant_mode = batched.cache_quant_mode;
+        decoded.ape = batched.ape;
+        decoded.norm = batched.norm;
+        decoded.reset(B, T);
+
+        const int64_t windows = batched.prefill(kv, gate, rope);
+        auto seq_len = torch::zeros(
+            {B}, cuda.dtype(torch::kInt64));
+        for (int t = 0; t < T; ++t) {
+            seq_len.fill_(t + 1);
+            decoded.update(
+                kv.narrow(1, t, 1).contiguous(),
+                gate.narrow(1, t, 1).contiguous(),
+                seq_len, rope);
+        }
+        const auto pool_width = T / R;
+        auto reference_pool = decoded.pool.narrow(1, 0, pool_width);
+        auto candidate_pool = batched.pool.narrow(1, 0, pool_width);
+        const double pool_rel =
+            (candidate_pool.to(torch::kFloat32) -
+             reference_pool.to(torch::kFloat32)).norm().item<double>() /
+            std::max(
+                reference_pool.to(torch::kFloat32).norm().item<double>(),
+                1e-30);
+        const double state_rel =
+            (batched.state_kv - decoded.state_kv)
+                .norm().item<double>() /
+            std::max(decoded.state_kv.norm().item<double>(), 1e-30);
+        const double gate_rel =
+            (batched.state_gate - decoded.state_gate)
+                .norm().item<double>() /
+            std::max(decoded.state_gate.norm().item<double>(), 1e-30);
+        const double previous_rel =
+            (batched.previous_kv - decoded.previous_kv)
+                .norm().item<double>() /
+            std::max(decoded.previous_kv.norm().item<double>(), 1e-30);
+        const double previous_gate_rel =
+            (batched.previous_gate - decoded.previous_gate)
+                .norm().item<double>() /
+            std::max(decoded.previous_gate.norm().item<double>(), 1e-30);
+        std::cout << "dsv4_pool_prefill_windows=" << windows
+                  << " pool_rel=" << pool_rel
+                  << " state_rel=" << state_rel
+                  << " gate_rel=" << gate_rel
+                  << " previous_rel=" << previous_rel
+                  << " previous_gate_rel=" << previous_gate_rel << "\n";
+        if (windows != pool_width || pool_rel > 0.002 ||
+            state_rel > 1e-7 || gate_rel > 1e-7 ||
+            previous_rel > 1e-7 || previous_gate_rel > 1e-7) {
+            throw std::runtime_error(
+                "DeepSeek V4 batched compressor prefill state check failed");
+        }
+    }
+
+    {
         constexpr int ROWS = 9, WIDTH = 128;
         auto input = torch::randn(
             {ROWS, WIDTH}, cuda.dtype(torch::kFloat16)) * 2.0;
@@ -16899,6 +17863,8 @@ int main(int argc, char ** argv) {
         std::string moe_cache_profile_path;
         std::string tensor_parallel_arg;
         std::string tensor_split_arg;
+        std::string layer_parallel_arg;
+        std::string layer_split_arg;
         double moe_gpu_cache_gb = 0.0;
         int gen = 16;
         int server_port = 8080;
@@ -17107,6 +18073,12 @@ int main(int argc, char ** argv) {
             else if (a == "--tensor-split" && i + 1 < argc) {
                 tensor_split_arg = argv[++i];
             }
+            else if (a == "--layer-parallel" && i + 1 < argc) {
+                layer_parallel_arg = argv[++i];
+            }
+            else if (a == "--layer-split" && i + 1 < argc) {
+                layer_split_arg = argv[++i];
+            }
             else if (a == "--tensor-parallel-test-duplicates") {
                 tensor_parallel_test_duplicates = true;
             }
@@ -17131,6 +18103,7 @@ int main(int argc, char ** argv) {
                              "(--ids 1,2,3 --gen 128 | --server "
                              "[--host 127.0.0.1 --port 8080 --ctx-size 32768 --model-name name "
                              "--tensor-parallel 0,1 --tensor-split 1,1 "
+                             "--layer-parallel 0,1 --layer-split 1,1 "
                              "--cpu-offload-layers 0-7,12 --moe-gpu-cache-gb 8 "
                              "--moe-cache-profile profile.json "
                              "--api-key key --web-root path] | --kl-base reference.bin "
@@ -17147,9 +18120,9 @@ int main(int argc, char ** argv) {
         configure_tensor_parallel(
             tensor_parallel_arg,
             tensor_split_arg,
-            tensor_parallel_test_duplicates ||
-                !check_tp_linear.empty() ||
-                !check_tp_moe.empty());
+            tensor_parallel_test_duplicates);
+        configure_layer_placement(
+            layer_parallel_arg, layer_split_arg);
         if (moe_gpu_cache_gb < 0.0 ||
                 !std::isfinite(moe_gpu_cache_gb)) {
             throw std::runtime_error(
