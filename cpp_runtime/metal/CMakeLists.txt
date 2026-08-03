@@ -130,6 +130,39 @@ if(TARGET mfq-server)
             "No llama.cpp runtime dylibs found in "
             "${MFQ_LLAMA_RUNTIME_DIR}")
     endif()
+
+    add_executable(mfq-perplexity
+        mfq_perplexity_mlx.cpp
+    )
+    target_link_libraries(mfq-perplexity PRIVATE
+        mfq-metal-runtime
+        mfq-server
+    )
+    target_compile_features(mfq-perplexity PRIVATE cxx_std_20)
+    set_target_properties(mfq-perplexity PROPERTIES
+        BUILD_RPATH "@executable_path/lib"
+        BUILD_WITH_INSTALL_RPATH ON
+        INSTALL_RPATH "@executable_path/lib"
+    )
+    add_custom_command(TARGET mfq-perplexity POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:mfq-perplexity>/lib"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${MFQ_MLX_ROOT}/lib/libmlx.dylib"
+            "$<TARGET_FILE_DIR:mfq-perplexity>/lib/libmlx.dylib"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${MFQ_MLX_ROOT}/lib/libjaccl.dylib"
+            "$<TARGET_FILE_DIR:mfq-perplexity>/lib/libjaccl.dylib"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${MFQ_MLX_ROOT}/lib/mlx.metallib"
+            "$<TARGET_FILE_DIR:mfq-perplexity>/lib/mlx.metallib"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${_MFQ_LLAMA_RUNTIME_DYLIBS}
+            "$<TARGET_FILE_DIR:mfq-perplexity>/lib"
+        COMMAND_EXPAND_LISTS
+        COMMENT "Copying mfq-perplexity MLX and tokenizer runtime files"
+    )
+
     add_custom_command(TARGET mfq-decode-metal POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${_MFQ_LLAMA_RUNTIME_DYLIBS}
@@ -150,6 +183,14 @@ if(TARGET mfq-server)
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/bundle_macos_dylib.cmake"
             COMMENT
                 "Making ${_MFQ_LLAMA_RUNTIME_DYLIB_NAME} relocatable"
+        )
+        add_custom_command(TARGET mfq-perplexity POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                "-DMFQ_DYLIB=$<TARGET_FILE_DIR:mfq-perplexity>/lib/${_MFQ_LLAMA_RUNTIME_DYLIB_NAME}"
+                "-DMFQ_INSTALL_NAME_TOOL=${CMAKE_INSTALL_NAME_TOOL}"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/bundle_macos_dylib.cmake"
+            COMMENT
+                "Making ${_MFQ_LLAMA_RUNTIME_DYLIB_NAME} relocatable for mfq-perplexity"
         )
     endforeach()
 endif()
