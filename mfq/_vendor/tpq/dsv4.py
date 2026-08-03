@@ -455,10 +455,22 @@ def _qkv(x: torch.Tensor, w: dict, cfg: DSV4Config, cache: RopeCache, pos0: int)
     # hidden 与 dense GEMM 仍为 BF16。SM120 sparse kernel 将移除此转换。
     qr = rmsnorm(_lin(x, w["wq_a"]).float(), w["q_norm"], cfg.rms_eps)
     q = _lin(qr, w["wq_b"]).view(B, T, H, hd).float()
-    qf = q.float()
-    q = (
-        qf * torch.rsqrt(qf.square().mean(-1, keepdim=True) + cfg.rms_eps)
-    ).to(q.dtype)   # 逐头无权重 RMS，易漏！
+    requested_norm_block = int(
+        os.environ.get("TPQ_PREFILL_QUERY_BLOCK", "0")
+    )
+    if requested_norm_block > 0:
+        norm_block = min(T, requested_norm_block)
+    else:
+        bytes_per_token = max(1, B * H * hd * q.element_size())
+        norm_block = max(1, min(T, (64 << 20) // bytes_per_token))
+    for norm_begin in range(0, T, norm_block):
+        norm_end = min(T, norm_begin + norm_block)
+        q_block = q[:, norm_begin:norm_end]
+        q_block.mul_(
+            torch.rsqrt(
+                q_block.square().mean(-1, keepdim=True) + cfg.rms_eps
+            )
+        )
     cos = cache.cos[pos0:pos0 + T]
     sin = cache.sin[pos0:pos0 + T]
     q[..., hd - rd:] = rope_apply(q[..., hd - rd:], cos.view(1, T, 1, -1), sin.view(1, T, 1, -1))

@@ -4201,6 +4201,489 @@ torch::Tensor nepq_moe_grouped_matmul_ws_cuda(
     return out;
 }
 
+// Route-compacted online-dequant FP16 Tensor Core path for mixed NVQ pools.
+// One task covers up to 16 routed rows and a 64-row output tile.  The route
+// map is identical to the production grouped kernels; only the activation
+// arithmetic changes from Q8 to FP16 for controlled KLD comparisons.
+template <int FORMAT>
+__global__ void __launch_bounds__(256, 1) nvq_moe_grouped_f16_kernel(
+    const uint8_t * indices,
+    int64_t indices_nbytes,
+    const uint8_t * aux,
+    int64_t aux_nbytes,
+    const uint8_t * sub_scale,
+    int64_t sub_scale_nbytes,
+    const float * neuron_scale,
+    const int8_t * codebook,
+    const __half * x,
+    const int32_t * expert_local,
+    const int32_t * ids_dst,
+    const int32_t * expert_bounds,
+    const int32_t * tile_bounds,
+    const int32_t * tile_experts,
+    __half * output,
+    int routes,
+    int global_experts,
+    int pool_experts,
+    int out_per_expert,
+    int K,
+    int ng,
+    int nvec,
+    int nsign,
+    int sub_bits,
+    int sign_mode,
+    int max_tiles,
+    bool routed_input) {
+    constexpr int kTileM = 16;
+    constexpr int kTileN = 64;
+    constexpr int kGroupsPerChunk = 4;
+    constexpr int kTileK = kGroupSize * kGroupsPerChunk;
+    constexpr int kStrideK = kTileK + 8;
+    constexpr int kNFragments = kTileN / 16;
+    constexpr int kFineTilesPerTask = kTileM / 8;
+
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int tid = warp * 32 + lane;
+    const int ntiles_n = (out_per_expert + kTileN - 1) / kTileN;
+    const int64_t max_tasks = static_cast<int64_t>(max_tiles) * ntiles_n;
+    __shared__ __half weight_tile[kTileN][kStrideK];
+    __shared__ __half activation_tile[kTileM][kStrideK];
+    __shared__ float output_tile[kNFragments][16][16];
+
+    using FragmentA = wmma::fragment<wmma::matrix_a, 16, 16, 16,
+                                     __half, wmma::row_major>;
+    using FragmentB = wmma::fragment<wmma::matrix_b, 16, 16, 16,
+                                     __half, wmma::col_major>;
+    using FragmentC = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
+
+    for (int64_t task = blockIdx.x; task < max_tasks; task += gridDim.x) {
+        const int fine_tile = static_cast<int>(task / ntiles_n);
+        const int ntile = static_cast<int>(task -
+            static_cast<int64_t>(fine_tile) * ntiles_n);
+        if (fine_tile >= tile_bounds[global_experts]) continue;
+        const int expert = tile_experts[fine_tile];
+        const int local_fine_tile = fine_tile - tile_bounds[expert];
+        if (local_fine_tile % kFineTilesPerTask != 0) continue;
+        const int local_expert = expert_local[expert];
+        if (static_cast<unsigned int>(local_expert) >=
+            static_cast<unsigned int>(pool_experts)) continue;
+        const int first = expert_bounds[expert] + local_fine_tile * 8;
+        const int last = min(first + kTileM, expert_bounds[expert + 1]);
+        const int n0 = ntile * kTileN;
+
+        FragmentC accumulator;
+        wmma::fill_fragment(accumulator, 0.0f);
+        const int chunks = (ng + kGroupsPerChunk - 1) / kGroupsPerChunk;
+        for (int chunk = 0; chunk < chunks; ++chunk) {
+            const int group_base = chunk * kGroupsPerChunk;
+            const int k_base = group_base * kGroupSize;
+            const int row_local = tid / kGroupsPerChunk;
+            const int group_local = tid - row_local * kGroupsPerChunk;
+            const int local_row = n0 + row_local;
+            const int row = local_expert * out_per_expert + local_row;
+            const int group = group_base + group_local;
+            const bool valid_weight =
+                local_row < out_per_expert && group < ng;
+            uint32_t state = 0;
+            float scale = 0.0f;
+            if (valid_weight) {
+                const int64_t sub_linear =
+                    static_cast<int64_t>(row) * ng + group;
+                state = load_packed_bits(
+                    sub_scale, sub_linear * sub_bits,
+                    sub_bits, sub_scale_nbytes);
+                scale = format_scale<FORMAT>(
+                    neuron_scale[row], state, codebook);
+            }
+#pragma unroll
+            for (int quartet = 0; quartet < kChunksPerGroup; ++quartet) {
+                const int packed = valid_weight
+                    ? decode_chunk4<FORMAT>(
+                          indices, indices_nbytes, aux, aux_nbytes, codebook,
+                          row, group, quartet, nvec, nsign, ng,
+                          sign_mode, state)
+                    : 0;
+#pragma unroll
+                for (int pair = 0; pair < 2; ++pair) {
+                    const int shift = pair * 16;
+                    const int value0 = static_cast<int>(
+                        static_cast<int8_t>((packed >> shift) & 0xff));
+                    const int value1 = static_cast<int>(
+                        static_cast<int8_t>((packed >> (shift + 8)) & 0xff));
+                    *reinterpret_cast<__half2 *>(
+                        &weight_tile[row_local]
+                            [group_local * kGroupSize + quartet * 4 + pair * 2]) =
+                        __halves2half2(
+                            __float2half(scale * static_cast<float>(value0)),
+                            __float2half(scale * static_cast<float>(value1)));
+                }
+            }
+
+            constexpr int kActivationPairs = kTileM * (kTileK / 2);
+            for (int index = tid; index < kActivationPairs; index += 256) {
+                const int m_local = index / (kTileK / 2);
+                const int k_pair = index - m_local * (kTileK / 2);
+                const int compact = first + m_local;
+                const int k = k_base + k_pair * 2;
+                __half2 values = __float2half2_rn(0.0f);
+                if (compact < last) {
+                    const int pair_index = ids_dst[compact];
+                    const int source_row = routed_input
+                        ? pair_index : pair_index / routes;
+                    if (k + 1 < K) {
+                        values = *reinterpret_cast<const __half2 *>(
+                            x + static_cast<int64_t>(source_row) * K + k);
+                    } else if (k < K) {
+                        values = __halves2half2(
+                            x[static_cast<int64_t>(source_row) * K + k],
+                            __float2half(0.0f));
+                    }
+                }
+                *reinterpret_cast<__half2 *>(
+                    &activation_tile[m_local][k_pair * 2]) = values;
+            }
+            __syncthreads();
+
+            if (warp < kNFragments) {
+#pragma unroll
+                for (int k_local = 0; k_local < kTileK; k_local += 16) {
+                    FragmentA activation_fragment;
+                    FragmentB weight_fragment;
+                    wmma::load_matrix_sync(
+                        activation_fragment, &activation_tile[0][k_local],
+                        kStrideK);
+                    wmma::load_matrix_sync(
+                        weight_fragment, &weight_tile[warp * 16][k_local],
+                        kStrideK);
+                    wmma::mma_sync(
+                        accumulator, activation_fragment,
+                        weight_fragment, accumulator);
+                }
+            }
+            __syncthreads();
+        }
+
+        if (warp < kNFragments) {
+            wmma::store_matrix_sync(
+                &output_tile[warp][0][0], accumulator,
+                16, wmma::mem_row_major);
+        }
+        __syncthreads();
+        if (warp < kNFragments) {
+            for (int element = lane; element < 256; element += 32) {
+                const int m_local = element / 16;
+                const int n_local = element - m_local * 16;
+                const int compact = first + m_local;
+                const int local_row = n0 + warp * 16 + n_local;
+                if (compact < last && local_row < out_per_expert) {
+                    const int pair_index = ids_dst[compact];
+                    output[static_cast<int64_t>(pair_index) * out_per_expert +
+                           local_row] =
+                        __float2half(output_tile[warp][m_local][n_local]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+template <int FORMAT>
+__global__ void __launch_bounds__(256, 1) nepq_moe_grouped_f16_kernel(
+    const uint8_t * indices,
+    int64_t indices_nbytes,
+    const uint8_t * aux,
+    int64_t aux_nbytes,
+    const uint8_t * sub_scale,
+    int64_t sub_scale_nbytes,
+    const float * neuron_scale,
+    const int8_t * table_pool,
+    const uint8_t * bank_ids,
+    const __half * x,
+    const int32_t * expert_local,
+    const int32_t * ids_dst,
+    const int32_t * expert_bounds,
+    const int32_t * tile_bounds,
+    const int32_t * tile_experts,
+    __half * output,
+    int routes,
+    int global_experts,
+    int pool_experts,
+    int out_per_expert,
+    int K,
+    int ng,
+    int nvec,
+    int nsign,
+    int nsuper,
+    int table_stride,
+    int sub_bits,
+    int max_tiles,
+    bool routed_input) {
+    constexpr int kTileM = 16;
+    constexpr int kTileN = 64;
+    constexpr int kGroupsPerChunk = kNepqGroupsPerSupergroup;
+    constexpr int kTileK = kGroupSize * kGroupsPerChunk;
+    constexpr int kStrideK = kTileK + 8;
+    constexpr int kNFragments = kTileN / 16;
+    constexpr int kFineTilesPerTask = kTileM / 8;
+
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int tid = warp * 32 + lane;
+    const int ntiles_n = (out_per_expert + kTileN - 1) / kTileN;
+    const int64_t max_tasks = static_cast<int64_t>(max_tiles) * ntiles_n;
+    __shared__ __half weight_tile[kTileN][kStrideK];
+    __shared__ __half activation_tile[kTileM][kStrideK];
+    __shared__ float output_tile[kNFragments][16][16];
+
+    using FragmentA = wmma::fragment<wmma::matrix_a, 16, 16, 16,
+                                     __half, wmma::row_major>;
+    using FragmentB = wmma::fragment<wmma::matrix_b, 16, 16, 16,
+                                     __half, wmma::col_major>;
+    using FragmentC = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
+
+    for (int64_t task = blockIdx.x; task < max_tasks; task += gridDim.x) {
+        const int fine_tile = static_cast<int>(task / ntiles_n);
+        const int ntile = static_cast<int>(task -
+            static_cast<int64_t>(fine_tile) * ntiles_n);
+        if (fine_tile >= tile_bounds[global_experts]) continue;
+        const int expert = tile_experts[fine_tile];
+        const int local_fine_tile = fine_tile - tile_bounds[expert];
+        if (local_fine_tile % kFineTilesPerTask != 0) continue;
+        const int local_expert = expert_local[expert];
+        if (static_cast<unsigned int>(local_expert) >=
+            static_cast<unsigned int>(pool_experts)) continue;
+        const int first = expert_bounds[expert] + local_fine_tile * 8;
+        const int last = min(first + kTileM, expert_bounds[expert + 1]);
+        const int n0 = ntile * kTileN;
+
+        FragmentC accumulator;
+        wmma::fill_fragment(accumulator, 0.0f);
+        const int chunks = (ng + kGroupsPerChunk - 1) / kGroupsPerChunk;
+        for (int chunk = 0; chunk < chunks; ++chunk) {
+            const int group_base = chunk * kGroupsPerChunk;
+            const int k_base = group_base * kGroupSize;
+            const int row_local = tid / kGroupsPerChunk;
+            const int group_local = tid - row_local * kGroupsPerChunk;
+            const int local_row = n0 + row_local;
+            const int row = local_expert * out_per_expert + local_row;
+            const int group = group_base + group_local;
+            const bool valid_weight =
+                local_row < out_per_expert && group < ng;
+            uint32_t state = 0;
+            float scale = 0.0f;
+            const int8_t * table = table_pool;
+            if (valid_weight) {
+                const int64_t sub_linear =
+                    static_cast<int64_t>(row) * ng + group;
+                state = load_packed_bits(
+                    sub_scale, sub_linear * sub_bits,
+                    sub_bits, sub_scale_nbytes);
+                table = nepq_active_table(
+                    table_pool, bank_ids, row, group,
+                    nsuper, table_stride);
+                scale = format_scale<FORMAT>(
+                    neuron_scale[row], state, table);
+            }
+#pragma unroll
+            for (int quartet = 0; quartet < kChunksPerGroup; ++quartet) {
+                const int packed = valid_weight
+                    ? decode_nepq_chunk4<FORMAT>(
+                          indices, indices_nbytes, aux, aux_nbytes, table,
+                          row, group, quartet, nvec, nsign, ng,
+                          0, state)
+                    : 0;
+#pragma unroll
+                for (int pair = 0; pair < 2; ++pair) {
+                    const int shift = pair * 16;
+                    const int value0 = static_cast<int>(
+                        static_cast<int8_t>((packed >> shift) & 0xff));
+                    const int value1 = static_cast<int>(
+                        static_cast<int8_t>((packed >> (shift + 8)) & 0xff));
+                    *reinterpret_cast<__half2 *>(
+                        &weight_tile[row_local]
+                            [group_local * kGroupSize + quartet * 4 + pair * 2]) =
+                        __halves2half2(
+                            __float2half(scale * static_cast<float>(value0)),
+                            __float2half(scale * static_cast<float>(value1)));
+                }
+            }
+
+            constexpr int kActivationPairs = kTileM * (kTileK / 2);
+            for (int index = tid; index < kActivationPairs; index += 256) {
+                const int m_local = index / (kTileK / 2);
+                const int k_pair = index - m_local * (kTileK / 2);
+                const int compact = first + m_local;
+                const int k = k_base + k_pair * 2;
+                __half2 values = __float2half2_rn(0.0f);
+                if (compact < last) {
+                    const int pair_index = ids_dst[compact];
+                    const int source_row = routed_input
+                        ? pair_index : pair_index / routes;
+                    if (k + 1 < K) {
+                        values = *reinterpret_cast<const __half2 *>(
+                            x + static_cast<int64_t>(source_row) * K + k);
+                    } else if (k < K) {
+                        values = __halves2half2(
+                            x[static_cast<int64_t>(source_row) * K + k],
+                            __float2half(0.0f));
+                    }
+                }
+                *reinterpret_cast<__half2 *>(
+                    &activation_tile[m_local][k_pair * 2]) = values;
+            }
+            __syncthreads();
+
+            if (warp < kNFragments) {
+#pragma unroll
+                for (int k_local = 0; k_local < kTileK; k_local += 16) {
+                    FragmentA activation_fragment;
+                    FragmentB weight_fragment;
+                    wmma::load_matrix_sync(
+                        activation_fragment, &activation_tile[0][k_local],
+                        kStrideK);
+                    wmma::load_matrix_sync(
+                        weight_fragment, &weight_tile[warp * 16][k_local],
+                        kStrideK);
+                    wmma::mma_sync(
+                        accumulator, activation_fragment,
+                        weight_fragment, accumulator);
+                }
+            }
+            __syncthreads();
+        }
+
+        if (warp < kNFragments) {
+            wmma::store_matrix_sync(
+                &output_tile[warp][0][0], accumulator,
+                16, wmma::mem_row_major);
+        }
+        __syncthreads();
+        if (warp < kNFragments) {
+            for (int element = lane; element < 256; element += 32) {
+                const int m_local = element / 16;
+                const int n_local = element - m_local * 16;
+                const int compact = first + m_local;
+                const int local_row = n0 + warp * 16 + n_local;
+                if (compact < last && local_row < out_per_expert) {
+                    const int pair_index = ids_dst[compact];
+                    output[static_cast<int64_t>(pair_index) * out_per_expert +
+                           local_row] =
+                        __float2half(output_tile[warp][m_local][n_local]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+torch::Tensor nvq_moe_grouped_matmul_pool_f16_cuda(
+    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
+    torch::Tensor neuron_scale, torch::Tensor codebook, torch::Tensor x,
+    torch::Tensor expert_local, int64_t n_experts, int64_t pool_experts,
+    int64_t out_per_expert, int64_t neuron_len, int64_t gs,
+    int64_t sub_bits, int64_t format, int64_t sign_mode,
+    torch::Tensor out, torch::Tensor ids_dst, torch::Tensor expert_bounds,
+    torch::Tensor tile_bounds, torch::Tensor tile_experts) {
+    check_common(indices, aux, sub_scale, neuron_scale, codebook,
+                 neuron_len, gs, sub_bits, format, sign_mode);
+    TORCH_CHECK(gs == kGroupSize, "NVQ routed FP16 requires gs24");
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous() &&
+                x.scalar_type() == torch::kFloat16 &&
+                (x.dim() == 2 || x.dim() == 3) &&
+                x.size(-1) == neuron_len,
+                "NVQ routed FP16 input shape mismatch");
+    const int routes = static_cast<int>(out.size(1));
+    const int pairs = static_cast<int>(out.size(0)) * routes;
+    const int K = static_cast<int>(neuron_len);
+    const int ng = (K + kGroupSize - 1) / kGroupSize;
+    const int nvec = (K + (is_d4_format(format) ? 3 : 7)) /
+        (is_d4_format(format) ? 4 : 8);
+    const int nsign = (K + 7) / 8;
+    const int max_tiles = (pairs + 7) / 8 + static_cast<int>(n_experts);
+    const int ntiles_n = (static_cast<int>(out_per_expert) + 63) / 64;
+    const int blocks = static_cast<int>(std::min<int64_t>(
+        static_cast<int64_t>(max_tiles) * ntiles_n, 4096));
+    const dim3 threads(32, 8);
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+#define NVQ_MOE_F16_LAUNCH()                                                     \
+    nvq_moe_grouped_f16_kernel<F><<<blocks, threads, 0, stream>>>(               \
+        indices.data_ptr<uint8_t>(), indices.numel(),                            \
+        aux.data_ptr<uint8_t>(), aux.numel(),                                    \
+        sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),                        \
+        neuron_scale.data_ptr<float>(), codebook.data_ptr<int8_t>(),             \
+        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),                \
+        expert_local.data_ptr<int32_t>(), ids_dst.data_ptr<int32_t>(),           \
+        expert_bounds.data_ptr<int32_t>(), tile_bounds.data_ptr<int32_t>(),      \
+        tile_experts.data_ptr<int32_t>(),                                        \
+        reinterpret_cast<__half *>(out.data_ptr<at::Half>()),                    \
+        routes, static_cast<int>(n_experts), static_cast<int>(pool_experts),     \
+        static_cast<int>(out_per_expert), K, ng, nvec, nsign,                   \
+        static_cast<int>(sub_bits), static_cast<int>(sign_mode),                 \
+        max_tiles, x.dim() == 3)
+    launch_by_format(static_cast<int>(format), [&](auto tag) {
+        constexpr int F = decltype(tag)::value;
+        NVQ_MOE_F16_LAUNCH();
+    });
+#undef NVQ_MOE_F16_LAUNCH
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+torch::Tensor nepq_moe_grouped_matmul_pool_f16_cuda(
+    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
+    torch::Tensor neuron_scale, torch::Tensor table_pool,
+    torch::Tensor bank_ids, torch::Tensor x, torch::Tensor expert_local,
+    int64_t n_experts, int64_t pool_experts, int64_t out_per_expert,
+    int64_t neuron_len, int64_t sub_bits, int64_t format,
+    torch::Tensor out, torch::Tensor ids_dst, torch::Tensor expert_bounds,
+    torch::Tensor tile_bounds, torch::Tensor tile_experts) {
+    check_nepq_common(indices, aux, sub_scale, neuron_scale, table_pool,
+                      bank_ids, neuron_len, sub_bits, format);
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous() &&
+                x.scalar_type() == torch::kFloat16 &&
+                (x.dim() == 2 || x.dim() == 3) &&
+                x.size(-1) == neuron_len,
+                "NEPQ routed FP16 input shape mismatch");
+    const int routes = static_cast<int>(out.size(1));
+    const int pairs = static_cast<int>(out.size(0)) * routes;
+    const int K = static_cast<int>(neuron_len);
+    const int ng = (K + kGroupSize - 1) / kGroupSize;
+    const int nvec = K / 8;
+    const int nsign = (K + 7) / 8;
+    const int nsuper = (ng + kNepqGroupsPerSupergroup - 1) /
+        kNepqGroupsPerSupergroup;
+    const int table_stride = static_cast<int>(table_pool.size(1));
+    const int max_tiles = (pairs + 7) / 8 + static_cast<int>(n_experts);
+    const int ntiles_n = (static_cast<int>(out_per_expert) + 63) / 64;
+    const int blocks = static_cast<int>(std::min<int64_t>(
+        static_cast<int64_t>(max_tiles) * ntiles_n, 4096));
+    const dim3 threads(32, 8);
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+#define NEPQ_MOE_F16_LAUNCH()                                                    \
+    nepq_moe_grouped_f16_kernel<F><<<blocks, threads, 0, stream>>>(              \
+        indices.data_ptr<uint8_t>(), indices.numel(),                            \
+        aux.data_ptr<uint8_t>(), aux.numel(),                                    \
+        sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),                        \
+        neuron_scale.data_ptr<float>(), table_pool.data_ptr<int8_t>(),           \
+        bank_ids.data_ptr<uint8_t>(),                                            \
+        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),                \
+        expert_local.data_ptr<int32_t>(), ids_dst.data_ptr<int32_t>(),           \
+        expert_bounds.data_ptr<int32_t>(), tile_bounds.data_ptr<int32_t>(),      \
+        tile_experts.data_ptr<int32_t>(),                                        \
+        reinterpret_cast<__half *>(out.data_ptr<at::Half>()),                    \
+        routes, static_cast<int>(n_experts), static_cast<int>(pool_experts),     \
+        static_cast<int>(out_per_expert), K, ng, nvec, nsign, nsuper,           \
+        table_stride, static_cast<int>(sub_bits), max_tiles, x.dim() == 3)
+    launch_nepq_by_format(static_cast<int>(format), [&](auto tag) {
+        constexpr int F = decltype(tag)::value;
+        NEPQ_MOE_F16_LAUNCH();
+    });
+#undef NEPQ_MOE_F16_LAUNCH
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
 torch::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
     torch::Tensor indices,
     torch::Tensor aux,
