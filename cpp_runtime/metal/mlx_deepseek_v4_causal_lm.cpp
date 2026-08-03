@@ -566,11 +566,13 @@ void MlxDeepseekV4Layer::validate_components() const {
 }
 
 MlxDeepseekV4HcPreResult
-MlxDeepseekV4Layer::hc_pre(
+MlxDeepseekV4Layer::hc_pre_norm(
     const array& residual,
     const MlxLinear& function,
     const array& scale,
-    const array& base) const {
+    const array& base,
+    const array& norm,
+    const MlxRmsNorm& normalizer) const {
     const int batch = residual.shape(0);
     const int tokens = residual.shape(1);
     const int hidden =
@@ -585,10 +587,28 @@ MlxDeepseekV4Layer::hc_pre(
                 hidden,
                 "hyper-connection width"),
         });
-    auto flat_float =
-        mlx::core::astype(
-            flat,
-            mlx::core::float32);
+    auto raw_mixes = mlx::core::astype(
+        function(flat),
+        mlx::core::float32);
+    if (config_.fast_hyper_connections()) {
+        return deepseek_v4_hc_pre_norm(
+            residual,
+            raw_mixes,
+            scale,
+            base,
+            norm,
+            checked_int(
+                config_.hc_sinkhorn_iters,
+                "HC Sinkhorn iterations"),
+            static_cast<float>(
+                config_.hc_eps),
+            static_cast<float>(
+                config_.rms_eps),
+            true);
+    }
+    auto flat_float = mlx::core::astype(
+        flat,
+        mlx::core::float32);
     auto inverse = mlx::core::rsqrt(
         mlx::core::mean(
             flat_float * flat_float,
@@ -596,30 +616,16 @@ MlxDeepseekV4Layer::hc_pre(
             true) +
         static_cast<float>(
             config_.rms_eps));
-    auto mixes =
-        mlx::core::astype(
-            function(flat),
-            mlx::core::float32) *
-        inverse;
-    if (config_.fast_hyper_connections()) {
-        return deepseek_v4_hc_pre(
-            residual,
-            mixes,
-            scale,
-            base,
-            checked_int(
-                config_.hc_sinkhorn_iters,
-                "HC Sinkhorn iterations"),
-            static_cast<float>(
-                config_.hc_eps));
-    }
-    return hc_pre_generic(
+    auto mixes = raw_mixes * inverse;
+    auto result = hc_pre_generic(
         residual,
         mixes,
         scale,
         base,
         static_cast<float>(
             config_.hc_eps));
+    result.reduced = normalizer(result.reduced);
+    return result;
 }
 
 array MlxDeepseekV4Layer::hc_post(
@@ -665,13 +671,14 @@ array MlxDeepseekV4Layer::forward(
     }
 
     auto residual = source;
-    auto attention_hc = hc_pre(
+    auto attention_hc = hc_pre_norm(
         source,
         components_.hc_attention_fn,
         components_.hc_attention_scale,
-        components_.hc_attention_base);
-    auto branch = attention_norm_(
-        attention_hc.reduced);
+        components_.hc_attention_base,
+        components_.attention_norm,
+        attention_norm_);
+    auto branch = attention_hc.reduced;
     detail::profile_eval(
         "layer.attention_hc_pre_norm",
         branch);
@@ -689,12 +696,14 @@ array MlxDeepseekV4Layer::forward(
         result);
 
     residual = result;
-    auto ffn_hc = hc_pre(
+    auto ffn_hc = hc_pre_norm(
         result,
         components_.hc_ffn_fn,
         components_.hc_ffn_scale,
-        components_.hc_ffn_base);
-    branch = ffn_norm_(ffn_hc.reduced);
+        components_.hc_ffn_base,
+        components_.ffn_norm,
+        ffn_norm_);
+    branch = ffn_hc.reduced;
     detail::profile_eval(
         "layer.ffn_hc_pre_norm",
         branch);
@@ -966,7 +975,7 @@ void MlxDeepseekV4CausalLm::clear_cache() noexcept {
 
 void MlxDeepseekV4CausalLm::materialize_state(
     const MlxDeepseekV4LayerState& state) const {
-    std::vector<array> arrays{state.local()};
+    std::vector<array> arrays{state.local_state()};
     const auto append_pool =
         [&](const MlxDeepseekV4PoolState& pool) {
             arrays.push_back(pool.pool());
@@ -1113,7 +1122,7 @@ array MlxDeepseekV4CausalLm::forward_chunk(
                 }
             };
         for (const auto& state : states_) {
-            outputs.push_back(state.local());
+            outputs.push_back(state.local_state());
             if (state.main()) {
                 append_pool(*state.main());
             }

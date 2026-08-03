@@ -163,6 +163,95 @@ constexpr const char* kNint8ZeroGroupedRow = R"METAL(
     }
 )METAL";
 
+constexpr const char* kNint8ZeroGroupedRowInverseRope = R"METAL(
+    uint lane = thread_index_in_simdgroup;
+    uint workgroup = thread_position_in_grid.x >> 5;
+    uint output = workgroup % uint(OUT);
+    uint row_tile = workgroup / uint(OUT);
+    uint first_row = row_tile * uint(TILE_M);
+    if (output >= uint(OUT) || first_row >= uint(M)) {
+        return;
+    }
+
+    uint input_group = output / uint(OUT_PER_GROUP);
+    float accumulators[TILE_M];
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        accumulators[local_row] = 0.0f;
+    }
+
+    constexpr uint PREFIX = uint(HEAD_DIM - ROTARY);
+    constexpr uint PAIRS = uint(ROTARY / 2);
+    for (uint column = lane * 4u;
+         column < uint(K);
+         column += 128u) {
+        uint quant_group = column >> 5;
+        float scale =
+            float(scales[output * uint(NG) + quant_group]);
+        uint weight_offset = output * uint(K) + column;
+        const device char4* packed =
+            (const device char4*)(q + weight_offset);
+        float4 weights = scale * float4(*packed);
+        uint head_column = column % uint(HEAD_DIM);
+
+        for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+            uint row = first_row + local_row;
+            if (row < uint(M)) {
+                uint input_offset =
+                    (row * uint(GROUP_COUNT) + input_group) * uint(K)
+                    + column;
+                float4 activations = float4(
+                    float(x[input_offset]),
+                    float(x[input_offset + 1u]),
+                    float(x[input_offset + 2u]),
+                    float(x[input_offset + 3u]));
+                if (head_column >= PREFIX) {
+                    uint token = row % uint(TOKENS);
+                    uint pair = (head_column - PREFIX) >> 1u;
+                    uint rope_offset = token * PAIRS + pair;
+                    float cosine0 = float(cos_values[rope_offset]);
+                    float sine0 = float(sin_values[rope_offset]);
+                    float cosine1 = float(cos_values[rope_offset + 1u]);
+                    float sine1 = float(sin_values[rope_offset + 1u]);
+
+                    // Match the original graph exactly: inverse RoPE writes
+                    // one T-typed intermediate before the packed GEMV reads
+                    // it back and promotes it to float for accumulation.
+                    T rotated0 = T(
+                        activations.x * cosine0
+                        + activations.y * sine0);
+                    T rotated1 = T(
+                        activations.y * cosine0
+                        - activations.x * sine0);
+                    T rotated2 = T(
+                        activations.z * cosine1
+                        + activations.w * sine1);
+                    T rotated3 = T(
+                        activations.w * cosine1
+                        - activations.z * sine1);
+                    activations = float4(
+                        float(rotated0),
+                        float(rotated1),
+                        float(rotated2),
+                        float(rotated3));
+                }
+                accumulators[local_row] +=
+                    activations.x * weights.x
+                    + activations.y * weights.y
+                    + activations.z * weights.z
+                    + activations.w * weights.w;
+            }
+        }
+    }
+
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        float total = simd_sum(accumulators[local_row]);
+        uint row = first_row + local_row;
+        if (lane == 0u && row < uint(M)) {
+            y[row * uint(OUT) + output] = T(total);
+        }
+    }
+)METAL";
+
 constexpr const char* kNint8ZeroEmbedding = R"METAL(
     uint linear = thread_position_in_grid.x;
     if (linear >= uint(COUNT * K)) {
@@ -326,6 +415,24 @@ mlx::core::fast::CustomKernelFunction make_grouped_row_kernel() {
 
 const mlx::core::fast::CustomKernelFunction& grouped_row_kernel() {
     static const auto kernel = make_grouped_row_kernel();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+grouped_row_inverse_rope_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_nint8_zero_grouped_row_inverse_rope",
+            {"q", "scales", "x", "cos_values", "sin_values"},
+            {"y"},
+            kNint8ZeroGroupedRowInverseRope,
+            "",
+            true,
+            false,
+            options);
+    }();
     return kernel;
 }
 
@@ -622,6 +729,132 @@ array MlxNint8ZeroWeight::grouped_row_matmul(
         std::min<std::int64_t>(256, grid_x));
     auto outputs = grouped_row_kernel()(
         {q_, scales_, source},
+        {
+            Shape{
+                static_cast<std::int32_t>(rows),
+                output_size_,
+            },
+        },
+        {source.dtype()},
+        {static_cast<int>(grid_x), 1, 1},
+        {threadgroup, 1, 1},
+        std::move(templates),
+        std::nullopt,
+        false,
+        {});
+    return mlx::core::reshape(
+        outputs.front(),
+        std::move(output_shape));
+}
+
+array MlxNint8ZeroWeight::grouped_row_matmul_inverse_rope(
+    const array& input,
+    int group_count,
+    const array& cosine,
+    const array& sine,
+    int head_dimension,
+    int rotary_dimension) const {
+    if (group_count <= 0 ||
+        input.ndim() < 3 ||
+        input.shape(-2) != group_count ||
+        input.shape(-1) != input_size_ ||
+        output_size_ % group_count != 0 ||
+        head_dimension <= 0 ||
+        rotary_dimension <= 0 ||
+        rotary_dimension > head_dimension ||
+        head_dimension % 4 != 0 ||
+        rotary_dimension % 4 != 0 ||
+        input_size_ % head_dimension != 0 ||
+        cosine.shape() != sine.shape() ||
+        cosine.ndim() != 2 ||
+        cosine.shape(0) <= 0 ||
+        cosine.shape(1) != rotary_dimension / 2) {
+        throw std::runtime_error(
+            "NINT8-0 inverse-RoPE grouped-row shape is incompatible");
+    }
+
+    std::int64_t rows = 1;
+    Shape output_shape(
+        input.shape().begin(),
+        input.shape().end() - 2);
+    for (std::size_t index = 0; index + 2 < input.ndim(); ++index) {
+        const int extent = input.shape(static_cast<int>(index));
+        if (extent <= 0 ||
+            rows > std::numeric_limits<std::int32_t>::max() / extent) {
+            throw std::runtime_error(
+                "unsupported NINT8-0 inverse-RoPE grouped-row count");
+        }
+        rows *= extent;
+    }
+    const int tokens = cosine.shape(0);
+    if (rows <= 0 ||
+        rows > std::numeric_limits<std::int32_t>::max() ||
+        rows % tokens != 0) {
+        throw std::runtime_error(
+            "NINT8-0 inverse-RoPE token count is incompatible");
+    }
+
+    const int out_per_group = output_size_ / group_count;
+    output_shape.push_back(group_count);
+    output_shape.push_back(out_per_group);
+
+    auto source = input;
+    if (source.dtype() != mlx::core::float16 &&
+        source.dtype() != mlx::core::float32) {
+        source = mlx::core::astype(source, mlx::core::float16);
+    }
+    source = mlx::core::contiguous(
+        mlx::core::reshape(
+            source,
+            Shape{
+                static_cast<std::int32_t>(rows),
+                group_count,
+                input_size_,
+            }));
+    auto cos_values = cosine;
+    auto sin_values = sine;
+    if (cos_values.dtype() != mlx::core::float32) {
+        cos_values = mlx::core::astype(
+            cos_values,
+            mlx::core::float32);
+    }
+    if (sin_values.dtype() != mlx::core::float32) {
+        sin_values = mlx::core::astype(
+            sin_values,
+            mlx::core::float32);
+    }
+    cos_values = mlx::core::contiguous(cos_values);
+    sin_values = mlx::core::contiguous(sin_values);
+
+    const int tile_rows =
+        rows == 1 ? 1 : (rows <= 16 ? static_cast<int>(rows) : 8);
+    const auto row_tiles =
+        (rows + tile_rows - 1) / tile_rows;
+    const auto grid_x =
+        row_tiles * static_cast<std::int64_t>(output_size_) * 32;
+    if (grid_x > std::numeric_limits<int>::max()) {
+        throw std::runtime_error(
+            "NINT8-0 inverse-RoPE grouped-row Metal grid exceeds MLX limits");
+    }
+
+    std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
+        templates{
+            {"T", source.dtype()},
+            {"M", static_cast<int>(rows)},
+            {"TILE_M", tile_rows},
+            {"TOKENS", tokens},
+            {"GROUP_COUNT", group_count},
+            {"OUT_PER_GROUP", out_per_group},
+            {"OUT", output_size_},
+            {"K", input_size_},
+            {"NG", groups_},
+            {"HEAD_DIM", head_dimension},
+            {"ROTARY", rotary_dimension},
+        };
+    const int threadgroup = static_cast<int>(
+        std::min<std::int64_t>(256, grid_x));
+    auto outputs = grouped_row_inverse_rope_kernel()(
+        {q_, scales_, source, cos_values, sin_values},
         {
             Shape{
                 static_cast<std::int32_t>(rows),

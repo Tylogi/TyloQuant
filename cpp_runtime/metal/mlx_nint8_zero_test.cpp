@@ -1,4 +1,5 @@
 #include "mlx_nint8_zero.h"
+#include "mlx_deepseek_v4_attention.h"
 #include "mlx_tensor.h"
 
 #include <cmath>
@@ -334,6 +335,72 @@ int main() {
                 grouped_values_f16[index],
                 grouped_values[index],
                 0.05f);
+        }
+
+        std::vector<float> rope_cos_values(2 * 4);
+        std::vector<float> rope_sin_values(2 * 4);
+        for (int token = 0; token < 2; ++token) {
+            for (int pair = 0; pair < 4; ++pair) {
+                const float angle =
+                    0.07f * static_cast<float>(1 + token * 4 + pair);
+                rope_cos_values[token * 4 + pair] = std::cos(angle);
+                rope_sin_values[token * 4 + pair] = std::sin(angle);
+            }
+        }
+        const array rope_cosine(
+            rope_cos_values.begin(),
+            Shape{2, 4});
+        const array rope_sine(
+            rope_sin_values.begin(),
+            Shape{2, 4});
+        auto grouped_input_half = astype(grouped_input, float16);
+        auto attention_input = reshape(
+            grouped_input_half,
+            Shape{1, 2, 8, 16});
+        auto rope_prefix = slice(
+            attention_input,
+            Shape{0, 0, 0, 0},
+            Shape{1, 2, 8, 8});
+        auto rope_tail = slice(
+            attention_input,
+            Shape{0, 0, 0, 8},
+            Shape{1, 2, 8, 16});
+        auto explicit_inverse_rope = reshape(
+            concatenate(
+                {
+                    rope_prefix,
+                    mfq::metal::deepseek_v4_rope_adjacent(
+                        rope_tail,
+                        rope_cosine,
+                        rope_sine,
+                        true),
+                },
+                -1),
+            Shape{2, 2, 64});
+        auto explicit_rope_output = astype(
+            grouped_weight.grouped_row_matmul(
+                explicit_inverse_rope,
+                2),
+            float32);
+        auto fused_rope_output = astype(
+            grouped_weight.grouped_row_matmul_inverse_rope(
+                grouped_input_half,
+                2,
+                rope_cosine,
+                rope_sine,
+                16,
+                8),
+            float32);
+        eval(explicit_rope_output, fused_rope_output);
+        const auto* explicit_rope_values =
+            explicit_rope_output.data<float>();
+        const auto* fused_rope_values =
+            fused_rope_output.data<float>();
+        for (int index = 0; index < 12; ++index) {
+            require_close(
+                fused_rope_values[index],
+                explicit_rope_values[index],
+                0.01f);
         }
 
         std::vector<float> large_input_values(64 * 64);

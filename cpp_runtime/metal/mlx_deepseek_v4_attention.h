@@ -47,8 +47,8 @@ public:
         const mlx::core::array& ape,
         const mlx::core::array& norm,
         int length,
-        const mlx::core::array& cosine,
-        const mlx::core::array& sine,
+        const mlx::core::array& compressed_cosine,
+        const mlx::core::array& compressed_sine,
         int quant_mode,
         float eps);
 
@@ -136,7 +136,7 @@ public:
     int position() const noexcept {
         return position_;
     }
-    const mlx::core::array& local() const noexcept {
+    const mlx::core::array& local_state() const noexcept {
         return local_;
     }
     mlx::core::array local_positions() const;

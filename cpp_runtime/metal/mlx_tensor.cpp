@@ -341,6 +341,11 @@ const MlxNintWeight* MlxLinear::nint_weight_ref() const noexcept {
     return std::get_if<MlxNintWeight>(&weight_);
 }
 
+const MlxNint8ZeroWeight*
+MlxLinear::nint8_zero_weight_ref() const noexcept {
+    return std::get_if<MlxNint8ZeroWeight>(&weight_);
+}
+
 const array* MlxLinear::dense_weight_ref() const noexcept {
     return std::get_if<array>(&weight_);
 }
