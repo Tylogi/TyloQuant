@@ -139,9 +139,7 @@ public:
     const mlx::core::array& local() const noexcept {
         return local_;
     }
-    const mlx::core::array& local_positions() const noexcept {
-        return local_positions_;
-    }
+    mlx::core::array local_positions() const;
     const std::optional<MlxDeepseekV4PoolState>&
     main() const noexcept {
         return main_;
@@ -156,12 +154,10 @@ private:
 
     MlxDeepseekV4LayerState(
         mlx::core::array local,
-        mlx::core::array local_positions,
         std::optional<MlxDeepseekV4PoolState> main,
         std::optional<MlxDeepseekV4PoolState> indexer);
 
     mlx::core::array local_;
-    mlx::core::array local_positions_;
     std::optional<MlxDeepseekV4PoolState> main_;
     std::optional<MlxDeepseekV4PoolState> indexer_;
     int position_ = 0;

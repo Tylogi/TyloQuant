@@ -3,7 +3,11 @@
 #include "mfq_container.h"
 #include "mlx_nint.h"
 #include "mlx_nint8_zero.h"
+#include "mlx_staging_allocator.h"
 #include "mlx_vq.h"
+
+#include <mlx/allocator.h>
+#include <mlx/memory.h>
 
 #include <algorithm>
 #include <cmath>
@@ -15,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -81,6 +86,11 @@ constexpr int kVqStateBankOffset = 24;
 constexpr int kVqBankOffset = 25;
 constexpr int kVqParameterOffset = 26;
 constexpr int kVqRotationVariant = 27;
+constexpr int kVqProfile = 28;
+constexpr int kVqProfileGeneric = 0;
+constexpr int kVqProfileJsc8 = 1;
+constexpr int kVqProfileNpq = 2;
+constexpr int kVqProfileNvq1L = 3;
 
 constexpr const char* kMoeHeader = R"METAL(
 template <typename Stream>
@@ -93,10 +103,13 @@ inline uint mfq_moe_read_bits(
     uint byte_index =
         (value_index >> 3) * bits + (residual_bits >> 3);
     uint shift = residual_bits & 7u;
-    uint packed =
-        uint(stream[byte_index])
-        | (uint(stream[byte_index + 1u]) << 8)
-        | (uint(stream[byte_index + 2u]) << 16);
+    uint packed = uint(stream[byte_index]);
+    if (shift + bits > 8u) {
+        packed |= uint(stream[byte_index + 1u]) << 8;
+    }
+    if (shift + bits > 16u) {
+        packed |= uint(stream[byte_index + 2u]) << 16;
+    }
     return (packed >> shift)
         & ((1u << bits) - 1u);
 }
@@ -149,17 +162,43 @@ inline uint mfq_moe_nint_read_value(
         value_index,
         bits);
 }
+
+inline float4 mfq_moe_load_code4(
+    device const int8_t* stream,
+    uint offset
+) {
+    return float4(
+        *(device const char4*)(stream + offset));
+}
+
+inline float4 mfq_moe_load_code4(
+    constant const int8_t* stream,
+    uint offset
+) {
+    return float4(
+        *(constant const char4*)(stream + offset));
+}
 )METAL";
 
 constexpr const char* kMoeSource = R"METAL(
     constexpr uint SIMD_GROUPS = 2u;
-    constexpr uint ROWS_PER_SIMD = 4u;
+    constexpr uint K_LANES = 8u;
+    constexpr uint LANE_GROUPS = 4u;
+    constexpr uint ROWS_PER_SIMD = 1u;
+    constexpr uint MATRIX_ROWS =
+        uint(FUSED_SWIGLU) != 0u
+            ? 2u * ROWS_PER_SIMD
+            : ROWS_PER_SIMD;
+    constexpr uint ROWS_PER_PHYSICAL_SIMD =
+        LANE_GROUPS * ROWS_PER_SIMD;
     constexpr uint ROWS_PER_TG =
-        SIMD_GROUPS * ROWS_PER_SIMD;
+        SIMD_GROUPS * ROWS_PER_PHYSICAL_SIMD;
     constexpr uint OUTPUT_TILES =
         (uint(OUT) + ROWS_PER_TG - 1u) / ROWS_PER_TG;
 
     uint lane = thread_index_in_simdgroup;
+    uint k_lane = lane & (K_LANES - 1u);
+    uint lane_group = lane / K_LANES;
     uint simd_group = simdgroup_index_in_threadgroup;
     uint workgroup = threadgroup_position_in_grid.x;
     uint output_tile = workgroup % OUTPUT_TILES;
@@ -176,7 +215,8 @@ constexpr const char* kMoeSource = R"METAL(
 
     uint output_base =
         output_tile * ROWS_PER_TG
-        + simd_group * ROWS_PER_SIMD;
+        + simd_group * ROWS_PER_PHYSICAL_SIMD
+        + lane_group * ROWS_PER_SIMD;
     int expert =
         int(expert_ids[token * uint(ROUTES) + route]);
     if (expert < 0 || expert >= int(EXPERTS)) {
@@ -186,7 +226,7 @@ constexpr const char* kMoeSource = R"METAL(
             ++row
         ) {
             uint output = output_base + row;
-            if (lane == 0u && output < uint(OUT)) {
+            if (k_lane == 0u && output < uint(OUT)) {
                 y[
                     (
                         (
@@ -219,7 +259,7 @@ constexpr const char* kMoeSource = R"METAL(
                 : token * uint(ROUTES) + route
         )
     ) * uint(K);
-    float accumulators[ROWS_PER_SIMD] = {0.0f};
+    float accumulators[MATRIX_ROWS] = {0.0f};
 
     if (family == 0u) {
         uint bits =
@@ -238,22 +278,28 @@ constexpr const char* kMoeSource = R"METAL(
             uint(descriptors[descriptor_base + 10u]);
 
         for (
-            uint group = lane;
+            uint group = k_lane;
             group < groups;
-            group += 32u
+            group += K_LANES
         ) {
-            uint outputs[ROWS_PER_SIMD];
-            float scales[ROWS_PER_SIMD];
-            float minimums[ROWS_PER_SIMD];
+            uint outputs[MATRIX_ROWS];
+            float scales[MATRIX_ROWS];
+            float minimums[MATRIX_ROWS];
             for (
                 uint row = 0u;
-                row < ROWS_PER_SIMD;
+                row < MATRIX_ROWS;
                 ++row
             ) {
-                uint output =
-                    min(output_base + row, uint(OUT) - 1u);
+                uint output = min(
+                    output_base + (
+                        uint(FUSED_SWIGLU) != 0u
+                            ? (row / ROWS_PER_SIMD) * uint(OUT)
+                                + row % ROWS_PER_SIMD
+                            : row
+                    ),
+                    uint(MATRIX_OUT) - 1u);
                 uint pool_output =
-                    local_expert * uint(OUT) + output;
+                    local_expert * uint(MATRIX_OUT) + output;
                 uint metadata =
                     pool_output * groups + group;
                 outputs[row] = pool_output;
@@ -298,7 +344,7 @@ constexpr const char* kMoeSource = R"METAL(
                     }
                     for (
                         uint row = 0u;
-                        row < ROWS_PER_SIMD;
+                        row < MATRIX_ROWS;
                         ++row
                     ) {
                         uint quantized_index = (
@@ -354,7 +400,7 @@ constexpr const char* kMoeSource = R"METAL(
                     }
                     for (
                         uint row = 0u;
-                        row < ROWS_PER_SIMD;
+                        row < MATRIX_ROWS;
                         ++row
                     ) {
                         uint quantized_index = (
@@ -419,7 +465,7 @@ constexpr const char* kMoeSource = R"METAL(
                             : 0.0f;
                     for (
                         uint row = 0u;
-                        row < ROWS_PER_SIMD;
+                        row < MATRIX_ROWS;
                         ++row
                     ) {
                         uint quantized_index = (
@@ -476,7 +522,7 @@ constexpr const char* kMoeSource = R"METAL(
                     }
                     for (
                         uint row = 0u;
-                        row < ROWS_PER_SIMD;
+                        row < MATRIX_ROWS;
                         ++row
                     ) {
                         uint metadata =
@@ -567,7 +613,7 @@ constexpr const char* kMoeSource = R"METAL(
                     }
                     for (
                         uint row = 0u;
-                        row < ROWS_PER_SIMD;
+                        row < MATRIX_ROWS;
                         ++row
                     ) {
                         uint quantized_index = (
@@ -624,7 +670,7 @@ constexpr const char* kMoeSource = R"METAL(
                             : 0.0f;
                     for (
                         uint row = 0u;
-                        row < ROWS_PER_SIMD;
+                        row < MATRIX_ROWS;
                         ++row
                     ) {
                         uint quantized_index = (
@@ -655,7 +701,7 @@ constexpr const char* kMoeSource = R"METAL(
                             : 0.0f;
                     for (
                         uint row = 0u;
-                        row < ROWS_PER_SIMD;
+                        row < MATRIX_ROWS;
                         ++row
                     ) {
                         uint quantized_index = (
@@ -731,25 +777,315 @@ constexpr const char* kMoeSource = R"METAL(
             ) / vector_size;
         uint signs = (uint(K) + 7u) / 8u;
 
+        uint outputs[MATRIX_ROWS];
+        float row_anchors[MATRIX_ROWS];
         for (
-            uint group = lane;
-            group < groups;
-            group += 32u
+            uint row = 0u;
+            row < MATRIX_ROWS;
+            ++row
         ) {
-            uint outputs[ROWS_PER_SIMD];
-            uint table_banks[ROWS_PER_SIMD];
-            uint selected_code_banks[ROWS_PER_SIMD];
-            uint delta_values[ROWS_PER_SIMD];
-            float weight_scales[ROWS_PER_SIMD];
+            uint output = min(
+                output_base + (
+                    uint(FUSED_SWIGLU) != 0u
+                        ? (row / ROWS_PER_SIMD) * uint(OUT)
+                            + row % ROWS_PER_SIMD
+                        : row
+                ),
+                uint(MATRIX_OUT) - 1u);
+            uint pool_output =
+                local_expert * uint(MATRIX_OUT) + output;
+            outputs[row] = pool_output;
+            row_anchors[row] =
+                vq_anchors[anchor_offset + pool_output];
+        }
+
+        uint profile =
+            uint(descriptors[descriptor_base + 28u]);
+        if (profile == 1u) {
+            for (
+                uint group = k_lane;
+                group < groups;
+                group += K_LANES
+            ) {
+                uint selected_code_banks[MATRIX_ROWS];
+                float weight_scales[MATRIX_ROWS];
+                for (
+                    uint row = 0u;
+                    row < MATRIX_ROWS;
+                    ++row
+                ) {
+                    uint state_index =
+                        outputs[row] * groups + group;
+                    uint state_byte = uint(vq_state[
+                        state_offset + (state_index >> 1)
+                    ]);
+                    uint state = (
+                        state_byte
+                        >> ((state_index & 1u) * 4u)
+                    ) & 15u;
+                    selected_code_banks[row] = uint(
+                        vq_state_to_codebank[
+                            state_bank_offset + state
+                        ]);
+                    weight_scales[row] =
+                        row_anchors[row]
+                        * vq_scales[scale_offset + state];
+                }
+                uint vector_shift =
+                    vector_size == 4u ? 2u : 3u;
+                uint vectors_per_sign = 8u >> vector_shift;
+                for (
+                    uint sign_block = 0u;
+                    sign_block < 3u;
+                    ++sign_block
+                ) {
+                    uint column_base =
+                        group * 24u + sign_block * 8u;
+                    if (column_base >= uint(K)) {
+                        break;
+                    }
+                    float4 activation0 = float4(
+                        float(x[x_offset + column_base]),
+                        float(x[x_offset + column_base + 1u]),
+                        float(x[x_offset + column_base + 2u]),
+                        float(x[x_offset + column_base + 3u]));
+                    float4 activation1 = float4(
+                        float(x[x_offset + column_base + 4u]),
+                        float(x[x_offset + column_base + 5u]),
+                        float(x[x_offset + column_base + 6u]),
+                        float(x[x_offset + column_base + 7u]));
+                    uint first_vector =
+                        column_base >> vector_shift;
+                    for (
+                        uint row = 0u;
+                        row < MATRIX_ROWS;
+                        ++row
+                    ) {
+                        uint indices[2] = {0u, 0u};
+                        for (
+                            uint local_vector = 0u;
+                            local_vector < vectors_per_sign;
+                            ++local_vector
+                        ) {
+                            indices[local_vector] = uint(vq_indices[
+                                indices_offset
+                                + outputs[row] * vectors
+                                + first_vector + local_vector
+                            ]);
+                        }
+                        uint sign_value = mfq_moe_read_bits(
+                            vq_aux + aux_offset,
+                            outputs[row] * signs
+                                + column_base / 8u,
+                            7u);
+                        uint bank_base =
+                            selected_code_banks[row] * 256u;
+                        uint code0_offset =
+                            (bank_base + indices[0]) * vector_size;
+                        uint code1_offset = vector_size == 4u
+                            ? (bank_base + indices[1]) * 4u
+                            : code0_offset + 4u;
+                        float4 code0 = mfq_moe_load_code4(
+                            vq_codebooks,
+                            codebook_offset + code0_offset);
+                        float4 code1 = mfq_moe_load_code4(
+                            vq_codebooks,
+                            codebook_offset + code1_offset);
+                        code0 = select(
+                            code0,
+                            -code0,
+                            bool4(
+                                (sign_value & 1u) != 0u,
+                                (sign_value & 2u) != 0u,
+                                (sign_value & 4u) != 0u,
+                                (sign_value & 8u) != 0u));
+                        code1 = select(
+                            code1,
+                            -code1,
+                            bool4(
+                                (sign_value & 16u) != 0u,
+                                (sign_value & 32u) != 0u,
+                                (sign_value & 64u) != 0u,
+                                (popcount(sign_value) & 1u) != 0u));
+                        float code_dot =
+                            dot(activation0, code0)
+                            + dot(activation1, code1);
+                        accumulators[row] = fma(
+                            weight_scales[row],
+                            code_dot,
+                            accumulators[row]);
+                    }
+                }
+            }
+        } else if (profile == 2u) {
+            for (
+                uint group = k_lane;
+                group < groups;
+                group += K_LANES
+            ) {
+                uint states_by_row[MATRIX_ROWS];
+                float weight_scales[MATRIX_ROWS];
+                for (
+                    uint row = 0u;
+                    row < MATRIX_ROWS;
+                    ++row
+                ) {
+                    uint state_index =
+                        outputs[row] * groups + group;
+                    uint state = mfq_moe_read_bits(
+                        vq_state + state_offset,
+                        state_index,
+                        state_bits);
+                    states_by_row[row] = state;
+                    weight_scales[row] =
+                        row_anchors[row]
+                        * vq_scales[scale_offset + state];
+                }
+
+                for (
+                    uint local_vector = 0u;
+                    local_vector < 3u;
+                    ++local_vector
+                ) {
+                    uint column_base =
+                        group * 24u + local_vector * 8u;
+                    if (column_base >= uint(K)) {
+                        break;
+                    }
+                    float4 activation0 = float4(
+                        float(x[x_offset + column_base]),
+                        float(x[x_offset + column_base + 1u]),
+                        float(x[x_offset + column_base + 2u]),
+                        float(x[x_offset + column_base + 3u]));
+                    float4 activation1 = float4(
+                        float(x[x_offset + column_base + 4u]),
+                        float(x[x_offset + column_base + 5u]),
+                        float(x[x_offset + column_base + 6u]),
+                        float(x[x_offset + column_base + 7u]));
+                    uint vector = column_base >> 3;
+                    for (
+                        uint row = 0u;
+                        row < MATRIX_ROWS;
+                        ++row
+                    ) {
+                        uint index = mfq_moe_read_bits(
+                            vq_indices + indices_offset,
+                            outputs[row] * vectors + vector,
+                            index_bits);
+                        uint code_base = codebook_offset + (
+                            states_by_row[row] * entries + index
+                        ) * 8u;
+                        float4 code0 = mfq_moe_load_code4(
+                            vq_codebooks, code_base);
+                        float4 code1 = mfq_moe_load_code4(
+                            vq_codebooks, code_base + 4u);
+                        float code_dot =
+                            dot(activation0, code0)
+                            + dot(activation1, code1);
+                        accumulators[row] = fma(
+                            weight_scales[row],
+                            code_dot,
+                            accumulators[row]);
+                    }
+                }
+            }
+        } else if (profile == 3u) {
+            float delta = vq_parameters[parameter_offset];
+            for (
+                uint group = k_lane;
+                group < groups;
+                group += K_LANES
+            ) {
+                uint delta_by_row[MATRIX_ROWS];
+                float weight_scales[MATRIX_ROWS];
+                for (
+                    uint row = 0u;
+                    row < MATRIX_ROWS;
+                    ++row
+                ) {
+                    uint state_index =
+                        outputs[row] * groups + group;
+                    uint state = mfq_moe_read_bits(
+                        vq_state + state_offset,
+                        state_index,
+                        state_bits);
+                    delta_by_row[row] = mfq_moe_read_bits(
+                        vq_aux + aux_offset,
+                        state_index,
+                        1u);
+                    weight_scales[row] =
+                        row_anchors[row]
+                        * vq_scales[scale_offset + state];
+                }
+
+                for (
+                    uint local_vector = 0u;
+                    local_vector < 3u;
+                    ++local_vector
+                ) {
+                    uint column_base =
+                        group * 24u + local_vector * 8u;
+                    if (column_base >= uint(K)) {
+                        break;
+                    }
+                    float4 activation0 = float4(
+                        float(x[x_offset + column_base]),
+                        float(x[x_offset + column_base + 1u]),
+                        float(x[x_offset + column_base + 2u]),
+                        float(x[x_offset + column_base + 3u]));
+                    float4 activation1 = float4(
+                        float(x[x_offset + column_base + 4u]),
+                        float(x[x_offset + column_base + 5u]),
+                        float(x[x_offset + column_base + 6u]),
+                        float(x[x_offset + column_base + 7u]));
+                    uint vector = column_base >> 3;
+                    for (
+                        uint row = 0u;
+                        row < MATRIX_ROWS;
+                        ++row
+                    ) {
+                        uint index = mfq_moe_read_bits(
+                            vq_indices + indices_offset,
+                            outputs[row] * vectors + vector,
+                            11u);
+                        float signed_delta =
+                            delta_by_row[row] != 0u
+                            ? -delta
+                            : delta;
+                        uint code_base =
+                            codebook_offset + index * 8u;
+                        float4 code0 = mfq_moe_load_code4(
+                            vq_codebooks, code_base)
+                            + float4(signed_delta);
+                        float4 code1 = mfq_moe_load_code4(
+                            vq_codebooks, code_base + 4u)
+                            + float4(signed_delta);
+                        float code_dot =
+                            dot(activation0, code0)
+                            + dot(activation1, code1);
+                        accumulators[row] = fma(
+                            weight_scales[row],
+                            code_dot,
+                            accumulators[row]);
+                    }
+                }
+            }
+        } else {
+        for (
+            uint group = k_lane;
+            group < groups;
+            group += K_LANES
+        ) {
+            uint table_banks[MATRIX_ROWS];
+            uint selected_code_banks[MATRIX_ROWS];
+            uint delta_values[MATRIX_ROWS];
+            float weight_scales[MATRIX_ROWS];
             for (
                 uint row = 0u;
-                row < ROWS_PER_SIMD;
+                row < MATRIX_ROWS;
                 ++row
             ) {
-                uint output =
-                    min(output_base + row, uint(OUT) - 1u);
-                uint pool_output =
-                    local_expert * uint(OUT) + output;
+                uint pool_output = outputs[row];
                 uint state_index =
                     pool_output * groups + group;
                 uint state = mfq_moe_read_bits(
@@ -780,15 +1116,12 @@ constexpr const char* kMoeSource = R"METAL(
                 } else if (code_bank_mode == 2u) {
                     selected_code_bank = delta_value;
                 }
-                outputs[row] = pool_output;
                 table_banks[row] = table_bank;
                 selected_code_banks[row] =
                     selected_code_bank;
                 delta_values[row] = delta_value;
                 weight_scales[row] =
-                    vq_anchors[
-                        anchor_offset + pool_output]
-                    * vq_scales[
+                    row_anchors[row] * vq_scales[
                         scale_offset
                         + table_bank * states + state
                     ];
@@ -823,7 +1156,7 @@ constexpr const char* kMoeSource = R"METAL(
                     column_base / vector_size;
                 for (
                     uint row = 0u;
-                    row < ROWS_PER_SIMD;
+                    row < MATRIX_ROWS;
                     ++row
                 ) {
                     uint index = mfq_moe_read_bits(
@@ -916,6 +1249,7 @@ constexpr const char* kMoeSource = R"METAL(
                 }
             }
         }
+        }
     } else if (family == 2u) {
         uint groups =
             uint(descriptors[descriptor_base + 4u]);
@@ -924,22 +1258,28 @@ constexpr const char* kMoeSource = R"METAL(
         uint scale_offset =
             uint(descriptors[descriptor_base + 6u]);
         for (
-            uint group = lane;
+            uint group = k_lane;
             group < groups;
-            group += 32u
+            group += K_LANES
         ) {
             uint column_base = group * 32u;
-            uint outputs[ROWS_PER_SIMD];
-            float scales[ROWS_PER_SIMD];
+            uint outputs[MATRIX_ROWS];
+            float scales[MATRIX_ROWS];
             for (
                 uint row = 0u;
-                row < ROWS_PER_SIMD;
+                row < MATRIX_ROWS;
                 ++row
             ) {
-                uint output =
-                    min(output_base + row, uint(OUT) - 1u);
+                uint output = min(
+                    output_base + (
+                        uint(FUSED_SWIGLU) != 0u
+                            ? (row / ROWS_PER_SIMD) * uint(OUT)
+                                + row % ROWS_PER_SIMD
+                            : row
+                    ),
+                    uint(MATRIX_OUT) - 1u);
                 uint pool_output =
-                    local_expert * uint(OUT) + output;
+                    local_expert * uint(MATRIX_OUT) + output;
                 outputs[row] = pool_output;
                 scales[row] = float(q8_scales[
                     scale_offset
@@ -959,7 +1299,7 @@ constexpr const char* kMoeSource = R"METAL(
                         : 0.0f;
                 for (
                     uint row = 0u;
-                    row < ROWS_PER_SIMD;
+                    row < MATRIX_ROWS;
                     ++row
                 ) {
                     uint quantized_index = (
@@ -978,23 +1318,62 @@ constexpr const char* kMoeSource = R"METAL(
         }
     }
 
-    for (
-        uint row = 0u;
-        row < ROWS_PER_SIMD;
-        ++row
-    ) {
-        float total = simd_sum(accumulators[row]);
-        uint output = output_base + row;
-        if (lane == 0u && output < uint(OUT)) {
-            y[
-                (
+    if (uint(FUSED_SWIGLU) != 0u) {
+        for (
+            uint row = 0u;
+            row < ROWS_PER_SIMD;
+            ++row
+        ) {
+            float gate = accumulators[row];
+            float up = accumulators[ROWS_PER_SIMD + row];
+            for (
+                uint offset = K_LANES >> 1;
+                offset > 0u;
+                offset >>= 1
+            ) {
+                gate += simd_shuffle_down(gate, offset);
+                up += simd_shuffle_down(up, offset);
+            }
+            uint output = output_base + row;
+            if (k_lane == 0u && output < uint(OUT)) {
+                // Match the unfused graph: both projections round to the
+                // activation dtype before the elementwise SwiGLU.
+                gate = float(T(gate));
+                up = float(T(up));
+                if (params[0] > 0.0f) {
+                    gate = min(gate, params[0]);
+                    up = clamp(up, -params[0], params[0]);
+                }
+                float activated = gate / (1.0f + exp(-gate));
+                y[
+                    (token * uint(ROUTES) + route)
+                        * uint(OUT)
+                    + output
+                ] = T(activated * up);
+            }
+        }
+    } else {
+        for (
+            uint row = 0u;
+            row < ROWS_PER_SIMD;
+            ++row
+        ) {
+            float total = accumulators[row];
+            total += simd_shuffle_down(total, 4u);
+            total += simd_shuffle_down(total, 2u);
+            total += simd_shuffle_down(total, 1u);
+            uint output = output_base + row;
+            if (k_lane == 0u && output < uint(OUT)) {
+                y[
                     (
-                        token * uint(ROUTES) + route
-                    ) * uint(PROJECTIONS)
-                    + projection
-                ) * uint(OUT)
-                + output
-            ] = T(total);
+                        (
+                            token * uint(ROUTES) + route
+                        ) * uint(PROJECTIONS)
+                        + projection
+                    ) * uint(OUT)
+                    + output
+                ] = T(total);
+            }
         }
     }
 )METAL";
@@ -1178,7 +1557,7 @@ constexpr const char* kMoeHadamardSource = R"METAL(
 class BlobCursor {
 public:
     explicit BlobCursor(
-        const std::vector<std::uint8_t>& blob)
+        std::span<const std::uint8_t> blob)
         : blob_(blob) {}
 
     template <typename T>
@@ -1193,16 +1572,11 @@ public:
         return value;
     }
 
-    std::vector<std::uint8_t> bytes(
+    std::span<const std::uint8_t> bytes(
         std::size_t count,
         const char* name) {
         require(count, name);
-        std::vector<std::uint8_t> result(
-            blob_.begin()
-                + static_cast<std::ptrdiff_t>(offset_),
-            blob_.begin()
-                + static_cast<std::ptrdiff_t>(
-                    offset_ + count));
+        auto result = blob_.subspan(offset_, count);
         offset_ += count;
         return result;
     }
@@ -1221,7 +1595,7 @@ private:
         }
     }
 
-    const std::vector<std::uint8_t>& blob_;
+    std::span<const std::uint8_t> blob_;
     std::size_t offset_ = 0;
 };
 
@@ -1314,8 +1688,9 @@ int checked_positive(
     return static_cast<int>(value);
 }
 
+template <typename Allocator>
 void append_raw(
-    std::vector<std::uint8_t>& target,
+    std::vector<std::uint8_t, Allocator>& target,
     const array& source,
     Dtype expected,
     const char* name) {
@@ -1344,8 +1719,9 @@ void append_raw(
         evaluated.nbytes());
 }
 
+template <typename Allocator>
 array make_raw_array(
-    std::vector<std::uint8_t> bytes,
+    std::vector<std::uint8_t, Allocator> bytes,
     Dtype dtype) {
     if (bytes.empty()) {
         bytes.resize(dtype.size(), 0);
@@ -1357,14 +1733,15 @@ array make_raw_array(
     const auto elements = checked_int(
         bytes.size() / dtype.size(),
         "packed stream");
-    auto storage =
-        std::make_shared<std::vector<std::uint8_t>>(
-            std::move(bytes));
-    return array(
-        storage->data(),
+    auto result = array(
+        mlx::core::allocator::malloc(bytes.size()),
         Shape{elements},
-        dtype,
-        [storage = std::move(storage)](void*) {});
+        dtype);
+    std::memcpy(
+        result.data<std::uint8_t>(),
+        bytes.data(),
+        bytes.size());
+    return result;
 }
 
 array make_int32_array(
@@ -1399,6 +1776,7 @@ make_moe_kernel() {
             "vq_parameters",
             "x",
             "expert_ids",
+            "params",
         },
         {"y"},
         kMoeSource,
@@ -1468,27 +1846,27 @@ struct RotationSpec {
 };
 
 struct PackedStreams {
-    std::vector<std::uint8_t> nint_q;
-    std::vector<std::uint8_t> nint_sub_scale;
-    std::vector<std::uint8_t> nint_sub_min;
-    std::vector<std::uint8_t> nint_anchor_scale;
-    std::vector<std::uint8_t> nint_anchor_min;
-    std::vector<std::uint8_t> q8_q;
-    std::vector<std::uint8_t> q8_scales;
-    std::vector<std::uint8_t> vq_indices;
-    std::vector<std::uint8_t> vq_state;
-    std::vector<std::uint8_t> vq_aux;
-    std::vector<std::uint8_t> vq_anchors;
-    std::vector<std::uint8_t> vq_codebooks;
-    std::vector<std::uint8_t> vq_scales;
-    std::vector<std::uint8_t>
+    detail::StagingVector<std::uint8_t> nint_q;
+    detail::StagingVector<std::uint8_t> nint_sub_scale;
+    detail::StagingVector<std::uint8_t> nint_sub_min;
+    detail::StagingVector<std::uint8_t> nint_anchor_scale;
+    detail::StagingVector<std::uint8_t> nint_anchor_min;
+    detail::StagingVector<std::uint8_t> q8_q;
+    detail::StagingVector<std::uint8_t> q8_scales;
+    detail::StagingVector<std::uint8_t> vq_indices;
+    detail::StagingVector<std::uint8_t> vq_state;
+    detail::StagingVector<std::uint8_t> vq_aux;
+    detail::StagingVector<std::uint8_t> vq_anchors;
+    detail::StagingVector<std::uint8_t> vq_codebooks;
+    detail::StagingVector<std::uint8_t> vq_scales;
+    detail::StagingVector<std::uint8_t>
         vq_state_to_codebank;
-    std::vector<std::uint8_t> vq_banks;
-    std::vector<std::uint8_t> vq_parameters;
+    detail::StagingVector<std::uint8_t> vq_banks;
+    detail::StagingVector<std::uint8_t> vq_parameters;
 };
 
 void validate_nint_payload_shape(
-    const std::vector<std::uint8_t>& payload,
+    std::span<const std::uint8_t> payload,
     int expected_rows,
     int expected_columns) {
     BlobCursor cursor(payload);
@@ -1631,7 +2009,7 @@ void claim_experts(
 }
 
 void add_nint_pool(
-    const std::vector<std::uint8_t>& payload,
+    std::span<const std::uint8_t> payload,
     const std::vector<std::int32_t>& expert_ids,
     int out_per_expert,
     int neuron_len,
@@ -1737,7 +2115,7 @@ void add_nint_pool(
 }
 
 void add_q8_pool(
-    const std::vector<std::uint8_t>& payload,
+    std::span<const std::uint8_t> payload,
     const std::vector<std::int32_t>& expert_ids,
     int out_per_expert,
     int neuron_len,
@@ -1910,8 +2288,8 @@ int rotation_variant(
 
 void add_vq_pool(
     std::string_view dtype,
-    const std::vector<std::uint8_t>& payload,
-    const std::vector<std::uint8_t>& runtime,
+    std::span<const std::uint8_t> payload,
+    std::span<const std::uint8_t> runtime,
     const std::vector<std::int32_t>& expert_ids,
     int out_per_expert,
     int neuron_len,
@@ -2080,6 +2458,21 @@ void add_vq_pool(
             parameter_offset;
         descriptors[base + kVqRotationVariant] =
             rotation;
+        descriptors[base + kVqProfile] =
+            dtype == "NVQ2J" || dtype == "NVQ3J"
+                ? kVqProfileJsc8
+                : (
+                    dtype == "NPQ0-S" || dtype == "NPQ0-L"
+                        ? kVqProfileNpq
+                        : (
+                            dtype == "NVQ1-L"
+                                    && weight.group_size() == 24
+                                    && weight.vector_size() == 8
+                                    && weight.index_bits() == 11
+                                ? kVqProfileNvq1L
+                                : kVqProfileGeneric
+                        )
+                );
     }
 
     append_raw(
@@ -2130,7 +2523,7 @@ void add_vq_pool(
 }
 
 bool is_ascii(
-    const std::vector<std::uint8_t>& value) {
+    std::span<const std::uint8_t> value) {
     return std::all_of(
         value.begin(),
         value.end(),
@@ -2548,7 +2941,7 @@ struct MlxCccpRoutedWeight::Impl {
     std::size_t codebook_bytes = 0;
 };
 
-struct MlxCccpExpertResidency::Impl {
+struct MlxNintMoeOffloadCache::Impl {
     struct Key {
         std::string name;
         std::int32_t expert = 0;
@@ -2603,7 +2996,7 @@ struct MlxCccpExpertResidency::Impl {
           experts(expert_count) {
         if (experts <= 0) {
             throw std::invalid_argument(
-                "CCCP residency expert count must "
+                "NINTM offload expert count must "
                 "be positive");
         }
     }
@@ -3352,7 +3745,7 @@ MlxCccpRoutedWeight::shared_codebook_nbytes() const noexcept {
     return impl_->codebook_bytes;
 }
 
-MlxCccpExpertResidency::MlxCccpExpertResidency(
+MlxNintMoeOffloadCache::MlxNintMoeOffloadCache(
     const MfqContainer& model,
     std::size_t cache_limit_bytes,
     int experts)
@@ -3361,10 +3754,10 @@ MlxCccpExpertResidency::MlxCccpExpertResidency(
           cache_limit_bytes,
           experts)) {}
 
-MlxCccpExpertResidency::~MlxCccpExpertResidency() =
+MlxNintMoeOffloadCache::~MlxNintMoeOffloadCache() =
     default;
 
-bool MlxCccpExpertResidency::can_stream(
+bool MlxNintMoeOffloadCache::can_offload(
     const std::string& name) {
     std::lock_guard lock(impl_->mutex);
     try {
@@ -3375,13 +3768,13 @@ bool MlxCccpExpertResidency::can_stream(
     }
 }
 
-MlxCccpProjectionInfo
-MlxCccpExpertResidency::projection_info(
+MlxNintMoeProjectionInfo
+MlxNintMoeOffloadCache::projection_info(
     const std::string& name) {
     std::lock_guard lock(impl_->mutex);
     const auto projection =
         impl_->projection_locked(name);
-    MlxCccpProjectionInfo result;
+    MlxNintMoeProjectionInfo result;
     result.experts = projection->experts;
     result.out_per_expert =
         projection->out_per_expert;
@@ -3407,7 +3800,7 @@ MlxCccpExpertResidency::projection_info(
 }
 
 std::vector<std::uint8_t>
-MlxCccpExpertResidency::availability(
+MlxNintMoeOffloadCache::availability(
     const std::string& name) {
     std::lock_guard lock(impl_->mutex);
     const auto projection =
@@ -3432,7 +3825,7 @@ MlxCccpExpertResidency::availability(
 }
 
 MlxCccpRoutedWeight
-MlxCccpExpertResidency::grouped(
+MlxNintMoeOffloadCache::grouped(
     const std::string& name,
     const std::vector<std::int32_t>&
         active_experts) {
@@ -3721,23 +4114,23 @@ MlxCccpExpertResidency::grouped(
 }
 
 std::size_t
-MlxCccpExpertResidency::cache_limit_bytes() const noexcept {
+MlxNintMoeOffloadCache::cache_limit_bytes() const noexcept {
     return impl_->cache_limit;
 }
 
 std::size_t
-MlxCccpExpertResidency::resident_packed_bytes() const {
+MlxNintMoeOffloadCache::resident_packed_bytes() const {
     std::lock_guard lock(impl_->mutex);
     return impl_->resident_bytes;
 }
 
 std::size_t
-MlxCccpExpertResidency::cached_expert_count() const {
+MlxNintMoeOffloadCache::cached_expert_count() const {
     std::lock_guard lock(impl_->mutex);
     return impl_->cache.size();
 }
 
-void MlxCccpExpertResidency::discard_record(
+void MlxNintMoeOffloadCache::discard_record(
     const std::string& name) noexcept {
     std::lock_guard lock(impl_->mutex);
     for (
@@ -3760,7 +4153,7 @@ void MlxCccpExpertResidency::discard_record(
     impl_->projections.erase(name);
 }
 
-void MlxCccpExpertResidency::clear() {
+void MlxNintMoeOffloadCache::clear() {
     std::lock_guard lock(impl_->mutex);
     impl_->cache.clear();
     impl_->lru.clear();
@@ -3768,7 +4161,7 @@ void MlxCccpExpertResidency::clear() {
     impl_->resident_bytes = 0;
 }
 
-struct MlxMoeWeight::Impl {
+struct MlxNintMoeWeight::Impl {
     array descriptors;
     array nint_q;
     array nint_sub_scale;
@@ -3871,7 +4264,7 @@ struct MlxMoeWeight::Impl {
     }
 };
 
-MlxMoeWeight::MlxMoeWeight(
+MlxNintMoeWeight::MlxNintMoeWeight(
     std::shared_ptr<const Impl> impl)
     : impl_(std::move(impl)) {
     if (!impl_) {
@@ -3880,8 +4273,8 @@ MlxMoeWeight::MlxMoeWeight(
     }
 }
 
-MlxMoeWeight MlxMoeWeight::from_blob(
-    const std::vector<std::uint8_t>& blob) {
+MlxNintMoeWeight MlxNintMoeWeight::from_blob(
+    std::span<const std::uint8_t> blob) {
     BlobCursor cursor(blob);
     const auto magic_bytes = cursor.bytes(4, "header");
     const std::string_view magic(
@@ -4139,11 +4532,17 @@ MlxMoeWeight MlxMoeWeight::from_blob(
         output_width,
         input_width,
         1);
-    return MlxMoeWeight(std::move(impl));
+    // NINTM cohorts are parsed through the standalone NINT/VQ loaders and
+    // then repacked into the heterogeneous execution streams above. Those
+    // temporary MLX arrays are dead now, but the Metal allocator otherwise
+    // caches their buffers and can retain almost another model-sized copy
+    // while loading a fully resident MoE. Active arrays are unaffected.
+    mlx::core::clear_cache();
+    return MlxNintMoeWeight(std::move(impl));
 }
 
-MlxMoeWeight MlxMoeWeight::concatenate_projections(
-    const std::vector<MlxMoeWeight>& weights) {
+MlxNintMoeWeight MlxNintMoeWeight::concatenate_projections(
+    const std::vector<MlxNintMoeWeight>& weights) {
     if (weights.empty()) {
         throw std::invalid_argument(
             "at least one NINTM projection is required");
@@ -4479,12 +4878,47 @@ MlxMoeWeight MlxMoeWeight::concatenate_projections(
         first.out_per_expert,
         first.neuron_len,
         projection_count);
-    return MlxMoeWeight(std::move(impl));
+    return MlxNintMoeWeight(std::move(impl));
 }
 
-array MlxMoeWeight::routed_matmul(
+array MlxNintMoeWeight::routed_matmul(
     const array& input,
     const array& expert_ids) const {
+    return routed_matmul_impl(
+        input,
+        expert_ids,
+        false,
+        0.0f);
+}
+
+array MlxNintMoeWeight::routed_swiglu(
+    const array& input,
+    const array& expert_ids,
+    float limit) const {
+    if (
+        impl_->projections != 1
+        || impl_->out_per_expert <= 0
+        || (impl_->out_per_expert & 1) != 0
+    ) {
+        throw std::invalid_argument(
+            "fused NINTM SwiGLU requires one even-width gate/up projection");
+    }
+    if (!std::isfinite(limit) || limit < 0.0f) {
+        throw std::invalid_argument(
+            "NINTM SwiGLU limit must be finite and non-negative");
+    }
+    return routed_matmul_impl(
+        input,
+        expert_ids,
+        true,
+        limit);
+}
+
+array MlxNintMoeWeight::routed_matmul_impl(
+    const array& input,
+    const array& expert_ids,
+    bool fused_swiglu,
+    float swiglu_limit) const {
     auto ids = mlx::core::contiguous(
         mlx::core::astype(
             expert_ids,
@@ -4530,12 +4964,15 @@ array MlxMoeWeight::routed_matmul(
                 mlx::core::float16);
     }
     source = mlx::core::contiguous(source);
-    const auto output_width = checked_product(
-        static_cast<std::size_t>(
-            impl_->projections),
-        static_cast<std::size_t>(
-            impl_->out_per_expert),
-        "routed output width");
+    const int logical_output_width = fused_swiglu
+        ? impl_->out_per_expert / 2
+        : impl_->out_per_expert;
+    const auto output_width = fused_swiglu
+        ? static_cast<std::size_t>(logical_output_width)
+        : checked_product(
+              static_cast<std::size_t>(impl_->projections),
+              static_cast<std::size_t>(impl_->out_per_expert),
+              "routed output width");
     const Shape output_shape{
         tokens,
         routes,
@@ -4601,14 +5038,14 @@ array MlxMoeWeight::routed_matmul(
     const auto output_tiles =
         (
             static_cast<std::size_t>(
-                impl_->out_per_expert)
+                logical_output_width)
             + 7
         ) / 8;
     auto workgroups = route_count_size;
     workgroups = checked_product(
         workgroups,
         static_cast<std::size_t>(
-            impl_->projections),
+            fused_swiglu ? 1 : impl_->projections),
         "routed projection count");
     workgroups = checked_product(
         workgroups,
@@ -4627,6 +5064,9 @@ array MlxMoeWeight::routed_matmul(
             "NINTM Metal grid exceeds MLX limits");
     }
 
+    const array params(
+        {swiglu_limit},
+        mlx::core::float32);
     auto outputs = moe_kernel()(
         {
             impl_->descriptors,
@@ -4648,6 +5088,7 @@ array MlxMoeWeight::routed_matmul(
             impl_->vq_parameters,
             source,
             ids,
+            params,
         },
         {output_shape},
         {source.dtype()},
@@ -4662,8 +5103,13 @@ array MlxMoeWeight::routed_matmul(
             {"TOKENS", tokens},
             {"ROUTES", routes},
             {"EXPERTS", impl_->experts},
-            {"OUT", impl_->out_per_expert},
+            {"OUT", logical_output_width},
+            {"MATRIX_OUT", impl_->out_per_expert},
             {"PROJECTIONS", impl_->projections},
+            {
+                "FUSED_SWIGLU",
+                static_cast<int>(fused_swiglu),
+            },
             {"K", impl_->neuron_len},
             {"DESCRIPTOR_SIZE", kDescriptorSize},
             {"VARIANT_STRIDE", variant_stride},
@@ -4678,23 +5124,23 @@ array MlxMoeWeight::routed_matmul(
     return std::move(outputs.front());
 }
 
-int MlxMoeWeight::experts() const noexcept {
+int MlxNintMoeWeight::experts() const noexcept {
     return impl_->experts;
 }
 
-int MlxMoeWeight::out_per_expert() const noexcept {
+int MlxNintMoeWeight::out_per_expert() const noexcept {
     return impl_->out_per_expert;
 }
 
-int MlxMoeWeight::neuron_len() const noexcept {
+int MlxNintMoeWeight::neuron_len() const noexcept {
     return impl_->neuron_len;
 }
 
-int MlxMoeWeight::projections() const noexcept {
+int MlxNintMoeWeight::projections() const noexcept {
     return impl_->projections;
 }
 
-std::size_t MlxMoeWeight::packed_nbytes() const noexcept {
+std::size_t MlxNintMoeWeight::packed_nbytes() const noexcept {
     return impl_->packed_bytes;
 }
 
@@ -4708,7 +5154,7 @@ MlxRoutedLinear::MlxRoutedLinear(
 }
 
 MlxRoutedLinear MlxRoutedLinear::from_blob(
-    const std::vector<std::uint8_t>& blob) {
+    std::span<const std::uint8_t> blob) {
     return MlxRoutedLinear(
         MlxMoeWeight::from_blob(blob));
 }
@@ -4717,6 +5163,16 @@ array MlxRoutedLinear::forward(
     const array& input,
     const array& expert_ids) const {
     return weight_.routed_matmul(input, expert_ids);
+}
+
+array MlxRoutedLinear::swiglu(
+    const array& input,
+    const array& expert_ids,
+    float limit) const {
+    return weight_.routed_swiglu(
+        input,
+        expert_ids,
+        limit);
 }
 
 array MlxRoutedLinear::combine(
@@ -4752,9 +5208,9 @@ MlxRoutedSwiGluFfn::MlxRoutedSwiGluFfn(
 
 MlxRoutedSwiGluFfn
 MlxRoutedSwiGluFfn::from_blobs(
-    const std::vector<std::uint8_t>& gate,
-    const std::vector<std::uint8_t>& up,
-    const std::vector<std::uint8_t>& down) {
+    std::span<const std::uint8_t> gate,
+    std::span<const std::uint8_t> up,
+    std::span<const std::uint8_t> down) {
     return MlxRoutedSwiGluFfn(
         MlxMoeWeight::from_blob(gate),
         MlxMoeWeight::from_blob(up),

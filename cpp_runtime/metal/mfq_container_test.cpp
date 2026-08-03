@@ -178,6 +178,13 @@ void test_basic_container(
         model.record("weight").source_path.is_absolute(),
         "record source path was not made absolute");
     require(model.read_text("weight") == "data", "payload mismatch");
+    const auto mapped = model.map_record("weight");
+    require(
+        mapped.size() == 4
+            && std::string(
+                   mapped.view().begin(),
+                   mapped.view().end()) == "data",
+        "mapped payload mismatch");
     const auto middle =
         model.read_range("weight", 1, 2);
     require(

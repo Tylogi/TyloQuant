@@ -1,9 +1,12 @@
 #include "mlx_nint.h"
 
+#include "mlx_staging_allocator.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -803,7 +806,7 @@ constexpr const char* kNintEmbedding = R"METAL(
 
 class BlobCursor {
 public:
-    explicit BlobCursor(const std::vector<std::uint8_t>& blob)
+    explicit BlobCursor(std::span<const std::uint8_t> blob)
         : blob_(blob) {}
 
     template <typename T>
@@ -815,11 +818,11 @@ public:
         return value;
     }
 
-    std::vector<std::uint8_t> bytes(
+    detail::StagingVector<std::uint8_t> bytes(
         std::size_t count,
         const char* name) {
         require(count, name);
-        std::vector<std::uint8_t> result(
+        detail::StagingVector<std::uint8_t> result(
             blob_.begin() + static_cast<std::ptrdiff_t>(offset_),
             blob_.begin() + static_cast<std::ptrdiff_t>(offset_ + count));
         offset_ += count;
@@ -841,7 +844,7 @@ private:
         }
     }
 
-    const std::vector<std::uint8_t>& blob_;
+    std::span<const std::uint8_t> blob_;
     std::size_t offset_ = 0;
 };
 
@@ -855,35 +858,37 @@ std::size_t packed_size(std::size_t count, int bits) {
 }
 
 std::uint8_t packed_value(
-    const std::vector<std::uint8_t>& data,
+    std::span<const std::uint8_t> data,
     std::size_t index,
     int bits) {
     const auto bit_index = index * static_cast<std::size_t>(bits);
     const auto byte_index = bit_index / 8;
     const auto shift = static_cast<unsigned>(bit_index & 7);
-    std::uint32_t value = data.at(byte_index);
+    std::uint32_t value = data[byte_index];
     if (shift + static_cast<unsigned>(bits) > 8) {
-        value |= static_cast<std::uint32_t>(data.at(byte_index + 1)) << 8;
+        value |= static_cast<std::uint32_t>(data[byte_index + 1]) << 8;
     }
     return static_cast<std::uint8_t>(
         (value >> shift) & ((1u << bits) - 1u));
 }
 
-std::vector<std::uint8_t> unpack_values(
-    const std::vector<std::uint8_t>& data,
+detail::StagingVector<std::uint8_t> unpack_values(
+    std::span<const std::uint8_t> data,
     std::size_t count,
     int bits) {
-    std::vector<std::uint8_t> result(count);
+    detail::StagingVector<std::uint8_t> result(count);
     for (std::size_t index = 0; index < count; ++index) {
         result[index] = packed_value(data, index, bits);
     }
     return result;
 }
 
-std::vector<std::uint8_t> pack_values(
-    const std::vector<std::uint8_t>& values,
+detail::StagingVector<std::uint8_t> pack_values(
+    std::span<const std::uint8_t> values,
     int bits) {
-    std::vector<std::uint8_t> result(packed_size(values.size(), bits), 0);
+    detail::StagingVector<std::uint8_t> result(
+        packed_size(values.size(), bits),
+        0);
     for (std::size_t index = 0; index < values.size(); ++index) {
         const auto bit_index = index * static_cast<std::size_t>(bits);
         for (int bit = 0; bit < bits; ++bit) {
@@ -897,13 +902,13 @@ std::vector<std::uint8_t> pack_values(
     return result;
 }
 
-std::vector<std::uint8_t> pack_q5_execution_layout(
-    const std::vector<std::uint8_t>& values,
+detail::StagingVector<std::uint8_t> pack_q5_execution_layout(
+    std::span<const std::uint8_t> values,
     std::size_t rows,
     std::size_t group_size) {
     const auto low_bytes = (group_size + 1) / 2;
     const auto high_bytes = (group_size + 7) / 8;
-    std::vector<std::uint8_t> result(
+    detail::StagingVector<std::uint8_t> result(
         rows * (low_bytes + high_bytes),
         0);
     for (std::size_t row = 0; row < rows; ++row) {
@@ -921,12 +926,12 @@ std::vector<std::uint8_t> pack_q5_execution_layout(
     return result;
 }
 
-std::vector<std::uint8_t> read_old_values(
+detail::StagingVector<std::uint8_t> read_old_values(
     BlobCursor& cursor,
     std::size_t count,
     int storage_bytes,
     const char* name) {
-    std::vector<std::uint8_t> result(count);
+    detail::StagingVector<std::uint8_t> result(count);
     for (std::size_t index = 0; index < count; ++index) {
         std::uint32_t value = storage_bytes == 1
             ? cursor.scalar<std::uint8_t>(name)
@@ -960,8 +965,10 @@ float half_to_float(std::uint16_t bits) {
     return negative ? -value : value;
 }
 
-template <typename T>
-array make_array(const std::vector<T>& values, Shape shape) {
+template <typename T, typename Allocator>
+array make_array(
+    const std::vector<T, Allocator>& values,
+    Shape shape) {
     return array(values.begin(), std::move(shape));
 }
 
@@ -1229,7 +1236,7 @@ MlxNintWeight::MlxNintWeight(
       q5_execution_layout_(q5_execution_layout) {}
 
 MlxNintWeight MlxNintWeight::from_blob(
-    const std::vector<std::uint8_t>& blob) {
+    std::span<const std::uint8_t> blob) {
     BlobCursor cursor(blob);
     const auto bits = static_cast<int>(cursor.scalar<std::uint8_t>("bits"));
     const auto sub_bits =
@@ -1260,8 +1267,8 @@ MlxNintWeight MlxNintWeight::from_blob(
         throw std::runtime_error("inconsistent NINT Metal dimensions");
     }
 
-    std::vector<float> neuron_scale(output_size);
-    std::vector<float> neuron_min(output_size);
+    detail::StagingVector<float> neuron_scale(output_size);
+    detail::StagingVector<float> neuron_min(output_size);
     for (auto& value : neuron_scale) {
         value = half_to_float(
             cursor.scalar<std::uint16_t>("neuron scale"));
@@ -1286,10 +1293,10 @@ MlxNintWeight MlxNintWeight::from_blob(
         2 * metadata_count * static_cast<std::size_t>(old_sub_bytes) +
         q_count * static_cast<std::size_t>(old_q_bytes);
 
-    std::vector<std::uint8_t> sub_scale;
-    std::vector<std::uint8_t> sub_min;
-    std::vector<std::uint8_t> q_values;
-    std::vector<std::uint8_t> q_packed;
+    detail::StagingVector<std::uint8_t> sub_scale;
+    detail::StagingVector<std::uint8_t> sub_min;
+    detail::StagingVector<std::uint8_t> q_values;
+    detail::StagingVector<std::uint8_t> q_packed;
     if (cursor.remaining() == packed_tail) {
         sub_scale = unpack_values(
             cursor.bytes(packed_metadata_bytes, "sub scale"),

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -25,8 +26,8 @@ struct VqTensorMetadata {
 // or allocating MLX arrays. from_blob() performs full payload validation.
 VqTensorMetadata inspect_vq_blob(
     std::string_view dtype,
-    const std::vector<std::uint8_t>& blob,
-    const std::vector<std::uint8_t>& runtime_payload = {});
+    std::span<const std::uint8_t> blob,
+    std::span<const std::uint8_t> runtime_payload = {});
 
 // Native packed NVQ/NPQ/NEPQ execution weight.
 //
@@ -38,8 +39,8 @@ class MlxVqWeight {
 public:
     static MlxVqWeight from_blob(
         std::string_view dtype,
-        const std::vector<std::uint8_t>& blob,
-        const std::vector<std::uint8_t>& runtime_payload = {});
+        std::span<const std::uint8_t> blob,
+        std::span<const std::uint8_t> runtime_payload = {});
 
     mlx::core::array dequantize(
         mlx::core::Dtype dtype = mlx::core::float16) const;

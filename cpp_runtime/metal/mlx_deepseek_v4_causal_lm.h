@@ -48,7 +48,7 @@ public:
             rope_base,
         std::pair<mlx::core::array, mlx::core::array>
             rope_compressed,
-        std::shared_ptr<MlxCccpExpertResidency> residency =
+        std::shared_ptr<MlxNintMoeOffloadCache> offload =
             nullptr);
 
     MlxDeepseekV4Layer(
@@ -116,27 +116,21 @@ using MlxDeepseekV4TokenCallback =
 // and never invokes Python or a subprocess.
 class MlxDeepseekV4CausalLm {
 public:
-    static constexpr std::size_t
-    default_expert_cache_bytes() noexcept {
-        return std::size_t{4} << 30;
-    }
-
-    // Streamed CCCP residency keeps its own lightweight container index and
-    // performs bounded read_range() calls during generation, so the caller's
-    // container does not need to outlive the loaded runtime.
+    // NINTM is fully resident by default, matching the CUDA runtime.  Passing
+    // a cache budget explicitly opts into the bounded expert-residency mode.
     static MlxDeepseekV4CausalLm load(
         const MfqContainer& model,
         int max_context = 4096,
-        std::size_t expert_cache_bytes =
-            default_expert_cache_bytes());
+        std::optional<std::size_t> expert_cache_bytes =
+            std::nullopt);
 
     static MlxDeepseekV4CausalLm load(
         const MfqContainer& model,
         const DeepseekV4Config& config,
         const DeepseekV4TensorNames& names,
         int max_context,
-        std::size_t expert_cache_bytes =
-            default_expert_cache_bytes());
+        std::optional<std::size_t> expert_cache_bytes =
+            std::nullopt);
 
     MlxDeepseekV4CausalLm(
         DeepseekV4Config config,
@@ -150,8 +144,8 @@ public:
         int max_context,
         mlx::core::Dtype activation_dtype =
             mlx::core::float16,
-        std::shared_ptr<MlxCccpExpertResidency>
-            expert_residency = nullptr);
+        std::shared_ptr<MlxNintMoeOffloadCache>
+            expert_offload = nullptr);
 
     // Accepts [tokens] or [batch,tokens]. Like the Python reference,
     // use_cache=false starts a fresh cache and still leaves that cache ready
@@ -246,8 +240,8 @@ private:
     MlxLinear hc_head_fn_;
     mlx::core::array hc_head_base_;
     mlx::core::array hc_head_scale_;
-    std::shared_ptr<MlxCccpExpertResidency>
-        expert_residency_;
+    std::shared_ptr<MlxNintMoeOffloadCache>
+        expert_offload_;
     int max_context_;
     mlx::core::Dtype activation_dtype_;
     std::vector<MlxDeepseekV4LayerState> states_;

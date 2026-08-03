@@ -32,7 +32,7 @@ public:
         std::size_t layer,
         const std::optional<mlx::core::array>& available =
             std::nullopt,
-        std::shared_ptr<MlxCccpExpertResidency> residency =
+        std::shared_ptr<MlxNintMoeOffloadCache> offload =
             nullptr);
 
     MlxDeepseekV4Moe(
@@ -68,7 +68,7 @@ public:
         return grouped_projections_.has_value();
     }
     bool uses_streamed_experts() const noexcept {
-        return static_cast<bool>(expert_residency_);
+        return static_cast<bool>(expert_offload_);
     }
 
 private:
@@ -80,8 +80,8 @@ private:
         MlxLinear shared_down,
         std::optional<MlxRoutedLinear> routed_gate_up,
         std::optional<MlxRoutedLinear> routed_down,
-        std::shared_ptr<MlxCccpExpertResidency>
-            expert_residency,
+        std::shared_ptr<MlxNintMoeOffloadCache>
+            expert_offload,
         std::string streamed_gate_up_name,
         std::string streamed_down_name,
         std::optional<mlx::core::array> router_bias,
@@ -98,8 +98,8 @@ private:
     MlxLinear shared_down_;
     std::optional<MlxRoutedLinear> routed_gate_up_;
     std::optional<MlxRoutedLinear> routed_down_;
-    std::shared_ptr<MlxCccpExpertResidency>
-        expert_residency_;
+    std::shared_ptr<MlxNintMoeOffloadCache>
+        expert_offload_;
     std::string streamed_gate_up_name_;
     std::string streamed_down_name_;
     std::optional<MlxGroupedLinear> grouped_projections_;

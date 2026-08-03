@@ -58,7 +58,7 @@ struct Arguments {
     int batch_size = 0;
     int ubatch_size = 0;
     int score_count = -1;
-    double expert_cache_gb = 4.0;
+    std::optional<double> expert_cache_gb;
     bool context_explicit = false;
     bool parallel_explicit = false;
     bool batch_explicit = false;
@@ -257,20 +257,20 @@ Arguments parse_arguments(int argc, char** argv) {
                 usage_error("--kl-score-count must be positive");
             }
             result.score_count = static_cast<int>(parsed);
-        } else if (value == "--expert-cache-gb") {
-            const auto text = require_value("--expert-cache-gb");
+        } else if (value == "--moe-gpu-cache-gb") {
+            const auto text = require_value(value.c_str());
             std::size_t consumed = 0;
             double parsed = 0.0;
             try {
                 parsed = std::stod(text, &consumed);
             } catch (const std::exception&) {
                 usage_error(
-                    "--expert-cache-gb requires a finite non-negative number");
+                    value + " requires a finite non-negative number");
             }
             if (consumed != text.size() ||
                 !std::isfinite(parsed) || parsed < 0.0) {
                 usage_error(
-                    "--expert-cache-gb requires a finite non-negative number");
+                    value + " requires a finite non-negative number");
             }
             result.expert_cache_gb = parsed;
         } else if (value == "--help" || value == "-h") {
@@ -310,7 +310,8 @@ void print_help() {
         << " -ub, --ubatch-size N     physical token batch (default n_batch)\n"
         << "      --kl-score-count N  score only the first N stored rows/chunk\n"
         << "      --tokenizer-gguf P  external tokenizer GGUF; embedded is default\n"
-        << "      --expert-cache-gb N DeepSeek-V4 packed expert LRU (default 4)\n\n"
+        << "      --moe-gpu-cache-gb N bounded disk-backed NINTM expert cache\n"
+        << "                           default: full unified-memory residency\n\n"
         << "The evaluator follows llama.cpp's non-strided WikiText-2 protocol: "
            "each window is independent and only its second half is scored.\n";
 }
@@ -917,10 +918,15 @@ MfqTokenizerProbe tokenizer_policy(
         parse_special);
 }
 
-std::size_t expert_cache_bytes(double gib) {
+std::optional<std::size_t> expert_cache_bytes(
+    const std::optional<double>& gib) {
+    if (!gib.has_value()) {
+        return std::nullopt;
+    }
     constexpr long double bytes_per_gib =
         static_cast<long double>(std::uint64_t{1} << 30);
-    const auto bytes = static_cast<long double>(gib) * bytes_per_gib;
+    const auto bytes =
+        static_cast<long double>(*gib) * bytes_per_gib;
     if (bytes > static_cast<long double>(
                     std::numeric_limits<std::size_t>::max())) {
         throw std::runtime_error(

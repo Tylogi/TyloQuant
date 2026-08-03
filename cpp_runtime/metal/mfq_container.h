@@ -2,11 +2,45 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace mfq::metal {
+
+class MfqMappedBytes {
+public:
+    MfqMappedBytes() = default;
+
+    std::span<const std::uint8_t> view() const noexcept {
+        return {data_, size_};
+    }
+
+    const std::uint8_t* data() const noexcept {
+        return data_;
+    }
+
+    std::size_t size() const noexcept {
+        return size_;
+    }
+
+private:
+    friend class MfqContainer;
+
+    MfqMappedBytes(
+        std::shared_ptr<void> mapping,
+        const std::uint8_t* data,
+        std::size_t size)
+        : mapping_(std::move(mapping)),
+          data_(data),
+          size_(size) {}
+
+    std::shared_ptr<void> mapping_;
+    const std::uint8_t* data_ = nullptr;
+    std::size_t size_ = 0;
+};
 
 struct MfqRecord {
     std::string name;
@@ -41,7 +75,7 @@ public:
         return records_;
     }
 
-    bool contains(const std::string& name) const noexcept;
+    bool contains(const std::string& name) const;
     const MfqRecord& record(const std::string& name) const;
     // Read one exact byte range relative to a record.  This is the native
     // streaming primitive used by bounded expert residency; it never
@@ -51,6 +85,10 @@ public:
         std::uint64_t relative_offset,
         std::uint64_t nbytes) const;
     std::vector<std::uint8_t> read(const std::string& name) const;
+    // Read-only mmap view used by full-resident model loading. The mapping is
+    // released as soon as the parser has copied the record into its final MLX
+    // buffers, so record staging never enters the process malloc depot.
+    MfqMappedBytes map_record(const std::string& name) const;
     std::string read_text(const std::string& name) const;
 
 private:

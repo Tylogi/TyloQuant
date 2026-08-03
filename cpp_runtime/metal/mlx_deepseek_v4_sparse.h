@@ -137,4 +137,19 @@ mlx::core::array attention_dsv4_sparse(
     const std::optional<mlx::core::array>& meta = std::nullopt,
     std::optional<float> scale = std::nullopt);
 
+// Single-token specialization which addresses the circular local cache and
+// compressed pool directly.  This avoids materializing a concatenated cache
+// and a separate indices/mask plan on every layer of every decode step.
+mlx::core::array attention_dsv4_sparse_decode(
+    const mlx::core::array& q,
+    const mlx::core::array& local_kv,
+    const std::optional<mlx::core::array>& pooled_kv,
+    int pool_len,
+    const mlx::core::array& topk,
+    const mlx::core::array& sinks,
+    int seq_len,
+    int ratio,
+    int window,
+    std::optional<float> scale = std::nullopt);
+
 } // namespace mfq::metal

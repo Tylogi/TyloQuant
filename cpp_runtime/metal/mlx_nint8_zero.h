@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -13,9 +14,16 @@ bool is_nint8_zero_dtype(std::string_view dtype) noexcept;
 class MlxNint8ZeroWeight {
 public:
     static MlxNint8ZeroWeight from_blob(
-        const std::vector<std::uint8_t>& blob);
+        std::span<const std::uint8_t> blob);
 
     mlx::core::array matmul(const mlx::core::array& input) const;
+    // DeepSeek-V4 O-LoRA diagonal grouped projection:
+    // input [..., group_count, K] ->
+    // output [..., group_count, OUT/group_count].
+    // Each output block consumes only the matching input group.
+    mlx::core::array grouped_row_matmul(
+        const mlx::core::array& input,
+        int group_count) const;
     mlx::core::array embedding(
         const mlx::core::array& token_ids,
         mlx::core::Dtype dtype = mlx::core::float16) const;

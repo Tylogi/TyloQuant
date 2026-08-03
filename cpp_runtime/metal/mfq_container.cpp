@@ -1,6 +1,7 @@
 #include "mfq_container.h"
 
 #include <cctype>
+#include <cerrno>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -8,7 +9,12 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 namespace mfq::metal {
 namespace {
@@ -23,6 +29,83 @@ constexpr std::uint64_t kMinMetadataEntryBytes =
     2 * sizeof(std::uint32_t);
 constexpr std::uint64_t kMinRecordEntryBytes =
     2 * sizeof(std::uint32_t) + sizeof(std::uint64_t);
+
+std::string deepseek_v4_ew_alias(std::string_view name) {
+    static const std::unordered_map<std::string_view, std::string_view>
+        globals{
+            {"embed.weight", "token_embd.weight"},
+            {"norm.weight", "output_norm.weight"},
+            {"head.weight", "output.weight"},
+            {"hc_head_fn", "output_hc_fn.weight"},
+            {"hc_head_base", "output_hc_base.weight"},
+            {"hc_head_scale", "output_hc_scale.weight"},
+        };
+    if (const auto found = globals.find(name);
+        found != globals.end()) {
+        return std::string(found->second);
+    }
+
+    constexpr std::string_view prefix = "layers.";
+    if (!name.starts_with(prefix)) {
+        return {};
+    }
+    const auto suffix_start = name.find('.', prefix.size());
+    if (suffix_start == std::string_view::npos ||
+        suffix_start == prefix.size()) {
+        return {};
+    }
+    const auto layer = name.substr(
+        prefix.size(), suffix_start - prefix.size());
+    for (const char value : layer) {
+        if (value < '0' || value > '9') {
+            return {};
+        }
+    }
+    const auto suffix = name.substr(suffix_start + 1);
+    static const std::unordered_map<std::string_view, std::string_view>
+        suffixes{
+            {"attn.wq_a.weight", "attn_q_a.weight"},
+            {"attn.q_norm.weight", "attn_q_a_norm.weight"},
+            {"attn.wq_b.weight", "attn_q_b.weight"},
+            {"attn.wkv.weight", "attn_kv.weight"},
+            {"attn.kv_norm.weight", "attn_kv_a_norm.weight"},
+            {"attn.attn_sink", "attn_sinks.weight"},
+            {"attn.wo_a.weight", "attn_output_a.weight"},
+            {"attn.wo_b.weight", "attn_output_b.weight"},
+            {"attn_norm.weight", "attn_norm.weight"},
+            {"ffn_norm.weight", "ffn_norm.weight"},
+            {"ffn.gate.weight", "ffn_gate_inp.weight"},
+            {"ffn.shared_experts.w1.weight", "ffn_gate_shexp.weight"},
+            {"ffn.shared_experts.w3.weight", "ffn_up_shexp.weight"},
+            {"ffn.shared_experts.w2.weight", "ffn_down_shexp.weight"},
+            {"hc_attn_fn", "hc_attn_fn.weight"},
+            {"hc_attn_base", "hc_attn_base.weight"},
+            {"hc_attn_scale", "hc_attn_scale.weight"},
+            {"hc_ffn_fn", "hc_ffn_fn.weight"},
+            {"hc_ffn_base", "hc_ffn_base.weight"},
+            {"hc_ffn_scale", "hc_ffn_scale.weight"},
+            {"ffn.experts.gate_up.weight", "ffn_gate_up_exps.weight"},
+            {"ffn.experts.down.weight", "ffn_down_exps.weight"},
+            {"ffn.gate.tid2eid", "ffn_gate_tid2eid.weight"},
+            {"ffn.gate.bias", "exp_probs_b.bias"},
+            {"attn.compressor.wkv.weight", "attn_compressor_kv.weight"},
+            {"attn.compressor.wgate.weight", "attn_compressor_gate.weight"},
+            {"attn.compressor.ape", "attn_compressor_ape.weight"},
+            {"attn.compressor.norm.weight", "attn_compressor_norm.weight"},
+            {"attn.indexer.wq_b.weight", "indexer.attn_q_b.weight"},
+            {"attn.indexer.weights_proj.weight", "indexer.proj.weight"},
+            {"attn.indexer.compressor.wkv.weight", "indexer_compressor_kv.weight"},
+            {"attn.indexer.compressor.wgate.weight", "indexer_compressor_gate.weight"},
+            {"attn.indexer.compressor.ape", "indexer_compressor_ape.weight"},
+            {"attn.indexer.compressor.norm.weight", "indexer_compressor_norm.weight"},
+        };
+    const auto mapped = suffixes.find(suffix);
+    if (mapped == suffixes.end()) {
+        return {};
+    }
+    return "blk." + std::string(layer) + "." +
+        std::string(mapped->second);
+}
 
 void require_regular_file(const std::filesystem::path& path) {
     std::error_code error;
@@ -410,12 +493,26 @@ MfqContainer::MfqContainer(std::filesystem::path path) {
     source_paths_ = paths;
 }
 
-bool MfqContainer::contains(const std::string& name) const noexcept {
-    return records_.find(name) != records_.end();
+bool MfqContainer::contains(const std::string& name) const {
+    if (records_.find(name) != records_.end()) {
+        return true;
+    }
+    if (header_.architecture != "deepseek_v4-ew-mfq") {
+        return false;
+    }
+    const auto alias = deepseek_v4_ew_alias(name);
+    return !alias.empty() && records_.find(alias) != records_.end();
 }
 
 const MfqRecord& MfqContainer::record(const std::string& name) const {
-    const auto found = records_.find(name);
+    auto found = records_.find(name);
+    if (found == records_.end() &&
+        header_.architecture == "deepseek_v4-ew-mfq") {
+        const auto alias = deepseek_v4_ew_alias(name);
+        if (!alias.empty()) {
+            found = records_.find(alias);
+        }
+    }
     if (found == records_.end()) {
         throw std::runtime_error("missing MFQ record: " + name);
     }
@@ -426,6 +523,72 @@ std::vector<std::uint8_t> MfqContainer::read(
     const std::string& name) const {
     const auto& value = record(name);
     return read_range(name, 0, value.nbytes);
+}
+
+MfqMappedBytes MfqContainer::map_record(
+    const std::string& name) const {
+    const auto& value = record(name);
+    if (value.nbytes == 0) {
+        return {};
+    }
+    if (
+        value.nbytes > static_cast<std::uint64_t>(
+            std::numeric_limits<std::size_t>::max())
+        || value.offset > static_cast<std::uint64_t>(
+            std::numeric_limits<off_t>::max())
+    ) {
+        throw std::runtime_error(
+            "MFQ record is too large to map: " + name);
+    }
+    const auto page_size = static_cast<std::uint64_t>(
+        ::getpagesize());
+    const auto mapped_offset =
+        value.offset - value.offset % page_size;
+    const auto delta = value.offset - mapped_offset;
+    if (
+        delta > static_cast<std::uint64_t>(
+            std::numeric_limits<std::size_t>::max())
+            - value.nbytes
+        || mapped_offset > static_cast<std::uint64_t>(
+            std::numeric_limits<off_t>::max())
+    ) {
+        throw std::runtime_error(
+            "MFQ mapped record range overflows: " + name);
+    }
+    const auto mapped_size = static_cast<std::size_t>(
+        delta + value.nbytes);
+    const int descriptor = ::open(
+        value.source_path.c_str(),
+        O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) {
+        throw std::runtime_error(
+            "cannot open MFQ record for mmap: " + name
+            + ": " + std::strerror(errno));
+    }
+    void* mapping = ::mmap(
+        nullptr,
+        mapped_size,
+        PROT_READ,
+        MAP_PRIVATE,
+        descriptor,
+        static_cast<off_t>(mapped_offset));
+    const int map_error = errno;
+    ::close(descriptor);
+    if (mapping == MAP_FAILED) {
+        throw std::runtime_error(
+            "cannot mmap MFQ record: " + name
+            + ": " + std::strerror(map_error));
+    }
+    auto owner = std::shared_ptr<void>(
+        mapping,
+        [mapped_size](void* address) {
+            ::munmap(address, mapped_size);
+        });
+    return MfqMappedBytes(
+        std::move(owner),
+        static_cast<const std::uint8_t*>(mapping)
+            + static_cast<std::size_t>(delta),
+        static_cast<std::size_t>(value.nbytes));
 }
 
 std::vector<std::uint8_t> MfqContainer::read_range(

@@ -1,4 +1,5 @@
 #include "mlx_deepseek_v4_attention.h"
+#include "mlx_eval_timing.h"
 
 #include "mlx_grouped_linear.h"
 #include "mlx_transformer.h"
@@ -82,6 +83,109 @@ constexpr const char* kHadamardSource = R"METAL(
     }
 )METAL";
 
+constexpr const char* kPartialAdjacentRopeSource = R"METAL(
+    uint index = thread_position_in_grid.x;
+    if (index >= uint(SIZE)) {
+        return;
+    }
+    uint column = index % uint(DIM);
+    uint row = index / uint(DIM);
+    constexpr uint PREFIX = uint(DIM - ROTARY);
+    if (column < PREFIX) {
+        y[index] = x[index];
+        return;
+    }
+
+    uint rotary_column = column - PREFIX;
+    uint pair = rotary_column >> 1u;
+    uint token = (row / uint(HEADS)) % uint(TOKENS);
+    float cosine = float(cos_values[token * uint(PAIRS) + pair]);
+    float sine = float(sin_values[token * uint(PAIRS) + pair]);
+    if (INVERSE != 0) {
+        sine = -sine;
+    }
+    uint pair_base =
+        row * uint(DIM) + PREFIX + (pair << 1u);
+    float first = float(x[pair_base]);
+    float second = float(x[pair_base + 1u]);
+    float result = (rotary_column & 1u) == 0u
+        ? first * cosine - second * sine
+        : first * sine + second * cosine;
+    y[index] = T(result);
+)METAL";
+
+constexpr const char* kRmsPartialAdjacentRopeSource = R"METAL(
+    uint row = threadgroup_position_in_grid.x;
+    uint local_thread = thread_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    if (row >= uint(ROWS)) {
+        return;
+    }
+
+    threadgroup float reductions[8];
+    float sum_squares = 0.0f;
+    uint row_base = row * uint(DIM);
+    for (uint column = local_thread;
+         column < uint(DIM);
+         column += 256u) {
+        float value = float(x[row_base + column]);
+        sum_squares += value * value;
+    }
+    float subtotal = simd_sum(sum_squares);
+    if (lane == 0u) {
+        reductions[simd_group] = subtotal;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (local_thread == 0u) {
+        float total = 0.0f;
+        for (uint group = 0u; group < 8u; ++group) {
+            total += reductions[group];
+        }
+        reductions[0] = rsqrt(total / float(DIM) + params[0]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inverse_rms = reductions[0];
+
+    constexpr uint PREFIX = uint(DIM - ROTARY);
+    uint token = (row / uint(HEADS)) % uint(TOKENS);
+    for (uint column = local_thread;
+         column < uint(DIM);
+         column += 256u) {
+        // Preserve the original FP16/BF16 boundary between RMSNorm and RoPE.
+        float weight = WEIGHTED != 0
+            ? float(weights[column])
+            : 1.0f;
+        T normalized = T(
+            float(x[row_base + column]) * inverse_rms * weight);
+        if (column < PREFIX) {
+            y[row_base + column] = normalized;
+            continue;
+        }
+        uint rotary_column = column - PREFIX;
+        uint pair = rotary_column >> 1u;
+        uint pair_base = row_base + PREFIX + (pair << 1u);
+        float first_weight = WEIGHTED != 0
+            ? float(weights[PREFIX + (pair << 1u)])
+            : 1.0f;
+        float second_weight = WEIGHTED != 0
+            ? float(weights[PREFIX + (pair << 1u) + 1u])
+            : 1.0f;
+        float first = float(T(
+            float(x[pair_base]) * inverse_rms * first_weight));
+        float second = float(T(
+            float(x[pair_base + 1u]) * inverse_rms * second_weight));
+        float cosine =
+            float(cos_values[token * uint(PAIRS) + pair]);
+        float sine =
+            float(sin_values[token * uint(PAIRS) + pair]);
+        float result = (rotary_column & 1u) == 0u
+            ? first * cosine - second * sine
+            : first * sine + second * cosine;
+        y[row_base + column] = T(result);
+    }
+)METAL";
+
 const mlx::core::fast::CustomKernelFunction&
 hadamard_kernel() {
     static const auto kernel = [] {
@@ -92,6 +196,42 @@ hadamard_kernel() {
             {"x"},
             {"y"},
             kHadamardSource,
+            "",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+partial_adjacent_rope_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_dsv4_partial_adjacent_rope",
+            {"x", "cos_values", "sin_values"},
+            {"y"},
+            kPartialAdjacentRopeSource,
+            "",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+rms_partial_adjacent_rope_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_dsv4_rms_partial_adjacent_rope",
+            {"x", "cos_values", "sin_values", "weights", "params"},
+            {"y"},
+            kRmsPartialAdjacentRopeSource,
             "",
             true,
             false,
@@ -182,33 +322,140 @@ array replace_last_rope(
     const array& cosine,
     const array& sine,
     bool inverse = false) {
-    if (rotary == input.shape(-1)) {
-        return deepseek_v4_rope_adjacent(
-            input,
-            cosine,
-            sine,
-            inverse);
+    if (input.ndim() < 2 || input.ndim() > 4 ||
+        input.shape(-1) <= 0 ||
+        rotary <= 0 ||
+        rotary > input.shape(-1) ||
+        rotary % 2 != 0 ||
+        cosine.shape() != sine.shape() ||
+        cosine.shape(-1) != rotary / 2) {
+        throw std::invalid_argument(
+            "invalid DeepSeek-V4 partial adjacent RoPE input");
     }
-    auto prefix = slice_axis(
-        input,
-        -1,
-        0,
-        input.shape(-1) - rotary);
-    auto suffix = slice_axis(
-        input,
-        -1,
-        input.shape(-1) - rotary,
-        input.shape(-1));
-    return mlx::core::concatenate(
+
+    auto source = floating_contiguous(input);
+    const int dimension = source.shape(-1);
+    const int tokens = source.ndim() == 2
+        ? source.shape(0)
+        : source.shape(1);
+    const int heads = source.ndim() == 4
+        ? source.shape(2)
+        : 1;
+    const int pairs = rotary / 2;
+    if (tokens <= 0 || heads <= 0 ||
+        cosine.size() !=
+            static_cast<std::size_t>(tokens) * pairs) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 RoPE table is not token-broadcastable");
+    }
+    auto cos_values = typed_contiguous(
+        cosine,
+        mlx::core::float32);
+    auto sin_values = typed_contiguous(
+        sine,
+        mlx::core::float32);
+    const auto size = source.size();
+    if (size >
+        static_cast<std::size_t>(
+            std::numeric_limits<int>::max())) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 RoPE tensor exceeds Metal grid limits");
+    }
+    const int grid = static_cast<int>(size);
+    auto outputs = partial_adjacent_rope_kernel()(
+        {source, cos_values, sin_values},
+        {source.shape()},
+        {source.dtype()},
+        {grid, 1, 1},
+        {std::min(256, grid), 1, 1},
         {
-            std::move(prefix),
-            deepseek_v4_rope_adjacent(
-                suffix,
-                cosine,
-                sine,
-                inverse),
+            {"T", source.dtype()},
+            {"SIZE", grid},
+            {"DIM", dimension},
+            {"ROTARY", rotary},
+            {"PAIRS", pairs},
+            {"TOKENS", tokens},
+            {"HEADS", heads},
+            {"INVERSE", inverse ? 1 : 0},
         },
-        -1);
+        std::nullopt,
+        false,
+        {});
+    return std::move(outputs.front());
+}
+
+array rms_replace_last_rope(
+    const array& input,
+    int rotary,
+    const array& cosine,
+    const array& sine,
+    const array& weights,
+    bool weighted,
+    const array& params) {
+    if ((input.ndim() != 3 && input.ndim() != 4) ||
+        input.shape(-1) <= 0 ||
+        rotary <= 0 ||
+        rotary > input.shape(-1) ||
+        rotary % 2 != 0 ||
+        cosine.shape() != sine.shape() ||
+        cosine.shape(-1) != rotary / 2 ||
+        params.dtype() != mlx::core::float32 ||
+        params.size() != 1 ||
+        (weighted &&
+         (weights.dtype() != mlx::core::float32 ||
+          weights.ndim() != 1 ||
+          weights.size() !=
+              static_cast<std::size_t>(input.shape(-1))))) {
+        throw std::invalid_argument(
+            "invalid DeepSeek-V4 fused RMS/RoPE input");
+    }
+    auto source = floating_contiguous(input);
+    const int dimension = source.shape(-1);
+    const int tokens = source.shape(1);
+    const int heads = source.ndim() == 4
+        ? source.shape(2)
+        : 1;
+    const int pairs = rotary / 2;
+    if (tokens <= 0 || heads <= 0 ||
+        cosine.size() !=
+            static_cast<std::size_t>(tokens) * pairs) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 fused RMS/RoPE table mismatch");
+    }
+    const auto rows = source.size() /
+        static_cast<std::size_t>(dimension);
+    if (rows == 0 ||
+        rows > static_cast<std::size_t>(
+            std::numeric_limits<int>::max() / 256)) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 fused RMS/RoPE grid exceeds Metal limits");
+    }
+    auto outputs = rms_partial_adjacent_rope_kernel()(
+        {
+            source,
+            typed_contiguous(cosine, mlx::core::float32),
+            typed_contiguous(sine, mlx::core::float32),
+            weights,
+            params,
+        },
+        {source.shape()},
+        {source.dtype()},
+        {static_cast<int>(rows) * 256, 1, 1},
+        {256, 1, 1},
+        {
+            {"T", source.dtype()},
+            {"ROWS", static_cast<int>(rows)},
+            {"DIM", dimension},
+            {"ROTARY", rotary},
+            {"PAIRS", pairs},
+            {"TOKENS", tokens},
+            {"HEADS", heads},
+            {"WEIGHTED", weighted ? 1 : 0},
+        },
+        std::nullopt,
+        false,
+        {});
+    return std::move(outputs.front());
 }
 
 array load_float_array(
@@ -222,10 +469,11 @@ array load_float_array(
             "DeepSeek-V4 attention tensor must be BF16/F16/F32: " +
             name);
     }
+    const auto mapped = model.map_record(name);
     return typed_contiguous(
         load_dense_array(
             record.dtype,
-            model.read(name)),
+            mapped.view()),
         mlx::core::float32);
 }
 
@@ -635,38 +883,12 @@ array deepseek_v4_rope_adjacent(
         throw std::invalid_argument(
             "invalid DeepSeek-V4 adjacent RoPE input");
     }
-    auto source = mlx::core::astype(
+    return replace_last_rope(
         value,
-        mlx::core::float32);
-    auto cos_values = mlx::core::astype(
+        value.shape(-1),
         cosine,
-        mlx::core::float32);
-    auto sin_values = mlx::core::astype(
         sine,
-        mlx::core::float32);
-    if (inverse) {
-        sin_values = -sin_values;
-    }
-    Shape paired_shape = value.shape();
-    paired_shape.back() /= 2;
-    paired_shape.push_back(2);
-    auto paired = mlx::core::reshape(
-        source,
-        paired_shape);
-    auto first = mlx::core::take(paired, 0, -1);
-    auto second = mlx::core::take(paired, 1, -1);
-    auto rotated = mlx::core::stack(
-        {
-            first * cos_values - second * sin_values,
-            first * sin_values + second * cos_values,
-        },
-        -1);
-    auto result = mlx::core::reshape(
-        std::move(rotated),
-        value.shape());
-    return result.dtype() == value.dtype()
-        ? result
-        : mlx::core::astype(result, value.dtype());
+        inverse);
 }
 
 array deepseek_v4_unweighted_rms(
@@ -857,13 +1079,42 @@ void MlxDeepseekV4PoolState::update(
 
 MlxDeepseekV4LayerState::MlxDeepseekV4LayerState(
     array local,
-    array local_positions,
     std::optional<MlxDeepseekV4PoolState> main,
     std::optional<MlxDeepseekV4PoolState> indexer)
     : local_(std::move(local)),
-      local_positions_(std::move(local_positions)),
       main_(std::move(main)),
       indexer_(std::move(indexer)) {}
+
+array MlxDeepseekV4LayerState::local_positions() const {
+    const int window = local_.shape(1);
+    auto slots = mlx::core::arange(
+        window,
+        mlx::core::int32);
+    array positions = mlx::core::full(
+        Shape{window},
+        -1,
+        mlx::core::int32);
+    if (position_ > 0 && position_ < window) {
+        positions = mlx::core::where(
+            mlx::core::less(
+                slots,
+                array(position_, mlx::core::int32)),
+            slots,
+            positions);
+    } else if (position_ >= window) {
+        const int last = position_ - 1;
+        positions =
+            array(last, mlx::core::int32) -
+            mlx::core::remainder(
+                array(last, mlx::core::int32) - slots,
+                array(window, mlx::core::int32));
+    }
+    return mlx::core::broadcast_to(
+        mlx::core::reshape(
+            positions,
+            Shape{1, window}),
+        Shape{batch(), window});
+}
 
 MlxDeepseekV4LayerState
 MlxDeepseekV4LayerState::allocate(
@@ -912,10 +1163,6 @@ MlxDeepseekV4LayerState::allocate(
         mlx::core::zeros(
             Shape{batch, window, head_dim},
             dtype),
-        mlx::core::full(
-            Shape{batch, window},
-            -1,
-            mlx::core::int32),
         std::move(main),
         std::move(indexer));
 }
@@ -927,8 +1174,8 @@ struct MlxDeepseekV4Attention::Impl {
     int maximum_context;
     MlxDeepseekV4AttentionComponents components;
     std::pair<array, array> rope;
+    array rms_params;
     MlxRmsNorm q_norm;
-    MlxRmsNorm kv_norm;
     std::optional<ProjectionGroup> projections;
 
     Impl(
@@ -951,11 +1198,11 @@ struct MlxDeepseekV4Attention::Impl {
                   selected_rope.second,
                   mlx::core::float32),
           },
+          rms_params(
+              {static_cast<float>(config.rms_eps)},
+              mlx::core::float32),
           q_norm(
               components.q_norm,
-              static_cast<float>(config.rms_eps)),
-          kv_norm(
-              components.kv_norm,
               static_cast<float>(config.rms_eps)) {
         validate();
         projections.emplace(projection_list());
@@ -1306,7 +1553,22 @@ struct MlxDeepseekV4Attention::Impl {
                 tokens,
                 groups * rank,
             });
-        return components.wo_b(low_rank);
+        if (detail::component_profile_active()) {
+            detail::profile_eval(
+                std::string("attention.r")
+                    + std::to_string(ratio)
+                    + ".output_projection_a",
+                low_rank);
+        }
+        auto result = components.wo_b(low_rank);
+        if (detail::component_profile_active()) {
+            detail::profile_eval(
+                std::string("attention.r")
+                    + std::to_string(ratio)
+                    + ".output_projection_b",
+                result);
+        }
+        return result;
     }
 };
 
@@ -1520,18 +1782,34 @@ array MlxDeepseekV4Attention::operator()(
         1,
         mlx::core::int32);
     auto projected = impl_->project(source);
+    const auto profile_component =
+        [ratio = impl_->ratio](const char* component) {
+            return std::string("attention.r")
+                + std::to_string(ratio)
+                + "." + component;
+        };
+    if (detail::component_profile_active()) {
+        detail::profile_eval(
+            profile_component("input_projections"),
+            projected);
+    }
     std::size_t output = 0;
     auto q_rank = impl_->q_norm(
         projected.at(output++));
-    auto kv = impl_->kv_norm(
-        projected.at(output++));
-    auto q = mlx::core::reshape(
+    auto kv = projected.at(output++);
+    if (detail::component_profile_active()) {
+        detail::profile_eval(
+            profile_component("q_rank_norm"),
+            q_rank);
+    }
+    auto q_projected = mlx::core::reshape(
         impl_->components.q_b(q_rank),
         Shape{batch, tokens, heads, head_dim});
-    q = deepseek_v4_unweighted_rms(
-        q,
-        static_cast<float>(config.rms_eps));
-
+    if (detail::component_profile_active()) {
+        detail::profile_eval(
+            profile_component("q_b_projection"),
+            q_projected);
+    }
     const int rotary = checked_int(
         config.qk_rope_head_dim,
         "rotary dimension");
@@ -1549,16 +1827,30 @@ array MlxDeepseekV4Attention::operator()(
     auto q_sine = mlx::core::expand_dims(
         mlx::core::expand_dims(sine, 0),
         2);
-    q = replace_last_rope(
-        q,
+    auto q = rms_replace_last_rope(
+        q_projected,
         rotary,
         q_cosine,
-        q_sine);
-    kv = replace_last_rope(
+        q_sine,
+        impl_->rms_params,
+        false,
+        impl_->rms_params);
+    kv = rms_replace_last_rope(
         kv,
         rotary,
         mlx::core::expand_dims(cosine, 0),
-        mlx::core::expand_dims(sine, 0));
+        mlx::core::expand_dims(sine, 0),
+        impl_->components.kv_norm,
+        true,
+        impl_->rms_params);
+    if (detail::component_profile_active()) {
+        detail::profile_eval(
+            profile_component("q_rms_rope"),
+            q);
+        detail::profile_eval(
+            profile_component("kv_norm_rope"),
+            kv);
+    }
 
     array index_weights = mlx::core::zeros(
         Shape{batch, tokens, 0},
@@ -1632,12 +1924,44 @@ array MlxDeepseekV4Attention::operator()(
             "DeepSeek-V4 projection group output mismatch");
     }
 
+    if (
+        detail::component_profile_active()
+        && impl_->ratio != 0
+    ) {
+        std::vector<array> compressor_state;
+        const auto append_pool =
+            [&compressor_state](
+                const MlxDeepseekV4PoolState& pool) {
+                compressor_state.push_back(pool.pool());
+                compressor_state.push_back(pool.state_kv());
+                compressor_state.push_back(pool.state_gate());
+                if (pool.prev_kv()) {
+                    compressor_state.push_back(*pool.prev_kv());
+                }
+                if (pool.prev_gate()) {
+                    compressor_state.push_back(*pool.prev_gate());
+                }
+            };
+        append_pool(*state.main_);
+        if (state.indexer_) {
+            append_pool(*state.indexer_);
+        }
+        detail::profile_eval(
+            profile_component("compressor_update"),
+            std::move(compressor_state));
+    }
+
     auto topk = impl_->topk(
         q_rank,
         index_weights,
         state,
         positions,
         pos0);
+    if (detail::component_profile_active()) {
+        detail::profile_eval(
+            profile_component("indexer_topk"),
+            topk);
+    }
     const int window = checked_int(
         config.sliding_window,
         "sliding window");
@@ -1647,6 +1971,7 @@ array MlxDeepseekV4Attention::operator()(
         : 0;
     array unified = state.local_;
     std::optional<std::pair<array, array>> plan;
+    std::optional<array> direct_decode;
     if (tokens == 1) {
         const int slot = pos0 % window;
         auto local_index = mlx::core::full(
@@ -1661,37 +1986,46 @@ array MlxDeepseekV4Attention::operator()(
                 state.local_.dtype()),
             1);
         unified = state.local_;
-        state.local_positions_ =
-            mlx::core::put_along_axis(
-                state.local_positions_,
-                mlx::core::full(
-                    Shape{batch, 1},
-                    slot,
-                    mlx::core::int32),
-                mlx::core::full(
-                    Shape{batch, 1},
-                    pos0,
-                    mlx::core::int32),
-                1);
-        if (state.main_.has_value()) {
-            unified = mlx::core::concatenate(
-                {
-                    state.local_,
-                    pool_prefix(*state.main_),
-                },
-                1);
-        }
-        plan = dsv4_build_decode_plan(
-            topk,
-            mlx::core::full(
-                Shape{batch},
+        if (config.fast_attention()) {
+            std::optional<array> pooled;
+            if (state.main_.has_value()) {
+                pooled = state.main_->pool();
+            }
+            direct_decode = attention_dsv4_sparse_decode(
+                mlx::core::transpose(
+                    q,
+                    {0, 2, 1, 3}),
+                state.local_,
+                pooled,
+                pool_len,
+                topk,
+                impl_->components.sinks,
                 pos0 + 1,
-                mlx::core::int32),
-            pool_len,
-            impl_->ratio == 0
-                ? 1
-                : impl_->ratio,
-            window);
+                impl_->ratio == 0
+                    ? 1
+                    : impl_->ratio,
+                window);
+        } else {
+            if (state.main_.has_value()) {
+                unified = mlx::core::concatenate(
+                    {
+                        state.local_,
+                        pool_prefix(*state.main_),
+                    },
+                    1);
+            }
+            plan = dsv4_build_decode_plan(
+                topk,
+                mlx::core::full(
+                    Shape{batch},
+                    pos0 + 1,
+                    mlx::core::int32),
+                pool_len,
+                impl_->ratio == 0
+                    ? 1
+                    : impl_->ratio,
+                window);
+        }
     } else {
         const int history = std::min(pos0, window);
         array history_values = slice_axis(
@@ -1762,37 +2096,44 @@ array MlxDeepseekV4Attention::operator()(
                 recent_values,
                 state.local_.dtype()),
             1);
-        state.local_positions_ =
-            mlx::core::put_along_axis(
-                state.local_positions_,
-                mlx::core::broadcast_to(
-                    mlx::core::reshape(
-                        recent_slots,
-                        Shape{1, recent}),
-                    Shape{batch, recent}),
-                mlx::core::broadcast_to(
-                    mlx::core::reshape(
-                        recent_positions,
-                        Shape{1, recent}),
-                    Shape{batch, recent}),
-                1);
     }
 
-    array attended = config.fast_attention()
-        ? attention_dsv4_sparse(
-              mlx::core::transpose(
+    array attended = direct_decode
+        ? *direct_decode
+        : config.fast_attention()
+            ? attention_dsv4_sparse(
+                  mlx::core::transpose(
+                      q,
+                      {0, 2, 1, 3}),
+                  unified,
+                  plan->first,
+                  plan->second,
+                  impl_->components.sinks)
+            : generic_sparse_attention(
                   q,
-                  {0, 2, 1, 3}),
-              unified,
-              plan->first,
-              plan->second,
-              impl_->components.sinks)
-        : generic_sparse_attention(
-              q,
-              unified,
-              plan->first,
-              plan->second,
-              impl_->components.sinks);
+                  unified,
+                  plan->first,
+                  plan->second,
+                  impl_->components.sinks);
+    if (detail::component_profile_active()) {
+        if (direct_decode) {
+            detail::profile_eval(
+                profile_component("cache_update"),
+                std::vector<array>{state.local_});
+        } else {
+            detail::profile_eval(
+                profile_component("cache_plan"),
+                std::vector<array>{
+                    state.local_,
+                    unified,
+                    plan->first,
+                    plan->second,
+                });
+        }
+        detail::profile_eval(
+            profile_component("sparse_core"),
+            attended);
+    }
     attended = replace_last_rope(
         attended,
         rotary,

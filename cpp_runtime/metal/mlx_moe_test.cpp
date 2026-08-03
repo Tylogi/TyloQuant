@@ -2906,6 +2906,13 @@ void test_vq_cohorts_and_ffn() {
         make_jsc_nvq(
             width,
             width,
+            "NVQ3J",
+            2,
+            4,
+            8),
+        make_jsc_nvq(
+            width,
+            width,
             "NVQ3J-512",
             3,
             4,
@@ -2931,9 +2938,9 @@ void test_vq_cohorts_and_ffn() {
         "VQ NINTM metadata mismatch");
 
     const std::vector<std::int32_t> ids{
-        0, 7, 2,
-        3, 1, 6,
-        4, 5, 7,
+        0, 8, 2,
+        3, 1, 7,
+        5, 6, 4,
     };
     std::vector<float> input(tokens * width);
     for (

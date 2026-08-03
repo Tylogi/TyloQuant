@@ -1,5 +1,7 @@
 #include "mlx_grouped_linear.h"
 
+#include <mlx/allocator.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -423,14 +425,15 @@ array make_raw_array(
     const auto elements = checked_int(
         bytes.size() / dtype.size(),
         "packed stream");
-    auto storage =
-        std::make_shared<std::vector<std::uint8_t>>(
-            std::move(bytes));
-    return array(
-        storage->data(),
+    auto result = array(
+        mlx::core::allocator::malloc(bytes.size()),
         Shape{elements},
-        dtype,
-        [storage = std::move(storage)](void*) {});
+        dtype);
+    std::memcpy(
+        result.data<std::uint8_t>(),
+        bytes.data(),
+        bytes.size());
+    return result;
 }
 
 array make_int32_array(

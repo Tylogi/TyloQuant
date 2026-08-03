@@ -952,6 +952,87 @@ void test_sparse_attention_path(int queries) {
             std::to_string(queries));
 }
 
+void test_direct_decode_attention_path() {
+    constexpr int heads = 64;
+    constexpr int dimension = 512;
+    constexpr int window = 4;
+    constexpr int pool_len = 2;
+    constexpr int ratio = 2;
+    constexpr int seq_len = 5;
+    std::vector<float> query(
+        static_cast<std::size_t>(heads) * dimension,
+        0.0f);
+    for (int head = 0; head < heads; ++head) {
+        query[head * dimension] =
+            0.25f + static_cast<float>(head) / 128.0f;
+        query[head * dimension + 7] = -0.375f;
+    }
+    std::vector<float> local(window * dimension, 0.0f);
+    std::vector<float> pool(pool_len * dimension, 0.0f);
+    for (int row = 0; row < window; ++row) {
+        local[row * dimension] =
+            -0.5f + static_cast<float>(row) * 0.4f;
+        local[row * dimension + 7] =
+            0.75f - static_cast<float>(row) * 0.2f;
+    }
+    for (int row = 0; row < pool_len; ++row) {
+        pool[row * dimension] =
+            1.25f + static_cast<float>(row) * 0.5f;
+        pool[row * dimension + 7] =
+            -0.25f + static_cast<float>(row) * 0.125f;
+    }
+    std::vector<float> sinks(heads);
+    for (int head = 0; head < heads; ++head) {
+        sinks[head] =
+            -0.75f + static_cast<float>(head) / 96.0f;
+    }
+    auto local_array = float_array(
+        local,
+        Shape{1, window, dimension});
+    auto pool_array = float_array(
+        pool,
+        Shape{1, pool_len, dimension});
+    auto topk = int_array(
+        {0, 1},
+        Shape{1, 1, pool_len});
+    auto sink_array = float_array(
+        sinks,
+        Shape{heads});
+    auto plan = mfq::metal::dsv4_build_decode_plan(
+        topk,
+        int_array({seq_len}, Shape{1}),
+        pool_len,
+        ratio,
+        window);
+    auto legacy = mfq::metal::attention_dsv4_sparse(
+        float_array(
+            query,
+            Shape{1, heads, 1, dimension}),
+        mlx::core::concatenate(
+            {local_array, pool_array},
+            1),
+        plan.first,
+        plan.second,
+        sink_array);
+    auto direct = mfq::metal::attention_dsv4_sparse_decode(
+        float_array(
+            query,
+            Shape{1, heads, 1, dimension}),
+        local_array,
+        pool_array,
+        pool_len,
+        topk,
+        sink_array,
+        seq_len,
+        ratio,
+        window);
+    require_close(
+        evaluated_float(std::move(direct)),
+        evaluated_float(std::move(legacy)),
+        1e-6f,
+        "direct sparse decode attention");
+}
+
 void test_invalid_inputs() {
     require_invalid(
         [] {
@@ -1082,6 +1163,7 @@ int main() {
         test_sparse_attention_path(1);
         test_sparse_attention_path(2);
         test_sparse_attention_path(32);
+        test_direct_decode_attention_path();
         test_invalid_inputs();
         std::cout
             << "MFQ C++ DeepSeek-V4 sparse Metal tests passed\n";

@@ -9,6 +9,7 @@
 #include "mlx_vq.h"
 
 #include <optional>
+#include <span>
 #include <string>
 #include <variant>
 #include <vector>
@@ -19,7 +20,7 @@ namespace mfq::metal {
 
 mlx::core::array load_dense_array(
     const std::string& dtype,
-    const std::vector<std::uint8_t>& blob);
+    std::span<const std::uint8_t> blob);
 
 class MlxLinear {
 public:

@@ -47,9 +47,10 @@ array load_dense(
             "DeepSeek-V4 dense tensor has incompatible dtype: "
             + name);
     }
+    const auto mapped = model.map_record(name);
     auto value = load_dense_array(
         record.dtype,
-        model.read(name));
+        mapped.view());
     if (value.dtype() != dtype) {
         value = mlx::core::astype(value, dtype);
     }
@@ -65,7 +66,8 @@ MlxRoutedLinear load_routed(
             "DeepSeek-V4 routed expert tensor must use NINTM: "
             + name);
     }
-    return MlxRoutedLinear::from_blob(model.read(name));
+    const auto mapped = model.map_record(name);
+    return MlxRoutedLinear::from_blob(mapped.view());
 }
 
 std::optional<MlxGroupedLinear> make_grouped(
@@ -127,14 +129,14 @@ int count_available(const array& value) {
 
 array streamed_availability(
     const std::optional<array>& requested,
-    MlxCccpExpertResidency& residency,
+    MlxNintMoeOffloadCache& offload,
     const std::string& gate_up_name,
     const std::string& down_name,
     int experts) {
     const auto gate =
-        residency.availability(gate_up_name);
+        offload.availability(gate_up_name);
     const auto down =
-        residency.availability(down_name);
+        offload.availability(down_name);
     if (
         gate.size()
             != static_cast<std::size_t>(experts)
@@ -169,8 +171,8 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
     const DeepseekV4Config& config,
     std::size_t layer,
     const std::optional<array>& available,
-    std::shared_ptr<MlxCccpExpertResidency>
-        residency) {
+    std::shared_ptr<MlxNintMoeOffloadCache>
+        offload) {
     config.validate();
     if (layer >=
         static_cast<std::size_t>(config.n_layers)) {
@@ -204,15 +206,15 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
         name("ffn.experts.down.weight");
     bool stream_gate_up = false;
     bool stream_down = false;
-    if (residency) {
+    if (offload) {
         stream_gate_up =
-            residency->can_stream(gate_up_name);
+            offload->can_offload(gate_up_name);
         try {
             stream_down =
-                residency->can_stream(down_name);
+                offload->can_offload(down_name);
         } catch (...) {
             if (stream_gate_up) {
-                residency->discard_record(
+                offload->discard_record(
                     gate_up_name);
             }
             throw;
@@ -221,10 +223,10 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
     if (stream_gate_up && stream_down) {
         try {
             const auto gate_info =
-                residency->projection_info(
+                offload->projection_info(
                     gate_up_name);
             const auto down_info =
-                residency->projection_info(
+                offload->projection_info(
                     down_name);
             const int experts = checked_int(
                 static_cast<std::size_t>(
@@ -254,7 +256,7 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
             auto effective_available =
                 streamed_availability(
                     available,
-                    *residency,
+                    *offload,
                     gate_up_name,
                     down_name,
                     experts);
@@ -277,29 +279,29 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
                         "ffn.shared_experts.w2.weight")),
                 std::nullopt,
                 std::nullopt,
-                residency,
+                offload,
                 gate_up_name,
                 down_name,
                 std::move(router_bias),
                 std::move(token_experts),
                 std::move(effective_available));
         } catch (...) {
-            residency->discard_record(
+            offload->discard_record(
                 gate_up_name);
-            residency->discard_record(
+            offload->discard_record(
                 down_name);
             throw;
         }
     }
     // A mixed representation must use the eager routed implementation for
-    // both projections.  Drop any projection/codebook parsed by can_stream()
+    // both projections. Drop any projection/codebook parsed by can_offload()
     // so a streamable half does not remain resident but unused.
-    if (residency) {
+    if (offload) {
         if (stream_gate_up) {
-            residency->discard_record(gate_up_name);
+            offload->discard_record(gate_up_name);
         }
         if (stream_down) {
-            residency->discard_record(down_name);
+            offload->discard_record(down_name);
         }
     }
     return MlxDeepseekV4Moe(
@@ -361,8 +363,8 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
         routed_gate_up,
     std::optional<MlxRoutedLinear>
         routed_down,
-    std::shared_ptr<MlxCccpExpertResidency>
-        expert_residency,
+    std::shared_ptr<MlxNintMoeOffloadCache>
+        expert_offload,
     std::string streamed_gate_up_name,
     std::string streamed_down_name,
     std::optional<array> router_bias,
@@ -375,8 +377,8 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
       shared_down_(std::move(shared_down)),
       routed_gate_up_(std::move(routed_gate_up)),
       routed_down_(std::move(routed_down)),
-      expert_residency_(
-          std::move(expert_residency)),
+      expert_offload_(
+          std::move(expert_offload)),
       streamed_gate_up_name_(
           std::move(streamed_gate_up_name)),
       streamed_down_name_(
@@ -420,7 +422,7 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
         routed_gate_up_.has_value()
         && routed_down_.has_value();
     const bool streamed =
-        static_cast<bool>(expert_residency_);
+        static_cast<bool>(expert_offload_);
     if (
         routed_gate_up_.has_value()
             != routed_down_.has_value()
@@ -461,10 +463,10 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
                 "names cannot be empty");
         }
         const auto gate =
-            expert_residency_->projection_info(
+            expert_offload_->projection_info(
                 streamed_gate_up_name_);
         const auto down =
-            expert_residency_->projection_info(
+            expert_offload_->projection_info(
                 streamed_down_name_);
         if (
             gate.experts != experts
@@ -589,6 +591,15 @@ MlxDeepseekV4Moe::forward_with_routing(
             input,
             Shape{rows, hidden}));
     auto projections = project_shared(source);
+    if (detail::component_profile_active()) {
+        detail::profile_eval(
+            "moe.shared_router_projections",
+            std::vector<array>{
+                projections[0],
+                projections[1],
+                projections[2],
+            });
+    }
     auto logits = std::move(projections[0]);
     array expert_ids = mlx::core::zeros(
         Shape{
@@ -671,24 +682,48 @@ MlxDeepseekV4Moe::forward_with_routing(
         expert_ids = std::move(routing.ids);
         expert_weights = std::move(routing.weights);
     }
+    if (detail::component_profile_active()) {
+        detail::profile_eval(
+            "moe.routing",
+            std::vector<array>{
+                expert_ids,
+                expert_weights,
+            });
+    }
 
     array routed = mlx::core::zeros(
         Shape{rows, hidden},
         source.dtype());
-    if (!expert_residency_) {
-        auto gate_up =
-            routed_gate_up_->forward(
-                source,
-                expert_ids);
+    if (!expert_offload_) {
         auto routed_hidden =
-            moe_limited_swiglu_split(
-                gate_up,
+            routed_gate_up_->swiglu(
+                source,
+                expert_ids,
                 static_cast<float>(
                     config_.swiglu_limit));
-        routed = routed_down_->combine(
-            routed_hidden,
-            expert_ids,
-            expert_weights);
+        if (detail::component_profile_active()) {
+            detail::profile_eval(
+                "moe.routed_gate_up_swiglu",
+                routed_hidden);
+            auto routed_pairs =
+                routed_down_->forward(
+                    routed_hidden,
+                    expert_ids);
+            detail::profile_eval(
+                "moe.routed_down",
+                routed_pairs);
+            routed = moe_weighted_reduce(
+                routed_pairs,
+                expert_weights);
+            detail::profile_eval(
+                "moe.route_reduce",
+                routed);
+        } else {
+            routed = routed_down_->combine(
+                routed_hidden,
+                expert_ids,
+                expert_weights);
+        }
     } else {
         constexpr int kStreamRows = 16;
         auto host_ids =
@@ -771,7 +806,7 @@ MlxDeepseekV4Moe::forward_with_routing(
                     Shape{start, 0},
                     Shape{end, routes});
             auto gate_weight =
-                expert_residency_->grouped(
+                expert_offload_->grouped(
                     streamed_gate_up_name_,
                     selected);
             auto gate_up =
@@ -784,7 +819,7 @@ MlxDeepseekV4Moe::forward_with_routing(
                     static_cast<float>(
                         config_.swiglu_limit));
             auto down_weight =
-                expert_residency_->grouped(
+                expert_offload_->grouped(
                     streamed_down_name_,
                     selected);
             auto down =
@@ -822,8 +857,17 @@ MlxDeepseekV4Moe::forward_with_routing(
             shared_gate_up,
             static_cast<float>(
                 config_.swiglu_limit));
+    detail::profile_eval(
+        "moe.shared_swiglu",
+        shared_hidden);
     auto shared = shared_down_(shared_hidden);
+    detail::profile_eval(
+        "moe.shared_down",
+        shared);
     auto output = routed + shared;
+    detail::profile_eval(
+        "moe.output_add",
+        output);
     Shape output_shape(
         input.shape().begin(),
         input.shape().end() - 1);
