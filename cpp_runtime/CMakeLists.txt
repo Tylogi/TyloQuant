@@ -325,6 +325,7 @@ add_executable(mfq-decode
     ../mfq/kernels/cuda/glm_dsa.cu
     ../mfq/kernels/cuda/kv_cache.cu
     ../mfq/kernels/cuda/moe.cu
+    ../mfq/kernels/cuda/mx_matmul.cu
     ../mfq/kernels/cuda/nint_matmul.cu
     ../mfq/kernels/cuda/nvq_matmul.cu
     ../mfq/kernels/cuda/nepq.cu

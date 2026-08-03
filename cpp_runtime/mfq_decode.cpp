@@ -516,6 +516,20 @@ torch::Tensor nint_dequant_full_packed_compact_bits_cuda(
     torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
     torch::Tensor neuron_scale, torch::Tensor neuron_min, int64_t neuron_len, int64_t gs, int64_t bits);
 torch::Tensor nint_cublas_gemm_nt_f32acc_cuda(torch::Tensor x, torch::Tensor w);
+torch::Tensor mxfp8_dequant_cuda(
+    torch::Tensor values, torch::Tensor scales);
+torch::Tensor mxfp8_small_m_cuda(
+    torch::Tensor values, torch::Tensor scales, torch::Tensor x);
+torch::Tensor mxfp8_small_m_f32_cuda(
+    torch::Tensor values, torch::Tensor scales, torch::Tensor x);
+torch::Tensor mxfp8_gemm_f32_cuda(
+    torch::Tensor values, torch::Tensor scales, torch::Tensor x);
+torch::Tensor mxfp8_groupwise_small_m_cuda(
+    torch::Tensor values, torch::Tensor scales,
+    torch::Tensor x, int64_t groups);
+torch::Tensor mxfp8_groupwise_small_m_f32_cuda(
+    torch::Tensor values, torch::Tensor scales,
+    torch::Tensor x, int64_t groups);
 torch::Tensor nvq_dequant_cuda(
     torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
     torch::Tensor neuron_scale, torch::Tensor codebook,
@@ -745,6 +759,15 @@ struct TensorParallelCollectiveRuntime {
     }
 
     void reset() noexcept {
+        // Release CUDA-owned state while every device context is still alive.
+        // Relying on static destruction is too late: libtorch's CUDA allocator
+        // may already be shutting down when tensors on secondary TP devices are
+        // destroyed.
+        for (int device : devices) {
+            (void)cudaSetDevice(device);
+            (void)cudaDeviceSynchronize();
+        }
+        reduction_buffers.clear();
 #ifdef MFQ_HAVE_NCCL
         for (auto communicator : communicators) {
             if (communicator != nullptr) {
@@ -766,7 +789,6 @@ struct TensorParallelCollectiveRuntime {
         streams.clear();
         ready.clear();
         completed.clear();
-        reduction_buffers.clear();
         collectives_enabled = false;
     }
 
@@ -1772,6 +1794,136 @@ static Nint8ZeroCpu slice_nint8_zero_cpu_input_groups(
     return result;
 }
 
+struct Mxfp8Cpu {
+    int64_t out = 0;
+    int64_t neuron_len = 0;
+    std::vector<uint8_t> values;
+    std::vector<uint8_t> scales;
+};
+
+static size_t checked_mxfp8_size(
+        uint64_t left, uint64_t right,
+        const char * label) {
+    if (left == 0 || right == 0 ||
+            left > std::numeric_limits<size_t>::max() / right) {
+        throw std::runtime_error(
+            std::string("invalid MXFP8 ") + label);
+    }
+    return static_cast<size_t>(left * right);
+}
+
+static Mxfp8Cpu unpack_mxfp8(
+        const std::vector<uint8_t> & blob) {
+    constexpr size_t kHeaderBytes = 56;
+    if (blob.size() < kHeaderBytes ||
+            std::memcmp(blob.data(), "MXT1", 4) != 0 ||
+            blob[4] != 1 || blob[5] != 8 ||
+            blob[6] != 0 || blob[7] != 0) {
+        throw std::runtime_error("invalid MXFP8 payload header");
+    }
+    size_t offset = 8;
+    const uint64_t rows = read_u64_from(blob, offset);
+    const uint64_t columns = read_u64_from(blob, offset);
+    const uint64_t storage_rows = read_u64_from(blob, offset);
+    const uint64_t storage_columns = read_u64_from(blob, offset);
+    const uint64_t scale_rows = read_u64_from(blob, offset);
+    const uint64_t scale_columns = read_u64_from(blob, offset);
+    if (rows > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            columns > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            columns % 128 != 0 ||
+            storage_rows != rows || storage_columns != columns ||
+            scale_rows != (rows + 127) / 128 ||
+            scale_columns != columns / 128) {
+        throw std::runtime_error("invalid MXFP8 payload geometry");
+    }
+    const size_t value_bytes = checked_mxfp8_size(
+        storage_rows, storage_columns, "value size");
+    const size_t scale_bytes = checked_mxfp8_size(
+        scale_rows, scale_columns, "scale size");
+    if (value_bytes > blob.size() - offset ||
+            scale_bytes != blob.size() - offset - value_bytes) {
+        throw std::runtime_error("invalid MXFP8 payload length");
+    }
+    Mxfp8Cpu result;
+    result.out = static_cast<int64_t>(rows);
+    result.neuron_len = static_cast<int64_t>(columns);
+    result.values.assign(
+        blob.begin() + static_cast<ptrdiff_t>(offset),
+        blob.begin() + static_cast<ptrdiff_t>(offset + value_bytes));
+    offset += value_bytes;
+    result.scales.assign(
+        blob.begin() + static_cast<ptrdiff_t>(offset),
+        blob.end());
+    return result;
+}
+
+static Mxfp8Cpu slice_mxfp8_cpu(
+        const Mxfp8Cpu & source,
+        TensorParallelAxis axis,
+        int64_t begin,
+        int64_t end) {
+    if (axis != TensorParallelAxis::Output &&
+            axis != TensorParallelAxis::Input) {
+        throw std::runtime_error("MXFP8 slicing requires output or input axis");
+    }
+    const int64_t extent = axis == TensorParallelAxis::Output
+        ? source.out : source.neuron_len;
+    if (begin < 0 || begin >= end || end > extent ||
+            begin % 128 != 0 ||
+            (end != extent && end % 128 != 0)) {
+        throw std::runtime_error(
+            "MXFP8 tensor-parallel shards must preserve 128-element blocks");
+    }
+    Mxfp8Cpu result;
+    if (axis == TensorParallelAxis::Output) {
+        result.out = end - begin;
+        result.neuron_len = source.neuron_len;
+        const size_t value_begin =
+            static_cast<size_t>(begin * source.neuron_len);
+        const size_t value_end =
+            static_cast<size_t>(end * source.neuron_len);
+        result.values.assign(
+            source.values.begin() + static_cast<ptrdiff_t>(value_begin),
+            source.values.begin() + static_cast<ptrdiff_t>(value_end));
+        const int64_t scale_columns = source.neuron_len / 128;
+        const size_t scale_begin =
+            static_cast<size_t>((begin / 128) * scale_columns);
+        const size_t scale_end = static_cast<size_t>(
+            ((end + 127) / 128) * scale_columns);
+        result.scales.assign(
+            source.scales.begin() + static_cast<ptrdiff_t>(scale_begin),
+            source.scales.begin() + static_cast<ptrdiff_t>(scale_end));
+        return result;
+    }
+
+    result.out = source.out;
+    result.neuron_len = end - begin;
+    result.values.resize(
+        static_cast<size_t>(result.out * result.neuron_len));
+    for (int64_t row = 0; row < source.out; ++row) {
+        std::memcpy(
+            result.values.data() +
+                static_cast<size_t>(row * result.neuron_len),
+            source.values.data() +
+                static_cast<size_t>(row * source.neuron_len + begin),
+            static_cast<size_t>(result.neuron_len));
+    }
+    const int64_t source_scale_columns = source.neuron_len / 128;
+    const int64_t result_scale_columns = result.neuron_len / 128;
+    const int64_t scale_rows = (source.out + 127) / 128;
+    result.scales.resize(
+        static_cast<size_t>(scale_rows * result_scale_columns));
+    for (int64_t row = 0; row < scale_rows; ++row) {
+        std::memcpy(
+            result.scales.data() +
+                static_cast<size_t>(row * result_scale_columns),
+            source.scales.data() + static_cast<size_t>(
+                row * source_scale_columns + begin / 128),
+            static_cast<size_t>(result_scale_columns));
+    }
+    return result;
+}
+
 static torch::Tensor cpu_u8_tensor(const std::vector<uint8_t> & v, std::initializer_list<int64_t> shape) {
     return torch::from_blob((void *)v.data(), shape, torch::TensorOptions().dtype(torch::kUInt8)).clone();
 }
@@ -1787,6 +1939,33 @@ static torch::Tensor cpu_f16_tensor(
 static torch::Tensor cpu_f16_to_f32_tensor(const std::vector<uint16_t> & v, int64_t n) {
     auto h = torch::from_blob((void *)v.data(), {n}, torch::TensorOptions().dtype(torch::kFloat16)).clone();
     return h.to(torch::kFloat32).contiguous();
+}
+
+struct Mxfp8Weight {
+    torch::Tensor values;
+    torch::Tensor scales;
+    int64_t out = 0;
+    int64_t neuron_len = 0;
+};
+
+static Mxfp8Weight to_cuda_device_mxfp8(
+        const Mxfp8Cpu & source,
+        int device) {
+    c10::cuda::CUDAGuard guard(device);
+    Mxfp8Weight result;
+    result.out = source.out;
+    result.neuron_len = source.neuron_len;
+    result.values = cpu_u8_tensor(
+        source.values,
+        {source.out, source.neuron_len})
+        .to(torch::Device(torch::kCUDA, device), false, false)
+        .contiguous();
+    result.scales = cpu_u8_tensor(
+        source.scales,
+        {(source.out + 127) / 128, source.neuron_len / 128})
+        .to(torch::Device(torch::kCUDA, device), false, false)
+        .contiguous();
+    return result;
 }
 
 struct Workspace {
@@ -7843,15 +8022,200 @@ struct NvqLinear {
     }
 };
 
+static torch::Tensor mxfp8_matmul(
+        const Mxfp8Weight & weight,
+        torch::Tensor x) {
+    x = x.contiguous().to(torch::kFloat16);
+    TORCH_CHECK(
+        x.dim() == 2 && x.size(1) == weight.neuron_len,
+        "MXFP8 activation width mismatch");
+    if (x.size(0) <= 8) {
+        return g_profiler.measure("mxfp8.small_m", [&]() {
+            return mxfp8_small_m_cuda(
+                weight.values, weight.scales, x);
+        });
+    }
+    auto dense = g_profiler.measure("mxfp8.dequant", [&]() {
+        return mxfp8_dequant_cuda(
+            weight.values, weight.scales);
+    });
+    return g_profiler.measure("mxfp8.gemm", [&]() {
+        return nint_cublas_gemm_nt_f32acc_cuda(x, dense);
+    });
+}
+
+static torch::Tensor mxfp8_matmul_f32(
+        const Mxfp8Weight & weight,
+        torch::Tensor x) {
+    x = x.contiguous().to(torch::kFloat16);
+    TORCH_CHECK(
+        x.dim() == 2 && x.size(1) == weight.neuron_len,
+        "MXFP8 FP32-output activation width mismatch");
+    if (x.size(0) <= 8) {
+        return g_profiler.measure("mxfp8.small_m_f32", [&]() {
+            return mxfp8_small_m_f32_cuda(
+                weight.values, weight.scales, x);
+        });
+    }
+    return g_profiler.measure("mxfp8.gemm_f32", [&]() {
+        return mxfp8_gemm_f32_cuda(
+            weight.values, weight.scales, x);
+    });
+}
+
+static torch::Tensor mxfp8_cpu_reference(
+        const Mxfp8Weight & weight) {
+    auto values = weight.values.to(torch::kCPU).contiguous();
+    auto scales = weight.scales.to(torch::kCPU).contiguous();
+    const auto * value_bytes = values.data_ptr<uint8_t>();
+    const auto * scale_bytes = scales.data_ptr<uint8_t>();
+    const int64_t scale_columns = weight.neuron_len / 128;
+    std::vector<float> dense(
+        static_cast<size_t>(weight.out * weight.neuron_len));
+    for (int64_t row = 0; row < weight.out; ++row) {
+        for (int64_t column = 0;
+             column < weight.neuron_len; ++column) {
+            const uint8_t raw = value_bytes[
+                static_cast<size_t>(row * weight.neuron_len + column)];
+            const unsigned exponent =
+                (static_cast<unsigned>(raw) >> 3u) & 15u;
+            const unsigned mantissa =
+                static_cast<unsigned>(raw) & 7u;
+            float value;
+            if (exponent == 15u && mantissa == 7u) {
+                value = std::numeric_limits<float>::quiet_NaN();
+            } else {
+                value = exponent == 0u
+                    ? std::ldexp(float(mantissa) * 0.125f, -6)
+                    : std::ldexp(
+                        1.0f + float(mantissa) * 0.125f,
+                        static_cast<int>(exponent) - 7);
+                if ((raw & 128u) != 0u) value = -value;
+            }
+            const uint8_t raw_scale = scale_bytes[
+                static_cast<size_t>(
+                    (row / 128) * scale_columns + column / 128)];
+            const float scale = raw_scale == 255u
+                ? std::numeric_limits<float>::quiet_NaN()
+                : std::ldexp(1.0f, int(raw_scale) - 127);
+            dense[static_cast<size_t>(
+                row * weight.neuron_len + column)] = value * scale;
+        }
+    }
+    return torch::from_blob(
+        dense.data(), {weight.out, weight.neuron_len},
+        torch::TensorOptions().dtype(torch::kFloat32))
+        .clone().to(weight.values.device())
+        .to(torch::kFloat16).contiguous();
+}
+
+static torch::Tensor mxfp8_groupwise_matmul(
+        const Mxfp8Weight & weight,
+        torch::Tensor grouped,
+        int64_t groups) {
+    grouped = grouped.contiguous().to(torch::kFloat16);
+    TORCH_CHECK(
+        grouped.dim() == 3 && grouped.size(1) == groups &&
+            grouped.size(2) == weight.neuron_len &&
+            weight.out % groups == 0,
+        "MXFP8 groupwise projection geometry mismatch");
+    const int64_t outputs_per_group = weight.out / groups;
+    TORCH_CHECK(
+        outputs_per_group % 128 == 0,
+        "MXFP8 groupwise output width must preserve scale blocks");
+    if (grouped.size(0) <= 8) {
+        return g_profiler.measure("mxfp8.groupwise_small_m", [&]() {
+            return mxfp8_groupwise_small_m_cuda(
+                weight.values, weight.scales, grouped, groups);
+        });
+    }
+    std::vector<torch::Tensor> outputs;
+    outputs.reserve(static_cast<size_t>(groups));
+    const int64_t scale_rows_per_group = outputs_per_group / 128;
+    for (int64_t group = 0; group < groups; ++group) {
+        Mxfp8Weight shard;
+        shard.out = outputs_per_group;
+        shard.neuron_len = weight.neuron_len;
+        shard.values = weight.values.narrow(
+            0, group * outputs_per_group,
+            outputs_per_group).contiguous();
+        shard.scales = weight.scales.narrow(
+            0, group * scale_rows_per_group,
+            scale_rows_per_group).contiguous();
+        outputs.push_back(mxfp8_matmul(
+            shard, grouped.select(1, group).contiguous()));
+    }
+    return torch::cat(outputs, -1).contiguous();
+}
+
+static torch::Tensor mxfp8_groupwise_matmul_f32(
+        const Mxfp8Weight & weight,
+        torch::Tensor grouped,
+        int64_t groups) {
+    grouped = grouped.contiguous().to(torch::kFloat16);
+    TORCH_CHECK(
+        grouped.dim() == 3 && grouped.size(1) == groups &&
+            grouped.size(2) == weight.neuron_len &&
+            weight.out % groups == 0,
+        "MXFP8 groupwise FP32-output projection geometry mismatch");
+    const int64_t outputs_per_group = weight.out / groups;
+    TORCH_CHECK(
+        outputs_per_group % 128 == 0,
+        "MXFP8 groupwise output width must preserve scale blocks");
+    if (grouped.size(0) <= 8) {
+        return g_profiler.measure(
+            "mxfp8.groupwise_small_m_f32", [&]() {
+                return mxfp8_groupwise_small_m_f32_cuda(
+                    weight.values, weight.scales, grouped, groups);
+            });
+    }
+    std::vector<torch::Tensor> outputs;
+    outputs.reserve(static_cast<size_t>(groups));
+    const int64_t scale_rows_per_group = outputs_per_group / 128;
+    for (int64_t group = 0; group < groups; ++group) {
+        Mxfp8Weight shard;
+        shard.out = outputs_per_group;
+        shard.neuron_len = weight.neuron_len;
+        shard.values = weight.values.narrow(
+            0, group * outputs_per_group,
+            outputs_per_group).contiguous();
+        shard.scales = weight.scales.narrow(
+            0, group * scale_rows_per_group,
+            scale_rows_per_group).contiguous();
+        outputs.push_back(mxfp8_matmul_f32(
+            shard, grouped.select(1, group).contiguous()));
+    }
+    return torch::cat(outputs, -1).contiguous();
+}
+
+struct Mxfp8Linear {
+    Mxfp8Weight weight;
+
+    torch::Tensor forward(torch::Tensor x) const {
+        auto shape = x.sizes().vec();
+        auto y = mxfp8_matmul(
+            weight, x.reshape({-1, x.size(-1)}));
+        shape.back() = y.size(-1);
+        return y.reshape(shape);
+    }
+};
+
+enum class QuantLinearKind {
+    Nint,
+    Nvq,
+    Mxfp8,
+};
+
 struct QuantLinearShard {
     int device = 0;
     int64_t input_begin = 0;
     int64_t input_end = 0;
     int64_t output_begin = 0;
     int64_t output_end = 0;
-    bool is_nint = true;
+    QuantLinearKind kind = QuantLinearKind::Nint;
     NintWeight nint;
     NvqWeight nvq;
+    Mxfp8Weight mxfp8;
 };
 
 static torch::Tensor run_quant_linear_shard(
@@ -7861,16 +8225,22 @@ static torch::Tensor run_quant_linear_shard(
             c10::nullopt,
         int gate_mode = 0) {
     c10::cuda::CUDAGuard guard(shard.device);
-    if (shard.is_nint) {
+    if (shard.kind == QuantLinearKind::Nint) {
         return gate.has_value()
             ? nint_matmul_input_mul(
                 shard.nint, x, gate.value(), gate_mode)
             : nint_matmul(shard.nint, x);
     }
-    return gate.has_value()
-        ? nvq_matmul_input_mul(
-            shard.nvq, x, gate.value(), gate_mode)
-        : nvq_matmul(shard.nvq, x);
+    if (shard.kind == QuantLinearKind::Nvq) {
+        return gate.has_value()
+            ? nvq_matmul_input_mul(
+                shard.nvq, x, gate.value(), gate_mode)
+            : nvq_matmul(shard.nvq, x);
+    }
+    TORCH_CHECK(
+        !gate.has_value(),
+        "MXFP8 tensor-parallel linear does not support input gating");
+    return mxfp8_matmul(shard.mxfp8, x);
 }
 
 static torch::Tensor tensor_to_cuda_device(
@@ -7992,9 +8362,10 @@ static torch::Tensor reduce_tensor_parallel_outputs(
 }
 
 struct QuantLinear {
-    bool is_nint = true;
+    QuantLinearKind kind = QuantLinearKind::Nint;
     NintLinear nint;
     NvqLinear nvq;
+    Mxfp8Linear mxfp8;
     TensorParallelAxis tensor_parallel_axis =
         TensorParallelAxis::Mirrored;
     std::vector<QuantLinearShard> tensor_parallel_shards;
@@ -8004,6 +8375,10 @@ struct QuantLinear {
     bool tensor_parallel() const {
         return !tensor_parallel_shards.empty();
     }
+
+    bool is_nint() const { return kind == QuantLinearKind::Nint; }
+    bool is_nvq() const { return kind == QuantLinearKind::Nvq; }
+    bool is_mxfp8() const { return kind == QuantLinearKind::Mxfp8; }
 
     torch::Tensor forward_tensor_parallel_flat(
             torch::Tensor x,
@@ -8039,14 +8414,23 @@ struct QuantLinear {
                 local_gate =
                     tensor_to_cuda_device(local_gate, shard.device);
             }
-            local_outputs.push_back(
-                run_quant_linear_shard(
-                    shard, local_x,
-                    gate.has_value()
-                        ? c10::optional<torch::Tensor>(
-                            local_gate)
-                        : c10::nullopt,
-                    gate_mode));
+            if (is_mxfp8() &&
+                    tensor_parallel_axis == TensorParallelAxis::Input) {
+                TORCH_CHECK(
+                    !gate.has_value(),
+                    "MXFP8 input-axis tensor parallelism does not support gating");
+                local_outputs.push_back(
+                    mxfp8_matmul_f32(shard.mxfp8, local_x));
+            } else {
+                local_outputs.push_back(
+                    run_quant_linear_shard(
+                        shard, local_x,
+                        gate.has_value()
+                            ? c10::optional<torch::Tensor>(
+                                local_gate)
+                            : c10::nullopt,
+                        gate_mode));
+            }
         }
 
         const int primary = g_tensor_parallel.primary_device();
@@ -8061,8 +8445,11 @@ struct QuantLinear {
             return torch::cat(gathered, -1).contiguous();
         }
 
-        return reduce_tensor_parallel_outputs(
+        auto reduced = reduce_tensor_parallel_outputs(
             std::move(local_outputs));
+        return is_mxfp8()
+            ? reduced.to(x.scalar_type()).contiguous()
+            : reduced;
     }
 
     torch::Tensor forward(torch::Tensor x) const {
@@ -8074,7 +8461,41 @@ struct QuantLinear {
             shape.back() = y.size(-1);
             return y.reshape(shape);
         }
-        return is_nint ? nint.forward(x) : nvq.forward(x);
+        if (is_nint()) return nint.forward(x);
+        if (is_nvq()) return nvq.forward(x);
+        return mxfp8.forward(x);
+    }
+    torch::Tensor forward_mxfp8_groupwise(
+            torch::Tensor grouped,
+            int64_t groups) const {
+        TORCH_CHECK(
+            is_mxfp8(),
+            "groupwise MXFP8 projection requires an MXFP8 tensor");
+        if (!tensor_parallel()) {
+            return mxfp8_groupwise_matmul(
+                mxfp8.weight, grouped, groups);
+        }
+        TORCH_CHECK(
+            tensor_parallel_axis == TensorParallelAxis::Input,
+            "groupwise MXFP8 tensor parallelism requires input-axis shards");
+        std::vector<torch::Tensor> partials;
+        partials.reserve(tensor_parallel_shards.size());
+        for (const auto & shard : tensor_parallel_shards) {
+            TORCH_CHECK(
+                shard.kind == QuantLinearKind::Mxfp8,
+                "groupwise MXFP8 tensor-parallel shard kind mismatch");
+            c10::cuda::CUDAGuard guard(shard.device);
+            auto local = grouped.narrow(
+                -1, shard.input_begin,
+                shard.input_end - shard.input_begin);
+            local = tensor_to_cuda_device(
+                local, shard.device);
+            partials.push_back(mxfp8_groupwise_matmul_f32(
+                shard.mxfp8, local, groups));
+        }
+        return reduce_tensor_parallel_outputs(
+            std::move(partials))
+            .to(grouped.scalar_type()).contiguous();
     }
     torch::Tensor forward_input_mul(torch::Tensor x, torch::Tensor gate, int mode) const {
         if (tensor_parallel()) {
@@ -8086,14 +8507,17 @@ struct QuantLinear {
             shape.back() = y.size(-1);
             return y.reshape(shape);
         }
-        return is_nint ? nint.forward_input_mul(x, gate, mode) : nvq.forward_input_mul(x, gate, mode);
+        if (is_nint()) return nint.forward_input_mul(x, gate, mode);
+        if (is_nvq()) return nvq.forward_input_mul(x, gate, mode);
+        throw std::runtime_error(
+            "MXFP8 linear does not support input gating");
     }
     torch::Tensor forward_input_mul_f32_kld(
             torch::Tensor x,
             torch::Tensor gate,
             int mode) const {
         TORCH_CHECK(
-            !tensor_parallel() && is_nint,
+            !tensor_parallel() && is_nint(),
             "FP32-output KLD down projection requires a local NINT tensor");
         return nint.forward_input_mul_f32_kld(
             x, gate, mode);
@@ -8101,12 +8525,15 @@ struct QuantLinear {
     int64_t out() const {
         return tensor_parallel()
             ? logical_out
-            : (is_nint ? nint.w.out : nvq.w.out);
+            : (is_nint() ? nint.w.out
+               : (is_nvq() ? nvq.w.out : mxfp8.weight.out));
     }
     int64_t neuron_len() const {
         return tensor_parallel()
             ? logical_neuron_len
-            : (is_nint ? nint.w.neuron_len : nvq.w.neuron_len);
+            : (is_nint() ? nint.w.neuron_len
+               : (is_nvq() ? nvq.w.neuron_len
+                  : mxfp8.weight.neuron_len));
     }
 };
 
@@ -8342,7 +8769,7 @@ static QuantLinear load_quant_linear(
     };
     result.tensor_parallel_axis = axis;
     if (is_nint_linear_dtype(dtype)) {
-        result.is_nint = true;
+        result.kind = QuantLinearKind::Nint;
         const auto blob = mfq.read_blob(name);
         if (dtype == "NINT8-0") {
             const auto cpu = unpack_nint8_zero(blob);
@@ -8368,7 +8795,7 @@ static QuantLinear load_quant_linear(
                             cpu, slice.begin, slice.end);
                     QuantLinearShard shard;
                     shard.device = slice.device;
-                    shard.is_nint = true;
+                    shard.kind = QuantLinearKind::Nint;
                     shard.output_begin =
                         axis == TensorParallelAxis::Output
                         ? slice.begin : 0;
@@ -8420,7 +8847,7 @@ static QuantLinear load_quant_linear(
                             cpu, slice.begin, slice.end);
                     QuantLinearShard shard;
                     shard.device = slice.device;
-                    shard.is_nint = true;
+                    shard.kind = QuantLinearKind::Nint;
                     shard.output_begin =
                         axis == TensorParallelAxis::Output
                         ? slice.begin : 0;
@@ -8449,7 +8876,7 @@ static QuantLinear load_quant_linear(
             }
         }
     } else if (is_nvq_linear_dtype(dtype)) {
-        result.is_nint = false;
+        result.kind = QuantLinearKind::Nvq;
         const auto cpu =
             unpack_nvq(mfq.read_blob(name), dtype);
         result.logical_out = cpu.out;
@@ -8470,7 +8897,7 @@ static QuantLinear load_quant_linear(
                     cpu, axis, slice.begin, slice.end);
                 QuantLinearShard shard;
                 shard.device = slice.device;
-                shard.is_nint = false;
+                shard.kind = QuantLinearKind::Nvq;
                 shard.output_begin =
                     axis == TensorParallelAxis::Output
                     ? slice.begin : 0;
@@ -8496,14 +8923,49 @@ static QuantLinear load_quant_linear(
                 active_weight_load_device());
             result.nvq.w = to_device_nvq(cpu, true);
         }
+    } else if (dtype == "MXFP8") {
+        result.kind = QuantLinearKind::Mxfp8;
+        const auto cpu = unpack_mxfp8(mfq.read_blob(name));
+        result.logical_out = cpu.out;
+        result.logical_neuron_len = cpu.neuron_len;
+        if (g_tensor_parallel.enabled() &&
+                axis != TensorParallelAxis::Mirrored) {
+            const int64_t extent = axis == TensorParallelAxis::Output
+                ? cpu.out : cpu.neuron_len;
+            for (const auto & slice : select_slices(extent, 128)) {
+                auto shard_cpu = slice_mxfp8_cpu(
+                    cpu, axis, slice.begin, slice.end);
+                QuantLinearShard shard;
+                shard.device = slice.device;
+                shard.kind = QuantLinearKind::Mxfp8;
+                shard.output_begin = axis == TensorParallelAxis::Output
+                    ? slice.begin : 0;
+                shard.output_end = axis == TensorParallelAxis::Output
+                    ? slice.end : cpu.out;
+                shard.input_begin = axis == TensorParallelAxis::Input
+                    ? slice.begin : 0;
+                shard.input_end = axis == TensorParallelAxis::Input
+                    ? slice.end : cpu.neuron_len;
+                shard.mxfp8 = to_cuda_device_mxfp8(
+                    shard_cpu, slice.device);
+                result.tensor_parallel_shards.push_back(
+                    std::move(shard));
+            }
+        } else {
+            result.mxfp8.weight = to_cuda_device_mxfp8(
+                cpu, active_weight_load_device());
+        }
     } else {
-        throw std::runtime_error("linear tensor must be NINT/NVQ: " + name + " dtype=" + dtype);
+        throw std::runtime_error(
+            "linear tensor must be NINT/NVQ/MXFP8: " +
+            name + " dtype=" + dtype);
     }
     return result;
 }
 
 static bool is_quant_dtype(const std::string & dtype) {
-    return is_nint_linear_dtype(dtype) || is_nvq_linear_dtype(dtype);
+    return is_nint_linear_dtype(dtype) ||
+        is_nvq_linear_dtype(dtype) || dtype == "MXFP8";
 }
 
 static QuantLinearGroup make_quant_group(std::vector<QuantLinear> layers) {
@@ -8515,8 +8977,8 @@ static QuantLinearGroup make_quant_group(std::vector<QuantLinear> layers) {
     nint_weights.reserve(layers.size());
     for (const auto & layer : layers) {
         result.outs.push_back(layer.out());
-        all_nint = all_nint && layer.is_nint;
-        if (layer.is_nint && !layer.tensor_parallel()) {
+        all_nint = all_nint && layer.is_nint();
+        if (layer.is_nint() && !layer.tensor_parallel()) {
             nint_weights.push_back(layer.nint.w);
         }
     }
@@ -8537,7 +8999,7 @@ static QuantLinearGroup make_quant_group(std::vector<QuantLinear> layers) {
         result.layers = std::move(layers);
         result.nvq_prefix2 = result.layers.size() >= 2 &&
             !any_tensor_parallel &&
-            !result.layers[0].is_nint && !result.layers[1].is_nint &&
+            result.layers[0].is_nvq() && result.layers[1].is_nvq() &&
             nvq_pair_compatible(result.layers[0].nvq.w, result.layers[1].nvq.w);
     }
     return result;
@@ -8546,13 +9008,16 @@ static QuantLinearGroup make_quant_group(std::vector<QuantLinear> layers) {
 static bool quant_linear_pair_compatible(const QuantLinear & a, const QuantLinear & b) {
     if (a.tensor_parallel() || b.tensor_parallel()) {
         return a.tensor_parallel() && b.tensor_parallel() &&
-            a.is_nint == b.is_nint &&
+            a.kind == b.kind &&
             a.tensor_parallel_axis == b.tensor_parallel_axis &&
             a.tensor_parallel_shards.size() ==
                 b.tensor_parallel_shards.size();
     }
-    if (a.is_nint != b.is_nint) return false;
-    if (!a.is_nint) return nvq_pair_compatible(a.nvq.w, b.nvq.w);
+    if (a.kind != b.kind) return false;
+    if (a.is_nvq()) return nvq_pair_compatible(a.nvq.w, b.nvq.w);
+    if (a.is_mxfp8()) {
+        return a.mxfp8.weight.neuron_len == b.mxfp8.weight.neuron_len;
+    }
     const auto & x = a.nint.w;
     const auto & y = b.nint.w;
     return x.ng == y.ng && x.gs == y.gs && x.bits == y.bits &&
@@ -8687,10 +9152,15 @@ static torch::Tensor dequant_nint_dense_f32(const NintWeight & w) {
 
 static torch::Tensor dequant_quant_linear_f32(const QuantLinear & linear) {
     if (!linear.tensor_parallel()) {
-        return linear.is_nint
+        return linear.is_nint()
             ? dequant_nint_dense_f32(linear.nint.w)
-            : nvq_dequant(linear.nvq.w)
-                .to(torch::kFloat32).contiguous();
+            : (linear.is_nvq()
+               ? nvq_dequant(linear.nvq.w)
+                    .to(torch::kFloat32).contiguous()
+               : mxfp8_dequant_cuda(
+                    linear.mxfp8.weight.values,
+                    linear.mxfp8.weight.scales)
+                    .to(torch::kFloat32).contiguous());
     }
     if (linear.tensor_parallel_axis != TensorParallelAxis::Output &&
         linear.tensor_parallel_axis != TensorParallelAxis::Input) {
@@ -8702,10 +9172,15 @@ static torch::Tensor dequant_quant_linear_f32(const QuantLinear & linear) {
     parts.reserve(linear.tensor_parallel_shards.size());
     for (const auto & shard : linear.tensor_parallel_shards) {
         c10::cuda::CUDAGuard shard_guard(shard.device);
-        auto part = shard.is_nint
+        auto part = shard.kind == QuantLinearKind::Nint
             ? dequant_nint_dense_f32(shard.nint)
-            : nvq_dequant(shard.nvq)
-                .to(torch::kFloat32).contiguous();
+            : (shard.kind == QuantLinearKind::Nvq
+               ? nvq_dequant(shard.nvq)
+                    .to(torch::kFloat32).contiguous()
+               : mxfp8_dequant_cuda(
+                    shard.mxfp8.values,
+                    shard.mxfp8.scales)
+                    .to(torch::kFloat32).contiguous());
         parts.push_back(
             tensor_to_cuda_device(part, primary)
                 .to(torch::kFloat32).contiguous());
@@ -9680,10 +10155,10 @@ struct FFN {
             const bool quant_fusion_enabled = geglu_fusion_enabled &&
                 (enable_quant == nullptr || enable_quant[0] == '1');
             const bool down_quant_layout_supported =
-                down.is_nint && !down.tensor_parallel() &&
+                down.is_nint() && !down.tensor_parallel() &&
                 !down.nint.w.q8_zero &&
                 down.nint.w.gs <= 32;
-            if (gate_up.nint_grouped && down.is_nint &&
+            if (gate_up.nint_grouped && down.is_nint() &&
                 quant_fusion_enabled && down_quant_layout_supported &&
                 !gate_up.nint.w.q8_zero &&
                 xh.numel() / xh.size(-1) == 1 && gate_up.nint.split_w.empty() &&
@@ -9742,7 +10217,7 @@ struct FFN {
         }
         if (nvq_fusion_enabled() && xh.numel() / xh.size(-1) == 1 &&
             gate_up.nvq_prefix2 && gate_up.layers.size() == 2 &&
-            !gate_up.layers[0].is_nint && !gate_up.layers[1].is_nint && !down.is_nint &&
+            gate_up.layers[0].is_nvq() && gate_up.layers[1].is_nvq() && down.is_nvq() &&
             gate_up.outs.size() == 2 && gate_up.outs[0] == gate_up.outs[1] &&
             gate_up.outs[0] == down.nvq.w.neuron_len &&
             (down.nvq.w.gs == 24 || down.nvq.w.gs == 28 || down.nvq.w.gs == 32)) {
@@ -9754,7 +10229,7 @@ struct FFN {
             return y.reshape(shape);
         }
         const char* enable_gateup_quant = std::getenv("MFQ_ENABLE_FFN_GATEUP_QUANT_FUSION");
-            if (gate_up.nint_grouped && down.is_nint &&
+            if (gate_up.nint_grouped && down.is_nint() &&
                 !gate_up.nint.w.q8_zero && !down.nint.w.q8_zero &&
                 (enable_gateup_quant != nullptr && enable_gateup_quant[0] == '1') &&
             xh.numel() / xh.size(-1) == 1 &&
@@ -10253,13 +10728,25 @@ struct Dsv4Block : Block {
             const char * value = std::getenv("MFQ_DSV4_GROUPWISE_OUTPUT_A");
             return value == nullptr || value[0] != '0';
         }();
-        if (groupwise_enabled && output_a.is_nint &&
+        if (groupwise_enabled && output_a.is_nint() &&
                 output_a.nint.w.bits == 8 && output_a.nint.w.gs == 48 &&
                 output_a.nint.w.out == groups * o_rank) {
             auto low_rank = g_profiler.measure("dsv4.output_a", [&]() {
                 return nint_matmul_groupwise_u8(
                     output_a.nint.w, grouped, groups);
             });
+            return g_profiler.measure("dsv4.output_b", [&]() {
+                return output_b.forward(low_rank)
+                    .reshape({batch, tokens, hidden_size});
+            });
+        }
+        if (groupwise_enabled && output_a.is_mxfp8() &&
+                output_a.out() == groups * o_rank) {
+            auto low_rank = g_profiler.measure(
+                "dsv4.output_a", [&]() {
+                    return output_a.forward_mxfp8_groupwise(
+                        grouped, groups);
+                });
             return g_profiler.measure("dsv4.output_b", [&]() {
                 return output_b.forward(low_rank)
                     .reshape({batch, tokens, hidden_size});
@@ -11643,7 +12130,7 @@ struct LinearBlock : Block {
         gdn_state = gd[1];
         torch::Tensor oo;
         const NintWeight * out_nint =
-            !dense_out_proj && out_proj.is_nint &&
+            !dense_out_proj && out_proj.is_nint() &&
             !out_proj.tensor_parallel()
                 ? &out_proj.nint.w : nullptr;
         if (out_nint != nullptr && B == 1 && T == 1 && out_nint->bits == 5 && out_nint->gs == 28 &&
@@ -11716,7 +12203,7 @@ struct LinearBlock : Block {
 
 static void prepare_ffn_workspaces(FFN & f) {
     if (f.down.tensor_parallel()) return;
-    if (f.gate_up.nvq_prefix2 && f.gate_up.layers.size() == 2 && !f.down.is_nint &&
+    if (f.gate_up.nvq_prefix2 && f.gate_up.layers.size() == 2 && f.down.is_nvq() &&
         f.gate_up.outs.size() == 2 && f.gate_up.outs[0] == f.gate_up.outs[1] &&
         f.gate_up.outs[0] == f.down.nvq.w.neuron_len) {
         NvqWorkspace & ws = f.gate_up.layers[0].nvq.w.workspace(1);
@@ -12457,9 +12944,12 @@ struct Model {
 
     torch::Tensor embed_forward(torch::Tensor ids) const {
         auto token_ids = ids.contiguous().to(torch::kCUDA, torch::kInt64);
-        if (!embed.is_nint) {
+        if (embed.is_nvq()) {
             return nvq_embedding(embed.nvq.w, token_ids);
         }
+        TORCH_CHECK(
+            embed.is_nint(),
+            "MXFP8 token embeddings are not supported by the CUDA runtime");
         if (embed.nint.w.q8_zero) {
             return nint8_zero_embedding_lookup_cuda(
                 embed.nint.w.q_packed, embed.nint.w.q8_zero_scale,
@@ -12630,7 +13120,7 @@ struct Model {
         bool lm_head_argmax = (disable_argmax == nullptr || disable_argmax[0] != '1') ||
                               (use_argmax != nullptr && use_argmax[0] == '1');
         NintWeight * lm_nint =
-            lm_head.is_nint && !lm_head.tensor_parallel()
+            lm_head.is_nint() && !lm_head.tensor_parallel()
                 ? &lm_head.nint.w : nullptr;
         if (lm_head_argmax && lm_nint != nullptr &&
             !lm_nint->q5_exec &&
@@ -12742,7 +13232,7 @@ static Model load_model(const std::string & mfq_path, const std::string & config
     }
     if (g_kl_mmq_mode == KlMmqMode::Default &&
         nint5_q5_exec_enabled() &&
-        m.lm_head.is_nint &&
+        m.lm_head.is_nint() &&
         ((m.lm_head.tensor_parallel() &&
           !m.lm_head.tensor_parallel_shards.empty() &&
           m.lm_head.tensor_parallel_shards.front().nint.bits == 5 &&
@@ -14923,7 +15413,7 @@ static int run_linear_check(
     int reps) {
     MfqFile mfq(mfq_path);
     auto linear = load_quant_linear(mfq, name);
-    if (nint5_q5_exec_enabled() && linear.is_nint &&
+    if (nint5_q5_exec_enabled() && linear.is_nint() &&
         linear.nint.w.bits == 5 && linear.nint.w.gs == 28) {
         enable_nint5_q5_exec(linear.nint.w);
     }
@@ -14963,8 +15453,10 @@ static int run_linear_check(
     cudaEventDestroy(stop);
     y_test = y_test.to(torch::kFloat32);
 
-    const NintWeight * nint = linear.is_nint ? &linear.nint.w : nullptr;
-    const NvqWeight * nvq = linear.is_nint ? nullptr : &linear.nvq.w;
+    const NintWeight * nint = linear.is_nint() ? &linear.nint.w : nullptr;
+    const NvqWeight * nvq = linear.is_nvq() ? &linear.nvq.w : nullptr;
+    const Mxfp8Weight * mxfp8 = linear.is_mxfp8()
+        ? &linear.mxfp8.weight : nullptr;
     const char * dq_env_name = nint == nullptr ? nullptr :
         (nint->bits == 4 ? "MFQ_NINT4_GS24_DQ_VEC2" :
          (nint->bits == 6 ? "MFQ_NINT6_GS24_DQ_VEC4" : nullptr));
@@ -14993,8 +15485,10 @@ static int run_linear_check(
             : nint_dequant_full_packed_compact_bits_cuda(
                   nint->q_packed, nint->sub_scale, nint->sub_min,
                   nint->neuron_scale, nint->neuron_min, nint->neuron_len, nint->gs, nint->bits);
-    } else {
+    } else if (nvq != nullptr) {
         ww = nvq_dequant(*nvq);
+    } else {
+        ww = mxfp8_cpu_reference(*mxfp8);
     }
     torch::Tensor ref_input = xh;
     if (gate_mode == 1) ref_input = xh * torch::sigmoid(gateh);
@@ -15016,17 +15510,21 @@ static int run_linear_check(
                                nint->sub_min.numel())) +
                 (double)(nint->neuron_scale.numel() +
                          nint->neuron_min.numel()) * sizeof(float))
-        : (double)nvq->indices_packed.numel() + (double)nvq->aux_packed.numel() +
+        : nvq != nullptr
+        ? (double)nvq->indices_packed.numel() + (double)nvq->aux_packed.numel() +
           (double)nvq->sub_scale_packed.numel() +
-          (double)nvq->neuron_scale.numel() * sizeof(float) + (double)nvq->codebook.numel();
+          (double)nvq->neuron_scale.numel() * sizeof(float) + (double)nvq->codebook.numel()
+        : (double)mxfp8->values.numel() + (double)mxfp8->scales.numel();
     std::cout << "shape=" << y_ref.sizes() << "\n";
     if (nint != nullptr) {
         std::cout << "dtype="
                   << (nint->q8_zero ? "NINT8-0" : "NINT" + std::to_string(nint->bits))
                   << " gs=" << nint->gs << " m=" << M << "\n";
-    } else {
+    } else if (nvq != nullptr) {
         std::cout << "dtype=NVQ" << nvq->format << " gs=" << nvq->gs
                   << " sub_bits=" << nvq->sub_bits << " m=" << M << "\n";
+    } else {
+        std::cout << "dtype=MXFP8 block=128x128 m=" << M << "\n";
     }
     if (gate_mode != 0) std::cout << "gate=" << (gate_mode == 1 ? "sigmoid" : "silu") << "\n";
     std::cout << "production_ms=" << per_ms << "\n";
@@ -15108,8 +15606,9 @@ static int run_tensor_parallel_linear_check(
         << " mean_abs=" << mean_abs
         << " max_abs=" << max_abs
         << '\n';
-    const double tolerance =
-        axis == TensorParallelAxis::Output
+    const double tolerance = full.is_mxfp8()
+        ? 5.0e-4
+        : axis == TensorParallelAxis::Output
         ? 1.0e-6 : 5.0e-3;
     if (!torch::isfinite(test).all().item<bool>() ||
         relative > tolerance) {
@@ -15206,7 +15705,7 @@ static int run_linear_group_check(
     for (size_t index = 0; index < names.size(); ++index) {
         auto linear = load_quant_linear(mfq, names[index]);
         TORCH_CHECK(
-            linear.is_nint,
+            linear.is_nint(),
             "--check-linear-group currently requires NINT tensors");
         const auto & weight = linear.nint.w;
         auto dense = weight.q8_zero
@@ -15454,7 +15953,7 @@ static int run_q8_embedding_check(
     MfqFile mfq(mfq_path);
     auto linear = load_quant_linear(mfq, name);
     TORCH_CHECK(
-        linear.is_nint && linear.nint.w.q8_zero,
+        linear.is_nint() && linear.nint.w.q8_zero,
         "--check-q8-embedding requires an NINT8-0 tensor");
     const int64_t vocab = linear.nint.w.out;
     std::vector<int64_t> host_ids = {
@@ -15504,10 +16003,15 @@ static int run_dsv4_output_a_check(
     constexpr int64_t kGroups = 8;
     TORCH_CHECK(batch > 0 && reps > 0, "DSV4 output_a check requires positive batch and reps");
     MfqFile mfq(mfq_path);
-    auto linear = load_quant_linear(mfq, name);
+    auto linear = load_quant_linear(
+        mfq, name, TensorParallelAxis::Input);
+    const bool supported_nint =
+        linear.is_nint() &&
+        linear.nint.w.bits == 8 &&
+        linear.nint.w.gs == 48;
     TORCH_CHECK(
-        linear.is_nint && linear.nint.w.bits == 8 && linear.nint.w.gs == 48,
-        "DSV4 output_a check requires NINT8 gs48");
+        supported_nint || linear.is_mxfp8(),
+        "DSV4 output_a check requires NINT8 gs48 or MXFP8");
     TORCH_CHECK(
         linear.out() % kGroups == 0,
         "DSV4 output_a rows must divide eight groups");
@@ -15537,8 +16041,10 @@ static int run_dsv4_output_a_check(
         return torch::stack(diagonal, 1).reshape({batch, linear.out()});
     };
     auto groupwise = [&]() {
-        return nint_matmul_groupwise_u8(
-            linear.nint.w, grouped, kGroups);
+        return linear.is_mxfp8()
+            ? linear.forward_mxfp8_groupwise(grouped, kGroups)
+            : nint_matmul_groupwise_u8(
+                linear.nint.w, grouped, kGroups);
     };
     auto time_ms = [&](auto && fn) {
         torch::Tensor output;
@@ -15569,6 +16075,7 @@ static int run_dsv4_output_a_check(
     std::cout << std::fixed << std::setprecision(9)
               << "dsv4_output_a_check"
               << " tensor=" << name
+              << " format=" << (linear.is_mxfp8() ? "MXFP8" : "NINT8")
               << " batch=" << batch
               << " groups=" << kGroups
               << " rows_per_group=" << rows_per_group
@@ -15582,9 +16089,18 @@ static int run_dsv4_output_a_check(
               << " speedup=" << legacy_result.first / groupwise_result.first
               << " checksum=" << candidate.sum().item<double>()
               << "\n";
-    TORCH_CHECK(
-        candidate.equal(reference),
-        "DSV4 groupwise output_a must be bit-exact with the legacy path");
+    if (linear.is_mxfp8()) {
+        TORCH_CHECK(
+            torch::isfinite(candidate).all().item<bool>() &&
+                relative <= 5.0e-4f,
+            "DSV4 MXFP8 groupwise output_a exceeded the FP16 GEMM "
+            "reduction-order tolerance");
+    } else {
+        TORCH_CHECK(
+            candidate.equal(reference),
+            "DSV4 NINT groupwise output_a must be bit-exact with the "
+            "legacy path");
+    }
     return 0;
 }
 
@@ -15601,7 +16117,7 @@ static int run_gemma_geglu_check(
     auto gate_up = load_quant_group(
         mfq, {prefix + "gate_proj.weight", prefix + "up_proj.weight"}, 2);
     auto down = load_quant_linear(mfq, prefix + "down_proj.weight");
-    if (!gate_up.nint_grouped || !gate_up.nint.split_w.empty() || !down.is_nint ||
+    if (!gate_up.nint_grouped || !gate_up.nint.split_w.empty() || !down.is_nint() ||
         gate_up.outs.size() != 2 || gate_up.outs[0] != gate_up.outs[1]) {
         throw std::runtime_error("Gemma GeGLU check requires packed NINT gate/up and NINT down tensors");
     }
@@ -17838,6 +18354,11 @@ static int run_dsv4_attention_check(int reps) {
 }
 
 int main(int argc, char ** argv) {
+    struct TensorParallelCollectiveCleanup {
+        ~TensorParallelCollectiveCleanup() {
+            g_tensor_parallel_collectives.reset();
+        }
+    } tensor_parallel_collective_cleanup;
     try {
         std::string mfq_path, config_path, ids_arg, ids_file;
         std::string check_linear, check_linear_gate, kl_base;
