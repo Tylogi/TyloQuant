@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -12,7 +13,8 @@ bool is_nint_dtype(std::string_view dtype) noexcept;
 
 class MlxNintWeight {
 public:
-    static MlxNintWeight from_blob(const std::vector<std::uint8_t>& blob);
+    static MlxNintWeight from_blob(
+        std::span<const std::uint8_t> blob);
 
     mlx::core::array matmul(const mlx::core::array& input) const;
     bool can_fuse_swiglu(

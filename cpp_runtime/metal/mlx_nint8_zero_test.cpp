@@ -99,6 +99,39 @@ Fixture make_fixture() {
     return {std::move(blob), std::move(q), scales};
 }
 
+Fixture make_grouped_fixture() {
+    constexpr std::int32_t output_size = 6;
+    constexpr std::int32_t input_size = 64;
+    constexpr std::uint32_t groups = 2;
+    const std::vector<float> scales(
+        static_cast<std::size_t>(output_size) * groups,
+        0.5f);
+
+    std::vector<std::int8_t> q(
+        static_cast<std::size_t>(output_size) * input_size);
+    for (std::size_t index = 0; index < q.size(); ++index) {
+        q[index] = static_cast<std::int8_t>(
+            static_cast<int>((index * 11 + 5) % 29) - 14);
+    }
+
+    std::vector<std::uint8_t> blob{'N', 'I', '8', '0'};
+    append<std::int32_t>(blob, 0);
+    append<std::int32_t>(blob, input_size);
+    append<std::uint32_t>(blob, 2);
+    append<std::int64_t>(blob, output_size);
+    append<std::int64_t>(blob, input_size);
+    append<std::uint32_t>(blob, output_size);
+    append<std::uint32_t>(blob, groups);
+    for (std::size_t block = 0; block < scales.size(); ++block) {
+        append<std::uint16_t>(blob, 0x3800);
+        const auto source = block * 32;
+        const auto* bytes =
+            reinterpret_cast<const std::uint8_t*>(q.data() + source);
+        blob.insert(blob.end(), bytes, bytes + 32);
+    }
+    return {std::move(blob), std::move(q), scales};
+}
+
 void require(bool condition, const std::string& message) {
     if (!condition) {
         throw std::runtime_error(message);
@@ -237,6 +270,70 @@ int main() {
                     expected,
                     0.05f);
             }
+        }
+
+        const auto grouped_fixture = make_grouped_fixture();
+        const auto grouped_weight =
+            mfq::metal::MlxNint8ZeroWeight::from_blob(
+                grouped_fixture.blob);
+        std::vector<float> grouped_input_values(2 * 2 * 64);
+        for (std::size_t index = 0;
+             index < grouped_input_values.size();
+             ++index) {
+            grouped_input_values[index] =
+                static_cast<float>(
+                    static_cast<int>((index * 3 + 2) % 23) - 11) /
+                16.0f;
+        }
+        const array grouped_input(
+            grouped_input_values.begin(),
+            Shape{2, 2, 64});
+        auto grouped_output = grouped_weight.grouped_row_matmul(
+            grouped_input,
+            2);
+        grouped_output.eval();
+        require(
+            grouped_output.shape() == Shape({2, 2, 3}),
+            "NINT8-0 grouped-row output shape mismatch");
+        const auto* grouped_values = grouped_output.data<float>();
+        for (int row = 0; row < 2; ++row) {
+            for (int group = 0; group < 2; ++group) {
+                for (int local_output = 0;
+                     local_output < 3;
+                     ++local_output) {
+                    const int output_index = group * 3 + local_output;
+                    float expected = 0.0f;
+                    for (int column = 0; column < 64; ++column) {
+                        expected +=
+                            grouped_input_values[
+                                (row * 2 + group) * 64 + column] *
+                            grouped_fixture.scales[
+                                output_index * 2 + column / 32] *
+                            static_cast<float>(
+                                grouped_fixture.q[
+                                    output_index * 64 + column]);
+                    }
+                    require_close(
+                        grouped_values[
+                            (row * 2 + group) * 3 + local_output],
+                        expected);
+                }
+            }
+        }
+
+        auto grouped_output_f16 = astype(
+            grouped_weight.grouped_row_matmul(
+                astype(grouped_input, float16),
+                2),
+            float32);
+        grouped_output_f16.eval();
+        const auto* grouped_values_f16 =
+            grouped_output_f16.data<float>();
+        for (int index = 0; index < 12; ++index) {
+            require_close(
+                grouped_values_f16[index],
+                grouped_values[index],
+                0.05f);
         }
 
         std::vector<float> large_input_values(64 * 64);

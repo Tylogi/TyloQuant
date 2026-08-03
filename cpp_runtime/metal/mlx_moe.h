@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -15,7 +16,7 @@ namespace mfq::metal {
 
 class MfqContainer;
 
-struct MlxCccpProjectionInfo {
+struct MlxNintMoeProjectionInfo {
     int experts = 0;
     int out_per_expert = 0;
     int neuron_len = 0;
@@ -32,7 +33,6 @@ public:
     mlx::core::array routed_matmul(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids) const;
-
     int experts() const noexcept;
     int out_per_expert() const noexcept;
     int neuron_len() const noexcept;
@@ -47,34 +47,39 @@ private:
 
     std::shared_ptr<const Impl> impl_;
 
-    friend class MlxCccpExpertResidency;
+    friend class MlxNintMoeOffloadCache;
 };
 
-// Bounded per-expert CCCP residency over native NIM2 records.
+// Optional bounded per-expert residency for NINTM records.
 //
-// Parsing and loads use MfqContainer::read_range(), so no NINTM record is
-// copied as one blob.  The LRU limit accounts for the exact packed index bytes
-// resident per expert.  Entries needed by the current active set are never
-// evicted, even when that set alone exceeds the configured limit.
-class MlxCccpExpertResidency {
+// This is an offload policy, not the NINTM container itself. Full-resident
+// MlxNintMoeWeight is the default model path. The cache is constructed only
+// after an explicit disk-offload request. Apple Silicon has unified memory,
+// so there is no separate CUDA-style CPU-RAM versus device-RAM mode. Disk
+// backing uses read_range(); the LRU limit accounts for packed expert bytes
+// staged in unified memory for active dispatches.
+class MlxNintMoeOffloadCache {
 public:
-    MlxCccpExpertResidency(
+    MlxNintMoeOffloadCache(
         const MfqContainer& model,
         std::size_t cache_limit_bytes,
         int experts);
-    ~MlxCccpExpertResidency();
+    ~MlxNintMoeOffloadCache();
 
-    MlxCccpExpertResidency(
-        const MlxCccpExpertResidency&) = delete;
-    MlxCccpExpertResidency& operator=(
-        const MlxCccpExpertResidency&) = delete;
+    MlxNintMoeOffloadCache(
+        const MlxNintMoeOffloadCache&) = delete;
+    MlxNintMoeOffloadCache& operator=(
+        const MlxNintMoeOffloadCache&) = delete;
 
     // Returns false only for a valid non-streamable representation (for
     // example NIM1 or a mixed non-CCCP NIM2 record).  Malformed CCCP records
     // still raise.
-    bool can_stream(const std::string& name);
+    bool can_offload(const std::string& name);
+    bool can_stream(const std::string& name) {
+        return can_offload(name);
+    }
 
-    MlxCccpProjectionInfo projection_info(
+    MlxNintMoeProjectionInfo projection_info(
         const std::string& name);
     std::vector<std::uint8_t> availability(
         const std::string& name);
@@ -99,25 +104,34 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// Compatibility names for callers that used the original CCCP-specific API.
+// New model/runtime code must use the generic NINTM names above.
+using MlxCccpProjectionInfo = MlxNintMoeProjectionInfo;
+using MlxCccpExpertResidency = MlxNintMoeOffloadCache;
+
 // Native packed NINTM routed-expert weight.
 //
 // NINT1-NINT8 and NINT8-0 cohorts are decoded directly by one heterogeneous
 // Metal dispatch.  Expert IDs retain the global ordering from the NINTM
 // container while each descriptor points at its cohort-local packed rows.
-class MlxMoeWeight {
+class MlxNintMoeWeight {
 public:
-    static MlxMoeWeight from_blob(
-        const std::vector<std::uint8_t>& blob);
+    static MlxNintMoeWeight from_blob(
+        std::span<const std::uint8_t> blob);
 
     // Gate/up and other shape-compatible projections can share one dispatch.
     // The returned last dimension is
     // projections() * out_per_expert(), in projection-major order.
-    static MlxMoeWeight concatenate_projections(
-        const std::vector<MlxMoeWeight>& weights);
+    static MlxNintMoeWeight concatenate_projections(
+        const std::vector<MlxNintMoeWeight>& weights);
 
     mlx::core::array routed_matmul(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids) const;
+    mlx::core::array routed_swiglu(
+        const mlx::core::array& input,
+        const mlx::core::array& expert_ids,
+        float limit = 0.0f) const;
     mlx::core::array operator()(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids) const {
@@ -133,10 +147,18 @@ public:
 private:
     struct Impl;
 
-    explicit MlxMoeWeight(std::shared_ptr<const Impl> impl);
+    explicit MlxNintMoeWeight(std::shared_ptr<const Impl> impl);
+
+    mlx::core::array routed_matmul_impl(
+        const mlx::core::array& input,
+        const mlx::core::array& expert_ids,
+        bool fused_swiglu,
+        float swiglu_limit) const;
 
     std::shared_ptr<const Impl> impl_;
 };
+
+using MlxMoeWeight = MlxNintMoeWeight;
 
 // One explicit-[tokens,routes] routed projection.
 class MlxRoutedLinear {
@@ -144,11 +166,15 @@ public:
     explicit MlxRoutedLinear(MlxMoeWeight weight);
 
     static MlxRoutedLinear from_blob(
-        const std::vector<std::uint8_t>& blob);
+        std::span<const std::uint8_t> blob);
 
     mlx::core::array forward(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids) const;
+    mlx::core::array swiglu(
+        const mlx::core::array& input,
+        const mlx::core::array& expert_ids,
+        float limit = 0.0f) const;
     mlx::core::array combine(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
@@ -184,9 +210,9 @@ public:
         MlxMoeWeight down);
 
     static MlxRoutedSwiGluFfn from_blobs(
-        const std::vector<std::uint8_t>& gate,
-        const std::vector<std::uint8_t>& up,
-        const std::vector<std::uint8_t>& down);
+        std::span<const std::uint8_t> gate,
+        std::span<const std::uint8_t> up,
+        std::span<const std::uint8_t> down);
 
     mlx::core::array forward(
         const mlx::core::array& input,

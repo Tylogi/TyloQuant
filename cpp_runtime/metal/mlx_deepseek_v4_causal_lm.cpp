@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <iomanip>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -82,10 +84,11 @@ array load_float_array(
             "DeepSeek-V4 runtime tensor must be BF16/F16/F32: " +
             name);
     }
+    const auto mapped = model.map_record(name);
     return float32_contiguous(
         load_dense_array(
             record.dtype,
-            model.read(name)));
+            mapped.view()));
 }
 
 array slice_last(
@@ -442,7 +445,7 @@ MlxDeepseekV4Layer MlxDeepseekV4Layer::load(
     const array& available,
     std::pair<array, array> rope_base,
     std::pair<array, array> rope_compressed,
-    std::shared_ptr<MlxCccpExpertResidency> residency) {
+    std::shared_ptr<MlxNintMoeOffloadCache> offload) {
     config.validate();
     if (index >=
         static_cast<std::size_t>(
@@ -475,7 +478,7 @@ MlxDeepseekV4Layer MlxDeepseekV4Layer::load(
                 config,
                 index,
                 available,
-                std::move(residency)),
+                std::move(offload)),
             load_float_array(
                 model,
                 name("attn_norm.weight")),
@@ -669,6 +672,9 @@ array MlxDeepseekV4Layer::forward(
         components_.hc_attention_base);
     auto branch = attention_norm_(
         attention_hc.reduced);
+    detail::profile_eval(
+        "layer.attention_hc_pre_norm",
+        branch);
     branch = components_.attention(
         branch,
         state,
@@ -678,6 +684,9 @@ array MlxDeepseekV4Layer::forward(
         residual,
         attention_hc.post,
         attention_hc.combination);
+    detail::profile_eval(
+        "layer.attention_hc_post",
+        result);
 
     residual = result;
     auto ffn_hc = hc_pre(
@@ -686,21 +695,28 @@ array MlxDeepseekV4Layer::forward(
         components_.hc_ffn_scale,
         components_.hc_ffn_base);
     branch = ffn_norm_(ffn_hc.reduced);
+    detail::profile_eval(
+        "layer.ffn_hc_pre_norm",
+        branch);
     branch = components_.moe(
         branch,
         token_ids);
-    return hc_post(
+    auto output = hc_post(
         branch,
         residual,
         ffn_hc.post,
         ffn_hc.combination);
+    detail::profile_eval(
+        "layer.ffn_hc_post",
+        output);
+    return output;
 }
 
 MlxDeepseekV4CausalLm
 MlxDeepseekV4CausalLm::load(
     const MfqContainer& model,
     int max_context,
-    std::size_t expert_cache_bytes) {
+    std::optional<std::size_t> expert_cache_bytes) {
     return load(
         model,
         DeepseekV4Config::from_mfq(model),
@@ -715,7 +731,7 @@ MlxDeepseekV4CausalLm::load(
     const DeepseekV4Config& config,
     const DeepseekV4TensorNames& names,
     int max_context,
-    std::size_t expert_cache_bytes) {
+    std::optional<std::size_t> expert_cache_bytes) {
     config.validate();
     validate_deepseek_v4_model_bindings(
         model,
@@ -749,13 +765,17 @@ MlxDeepseekV4CausalLm::load(
             config.rope_scaling);
     auto availability =
         expert_availability(model, config);
-    auto expert_residency =
-        std::make_shared<MlxCccpExpertResidency>(
-            model,
-            expert_cache_bytes,
-            checked_int(
-                config.n_experts,
-                "expert count"));
+    std::shared_ptr<MlxNintMoeOffloadCache>
+        expert_offload;
+    if (expert_cache_bytes.has_value()) {
+        expert_offload =
+            std::make_shared<MlxNintMoeOffloadCache>(
+                model,
+                *expert_cache_bytes,
+                checked_int(
+                    config.n_experts,
+                    "expert count"));
+    }
     std::vector<MlxDeepseekV4Layer> layers;
     layers.reserve(
         static_cast<std::size_t>(
@@ -774,7 +794,7 @@ MlxDeepseekV4CausalLm::load(
                 availability.at(index),
                 rope_base,
                 rope_compressed,
-                expert_residency));
+                expert_offload));
     }
     return MlxDeepseekV4CausalLm(
         config,
@@ -799,7 +819,7 @@ MlxDeepseekV4CausalLm::load(
             names.hc_head_scale),
         context,
         mlx::core::float16,
-        std::move(expert_residency));
+        std::move(expert_offload));
 }
 
 MlxDeepseekV4CausalLm::MlxDeepseekV4CausalLm(
@@ -813,8 +833,8 @@ MlxDeepseekV4CausalLm::MlxDeepseekV4CausalLm(
     array hc_head_scale,
     int max_context,
     Dtype activation_dtype,
-    std::shared_ptr<MlxCccpExpertResidency>
-        expert_residency)
+    std::shared_ptr<MlxNintMoeOffloadCache>
+        expert_offload)
     : config_(std::move(config)),
       embedding_(std::move(embedding)),
       layers_(std::move(layers)),
@@ -830,8 +850,8 @@ MlxDeepseekV4CausalLm::MlxDeepseekV4CausalLm(
       hc_head_scale_(
           float32_contiguous(
               hc_head_scale)),
-      expert_residency_(
-          std::move(expert_residency)),
+      expert_offload_(
+          std::move(expert_offload)),
       max_context_(max_context),
       activation_dtype_(activation_dtype) {
     validate_components();
@@ -946,10 +966,7 @@ void MlxDeepseekV4CausalLm::clear_cache() noexcept {
 
 void MlxDeepseekV4CausalLm::materialize_state(
     const MlxDeepseekV4LayerState& state) const {
-    std::vector<array> arrays{
-        state.local(),
-        state.local_positions(),
-    };
+    std::vector<array> arrays{state.local()};
     const auto append_pool =
         [&](const MlxDeepseekV4PoolState& pool) {
             arrays.push_back(pool.pool());
@@ -1049,6 +1066,10 @@ array MlxDeepseekV4CausalLm::forward_chunk(
         });
     auto hidden_values =
         mlx::core::contiguous(streams);
+    detail::profile_eval(
+        "model.embedding_broadcast",
+        hidden_values);
+    const bool bounded_prefill = tokens > 1;
     for (std::size_t index = 0;
          index < layers_.size();
          ++index) {
@@ -1057,15 +1078,57 @@ array MlxDeepseekV4CausalLm::forward_chunk(
             token_ids,
             states_[index],
             pos0);
-        detail::eval_with_timing(hidden_values);
-        materialize_state(
-            states_[index]);
+        if (bounded_prefill) {
+            detail::eval_with_timing(hidden_values);
+            materialize_state(
+                states_[index]);
+        }
     }
+    auto headed = head(hidden_values);
+    detail::profile_eval(
+        "model.final_hc_norm",
+        headed);
     auto logits = mlx::core::astype(
-        output_(head(hidden_values)),
+        output_(headed),
         mlx::core::float32);
-    for (const auto& state : states_) {
-        materialize_state(state);
+    detail::profile_eval(
+        "model.lm_head_cast",
+        logits);
+    if (!bounded_prefill) {
+        // Decode owns one token and a bounded cache update per layer.  Keep
+        // the complete 43-layer graph lazy, then materialize logits and every
+        // updated cache array together.  Evaluating hidden/state after every
+        // layer fragmented one token into roughly 86 Metal synchronizations.
+        std::vector<array> outputs{logits};
+        const auto append_pool =
+            [&outputs](const MlxDeepseekV4PoolState& pool) {
+                outputs.push_back(pool.pool());
+                outputs.push_back(pool.state_kv());
+                outputs.push_back(pool.state_gate());
+                if (pool.prev_kv()) {
+                    outputs.push_back(*pool.prev_kv());
+                }
+                if (pool.prev_gate()) {
+                    outputs.push_back(*pool.prev_gate());
+                }
+            };
+        for (const auto& state : states_) {
+            outputs.push_back(state.local());
+            if (state.main()) {
+                append_pool(*state.main());
+            }
+            if (state.indexer()) {
+                append_pool(*state.indexer());
+            }
+        }
+        if (detail::component_profile_active()) {
+            detail::profile_eval(
+                "model.finalize_cache",
+                std::move(outputs));
+        } else {
+            detail::eval_with_timing(
+                std::move(outputs));
+        }
     }
     return logits;
 }
@@ -1217,29 +1280,29 @@ bool MlxDeepseekV4CausalLm::uses_streamed_experts()
 std::size_t
 MlxDeepseekV4CausalLm::expert_cache_limit_bytes()
     const noexcept {
-    return expert_residency_
-        ? expert_residency_->cache_limit_bytes()
+    return expert_offload_
+        ? expert_offload_->cache_limit_bytes()
         : 0;
 }
 
 std::size_t
 MlxDeepseekV4CausalLm::expert_resident_packed_bytes()
     const {
-    return expert_residency_
-        ? expert_residency_->resident_packed_bytes()
+    return expert_offload_
+        ? expert_offload_->resident_packed_bytes()
         : 0;
 }
 
 std::size_t
 MlxDeepseekV4CausalLm::cached_expert_count() const {
-    return expert_residency_
-        ? expert_residency_->cached_expert_count()
+    return expert_offload_
+        ? expert_offload_->cached_expert_count()
         : 0;
 }
 
 void MlxDeepseekV4CausalLm::clear_expert_cache() {
-    if (expert_residency_) {
-        expert_residency_->clear();
+    if (expert_offload_) {
+        expert_offload_->clear();
     }
 }
 
@@ -1342,10 +1405,70 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
 
     std::int32_t generated = 0;
     while (generated < max_tokens) {
+        const int decode_step = generated;
+        const int profile_skip =
+            detail::component_profile_skip_steps();
+        const bool profile_this_step =
+            detail::component_profile_requested()
+            && decode_step >= profile_skip
+            && decode_step - profile_skip
+                < detail::component_profile_steps();
+        detail::ComponentProfile component_profile;
+        detail::ScopedComponentProfile profile_scope(
+            profile_this_step
+                ? &component_profile
+                : nullptr);
+        const auto component_started =
+            std::chrono::steady_clock::now();
+        const auto report_components = [&] {
+            if (!profile_this_step) {
+                return;
+            }
+            const double wall_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now()
+                    - component_started)
+                    .count();
+            const double evaluated_ms =
+                component_profile.evaluated_ms();
+            std::cout
+                << "component_profile"
+                << " step=" << decode_step
+                << " cache_position=" << cache_position_
+                << " wall_ms=" << std::fixed
+                << std::setprecision(3) << wall_ms
+                << " evaluated_ms=" << evaluated_ms
+                << " unscoped_ms="
+                << std::max(0.0, wall_ms - evaluated_ms)
+                << std::endl;
+            for (const auto& [name, timing] :
+                 component_profile.timings()) {
+                std::cout
+                    << "component_cost"
+                    << " step=" << decode_step
+                    << " name=" << name
+                    << " ms=" << timing.elapsed_ms
+                    << " calls=" << timing.evaluations
+                    << " pct_evaluated="
+                    << (
+                        evaluated_ms > 0.0
+                            ? 100.0 * timing.elapsed_ms
+                                / evaluated_ms
+                            : 0.0
+                    )
+                    << std::endl;
+            }
+        };
         auto sampled = sampler.sample(
             logits,
             counts);
-        sampled.eval();
+        if (profile_this_step) {
+            detail::profile_eval(
+                "model.sampling",
+                sampled);
+        } else {
+            sampled.eval();
+        }
         const auto token =
             sampled.data<std::int32_t>()[0];
         if (token < 0 || token >= vocab) {
@@ -1369,11 +1492,13 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
         }
         if (contains_token(eos, token) ||
             generated == max_tokens) {
+            report_components();
             break;
         }
         logits = last_token_logits(
             decode(token_ids),
             vocab);
+        report_components();
     }
     return generated;
 }

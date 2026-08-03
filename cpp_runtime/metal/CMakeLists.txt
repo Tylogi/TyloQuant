@@ -105,23 +105,13 @@ set_target_properties(mfq-decode-metal PROPERTIES
 )
 
 add_custom_command(TARGET mfq-decode-metal POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory
-        "$<TARGET_FILE_DIR:mfq-decode-metal>/lib"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${MFQ_MLX_ROOT}/lib/libmlx.dylib"
-        "$<TARGET_FILE_DIR:mfq-decode-metal>/lib/libmlx.dylib"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${MFQ_MLX_ROOT}/lib/libjaccl.dylib"
-        "$<TARGET_FILE_DIR:mfq-decode-metal>/lib/libjaccl.dylib"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${MFQ_MLX_ROOT}/lib/mlx.metallib"
-        "$<TARGET_FILE_DIR:mfq-decode-metal>/lib/mlx.metallib"
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/../web"
         "$<TARGET_FILE_DIR:mfq-decode-metal>/web"
-    COMMENT "Copying MLX runtime and MFQ WebUI assets"
+    COMMENT "Copying MFQ WebUI assets"
 )
 
+set(_MFQ_LLAMA_RUNTIME_DYLIBS)
 if(TARGET mfq-server)
     file(GLOB _MFQ_LLAMA_RUNTIME_DYLIBS
         "${MFQ_LLAMA_RUNTIME_DIR}/*.dylib")
@@ -130,6 +120,45 @@ if(TARGET mfq-server)
             "No llama.cpp runtime dylibs found in "
             "${MFQ_LLAMA_RUNTIME_DIR}")
     endif()
+endif()
+
+# Both native executables live in this binary directory and use the same
+# relocatable runtime bundle.  A single dependency target prevents parallel
+# links from copying and running install_name_tool on the same dylibs at once.
+set(_MFQ_METAL_RUNTIME_BUNDLE_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/lib")
+set(_MFQ_METAL_RUNTIME_BUNDLE_STAMP
+    "${_MFQ_METAL_RUNTIME_BUNDLE_DIR}/.mfq-runtime-bundle.stamp")
+add_custom_command(
+    OUTPUT "${_MFQ_METAL_RUNTIME_BUNDLE_STAMP}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "${_MFQ_METAL_RUNTIME_BUNDLE_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${MFQ_MLX_ROOT}/lib/libmlx.dylib"
+        "${_MFQ_METAL_RUNTIME_BUNDLE_DIR}/libmlx.dylib"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${MFQ_MLX_ROOT}/lib/libjaccl.dylib"
+        "${_MFQ_METAL_RUNTIME_BUNDLE_DIR}/libjaccl.dylib"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${MFQ_MLX_ROOT}/lib/mlx.metallib"
+        "${_MFQ_METAL_RUNTIME_BUNDLE_DIR}/mlx.metallib"
+    DEPENDS
+        "${MFQ_MLX_ROOT}/lib/libmlx.dylib"
+        "${MFQ_MLX_ROOT}/lib/libjaccl.dylib"
+        "${MFQ_MLX_ROOT}/lib/mlx.metallib"
+        ${_MFQ_LLAMA_RUNTIME_DYLIBS}
+    COMMAND_EXPAND_LISTS
+    COMMENT "Building the shared native Metal runtime bundle"
+)
+
+if(TARGET mfq-server)
+    add_custom_command(
+        OUTPUT "${_MFQ_METAL_RUNTIME_BUNDLE_STAMP}"
+        APPEND
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${_MFQ_LLAMA_RUNTIME_DYLIBS}
+            "${_MFQ_METAL_RUNTIME_BUNDLE_DIR}"
+    )
 
     add_executable(mfq-perplexity
         mfq_perplexity_mlx.cpp
@@ -144,55 +173,34 @@ if(TARGET mfq-server)
         BUILD_WITH_INSTALL_RPATH ON
         INSTALL_RPATH "@executable_path/lib"
     )
-    add_custom_command(TARGET mfq-perplexity POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory
-            "$<TARGET_FILE_DIR:mfq-perplexity>/lib"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${MFQ_MLX_ROOT}/lib/libmlx.dylib"
-            "$<TARGET_FILE_DIR:mfq-perplexity>/lib/libmlx.dylib"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${MFQ_MLX_ROOT}/lib/libjaccl.dylib"
-            "$<TARGET_FILE_DIR:mfq-perplexity>/lib/libjaccl.dylib"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${MFQ_MLX_ROOT}/lib/mlx.metallib"
-            "$<TARGET_FILE_DIR:mfq-perplexity>/lib/mlx.metallib"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${_MFQ_LLAMA_RUNTIME_DYLIBS}
-            "$<TARGET_FILE_DIR:mfq-perplexity>/lib"
-        COMMAND_EXPAND_LISTS
-        COMMENT "Copying mfq-perplexity MLX and tokenizer runtime files"
-    )
-
-    add_custom_command(TARGET mfq-decode-metal POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${_MFQ_LLAMA_RUNTIME_DYLIBS}
-            "$<TARGET_FILE_DIR:mfq-decode-metal>/lib"
-        COMMAND_EXPAND_LISTS
-        COMMENT "Copying llama.cpp tokenizer runtime dylibs"
-    )
     foreach(_MFQ_LLAMA_RUNTIME_DYLIB
             IN LISTS _MFQ_LLAMA_RUNTIME_DYLIBS)
         get_filename_component(
             _MFQ_LLAMA_RUNTIME_DYLIB_NAME
             "${_MFQ_LLAMA_RUNTIME_DYLIB}"
             NAME)
-        add_custom_command(TARGET mfq-decode-metal POST_BUILD
+        add_custom_command(
+            OUTPUT "${_MFQ_METAL_RUNTIME_BUNDLE_STAMP}"
+            APPEND
             COMMAND ${CMAKE_COMMAND}
-                "-DMFQ_DYLIB=$<TARGET_FILE_DIR:mfq-decode-metal>/lib/${_MFQ_LLAMA_RUNTIME_DYLIB_NAME}"
+                "-DMFQ_DYLIB=${_MFQ_METAL_RUNTIME_BUNDLE_DIR}/${_MFQ_LLAMA_RUNTIME_DYLIB_NAME}"
                 "-DMFQ_INSTALL_NAME_TOOL=${CMAKE_INSTALL_NAME_TOOL}"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/bundle_macos_dylib.cmake"
-            COMMENT
-                "Making ${_MFQ_LLAMA_RUNTIME_DYLIB_NAME} relocatable"
-        )
-        add_custom_command(TARGET mfq-perplexity POST_BUILD
-            COMMAND ${CMAKE_COMMAND}
-                "-DMFQ_DYLIB=$<TARGET_FILE_DIR:mfq-perplexity>/lib/${_MFQ_LLAMA_RUNTIME_DYLIB_NAME}"
-                "-DMFQ_INSTALL_NAME_TOOL=${CMAKE_INSTALL_NAME_TOOL}"
-                -P "${CMAKE_CURRENT_SOURCE_DIR}/bundle_macos_dylib.cmake"
-            COMMENT
-                "Making ${_MFQ_LLAMA_RUNTIME_DYLIB_NAME} relocatable for mfq-perplexity"
         )
     endforeach()
+endif()
+
+add_custom_command(
+    OUTPUT "${_MFQ_METAL_RUNTIME_BUNDLE_STAMP}"
+    APPEND
+    COMMAND ${CMAKE_COMMAND} -E touch
+        "${_MFQ_METAL_RUNTIME_BUNDLE_STAMP}"
+)
+add_custom_target(mfq-metal-runtime-bundle
+    DEPENDS "${_MFQ_METAL_RUNTIME_BUNDLE_STAMP}")
+add_dependencies(mfq-decode-metal mfq-metal-runtime-bundle)
+if(TARGET mfq-perplexity)
+    add_dependencies(mfq-perplexity mfq-metal-runtime-bundle)
 endif()
 
 add_executable(mfq-metal-container-test

@@ -1,5 +1,7 @@
 #include "mlx_cccp.h"
 
+#include <mlx/allocator.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -706,29 +708,30 @@ std::uint32_t packed_index(
 array make_u8_array(
     std::vector<std::uint8_t> values,
     Shape shape) {
-    auto storage =
-        std::make_shared<
-            std::vector<std::uint8_t>>(
-            std::move(values));
-    return array(
-        storage->data(),
+    auto result = array(
+        mlx::core::allocator::malloc(values.size()),
         std::move(shape),
-        mlx::core::uint8,
-        [storage = std::move(storage)](void*) {});
+        mlx::core::uint8);
+    std::memcpy(
+        result.data<std::uint8_t>(),
+        values.data(),
+        values.size());
+    return result;
 }
 
 array make_float16_array(
     std::vector<std::uint16_t> values,
     Shape shape) {
-    auto storage =
-        std::make_shared<
-            std::vector<std::uint16_t>>(
-            std::move(values));
-    return array(
-        storage->data(),
+    const auto bytes = values.size() * sizeof(std::uint16_t);
+    auto result = array(
+        mlx::core::allocator::malloc(bytes),
         std::move(shape),
-        mlx::core::float16,
-        [storage = std::move(storage)](void*) {});
+        mlx::core::float16);
+    std::memcpy(
+        result.data<std::uint16_t>(),
+        values.data(),
+        bytes);
+    return result;
 }
 
 array make_float16_codebook(

@@ -1391,3 +1391,99 @@ constexpr const char* kSparseAttentionDecodeSource = R"MFQ_METAL(
             accumulators[item] * inverse_denominator;
     }
 )MFQ_METAL";
+
+constexpr const char* kSparseAttentionDirectDecodeSource = R"MFQ_METAL(
+    constexpr uint HEADS = 64u;
+    constexpr uint HEADS_PER_GROUP = 4u;
+    constexpr uint HEAD_GROUPS = HEADS / HEADS_PER_GROUP;
+    constexpr uint DIM = 512u;
+    constexpr uint VALUES_PER_LANE = DIM / 32u;
+
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint workgroup = threadgroup_position_in_grid.x;
+    uint head_group = workgroup % HEAD_GROUPS;
+    uint batch = workgroup / HEAD_GROUPS;
+    if (batch >= uint(B)) {
+        return;
+    }
+    uint head = head_group * HEADS_PER_GROUP + simd_group;
+    uint query_base = (batch * HEADS + head) * DIM;
+    uint seq_len = uint(max(decode_params[0], 0));
+    uint pool_len = uint(max(decode_params[1], 0));
+    uint topk_count = uint(max(decode_params[2], 0));
+    uint topk_base = batch * topk_count;
+    uint local_count = min(seq_len, uint(WINDOW));
+    float maximum = sinks[head];
+    float denominator = 1.0f;
+    float accumulators[VALUES_PER_LANE];
+    for (uint item = 0u; item < VALUES_PER_LANE; ++item) {
+        accumulators[item] = 0.0f;
+    }
+
+    for (uint selected = 0u; selected < local_count; ++selected) {
+        uint absolute = seq_len - local_count + selected;
+        uint cache_row = absolute % uint(WINDOW);
+        uint cache_base =
+            (batch * uint(WINDOW) + cache_row) * DIM;
+        float dot = 0.0f;
+        for (uint item = 0u; item < VALUES_PER_LANE; ++item) {
+            uint dimension = lane + item * 32u;
+            dot += q[query_base + dimension]
+                * float(local_kv[cache_base + dimension]);
+        }
+        float score = simd_sum(dot) * params[0];
+        float new_maximum = max(maximum, score);
+        float old_scale = metal::fast::exp(maximum - new_maximum);
+        float new_scale = metal::fast::exp(score - new_maximum);
+        denominator = denominator * old_scale + new_scale;
+        maximum = new_maximum;
+
+        for (uint item = 0u; item < VALUES_PER_LANE; ++item) {
+            uint dimension = lane + item * 32u;
+            float value = float(local_kv[cache_base + dimension]);
+            accumulators[item] =
+                accumulators[item] * old_scale + value * new_scale;
+        }
+    }
+
+    uint visible = min(pool_len, seq_len / uint(RATIO));
+    for (uint selected = 0u; selected < topk_count; ++selected) {
+        int pooled = topk[topk_base + selected];
+        bool valid = pooled >= 0 && uint(pooled) < visible;
+        uint cache_row = valid ? uint(pooled) : 0u;
+        uint cache_base =
+            (batch * uint(POOL_CAPACITY) + cache_row) * DIM;
+        float dot = 0.0f;
+        for (uint item = 0u; item < VALUES_PER_LANE; ++item) {
+            uint dimension = lane + item * 32u;
+            dot += q[query_base + dimension]
+                * float(pooled_kv[cache_base + dimension]);
+        }
+        float score = simd_sum(dot);
+        score = valid ? score * params[0] : -INFINITY;
+        float new_maximum = max(maximum, score);
+        float old_scale = metal::fast::exp(maximum - new_maximum);
+        float new_scale = valid
+            ? metal::fast::exp(score - new_maximum)
+            : 0.0f;
+        denominator = denominator * old_scale + new_scale;
+        maximum = new_maximum;
+        for (uint item = 0u; item < VALUES_PER_LANE; ++item) {
+            uint dimension = lane + item * 32u;
+            float value = valid
+                ? float(pooled_kv[cache_base + dimension])
+                : 0.0f;
+            accumulators[item] =
+                accumulators[item] * old_scale + value * new_scale;
+        }
+    }
+
+    float inverse_denominator = 1.0f / denominator;
+    uint output_base = (batch * HEADS + head) * DIM;
+    for (uint item = 0u; item < VALUES_PER_LANE; ++item) {
+        uint dimension = lane + item * 32u;
+        out[output_base + dimension] =
+            accumulators[item] * inverse_denominator;
+    }
+)MFQ_METAL";

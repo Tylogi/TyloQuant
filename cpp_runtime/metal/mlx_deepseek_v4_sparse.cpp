@@ -183,6 +183,23 @@ const Kernel& sparse_attention_decode_kernel() {
     return kernel;
 }
 
+const Kernel& sparse_attention_direct_decode_kernel() {
+    static const auto kernel = make_kernel(
+        "mfq_cpp_dsv4_sparse_attention_direct_decode",
+        {
+            "q",
+            "local_kv",
+            "pooled_kv",
+            "topk",
+            "sinks",
+            "params",
+            "decode_params",
+        },
+        {"out"},
+        kSparseAttentionDirectDecodeSource);
+    return kernel;
+}
+
 array typed_contiguous(const array& input, Dtype dtype) {
     auto result = input;
     if (result.dtype() != dtype) {
@@ -1205,6 +1222,111 @@ array attention_dsv4_sparse(
         {grid, 1, 1},
         {256, 1, 1},
         templates,
+        std::nullopt,
+        false,
+        {});
+    return std::move(outputs.front());
+}
+
+array attention_dsv4_sparse_decode(
+    const array& q,
+    const array& local_kv,
+    const std::optional<array>& pooled_kv,
+    int pool_len,
+    const array& topk,
+    const array& sinks,
+    int seq_len,
+    int ratio,
+    int window,
+    std::optional<float> scale) {
+    auto query = typed_contiguous(
+        q,
+        mlx::core::float32);
+    auto local = typed_contiguous(
+        local_kv,
+        mlx::core::float16);
+    auto selected_topk = typed_contiguous(
+        topk,
+        mlx::core::int32);
+    auto sink_logits = typed_contiguous(
+        sinks,
+        mlx::core::float32);
+    auto pool = pooled_kv
+        ? typed_contiguous(
+              *pooled_kv,
+              mlx::core::float16)
+        : local;
+    if (query.ndim() != 4 ||
+        query.shape(0) <= 0 ||
+        query.shape(1) != kAttentionHeads ||
+        query.shape(2) != 1 ||
+        query.shape(3) != kAttentionDimension ||
+        local.shape() != Shape{
+            query.shape(0),
+            window,
+            kAttentionDimension,
+        } ||
+        pool.ndim() != 3 ||
+        pool.shape(0) != query.shape(0) ||
+        pool.shape(2) != kAttentionDimension ||
+        pool_len < 0 ||
+        pool_len > pool.shape(1) ||
+        selected_topk.ndim() != 3 ||
+        selected_topk.shape(0) != query.shape(0) ||
+        selected_topk.shape(1) != 1 ||
+        sink_logits.size() != kAttentionHeads ||
+        seq_len <= 0 ||
+        ratio <= 0 ||
+        window <= 0) {
+        throw std::invalid_argument(
+            "DSV4 direct decode attention shape mismatch");
+    }
+    const float selected_scale = scale.value_or(
+        1.0f /
+        std::sqrt(
+            static_cast<float>(
+                kAttentionDimension)));
+    if (!std::isfinite(selected_scale) ||
+        selected_scale <= 0.0f) {
+        throw std::invalid_argument(
+            "DSV4 direct decode attention scale must be finite and positive");
+    }
+    const int batch = query.shape(0);
+    const int topk_count = selected_topk.shape(2);
+    const int grid = checked_product(
+        {batch, 16, 128},
+        "direct sparse decode attention grid");
+    const array params(
+        {selected_scale},
+        mlx::core::float32);
+    const array decode_params(
+        {seq_len, pool_len, topk_count},
+        mlx::core::int32);
+    auto outputs = sparse_attention_direct_decode_kernel()(
+        {
+            query,
+            local,
+            pool,
+            selected_topk,
+            sink_logits,
+            params,
+            decode_params,
+        },
+        {Shape{
+            batch,
+            1,
+            kAttentionHeads,
+            kAttentionDimension,
+        }},
+        {mlx::core::float32},
+        {grid, 1, 1},
+        {128, 1, 1},
+        {
+            {"B", batch},
+            {"POOL_CAPACITY", pool.shape(1)},
+            {"RATIO", ratio},
+            {"WINDOW", window},
+        },
         std::nullopt,
         false,
         {});

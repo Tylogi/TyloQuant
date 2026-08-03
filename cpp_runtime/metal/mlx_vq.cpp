@@ -1,6 +1,7 @@
 #include "mlx_vq.h"
 
 #include "../nvq_codebooks.generated.h"
+#include "mlx_staging_allocator.h"
 
 #include <algorithm>
 #include <array>
@@ -11,6 +12,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -48,9 +50,13 @@ inline uint mfq_vq_read_bits(
     uint byte_index =
         (value_index >> 3) * bits + (residual_bits >> 3);
     uint shift = residual_bits & 7u;
-    uint packed = uint(stream[byte_index])
-        | (uint(stream[byte_index + 1u]) << 8)
-        | (uint(stream[byte_index + 2u]) << 16);
+    uint packed = uint(stream[byte_index]);
+    if (shift + bits > 8u) {
+        packed |= uint(stream[byte_index + 1u]) << 8;
+    }
+    if (shift + bits > 16u) {
+        packed |= uint(stream[byte_index + 2u]) << 16;
+    }
     return (packed >> shift) & ((1u << bits) - 1u);
 }
 
@@ -63,9 +69,13 @@ inline uint mfq_vq_read_bits(
     uint byte_index =
         (value_index >> 3) * bits + (residual_bits >> 3);
     uint shift = residual_bits & 7u;
-    uint packed = uint(stream[byte_index])
-        | (uint(stream[byte_index + 1u]) << 8)
-        | (uint(stream[byte_index + 2u]) << 16);
+    uint packed = uint(stream[byte_index]);
+    if (shift + bits > 8u) {
+        packed |= uint(stream[byte_index + 1u]) << 8;
+    }
+    if (shift + bits > 16u) {
+        packed |= uint(stream[byte_index + 2u]) << 16;
+    }
     return (packed >> shift) & ((1u << bits) - 1u);
 }
 
@@ -744,7 +754,7 @@ constexpr const char* kHadamardSource = R"METAL(
 
 class BlobCursor {
 public:
-    explicit BlobCursor(const std::vector<std::uint8_t>& blob)
+    explicit BlobCursor(std::span<const std::uint8_t> blob)
         : blob_(blob) {}
 
     template <typename T>
@@ -764,11 +774,11 @@ public:
         return result;
     }
 
-    std::vector<std::uint8_t> bytes(
+    detail::StagingVector<std::uint8_t> bytes(
         std::size_t count,
         const char* name) {
         require(count, name);
-        std::vector<std::uint8_t> result(
+        detail::StagingVector<std::uint8_t> result(
             blob_.begin() + static_cast<std::ptrdiff_t>(offset_),
             blob_.begin()
                 + static_cast<std::ptrdiff_t>(offset_ + count));
@@ -800,7 +810,7 @@ private:
         }
     }
 
-    const std::vector<std::uint8_t>& blob_;
+    std::span<const std::uint8_t> blob_;
     std::size_t offset_ = 0;
 };
 
@@ -815,15 +825,15 @@ struct MatrixHeader {
 };
 
 struct CanonicalVq {
-    std::vector<std::uint8_t> indices;
-    std::vector<std::uint8_t> states_packed;
-    std::vector<std::uint8_t> auxiliary;
-    std::vector<float> anchors;
-    std::vector<std::int8_t> codebooks;
-    std::vector<float> scales;
-    std::vector<std::uint8_t> state_to_codebank;
-    std::vector<std::uint8_t> bank_ids;
-    std::vector<std::int8_t> rotation_signs;
+    detail::StagingVector<std::uint8_t> indices;
+    detail::StagingVector<std::uint8_t> states_packed;
+    detail::StagingVector<std::uint8_t> auxiliary;
+    detail::StagingVector<float> anchors;
+    detail::StagingVector<std::int8_t> codebooks;
+    detail::StagingVector<float> scales;
+    detail::StagingVector<std::uint8_t> state_to_codebank;
+    detail::StagingVector<std::uint8_t> bank_ids;
+    detail::StagingVector<std::int8_t> rotation_signs;
     float parameter = 0.0f;
     std::string label;
     std::vector<int> output_shape;
@@ -908,7 +918,7 @@ std::size_t packed_nbytes(
     ) / 8;
 }
 
-std::vector<std::uint8_t> padded_stream(
+detail::StagingVector<std::uint8_t> padded_stream(
     BlobCursor& cursor,
     std::size_t count,
     int bits,
@@ -947,12 +957,12 @@ float half_to_float(std::uint16_t bits) {
     return negative ? -value : value;
 }
 
-std::vector<float> read_half_values(
+detail::StagingVector<float> read_half_values(
     BlobCursor& cursor,
     std::size_t count,
     const char* name,
     bool require_nonnegative = true) {
-    std::vector<float> result(count);
+    detail::StagingVector<float> result(count);
     for (auto& value : result) {
         value = half_to_float(
             cursor.scalar<std::uint16_t>(name));
@@ -1008,7 +1018,7 @@ MatrixHeader read_matrix_header(
     return result;
 }
 
-std::vector<std::int8_t> decode_lattice_codebook(
+detail::StagingVector<std::int8_t> decode_lattice_codebook(
     const std::uint16_t* words,
     int entries,
     int vector_size) {
@@ -1018,7 +1028,7 @@ std::vector<std::int8_t> decode_lattice_codebook(
             "invalid VQ lattice codebook dimensions");
     }
     const int digit_bits = vector_size == 8 ? 2 : 3;
-    std::vector<std::int8_t> result(
+    detail::StagingVector<std::int8_t> result(
         checked_product(
             static_cast<std::size_t>(entries),
             static_cast<std::size_t>(vector_size),
@@ -1040,7 +1050,7 @@ std::vector<std::int8_t> decode_lattice_codebook(
     return result;
 }
 
-std::vector<std::int8_t> decode_lattice_codebook(
+detail::StagingVector<std::int8_t> decode_lattice_codebook(
     const std::uint8_t* bytes,
     int entries,
     int vector_size) {
@@ -1059,10 +1069,10 @@ std::vector<std::int8_t> decode_lattice_codebook(
         vector_size);
 }
 
-std::vector<std::int8_t> decode_ternary_codebook(
+detail::StagingVector<std::int8_t> decode_ternary_codebook(
     const std::uint16_t* words,
     int entries) {
-    std::vector<std::int8_t> result(
+    detail::StagingVector<std::int8_t> result(
         checked_product(
             static_cast<std::size_t>(entries),
             std::size_t{8},
@@ -1087,7 +1097,7 @@ std::vector<std::int8_t> decode_ternary_codebook(
     return result;
 }
 
-std::vector<std::int8_t> decode_ternary_codebook(
+detail::StagingVector<std::int8_t> decode_ternary_codebook(
     const std::uint8_t* bytes,
     int entries) {
     std::vector<std::uint16_t> words(
@@ -1285,7 +1295,7 @@ std::string expected_nvq_dtype(
 
 CanonicalVq parse_nvq(
     std::string_view dtype,
-    const std::vector<std::uint8_t>& blob) {
+    std::span<const std::uint8_t> blob) {
     constexpr std::uint8_t kIndexParity = 0x80;
     constexpr std::uint8_t kCustomCodebook = 0x40;
     constexpr std::uint8_t kJsc = 0x20;
@@ -1499,7 +1509,7 @@ CanonicalVq parse_nvq(
 
 CanonicalVq parse_nvq1_l(
     std::string_view dtype,
-    const std::vector<std::uint8_t>& blob) {
+    std::span<const std::uint8_t> blob) {
     if (dtype != "NVQ1-L") {
         throw std::runtime_error(
             "MFQ dtype/blob mismatch for NVQ1-L");
@@ -1603,7 +1613,7 @@ CanonicalVq parse_nvq1_l(
 
 CanonicalVq parse_nvq1_s(
     std::string_view dtype,
-    const std::vector<std::uint8_t>& blob) {
+    std::span<const std::uint8_t> blob) {
     if (dtype != "NVQ1-S") {
         throw std::runtime_error(
             "MFQ dtype/blob mismatch for NVQ1-S");
@@ -1702,7 +1712,7 @@ CanonicalVq parse_nvq1_s(
 
 CanonicalVq parse_npq(
     std::string_view dtype,
-    const std::vector<std::uint8_t>& blob,
+    std::span<const std::uint8_t> blob,
     bool short_profile) {
     const auto expected_dtype =
         short_profile ? "NPQ0-S" : "NPQ0-L";
@@ -1824,8 +1834,8 @@ NepqProfile nepq_profile(int id) {
     }
 }
 
-std::vector<std::int8_t> parse_rotation_payload(
-    const std::vector<std::uint8_t>& payload,
+detail::StagingVector<std::int8_t> parse_rotation_payload(
+    std::span<const std::uint8_t> payload,
     int input_size,
     int rotation_block,
     std::uint64_t rotation_seed) {
@@ -1870,7 +1880,7 @@ std::vector<std::int8_t> parse_rotation_payload(
         throw std::runtime_error(
             "invalid NEPQ rotation metadata tail");
     }
-    std::vector<std::int8_t> signs(raw.size());
+    detail::StagingVector<std::int8_t> signs(raw.size());
     std::memcpy(signs.data(), raw.data(), raw.size());
     for (const auto sign : signs) {
         if (sign != -1 && sign != 1) {
@@ -1883,8 +1893,8 @@ std::vector<std::int8_t> parse_rotation_payload(
 
 CanonicalVq parse_nepq(
     std::string_view dtype,
-    const std::vector<std::uint8_t>& blob,
-    const std::vector<std::uint8_t>& runtime_payload) {
+    std::span<const std::uint8_t> blob,
+    std::span<const std::uint8_t> runtime_payload) {
     BlobCursor cursor(blob);
     if (!magic_is(cursor.magic("NEPQ magic"), "NEP1")) {
         throw std::runtime_error("invalid NEPQ cohort magic");
@@ -2097,8 +2107,8 @@ CanonicalVq parse_nepq(
 
 VqTensorMetadata inspect_matrix_vq_header(
     std::string_view dtype,
-    const std::vector<std::uint8_t>& blob,
-    const std::vector<std::uint8_t>& runtime_payload) {
+    std::span<const std::uint8_t> blob,
+    std::span<const std::uint8_t> runtime_payload) {
     if (!runtime_payload.empty()) {
         throw std::runtime_error(
             "unexpected matrix VQ runtime metadata");
@@ -2203,8 +2213,8 @@ VqTensorMetadata inspect_matrix_vq_header(
 
 VqTensorMetadata inspect_nepq_header(
     std::string_view dtype,
-    const std::vector<std::uint8_t>& blob,
-    const std::vector<std::uint8_t>& runtime_payload) {
+    std::span<const std::uint8_t> blob,
+    std::span<const std::uint8_t> runtime_payload) {
     BlobCursor cursor(blob);
     if (!magic_is(cursor.magic("NEPQ magic"), "NEP1")) {
         throw std::runtime_error(
@@ -2296,8 +2306,8 @@ VqTensorMetadata inspect_nepq_header(
 
 CanonicalVq parse_vq(
     std::string_view dtype,
-    const std::vector<std::uint8_t>& blob,
-    const std::vector<std::uint8_t>& runtime_payload) {
+    std::span<const std::uint8_t> blob,
+    std::span<const std::uint8_t> runtime_payload) {
     if (dtype == "NVQ1-L") {
         if (!runtime_payload.empty()) {
             throw std::runtime_error(
@@ -2341,9 +2351,9 @@ CanonicalVq parse_vq(
         + std::string(dtype));
 }
 
-template <typename T>
+template <typename T, typename Allocator>
 array make_array(
-    const std::vector<T>& values,
+    const std::vector<T, Allocator>& values,
     Shape shape) {
     return array(values.begin(), std::move(shape));
 }
@@ -2572,8 +2582,8 @@ common_templates(
 
 VqTensorMetadata inspect_vq_blob(
     std::string_view dtype,
-    const std::vector<std::uint8_t>& blob,
-    const std::vector<std::uint8_t>& runtime_payload) {
+    std::span<const std::uint8_t> blob,
+    std::span<const std::uint8_t> runtime_payload) {
     if (!is_vq_dtype(dtype)) {
         throw std::runtime_error(
             "unsupported native Metal VQ dtype: "
@@ -2681,8 +2691,8 @@ MlxVqWeight::MlxVqWeight(
 
 MlxVqWeight MlxVqWeight::from_blob(
     std::string_view dtype,
-    const std::vector<std::uint8_t>& blob,
-    const std::vector<std::uint8_t>& runtime_payload) {
+    std::span<const std::uint8_t> blob,
+    std::span<const std::uint8_t> runtime_payload) {
     auto parsed = parse_vq(
         dtype,
         blob,

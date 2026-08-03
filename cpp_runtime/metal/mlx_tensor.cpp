@@ -1,9 +1,12 @@
 #include "mlx_tensor.h"
 
+#include <mlx/allocator.h>
+
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <utility>
 
@@ -16,7 +19,7 @@ using mlx::core::array;
 
 class DenseCursor {
 public:
-    explicit DenseCursor(const std::vector<std::uint8_t>& blob)
+    explicit DenseCursor(std::span<const std::uint8_t> blob)
         : blob_(blob) {}
 
     template <typename T>
@@ -39,7 +42,7 @@ public:
     }
 
 private:
-    const std::vector<std::uint8_t>& blob_;
+    std::span<const std::uint8_t> blob_;
     std::size_t offset_ = 0;
 };
 
@@ -72,7 +75,8 @@ array load_weight(
         throw std::runtime_error(
             "dense linear/embedding requires BF16, F16, or F32 tensor: " + name);
     }
-    auto result = load_dense_array(record.dtype, model.read(name));
+    const auto mapped = model.map_record(name);
+    auto result = load_dense_array(record.dtype, mapped.view());
     if (result.ndim() != 2) {
         throw std::runtime_error(
             "linear/embedding weight must have rank two: " + name);
@@ -84,7 +88,7 @@ array load_weight(
 
 array load_dense_array(
     const std::string& dtype_name,
-    const std::vector<std::uint8_t>& blob) {
+    std::span<const std::uint8_t> blob) {
     DenseCursor cursor(blob);
     const auto dimensions =
         cursor.scalar<std::uint32_t>("dimension count");
@@ -113,14 +117,15 @@ array load_dense_array(
         throw std::runtime_error("dense MFQ payload length mismatch");
     }
 
-    auto storage = std::make_shared<std::vector<std::uint8_t>>(
-        cursor.data(),
-        cursor.data() + cursor.remaining());
-    return array(
-        storage->data(),
+    auto result = array(
+        mlx::core::allocator::malloc(cursor.remaining()),
         std::move(shape),
-        dtype,
-        [storage = std::move(storage)](void*) {});
+        dtype);
+    std::memcpy(
+        result.data<std::uint8_t>(),
+        cursor.data(),
+        cursor.remaining());
+    return result;
 }
 
 MlxLinear MlxLinear::load(
@@ -128,15 +133,18 @@ MlxLinear MlxLinear::load(
     const std::string& name) {
     const auto& record = model.record(name);
     if (is_nint8_zero_dtype(record.dtype)) {
+        const auto mapped = model.map_record(name);
         return MlxLinear(
-            MlxNint8ZeroWeight::from_blob(model.read(name)));
+            MlxNint8ZeroWeight::from_blob(mapped.view()));
     }
     if (is_nint_dtype(record.dtype)) {
-        return MlxLinear(MlxNintWeight::from_blob(model.read(name)));
+        const auto mapped = model.map_record(name);
+        return MlxLinear(MlxNintWeight::from_blob(mapped.view()));
     }
     if (is_vq_dtype(record.dtype)) {
+        const auto mapped = model.map_record(name);
         return MlxLinear(
-            MlxVqWeight::from_blob(record.dtype, model.read(name)));
+            MlxVqWeight::from_blob(record.dtype, mapped.view()));
     }
     if (record.dtype == "TPQ-I4G64" ||
         record.dtype == "CCCP-I4G64") {
@@ -246,6 +254,12 @@ array MlxLinear::grouped_row_matmul(
             input,
             group_count);
     }
+    if (const auto* packed =
+            std::get_if<MlxNint8ZeroWeight>(&weight_)) {
+        return packed->grouped_row_matmul(
+            input,
+            group_count);
+    }
     if (const auto* dense =
             std::get_if<array>(&weight_)) {
         auto source = input;
@@ -336,16 +350,19 @@ MlxEmbedding MlxEmbedding::load(
     const std::string& name) {
     const auto& record = model.record(name);
     if (is_nint8_zero_dtype(record.dtype)) {
+        const auto mapped = model.map_record(name);
         return MlxEmbedding(
-            MlxNint8ZeroWeight::from_blob(model.read(name)));
+            MlxNint8ZeroWeight::from_blob(mapped.view()));
     }
     if (is_nint_dtype(record.dtype)) {
+        const auto mapped = model.map_record(name);
         return MlxEmbedding(
-            MlxNintWeight::from_blob(model.read(name)));
+            MlxNintWeight::from_blob(mapped.view()));
     }
     if (is_vq_dtype(record.dtype)) {
+        const auto mapped = model.map_record(name);
         return MlxEmbedding(
-            MlxVqWeight::from_blob(record.dtype, model.read(name)));
+            MlxVqWeight::from_blob(record.dtype, mapped.view()));
     }
     if (record.dtype == "TPQ-I4G64" ||
         record.dtype == "CCCP-I4G64") {

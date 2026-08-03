@@ -691,6 +691,13 @@ DeepseekV4Config DeepseekV4Config::from_json(
         config.compress_ratios.assign(
             static_cast<std::size_t>(config.n_layers),
             0);
+    } else if (config.compress_ratios.size() >
+               static_cast<std::size_t>(config.n_layers)) {
+        // Released V4F configs may append DSpark/MTP layer ratios after the
+        // base decoder.  The native causal-LM runtime currently owns only
+        // num_hidden_layers base layers, so ignore those speculative tails.
+        config.compress_ratios.resize(
+            static_cast<std::size_t>(config.n_layers));
     }
     config.validate();
     return config;
@@ -698,6 +705,16 @@ DeepseekV4Config DeepseekV4Config::from_json(
 
 DeepseekV4Config DeepseekV4Config::from_mfq(
     const MfqContainer& model) {
+    if (model.header().architecture ==
+            "deepseek_v4-ew-mfq") {
+        constexpr const char* model_config_asset =
+            "__mfq_asset__/model_config.json";
+        if (!model.contains(model_config_asset)) {
+            throw std::runtime_error(
+                "DeepSeek-V4 EW MFQ has no embedded model config asset");
+        }
+        return from_json(model.read_text(model_config_asset));
+    }
     if (model.header().architecture !=
             "deepseek_v4-tpq-mfq" &&
         model.header().architecture !=

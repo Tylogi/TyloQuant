@@ -1,11 +1,16 @@
 #include "mlx_nint8_zero.h"
 
+#include "mlx_staging_allocator.h"
+
+#include <mlx/allocator.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -100,6 +105,64 @@ constexpr const char* kNint8ZeroGemv = R"METAL(
     }
 )METAL";
 
+constexpr const char* kNint8ZeroGroupedRow = R"METAL(
+    uint lane = thread_index_in_simdgroup;
+    uint workgroup = thread_position_in_grid.x >> 5;
+    uint output = workgroup % uint(OUT);
+    uint row_tile = workgroup / uint(OUT);
+    uint first_row = row_tile * uint(TILE_M);
+    if (output >= uint(OUT) || first_row >= uint(M)) {
+        return;
+    }
+
+    uint input_group = output / uint(OUT_PER_GROUP);
+    float accumulators[TILE_M];
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        accumulators[local_row] = 0.0f;
+    }
+
+    // One SIMD owns one output row. Unlike the generic grouped fallback, it
+    // evaluates only the diagonal input/output group pair. Four adjacent Q8
+    // values share a scale block and are consumed together.
+    for (uint column = lane * 4u;
+         column < uint(K);
+         column += 128u) {
+        uint quant_group = column >> 5;
+        float scale =
+            float(scales[output * uint(NG) + quant_group]);
+        uint offset = output * uint(K) + column;
+        const device char4* packed =
+            (const device char4*)(q + offset);
+        float4 weights = scale * float4(*packed);
+        for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+            uint row = first_row + local_row;
+            if (row < uint(M)) {
+                uint input_offset =
+                    (row * uint(GROUP_COUNT) + input_group) * uint(K)
+                    + column;
+                float4 activations = float4(
+                    float(x[input_offset]),
+                    float(x[input_offset + 1u]),
+                    float(x[input_offset + 2u]),
+                    float(x[input_offset + 3u]));
+                accumulators[local_row] +=
+                    activations.x * weights.x
+                    + activations.y * weights.y
+                    + activations.z * weights.z
+                    + activations.w * weights.w;
+            }
+        }
+    }
+
+    for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
+        float total = simd_sum(accumulators[local_row]);
+        uint row = first_row + local_row;
+        if (lane == 0u && row < uint(M)) {
+            y[row * uint(OUT) + output] = T(total);
+        }
+    }
+)METAL";
+
 constexpr const char* kNint8ZeroEmbedding = R"METAL(
     uint linear = thread_position_in_grid.x;
     if (linear >= uint(COUNT * K)) {
@@ -120,7 +183,7 @@ constexpr const char* kNint8ZeroEmbedding = R"METAL(
 
 class BlobCursor {
 public:
-    explicit BlobCursor(const std::vector<std::uint8_t>& blob)
+    explicit BlobCursor(std::span<const std::uint8_t> blob)
         : blob_(blob) {}
 
     template <typename T>
@@ -153,7 +216,7 @@ private:
         }
     }
 
-    const std::vector<std::uint8_t>& blob_;
+    std::span<const std::uint8_t> blob_;
     std::size_t offset_ = 0;
 };
 
@@ -178,28 +241,35 @@ std::size_t checked_product(
     return left * right;
 }
 
+template <typename Allocator>
 array make_int8_array(
-    std::vector<std::int8_t> values,
+    std::vector<std::int8_t, Allocator> values,
     Shape shape) {
-    auto storage =
-        std::make_shared<std::vector<std::int8_t>>(std::move(values));
-    return array(
-        storage->data(),
+    auto result = array(
+        mlx::core::allocator::malloc(values.size()),
         std::move(shape),
-        mlx::core::int8,
-        [storage = std::move(storage)](void*) {});
+        mlx::core::int8);
+    std::memcpy(
+        result.data<std::int8_t>(),
+        values.data(),
+        values.size());
+    return result;
 }
 
+template <typename Allocator>
 array make_float16_array(
-    std::vector<std::uint16_t> values,
+    std::vector<std::uint16_t, Allocator> values,
     Shape shape) {
-    auto storage =
-        std::make_shared<std::vector<std::uint16_t>>(std::move(values));
-    return array(
-        storage->data(),
+    const auto bytes = values.size() * sizeof(std::uint16_t);
+    auto result = array(
+        mlx::core::allocator::malloc(bytes),
         std::move(shape),
-        mlx::core::float16,
-        [storage = std::move(storage)](void*) {});
+        mlx::core::float16);
+    std::memcpy(
+        result.data<std::uint16_t>(),
+        values.data(),
+        bytes);
+    return result;
 }
 
 mlx::core::fast::CustomKernelFunction make_matmul_kernel() {
@@ -237,6 +307,25 @@ mlx::core::fast::CustomKernelFunction make_gemv_kernel() {
 
 const mlx::core::fast::CustomKernelFunction& gemv_kernel() {
     static const auto kernel = make_gemv_kernel();
+    return kernel;
+}
+
+mlx::core::fast::CustomKernelFunction make_grouped_row_kernel() {
+    CompileOptions options;
+    options.math_mode = MathMode::Fast;
+    return mlx::core::fast::metal_kernel(
+        "mfq_cpp_nint8_zero_grouped_row",
+        {"q", "scales", "x"},
+        {"y"},
+        kNint8ZeroGroupedRow,
+        "",
+        true,
+        false,
+        options);
+}
+
+const mlx::core::fast::CustomKernelFunction& grouped_row_kernel() {
+    static const auto kernel = make_grouped_row_kernel();
     return kernel;
 }
 
@@ -278,7 +367,7 @@ MlxNint8ZeroWeight::MlxNint8ZeroWeight(
       groups_(groups) {}
 
 MlxNint8ZeroWeight MlxNint8ZeroWeight::from_blob(
-    const std::vector<std::uint8_t>& blob) {
+    std::span<const std::uint8_t> blob) {
     BlobCursor cursor(blob);
     const auto* magic = cursor.bytes(4, "magic");
     if (std::memcmp(magic, "NI80", 4) != 0) {
@@ -324,9 +413,9 @@ MlxNint8ZeroWeight MlxNint8ZeroWeight::from_blob(
             "invalid NINT8-0 block payload length");
     }
 
-    std::vector<std::int8_t> q(
+    detail::StagingVector<std::int8_t> q(
         checked_product(blocks, kBlockElements, "quantized value count"));
-    std::vector<std::uint16_t> scales(blocks);
+    detail::StagingVector<std::uint16_t> scales(blocks);
     for (std::size_t block = 0; block < blocks; ++block) {
         scales[block] =
             cursor.scalar<std::uint16_t>("block scale");
@@ -433,6 +522,8 @@ array MlxNint8ZeroWeight::matmul(const array& input) const {
         };
     const auto* kernel =
         rows == 1 ? &gemv_kernel() : &matmul_kernel();
+    const int threadgroup = static_cast<int>(
+        std::min<std::int64_t>(256, grid_x));
     auto outputs = (*kernel)(
         {q_, scales_, source},
         {
@@ -443,7 +534,103 @@ array MlxNint8ZeroWeight::matmul(const array& input) const {
         },
         {source.dtype()},
         {static_cast<int>(grid_x), 1, 1},
-        {32, 1, 1},
+        {threadgroup, 1, 1},
+        std::move(templates),
+        std::nullopt,
+        false,
+        {});
+    return mlx::core::reshape(
+        outputs.front(),
+        std::move(output_shape));
+}
+
+array MlxNint8ZeroWeight::grouped_row_matmul(
+    const array& input,
+    int group_count) const {
+    if (group_count <= 0 ||
+        input.ndim() < 2 ||
+        input.shape(-2) != group_count ||
+        input.shape(-1) != input_size_ ||
+        output_size_ % group_count != 0) {
+        throw std::runtime_error(
+            "NINT8-0 grouped-row input or weight shape is incompatible");
+    }
+
+    std::int64_t rows = 1;
+    Shape output_shape(
+        input.shape().begin(),
+        input.shape().end() - 2);
+    for (std::size_t index = 0; index + 2 < input.ndim(); ++index) {
+        const int extent = input.shape(static_cast<int>(index));
+        if (extent < 0 ||
+            rows > std::numeric_limits<std::int32_t>::max() /
+                std::max(1, extent)) {
+            throw std::runtime_error(
+                "unsupported NINT8-0 grouped-row count");
+        }
+        rows *= extent;
+    }
+    if (rows <= 0 ||
+        rows > std::numeric_limits<std::int32_t>::max()) {
+        throw std::runtime_error(
+            "unsupported NINT8-0 grouped-row count");
+    }
+
+    const int out_per_group = output_size_ / group_count;
+    output_shape.push_back(group_count);
+    output_shape.push_back(out_per_group);
+
+    auto source = input;
+    if (source.dtype() != mlx::core::float16 &&
+        source.dtype() != mlx::core::float32) {
+        source = mlx::core::astype(
+            source,
+            mlx::core::float16);
+    }
+    source = mlx::core::contiguous(
+        mlx::core::reshape(
+            source,
+            Shape{
+                static_cast<std::int32_t>(rows),
+                group_count,
+                input_size_,
+            }));
+
+    const int tile_rows =
+        rows == 1 ? 1 : (rows <= 16 ? static_cast<int>(rows) : 8);
+    const auto row_tiles =
+        (rows + tile_rows - 1) / tile_rows;
+    const auto grid_x =
+        row_tiles * static_cast<std::int64_t>(output_size_) * 32;
+    if (grid_x > std::numeric_limits<int>::max()) {
+        throw std::runtime_error(
+            "NINT8-0 grouped-row Metal grid exceeds MLX limits");
+    }
+
+    std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
+        templates{
+            {"T", source.dtype()},
+            {"M", static_cast<int>(rows)},
+            {"TILE_M", tile_rows},
+            {"GROUP_COUNT", group_count},
+            {"OUT_PER_GROUP", out_per_group},
+            {"OUT", output_size_},
+            {"K", input_size_},
+            {"NG", groups_},
+        };
+    const int threadgroup = static_cast<int>(
+        std::min<std::int64_t>(256, grid_x));
+    auto outputs = grouped_row_kernel()(
+        {q_, scales_, source},
+        {
+            Shape{
+                static_cast<std::int32_t>(rows),
+                output_size_,
+            },
+        },
+        {source.dtype()},
+        {static_cast<int>(grid_x), 1, 1},
+        {threadgroup, 1, 1},
         std::move(templates),
         std::nullopt,
         false,
