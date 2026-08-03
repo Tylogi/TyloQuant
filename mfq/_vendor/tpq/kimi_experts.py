@@ -277,6 +277,15 @@ class PackedExpertPool:
             and os.environ.get("TPQ_TP_HIDDEN", "0") != "0"
             and os.environ.get("TPQ_TP_NO_OWNER", "1") != "0"
         )
+        self._peer_access = all(
+            left == right
+            or torch.cuda.can_device_access_peer(
+                int(devices[left].index),
+                int(devices[right].index),
+            )
+            for left in range(len(devices))
+            for right in range(len(devices))
+        )
         if parallelism == "tensor":
             tensor_group_size = len(devices)
         elif parallelism == "hybrid":
@@ -315,6 +324,7 @@ class PackedExpertPool:
         self._streams: list[torch.cuda.Stream] = []
         self._source_events: list[torch.cuda.Event] = []
         self._done_events: list[list[torch.cuda.Event]] = []
+        self._prefill_ready_events: list[list[torch.cuda.Event]] = []
         self._output_events: list[list[torch.cuda.Event]] = []
         self._routed_inputs: list[torch.Tensor] = []
         self._routed_ids: list[torch.Tensor] = []
@@ -328,6 +338,15 @@ class PackedExpertPool:
         self._graphs: dict[int, list[torch.cuda.CUDAGraph]] = {}
         self._graph_batches: dict[int, object] = {}
         self._graph_rank_order: dict[int, tuple[int, ...]] = {}
+        self._prefill_graphs: dict[
+            int, list[torch.cuda.CUDAGraph]
+        ] = {}
+        self._prefill_graph_batches: dict[int, object] = {}
+        self._prefill_graph_rank_order: dict[int, tuple[int, ...]] = {}
+        self._prefill_metadata_directories: dict[int, tuple] = {}
+        self._prefill_selected_metadata: dict[int, tuple] = {}
+        self._prefill_slot_ids: dict[int, tuple] = {}
+        self._prefill_hit_masks: dict[int, tuple] = {}
         self._output_replicas: dict[int, list[torch.Tensor]] = {}
         self._route_graphs: dict[
             int, tuple[torch.cuda.CUDAGraph, ...]
@@ -881,6 +900,13 @@ class PackedExpertPool:
                 ]
                 for _ in self.devices
             ]
+            self._prefill_ready_events = [
+                [
+                    torch.cuda.Event()
+                    for _ in range(int(self.store.cfg["n_layers"]))
+                ]
+                for _ in self.devices
+            ]
             self._output_events = [
                 [
                     torch.cuda.Event()
@@ -895,6 +921,8 @@ class PackedExpertPool:
             for rank, events in enumerate(self._done_events):
                 with torch.cuda.device(self.devices[rank]):
                     for event in events:
+                        event.cuda_event
+                    for event in self._prefill_ready_events[rank]:
                         event.cuda_event
                     for event in self._output_events[rank]:
                         event.record(
@@ -1153,6 +1181,149 @@ class PackedExpertPool:
             f"{time.time() - started:.1f}s",
             flush=True,
         )
+
+    def _prepare_prefill_expert_graph(
+        self,
+        layer: int,
+        *,
+        activation: str,
+        activation_beta: float,
+        activation_linear_beta: float,
+        activation_limit: float,
+    ) -> None:
+        """Capture owner-published graphs used by batched prefill.
+
+        Hidden-mode graphs consume fixed all-rank decode buffers.  Prefill
+        enters through :meth:`run` and publishes one routed row from the
+        layer owner, so it needs a distinct graph set even when full-TP
+        decode is enabled.
+        """
+        from .fusedext import (
+            expert_dispatch_pack_fused,
+            make_tp_graph_launch_batch,
+            tp_peer_copy_fused,
+        )
+        from .ops import packed_moe_topk, packed_route_slots
+
+        owner = self.plan.owner_by_layer[layer]
+        owner_device = self.devices[owner]
+        local_layer = layer - self.plan.ranges[owner][0]
+        rank_order = (
+            owner,
+            *(rank for rank in range(len(self.devices)) if rank != owner),
+        )
+        top_k = int(self.store.cfg["top_k"])
+        metadata_directories = tuple(
+            metadata.t().contiguous()
+            for metadata in self._metadata[layer]
+        )
+        selected_metadata = tuple(
+            torch.empty(
+                metadata.shape[0],
+                top_k,
+                dtype=torch.long,
+                device=self.devices[rank],
+            )
+            for rank, metadata in enumerate(self._metadata[layer])
+        )
+        slot_ids = tuple(
+            torch.arange(
+                top_k,
+                dtype=torch.long,
+                device=device,
+            )
+            for device in self.devices
+        )
+        hit_masks = tuple(
+            torch.empty(top_k, dtype=torch.bool, device=device)
+            for device in self.devices
+        )
+        self._prefill_metadata_directories[layer] = metadata_directories
+        self._prefill_selected_metadata[layer] = selected_metadata
+        self._prefill_slot_ids[layer] = slot_ids
+        self._prefill_hit_masks[layer] = hit_masks
+        graphs: list[torch.cuda.CUDAGraph] = []
+        for rank in rank_order:
+            device = self.devices[rank]
+            stream = self._streams[rank]
+            hidden, output, local_result = self._workspaces[rank]
+            with torch.cuda.device(device):
+                self._routed_inputs[rank].zero_()
+                self._routed_ids[rank].copy_(
+                    self._source_ids[owner], non_blocking=False
+                )
+                self._routed_weights[rank].fill_(
+                    0.0
+                )
+                self._routed_weights[rank].copy_(
+                    self._source_weights[owner], non_blocking=False
+                )
+
+            def launch_rank(rank_index: int = rank) -> None:
+                hidden.zero_()
+                output.zero_()
+                local_result.zero_()
+                if not packed_route_slots(
+                    self._routed_ids[rank_index],
+                    metadata_directories[rank_index],
+                    output=selected_metadata[rank_index],
+                    hit_mask=hit_masks[rank_index],
+                ):
+                    raise RuntimeError(
+                        "packed MoE prefill route-slot gather was rejected"
+                    )
+                packed_moe_topk(
+                    self._routed_inputs[rank_index],
+                    slot_ids[rank_index],
+                    self._routed_weights[rank_index],
+                    selected_metadata[rank_index],
+                    activation=activation,
+                    activation_beta=activation_beta,
+                    activation_linear_beta=activation_linear_beta,
+                    limit=activation_limit,
+                    hidden_workspace=hidden,
+                    output_workspace=output,
+                    result=local_result,
+                    grouped_prefix=-1,
+                    **self.store.man.projection_operator_capability(layer),
+                )
+
+            with torch.cuda.device(device), torch.cuda.stream(stream):
+                launch_rank()
+                stream.synchronize()
+                graph = torch.cuda.CUDAGraph(keep_graph=True)
+                with torch.cuda.graph(graph, stream=stream):
+                    launch_rank()
+                graph.instantiate()
+                graphs.append(graph)
+        for device in self.devices:
+            torch.cuda.synchronize(device)
+        ordered_streams = [self._streams[rank] for rank in rank_order]
+        ordered_events = [
+            self._done_events[rank][layer] for rank in rank_order
+        ]
+        for rank in rank_order:
+            stream = self._streams[rank]
+            with (
+                torch.cuda.device(self.devices[rank]),
+                torch.cuda.stream(stream),
+            ):
+                self._done_events[rank][layer].record(stream)
+                stream.synchronize()
+        with torch.cuda.device(owner_device):
+            self._source_events[layer].record(
+                torch.cuda.current_stream(owner_device)
+            )
+            torch.cuda.synchronize(owner_device)
+            self._prefill_graphs[layer] = graphs
+            self._prefill_graph_rank_order[layer] = rank_order
+            self._prefill_graph_batches[layer] = make_tp_graph_launch_batch(
+                [int(self.devices[rank].index) for rank in rank_order],
+                graphs,
+                ordered_streams,
+                ordered_events,
+                self._source_events[layer],
+            )
 
     def compose_route_topk(
         self,
@@ -1427,7 +1598,43 @@ class PackedExpertPool:
 
         owner = self.plan.owner_by_layer[layer]
         owner_device = self.devices[owner]
-        graph_batch = self._graph_batches.get(layer)
+        if self.hidden_mode and layer not in self._prefill_graph_batches:
+            from .fusedext import expert_dispatch_pack_fused
+
+            # The prefill graph indirectly consumes the routed projection
+            # metadata selected by the current expert IDs.  Capturing it at
+            # pool construction time uses uninitialised route buffers and can
+            # preserve an invalid first execution on multi-device CUDA graph
+            # replay.  Publish the first real row before the one-time capture.
+            with torch.cuda.device(owner_device):
+                if not expert_dispatch_pack_fused(
+                    value,
+                    route_ids.reshape(-1),
+                    route_weights.reshape(-1),
+                    self._source_inputs[owner],
+                    self._source_ids[owner],
+                    self._source_weights[owner],
+                ):
+                    raise RuntimeError(
+                        "packed MoE source publication was rejected"
+                    )
+                torch.cuda.current_stream(owner_device).synchronize()
+            self._prepare_prefill_expert_graph(
+                layer,
+                activation=activation,
+                activation_beta=float(activation_beta),
+                activation_linear_beta=(
+                    0.0
+                    if activation_linear_beta is None
+                    else float(activation_linear_beta)
+                ),
+                activation_limit=float(limit),
+            )
+        graph_batch = (
+            self._prefill_graph_batches.get(layer)
+            if self.hidden_mode
+            else self._graph_batches.get(layer)
+        )
         if graph_batch is not None:
             from .fusedext import expert_dispatch_pack_fused
 
@@ -1445,15 +1652,103 @@ class PackedExpertPool:
                     raise RuntimeError(
                         "packed MoE source publication was rejected"
                     )
-                rank_order = self._graph_rank_order[layer]
+                self._source_events[layer].record(
+                    torch.cuda.current_stream(owner_device)
+                )
+                rank_order = (
+                    self._prefill_graph_rank_order[layer]
+                    if self.hidden_mode
+                    else self._graph_rank_order[layer]
+                )
                 contributions = [
                     self._return_buffers[owner][rank, local_layer]
                     for rank in rank_order
                 ]
-                reduced = graph_batch.launch_reduce(
-                    contributions,
-                    self._zero_buffers[owner],
-                )
+                if self.hidden_mode:
+                    source_ready = self._source_events[layer]
+                    for rank, device in enumerate(self.devices):
+                        stream = self._streams[rank]
+                        with (
+                            torch.cuda.device(device),
+                            torch.cuda.stream(stream),
+                        ):
+                            stream.wait_event(source_ready)
+                            self._routed_inputs[rank].copy_(
+                                self._source_inputs[owner],
+                                non_blocking=True,
+                            )
+                            self._routed_ids[rank].copy_(
+                                self._source_ids[owner],
+                                non_blocking=True,
+                            )
+                            self._routed_weights[rank].copy_(
+                                self._source_weights[owner],
+                                non_blocking=True,
+                            )
+                            self._prefill_ready_events[rank][layer].record(
+                                stream
+                            )
+                    graph_batch.launch_from_events(
+                        [
+                            self._prefill_ready_events[rank][
+                                layer
+                            ].cuda_event
+                            for rank in range(len(self.devices))
+                        ]
+                    )
+                    reduced = self._reduce_buffers[owner][local_layer]
+                    if self._peer_access:
+                        for rank, device in enumerate(self.devices):
+                            stream = self._streams[rank]
+                            with (
+                                torch.cuda.device(device),
+                                torch.cuda.stream(stream),
+                            ):
+                                stream.wait_event(
+                                    self._done_events[rank][layer]
+                                )
+                                self._return_buffers[owner][
+                                    rank, local_layer
+                                ].copy_(
+                                    self._workspaces[rank][2],
+                                    non_blocking=True,
+                                )
+                                self._done_events[rank][layer].record(stream)
+                        owner_stream = torch.cuda.current_stream(owner_device)
+                        for rank in range(len(self.devices)):
+                            owner_stream.wait_event(
+                                self._done_events[rank][layer]
+                            )
+                        reduced.copy_(contributions[0])
+                        for rank in range(1, len(contributions)):
+                            reduced.add_(contributions[rank])
+                    else:
+                        partials = [
+                            self._workspaces[rank][2]
+                            for rank in range(len(self.devices))
+                        ]
+                        if not torch.cuda.nccl.is_available(partials):
+                            raise RuntimeError(
+                                "packed MoE TP requires CUDA P2P or NCCL"
+                            )
+                        torch.cuda.nccl.all_reduce(
+                            partials,
+                            streams=self._streams,
+                        )
+                        for rank, device in enumerate(self.devices):
+                            with torch.cuda.device(device):
+                                self._done_events[rank][layer].record(
+                                    self._streams[rank]
+                                )
+                        torch.cuda.current_stream(owner_device).wait_event(
+                            self._done_events[owner][layer]
+                        )
+                        reduced.copy_(partials[owner])
+                else:
+                    reduced = graph_batch.launch_reduce(
+                        contributions,
+                        self._zero_buffers[owner],
+                    )
             self.hits += route_ids.numel()
             return reduced
 
@@ -1501,14 +1796,40 @@ class PackedExpertPool:
                     ),
                     limit=float(limit),
                 )
-                self._return_buffers[owner][
-                    rank, local_layer
-                ].copy_(
-                    partial,
-                    non_blocking=True,
-                )
+                if self._peer_access:
+                    self._return_buffers[owner][
+                        rank, local_layer
+                    ].copy_(
+                        partial,
+                        non_blocking=True,
+                    )
                 self._done_events[rank][layer].record(stream)
         self.hits += route_ids.numel()
+        if not self._peer_access:
+            partials = [
+                self._workspaces[rank][2]
+                for rank in range(len(self.devices))
+            ]
+            if not torch.cuda.nccl.is_available(partials):
+                raise RuntimeError(
+                    "packed MoE TP requires CUDA P2P or NCCL"
+                )
+            torch.cuda.nccl.all_reduce(
+                partials,
+                streams=self._streams,
+            )
+            for rank, device in enumerate(self.devices):
+                with torch.cuda.device(device):
+                    self._done_events[rank][layer].record(
+                        self._streams[rank]
+                    )
+            with torch.cuda.device(owner_device):
+                torch.cuda.current_stream(owner_device).wait_event(
+                    self._done_events[owner][layer]
+                )
+                reduced = self._reduce_buffers[owner][local_layer]
+                reduced.copy_(partials[owner])
+            return reduced
         with torch.cuda.device(owner_device):
             owner_stream = torch.cuda.current_stream(owner_device)
             for rank in range(len(self.devices)):

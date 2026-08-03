@@ -519,10 +519,8 @@ class BlockFP8Weight:
             )
         first_block = r0 // self.block
         last_block = (r1 + self.block - 1) // self.block
-        scale_rows = self.s[first_block:last_block].repeat_interleave(
-            self.block,
-            dim=0,
-        )
+        scale_rows = self.s[first_block:last_block].to(dtype)
+        scale_rows = scale_rows.repeat_interleave(self.block, dim=0)
         offset = r0 - first_block * self.block
         scale_rows = scale_rows[offset : offset + (r1 - r0)]
         scales = scale_rows.repeat_interleave(
@@ -530,7 +528,8 @@ class BlockFP8Weight:
             dim=1,
         )[:, : self.cols]
         values = self.q[r0:r1].view(torch.float8_e4m3fn).to(dtype)
-        return values * scales.to(dtype)
+        values.mul_(scales)
+        return values
 
     def matmul_T(
         self,
@@ -560,14 +559,16 @@ class BlockFP8Weight:
         out = torch.empty(
             x.shape[0],
             rows,
-            dtype=torch.float32,
+            dtype=dtype,
             device=x.device,
         )
         for r0 in range(0, rows, chunk):
             r1 = min(r0 + chunk, rows)
-            out[:, r0:r1] = (
-                x_compute @ self.dequant_rows(r0, r1, dtype).t()
-            ).float()
+            torch.mm(
+                x_compute,
+                self.dequant_rows(r0, r1, dtype).t(),
+                out=out[:, r0:r1],
+            )
         return out
 
     def matmul_T_decode_fused(

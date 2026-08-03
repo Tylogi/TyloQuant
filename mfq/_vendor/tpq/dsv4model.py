@@ -193,17 +193,27 @@ def _o_proj_tpq(o: torch.Tensor, w: dict, cfg) -> torch.Tensor:
         # only the token-sized LoRA result is concatenated.
         from .ops import linear
 
-        groups = []
+        projected = None
         for group in range(G):
             compact = wo_a.row_view(
                 group * rank,
                 (group + 1) * rank,
             )
             value = o[:, :, group].reshape(-1, o.shape[-1])
-            groups.append(
-                linear(value, compact).view(B, T, rank)
+            group_value = linear(value, compact).view(B, T, rank)
+            if projected is None:
+                projected = torch.empty(
+                    B,
+                    T,
+                    G * rank,
+                    device=group_value.device,
+                    dtype=group_value.dtype,
+                )
+            projected[:, :, group * rank:(group + 1) * rank].copy_(
+                group_value
             )
-        return _tpq_lin(torch.cat(groups, dim=-1), w["wo_b"])
+        del o, value, compact, group_value
+        return _tpq_lin(projected, w["wo_b"])
     if not o.is_cuda and B * T == 1:
         wo_b = w["wo_b"]
         if isinstance(wo_b, Int4Weight):
@@ -1498,6 +1508,12 @@ class DSV4TPQModel:
         h = self._embed(t).unsqueeze(2).repeat(1, 1, cfg.hc_mult, 1)
         for i in range(cfg.n_layers):
             h = self._block(h, i, t, 0)
+            if self._tp_attention_contexts is not None:
+                self._layers.pop(i, None)
+                prefix = f"layers.{i}."
+                for name in tuple(self._w):
+                    if name.startswith(prefix):
+                        self._w.pop(name, None)
         y = hc_head(h, *self._hc_head_w(), cfg)
         y = rmsnorm(y, self.w("norm.weight"), cfg.rms_eps)
         self.pos = len(ids)
@@ -2354,6 +2370,7 @@ class DSV4TPQModel:
                     B, T, 0, dtype=torch.bool, device=dev
                 )
 
+        deferred_selected_positions = None
         if direct_compressed_prefix:
             selected_values = (
                 st["compressed"]
@@ -2362,9 +2379,13 @@ class DSV4TPQModel:
                 .to(q.dtype)
             )
         elif selected_positions is not None and selected_positions.numel():
-            selected_values = st["compressed"].gather_batched(
-                selected_positions.clamp_min(0)
-            ).to(q.dtype)
+            if T > 1:
+                deferred_selected_positions = selected_positions
+                selected_values = None
+            else:
+                selected_values = st["compressed"].gather_batched(
+                    selected_positions.clamp_min(0)
+                ).to(q.dtype)
         elif single_main_decode:
             selected_values = st["kv"][:, :0].unsqueeze(1)
         else:
@@ -2432,10 +2453,15 @@ class DSV4TPQModel:
                 )
 
         if selected_valid is None:
+            selected_width = (
+                deferred_selected_positions.shape[2]
+                if deferred_selected_positions is not None
+                else selected_values.shape[2]
+            )
             selected_valid = torch.ones(
                 B,
                 1,
-                selected_values.shape[2],
+                selected_width,
                 device=dev,
                 dtype=torch.bool,
             )
@@ -2448,43 +2474,163 @@ class DSV4TPQModel:
         if T == 1:
             raw_values = st["kv"]
             raw_positions = st["win_pos"]
-        raw_scores = torch.einsum(
-            "bthd,bsd->bhts", q * scale, raw_values
-        )
-        raw_allow = (
-            (raw_positions.unsqueeze(1) >= 0)
-            & (raw_positions.unsqueeze(1) <= poss.view(1, T, 1))
-            & (raw_positions.unsqueeze(1) > poss.view(1, T, 1) - win)
-        )
-        raw_scores = raw_scores.masked_fill(
-            ~raw_allow.unsqueeze(1), float("-inf")
-        )
-        if selected_values.shape[2]:
-            compressed_scores = torch.einsum(
-                "bthd,btkd->bhtk", q * scale, selected_values
-            ).masked_fill(~selected_valid.unsqueeze(1), float("-inf"))
-        else:
-            compressed_scores = torch.empty(
-                B, H, T, 0, device=dev, dtype=q.dtype
-            )
-
-        scores = torch.cat([raw_scores, compressed_scores], dim=-1).float()
-        m = scores.amax(dim=-1)
-        e = (scores - m.unsqueeze(-1)).exp()
-        denom = e.sum(dim=-1) + (w["attn_sink"].view(1, -1, 1) - m).exp()
-        probs = (
-            e / denom.unsqueeze(-1)
-        ).to(raw_values.dtype)
         raw_width = raw_values.shape[1]
-        o = torch.einsum(
-            "bhts,bsd->bthd", probs[..., :raw_width], raw_values
+        compressed_width = (
+            deferred_selected_positions.shape[2]
+            if deferred_selected_positions is not None
+            else selected_values.shape[2]
         )
-        if selected_values.shape[2]:
-            o += torch.einsum(
-                "bhtk,btkd->bthd", probs[..., raw_width:], selected_values
+        requested_query_block = int(
+            os.environ.get("TPQ_PREFILL_QUERY_BLOCK", "0")
+        )
+        if requested_query_block > 0:
+            query_block = min(T, requested_query_block)
+        elif q.is_cuda and T > 1:
+            free_bytes, _ = torch.cuda.mem_get_info(q.device)
+            allocator_headroom = max(
+                0,
+                torch.cuda.memory_reserved(q.device)
+                - torch.cuda.memory_allocated(q.device),
+            )
+            usable_headroom = free_bytes + allocator_headroom
+            workspace_budget = min(
+                512 << 20,
+                max(32 << 20, int(usable_headroom * 0.45)),
+            )
+            score_elements_per_query = max(
+                1, B * H * (raw_width + compressed_width)
+            )
+            # During softmax, the half score inputs, FP32 score/exp tensors,
+            # masks and probability tensor coexist.  Fourteen bytes per score
+            # is a conservative bound that keeps the packed expert arena and
+            # dense TP weights resident during long prefill.
+            query_block = max(
+                1,
+                min(
+                    T,
+                    workspace_budget // (14 * score_elements_per_query),
+                ),
+            )
+            if query_block >= 32:
+                query_block = (query_block // 32) * 32
+        else:
+            query_block = T
+
+        # Each query slice is dead once its attention result has been
+        # computed, and the result has the identical shape/dtype.  Reuse the
+        # Q storage instead of allocating another full [B,T,H,hd] buffer.
+        o = q
+        sink = w["attn_sink"].view(1, -1, 1)
+        for query_begin in range(0, T, query_block):
+            query_end = min(T, query_begin + query_block)
+            query = q[:, query_begin:query_end] * scale
+            query_positions = poss[query_begin:query_end]
+            raw_scores = torch.einsum(
+                "bthd,bsd->bhts", query, raw_values
+            )
+            raw_allow = (
+                (raw_positions.unsqueeze(1) >= 0)
+                & (
+                    raw_positions.unsqueeze(1)
+                    <= query_positions.view(1, -1, 1)
+                )
+                & (
+                    raw_positions.unsqueeze(1)
+                    > query_positions.view(1, -1, 1) - win
+                )
+            )
+            raw_scores = raw_scores.masked_fill(
+                ~raw_allow.unsqueeze(1), float("-inf")
+            )
+            if compressed_width:
+                selected_query = (
+                    st["compressed"].gather_batched(
+                        deferred_selected_positions[
+                            :, query_begin:query_end
+                        ].clamp_min(0)
+                    ).to(q.dtype)
+                    if deferred_selected_positions is not None
+                    else selected_values[:, query_begin:query_end]
+                )
+                valid_query = (
+                    selected_valid
+                    if selected_valid.shape[1] == 1
+                    else selected_valid[:, query_begin:query_end]
+                )
+                compressed_scores = torch.einsum(
+                    "bthd,btkd->bhtk", query, selected_query
+                ).masked_fill(~valid_query.unsqueeze(1), float("-inf"))
+            else:
+                selected_query = torch.empty(
+                    B,
+                    query_end - query_begin,
+                    0,
+                    hd,
+                    device=dev,
+                    dtype=q.dtype,
+                )
+                compressed_scores = torch.empty(
+                    B,
+                    H,
+                    query_end - query_begin,
+                    0,
+                    device=dev,
+                    dtype=q.dtype,
+                )
+
+            scores = torch.cat(
+                [raw_scores, compressed_scores], dim=-1
+            ).float()
+            maximum = scores.amax(dim=-1)
+            exponentials = (scores - maximum.unsqueeze(-1)).exp()
+            denominator = exponentials.sum(dim=-1) + (
+                sink - maximum
+            ).exp()
+            probabilities = (
+                exponentials / denominator.unsqueeze(-1)
+            ).to(raw_values.dtype)
+            output = torch.einsum(
+                "bhts,bsd->bthd",
+                probabilities[..., :raw_width],
+                raw_values,
+            )
+            if compressed_width:
+                output += torch.einsum(
+                    "bhtk,btkd->bthd",
+                    probabilities[..., raw_width:],
+                    selected_query,
+                )
+            o[:, query_begin:query_end].copy_(output)
+            del selected_query
+            if compressed_width:
+                del valid_query
+            del (
+                query,
+                query_positions,
+                raw_scores,
+                raw_allow,
+                compressed_scores,
+                scores,
+                maximum,
+                exponentials,
+                denominator,
+                probabilities,
+                output,
             )
         o[..., hd - rd:] = rope_apply(
             o[..., hd - rd:], out_cos, out_sin, inverse=True
+        )
+        del (
+            q,
+            kv,
+            raw_values,
+            raw_positions,
+            selected_positions,
+            selected_valid,
+            deferred_selected_positions,
+            selected_values,
+            out_cos,
+            out_sin,
         )
         return _d._o_proj_hook(o.flatten(2), w, cfg)
 

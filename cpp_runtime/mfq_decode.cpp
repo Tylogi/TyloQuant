@@ -273,6 +273,14 @@ torch::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
     bool input_quantized, torch::Tensor out, torch::Tensor qx,
     torch::Tensor xscale, torch::Tensor ids_dst, torch::Tensor expert_bounds,
     torch::Tensor tile_bounds, torch::Tensor tile_experts);
+torch::Tensor nvq_moe_grouped_matmul_pool_f16_cuda(
+    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
+    torch::Tensor neuron_scale, torch::Tensor codebook, torch::Tensor x,
+    torch::Tensor expert_local, int64_t n_experts, int64_t pool_experts,
+    int64_t out_per_expert, int64_t neuron_len, int64_t gs,
+    int64_t sub_bits, int64_t format, int64_t sign_mode,
+    torch::Tensor out, torch::Tensor ids_dst, torch::Tensor expert_bounds,
+    torch::Tensor tile_bounds, torch::Tensor tile_experts);
 torch::Tensor nepq_moe_grouped_matmul_pool_ws_cuda(
     torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
     torch::Tensor neuron_scale, torch::Tensor table_pool, torch::Tensor bank_ids,
@@ -281,6 +289,14 @@ torch::Tensor nepq_moe_grouped_matmul_pool_ws_cuda(
     int64_t out_per_expert, int64_t neuron_len, int64_t sub_bits, int64_t format,
     bool input_quantized, torch::Tensor out, torch::Tensor qx,
     torch::Tensor xscale, torch::Tensor ids_dst, torch::Tensor expert_bounds,
+    torch::Tensor tile_bounds, torch::Tensor tile_experts);
+torch::Tensor nepq_moe_grouped_matmul_pool_f16_cuda(
+    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
+    torch::Tensor neuron_scale, torch::Tensor table_pool,
+    torch::Tensor bank_ids, torch::Tensor x, torch::Tensor expert_local,
+    int64_t n_experts, int64_t pool_experts, int64_t out_per_expert,
+    int64_t neuron_len, int64_t sub_bits, int64_t format,
+    torch::Tensor out, torch::Tensor ids_dst, torch::Tensor expert_bounds,
     torch::Tensor tile_bounds, torch::Tensor tile_experts);
 torch::Tensor nepq_hadamard_input_cuda(
     torch::Tensor input, torch::Tensor signs, int64_t block_size);
@@ -490,6 +506,11 @@ torch::Tensor nvq_dequant_cuda(
     torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
     torch::Tensor neuron_scale, torch::Tensor codebook,
     int64_t neuron_len, int64_t gs, int64_t sub_bits, int64_t format, int64_t sign_mode);
+torch::Tensor nepq_dequant_cuda(
+    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
+    torch::Tensor neuron_scale, torch::Tensor table_pool,
+    torch::Tensor bank_ids, int64_t neuron_len,
+    int64_t sub_bits, int64_t format);
 torch::Tensor nvq_gemm_f16_cuda(
     torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
     torch::Tensor neuron_scale, torch::Tensor codebook, torch::Tensor x,
@@ -4203,11 +4224,6 @@ struct MixedMoeRuntime {
     }
 
     torch::Tensor forward(torch::Tensor x, const MoeRoutePlan & route) const {
-        if (g_kl_mmq_mode != KlMmqMode::Default) {
-            ++g_kl_mmq_fallback_calls;
-            throw std::runtime_error(
-                "KLD common MMQ does not support mixed-family routed pools");
-        }
         if (!x.is_cuda() || !x.is_contiguous() ||
             x.scalar_type() != torch::kFloat16 ||
             (x.dim() != 2 && x.dim() != 3) || x.size(-1) != neuron_len) {
@@ -4243,6 +4259,12 @@ struct MixedMoeRuntime {
             !disable_prefill_mma && !g_force_moe_prefill_mma_off &&
             tokens >= prefill_mma_min_tokens && route.map_ready &&
             route.ids_dst.numel() == route.ids.numel();
+        const bool use_kl_mmq = g_kl_mmq_mode != KlMmqMode::Default;
+        if (use_kl_mmq) {
+            TORCH_CHECK(
+                route.map_ready && route.ids_dst.numel() == route.ids.numel(),
+                "KLD mixed routed FP16 requires the compact route map");
+        }
 
         for (const auto & pool : pools) {
             int gs = 24;
@@ -4278,6 +4300,37 @@ struct MixedMoeRuntime {
                         value = found->second;
                     }
                 }
+            }
+            if (use_kl_mmq) {
+                value = kl_mmq_prepare_activation(value);
+                ++g_kl_mmq_moe_calls;
+                if (pool.family == MixedMoeFamily::Nvq) {
+                    nvq_moe_grouped_matmul_pool_f16_cuda(
+                        pool.nvq.indices_packed, pool.nvq.aux_packed,
+                        pool.nvq.sub_scale_packed, pool.nvq.neuron_scale,
+                        pool.nvq.codebook, value, pool.expert_local,
+                        n_experts, pool.local_experts, out_per_expert,
+                        neuron_len, pool.nvq.gs, pool.nvq.sub_bits,
+                        pool.nvq.kernel_format, pool.nvq.sign_mode, output,
+                        route.ids_dst, route.expert_bounds,
+                        route.tile_bounds, route.tile_experts);
+                    continue;
+                }
+                if (pool.family == MixedMoeFamily::Nepq) {
+                    nepq_moe_grouped_matmul_pool_f16_cuda(
+                        pool.nepq.indices_packed, pool.nepq.aux_packed,
+                        pool.nepq.state_packed, pool.nepq.neuron_scale,
+                        pool.nepq.table_pool, pool.nepq.bank_ids, value,
+                        pool.expert_local, n_experts, pool.local_experts,
+                        out_per_expert, neuron_len, pool.nepq.state_bits,
+                        pool.nepq.format, output, route.ids_dst,
+                        route.expert_bounds, route.tile_bounds,
+                        route.tile_experts);
+                    continue;
+                }
+                ++g_kl_mmq_fallback_calls;
+                throw std::runtime_error(
+                    "KLD mixed routed FP16 encountered a non-VQ pool");
             }
             MixedMoeActivationKey activation_key{
                 input_rows, groups, gs, x.get_device(), transform};
@@ -6819,25 +6872,35 @@ static torch::Tensor nint_matmul(const NintWeight & w, torch::Tensor x) {
     x = pad_last(x, w.neuron_len);
     int M = (int)x.size(0);
     if (g_kl_mmq_mode != KlMmqMode::Default) {
-        TORCH_CHECK(
-            M >= 16,
-            "KLD common MMQ requires at least 16 activation rows");
+        const int original_m = M;
+        TORCH_CHECK(original_m > 0, "KLD common MMQ requires activation rows");
+        if (M < 16) {
+            auto padding = torch::zeros(
+                {16 - M, x.size(1)}, x.options());
+            x = torch::cat({x, padding}, 0).contiguous();
+            M = 16;
+        }
         TORCH_CHECK(
             !w.q5_exec,
             "KLD common MMQ requires original NINT5 packed weights");
         x = kl_mmq_prepare_activation(x);
         ++g_kl_mmq_dense_calls;
+        torch::Tensor result;
         if (w.q8_zero) {
-            return g_profiler.measure("kld_mmq.nint8_zero.fp16", [&]() {
+            result = g_profiler.measure("kld_mmq.nint8_zero.fp16", [&]() {
                 return nint8_zero_mmq_f16_packed_cuda(
                     w.q_packed, w.q8_zero_scale, x, w.neuron_len);
             });
+        } else {
+            result = g_profiler.measure("kld_mmq.nint.fp16", [&]() {
+                return nint_mmq_f16_packed_cuda(
+                    w.q_packed, w.sub_scale, w.sub_min,
+                    w.neuron_scale, w.neuron_min, x, w.gs, w.bits);
+            });
         }
-        return g_profiler.measure("kld_mmq.nint.fp16", [&]() {
-            return nint_mmq_f16_packed_cuda(
-                w.q_packed, w.sub_scale, w.sub_min,
-                w.neuron_scale, w.neuron_min, x, w.gs, w.bits);
-        });
+        return original_m < 16
+            ? result.index({Slice(0, original_m)}).contiguous()
+            : result;
     }
     if (w.q8_zero) {
         Workspace & ws = w.workspace(M);
@@ -8197,9 +8260,41 @@ static torch::Tensor dequant_nint_dense_f32(const NintWeight & w) {
 }
 
 static torch::Tensor dequant_quant_linear_f32(const QuantLinear & linear) {
-    return linear.is_nint
-        ? dequant_nint_dense_f32(linear.nint.w)
-        : nvq_dequant(linear.nvq.w).to(torch::kFloat32).contiguous();
+    if (!linear.tensor_parallel()) {
+        return linear.is_nint
+            ? dequant_nint_dense_f32(linear.nint.w)
+            : nvq_dequant(linear.nvq.w)
+                .to(torch::kFloat32).contiguous();
+    }
+    if (linear.tensor_parallel_axis != TensorParallelAxis::Output &&
+        linear.tensor_parallel_axis != TensorParallelAxis::Input) {
+        throw std::runtime_error(
+            "cannot reconstruct a mirrored tensor-parallel linear");
+    }
+    const int primary = g_tensor_parallel.primary_device();
+    std::vector<torch::Tensor> parts;
+    parts.reserve(linear.tensor_parallel_shards.size());
+    for (const auto & shard : linear.tensor_parallel_shards) {
+        c10::cuda::CUDAGuard shard_guard(shard.device);
+        auto part = shard.is_nint
+            ? dequant_nint_dense_f32(shard.nint)
+            : nvq_dequant(shard.nvq)
+                .to(torch::kFloat32).contiguous();
+        parts.push_back(
+            tensor_to_cuda_device(part, primary)
+                .to(torch::kFloat32).contiguous());
+    }
+    c10::cuda::CUDAGuard primary_guard(primary);
+    auto dense = torch::cat(
+        parts,
+        linear.tensor_parallel_axis == TensorParallelAxis::Output
+            ? 0 : 1).contiguous();
+    if (dense.size(0) != linear.out() ||
+        dense.size(1) != linear.neuron_len()) {
+        throw std::runtime_error(
+            "reconstructed tensor-parallel linear shape mismatch");
+    }
+    return dense;
 }
 
 static DenseLinearGroup make_fp32_quant_group(QuantLinearGroup group) {
@@ -14947,29 +15042,20 @@ static int run_nintm_tensor_check(
     double dense_reference_max_abs = -1.0;
     if (split_width == 0) {
         auto cpu_reference = unpack_nint_moe(mfq.read_blob(tensor_name));
-        const bool q8_zero_only = std::all_of(
-            cpu_reference.pools.begin(), cpu_reference.pools.end(),
-            [](const NintMoeCpuPool & pool) {
-                return pool.dtype == "NINT8-0";
-            });
-        const bool nint_only = std::all_of(
-            cpu_reference.pools.begin(), cpu_reference.pools.end(),
-            [](const NintMoeCpuPool & pool) {
-                return pool.dtype != "NINT8-0" &&
-                    pool.dtype.rfind("NINT", 0) == 0;
-            });
-        if (q8_zero_only || nint_only) {
         auto reference = torch::empty(
             {tokens * routes, weight.out_per_expert},
             output.options().dtype(torch::kFloat16));
         for (const auto & pool : cpu_reference.pools) {
             torch::Tensor dense_flat;
-            if (q8_zero_only) {
+            int rotation_block = 0;
+            torch::Tensor rotation_signs;
+            if (pool.dtype == "NINT8-0") {
                 auto packed = to_gpu_nint8_zero(pool.q8_zero);
                 dense_flat = nint8_zero_dequant_cuda(
                     packed.q_packed, packed.q8_zero_scale,
                     packed.neuron_len);
-            } else {
+            } else if (pool.dtype != "NINTM" &&
+                       pool.dtype.rfind("NINT", 0) == 0) {
                 auto packed = to_gpu_nint(pool.weight);
                 dense_flat = packed.bits == 4
                     ? nint_dequant_full_packed_compact_cuda(
@@ -14982,6 +15068,22 @@ static int run_nintm_tensor_check(
                           packed.sub_min, packed.neuron_scale,
                           packed.neuron_min, packed.neuron_len,
                           packed.gs, packed.bits);
+            } else if (pool.dtype.rfind("NEPQ", 0) == 0) {
+                auto parsed = unpack_nepq(
+                    pool.payload, pool.dtype, pool.runtime_payload);
+                auto packed = to_gpu_nepq(parsed);
+                dense_flat = nepq_dequant_cuda(
+                    packed.indices_packed, packed.aux_packed,
+                    packed.state_packed, packed.neuron_scale,
+                    packed.table_pool, packed.bank_ids,
+                    packed.neuron_len, packed.state_bits,
+                    packed.format);
+                rotation_block = packed.rotation_block;
+                rotation_signs = packed.rotation_signs;
+            } else {
+                auto packed = to_gpu_nvq(
+                    unpack_nvq(pool.payload, pool.dtype));
+                dense_flat = nvq_dequant(packed);
             }
             auto dense = dense_flat
                 .reshape({
@@ -15013,6 +15115,11 @@ static int run_nintm_tensor_check(
                     ? x.reshape({tokens * routes, weight.neuron_len})
                           .index_select(0, pair_index)
                     : x.index_select(0, token_index);
+                if (rotation_block != 0) {
+                    selected = nepq_hadamard_input_cuda(
+                        selected.contiguous(), rotation_signs,
+                        rotation_block);
+                }
                 auto expected = torch::matmul(
                     selected, dense.index({static_cast<int64_t>(local)})
                                   .transpose(0, 1));
@@ -15031,7 +15138,6 @@ static int run_nintm_tensor_check(
             difference.abs().mean().item<double>();
         dense_reference_max_abs =
             difference.abs().max().item<double>();
-        }
     }
     auto flat = output.to(torch::kFloat32).cpu().reshape({-1});
     if (!torch::isfinite(flat).all().item<bool>()) {
@@ -17240,6 +17346,8 @@ int main(int argc, char ** argv) {
             if (mfq_path.empty()) {
                 throw std::runtime_error("--check-nintm-tensor requires --mfq");
             }
+            KlMmqScope check_kl_mmq_scope(
+                parse_kl_mmq_mode(kl_mmq_arg));
             const auto tensor_names =
                 parse_tensor_names(check_nintm_tensor);
             if (g_moe_expert_cache &&
