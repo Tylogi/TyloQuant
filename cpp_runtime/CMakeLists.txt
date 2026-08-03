@@ -303,10 +303,12 @@ if(NOT APPLE)
     if(UNIX)
         get_filename_component(MFQ_PYTHON_SITE_PACKAGES
             "${Torch_DIR}/../../../.." ABSOLUTE)
-        find_file(MFQ_NCCL_LIBRARY
-            NAMES libnccl.so.2
-            PATHS "${MFQ_PYTHON_SITE_PACKAGES}/nvidia/nccl/lib"
-            NO_DEFAULT_PATH)
+        find_library(MFQ_NCCL_LIBRARY
+            NAMES nccl libnccl.so.2
+            HINTS "${MFQ_PYTHON_SITE_PACKAGES}/nvidia/nccl/lib")
+        find_path(MFQ_NCCL_INCLUDE_DIR
+            NAMES nccl.h
+            HINTS "${MFQ_PYTHON_SITE_PACKAGES}/nvidia/nccl/include")
     endif()
 
 add_executable(mfq-decode
@@ -353,8 +355,11 @@ target_link_libraries(mfq-decode PRIVATE
     CUDA::cublas
     mfq-server
 )
-if (MFQ_NCCL_LIBRARY)
+if (MFQ_NCCL_LIBRARY AND MFQ_NCCL_INCLUDE_DIR)
+    target_include_directories(mfq-decode PRIVATE
+        "${MFQ_NCCL_INCLUDE_DIR}")
     target_link_libraries(mfq-decode PRIVATE "${MFQ_NCCL_LIBRARY}")
+    target_compile_definitions(mfq-decode PRIVATE MFQ_HAVE_NCCL=1)
 endif()
 target_compile_definitions(mfq-decode PRIVATE
     NOMINMAX
