@@ -13,13 +13,28 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from mfq.formats.tpq import TpqInt4Tensor, pack_tpq_indices
-from mfq.formats.io import load_mmap
+from mfq.formats.io import BFloat16Array, load_mmap
 from mfq.formats.moe import NintMoeTensor
 from mfq.quantize.expert_nint import dequantize_expertwise
 from mfq.runtime.tpq import load_tpq_package, open_tpq_artifact
 from mfq.runtime.tpq_mfq import MfqTpqStore, install_mfq_tpq_store
 from mfq.tools.import_tpq_to_mfq import convert
 from mfq.tools.split_mfq import split_mfq
+
+
+def test_mfq_tpq_store_reinterprets_bfloat16_dense_bits() -> None:
+    bits = np.asarray(
+        [[0x3F80, 0xC020], [0x0000, 0x7F80]],
+        dtype="<u2",
+    ).view(BFloat16Array)
+
+    restored = MfqTpqStore._torch_array(bits)
+
+    assert restored.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        restored.float(),
+        torch.tensor([[1.0, -2.5], [0.0, float("inf")]]),
+    )
 
 
 def _cccp_artifact(root: Path) -> tuple[Path, dict[str, np.ndarray]]:
