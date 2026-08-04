@@ -20,9 +20,20 @@ _LINEAR_ROUTE_IMPLEMENTATIONS: dict[tuple[str, str], object] = {}
 _BLOCK_SCALED_GEMV_IMPLEMENTATIONS: dict[
     tuple[str, str, int], object
 ] = {}
+_BLOCK_SCALED_GEMM_IMPLEMENTATIONS: dict[
+    tuple[str, str, int], object
+] = {}
 _BLOCK_SCALED_GROUPED_GEMV_IMPLEMENTATIONS: dict[
     tuple[str, str, int], object
 ] = {}
+_BLOCK_SCALED_GROUPED_ROWS_GEMV_IMPLEMENTATIONS: dict[
+    tuple[str, str, int], object
+] = {}
+_BLOCK_SCALED_GROUPED_GEMM_IMPLEMENTATIONS: dict[
+    tuple[str, str, int], object
+] = {}
+_DENSE_GROUPED_GEMV_IMPLEMENTATIONS: dict[tuple[str, str], object] = {}
+_DENSE_GEMV_IMPLEMENTATIONS: dict[tuple[str, str], object] = {}
 _RESIDENT_MOE_IMPLEMENTATIONS: dict[
     tuple[
         str,
@@ -33,6 +44,8 @@ _RESIDENT_MOE_IMPLEMENTATIONS: dict[
     object,
 ] = {}
 _PACKED_ROUTE_SLOT_IMPLEMENTATIONS: dict[str, object] = {}
+_COMPRESSED_STATE_IMPLEMENTATIONS: dict[tuple[str, int], object] = {}
+_HEAD_NORM_ROPE_IMPLEMENTATIONS: dict[tuple[str, int, int], object] = {}
 
 
 def linear(
@@ -53,12 +66,95 @@ def linear(
     if isinstance(weight, BlockFP8Weight):
         result = weight.matmul_T_decode_fused(value, output=output)
     elif isinstance(weight, ProjectionGroup):
-        result = weight.matmul_T_decode_fused(value, output=output)
+        result = weight.matmul_T_decode_fused(
+            value,
+            output=output,
+            output_dtype=output_dtype,
+        )
     else:
-        result = torch.nn.functional.linear(value.to(weight.dtype), weight)
-        if output is not None:
-            output.copy_(result)
-            result = output
+        result = None
+        if (
+            isinstance(weight, torch.Tensor)
+            and value.is_cuda
+            and weight.is_cuda
+            and value.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and value.ndim == 2
+            and value.shape[0] == 1
+            and weight.ndim == 2
+            and weight.shape[1] == value.shape[1]
+            and value.is_contiguous()
+            and weight.is_contiguous()
+            and value.device == weight.device
+        ):
+            target_dtype = output_dtype or torch.bfloat16
+            target = output
+            if target is None:
+                target = torch.empty(
+                    (1, int(weight.shape[0])),
+                    dtype=target_dtype,
+                    device=value.device,
+                )
+            result = dense_gemv(value, weight, output=target)
+        if result is None:
+            result = torch.nn.functional.linear(
+                value.to(weight.dtype), weight
+            )
+            if output is not None:
+                output.copy_(result)
+                result = output
+    return (
+        result
+        if output_dtype is None or result.dtype == output_dtype
+        else result.to(output_dtype)
+    )
+
+
+def dense_gemv(
+    value: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    output: torch.Tensor,
+) -> torch.Tensor | None:
+    """Registered one-token BF16 GEMV into fixed caller-owned storage."""
+    _ensure_builtins()
+    key = (value.device.type, "bf16")
+    try:
+        implementation = _DENSE_GEMV_IMPLEMENTATIONS.get(key)
+        if implementation is None:
+            request = OperatorRequest(
+                operation="dense_gemv",
+                device_type=value.device.type,
+                packed_formats=("bf16",),
+                activation="none",
+                batch_size=int(value.shape[0]),
+            )
+            implementation = REGISTRY.resolve(request).implementation
+            _DENSE_GEMV_IMPLEMENTATIONS[key] = implementation
+        return implementation(
+            value=value,
+            weight=weight,
+            output=output,
+        )
+    except LookupError:
+        return None
+
+
+def linear_grouped_rows(
+    value: torch.Tensor,
+    weight,
+    *,
+    output_dtype: torch.dtype | None = None,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Apply compact projection ``i`` to input row ``i`` in one call."""
+    from ..kernels import ProjectionGroup
+
+    if not isinstance(weight, ProjectionGroup):
+        return None
+    result = weight.matmul_T_grouped_rows_fused(value, output=output)
+    if result is None:
+        return None
     return result if output_dtype is None else result.to(output_dtype)
 
 
@@ -173,13 +269,20 @@ def block_scaled_gemv(
     scales: torch.Tensor,
     *,
     block_size: int,
+    rows: int | None = None,
+    cols: int | None = None,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """直接读取块缩放紧凑权重执行单 token GEMV。"""
     _ensure_builtins()
     if weights.dtype != torch.uint8 or scales.dtype != torch.float32:
         return None
-    format_name = "e4m3fn"
+    block_major = weights.ndim == 5
+    format_name = (
+        "e4m3fn-block-major32" if block_major else "e4m3fn"
+    )
+    logical_rows = int(weights.shape[0]) if rows is None else int(rows)
+    logical_cols = int(weights.shape[1]) if cols is None else int(cols)
     key = (value.device.type, format_name, int(block_size))
     try:
         implementation = _BLOCK_SCALED_GEMV_IMPLEMENTATIONS.get(key)
@@ -199,8 +302,64 @@ def block_scaled_gemv(
             value=value,
             weights=weights,
             scales=scales,
-            cols=int(weights.shape[1]),
+            rows=logical_rows,
+            cols=logical_cols,
             block_size=int(block_size),
+            block_major=block_major,
+            output=output,
+        )
+    except LookupError:
+        return None
+
+
+def block_scaled_gemm(
+    value: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    *,
+    block_size: int,
+    rows: int | None = None,
+    cols: int | None = None,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Verify 2..16 tokens while scanning compact block-FP8 once."""
+    _ensure_builtins()
+    if (
+        weights.dtype != torch.uint8
+        or scales.dtype != torch.float32
+        or value.ndim != 2
+        or not 2 <= int(value.shape[0]) <= 16
+    ):
+        return None
+    block_major = weights.ndim == 5
+    format_name = (
+        "e4m3fn-block-major32" if block_major else "e4m3fn"
+    )
+    logical_rows = int(weights.shape[0]) if rows is None else int(rows)
+    logical_cols = int(weights.shape[1]) if cols is None else int(cols)
+    key = (value.device.type, format_name, int(block_size))
+    try:
+        implementation = _BLOCK_SCALED_GEMM_IMPLEMENTATIONS.get(key)
+        if implementation is None:
+            request = OperatorRequest(
+                operation="block_scaled_gemm",
+                device_type=value.device.type,
+                packed_formats=(format_name,),
+                code_dims=(int(block_size),),
+                activation="none",
+                top_k=1,
+                batch_size=int(value.shape[0]),
+            )
+            implementation = REGISTRY.resolve(request).implementation
+            _BLOCK_SCALED_GEMM_IMPLEMENTATIONS[key] = implementation
+        return implementation(
+            value=value,
+            weights=weights,
+            scales=scales,
+            rows=logical_rows,
+            cols=logical_cols,
+            block_size=int(block_size),
+            block_major=block_major,
             output=output,
         )
     except LookupError:
@@ -216,6 +375,7 @@ def block_scaled_grouped_gemv(
     total_rows: int,
     cols: int,
     block_size: int = 128,
+    block_major: bool = False,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """One-token logical row concatenation over compact block-FP8 weights.
@@ -225,14 +385,17 @@ def block_scaled_grouped_gemv(
     neither concatenates nor dequantizes a complete matrix.
     """
     _ensure_builtins()
-    key = (value.device.type, "e4m3fn", int(block_size))
+    format_name = (
+        "e4m3fn-block-major32" if block_major else "e4m3fn"
+    )
+    key = (value.device.type, format_name, int(block_size))
     try:
         implementation = _BLOCK_SCALED_GROUPED_GEMV_IMPLEMENTATIONS.get(key)
         if implementation is None:
             request = OperatorRequest(
                 operation="block_scaled_grouped_gemv",
                 device_type=value.device.type,
-                packed_formats=("e4m3fn",),
+                packed_formats=(format_name,),
                 code_dims=(int(block_size),),
                 activation="none",
                 batch_size=int(value.shape[0]),
@@ -247,10 +410,392 @@ def block_scaled_grouped_gemv(
             total_rows=int(total_rows),
             cols=int(cols),
             block_size=int(block_size),
+            block_major=bool(block_major),
             output=output,
         )
     except LookupError:
         return None
+
+
+def block_scaled_grouped_gemm(
+    value: torch.Tensor,
+    weight_ptrs: torch.Tensor,
+    scale_ptrs: torch.Tensor,
+    row_offsets: torch.Tensor,
+    *,
+    total_rows: int,
+    cols: int,
+    block_size: int = 128,
+    block_major: bool = False,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Multi-token logical row concatenation over compact FP8 weights."""
+    _ensure_builtins()
+    format_name = (
+        "e4m3fn-block-major32" if block_major else "e4m3fn"
+    )
+    key = (value.device.type, format_name, int(block_size))
+    try:
+        implementation = _BLOCK_SCALED_GROUPED_GEMM_IMPLEMENTATIONS.get(key)
+        if implementation is None:
+            request = OperatorRequest(
+                operation="block_scaled_grouped_gemm",
+                device_type=value.device.type,
+                packed_formats=(format_name,),
+                code_dims=(int(block_size),),
+                activation="none",
+                batch_size=int(value.shape[0]),
+            )
+            implementation = REGISTRY.resolve(request).implementation
+            _BLOCK_SCALED_GROUPED_GEMM_IMPLEMENTATIONS[key] = implementation
+        return implementation(
+            value=value,
+            weight_ptrs=weight_ptrs,
+            scale_ptrs=scale_ptrs,
+            row_offsets=row_offsets,
+            total_rows=int(total_rows),
+            cols=int(cols),
+            block_size=int(block_size),
+            block_major=bool(block_major),
+            output=output,
+        )
+    except LookupError:
+        return None
+
+
+def block_scaled_grouped_rows_gemv(
+    value: torch.Tensor,
+    weight_ptrs: torch.Tensor,
+    scale_ptrs: torch.Tensor,
+    row_offsets: torch.Tensor,
+    *,
+    total_rows: int,
+    cols: int,
+    block_size: int = 128,
+    block_major: bool = False,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """One compact FP8 projection for each matching input row."""
+    _ensure_builtins()
+    format_name = (
+        "e4m3fn-block-major32" if block_major else "e4m3fn"
+    )
+    key = (value.device.type, format_name, int(block_size))
+    try:
+        implementation = (
+            _BLOCK_SCALED_GROUPED_ROWS_GEMV_IMPLEMENTATIONS.get(key)
+        )
+        if implementation is None:
+            request = OperatorRequest(
+                operation="block_scaled_grouped_rows_gemv",
+                device_type=value.device.type,
+                packed_formats=(format_name,),
+                code_dims=(int(block_size),),
+                activation="none",
+                batch_size=int(value.shape[0]),
+            )
+            implementation = REGISTRY.resolve(request).implementation
+            _BLOCK_SCALED_GROUPED_ROWS_GEMV_IMPLEMENTATIONS[key] = (
+                implementation
+            )
+        return implementation(
+            value=value,
+            weight_ptrs=weight_ptrs,
+            scale_ptrs=scale_ptrs,
+            row_offsets=row_offsets,
+            total_rows=int(total_rows),
+            cols=int(cols),
+            block_size=int(block_size),
+            block_major=bool(block_major),
+            output=output,
+        )
+    except LookupError:
+        return None
+
+
+def vq_relayout_block_major(
+    payload: torch.Tensor,
+    *,
+    rows: int,
+    blocks: int,
+    bits: int,
+    code_dim: int,
+    codebook_size: int,
+) -> torch.Tensor | None:
+    """Convert compact VQ index traversal order without expanding indices."""
+    _ensure_builtins()
+    if (
+        payload.device.type != "cpu"
+        or payload.dtype != torch.uint8
+        or not 8 <= int(bits) <= 16
+    ):
+        return None
+    request = OperatorRequest(
+        operation="vq_relayout:block_major",
+        device_type="cpu",
+        packed_formats=(f"p{int(bits)}",),
+        code_dims=(int(code_dim),),
+        codebook_sizes=(int(codebook_size),),
+        activation="none",
+        top_k=1,
+        batch_size=1,
+    )
+    try:
+        return REGISTRY.call(
+            request,
+            payload=payload,
+            rows=int(rows),
+            blocks=int(blocks),
+            bits=int(bits),
+        )
+    except LookupError:
+        return None
+
+
+def vq_relayout_row_tile(
+    payload: torch.Tensor,
+    *,
+    rows: int,
+    blocks: int,
+    bits: int,
+    code_dim: int,
+    codebook_size: int,
+    tile_rows: int = 8,
+) -> torch.Tensor | None:
+    """Convert compact indices to a CPU row-tile traversal."""
+    _ensure_builtins()
+    if (
+        payload.device.type != "cpu"
+        or payload.dtype != torch.uint8
+        or not 8 <= int(bits) <= 16
+        or int(tile_rows) <= 0
+        or int(tile_rows) % 8
+    ):
+        return None
+    request = OperatorRequest(
+        operation="vq_relayout:row_tile",
+        device_type="cpu",
+        packed_formats=(f"p{int(bits)}",),
+        code_dims=(int(code_dim),),
+        codebook_sizes=(int(codebook_size),),
+        activation="none",
+        top_k=1,
+        batch_size=1,
+    )
+    try:
+        return REGISTRY.call(
+            request,
+            payload=payload,
+            rows=int(rows),
+            blocks=int(blocks),
+            bits=int(bits),
+            tile_rows=int(tile_rows),
+        )
+    except LookupError:
+        return None
+
+
+def vq_compile_u16_row_tile(
+    payload: torch.Tensor,
+    *,
+    rows: int,
+    blocks: int,
+    bits: int,
+    code_dim: int,
+    codebook_size: int,
+    tile_rows: int = 8,
+) -> torch.Tensor | None:
+    """Compile compact VQ indices into an exact in-RAM CPU execution image.
+
+    Dispatch remains format driven.  The returned uint16 tensor is transient
+    runtime state and is never written into, or substituted for, the model
+    archive on disk.
+    """
+    _ensure_builtins()
+    request = OperatorRequest(
+        operation="vq_compile:u16_row_tile",
+        device_type=payload.device.type,
+        packed_formats=(f"p{int(bits)}",),
+        code_dims=(int(code_dim),),
+        codebook_sizes=(int(codebook_size),),
+        activation="none",
+        top_k=1,
+        batch_size=1,
+    )
+    try:
+        return REGISTRY.call(
+            request,
+            payload=payload,
+            rows=int(rows),
+            blocks=int(blocks),
+            bits=int(bits),
+            tile_rows=int(tile_rows),
+        )
+    except LookupError:
+        return None
+
+
+def dense_grouped_gemv(
+    value: torch.Tensor,
+    weight_ptrs: torch.Tensor,
+    row_offsets: torch.Tensor,
+    *,
+    total_rows: int,
+    cols: int,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """One-token logical row concatenation over BF16 CPU matrices."""
+    _ensure_builtins()
+    key = (value.device.type, "bf16")
+    try:
+        implementation = _DENSE_GROUPED_GEMV_IMPLEMENTATIONS.get(key)
+        if implementation is None:
+            request = OperatorRequest(
+                operation="dense_grouped_gemv",
+                device_type=value.device.type,
+                packed_formats=("bf16",),
+                activation="none",
+                batch_size=int(value.shape[0]),
+            )
+            implementation = REGISTRY.resolve(request).implementation
+            _DENSE_GROUPED_GEMV_IMPLEMENTATIONS[key] = implementation
+        return implementation(
+            value=value,
+            weight_ptrs=weight_ptrs,
+            row_offsets=row_offsets,
+            total_rows=int(total_rows),
+            cols=int(cols),
+            output=output,
+        )
+    except LookupError:
+        return None
+
+
+def create_resident_projection_layer(weights: tuple[object, ...]):
+    """Create a fixed-address single-token projection executor.
+
+    Selection is based on source formats, not model family.  Mixed BF16 and
+    block-FP8 projections sharing one input can therefore enter one persistent
+    CPU team without copying or dequantizing their model weights.
+    """
+    from ..kernels import BlockFP8Weight
+
+    _ensure_builtins()
+    if not weights:
+        return None
+    formats: set[str] = set()
+    for weight in weights:
+        if (
+            isinstance(weight, torch.Tensor)
+            and not weight.is_cuda
+            and weight.dtype == torch.bfloat16
+        ):
+            formats.add("bf16")
+        elif isinstance(weight, BlockFP8Weight) and not weight.q.is_cuda:
+            formats.add(
+                "e4m3fn-block-major32"
+                if weight.layout == "block-major32"
+                else "e4m3fn"
+            )
+        else:
+            return None
+    request = OperatorRequest(
+        operation="resident_projection_layer",
+        device_type="cpu",
+        packed_formats=tuple(formats),
+        code_dims=(128,) if any("e4m3fn" in item for item in formats) else (),
+        activation="none",
+        top_k=1,
+        batch_size=1,
+    )
+    try:
+        return REGISTRY.call(request, weights=weights)
+    except LookupError:
+        return None
+
+
+def compressed_state_update(
+    projected: torch.Tensor,
+    ape: torch.Tensor,
+    ckv: torch.Tensor,
+    cscore: torch.Tensor,
+    *,
+    ratio: int,
+    position: int,
+    kv_rows: int,
+) -> bool:
+    """Write a one-token KV/score projection into compact ring state.
+
+    The operation is keyed only by device, ratio and decode batch shape.  It
+    is reusable by any compressed-attention configuration and does not own
+    projection weights or model-specific pooling rules.
+    """
+    _ensure_builtins()
+    key = (projected.device.type, int(ratio))
+    try:
+        implementation = _COMPRESSED_STATE_IMPLEMENTATIONS.get(key)
+        if implementation is None:
+            request = OperatorRequest(
+                operation="compressed_state_update",
+                device_type=projected.device.type,
+                code_dims=(int(ratio),),
+                activation="none",
+                batch_size=int(projected.shape[0]),
+            )
+            implementation = REGISTRY.resolve(request).implementation
+            _COMPRESSED_STATE_IMPLEMENTATIONS[key] = implementation
+        return bool(
+            implementation(
+                projected=projected,
+                ape=ape,
+                ckv=ckv,
+                cscore=cscore,
+                ratio=int(ratio),
+                position=int(position),
+                kv_rows=int(kv_rows),
+            )
+        )
+    except LookupError:
+        return False
+
+
+def head_rmsnorm_rope(
+    rows: torch.Tensor,
+    weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    rope_width: int,
+    eps: float,
+) -> bool:
+    """In-place per-head RMSNorm plus interleaved tail RoPE."""
+    _ensure_builtins()
+    width = int(rows.shape[-1])
+    key = (rows.device.type, width, int(rope_width))
+    try:
+        implementation = _HEAD_NORM_ROPE_IMPLEMENTATIONS.get(key)
+        if implementation is None:
+            request = OperatorRequest(
+                operation="head_rmsnorm_rope",
+                device_type=rows.device.type,
+                code_dims=(width, int(rope_width)),
+                activation="none",
+                batch_size=1,
+            )
+            implementation = REGISTRY.resolve(request).implementation
+            _HEAD_NORM_ROPE_IMPLEMENTATIONS[key] = implementation
+        return bool(
+            implementation(
+                rows=rows,
+                weight=weight,
+                cos=cos,
+                sin=sin,
+                rope_width=int(rope_width),
+                eps=float(eps),
+            )
+        )
+    except LookupError:
+        return False
 
 
 def route_topk(
@@ -343,6 +888,7 @@ def linear_route_topk(
             bias=bias,
             mask=mask,
             top_k=int(top_k),
+            normalize=bool(normalize),
             scaling=float(scaling),
             output_buffers=output_buffers,
         )
@@ -800,18 +1346,17 @@ def packed_moe_selected_topk(
     if not experts:
         return None
     _ensure_builtins()
-    bit_to_format = {
-        8: "p8",
-        9: "p9",
-        10: "p10",
-        12: "p12",
-        14: "p14",
-        16: "p16",
-    }
+    # Packed projection-VQ is a generic bitstream format.  Keep the registry
+    # key derived from the actual bit width so new heterogeneous manifests do
+    # not need another model-specific lookup table.
+    def packed_format(bits: int) -> str:
+        if bits < 8 or bits > 16:
+            raise ValueError(f"unsupported packed VQ width: {bits}")
+        return f"p{bits}"
     packed_formats = tuple(
         sorted(
             {
-                bit_to_format[int(weight.bits)]
+                packed_format(int(weight.bits))
                 for pair in experts
                 for weight in pair
             }
@@ -923,6 +1468,175 @@ def resident_moe_topk(
             output_workspace=output_workspace,
             result=result,
             include_k4096=4096 in normalized_sizes,
+        )
+    except LookupError:
+        return None
+
+
+def create_resident_moe_layer(
+    executor,
+    experts: tuple[tuple[object, object, object], ...],
+    router_weight: torch.Tensor,
+    router_bias: torch.Tensor,
+    router_mask: torch.Tensor,
+    shared_weights: tuple[object, object, object],
+    *,
+    activation: str,
+    top_k: int,
+    normalize_route: bool,
+    routed_scaling: float,
+):
+    """Compose a persistent Router/shared/routed CPU MoE executor.
+
+    Dispatch is based solely on packed formats, codebook geometry, dense
+    block format and activation.  The returned executor keeps every source
+    tensor compact and can be reused for every decode token in that layer.
+    """
+    _ensure_builtins()
+    if not experts or len(shared_weights) != 3:
+        return None
+    packed_formats = tuple(
+        sorted(
+            {f"p{int(weight.bits)}" for bundle in experts for weight in bundle}
+            | {
+                "e4m3fn-block-major32"
+                if getattr(weight, "layout", "row-major")
+                == "block-major32"
+                else "e4m3fn"
+                for weight in shared_weights
+            }
+            | {str(router_weight.dtype).removeprefix("torch.")}
+        )
+    )
+    code_dims = tuple(
+        sorted(
+            {int(weight.dim) for bundle in experts for weight in bundle}
+            | {int(getattr(weight, "block", 128)) for weight in shared_weights}
+        )
+    )
+    codebook_sizes = tuple(
+        sorted(
+            {
+                int(weight.cb.shape[0])
+                for bundle in experts
+                for weight in bundle
+            }
+        )
+    )
+    request = OperatorRequest(
+        operation="resident_moe_layer",
+        device_type=router_weight.device.type,
+        packed_formats=packed_formats,
+        code_dims=code_dims,
+        codebook_sizes=codebook_sizes,
+        activation=activation,
+        top_k=int(top_k),
+        batch_size=1,
+    )
+    try:
+        return REGISTRY.call(
+            request,
+            executor=executor,
+            router_weight=router_weight,
+            router_bias=router_bias,
+            router_mask=router_mask,
+            shared_weights=shared_weights,
+            top_k=int(top_k),
+            normalize_route=bool(normalize_route),
+            routed_scaling=float(routed_scaling),
+        )
+    except LookupError:
+        return None
+
+
+def create_latent_resident_moe_layer(
+    executor,
+    experts: tuple[tuple[object, object, object], ...],
+    input_weights: tuple[object, object, object, object],
+    output_weights: tuple[object, object],
+    route_correction: torch.Tensor,
+    route_mask: torch.Tensor,
+    routed_norm: torch.Tensor,
+    *,
+    activation: str,
+    scoring: str,
+    top_k: int,
+    normalize_route: bool,
+    routed_scaling: float,
+    rms_eps: float,
+    limit: float,
+    beta: float,
+    linear_beta: float | None,
+):
+    """Create one format-driven full latent-MoE CPU decode executor."""
+    from ..kernels import BlockFP8Weight
+
+    _ensure_builtins()
+    if not experts or len(input_weights) != 4 or len(output_weights) != 2:
+        return None
+
+    def dense_format(weight) -> str | None:
+        if isinstance(weight, BlockFP8Weight) and not weight.q.is_cuda:
+            return (
+                "e4m3fn-block-major32"
+                if weight.layout == "block-major32"
+                else "e4m3fn"
+            )
+        if (
+            isinstance(weight, torch.Tensor)
+            and not weight.is_cuda
+            and weight.dtype in (torch.bfloat16, torch.float32)
+        ):
+            return str(weight.dtype).removeprefix("torch.")
+        return None
+
+    dense_formats = {
+        dense_format(weight)
+        for weight in (*input_weights, *output_weights)
+    }
+    if None in dense_formats:
+        return None
+    packed_formats = tuple(sorted(
+        {f"p{int(weight.bits)}" for bundle in experts for weight in bundle}
+        | dense_formats
+    ))
+    code_dims = tuple(sorted(
+        {int(weight.dim) for bundle in experts for weight in bundle}
+        | {128}
+    ))
+    codebook_sizes = tuple(sorted({
+        int(weight.cb.shape[0])
+        for bundle in experts
+        for weight in bundle
+    }))
+    request = OperatorRequest(
+        operation="latent_resident_moe_layer",
+        device_type="cpu",
+        packed_formats=packed_formats,
+        code_dims=code_dims,
+        codebook_sizes=codebook_sizes,
+        activation=activation,
+        top_k=int(top_k),
+        batch_size=1,
+    )
+    try:
+        return REGISTRY.call(
+            request,
+            executor=executor,
+            input_weights=input_weights,
+            output_weights=output_weights,
+            route_correction=route_correction,
+            route_mask=route_mask,
+            routed_norm=routed_norm,
+            top_k=int(top_k),
+            normalize_route=bool(normalize_route),
+            routed_scaling=float(routed_scaling),
+            rms_eps=float(rms_eps),
+            limit=float(limit),
+            scoring=str(scoring),
+            activation=str(activation),
+            beta=float(beta),
+            linear_beta=linear_beta,
         )
     except LookupError:
         return None

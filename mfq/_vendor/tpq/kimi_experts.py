@@ -1338,6 +1338,7 @@ class PackedExpertPool:
         scaling: float,
         n_group: int,
         topk_group: int,
+        layers=None,
     ) -> None:
         """Compose registered Top-K and packed-expert graphs per TP rank.
 
@@ -1353,7 +1354,18 @@ class PackedExpertPool:
         from .fusedext import make_tp_graph_sequence_batch
         from .ops import route_topk
 
-        for layer in sorted(self._graphs):
+        selected_layers = (
+            sorted(self._graphs)
+            if layers is None
+            else sorted({int(layer) for layer in layers})
+        )
+        unknown = set(selected_layers) - set(self._graphs)
+        if unknown:
+            raise ValueError(
+                "route/packed composition references unknown layers: "
+                + ",".join(str(layer) for layer in sorted(unknown))
+            )
+        for layer in selected_layers:
             logits = logits_by_layer[layer]
             corrections = corrections_by_layer[layer]
             masks = masks_by_layer[layer]
@@ -1432,7 +1444,7 @@ class PackedExpertPool:
             )
         print(
             "[tpq-packed] 通用 Route TopK→packed MoE 全rank父图完成："
-            f"{len(self._route_graphs)} 层×{len(self.devices)} rank",
+            f"{len(selected_layers)} 层×{len(self.devices)} rank",
             flush=True,
         )
 

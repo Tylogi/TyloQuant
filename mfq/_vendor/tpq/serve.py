@@ -1,4 +1,4 @@
-"""Serve one TPQ CCCP model through the OpenAI-compatible API."""
+"""Serve one TPQ model through the OpenAI-compatible API."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from .chat_adapters import adapter_for_arch
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Serve one TPQ CCCP model through an OpenAI API",
+        description="Serve one TPQ model through an OpenAI API",
     )
     parser.add_argument("--model", required=True)
     parser.add_argument("--served-model-name")
@@ -21,6 +21,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--cache-gb", type=float)
     parser.add_argument("--vram-gb", type=float)
+    parser.add_argument(
+        "--extreme",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="默认自动检测；可用 --extreme 强制或 --no-extreme 禁用",
+    )
     parser.add_argument(
         "--dense-residency",
         choices=("auto", "gpu"),
@@ -55,6 +61,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--tp > 1 requires --device cuda")
     if args.dense_residency == "gpu" and args.device != "cuda":
         parser.error("--dense-residency gpu requires --device cuda")
+    if args.extreme:
+        if args.device != "cuda" or args.tp != 1:
+            parser.error("--extreme requires --device cuda --tp 1")
+        if args.cache_gb is not None or args.vram_gb is not None:
+            parser.error("--extreme cannot be combined with --cache-gb/--vram-gb")
+        from .extreme import configure_extreme_environment
+
+        configure_extreme_environment()
+        args.dense_residency = "gpu"
+    elif args.extreme is False:
+        os.environ["TPQ_AUTO_EXTREME"] = "0"
     if args.served_model_name is None:
         args.served_model_name = Path(args.model).resolve().name
     return args
@@ -81,6 +98,7 @@ def build_service(args: argparse.Namespace) -> tuple[Any, Any]:
         vram_cache_gb=args.vram_gb,
         tp_size=args.tp,
         dense_residency=args.dense_residency,
+        extreme_mode=args.extreme,
     )
     adapter = adapter_for_arch(engine.arch)
     service = ChatService(

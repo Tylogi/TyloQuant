@@ -99,6 +99,16 @@ def choose_ep_layout(manifest: dict[str, Any], tp: int) -> str:
             ).values()
             for layout in projections.values()
         }
+        heterogeneous = quant.get(
+            "heterogeneous_expert_tiering"
+        ) or {}
+        used_layouts.update(
+            str(layout)
+            for projections in heterogeneous.get(
+                "precision_levels", {}
+            ).values()
+            for layout in projections.values()
+        )
         dims.update(
             int(quant["layouts"][layout]["dim"])
             for layout in used_layouts

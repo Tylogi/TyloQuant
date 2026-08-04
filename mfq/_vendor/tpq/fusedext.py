@@ -29,7 +29,26 @@ import torch
 
 _EXT = None
 _ERR: str | None = None
-_EXTENSION_NAME = "tpq_vq_gemv"
+_EXTENSION_NAME = "tpq_vq_gemv_hc_rms_h20_v4"
+
+
+def _apply_cuda_hardware_defaults() -> None:
+    """Apply measured kernel defaults without overriding explicit tuning.
+
+    This lives in the common CUDA loader because the routed packed operator is
+    shared by every architecture.  Setting the environment value before the
+    extension is loaded also avoids stale extension-cache binaries silently
+    retaining an older C++ default.
+    """
+    if "TPQ_ROUTED_WARPS" in os.environ or not torch.cuda.is_available():
+        return
+    try:
+        capability = torch.cuda.get_device_capability(0)
+        device_name = torch.cuda.get_device_name(0).upper()
+    except Exception:
+        return
+    if capability == (9, 0) and "H20" in device_name:
+        os.environ["TPQ_ROUTED_WARPS"] = "16"
 
 
 def _ensure_ninja_on_path() -> None:
@@ -70,6 +89,7 @@ def _build(verbose: bool = False):
         _ERR = "无 CUDA"
         return None
     try:
+        _apply_cuda_hardware_defaults()
         _ensure_ninja_on_path()
         # Windows 下新版 setuptools 的 distutils shim 不自动挂
         # _msvccompiler 子模块，而 torch._run_ninja_build 以属性方式访问它；
@@ -1838,6 +1858,100 @@ if _EXT is not None:
             return None
         return _EXT.tp_all_rank_reduce(contributions, outputs)
 
+    def compressed_state_update_fused(
+        projected: torch.Tensor,
+        ape: torch.Tensor,
+        ckv: torch.Tensor,
+        cscore: torch.Tensor,
+        ratio: int,
+        position: int,
+        kv_rows: int,
+    ):
+        if (
+            not projected.is_cuda
+            or projected.dtype != torch.bfloat16
+            or ape.dtype != torch.bfloat16
+            or ckv.dtype != torch.float32
+            or cscore.dtype != torch.float32
+        ):
+            return None
+        return _EXT.compressed_state_update(
+            projected,
+            ape,
+            ckv,
+            cscore,
+            int(ratio),
+            int(position),
+            int(kv_rows),
+        )
+
+    def head_rmsnorm_rope_fused(
+        rows: torch.Tensor,
+        weight: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        rope_width: int,
+        eps: float,
+    ):
+        if (
+            not rows.is_cuda
+            or rows.dtype != torch.float32
+            or weight.dtype != torch.bfloat16
+            or cos.dtype != torch.float32
+            or sin.dtype != torch.float32
+        ):
+            return None
+        return _EXT.head_rmsnorm_rope(
+            rows,
+            weight,
+            cos,
+            sin,
+            int(rope_width),
+            float(eps),
+        )
+
+    def tp_all_rank_reduce_from_events_fused(
+        contributions: list[torch.Tensor],
+        input_events: list[torch.cuda.Event],
+        outputs: list[torch.Tensor],
+        output_events: list[torch.cuda.Event],
+    ):
+        """Wait producer events and publish one TP reduction per output.
+
+        This is the public collective used by replicated no-owner subgroups.
+        The C++ entry point performs all device switches, waits, reductions
+        and completion records in one host call.
+        """
+        if (
+            not 1 <= len(contributions) <= 16
+            or len(input_events) != len(contributions)
+            or not 1 <= len(outputs) <= 16
+            or len(output_events) != len(outputs)
+            or any(
+                not item.is_cuda
+                or item.dtype != torch.float32
+                or not item.is_contiguous()
+                for item in contributions
+            )
+            or any(
+                not item.is_cuda
+                or item.dtype not in {torch.float32, torch.bfloat16}
+                or not item.is_contiguous()
+                for item in outputs
+            )
+            or any(
+                item.numel() != contributions[0].numel()
+                for item in (*contributions[1:], *outputs)
+            )
+        ):
+            return None
+        return _EXT.tp_all_rank_reduce_from_events(
+            contributions,
+            [event.cuda_event for event in input_events],
+            outputs,
+            [event.cuda_event for event in output_events],
+        )
+
     def tp_hidden_add_batch_fused(
         left: list[torch.Tensor],
         left_events: list[torch.cuda.Event],
@@ -2403,6 +2517,15 @@ else:
         return None
 
     def tp_all_rank_reduce_fused(*args, **kwargs):
+        return None
+
+    def compressed_state_update_fused(*args, **kwargs):
+        return None
+
+    def head_rmsnorm_rope_fused(*args, **kwargs):
+        return None
+
+    def tp_all_rank_reduce_from_events_fused(*args, **kwargs):
         return None
 
     def tp_hidden_add_batch_fused(*args, **kwargs):

@@ -3098,9 +3098,22 @@ torch::Tensor packed_moe_topk(
           p12_l2_warps = 16;
       const char* routed_warps_setting =
           std::getenv("TPQ_ROUTED_WARPS");
+      cudaDeviceProp routed_device_properties{};
+      C10_CUDA_CHECK(cudaGetDeviceProperties(
+          &routed_device_properties,
+          input.get_device()));
+      const bool h20_routed_kernel = (
+          routed_device_properties.major == 9 &&
+          routed_device_properties.minor == 0 &&
+          std::string(routed_device_properties.name).find("H20") !=
+              std::string::npos
+      );
+      const int default_routed_warps = (
+          h20_routed_kernel ? 16 : ROWS_PER_BLOCK
+      );
       int routed_warps = (
           routed_warps_setting == nullptr
-          ? ROWS_PER_BLOCK
+          ? default_routed_warps
           : std::atoi(routed_warps_setting)
       );
       if (
@@ -3108,7 +3121,7 @@ torch::Tensor packed_moe_topk(
           routed_warps != 16 &&
           routed_warps != 32
       )
-          routed_warps = ROWS_PER_BLOCK;
+          routed_warps = default_routed_warps;
       const char* vector_copy_setting =
           std::getenv("TPQ_ROUTED_VECTOR_COPY");
       const bool vector_input_copy = (
@@ -6642,12 +6655,15 @@ __global__ void dsv4_hc_pre_norm_bf16_kernel(
     }
 }
 
-// SM120 decode fast path.  The original all-in-one HC kernel launches one
+// Decode fast path.  The original all-in-one HC kernel launches one
 // block per token and evaluates the 24-row GEMV in three serial batches of
 // eight warps.  For N=1 that leaves almost the whole GPU idle.  Split the
 // operation into 24 independent GEMV blocks followed by one finish block.
-// The 24 float mixes temporarily occupy the first 96 bytes of the BF16 y
-// output; the finish kernel loads them into shared memory before overwriting y.
+// The 24 raw float mixes plus one shared input RMS value temporarily occupy
+// the first 100 bytes of the BF16 y output; the finish kernel loads them into
+// shared memory before overwriting y.  Only block zero evaluates the input
+// sum-of-squares.  The previous implementation repeated that identical work
+// in all 24 GEMV blocks, nearly doubling the hot-path memory/FMA traffic.
 
 __global__ void dsv4_hc_mix_parallel_bf16_kernel(
     const __nv_bfloat16* __restrict__ x,       // [N,4,D]
@@ -6673,27 +6689,38 @@ __global__ void dsv4_hc_mix_parallel_bf16_kernel(
         const float2 fv = __bfloat1622float2(f2[i]);
         dot = fmaf(xv.x, fv.x, dot);
         dot = fmaf(xv.y, fv.y, dot);
-        ss = fmaf(xv.x, xv.x, ss);
-        ss = fmaf(xv.y, xv.y, ss);
+        if (m == 0) {
+            ss = fmaf(xv.x, xv.x, ss);
+            ss = fmaf(xv.y, xv.y, ss);
+        }
     }
     dot = warp_sum_f32(dot);
-    ss = warp_sum_f32(ss);
+    if (m == 0)
+        ss = warp_sum_f32(ss);
     __shared__ float dot_warp[8];
     __shared__ float ss_warp[8];
     if (lane == 0) {
         dot_warp[warp] = dot;
-        ss_warp[warp] = ss;
+        if (m == 0)
+            ss_warp[warp] = ss;
     }
     __syncthreads();
     if (warp == 0) {
         float dv = lane < 8 ? dot_warp[lane] : 0.f;
-        float sv = lane < 8 ? ss_warp[lane] : 0.f;
         dv = warp_sum_f32(dv);
-        sv = warp_sum_f32(sv);
         if (lane == 0) {
             float* mixes = reinterpret_cast<float*>(
                 scratch + (long)n * D);
-            mixes[m] = dv * rsqrtf(sv / (float)flatD + eps);
+            mixes[m] = dv;
+        }
+        if (m == 0) {
+            float sv = lane < 8 ? ss_warp[lane] : 0.f;
+            sv = warp_sum_f32(sv);
+            if (lane == 0) {
+                float* mixes = reinterpret_cast<float*>(
+                    scratch + (long)n * D);
+                mixes[24] = rsqrtf(sv / (float)flatD + eps);
+            }
         }
     }
 }
@@ -6723,9 +6750,10 @@ __global__ void dsv4_hc_finish_norm_bf16_kernel(
 
     if (tid == 0) {
         const float* mix_scratch = reinterpret_cast<const float*>(yn);
+        const float inv_x_rms = mix_scratch[24];
         #pragma unroll
         for (int i = 0; i < 24; ++i)
-            mixes[i] = mix_scratch[i];
+            mixes[i] = mix_scratch[i] * inv_x_rms;
 
         const float s0 = scale[0], s1 = scale[1], s2 = scale[2];
         #pragma unroll
@@ -6917,7 +6945,7 @@ void dsv4_hc_pre_norm_into(
     auto bc = base.contiguous();
     auto nc = norm.contiguous();
     if (fn.scalar_type() == at::kBFloat16 &&
-        norm.scalar_type() == at::kBFloat16 && D >= 48) {
+        norm.scalar_type() == at::kBFloat16 && D >= 50) {
         launch_dsv4_hc_pre_norm_bf16_parallel(
             xc, fc, sc, bc, nc, y, post, comb,
             N, D, (int)iters, (float)eps);
@@ -10519,6 +10547,256 @@ std::vector<torch::Tensor> tp_all_rank_reduce(
     return outputs;
 }
 
+__global__ void head_rmsnorm_rope_kernel(
+    float* __restrict__ rows,
+    const __nv_bfloat16* __restrict__ weight,
+    const float* __restrict__ cos,
+    const float* __restrict__ sin,
+    const int width,
+    const int rope_width,
+    const float eps)
+{
+    extern __shared__ float scratch[];
+    const int row = blockIdx.x;
+    float sum = 0.0f;
+    for (int item = threadIdx.x; item < width; item += blockDim.x) {
+        const float value = rows[row * width + item];
+        sum = fmaf(value, value, sum);
+    }
+    scratch[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(scratch[0] / width + eps);
+    for (int item = threadIdx.x; item < width; item += blockDim.x) {
+        rows[row * width + item] =
+            rows[row * width + item] * scale *
+            __bfloat162float(weight[item]);
+    }
+    __syncthreads();
+    const int rope_pairs = rope_width / 2;
+    const int rope_start = width - rope_width;
+    for (
+        int pair = threadIdx.x;
+        pair < rope_pairs;
+        pair += blockDim.x
+    ) {
+        const int offset = row * width + rope_start + 2 * pair;
+        const float first = rows[offset];
+        const float second = rows[offset + 1];
+        const float c = cos[pair];
+        const float s = sin[pair];
+        rows[offset] = __fsub_rn(first * c, second * s);
+        rows[offset + 1] = __fadd_rn(first * s, second * c);
+    }
+}
+
+bool head_rmsnorm_rope(
+    torch::Tensor rows,
+    torch::Tensor weight,
+    torch::Tensor cos,
+    torch::Tensor sin,
+    int64_t rope_width,
+    double eps)
+{
+    TORCH_CHECK(
+        rows.is_cuda() && weight.is_cuda() &&
+        cos.is_cuda() && sin.is_cuda() &&
+        rows.is_contiguous() && weight.is_contiguous() &&
+        cos.is_contiguous() && sin.is_contiguous(),
+        "head norm/RoPE tensors must be contiguous CUDA tensors");
+    if (
+        rows.scalar_type() != at::kFloat ||
+        weight.scalar_type() != at::kBFloat16 ||
+        cos.scalar_type() != at::kFloat ||
+        sin.scalar_type() != at::kFloat ||
+        rows.dim() != 2 || weight.dim() != 1)
+        return false;
+    const int width = static_cast<int>(rows.size(1));
+    if (
+        rows.size(0) <= 0 || weight.numel() != width ||
+        rope_width <= 0 || rope_width > width || rope_width % 2 ||
+        cos.numel() != rope_width / 2 ||
+        sin.numel() != rope_width / 2 || width > 4096)
+        return false;
+    int threads = 1;
+    while (threads < width && threads < 256)
+        threads <<= 1;
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    head_rmsnorm_rope_kernel<<<
+        static_cast<int>(rows.size(0)),
+        threads,
+        threads * sizeof(float),
+        stream>>>(
+            rows.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(
+                weight.data_ptr<at::BFloat16>()),
+            cos.data_ptr<float>(),
+            sin.data_ptr<float>(),
+            width,
+            static_cast<int>(rope_width),
+            static_cast<float>(eps));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return true;
+}
+
+__global__ void compressed_state_update_kernel(
+    const __nv_bfloat16* projected,
+    const __nv_bfloat16* ape,
+    float* ckv,
+    float* cscore,
+    int state_width,
+    int kv_rows,
+    int score_rows,
+    int slot,
+    int phase);
+
+bool compressed_state_update(
+    torch::Tensor projected,
+    torch::Tensor ape,
+    torch::Tensor ckv,
+    torch::Tensor cscore,
+    int64_t ratio,
+    int64_t position,
+    int64_t kv_rows);
+
+__global__ void compressed_state_update_kernel(
+    const __nv_bfloat16* __restrict__ projected,
+    const __nv_bfloat16* __restrict__ ape,
+    float* __restrict__ ckv,
+    float* __restrict__ cscore,
+    const int state_width,
+    const int kv_rows,
+    const int score_rows,
+    const int slot,
+    const int phase)
+{
+    for (
+        int index = blockIdx.x * blockDim.x + threadIdx.x;
+        index < kv_rows;
+        index += blockDim.x * gridDim.x
+    ) {
+        ckv[slot * state_width + index] =
+            __bfloat162float(projected[index]);
+    }
+    for (
+        int index = blockIdx.x * blockDim.x + threadIdx.x;
+        index < score_rows;
+        index += blockDim.x * gridDim.x
+    ) {
+        cscore[slot * state_width + index] = __fadd_rn(
+            __bfloat162float(projected[kv_rows + index]),
+            __bfloat162float(ape[phase * score_rows + index]));
+    }
+}
+
+bool compressed_state_update(
+    torch::Tensor projected,
+    torch::Tensor ape,
+    torch::Tensor ckv,
+    torch::Tensor cscore,
+    int64_t ratio,
+    int64_t position,
+    int64_t kv_rows)
+{
+    TORCH_CHECK(
+        projected.is_cuda() && ape.is_cuda() &&
+        ckv.is_cuda() && cscore.is_cuda() &&
+        projected.is_contiguous() && ape.is_contiguous() &&
+        ckv.is_contiguous() && cscore.is_contiguous(),
+        "compressed state tensors must be contiguous CUDA tensors");
+    TORCH_CHECK(
+        ckv.scalar_type() == at::kFloat &&
+        cscore.scalar_type() == at::kFloat &&
+        ckv.sizes() == cscore.sizes() && ckv.dim() == 3 &&
+        ckv.size(0) == 1,
+        "compressed state outputs must be matching [1,slots,width] FP32");
+    TORCH_CHECK(
+        projected.dim() == 2 && projected.size(0) == 1 &&
+        kv_rows > 0 && kv_rows < projected.numel(),
+        "compressed projection must be [1,kv+score]");
+    if (
+        projected.scalar_type() != at::kBFloat16 ||
+        ape.scalar_type() != at::kBFloat16)
+        return false;
+    const int score_rows = static_cast<int>(
+        projected.numel() - kv_rows);
+    TORCH_CHECK(
+        ckv.size(2) == kv_rows &&
+        ape.dim() == 2 && ape.size(0) == ratio &&
+        ape.size(1) == score_rows && score_rows <= kv_rows &&
+        ratio > 0 && position >= 0,
+        "compressed state layout/ratio/position mismatch");
+    const bool overlap = ckv.size(1) == 2 * ratio;
+    TORCH_CHECK(
+        ckv.size(1) == ratio || overlap,
+        "compressed state slot count must equal ratio or 2*ratio");
+    const int phase = static_cast<int>(position % ratio);
+    const int slot = phase + (overlap ? static_cast<int>(ratio) : 0);
+    const int blocks = std::min(
+        32,
+        (std::max(static_cast<int>(kv_rows), score_rows) + 255) / 256);
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    compressed_state_update_kernel<<<blocks, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(
+            projected.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(
+            ape.data_ptr<at::BFloat16>()),
+        ckv.data_ptr<float>(),
+        cscore.data_ptr<float>(),
+        static_cast<int>(ckv.size(2)),
+        static_cast<int>(kv_rows),
+        score_rows,
+        slot,
+        phase);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return true;
+}
+
+std::vector<torch::Tensor> tp_all_rank_reduce_from_events(
+    std::vector<torch::Tensor> contributions,
+    std::vector<int64_t> input_events,
+    std::vector<torch::Tensor> outputs,
+    std::vector<int64_t> output_events)
+{
+    TORCH_CHECK(
+        !contributions.empty() && contributions.size() <= 16 &&
+        input_events.size() == contributions.size() &&
+        !outputs.empty() && outputs.size() <= 16 &&
+        output_events.size() == outputs.size(),
+        "TP event reduction inputs/outputs/events must be non-empty and "
+        "size-equal");
+    int original_device = -1;
+    C10_CUDA_CHECK(cudaGetDevice(&original_device));
+    for (size_t rank = 0; rank < outputs.size(); ++rank) {
+        const int target = outputs[rank].get_device();
+        C10_CUDA_CHECK(cudaSetDevice(target));
+        const auto stream = at::cuda::getCurrentCUDAStream(target);
+        for (const auto raw_event : input_events) {
+            C10_CUDA_CHECK(
+                cudaStreamWaitEvent(
+                    stream,
+                    reinterpret_cast<cudaEvent_t>(
+                        static_cast<uintptr_t>(raw_event)),
+                    0));
+        }
+        launch_tp_all_rank_reduce_one(
+            contributions,
+            outputs[rank],
+            stream);
+        C10_CUDA_CHECK(
+            cudaEventRecord(
+                reinterpret_cast<cudaEvent_t>(
+                    static_cast<uintptr_t>(output_events[rank])),
+                stream));
+    }
+    C10_CUDA_CHECK(cudaSetDevice(original_device));
+    return outputs;
+}
+
 namespace {
 
 bool tp_environment_enabled(const char* name)
@@ -12709,6 +12987,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &flashinfer_mla_batch1_plan,
           "Device-side exact batch-1 FlashInfer MLA scheduler");
     m.def("rope1", &rope1, "RoPE interleaved (decode single-phase, f32)");
+    m.def(
+          "head_rmsnorm_rope",
+          &head_rmsnorm_rope,
+          "In-place per-head RMSNorm and interleaved tail RoPE");
     m.def("glm_rope_qk", &glm_rope_qk,
           "GLM MLA Q/K RoPE (fused, HF cat layout, f32)");
     m.def("glm_latent_kv_decode_prepare",
@@ -12789,6 +13071,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("tp_all_rank_reduce",
           &tp_all_rank_reduce,
           "Reduce FP32 TP partials into fixed outputs on every rank");
+    m.def(
+          "compressed_state_update",
+          &compressed_state_update,
+          "Write projected KV/score plus phase bias into ring state");
+    m.def(
+          "tp_all_rank_reduce_from_events",
+          &tp_all_rank_reduce_from_events,
+          "Wait fixed rank events and reduce TP partials into outputs");
     m.def("tp_hidden_add_batch",
           &tp_hidden_add_batch,
           "Add fixed BF16 TPHidden replicas in one host call");

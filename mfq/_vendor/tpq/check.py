@@ -149,6 +149,7 @@ def _slot_bytes(
     manifest: dict[str, Any],
     kind: str,
     layer: int | None = None,
+    expert_id: int | None = None,
 ) -> int:
     if kind == "d":
         return 0
@@ -156,7 +157,42 @@ def _slot_bytes(
     if quant.get("method") == "projection-vq":
         if layer is None:
             raise ValueError("projection-VQ capacity requires a layer")
-        layouts = quant["projection_layouts"][str(layer)]
+        layouts_by_layer = quant.get("projection_layouts") or {}
+        layouts = layouts_by_layer.get(
+            str(layer), layouts_by_layer.get(layer)
+        )
+        if layouts is None:
+            heterogeneous = quant.get(
+                "heterogeneous_expert_tiering"
+            ) or {}
+            if expert_id is None:
+                raise ValueError(
+                    "heterogeneous projection-VQ capacity requires "
+                    "an expert_id"
+                )
+            levels_by_layer = heterogeneous.get(
+                "layer_expert_levels", {}
+            )
+            levels = levels_by_layer.get(
+                str(layer), levels_by_layer.get(layer)
+            )
+            if (
+                not isinstance(levels, list)
+                or expert_id < 0
+                or expert_id >= len(levels)
+            ):
+                raise ValueError(
+                    f"L{layer} has no precision level for expert {expert_id}"
+                )
+            level = str(levels[expert_id])
+            layouts = heterogeneous.get(
+                "precision_levels", {}
+            ).get(level)
+            if layouts is None:
+                raise ValueError(
+                    f"L{layer} expert {expert_id} references unknown "
+                    f"precision level {level!r}"
+                )
         config = manifest["config"]
         hidden = int(config["hidden"])
         intermediate = int(config["moe_inter"])
@@ -218,6 +254,7 @@ def expert_plan_bytes(
                 manifest,
                 _expert_kind(manifest, layer, expert_id),
                 layer,
+                expert_id,
             )
             if not size:
                 continue
@@ -243,6 +280,12 @@ def _required_files(root: Path, manifest: dict[str, Any]) -> list[Path]:
     tokenizer_files = manifest.get("tokenizer_files")
     if tokenizer_files:
         names.update(str(name) for name in tokenizer_files)
+    elif str(manifest.get("model_family", "")).lower() == "kimi_k3":
+        names.update((
+            "tokenizer_config.json",
+            "tiktoken.model",
+            "tokenization_kimi.py",
+        ))
     else:
         names.add("tokenizer.json")
     names.update(str(name) for name in manifest.get("model_files", ()))
@@ -352,17 +395,23 @@ def fixed_vram_gib(
 
         setting = (environment or {}).get("TPQ_DENSE_BF16")
         runtime_bytes = dsv4_dense_runtime_bytes(dense_path, setting)
-        if runtime_bytes is not None:
-            dense = runtime_bytes / GIB
-            head = 0.0
-        else:
+        dense = runtime_bytes / GIB
+        head = 0.0
+        if str(setting or "").strip().lower() not in {
+            "1", "true", "all"
+        }:
             name = manifest.get("dspark_file")
             if name and (root / name).is_file():
                 attachment = 2.5
-    return dense + head + attachment + 1.5 + _initial_kv_gib(
-        architecture,
-        max_ctx,
-    )
+    if architecture == "dsv4":
+        from .capacity import dsv4_context_runtime_bytes
+
+        context_gib = (
+            dsv4_context_runtime_bytes(config, max_ctx).total_bytes / GIB
+        )
+    else:
+        context_gib = _initial_kv_gib(architecture, max_ctx)
+    return dense + head + attachment + 1.5 + context_gib
 
 
 def kimi_parallel_rank_bytes(
@@ -660,6 +709,18 @@ def main(argv: list[str] | None = None) -> None:
                 else "未配置 ratio-4 压缩层"
             )
         )
+        from .capacity import dsv4_context_runtime_bytes
+
+        context_memory = dsv4_context_runtime_bytes(
+            manifest["config"],
+            max_ctx,
+        )
+        print(
+            "[通过] DSV4 上下文容量："
+            f"max_ctx={max_ctx}；完整状态="
+            f"{context_memory.total_bytes / GIB:.3f}GiB；"
+            f"渐近增量={context_memory.asymptotic_bytes_per_token / 1024:.2f}KiB/token"
+        )
         if manifest.get("quant", {}).get("method") == "projection-vq":
             # Run exactly the same capability normalization used by model
             # construction so unsupported packed widths fail here, before
@@ -668,12 +729,11 @@ def main(argv: list[str] | None = None) -> None:
 
             model_manifest = Manifest(str(root))
             capabilities = {
-                tuple(
-                    model_manifest.projection_operator_capability(layer)[
-                        "packed_formats"
-                    ]
-                )
+                tuple(capability["packed_formats"])
                 for layer in model_manifest.expert_files
+                for capability in (
+                    model_manifest.projection_operator_capabilities(layer)
+                )
             }
             formats = sorted(
                 {item for capability in capabilities for item in capability},

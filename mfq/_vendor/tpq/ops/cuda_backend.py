@@ -39,6 +39,18 @@ def _block_scaled_gemv(**kwargs):
         )
 
 
+def _dense_gemv(**kwargs):
+    from ..fusedext import bf16_gemv_fused
+
+    value = kwargs["value"]
+    with torch.cuda.device(value.device):
+        return bf16_gemv_fused(
+            value,
+            kwargs["weight"],
+            kwargs["output"],
+        )
+
+
 def _block_scaled_grouped_gemv(**kwargs):
     from ..fusedext import block_fp8_grouped_gemv_fused
 
@@ -53,6 +65,37 @@ def _block_scaled_grouped_gemv(**kwargs):
             int(kwargs["cols"]),
             int(kwargs["block_size"]),
             output=kwargs.get("output"),
+        )
+
+
+def _compressed_state_update(**kwargs):
+    from ..fusedext import compressed_state_update_fused
+
+    projected = kwargs["projected"]
+    with torch.cuda.device(projected.device):
+        return compressed_state_update_fused(
+            projected,
+            kwargs["ape"],
+            kwargs["ckv"],
+            kwargs["cscore"],
+            int(kwargs["ratio"]),
+            int(kwargs["position"]),
+            int(kwargs["kv_rows"]),
+        )
+
+
+def _head_rmsnorm_rope(**kwargs):
+    from ..fusedext import head_rmsnorm_rope_fused
+
+    rows = kwargs["rows"]
+    with torch.cuda.device(rows.device):
+        return head_rmsnorm_rope_fused(
+            rows,
+            kwargs["weight"],
+            kwargs["cos"],
+            kwargs["sin"],
+            int(kwargs["rope_width"]),
+            float(kwargs["eps"]),
         )
 
 
@@ -609,6 +652,19 @@ def register(registry: OperatorRegistry) -> None:
         priority=50,
     )
     registry.register(
+        "cuda.dense_gemv.bf16.decode",
+        OperatorCapability(
+            operation="dense_gemv",
+            device_types=("cuda",),
+            packed_formats=("bf16",),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=(1,),
+        ),
+        _dense_gemv,
+        priority=100,
+    )
+    registry.register(
         "cuda.block_scaled_gemv.e4m3fn.b128.decode",
         OperatorCapability(
             operation="block_scaled_gemv",
@@ -661,6 +717,32 @@ def register(registry: OperatorRegistry) -> None:
             batch_sizes=(1,),
         ),
         _block_scaled_grouped_gemv,
+        priority=110,
+    )
+    registry.register(
+        "cuda.compressed_state_update.ring.decode",
+        OperatorCapability(
+            operation="compressed_state_update",
+            device_types=("cuda",),
+            code_dims=(4, 128),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=(1,),
+        ),
+        _compressed_state_update,
+        priority=110,
+    )
+    registry.register(
+        "cuda.head_rmsnorm_rope.f32_bf16.decode",
+        OperatorCapability(
+            operation="head_rmsnorm_rope",
+            device_types=("cuda",),
+            code_dims=(64, 128, 256, 512, 1024),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=(1,),
+        ),
+        _head_rmsnorm_rope,
         priority=110,
     )
     registry.register(

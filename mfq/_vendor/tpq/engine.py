@@ -78,6 +78,7 @@ def _make_model(
     device: str,
     vram_cache_gb: float,
     tp_size: int = 1,
+    extreme_fixed_gpu_bytes: int = 0,
 ):
     """按 TPQ 清单字段分派 Kimi、DeepSeek-V4 或 GLM。"""
     _root, manifest = _load_tpq_manifest(model_dir)
@@ -95,12 +96,14 @@ def _make_model(
             device=device,
             vram_cache_gb=vram_cache_gb,
             tp_size=tp_size,
+            extreme_fixed_gpu_bytes=extreme_fixed_gpu_bytes,
         ), "kimi_k3"
     if "hc_mult" in cfg or "compress_ratios" in cfg:
-        projection_vq = bool(
-            manifest.get("quant", {}).get("method") == "projection-vq"
-            and manifest.get("quant", {}).get("projection_layouts")
-        )
+        # Reuse the canonical manifest parser: projection-VQ may be declared
+        # per layer or by a heterogeneous per-expert precision map.
+        from .store import Manifest
+
+        projection_vq = Manifest(model_dir).projection_vq
         if tp_size != 1 and not projection_vq:
             raise ValueError(
                 "--tp > 1 requires a projection-VQ DeepSeek-V4 archive"
@@ -108,7 +111,10 @@ def _make_model(
         from .dsv4model import DSV4TPQModel
         return DSV4TPQModel(model_dir, cache_gb=cache_gb, max_ctx=max_ctx,
                              device=device, vram_cache_gb=vram_cache_gb,
-                             tp_size=tp_size), "dsv4"
+                             tp_size=tp_size,
+                             extreme_fixed_gpu_bytes=(
+                                 extreme_fixed_gpu_bytes
+                             )), "dsv4"
     return GLMModel(model_dir, cache_gb=cache_gb, max_ctx=max_ctx,
                     device=device, vram_cache_gb=vram_cache_gb,
                     tp_size=tp_size), "glm"
@@ -178,12 +184,13 @@ def _dense_need_gb(model_dir: str, arch_hint: str, kv_gb: float) -> float:
                 dense_path,
                 os.environ.get("TPQ_DENSE_BF16"),
             )
-            if runtime_bytes is not None:
-                # BF16 展开值已包含 head。DSpark 在 spec=0 时不加载；实验
-                # 投机路径启用后会根据实分配再次收紧专家 cache。
-                dense_gb = runtime_bytes / 2**30
-                head_gb = 0.0
-                dsv4_bf16_resident = True
+            # The header calculation covers both compact and BF16-resident
+            # modes and already includes lm_head exactly once.
+            dense_gb = runtime_bytes / 2**30
+            head_gb = 0.0
+            dsv4_bf16_resident = str(
+                os.environ.get("TPQ_DENSE_BF16", "")
+            ).strip().lower() in {"1", "true", "all"}
         fn = man.get("dspark_file") or man.get("mtp_file")  # 清单指引（产物自包含）
         if fn and os.path.exists(os.path.join(model_dir, fn)):
             if man.get("dspark_file"):
@@ -284,13 +291,30 @@ class Engine:
         vram_cache_gb: float | None = None,
         tp_size: int = 1,
         dense_residency: str = "auto",
+        extreme_mode: bool | None = None,
     ):
         import psutil
         t0 = time.time()
         self.quiet = quiet
+        requested_extreme = extreme_mode
+        if extreme_mode is True:
+            from .extreme import configure_extreme_environment
+
+            configure_extreme_environment()
+        self.extreme_mode = bool(
+            extreme_mode is True
+            or os.environ.get("TPQ_EXTREME_MODE", "0") != "0"
+        )
+        self.auto_extreme_decision = None
+        self.extreme_strategy = "disabled"
+        extreme_archive = None
         if tp_size <= 0:
             raise ValueError("tp_size must be positive")
         self.tp_size = int(tp_size)
+        if self.extreme_mode and (self.tp_size != 1 or device != "cuda"):
+            raise ValueError("极限模式要求单卡 device='cuda', tp_size=1")
+        if self.extreme_mode:
+            dense_residency = "gpu"
         dense_residency = str(dense_residency).strip().lower()
         if dense_residency not in {"auto", "gpu"}:
             raise ValueError("dense_residency must be 'auto' or 'gpu'")
@@ -323,6 +347,47 @@ class Engine:
                 arch_hint = "kimi_k3"
             elif "hc_mult" in _cfg or "compress_ratios" in _cfg:
                 arch_hint = "dsv4"
+        if (
+            not self.extreme_mode
+            and requested_extreme is None
+            and os.environ.get("TPQ_AUTO_EXTREME", "1") != "0"
+        ):
+            from .extreme import (
+                configure_extreme_environment,
+                detect_auto_extreme,
+            )
+
+            normal_reserve = float(
+                os.environ.get("TPQ_RESIDENT_RESERVE_GB", "32")
+            )
+            self.auto_extreme_decision = detect_auto_extreme(
+                model_dir,
+                max_ctx=max_ctx,
+                device=device,
+                tp_size=self.tp_size,
+                normal_ram_reserve_gib=normal_reserve,
+                environment=os.environ,
+            )
+            if self.auto_extreme_decision.activate:
+                configure_extreme_environment()
+                self.extreme_mode = True
+                dense_residency = "gpu"
+                self.dense_residency["requested"] = "gpu"
+                if not quiet:
+                    decision = self.auto_extreme_decision
+                    print(
+                        "[tpq-auto] RAM 单侧安全容量不足，自动切换极限模式："
+                        f"专家 {decision.expert_bytes / 2**30:.2f}GiB；"
+                        f"转入 GPU {decision.spill_bytes / 2**30:.2f}GiB；"
+                        f"GPU 专家余量 "
+                        f"{decision.gpu_expert_capacity / 2**30:.2f}GiB",
+                        flush=True,
+                    )
+        if self.extreme_mode:
+            from .extreme import inspect_compact_projection_archive
+
+            extreme_archive = inspect_compact_projection_archive(model_dir)
+            self.extreme_strategy = "layered"
         # Tokenizer 是运行时硬依赖，必须在数百 GiB 权重加载之前验证并初始化。
         # 旧顺序在模型完整 preload 后才 import ``tokenizers``，一旦 Python
         # 环境缺包，会白白消耗数分钟加载时间和大量磁盘读。Kimi 继续使用其
@@ -337,10 +402,18 @@ class Engine:
             prepared_tokenizer = Tokenizer.from_file(
                 os.path.join(model_dir, "tokenizer.json")
             )
-        # RAM 开销按架构：DSV4 的 KV 为环形窗+压缩槽（≈0.2GB 与上下文长度几乎无关），
-        # f32 常驻 = head 2.1GB；GLM KV f16 ≈5MB/token、f32 常驻 4.5GB
+        # RAM 开销按架构。普通 DSV4 允许 paged KV 按需增长；极限模式的
+        # GPU-only 专家不可再收缩，所以必须在放置专家前为完整声明上下文预留。
         if arch_hint == "dsv4":
-            kv_gb = 0.2
+            if self.extreme_mode:
+                from .capacity import dsv4_context_runtime_bytes
+
+                kv_gb = (
+                    dsv4_context_runtime_bytes(_cfg, max_ctx).total_bytes
+                    / 2**30
+                )
+            else:
+                kv_gb = 0.2
             ram_overhead = 2.0 + 2.1 + kv_gb + 3.0   # f32 2.1 + 安全 3（用户实测调优）
         else:
             # GLM：MLA 潜变量 KV（默认开）≈0.09MB/token + 吸收矩阵 2.3GB；
@@ -355,11 +428,21 @@ class Engine:
             initial_ctx = min(max(0, int(max_ctx)), 4096)
             kv_gb = 0.5 + 0.027 * initial_ctx / 1024
             ram_overhead = 2.0 + kv_gb + 6.0
-        avail_ram = psutil.virtual_memory().available / 2**30
-        auto_ram = max(2.0, avail_ram - ram_overhead)
+        if self.extreme_mode:
+            from .extreme import effective_available_memory_bytes
+
+            avail_ram = effective_available_memory_bytes() / 2**30
+        else:
+            avail_ram = psutil.virtual_memory().available / 2**30
+        auto_ram = (
+            max(0.0, avail_ram - 1.0)
+            if self.extreme_mode
+            else max(2.0, avail_ram - ram_overhead)
+        )
 
         dev = device
         auto_vram = vram_cache_gb
+        extreme_fixed_gpu_bytes = 0
         if device == "cuda":
             if not torch.cuda.is_available():
                 if dense_residency == "gpu":
@@ -413,17 +496,34 @@ class Engine:
                 # 带宽掉到 PCIe 级，整轮同步卡顿）。给本进程分配器设硬上限 =
                 # 空闲显存 − 系统预留，宁可 OOM 报错也绝不触发共享显存换页。
                 reserve_gb = float(os.environ.get("TPQ_VRAM_RESERVE_GB", "1.25"))
+                extreme_vram_cap_gb = max(
+                    0.0,
+                    float(os.environ.get("TPQ_EXTREME_VRAM_CAP_GB", "0")),
+                )
+                planning_free_v = (
+                    min(free_v, extreme_vram_cap_gb)
+                    if extreme_vram_cap_gb > 0
+                    else free_v
+                )
                 fractions = []
                 limits = []
                 for rank, (free_bytes, total_bytes) in enumerate(
                     rank_memory
                 ):
+                    process_available = free_bytes
+                    minimum_fraction = 0.10
+                    if extreme_vram_cap_gb > 0:
+                        process_available = min(
+                            process_available,
+                            int(extreme_vram_cap_gb * 2**30),
+                        )
+                        minimum_fraction = 0.01
                     fraction = max(
-                        0.10,
+                        minimum_fraction,
                         min(
                             0.99,
                             (
-                                free_bytes
+                                process_available
                                 - int(reserve_gb * 2**30)
                             )
                             / total_bytes,
@@ -441,27 +541,86 @@ class Engine:
                     print(f"[tpq] 显存适配: 物理 {total_v:.1f}GB / 空闲 {free_v:.1f}GB → "
                           f"本进程上限 {frac * total_v:.1f}GB（预留 {reserve_gb:.2f}GB 防共享显存）",
                           flush=True)
+                    if extreme_vram_cap_gb > 0:
+                        print(
+                            "[tpq-extreme] 测试显存硬上限："
+                            f"{extreme_vram_cap_gb:.2f}GiB",
+                            flush=True,
+                        )
                 # dense 常驻需求按架构：GLM ≈13.5GB（int4 9.2 + lm_head 3.8 + router 0.5），
                 # DSV4 ≈10.5GB（dense 一次性反量化 bf16 常驻 ≈7.2 + head bf16 ≈1.1 + DSpark ≈2.2；
                 # bf16 消除逐调用反量化，是 attn 段的关键提速；+ KV + 安全 2GB（悬崖余量）
                 dense_need = _dense_need_gb(model_dir, arch_hint, kv_gb)
+                if self.extreme_mode and extreme_archive is not None:
+                    from .extreme import (
+                        EXTREME_GPU_LOAD_WORKSPACE_GIB,
+                        GIB,
+                        choose_extreme_strategy,
+                    )
+
+                    dense_resident_need = max(
+                        0.0,
+                        dense_need - EXTREME_GPU_LOAD_WORKSPACE_GIB,
+                    )
+
+                    self.extreme_strategy = choose_extreme_strategy(
+                        compact_expert_bytes=extreme_archive.expert_bytes,
+                        fixed_gpu_bytes=int(dense_resident_need * GIB),
+                        gpu_limit_bytes=self._vram_limit_bytes,
+                    )
+                    if self.extreme_strategy == "layered":
+                        # The hybrid pool turns this estimate into a real CUDA
+                        # allocation before placing any expert. Dense later
+                        # replaces that allocation, so capacity is proven
+                        # without keeping a second full weight copy.
+                        extreme_fixed_gpu_bytes = int(
+                            dense_resident_need * GIB
+                        )
+                    if self.extreme_strategy == "full-gpu":
+                        # Reuse the same model-independent packed resident
+                        # pool as profile=resident.  Extreme remains a capacity
+                        # policy; it must not force RAM/H2D when the complete
+                        # compact archive already fits one GPU.
+                        os.environ["TPQ_PACKED_FULL_GPU"] = "1"
+                    if not quiet:
+                        print(
+                            "[tpq-extreme] 公共紧凑归档："
+                            f"{len(extreme_archive.layers)} 层 / "
+                            f"{extreme_archive.expert_bytes / GIB:.2f}GiB；"
+                            f"策略={self.extreme_strategy}",
+                            flush=True,
+                        )
                 # 余量按架构：GLM 的 dense 常驻 + 吸收矩阵(2.1GB) + 瞬态反量化块贴近
                 # 分配器硬上限，实测 1-2GB 余量仍会在 decode 中 OOM → GLM 3GB，DSV4 1GB
                 #（GLM 专家本就走 RAM/磁盘流式，显存缓存价值低）
-                margin = 3.0 if arch_hint == "glm" else 1.0
-                if free_v < dense_need + margin:
+                margin = (
+                    0.0
+                    if self.extreme_mode
+                    else (3.0 if arch_hint == "glm" else 1.0)
+                )
+                if planning_free_v < dense_need + margin:
                     if dense_residency == "gpu":
                         raise RuntimeError(
                             "Dense 要求 GPU 常驻，但空闲显存 "
-                            f"{free_v:.1f}GB < 需要 "
+                            f"{planning_free_v:.1f}GB < 需要 "
                             f"{dense_need + margin:.1f}GB"
                         )
-                    print(f"[tpq] 显存不足（空闲 {free_v:.1f}GB < 需要 {dense_need + margin:.1f}GB），"
+                    print(f"[tpq] 显存不足（空闲 {planning_free_v:.1f}GB < 需要 {dense_need + margin:.1f}GB），"
                           f"回退 CPU 模式", flush=True)
                     dev = "cpu"
                 elif vram_cache_gb is None:
                     # 显存余量 2GB（DSV4）：顶到 100% 会触发分配器 cudaFree+同步回收（悬崖 ×4）
-                    auto_vram = max(0.5, free_v - dense_need - margin)
+                    # 极限模式把完整可用余量交给 packed pool；pool 会先用
+                    # extreme_fixed_gpu_bytes 建立真实 CUDA 占位，再从剩余空间
+                    # 放置专家。Dense 流式加载时直接复用占位块，不会重复扣除。
+                    auto_vram = (
+                        planning_free_v
+                        if self.extreme_mode
+                        else max(
+                            0.5,
+                            planning_free_v - dense_need - margin,
+                        )
+                    )
         if cache_gb is None:
             cache_gb = auto_ram
         if vram_cache_gb is None:
@@ -499,9 +658,17 @@ class Engine:
                 device=dev,
                 vram_cache_gb=vram_cache_gb or 4.0,
                 tp_size=self.tp_size,
+                extreme_fixed_gpu_bytes=extreme_fixed_gpu_bytes,
             )
             self.model.preload()
-        except torch.cuda.OutOfMemoryError:
+        except torch.cuda.OutOfMemoryError as oom_error:
+            if self.extreme_mode:
+                raise RuntimeError(
+                    "极限模式显存不足：Dense、GPU 专家层、Top-K staging 与当前"
+                    f" max_ctx={max_ctx} 无法同时容纳。请降低 --max-ctx、"
+                    "关闭其他显存进程或换用更小模型。底层分配："
+                    f"{oom_error}"
+                ) from oom_error
             if dev != "cuda" or (vram_cache_gb or 4.0) <= 1.0:
                 raise
             # Leave the exception handler before retrying.  Its traceback keeps
@@ -524,10 +691,19 @@ class Engine:
                 device=dev,
                 vram_cache_gb=retry_vram_cache_gb,
                 tp_size=self.tp_size,
+                extreme_fixed_gpu_bytes=0,
             )
             self.model.preload()
         full_resident = bool(
             getattr(getattr(self.model, "pool", None), "full_resident", False)
+        )
+        compact_cpu_resident = bool(
+            dev == "cpu"
+            and getattr(
+                getattr(self.model, "pool", None),
+                "compact_full_resident",
+                False,
+            )
         )
         if dev == "cuda":
             released, dense_paths = (
@@ -599,6 +775,7 @@ class Engine:
         if (
             dev == "cuda"
             and not full_resident
+            and not self.extreme_mode
             and os.environ.get("TPQ_VRAM_WATCH", "1") != "0"
         ):
             _pool = getattr(self.model, "pool", None)
@@ -633,10 +810,38 @@ class Engine:
                     f"主机专家 {pool.host_expert_bytes / 2**30:.2f}GB",
                     flush=True,
                 )
+            elif compact_cpu_resident:
+                pool = self.model.pool
+                print(
+                    f"[tpq] 模型加载完成（{time.time() - t0:.1f}s）："
+                    f"CPU 专家执行镜像 {pool.host_expert_bytes / 2**30:.2f}GB "
+                    f"全量常驻；cpu_compile="
+                    f"{getattr(pool, 'cpu_compile_mode', 'off')}；"
+                    f"expanded_index_bytes="
+                    f"{getattr(pool, 'expanded_index_bytes', 0)}",
+                    flush=True,
+                )
             else:
+                pool = getattr(self.model, "pool", None)
+                extreme_detail = ""
+                if self.extreme_mode and pool is not None:
+                    ram_layers = len(
+                        getattr(pool, "extreme_ram_layers", ())
+                    )
+                    gpu_layers = len(
+                        getattr(pool, "extreme_gpu_layers", ())
+                    )
+                    ratio = float(
+                        getattr(pool, "extreme_storage_ratio", 0.0)
+                    )
+                    extreme_detail = (
+                        f"；极限常驻 RAM={ram_layers}层/GPU={gpu_layers}层"
+                        f"/紧凑开销={ratio:.3f}x"
+                    )
                 print(
                     f"[tpq] 模型加载完成（{time.time() - t0:.1f}s）"
-                    f"专家缓存预算 {cache_gb:.0f}GB",
+                    f"专家缓存预算 {cache_gb:.0f}GB"
+                    f"{extreme_detail}",
                     flush=True,
                 )
 
@@ -646,6 +851,7 @@ class Engine:
         if (
             pool is None
             or getattr(pool, "full_resident", False)
+            or getattr(pool, "fixed_extreme_residency", False)
             or getattr(pool, "manages_per_rank_budget", False)
             or not self._vram_limit_bytes
         ):
@@ -1612,6 +1818,19 @@ class Engine:
         GLM 仍走 MTP layer 78。
         """
         if getattr(self, "arch", "glm") == "kimi_k3":
+            if (
+                getattr(self.model, "device", torch.device("cpu")).type
+                == "cpu"
+                and hasattr(self.model, "forward_hidden_block_cpu")
+                and hasattr(self.model, "snapshot_decode_state")
+            ):
+                return self._generate_kimi_prompt_lookup(
+                    ids,
+                    max_new=max_new,
+                    k=k,
+                    callback=callback,
+                    should_stop=should_stop,
+                )
             return self.generate(
                 ids,
                 max_new=max_new,
@@ -1764,6 +1983,123 @@ class Engine:
             h_main_last = h2[accepted:accepted + 1]
             next_pos += 1 + accepted
         self.spec_stats = stats
+        return out
+
+    @staticmethod
+    def _prompt_lookup_draft(
+        history: list[int],
+        maximum: int,
+        *,
+        minimum_ngram: int = 3,
+        maximum_ngram: int = 16,
+    ) -> list[int]:
+        """Copy a continuation after the longest previous suffix match."""
+        if maximum <= 0 or len(history) <= minimum_ngram:
+            return []
+        upper = min(maximum_ngram, len(history) - 1)
+        for width in range(upper, minimum_ngram - 1, -1):
+            suffix = history[-width:]
+            latest = len(history) - width - 1
+            for start in range(latest, -1, -1):
+                if history[start:start + width] != suffix:
+                    continue
+                draft = history[start + width:start + width + maximum]
+                if draft:
+                    return list(draft)
+        return []
+
+    @torch.no_grad()
+    def _generate_kimi_prompt_lookup(
+        self,
+        ids: list[int],
+        *,
+        max_new: int | None,
+        k: int,
+        callback=None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> list[int]:
+        """Lossless prompt-lookup decode using Kimi's CPU block verifier."""
+        maximum_draft = max(1, min(int(k), 15))
+        max_ctx = getattr(self.model, "max_ctx", None)
+        if max_ctx and len(ids) >= max_ctx:
+            return []
+        if max_new is not None and max_ctx:
+            max_new = min(max_new, max(0, max_ctx - len(ids)))
+        logits = self._prepare_glm_prompt(ids)
+        history = list(ids)
+        out: list[int] = []
+        stats = {
+            "mode": "kimi_prompt_lookup_block",
+            "rounds": 0,
+            "block_rounds": 0,
+            "fallback_rounds": 0,
+            "drafted": 0,
+            "accepted": 0,
+            "replayed": 0,
+        }
+        stop = False
+        while (
+            not stop
+            and _generation_open(
+                len(out), max_new, len(ids) + len(out), max_ctx
+            )
+        ):
+            first = int(logits.argmax().item())
+            if first in self.eos:
+                break
+            out.append(first)
+            history.append(first)
+            if callback:
+                callback(first, self.decode([first]))
+            stop = should_stop is not None and should_stop()
+            stats["rounds"] += 1
+            room = maximum_draft
+            if max_new is not None:
+                room = min(room, max_new - len(out))
+            if max_ctx is not None:
+                room = min(room, max_ctx - len(ids) - len(out))
+            if stop or room <= 0:
+                logits = self.model.forward([first])
+                stats["fallback_rounds"] += 1
+                break
+            drafts = self._prompt_lookup_draft(history, room)
+            if not drafts:
+                logits = self.model.forward([first])
+                stats["fallback_rounds"] += 1
+                continue
+            snapshot = self.model.snapshot_decode_state()
+            hidden = self.model.forward_hidden_block_cpu([first] + drafts)
+            block_logits = self.model.logits_of(hidden)
+            stats["block_rounds"] += 1
+            stats["drafted"] += len(drafts)
+            accepted = 0
+            for index, draft in enumerate(drafts):
+                if int(block_logits[index].argmax().item()) != draft:
+                    break
+                if draft in self.eos:
+                    stop = True
+                    break
+                out.append(draft)
+                history.append(draft)
+                accepted += 1
+                if callback:
+                    callback(draft, self.decode([draft]))
+                if should_stop is not None and should_stop():
+                    stop = True
+                    break
+            stats["accepted"] += accepted
+            fully_committed = accepted == len(drafts) and not stop
+            if fully_committed:
+                logits = block_logits[accepted]
+                continue
+            self.model.restore_decode_state(snapshot)
+            committed = [first] + drafts[:accepted]
+            canonical_hidden = self.model.forward_hidden(committed)
+            logits = self.model.logits_of(canonical_hidden[-1:]).squeeze(0)
+            stats["replayed"] += len(committed)
+        self.spec_stats = stats
+        self._cache_ids = list(ids) + out
+        self._cache_via_spec = False
         return out
 
     @torch.no_grad()

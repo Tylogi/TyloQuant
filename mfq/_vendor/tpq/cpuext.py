@@ -18,7 +18,7 @@ import torch
 _EXT = None
 _TRIED = False
 _ERR: str | None = None
-_EXTENSION_NAME = "tpq_cpu_kernels_v86"
+_EXTENSION_NAME = "tpq_cpu_kernels_v147"
 _PACKED_MOE_WORKSPACE: tuple[torch.Tensor, torch.Tensor] | None = None
 _PACKED_THREE_WORKSPACE: tuple[torch.Tensor, ...] | None = None
 _PACKED_MOE_LOCK = threading.Lock()
@@ -29,16 +29,18 @@ def configure_cpu_threads() -> int:
     raw = os.environ.get("TPQ_CPU_THREADS", "auto").strip().lower()
     if raw in ("0", "false", "off", "none"):
         return torch.get_num_threads()
-    if raw not in ("", "auto"):
+    logical = os.cpu_count() or torch.get_num_threads()
+    try:
+        import psutil
+
+        physical = psutil.cpu_count(logical=False) or logical
+    except ImportError:
+        physical = logical
+    if raw == "physical":
+        target = physical
+    elif raw not in ("", "auto"):
         target = max(1, int(raw))
     else:
-        logical = os.cpu_count() or torch.get_num_threads()
-        try:
-            import psutil
-
-            physical = psutil.cpu_count(logical=False) or logical
-        except ImportError:
-            physical = logical
         if physical >= 32 and logical >= 2 * physical:
             target = max(1, physical * 3 // 4)
         else:
@@ -147,6 +149,70 @@ def vq_gemv_cpu(
     )
 
 
+def vq_repack_block_major_cpu(
+    payload: torch.Tensor,
+    rows: int,
+    blocks: int,
+    bits: int,
+) -> torch.Tensor | None:
+    """Reorder packed VQ indices while preserving their exact bit width."""
+    if payload.is_cuda or payload.dtype != torch.uint8:
+        return None
+    extension = _build()
+    if extension is None:
+        return None
+    return extension.vq_repack_block_major(
+        payload.contiguous().reshape(-1),
+        int(rows),
+        int(blocks),
+        int(bits),
+    )
+
+
+def vq_repack_row_tile_cpu(
+    payload: torch.Tensor,
+    rows: int,
+    blocks: int,
+    bits: int,
+    tile_rows: int = 8,
+) -> torch.Tensor | None:
+    """Build a compact row-tile traversal without expanding indices."""
+    if payload.is_cuda or payload.dtype != torch.uint8:
+        return None
+    extension = _build()
+    if extension is None:
+        return None
+    return extension.vq_repack_row_tile(
+        payload.contiguous().reshape(-1),
+        int(rows),
+        int(blocks),
+        int(bits),
+        int(tile_rows),
+    )
+
+
+def vq_compile_u16_row_tile_cpu(
+    payload: torch.Tensor,
+    rows: int,
+    blocks: int,
+    bits: int,
+    tile_rows: int = 8,
+) -> torch.Tensor | None:
+    """Compile packed indices directly into their final CPU execution arena."""
+    if payload.is_cuda or payload.dtype != torch.uint8:
+        return None
+    extension = _build()
+    if extension is None:
+        return None
+    return extension.vq_compile_u16_row_tile(
+        payload.contiguous().reshape(-1),
+        int(rows),
+        int(blocks),
+        int(bits),
+        int(tile_rows),
+    )
+
+
 def vq_gemv_list_cpu(
     x_rows: torch.Tensor,
     indices: list[torch.Tensor],
@@ -181,6 +247,8 @@ def block_fp8_gemv_cpu(
     cols: int,
     block_size: int,
     output: torch.Tensor | None = None,
+    *,
+    rows: int | None = None,
 ) -> torch.Tensor | None:
     """Direct compact E4M3FN block-scaled GEMV for one CPU token."""
     if (
@@ -190,8 +258,7 @@ def block_fp8_gemv_cpu(
         or value.dtype not in (torch.float32, torch.bfloat16)
         or weights.is_cuda
         or weights.dtype != torch.uint8
-        or weights.ndim != 2
-        or tuple(weights.shape) != (int(weights.shape[0]), int(cols))
+        or weights.ndim not in (2, 5)
         or scales.is_cuda
         or scales.dtype != torch.float32
         or int(block_size) != 128
@@ -200,15 +267,127 @@ def block_fp8_gemv_cpu(
     extension = _build()
     if extension is None:
         return None
-    rows = int(weights.shape[0])
+    if rows is None:
+        rows = (
+            int(weights.shape[0])
+            if weights.ndim == 2
+            else int(weights.shape[0]) * int(block_size)
+        )
     if output is None:
-        output = torch.empty(rows, dtype=value.dtype)
+        output = torch.empty(int(rows), dtype=value.dtype)
     return extension.block_fp8_gemv(
         value,
         weights,
         scales,
+        int(rows),
         int(cols),
         int(block_size),
+        output,
+    )
+
+
+def block_fp8_gemm_cpu(
+    value: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    cols: int,
+    block_size: int,
+    output: torch.Tensor | None = None,
+    *,
+    rows: int | None = None,
+) -> torch.Tensor | None:
+    """Scan compact block-FP8 once for 2..16 candidate tokens."""
+    if (
+        value.is_cuda
+        or value.ndim != 2
+        or not 2 <= value.shape[0] <= 16
+        or value.shape[1] != int(cols)
+        or value.dtype not in (torch.float32, torch.bfloat16)
+        or weights.is_cuda
+        or weights.dtype != torch.uint8
+        or weights.ndim not in (2, 5)
+        or scales.is_cuda
+        or scales.dtype != torch.float32
+        or int(block_size) != 128
+    ):
+        return None
+    extension = _build()
+    if extension is None:
+        return None
+    if rows is None:
+        rows = (
+            int(weights.shape[0])
+            if weights.ndim == 2
+            else int(weights.shape[0]) * int(block_size)
+        )
+    if output is None:
+        output = torch.empty(
+            int(value.shape[0]), int(rows), dtype=value.dtype
+        )
+    return extension.block_fp8_gemm(
+        value,
+        weights,
+        scales,
+        int(rows),
+        int(cols),
+        int(block_size),
+        output,
+    )
+
+
+def block_fp8_to_block_major_cpu(
+    weights: torch.Tensor,
+    block_size: int = 128,
+) -> torch.Tensor | None:
+    """Pack compact FP8 bytes into the public 32x128 CPU tile layout."""
+    if (
+        weights.is_cuda
+        or weights.dtype != torch.uint8
+        or weights.ndim != 2
+        or not weights.is_contiguous()
+        or int(block_size) != 128
+    ):
+        return None
+    extension = _build()
+    if extension is None:
+        return None
+    return extension.block_fp8_to_block_major(weights, int(block_size))
+
+
+def bf16_grouped_gemv_cpu(
+    value: torch.Tensor,
+    weight_ptrs: torch.Tensor,
+    row_offsets: torch.Tensor,
+    total_rows: int,
+    cols: int,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Apply several BF16 matrices to one CPU token in one native call."""
+    if (
+        value.is_cuda
+        or value.ndim != 2
+        or value.shape != (1, int(cols))
+        or value.dtype not in (torch.float32, torch.bfloat16)
+        or weight_ptrs.is_cuda
+        or weight_ptrs.dtype != torch.int64
+        or row_offsets.is_cuda
+        or row_offsets.dtype != torch.int32
+        or int(total_rows) <= 0
+    ):
+        return None
+    extension = _build()
+    if extension is None:
+        return None
+    if output is None:
+        output = torch.empty(
+            1, int(total_rows), dtype=torch.bfloat16
+        )
+    return extension.bf16_grouped_gemv(
+        value.contiguous(),
+        weight_ptrs.contiguous(),
+        row_offsets.contiguous(),
+        int(total_rows),
+        int(cols),
         output,
     )
 
@@ -222,6 +401,8 @@ def block_fp8_grouped_gemv_cpu(
     cols: int,
     block_size: int,
     output: torch.Tensor | None = None,
+    *,
+    block_major: bool = False,
 ) -> torch.Tensor | None:
     """Evaluate a logical row-concatenation of compact CPU FP8 weights."""
     if (
@@ -252,6 +433,102 @@ def block_fp8_grouped_gemv_cpu(
         int(total_rows),
         int(cols),
         int(block_size),
+        bool(block_major),
+        output,
+    )
+
+
+def block_fp8_grouped_rows_gemv_cpu(
+    value: torch.Tensor,
+    weight_ptrs: torch.Tensor,
+    scale_ptrs: torch.Tensor,
+    row_offsets: torch.Tensor,
+    total_rows: int,
+    cols: int,
+    block_size: int,
+    output: torch.Tensor | None = None,
+    *,
+    block_major: bool = False,
+) -> torch.Tensor | None:
+    """One compact FP8 projection per matching input row."""
+    groups = int(weight_ptrs.numel())
+    if (
+        value.is_cuda
+        or value.ndim != 2
+        or value.shape != (groups, int(cols))
+        or value.dtype not in (torch.float32, torch.bfloat16)
+        or weight_ptrs.is_cuda
+        or weight_ptrs.dtype != torch.int64
+        or scale_ptrs.is_cuda
+        or scale_ptrs.dtype != torch.int64
+        or row_offsets.is_cuda
+        or row_offsets.dtype != torch.int32
+        or int(block_size) != 128
+        or int(total_rows) <= 0
+    ):
+        return None
+    extension = _build()
+    if extension is None:
+        return None
+    if output is None:
+        output = torch.empty(int(total_rows), dtype=value.dtype)
+    return extension.block_fp8_grouped_rows_gemv(
+        value.contiguous(),
+        weight_ptrs.contiguous(),
+        scale_ptrs.contiguous(),
+        row_offsets.contiguous(),
+        int(total_rows),
+        int(cols),
+        int(block_size),
+        bool(block_major),
+        output,
+    )
+
+
+def block_fp8_grouped_gemm_cpu(
+    value: torch.Tensor,
+    weight_ptrs: torch.Tensor,
+    scale_ptrs: torch.Tensor,
+    row_offsets: torch.Tensor,
+    total_rows: int,
+    cols: int,
+    block_size: int,
+    output: torch.Tensor | None = None,
+    *,
+    block_major: bool = False,
+) -> torch.Tensor | None:
+    """Batch a logical compact FP8 row-concatenation in one CPU call."""
+    if (
+        value.is_cuda
+        or value.ndim != 2
+        or not 2 <= value.shape[0] <= 16
+        or value.shape[1] != int(cols)
+        or value.dtype not in (torch.float32, torch.bfloat16)
+        or any(item.is_cuda for item in (
+            weight_ptrs, scale_ptrs, row_offsets
+        ))
+        or weight_ptrs.dtype != torch.int64
+        or scale_ptrs.dtype != torch.int64
+        or row_offsets.dtype != torch.int32
+        or int(block_size) != 128
+    ):
+        return None
+    extension = _build()
+    if extension is None:
+        return None
+    if output is None:
+        output = torch.empty(
+            int(value.shape[0]), int(total_rows), dtype=value.dtype
+        )
+    return extension.block_fp8_grouped_gemm(
+        value,
+        weight_ptrs,
+        scale_ptrs,
+        row_offsets,
+        int(total_rows),
+        int(cols),
+        int(block_size),
+        bool(block_major),
         output,
     )
 
@@ -441,19 +718,30 @@ def moe_packed_topk_cpu(
         down_spec = _shared_projection_spec(dn)
         with _PACKED_MOE_LOCK:
             if (
-                _PACKED_MOE_WORKSPACE is None
-                or _PACKED_MOE_WORKSPACE[1].numel() < hidden
-            ):
-                _PACKED_MOE_WORKSPACE = (
-                    torch.empty(1, dtype=torch.float32),
-                    torch.empty(hidden, dtype=torch.float32),
-                )
-            result = _PACKED_MOE_WORKSPACE[1]
-            if (
                 gate_spec is not None
                 and up_spec is not None
                 and down_spec is not None
             ):
+                required = (
+                    max(
+                        int(gate_spec.blocks * gate_spec.cb.shape[0]),
+                        int(up_spec.blocks * up_spec.cb.shape[0]),
+                    )
+                    + len(experts) * intermediate * 2
+                    + len(experts)
+                    * int(down_spec.blocks * down_spec.cb.shape[0])
+                    + len(experts) * hidden
+                )
+                if (
+                    _PACKED_MOE_WORKSPACE is None
+                    or _PACKED_MOE_WORKSPACE[0].numel() < required
+                    or _PACKED_MOE_WORKSPACE[1].numel() < hidden
+                ):
+                    _PACKED_MOE_WORKSPACE = (
+                        torch.empty(required, dtype=torch.float32),
+                        torch.empty(hidden, dtype=torch.float32),
+                    )
+                workspace, result = _PACKED_MOE_WORKSPACE
                 return extension.moe_packed_three_projection(
                     x_float,
                     [weight.raw for weight in gate],
@@ -480,8 +768,19 @@ def moe_packed_topk_cpu(
                         if activation_linear_beta is None
                         else float(activation_linear_beta)
                     ),
+                    workspace,
                     result,
                 )
+
+            if (
+                _PACKED_MOE_WORKSPACE is None
+                or _PACKED_MOE_WORKSPACE[1].numel() < hidden
+            ):
+                _PACKED_MOE_WORKSPACE = (
+                    torch.empty(1, dtype=torch.float32),
+                    torch.empty(hidden, dtype=torch.float32),
+                )
+            result = _PACKED_MOE_WORKSPACE[1]
 
             # Grouped projection codebooks (for example one codebook per
             # contiguous expert band) cannot use the one-codebook native fast
@@ -637,6 +936,336 @@ def reset_packed_moe_phase_profile() -> None:
         extension.reset_packed_moe_phase_profile()
 
 
+def make_resident_projection_cpu(weights: tuple[object, ...]):
+    """Build one fixed-address mixed BF16/block-FP8 decode projection.
+
+    The returned native executor owns token-sized workspaces only. Source
+    weights remain in their original format and a single OpenMP team covers
+    every logical output row.
+    """
+    from .kernels import BlockFP8Weight
+
+    if not weights:
+        return None
+    cols = int(weights[0].shape[1])
+    payloads: list[torch.Tensor] = []
+    scales: list[torch.Tensor] = []
+    rows: list[int] = []
+    kinds: list[int] = []
+    empty_scale = torch.empty(0, dtype=torch.float32)
+    for weight in weights:
+        if int(weight.shape[1]) != cols:
+            return None
+        if (
+            isinstance(weight, torch.Tensor)
+            and not weight.is_cuda
+            and weight.dtype == torch.bfloat16
+            and weight.ndim == 2
+            and weight.is_contiguous()
+        ):
+            payloads.append(weight)
+            scales.append(empty_scale)
+            rows.append(int(weight.shape[0]))
+            kinds.append(0)
+        elif (
+            isinstance(weight, BlockFP8Weight)
+            and not weight.q.is_cuda
+            and weight.block == 128
+            and weight.q.is_contiguous()
+            and weight.s.is_contiguous()
+        ):
+            payloads.append(weight.q)
+            scales.append(weight.s)
+            rows.append(int(weight.rows))
+            kinds.append(1)
+        else:
+            return None
+    extension = _build()
+    if extension is None:
+        return None
+    return extension.CpuResidentProjectionLayer(
+        payloads,
+        scales,
+        rows,
+        kinds,
+        cols,
+        128,
+    )
+
+
+def reset_resident_projection_profile() -> None:
+    extension = _build()
+    if extension is not None:
+        extension.reset_resident_projection_profile()
+
+
+def resident_projection_profile() -> dict[str, float | int]:
+    extension = _build()
+    if extension is None:
+        return {"calls": 0, "seconds": 0.0}
+    values = extension.resident_projection_profile()
+    return {
+        "calls": int(values[0]),
+        "seconds": float(values[1]),
+    }
+
+
+def make_packed_three_layer_cpu(
+    experts: tuple[tuple[object, object, object], ...],
+    *,
+    force_mixed: bool = False,
+):
+    """Build one generic resident packed Gate/Up/Down layer executor.
+
+    The executor retains compact p8--p16 payload tensors and their codebooks;
+    it never materializes indices or dequantized expert matrices.  Uniform
+    layers use the C++ resident directory.  Heterogeneous layers retain the
+    same public resident interface and select compact bundles directly before
+    entering the mixed-codebook fused operator, avoiding store/LRU rebuilds.
+    """
+    if not experts or any(len(bundle) != 3 for bundle in experts):
+        return None
+    gate = tuple(bundle[0] for bundle in experts)
+    up = tuple(bundle[1] for bundle in experts)
+    down = tuple(bundle[2] for bundle in experts)
+
+    def common(weights):
+        first = weights[0]
+        signature = (
+            int(first.rows),
+            int(first.blocks),
+            int(first.bits),
+            str(getattr(first, "layout", "row-major")),
+        )
+        if any(
+            (
+                int(weight.rows),
+                int(weight.blocks),
+                int(weight.bits),
+                str(getattr(weight, "layout", "row-major")),
+            )
+            != signature
+            for weight in weights[1:]
+        ):
+            return None
+        return signature
+
+    gate_spec = common(gate)
+    up_spec = common(up)
+    down_spec = common(down)
+    extension = _build()
+    if extension is None:
+        return None
+    uses_non_row_major = any(
+        getattr(weight, "layout", "row-major") != "row-major"
+        for weights in (gate, up, down)
+        for weight in weights
+    )
+    if (
+        force_mixed
+        or uses_non_row_major
+        or gate_spec is None
+        or up_spec is None
+        or down_spec is None
+    ):
+        def metadata(weights):
+            return (
+                [weight.raw for weight in weights],
+                [weight.cb.float().contiguous() for weight in weights],
+                [int(weight.rows) for weight in weights],
+                [int(weight.blocks) for weight in weights],
+                [int(weight.bits) for weight in weights],
+                [
+                    {
+                        "row-major": 0,
+                        "block-major": 1,
+                        "row-tile-8": 2,
+                        "u16-row-tile-8": 2,
+                    }[getattr(weight, "layout", "row-major")]
+                    for weight in weights
+                ],
+            )
+
+        return extension.CpuPackedThreeMixedLayer(
+            *metadata(gate),
+            *metadata(up),
+            *metadata(down),
+        )
+    return extension.CpuPackedThreeLayer(
+        [weight.raw for weight in gate],
+        [weight.cb.float().contiguous() for weight in gate],
+        *gate_spec[:3],
+        [weight.raw for weight in up],
+        [weight.cb.float().contiguous() for weight in up],
+        *up_spec[:3],
+        [weight.raw for weight in down],
+        [weight.cb.float().contiguous() for weight in down],
+        *down_spec[:3],
+    )
+
+
+def configure_packed_latent_moe_cpu(
+    executor,
+    input_weights: tuple[object, object, object, object],
+    output_weights: tuple[object, object],
+    route_correction: torch.Tensor,
+    route_mask: torch.Tensor,
+    routed_norm: torch.Tensor,
+    *,
+    top_k: int,
+    normalize_route: bool,
+    routed_scaling: float,
+    rms_eps: float,
+    limit: float,
+    scoring: str,
+    activation: str,
+    beta: float,
+    linear_beta: float | None,
+):
+    """Attach a full latent-MoE decode graph to a resident packed layer."""
+    from .kernels import BlockFP8Weight
+
+    if executor is None or not hasattr(executor, "configure_latent_moe"):
+        return None
+
+    def metadata(weights):
+        payloads = []
+        scales = []
+        rows = []
+        cols = []
+        kinds = []
+        for weight in weights:
+            if isinstance(weight, BlockFP8Weight):
+                if weight.q.is_cuda or weight.block != 128:
+                    return None
+                payloads.append(weight.q)
+                scales.append(weight.s)
+                rows.append(int(weight.rows))
+                cols.append(int(weight.cols))
+                kinds.append(1)
+            elif (
+                isinstance(weight, torch.Tensor)
+                and not weight.is_cuda
+                and weight.ndim == 2
+                and weight.dtype in (torch.bfloat16, torch.float32)
+            ):
+                payloads.append(weight.contiguous())
+                scales.append(torch.empty(0, dtype=torch.float32))
+                rows.append(int(weight.shape[0]))
+                cols.append(int(weight.shape[1]))
+                kinds.append(0 if weight.dtype == torch.bfloat16 else 2)
+            else:
+                return None
+        return payloads, scales, rows, cols, kinds
+
+    input_meta = metadata(input_weights)
+    output_meta = metadata(output_weights)
+    if input_meta is None or output_meta is None:
+        return None
+    if len(set(input_meta[3])) != 1:
+        return None
+    executor.configure_latent_moe(
+        input_meta[0],
+        input_meta[1],
+        input_meta[2],
+        input_meta[4],
+        input_meta[3][0],
+        output_meta[0],
+        output_meta[1],
+        output_meta[2],
+        output_meta[3],
+        output_meta[4],
+        route_correction.float().contiguous(),
+        route_mask.bool().contiguous(),
+        routed_norm.to(torch.bfloat16).contiguous(),
+        128,
+        int(top_k),
+        bool(normalize_route),
+        float(routed_scaling),
+        float(rms_eps),
+        float(limit),
+        str(scoring),
+        str(activation),
+        float(beta),
+        -1.0 if linear_beta is None else float(linear_beta),
+    )
+    return executor
+
+
+def reset_latent_moe_phase_profile() -> None:
+    extension = _build()
+    if extension is not None:
+        extension.reset_latent_moe_phase_profile()
+
+
+def latent_moe_phase_profile() -> dict[str, float | int]:
+    extension = _build()
+    if extension is None:
+        return {}
+    values = extension.latent_moe_phase_profile()
+    names = (
+        "calls",
+        "prelude_route_seconds",
+        "packed_experts_seconds",
+        "norm_output_seconds",
+        "total_seconds",
+    )
+    return {
+        name: int(value) if name == "calls" else float(value)
+        for name, value in zip(names, values)
+    }
+
+
+def configure_packed_resident_moe_cpu(
+    executor,
+    router_weight: torch.Tensor,
+    router_bias: torch.Tensor,
+    router_mask: torch.Tensor,
+    shared_weights: tuple[object, object, object],
+    *,
+    top_k: int,
+    normalize_route: bool,
+    routed_scaling: float,
+):
+    """Attach dense Router/shared projections to a compact resident layer.
+
+    The native executor keeps each source in its own compact format: routed
+    experts remain packed p8--p16 and shared projections remain block-FP8.
+    No logical weight matrix is materialized by this configuration step.
+    """
+    from .kernels import BlockFP8Weight
+
+    if (
+        executor is None
+        or not hasattr(executor, "configure_fused_moe")
+        or router_weight.is_cuda
+        or router_weight.ndim != 2
+        or router_weight.dtype not in (torch.float32, torch.bfloat16)
+        or len(shared_weights) != 3
+        or not all(
+            isinstance(weight, BlockFP8Weight)
+            and not weight.q.is_cuda
+            and weight.block == 128
+            for weight in shared_weights
+        )
+    ):
+        return None
+    executor.configure_fused_moe(
+        router_weight.contiguous(),
+        router_bias.float().contiguous(),
+        router_mask.bool().contiguous(),
+        [weight.q for weight in shared_weights],
+        [weight.s for weight in shared_weights],
+        [int(weight.rows) for weight in shared_weights],
+        [int(weight.cols) for weight in shared_weights],
+        128,
+        int(top_k),
+        bool(normalize_route),
+        float(routed_scaling),
+    )
+    return executor
+
+
 def packed_moe_phase_profile() -> dict[str, float | int]:
     extension = _build()
     if extension is None:
@@ -682,6 +1311,54 @@ def three_projection_phase_profile() -> dict[str, float | int]:
     }
 
 
+def reset_resident_moe_phase_profile() -> None:
+    extension = _build()
+    if extension is not None:
+        extension.reset_resident_moe_phase_profile()
+
+
+def resident_moe_phase_profile() -> dict[str, float | int]:
+    extension = _build()
+    if extension is None:
+        return {}
+    values = extension.resident_moe_phase_profile()
+    names = (
+        "calls",
+        "router_shared_gu_seconds",
+        "routed_gu_seconds",
+        "shared_routed_down_seconds",
+    )
+    return {
+        name: int(value) if name == "calls" else float(value)
+        for name, value in zip(names, values)
+    }
+
+
+def route_topk_sigmoid_cpu(
+    logits: torch.Tensor,
+    bias: torch.Tensor,
+    mask: torch.Tensor,
+    top_k: int,
+    normalize: bool,
+    scaling: float,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Run stable sigmoid routing without materializing sort auxiliaries."""
+    if logits.is_cuda or bias.is_cuda or mask.is_cuda:
+        return None
+    extension = _build()
+    if extension is None:
+        return None
+    weights, indices = extension.route_topk_sigmoid(
+        logits,
+        bias,
+        mask,
+        int(top_k),
+        bool(normalize),
+        float(scaling),
+    )
+    return weights, indices
+
+
 def reset_block_fp8_gemv_profile() -> None:
     extension = _build()
     if extension is not None:
@@ -697,6 +1374,14 @@ def block_fp8_gemv_profile() -> dict[str, float | int]:
         "calls": int(values[0]),
         "seconds": float(values[1]),
         "weight_elements": int(values[2]),
+        "block_major_pack_calls": int(values[3]),
+        "block_major_packed_bytes": int(values[4]),
+        "numa_bound_tasks": int(values[5]),
+        "block_major_rows8_tasks": (
+            int(values[6]) if len(values) > 6 else 0
+        ),
+        "block_gemm_calls": int(values[7]) if len(values) > 7 else 0,
+        "block_gemm_tokens": int(values[8]) if len(values) > 8 else 0,
     }
 
 
@@ -712,6 +1397,9 @@ def kda_recurrent_cpu(
     workspace: torch.Tensor,
     output: torch.Tensor,
     lower_bound: float,
+    output_gate: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 0.0,
 ) -> torch.Tensor | None:
     if (
         query.is_cuda
@@ -722,6 +1410,10 @@ def kda_recurrent_cpu(
     extension = _build()
     if extension is None:
         return None
+    if output_gate is None:
+        output_gate = torch.empty(0, dtype=query.dtype)
+    if norm_weight is None:
+        norm_weight = torch.empty(0, dtype=query.dtype)
     return extension.kda_recurrent(
         query.contiguous(),
         key.contiguous(),
@@ -734,6 +1426,9 @@ def kda_recurrent_cpu(
         workspace,
         output,
         float(lower_bound),
+        output_gate.contiguous(),
+        norm_weight.contiguous(),
+        float(norm_eps),
     )
 
 

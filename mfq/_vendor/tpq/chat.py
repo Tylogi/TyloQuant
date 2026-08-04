@@ -318,11 +318,11 @@ def chat_loop(
 
 
 def main(argv=None, should_stop=None) -> None:
-    ap = argparse.ArgumentParser(description="TPQ CCCP 量化模型推理聊天")
+    ap = argparse.ArgumentParser(description="TPQ 量化模型推理聊天")
     ap.add_argument(
         "--model",
         required=True,
-        help="GLM/DeepSeek-V4/Kimi K3 CCCP 模型目录",
+        help="GLM/DeepSeek-V4/Kimi K3 TPQ 模型目录",
     )
     ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
                     help="cuda=GPU 加速推理（dense 常驻显存，专家流式上卡）")
@@ -330,6 +330,12 @@ def main(argv=None, should_stop=None) -> None:
                     help="专家缓存预算（缺省自动：可用RAM − 固定开销）")
     ap.add_argument("--vram-gb", type=float, default=None,
                     help="专家显存缓存预算（缺省自动：空闲显存 − dense常驻 − KV）")
+    ap.add_argument(
+        "--extreme",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="默认自动检测；可用 --extreme 强制或 --no-extreme 禁用",
+    )
     ap.add_argument(
         "--dense-residency",
         choices=("auto", "gpu"),
@@ -357,7 +363,7 @@ def main(argv=None, should_stop=None) -> None:
     ap.add_argument("--no-repeat-ngram", type=int, default=0,
                     help="禁止重复 n-gram（如 3）")
     ap.add_argument("--spec", type=int, default=0,
-                    help="投机解码草稿数（0=关闭；GLM-MTP 建议 2，DSV4-DSpark 建议 5；仅贪心有效）")
+                    help="投机解码草稿数（0=关闭；GLM-MTP 建议2；Kimi CPU无损prompt-lookup建议8；仅贪心有效）")
     ap.add_argument("--think", action="store_true", help="开启思维链推理")
     ap.add_argument(
         "--reasoning",
@@ -372,6 +378,17 @@ def main(argv=None, should_stop=None) -> None:
         ap.error("--tp > 1 requires --device cuda")
     if a.dense_residency == "gpu" and a.device != "cuda":
         ap.error("--dense-residency gpu requires --device cuda")
+    if a.extreme:
+        if a.device != "cuda" or a.tp != 1:
+            ap.error("--extreme requires --device cuda --tp 1")
+        if a.cache_gb is not None or a.vram_gb is not None:
+            ap.error("--extreme cannot be combined with --cache-gb/--vram-gb")
+        from .extreme import configure_extreme_environment
+
+        configure_extreme_environment()
+        a.dense_residency = "gpu"
+    elif a.extreme is False:
+        os.environ["TPQ_AUTO_EXTREME"] = "0"
     if a.think and a.reasoning == "chat":
         ap.error("--think cannot be combined with --reasoning chat")
     think = a.think or (
@@ -425,7 +442,8 @@ def main(argv=None, should_stop=None) -> None:
 
     eng = Engine(a.model, cache_gb=a.cache_gb, max_ctx=max_ctx,
                  device=a.device, vram_cache_gb=a.vram_gb,
-                 tp_size=a.tp, dense_residency=a.dense_residency)
+                 tp_size=a.tp, dense_residency=a.dense_residency,
+                 extreme_mode=a.extreme)
     if a.prompt is not None:
         prompt_options = _terminal_options(
             think=think,
