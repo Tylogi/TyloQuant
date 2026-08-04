@@ -32,13 +32,29 @@ import torch.nn.functional as F
 from .kernels import VQWeight, cb_compute
 from .precision import compute_dtype
 
-try:  # CUDA 融合 kernel（可选，见 fusedext.py / csrc/vq_gemv.cu）
-    from . import fusedext as _fx
-    _fused = _fx.vq_gemv_fused if _fx.available() else None
-    _slots_fused = _fx.moe_mlp_slots_fused if _fx.available() else None
-except Exception:  # 未编译 / 非 CUDA：静默回退 torch 批量路径
-    _fused = None
-    _slots_fused = None
+_slots_fused = None
+_slots_fused_checked = False
+
+
+def _load_slots_fused():
+    """仅在真实 CUDA MoE 调用时加载 CUDA 扩展。
+
+    公共 grouped 模块也承载 CPU 的 SiTU/packed MoE 辅助函数；在模块导入期
+    编译 CUDA 会让纯 CPU CLI 启动和单元测试无故依赖 NVCC。这里缓存一次探测
+    结果，CUDA 行为保持不变，CPU 路径则完全不接触 fusedext。
+    """
+    global _slots_fused, _slots_fused_checked
+    if _slots_fused_checked:
+        return _slots_fused
+    _slots_fused_checked = True
+    try:
+        from . import fusedext as extension
+
+        if extension.available():
+            _slots_fused = extension.moe_mlp_slots_fused
+    except Exception:
+        _slots_fused = None
+    return _slots_fused
 
 
 _SLOT_WORKSPACES: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
@@ -237,8 +253,9 @@ def moe_mlp_grouped_slots(
     SwiGLU、DN VQ GEMV 和 FP32 路由加权，层间输出为 BF16。签名混排、
     非 CUDA 或扩展不可用时返回 None，由调用方走原批量实现。
     """
+    slots_fused = _load_slots_fused() if x_rows.is_cuda else None
     if (
-        _slots_fused is None
+        slots_fused is None
         or os.environ.get("TPQ_SLOT_VQ", "1") == "0"
         or not x_rows.is_cuda
         or not experts
@@ -283,7 +300,7 @@ def moe_mlp_grouped_slots(
         ),
         result_dtype,
     )
-    return _slots_fused(
+    return slots_fused(
         x_bf16,
         [gu.idx for gu, _ in experts],
         gu_codebooks,

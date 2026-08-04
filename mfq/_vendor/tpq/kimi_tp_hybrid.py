@@ -1,6 +1,6 @@
 """Tensor-parallel packed routed experts with a bounded per-rank GPU cache.
 
-This pool is the multi-GPU counterpart of :mod:`tpq.kimi_hybrid`.  The full
+This pool is the multi-GPU counterpart of :mod:`tpq.packed_hybrid`.  The full
 CCCP expert payload remains packed in host RAM.  On a cache miss each GPU gets
 only its row/column tensor-parallel shard; neither RAM nor VRAM contains a
 dequantized expert matrix.
@@ -23,10 +23,10 @@ from collections import Counter, OrderedDict
 import torch
 
 from .kimi_experts import PackedExpertPool
-from .kimi_hybrid import (
+from .packed_hybrid import (
     DeviceExpert,
     HostPackedWeight,
-    KimiPackedHybridPool,
+    PackedHybridPool,
     PackedExpert,
     PackedExpertSignature,
     PackedWeightSignature,
@@ -124,7 +124,7 @@ def tensor_shard_host_expert(
     return tuple(output)
 
 
-class KimiPackedTensorHybridPool(KimiPackedHybridPool):
+class PackedTensorHybridPool(PackedHybridPool):
     """All-rank packed TP with full host RAM and bounded per-rank VRAM."""
 
     device_routed = True
@@ -715,7 +715,7 @@ class KimiPackedTensorHybridPool(KimiPackedHybridPool):
 
 
 __all__ = [
-    "KimiPackedTensorHybridPool",
+    "PackedTensorHybridPool",
     "tensor_shard_host_expert",
     "tensor_shard_signature",
 ]

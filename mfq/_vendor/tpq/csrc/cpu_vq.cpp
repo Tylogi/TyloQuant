@@ -2,16 +2,26 @@
 #include <torch/extension.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <cstdint>
 #include <immintrin.h>
 #include <limits>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
+
+#if defined(__linux__)
+#include <linux/mempolicy.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -23,14 +33,121 @@ int64_t packed_moe_phase_calls = 0;
 double three_projection_phase_seconds[5] = {
     0.0, 0.0, 0.0, 0.0, 0.0};
 int64_t three_projection_phase_calls = 0;
+double resident_moe_phase_seconds[3] = {0.0, 0.0, 0.0};
+int64_t resident_moe_phase_calls = 0;
+double latent_moe_phase_seconds[4] = {0.0, 0.0, 0.0, 0.0};
+int64_t latent_moe_phase_calls = 0;
+double resident_projection_seconds = 0.0;
+int64_t resident_projection_calls = 0;
 double block_fp8_gemv_seconds = 0.0;
 int64_t block_fp8_gemv_calls = 0;
 int64_t block_fp8_gemv_weight_elements = 0;
+int64_t block_fp8_block_major_calls = 0;
+int64_t block_fp8_block_major_bytes = 0;
+int64_t block_fp8_numa_bound_tasks = 0;
+int64_t block_fp8_rows8_tasks = 0;
+int64_t block_fp8_gemm_calls = 0;
+int64_t block_fp8_gemm_tokens = 0;
 
 inline double wall_seconds() {
   return std::chrono::duration<double>(
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
+}
+
+inline bool packed_single_team_enabled() {
+  const char* value = std::getenv("TPQ_CPU_PACKED_SINGLE_TEAM");
+  return value == nullptr ||
+      (value[0] != '\0' && value[0] != '0');
+}
+
+inline bool packed_rows16_enabled() {
+  const char* value = std::getenv("TPQ_CPU_PACKED_ROWS16");
+  return value == nullptr ||
+      (value[0] != '\0' && value[0] != '0');
+}
+
+inline bool block_fp8_rows8_enabled() {
+  const char* value = std::getenv("TPQ_CPU_BLOCK_FP8_ROWS8");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+inline bool packed_direct_rows8_enabled() {
+  const char* value = std::getenv("TPQ_CPU_PACKED_DIRECT_ROWS8");
+  return value == nullptr ||
+      (value[0] != '\0' && value[0] != '0');
+}
+
+inline bool packed_fused_gate_up_enabled() {
+  const char* value = std::getenv("TPQ_CPU_PACKED_FUSED_GATE_UP");
+  return value == nullptr ||
+      (value[0] != '\0' && value[0] != '0');
+}
+
+inline bool packed_fused_down_reduce_enabled() {
+  const char* value = std::getenv("TPQ_CPU_PACKED_FUSED_DOWN_REDUCE");
+  return value == nullptr ||
+      (value[0] != '\0' && value[0] != '0');
+}
+
+inline bool bind_to_current_numa_node(void* address, int64_t bytes) {
+#if defined(__linux__) && defined(SYS_mbind) && defined(SYS_getcpu)
+  unsigned cpu = 0;
+  unsigned node = 0;
+  if (syscall(SYS_getcpu, &cpu, &node, nullptr) != 0 ||
+      node >= sizeof(unsigned long) * 8) {
+    return false;
+  }
+  const long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) {
+    return false;
+  }
+  const uintptr_t first = reinterpret_cast<uintptr_t>(address);
+  const uintptr_t aligned_first =
+      (first + static_cast<uintptr_t>(page_size) - 1) &
+      ~(static_cast<uintptr_t>(page_size) - 1);
+  const uintptr_t last = first + static_cast<uintptr_t>(bytes);
+  const uintptr_t aligned_last =
+      last & ~(static_cast<uintptr_t>(page_size) - 1);
+  if (aligned_last <= aligned_first) {
+    return false;
+  }
+  unsigned long mask = 1UL << node;
+  return syscall(
+      SYS_mbind,
+      reinterpret_cast<void*>(aligned_first),
+      aligned_last - aligned_first,
+      MPOL_BIND,
+      &mask,
+      sizeof(mask) * 8,
+      0) == 0;
+#else
+  (void)address;
+  (void)bytes;
+  return false;
+#endif
+}
+
+inline uint64_t load_u40_le(const uint8_t* source) {
+  // p10 stores four indices in five bytes.  Two naturally unaligned scalar
+  // loads are substantially cheaper than a five-iteration byte loop, while
+  // memcpy keeps the access defined and lets x86 emit one 32-bit load.
+  uint32_t low = 0;
+  std::memcpy(&low, source, sizeof(low));
+  return static_cast<uint64_t>(low) |
+      (static_cast<uint64_t>(source[4]) << 32);
+}
+
+inline uint64_t load_u56_le(const uint8_t* source) {
+  // p14 stores four indices in seven bytes.  Never read an eighth byte: the
+  // final group can end exactly at the packed payload boundary.
+  uint32_t low = 0;
+  uint16_t middle = 0;
+  std::memcpy(&low, source, sizeof(low));
+  std::memcpy(&middle, source + 4, sizeof(middle));
+  return static_cast<uint64_t>(low) |
+      (static_cast<uint64_t>(middle) << 32) |
+      (static_cast<uint64_t>(source[6]) << 48);
 }
 
 const float* e4m3fn_table() {
@@ -177,10 +294,708 @@ inline float block_fp8_row_dot(
   return total;
 }
 
+inline float bf16_dense_row_dot(
+    const at::BFloat16* input,
+    const at::BFloat16* weight,
+    int64_t cols) {
+  float total = 0.0f;
+  int64_t col = 0;
+#if defined(__AVX512BF16__)
+  __m512 accumulated = _mm512_setzero_ps();
+  for (; col + 32 <= cols; col += 32) {
+    const auto activation = (__m512bh)_mm512_loadu_si512(
+        reinterpret_cast<const __m512i*>(input + col));
+    const auto values = (__m512bh)_mm512_loadu_si512(
+        reinterpret_cast<const __m512i*>(weight + col));
+    accumulated = _mm512_dpbf16_ps(
+        accumulated, activation, values);
+  }
+  total = _mm512_reduce_add_ps(accumulated);
+#endif
+  for (; col < cols; ++col) {
+    total += static_cast<float>(input[col]) *
+        static_cast<float>(weight[col]);
+  }
+  return total;
+}
+
+inline float f32_dense_row_dot(
+    const float* input,
+    const float* weight,
+    int64_t cols) {
+  int64_t column = 0;
+  float total = 0.0f;
+#if defined(__AVX512F__)
+  __m512 accumulated = _mm512_setzero_ps();
+  for (; column + 16 <= cols; column += 16) {
+    accumulated = _mm512_fmadd_ps(
+        _mm512_loadu_ps(input + column),
+        _mm512_loadu_ps(weight + column),
+        accumulated);
+  }
+  total = _mm512_reduce_add_ps(accumulated);
+#endif
+  for (; column < cols; ++column) {
+    total += input[column] * weight[column];
+  }
+  return total;
+}
+
+// Logical-row view of both public compact block-FP8 CPU layouts.  The
+// block-major representation remains one byte per weight; only the address
+// calculation changes.  This helper is intentionally shape/format driven so
+// fused MoE scheduling can reuse the same primitive for any model family.
+inline float block_fp8_logical_row_dot_bf16(
+    const at::BFloat16* input,
+    const torch::Tensor& weights,
+    const torch::Tensor& scales,
+    int64_t row,
+    int64_t rows,
+    int64_t cols,
+    int64_t block_size) {
+  TORCH_INTERNAL_ASSERT(
+      weights.scalar_type() == at::kByte && scales.scalar_type() == at::kFloat);
+  const int64_t col_blocks = (cols + block_size - 1) / block_size;
+  const float* scale_row =
+      scales.data_ptr<float>() + (row / block_size) * col_blocks;
+  const float* lut = e4m3fn_table();
+  if (weights.dim() == 2) {
+    return block_fp8_row_dot(
+        nullptr,
+        input,
+        true,
+        weights.data_ptr<uint8_t>() + row * cols,
+        scale_row,
+        lut,
+        cols,
+        block_size);
+  }
+  TORCH_INTERNAL_ASSERT(weights.dim() == 5);
+  constexpr int64_t chunk_rows = 32;
+  constexpr int64_t row_chunks = 4;
+  const int64_t row_block = row / block_size;
+  const int64_t local_row = row % block_size;
+  const int64_t row_chunk = local_row / chunk_rows;
+  const int64_t row_in_chunk = local_row % chunk_rows;
+  const uint8_t* base = weights.data_ptr<uint8_t>();
+  float total = 0.0f;
+  for (int64_t col_block = 0; col_block < col_blocks; ++col_block) {
+    const int64_t start = col_block * block_size;
+    const int64_t count = std::min(block_size, cols - start);
+    const int64_t offset =
+        ((((row_block * row_chunks + row_chunk) * col_blocks + col_block) *
+           chunk_rows + row_in_chunk) * block_size);
+    total += block_fp8_row_dot(
+        nullptr,
+        input + start,
+        true,
+        base + offset,
+        scale_row + col_block,
+        lut,
+        count,
+        block_size);
+  }
+  (void)rows;
+  return total;
+}
+
+torch::Tensor bf16_grouped_gemv_cpu(
+    torch::Tensor value,
+    torch::Tensor weight_ptrs,
+    torch::Tensor row_offsets,
+    int64_t total_rows,
+    int64_t cols,
+    torch::Tensor output) {
+  TORCH_CHECK(
+      !value.is_cuda() && value.dim() == 2 && value.size(0) == 1 &&
+          value.size(1) == cols &&
+          (value.scalar_type() == at::kFloat ||
+           value.scalar_type() == at::kBFloat16),
+      "BF16 grouped GEMV requires CPU FP32/BF16 [1,cols] input");
+  TORCH_CHECK(
+      !weight_ptrs.is_cuda() && weight_ptrs.scalar_type() == at::kLong &&
+          weight_ptrs.dim() == 1 && weight_ptrs.is_contiguous(),
+      "BF16 grouped GEMV weight pointers must be CPU int64");
+  TORCH_CHECK(
+      !row_offsets.is_cuda() && row_offsets.scalar_type() == at::kInt &&
+          row_offsets.dim() == 1 && row_offsets.is_contiguous() &&
+          row_offsets.numel() == weight_ptrs.numel() + 1,
+      "BF16 grouped GEMV row offsets must be CPU int32");
+  TORCH_CHECK(
+      !output.is_cuda() && output.scalar_type() == at::kBFloat16 &&
+          output.is_contiguous() && output.numel() >= total_rows,
+      "BF16 grouped GEMV output must be contiguous CPU BF16");
+  TORCH_CHECK(total_rows > 0 && cols > 0,
+              "BF16 grouped GEMV dimensions must be positive");
+  auto input = value.scalar_type() == at::kBFloat16
+      ? value.contiguous()
+      : value.to(at::kBFloat16).contiguous();
+  const at::BFloat16* xp = input.data_ptr<at::BFloat16>();
+  const int64_t* pointers = weight_ptrs.data_ptr<int64_t>();
+  const int32_t* offsets = row_offsets.data_ptr<int32_t>();
+  const int64_t groups = weight_ptrs.numel();
+  TORCH_CHECK(offsets[0] == 0 && offsets[groups] == total_rows,
+              "BF16 grouped GEMV offsets must cover total_rows");
+  at::BFloat16* op = output.data_ptr<at::BFloat16>();
+  at::parallel_for(0, total_rows, 1, [&](int64_t begin, int64_t end) {
+    int64_t group = std::upper_bound(
+        offsets, offsets + groups + 1,
+        static_cast<int32_t>(begin)) - offsets - 1;
+    group = std::max<int64_t>(0, std::min(group, groups - 1));
+    for (int64_t row = begin; row < end; ++row) {
+      while (group + 1 < groups && row >= offsets[group + 1]) {
+        ++group;
+      }
+      const auto* weights = reinterpret_cast<const at::BFloat16*>(
+          static_cast<uintptr_t>(pointers[group]));
+      op[row] = at::BFloat16(bf16_dense_row_dot(
+          xp,
+          weights + (row - offsets[group]) * cols,
+          cols));
+    }
+  });
+  return output.reshape({1, -1}).narrow(1, 0, total_rows);
+}
+
+// One fixed-address decode executor for a logical group containing native
+// BF16 and/or compact block-FP8 projections.  The caller owns the model
+// tensors; this object retains references and only allocates one BF16 input
+// row plus token-sized outputs.  A single OpenMP team covers every logical
+// output row, so mixed Attention/Dense input projections do not re-enter the
+// worker pool once per weight format.
+class CpuResidentProjectionLayer {
+ public:
+  CpuResidentProjectionLayer(
+      std::vector<torch::Tensor> weights,
+      std::vector<torch::Tensor> scales,
+      std::vector<int64_t> rows,
+      std::vector<int64_t> kinds,
+      int64_t cols,
+      int64_t block_size)
+      : weights_(std::move(weights)),
+        scales_(std::move(scales)),
+        rows_(std::move(rows)),
+        kinds_(std::move(kinds)),
+        cols_(cols),
+        block_size_(block_size) {
+    const int64_t groups = weights_.size();
+    TORCH_CHECK(groups > 0 && scales_.size() == groups &&
+                    rows_.size() == groups && kinds_.size() == groups,
+                "resident projection metadata lengths must match");
+    TORCH_CHECK(cols_ > 0 && block_size_ > 0,
+                "resident projection dimensions must be positive");
+    row_offsets_.reserve(groups + 1);
+    row_offsets_.push_back(0);
+    auto cpu = torch::TensorOptions().device(torch::kCPU);
+    for (int64_t group = 0; group < groups; ++group) {
+      auto& weight = weights_[group];
+      TORCH_CHECK(!weight.is_cuda() && weight.is_contiguous() &&
+                      rows_[group] > 0,
+                  "resident projection weights must be contiguous CPU tensors");
+      if (kinds_[group] == 0) {
+        TORCH_CHECK(weight.scalar_type() == at::kBFloat16 &&
+                        weight.dim() == 2 && weight.size(0) == rows_[group] &&
+                        weight.size(1) == cols_,
+                    "resident BF16 projection shape mismatch");
+      } else {
+        TORCH_CHECK(kinds_[group] == 1 &&
+                        weight.scalar_type() == at::kByte &&
+                        (weight.dim() == 2 || weight.dim() == 5),
+                    "resident compact projection must be block-FP8");
+        TORCH_CHECK(!scales_[group].is_cuda() &&
+                        scales_[group].scalar_type() == at::kFloat &&
+                        scales_[group].is_contiguous(),
+                    "resident block-FP8 scales must be contiguous CPU FP32");
+        if (weight.dim() == 2) {
+          TORCH_CHECK(weight.size(0) == rows_[group] &&
+                          weight.size(1) == cols_,
+                      "resident row-major block-FP8 shape mismatch");
+        }
+      }
+      row_offsets_.push_back(row_offsets_.back() + rows_[group]);
+      outputs_.push_back(torch::empty(
+          {1, rows_[group]},
+          cpu.dtype(kinds_[group] == 0 ? at::kBFloat16 : at::kFloat)));
+    }
+    input_bf16_ = torch::empty({1, cols_}, cpu.dtype(at::kBFloat16));
+    const int64_t total_rows = row_offsets_.back();
+    combined_bf16_ = torch::empty(
+        {1, total_rows}, cpu.dtype(at::kBFloat16));
+    combined_float_ = torch::empty(
+        {1, total_rows}, cpu.dtype(at::kFloat));
+    row_groups_.resize(total_rows);
+    local_rows_.resize(total_rows);
+    for (int64_t group = 0; group < groups; ++group) {
+      for (int64_t row = 0; row < rows_[group]; ++row) {
+        const int64_t logical = row_offsets_[group] + row;
+        row_groups_[logical] = group;
+        local_rows_[logical] = row;
+      }
+    }
+  }
+
+  std::vector<torch::Tensor> forward(torch::Tensor value) {
+    run(value, torch::Tensor());
+    return outputs_;
+  }
+
+  torch::Tensor forward_combined(
+      torch::Tensor value,
+      bool float_output) {
+    auto output = float_output ? combined_float_ : combined_bf16_;
+    run(value, output);
+    return output;
+  }
+
+ private:
+  void run(torch::Tensor value, torch::Tensor combined) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    const double started = wall_seconds();
+    TORCH_CHECK(!value.is_cuda() && value.dim() == 2 &&
+                    value.size(0) == 1 && value.size(1) == cols_ &&
+                    value.is_contiguous() &&
+                    (value.scalar_type() == at::kFloat ||
+                     value.scalar_type() == at::kBFloat16),
+                "resident projection requires contiguous CPU FP32/BF16 [1,cols]");
+    const bool copy_input = value.scalar_type() == at::kFloat;
+    const float* input_float = copy_input ? value.data_ptr<float>() : nullptr;
+    at::BFloat16* input_storage = input_bf16_.data_ptr<at::BFloat16>();
+    const at::BFloat16* input = copy_input
+        ? input_storage
+        : value.data_ptr<at::BFloat16>();
+    const int64_t total_rows = row_offsets_.back();
+#pragma omp parallel
+    {
+      if (copy_input) {
+#pragma omp for schedule(static)
+        for (int64_t column = 0; column < cols_; ++column) {
+          input_storage[column] = at::BFloat16(input_float[column]);
+        }
+      }
+#pragma omp for schedule(static)
+      for (int64_t logical = 0; logical < total_rows; ++logical) {
+        const int64_t group = row_groups_[logical];
+        const int64_t row = local_rows_[logical];
+        float result;
+        if (kinds_[group] == 0) {
+          result = bf16_dense_row_dot(
+              input,
+              weights_[group].data_ptr<at::BFloat16>() + row * cols_,
+              cols_);
+        } else {
+          result = block_fp8_logical_row_dot_bf16(
+              input,
+              weights_[group],
+              scales_[group],
+              row,
+              rows_[group],
+              cols_,
+              block_size_);
+        }
+        if (combined.defined()) {
+          if (combined.scalar_type() == at::kFloat) {
+            combined.data_ptr<float>()[logical] = result;
+          } else {
+            combined.data_ptr<at::BFloat16>()[logical] =
+                at::BFloat16(result);
+          }
+        } else if (kinds_[group] == 0) {
+          outputs_[group].data_ptr<at::BFloat16>()[row] =
+              at::BFloat16(result);
+        } else {
+          outputs_[group].data_ptr<float>()[row] = result;
+        }
+      }
+    }
+    resident_projection_seconds += wall_seconds() - started;
+    ++resident_projection_calls;
+  }
+
+  std::vector<torch::Tensor> weights_, scales_, outputs_;
+  std::vector<int64_t> rows_, kinds_, row_offsets_;
+  std::vector<int64_t> row_groups_, local_rows_;
+  int64_t cols_ = 0;
+  int64_t block_size_ = 128;
+  torch::Tensor input_bf16_, combined_bf16_, combined_float_;
+  std::mutex mutex_;
+};
+
+inline void block_fp8_row_dot_many(
+    const float* input_f,
+    const at::BFloat16* input_b,
+    bool input_bf16,
+    int64_t tokens,
+    const uint8_t* weight_row,
+    int64_t weight_block_stride,
+    const float* scale_row,
+    const float* lut,
+    int64_t cols,
+    int64_t block_size,
+    float* totals) {
+  std::fill(totals, totals + tokens, 0.0f);
+  const int64_t col_blocks = (cols + block_size - 1) / block_size;
+  for (int64_t col_block = 0; col_block < col_blocks; ++col_block) {
+    const int64_t start = col_block * block_size;
+    const int64_t stop = std::min(start + block_size, cols);
+    const uint8_t* weight_block =
+        weight_row + col_block * weight_block_stride;
+    alignas(64) float partial[16] = {0.0f};
+    int64_t col = start;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+#if defined(__AVX512BF16__)
+    if (input_bf16) {
+      __m512 accumulated[16];
+      for (int64_t token = 0; token < tokens; ++token) {
+        accumulated[token] = _mm512_setzero_ps();
+      }
+      for (; col + 32 <= stop; col += 32) {
+        const __m512i decoded = decode_e4m3fn_bf16x32(
+            weight_block + col - start);
+        for (int64_t token = 0; token < tokens; ++token) {
+          const __m512i activation = _mm512_loadu_si512(
+              reinterpret_cast<const __m512i*>(
+                  input_b + token * cols + col));
+          accumulated[token] = _mm512_dpbf16_ps(
+              accumulated[token],
+              (__m512bh)activation,
+              (__m512bh)decoded);
+        }
+      }
+      for (int64_t token = 0; token < tokens; ++token) {
+        partial[token] = _mm512_reduce_add_ps(accumulated[token]);
+      }
+    } else
+#endif
+    {
+      __m512 accumulated[16];
+      for (int64_t token = 0; token < tokens; ++token) {
+        accumulated[token] = _mm512_setzero_ps();
+      }
+      for (; col + 16 <= stop; col += 16) {
+        const __m128i packed = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(
+                weight_block + col - start));
+        const __m512 decoded = _mm512_i32gather_ps(
+            _mm512_cvtepu8_epi32(packed), lut, 4);
+        for (int64_t token = 0; token < tokens; ++token) {
+          accumulated[token] = _mm512_fmadd_ps(
+              _mm512_loadu_ps(input_f + token * cols + col),
+              decoded,
+              accumulated[token]);
+        }
+      }
+      for (int64_t token = 0; token < tokens; ++token) {
+        partial[token] = _mm512_reduce_add_ps(accumulated[token]);
+      }
+    }
+#endif
+    for (; col < stop; ++col) {
+      const float decoded = lut[weight_block[col - start]];
+      for (int64_t token = 0; token < tokens; ++token) {
+        const float activation = input_bf16
+            ? static_cast<float>(input_b[token * cols + col])
+            : input_f[token * cols + col];
+        partial[token] += activation * decoded;
+      }
+    }
+    const float scale = scale_row[col_block];
+    for (int64_t token = 0; token < tokens; ++token) {
+      totals[token] += partial[token] * scale;
+    }
+  }
+}
+
+// Decode layout used by the public CPU block-FP8 backend:
+// [row_block, row_chunk32, col_block, row_in_chunk, col_in_block].
+// A 32x128 chunk is exactly one 4 KiB page.  The same row-chunk task owns
+// that page during packing and GEMV, which gives Linux first-touch/NUMA
+// placement a stable unit while keeping the payload at one byte/weight.
+torch::Tensor block_fp8_to_block_major_cpu(
+    torch::Tensor weights,
+    int64_t block_size) {
+  TORCH_CHECK(
+      !weights.is_cuda() && weights.scalar_type() == at::kByte &&
+          weights.dim() == 2 && weights.is_contiguous(),
+      "block-major packing requires contiguous CPU uint8 [rows,cols]");
+  TORCH_CHECK(block_size == 128,
+              "block-major packing currently requires block128");
+  const int64_t rows = weights.size(0);
+  const int64_t cols = weights.size(1);
+  const int64_t row_blocks = (rows + block_size - 1) / block_size;
+  const int64_t col_blocks = (cols + block_size - 1) / block_size;
+  constexpr int64_t row_chunks = 4;
+  constexpr int64_t chunk_rows = 32;
+  auto packed = torch::empty(
+      {row_blocks, row_chunks, col_blocks, chunk_rows, block_size},
+      weights.options());
+  const uint8_t* source = weights.data_ptr<uint8_t>();
+  uint8_t* destination = packed.data_ptr<uint8_t>();
+  const int64_t task_bytes = col_blocks * chunk_rows * block_size;
+  const int64_t tasks = row_blocks * row_chunks;
+  std::atomic<int64_t> numa_bound{0};
+  at::parallel_for(0, tasks, 1, [&](int64_t begin, int64_t end) {
+    for (int64_t task = begin; task < end; ++task) {
+      const int64_t row_block = task / row_chunks;
+      const int64_t row_chunk = task % row_chunks;
+      const int64_t first_row =
+          row_block * block_size + row_chunk * chunk_rows;
+      uint8_t* task_output = destination + task * task_bytes;
+      if (bind_to_current_numa_node(task_output, task_bytes)) {
+        numa_bound.fetch_add(1, std::memory_order_relaxed);
+      }
+      for (int64_t col_block = 0; col_block < col_blocks; ++col_block) {
+        const int64_t first_col = col_block * block_size;
+        const int64_t valid_cols = std::min(block_size, cols - first_col);
+        uint8_t* tile =
+            task_output + col_block * chunk_rows * block_size;
+        for (int64_t local_row = 0; local_row < chunk_rows; ++local_row) {
+          const int64_t row = first_row + local_row;
+          uint8_t* target = tile + local_row * block_size;
+          if (row < rows && valid_cols > 0) {
+            std::memcpy(
+                target,
+                source + row * cols + first_col,
+                static_cast<size_t>(valid_cols));
+          }
+        }
+      }
+    }
+  });
+  ++block_fp8_block_major_calls;
+  block_fp8_block_major_bytes += rows * cols;
+  block_fp8_numa_bound_tasks += numa_bound.load(std::memory_order_relaxed);
+  return packed;
+}
+
+inline void block_fp8_block_major_task(
+    const float* input_f,
+    const at::BFloat16* input_b,
+    bool input_bf16,
+    const uint8_t* task_weights,
+    const float* scale_row,
+    const float* lut,
+    int64_t first_row,
+    int64_t rows,
+    int64_t cols,
+    int64_t col_blocks,
+    bool rows8,
+    bool output_bf16,
+    float* output_f,
+    at::BFloat16* output_b) {
+  constexpr int64_t block_size = 128;
+  constexpr int64_t chunk_rows = 32;
+  alignas(64) float sums[chunk_rows] = {0.0f};
+  const int64_t valid_rows = std::min(chunk_rows, rows - first_row);
+  for (int64_t col_block = 0; col_block < col_blocks; ++col_block) {
+    const int64_t first_col = col_block * block_size;
+    const int64_t valid_cols = std::min(block_size, cols - first_col);
+    const uint8_t* tile =
+        task_weights + col_block * chunk_rows * block_size;
+    const uint8_t* next_tile =
+        col_block + 1 < col_blocks
+        ? tile + chunk_rows * block_size
+        : nullptr;
+    const float scale = scale_row[col_block];
+    int64_t local_row = 0;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if (rows8) {
+      for (; local_row + 8 <= valid_rows; local_row += 8) {
+        float partial[8] = {
+            0.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 0.0f};
+        if (next_tile != nullptr) {
+          for (int64_t lane = 0; lane < 8; ++lane) {
+            const uint8_t* next_row =
+                next_tile + (local_row + lane) * block_size;
+            _mm_prefetch(
+                reinterpret_cast<const char*>(next_row), _MM_HINT_T0);
+            _mm_prefetch(
+                reinterpret_cast<const char*>(next_row + 64), _MM_HINT_T0);
+          }
+        }
+        int64_t col = 0;
+#if defined(__AVX512BF16__)
+        if (input_bf16) {
+          __m512 accumulated[8];
+          for (auto& value : accumulated) {
+            value = _mm512_setzero_ps();
+          }
+          for (; col + 32 <= valid_cols; col += 32) {
+            const __m512i activation = _mm512_loadu_si512(
+                reinterpret_cast<const __m512i*>(
+                    input_b + first_col + col));
+            for (int64_t lane = 0; lane < 8; ++lane) {
+              accumulated[lane] = _mm512_dpbf16_ps(
+                  accumulated[lane],
+                  (__m512bh)activation,
+                  (__m512bh)decode_e4m3fn_bf16x32(
+                      tile + (local_row + lane) * block_size + col));
+            }
+          }
+          for (int64_t lane = 0; lane < 8; ++lane) {
+            partial[lane] = _mm512_reduce_add_ps(accumulated[lane]);
+          }
+        } else
+#endif
+        {
+          __m512 accumulated[8];
+          for (auto& value : accumulated) {
+            value = _mm512_setzero_ps();
+          }
+          for (; col + 16 <= valid_cols; col += 16) {
+            const __m512 activation = _mm512_loadu_ps(
+                input_f + first_col + col);
+            for (int64_t lane = 0; lane < 8; ++lane) {
+              const __m128i packed = _mm_loadu_si128(
+                  reinterpret_cast<const __m128i*>(
+                      tile + (local_row + lane) * block_size + col));
+              const __m512 decoded = _mm512_i32gather_ps(
+                  _mm512_cvtepu8_epi32(packed), lut, 4);
+              accumulated[lane] = _mm512_fmadd_ps(
+                  activation, decoded, accumulated[lane]);
+            }
+          }
+          for (int64_t lane = 0; lane < 8; ++lane) {
+            partial[lane] = _mm512_reduce_add_ps(accumulated[lane]);
+          }
+        }
+        for (; col < valid_cols; ++col) {
+          const float activation = input_bf16
+              ? static_cast<float>(input_b[first_col + col])
+              : input_f[first_col + col];
+          for (int64_t lane = 0; lane < 8; ++lane) {
+            partial[lane] += activation *
+                lut[tile[(local_row + lane) * block_size + col]];
+          }
+        }
+        for (int64_t lane = 0; lane < 8; ++lane) {
+          sums[local_row + lane] += partial[lane] * scale;
+        }
+      }
+    }
+    for (; local_row + 4 <= valid_rows; local_row += 4) {
+      float partial[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#if defined(__AVX512F__)
+      if (next_tile != nullptr) {
+        for (int64_t lane = 0; lane < 4; ++lane) {
+          const uint8_t* next_row =
+              next_tile + (local_row + lane) * block_size;
+          _mm_prefetch(
+              reinterpret_cast<const char*>(next_row),
+              _MM_HINT_T0);
+          _mm_prefetch(
+              reinterpret_cast<const char*>(next_row + 64),
+              _MM_HINT_T0);
+        }
+      }
+#endif
+      int64_t col = 0;
+#if defined(__AVX512BF16__)
+      if (input_bf16) {
+        __m512 accumulated0 = _mm512_setzero_ps();
+        __m512 accumulated1 = _mm512_setzero_ps();
+        __m512 accumulated2 = _mm512_setzero_ps();
+        __m512 accumulated3 = _mm512_setzero_ps();
+        for (; col + 32 <= valid_cols; col += 32) {
+          const __m512i activation = _mm512_loadu_si512(
+              reinterpret_cast<const __m512i*>(input_b + first_col + col));
+          accumulated0 = _mm512_dpbf16_ps(
+              accumulated0,
+              (__m512bh)activation,
+              (__m512bh)decode_e4m3fn_bf16x32(
+                  tile + (local_row + 0) * block_size + col));
+          accumulated1 = _mm512_dpbf16_ps(
+              accumulated1,
+              (__m512bh)activation,
+              (__m512bh)decode_e4m3fn_bf16x32(
+                  tile + (local_row + 1) * block_size + col));
+          accumulated2 = _mm512_dpbf16_ps(
+              accumulated2,
+              (__m512bh)activation,
+              (__m512bh)decode_e4m3fn_bf16x32(
+                  tile + (local_row + 2) * block_size + col));
+          accumulated3 = _mm512_dpbf16_ps(
+              accumulated3,
+              (__m512bh)activation,
+              (__m512bh)decode_e4m3fn_bf16x32(
+                  tile + (local_row + 3) * block_size + col));
+        }
+        partial[0] = _mm512_reduce_add_ps(accumulated0);
+        partial[1] = _mm512_reduce_add_ps(accumulated1);
+        partial[2] = _mm512_reduce_add_ps(accumulated2);
+        partial[3] = _mm512_reduce_add_ps(accumulated3);
+      } else
+#endif
+      {
+        __m512 accumulated0 = _mm512_setzero_ps();
+        __m512 accumulated1 = _mm512_setzero_ps();
+        __m512 accumulated2 = _mm512_setzero_ps();
+        __m512 accumulated3 = _mm512_setzero_ps();
+        for (; col + 16 <= valid_cols; col += 16) {
+          const __m512 activation = _mm512_loadu_ps(
+              input_f + first_col + col);
+          const auto decode_row = [&](int64_t row) {
+            const __m128i packed = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(
+                    tile + row * block_size + col));
+            return _mm512_i32gather_ps(
+                _mm512_cvtepu8_epi32(packed), lut, 4);
+          };
+          accumulated0 = _mm512_fmadd_ps(
+              activation, decode_row(local_row + 0), accumulated0);
+          accumulated1 = _mm512_fmadd_ps(
+              activation, decode_row(local_row + 1), accumulated1);
+          accumulated2 = _mm512_fmadd_ps(
+              activation, decode_row(local_row + 2), accumulated2);
+          accumulated3 = _mm512_fmadd_ps(
+              activation, decode_row(local_row + 3), accumulated3);
+        }
+        partial[0] = _mm512_reduce_add_ps(accumulated0);
+        partial[1] = _mm512_reduce_add_ps(accumulated1);
+        partial[2] = _mm512_reduce_add_ps(accumulated2);
+        partial[3] = _mm512_reduce_add_ps(accumulated3);
+      }
+      for (; col < valid_cols; ++col) {
+        const float activation = input_bf16
+            ? static_cast<float>(input_b[first_col + col])
+            : input_f[first_col + col];
+        for (int64_t lane = 0; lane < 4; ++lane) {
+          partial[lane] += activation *
+              lut[tile[(local_row + lane) * block_size + col]];
+        }
+      }
+      for (int64_t lane = 0; lane < 4; ++lane) {
+        sums[local_row + lane] += partial[lane] * scale;
+      }
+    }
+#endif
+    for (; local_row < valid_rows; ++local_row) {
+      sums[local_row] += block_fp8_row_dot(
+          input_f == nullptr ? nullptr : input_f + first_col,
+          input_b == nullptr ? nullptr : input_b + first_col,
+          input_bf16,
+          tile + local_row * block_size,
+          &scale,
+          lut,
+          valid_cols,
+          block_size);
+    }
+  }
+  for (int64_t local_row = 0; local_row < valid_rows; ++local_row) {
+    const int64_t row = first_row + local_row;
+    if (output_bf16) {
+      output_b[row] = at::BFloat16(sums[local_row]);
+    } else {
+      output_f[row] = sums[local_row];
+    }
+  }
+}
+
 torch::Tensor block_fp8_gemv_cpu(
     torch::Tensor value,
     torch::Tensor weights,
     torch::Tensor scales,
+    int64_t rows,
     int64_t cols,
     int64_t block_size,
     torch::Tensor output) {
@@ -196,21 +1011,31 @@ torch::Tensor block_fp8_gemv_cpu(
       value.scalar_type() == at::kFloat ||
           value.scalar_type() == at::kBFloat16,
       "block FP8 GEMV input must be float32 or bfloat16");
+  const bool block_major = weights.dim() == 5;
   TORCH_CHECK(
-      weights.dim() == 2 && weights.scalar_type() == at::kByte &&
-          weights.is_contiguous(),
-      "block FP8 weights must be contiguous uint8 [rows,cols]");
+      weights.scalar_type() == at::kByte && weights.is_contiguous() &&
+          (weights.dim() == 2 || block_major),
+      "block FP8 weights must be row-major [rows,cols] or block-major");
   TORCH_CHECK(
       scales.dim() == 2 && scales.scalar_type() == at::kFloat &&
           scales.is_contiguous(),
       "block FP8 scales must be contiguous float32");
   TORCH_CHECK(
-      block_size == 128 && cols == weights.size(1) &&
+      block_size == 128 && rows > 0 && cols > 0 &&
           value.size(1) == cols,
       "block FP8 GEMV currently requires block128 matching columns");
-  const int64_t rows = weights.size(0);
   const int64_t row_blocks = (rows + block_size - 1) / block_size;
   const int64_t col_blocks = (cols + block_size - 1) / block_size;
+  if (block_major) {
+    TORCH_CHECK(
+        weights.size(0) == row_blocks && weights.size(1) == 4 &&
+            weights.size(2) == col_blocks && weights.size(3) == 32 &&
+            weights.size(4) == block_size,
+        "block-major FP8 tensor shape does not match logical matrix");
+  } else {
+    TORCH_CHECK(weights.size(0) == rows && weights.size(1) == cols,
+                "row-major FP8 tensor shape does not match logical matrix");
+  }
   TORCH_CHECK(
       scales.size(0) == row_blocks && scales.size(1) == col_blocks,
       "block FP8 scale grid does not match weight shape");
@@ -231,28 +1056,172 @@ torch::Tensor block_fp8_gemv_cpu(
   const float* sp = scales.data_ptr<float>();
   const float* lut = e4m3fn_table();
   const bool output_bf16 = output.scalar_type() == at::kBFloat16;
+  const bool rows8 = block_fp8_rows8_enabled();
   float* op = output_bf16 ? nullptr : output.data_ptr<float>();
   at::BFloat16* opb = output_bf16
       ? output.data_ptr<at::BFloat16>()
       : nullptr;
+  if (block_major) {
+    constexpr int64_t row_chunks = 4;
+    constexpr int64_t chunk_rows = 32;
+    const int64_t task_bytes = col_blocks * chunk_rows * block_size;
+    at::parallel_for(
+        0, row_blocks * row_chunks, 1,
+        [&](int64_t begin, int64_t end) {
+          for (int64_t task = begin; task < end; ++task) {
+            const int64_t row_block = task / row_chunks;
+            const int64_t row_chunk = task % row_chunks;
+            const int64_t first_row =
+                row_block * block_size + row_chunk * chunk_rows;
+            if (first_row >= rows) {
+              continue;
+            }
+            block_fp8_block_major_task(
+                xp, xb, input_bf16,
+                wp + task * task_bytes,
+                sp + row_block * col_blocks,
+                lut, first_row, rows, cols, col_blocks,
+                rows8,
+                output_bf16, op, opb);
+          }
+        });
+    if (rows8) {
+      block_fp8_rows8_tasks += row_blocks * row_chunks;
+    }
+  } else {
+    at::parallel_for(0, rows, 1, [&](int64_t begin, int64_t end) {
+      for (int64_t row = begin; row < end; ++row) {
+        const uint8_t* weight_row = wp + row * cols;
+        const float* scale_row = sp + (row / block_size) * col_blocks;
+        const float dot = block_fp8_row_dot(
+            xp, xb, input_bf16, weight_row, scale_row, lut, cols,
+            block_size);
+        if (output_bf16) {
+          opb[row] = at::BFloat16(dot);
+        } else {
+          op[row] = dot;
+        }
+      }
+    });
+  }
+  block_fp8_gemv_seconds += wall_seconds() - started;
+  ++block_fp8_gemv_calls;
+  block_fp8_gemv_weight_elements += rows * cols;
+  return output.reshape({-1}).narrow(0, 0, rows).reshape({1, rows});
+}
+
+torch::Tensor block_fp8_gemm_cpu(
+    torch::Tensor value,
+    torch::Tensor weights,
+    torch::Tensor scales,
+    int64_t rows,
+    int64_t cols,
+    int64_t block_size,
+    torch::Tensor output) {
+  const double started = wall_seconds();
+  TORCH_CHECK(
+      !value.is_cuda() && !weights.is_cuda() && !scales.is_cuda() &&
+          !output.is_cuda(),
+      "block FP8 GEMM operands must be on CPU");
+  TORCH_CHECK(
+      value.dim() == 2 && value.size(0) >= 2 && value.size(0) <= 16 &&
+          value.size(1) == cols,
+      "block FP8 GEMM requires 2..16 matching input rows");
+  TORCH_CHECK(
+      value.scalar_type() == at::kFloat ||
+          value.scalar_type() == at::kBFloat16,
+      "block FP8 GEMM input must be float32 or bfloat16");
+  const bool block_major = weights.dim() == 5;
+  TORCH_CHECK(
+      weights.scalar_type() == at::kByte && weights.is_contiguous() &&
+          (weights.dim() == 2 || block_major),
+      "block FP8 GEMM weights must stay compact");
+  TORCH_CHECK(
+      scales.dim() == 2 && scales.scalar_type() == at::kFloat &&
+          scales.is_contiguous(),
+      "block FP8 GEMM scales must be contiguous float32");
+  TORCH_CHECK(block_size == 128 && rows > 0 && cols > 0,
+              "block FP8 GEMM currently requires block128");
+  const int64_t tokens = value.size(0);
+  const int64_t row_blocks = (rows + block_size - 1) / block_size;
+  const int64_t col_blocks = (cols + block_size - 1) / block_size;
+  if (block_major) {
+    TORCH_CHECK(
+        weights.size(0) == row_blocks && weights.size(1) == 4 &&
+            weights.size(2) == col_blocks && weights.size(3) == 32 &&
+            weights.size(4) == block_size,
+        "block-major FP8 GEMM shape mismatch");
+  } else {
+    TORCH_CHECK(weights.size(0) == rows && weights.size(1) == cols,
+                "row-major FP8 GEMM shape mismatch");
+  }
+  TORCH_CHECK(
+      scales.size(0) == row_blocks && scales.size(1) == col_blocks,
+      "block FP8 GEMM scale grid mismatch");
+  TORCH_CHECK(
+      (output.scalar_type() == at::kFloat ||
+       output.scalar_type() == at::kBFloat16) &&
+          output.is_contiguous() && output.dim() == 2 &&
+          output.size(0) == tokens && output.size(1) >= rows,
+      "block FP8 GEMM output must be contiguous [tokens,rows]");
+
+  auto input = value.contiguous();
+  const bool input_bf16 = input.scalar_type() == at::kBFloat16;
+  const float* input_f = input_bf16 ? nullptr : input.data_ptr<float>();
+  const at::BFloat16* input_b = input_bf16
+      ? input.data_ptr<at::BFloat16>()
+      : nullptr;
+  const uint8_t* weightp = weights.data_ptr<uint8_t>();
+  const float* scalep = scales.data_ptr<float>();
+  const float* lut = e4m3fn_table();
+  const bool output_bf16 = output.scalar_type() == at::kBFloat16;
+  float* output_f = output_bf16 ? nullptr : output.data_ptr<float>();
+  at::BFloat16* output_b = output_bf16
+      ? output.data_ptr<at::BFloat16>()
+      : nullptr;
   at::parallel_for(0, rows, 1, [&](int64_t begin, int64_t end) {
+    float result[16];
     for (int64_t row = begin; row < end; ++row) {
-      const uint8_t* weight_row = wp + row * cols;
-      const float* scale_row = sp + (row / block_size) * col_blocks;
-      const float value = block_fp8_row_dot(
-          xp, xb, input_bf16, weight_row, scale_row, lut, cols,
-          block_size);
-      if (output_bf16) {
-        opb[row] = at::BFloat16(value);
+      const uint8_t* source;
+      if (block_major) {
+        const int64_t row_block = row / block_size;
+        const int64_t local = row % block_size;
+        const int64_t row_chunk = local / 32;
+        const int64_t row_in_chunk = local % 32;
+        const int64_t task = row_block * 4 + row_chunk;
+        const int64_t task_bytes = col_blocks * 32 * block_size;
+        source = weightp + task * task_bytes + row_in_chunk * block_size;
       } else {
-        op[row] = value;
+        source = weightp + row * cols;
+      }
+      block_fp8_row_dot_many(
+          input_f,
+          input_b,
+          input_bf16,
+          tokens,
+          source,
+          block_major ? 32 * block_size : block_size,
+          scalep + (row / block_size) * col_blocks,
+          lut,
+          cols,
+          block_size,
+          result);
+      for (int64_t token = 0; token < tokens; ++token) {
+        if (output_bf16) {
+          output_b[token * output.size(1) + row] =
+              at::BFloat16(result[token]);
+        } else {
+          output_f[token * output.size(1) + row] = result[token];
+        }
       }
     }
   });
   block_fp8_gemv_seconds += wall_seconds() - started;
   ++block_fp8_gemv_calls;
   block_fp8_gemv_weight_elements += rows * cols;
-  return output.narrow(0, 0, rows).reshape({1, rows});
+  ++block_fp8_gemm_calls;
+  block_fp8_gemm_tokens += tokens;
+  return output.narrow(1, 0, rows);
 }
 
 torch::Tensor block_fp8_grouped_gemv_cpu(
@@ -263,6 +1232,7 @@ torch::Tensor block_fp8_grouped_gemv_cpu(
     int64_t total_rows,
     int64_t cols,
     int64_t block_size,
+    bool block_major,
     torch::Tensor output) {
   const double started = wall_seconds();
   TORCH_CHECK(
@@ -320,8 +1290,315 @@ torch::Tensor block_fp8_grouped_gemv_cpu(
   const int64_t col_blocks = (cols + block_size - 1) / block_size;
   const float* lut = e4m3fn_table();
   const bool output_bf16 = output.scalar_type() == at::kBFloat16;
+  const bool rows8 = block_fp8_rows8_enabled();
   float* op = output_bf16 ? nullptr : output.data_ptr<float>();
   at::BFloat16* opb = output_bf16
+      ? output.data_ptr<at::BFloat16>()
+      : nullptr;
+  if (block_major) {
+    constexpr int64_t row_chunks = 4;
+    constexpr int64_t chunk_rows = 32;
+    std::vector<int64_t> task_offsets(groups + 1, 0);
+    for (int64_t group = 0; group < groups; ++group) {
+      const int64_t group_rows = offsets[group + 1] - offsets[group];
+      task_offsets[group + 1] = task_offsets[group] +
+          ((group_rows + block_size - 1) / block_size) * row_chunks;
+    }
+    const int64_t total_tasks = task_offsets[groups];
+    const int64_t task_bytes = col_blocks * chunk_rows * block_size;
+    at::parallel_for(0, total_tasks, 1, [&](int64_t begin, int64_t end) {
+      int64_t group = std::upper_bound(
+          task_offsets.begin(), task_offsets.end(), begin) -
+          task_offsets.begin() - 1;
+      group = std::max<int64_t>(0, std::min(group, groups - 1));
+      for (int64_t task = begin; task < end; ++task) {
+        while (group + 1 < groups && task >= task_offsets[group + 1]) {
+          ++group;
+        }
+        const int64_t local_task = task - task_offsets[group];
+        const int64_t row_block = local_task / row_chunks;
+        const int64_t row_chunk = local_task % row_chunks;
+        const int64_t local_first_row =
+            row_block * block_size + row_chunk * chunk_rows;
+        const int64_t group_rows = offsets[group + 1] - offsets[group];
+        if (local_first_row >= group_rows) {
+          continue;
+        }
+        const auto* weight = reinterpret_cast<const uint8_t*>(wp[group]);
+        const auto* scale = reinterpret_cast<const float*>(sp[group]);
+        block_fp8_block_major_task(
+            xp, xb, input_bf16,
+            weight + local_task * task_bytes,
+            scale + row_block * col_blocks,
+            lut,
+            offsets[group] + local_first_row,
+            offsets[group] + group_rows,
+            cols,
+            col_blocks,
+            rows8,
+            output_bf16,
+            op,
+            opb);
+      }
+    });
+    if (rows8) {
+      block_fp8_rows8_tasks += total_tasks;
+    }
+  } else {
+    at::parallel_for(0, total_rows, 1, [&](int64_t begin, int64_t end) {
+      int64_t group = std::upper_bound(
+          offsets, offsets + groups + 1, static_cast<int32_t>(begin)) -
+          offsets - 1;
+      group = std::max<int64_t>(0, std::min(group, groups - 1));
+      for (int64_t row = begin; row < end; ++row) {
+        while (group + 1 < groups && row >= offsets[group + 1]) {
+          ++group;
+        }
+        const int64_t local_row = row - offsets[group];
+        const auto* weight = reinterpret_cast<const uint8_t*>(wp[group]);
+        const auto* scale = reinterpret_cast<const float*>(sp[group]);
+        const float dot = block_fp8_row_dot(
+            xp,
+            xb,
+            input_bf16,
+            weight + local_row * cols,
+            scale + (local_row / block_size) * col_blocks,
+            lut,
+            cols,
+            block_size);
+        if (output_bf16) {
+          opb[row] = at::BFloat16(dot);
+        } else {
+          op[row] = dot;
+        }
+      }
+    });
+  }
+  block_fp8_gemv_seconds += wall_seconds() - started;
+  ++block_fp8_gemv_calls;
+  block_fp8_gemv_weight_elements += total_rows * cols;
+  return output.reshape({-1})
+      .narrow(0, 0, total_rows)
+      .reshape({1, total_rows});
+}
+
+torch::Tensor block_fp8_grouped_rows_gemv_cpu(
+    torch::Tensor value,
+    torch::Tensor weight_ptrs,
+    torch::Tensor scale_ptrs,
+    torch::Tensor row_offsets,
+    int64_t total_rows,
+    int64_t cols,
+    int64_t block_size,
+    bool block_major,
+    torch::Tensor output) {
+  const double started = wall_seconds();
+  TORCH_CHECK(
+      !value.is_cuda() && !weight_ptrs.is_cuda() &&
+          !scale_ptrs.is_cuda() && !row_offsets.is_cuda() &&
+          !output.is_cuda(),
+      "grouped-row block FP8 operands must be on CPU");
+  const int64_t groups = weight_ptrs.numel();
+  TORCH_CHECK(
+      value.dim() == 2 && value.size(0) == groups &&
+          value.size(1) == cols &&
+          (value.scalar_type() == at::kFloat ||
+           value.scalar_type() == at::kBFloat16),
+      "grouped-row block FP8 requires one input per projection");
+  TORCH_CHECK(
+      weight_ptrs.scalar_type() == at::kLong &&
+          scale_ptrs.scalar_type() == at::kLong &&
+          weight_ptrs.dim() == 1 && scale_ptrs.dim() == 1 &&
+          weight_ptrs.is_contiguous() && scale_ptrs.is_contiguous() &&
+          scale_ptrs.numel() == groups,
+      "grouped-row pointer arrays must match");
+  TORCH_CHECK(
+      row_offsets.scalar_type() == at::kInt &&
+          row_offsets.dim() == 1 && row_offsets.is_contiguous() &&
+          row_offsets.numel() == groups + 1,
+      "grouped-row offsets must delimit every projection");
+  TORCH_CHECK(
+      block_size == 128 && total_rows > 0 && cols > 0,
+      "grouped-row block FP8 currently requires block128");
+  TORCH_CHECK(
+      output.is_contiguous() && output.numel() >= total_rows &&
+          (output.scalar_type() == at::kFloat ||
+           output.scalar_type() == at::kBFloat16),
+      "grouped-row output must be contiguous float32 or bfloat16");
+
+  auto input = value.contiguous();
+  const bool input_bf16 = input.scalar_type() == at::kBFloat16;
+  const float* input_f = input_bf16 ? nullptr : input.data_ptr<float>();
+  const at::BFloat16* input_b = input_bf16
+      ? input.data_ptr<at::BFloat16>() : nullptr;
+  const int64_t* weights = weight_ptrs.data_ptr<int64_t>();
+  const int64_t* scales = scale_ptrs.data_ptr<int64_t>();
+  const int32_t* offsets = row_offsets.data_ptr<int32_t>();
+  TORCH_CHECK(
+      offsets[0] == 0 && offsets[groups] == total_rows,
+      "grouped-row offsets must cover total rows");
+  const int64_t col_blocks = (cols + block_size - 1) / block_size;
+  const float* lut = e4m3fn_table();
+  const bool output_bf16 = output.scalar_type() == at::kBFloat16;
+  float* output_f = output_bf16 ? nullptr : output.data_ptr<float>();
+  at::BFloat16* output_b = output_bf16
+      ? output.data_ptr<at::BFloat16>() : nullptr;
+  if (block_major) {
+    constexpr int64_t row_chunks = 4;
+    constexpr int64_t chunk_rows = 32;
+    std::vector<int64_t> task_offsets(groups + 1, 0);
+    for (int64_t group = 0; group < groups; ++group) {
+      const int64_t group_rows = offsets[group + 1] - offsets[group];
+      task_offsets[group + 1] = task_offsets[group] +
+          ((group_rows + block_size - 1) / block_size) * row_chunks;
+    }
+    const int64_t total_tasks = task_offsets[groups];
+    const int64_t task_bytes = col_blocks * chunk_rows * block_size;
+    at::parallel_for(0, total_tasks, 1, [&](int64_t begin, int64_t end) {
+      int64_t group = std::upper_bound(
+          task_offsets.begin(), task_offsets.end(), begin) -
+          task_offsets.begin() - 1;
+      group = std::max<int64_t>(0, std::min(group, groups - 1));
+      for (int64_t task = begin; task < end; ++task) {
+        while (group + 1 < groups && task >= task_offsets[group + 1]) {
+          ++group;
+        }
+        const int64_t local_task = task - task_offsets[group];
+        const int64_t row_block = local_task / row_chunks;
+        const int64_t row_chunk = local_task % row_chunks;
+        const int64_t local_first =
+            row_block * block_size + row_chunk * chunk_rows;
+        const int64_t group_rows = offsets[group + 1] - offsets[group];
+        if (local_first >= group_rows) {
+          continue;
+        }
+        const auto* weight =
+            reinterpret_cast<const uint8_t*>(weights[group]);
+        const auto* scale =
+            reinterpret_cast<const float*>(scales[group]);
+        block_fp8_block_major_task(
+            input_f ? input_f + group * cols : nullptr,
+            input_b ? input_b + group * cols : nullptr,
+            input_bf16,
+            weight + local_task * task_bytes,
+            scale + row_block * col_blocks,
+            lut,
+            offsets[group] + local_first,
+            offsets[group] + group_rows,
+            cols,
+            col_blocks,
+            block_fp8_rows8_enabled(),
+            output_bf16,
+            output_f,
+            output_b);
+      }
+    });
+  } else {
+    at::parallel_for(0, total_rows, 1, [&](int64_t begin, int64_t end) {
+      int64_t group = std::upper_bound(
+          offsets, offsets + groups + 1, static_cast<int32_t>(begin)) -
+          offsets - 1;
+      group = std::max<int64_t>(0, std::min(group, groups - 1));
+      for (int64_t row = begin; row < end; ++row) {
+        while (group + 1 < groups && row >= offsets[group + 1]) {
+          ++group;
+        }
+        const int64_t local_row = row - offsets[group];
+        const auto* weight =
+            reinterpret_cast<const uint8_t*>(weights[group]);
+        const auto* scale =
+            reinterpret_cast<const float*>(scales[group]);
+        const float dot = block_fp8_row_dot(
+            input_f ? input_f + group * cols : nullptr,
+            input_b ? input_b + group * cols : nullptr,
+            input_bf16,
+            weight + local_row * cols,
+            scale + (local_row / block_size) * col_blocks,
+            lut,
+            cols,
+            block_size);
+        if (output_bf16) {
+          output_b[row] = at::BFloat16(dot);
+        } else {
+          output_f[row] = dot;
+        }
+      }
+    });
+  }
+  block_fp8_gemv_seconds += wall_seconds() - started;
+  ++block_fp8_gemv_calls;
+  block_fp8_gemv_weight_elements += total_rows * cols;
+  return output.reshape({-1}).narrow(0, 0, total_rows).reshape({1, total_rows});
+}
+
+torch::Tensor block_fp8_grouped_gemm_cpu(
+    torch::Tensor value,
+    torch::Tensor weight_ptrs,
+    torch::Tensor scale_ptrs,
+    torch::Tensor row_offsets,
+    int64_t total_rows,
+    int64_t cols,
+    int64_t block_size,
+    bool block_major,
+    torch::Tensor output) {
+  const double started = wall_seconds();
+  TORCH_CHECK(
+      !value.is_cuda() && !weight_ptrs.is_cuda() &&
+          !scale_ptrs.is_cuda() && !row_offsets.is_cuda() &&
+          !output.is_cuda(),
+      "grouped block FP8 GEMM operands must be on CPU");
+  TORCH_CHECK(
+      value.dim() == 2 && value.size(0) >= 2 && value.size(0) <= 16 &&
+          value.size(1) == cols &&
+          (value.scalar_type() == at::kFloat ||
+           value.scalar_type() == at::kBFloat16),
+      "grouped block FP8 GEMM requires 2..16 matching rows");
+  TORCH_CHECK(
+      weight_ptrs.scalar_type() == at::kLong &&
+          scale_ptrs.scalar_type() == at::kLong &&
+          weight_ptrs.dim() == 1 && scale_ptrs.dim() == 1 &&
+          weight_ptrs.is_contiguous() && scale_ptrs.is_contiguous() &&
+          weight_ptrs.numel() == scale_ptrs.numel(),
+      "grouped block FP8 GEMM pointer arrays must match");
+  TORCH_CHECK(
+      row_offsets.scalar_type() == at::kInt && row_offsets.dim() == 1 &&
+          row_offsets.is_contiguous() &&
+          row_offsets.numel() == weight_ptrs.numel() + 1,
+      "grouped block FP8 GEMM row offsets must delimit every weight");
+  TORCH_CHECK(block_size == 128 && total_rows > 0 && cols > 0,
+              "grouped block FP8 GEMM currently requires block128");
+  const int64_t tokens = value.size(0);
+  TORCH_CHECK(
+      output.dim() == 2 && output.size(0) == tokens &&
+          output.size(1) >= total_rows && output.stride(1) == 1 &&
+          output.stride(0) >= total_rows &&
+          (output.scalar_type() == at::kFloat ||
+           output.scalar_type() == at::kBFloat16),
+      "grouped block FP8 GEMM output must be a dense-row "
+      "[tokens,total_rows] view");
+
+  auto input = value.contiguous();
+  const bool input_bf16 = input.scalar_type() == at::kBFloat16;
+  const float* input_f = input_bf16 ? nullptr : input.data_ptr<float>();
+  const at::BFloat16* input_b = input_bf16
+      ? input.data_ptr<at::BFloat16>()
+      : nullptr;
+  const int64_t* weights = weight_ptrs.data_ptr<int64_t>();
+  const int64_t* scales = scale_ptrs.data_ptr<int64_t>();
+  const int32_t* offsets = row_offsets.data_ptr<int32_t>();
+  const int64_t groups = weight_ptrs.numel();
+  TORCH_CHECK(offsets[0] == 0 && offsets[groups] == total_rows,
+              "grouped block FP8 GEMM offsets must cover total rows");
+  for (int64_t group = 0; group < groups; ++group) {
+    TORCH_CHECK(offsets[group] <= offsets[group + 1],
+                "grouped block FP8 GEMM offsets must be sorted");
+  }
+  const int64_t col_blocks = (cols + block_size - 1) / block_size;
+  const float* lut = e4m3fn_table();
+  const bool output_bf16 = output.scalar_type() == at::kBFloat16;
+  const int64_t output_stride = output.stride(0);
+  float* output_f = output_bf16 ? nullptr : output.data_ptr<float>();
+  at::BFloat16* output_b = output_bf16
       ? output.data_ptr<at::BFloat16>()
       : nullptr;
   at::parallel_for(0, total_rows, 1, [&](int64_t begin, int64_t end) {
@@ -329,39 +1606,67 @@ torch::Tensor block_fp8_grouped_gemv_cpu(
         offsets, offsets + groups + 1, static_cast<int32_t>(begin)) -
         offsets - 1;
     group = std::max<int64_t>(0, std::min(group, groups - 1));
+    alignas(64) float results[16];
     for (int64_t row = begin; row < end; ++row) {
       while (group + 1 < groups && row >= offsets[group + 1]) {
         ++group;
       }
       const int64_t local_row = row - offsets[group];
-      const auto* weight = reinterpret_cast<const uint8_t*>(wp[group]);
-      const auto* scale = reinterpret_cast<const float*>(sp[group]);
-      const float value = block_fp8_row_dot(
-          xp,
-          xb,
+      const auto* weight =
+          reinterpret_cast<const uint8_t*>(weights[group]);
+      const auto* scale = reinterpret_cast<const float*>(scales[group]);
+      const uint8_t* source;
+      int64_t weight_stride;
+      if (block_major) {
+        const int64_t row_block = local_row / block_size;
+        const int64_t local = local_row % block_size;
+        const int64_t row_chunk = local / 32;
+        const int64_t row_in_chunk = local % 32;
+        const int64_t task = row_block * 4 + row_chunk;
+        const int64_t task_bytes = col_blocks * 32 * block_size;
+        source = weight + task * task_bytes + row_in_chunk * block_size;
+        weight_stride = 32 * block_size;
+      } else {
+        source = weight + local_row * cols;
+        weight_stride = block_size;
+      }
+      block_fp8_row_dot_many(
+          input_f,
+          input_b,
           input_bf16,
-          weight + local_row * cols,
+          tokens,
+          source,
+          weight_stride,
           scale + (local_row / block_size) * col_blocks,
           lut,
           cols,
-          block_size);
-      if (output_bf16) {
-        opb[row] = at::BFloat16(value);
-      } else {
-        op[row] = value;
+          block_size,
+          results);
+      for (int64_t token = 0; token < tokens; ++token) {
+        if (output_bf16) {
+          output_b[token * output_stride + row] =
+              at::BFloat16(results[token]);
+        } else {
+          output_f[token * output_stride + row] = results[token];
+        }
       }
     }
   });
   block_fp8_gemv_seconds += wall_seconds() - started;
   ++block_fp8_gemv_calls;
   block_fp8_gemv_weight_elements += total_rows * cols;
-  return output.narrow(0, 0, total_rows).reshape({1, total_rows});
+  ++block_fp8_gemm_calls;
+  block_fp8_gemm_tokens += tokens;
+  return output.narrow(1, 0, total_rows);
 }
 
 void reset_block_fp8_gemv_profile_cpu() {
   block_fp8_gemv_seconds = 0.0;
   block_fp8_gemv_calls = 0;
   block_fp8_gemv_weight_elements = 0;
+  block_fp8_rows8_tasks = 0;
+  block_fp8_gemm_calls = 0;
+  block_fp8_gemm_tokens = 0;
 }
 
 std::vector<double> block_fp8_gemv_profile_cpu() {
@@ -369,6 +1674,12 @@ std::vector<double> block_fp8_gemv_profile_cpu() {
       static_cast<double>(block_fp8_gemv_calls),
       block_fp8_gemv_seconds,
       static_cast<double>(block_fp8_gemv_weight_elements),
+      static_cast<double>(block_fp8_block_major_calls),
+      static_cast<double>(block_fp8_block_major_bytes),
+      static_cast<double>(block_fp8_numa_bound_tasks),
+      static_cast<double>(block_fp8_rows8_tasks),
+      static_cast<double>(block_fp8_gemm_calls),
+      static_cast<double>(block_fp8_gemm_tokens),
   };
 }
 
@@ -1091,6 +2402,38 @@ inline void codebook_scores(
   }
 }
 
+inline void codebook_scores_range(
+    const float* input,
+    const float* transposed_codebook,
+    float* output,
+    int64_t codes,
+    int64_t dimension,
+    int64_t begin,
+    int64_t end) {
+  int64_t code = begin;
+#if defined(__AVX512F__)
+  for (; code + 16 <= end; code += 16) {
+    __m512 accumulated = _mm512_setzero_ps();
+    for (int64_t index = 0; index < dimension; ++index) {
+      accumulated = _mm512_fmadd_ps(
+          _mm512_set1_ps(input[index]),
+          _mm512_loadu_ps(
+              transposed_codebook + index * codes + code),
+          accumulated);
+    }
+    _mm512_storeu_ps(output + code, accumulated);
+  }
+#endif
+  for (; code < end; ++code) {
+    float sum = 0.0f;
+    for (int64_t index = 0; index < dimension; ++index) {
+      sum += input[index] *
+          transposed_codebook[index * codes + code];
+    }
+    output[code] = sum;
+  }
+}
+
 struct TransposedCodebook {
   torch::Tensor source;
   torch::Tensor values;
@@ -1125,6 +2468,85 @@ torch::Tensor cached_transposed_codebook(torch::Tensor codebook) {
   transposed_codebooks.emplace(
       key, TransposedCodebook{codebook, output});
   return output;
+}
+
+struct PairedBf16Codebook {
+  torch::Tensor source;
+  torch::Tensor values;
+};
+
+std::unordered_map<const void*, PairedBf16Codebook> paired_bf16_codebooks;
+std::mutex paired_bf16_codebooks_mutex;
+
+torch::Tensor cached_paired_bf16_codebook(torch::Tensor codebook) {
+  const void* key = codebook.data_ptr<float>();
+  std::lock_guard<std::mutex> guard(paired_bf16_codebooks_mutex);
+  auto found = paired_bf16_codebooks.find(key);
+  if (found != paired_bf16_codebooks.end()) {
+    return found->second.values;
+  }
+  const int64_t codes = codebook.size(0);
+  const int64_t dimension = codebook.size(1);
+  TORCH_CHECK(dimension % 2 == 0,
+              "paired BF16 codebook requires an even code dimension");
+  auto output = torch::empty(
+      {dimension / 2, codes, 2},
+      torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCPU));
+  const float* source = codebook.data_ptr<float>();
+  at::BFloat16* destination = output.data_ptr<at::BFloat16>();
+  for (int64_t pair = 0; pair < dimension / 2; ++pair) {
+    for (int64_t code = 0; code < codes; ++code) {
+      destination[(pair * codes + code) * 2] =
+          at::BFloat16(source[code * dimension + pair * 2]);
+      destination[(pair * codes + code) * 2 + 1] =
+          at::BFloat16(source[code * dimension + pair * 2 + 1]);
+    }
+  }
+  paired_bf16_codebooks.emplace(
+      key, PairedBf16Codebook{codebook, output});
+  return output;
+}
+
+inline void codebook_scores_bf16_range(
+    const at::BFloat16* input,
+    const at::BFloat16* paired_codebook,
+    float* output,
+    int64_t codes,
+    int64_t dimension,
+    int64_t begin,
+    int64_t end) {
+  int64_t code = begin;
+#if defined(__AVX512BF16__)
+  for (; code + 16 <= end; code += 16) {
+    __m512 accumulated = _mm512_setzero_ps();
+    for (int64_t pair = 0; pair < dimension / 2; ++pair) {
+      uint32_t activation_pair = 0;
+      std::memcpy(
+          &activation_pair,
+          input + pair * 2,
+          sizeof(activation_pair));
+      const auto activation = (__m512bh)_mm512_set1_epi32(
+          static_cast<int32_t>(activation_pair));
+      const auto values = (__m512bh)_mm512_loadu_si512(
+          reinterpret_cast<const __m512i*>(
+              paired_codebook + (pair * codes + code) * 2));
+      accumulated = _mm512_dpbf16_ps(
+          accumulated, activation, values);
+    }
+    _mm512_storeu_ps(output + code, accumulated);
+  }
+#endif
+  for (; code < end; ++code) {
+    float sum = 0.0f;
+    for (int64_t lane = 0; lane < dimension; ++lane) {
+      const int64_t pair = lane / 2;
+      const int64_t within = lane % 2;
+      sum += static_cast<float>(input[lane]) *
+          static_cast<float>(
+              paired_codebook[(pair * codes + code) * 2 + within]);
+    }
+    output[code] = sum;
+  }
 }
 
 inline void float_axpy(
@@ -1431,11 +2853,7 @@ inline float lookup_sum_packed(
       const int64_t start_byte = (start_index / 4) * 5;
       for (int64_t block = 0; block < blocks; block += 4) {
         const int64_t offset = start_byte + (block / 4) * 5;
-        uint64_t word = 0;
-        for (int byte = 0; byte < 5; ++byte) {
-          word |= static_cast<uint64_t>(packed[offset + byte])
-              << (8 * byte);
-        }
+        const uint64_t word = load_u40_le(packed + offset);
         sum += score[block * codes + (word & 0x3ff)];
         sum += score[(block + 1) * codes + ((word >> 10) & 0x3ff)];
         sum += score[(block + 2) * codes + ((word >> 20) & 0x3ff)];
@@ -1446,11 +2864,7 @@ inline float lookup_sum_packed(
     for (int64_t block = 0; block < blocks; ++block) {
       const int64_t index_offset = start_index + block;
       const int64_t offset = (index_offset / 4) * 5;
-      uint64_t word = 0;
-      for (int byte = 0; byte < 5; ++byte) {
-        word |= static_cast<uint64_t>(packed[offset + byte])
-            << (8 * byte);
-      }
+      const uint64_t word = load_u40_le(packed + offset);
       const int64_t shift = (index_offset % 4) * 10;
       sum += score[block * codes + ((word >> shift) & 0x3ff)];
     }
@@ -1460,10 +2874,7 @@ inline float lookup_sum_packed(
     const int64_t start_byte = (start_index / 4) * 7;
     for (int64_t block = 0; block < blocks; block += 4) {
       const int64_t offset = start_byte + (block / 4) * 7;
-      uint64_t word = 0;
-      for (int byte = 0; byte < 7; ++byte) {
-        word |= static_cast<uint64_t>(packed[offset + byte]) << (8 * byte);
-      }
+      const uint64_t word = load_u56_le(packed + offset);
       sum += score[block * codes + (word & 0x3fff)];
       sum += score[(block + 1) * codes + ((word >> 14) & 0x3fff)];
       sum += score[(block + 2) * codes + ((word >> 28) & 0x3fff)];
@@ -1475,10 +2886,7 @@ inline float lookup_sum_packed(
     for (int64_t block = 0; block < blocks; ++block) {
       const int64_t index_offset = start_index + block;
       const int64_t offset = (index_offset / 4) * 7;
-      uint64_t word = 0;
-      for (int byte = 0; byte < 7; ++byte) {
-        word |= static_cast<uint64_t>(packed[offset + byte]) << (8 * byte);
-      }
+      const uint64_t word = load_u56_le(packed + offset);
       const int64_t shift = (index_offset % 4) * 14;
       sum += score[block * codes + ((word >> shift) & 0x3fff)];
     }
@@ -1490,6 +2898,146 @@ inline float lookup_sum_packed(
     sum += score[block * codes + index];
   }
   return sum;
+}
+
+inline bool lookup_sum_packed_rows16(
+    const float* score,
+    const uint8_t* packed,
+    int64_t first_row,
+    int64_t rows,
+    int64_t blocks,
+    int64_t codes,
+    int64_t bits,
+    float* output) {
+#if defined(__AVX512F__)
+  if (bits != 8 && bits != 10 && bits != 12) {
+    return false;
+  }
+  const int64_t valid = std::min<int64_t>(16, rows - first_row);
+  const int64_t row_bits = blocks * bits;
+  if (valid <= 0 || row_bits % 8 != 0) {
+    return false;
+  }
+  const int64_t row_bytes = row_bits / 8;
+  alignas(64) int32_t offsets_array[16];
+  for (int lane = 0; lane < 16; ++lane) {
+    offsets_array[lane] = static_cast<int32_t>(
+        (first_row + lane) * row_bytes);
+  }
+  const __m512i row_offsets = _mm512_load_si512(offsets_array);
+  const __mmask16 valid_mask = valid == 16
+      ? static_cast<__mmask16>(0xffff)
+      : static_cast<__mmask16>((uint32_t{1} << valid) - 1);
+  __m512 sums = _mm512_setzero_ps();
+  bool overwrite_last = false;
+
+  if (bits == 8) {
+    const int64_t vector_blocks = std::max<int64_t>(0, blocks - 3);
+    int64_t block = 0;
+    for (; block < vector_blocks; ++block) {
+      const __m512i packed_words = _mm512_mask_i32gather_epi32(
+          _mm512_setzero_si512(),
+          valid_mask,
+          _mm512_add_epi32(
+              row_offsets, _mm512_set1_epi32(static_cast<int>(block))),
+          packed,
+          1);
+      const __m512i indices = _mm512_and_si512(
+          packed_words, _mm512_set1_epi32(0xff));
+      sums = _mm512_add_ps(
+          sums,
+          _mm512_mask_i32gather_ps(
+              _mm512_setzero_ps(), valid_mask, indices,
+              score + block * codes, 4));
+    }
+    alignas(64) float partial[16];
+    _mm512_store_ps(partial, sums);
+    for (; block < blocks; ++block) {
+      const float* block_score = score + block * codes;
+      for (int64_t lane = 0; lane < valid; ++lane) {
+        partial[lane] += block_score[
+            packed[(first_row + lane) * blocks + block]];
+      }
+    }
+    std::memcpy(output + first_row, partial, valid * sizeof(float));
+    return true;
+  }
+
+  const int64_t group = bits == 10 ? 4 : 2;
+  const int64_t group_bytes = bits == 10 ? 5 : 3;
+  TORCH_CHECK(blocks % group == 0, "packed row group is misaligned");
+  for (int64_t block = 0; block < blocks; block += group) {
+    const int64_t byte_offset = (block / group) * group_bytes;
+    __mmask16 load_mask = valid_mask;
+    const bool final_group = block + group == blocks;
+    if (final_group && first_row + valid == rows) {
+      load_mask &= static_cast<__mmask16>(~(
+          uint32_t{1} << (valid - 1)));
+      overwrite_last = true;
+    }
+    const __m512i addresses = _mm512_add_epi32(
+        row_offsets,
+        _mm512_set1_epi32(static_cast<int>(byte_offset)));
+    const __m512i low = _mm512_mask_i32gather_epi32(
+        _mm512_setzero_si512(), load_mask, addresses, packed, 1);
+    if (bits == 10) {
+      const __m512i high_words = _mm512_mask_i32gather_epi32(
+          _mm512_setzero_si512(), load_mask,
+          _mm512_add_epi32(addresses, _mm512_set1_epi32(4)),
+          packed, 1);
+      const __m512i mask = _mm512_set1_epi32(0x3ff);
+      const __m512i indices0 = _mm512_and_si512(low, mask);
+      const __m512i indices1 = _mm512_and_si512(
+          _mm512_srli_epi32(low, 10), mask);
+      const __m512i indices2 = _mm512_and_si512(
+          _mm512_srli_epi32(low, 20), mask);
+      const __m512i indices3 = _mm512_or_si512(
+          _mm512_srli_epi32(low, 30),
+          _mm512_slli_epi32(
+              _mm512_and_si512(
+                  high_words, _mm512_set1_epi32(0xff)),
+              2));
+      const __m512i indices[4] = {
+          indices0, indices1, indices2, indices3};
+      for (int lane = 0; lane < 4; ++lane) {
+        sums = _mm512_add_ps(
+            sums,
+            _mm512_mask_i32gather_ps(
+                _mm512_setzero_ps(), load_mask, indices[lane],
+                score + (block + lane) * codes, 4));
+      }
+    } else {
+      const __m512i mask = _mm512_set1_epi32(0xfff);
+      const __m512i indices[2] = {
+          _mm512_and_si512(low, mask),
+          _mm512_and_si512(_mm512_srli_epi32(low, 12), mask)};
+      for (int lane = 0; lane < 2; ++lane) {
+        sums = _mm512_add_ps(
+            sums,
+            _mm512_mask_i32gather_ps(
+                _mm512_setzero_ps(), load_mask, indices[lane],
+                score + (block + lane) * codes, 4));
+      }
+    }
+  }
+  _mm512_mask_storeu_ps(output + first_row, valid_mask, sums);
+  if (overwrite_last) {
+    const int64_t row = first_row + valid - 1;
+    output[row] = lookup_sum_packed(
+        score, packed, row * blocks, blocks, codes, bits);
+  }
+  return true;
+#else
+  (void)score;
+  (void)packed;
+  (void)first_row;
+  (void)rows;
+  (void)blocks;
+  (void)codes;
+  (void)bits;
+  (void)output;
+  return false;
+#endif
 }
 
 inline uint16_t read_packed_index(
@@ -1517,21 +3065,157 @@ inline uint16_t read_packed_index(
   }
   if (bits == 10) {
     const int64_t offset = (index_offset / 4) * 5;
-    uint64_t word = 0;
-    for (int byte = 0; byte < 5; ++byte) {
-      word |= static_cast<uint64_t>(packed[offset + byte])
-          << (8 * byte);
-    }
+    const uint64_t word = load_u40_le(packed + offset);
     return static_cast<uint16_t>(
         (word >> ((index_offset % 4) * 10)) & 0x3ff);
   }
   const int64_t offset = (index_offset / 4) * 7;
-  uint64_t word = 0;
-  for (int byte = 0; byte < 7; ++byte) {
-    word |= static_cast<uint64_t>(packed[offset + byte]) << (8 * byte);
-  }
+  const uint64_t word = load_u56_le(packed + offset);
   return static_cast<uint16_t>(
       (word >> ((index_offset % 4) * 14)) & 0x3fff);
+}
+
+inline void write_packed_index(
+    uint8_t* packed,
+    int64_t index_offset,
+    int64_t bits,
+    uint16_t value) {
+  const int64_t bit_offset = index_offset * bits;
+  const int64_t byte_offset = bit_offset >> 3;
+  const int shift = static_cast<int>(bit_offset & 7);
+  const uint32_t encoded = static_cast<uint32_t>(value) << shift;
+  const int bytes = (shift + bits + 7) >> 3;
+  for (int byte = 0; byte < bytes; ++byte) {
+    packed[byte_offset + byte] |= static_cast<uint8_t>(
+        (encoded >> (byte * 8)) & 0xff);
+  }
+}
+
+torch::Tensor vq_repack_block_major_cpu(
+    torch::Tensor payload,
+    int64_t rows,
+    int64_t blocks,
+    int64_t bits) {
+  TORCH_CHECK(
+      !payload.is_cuda() && payload.scalar_type() == at::kByte &&
+          payload.is_contiguous() && payload.dim() == 1,
+      "packed VQ relayout requires contiguous CPU uint8 payload");
+  TORCH_CHECK(
+      rows > 0 && blocks > 0 && bits >= 8 && bits <= 16,
+      "packed VQ relayout metadata is invalid");
+  const int64_t count = rows * blocks;
+  TORCH_CHECK(
+      count * bits % 8 == 0 && payload.numel() == count * bits / 8,
+      "packed VQ relayout payload length mismatch");
+  TORCH_CHECK(
+      rows * bits % 8 == 0,
+      "block-major VQ layout requires byte-aligned block rows");
+  auto output = torch::zeros_like(payload);
+  const uint8_t* source = payload.data_ptr<uint8_t>();
+  uint8_t* destination = output.data_ptr<uint8_t>();
+  const int64_t block_bytes = rows * bits / 8;
+  at::parallel_for(0, blocks, 1, [&](int64_t begin, int64_t end) {
+    for (int64_t block = begin; block < end; ++block) {
+      uint8_t* target = destination + block * block_bytes;
+      for (int64_t row = 0; row < rows; ++row) {
+        const uint16_t index = read_packed_index(
+            source, row * blocks + block, bits);
+        write_packed_index(target, row, bits, index);
+      }
+    }
+  });
+  return output;
+}
+
+torch::Tensor vq_repack_row_tile_cpu(
+    torch::Tensor payload,
+    int64_t rows,
+    int64_t blocks,
+    int64_t bits,
+    int64_t tile_rows) {
+  TORCH_CHECK(
+      !payload.is_cuda() && payload.scalar_type() == at::kByte &&
+          payload.is_contiguous() && payload.dim() == 1,
+      "packed VQ row-tile relayout requires contiguous CPU uint8 payload");
+  TORCH_CHECK(
+      rows > 0 && blocks > 0 && bits >= 8 && bits <= 16 &&
+          tile_rows > 0 && tile_rows % 8 == 0,
+      "packed VQ row-tile metadata is invalid");
+  const int64_t count = rows * blocks;
+  TORCH_CHECK(
+      count * bits % 8 == 0 && payload.numel() == count * bits / 8,
+      "packed VQ row-tile payload length mismatch");
+  auto output = torch::zeros_like(payload);
+  const uint8_t* source = payload.data_ptr<uint8_t>();
+  uint8_t* destination = output.data_ptr<uint8_t>();
+  const int64_t tiles = (rows + tile_rows - 1) / tile_rows;
+  at::parallel_for(0, tiles, 1, [&](int64_t begin, int64_t end) {
+    for (int64_t tile = begin; tile < end; ++tile) {
+      const int64_t first_row = tile * tile_rows;
+      const int64_t valid_rows = std::min(tile_rows, rows - first_row);
+      const int64_t target_start = first_row * blocks;
+      for (int64_t block = 0; block < blocks; ++block) {
+        for (int64_t local_row = 0; local_row < valid_rows; ++local_row) {
+          const uint16_t index = read_packed_index(
+              source, (first_row + local_row) * blocks + block, bits);
+          write_packed_index(
+              destination,
+              target_start + block * valid_rows + local_row,
+              bits,
+              index);
+        }
+      }
+    }
+  });
+  return output;
+}
+
+// Compile a byte-packed VQ stream into the CPU's native uint16 row-tile
+// traversal.  The result is an in-memory execution image, not a new model
+// file: callers can release the source payload immediately after this call.
+// Each logical index is decoded exactly once during model load, which removes
+// p9--p15 bit extraction from every subsequent decode token.
+torch::Tensor vq_compile_u16_row_tile_cpu(
+    torch::Tensor payload,
+    int64_t rows,
+    int64_t blocks,
+    int64_t bits,
+    int64_t tile_rows) {
+  TORCH_CHECK(
+      !payload.is_cuda() && payload.scalar_type() == at::kByte &&
+          payload.is_contiguous() && payload.dim() == 1,
+      "packed VQ compilation requires contiguous CPU uint8 payload");
+  TORCH_CHECK(
+      rows > 0 && blocks > 0 && bits >= 8 && bits <= 16 &&
+          tile_rows == 8,
+      "packed VQ compilation metadata is invalid");
+  const int64_t count = rows * blocks;
+  TORCH_CHECK(
+      count * bits % 8 == 0 && payload.numel() == count * bits / 8,
+      "packed VQ compilation payload length mismatch");
+  auto output = torch::empty(
+      {count},
+      torch::TensorOptions().dtype(torch::kUInt16).device(torch::kCPU));
+  const uint8_t* source = payload.data_ptr<uint8_t>();
+  uint16_t* destination = output.data_ptr<uint16_t>();
+  const int64_t tiles = (rows + tile_rows - 1) / tile_rows;
+  at::parallel_for(0, tiles, 1, [&](int64_t begin, int64_t end) {
+    for (int64_t tile = begin; tile < end; ++tile) {
+      const int64_t first_row = tile * tile_rows;
+      const int64_t valid_rows = std::min(tile_rows, rows - first_row);
+      const int64_t target_start = first_row * blocks;
+      for (int64_t block = 0; block < blocks; ++block) {
+        for (int64_t local_row = 0; local_row < valid_rows; ++local_row) {
+          destination[target_start + block * valid_rows + local_row] =
+              read_packed_index(
+                  source,
+                  (first_row + local_row) * blocks + block,
+                  bits);
+        }
+      }
+    }
+  });
+  return output;
 }
 
 inline float direct_dot_packed(
@@ -1576,11 +3260,7 @@ inline float direct_dot_packed(
     const uint8_t* row = packed + (start_index / 4) * 5;
     for (int64_t block = 0; block < blocks; block += 4) {
       const int64_t offset = (block / 4) * 5;
-      uint64_t word = 0;
-      for (int byte = 0; byte < 5; ++byte) {
-        word |= static_cast<uint64_t>(row[offset + byte])
-            << (8 * byte);
-      }
+      const uint64_t word = load_u40_le(row + offset);
       add_code(block, static_cast<uint16_t>(word & 0x3ff));
       add_code(
           block + 1,
@@ -1598,10 +3278,7 @@ inline float direct_dot_packed(
     const uint8_t* row = packed + (start_index / 4) * 7;
     for (int64_t block = 0; block < blocks; block += 4) {
       const int64_t offset = (block / 4) * 7;
-      uint64_t word = 0;
-      for (int byte = 0; byte < 7; ++byte) {
-        word |= static_cast<uint64_t>(row[offset + byte]) << (8 * byte);
-      }
+      const uint64_t word = load_u56_le(row + offset);
       add_code(block, static_cast<uint16_t>(word & 0x3fff));
       add_code(
           block + 1,
@@ -1621,6 +3298,328 @@ inline float direct_dot_packed(
         read_packed_index(packed, start_index + block, bits));
   }
   return sum;
+}
+
+inline float direct_dot_packed_block_major(
+    const float* input,
+    const float* codebook,
+    const uint8_t* packed,
+    int64_t row,
+    int64_t rows,
+    int64_t blocks,
+    int64_t bits,
+    int64_t dim) {
+  float sum = 0.0f;
+  for (int64_t block = 0; block < blocks; ++block) {
+    const uint16_t index = read_packed_index(
+        packed, block * rows + row, bits);
+    const float* code = codebook + static_cast<int64_t>(index) * dim;
+    const float* value = input + block * dim;
+    for (int64_t lane = 0; lane < dim; ++lane) {
+      sum += value[lane] * code[lane];
+    }
+  }
+  return sum;
+}
+
+inline float direct_dot_packed_row_tile8(
+    const float* input,
+    const float* codebook,
+    const uint8_t* packed,
+    int64_t row,
+    int64_t rows,
+    int64_t blocks,
+    int64_t bits,
+    int64_t dim) {
+  const int64_t first_row = (row / 8) * 8;
+  const int64_t local_row = row - first_row;
+  const int64_t valid_rows = std::min<int64_t>(8, rows - first_row);
+  const int64_t tile_start = first_row * blocks;
+  float sum = 0.0f;
+  for (int64_t block = 0; block < blocks; ++block) {
+    const uint16_t index = read_packed_index(
+        packed, tile_start + block * valid_rows + local_row, bits);
+    const float* code = codebook + static_cast<int64_t>(index) * dim;
+    const float* value = input + block * dim;
+    for (int64_t lane = 0; lane < dim; ++lane) {
+      sum += value[lane] * code[lane];
+    }
+  }
+  return sum;
+}
+
+// Visit one row-major packed block for up to eight output rows at a time.
+// Keeping the packed word outside the projection loop is important for p10,
+// p12 and p14: one 5/3/7-byte load yields 4/2/4 indices instead of reloading
+// the same word once per block.  The callback still observes blocks in their
+// original order, so this only changes index decoding, not VQ arithmetic.
+template <typename Callback>
+inline void for_each_packed_rows8_block(
+    const uint8_t* packed,
+    int64_t first_row,
+    int64_t valid_rows,
+    int64_t blocks,
+    int64_t bits,
+    Callback&& callback) {
+  uint16_t indices[4][8];
+  if (bits == 8) {
+    for (int64_t block = 0; block < blocks; ++block) {
+      for (int64_t local_row = 0; local_row < valid_rows; ++local_row) {
+        indices[0][local_row] = packed[
+            (first_row + local_row) * blocks + block];
+      }
+      callback(block, indices[0]);
+    }
+    return;
+  }
+  if (bits == 16) {
+    for (int64_t block = 0; block < blocks; ++block) {
+      for (int64_t local_row = 0; local_row < valid_rows; ++local_row) {
+        const int64_t offset =
+            ((first_row + local_row) * blocks + block) * 2;
+        indices[0][local_row] =
+            static_cast<uint16_t>(packed[offset]) |
+            (static_cast<uint16_t>(packed[offset + 1]) << 8);
+      }
+      callback(block, indices[0]);
+    }
+    return;
+  }
+  if (bits == 12 && blocks % 2 == 0) {
+    for (int64_t block = 0; block < blocks; block += 2) {
+      for (int64_t local_row = 0; local_row < valid_rows; ++local_row) {
+        const int64_t start_index =
+            (first_row + local_row) * blocks + block;
+        const uint8_t* word = packed + (start_index / 2) * 3;
+        indices[0][local_row] =
+            static_cast<uint16_t>(word[0]) |
+            ((static_cast<uint16_t>(word[1]) & 0x0f) << 8);
+        indices[1][local_row] =
+            (static_cast<uint16_t>(word[1]) >> 4) |
+            (static_cast<uint16_t>(word[2]) << 4);
+      }
+      callback(block, indices[0]);
+      callback(block + 1, indices[1]);
+    }
+    return;
+  }
+  if ((bits == 10 || bits == 14) && blocks % 4 == 0) {
+    const int64_t bytes = bits == 10 ? 5 : 7;
+    const uint64_t mask = bits == 10 ? 0x3ff : 0x3fff;
+    for (int64_t block = 0; block < blocks; block += 4) {
+      for (int64_t local_row = 0; local_row < valid_rows; ++local_row) {
+        const int64_t start_index =
+            (first_row + local_row) * blocks + block;
+        const uint8_t* address =
+            packed + (start_index / 4) * bytes;
+        const uint64_t word = bits == 10
+            ? load_u40_le(address)
+            : load_u56_le(address);
+        indices[0][local_row] = static_cast<uint16_t>(word & mask);
+        indices[1][local_row] =
+            static_cast<uint16_t>((word >> bits) & mask);
+        indices[2][local_row] =
+            static_cast<uint16_t>((word >> (bits * 2)) & mask);
+        indices[3][local_row] =
+            static_cast<uint16_t>((word >> (bits * 3)) & mask);
+      }
+      callback(block, indices[0]);
+      callback(block + 1, indices[1]);
+      callback(block + 2, indices[2]);
+      callback(block + 3, indices[3]);
+    }
+    return;
+  }
+  for (int64_t block = 0; block < blocks; ++block) {
+    for (int64_t local_row = 0; local_row < valid_rows; ++local_row) {
+      indices[0][local_row] = read_packed_index(
+          packed, (first_row + local_row) * blocks + block, bits);
+    }
+    callback(block, indices[0]);
+  }
+}
+
+inline void decode_contiguous_indices(
+    const uint8_t* packed,
+    int64_t start_index,
+    int64_t count,
+    int64_t bits,
+    uint16_t* indices) {
+  if (bits == 8) {
+    for (int64_t index = 0; index < count; ++index) {
+      indices[index] = packed[start_index + index];
+    }
+    return;
+  }
+  if (bits == 16) {
+    const uint8_t* source = packed + start_index * 2;
+    for (int64_t index = 0; index < count; ++index) {
+      indices[index] = static_cast<uint16_t>(source[index * 2]) |
+          (static_cast<uint16_t>(source[index * 2 + 1]) << 8);
+    }
+    return;
+  }
+  if (bits == 12 && start_index % 2 == 0 && count % 2 == 0) {
+    const uint8_t* source = packed + (start_index / 2) * 3;
+    for (int64_t index = 0; index < count; index += 2) {
+      indices[index] = static_cast<uint16_t>(source[0]) |
+          ((static_cast<uint16_t>(source[1]) & 0x0f) << 8);
+      indices[index + 1] = (static_cast<uint16_t>(source[1]) >> 4) |
+          (static_cast<uint16_t>(source[2]) << 4);
+      source += 3;
+    }
+    return;
+  }
+  if ((bits == 10 || bits == 14) &&
+      start_index % 4 == 0 && count % 4 == 0) {
+    const int64_t bytes = bits == 10 ? 5 : 7;
+    const uint64_t mask = bits == 10 ? 0x3ff : 0x3fff;
+    const uint8_t* source = packed + (start_index / 4) * bytes;
+    for (int64_t index = 0; index < count; index += 4) {
+      const uint64_t word = bits == 10
+          ? load_u40_le(source) : load_u56_le(source);
+      indices[index] = static_cast<uint16_t>(word & mask);
+      indices[index + 1] =
+          static_cast<uint16_t>((word >> bits) & mask);
+      indices[index + 2] =
+          static_cast<uint16_t>((word >> (bits * 2)) & mask);
+      indices[index + 3] =
+          static_cast<uint16_t>((word >> (bits * 3)) & mask);
+      source += bytes;
+    }
+    return;
+  }
+  for (int64_t index = 0; index < count; ++index) {
+    indices[index] = read_packed_index(
+        packed, start_index + index, bits);
+  }
+}
+
+template <typename Callback>
+inline void for_each_packed_row_tile8_block(
+    const uint8_t* packed,
+    int64_t first_row,
+    int64_t valid_rows,
+    int64_t blocks,
+    int64_t bits,
+    Callback&& callback) {
+  uint16_t indices[8];
+  const int64_t tile_start = first_row * blocks;
+  for (int64_t block = 0; block < blocks; ++block) {
+    decode_contiguous_indices(
+        packed,
+        tile_start + block * valid_rows,
+        valid_rows,
+        bits,
+        indices);
+    callback(block, indices);
+  }
+}
+
+inline void direct_dot_packed_rows8(
+    const float* input,
+    const float* codebook,
+    const uint8_t* packed,
+    int64_t first_row,
+    int64_t valid_rows,
+    int64_t blocks,
+    int64_t bits,
+    int64_t dim,
+    int64_t layout,
+    float* output) {
+  const auto visit = [&](auto&& callback) {
+    if (layout == 2) {
+      for_each_packed_row_tile8_block(
+          packed, first_row, valid_rows, blocks, bits,
+          std::forward<decltype(callback)>(callback));
+    } else {
+      for_each_packed_rows8_block(
+          packed, first_row, valid_rows, blocks, bits,
+          std::forward<decltype(callback)>(callback));
+    }
+  };
+#if defined(__AVX512F__)
+  if (dim == 16) {
+    __m512 accumulated[8];
+    for (int64_t row = 0; row < valid_rows; ++row) {
+      accumulated[row] = _mm512_setzero_ps();
+    }
+    visit([&](int64_t block, const uint16_t* indices) {
+      const __m512 activation = _mm512_loadu_ps(input + block * dim);
+      for (int64_t local_row = 0; local_row < valid_rows; ++local_row) {
+        accumulated[local_row] = _mm512_fmadd_ps(
+            activation,
+            _mm512_loadu_ps(
+                codebook + static_cast<int64_t>(indices[local_row]) * dim),
+            accumulated[local_row]);
+      }
+    });
+    for (int64_t row = 0; row < valid_rows; ++row) {
+      output[row] = _mm512_reduce_add_ps(accumulated[row]);
+    }
+    return;
+  }
+#endif
+#if defined(__AVX2__)
+  if (dim == 8) {
+    __m256 accumulated[8];
+    for (int64_t row = 0; row < valid_rows; ++row) {
+      accumulated[row] = _mm256_setzero_ps();
+    }
+    visit([&](int64_t block, const uint16_t* indices) {
+      const __m256 activation = _mm256_loadu_ps(input + block * dim);
+      for (int64_t local_row = 0; local_row < valid_rows; ++local_row) {
+        accumulated[local_row] = _mm256_fmadd_ps(
+            activation,
+            _mm256_loadu_ps(
+                codebook + static_cast<int64_t>(indices[local_row]) * dim),
+            accumulated[local_row]);
+      }
+    });
+    for (int64_t row = 0; row < valid_rows; ++row) {
+      alignas(32) float lanes[8];
+      _mm256_store_ps(lanes, accumulated[row]);
+      float sum = 0.0f;
+      for (float lane : lanes) {
+        sum += lane;
+      }
+      output[row] = sum;
+    }
+    return;
+  }
+  if (dim == 4) {
+    __m128 accumulated[8];
+    for (int64_t row = 0; row < valid_rows; ++row) {
+      accumulated[row] = _mm_setzero_ps();
+    }
+    visit([&](int64_t block, const uint16_t* indices) {
+      const __m128 activation = _mm_loadu_ps(input + block * dim);
+      for (int64_t local_row = 0; local_row < valid_rows; ++local_row) {
+        accumulated[local_row] = _mm_fmadd_ps(
+            activation,
+            _mm_loadu_ps(
+                codebook + static_cast<int64_t>(indices[local_row]) * dim),
+            accumulated[local_row]);
+      }
+    });
+    for (int64_t row = 0; row < valid_rows; ++row) {
+      alignas(16) float lanes[4];
+      _mm_store_ps(lanes, accumulated[row]);
+      output[row] = lanes[0] + lanes[1] + lanes[2] + lanes[3];
+    }
+    return;
+  }
+#endif
+  for (int64_t local_row = 0; local_row < valid_rows; ++local_row) {
+    output[local_row] = direct_dot_packed(
+        input,
+        codebook,
+        packed,
+        (first_row + local_row) * blocks,
+        blocks,
+        bits,
+        dim);
+  }
 }
 
 torch::Tensor vq_gemv_packed_list_cpu(
@@ -1675,12 +3674,16 @@ torch::Tensor vq_gemv_packed_list_cpu(
       (score_n == 1 || score_n == n) &&
       n * rows * dim < score_n * codes * dim + n * rows;
 #if defined(__AVX512F__)
-  // Large p14/p16 codebooks are sparse during Top-K decode: only the selected
-  // experts' row indices are needed.  Vectorise over 16 output rows and
+  // Sparse Top-K decode only needs the selected experts' row indices.
+  // Vectorise the direct path for every packed width p8--p16; heterogeneous
+  // archives frequently choose p11/p12/p13 for a single selected expert, and
+  // leaving those widths on the scalar direct-dot fallback dominated DSV4
+  // CPU decode.  Index extraction remains byte-packed and row-local.
+  // Vectorise over 16 output rows and
   // gather the referenced transposed code vectors directly.  Keeping one
   // block-local dot before accumulating preserves the score-then-lookup
   // floating-point order while avoiding a blocks*K score table.
-  if (use_direct && (bits == 14 || bits == 16)) {
+  if (use_direct) {
     auto out = torch::empty(
         {n, rows},
         torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
@@ -1721,11 +3724,7 @@ torch::Tensor vq_gemv_packed_list_cpu(
               const int64_t index_offset =
                   (row + lane) * blocks + block;
               const int64_t offset = (index_offset / 4) * 7;
-              uint64_t word = 0;
-              for (int byte = 0; byte < 7; ++byte) {
-                word |= static_cast<uint64_t>(payload[offset + byte])
-                    << (8 * byte);
-              }
+              const uint64_t word = load_u56_le(payload + offset);
               gathered_indices[0][lane] =
                   static_cast<int32_t>(word & 0x3fff);
               gathered_indices[1][lane] =
@@ -1863,6 +3862,7 @@ torch::Tensor moe_packed_three_projection_cpu(
     std::string activation,
     double beta,
     double linear_beta,
+    torch::Tensor workspace,
     torch::Tensor result) {
   const int64_t experts =
       static_cast<int64_t>(gate_payloads.size());
@@ -1891,7 +3891,276 @@ torch::Tensor moe_packed_three_projection_cpu(
           down_blocks * down_codebook.size(1) == gate_rows,
       "three-projection logical matrix shapes do not match");
 
+  // Small/medium codebooks use score-then-lookup.  Keep every stage in one
+  // OpenMP team so the public Top-K call does not enter and leave the host
+  // worker pool seven times per layer.  The packed p8--p13 payload remains
+  // byte-exact and row-major; no expanded index or weight matrix is created.
+  // p14/p16 retain the sparse direct-gather path below.
+  const bool score_pipeline =
+      packed_single_team_enabled() &&
+      gate_bits <= 13 && up_bits <= 13 && down_bits <= 13 &&
+      x_row.scalar_type() == at::kFloat && x_row.is_contiguous() &&
+      gate_codebook.scalar_type() == at::kFloat &&
+      up_codebook.scalar_type() == at::kFloat &&
+      down_codebook.scalar_type() == at::kFloat &&
+      gate_codebook.is_contiguous() && up_codebook.is_contiguous() &&
+      down_codebook.is_contiguous();
+  if (score_pipeline) {
+    const int64_t gate_codes = gate_codebook.size(0);
+    const int64_t up_codes = up_codebook.size(0);
+    const int64_t down_codes = down_codebook.size(0);
+    TORCH_CHECK(
+        gate_codes <= (int64_t{1} << gate_bits) &&
+            up_codes <= (int64_t{1} << up_bits) &&
+            down_codes <= (int64_t{1} << down_bits),
+        "packed width cannot represent projection codebook");
+    std::vector<const uint8_t*> gate_ptrs(experts);
+    std::vector<const uint8_t*> up_ptrs(experts);
+    std::vector<const uint8_t*> down_ptrs(experts);
+    const auto collect_payloads = [&](
+        const std::vector<torch::Tensor>& payloads,
+        int64_t rows,
+        int64_t blocks,
+        int64_t bits,
+        std::vector<const uint8_t*>& pointers) {
+      const int64_t expected_bits = rows * blocks * bits;
+      TORCH_CHECK(
+          expected_bits % 8 == 0,
+          "packed projection payload must be byte aligned");
+      const int64_t expected_bytes = expected_bits / 8;
+      for (int64_t expert = 0; expert < experts; ++expert) {
+        const auto& payload = payloads[expert];
+        TORCH_CHECK(
+            !payload.is_cuda() && payload.scalar_type() == at::kByte &&
+                payload.is_contiguous() &&
+                payload.numel() == expected_bytes,
+            "packed projection payload mismatch");
+        pointers[expert] = payload.data_ptr<uint8_t>();
+      }
+    };
+    collect_payloads(
+        gate_payloads,
+        gate_rows,
+        gate_blocks,
+        gate_bits,
+        gate_ptrs);
+    collect_payloads(
+        up_payloads,
+        up_rows,
+        up_blocks,
+        up_bits,
+        up_ptrs);
+    collect_payloads(
+        down_payloads,
+        down_rows,
+        down_blocks,
+        down_bits,
+        down_ptrs);
+    TORCH_CHECK(
+        !result.is_cuda() && result.scalar_type() == at::kFloat &&
+            result.is_contiguous() && result.numel() >= down_rows,
+        "three-projection result workspace is invalid");
+
+    auto gate_cb = cached_transposed_codebook(gate_codebook);
+    auto up_cb = cached_transposed_codebook(up_codebook);
+    auto down_cb = cached_transposed_codebook(down_codebook);
+    auto route = route_weights.to(torch::kFloat32).contiguous();
+    const int64_t score_count = std::max(
+        gate_blocks * gate_codes,
+        up_blocks * up_codes);
+    const int64_t gate_offset = score_count;
+    const int64_t up_offset = gate_offset + experts * gate_rows;
+    const int64_t down_score_offset =
+        up_offset + experts * up_rows;
+    const int64_t down_value_offset =
+        down_score_offset + experts * down_blocks * down_codes;
+    TORCH_CHECK(
+        !workspace.is_cuda() &&
+            workspace.scalar_type() == at::kFloat &&
+            workspace.is_contiguous() &&
+            workspace.numel() >= down_value_offset + experts * down_rows,
+        "three-projection persistent workspace is too small");
+    float* workspacep = workspace.data_ptr<float>();
+    float* scorep = workspacep;
+    float* gatep = workspacep + gate_offset;
+    float* upp = workspacep + up_offset;
+    float* down_scorep = workspacep + down_score_offset;
+    float* downp = workspacep + down_value_offset;
+    float* resultp = result.data_ptr<float>();
+    const float* xp = x_row.data_ptr<float>();
+    const float* gate_cbp = gate_cb.data_ptr<float>();
+    const float* up_cbp = up_cb.data_ptr<float>();
+    const float* down_cbp = down_cb.data_ptr<float>();
+    const float* routep = route.data_ptr<float>();
+    const float activation_limit = static_cast<float>(limit);
+    const float situ_beta = static_cast<float>(beta);
+    const float situ_linear_beta = static_cast<float>(linear_beta);
+    const bool rows16 = packed_rows16_enabled();
+    double phase_markers[6] = {wall_seconds(), 0.0, 0.0, 0.0, 0.0, 0.0};
+
+#pragma omp parallel
+    {
+#pragma omp for schedule(static)
+      for (int64_t block = 0; block < gate_blocks; ++block) {
+        codebook_scores(
+            xp + block * gate_codebook.size(1),
+            gate_cbp,
+            scorep + block * gate_codes,
+            gate_codes,
+            gate_codebook.size(1));
+      }
+      if (rows16 &&
+          (gate_bits == 8 || gate_bits == 10 || gate_bits == 12)) {
+#pragma omp for schedule(static)
+        for (int64_t item = 0;
+             item < experts * ((gate_rows + 15) / 16);
+             ++item) {
+          const int64_t groups = (gate_rows + 15) / 16;
+          const int64_t expert = item / groups;
+          const int64_t first_row = (item - expert * groups) * 16;
+          lookup_sum_packed_rows16(
+              scorep, gate_ptrs[expert], first_row, gate_rows,
+              gate_blocks, gate_codes, gate_bits,
+              gatep + expert * gate_rows);
+        }
+      } else {
+#pragma omp for schedule(static)
+        for (int64_t item = 0; item < experts * gate_rows; ++item) {
+          const int64_t expert = item / gate_rows;
+          const int64_t row = item - expert * gate_rows;
+          gatep[item] = lookup_sum_packed(
+              scorep, gate_ptrs[expert], row * gate_blocks, gate_blocks,
+              gate_codes, gate_bits);
+        }
+      }
+#pragma omp single
+      { phase_markers[1] = wall_seconds(); }
+
+#pragma omp for schedule(static)
+      for (int64_t block = 0; block < up_blocks; ++block) {
+        codebook_scores(
+            xp + block * up_codebook.size(1),
+            up_cbp,
+            scorep + block * up_codes,
+            up_codes,
+            up_codebook.size(1));
+      }
+      if (rows16 &&
+          (up_bits == 8 || up_bits == 10 || up_bits == 12)) {
+#pragma omp for schedule(static)
+        for (int64_t item = 0;
+             item < experts * ((up_rows + 15) / 16);
+             ++item) {
+          const int64_t groups = (up_rows + 15) / 16;
+          const int64_t expert = item / groups;
+          const int64_t first_row = (item - expert * groups) * 16;
+          lookup_sum_packed_rows16(
+              scorep, up_ptrs[expert], first_row, up_rows,
+              up_blocks, up_codes, up_bits,
+              upp + expert * up_rows);
+        }
+      } else {
+#pragma omp for schedule(static)
+        for (int64_t item = 0; item < experts * up_rows; ++item) {
+          const int64_t expert = item / up_rows;
+          const int64_t row = item - expert * up_rows;
+          upp[item] = lookup_sum_packed(
+              scorep, up_ptrs[expert], row * up_blocks, up_blocks,
+              up_codes, up_bits);
+        }
+      }
+#pragma omp single
+      { phase_markers[2] = wall_seconds(); }
+
+#pragma omp for schedule(static)
+      for (int64_t item = 0; item < experts * gate_rows; ++item) {
+        float gate = gatep[item];
+        float up = upp[item];
+        if (activation_limit != 0.0f) {
+          gate = std::min(gate, activation_limit);
+          up = std::max(
+              -activation_limit, std::min(up, activation_limit));
+        }
+        if (activation == "situ") {
+          float linear = up;
+          if (situ_linear_beta > 0.0f) {
+            linear = situ_linear_beta *
+                std::tanh(up / situ_linear_beta);
+          }
+          gatep[item] =
+              situ_beta * std::tanh(gate / situ_beta) *
+              (1.0f / (1.0f + std::exp(-gate))) * linear;
+        } else {
+          gatep[item] =
+              gate * (1.0f / (1.0f + std::exp(-gate))) * up;
+        }
+      }
+#pragma omp single
+      { phase_markers[3] = wall_seconds(); }
+
+#pragma omp for schedule(static)
+      for (int64_t item = 0; item < experts * down_blocks; ++item) {
+        const int64_t expert = item / down_blocks;
+        const int64_t block = item - expert * down_blocks;
+        codebook_scores(
+            gatep + expert * gate_rows +
+                block * down_codebook.size(1),
+            down_cbp,
+            down_scorep + item * down_codes,
+            down_codes,
+            down_codebook.size(1));
+      }
+      if (rows16 &&
+          (down_bits == 8 || down_bits == 10 || down_bits == 12)) {
+#pragma omp for schedule(static)
+        for (int64_t item = 0;
+             item < experts * ((down_rows + 15) / 16);
+             ++item) {
+          const int64_t groups = (down_rows + 15) / 16;
+          const int64_t expert = item / groups;
+          const int64_t first_row = (item - expert * groups) * 16;
+          lookup_sum_packed_rows16(
+              down_scorep + expert * down_blocks * down_codes,
+              down_ptrs[expert], first_row, down_rows,
+              down_blocks, down_codes, down_bits,
+              downp + expert * down_rows);
+        }
+      } else {
+#pragma omp for schedule(static)
+        for (int64_t item = 0; item < experts * down_rows; ++item) {
+          const int64_t expert = item / down_rows;
+          const int64_t row = item - expert * down_rows;
+          downp[item] = lookup_sum_packed(
+              down_scorep + expert * down_blocks * down_codes,
+              down_ptrs[expert], row * down_blocks, down_blocks,
+              down_codes, down_bits);
+        }
+      }
+#pragma omp single
+      { phase_markers[4] = wall_seconds(); }
+
+#pragma omp for schedule(static)
+      for (int64_t row = 0; row < down_rows; ++row) {
+        float value = 0.0f;
+        for (int64_t expert = 0; expert < experts; ++expert) {
+          value += downp[expert * down_rows + row] * routep[expert];
+        }
+        resultp[row] = value;
+      }
+#pragma omp single
+      { phase_markers[5] = wall_seconds(); }
+    }
+    for (int64_t phase = 0; phase < 5; ++phase) {
+      three_projection_phase_seconds[phase] +=
+          phase_markers[phase + 1] - phase_markers[phase];
+    }
+    ++three_projection_phase_calls;
+    return result.narrow(0, 0, down_rows);
+  }
+
   const double gate_started = wall_seconds();
+  // Gate and Up deliberately keep separate score pages. Combining their
+  // unrelated random-gather streams regresses dual-socket LLC locality.
   auto gate_values = vq_gemv_packed_list_cpu(
       x_row,
       std::move(gate_payloads),
@@ -1910,28 +4179,48 @@ torch::Tensor moe_packed_three_projection_cpu(
       up_bits,
       true);
   const double activation_started = wall_seconds();
-  if (limit != 0.0) {
-    gate_values.clamp_max_(limit);
-    up_values.clamp_(-limit, limit);
-  }
-  torch::Tensor activated;
-  if (activation == "situ") {
-    activated = gate_values.clone();
-    activated.div_(beta);
-    activated.tanh_();
-    activated.mul_(beta);
-    auto sigmoid = gate_values.sigmoid();
-    activated.mul_(sigmoid);
-    if (linear_beta > 0.0) {
-      up_values.div_(linear_beta);
-      up_values.tanh_();
-      up_values.mul_(linear_beta);
-    }
-    activated.mul_(up_values);
-  } else {
-    activated = gate_values * gate_values.sigmoid();
-    activated.mul_(up_values);
-  }
+  TORCH_CHECK(
+      gate_values.scalar_type() == at::kFloat &&
+          up_values.scalar_type() == at::kFloat &&
+          gate_values.is_contiguous() && up_values.is_contiguous() &&
+          gate_values.sizes() == up_values.sizes(),
+      "three-projection activation workspace is invalid");
+  // Reuse the gate output as the activation workspace.  This keeps the whole
+  // Top-K activation in the public native operator and avoids clone/sigmoid/
+  // multiply tensor launches while retaining only O(TopK*intermediate)
+  // temporary storage.
+  float* gatep = gate_values.data_ptr<float>();
+  float* upp = up_values.data_ptr<float>();
+  const int64_t activation_count = gate_values.numel();
+  const float activation_limit = static_cast<float>(limit);
+  const float situ_beta = static_cast<float>(beta);
+  const float situ_linear_beta = static_cast<float>(linear_beta);
+  at::parallel_for(
+      0, activation_count, 256, [&](int64_t begin, int64_t end) {
+        for (int64_t index = begin; index < end; ++index) {
+          float gate = gatep[index];
+          float up = upp[index];
+          if (activation_limit != 0.0f) {
+            gate = std::min(gate, activation_limit);
+            up = std::max(
+                -activation_limit, std::min(up, activation_limit));
+          }
+          if (activation == "situ") {
+            float linear = up;
+            if (situ_linear_beta > 0.0f) {
+              linear = situ_linear_beta *
+                  std::tanh(up / situ_linear_beta);
+            }
+            gatep[index] =
+                situ_beta * std::tanh(gate / situ_beta) *
+                (1.0f / (1.0f + std::exp(-gate))) * linear;
+          } else {
+            gatep[index] =
+                gate * (1.0f / (1.0f + std::exp(-gate))) * up;
+          }
+        }
+      });
+  auto activated = gate_values;
   const double down_started = wall_seconds();
   auto down_values = vq_gemv_packed_list_cpu(
       activated,
@@ -1942,15 +4231,29 @@ torch::Tensor moe_packed_three_projection_cpu(
       down_bits,
       true);
   const double reduce_started = wall_seconds();
-  auto reduced = torch::sum(
-      down_values *
-          route_weights.to(torch::kFloat32).reshape({experts, 1}),
-      0);
   TORCH_CHECK(
       !result.is_cuda() && result.scalar_type() == at::kFloat &&
           result.numel() >= down_rows,
       "three-projection result workspace is invalid");
-  result.narrow(0, 0, down_rows).copy_(reduced);
+  auto route = route_weights.to(torch::kFloat32).contiguous();
+  TORCH_CHECK(
+      down_values.scalar_type() == at::kFloat &&
+          down_values.is_contiguous() &&
+          down_values.size(0) == experts &&
+          down_values.size(1) == down_rows,
+      "three-projection down workspace is invalid");
+  const float* downp = down_values.data_ptr<float>();
+  const float* routep = route.data_ptr<float>();
+  float* resultp = result.data_ptr<float>();
+  at::parallel_for(0, down_rows, 256, [&](int64_t begin, int64_t end) {
+    for (int64_t column = begin; column < end; ++column) {
+      float value = 0.0f;
+      for (int64_t expert = 0; expert < experts; ++expert) {
+        value += downp[expert * down_rows + column] * routep[expert];
+      }
+      resultp[column] = value;
+    }
+  });
   const double finished = wall_seconds();
   three_projection_phase_seconds[0] += up_started - gate_started;
   three_projection_phase_seconds[1] +=
@@ -1963,6 +4266,1781 @@ torch::Tensor moe_packed_three_projection_cpu(
   ++three_projection_phase_calls;
   return result.narrow(0, 0, down_rows);
 }
+
+class CpuPackedThreeLayer {
+ public:
+  CpuPackedThreeLayer(
+      std::vector<torch::Tensor> gate_payloads,
+      std::vector<torch::Tensor> gate_codebooks,
+      int64_t gate_rows,
+      int64_t gate_blocks,
+      int64_t gate_bits,
+      std::vector<torch::Tensor> up_payloads,
+      std::vector<torch::Tensor> up_codebooks,
+      int64_t up_rows,
+      int64_t up_blocks,
+      int64_t up_bits,
+      std::vector<torch::Tensor> down_payloads,
+      std::vector<torch::Tensor> down_codebooks,
+      int64_t down_rows,
+      int64_t down_blocks,
+      int64_t down_bits)
+      : gate_payloads_(std::move(gate_payloads)),
+        gate_codebooks_(std::move(gate_codebooks)),
+        up_payloads_(std::move(up_payloads)),
+        up_codebooks_(std::move(up_codebooks)),
+        down_payloads_(std::move(down_payloads)),
+        down_codebooks_(std::move(down_codebooks)),
+        gate_rows_(gate_rows),
+        gate_blocks_(gate_blocks),
+        gate_bits_(gate_bits),
+        up_rows_(up_rows),
+        up_blocks_(up_blocks),
+        up_bits_(up_bits),
+        down_rows_(down_rows),
+        down_blocks_(down_blocks),
+        down_bits_(down_bits) {
+    const int64_t experts = gate_payloads_.size();
+    TORCH_CHECK(
+        experts > 0 && experts == (int64_t)gate_codebooks_.size() &&
+            experts == (int64_t)up_payloads_.size() &&
+            experts == (int64_t)up_codebooks_.size() &&
+            experts == (int64_t)down_payloads_.size() &&
+            experts == (int64_t)down_codebooks_.size(),
+        "resident packed layer expert counts must match");
+    const int64_t top_k = std::min<int64_t>(16, experts);
+    const int64_t gate_codes = gate_codebooks_[0].size(0);
+    const int64_t up_codes = up_codebooks_[0].size(0);
+    const int64_t down_codes = down_codebooks_[0].size(0);
+    const int64_t score_count = std::max(
+        gate_blocks_ * gate_codes, up_blocks_ * up_codes);
+    const int64_t required =
+        score_count + top_k * gate_rows_ + top_k * up_rows_ +
+        top_k * down_blocks_ * down_codes + top_k * down_rows_;
+    auto options = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(torch::kCPU);
+    workspace_ = torch::empty({required}, options);
+    result_ = torch::empty({down_rows_}, options);
+    empty_ = torch::empty({0}, options);
+  }
+
+  torch::Tensor forward(
+      torch::Tensor x_row,
+      torch::Tensor expert_ids,
+      torch::Tensor route_weights,
+      double limit,
+      std::string activation,
+      double beta,
+      double linear_beta) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto ids = expert_ids.to(torch::kLong).contiguous();
+    TORCH_CHECK(
+        !ids.is_cuda() && ids.dim() == 1 && ids.numel() > 0 &&
+            ids.numel() <= 16 && route_weights.numel() == ids.numel(),
+        "resident packed layer route shape mismatch");
+    const int64_t count = ids.numel();
+    const int64_t* idp = ids.data_ptr<int64_t>();
+    std::vector<torch::Tensor> gate;
+    std::vector<torch::Tensor> up;
+    std::vector<torch::Tensor> down;
+    gate.reserve(count);
+    up.reserve(count);
+    down.reserve(count);
+    torch::Tensor gate_codebook;
+    torch::Tensor up_codebook;
+    torch::Tensor down_codebook;
+    for (int64_t slot = 0; slot < count; ++slot) {
+      const int64_t expert = idp[slot];
+      TORCH_CHECK(
+          expert >= 0 && expert < (int64_t)gate_payloads_.size(),
+          "resident packed layer selected an invalid expert");
+      if (slot == 0) {
+        gate_codebook = gate_codebooks_[expert];
+        up_codebook = up_codebooks_[expert];
+        down_codebook = down_codebooks_[expert];
+      } else if (
+          gate_codebooks_[expert].data_ptr() != gate_codebook.data_ptr() ||
+          up_codebooks_[expert].data_ptr() != up_codebook.data_ptr() ||
+          down_codebooks_[expert].data_ptr() != down_codebook.data_ptr()) {
+        return empty_;
+      }
+      gate.push_back(gate_payloads_[expert]);
+      up.push_back(up_payloads_[expert]);
+      down.push_back(down_payloads_[expert]);
+    }
+    return moe_packed_three_projection_cpu(
+        x_row,
+        std::move(gate),
+        gate_codebook,
+        gate_rows_,
+        gate_blocks_,
+        gate_bits_,
+        std::move(up),
+        up_codebook,
+        up_rows_,
+        up_blocks_,
+        up_bits_,
+        std::move(down),
+        down_codebook,
+        down_rows_,
+        down_blocks_,
+        down_bits_,
+        route_weights,
+        limit,
+        std::move(activation),
+        beta,
+        linear_beta,
+        workspace_,
+        result_);
+  }
+
+ private:
+  std::vector<torch::Tensor> gate_payloads_;
+  std::vector<torch::Tensor> gate_codebooks_;
+  std::vector<torch::Tensor> up_payloads_;
+  std::vector<torch::Tensor> up_codebooks_;
+  std::vector<torch::Tensor> down_payloads_;
+  std::vector<torch::Tensor> down_codebooks_;
+  int64_t gate_rows_;
+  int64_t gate_blocks_;
+  int64_t gate_bits_;
+  int64_t up_rows_;
+  int64_t up_blocks_;
+  int64_t up_bits_;
+  int64_t down_rows_;
+  int64_t down_blocks_;
+  int64_t down_bits_;
+  torch::Tensor workspace_;
+  torch::Tensor result_;
+  torch::Tensor empty_;
+  std::mutex mutex_;
+};
+
+// Resident directory for archives whose projection layout varies per expert.
+// It owns only compact payload/codebook tensors and a bounded Top-K workspace;
+// no index stream or logical weight matrix is expanded.  All selected Gate,
+// Up, activation, Down and route reduction stages stay inside one OpenMP team.
+class CpuPackedThreeMixedLayer {
+ public:
+  CpuPackedThreeMixedLayer(
+      std::vector<torch::Tensor> gate_payloads,
+      std::vector<torch::Tensor> gate_codebooks,
+      std::vector<int64_t> gate_rows,
+      std::vector<int64_t> gate_blocks,
+      std::vector<int64_t> gate_bits,
+      std::vector<int64_t> gate_layouts,
+      std::vector<torch::Tensor> up_payloads,
+      std::vector<torch::Tensor> up_codebooks,
+      std::vector<int64_t> up_rows,
+      std::vector<int64_t> up_blocks,
+      std::vector<int64_t> up_bits,
+      std::vector<int64_t> up_layouts,
+      std::vector<torch::Tensor> down_payloads,
+      std::vector<torch::Tensor> down_codebooks,
+      std::vector<int64_t> down_rows,
+      std::vector<int64_t> down_blocks,
+      std::vector<int64_t> down_bits,
+      std::vector<int64_t> down_layouts)
+      : gate_payloads_(std::move(gate_payloads)),
+        gate_codebooks_(normalize_codebooks(std::move(gate_codebooks))),
+        gate_rows_(std::move(gate_rows)),
+        gate_blocks_(std::move(gate_blocks)),
+        gate_bits_(std::move(gate_bits)),
+        gate_layouts_(std::move(gate_layouts)),
+        up_payloads_(std::move(up_payloads)),
+        up_codebooks_(normalize_codebooks(std::move(up_codebooks))),
+        up_rows_(std::move(up_rows)),
+        up_blocks_(std::move(up_blocks)),
+        up_bits_(std::move(up_bits)),
+        up_layouts_(std::move(up_layouts)),
+        down_payloads_(std::move(down_payloads)),
+        down_codebooks_(normalize_codebooks(std::move(down_codebooks))),
+        down_rows_(std::move(down_rows)),
+        down_blocks_(std::move(down_blocks)),
+        down_bits_(std::move(down_bits)),
+        down_layouts_(std::move(down_layouts)) {
+    const int64_t experts = gate_payloads_.size();
+    TORCH_CHECK(experts > 0, "mixed resident layer cannot be empty");
+    validate_projection(
+        "gate", experts, gate_payloads_, gate_codebooks_,
+        gate_rows_, gate_blocks_, gate_bits_, gate_layouts_);
+    validate_projection(
+        "up", experts, up_payloads_, up_codebooks_,
+        up_rows_, up_blocks_, up_bits_, up_layouts_);
+    validate_projection(
+        "down", experts, down_payloads_, down_codebooks_,
+        down_rows_, down_blocks_, down_bits_, down_layouts_);
+    hidden_ = down_rows_[0];
+    intermediate_ = gate_rows_[0];
+    int64_t max_scores = 1;
+    for (int64_t expert = 0; expert < experts; ++expert) {
+      TORCH_CHECK(
+          gate_rows_[expert] == intermediate_ &&
+              up_rows_[expert] == intermediate_ &&
+              down_rows_[expert] == hidden_ &&
+              gate_blocks_[expert] * gate_codebooks_[expert].size(1) == hidden_ &&
+              up_blocks_[expert] * up_codebooks_[expert].size(1) == hidden_ &&
+              down_blocks_[expert] * down_codebooks_[expert].size(1) == intermediate_,
+          "mixed resident projection shapes do not match");
+      max_scores = std::max(
+          max_scores,
+          gate_blocks_[expert] * gate_codebooks_[expert].size(0));
+      max_scores = std::max(
+          max_scores,
+          up_blocks_[expert] * up_codebooks_[expert].size(0));
+      max_scores = std::max(
+          max_scores,
+          down_blocks_[expert] * down_codebooks_[expert].size(0));
+    }
+    gate_transposed_ = transpose_codebooks(gate_codebooks_);
+    up_transposed_ = transpose_codebooks(up_codebooks_);
+    down_transposed_ = transpose_codebooks(down_codebooks_);
+    gate_paired_bf16_ = paired_codebooks(
+        gate_codebooks_, gate_layouts_);
+    up_paired_bf16_ = paired_codebooks(
+        up_codebooks_, up_layouts_);
+    has_score_layout_ =
+        std::find(gate_layouts_.begin(), gate_layouts_.end(), 1) !=
+            gate_layouts_.end() ||
+        std::find(up_layouts_.begin(), up_layouts_.end(), 1) !=
+            up_layouts_.end();
+    auto options = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(torch::kCPU);
+    score_ = torch::empty({max_scores}, options);
+    gate_values_ = torch::empty({16, intermediate_}, options);
+    up_values_ = torch::empty({16, intermediate_}, options);
+    down_values_ = torch::empty({16, hidden_}, options);
+    result_ = torch::empty({hidden_}, options);
+    if (has_score_layout_) {
+      input_bf16_ = torch::empty(
+          {hidden_}, options.dtype(torch::kBFloat16));
+    }
+  }
+
+  void configure_fused_moe(
+      torch::Tensor router_weight,
+      torch::Tensor router_bias,
+      torch::Tensor router_mask,
+      std::vector<torch::Tensor> shared_weights,
+      std::vector<torch::Tensor> shared_scales,
+      std::vector<int64_t> shared_rows,
+      std::vector<int64_t> shared_cols,
+      int64_t shared_block,
+      int64_t top_k,
+      bool normalize_route,
+      double routed_scaling) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    TORCH_CHECK(
+        !router_weight.is_cuda() && router_weight.dim() == 2 &&
+            router_weight.is_contiguous() &&
+            (router_weight.scalar_type() == at::kFloat ||
+             router_weight.scalar_type() == at::kBFloat16) &&
+            router_weight.size(1) == hidden_,
+        "resident fused MoE router must be contiguous CPU FP32/BF16");
+    const int64_t experts = router_weight.size(0);
+    TORCH_CHECK(
+        !router_bias.is_cuda() && router_bias.numel() == experts &&
+            !router_mask.is_cuda() &&
+            router_mask.scalar_type() == at::kBool &&
+            router_mask.numel() == experts &&
+            top_k > 0 && top_k <= 16 && top_k <= experts,
+        "resident fused MoE route metadata mismatch");
+    TORCH_CHECK(
+        shared_weights.size() == 3 && shared_scales.size() == 3 &&
+            shared_rows.size() == 3 && shared_cols.size() == 3 &&
+            shared_block == 128,
+        "resident fused MoE requires Gate/Up/Down block-FP8 operands");
+    TORCH_CHECK(
+        shared_rows[0] == intermediate_ &&
+            shared_rows[1] == intermediate_ &&
+            shared_rows[2] == hidden_ &&
+            shared_cols[0] == hidden_ && shared_cols[1] == hidden_ &&
+            shared_cols[2] == intermediate_,
+        "resident fused MoE shared projection shapes mismatch");
+    for (int64_t projection = 0; projection < 3; ++projection) {
+      const auto& weight = shared_weights[projection];
+      const auto& scale = shared_scales[projection];
+      const int64_t rows = shared_rows[projection];
+      const int64_t cols = shared_cols[projection];
+      TORCH_CHECK(
+          !weight.is_cuda() && weight.scalar_type() == at::kByte &&
+              weight.is_contiguous() &&
+              (weight.dim() == 2 || weight.dim() == 5) &&
+              !scale.is_cuda() && scale.scalar_type() == at::kFloat &&
+              scale.dim() == 2 && scale.is_contiguous() &&
+              scale.size(0) == (rows + shared_block - 1) / shared_block &&
+              scale.size(1) == (cols + shared_block - 1) / shared_block,
+          "resident fused MoE shared block-FP8 layout mismatch");
+      if (weight.dim() == 2) {
+        TORCH_CHECK(
+            weight.size(0) == rows && weight.size(1) == cols,
+            "resident fused MoE row-major block-FP8 shape mismatch");
+      } else {
+        TORCH_CHECK(
+            weight.size(0) == (rows + shared_block - 1) / shared_block &&
+                weight.size(1) == 4 &&
+                weight.size(2) ==
+                    (cols + shared_block - 1) / shared_block &&
+                weight.size(3) == 32 && weight.size(4) == shared_block,
+            "resident fused MoE block-major block-FP8 shape mismatch");
+      }
+    }
+    router_weight_ = std::move(router_weight);
+    router_bias_ = router_bias.to(torch::kFloat32).contiguous();
+    router_mask_ = router_mask.to(torch::kBool).contiguous();
+    shared_weights_ = std::move(shared_weights);
+    shared_scales_ = std::move(shared_scales);
+    shared_rows_ = std::move(shared_rows);
+    shared_cols_ = std::move(shared_cols);
+    shared_block_ = shared_block;
+    route_top_k_ = top_k;
+    normalize_route_ = normalize_route;
+    routed_scaling_ = static_cast<float>(routed_scaling);
+    auto float_options = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(torch::kCPU);
+    route_scores_ = torch::empty({experts}, float_options);
+    route_weights_ = torch::empty({top_k}, float_options);
+    shared_activation_ = torch::empty({intermediate_}, float_options);
+    shared_activation_bf16_ = torch::empty(
+        {intermediate_}, float_options.dtype(torch::kBFloat16));
+    input_bf16_ = torch::empty(
+        {hidden_}, float_options.dtype(torch::kBFloat16));
+    selected_.assign(top_k, -1);
+    fused_moe_ready_ = true;
+  }
+
+  torch::Tensor forward_fused_moe(
+      torch::Tensor x_row,
+      double limit,
+      std::string activation,
+      double beta,
+      double linear_beta) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!fused_moe_ready_ || !packed_direct_rows8_enabled() ||
+        !packed_fused_gate_up_enabled() ||
+        !packed_fused_down_reduce_enabled()) {
+      return torch::empty(
+          {0}, torch::TensorOptions().dtype(torch::kFloat32));
+    }
+    auto x = x_row.to(torch::kFloat32).contiguous();
+    TORCH_CHECK(
+        !x.is_cuda() && x.sizes() == torch::IntArrayRef({1, hidden_}),
+        "resident fused MoE requires one CPU input row");
+    TORCH_CHECK(
+        activation == "situ" || activation == "silu" ||
+            activation == "swiglu",
+        "resident fused MoE activation must be situ, silu, or swiglu");
+    const int64_t experts = router_weight_.size(0);
+    for (int64_t expert = 0;
+         expert < static_cast<int64_t>(gate_layouts_.size()); ++expert) {
+      if (gate_layouts_[expert] == 1 || up_layouts_[expert] == 1 ||
+          down_layouts_[expert] == 1) {
+        return torch::empty(
+            {0}, torch::TensorOptions().dtype(torch::kFloat32));
+      }
+    }
+    const bool* maskp = router_mask_.data_ptr<bool>();
+    const float* biasp = router_bias_.data_ptr<float>();
+    float* scorep = route_scores_.data_ptr<float>();
+    float* routep = route_weights_.data_ptr<float>();
+    const float* xp = x.data_ptr<float>();
+    at::BFloat16* xb = input_bf16_.data_ptr<at::BFloat16>();
+    float* sharedp = shared_activation_.data_ptr<float>();
+    at::BFloat16* sharedb =
+        shared_activation_bf16_.data_ptr<at::BFloat16>();
+    float* routed_activation = gate_values_.data_ptr<float>();
+    float* resultp = result_.data_ptr<float>();
+    const float activation_limit = static_cast<float>(limit);
+    const float situ_beta = static_cast<float>(beta);
+    const float situ_linear_beta = static_cast<float>(linear_beta);
+    const double started = wall_seconds();
+    double markers[3] = {0.0, 0.0, 0.0};
+
+#pragma omp parallel
+    {
+#pragma omp for schedule(static)
+      for (int64_t column = 0; column < hidden_; ++column) {
+        xb[column] = at::BFloat16(xp[column]);
+      }
+
+      // Router rows and shared Gate+Up rows are independent.  One dynamic
+      // work range lets both sockets consume them concurrently without a
+      // second thread-pool launch or a model-sized temporary.
+#pragma omp for schedule(dynamic, 4)
+      for (int64_t task = 0; task < experts + intermediate_; ++task) {
+        if (task < experts) {
+          float raw;
+          if (router_weight_.scalar_type() == at::kFloat) {
+            raw = f32_dense_row_dot(
+                xp,
+                router_weight_.data_ptr<float>() + task * hidden_,
+                hidden_);
+          } else {
+            raw = bf16_dense_row_dot(
+                xb,
+                router_weight_.data_ptr<at::BFloat16>() + task * hidden_,
+                hidden_);
+          }
+          const float softplus =
+              raw > 20.0f ? raw : std::log1p(std::exp(raw));
+          scorep[task] = std::sqrt(softplus);
+        } else {
+          const int64_t row = task - experts;
+          const float gate = block_fp8_logical_row_dot_bf16(
+              xb, shared_weights_[0], shared_scales_[0], row,
+              shared_rows_[0], shared_cols_[0], shared_block_);
+          const float up = block_fp8_logical_row_dot_bf16(
+              xb, shared_weights_[1], shared_scales_[1], row,
+              shared_rows_[1], shared_cols_[1], shared_block_);
+          apply_gated_activation(
+              gate, up, activation_limit, activation,
+              situ_beta, situ_linear_beta, sharedp[row]);
+          sharedb[row] = at::BFloat16(sharedp[row]);
+        }
+      }
+
+#pragma omp single
+      {
+        std::fill(selected_.begin(), selected_.end(), int64_t{-1});
+        std::vector<float> choices(
+            route_top_k_, -std::numeric_limits<float>::infinity());
+        for (int64_t expert = 0; expert < experts; ++expert) {
+          if (!maskp[expert]) {
+            continue;
+          }
+          const float choice = scorep[expert] + biasp[expert];
+          for (int64_t rank = 0; rank < route_top_k_; ++rank) {
+            if (choice > choices[rank]) {
+              for (int64_t move = route_top_k_ - 1; move > rank; --move) {
+                choices[move] = choices[move - 1];
+                selected_[move] = selected_[move - 1];
+              }
+              choices[rank] = choice;
+              selected_[rank] = expert;
+              break;
+            }
+          }
+        }
+        float denominator = normalize_route_ ? 1.0e-20f : 1.0f;
+        for (int64_t rank = 0; rank < route_top_k_; ++rank) {
+          TORCH_CHECK(
+              selected_[rank] >= 0,
+              "resident fused MoE has insufficient available experts");
+          routep[rank] = scorep[selected_[rank]];
+          if (normalize_route_) {
+            denominator += routep[rank];
+          }
+        }
+        const float multiplier = routed_scaling_ / denominator;
+        for (int64_t rank = 0; rank < route_top_k_; ++rank) {
+          routep[rank] *= multiplier;
+        }
+        markers[0] = wall_seconds();
+      }
+
+      evaluate_selected_gate_up_activation(
+          xp, selected_,
+          gate_payloads_, gate_codebooks_, gate_blocks_, gate_bits_,
+          gate_layouts_,
+          up_payloads_, up_codebooks_, up_blocks_, up_bits_, up_layouts_,
+          intermediate_, activation_limit, activation,
+          situ_beta, situ_linear_beta, routed_activation);
+#pragma omp single
+      { markers[1] = wall_seconds(); }
+
+      evaluate_selected_down_shared_reduced(
+          routed_activation,
+          intermediate_,
+          selected_,
+          down_payloads_,
+          down_codebooks_,
+          down_blocks_,
+          down_bits_,
+          down_layouts_,
+          hidden_,
+          routep,
+          sharedb,
+          shared_weights_[2],
+          shared_scales_[2],
+          shared_rows_[2],
+          shared_cols_[2],
+          shared_block_,
+          resultp);
+#pragma omp single
+      { markers[2] = wall_seconds(); }
+    }
+    resident_moe_phase_seconds[0] += markers[0] - started;
+    resident_moe_phase_seconds[1] += markers[1] - markers[0];
+    resident_moe_phase_seconds[2] += markers[2] - markers[1];
+    ++resident_moe_phase_calls;
+    return result_;
+  }
+
+  // Configure a generic latent-MoE decode layer.  Four projections consume
+  // the full hidden row (shared Gate, shared Up, routed latent and Router),
+  // packed experts transform the latent row, and two projections return the
+  // shared/routed branches to the full hidden width.  The interface is shape
+  // and storage-format driven; no model name appears in this executor.
+  void configure_latent_moe(
+      std::vector<torch::Tensor> input_weights,
+      std::vector<torch::Tensor> input_scales,
+      std::vector<int64_t> input_rows,
+      std::vector<int64_t> input_kinds,
+      int64_t input_cols,
+      std::vector<torch::Tensor> output_weights,
+      std::vector<torch::Tensor> output_scales,
+      std::vector<int64_t> output_rows,
+      std::vector<int64_t> output_cols,
+      std::vector<int64_t> output_kinds,
+      torch::Tensor route_correction,
+      torch::Tensor route_mask,
+      torch::Tensor routed_norm,
+      int64_t block_size,
+      int64_t top_k,
+      bool normalize_route,
+      double routed_scaling,
+      double rms_eps,
+      double limit,
+      std::string scoring,
+      std::string activation,
+      double beta,
+      double linear_beta) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    TORCH_CHECK(
+        input_weights.size() == 4 && input_scales.size() == 4 &&
+            input_rows.size() == 4 && input_kinds.size() == 4 &&
+            output_weights.size() == 2 && output_scales.size() == 2 &&
+            output_rows.size() == 2 && output_cols.size() == 2 &&
+            output_kinds.size() == 2,
+        "latent resident MoE projection metadata mismatch");
+    const int64_t experts = gate_payloads_.size();
+    TORCH_CHECK(
+        input_cols > 0 && input_rows[0] == input_rows[1] &&
+            input_rows[2] == hidden_ && input_rows[3] == experts &&
+            output_rows[0] == input_cols && output_rows[1] == input_cols &&
+            output_cols[0] == input_rows[0] && output_cols[1] == hidden_ &&
+            routed_norm.numel() == hidden_ && top_k > 0 && top_k <= 16 &&
+            top_k <= experts && route_correction.numel() == experts &&
+            route_mask.numel() == experts && block_size == 128,
+        "latent resident MoE logical shapes mismatch");
+    TORCH_CHECK(
+        scoring == "sigmoid" || scoring == "softplus_sqrt",
+        "latent resident MoE scoring must be sigmoid or softplus_sqrt");
+    TORCH_CHECK(
+        activation == "situ" || activation == "silu" ||
+            activation == "swiglu",
+        "latent resident MoE activation is unsupported");
+
+    const auto validate = [&](
+        const torch::Tensor& weight,
+        const torch::Tensor& scale,
+        int64_t rows,
+        int64_t cols,
+        int64_t kind) {
+      TORCH_CHECK(!weight.is_cuda() && weight.is_contiguous(),
+                  "latent resident projection must be contiguous CPU data");
+      if (kind == 0 || kind == 2) {
+        TORCH_CHECK(
+            weight.dim() == 2 && weight.size(0) == rows &&
+                weight.size(1) == cols &&
+                weight.scalar_type() ==
+                    (kind == 0 ? at::kBFloat16 : at::kFloat),
+            "latent resident dense projection shape/dtype mismatch");
+      } else {
+        TORCH_CHECK(
+            kind == 1 && weight.scalar_type() == at::kByte &&
+                (weight.dim() == 2 || weight.dim() == 5) &&
+                !scale.is_cuda() && scale.scalar_type() == at::kFloat &&
+                scale.is_contiguous() &&
+                scale.size(0) == (rows + block_size - 1) / block_size &&
+                scale.size(1) == (cols + block_size - 1) / block_size,
+            "latent resident block-FP8 projection mismatch");
+      }
+    };
+    for (int64_t index = 0; index < 4; ++index) {
+      validate(
+          input_weights[index], input_scales[index], input_rows[index],
+          input_cols, input_kinds[index]);
+    }
+    for (int64_t index = 0; index < 2; ++index) {
+      validate(
+          output_weights[index], output_scales[index], output_rows[index],
+          output_cols[index], output_kinds[index]);
+    }
+    for (int64_t expert = 0; expert < experts; ++expert) {
+      TORCH_CHECK(
+          gate_layouts_[expert] != 1 && up_layouts_[expert] != 1 &&
+              down_layouts_[expert] != 1,
+          "latent resident MoE requires row or row-tile expert indices");
+    }
+
+    latent_input_weights_ = std::move(input_weights);
+    latent_input_scales_ = std::move(input_scales);
+    latent_input_rows_ = std::move(input_rows);
+    latent_input_kinds_ = std::move(input_kinds);
+    latent_input_cols_ = input_cols;
+    latent_output_weights_ = std::move(output_weights);
+    latent_output_scales_ = std::move(output_scales);
+    latent_output_rows_ = std::move(output_rows);
+    latent_output_cols_ = std::move(output_cols);
+    latent_output_kinds_ = std::move(output_kinds);
+    latent_route_correction_ = route_correction.to(torch::kFloat32).contiguous();
+    latent_route_mask_ = route_mask.to(torch::kBool).contiguous();
+    latent_routed_norm_ = routed_norm.to(torch::kBFloat16).contiguous();
+    latent_block_size_ = block_size;
+    route_top_k_ = top_k;
+    normalize_route_ = normalize_route;
+    routed_scaling_ = static_cast<float>(routed_scaling);
+    latent_rms_eps_ = static_cast<float>(rms_eps);
+    latent_limit_ = static_cast<float>(limit);
+    latent_scoring_ = std::move(scoring);
+    latent_activation_ = std::move(activation);
+    latent_beta_ = static_cast<float>(beta);
+    latent_linear_beta_ = static_cast<float>(linear_beta);
+
+    auto f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+    auto bf16 = f32.dtype(torch::kBFloat16);
+    latent_input_float_ = torch::empty({input_cols}, f32);
+    latent_input_bf16_ = torch::empty({input_cols}, bf16);
+    latent_shared_gate_ = torch::empty({latent_input_rows_[0]}, f32);
+    latent_shared_up_ = torch::empty({latent_input_rows_[1]}, f32);
+    latent_shared_activation_ = torch::empty({latent_input_rows_[0]}, f32);
+    latent_shared_activation_bf16_ = torch::empty({latent_input_rows_[0]}, bf16);
+    latent_projected_ = torch::empty({hidden_}, f32);
+    latent_routed_normalized_ = torch::empty({hidden_}, f32);
+    latent_routed_normalized_bf16_ = torch::empty({hidden_}, bf16);
+    route_scores_ = torch::empty({experts}, f32);
+    route_weights_ = torch::empty({top_k}, f32);
+    latent_full_output_ = torch::empty({1, input_cols}, bf16);
+    selected_.assign(top_k, -1);
+    latent_moe_ready_ = true;
+  }
+
+  torch::Tensor forward_latent_moe(
+      torch::Tensor x_row,
+      torch::Tensor residual) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!latent_moe_ready_ || !packed_direct_rows8_enabled() ||
+        !packed_fused_gate_up_enabled() ||
+        !packed_fused_down_reduce_enabled()) {
+      return torch::empty(
+          {0}, torch::TensorOptions().dtype(torch::kBFloat16));
+    }
+    TORCH_CHECK(
+        !x_row.is_cuda() && x_row.dim() == 2 && x_row.size(0) == 1 &&
+            x_row.size(1) == latent_input_cols_ && x_row.is_contiguous() &&
+            (x_row.scalar_type() == at::kFloat ||
+             x_row.scalar_type() == at::kBFloat16),
+        "latent resident MoE input mismatch");
+    TORCH_CHECK(
+        !residual.is_cuda() && residual.sizes() == x_row.sizes() &&
+            residual.is_contiguous() &&
+            (residual.scalar_type() == at::kFloat ||
+             residual.scalar_type() == at::kBFloat16),
+        "latent resident MoE residual mismatch");
+    const int64_t experts = gate_payloads_.size();
+    const int64_t shared_intermediate = latent_input_rows_[0];
+    const int64_t prelude_rows =
+        shared_intermediate * 2 + hidden_ + experts;
+    const bool* maskp = latent_route_mask_.data_ptr<bool>();
+    const float* correctionp = latent_route_correction_.data_ptr<float>();
+    float* inputp = latent_input_float_.data_ptr<float>();
+    at::BFloat16* inputb = latent_input_bf16_.data_ptr<at::BFloat16>();
+    float* shared_gatep = latent_shared_gate_.data_ptr<float>();
+    float* shared_upp = latent_shared_up_.data_ptr<float>();
+    float* sharedp = latent_shared_activation_.data_ptr<float>();
+    at::BFloat16* sharedb =
+        latent_shared_activation_bf16_.data_ptr<at::BFloat16>();
+    float* projectedp = latent_projected_.data_ptr<float>();
+    float* scorep = route_scores_.data_ptr<float>();
+    float* routep = route_weights_.data_ptr<float>();
+    float* packed_activationp = gate_values_.data_ptr<float>();
+    float* routedp = result_.data_ptr<float>();
+    float* normp = latent_routed_normalized_.data_ptr<float>();
+    at::BFloat16* normb =
+        latent_routed_normalized_bf16_.data_ptr<at::BFloat16>();
+    at::BFloat16* outputp = latent_full_output_.data_ptr<at::BFloat16>();
+    const at::BFloat16* norm_weightp =
+        latent_routed_norm_.data_ptr<at::BFloat16>();
+    float inverse_rms = 1.0f;
+    const double started = wall_seconds();
+    double markers[3] = {started, started, started};
+
+    const auto projection_dot = [&](
+        const torch::Tensor& weight,
+        const torch::Tensor& scale,
+        int64_t rows,
+        int64_t cols,
+        int64_t kind,
+        int64_t row,
+        const float* sourcef,
+        const at::BFloat16* sourceb) -> float {
+      if (kind == 0) {
+        return bf16_dense_row_dot(
+            sourceb,
+            weight.data_ptr<at::BFloat16>() + row * cols,
+            cols);
+      }
+      if (kind == 2) {
+        return f32_dense_row_dot(
+            sourcef, weight.data_ptr<float>() + row * cols, cols);
+      }
+      return block_fp8_logical_row_dot_bf16(
+          sourceb, weight, scale, row, rows, cols, latent_block_size_);
+    };
+
+#pragma omp parallel
+    {
+#pragma omp for schedule(static)
+      for (int64_t column = 0; column < latent_input_cols_; ++column) {
+        const float value = x_row.scalar_type() == at::kFloat
+            ? x_row.data_ptr<float>()[column]
+            : static_cast<float>(x_row.data_ptr<at::BFloat16>()[column]);
+        inputp[column] = value;
+        inputb[column] = at::BFloat16(value);
+      }
+
+#pragma omp for schedule(dynamic, 4)
+      for (int64_t logical = 0; logical < prelude_rows; ++logical) {
+        int64_t projection;
+        int64_t row;
+        if (logical < shared_intermediate) {
+          projection = 0;
+          row = logical;
+        } else if (logical < shared_intermediate * 2) {
+          projection = 1;
+          row = logical - shared_intermediate;
+        } else if (logical < shared_intermediate * 2 + hidden_) {
+          projection = 2;
+          row = logical - shared_intermediate * 2;
+        } else {
+          projection = 3;
+          row = logical - shared_intermediate * 2 - hidden_;
+        }
+        const float value = projection_dot(
+            latent_input_weights_[projection],
+            latent_input_scales_[projection],
+            latent_input_rows_[projection], latent_input_cols_,
+            latent_input_kinds_[projection], row, inputp, inputb);
+        if (projection == 0) {
+          shared_gatep[row] = value;
+        } else if (projection == 1) {
+          shared_upp[row] = value;
+        } else if (projection == 2) {
+          projectedp[row] = value;
+        } else {
+          scorep[row] = latent_scoring_ == "sigmoid"
+              ? 1.0f / (1.0f + std::exp(-value))
+              : std::sqrt(value > 20.0f
+                    ? value : std::log1p(std::exp(value)));
+        }
+      }
+
+#pragma omp for schedule(static)
+      for (int64_t row = 0; row < shared_intermediate; ++row) {
+        apply_gated_activation(
+            shared_gatep[row], shared_upp[row], latent_limit_,
+            latent_activation_, latent_beta_, latent_linear_beta_,
+            sharedp[row]);
+        sharedb[row] = at::BFloat16(sharedp[row]);
+      }
+
+#pragma omp single
+      {
+        std::fill(selected_.begin(), selected_.end(), int64_t{-1});
+        std::vector<float> choices(
+            route_top_k_, -std::numeric_limits<float>::infinity());
+        for (int64_t expert = 0; expert < experts; ++expert) {
+          if (!maskp[expert]) {
+            continue;
+          }
+          const float choice = scorep[expert] + correctionp[expert];
+          for (int64_t rank = 0; rank < route_top_k_; ++rank) {
+            if (choice > choices[rank]) {
+              for (int64_t move = route_top_k_ - 1; move > rank; --move) {
+                choices[move] = choices[move - 1];
+                selected_[move] = selected_[move - 1];
+              }
+              choices[rank] = choice;
+              selected_[rank] = expert;
+              break;
+            }
+          }
+        }
+        float denominator = normalize_route_ ? 1.0e-20f : 1.0f;
+        for (int64_t rank = 0; rank < route_top_k_; ++rank) {
+          TORCH_CHECK(selected_[rank] >= 0,
+                      "latent resident route has too few experts");
+          routep[rank] = scorep[selected_[rank]];
+          if (normalize_route_) {
+            denominator += routep[rank];
+          }
+        }
+        const float multiplier = routed_scaling_ / denominator;
+        for (int64_t rank = 0; rank < route_top_k_; ++rank) {
+          routep[rank] *= multiplier;
+        }
+        markers[0] = wall_seconds();
+      }
+
+      evaluate_selected_gate_up_activation(
+          projectedp, selected_,
+          gate_payloads_, gate_codebooks_, gate_blocks_, gate_bits_,
+          gate_layouts_, up_payloads_, up_codebooks_, up_blocks_, up_bits_,
+          up_layouts_, intermediate_, latent_limit_, latent_activation_,
+          latent_beta_, latent_linear_beta_, packed_activationp);
+      evaluate_selected_direct_rows_reduced(
+          packed_activationp, intermediate_, selected_, down_payloads_,
+          down_codebooks_, down_blocks_, down_bits_, down_layouts_, hidden_,
+          routep, routedp);
+#pragma omp single
+      {
+        float sum = 0.0f;
+        for (int64_t column = 0; column < hidden_; ++column) {
+          sum += routedp[column] * routedp[column];
+        }
+        inverse_rms = 1.0f / std::sqrt(
+            sum / static_cast<float>(hidden_) + latent_rms_eps_);
+        markers[1] = wall_seconds();
+      }
+
+#pragma omp for schedule(static)
+      for (int64_t column = 0; column < hidden_; ++column) {
+        const float value = routedp[column] * inverse_rms *
+            static_cast<float>(norm_weightp[column]);
+        normp[column] = value;
+        normb[column] = at::BFloat16(value);
+      }
+
+#pragma omp for schedule(static)
+      for (int64_t row = 0; row < latent_input_cols_; ++row) {
+        const float shared_value = projection_dot(
+            latent_output_weights_[0], latent_output_scales_[0],
+            latent_output_rows_[0], latent_output_cols_[0],
+            latent_output_kinds_[0], row, sharedp, sharedb);
+        const float routed_value = projection_dot(
+            latent_output_weights_[1], latent_output_scales_[1],
+            latent_output_rows_[1], latent_output_cols_[1],
+            latent_output_kinds_[1], row, normp, normb);
+        const float residual_value = residual.scalar_type() == at::kFloat
+            ? residual.data_ptr<float>()[row]
+            : static_cast<float>(residual.data_ptr<at::BFloat16>()[row]);
+        outputp[row] = at::BFloat16(
+            residual_value + shared_value + routed_value);
+      }
+#pragma omp single
+      { markers[2] = wall_seconds(); }
+    }
+    latent_moe_phase_seconds[0] += markers[0] - started;
+    latent_moe_phase_seconds[1] += markers[1] - markers[0];
+    latent_moe_phase_seconds[2] += markers[2] - markers[1];
+    latent_moe_phase_seconds[3] += markers[2] - started;
+    ++latent_moe_phase_calls;
+    return latent_full_output_;
+  }
+
+  torch::Tensor forward(
+      torch::Tensor x_row,
+      torch::Tensor expert_ids,
+      torch::Tensor route_weights,
+      double limit,
+      std::string activation,
+      double beta,
+      double linear_beta) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto x = x_row.to(torch::kFloat32).contiguous();
+    auto ids = expert_ids.to(torch::kLong).contiguous();
+    auto route = route_weights.to(torch::kFloat32).contiguous();
+    TORCH_CHECK(
+        !x.is_cuda() && x.sizes() == torch::IntArrayRef({1, hidden_}),
+        "mixed resident layer requires one CPU input row");
+    TORCH_CHECK(
+        !ids.is_cuda() && ids.dim() == 1 && ids.numel() > 0 &&
+            ids.numel() <= 16 && route.numel() == ids.numel(),
+        "mixed resident layer route shape mismatch");
+    TORCH_CHECK(
+        activation == "situ" || activation == "silu" ||
+            activation == "swiglu",
+        "mixed resident activation must be situ, silu, or swiglu");
+    const int64_t top_k = ids.numel();
+    const int64_t* idp = ids.data_ptr<int64_t>();
+    std::vector<int64_t> selected(idp, idp + top_k);
+    for (const int64_t expert : selected) {
+      TORCH_CHECK(
+          expert >= 0 && expert < (int64_t)gate_payloads_.size(),
+          "mixed resident layer selected an invalid expert");
+    }
+    const float* xp = x.data_ptr<float>();
+    const float activation_limit = static_cast<float>(limit);
+    const float situ_beta = static_cast<float>(beta);
+    const float situ_linear_beta = static_cast<float>(linear_beta);
+    float* scorep = score_.data_ptr<float>();
+    float* gatep = gate_values_.data_ptr<float>();
+    float* upp = up_values_.data_ptr<float>();
+    float* downp = down_values_.data_ptr<float>();
+    float* resultp = result_.data_ptr<float>();
+    const float* routep = route.data_ptr<float>();
+    at::BFloat16* input_bf16p = has_score_layout_
+        ? input_bf16_.data_ptr<at::BFloat16>() : nullptr;
+    const auto gate_groups = projection_groups(
+        selected, gate_codebooks_, gate_blocks_, gate_bits_, gate_layouts_);
+    const auto up_groups = projection_groups(
+        selected, up_codebooks_, up_blocks_, up_bits_, up_layouts_);
+    const auto gate_score_modes = projection_score_modes(
+        selected, gate_groups.first, gate_codebooks_, gate_rows_,
+        gate_blocks_, gate_layouts_);
+    const auto up_score_modes = projection_score_modes(
+        selected, up_groups.first, up_codebooks_, up_rows_,
+        up_blocks_, up_layouts_);
+    const bool down_direct = selected_direct(
+        selected, down_codebooks_, down_rows_);
+    const bool fused_gate_up =
+        packed_direct_rows8_enabled() && packed_fused_gate_up_enabled() &&
+        std::find(gate_score_modes.begin(), gate_score_modes.end(), uint8_t{1}) ==
+            gate_score_modes.end() &&
+        std::find(up_score_modes.begin(), up_score_modes.end(), uint8_t{1}) ==
+            up_score_modes.end() &&
+        selected_row_major(selected, gate_layouts_) &&
+        selected_row_major(selected, up_layouts_);
+    const bool fused_down_reduce =
+        packed_direct_rows8_enabled() &&
+        packed_fused_down_reduce_enabled() && down_direct &&
+        selected_row_major(selected, down_layouts_);
+    double phase_markers[6] = {wall_seconds(), 0.0, 0.0, 0.0, 0.0, 0.0};
+
+#pragma omp parallel
+    {
+      const auto& gate_payloads = gate_payloads_;
+      const auto& up_payloads = up_payloads_;
+      const auto& down_payloads = down_payloads_;
+      const auto& gate_codebooks = gate_codebooks_;
+      const auto& up_codebooks = up_codebooks_;
+      const auto& down_codebooks = down_codebooks_;
+      if (has_score_layout_) {
+#pragma omp for schedule(static)
+        for (int64_t column = 0; column < hidden_; ++column) {
+          input_bf16p[column] = at::BFloat16(xp[column]);
+        }
+      }
+      if (fused_gate_up) {
+        evaluate_selected_gate_up_activation(
+            xp, selected,
+            gate_payloads, gate_codebooks, gate_blocks_, gate_bits_,
+            gate_layouts_,
+            up_payloads, up_codebooks, up_blocks_, up_bits_, up_layouts_,
+            intermediate_, activation_limit, activation,
+            situ_beta, situ_linear_beta, gatep);
+#pragma omp single
+        {
+          phase_markers[1] = wall_seconds();
+          phase_markers[2] = phase_markers[1];
+          phase_markers[3] = phase_markers[1];
+        }
+      } else {
+        evaluate_selected_projection(
+            xp, selected, gate_payloads, gate_codebooks,
+            gate_transposed_, gate_paired_bf16_, input_bf16p,
+            gate_rows_, gate_blocks_, gate_bits_,
+            gate_layouts_, gate_groups.first, gate_groups.second,
+            gate_score_modes, intermediate_, scorep, gatep);
+#pragma omp single
+        { phase_markers[1] = wall_seconds(); }
+
+        evaluate_selected_projection(
+            xp, selected, up_payloads, up_codebooks,
+            up_transposed_, up_paired_bf16_, input_bf16p,
+            up_rows_, up_blocks_, up_bits_,
+            up_layouts_, up_groups.first, up_groups.second,
+            up_score_modes, intermediate_, scorep, upp);
+#pragma omp single
+        { phase_markers[2] = wall_seconds(); }
+
+#pragma omp for schedule(static)
+        for (int64_t item = 0; item < top_k * intermediate_; ++item) {
+          float gate = gatep[item];
+          float up = upp[item];
+          apply_gated_activation(
+              gate, up, activation_limit, activation,
+              situ_beta, situ_linear_beta, gatep[item]);
+        }
+#pragma omp single
+        { phase_markers[3] = wall_seconds(); }
+      }
+
+      if (fused_down_reduce) {
+        evaluate_selected_direct_rows_reduced(
+            gatep, intermediate_, selected,
+            down_payloads, down_codebooks, down_blocks_, down_bits_,
+            down_layouts_,
+            hidden_, routep, resultp);
+      } else if (down_direct) {
+        evaluate_selected_direct_rows(
+            gatep, intermediate_, selected,
+            down_payloads, down_codebooks, down_rows_,
+            down_blocks_, down_bits_, down_layouts_, hidden_, downp);
+      } else {
+        for (int64_t slot = 0; slot < top_k; ++slot) {
+          const int64_t expert = selected[slot];
+          evaluate_projection(
+              gatep + slot * intermediate_, down_payloads[expert],
+              down_codebooks[expert], down_transposed_[expert],
+              down_rows_[expert], down_blocks_[expert],
+              down_bits_[expert], down_layouts_[expert], scorep,
+              downp + slot * hidden_);
+        }
+      }
+#pragma omp single
+      { phase_markers[4] = wall_seconds(); }
+
+      if (!fused_down_reduce) {
+#pragma omp for schedule(static)
+        for (int64_t row = 0; row < hidden_; ++row) {
+          float value = 0.0f;
+          for (int64_t slot = 0; slot < top_k; ++slot) {
+            value += downp[slot * hidden_ + row] * routep[slot];
+          }
+          resultp[row] = value;
+        }
+      }
+#pragma omp single
+      { phase_markers[5] = wall_seconds(); }
+    }
+    for (int64_t phase = 0; phase < 5; ++phase) {
+      three_projection_phase_seconds[phase] +=
+          phase_markers[phase + 1] - phase_markers[phase];
+    }
+    ++three_projection_phase_calls;
+    return result_;
+  }
+
+ private:
+  static std::vector<torch::Tensor> normalize_codebooks(
+      std::vector<torch::Tensor> codebooks) {
+    for (auto& codebook : codebooks) {
+      codebook = codebook.to(torch::kFloat32).contiguous();
+    }
+    return codebooks;
+  }
+
+  static std::vector<torch::Tensor> transpose_codebooks(
+      const std::vector<torch::Tensor>& codebooks) {
+    std::vector<torch::Tensor> output;
+    output.reserve(codebooks.size());
+    for (const auto& codebook : codebooks) {
+      output.push_back(cached_transposed_codebook(codebook));
+    }
+    return output;
+  }
+
+  static std::vector<torch::Tensor> paired_codebooks(
+      const std::vector<torch::Tensor>& codebooks,
+      const std::vector<int64_t>& layouts) {
+    std::vector<torch::Tensor> output(codebooks.size());
+    for (int64_t expert = 0;
+         expert < static_cast<int64_t>(codebooks.size()); ++expert) {
+      if (layouts[expert] == 1) {
+        output[expert] = cached_paired_bf16_codebook(
+            codebooks[expert]);
+      }
+    }
+    return output;
+  }
+
+  static void validate_projection(
+      const char* name,
+      int64_t experts,
+      const std::vector<torch::Tensor>& payloads,
+      const std::vector<torch::Tensor>& codebooks,
+      const std::vector<int64_t>& rows,
+      const std::vector<int64_t>& blocks,
+      const std::vector<int64_t>& bits,
+      const std::vector<int64_t>& layouts) {
+    TORCH_CHECK(
+        (int64_t)payloads.size() == experts &&
+            (int64_t)codebooks.size() == experts &&
+            (int64_t)rows.size() == experts &&
+            (int64_t)blocks.size() == experts &&
+            (int64_t)bits.size() == experts &&
+            (int64_t)layouts.size() == experts,
+        name, " mixed projection metadata counts must match");
+    for (int64_t expert = 0; expert < experts; ++expert) {
+      TORCH_CHECK(
+          !payloads[expert].is_cuda() &&
+              payloads[expert].scalar_type() == at::kByte &&
+              payloads[expert].is_contiguous(),
+          name, " payload must be contiguous CPU uint8");
+      TORCH_CHECK(
+          codebooks[expert].dim() == 2 &&
+              codebooks[expert].size(0) <= (int64_t{1} << bits[expert]) &&
+              bits[expert] >= 8 && bits[expert] <= 16 &&
+              (layouts[expert] >= 0 && layouts[expert] <= 2),
+          name, " codebook/packed width mismatch");
+      const int64_t expected_bits =
+          rows[expert] * blocks[expert] * bits[expert];
+      TORCH_CHECK(
+          expected_bits % 8 == 0 &&
+              payloads[expert].numel() == expected_bits / 8,
+          name, " packed payload length mismatch");
+    }
+  }
+
+  static void evaluate_projection(
+      const float* input,
+      const torch::Tensor& payload,
+      const torch::Tensor& codebook,
+      const torch::Tensor& transposed,
+      int64_t rows,
+      int64_t blocks,
+      int64_t bits,
+      int64_t layout,
+      float* scores,
+      float* output) {
+    const int64_t codes = codebook.size(0);
+    const int64_t dim = codebook.size(1);
+    const bool use_direct =
+        layout == 2 || rows * dim < codes * dim + rows;
+    const uint8_t* packed = payload.data_ptr<uint8_t>();
+    if (use_direct) {
+      const float* cb = codebook.data_ptr<float>();
+#pragma omp for schedule(static)
+      for (int64_t row = 0; row < rows; ++row) {
+        output[row] = layout == 0
+            ? direct_dot_packed(
+                  input, cb, packed, row * blocks, blocks, bits, dim)
+            : layout == 1
+            ? direct_dot_packed_block_major(
+                  input, cb, packed, row, rows, blocks, bits, dim)
+            : direct_dot_packed_row_tile8(
+                  input, cb, packed, row, rows, blocks, bits, dim);
+      }
+      return;
+    }
+    TORCH_INTERNAL_ASSERT(layout == 0);
+    const float* cb = transposed.data_ptr<float>();
+#pragma omp for schedule(static)
+    for (int64_t block = 0; block < blocks; ++block) {
+      codebook_scores(
+          input + block * dim,
+          cb,
+          scores + block * codes,
+          codes,
+          dim);
+    }
+#pragma omp for schedule(static)
+    for (int64_t row = 0; row < rows; ++row) {
+      output[row] = lookup_sum_packed(
+          scores, packed, row * blocks, blocks, codes, bits);
+    }
+  }
+
+  static bool selected_direct(
+      const std::vector<int64_t>& selected,
+      const std::vector<torch::Tensor>& codebooks,
+      const std::vector<int64_t>& rows) {
+    for (const int64_t expert : selected) {
+      const int64_t codes = codebooks[expert].size(0);
+      const int64_t dim = codebooks[expert].size(1);
+      if (rows[expert] * dim >= codes * dim + rows[expert]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static bool selected_row_major(
+      const std::vector<int64_t>& selected,
+      const std::vector<int64_t>& layouts) {
+    for (const int64_t expert : selected) {
+      if (layouts[expert] == 1) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  using SlotGroups = std::vector<std::vector<int64_t>>;
+
+  static std::pair<SlotGroups, std::vector<int64_t>> projection_groups(
+      const std::vector<int64_t>& selected,
+      const std::vector<torch::Tensor>& codebooks,
+      const std::vector<int64_t>& blocks,
+      const std::vector<int64_t>& bits,
+      const std::vector<int64_t>& layouts) {
+    SlotGroups groups;
+    std::vector<int64_t> group_for_slot(selected.size(), -1);
+    for (int64_t slot = 0;
+         slot < static_cast<int64_t>(selected.size()); ++slot) {
+      const int64_t expert = selected[slot];
+      int64_t match = -1;
+      for (int64_t group = 0;
+           group < static_cast<int64_t>(groups.size()); ++group) {
+        const int64_t other = selected[groups[group][0]];
+        if (codebooks[expert].data_ptr() == codebooks[other].data_ptr() &&
+            blocks[expert] == blocks[other] && bits[expert] == bits[other] &&
+            layouts[expert] == layouts[other]) {
+          match = group;
+          break;
+        }
+      }
+      if (match < 0) {
+        match = groups.size();
+        groups.push_back({});
+      }
+      groups[match].push_back(slot);
+      group_for_slot[slot] = match;
+    }
+    return {std::move(groups), std::move(group_for_slot)};
+  }
+
+  static std::vector<uint8_t> projection_score_modes(
+      const std::vector<int64_t>& selected,
+      const SlotGroups& groups,
+      const std::vector<torch::Tensor>& codebooks,
+      const std::vector<int64_t>& rows,
+      const std::vector<int64_t>& blocks,
+      const std::vector<int64_t>& layouts) {
+    std::vector<uint8_t> modes(groups.size(), 0);
+    for (int64_t group = 0;
+         group < static_cast<int64_t>(groups.size()); ++group) {
+      const int64_t expert = selected[groups[group][0]];
+      if (layouts[expert] != 1) {
+        continue;
+      }
+      const int64_t members = groups[group].size();
+      const int64_t codes = codebooks[expert].size(0);
+      const int64_t dim = codebooks[expert].size(1);
+      const int64_t direct_work =
+          members * rows[expert] * blocks[expert] * dim;
+      const int64_t score_work =
+          blocks[expert] * codes * dim +
+          members * rows[expert] * blocks[expert];
+      modes[group] = score_work < direct_work ? 1 : 0;
+    }
+    return modes;
+  }
+
+  static inline void apply_gated_activation(
+      float gate,
+      float up,
+      float activation_limit,
+      const std::string& activation,
+      float situ_beta,
+      float situ_linear_beta,
+      float& output) {
+    if (activation_limit != 0.0f) {
+      gate = std::min(gate, activation_limit);
+      up = std::max(-activation_limit, std::min(up, activation_limit));
+    }
+    if (activation == "situ") {
+      float linear = up;
+      if (situ_linear_beta > 0.0f) {
+        linear = situ_linear_beta * std::tanh(up / situ_linear_beta);
+      }
+      output = situ_beta * std::tanh(gate / situ_beta) *
+          (1.0f / (1.0f + std::exp(-gate))) * linear;
+    } else {
+      output = gate * (1.0f / (1.0f + std::exp(-gate))) * up;
+    }
+  }
+
+  // Gate and Up share the input and output row partition.  Decode both
+  // compact projections and apply the gated activation while the eight rows
+  // are still hot, eliminating two full intermediate sweeps and two team
+  // barriers without materializing either expert matrix.
+  static void evaluate_selected_gate_up_activation(
+      const float* input,
+      const std::vector<int64_t>& selected,
+      const std::vector<torch::Tensor>& gate_payloads,
+      const std::vector<torch::Tensor>& gate_codebooks,
+      const std::vector<int64_t>& gate_blocks,
+      const std::vector<int64_t>& gate_bits,
+      const std::vector<int64_t>& gate_layouts,
+      const std::vector<torch::Tensor>& up_payloads,
+      const std::vector<torch::Tensor>& up_codebooks,
+      const std::vector<int64_t>& up_blocks,
+      const std::vector<int64_t>& up_bits,
+      const std::vector<int64_t>& up_layouts,
+      int64_t common_rows,
+      float activation_limit,
+      const std::string& activation,
+      float situ_beta,
+      float situ_linear_beta,
+      float* output) {
+    const int64_t top_k = selected.size();
+    const int64_t row_groups = (common_rows + 7) / 8;
+#pragma omp for schedule(static)
+    for (int64_t task = 0; task < top_k * row_groups; ++task) {
+      const int64_t slot = task / row_groups;
+      const int64_t first_row = (task - slot * row_groups) * 8;
+      const int64_t valid_rows = std::min<int64_t>(
+          8, common_rows - first_row);
+      const int64_t expert = selected[slot];
+      alignas(64) float gate_values[8];
+      alignas(64) float up_values[8];
+      direct_dot_packed_rows8(
+          input,
+          gate_codebooks[expert].data_ptr<float>(),
+          gate_payloads[expert].data_ptr<uint8_t>(),
+          first_row,
+          valid_rows,
+          gate_blocks[expert],
+          gate_bits[expert],
+          gate_codebooks[expert].size(1),
+          gate_layouts[expert],
+          gate_values);
+      direct_dot_packed_rows8(
+          input,
+          up_codebooks[expert].data_ptr<float>(),
+          up_payloads[expert].data_ptr<uint8_t>(),
+          first_row,
+          valid_rows,
+          up_blocks[expert],
+          up_bits[expert],
+          up_codebooks[expert].size(1),
+          up_layouts[expert],
+          up_values);
+      float* destination = output + slot * common_rows + first_row;
+      for (int64_t row = 0; row < valid_rows; ++row) {
+        apply_gated_activation(
+            gate_values[row], up_values[row], activation_limit,
+            activation, situ_beta, situ_linear_beta, destination[row]);
+      }
+    }
+  }
+
+  static void evaluate_selected_projection(
+      const float* input,
+      const std::vector<int64_t>& selected,
+      const std::vector<torch::Tensor>& payloads,
+      const std::vector<torch::Tensor>& codebooks,
+      const std::vector<torch::Tensor>& transposed,
+      const std::vector<torch::Tensor>& paired_bf16,
+      const at::BFloat16* input_bf16,
+      const std::vector<int64_t>& rows,
+      const std::vector<int64_t>& blocks,
+      const std::vector<int64_t>& bits,
+      const std::vector<int64_t>& layouts,
+      const SlotGroups& groups,
+      const std::vector<int64_t>& group_for_slot,
+      const std::vector<uint8_t>& score_modes,
+      int64_t common_rows,
+      float* scores,
+      float* output) {
+    const int64_t top_k = selected.size();
+    const bool any_score = std::find(
+        score_modes.begin(), score_modes.end(), uint8_t{1}) !=
+        score_modes.end();
+    bool all_direct_layout = true;
+    for (const int64_t expert : selected) {
+      all_direct_layout = all_direct_layout && layouts[expert] != 1;
+    }
+    if (packed_direct_rows8_enabled() && !any_score && all_direct_layout) {
+      const int64_t row_groups = (common_rows + 7) / 8;
+#pragma omp for schedule(static)
+      for (int64_t task = 0; task < top_k * row_groups; ++task) {
+        const int64_t slot = task / row_groups;
+        const int64_t first_row = (task - slot * row_groups) * 8;
+        const int64_t valid_rows = std::min<int64_t>(
+            8, common_rows - first_row);
+        const int64_t expert = selected[slot];
+        direct_dot_packed_rows8(
+            input,
+            codebooks[expert].data_ptr<float>(),
+            payloads[expert].data_ptr<uint8_t>(),
+            first_row,
+            valid_rows,
+            blocks[expert],
+            bits[expert],
+            codebooks[expert].size(1),
+            layouts[expert],
+            output + slot * common_rows + first_row);
+      }
+      return;
+    }
+#pragma omp for schedule(static)
+    for (int64_t item = 0; item < top_k * common_rows; ++item) {
+      const int64_t slot = item / common_rows;
+      const int64_t row = item - slot * common_rows;
+      const int64_t expert = selected[slot];
+      TORCH_INTERNAL_ASSERT(rows[expert] == common_rows);
+      if (score_modes[group_for_slot[slot]]) {
+        output[item] = 0.0f;
+        continue;
+      }
+      const float* codebook = codebooks[expert].data_ptr<float>();
+      const uint8_t* payload = payloads[expert].data_ptr<uint8_t>();
+      const int64_t dim = codebooks[expert].size(1);
+      output[item] = layouts[expert] == 0
+          ? direct_dot_packed(
+                input, codebook, payload, row * blocks[expert],
+                blocks[expert], bits[expert], dim)
+          : layouts[expert] == 1
+          ? direct_dot_packed_block_major(
+                input, codebook, payload, row, rows[expert],
+                blocks[expert], bits[expert], dim)
+          : direct_dot_packed_row_tile8(
+                input, codebook, payload, row, rows[expert],
+                blocks[expert], bits[expert], dim);
+    }
+
+    constexpr int64_t block_chunk = 32;
+    constexpr int64_t code_chunk = 256;
+    for (int64_t group = 0;
+         group < static_cast<int64_t>(groups.size()); ++group) {
+      if (!score_modes[group]) {
+        continue;
+      }
+      const int64_t representative = selected[groups[group][0]];
+      const int64_t group_blocks = blocks[representative];
+      const int64_t codes = codebooks[representative].size(0);
+      const int64_t dim = codebooks[representative].size(1);
+      const int64_t code_chunks = (codes + code_chunk - 1) / code_chunk;
+      const float* codebook = transposed[representative].data_ptr<float>();
+      const at::BFloat16* bf16_codebook =
+          paired_bf16[representative].data_ptr<at::BFloat16>();
+      for (int64_t first_block = 0;
+           first_block < group_blocks;
+           first_block += block_chunk) {
+        const int64_t chunk_blocks = std::min(
+            block_chunk, group_blocks - first_block);
+#pragma omp for schedule(static)
+        for (int64_t task = 0;
+             task < chunk_blocks * code_chunks; ++task) {
+          const int64_t local_block = task / code_chunks;
+          const int64_t code_part = task - local_block * code_chunks;
+          const int64_t code_begin = code_part * code_chunk;
+          const int64_t code_end = std::min(code_begin + code_chunk, codes);
+          const int64_t block = first_block + local_block;
+          if (input_bf16 != nullptr) {
+            codebook_scores_bf16_range(
+                input_bf16 + block * dim,
+                bf16_codebook,
+                scores + local_block * codes,
+                codes,
+                dim,
+                code_begin,
+                code_end);
+          } else {
+            codebook_scores_range(
+                input + block * dim,
+                codebook,
+                scores + local_block * codes,
+                codes,
+                dim,
+                code_begin,
+                code_end);
+          }
+        }
+        const int64_t group_items =
+            static_cast<int64_t>(groups[group].size()) * common_rows;
+#pragma omp for schedule(static)
+        for (int64_t item = 0; item < group_items; ++item) {
+          const int64_t member = item / common_rows;
+          const int64_t row = item - member * common_rows;
+          const int64_t slot = groups[group][member];
+          const int64_t expert = selected[slot];
+          const uint8_t* payload = payloads[expert].data_ptr<uint8_t>();
+          float value = output[slot * common_rows + row];
+          for (int64_t local_block = 0;
+               local_block < chunk_blocks; ++local_block) {
+            const int64_t block = first_block + local_block;
+            const uint16_t index = read_packed_index(
+                payload, block * common_rows + row, bits[expert]);
+            value += scores[local_block * codes + index];
+          }
+          output[slot * common_rows + row] = value;
+        }
+      }
+    }
+  }
+
+  // Decode all routed experts in one work-sharing loop.  The old mixed path
+  // entered one omp-for per expert (16 barriers per projection); Top-K is a
+  // scheduling dimension too, so one [top_k, rows] range keeps all cores busy
+  // and preserves each output row's exact accumulation order.
+  static void evaluate_selected_direct(
+      const float* input,
+      const std::vector<int64_t>& selected,
+      const std::vector<torch::Tensor>& payloads,
+      const std::vector<torch::Tensor>& codebooks,
+      const std::vector<int64_t>& rows,
+      const std::vector<int64_t>& blocks,
+      const std::vector<int64_t>& bits,
+      const std::vector<int64_t>& layouts,
+      int64_t common_rows,
+      float* output) {
+    const int64_t top_k = selected.size();
+    bool all_direct_layout = true;
+    for (const int64_t expert : selected) {
+      all_direct_layout = all_direct_layout && layouts[expert] != 1;
+    }
+    if (packed_direct_rows8_enabled() && all_direct_layout) {
+      const int64_t row_groups = (common_rows + 7) / 8;
+#pragma omp for schedule(static)
+      for (int64_t task = 0; task < top_k * row_groups; ++task) {
+        const int64_t slot = task / row_groups;
+        const int64_t first_row = (task - slot * row_groups) * 8;
+        const int64_t valid_rows = std::min<int64_t>(
+            8, common_rows - first_row);
+        const int64_t expert = selected[slot];
+        direct_dot_packed_rows8(
+            input,
+            codebooks[expert].data_ptr<float>(),
+            payloads[expert].data_ptr<uint8_t>(),
+            first_row,
+            valid_rows,
+            blocks[expert],
+            bits[expert],
+            codebooks[expert].size(1),
+            layouts[expert],
+            output + slot * common_rows + first_row);
+      }
+      return;
+    }
+#pragma omp for schedule(static)
+    for (int64_t item = 0; item < top_k * common_rows; ++item) {
+      const int64_t slot = item / common_rows;
+      const int64_t row = item - slot * common_rows;
+      const int64_t expert = selected[slot];
+      TORCH_INTERNAL_ASSERT(rows[expert] == common_rows);
+      output[item] = direct_dot_packed(
+          input,
+          codebooks[expert].data_ptr<float>(),
+          payloads[expert].data_ptr<uint8_t>(),
+          row * blocks[expert],
+          blocks[expert],
+          bits[expert],
+          codebooks[expert].size(1));
+    }
+  }
+
+  static void evaluate_selected_direct_rows(
+      const float* inputs,
+      int64_t input_stride,
+      const std::vector<int64_t>& selected,
+      const std::vector<torch::Tensor>& payloads,
+      const std::vector<torch::Tensor>& codebooks,
+      const std::vector<int64_t>& rows,
+      const std::vector<int64_t>& blocks,
+      const std::vector<int64_t>& bits,
+      const std::vector<int64_t>& layouts,
+      int64_t common_rows,
+      float* output) {
+    const int64_t top_k = selected.size();
+    bool all_direct_layout = true;
+    for (const int64_t expert : selected) {
+      all_direct_layout = all_direct_layout && layouts[expert] != 1;
+    }
+    if (packed_direct_rows8_enabled() && all_direct_layout) {
+      const int64_t row_groups = (common_rows + 7) / 8;
+#pragma omp for schedule(static)
+      for (int64_t task = 0; task < top_k * row_groups; ++task) {
+        const int64_t slot = task / row_groups;
+        const int64_t first_row = (task - slot * row_groups) * 8;
+        const int64_t valid_rows = std::min<int64_t>(
+            8, common_rows - first_row);
+        const int64_t expert = selected[slot];
+        direct_dot_packed_rows8(
+            inputs + slot * input_stride,
+            codebooks[expert].data_ptr<float>(),
+            payloads[expert].data_ptr<uint8_t>(),
+            first_row,
+            valid_rows,
+            blocks[expert],
+            bits[expert],
+            codebooks[expert].size(1),
+            layouts[expert],
+            output + slot * common_rows + first_row);
+      }
+      return;
+    }
+#pragma omp for schedule(static)
+    for (int64_t item = 0; item < top_k * common_rows; ++item) {
+      const int64_t slot = item / common_rows;
+      const int64_t row = item - slot * common_rows;
+      const int64_t expert = selected[slot];
+      TORCH_INTERNAL_ASSERT(rows[expert] == common_rows);
+      const float* input = inputs + slot * input_stride;
+      const float* codebook = codebooks[expert].data_ptr<float>();
+      const uint8_t* payload = payloads[expert].data_ptr<uint8_t>();
+      output[item] = layouts[expert] == 0
+          ? direct_dot_packed(
+                input, codebook, payload, row * blocks[expert],
+                blocks[expert], bits[expert], codebooks[expert].size(1))
+          : layouts[expert] == 1
+          ? direct_dot_packed_block_major(
+                input, codebook, payload, row, rows[expert],
+                blocks[expert], bits[expert], codebooks[expert].size(1))
+          : direct_dot_packed_row_tile8(
+                input, codebook, payload, row, rows[expert],
+                blocks[expert], bits[expert], codebooks[expert].size(1));
+    }
+  }
+
+  // Compute every selected Down projection for one output tile and fold the
+  // route weights immediately.  Result ownership is by output row, so no
+  // atomics, per-expert Down tensor or second reduction pass is required.
+  static void evaluate_selected_direct_rows_reduced(
+      const float* inputs,
+      int64_t input_stride,
+      const std::vector<int64_t>& selected,
+      const std::vector<torch::Tensor>& payloads,
+      const std::vector<torch::Tensor>& codebooks,
+      const std::vector<int64_t>& blocks,
+      const std::vector<int64_t>& bits,
+      const std::vector<int64_t>& layouts,
+      int64_t common_rows,
+      const float* route,
+      float* output) {
+    const int64_t top_k = selected.size();
+    const int64_t row_groups = (common_rows + 7) / 8;
+#pragma omp for schedule(static)
+    for (int64_t group = 0; group < row_groups; ++group) {
+      const int64_t first_row = group * 8;
+      const int64_t valid_rows = std::min<int64_t>(
+          8, common_rows - first_row);
+      alignas(64) float reduced[8] = {};
+      alignas(64) float projected[8];
+      for (int64_t slot = 0; slot < top_k; ++slot) {
+        const int64_t expert = selected[slot];
+        direct_dot_packed_rows8(
+            inputs + slot * input_stride,
+            codebooks[expert].data_ptr<float>(),
+            payloads[expert].data_ptr<uint8_t>(),
+            first_row,
+            valid_rows,
+            blocks[expert],
+            bits[expert],
+            codebooks[expert].size(1),
+            layouts[expert],
+            projected);
+        for (int64_t row = 0; row < valid_rows; ++row) {
+          reduced[row] += projected[row] * route[slot];
+        }
+      }
+      for (int64_t row = 0; row < valid_rows; ++row) {
+        output[first_row + row] = reduced[row];
+      }
+    }
+  }
+
+  // The shared expert is block-FP8 while routed experts retain their native
+  // p8--p16 VQ payloads.  Output-row ownership lets one loop calculate both
+  // formats and perform the final route/shared merge without materializing a
+  // shared output tensor or launching another reduction operator.
+  static void evaluate_selected_down_shared_reduced(
+      const float* inputs,
+      int64_t input_stride,
+      const std::vector<int64_t>& selected,
+      const std::vector<torch::Tensor>& payloads,
+      const std::vector<torch::Tensor>& codebooks,
+      const std::vector<int64_t>& blocks,
+      const std::vector<int64_t>& bits,
+      const std::vector<int64_t>& layouts,
+      int64_t common_rows,
+      const float* route,
+      const at::BFloat16* shared_input,
+      const torch::Tensor& shared_weight,
+      const torch::Tensor& shared_scales,
+      int64_t shared_rows,
+      int64_t shared_cols,
+      int64_t shared_block,
+      float* output) {
+    const int64_t top_k = selected.size();
+    const int64_t row_groups = (common_rows + 7) / 8;
+#pragma omp for schedule(static)
+    for (int64_t group = 0; group < row_groups; ++group) {
+      const int64_t first_row = group * 8;
+      const int64_t valid_rows = std::min<int64_t>(
+          8, common_rows - first_row);
+      alignas(64) float reduced[8];
+      alignas(64) float projected[8];
+      for (int64_t row = 0; row < valid_rows; ++row) {
+        reduced[row] = block_fp8_logical_row_dot_bf16(
+            shared_input,
+            shared_weight,
+            shared_scales,
+            first_row + row,
+            shared_rows,
+            shared_cols,
+            shared_block);
+      }
+      for (int64_t slot = 0; slot < top_k; ++slot) {
+        const int64_t expert = selected[slot];
+        direct_dot_packed_rows8(
+            inputs + slot * input_stride,
+            codebooks[expert].data_ptr<float>(),
+            payloads[expert].data_ptr<uint8_t>(),
+            first_row,
+            valid_rows,
+            blocks[expert],
+            bits[expert],
+            codebooks[expert].size(1),
+            layouts[expert],
+            projected);
+        for (int64_t row = 0; row < valid_rows; ++row) {
+          reduced[row] += projected[row] * route[slot];
+        }
+      }
+      for (int64_t row = 0; row < valid_rows; ++row) {
+        output[first_row + row] = reduced[row];
+      }
+    }
+  }
+
+  std::vector<torch::Tensor> gate_payloads_;
+  std::vector<torch::Tensor> gate_codebooks_;
+  std::vector<torch::Tensor> gate_transposed_;
+  std::vector<torch::Tensor> gate_paired_bf16_;
+  std::vector<int64_t> gate_rows_, gate_blocks_, gate_bits_, gate_layouts_;
+  std::vector<torch::Tensor> up_payloads_;
+  std::vector<torch::Tensor> up_codebooks_;
+  std::vector<torch::Tensor> up_transposed_;
+  std::vector<torch::Tensor> up_paired_bf16_;
+  std::vector<int64_t> up_rows_, up_blocks_, up_bits_, up_layouts_;
+  std::vector<torch::Tensor> down_payloads_;
+  std::vector<torch::Tensor> down_codebooks_;
+  std::vector<torch::Tensor> down_transposed_;
+  std::vector<int64_t> down_rows_, down_blocks_, down_bits_, down_layouts_;
+  torch::Tensor router_weight_, router_bias_, router_mask_;
+  std::vector<torch::Tensor> shared_weights_, shared_scales_;
+  std::vector<int64_t> shared_rows_, shared_cols_;
+  torch::Tensor route_scores_, route_weights_;
+  torch::Tensor shared_activation_, shared_activation_bf16_;
+  std::vector<int64_t> selected_;
+  int64_t shared_block_ = 128;
+  int64_t route_top_k_ = 0;
+  bool normalize_route_ = true;
+  float routed_scaling_ = 1.0f;
+  bool fused_moe_ready_ = false;
+  std::vector<torch::Tensor> latent_input_weights_, latent_input_scales_;
+  std::vector<int64_t> latent_input_rows_, latent_input_kinds_;
+  std::vector<torch::Tensor> latent_output_weights_, latent_output_scales_;
+  std::vector<int64_t> latent_output_rows_, latent_output_cols_;
+  std::vector<int64_t> latent_output_kinds_;
+  torch::Tensor latent_route_correction_, latent_route_mask_;
+  torch::Tensor latent_routed_norm_;
+  torch::Tensor latent_input_float_, latent_input_bf16_;
+  torch::Tensor latent_shared_gate_, latent_shared_up_;
+  torch::Tensor latent_shared_activation_, latent_shared_activation_bf16_;
+  torch::Tensor latent_projected_, latent_routed_normalized_;
+  torch::Tensor latent_routed_normalized_bf16_, latent_full_output_;
+  int64_t latent_input_cols_ = 0;
+  int64_t latent_block_size_ = 128;
+  float latent_rms_eps_ = 1.0e-6f;
+  float latent_limit_ = 0.0f;
+  float latent_beta_ = 1.0f;
+  float latent_linear_beta_ = -1.0f;
+  std::string latent_scoring_ = "sigmoid";
+  std::string latent_activation_ = "situ";
+  bool latent_moe_ready_ = false;
+  int64_t hidden_ = 0;
+  int64_t intermediate_ = 0;
+  bool has_score_layout_ = false;
+  torch::Tensor score_, gate_values_, up_values_, down_values_, result_;
+  torch::Tensor input_bf16_;
+  std::mutex mutex_;
+};
 
 void reset_three_projection_phase_profile_cpu() {
   std::fill(
@@ -1981,6 +6059,134 @@ std::vector<double> three_projection_phase_profile_cpu() {
       three_projection_phase_seconds[3],
       three_projection_phase_seconds[4],
   };
+}
+
+void reset_resident_moe_phase_profile_cpu() {
+  std::fill(
+      std::begin(resident_moe_phase_seconds),
+      std::end(resident_moe_phase_seconds),
+      0.0);
+  resident_moe_phase_calls = 0;
+}
+
+void reset_latent_moe_phase_profile_cpu() {
+  std::fill(
+      std::begin(latent_moe_phase_seconds),
+      std::end(latent_moe_phase_seconds),
+      0.0);
+  latent_moe_phase_calls = 0;
+}
+
+void reset_resident_projection_profile_cpu() {
+  resident_projection_seconds = 0.0;
+  resident_projection_calls = 0;
+}
+
+std::vector<double> resident_projection_profile_cpu() {
+  return {
+      static_cast<double>(resident_projection_calls),
+      resident_projection_seconds,
+  };
+}
+
+std::vector<double> resident_moe_phase_profile_cpu() {
+  return {
+      static_cast<double>(resident_moe_phase_calls),
+      resident_moe_phase_seconds[0],
+      resident_moe_phase_seconds[1],
+      resident_moe_phase_seconds[2],
+  };
+}
+
+std::vector<double> latent_moe_phase_profile_cpu() {
+  return {
+      static_cast<double>(latent_moe_phase_calls),
+      latent_moe_phase_seconds[0],
+      latent_moe_phase_seconds[1],
+      latent_moe_phase_seconds[2],
+      latent_moe_phase_seconds[3],
+  };
+}
+
+std::vector<torch::Tensor> route_topk_sigmoid_cpu(
+    torch::Tensor logits,
+    torch::Tensor bias,
+    torch::Tensor mask,
+    int64_t top_k,
+    bool normalize,
+    double scaling) {
+  TORCH_CHECK(
+      !logits.is_cuda() && logits.dim() == 2,
+      "CPU sigmoid Top-K requires [batch, experts] logits");
+  TORCH_CHECK(
+      !bias.is_cuda() && bias.numel() == logits.size(1),
+      "CPU sigmoid Top-K bias width mismatch");
+  TORCH_CHECK(
+      !mask.is_cuda() && mask.scalar_type() == at::kBool &&
+          mask.numel() == logits.size(1),
+      "CPU sigmoid Top-K mask width mismatch");
+  TORCH_CHECK(
+      top_k > 0 && top_k <= logits.size(1),
+      "CPU sigmoid Top-K count is invalid");
+  auto logits_f = logits.to(torch::kFloat32).contiguous();
+  auto bias_f = bias.to(torch::kFloat32).contiguous();
+  auto mask_c = mask.contiguous();
+  auto weights = torch::empty(
+      {logits.size(0), top_k},
+      torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+  auto indices = torch::empty(
+      {logits.size(0), top_k},
+      torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU));
+  const float* logitp = logits_f.data_ptr<float>();
+  const float* biasp = bias_f.data_ptr<float>();
+  const bool* maskp = mask_c.data_ptr<bool>();
+  float* weightp = weights.data_ptr<float>();
+  int64_t* indexp = indices.data_ptr<int64_t>();
+  const int64_t experts = logits.size(1);
+  struct Candidate {
+    float choice;
+    float score;
+    int64_t index;
+  };
+  at::parallel_for(0, logits.size(0), 1, [&](int64_t begin, int64_t end) {
+    std::vector<Candidate> candidates(experts);
+    for (int64_t batch = begin; batch < end; ++batch) {
+      for (int64_t expert = 0; expert < experts; ++expert) {
+        const float value = logitp[batch * experts + expert];
+        const float score = 1.0f / (1.0f + std::exp(-value));
+        candidates[expert] = Candidate{
+            maskp[expert]
+                ? score + biasp[expert]
+                : -std::numeric_limits<float>::infinity(),
+            score,
+            expert};
+      }
+      std::partial_sort(
+          candidates.begin(),
+          candidates.begin() + top_k,
+          candidates.end(),
+          [](const Candidate& left, const Candidate& right) {
+            return left.choice > right.choice ||
+                (left.choice == right.choice && left.index < right.index);
+          });
+      float denominator = 0.0f;
+      if (normalize && top_k > 1) {
+        for (int64_t rank = 0; rank < top_k; ++rank) {
+          denominator += candidates[rank].score;
+        }
+        denominator += 1.0e-20f;
+      } else {
+        denominator = 1.0f;
+      }
+      for (int64_t rank = 0; rank < top_k; ++rank) {
+        weightp[batch * top_k + rank] =
+            candidates[rank].score / denominator *
+            static_cast<float>(scaling);
+        indexp[batch * top_k + rank] = candidates[rank].index;
+      }
+    }
+  });
+  return {weights, indices};
 }
 
 torch::Tensor moe_packed_topk_cpu(
@@ -2435,7 +6641,10 @@ torch::Tensor kda_recurrent_cpu(
     torch::Tensor state,
     torch::Tensor workspace,
     torch::Tensor output,
-    double lower_bound) {
+    double lower_bound,
+    torch::Tensor output_gate,
+    torch::Tensor norm_weight,
+    double norm_eps) {
   TORCH_CHECK(
       !query.is_cuda() && query.dim() == 2 &&
           query.is_contiguous() && key.sizes() == query.sizes() &&
@@ -2474,6 +6683,18 @@ torch::Tensor kda_recurrent_cpu(
   TORCH_CHECK(
       output.sizes() == value.sizes() && output.is_contiguous(),
       "CPU KDA output shape mismatch");
+  const bool fuse_output_norm = output_gate.numel() != 0;
+  if (fuse_output_norm) {
+    TORCH_CHECK(
+        !output_gate.is_cuda() && output_gate.sizes() == value.sizes() &&
+            output_gate.scalar_type() == value.scalar_type() &&
+            output_gate.is_contiguous() && !norm_weight.is_cuda() &&
+            norm_weight.numel() == value.size(1) &&
+            norm_weight.is_contiguous() &&
+            (norm_weight.scalar_type() == at::kFloat ||
+             norm_weight.scalar_type() == at::kBFloat16),
+        "fused KDA output norm shape or dtype mismatch");
+  }
   TORCH_CHECK(
       beta.numel() >= heads && a_log.numel() >= heads &&
           dt_bias.numel() >= heads * key_dim,
@@ -2504,6 +6725,22 @@ torch::Tensor kda_recurrent_cpu(
       bf16 ? value.data_ptr<at::BFloat16>() : nullptr;
   const at::BFloat16* gate_b =
       bf16 ? gate.data_ptr<at::BFloat16>() : nullptr;
+  const float* output_gate_f =
+      !fuse_output_norm || bf16 ? nullptr : output_gate.data_ptr<float>();
+  const at::BFloat16* output_gate_b =
+      fuse_output_norm && bf16
+      ? output_gate.data_ptr<at::BFloat16>()
+      : nullptr;
+  const bool norm_weight_bf16 =
+      fuse_output_norm && norm_weight.scalar_type() == at::kBFloat16;
+  const float* norm_weight_f =
+      !fuse_output_norm || norm_weight_bf16
+      ? nullptr
+      : norm_weight.data_ptr<float>();
+  const at::BFloat16* norm_weight_b =
+      fuse_output_norm && norm_weight_bf16
+      ? norm_weight.data_ptr<at::BFloat16>()
+      : nullptr;
   const bool beta_bf16 = beta.scalar_type() == at::kBFloat16;
   const bool a_bf16 = a_log.scalar_type() == at::kBFloat16;
   const bool dt_bf16 = dt_bias.scalar_type() == at::kBFloat16;
@@ -2570,12 +6807,10 @@ torch::Tensor kda_recurrent_cpu(
 
   const float output_scale =
       1.0f / std::sqrt(static_cast<float>(key_dim));
-  at::parallel_for(
-      0, heads * value_dim, 1,
-      [&](int64_t begin, int64_t end) {
-    for (int64_t item = begin; item < end; ++item) {
-      const int64_t head = item / value_dim;
-      const int64_t row = item - head * value_dim;
+  at::parallel_for(0, heads, 1, [&](int64_t begin, int64_t end) {
+    for (int64_t head = begin; head < end; ++head) {
+      float output_square = 0.0f;
+      for (int64_t row = 0; row < value_dim; ++row) {
       float* state_row =
           statep + (head * value_dim + row) * key_dim;
       const float* key_row = key_norm + head * key_dim;
@@ -2636,10 +6871,37 @@ torch::Tensor kda_recurrent_cpu(
         output_value += state_row[lane] * query_row[lane];
       }
       output_value *= output_scale;
+      output_square += output_value * output_value;
       if (bf16) {
         output_b[value_index] = at::BFloat16(output_value);
       } else {
         output_f[value_index] = output_value;
+      }
+      }
+      if (fuse_output_norm) {
+        const float inverse = 1.0f / std::sqrt(
+            output_square / static_cast<float>(value_dim) +
+            static_cast<float>(norm_eps));
+        const int64_t base = head * value_dim;
+        for (int64_t row = 0; row < value_dim; ++row) {
+          const int64_t index = base + row;
+          const float current = bf16
+              ? static_cast<float>(output_b[index])
+              : output_f[index];
+          const float gate_value = bf16
+              ? static_cast<float>(output_gate_b[index])
+              : output_gate_f[index];
+          const float coefficient = norm_weight_bf16
+              ? static_cast<float>(norm_weight_b[row])
+              : norm_weight_f[row];
+          const float normalized = current * inverse * coefficient /
+              (1.0f + std::exp(-gate_value));
+          if (bf16) {
+            output_b[index] = at::BFloat16(normalized);
+          } else {
+            output_f[index] = normalized;
+          }
+        }
       }
     }
   });
@@ -4959,6 +9221,75 @@ torch::Tensor attention_decode_cpu(
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  pybind11::class_<CpuResidentProjectionLayer>(
+      module, "CpuResidentProjectionLayer")
+      .def(
+          pybind11::init<
+              std::vector<torch::Tensor>,
+              std::vector<torch::Tensor>,
+              std::vector<int64_t>,
+              std::vector<int64_t>,
+              int64_t,
+              int64_t>())
+      .def("forward", &CpuResidentProjectionLayer::forward)
+      .def(
+          "forward_combined",
+          &CpuResidentProjectionLayer::forward_combined);
+  pybind11::class_<CpuPackedThreeLayer>(
+      module, "CpuPackedThreeLayer")
+      .def(
+          pybind11::init<
+              std::vector<torch::Tensor>,
+              std::vector<torch::Tensor>,
+              int64_t,
+              int64_t,
+              int64_t,
+              std::vector<torch::Tensor>,
+              std::vector<torch::Tensor>,
+              int64_t,
+              int64_t,
+              int64_t,
+              std::vector<torch::Tensor>,
+              std::vector<torch::Tensor>,
+              int64_t,
+              int64_t,
+              int64_t>())
+      .def("forward", &CpuPackedThreeLayer::forward);
+  pybind11::class_<CpuPackedThreeMixedLayer>(
+      module, "CpuPackedThreeMixedLayer")
+      .def(
+          pybind11::init<
+              std::vector<torch::Tensor>,
+              std::vector<torch::Tensor>,
+              std::vector<int64_t>,
+              std::vector<int64_t>,
+              std::vector<int64_t>,
+              std::vector<int64_t>,
+              std::vector<torch::Tensor>,
+              std::vector<torch::Tensor>,
+              std::vector<int64_t>,
+              std::vector<int64_t>,
+              std::vector<int64_t>,
+              std::vector<int64_t>,
+              std::vector<torch::Tensor>,
+              std::vector<torch::Tensor>,
+              std::vector<int64_t>,
+              std::vector<int64_t>,
+              std::vector<int64_t>,
+              std::vector<int64_t>>())
+      .def("forward", &CpuPackedThreeMixedLayer::forward)
+      .def(
+          "configure_fused_moe",
+          &CpuPackedThreeMixedLayer::configure_fused_moe)
+      .def(
+          "forward_fused_moe",
+          &CpuPackedThreeMixedLayer::forward_fused_moe)
+      .def(
+          "configure_latent_moe",
+          &CpuPackedThreeMixedLayer::configure_latent_moe)
+      .def(
+          "forward_latent_moe",
+          &CpuPackedThreeMixedLayer::forward_latent_moe);
   pybind11::class_<CpuMoeLayer>(module, "CpuMoeLayer")
       .def(
           pybind11::init<
@@ -4989,13 +9320,33 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       &vq_gemv_cpu,
       "TPQ uint8/uint16 VQ GEMV for CPU");
   module.def(
+      "bf16_grouped_gemv",
+      &bf16_grouped_gemv_cpu,
+      "TPQ grouped BF16 GEMV for one shared CPU input");
+  module.def(
       "block_fp8_gemv",
       &block_fp8_gemv_cpu,
       "TPQ compact E4M3FN block128 GEMV for CPU");
   module.def(
+      "block_fp8_gemm",
+      &block_fp8_gemm_cpu,
+      "TPQ compact E4M3FN block128 2..16 token GEMM for CPU");
+  module.def(
+      "block_fp8_to_block_major",
+      &block_fp8_to_block_major_cpu,
+      "TPQ compact row-major to 32x128 block-major CPU layout");
+  module.def(
       "block_fp8_grouped_gemv",
       &block_fp8_grouped_gemv_cpu,
       "TPQ grouped compact E4M3FN block128 GEMV for CPU");
+  module.def(
+      "block_fp8_grouped_rows_gemv",
+      &block_fp8_grouped_rows_gemv_cpu,
+      "TPQ one-input-per-projection compact E4M3FN GEMV for CPU");
+  module.def(
+      "block_fp8_grouped_gemm",
+      &block_fp8_grouped_gemm_cpu,
+      "TPQ grouped compact E4M3FN block128 2..16 token GEMM for CPU");
   module.def(
       "reset_block_fp8_gemv_profile",
       &reset_block_fp8_gemv_profile_cpu,
@@ -5005,6 +9356,30 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       &block_fp8_gemv_profile_cpu,
       "Read compact block-FP8 CPU GEMV timers");
   module.def(
+      "reset_resident_moe_phase_profile",
+      &reset_resident_moe_phase_profile_cpu,
+      "Reset resident Router/shared/routed CPU MoE timers");
+  module.def(
+      "resident_moe_phase_profile",
+      &resident_moe_phase_profile_cpu,
+      "Read resident Router/shared/routed CPU MoE timers");
+  module.def(
+      "reset_latent_moe_phase_profile",
+      &reset_latent_moe_phase_profile_cpu,
+      "Reset resident latent-MoE CPU timers");
+  module.def(
+      "latent_moe_phase_profile",
+      &latent_moe_phase_profile_cpu,
+      "Read resident latent-MoE CPU timers");
+  module.def(
+      "reset_resident_projection_profile",
+      &reset_resident_projection_profile_cpu,
+      "Reset fixed-address mixed CPU projection timers");
+  module.def(
+      "resident_projection_profile",
+      &resident_projection_profile_cpu,
+      "Read fixed-address mixed CPU projection timers");
+  module.def(
       "vq_gemv_list",
       &vq_gemv_list_cpu,
       "TPQ list-backed uint8/uint16 VQ GEMV for CPU");
@@ -5012,6 +9387,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       "vq_gemv_packed_list",
       &vq_gemv_packed_list_cpu,
       "TPQ list-backed packed 8--16-bit VQ GEMV for CPU");
+  module.def(
+      "vq_repack_block_major",
+      &vq_repack_block_major_cpu,
+      "TPQ compact packed VQ row-to-block-major CPU relayout");
+  module.def(
+      "vq_repack_row_tile",
+      &vq_repack_row_tile_cpu,
+      "TPQ compact packed VQ row-to-tile-major CPU relayout");
+  module.def(
+      "vq_compile_u16_row_tile",
+      &vq_compile_u16_row_tile_cpu,
+      "TPQ online packed VQ to uint16 row-tile CPU compilation");
   module.def(
       "moe_packed_three_projection",
       &moe_packed_three_projection_cpu,
@@ -5024,6 +9411,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       "three_projection_phase_profile",
       &three_projection_phase_profile_cpu,
       "Read packed three-projection CPU MoE phase timers");
+  module.def(
+      "route_topk_sigmoid",
+      &route_topk_sigmoid_cpu,
+      "Stable compact CPU sigmoid Router Top-K");
   module.def(
       "moe_packed_topk",
       &moe_packed_topk_cpu,

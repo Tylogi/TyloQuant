@@ -49,3 +49,33 @@ packed MoE 固定输出遵循同一公共接口和“decode 不分配临时结�
 时只回读 Top-K ID，再进入原有紧凑 RAM→VRAM 搬运回退。该算子和 FlashInfer MLA
 动态 plan 都由 `python -m tpq check --cuda-ops` 做固定地址 CUDA Graph 验收；
 MLA 同时逐字段核对单 CTA `1×78` 与双 CTA `2×39` 的官方调度。
+
+CPU 多 token 验证使用两个同样不含模型名的公共能力：
+
+- `cpu.block_scaled_gemm.e4m3fn.b128.verify`：一次扫描一个紧凑 block-FP8
+  权重，为 2–16 行激活计算输出；row-major 与 block-major32 都直接读取原字节。
+- `cpu.block_scaled_grouped_gemm.e4m3fn.b128.verify`：逻辑拼接多个投影，成员
+  可以分成不同布局段；输出允许带行 stride，因而不需要为布局段复制整块结果。
+
+两个能力都只展开一个 FP8 字节到寄存器并复用于候选行，不创建 BF16/FP32 权重，
+注册选择依据仍是设备、格式、block size 和 batch。模型适配层只负责保持 Attention、
+MoE 和 recurrent state 的数学顺序。
+
+多卡 `Router → Top-K → packed expert` 的父图由公共
+`TensorParallelRoutePackedPlan` 统一绑定。其能力键只包含 scoring、Top-K、
+分组参数和 TP rank 数，不包含模型名；Kimi 与 DSV4 都只提交固定 logits、
+correction、mask 和输出缓冲。模型自身的 token-hash 等特殊数学留在模型适配层，
+普通分层专家配置可以直接复用该公共计划。
+
+共享同一 token 输入的多个 block-FP8 projection 使用公共 `ProjectionGroup`。
+该对象只建立固定地址 pointer/row-offset 元数据，源 FP8 payload 与独立 scale 原点
+保持不变；执行统一进入注册项 `block_scaled_grouped_gemv`。Q/KV、Gate/Up、
+Compressor/Indexer 等名称不进入注册键，Kimi、DSV4 或后续按层分级模型只需提交
+projection 列表。TP 阶段耗时统一由 `TPHiddenStageProfiler` 记录异步 Event，并在
+token 边界一次性汇总，禁止各模型再维护一套逐层同步探针。
+
+延迟敏感的小投影可以使用公共 `ReplicatedSubgroupTensorParallel`，但语义必须是
+所有子组同时计算同一逻辑算子，每个 rank 都直接获得完整输出；它不允许按层挑选
+owner 子组。`compressed_state_update` 与 `head_rmsnorm_rope` 也按设备、ratio、
+head/rope 维度注册，不按模型分支。前者只负责固定 ring state 写入，后者只负责
+逐 head 归一化和 RoPE；模型适配层继续负责压缩池化与 Attention 数学拓扑。

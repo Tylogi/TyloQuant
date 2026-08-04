@@ -778,16 +778,45 @@ class Manifest:
         # top-level ``expert_files``/``layer_audit`` maps and stores the
         # projection descriptions in ``quant.layouts``.  Normalize both here
         # so model and operator code never branch on a model-family name.
+        heterogeneous = (
+            self.quant.get("heterogeneous_expert_tiering") or {}
+        )
+        heterogeneous_projection_vq = bool(
+            self.quant.get("method") == "projection-vq"
+            and self.quant.get("layouts")
+            and heterogeneous.get("precision_levels")
+            and heterogeneous.get("layer_expert_levels")
+        )
         flat_projection_vq = bool(
             not routed_layers
             and m.get("expert_files")
             and self.quant.get("method") == "projection-vq"
-            and self.quant.get("projection_layouts")
+            and (
+                self.quant.get("projection_layouts")
+                or heterogeneous_projection_vq
+            )
         )
         self.projection_vq = bool(
-            (routed_layers and self.quant.get("projection_layouts"))
+            (
+                routed_layers
+                and (
+                    self.quant.get("projection_layouts")
+                    or heterogeneous_projection_vq
+                )
+            )
             or flat_projection_vq
         )
+        self.heterogeneous_projection_vq = heterogeneous_projection_vq
+        self.projection_layout_by_layer: dict[int, dict[str, str]] = {}
+        self.projection_layout_by_expert: dict[
+            int, tuple[dict[str, str], ...]
+        ] = {}
+        self.projection_precision_levels: dict[
+            str, dict[str, str]
+        ] = {}
+        self.projection_level_by_expert: dict[
+            int, tuple[str, ...]
+        ] = {}
         if self.projection_vq:
             if flat_projection_vq:
                 layer_audit = m.get("layer_audit") or {}
@@ -800,16 +829,6 @@ class Manifest:
                     for layer, item in layer_audit.items()
                     if isinstance(item, dict) and item.get("audit_path")
                 }
-                self.projection_layout_by_layer = {
-                    int(layer): {
-                        str(projection): str(layout_name)
-                        for projection, layout_name in layouts.items()
-                    }
-                    for layer, layouts in self.quant[
-                        "projection_layouts"
-                    ].items()
-                }
-                layout_specs = self.quant.get("layouts") or {}
                 self.routed_layers = len(self.expert_files)
                 self.routed_experts_per_layer = int(
                     self.config.get("n_experts", 0)
@@ -826,6 +845,37 @@ class Manifest:
                     int(layer): str(item["audit_path"])
                     for layer, item in routed_layers.items()
                 }
+
+            if heterogeneous_projection_vq:
+                layout_specs = self.quant.get("layouts") or {}
+                self.projection_precision_levels = {
+                    str(level): {
+                        str(projection): str(layout_name)
+                        for projection, layout_name in layouts.items()
+                    }
+                    for level, layouts in heterogeneous[
+                        "precision_levels"
+                    ].items()
+                }
+                self.projection_level_by_expert = {
+                    int(layer): tuple(str(level) for level in levels)
+                    for layer, levels in heterogeneous[
+                        "layer_expert_levels"
+                    ].items()
+                }
+            elif flat_projection_vq:
+                layout_specs = self.quant.get("layouts") or {}
+                self.projection_layout_by_layer = {
+                    int(layer): {
+                        str(projection): str(layout_name)
+                        for projection, layout_name in layouts.items()
+                    }
+                    for layer, layouts in self.quant[
+                        "projection_layouts"
+                    ].items()
+                }
+            else:
+                layout_specs = self.quant["projection_layouts"]
                 self.projection_layout_by_layer = {
                     int(layer): {
                         str(projection): str(layout_name)
@@ -835,7 +885,6 @@ class Manifest:
                     }
                     for layer, item in routed_layers.items()
                 }
-                layout_specs = self.quant["projection_layouts"]
             self.vq_dims = {
                 str(name): (
                     int(item["dim"]),
@@ -870,7 +919,17 @@ class Manifest:
                     "index_packing", {}
                 ).items()
             }
+            self._validate_projection_layouts()
+            if heterogeneous_projection_vq:
+                self.projection_layout_by_expert = {
+                    layer: tuple(
+                        self.projection_precision_levels[level]
+                        for level in levels
+                    )
+                    for layer, levels in self.projection_level_by_expert.items()
+                }
         else:
+            self.heterogeneous_projection_vq = False
             self.expert_files = {
                 int(l): v for l, v in m["expert_files"].items()
             }
@@ -880,7 +939,6 @@ class Manifest:
                     "expert_audit_files", {}
                 ).items()
             }
-            self.projection_layout_by_layer = {}
             self.projection_layout_specs = {}
             self.projection_codebook_group_sizes = {}
             self.projection_codebook_group_counts = {}
@@ -941,6 +999,92 @@ class Manifest:
             )
         self._audit_tiers: dict[int, str] = {}
 
+    def _validate_projection_layouts(self) -> None:
+        projections = {"gate", "up", "down"}
+        if self.heterogeneous_projection_vq:
+            if not self.projection_precision_levels:
+                raise ValueError(
+                    "heterogeneous projection VQ has no precision_levels"
+                )
+            for level, layouts in self.projection_precision_levels.items():
+                if set(layouts) != projections:
+                    raise ValueError(
+                        f"precision level {level!r} must define gate/up/down"
+                    )
+            expected = int(self.routed_experts_per_layer)
+            for layer in self.expert_files:
+                levels = self.projection_level_by_expert.get(layer)
+                if levels is None:
+                    raise ValueError(
+                        f"L{layer} has no heterogeneous expert level map"
+                    )
+                if len(levels) != expected:
+                    raise ValueError(
+                        f"L{layer} expert level count {len(levels)} != "
+                        f"n_experts {expected}"
+                    )
+                unknown = sorted(
+                    set(levels) - set(self.projection_precision_levels)
+                )
+                if unknown:
+                    raise ValueError(
+                        f"L{layer} references unknown precision levels "
+                        f"{unknown}"
+                    )
+            referenced = {
+                layout
+                for layouts in self.projection_precision_levels.values()
+                for layout in layouts.values()
+            }
+        else:
+            referenced = {
+                layout
+                for layouts in self.projection_layout_by_layer.values()
+                for layout in layouts.values()
+            }
+        missing = sorted(referenced - set(self.projection_layout_specs))
+        if missing:
+            raise ValueError(
+                f"projection VQ references undefined layouts: {missing}"
+            )
+        for layout in referenced:
+            dim, size = self.vq_dims[layout]
+            if dim <= 0 or size <= 0 or size & (size - 1):
+                raise ValueError(
+                    f"projection layout {layout} must have a positive dim "
+                    "and power-of-two codebook size"
+                )
+            expected_bits = size.bit_length() - 1
+            packing = self.index_packing.get(layout)
+            if packing is None:
+                continue
+            bits = int(
+                packing.removeprefix("packed-u").removeprefix("u")
+            )
+            if bits < expected_bits:
+                raise ValueError(
+                    f"projection layout {layout} packing {packing} does not "
+                    f"have enough bits for codebook size {size}"
+                )
+
+    def projection_layouts(
+        self,
+        layer: int,
+        expert_id: int | None = None,
+    ) -> dict[str, str]:
+        """Resolve Gate/Up/Down layouts without model-name dispatch."""
+        layer = int(layer)
+        if not self.heterogeneous_projection_vq:
+            return self.projection_layout_by_layer[layer]
+        if expert_id is None:
+            raise ValueError(
+                f"L{layer} uses heterogeneous layouts; expert_id is required"
+            )
+        levels = self.projection_level_by_expert[layer]
+        if expert_id < 0 or expert_id >= len(levels):
+            raise IndexError(f"L{layer} expert_id {expert_id} is out of range")
+        return self.projection_precision_levels[levels[expert_id]]
+
     def tier_string(self, layer: int) -> str | None:
         value = self.tiers_per_layer.get(layer)
         if value is not None:
@@ -966,8 +1110,9 @@ class Manifest:
     def projection_operator_capability(
         self,
         layer: int,
+        expert_id: int | None = None,
     ) -> dict[str, tuple]:
-        """Return the exact public operator key for one projection-VQ layer."""
+        """Return the exact public operator key for one expert layout."""
         if not self.projection_vq:
             return {}
         formats = {
@@ -977,12 +1122,27 @@ class Manifest:
         formats.update(
             {f"packed-u{bits}": f"p{bits}" for bits in range(8, 17)}
         )
-        layouts = self.projection_layout_by_layer[int(layer)]
+        if self.heterogeneous_projection_vq and expert_id is None:
+            used_levels = set(self.projection_level_by_expert[int(layer)])
+            layout_names = sorted(
+                {
+                    layout
+                    for level in used_levels
+                    for layout in self.projection_precision_levels[
+                        level
+                    ].values()
+                }
+            )
+        else:
+            layouts = self.projection_layouts(layer, expert_id)
+            layout_names = [
+                layouts[projection]
+                for projection in ("gate", "up", "down")
+            ]
         packed_formats = []
         code_dims = []
         codebook_sizes = []
-        for projection in ("gate", "up", "down"):
-            layout = layouts[projection]
+        for layout in layout_names:
             packing = self.index_packing.get(layout)
             dim, size = self.vq_dims[layout]
             if packing is None:
@@ -992,7 +1152,7 @@ class Manifest:
                 bits = int(size).bit_length() - 1
                 if size <= 0 or (1 << bits) != int(size):
                     raise ValueError(
-                        f"L{layer} {projection} cannot infer packed width "
+                        f"L{layer} cannot infer packed width "
                         f"from non-power-of-two codebook {layout}"
                     )
                 packing = (
@@ -1002,7 +1162,7 @@ class Manifest:
                 )
             if packing not in formats:
                 raise ValueError(
-                    f"L{layer} {projection} 缺少公共 packed 格式: "
+                    f"L{layer} has no public packed format for "
                     f"{layout} -> {packing!r}"
                 )
             packed_formats.append(formats[packing])
@@ -1014,9 +1174,24 @@ class Manifest:
             "codebook_sizes": tuple(codebook_sizes),
         }
 
+    def projection_operator_capabilities(
+        self,
+        layer: int,
+    ) -> tuple[dict[str, tuple], ...]:
+        """Return every unique public packed capability used by a layer."""
+        per_expert = self.projection_layout_by_expert.get(int(layer))
+        if per_expert is None:
+            return (self.projection_operator_capability(layer),)
+        unique: dict[tuple[tuple[str, tuple], ...], dict[str, tuple]] = {}
+        for expert in range(len(per_expert)):
+            capability = self.projection_operator_capability(layer, expert)
+            key = tuple(sorted(capability.items()))
+            unique.setdefault(key, capability)
+        return tuple(unique.values())
 
-class CCCPStore:
-    """TPQ dense and expert mmap store (legacy class name)."""
+
+class TPQStore:
+    """TPQ dense and expert mmap store."""
 
     def __init__(self, root: str):
         self.root = root
@@ -1220,7 +1395,7 @@ class CCCPStore:
             self._eh(layer)
             keys = self._expert_keys[layer]
         if self.man.projection_vq:
-            layouts = self.man.projection_layout_by_layer[layer]
+            layouts = self.man.projection_layouts(layer, eid)
             if all(
                 f"e{eid}.{projection}.{layouts[projection]}" in keys
                 for projection in ("gate", "up", "down")
@@ -1422,7 +1597,7 @@ class CCCPStore:
         projection: str,
         eid: int | None,
     ) -> str:
-        layout = self.man.projection_layout_by_layer[layer][projection]
+        layout = self.man.projection_layouts(layer, eid)[projection]
         key = f"cb.{projection}.{layout}"
         group_size = self.man.projection_codebook_group_sizes.get(layout)
         if group_size is None:
@@ -1568,7 +1743,7 @@ class CCCPStore:
         """
         if self.man.projection_vq:
             handle = self._eh(layer)
-            layouts = self.man.projection_layout_by_layer[layer]
+            layouts = self.man.projection_layouts(layer, eid)
             codebooks = self.projection_codebooks(layer, eid)
             hidden = int(
                 self.cfg.get("routed_hidden", self.cfg["hidden"])
@@ -1700,9 +1875,8 @@ class CCCPStore:
         )
 
 
-# Canonical name for new callers.  The historical name remains a strict alias
-# so released CCCP artifacts and downstream imports keep working.
-TPQStore = CCCPStore
+# Historical import alias for released CCCP artifacts and downstream callers.
+CCCPStore = TPQStore
 
 
 class PackedVQWeight:
@@ -1721,6 +1895,8 @@ class PackedVQWeight:
         "blocks",
         "dim",
         "bits",
+        "source_bits",
+        "layout",
     )
 
     def __init__(
@@ -1742,6 +1918,8 @@ class PackedVQWeight:
             raise ValueError("VQ columns must be divisible by code dimension")
         self.blocks = self.cols // self.dim
         self.bits = int(bits)
+        self.source_bits = int(bits)
+        self.layout = "row-major"
         expected_bits = self.rows * self.blocks * self.bits
         if expected_bits % 8:
             raise ValueError(
@@ -1773,6 +1951,87 @@ class PackedVQWeight:
             self.bits
         ]
 
+    def optimize_cpu_layout(self) -> bool:
+        """Replace row-major indices with compact block-major traversal.
+
+        The byte count and index width stay identical.  This is a CPU-only
+        storage transform; CUDA transport continues to use the archive's
+        original row-major representation unless explicitly requested.
+        """
+        if self.layout == "block-major":
+            return True
+        from .ops import vq_relayout_block_major
+
+        packed = vq_relayout_block_major(
+            self.raw,
+            rows=self.rows,
+            blocks=self.blocks,
+            bits=self.bits,
+            code_dim=self.dim,
+            codebook_size=int(self.cb.shape[0]),
+        )
+        if packed is None:
+            return False
+        if packed.numel() != self.raw.numel():
+            raise RuntimeError("compact VQ relayout changed payload size")
+        self.raw = packed
+        self.layout = "block-major"
+        return True
+
+    def optimize_cpu_row_tile(self, tile_rows: int = 8) -> bool:
+        """Replace row-major indices with compact CPU row-tile traversal."""
+        if self.layout == f"row-tile-{int(tile_rows)}":
+            return True
+        if self.layout != "row-major":
+            return False
+        from .ops import vq_relayout_row_tile
+
+        packed = vq_relayout_row_tile(
+            self.raw,
+            rows=self.rows,
+            blocks=self.blocks,
+            bits=self.bits,
+            code_dim=self.dim,
+            codebook_size=int(self.cb.shape[0]),
+            tile_rows=int(tile_rows),
+        )
+        if packed is None:
+            return False
+        if packed.numel() != self.raw.numel():
+            raise RuntimeError("compact VQ row-tile changed payload size")
+        self.raw = packed
+        self.layout = f"row-tile-{int(tile_rows)}"
+        return True
+
+    def compile_cpu_u16_row_tile(self, tile_rows: int = 8) -> bool:
+        """Compile packed bytes into an exact runtime-only CPU image."""
+        if self.layout == f"u16-row-tile-{int(tile_rows)}":
+            return True
+        if self.layout != "row-major" or int(tile_rows) != 8:
+            return False
+        from .ops import vq_compile_u16_row_tile
+
+        compiled = vq_compile_u16_row_tile(
+            self.raw,
+            rows=self.rows,
+            blocks=self.blocks,
+            bits=self.bits,
+            code_dim=self.dim,
+            codebook_size=int(self.cb.shape[0]),
+            tile_rows=int(tile_rows),
+        )
+        if compiled is None:
+            return False
+        if compiled.dtype != torch.uint16 or compiled.numel() != (
+            self.rows * self.blocks
+        ):
+            raise RuntimeError("CPU VQ compilation returned an invalid image")
+        self.source_bits = int(self.bits)
+        self.raw = compiled.contiguous().view(torch.uint8).reshape(-1)
+        self.bits = 16
+        self.layout = f"u16-row-tile-{int(tile_rows)}"
+        return True
+
     def unpack(self) -> torch.Tensor:
         """Reference unpacker used by CPU tests and correctness probes."""
         count = self.rows * self.blocks
@@ -1790,7 +2049,27 @@ class PackedVQWeight:
             result = _unpack_u14(self.raw, count)
         else:
             result = _unpack_odd_width(self.raw, count, self.bits)
-        return result.reshape(self.rows, self.blocks)
+        physical = result.reshape(-1)
+        if self.layout == "row-major":
+            return physical.reshape(self.rows, self.blocks)
+        if self.layout == "block-major":
+            return physical.reshape(self.blocks, self.rows).t().contiguous()
+        if self.layout in ("row-tile-8", "u16-row-tile-8"):
+            logical = torch.empty(
+                self.rows,
+                self.blocks,
+                dtype=physical.dtype,
+                device=physical.device,
+            )
+            for first_row in range(0, self.rows, 8):
+                valid = min(8, self.rows - first_row)
+                start = first_row * self.blocks
+                stop = start + self.blocks * valid
+                logical[first_row : first_row + valid].copy_(
+                    physical[start:stop].reshape(self.blocks, valid).t()
+                )
+            return logical
+        raise ValueError(f"unsupported packed VQ layout {self.layout!r}")
 
 
 class PackedCpuExpertPool:
@@ -1804,8 +2083,9 @@ class PackedCpuExpertPool:
 
     full_resident = False
     prefetch_default = True
+    expanded_index_bytes = 0
 
-    def __init__(self, store: CCCPStore, budget_gb: float = 16.0):
+    def __init__(self, store: TPQStore, budget_gb: float = 16.0):
         self.store = store
         self.device = torch.device("cpu")
         self.gpu = False
@@ -1819,9 +2099,27 @@ class PackedCpuExpertPool:
             tuple[PackedVQWeight, ...],
         ] = {}
         self.bytes = 0
+        self.compact_full_resident = False
         self.hits = 0
         self.miss = 0
         self._pending: OrderedDict = OrderedDict()
+        self._native_layers: dict[int, object | bool] = {}
+        self.native_hits = 0
+        self.native_fallbacks = 0
+        self.block_major_entries = 0
+        self.block_major_bytes = 0
+        self.compiled_index_bytes = 0
+        self.compiled_source_bytes = 0
+        self.cpu_compile_mode = "off"
+
+    @property
+    def host_expert_bytes(self) -> int:
+        """Return the compact resident/LRU payload footprint."""
+        return int(self.bytes)
+
+    @property
+    def compact_resident_entries(self) -> int:
+        return len(self.pinned)
 
     @staticmethod
     def _entry_bytes(entry) -> int:
@@ -1843,18 +2141,46 @@ class PackedCpuExpertPool:
         if os.environ.get("TPQ_FULL_RESIDENT", "1") == "0":
             return False
         import psutil
-        from concurrent.futures import as_completed
+        from concurrent.futures import FIRST_COMPLETED, wait
 
         if reserve_gb is None:
             reserve_gb = float(
                 os.environ.get("TPQ_RESIDENT_RESERVE_GB", "3.0")
             )
-        total = sum(
-            os.path.getsize(os.path.join(self.store.root, filename))
-            for filename in self.store.man.expert_files.values()
-            if os.path.exists(os.path.join(self.store.root, filename))
-        )
+        native_expert_bytes = getattr(self.store, "expert_bytes", None)
+        if native_expert_bytes is None:
+            total = sum(
+                os.path.getsize(os.path.join(self.store.root, filename))
+                for filename in self.store.man.expert_files.values()
+                if os.path.exists(os.path.join(self.store.root, filename))
+            )
+        else:
+            total = int(native_expert_bytes)
         available = int(psutil.virtual_memory().available)
+        compile_mode = os.environ.get(
+            "TPQ_CPU_COMPILE", "off"
+        ).strip().lower()
+        if compile_mode not in {"0", "off", "false", "auto", "u16"}:
+            raise ValueError("TPQ_CPU_COMPILE must be off, auto, or u16")
+        compile_enabled = compile_mode in {"auto", "u16"}
+        compiled_upper_bound = total * 2
+        compiled_need = compiled_upper_bound + int(reserve_gb * 2**30)
+        if compile_enabled and compiled_need > available:
+            if compile_mode == "u16":
+                raise MemoryError(
+                    "forced CPU VQ compilation cannot fit: "
+                    f"upper bound {compiled_upper_bound / 2**30:.1f}GiB + "
+                    f"reserve {reserve_gb:.1f}GiB > available "
+                    f"{available / 2**30:.1f}GiB"
+                )
+            compile_enabled = False
+            print(
+                "[tpq] CPU 在线编译自动回退紧凑索引："
+                f"上界 {compiled_upper_bound / 2**30:.1f}GiB + "
+                f"预留 {reserve_gb:.1f}GiB > 可用 "
+                f"{available / 2**30:.1f}GiB",
+                flush=True,
+            )
         if total + int(reserve_gb * 2**30) > available:
             print(
                 "[tpq] packed CPU专家无法全量常驻："
@@ -1875,26 +2201,91 @@ class PackedCpuExpertPool:
             f"[tpq] packed CPU专家全量常驻：{len(keys)} 个读取中…",
             flush=True,
         )
-        futures = {
-            _executor().submit(self.store.load_expert_packed, *key): key
-            for key in keys
-        }
         resident_bytes = 0
-        for index, future in enumerate(as_completed(futures), 1):
-            key = futures[future]
-            entry = future.result()
-            self.pinned[key] = entry
-            resident_bytes += self._entry_bytes(entry)
-            if index % 2000 == 0:
-                print(
-                    f"[tpq] packed CPU专家常驻 {index}/{len(keys)}",
-                    flush=True,
-                )
+        layout_mode = os.environ.get(
+            "TPQ_CPU_PACKED_LAYOUT", "off"
+        ).strip().lower()
+        self.cpu_compile_mode = "u16" if compile_enabled else "off"
+        executor = _executor()
+        key_iterator = iter(keys)
+        pending = {}
+        window = max(4, int(os.environ.get("TPQ_CPU_LOAD_WINDOW", "32")))
+
+        def submit_one() -> bool:
+            try:
+                key = next(key_iterator)
+            except StopIteration:
+                return False
+            pending[executor.submit(self.store.load_expert_packed, *key)] = key
+            return True
+
+        for _ in range(min(window, len(keys))):
+            submit_one()
+        index = 0
+        while pending:
+            completed, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
+            for future in completed:
+                key = pending.pop(future)
+                entry = future.result()
+                index += 1
+                if compile_enabled:
+                    for weight in entry:
+                        source_bytes = int(weight.nbytes)
+                        if not weight.compile_cpu_u16_row_tile(8):
+                            raise RuntimeError(
+                                "CPU VQ compilation unavailable for "
+                                f"layer/expert {key}"
+                            )
+                        self.compiled_source_bytes += source_bytes
+                        self.compiled_index_bytes += int(weight.nbytes)
+                elif layout_mode in {"tile8", "row-tile", "row_tile"}:
+                    for projection, weight in enumerate(entry):
+                        if projection >= 2:
+                            continue
+                        if weight.optimize_cpu_row_tile(8):
+                            self.block_major_entries += 1
+                            self.block_major_bytes += int(weight.nbytes)
+                elif layout_mode not in {"0", "off", "false", "row"}:
+                    for projection, weight in enumerate(entry):
+                        if (
+                            projection < 2
+                            and weight.dim == 4
+                            and int(weight.cb.shape[0]) <= 4096
+                            and weight.optimize_cpu_layout()
+                        ):
+                            self.block_major_entries += 1
+                            self.block_major_bytes += int(weight.nbytes)
+                self.pinned[key] = entry
+                resident_bytes += self._entry_bytes(entry)
+                if index % 2000 == 0:
+                    print(
+                        f"[tpq] packed CPU专家常驻 {index}/{len(keys)}",
+                        flush=True,
+                    )
+                submit_one()
         self.bytes = resident_bytes
+        self.expanded_index_bytes = int(self.compiled_index_bytes)
+        self.compact_full_resident = True
+        if compile_enabled or layout_mode in {"tile8", "row-tile", "row_tile"}:
+            # Relayout replaces each source tensor with an equal-size compact
+            # tensor.  Release completed Future references and return the old
+            # byte buffers to the OS instead of leaving one model-sized copy
+            # in the glibc arena.
+            pending.clear()
+            future = None
+            import ctypes
+            import gc
+
+            gc.collect()
+            malloc_trim = getattr(ctypes.CDLL(None), "malloc_trim", None)
+            if malloc_trim is not None:
+                malloc_trim(0)
         print(
             "[tpq] packed CPU专家常驻完成："
             f"{len(keys)} 个 / {resident_bytes / 2**30:.1f}GiB / "
-            f"{time.time() - started:.1f}s；expanded_index_bytes=0",
+            f"{time.time() - started:.1f}s；"
+            f"cpu_compile={self.cpu_compile_mode}；"
+            f"compiled_index_bytes={self.compiled_index_bytes}",
             flush=True,
         )
         return True
@@ -1961,6 +2352,71 @@ class PackedCpuExpertPool:
                 *key,
             )
 
+    def run_native(
+        self,
+        layer: int,
+        value: torch.Tensor,
+        expert_ids: torch.Tensor,
+        route_weights: torch.Tensor,
+        *,
+        activation: str,
+        activation_beta: float,
+        activation_linear_beta: float | None,
+        limit: float = 0.0,
+    ) -> torch.Tensor | None:
+        """Run one full-resident layer through the common native directory.
+
+        This removes the per-token Python expert-list reconstruction while
+        preserving the exact packed tensors held by ``pinned``.  Mixed
+        codebook routes deliberately return ``None`` and use the existing
+        registered fallback.
+        """
+        if not self.compact_full_resident:
+            return None
+        cached = self.native_layer(int(layer))
+        if cached is None:
+            return None
+        output = cached.forward(
+            value.float().contiguous(),
+            expert_ids,
+            route_weights.float().contiguous(),
+            float(limit),
+            str(activation).strip().lower(),
+            float(activation_beta),
+            (
+                -1.0
+                if activation_linear_beta is None
+                else float(activation_linear_beta)
+            ),
+        )
+        if output.numel():
+            self.native_hits += 1
+            return output
+        self.native_fallbacks += 1
+        return None
+
+    def native_layer(self, layer: int):
+        """Return one cached format-driven compact resident executor."""
+        if not self.compact_full_resident:
+            return None
+        cached = self._native_layers.get(int(layer))
+        if cached is None:
+            n_experts = int(self.store.cfg["n_experts"])
+            entries = tuple(
+                self.pinned.get((int(layer), expert))
+                for expert in range(n_experts)
+            )
+            if any(entry is None or len(entry) != 3 for entry in entries):
+                self._native_layers[int(layer)] = False
+                return None
+            from .cpuext import make_packed_three_layer_cpu
+
+            cached = make_packed_three_layer_cpu(entries)
+            self._native_layers[int(layer)] = cached or False
+        if cached is False:
+            return None
+        return cached
+
 
 class ExpertPool:
     """专家缓存池（两级）：计算设备缓存 + 可选内存前级缓存。
@@ -1971,7 +2427,7 @@ class ExpertPool:
     两级均以 VQ 索引态驻留（v 档 ≈9.4MB/专家，w 档 ≈4.7MB），LRU 驱逐。
     """
 
-    def __init__(self, store: CCCPStore, budget_gb: float = 16.0, device: str = "cpu",
+    def __init__(self, store: TPQStore, budget_gb: float = 16.0, device: str = "cpu",
                  ram_gb: float = 0.0, pin_gb: float = 0.0):
         self.store = store
         self.device = torch.device(device)

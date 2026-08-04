@@ -119,6 +119,41 @@ def _vq_gemv(**kwargs):
     )
 
 
+def _vq_relayout(**kwargs):
+    from ..cpuext import vq_repack_block_major_cpu
+
+    return vq_repack_block_major_cpu(
+        kwargs["payload"],
+        kwargs["rows"],
+        kwargs["blocks"],
+        kwargs["bits"],
+    )
+
+
+def _vq_relayout_row_tile(**kwargs):
+    from ..cpuext import vq_repack_row_tile_cpu
+
+    return vq_repack_row_tile_cpu(
+        kwargs["payload"],
+        kwargs["rows"],
+        kwargs["blocks"],
+        kwargs["bits"],
+        kwargs.get("tile_rows", 8),
+    )
+
+
+def _vq_compile_u16_row_tile(**kwargs):
+    from ..cpuext import vq_compile_u16_row_tile_cpu
+
+    return vq_compile_u16_row_tile_cpu(
+        kwargs["payload"],
+        kwargs["rows"],
+        kwargs["blocks"],
+        kwargs["bits"],
+        kwargs.get("tile_rows", 8),
+    )
+
+
 def _block_scaled_gemv(**kwargs):
     from ..cpuext import block_fp8_gemv_cpu
 
@@ -129,6 +164,21 @@ def _block_scaled_gemv(**kwargs):
         kwargs["cols"],
         kwargs["block_size"],
         kwargs.get("output"),
+        rows=kwargs.get("rows"),
+    )
+
+
+def _block_scaled_gemm(**kwargs):
+    from ..cpuext import block_fp8_gemm_cpu
+
+    return block_fp8_gemm_cpu(
+        kwargs["value"],
+        kwargs["weights"],
+        kwargs["scales"],
+        kwargs["cols"],
+        kwargs["block_size"],
+        kwargs.get("output"),
+        rows=kwargs.get("rows"),
     )
 
 
@@ -144,6 +194,52 @@ def _block_scaled_grouped_gemv(**kwargs):
         kwargs["cols"],
         kwargs["block_size"],
         kwargs.get("output"),
+        block_major=kwargs.get("block_major", False),
+    )
+
+
+def _dense_grouped_gemv(**kwargs):
+    from ..cpuext import bf16_grouped_gemv_cpu
+
+    return bf16_grouped_gemv_cpu(
+        kwargs["value"],
+        kwargs["weight_ptrs"],
+        kwargs["row_offsets"],
+        kwargs["total_rows"],
+        kwargs["cols"],
+        kwargs.get("output"),
+    )
+
+
+def _block_scaled_grouped_gemm(**kwargs):
+    from ..cpuext import block_fp8_grouped_gemm_cpu
+
+    return block_fp8_grouped_gemm_cpu(
+        kwargs["value"],
+        kwargs["weight_ptrs"],
+        kwargs["scale_ptrs"],
+        kwargs["row_offsets"],
+        kwargs["total_rows"],
+        kwargs["cols"],
+        kwargs["block_size"],
+        kwargs.get("output"),
+        block_major=kwargs.get("block_major", False),
+    )
+
+
+def _block_scaled_grouped_rows_gemv(**kwargs):
+    from ..cpuext import block_fp8_grouped_rows_gemv_cpu
+
+    return block_fp8_grouped_rows_gemv_cpu(
+        kwargs["value"],
+        kwargs["weight_ptrs"],
+        kwargs["scale_ptrs"],
+        kwargs["row_offsets"],
+        kwargs["total_rows"],
+        kwargs["cols"],
+        kwargs["block_size"],
+        kwargs.get("output"),
+        block_major=kwargs.get("block_major", False),
     )
 
 
@@ -173,6 +269,49 @@ def _packed_moe_topk(**kwargs):
         activation_beta=kwargs["beta"],
         activation_linear_beta=kwargs.get("linear_beta"),
     )
+
+
+def _resident_moe_layer(**kwargs):
+    from ..cpuext import configure_packed_resident_moe_cpu
+
+    return configure_packed_resident_moe_cpu(
+        kwargs["executor"],
+        kwargs["router_weight"],
+        kwargs["router_bias"],
+        kwargs["router_mask"],
+        kwargs["shared_weights"],
+        top_k=kwargs["top_k"],
+        normalize_route=kwargs["normalize_route"],
+        routed_scaling=kwargs["routed_scaling"],
+    )
+
+
+def _latent_resident_moe_layer(**kwargs):
+    from ..cpuext import configure_packed_latent_moe_cpu
+
+    return configure_packed_latent_moe_cpu(
+        kwargs["executor"],
+        kwargs["input_weights"],
+        kwargs["output_weights"],
+        kwargs["route_correction"],
+        kwargs["route_mask"],
+        kwargs["routed_norm"],
+        top_k=kwargs["top_k"],
+        normalize_route=kwargs["normalize_route"],
+        routed_scaling=kwargs["routed_scaling"],
+        rms_eps=kwargs["rms_eps"],
+        limit=kwargs["limit"],
+        scoring=kwargs["scoring"],
+        activation=kwargs["activation"],
+        beta=kwargs["beta"],
+        linear_beta=kwargs.get("linear_beta"),
+    )
+
+
+def _resident_projection_layer(**kwargs):
+    from ..cpuext import make_resident_projection_cpu
+
+    return make_resident_projection_cpu(tuple(kwargs["weights"]))
 
 
 def _kda_recurrent(**kwargs):
@@ -207,6 +346,28 @@ def _gated_rmsnorm(**kwargs):
 
 def _route_topk(**kwargs):
     logits = kwargs["logits"]
+    try:
+        from ..cpuext import route_topk_sigmoid_cpu
+
+        routed = route_topk_sigmoid_cpu(
+            logits,
+            kwargs["bias"],
+            kwargs["mask"],
+            kwargs["top_k"],
+            kwargs["normalize"],
+            kwargs["scaling"],
+        )
+    except (ImportError, RuntimeError):
+        routed = None
+    if routed is not None:
+        weights, indices = routed
+        output_buffers = kwargs.get("output_buffers")
+        if output_buffers is not None:
+            output_weights, output_indices = output_buffers
+            output_weights.copy_(weights)
+            output_indices.copy_(indices)
+            return output_weights, output_indices
+        return weights, indices
     scores = logits.float().sigmoid()
     choice = scores + kwargs["bias"].float()
     choice = choice.masked_fill(~kwargs["mask"], float("-inf"))
@@ -231,13 +392,110 @@ def _route_topk(**kwargs):
     return weights, indices
 
 
+def _linear_route_topk(**kwargs):
+    logits, output_weights, output_indices = kwargs["output_buffers"]
+    value = kwargs["value"].float()
+    weight = kwargs["weight"]
+    if not isinstance(weight, torch.Tensor):
+        return None
+    torch.mm(value, weight.float().t(), out=logits)
+    return _route_topk(
+        logits=logits,
+        bias=kwargs["bias"],
+        mask=kwargs["mask"],
+        top_k=kwargs["top_k"],
+        normalize=kwargs["normalize"],
+        scaling=kwargs["scaling"],
+        output_buffers=(output_weights, output_indices),
+    )
+
+
 def register(registry: OperatorRegistry) -> None:
+    registry.register(
+        "cpu.resident_projection_layer.mixed.decode",
+        OperatorCapability(
+            operation="resident_projection_layer",
+            device_types=("cpu",),
+            packed_formats=(
+                "bf16",
+                "e4m3fn",
+                "e4m3fn-block-major32",
+            ),
+            code_dims=(128,),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=(1,),
+        ),
+        _resident_projection_layer,
+        priority=120,
+    )
+    registry.register(
+        "cpu.resident_moe_layer.packed_block_fp8.decode",
+        OperatorCapability(
+            operation="resident_moe_layer",
+            device_types=("cpu",),
+            packed_formats=(
+                *(f"p{bits}" for bits in range(8, 17)),
+                "e4m3fn",
+                "e4m3fn-block-major32",
+                "float32",
+                "bfloat16",
+            ),
+            code_dims=(4, 8, 16, 128),
+            codebook_sizes=(
+                256, 512, 1024, 2048, 4096,
+                8192, 16384, 32768, 65536,
+            ),
+            activations=("silu", "swiglu", "situ"),
+            max_top_k=16,
+            batch_sizes=(1,),
+        ),
+        _resident_moe_layer,
+        priority=120,
+    )
+    registry.register(
+        "cpu.latent_resident_moe_layer.packed_block_fp8.decode",
+        OperatorCapability(
+            operation="latent_resident_moe_layer",
+            device_types=("cpu",),
+            packed_formats=(
+                *(f"p{bits}" for bits in range(8, 17)),
+                "e4m3fn",
+                "e4m3fn-block-major32",
+                "float32",
+                "bfloat16",
+            ),
+            code_dims=(4, 8, 16, 128),
+            codebook_sizes=(
+                256, 512, 1024, 2048, 4096,
+                8192, 16384, 32768, 65536,
+            ),
+            activations=("silu", "swiglu", "situ"),
+            max_top_k=16,
+            batch_sizes=(1,),
+        ),
+        _latent_resident_moe_layer,
+        priority=130,
+    )
+    registry.register(
+        "cpu.dense_grouped_gemv.bf16.decode",
+        OperatorCapability(
+            operation="dense_grouped_gemv",
+            device_types=("cpu",),
+            packed_formats=("bf16",),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=(1,),
+        ),
+        _dense_grouped_gemv,
+        priority=100,
+    )
     registry.register(
         "cpu.block_scaled_gemv.e4m3fn.b128.decode",
         OperatorCapability(
             operation="block_scaled_gemv",
             device_types=("cpu",),
-            packed_formats=("e4m3fn",),
+            packed_formats=("e4m3fn", "e4m3fn-block-major32"),
             code_dims=(128,),
             activations=("none",),
             max_top_k=1,
@@ -247,17 +505,59 @@ def register(registry: OperatorRegistry) -> None:
         priority=100,
     )
     registry.register(
+        "cpu.block_scaled_gemm.e4m3fn.b128.verify",
+        OperatorCapability(
+            operation="block_scaled_gemm",
+            device_types=("cpu",),
+            packed_formats=("e4m3fn", "e4m3fn-block-major32"),
+            code_dims=(128,),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=tuple(range(2, 17)),
+        ),
+        _block_scaled_gemm,
+        priority=100,
+    )
+    registry.register(
         "cpu.block_scaled_grouped_gemv.e4m3fn.b128.decode",
         OperatorCapability(
             operation="block_scaled_grouped_gemv",
             device_types=("cpu",),
-            packed_formats=("e4m3fn",),
+            packed_formats=("e4m3fn", "e4m3fn-block-major32"),
             code_dims=(128,),
             activations=("none",),
             max_top_k=1,
             batch_sizes=(1,),
         ),
         _block_scaled_grouped_gemv,
+        priority=100,
+    )
+    registry.register(
+        "cpu.block_scaled_grouped_gemm.e4m3fn.b128.verify",
+        OperatorCapability(
+            operation="block_scaled_grouped_gemm",
+            device_types=("cpu",),
+            packed_formats=("e4m3fn", "e4m3fn-block-major32"),
+            code_dims=(128,),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=tuple(range(2, 17)),
+        ),
+        _block_scaled_grouped_gemm,
+        priority=100,
+    )
+    registry.register(
+        "cpu.block_scaled_grouped_rows_gemv.e4m3fn.b128.decode",
+        OperatorCapability(
+            operation="block_scaled_grouped_rows_gemv",
+            device_types=("cpu",),
+            packed_formats=("e4m3fn", "e4m3fn-block-major32"),
+            code_dims=(128,),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=tuple(range(1, 17)),
+        ),
+        _block_scaled_grouped_rows_gemv,
         priority=100,
     )
     registry.register(
@@ -283,6 +583,18 @@ def register(registry: OperatorRegistry) -> None:
         ),
         _route_topk,
         priority=10,
+    )
+    registry.register(
+        "cpu.linear_route_topk.sigmoid.decode",
+        OperatorCapability(
+            operation="linear_route_topk",
+            device_types=("cpu",),
+            activations=("sigmoid",),
+            max_top_k=16,
+            batch_sizes=tuple(range(1, 257)),
+        ),
+        _linear_route_topk,
+        priority=100,
     )
     registry.register(
         "cpu.gated_activation.reference",
@@ -352,6 +664,60 @@ def register(registry: OperatorRegistry) -> None:
         ),
         _vq_gemv_packed_list,
         priority=60,
+    )
+    registry.register(
+        "cpu.vq_relayout.compact_block_major",
+        OperatorCapability(
+            operation="vq_relayout:block_major",
+            device_types=("cpu",),
+            packed_formats=tuple(f"p{bits}" for bits in range(8, 17)),
+            code_dims=(4, 8, 16),
+            codebook_sizes=(
+                256, 512, 1024, 2048, 4096,
+                8192, 16384, 32768, 65536,
+            ),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=(1,),
+        ),
+        _vq_relayout,
+        priority=100,
+    )
+    registry.register(
+        "cpu.vq_relayout.compact_row_tile",
+        OperatorCapability(
+            operation="vq_relayout:row_tile",
+            device_types=("cpu",),
+            packed_formats=tuple(f"p{bits}" for bits in range(8, 17)),
+            code_dims=(4, 8, 16),
+            codebook_sizes=(
+                256, 512, 1024, 2048, 4096,
+                8192, 16384, 32768, 65536,
+            ),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=(1,),
+        ),
+        _vq_relayout_row_tile,
+        priority=110,
+    )
+    registry.register(
+        "cpu.vq_compile.u16_row_tile",
+        OperatorCapability(
+            operation="vq_compile:u16_row_tile",
+            device_types=("cpu",),
+            packed_formats=tuple(f"p{bits}" for bits in range(8, 17)),
+            code_dims=(4, 8, 16),
+            codebook_sizes=(
+                256, 512, 1024, 2048, 4096,
+                8192, 16384, 32768, 65536,
+            ),
+            activations=("none",),
+            max_top_k=1,
+            batch_sizes=(1,),
+        ),
+        _vq_compile_u16_row_tile,
+        priority=120,
     )
     registry.register(
         "cpu.packed_moe_topk.mixed.persistent_pool",

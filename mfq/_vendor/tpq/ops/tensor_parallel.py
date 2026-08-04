@@ -37,11 +37,9 @@ def _linear(
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Public linear dispatch for BF16 and compact audited block-FP8."""
-    if isinstance(weight, (BlockFP8Weight, ProjectionGroup)):
-        result = weight.matmul_T_decode_fused(value)
-    else:
-        result = F.linear(value.to(weight.dtype), weight)
-    return result if output_dtype is None else result.to(output_dtype)
+    from .api import linear
+
+    return linear(value, weight, output_dtype=output_dtype)
 
 
 def _projection_parts(weight, rows: tuple[int, ...]) -> tuple:
@@ -1256,6 +1254,492 @@ class TensorParallelGatedMLP:
             )
         state.pending_output = None
         return output
+
+
+@dataclass(frozen=True)
+class ReplicatedLinearSpec:
+    """Capability description for a small rank-local replicated Linear."""
+
+    in_features: int
+    out_features: int
+    input_dtype: torch.dtype = torch.bfloat16
+    output_dtype: torch.dtype = torch.float32
+
+
+@dataclass
+class _ReplicatedLinearLayer:
+    weights: list[object]
+    local_inputs: list[torch.Tensor]
+    outputs: list[torch.Tensor]
+    streams: list[torch.cuda.Stream]
+    events: list[torch.cuda.Event]
+    source_event: torch.cuda.Event
+    bound_input_hidden: object | None = None
+    graph_batch: object | None = None
+    graphs: list[torch.cuda.CUDAGraph] | None = None
+
+
+class TensorParallelReplicatedLinear:
+    """Run one compact Linear independently on every TP rank.
+
+    This is for small projections whose output is consumed locally before the
+    next large collective.  Replicating a compact Router avoids splitting a
+    single-token GEMV into tiny shards and removes the logits collective.
+    """
+
+    def __init__(self, devices, spec: ReplicatedLinearSpec) -> None:
+        if not devices:
+            raise ValueError("replicated linear requires at least one rank")
+        self.devices = tuple(torch.device(device) for device in devices)
+        self.spec = spec
+        self.layers: dict[int, _ReplicatedLinearLayer] = {}
+
+    def add_layer(self, layer: int, weight) -> None:
+        if layer in self.layers:
+            raise ValueError(
+                f"replicated linear layer {layer} is already registered"
+            )
+        if _weight_shape(weight) != (
+            self.spec.out_features,
+            self.spec.in_features,
+        ):
+            raise ValueError(
+                f"replicated linear layer {layer} weight shape mismatch"
+            )
+        weights: list[object] = []
+        inputs: list[torch.Tensor] = []
+        outputs: list[torch.Tensor] = []
+        streams: list[torch.cuda.Stream] = []
+        events: list[torch.cuda.Event] = []
+        for device in self.devices:
+            with torch.cuda.device(device):
+                weights.append(
+                    _row_slice(
+                        weight, 0, self.spec.out_features, device
+                    )
+                )
+                inputs.append(torch.empty(
+                    1, self.spec.in_features,
+                    dtype=self.spec.input_dtype, device=device,
+                ))
+                outputs.append(torch.empty(
+                    1, self.spec.out_features,
+                    dtype=self.spec.output_dtype, device=device,
+                ))
+                streams.append(torch.cuda.Stream(device=device))
+                events.append(torch.cuda.Event())
+        with torch.cuda.device(self.devices[0]):
+            source_event = torch.cuda.Event()
+            source_event.record(torch.cuda.current_stream(self.devices[0]))
+        self.layers[layer] = _ReplicatedLinearLayer(
+            weights, inputs, outputs, streams, events, source_event,
+        )
+
+    def bind_input_hidden(self, layer: int, hidden) -> None:
+        state = self.layers[layer]
+        if state.graph_batch is not None:
+            raise RuntimeError(
+                "replicated linear input must be bound before capture"
+            )
+        if (
+            tuple(hidden.devices) != self.devices
+            or hidden.shape != torch.Size((1, self.spec.in_features))
+            or hidden.dtype != self.spec.input_dtype
+            or hidden.ready_events is None
+        ):
+            raise ValueError("replicated linear TPHidden layout mismatch")
+        state.local_inputs = list(hidden.replicas)
+        state.bound_input_hidden = hidden
+
+    def capture(self) -> None:
+        from ..fusedext import make_tp_graph_launch_batch
+        from .api import linear
+
+        for device in self.devices:
+            torch.cuda.synchronize(device)
+        for state in self.layers.values():
+            if state.bound_input_hidden is None:
+                raise RuntimeError(
+                    "replicated linear requires a fixed TPHidden binding"
+                )
+            graphs: list[torch.cuda.CUDAGraph] = []
+            for rank, device in enumerate(self.devices):
+                stream = state.streams[rank]
+
+                def execute_rank(rank_index: int = rank) -> None:
+                    linear(
+                        state.local_inputs[rank_index],
+                        state.weights[rank_index],
+                        output=state.outputs[rank_index],
+                    )
+
+                with torch.cuda.device(device), torch.cuda.stream(stream):
+                    execute_rank()
+                    stream.synchronize()
+                    graph = torch.cuda.CUDAGraph(keep_graph=True)
+                    with torch.cuda.graph(graph, stream=stream):
+                        execute_rank()
+                    graph.instantiate()
+                    stream.synchronize()
+                    graphs.append(graph)
+                    state.events[rank].record(stream)
+            with torch.cuda.device(self.devices[0]):
+                state.graph_batch = make_tp_graph_launch_batch(
+                    [int(device.index) for device in self.devices],
+                    graphs,
+                    state.streams,
+                    state.events,
+                    state.source_event,
+                )
+                state.graphs = graphs
+
+    def output_hidden(self, layer: int):
+        from .hidden import TPHidden
+
+        state = self.layers[layer]
+        return TPHidden(
+            self.devices, tuple(state.outputs), tuple(state.events)
+        )
+
+    def run_hidden(self, layer: int, hidden):
+        state = self.layers[layer]
+        if state.graph_batch is None or state.bound_input_hidden is None:
+            raise RuntimeError("replicated linear graph is not captured")
+        if (
+            hidden.fixed_addresses
+            != state.bound_input_hidden.fixed_addresses
+            or hidden.ready_events is None
+        ):
+            raise ValueError(
+                "replicated linear input must use captured fixed addresses"
+            )
+        state.graph_batch.launch_from_events(
+            [event.cuda_event for event in hidden.ready_events]
+        )
+        return self.output_hidden(layer)
+
+
+@dataclass(frozen=True)
+class PackedMoEFinalizerSpec:
+    hidden_size: int
+    dtype: torch.dtype = torch.bfloat16
+
+
+@dataclass(frozen=True)
+class RoutePackedPlanSpec:
+    """Model-independent routing math for a packed TP expert graph."""
+
+    scoring_func: str
+    top_k: int
+    normalize: bool
+    scaling: float
+    n_group: int = 1
+    topk_group: int = 1
+
+    def normalized(self) -> "RoutePackedPlanSpec":
+        return RoutePackedPlanSpec(
+            scoring_func=self.scoring_func.strip().lower(),
+            top_k=int(self.top_k),
+            normalize=bool(self.normalize),
+            scaling=float(self.scaling),
+            n_group=int(self.n_group),
+            topk_group=int(self.topk_group),
+        )
+
+
+class TensorParallelRoutePackedPlan:
+    """Compose registered Top-K routing with all-rank packed experts.
+
+    This is a public scheduling component keyed only by routing mathematics
+    and TP capabilities.  Model runtimes provide fixed logits, correction,
+    mask and output buffers; model family names never participate in the
+    selection or execution path.
+    """
+
+    def __init__(
+        self,
+        devices,
+        spec: RoutePackedPlanSpec,
+        expert_executor,
+        logits_by_layer,
+        corrections_by_layer,
+        masks_by_layer,
+        route_buffers_by_layer,
+        *,
+        layers=None,
+    ) -> None:
+        if not devices:
+            raise ValueError("route/packed plan requires TP ranks")
+        self.devices = tuple(torch.device(device) for device in devices)
+        self.spec = spec.normalized()
+        if self.spec.top_k <= 0:
+            raise ValueError("route/packed plan top_k must be positive")
+        if self.spec.n_group <= 0 or self.spec.topk_group <= 0:
+            raise ValueError("route/packed plan groups must be positive")
+        if not hasattr(expert_executor, "compose_route_topk"):
+            raise TypeError(
+                "packed expert executor lacks route composition capability"
+            )
+        executor_devices = tuple(
+            torch.device(device)
+            for device in getattr(expert_executor, "devices", self.devices)
+        )
+        if executor_devices != self.devices:
+            raise ValueError("route/packed executor TP layout mismatch")
+        selected = (
+            tuple(sorted(int(layer) for layer in logits_by_layer))
+            if layers is None
+            else tuple(sorted({int(layer) for layer in layers}))
+        )
+        if not selected:
+            raise ValueError("route/packed plan requires at least one layer")
+        required = set(selected)
+        mappings = (
+            logits_by_layer,
+            corrections_by_layer,
+            masks_by_layer,
+            route_buffers_by_layer,
+        )
+        if any(required - set(mapping) for mapping in mappings):
+            raise ValueError("route/packed plan has incomplete layer bindings")
+        self.layers = frozenset(selected)
+        self.expert_executor = expert_executor
+        expert_executor.compose_route_topk(
+            logits_by_layer,
+            corrections_by_layer,
+            masks_by_layer,
+            route_buffers_by_layer,
+            scoring_func=self.spec.scoring_func,
+            top_k=self.spec.top_k,
+            normalize=self.spec.normalize,
+            scaling=self.spec.scaling,
+            n_group=self.spec.n_group,
+            topk_group=self.spec.topk_group,
+            layers=selected,
+        )
+
+    @property
+    def component_key(self) -> tuple:
+        """Stable public capability key used by configs and diagnostics."""
+        return (
+            "tensor_parallel_route_packed",
+            self.spec.scoring_func,
+            self.spec.top_k,
+            self.spec.normalize,
+            self.spec.n_group,
+            self.spec.topk_group,
+            len(self.devices),
+        )
+
+    def handles(self, layer: int) -> bool:
+        return int(layer) in self.layers
+
+
+@dataclass
+class _PackedMoEFinalizerLayer:
+    graph_batch: object
+    expert_contributions: tuple[torch.Tensor, ...]
+    zero_residual: object
+    routed_workspaces: list[torch.Tensor]
+    shared_workspaces: list[torch.Tensor]
+    output: object
+
+
+class TensorParallelAllRankCollective:
+    """Publish fixed FP32 Row-TP partials to every rank in one host call."""
+
+    def __init__(self, devices) -> None:
+        if not devices:
+            raise ValueError("all-rank collective requires TP ranks")
+        self.devices = tuple(torch.device(device) for device in devices)
+
+    def reduce_from_events(self, launch_batch, partials, output):
+        if (
+            tuple(partials.devices) != self.devices
+            or tuple(output.devices) != self.devices
+            or partials.shape != output.shape
+            or partials.ready_events is None
+            or output.ready_events is None
+        ):
+            raise ValueError("all-rank collective TP layout mismatch")
+        launch_batch.reduce_all_rank_many_from_events(
+            [event.cuda_event for event in partials.ready_events],
+            [list(partials.contributions)],
+            [list(output.replicas)],
+            [event.cuda_event for event in output.ready_events],
+        )
+        return output
+
+
+class ReplicatedSubgroupTensorParallel:
+    """Run one logical Row-TP operator in every contiguous subgroup.
+
+    Every visible rank participates: each subgroup owns the same logical
+    projection shards and independently publishes the same complete hidden.
+    This differs from owner-group scheduling, where only one subgroup runs a
+    layer.  Large packed operators can therefore retain full-width TP while
+    latency-bound batch-1 projections use a smaller useful shard width.
+    """
+
+    def __init__(self, devices, group_size: int) -> None:
+        self.devices = tuple(torch.device(device) for device in devices)
+        self.group_size = int(group_size)
+        if (
+            not self.devices
+            or self.group_size <= 0
+            or self.group_size > len(self.devices)
+            or len(self.devices) % self.group_size
+        ):
+            raise ValueError(
+                "replicated TP subgroup size must divide rank count"
+            )
+        self.rank_groups = tuple(
+            tuple(range(start, start + self.group_size))
+            for start in range(0, len(self.devices), self.group_size)
+        )
+
+    def group_index(self, rank: int) -> int:
+        rank = int(rank)
+        if not 0 <= rank < len(self.devices):
+            raise IndexError("TP rank is outside replicated subgroups")
+        return rank // self.group_size
+
+    def local_rank(self, rank: int) -> int:
+        return int(rank) % self.group_size
+
+    @property
+    def component_key(self) -> tuple:
+        return (
+            "replicated_subgroup_tensor_parallel",
+            len(self.devices),
+            self.group_size,
+        )
+
+    def reduce_from_events(self, partials, output):
+        """Reduce each subgroup independently into all of its local ranks."""
+        from .hidden import TPPartials, TPHidden
+
+        if not isinstance(partials, TPPartials) or not isinstance(
+            output, TPHidden
+        ):
+            raise TypeError("replicated subgroup reduction needs TP buffers")
+        if (
+            tuple(partials.devices) != self.devices
+            or tuple(output.devices) != self.devices
+            or partials.shape != output.shape
+            or output.ready_events is None
+        ):
+            raise ValueError("replicated subgroup TP layout mismatch")
+        from ..fusedext import tp_all_rank_reduce_from_events_fused
+
+        for ranks in self.rank_groups:
+            result = tp_all_rank_reduce_from_events_fused(
+                [partials.contributions[rank] for rank in ranks],
+                [partials.ready_events[rank] for rank in ranks],
+                [output.replicas[rank] for rank in ranks],
+                [output.ready_events[rank] for rank in ranks],
+            )
+            if result is None:
+                raise RuntimeError(
+                    "replicated subgroup event reduction was rejected"
+                )
+        return output
+
+
+class TensorParallelPackedMoEFinalizer:
+    """Publish packed routed + shared Row-TP partials once per layer."""
+
+    def __init__(self, devices, spec, expert_executor) -> None:
+        if not devices:
+            raise ValueError("packed MoE finalizer requires TP ranks")
+        self.devices = tuple(torch.device(device) for device in devices)
+        self.spec = spec
+        self.expert_executor = expert_executor
+        self.layers: dict[int, _PackedMoEFinalizerLayer] = {}
+
+    def add_layer(self, layer: int) -> None:
+        from .hidden import TPHidden
+
+        if layer in self.layers:
+            raise ValueError(
+                f"packed MoE finalizer layer {layer} is already registered"
+            )
+        graph_batch, contributions, _ = (
+            self.expert_executor.fixed_layer_plan(layer)
+        )
+        shape = (1, self.spec.hidden_size)
+        if any(
+            item.numel() != self.spec.hidden_size
+            for item in contributions
+        ):
+            raise ValueError(
+                "packed expert partial width does not match finalizer"
+            )
+        zero = TPHidden.empty(
+            self.devices, shape, dtype=self.spec.dtype
+        )
+        for rank, replica in enumerate(zero.replicas):
+            with torch.cuda.device(self.devices[rank]):
+                replica.zero_()
+                zero.ready_events[rank].record(
+                    torch.cuda.current_stream(self.devices[rank])
+                )
+        output = TPHidden.empty(
+            self.devices, shape, dtype=self.spec.dtype
+        )
+        routed_workspaces = []
+        shared_workspaces = []
+        for device in self.devices:
+            with torch.cuda.device(device):
+                routed_workspaces.append(torch.empty(
+                    shape, dtype=self.spec.dtype, device=device,
+                ))
+                shared_workspaces.append(torch.empty(
+                    shape, dtype=self.spec.dtype, device=device,
+                ))
+        self.layers[layer] = _PackedMoEFinalizerLayer(
+            graph_batch,
+            tuple(contributions),
+            zero,
+            routed_workspaces,
+            shared_workspaces,
+            output,
+        )
+
+    def output_hidden(self, layer: int):
+        return self.layers[layer].output
+
+    def launch_batch(self, layer: int):
+        """Expose the common all-rank scheduler, not packed internals."""
+        return self.layers[layer].graph_batch
+
+    def run_from_events(self, layer, input_events, shared_partials):
+        state = self.layers[layer]
+        if (
+            len(input_events) != len(self.devices)
+            or tuple(shared_partials.devices) != self.devices
+            or shared_partials.shape
+            != torch.Size((1, self.spec.hidden_size))
+            or state.output.ready_events is None
+            or state.zero_residual.ready_events is None
+        ):
+            raise ValueError("packed MoE finalizer TP layout mismatch")
+        state.graph_batch.launch_moe_all_rank_from_events(
+            [event.cuda_event for event in input_events],
+            list(state.expert_contributions),
+            list(shared_partials.contributions),
+            [event.cuda_event for event in shared_partials.ready_events],
+            list(state.zero_residual.replicas),
+            [
+                event.cuda_event
+                for event in state.zero_residual.ready_events
+            ],
+            state.routed_workspaces,
+            state.shared_workspaces,
+            list(state.output.replicas),
+            [event.cuda_event for event in state.output.ready_events],
+        )
+        return state.output
 
 
 @dataclass(frozen=True)
@@ -4339,14 +4823,22 @@ __all__ = [
     "MLASpec",
     "MoEPreludeSpec",
     "OwnerGroupedTensorParallel",
+    "ReplicatedSubgroupTensorParallel",
+    "PackedMoEFinalizerSpec",
+    "RoutePackedPlanSpec",
+    "ReplicatedLinearSpec",
     "RouteDownSpec",
     "RowParallelLinearSpec",
     "TensorParallelGatedMLP",
     "TensorParallelKDA",
     "TensorParallelMLA",
+    "TensorParallelAllRankCollective",
     "TensorParallelMoELayerPlan",
     "TensorParallelDecodeLayerPlan",
     "TensorParallelMoEPrelude",
+    "TensorParallelPackedMoEFinalizer",
+    "TensorParallelRoutePackedPlan",
+    "TensorParallelReplicatedLinear",
     "TensorParallelRouteDown",
     "TensorParallelRowLinear",
     "TensorParallelVocab",

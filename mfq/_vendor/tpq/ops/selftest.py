@@ -179,6 +179,40 @@ def _run_projection_layout(
     }
 
 
+def _run_dense_bf16_gemv(torch) -> dict[str, Any]:
+    """Check the registered fixed-output CUDA BF16 decode linear."""
+    from .api import dense_gemv
+
+    device = torch.device("cuda:0")
+    value = torch.randn(1, 512, dtype=torch.bfloat16, device=device)
+    weight = torch.randn(257, 512, dtype=torch.bfloat16, device=device)
+    output = torch.empty(1, 257, dtype=torch.bfloat16, device=device)
+    actual = dense_gemv(value, weight, output=output)
+    if actual is None:
+        return {
+            "layout": "dense_bf16_gemv",
+            "activation": "none",
+            "max_abs": float("inf"),
+            "mean_abs": float("inf"),
+            "finite": False,
+            "allclose": False,
+            "fixed_output": False,
+        }
+    expected = torch.nn.functional.linear(value, weight)
+    difference = (actual.float() - expected.float()).abs()
+    return {
+        "layout": "dense_bf16_gemv",
+        "activation": "none",
+        "max_abs": float(difference.max()),
+        "mean_abs": float(difference.mean()),
+        "finite": bool(torch.isfinite(actual).all()),
+        "allclose": bool(
+            torch.allclose(actual, expected, rtol=0.02, atol=0.25)
+        ),
+        "fixed_output": actual.data_ptr() == output.data_ptr(),
+    }
+
+
 def _run_hc_workspace(torch) -> dict[str, Any]:
     """Verify caller-owned HC decode buffers preserve exact results."""
     from .api import (
@@ -315,6 +349,92 @@ def _run_packed_route_slots(torch) -> dict[str, Any]:
         "mean_abs": float((output - expected).abs().float().mean()),
         "finite": True,
         "allclose": exact,
+    }
+
+
+def _run_compressed_state_update(torch) -> dict[str, Any]:
+    """Verify the public one-token compressed ring-state update."""
+    from .api import compressed_state_update
+
+    device = torch.device("cuda:0")
+    ratio = 4
+    width = 8
+    position = 2
+    projected = torch.randn(
+        1, 2 * width, dtype=torch.bfloat16, device=device
+    )
+    ape = torch.randn(
+        ratio, width, dtype=torch.bfloat16, device=device
+    )
+    ckv = torch.zeros(1, 2 * ratio, width, device=device)
+    cscore = torch.full_like(ckv, float("-inf"))
+    ok = compressed_state_update(
+        projected,
+        ape,
+        ckv,
+        cscore,
+        ratio=ratio,
+        position=position,
+        kv_rows=width,
+    )
+    torch.cuda.synchronize(device)
+    slot = ratio + position % ratio
+    actual = torch.cat((ckv[0, slot], cscore[0, slot]))
+    expected = torch.cat(
+        (
+            projected[0, :width].float(),
+            projected[0, width:].float() + ape[position % ratio].float(),
+        )
+    )
+    difference = (actual - expected).abs()
+    return {
+        "layout": "compressed_state_update",
+        "activation": "none",
+        "max_abs": float(difference.max()),
+        "mean_abs": float(difference.mean()),
+        "finite": bool(torch.isfinite(actual).all()),
+        "allclose": bool(ok and torch.equal(actual, expected)),
+    }
+
+
+def _run_head_rmsnorm_rope(torch) -> dict[str, Any]:
+    from .api import head_rmsnorm_rope
+
+    device = torch.device("cuda:0")
+    width = 512
+    rope_width = 64
+    rows = torch.randn(3, width, device=device)
+    weight = torch.randn(width, dtype=torch.bfloat16, device=device)
+    cos = torch.randn(rope_width // 2, device=device)
+    sin = torch.randn(rope_width // 2, device=device)
+    expected = rows * torch.rsqrt(
+        rows.square().mean(-1, keepdim=True) + 1e-6
+    ) * weight.float()
+    start = width - rope_width
+    first = expected[:, start::2].clone()
+    second = expected[:, start + 1::2].clone()
+    expected[:, start::2] = first * cos - second * sin
+    expected[:, start + 1::2] = first * sin + second * cos
+    actual = rows.clone()
+    ok = head_rmsnorm_rope(
+        actual,
+        weight,
+        cos,
+        sin,
+        rope_width=rope_width,
+        eps=1e-6,
+    )
+    torch.cuda.synchronize(device)
+    difference = (actual - expected).abs()
+    return {
+        "layout": "head_rmsnorm_rope",
+        "activation": "none",
+        "max_abs": float(difference.max()),
+        "mean_abs": float(difference.mean()),
+        "finite": bool(torch.isfinite(actual).all()),
+        "allclose": bool(
+            ok and torch.allclose(actual, expected, rtol=2e-5, atol=2e-5)
+        ),
     }
 
 
@@ -579,8 +699,11 @@ def projection_cuda_selftest() -> dict[str, Any]:
                 (15, 8, 32768),
             ),
         ),
+        _run_dense_bf16_gemv(torch),
         _run_hc_workspace(torch),
         _run_packed_route_slots(torch),
+        _run_compressed_state_update(torch),
+        _run_head_rmsnorm_rope(torch),
         _run_paged_mla_plan(torch, heads=64),
         _run_paged_mla_plan(torch, heads=96),
     ]
