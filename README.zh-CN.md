@@ -16,6 +16,10 @@ NINT · NVQ/NPQ · NEPQ · Gradient Precision Calibration · Expert-Wise MoE · 
   <a href="./README.md">English</a> | <strong>中文</strong>
 </p>
 
+<p align="center">
+  <a href="https://huggingface.co/Tylogi">Hugging Face 模型主页</a> · <a href="https://www.modelscope.cn/profile/Tylogi">ModelScope 模型主页</a>
+</p>
+
 **TyloQuant MFQ**（简称 **MFQ**）联合设计量化格式、精度分配与推理 kernel，面向高保真
 LLM 部署。项目支持 `0.84-8.30 bpw` 的自定义权重编码，可按计算组或 MoE 专家分配精度，
 并由 CUDA kernel 与 C++ runtime 直接执行 packed 权重。
@@ -199,5 +203,22 @@ kernel 在 GPU 上执行。Metal HTTP 服务端仍在开发中。详见
 - [Apple Silicon / Metal 开发状态](./docs/metal.md)
 - [MoE Observation 数据索引](./plan/MoE公开Observation数据索引.md)
 - [0xSero 公开资源索引](./plan/0xSero公开资源索引.md)
+
+## 致谢
+
+MFQ 得益于开源 AI 社区的优秀工作，特别感谢：
+
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)：提供 GGUF 生态、高性能推理后端与
+  评测工具，为 MFQ 的互操作和验证奠定了重要基础。
+- [oMLX](https://github.com/jundot/omlx)：其出色的 Apple Silicon 推理工程为 MFQ 提供了
+  宝贵的性能基线与设计参考。
+- [MLX](https://github.com/ml-explore/mlx)：提供 MFQ 原生 macOS 路径使用的 Apple
+  Silicon array framework 与 Metal runtime。
+- [PyTorch](https://github.com/pytorch/pytorch) 与
+  [Transformers](https://github.com/huggingface/transformers)：提供核心研究、模型接入与
+  量化基础设施。
+- [Unsloth](https://github.com/unslothai/unsloth)：公开 Dynamic 量化模型与可复现的对比基线。
+
+感谢所有维护者与贡献者，让高性能本地推理更开放、更易用。
 
 许可证：[Apache License 2.0](./LICENSE)。

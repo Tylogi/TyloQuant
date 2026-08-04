@@ -16,6 +16,10 @@ NINT · NVQ/NPQ · NEPQ · TPQ · Gradient Precision Calibration · Expert-Wise 
   <strong>English</strong> | <a href="./README.zh-CN.md">中文</a>
 </p>
 
+<p align="center">
+  <a href="https://huggingface.co/Tylogi">Hugging Face Models</a> · <a href="https://www.modelscope.cn/profile/Tylogi">ModelScope Models</a>
+</p>
+
 **TyloQuant MFQ** (or **MFQ**) co-designs quantization formats, precision
 allocation, and inference kernels for high-fidelity LLM deployment. It supports
 custom weight encodings from `0.84-8.30 bpw`, allocates precision per compute
@@ -234,5 +238,26 @@ See the [Metal development status](./docs/metal.md).
 - [Apple Silicon / Metal Development Status](./docs/metal.md)
 - [MoE Observation Data Index](./plan/MoE公开Observation数据索引.md)
 - [0xSero Public Resource Index](./plan/0xSero公开资源索引.md)
+
+## Acknowledgements
+
+MFQ benefits from the outstanding work of the open-source AI community. We
+especially thank:
+
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) for the GGUF ecosystem,
+  optimized inference backends, and evaluation tooling that underpin important
+  parts of MFQ interoperability and validation.
+- [oMLX](https://github.com/jundot/omlx) for its excellent Apple silicon
+  inference engineering and valuable performance and design references.
+- [MLX](https://github.com/ml-explore/mlx) for the Apple silicon array framework
+  and Metal runtime used by MFQ's native macOS path.
+- [PyTorch](https://github.com/pytorch/pytorch) and
+  [Transformers](https://github.com/huggingface/transformers) for core research,
+  model integration, and quantization infrastructure.
+- [Unsloth](https://github.com/unslothai/unsloth) for openly released Dynamic
+  quantization models and reproducible comparison baselines.
+
+We are grateful to their maintainers and contributors for making
+high-performance local inference more accessible.
 
 License: [Apache License 2.0](./LICENSE).
