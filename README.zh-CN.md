@@ -30,6 +30,10 @@ LLM 部署。项目支持 `0.84-8.30 bpw` 的自定义权重编码，可按计�
 
 <img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ 与 Unsloth Dynamic 在 ctx512 和 ctx2048 下的文件大小与 Mean KLD 对比" width="100%">
 
+值得注意的是，即使是最小的 `74.902 GiB` MFQ 档位也保持了很强的量化保真度：在两种
+context 长度下，其 Mean KLD 均低于图中所有已完成的 Unsloth Dynamic 结果，包括
+`127.277 GiB` 的 IQ4 档位。
+
 完整 WikiText-2 评测在两套 runtime 中使用相同的 BF16 reference logits、tokenizer、
 BOS 与 token 序列；`ctx512` 覆盖 146,115 个计分 token，`ctx2048` 覆盖 146,289 个。
 三组最接近体积的对位中，MFQ 在 `ctx512` 下将 Mean KLD 降低

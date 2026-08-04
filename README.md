@@ -38,6 +38,10 @@ and registered tiers.
 
 <img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ versus Unsloth Dynamic disk size and Mean KLD at ctx512 and ctx2048" width="100%">
 
+Notably, even the smallest `74.902 GiB` MFQ tier retains strong fidelity: at
+both context lengths, its Mean KLD is lower than every completed Unsloth Dynamic
+result shown, including the `127.277 GiB` IQ4 results.
+
 The full WikiText-2 evaluation uses identical BF16-reference logits, tokenizer,
 BOS, and token sequences for both runtimes. It covers 146,115 scored tokens at
 `ctx512` and 146,289 at `ctx2048`. Across the three closest-size pairs, MFQ
