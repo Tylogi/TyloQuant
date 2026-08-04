@@ -47,7 +47,7 @@ with their Unsloth Dynamic recipes. Lower Mean KLD and higher same-top are
 better. All plotted tiers use the complete 145-chunk evaluation of the current
 file.
 
-### DeepSeek-V4-Flash-0731: disk size vs. Mean KLD
+### DeepSeek-V4-Flash-0731
 
 <img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ versus Unsloth Dynamic disk size and Mean KLD at ctx512 and ctx2048" width="100%">
 

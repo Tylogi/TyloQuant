@@ -29,7 +29,7 @@ LLM 部署。项目支持 `0.84-8.30 bpw` 的自定义权重编码，可按计�
 完整 WikiText-2 评测包含 145 个 chunk、148,335 个计分 token，并使用同一
 BF16 参考模型。上图所示的每个匹配精度档位中，MFQ 的原始 Mean KLD 均更低。
 
-### DeepSeek-V4-Flash-0731：文件大小与 Mean KLD
+### DeepSeek-V4-Flash-0731
 
 <img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ 与 Unsloth Dynamic 在 ctx512 和 ctx2048 下的文件大小与 Mean KLD 对比" width="100%">
 
