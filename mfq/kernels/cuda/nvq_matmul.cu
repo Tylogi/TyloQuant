@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdint>
+#include <limits>
 #include <type_traits>
 
 using namespace nvcuda;
@@ -4714,8 +4715,10 @@ torch::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
         neuron_len, gs, sub_bits, format, sign_mode);
     TORCH_CHECK(n_experts > 0 && n_experts <= 4096,
                 "NVQ global expert count must be in [1,4096]");
-    TORCH_CHECK(pool_experts > 0 && pool_experts <= n_experts,
-                "NVQ pool expert count is invalid");
+    TORCH_CHECK(
+        pool_experts > 0 &&
+        pool_experts <= static_cast<int64_t>(std::numeric_limits<int>::max()),
+        "NVQ pool storage expert count must fit int32");
     TORCH_CHECK(out_per_expert > 0 &&
                 neuron_scale.numel() == pool_experts * out_per_expert,
                 "NVQ pool shape does not match the flattened row count");
@@ -4980,7 +4983,8 @@ torch::Tensor nepq_moe_grouped_matmul_pool_ws_cuda(
         "NEPQ grouped table pool shape mismatch");
     TORCH_CHECK(n_experts > 0 && n_experts <= 4096,
                 "NEPQ global expert count must be in [1,4096]");
-    TORCH_CHECK(pool_experts > 0 && pool_experts <= n_experts &&
+    TORCH_CHECK(pool_experts > 0 &&
+                pool_experts <= static_cast<int64_t>(std::numeric_limits<int>::max()) &&
                 out_per_expert > 0 &&
                 neuron_scale.numel() == pool_experts * out_per_expert,
                 "NEPQ pool shape does not match the flattened row count");
