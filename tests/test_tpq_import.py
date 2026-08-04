@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import importlib
 import json
+import struct
+from dataclasses import dataclass
+from types import SimpleNamespace
 import zlib
 from pathlib import Path
 
@@ -175,6 +178,14 @@ def test_import_projection_tpq_preserves_three_packed_projections(
             "code_dims": (2, 4, 2),
             "codebook_sizes": (512, 1024, 2048),
         }
+        assert store.man.projection_layouts(0, 1) == {
+            "gate": "g9",
+            "up": "u10",
+            "down": "d11",
+        }
+        assert store.man.projection_operator_capabilities(0) == (
+            store.man.projection_operator_capability(0),
+        )
         for expert in range(2):
             weights = store.load_expert_packed(0, expert)
             assert len(weights) == 3
@@ -353,10 +364,151 @@ def test_native_cccp_mfq_exposes_tpq_store_interface(tmp_path: Path) -> None:
         store.close()
 
     install_mfq_tpq_store(tpq)
-    from tpq import dsv4model
+    from tpq import dsv4model, kimi_model
 
     dispatched = dsv4model.CCCPStore(str(entry))
     try:
         assert isinstance(dispatched, MfqTpqStore)
     finally:
         dispatched.close()
+    kimi_dispatched = kimi_model.TPQStore(str(entry))
+    try:
+        assert isinstance(kimi_dispatched, MfqTpqStore)
+    finally:
+        kimi_dispatched.close()
+
+
+def test_tpq4_native_lifecycle_is_not_replaced_by_legacy_patch() -> None:
+    from mfq.runtime.tpq_residency_patch import apply_tpq_residency_patch
+
+    package = load_tpq_package()
+    dsv4model = importlib.import_module("tpq.dsv4model")
+    native_preload = dsv4model.DSV4TPQModel.preload
+    assert hasattr(
+        dsv4model.DSV4TPQModel,
+        "_prepare_tp_packed_finalizer",
+    )
+    apply_tpq_residency_patch()
+    assert dsv4model.DSV4TPQModel.preload is native_preload
+
+
+def test_native_tpq_mfq_reads_legacy_source_exact_fp8_pair(
+    tmp_path: Path,
+) -> None:
+    from mfq.formats.header import FileHeader
+    from mfq.formats.shards import write_blob_record_shards
+
+    @dataclass(frozen=True)
+    class BlobRecord:
+        name: str
+        dtype: str
+        path: Path
+        nbytes: int
+        offset: int = 0
+
+    @dataclass(frozen=True)
+    class BlockFP8Weight:
+        q: torch.Tensor
+        s: torch.Tensor
+        columns: int
+        block: int
+
+    def dense_blob(path: Path, value: np.ndarray) -> BlobRecord:
+        payload = (
+            struct.pack("<I", value.ndim)
+            + struct.pack(f"<{value.ndim}q", *value.shape)
+            + value.tobytes()
+        )
+        path.write_bytes(payload)
+        return BlobRecord("", "", path, len(payload))
+
+    raw = np.arange(128 * 256, dtype=np.uint8).reshape(128, 256)
+    scales = np.array([[127, 128]], dtype=np.uint8)
+    raw_record = dense_blob(tmp_path / "raw.bin", raw)
+    scale_record = dense_blob(tmp_path / "scale.bin", scales)
+    records = [
+        BlobRecord(
+            "dense.weight",
+            "F8_E4M3",
+            raw_record.path,
+            raw_record.nbytes,
+        ),
+        BlobRecord(
+            "dense.scale",
+            "F8_E8M0",
+            scale_record.path,
+            scale_record.nbytes,
+        ),
+    ]
+    output = tmp_path / "legacy-fp8.mfq"
+    manifest = {
+        "format": "cccp-1",
+        "config": {"n_experts": 0},
+        "quant": {"vq": {"x": [8, 256]}},
+        "expert_files": {},
+    }
+    write_blob_record_shards(
+        output,
+        FileHeader(
+            version=2,
+            model_arch="deepseek_v4-tpq-mfq",
+            num_tensors=2,
+            extra={
+                "source_format": "cccp-1",
+                "cccp_manifest": manifest,
+            },
+        ),
+        records,
+    )
+    package = SimpleNamespace(
+        kernels=SimpleNamespace(BlockFP8Weight=BlockFP8Weight)
+    )
+    store = MfqTpqStore(output, package)
+    try:
+        assert store.dense_names() == ["dense.weight"]
+        value = store.get_dense("dense.weight")
+        assert torch.equal(value.q, torch.from_numpy(raw))
+        torch.testing.assert_close(value.s, torch.tensor([[1.0, 2.0]]))
+        assert value.columns == 256
+        assert value.block == 128
+        assert torch.equal(
+            store.get_raw("dense.scale"), torch.from_numpy(scales)
+        )
+    finally:
+        store.close()
+
+
+def test_import_tpq4_routed_heterogeneous_projection_manifest(
+    tmp_path: Path,
+) -> None:
+    source, _expected = _projection_tpq_artifact(tmp_path / "heterogeneous")
+    manifest_path = source / "tpq.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    layouts = manifest["quant"].pop("projection_layouts")["0"]
+    manifest["quant"]["heterogeneous_expert_tiering"] = {
+        "precision_levels": {"low": layouts, "high": layouts},
+        "layer_expert_levels": {"0": ["low", "high"]},
+    }
+    manifest["routed_experts"] = {
+        "layers": 1,
+        "experts_per_layer": 2,
+        "no_expert_drop": True,
+        "layer_files": {
+            "0": {"path": manifest["expert_files"]["0"]},
+        },
+    }
+    manifest.pop("expert_files")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    output = convert(source, tmp_path / "heterogeneous.mfq")
+    package = load_tpq_package()
+    store = MfqTpqStore(output, package)
+    try:
+        assert store.man.heterogeneous_projection_vq
+        assert store.man.projection_layouts(0, 0) == layouts
+        assert store.man.projection_layouts(0, 1) == layouts
+        capabilities = store.man.projection_operator_capabilities(0)
+        assert len(capabilities) == 1
+        assert capabilities[0]["packed_formats"] == ("p9", "p10", "p11")
+    finally:
+        store.close()

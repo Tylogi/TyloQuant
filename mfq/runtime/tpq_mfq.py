@@ -45,23 +45,55 @@ class _ManifestView:
     int4_group: int
     model_family: str
     projection_vq: bool
+    heterogeneous_projection_vq: bool
     projection_layout_by_layer: dict[int, dict[str, str]]
     projection_layout_by_expert: dict[
         int, tuple[dict[str, str], ...]
     ]
     projection_layout_specs: dict[str, dict[str, Any]]
+    projection_precision_levels: dict[str, dict[str, str]]
+    projection_level_by_expert: dict[int, tuple[str, ...]]
     projection_codebook_group_sizes: dict[str, int]
     projection_codebook_group_counts: dict[str, int]
     index_packing: dict[str, str]
     no_expert_drop: bool
     routed_layers: int
     routed_experts_per_layer: int
+    dense_root: str
+    dense_files: list[str]
+    dense_file: str
+    dense_audit_file: str | None
+    expert_audit_files: dict[int, str]
+    vq_codebook_layout: dict[str, Any]
+    vq_codebook_layout_format: str | None
+    vq_codebook_group_sizes: dict[str, int]
+    vq_codebook_file: str | None
     zlib: bool = False
 
     def tier_string(self, layer: int) -> str | None:
         return self.tiers_per_layer.get(int(layer))
 
-    def projection_operator_capability(self, layer: int) -> dict[str, tuple]:
+    def projection_layouts(
+        self,
+        layer: int,
+        expert_id: int | None = None,
+    ) -> dict[str, str]:
+        layouts_by_expert = self.projection_layout_by_expert.get(int(layer))
+        if layouts_by_expert is None:
+            return self.projection_layout_by_layer[int(layer)]
+        if expert_id is None:
+            raise ValueError(
+                f"L{layer} uses heterogeneous layouts; expert_id is required"
+            )
+        if expert_id < 0 or expert_id >= len(layouts_by_expert):
+            raise IndexError(f"TPQ expert is out of range: {expert_id}")
+        return layouts_by_expert[int(expert_id)]
+
+    def projection_operator_capability(
+        self,
+        layer: int,
+        expert_id: int | None = None,
+    ) -> dict[str, tuple]:
         if not self.projection_vq:
             return {}
         formats = {"u8": "p8", "u16": "p16"}
@@ -92,29 +124,42 @@ class _ManifestView:
             return packed_format, int(dim), int(size)
 
         layouts_by_expert = self.projection_layout_by_expert.get(int(layer))
-        if layouts_by_expert is None:
+        if layouts_by_expert is not None and expert_id is None:
+            layout_names = sorted(
+                {
+                    layout
+                    for layouts in layouts_by_expert
+                    for layout in layouts.values()
+                }
+            )
             exact = tuple(
-                capability(
-                    self.projection_layout_by_layer[int(layer)], projection
-                )
+                capability({"value": layout}, "value")
+                for layout in layout_names
+            )
+        else:
+            layouts = self.projection_layouts(layer, expert_id)
+            exact = tuple(
+                capability(layouts, projection)
                 for projection in ("gate", "up", "down")
             )
-            return {
-                "packed_formats": tuple(value[0] for value in exact),
-                "code_dims": tuple(value[1] for value in exact),
-                "codebook_sizes": tuple(value[2] for value in exact),
-            }
-
-        mixed = {
-            capability(layouts, projection)
-            for layouts in layouts_by_expert
-            for projection in ("gate", "up", "down")
-        }
         return {
-            "packed_formats": tuple(sorted({value[0] for value in mixed})),
-            "code_dims": tuple(sorted({value[1] for value in mixed})),
-            "codebook_sizes": tuple(sorted({value[2] for value in mixed})),
+            "packed_formats": tuple(value[0] for value in exact),
+            "code_dims": tuple(value[1] for value in exact),
+            "codebook_sizes": tuple(value[2] for value in exact),
         }
+
+    def projection_operator_capabilities(
+        self,
+        layer: int,
+    ) -> tuple[dict[str, tuple], ...]:
+        per_expert = self.projection_layout_by_expert.get(int(layer))
+        if per_expert is None:
+            return (self.projection_operator_capability(layer),)
+        unique: dict[tuple[tuple[str, tuple], ...], dict[str, tuple]] = {}
+        for expert_id in range(len(per_expert)):
+            value = self.projection_operator_capability(layer, expert_id)
+            unique.setdefault(tuple(sorted(value.items())), value)
+        return tuple(unique.values())
 
     def projection_layout(
         self,
@@ -122,17 +167,7 @@ class _ManifestView:
         projection: str,
         expert: int | None = None,
     ) -> str:
-        layouts_by_expert = self.projection_layout_by_expert.get(int(layer))
-        if layouts_by_expert is not None:
-            if expert is None:
-                raise ValueError(
-                    f"L{layer} uses heterogeneous projection layouts; "
-                    "expert_id is required"
-                )
-            if expert < 0 or expert >= len(layouts_by_expert):
-                raise IndexError(f"TPQ expert is out of range: {expert}")
-            return layouts_by_expert[int(expert)][str(projection)]
-        return self.projection_layout_by_layer[int(layer)][str(projection)]
+        return self.projection_layouts(layer, expert)[str(projection)]
 
 
 @dataclass(frozen=True)
@@ -181,8 +216,9 @@ class NativeCCCPArtifact:
                 )
             expert_bytes = sum(
                 record.nbytes
-                for record in store.records.values()
+                for name, record in store.records.items()
                 if record.dtype == "NINTM"
+                or ".ffn.experts." in name
             )
             index_storage = {
                 str(key): int(value)
@@ -257,16 +293,67 @@ class MfqCccpStore:
             int(layer): str(value)
             for layer, value in manifest.get("tiers_per_layer", {}).items()
         }
-        expert_layers = sorted(
-            int(layer) for layer in manifest["expert_files"]
-        )
         routed_layers = (
             (manifest.get("routed_experts") or {}).get("layer_files") or {}
         )
         routed = manifest.get("routed_experts") or {}
+        expert_source = manifest.get("expert_files") or routed_layers
+        expert_layers = sorted(int(layer) for layer in expert_source)
         projection_vq = quant.get("method") == "projection-vq"
+        heterogeneous = quant.get("heterogeneous_expert_tiering") or {}
+        precision_levels = {
+            str(level): {
+                str(projection): str(layout)
+                for projection, layout in layouts.items()
+            }
+            for level, layouts in (
+                heterogeneous.get("precision_levels") or {}
+            ).items()
+        }
+        projection_level_by_expert = {
+            int(layer): tuple(str(value) for value in levels)
+            for layer, levels in (
+                heterogeneous.get("layer_expert_levels") or {}
+            ).items()
+        }
+        heterogeneous_projection_vq = bool(
+            projection_vq
+            and quant.get("layouts")
+            and precision_levels
+            and projection_level_by_expert
+        )
         projection_layout_by_expert = {}
-        if projection_vq and routed_layers:
+        if heterogeneous_projection_vq:
+            projection_layout_specs = {
+                str(name): dict(value)
+                for name, value in (quant.get("layouts") or {}).items()
+            }
+            projection_layout_by_layer = {}
+            n_experts = int(config["n_experts"])
+            for raw_layer, levels in projection_level_by_expert.items():
+                if len(levels) != n_experts:
+                    raise ValueError(
+                        f"TPQ L{raw_layer} has {len(levels)} expert layouts, "
+                        f"expected {n_experts}"
+                    )
+                unknown = sorted(set(levels).difference(precision_levels))
+                if unknown:
+                    raise ValueError(
+                        f"TPQ L{raw_layer} uses unknown precision levels: "
+                        f"{unknown[:8]}"
+                    )
+                projection_layout_by_expert[int(raw_layer)] = tuple(
+                    precision_levels[level] for level in levels
+                )
+            missing = sorted(
+                set(expert_layers).difference(projection_layout_by_expert)
+            )
+            if missing:
+                raise ValueError(
+                    "TPQ heterogeneous projection layouts are missing "
+                    f"layers: {missing[:8]}"
+                )
+        elif projection_vq and routed_layers:
             projection_layout_by_layer = {
                 int(layer): {
                     str(projection): str(layout)
@@ -293,47 +380,9 @@ class MfqCccpStore:
                     for layer, value in raw_layouts.items()
                 }
             else:
-                heterogeneous = (
-                    quant.get("heterogeneous_expert_tiering") or {}
+                raise ValueError(
+                    "TPQ projection-VQ manifest has no projection layouts"
                 )
-                precision_levels = (
-                    heterogeneous.get("precision_levels") or {}
-                )
-                layer_levels = (
-                    heterogeneous.get("layer_expert_levels") or {}
-                )
-                n_experts = int(config["n_experts"])
-                projection_layout_by_layer = {}
-                for raw_layer, raw_levels in layer_levels.items():
-                    levels = tuple(str(value) for value in raw_levels)
-                    if len(levels) != n_experts:
-                        raise ValueError(
-                            f"TPQ L{raw_layer} has {len(levels)} expert "
-                            f"layouts, expected {n_experts}"
-                        )
-                    unknown = sorted(set(levels).difference(precision_levels))
-                    if unknown:
-                        raise ValueError(
-                            f"TPQ L{raw_layer} uses unknown precision levels: "
-                            f"{unknown[:8]}"
-                        )
-                    projection_layout_by_expert[int(raw_layer)] = tuple(
-                        {
-                            projection: str(
-                                precision_levels[level][projection]
-                            )
-                            for projection in ("gate", "up", "down")
-                        }
-                        for level in levels
-                    )
-                missing = sorted(
-                    set(expert_layers).difference(projection_layout_by_expert)
-                )
-                if missing:
-                    raise ValueError(
-                        "TPQ heterogeneous projection layouts are missing "
-                        f"layers: {missing[:8]}"
-                    )
         else:
             projection_layout_by_layer = {}
             projection_layout_specs = {}
@@ -347,6 +396,32 @@ class MfqCccpStore:
                 str(name): (int(value[0]), int(value[1]))
                 for name, value in quant["vq"].items()
             }
+        dense_files = [
+            str(value)
+            for value in (
+                manifest.get("dense_files")
+                or ([manifest["dense_file"]] if manifest.get("dense_file") else [])
+            )
+        ]
+        expert_audit_files = {
+            int(layer): str(value)
+            for layer, value in manifest.get("expert_audit_files", {}).items()
+        }
+        expert_audit_files.update(
+            {
+                int(layer): str(item["audit_path"])
+                for layer, item in routed_layers.items()
+                if isinstance(item, dict) and item.get("audit_path")
+            }
+        )
+        expert_audit_files.update(
+            {
+                int(layer): str(item["audit_path"])
+                for layer, item in (manifest.get("layer_audit") or {}).items()
+                if isinstance(item, dict) and item.get("audit_path")
+            }
+        )
+        vq_codebook_layout = dict(quant.get("vq_codebook_layout") or {})
         self.man = _ManifestView(
             config=config,
             quant=quant,
@@ -359,9 +434,12 @@ class MfqCccpStore:
             int4_group=int(quant.get("int4_group", 64)),
             model_family=str(manifest.get("model_family", "")),
             projection_vq=projection_vq,
+            heterogeneous_projection_vq=heterogeneous_projection_vq,
             projection_layout_by_layer=projection_layout_by_layer,
             projection_layout_by_expert=projection_layout_by_expert,
             projection_layout_specs=projection_layout_specs,
+            projection_precision_levels=precision_levels,
+            projection_level_by_expert=projection_level_by_expert,
             projection_codebook_group_sizes={
                 name: int(value["group_size"])
                 for name, value in projection_layout_specs.items()
@@ -391,6 +469,31 @@ class MfqCccpStore:
                     config.get("n_experts", 0),
                 )
             ),
+            dense_root=self.root,
+            dense_files=dense_files,
+            dense_file=dense_files[0] if dense_files else "",
+            dense_audit_file=(
+                str(manifest["dense_audit_file"])
+                if manifest.get("dense_audit_file")
+                else None
+            ),
+            expert_audit_files=expert_audit_files,
+            vq_codebook_layout=vq_codebook_layout,
+            vq_codebook_layout_format=vq_codebook_layout.get("format"),
+            vq_codebook_group_sizes={
+                str(name): int(value)
+                for name, value in vq_codebook_layout.get(
+                    "group_size", {}
+                ).items()
+            },
+            vq_codebook_file=(
+                str(value)
+                if (
+                    value := quant.get("vq_codebook_file")
+                    or vq_codebook_layout.get("codebook_file")
+                )
+                else None
+            ),
         )
         self.cfg = config
         self._tpq = tpq
@@ -398,6 +501,14 @@ class MfqCccpStore:
             name
             for name, record in self._store.records.items()
             if record.dtype != "NINTM"
+            and not (
+                name.endswith(".scale")
+                and (
+                    weight_name := name.removesuffix(".scale") + ".weight"
+                ) in self._store.records
+                and self._store.records[weight_name].dtype == "F8_E4M3"
+                and record.dtype == "F8_E8M0"
+            )
         )
         self._layer_cache: dict[
             int, tuple[NintMoeTensor, NintMoeTensor]
@@ -510,7 +621,41 @@ class MfqCccpStore:
             array = array.copy()
         return torch.from_numpy(array)
 
+    def _legacy_fp8_array(self, name: str) -> np.ndarray:
+        """Read one source-exact FP8 record from an early TPQ-MFQ file."""
+
+        record = self._store.records[name]
+        if record.dtype not in {"F8_E4M3", "F8_E8M0"}:
+            raise TypeError(f"native TPQ record is not raw FP8: {name}")
+        blob = self._store.blob_view(record)
+        try:
+            if len(blob) < 4:
+                raise ValueError(f"truncated native TPQ FP8 payload: {name}")
+            ndim = int(struct.unpack_from("<I", blob, 0)[0])
+            shape_end = 4 + 8 * ndim
+            if ndim <= 0 or shape_end > len(blob):
+                raise ValueError(f"invalid native TPQ FP8 shape: {name}")
+            shape = tuple(
+                int(value)
+                for value in struct.unpack_from(f"<{ndim}q", blob, 4)
+            )
+            if any(value <= 0 for value in shape):
+                raise ValueError(f"invalid native TPQ FP8 shape: {name}")
+            elements = int(np.prod(shape, dtype=np.int64))
+            if shape_end + elements != len(blob):
+                raise ValueError(f"native TPQ FP8 payload size mismatch: {name}")
+            return np.frombuffer(
+                blob,
+                dtype=np.uint8,
+                count=elements,
+                offset=shape_end,
+            ).copy().reshape(shape)
+        finally:
+            blob.release()
+
     def get_raw(self, name: str) -> torch.Tensor:
+        if self._store.records[name].dtype in {"F8_E4M3", "F8_E8M0"}:
+            return self._torch_array(self._legacy_fp8_array(name))
         value = self._store[name]
         if isinstance(value, np.ndarray):
             return self._torch_array(value)
@@ -521,6 +666,35 @@ class MfqCccpStore:
         raise TypeError(f"native CCCP record is not dense: {name}")
 
     def get_dense(self, name: str):
+        record = self._store.records[name]
+        if record.dtype == "F8_E4M3" and name.endswith(".weight"):
+            scale_name = name.removesuffix(".weight") + ".scale"
+            scale_record = self._store.records.get(scale_name)
+            if scale_record is None or scale_record.dtype != "F8_E8M0":
+                raise ValueError(
+                    f"native TPQ FP8 tensor has no E8M0 scale: {name}"
+                )
+            raw = self._legacy_fp8_array(name)
+            scales = self._legacy_fp8_array(scale_name)
+            if raw.ndim != 2:
+                raise ValueError(
+                    f"native TPQ FP8 tensor is not a matrix: {name}"
+                )
+            expected_scales = (
+                (int(raw.shape[0]) + 127) // 128,
+                (int(raw.shape[1]) + 127) // 128,
+            )
+            if tuple(scales.shape) != expected_scales:
+                raise ValueError(
+                    f"native TPQ FP8 scale shape mismatch for {name}: "
+                    f"{tuple(scales.shape)} != {expected_scales}"
+                )
+            return self._tpq.kernels.BlockFP8Weight(
+                self._torch_array(raw),
+                torch.pow(2.0, self._torch_array(scales).float() - 127.0),
+                int(raw.shape[1]),
+                128,
+            )
         value = self._store[name]
         if isinstance(value, CccpInt4Tensor):
             return self._tpq.kernels.Int4Weight(
@@ -1031,9 +1205,9 @@ class MfqCccpStore:
 
 
 def install_mfq_cccp_store(tpq: ModuleType) -> None:
-    """Teach TyloQuant's DSV4 constructor to accept a native MFQ path."""
+    """Teach TPQ model constructors to accept a native MFQ path."""
 
-    from tpq import dsv4model, store
+    from tpq import dsv4model, kimi_model, store
 
     current = getattr(
         dsv4model,
@@ -1046,7 +1220,7 @@ def install_mfq_cccp_store(tpq: ModuleType) -> None:
         return
     original = current
 
-    class CCCPStoreDispatch:
+    class TPQStoreDispatch:
         _mfq_native_dispatch = True
 
         def __new__(cls, root):
@@ -1055,10 +1229,12 @@ def install_mfq_cccp_store(tpq: ModuleType) -> None:
                 return MfqCccpStore(path, tpq)
             return original(root)
 
-    dsv4model.TPQStore = CCCPStoreDispatch
-    dsv4model.CCCPStore = CCCPStoreDispatch
-    store.TPQStoreDispatch = CCCPStoreDispatch
-    store.CCCPStoreDispatch = CCCPStoreDispatch
+    dsv4model.TPQStore = TPQStoreDispatch
+    dsv4model.CCCPStore = TPQStoreDispatch
+    kimi_model.TPQStore = TPQStoreDispatch
+    kimi_model.CCCPStore = TPQStoreDispatch
+    store.TPQStoreDispatch = TPQStoreDispatch
+    store.CCCPStoreDispatch = TPQStoreDispatch
 
 
 def inspect_native_cccp(path: str | Path) -> dict[str, Any]:

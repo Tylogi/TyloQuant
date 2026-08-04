@@ -41,6 +41,7 @@ def _cgroup_reclaim_capacity() -> int | None:
 def _patch_host_residency(store) -> None:
     if getattr(store.ExpertPool.preload_all, "_mfq_cgroup_resident", False):
         return
+    original_preload_all = store.ExpertPool.preload_all
 
     def drop_dense_file_cache(self) -> None:
         _drop_file_cache(os.path.join(self.root, self.man.dense_file))
@@ -49,6 +50,13 @@ def _patch_host_residency(store) -> None:
         _drop_file_cache(os.path.join(self.root, self.man.expert_files[layer]))
 
     def preload_all(self, reserve_gb: float | None = None) -> bool:
+        root = getattr(self.store, "root", None)
+        expert_files = tuple(self.store.man.expert_files.values())
+        if root is not None and expert_files and all(
+            os.path.isfile(os.path.join(root, filename))
+            for filename in expert_files
+        ):
+            return original_preload_all(self, reserve_gb)
         if os.environ.get("TPQ_FULL_RESIDENT", "1") == "0":
             return False
         import psutil
@@ -300,6 +308,9 @@ def _patch_full_gpu_residency(store) -> None:
     store.ExpertPool.preload_gpu_all = preload_gpu_all
 
     from tpq import dsv4model
+
+    if hasattr(dsv4model.DSV4TPQModel, "_prepare_tp_packed_finalizer"):
+        return
 
     def preload(self) -> None:
         if self.device.type == "cpu":

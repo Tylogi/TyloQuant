@@ -126,7 +126,34 @@ def _projection_metadata(
     routed_layers = (
         (manifest.get("routed_experts") or {}).get("layer_files") or {}
     )
-    if routed_layers:
+    heterogeneous = quant.get("heterogeneous_expert_tiering") or {}
+    precision_levels = heterogeneous.get("precision_levels") or {}
+    layer_levels = heterogeneous.get("layer_expert_levels") or {}
+    if quant.get("layouts") and precision_levels and layer_levels:
+        n_experts = int(manifest["config"]["n_experts"])
+        assignments = {}
+        for raw_layer, raw_levels in layer_levels.items():
+            levels = tuple(str(value) for value in raw_levels)
+            if len(levels) != n_experts:
+                raise ValueError(
+                    f"TPQ projection layout L{raw_layer} has "
+                    f"{len(levels)} expert levels, expected {n_experts}"
+                )
+            unknown_levels = sorted(set(levels).difference(precision_levels))
+            if unknown_levels:
+                raise ValueError(
+                    f"TPQ projection layout L{raw_layer} uses unknown "
+                    f"precision levels: {unknown_levels[:8]}"
+                )
+            assignments[int(raw_layer)] = {
+                projection: tuple(
+                    str(precision_levels[level][projection])
+                    for level in levels
+                )
+                for projection in ("gate", "up", "down")
+            }
+        specs = quant.get("layouts") or {}
+    elif routed_layers:
         assignments = {
             int(layer): {
                 str(projection): str(layout)
@@ -146,31 +173,7 @@ def _projection_metadata(
                 for layer, value in raw_assignments.items()
             }
         else:
-            heterogeneous = quant.get("heterogeneous_expert_tiering") or {}
-            precision_levels = heterogeneous.get("precision_levels") or {}
-            layer_levels = heterogeneous.get("layer_expert_levels") or {}
-            n_experts = int(manifest["config"]["n_experts"])
             assignments = {}
-            for raw_layer, raw_levels in layer_levels.items():
-                levels = tuple(str(value) for value in raw_levels)
-                if len(levels) != n_experts:
-                    raise ValueError(
-                        f"TPQ projection layout L{raw_layer} has "
-                        f"{len(levels)} expert levels, expected {n_experts}"
-                    )
-                unknown_levels = sorted(set(levels).difference(precision_levels))
-                if unknown_levels:
-                    raise ValueError(
-                        f"TPQ projection layout L{raw_layer} uses unknown "
-                        f"precision levels: {unknown_levels[:8]}"
-                    )
-                assignments[int(raw_layer)] = {
-                    projection: tuple(
-                        str(precision_levels[level][projection])
-                        for level in levels
-                    )
-                    for projection in ("gate", "up", "down")
-                }
         specs = quant.get("layouts") or {}
     if not assignments or not specs:
         raise ValueError("TPQ projection-VQ manifest lacks layouts")

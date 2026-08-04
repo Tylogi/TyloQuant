@@ -405,8 +405,6 @@ def load_cccp_model(
             tp_size=tp_size,
         )
     elif artifact.architecture == "kimi_k3":
-        if hasattr(artifact, "path"):
-            raise ValueError("native CCCP MFQ does not yet support Kimi-K3")
         from tpq.kimi_model import KimiK3TPQModel
 
         runtime = KimiK3TPQModel(
@@ -509,19 +507,29 @@ def run_cccp_chat(
         device: str,
         vram_cache_gb: float,
         tp_size: int = 1,
+        extreme_fixed_gpu_bytes: int = 0,
     ):
-        from tpq.dsv4model import DSV4TPQModel
+        if artifact.architecture == "kimi_k3":
+            from tpq.kimi_model import KimiK3TPQModel
 
+            model_type = KimiK3TPQModel
+            architecture = "kimi_k3"
+        else:
+            from tpq.dsv4model import DSV4TPQModel
+
+            model_type = DSV4TPQModel
+            architecture = "dsv4"
         return (
-            DSV4TPQModel(
+            model_type(
                 str(artifact.path),
                 cache_gb=cache_gb,
                 max_ctx=max_ctx,
                 device=device,
                 vram_cache_gb=vram_cache_gb,
                 tp_size=tp_size,
+                extreme_fixed_gpu_bytes=extreme_fixed_gpu_bytes,
             ),
-            "dsv4",
+            architecture,
         )
 
     with _native_tokenizer_host(artifact, tokenizer_root) as host:
