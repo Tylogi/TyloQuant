@@ -239,8 +239,16 @@ constexpr const char* kHcPostSource = R"METAL(
             (row * 4u + source) * uint(HIDDEN) + feature
         ]);
     }
+    float branch_value = float(
+        branch[row * uint(HIDDEN) + feature]
+    );
+    if (ADD_BRANCH != 0) {
+        branch_value += float(
+            branch2[row * uint(HIDDEN) + feature]
+        );
+    }
     float direct = post[row * 4u + destination]
-        * float(branch[row * uint(HIDDEN) + feature]);
+        * branch_value;
     output[index] = half(direct + residual_sum);
 )METAL";
 
@@ -274,7 +282,13 @@ const mlx::core::fast::CustomKernelFunction& hc_pre_kernel() {
 const mlx::core::fast::CustomKernelFunction& hc_post_kernel() {
     static const auto kernel = make_kernel(
         "mfq_cpp_dsv4_hc_post",
-        {"branch", "residual", "post", "combination"},
+        {
+            "branch",
+            "branch2",
+            "residual",
+            "post",
+            "combination",
+        },
         {"output"},
         kHcPostSource);
     return kernel;
@@ -305,6 +319,85 @@ array float32_contiguous(const array& input) {
         result = mlx::core::astype(result, mlx::core::float32);
     }
     return mlx::core::contiguous(result);
+}
+
+array hc_post_impl(
+    const array& branch,
+    const array& branch2,
+    const array& residual,
+    const array& post,
+    const array& combination,
+    bool add_branch) {
+    auto branch_values = float16_contiguous(branch);
+    auto branch2_values = add_branch
+        ? float16_contiguous(branch2)
+        : branch_values;
+    auto residual_values = float16_contiguous(residual);
+    auto post_values = float32_contiguous(post);
+    auto combination_values =
+        float32_contiguous(combination);
+    if (branch_values.ndim() != 3 ||
+        branch_values.shape(2) <= 0 ||
+        branch2_values.shape() != branch_values.shape()) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 HC branch must have matching "
+            "[batch,tokens,hidden] shapes");
+    }
+    const int batch = branch_values.shape(0);
+    const int tokens = branch_values.shape(1);
+    const int hidden = branch_values.shape(2);
+    if (batch <= 0 || tokens <= 0 ||
+        residual_values.shape() !=
+            Shape{
+                batch,
+                tokens,
+                kConnections,
+                hidden,
+            } ||
+        post_values.shape() !=
+            Shape{batch, tokens, kConnections} ||
+        combination_values.shape() !=
+            Shape{
+                batch,
+                tokens,
+                kConnections,
+                kConnections,
+            }) {
+        throw std::invalid_argument(
+            "invalid DeepSeek-V4 HC post input");
+    }
+    const int size = checked_int(
+        static_cast<std::size_t>(batch)
+            * tokens * kConnections * hidden,
+        "output size");
+    auto outputs = hc_post_kernel()(
+        {
+            branch_values,
+            branch2_values,
+            residual_values,
+            post_values,
+            combination_values,
+        },
+        {
+            Shape{
+                batch,
+                tokens,
+                kConnections,
+                hidden,
+            },
+        },
+        {mlx::core::float16},
+        {size, 1, 1},
+        {std::min(kThreads, size), 1, 1},
+        {
+            {"SIZE", size},
+            {"HIDDEN", hidden},
+            {"ADD_BRANCH", static_cast<int>(add_branch)},
+        },
+        std::nullopt,
+        false,
+        {});
+    return std::move(outputs.front());
 }
 
 } // namespace
@@ -490,70 +583,28 @@ array deepseek_v4_hc_post(
     const array& residual,
     const array& post,
     const array& combination) {
-    auto branch_values = float16_contiguous(branch);
-    auto residual_values = float16_contiguous(residual);
-    auto post_values = float32_contiguous(post);
-    auto combination_values =
-        float32_contiguous(combination);
-    if (branch_values.ndim() != 3 ||
-        branch_values.shape(2) <= 0) {
-        throw std::invalid_argument(
-            "DeepSeek-V4 HC branch must have "
-            "[batch,tokens,hidden] shape");
-    }
-    const int batch = branch_values.shape(0);
-    const int tokens = branch_values.shape(1);
-    const int hidden = branch_values.shape(2);
-    if (batch <= 0 || tokens <= 0 ||
-        residual_values.shape() !=
-            Shape{
-                batch,
-                tokens,
-                kConnections,
-                hidden,
-            } ||
-        post_values.shape() !=
-            Shape{batch, tokens, kConnections} ||
-        combination_values.shape() !=
-            Shape{
-                batch,
-                tokens,
-                kConnections,
-                kConnections,
-            }) {
-        throw std::invalid_argument(
-            "invalid DeepSeek-V4 HC post input");
-    }
-    const int size = checked_int(
-        static_cast<std::size_t>(batch)
-            * tokens * kConnections * hidden,
-        "output size");
-    auto outputs = hc_post_kernel()(
-        {
-            branch_values,
-            residual_values,
-            post_values,
-            combination_values,
-        },
-        {
-            Shape{
-                batch,
-                tokens,
-                kConnections,
-                hidden,
-            },
-        },
-        {mlx::core::float16},
-        {size, 1, 1},
-        {std::min(kThreads, size), 1, 1},
-        {
-            {"SIZE", size},
-            {"HIDDEN", hidden},
-        },
-        std::nullopt,
-        false,
-        {});
-    return std::move(outputs.front());
+    return hc_post_impl(
+        branch,
+        branch,
+        residual,
+        post,
+        combination,
+        false);
+}
+
+array deepseek_v4_hc_post_sum(
+    const array& routed,
+    const array& shared,
+    const array& residual,
+    const array& post,
+    const array& combination) {
+    return hc_post_impl(
+        routed,
+        shared,
+        residual,
+        post,
+        combination,
+        true);
 }
 
 } // namespace mfq::metal

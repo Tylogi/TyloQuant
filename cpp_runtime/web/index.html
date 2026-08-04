@@ -322,6 +322,12 @@
             <input id="setting-exclude-reasoning" type="checkbox">
           </label>
           <label class="field compact-field">
+            <span>上下文窗口 tokens</span>
+            <input id="setting-context-window" type="number" min="512" max="32768" step="512">
+          </label>
+          <p class="field-note" id="setting-context-limit">修改后需要重载模型以重新分配 KV cache。</p>
+          <button class="secondary-button reload-model-button" id="reload-model" type="button">按此上下文重载模型</button>
+          <label class="field compact-field">
             <span>最大生成 tokens</span>
             <input id="setting-max-tokens" type="number" min="1" max="8192" step="1">
           </label>

@@ -65,3 +65,11 @@ def test_webui_uses_the_bundled_server_origin() -> None:
     assert "return location.origin;" in WEB_JS
     assert "LEGACY_LOCAL_ENDPOINT" in WEB_JS
     assert 'streamState.finishReason === "length"' in WEB_JS
+
+
+def test_webui_can_reload_model_with_a_new_context() -> None:
+    assert 'id="setting-context-window"' in WEB_HTML
+    assert 'id="reload-model"' in WEB_HTML
+    assert 'fetchJson("/api/reload"' in WEB_JS
+    assert 'server.Post("/api/reload"' in SERVER
+    assert "context_size must be within the model context capacity" in SERVER

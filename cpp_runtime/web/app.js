@@ -97,7 +97,8 @@
       "settings-panel", "settings-scrim",
       "close-settings", "setting-endpoint", "setting-api-key",
       "preset-control", "setting-system-prompt",
-      "setting-exclude-reasoning", "setting-max-tokens",
+      "setting-exclude-reasoning", "setting-context-window",
+      "setting-context-limit", "reload-model", "setting-max-tokens",
       "setting-temperature", "temperature-value", "setting-top-p",
       "top-p-value", "setting-top-k", "setting-repetition",
       "repetition-value", "setting-presence", "presence-value",
@@ -1376,7 +1377,14 @@
         payload = mergeFallbackStatus(health);
       }
       state.status = payload;
-      setConnection(true, payload.active_requests > 0 ? "生成中" : "在线");
+      setConnection(
+        true,
+        payload.reloading
+          ? "重载中"
+          : payload.active_requests > 0
+            ? "生成中"
+            : "在线"
+      );
       if (!state.models.length) await loadModels();
       updateMonitor();
     } catch (error) {
@@ -1600,6 +1608,19 @@
     refs["setting-system-prompt"].value = settings.systemPrompt;
     refs["setting-exclude-reasoning"].checked =
       settings.excludeReasoningFromContext;
+    const serverContext = Number(state.status?.max_context);
+    const contextCapacity = Number(state.status?.context_capacity);
+    const contextLimit = Number.isFinite(contextCapacity) && contextCapacity > 0
+      ? Math.floor(contextCapacity)
+      : 32768;
+    refs["setting-context-window"].max = String(contextLimit);
+    refs["setting-context-window"].value = String(
+      Number.isFinite(serverContext) && serverContext > 0
+        ? Math.min(Math.floor(serverContext), contextLimit)
+        : contextLimit
+    );
+    refs["setting-context-limit"].textContent =
+      `当前已加载 ${formatNumber(serverContext || contextLimit)}，模型上限 ${formatNumber(contextLimit)} tokens。重载会卸载当前 runtime 并重新分配 KV cache。`;
     refs["setting-max-tokens"].value = String(settings.maxTokens);
     refs["setting-temperature"].value = String(settings.temperature);
     refs["setting-top-p"].value = String(settings.topP);
@@ -1663,6 +1684,60 @@
     showToast("推理设置已应用。");
   }
 
+  async function reloadModel() {
+    if (state.generating) {
+      showToast("请先停止当前生成再重载模型。", true);
+      return;
+    }
+    const capacityValue = Number(state.status?.context_capacity);
+    const capacity = Number.isFinite(capacityValue) && capacityValue > 0
+      ? Math.floor(capacityValue)
+      : 32768;
+    const contextSize = Math.round(numberInput(
+      refs["setting-context-window"],
+      Number(state.status?.max_context) || capacity,
+      512,
+      capacity
+    ));
+    const currentContext = Number(state.status?.max_context) || 0;
+    const action = currentContext === contextSize
+      ? `以当前 ${formatNumber(contextSize)} token 上下文重新加载模型？`
+      : `将模型从 ${formatNumber(currentContext)} token 上下文重载为 ${formatNumber(contextSize)}？`;
+    if (!window.confirm(`${action}\n\n重载期间不能生成，通常需要约 1–2 分钟。`)) {
+      return;
+    }
+
+    const button = refs["reload-model"];
+    const previousLabel = button.textContent;
+    button.disabled = true;
+    button.textContent = "正在重载模型…";
+    refs["setting-context-window"].disabled = true;
+    setConnection(true, "重载中");
+    try {
+      const payload = await fetchJson("/api/reload", {
+        method: "POST",
+        body: JSON.stringify({ context_size: contextSize }),
+      });
+      state.status = {
+        ...(state.status || {}),
+        ...payload,
+        reloading: false,
+      };
+      updateMonitor();
+      populateSettings();
+      setConnection(true, "在线");
+      showToast(`模型已按 ${formatNumber(payload.max_context)} token 上下文重载。`);
+    } catch (error) {
+      setConnection(false, "重载失败");
+      showToast(error?.message || "模型重载失败", true);
+      await refreshStatus({ quiet: true });
+    } finally {
+      button.disabled = false;
+      button.textContent = previousLabel;
+      refs["setting-context-window"].disabled = false;
+    }
+  }
+
   function resetSettingsForm() {
     const endpoint = state.settings.endpoint || defaultEndpoint;
     state.settings = { ...defaultSettings, endpoint };
@@ -1719,6 +1794,7 @@
     refs["close-settings"].addEventListener("click", closeSettings);
     refs["settings-scrim"].addEventListener("click", closeSettings);
     refs["save-settings"].addEventListener("click", saveSettings);
+    refs["reload-model"].addEventListener("click", reloadModel);
     refs["reset-settings"].addEventListener("click", resetSettingsForm);
     refs["export-chat"].addEventListener("click", exportConversation);
     refs["refresh-status"].addEventListener("click", () => refreshStatus());

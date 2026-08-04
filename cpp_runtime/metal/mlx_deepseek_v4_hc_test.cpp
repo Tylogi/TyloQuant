@@ -405,6 +405,25 @@ void test_hc_pre_post() {
         expected_expanded,
         1.5e-3f,
         "HC post");
+
+    auto shared_array = branch_array * 0.25f;
+    auto fused_sum = mfq::metal::deepseek_v4_hc_post_sum(
+        branch_array,
+        shared_array,
+        residual_array,
+        actual.post,
+        actual.combination);
+    auto separate_sum = mfq::metal::deepseek_v4_hc_post(
+        branch_array + shared_array,
+        residual_array,
+        actual.post,
+        actual.combination);
+    require_close(
+        evaluated_float(std::move(fused_sum)),
+        evaluated_float(std::move(separate_sum)),
+        1.5e-3f,
+        "HC post fused branch sum");
+
 }
 
 void test_invalid_shapes() {

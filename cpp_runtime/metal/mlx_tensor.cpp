@@ -260,6 +260,13 @@ array MlxLinear::grouped_row_matmul(
             input,
             group_count);
     }
+    if (const auto* packed =
+            std::get_if<MlxMxWeight>(&weight_);
+        packed != nullptr && packed->bits() == 8) {
+        return packed->grouped_row_matmul(
+            input,
+            group_count);
+    }
     if (const auto* dense =
             std::get_if<array>(&weight_)) {
         auto source = input;
@@ -334,6 +341,10 @@ MlxLinear::grouped_weight_ref() const noexcept {
             std::get_if<MlxCccpPqWeight>(&weight_)) {
         return MlxGroupedLinearWeightRef{packed};
     }
+    if (const auto* packed =
+            std::get_if<MlxMxWeight>(&weight_)) {
+        return MlxGroupedLinearWeightRef{packed};
+    }
     return std::nullopt;
 }
 
@@ -344,6 +355,10 @@ const MlxNintWeight* MlxLinear::nint_weight_ref() const noexcept {
 const MlxNint8ZeroWeight*
 MlxLinear::nint8_zero_weight_ref() const noexcept {
     return std::get_if<MlxNint8ZeroWeight>(&weight_);
+}
+
+const MlxMxWeight* MlxLinear::mx_weight_ref() const noexcept {
+    return std::get_if<MlxMxWeight>(&weight_);
 }
 
 const array* MlxLinear::dense_weight_ref() const noexcept {

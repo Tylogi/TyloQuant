@@ -52,6 +52,21 @@ public:
         int quant_mode,
         float eps);
 
+    // Build complete compressor windows in parallel during prefill, then
+    // retain only the bounded tail state required by subsequent decode.
+    // The starting position must be ratio-aligned; callers can fall back to
+    // update() for an already-partial window.
+    void prefill(
+        const mlx::core::array& kv,
+        const mlx::core::array& gate,
+        const mlx::core::array& ape,
+        const mlx::core::array& norm,
+        int start_position,
+        const mlx::core::array& compressed_cosine,
+        const mlx::core::array& compressed_sine,
+        int quant_mode,
+        float eps);
+
     int ratio() const noexcept {
         return ratio_;
     }

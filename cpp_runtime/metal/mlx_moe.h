@@ -109,6 +109,18 @@ private:
 using MlxCccpProjectionInfo = MlxNintMoeProjectionInfo;
 using MlxCccpExpertResidency = MlxNintMoeOffloadCache;
 
+// A sorted routed-MoE row block list.  The plan is built once on the GPU and
+// shared by gate/up and down projections so every populated row block can be
+// scheduled as an independent Metal threadgroup.
+struct MlxGroupedVqMmqPlan {
+    mlx::core::array block_meta;
+    mlx::core::array block_count;
+    int max_blocks = 0;
+    int block_rows = 0;
+    int route_count = 0;
+    int experts = 0;
+};
+
 // Native packed NINTM routed-expert weight.
 //
 // NINT1-NINT8 and NINT8-0 cohorts are decoded directly by one heterogeneous
@@ -132,6 +144,18 @@ public:
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
         float limit = 0.0f) const;
+    bool supports_grouped_vq_mmq() const noexcept;
+    MlxGroupedVqMmqPlan build_grouped_vq_mmq_plan(
+        const mlx::core::array& expert_ids,
+        const mlx::core::array& route_order) const;
+    mlx::core::array routed_matmul_sorted(
+        const mlx::core::array& input,
+        const mlx::core::array& expert_ids,
+        const mlx::core::array& route_order,
+        bool input_is_sorted,
+        bool fused_swiglu = false,
+        float swiglu_limit = 0.0f,
+        const MlxGroupedVqMmqPlan* plan = nullptr) const;
     mlx::core::array operator()(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids) const {
@@ -179,6 +203,45 @@ public:
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
         const mlx::core::array& route_weights) const;
+    bool supports_grouped_vq_mmq() const noexcept {
+        return weight_.supports_grouped_vq_mmq();
+    }
+    MlxGroupedVqMmqPlan build_grouped_vq_mmq_plan(
+        const mlx::core::array& expert_ids,
+        const mlx::core::array& route_order) const {
+        return weight_.build_grouped_vq_mmq_plan(
+            expert_ids,
+            route_order);
+    }
+    mlx::core::array forward_sorted(
+        const mlx::core::array& input,
+        const mlx::core::array& expert_ids,
+        const mlx::core::array& route_order,
+        bool input_is_sorted,
+        const MlxGroupedVqMmqPlan* plan = nullptr) const {
+        return weight_.routed_matmul_sorted(
+            input,
+            expert_ids,
+            route_order,
+            input_is_sorted,
+            false,
+            0.0f,
+            plan);
+    }
+    mlx::core::array swiglu_sorted(
+        const mlx::core::array& input,
+        const mlx::core::array& expert_ids,
+        const mlx::core::array& route_order,
+        float limit = 0.0f) const {
+        return weight_.routed_matmul_sorted(
+            input,
+            expert_ids,
+            route_order,
+            false,
+            true,
+            limit,
+            nullptr);
+    }
     mlx::core::array operator()(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids) const {

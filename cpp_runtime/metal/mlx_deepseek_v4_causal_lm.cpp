@@ -707,14 +707,21 @@ array MlxDeepseekV4Layer::forward(
     detail::profile_eval(
         "layer.ffn_hc_pre_norm",
         branch);
-    branch = components_.moe(
+    auto moe_branches = components_.moe.forward_branches(
         branch,
         token_ids);
-    auto output = hc_post(
-        branch,
-        residual,
-        ffn_hc.post,
-        ffn_hc.combination);
+    auto output = config_.fast_hyper_connections()
+        ? deepseek_v4_hc_post_sum(
+              moe_branches.routed,
+              moe_branches.shared,
+              residual,
+              ffn_hc.post,
+              ffn_hc.combination)
+        : hc_post(
+              moe_branches.routed + moe_branches.shared,
+              residual,
+              ffn_hc.post,
+              ffn_hc.combination);
     detail::profile_eval(
         "layer.ffn_hc_post",
         output);
@@ -973,9 +980,10 @@ void MlxDeepseekV4CausalLm::clear_cache() noexcept {
     cache_batch_ = 0;
 }
 
-void MlxDeepseekV4CausalLm::materialize_state(
-    const MlxDeepseekV4LayerState& state) const {
-    std::vector<array> arrays{state.local_state()};
+void MlxDeepseekV4CausalLm::append_state_arrays(
+    const MlxDeepseekV4LayerState& state,
+    std::vector<array>& arrays) const {
+    arrays.push_back(state.local_state());
     const auto append_pool =
         [&](const MlxDeepseekV4PoolState& pool) {
             arrays.push_back(pool.pool());
@@ -994,6 +1002,13 @@ void MlxDeepseekV4CausalLm::materialize_state(
     if (state.indexer()) {
         append_pool(*state.indexer());
     }
+}
+
+void MlxDeepseekV4CausalLm::materialize_state(
+    const MlxDeepseekV4LayerState& state) const {
+    std::vector<array> arrays;
+    arrays.reserve(11);
+    append_state_arrays(state, arrays);
     detail::eval_with_timing(std::move(arrays));
 }
 
@@ -1045,7 +1060,8 @@ array MlxDeepseekV4CausalLm::head(
 
 array MlxDeepseekV4CausalLm::forward_chunk(
     const array& token_ids,
-    int pos0) {
+    int pos0,
+    bool full_logits) {
     if (cache_batch_ == 0 ||
         states_.size() != layers_.size() ||
         token_ids.ndim() != 2 ||
@@ -1088,12 +1104,32 @@ array MlxDeepseekV4CausalLm::forward_chunk(
             states_[index],
             pos0);
         if (bounded_prefill) {
-            detail::eval_with_timing(hidden_values);
-            materialize_state(
-                states_[index]);
+            // Hidden and cache branches share the layer projections. Submit
+            // them together so prefill needs one GPU synchronization per
+            // layer instead of separately waiting for hidden and state.
+            std::vector<array> layer_outputs{
+                hidden_values,
+            };
+            layer_outputs.reserve(12);
+            append_state_arrays(
+                states_[index],
+                layer_outputs);
+            detail::eval_with_timing(
+                std::move(layer_outputs));
         }
     }
-    auto headed = head(hidden_values);
+    auto head_input = full_logits
+        ? hidden_values
+        : mlx::core::slice(
+              hidden_values,
+              Shape{0, tokens - 1, 0, 0},
+              Shape{
+                  batch,
+                  tokens,
+                  kConnections,
+                  hidden,
+              });
+    auto headed = head(head_input);
     detail::profile_eval(
         "model.final_hc_norm",
         headed);
@@ -1172,7 +1208,7 @@ array MlxDeepseekV4CausalLm::forward(
             "DeepSeek-V4 decode exceeds max_context");
     }
     const int start = cache_position_;
-    auto logits = forward_chunk(ids, start);
+    auto logits = forward_chunk(ids, start, true);
     cache_position_ += tokens;
     return logits;
 }
@@ -1234,7 +1270,8 @@ array MlxDeepseekV4CausalLm::prefill_impl(
             Shape{batch, end});
         auto chunk = forward_chunk(
             chunk_ids,
-            start);
+            start,
+            full_logits);
         cache_position_ = end;
         if (full_logits) {
             outputs.push_back(
@@ -1387,7 +1424,16 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
         materialize_state(state);
     }
     double prefill_evaluation_ms = 0.0;
+    const bool profile_prefill =
+        detail::component_profile_requested();
+    detail::ComponentProfile prefill_component_profile;
+    const auto prefill_component_started =
+        std::chrono::steady_clock::now();
     auto logits = [&]() {
+        detail::ScopedComponentProfile component_scope(
+            profile_prefill
+                ? &prefill_component_profile
+                : nullptr);
         detail::ScopedMlxEvaluationTiming timing(
             prefill_callback
                 ? &prefill_evaluation_ms
@@ -1405,6 +1451,40 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
         }
         return value;
     }();
+    if (profile_prefill) {
+        const double wall_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now()
+                - prefill_component_started)
+                .count();
+        const double evaluated_ms =
+            prefill_component_profile.evaluated_ms();
+        std::cout
+            << "component_profile phase=prefill"
+            << " tokens=" << prompt_count
+            << " wall_ms=" << std::fixed
+            << std::setprecision(3) << wall_ms
+            << " evaluated_ms=" << evaluated_ms
+            << " unscoped_ms="
+            << std::max(0.0, wall_ms - evaluated_ms)
+            << std::endl;
+        for (const auto& [name, timing] :
+             prefill_component_profile.timings()) {
+            std::cout
+                << "component_cost phase=prefill"
+                << " name=" << name
+                << " ms=" << timing.elapsed_ms
+                << " calls=" << timing.evaluations
+                << " pct_evaluated="
+                << (
+                    evaluated_ms > 0.0
+                        ? 100.0 * timing.elapsed_ms
+                            / evaluated_ms
+                        : 0.0
+                )
+                << std::endl;
+        }
+    }
     if (prefill_callback) {
         prefill_callback(
             prompt.size(),

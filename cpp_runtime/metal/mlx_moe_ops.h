@@ -23,6 +23,20 @@ MlxMoeTopKResult moe_topk(
     float norm_floor = 1e-20f,
     float scale = 1.0f);
 
+// Decode-only DeepSeek-V4 router hot path.  Compute one FP16 dense router
+// row and normalized top-6 sqrt-softplus routing in one Metal dispatch.
+bool moe_dense_router_topk_supported(
+    const mlx::core::array& input,
+    const mlx::core::array& weight) noexcept;
+
+MlxMoeTopKResult moe_dense_router_topk(
+    const mlx::core::array& input,
+    const mlx::core::array& weight,
+    const std::optional<mlx::core::array>& bias = std::nullopt,
+    const std::optional<mlx::core::array>& available = std::nullopt,
+    float norm_floor = 1e-20f,
+    float scale = 1.0f);
+
 mlx::core::array moe_sqrtsoftplus_weights(
     const mlx::core::array& logits,
     const mlx::core::array& ids,

@@ -223,7 +223,8 @@ private:
         bool allow_empty) const;
     mlx::core::array forward_chunk(
         const mlx::core::array& token_ids,
-        int pos0);
+        int pos0,
+        bool full_logits);
     mlx::core::array prefill_impl(
         const mlx::core::array& token_ids,
         int chunk_size,
@@ -233,6 +234,9 @@ private:
         const mlx::core::array& hidden) const;
     void materialize_state(
         const MlxDeepseekV4LayerState& state) const;
+    void append_state_arrays(
+        const MlxDeepseekV4LayerState& state,
+        std::vector<mlx::core::array>& arrays) const;
 
     DeepseekV4Config config_;
     MlxEmbedding embedding_;

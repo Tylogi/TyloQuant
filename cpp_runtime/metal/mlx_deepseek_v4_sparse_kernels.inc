@@ -710,7 +710,8 @@ constexpr const char* kIndexerScoresSource = R"MFQ_METAL(
         if (key_index < uint(K)) {
             uint visible = min(
                 uint(K),
-                (uint(QUERY_OFFSET) + query + 1u) / uint(RATIO)
+                (uint(decode_params[0]) + query + 1u) /
+                    uint(decode_params[1])
             );
             out[(batch * uint(M) + query) * uint(K) + key_index] =
                 key_index < visible
@@ -722,75 +723,162 @@ constexpr const char* kIndexerScoresSource = R"MFQ_METAL(
 
 constexpr const char* kIndexerDecodeScoresSource = R"MFQ_METAL(
     constexpr uint HEADS = 64u;
-    constexpr uint HEAD_BLOCK = 32u;
     constexpr uint DIM = 128u;
-    constexpr uint DIM4 = DIM / 4u;
-    constexpr uint THREAD_COUNT = uint(THREADS);
+    constexpr uint HEADS_PER_TILE = 8u;
+    constexpr uint KEYS_PER_SIMD = 8u;
+    constexpr uint SIMD_GROUPS = 8u;
+    constexpr uint KEYS_PER_GROUP = KEYS_PER_SIMD * SIMD_GROUPS;
+    constexpr uint DIM8 = DIM / 8u;
+    constexpr uint DIM16 = DIM / 16u;
 
     uint local_thread = thread_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
     uint workgroup = threadgroup_position_in_grid.x;
-    uint key_tile = workgroup % uint(KEY_TILES);
-    uint batch = workgroup / uint(KEY_TILES);
+    uint key_tiles = uint(decode_params[4]);
+    uint key_tile = workgroup % key_tiles;
+    uint batch = workgroup / key_tiles;
     if (batch >= uint(B)) {
         return;
     }
 
-    threadgroup half query_shared[HEADS * DIM];
-    threadgroup half weight_shared[HEADS];
-    uint query_base = batch * HEADS * DIM;
-    uint weight_base = batch * HEADS;
+    uint first_group_key = key_tile * KEYS_PER_GROUP;
+    uint first_simd_key = first_group_key + simd_group * KEYS_PER_SIMD;
+
+    // This is the same layout used by llama.cpp's fused Lightning Indexer:
+    // stage 64 K rows once, then keep one transposed 128x8 K tile resident in
+    // each SIMDgroup while all 64 query heads pass over it.
+    threadgroup half4x4 key_blocks[KEYS_PER_GROUP * DIM16];
+    threadgroup half* key_shared =
+        reinterpret_cast<threadgroup half*>(key_blocks);
     for (
         uint index = local_thread;
-        index < HEADS * DIM;
-        index += THREAD_COUNT
+        index < KEYS_PER_GROUP * DIM16;
+        index += uint(THREADS)
     ) {
-        query_shared[index] = q[query_base + index];
-    }
-    if (local_thread < HEADS) {
-        weight_shared[local_thread] = weights[weight_base + local_thread];
+        uint local_key = index / DIM16;
+        uint block = index - local_key * DIM16;
+        uint key_index = first_group_key + local_key;
+        half4x4 value;
+        if (key_index < uint(decode_params[2])) {
+            const device half4x4* row =
+                reinterpret_cast<const device half4x4*>(
+                    k + (batch * uint(decode_params[3]) + key_index) * DIM
+                );
+            value = row[block];
+        } else {
+            for (uint column = 0u; column < 4u; ++column) {
+                value[column] = half4(0.0h);
+            }
+        }
+        key_blocks[index] = value;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint key_index = key_tile * THREAD_COUNT + local_thread;
-    if (key_index >= uint(K)) {
-        return;
+    metal::simdgroup_matrix<half, 8, 8> key_matrix[DIM8];
+    for (uint block = 0u; block < DIM8; ++block) {
+        simdgroup_load(
+            key_matrix[block],
+            key_shared + simd_group * KEYS_PER_SIMD * DIM + 8u * block,
+            DIM,
+            0,
+            true
+        );
     }
-    const device half4* key4 = (const device half4*)(
-        k + (batch * uint(K) + key_index) * DIM
-    );
-    const threadgroup half4* query4 =
-        (const threadgroup half4*)query_shared;
 
-    float total = 0.0f;
-    for (uint head_pass = 0u; head_pass < 2u; ++head_pass) {
-        float accumulators[HEAD_BLOCK];
-        for (uint local_head = 0u; local_head < HEAD_BLOCK; ++local_head) {
-            accumulators[local_head] = 0.0f;
-        }
-        for (uint chunk = 0u; chunk < DIM4; ++chunk) {
-            float4 key_value = float4(key4[chunk]);
-            for (uint local_head = 0u; local_head < HEAD_BLOCK; ++local_head) {
-                uint head = head_pass * HEAD_BLOCK + local_head;
-                accumulators[local_head] += metal::dot(
-                    float4(query4[head * DIM4 + chunk]),
-                    key_value
+    threadgroup half4 query4[HEADS_PER_TILE * DIM / 4u];
+    threadgroup half* query_shared =
+        reinterpret_cast<threadgroup half*>(query4);
+    threadgroup float head_weights[HEADS_PER_TILE];
+    threadgroup float score_tile[
+        SIMD_GROUPS * HEADS_PER_TILE * KEYS_PER_SIMD
+    ];
+
+    uint query_base = batch * HEADS * DIM;
+    uint weight_base = batch * HEADS;
+    float score = 0.0f;
+    for (
+        uint head_base = 0u;
+        head_base < HEADS;
+        head_base += HEADS_PER_TILE
+    ) {
+        for (
+            uint index = local_thread;
+            index < HEADS_PER_TILE * DIM / 4u;
+            index += uint(THREADS)
+        ) {
+            uint local_head = index / (DIM / 4u);
+            uint vector_index = index - local_head * (DIM / 4u);
+            const device half4* row =
+                reinterpret_cast<const device half4*>(
+                    q + query_base + (head_base + local_head) * DIM
                 );
+            query4[index] = row[vector_index];
+        }
+        if (local_thread < HEADS_PER_TILE) {
+            head_weights[local_thread] = float(
+                weights[weight_base + head_base + local_thread]
+            );
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        metal::simdgroup_matrix<float, 8, 8> product(0.0f);
+        for (uint block = 0u; block < DIM8; ++block) {
+            metal::simdgroup_matrix<half, 8, 8> query_matrix;
+            simdgroup_load(
+                query_matrix,
+                query_shared + 8u * block,
+                DIM,
+                0,
+                false
+            );
+            simdgroup_multiply_accumulate(
+                product,
+                query_matrix,
+                key_matrix[block],
+                product
+            );
+        }
+
+        threadgroup float* local_scores =
+            score_tile + simd_group * HEADS_PER_TILE * KEYS_PER_SIMD;
+        simdgroup_store(
+            product,
+            local_scores,
+            KEYS_PER_SIMD,
+            0,
+            false
+        );
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (lane < KEYS_PER_SIMD) {
+            for (
+                uint local_head = 0u;
+                local_head < HEADS_PER_TILE;
+                ++local_head
+            ) {
+                score += max(
+                    local_scores[local_head * KEYS_PER_SIMD + lane],
+                    0.0f
+                ) * head_weights[local_head];
             }
         }
-        for (uint local_head = 0u; local_head < HEAD_BLOCK; ++local_head) {
-            uint head = head_pass * HEAD_BLOCK + local_head;
-            total += max(accumulators[local_head], 0.0f)
-                * float(weight_shared[head]);
-        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    uint visible = min(
-        uint(K),
-        (uint(QUERY_OFFSET) + 1u) / uint(RATIO)
-    );
-    out[batch * uint(K) + key_index] = key_index < visible
-        ? half(total * params[0])
-        : half(-INFINITY);
+    if (lane < KEYS_PER_SIMD) {
+        uint key_index = first_simd_key + lane;
+        if (key_index < uint(decode_params[2])) {
+            uint visible = min(
+                uint(decode_params[2]),
+                (uint(decode_params[0]) + 1u) /
+                    uint(decode_params[1])
+            );
+            out[batch * uint(decode_params[3]) + key_index] = key_index < visible
+                ? half(score * params[0])
+                : half(-INFINITY);
+        }
+    }
 )MFQ_METAL";
 
 constexpr const char* kTopkHeader = R"MFQ_METAL(
@@ -808,14 +896,12 @@ constexpr const char* kTopkSource = R"MFQ_METAL(
     constexpr uint SIMD_GROUPS = THREADS / 32u;
     uint row = threadgroup_position_in_grid.x;
     uint tid = thread_index_in_threadgroup;
-    if (row >= uint(ROWS)) {
-        return;
-    }
-    uint input_base = row * uint(K);
+    uint active_k = uint(max(topk_params[0], 0));
+    uint input_base = row * uint(topk_params[1]);
     uint output_base = row * TOPK;
-    if (uint(K) <= TOPK) {
+    if (active_k <= TOPK) {
         for (uint index = tid; index < TOPK; index += THREADS) {
-            out[output_base + index] = index < uint(K) ? int(index) : 0;
+            out[output_base + index] = index < active_k ? int(index) : 0;
         }
         return;
     }
@@ -835,7 +921,7 @@ constexpr const char* kTopkSource = R"MFQ_METAL(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint index = tid; index < uint(K); index += THREADS) {
+    for (uint index = tid; index < active_k; index += THREADS) {
         uint key = mfq_dsv4_ordered_half(x[input_base + index]);
         atomic_fetch_add_explicit(
             &histogram[key >> 8u], 1u, memory_order_relaxed
@@ -867,7 +953,7 @@ constexpr const char* kTopkSource = R"MFQ_METAL(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint threshold_high = state[0];
-    for (uint index = tid; index < uint(K); index += THREADS) {
+    for (uint index = tid; index < active_k; index += THREADS) {
         uint key = mfq_dsv4_ordered_half(x[input_base + index]);
         if ((key >> 8u) == threshold_high) {
             atomic_fetch_add_explicit(
@@ -902,9 +988,9 @@ constexpr const char* kTopkSource = R"MFQ_METAL(
 
     uint threshold = state[2];
     if (DETERMINISTIC == 0) {
-        for (uint base = 0u; base < uint(K); base += THREADS) {
+        for (uint base = 0u; base < active_k; base += THREADS) {
             uint index = base + tid;
-            if (index < uint(K)) {
+            if (index < active_k) {
                 uint key = mfq_dsv4_ordered_half(x[input_base + index]);
                 if (key > threshold) {
                     uint position = atomic_fetch_add_explicit(
@@ -931,9 +1017,9 @@ constexpr const char* kTopkSource = R"MFQ_METAL(
     threadgroup uint tie_partials[SIMD_GROUPS];
     uint simd_group = simdgroup_index_in_threadgroup;
     uint lane = thread_index_in_simdgroup;
-    uint segment = (uint(K) + THREADS - 1u) / THREADS;
+    uint segment = (active_k + THREADS - 1u) / THREADS;
     uint segment_begin = tid * segment;
-    uint segment_end = min(segment_begin + segment, uint(K));
+    uint segment_end = min(segment_begin + segment, active_k);
     uint local_greater = 0u;
     uint local_ties = 0u;
     for (uint index = segment_begin; index < segment_end; ++index) {

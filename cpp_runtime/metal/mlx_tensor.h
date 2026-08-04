@@ -60,6 +60,7 @@ public:
     grouped_weight_ref() const noexcept;
     const MlxNintWeight* nint_weight_ref() const noexcept;
     const MlxNint8ZeroWeight* nint8_zero_weight_ref() const noexcept;
+    const MlxMxWeight* mx_weight_ref() const noexcept;
     const mlx::core::array* dense_weight_ref() const noexcept;
 
 private:

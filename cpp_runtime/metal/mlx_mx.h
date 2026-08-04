@@ -22,11 +22,29 @@ public:
     mlx::core::array embedding(
         const mlx::core::array& token_ids,
         mlx::core::Dtype dtype = mlx::core::float16) const;
+    mlx::core::array grouped_row_matmul(
+        const mlx::core::array& input,
+        int group_count) const;
+    mlx::core::array grouped_row_matmul_inverse_rope(
+        const mlx::core::array& input,
+        int group_count,
+        const mlx::core::array& cosine,
+        const mlx::core::array& sine,
+        int head_dimension,
+        int rotary_dimension) const;
 
     int bits() const noexcept { return bits_; }
     int input_size() const noexcept { return input_size_; }
     int output_size() const noexcept { return output_size_; }
     std::size_t packed_nbytes() const noexcept;
+
+    // Read-only packed storage used by fused/grouped Metal kernels.
+    const mlx::core::array& packed_values() const noexcept {
+        return values_;
+    }
+    const mlx::core::array& block_scales() const noexcept {
+        return scales_;
+    }
 
 private:
     MlxMxWeight(

@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <mlx/mlx.h>
 
@@ -17,6 +18,13 @@ namespace mfq::metal {
 
 struct MlxDeepseekV4MoeResult {
     mlx::core::array output;
+    mlx::core::array expert_ids;
+    mlx::core::array expert_weights;
+};
+
+struct MlxDeepseekV4MoeBranches {
+    mlx::core::array routed;
+    mlx::core::array shared;
     mlx::core::array expert_ids;
     mlx::core::array expert_weights;
 };
@@ -54,6 +62,12 @@ public:
         const mlx::core::array& input,
         const mlx::core::array& token_ids) const;
 
+    // Preserve routed and shared branches so the following HC expansion can
+    // consume their sum directly without materializing an intermediate.
+    MlxDeepseekV4MoeBranches forward_branches(
+        const mlx::core::array& input,
+        const mlx::core::array& token_ids) const;
+
     mlx::core::array forward(
         const mlx::core::array& input,
         const mlx::core::array& token_ids) const;
@@ -65,7 +79,8 @@ public:
     }
 
     bool uses_grouped_shared_projection() const noexcept {
-        return grouped_projections_.has_value();
+        return grouped_projections_.has_value()
+            || grouped_shared_gate_up_.has_value();
     }
     bool uses_streamed_experts() const noexcept {
         return static_cast<bool>(expert_offload_);
@@ -88,8 +103,10 @@ private:
         std::optional<mlx::core::array> token_experts,
         std::optional<mlx::core::array> available);
 
-    std::array<mlx::core::array, 3> project_shared(
-        const mlx::core::array& input) const;
+    std::vector<mlx::core::array> project_shared(
+        const mlx::core::array& input,
+        float swiglu_limit,
+        bool project_router) const;
 
     DeepseekV4Config config_;
     MlxLinear router_;
@@ -103,6 +120,10 @@ private:
     std::string streamed_gate_up_name_;
     std::string streamed_down_name_;
     std::optional<MlxGroupedLinear> grouped_projections_;
+    std::optional<MlxGroupedLinear>
+        grouped_shared_gate_up_;
+    bool fused_shared_swiglu_ = true;
+    bool fused_dense_router_ = true;
     std::optional<mlx::core::array> router_bias_;
     std::optional<mlx::core::array> token_experts_;
     mlx::core::array available_;

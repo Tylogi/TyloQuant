@@ -1,8 +1,14 @@
 #include "mlx_deepseek_v4_sparse.h"
+#include "mfq_nintm_prefill_embedded.h"
+
+#include <mlx/backend/metal/device.h>
+#include <mlx/primitives.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <optional>
@@ -23,10 +29,284 @@ using Kernel = mlx::core::fast::CustomKernelFunction;
 using TemplateArgs = std::vector<
     std::pair<std::string, mlx::core::fast::TemplateArg>>;
 
+class Dsv4CacheWrite final : public mlx::core::UnaryPrimitive {
+public:
+    explicit Dsv4CacheWrite(mlx::core::Stream stream)
+        : UnaryPrimitive(stream) {}
+
+    void eval_cpu(
+        const std::vector<array>& inputs,
+        array& output) override {
+        const auto& cache = inputs.at(0);
+        const auto& values = inputs.at(1);
+        const auto& rows = inputs.at(2);
+        output.set_data(
+            mlx::core::allocator::malloc(output.nbytes()));
+        std::memcpy(
+            output.data<char>(),
+            cache.data<char>(),
+            cache.nbytes());
+        const auto item_size = cache.itemsize();
+        const int batch = cache.shape(0);
+        const int capacity = cache.shape(1);
+        const int dimension = cache.shape(2);
+        const int updates = values.shape(1);
+        const auto* row_values = rows.data<std::int32_t>();
+        const auto* source = values.data<char>();
+        auto* destination = output.data<char>();
+        for (int b = 0; b < batch; ++b) {
+            for (int u = 0; u < updates; ++u) {
+                const int row = row_values[b * updates + u];
+                if (row < 0 || row >= capacity) {
+                    continue;
+                }
+                const auto source_offset =
+                    static_cast<std::size_t>(
+                        (b * updates + u) * dimension) *
+                    item_size;
+                const auto destination_offset =
+                    static_cast<std::size_t>(
+                        (b * capacity + row) * dimension) *
+                    item_size;
+                std::memcpy(
+                    destination + destination_offset,
+                    source + source_offset,
+                    static_cast<std::size_t>(dimension) * item_size);
+            }
+        }
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        array& output) override {
+        const auto& cache = inputs.at(0);
+        const auto& values = inputs.at(1);
+        const auto& rows = inputs.at(2);
+
+        // Deliberately preserve the fixed cache allocation. The Metal command
+        // encoder sees this resource as an output and inserts a hazard barrier
+        // after any earlier reader before the row write is dispatched.
+        output.copy_shared_buffer(cache);
+
+        const bool half = cache.dtype() == mlx::core::float16;
+        const std::string kernel_name = half
+            ? "mfq_dsv4_cache_write_f16"
+            : "mfq_dsv4_cache_write_f32";
+        auto& selected_stream = stream();
+        auto& device = mlx::core::metal::device(
+            selected_stream.device);
+        auto* library = device.get_library(
+            "mfq_dsv4_cache_write",
+            [] {
+                return std::string(R"MFQ_METAL(
+#include <metal_stdlib>
+using namespace metal;
+
+template <typename T>
+kernel void mfq_dsv4_cache_write(
+    device T* cache [[buffer(0)]],
+    device const T* values [[buffer(1)]],
+    device const int* rows [[buffer(2)]],
+    constant uint& batch [[buffer(3)]],
+    constant uint& updates [[buffer(4)]],
+    constant uint& capacity [[buffer(5)]],
+    constant uint& dimension [[buffer(6)]],
+    uint thread_id [[thread_position_in_grid]]) {
+    if (thread_id >= batch * dimension) {
+        return;
+    }
+    const uint b = thread_id / dimension;
+    const uint d = thread_id - b * dimension;
+    for (uint update = 0u; update < updates; ++update) {
+        const int row = rows[b * updates + update];
+        if (row >= 0 && uint(row) < capacity) {
+            cache[(b * capacity + uint(row)) * dimension + d] =
+                values[(b * updates + update) * dimension + d];
+        }
+    }
+}
+
+template [[host_name("mfq_dsv4_cache_write_f16")]]
+kernel decltype(mfq_dsv4_cache_write<half>)
+    mfq_dsv4_cache_write<half>;
+template [[host_name("mfq_dsv4_cache_write_f32")]]
+kernel decltype(mfq_dsv4_cache_write<float>)
+    mfq_dsv4_cache_write<float>;
+)MFQ_METAL");
+            });
+        auto* kernel = device.get_kernel(
+            kernel_name,
+            library);
+        auto& encoder = mlx::core::metal::get_command_encoder(
+            selected_stream);
+        encoder.set_compute_pipeline_state(kernel);
+        encoder.set_output_array(output, 0);
+        encoder.set_input_array(values, 1);
+        encoder.set_input_array(rows, 2);
+        const std::uint32_t batch = cache.shape(0);
+        const std::uint32_t updates = values.shape(1);
+        const std::uint32_t capacity = cache.shape(1);
+        const std::uint32_t dimension = cache.shape(2);
+        encoder.set_bytes(batch, 3);
+        encoder.set_bytes(updates, 4);
+        encoder.set_bytes(capacity, 5);
+        encoder.set_bytes(dimension, 6);
+        const auto threads = batch * dimension;
+        encoder.dispatch_threads(
+            MTL::Size(threads, 1, 1),
+            MTL::Size(
+                std::min<std::uint32_t>(threads, 256),
+                1,
+                1));
+    }
+
+    const char* name() const override {
+        return "Dsv4CacheWrite";
+    }
+
+    bool is_equivalent(
+        const mlx::core::Primitive&) const override {
+        return true;
+    }
+
+    std::vector<Shape> output_shapes(
+        const std::vector<array>& inputs) override {
+        return {inputs.at(0).shape()};
+    }
+};
+
 constexpr int kIndexerHeads = 64;
 constexpr int kIndexerDimension = 128;
 constexpr int kAttentionHeads = 64;
 constexpr int kAttentionDimension = 512;
+
+struct Dsv4SparsePrefillParams {
+    std::int32_t batch = 0;
+    std::int32_t queries = 0;
+    std::int32_t keys = 0;
+    std::int32_t selected = 0;
+    float scale = 0.0f;
+};
+
+class Dsv4SparsePrefillPrimitive final
+    : public mlx::core::UnaryPrimitive {
+public:
+    Dsv4SparsePrefillPrimitive(
+        mlx::core::Stream stream,
+        Dsv4SparsePrefillParams params)
+        : UnaryPrimitive(stream),
+          params_(params) {}
+
+    void eval_cpu(
+        const std::vector<array>&,
+        array&) override {
+        throw std::runtime_error(
+            "Steel DSV4 sparse prefill has no CPU path");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        array& output) override {
+        if (inputs.size() != 5) {
+            throw std::logic_error(
+                "Steel DSV4 sparse prefill input count mismatch");
+        }
+        output.set_data(
+            mlx::core::allocator::malloc(output.nbytes()));
+        auto& selected_stream = stream();
+        auto& device = mlx::core::metal::device(
+            selected_stream.device);
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            "mfq_dsv4_sparse_prefill_v1",
+            options,
+            [] {
+                std::string source;
+                source.reserve(
+                    sizeof(detail::kSteelAttentionSource)
+                    + sizeof(detail::kDsv4SparsePrefillSource)
+                    + 160);
+                source += "#include <metal_stdlib>\n";
+                source += "#include <metal_simdgroup>\n";
+                source += "#include <metal_simdgroup_matrix>\n";
+                source += "using namespace metal;\n";
+                source += "using bfloat16_t = bfloat;\n";
+                source += detail::kSteelAttentionSource;
+                source += detail::kDsv4SparsePrefillSource;
+                return source;
+            });
+        auto* kernel = device.get_kernel(
+            "mfq_dsv4_sparse_prefill_f16_bk256_dc32",
+            library);
+        auto& encoder =
+            mlx::core::metal::get_command_encoder(
+                selected_stream);
+        encoder.set_compute_pipeline_state(kernel);
+        for (int index = 0; index < 5; ++index) {
+            encoder.set_input_array(
+                inputs[static_cast<std::size_t>(index)],
+                index);
+        }
+        encoder.set_output_array(output, 5);
+        encoder.set_bytes(params_, 6);
+        encoder.dispatch_threadgroups(
+            MTL::Size(params_.queries, params_.batch, 1),
+            MTL::Size(32, 8, 1));
+    }
+
+    const char* name() const override {
+        return "Dsv4SparsePrefillPrimitive";
+    }
+
+    bool is_equivalent(
+        const mlx::core::Primitive& other) const override {
+        const auto* primitive = dynamic_cast<
+            const Dsv4SparsePrefillPrimitive*>(&other);
+        return primitive != nullptr
+            && primitive->params_.batch == params_.batch
+            && primitive->params_.queries == params_.queries
+            && primitive->params_.keys == params_.keys
+            && primitive->params_.selected == params_.selected
+            && primitive->params_.scale == params_.scale;
+    }
+
+    std::vector<Shape> output_shapes(
+        const std::vector<array>&) override {
+        return {Shape{
+            params_.batch,
+            params_.queries,
+            kAttentionHeads,
+            kAttentionDimension,
+        }};
+    }
+
+private:
+    Dsv4SparsePrefillParams params_;
+};
+
+array dsv4_sparse_prefill_steel(
+    std::vector<array> inputs,
+    Dsv4SparsePrefillParams params) {
+    auto stream = mlx::core::default_stream(
+        mlx::core::default_device());
+    if (stream.device != mlx::core::Device::gpu) {
+        throw std::invalid_argument(
+            "Steel DSV4 sparse prefill requires Metal");
+    }
+    return array(
+        Shape{
+            params.batch,
+            params.queries,
+            kAttentionHeads,
+            kAttentionDimension,
+        },
+        mlx::core::float16,
+        std::make_shared<Dsv4SparsePrefillPrimitive>(
+            stream,
+            params),
+        std::move(inputs));
+}
 
 #include "mlx_deepseek_v4_sparse_kernels.inc"
 
@@ -113,7 +393,7 @@ const Kernel& decode_pool_step_kernel() {
 const Kernel& indexer_scores_kernel() {
     static const auto kernel = make_kernel(
         "mfq_cpp_dsv4_indexer_scores",
-        {"q", "k", "weights", "params"},
+        {"q", "k", "weights", "params", "decode_params"},
         {"out"},
         kIndexerScoresSource);
     return kernel;
@@ -122,7 +402,7 @@ const Kernel& indexer_scores_kernel() {
 const Kernel& indexer_decode_scores_kernel() {
     static const auto kernel = make_kernel(
         "mfq_cpp_dsv4_indexer_decode_scores",
-        {"q", "k", "weights", "params"},
+        {"q", "k", "weights", "params", "decode_params"},
         {"out"},
         kIndexerDecodeScoresSource);
     return kernel;
@@ -131,7 +411,7 @@ const Kernel& indexer_decode_scores_kernel() {
 const Kernel& topk_kernel() {
     static const auto kernel = make_kernel(
         "mfq_cpp_dsv4_topk512",
-        {"x"},
+        {"x", "topk_params"},
         {"out"},
         kTopkSource,
         kTopkHeader);
@@ -317,6 +597,54 @@ TemplateArgs decode_compressor_templates(
 }
 
 } // namespace
+
+array dsv4_cache_write_inplace(
+    const array& cache,
+    const array& values,
+    const array& rows) {
+    if (cache.ndim() != 3 ||
+        cache.shape(0) <= 0 ||
+        cache.shape(1) <= 0 ||
+        cache.shape(2) <= 0 ||
+        !cache.flags().row_contiguous ||
+        (cache.dtype() != mlx::core::float16 &&
+         cache.dtype() != mlx::core::float32)) {
+        throw std::invalid_argument(
+            "DSV4 fixed cache must be row-contiguous f16/f32 [B,C,D]");
+    }
+    auto update_values = typed_contiguous(
+        values,
+        cache.dtype());
+    auto update_rows = typed_contiguous(
+        rows,
+        mlx::core::int32);
+    if (update_values.ndim() != 3 ||
+        update_values.shape(0) != cache.shape(0) ||
+        update_values.shape(1) <= 0 ||
+        update_values.shape(2) != cache.shape(2) ||
+        update_rows.shape() != Shape{
+            cache.shape(0),
+            update_values.shape(1),
+        }) {
+        throw std::invalid_argument(
+            "DSV4 fixed cache update expects values [B,U,D] and rows [B,U]");
+    }
+    auto stream = mlx::core::default_stream(
+        mlx::core::default_device());
+    if (stream.device != mlx::core::Device::gpu) {
+        throw std::invalid_argument(
+            "DSV4 fixed cache update requires the Metal device");
+    }
+    return array(
+        cache.shape(),
+        cache.dtype(),
+        std::make_shared<Dsv4CacheWrite>(stream),
+        std::vector<array>{
+            cache,
+            std::move(update_values),
+            std::move(update_rows),
+        });
+}
 
 array dsv4_fp4_sim(const array& input) {
     auto source = typed_contiguous(
@@ -701,43 +1029,12 @@ MlxDsv4PoolUpdate dsv4_decode_pool_update(
         throw std::invalid_argument(
             "invalid DSV4 decode pool update input");
     }
-    const int capacity = pool_values.shape(1);
-    const auto zero = array(0, mlx::core::int32);
-    const auto last = array(
-        capacity - 1,
-        mlx::core::int32);
-    auto safe_rows = mlx::core::minimum(
-        mlx::core::maximum(
-            step.emit_rows,
-            zero),
-        last);
-    auto row_indices = mlx::core::broadcast_to(
-        mlx::core::reshape(
-            safe_rows,
-            Shape{batch, 1, 1}),
-        Shape{batch, 1, head_dim});
-    auto existing = mlx::core::take_along_axis(
+    auto next_pool = dsv4_cache_write_inplace(
         pool_values,
-        row_indices,
-        1);
-    auto valid = mlx::core::logical_and(
-        mlx::core::greater_equal(
-            step.emit_rows,
-            zero),
-        mlx::core::less(
-            step.emit_rows,
-            array(capacity, mlx::core::int32)));
-    auto replacement = mlx::core::where(
-        mlx::core::reshape(
-            valid,
-            Shape{batch, 1, 1}),
         step.emitted,
-        existing);
-    auto next_pool = mlx::core::put_along_axis(
-        pool_values,
-        row_indices,
-        replacement,
-        1);
+        mlx::core::reshape(
+            step.emit_rows,
+            Shape{batch, 1}));
     return {
         std::move(next_pool),
         std::move(step.state_kv),
@@ -752,7 +1049,8 @@ array dsv4_indexer_scores_decode(
     const array& k,
     const array& weights,
     int query_offset,
-    int ratio) {
+    int ratio,
+    int score_count) {
     auto query = typed_contiguous(
         q,
         mlx::core::float16);
@@ -775,15 +1073,22 @@ array dsv4_indexer_scores_decode(
         head_weights.shape() !=
             Shape{query.shape(0), 1, kIndexerHeads} ||
         query_offset < 0 ||
-        ratio <= 0) {
+        ratio <= 0 ||
+        score_count == 0 ||
+        score_count < -1 ||
+        score_count > key.shape(1)) {
         throw std::invalid_argument(
             "DSV4 decode indexer score shape mismatch");
     }
     const int batch = query.shape(0);
-    const int keys = key.shape(1);
-    constexpr int threads = 128;
+    const int key_capacity = key.shape(1);
+    const int keys = score_count < 0
+        ? key_capacity
+        : score_count;
+    constexpr int threads = 256;
+    constexpr int keys_per_group = 64;
     const int key_tiles =
-        (keys + threads - 1) / threads;
+        (keys + keys_per_group - 1) / keys_per_group;
     const int groups = checked_product(
         {batch, key_tiles},
         "decode indexer group count");
@@ -796,24 +1101,30 @@ array dsv4_indexer_scores_decode(
             static_cast<float>(
                 kIndexerDimension * kIndexerHeads));
     const array params({scale}, mlx::core::float32);
+    const array decode_params(
+        {
+            query_offset,
+            ratio,
+            keys,
+            key_capacity,
+            key_tiles,
+        },
+        mlx::core::int32);
     auto outputs = indexer_decode_scores_kernel()(
         {
             query,
             key,
             head_weights,
             params,
+            decode_params,
         },
-        {Shape{batch, 1, keys}},
+        {Shape{batch, 1, key_capacity}},
         {mlx::core::float16},
         {grid, 1, 1},
         {threads, 1, 1},
         {
             {"B", batch},
-            {"K", keys},
-            {"KEY_TILES", key_tiles},
             {"THREADS", threads},
-            {"QUERY_OFFSET", query_offset},
-            {"RATIO", ratio},
         },
         std::nullopt,
         false,
@@ -880,12 +1191,16 @@ array dsv4_indexer_scores(
             static_cast<float>(
                 kIndexerDimension * kIndexerHeads));
     const array params({scale}, mlx::core::float32);
+    const array decode_params(
+        {query_offset, ratio},
+        mlx::core::int32);
     auto outputs = indexer_scores_kernel()(
         {
             query,
             key,
             head_weights,
             params,
+            decode_params,
         },
         {Shape{batch, queries, keys}},
         {mlx::core::float16},
@@ -896,8 +1211,6 @@ array dsv4_indexer_scores(
             {"M", queries},
             {"K", keys},
             {"KEY_TILES", key_tiles},
-            {"QUERY_OFFSET", query_offset},
-            {"RATIO", ratio},
         },
         std::nullopt,
         false,
@@ -907,35 +1220,43 @@ array dsv4_indexer_scores(
 
 array dsv4_topk512(
     const array& scores,
-    bool deterministic) {
+    bool deterministic,
+    int valid_keys) {
     auto source = typed_contiguous(
         scores,
         mlx::core::float16);
     if (source.ndim() != 3 ||
         source.shape(0) <= 0 ||
         source.shape(1) <= 0 ||
-        source.shape(2) <= 0) {
+        source.shape(2) <= 0 ||
+        valid_keys == 0 ||
+        valid_keys < -1 ||
+        valid_keys > source.shape(2)) {
         throw std::invalid_argument(
             "DSV4 top-k expects f16 [B,M,K]");
     }
     const int batch = source.shape(0);
     const int queries = source.shape(1);
     const int keys = source.shape(2);
+    const int active_keys = valid_keys < 0
+        ? keys
+        : valid_keys;
     const int rows = checked_product(
         {batch, queries},
         "top-k row count");
     const int grid = checked_product(
         {rows, 1024},
         "top-k grid");
+    const array topk_params(
+        {active_keys, keys},
+        mlx::core::int32);
     auto outputs = topk_kernel()(
-        {source},
+        {source, topk_params},
         {Shape{batch, queries, 512}},
         {mlx::core::int32},
         {grid, 1, 1},
         {1024, 1, 1},
         {
-            {"ROWS", rows},
-            {"K", keys},
             {
                 "DETERMINISTIC",
                 static_cast<int>(deterministic),
@@ -1158,28 +1479,24 @@ array attention_dsv4_sparse(
         auto half_query = typed_contiguous(
             q,
             mlx::core::float16);
-        const int grid = checked_product(
-            {batch, queries, 256},
-            "sparse prefill attention grid");
-        auto outputs =
-            sparse_attention_prefill_mma_kernel()(
-                {
-                    half_query,
-                    cache,
-                    selected_indices,
-                    selected_mask,
-                    sink_logits,
-                    params,
-                },
-                {output_shape},
-                {mlx::core::float32},
-                {grid, 1, 1},
-                {256, 1, 1},
-                templates,
-                std::nullopt,
-                false,
-                {});
-        return std::move(outputs.front());
+        auto half_sinks = typed_contiguous(
+            sinks,
+            mlx::core::float16);
+        return dsv4_sparse_prefill_steel(
+            {
+                std::move(half_query),
+                cache,
+                selected_indices,
+                selected_mask,
+                std::move(half_sinks),
+            },
+            Dsv4SparsePrefillParams{
+                .batch = batch,
+                .queries = queries,
+                .keys = max_seq,
+                .selected = selected,
+                .scale = selected_scale,
+            });
     }
     if (queries == 1) {
         const int grid = checked_product(

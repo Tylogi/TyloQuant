@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -52,6 +53,7 @@ struct Arguments {
     std::string host = "127.0.0.1";
     int port = 8080;
     std::int64_t context_size = 32768;
+    int prefill_chunk_size = 2048;
     std::optional<double> expert_cache_gb;
     std::string model_name;
     std::string api_key;
@@ -145,6 +147,16 @@ Arguments parse_arguments(int argc, char** argv) {
                 usage_error("--ctx-size must be positive");
             }
             result.context_size = parsed;
+        } else if (value == "--prefill-chunk-size") {
+            const auto parsed = std::stoll(
+                require_value("--prefill-chunk-size"));
+            if (parsed <= 0 ||
+                parsed > std::numeric_limits<int>::max()) {
+                usage_error(
+                    "--prefill-chunk-size must be a positive integer");
+            }
+            result.prefill_chunk_size =
+                static_cast<int>(parsed);
         } else if (value == "--moe-gpu-cache-gb") {
             const auto text =
                 require_value(value.c_str());
@@ -200,6 +212,7 @@ void print_help() {
         << "  --host ADDRESS         server bind address (default 127.0.0.1)\n"
         << "  --port PORT            server port (default 8080)\n"
         << "  --ctx-size TOKENS      runtime/API context limit (default 32768)\n"
+        << "  --prefill-chunk-size N maximum prompt chunk (default 2048)\n"
         << "  --moe-gpu-cache-gb N   bounded disk-backed NINTM expert cache\n"
         << "                          default: full unified-memory residency\n"
         << "  --model-name NAME      API model name (default MFQ filename)\n"
@@ -269,7 +282,8 @@ std::int32_t generate_with_prefill_metrics(
     const mfq::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
     const MfqTokenCallback& callback,
-    const MfqPrefillCallback& on_prefill) {
+    const MfqPrefillCallback& on_prefill,
+    int) {
     return runtime.generate(
         prompt,
         sampling,
@@ -284,22 +298,24 @@ std::int32_t generate_with_prefill_metrics(
     const mfq::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
     const MfqTokenCallback& callback,
-    const MfqPrefillCallback& on_prefill) {
+    const MfqPrefillCallback& on_prefill,
+    int prefill_chunk_size) {
     return runtime.generate(
         prompt,
         sampling,
         max_tokens,
         callback,
         std::nullopt,
-        512,
+        prefill_chunk_size,
         on_prefill);
 }
 
-template <typename Runtime>
+template <typename Runtime, typename Loader>
 int serve_loaded_runtime(
     const Arguments& arguments,
     const mfq::metal::MfqContainer& container,
-    Runtime& runtime,
+    Runtime runtime,
+    Loader load_runtime,
     std::string model_type,
     std::int64_t maximum_context,
     std::int64_t vocabulary_size,
@@ -330,16 +346,27 @@ int serve_loaded_runtime(
     server.max_context = std::min<std::int64_t>(
         arguments.context_size,
         maximum_context);
+    server.context_capacity = maximum_context;
     server.vocab_size = vocabulary_size;
 
-    std::mutex runtime_mutex;
+    auto runtime_mutex = std::make_shared<std::mutex>();
+    auto runtime_holder =
+        std::make_shared<std::optional<Runtime>>(
+            std::move(runtime));
+    auto loaded_context =
+        std::make_shared<std::int64_t>(server.max_context);
     const MfqGenerateFn generate =
-        [&, runtime_stream](
+        [runtime_mutex, runtime_holder, runtime_stream,
+         prefill_chunk_size = arguments.prefill_chunk_size](
             const std::vector<std::int64_t>& prompt,
             const MfqSamplingParams& sampling,
             const MfqTokenCallback& callback,
             const MfqPrefillCallback& on_prefill) {
-            std::lock_guard<std::mutex> lock(runtime_mutex);
+            std::lock_guard<std::mutex> lock(*runtime_mutex);
+            if (!runtime_holder->has_value()) {
+                throw std::runtime_error(
+                    "model runtime is unavailable after a failed reload");
+            }
             mlx::core::set_default_device(
                 mlx::core::Device::gpu);
             mlx::core::set_default_stream(runtime_stream);
@@ -355,14 +382,68 @@ int serve_loaded_runtime(
                 sampling.repetition_penalty;
             parameters.seed = sampling.seed;
             return generate_with_prefill_metrics(
-                runtime,
+                runtime_holder->value(),
                 prompt,
                 parameters,
                 sampling.max_tokens,
                 callback,
-                on_prefill);
+                on_prefill,
+                prefill_chunk_size);
         };
-    return run_mfq_server(server, generate);
+    const MfqReloadFn reload =
+        [runtime_mutex, runtime_holder, loaded_context,
+         load_runtime, runtime_stream](
+            std::int64_t requested_context) mutable {
+            std::lock_guard<std::mutex> lock(*runtime_mutex);
+            mlx::core::set_default_device(
+                mlx::core::Device::gpu);
+            mlx::core::set_default_stream(runtime_stream);
+            mlx::core::synchronize();
+
+            const auto previous_context = *loaded_context;
+            runtime_holder->reset();
+            release_model_load_staging_memory();
+            const auto started =
+                std::chrono::steady_clock::now();
+            std::cout
+                << "Reloading native Metal model with context="
+                << requested_context << "..." << std::endl;
+            try {
+                runtime_holder->emplace(
+                    load_runtime(requested_context));
+                release_model_load_staging_memory();
+                *loaded_context = requested_context;
+                const auto seconds =
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() -
+                        started).count();
+                std::cout
+                    << "Reloaded native Metal model in "
+                    << seconds << " s context="
+                    << requested_context << std::endl;
+                return requested_context;
+            } catch (const std::exception& reload_error) {
+                const std::string message = reload_error.what();
+                std::cerr
+                    << "Model reload failed; restoring context="
+                    << previous_context << std::endl;
+                try {
+                    runtime_holder->emplace(
+                        load_runtime(previous_context));
+                    release_model_load_staging_memory();
+                    *loaded_context = previous_context;
+                } catch (const std::exception& restore_error) {
+                    throw std::runtime_error(
+                        "model reload failed: " + message +
+                        "; restoring the previous model also failed: " +
+                        restore_error.what());
+                }
+                throw std::runtime_error(
+                    "model reload failed and the previous model was "
+                    "restored: " + message);
+            }
+        };
+    return run_mfq_server(server, generate, reload);
 }
 
 int run_native_server(
@@ -442,10 +523,26 @@ int run_native_server(
             std::cout << " nintm_load=full-resident";
         }
         std::cout << std::endl;
+        const auto load_runtime =
+            [&container, expert_cache_bytes](
+                std::int64_t requested_context) {
+                if (requested_context < 1 ||
+                    requested_context >
+                        std::numeric_limits<int>::max()) {
+                    throw std::invalid_argument(
+                        "Metal runtime context is out of range");
+                }
+                return mfq::metal::
+                    MlxDeepseekV4CausalLm::load(
+                        container,
+                        static_cast<int>(requested_context),
+                        expert_cache_bytes);
+            };
         return serve_loaded_runtime(
             arguments,
             container,
-            runtime,
+            std::move(runtime),
+            load_runtime,
             config.model_type,
             config.max_position_embeddings,
             config.vocab,
@@ -468,10 +565,16 @@ int run_native_server(
         << " Qwen3.5 layers in "
         << load_seconds << " s"
         << std::endl;
+    const auto load_runtime =
+        [&container](std::int64_t) {
+            return mfq::metal::
+                MlxQwen35CausalLm::load(container);
+        };
     return serve_loaded_runtime(
         arguments,
         container,
-        runtime,
+        std::move(runtime),
+        load_runtime,
         config.text_model_type.empty()
             ? config.model_type
             : config.text_model_type,

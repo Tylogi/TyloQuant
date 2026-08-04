@@ -3,6 +3,7 @@
 #include <mlx/allocator.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -45,6 +46,7 @@ constexpr int kQ8ScaleOffset = 4;
 constexpr int kFamilyVq = 2;
 constexpr int kFamilyCccpInt4 = 3;
 constexpr int kFamilyCccpPq = 4;
+constexpr int kFamilyMx = 5;
 
 struct DirectProjectionLayout {
     int family = kFamilyNint;
@@ -138,6 +140,91 @@ inline uint mfq_grouped_vq_read_bits(
         | (uint(stream[byte_index + 2u]) << 16);
     return (packed >> shift)
         & ((1u << bits) - 1u);
+}
+
+inline float mfq_grouped_mx_e8m0(uchar raw) {
+    if (raw == 255u) {
+        return NAN;
+    }
+    uint bits = raw == 0u ? 0x00400000u : uint(raw) << 23u;
+    return as_type<float>(bits);
+}
+
+inline float mfq_grouped_mx_fp4(uchar raw) {
+    uchar magnitude = raw & 7u;
+    float value = magnitude == 0u ? 0.0f
+        : (magnitude == 1u ? 0.5f
+        : (magnitude == 2u ? 1.0f
+        : (magnitude == 3u ? 1.5f
+        : (magnitude == 4u ? 2.0f
+        : (magnitude == 5u ? 3.0f
+        : (magnitude == 6u ? 4.0f : 6.0f))))));
+    return (raw & 8u) == 0u ? value : -value;
+}
+
+constant ushort mfq_grouped_mx_fp8_half_lut[256] = {
+    0x0000u, 0x1800u, 0x1c00u, 0x1e00u, 0x2000u, 0x2100u, 0x2200u, 0x2300u,
+    0x2400u, 0x2480u, 0x2500u, 0x2580u, 0x2600u, 0x2680u, 0x2700u, 0x2780u,
+    0x2800u, 0x2880u, 0x2900u, 0x2980u, 0x2a00u, 0x2a80u, 0x2b00u, 0x2b80u,
+    0x2c00u, 0x2c80u, 0x2d00u, 0x2d80u, 0x2e00u, 0x2e80u, 0x2f00u, 0x2f80u,
+    0x3000u, 0x3080u, 0x3100u, 0x3180u, 0x3200u, 0x3280u, 0x3300u, 0x3380u,
+    0x3400u, 0x3480u, 0x3500u, 0x3580u, 0x3600u, 0x3680u, 0x3700u, 0x3780u,
+    0x3800u, 0x3880u, 0x3900u, 0x3980u, 0x3a00u, 0x3a80u, 0x3b00u, 0x3b80u,
+    0x3c00u, 0x3c80u, 0x3d00u, 0x3d80u, 0x3e00u, 0x3e80u, 0x3f00u, 0x3f80u,
+    0x4000u, 0x4080u, 0x4100u, 0x4180u, 0x4200u, 0x4280u, 0x4300u, 0x4380u,
+    0x4400u, 0x4480u, 0x4500u, 0x4580u, 0x4600u, 0x4680u, 0x4700u, 0x4780u,
+    0x4800u, 0x4880u, 0x4900u, 0x4980u, 0x4a00u, 0x4a80u, 0x4b00u, 0x4b80u,
+    0x4c00u, 0x4c80u, 0x4d00u, 0x4d80u, 0x4e00u, 0x4e80u, 0x4f00u, 0x4f80u,
+    0x5000u, 0x5080u, 0x5100u, 0x5180u, 0x5200u, 0x5280u, 0x5300u, 0x5380u,
+    0x5400u, 0x5480u, 0x5500u, 0x5580u, 0x5600u, 0x5680u, 0x5700u, 0x5780u,
+    0x5800u, 0x5880u, 0x5900u, 0x5980u, 0x5a00u, 0x5a80u, 0x5b00u, 0x5b80u,
+    0x5c00u, 0x5c80u, 0x5d00u, 0x5d80u, 0x5e00u, 0x5e80u, 0x5f00u, 0x7e00u,
+    0x8000u, 0x9800u, 0x9c00u, 0x9e00u, 0xa000u, 0xa100u, 0xa200u, 0xa300u,
+    0xa400u, 0xa480u, 0xa500u, 0xa580u, 0xa600u, 0xa680u, 0xa700u, 0xa780u,
+    0xa800u, 0xa880u, 0xa900u, 0xa980u, 0xaa00u, 0xaa80u, 0xab00u, 0xab80u,
+    0xac00u, 0xac80u, 0xad00u, 0xad80u, 0xae00u, 0xae80u, 0xaf00u, 0xaf80u,
+    0xb000u, 0xb080u, 0xb100u, 0xb180u, 0xb200u, 0xb280u, 0xb300u, 0xb380u,
+    0xb400u, 0xb480u, 0xb500u, 0xb580u, 0xb600u, 0xb680u, 0xb700u, 0xb780u,
+    0xb800u, 0xb880u, 0xb900u, 0xb980u, 0xba00u, 0xba80u, 0xbb00u, 0xbb80u,
+    0xbc00u, 0xbc80u, 0xbd00u, 0xbd80u, 0xbe00u, 0xbe80u, 0xbf00u, 0xbf80u,
+    0xc000u, 0xc080u, 0xc100u, 0xc180u, 0xc200u, 0xc280u, 0xc300u, 0xc380u,
+    0xc400u, 0xc480u, 0xc500u, 0xc580u, 0xc600u, 0xc680u, 0xc700u, 0xc780u,
+    0xc800u, 0xc880u, 0xc900u, 0xc980u, 0xca00u, 0xca80u, 0xcb00u, 0xcb80u,
+    0xcc00u, 0xcc80u, 0xcd00u, 0xcd80u, 0xce00u, 0xce80u, 0xcf00u, 0xcf80u,
+    0xd000u, 0xd080u, 0xd100u, 0xd180u, 0xd200u, 0xd280u, 0xd300u, 0xd380u,
+    0xd400u, 0xd480u, 0xd500u, 0xd580u, 0xd600u, 0xd680u, 0xd700u, 0xd780u,
+    0xd800u, 0xd880u, 0xd900u, 0xd980u, 0xda00u, 0xda80u, 0xdb00u, 0xdb80u,
+    0xdc00u, 0xdc80u, 0xdd00u, 0xdd80u, 0xde00u, 0xde80u, 0xdf00u, 0xfe00u,
+};
+
+inline float mfq_grouped_mx_fp8(uchar raw) {
+    return float(as_type<half>(
+        mfq_grouped_mx_fp8_half_lut[uint(raw)]));
+}
+
+template <typename ValueStream, typename ScaleStream>
+inline float mfq_grouped_mx_weight(
+    ValueStream values,
+    ScaleStream scales,
+    uint output,
+    uint column,
+    uint bits,
+    uint width
+) {
+    if (bits == 4u) {
+        uchar packed = values[output * (width / 2u) + (column >> 1u)];
+        uchar code = (column & 1u) == 0u
+            ? packed & 15u
+            : packed >> 4u;
+        uchar scale = scales[output * (width / 32u) + column / 32u];
+        return mfq_grouped_mx_fp4(code)
+            * mfq_grouped_mx_e8m0(scale);
+    }
+    uchar code = values[output * width + column];
+    uchar scale = scales[
+        (output / 128u) * (width / 128u) + column / 128u];
+    return mfq_grouped_mx_fp8(code)
+        * mfq_grouped_mx_e8m0(scale);
 }
 
 template <
@@ -492,6 +579,8 @@ std::string direct_kernel_key(
             layout.family == kFamilyCccpPq
         ) {
             key += "cpq";
+        } else if (layout.family == kFamilyMx) {
+            key += "mx" + std::to_string(layout.bits);
         } else if (layout.q5_execution) {
             key += "n5x";
         } else {
@@ -541,6 +630,24 @@ bool supports_single_row_nint_fast_path(
         }
     }
     return true;
+}
+
+bool supports_single_row_mxfp8_fast_path(
+    const std::vector<DirectProjectionLayout>& layouts) noexcept {
+    if (layouts.size() < 2 || layouts.size() > 14) {
+        return false;
+    }
+    bool found_mxfp8 = false;
+    for (const auto& layout : layouts) {
+        if (layout.family == kFamilyMx && layout.bits == 8) {
+            found_mxfp8 = true;
+            continue;
+        }
+        if (layout.family != kFamilyNint8Zero) {
+            return false;
+        }
+    }
+    return found_mxfp8;
 }
 
 std::string single_row_nint_kernel_key(
@@ -596,6 +703,11 @@ std::vector<std::string> direct_input_names(
                 "cccp_i4_packed_" + suffix);
             names.push_back(
                 "cccp_i4_scales_" + suffix);
+        } else if (
+            layouts[projection].family == kFamilyMx
+        ) {
+            names.push_back("mx_values_" + suffix);
+            names.push_back("mx_scales_" + suffix);
         } else {
             names.push_back(
                 "cccp_pq_indices_" + suffix);
@@ -795,6 +907,16 @@ std::string make_direct_source(
                 + "_GS)]);\n"
                 "                weight ="
                 " float(int(quantized) - 8) * scale;\n";
+        } else if (
+            layouts[projection].family == kFamilyMx
+        ) {
+            source +=
+                "                weight = mfq_grouped_mx_weight(\n"
+                "                    mx_values_" + suffix + ",\n"
+                "                    mx_scales_" + suffix + ",\n"
+                "                    output, column,\n"
+                "                    uint(P" + suffix + "_BITS),\n"
+                "                    uint(K));\n";
         } else {
             source +=
                 "                uint block ="
@@ -879,7 +1001,8 @@ mlx::core::fast::CustomKernelFunction direct_kernel(
 }
 
 std::string make_single_row_nint_source(
-    const std::vector<DirectProjectionLayout>& layouts) {
+    const std::vector<DirectProjectionLayout>& layouts,
+    bool fused_swiglu) {
     std::string source = R"METAL(
     constexpr uint ROWS_PER_SIMD = 4u;
     constexpr uint ROWS_PER_TG = 8u;
@@ -1089,40 +1212,68 @@ std::string make_single_row_nint_source(
     }
     source += "    }\n";
 
-    for (
-        std::size_t projection = 0;
-        projection < layouts.size();
-        ++projection
-    ) {
-        const auto suffix = std::to_string(projection);
-        source +=
-            "    if (active_" + suffix + ") {\n"
-            "        for (uint row = 0u;"
-            " row < ROWS_PER_SIMD; ++row) {\n"
-            "            float total ="
-            " simd_sum(accumulators_" + suffix + "[row]);\n"
-            "            uint output = output_base + row;\n"
-            "            if (lane == 0u"
-            " && output < uint(P" + suffix + "_OUT)) {\n"
-            "                y[uint(P" + suffix
-            + "_OUT_OFFSET) + output] = T(total);\n"
-            "            }\n"
-            "        }\n"
-            "    }\n";
+    if (fused_swiglu) {
+        source += R"METAL(
+    if (active_0 && active_1) {
+        for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+            float gate = simd_sum(accumulators_0[row]);
+            float up = simd_sum(accumulators_1[row]);
+            uint output = output_base + row;
+            if (lane == 0u && output < uint(P0_OUT)) {
+                gate = float(T(gate));
+                up = float(T(up));
+                if (params[0] > 0.0f) {
+                    gate = min(gate, params[0]);
+                    up = clamp(up, -params[0], params[0]);
+                }
+                float activated = gate / (1.0f + exp(-gate));
+                y[output] = T(activated * up);
+            }
+        }
+    }
+)METAL";
+    } else {
+        for (
+            std::size_t projection = 0;
+            projection < layouts.size();
+            ++projection
+        ) {
+            const auto suffix = std::to_string(projection);
+            source +=
+                "    if (active_" + suffix + ") {\n"
+                "        for (uint row = 0u;"
+                " row < ROWS_PER_SIMD; ++row) {\n"
+                "            float total ="
+                " simd_sum(accumulators_" + suffix + "[row]);\n"
+                "            uint output = output_base + row;\n"
+                "            if (lane == 0u"
+                " && output < uint(P" + suffix + "_OUT)) {\n"
+                "                y[uint(P" + suffix
+                + "_OUT_OFFSET) + output] = T(total);\n"
+                "            }\n"
+                "        }\n"
+                "    }\n";
+        }
     }
     return source;
 }
 
 mlx::core::fast::CustomKernelFunction make_single_row_nint_kernel(
-    const std::vector<DirectProjectionLayout>& layouts) {
+    const std::vector<DirectProjectionLayout>& layouts,
+    bool fused_swiglu) {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
     const auto key = single_row_nint_kernel_key(layouts);
+    auto inputs = direct_input_names(layouts);
+    if (fused_swiglu) {
+        inputs.emplace_back("params");
+    }
     return mlx::core::fast::metal_kernel(
-        "mfq_cpp_single_row_grouped_nint_" + key,
-        direct_input_names(layouts),
+        "mfq_cpp_single_row_grouped_nint_" + key
+            + (fused_swiglu ? "_swiglu" : ""),
+        std::move(inputs),
         {"y"},
-        make_single_row_nint_source(layouts),
+        make_single_row_nint_source(layouts, fused_swiglu),
         "",
         true,
         false,
@@ -1130,19 +1281,266 @@ mlx::core::fast::CustomKernelFunction make_single_row_nint_kernel(
 }
 
 mlx::core::fast::CustomKernelFunction single_row_nint_kernel(
-    const std::vector<DirectProjectionLayout>& layouts) {
+    const std::vector<DirectProjectionLayout>& layouts,
+    bool fused_swiglu = false) {
     static std::mutex mutex;
     static std::unordered_map<
         std::string,
         mlx::core::fast::CustomKernelFunction> kernels;
 
-    const auto key = single_row_nint_kernel_key(layouts);
+    const auto key = single_row_nint_kernel_key(layouts)
+        + (fused_swiglu ? "_swiglu" : "");
     std::lock_guard<std::mutex> lock(mutex);
     const auto found = kernels.find(key);
     if (found != kernels.end()) {
         return found->second;
     }
-    auto kernel = make_single_row_nint_kernel(layouts);
+    auto kernel = make_single_row_nint_kernel(
+        layouts,
+        fused_swiglu);
+    kernels.emplace(key, kernel);
+    return kernel;
+}
+
+std::string make_single_row_mxfp8_source(
+    const std::vector<DirectProjectionLayout>& layouts) {
+    std::string source = R"METAL(
+    constexpr uint SIMD_GROUPS = 4u;
+    constexpr uint K_LANES = 8u;
+    constexpr uint ROWS_PER_SIMD = 32u / K_LANES;
+    constexpr uint ROWS_PER_TG = SIMD_GROUPS * ROWS_PER_SIMD;
+    constexpr uint MX_BLOCK = 128u;
+    constexpr uint MX_BLOCKS = uint(K) / MX_BLOCK;
+    constexpr uint Q8_GROUP = 32u;
+    constexpr uint Q8_GROUPS_PER_MX = MX_BLOCK / Q8_GROUP;
+
+    threadgroup half fp8_lut[256];
+    uint local_thread = thread_index_in_threadgroup;
+    fp8_lut[local_thread] = as_type<half>(
+        mfq_grouped_mx_fp8_half_lut[local_thread]);
+    fp8_lut[local_thread + 128u] = as_type<half>(
+        mfq_grouped_mx_fp8_half_lut[local_thread + 128u]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint k_lane = lane & (K_LANES - 1u);
+    uint simd_row = lane / K_LANES;
+    uint output_index =
+        threadgroup_position_in_grid.x * ROWS_PER_TG
+        + simd_group * ROWS_PER_SIMD + simd_row;
+)METAL";
+
+    for (
+        std::size_t projection = 0;
+        projection < layouts.size();
+        ++projection
+    ) {
+        const auto suffix = std::to_string(projection);
+        source +=
+            "    bool active_" + suffix
+            + " = output_index < uint(P" + suffix + "_OUT);\n"
+            "    uint output_" + suffix + " = min(\n"
+            "        output_index, uint(P" + suffix + "_OUT) - 1u);\n"
+            "    float accumulator_" + suffix + " = 0.0f;\n";
+    }
+
+    source += R"METAL(
+    for (
+        uint block = k_lane;
+        block < MX_BLOCKS;
+        block += K_LANES
+    ) {
+        uint column_base = block * MX_BLOCK;
+)METAL";
+    for (
+        std::size_t projection = 0;
+        projection < layouts.size();
+        ++projection
+    ) {
+        if (layouts[projection].family == kFamilyMx) {
+            source +=
+                "        float mx_dot_" + std::to_string(projection)
+                + " = 0.0f;\n";
+        }
+    }
+
+    source += R"METAL(
+        for (
+            uint q8_local = 0u;
+            q8_local < Q8_GROUPS_PER_MX;
+            ++q8_local
+        ) {
+)METAL";
+    for (
+        std::size_t projection = 0;
+        projection < layouts.size();
+        ++projection
+    ) {
+        if (layouts[projection].family == kFamilyNint8Zero) {
+            source +=
+                "            float q8_dot_" + std::to_string(projection)
+                + " = 0.0f;\n";
+        }
+    }
+
+    source += R"METAL(
+            uint q8_column_base =
+                column_base + q8_local * Q8_GROUP;
+            for (uint element = 0u; element < Q8_GROUP; element += 4u) {
+                uint column = q8_column_base + element;
+                half4 activation = *(device const half4*)(x + column);
+)METAL";
+    for (
+        std::size_t projection = 0;
+        projection < layouts.size();
+        ++projection
+    ) {
+        const auto suffix = std::to_string(projection);
+        if (layouts[projection].family == kFamilyMx) {
+            source +=
+                "                if (active_" + suffix + ") {\n"
+                "                    uint value_offset = output_" + suffix
+                + " * uint(K) + column;\n"
+                "                    uchar4 code = *(device const uchar4*)(\n"
+                "                        mx_values_" + suffix
+                + " + value_offset);\n"
+                "                    mx_dot_" + suffix + " = fma(\n"
+                "                        float(activation.x),\n"
+                "                        float(fp8_lut[uint(code.x)]),\n"
+                "                        mx_dot_" + suffix + ");\n"
+                "                    mx_dot_" + suffix + " = fma(\n"
+                "                        float(activation.y),\n"
+                "                        float(fp8_lut[uint(code.y)]),\n"
+                "                        mx_dot_" + suffix + ");\n"
+                "                    mx_dot_" + suffix + " = fma(\n"
+                "                        float(activation.z),\n"
+                "                        float(fp8_lut[uint(code.z)]),\n"
+                "                        mx_dot_" + suffix + ");\n"
+                "                    mx_dot_" + suffix + " = fma(\n"
+                "                        float(activation.w),\n"
+                "                        float(fp8_lut[uint(code.w)]),\n"
+                "                        mx_dot_" + suffix + ");\n"
+                "                }\n";
+        } else {
+            source +=
+                "                if (active_" + suffix + ") {\n"
+                "                    uint value_offset = output_" + suffix
+                + " * uint(K) + column;\n"
+                "                    char4 quantized = *(device const char4*)(\n"
+                "                        q8_q_" + suffix
+                + " + value_offset);\n"
+                "                    q8_dot_" + suffix + " = fma(\n"
+                "                        float(activation.x),\n"
+                "                        float(quantized.x),\n"
+                "                        q8_dot_" + suffix + ");\n"
+                "                    q8_dot_" + suffix + " = fma(\n"
+                "                        float(activation.y),\n"
+                "                        float(quantized.y),\n"
+                "                        q8_dot_" + suffix + ");\n"
+                "                    q8_dot_" + suffix + " = fma(\n"
+                "                        float(activation.z),\n"
+                "                        float(quantized.z),\n"
+                "                        q8_dot_" + suffix + ");\n"
+                "                    q8_dot_" + suffix + " = fma(\n"
+                "                        float(activation.w),\n"
+                "                        float(quantized.w),\n"
+                "                        q8_dot_" + suffix + ");\n"
+                "                }\n";
+        }
+    }
+
+    source += "            }\n";
+    for (
+        std::size_t projection = 0;
+        projection < layouts.size();
+        ++projection
+    ) {
+        if (layouts[projection].family != kFamilyNint8Zero) {
+            continue;
+        }
+        const auto suffix = std::to_string(projection);
+        source +=
+            "            if (active_" + suffix + ") {\n"
+            "                uint group = block * Q8_GROUPS_PER_MX"
+            " + q8_local;\n"
+            "                float scale = float(q8_scales_" + suffix
+            + "[output_" + suffix + " * uint(P" + suffix
+            + "_NG) + group]);\n"
+            "                accumulator_" + suffix + " = fma(\n"
+            "                    scale, q8_dot_" + suffix + ",\n"
+            "                    accumulator_" + suffix + ");\n"
+            "            }\n";
+    }
+    source += "        }\n";
+    for (
+        std::size_t projection = 0;
+        projection < layouts.size();
+        ++projection
+    ) {
+        if (layouts[projection].family != kFamilyMx) {
+            continue;
+        }
+        const auto suffix = std::to_string(projection);
+        source +=
+            "        if (active_" + suffix + ") {\n"
+            "            uint scale_offset =\n"
+            "                (output_" + suffix
+            + " / MX_BLOCK) * MX_BLOCKS + block;\n"
+            "            accumulator_" + suffix + " = fma(\n"
+            "                mfq_grouped_mx_e8m0(\n"
+            "                    mx_scales_" + suffix
+            + "[scale_offset]),\n"
+            "                mx_dot_" + suffix + ",\n"
+            "                accumulator_" + suffix + ");\n"
+            "        }\n";
+    }
+    source += "    }\n";
+
+    for (
+        std::size_t projection = 0;
+        projection < layouts.size();
+        ++projection
+    ) {
+        const auto suffix = std::to_string(projection);
+        source +=
+            "    accumulator_" + suffix
+            + " += simd_shuffle_down(accumulator_" + suffix + ", 4);\n"
+            "    accumulator_" + suffix
+            + " += simd_shuffle_down(accumulator_" + suffix + ", 2);\n"
+            "    accumulator_" + suffix
+            + " += simd_shuffle_down(accumulator_" + suffix + ", 1);\n"
+            "    if (k_lane == 0u && active_" + suffix + ") {\n"
+            "        y[uint(P" + suffix + "_OUT_OFFSET) + output_index] =\n"
+            "            half(accumulator_" + suffix + ");\n"
+            "    }\n";
+    }
+    return source;
+}
+
+mlx::core::fast::CustomKernelFunction single_row_mxfp8_kernel(
+    const std::vector<DirectProjectionLayout>& layouts) {
+    static std::mutex mutex;
+    static std::unordered_map<
+        std::string,
+        mlx::core::fast::CustomKernelFunction> kernels;
+    const auto key = "mxfp8_m1_" + direct_kernel_key(layouts);
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto found = kernels.find(key);
+    if (found != kernels.end()) {
+        return found->second;
+    }
+    CompileOptions options;
+    options.math_mode = MathMode::Fast;
+    auto kernel = mlx::core::fast::metal_kernel(
+        "mfq_cpp_single_row_grouped_" + key,
+        direct_input_names(layouts),
+        {"y"},
+        make_single_row_mxfp8_source(layouts),
+        kGroupedHeader,
+        true,
+        false,
+        options);
     kernels.emplace(key, kernel);
     return kernel;
 }
@@ -1202,6 +1600,7 @@ struct MlxGroupedLinear::Impl {
     int total_output_size = 0;
     int total_tiles = 0;
     int single_row_tiles = 0;
+    int single_row_mxfp8_tiles = 0;
     std::size_t packed_bytes = 0;
     std::size_t copied_packed_bytes = 0;
 
@@ -1263,6 +1662,14 @@ struct MlxGroupedLinear::Impl {
                     (layout.output_size + 7) / 8);
             }
         }
+        if (supports_single_row_mxfp8_fast_path(
+                direct_layouts)) {
+            for (const auto& layout : direct_layouts) {
+                single_row_mxfp8_tiles = std::max(
+                    single_row_mxfp8_tiles,
+                    (layout.output_size + 15) / 16);
+            }
+        }
     }
 
     bool uses_zero_copy_storage() const noexcept {
@@ -1271,6 +1678,17 @@ struct MlxGroupedLinear::Impl {
 
     bool has_single_row_nint_fast_path() const noexcept {
         return single_row_tiles > 0;
+    }
+
+    bool has_single_row_mxfp8_fast_path() const noexcept {
+        return single_row_mxfp8_tiles > 0;
+    }
+
+    bool supports_single_row_swiglu() const noexcept {
+        return has_single_row_nint_fast_path()
+            && direct_layouts.size() == 2
+            && output_sizes.size() == 2
+            && output_sizes[0] == output_sizes[1];
     }
 };
 
@@ -1291,7 +1709,31 @@ MlxGroupedLinear::MlxGroupedLinear(
     // Three VQ projections are the largest supported binding: 27 weight
     // buffers (29 resources including x/y), below Metal's 31-buffer kernel
     // argument limit.
-    if (weights.size() <= 3) {
+    const bool direct_mxfp8_group =
+        weights.size() <= 14 &&
+        std::any_of(
+            weights.begin(),
+            weights.end(),
+            [](const MlxGroupedLinearWeightRef& weight) {
+                const auto* mx = std::get_if<
+                    const MlxMxWeight*>(&weight);
+                return mx != nullptr && *mx != nullptr &&
+                    (*mx)->bits() == 8;
+            }) &&
+        std::all_of(
+            weights.begin(),
+            weights.end(),
+            [](const MlxGroupedLinearWeightRef& weight) {
+                if (std::holds_alternative<
+                        const MlxNint8ZeroWeight*>(weight)) {
+                    return true;
+                }
+                const auto* mx = std::get_if<
+                    const MlxMxWeight*>(&weight);
+                return mx != nullptr && *mx != nullptr &&
+                    (*mx)->bits() == 8;
+            });
+    if (weights.size() <= 3 || direct_mxfp8_group) {
         std::vector<DirectProjectionLayout> layouts;
         std::vector<array> direct_inputs;
         std::vector<int> output_sizes;
@@ -1508,6 +1950,23 @@ MlxGroupedLinear::MlxGroupedLinear(
                             weight->packed_values());
                         direct_inputs.push_back(
                             weight->scales());
+                    } else if constexpr (
+                        std::is_same_v<Weight, MlxMxWeight>
+                    ) {
+                        layout.family = kFamilyMx;
+                        layout.bits = weight->bits();
+                        validate_direct_array(
+                            weight->packed_values(),
+                            mlx::core::uint8,
+                            "MX packed values");
+                        validate_direct_array(
+                            weight->block_scales(),
+                            mlx::core::uint8,
+                            "MX block scales");
+                        direct_inputs.push_back(
+                            weight->packed_values());
+                        direct_inputs.push_back(
+                            weight->block_scales());
                     } else {
                         layout.family =
                             kFamilyCccpPq;
@@ -1575,11 +2034,13 @@ MlxGroupedLinear::MlxGroupedLinear(
                     std::holds_alternative<
                         const MlxCccpInt4Weight*>(weight) ||
                     std::holds_alternative<
-                        const MlxCccpPqWeight*>(weight);
+                        const MlxCccpPqWeight*>(weight) ||
+                    std::holds_alternative<
+                        const MlxMxWeight*>(weight);
             })) {
         throw MlxGroupedLinearUnsupported(
-            "VQ/CCCP grouped linear is limited to the production "
-            "two/three-projection zero-copy path");
+            "VQ/CCCP/MX grouped linear requires the direct-binding "
+            "zero-copy path");
     }
 
     std::vector<std::int32_t> descriptors(
@@ -1792,6 +2253,98 @@ bool MlxGroupedLinear::supports(
         rows <= static_cast<std::size_t>(max_rows());
 }
 
+bool MlxGroupedLinear::supports_single_row_swiglu(
+    const array& input) const noexcept {
+    return impl_->supports_single_row_swiglu()
+        && input.ndim() > 0
+        && input.shape(-1) == impl_->input_size
+        && input.dtype() == mlx::core::float16
+        && input.size() == static_cast<std::size_t>(
+            impl_->input_size);
+}
+
+array MlxGroupedLinear::single_row_swiglu(
+    const array& input,
+    float limit) const {
+    if (!supports_single_row_swiglu(input)) {
+        throw MlxGroupedLinearUnsupported(
+            "grouped SwiGLU requires one FP16 row and two "
+            "equal-width NINT projections");
+    }
+    if (!std::isfinite(limit) || limit < 0.0f) {
+        throw std::invalid_argument(
+            "grouped SwiGLU limit must be finite and non-negative");
+    }
+
+    Shape prefix(
+        input.shape().begin(),
+        input.shape().end() - 1);
+    auto output_shape = prefix;
+    output_shape.push_back(impl_->output_sizes[0]);
+    auto source = mlx::core::contiguous(
+        mlx::core::reshape(
+            input,
+            Shape{1, impl_->input_size}));
+    const array params({limit}, mlx::core::float32);
+    auto inputs = impl_->direct_weight_inputs;
+    inputs.push_back(source);
+    inputs.push_back(params);
+
+    std::vector<
+        std::pair<
+            std::string,
+            mlx::core::fast::TemplateArg>>
+        templates{
+            {"T", source.dtype()},
+            {"K", impl_->input_size},
+            {
+                "GS",
+                impl_->direct_layouts.front().group_size,
+            },
+            {
+                "NG",
+                impl_->direct_layouts.front().groups,
+            },
+        };
+    for (
+        std::size_t projection = 0;
+        projection < impl_->direct_layouts.size();
+        ++projection
+    ) {
+        const auto& layout = impl_->direct_layouts[projection];
+        const auto name =
+            "P" + std::to_string(projection) + "_";
+        templates.emplace_back(
+            name + "OUT",
+            layout.output_size);
+        templates.emplace_back(
+            name + "OUT_OFFSET",
+            layout.output_offset);
+    }
+
+    const auto grid = static_cast<std::size_t>(
+        impl_->single_row_tiles) * 64;
+    auto result = single_row_nint_kernel(
+        impl_->direct_layouts,
+        true)(
+        inputs,
+        {Shape{1, impl_->output_sizes[0]}},
+        {source.dtype()},
+        {
+            checked_int(grid, "SwiGLU Metal grid"),
+            1,
+            1,
+        },
+        {64, 1, 1},
+        std::move(templates),
+        std::nullopt,
+        false,
+        {}).front();
+    return mlx::core::reshape(
+        std::move(result),
+        std::move(output_shape));
+}
+
 std::vector<array> MlxGroupedLinear::matmul(
     const array& input) const {
     if (input.ndim() == 0 ||
@@ -1835,12 +2388,19 @@ std::vector<array> MlxGroupedLinear::matmul(
         rows == 1 &&
         source.dtype() == mlx::core::float16 &&
         impl_->has_single_row_nint_fast_path();
-    const int work_tiles = use_single_row_nint_fast_path
+    const bool use_single_row_mxfp8_fast_path =
+        rows == 1 &&
+        source.dtype() == mlx::core::float16 &&
+        impl_->has_single_row_mxfp8_fast_path();
+    const int work_tiles = use_single_row_mxfp8_fast_path
+        ? impl_->single_row_mxfp8_tiles
+        : use_single_row_nint_fast_path
         ? impl_->single_row_tiles
         : impl_->total_tiles;
     const auto grid = rows
         * static_cast<std::size_t>(work_tiles)
-        * 64;
+        * static_cast<std::size_t>(
+            use_single_row_mxfp8_fast_path ? 128 : 64);
     if (grid >
         static_cast<std::size_t>(
             std::numeric_limits<int>::max())) {
@@ -1861,12 +2421,57 @@ std::vector<array> MlxGroupedLinear::matmul(
         1,
         1,
     };
-    const auto threadgroup = std::tuple<int, int, int>{64, 1, 1};
+    const auto threadgroup = std::tuple<int, int, int>{
+        use_single_row_mxfp8_fast_path ? 128 : 64,
+        1,
+        1,
+    };
 
     array combined = [&]() {
         if (impl_->uses_zero_copy_storage()) {
             auto inputs = impl_->direct_weight_inputs;
             inputs.push_back(source);
+            if (use_single_row_mxfp8_fast_path) {
+                std::vector<
+                    std::pair<
+                        std::string,
+                        mlx::core::fast::TemplateArg>>
+                    templates{
+                        {"K", impl_->input_size},
+                    };
+                for (
+                    std::size_t projection = 0;
+                    projection < impl_->direct_layouts.size();
+                    ++projection
+                ) {
+                    const auto& layout =
+                        impl_->direct_layouts[projection];
+                    const auto prefix =
+                        "P" + std::to_string(projection) + "_";
+                    templates.emplace_back(
+                        prefix + "OUT",
+                        layout.output_size);
+                    templates.emplace_back(
+                        prefix + "OUT_OFFSET",
+                        layout.output_offset);
+                    if (layout.family == kFamilyNint8Zero) {
+                        templates.emplace_back(
+                            prefix + "NG",
+                            layout.groups);
+                    }
+                }
+                return single_row_mxfp8_kernel(
+                    impl_->direct_layouts)(
+                    inputs,
+                    output_shapes,
+                    output_dtypes,
+                    grid_shape,
+                    threadgroup,
+                    std::move(templates),
+                    std::nullopt,
+                    false,
+                    {}).front();
+            }
             if (use_single_row_nint_fast_path) {
                 std::vector<
                     std::pair<
@@ -2013,6 +2618,10 @@ std::vector<array> MlxGroupedLinear::matmul(
                     templates.emplace_back(
                         prefix + "INDEX_BITS",
                         layout.index_bits);
+                } else if (layout.family == kFamilyMx) {
+                    templates.emplace_back(
+                        prefix + "BITS",
+                        layout.bits);
                 }
             }
             return direct_kernel(impl_->direct_layouts)(
@@ -2117,6 +2726,11 @@ MlxGroupedLinear::copied_packed_nbytes() const noexcept {
 bool MlxGroupedLinear::has_single_row_nint_fast_path()
     const noexcept {
     return impl_->has_single_row_nint_fast_path();
+}
+
+bool MlxGroupedLinear::has_single_row_mxfp8_fast_path()
+    const noexcept {
+    return impl_->has_single_row_mxfp8_fast_path();
 }
 
 } // namespace mfq::metal

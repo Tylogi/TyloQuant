@@ -409,7 +409,7 @@ struct RequestWork {
 
 static RequestWork parse_work(const json & body, bool chat, const LlamaTokenizer & tokenizer,
                               const common_chat_templates * templates,
-                              const MfqServerConfig & config) {
+                              int64_t max_context) {
     if (!body.is_object()) throw ApiError(400, "invalid_request_error", "request body must be a JSON object");
     if (integer_field(body, "n", 1) != 1) {
         throw ApiError(400, "unsupported_parameter", "only n=1 is supported", "n");
@@ -533,7 +533,8 @@ static RequestWork parse_work(const json & body, bool chat, const LlamaTokenizer
     }
     work.prompt = tokenizer.tokenize(prompt, parse_special);
     if (work.prompt.empty()) throw ApiError(400, "invalid_request_error", "prompt tokenized to an empty sequence", "prompt");
-    if (config.max_context > 0 && static_cast<int64_t>(work.prompt.size()) + max_tokens > config.max_context) {
+    if (max_context > 0 &&
+        static_cast<int64_t>(work.prompt.size()) + max_tokens > max_context) {
         throw ApiError(400, "context_length_exceeded",
                        "prompt tokens plus max_tokens exceed the model context window", "max_tokens");
     }
@@ -845,7 +846,15 @@ public:
         ++failed_requests_;
     }
 
-    json snapshot(const MfqServerConfig & config) const {
+    uint64_t active_requests() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return active_requests_;
+    }
+
+    json snapshot(
+            const MfqServerConfig & config,
+            int64_t max_context,
+            bool reloading) const {
         std::lock_guard<std::mutex> lock(mutex_);
         const double uptime_seconds =
             std::chrono::duration<double>(
@@ -854,7 +863,9 @@ public:
             {"status", "ok"},
             {"model", config.model_name},
             {"model_type", config.model_type},
-            {"max_context", config.max_context},
+            {"max_context", max_context},
+            {"context_capacity", config.context_capacity},
+            {"reloading", reloading},
             {"vocab_size", config.vocab_size},
             {"started_at", started_unix_},
             {"uptime_seconds", uptime_seconds},
@@ -1133,7 +1144,10 @@ MfqTokenizerProbe probe_mfq_tokenizer(
     };
 }
 
-int run_mfq_server(const MfqServerConfig & config, const MfqGenerateFn & generate) {
+int run_mfq_server(
+        const MfqServerConfig & config,
+        const MfqGenerateFn & generate,
+        const MfqReloadFn & reload) {
     if (config.tokenizer_gguf.empty() &&
         config.tokenizer_model.empty()) {
         throw std::runtime_error(
@@ -1170,6 +1184,8 @@ int run_mfq_server(const MfqServerConfig & config, const MfqGenerateFn & generat
 
     httplib::Server server;
     ServerMetrics server_metrics;
+    std::atomic<int64_t> active_context{config.max_context};
+    std::atomic<bool> reloading{false};
     server.set_payload_max_length(16 * 1024 * 1024);
     server.set_read_timeout(300, 0);
     server.set_write_timeout(300, 0);
@@ -1228,18 +1244,82 @@ int run_mfq_server(const MfqServerConfig & config, const MfqGenerateFn & generat
             {"model", config.model_name},
             {"endpoints", {
                 "/v1/chat/completions", "/v1/completions", "/v1/models",
-                "/health", "/api/status", "/admin/",
+                "/health", "/api/status", "/api/reload", "/admin/",
             }},
         });
     });
 
     server.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
-        set_json(res, {{"status", "ok"}, {"model", config.model_name}});
+        set_json(res, {
+            {"status", reloading.load() ? "loading" : "ok"},
+            {"model", config.model_name},
+            {"max_context", active_context.load()},
+        });
     });
 
     server.Get("/api/status", [&](const httplib::Request & req, httplib::Response & res) {
         if (!authorized(req, res, config.api_key)) return;
-        set_json(res, server_metrics.snapshot(config));
+        set_json(res, server_metrics.snapshot(
+            config, active_context.load(), reloading.load()));
+    });
+
+    server.Post("/api/reload", [&](const httplib::Request & req, httplib::Response & res) {
+        if (!authorized(req, res, config.api_key)) return;
+        if (!reload) {
+            set_json(res, error_body(
+                "this runtime does not support model reload",
+                "unsupported_operation"), 501);
+            return;
+        }
+        bool expected = false;
+        if (!reloading.compare_exchange_strong(expected, true)) {
+            set_json(res, error_body(
+                "model reload is already in progress", "conflict"), 409);
+            return;
+        }
+        const auto finish_reload = [&] {
+            reloading.store(false);
+        };
+        try {
+            if (server_metrics.active_requests() != 0) {
+                throw ApiError(
+                    409, "conflict",
+                    "cannot reload while a generation request is active");
+            }
+            const json body = parse_body(req);
+            const int64_t context_size = integer_field(
+                body, "context_size", active_context.load());
+            const int64_t capacity = config.context_capacity > 0
+                ? config.context_capacity
+                : config.max_context;
+            if (context_size < 1 ||
+                (capacity > 0 && context_size > capacity)) {
+                throw ApiError(
+                    400, "invalid_request_error",
+                    "context_size must be within the model context capacity",
+                    "context_size");
+            }
+            const int64_t loaded_context = reload(context_size);
+            if (loaded_context < 1 ||
+                (capacity > 0 && loaded_context > capacity)) {
+                throw std::runtime_error(
+                    "runtime reload returned an invalid context size");
+            }
+            active_context.store(loaded_context);
+            finish_reload();
+            set_json(res, {
+                {"status", "ok"},
+                {"model", config.model_name},
+                {"max_context", loaded_context},
+                {"context_capacity", capacity},
+            });
+        } catch (const ApiError & error) {
+            finish_reload();
+            handle_api_error(res, error);
+        } catch (const std::exception & error) {
+            finish_reload();
+            set_json(res, error_body(error.what(), "server_error"), 500);
+        }
     });
 
     server.Get("/v1/models", [&](const httplib::Request & req, httplib::Response & res) {
@@ -1257,10 +1337,16 @@ int run_mfq_server(const MfqServerConfig & config, const MfqGenerateFn & generat
 
     auto completion_handler = [&](bool chat, const httplib::Request & req, httplib::Response & res) {
         if (!authorized(req, res, config.api_key)) return;
+        if (reloading.load()) {
+            set_json(res, error_body(
+                "model reload is in progress", "service_unavailable"), 503);
+            return;
+        }
         try {
             const json body = parse_body(req);
             RequestWork work = parse_work(
-                body, chat, *tokenizer, chat_templates.get(), config);
+                body, chat, *tokenizer, chat_templates.get(),
+                active_context.load());
             const std::string id = request_id(chat ? "chatcmpl-" : "cmpl-");
             const int64_t created = unix_time_seconds();
 
@@ -1317,9 +1403,16 @@ int run_mfq_server(const MfqServerConfig & config, const MfqGenerateFn & generat
             res.set_chunked_content_provider(
                 "text/event-stream; charset=utf-8",
                 [work = std::move(work), id, created, &tokenizer, &generate,
-                 &config, &server_metrics, chat]
+                 &config, &server_metrics, &reloading, chat]
                 (size_t offset, httplib::DataSink & sink) mutable -> bool {
                     if (offset != 0) {
+                        sink.done();
+                        return false;
+                    }
+                    if (reloading.load()) {
+                        write_sse(sink, error_body(
+                            "model reload is in progress",
+                            "service_unavailable"));
                         sink.done();
                         return false;
                     }
