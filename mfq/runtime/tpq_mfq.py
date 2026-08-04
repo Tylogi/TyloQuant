@@ -18,7 +18,7 @@ import torch
 
 from mfq.formats.tpq import CccpInt4Tensor, CccpPqSpec, CccpPqTensor
 from mfq.formats.tpq import normalize_tpq_dtype, unpack_tpq_indices
-from mfq.formats.io import MMapTensorStore, load_mmap
+from mfq.formats.io import MMapTensorStore, is_bfloat16_array, load_mmap
 from mfq.formats.moe import NintMoePool, NintMoeTensor
 from mfq.formats.mx import MXFP8_DTYPE, MxTensor
 
@@ -617,6 +617,10 @@ class MfqCccpStore:
     @staticmethod
     def _torch_array(value: np.ndarray) -> torch.Tensor:
         array = np.asarray(value)
+        if is_bfloat16_array(value):
+            return torch.from_numpy(
+                np.ascontiguousarray(array, dtype=np.uint16)
+            ).view(torch.bfloat16)
         if not array.flags.writeable:
             array = array.copy()
         return torch.from_numpy(array)
