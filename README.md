@@ -47,6 +47,17 @@ with their Unsloth Dynamic recipes. Lower Mean KLD and higher same-top are
 better. All plotted tiers use the complete 145-chunk evaluation of the current
 file.
 
+### DeepSeek-V4-Flash-0731: disk size vs. Mean KLD
+
+<img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ versus Unsloth Dynamic disk size and Mean KLD at ctx512 and ctx2048" width="100%">
+
+The full WikiText-2 evaluation uses identical BF16-reference logits, tokenizer,
+BOS, and token sequences for both runtimes. It covers 146,115 scored tokens at
+`ctx512` and 146,289 at `ctx2048`. Across the three closest-size pairs, MFQ
+reduces Mean KLD by **57.04–57.75%** at `ctx512` and **52.88–55.35%** at
+`ctx2048`, with each pair within 2.116 GiB. Lower Mean KLD is better. See the
+[complete results and protocol](./docs/deepseek-v4-flash-0731-results.md).
+
 ## Installation
 
 ### Requirements
@@ -207,7 +218,7 @@ See the [Metal development status](./docs/metal.md).
 
 - [ ] Publish a reproducible Gemma-4-26B-A4B-it benchmark protocol and raw result bundle
 - [ ] Add matched-size KLD and perplexity results for more Qwen3.5 and Qwen3.6 models
-- [ ] Complete independent full-model KLD evaluation for DeepSeek-V4-Flash
+- [x] Complete independent full-model KLD evaluation for DeepSeek-V4-Flash
 - [ ] Re-run production decode acceptance after the NINT8 M=1 kernel fix
 - [ ] Add benchmark coverage for more model families and GPU generations
 - [ ] Publish downloadable quantized models with model cards and checksums
@@ -217,6 +228,7 @@ See the [Metal development status](./docs/metal.md).
 ## Documentation
 
 - [Benchmarks and Technical Notes](./docs/benchmarks.md)
+- [DeepSeek-V4-Flash-0731 Results](./docs/deepseek-v4-flash-0731-results.md)
 - [Quantization Format Specification](./FORMATS.md)
 - [C++ Runtime and API](./cpp_runtime/README.md)
 - [Apple Silicon / Metal Development Status](./docs/metal.md)

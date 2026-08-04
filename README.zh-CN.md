@@ -29,6 +29,17 @@ LLM 部署。项目支持 `0.84-8.30 bpw` 的自定义权重编码，可按计�
 完整 WikiText-2 评测包含 145 个 chunk、148,335 个计分 token，并使用同一
 BF16 参考模型。上图所示的每个匹配精度档位中，MFQ 的原始 Mean KLD 均更低。
 
+### DeepSeek-V4-Flash-0731：文件大小与 Mean KLD
+
+<img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ 与 Unsloth Dynamic 在 ctx512 和 ctx2048 下的文件大小与 Mean KLD 对比" width="100%">
+
+完整 WikiText-2 评测在两套 runtime 中使用相同的 BF16 reference logits、tokenizer、
+BOS 与 token 序列；`ctx512` 覆盖 146,115 个计分 token，`ctx2048` 覆盖 146,289 个。
+三组最接近体积的对位中，MFQ 在 `ctx512` 下将 Mean KLD 降低
+**57.04–57.75%**，在 `ctx2048` 下降低 **52.88–55.35%**，且每组文件大小差均不超过
+2.116 GiB。Mean KLD 越低越好。完整数据与测试协议见
+[DeepSeek-V4-Flash-0731 实验结果](./docs/deepseek-v4-flash-0731-results.md)。
+
 ## 安装
 
 ### 环境要求
@@ -172,7 +183,7 @@ kernel 在 GPU 上执行。Metal HTTP 服务端仍在开发中。详见
 
 - [ ] 发布可复现的 Gemma-4-26B-A4B-it 测试流程与原始结果包
 - [ ] 补充更多 Qwen3.5、Qwen3.6 模型的等大小 KLD 与困惑度测试
-- [ ] 完成 DeepSeek-V4-Flash 的独立整模 KLD 评测
+- [x] 完成 DeepSeek-V4-Flash 的独立整模 KLD 评测
 - [ ] 在 NINT8 M=1 kernel 修复后重新执行 production decode 验收
 - [ ] 扩展更多模型家族和 GPU 代际的基准测试
 - [ ] 发布带有模型卡和校验和的可下载量化模型
@@ -182,6 +193,7 @@ kernel 在 GPU 上执行。Metal HTTP 服务端仍在开发中。详见
 ## 文档
 
 - [基准测试与技术说明](./docs/benchmarks.zh-CN.md)
+- [DeepSeek-V4-Flash-0731 实验结果](./docs/deepseek-v4-flash-0731-results.md)
 - [量化格式规范](./FORMATS.md)
 - [C++ Runtime 与 API](./cpp_runtime/README.md)
 - [Apple Silicon / Metal 开发状态](./docs/metal.md)

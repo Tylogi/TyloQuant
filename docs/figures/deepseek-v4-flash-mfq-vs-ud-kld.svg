@@ -1,0 +1,152 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" role="img" aria-labelledby="title desc">
+  <title id="title">DeepSeek-V4-Flash-0731 MFQ versus Unsloth Dynamic Mean KLD</title>
+  <desc id="desc">Two panels compare full WikiText-2 Mean KLD against disk size at context lengths 512 and 2048. Three MFQ tiers have lower KLD than all plotted Unsloth Dynamic tiers. Lower is better.</desc>
+  <defs>
+    <style>
+      .title { font: 700 27px Inter, "Segoe UI", Arial, sans-serif; fill: #172033; }
+      .subtitle { font: 13.5px Inter, "Segoe UI", Arial, sans-serif; fill: #687386; }
+      .panel-title { font: 700 16px Inter, "Segoe UI", Arial, sans-serif; fill: #273449; }
+      .axis { font: 13px Inter, "Segoe UI", Arial, sans-serif; fill: #536074; }
+      .tick { font: 12px Inter, "Segoe UI", Arial, sans-serif; fill: #687386; }
+      .label { font: 600 11.5px Inter, "Segoe UI", Arial, sans-serif; }
+      .legend { font: 600 12px Inter, "Segoe UI", Arial, sans-serif; fill: #38465a; }
+      .note { font: 600 13px Inter, "Segoe UI", Arial, sans-serif; fill: #435169; }
+      .grid { stroke: #dce2ea; stroke-width: 1; }
+      .frame { fill: #fbfcfe; stroke: #dce2ea; stroke-width: 1; }
+      .pair { stroke: #9eaabd; stroke-width: 1.4; stroke-dasharray: 5 4; }
+      .ud-line { fill: none; stroke: #e07a2e; stroke-width: 2.2; opacity: .84; }
+      .mfq-line { fill: none; stroke: #2477d4; stroke-width: 2.8; opacity: .94; }
+      .ud-point { fill: #fff; stroke: #e07a2e; stroke-width: 2.5; }
+      .ud-duplicate { fill: #fff7ef; stroke: #e07a2e; stroke-width: 2.5; }
+      .mfq-point { fill: #2477d4; stroke: #fff; stroke-width: 1.5; }
+      .ud-text { fill: #ad5518; }
+      .mfq-text { fill: #155ca9; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="720" rx="18" fill="#fff"/>
+  <text class="title" x="75" y="42">DeepSeek-V4-Flash-0731: MFQ vs. Unsloth Dynamic</text>
+  <text class="subtitle" x="75" y="67">Full WikiText-2 evaluation · identical BF16 reference · lower Mean KLD is better</text>
+
+  <g transform="translate(814 62)">
+    <circle class="ud-point" cx="0" cy="0" r="5.5"/>
+    <text class="legend" x="12" y="4">Unsloth Dynamic</text>
+    <path class="mfq-point" d="M151 -7l7 7-7 7-7-7z"/>
+    <text class="legend" x="164" y="4">MFQ</text>
+    <line class="pair" x1="224" y1="0" x2="254" y2="0"/>
+    <text class="legend" x="263" y="4">closest-size pair</text>
+  </g>
+
+  <rect class="frame" x="75" y="108" width="470" height="515" rx="12"/>
+  <rect class="frame" x="645" y="108" width="470" height="515" rx="12"/>
+  <text class="panel-title" x="310" y="135" text-anchor="middle">ctx512 · 146,115 scored tokens</text>
+  <text class="panel-title" x="880" y="135" text-anchor="middle">ctx2048 · 146,289 scored tokens</text>
+
+  <!-- Shared horizontal grid and y-axis ticks. -->
+  <g>
+    <line class="grid" x1="95" y1="182.1" x2="525" y2="182.1"/>
+    <line class="grid" x1="95" y1="256.3" x2="525" y2="256.3"/>
+    <line class="grid" x1="95" y1="330.4" x2="525" y2="330.4"/>
+    <line class="grid" x1="95" y1="404.6" x2="525" y2="404.6"/>
+    <line class="grid" x1="95" y1="478.8" x2="525" y2="478.8"/>
+    <line class="grid" x1="95" y1="552.9" x2="525" y2="552.9"/>
+    <line class="grid" x1="665" y1="182.1" x2="1095" y2="182.1"/>
+    <line class="grid" x1="665" y1="256.3" x2="1095" y2="256.3"/>
+    <line class="grid" x1="665" y1="330.4" x2="1095" y2="330.4"/>
+    <line class="grid" x1="665" y1="404.6" x2="1095" y2="404.6"/>
+    <line class="grid" x1="665" y1="478.8" x2="1095" y2="478.8"/>
+    <line class="grid" x1="665" y1="552.9" x2="1095" y2="552.9"/>
+  </g>
+  <g class="tick" text-anchor="end">
+    <text x="88" y="186.1">0.7</text>
+    <text x="88" y="260.3">0.6</text>
+    <text x="88" y="334.4">0.5</text>
+    <text x="88" y="408.6">0.4</text>
+    <text x="88" y="482.8">0.3</text>
+    <text x="88" y="556.9">0.2</text>
+    <text x="658" y="186.1">0.7</text>
+    <text x="658" y="260.3">0.6</text>
+    <text x="658" y="334.4">0.5</text>
+    <text x="658" y="408.6">0.4</text>
+    <text x="658" y="482.8">0.3</text>
+    <text x="658" y="556.9">0.2</text>
+  </g>
+
+  <!-- Vertical grid and disk-size ticks. -->
+  <g>
+    <line class="grid" x1="116.5" y1="145" x2="116.5" y2="590"/>
+    <line class="grid" x1="224" y1="145" x2="224" y2="590"/>
+    <line class="grid" x1="331.5" y1="145" x2="331.5" y2="590"/>
+    <line class="grid" x1="439" y1="145" x2="439" y2="590"/>
+    <line class="grid" x1="510.7" y1="145" x2="510.7" y2="590"/>
+    <line class="grid" x1="686.5" y1="145" x2="686.5" y2="590"/>
+    <line class="grid" x1="794" y1="145" x2="794" y2="590"/>
+    <line class="grid" x1="901.5" y1="145" x2="901.5" y2="590"/>
+    <line class="grid" x1="1009" y1="145" x2="1009" y2="590"/>
+    <line class="grid" x1="1080.7" y1="145" x2="1080.7" y2="590"/>
+  </g>
+  <g class="tick" text-anchor="middle">
+    <text x="116.5" y="610">75</text><text x="224" y="610">90</text><text x="331.5" y="610">105</text><text x="439" y="610">120</text><text x="510.7" y="610">130</text>
+    <text x="686.5" y="610">75</text><text x="794" y="610">90</text><text x="901.5" y="610">105</text><text x="1009" y="610">120</text><text x="1080.7" y="610">130</text>
+  </g>
+
+  <!-- Closest-size pair connectors. -->
+  <g>
+    <line class="pair" x1="115.8" y1="478.0" x2="129.9" y2="172.8"/>
+    <line class="pair" x1="210.1" y1="543.5" x2="225.3" y2="328.6"/>
+    <line class="pair" x1="279.8" y1="566.0" x2="274.5" y2="386.4"/>
+    <line class="pair" x1="685.8" y1="498.1" x2="699.9" y2="246.1"/>
+    <line class="pair" x1="780.1" y1="552.9" x2="795.3" y2="376.2"/>
+    <line class="pair" x1="849.8" y1="570.7" x2="844.5" y2="424.1"/>
+  </g>
+
+  <!-- Series: ctx512. -->
+  <polyline class="ud-line" points="129.9,172.8 159.0,213.4 185.5,281.8 185.9,281.4 225.3,328.6 274.5,386.4 353.7,386.9 433.9,435.5 491.2,450.4"/>
+  <polyline class="mfq-line" points="115.8,478.0 210.1,543.5 279.8,566.0"/>
+  <g>
+    <circle class="ud-point" cx="129.9" cy="172.8" r="5.5"/><circle class="ud-point" cx="159.0" cy="213.4" r="5.5"/>
+    <circle class="ud-point" cx="185.5" cy="281.8" r="5.5"/><circle class="ud-point" cx="185.9" cy="281.4" r="3.1"/>
+    <circle class="ud-point" cx="225.3" cy="328.6" r="5.5"/><circle class="ud-point" cx="274.5" cy="386.4" r="5.5"/>
+    <circle class="ud-point" cx="353.7" cy="386.9" r="5.5"/><circle class="ud-point" cx="433.9" cy="435.5" r="5.5"/>
+    <circle class="ud-duplicate" cx="491.2" cy="450.4" r="6.5"/><text class="label ud-text" x="491.2" y="454.4" text-anchor="middle">2</text>
+    <path class="mfq-point" d="M115.8 470.5l7.5 7.5-7.5 7.5-7.5-7.5z"/>
+    <path class="mfq-point" d="M210.1 536l7.5 7.5-7.5 7.5-7.5-7.5z"/>
+    <path class="mfq-point" d="M279.8 558.5l7.5 7.5-7.5 7.5-7.5-7.5z"/>
+  </g>
+
+  <!-- Series: ctx2048. -->
+  <polyline class="ud-line" points="699.9,246.1 729.0,285.4 755.5,336.1 755.9,336.8 795.3,376.2 844.5,424.1 923.7,423.0 1003.9,466.7 1061.2,480.6"/>
+  <polyline class="mfq-line" points="685.8,498.1 780.1,552.9 849.8,570.7"/>
+  <g>
+    <circle class="ud-point" cx="699.9" cy="246.1" r="5.5"/><circle class="ud-point" cx="729.0" cy="285.4" r="5.5"/>
+    <circle class="ud-point" cx="755.5" cy="336.1" r="5.5"/><circle class="ud-point" cx="755.9" cy="336.8" r="3.1"/>
+    <circle class="ud-point" cx="795.3" cy="376.2" r="5.5"/><circle class="ud-point" cx="844.5" cy="424.1" r="5.5"/>
+    <circle class="ud-point" cx="923.7" cy="423.0" r="5.5"/><circle class="ud-point" cx="1003.9" cy="466.7" r="5.5"/>
+    <circle class="ud-duplicate" cx="1061.2" cy="480.6" r="6.5"/><text class="label ud-text" x="1061.2" y="484.6" text-anchor="middle">2</text>
+    <path class="mfq-point" d="M685.8 490.6l7.5 7.5-7.5 7.5-7.5-7.5z"/>
+    <path class="mfq-point" d="M780.1 545.4l7.5 7.5-7.5 7.5-7.5-7.5z"/>
+    <path class="mfq-point" d="M849.8 563.2l7.5 7.5-7.5 7.5-7.5-7.5z"/>
+  </g>
+
+  <!-- Labels for the three matched comparisons in each panel. -->
+  <g>
+    <text class="label ud-text" x="143" y="166">UD-IQ1_S · .713</text>
+    <text class="label ud-text" x="238" y="321">UD-Q2_K_XL · .502</text>
+    <text class="label ud-text" x="287" y="379">UD-IQ3_XXS · .425</text>
+    <text class="label mfq-text" x="128" y="495">MFQ S · .301</text>
+    <text class="label mfq-text" x="196" y="559" text-anchor="end">MFQ M · .213</text>
+    <text class="label mfq-text" x="294" y="557">MFQ L · .182</text>
+
+    <text class="label ud-text" x="713" y="239">UD-IQ1_S · .614</text>
+    <text class="label ud-text" x="808" y="369">UD-Q2_K_XL · .438</text>
+    <text class="label ud-text" x="858" y="417">UD-IQ3_XXS · .374</text>
+    <text class="label mfq-text" x="698" y="515">MFQ S · .274</text>
+    <text class="label mfq-text" x="767" y="545" text-anchor="end">MFQ M · .200</text>
+    <text class="label mfq-text" x="864" y="562">MFQ L · .176</text>
+  </g>
+
+  <text class="axis" x="310" y="638" text-anchor="middle">Disk size (GiB)</text>
+  <text class="axis" x="880" y="638" text-anchor="middle">Disk size (GiB)</text>
+  <text class="axis" x="28" y="368" text-anchor="middle" transform="rotate(-90 28 368)">Mean KLD</text>
+  <text class="note" x="600" y="684" text-anchor="middle">Closest-size pairs: MFQ lowers Mean KLD by 57.04–57.75% (ctx512) and 52.88–55.35% (ctx2048)</text>
+</svg>
