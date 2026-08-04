@@ -92,6 +92,11 @@ def normalize_tpq_dtype(dtype: str) -> str:
     """Return the canonical TPQ spelling for a public MFQ dtype."""
 
     value = str(dtype)
+    # Early projection-VQ MFQ conversions used the layout-oriented ``PVQ``
+    # spelling even though projection-VQ is the public TPQ-P family.  Keep it
+    # as a read-only alias; canonical writers continue to emit ``TPQ-P``.
+    if value in {"TPQ-PVQ", "CCCP-PVQ"}:
+        return "TPQ-P"
     if value == "CCCP-I4G64":
         return "TPQ-I4G64"
     if value.startswith("CCCP-"):

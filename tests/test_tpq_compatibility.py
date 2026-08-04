@@ -15,6 +15,7 @@ from mfq.formats.shards import write_blob_record_shards
 from mfq.formats.tpq import (
     TPQ_X,
     TpqPqTensor,
+    normalize_tpq_dtype,
     pack_tpq_pq,
 )
 from mfq.quantize.tpq import quantize_tpq_pq_fixed
@@ -87,6 +88,11 @@ def test_reader_accepts_legacy_cccp_dtype(tmp_path: Path) -> None:
 
 def test_legacy_scheme_family_normalizes_to_tpq() -> None:
     assert ExpertPrecision(family="CCCP-V").family == "TPQ-V"
+
+
+def test_legacy_projection_vq_dtype_normalizes_to_tpq_p() -> None:
+    assert normalize_tpq_dtype("TPQ-PVQ") == "TPQ-P"
+    assert normalize_tpq_dtype("CCCP-PVQ") == "TPQ-P"
 
 
 def test_cli_exposes_tpq_and_legacy_cccp_groups() -> None:
