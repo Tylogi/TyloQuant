@@ -2451,7 +2451,15 @@ class DSV4TPQModel:
                     self.pool.cancel_run(pending_routed)
                 raise
             mark_moe("shared")
-            routed_rows = []
+            # Every packed pool executes into a fixed ``result`` workspace.
+            # Keeping views returned by consecutive calls aliases every token
+            # to that same buffer, so a batched prefill would observe the last
+            # routed result in all rows.  Preserve the zero-copy single-token
+            # decode path, while batch prefill copies each completed row into
+            # one independently owned output tensor before the next launch can
+            # overwrite the workspace.
+            routed_single = None
+            routed_batch = None
             for row in range(B * T):
                 if row == 0 and pending_routed is not None:
                     routed = self.pool.finish_run(pending_routed)
@@ -2511,7 +2519,13 @@ class DSV4TPQModel:
                                 "no public packed CPU MoE operator accepted "
                                 f"DeepSeek-V4 layer {layer}"
                             )
-                routed_rows.append(routed.reshape(-1))
+                routed_flat = routed.reshape(-1)
+                if B * T == 1:
+                    routed_single = routed_flat
+                else:
+                    if routed_batch is None:
+                        routed_batch = routed_flat.new_empty((B * T, D))
+                    routed_batch[row].copy_(routed_flat)
             mark_moe("routed")
             # Full-resident packed experts have nothing to prefetch.  Hybrid
             # pools expose the exact host route already resolved for compact
@@ -2530,20 +2544,26 @@ class DSV4TPQModel:
                         for expert_id in indices[-1].tolist()
                     ]
             if return_parts and B * T == 1:
+                if routed_single is None:
+                    raise RuntimeError("packed MoE produced no routed output")
                 mark_moe("merge")
                 if profile_moe:
                     self._moe_profile_records.append(
                         (layer, tuple(moe_events))
                     )
                 return (
-                    routed_rows[0].view(1, D),
+                    routed_single.view(1, D),
                     shared.reshape(1, D),
                 )
-            routed = (
-                routed_rows[0].view(1, D)
-                if len(routed_rows) == 1
-                else torch.stack(routed_rows)
-            ).to(shared.dtype)
+            if B * T == 1:
+                if routed_single is None:
+                    raise RuntimeError("packed MoE produced no routed output")
+                routed = routed_single.view(1, D)
+            else:
+                if routed_batch is None:
+                    raise RuntimeError("packed MoE produced no routed batch")
+                routed = routed_batch
+            routed = routed.to(shared.dtype)
             output = (routed + shared).view(B, T, D).to(output_dtype)
             mark_moe("merge")
             if profile_moe:
