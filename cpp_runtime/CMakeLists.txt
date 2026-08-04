@@ -28,138 +28,37 @@ endif()
 
 if(MFQ_BUILD_CPP_SERVER)
     find_package(Threads REQUIRED)
-
-    set(_MFQ_LLAMA_BUILD_DEFAULT "")
-    if(EXISTS
-           "${CMAKE_CURRENT_SOURCE_DIR}/../references/llamacpp/build_mfq_bench/CMakeCache.txt")
-        set(_MFQ_LLAMA_BUILD_DEFAULT
-            "${CMAKE_CURRENT_SOURCE_DIR}/../references/llamacpp/build_mfq_bench")
-    endif()
-    set(MFQ_LLAMA_BUILD_DIR "${_MFQ_LLAMA_BUILD_DEFAULT}" CACHE PATH
-        "Matching llama.cpp shared-library build used by mfq-server")
-    unset(_MFQ_LLAMA_BUILD_DEFAULT)
-
-    set(_MFQ_LLAMA_SOURCE_DEFAULT "")
-    if(EXISTS
-           "${CMAKE_CURRENT_SOURCE_DIR}/../references/llamacpp/common/chat.h")
-        set(_MFQ_LLAMA_SOURCE_DEFAULT
-            "${CMAKE_CURRENT_SOURCE_DIR}/../references/llamacpp")
-    endif()
-    set(MFQ_LLAMA_SOURCE_DIR "${_MFQ_LLAMA_SOURCE_DEFAULT}" CACHE PATH
-        "llama.cpp source tree matching MFQ_LLAMA_BUILD_DIR")
-    unset(_MFQ_LLAMA_SOURCE_DEFAULT)
-
+    set(MFQ_LLAMA_SOURCE_DIR
+        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/llama-runtime")
     if(NOT EXISTS "${MFQ_LLAMA_SOURCE_DIR}/common/chat.h")
         message(FATAL_ERROR
-            "MFQ_LLAMA_SOURCE_DIR does not contain common/chat.h: "
-            "${MFQ_LLAMA_SOURCE_DIR}")
-    endif()
-    if(NOT EXISTS "${MFQ_LLAMA_BUILD_DIR}/CMakeCache.txt")
-        message(FATAL_ERROR
-            "MFQ_LLAMA_BUILD_DIR is not a configured llama.cpp build: "
-            "${MFQ_LLAMA_BUILD_DIR}")
+            "Bundled llama runtime is incomplete: ${MFQ_LLAMA_SOURCE_DIR}")
     endif()
 
-    # common/chat.h exposes C++ types in the llama-common ABI. Do not mix
-    # headers from one llama.cpp checkout with libraries built from another.
-    file(STRINGS "${MFQ_LLAMA_BUILD_DIR}/CMakeCache.txt"
-        _MFQ_LLAMA_HOME_LINE
-        REGEX "^CMAKE_HOME_DIRECTORY:[^=]*="
-        LIMIT_COUNT 1)
-    if(NOT _MFQ_LLAMA_HOME_LINE)
-        message(FATAL_ERROR
-            "Cannot identify the llama.cpp source used by "
-            "${MFQ_LLAMA_BUILD_DIR}")
-    endif()
-    string(REGEX REPLACE "^CMAKE_HOME_DIRECTORY:[^=]*=" ""
-        _MFQ_LLAMA_CONFIGURED_SOURCE "${_MFQ_LLAMA_HOME_LINE}")
-    file(REAL_PATH "${MFQ_LLAMA_SOURCE_DIR}" _MFQ_LLAMA_SOURCE_REAL)
-    file(REAL_PATH "${_MFQ_LLAMA_CONFIGURED_SOURCE}"
-        _MFQ_LLAMA_CONFIGURED_SOURCE_REAL)
-    if(NOT _MFQ_LLAMA_SOURCE_REAL STREQUAL
-       _MFQ_LLAMA_CONFIGURED_SOURCE_REAL)
-        message(FATAL_ERROR
-            "MFQ_LLAMA_SOURCE_DIR (${_MFQ_LLAMA_SOURCE_REAL}) does not "
-            "match MFQ_LLAMA_BUILD_DIR's source "
-            "(${_MFQ_LLAMA_CONFIGURED_SOURCE_REAL})")
-    endif()
-    unset(_MFQ_LLAMA_HOME_LINE)
-    unset(_MFQ_LLAMA_CONFIGURED_SOURCE)
-    unset(_MFQ_LLAMA_SOURCE_REAL)
-    unset(_MFQ_LLAMA_CONFIGURED_SOURCE_REAL)
+    # Tokenizer, GGUF metadata and chat-template support are built from the
+    # exact vendored source revision.  A clean MFQ checkout therefore needs
+    # no external llama.cpp checkout, build directory, or runtime dylibs.
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_APP OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_MTMD OFF CACHE BOOL "" FORCE)
+    set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
+    set(GGML_METAL OFF CACHE BOOL "" FORCE)
+    set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+    set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+    set(GGML_RPC OFF CACHE BOOL "" FORCE)
+    add_subdirectory(
+        "${MFQ_LLAMA_SOURCE_DIR}"
+        "${CMAKE_CURRENT_BINARY_DIR}/llama-runtime"
+        EXCLUDE_FROM_ALL)
 
-    set(MFQ_LLAMA_RUNTIME_DIR "${MFQ_LLAMA_BUILD_DIR}/bin")
-    if(WIN32)
-        set(MFQ_LLAMA_LIBRARY
-            "${MFQ_LLAMA_BUILD_DIR}/src/llama.lib")
-        set(MFQ_GGML_BASE_LIBRARY
-            "${MFQ_LLAMA_BUILD_DIR}/ggml/src/ggml-base.lib")
-        set(MFQ_LLAMA_COMMON_LIBRARY
-            "${MFQ_LLAMA_BUILD_DIR}/common/llama-common.lib")
-        set(_MFQ_LLAMA_RUNTIME_DLLS
-            llama.dll
-            llama-common.dll
-            ggml.dll
-            ggml-base.dll
-            ggml-cpu.dll)
-    else()
-        if(APPLE)
-            set(_MFQ_LLAMA_SHARED_SUFFIX ".dylib")
-        else()
-            set(_MFQ_LLAMA_SHARED_SUFFIX ".so")
-        endif()
-        set(MFQ_LLAMA_LIBRARY
-            "${MFQ_LLAMA_RUNTIME_DIR}/libllama${_MFQ_LLAMA_SHARED_SUFFIX}")
-        set(MFQ_GGML_BASE_LIBRARY
-            "${MFQ_LLAMA_RUNTIME_DIR}/libggml-base${_MFQ_LLAMA_SHARED_SUFFIX}")
-        set(MFQ_LLAMA_COMMON_LIBRARY
-            "${MFQ_LLAMA_RUNTIME_DIR}/libllama-common${_MFQ_LLAMA_SHARED_SUFFIX}")
-        unset(_MFQ_LLAMA_SHARED_SUFFIX)
-    endif()
-
-    foreach(_MFQ_LLAMA_LIBRARY_PATH
-            "${MFQ_LLAMA_LIBRARY}"
-            "${MFQ_GGML_BASE_LIBRARY}"
-            "${MFQ_LLAMA_COMMON_LIBRARY}")
-        if(NOT EXISTS "${_MFQ_LLAMA_LIBRARY_PATH}")
-            message(FATAL_ERROR
-                "Required llama.cpp library does not exist: "
-                "${_MFQ_LLAMA_LIBRARY_PATH}")
-        endif()
-    endforeach()
-    unset(_MFQ_LLAMA_LIBRARY_PATH)
-    if(WIN32)
-        foreach(_MFQ_LLAMA_DLL IN LISTS _MFQ_LLAMA_RUNTIME_DLLS)
-            if(NOT EXISTS "${MFQ_LLAMA_RUNTIME_DIR}/${_MFQ_LLAMA_DLL}")
-                message(FATAL_ERROR
-                    "Required llama.cpp runtime DLL does not exist: "
-                    "${MFQ_LLAMA_RUNTIME_DIR}/${_MFQ_LLAMA_DLL}")
-            endif()
-        endforeach()
-    endif()
-
-    add_library(mfq_llama SHARED IMPORTED GLOBAL)
-    add_library(mfq_ggml_base SHARED IMPORTED GLOBAL)
-    add_library(mfq_llama_common SHARED IMPORTED GLOBAL)
-    if(WIN32)
-        set_target_properties(mfq_llama PROPERTIES
-            IMPORTED_IMPLIB "${MFQ_LLAMA_LIBRARY}"
-            IMPORTED_LOCATION "${MFQ_LLAMA_RUNTIME_DIR}/llama.dll")
-        set_target_properties(mfq_ggml_base PROPERTIES
-            IMPORTED_IMPLIB "${MFQ_GGML_BASE_LIBRARY}"
-            IMPORTED_LOCATION "${MFQ_LLAMA_RUNTIME_DIR}/ggml-base.dll")
-        set_target_properties(mfq_llama_common PROPERTIES
-            IMPORTED_IMPLIB "${MFQ_LLAMA_COMMON_LIBRARY}"
-            IMPORTED_LOCATION
-                "${MFQ_LLAMA_RUNTIME_DIR}/llama-common.dll")
-    else()
-        set_target_properties(mfq_llama PROPERTIES
-            IMPORTED_LOCATION "${MFQ_LLAMA_LIBRARY}")
-        set_target_properties(mfq_ggml_base PROPERTIES
-            IMPORTED_LOCATION "${MFQ_GGML_BASE_LIBRARY}")
-        set_target_properties(mfq_llama_common PROPERTIES
-            IMPORTED_LOCATION "${MFQ_LLAMA_COMMON_LIBRARY}")
-    endif()
+    add_library(mfq_llama ALIAS llama)
+    add_library(mfq_ggml_base ALIAS ggml-base)
+    add_library(mfq_llama_common ALIAS llama-common)
 
     add_library(mfq_httplib STATIC
         ../third_party/cpp-httplib/httplib.cpp
