@@ -213,6 +213,95 @@ void test_router_modes() {
     }
 }
 
+void test_fused_dense_router_topk() {
+    constexpr int experts = 256;
+    constexpr int width = 4096;
+    constexpr int routes = 6;
+    std::vector<float> input_values(width);
+    for (int column = 0; column < width; ++column) {
+        input_values[column] =
+            static_cast<float>((column * 7) % 19 - 9) / 32.0f;
+    }
+    std::vector<float> weight_values(
+        static_cast<std::size_t>(experts) * width);
+    for (int expert = 0; expert < experts; ++expert) {
+        for (int column = 0; column < width; ++column) {
+            weight_values[
+                static_cast<std::size_t>(expert) * width + column
+            ] =
+                static_cast<float>(expert - 127) / 512.0f
+                + static_cast<float>((column * 3 + expert) % 11 - 5)
+                    / 1024.0f;
+        }
+    }
+    std::vector<float> bias(experts);
+    for (int expert = 0; expert < experts; ++expert) {
+        bias[expert] =
+            static_cast<float>((expert * 5) % 13 - 6) / 128.0f;
+    }
+    std::vector<std::uint8_t> available(experts, 1);
+    available[255] = 0;
+    available[251] = 0;
+
+    auto input = mlx::core::contiguous(
+        mlx::core::astype(
+            array(input_values.begin(), Shape{1, width}),
+            mlx::core::float16));
+    auto weight = mlx::core::contiguous(
+        mlx::core::astype(
+            array(weight_values.begin(), Shape{experts, width}),
+            mlx::core::float16));
+    auto bias_array = array(bias.begin(), Shape{experts});
+    auto available_array = mlx::core::astype(
+        array(available.begin(), Shape{experts}),
+        mlx::core::bool_);
+    require(
+        mfq::metal::moe_dense_router_topk_supported(
+            input,
+            weight),
+        "valid fused dense router shape was rejected");
+    require(
+        !mfq::metal::moe_dense_router_topk_supported(
+            mlx::core::astype(input, mlx::core::float32),
+            weight),
+        "float32 input unexpectedly accepted fused dense router");
+
+    auto logits = mlx::core::matmul(
+        input,
+        mlx::core::transpose(weight));
+    auto reference = mfq::metal::moe_topk(
+        logits,
+        routes,
+        false,
+        true,
+        true,
+        false,
+        bias_array,
+        available_array,
+        1e-20f,
+        1.5f);
+    auto fused = mfq::metal::moe_dense_router_topk(
+        input,
+        weight,
+        bias_array,
+        available_array,
+        1e-20f,
+        1.5f);
+    const auto reference_ids = integers(reference.ids);
+    const auto fused_ids = integers(fused.ids);
+    const auto reference_weights = floats(reference.weights);
+    const auto fused_weights = floats(fused.weights);
+    require(
+        fused_ids == reference_ids,
+        "fused dense router selected different experts");
+    for (int route = 0; route < routes; ++route) {
+        require_close(
+            fused_weights[route],
+            reference_weights[route],
+            8e-4f);
+    }
+}
+
 void test_sqrtsoftplus_weights() {
     constexpr int rows = 2;
     constexpr int experts = 8;
@@ -512,6 +601,7 @@ int main() {
             mlx::core::Device::gpu);
 #endif
         test_router_modes();
+        test_fused_dense_router_topk();
         test_sqrtsoftplus_weights();
         test_hash_id_repair();
         test_reduce_and_shared_gate();

@@ -721,7 +721,8 @@ public:
         if (grouped_.has_value() &&
             grouped_->supports(input) &&
             (rows > 1 ||
-             grouped_->has_single_row_nint_fast_path())) {
+             grouped_->has_single_row_nint_fast_path() ||
+             grouped_->has_single_row_mxfp8_fast_path())) {
             return (*grouped_)(input);
         }
         std::vector<array> result;
@@ -1063,15 +1064,148 @@ void MlxDeepseekV4PoolState::update(
     }
     const int row = length / ratio_ - 1;
     auto row_indices = mlx::core::full(
-        Shape{batch_, 1, head_dim_},
+        Shape{batch_, 1},
         row,
         mlx::core::int32);
-    pool_ = mlx::core::put_along_axis(
+    pool_ = dsv4_cache_write_inplace(
         pool_,
-        row_indices,
         step.emitted,
-        1);
+        row_indices);
     pool_len_ = std::max(pool_len_, row + 1);
+}
+
+void MlxDeepseekV4PoolState::prefill(
+    const array& kv,
+    const array& gate,
+    const array& ape,
+    const array& norm,
+    int start_position,
+    const array& cosine,
+    const array& sine,
+    int quant_mode,
+    float eps) {
+    auto values = typed_contiguous(kv, dtype_);
+    auto gates = typed_contiguous(gate, dtype_);
+    const int output_dim =
+        head_dim_ * (overlap_ ? 2 : 1);
+    const int tokens = values.ndim() == 3
+        ? values.shape(1)
+        : 0;
+    const int expected =
+        pool_len_ * ratio_ + remainder_;
+    if (values.ndim() != 3 ||
+        values.shape(0) != batch_ ||
+        values.shape(2) != output_dim ||
+        gates.shape() != values.shape() ||
+        tokens <= 0 ||
+        remainder_ != 0 ||
+        start_position != expected ||
+        start_position > capacity_ * ratio_ - tokens) {
+        throw std::invalid_argument(
+            "invalid DeepSeek-V4 compressor prefill input");
+    }
+
+    const int windows = tokens / ratio_;
+    const int cutoff = windows * ratio_;
+    array tail_kv = state_kv_;
+    array tail_gate = state_gate_;
+    if (windows > 0) {
+        auto grouped_kv = mlx::core::contiguous(
+            mlx::core::reshape(
+                slice_axis(values, 1, 0, cutoff),
+                Shape{
+                    batch_,
+                    windows,
+                    ratio_,
+                    output_dim,
+                }));
+        auto grouped_gate = mlx::core::contiguous(
+            mlx::core::reshape(
+                slice_axis(gates, 1, 0, cutoff),
+                Shape{
+                    batch_,
+                    windows,
+                    ratio_,
+                    output_dim,
+                }));
+        auto positions = mlx::core::contiguous(
+            mlx::core::broadcast_to(
+                mlx::core::reshape(
+                    mlx::core::arange(
+                        pool_len_,
+                        pool_len_ + windows,
+                        1,
+                        mlx::core::int32),
+                    Shape{1, windows}),
+                Shape{batch_, windows}));
+        const bool has_previous =
+            overlap_ && pool_len_ > 0;
+        auto compressed = dsv4_compress(
+            grouped_kv,
+            grouped_gate,
+            ape,
+            norm,
+            has_previous ? prev_kv_ : std::nullopt,
+            has_previous ? prev_gate_ : std::nullopt,
+            positions,
+            cosine,
+            sine,
+            ratio_,
+            overlap_,
+            quant_mode,
+            eps);
+        pool_ = dsv4_cache_write_inplace(
+            pool_,
+            compressed,
+            positions);
+
+        tail_kv = mlx::core::contiguous(
+            slice_axis(
+                values,
+                1,
+                cutoff - ratio_,
+                cutoff));
+        tail_gate = mlx::core::contiguous(
+            slice_axis(
+                gates,
+                1,
+                cutoff - ratio_,
+                cutoff));
+        if (overlap_) {
+            prev_kv_ = mlx::core::contiguous(
+                slice_axis(
+                    tail_kv,
+                    2,
+                    0,
+                    head_dim_));
+            prev_gate_ = mlx::core::contiguous(
+                slice_axis(
+                    tail_gate,
+                    2,
+                    0,
+                    head_dim_));
+        }
+        pool_len_ += windows;
+    }
+
+    const int remainder = tokens - cutoff;
+    if (remainder > 0) {
+        tail_kv = mlx::core::concatenate(
+            {
+                slice_axis(values, 1, cutoff, tokens),
+                slice_axis(tail_kv, 1, remainder, ratio_),
+            },
+            1);
+        tail_gate = mlx::core::concatenate(
+            {
+                slice_axis(gates, 1, cutoff, tokens),
+                slice_axis(tail_gate, 1, remainder, ratio_),
+            },
+            1);
+    }
+    state_kv_ = mlx::core::contiguous(tail_kv);
+    state_gate_ = mlx::core::contiguous(tail_gate);
+    remainder_ = remainder;
 }
 
 MlxDeepseekV4LayerState::MlxDeepseekV4LayerState(
@@ -1507,21 +1641,31 @@ struct MlxDeepseekV4Attention::Impl {
         auto query = index_query(
             q_rank,
             positions);
-        const auto keys = pool_prefix(
-            *state.indexer_);
         if (config.fast_indexer() &&
             requested == 512) {
+            if (tokens == 1) {
+                return dsv4_topk512(
+                    dsv4_indexer_scores_decode(
+                        query,
+                        state.indexer_->pool(),
+                        index_weights,
+                        pos0,
+                        ratio,
+                        pool_len),
+                    true,
+                    pool_len);
+            }
             return dsv4_topk512(
                 dsv4_indexer_scores(
                     query,
-                    keys,
+                    pool_prefix(*state.indexer_),
                     index_weights,
                     pos0,
                     ratio));
         }
         return generic_index_topk(
             query,
-            keys,
+            pool_prefix(*state.indexer_),
             index_weights,
             positions,
             ratio,
@@ -1569,6 +1713,15 @@ struct MlxDeepseekV4Attention::Impl {
         array low_rank =
             components.wo_a.nint8_zero_weight_ref()
             ? components.wo_a.nint8_zero_weight_ref()
+                  ->grouped_row_matmul_inverse_rope(
+                      grouped,
+                      groups,
+                      cosine,
+                      sine,
+                      head_dim,
+                      rotary)
+            : components.wo_a.mx_weight_ref() && tokens == 1
+            ? components.wo_a.mx_weight_ref()
                   ->grouped_row_matmul_inverse_rope(
                       grouped,
                       groups,
@@ -1914,54 +2067,83 @@ array MlxDeepseekV4Attention::operator()(
             index_gate = projected.at(output++);
             index_weights = projected.at(output++);
         }
-        for (int token = 0; token < tokens; ++token) {
-            const int length = pos0 + token + 1;
-            state.main_->update(
-                slice_axis(
-                    main_kv,
-                    1,
-                    token,
-                    token + 1),
-                slice_axis(
-                    main_gate,
-                    1,
-                    token,
-                    token + 1),
+        const bool batch_prefill =
+            tokens > 1 &&
+            state.main_->remainder() == 0 &&
+            (!state.indexer_ ||
+             state.indexer_->remainder() == 0);
+        if (batch_prefill) {
+            state.main_->prefill(
+                main_kv,
+                main_gate,
                 *impl_->components.main_ape,
                 *impl_->components.main_norm,
-                length,
+                pos0,
                 impl_->pool_rope->first,
                 impl_->pool_rope->second,
                 0,
-                static_cast<float>(
-                    config.rms_eps));
+                static_cast<float>(config.rms_eps));
             if (impl_->ratio == 4) {
-                state.indexer_->update(
-                    slice_axis(
-                        index_kv,
-                        1,
-                        token,
-                        token + 1),
-                    slice_axis(
-                        index_gate,
-                        1,
-                        token,
-                        token + 1),
+                state.indexer_->prefill(
+                    index_kv,
+                    index_gate,
                     *impl_->components.index_ape,
                     *impl_->components.index_norm,
-                    length,
+                    pos0,
                     impl_->pool_rope->first,
                     impl_->pool_rope->second,
                     config.fast_indexer() ? 2 : 0,
-                    static_cast<float>(
-                        config.rms_eps));
-                if (state.indexer_->pool_len() !=
-                    state.main_->pool_len()) {
-                    throw std::runtime_error(
-                        "DeepSeek-V4 main and Indexer "
-                        "pool lengths diverged");
+                    static_cast<float>(config.rms_eps));
+            }
+        } else {
+            for (int token = 0; token < tokens; ++token) {
+                const int length = pos0 + token + 1;
+                state.main_->update(
+                    slice_axis(
+                        main_kv,
+                        1,
+                        token,
+                        token + 1),
+                    slice_axis(
+                        main_gate,
+                        1,
+                        token,
+                        token + 1),
+                    *impl_->components.main_ape,
+                    *impl_->components.main_norm,
+                    length,
+                    impl_->pool_rope->first,
+                    impl_->pool_rope->second,
+                    0,
+                    static_cast<float>(config.rms_eps));
+                if (impl_->ratio == 4) {
+                    state.indexer_->update(
+                        slice_axis(
+                            index_kv,
+                            1,
+                            token,
+                            token + 1),
+                        slice_axis(
+                            index_gate,
+                            1,
+                            token,
+                            token + 1),
+                        *impl_->components.index_ape,
+                        *impl_->components.index_norm,
+                        length,
+                        impl_->pool_rope->first,
+                        impl_->pool_rope->second,
+                        config.fast_indexer() ? 2 : 0,
+                        static_cast<float>(config.rms_eps));
                 }
             }
+        }
+        if (state.indexer_ &&
+            state.indexer_->pool_len() !=
+                state.main_->pool_len()) {
+            throw std::runtime_error(
+                "DeepSeek-V4 main and Indexer "
+                "pool lengths diverged");
         }
     }
     if (output != projected.size()) {
@@ -2020,16 +2202,15 @@ array MlxDeepseekV4Attention::operator()(
     if (tokens == 1) {
         const int slot = pos0 % window;
         auto local_index = mlx::core::full(
-            Shape{batch, 1, head_dim},
+            Shape{batch, 1},
             slot,
             mlx::core::int32);
-        state.local_ = mlx::core::put_along_axis(
+        state.local_ = dsv4_cache_write_inplace(
             state.local_,
-            local_index,
             mlx::core::astype(
                 kv,
                 state.local_.dtype()),
-            1);
+            local_index);
         unified = state.local_;
         if (config.fast_attention()) {
             std::optional<array> pooled;
@@ -2132,15 +2313,14 @@ array MlxDeepseekV4Attention::operator()(
         auto local_indices = mlx::core::broadcast_to(
             mlx::core::reshape(
                 recent_slots,
-                Shape{1, recent, 1}),
-            Shape{batch, recent, head_dim});
-        state.local_ = mlx::core::put_along_axis(
+                Shape{1, recent}),
+            Shape{batch, recent});
+        state.local_ = dsv4_cache_write_inplace(
             state.local_,
-            local_indices,
             mlx::core::astype(
                 recent_values,
                 state.local_.dtype()),
-            1);
+            local_indices);
     }
 
     array attended = direct_decode

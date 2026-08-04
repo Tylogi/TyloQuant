@@ -1,0 +1,21 @@
+#pragma once
+
+namespace mfq::metal::detail {
+
+inline constexpr char kSteelMmaSource[] = R"MFQ_STEEL(
+@MFQ_STEEL_MMA_SOURCE@
+)MFQ_STEEL";
+
+inline constexpr char kSteelAttentionSource[] = R"MFQ_ATTN_STEEL(
+@MFQ_STEEL_ATTN_SOURCE@
+)MFQ_ATTN_STEEL";
+
+inline constexpr char kNintmPrefillSource[] = R"MFQ_NINTM(
+@MFQ_NINTM_PREFILL_SOURCE@
+)MFQ_NINTM";
+
+inline constexpr char kDsv4SparsePrefillSource[] = R"MFQ_SPARSE(
+@MFQ_DSV4_SPARSE_PREFILL_SOURCE@
+)MFQ_SPARSE";
+
+} // namespace mfq::metal::detail

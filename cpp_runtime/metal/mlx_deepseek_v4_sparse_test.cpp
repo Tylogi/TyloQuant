@@ -480,6 +480,49 @@ void test_decode_pool_state_and_bounds() {
         "decode pool capacity boundary");
 }
 
+void test_fixed_cache_write() {
+    auto cache = mlx::core::zeros(
+        Shape{2, 5, 3},
+        mlx::core::float16);
+    cache.eval();
+    const void* allocation = cache.buffer().ptr();
+    auto updated = mfq::metal::dsv4_cache_write_inplace(
+        cache,
+        mlx::core::astype(
+            float_array(
+                {
+                    1.0f, 2.0f, 3.0f,
+                    4.0f, 5.0f, 6.0f,
+                    7.0f, 8.0f, 9.0f,
+                    10.0f, 11.0f, 12.0f,
+                },
+                Shape{2, 2, 3}),
+            mlx::core::float16),
+        int_array(
+            {1, 4, 0, 3},
+            Shape{2, 2}));
+    updated.eval();
+    require(
+        updated.buffer().ptr() == allocation,
+        "fixed cache update replaced the Metal allocation");
+    require_close(
+        evaluated_float(updated),
+        {
+            0.0f, 0.0f, 0.0f,
+            1.0f, 2.0f, 3.0f,
+            0.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 0.0f,
+            4.0f, 5.0f, 6.0f,
+            7.0f, 8.0f, 9.0f,
+            0.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 0.0f,
+            10.0f, 11.0f, 12.0f,
+            0.0f, 0.0f, 0.0f,
+        },
+        1e-3f,
+        "fixed cache update");
+}
+
 void test_overlap_state() {
     const CompressorFixture fixture(128, 2, true);
     const auto token = mlx::core::astype(
@@ -606,6 +649,38 @@ void test_indexer_paths() {
                     std::signbit(decode_values[key_index]),
                 "decode indexer visibility mismatch");
         }
+    }
+
+    constexpr int fixed_capacity = 257;
+    constexpr int fixed_prefix = 129;
+    auto fixed_scores = mfq::metal::dsv4_indexer_scores_decode(
+        float_array(
+            std::vector<float>(64 * 128, 1.0f),
+            Shape{1, 1, 64, 128}),
+        float_array(
+            std::vector<float>(
+                fixed_capacity * 128,
+                0.5f),
+            Shape{1, fixed_capacity, 128}),
+        float_array(
+            std::vector<float>(64, 1.0f / 64.0f),
+            Shape{1, 1, 64}),
+        258,
+        2,
+        fixed_prefix);
+    require(
+        fixed_scores.shape() == Shape{1, 1, fixed_capacity},
+        "fixed decode indexer scratch shape mismatch");
+    const auto fixed_topk = evaluated_int(
+        mfq::metal::dsv4_topk512(
+            fixed_scores,
+            true,
+            fixed_prefix));
+    for (int index = 0; index < 512; ++index) {
+        require(
+            fixed_topk[index] ==
+                (index < fixed_prefix ? index : 0),
+            "fixed decode indexer valid-prefix mismatch");
     }
 }
 
@@ -1155,6 +1230,7 @@ int main() {
     try {
         test_fp4_sim();
         test_compressor_quantization();
+        test_fixed_cache_write();
         test_decode_pool_state_and_bounds();
         test_overlap_state();
         test_indexer_paths();

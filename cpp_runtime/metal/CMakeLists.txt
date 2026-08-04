@@ -47,6 +47,85 @@ find_library(MFQ_FOUNDATION_FRAMEWORK Foundation REQUIRED)
 find_library(MFQ_QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
 find_library(MFQ_ACCELERATE_FRAMEWORK Accelerate REQUIRED)
 
+# MLX's runtime Metal compiler does not expose filesystem include paths.  Fold
+# the Steel MMA implementation into the NINTM prefill source at configure time
+# so the native primitive can use the same tiled MMA machinery as MLX/oMLX
+# without requiring a full Xcode Metal command-line toolchain at build time.
+set(_MFQ_STEEL_STUB_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/metal-include-stubs")
+file(MAKE_DIRECTORY "${_MFQ_STEEL_STUB_DIR}")
+foreach(_MFQ_METAL_SYSTEM_HEADER
+        metal_stdlib metal_math metal_simdgroup metal_simdgroup_matrix)
+    file(TOUCH
+        "${_MFQ_STEEL_STUB_DIR}/${_MFQ_METAL_SYSTEM_HEADER}")
+endforeach()
+set(_MFQ_STEEL_ENTRY
+    "${CMAKE_CURRENT_BINARY_DIR}/mfq_steel_mma_entry.h")
+file(WRITE "${_MFQ_STEEL_ENTRY}"
+    "#include \"mlx/backend/metal/kernels/complex.h\"\n"
+    "#include \"mlx/backend/metal/kernels/steel/gemm/mma.h\"\n")
+execute_process(
+    COMMAND "${CMAKE_CXX_COMPILER}" -E -P -x c++
+        -D__METAL_VERSION__=310
+        "-I${MFQ_MLX_ROOT}/include"
+        "-I${_MFQ_STEEL_STUB_DIR}"
+        "${_MFQ_STEEL_ENTRY}"
+    RESULT_VARIABLE _MFQ_STEEL_EXPAND_RESULT
+    OUTPUT_VARIABLE MFQ_STEEL_MMA_SOURCE
+    ERROR_VARIABLE _MFQ_STEEL_EXPAND_ERROR)
+if(NOT _MFQ_STEEL_EXPAND_RESULT EQUAL 0)
+    message(FATAL_ERROR
+        "Failed to embed MLX Steel MMA headers: "
+        "${_MFQ_STEEL_EXPAND_ERROR}")
+endif()
+set(_MFQ_STEEL_ATTN_ENTRY
+    "${CMAKE_CURRENT_BINARY_DIR}/mfq_steel_attn_entry.h")
+file(WRITE "${_MFQ_STEEL_ATTN_ENTRY}"
+    "#include \"mlx/backend/metal/kernels/utils.h\"\n"
+    "#include \"mlx/backend/metal/kernels/steel/attn/attn.h\"\n")
+execute_process(
+    COMMAND "${CMAKE_CXX_COMPILER}" -E -P -x c++
+        -D__METAL_VERSION__=310
+        -DMLX_METAL_JIT
+        "-I${MFQ_MLX_ROOT}/include"
+        "-I${_MFQ_STEEL_STUB_DIR}"
+        "${_MFQ_STEEL_ATTN_ENTRY}"
+    RESULT_VARIABLE _MFQ_STEEL_ATTN_EXPAND_RESULT
+    OUTPUT_VARIABLE MFQ_STEEL_ATTN_SOURCE
+    ERROR_VARIABLE _MFQ_STEEL_ATTN_EXPAND_ERROR)
+if(NOT _MFQ_STEEL_ATTN_EXPAND_RESULT EQUAL 0)
+    message(FATAL_ERROR
+        "Failed to embed MLX Steel attention headers: "
+        "${_MFQ_STEEL_ATTN_EXPAND_ERROR}")
+endif()
+set(_MFQ_NINTM_PREFILL_METAL
+    "${CMAKE_CURRENT_SOURCE_DIR}/mfq_nintm_prefill.metal")
+file(READ "${_MFQ_NINTM_PREFILL_METAL}"
+    MFQ_NINTM_PREFILL_SOURCE)
+string(REPLACE
+    "#include \"mlx/backend/metal/kernels/steel/gemm/gemm.h\""
+    ""
+    MFQ_NINTM_PREFILL_SOURCE
+    "${MFQ_NINTM_PREFILL_SOURCE}")
+set(_MFQ_DSV4_SPARSE_PREFILL_METAL
+    "${CMAKE_CURRENT_SOURCE_DIR}/mfq_dsv4_sparse_prefill.metal")
+file(READ "${_MFQ_DSV4_SPARSE_PREFILL_METAL}"
+    MFQ_DSV4_SPARSE_PREFILL_SOURCE)
+string(REPLACE
+    "#include \"mlx/backend/metal/kernels/steel/attn/attn.h\""
+    ""
+    MFQ_DSV4_SPARSE_PREFILL_SOURCE
+    "${MFQ_DSV4_SPARSE_PREFILL_SOURCE}")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${_MFQ_NINTM_PREFILL_METAL}"
+    "${_MFQ_DSV4_SPARSE_PREFILL_METAL}"
+    "${MFQ_MLX_ROOT}/include/mlx/backend/metal/kernels/steel/attn/attn.h"
+    "${MFQ_MLX_ROOT}/include/mlx/backend/metal/kernels/steel/gemm/mma.h")
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/mfq_nintm_prefill_embedded.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/mfq_nintm_prefill_embedded.h"
+    @ONLY)
+
 add_library(mfq-metal-runtime STATIC
     deepseek_v4_model.cpp
     mfq_container.cpp
@@ -74,6 +153,9 @@ add_library(mfq-metal-runtime STATIC
 )
 target_include_directories(mfq-metal-runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_include_directories(mfq-metal-runtime PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}
 )
 target_link_libraries(mfq-metal-runtime PUBLIC
     mfq-mlx
@@ -237,6 +319,17 @@ set_target_properties(mfq-metal-mx-test PROPERTIES
     BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
 )
 add_test(NAME mfq-metal-mx-test COMMAND mfq-metal-mx-test)
+
+add_executable(mfq-metal-mx-benchmark
+    mlx_mx_benchmark.cpp
+)
+target_link_libraries(mfq-metal-mx-benchmark PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(mfq-metal-mx-benchmark PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-mx-benchmark PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
 
 add_executable(mfq-metal-nint-benchmark
     mlx_nint_benchmark.cpp

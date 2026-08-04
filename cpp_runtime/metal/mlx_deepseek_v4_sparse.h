@@ -27,6 +27,15 @@ struct MlxDsv4PoolUpdate {
     std::optional<mlx::core::array> prev_gate;
 };
 
+// Destructively update rows of a fixed-capacity [B,C,D] cache. The returned
+// array aliases the original Metal allocation; callers must replace the old
+// cache handle and must not retain snapshots of it. This mirrors llama.cpp's
+// persistent KV writes instead of copying all C rows for every token.
+mlx::core::array dsv4_cache_write_inplace(
+    const mlx::core::array& cache,
+    const mlx::core::array& values,
+    const mlx::core::array& rows);
+
 // Simulate DeepSeek-V4's power-of-two-scaled E2M1 cache groups.
 mlx::core::array dsv4_fp4_sim(
     const mlx::core::array& input);
@@ -93,18 +102,23 @@ mlx::core::array dsv4_indexer_scores(
     int query_offset,
     int ratio);
 
-// Decode-specialized streaming indexer score path.
+// Decode-specialized streaming indexer score path. When score_count is set,
+// only that key prefix is dispatched while the returned scratch keeps the
+// full K capacity; pass the same prefix as valid_keys to dsv4_topk512.
 mlx::core::array dsv4_indexer_scores_decode(
     const mlx::core::array& q,
     const mlx::core::array& k,
     const mlx::core::array& weights,
     int query_offset,
-    int ratio);
+    int ratio,
+    int score_count = -1);
 
-// Fixed-width half-precision top-512 selection.
+// Fixed-width half-precision top-512 selection. valid_keys limits selection
+// to an initialized prefix of a fixed-capacity decode scratch.
 mlx::core::array dsv4_topk512(
     const mlx::core::array& scores,
-    bool deterministic = true);
+    bool deterministic = true,
+    int valid_keys = -1);
 
 // Build circular-local plus pooled sparse-attention plans.  The pair contains
 // int32 cache indices followed by a float16 additive mask.

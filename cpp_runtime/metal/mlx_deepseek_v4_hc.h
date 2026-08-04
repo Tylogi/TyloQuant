@@ -41,4 +41,13 @@ mlx::core::array deepseek_v4_hc_post(
     const mlx::core::array& post,
     const mlx::core::array& combination);
 
+// HC expansion with a fused routed + shared MoE branch sum. This avoids a
+// full hidden-width temporary and one elementwise dispatch per layer.
+mlx::core::array deepseek_v4_hc_post_sum(
+    const mlx::core::array& routed,
+    const mlx::core::array& shared,
+    const mlx::core::array& residual,
+    const mlx::core::array& post,
+    const mlx::core::array& combination);
+
 } // namespace mfq::metal

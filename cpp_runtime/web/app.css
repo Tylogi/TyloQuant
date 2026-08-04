@@ -1756,6 +1756,16 @@ svg {
   background: var(--surface-muted);
 }
 
+.reload-model-button {
+  width: 100%;
+  margin-top: 10px;
+}
+
+.reload-model-button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
 .toast-region {
   position: fixed;
   z-index: 100;

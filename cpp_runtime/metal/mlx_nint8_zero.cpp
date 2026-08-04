@@ -74,29 +74,55 @@ constexpr const char* kNint8ZeroGemv = R"METAL(
     }
 
     float accumulator = 0.0f;
-    // Four adjacent Q8 values stay within one 32-value scale block.  Loading
-    // them as one vector cuts loop/address overhead by 4x while preserving the
-    // coalesced one-SIMD-per-output memory layout.
-    for (uint column = lane * 4u;
+    // Wide projections amortize one scale/address calculation over sixteen
+    // adjacent Q8 values. Narrow projections use eight to avoid unnecessary
+    // live vectors. Both widths stay inside one 32-value scale block.
+    constexpr uint VECTOR_WIDTH = uint(K) >= 4096u ? 16u : 8u;
+    for (uint column = lane * VECTOR_WIDTH;
          column < uint(K);
-         column += 128u) {
+         column += 32u * VECTOR_WIDTH) {
+        float4 activations0 = float4(
+            float(x[column]),
+            float(x[column + 1u]),
+            float(x[column + 2u]),
+            float(x[column + 3u]));
+        float4 activations1 = float4(
+            float(x[column + 4u]),
+            float(x[column + 5u]),
+            float(x[column + 6u]),
+            float(x[column + 7u]));
+        float4 activations2 = float4(0.0f);
+        float4 activations3 = float4(0.0f);
+        if (VECTOR_WIDTH == 16u) {
+            activations2 = float4(
+                float(x[column + 8u]),
+                float(x[column + 9u]),
+                float(x[column + 10u]),
+                float(x[column + 11u]));
+            activations3 = float4(
+                float(x[column + 12u]),
+                float(x[column + 13u]),
+                float(x[column + 14u]),
+                float(x[column + 15u]));
+        }
         uint group = column >> 5;
         float scale = float(scales[output * uint(NG) + group]);
         uint offset = output * uint(K) + column;
         const device char4* packed =
             (const device char4*)(q + offset);
-        char4 codes = *packed;
-        float4 activations = float4(
-            float(x[column]),
-            float(x[column + 1u]),
-            float(x[column + 2u]),
-            float(x[column + 3u]));
-        float4 weights = scale * float4(codes);
+        float4 weights0 = scale * float4(packed[0]);
+        float4 weights1 = scale * float4(packed[1]);
+        float4 weights2 = float4(0.0f);
+        float4 weights3 = float4(0.0f);
+        if (VECTOR_WIDTH == 16u) {
+            weights2 = scale * float4(packed[2]);
+            weights3 = scale * float4(packed[3]);
+        }
         accumulator +=
-            activations.x * weights.x
-            + activations.y * weights.y
-            + activations.z * weights.z
-            + activations.w * weights.w;
+            dot(activations0, weights0)
+            + dot(activations1, weights1)
+            + dot(activations2, weights2)
+            + dot(activations3, weights3);
     }
 
     float total = simd_sum(accumulator);

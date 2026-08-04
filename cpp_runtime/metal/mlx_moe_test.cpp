@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -2928,9 +2929,28 @@ void test_vq_cohorts_and_ffn() {
         make_npq(width, width),
         make_rotated_nepq1_s(width, width),
     });
+    const char* previous_exec = std::getenv(
+        "MFQ_METAL_NINTM_JSC_EXEC");
+    const bool had_previous_exec =
+        previous_exec != nullptr;
+    const std::string previous_exec_value =
+        had_previous_exec ? previous_exec : "";
+    setenv("MFQ_METAL_NINTM_JSC_EXEC", "1", 1);
     const auto weight =
         mfq::metal::MlxMoeWeight::from_blob(
             fixture.blob);
+    setenv("MFQ_METAL_NINTM_JSC_EXEC", "0", 1);
+    const auto legacy_weight =
+        mfq::metal::MlxMoeWeight::from_blob(
+            fixture.blob);
+    if (had_previous_exec) {
+        setenv(
+            "MFQ_METAL_NINTM_JSC_EXEC",
+            previous_exec_value.c_str(),
+            1);
+    } else {
+        unsetenv("MFQ_METAL_NINTM_JSC_EXEC");
+    }
     require(
         weight.experts() == fixture.experts
             && weight.out_per_expert() == width
@@ -2969,6 +2989,31 @@ void test_vq_cohorts_and_ffn() {
                     tokens,
                     routes,
                 })));
+    const auto legacy_actual = evaluated_floats(
+        legacy_weight.routed_matmul(
+            mlx::core::array(
+                input.begin(),
+                mlx::core::Shape{
+                    tokens,
+                    width,
+                }),
+            mlx::core::array(
+                ids.begin(),
+                mlx::core::Shape{
+                    tokens,
+                    routes,
+                })));
+    require(
+        legacy_actual.size() == actual.size(),
+        "JSC execution layout result size mismatch");
+    for (std::size_t index = 0;
+         index < actual.size();
+         ++index) {
+        require_close(
+            actual[index],
+            legacy_actual[index],
+            1e-6f);
+    }
     for (int token = 0; token < tokens; ++token) {
         std::vector<float> source(
             input.begin() + token * width,
@@ -3171,6 +3216,132 @@ void test_vq_cohorts_and_ffn() {
             ffn_actual[index],
             expected[index],
             8e-3f);
+    }
+}
+
+void test_grouped_vq_mmq_prefill() {
+    constexpr int tokens = 49;
+    constexpr int routes = 2;
+    constexpr int width = 24;
+    auto fixture = make_vq_moe_fixture({
+        make_jsc_nvq(
+            width,
+            width,
+            "NVQ3J",
+            2,
+            4,
+            8),
+        make_jsc_nvq(width, width),
+    });
+    const auto weight =
+        mfq::metal::MlxMoeWeight::from_blob(
+            fixture.blob);
+    std::vector<float> input(tokens * width);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] = static_cast<float>(
+            static_cast<int>((index * 7 + 5) % 23) - 11)
+            / 128.0f;
+    }
+    std::vector<std::int32_t> ids(tokens * routes);
+    for (int row = 0; row < tokens * routes; ++row) {
+        ids[row] = row < 31 ? 0 : 1;
+    }
+    auto input_array = mlx::core::astype(
+        mlx::core::array(
+            input.begin(),
+            mlx::core::Shape{tokens, width}),
+        mlx::core::float16);
+    const auto actual = evaluated_floats(
+        weight.routed_matmul(
+            input_array,
+            mlx::core::array(
+                ids.begin(),
+                mlx::core::Shape{tokens, routes})));
+    auto ids_array = mlx::core::array(
+        ids.begin(),
+        mlx::core::Shape{tokens, routes});
+    auto route_order = mlx::core::contiguous(
+        mlx::core::astype(
+            mlx::core::argsort(
+                mlx::core::reshape(
+                    ids_array,
+                    mlx::core::Shape{tokens * routes})),
+            mlx::core::int32));
+    auto block_plan = weight.build_grouped_vq_mmq_plan(
+        ids_array,
+        route_order);
+    require(block_plan.block_rows == 32, "unexpected block row size");
+    require(
+        block_plan.route_count == tokens * routes,
+        "unexpected block plan route count");
+    auto plain_sorted = weight.routed_matmul_sorted(
+        input_array,
+        ids_array,
+        route_order,
+        false,
+        false,
+        0.0f,
+        &block_plan);
+    const auto plain_actual = evaluated_floats(
+        mlx::core::take(
+            std::move(plain_sorted),
+            mlx::core::argsort(route_order),
+            0));
+    auto fused_sorted = weight.routed_matmul_sorted(
+        input_array,
+        ids_array,
+        route_order,
+        false,
+        true,
+        0.0f,
+        &block_plan);
+    const auto fused_actual = evaluated_floats(
+        mlx::core::reshape(
+            mlx::core::take(
+                std::move(fused_sorted),
+                mlx::core::argsort(route_order),
+                0),
+            mlx::core::Shape{tokens, routes, width / 2}));
+    for (int token = 0; token < tokens; ++token) {
+        std::vector<float> source(
+            input.begin() + token * width,
+            input.begin() + (token + 1) * width);
+        for (int route = 0; route < routes; ++route) {
+            int expert = ids[token * routes + route];
+            for (int output = 0; output < width; ++output) {
+                require_close(
+                    plain_actual[
+                        (token * routes + route) * width + output],
+                    actual[(token * routes + route) * width + output],
+                    4e-3f);
+                require_close(
+                    actual[(token * routes + route) * width + output],
+                    routed_vq_dot(
+                        source,
+                        fixture,
+                        expert,
+                        output),
+                    4e-3f);
+            }
+            for (int output = 0; output < width / 2; ++output) {
+                const float gate = routed_vq_dot(
+                    source,
+                    fixture,
+                    expert,
+                    output);
+                const float up = routed_vq_dot(
+                    source,
+                    fixture,
+                    expert,
+                    output + width / 2);
+                require_close(
+                    fused_actual[
+                        (token * routes + route) * (width / 2)
+                        + output],
+                    gate / (1.0f + std::exp(-gate)) * up,
+                    6e-3f);
+            }
+        }
     }
 }
 
@@ -3440,6 +3611,7 @@ int main() {
         test_all_families_and_projections();
         test_swiglu_ffn();
         test_vq_cohorts_and_ffn();
+        test_grouped_vq_mmq_prefill();
         test_container_validation();
         test_streamed_cccp_residency();
         std::cout

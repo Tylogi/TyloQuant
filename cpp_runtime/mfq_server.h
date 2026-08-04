@@ -27,6 +27,7 @@ struct MfqServerConfig {
     std::string api_key;
     std::string web_root;
     int64_t max_context = 0;
+    int64_t context_capacity = 0;
     int64_t vocab_size = 0;
 };
 
@@ -50,8 +51,12 @@ using MfqGenerateFn = std::function<int32_t(
     const MfqSamplingParams & sampling,
     const MfqTokenCallback & on_token,
     const MfqPrefillCallback & on_prefill)>;
+using MfqReloadFn = std::function<int64_t(int64_t context_size)>;
 
-int run_mfq_server(const MfqServerConfig & config, const MfqGenerateFn & generate);
+int run_mfq_server(
+    const MfqServerConfig & config,
+    const MfqGenerateFn & generate,
+    const MfqReloadFn & reload = {});
 MfqTokenizerProbe probe_mfq_tokenizer(
     const std::vector<uint8_t> & tokenizer_gguf,
     const std::string & text,

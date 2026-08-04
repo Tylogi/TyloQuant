@@ -1394,6 +1394,76 @@ int main() {
             8e-4f,
             "NINT4/5/6 float32 fallback");
 
+        // The DeepSeek-V4 shared expert uses an independent dense router and
+        // an equal-width NINT gate/up pair.  Decode can therefore keep the
+        // pair's limited SwiGLU inside the single-row grouped dispatch.
+        const auto swiglu_gate_fixture =
+            make_nint_fixture(5, 9);
+        const auto swiglu_up_fixture =
+            make_nint_fixture(6, 9);
+        const auto swiglu_gate_weight =
+            mfq::metal::MlxNintWeight::from_blob(
+                swiglu_gate_fixture.blob);
+        const auto swiglu_up_weight =
+            mfq::metal::MlxNintWeight::from_blob(
+                swiglu_up_fixture.blob);
+        const mfq::metal::MlxGroupedLinear swiglu_pair({
+            &swiglu_gate_weight,
+            &swiglu_up_weight,
+        });
+        require(
+            swiglu_pair.supports_single_row_swiglu(half_input),
+            "equal-width NINT5/6 gate/up rejected fused SwiGLU");
+        require(
+            !swiglu_pair.supports_single_row_swiglu(input),
+            "float32 gate/up unexpectedly accepted fused SwiGLU");
+        require(
+            !swiglu_pair.supports_single_row_swiglu(
+                mlx::core::concatenate(
+                    {half_input, half_input},
+                    0)),
+            "multi-row gate/up unexpectedly accepted fused SwiGLU");
+
+        constexpr float swiglu_limit = 0.75f;
+        auto unfused_swiglu = swiglu_pair(half_input);
+        auto fused_swiglu = mlx::core::contiguous(
+            mlx::core::astype(
+                swiglu_pair.single_row_swiglu(
+                    half_input,
+                    swiglu_limit),
+                mlx::core::float32));
+        auto unfused_gate = mlx::core::contiguous(
+            mlx::core::astype(
+                unfused_swiglu[0],
+                mlx::core::float32));
+        auto unfused_up = mlx::core::contiguous(
+            mlx::core::astype(
+                unfused_swiglu[1],
+                mlx::core::float32));
+        mlx::core::eval(
+            {fused_swiglu, unfused_gate, unfused_up});
+        require(
+            fused_swiglu.shape() == mlx::core::Shape{1, 9},
+            "fused grouped SwiGLU output shape mismatch");
+        const auto* fused_values = fused_swiglu.data<float>();
+        const auto* gate_values = unfused_gate.data<float>();
+        const auto* up_values = unfused_up.data<float>();
+        for (int output = 0; output < 9; ++output) {
+            const float gate = std::min(
+                gate_values[output],
+                swiglu_limit);
+            const float up = std::clamp(
+                up_values[output],
+                -swiglu_limit,
+                swiglu_limit);
+            const float expected =
+                gate / (1.0f + std::exp(-gate)) * up;
+            require_close(
+                fused_values[output],
+                expected,
+                1.5e-3f);
+        }
+
         // Cover tiles where only a subset of heterogeneous projections is
         // still active (Q only, Q+V, and Q+K+V).
         const auto uneven_q_fixture =

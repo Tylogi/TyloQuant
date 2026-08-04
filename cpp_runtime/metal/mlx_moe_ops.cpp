@@ -139,6 +139,84 @@ constexpr const char* kTopKSource = R"METAL(
     }
 )METAL";
 
+constexpr const char* kDenseRouterTopKSource = R"METAL(
+    constexpr uint EXPERTS = 256u;
+    constexpr uint TOP_K = 6u;
+    constexpr uint SIMD_GROUPS = 32u;
+
+    uint tid = thread_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    threadgroup float route_weights[EXPERTS];
+    threadgroup float scores[EXPERTS];
+
+    // One SIMD group consumes one row at a time.  Eight rounds cover all 256
+    // experts while every weight and activation load remains contiguous.
+    for (uint round = 0u; round < 8u; ++round) {
+        uint expert = round * SIMD_GROUPS + simd_group;
+        uint weight_base = expert * uint(K);
+        float accumulator = 0.0f;
+        for (
+            uint column = lane * 4u;
+            column < uint(K);
+            column += 128u
+        ) {
+            float4 activation = float4(
+                *(device const half4*)(input + column));
+            float4 values = float4(
+                *(device const half4*)(weight + weight_base + column));
+            accumulator += dot(activation, values);
+        }
+        float raw = simd_sum(accumulator);
+        if (lane == 0u) {
+            // Preserve the existing FP16 router GEMV output boundary before
+            // applying sqrt-softplus and selecting experts.
+            raw = float(half(raw));
+            raw = isnan(raw) ? -FLT_MAX : raw;
+            float softplus = raw > 20.0f ? raw : log1p(exp(raw));
+            float route_weight = sqrt(softplus);
+            route_weights[expert] = route_weight;
+            scores[expert] = (
+                HAS_AVAILABLE == 0 || available[expert]
+            )
+                ? route_weight
+                    + (HAS_BIAS != 0 ? bias[expert] : 0.0f)
+                : -INFINITY;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        float selected_weights[TOP_K];
+        for (uint rank = 0u; rank < TOP_K; ++rank) {
+            float best_score = -INFINITY;
+            uint best_expert = EXPERTS;
+            for (uint expert = 0u; expert < EXPERTS; ++expert) {
+                float score = scores[expert];
+                if (
+                    score > best_score
+                    || (score == best_score && expert < best_expert)
+                ) {
+                    best_score = score;
+                    best_expert = expert;
+                }
+            }
+            ids[rank] = int(best_expert);
+            selected_weights[rank] = route_weights[best_expert];
+            scores[best_expert] = -INFINITY;
+        }
+        float denominator = 0.0f;
+        for (uint rank = 0u; rank < TOP_K; ++rank) {
+            denominator += selected_weights[rank];
+        }
+        denominator = max(denominator, params[0]);
+        for (uint rank = 0u; rank < TOP_K; ++rank) {
+            weights[rank] =
+                selected_weights[rank] / denominator * params[1];
+        }
+    }
+)METAL";
+
 constexpr const char* kSqrtSoftplusSource = R"METAL(
     uint lane = thread_index_in_simdgroup;
     uint row = thread_position_in_grid.x >> 5;
@@ -318,6 +396,16 @@ const mlx::core::fast::CustomKernelFunction& top_k_kernel() {
         {"logits", "bias", "available", "params"},
         {"ids", "weights"},
         kTopKSource);
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+dense_router_top_k_kernel() {
+    static const auto kernel = make_kernel(
+        "mfq_cpp_moe_dense_router_topk",
+        {"input", "weight", "bias", "available", "params"},
+        {"ids", "weights"},
+        kDenseRouterTopKSource);
     return kernel;
 }
 
@@ -592,6 +680,100 @@ MlxMoeTopKResult moe_topk(
             {"TOP_K", top_k},
             {"MODE", mode},
             {"NORMALIZE", static_cast<int>(normalize)},
+            {"HAS_BIAS", static_cast<int>(bias.has_value())},
+            {
+                "HAS_AVAILABLE",
+                static_cast<int>(available.has_value()),
+            },
+        },
+        std::nullopt,
+        false,
+        {});
+    return {
+        std::move(outputs.at(0)),
+        std::move(outputs.at(1)),
+    };
+}
+
+bool moe_dense_router_topk_supported(
+    const array& input,
+    const array& weight) noexcept {
+    return input.ndim() > 0
+        && input.dtype() == mlx::core::float16
+        && input.size() == static_cast<std::size_t>(
+            input.shape(-1))
+        && input.shape(-1) > 0
+        && (input.shape(-1) % 4) == 0
+        && weight.ndim() == 2
+        && weight.dtype() == mlx::core::float16
+        && weight.shape(0) == 256
+        && weight.shape(1) == input.shape(-1);
+}
+
+MlxMoeTopKResult moe_dense_router_topk(
+    const array& input,
+    const array& weight,
+    const std::optional<array>& bias,
+    const std::optional<array>& available,
+    float norm_floor,
+    float scale) {
+    if (!moe_dense_router_topk_supported(input, weight)) {
+        throw std::invalid_argument(
+            "fused dense router requires one FP16 row and a "
+            "contiguous [256,K] FP16 weight with K divisible by four");
+    }
+    if (!std::isfinite(norm_floor) || norm_floor < 0.0f ||
+        !std::isfinite(scale)) {
+        throw std::invalid_argument(
+            "fused dense router parameters are invalid");
+    }
+    auto source = mlx::core::contiguous(
+        mlx::core::reshape(
+            input,
+            Shape{1, input.shape(-1)}));
+    auto weights = mlx::core::contiguous(weight);
+    array bias_values =
+        mlx::core::zeros(Shape{256}, mlx::core::float32);
+    if (bias.has_value()) {
+        bias_values = float32_contiguous(*bias);
+        if (bias_values.shape() != Shape{256}) {
+            throw std::invalid_argument(
+                "fused dense router bias shape mismatch");
+        }
+    }
+    array available_values =
+        mlx::core::ones(Shape{256}, mlx::core::bool_);
+    if (available.has_value()) {
+        available_values = mlx::core::contiguous(
+            mlx::core::reshape(
+                mlx::core::astype(
+                    *available,
+                    mlx::core::bool_),
+                Shape{checked_int(
+                    available->size(),
+                    "fused router availability size")}));
+        if (available_values.shape() != Shape{256}) {
+            throw std::invalid_argument(
+                "fused dense router availability shape mismatch");
+        }
+    }
+    const array params(
+        {norm_floor, scale},
+        mlx::core::float32);
+    auto outputs = dense_router_top_k_kernel()(
+        {
+            source,
+            weights,
+            bias_values,
+            available_values,
+            params,
+        },
+        {Shape{1, 6}, Shape{1, 6}},
+        {mlx::core::int32, mlx::core::float32},
+        {1024, 1, 1},
+        {1024, 1, 1},
+        {
+            {"K", input.shape(-1)},
             {"HAS_BIAS", static_cast<int>(bias.has_value())},
             {
                 "HAS_AVAILABLE",
