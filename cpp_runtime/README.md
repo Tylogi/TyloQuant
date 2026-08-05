@@ -196,6 +196,10 @@ build/cpp_runtime/mfq-decode.exe `
 `--cpu-offload-layers` 同时使用。运行结束会输出命中、miss、eviction、H2D
 字节数和实际 arena 分配量。
 
+decode 默认让 route id 的异步 D2H 回读与 shared expert 计算重叠，再提交所需
+专家的 H2D 传输。设置 `MFQ_MOE_DELAYED_ROUTE_READBACK=0` 可恢复同步回读，
+用于性能和数值对照。
+
 可选的 `--moe-cache-profile profile.json` 在模型加载阶段预热专家。JSON
 描述的是来源无关的逐层专家排名或边缘频率；REAP、路由 trace 和手工统计都可以
 生成它：
