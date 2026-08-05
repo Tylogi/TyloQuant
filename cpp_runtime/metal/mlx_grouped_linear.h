@@ -53,9 +53,11 @@ public:
     std::vector<mlx::core::array> matmul(
         const mlx::core::array& input) const;
 
-    // Decode-only two-projection fast path. The two equally sized NINT
-    // projections share their activation loads and round to the input dtype
-    // before applying limited SwiGLU in the same Metal dispatch.
+    // Decode-only two-projection fast path. Equally sized NINT projections
+    // share their activation loads. MXFP8 Gate/Up uses two independent
+    // 16-lane halves of each SIMD group so both projections remain parallel.
+    // Both paths round to the input dtype before applying limited SwiGLU in
+    // the same Metal dispatch.
     bool supports_single_row_swiglu(
         const mlx::core::array& input) const noexcept;
     mlx::core::array single_row_swiglu(
