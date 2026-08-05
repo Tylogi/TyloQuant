@@ -16,6 +16,10 @@ NINT · NVQ/NPQ · NEPQ · TPQ · Gradient Precision Calibration · Expert-Wise 
   <strong>English</strong> | <a href="./README.zh-CN.md">中文</a>
 </p>
 
+<p align="center">
+  <a href="https://huggingface.co/Tylogi">Hugging Face Models</a> · <a href="https://www.modelscope.cn/profile/Tylogi">ModelScope Models</a>
+</p>
+
 **TyloQuant MFQ** (or **MFQ**) co-designs quantization formats, precision
 allocation, and inference kernels for high-fidelity LLM deployment. It supports
 custom weight encodings from `0.84-8.30 bpw`, allocates precision per compute
@@ -29,6 +33,21 @@ matched to llama.cpp `IQ*` use `V`, while scalar-quantized models matched to
 and registered tiers.
 
 ## Result at a Glance
+
+### DeepSeek-V4-Flash-0731
+
+<img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ versus Unsloth Dynamic disk size and Mean KLD at ctx512 and ctx2048" width="100%">
+
+Notably, even the smallest `74.902 GiB` MFQ tier retains strong fidelity: at
+both context lengths, its Mean KLD is lower than every completed Unsloth Dynamic
+result shown, including the `127.277 GiB` IQ4 results.
+
+The full WikiText-2 evaluation uses identical BF16-reference logits, tokenizer,
+BOS, and token sequences for both runtimes. It covers 146,115 scored tokens at
+`ctx512` and 146,289 at `ctx2048`. Across the three closest-size pairs, MFQ
+reduces Mean KLD by **57.04–57.75%** at `ctx512` and **52.88–55.35%** at
+`ctx2048`, with each pair within 2.116 GiB. Lower Mean KLD is better. See the
+[complete results and protocol](./docs/deepseek-v4-flash-0731-results.md).
 
 ### Qwen3.5-9B: disk size vs. Mean KLD
 
@@ -207,7 +226,7 @@ See the [Metal development status](./docs/metal.md).
 
 - [ ] Publish a reproducible Gemma-4-26B-A4B-it benchmark protocol and raw result bundle
 - [ ] Add matched-size KLD and perplexity results for more Qwen3.5 and Qwen3.6 models
-- [ ] Complete independent full-model KLD evaluation for DeepSeek-V4-Flash
+- [x] Complete independent full-model KLD evaluation for DeepSeek-V4-Flash
 - [ ] Re-run production decode acceptance after the NINT8 M=1 kernel fix
 - [ ] Add benchmark coverage for more model families and GPU generations
 - [ ] Publish downloadable quantized models with model cards and checksums
@@ -217,10 +236,32 @@ See the [Metal development status](./docs/metal.md).
 ## Documentation
 
 - [Benchmarks and Technical Notes](./docs/benchmarks.md)
+- [DeepSeek-V4-Flash-0731 Results](./docs/deepseek-v4-flash-0731-results.md)
 - [Quantization Format Specification](./FORMATS.md)
 - [C++ Runtime and API](./cpp_runtime/README.md)
 - [Apple Silicon / Metal Development Status](./docs/metal.md)
 - [MoE Observation Data Index](./plan/MoE公开Observation数据索引.md)
 - [0xSero Public Resource Index](./plan/0xSero公开资源索引.md)
+
+## Acknowledgements
+
+MFQ benefits from the outstanding work of the open-source AI community. We
+especially thank:
+
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) for the GGUF ecosystem,
+  optimized inference backends, and evaluation tooling that underpin important
+  parts of MFQ interoperability and validation.
+- [oMLX](https://github.com/jundot/omlx) for its excellent Apple silicon
+  inference engineering and valuable performance and design references.
+- [MLX](https://github.com/ml-explore/mlx) for the Apple silicon array framework
+  and Metal runtime used by MFQ's native macOS path.
+- [PyTorch](https://github.com/pytorch/pytorch) and
+  [Transformers](https://github.com/huggingface/transformers) for core research,
+  model integration, and quantization infrastructure.
+- [Unsloth](https://github.com/unslothai/unsloth) for openly released Dynamic
+  quantization models and reproducible comparison baselines.
+
+We are grateful to their maintainers and contributors for making
+high-performance local inference more accessible.
 
 License: [Apache License 2.0](./LICENSE).

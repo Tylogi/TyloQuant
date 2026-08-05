@@ -6980,6 +6980,23 @@ static torch::Tensor load_dense_gpu(const MfqFile & mfq, const std::string & nam
         active_weight_load_device());
     const auto & rec = mfq.record(name);
     auto blob = mfq.read_blob(name);
+    if (rec.dtype == "NINT8-0") {
+        const auto packed = to_gpu_nint8_zero(
+            unpack_nint8_zero(blob));
+        auto dense = nint8_zero_dequant_cuda(
+            packed.q_packed,
+            packed.q8_zero_scale,
+            packed.neuron_len)
+            .to(torch::kFloat32)
+            .contiguous();
+        if (packed.shape.size() != 2 ||
+            dense.size(0) != packed.shape[0] ||
+            dense.size(1) != packed.shape[1]) {
+            throw std::runtime_error(
+                "NINT8-0 dense tensor shape mismatch: " + name);
+        }
+        return dense;
+    }
     size_t off = 0;
     uint32_t ndim = read_u32_from(blob, off);
     std::vector<int64_t> shape(ndim);
@@ -7004,6 +7021,50 @@ static torch::Tensor load_dense_gpu(const MfqFile & mfq, const std::string & nam
     }
     (void)numel;
     return t.to(torch::kCUDA).contiguous();
+}
+
+static torch::Tensor load_dense_linear_cpu(
+        const MfqFile & mfq,
+        const std::string & name) {
+    const auto & rec = mfq.record(name);
+    auto blob = mfq.read_blob(name);
+    size_t off = 0;
+    const uint32_t ndim = read_u32_from(blob, off);
+    std::vector<int64_t> shape(ndim);
+    for (uint32_t index = 0; index < ndim; ++index) {
+        shape[index] = read_i64_from(blob, off);
+    }
+    if (shape.size() != 2) {
+        throw std::runtime_error(
+            "dense linear tensor must be rank 2: " + name);
+    }
+    torch::Tensor value;
+    if (rec.dtype == "BF16") {
+        value = torch::from_blob(
+            blob.data() + off, shape,
+            torch::TensorOptions().dtype(torch::kBFloat16)).clone();
+    } else if (rec.dtype == "F16") {
+        value = torch::from_blob(
+            blob.data() + off, shape,
+            torch::TensorOptions().dtype(torch::kFloat16)).clone();
+    } else if (rec.dtype == "F32") {
+        value = torch::from_blob(
+            blob.data() + off, shape,
+            torch::TensorOptions().dtype(torch::kFloat32)).clone();
+    } else {
+        throw std::runtime_error(
+            "unsupported dense linear dtype: " + rec.dtype +
+            " tensor " + name);
+    }
+    return value.contiguous();
+}
+
+static torch::Tensor load_dense_linear_gpu(
+        const MfqFile & mfq,
+        const std::string & name) {
+    c10::cuda::CUDAGuard guard(active_weight_load_device());
+    return load_dense_linear_cpu(mfq, name)
+        .to(torch::kCUDA).contiguous();
 }
 
 static NintWeight cat_weights(const std::vector<NintWeight> & ws) {
@@ -8204,6 +8265,7 @@ enum class QuantLinearKind {
     Nint,
     Nvq,
     Mxfp8,
+    Dense,
 };
 
 struct QuantLinearShard {
@@ -8216,6 +8278,7 @@ struct QuantLinearShard {
     NintWeight nint;
     NvqWeight nvq;
     Mxfp8Weight mxfp8;
+    torch::Tensor dense;
 };
 
 static torch::Tensor run_quant_linear_shard(
@@ -8236,6 +8299,19 @@ static torch::Tensor run_quant_linear_shard(
             ? nvq_matmul_input_mul(
                 shard.nvq, x, gate.value(), gate_mode)
             : nvq_matmul(shard.nvq, x);
+    }
+    if (shard.kind == QuantLinearKind::Dense) {
+        auto local = x.to(shard.dense.scalar_type());
+        if (gate.has_value()) {
+            TORCH_CHECK(
+                gate_mode == 1 || gate_mode == 2,
+                "dense input gate mode must be sigmoid or SiLU");
+            auto local_gate = gate.value().to(local.scalar_type());
+            local = gate_mode == 1
+                ? local * torch::sigmoid(local_gate)
+                : local * torch::silu(local_gate);
+        }
+        return torch::matmul(local, shard.dense.transpose(0, 1));
     }
     TORCH_CHECK(
         !gate.has_value(),
@@ -8366,6 +8442,7 @@ struct QuantLinear {
     NintLinear nint;
     NvqLinear nvq;
     Mxfp8Linear mxfp8;
+    torch::Tensor dense;
     TensorParallelAxis tensor_parallel_axis =
         TensorParallelAxis::Mirrored;
     std::vector<QuantLinearShard> tensor_parallel_shards;
@@ -8379,6 +8456,7 @@ struct QuantLinear {
     bool is_nint() const { return kind == QuantLinearKind::Nint; }
     bool is_nvq() const { return kind == QuantLinearKind::Nvq; }
     bool is_mxfp8() const { return kind == QuantLinearKind::Mxfp8; }
+    bool is_dense() const { return kind == QuantLinearKind::Dense; }
 
     torch::Tensor forward_tensor_parallel_flat(
             torch::Tensor x,
@@ -8463,6 +8541,11 @@ struct QuantLinear {
         }
         if (is_nint()) return nint.forward(x);
         if (is_nvq()) return nvq.forward(x);
+        if (is_dense()) {
+            return torch::matmul(
+                x.to(dense.scalar_type()),
+                dense.transpose(0, 1));
+        }
         return mxfp8.forward(x);
     }
     torch::Tensor forward_mxfp8_groupwise(
@@ -8510,7 +8593,7 @@ struct QuantLinear {
         if (is_nint()) return nint.forward_input_mul(x, gate, mode);
         if (is_nvq()) return nvq.forward_input_mul(x, gate, mode);
         throw std::runtime_error(
-            "MXFP8 linear does not support input gating");
+            "MXFP8/dense linear does not support input gating");
     }
     torch::Tensor forward_input_mul_f32_kld(
             torch::Tensor x,
@@ -8526,14 +8609,16 @@ struct QuantLinear {
         return tensor_parallel()
             ? logical_out
             : (is_nint() ? nint.w.out
-               : (is_nvq() ? nvq.w.out : mxfp8.weight.out));
+               : (is_nvq() ? nvq.w.out
+                  : (is_dense() ? dense.size(0) : mxfp8.weight.out)));
     }
     int64_t neuron_len() const {
         return tensor_parallel()
             ? logical_neuron_len
             : (is_nint() ? nint.w.neuron_len
                : (is_nvq() ? nvq.w.neuron_len
-                  : mxfp8.weight.neuron_len));
+                  : (is_dense() ? dense.size(1)
+                     : mxfp8.weight.neuron_len)));
     }
 };
 
@@ -8955,9 +9040,55 @@ static QuantLinear load_quant_linear(
             result.mxfp8.weight = to_cuda_device_mxfp8(
                 cpu, active_weight_load_device());
         }
+    } else if (dtype == "BF16" || dtype == "F16" || dtype == "F32") {
+        result.kind = QuantLinearKind::Dense;
+        auto cpu = load_dense_linear_cpu(mfq, name);
+        result.logical_out = cpu.size(0);
+        result.logical_neuron_len = cpu.size(1);
+        // Keep native floating-point linears whole on the primary TP rank.
+        // Splitting these matrices changes the cuBLAS GEMM geometry and causes
+        // materially larger drift than the weight formats under test. They
+        // are a small fraction of the model; routed experts and MXFP8/NINT/NVQ
+        // weights remain sharded.
+        const char * shard_native_float_env =
+            std::getenv("MFQ_TP_SHARD_NATIVE_FLOAT");
+        const bool shard_native_float =
+            shard_native_float_env != nullptr &&
+            std::atoi(shard_native_float_env) != 0;
+        if (shard_native_float && g_tensor_parallel.enabled() &&
+                axis != TensorParallelAxis::Mirrored) {
+            const int64_t extent = axis == TensorParallelAxis::Output
+                ? cpu.size(0) : cpu.size(1);
+            for (const auto & slice : select_slices(extent, 128)) {
+                QuantLinearShard shard;
+                shard.device = slice.device;
+                shard.kind = QuantLinearKind::Dense;
+                shard.output_begin = axis == TensorParallelAxis::Output
+                    ? slice.begin : 0;
+                shard.output_end = axis == TensorParallelAxis::Output
+                    ? slice.end : cpu.size(0);
+                shard.input_begin = axis == TensorParallelAxis::Input
+                    ? slice.begin : 0;
+                shard.input_end = axis == TensorParallelAxis::Input
+                    ? slice.end : cpu.size(1);
+                const int64_t dimension =
+                    axis == TensorParallelAxis::Output ? 0 : 1;
+                c10::cuda::CUDAGuard guard(slice.device);
+                shard.dense = cpu.narrow(
+                        dimension, slice.begin,
+                        slice.end - slice.begin)
+                    .to(torch::Device(torch::kCUDA, slice.device))
+                    .contiguous();
+                result.tensor_parallel_shards.push_back(
+                    std::move(shard));
+            }
+        } else {
+            c10::cuda::CUDAGuard guard(active_weight_load_device());
+            result.dense = cpu.to(torch::kCUDA).contiguous();
+        }
     } else {
         throw std::runtime_error(
-            "linear tensor must be NINT/NVQ/MXFP8: " +
+            "linear tensor must be NINT/NVQ/MXFP8/BF16/F16/F32: " +
             name + " dtype=" + dtype);
     }
     return result;
@@ -9152,15 +9283,24 @@ static torch::Tensor dequant_nint_dense_f32(const NintWeight & w) {
 
 static torch::Tensor dequant_quant_linear_f32(const QuantLinear & linear) {
     if (!linear.tensor_parallel()) {
-        return linear.is_nint()
-            ? dequant_nint_dense_f32(linear.nint.w)
-            : (linear.is_nvq()
-               ? nvq_dequant(linear.nvq.w)
-                    .to(torch::kFloat32).contiguous()
-               : mxfp8_dequant_cuda(
-                    linear.mxfp8.weight.values,
-                    linear.mxfp8.weight.scales)
-                    .to(torch::kFloat32).contiguous());
+        if (linear.is_nint()) {
+            return dequant_nint_dense_f32(linear.nint.w);
+        }
+        if (linear.is_nvq()) {
+            return nvq_dequant(linear.nvq.w)
+                .to(torch::kFloat32).contiguous();
+        }
+        if (linear.is_mxfp8()) {
+            return mxfp8_dequant_cuda(
+                linear.mxfp8.weight.values,
+                linear.mxfp8.weight.scales)
+                .to(torch::kFloat32).contiguous();
+        }
+        if (linear.is_dense()) {
+            return linear.dense.to(torch::kFloat32).contiguous();
+        }
+        throw std::runtime_error(
+            "unsupported linear kind for FP32 reconstruction");
     }
     if (linear.tensor_parallel_axis != TensorParallelAxis::Output &&
         linear.tensor_parallel_axis != TensorParallelAxis::Input) {
@@ -9172,15 +9312,23 @@ static torch::Tensor dequant_quant_linear_f32(const QuantLinear & linear) {
     parts.reserve(linear.tensor_parallel_shards.size());
     for (const auto & shard : linear.tensor_parallel_shards) {
         c10::cuda::CUDAGuard shard_guard(shard.device);
-        auto part = shard.kind == QuantLinearKind::Nint
-            ? dequant_nint_dense_f32(shard.nint)
-            : (shard.kind == QuantLinearKind::Nvq
-               ? nvq_dequant(shard.nvq)
-                    .to(torch::kFloat32).contiguous()
-               : mxfp8_dequant_cuda(
-                    shard.mxfp8.values,
-                    shard.mxfp8.scales)
-                    .to(torch::kFloat32).contiguous());
+        torch::Tensor part;
+        if (shard.kind == QuantLinearKind::Nint) {
+            part = dequant_nint_dense_f32(shard.nint);
+        } else if (shard.kind == QuantLinearKind::Nvq) {
+            part = nvq_dequant(shard.nvq)
+                .to(torch::kFloat32).contiguous();
+        } else if (shard.kind == QuantLinearKind::Mxfp8) {
+            part = mxfp8_dequant_cuda(
+                shard.mxfp8.values,
+                shard.mxfp8.scales)
+                .to(torch::kFloat32).contiguous();
+        } else if (shard.kind == QuantLinearKind::Dense) {
+            part = shard.dense.to(torch::kFloat32).contiguous();
+        } else {
+            throw std::runtime_error(
+                "unsupported tensor-parallel shard kind for reconstruction");
+        }
         parts.push_back(
             tensor_to_cuda_device(part, primary)
                 .to(torch::kFloat32).contiguous());
@@ -9638,9 +9786,14 @@ struct FFN {
             std::make_shared<CudaIndependentBranchExecutor>();
     bool geglu = false;
     bool is_moe = false;
+    bool moe_split_gate_up = false;
     NintMoeWeight moe_gate_up;
+    NintMoeWeight moe_gate;
+    NintMoeWeight moe_up;
     NintMoeWeight moe_down;
     std::shared_ptr<MixedMoeRuntime> cpu_moe_gate_up;
+    std::shared_ptr<MixedMoeRuntime> cpu_moe_gate;
+    std::shared_ptr<MixedMoeRuntime> cpu_moe_up;
     std::shared_ptr<MixedMoeRuntime> cpu_moe_down;
     torch::Tensor moe_router;
     torch::Tensor moe_shared_gate;
@@ -9773,7 +9926,7 @@ struct FFN {
     }
 
     bool tensor_parallel_moe_compatible() const {
-        if (!is_moe ||
+        if (!is_moe || moe_split_gate_up ||
                 !moe_gate_up.tensor_parallel_experts ||
                 !moe_down.tensor_parallel_experts ||
                 moe_gate_up.tensor_parallel_shards.size() !=
@@ -10011,7 +10164,9 @@ struct FFN {
                 });
             }
             auto route = g_profiler.measure("moe.route_map", [&]() {
-                return build_moe_route_plan(selected.at(0), moe_gate_up.n_experts);
+                return build_moe_route_plan(
+                    selected.at(0),
+                    moe_split_gate_up ? moe_gate.n_experts : moe_gate_up.n_experts);
             });
             if (tensor_parallel_moe_compatible()) {
                 auto routed = g_profiler.measure(
@@ -10043,18 +10198,47 @@ struct FFN {
                 });
             }
             std::optional<NintMoeWeight> staged_gate_up;
+            std::optional<NintMoeWeight> staged_gate;
+            std::optional<NintMoeWeight> staged_up;
             const NintMoeWeight * active_gate_up = &moe_gate_up;
-            if (cpu_moe_gate_up) {
-                staged_gate_up.emplace(g_profiler.measure(
-                    "moe.cpu_offload_gate_up_h2d", [&]() {
-                        return stage_cpu_mixed_moe(cpu_moe_gate_up);
-                    }));
-                active_gate_up = &staged_gate_up.value();
+            const NintMoeWeight * active_gate = &moe_gate;
+            const NintMoeWeight * active_up = &moe_up;
+            torch::Tensor gate_up_pair;
+            if (moe_split_gate_up) {
+                if (cpu_moe_gate) {
+                    staged_gate.emplace(g_profiler.measure(
+                        "moe.cpu_offload_gate_h2d", [&]() {
+                            return stage_cpu_mixed_moe(cpu_moe_gate);
+                        }));
+                    active_gate = &staged_gate.value();
+                }
+                if (cpu_moe_up) {
+                    staged_up.emplace(g_profiler.measure(
+                        "moe.cpu_offload_up_h2d", [&]() {
+                            return stage_cpu_mixed_moe(cpu_moe_up);
+                        }));
+                    active_up = &staged_up.value();
+                }
+                gate_up_pair = g_profiler.measure("moe.gate_up_split", [&]() {
+                    auto gate = active_gate->forward(xf, route);
+                    auto up = active_up->forward(xf, route);
+                    return torch::cat({gate, up}, -1).contiguous();
+                });
+            } else {
+                if (cpu_moe_gate_up) {
+                    staged_gate_up.emplace(g_profiler.measure(
+                        "moe.cpu_offload_gate_up_h2d", [&]() {
+                            return stage_cpu_mixed_moe(cpu_moe_gate_up);
+                        }));
+                    active_gate_up = &staged_gate_up.value();
+                }
+                gate_up_pair = g_profiler.measure("moe.gate_up", [&]() {
+                    return active_gate_up->forward(xf, route);
+                });
             }
-            auto gate_up_pair = g_profiler.measure("moe.gate_up", [&]() {
-                return active_gate_up->forward(xf, route);
-            });
             staged_gate_up.reset();
+            staged_gate.reset();
+            staged_up.reset();
             moe_down.prefetch(route);
             std::optional<NintMoeWeight> staged_down;
             const NintMoeWeight * active_down = &moe_down;
@@ -10108,7 +10292,7 @@ struct FFN {
             }
             record_moe_route_stats(
                 moe_layer, selected.at(0), selected.at(1), down_pair,
-                moe_gate_up.n_experts);
+                moe_split_gate_up ? moe_gate.n_experts : moe_gate_up.n_experts);
             staged_down.reset();
             static const bool disable_reduce_gate_fusion = [] {
                 const char * value = std::getenv("MFQ_DISABLE_MOE_REDUCE_GATE_FUSION");
@@ -12515,19 +12699,42 @@ static std::unique_ptr<Block> load_block(
         }
 
         b->ffn.is_moe = true;
+        const bool has_split_gate =
+            mfq.records.count(p + "ffn_gate_exps.weight") != 0;
+        const bool has_split_up =
+            mfq.records.count(p + "ffn_up_exps.weight") != 0;
+        if (has_split_gate != has_split_up) {
+            throw std::runtime_error(
+                "DeepSeek V4 split routed Gate/Up records are incomplete at layer " +
+                std::to_string(i));
+        }
+        b->ffn.moe_split_gate_up = has_split_gate;
         const bool cpu_offload =
             g_dsv4_cpu_offload_layers.count(i) != 0;
         if (cpu_offload) {
-            b->ffn.cpu_moe_gate_up = load_nint_moe_cpu_offloaded(
-                mfq, p + "ffn_gate_up_exps.weight");
+            if (b->ffn.moe_split_gate_up) {
+                b->ffn.cpu_moe_gate = load_nint_moe_cpu_offloaded(
+                    mfq, p + "ffn_gate_exps.weight");
+                b->ffn.cpu_moe_up = load_nint_moe_cpu_offloaded(
+                    mfq, p + "ffn_up_exps.weight");
+                b->ffn.moe_gate =
+                    cpu_mixed_moe_metadata(b->ffn.cpu_moe_gate);
+                b->ffn.moe_up =
+                    cpu_mixed_moe_metadata(b->ffn.cpu_moe_up);
+            } else {
+                b->ffn.cpu_moe_gate_up = load_nint_moe_cpu_offloaded(
+                    mfq, p + "ffn_gate_up_exps.weight");
+                b->ffn.moe_gate_up =
+                    cpu_mixed_moe_metadata(b->ffn.cpu_moe_gate_up);
+            }
             b->ffn.cpu_moe_down = load_nint_moe_cpu_offloaded(
                 mfq, p + "ffn_down_exps.weight");
-            b->ffn.moe_gate_up =
-                cpu_mixed_moe_metadata(b->ffn.cpu_moe_gate_up);
             b->ffn.moe_down =
                 cpu_mixed_moe_metadata(b->ffn.cpu_moe_down);
-            const int64_t gate_up_bytes =
-                b->ffn.moe_gate_up.mixed_weight_bytes;
+            const int64_t gate_up_bytes = b->ffn.moe_split_gate_up
+                ? b->ffn.moe_gate.mixed_weight_bytes +
+                    b->ffn.moe_up.mixed_weight_bytes
+                : b->ffn.moe_gate_up.mixed_weight_bytes;
             const int64_t down_bytes =
                 b->ffn.moe_down.mixed_weight_bytes;
             g_dsv4_cpu_offload_host_bytes +=
@@ -12540,9 +12747,18 @@ static std::unique_ptr<Block> load_block(
                 << g_dsv4_cpu_offload_host_bytes
                 << std::endl;
         } else {
-            b->ffn.moe_gate_up = load_nint_moe_gpu(
-                mfq, p + "ffn_gate_up_exps.weight",
-                true, i, "gate_up");
+            if (b->ffn.moe_split_gate_up) {
+                b->ffn.moe_gate = load_nint_moe_gpu(
+                    mfq, p + "ffn_gate_exps.weight",
+                    true, i, "gate");
+                b->ffn.moe_up = load_nint_moe_gpu(
+                    mfq, p + "ffn_up_exps.weight",
+                    true, i, "up");
+            } else {
+                b->ffn.moe_gate_up = load_nint_moe_gpu(
+                    mfq, p + "ffn_gate_up_exps.weight",
+                    true, i, "gate_up");
+            }
             b->ffn.moe_down = load_nint_moe_gpu(
                 mfq, p + "ffn_down_exps.weight",
                 true, i, "down");
@@ -12597,12 +12813,20 @@ static std::unique_ptr<Block> load_block(
             b->output_a.out() == c.o_groups * c.o_lora_rank &&
             b->output_b.neuron_len() == c.o_groups * c.o_lora_rank &&
             b->output_b.out() == c.hidden_size;
+        const bool gate_up_shapes = b->ffn.moe_split_gate_up
+            ? b->ffn.moe_gate.n_experts == c.num_experts &&
+                b->ffn.moe_up.n_experts == c.num_experts &&
+                b->ffn.moe_gate.neuron_len == c.hidden_size &&
+                b->ffn.moe_up.neuron_len == c.hidden_size &&
+                b->ffn.moe_gate.out_per_expert == c.moe_intermediate_size &&
+                b->ffn.moe_up.out_per_expert == c.moe_intermediate_size
+            : b->ffn.moe_gate_up.n_experts == c.num_experts &&
+                b->ffn.moe_gate_up.neuron_len == c.hidden_size &&
+                b->ffn.moe_gate_up.out_per_expert ==
+                    2 * c.moe_intermediate_size;
         const bool moe_shapes =
-            b->ffn.moe_gate_up.n_experts == c.num_experts &&
+            gate_up_shapes &&
             b->ffn.moe_down.n_experts == c.num_experts &&
-            b->ffn.moe_gate_up.neuron_len == c.hidden_size &&
-            b->ffn.moe_gate_up.out_per_expert ==
-                2 * c.moe_intermediate_size &&
             b->ffn.moe_down.neuron_len == c.moe_intermediate_size &&
             b->ffn.moe_down.out_per_expert == c.hidden_size &&
             b->ffn.moe_router.size(0) == c.num_experts &&
@@ -12944,6 +13168,12 @@ struct Model {
 
     torch::Tensor embed_forward(torch::Tensor ids) const {
         auto token_ids = ids.contiguous().to(torch::kCUDA, torch::kInt64);
+        if (embed.is_dense()) {
+            auto output_shape = token_ids.sizes().vec();
+            output_shape.push_back(embed.dense.size(1));
+            return embed.dense.index_select(
+                0, token_ids.reshape({-1})).reshape(output_shape);
+        }
         if (embed.is_nvq()) {
             return nvq_embedding(embed.nvq.w, token_ids);
         }
@@ -13021,7 +13251,8 @@ struct Model {
             });
         }
         if (c.is_dsv4()) {
-            x = x.unsqueeze(2)
+            x = x.to(torch::kFloat16)
+                .unsqueeze(2)
                 .expand({B, T, c.hc_mult, c.hidden_size})
                 .contiguous();
         }
@@ -15201,6 +15432,7 @@ static int run_kl_eval_streamed(
     const std::string & mfq_path,
     const std::string & config_path,
     const std::string & reference_path,
+    const std::string & logits_output_path,
     int max_chunks,
     int layer_group,
     int chunk_batch,
@@ -15234,6 +15466,42 @@ static int run_kl_eval_streamed(
         }
     }
     const int first = target_start - 1;
+
+    std::ofstream logits_output;
+    std::filesystem::path logits_final;
+    std::filesystem::path logits_partial;
+    if (!logits_output_path.empty()) {
+        logits_final = std::filesystem::path(logits_output_path);
+        logits_partial = logits_final;
+        logits_partial += ".partial";
+        if (std::filesystem::exists(logits_final) ||
+                std::filesystem::exists(logits_partial)) {
+            throw std::runtime_error(
+                "refusing to overwrite saved KL logits: " +
+                logits_output_path);
+        }
+        if (!logits_final.parent_path().empty()) {
+            std::filesystem::create_directories(
+                logits_final.parent_path());
+        }
+        logits_output.open(logits_partial, std::ios::binary);
+        if (!logits_output) {
+            throw std::runtime_error(
+                "cannot create saved KL logits: " +
+                logits_partial.string());
+        }
+        const char magic[8] = {'_', 'm', 'f', 'q', 'f', '1', '6', '_'};
+        const int32_t header[5] = {
+            chunks,
+            static_cast<int32_t>(n_ctx),
+            target_start,
+            score_count,
+            input.n_vocab,
+        };
+        logits_output.write(magic, sizeof(magic));
+        logits_output.write(
+            reinterpret_cast<const char *>(header), sizeof(header));
+    }
 
     auto started = std::chrono::steady_clock::now();
     Model model = load_model(mfq_path, config_path, n_ctx, false);
@@ -15349,6 +15617,20 @@ static int run_kl_eval_streamed(
                 logits / model.c.final_logit_softcapping) *
                 model.c.final_logit_softcapping;
         }
+        if (logits_output.is_open()) {
+            auto saved = logits.to(torch::kCPU, torch::kFloat16)
+                             .contiguous();
+            logits_output.write(
+                reinterpret_cast<const char *>(
+                    saved.data_ptr<c10::Half>()),
+                static_cast<std::streamsize>(
+                    saved.numel() * sizeof(c10::Half)));
+            if (!logits_output) {
+                throw std::runtime_error(
+                    "failed while writing saved KL logits: " +
+                    logits_partial.string());
+            }
+        }
         for (int bi = 0; bi < count; ++bi) {
             accumulate_streamed_kl_chunk(
                 reference, input, begin + bi,
@@ -15367,6 +15649,15 @@ static int run_kl_eval_streamed(
         torch::cuda::synchronize();
     }
     auto ended = std::chrono::steady_clock::now();
+    if (logits_output.is_open()) {
+        logits_output.close();
+        if (!logits_output) {
+            throw std::runtime_error(
+                "failed to finalize saved KL logits: " +
+                logits_partial.string());
+        }
+        std::filesystem::rename(logits_partial, logits_final);
+    }
     std::cout << "cpp_kl_result chunks=" << chunks
               << " scored_tokens=" << metrics.count
               << " sec="
@@ -18362,6 +18653,7 @@ int main(int argc, char ** argv) {
     try {
         std::string mfq_path, config_path, ids_arg, ids_file;
         std::string check_linear, check_linear_gate, kl_base;
+        std::string kl_save_logits_f16;
         std::string check_tp_linear;
         std::string check_tp_moe;
         std::string check_tp_axis_arg = "output";
@@ -18526,6 +18818,9 @@ int main(int argc, char ** argv) {
             else if (a == "--compare-dsv4-hc-ops") compare_dsv4_hc_ops = true;
             else if (a == "--compare-dsv4-hc-model") compare_dsv4_hc_model = true;
             else if (a == "--kl-base" && i + 1 < argc) kl_base = argv[++i];
+            else if (a == "--kl-save-logits-f16" && i + 1 < argc) {
+                kl_save_logits_f16 = argv[++i];
+            }
             else if (a == "--kl-chunks" && i + 1 < argc) kl_chunks = std::stoi(argv[++i]);
             else if (a == "--kl-score-count" && i + 1 < argc) {
                 kl_score_count = std::stoi(argv[++i]);
@@ -18632,6 +18927,7 @@ int main(int argc, char ** argv) {
                              "--kl-score-count N --kl-n-batch N "
                              "--kl-reference-n-batch N "
                              "--kl-reference-n-ubatch N --kl-mmq default|fp16|nint8_1] "
+                             "[--kl-save-logits-f16 PATH] "
                              "[--nint6-mmq fp16|int8])\n";
                 return 2;
             }
@@ -19073,7 +19369,8 @@ int main(int argc, char ** argv) {
                     "--moe-gpu-cache-gb is unavailable for streamed KL");
             }
             return run_kl_eval_streamed(
-                mfq_path, config_path, kl_base, kl_chunks,
+                mfq_path, config_path, kl_base,
+                kl_save_logits_f16, kl_chunks,
                 kl_stream_layers, kl_stream_batch,
                 kl_score_count, kl_reference_contract);
         }

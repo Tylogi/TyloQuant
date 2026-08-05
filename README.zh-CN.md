@@ -16,11 +16,30 @@ NINT · NVQ/NPQ · NEPQ · Gradient Precision Calibration · Expert-Wise MoE · 
   <a href="./README.md">English</a> | <strong>中文</strong>
 </p>
 
+<p align="center">
+  <a href="https://huggingface.co/Tylogi">Hugging Face 模型主页</a> · <a href="https://www.modelscope.cn/profile/Tylogi">ModelScope 模型主页</a>
+</p>
+
 **TyloQuant MFQ**（简称 **MFQ**）联合设计量化格式、精度分配与推理 kernel，面向高保真
 LLM 部署。项目支持 `0.84-8.30 bpw` 的自定义权重编码，可按计算组或 MoE 专家分配精度，
 并由 CUDA kernel 与 C++ runtime 直接执行 packed 权重。
 
 ## 核心结果
+
+### DeepSeek-V4-Flash-0731
+
+<img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ 与 Unsloth Dynamic 在 ctx512 和 ctx2048 下的文件大小与 Mean KLD 对比" width="100%">
+
+值得注意的是，即使是最小的 `74.902 GiB` MFQ 档位也保持了很强的量化保真度：在两种
+context 长度下，其 Mean KLD 均低于图中所有已完成的 Unsloth Dynamic 结果，包括
+`127.277 GiB` 的 IQ4 档位。
+
+完整 WikiText-2 评测在两套 runtime 中使用相同的 BF16 reference logits、tokenizer、
+BOS 与 token 序列；`ctx512` 覆盖 146,115 个计分 token，`ctx2048` 覆盖 146,289 个。
+三组最接近体积的对位中，MFQ 在 `ctx512` 下将 Mean KLD 降低
+**57.04–57.75%**，在 `ctx2048` 下降低 **52.88–55.35%**，且每组文件大小差均不超过
+2.116 GiB。Mean KLD 越低越好。完整数据与测试协议见
+[DeepSeek-V4-Flash-0731 实验结果](./docs/deepseek-v4-flash-0731-results.md)。
 
 ### Qwen3.5-9B：文件大小与 Mean KLD
 
@@ -172,7 +191,7 @@ kernel 在 GPU 上执行。Metal HTTP 服务端仍在开发中。详见
 
 - [ ] 发布可复现的 Gemma-4-26B-A4B-it 测试流程与原始结果包
 - [ ] 补充更多 Qwen3.5、Qwen3.6 模型的等大小 KLD 与困惑度测试
-- [ ] 完成 DeepSeek-V4-Flash 的独立整模 KLD 评测
+- [x] 完成 DeepSeek-V4-Flash 的独立整模 KLD 评测
 - [ ] 在 NINT8 M=1 kernel 修复后重新执行 production decode 验收
 - [ ] 扩展更多模型家族和 GPU 代际的基准测试
 - [ ] 发布带有模型卡和校验和的可下载量化模型
@@ -182,10 +201,28 @@ kernel 在 GPU 上执行。Metal HTTP 服务端仍在开发中。详见
 ## 文档
 
 - [基准测试与技术说明](./docs/benchmarks.zh-CN.md)
+- [DeepSeek-V4-Flash-0731 实验结果](./docs/deepseek-v4-flash-0731-results.md)
 - [量化格式规范](./FORMATS.md)
 - [C++ Runtime 与 API](./cpp_runtime/README.md)
 - [Apple Silicon / Metal 开发状态](./docs/metal.md)
 - [MoE Observation 数据索引](./plan/MoE公开Observation数据索引.md)
 - [0xSero 公开资源索引](./plan/0xSero公开资源索引.md)
+
+## 致谢
+
+MFQ 得益于开源 AI 社区的优秀工作，特别感谢：
+
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)：提供 GGUF 生态、高性能推理后端与
+  评测工具，为 MFQ 的互操作和验证奠定了重要基础。
+- [oMLX](https://github.com/jundot/omlx)：其出色的 Apple Silicon 推理工程为 MFQ 提供了
+  宝贵的性能基线与设计参考。
+- [MLX](https://github.com/ml-explore/mlx)：提供 MFQ 原生 macOS 路径使用的 Apple
+  Silicon array framework 与 Metal runtime。
+- [PyTorch](https://github.com/pytorch/pytorch) 与
+  [Transformers](https://github.com/huggingface/transformers)：提供核心研究、模型接入与
+  量化基础设施。
+- [Unsloth](https://github.com/unslothai/unsloth)：公开 Dynamic 量化模型与可复现的对比基线。
+
+感谢所有维护者与贡献者，让高性能本地推理更开放、更易用。
 
 许可证：[Apache License 2.0](./LICENSE)。
