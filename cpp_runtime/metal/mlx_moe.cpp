@@ -4,6 +4,7 @@
 #include "mfq_nintm_prefill_embedded.h"
 #include "mlx_nint.h"
 #include "mlx_nint8_zero.h"
+#include "mlx_reference.h"
 #include "mlx_staging_allocator.h"
 #include "mlx_vq.h"
 
@@ -34,6 +35,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace mfq::metal {
@@ -2778,6 +2780,16 @@ struct PackedStreams {
     detail::StagingVector<std::uint8_t> vq_parameters;
 };
 
+using ReferenceMoeWeight = std::variant<
+    MlxNintWeight,
+    MlxNint8ZeroWeight,
+    MlxVqWeight>;
+
+struct ReferenceMoeCohort {
+    std::vector<std::int32_t> expert_ids;
+    ReferenceMoeWeight weight;
+};
+
 void validate_nint_payload_shape(
     std::span<const std::uint8_t> payload,
     int expected_rows,
@@ -2921,13 +2933,14 @@ void claim_experts(
     }
 }
 
-void add_nint_pool(
+MlxNintWeight add_nint_pool(
     std::span<const std::uint8_t> payload,
     const std::vector<std::int32_t>& expert_ids,
     int out_per_expert,
     int neuron_len,
     PackedStreams& streams,
-    std::vector<std::int32_t>& descriptors) {
+    std::vector<std::int32_t>& descriptors,
+    bool pack_execution = true) {
     const auto expected_rows = checked_product(
         expert_ids.size(),
         static_cast<std::size_t>(out_per_expert),
@@ -2950,6 +2963,10 @@ void add_nint_pool(
     ) {
         throw std::runtime_error(
             "NINTM NINT cohort shape is inconsistent");
+    }
+
+    if (!pack_execution) {
+        return weight;
     }
 
     const int q_offset =
@@ -3025,15 +3042,17 @@ void add_nint_pool(
         mlx::core::float32,
         "NINT neuron minima");
 
+    return weight;
 }
 
-void add_q8_pool(
+MlxNint8ZeroWeight add_q8_pool(
     std::span<const std::uint8_t> payload,
     const std::vector<std::int32_t>& expert_ids,
     int out_per_expert,
     int neuron_len,
     PackedStreams& streams,
-    std::vector<std::int32_t>& descriptors) {
+    std::vector<std::int32_t>& descriptors,
+    bool pack_execution = true) {
     auto weight =
         MlxNint8ZeroWeight::from_blob(payload);
     const auto expected_rows = checked_product(
@@ -3050,6 +3069,10 @@ void add_q8_pool(
     ) {
         throw std::runtime_error(
             "NINTM NINT8-0 cohort shape is inconsistent");
+    }
+
+    if (!pack_execution) {
+        return weight;
     }
 
     const int q_offset =
@@ -3097,6 +3120,7 @@ void add_q8_pool(
         weight.scales(),
         mlx::core::float16,
         "NINT8-0 scales");
+    return weight;
 }
 
 std::vector<std::int8_t> int8_values(
@@ -3199,7 +3223,7 @@ int rotation_variant(
         "rotation variant");
 }
 
-void add_vq_pool(
+MlxVqWeight add_vq_pool(
     std::string_view dtype,
     std::span<const std::uint8_t> payload,
     std::span<const std::uint8_t> runtime,
@@ -3208,7 +3232,8 @@ void add_vq_pool(
     int neuron_len,
     PackedStreams& streams,
     std::vector<RotationSpec>& rotations,
-    std::vector<std::int32_t>& descriptors) {
+    std::vector<std::int32_t>& descriptors,
+    bool pack_execution = true) {
     const auto expected_rows = checked_product(
         expert_ids.size(),
         static_cast<std::size_t>(out_per_expert),
@@ -3274,6 +3299,9 @@ void add_vq_pool(
     ) {
         throw std::runtime_error(
             "NINTM VQ header/full parse mismatch");
+    }
+    if (!pack_execution) {
+        return weight;
     }
 
     // CUDA's NVQ2 execution layout merges one byte index and one byte sign
@@ -3559,6 +3587,7 @@ void add_vq_pool(
         weight.parameters(),
         mlx::core::float32,
         "VQ parameters");
+    return weight;
 }
 
 bool is_ascii(
@@ -5220,6 +5249,7 @@ struct MlxNintMoeWeight::Impl {
     array vq_parameters;
     std::vector<RotationSpec> rotations;
     std::vector<std::int32_t> descriptor_values;
+    std::vector<ReferenceMoeCohort> reference_cohorts;
     int experts = 0;
     int out_per_expert = 0;
     int neuron_len = 0;
@@ -5440,6 +5470,10 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
         -1);
     PackedStreams streams;
     std::vector<RotationSpec> rotations;
+    std::vector<ReferenceMoeCohort>
+        reference_cohorts;
+    const bool reference =
+        mlx_reference_enabled();
 
     for (
         std::uint32_t pool = 0;
@@ -5532,28 +5566,42 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
                     "unexpected NINTM NINT "
                     "runtime metadata");
             }
-            add_nint_pool(
+            auto weight = add_nint_pool(
                 payload,
                 expert_ids,
                 output_width,
                 input_width,
                 streams,
-                descriptors);
+                descriptors,
+                !reference);
+            if (reference) {
+                reference_cohorts.push_back({
+                    expert_ids,
+                    std::move(weight),
+                });
+            }
         } else if (is_nint8_zero_dtype(dtype)) {
             if (!runtime.empty()) {
                 throw std::runtime_error(
                     "unexpected NINTM NINT8-0 "
                     "runtime metadata");
             }
-            add_q8_pool(
+            auto weight = add_q8_pool(
                 payload,
                 expert_ids,
                 output_width,
                 input_width,
                 streams,
-                descriptors);
+                descriptors,
+                !reference);
+            if (reference) {
+                reference_cohorts.push_back({
+                    expert_ids,
+                    std::move(weight),
+                });
+            }
         } else if (is_vq_dtype(dtype)) {
-            add_vq_pool(
+            auto weight = add_vq_pool(
                 dtype,
                 payload,
                 runtime,
@@ -5562,7 +5610,14 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
                 input_width,
                 streams,
                 rotations,
-                descriptors);
+                descriptors,
+                !reference);
+            if (reference) {
+                reference_cohorts.push_back({
+                    expert_ids,
+                    std::move(weight),
+                });
+            }
         } else {
             throw std::runtime_error(
                 "unsupported nested NINTM cohort dtype: "
@@ -5646,6 +5701,21 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
         output_width,
         input_width,
         1);
+    impl->reference_cohorts =
+        std::move(reference_cohorts);
+    if (reference) {
+        impl->grouped_vq_mmq = false;
+        impl->native_primitive = false;
+        impl->packed_bytes = 0;
+        for (const auto& cohort :
+             impl->reference_cohorts) {
+            impl->packed_bytes += std::visit(
+                [](const auto& weight) {
+                    return weight.packed_nbytes();
+                },
+                cohort.weight);
+        }
+    }
     // NINTM cohorts are parsed through the standalone NINT/VQ loaders and
     // then repacked into the heterogeneous execution streams above. Those
     // temporary MLX arrays are dead now, but the Metal allocator otherwise
@@ -6236,6 +6306,13 @@ array MlxNintMoeWeight::routed_matmul_impl(
     const array& expert_ids,
     bool fused_swiglu,
     float swiglu_limit) const {
+    if (mlx_reference_enabled()) {
+        return routed_bf16_reference(
+            input,
+            expert_ids,
+            fused_swiglu,
+            swiglu_limit);
+    }
     auto ids = mlx::core::contiguous(
         mlx::core::astype(
             expert_ids,
@@ -6565,6 +6642,130 @@ array MlxNintMoeWeight::routed_matmul_impl(
         false,
         {});
     return std::move(outputs.front());
+}
+
+array MlxNintMoeWeight::routed_bf16_reference(
+    const array& input,
+    const array& expert_ids,
+    bool fused_swiglu,
+    float swiglu_limit) const {
+    auto ids = mlx::core::contiguous(
+        mlx::core::astype(
+            expert_ids,
+            mlx::core::int32));
+    if (ids.ndim() != 2) {
+        throw std::invalid_argument(
+            "unpacked reference expert IDs must be [tokens,routes]");
+    }
+    const int tokens = ids.shape(0);
+    const int routes = ids.shape(1);
+    const bool shared_input =
+        input.ndim() == 2
+        && input.shape(0) == tokens
+        && input.shape(1) == impl_->neuron_len;
+    if (!shared_input && (
+        input.ndim() != 3
+        || input.shape(0) != tokens
+        || input.shape(1) != routes
+        || input.shape(2) != impl_->neuron_len)) {
+        throw std::invalid_argument(
+            "unpacked reference routed input shape mismatch");
+    }
+    if (impl_->projections != 1
+        || impl_->reference_cohorts.empty()) {
+        throw std::runtime_error(
+            "unpacked reference NINTM cohorts are unavailable");
+    }
+
+    ids.eval();
+    std::vector<bool> selected(
+        static_cast<std::size_t>(impl_->experts),
+        false);
+    const auto* id_values = ids.data<std::int32_t>();
+    for (std::size_t index = 0; index < ids.size(); ++index) {
+        const int expert = id_values[index];
+        if (expert >= 0 && expert < impl_->experts) {
+            selected[static_cast<std::size_t>(expert)] = true;
+        }
+    }
+
+    const auto reference_dtype = mlx::core::float16;
+    auto source = input.dtype() == reference_dtype
+        ? input
+        : mlx::core::astype(
+              input,
+              reference_dtype);
+    auto output = mlx::core::zeros(
+        Shape{
+            tokens,
+            routes,
+            impl_->out_per_expert,
+        },
+        reference_dtype);
+    for (int expert = 0; expert < impl_->experts; ++expert) {
+        if (!selected[static_cast<std::size_t>(expert)]) {
+            continue;
+        }
+        const ReferenceMoeCohort* cohort = nullptr;
+        int local_expert = -1;
+        for (const auto& candidate :
+             impl_->reference_cohorts) {
+            const auto found = std::find(
+                candidate.expert_ids.begin(),
+                candidate.expert_ids.end(),
+                expert);
+            if (found != candidate.expert_ids.end()) {
+                cohort = &candidate;
+                local_expert = static_cast<int>(
+                    found - candidate.expert_ids.begin());
+                break;
+            }
+        }
+        if (cohort == nullptr) {
+            throw std::runtime_error(
+                "dense reference cannot locate selected expert");
+        }
+        const int row_begin =
+            local_expert * impl_->out_per_expert;
+        const auto rows = mlx::core::arange(
+            row_begin,
+            row_begin + impl_->out_per_expert,
+            1,
+            mlx::core::int32);
+        auto dense = std::visit(
+            [&](const auto& weight) {
+                return mlx::core::astype(
+                    weight.embedding(
+                        rows,
+                        mlx::core::float32),
+                    reference_dtype);
+            },
+            cohort->weight);
+        auto projected = mlx::core::matmul(
+            source,
+            mlx::core::transpose(dense));
+        if (shared_input) {
+            projected = mlx::core::expand_dims(
+                projected,
+                1);
+        }
+        auto mask = mlx::core::expand_dims(
+            mlx::core::equal(
+                ids,
+                array(expert, mlx::core::int32)),
+            -1);
+        output = mlx::core::where(
+            mask,
+            projected,
+            output);
+        output.eval();
+        mlx::core::clear_cache();
+    }
+    return fused_swiglu
+        ? moe_limited_swiglu_split(
+              output,
+              swiglu_limit)
+        : output;
 }
 
 int MlxNintMoeWeight::experts() const noexcept {

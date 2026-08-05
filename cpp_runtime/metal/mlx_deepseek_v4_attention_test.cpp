@@ -403,9 +403,26 @@ array input_tokens(
 float normalized_kv(
     float value,
     float eps) {
-    return value /
+    const float normalized = value /
         std::sqrt(
             value * value / 512.0f + eps);
+    const float raw_scale =
+        std::max(std::fabs(normalized), 1.0e-4f) /
+        448.0f;
+    const float scale = std::exp2(
+        std::ceil(std::log2(raw_scale)));
+    const float magnitude = std::fabs(normalized / scale);
+    float quantized = 0.0f;
+    if (magnitude < std::exp2(-6.0f)) {
+        quantized = std::rint(magnitude * 512.0f) / 512.0f;
+    } else {
+        const float exponent = std::floor(std::log2(magnitude));
+        const float step = std::exp2(exponent - 3.0f);
+        quantized = std::min(
+            std::rint(magnitude / step) * step,
+            448.0f);
+    }
+    return std::copysign(quantized * scale, normalized);
 }
 
 std::vector<float> local_attention_reference(

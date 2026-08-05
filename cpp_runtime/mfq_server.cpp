@@ -792,6 +792,7 @@ static void log_request_metrics(const std::string & id, bool chat, bool stream,
          << " presence_penalty=" << sampling.presence_penalty
          << " frequency_penalty=" << sampling.frequency_penalty
          << " repetition_penalty=" << sampling.repetition_penalty
+         << " seed=" << sampling.seed
          << " penalties=" << (penalties ? 1 : 0)
          << " finish_reason=" << result.finish_reason
          << " client_connected=" << (result.client_connected ? 1 : 0);

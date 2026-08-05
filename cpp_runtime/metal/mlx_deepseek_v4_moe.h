@@ -94,10 +94,14 @@ private:
         MlxLinear shared_up,
         MlxLinear shared_down,
         std::optional<MlxRoutedLinear> routed_gate_up,
+        std::optional<MlxRoutedLinear> routed_gate,
+        std::optional<MlxRoutedLinear> routed_up,
         std::optional<MlxRoutedLinear> routed_down,
         std::shared_ptr<MlxNintMoeOffloadCache>
             expert_offload,
         std::string streamed_gate_up_name,
+        std::string streamed_gate_name,
+        std::string streamed_up_name,
         std::string streamed_down_name,
         std::optional<mlx::core::array> router_bias,
         std::optional<mlx::core::array> token_experts,
@@ -114,10 +118,14 @@ private:
     MlxLinear shared_up_;
     MlxLinear shared_down_;
     std::optional<MlxRoutedLinear> routed_gate_up_;
+    std::optional<MlxRoutedLinear> routed_gate_;
+    std::optional<MlxRoutedLinear> routed_up_;
     std::optional<MlxRoutedLinear> routed_down_;
     std::shared_ptr<MlxNintMoeOffloadCache>
         expert_offload_;
     std::string streamed_gate_up_name_;
+    std::string streamed_gate_name_;
+    std::string streamed_up_name_;
     std::string streamed_down_name_;
     std::optional<MlxGroupedLinear> grouped_projections_;
     std::optional<MlxGroupedLinear>

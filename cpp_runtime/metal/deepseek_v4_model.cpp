@@ -1608,8 +1608,7 @@ void validate_deepseek_v4_model_bindings(
     const MfqContainer& model,
     const DeepseekV4Config& config,
     const DeepseekV4TensorNames& names) {
-    for (const auto& binding :
-         deepseek_v4_required_bindings(config, names)) {
+    const auto validate = [&](const DeepseekV4TensorBinding& binding) {
         if (!model.contains(binding.name)) {
             throw std::runtime_error(
                 "DeepSeek-V4 model is missing tensor: " +
@@ -1649,6 +1648,47 @@ void validate_deepseek_v4_model_bindings(
                 "DeepSeek-V4 tensor " + binding.name +
                 " has unsupported dtype " + metadata.dtype);
         }
+    };
+
+    constexpr std::string_view combined_suffix =
+        "ffn.experts.gate_up.weight";
+    for (const auto& binding :
+         deepseek_v4_required_bindings(config, names)) {
+        if (binding.name.ends_with(combined_suffix)) {
+            const auto prefix = binding.name.substr(
+                0,
+                binding.name.size() - combined_suffix.size());
+            const auto gate_name =
+                prefix + "ffn.experts.gate.weight";
+            const auto up_name =
+                prefix + "ffn.experts.up.weight";
+            const bool has_gate = model.contains(gate_name);
+            const bool has_up = model.contains(up_name);
+            if (has_gate != has_up) {
+                throw std::runtime_error(
+                    "DeepSeek-V4 split routed Gate/Up records "
+                    "are incomplete: " + binding.name);
+            }
+            if (has_gate) {
+                const std::vector<std::int64_t> split_shape{
+                    config.n_experts,
+                    config.moe_inter,
+                    config.hidden,
+                };
+                validate({
+                    gate_name,
+                    split_shape,
+                    DeepseekV4TensorKind::routed_experts,
+                });
+                validate({
+                    up_name,
+                    split_shape,
+                    DeepseekV4TensorKind::routed_experts,
+                });
+                continue;
+            }
+        }
+        validate(binding);
     }
 }
 

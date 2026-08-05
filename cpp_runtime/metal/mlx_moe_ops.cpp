@@ -169,9 +169,9 @@ constexpr const char* kDenseRouterTopKSource = R"METAL(
         }
         float raw = simd_sum(accumulator);
         if (lane == 0u) {
-            // Preserve the existing FP16 router GEMV output boundary before
-            // applying sqrt-softplus and selecting experts.
-            raw = float(half(raw));
+            // DeepSeek-V4 routes from x.float() @ weight.float().  Keep the
+            // SIMD reduction in FP32: rounding router logits to FP16 here can
+            // change the discrete top-k expert set.
             raw = isnan(raw) ? -FLT_MAX : raw;
             float softplus = raw > 20.0f ? raw : log1p(exp(raw));
             float route_weight = sqrt(softplus);

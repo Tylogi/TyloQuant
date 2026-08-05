@@ -168,6 +168,19 @@ if(MFQ_BUILD_METAL_RUNTIME)
             mfq-metal-tokenizer-test PRIVATE
             cxx_std_20
         )
+
+        add_executable(mfq-metal-deepseek-v4-real-cache-audit
+            metal/deepseek_v4_real_cache_audit.cpp
+        )
+        target_link_libraries(
+            mfq-metal-deepseek-v4-real-cache-audit PRIVATE
+            mfq-metal-runtime
+            mfq-server
+        )
+        target_compile_features(
+            mfq-metal-deepseek-v4-real-cache-audit PRIVATE
+            cxx_std_20
+        )
     endif()
 endif()
 
