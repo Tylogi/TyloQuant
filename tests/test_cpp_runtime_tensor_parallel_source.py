@@ -51,3 +51,21 @@ def test_tensor_parallel_disables_single_device_cuda_graphs():
     assert SOURCE.count("!g_tensor_parallel.enabled()") >= 2
     assert "const bool graph_enabled" in SOURCE
     assert "bool use_cuda_graph" in SOURCE
+
+
+def test_deepseek_v4_split_gate_up_uses_existing_moe_runtime_and_cache():
+    assert 'p + "ffn_gate_exps.weight"' in SOURCE
+    assert 'p + "ffn_up_exps.weight"' in SOURCE
+    assert "has_split_gate != has_split_up" in SOURCE
+    assert "moe_split_gate_up" in SOURCE
+    assert 'true, i, "gate"' in SOURCE
+    assert 'true, i, "up"' in SOURCE
+    assert '"moe.gate_up_split"' in SOURCE
+    assert "torch::cat({gate, up}, -1).contiguous()" in SOURCE
+
+
+def test_native_float_linears_are_supported_without_forcing_tp_shards():
+    assert "QuantLinearKind::Dense" in SOURCE
+    assert 'dtype == "BF16" || dtype == "F16" || dtype == "F32"' in SOURCE
+    assert 'std::getenv("MFQ_TP_SHARD_NATIVE_FLOAT")' in SOURCE
+    assert "result.dense = cpu.to(torch::kCUDA).contiguous()" in SOURCE
