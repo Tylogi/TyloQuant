@@ -372,6 +372,29 @@ static double number_field(const json & body, const char * name, double fallback
     return body[name].get<double>();
 }
 
+static MfqSamplingParams default_sampling_params(
+        const MfqServerConfig & config) {
+    MfqSamplingParams defaults;
+    if (config.model_type == "deepseek_v4") {
+        defaults.temperature = 1.0;
+        defaults.top_p = 0.8;
+        defaults.repetition_penalty = 1.05;
+        defaults.presence_penalty = 1.35;
+    }
+    return defaults;
+}
+
+static json sampling_params_json(const MfqSamplingParams & sampling) {
+    return {
+        {"temperature", sampling.temperature},
+        {"top_k", sampling.top_k},
+        {"top_p", sampling.top_p},
+        {"presence_penalty", sampling.presence_penalty},
+        {"frequency_penalty", sampling.frequency_penalty},
+        {"repetition_penalty", sampling.repetition_penalty},
+    };
+}
+
 static std::vector<std::string> parse_stops(const json & body) {
     std::vector<std::string> stops;
     if (!body.contains("stop") || body["stop"].is_null()) return stops;
@@ -409,7 +432,8 @@ struct RequestWork {
 
 static RequestWork parse_work(const json & body, bool chat, const LlamaTokenizer & tokenizer,
                               const common_chat_templates * templates,
-                              int64_t max_context) {
+                              int64_t max_context,
+                              const MfqSamplingParams & defaults) {
     if (!body.is_object()) throw ApiError(400, "invalid_request_error", "request body must be a JSON object");
     if (integer_field(body, "n", 1) != 1) {
         throw ApiError(400, "unsupported_parameter", "only n=1 is supported", "n");
@@ -456,12 +480,17 @@ static RequestWork parse_work(const json & body, bool chat, const LlamaTokenizer
         throw ApiError(400, "invalid_request_error", "max_tokens must be positive", "max_tokens");
     }
     work.sampling.max_tokens = static_cast<int32_t>(max_tokens);
-    work.sampling.temperature = number_field(body, "temperature", 1.0);
-    work.sampling.top_p = number_field(body, "top_p", 0.95);
-    work.sampling.top_k = static_cast<int32_t>(integer_field(body, "top_k", 20));
-    work.sampling.presence_penalty = number_field(body, "presence_penalty", 0.0);
-    work.sampling.frequency_penalty = number_field(body, "frequency_penalty", 0.0);
-    work.sampling.repetition_penalty = number_field(body, "repetition_penalty", 1.0);
+    work.sampling.temperature = number_field(
+        body, "temperature", defaults.temperature);
+    work.sampling.top_p = number_field(body, "top_p", defaults.top_p);
+    work.sampling.top_k = static_cast<int32_t>(integer_field(
+        body, "top_k", defaults.top_k));
+    work.sampling.presence_penalty = number_field(
+        body, "presence_penalty", defaults.presence_penalty);
+    work.sampling.frequency_penalty = number_field(
+        body, "frequency_penalty", defaults.frequency_penalty);
+    work.sampling.repetition_penalty = number_field(
+        body, "repetition_penalty", defaults.repetition_penalty);
     if (work.sampling.temperature < 0.0 || work.sampling.temperature > 10.0) {
         throw ApiError(400, "invalid_request_error", "temperature must be in [0, 10]", "temperature");
     }
@@ -1182,6 +1211,8 @@ int run_mfq_server(
         throw std::runtime_error(
             "cannot initialize tokenizer.chat_template");
     }
+    const MfqSamplingParams sampling_defaults =
+        default_sampling_params(config);
 
     httplib::Server server;
     ServerMetrics server_metrics;
@@ -1254,14 +1285,19 @@ int run_mfq_server(
         set_json(res, {
             {"status", reloading.load() ? "loading" : "ok"},
             {"model", config.model_name},
+            {"model_type", config.model_type},
             {"max_context", active_context.load()},
+            {"sampling_defaults", sampling_params_json(sampling_defaults)},
         });
     });
 
     server.Get("/api/status", [&](const httplib::Request & req, httplib::Response & res) {
         if (!authorized(req, res, config.api_key)) return;
-        set_json(res, server_metrics.snapshot(
-            config, active_context.load(), reloading.load()));
+        json status = server_metrics.snapshot(
+            config, active_context.load(), reloading.load());
+        status["sampling_defaults"] = sampling_params_json(
+            sampling_defaults);
+        set_json(res, status);
     });
 
     server.Post("/api/reload", [&](const httplib::Request & req, httplib::Response & res) {
@@ -1347,7 +1383,7 @@ int run_mfq_server(
             const json body = parse_body(req);
             RequestWork work = parse_work(
                 body, chat, *tokenizer, chat_templates.get(),
-                active_context.load());
+                active_context.load(), sampling_defaults);
             const std::string id = request_id(chat ? "chatcmpl-" : "cmpl-");
             const int64_t created = unix_time_seconds();
 
