@@ -3,24 +3,10 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <algorithm>
-#include <cstdarg>
 #include <climits>
-#include <cstdio>
-#include <cstdlib>
 
 #define MFQ_LLAMA_FATTN_KERNEL_ONLY
 #include "llama_fattn_mma_f16.cuh"
-
-extern "C" void ggml_abort(const char* file, int line, const char* fmt, ...)
-{
-    std::fprintf(stderr, "ggml assertion at %s:%d: ", file, line);
-    va_list args;
-    va_start(args, fmt);
-    std::vfprintf(stderr, fmt, args);
-    va_end(args);
-    std::fputc('\n', stderr);
-    std::abort();
-}
 
 __global__ void mfq_causal_mask_kernel(
     half* mask, int* kv_max, int B, int T, int mask_stride, int tiles,
