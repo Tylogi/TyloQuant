@@ -103,6 +103,8 @@ constexpr int kVqProfileNpqS = 2;
 constexpr int kVqProfileNvq1L = 3;
 constexpr int kVqProfileJsc8 = 4;
 constexpr int kVqProfileNpqL = 5;
+constexpr int kVqProfileNvq1S = 6;
+constexpr int kVqProfileJscExtended8 = 7;
 
 constexpr const char* kMoeHeader = R"METAL(
 template <typename Stream>
@@ -258,6 +260,8 @@ inline void mfq_moe_jsc_profile(
     thread float* accumulators,
     uint groups,
     uint vectors,
+    uint index_bits,
+    uint entries,
     uint indices_offset,
     uint state_offset,
     uint aux_offset,
@@ -330,22 +334,32 @@ inline void mfq_moe_jsc_profile(
                     sign_value = uint(indices_stream[
                         execution_offset + BYTES_PER_SIGN - 1u]);
                 } else {
-                    index0 = uint(indices_stream[
-                        indices_offset
-                        + outputs[row] * vectors
-                        + first_vector]);
+                    uint index_linear =
+                        outputs[row] * vectors + first_vector;
+                    index0 = index_bits == 8u
+                        ? uint(indices_stream[
+                              indices_offset + index_linear])
+                        : mfq_moe_read_bits(
+                              indices_stream + indices_offset,
+                              index_linear,
+                              index_bits);
                     if (VECTOR_SIZE == 4u) {
-                        index1 = uint(indices_stream[
-                            indices_offset
-                            + outputs[row] * vectors
-                            + first_vector + 1u]);
+                        index1 = index_bits == 8u
+                            ? uint(indices_stream[
+                                  indices_offset
+                                  + index_linear + 1u])
+                            : mfq_moe_read_bits(
+                                  indices_stream + indices_offset,
+                                  index_linear + 1u,
+                                  index_bits);
                     }
                     sign_value = mfq_moe_read_bits(
                         aux_stream + aux_offset,
                         outputs[row] * signs + column_base / 8u,
                         7u);
                 }
-                uint bank_base = selected_code_banks[row] * 256u;
+                uint bank_base =
+                    selected_code_banks[row] * entries;
                 uint code0_offset =
                     (bank_base + index0) * VECTOR_SIZE;
                 uint code1_offset = VECTOR_SIZE == 4u
@@ -1169,6 +1183,45 @@ constexpr const char* kMoeSource = R"METAL(
                 accumulators,
                 groups,
                 vectors,
+                index_bits,
+                entries,
+                indices_offset,
+                state_offset,
+                aux_offset,
+                codebook_offset,
+                scale_offset,
+                state_bank_offset,
+                signs,
+                k_lane,
+                K_LANES,
+                uint(K));
+        } else if (
+            (uint(VQ_PROFILE_MASK) & 128u) != 0u
+            && profile == 7u
+        ) {
+            // Extended E8 JSC profiles keep 10- or 12-bit indices packed.
+            // They otherwise share the vectorized 24-column execution shape
+            // with NVQ2J, including its banked codebooks and parity sign.
+            mfq_moe_jsc_profile<
+                8u,
+                MATRIX_ROWS,
+                0u
+            >(
+                x,
+                vq_indices,
+                vq_state,
+                vq_aux,
+                vq_scales,
+                vq_state_to_codebank,
+                vq_codebooks,
+                x_offset,
+                outputs,
+                row_anchors,
+                accumulators,
+                groups,
+                vectors,
+                index_bits,
+                entries,
                 indices_offset,
                 state_offset,
                 aux_offset,
@@ -1355,6 +1408,96 @@ constexpr const char* kMoeSource = R"METAL(
                             vq_codebooks, code_base);
                         float4 code1 = mfq_moe_load_code4(
                             vq_codebooks, code_base + 4u);
+                        float code_dot =
+                            dot(activation0, code0)
+                            + dot(activation1, code1);
+                        accumulators[row] = fma(
+                            weight_scales[row],
+                            code_dot,
+                            accumulators[row]);
+                    }
+                }
+            }
+        } else if (
+            (uint(VQ_PROFILE_MASK) & 64u) != 0u
+            && profile == 6u
+        ) {
+            // NVQ1-S stores three 8-wide vectors per 24-column group.  Keep
+            // its two-codebook/delta semantics, but avoid the scalar generic
+            // VQ inner loop and redundant packed-bit address calculations.
+            float delta = vq_parameters[parameter_offset];
+            for (
+                uint group = k_lane;
+                group < groups;
+                group += K_LANES
+            ) {
+                uint delta_by_row[MATRIX_ROWS];
+                float weight_scales[MATRIX_ROWS];
+                for (
+                    uint row = 0u;
+                    row < MATRIX_ROWS;
+                    ++row
+                ) {
+                    uint state_index =
+                        outputs[row] * groups + group;
+                    uint state_byte = uint(vq_state[
+                        state_offset + (state_index >> 1)
+                    ]);
+                    uint state = (
+                        state_byte
+                        >> ((state_index & 1u) * 4u)
+                    ) & 15u;
+                    delta_by_row[row] = mfq_moe_read_bits(
+                        vq_aux + aux_offset,
+                        state_index,
+                        1u);
+                    weight_scales[row] =
+                        row_anchors[row]
+                        * vq_scales[scale_offset + state];
+                }
+
+                for (
+                    uint local_vector = 0u;
+                    local_vector < 3u;
+                    ++local_vector
+                ) {
+                    uint column_base =
+                        group * 24u + local_vector * 8u;
+                    if (column_base >= uint(K)) {
+                        break;
+                    }
+                    float4 activation0 = float4(
+                        float(x[x_offset + column_base]),
+                        float(x[x_offset + column_base + 1u]),
+                        float(x[x_offset + column_base + 2u]),
+                        float(x[x_offset + column_base + 3u]));
+                    float4 activation1 = float4(
+                        float(x[x_offset + column_base + 4u]),
+                        float(x[x_offset + column_base + 5u]),
+                        float(x[x_offset + column_base + 6u]),
+                        float(x[x_offset + column_base + 7u]));
+                    uint vector = column_base >> 3;
+                    for (
+                        uint row = 0u;
+                        row < MATRIX_ROWS;
+                        ++row
+                    ) {
+                        uint index = mfq_moe_read_bits(
+                            vq_indices + indices_offset,
+                            outputs[row] * vectors + vector,
+                            9u);
+                        uint bank = delta_by_row[row];
+                        float signed_delta =
+                            bank != 0u ? -delta : delta;
+                        uint code_base = codebook_offset + (
+                            bank * 512u + index
+                        ) * 8u;
+                        float4 code0 = mfq_moe_load_code4(
+                            vq_codebooks, code_base)
+                            + float4(signed_delta);
+                        float4 code1 = mfq_moe_load_code4(
+                            vq_codebooks, code_base + 4u)
+                            + float4(signed_delta);
                         float code_dot =
                             dot(activation0, code0)
                             + dot(activation1, code1);
@@ -3507,7 +3650,9 @@ MlxVqWeight add_vq_pool(
         descriptors[base + kVqRotationVariant] =
             rotation;
         descriptors[base + kVqProfile] =
-            dtype == "NVQ2J" || dtype == "NVQ3J"
+            dtype == "NVQ2J-L" || dtype == "NVQ2J-XL"
+                ? kVqProfileJscExtended8
+                : dtype == "NVQ2J" || dtype == "NVQ3J"
                 ? (
                     weight.vector_size() == 4
                         ? kVqProfileJsc4
@@ -3526,7 +3671,14 @@ MlxVqWeight add_vq_pool(
                                     && weight.vector_size() == 8
                                     && weight.index_bits() == 11
                                 ? kVqProfileNvq1L
-                                : kVqProfileGeneric
+                                : (
+                                    dtype == "NVQ1-S"
+                                            && weight.group_size() == 24
+                                            && weight.vector_size() == 8
+                                            && weight.index_bits() == 9
+                                        ? kVqProfileNvq1S
+                                        : kVqProfileGeneric
+                                )
                         )
                 );
         descriptors[base + kVqJscExecution] =
@@ -5332,7 +5484,7 @@ struct MlxNintMoeWeight::Impl {
             if (family == kFamilyVq) {
                 const auto profile = descriptor_values[
                     base + kVqProfile];
-                if (profile >= 0 && profile < 6) {
+                if (profile >= 0 && profile < 8) {
                     vq_profile_mask |= std::uint32_t{1}
                         << static_cast<unsigned>(profile);
                 }
@@ -5361,7 +5513,7 @@ struct MlxNintMoeWeight::Impl {
             && std::string_view(specialize_env) == "0"
         ) {
             family_mask = 7;
-            vq_profile_mask = 63;
+            vq_profile_mask = 255;
         }
         const char* npq_indices_env = std::getenv(
             "MFQ_METAL_NINTM_NPQ_INDICES");
@@ -6328,7 +6480,6 @@ array MlxNintMoeWeight::routed_matmul_impl(
         throw std::invalid_argument(
             "routed expert dimensions cannot be negative");
     }
-
     bool shared_input = false;
     if (
         input.ndim() == 2
