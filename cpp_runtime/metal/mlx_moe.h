@@ -178,6 +178,11 @@ private:
         const mlx::core::array& expert_ids,
         bool fused_swiglu,
         float swiglu_limit) const;
+    mlx::core::array routed_bf16_reference(
+        const mlx::core::array& input,
+        const mlx::core::array& expert_ids,
+        bool fused_swiglu,
+        float swiglu_limit) const;
 
     std::shared_ptr<const Impl> impl_;
 };

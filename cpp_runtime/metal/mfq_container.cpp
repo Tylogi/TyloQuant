@@ -85,6 +85,8 @@ std::string deepseek_v4_ew_alias(std::string_view name) {
             {"hc_ffn_base", "hc_ffn_base.weight"},
             {"hc_ffn_scale", "hc_ffn_scale.weight"},
             {"ffn.experts.gate_up.weight", "ffn_gate_up_exps.weight"},
+            {"ffn.experts.gate.weight", "ffn_gate_exps.weight"},
+            {"ffn.experts.up.weight", "ffn_up_exps.weight"},
             {"ffn.experts.down.weight", "ffn_down_exps.weight"},
             {"ffn.gate.tid2eid", "ffn_gate_tid2eid.weight"},
             {"ffn.gate.bias", "exp_probs_b.bias"},

@@ -37,6 +37,7 @@ from mfq.kernels.metal.deepseek_v4 import (
     dsv4_build_decode_plan,
     dsv4_build_prefill_plan,
     dsv4_decode_pool_step,
+    dsv4_fp4_sim,
     dsv4_indexer_scores,
     dsv4_topk512,
 )
@@ -365,6 +366,25 @@ def _unweighted_rms(value: mx.array, eps: float) -> mx.array:
     source = value.astype(mx.float32)
     inverse = mx.rsqrt(mx.mean(source * source, axis=-1, keepdims=True) + eps)
     return (source * inverse).astype(value.dtype)
+
+
+def _mxfp8_fake_quant_prefix(value: mx.array, block_size: int = 64) -> mx.array:
+    """Match V4F's in-place UE8M0/E4M3 activation simulation."""
+    if value.shape[-1] % block_size:
+        raise ValueError("MXFP8 fake-quant width must be block aligned")
+    dtype = value.dtype
+    grouped = value.astype(mx.float32).reshape((*value.shape[:-1], -1, block_size))
+    amax = mx.maximum(mx.max(mx.abs(grouped), axis=-1, keepdims=True), 1.0e-4)
+    scale = mx.power(2.0, mx.ceil(mx.log2(amax / 448.0)))
+    normalized = mx.clip(grouped / scale, -448.0, 448.0)
+    magnitude = mx.abs(normalized)
+    subnormal = mx.round(magnitude * 512.0) / 512.0
+    exponent = mx.floor(mx.log2(mx.maximum(magnitude, mx.array(1.0e-30))))
+    step = mx.power(2.0, exponent - 3.0)
+    normal = mx.minimum(mx.round(magnitude / step) * step, 448.0)
+    quantized = mx.where(magnitude < 2.0**-6, subnormal, normal)
+    restored = mx.sign(normalized) * quantized * scale
+    return restored.reshape(value.shape).astype(dtype)
 
 
 def _limited_swiglu(
@@ -1195,7 +1215,8 @@ class MlxDeepseekV4Attention:
             sine[None],
         )
         q = mx.concatenate((q[..., :-rotary], q_rotary), axis=-1)
-        kv = mx.concatenate((kv[..., :-rotary], kv_rotary), axis=-1)
+        kv_prefix = _mxfp8_fake_quant_prefix(kv[..., :-rotary])
+        kv = mx.concatenate((kv_prefix, kv_rotary), axis=-1)
         return outputs, q_rank, q, kv
 
     def _update_compressors(
@@ -1272,6 +1293,7 @@ class MlxDeepseekV4Attention:
                 self._hadamard_signs,
                 config.index_head_dim,
             ).reshape(query.shape)
+            query = dsv4_fp4_sim(query.astype(mx.float16))
         return query, outputs["index_weights"]
 
     def _topk(
