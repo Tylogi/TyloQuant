@@ -12,6 +12,7 @@
 #endif
 
 #include "mfq_server.h"
+#include "moe_cache_transfer.h"
 #include "moe_cache_policy.h"
 #include "moe_cache_profile.h"
 #include "tensor_parallel.h"
@@ -5568,6 +5569,7 @@ struct MoeGpuArena {
 
 struct MoePinnedStage {
     torch::Tensor host;
+    torch::Tensor device;
     cudaEvent_t done = nullptr;
     bool pending = false;
 };
@@ -5815,7 +5817,9 @@ public:
 private:
     friend class MoeCachedSource;
 
-    MoePinnedStage & acquire_stage(int64_t required_bytes) {
+    MoePinnedStage & acquire_stage(
+            int64_t required_bytes,
+            bool require_device) {
         for (size_t offset = 0; offset < stages_.size(); ++offset) {
             const size_t index =
                 (next_stage_ + offset) % stages_.size();
@@ -5825,7 +5829,7 @@ private:
                 stage.pending = false;
                 next_stage_ = (index + 1) % stages_.size();
                 if (!stage.host.defined() ||
-                    stage.host.numel() < required_bytes) {
+                        stage.host.numel() < required_bytes) {
                     int64_t capacity = 1;
                     while (capacity < required_bytes) capacity *= 2;
                     stage.host = torch::empty(
@@ -5834,6 +5838,17 @@ private:
                             .device(torch::kCPU)
                             .dtype(torch::kUInt8)
                             .pinned_memory(true));
+                }
+                if (require_device &&
+                        (!stage.device.defined() ||
+                         stage.device.numel() < required_bytes)) {
+                    int64_t capacity = 1;
+                    while (capacity < required_bytes) capacity *= 2;
+                    stage.device = torch::empty(
+                        {capacity},
+                        torch::TensorOptions()
+                            .device(torch::kCUDA)
+                            .dtype(torch::kUInt8));
                 }
                 return stage;
             }
@@ -5844,7 +5859,7 @@ private:
         stage.pending = false;
         next_stage_ = (next_stage_ + 1) % stages_.size();
         if (!stage.host.defined() ||
-            stage.host.numel() < required_bytes) {
+                stage.host.numel() < required_bytes) {
             int64_t capacity = 1;
             while (capacity < required_bytes) capacity *= 2;
             stage.host = torch::empty(
@@ -5854,6 +5869,17 @@ private:
                     .dtype(torch::kUInt8)
                     .pinned_memory(true));
         }
+        if (require_device &&
+                (!stage.device.defined() ||
+                 stage.device.numel() < required_bytes)) {
+            int64_t capacity = 1;
+            while (capacity < required_bytes) capacity *= 2;
+            stage.device = torch::empty(
+                {capacity},
+                torch::TensorOptions()
+                    .device(torch::kCUDA)
+                    .dtype(torch::kUInt8));
+        }
         return stage;
     }
 
@@ -5861,7 +5887,8 @@ private:
             const std::vector<MoeCacheTransfer> & transfers,
             bool waits_for_compute,
             bool wait_on_compute_stream) {
-        int64_t total = 0;
+        int64_t payload_bytes = 0;
+        int transfer_count = 0;
         for (const auto & transfer : transfers) {
             if (transfer.nbytes < 0 ||
                 (transfer.nbytes > 0 &&
@@ -5870,9 +5897,19 @@ private:
                 throw std::runtime_error(
                     "invalid MoE cache transfer");
             }
-            total += transfer.nbytes;
+            if (transfer.nbytes == 0) continue;
+            payload_bytes =
+                (payload_bytes + 15) & ~int64_t{15};
+            if (transfer.nbytes >
+                    std::numeric_limits<int64_t>::max() -
+                        payload_bytes) {
+                throw std::overflow_error(
+                    "MoE cache transfer byte count overflows int64");
+            }
+            payload_bytes += transfer.nbytes;
+            ++transfer_count;
         }
-        if (total == 0) {
+        if (transfer_count == 0) {
             if (wait_on_compute_stream &&
                     transfer_ready_recorded_) {
                 MFQ_CUDA_CHECK(cudaStreamWaitEvent(
@@ -5881,35 +5918,96 @@ private:
             }
             return;
         }
-        auto & stage = acquire_stage(total);
+        if (prewarming_) {
+            auto & stage = acquire_stage(payload_bytes, false);
+            auto * staging = stage.host.data_ptr<uint8_t>();
+            int64_t offset = 0;
+            for (const auto & transfer : transfers) {
+                if (transfer.nbytes == 0) continue;
+                offset = (offset + 15) & ~int64_t{15};
+                std::memcpy(
+                    staging + offset,
+                    transfer.source,
+                    static_cast<size_t>(transfer.nbytes));
+                MFQ_CUDA_CHECK(cudaMemcpyAsync(
+                    transfer.destination,
+                    staging + offset,
+                    static_cast<size_t>(transfer.nbytes),
+                    cudaMemcpyHostToDevice,
+                    weight_stream_));
+                if (transfer.packed_weight) {
+                    stats_.h2d_bytes += transfer.nbytes;
+                }
+                offset += transfer.nbytes;
+            }
+            MFQ_CUDA_CHECK(cudaEventRecord(
+                stage.done, weight_stream_));
+            MFQ_CUDA_CHECK(cudaEventRecord(
+                transfer_ready_, weight_stream_));
+            transfer_ready_recorded_ = true;
+            stage.pending = true;
+            if (wait_on_compute_stream) {
+                MFQ_CUDA_CHECK(cudaStreamWaitEvent(
+                    at::cuda::getCurrentCUDAStream().stream(),
+                    transfer_ready_, 0));
+            }
+            return;
+        }
+        const int64_t descriptor_offset =
+            (payload_bytes + 15) & ~int64_t{15};
+        const int64_t descriptor_bytes =
+            static_cast<int64_t>(transfer_count) *
+            static_cast<int64_t>(
+                sizeof(mfq::MoeCacheScatterDescriptor));
+        if (descriptor_bytes >
+                std::numeric_limits<int64_t>::max() -
+                    descriptor_offset) {
+            throw std::overflow_error(
+                "MoE cache descriptor byte count overflows int64");
+        }
+        const int64_t total_bytes =
+            descriptor_offset + descriptor_bytes;
+        auto & stage = acquire_stage(total_bytes, true);
         auto * staging = stage.host.data_ptr<uint8_t>();
+        auto * descriptors =
+            reinterpret_cast<mfq::MoeCacheScatterDescriptor *>(
+                staging + descriptor_offset);
         int64_t offset = 0;
+        int descriptor = 0;
         for (const auto & transfer : transfers) {
             if (transfer.nbytes == 0) continue;
+            offset = (offset + 15) & ~int64_t{15};
             std::memcpy(
                 staging + offset,
                 transfer.source,
                 static_cast<size_t>(transfer.nbytes));
+            descriptors[descriptor++] = {
+                static_cast<uint64_t>(
+                    reinterpret_cast<uintptr_t>(
+                        transfer.destination)),
+                static_cast<uint64_t>(offset),
+                static_cast<uint64_t>(transfer.nbytes),
+            };
+            if (transfer.packed_weight) {
+                stats_.h2d_bytes += transfer.nbytes;
+            }
             offset += transfer.nbytes;
         }
         if (waits_for_compute && compute_done_recorded_) {
             MFQ_CUDA_CHECK(cudaStreamWaitEvent(
                 weight_stream_, compute_done_, 0));
         }
-        offset = 0;
-        for (const auto & transfer : transfers) {
-            if (transfer.nbytes == 0) continue;
-            MFQ_CUDA_CHECK(cudaMemcpyAsync(
-                transfer.destination,
-                staging + offset,
-                static_cast<size_t>(transfer.nbytes),
-                cudaMemcpyHostToDevice,
-                weight_stream_));
-            if (transfer.packed_weight) {
-                stats_.h2d_bytes += transfer.nbytes;
-            }
-            offset += transfer.nbytes;
-        }
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(
+            stage.device.data_ptr<uint8_t>(),
+            staging,
+            static_cast<size_t>(total_bytes),
+            cudaMemcpyHostToDevice,
+            weight_stream_));
+        mfq::moe_cache_scatter_cuda(
+            stage.device.data_ptr<uint8_t>(),
+            descriptor_offset,
+            transfer_count,
+            weight_stream_);
         MFQ_CUDA_CHECK(cudaEventRecord(stage.done, weight_stream_));
         MFQ_CUDA_CHECK(cudaEventRecord(
             transfer_ready_, weight_stream_));
@@ -5928,6 +6026,7 @@ private:
     int64_t allocated_bytes_ = 0;
     int64_t host_bytes_ = 0;
     bool finalized_ = false;
+    bool prewarming_ = false;
     cudaStream_t weight_stream_ = nullptr;
     cudaStream_t route_stream_ = nullptr;
     cudaEvent_t compute_done_ = nullptr;
@@ -6656,14 +6755,21 @@ void MoeExpertCache::prewarm() {
                 selected_it->expert);
         }
     }
-    for (const auto & source : sources_) {
-        const auto found = source_experts.find(source.get());
-        if (found == source_experts.end()) continue;
-        prepare(*source, found->second, true);
-    }
-    if (transfer_ready_recorded_) {
-        MFQ_CUDA_CHECK(
-            cudaEventSynchronize(transfer_ready_));
+    prewarming_ = true;
+    try {
+        for (const auto & source : sources_) {
+            const auto found = source_experts.find(source.get());
+            if (found == source_experts.end()) continue;
+            prepare(*source, found->second, true);
+        }
+        if (transfer_ready_recorded_) {
+            MFQ_CUDA_CHECK(
+                cudaEventSynchronize(transfer_ready_));
+        }
+        prewarming_ = false;
+    } catch (...) {
+        prewarming_ = false;
+        throw;
     }
     for (auto selected_it = prewarm_selected_.rbegin();
          selected_it != prewarm_selected_.rend();
@@ -10197,6 +10303,30 @@ struct FFN {
                         shared_gate_logits);
                 });
             }
+
+            // Start the first routed projection transfer before the shared
+            // expert.  The cache uses a separate CUDA stream, so the H2D copy
+            // can overlap the independent dense/shared computation.  The
+            // projection forward below still performs the normal cache check
+            // and stream wait, preserving the existing execution semantics.
+            if (moe_split_gate_up) {
+                moe_gate.prefetch(route);
+            } else {
+                moe_gate_up.prefetch(route);
+            }
+            auto shared_output = g_profiler.measure(
+                "moe.shared", [&]() {
+                    return shared->forward(xf);
+                });
+            if (!moe_split_gate_up && !moe_shared_ungated) {
+                shared_gate_logits = g_profiler.measure(
+                    "moe.shared_gate", [&]() {
+                        return torch::matmul(
+                            xf32,
+                            moe_shared_gate.transpose(0, 1))
+                            .contiguous();
+                    });
+            }
             std::optional<NintMoeWeight> staged_gate_up;
             std::optional<NintMoeWeight> staged_gate;
             std::optional<NintMoeWeight> staged_up;
@@ -10221,6 +10351,17 @@ struct FFN {
                 }
                 gate_up_pair = g_profiler.measure("moe.gate_up_split", [&]() {
                     auto gate = active_gate->forward(xf, route);
+                    active_up->prefetch(route);
+                    if (!moe_shared_ungated &&
+                            !shared_gate_logits.defined()) {
+                        shared_gate_logits = g_profiler.measure(
+                            "moe.shared_gate", [&]() {
+                                return torch::matmul(
+                                    xf32,
+                                    moe_shared_gate.transpose(0, 1))
+                                    .contiguous();
+                            });
+                    }
                     auto up = active_up->forward(xf, route);
                     return torch::cat({gate, up}, -1).contiguous();
                 });
@@ -10307,7 +10448,6 @@ struct FFN {
                     return moe_weighted_reduce_cuda(down_pair, selected.at(1));
                 });
             }
-            auto shared_output = shared->forward(xf);
             if (!moe_shared_ungated && !shared_gate_logits.defined()) {
                 shared_gate_logits = g_profiler.measure("moe.shared_gate", [&]() {
                     return torch::matmul(xf32, moe_shared_gate.transpose(0, 1)).contiguous();
