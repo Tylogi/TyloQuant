@@ -1209,6 +1209,40 @@ svg {
   color: var(--teal);
 }
 
+.reasoning-effort-control[hidden] {
+  display: none;
+}
+
+.reasoning-effort-control {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.reasoning-effort-control select {
+  height: 29px;
+  min-width: 66px;
+  padding: 0 25px 0 9px;
+  border: 1px solid rgb(23 131 111 / 30%);
+  border-radius: 6px;
+  outline: 0;
+  background-color: var(--teal-soft);
+  color: var(--teal);
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.reasoning-effort-control select:focus-visible {
+  border-color: var(--teal);
+  box-shadow: 0 0 0 2px rgb(23 131 111 / 12%);
+}
+
+.reasoning-effort-control select:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
 .composer-hint {
   margin-left: auto;
   color: var(--ink-faint);

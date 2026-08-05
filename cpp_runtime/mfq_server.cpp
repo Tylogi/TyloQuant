@@ -395,6 +395,32 @@ static json sampling_params_json(const MfqSamplingParams & sampling) {
     };
 }
 
+static json chat_template_capabilities_json(
+        const std::string & chat_template) {
+    json reasoning_effort_values = json::array();
+    if (chat_template.find("reasoning_effort") != std::string::npos) {
+        const auto supports_value = [&](const char * value) {
+            return chat_template.find(
+                       std::string("'") + value + "'") !=
+                       std::string::npos ||
+                   chat_template.find(
+                       std::string("\"") + value + "\"") !=
+                       std::string::npos;
+        };
+        for (const char * value : {"high", "max"}) {
+            if (supports_value(value)) {
+                reasoning_effort_values.push_back(value);
+            }
+        }
+    }
+    return {
+        {"reasoning_effort", {
+            {"supported", !reasoning_effort_values.empty()},
+            {"values", std::move(reasoning_effort_values)},
+        }},
+    };
+}
+
 static std::vector<std::string> parse_stops(const json & body) {
     std::vector<std::string> stops;
     if (!body.contains("stop") || body["stop"].is_null()) return stops;
@@ -428,11 +454,13 @@ struct RequestWork {
     std::vector<int64_t> prompt;
     std::vector<std::string> stops;
     MfqSamplingParams sampling;
+    MfqPromptCachePlan cache_plan;
 };
 
 static RequestWork parse_work(const json & body, bool chat, const LlamaTokenizer & tokenizer,
                               const common_chat_templates * templates,
                               int64_t max_context,
+                              const std::string & model_type,
                               const MfqSamplingParams & defaults) {
     if (!body.is_object()) throw ApiError(400, "invalid_request_error", "request body must be a JSON object");
     if (integer_field(body, "n", 1) != 1) {
@@ -562,6 +590,22 @@ static RequestWork parse_work(const json & body, bool chat, const LlamaTokenizer
     }
     work.prompt = tokenizer.tokenize(prompt, parse_special);
     if (work.prompt.empty()) throw ApiError(400, "invalid_request_error", "prompt tokenized to an empty sequence", "prompt");
+    if (chat && model_type == "deepseek_v4" &&
+        boolean_field(body, "add_generation_prompt", true)) {
+        const std::string stable_marker =
+            request_enable_thinking(body) ? "<think>" : "</think>";
+        const auto marker_tokens =
+            tokenizer.tokenize(stable_marker, true);
+        if (!marker_tokens.empty() &&
+            marker_tokens.size() < work.prompt.size() &&
+            std::equal(
+                marker_tokens.rbegin(),
+                marker_tokens.rend(),
+                work.prompt.rbegin())) {
+            work.cache_plan.stable_prefix_tokens =
+                work.prompt.size() - marker_tokens.size();
+        }
+    }
     if (max_context > 0 &&
         static_cast<int64_t>(work.prompt.size()) + max_tokens > max_context) {
         throw ApiError(400, "context_length_exceeded",
@@ -752,6 +796,7 @@ struct CompletionResult {
 };
 
 struct RequestMetricValues {
+    size_t prefill_tokens = 0;
     double generation_ms = 0.0;
     double ttft_ms = 0.0;
     double prefill_ms = 0.0;
@@ -765,6 +810,9 @@ static RequestMetricValues request_metric_values(
         const CompletionResult & result, const RequestMetrics & metrics) {
     const auto finished = RequestMetrics::Clock::now();
     RequestMetricValues values;
+    values.prefill_tokens = metrics.saw_prefill
+        ? metrics.prefill_tokens
+        : 0;
     values.generation_ms =
         std::chrono::duration<double, std::milli>(finished - metrics.started).count();
     values.ttft_ms = metrics.saw_token
@@ -806,6 +854,7 @@ static void log_request_metrics(const std::string & id, bool chat, bool stream,
          << " endpoint=" << (chat ? "chat" : "completion")
          << " stream=" << (stream ? 1 : 0)
          << " prompt_tokens=" << prompt_tokens
+         << " prefill_tokens=" << values.prefill_tokens
          << " completion_tokens=" << result.completion_tokens
          << " max_tokens=" << sampling.max_tokens
          << " ttft_ms=" << values.ttft_ms
@@ -856,6 +905,7 @@ public:
             {"endpoint", chat ? "chat" : "completion"},
             {"stream", stream},
             {"prompt_tokens", prompt_tokens},
+            {"prefill_tokens", values.prefill_tokens},
             {"completion_tokens", result.completion_tokens},
             {"ttft_ms", values.ttft_ms},
             {"prefill_ms", values.prefill_ms},
@@ -990,7 +1040,8 @@ static CompletionResult generate_text(const RequestWork & work, const LlamaToken
             if (metrics != nullptr) {
                 metrics->mark_prefill(prompt_tokens, prefill_ms);
             }
-        });
+        },
+        work.cache_plan);
     if (result.client_connected && !emitter.stopped()) emitter.flush();
     if (result.client_connected && chat_parser) {
         chat_parser->flush();
@@ -1213,6 +1264,9 @@ int run_mfq_server(
     }
     const MfqSamplingParams sampling_defaults =
         default_sampling_params(config);
+    const json chat_template_capabilities =
+        chat_template_capabilities_json(
+            tokenizer->chat_template());
 
     httplib::Server server;
     ServerMetrics server_metrics;
@@ -1288,6 +1342,7 @@ int run_mfq_server(
             {"model_type", config.model_type},
             {"max_context", active_context.load()},
             {"sampling_defaults", sampling_params_json(sampling_defaults)},
+            {"chat_template_capabilities", chat_template_capabilities},
         });
     });
 
@@ -1297,6 +1352,8 @@ int run_mfq_server(
             config, active_context.load(), reloading.load());
         status["sampling_defaults"] = sampling_params_json(
             sampling_defaults);
+        status["chat_template_capabilities"] =
+            chat_template_capabilities;
         set_json(res, status);
     });
 
@@ -1383,7 +1440,8 @@ int run_mfq_server(
             const json body = parse_body(req);
             RequestWork work = parse_work(
                 body, chat, *tokenizer, chat_templates.get(),
-                active_context.load(), sampling_defaults);
+                active_context.load(), config.model_type,
+                sampling_defaults);
             const std::string id = request_id(chat ? "chatcmpl-" : "cmpl-");
             const int64_t created = unix_time_seconds();
 

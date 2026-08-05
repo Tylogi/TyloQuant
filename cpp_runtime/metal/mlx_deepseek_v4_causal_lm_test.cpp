@@ -1341,6 +1341,112 @@ void test_generation_eos_and_callback() {
     }
 }
 
+void test_generation_stable_prefix_cache() {
+    mfq::metal::MlxSamplingParams sampling;
+    sampling.temperature = 0.0;
+
+    auto cached = make_model();
+    std::size_t first_prefill_tokens = 0;
+    (void)cached.generate(
+        {1, 2, 3},
+        sampling,
+        1,
+        {},
+        std::vector<std::int64_t>{},
+        512,
+        [&](std::size_t tokens, double) {
+            first_prefill_tokens = tokens;
+        },
+        2);
+    require(
+        first_prefill_tokens == 3 &&
+            cached.cache_position() == 2,
+        "DeepSeek-V4 initial stable cache checkpoint mismatch");
+
+    std::size_t reused_prefill_tokens = 0;
+    std::vector<std::int64_t> cached_output;
+    (void)cached.generate(
+        {1, 2, 4, 5},
+        sampling,
+        1,
+        [&](std::int64_t token) {
+            cached_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{},
+        512,
+        [&](std::size_t tokens, double) {
+            reused_prefill_tokens = tokens;
+        },
+        3);
+    require(
+        reused_prefill_tokens == 2 &&
+            cached.cache_position() == 3,
+        "DeepSeek-V4 stable prefix was not reused");
+
+    auto fresh = make_model();
+    std::vector<std::int64_t> fresh_output;
+    (void)fresh.generate(
+        {1, 2, 4, 5},
+        sampling,
+        1,
+        [&](std::int64_t token) {
+            fresh_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{});
+    require(
+        cached_output == fresh_output,
+        "DeepSeek-V4 reused prefix changed sampled output");
+
+    std::size_t fallback_prefill_tokens = 0;
+    (void)cached.generate(
+        {1, 7, 4, 5},
+        sampling,
+        1,
+        {},
+        std::vector<std::int64_t>{},
+        512,
+        [&](std::size_t tokens, double) {
+            fallback_prefill_tokens = tokens;
+        },
+        3);
+    require(
+        fallback_prefill_tokens == 4,
+        "DeepSeek-V4 mismatched prefix did not fall back to full prefill");
+
+    auto interrupted = make_model();
+    (void)interrupted.generate(
+        {1, 2, 3},
+        sampling,
+        3,
+        [](std::int64_t) {
+            return false;
+        },
+        std::vector<std::int64_t>{},
+        512,
+        {},
+        2);
+    require(
+        interrupted.cache_position() == 2,
+        "DeepSeek-V4 interrupted generation lost its stable checkpoint");
+    std::size_t interrupted_prefill_tokens = 0;
+    (void)interrupted.generate(
+        {1, 2, 6},
+        sampling,
+        1,
+        {},
+        std::vector<std::int64_t>{},
+        512,
+        [&](std::size_t tokens, double) {
+            interrupted_prefill_tokens = tokens;
+        },
+        2);
+    require(
+        interrupted_prefill_tokens == 1,
+        "DeepSeek-V4 interrupted request checkpoint was not reusable");
+}
+
 void test_mfq_container_load() {
     const auto path =
         std::filesystem::temp_directory_path() /
@@ -1522,6 +1628,7 @@ int main() {
         test_layer_schedule_and_manual_reference();
         test_prefill_decode_and_chunking();
         test_generation_eos_and_callback();
+        test_generation_stable_prefix_cache();
         test_mfq_container_load();
         test_streamed_mfq_container_lifetime();
         test_validation();
