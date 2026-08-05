@@ -20,6 +20,9 @@ WEB_JS = (ROOT / "cpp_runtime" / "web" / "app.js").read_text(
 WEB_HTML = (ROOT / "cpp_runtime" / "web" / "index.html").read_text(
     encoding="utf-8"
 )
+WEB_CSS = (ROOT / "cpp_runtime" / "web" / "app.css").read_text(
+    encoding="utf-8"
+)
 
 
 def test_server_uses_native_gguf_jinja_template_and_common_parser() -> None:
@@ -61,10 +64,32 @@ def test_webui_keeps_reasoning_separate_and_template_controlled() -> None:
     assert 'id="setting-exclude-reasoning"' in WEB_HTML
 
 
+def test_webui_exposes_template_gated_reasoning_effort() -> None:
+    assert "chat_template_capabilities_json" in SERVER
+    assert '{"chat_template_capabilities", chat_template_capabilities}' in SERVER
+    assert 'id="reasoning-effort-control" hidden' in WEB_HTML
+    assert 'id="reasoning-effort-select"' in WEB_HTML
+    assert '<option value="high">高</option>' in WEB_HTML
+    assert '<option value="max">最大</option>' in WEB_HTML
+    assert "state.status?.chat_template_capabilities?.reasoning_effort" in WEB_JS
+    assert "supportedReasoningEfforts.includes(state.settings.reasoningEffort)" in WEB_JS
+    assert "chatTemplateKwargs.reasoning_effort = state.settings.reasoningEffort" in WEB_JS
+    assert "control.hidden = !supported || !state.settings.enableThinking" in WEB_JS
+    assert ".reasoning-effort-control[hidden]" in WEB_CSS
+
+
 def test_webui_uses_the_bundled_server_origin() -> None:
     assert "return location.origin;" in WEB_JS
     assert "LEGACY_LOCAL_ENDPOINT" in WEB_JS
     assert 'streamState.finishReason === "length"' in WEB_JS
+
+
+def test_dsv4_server_uses_exact_stable_prefix_kv_reuse() -> None:
+    assert "MfqPromptCachePlan" in SERVER
+    assert 'model_type == "deepseek_v4"' in SERVER
+    assert 'request_enable_thinking(body) ? "<think>" : "</think>"' in SERVER
+    assert "stable_prefix_tokens" in SERVER
+    assert '{"prefill_tokens", values.prefill_tokens}' in SERVER
 
 
 def test_webui_can_reload_model_with_a_new_context() -> None:

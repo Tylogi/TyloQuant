@@ -19436,7 +19436,8 @@ int main(int argc, char ** argv) {
                 server_config, [&](const std::vector<int64_t> & prompt,
                                    const MfqSamplingParams & sampling,
                                    const MfqTokenCallback & on_token,
-                                   const MfqPrefillCallback & on_prefill) {
+                                   const MfqPrefillCallback & on_prefill,
+                                   const MfqPromptCachePlan &) {
                 return generate_server_tokens(
                     model, model_mutex, decode_graph_cache, prompt, sampling,
                     on_token, on_prefill);

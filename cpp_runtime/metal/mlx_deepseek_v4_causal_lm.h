@@ -188,7 +188,9 @@ public:
             eos_token_ids = std::nullopt,
         int chunk_size = 512,
         const std::function<void(std::size_t, double)>&
-            prefill_callback = {});
+            prefill_callback = {},
+        std::optional<std::size_t> stable_prefix_tokens =
+            std::nullopt);
 
     const DeepseekV4Config& config() const noexcept {
         return config_;
@@ -253,6 +255,10 @@ private:
     std::vector<MlxDeepseekV4LayerState> states_;
     int cache_position_ = 0;
     int cache_batch_ = 0;
+    // Exact token sequence represented by states_ when a server request leaves
+    // a stable prompt checkpoint.  It is intentionally empty for cache state
+    // produced through the public forward/prefill/decode APIs.
+    std::vector<std::int64_t> stable_cache_tokens_;
 };
 
 } // namespace mfq::metal
