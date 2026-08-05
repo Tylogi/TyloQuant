@@ -114,3 +114,11 @@ def test_dual_kld_mmq_sequence_reuses_one_loaded_model():
 
 def test_kld_progress_is_flushed_for_unattended_logs():
     assert "if (!kl_base.empty()) std::cout << std::unitbuf;" in SOURCE
+
+
+def test_streamed_kld_can_atomically_save_candidate_f16_logits():
+    assert 'a == "--kl-save-logits-f16"' in SOURCE
+    assert 'logits_partial += ".partial"' in SOURCE
+    assert "refusing to overwrite saved KL logits" in SOURCE
+    assert "saved.data_ptr<c10::Half>()" in SOURCE
+    assert "std::filesystem::rename(logits_partial, logits_final)" in SOURCE
