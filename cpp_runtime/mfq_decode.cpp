@@ -2573,6 +2573,7 @@ struct NintMoeWeight {
     std::vector<TensorParallelShard>
         tensor_parallel_shards;
     std::function<void(const MoeRoutePlan &)> cache_prefetch;
+    std::function<void(const MoeRoutePlan &)> cache_prefetch_begin;
     std::function<torch::Tensor(torch::Tensor, const MoeRoutePlan &)> mixed_forward;
     std::function<torch::Tensor(
         torch::Tensor, const MoeRoutePlan &, bool)> mixed_glu_output_forward;
@@ -2692,6 +2693,10 @@ struct NintMoeWeight {
 
     void prefetch(const MoeRoutePlan & route) const {
         if (cache_prefetch) cache_prefetch(route);
+    }
+
+    void prefetch_begin(const MoeRoutePlan & route) const {
+        if (cache_prefetch_begin) cache_prefetch_begin(route);
     }
 
     torch::Tensor forward(
@@ -5721,9 +5726,11 @@ public:
 
     void prewarm();
 
-    std::vector<int32_t> read_route_experts(
-            const torch::Tensor & ids,
+    void begin_route_experts(
+            const MoeRoutePlan & route,
             int n_experts) {
+        if (route.host_unique_experts) return;
+        const auto & ids = route.ids;
         if (!ids.is_cuda() || !ids.is_contiguous() ||
                 ids.scalar_type() != torch::kInt32 ||
                 ids.dim() != 2) {
@@ -5734,6 +5741,15 @@ public:
         if (count <= 0) {
             throw std::runtime_error(
                 "cached MoE route list is empty");
+        }
+        if (n_experts <= 0) {
+            throw std::runtime_error(
+                "cached MoE expert count must be positive");
+        }
+        if (route_readback_pending_) {
+            if (pending_route_generation_ == route.generation) return;
+            throw std::runtime_error(
+                "overlapping cached MoE route readbacks are unsupported");
         }
         if (!route_host_.defined() ||
                 route_host_.numel() < count) {
@@ -5760,8 +5776,33 @@ public:
             route_stream_));
         MFQ_CUDA_CHECK(cudaEventRecord(
             route_done_, route_stream_));
-        MFQ_CUDA_CHECK(cudaEventSynchronize(route_done_));
         stats_.route_d2h_bytes += nbytes;
+        pending_route_generation_ = route.generation;
+        pending_route_count_ = count;
+        pending_route_n_experts_ = n_experts;
+        route_readback_pending_ = true;
+    }
+
+    std::vector<int32_t> read_route_experts(
+            const MoeRoutePlan & route,
+            int n_experts) {
+        if (!route.host_unique_experts &&
+                (!route_readback_pending_ ||
+                 pending_route_generation_ != route.generation)) {
+            begin_route_experts(route, n_experts);
+        }
+        if (!route_readback_pending_ ||
+                pending_route_generation_ != route.generation ||
+                pending_route_n_experts_ != n_experts) {
+            throw std::runtime_error(
+                "cached MoE route readback state does not match the route");
+        }
+        MFQ_CUDA_CHECK(cudaEventSynchronize(route_done_));
+        const int64_t count = pending_route_count_;
+        route_readback_pending_ = false;
+        pending_route_generation_ = 0;
+        pending_route_count_ = 0;
+        pending_route_n_experts_ = 0;
         const auto * values =
             route_host_.data_ptr<int32_t>();
         std::vector<int32_t> result(
@@ -6036,6 +6077,10 @@ private:
     cudaEvent_t route_input_ready_ = nullptr;
     cudaEvent_t route_done_ = nullptr;
     torch::Tensor route_host_;
+    uint64_t pending_route_generation_ = 0;
+    int64_t pending_route_count_ = 0;
+    int pending_route_n_experts_ = 0;
+    bool route_readback_pending_ = false;
     std::vector<MoePinnedStage> stages_;
     size_t next_stage_ = 0;
     std::unordered_map<std::string, std::unique_ptr<MoeGpuArena>> arenas_;
@@ -6339,9 +6384,14 @@ public:
             route.host_unique_experts =
                 std::make_shared<std::vector<int32_t>>(
                     cache_->read_route_experts(
-                        route.ids, cpu_->n_experts));
+                        route, cpu_->n_experts));
         }
         return *route.host_unique_experts;
+    }
+
+    void begin_prefetch(const MoeRoutePlan & route) {
+        if (use_full_projection(route)) return;
+        cache_->begin_route_experts(route, cpu_->n_experts);
     }
 
     bool use_full_projection(const MoeRoutePlan & route) const {
@@ -6945,6 +6995,10 @@ static NintMoeWeight wrap_cached_moe_source(
     result.cache_prefetch = [source](
             const MoeRoutePlan & route) {
         source->prefetch(route);
+    };
+    result.cache_prefetch_begin = [source](
+            const MoeRoutePlan & route) {
+        source->begin_prefetch(route);
     };
     result.mixed_forward = [source](
             torch::Tensor x,
@@ -10304,15 +10358,28 @@ struct FFN {
                 });
             }
 
-            // Start the first routed projection transfer before the shared
-            // expert.  The cache uses a separate CUDA stream, so the H2D copy
-            // can overlap the independent dense/shared computation.  The
-            // projection forward below still performs the normal cache check
-            // and stream wait, preserving the existing execution semantics.
+            // Start the tiny route readback before the shared expert.  The
+            // cache consumes it after the shared branch has been enqueued,
+            // then launches H2D on its separate stream.  The projection
+            // forward below still performs the normal cache check and stream
+            // wait, preserving the existing execution semantics.
+            static const bool delayed_route_readback = [] {
+                const char * value =
+                    std::getenv("MFQ_MOE_DELAYED_ROUTE_READBACK");
+                return value == nullptr || std::atoi(value) != 0;
+            }();
             if (moe_split_gate_up) {
-                moe_gate.prefetch(route);
+                if (delayed_route_readback) {
+                    moe_gate.prefetch_begin(route);
+                } else {
+                    moe_gate.prefetch(route);
+                }
             } else {
-                moe_gate_up.prefetch(route);
+                if (delayed_route_readback) {
+                    moe_gate_up.prefetch_begin(route);
+                } else {
+                    moe_gate_up.prefetch(route);
+                }
             }
             auto shared_output = g_profiler.measure(
                 "moe.shared", [&]() {
@@ -10321,11 +10388,18 @@ struct FFN {
             if (!moe_split_gate_up && !moe_shared_ungated) {
                 shared_gate_logits = g_profiler.measure(
                     "moe.shared_gate", [&]() {
-                        return torch::matmul(
-                            xf32,
-                            moe_shared_gate.transpose(0, 1))
-                            .contiguous();
-                    });
+                    return torch::matmul(
+                        xf32,
+                        moe_shared_gate.transpose(0, 1))
+                        .contiguous();
+                });
+            }
+            if (delayed_route_readback) {
+                if (moe_split_gate_up) {
+                    moe_gate.prefetch(route);
+                } else {
+                    moe_gate_up.prefetch(route);
+                }
             }
             std::optional<NintMoeWeight> staged_gate_up;
             std::optional<NintMoeWeight> staged_gate;
