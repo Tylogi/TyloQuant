@@ -742,10 +742,7 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
     fused_dense_router_ =
         fused_router_env == nullptr
         || std::string_view(fused_router_env) != "0";
-    if (
-        !grouped_projections_.has_value()
-        && grouped_gate_up_enabled
-    ) {
+    if (grouped_gate_up_enabled) {
         grouped_shared_gate_up_ = make_grouped_gate_up(
             shared_gate_,
             shared_up_);
@@ -757,17 +754,6 @@ MlxDeepseekV4Moe::project_shared(
     const array& input,
     float swiglu_limit,
     bool project_router) const {
-    if (project_router &&
-        grouped_projections_.has_value() &&
-        grouped_projections_->supports(input)) {
-        auto outputs =
-            grouped_projections_->matmul(input);
-        return {
-            std::move(outputs.at(0)),
-            std::move(outputs.at(1)),
-            std::move(outputs.at(2)),
-        };
-    }
     if (
         grouped_shared_gate_up_.has_value()
         && fused_shared_swiglu_
@@ -785,6 +771,17 @@ MlxDeepseekV4Moe::project_shared(
             };
         }
         return {std::move(shared_hidden)};
+    }
+    if (project_router &&
+        grouped_projections_.has_value() &&
+        grouped_projections_->supports(input)) {
+        auto outputs =
+            grouped_projections_->matmul(input);
+        return {
+            std::move(outputs.at(0)),
+            std::move(outputs.at(1)),
+            std::move(outputs.at(2)),
+        };
     }
     if (
         grouped_shared_gate_up_.has_value()
