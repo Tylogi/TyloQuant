@@ -36,18 +36,12 @@ and registered tiers.
 
 ### DeepSeek-V4-Flash-0731
 
-<img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ versus Unsloth Dynamic disk size and Mean KLD at ctx512 and ctx2048" width="100%">
-
-Notably, even the smallest `74.902 GiB` MFQ tier retains strong fidelity: at
-both context lengths, its Mean KLD is lower than every completed Unsloth Dynamic
-result shown, including the `127.277 GiB` IQ4 results.
-
-The full WikiText-2 evaluation uses identical BF16-reference logits, tokenizer,
-BOS, and token sequences for both runtimes. It covers 146,115 scored tokens at
-`ctx512` and 146,289 at `ctx2048`. Across the three closest-size pairs, MFQ
-reduces Mean KLD by **57.04–57.75%** at `ctx512` and **52.88–55.35%** at
-`ctx2048`, with each pair within 2.116 GiB. Lower Mean KLD is better. See the
-[complete results and protocol](./docs/deepseek-v4-flash-0731-results.md).
+The official-0731 WikiText-2 evaluation covers 573 chunks and 146,115 scored
+tokens at `ctx=512`. The released 77.519 GiB S tier records `0.313576` Mean
+KLD and `82.2913%` same-top. The 88.007 GiB M and 98.007 GiB L tiers record
+`0.244488` / `84.5300%` and `0.201444` / `86.0753%`, respectively. Across the
+three nearest-size UD comparisons, MFQ reduces Mean KLD by **34.24–51.42%**.
+See the [complete results and protocol](./docs/deepseek-v4-flash-0731-results.md).
 
 ### Qwen3.5-9B: disk size vs. Mean KLD
 
