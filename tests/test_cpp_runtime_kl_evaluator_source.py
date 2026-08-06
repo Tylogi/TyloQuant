@@ -122,3 +122,25 @@ def test_streamed_kld_can_atomically_save_candidate_f16_logits():
     assert "refusing to overwrite saved KL logits" in SOURCE
     assert "saved.data_ptr<c10::Half>()" in SOURCE
     assert "std::filesystem::rename(logits_partial, logits_final)" in SOURCE
+
+
+def test_streamed_kld_defaults_to_one_sequence_per_forward():
+    assert "int kl_stream_batch = 1;" in SOURCE
+    assert "int kl_stream_batch = 4;" not in SOURCE
+    assert 'a == "--kl-stream-batch"' in SOURCE
+
+
+def test_kld_execution_geometry_must_match_reference_contract():
+    assert "validate_kl_execution_geometry(" in SOURCE
+    assert 'reference_contract, "single-sequence"' in SOURCE
+    assert 'reference_contract, "optimized"' in SOURCE
+    assert 'reference_contract, "streamed"' in SOURCE
+    assert '" execution_n_seq="' in SOURCE
+    assert '" execution_n_batch="' in SOURCE
+    assert '" execution_n_ubatch="' in SOURCE
+
+
+def test_single_sequence_kld_records_actual_execution_geometry():
+    assert '<< " execution_n_seq=1"' in SOURCE
+    assert '<< " execution_n_batch=" << execution_n_batch' in SOURCE
+    assert '<< " execution_n_ubatch=" << execution_n_batch' in SOURCE

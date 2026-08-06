@@ -1,67 +1,50 @@
-# DeepSeek-V4-Flash-0731：MFQ 与 UD 已完成结果
+# DeepSeek-V4-Flash-0731：MFQ、TPQ 与 UD 结果
 
-更新时间：2026-08-04
+更新时间：2026-08-06
 
-## KLD 测试设置
+## 测试协议
 
-- 数据集：WikiText2 `wiki.test.raw`
-- Reference：BF16 logits，同一 tokenizer、BOS 和 token 序列
-- `ctx512`：`n_ctx=512`、`n_batch=512`、`n_ubatch=512`、`n_seq=1`，573块，146,115个计分token
-- `ctx2048`：`n_ctx=2048`、`n_batch=2048`、`n_ubatch=2048`、`n_seq=1`，143块，146,289个计分token
-- MFQ：optimized evaluator、FP16 MMQ
-- UD：llama.cpp `llama-perplexity`，对同一BF16 reference计算KLD
-- 表中只保留全集结果；三块门、失败、OOM和中途暂停结果均未计入
+- 源权重：官方 DeepSeek-V4-Flash-0731。
+- Reference：官方 DeepSeek runtime 生成的 BF16 logits。
+- 数据集：WikiText-2 `wiki.test.raw`，使用已校验的原始字节、CRLF 与 token 对齐。
+- 每条序列：`ctx=512`；reference 使用 `batch=512`、`ubatch=512`、`n_seq=1`。
+- 规模：573 个 chunk，每块打分 255 个 token，共 146,115 个 token。
+- Mean KLD：正向 `KL(P_reference || P_model)`；same-top 为 reference 与被测模型 argmax 一致率。
+- UD：llama.cpp 全驻留评测。
+- TPQ：MFQ 内的 TPQ 全驻留路径。
+- MFQ：streamed TP1 路径、`layer_group=4`、FP16 MMQ。表中 B4 表示一次并行处理 4 条互不共享注意力状态的 512-token 序列；单序列 context 仍为 512，总执行 batch 为 2048。
+- 只列完整 573-chunk 结果；三块门、失败和中途结果均未计入。
 
-## 完整KLD表
+## 完整结果
 
-| 类型 | 模型 | 文件大小（GiB） | ctx512 Mean KLD | ctx512 same-top | ctx2048 Mean KLD | ctx2048 same-top | 备注 |
-|---|---|---:|---:|---:|---:|---:|---|
-| MFQ | DeepSeek-V4-Flash-0731-EW-V2-S | 74.902 | **0.301010** | **81.3585%** | **0.273962** | **82.2482%** | 全集 |
-| TPQ | DeepSeek-V4-Flash-0731-TPQ-S | 76.473 | 0.419456 | 79.2848% | 0.368860 | 80.7149% | ctx512/ctx2048 全集 |
-| MFQ | DeepSeek-V4-Flash-0731-EW-V2-M | 88.066 | **0.212639** | **84.1775%** | **0.200006** | **84.8341%** | 全集 |
-| MFQ | DeepSeek-V4-Flash-0731-EW-V2-L | 97.785 | **0.182413** | **85.2630%** | **0.176085** | **85.6339%** | 全集 |
-| UD | UD-IQ1_S | 76.871 | 0.712517 | 71.4460% | 0.613621 | 73.4810% | 全集 |
-| UD | UD-IQ1_M | 80.933 | 0.657802 | 72.9250% | 0.560693 | 75.0950% | 全集 |
-| UD | UD-IQ2_XXS | 84.621 | 0.565540 | 74.7900% | 0.492279 | 76.7170% | 全集 |
-| UD | UD-IQ2_M | 84.682 | 0.566106 | 74.6770% | 0.491329 | 76.7110% | 全集 |
-| UD | UD-Q2_K_XL | 90.182 | 0.502402 | 76.1670% | 0.438221 | 77.9800% | 全集 |
-| UD | UD-IQ3_XXS | 97.051 | 0.424584 | 78.5570% | 0.373674 | 80.0440% | 全集 |
-| UD | UD-IQ3_S | 108.098 | 0.423805 | 78.5060% | 0.375224 | 79.8130% | 全集 |
-| UD | UD-Q3_K_M | 119.282 | 0.358355 | 80.4740% | 0.316184 | 81.7570% | 全集 |
-| UD | UD-IQ4_NL | 127.277 | 0.338218 | 80.9470% | 0.297450 | 82.0600% | 全集 |
-| UD | UD-IQ4_XS | 127.277 | 0.338218 | 80.9470% | 0.297450 | 82.0600% | 与UD-IQ4_NL的3个权重分片逐字节相同，复用其结果 |
+| 类型 | 模型 | 字节数 | 大小（GiB） | Mean KLD | same-top | 执行方式 |
+|---|---|---:|---:|---:|---:|---|
+| MFQ | DeepSeek-V4-Flash-0731-EW-V2-S（NINT8-0 Emb/Head，发布版） | 83,235,658,220 | 77.519 | **0.313576** | **82.2913%** | streamed TP1x6, B4 |
+| MFQ | DeepSeek-V4-Flash-0731-EW-V2-S（BF16 Emb/Head） | 84,228,528,563 | 78.444 | 0.313559 | 82.2386% | streamed TP1x6, B4 |
+| MFQ | DeepSeek-V4-Flash-0731-EW-V2-M | 94,496,321,567 | 88.007 | **0.244488** | **84.5300%** | streamed TP1x6, B4 |
+| MFQ | DeepSeek-V4-Flash-0731-EW-V2-L | 105,234,452,170 | 98.007 | **0.201444** | **86.0753%** | streamed TP1x6, B4 |
+| TPQ | DeepSeek-V4-Flash-0731-TPQ-S | 82,112,397,367 | 76.473 | 0.291115 | 83.0846% | full-resident TP1x6 |
+| UD | UD-IQ1_S | 82,539,237,792 | 76.871 | 0.645514 | 73.0110% | llama.cpp |
+| UD | UD-IQ1_M | 86,901,313,952 | 80.933 | 0.581024 | 74.6580% | llama.cpp |
+| UD | UD-IQ2_XXS | 90,860,736,928 | 84.621 | 0.478268 | 76.9380% | llama.cpp |
+| UD | UD-IQ2_M | 90,926,928,288 | 84.682 | 0.478002 | 76.8580% | llama.cpp |
+| UD | UD-Q2_K_XL | 96,832,508,352 | 90.182 | 0.403276 | 78.7780% | llama.cpp |
+| UD | UD-IQ3_XXS | 104,207,848,032 | 97.051 | 0.306343 | 82.0150% | llama.cpp |
+| UD | UD-IQ3_S | 116,069,339,712 | 108.098 | 0.310893 | 81.6860% | llama.cpp |
+| UD | UD-Q3_K_M | 128,078,484,032 | 119.282 | 0.215570 | 85.1060% | llama.cpp |
+| UD | UD-Q3_K_XL | 128,206,729,792 | 119.402 | 0.215313 | 84.9650% | llama.cpp |
+| UD | UD-IQ4_NL | 136,662,446,656 | 127.277 | 0.180695 | 86.0750% | llama.cpp |
+| UD | UD-Q4_K_XL | 155,095,241,120 | 144.444 | 0.149590 | 87.4540% | llama.cpp |
+| UD | UD-Q8_K_XL | 161,869,615,520 | 150.753 | 0.149420 | 87.5870% | llama.cpp |
 
-### 近似同体积对位
+## 近似同体积对位
 
-| MFQ / UD | 大小差（MFQ-UD） | ctx512 KLD差（MFQ-UD） | ctx2048 KLD差（MFQ-UD） |
-|---|---:|---:|---:|
-| EW-V2-S / UD-IQ1_S | -1.969 GiB | **-0.411507** | **-0.339659** |
-| EW-V2-M / UD-Q2_K_XL | -2.116 GiB | **-0.289763** | **-0.238215** |
-| EW-V2-L / UD-IQ3_XXS | +0.734 GiB | **-0.242171** | **-0.197589** |
+| 对位 | 大小差（MFQ − UD） | KLD 差（MFQ − UD） | KLD 降幅 | same-top 差 |
+|---|---:|---:|---:|---:|
+| EW-V2-S 发布版 / UD-IQ1_S | +0.649 GiB | -0.331938 | **51.422%** | **+9.2803 pp** |
+| EW-V2-M / UD-Q2_K_XL | -2.176 GiB | -0.158788 | **39.374%** | **+5.7520 pp** |
+| EW-V2-L / UD-IQ3_XXS | +0.956 GiB | -0.104899 | **34.242%** | **+4.0603 pp** |
 
-注：EW-V2-L 与 UD-IQ3_XXS 的 ctx512 KLD差为 `0.182413 - 0.424584 = -0.242171`。
+## B4 与 B1 数值检查
 
-## 推理速度测试设置
-
-- 硬件：RTX 5090 32 GiB
-- 工作负载：1024-token prefill + 128-token decode，`ctx=1280`
-- MFQ单卡：21 GiB MoE专家GPU cache，其余专家权重驻留CPU
-- UD单卡：llama.cpp CUDA原生layer offload，`batch=2048`、`ubatch=512`、FA开启、64 CPU线程、目标保留512 MiB显存
-- MFQ速度为一次正式运行；UD速度为5次重复的均值和标准差
-
-## 完整速度表
-
-| 类型 | 模型 | 大小（GiB） | 模式 | Prefill（tok/s） | Decode（tok/s） | 峰值显存（MiB） |
-|---|---|---:|---|---:|---:|---:|
-| MFQ | EW-V2-S | 74.902 | 单卡32 GiB + CPU，21 GiB专家cache | 39.910 | 8.073 | 31,468 |
-| UD | UD-IQ1_S | 76.871 | 单卡32 GiB + CPU，llama.cpp layer offload | **167.456 ± 1.811** | **34.896 ± 0.807** | 31,597 |
-| MFQ | EW-V2-M | 88.066 | 单卡32 GiB + CPU，21 GiB专家cache | 35.120 | 6.453 | 31,490 |
-| UD | UD-Q2_K_XL | 90.182 | 单卡32 GiB + CPU，llama.cpp layer offload | **128.399 ± 1.570** | **31.824 ± 0.533** | 31,083 |
-
-## 尚无全集结果的已下载UD
-
-- UD-Q3_K_XL
-- UD-Q4_K_XL
-- UD-Q8_K_XL
-
-这些模型未进入KLD表。当前下载清单中未发现UD-Q5_K_XL和UD-Q6_K_XL目录。
+BF16 Emb/Head 的 EW-V2-S 另完成了严格 B1 全集复测：Mean KLD `0.313374`，same-top `82.3016%`。相对表中 B4 结果，Mean KLD 相差 `0.000186`，same-top 相差 `0.0630` 个百分点。B4 的四条序列相互独立，差异来自 M=2048 与 M=512 算子路径的浮点舍入。

@@ -15399,6 +15399,25 @@ struct KlReferenceContract {
     int64_t n_ubatch = 0;
 };
 
+static void validate_kl_execution_geometry(
+        int64_t execution_n_batch,
+        int64_t execution_n_ubatch,
+        const KlReferenceContract & reference_contract,
+        const char * execution_path) {
+    if (reference_contract.n_batch == 0) return;
+    if (execution_n_batch != reference_contract.n_batch ||
+            execution_n_ubatch != reference_contract.n_ubatch) {
+        std::ostringstream message;
+        message << execution_path
+                << " KL execution geometry n_batch=" << execution_n_batch
+                << " n_ubatch=" << execution_n_ubatch
+                << " does not match reference n_batch="
+                << reference_contract.n_batch
+                << " n_ubatch=" << reference_contract.n_ubatch;
+        throw std::runtime_error(message.str());
+    }
+}
+
 enum class KlEvaluator {
     Legacy,
     Optimized,
@@ -15586,6 +15605,17 @@ static int run_kl_eval(
         ? available_chunks
         : std::min(max_chunks, available_chunks);
     if (chunks <= 0) throw std::runtime_error("KL evaluation requires at least one chunk");
+    const int64_t execution_n_batch =
+        (int64_t)eval_chunks[0].tokens.size();
+    if (reference_contract.n_batch != 0) {
+        for (int ci = 0; ci < chunks; ++ci) {
+            const int64_t execution_tokens =
+                (int64_t)eval_chunks[(size_t)ci].tokens.size();
+            validate_kl_execution_geometry(
+                execution_tokens, execution_tokens,
+                reference_contract, "single-sequence");
+        }
+    }
     constexpr int KL_BATCH = 8;
     double kld_sum = 0.0;
     double reverse_kld_sum = 0.0;
@@ -15600,6 +15630,9 @@ static int run_kl_eval(
               << " graph=single_sequence"
               << " available_chunks=" << available_chunks
               << " selected_chunks=" << chunks
+              << " execution_n_seq=1"
+              << " execution_n_batch=" << execution_n_batch
+              << " execution_n_ubatch=" << execution_n_batch
               << " score_count_override=" << score_override
               << " reference_n_batch=" << reference_contract.n_batch
               << " reference_n_ubatch=" << reference_contract.n_ubatch
@@ -15762,6 +15795,9 @@ static int run_kl_eval(
                   (reference_format == "_logit2_" ? "trace_v2" : "legacy"))
               << " execution=" << kl_evaluator_name(evaluator)
               << " graph=single_sequence"
+              << " execution_n_seq=1"
+              << " execution_n_batch=" << execution_n_batch
+              << " execution_n_ubatch=" << execution_n_batch
               << " score_count_override=" << score_override
               << " reference_n_batch=" << reference_contract.n_batch
               << " reference_n_ubatch=" << reference_contract.n_ubatch
@@ -16021,7 +16057,9 @@ static int run_kl_eval_batched(
     const int chunks = (int)input.chunks.size();
     const int64_t n_ctx = (int64_t)input.chunks[0].tokens.size();
     const int64_t n_batch = requested_n_batch == 0
-        ? n_ctx : requested_n_batch;
+        ? (reference_contract.n_batch == 0
+              ? n_ctx : reference_contract.n_batch)
+        : requested_n_batch;
     if (n_ctx <= 0 || n_batch < n_ctx || n_batch % n_ctx != 0) {
         throw std::runtime_error(
             "optimized KL requires --kl-n-batch to be at least n_ctx "
@@ -16029,6 +16067,8 @@ static int run_kl_eval_batched(
     }
     const int llama_kl_n_seq = std::max<int64_t>(
         1, n_batch / n_ctx);
+    validate_kl_execution_geometry(
+        n_batch, n_batch, reference_contract, "optimized");
     KlKvCacheCapacityScope kv_cache_capacity_scope(n_ctx);
     const int target_start = input.chunks[0].target_start;
     int score_count = input.chunks[0].score_count;
@@ -16207,6 +16247,11 @@ static int run_kl_eval_streamed(
     auto input = load_streamed_kl_input(reference_path, max_chunks);
     const int chunks = (int)input.chunks.size();
     const int64_t n_ctx = (int64_t)input.chunks[0].tokens.size();
+    const int64_t execution_n_seq = std::min(chunk_batch, chunks);
+    const int64_t execution_n_batch = execution_n_seq * n_ctx;
+    validate_kl_execution_geometry(
+        execution_n_batch, execution_n_batch,
+        reference_contract, "streamed");
     const int target_start = input.chunks[0].target_start;
     int score_count = input.chunks[0].score_count;
     for (const auto & chunk : input.chunks) {
@@ -16296,6 +16341,9 @@ static int run_kl_eval_streamed(
               << " reference_n_ubatch=" << reference_contract.n_ubatch
               << " layer_group=" << layer_group
               << " chunk_batch=" << chunk_batch
+              << " execution_n_seq=" << execution_n_seq
+              << " execution_n_batch=" << execution_n_batch
+              << " execution_n_ubatch=" << execution_n_batch
               << " hidden_bytes=" << hidden_bytes << "\n";
 
     for (int begin = 0; begin < chunks; begin += chunk_batch) {
@@ -16447,6 +16495,9 @@ static int run_kl_eval_streamed(
               << " execution=streamed_layer_groups"
               << " graph=streamed_layer_groups"
               << " n_ctx=" << n_ctx
+              << " execution_n_seq=" << execution_n_seq
+              << " execution_n_batch=" << execution_n_batch
+              << " execution_n_ubatch=" << execution_n_batch
               << " score_count=" << score_count
               << " score_count_override=" << score_override
               << " reference_n_batch=" << reference_contract.n_batch
@@ -19450,7 +19501,7 @@ int main(int argc, char ** argv) {
         int64_t kl_n_batch = 0;
         KlReferenceContract kl_reference_contract;
         int kl_stream_layers = 0;
-        int kl_stream_batch = 4;
+        int kl_stream_batch = 1;
         int64_t block_trace_start = 0;
         int64_t block_trace_count = 0;
         int prefill_repeat = 0;
