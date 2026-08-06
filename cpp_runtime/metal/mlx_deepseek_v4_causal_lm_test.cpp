@@ -1445,6 +1445,54 @@ void test_generation_stable_prefix_cache() {
     require(
         interrupted_prefill_tokens == 1,
         "DeepSeek-V4 interrupted request checkpoint was not reusable");
+
+    // A client normally disconnects after several decoded tokens, not before
+    // the first decode. Exercise enough steps to overwrite the sliding ring
+    // and advance both compressor variants, then require the restored prefix
+    // to match a completely fresh runtime.
+    auto late_interrupted = make_model();
+    int observed = 0;
+    (void)late_interrupted.generate(
+        {1, 2, 3},
+        sampling,
+        8,
+        [&](std::int64_t) {
+            return ++observed < 7;
+        },
+        std::vector<std::int64_t>{},
+        512,
+        {},
+        2);
+    require(
+        observed == 7 && late_interrupted.cache_position() == 2,
+        "DeepSeek-V4 late interruption did not restore its checkpoint");
+    std::vector<std::int64_t> restored_output;
+    (void)late_interrupted.generate(
+        {1, 2, 6},
+        sampling,
+        4,
+        [&](std::int64_t token) {
+            restored_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{},
+        512,
+        {},
+        2);
+    auto late_fresh = make_model();
+    std::vector<std::int64_t> late_fresh_output;
+    (void)late_fresh.generate(
+        {1, 2, 6},
+        sampling,
+        4,
+        [&](std::int64_t token) {
+            late_fresh_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{});
+    require(
+        restored_output == late_fresh_output,
+        "DeepSeek-V4 interrupted decode corrupted the stable cache");
 }
 
 void test_mfq_container_load() {

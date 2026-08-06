@@ -23,6 +23,50 @@ inline uint read_bits(
     return (packed >> shift) & ((1u << bits) - 1u);
 }
 
+inline float decode_mxfp4_value(uchar raw) {
+    uchar magnitude = raw & 7u;
+    float value = magnitude == 0u ? 0.0f
+        : (magnitude == 1u ? 0.5f
+        : (magnitude == 2u ? 1.0f
+        : (magnitude == 3u ? 1.5f
+        : (magnitude == 4u ? 2.0f
+        : (magnitude == 5u ? 3.0f
+        : (magnitude == 6u ? 4.0f : 6.0f))))));
+    return (raw & 8u) == 0u ? value : -value;
+}
+
+inline float decode_e8m0(uchar raw) {
+    if (raw == 255u) {
+        return NAN;
+    }
+    uint bits = raw == 0u ? 0x00400000u : uint(raw) << 23u;
+    return as_type<float>(bits);
+}
+
+inline void decode_mxfp4_group32(
+    const device int* d,
+    const device uchar* values,
+    const device uchar* scales,
+    threadgroup half* target,
+    uint row,
+    uint group,
+    uint k_size) {
+    uint groups = uint(d[4]);
+    uint value_offset = uint(d[5]);
+    uint scale_offset = uint(d[6]);
+    float scale = decode_e8m0(
+        scales[scale_offset + row * groups + group]);
+    uint packed_row = value_offset + row * (k_size >> 1u);
+    uint packed_column = group * 16u;
+    for (uint pair = 0u; pair < 16u; ++pair) {
+        uchar packed = values[packed_row + packed_column + pair];
+        target[pair * 2u] = half(
+            scale * decode_mxfp4_value(packed & 15u));
+        target[pair * 2u + 1u] = half(
+            scale * decode_mxfp4_value(packed >> 4u));
+    }
+}
+
 inline void decode_vq_group24(
     const device int* d,
     const device uchar* indices,
@@ -256,6 +300,8 @@ template <bool FUSED_SWIGLU>
     const device int* route_order [[buffer(12)]],
     const device int* block_meta [[buffer(26)]],
     const device int* block_count [[buffer(27)]],
+    const device uchar* mx_values [[buffer(28)]],
+    const device uchar* mx_scales [[buffer(29)]],
     device half* y [[buffer(13)]],
     constant int& route_count [[buffer(14)]],
     constant int& tokens [[buffer(15)]],
@@ -307,6 +353,7 @@ template <bool FUSED_SWIGLU>
 
     const device int* descriptor =
         descriptors + expert * descriptor_size;
+    uint family = uint(descriptor[0]);
     uint local_expert = uint(descriptor[1]);
     uint rotation = uint(descriptor[27]);
     short valid_n = short(min(BN, output_width - output_base));
@@ -350,16 +397,41 @@ template <bool FUSED_SWIGLU>
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
+                constexpr uint GROUPS_PER_TILE = BK / 24;
                 for (uint group_item = thread_id;
-                     group_item < uint(BN * (BK / 24));
+                     group_item < uint(BN) * GROUPS_PER_TILE;
                      group_item += TGP_SIZE) {
-                    uint output_row = group_item / uint(BK / 24);
+                    uint output_row = group_item / GROUPS_PER_TILE;
                     uint local_group =
-                        group_item - output_row * uint(BK / 24);
-                    uint input_column =
-                        uint(k_base) + local_group * 24u;
-                    if (output_row < uint(valid_n)
-                        && input_column < uint(input_width)) {
+                        group_item - output_row * GROUPS_PER_TILE;
+                    if (output_row < uint(valid_n) && family == 3u
+                        && local_group < uint(BK / 32)) {
+                        uint input_column =
+                            uint(k_base) + local_group * 32u;
+                        if (input_column >= uint(input_width)) {
+                            continue;
+                        }
+                        uint group = input_column / 32u;
+                        uint pool_row =
+                            local_expert * uint(matrix_output_width)
+                            + uint(output_base) + output_row
+                            + uint(projection * output_width);
+                        decode_mxfp4_group32(
+                            descriptor,
+                            mx_values,
+                            mx_scales,
+                            Ws + output_row * uint(BK_padded)
+                                + local_group * 32u,
+                            pool_row,
+                            group,
+                            uint(input_width));
+                    } else if (output_row < uint(valid_n)
+                        && family == 1u) {
+                        uint input_column =
+                            uint(k_base) + local_group * 24u;
+                        if (input_column >= uint(input_width)) {
+                            continue;
+                        }
                         uint group = input_column / 24u;
                         uint pool_row =
                             local_expert * uint(matrix_output_width)

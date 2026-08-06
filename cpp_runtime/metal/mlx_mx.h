@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -15,6 +16,9 @@ public:
     static MlxMxWeight from_blob(
         std::string_view dtype,
         const std::vector<std::uint8_t>& blob);
+    static MlxMxWeight from_blob(
+        std::string_view dtype,
+        std::span<const std::uint8_t> blob);
 
     mlx::core::array matmul(const mlx::core::array& input) const;
     mlx::core::array dequantize(
