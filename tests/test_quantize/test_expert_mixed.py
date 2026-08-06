@@ -15,6 +15,7 @@ from mfq.calibration.artifact import (
 )
 from mfq.formats import io
 from mfq.formats.moe import expert_tensor_family
+from mfq.formats.mx import MxTensor, pack_mx
 from mfq.formats.nepq import NEPQ0_L, NEPQ0_S, NEPQ1_L, NEPQ1_S
 from mfq.formats.nint import NintSpec
 from mfq.quantize.expert_nint import (
@@ -237,6 +238,46 @@ def test_mixed_moe_writer_size_and_roundtrip(tmp_path):
         "NEPQ0-S",
     )
     assert io.pack_nint_moe(tensor) == path.read_bytes()
+
+
+def test_mixed_moe_preserves_native_mxfp4_bytes(tmp_path):
+    shape = (2, 2, 32)
+    values = np.arange(2 * 2 * 16, dtype=np.uint8).reshape(2, 2, 16)
+    scales = np.arange(2 * 2, dtype=np.uint8).reshape(2, 2, 1)
+
+    class ExactMxSource:
+        def write_mxfp4_expert_pool(self, expert_ids, path):
+            ids = np.asarray(expert_ids, dtype=np.int64)
+            tensor = MxTensor(
+                "MXFP4",
+                (len(ids) * 2, 32),
+                np.ascontiguousarray(values[ids].reshape(-1, 16)),
+                np.ascontiguousarray(scales[ids].reshape(-1, 1)),
+            )
+            payload = pack_mx(tensor)
+            path.write_bytes(payload)
+            return len(payload)
+
+    precisions = (ExpertPrecision("MXFP4"),) * 2
+    path = tmp_path / "mixed-mxfp4.blob"
+    nbytes = _write_mixed_moe_axis0_blob(
+        ExactMxSource(),
+        shape,
+        shape,
+        precisions,
+        path,
+        row_chunk=2,
+        quant_backend="cpu",
+        device="cpu",
+        artifact_root=tmp_path,
+    )
+    assert nbytes == _mixed_moe_blob_nbytes(shape, precisions, tmp_path)
+    restored = io.unpack_nint_moe(path.read_bytes())
+    assert restored.expert_profiles == ("MXFP4", "MXFP4")
+    pool = restored.pools[0].tensor
+    assert isinstance(pool, MxTensor)
+    np.testing.assert_array_equal(pool.values, values.reshape(-1, 16))
+    np.testing.assert_array_equal(pool.scales, scales.reshape(-1, 1))
 
 
 @pytest.mark.parametrize(

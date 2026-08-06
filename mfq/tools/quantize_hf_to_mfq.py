@@ -41,6 +41,7 @@ from mfq.formats.assets import (
     runtime_asset_manifest,
 )
 from mfq.formats.header import MFQ_MAGIC, FileHeader
+from mfq.formats.mx import mx_header_bytes
 from mfq.formats.io import (
     _DENSE_NAMES,
     _NINT_HDR,
@@ -2769,6 +2770,15 @@ def _write_mixed_moe_axis0_blob(
                         ),
                     )
                     runtime_payload = b""
+                elif precision.family == "MXFP4":
+                    exact_writer = getattr(source, "write_mxfp4_expert_pool", None)
+                    if exact_writer is None:
+                        raise TypeError(
+                            "MXFP4 expert preservation requires an exact native "
+                            "MXFP4 source"
+                        )
+                    pool_nbytes = exact_writer(expert_ids, pool_path)
+                    runtime_payload = b""
                 elif precision.family.startswith("NEPQ"):
                     pool_nbytes, runtime_payload = _write_nepq_cohort_blob(
                         pool_source,
@@ -2922,6 +2932,15 @@ def _mixed_moe_blob_nbytes(
             payload_nbytes = _nint_blob_nbytes(
                 rows, columns, precision.nint_spec
             )
+        elif precision.family == "MXFP4":
+            payload_nbytes = len(
+                mx_header_bytes(
+                    "MXFP4",
+                    (rows, columns),
+                    (rows, columns // 2),
+                    (rows, columns // 32),
+                )
+            ) + rows * (columns // 2 + columns // 32)
         elif precision.family == "NVQ1-L":
             payload_nbytes = (
                 _NVQ1_L_HEADER.size

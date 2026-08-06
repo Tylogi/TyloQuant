@@ -6,6 +6,7 @@ from mfq.quantize.v4f_plan import (
     allocate_v4f_ew_nvq2j_nint4,
     routed_blob_bytes,
     routed_family_blob_bytes,
+    routed_family_pool_bytes,
 )
 from mfq.tools.quantize_v4f_to_mfq import (
     _layer_source_shards,
@@ -46,6 +47,17 @@ def test_v4f_family_accounting_preserves_legacy_two_pool_sizes() -> None:
                 projection,
                 {"NEPQ0-S": low_count, "NVQ2J": high_count},
             ) == routed_blob_bytes(projection, low_count, high_count)
+
+
+def test_v4f_native_mxfp4_pool_uses_exact_4_25_bpw_payload() -> None:
+    for projection, columns in (("gate_up", 4096), ("down", 2048)):
+        one = routed_family_pool_bytes(projection, "MXFP4", 1)
+        two = routed_family_pool_bytes(projection, "MXFP4", 2)
+        expert_payload = 4096 * (columns // 2 + columns // 32)
+        # The first cohort carries one MX payload header; subsequent experts
+        # add only the original packed value and E8M0 byte streams.
+        assert two - one == expert_payload + 4
+        assert expert_payload * 8 / (4096 * columns) == 4.25
 
 
 def test_v4f_88g_allocator_uses_budget_and_is_deterministic(tmp_path) -> None:

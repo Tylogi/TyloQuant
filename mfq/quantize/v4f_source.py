@@ -16,6 +16,7 @@ from mfq.quantize.mxfp import (
     read_mxfp4_rows,
     read_mxfp8_rows,
 )
+from mfq.formats.mx import MXFP4_DTYPE, mx_header_bytes
 
 
 _GLOBAL_NAME_MAP = {
@@ -237,6 +238,70 @@ class V4FExpertSource:
             stop,
             device=device,
         )
+
+    def _raw_part(self, expert: int, part: str) -> tuple[np.memmap, np.memmap]:
+        """Return the official packed MXFP4 values and E8M0 scales unchanged."""
+
+        weight_name = self._weight_name(expert, part)
+        scale_name = weight_name.removesuffix(".weight") + ".scale"
+        if self.checkpoint.shard_for(weight_name) != self.checkpoint.shard_for(
+            scale_name
+        ):
+            raise ValueError(f"MXFP4 weight and scale are split: {weight_name}")
+        reader = self.checkpoint.reader_for(weight_name)
+        weight = reader.info(weight_name)
+        scales = reader.info(scale_name)
+        expected_values = (
+            (2048, 2048) if part in {"w1", "w3"} else (4096, 1024)
+        )
+        expected_scales = (
+            (2048, 128) if part in {"w1", "w3"} else (4096, 64)
+        )
+        if weight.dtype != "I8" or weight.shape != expected_values:
+            raise ValueError(
+                f"unexpected MXFP4 value tensor {weight_name}: "
+                f"{weight.dtype} {weight.shape}"
+            )
+        if scales.dtype != "F8_E8M0" or scales.shape != expected_scales:
+            raise ValueError(
+                f"unexpected MXFP4 scale tensor {scale_name}: "
+                f"{scales.dtype} {scales.shape}"
+            )
+        return reader.raw_tensor(weight_name), reader.raw_tensor(scale_name)
+
+    def write_mxfp4_expert_pool(
+        self,
+        expert_ids: tuple[int, ...],
+        output: str | Path,
+    ) -> int:
+        """Write selected official experts as one exact native MXFP4 payload."""
+
+        ids = tuple(int(expert) for expert in expert_ids)
+        if not ids or len(set(ids)) != len(ids):
+            raise ValueError("MXFP4 expert pool requires unique expert ids")
+        if any(expert < 0 or expert >= self.n_experts for expert in ids):
+            raise IndexError("MXFP4 expert pool contains an invalid expert id")
+        rows = len(ids) * self.rows_per_expert
+        parts = ("w1", "w3") if self.projection == "gate_up" else ("w2",)
+        target = Path(output)
+        with target.open("wb") as handle:
+            handle.write(
+                mx_header_bytes(
+                    MXFP4_DTYPE,
+                    (rows, self.columns),
+                    (rows, self.columns // 2),
+                    (rows, self.columns // 32),
+                )
+            )
+            for expert in ids:
+                for part in parts:
+                    values, _ = self._raw_part(expert, part)
+                    handle.write(memoryview(values))
+            for expert in ids:
+                for part in parts:
+                    _, scales = self._raw_part(expert, part)
+                    handle.write(memoryview(scales))
+        return target.stat().st_size
 
     def read_expert_rows(
         self,
