@@ -7,6 +7,7 @@ import torch
 from mfq.formats.npq0_s import pack_npq0_s, unpack_npq0_s
 from mfq.quantize.npq0_s import (
     Npq0SConfig,
+    Npq0STables,
     dequantize_npq0_s,
     npq0_s_tables_from_tensor,
     quantize_npq0_s_fixed,
@@ -84,3 +85,111 @@ def test_npq0_s_index_selects_a_cartesian_product_codeword() -> None:
 def test_npq0_s_rejects_non_vec8_width() -> None:
     with pytest.raises(ValueError, match="divisible by 8"):
         train_npq0_s(torch.zeros((2, 34)), config=_config(), device="cpu")
+
+
+def test_npq0_s_weighted_kmeans_does_not_clip_training_samples() -> None:
+    from mfq.quantize.npq0_s import _weighted_kmeans
+
+    samples = torch.tensor(
+        [[200.0, 200.0, 200.0, 200.0], [-100.0, -100.0, -100.0, -100.0]]
+    )
+    objective_weight = torch.ones_like(samples)
+    table = _weighted_kmeans(
+        samples,
+        objective_weight,
+        1,
+        iterations=1,
+        initialization_points=2,
+        seed=0,
+    )
+    assert torch.equal(table, torch.full((1, 4), 50, dtype=torch.int8))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_npq0_s_native_fixed_assignment_matches_torch_reference() -> None:
+    from mfq.quantize.cuda._ext import ext
+    from mfq.quantize.npq0_s import (
+        _assign_groups,
+        _refit_anchor_and_lut,
+        _validate_tables,
+    )
+    from mfq.quantize.nvq_quant_torch import _fp16_round, _pad_weight
+
+    rng = np.random.default_rng(81)
+    tables = Npq0STables(
+        scale_lut=np.linspace(0.2, 1.5, 4, dtype=np.float32),
+        first_codebooks=rng.integers(-31, 32, (4, 8, 4), dtype=np.int8),
+        second_codebooks=rng.integers(-31, 32, (4, 8, 4), dtype=np.int8),
+    )
+    scale_np, first_np, second_np = _validate_tables(tables)
+    generator = torch.Generator(device="cuda").manual_seed(83)
+    value = 0.05 * torch.randn((3, 40), generator=generator, device="cuda")
+    importance = 0.2 + torch.rand((40,), generator=generator, device="cuda")
+    padded, objective_weight, ng = _pad_weight(value, 24, importance)
+    xgroup = padded.reshape(-1, 24).contiguous()
+    wgroup = objective_weight.reshape_as(xgroup).contiguous()
+    scale_lut = torch.as_tensor(scale_np, device="cuda")
+    first = torch.as_tensor(first_np, device="cuda")
+    second = torch.as_tensor(second_np, device="cuda")
+    maximum_code = max(int(np.abs(first_np).max()), int(np.abs(second_np).max()))
+    anchor = _fp16_round(
+        padded.abs().amax(1) / (maximum_code * float(scale_np.max()))
+    ).contiguous()
+
+    state, first_index, second_index, _ = _assign_groups(
+        xgroup,
+        wgroup,
+        anchor,
+        scale_lut,
+        first,
+        second,
+        ng=ng,
+        group_chunk=16,
+    )
+    fitted, _ = _refit_anchor_and_lut(
+        xgroup,
+        wgroup,
+        state,
+        first_index,
+        second_index,
+        anchor,
+        scale_lut,
+        first,
+        second,
+        out=3,
+        ng=ng,
+        learn_lut=False,
+    )
+    ref_state, ref_first, ref_second, ref_error = _assign_groups(
+        xgroup,
+        wgroup,
+        fitted,
+        scale_lut,
+        first,
+        second,
+        ng=ng,
+        group_chunk=16,
+    )
+    native_anchor, native_state, native_first, native_second, native_error = (
+        ext().npq0_s_assign(
+            padded.contiguous(),
+            objective_weight.contiguous(),
+            anchor,
+            scale_lut.contiguous(),
+            first.contiguous(),
+            second.contiguous(),
+            40,
+            1,
+        )
+    )
+
+    torch.testing.assert_close(native_anchor, fitted, rtol=0, atol=0)
+    assert torch.equal(native_state.reshape(-1).to(torch.int64), ref_state)
+    assert torch.equal(native_first.reshape(-1, 3).to(torch.int64), ref_first)
+    assert torch.equal(native_second.reshape(-1, 3).to(torch.int64), ref_second)
+    torch.testing.assert_close(
+        native_error,
+        ref_error.reshape(3, ng).sum(1),
+        rtol=2e-6,
+        atol=2e-7,
+    )

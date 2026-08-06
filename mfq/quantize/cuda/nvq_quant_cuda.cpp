@@ -33,7 +33,34 @@ std::vector<torch::Tensor> nepq0_s_assign_cuda(
     torch::Tensor scale_lut,
     torch::Tensor first_tables,
     torch::Tensor second_tables);
+std::vector<torch::Tensor> npq0_s_assign_cuda(
+    torch::Tensor value,
+    torch::Tensor objective_weight,
+    torch::Tensor initial_anchor,
+    torch::Tensor scale_lut,
+    torch::Tensor first_codebooks,
+    torch::Tensor second_codebooks,
+    int64_t valid_width,
+    int64_t refine_steps);
+std::vector<torch::Tensor> npq0_l_assign_cuda(
+    torch::Tensor value,
+    torch::Tensor objective_weight,
+    torch::Tensor initial_anchor,
+    torch::Tensor scale_lut,
+    torch::Tensor first_codebooks,
+    torch::Tensor second_codebooks,
+    int64_t valid_width,
+    int64_t refine_steps);
 std::vector<torch::Tensor> nvq2j_assign_cuda(
+    torch::Tensor value,
+    torch::Tensor objective_weight,
+    torch::Tensor initial_anchor,
+    torch::Tensor scale_lut,
+    torch::Tensor bank_for_state,
+    torch::Tensor codebooks,
+    int64_t valid_width,
+    int64_t refine_steps);
+std::vector<torch::Tensor> nvq3j_assign_cuda(
     torch::Tensor value,
     torch::Tensor objective_weight,
     torch::Tensor initial_anchor,
@@ -74,9 +101,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &nepq0_s_assign_cuda,
         "NEPQ0-S 256-bank assignment and one-step anchor refit (CUDA)");
     m.def(
+        "npq0_s_assign",
+        &npq0_s_assign_cuda,
+        "NPQ0-S fixed-table assignment and anchor refit (CUDA)");
+    m.def(
+        "npq0_l_assign",
+        &npq0_l_assign_cuda,
+        "NPQ0-L fixed-table assignment and anchor refit (CUDA)");
+    m.def(
         "nvq2j_assign",
         &nvq2j_assign_cuda,
         "NVQ2J fixed-table assignment and anchor refit (CUDA)");
+    m.def(
+        "nvq3j_assign",
+        &nvq3j_assign_cuda,
+        "NVQ3J fixed-table assignment and anchor refit (CUDA)");
     m.def(
         "nvq2j_search_banks",
         &nvq2j_search_banks_cuda,

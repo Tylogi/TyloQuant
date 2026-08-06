@@ -674,43 +674,39 @@ def quantize_npq0_l_fixed(
     maximum_code = max(int(np.abs(first_np).max()), int(np.abs(second_np).max()), 1)
     maximum_scale = max(float(scale_np.max()), 1e-12)
     base_anchor = value.abs().amax(1) / (maximum_code * maximum_scale)
+    native_assign = None
+    if value.is_cuda:
+        from mfq.quantize.cuda._ext import ext
 
+        native_assign = ext().npq0_l_assign
+
+    assignment_dtype = torch.uint8 if native_assign is not None else torch.int64
     best_row_error = torch.full((out,), torch.inf, device=value.device)
     best_anchor = torch.zeros(out, device=value.device)
-    best_state = torch.zeros(out * ng, dtype=torch.int64, device=value.device)
+    best_state = torch.zeros(out * ng, dtype=assignment_dtype, device=value.device)
     best_first = torch.zeros(
         (out * ng, _VECTORS_PER_GROUP),
-        dtype=torch.int64,
+        dtype=assignment_dtype,
         device=value.device,
     )
     best_second = torch.zeros_like(best_first)
     for multiplier in config.anchor_multipliers:
-        anchor = _fp16_round(base_anchor * multiplier)
-        state, first_indices, second_indices, error = _assign_groups(
-            xgroup,
-            wgroup,
-            anchor,
-            scale_lut,
-            first_codebooks,
-            second_codebooks,
-            ng=ng,
-            group_chunk=config.group_chunk,
-        )
-        for _ in range(config.fixed_refine_steps):
-            anchor, _ = _refit_anchor_and_lut(
-                xgroup,
-                wgroup,
-                state,
-                first_indices,
-                second_indices,
+        anchor = _fp16_round(base_anchor * multiplier).contiguous()
+        if native_assign is not None:
+            anchor, state, first_indices, second_indices, row_error = native_assign(
+                value.contiguous(),
+                objective_weight.contiguous(),
                 anchor,
-                scale_lut,
-                first_codebooks,
-                second_codebooks,
-                out=out,
-                ng=ng,
-                learn_lut=False,
+                scale_lut.contiguous(),
+                first_codebooks.contiguous(),
+                second_codebooks.contiguous(),
+                neuron_len,
+                config.fixed_refine_steps,
             )
+            state = state.reshape(-1)
+            first_indices = first_indices.reshape(-1, _VECTORS_PER_GROUP)
+            second_indices = second_indices.reshape(-1, _VECTORS_PER_GROUP)
+        else:
             state, first_indices, second_indices, error = _assign_groups(
                 xgroup,
                 wgroup,
@@ -721,7 +717,32 @@ def quantize_npq0_l_fixed(
                 ng=ng,
                 group_chunk=config.group_chunk,
             )
-        row_error = error.reshape(out, ng).sum(1)
+            for _ in range(config.fixed_refine_steps):
+                anchor, _ = _refit_anchor_and_lut(
+                    xgroup,
+                    wgroup,
+                    state,
+                    first_indices,
+                    second_indices,
+                    anchor,
+                    scale_lut,
+                    first_codebooks,
+                    second_codebooks,
+                    out=out,
+                    ng=ng,
+                    learn_lut=False,
+                )
+                state, first_indices, second_indices, error = _assign_groups(
+                    xgroup,
+                    wgroup,
+                    anchor,
+                    scale_lut,
+                    first_codebooks,
+                    second_codebooks,
+                    ng=ng,
+                    group_chunk=config.group_chunk,
+                )
+            row_error = error.reshape(out, ng).sum(1)
         better = row_error < best_row_error
         best_row_error = torch.where(better, row_error, best_row_error)
         best_anchor = torch.where(better, anchor, best_anchor)
