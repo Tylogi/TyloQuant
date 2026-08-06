@@ -645,19 +645,31 @@ def quantize_nvq_jsc_fixed(
     ).contiguous()
     alpha = torch.as_tensor(alpha_np, device=value.device, dtype=torch.float32)
     bank_for_state = torch.as_tensor(bank_np, device=value.device, dtype=torch.int64)
-    if (
-        value.is_cuda
-        and spec.vector_size == 8
-        and spec.codebook_entries in {256, 1024, 4096}
-        and codebooks_np.shape[0] == 4
-        and codebooks.dtype == torch.int8
-        and np.array_equal(
-            np.bincount(bank_np, minlength=4),
-            np.full(4, _STATE_COUNT // 4),
-        )
-    ):
+    native_assign = None
+    if value.is_cuda and codebooks.dtype == torch.int8:
         from mfq.quantize.cuda._ext import ext
 
+        bank_count = int(codebooks_np.shape[0])
+        balanced_banks = np.array_equal(
+            np.bincount(bank_np, minlength=bank_count),
+            np.full(bank_count, _STATE_COUNT // bank_count),
+        )
+        if (
+            spec.vector_size == 8
+            and spec.codebook_entries in {256, 1024, 4096}
+            and bank_count == 4
+            and balanced_banks
+        ):
+            native_assign = ext().nvq2j_assign
+        elif (
+            spec.vector_size == 4
+            and spec.codebook_entries == 256
+            and bank_count == 2
+            and balanced_banks
+        ):
+            native_assign = ext().nvq3j_assign
+
+    if native_assign is not None:
         bank_u8 = bank_for_state.to(torch.uint8).contiguous()
         native_codebooks = codebooks.permute(0, 2, 1).contiguous()
         bank_peak = codebooks.to(torch.float32).amax((1, 2))
@@ -672,7 +684,7 @@ def quantize_nvq_jsc_fixed(
         initial_anchor = _fp16_round(
             weighted_target[:, :neuron_len].amax(1) / maximum_basis
         ).contiguous()
-        neuron_scale, state, indices = ext().nvq2j_assign(
+        neuron_scale, state, indices = native_assign(
             target.contiguous(),
             objective_weight.contiguous(),
             initial_anchor,

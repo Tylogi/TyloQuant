@@ -332,7 +332,7 @@ def _weighted_kmeans(
     seed: int,
 ) -> torch.Tensor:
     valid = objective_weight.sum(1) > 0
-    samples = samples[valid].clamp(-127, 127)
+    samples = samples[valid]
     objective_weight = objective_weight[valid]
     if not samples.shape[0]:
         return torch.zeros(
@@ -687,6 +687,60 @@ def quantize_npq0_s_fixed(
     maximum_code = max(int(np.abs(first_np).max()), int(np.abs(second_np).max()), 1)
     maximum_scale = max(float(scale_np.max()), 1e-12)
     base_anchor = value.abs().amax(1) / (maximum_code * maximum_scale)
+
+    if value.is_cuda:
+        from mfq.quantize.cuda._ext import ext
+
+        native_scale = torch.as_tensor(
+            scale_np, device=value.device, dtype=torch.float32
+        ).contiguous()
+        native_first = torch.as_tensor(
+            first_np, device=value.device, dtype=torch.int8
+        ).contiguous()
+        native_second = torch.as_tensor(
+            second_np, device=value.device, dtype=torch.int8
+        ).contiguous()
+        best_row_error = torch.full((out,), torch.inf, device=value.device)
+        best_anchor = torch.zeros(out, device=value.device)
+        best_state = torch.zeros((out, ng), dtype=torch.uint8, device=value.device)
+        best_first = torch.zeros(
+            (out, ng, _VECTORS_PER_GROUP),
+            dtype=torch.uint8,
+            device=value.device,
+        )
+        best_second = torch.zeros_like(best_first)
+        for multiplier in config.anchor_multipliers:
+            initial_anchor = _fp16_round(base_anchor * multiplier).contiguous()
+            anchor, state, first_indices, second_indices, row_error = (
+                ext().npq0_s_assign(
+                    value.contiguous(),
+                    objective_weight.contiguous(),
+                    initial_anchor,
+                    native_scale,
+                    native_first,
+                    native_second,
+                    neuron_len,
+                    config.fixed_refine_steps,
+                )
+            )
+            better_rows = row_error < best_row_error
+            best_row_error = torch.where(
+                better_rows, row_error, best_row_error
+            )
+            best_anchor = torch.where(better_rows, anchor, best_anchor)
+            best_state[better_rows] = state[better_rows]
+            best_first[better_rows] = first_indices[better_rows]
+            best_second[better_rows] = second_indices[better_rows]
+        return _tensor_from_assignment(
+            (out, neuron_len),
+            best_anchor,
+            native_scale,
+            best_state.reshape(-1),
+            best_first.reshape(-1, _VECTORS_PER_GROUP),
+            best_second.reshape(-1, _VECTORS_PER_GROUP),
+            native_first,
+            native_second,
+        )
 
     best_row_error = torch.full((out,), torch.inf, device=value.device)
     best_anchor = torch.zeros(out, device=value.device)
