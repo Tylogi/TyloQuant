@@ -256,6 +256,81 @@ struct VqFixture {
     int input = 0;
 };
 
+struct Mxfp4Fixture {
+    std::vector<std::uint8_t> blob;
+    std::vector<float> dense;
+    int rows = 0;
+    int input = 0;
+};
+
+float decode_mxfp4_code(std::uint8_t code) {
+    constexpr std::array<float, 8> table{
+        0.0f, 0.5f, 1.0f, 1.5f,
+        2.0f, 3.0f, 4.0f, 6.0f,
+    };
+    const float value = table[code & 7u];
+    return (code & 8u) == 0u ? value : -value;
+}
+
+Mxfp4Fixture make_mxfp4(int rows, int input) {
+    if (rows <= 0 || input <= 0 || input % 32 != 0) {
+        throw std::runtime_error("invalid MXFP4 fixture geometry");
+    }
+    std::vector<std::uint8_t> values(
+        static_cast<std::size_t>(rows) * input / 2);
+    std::vector<std::uint8_t> scales(
+        static_cast<std::size_t>(rows) * input / 32);
+    std::vector<float> dense(
+        static_cast<std::size_t>(rows) * input);
+    for (int row = 0; row < rows; ++row) {
+        for (int group = 0; group < input / 32; ++group) {
+            scales[
+                static_cast<std::size_t>(row) * (input / 32)
+                + group
+            ] = static_cast<std::uint8_t>(125 + (row + group) % 5);
+        }
+        for (int column = 0; column < input; column += 2) {
+            const auto low = static_cast<std::uint8_t>(
+                (row * 7 + column * 3 + 1) & 15);
+            const auto high = static_cast<std::uint8_t>(
+                (row * 11 + column * 5 + 6) & 15);
+            values[
+                static_cast<std::size_t>(row) * (input / 2)
+                + column / 2
+            ] = static_cast<std::uint8_t>(low | (high << 4));
+            const float scale = std::ldexp(
+                1.0f,
+                static_cast<int>(scales[
+                    static_cast<std::size_t>(row) * (input / 32)
+                    + column / 32
+                ]) - 127);
+            dense[static_cast<std::size_t>(row) * input + column] =
+                decode_mxfp4_code(low) * scale;
+            dense[static_cast<std::size_t>(row) * input + column + 1] =
+                decode_mxfp4_code(high) * scale;
+        }
+    }
+    std::vector<std::uint8_t> blob;
+    append_magic(blob, "MXT1");
+    append<std::uint8_t>(blob, 1);
+    append<std::uint8_t>(blob, 4);
+    append<std::uint16_t>(blob, 0);
+    append<std::uint64_t>(blob, rows);
+    append<std::uint64_t>(blob, input);
+    append<std::uint64_t>(blob, rows);
+    append<std::uint64_t>(blob, input / 2);
+    append<std::uint64_t>(blob, rows);
+    append<std::uint64_t>(blob, input / 32);
+    append_bytes(blob, values);
+    append_bytes(blob, scales);
+    return {
+        std::move(blob),
+        std::move(dense),
+        rows,
+        input,
+    };
+}
+
 VqFixture make_plain_nvq(
     int output,
     int input,
@@ -2896,6 +2971,117 @@ void test_swiglu_ffn() {
     }
 }
 
+void test_mxfp4_nintm_and_projection_offsets() {
+    constexpr int experts = 2;
+    constexpr int output = 7;
+    constexpr int input = 64;
+    constexpr int tokens = 2;
+    constexpr int routes = 2;
+    const auto fixture = make_mxfp4(experts * output, input);
+    std::vector<std::uint8_t> blob;
+    append_magic(blob, "NIM2");
+    append<std::uint32_t>(blob, experts);
+    append<std::uint32_t>(blob, output);
+    append<std::uint32_t>(blob, input);
+    append<std::uint32_t>(blob, 1);
+    append<std::uint32_t>(blob, experts);
+    append<std::uint32_t>(blob, 5);
+    append<std::uint64_t>(blob, fixture.blob.size());
+    append<std::uint64_t>(blob, 0);
+    // Reverse global IDs so descriptor local-row mapping is independently
+    // checked rather than accidentally matching global expert order.
+    append<std::int32_t>(blob, 1);
+    append<std::int32_t>(blob, 0);
+    blob.insert(blob.end(), {'M', 'X', 'F', 'P', '4'});
+    append_bytes(blob, fixture.blob);
+
+    const auto weight =
+        mfq::metal::MlxMoeWeight::from_blob(blob);
+    require(
+        weight.experts() == experts
+            && weight.out_per_expert() == output
+            && weight.neuron_len() == input
+            && weight.packed_nbytes() >= fixture.blob.size(),
+        "MXFP4 NINTM metadata mismatch");
+    std::vector<float> source(tokens * input);
+    for (std::size_t index = 0; index < source.size(); ++index) {
+        source[index] = static_cast<float>(
+            static_cast<int>((index * 13 + 5) % 29) - 14) / 128.0f;
+    }
+    const std::vector<std::int32_t> ids{0, 1, 1, 0};
+    const auto input_array = mlx::core::array(
+        source.begin(),
+        mlx::core::Shape{tokens, input});
+    const auto id_array = mlx::core::array(
+        ids.begin(),
+        mlx::core::Shape{tokens, routes});
+    const auto actual = evaluated_floats(
+        weight.routed_matmul(input_array, id_array));
+    require(
+        weight.supports_grouped_vq_mmq(),
+        "MXFP4 NINTM must support grouped matrix prefill");
+    const std::vector<std::int32_t> order{0, 3, 1, 2};
+    const auto order_array = mlx::core::array(
+        order.begin(),
+        mlx::core::Shape{tokens * routes});
+    const auto plan = weight.build_grouped_vq_mmq_plan(
+        id_array,
+        order_array);
+    const auto matrix_actual = evaluated_floats(
+        mlx::core::take(
+            weight.routed_matmul_sorted(
+                input_array,
+                id_array,
+                order_array,
+                false,
+                false,
+                0.0f,
+                &plan),
+            mlx::core::argsort(order_array),
+            0));
+    const auto concatenated =
+        mfq::metal::MlxMoeWeight::concatenate_projections(
+            {weight, weight});
+    const auto projected = evaluated_floats(
+        concatenated.routed_matmul(input_array, id_array));
+    for (int token = 0; token < tokens; ++token) {
+        for (int route = 0; route < routes; ++route) {
+            const int expert = ids[token * routes + route];
+            const int local_expert = expert == 1 ? 0 : 1;
+            for (int row = 0; row < output; ++row) {
+                float expected = 0.0f;
+                const auto dense_offset = (
+                    static_cast<std::size_t>(local_expert) * output + row
+                ) * input;
+                for (int column = 0; column < input; ++column) {
+                    expected += source[token * input + column]
+                        * fixture.dense[dense_offset + column];
+                }
+                const auto route_offset =
+                    static_cast<std::size_t>(token * routes + route);
+                require_close(
+                    actual[route_offset * output + row],
+                    expected,
+                    2e-4f);
+                require_close(
+                    matrix_actual[route_offset * output + row],
+                    actual[route_offset * output + row],
+                    4e-3f);
+                require_close(
+                    projected[route_offset * (2 * output) + row],
+                    expected,
+                    2e-4f);
+                require_close(
+                    projected[
+                        route_offset * (2 * output) + output + row
+                    ],
+                    expected,
+                    2e-4f);
+            }
+        }
+    }
+}
+
 void test_vq_cohorts_and_ffn() {
     constexpr int tokens = 3;
     constexpr int routes = 3;
@@ -3345,6 +3531,97 @@ void test_grouped_vq_mmq_prefill() {
     }
 }
 
+void test_grouped_mxfp4_vq_mmq_prefill() {
+    constexpr int experts = 2;
+    constexpr int tokens = 37;
+    constexpr int routes = 2;
+    constexpr int output = 17;
+    constexpr int input = 96;
+    const auto mx_weight = make_mxfp4(output, input);
+    const auto vq_weight = make_jsc_nvq(output, input);
+    std::vector<std::uint8_t> blob;
+    append_magic(blob, "NIM2");
+    append<std::uint32_t>(blob, experts);
+    append<std::uint32_t>(blob, output);
+    append<std::uint32_t>(blob, input);
+    append<std::uint32_t>(blob, experts);
+    auto append_pool = [&blob](
+        int expert,
+        std::string_view dtype,
+        const std::vector<std::uint8_t>& payload,
+        const std::vector<std::uint8_t>& runtime) {
+        append<std::uint32_t>(blob, 1);
+        append<std::uint32_t>(
+            blob,
+            static_cast<std::uint32_t>(dtype.size()));
+        append<std::uint64_t>(blob, payload.size());
+        append<std::uint64_t>(blob, runtime.size());
+        append<std::int32_t>(blob, expert);
+        blob.insert(blob.end(), dtype.begin(), dtype.end());
+        append_bytes(blob, runtime);
+        append_bytes(blob, payload);
+    };
+    append_pool(0, "MXFP4", mx_weight.blob, {});
+    append_pool(
+        1,
+        vq_weight.dtype,
+        vq_weight.blob,
+        vq_weight.runtime);
+
+    const auto weight =
+        mfq::metal::MlxMoeWeight::from_blob(blob);
+    require(
+        weight.supports_grouped_vq_mmq(),
+        "mixed MXFP4/VQ NINTM must support grouped matrix prefill");
+    std::vector<float> source(tokens * input);
+    for (std::size_t index = 0; index < source.size(); ++index) {
+        source[index] = static_cast<float>(
+            static_cast<int>((index * 11 + 3) % 31) - 15) / 128.0f;
+    }
+    std::vector<std::int32_t> ids(tokens * routes);
+    for (std::size_t index = 0; index < ids.size(); ++index) {
+        ids[index] = static_cast<std::int32_t>((index / 5) & 1u);
+    }
+    const auto input_array = mlx::core::astype(
+        mlx::core::array(
+            source.begin(),
+            mlx::core::Shape{tokens, input}),
+        mlx::core::float16);
+    const auto ids_array = mlx::core::array(
+        ids.begin(),
+        mlx::core::Shape{tokens, routes});
+    const auto direct = evaluated_floats(
+        weight.routed_matmul(input_array, ids_array));
+    const auto order = mlx::core::contiguous(
+        mlx::core::astype(
+            mlx::core::argsort(
+                mlx::core::reshape(
+                    ids_array,
+                    mlx::core::Shape{tokens * routes})),
+            mlx::core::int32));
+    const auto plan = weight.build_grouped_vq_mmq_plan(
+        ids_array,
+        order);
+    const auto matrix = evaluated_floats(
+        mlx::core::take(
+            weight.routed_matmul_sorted(
+                input_array,
+                ids_array,
+                order,
+                false,
+                false,
+                0.0f,
+                &plan),
+            mlx::core::argsort(order),
+            0));
+    require(
+        matrix.size() == direct.size(),
+        "mixed MXFP4/VQ grouped prefill output size mismatch");
+    for (std::size_t index = 0; index < direct.size(); ++index) {
+        require_close(matrix[index], direct[index], 1e-2f);
+    }
+}
+
 void expect_invalid(
     const std::vector<std::uint8_t>& blob,
     const std::string& label) {
@@ -3610,8 +3887,10 @@ int main() {
     try {
         test_all_families_and_projections();
         test_swiglu_ffn();
+        test_mxfp4_nintm_and_projection_offsets();
         test_vq_cohorts_and_ffn();
         test_grouped_vq_mmq_prefill();
+        test_grouped_mxfp4_vq_mmq_prefill();
         test_container_validation();
         test_streamed_cccp_residency();
         std::cout

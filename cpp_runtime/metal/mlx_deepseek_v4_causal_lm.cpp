@@ -1476,7 +1476,12 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
         void capture(
             const std::vector<std::int64_t>& prompt_tokens,
             std::size_t count) {
-            saved_states = target_states;
+            saved_states.emplace();
+            saved_states->reserve(target_states.size());
+            for (const auto& state : target_states) {
+                saved_states->push_back(
+                    state.snapshot());
+            }
             saved_tokens.assign(
                 prompt_tokens.begin(),
                 prompt_tokens.begin() +
@@ -1487,6 +1492,11 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
 
         bool active() const noexcept {
             return saved_states.has_value();
+        }
+
+        const std::vector<MlxDeepseekV4LayerState>&
+        states() const {
+            return *saved_states;
         }
 
         ~StableCacheRestore() {
@@ -1545,6 +1555,12 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
                 materialize_state(state);
             }
             stable_restore.capture(prompt, stable_count);
+            // Materialize every copy before evaluating the suffix. Otherwise
+            // the lazy copy graph would still read arrays after the suffix or
+            // decode kernels had modified them in place.
+            for (const auto& state : stable_restore.states()) {
+                materialize_state(state);
+            }
             if (stable_count < prompt.size()) {
                 return prefill_range(
                     stable_count,

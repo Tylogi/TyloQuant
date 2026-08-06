@@ -1063,6 +1063,33 @@ MlxDeepseekV4PoolState::MlxDeepseekV4PoolState(
       prev_gate_(std::move(prev_gate)) {}
 
 MlxDeepseekV4PoolState
+MlxDeepseekV4PoolState::snapshot() const {
+    const auto copy_optional = [](
+        const std::optional<array>& value)
+        -> std::optional<array> {
+        return value
+            ? std::optional<array>(
+                  mlx::core::copy(*value))
+            : std::nullopt;
+    };
+    MlxDeepseekV4PoolState result(
+        ratio_,
+        head_dim_,
+        overlap_,
+        batch_,
+        capacity_,
+        dtype_,
+        pool_,
+        mlx::core::copy(state_kv_),
+        mlx::core::copy(state_gate_),
+        copy_optional(prev_kv_),
+        copy_optional(prev_gate_));
+    result.pool_len_ = pool_len_;
+    result.remainder_ = remainder_;
+    return result;
+}
+
+MlxDeepseekV4PoolState
 MlxDeepseekV4PoolState::allocate(
     int ratio,
     int head_dim,
@@ -1329,6 +1356,22 @@ MlxDeepseekV4LayerState::MlxDeepseekV4LayerState(
     : local_(std::move(local)),
       main_(std::move(main)),
       indexer_(std::move(indexer)) {}
+
+MlxDeepseekV4LayerState
+MlxDeepseekV4LayerState::snapshot() const {
+    MlxDeepseekV4LayerState result(
+        mlx::core::copy(local_),
+        main_
+            ? std::optional<MlxDeepseekV4PoolState>(
+                  main_->snapshot())
+            : std::nullopt,
+        indexer_
+            ? std::optional<MlxDeepseekV4PoolState>(
+                  indexer_->snapshot())
+            : std::nullopt);
+    result.position_ = position_;
+    return result;
+}
 
 array MlxDeepseekV4LayerState::local_positions() const {
     const int window = local_.shape(1);

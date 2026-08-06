@@ -1,9 +1,9 @@
 """Single-dispatch heterogeneous routed matmul for Apple silicon.
 
 Each global expert owns one fixed-width descriptor.  The descriptor points
-into concatenated packed NINT or VQ-family streams, so one Metal dispatch can
-execute routes spanning different precision cohorts without first evaluating
-every expert in every cohort.
+into concatenated packed NINT, VQ-family, or MXFP4 streams, so one Metal
+dispatch can execute routes spanning different precision cohorts without
+first evaluating every expert in every cohort.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
     ) from exc
 
 from mfq.formats.moe import NintMoeTensor
+from mfq.formats.mx import MXFP4_DTYPE, MxTensor
 from mfq.formats.nepq import NepqTensor
 from mfq.formats.nint8_zero import Nint8ZeroTensor
 from mfq.formats.npq0_l import Npq0LTensor
@@ -27,6 +28,7 @@ from mfq.formats.npq0_s import Npq0STensor
 from mfq.formats.nvq import NvqJscTensor, NvqTensor
 from mfq.formats.nvq1_l import Nvq1LTensor
 from mfq.formats.nvq1_s import Nvq1STensor
+from mfq.kernels.metal.mx import MetalMxWeight
 from mfq.kernels.metal.nint import MetalNintWeight
 from mfq.kernels.metal.nint8_zero import MetalNint8ZeroWeight
 from mfq.kernels.metal.vq import _BITSTREAM_HEADER, MetalVqWeight, signed_hadamard
@@ -45,6 +47,7 @@ _VQ_TYPES = (
 _FAMILY_NINT = 0
 _FAMILY_VQ = 1
 _FAMILY_NINT8_ZERO = 2
+_FAMILY_MXFP4 = 3
 _DESCRIPTOR_SIZE = 32
 
 # Common descriptor fields.
@@ -66,6 +69,12 @@ _NINT_Q5_EXEC = 10
 _Q8_NG = 4
 _Q8_Q_OFFSET = 5
 _Q8_SCALE_OFFSET = 6
+
+# Native MXFP4 descriptor fields. Values are packed low-nibble first and one
+# E8M0 scale is stored per 32 input columns and flattened output row.
+_MX_NG = 4
+_MX_VALUE_OFFSET = 5
+_MX_SCALE_OFFSET = 6
 
 # VQ-family descriptor fields.
 _VQ_GS = 4
@@ -162,6 +171,26 @@ inline uint mfq_grouped_nint_read_octet(
     return packed;
 }
 
+inline float mfq_grouped_mxfp4_value(uchar code) {
+    uint magnitude = uint(code & 7u);
+    float value = magnitude == 0u ? 0.0f
+        : (magnitude == 1u ? 0.5f
+        : (magnitude == 2u ? 1.0f
+        : (magnitude == 3u ? 1.5f
+        : (magnitude == 4u ? 2.0f
+        : (magnitude == 5u ? 3.0f
+        : (magnitude == 6u ? 4.0f : 6.0f))))));
+    return (code & 8u) == 0u ? value : -value;
+}
+
+inline float mfq_grouped_e8m0(uchar raw) {
+    if (raw == 255u) {
+        return NAN;
+    }
+    uint bits = raw == 0u ? 0x00400000u : uint(raw) << 23u;
+    return as_type<float>(bits);
+}
+
 template <
     typename DescriptorPtr,
     typename NintPtr,
@@ -179,7 +208,9 @@ template <
     typename VqScalesPtr,
     typename VqStateBankPtr,
     typename VqBanksPtr,
-    typename VqParametersPtr
+    typename VqParametersPtr,
+    typename MxValuePtr,
+    typename MxScalePtr
 >
 inline float mfq_grouped_decode_weight(
     DescriptorPtr descriptors,
@@ -199,6 +230,8 @@ inline float mfq_grouped_decode_weight(
     VqStateBankPtr vq_state_to_codebank,
     VqBanksPtr vq_banks,
     VqParametersPtr vq_parameters,
+    MxValuePtr mx_values,
+    MxScalePtr mx_scales,
     uint descriptor_base,
     uint pool_output,
     uint column,
@@ -244,6 +277,20 @@ inline float mfq_grouped_decode_weight(
             uint(descriptors[descriptor_base + 5u])
                 + pool_output * K + column
         ]);
+    }
+    if (family == 3u) {
+        uint groups = uint(descriptors[descriptor_base + 4u]);
+        uint packed = uint(mx_values[
+            uint(descriptors[descriptor_base + 5u])
+                + pool_output * (K >> 1u) + (column >> 1u)
+        ]);
+        uint code = (column & 1u) == 0u ? packed & 15u : packed >> 4u;
+        uchar raw_scale = mx_scales[
+            uint(descriptors[descriptor_base + 6u])
+                + pool_output * groups + (column >> 5u)
+        ];
+        return mfq_grouped_mxfp4_value(uchar(code))
+            * mfq_grouped_e8m0(raw_scale);
     }
 
     uint groupsize = uint(descriptors[descriptor_base + 4u]);
@@ -569,6 +616,40 @@ _GROUPED_SOURCE = r"""
                         (outputs[row] * groups + group) * 32u + component;
                     accumulators[row] += activation * scales[row]
                         * float(q8_q[q_offset + q_index]);
+                }
+            }
+        }
+    } else if (family == 3u) {
+        uint groups = uint(descriptors[descriptor_base + 4u]);
+        uint value_offset = uint(descriptors[descriptor_base + 5u]);
+        uint scale_offset = uint(descriptors[descriptor_base + 6u]);
+        for (uint group = lane; group < groups; group += 32u) {
+            uint column_base = group * 32u;
+            uint outputs[ROWS_PER_SIMD];
+            float scales[ROWS_PER_SIMD];
+            for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+                uint output = min(output_base + row, uint(OUT) - 1u);
+                uint pool_output = local_expert * uint(OUT) + output;
+                outputs[row] = pool_output;
+                scales[row] = mfq_grouped_e8m0(
+                    mx_scales[scale_offset + pool_output * groups + group]
+                );
+            }
+            for (uint component = 0u; component < 32u; component += 2u) {
+                uint column = column_base + component;
+                float activation0 = column < uint(K)
+                    ? float(x[x_offset + column]) : 0.0f;
+                float activation1 = column + 1u < uint(K)
+                    ? float(x[x_offset + column + 1u]) : 0.0f;
+                for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+                    uint packed_index = value_offset
+                        + outputs[row] * (uint(K) >> 1u)
+                        + (column >> 1u);
+                    uchar packed = mx_values[packed_index];
+                    accumulators[row] += activation0 * scales[row]
+                        * mfq_grouped_mxfp4_value(packed & 15u);
+                    accumulators[row] += activation1 * scales[row]
+                        * mfq_grouped_mxfp4_value(packed >> 4u);
                 }
             }
         }
@@ -983,6 +1064,39 @@ _GROUPED_COMPACT_SOURCE = r"""
                     }
                 }
             }
+        } else if (family == 3u) {
+            uint groups = uint(descriptors[descriptor_base + 4u]);
+            uint value_offset = uint(descriptors[descriptor_base + 5u]);
+            uint scale_offset = uint(descriptors[descriptor_base + 6u]);
+            for (uint group = k_lane; group < groups; group += K_LANES) {
+                float scale = mfq_grouped_e8m0(
+                    mx_scales[scale_offset + pool_output * groups + group]
+                );
+                uint column_base = group * 32u;
+                for (uint component = 0u; component < 32u; component += 2u) {
+                    uint column = column_base + component;
+                    uchar packed = mx_values[
+                        value_offset + pool_output * (uint(K) >> 1u)
+                            + (column >> 1u)
+                    ];
+                    float weight0 = scale
+                        * mfq_grouped_mxfp4_value(packed & 15u);
+                    float weight1 = scale
+                        * mfq_grouped_mxfp4_value(packed >> 4u);
+                    for (uint input = 0u; input < ROUTES_PER_TILE; ++input) {
+                        if (selected_inputs[input]) {
+                            uint x_index = (
+                                rotation_variant * uint(ROUTE_COUNT)
+                                + original_rows[input]
+                            ) * uint(K) + column;
+                            accumulators[input] += float(x[x_index]) * weight0;
+                            if (column + 1u < uint(K)) {
+                                accumulators[input] += float(x[x_index + 1u]) * weight1;
+                            }
+                        }
+                    }
+                }
+            }
         } else {
             uint groupsize = uint(descriptors[descriptor_base + 4u]);
             uint groups = uint(descriptors[descriptor_base + 5u]);
@@ -1169,11 +1283,11 @@ _GROUPED_MMA_SOURCE = r"""
         uint family = uint(descriptors[descriptor_base]);
         uint groupsize = family == 0u
             ? uint(descriptors[descriptor_base + 5u])
-            : (family == 2u
+            : ((family == 2u || family == 3u)
                 ? 32u : uint(descriptors[descriptor_base + 4u]));
         uint groups = family == 0u
             ? uint(descriptors[descriptor_base + 6u])
-            : (family == 2u
+            : ((family == 2u || family == 3u)
                 ? uint(descriptors[descriptor_base + 4u])
                 : uint(descriptors[descriptor_base + 5u]));
         uint chunks = (groups + GPC - 1u) / GPC;
@@ -1327,6 +1441,8 @@ _GROUPED_MMA_SOURCE = r"""
                                 vq_state_to_codebank,
                                 vq_banks,
                                 vq_parameters,
+                                mx_values,
+                                mx_scales,
                                 descriptor_base,
                                 pool_output,
                                 column,
@@ -1601,6 +1717,8 @@ _GROUPED_EXPERT_MMA_SOURCE = r"""
                             vq_state_to_codebank,
                             vq_banks,
                             vq_parameters,
+                            mx_values,
+                            mx_scales,
                             descriptor_base,
                             pool_output,
                             column,
@@ -1790,6 +1908,8 @@ _GROUPED_KERNEL = mx.fast.metal_kernel(
         "vq_state_to_codebank",
         "vq_banks",
         "vq_parameters",
+        "mx_values",
+        "mx_scales",
         "x",
         "expert_ids",
     ],
@@ -1819,6 +1939,8 @@ _GROUPED_COMPACT_KERNEL = mx.fast.metal_kernel(
         "vq_state_to_codebank",
         "vq_banks",
         "vq_parameters",
+        "mx_values",
+        "mx_scales",
         "x",
         "expert_ids",
         "route_positions",
@@ -1849,6 +1971,8 @@ _GROUPED_MMA_KERNEL = mx.fast.metal_kernel(
         "vq_state_to_codebank",
         "vq_banks",
         "vq_parameters",
+        "mx_values",
+        "mx_scales",
         "x",
         "expert_ids",
         "route_positions",
@@ -1879,6 +2003,8 @@ _GROUPED_EXPERT_MMA_KERNEL = mx.fast.metal_kernel(
         "vq_state_to_codebank",
         "vq_banks",
         "vq_parameters",
+        "mx_values",
+        "mx_scales",
         "x",
         "expert_ids",
         "route_positions",
@@ -1931,6 +2057,8 @@ class MetalMoeWeight:
     vq_state_to_codebank: mx.array
     vq_banks: mx.array
     vq_parameters: mx.array
+    mx_values: mx.array
+    mx_scales: mx.array
     descriptor_values: np.ndarray
     rotation_specs: tuple[tuple[mx.array, int, int], ...]
     experts: int
@@ -1961,6 +2089,8 @@ class MetalMoeWeight:
         vq_state_to_codebank: list[mx.array] = []
         vq_banks: list[mx.array] = []
         vq_parameters: list[mx.array] = []
+        mx_values: list[mx.array] = []
+        mx_scales: list[mx.array] = []
 
         offsets = {
             "nint_q": 0,
@@ -1977,6 +2107,8 @@ class MetalMoeWeight:
             "vq_state_bank": 0,
             "vq_bank": 0,
             "vq_parameter": 0,
+            "mx_value": 0,
+            "mx_scale": 0,
         }
         rotation_variants: dict[tuple[int, int], int] = {}
         rotation_specs: list[tuple[mx.array, int, int]] = []
@@ -2041,9 +2173,34 @@ class MetalMoeWeight:
                 offsets["q8_scale"] += _size(q8_weight.scales)
                 continue
 
+            if isinstance(source, MxTensor):
+                if source.dtype != MXFP4_DTYPE:
+                    raise TypeError(
+                        "grouped Metal NINTM supports native MXFP4 cohorts, "
+                        f"received {source.dtype}"
+                    )
+                mx_weight = MetalMxWeight.from_tensor(source)
+                if mx_weight.out != expert_ids.size * tensor.out_per_expert:
+                    raise ValueError("NINTM MXFP4 cohort row count is inconsistent")
+                groups = tensor.neuron_len // 32
+                for local_expert, expert in enumerate(expert_ids):
+                    descriptor = descriptors[int(expert)]
+                    descriptor[_FAMILY] = _FAMILY_MXFP4
+                    descriptor[_LOCAL_EXPERT] = local_expert
+                    descriptor[_OUT] = tensor.out_per_expert
+                    descriptor[_K] = tensor.neuron_len
+                    descriptor[_MX_NG] = groups
+                    descriptor[_MX_VALUE_OFFSET] = offsets["mx_value"]
+                    descriptor[_MX_SCALE_OFFSET] = offsets["mx_scale"]
+                mx_values.append(mx_weight.values)
+                mx_scales.append(mx_weight.scales)
+                offsets["mx_value"] += _size(mx_weight.values)
+                offsets["mx_scale"] += _size(mx_weight.scales)
+                continue
+
             if not isinstance(source, _VQ_TYPES):
                 raise TypeError(
-                    "grouped Metal NINTM supports NINT/NVQ/NPQ/NEPQ cohorts; "
+                    "grouped Metal NINTM supports NINT/NVQ/NPQ/NEPQ/MXFP4 cohorts; "
                     f"received {type(source).__name__}"
                 )
             weight = MetalVqWeight.from_tensor(source)
@@ -2131,6 +2288,8 @@ class MetalMoeWeight:
             vq_state_to_codebank=_join(vq_state_to_codebank, dtype=mx.uint8),
             vq_banks=_join(vq_banks, dtype=mx.uint8),
             vq_parameters=_join(vq_parameters, dtype=mx.float32),
+            mx_values=_join(mx_values, dtype=mx.uint8),
+            mx_scales=_join(mx_scales, dtype=mx.uint8),
             descriptor_values=descriptors,
             rotation_specs=tuple(rotation_specs),
             experts=tensor.n_experts,
@@ -2175,6 +2334,8 @@ class MetalMoeWeight:
             "vq_state_to_codebank",
             "vq_banks",
             "vq_parameters",
+            "mx_values",
+            "mx_scales",
         )
         offsets = {field: 0 for field in buffer_fields}
         descriptor_sets: list[np.ndarray] = []
@@ -2191,6 +2352,9 @@ class MetalMoeWeight:
                 elif descriptor[_FAMILY] == _FAMILY_NINT8_ZERO:
                     descriptor[_Q8_Q_OFFSET] += offsets["q8_q"]
                     descriptor[_Q8_SCALE_OFFSET] += offsets["q8_scales"]
+                elif descriptor[_FAMILY] == _FAMILY_MXFP4:
+                    descriptor[_MX_VALUE_OFFSET] += offsets["mx_values"]
+                    descriptor[_MX_SCALE_OFFSET] += offsets["mx_scales"]
                 else:
                     descriptor[_VQ_INDICES_OFFSET] += offsets["vq_indices"]
                     descriptor[_VQ_STATE_OFFSET] += offsets["vq_state"]
@@ -2246,6 +2410,8 @@ class MetalMoeWeight:
             vq_state_to_codebank=combine("vq_state_to_codebank"),
             vq_banks=combine("vq_banks"),
             vq_parameters=combine("vq_parameters"),
+            mx_values=combine("mx_values"),
+            mx_scales=combine("mx_scales"),
             descriptor_values=descriptor_values,
             rotation_specs=tuple(combined_specs),
             experts=first.experts,
@@ -2274,6 +2440,8 @@ class MetalMoeWeight:
             self.vq_state_to_codebank,
             self.vq_banks,
             self.vq_parameters,
+            self.mx_values,
+            self.mx_scales,
             *(signs for signs, _, _ in self.rotation_specs),
         )
         return sum(int(array.nbytes) for array in arrays)
@@ -2363,6 +2531,8 @@ def grouped_moe_matmul(
         weight.vq_state_to_codebank,
         weight.vq_banks,
         weight.vq_parameters,
+        weight.mx_values,
+        weight.mx_scales,
     ]
     route_count = tokens * routes
     descriptor_families = weight.descriptor_values[:, _FAMILY]
@@ -2396,7 +2566,11 @@ def grouped_moe_matmul(
             np.where(
                 descriptor_families == _FAMILY_NINT8_ZERO,
                 32,
-                weight.descriptor_values[:, _VQ_GS],
+                np.where(
+                    descriptor_families == _FAMILY_MXFP4,
+                    32,
+                    weight.descriptor_values[:, _VQ_GS],
+                ),
             ),
         )
         route_matrix_safe = bool(np.all(matrix_group_sizes <= 48))
