@@ -531,6 +531,14 @@ torch::Tensor mxfp8_groupwise_small_m_cuda(
 torch::Tensor mxfp8_groupwise_small_m_f32_cuda(
     torch::Tensor values, torch::Tensor scales,
     torch::Tensor x, int64_t groups);
+torch::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
+    torch::Tensor values, torch::Tensor scales, torch::Tensor input,
+    torch::Tensor ids, torch::Tensor expert_local,
+    int64_t global_experts, int64_t pool_experts,
+    int64_t out_per_expert, int64_t neuron_len,
+    torch::Tensor output, torch::Tensor ids_dst,
+    torch::Tensor expert_bounds, torch::Tensor tile_bounds,
+    torch::Tensor tile_experts);
 torch::Tensor nvq_dequant_cuda(
     torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
     torch::Tensor neuron_scale, torch::Tensor codebook,
@@ -715,6 +723,7 @@ static int64_t g_kl_kv_cache_capacity = 0;
 static std::unordered_set<int> g_dsv4_cpu_offload_layers;
 static int64_t g_dsv4_cpu_offload_host_bytes = 0;
 class MoeExpertCache;
+class MoeCachedSource;
 static std::shared_ptr<MoeExpertCache> g_moe_expert_cache;
 static int g_moe_cache_registration_min_slots = 8;
 static int g_gemma_trace_layer = -1;
@@ -1802,6 +1811,13 @@ struct Mxfp8Cpu {
     std::vector<uint8_t> scales;
 };
 
+struct Mxfp4Cpu {
+    int64_t out = 0;
+    int64_t neuron_len = 0;
+    std::vector<uint8_t> values;
+    std::vector<uint8_t> scales;
+};
+
 static size_t checked_mxfp8_size(
         uint64_t left, uint64_t right,
         const char * label) {
@@ -1855,6 +1871,105 @@ static Mxfp8Cpu unpack_mxfp8(
     result.scales.assign(
         blob.begin() + static_cast<ptrdiff_t>(offset),
         blob.end());
+    return result;
+}
+
+static Mxfp4Cpu unpack_mxfp4(
+        const std::vector<uint8_t> & blob) {
+    constexpr size_t kHeaderBytes = 56;
+    if (blob.size() < kHeaderBytes ||
+            std::memcmp(blob.data(), "MXT1", 4) != 0 ||
+            blob[4] != 1 || blob[5] != 4 ||
+            blob[6] != 0 || blob[7] != 0) {
+        throw std::runtime_error("invalid MXFP4 payload header");
+    }
+    size_t offset = 8;
+    const uint64_t rows = read_u64_from(blob, offset);
+    const uint64_t columns = read_u64_from(blob, offset);
+    const uint64_t storage_rows = read_u64_from(blob, offset);
+    const uint64_t storage_columns = read_u64_from(blob, offset);
+    const uint64_t scale_rows = read_u64_from(blob, offset);
+    const uint64_t scale_columns = read_u64_from(blob, offset);
+    if (rows > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            columns > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            columns % 32 != 0 || storage_rows != rows ||
+            storage_columns != columns / 2 || scale_rows != rows ||
+            scale_columns != columns / 32) {
+        throw std::runtime_error("invalid MXFP4 payload geometry");
+    }
+    const size_t value_bytes = checked_mxfp8_size(
+        storage_rows, storage_columns, "MXFP4 value size");
+    const size_t scale_bytes = checked_mxfp8_size(
+        scale_rows, scale_columns, "MXFP4 scale size");
+    if (value_bytes > blob.size() - offset ||
+            scale_bytes != blob.size() - offset - value_bytes) {
+        throw std::runtime_error("invalid MXFP4 payload length");
+    }
+    Mxfp4Cpu result;
+    result.out = static_cast<int64_t>(rows);
+    result.neuron_len = static_cast<int64_t>(columns);
+    result.values.assign(
+        blob.begin() + static_cast<ptrdiff_t>(offset),
+        blob.begin() + static_cast<ptrdiff_t>(offset + value_bytes));
+    offset += value_bytes;
+    result.scales.assign(
+        blob.begin() + static_cast<ptrdiff_t>(offset), blob.end());
+    return result;
+}
+
+static torch::Tensor dequant_mxfp4_cpu(const Mxfp4Cpu & source) {
+    auto dense = torch::empty(
+        {source.out, source.neuron_len},
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32));
+    float * destination = dense.data_ptr<float>();
+    static constexpr float magnitude[8] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    };
+    const int64_t packed_columns = source.neuron_len / 2;
+    const int64_t scale_columns = source.neuron_len / 32;
+    for (int64_t row = 0; row < source.out; ++row) {
+        for (int64_t column = 0; column < source.neuron_len; ++column) {
+            const uint8_t packed = source.values[
+                static_cast<size_t>(row * packed_columns + column / 2)];
+            const uint8_t code = static_cast<uint8_t>(
+                (packed >> ((column & 1) * 4)) & 15u);
+            const uint8_t raw_scale = source.scales[
+                static_cast<size_t>(row * scale_columns + column / 32)];
+            const float scale = raw_scale == 255u
+                ? std::numeric_limits<float>::quiet_NaN()
+                : std::ldexp(1.0f, static_cast<int>(raw_scale) - 127);
+            const float value = magnitude[code & 7u] * scale;
+            destination[row * source.neuron_len + column] =
+                (code & 8u) == 0u ? value : -value;
+        }
+    }
+    return dense.to(torch::kFloat16);
+}
+
+static Mxfp4Cpu select_mxfp4_cpu_rows(
+        const Mxfp4Cpu & source,
+        const std::vector<int64_t> & rows) {
+    Mxfp4Cpu result;
+    result.out = static_cast<int64_t>(rows.size());
+    result.neuron_len = source.neuron_len;
+    const size_t value_row = static_cast<size_t>(source.neuron_len / 2);
+    const size_t scale_row = static_cast<size_t>(source.neuron_len / 32);
+    result.values.resize(rows.size() * value_row);
+    result.scales.resize(rows.size() * scale_row);
+    for (size_t destination = 0; destination < rows.size(); ++destination) {
+        const int64_t source_row = rows[destination];
+        if (source_row < 0 || source_row >= source.out) {
+            throw std::runtime_error("MXFP4 selected row is out of range");
+        }
+        std::memcpy(
+            result.values.data() + destination * value_row,
+            source.values.data() + static_cast<size_t>(source_row) * value_row,
+            value_row);
+        std::memcpy(
+            result.scales.data() + destination * scale_row,
+            source.scales.data() + static_cast<size_t>(source_row) * scale_row,
+            scale_row);
+    }
     return result;
 }
 
@@ -2239,6 +2354,7 @@ struct NintMoeCpuPool {
     std::vector<uint8_t> runtime_payload;
     NintCpu weight;
     Nint8ZeroCpu q8_zero;
+    Mxfp4Cpu mxfp4;
 };
 
 struct NintMoeCpu {
@@ -2315,7 +2431,16 @@ static NintMoeCpu unpack_nint_moe_impl(
         pool.payload.assign(
             blob.begin() + (ptrdiff_t)off, blob.begin() + (ptrdiff_t)payload_end);
         off = payload_end;
-        if (!version1 && pool.dtype == "NINT8-0") {
+        if (!version1 && pool.dtype == "MXFP4") {
+            pool.mxfp4 = unpack_mxfp4(pool.payload);
+            const int expected_rows =
+                static_cast<int>(expert_count) * result.out_per_expert;
+            if (pool.mxfp4.out != expected_rows ||
+                    pool.mxfp4.neuron_len != result.neuron_len) {
+                throw std::runtime_error(
+                    "NINTM MXFP4 pool weight shape mismatch");
+            }
+        } else if (!version1 && pool.dtype == "NINT8-0") {
             pool.q8_zero = unpack_nint8_zero(pool.payload);
             const int expected_rows =
                 static_cast<int>(expert_count) * result.out_per_expert;
@@ -2403,6 +2528,46 @@ struct MoeActivationKeyHash {
 struct MoeActivationWorkspace {
     torch::Tensor qx;
     torch::Tensor xscale;
+};
+
+struct Mxfp4Weight {
+    torch::Tensor values;
+    torch::Tensor scales;
+    int64_t out = 0;
+    int64_t neuron_len = 0;
+};
+
+static Mxfp4Weight to_device_mxfp4(
+        const Mxfp4Cpu & source, bool cuda, int device = -1) {
+    Mxfp4Weight result;
+    result.out = source.out;
+    result.neuron_len = source.neuron_len;
+    result.values = cpu_u8_tensor(
+        source.values, {source.out, source.neuron_len / 2});
+    result.scales = cpu_u8_tensor(
+        source.scales, {source.out, source.neuron_len / 32});
+    if (cuda) {
+        const int target_device = device >= 0
+            ? device : c10::cuda::current_device();
+        c10::cuda::CUDAGuard guard(target_device);
+        const auto target = torch::Device(torch::kCUDA, target_device);
+        result.values = result.values.to(target, false, false).contiguous();
+        result.scales = result.scales.to(target, false, false).contiguous();
+    }
+    return result;
+}
+
+struct MoeActivationGeometry {
+    int groups = 0;
+    int gs = 0;
+    int transform_block = 0;
+    uint64_t transform_seed = 0;
+
+    bool operator==(const MoeActivationGeometry & other) const {
+        return groups == other.groups && gs == other.gs &&
+            transform_block == other.transform_block &&
+            transform_seed == other.transform_seed;
+    }
 };
 
 struct MoeHeteroWorkspace {
@@ -2575,27 +2740,38 @@ struct NintMoeWeight {
     std::function<void(const MoeRoutePlan &)> cache_prefetch;
     std::function<void(const MoeRoutePlan &)> cache_prefetch_begin;
     std::function<torch::Tensor(torch::Tensor, const MoeRoutePlan &)> mixed_forward;
+    std::function<torch::Tensor(torch::Tensor, const MoeRoutePlan &)>
+        mixed_prequantized_forward;
     std::function<torch::Tensor(
         torch::Tensor, const MoeRoutePlan &, bool)> mixed_glu_output_forward;
     std::function<torch::Tensor(
         torch::Tensor, const MoeRoutePlan &, bool)> mixed_glu_forward;
     std::function<torch::Tensor(
         torch::Tensor, const MoeRoutePlan &, double)> mixed_clamped_swiglu_forward;
-    mutable std::unordered_map<MoeActivationKey, MoeActivationWorkspace, MoeActivationKeyHash>
-        activation_workspaces;
     mutable std::unordered_map<int, MoeHeteroWorkspace> hetero_workspaces;
+    std::vector<MoeActivationGeometry> activation_geometries;
+    int activation_workspace_domain = 0;
+    std::shared_ptr<MoeCachedSource> cached_source;
 
     MoeActivationWorkspace & activation_workspace(
             torch::Tensor x, int input_rows, int groups, int gs) const {
+        // Decode Gate and Up consume the same activation.  A process thread
+        // therefore owns one stable workspace per activation geometry; the
+        // explicit forward_prequantized() entry point below is the only path
+        // allowed to reuse its contents without launching quantization again.
+        static thread_local std::unordered_map<
+            MoeActivationKey, MoeActivationWorkspace, MoeActivationKeyHash>
+            shared_activation_workspaces;
         MoeActivationKey key{input_rows, groups, gs, x.get_device()};
-        auto it = activation_workspaces.find(key);
-        if (it != activation_workspaces.end()) return it->second;
+        auto it = shared_activation_workspaces.find(key);
+        if (it != shared_activation_workspaces.end()) return it->second;
         MoeActivationWorkspace workspace;
         workspace.qx = torch::empty(
             {input_rows, groups * gs}, x.options().dtype(torch::kInt8));
         workspace.xscale = torch::empty(
             {input_rows, groups}, x.options().dtype(torch::kFloat32));
-        return activation_workspaces.emplace(key, std::move(workspace)).first->second;
+        return shared_activation_workspaces.emplace(
+            key, std::move(workspace)).first->second;
     }
 
     MoeHeteroWorkspace & hetero_workspace(torch::Tensor x, int input_rows) const {
@@ -2699,10 +2875,57 @@ struct NintMoeWeight {
         if (cache_prefetch_begin) cache_prefetch_begin(route);
     }
 
+    bool supports_prequantized_input() const {
+        return !tensor_parallel() &&
+            (hetero_supported || static_cast<bool>(mixed_prequantized_forward));
+    }
+
+    bool can_reuse_activation_for(
+            const NintMoeWeight & consumer) const {
+        if (!supports_prequantized_input() ||
+                !consumer.supports_prequantized_input() ||
+                neuron_len != consumer.neuron_len ||
+                activation_workspace_domain == 0 ||
+                activation_workspace_domain !=
+                    consumer.activation_workspace_domain) {
+            return false;
+        }
+        if (activation_geometries.empty() ||
+                consumer.activation_geometries.empty()) {
+            return false;
+        }
+        return std::all_of(
+            consumer.activation_geometries.begin(),
+            consumer.activation_geometries.end(),
+            [&](const MoeActivationGeometry & required) {
+                return std::find(
+                    activation_geometries.begin(),
+                    activation_geometries.end(),
+                    required) != activation_geometries.end();
+            });
+    }
+
     torch::Tensor forward(
             torch::Tensor x,
             const MoeRoutePlan & route) const {
+        return forward_impl(x, route, false);
+    }
+
+    torch::Tensor forward_prequantized(
+            torch::Tensor x,
+            const MoeRoutePlan & route) const {
+        return forward_impl(x, route, true);
+    }
+
+    torch::Tensor forward_impl(
+            torch::Tensor x,
+            const MoeRoutePlan & route,
+            bool input_prequantized) const {
         if (tensor_parallel()) {
+            if (input_prequantized) {
+                throw std::runtime_error(
+                    "prequantized MoE activation reuse is unavailable with tensor parallelism");
+            }
             if (tensor_parallel_experts) {
                 std::vector<torch::Tensor> partials;
                 partials.reserve(tensor_parallel_shards.size());
@@ -2726,7 +2949,14 @@ struct NintMoeWeight {
                         local_x, local_route);
                 });
         }
+        if (input_prequantized && mixed_prequantized_forward) {
+            return mixed_prequantized_forward(x, route);
+        }
         if (mixed_forward) return mixed_forward(x, route);
+        if (input_prequantized && !hetero_supported) {
+            throw std::runtime_error(
+                "prequantized MoE activation reuse requires heterogeneous NINT dispatch");
+        }
         if (!x.is_cuda() || !x.is_contiguous() || x.scalar_type() != torch::kFloat16 ||
             (x.dim() != 2 && x.dim() != 3) || x.size(-1) != neuron_len) {
             throw std::runtime_error("NINTM input must be contiguous CUDA f16 with exact K");
@@ -2797,19 +3027,22 @@ struct NintMoeWeight {
                 const char * value = std::getenv("MFQ_DISABLE_MOE_DUAL_QUANT");
                 return value != nullptr && std::atoi(value) != 0;
             }();
-            if (!disable_dual_quant && supports_dual_quant()) {
-                nint_moe_quantize_24_28_ws_cuda(
-                    x,
-                    workspace.qx.at(static_cast<size_t>(gs24_quantize_index)),
-                    workspace.xscale.at(static_cast<size_t>(gs24_quantize_index)),
-                    workspace.qx.at(static_cast<size_t>(gs28_quantize_index)),
-                    workspace.xscale.at(static_cast<size_t>(gs28_quantize_index)));
-            } else {
-                for (int pool_index : quantize_pool_indices) {
-                    const auto & pool = pools.at(static_cast<size_t>(pool_index));
-                    nint_moe_quantize_input_ws_cuda(
-                        x, pool.weight.gs, workspace.qx.at(static_cast<size_t>(pool_index)),
-                        workspace.xscale.at(static_cast<size_t>(pool_index)));
+            if (!input_prequantized) {
+                if (!disable_dual_quant && supports_dual_quant()) {
+                    nint_moe_quantize_24_28_ws_cuda(
+                        x,
+                        workspace.qx.at(static_cast<size_t>(gs24_quantize_index)),
+                        workspace.xscale.at(static_cast<size_t>(gs24_quantize_index)),
+                        workspace.qx.at(static_cast<size_t>(gs28_quantize_index)),
+                        workspace.xscale.at(static_cast<size_t>(gs28_quantize_index)));
+                } else {
+                    for (int pool_index : quantize_pool_indices) {
+                        const auto & pool = pools.at(static_cast<size_t>(pool_index));
+                        nint_moe_quantize_input_ws_cuda(
+                            x, pool.weight.gs,
+                            workspace.qx.at(static_cast<size_t>(pool_index)),
+                            workspace.xscale.at(static_cast<size_t>(pool_index)));
+                    }
                 }
             }
             return nint_moe_grouped_matmul_hetero_qx_cuda(
@@ -2823,7 +3056,8 @@ struct NintMoeWeight {
             int gs = (int)pool.weight.gs;
             MoeActivationKey key{input_rows, groups, gs, x.get_device()};
             auto & workspace = activation_workspace(x, input_rows, groups, gs);
-            bool input_quantized = quantized.find(key) != quantized.end();
+            bool input_quantized = input_prequantized ||
+                quantized.find(key) != quantized.end();
             nint_moe_grouped_matmul_pool_ws_cuda(
                 pool.weight.q_packed, pool.weight.sub_scale, pool.weight.sub_min,
                 pool.weight.neuron_scale, pool.weight.neuron_min, x, route.ids,
@@ -3017,6 +3251,8 @@ static void initialize_nint_moe_dispatch(
         const std::vector<int32_t> & expert_pool,
         const std::vector<int32_t> & expert_local) {
     result.quantize_pool_indices.clear();
+    result.activation_geometries.clear();
+    result.activation_workspace_domain = 1;
     result.gs24_quantize_index = -1;
     result.gs28_quantize_index = -1;
     result.profile_mask = 0;
@@ -3038,6 +3274,12 @@ static void initialize_nint_moe_dispatch(
             (pool.weight.gs << 32) ^ pool.weight.ng;
         if (quantized_shapes.insert(activation_key).second) {
             result.quantize_pool_indices.push_back(pool_index);
+            result.activation_geometries.push_back({
+                static_cast<int>(pool.weight.ng),
+                static_cast<int>(pool.weight.gs),
+                0,
+                0,
+            });
         }
     }
     for (int pool_index : result.quantize_pool_indices) {
@@ -4558,6 +4800,7 @@ static NepqCpu select_nepq_cpu_rows(
 enum class MixedMoeFamily {
     Nint,
     Nint8Zero,
+    Mxfp4,
     Nvq,
     Nepq,
 };
@@ -4566,6 +4809,7 @@ struct MixedMoePool {
     MixedMoeFamily family = MixedMoeFamily::Nint;
     NintWeight nint;
     NintWeight q8_zero;
+    Mxfp4Weight mxfp4;
     NvqWeight nvq;
     NepqWeight nepq;
     torch::Tensor expert_local;
@@ -4619,26 +4863,61 @@ struct MixedMoeRuntime {
     int neuron_len = 0;
     bool partial_experts = false;
     std::vector<MixedMoePool> pools;
-    mutable std::unordered_map<
-        MixedMoeActivationKey, MoeActivationWorkspace,
-        MixedMoeActivationKeyHash> activation_workspaces;
-
     MoeActivationWorkspace & activation_workspace(
             torch::Tensor x, int input_rows, int groups, int gs,
             MixedMoeTransformKey transform) const {
+        static thread_local std::unordered_map<
+            MixedMoeActivationKey, MoeActivationWorkspace,
+            MixedMoeActivationKeyHash> shared_activation_workspaces;
         MixedMoeActivationKey key{
             input_rows, groups, gs, x.get_device(), transform};
-        auto found = activation_workspaces.find(key);
-        if (found != activation_workspaces.end()) return found->second;
+        auto found = shared_activation_workspaces.find(key);
+        if (found != shared_activation_workspaces.end()) return found->second;
         MoeActivationWorkspace value;
         value.qx = torch::empty(
             {input_rows, groups * gs}, x.options().dtype(torch::kInt8));
         value.xscale = torch::empty(
             {input_rows, groups}, x.options().dtype(torch::kFloat32));
-        return activation_workspaces.emplace(key, std::move(value)).first->second;
+        return shared_activation_workspaces.emplace(
+            key, std::move(value)).first->second;
     }
 
-    torch::Tensor forward(torch::Tensor x, const MoeRoutePlan & route) const {
+    std::vector<MoeActivationGeometry> activation_geometry() const {
+        std::vector<MoeActivationGeometry> result;
+        for (const auto & pool : pools) {
+            int groups = 0;
+            int gs = 24;
+            int transform_block = 0;
+            uint64_t transform_seed = 0;
+            if (pool.family == MixedMoeFamily::Nint) {
+                groups = static_cast<int>(pool.nint.ng);
+                gs = static_cast<int>(pool.nint.gs);
+            } else if (pool.family == MixedMoeFamily::Nint8Zero) {
+                groups = static_cast<int>(pool.q8_zero.ng);
+                gs = 32;
+            } else if (pool.family == MixedMoeFamily::Nvq) {
+                groups = static_cast<int>(pool.nvq.ng);
+                gs = static_cast<int>(pool.nvq.gs);
+            } else if (pool.family == MixedMoeFamily::Mxfp4) {
+                continue;
+            } else {
+                groups = pool.nepq.ng;
+                transform_block = pool.nepq.rotation_block;
+                transform_seed = pool.nepq.rotation_seed;
+            }
+            const MoeActivationGeometry geometry{
+                groups, gs, transform_block, transform_seed};
+            if (std::find(result.begin(), result.end(), geometry) == result.end()) {
+                result.push_back(geometry);
+            }
+        }
+        return result;
+    }
+
+    torch::Tensor forward(
+            torch::Tensor x,
+            const MoeRoutePlan & route,
+            bool input_prequantized = false) const {
         if (!x.is_cuda() || !x.is_contiguous() ||
             x.scalar_type() != torch::kFloat16 ||
             (x.dim() != 2 && x.dim() != 3) || x.size(-1) != neuron_len) {
@@ -4679,6 +4958,10 @@ struct MixedMoeRuntime {
             tokens >= prefill_mma_min_tokens && route.map_ready &&
             route.ids_dst.numel() == route.ids.numel();
         const bool use_kl_mmq = g_kl_mmq_mode != KlMmqMode::Default;
+        if (input_prequantized && use_kl_mmq) {
+            throw std::runtime_error(
+                "mixed prequantized activation reuse is unavailable in KLD MMQ mode");
+        }
         if (use_kl_mmq) {
             TORCH_CHECK(
                 route.map_ready && route.ids_dst.numel() == route.ids.numel(),
@@ -4699,13 +4982,15 @@ struct MixedMoeRuntime {
             } else if (pool.family == MixedMoeFamily::Nvq) {
                 gs = (int)pool.nvq.gs;
                 groups = (int)pool.nvq.ng;
+            } else if (pool.family == MixedMoeFamily::Mxfp4) {
+                groups = 0;
             } else {
                 groups = pool.nepq.ng;
                 transform = {
                     pool.nepq.rotation_block,
                     pool.nepq.rotation_seed,
                 };
-                if (transform.block != 0) {
+                if (transform.block != 0 && !input_prequantized) {
                     auto found = prepared_inputs.find(transform);
                     if (found == prepared_inputs.end()) {
                         auto flat = x.reshape({input_rows, neuron_len}).contiguous();
@@ -4723,6 +5008,15 @@ struct MixedMoeRuntime {
             if (use_kl_mmq) {
                 value = kl_mmq_prepare_activation(value);
                 ++g_kl_mmq_moe_calls;
+                if (pool.family == MixedMoeFamily::Mxfp4) {
+                    mxfp4_moe_grouped_matmul_pool_f16_cuda(
+                        pool.mxfp4.values, pool.mxfp4.scales, value,
+                        route.ids, pool.expert_local, n_experts,
+                        pool.local_experts, out_per_expert, neuron_len,
+                        output, route.ids_dst, route.expert_bounds,
+                        route.tile_bounds, route.tile_experts);
+                    continue;
+                }
                 if (pool.family == MixedMoeFamily::Nvq) {
                     nvq_moe_grouped_matmul_pool_f16_cuda(
                         pool.nvq.indices_packed, pool.nvq.aux_packed,
@@ -4751,11 +5045,20 @@ struct MixedMoeRuntime {
                 throw std::runtime_error(
                     "KLD mixed routed FP16 encountered a non-VQ pool");
             }
+            if (pool.family == MixedMoeFamily::Mxfp4) {
+                mxfp4_moe_grouped_matmul_pool_f16_cuda(
+                    pool.mxfp4.values, pool.mxfp4.scales, value,
+                    route.ids, pool.expert_local, n_experts,
+                    pool.local_experts, out_per_expert, neuron_len,
+                    output, route.ids_dst, route.expert_bounds,
+                    route.tile_bounds, route.tile_experts);
+                continue;
+            }
             MixedMoeActivationKey activation_key{
                 input_rows, groups, gs, x.get_device(), transform};
             auto & workspace = activation_workspace(
                 value, input_rows, groups, gs, transform);
-            const bool input_quantized =
+            const bool input_quantized = input_prequantized ||
                 quantized.find(activation_key) != quantized.end();
             if (pool.family == MixedMoeFamily::Nint) {
                 nint_moe_grouped_matmul_pool_ws_cuda(
@@ -4807,7 +5110,8 @@ struct MixedMoeRuntime {
         return std::all_of(
             pools.begin(), pools.end(), [](const MixedMoePool & pool) {
                 if (pool.family == MixedMoeFamily::Nepq ||
-                    pool.family == MixedMoeFamily::Nint8Zero) return false;
+                    pool.family == MixedMoeFamily::Nint8Zero ||
+                    pool.family == MixedMoeFamily::Mxfp4) return false;
                 const int gs = pool.family == MixedMoeFamily::Nint
                     ? static_cast<int>(pool.nint.gs)
                     : static_cast<int>(pool.nvq.gs);
@@ -4917,6 +5221,9 @@ static int64_t mixed_moe_storage_bytes(const MixedMoeRuntime & runtime) {
         } else if (pool.family == MixedMoeFamily::Nint8Zero) {
             bytes += tensor_storage_bytes(pool.q8_zero.q_packed);
             bytes += tensor_storage_bytes(pool.q8_zero.q8_zero_scale);
+        } else if (pool.family == MixedMoeFamily::Mxfp4) {
+            bytes += tensor_storage_bytes(pool.mxfp4.values);
+            bytes += tensor_storage_bytes(pool.mxfp4.scales);
         } else if (pool.family == MixedMoeFamily::Nvq) {
             bytes += tensor_storage_bytes(pool.nvq.indices_packed);
             bytes += tensor_storage_bytes(pool.nvq.aux_packed);
@@ -4970,6 +5277,14 @@ static std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
                 throw std::runtime_error(
                     "mixed NINT8-0 cohort shape mismatch");
             }
+        } else if (source.dtype == "MXFP4") {
+            pool.family = MixedMoeFamily::Mxfp4;
+            pool.mxfp4 = to_device_mxfp4(source.mxfp4, cuda);
+            if (pool.mxfp4.out != expected_rows ||
+                    pool.mxfp4.neuron_len != cpu.neuron_len) {
+                throw std::runtime_error(
+                    "mixed MXFP4 cohort shape mismatch");
+            }
         } else if (source.dtype != "NINTM" &&
                    source.dtype.rfind("NINT", 0) == 0) {
             pool.family = MixedMoeFamily::Nint;
@@ -5016,9 +5331,15 @@ static NintMoeWeight wrap_mixed_moe_runtime(
     result.partial_experts = runtime->partial_experts;
     result.hetero_supported = false;
     result.mixed_weight_bytes = mixed_moe_storage_bytes(*runtime);
+    result.activation_geometries = runtime->activation_geometry();
+    result.activation_workspace_domain = 2;
     result.mixed_forward = [runtime](
             torch::Tensor x, const MoeRoutePlan & route) {
         return runtime->forward(x, route);
+    };
+    result.mixed_prequantized_forward = [runtime](
+            torch::Tensor x, const MoeRoutePlan & route) {
+        return runtime->forward(x, route, true);
     };
     if (runtime->supports_clamped_swiglu()) {
         result.mixed_clamped_swiglu_forward = [runtime](
@@ -5123,6 +5444,10 @@ static NintMoeWeight to_cuda_device_moe_output_slice(
                 to_gpu_nint(
                     select_nint_cpu_rows(
                         source.weight, rows));
+        } else if (source.dtype == "MXFP4") {
+            pool.family = MixedMoeFamily::Mxfp4;
+            pool.mxfp4 = to_device_mxfp4(
+                select_mxfp4_cpu_rows(source.mxfp4, rows), true);
         } else if (
                 source.dtype.rfind("NEPQ", 0) == 0) {
             pool.family =
@@ -5238,6 +5563,10 @@ static NintMoeWeight to_cuda_device_moe_expert_slice(
             pool.family = MixedMoeFamily::Nint;
             pool.nint = to_gpu_nint(
                 select_nint_cpu_rows(source.weight, rows));
+        } else if (source.dtype == "MXFP4") {
+            pool.family = MixedMoeFamily::Mxfp4;
+            pool.mxfp4 = to_device_mxfp4(
+                select_mxfp4_cpu_rows(source.mxfp4, rows), true);
         } else if (source.dtype.rfind("NEPQ", 0) == 0) {
             pool.family = MixedMoeFamily::Nepq;
             auto parsed = unpack_nepq(
@@ -5353,6 +5682,13 @@ static NvqWeight copy_cpu_nvq_to_cuda(const NvqWeight & source) {
     return result;
 }
 
+static Mxfp4Weight copy_cpu_mxfp4_to_cuda(const Mxfp4Weight & source) {
+    Mxfp4Weight result = source;
+    result.values = copy_cpu_weight_to_cuda(source.values);
+    result.scales = copy_cpu_weight_to_cuda(source.scales);
+    return result;
+}
+
 static NepqWeight copy_cpu_nepq_to_cuda(const NepqWeight & source) {
     NepqWeight result = source;
     result.indices_packed =
@@ -5389,6 +5725,8 @@ static NintMoeWeight stage_cpu_mixed_moe(
             pool.nint = copy_cpu_nint_to_cuda(source.nint);
         } else if (pool.family == MixedMoeFamily::Nint8Zero) {
             pool.q8_zero = copy_cpu_nint_to_cuda(source.q8_zero);
+        } else if (pool.family == MixedMoeFamily::Mxfp4) {
+            pool.mxfp4 = copy_cpu_mxfp4_to_cuda(source.mxfp4);
         } else if (pool.family == MixedMoeFamily::Nvq) {
             pool.nvq = copy_cpu_nvq_to_cuda(source.nvq);
         } else {
@@ -5407,6 +5745,8 @@ static NintMoeWeight cpu_mixed_moe_metadata(
     result.neuron_len = runtime->neuron_len;
     result.hetero_supported = false;
     result.mixed_weight_bytes = mixed_moe_storage_bytes(*runtime);
+    result.activation_geometries = runtime->activation_geometry();
+    result.activation_workspace_domain = 2;
     return result;
 }
 
@@ -5465,6 +5805,9 @@ static std::vector<torch::Tensor> moe_cache_fields(
             pool.q8_zero.q_packed,
             pool.q8_zero.q8_zero_scale,
         };
+    }
+    if (pool.family == MixedMoeFamily::Mxfp4) {
+        return {pool.mxfp4.values, pool.mxfp4.scales};
     }
     if (pool.family == MixedMoeFamily::Nvq) {
         return {
@@ -5530,6 +5873,8 @@ static std::string moe_cache_signature(
                << ":q" << pool.nint.qbytes;
     } else if (pool.family == MixedMoeFamily::Nint8Zero) {
         stream << ":g32:n" << pool.q8_zero.ng;
+    } else if (pool.family == MixedMoeFamily::Mxfp4) {
+        stream << ":mx4";
     } else if (pool.family == MixedMoeFamily::Nvq) {
         stream << ":f" << pool.nvq.format
                << ":kf" << pool.nvq.kernel_format
@@ -5589,6 +5934,8 @@ struct MoeCacheStats {
     int64_t route_d2h_bytes = 0;
     int64_t hetero_dispatches = 0;
     int64_t full_projection_fallbacks = 0;
+    int64_t h2d_submissions = 0;
+    int64_t h2d_descriptors = 0;
 };
 
 class MoeExpertCache : public std::enable_shared_from_this<MoeExpertCache> {
@@ -5724,6 +6071,10 @@ public:
         const std::vector<int32_t> & experts,
         bool prefetch);
 
+    bool prepare_bundle(
+        const std::vector<MoeCachedSource *> & sources,
+        const std::vector<int32_t> & experts);
+
     void prewarm();
 
     void begin_route_experts(
@@ -5852,11 +6203,23 @@ public:
                << stats_.hetero_dispatches
                << " full_projection_fallbacks="
                << stats_.full_projection_fallbacks
+               << " h2d_submissions="
+               << stats_.h2d_submissions
+               << " h2d_descriptors="
+               << stats_.h2d_descriptors
                << "\n";
     }
 
 private:
     friend class MoeCachedSource;
+
+    void append_source_transfers(
+        MoeCachedSource & source,
+        const std::vector<int32_t> & experts,
+        bool prefetch,
+        std::vector<MoeCacheTransfer> & transfers,
+        bool & replaced_occupied,
+        std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> * held_slots);
 
     MoePinnedStage & acquire_stage(
             int64_t required_bytes,
@@ -5959,6 +6322,8 @@ private:
             }
             return;
         }
+        ++stats_.h2d_submissions;
+        stats_.h2d_descriptors += transfer_count;
         if (prewarming_) {
             auto & stage = acquire_stage(payload_bytes, false);
             auto * staging = stage.host.data_ptr<uint8_t>();
@@ -6291,6 +6656,12 @@ public:
                 if (!pool.q8_zero.shape.empty()) {
                     pool.q8_zero.shape[0] = pool.q8_zero.out;
                 }
+            } else if (pool.family == MixedMoeFamily::Mxfp4) {
+                pool.mxfp4.values = arena.fields.at(field++);
+                pool.mxfp4.scales = arena.fields.at(field++);
+                pool.mxfp4.out =
+                    static_cast<int64_t>(arena.slots) *
+                    cpu_->out_per_expert;
             } else if (pool.family == MixedMoeFamily::Nvq) {
                 pool.nvq.workspaces.clear();
                 pool.nvq.indices_packed = arena.fields.at(field++);
@@ -6420,6 +6791,25 @@ public:
         return output;
     }
 
+    torch::Tensor forward_prequantized(
+            torch::Tensor x,
+            const MoeRoutePlan & route) {
+        if (use_full_projection(route)) {
+            throw std::runtime_error(
+                "cached prequantized activation reuse only supports decode-sized routes");
+        }
+        cache_->prepare(*this, route_experts(route), false);
+        torch::Tensor output;
+        if (pure_nint_) {
+            cache_->count_hetero_dispatch();
+            output = pure_nint_->forward_prequantized(x, route);
+        } else {
+            output = active_->forward(x, route, true);
+        }
+        cache_->record_compute_use();
+        return output;
+    }
+
     void prefetch(const MoeRoutePlan & route) {
         if (use_full_projection(route)) return;
         cache_->prepare(
@@ -6482,6 +6872,27 @@ public:
 
     bool supports_nint_hetero() const noexcept {
         return pure_nint_candidate_;
+    }
+
+    static bool prefetch_bundle(
+            const std::vector<std::shared_ptr<MoeCachedSource>> & sources,
+            const MoeRoutePlan & route) {
+        if (sources.empty()) return false;
+        auto & first = *sources.front();
+        if (first.use_full_projection(route)) return false;
+        std::vector<MoeCachedSource *> raw_sources;
+        raw_sources.reserve(sources.size());
+        for (const auto & source : sources) {
+            if (!source || source->cache_ != first.cache_ ||
+                    source->n_experts() != first.n_experts() ||
+                    source->layer_id() != first.layer_id() ||
+                    source->use_full_projection(route)) {
+                return false;
+            }
+            raw_sources.push_back(source.get());
+        }
+        return first.cache_->prepare_bundle(
+            raw_sources, first.route_experts(route));
     }
 
 private:
@@ -6864,16 +7275,13 @@ void MoeExpertCache::invalidate(
         ->invalidate(key.cohort, key.expert, slot);
 }
 
-void MoeExpertCache::prepare(
+void MoeExpertCache::append_source_transfers(
         MoeCachedSource & source,
         const std::vector<int32_t> & experts,
-        bool prefetch) {
-    if (!finalized_) {
-        throw std::runtime_error(
-            "MoE cache must be finalized before inference");
-    }
-    std::vector<MoeCacheTransfer> transfers;
-    bool replaced_occupied = false;
+        bool prefetch,
+        std::vector<MoeCacheTransfer> & transfers,
+        bool & replaced_occupied,
+        std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> * held_slots) {
     for (int expert : experts) {
         const int cohort_index =
             source.expert_to_cohort_.at(
@@ -6888,6 +7296,11 @@ void MoeExpertCache::prepare(
         const mfq::MoeCacheKey key{
             source.id_, cohort_index, expert};
         auto lease = arena.book->acquire(key);
+        if (held_slots != nullptr &&
+                !arena.book->inflight(lease.slot)) {
+            arena.book->mark_inflight(lease.slot);
+            held_slots->emplace_back(arena.book.get(), lease.slot);
+        }
         if (lease.hit) {
             if (prefetch) {
                 ++stats_.prefetch_hits;
@@ -6979,10 +7392,90 @@ void MoeExpertCache::prepare(
         });
         source.hetero_map_dirty_ = false;
     }
+}
+
+void MoeExpertCache::prepare(
+        MoeCachedSource & source,
+        const std::vector<int32_t> & experts,
+        bool prefetch) {
+    if (!finalized_) {
+        throw std::runtime_error(
+            "MoE cache must be finalized before inference");
+    }
+    std::vector<MoeCacheTransfer> transfers;
+    bool replaced_occupied = false;
+    append_source_transfers(
+        source, experts, prefetch, transfers,
+        replaced_occupied, nullptr);
     submit_transfers(
         transfers,
         replaced_occupied,
         !prefetch);
+}
+
+bool MoeExpertCache::prepare_bundle(
+        const std::vector<MoeCachedSource *> & sources,
+        const std::vector<int32_t> & experts) {
+    if (!finalized_) {
+        throw std::runtime_error(
+            "MoE cache must be finalized before inference");
+    }
+    if (sources.empty() || experts.empty()) return false;
+
+    std::unordered_map<
+        MoeGpuArena *,
+        std::unordered_set<mfq::MoeCacheKey, mfq::MoeCacheKeyHash>>
+        arena_demands;
+    for (auto * source : sources) {
+        if (source == nullptr || source->cache_ != this) return false;
+        for (int expert : experts) {
+            if (expert < 0 || expert >= source->n_experts()) return false;
+            const int cohort_index = source->expert_to_cohort_.at(
+                static_cast<size_t>(expert));
+            auto & cohort = source->cohorts_.at(
+                static_cast<size_t>(cohort_index));
+            arena_demands[cohort.arena].insert(
+                {source->id_, cohort_index, expert});
+        }
+    }
+    for (const auto & item : arena_demands) {
+        if (item.second.size() >
+                static_cast<size_t>(item.first->book->capacity())) {
+            return false;
+        }
+    }
+
+    std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> held_slots;
+    for (const auto & item : arena_demands) {
+        auto * book = item.first->book.get();
+        for (const auto & key : item.second) {
+            const int slot = book->slot_for(key);
+            if (slot >= 0 && !book->inflight(slot)) {
+                book->mark_inflight(slot);
+                held_slots.emplace_back(book, slot);
+            }
+        }
+    }
+    std::vector<MoeCacheTransfer> transfers;
+    bool replaced_occupied = false;
+    try {
+        for (auto * source : sources) {
+            append_source_transfers(
+                *source, experts, true, transfers,
+                replaced_occupied, &held_slots);
+        }
+        submit_transfers(
+            transfers, replaced_occupied, false);
+    } catch (...) {
+        for (const auto & held : held_slots) {
+            held.first->clear_inflight(held.second);
+        }
+        throw;
+    }
+    for (const auto & held : held_slots) {
+        held.first->clear_inflight(held.second);
+    }
+    return true;
 }
 
 static NintMoeWeight wrap_cached_moe_source(
@@ -6992,6 +7485,9 @@ static NintMoeWeight wrap_cached_moe_source(
         cpu_mixed_moe_metadata(cpu);
     result.hetero_supported =
         source->supports_nint_hetero();
+    result.activation_workspace_domain =
+        source->supports_nint_hetero() ? 1 : 2;
+    result.cached_source = source;
     result.cache_prefetch = [source](
             const MoeRoutePlan & route) {
         source->prefetch(route);
@@ -7004,6 +7500,11 @@ static NintMoeWeight wrap_cached_moe_source(
             torch::Tensor x,
             const MoeRoutePlan & route) {
         return source->forward(x, route);
+    };
+    result.mixed_prequantized_forward = [source](
+            torch::Tensor x,
+            const MoeRoutePlan & route) {
+        return source->forward_prequantized(x, route);
     };
     if (source->supports_nint_hetero()) {
         result.mixed_glu_output_forward = [source](
@@ -7031,6 +7532,21 @@ static NintMoeWeight wrap_cached_moe_source(
         };
     }
     return result;
+}
+
+static bool prefetch_cached_moe_projection_bundle(
+        const NintMoeWeight & gate,
+        const NintMoeWeight & up,
+        const NintMoeWeight & down,
+        const MoeRoutePlan & route) {
+    if (!gate.cached_source ||
+            !up.cached_source ||
+            !down.cached_source) {
+        return false;
+    }
+    return MoeCachedSource::prefetch_bundle(
+        {gate.cached_source, up.cached_source, down.cached_source},
+        route);
 }
 
 static NintMoeWeight load_nint_moe_gpu(
@@ -10394,9 +10910,23 @@ struct FFN {
                         .contiguous();
                 });
             }
+            bool projection_bundle_prefetched = false;
             if (delayed_route_readback) {
                 if (moe_split_gate_up) {
-                    moe_gate.prefetch(route);
+                    static const bool disable_projection_bundle = [] {
+                        const char * value = std::getenv(
+                            "MFQ_DISABLE_MOE_PROJECTION_BUNDLE_PREFETCH");
+                        return value != nullptr && std::atoi(value) != 0;
+                    }();
+                    if (!disable_projection_bundle &&
+                            !cpu_moe_gate && !cpu_moe_up && !cpu_moe_down) {
+                        projection_bundle_prefetched =
+                            prefetch_cached_moe_projection_bundle(
+                                moe_gate, moe_up, moe_down, route);
+                    }
+                    if (!projection_bundle_prefetched) {
+                        moe_gate.prefetch(route);
+                    }
                 } else {
                     moe_gate_up.prefetch(route);
                 }
@@ -10424,8 +10954,20 @@ struct FFN {
                     active_up = &staged_up.value();
                 }
                 gate_up_pair = g_profiler.measure("moe.gate_up_split", [&]() {
+                    static const bool disable_activation_reuse = [] {
+                        const char * value = std::getenv(
+                            "MFQ_DISABLE_SPLIT_MOE_ACTIVATION_REUSE");
+                        return value != nullptr && std::atoi(value) != 0;
+                    }();
+                    const bool reuse_gate_activation =
+                        !disable_activation_reuse &&
+                        g_kl_mmq_mode == KlMmqMode::Default &&
+                        xf.size(0) <= 8 &&
+                        active_gate->can_reuse_activation_for(*active_up);
                     auto gate = active_gate->forward(xf, route);
-                    active_up->prefetch(route);
+                    if (!projection_bundle_prefetched) {
+                        active_up->prefetch(route);
+                    }
                     if (!moe_shared_ungated &&
                             !shared_gate_logits.defined()) {
                         shared_gate_logits = g_profiler.measure(
@@ -10436,7 +10978,9 @@ struct FFN {
                                     .contiguous();
                             });
                     }
-                    auto up = active_up->forward(xf, route);
+                    auto up = reuse_gate_activation
+                        ? active_up->forward_prequantized(xf, route)
+                        : active_up->forward(xf, route);
                     return torch::cat({gate, up}, -1).contiguous();
                 });
             } else {
@@ -10454,7 +10998,9 @@ struct FFN {
             staged_gate_up.reset();
             staged_gate.reset();
             staged_up.reset();
-            moe_down.prefetch(route);
+            if (!projection_bundle_prefetched) {
+                moe_down.prefetch(route);
+            }
             std::optional<NintMoeWeight> staged_down;
             const NintMoeWeight * active_down = &moe_down;
             if (cpu_moe_down) {
@@ -16971,6 +17517,9 @@ static int run_nintm_tensor_check(
                           packed.sub_min, packed.neuron_scale,
                           packed.neuron_min, packed.neuron_len,
                           packed.gs, packed.bits);
+            } else if (pool.dtype == "MXFP4") {
+                dense_flat = dequant_mxfp4_cpu(pool.mxfp4)
+                    .to(torch::kCUDA).contiguous();
             } else if (pool.dtype.rfind("NEPQ", 0) == 0) {
                 auto parsed = unpack_nepq(
                     pool.payload, pool.dtype, pool.runtime_payload);

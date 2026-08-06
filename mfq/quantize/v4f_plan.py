@@ -23,6 +23,7 @@ from mfq.formats.nepq import (
 )
 from mfq.formats.nint import NintSpec
 from mfq.formats.nvq import NVQ2_E8, _HEADER as _NVQ_HEADER
+from mfq.formats.mx import mx_header_bytes
 
 
 _ROUTED_SUFFIXES = (
@@ -276,7 +277,7 @@ def routed_family_blob_bytes(
 
     if projection not in {"gate_up", "down"}:
         raise ValueError(f"unsupported V4F routed projection: {projection}")
-    supported = {"NEPQ0-S", "NVQ2J", *_ROUTED_NINT}
+    supported = {"NEPQ0-S", "NVQ2J", "MXFP4", *_ROUTED_NINT}
     unknown = set(family_counts) - supported
     if unknown:
         raise ValueError(f"unsupported V4F routed families: {sorted(unknown)}")
@@ -306,7 +307,7 @@ def routed_family_pool_bytes(
 
     if projection not in {"gate_up", "down"}:
         raise ValueError(f"unsupported V4F routed projection: {projection}")
-    supported = {"NEPQ0-S", "NVQ2J", *_ROUTED_NINT}
+    supported = {"NEPQ0-S", "NVQ2J", "MXFP4", *_ROUTED_NINT}
     if family not in supported:
         raise ValueError(f"unsupported V4F routed family: {family}")
     count = int(count)
@@ -336,6 +337,16 @@ def routed_family_pool_bytes(
             + table_nbytes
             + NVQ2_E8.payload_nbytes(rows, columns)
         )
+    elif family == "MXFP4":
+        rows = count * rows_per_expert
+        payload = len(
+            mx_header_bytes(
+                "MXFP4",
+                (rows, columns),
+                (rows, columns // 2),
+                (rows, columns // 32),
+            )
+        ) + rows * (columns // 2 + columns // 32)
     else:
         payload = _nint_blob_nbytes(
             count * rows_per_expert,
