@@ -28,6 +28,8 @@ LLM 部署。项目支持 `0.84-8.30 bpw` 的自定义权重编码，可按计�
 
 ### DeepSeek-V4-Flash-0731
 
+<img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ 与 Unsloth Dynamic 模型大小和 Mean KLD 对比" width="100%">
+
 官方 0731 权重的 WikiText-2 全集评测使用 `ctx=512`，覆盖 573 个 chunk 和 146,115 个
 计分 token。发布版 77.519 GiB S 档的 Mean KLD 为 `0.313576`，same-top 为
 `82.2913%`；88.007 GiB M 档为 `0.244488` / `84.5300%`；98.007 GiB L 档为

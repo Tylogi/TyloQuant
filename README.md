@@ -36,6 +36,8 @@ and registered tiers.
 
 ### DeepSeek-V4-Flash-0731
 
+<img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ versus Unsloth Dynamic model size and Mean KLD" width="100%">
+
 The official-0731 WikiText-2 evaluation covers 573 chunks and 146,115 scored
 tokens at `ctx=512`. The released 77.519 GiB S tier records `0.313576` Mean
 KLD and `82.2913%` same-top. The 88.007 GiB M and 98.007 GiB L tiers record
