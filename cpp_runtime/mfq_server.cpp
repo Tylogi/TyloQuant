@@ -433,6 +433,77 @@ static bool boolean_field(
     return body[name].get<bool>();
 }
 
+static std::string request_json_schema(const json & body) {
+    const bool has_direct =
+        body.contains("json_schema") && !body["json_schema"].is_null();
+    const bool has_response_format =
+        body.contains("response_format") &&
+        !body["response_format"].is_null();
+    if (has_direct && has_response_format) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "json_schema and response_format cannot both be specified",
+            "response_format");
+    }
+
+    json schema;
+    if (has_direct) {
+        schema = body["json_schema"];
+        if (schema.is_string()) {
+            try {
+                schema = json::parse(schema.get<std::string>());
+            } catch (const std::exception &) {
+                throw ApiError(
+                    400, "invalid_request_error",
+                    "json_schema string must contain valid JSON",
+                    "json_schema");
+            }
+        }
+    } else if (has_response_format) {
+        const auto & response_format = body["response_format"];
+        if (!response_format.is_object() ||
+            !response_format.contains("type") ||
+            !response_format["type"].is_string()) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "response_format must contain a string type",
+                "response_format");
+        }
+        const std::string type = response_format["type"];
+        if (type == "text") return {};
+        if (type == "json_object") {
+            schema = {{"type", "object"}};
+        } else if (type == "json_schema") {
+            if (!response_format.contains("json_schema") ||
+                !response_format["json_schema"].is_object()) {
+                throw ApiError(
+                    400, "invalid_request_error",
+                    "response_format.json_schema must be an object",
+                    "response_format.json_schema");
+            }
+            const auto & envelope = response_format["json_schema"];
+            schema = envelope.contains("schema")
+                ? envelope["schema"]
+                : envelope;
+        } else {
+            throw ApiError(
+                400, "invalid_request_error",
+                "response_format.type must be text, json_object, or json_schema",
+                "response_format.type");
+        }
+    } else {
+        return {};
+    }
+
+    if (!schema.is_object()) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "structured output JSON schema must be an object",
+            has_direct ? "json_schema" : "response_format.json_schema.schema");
+    }
+    return schema.dump();
+}
+
 static common_chat_params apply_chat_template(
         const json & body, const common_chat_templates * templates) {
     if (!body.contains("messages") || !body["messages"].is_array() ||
@@ -446,6 +517,7 @@ static common_chat_params apply_chat_template(
         common_chat_templates_inputs inputs;
         inputs.messages =
             common_chat_msgs_parse_oaicompat(body["messages"]);
+        inputs.json_schema = request_json_schema(body);
         inputs.reasoning_format = request_reasoning_format(body);
         inputs.enable_thinking = request_enable_thinking(body);
         inputs.use_jinja = true;
@@ -478,13 +550,55 @@ static common_chat_params apply_chat_template(
             inputs.tools =
                 common_chat_tools_parse_oaicompat(body["tools"]);
         }
-        const std::string tool_choice =
+        const json tool_choice =
             body.contains("tool_choice") &&
                     !body["tool_choice"].is_null()
-                ? body["tool_choice"].get<std::string>()
-                : "auto";
-        inputs.tool_choice =
-            common_chat_tool_choice_parse_oaicompat(tool_choice);
+                ? body["tool_choice"]
+                : json("auto");
+        if (tool_choice.is_string()) {
+            inputs.tool_choice =
+                common_chat_tool_choice_parse_oaicompat(
+                    tool_choice.get<std::string>());
+        } else if (tool_choice.is_object()) {
+            if (!tool_choice.contains("type") ||
+                tool_choice["type"] != "function" ||
+                !tool_choice.contains("function") ||
+                !tool_choice["function"].is_object() ||
+                !tool_choice["function"].contains("name") ||
+                !tool_choice["function"]["name"].is_string()) {
+                throw ApiError(
+                    400, "invalid_request_error",
+                    "named tool_choice must select a function name",
+                    "tool_choice");
+            }
+            const std::string selected_name =
+                tool_choice["function"]["name"];
+            const auto selected = std::find_if(
+                inputs.tools.begin(), inputs.tools.end(),
+                [&](const common_chat_tool & tool) {
+                    return tool.name == selected_name;
+                });
+            if (selected == inputs.tools.end()) {
+                throw ApiError(
+                    400, "invalid_request_error",
+                    "named tool_choice does not match any supplied tool",
+                    "tool_choice");
+            }
+            inputs.tools = {*selected};
+            inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+        } else {
+            throw ApiError(
+                400, "invalid_request_error",
+                "tool_choice must be a string or function selector object",
+                "tool_choice");
+        }
+        if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED &&
+            inputs.tools.empty()) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "tool_choice required needs at least one tool",
+                "tool_choice");
+        }
 
         if (body.contains("chat_template_kwargs") &&
             !body["chat_template_kwargs"].is_null()) {

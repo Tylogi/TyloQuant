@@ -86,6 +86,9 @@ struct common_chat_msg {
     std::string                               reasoning_content;
     std::string                               tool_name;
     std::string                               tool_call_id;
+    // Template-specific message fields stored as JSON dumps. DeepSeek-V4 uses
+    // task, tools, and response_format.
+    std::map<std::string, std::string>        extra_fields;
 
     nlohmann::ordered_json to_json_oaicompat(bool concat_typed_text = false) const;
 
@@ -93,7 +96,7 @@ struct common_chat_msg {
 
     bool empty() const {
         return content.empty() && content_parts.empty() && tool_calls.empty() && reasoning_content.empty() &&
-               tool_name.empty() && tool_call_id.empty();
+               tool_name.empty() && tool_call_id.empty() && extra_fields.empty();
     }
 
     bool contains_media() const {
@@ -122,7 +125,8 @@ struct common_chat_msg {
     bool operator==(const common_chat_msg & other) const {
         return role == other.role && content == other.content && content_parts == other.content_parts &&
                tool_calls == other.tool_calls && reasoning_content == other.reasoning_content &&
-               tool_name == other.tool_name && tool_call_id == other.tool_call_id;
+               tool_name == other.tool_name && tool_call_id == other.tool_call_id &&
+               extra_fields == other.extra_fields;
     }
 
     bool operator!=(const common_chat_msg & other) const { return !(*this == other); }

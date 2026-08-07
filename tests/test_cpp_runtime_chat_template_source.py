@@ -23,6 +23,9 @@ METAL_DSV4 = (
 LLAMA_CHAT = (
     ROOT / "third_party" / "llama-runtime" / "common" / "chat.cpp"
 ).read_text(encoding="utf-8")
+LLAMA_CHAT_H = (
+    ROOT / "third_party" / "llama-runtime" / "common" / "chat.h"
+).read_text(encoding="utf-8")
 WEB_JS = (ROOT / "cpp_runtime" / "web" / "app.js").read_text(
     encoding="utf-8"
 )
@@ -32,6 +35,12 @@ WEB_HTML = (ROOT / "cpp_runtime" / "web" / "index.html").read_text(
 WEB_CSS = (ROOT / "cpp_runtime" / "web" / "app.css").read_text(
     encoding="utf-8"
 )
+
+
+def _section(text: str, start: str, end: str) -> str:
+    start_index = text.index(start)
+    end_index = text.index(end, start_index)
+    return text[start_index:end_index]
 
 
 def test_server_uses_native_gguf_jinja_template_and_common_parser() -> None:
@@ -123,3 +132,65 @@ def test_webui_can_reload_model_with_a_new_context() -> None:
     assert 'fetchJson("/api/reload"' in WEB_JS
     assert 'server.Post("/api/reload"' in SERVER
     assert "context_size must be within the model context capacity" in SERVER
+
+
+def test_server_supports_structured_output_and_named_tool_choice() -> None:
+    assert "static std::string request_json_schema(const json & body)" in SERVER
+    assert 'body.contains("response_format")' in SERVER
+    assert 'type == "json_object"' in SERVER
+    assert 'type == "json_schema"' in SERVER
+    assert "inputs.json_schema = request_json_schema(body);" in SERVER
+    assert "tool_choice.is_object()" in SERVER
+    assert "named tool_choice must select a function name" in SERVER
+    assert "named tool_choice does not match any supplied tool" in SERVER
+    assert "inputs.tools = {*selected};" in SERVER
+    assert "inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED;" in SERVER
+
+
+def test_dsv4_template_preserves_message_extensions() -> None:
+    assert "std::map<std::string, std::string>        extra_fields;" in LLAMA_CHAT_H
+    assert 'for (const char * key : {"task", "tools", "response_format"})' in LLAMA_CHAT
+    assert "msg.extra_fields[key] = message.at(key).dump();" in LLAMA_CHAT
+    assert "for (const auto & [key, value] : extra_fields)" in LLAMA_CHAT
+    assert "jmsg[key] = json::parse(value);" in LLAMA_CHAT
+    assert "has_message_scoped_tools" in LLAMA_CHAT
+
+
+def test_dsv4_template_uses_message_scoped_tools_and_schema() -> None:
+    dsv4 = _section(
+        LLAMA_CHAT,
+        "static common_chat_params common_chat_params_init_deepseek_v3_2",
+        "static common_chat_params common_chat_params_init_cohere2moe",
+    )
+    gpt_oss = _section(
+        LLAMA_CHAT,
+        "static common_chat_params common_chat_params_init_gpt_oss",
+        "static common_chat_params common_chat_params_init_gemma4",
+    )
+
+    assert "json available_tools = inputs.tools.is_array()" in dsv4
+    assert "std::set<std::string> available_tool_names;" in dsv4
+    assert 'message.contains("tools")' in dsv4
+    assert "available_tools.push_back(tool);" in dsv4
+    assert 'message.contains("response_format")' in dsv4
+    assert "normalize_response_format(message.at(\"response_format\"))" in dsv4
+    assert 'type == "text"' in dsv4
+    assert 'type == "json_object"' in dsv4
+    assert 'type == "json_schema"' in dsv4
+    assert 'response_format = response_format.at("schema");' in dsv4
+    assert "foreach_function(available_tools" in dsv4
+    assert 'p.schema(p.json(), "response-format-schema", response_schema)' in dsv4
+    assert "auto schema = response_schema;" in dsv4
+    assert "json available_tools = inputs.tools.is_array()" not in gpt_oss
+
+
+def test_dsv4_disabled_thinking_consumes_close_marker() -> None:
+    dsv4 = _section(
+        LLAMA_CHAT,
+        "static common_chat_params common_chat_params_init_deepseek_v3_2",
+        "static common_chat_params common_chat_params_init_cohere2moe",
+    )
+    assert "p.optional(p.literal(THINK_END)) +" in dsv4
+    assert "p.literal(THINK_START) +" in dsv4
+    assert "p.until(THINK_END) +" in dsv4
+    assert "p.literal(THINK_END));" in dsv4
