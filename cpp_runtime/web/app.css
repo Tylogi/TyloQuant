@@ -1627,7 +1627,8 @@ svg {
 }
 
 .field input,
-.field textarea {
+.field textarea,
+.field select {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -1636,9 +1637,14 @@ svg {
   font-size: 12px;
 }
 
-.field input {
+.field input,
+.field select {
   height: 36px;
   padding: 0 10px;
+}
+
+.language-field {
+  grid-template-columns: minmax(0, 1fr) 140px;
 }
 
 .field textarea {

@@ -379,7 +379,7 @@ static MfqSamplingParams default_sampling_params(
         defaults.temperature = 1.0;
         defaults.top_p = 0.8;
         defaults.repetition_penalty = 1.05;
-        defaults.presence_penalty = 1.35;
+        defaults.presence_penalty = 0.0;
     }
     return defaults;
 }
