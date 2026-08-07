@@ -1345,16 +1345,14 @@ void test_generation_stable_prefix_cache() {
     mfq::metal::MlxSamplingParams sampling;
     sampling.temperature = 0.0;
 
-    auto cached = make_model();
+    auto cached = make_model(true, true);
     std::size_t first_prefill_tokens = 0;
     (void)cached.generate(
         {1, 2, 3},
         sampling,
         2,
-        [](std::int64_t) {
-            return false;
-        },
-        std::vector<std::int64_t>{},
+        {},
+        std::nullopt,
         512,
         [&](std::size_t tokens, double) {
             first_prefill_tokens = tokens;
@@ -1386,7 +1384,7 @@ void test_generation_stable_prefix_cache() {
             cached.cache_position() == 3,
         "DeepSeek-V4 stable prefix was not reused");
 
-    auto fresh = make_model();
+    auto fresh = make_model(true, true);
     std::vector<std::int64_t> fresh_output;
     (void)fresh.generate(
         {1, 2, 4, 5},
@@ -1469,6 +1467,7 @@ void test_generation_stable_prefix_cache() {
         observed == 7 && late_interrupted.cache_position() == 2,
         "DeepSeek-V4 late interruption did not restore its checkpoint");
     std::vector<std::int64_t> restored_output;
+    std::size_t late_interrupted_prefill_tokens = 0;
     (void)late_interrupted.generate(
         {1, 2, 6},
         sampling,
@@ -1479,7 +1478,9 @@ void test_generation_stable_prefix_cache() {
         },
         std::vector<std::int64_t>{},
         512,
-        {},
+        [&](std::size_t tokens, double) {
+            late_interrupted_prefill_tokens = tokens;
+        },
         2);
     auto late_fresh = make_model();
     std::vector<std::int64_t> late_fresh_output;
@@ -1493,12 +1494,67 @@ void test_generation_stable_prefix_cache() {
         },
         std::vector<std::int64_t>{});
     require(
+        late_interrupted_prefill_tokens == 1,
+        "DeepSeek-V4 late interruption lost its checkpoint");
+    require(
         restored_output == late_fresh_output,
         "DeepSeek-V4 interrupted decode corrupted the stable cache");
 
-    // Hitting max_tokens is a truncated turn rather than a stable cache
-    // boundary. The following reroll must prefill from scratch instead of
-    // reusing state touched by a potentially very long decode.
+    // The compressor pool is an in-place fixed-capacity cache. Preserve a
+    // compact copy of its live prefix while a long response appends rows,
+    // then verify a cancelled reroll still reuses that prefix exactly.
+    const std::vector<std::int64_t> long_prompt{
+        1, 2, 3, 4, 5, 6, 7, 1, 2, 3};
+    const std::vector<std::int64_t> long_reroll{
+        1, 2, 3, 4, 5, 6, 7, 1, 4, 5};
+    auto pool_interrupted = make_model();
+    int pool_observed = 0;
+    (void)pool_interrupted.generate(
+        long_prompt,
+        sampling,
+        16,
+        [&](std::int64_t) {
+            return ++pool_observed < 15;
+        },
+        std::vector<std::int64_t>{},
+        512,
+        {},
+        8);
+    std::size_t pool_reroll_prefill_tokens = 0;
+    std::vector<std::int64_t> pool_reroll_output;
+    (void)pool_interrupted.generate(
+        long_reroll,
+        sampling,
+        4,
+        [&](std::int64_t token) {
+            pool_reroll_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{},
+        512,
+        [&](std::size_t tokens, double) {
+            pool_reroll_prefill_tokens = tokens;
+        },
+        8);
+    auto pool_fresh = make_model();
+    std::vector<std::int64_t> pool_fresh_output;
+    (void)pool_fresh.generate(
+        long_reroll,
+        sampling,
+        4,
+        [&](std::int64_t token) {
+            pool_fresh_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{});
+    require(
+        pool_reroll_prefill_tokens == 2,
+        "DeepSeek-V4 compact pool prefix was not reused");
+    require(
+        pool_reroll_output == pool_fresh_output,
+        "DeepSeek-V4 compact pool prefix changed reroll output");
+
+    // A max_tokens boundary discards only the response suffix as well.
     auto length_truncated = make_model();
     (void)length_truncated.generate(
         {1, 2, 3},
@@ -1537,8 +1593,8 @@ void test_generation_stable_prefix_cache() {
         },
         std::vector<std::int64_t>{});
     require(
-        truncated_prefill_tokens == 3,
-        "DeepSeek-V4 length-truncated request reused its checkpoint");
+        truncated_prefill_tokens == 1,
+        "DeepSeek-V4 length-truncated request lost its prefix checkpoint");
     require(
         truncated_output == truncated_fresh_output,
         "DeepSeek-V4 length-truncated reroll differs from a fresh runtime");

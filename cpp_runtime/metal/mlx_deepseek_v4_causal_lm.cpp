@@ -997,6 +997,9 @@ void MlxDeepseekV4CausalLm::append_state_arrays(
             if (pool.prev_gate()) {
                 arrays.push_back(*pool.prev_gate());
             }
+            if (pool.pool_prefix_backup()) {
+                arrays.push_back(*pool.pool_prefix_backup());
+            }
         };
     if (state.main()) {
         append_pool(*state.main());
@@ -1462,7 +1465,6 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
         std::vector<std::int64_t> saved_tokens;
         int saved_position = 0;
         int saved_batch = 0;
-        bool reuse_checkpoint = true;
 
         StableCacheRestore(
             std::vector<MlxDeepseekV4LayerState>& states,
@@ -1500,22 +1502,27 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
             return *saved_states;
         }
 
-        void invalidate_reuse() noexcept {
-            reuse_checkpoint = false;
-        }
-
-        ~StableCacheRestore() {
+        ~StableCacheRestore() noexcept {
             if (!saved_states) return;
-            target_states = std::move(*saved_states);
-            target_position = saved_position;
-            target_batch = saved_batch;
-            if (reuse_checkpoint) {
+            try {
+                if (target_states.size() !=
+                    saved_states->size()) {
+                    throw std::runtime_error(
+                        "DeepSeek-V4 stable cache layer count changed");
+                }
+                for (std::size_t index = 0;
+                     index < target_states.size();
+                     ++index) {
+                    target_states[index].restore_snapshot(
+                        std::move((*saved_states)[index]));
+                }
+                target_position = saved_position;
+                target_batch = saved_batch;
                 target_tokens = std::move(saved_tokens);
-            } else {
-                // A length-truncated generation is not a completed turn. Its
-                // long decode may have exercised in-place cache storage far
-                // beyond the checkpoint, so require a fresh prefill before
-                // accepting another request with the same prompt.
+            } catch (...) {
+                target_states.clear();
+                target_position = 0;
+                target_batch = 0;
                 target_tokens.clear();
             }
         }
@@ -1736,9 +1743,6 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
             decoded,
             vocab);
         report_components();
-    }
-    if (generated == max_tokens && stable_restore.active()) {
-        stable_restore.invalidate_reuse();
     }
     return generated;
 }
