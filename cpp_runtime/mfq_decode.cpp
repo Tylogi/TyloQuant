@@ -15028,11 +15028,12 @@ static torch::Tensor sample_server_token(
     torch::Tensor random_host,
     torch::Tensor random_cuda,
     std::mt19937_64 & rng,
+    const MfqTokenConstraintPtr & token_constraint,
     cudaEvent_t prefill_finished = nullptr)
 {
     const bool greedy = sampling.temperature <= 0.0 || sampling.top_k == 1;
     const bool has_penalties = sampling_has_penalties(sampling);
-    if (greedy && !has_penalties) {
+    if (greedy && !has_penalties && !token_constraint) {
         auto next = model.next_token(ids);
         if (prefill_finished != nullptr) {
             MFQ_CUDA_CHECK(cudaEventRecord(
@@ -15051,16 +15052,40 @@ static torch::Tensor sample_server_token(
             logits, counts, sampling.presence_penalty,
             sampling.frequency_penalty, sampling.repetition_penalty);
     }
-    if (greedy) return sample_greedy_cuda(logits);
-
     std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
-    *random_host.data_ptr<float>() = uniform(rng);
-    random_cuda.copy_(random_host, true);
-    if (sampling.top_k > 0) {
-        return sample_top_k_top_p_cuda(
-            logits, random_cuda, sampling.temperature, sampling.top_k, sampling.top_p);
+    const auto sample_logits = [&](torch::Tensor candidate_logits) {
+        if (greedy) return sample_greedy_cuda(candidate_logits);
+        *random_host.data_ptr<float>() = uniform(rng);
+        random_cuda.copy_(random_host, true);
+        if (sampling.top_k > 0) {
+            return sample_top_k_top_p_cuda(
+                candidate_logits, random_cuda, sampling.temperature,
+                sampling.top_k, sampling.top_p);
+        }
+        return sample_softmax_cuda(
+            candidate_logits, random_cuda, sampling.temperature);
+    };
+
+    auto next = sample_logits(logits);
+    if (token_constraint && token_constraint->allows &&
+        !token_constraint->allows(next.item<int64_t>())) {
+        auto masked = logits
+            .to(torch::kCPU, torch::kFloat32)
+            .contiguous();
+        token_constraint->apply(
+            masked.data_ptr<float>(),
+            static_cast<std::size_t>(masked.numel()));
+        next = sample_logits(masked.to(logits.device()));
+        const int64_t constrained_token = next.item<int64_t>();
+        if (!token_constraint->allows(constrained_token)) {
+            throw std::runtime_error(
+                "CUDA constrained sampler returned an invalid token");
+        }
     }
-    return sample_softmax_cuda(logits, random_cuda, sampling.temperature);
+    if (token_constraint && token_constraint->accept) {
+        token_constraint->accept(next.item<int64_t>());
+    }
+    return next;
 }
 
 class ServerPrefillCudaTimer {
@@ -15109,7 +15134,8 @@ static int32_t generate_server_tokens(
     const std::vector<int64_t> & prompt,
     const MfqSamplingParams & sampling,
     const MfqTokenCallback & on_token,
-    const MfqPrefillCallback & on_prefill)
+    const MfqPrefillCallback & on_prefill,
+    const MfqTokenConstraintPtr & token_constraint)
 {
     std::lock_guard<std::mutex> lock(model_mutex);
     model.reset(1);
@@ -15132,6 +15158,7 @@ static int32_t generate_server_tokens(
         ServerPrefillCudaTimer prefill_timer;
         auto next = sample_server_token(
             model, ids, sampling, counts, random_host, random_cuda, rng,
+            token_constraint,
             prefill_timer.finished_event());
         const int64_t token = next.item<int64_t>();
         const double prefill_ms = prefill_timer.elapsed_ms();
@@ -15231,7 +15258,11 @@ static int32_t generate_server_tokens(
     const int32_t graph_min_tokens = graph_min_env != nullptr
         ? std::max<int32_t>(2, std::atoi(graph_min_env))
         : 16;
+    // Grammar state advances on the CPU and may require a one-off full-logit
+    // mask, so constrained requests cannot be replayed as a fixed CUDA graph.
+    // Unconstrained decode keeps the existing graph fast path unchanged.
     const bool graph_eligible = graph_enabled && !reprefill &&
+        !token_constraint &&
         sampling.max_tokens >= graph_min_tokens &&
         sampling.max_tokens <= graph_cache.generated_capacity;
     if (graph_eligible) {
@@ -15374,7 +15405,8 @@ static int32_t generate_server_tokens(
             token = first.second;
         } else {
             next = sample_server_token(
-                model, ids, sampling, counts, random_host, random_cuda, rng);
+                model, ids, sampling, counts, random_host, random_cuda, rng,
+                token_constraint);
             token = next.item<int64_t>();
         }
         ++generated;
@@ -20252,10 +20284,10 @@ int main(int argc, char ** argv) {
                                    const MfqTokenCallback & on_token,
                                    const MfqPrefillCallback & on_prefill,
                                    const MfqPromptCachePlan &,
-                                   const MfqTokenConstraintPtr &) {
+                                   const MfqTokenConstraintPtr & token_constraint) {
                 return generate_server_tokens(
                     model, model_mutex, decode_graph_cache, prompt, sampling,
-                    on_token, on_prefill);
+                    on_token, on_prefill, token_constraint);
             });
             if (g_moe_expert_cache) {
                 g_moe_expert_cache->print_stats(std::cout);

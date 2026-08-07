@@ -57,6 +57,9 @@ def test_server_enforces_complete_chat_template_tool_calls() -> None:
     assert "token_constraint->apply" in METAL_DSV4
     assert "token_constraint->accept" in METAL_DSV4
     assert "token_constraint," in METAL_DECODE
+    assert "CUDA constrained sampler returned an invalid token" in DECODE
+    assert "masked.to(logits.device())" in DECODE
+    assert "!token_constraint &&" in DECODE
 
 
 def test_server_links_matching_llama_common_runtime() -> None:
