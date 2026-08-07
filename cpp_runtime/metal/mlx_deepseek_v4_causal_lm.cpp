@@ -1462,6 +1462,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
         std::vector<std::int64_t> saved_tokens;
         int saved_position = 0;
         int saved_batch = 0;
+        bool reuse_checkpoint = true;
 
         StableCacheRestore(
             std::vector<MlxDeepseekV4LayerState>& states,
@@ -1499,12 +1500,24 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
             return *saved_states;
         }
 
+        void invalidate_reuse() noexcept {
+            reuse_checkpoint = false;
+        }
+
         ~StableCacheRestore() {
             if (!saved_states) return;
             target_states = std::move(*saved_states);
             target_position = saved_position;
             target_batch = saved_batch;
-            target_tokens = std::move(saved_tokens);
+            if (reuse_checkpoint) {
+                target_tokens = std::move(saved_tokens);
+            } else {
+                // A length-truncated generation is not a completed turn. Its
+                // long decode may have exercised in-place cache storage far
+                // beyond the checkpoint, so require a fresh prefill before
+                // accepting another request with the same prompt.
+                target_tokens.clear();
+            }
         }
     } stable_restore(
         states_,
@@ -1723,6 +1736,9 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
             decoded,
             vocab);
         report_components();
+    }
+    if (generated == max_tokens && stable_restore.active()) {
+        stable_restore.invalidate_reuse();
     }
     return generated;
 }

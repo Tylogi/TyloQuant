@@ -502,8 +502,8 @@ static RequestWork parse_work(const json & body, bool chat, const LlamaTokenizer
     }
 
     const int64_t max_tokens = body.contains("max_completion_tokens")
-        ? integer_field(body, "max_completion_tokens", 256)
-        : integer_field(body, "max_tokens", 256);
+        ? integer_field(body, "max_completion_tokens", 4096)
+        : integer_field(body, "max_tokens", 4096);
     if (max_tokens < 1 || max_tokens > std::numeric_limits<int32_t>::max()) {
         throw ApiError(400, "invalid_request_error", "max_tokens must be positive", "max_tokens");
     }

@@ -1350,8 +1350,10 @@ void test_generation_stable_prefix_cache() {
     (void)cached.generate(
         {1, 2, 3},
         sampling,
-        1,
-        {},
+        2,
+        [](std::int64_t) {
+            return false;
+        },
         std::vector<std::int64_t>{},
         512,
         [&](std::size_t tokens, double) {
@@ -1493,6 +1495,53 @@ void test_generation_stable_prefix_cache() {
     require(
         restored_output == late_fresh_output,
         "DeepSeek-V4 interrupted decode corrupted the stable cache");
+
+    // Hitting max_tokens is a truncated turn rather than a stable cache
+    // boundary. The following reroll must prefill from scratch instead of
+    // reusing state touched by a potentially very long decode.
+    auto length_truncated = make_model();
+    (void)length_truncated.generate(
+        {1, 2, 3},
+        sampling,
+        8,
+        {},
+        std::vector<std::int64_t>{},
+        512,
+        {},
+        2);
+    std::size_t truncated_prefill_tokens = 0;
+    std::vector<std::int64_t> truncated_output;
+    (void)length_truncated.generate(
+        {1, 2, 6},
+        sampling,
+        4,
+        [&](std::int64_t token) {
+            truncated_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{},
+        512,
+        [&](std::size_t tokens, double) {
+            truncated_prefill_tokens = tokens;
+        },
+        2);
+    auto truncated_fresh = make_model();
+    std::vector<std::int64_t> truncated_fresh_output;
+    (void)truncated_fresh.generate(
+        {1, 2, 6},
+        sampling,
+        4,
+        [&](std::int64_t token) {
+            truncated_fresh_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{});
+    require(
+        truncated_prefill_tokens == 3,
+        "DeepSeek-V4 length-truncated request reused its checkpoint");
+    require(
+        truncated_output == truncated_fresh_output,
+        "DeepSeek-V4 length-truncated reroll differs from a fresh runtime");
 }
 
 void test_mfq_container_load() {

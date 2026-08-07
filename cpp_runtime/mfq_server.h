@@ -7,7 +7,7 @@
 #include <vector>
 
 struct MfqSamplingParams {
-    int32_t max_tokens = 256;
+    int32_t max_tokens = 4096;
     double temperature = 1.0;
     int32_t top_k = 20;
     double top_p = 0.95;
