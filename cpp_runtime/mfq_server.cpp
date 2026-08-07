@@ -5,10 +5,12 @@
 #include "gguf.h"
 #include "llama.h"
 #include "common/chat.h"
+#include "common/common.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -224,6 +226,160 @@ private:
     const llama_vocab * vocab_ = nullptr;
     gguf_context * metadata_ = nullptr;
 };
+
+class LlamaGrammarConstraint {
+public:
+    LlamaGrammarConstraint(
+            const LlamaTokenizer & tokenizer,
+            const common_chat_params & params)
+        : vocab_(llama_model_get_vocab(tokenizer.model())),
+          vocab_size_(tokenizer.vocab_size()) {
+        if (vocab_ == nullptr || params.grammar.empty()) {
+            throw std::invalid_argument(
+                "cannot create an empty chat-template grammar");
+        }
+
+        std::vector<std::string> trigger_patterns;
+        std::vector<llama_token> trigger_tokens;
+        trigger_patterns.reserve(params.grammar_triggers.size());
+        trigger_tokens.reserve(params.grammar_triggers.size());
+        for (const auto & trigger : params.grammar_triggers) {
+            switch (trigger.type) {
+                case COMMON_GRAMMAR_TRIGGER_TYPE_WORD:
+                    trigger_patterns.push_back(
+                        regex_escape(trigger.value));
+                    break;
+                case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN:
+                    trigger_patterns.push_back(trigger.value);
+                    break;
+                case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL: {
+                    const auto & pattern = trigger.value;
+                    trigger_patterns.push_back(
+                        pattern.empty()
+                            ? "^$"
+                            : (pattern.front() == '^' ? "" : "^") +
+                                pattern +
+                                (pattern.back() == '$' ? "" : "$"));
+                    break;
+                }
+                case COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN:
+                    trigger_tokens.push_back(trigger.token);
+                    break;
+                default:
+                    throw std::runtime_error(
+                        "unknown chat-template grammar trigger type");
+            }
+        }
+
+        std::vector<const char *> trigger_pattern_ptrs;
+        trigger_pattern_ptrs.reserve(trigger_patterns.size());
+        for (const auto & pattern : trigger_patterns) {
+            trigger_pattern_ptrs.push_back(pattern.c_str());
+        }
+
+        grammar_ = params.grammar_lazy
+            ? llama_sampler_init_grammar_lazy_patterns(
+                  vocab_, params.grammar.c_str(), "root",
+                  trigger_pattern_ptrs.data(),
+                  trigger_pattern_ptrs.size(),
+                  trigger_tokens.data(), trigger_tokens.size())
+            : llama_sampler_init_grammar(
+                  vocab_, params.grammar.c_str(), "root");
+        if (grammar_ == nullptr) {
+            throw std::runtime_error(
+                "failed to initialize chat-template grammar");
+        }
+
+        if (!params.grammar_lazy &&
+            !params.generation_prompt.empty()) {
+            for (const auto token : tokenizer.tokenize(
+                     params.generation_prompt, true)) {
+                llama_sampler_accept(
+                    grammar_, static_cast<llama_token>(token));
+            }
+        }
+    }
+
+    ~LlamaGrammarConstraint() {
+        if (grammar_ != nullptr) {
+            llama_sampler_free(grammar_);
+        }
+    }
+
+    LlamaGrammarConstraint(const LlamaGrammarConstraint &) = delete;
+    LlamaGrammarConstraint & operator=(
+        const LlamaGrammarConstraint &) = delete;
+
+    bool allows(std::int64_t token) {
+        if (token < 0 || token >= vocab_size_) return false;
+        llama_token_data candidate = {
+            static_cast<llama_token>(token), 0.0f, 0.0f};
+        llama_token_data_array candidates = {
+            &candidate, 1, -1, false};
+        llama_sampler_apply(grammar_, &candidates);
+        return std::isfinite(candidate.logit);
+    }
+
+    void apply(float * logits, std::size_t count) {
+        if (logits == nullptr ||
+            count != static_cast<std::size_t>(vocab_size_)) {
+            throw std::invalid_argument(
+                "grammar logits do not match tokenizer vocabulary");
+        }
+        candidates_.resize(count);
+        for (std::size_t index = 0; index < count; ++index) {
+            candidates_[index] = {
+                static_cast<llama_token>(index), logits[index], 0.0f};
+        }
+        llama_token_data_array candidates = {
+            candidates_.data(), candidates_.size(), -1, false};
+        llama_sampler_apply(grammar_, &candidates);
+        bool has_candidate = false;
+        for (std::size_t index = 0; index < count; ++index) {
+            logits[index] = candidates_[index].logit;
+            has_candidate = has_candidate ||
+                std::isfinite(candidates_[index].logit);
+        }
+        if (!has_candidate) {
+            throw std::runtime_error(
+                "chat-template grammar rejected every token");
+        }
+    }
+
+    void accept(std::int64_t token) {
+        if (token < 0 || token >= vocab_size_) {
+            throw std::out_of_range(
+                "grammar accepted token is out of range");
+        }
+        llama_sampler_accept(
+            grammar_, static_cast<llama_token>(token));
+    }
+
+private:
+    const llama_vocab * vocab_ = nullptr;
+    int32_t vocab_size_ = 0;
+    llama_sampler * grammar_ = nullptr;
+    std::vector<llama_token_data> candidates_;
+};
+
+static MfqTokenConstraintPtr make_token_constraint(
+        const LlamaTokenizer & tokenizer,
+        const common_chat_params & params) {
+    if (params.grammar.empty()) return {};
+    auto implementation =
+        std::make_shared<LlamaGrammarConstraint>(tokenizer, params);
+    auto constraint = std::make_shared<MfqTokenConstraint>();
+    constraint->allows = [implementation](std::int64_t token) {
+        return implementation->allows(token);
+    };
+    constraint->apply = [implementation](float * logits, std::size_t count) {
+        implementation->apply(logits, count);
+    };
+    constraint->accept = [implementation](std::int64_t token) {
+        implementation->accept(token);
+    };
+    return constraint;
+}
 
 static bool request_enable_thinking(const json & body) {
     if (body.contains("enable_thinking") && !body["enable_thinking"].is_null()) {
@@ -455,6 +611,7 @@ struct RequestWork {
     std::vector<std::string> stops;
     MfqSamplingParams sampling;
     MfqPromptCachePlan cache_plan;
+    MfqTokenConstraintPtr token_constraint;
 };
 
 static RequestWork parse_work(const json & body, bool chat, const LlamaTokenizer & tokenizer,
@@ -553,6 +710,8 @@ static RequestWork parse_work(const json & body, bool chat, const LlamaTokenizer
     if (chat) {
         const common_chat_params chat_params =
             apply_chat_template(body, templates);
+        work.token_constraint =
+            make_token_constraint(tokenizer, chat_params);
         prompt = chat_params.prompt;
         parse_special = true;
         work.chat_parser.format = chat_params.format;
@@ -744,6 +903,12 @@ private:
         common_chat_msg parsed =
             common_chat_parse(generated_, partial, params_);
         if (parsed.empty()) return true;
+        // A partial PEG parse may already know the tool name while its JSON
+        // arguments are still incomplete. Do not expose that half-call to an
+        // OpenAI-compatible client; emit the complete call on flush instead.
+        if (partial) {
+            parsed.tool_calls.clear();
+        }
         parsed.set_tool_call_ids(
             tool_call_ids_,
             []() { return request_id("call_"); });
@@ -1041,7 +1206,8 @@ static CompletionResult generate_text(const RequestWork & work, const LlamaToken
                 metrics->mark_prefill(prompt_tokens, prefill_ms);
             }
         },
-        work.cache_plan);
+        work.cache_plan,
+        work.token_constraint);
     if (result.client_connected && !emitter.stopped()) emitter.flush();
     if (result.client_connected && chat_parser) {
         chat_parser->flush();

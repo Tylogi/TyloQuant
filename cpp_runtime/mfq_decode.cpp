@@ -20251,7 +20251,8 @@ int main(int argc, char ** argv) {
                                    const MfqSamplingParams & sampling,
                                    const MfqTokenCallback & on_token,
                                    const MfqPrefillCallback & on_prefill,
-                                   const MfqPromptCachePlan &) {
+                                   const MfqPromptCachePlan &,
+                                   const MfqTokenConstraintPtr &) {
                 return generate_server_tokens(
                     model, model_mutex, decode_graph_cache, prompt, sampling,
                     on_token, on_prefill);

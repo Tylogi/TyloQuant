@@ -14,6 +14,15 @@ CMAKE = (ROOT / "cpp_runtime" / "CMakeLists.txt").read_text(
 METAL_CMAKE = (
     ROOT / "cpp_runtime" / "metal" / "CMakeLists.txt"
 ).read_text(encoding="utf-8")
+METAL_DECODE = (
+    ROOT / "cpp_runtime" / "metal" / "mfq_decode_mlx.cpp"
+).read_text(encoding="utf-8")
+METAL_DSV4 = (
+    ROOT / "cpp_runtime" / "metal" / "mlx_deepseek_v4_causal_lm.cpp"
+).read_text(encoding="utf-8")
+LLAMA_CHAT = (
+    ROOT / "third_party" / "llama-runtime" / "common" / "chat.cpp"
+).read_text(encoding="utf-8")
 WEB_JS = (ROOT / "cpp_runtime" / "web" / "app.js").read_text(
     encoding="utf-8"
 )
@@ -37,10 +46,23 @@ def test_server_uses_native_gguf_jinja_template_and_common_parser() -> None:
     assert "format_dsv4_chat_prompt" not in SERVER
 
 
+def test_server_enforces_complete_chat_template_tool_calls() -> None:
+    assert "LlamaGrammarConstraint" in SERVER
+    assert "make_token_constraint(tokenizer, chat_params)" in SERVER
+    assert "work.token_constraint" in SERVER
+    assert "if (partial)" in SERVER
+    assert "parsed.tool_calls.clear()" in SERVER
+    assert 'uses_tool_calls ? "tool_calls" : "function_calls"' in LLAMA_CHAT
+    assert 'src.find("tool_calls") != std::string::npos' in LLAMA_CHAT
+    assert "token_constraint->apply" in METAL_DSV4
+    assert "token_constraint->accept" in METAL_DSV4
+    assert "token_constraint," in METAL_DECODE
+
+
 def test_server_links_matching_llama_common_runtime() -> None:
-    assert "MFQ_LLAMA_COMMON_LIBRARY" in CMAKE
+    assert 'set(MFQ_LLAMA_SOURCE_DIR' in CMAKE
+    assert 'add_subdirectory(' in CMAKE
     assert "mfq_llama_common" in CMAKE
-    assert "llama-common.dll" in CMAKE
     assert "common/chat.h" in CMAKE
     assert "MFQ_LLAMA_RUNTIME_DYLIBS" in METAL_CMAKE
     assert "BUILD_WITH_INSTALL_RPATH ON" in METAL_CMAKE

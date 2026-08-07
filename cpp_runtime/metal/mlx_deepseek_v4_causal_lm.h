@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../mfq_token_constraint.h"
 #include "deepseek_v4_model.h"
 #include "mlx_deepseek_v4_attention.h"
 #include "mlx_deepseek_v4_hc.h"
@@ -190,7 +191,8 @@ public:
         const std::function<void(std::size_t, double)>&
             prefill_callback = {},
         std::optional<std::size_t> stable_prefix_tokens =
-            std::nullopt);
+            std::nullopt,
+        const MfqTokenConstraintPtr& token_constraint = {});
 
     const DeepseekV4Config& config() const noexcept {
         return config_;

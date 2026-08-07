@@ -28,7 +28,7 @@
     "模型": "Model",
     "选择模型": "Select model",
     "连接中": "Connecting",
-    "最近一次生成性能": "Latest generation performance",
+    "最近一次生成摘要": "Latest generation summary",
     "导出当前对话": "Export current chat",
     "推理设置": "Inference settings",
     "向模型发送消息": "Message the model",
@@ -288,7 +288,7 @@
       "new-chat", "clear-history", "conversation-list",
       "sidebar-status-dot", "sidebar-status-label", "sidebar-endpoint",
       "connection-pill", "active-request-count", "model-select",
-      "top-ttft", "top-prefill-tps", "top-tps", "export-chat", "open-settings",
+      "top-ttft", "top-context-tokens", "top-tps", "export-chat", "open-settings",
       "chat-view", "monitor-view", "message-scroller", "message-list",
       "composer-form", "message-input", "thinking-toggle",
       "reasoning-effort-control", "reasoning-effort-select", "composer-hint",
@@ -1727,14 +1727,21 @@
     const prefillMs = Number(last?.prefill_ms);
     const decodeTps = Number(last?.decode_tps);
     const ttft = Number(last?.ttft_ms);
+    const lastPromptTokens = Number(last?.prompt_tokens);
+    const lastCompletionTokens = Number(last?.completion_tokens);
+    const contextTokens =
+      Number.isFinite(lastPromptTokens) &&
+      Number.isFinite(lastCompletionTokens)
+        ? lastPromptTokens + lastCompletionTokens
+        : Number.NaN;
     const active = Number(status.active_requests) || 0;
     const promptTokens = Number(status.total_prompt_tokens) || 0;
     const completionTokens = Number(status.total_completion_tokens) || 0;
 
     refs["active-request-count"].textContent = String(active);
     refs["top-ttft"].textContent = Number.isFinite(ttft) ? `${formatNumber(ttft, 1)} ms` : "--";
-    refs["top-prefill-tps"].textContent = Number.isFinite(prefillTps)
-      ? formatNumber(prefillTps, 1)
+    refs["top-context-tokens"].textContent = Number.isFinite(contextTokens)
+      ? formatNumber(contextTokens)
       : "--";
     refs["top-tps"].textContent = Number.isFinite(decodeTps) ? formatNumber(decodeTps, 1) : "--";
     refs["metric-prefill-tps"].textContent = Number.isFinite(prefillTps)
