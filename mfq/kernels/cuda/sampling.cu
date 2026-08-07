@@ -394,12 +394,17 @@ torch::Tensor sample_greedy_cuda(torch::Tensor logits)
 {
     TORCH_CHECK(logits.is_cuda() && logits.is_contiguous(), "sample_greedy: logits must be cuda contiguous");
     TORCH_CHECK(logits.dim() == 2, "sample_greedy: logits must be [B,V]");
-    TORCH_CHECK(logits.scalar_type() == torch::kFloat32 || logits.scalar_type() == torch::kFloat16,
-                "sample_greedy: logits dtype must be f32 or f16");
+    TORCH_CHECK(
+        logits.scalar_type() == torch::kFloat32 ||
+        logits.scalar_type() == torch::kFloat16 ||
+        logits.scalar_type() == torch::kBFloat16,
+        "sample_greedy: logits dtype must be f32, f16, or bf16");
     int B = (int)logits.size(0);
     int V = (int)logits.size(1);
     auto out = torch::empty({B}, logits.options().dtype(torch::kInt64));
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(logits.scalar_type(), "sample_greedy_cuda", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        logits.scalar_type(), "sample_greedy_cuda", [&] {
         sample_greedy_kernel<scalar_t><<<B, SAMPLE_BD, 0, at::cuda::getCurrentCUDAStream()>>>(
             logits.data_ptr<scalar_t>(), out.data_ptr<int64_t>(), B, V);
     });
@@ -412,14 +417,19 @@ torch::Tensor sample_softmax_cuda(torch::Tensor logits, torch::Tensor random, do
     TORCH_CHECK(random.is_cuda() && random.is_contiguous() && random.scalar_type() == torch::kFloat32,
                 "sample_softmax: random must be cuda contiguous f32");
     TORCH_CHECK(logits.dim() == 2, "sample_softmax: logits must be [B,V]");
-    TORCH_CHECK(logits.scalar_type() == torch::kFloat32 || logits.scalar_type() == torch::kFloat16,
-                "sample_softmax: logits dtype must be f32 or f16");
+    TORCH_CHECK(
+        logits.scalar_type() == torch::kFloat32 ||
+        logits.scalar_type() == torch::kFloat16 ||
+        logits.scalar_type() == torch::kBFloat16,
+        "sample_softmax: logits dtype must be f32, f16, or bf16");
     int B = (int)logits.size(0);
     int V = (int)logits.size(1);
     TORCH_CHECK(random.numel() == B, "sample_softmax: random length must match B");
     TORCH_CHECK(temperature > 0.0, "sample_softmax: temperature must be > 0");
     auto out = torch::empty({B}, logits.options().dtype(torch::kInt64));
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(logits.scalar_type(), "sample_softmax_cuda", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        logits.scalar_type(), "sample_softmax_cuda", [&] {
         sample_softmax_kernel<scalar_t><<<B, SAMPLE_BD, 0, at::cuda::getCurrentCUDAStream()>>>(
             logits.data_ptr<scalar_t>(), random.data_ptr<float>(), out.data_ptr<int64_t>(),
             B, V, (float)temperature);
@@ -438,8 +448,11 @@ torch::Tensor sample_top_k_top_p_cuda(
     TORCH_CHECK(random.is_cuda() && random.is_contiguous() && random.scalar_type() == torch::kFloat32,
                 "sample_top_k_top_p: random must be cuda contiguous f32");
     TORCH_CHECK(logits.dim() == 2, "sample_top_k_top_p: logits must be [B,V]");
-    TORCH_CHECK(logits.scalar_type() == torch::kFloat32 || logits.scalar_type() == torch::kFloat16,
-                "sample_top_k_top_p: logits dtype must be f32 or f16");
+    TORCH_CHECK(
+        logits.scalar_type() == torch::kFloat32 ||
+        logits.scalar_type() == torch::kFloat16 ||
+        logits.scalar_type() == torch::kBFloat16,
+        "sample_top_k_top_p: logits dtype must be f32, f16, or bf16");
     int B = (int)logits.size(0);
     int V = (int)logits.size(1);
     TORCH_CHECK(random.numel() == B, "sample_top_k_top_p: random length must match B");
@@ -463,7 +476,9 @@ torch::Tensor sample_top_k_top_p_cuda(
             {capacity}, logits.options().dtype(torch::kFloat32));
         auto idxs_b = torch::empty(
             {capacity}, logits.options().dtype(torch::kInt32));
-        AT_DISPATCH_FLOATING_TYPES_AND_HALF(logits.scalar_type(), "sample_top_k_radix_stage1", [&] {
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::ScalarType::Half, at::ScalarType::BFloat16,
+            logits.scalar_type(), "sample_top_k_radix_stage1", [&] {
             sample_top_k_radix_stage1_kernel<scalar_t><<<first_blocks, SAMPLE_BD, 0, stream>>>(
                 logits.data_ptr<scalar_t>(), vals_a.data_ptr<float>(), idxs_a.data_ptr<int>(),
                 V, (int)top_k);
@@ -497,7 +512,9 @@ torch::Tensor sample_top_k_top_p_cuda(
         return out;
     }
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(logits.scalar_type(), "sample_top_k_top_p_cuda", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        logits.scalar_type(), "sample_top_k_top_p_cuda", [&] {
         sample_top_k_top_p_kernel<scalar_t><<<B, SAMPLE_BD, 0, at::cuda::getCurrentCUDAStream()>>>(
             logits.data_ptr<scalar_t>(), random.data_ptr<float>(), out.data_ptr<int64_t>(),
             B, V, (float)temperature, (int)top_k, (float)top_p);
@@ -531,8 +548,11 @@ torch::Tensor sample_apply_penalties_cuda(
                 "sample_apply_penalties: logits must be contiguous CUDA");
     TORCH_CHECK(logits.dim() == 2 && logits.size(0) == 1,
                 "sample_apply_penalties: logits must be [1,V]");
-    TORCH_CHECK(logits.scalar_type() == torch::kFloat32 || logits.scalar_type() == torch::kFloat16,
-                "sample_apply_penalties: logits dtype must be f32 or f16");
+    TORCH_CHECK(
+        logits.scalar_type() == torch::kFloat32 ||
+        logits.scalar_type() == torch::kFloat16 ||
+        logits.scalar_type() == torch::kBFloat16,
+        "sample_apply_penalties: logits dtype must be f32, f16, or bf16");
     TORCH_CHECK(counts.is_cuda() && counts.is_contiguous() && counts.scalar_type() == torch::kInt32,
                 "sample_apply_penalties: counts must be contiguous CUDA int32");
     TORCH_CHECK(counts.dim() == 1 && counts.numel() == logits.size(1),
@@ -540,7 +560,9 @@ torch::Tensor sample_apply_penalties_cuda(
     int vocab_size = (int)logits.size(1);
     constexpr int bd = 256;
     int blocks = (vocab_size + bd - 1) / bd;
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(logits.scalar_type(), "sample_apply_penalties_cuda", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        logits.scalar_type(), "sample_apply_penalties_cuda", [&] {
         sample_apply_penalties_kernel<scalar_t><<<blocks, bd, 0, at::cuda::getCurrentCUDAStream()>>>(
             logits.data_ptr<scalar_t>(), counts.data_ptr<int32_t>(), vocab_size,
             (float)presence_penalty, (float)frequency_penalty, (float)repetition_penalty);

@@ -731,6 +731,83 @@ ModelFixture make_model_fixture() {
     };
 }
 
+struct SplitModelFixture {
+    ModelFixture reference;
+    MoeFixture routed_gate;
+    MoeFixture routed_up;
+};
+
+MoeFixture concatenate_gate_up_reference(
+    const MoeFixture& gate,
+    const MoeFixture& up) {
+    require(
+        gate.output == up.output &&
+            gate.input == up.input &&
+            gate.rotations.size() == up.rotations.size(),
+        "split Gate/Up fixture dimensions mismatch");
+    MoeFixture result;
+    result.output = gate.output + up.output;
+    result.input = gate.input;
+    result.rotations = gate.rotations;
+    result.dense.resize(
+        static_cast<std::size_t>(kExperts) *
+        result.output * result.input);
+    for (int expert = 0; expert < kExperts; ++expert) {
+        const auto& gate_rotation = gate.rotations[expert];
+        const auto& up_rotation = up.rotations[expert];
+        require(
+            gate_rotation.block == up_rotation.block &&
+                gate_rotation.signs == up_rotation.signs,
+            "split Gate/Up fixture rotations mismatch");
+        const auto copy_projection =
+            [&](const MoeFixture& source, int output_offset) {
+                const auto source_begin =
+                    source.dense.begin() +
+                    static_cast<std::ptrdiff_t>(
+                        static_cast<std::size_t>(expert) *
+                        source.output * source.input);
+                const auto target_begin =
+                    result.dense.begin() +
+                    static_cast<std::ptrdiff_t>(
+                        (static_cast<std::size_t>(expert) *
+                             result.output +
+                         output_offset) *
+                        result.input);
+                std::copy(
+                    source_begin,
+                    source_begin +
+                        static_cast<std::ptrdiff_t>(
+                            static_cast<std::size_t>(source.output) *
+                            source.input),
+                    target_begin);
+            };
+        copy_projection(gate, 0);
+        copy_projection(up, gate.output);
+    }
+    return result;
+}
+
+SplitModelFixture make_split_model_fixture(bool cccp) {
+    auto reference = make_model_fixture();
+    auto gate = cccp
+        ? make_cccp_moe(kIntermediate, kHidden, 31)
+        : make_mixed_moe(kIntermediate, kHidden, 5);
+    auto up = cccp
+        ? make_cccp_moe(kIntermediate, kHidden, 37)
+        : make_mixed_moe(kIntermediate, kHidden, 8);
+    reference.routed_gate_up =
+        concatenate_gate_up_reference(gate, up);
+    if (cccp) {
+        reference.routed_down =
+            make_cccp_moe(kHidden, kIntermediate, 43);
+    }
+    return {
+        std::move(reference),
+        std::move(gate),
+        std::move(up),
+    };
+}
+
 DeepseekV4Config test_config(bool normalize) {
     DeepseekV4Config config;
     config.n_layers = 1;
@@ -894,7 +971,9 @@ std::vector<std::uint8_t> dense_payload(
 class TemporaryDeepseekMfq {
 public:
     explicit TemporaryDeepseekMfq(
-        const std::vector<MappedTensor>& records)
+        const std::vector<MappedTensor>& records,
+        std::string_view architecture =
+            "deepseek-v4-streamed-test")
         : path_(
               std::filesystem::
                   temp_directory_path()
@@ -904,7 +983,7 @@ public:
         append<std::uint32_t>(file, 1);
         append_mfq_string(
             file,
-            "deepseek-v4-streamed-test");
+            architecture);
         append<std::uint32_t>(
             file,
             static_cast<std::uint32_t>(
@@ -1017,6 +1096,60 @@ streamed_model_records(
                 {kVocab, kTopK}),
         },
     };
+}
+
+std::vector<MappedTensor>
+split_model_records(
+    const SplitModelFixture& fixture,
+    const std::vector<std::int32_t>& token_experts,
+    bool ew_names) {
+    auto records = streamed_model_records(
+        fixture.reference,
+        token_experts);
+    const auto combined = std::find_if(
+        records.begin(),
+        records.end(),
+        [](const MappedTensor& record) {
+            return record.name ==
+                "layers.0.ffn.experts.gate_up.weight";
+        });
+    require(
+        combined != records.end(),
+        "combined Gate/Up record is missing from fixture");
+    const auto position =
+        static_cast<std::size_t>(
+            std::distance(records.begin(), combined));
+    records.erase(combined);
+    records.insert(
+        records.begin() +
+            static_cast<std::ptrdiff_t>(position),
+        {
+            ew_names
+                ? "blk.0.ffn_gate_exps.weight"
+                : "layers.0.ffn.experts.gate.weight",
+            "NINTM",
+            fixture.routed_gate.blob,
+        });
+    records.insert(
+        records.begin() +
+            static_cast<std::ptrdiff_t>(position + 1),
+        {
+            ew_names
+                ? "blk.0.ffn_up_exps.weight"
+                : "layers.0.ffn.experts.up.weight",
+            "NINTM",
+            fixture.routed_up.blob,
+        });
+    if (ew_names) {
+        for (auto& record : records) {
+            if (record.name ==
+                "layers.0.ffn.experts.down.weight") {
+                record.name =
+                    "blk.0.ffn_down_exps.weight";
+            }
+        }
+    }
+    return records;
 }
 
 std::vector<MappedTensor>
@@ -1638,6 +1771,134 @@ void test_hash_repair_and_mixed_formats(
     compare(std::move(actual), expected, 3e-2f);
 }
 
+void test_split_gate_up_eager_load_and_forward() {
+    const auto fixture = make_split_model_fixture(false);
+    const TemporaryDeepseekMfq file(
+        split_model_records(
+            fixture,
+            kTokenExperts,
+            true),
+        "deepseek_v4-ew-mfq");
+    const mfq::metal::MfqContainer model(file.path());
+    const auto config = test_config(true);
+    auto moe = MlxDeepseekV4Moe::load(
+        model,
+        config,
+        0,
+        availability_array(kAvailable));
+    require(
+        !moe.uses_streamed_experts(),
+        "split NINTM Gate/Up unexpectedly selected offload");
+
+    const auto run = [&](int rows, int salt) {
+        const auto input = input_values(rows, salt);
+        std::vector<std::int32_t> tokens(
+            static_cast<std::size_t>(rows));
+        for (int row = 0; row < rows; ++row) {
+            tokens[static_cast<std::size_t>(row)] = row % kVocab;
+        }
+        const auto expected = reference(
+            fixture.reference,
+            config,
+            input,
+            rows,
+            tokens,
+            std::nullopt,
+            kTokenExperts,
+            kAvailable);
+        auto actual = moe.forward_with_routing(
+            array(input.begin(), Shape{rows, kHidden}),
+            array(tokens.begin(), Shape{rows}));
+        compare(std::move(actual), expected, 3e-2f);
+    };
+    run(3, 27);
+    run(34, 29);
+}
+
+void test_split_gate_up_streamed_load_and_forward() {
+    const auto fixture = make_split_model_fixture(true);
+    const TemporaryDeepseekMfq file(
+        split_model_records(
+            fixture,
+            kTokenExperts,
+            true),
+        "deepseek_v4-ew-mfq");
+    const mfq::metal::MfqContainer model(file.path());
+    auto residency =
+        std::make_shared<mfq::metal::MlxCccpExpertResidency>(
+            model,
+            0,
+            kExperts);
+    const auto config = test_config(true);
+    auto moe = MlxDeepseekV4Moe::load(
+        model,
+        config,
+        0,
+        availability_array(kAvailable),
+        residency);
+    require(
+        moe.uses_streamed_experts(),
+        "split CCCP Gate/Up did not select streamed residency");
+
+    const auto run = [&](int rows, int salt) {
+        const auto input = input_values(rows, salt);
+        std::vector<std::int32_t> tokens(
+            static_cast<std::size_t>(rows));
+        for (int row = 0; row < rows; ++row) {
+            tokens[static_cast<std::size_t>(row)] = row % kVocab;
+        }
+        const auto expected = reference(
+            fixture.reference,
+            config,
+            input,
+            rows,
+            tokens,
+            std::nullopt,
+            kTokenExperts,
+            kAvailable);
+        compare(
+            moe.forward_with_routing(
+                array(input.begin(), Shape{rows, kHidden}),
+                array(tokens.begin(), Shape{rows})),
+            expected,
+            3e-2f);
+    };
+    run(1, 31);
+    run(35, 33);
+}
+
+void test_split_gate_up_requires_pair() {
+    const auto fixture = make_split_model_fixture(false);
+    auto records = split_model_records(
+        fixture,
+        kTokenExperts,
+        false);
+    records.erase(
+        std::remove_if(
+            records.begin(),
+            records.end(),
+            [](const MappedTensor& record) {
+                return record.name ==
+                    "layers.0.ffn.experts.up.weight";
+            }),
+        records.end());
+    const TemporaryDeepseekMfq file(records);
+    const mfq::metal::MfqContainer model(file.path());
+    bool rejected = false;
+    try {
+        (void)MlxDeepseekV4Moe::load(
+            model,
+            test_config(true),
+            0,
+            availability_array(kAvailable));
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    require(
+        rejected,
+        "DeepSeek-V4 accepted an incomplete split Gate/Up pair");
+}
+
 void test_streamed_cccp_load_and_forward() {
     auto fixture = make_model_fixture();
     fixture.routed_gate_up =
@@ -1968,6 +2229,9 @@ int main() {
         test_grouped_and_fallbacks(fixture);
         test_unnormalized_bias_routing(fixture);
         test_hash_repair_and_mixed_formats(fixture);
+        test_split_gate_up_eager_load_and_forward();
+        test_split_gate_up_streamed_load_and_forward();
+        test_split_gate_up_requires_pair();
         test_streamed_cccp_load_and_forward();
         test_streamed_router_availability_intersection();
         test_availability_validation(fixture);

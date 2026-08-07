@@ -972,12 +972,14 @@ void MlxDeepseekV4CausalLm::reset_cache(
     states_ = std::move(states);
     cache_position_ = 0;
     cache_batch_ = batch;
+    stable_cache_tokens_.clear();
 }
 
 void MlxDeepseekV4CausalLm::clear_cache() noexcept {
     states_.clear();
     cache_position_ = 0;
     cache_batch_ = 0;
+    stable_cache_tokens_.clear();
 }
 
 void MlxDeepseekV4CausalLm::append_state_arrays(
@@ -1181,6 +1183,7 @@ array MlxDeepseekV4CausalLm::forward_chunk(
 array MlxDeepseekV4CausalLm::forward(
     const array& token_ids,
     bool use_cache) {
+    stable_cache_tokens_.clear();
     auto ids = normalize_ids(
         token_ids,
         true);
@@ -1217,6 +1220,7 @@ array MlxDeepseekV4CausalLm::prefill(
     const array& token_ids,
     int chunk_size,
     bool full_logits) {
+    stable_cache_tokens_.clear();
     return prefill_impl(
         token_ids,
         chunk_size,
@@ -1238,14 +1242,15 @@ array MlxDeepseekV4CausalLm::prefill_impl(
         throw std::invalid_argument(
             "DeepSeek-V4 prefill chunk_size must be positive");
     }
-    if (tokens > max_context_) {
+    const int initial_position = reset ? 0 : cache_position_;
+    if (initial_position < 0 ||
+        tokens > max_context_ - initial_position) {
         throw std::invalid_argument(
             "DeepSeek-V4 prefill exceeds max_context");
     }
     if (reset) {
         reset_cache(batch);
     } else if (cache_batch_ != batch ||
-               cache_position_ != 0 ||
                states_.size() != layers_.size()) {
         throw std::runtime_error(
             "DeepSeek-V4 prepared prefill cache is invalid");
@@ -1270,9 +1275,9 @@ array MlxDeepseekV4CausalLm::prefill_impl(
             Shape{batch, end});
         auto chunk = forward_chunk(
             chunk_ids,
-            start,
+            initial_position + start,
             full_logits);
-        cache_position_ = end;
+        cache_position_ = initial_position + end;
         if (full_logits) {
             outputs.push_back(
                 std::move(chunk));
@@ -1300,6 +1305,7 @@ array MlxDeepseekV4CausalLm::decode(
         throw std::runtime_error(
             "DeepSeek-V4 decode requires prefill first");
     }
+    stable_cache_tokens_.clear();
     return forward(token_ids, true);
 }
 
@@ -1361,7 +1367,8 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
         eos_token_ids,
     int chunk_size,
     const std::function<void(std::size_t, double)>&
-        prefill_callback) {
+        prefill_callback,
+    std::optional<std::size_t> stable_prefix_tokens) {
     if (prompt.empty()) {
         throw std::invalid_argument(
             "DeepSeek-V4 generation prompt cannot be empty");
@@ -1417,12 +1424,96 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
             Shape{vocab},
             mlx::core::int32),
         prompt_ids);
-    // State allocation/zeroing is request setup. Keep it in TTFT while
-    // materializing it before the model-evaluation prefill metric starts.
-    reset_cache(1);
-    for (const auto& state : states_) {
-        materialize_state(state);
+    const bool retain_stable_prefix =
+        stable_prefix_tokens.has_value() &&
+        *stable_prefix_tokens > 0 &&
+        *stable_prefix_tokens < prompt.size();
+    const std::size_t stable_count = retain_stable_prefix
+        ? *stable_prefix_tokens
+        : 0;
+    std::size_t reused_tokens = 0;
+    if (retain_stable_prefix &&
+        cache_batch_ == 1 &&
+        cache_position_ ==
+            static_cast<int>(stable_cache_tokens_.size()) &&
+        !stable_cache_tokens_.empty() &&
+        stable_cache_tokens_.size() <= stable_count &&
+        stable_cache_tokens_.size() <= prompt.size() &&
+        std::equal(
+            stable_cache_tokens_.begin(),
+            stable_cache_tokens_.end(),
+            prompt.begin())) {
+        reused_tokens = stable_cache_tokens_.size();
+    } else {
+        // State allocation/zeroing is request setup. Keep it in TTFT while
+        // materializing it before the model-evaluation prefill metric starts.
+        reset_cache(1);
+        for (const auto& state : states_) {
+            materialize_state(state);
+        }
     }
+
+    struct StableCacheRestore {
+        std::vector<MlxDeepseekV4LayerState>& target_states;
+        int& target_position;
+        int& target_batch;
+        std::vector<std::int64_t>& target_tokens;
+        std::optional<std::vector<MlxDeepseekV4LayerState>> saved_states;
+        std::vector<std::int64_t> saved_tokens;
+        int saved_position = 0;
+        int saved_batch = 0;
+
+        StableCacheRestore(
+            std::vector<MlxDeepseekV4LayerState>& states,
+            int& position,
+            int& batch,
+            std::vector<std::int64_t>& tokens)
+            : target_states(states),
+              target_position(position),
+              target_batch(batch),
+              target_tokens(tokens) {}
+
+        void capture(
+            const std::vector<std::int64_t>& prompt_tokens,
+            std::size_t count) {
+            saved_states.emplace();
+            saved_states->reserve(target_states.size());
+            for (const auto& state : target_states) {
+                saved_states->push_back(
+                    state.snapshot());
+            }
+            saved_tokens.assign(
+                prompt_tokens.begin(),
+                prompt_tokens.begin() +
+                    static_cast<std::ptrdiff_t>(count));
+            saved_position = static_cast<int>(count);
+            saved_batch = target_batch;
+        }
+
+        bool active() const noexcept {
+            return saved_states.has_value();
+        }
+
+        const std::vector<MlxDeepseekV4LayerState>&
+        states() const {
+            return *saved_states;
+        }
+
+        ~StableCacheRestore() {
+            if (!saved_states) return;
+            target_states = std::move(*saved_states);
+            target_position = saved_position;
+            target_batch = saved_batch;
+            target_tokens = std::move(saved_tokens);
+        }
+    } stable_restore(
+        states_,
+        cache_position_,
+        cache_batch_,
+        stable_cache_tokens_);
+
+    const std::size_t evaluated_prompt_tokens =
+        prompt.size() - reused_tokens;
     double prefill_evaluation_ms = 0.0;
     const bool profile_prefill =
         detail::component_profile_requested();
@@ -1438,11 +1529,49 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
             prefill_callback
                 ? &prefill_evaluation_ms
                 : nullptr);
-        auto value = prefill_impl(
-            prompt_ids,
-            chunk_size,
-            false,
-            false);
+        const auto prefill_range = [&](std::size_t begin, std::size_t end) {
+            auto ids = mlx::core::slice(
+                prompt_ids,
+                Shape{0, static_cast<int>(begin)},
+                Shape{1, static_cast<int>(end)});
+            return prefill_impl(
+                ids,
+                chunk_size,
+                false,
+                false);
+        };
+
+        std::optional<array> stable_logits;
+        array value = [&]() {
+            if (!retain_stable_prefix) {
+                return prefill_range(0, prompt.size());
+            }
+            if (reused_tokens < stable_count) {
+                stable_logits = prefill_range(
+                    reused_tokens,
+                    stable_count);
+            }
+            for (const auto& state : states_) {
+                materialize_state(state);
+            }
+            stable_restore.capture(prompt, stable_count);
+            // Materialize every copy before evaluating the suffix. Otherwise
+            // the lazy copy graph would still read arrays after the suffix or
+            // decode kernels had modified them in place.
+            for (const auto& state : stable_restore.states()) {
+                materialize_state(state);
+            }
+            if (stable_count < prompt.size()) {
+                return prefill_range(
+                    stable_count,
+                    prompt.size());
+            }
+            if (!stable_logits) {
+                throw std::runtime_error(
+                    "DeepSeek-V4 stable cache has no logits for sampling");
+            }
+            return std::move(*stable_logits);
+        }();
         if (prefill_callback) {
             // DeepSeek evaluates layer/state chunks eagerly. Their wrapped
             // eval calls accumulate above; this final eval adds only the
@@ -1461,7 +1590,8 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
             prefill_component_profile.evaluated_ms();
         std::cout
             << "component_profile phase=prefill"
-            << " tokens=" << prompt_count
+            << " tokens=" << evaluated_prompt_tokens
+            << " reused_tokens=" << reused_tokens
             << " wall_ms=" << std::fixed
             << std::setprecision(3) << wall_ms
             << " evaluated_ms=" << evaluated_ms
@@ -1487,7 +1617,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
     }
     if (prefill_callback) {
         prefill_callback(
-            prompt.size(),
+            evaluated_prompt_tokens,
             prefill_evaluation_ms);
     }
     MlxSampler sampler(sampling);
@@ -1584,8 +1714,13 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
             report_components();
             break;
         }
+        auto decoded = forward_chunk(
+            token_ids,
+            cache_position_,
+            true);
+        ++cache_position_;
         logits = last_token_logits(
-            decode(token_ids),
+            decoded,
             vocab);
         report_components();
     }

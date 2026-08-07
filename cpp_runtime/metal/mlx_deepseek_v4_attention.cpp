@@ -186,6 +186,48 @@ constexpr const char* kRmsPartialAdjacentRopeSource = R"METAL(
     }
 )METAL";
 
+constexpr const char* kKvFp8SimSource = R"METAL(
+    uint group = threadgroup_position_in_grid.x;
+    uint lane = thread_index_in_threadgroup;
+    constexpr uint GROUP_SIZE = 64u;
+    constexpr uint PREFIX_GROUPS = uint(PREFIX / GROUP_SIZE);
+    uint row = group / PREFIX_GROUPS;
+    uint block = group - row * PREFIX_GROUPS;
+    uint column = block * GROUP_SIZE + lane;
+    uint index = row * uint(DIM) + column;
+
+    threadgroup float maxima[GROUP_SIZE];
+    float value = float(x[index]);
+    maxima[lane] = abs(value);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = GROUP_SIZE / 2u; stride != 0u; stride >>= 1u) {
+        if (lane < stride) {
+            maxima[lane] = max(maxima[lane], maxima[lane + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float amax = max(maxima[0], 1.0e-4f);
+    float raw_scale = amax / 448.0f;
+    uint bits = as_type<uint>(raw_scale);
+    uint exponent = (bits >> 23u) & 0xffu;
+    bool has_mantissa = (bits & 0x7fffffu) != 0u;
+    float scale = as_type<float>(
+        (exponent + uint(has_mantissa)) << 23u);
+    float normalized = clamp(value / scale, -448.0f, 448.0f);
+    float magnitude = abs(normalized);
+    float quantized;
+    if (magnitude < 0x1p-6f) {
+        quantized = rint(magnitude * 512.0f) / 512.0f;
+    } else {
+        float quant_exponent = floor(log2(magnitude));
+        float step = exp2(quant_exponent - 3.0f);
+        quantized = min(rint(magnitude / step) * step, 448.0f);
+    }
+    y[row * uint(PREFIX) + column] =
+        T(copysign(quantized * scale, normalized));
+)METAL";
+
 const mlx::core::fast::CustomKernelFunction&
 hadamard_kernel() {
     static const auto kernel = [] {
@@ -232,6 +274,24 @@ rms_partial_adjacent_rope_kernel() {
             {"x", "cos_values", "sin_values", "weights", "params"},
             {"y"},
             kRmsPartialAdjacentRopeSource,
+            "",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+kv_fp8_sim_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_dsv4_kv_fp8_sim",
+            {"x"},
+            {"y"},
+            kKvFp8SimSource,
             "",
             true,
             false,
@@ -456,6 +516,60 @@ array rms_replace_last_rope(
         false,
         {});
     return std::move(outputs.front());
+}
+
+array kv_fp8_sim_prefix(
+    const array& input,
+    int rotary) {
+    auto source = floating_contiguous(input);
+    // V4F's released QAT graph fixes this operation to D=512/RoPE=64.
+    // Keep synthetic/smaller compatibility configurations unchanged.
+    if (source.shape(-1) != 512 || rotary != 64) {
+        return source;
+    }
+    if ((source.ndim() != 3 && source.ndim() != 4) ||
+        rotary <= 0 || rotary >= source.shape(-1)) {
+        throw std::invalid_argument(
+            "invalid DeepSeek-V4 KV FP8 simulation input");
+    }
+    const int dimension = source.shape(-1);
+    const int prefix = dimension - rotary;
+    if (prefix % 64 != 0) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 KV FP8 prefix must be 64-aligned");
+    }
+    const int rows = checked_int(
+        source.size() / static_cast<std::size_t>(dimension),
+        "DeepSeek-V4 KV FP8 row count");
+    const int groups = checked_product(
+        {rows, prefix / 64},
+        "DeepSeek-V4 KV FP8 group count");
+    Shape prefix_shape = source.shape();
+    prefix_shape.back() = prefix;
+    auto outputs = kv_fp8_sim_kernel()(
+        {source},
+        {prefix_shape},
+        {source.dtype()},
+        {groups * 64, 1, 1},
+        {64, 1, 1},
+        {
+            {"T", source.dtype()},
+            {"DIM", dimension},
+            {"PREFIX", prefix},
+        },
+        std::nullopt,
+        false,
+        {});
+    return mlx::core::concatenate(
+        {
+            std::move(outputs.front()),
+            slice_axis(
+                source,
+                static_cast<int>(source.ndim()) - 1,
+                prefix,
+                dimension),
+        },
+        static_cast<int>(source.ndim()) - 1);
 }
 
 array load_float_array(
@@ -949,6 +1063,33 @@ MlxDeepseekV4PoolState::MlxDeepseekV4PoolState(
       prev_gate_(std::move(prev_gate)) {}
 
 MlxDeepseekV4PoolState
+MlxDeepseekV4PoolState::snapshot() const {
+    const auto copy_optional = [](
+        const std::optional<array>& value)
+        -> std::optional<array> {
+        return value
+            ? std::optional<array>(
+                  mlx::core::copy(*value))
+            : std::nullopt;
+    };
+    MlxDeepseekV4PoolState result(
+        ratio_,
+        head_dim_,
+        overlap_,
+        batch_,
+        capacity_,
+        dtype_,
+        pool_,
+        mlx::core::copy(state_kv_),
+        mlx::core::copy(state_gate_),
+        copy_optional(prev_kv_),
+        copy_optional(prev_gate_));
+    result.pool_len_ = pool_len_;
+    result.remainder_ = remainder_;
+    return result;
+}
+
+MlxDeepseekV4PoolState
 MlxDeepseekV4PoolState::allocate(
     int ratio,
     int head_dim,
@@ -1215,6 +1356,22 @@ MlxDeepseekV4LayerState::MlxDeepseekV4LayerState(
     : local_(std::move(local)),
       main_(std::move(main)),
       indexer_(std::move(indexer)) {}
+
+MlxDeepseekV4LayerState
+MlxDeepseekV4LayerState::snapshot() const {
+    MlxDeepseekV4LayerState result(
+        mlx::core::copy(local_),
+        main_
+            ? std::optional<MlxDeepseekV4PoolState>(
+                  main_->snapshot())
+            : std::nullopt,
+        indexer_
+            ? std::optional<MlxDeepseekV4PoolState>(
+                  indexer_->snapshot())
+            : std::nullopt);
+    result.position_ = position_;
+    return result;
+}
 
 array MlxDeepseekV4LayerState::local_positions() const {
     const int window = local_.shape(1);
@@ -1605,6 +1762,10 @@ struct MlxDeepseekV4Attention::Impl {
             query = signed_hadamard(
                 query,
                 dimension);
+            query = dsv4_fp4_sim(
+                mlx::core::astype(
+                    query,
+                    mlx::core::float16));
         }
         return query;
     }
@@ -2041,6 +2202,11 @@ array MlxDeepseekV4Attention::operator()(
         impl_->components.kv_norm,
         true,
         impl_->rms_params);
+    // The released V4F graph was trained with dynamic MXFP8 simulation on
+    // the non-RoPE KV channels (64 values per UE8M0-scaled group).  Preserve
+    // the RoPE channels verbatim and use this same fake-quantized KV for both
+    // prefill and incremental cache writes.
+    kv = kv_fp8_sim_prefix(kv, rotary);
     if (detail::component_profile_active()) {
         detail::profile_eval(
             profile_component("q_rms_rope"),

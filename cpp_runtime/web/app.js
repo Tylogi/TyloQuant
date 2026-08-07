@@ -26,8 +26,28 @@
     presencePenalty: 0,
     frequencyPenalty: 0,
     enableThinking: true,
+    reasoningEffort: "",
     excludeReasoningFromContext: false,
     preset: "balanced",
+    samplingCustomized: false,
+  };
+
+  const legacySamplingDefaults = {
+    temperature: 0.7,
+    topP: 0.8,
+    topK: 20,
+    repetitionPenalty: 1,
+    presencePenalty: 0,
+    frequencyPenalty: 0,
+  };
+
+  const deepSeekV4SamplingDefaults = {
+    temperature: 1,
+    topP: 0.8,
+    topK: 20,
+    repetitionPenalty: 1.05,
+    presencePenalty: 1.35,
+    frequencyPenalty: 0,
   };
 
   const presets = {
@@ -73,6 +93,7 @@
     followOutput: true,
     reasoningOpenState: new WeakMap(),
     pollTimer: 0,
+    samplingDefaults: null,
   };
 
   const refs = {};
@@ -85,7 +106,8 @@
       "connection-pill", "active-request-count", "model-select",
       "top-ttft", "top-prefill-tps", "top-tps", "export-chat", "open-settings",
       "chat-view", "monitor-view", "message-scroller", "message-list",
-      "composer-form", "message-input", "thinking-toggle", "composer-hint",
+      "composer-form", "message-input", "thinking-toggle",
+      "reasoning-effort-control", "reasoning-effort-select", "composer-hint",
       "send-button", "refresh-status", "monitor-updated",
       "metric-prefill-tps", "metric-decode-tps", "metric-ttft",
       "metric-requests", "metric-active",
@@ -159,6 +181,15 @@
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
       if (saved.settings && typeof saved.settings === "object") {
         state.settings = { ...defaultSettings, ...saved.settings };
+        if (!["", "high", "max"].includes(state.settings.reasoningEffort)) {
+          state.settings.reasoningEffort = "";
+        }
+        if (typeof saved.settings.samplingCustomized !== "boolean") {
+          state.settings.samplingCustomized = !samplingMatches(
+            state.settings,
+            legacySamplingDefaults
+          );
+        }
         if (
           location.pathname.startsWith("/admin") &&
           defaultEndpoint !== LEGACY_LOCAL_ENDPOINT &&
@@ -208,6 +239,42 @@
     } catch {
       showToast("浏览器存储空间不足，历史记录未保存。", true);
     }
+  }
+
+  function samplingMatches(settings, defaults) {
+    return settings.temperature === defaults.temperature &&
+      settings.topP === defaults.topP &&
+      settings.topK === defaults.topK &&
+      settings.repetitionPenalty === defaults.repetitionPenalty &&
+      settings.presencePenalty === defaults.presencePenalty &&
+      settings.frequencyPenalty === defaults.frequencyPenalty;
+  }
+
+  function normalizeSamplingDefaults(value) {
+    if (!value || typeof value !== "object") return null;
+    const defaults = {
+      temperature: Number(value.temperature),
+      topP: Number(value.top_p),
+      topK: Number(value.top_k),
+      repetitionPenalty: Number(value.repetition_penalty),
+      presencePenalty: Number(value.presence_penalty),
+      frequencyPenalty: Number(value.frequency_penalty),
+    };
+    return Object.values(defaults).every(Number.isFinite) ? defaults : null;
+  }
+
+  function applyServerSamplingDefaults(status) {
+    const defaults = normalizeSamplingDefaults(status?.sampling_defaults) ||
+      (status?.model_type === "deepseek_v4"
+        ? deepSeekV4SamplingDefaults
+        : null);
+    if (!defaults) return;
+    state.samplingDefaults = defaults;
+    if (state.settings.samplingCustomized ||
+        samplingMatches(state.settings, defaults)) return;
+    Object.assign(state.settings, defaults);
+    state.settings.preset = "custom";
+    persistState();
   }
 
   function activeConversation() {
@@ -1013,6 +1080,7 @@
     refs["new-chat"].disabled = generating;
     refs["model-select"].disabled = generating;
     refs["thinking-toggle"].disabled = generating;
+    updateThinkingControls();
   }
 
   function stopGeneration() {
@@ -1046,6 +1114,20 @@
   }
 
   function generationRequestBody(messages) {
+    const chatTemplateKwargs = {
+      enable_thinking: state.settings.enableThinking,
+    };
+    const reasoningCapability =
+      state.status?.chat_template_capabilities?.reasoning_effort;
+    const supportedReasoningEfforts = Array.isArray(reasoningCapability?.values)
+      ? reasoningCapability.values
+      : [];
+    if (
+      state.settings.enableThinking &&
+      supportedReasoningEfforts.includes(state.settings.reasoningEffort)
+    ) {
+      chatTemplateKwargs.reasoning_effort = state.settings.reasoningEffort;
+    }
     return {
       model: state.settings.model || state.models[0] || "mfq",
       messages,
@@ -1059,9 +1141,7 @@
       stream: true,
       stream_options: { include_usage: true },
       reasoning_format: "auto",
-      chat_template_kwargs: {
-        enable_thinking: state.settings.enableThinking,
-      },
+      chat_template_kwargs: chatTemplateKwargs,
     };
   }
 
@@ -1335,7 +1415,10 @@
     return {
       status: health?.status || "ok",
       model: health?.model || state.settings.model || state.models[0] || "mfq",
-      model_type: "--",
+      model_type: health?.model_type || "--",
+      sampling_defaults: health?.sampling_defaults || null,
+      chat_template_capabilities:
+        health?.chat_template_capabilities || null,
       max_context: null,
       uptime_seconds: null,
       active_requests: state.generating ? 1 : 0,
@@ -1377,6 +1460,7 @@
         payload = mergeFallbackStatus(health);
       }
       state.status = payload;
+      applyServerSamplingDefaults(payload);
       setConnection(
         true,
         payload.reloading
@@ -1419,6 +1503,7 @@
     refs["metric-requests"].textContent = formatNumber(status.total_requests || 0);
     refs["metric-active"].textContent = `${formatNumber(active)} active`;
     refs["metric-tokens"].textContent = formatNumber(promptTokens + completionTokens);
+    updateThinkingControls();
     refs["runtime-model"].textContent = status.model || state.settings.model || "--";
     refs["runtime-type"].textContent = status.model_type || "--";
     refs["runtime-context"].textContent = status.max_context
@@ -1469,6 +1554,38 @@
       ? `${formatNumber(decodeTps, 1)} tok/s`
       : "-- tok/s";
     drawChart();
+  }
+
+  function updateThinkingControls() {
+    const capability =
+      state.status?.chat_template_capabilities?.reasoning_effort;
+    const capabilityKnown = state.status !== null;
+    const advertisedValues = Array.isArray(capability?.values)
+      ? capability.values.filter((value) => value === "high" || value === "max")
+      : [];
+    const supported = Boolean(capability?.supported) && advertisedValues.length > 0;
+    const select = refs["reasoning-effort-select"];
+    const control = refs["reasoning-effort-control"];
+    if (!select || !control) return;
+
+    for (const option of select.options) {
+      if (!option.value) continue;
+      const available = advertisedValues.includes(option.value);
+      option.hidden = !available;
+      option.disabled = !available;
+    }
+    if (
+      capabilityKnown &&
+      state.settings.reasoningEffort &&
+      !advertisedValues.includes(state.settings.reasoningEffort)
+    ) {
+      state.settings.reasoningEffort = "";
+      persistState();
+    }
+    select.value = state.settings.reasoningEffort;
+    control.hidden = !supported || !state.settings.enableThinking;
+    select.disabled =
+      state.generating || !state.settings.enableThinking || !supported;
   }
 
   function drawChart() {
@@ -1652,7 +1769,7 @@
   function saveSettings() {
     const oldEndpoint = state.settings.endpoint;
     const activePreset = refs.presetButtons.find((button) => button.classList.contains("is-active"));
-    state.settings = {
+    const nextSettings = {
       ...state.settings,
       endpoint: normalizeEndpoint(refs["setting-endpoint"].value),
       model: refs["model-select"].value || state.settings.model,
@@ -1668,6 +1785,10 @@
       frequencyPenalty: numberInput(refs["setting-frequency"], 0, -2, 2),
       preset: activePreset?.dataset.preset || "custom",
     };
+    nextSettings.samplingCustomized = state.samplingDefaults
+      ? !samplingMatches(nextSettings, state.samplingDefaults)
+      : true;
+    state.settings = nextSettings;
     state.apiKey = refs["setting-api-key"].value.trim();
     persistState();
     closeSettings();
@@ -1741,6 +1862,10 @@
   function resetSettingsForm() {
     const endpoint = state.settings.endpoint || defaultEndpoint;
     state.settings = { ...defaultSettings, endpoint };
+    if (state.samplingDefaults) {
+      Object.assign(state.settings, state.samplingDefaults);
+      state.settings.preset = "custom";
+    }
     populateSettings();
   }
 
@@ -1805,6 +1930,12 @@
     refs["thinking-toggle"].addEventListener("click", () => {
       state.settings.enableThinking = !state.settings.enableThinking;
       refs["thinking-toggle"].setAttribute("aria-pressed", String(state.settings.enableThinking));
+      updateThinkingControls();
+      persistState();
+    });
+    refs["reasoning-effort-select"].addEventListener("change", () => {
+      state.settings.reasoningEffort =
+        refs["reasoning-effort-select"].value;
       persistState();
     });
     refs["message-input"].addEventListener("input", resizeComposer);
@@ -1848,6 +1979,7 @@
     renderConversationList();
     renderMessages({ scroll: false });
     refs["thinking-toggle"].setAttribute("aria-pressed", String(state.settings.enableThinking));
+    updateThinkingControls();
     refs["setting-endpoint"].value = state.settings.endpoint;
     resizeComposer();
     updateMonitor();

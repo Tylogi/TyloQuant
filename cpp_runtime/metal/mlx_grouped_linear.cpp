@@ -1545,6 +1545,117 @@ mlx::core::fast::CustomKernelFunction single_row_mxfp8_kernel(
     return kernel;
 }
 
+constexpr const char* kSingleRowMxfp8PairSwiglu = R"METAL(
+    constexpr uint SIMD_GROUPS = 4u;
+    constexpr uint K_LANES = 16u;
+    constexpr uint ROWS_PER_TG = SIMD_GROUPS;
+    constexpr uint BLOCK = 128u;
+    constexpr uint BLOCKS = uint(K) / BLOCK;
+
+    threadgroup half fp8_lut[256];
+    uint local_thread = thread_index_in_threadgroup;
+    fp8_lut[local_thread] = as_type<half>(
+        mfq_grouped_mx_fp8_half_lut[local_thread]);
+    fp8_lut[local_thread + 128u] = as_type<half>(
+        mfq_grouped_mx_fp8_half_lut[local_thread + 128u]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint lane = thread_index_in_simdgroup;
+    uint projection = lane >> 4u;
+    uint k_lane = lane & (K_LANES - 1u);
+    uint output_index =
+        threadgroup_position_in_grid.x * ROWS_PER_TG
+        + simdgroup_index_in_threadgroup;
+    uint output = min(output_index, uint(OUT) - 1u);
+    uint value_base = output * uint(K);
+    uint scale_base = (output / BLOCK) * BLOCKS;
+    device const uchar* values = projection == 0u
+        ? mx_values_0
+        : mx_values_1;
+    float accumulator = 0.0f;
+
+    // Gate and Up occupy separate SIMD half-groups. Both halves visit the
+    // same 128-column block at once: the 16 lanes in each half read one
+    // contiguous 128-byte MXFP8 row segment instead of maintaining 16
+    // strided weight streams. The activation is tiny and remains cache-hot.
+    for (uint block = 0u; block < BLOCKS; ++block) {
+        uint column_base = block * BLOCK;
+        uint column = column_base + k_lane * 8u;
+        half4 activation0 = *(device const half4*)(x + column);
+        half4 activation1 = *(device const half4*)(x + column + 4u);
+        uchar4 code0 = *(device const uchar4*)(
+            values + value_base + column);
+        uchar4 code1 = *(device const uchar4*)(
+            values + value_base + column + 4u);
+        float4 weight0 = float4(
+            float(fp8_lut[uint(code0.x)]),
+            float(fp8_lut[uint(code0.y)]),
+            float(fp8_lut[uint(code0.z)]),
+            float(fp8_lut[uint(code0.w)]));
+        float4 weight1 = float4(
+            float(fp8_lut[uint(code1.x)]),
+            float(fp8_lut[uint(code1.y)]),
+            float(fp8_lut[uint(code1.z)]),
+            float(fp8_lut[uint(code1.w)]));
+        float block_dot =
+            dot(float4(activation0), weight0)
+            + dot(float4(activation1), weight1);
+        uchar scale = projection == 0u
+            ? mx_scales_0[scale_base + block]
+            : mx_scales_1[scale_base + block];
+        accumulator = fma(
+            mfq_grouped_mx_e8m0(scale),
+            block_dot,
+            accumulator);
+    }
+
+    // Each 16-lane half is an independent reduction tree. Only lanes 0 and
+    // 16 are consumed, so shuffle-down traffic from inactive upper nodes
+    // cannot cross-contaminate the two projection sums.
+    accumulator += simd_shuffle_down(accumulator, 8);
+    accumulator += simd_shuffle_down(accumulator, 4);
+    accumulator += simd_shuffle_down(accumulator, 2);
+    accumulator += simd_shuffle_down(accumulator, 1);
+    float gate = simd_shuffle(accumulator, 0u);
+    float up = simd_shuffle(accumulator, 16u);
+    if (lane == 0u && output_index < uint(OUT)) {
+        // Match the unfused graph's MXFP8 GEMV -> FP16 boundary exactly.
+        gate = float(half(gate));
+        up = float(half(up));
+        if (params[0] > 0.0f) {
+            gate = min(gate, params[0]);
+            up = clamp(up, -params[0], params[0]);
+        }
+        float activated = gate / (1.0f + exp(-gate));
+        y[output_index] = half(activated * up);
+    }
+)METAL";
+
+const mlx::core::fast::CustomKernelFunction&
+single_row_mxfp8_pair_swiglu_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_single_row_mxfp8_pair_swiglu",
+            {
+                "mx_values_0",
+                "mx_scales_0",
+                "mx_values_1",
+                "mx_scales_1",
+                "x",
+                "params",
+            },
+            {"y"},
+            kSingleRowMxfp8PairSwiglu,
+            kGroupedHeader,
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
 void validate_direct_array(
     const array& value,
     Dtype dtype,
@@ -1685,10 +1796,19 @@ struct MlxGroupedLinear::Impl {
     }
 
     bool supports_single_row_swiglu() const noexcept {
-        return has_single_row_nint_fast_path()
-            && direct_layouts.size() == 2
-            && output_sizes.size() == 2
-            && output_sizes[0] == output_sizes[1];
+        if (direct_layouts.size() != 2
+            || output_sizes.size() != 2
+            || output_sizes[0] != output_sizes[1]) {
+            return false;
+        }
+        const bool nint_pair = has_single_row_nint_fast_path();
+        const bool mxfp8_pair =
+            has_single_row_mxfp8_fast_path()
+            && direct_layouts[0].family == kFamilyMx
+            && direct_layouts[0].bits == 8
+            && direct_layouts[1].family == kFamilyMx
+            && direct_layouts[1].bits == 8;
+        return nint_pair || mxfp8_pair;
     }
 };
 
@@ -2269,7 +2389,7 @@ array MlxGroupedLinear::single_row_swiglu(
     if (!supports_single_row_swiglu(input)) {
         throw MlxGroupedLinearUnsupported(
             "grouped SwiGLU requires one FP16 row and two "
-            "equal-width NINT projections");
+            "equal-width NINT or MXFP8 projections");
     }
     if (!std::isfinite(limit) || limit < 0.0f) {
         throw std::invalid_argument(
@@ -2286,9 +2406,41 @@ array MlxGroupedLinear::single_row_swiglu(
             input,
             Shape{1, impl_->input_size}));
     const array params({limit}, mlx::core::float32);
+    const bool mxfp8_pair =
+        impl_->has_single_row_mxfp8_fast_path()
+        && impl_->direct_layouts[0].family == kFamilyMx
+        && impl_->direct_layouts[0].bits == 8
+        && impl_->direct_layouts[1].family == kFamilyMx
+        && impl_->direct_layouts[1].bits == 8;
     auto inputs = impl_->direct_weight_inputs;
     inputs.push_back(source);
     inputs.push_back(params);
+
+    if (mxfp8_pair) {
+        const auto workgroups =
+            (static_cast<std::size_t>(impl_->output_sizes[0]) + 3) / 4;
+        const auto grid = workgroups * 128;
+        auto result = single_row_mxfp8_pair_swiglu_kernel()(
+            inputs,
+            {Shape{1, impl_->output_sizes[0]}},
+            {source.dtype()},
+            {
+                checked_int(grid, "MXFP8 SwiGLU Metal grid"),
+                1,
+                1,
+            },
+            {128, 1, 1},
+            {
+                {"K", impl_->input_size},
+                {"OUT", impl_->output_sizes[0]},
+            },
+            std::nullopt,
+            false,
+            {}).front();
+        return mlx::core::reshape(
+            std::move(result),
+            std::move(output_shape));
+    }
 
     std::vector<
         std::pair<

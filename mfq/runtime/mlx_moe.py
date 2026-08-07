@@ -14,8 +14,8 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
         "MFQ's MLX runtime requires MLX; install with `pip install -e '.[metal]'`"
     ) from exc
 
-from mfq.formats.tpq import CccpPqTensor
 from mfq.formats.moe import NintMoeTensor
+from mfq.formats.mx import MXFP4_DTYPE, MxTensor
 from mfq.formats.nepq import NepqTensor
 from mfq.formats.nint8_zero import Nint8ZeroTensor
 from mfq.formats.npq0_l import Npq0LTensor
@@ -23,12 +23,7 @@ from mfq.formats.npq0_s import Npq0STensor
 from mfq.formats.nvq import NvqJscTensor, NvqTensor
 from mfq.formats.nvq1_l import Nvq1LTensor
 from mfq.formats.nvq1_s import Nvq1STensor
-from mfq.kernels.metal.tpq import (
-    MetalCccpMoeWeight,
-    MetalCccpPqWeight,
-    cccp_grouped_moe_matmul,
-    cccp_pq_routed_matmul,
-)
+from mfq.formats.tpq import CccpPqTensor
 from mfq.kernels.metal.kimi_k3 import situ_split
 from mfq.kernels.metal.moe import (
     MetalMoeWeight,
@@ -40,10 +35,17 @@ from mfq.kernels.metal.moe_ops import (
     swiglu_split,
     weighted_reduce,
 )
+from mfq.kernels.metal.mx import MetalMxWeight, mx_matmul
 from mfq.kernels.metal.nint import MetalNintWeight, nint_matmul
 from mfq.kernels.metal.nint8_zero import (
     MetalNint8ZeroWeight,
     nint8_zero_matmul,
+)
+from mfq.kernels.metal.tpq import (
+    MetalCccpMoeWeight,
+    MetalCccpPqWeight,
+    cccp_grouped_moe_matmul,
+    cccp_pq_routed_matmul,
 )
 from mfq.kernels.metal.vq import MetalVqWeight, vq_matmul
 from mfq.quantize.nint_quant import NintTensor
@@ -62,7 +64,13 @@ _VQ_TYPES = (
 @dataclass(frozen=True)
 class _MlxMoePool:
     expert_ids: mx.array
-    weight: MetalNintWeight | MetalNint8ZeroWeight | MetalVqWeight | MetalCccpPqWeight
+    weight: (
+        MetalNintWeight
+        | MetalNint8ZeroWeight
+        | MetalVqWeight
+        | MetalCccpPqWeight
+        | MetalMxWeight
+    )
     experts: int
     out_per_expert: int
 
@@ -83,6 +91,8 @@ class _MlxMoePool:
             value = nint_matmul(self.weight, x)
         elif isinstance(self.weight, MetalNint8ZeroWeight):
             value = nint8_zero_matmul(self.weight, x)
+        elif isinstance(self.weight, MetalMxWeight):
+            value = mx_matmul(self.weight, x)
         else:
             value = vq_matmul(self.weight, x)
         return value.reshape((*x.shape[:-1], self.experts, self.out_per_expert))
@@ -120,6 +130,7 @@ class MlxRoutedLinear:
             if isinstance(source, NintTensor):
                 weight: (
                     MetalNintWeight | MetalNint8ZeroWeight | MetalVqWeight | MetalCccpPqWeight
+                    | MetalMxWeight
                 ) = MetalNintWeight.from_tensor(source)
             elif isinstance(source, Nint8ZeroTensor):
                 weight = MetalNint8ZeroWeight.from_tensor(source)
@@ -127,9 +138,11 @@ class MlxRoutedLinear:
                 weight = MetalVqWeight.from_tensor(source)
             elif isinstance(source, CccpPqTensor):
                 weight = MetalCccpPqWeight.from_tensor(source)
+            elif isinstance(source, MxTensor) and source.dtype == MXFP4_DTYPE:
+                weight = MetalMxWeight.from_tensor(source)
             else:
                 raise TypeError(
-                    "Metal NINTM supports NINT/NVQ/NPQ/NEPQ/CCCP cohorts; "
+                    "Metal NINTM supports NINT/NVQ/NPQ/NEPQ/CCCP/MXFP4 cohorts; "
                     f"received {type(source).__name__}"
                 )
             expert_ids = np.ascontiguousarray(pool.expert_ids, dtype=np.int32)

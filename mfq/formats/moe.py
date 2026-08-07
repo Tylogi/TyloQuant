@@ -8,6 +8,7 @@ from typing import TypeAlias
 import numpy as np
 
 from mfq.formats.tpq import TpqPqTensor
+from mfq.formats.mx import MxTensor
 from mfq.formats.nepq import NepqTensor
 from mfq.formats.nint8_zero import Nint8ZeroTensor
 from mfq.formats.npq0_l import Npq0LTensor
@@ -28,6 +29,7 @@ ExpertPoolTensor: TypeAlias = (
     | Nvq1STensor
     | NepqTensor
     | TpqPqTensor
+    | MxTensor
 )
 
 
@@ -36,6 +38,12 @@ def expert_tensor_family(tensor: ExpertPoolTensor) -> str:
 
     if isinstance(tensor, Nint8ZeroTensor):
         return "NINT8-0"
+    if isinstance(tensor, MxTensor):
+        if tensor.dtype != "MXFP4":
+            raise ValueError(
+                f"NINTM supports native MXFP4 expert pools, got {tensor.dtype}"
+            )
+        return tensor.dtype
     if isinstance(tensor, NintTensor):
         return tensor.spec.profile_label
     if isinstance(tensor, NepqTensor):
@@ -110,6 +118,9 @@ class NintMoeTensor:
             expert_tensor_family(tensor)
             if isinstance(tensor, NepqTensor):
                 expected_shape = (expert_ids.size, out_per_expert, neuron_len)
+                valid = tuple(tensor.shape) == expected_shape
+            elif isinstance(tensor, MxTensor):
+                expected_shape = (expert_ids.size * out_per_expert, neuron_len)
                 valid = tuple(tensor.shape) == expected_shape
             else:
                 expected_shape = (expert_ids.size * out_per_expert, neuron_len)

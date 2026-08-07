@@ -267,8 +267,9 @@ void test_fused_dense_router_topk() {
         "float32 input unexpectedly accepted fused dense router");
 
     auto logits = mlx::core::matmul(
-        input,
-        mlx::core::transpose(weight));
+        mlx::core::astype(input, mlx::core::float32),
+        mlx::core::transpose(
+            mlx::core::astype(weight, mlx::core::float32)));
     auto reference = mfq::metal::moe_topk(
         logits,
         routes,
