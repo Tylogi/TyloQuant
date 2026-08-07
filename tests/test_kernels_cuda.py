@@ -1276,7 +1276,7 @@ def test_nint_embedding_lookup_non4_bits_matches_dequant_rows(spec):
     torch.testing.assert_close(y, w_ref[ids], atol=0, rtol=0)
 
 
-def test_sample_greedy_cuda_f32_f16():
+def test_sample_greedy_cuda_f32_f16_bf16():
     logits = torch.tensor(
         [[1.0, 5.0, 5.0, -1.0], [0.0, -2.0, 3.0, 1.0]],
         device=DEV,
@@ -1285,6 +1285,7 @@ def test_sample_greedy_cuda_f32_f16():
     ref = torch.tensor([1, 2], device=DEV, dtype=torch.int64)
     torch.testing.assert_close(sample_greedy(logits), ref, atol=0, rtol=0)
     torch.testing.assert_close(sample_greedy(logits.to(torch.float16)), ref, atol=0, rtol=0)
+    torch.testing.assert_close(sample_greedy(logits.to(torch.bfloat16)), ref, atol=0, rtol=0)
 
 
 def test_sample_softmax_cuda_matches_reference():

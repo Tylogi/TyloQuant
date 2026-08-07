@@ -123,9 +123,10 @@ struct MlxGroupedVqMmqPlan {
 
 // Native packed NINTM routed-expert weight.
 //
-// NINT1-NINT8 and NINT8-0 cohorts are decoded directly by one heterogeneous
-// Metal dispatch.  Expert IDs retain the global ordering from the NINTM
-// container while each descriptor points at its cohort-local packed rows.
+// NINT1-NINT8, NINT8-0, VQ-family, and native MXFP4 cohorts are decoded
+// directly by one heterogeneous Metal dispatch. Expert IDs retain the global
+// ordering from the NINTM container while each descriptor points at its
+// cohort-local packed rows.
 class MlxNintMoeWeight {
 public:
     static MlxNintMoeWeight from_blob(
@@ -174,6 +175,11 @@ private:
     explicit MlxNintMoeWeight(std::shared_ptr<const Impl> impl);
 
     mlx::core::array routed_matmul_impl(
+        const mlx::core::array& input,
+        const mlx::core::array& expert_ids,
+        bool fused_swiglu,
+        float swiglu_limit) const;
+    mlx::core::array routed_bf16_reference(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
         bool fused_swiglu,

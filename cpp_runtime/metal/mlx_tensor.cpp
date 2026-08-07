@@ -1,4 +1,5 @@
 #include "mlx_tensor.h"
+#include "mlx_reference.h"
 
 #include <mlx/allocator.h>
 
@@ -8,6 +9,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 namespace mfq::metal {
@@ -16,6 +18,56 @@ namespace {
 using mlx::core::Dtype;
 using mlx::core::Shape;
 using mlx::core::array;
+
+template <typename Variant>
+std::optional<array> unpack_quantized_weight(
+    const Variant& weight,
+    int output_size) {
+    const auto row_ids = mlx::core::arange(
+        0,
+        output_size,
+        1,
+        mlx::core::int32);
+    return std::visit(
+        [&](const auto& value) -> std::optional<array> {
+            using Weight = std::decay_t<decltype(value)>;
+            if constexpr (
+                std::is_same_v<Weight, MlxNintWeight>
+                || std::is_same_v<Weight, MlxNint8ZeroWeight>
+                || std::is_same_v<Weight, MlxVqWeight>
+                || std::is_same_v<Weight, MlxCccpInt4Weight>
+            ) {
+                return mlx::core::astype(
+                    value.embedding(
+                        row_ids,
+                        mlx::core::float32),
+                    mlx::core::float16);
+            } else if constexpr (
+                std::is_same_v<Weight, MlxCccpPqWeight>
+            ) {
+                return mlx::core::astype(
+                    value.dequantize(
+                        mlx::core::float32),
+                    mlx::core::float16);
+            } else {
+                return std::nullopt;
+            }
+        },
+        weight);
+}
+
+array dense_reference_matmul(
+    const array& dense,
+    const array& input) {
+    auto source = input.dtype() == mlx::core::float16
+        ? input
+        : mlx::core::astype(
+              input,
+              mlx::core::float16);
+    return mlx::core::matmul(
+        source,
+        mlx::core::transpose(dense));
+}
 
 class DenseCursor {
 public:
@@ -208,6 +260,12 @@ array MlxLinear::operator()(const array& input) const {
     if (input.ndim() == 0 || input.shape(-1) != input_size_) {
         throw std::runtime_error("linear input width mismatch");
     }
+    if (mlx_reference_enabled()) {
+        if (auto dense = unpack_quantized_weight(
+                weight_, output_size_)) {
+            return dense_reference_matmul(*dense, input);
+        }
+    }
     if (const auto* packed = std::get_if<MlxNintWeight>(&weight_)) {
         return packed->matmul(input);
     }
@@ -247,6 +305,27 @@ array MlxLinear::grouped_row_matmul(
         output_size_ % group_count != 0) {
         throw std::runtime_error(
             "grouped-row linear shape/group mismatch");
+    }
+    if (mlx_reference_enabled()) {
+        if (auto dense = unpack_quantized_weight(
+                weight_, output_size_)) {
+            auto source = input.dtype() == mlx::core::float16
+                ? input
+                : mlx::core::astype(
+                      input,
+                      mlx::core::float16);
+            const auto grouped_weight = mlx::core::reshape(
+                *dense,
+                Shape{
+                    group_count,
+                    output_size_ / group_count,
+                    input_size_,
+                });
+            return mlx::core::sum(
+                mlx::core::expand_dims(source, -2)
+                    * grouped_weight,
+                -1);
+        }
     }
     if (const auto* packed =
             std::get_if<MlxCccpInt4Weight>(&weight_)) {
@@ -321,6 +400,13 @@ array MlxLinear::grouped_row_matmul(
 
 std::optional<MlxGroupedLinearWeightRef>
 MlxLinear::grouped_weight_ref() const noexcept {
+    if (mlx_reference_enabled()) {
+        if (const auto* packed =
+                std::get_if<MlxMxWeight>(&weight_)) {
+            return MlxGroupedLinearWeightRef{packed};
+        }
+        return std::nullopt;
+    }
     if (const auto* packed =
             std::get_if<MlxNintWeight>(&weight_)) {
         return MlxGroupedLinearWeightRef{packed};
@@ -349,11 +435,13 @@ MlxLinear::grouped_weight_ref() const noexcept {
 }
 
 const MlxNintWeight* MlxLinear::nint_weight_ref() const noexcept {
+    if (mlx_reference_enabled()) return nullptr;
     return std::get_if<MlxNintWeight>(&weight_);
 }
 
 const MlxNint8ZeroWeight*
 MlxLinear::nint8_zero_weight_ref() const noexcept {
+    if (mlx_reference_enabled()) return nullptr;
     return std::get_if<MlxNint8ZeroWeight>(&weight_);
 }
 
@@ -439,19 +527,29 @@ MlxEmbedding::MlxEmbedding(array weight)
 array MlxEmbedding::operator()(
     const array& token_ids,
     Dtype dtype) const {
+    const bool reference = mlx_reference_enabled();
+    const auto finish_quantized = [&](const auto& packed) {
+        return reference
+            ? mlx::core::astype(
+                  packed.embedding(
+                      token_ids,
+                      mlx::core::float32),
+                  mlx::core::float16)
+            : packed.embedding(token_ids, dtype);
+    };
     if (const auto* packed = std::get_if<MlxNintWeight>(&weight_)) {
-        return packed->embedding(token_ids, dtype);
+        return finish_quantized(*packed);
     }
     if (const auto* packed =
             std::get_if<MlxNint8ZeroWeight>(&weight_)) {
-        return packed->embedding(token_ids, dtype);
+        return finish_quantized(*packed);
     }
     if (const auto* packed = std::get_if<MlxVqWeight>(&weight_)) {
-        return packed->embedding(token_ids, dtype);
+        return finish_quantized(*packed);
     }
     if (const auto* packed =
             std::get_if<MlxCccpInt4Weight>(&weight_)) {
-        return packed->embedding(token_ids, dtype);
+        return finish_quantized(*packed);
     }
     if (const auto* packed = std::get_if<MlxMxWeight>(&weight_)) {
         return packed->embedding(token_ids, dtype);
@@ -474,6 +572,12 @@ array MlxEmbedding::project(const array& input) const {
     if (input.ndim() == 0 || input.shape(-1) != hidden_size_) {
         throw std::runtime_error(
             "embedding projection input width mismatch");
+    }
+    if (mlx_reference_enabled()) {
+        if (auto dense = unpack_quantized_weight(
+                weight_, vocabulary_size_)) {
+            return dense_reference_matmul(*dense, input);
+        }
     }
     if (const auto* packed =
             std::get_if<MlxNintWeight>(&weight_)) {

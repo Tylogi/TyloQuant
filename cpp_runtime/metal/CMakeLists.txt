@@ -194,7 +194,7 @@ add_custom_command(TARGET mfq-decode-metal POST_BUILD
 )
 
 set(_MFQ_LLAMA_RUNTIME_DYLIBS)
-if(TARGET mfq-server)
+if(TARGET mfq-server AND DEFINED MFQ_LLAMA_RUNTIME_DIR)
     file(GLOB _MFQ_LLAMA_RUNTIME_DYLIBS
         "${MFQ_LLAMA_RUNTIME_DIR}/*.dylib")
     if(NOT _MFQ_LLAMA_RUNTIME_DYLIBS)
@@ -233,7 +233,7 @@ add_custom_command(
     COMMENT "Building the shared native Metal runtime bundle"
 )
 
-if(TARGET mfq-server)
+if(TARGET mfq-server AND _MFQ_LLAMA_RUNTIME_DYLIBS)
     add_custom_command(
         OUTPUT "${_MFQ_METAL_RUNTIME_BUNDLE_STAMP}"
         APPEND
@@ -242,19 +242,6 @@ if(TARGET mfq-server)
             "${_MFQ_METAL_RUNTIME_BUNDLE_DIR}"
     )
 
-    add_executable(mfq-perplexity
-        mfq_perplexity_mlx.cpp
-    )
-    target_link_libraries(mfq-perplexity PRIVATE
-        mfq-metal-runtime
-        mfq-server
-    )
-    target_compile_features(mfq-perplexity PRIVATE cxx_std_20)
-    set_target_properties(mfq-perplexity PROPERTIES
-        BUILD_RPATH "@executable_path/lib"
-        BUILD_WITH_INSTALL_RPATH ON
-        INSTALL_RPATH "@executable_path/lib"
-    )
     foreach(_MFQ_LLAMA_RUNTIME_DYLIB
             IN LISTS _MFQ_LLAMA_RUNTIME_DYLIBS)
         get_filename_component(
@@ -270,6 +257,22 @@ if(TARGET mfq-server)
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/bundle_macos_dylib.cmake"
         )
     endforeach()
+endif()
+
+if(TARGET mfq-server)
+    add_executable(mfq-perplexity
+        mfq_perplexity_mlx.cpp
+    )
+    target_link_libraries(mfq-perplexity PRIVATE
+        mfq-metal-runtime
+        mfq-server
+    )
+    target_compile_features(mfq-perplexity PRIVATE cxx_std_20)
+    set_target_properties(mfq-perplexity PROPERTIES
+        BUILD_RPATH "@executable_path/lib"
+        BUILD_WITH_INSTALL_RPATH ON
+        INSTALL_RPATH "@executable_path/lib"
+    )
 endif()
 
 add_custom_command(

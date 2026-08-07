@@ -450,3 +450,228 @@ torch::Tensor mxfp8_groupwise_small_m_f32_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }
+
+namespace {
+
+__device__ __forceinline__ float decode_mxfp4_e2m1(std::uint8_t code) {
+    constexpr float magnitude[8] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    };
+    const float value = magnitude[code & 7u];
+    return (code & 8u) == 0u ? value : -value;
+}
+
+template <bool COMPACT_ROUTE>
+__global__ void __launch_bounds__(256) mxfp4_moe_grouped_f16_kernel(
+        const std::uint8_t * __restrict__ values,
+        const std::uint8_t * __restrict__ scales,
+        const __half * __restrict__ input,
+        const std::int32_t * __restrict__ ids,
+        const std::int32_t * __restrict__ expert_local,
+        const std::int32_t * __restrict__ ids_dst,
+        const std::int32_t * __restrict__ expert_bounds,
+        const std::int32_t * __restrict__ tile_bounds,
+        const std::int32_t * __restrict__ tile_experts,
+        __half * __restrict__ output,
+        int tokens,
+        int routes,
+        int global_experts,
+        int pool_experts,
+        int out_per_expert,
+        int width,
+        int max_tiles,
+        int row_tiles,
+        bool routed_input) {
+    constexpr int kTileM = 8;
+    constexpr int kRowsPerBlock = 8;
+    const int warp = int(threadIdx.y);
+    const int lane = int(threadIdx.x);
+    const int pairs = tokens * routes;
+    const int scale_columns = width / 32;
+    const int packed_columns = width / 2;
+    const int64_t max_tasks = COMPACT_ROUTE
+        ? static_cast<int64_t>(max_tiles) * row_tiles
+        : static_cast<int64_t>(pairs) * row_tiles;
+    for (int64_t task = blockIdx.x; task < max_tasks; task += gridDim.x) {
+        const int row_tile = static_cast<int>(task % row_tiles);
+        int expert = -1;
+        int first = 0;
+        int last = 0;
+        int single_pair = -1;
+        if constexpr (COMPACT_ROUTE) {
+            const int tile = static_cast<int>(task / row_tiles);
+            if (tile >= tile_bounds[global_experts]) continue;
+            expert = tile_experts[tile];
+            const int local_tile = tile - tile_bounds[expert];
+            first = expert_bounds[expert] + local_tile * kTileM;
+            last = min(first + kTileM, expert_bounds[expert + 1]);
+        } else {
+            single_pair = static_cast<int>(task / row_tiles);
+            expert = ids[single_pair];
+            first = single_pair;
+            last = single_pair + 1;
+        }
+        const int local_expert = expert_local[expert];
+        if (static_cast<unsigned>(local_expert) >=
+                static_cast<unsigned>(pool_experts)) {
+            continue;
+        }
+        const int local_row = row_tile * kRowsPerBlock + warp;
+        if (local_row >= out_per_expert) continue;
+        const int packed_row = local_expert * out_per_expert + local_row;
+        float accum[kTileM];
+#pragma unroll
+        for (int item = 0; item < kTileM; ++item) accum[item] = 0.0f;
+        for (int column = lane; column < width; column += 32) {
+            const std::uint8_t packed = values[
+                static_cast<int64_t>(packed_row) * packed_columns + column / 2];
+            const std::uint8_t code = static_cast<std::uint8_t>(
+                (packed >> ((column & 1) * 4)) & 15u);
+            const float weight = decode_mxfp4_e2m1(code) * decode_e8m0(
+                scales[static_cast<int64_t>(packed_row) * scale_columns +
+                       column / 32]);
+#pragma unroll
+            for (int item = 0; item < kTileM; ++item) {
+                int pair = -1;
+                if constexpr (COMPACT_ROUTE) {
+                    const int compact = first + item;
+                    if (compact >= last) continue;
+                    pair = ids_dst[compact];
+                } else {
+                    if (item != 0) continue;
+                    pair = single_pair;
+                }
+                const int source_row = routed_input ? pair : pair / routes;
+                accum[item] = fmaf(
+                    __half2float(input[static_cast<int64_t>(source_row) * width + column]),
+                    weight,
+                    accum[item]);
+            }
+        }
+#pragma unroll
+        for (int item = 0; item < kTileM; ++item) {
+            float value = warp_sum(accum[item]);
+            if (lane != 0) continue;
+            int pair = -1;
+            if constexpr (COMPACT_ROUTE) {
+                const int compact = first + item;
+                if (compact >= last) continue;
+                pair = ids_dst[compact];
+            } else {
+                if (item != 0) continue;
+                pair = single_pair;
+            }
+            output[static_cast<int64_t>(pair) * out_per_expert + local_row] =
+                __float2half_rn(value);
+        }
+    }
+}
+
+void validate_mxfp4_moe(
+        const torch::Tensor & values,
+        const torch::Tensor & scales,
+        const torch::Tensor & input,
+        const torch::Tensor & ids,
+        const torch::Tensor & expert_local,
+        const torch::Tensor & output,
+        int64_t global_experts,
+        int64_t pool_experts,
+        int64_t out_per_expert,
+        int64_t neuron_len) {
+    TORCH_CHECK(values.is_cuda() && scales.is_cuda() && input.is_cuda() &&
+                    ids.is_cuda() && expert_local.is_cuda() && output.is_cuda(),
+                "MXFP4 routed tensors must be CUDA tensors");
+    TORCH_CHECK(values.scalar_type() == torch::kUInt8 &&
+                    scales.scalar_type() == torch::kUInt8 &&
+                    input.scalar_type() == torch::kFloat16 &&
+                    ids.scalar_type() == torch::kInt32 &&
+                    expert_local.scalar_type() == torch::kInt32 &&
+                    output.scalar_type() == torch::kFloat16,
+                "MXFP4 routed tensor dtypes are invalid");
+    TORCH_CHECK(values.is_contiguous() && scales.is_contiguous() &&
+                    input.is_contiguous() && ids.is_contiguous() &&
+                    expert_local.is_contiguous() && output.is_contiguous(),
+                "MXFP4 routed tensors must be contiguous");
+    TORCH_CHECK(neuron_len > 0 && neuron_len % 32 == 0 &&
+                    values.dim() == 2 &&
+                    values.size(0) == pool_experts * out_per_expert &&
+                    values.size(1) == neuron_len / 2 &&
+                    scales.sizes() == torch::IntArrayRef(
+                        {pool_experts * out_per_expert, neuron_len / 32}),
+                "MXFP4 routed weight geometry mismatch");
+    TORCH_CHECK((input.dim() == 2 || input.dim() == 3) &&
+                    input.size(-1) == neuron_len && ids.dim() == 2 &&
+                    input.size(0) == ids.size(0) &&
+                    output.sizes() == torch::IntArrayRef(
+                        {ids.size(0), ids.size(1), out_per_expert}) &&
+                    expert_local.numel() == global_experts,
+                "MXFP4 routed activation/route geometry mismatch");
+}
+
+} // namespace
+
+torch::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
+        torch::Tensor values,
+        torch::Tensor scales,
+        torch::Tensor input,
+        torch::Tensor ids,
+        torch::Tensor expert_local,
+        int64_t global_experts,
+        int64_t pool_experts,
+        int64_t out_per_expert,
+        int64_t neuron_len,
+        torch::Tensor output,
+        torch::Tensor ids_dst,
+        torch::Tensor expert_bounds,
+        torch::Tensor tile_bounds,
+        torch::Tensor tile_experts) {
+    validate_mxfp4_moe(
+        values, scales, input, ids, expert_local, output,
+        global_experts, pool_experts, out_per_expert, neuron_len);
+    const int tokens = static_cast<int>(ids.size(0));
+    const int routes = static_cast<int>(ids.size(1));
+    const int pairs = tokens * routes;
+    const int row_tiles =
+        (static_cast<int>(out_per_expert) + 7) / 8;
+    const dim3 threads(32, 8);
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    if (ids_dst.numel() == ids.numel()) {
+        TORCH_CHECK(expert_bounds.is_cuda() && tile_bounds.is_cuda() &&
+                        tile_experts.is_cuda() &&
+                        expert_bounds.scalar_type() == torch::kInt32 &&
+                        tile_bounds.scalar_type() == torch::kInt32 &&
+                        tile_experts.scalar_type() == torch::kInt32 &&
+                        expert_bounds.is_contiguous() &&
+                        tile_bounds.is_contiguous() && tile_experts.is_contiguous() &&
+                        expert_bounds.numel() >= global_experts + 1 &&
+                        tile_bounds.numel() >= global_experts + 1,
+                    "MXFP4 compact route map is invalid");
+        const int max_tiles = (pairs + 7) / 8 + static_cast<int>(global_experts);
+        const int blocks = static_cast<int>(std::min<int64_t>(
+            static_cast<int64_t>(max_tiles) * row_tiles, 4096));
+        mxfp4_moe_grouped_f16_kernel<true><<<blocks, threads, 0, stream>>>(
+            values.data_ptr<std::uint8_t>(), scales.data_ptr<std::uint8_t>(),
+            reinterpret_cast<const __half *>(input.data_ptr<at::Half>()),
+            ids.data_ptr<std::int32_t>(), expert_local.data_ptr<std::int32_t>(),
+            ids_dst.data_ptr<std::int32_t>(), expert_bounds.data_ptr<std::int32_t>(),
+            tile_bounds.data_ptr<std::int32_t>(), tile_experts.data_ptr<std::int32_t>(),
+            reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+            tokens, routes, static_cast<int>(global_experts),
+            static_cast<int>(pool_experts), static_cast<int>(out_per_expert),
+            static_cast<int>(neuron_len), max_tiles, row_tiles, input.dim() == 3);
+    } else {
+        const int blocks = static_cast<int>(std::min<int64_t>(
+            static_cast<int64_t>(pairs) * row_tiles, 4096));
+        mxfp4_moe_grouped_f16_kernel<false><<<blocks, threads, 0, stream>>>(
+            values.data_ptr<std::uint8_t>(), scales.data_ptr<std::uint8_t>(),
+            reinterpret_cast<const __half *>(input.data_ptr<at::Half>()),
+            ids.data_ptr<std::int32_t>(), expert_local.data_ptr<std::int32_t>(),
+            nullptr, nullptr, nullptr, nullptr,
+            reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+            tokens, routes, static_cast<int>(global_experts),
+            static_cast<int>(pool_experts), static_cast<int>(out_per_expert),
+            static_cast<int>(neuron_len), 0, row_tiles, input.dim() == 3);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}

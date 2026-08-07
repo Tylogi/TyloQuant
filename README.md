@@ -20,34 +20,18 @@ NINT · NVQ/NPQ · NEPQ · TPQ · Gradient Precision Calibration · Expert-Wise 
   <a href="https://huggingface.co/Tylogi">Hugging Face Models</a> · <a href="https://www.modelscope.cn/profile/Tylogi">ModelScope Models</a>
 </p>
 
-**TyloQuant MFQ** (or **MFQ**) co-designs quantization formats, precision
-allocation, and inference kernels for high-fidelity LLM deployment. It supports
-custom weight encodings from `0.84-8.30 bpw`, allocates precision per compute
-group or MoE expert, and executes packed weights directly through CUDA kernels
-and a C++ runtime.
-
-Public MFQ models use a unified `V`/`S` naming scheme: vector-quantized models
-matched to llama.cpp `IQ*` use `V`, while scalar-quantized models matched to
-`Q*_K*` use `S`. For example, `IQ3_XXS → V3-XXS` and
-`Q4_K_XL → S4-L`. See [Model Naming](./MODEL_NAMING.md) for the complete rules
-and registered tiers.
-
 ## Result at a Glance
 
 ### DeepSeek-V4-Flash-0731
 
-<img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ versus Unsloth Dynamic disk size and Mean KLD at ctx512 and ctx2048" width="100%">
+<img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ versus Unsloth Dynamic model size and Mean KLD" width="100%">
 
-Notably, even the smallest `74.902 GiB` MFQ tier retains strong fidelity: at
-both context lengths, its Mean KLD is lower than every completed Unsloth Dynamic
-result shown, including the `127.277 GiB` IQ4 results.
-
-The full WikiText-2 evaluation uses identical BF16-reference logits, tokenizer,
-BOS, and token sequences for both runtimes. It covers 146,115 scored tokens at
-`ctx512` and 146,289 at `ctx2048`. Across the three closest-size pairs, MFQ
-reduces Mean KLD by **57.04–57.75%** at `ctx512` and **52.88–55.35%** at
-`ctx2048`, with each pair within 2.116 GiB. Lower Mean KLD is better. See the
-[complete results and protocol](./docs/deepseek-v4-flash-0731-results.md).
+The official-0731 WikiText-2 evaluation covers 573 chunks and 146,115 scored
+tokens at `ctx=512`. The released 77.519 GiB S tier records `0.313576` Mean
+KLD and `82.2913%` same-top. The 88.007 GiB M and 98.007 GiB L tiers record
+`0.244488` / `84.5300%` and `0.201444` / `86.0753%`, respectively. Across the
+three nearest-size UD comparisons, MFQ reduces Mean KLD by **34.24–51.42%**.
+See the [complete results and protocol](./docs/deepseek-v4-flash-0731-results.md).
 
 ### Qwen3.5-9B: disk size vs. Mean KLD
 
@@ -65,6 +49,20 @@ The aligned `ubatch=2048` evaluation compares current, matched-size MFQ files
 with their Unsloth Dynamic recipes. Lower Mean KLD and higher same-top are
 better. All plotted tiers use the complete 145-chunk evaluation of the current
 file.
+
+## Overview
+
+**TyloQuant MFQ** (or **MFQ**) co-designs quantization formats, precision
+allocation, and inference kernels for high-fidelity LLM deployment. It supports
+custom weight encodings from `0.84-8.30 bpw`, allocates precision per compute
+group or MoE expert, and executes packed weights directly through CUDA kernels
+and a C++ runtime.
+
+Public MFQ models use a unified `V`/`S` naming scheme: vector-quantized models
+matched to llama.cpp `IQ*` use `V`, while scalar-quantized models matched to
+`Q*_K*` use `S`. For example, `IQ3_XXS → V3-XXS` and
+`Q4_K_XL → S4-L`. See [Model Naming](./MODEL_NAMING.md) for the complete rules
+and registered tiers.
 
 ## Installation
 

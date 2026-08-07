@@ -102,7 +102,14 @@ MFQ，也可来自 `--tokenizer-gguf`）。响应由 llama.cpp 的通用 chat pa
 `reasoning_content`、`content` 与 `tool_calls`，流式响应也保持这三个
 通道独立。历史消息中的 `reasoning_content` 会原样交给模板；模板可自行丢弃旧思考，
 也可通过 `chat_template_kwargs.preserve_reasoning=true` 请求保留。WebUI 默认采用模板
-行为，并提供“排除历史思考”开关。
+行为，并提供“排除历史思考”开关。当当前模板显式支持
+`reasoning_effort` 时，WebUI 会在“思考”开关旁显示模板声明的思考档位。
+
+Apple Metal 上的 DeepSeek-V4 服务会在 generation marker 前保留稳定 KV
+checkpoint。下一次请求只有在 token 前缀完全一致时才复用，并仅 prefill 新增后缀；
+历史编辑、模板变化或前缀不匹配会自动回退到完整 prefill。`/api/status` 的
+`last_request.prompt_tokens` 是完整上下文长度，`last_request.prefill_tokens` 是本次
+实际计算的 token 数。
 
 ## 多 GPU 张量并行
 
@@ -188,6 +195,10 @@ build/cpp_runtime/mfq-decode.exe `
 程序会在加载阶段报错。启用该选项后 CUDA Graph 自动停用；它不能与旧的
 `--cpu-offload-layers` 同时使用。运行结束会输出命中、miss、eviction、H2D
 字节数和实际 arena 分配量。
+
+decode 默认让 route id 的异步 D2H 回读与 shared expert 计算重叠，再提交所需
+专家的 H2D 传输。设置 `MFQ_MOE_DELAYED_ROUTE_READBACK=0` 可恢复同步回读，
+用于性能和数值对照。
 
 可选的 `--moe-cache-profile profile.json` 在模型加载阶段预热专家。JSON
 描述的是来源无关的逐层专家排名或边缘频率；REAP、路由 trace 和手工统计都可以

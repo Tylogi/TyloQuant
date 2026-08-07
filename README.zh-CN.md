@@ -20,25 +20,17 @@ NINT · NVQ/NPQ · NEPQ · Gradient Precision Calibration · Expert-Wise MoE · 
   <a href="https://huggingface.co/Tylogi">Hugging Face 模型主页</a> · <a href="https://www.modelscope.cn/profile/Tylogi">ModelScope 模型主页</a>
 </p>
 
-**TyloQuant MFQ**（简称 **MFQ**）联合设计量化格式、精度分配与推理 kernel，面向高保真
-LLM 部署。项目支持 `0.84-8.30 bpw` 的自定义权重编码，可按计算组或 MoE 专家分配精度，
-并由 CUDA kernel 与 C++ runtime 直接执行 packed 权重。
-
 ## 核心结果
 
 ### DeepSeek-V4-Flash-0731
 
-<img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ 与 Unsloth Dynamic 在 ctx512 和 ctx2048 下的文件大小与 Mean KLD 对比" width="100%">
+<img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ 与 Unsloth Dynamic 模型大小和 Mean KLD 对比" width="100%">
 
-值得注意的是，即使是最小的 `74.902 GiB` MFQ 档位也保持了很强的量化保真度：在两种
-context 长度下，其 Mean KLD 均低于图中所有已完成的 Unsloth Dynamic 结果，包括
-`127.277 GiB` 的 IQ4 档位。
-
-完整 WikiText-2 评测在两套 runtime 中使用相同的 BF16 reference logits、tokenizer、
-BOS 与 token 序列；`ctx512` 覆盖 146,115 个计分 token，`ctx2048` 覆盖 146,289 个。
-三组最接近体积的对位中，MFQ 在 `ctx512` 下将 Mean KLD 降低
-**57.04–57.75%**，在 `ctx2048` 下降低 **52.88–55.35%**，且每组文件大小差均不超过
-2.116 GiB。Mean KLD 越低越好。完整数据与测试协议见
+官方 0731 权重的 WikiText-2 全集评测使用 `ctx=512`，覆盖 573 个 chunk 和 146,115 个
+计分 token。发布版 77.519 GiB S 档的 Mean KLD 为 `0.313576`，same-top 为
+`82.2913%`；88.007 GiB M 档为 `0.244488` / `84.5300%`；98.007 GiB L 档为
+`0.201444` / `86.0753%`。三组近似同体积 UD 对位中，MFQ 将 Mean KLD 降低
+**34.24–51.42%**。完整数据与测试协议见
 [DeepSeek-V4-Flash-0731 实验结果](./docs/deepseek-v4-flash-0731-results.md)。
 
 ### Qwen3.5-9B：文件大小与 Mean KLD
@@ -47,6 +39,12 @@ BOS 与 token 序列；`ctx512` 覆盖 146,115 个计分 token，`ctx2048` 覆�
 
 完整 WikiText-2 评测包含 145 个 chunk、148,335 个计分 token，并使用同一
 BF16 参考模型。上图所示的每个匹配精度档位中，MFQ 的原始 Mean KLD 均更低。
+
+## 项目简介
+
+**TyloQuant MFQ**（简称 **MFQ**）联合设计量化格式、精度分配与推理 kernel，面向高保真
+LLM 部署。项目支持 `0.84-8.30 bpw` 的自定义权重编码，可按计算组或 MoE 专家分配精度，
+并由 CUDA kernel 与 C++ runtime 直接执行 packed 权重。
 
 ## 安装
 

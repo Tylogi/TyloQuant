@@ -16,6 +16,7 @@ from mfq.formats.io import (
     save,
 )
 from mfq.formats.moe import NintMoePool, NintMoeTensor
+from mfq.formats.mx import MxTensor
 from mfq.formats.nepq import NEPQ0_S, NepqTensor
 from mfq.formats.nint import NintSpec
 from mfq.formats.npq0_s import pack_npq0_s_tables
@@ -382,3 +383,86 @@ def test_materialize_overlay_slices_nepq_without_requantizing(tmp_path: Path) ->
         np.testing.assert_array_equal(merged_nepq.state[0], original_nepq.state[0])
         np.testing.assert_array_equal(merged_nepq.indices[0], original_nepq.indices[0])
         np.testing.assert_array_equal(merged_nepq.bank_ids[0], original_nepq.bank_ids[0])
+
+
+def test_materialize_overlay_slices_mxfp4_without_reencoding(tmp_path: Path) -> None:
+    rng = np.random.default_rng(20260806)
+    rows = 2
+    width = 32
+    native_values = rng.integers(0, 256, (2 * rows, width // 2), dtype=np.uint8)
+    native_scales = rng.integers(1, 254, (2 * rows, width // 32), dtype=np.uint8)
+    native = MxTensor(
+        "MXFP4",
+        (2 * rows, width),
+        native_values,
+        native_scales,
+    )
+    third = quantize_nint(
+        rng.normal(size=(rows, width)).astype(np.float32),
+        NintSpec(4, 24, 6),
+    )
+    base = NintMoeTensor(
+        (3, rows, width),
+        (
+            NintMoePool(np.array([0, 1], dtype=np.int32), native),
+            NintMoePool(np.array([2], dtype=np.int32), third),
+        ),
+    )
+    base_path = tmp_path / "base-mxfp4.mfq"
+    save(
+        base_path,
+        FileHeader(version=2, model_arch="test", num_tensors=1),
+        {"experts": base},
+    )
+    replacement = quantize_nint(
+        rng.normal(size=(rows, width)).astype(np.float32),
+        NintSpec(4, 24, 6),
+    )
+    overlay_path = tmp_path / "overlay-mxfp4.mfq"
+    _write_raw_mfq(
+        overlay_path,
+        arch="overlay",
+        records=[
+            (
+                "experts",
+                "NINTMD",
+                _pack_delta(
+                    n_experts=3,
+                    out_per_expert=rows,
+                    neuron_len=width,
+                    pools=[([1], replacement)],
+                ),
+            )
+        ],
+    )
+    plan = build_materialization_plan(base_path, overlay_path)
+    output_path = tmp_path / "materialized-mxfp4.mfq"
+    from mfq.tools.materialize_mfq_overlay import _stream_plan
+
+    with (
+        output_path.open("wb") as output,
+        base_path.open("rb") as base_handle,
+        overlay_path.open("rb") as overlay_handle,
+    ):
+        _stream_plan(
+            plan,
+            {"base": base_handle, "overlay": overlay_handle},
+            output,
+            start_offset=0,
+            length=None,
+            chunk_bytes=29,
+            progress_bytes=0,
+        )
+    validate_materialized_mfq(
+        output_path,
+        expected_bytes=plan.total_bytes,
+        expected_family_expert_counts={"MXFP4": 1, "NINT4": 2},
+    )
+    with open_mmap(output_path) as store:
+        merged = store["experts"]
+        assert isinstance(merged, NintMoeTensor)
+        assert merged.expert_profiles == ("MXFP4", "NINT4-24", "NINT4-24")
+        mx = merged.pools[0].tensor
+        assert isinstance(mx, MxTensor)
+        np.testing.assert_array_equal(mx.values, native_values[:rows])
+        np.testing.assert_array_equal(mx.scales, native_scales[:rows])

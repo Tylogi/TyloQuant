@@ -471,3 +471,42 @@ def test_nvq2j_weighted_fixed_quantizer_uses_native_assignment(
 
     assert calls == [((8, 72), (8, 72))]
     assert np.isfinite(dequantize_nvq_jsc(tensor)).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_nvq3j_weighted_fixed_quantizer_uses_native_assignment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mfq.formats.nvq import NVQ3_D4
+    from mfq.quantize.cuda import _ext as ext_module
+
+    native = ext_module.ext()
+    calls: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+
+    class NativeProxy:
+        def nvq3j_assign(self, value, objective_weight, *args):
+            calls.append((tuple(value.shape), tuple(objective_weight.shape)))
+            return native.nvq3j_assign(value, objective_weight, *args)
+
+    monkeypatch.setattr(ext_module, "ext", lambda: NativeProxy())
+    generator = torch.Generator().manual_seed(197)
+    weight = 0.04 * torch.randn((8, 50), generator=generator)
+    importance = np.linspace(0.25, 1.75, 50, dtype=np.float32)
+    tables = initial_jsc_tables(
+        NvqJscConfig(
+            banks=2,
+            iterations=0,
+            assignment_refine_steps=1,
+            spec=NVQ3_D4,
+        )
+    )
+    tensor = quantize_nvq_jsc_fixed(
+        weight,
+        tables,
+        importance=importance,
+        assignment_refine_steps=1,
+        device="cuda",
+    )
+
+    assert calls == [((8, 72), (8, 72))]
+    assert np.isfinite(dequantize_nvq_jsc(tensor)).all()

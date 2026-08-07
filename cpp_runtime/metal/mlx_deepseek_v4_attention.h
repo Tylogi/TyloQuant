@@ -107,6 +107,11 @@ public:
         return prev_gate_;
     }
 
+    // Take a rollback snapshot. Rolling compressor state is copied because
+    // decode replaces it, while the fixed pool may share storage: it is
+    // append-only and restored metadata hides rows beyond the checkpoint.
+    MlxDeepseekV4PoolState snapshot() const;
+
 private:
     MlxDeepseekV4PoolState(
         int ratio,
@@ -163,6 +168,8 @@ public:
     indexer() const noexcept {
         return indexer_;
     }
+
+    MlxDeepseekV4LayerState snapshot() const;
 
 private:
     friend class MlxDeepseekV4Attention;

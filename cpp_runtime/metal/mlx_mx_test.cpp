@@ -173,6 +173,46 @@ void test_grouped_mxfp8() {
     }
 }
 
+void test_grouped_mxfp8_swiglu() {
+    using namespace mlx::core;
+    constexpr int inputs = 128;
+    constexpr int outputs = 17;
+    const auto gate = mfq::metal::MlxMxWeight::from_blob(
+        "MXFP8", make_blob(8, outputs, inputs));
+    const auto up = mfq::metal::MlxMxWeight::from_blob(
+        "MXFP8", make_blob(8, outputs, inputs));
+    const mfq::metal::MlxGroupedLinear grouped({&gate, &up});
+    std::vector<float> values(inputs);
+    for (int index = 0; index < inputs; ++index) {
+        values[static_cast<std::size_t>(index)] =
+            static_cast<float>((index % 13) - 6) / 32.0f;
+    }
+    auto input = astype(
+        array(values.begin(), Shape{1, inputs}),
+        float16);
+    require(
+        grouped.supports_single_row_swiglu(input),
+        "grouped MXFP8 SwiGLU fast path was not selected");
+    auto gate_expected = astype(gate.matmul(input), float32);
+    auto up_expected = astype(up.matmul(input), float32);
+    auto actual = astype(
+        grouped.single_row_swiglu(input, 0.0f),
+        float32);
+    eval(gate_expected, up_expected, actual);
+    require(
+        actual.shape() == Shape{1, outputs},
+        "grouped MXFP8 SwiGLU output shape mismatch");
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+        const float gate_value = gate_expected.data<float>()[index];
+        const float up_value = up_expected.data<float>()[index];
+        const float expected =
+            gate_value / (1.0f + std::exp(-gate_value)) * up_value;
+        require(
+            std::fabs(actual.data<float>()[index] - expected) < 2e-3f,
+            "grouped MXFP8 SwiGLU value mismatch");
+    }
+}
+
 void test_grouped_mxfp8_q8() {
     using namespace mlx::core;
     constexpr int inputs = 128;
@@ -325,6 +365,7 @@ int main() {
         test_embedding("MXFP4", 96);
         test_embedding("MXFP8", 128);
         test_grouped_mxfp8();
+        test_grouped_mxfp8_swiglu();
         test_grouped_mxfp8_q8();
         test_grouped_mxfp8_inverse_rope();
         test_grouped_row_mxfp8_prefill();

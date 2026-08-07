@@ -17,6 +17,13 @@ struct MfqSamplingParams {
     uint64_t seed = 0;
 };
 
+// Describes the portion of a rendered prompt whose KV state is stable across
+// requests.  A runtime may retain this exact token prefix after generation and
+// reuse it only when the next request starts with the same token sequence.
+struct MfqPromptCachePlan {
+    size_t stable_prefix_tokens = 0;
+};
+
 struct MfqServerConfig {
     std::string host = "127.0.0.1";
     int port = 8080;
@@ -50,7 +57,8 @@ using MfqGenerateFn = std::function<int32_t(
     const std::vector<int64_t> & prompt,
     const MfqSamplingParams & sampling,
     const MfqTokenCallback & on_token,
-    const MfqPrefillCallback & on_prefill)>;
+    const MfqPrefillCallback & on_prefill,
+    const MfqPromptCachePlan & cache_plan)>;
 using MfqReloadFn = std::function<int64_t(int64_t context_size)>;
 
 int run_mfq_server(

@@ -543,6 +543,9 @@ Workspace 以 shape/M 缓存。`torch::empty` 是 CUDA caching allocator 分配�
 4. 在消费 stream 前等待 transfer event。
 
 预取和 demand 的命中/miss 分开计数。只允许管理 run contract 记录的进程和 cache 工件。
+decode 默认先在独立 CUDA stream 发起 route id 的极小 D2H 回读，在 shared expert
+入队后才同步回读并提交专家 H2D。这样可将 route readback 与 shared expert 重叠，
+而 arena slot、transfer event 和消费 stream 的依赖关系不变。
 
 ### 7.4 TPQ/CCCP expert residency
 
@@ -1071,6 +1074,7 @@ CUDA 改动还需运行对应的 `test_*_kernels_cuda.py`；native 改动需重�
 | graph | `MFQ_CUDA_GRAPH`, `MFQ_SERVER_CUDA_GRAPH` | decode/server graph |
 | profiling | `MFQ_REPORT_CUDA_MEMORY`, `MFQ_PROFILE_SCOPES` | allocator/范围统计 |
 | offload | `MFQ_ENABLE_MOE_HISTORY_PREFETCH` | 上一 token route 预取，默认关闭 |
+| offload | `MFQ_MOE_DELAYED_ROUTE_READBACK` | 默认开启；设为 `0` 恢复同步 route readback |
 
 TPQ/CCCP 开关：
 

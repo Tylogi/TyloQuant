@@ -12,6 +12,7 @@ except RuntimeError:
     pytest.skip("Metal device unavailable", allow_module_level=True)
 
 from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
+from mfq.formats.mx import MxTensor  # noqa: E402
 from mfq.formats.nepq import NEPQ0_S, dequantize_nepq, rotation_signs  # noqa: E402
 from mfq.formats.nint import NintSpec  # noqa: E402
 from mfq.formats.nint8_zero import (  # noqa: E402
@@ -80,6 +81,75 @@ def _decode_nint_moe(tensor: NintMoeTensor) -> np.ndarray:
         )
         result[np.asarray(pool.expert_ids)] = decoded
     return result
+
+
+def _mxfp4_rows(rows: int, width: int, seed: int) -> tuple[MxTensor, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    values = rng.integers(0, 256, size=(rows, width // 2), dtype=np.uint8)
+    scales = rng.integers(124, 130, size=(rows, width // 32), dtype=np.uint8)
+    codes = np.stack((values & 15, values >> 4), axis=-1).reshape(rows, width)
+    table = np.asarray(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        dtype=np.float32,
+    )
+    decoded = np.where((codes & 8) == 0, table[codes & 7], -table[codes & 7])
+    decoded *= np.repeat(
+        np.exp2(scales.astype(np.int16) - 127).astype(np.float32),
+        32,
+        axis=1,
+    )
+    return MxTensor("MXFP4", (rows, width), values, scales), decoded
+
+
+@pytest.mark.parametrize("path", ["direct", "compact", "route_mma", "expert_mma"])
+def test_routed_nintm_mxfp4_cohort_all_grouped_paths(path: str):
+    rng = np.random.default_rng(948)
+    experts, out, width = 4, 9, 96
+    mx_ids = np.asarray([0, 2], dtype=np.int32)
+    nint_ids = np.asarray([1, 3], dtype=np.int32)
+    mx_tensor, mx_dense = _mxfp4_rows(mx_ids.size * out, width, 949)
+    nint_source = rng.normal(0.0, 0.1, size=(nint_ids.size * out, width)).astype(
+        np.float32
+    )
+    nint_tensor = quantize(nint_source, NintSpec(4, 24, 6))
+    tensor = NintMoeTensor(
+        (experts, out, width),
+        (
+            NintMoePool(mx_ids, mx_tensor),
+            NintMoePool(nint_ids, nint_tensor),
+        ),
+    )
+    dense = np.empty((experts, out, width), dtype=np.float32)
+    dense[mx_ids] = mx_dense.reshape(mx_ids.size, out, width)
+    dense[nint_ids] = dequantize(nint_tensor).reshape(nint_ids.size, out, width)
+    source = rng.normal(0.0, 0.04, size=(9, width)).astype(np.float16)
+    ids = np.tile(np.asarray([[0, 1]], dtype=np.int32), (9, 1))
+    ids[1::2] = np.asarray([2, 3], dtype=np.int32)
+    layer = MlxRoutedLinear(tensor)
+    assert layer.uses_grouped_kernel
+    options = {
+        "direct": dict(compact_threshold=None),
+        "compact": dict(compact_threshold=1, matrix_threshold=None),
+        "route_mma": dict(
+            compact_threshold=1,
+            matrix_threshold=1,
+            expert_matrix_threshold=None,
+        ),
+        "expert_mma": dict(
+            compact_threshold=1,
+            matrix_threshold=1,
+            expert_matrix_threshold=1,
+        ),
+    }[path]
+    actual = _array(grouped_moe_matmul(layer.grouped_weight, source, ids, **options))
+    expected = np.stack(
+        [
+            np.stack([source[token].astype(np.float32) @ dense[expert].T for expert in row])
+            for token, row in enumerate(ids)
+        ]
+    )
+    tolerance = 4e-3 if "mma" in path else 8e-4
+    np.testing.assert_allclose(actual, expected, rtol=tolerance, atol=tolerance)
 
 
 def test_routed_nintm_mixed_precision_cohorts():

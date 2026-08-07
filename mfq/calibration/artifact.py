@@ -24,6 +24,7 @@ EXPERT_PRECISION_FAMILIES = frozenset(
         "NINT5",
         "NINT6",
         "NINT8",
+        "MXFP4",
         "NVQ1-L",
         "NVQ1-S",
         "NPQ0-L",

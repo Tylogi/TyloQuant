@@ -237,7 +237,7 @@ penalties.
 | MHA/GQA/MQA, dynamic KV cache, sliding-window cache | Available |
 | GDN scalar/KDA linear attention, D=32/64/128 | Available |
 | SSM conv+SiLU and fused Q/K/V conv+norm+state | Available |
-| Routed NINTM mixed NINT/NINT8-0/NVQ/NPQ/NEPQ MoE | Available, single heterogeneous dispatch |
+| Routed NINTM mixed NINT/NINT8-0/NVQ/NPQ/NEPQ/MXFP4 MoE | Available, single heterogeneous dispatch |
 | Rotated NEPQ routed MoE | Available in the heterogeneous grouped dispatch |
 | Paired routed gate/up projection | Available in one grouped dispatch |
 | MoE router top-k / sqrt-softplus / weighted and shared reduction | Available as Metal kernels |

@@ -27,6 +27,7 @@ _NINT_MOE_POOL_HDR = struct.Struct("<IIQQ")
 _NINT_HDR = struct.Struct("<BBiii")
 _NVQ_HDR = struct.Struct("<4sBBHiiI")
 _NEPQ_HDR = struct.Struct("<4sBBBBIIIIIQ")
+_MX_HDR = struct.Struct("<4sBBHQQQQQQ")
 
 _NIM2 = b"NIM2"
 _NID2 = b"NID2"
@@ -36,6 +37,9 @@ _NVQ_FLAG_MASK = 0xE0
 _NEPQ_MAGIC = b"NEP1"
 _NEPQ_VERSION = 1
 _NEPQ_ROTATED_FLAG = 1
+_MX_MAGIC = b"MXT1"
+_MX_VERSION = 1
+_MXFP4_KIND = 4
 _NEPQ_PROFILES = {
     0: ("NEPQ0-S", 2, 6, 0, 320),
     1: ("NEPQ0-L", 3, 7, 0, 832),
@@ -698,6 +702,82 @@ def _subset_nepq_payload(
     return tuple(segments), _sum_segments(segments)
 
 
+def _subset_mxfp4_payload(
+    handle: BinaryIO,
+    pool: MoePool,
+    selected_positions: tuple[int, ...],
+    *,
+    rows_per_expert: int,
+    neuron_len: int,
+) -> tuple[tuple[Segment, ...], int]:
+    header = _read_exact(handle, pool.payload_offset, _MX_HDR.size)
+    (
+        magic,
+        version,
+        kind,
+        reserved,
+        rows,
+        columns,
+        storage_rows,
+        storage_columns,
+        scale_rows,
+        scale_columns,
+    ) = _MX_HDR.unpack(header)
+    expected_rows = len(pool.expert_ids) * rows_per_expert
+    if (
+        magic != _MX_MAGIC
+        or version != _MX_VERSION
+        or kind != _MXFP4_KIND
+        or reserved
+        or rows != expected_rows
+        or columns != neuron_len
+        or storage_rows != expected_rows
+        or storage_columns != neuron_len // 2
+        or scale_rows != expected_rows
+        or scale_columns != neuron_len // 32
+        or neuron_len % 32
+    ):
+        raise ValueError("unsupported sliced MXFP4 pool layout")
+    values_per_expert = rows_per_expert * int(storage_columns)
+    scales_per_expert = rows_per_expert * int(scale_columns)
+    values_offset = pool.payload_offset + _MX_HDR.size
+    scales_offset = values_offset + int(storage_rows * storage_columns)
+    payload_end = scales_offset + int(scale_rows * scale_columns)
+    if payload_end != pool.payload_offset + pool.payload_nbytes:
+        raise ValueError("MXFP4 payload size does not match its metadata")
+    selected_rows = len(selected_positions) * rows_per_expert
+    new_header = _MX_HDR.pack(
+        magic,
+        version,
+        kind,
+        reserved,
+        selected_rows,
+        neuron_len,
+        selected_rows,
+        neuron_len // 2,
+        selected_rows,
+        neuron_len // 32,
+    )
+    segments: list[Segment] = [_literal(new_header)]
+    segments.extend(
+        _selected_stream_segments(
+            source=pool.source,
+            stream_offset=values_offset,
+            bytes_per_expert=values_per_expert,
+            selected_positions=selected_positions,
+        )
+    )
+    segments.extend(
+        _selected_stream_segments(
+            source=pool.source,
+            stream_offset=scales_offset,
+            bytes_per_expert=scales_per_expert,
+            selected_positions=selected_positions,
+        )
+    )
+    return tuple(segments), _sum_segments(segments)
+
+
 def _subset_pool(
     handles: dict[str, BinaryIO],
     pool: MoePool,
@@ -728,6 +808,16 @@ def _subset_pool(
         )
     elif pool.dtype.startswith("NEPQ"):
         payload_segments, payload_nbytes = _subset_nepq_payload(
+            handle,
+            pool,
+            selected_positions,
+            rows_per_expert=rows_per_expert,
+            neuron_len=neuron_len,
+        )
+    elif pool.dtype == "MXFP4":
+        if pool.runtime_nbytes:
+            raise ValueError("MXFP4 pool cannot carry runtime metadata")
+        payload_segments, payload_nbytes = _subset_mxfp4_payload(
             handle,
             pool,
             selected_positions,

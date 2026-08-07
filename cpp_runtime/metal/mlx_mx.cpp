@@ -6,6 +6,7 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -24,7 +25,7 @@ constexpr std::uint8_t kVersion = 1;
 
 class Cursor {
 public:
-    explicit Cursor(const std::vector<std::uint8_t>& blob) : blob_(blob) {}
+    explicit Cursor(std::span<const std::uint8_t> blob) : blob_(blob) {}
 
     template <typename T>
     T scalar(const char* name) {
@@ -37,13 +38,11 @@ public:
         return value;
     }
 
-    std::vector<std::uint8_t> bytes(std::size_t count, const char* name) {
+    std::span<const std::uint8_t> bytes(std::size_t count, const char* name) {
         if (count > remaining()) {
             throw std::runtime_error(std::string("truncated MX ") + name);
         }
-        std::vector<std::uint8_t> value(
-            blob_.begin() + static_cast<std::ptrdiff_t>(offset_),
-            blob_.begin() + static_cast<std::ptrdiff_t>(offset_ + count));
+        auto value = blob_.subspan(offset_, count);
         offset_ += count;
         return value;
     }
@@ -51,7 +50,7 @@ public:
     std::size_t remaining() const noexcept { return blob_.size() - offset_; }
 
 private:
-    const std::vector<std::uint8_t>& blob_;
+    std::span<const std::uint8_t> blob_;
     std::size_t offset_ = 0;
 };
 
@@ -74,7 +73,7 @@ int checked_dimension(std::uint64_t value, const char* name) {
 }
 
 template <typename T>
-array make_array(const std::vector<T>& values, Shape shape) {
+array make_array(std::span<const T> values, Shape shape) {
     return array(values.begin(), std::move(shape));
 }
 
@@ -509,6 +508,14 @@ MlxMxWeight::MlxMxWeight(
 MlxMxWeight MlxMxWeight::from_blob(
     std::string_view dtype,
     const std::vector<std::uint8_t>& blob) {
+    return from_blob(
+        dtype,
+        std::span<const std::uint8_t>(blob));
+}
+
+MlxMxWeight MlxMxWeight::from_blob(
+    std::string_view dtype,
+    std::span<const std::uint8_t> blob) {
     if (!is_mx_dtype(dtype)) {
         throw std::runtime_error("unsupported MX MFQ dtype: " + std::string(dtype));
     }

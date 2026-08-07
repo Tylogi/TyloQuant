@@ -2,6 +2,7 @@
 #include "../mfq_server.h"
 
 #include <iostream>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -21,18 +22,18 @@ void require(bool condition, const char* message) {
 int main(int argc, char** argv) {
     try {
         require(
-            argc == 2,
-            "usage: mfq-metal-tokenizer-test MODEL.mfq");
+            argc == 2 || argc == 3,
+            "usage: mfq-metal-tokenizer-test MODEL.mfq [TEXT]");
         const mfq::metal::MfqContainer model(argv[1]);
         require(
             model.contains(kTokenizerAsset),
             "MFQ has no embedded tokenizer GGUF");
         const auto probe = probe_mfq_tokenizer(
             model.read(kTokenizerAsset),
-            "你好，MFQ");
+            argc == 3 ? argv[2] : "你好，MFQ");
         require(
-            probe.vocab_size == 248320,
-            "embedded tokenizer vocabulary mismatch");
+            probe.vocab_size > 0,
+            "embedded tokenizer has an empty vocabulary");
         require(
             !probe.tokens.empty(),
             "embedded tokenizer returned no tokens");
@@ -42,6 +43,17 @@ int main(int argc, char** argv) {
         require(
             probe.eos_token >= 0 || probe.eot_token >= 0,
             "embedded tokenizer has no end-of-generation token");
+        if (std::getenv("MFQ_TOKENIZER_DUMP_TEMPLATE") != nullptr) {
+            std::cout << probe.chat_template << "\n";
+        }
+        if (argc == 3) {
+            std::cout << "token_ids=";
+            for (std::size_t index = 0; index < probe.tokens.size(); ++index) {
+                if (index != 0) std::cout << ',';
+                std::cout << probe.tokens[index];
+            }
+            std::cout << "\n";
+        }
 
         std::cout
             << "MFQ embedded tokenizer C++ test passed"

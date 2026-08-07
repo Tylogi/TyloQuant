@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "cpp_runtime/moe_cache_transfer.h"
 #include "glu.cuh"
 
 namespace {
@@ -40,6 +41,40 @@ constexpr int kMoeProfileNint3Gs24 = 5;
 constexpr int kMoeProfileNint2Gs16 = 6;
 
 int g_moe_small_mmq_override = -1;
+
+__global__ void moe_cache_scatter_kernel(
+        const std::uint8_t * staging,
+        std::int64_t descriptor_offset,
+        int transfer_count) {
+    const int transfer = static_cast<int>(blockIdx.x);
+    if (transfer >= transfer_count) return;
+    const auto * descriptors =
+        reinterpret_cast<const mfq::MoeCacheScatterDescriptor *>(
+            staging + descriptor_offset);
+    const auto item = descriptors[transfer];
+    auto * destination = reinterpret_cast<std::uint8_t *>(
+        static_cast<std::uintptr_t>(item.destination));
+    const auto * source = staging + item.source_offset;
+    const std::uint64_t nbytes = item.nbytes;
+    if ((((reinterpret_cast<std::uintptr_t>(destination) |
+            reinterpret_cast<std::uintptr_t>(source) |
+            static_cast<std::uintptr_t>(nbytes)) & 15u) == 0u)) {
+        auto * output = reinterpret_cast<uint4 *>(destination);
+        const auto * input = reinterpret_cast<const uint4 *>(source);
+        const std::uint64_t count = nbytes / sizeof(uint4);
+        for (std::uint64_t index = threadIdx.x;
+             index < count;
+             index += blockDim.x) {
+            output[index] = input[index];
+        }
+        return;
+    }
+    for (std::uint64_t index = threadIdx.x;
+         index < nbytes;
+         index += blockDim.x) {
+        destination[index] = source[index];
+    }
+}
 
 bool current_moe_small_mmq() {
     if (g_moe_small_mmq_override >= 0) return g_moe_small_mmq_override != 0;
@@ -3493,6 +3528,21 @@ void launch_nint8_zero_grouped_matmul(
 }
 
 } // namespace
+
+void mfq::moe_cache_scatter_cuda(
+        const std::uint8_t * staging,
+        std::int64_t descriptor_offset,
+        int transfer_count,
+        cudaStream_t stream) {
+    TORCH_CHECK(staging != nullptr, "MoE cache staging pointer is null");
+    TORCH_CHECK(descriptor_offset >= 0,
+        "MoE cache descriptor offset must be non-negative");
+    TORCH_CHECK(transfer_count > 0,
+        "MoE cache scatter requires at least one transfer");
+    moe_cache_scatter_kernel<<<transfer_count, 256, 0, stream>>>(
+        staging, descriptor_offset, transfer_count);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 
 void nint_moe_set_small_mmq_cuda(int64_t mode) {
     TORCH_CHECK(mode >= -1 && mode <= 1, "small-M MoE MMQ mode must be in [-1,1]");
