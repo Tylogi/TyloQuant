@@ -20,18 +20,6 @@ NINT · NVQ/NPQ · NEPQ · TPQ · Gradient Precision Calibration · Expert-Wise 
   <a href="https://huggingface.co/Tylogi">Hugging Face Models</a> · <a href="https://www.modelscope.cn/profile/Tylogi">ModelScope Models</a>
 </p>
 
-**TyloQuant MFQ** (or **MFQ**) co-designs quantization formats, precision
-allocation, and inference kernels for high-fidelity LLM deployment. It supports
-custom weight encodings from `0.84-8.30 bpw`, allocates precision per compute
-group or MoE expert, and executes packed weights directly through CUDA kernels
-and a C++ runtime.
-
-Public MFQ models use a unified `V`/`S` naming scheme: vector-quantized models
-matched to llama.cpp `IQ*` use `V`, while scalar-quantized models matched to
-`Q*_K*` use `S`. For example, `IQ3_XXS → V3-XXS` and
-`Q4_K_XL → S4-L`. See [Model Naming](./MODEL_NAMING.md) for the complete rules
-and registered tiers.
-
 ## Result at a Glance
 
 ### DeepSeek-V4-Flash-0731
@@ -61,6 +49,20 @@ The aligned `ubatch=2048` evaluation compares current, matched-size MFQ files
 with their Unsloth Dynamic recipes. Lower Mean KLD and higher same-top are
 better. All plotted tiers use the complete 145-chunk evaluation of the current
 file.
+
+## Overview
+
+**TyloQuant MFQ** (or **MFQ**) co-designs quantization formats, precision
+allocation, and inference kernels for high-fidelity LLM deployment. It supports
+custom weight encodings from `0.84-8.30 bpw`, allocates precision per compute
+group or MoE expert, and executes packed weights directly through CUDA kernels
+and a C++ runtime.
+
+Public MFQ models use a unified `V`/`S` naming scheme: vector-quantized models
+matched to llama.cpp `IQ*` use `V`, while scalar-quantized models matched to
+`Q*_K*` use `S`. For example, `IQ3_XXS → V3-XXS` and
+`Q4_K_XL → S4-L`. See [Model Naming](./MODEL_NAMING.md) for the complete rules
+and registered tiers.
 
 ## Installation
 

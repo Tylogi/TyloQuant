@@ -20,10 +20,6 @@ NINT · NVQ/NPQ · NEPQ · Gradient Precision Calibration · Expert-Wise MoE · 
   <a href="https://huggingface.co/Tylogi">Hugging Face 模型主页</a> · <a href="https://www.modelscope.cn/profile/Tylogi">ModelScope 模型主页</a>
 </p>
 
-**TyloQuant MFQ**（简称 **MFQ**）联合设计量化格式、精度分配与推理 kernel，面向高保真
-LLM 部署。项目支持 `0.84-8.30 bpw` 的自定义权重编码，可按计算组或 MoE 专家分配精度，
-并由 CUDA kernel 与 C++ runtime 直接执行 packed 权重。
-
 ## 核心结果
 
 ### DeepSeek-V4-Flash-0731
@@ -43,6 +39,12 @@ LLM 部署。项目支持 `0.84-8.30 bpw` 的自定义权重编码，可按计�
 
 完整 WikiText-2 评测包含 145 个 chunk、148,335 个计分 token，并使用同一
 BF16 参考模型。上图所示的每个匹配精度档位中，MFQ 的原始 Mean KLD 均更低。
+
+## 项目简介
+
+**TyloQuant MFQ**（简称 **MFQ**）联合设计量化格式、精度分配与推理 kernel，面向高保真
+LLM 部署。项目支持 `0.84-8.30 bpw` 的自定义权重编码，可按计算组或 MoE 专家分配精度，
+并由 CUDA kernel 与 C++ runtime 直接执行 packed 权重。
 
 ## 安装
 
