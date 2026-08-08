@@ -87,6 +87,17 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_sdpa_path():
     assert "attention_mask.value().eq(1).all().item<bool>()" in DECODE
 
 
+def test_minicpmo45_preserves_qkv_projection_boundaries():
+    assert "bool preserve_projection_boundaries = false" in DECODE
+    assert "std::move(layers), preserve_projection_boundaries" in DECODE
+    assert (
+        'ap + "q_proj.weight", ap + "k_proj.weight", ap + "v_proj.weight"},\n'
+        "            2, nullptr, c.is_minicpmo45())"
+    ) in DECODE
+    assert "f.down, 2, c.is_minicpmo45()" not in DECODE
+    assert "MFQ_DIAGNOSTIC_DISABLE_NINT_GROUP" in DECODE
+
+
 def test_minicpmo45_cli_exposes_tensor_fixture_contract():
     assert 'a == "--minicpmo-input-prefix"' in DECODE
     assert 'a == "--minicpmo-output-prefix"' in DECODE

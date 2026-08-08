@@ -10534,7 +10534,9 @@ static bool is_quant_dtype(const std::string & dtype) {
         is_nvq_linear_dtype(dtype) || dtype == "MXFP8";
 }
 
-static QuantLinearGroup make_quant_group(std::vector<QuantLinear> layers) {
+static QuantLinearGroup make_quant_group(
+        std::vector<QuantLinear> layers,
+        bool preserve_projection_boundaries = false) {
     if (layers.empty()) throw std::runtime_error("empty quantized linear group");
     QuantLinearGroup result;
     result.outs.reserve(layers.size());
@@ -10550,14 +10552,15 @@ static QuantLinearGroup make_quant_group(std::vector<QuantLinear> layers) {
     }
     const char * disable_nint_group =
         std::getenv("MFQ_DIAGNOSTIC_DISABLE_NINT_GROUP");
-    const bool keep_nint_separate =
+    const bool diagnostic_keep_nint_separate =
         disable_nint_group != nullptr && disable_nint_group[0] == '1';
     const bool any_tensor_parallel = std::any_of(
         layers.begin(), layers.end(),
         [](const QuantLinear & layer) {
             return layer.tensor_parallel();
         });
-    if (all_nint && !keep_nint_separate && !g_loading_cpu_layer &&
+    if (all_nint && !preserve_projection_boundaries &&
+        !diagnostic_keep_nint_separate && !g_loading_cpu_layer &&
         !any_tensor_parallel) {
         result.nint_grouped = true;
         result.nint = make_linear_group(nint_weights);
@@ -10594,7 +10597,8 @@ static QuantLinearGroup load_quant_group(
     const MfqFile & mfq, const std::vector<std::string> & names,
     size_t required_compatible_prefix = 0,
     const std::vector<mfq::TensorParallelSlice> *
-        slices_override = nullptr) {
+        slices_override = nullptr,
+    bool preserve_projection_boundaries = false) {
     std::vector<QuantLinear> layers;
     layers.reserve(names.size());
     for (const auto & name : names) {
@@ -10613,7 +10617,8 @@ static QuantLinearGroup load_quant_group(
     // A compatible prefix is fused opportunistically by make_quant_group().
     // Mixed-precision Q/K and gate/up pairs remain separate QuantLinear
     // branches and preserve the recipe-selected layouts.
-    return make_quant_group(std::move(layers));
+    return make_quant_group(
+        std::move(layers), preserve_projection_boundaries);
 }
 
 static std::vector<mfq::TensorParallelSlice>
@@ -15233,7 +15238,8 @@ static std::unique_ptr<Block> load_block(
         b->ffn_norm = load_dense_gpu(mfq, lp + "post_attention_layernorm.weight");
         const std::string ap = lp + "self_attn.";
         b->qkv = load_quant_group(mfq, {
-            ap + "q_proj.weight", ap + "k_proj.weight", ap + "v_proj.weight"}, 2);
+            ap + "q_proj.weight", ap + "k_proj.weight", ap + "v_proj.weight"},
+            2, nullptr, c.is_minicpmo45());
         b->o = load_quant_linear(mfq, ap + "o_proj.weight");
         if (mfq.records.count(ap + "q_norm.weight")) b->q_norm = load_dense_gpu(mfq, ap + "q_norm.weight");
         if (mfq.records.count(ap + "k_norm.weight")) b->k_norm = load_dense_gpu(mfq, ap + "k_norm.weight");
