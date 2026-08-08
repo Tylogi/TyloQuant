@@ -32,6 +32,11 @@ if TYPE_CHECKING:
         TorchNintCausalLMConfig,
         TorchNintCausalLMNames,
     )
+    from mfq.runtime.minicpmo45 import (
+        MiniCPMO45LoadReport,
+        TorchMfqMiniCPMO45,
+        load_minicpmo45,
+    )
     from mfq.runtime.mlx_attention import MlxKVCache, MlxSlidingWindowKVCache
     from mfq.runtime.mlx_causal_lm import (
         MlxCausalLM,
@@ -113,6 +118,11 @@ _TORCH_EXPORTS = {
     "TorchNintCausalLM",
     "TorchNintCausalLMConfig",
     "TorchNintCausalLMNames",
+}
+_MINICPMO45_EXPORTS = {
+    "MiniCPMO45LoadReport",
+    "TorchMfqMiniCPMO45",
+    "load_minicpmo45",
 }
 _TPQ_MFQ_EXPORTS = {
     "MfqCccpStore",
@@ -211,6 +221,10 @@ def __getattr__(name: str):
         from mfq.runtime import causal_lm
 
         value = getattr(causal_lm, name)
+    elif name in _MINICPMO45_EXPORTS:
+        from mfq.runtime import minicpmo45
+
+        value = getattr(minicpmo45, name)
     elif name in _MLX_OP_EXPORTS:
         from mfq.runtime import mlx_ops
 
@@ -285,6 +299,9 @@ __all__ = [
     "TorchNintCausalLM",
     "TorchNintCausalLMConfig",
     "TorchNintCausalLMNames",
+    "MiniCPMO45LoadReport",
+    "TorchMfqMiniCPMO45",
+    "load_minicpmo45",
     "MlxCccpInt4Embedding",
     "MlxCccpInt4Linear",
     "MlxCccpPqLinear",

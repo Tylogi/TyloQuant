@@ -22,6 +22,7 @@ from mfq.tools.quantize_hf_to_mfq import (
     _dtype_for_recipe_type,
     _GlmExpertRowSource,
     _hf_to_gguf_name,
+    _minicpmo45_quantizable_matrix,
     _RawSafeTensorSlice,
     _transform_glm_kv_b,
     _validate_runtime_fused_pairs,
@@ -216,6 +217,137 @@ def test_gemma4_hf_to_gguf_name_mapping(suffix, gguf_suffix):
         _hf_to_gguf_name(f"model.language_model.layers.29.{suffix}")
         == f"blk.29.{gguf_suffix}"
     )
+
+
+def test_minicpmo45_hf_to_gguf_name_mapping():
+    assert _hf_to_gguf_name("llm.model.embed_tokens.weight") == "token_embd.weight"
+    assert _hf_to_gguf_name("llm.model.norm.weight") == "output_norm.weight"
+    assert _hf_to_gguf_name("llm.lm_head.weight") == "output.weight"
+    assert (
+        _hf_to_gguf_name(
+            "llm.model.layers.3.post_attention_layernorm.weight"
+        )
+        == "blk.3.ffn_norm.weight"
+    )
+    assert _hf_to_gguf_name("llm.model.layers.3.self_attn.q_proj.weight") == "blk.3.attn_q.weight"
+    assert _hf_to_gguf_name("llm.model.layers.3.mlp.down_proj.weight") == "blk.3.ffn_down.weight"
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("llm.model.layers.0.self_attn.q_proj.weight", True),
+        ("vpm.encoder.layers.0.self_attn.q_proj.weight", True),
+        ("apm.layers.0.self_attn.q_proj.weight", True),
+        ("tts.emb_text.weight", True),
+        ("resampler.attn.in_proj_weight", False),
+        ("resampler.attn.out_proj.weight", False),
+        ("resampler.proj", False),
+        ("resampler.query", False),
+        ("apm.embed_positions.weight", False),
+        ("vpm.embeddings.position_embedding.weight", False),
+        ("tts.head_code.0.parametrizations.weight.original1", False),
+    ],
+)
+def test_minicpmo45_quantization_policy(name, expected):
+    assert _minicpmo45_quantizable_matrix(name, (8, 8)) is expected
+
+
+def test_minicpmo45_plan_preserves_raw_graph_matrices(tmp_path):
+    root = tmp_path / "minicpmo45"
+    root.mkdir()
+    tensors = {
+        "llm.model.layers.0.self_attn.q_proj.weight": torch.zeros((8, 8), dtype=torch.bfloat16),
+        "vpm.encoder.layers.0.self_attn.q_proj.weight": torch.zeros((8, 8), dtype=torch.bfloat16),
+        "resampler.attn.in_proj_weight": torch.zeros((24, 8), dtype=torch.bfloat16),
+        "resampler.attn.out_proj.weight": torch.zeros((8, 8), dtype=torch.bfloat16),
+        "resampler.proj": torch.zeros((8, 8), dtype=torch.bfloat16),
+        "resampler.query": torch.zeros((4, 8), dtype=torch.bfloat16),
+        "apm.embed_positions.weight": torch.zeros((16, 8), dtype=torch.bfloat16),
+        "vpm.embeddings.position_embedding.weight": torch.zeros((16, 8), dtype=torch.bfloat16),
+        "tts.head_code.0.parametrizations.weight.original1": torch.zeros(
+            (8, 8), dtype=torch.bfloat16
+        ),
+        "apm.conv1.weight": torch.zeros((8, 8, 3), dtype=torch.bfloat16),
+    }
+    save_file(tensors, root / "model.safetensors")
+    (root / "config.json").write_text(
+        json.dumps({"model_type": "minicpmo", "version": "4.5"}),
+        encoding="utf-8",
+    )
+
+    plan = build_hf_plan(root, False, None, "F16")
+    targets = {item.name: item.target_dtype for item in plan}
+
+    assert targets["llm.model.layers.0.self_attn.q_proj.weight"] == "NINT4"
+    assert targets["vpm.encoder.layers.0.self_attn.q_proj.weight"] == "NINT4"
+    for name in tensors:
+        if name not in {
+            "llm.model.layers.0.self_attn.q_proj.weight",
+            "vpm.encoder.layers.0.self_attn.q_proj.weight",
+        }:
+            assert targets[name] == "BF16"
+
+    text_plan = build_hf_plan(root, True, None, "F16")
+    assert [item.name for item in text_plan] == ["llm.model.layers.0.self_attn.q_proj.weight"]
+
+
+def test_minicpmo45_llm_recipe_keeps_other_components_at_source_precision(tmp_path):
+    root = tmp_path / "minicpmo45-recipe"
+    root.mkdir()
+    tensors = {
+        "llm.model.layers.0.self_attn.q_proj.weight": torch.zeros(
+            (8, 8), dtype=torch.bfloat16
+        ),
+        "vpm.encoder.layers.0.self_attn.q_proj.weight": torch.zeros(
+            (8, 8), dtype=torch.bfloat16
+        ),
+        "tts.emb_text.weight": torch.zeros((8, 8), dtype=torch.bfloat16),
+    }
+    save_file(tensors, root / "model.safetensors")
+    (root / "config.json").write_text(
+        json.dumps({"model_type": "minicpmo", "version": "4.5"}),
+        encoding="utf-8",
+    )
+
+    plan = build_hf_plan(
+        root,
+        False,
+        {"blk.0.attn_q.weight": "Q5_K"},
+        "F16",
+    )
+    targets = {item.name: item.target_dtype for item in plan}
+
+    assert targets == {
+        "llm.model.layers.0.self_attn.q_proj.weight": "NINT5",
+        "tts.emb_text.weight": "BF16",
+        "vpm.encoder.layers.0.self_attn.q_proj.weight": "BF16",
+    }
+
+
+def test_minicpmo45_llm_recipe_rejects_an_unmapped_language_tensor(tmp_path):
+    root = tmp_path / "minicpmo45-incomplete-recipe"
+    root.mkdir()
+    name = "llm.model.layers.0.self_attn.k_proj.weight"
+    save_file(
+        {name: torch.zeros((8, 8), dtype=torch.bfloat16)},
+        root / "model.safetensors",
+    )
+    (root / "config.json").write_text(
+        json.dumps({"model_type": "minicpmo", "version": "4.5"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="language tensor is absent from the GGUF recipe",
+    ):
+        build_hf_plan(
+            root,
+            False,
+            {"blk.0.attn_q.weight": "Q5_K"},
+            "F16",
+        )
 
 
 def test_q5_1_recipe_maps_to_nint5():

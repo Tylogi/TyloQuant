@@ -21,6 +21,7 @@ from mfq.kernels.cuda.norm import l2_norm, rms_norm
 from mfq.kernels.cuda.rope import rope
 from mfq.kernels.cuda.sampling import sample
 from mfq.kernels.cuda.ssm_conv import ssm_conv_silu
+from mfq.quantize.nint_quant import NintTensor
 from mfq.runtime.torch_linear import (
     QuantizedTensor,
     TorchLinearGroup,
@@ -32,7 +33,6 @@ from mfq.runtime.torch_linear import (
     TorchSwiGLUFFN,
     is_quantized_tensor,
 )
-from mfq.quantize.nint_quant import NintTensor
 
 TensorMapping = Mapping[str, MfqTensor]
 
@@ -119,6 +119,28 @@ class TorchNintCausalLMConfig:
             norm_weight_offset=1.0,
         )
 
+    @classmethod
+    def from_minicpmo45_hf_config(cls, cfg: dict) -> TorchNintCausalLMConfig:
+        if str(cfg.get("model_type", "")).lower() != "minicpmo":
+            raise ValueError("MiniCPM-o 4.5 config must use model_type='minicpmo'")
+        if str(cfg.get("version", "")) != "4.5":
+            raise ValueError("only MiniCPM-o version 4.5 is supported")
+        return cls(
+            vocab_size=int(cfg["vocab_size"]),
+            hidden_size=int(cfg["hidden_size"]),
+            intermediate_size=int(cfg["intermediate_size"]),
+            num_hidden_layers=int(cfg["num_hidden_layers"]),
+            num_attention_heads=int(cfg["num_attention_heads"]),
+            num_key_value_heads=int(cfg["num_key_value_heads"]),
+            max_position_embeddings=int(cfg["max_position_embeddings"]),
+            attention_head_dim=int(cfg.get("head_dim", 0)) or None,
+            rope_base=float(cfg.get("rope_theta", 1_000_000.0)),
+            rms_norm_eps=float(cfg.get("rms_norm_eps", 1e-6)),
+            tie_word_embeddings=bool(cfg.get("tie_word_embeddings", False)),
+            layer_types=("full_attention",) * int(cfg["num_hidden_layers"]),
+            norm_weight_offset=0.0,
+        )
+
 
 @dataclass(frozen=True)
 class TorchNintCausalLMNames:
@@ -189,6 +211,25 @@ class TorchNintCausalLMNames:
             linear_a="model.language_model.layers.{i}.linear_attn.A_log",
             linear_norm="model.language_model.layers.{i}.linear_attn.norm.weight",
             linear_out="model.language_model.layers.{i}.linear_attn.out_proj.weight",
+        )
+
+    @classmethod
+    def minicpmo45_hf(cls) -> TorchNintCausalLMNames:
+        return cls(
+            token_embd="llm.model.embed_tokens.weight",
+            attn_norm="llm.model.layers.{i}.input_layernorm.weight",
+            attn_q="llm.model.layers.{i}.self_attn.q_proj.weight",
+            attn_k="llm.model.layers.{i}.self_attn.k_proj.weight",
+            attn_v="llm.model.layers.{i}.self_attn.v_proj.weight",
+            attn_out="llm.model.layers.{i}.self_attn.o_proj.weight",
+            attn_q_norm="llm.model.layers.{i}.self_attn.q_norm.weight",
+            attn_k_norm="llm.model.layers.{i}.self_attn.k_norm.weight",
+            ffn_norm="llm.model.layers.{i}.post_attention_layernorm.weight",
+            ffn_gate="llm.model.layers.{i}.mlp.gate_proj.weight",
+            ffn_up="llm.model.layers.{i}.mlp.up_proj.weight",
+            ffn_down="llm.model.layers.{i}.mlp.down_proj.weight",
+            output_norm="llm.model.norm.weight",
+            output="llm.lm_head.weight",
         )
 
 
@@ -551,15 +592,27 @@ class TorchNintCausalLM:
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         *,
+        inputs_embeds: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
-        ids = torch.as_tensor(input_ids, device=self.device, dtype=torch.int64)
-        if ids.dim() == 1:
-            ids = ids.unsqueeze(0)
-        B, T = ids.shape
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("provide exactly one of input_ids or inputs_embeds")
+        ids: torch.Tensor | None = None
+        if input_ids is not None:
+            ids = torch.as_tensor(input_ids, device=self.device, dtype=torch.int64)
+            if ids.dim() == 1:
+                ids = ids.unsqueeze(0)
+            B, T = ids.shape
+        else:
+            x = torch.as_tensor(inputs_embeds, device=self.device)
+            if x.dim() == 2:
+                x = x.unsqueeze(0)
+            if x.dim() != 3 or x.shape[-1] != self.config.hidden_size:
+                raise ValueError("inputs_embeds must have shape [batch, tokens, hidden_size]")
+            B, T, _ = x.shape
         if positions is None:
             cache_pos = self.cache_pos if use_cache else 0
             positions = torch.arange(cache_pos, cache_pos + T, device=self.device, dtype=torch.int64)
@@ -567,8 +620,9 @@ class TorchNintCausalLM:
             positions = torch.as_tensor(positions, device=self.device, dtype=torch.int64)
         if use_cache and self.cache_pos == 0:
             self.reset_cache(B)
-        with _profile_scope("model/embed"):
-            x = self.embed(ids)
+        if ids is not None:
+            with _profile_scope("model/embed"):
+                x = self.embed(ids)
         for i, block in enumerate(self.blocks):
             with _profile_scope(f"model/block_{i:02d}"):
                 x = block.forward(x, positions, use_cache)
@@ -581,7 +635,7 @@ class TorchNintCausalLM:
             logits = self.lm_head(x.reshape(B, T, H))
         return logits
 
-    def __call__(self, input_ids: torch.Tensor, **kwargs) -> torch.Tensor:
+    def __call__(self, input_ids: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
         return self.forward(input_ids, **kwargs)
 
     def generate(
