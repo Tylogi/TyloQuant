@@ -5778,6 +5778,7 @@ struct MoeCacheTransfer {
     uint8_t * destination = nullptr;
     int64_t nbytes = 0;
     bool packed_weight = false;
+    const uint8_t * mapped_source = nullptr;
 };
 
 struct MoeCachedCohort;
@@ -5936,6 +5937,9 @@ struct MoeCacheStats {
     int64_t full_projection_fallbacks = 0;
     int64_t h2d_submissions = 0;
     int64_t h2d_descriptors = 0;
+    int64_t mapped_gather_bytes = 0;
+    int64_t mapped_gather_submissions = 0;
+    int64_t mapped_gather_descriptors = 0;
 };
 
 class MoeExpertCache : public std::enable_shared_from_this<MoeExpertCache> {
@@ -5963,9 +5967,29 @@ public:
             MFQ_CUDA_CHECK(cudaEventCreateWithFlags(
                 &stage.done, cudaEventDisableTiming));
         }
+        const char * mapped = std::getenv("MFQ_MOE_MAPPED_GATHER");
+        mapped_gather_enabled_ =
+            mapped != nullptr && std::atoi(mapped) != 0;
+        const char * blocks =
+            std::getenv("MFQ_MOE_MAPPED_COPY_BLOCKS");
+        if (blocks != nullptr) {
+            mapped_copy_blocks_ = std::max(
+                4, std::min(128, std::atoi(blocks)));
+        }
     }
 
     ~MoeExpertCache() {
+        if (!registered_host_fields_.empty() &&
+                weight_stream_ != nullptr) {
+            (void)cudaStreamSynchronize(weight_stream_);
+        }
+        for (auto it = registered_host_fields_.rbegin();
+             it != registered_host_fields_.rend();
+             ++it) {
+            if (it->owned) {
+                (void)cudaHostUnregister(it->host);
+            }
+        }
         for (auto & stage : stages_) {
             if (stage.done != nullptr) cudaEventDestroy(stage.done);
         }
@@ -6060,6 +6084,52 @@ public:
 
     int64_t allocated_bytes() const noexcept {
         return allocated_bytes_;
+    }
+
+    const uint8_t * register_mapped_field(
+            const torch::Tensor & field) {
+        if (!mapped_gather_enabled_ || !field.defined() ||
+                field.numel() == 0) {
+            return nullptr;
+        }
+        if (!field.is_cpu() || !field.is_contiguous()) {
+            throw std::runtime_error(
+                "mapped MoE cache fields must be contiguous CPU tensors");
+        }
+        auto * host = field.data_ptr();
+        const auto existing = mapped_host_lookup_.find(host);
+        if (existing != mapped_host_lookup_.end()) {
+            return existing->second;
+        }
+        const int64_t bytes = tensor_nbytes(field);
+        if (bytes <= 0 ||
+                static_cast<uint64_t>(bytes) >
+                    std::numeric_limits<size_t>::max()) {
+            throw std::runtime_error(
+                "mapped MoE cache field has an invalid byte count");
+        }
+        cudaError_t status = cudaHostRegister(
+            host,
+            static_cast<size_t>(bytes),
+            cudaHostRegisterMapped);
+        bool owned = true;
+        if (status == cudaErrorHostMemoryAlreadyRegistered) {
+            (void)cudaGetLastError();
+            owned = false;
+        } else {
+            MFQ_CUDA_CHECK(status);
+        }
+        void * device = nullptr;
+        status = cudaHostGetDevicePointer(&device, host, 0);
+        if (status != cudaSuccess) {
+            if (owned) (void)cudaHostUnregister(host);
+            MFQ_CUDA_CHECK(status);
+        }
+        auto * mapped = reinterpret_cast<const uint8_t *>(device);
+        mapped_host_lookup_.emplace(host, mapped);
+        registered_host_fields_.push_back({host, bytes, owned});
+        mapped_registered_bytes_ += bytes;
+        return mapped;
     }
 
     const MoeCacheStats & stats() const noexcept {
@@ -6207,6 +6277,14 @@ public:
                << stats_.h2d_submissions
                << " h2d_descriptors="
                << stats_.h2d_descriptors
+               << " mapped_registered_bytes="
+               << mapped_registered_bytes_
+               << " mapped_gather_bytes="
+               << stats_.mapped_gather_bytes
+               << " mapped_gather_submissions="
+               << stats_.mapped_gather_submissions
+               << " mapped_gather_descriptors="
+               << stats_.mapped_gather_descriptors
                << "\n";
     }
 
@@ -6291,8 +6369,10 @@ private:
             const std::vector<MoeCacheTransfer> & transfers,
             bool waits_for_compute,
             bool wait_on_compute_stream) {
-        int64_t payload_bytes = 0;
+        int64_t staged_payload_bytes = 0;
         int transfer_count = 0;
+        int staged_count = 0;
+        int mapped_count = 0;
         for (const auto & transfer : transfers) {
             if (transfer.nbytes < 0 ||
                 (transfer.nbytes > 0 &&
@@ -6302,15 +6382,22 @@ private:
                     "invalid MoE cache transfer");
             }
             if (transfer.nbytes == 0) continue;
-            payload_bytes =
-                (payload_bytes + 15) & ~int64_t{15};
-            if (transfer.nbytes >
-                    std::numeric_limits<int64_t>::max() -
-                        payload_bytes) {
-                throw std::overflow_error(
-                    "MoE cache transfer byte count overflows int64");
+            const bool direct_mapped =
+                !prewarming_ && transfer.mapped_source != nullptr;
+            if (direct_mapped) {
+                ++mapped_count;
+            } else {
+                staged_payload_bytes =
+                    (staged_payload_bytes + 15) & ~int64_t{15};
+                if (transfer.nbytes >
+                        std::numeric_limits<int64_t>::max() -
+                            staged_payload_bytes) {
+                    throw std::overflow_error(
+                        "MoE cache transfer byte count overflows int64");
+                }
+                staged_payload_bytes += transfer.nbytes;
+                ++staged_count;
             }
-            payload_bytes += transfer.nbytes;
             ++transfer_count;
         }
         if (transfer_count == 0) {
@@ -6325,7 +6412,7 @@ private:
         ++stats_.h2d_submissions;
         stats_.h2d_descriptors += transfer_count;
         if (prewarming_) {
-            auto & stage = acquire_stage(payload_bytes, false);
+            auto & stage = acquire_stage(staged_payload_bytes, false);
             auto * staging = stage.host.data_ptr<uint8_t>();
             int64_t offset = 0;
             for (const auto & transfer : transfers) {
@@ -6359,45 +6446,80 @@ private:
             }
             return;
         }
-        const int64_t descriptor_offset =
-            (payload_bytes + 15) & ~int64_t{15};
-        const int64_t descriptor_bytes =
-            static_cast<int64_t>(transfer_count) *
+        const int64_t scatter_descriptor_offset =
+            (staged_payload_bytes + 15) & ~int64_t{15};
+        const int64_t scatter_descriptor_bytes =
+            static_cast<int64_t>(staged_count) *
             static_cast<int64_t>(
                 sizeof(mfq::MoeCacheScatterDescriptor));
-        if (descriptor_bytes >
+        if (scatter_descriptor_bytes >
                 std::numeric_limits<int64_t>::max() -
-                    descriptor_offset) {
+                    scatter_descriptor_offset) {
             throw std::overflow_error(
                 "MoE cache descriptor byte count overflows int64");
         }
+        const int64_t mapped_descriptor_offset =
+            (scatter_descriptor_offset +
+             scatter_descriptor_bytes + 15) & ~int64_t{15};
+        const int64_t mapped_descriptor_bytes =
+            static_cast<int64_t>(mapped_count) *
+            static_cast<int64_t>(
+                sizeof(mfq::MoeCacheMappedCopyDescriptor));
+        if (mapped_descriptor_bytes >
+                std::numeric_limits<int64_t>::max() -
+                    mapped_descriptor_offset) {
+            throw std::overflow_error(
+                "MoE cache mapped descriptor byte count overflows int64");
+        }
         const int64_t total_bytes =
-            descriptor_offset + descriptor_bytes;
+            mapped_descriptor_offset + mapped_descriptor_bytes;
         auto & stage = acquire_stage(total_bytes, true);
         auto * staging = stage.host.data_ptr<uint8_t>();
-        auto * descriptors =
+        auto * scatter_descriptors =
             reinterpret_cast<mfq::MoeCacheScatterDescriptor *>(
-                staging + descriptor_offset);
+                staging + scatter_descriptor_offset);
+        auto * mapped_descriptors =
+            reinterpret_cast<mfq::MoeCacheMappedCopyDescriptor *>(
+                staging + mapped_descriptor_offset);
         int64_t offset = 0;
-        int descriptor = 0;
+        int scatter_descriptor = 0;
+        int mapped_descriptor = 0;
         for (const auto & transfer : transfers) {
             if (transfer.nbytes == 0) continue;
-            offset = (offset + 15) & ~int64_t{15};
-            std::memcpy(
-                staging + offset,
-                transfer.source,
-                static_cast<size_t>(transfer.nbytes));
-            descriptors[descriptor++] = {
-                static_cast<uint64_t>(
-                    reinterpret_cast<uintptr_t>(
-                        transfer.destination)),
-                static_cast<uint64_t>(offset),
-                static_cast<uint64_t>(transfer.nbytes),
-            };
+            if (transfer.mapped_source != nullptr) {
+                mapped_descriptors[mapped_descriptor++] = {
+                    static_cast<uint64_t>(
+                        reinterpret_cast<uintptr_t>(
+                            transfer.destination)),
+                    static_cast<uint64_t>(
+                        reinterpret_cast<uintptr_t>(
+                            transfer.mapped_source)),
+                    static_cast<uint64_t>(transfer.nbytes),
+                };
+                stats_.mapped_gather_bytes += transfer.nbytes;
+            } else {
+                offset = (offset + 15) & ~int64_t{15};
+                std::memcpy(
+                    staging + offset,
+                    transfer.source,
+                    static_cast<size_t>(transfer.nbytes));
+                scatter_descriptors[scatter_descriptor++] = {
+                    static_cast<uint64_t>(
+                        reinterpret_cast<uintptr_t>(
+                            transfer.destination)),
+                    static_cast<uint64_t>(offset),
+                    static_cast<uint64_t>(transfer.nbytes),
+                };
+                offset += transfer.nbytes;
+            }
             if (transfer.packed_weight) {
                 stats_.h2d_bytes += transfer.nbytes;
             }
-            offset += transfer.nbytes;
+        }
+        if (scatter_descriptor != staged_count ||
+                mapped_descriptor != mapped_count) {
+            throw std::runtime_error(
+                "MoE cache transfer descriptor count mismatch");
         }
         if (waits_for_compute && compute_done_recorded_) {
             MFQ_CUDA_CHECK(cudaStreamWaitEvent(
@@ -6409,11 +6531,26 @@ private:
             static_cast<size_t>(total_bytes),
             cudaMemcpyHostToDevice,
             weight_stream_));
-        mfq::moe_cache_scatter_cuda(
-            stage.device.data_ptr<uint8_t>(),
-            descriptor_offset,
-            transfer_count,
-            weight_stream_);
+        if (staged_count > 0) {
+            mfq::moe_cache_scatter_cuda(
+                stage.device.data_ptr<uint8_t>(),
+                scatter_descriptor_offset,
+                staged_count,
+                weight_stream_);
+        }
+        if (mapped_count > 0) {
+            auto * device_descriptors =
+                reinterpret_cast<const mfq::MoeCacheMappedCopyDescriptor *>(
+                    stage.device.data_ptr<uint8_t>() +
+                    mapped_descriptor_offset);
+            mfq::moe_cache_mapped_gather_cuda(
+                device_descriptors,
+                mapped_count,
+                mapped_copy_blocks_,
+                weight_stream_);
+            ++stats_.mapped_gather_submissions;
+            stats_.mapped_gather_descriptors += mapped_count;
+        }
         MFQ_CUDA_CHECK(cudaEventRecord(stage.done, weight_stream_));
         MFQ_CUDA_CHECK(cudaEventRecord(
             transfer_ready_, weight_stream_));
@@ -6453,6 +6590,16 @@ private:
     std::optional<mfq::MoeCacheProfile> profile_;
     std::vector<mfq::MoeProfileCandidate> prewarm_selected_;
     MoeCacheStats stats_;
+    struct RegisteredHostField {
+        void * host = nullptr;
+        int64_t bytes = 0;
+        bool owned = false;
+    };
+    bool mapped_gather_enabled_ = false;
+    int mapped_copy_blocks_ = 64;
+    int64_t mapped_registered_bytes_ = 0;
+    std::vector<RegisteredHostField> registered_host_fields_;
+    std::unordered_map<void *, const uint8_t *> mapped_host_lookup_;
 };
 
 struct MoeCachedCohort {
@@ -6460,6 +6607,7 @@ struct MoeCachedCohort {
     const MixedMoePool * cpu = nullptr;
     MoeGpuArena * arena = nullptr;
     std::vector<torch::Tensor> cpu_fields;
+    std::vector<const uint8_t *> mapped_fields;
     std::vector<int64_t> bytes_per_expert;
     std::vector<int32_t> expert_to_local;
     std::vector<int32_t> host_map;
@@ -6533,6 +6681,8 @@ public:
                 }
                 cohort.bytes_per_expert.push_back(
                     nbytes / pool.local_experts);
+                cohort.mapped_fields.push_back(
+                    cache_->register_mapped_field(field));
             }
             cohorts_.push_back(std::move(cohort));
         }
@@ -7220,6 +7370,9 @@ void MoeExpertCache::finalize() {
         << " host_bytes=" << host_bytes_
         << " budget_bytes=" << budget_bytes_
         << " allocated_bytes=" << allocated_bytes_
+        << " mapped_gather=" << (mapped_gather_enabled_ ? 1 : 0)
+        << " mapped_registered_bytes=" << mapped_registered_bytes_
+        << " mapped_copy_blocks=" << mapped_copy_blocks_
         << std::endl;
     if (profile_.has_value()) prewarm();
 }
@@ -7371,6 +7524,10 @@ void MoeExpertCache::append_source_transfers(
                         nbytes,
                     nbytes,
                     true,
+                    cohort.mapped_fields.at(field) == nullptr
+                        ? nullptr
+                        : cohort.mapped_fields.at(field) +
+                            static_cast<int64_t>(local_index) * nbytes,
                 });
             }
         }

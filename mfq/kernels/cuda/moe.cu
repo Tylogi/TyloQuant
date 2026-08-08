@@ -76,6 +76,41 @@ __global__ void moe_cache_scatter_kernel(
     }
 }
 
+__global__ void moe_cache_mapped_gather_kernel(
+        const mfq::MoeCacheMappedCopyDescriptor * descriptors,
+        int transfer_count) {
+    const int transfer = static_cast<int>(blockIdx.y);
+    if (transfer >= transfer_count) return;
+    const auto item = descriptors[transfer];
+    auto * destination = reinterpret_cast<std::uint8_t *>(
+        static_cast<std::uintptr_t>(item.destination));
+    const auto * source = reinterpret_cast<const std::uint8_t *>(
+        static_cast<std::uintptr_t>(item.source));
+    const std::uint64_t nbytes = item.nbytes;
+    const std::uint64_t worker =
+        static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::uint64_t workers =
+        static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+    if ((((reinterpret_cast<std::uintptr_t>(destination) |
+            reinterpret_cast<std::uintptr_t>(source) |
+            static_cast<std::uintptr_t>(nbytes)) & 15u) == 0u)) {
+        auto * output = reinterpret_cast<uint4 *>(destination);
+        const auto * input = reinterpret_cast<const uint4 *>(source);
+        const std::uint64_t count = nbytes / sizeof(uint4);
+        for (std::uint64_t index = worker;
+             index < count;
+             index += workers) {
+            output[index] = input[index];
+        }
+        return;
+    }
+    for (std::uint64_t index = worker;
+         index < nbytes;
+         index += workers) {
+        destination[index] = source[index];
+    }
+}
+
 bool current_moe_small_mmq() {
     if (g_moe_small_mmq_override >= 0) return g_moe_small_mmq_override != 0;
     static const bool enabled = [] {
@@ -3541,6 +3576,25 @@ void mfq::moe_cache_scatter_cuda(
         "MoE cache scatter requires at least one transfer");
     moe_cache_scatter_kernel<<<transfer_count, 256, 0, stream>>>(
         staging, descriptor_offset, transfer_count);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void mfq::moe_cache_mapped_gather_cuda(
+        const MoeCacheMappedCopyDescriptor * descriptors,
+        int transfer_count,
+        int blocks_per_transfer,
+        cudaStream_t stream) {
+    TORCH_CHECK(descriptors != nullptr,
+        "MoE cache mapped-copy descriptor pointer is null");
+    TORCH_CHECK(transfer_count > 0,
+        "MoE cache mapped gather requires at least one transfer");
+    TORCH_CHECK(blocks_per_transfer >= 1 && blocks_per_transfer <= 128,
+        "MoE cache mapped gather blocks must be in [1, 128]");
+    const dim3 grid(
+        static_cast<unsigned int>(blocks_per_transfer),
+        static_cast<unsigned int>(transfer_count));
+    moe_cache_mapped_gather_kernel<<<grid, 256, 0, stream>>>(
+        descriptors, transfer_count);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
