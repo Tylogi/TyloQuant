@@ -1,4 +1,4 @@
-# MiniCPM-o 4.5 Python Runtime
+# MiniCPM-o 4.5 Runtime
 
 MFQ supports the official `OpenBMB/MiniCPM-o-4_5` composite graph in the
 Python/CUDA runtime. The official remote-code modules continue to own image and
@@ -78,7 +78,40 @@ print(runtime.load_report)
 streaming, duplex, and TTS entry points. Call them with the same processor data
 and arguments used by the official repository.
 
-The native C++ server does not yet implement this composite graph. Quality and
-performance results require a calibrated checkpoint and modality-specific
-reference evaluation; structural support alone does not establish those
-results.
+## Native C++ composite graph
+
+`mfq-decode` has a CUDA-native tensor interface for SigLIP, the Resampler,
+Whisper, the audio projector, Qwen3, and the TTS code decoder. It reads tensors
+produced by the official processor from files sharing an input prefix:
+
+The converter embeds the official NumPy-generated Resampler position table as
+a versioned BF16 runtime asset. The C++ graph requires this asset so
+cross-attention does not depend on platform-specific sin/cos rounding.
+
+- `<prefix>.input_ids.pt` is required.
+- Image input uses `pixel_values`, `patch_mask`, `target_sizes`, and
+  `image_bounds` files. Bounds have rows `[batch, source, begin, end]`.
+- Audio input uses `audio_features`, `audio_lengths`, and `audio_bounds` files
+  with the same bound layout.
+- TTS accepts `tts_inputs_embeds` directly, or derives the condition from the
+  LLM hidden states selected by the two-element `tts_bound` tensor.
+
+Each name above uses the `.pt` suffix. Run the graph with:
+
+```bash
+mfq-decode \
+  --mfq /models/MiniCPM-o-4_5-Q4KM-table.mfq \
+  --minicpmo-input-prefix /data/request \
+  --minicpmo-output-prefix /data/result \
+  --minicpmo-tts-steps 2
+```
+
+The output prefix receives component states, merged input embeddings, Qwen3
+hidden states and logits, plus TTS code logits and generated codes when TTS is
+enabled. The native graph produces S3 audio codes. Token2wav waveform rendering
+still uses the assets supplied with the official model directory.
+
+The HTTP server does not yet parse raw MiniCPM-o image and audio requests.
+Quality and performance results require a calibrated checkpoint and
+modality-specific reference evaluation; structural support alone does not
+establish those results.

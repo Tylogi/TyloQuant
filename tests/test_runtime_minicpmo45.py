@@ -51,6 +51,28 @@ def test_minicpmo45_dense_bfloat16_bits_are_preserved():
     np.testing.assert_array_equal(result.view(torch.uint16).numpy(), bits)
 
 
+def test_minicpmo45_dense_float_storage_uses_official_bfloat16_compute_dtype():
+    value = np.asarray([1.25, -2.5], dtype=np.float32)
+
+    result = _dense_to_torch(value, "cpu", dtype=torch.bfloat16)
+
+    assert result.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        result.float(),
+        torch.tensor([1.25, -2.5]),
+        atol=0,
+        rtol=0,
+    )
+
+
+def test_minicpmo45_dense_integer_state_is_not_cast_to_bfloat16():
+    value = np.asarray([1, 2, 3], dtype=np.int64)
+
+    result = _dense_to_torch(value, "cpu", dtype=torch.bfloat16)
+
+    assert result.dtype == torch.int64
+
+
 def test_minicpmo45_record_dtype_detection():
     assert _record_is_quantized("NINT4")
     assert _record_is_quantized("NVQ3J512")

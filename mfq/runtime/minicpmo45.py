@@ -77,7 +77,7 @@ class _MfqLinearModule(nn.Module):
         if bias is None:
             self.register_buffer("bias", None, persistent=False)
         else:
-            dense_bias = _dense_to_torch(bias, self.device)
+            dense_bias = _dense_to_torch(bias, self.device, dtype=weight_dtype)
             if tuple(dense_bias.shape) != (self.out_features,):
                 raise ValueError(
                     f"linear bias shape mismatch: {tuple(dense_bias.shape)} != "
@@ -318,7 +318,11 @@ def _load_minicpmo45(
             value = store[name]
             if is_quantized_tensor(value):
                 raise TypeError(f"quantized state was not replaced by a module: {name}")
-            dense_state[name] = _dense_to_torch(value, target_device)
+            dense_state[name] = _dense_to_torch(
+                value,
+                target_device,
+                dtype=weight_dtype,
+            )
 
         load_result = model.load_state_dict(dense_state, strict=False, assign=True)
         if load_result.missing_keys or load_result.unexpected_keys:
@@ -369,13 +373,20 @@ def _replace_module(root: nn.Module, name: str, replacement: nn.Module) -> None:
         setattr(parent, child_name, replacement)
 
 
-def _dense_to_torch(value: np.ndarray, device: str | torch.device) -> torch.Tensor:
+def _dense_to_torch(
+    value: np.ndarray,
+    device: str | torch.device,
+    *,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
     is_bfloat16 = io.is_bfloat16_array(value)
     array = np.ascontiguousarray(value)
     if is_bfloat16:
         tensor = torch.from_numpy(array.view(np.uint16)).view(torch.bfloat16)
     else:
         tensor = torch.from_numpy(array)
+    if dtype is not None and tensor.is_floating_point():
+        tensor = tensor.to(dtype=dtype)
     return tensor.to(device=device).contiguous()
 
 

@@ -18,6 +18,7 @@
 #include "moe_cache_profile.h"
 #include "tensor_parallel.h"
 #include "nvq_codebooks.generated.h"
+#include "json.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -10813,6 +10814,8 @@ static DenseLinearGroup make_fp32_quant_group(QuantLinearGroup group) {
 
 struct Config {
     std::string model_type;
+    std::string hf_model_prefix = "model.language_model.";
+    std::string hf_output_name = "lm_head.weight";
     int64_t vocab_size = 0, hidden_size = 0, intermediate_size = 0, num_hidden_layers = 0;
     int64_t num_attention_heads = 0, num_key_value_heads = 0, max_position_embeddings = 0;
     int64_t head_dim = 0;
@@ -10856,6 +10859,7 @@ struct Config {
     bool is_gemma4() const { return model_type == "gemma4" || model_type == "gemma4_text"; }
     bool is_glm_dsa() const { return model_type == "glm_moe_dsa"; }
     bool is_dsv4() const { return model_type == "deepseek_v4"; }
+    bool is_minicpmo45() const { return model_type == "minicpmo"; }
     int64_t attention_size() const { return num_attention_heads * head_dim; }
     int64_t kv_size() const { return num_key_value_heads * head_dim; }
     int64_t linear_k_size() const { return linear_num_key_heads * linear_key_head_dim; }
@@ -10953,6 +10957,46 @@ static std::vector<int64_t> json_int_array(
 }
 
 static Config parse_config_json(const std::string & s) {
+    const auto document = nlohmann::json::parse(s, nullptr, false);
+    if (document.is_object() &&
+            document.value("model_type", std::string{}) == "minicpmo") {
+        if (document.value("version", std::string{}) != "4.5") {
+            throw std::runtime_error(
+                "only MiniCPM-o version 4.5 is supported");
+        }
+        Config c;
+        c.model_type = "minicpmo";
+        c.hf_model_prefix = "llm.model.";
+        c.hf_output_name = "llm.lm_head.weight";
+        c.vocab_size = document.at("vocab_size").get<int64_t>();
+        c.hidden_size = document.at("hidden_size").get<int64_t>();
+        c.intermediate_size = document.at("intermediate_size").get<int64_t>();
+        c.num_hidden_layers = document.at("num_hidden_layers").get<int64_t>();
+        c.num_attention_heads = document.at("num_attention_heads").get<int64_t>();
+        c.num_key_value_heads = document.at("num_key_value_heads").get<int64_t>();
+        c.max_position_embeddings =
+            document.at("max_position_embeddings").get<int64_t>();
+        c.head_dim = document.value(
+            "head_dim", c.hidden_size / c.num_attention_heads);
+        c.rope_base = document.value("rope_theta", 1000000.0);
+        c.rotary_dim = c.head_dim;
+        c.rms_norm_eps = document.value("rms_norm_eps", 1e-6);
+        c.tie_word_embeddings =
+            document.value("tie_word_embeddings", false);
+        c.norm_weight_offset = 0.0;
+        c.layer_types.assign(
+            static_cast<size_t>(c.num_hidden_layers), "full_attention");
+        if (c.hidden_size != 4096 || c.intermediate_size != 12288 ||
+            c.num_hidden_layers != 36 || c.num_attention_heads != 32 ||
+            c.num_key_value_heads != 8 || c.head_dim != 128 ||
+            document.value("hidden_act", std::string{}) != "silu" ||
+            document.value("attention_bias", true) ||
+            document.value("use_sliding_window", true)) {
+            throw std::runtime_error(
+                "unsupported MiniCPM-o 4.5 Qwen3 configuration");
+        }
+        return c;
+    }
     Config c;
     c.model_type = json_string(s, "model_type");
     c.vocab_size = json_int(s, "vocab_size");
@@ -11173,6 +11217,20 @@ static torch::Tensor qwen_rms_norm(torch::Tensor x, torch::Tensor weight, const 
     return rms_norm_offset_cuda(x, weight, c.rms_norm_eps, c.norm_weight_offset);
 }
 
+static torch::Tensor qwen_rms_norm_bf16(
+        torch::Tensor x, torch::Tensor weight, const Config & c) {
+    auto input = x.contiguous().to(torch::kBFloat16);
+    auto xf = input.to(torch::kFloat32);
+    auto inverse = torch::rsqrt(
+        xf.square().mean(-1, true) + c.rms_norm_eps);
+    auto normalized = (xf * inverse).to(torch::kBFloat16);
+    auto scale = weight.contiguous().to(torch::kBFloat16);
+    if (c.norm_weight_offset != 0.0) {
+        scale = scale + c.norm_weight_offset;
+    }
+    return (scale * normalized).contiguous();
+}
+
 static torch::Tensor gemma_rms_norm_f16(
     torch::Tensor x, torch::Tensor weight, const Config & c) {
     TORCH_CHECK(x.scalar_type() == torch::kFloat16,
@@ -11265,6 +11323,44 @@ struct RopeCache {
         }
         return rope_table_cuda(x.contiguous().to(torch::kFloat32), pos.contiguous().to(torch::kCUDA, torch::kInt64),
                                cos, sin, rotary_dim, sections);
+    }
+
+    torch::Tensor apply_bf16(torch::Tensor x, torch::Tensor pos) const {
+        TORCH_CHECK(
+            sections.numel() == 0,
+            "Qwen3 BF16 RoPE does not support multi-axis sections");
+        auto positions = pos.contiguous().to(cos.device(), torch::kInt64)
+            .clamp(0, cos.size(0) - 1);
+        torch::Tensor selected_cos;
+        torch::Tensor selected_sin;
+        if (positions.dim() == 1) {
+            selected_cos = cos.index_select(0, positions)
+                .to(torch::kBFloat16).unsqueeze(0).unsqueeze(0);
+            selected_sin = sin.index_select(0, positions)
+                .to(torch::kBFloat16).unsqueeze(0).unsqueeze(0);
+        } else if (positions.dim() == 2) {
+            const int64_t batches = positions.size(0);
+            const int64_t tokens = positions.size(1);
+            selected_cos = cos.index_select(0, positions.reshape({-1}))
+                .reshape({batches, tokens, rotary_dim / 2})
+                .to(torch::kBFloat16).unsqueeze(1);
+            selected_sin = sin.index_select(0, positions.reshape({-1}))
+                .reshape({batches, tokens, rotary_dim / 2})
+                .to(torch::kBFloat16).unsqueeze(1);
+        } else {
+            throw std::runtime_error(
+                "Qwen3 BF16 RoPE positions must be rank one or two");
+        }
+        auto xb = x.contiguous().to(torch::kBFloat16);
+        const int64_t half = rotary_dim / 2;
+        auto first = xb.narrow(-1, 0, half);
+        auto second = xb.narrow(-1, half, half);
+        auto output = xb.clone();
+        output.narrow(-1, 0, half).copy_(
+            first * selected_cos - second * selected_sin);
+        output.narrow(-1, half, half).copy_(
+            second * selected_cos + first * selected_sin);
+        return output.contiguous();
     }
 };
 
@@ -12024,6 +12120,14 @@ struct FFN {
             return g_profiler.measure("ffn.down", [&]() { return down.forward(act); });
         }
         auto parts = g_profiler.measure("ffn.gate_up", [&]() { return gate_up.forward(xh); });
+        if (down.is_dense() || down.is_mxfp8()) {
+            auto activation = g_profiler.measure("ffn.swiglu", [&]() {
+                return (parts[1] * torch::silu(parts[0])).contiguous();
+            });
+            return g_profiler.measure("ffn.down", [&]() {
+                return down.forward(activation);
+            });
+        }
         return g_profiler.measure("ffn.down", [&]() { return down.forward_input_mul(parts[1], parts[0], 2); });
     }
 
@@ -12047,19 +12151,21 @@ struct KVCache {
             int64_t max_seq,
             int64_t D,
             bool use_ring = false,
-            torch::Device device = torch::Device(torch::kCUDA))
+            torch::Device device = torch::Device(torch::kCUDA),
+            torch::ScalarType dtype = torch::kFloat16)
         : ring(use_ring) {
-        auto opts = torch::TensorOptions().device(device).dtype(torch::kFloat16);
+        auto opts = torch::TensorOptions().device(device).dtype(dtype);
         k = torch::zeros({B, H, max_seq, D}, opts);
         v = torch::zeros({B, H, max_seq, D}, opts);
     }
     std::pair<torch::Tensor, torch::Tensor> append(
             torch::Tensor kk, torch::Tensor vv, torch::Tensor pos,
             int64_t start_pos, int64_t end_pos) {
-        auto kh = kk.to(torch::kFloat16).contiguous();
-        auto vh = vv.to(torch::kFloat16).contiguous();
+        auto kh = kk.to(k.scalar_type()).contiguous();
+        auto vh = vv.to(v.scalar_type()).contiguous();
         const char * aten_write_env = std::getenv("MFQ_KV_CACHE_WRITE_ATEN");
-        const bool aten_write = aten_write_env != nullptr && aten_write_env[0] == '1';
+        const bool aten_write = k.scalar_type() != torch::kFloat16 ||
+            (aten_write_env != nullptr && aten_write_env[0] == '1');
         if (!k.is_cuda() || aten_write) {
             auto slots = ring ? torch::remainder(pos, k.size(2)) : pos;
             slots = slots.to(torch::kInt64).contiguous();
@@ -13033,6 +13139,9 @@ struct FullBlock : Block {
                           const c10::optional<torch::Tensor> & seq_len,
                           const Config & c, const RopeCache & rope) override {
         int64_t B = x.size(0), T = x.size(1), H = x.size(2);
+        if (c.is_minicpmo45() && x.scalar_type() != torch::kBFloat16) {
+            x = x.to(torch::kBFloat16).contiguous();
+        }
         const int64_t nh = attention_heads > 0 ? attention_heads : c.num_attention_heads;
         const int64_t nkh = kv_heads > 0 ? kv_heads : c.num_key_value_heads;
         const int64_t hd = attention_head_dim > 0 ? attention_head_dim : c.head_dim;
@@ -13046,7 +13155,8 @@ struct FullBlock : Block {
         const RopeCache & active_rope = attention_rope.cos.defined() ? attention_rope : rope;
         if (!cache.k.defined() || cache.k.numel() == 0) {
             cache = KVCache(
-                B, nkh, cache_capacity, hd, sliding, x.device());
+                B, nkh, cache_capacity, hd, sliding, x.device(),
+                c.is_minicpmo45() ? torch::kBFloat16 : torch::kFloat16);
             if (x.is_cuda()) {
                 const int64_t total = B * nh;
                 auto opts = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
@@ -13057,7 +13167,13 @@ struct FullBlock : Block {
         }
         auto residual = x;
         auto xn = g_profiler.measure("full.attn_norm", [&]() {
-            return qwen_rms_norm(x.reshape({B * T, H}).to(torch::kFloat32), attn_norm, c).reshape({B, T, H});
+            return c.is_minicpmo45()
+                ? qwen_rms_norm_bf16(
+                    x.reshape({B * T, H}), attn_norm, c)
+                    .reshape({B, T, H})
+                : qwen_rms_norm(
+                    x.reshape({B * T, H}).to(torch::kFloat32), attn_norm, c)
+                    .reshape({B, T, H});
         });
         auto parts = g_profiler.measure("full.qkv", [&]() { return qkv.forward(xn); });
         if (parts.size() != (value_equals_key ? 2u : 3u)) {
@@ -13065,6 +13181,11 @@ struct FullBlock : Block {
         }
         auto q_full = parts[0], k_full = parts[1];
         auto v_full = value_equals_key ? k_full : parts[2];
+        if (c.is_minicpmo45()) {
+            q_full = q_full.to(torch::kBFloat16).contiguous();
+            k_full = k_full.to(torch::kBFloat16).contiguous();
+            v_full = v_full.to(torch::kBFloat16).contiguous();
+        }
         torch::Tensor q_raw, q_gate;
         g_profiler.measure("full.qkv_view", [&]() {
             if (c.qwen35_attn_q_gate) {
@@ -13080,11 +13201,40 @@ struct FullBlock : Block {
         auto q = g_profiler.measure("full.q_view", [&]() { return q_raw.transpose(1, 2).contiguous(); });
         auto k = g_profiler.measure("full.k_view", [&]() { return k_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous(); });
         auto v = g_profiler.measure("full.v_view", [&]() { return v_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous(); });
-        if (q_norm.defined()) q = g_profiler.measure("full.q_norm", [&]() { return qwen_rms_norm(q.reshape({-1, hd}).to(torch::kFloat32), q_norm, c).reshape_as(q); });
-        if (k_norm.defined()) k = g_profiler.measure("full.k_norm", [&]() { return qwen_rms_norm(k.reshape({-1, hd}).to(torch::kFloat32), k_norm, c).reshape_as(k); });
-        if (v_norm.defined()) v = g_profiler.measure("full.v_norm", [&]() { return qwen_rms_norm(v.reshape({-1, hd}).to(torch::kFloat32), v_norm, c).reshape_as(v); });
-        q = g_profiler.measure("full.q_rope", [&]() { return active_rope.apply(q, pos, c); });
-        k = g_profiler.measure("full.k_rope", [&]() { return active_rope.apply(k, pos, c); });
+        if (q_norm.defined()) q = g_profiler.measure("full.q_norm", [&]() {
+            return c.is_minicpmo45()
+                ? qwen_rms_norm_bf16(
+                    q.reshape({-1, hd}), q_norm, c).reshape_as(q)
+                : qwen_rms_norm(
+                    q.reshape({-1, hd}).to(torch::kFloat32), q_norm, c)
+                    .reshape_as(q);
+        });
+        if (k_norm.defined()) k = g_profiler.measure("full.k_norm", [&]() {
+            return c.is_minicpmo45()
+                ? qwen_rms_norm_bf16(
+                    k.reshape({-1, hd}), k_norm, c).reshape_as(k)
+                : qwen_rms_norm(
+                    k.reshape({-1, hd}).to(torch::kFloat32), k_norm, c)
+                    .reshape_as(k);
+        });
+        if (v_norm.defined()) v = g_profiler.measure("full.v_norm", [&]() {
+            return c.is_minicpmo45()
+                ? qwen_rms_norm_bf16(
+                    v.reshape({-1, hd}), v_norm, c).reshape_as(v)
+                : qwen_rms_norm(
+                    v.reshape({-1, hd}).to(torch::kFloat32), v_norm, c)
+                    .reshape_as(v);
+        });
+        q = g_profiler.measure("full.q_rope", [&]() {
+            return c.is_minicpmo45()
+                ? active_rope.apply_bf16(q, pos)
+                : active_rope.apply(q, pos, c);
+        });
+        k = g_profiler.measure("full.k_rope", [&]() {
+            return c.is_minicpmo45()
+                ? active_rope.apply_bf16(k, pos)
+                : active_rope.apply(k, pos, c);
+        });
         auto kv = g_profiler.measure("full.kv_write", [&]() { return cache.append(k, v, pos, cache_pos, cache_pos + T); });
         double attn_scale = attention_scale > 0.0 ? attention_scale : 1.0 / std::sqrt((double)hd);
         torch::Tensor a;
@@ -13129,10 +13279,27 @@ struct FullBlock : Block {
                 return at::scaled_dot_product_attention(
                     qh, kh, vh, mask, 0.0, false, attn_scale, false);
             }
-            auto qh = q.to(torch::kFloat16).contiguous();
-            auto kh = k.to(torch::kFloat16).contiguous();
-            auto vh = v.to(torch::kFloat16).contiguous();
+            const auto attention_dtype = c.is_minicpmo45()
+                ? torch::kBFloat16 : torch::kFloat16;
+            auto qh = q.to(attention_dtype).contiguous();
+            auto kh = k.to(attention_dtype).contiguous();
+            auto vh = v.to(attention_dtype).contiguous();
             if (cache_pos == 0 && T > 1) {
+                if (c.is_minicpmo45()) {
+                    auto repeated_k = kh;
+                    auto repeated_v = vh;
+                    if (nkh != nh) {
+                        TORCH_CHECK(
+                            nh % nkh == 0,
+                            "MiniCPM-o Qwen3 attention head ratio is invalid");
+                        const int64_t repeat = nh / nkh;
+                        repeated_k = kh.repeat_interleave(repeat, 1).contiguous();
+                        repeated_v = vh.repeat_interleave(repeat, 1).contiguous();
+                    }
+                    a = at::scaled_dot_product_attention(
+                        qh, repeated_k, repeated_v, std::nullopt,
+                        0.0, true, attn_scale, false);
+                } else {
                 const char * llama_flash_env = std::getenv("MFQ_LLAMA_FLASH256");
                 const bool llama_flash_enabled =
                     llama_flash_env == nullptr || llama_flash_env[0] != '0';
@@ -13158,12 +13325,13 @@ struct FullBlock : Block {
                     a = at::scaled_dot_product_attention(
                         qh, kh, vh, std::nullopt, 0.0, true, attn_scale, true);
                 }
+                }
             } else if (seq_len.has_value()) {
                 const int64_t planned_len = g_decode_graph_attention_kv_len > 0
                     ? g_decode_graph_attention_kv_len : cache_pos + T;
                 const char * aten_decode_env = std::getenv("MFQ_ATTENTION_DECODE_ATEN");
-                const bool aten_decode_enabled =
-                    aten_decode_env != nullptr && aten_decode_env[0] == '1';
+                const bool aten_decode_enabled = c.is_minicpmo45() ||
+                    (aten_decode_env != nullptr && aten_decode_env[0] == '1');
                 const char * llama_decode_env = std::getenv("MFQ_LLAMA_FLASH_DECODE");
                 const bool llama_decode_enabled =
                     llama_decode_env == nullptr || llama_decode_env[0] != '0';
@@ -13194,9 +13362,34 @@ struct FullBlock : Block {
                         Slice(), Slice(), Slice(0, visible_len), Slice()}).contiguous();
                     auto cached_v = cache.v.index({
                         Slice(), Slice(), Slice(0, visible_len), Slice()}).contiguous();
+                    c10::optional<torch::Tensor> mask = c10::nullopt;
+                    if (c.is_minicpmo45() && (T > 1 || B > 1)) {
+                        auto options = torch::TensorOptions()
+                            .device(qh.device()).dtype(torch::kInt64);
+                        auto key_positions = torch::arange(visible_len, options);
+                        auto query_positions = pos.dim() == 1
+                            ? pos.to(qh.device(), torch::kInt64)
+                            : pos.select(0, 0).to(qh.device(), torch::kInt64);
+                        auto allowed = key_positions.unsqueeze(0) <=
+                            query_positions.unsqueeze(1);
+                        allowed = allowed.unsqueeze(0).expand({B, T, visible_len});
+                        auto lengths = seq_len.value()
+                            .to(qh.device(), torch::kInt64).reshape({B, 1, 1});
+                        allowed = allowed &
+                            (key_positions.reshape({1, 1, visible_len}) < lengths);
+                        mask = allowed.unsqueeze(1);
+                    }
+                    if (c.is_minicpmo45() && nkh != nh) {
+                        TORCH_CHECK(
+                            nh % nkh == 0,
+                            "MiniCPM-o Qwen3 attention head ratio is invalid");
+                        const int64_t repeat = nh / nkh;
+                        cached_k = cached_k.repeat_interleave(repeat, 1).contiguous();
+                        cached_v = cached_v.repeat_interleave(repeat, 1).contiguous();
+                    }
                     a = at::scaled_dot_product_attention(
-                        qh, cached_k, cached_v, std::nullopt,
-                        0.0, false, attn_scale, true);
+                        qh, cached_k, cached_v, mask,
+                        0.0, false, attn_scale, !c.is_minicpmo45());
                 } else if (sliding && T == 1 && llama_decode_enabled && hd == 256 && nh == 2 * nkh) {
                     const int64_t visible_len = std::min<int64_t>(attention_window, planned_len);
                     prepare_llama_decode_workspace(visible_len, 64);
@@ -13241,11 +13434,30 @@ struct FullBlock : Block {
                                 qh, cache.k, cache.v, seq_len.value(), attn_scale);
                 }
             } else {
-                a = sliding
-                    ? attention_swa_cuda(qh, kv.first.contiguous(), kv.second.contiguous(),
-                                         attn_scale, attention_window)
-                    : attention_cuda(qh, kv.first.contiguous(), kv.second.contiguous(),
-                                     attn_scale, true);
+                if (c.is_minicpmo45()) {
+                    auto cached_k = kv.first.contiguous();
+                    auto cached_v = kv.second.contiguous();
+                    if (nkh != nh) {
+                        TORCH_CHECK(
+                            nh % nkh == 0,
+                            "MiniCPM-o Qwen3 attention head ratio is invalid");
+                        const int64_t repeat = nh / nkh;
+                        cached_k = cached_k.repeat_interleave(repeat, 1).contiguous();
+                        cached_v = cached_v.repeat_interleave(repeat, 1).contiguous();
+                    }
+                    a = at::scaled_dot_product_attention(
+                        qh, cached_k, cached_v, std::nullopt,
+                        0.0, cache_pos == 0 && T > 1,
+                        attn_scale, false);
+                } else {
+                    a = sliding
+                        ? attention_swa_cuda(
+                            qh, kv.first.contiguous(), kv.second.contiguous(),
+                            attn_scale, attention_window)
+                        : attention_cuda(
+                            qh, kv.first.contiguous(), kv.second.contiguous(),
+                            attn_scale, true);
+                }
             }
             return a;
         });
@@ -13263,6 +13475,9 @@ struct FullBlock : Block {
                     a.transpose(1, 2).contiguous().reshape({B, T, attn_width});
             });
             oo = g_profiler.measure("full.o_proj", [&]() { return o.forward(af); });
+        }
+        if (c.is_minicpmo45()) {
+            oo = oo.to(torch::kBFloat16).contiguous();
         }
         if (gemma4) {
             trace_gemma_stage(layer, "attention_output", oo);
@@ -13435,8 +13650,10 @@ struct FullBlock : Block {
             if (!rr.is_cuda()) {
                 auto summed = (rr.to(torch::kFloat32) + oo2.to(torch::kFloat32))
                     .to(rr.scalar_type()).contiguous();
-                auto normalized = qwen_rms_norm(
-                    summed.to(torch::kFloat32), ffn_norm, c);
+                auto normalized = c.is_minicpmo45()
+                    ? qwen_rms_norm_bf16(summed, ffn_norm, c)
+                    : qwen_rms_norm(
+                        summed.to(torch::kFloat32), ffn_norm, c);
                 return std::vector<torch::Tensor>{summed, normalized};
             }
             const char * fp32_residual_env =
@@ -13452,13 +13669,48 @@ struct FullBlock : Block {
             if (rr.scalar_type() == torch::kFloat16 && oo2.scalar_type() == torch::kFloat16) {
                 return acc_rms_norm_f16_cuda(rr, oo2, ffn_norm, c.rms_norm_eps, c.norm_weight_offset);
             }
+            if (rr.scalar_type() == torch::kBFloat16 &&
+                    oo2.scalar_type() == torch::kBFloat16) {
+                auto sum = (rr + oo2).contiguous();
+                auto norm = c.is_minicpmo45()
+                    ? qwen_rms_norm_bf16(sum, ffn_norm, c)
+                    : qwen_rms_norm(
+                        sum.to(torch::kFloat32), ffn_norm, c)
+                        .to(torch::kBFloat16)
+                        .contiguous();
+                return std::vector<torch::Tensor>{sum, norm};
+            }
             return acc_rms_norm_cuda(rr, oo2, ffn_norm, c.rms_norm_eps, c.norm_weight_offset);
         });
         x = attn_pair[0].reshape({B, T, H});
         residual = x;
         xn = attn_pair[1].reshape({B, T, H});
-        auto ff = ffn.forward(xn.reshape({B * T, H})).reshape({B, T, H});
-        return g_profiler.measure("full.ffn_residual", [&]() {
+        torch::Tensor ff;
+        if (c.is_minicpmo45()) {
+            auto ffn_input = xn.reshape({B * T, H});
+            auto gate_up = g_profiler.measure(
+                "full.minicpmo45_ffn_gate_up",
+                [&]() { return ffn.gate_up.forward(ffn_input); });
+            TORCH_CHECK(
+                gate_up.size() == 2,
+                "MiniCPM-o Qwen3 FFN requires separate Gate and Up outputs");
+            auto gate = gate_up[0].to(torch::kBFloat16).contiguous();
+            auto up = gate_up[1].to(torch::kBFloat16).contiguous();
+            auto activation = g_profiler.measure(
+                "full.minicpmo45_ffn_swiglu",
+                [&]() {
+                    return (torch::silu(gate) * up).contiguous();
+                });
+            ff = g_profiler.measure(
+                "full.minicpmo45_ffn_down",
+                [&]() { return ffn.down.forward(activation); })
+                .reshape({B, T, H})
+                .to(torch::kBFloat16)
+                .contiguous();
+        } else {
+            ff = ffn.forward(xn.reshape({B * T, H})).reshape({B, T, H});
+        }
+        auto output = g_profiler.measure("full.ffn_residual", [&]() {
             auto rr = residual.reshape({-1, H});
             auto ff2 = ff.reshape({-1, H});
             if (!rr.is_cuda()) {
@@ -13472,8 +13724,13 @@ struct FullBlock : Block {
                 rr = rr.to(torch::kFloat32);
                 ff2 = ff2.to(torch::kFloat32);
             }
+            if (rr.scalar_type() == torch::kBFloat16 &&
+                    ff2.scalar_type() == torch::kBFloat16) {
+                return (rr + ff2).contiguous().reshape({B, T, H});
+            }
             return acc_cuda(rr, ff2).reshape({B, T, H});
         });
+        return output;
     }
 };
 
@@ -14329,7 +14586,8 @@ static FFN load_ffn(const MfqFile & mfq, const Config & c, int i, bool gguf_name
         load_important_neuron_branch(
             mfq, c, f, down_name, gate_name, up_name);
     } else {
-        std::string p = "model.language_model.layers." + std::to_string(i) + ".mlp.";
+        std::string p = c.hf_model_prefix + "layers." +
+            std::to_string(i) + ".mlp.";
         const std::string expert_gate_up = p + "experts.gate_up_proj";
         const std::string expert_down = p + "experts.down_proj";
         if (mfq.records.count(expert_gate_up) || mfq.records.count(expert_down)) {
@@ -14894,7 +15152,8 @@ static std::unique_ptr<Block> load_block(
         }
         throw std::runtime_error("unsupported layer type: " + type);
     }
-    std::string lp = "model.language_model.layers." + std::to_string(i) + ".";
+    std::string lp = c.hf_model_prefix + "layers." +
+        std::to_string(i) + ".";
     if (type == "full_attention") {
         auto b = std::make_unique<FullBlock>();
         b->layer = i;
@@ -14973,33 +15232,39 @@ struct Model {
 
     torch::Tensor embed_forward(torch::Tensor ids) const {
         auto token_ids = ids.contiguous().to(torch::kCUDA, torch::kInt64);
+        torch::Tensor output;
         if (embed.is_dense()) {
             auto output_shape = token_ids.sizes().vec();
             output_shape.push_back(embed.dense.size(1));
-            return embed.dense.index_select(
+            output = embed.dense.index_select(
                 0, token_ids.reshape({-1})).reshape(output_shape);
-        }
-        if (embed.is_nvq()) {
-            return nvq_embedding(embed.nvq.w, token_ids);
-        }
-        TORCH_CHECK(
-            embed.is_nint(),
-            "MXFP8 token embeddings are not supported by the CUDA runtime");
-        if (embed.nint.w.q8_zero) {
-            return nint8_zero_embedding_lookup_cuda(
+        } else if (embed.is_nvq()) {
+            output = nvq_embedding(embed.nvq.w, token_ids);
+        } else {
+            TORCH_CHECK(
+                embed.is_nint(),
+                "MXFP8 token embeddings are not supported by the CUDA runtime");
+            if (embed.nint.w.q8_zero) {
+                output = nint8_zero_embedding_lookup_cuda(
                 embed.nint.w.q_packed, embed.nint.w.q8_zero_scale,
                 token_ids, embed.nint.w.neuron_len);
-        }
-        if (embed.nint.w.bits == 4) {
-            return nint_embedding_lookup_packed_compact_cuda(
+            } else if (embed.nint.w.bits == 4) {
+                output = nint_embedding_lookup_packed_compact_cuda(
                 embed.nint.w.q_packed, embed.nint.w.sub_scale, embed.nint.w.sub_min,
                 embed.nint.w.neuron_scale, embed.nint.w.neuron_min,
                 token_ids, embed.nint.w.neuron_len, embed.nint.w.gs);
+            } else {
+                output = nint_embedding_lookup_packed_compact_bits_cuda(
+                    embed.nint.w.q_packed, embed.nint.w.sub_scale,
+                    embed.nint.w.sub_min, embed.nint.w.neuron_scale,
+                    embed.nint.w.neuron_min, token_ids,
+                    embed.nint.w.neuron_len, embed.nint.w.gs,
+                    embed.nint.w.bits);
+            }
         }
-        return nint_embedding_lookup_packed_compact_bits_cuda(
-            embed.nint.w.q_packed, embed.nint.w.sub_scale, embed.nint.w.sub_min,
-            embed.nint.w.neuron_scale, embed.nint.w.neuron_min,
-            token_ids, embed.nint.w.neuron_len, embed.nint.w.gs, embed.nint.w.bits);
+        return c.is_minicpmo45()
+            ? output.to(torch::kBFloat16).contiguous()
+            : output;
     }
 
     void reset(int64_t B) {
@@ -15029,9 +15294,13 @@ struct Model {
             });
         }
         return g_profiler.measure("model.output_norm", [&]() {
-            return qwen_rms_norm(
-                x.reshape({B * T, c.hidden_size}).to(torch::kFloat32),
-                output_norm, c).reshape({B, T, c.hidden_size});
+            return c.is_minicpmo45()
+                ? qwen_rms_norm_bf16(
+                    x.reshape({B * T, c.hidden_size}), output_norm, c)
+                    .reshape({B, T, c.hidden_size})
+                : qwen_rms_norm(
+                    x.reshape({B * T, c.hidden_size}).to(torch::kFloat32),
+                    output_norm, c).reshape({B, T, c.hidden_size});
         });
     }
 
@@ -15044,11 +15313,38 @@ struct Model {
         ids = tensor_to_cuda_device(
             ids.to(torch::kInt64), primary);
         if (ids.dim() == 1) ids = ids.unsqueeze(0);
-        int64_t B = ids.size(0), T = ids.size(1);
+        auto x = g_profiler.measure("model.embed", [&]() { return embed_forward(ids); });
+        return hidden_forward_inputs(
+            ids, x, pos_override, seq_len, block_trace);
+    }
+
+    torch::Tensor hidden_forward_inputs(
+            torch::Tensor ids,
+            torch::Tensor input_embeddings,
+            c10::optional<torch::Tensor> pos_override = c10::nullopt,
+            c10::optional<torch::Tensor> seq_len = c10::nullopt,
+            std::vector<torch::Tensor> * block_trace = nullptr) {
+        const int primary = g_layer_placement.primary_device();
+        c10::cuda::CUDAGuard primary_guard(primary);
+        ids = tensor_to_cuda_device(
+            ids.to(torch::kInt64), primary);
+        if (ids.dim() == 1) ids = ids.unsqueeze(0);
+        if (input_embeddings.dim() != 3 ||
+                input_embeddings.size(0) != ids.size(0) ||
+                input_embeddings.size(1) != ids.size(1) ||
+                input_embeddings.size(2) != c.hidden_size) {
+            throw std::runtime_error(
+                "inputs_embeds shape must match [batch,tokens,hidden_size]");
+        }
+        const int64_t B = ids.size(0);
+        const int64_t T = ids.size(1);
         if (cache_pos == 0) reset(B);
         auto pos = pos_override.has_value()
-            ? pos_override.value()
-            : torch::arange(cache_pos, cache_pos + T, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kInt64));
+            ? tensor_to_cuda_device(pos_override.value(), primary)
+            : torch::arange(
+                cache_pos, cache_pos + T,
+                torch::TensorOptions().device(torch::kCUDA)
+                    .dtype(torch::kInt64));
         torch::Tensor cpu_ids, cpu_pos;
         c10::optional<torch::Tensor> cpu_seq_len = c10::nullopt;
         if (g_dense_cpu_layer_count > 0) {
@@ -15059,7 +15355,11 @@ struct Model {
                     .to(torch::kCPU, torch::kInt64).contiguous();
             }
         }
-        auto x = g_profiler.measure("model.embed", [&]() { return embed_forward(ids); });
+        auto x = tensor_to_cuda_device(
+            input_embeddings, primary).contiguous();
+        if (c.is_minicpmo45()) {
+            x = x.to(torch::kBFloat16).contiguous();
+        }
         if (c.is_gemma4()) {
             x = g_profiler.measure("model.embed_scale", [&]() {
                 return x * c.embed_scale;
@@ -15108,8 +15408,20 @@ struct Model {
         return finalize_hidden(x, B, T);
     }
 
+    torch::Tensor forward_inputs(
+            torch::Tensor ids,
+            torch::Tensor input_embeddings,
+            c10::optional<torch::Tensor> pos_override = c10::nullopt,
+            c10::optional<torch::Tensor> seq_len = c10::nullopt) {
+        return logits_from_hidden(hidden_forward_inputs(
+            ids, input_embeddings, pos_override, seq_len));
+    }
+
     torch::Tensor logits_from_hidden(torch::Tensor y) {
         auto logits = g_profiler.measure("model.lm_head", [&]() { return lm_head.forward(y); });
+        if (c.is_minicpmo45()) {
+            logits = logits.to(torch::kBFloat16).contiguous();
+        }
         if (c.final_logit_softcapping > 0.0) {
             logits = torch::tanh(logits / c.final_logit_softcapping) *
                 c.final_logit_softcapping;
@@ -15288,14 +15600,16 @@ static Model load_model(const std::string & mfq_path, const std::string & config
     }
     const bool gguf_names = mfq.records.count("token_embd.weight") != 0;
     m.c.norm_weight_offset =
-        (gguf_names || m.c.is_gemma4() || m.c.is_glm_dsa()) ? 0.0 : 1.0;
+        (gguf_names || m.c.is_gemma4() || m.c.is_glm_dsa() ||
+         m.c.is_minicpmo45()) ? 0.0 : 1.0;
     const std::string hf_prefix = m.c.is_glm_dsa()
-        ? "model." : "model.language_model.";
+        ? "model." : m.c.hf_model_prefix;
     const std::string embed_name = gguf_names
         ? "token_embd.weight" : hf_prefix + "embed_tokens.weight";
     const std::string norm_name = gguf_names
         ? "output_norm.weight" : hf_prefix + "norm.weight";
-    const std::string output_name = gguf_names ? "output.weight" : "lm_head.weight";
+    const std::string output_name = gguf_names
+        ? "output.weight" : m.c.hf_output_name;
     m.embed = load_quant_linear(mfq, embed_name);
     m.output_norm = load_dense_gpu(mfq, norm_name);
     if (m.c.is_dsv4()) {
@@ -15385,6 +15699,8 @@ static Model load_model(const std::string & mfq_path, const std::string & config
     }
     return m;
 }
+
+#include "minicpmo45_runtime.inc"
 
 static std::vector<int64_t> parse_ids(const std::string & s) {
     std::vector<int64_t> ids;
@@ -20695,6 +21011,7 @@ int main(int argc, char ** argv) {
     } tensor_parallel_collective_cleanup;
     try {
         std::string mfq_path, config_path, ids_arg, ids_file;
+        std::string minicpmo_input_prefix, minicpmo_output_prefix;
         std::string check_linear, check_linear_cpu, check_linear_gate, kl_base;
         std::string kl_save_logits_f16;
         std::string check_tp_linear;
@@ -20726,6 +21043,7 @@ int main(int argc, char ** argv) {
         int cpu_threads = 0;
         int server_port = 8080;
         int64_t context_size = 0;
+        int64_t minicpmo_tts_steps = 0;
         int kl_chunks = -1;
         int kl_score_count = -1;
         int64_t kl_n_batch = 0;
@@ -20793,6 +21111,15 @@ int main(int argc, char ** argv) {
             else if (a == "--config" && i + 1 < argc) config_path = argv[++i];
             else if (a == "--ids" && i + 1 < argc) ids_arg = argv[++i];
             else if (a == "--ids-file" && i + 1 < argc) ids_file = argv[++i];
+            else if (a == "--minicpmo-input-prefix" && i + 1 < argc) {
+                minicpmo_input_prefix = argv[++i];
+            }
+            else if (a == "--minicpmo-output-prefix" && i + 1 < argc) {
+                minicpmo_output_prefix = argv[++i];
+            }
+            else if (a == "--minicpmo-tts-steps" && i + 1 < argc) {
+                minicpmo_tts_steps = std::stoll(argv[++i]);
+            }
             else if (a == "--check-linear" && i + 1 < argc) check_linear = argv[++i];
             else if (a == "--check-linear-cpu" && i + 1 < argc) {
                 check_linear_cpu = argv[++i];
@@ -21264,6 +21591,27 @@ int main(int argc, char ** argv) {
         }
         if (check_dsv4_hc) {
             return run_dsv4_hc_check(check_attention_reps);
+        }
+        if (!minicpmo_input_prefix.empty()) {
+            if (mfq_path.empty() || minicpmo_output_prefix.empty()) {
+                throw std::runtime_error(
+                    "--minicpmo-input-prefix requires --mfq and "
+                    "--minicpmo-output-prefix");
+            }
+            if (server_mode || !ids_arg.empty() || !ids_file.empty() ||
+                    !kl_base.empty() || !prefill_sweep_arg.empty()) {
+                throw std::runtime_error(
+                    "MiniCPM-o composite mode cannot be combined with "
+                    "token, server, KL, or prefill modes");
+            }
+            if (minicpmo_tts_steps < 0) {
+                throw std::runtime_error(
+                    "--minicpmo-tts-steps must be non-negative");
+            }
+            return run_minicpmo45_composite(
+                mfq_path, config_path,
+                minicpmo_input_prefix, minicpmo_output_prefix,
+                context_size, minicpmo_tts_steps);
         }
         if (mfq_path.empty() ||
             (!server_mode && ids_arg.empty() && ids_file.empty() &&
