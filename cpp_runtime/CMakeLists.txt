@@ -268,6 +268,10 @@ target_link_libraries(mfq-decode PRIVATE
     CUDA::cublas
     mfq-server
 )
+find_package(OpenMP QUIET)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(mfq-decode PRIVATE OpenMP::OpenMP_CXX)
+endif()
 if (MFQ_NCCL_LIBRARY AND MFQ_NCCL_INCLUDE_DIR)
     target_include_directories(mfq-decode PRIVATE
         "${MFQ_NCCL_INCLUDE_DIR}")

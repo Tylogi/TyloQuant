@@ -1,4 +1,5 @@
 #include <torch/torch.h>
+#include <ATen/Parallel.h>
 #include <ATen/ops/scaled_dot_product_attention.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAGraph.h>
@@ -47,6 +48,11 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#if defined(__x86_64__) && defined(__GNUC__)
+#include <immintrin.h>
+#define MFQ_CPU_X86_GNU 1
+#endif
 
 #ifndef _WIN32
 #include <fcntl.h>
@@ -722,6 +728,11 @@ static int64_t g_kl_mmq_fallback_calls = 0;
 static int64_t g_kl_kv_cache_capacity = 0;
 static std::unordered_set<int> g_dsv4_cpu_offload_layers;
 static int64_t g_dsv4_cpu_offload_host_bytes = 0;
+// llama.cpp-style repeating-layer placement: the first layers stay on CPU and
+// the last n_gpu_layers stay on CUDA.  -1 keeps the historical all-CUDA path.
+static int g_n_gpu_layers = -1;
+static int g_dense_cpu_layer_count = 0;
+static bool g_loading_cpu_layer = false;
 class MoeExpertCache;
 class MoeCachedSource;
 static std::shared_ptr<MoeExpertCache> g_moe_expert_cache;
@@ -7884,14 +7895,46 @@ static torch::Tensor nvq_dequant(const NvqWeight & w) {
         w.sub_bits, w.kernel_format, w.sign_mode);
 }
 
+static torch::Tensor dequant_nint8_zero_cpu(const Nint8ZeroCpu & source) {
+    TORCH_CHECK(source.shape.size() == 2,
+        "CPU NINT8-0 dense tensor must be rank 2");
+    auto packed = to_device_nint8_zero(source, false);
+    auto result = torch::empty(
+        source.shape,
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32));
+    const auto * quantized =
+        reinterpret_cast<const int8_t *>(packed.q_packed.data_ptr<uint8_t>());
+    const c10::Half * scales = packed.q8_zero_scale.data_ptr<c10::Half>();
+    float * output = result.data_ptr<float>();
+    at::parallel_for(0, source.out, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t row = begin; row < end; ++row) {
+            for (int64_t group = 0; group < source.ng; ++group) {
+                const int64_t meta = row * source.ng + group;
+                const float scale = static_cast<float>(scales[meta]);
+                const int64_t k0 = group * 32;
+                const int64_t valid = std::min<int64_t>(
+                    32, source.neuron_len - k0);
+                for (int64_t index = 0; index < valid; ++index) {
+                    output[row * source.neuron_len + k0 + index] =
+                        scale * static_cast<float>(quantized[meta * 32 + index]);
+                }
+            }
+        }
+    });
+    return result.contiguous();
+}
+
 static torch::Tensor load_dense_gpu(const MfqFile & mfq, const std::string & name) {
     c10::cuda::CUDAGuard guard(
         active_weight_load_device());
     const auto & rec = mfq.record(name);
     auto blob = mfq.read_blob(name);
     if (rec.dtype == "NINT8-0") {
-        const auto packed = to_gpu_nint8_zero(
-            unpack_nint8_zero(blob));
+        const auto source = unpack_nint8_zero(blob);
+        if (g_loading_cpu_layer) {
+            return dequant_nint8_zero_cpu(source);
+        }
+        const auto packed = to_gpu_nint8_zero(source);
         auto dense = nint8_zero_dequant_cuda(
             packed.q_packed,
             packed.q8_zero_scale,
@@ -7929,7 +7972,9 @@ static torch::Tensor load_dense_gpu(const MfqFile & mfq, const std::string & nam
         throw std::runtime_error("unsupported dense dtype for C++ runtime: " + rec.dtype + " tensor " + name);
     }
     (void)numel;
-    return t.to(torch::kCUDA).contiguous();
+    return g_loading_cpu_layer
+        ? t.contiguous()
+        : t.to(torch::kCUDA).contiguous();
 }
 
 static torch::Tensor load_dense_linear_cpu(
@@ -8114,7 +8159,439 @@ static NvqMatmulPath select_nvq_matmul_path(const NvqWeight & w, int M) {
     return NvqMatmulPath::DequantGemm;
 }
 
+static inline uint32_t cpu_load_packed_bits(
+        const uint8_t * data,
+        int64_t nbytes,
+        int64_t bit,
+        int bits) {
+    const int64_t byte = bit >> 3;
+    const int shift = static_cast<int>(bit & 7);
+    uint32_t word = data[byte];
+    if (byte + 1 < nbytes) word |= static_cast<uint32_t>(data[byte + 1]) << 8;
+    if (byte + 2 < nbytes) word |= static_cast<uint32_t>(data[byte + 2]) << 16;
+    return (word >> shift) & ((1u << bits) - 1u);
+}
+
+#ifdef MFQ_CPU_X86_GNU
+__attribute__((target("avx512f,avx512bw,avx512vnni")))
+static int32_t cpu_dot_s8_s8_vnni(
+        const int8_t * left,
+        const int8_t * right,
+        int32_t right_sum) {
+    const __m512i signed_a = _mm512_loadu_si512(
+        reinterpret_cast<const __m512i *>(left));
+    const __m512i a = _mm512_xor_si512(
+        signed_a, _mm512_set1_epi8(static_cast<char>(-128)));
+    const __m512i b = _mm512_loadu_si512(
+        reinterpret_cast<const __m512i *>(right));
+    const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), a, b);
+    return _mm512_reduce_add_epi32(dot) - 128 * right_sum;
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vnni")))
+static int32_t cpu_dot_u8_s8_vnni(
+        const uint8_t * left,
+        const int8_t * right) {
+    const __m512i a = _mm512_loadu_si512(
+        reinterpret_cast<const __m512i *>(left));
+    const __m512i b = _mm512_loadu_si512(
+        reinterpret_cast<const __m512i *>(right));
+    const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), a, b);
+    return _mm512_reduce_add_epi32(dot);
+}
+
+static bool cpu_has_avx512_vnni() {
+    static const bool supported = []() {
+        __builtin_cpu_init();
+        return __builtin_cpu_supports("avx512f") &&
+            __builtin_cpu_supports("avx512bw") &&
+            __builtin_cpu_supports("avx512vnni");
+    }();
+    return supported;
+}
+#endif
+
+static inline int32_t cpu_dot_s8_s8_64(
+        const int8_t * left,
+        const int8_t * right,
+        int32_t right_sum) {
+#ifdef MFQ_CPU_X86_GNU
+    if (cpu_has_avx512_vnni()) {
+        return cpu_dot_s8_s8_vnni(left, right, right_sum);
+    }
+#endif
+    int32_t result = 0;
+    for (int index = 0; index < 64; ++index) {
+        result += static_cast<int32_t>(left[index]) *
+            static_cast<int32_t>(right[index]);
+    }
+    return result;
+}
+
+static inline int32_t cpu_dot_u8_s8_64(
+        const uint8_t * left,
+        const int8_t * right) {
+#ifdef MFQ_CPU_X86_GNU
+    if (cpu_has_avx512_vnni()) return cpu_dot_u8_s8_vnni(left, right);
+#endif
+    int32_t result = 0;
+    for (int index = 0; index < 64; ++index) {
+        result += static_cast<int32_t>(left[index]) *
+            static_cast<int32_t>(right[index]);
+    }
+    return result;
+}
+
+static inline void cpu_unpack_nint_group(
+        const uint8_t * packed,
+        int bits,
+        int valid,
+        uint8_t * values) {
+    std::fill(values, values + 64, static_cast<uint8_t>(0));
+    if (bits == 8) {
+        std::memcpy(values, packed, static_cast<size_t>(valid));
+        return;
+    }
+    const uint32_t mask = (1u << bits) - 1u;
+    uint32_t reservoir = 0;
+    int available = 0;
+    int source = 0;
+    for (int index = 0; index < valid; ++index) {
+        while (available < bits) {
+            reservoir |= static_cast<uint32_t>(packed[source++]) << available;
+            available += 8;
+        }
+        values[index] = static_cast<uint8_t>(reservoir & mask);
+        reservoir >>= bits;
+        available -= bits;
+    }
+}
+
+struct CpuQuantizedActivation {
+    int64_t rows = 0;
+    int64_t groups = 0;
+    int64_t group_size = 0;
+    std::vector<int8_t> values;
+    std::vector<float> scales;
+    std::vector<int32_t> sums;
+};
+
+static CpuQuantizedActivation cpu_quantize_activation(
+        torch::Tensor x,
+        int64_t width,
+        int64_t group_size,
+        bool with_sums) {
+    TORCH_CHECK(!x.is_cuda(), "CPU activation quantization requires a CPU tensor");
+    x = pad_last(x.contiguous().to(torch::kFloat16), width).contiguous();
+    const int64_t rows = x.size(0);
+    const int64_t groups = (width + group_size - 1) / group_size;
+    TORCH_CHECK(group_size > 0 && group_size <= 64,
+        "CPU compact GEMV group size must be in [1, 64]");
+    CpuQuantizedActivation result;
+    result.rows = rows;
+    result.groups = groups;
+    result.group_size = group_size;
+    result.values.resize(static_cast<size_t>(rows * groups * 64));
+    result.scales.resize(static_cast<size_t>(rows * groups));
+    if (with_sums) {
+        result.sums.resize(static_cast<size_t>(rows * groups));
+    }
+    const c10::Half * input = x.data_ptr<c10::Half>();
+    at::parallel_for(0, rows * groups, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t linear = begin; linear < end; ++linear) {
+            const int64_t row = linear / groups;
+            const int64_t group = linear - row * groups;
+            const int64_t k0 = group * group_size;
+            const int64_t valid = std::min(group_size, width - k0);
+            float maximum = 0.0f;
+            for (int64_t index = 0; index < valid; ++index) {
+                maximum = std::max(
+                    maximum,
+                    std::fabs(static_cast<float>(input[row * width + k0 + index])));
+            }
+            const float scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
+            result.scales[static_cast<size_t>(linear)] = scale;
+            int32_t sum = 0;
+            int8_t * quantized = result.values.data() + linear * 64;
+            for (int64_t index = 0; index < valid; ++index) {
+                int value = static_cast<int>(std::round(
+                    static_cast<float>(input[row * width + k0 + index]) / scale));
+                value = std::max(-127, std::min(127, value));
+                quantized[index] = static_cast<int8_t>(value);
+                sum += value;
+            }
+            std::fill(
+                quantized + valid,
+                quantized + 64,
+                static_cast<int8_t>(0));
+            if (with_sums) {
+                result.sums[static_cast<size_t>(linear)] = sum;
+            }
+        }
+    });
+    return result;
+}
+
+static float cpu_half_from_bytes(const int8_t * bytes, int64_t offset) {
+    uint16_t raw = 0;
+    std::memcpy(&raw, bytes + offset, sizeof(raw));
+    c10::Half value;
+    std::memcpy(&value, &raw, sizeof(raw));
+    return static_cast<float>(value);
+}
+
+static int cpu_nvq_index_bits(int format) {
+    switch (format) {
+        case 10: case 11: return 8;
+        case 13: case 15: return 10;
+        case 14: return 12;
+        default:
+            throw std::runtime_error(
+                "CPU dense offload does not support NVQ kernel format " +
+                std::to_string(format));
+    }
+}
+
+static bool cpu_nvq_d4(int format) {
+    return format == 10 || format == 11 || format == 15;
+}
+
+static const int8_t * cpu_nvq_codebook(
+        const int8_t * metadata,
+        int format,
+        uint32_t state) {
+    constexpr int64_t header = 64;
+    const uint32_t bank = format == 11
+        ? state & 1u
+        : static_cast<uint8_t>(metadata[36 + state]);
+    if (format == 10 || format == 11) {
+        return metadata + header + bank * 256 * 4;
+    }
+    if (format == 13) return metadata + header + bank * 1024 * 8;
+    if (format == 14) return metadata + header + bank * 4096 * 8;
+    if (format == 15) return metadata + header + bank * 1024 * 4;
+    throw std::runtime_error("unsupported CPU NVQ codebook format");
+}
+
+static float cpu_nvq_scale(
+        const int8_t * metadata,
+        int format,
+        float anchor,
+        uint32_t state) {
+    if (format == 11) {
+        return anchor * static_cast<float>((state >> 1) + 1);
+    }
+    return anchor * cpu_half_from_bytes(
+        metadata, 4 + static_cast<int64_t>(state) * 2);
+}
+
+static int cpu_nvq_parity7(uint32_t value) {
+    value &= 0x7fu;
+    value ^= value >> 4;
+    value ^= value >> 2;
+    value ^= value >> 1;
+    return static_cast<int>(value & 1u);
+}
+
+static void cpu_decode_nvq_group(
+        const NvqWeight & w,
+        int row,
+        int group,
+        uint32_t state,
+        int8_t values[64]) {
+    std::fill(values, values + 64, static_cast<int8_t>(0));
+    const int format = static_cast<int>(w.kernel_format);
+    const bool d4 = cpu_nvq_d4(format);
+    const int vector_size = d4 ? 4 : 8;
+    const int nvec = static_cast<int>(
+        (w.neuron_len + vector_size - 1) / vector_size);
+    const int nsign = static_cast<int>((w.neuron_len + 7) / 8);
+    const auto * indices = w.indices_packed.data_ptr<uint8_t>();
+    const auto * aux = w.aux_packed.data_ptr<uint8_t>();
+    const int bits = cpu_nvq_index_bits(format);
+    const int8_t * bank = cpu_nvq_codebook(
+        w.codebook.data_ptr<int8_t>(), format, state);
+    for (int segment = 0; segment < 3; ++segment) {
+        const int vector8 = group * 3 + segment;
+        if (vector8 >= nsign) break;
+        const int64_t sign_linear = static_cast<int64_t>(row) * nsign + vector8;
+        const uint32_t mask7 = cpu_load_packed_bits(
+            aux, w.aux_packed.numel(), sign_linear * 7, 7);
+        const uint32_t mask8 = mask7 |
+            (static_cast<uint32_t>(cpu_nvq_parity7(mask7)) << 7);
+        const int chunks = d4 ? 2 : 1;
+        for (int chunk = 0; chunk < chunks; ++chunk) {
+            const int vector = d4 ? group * 6 + segment * 2 + chunk : vector8;
+            if (vector >= nvec) continue;
+            const int64_t index_linear = static_cast<int64_t>(row) * nvec + vector;
+            const uint32_t code = bits == 8
+                ? indices[index_linear]
+                : cpu_load_packed_bits(
+                    indices, w.indices_packed.numel(), index_linear * bits, bits);
+            const int8_t * source = bank +
+                static_cast<int64_t>(code) * vector_size;
+            const int count = d4 ? 4 : 8;
+            const int destination = segment * 8 + chunk * 4;
+            for (int index = 0; index < count; ++index) {
+                const int sign_index = chunk * 4 + index;
+                values[destination + index] =
+                    ((mask8 >> sign_index) & 1u) != 0
+                    ? static_cast<int8_t>(-source[index])
+                    : source[index];
+            }
+        }
+    }
+}
+
+static torch::Tensor nvq_matmul_cpu(
+        const NvqWeight & w,
+        torch::Tensor x) {
+    TORCH_CHECK(!x.is_cuda(), "CPU NVQ GEMV requires CPU activations");
+    TORCH_CHECK(
+        !w.indices_packed.is_cuda() && !w.sub_scale_packed.is_cuda() &&
+        !w.neuron_scale.is_cuda() && !w.codebook.is_cuda(),
+        "CPU NVQ GEMV requires CPU-resident weights");
+    TORCH_CHECK(w.gs == 24,
+        "CPU NVQ GEMV currently requires 24-value groups");
+    auto activation = cpu_quantize_activation(
+        std::move(x), w.neuron_len, w.gs, true);
+    const int64_t rows = activation.rows;
+    const int64_t outputs = w.out;
+    auto result = torch::empty(
+        {rows, outputs},
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat16));
+    c10::Half * output = result.data_ptr<c10::Half>();
+    const uint8_t * scales = w.sub_scale_packed.data_ptr<uint8_t>();
+    const float * anchors = w.neuron_scale.data_ptr<float>();
+    const int8_t * metadata = w.codebook.data_ptr<int8_t>();
+    const int64_t scale_bytes = w.sub_scale_packed.numel();
+    at::parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
+        std::vector<float> accumulators(static_cast<size_t>(rows));
+        for (int64_t neuron = begin; neuron < end; ++neuron) {
+            std::fill(accumulators.begin(), accumulators.end(), 0.0f);
+            for (int group = 0; group < w.ng; ++group) {
+                const int64_t scale_linear = neuron * w.ng + group;
+                const uint32_t state = cpu_load_packed_bits(
+                    scales, scale_bytes,
+                    scale_linear * w.sub_bits,
+                    static_cast<int>(w.sub_bits));
+                const float scale = cpu_nvq_scale(
+                    metadata, static_cast<int>(w.kernel_format),
+                    anchors[neuron], state);
+                alignas(64) int8_t weights[64];
+                cpu_decode_nvq_group(
+                    w, static_cast<int>(neuron), group, state, weights);
+                for (int64_t row = 0; row < rows; ++row) {
+                    const int8_t * quantized = activation.values.data() +
+                        (row * activation.groups + group) * 64;
+                    const int32_t dot = cpu_dot_s8_s8_64(
+                        weights, quantized,
+                        activation.sums[static_cast<size_t>(
+                            row * activation.groups + group)]);
+                    const float activation_scale = activation.scales[
+                        static_cast<size_t>(row * activation.groups + group)];
+                    accumulators[static_cast<size_t>(row)] = std::fma(
+                        scale * activation_scale,
+                        static_cast<float>(dot),
+                        accumulators[static_cast<size_t>(row)]);
+                }
+            }
+            for (int64_t row = 0; row < rows; ++row) {
+                output[row * outputs + neuron] =
+                    c10::Half(accumulators[static_cast<size_t>(row)]);
+            }
+        }
+    });
+    return result;
+}
+
+static torch::Tensor nint_matmul_cpu(
+        const NintWeight & w,
+        torch::Tensor x) {
+    TORCH_CHECK(!x.is_cuda(), "CPU NINT GEMV requires CPU activations");
+    TORCH_CHECK(!w.q_packed.is_cuda(), "CPU NINT GEMV requires CPU-resident weights");
+    TORCH_CHECK(!w.q5_exec, "CPU NINT GEMV requires the compact MFQ layout");
+    auto activation = cpu_quantize_activation(
+        std::move(x), w.neuron_len, w.gs, true);
+    const int64_t rows = activation.rows;
+    const int64_t width = w.neuron_len;
+    const int64_t outputs = w.out;
+    auto result = torch::empty(
+        {rows, outputs},
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat16));
+    c10::Half * output = result.data_ptr<c10::Half>();
+    const uint8_t * quant = w.q_packed.data_ptr<uint8_t>();
+    const int64_t qbytes = w.qbytes;
+    at::parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
+        std::vector<float> accumulators(static_cast<size_t>(rows));
+        for (int64_t neuron = begin; neuron < end; ++neuron) {
+            std::fill(accumulators.begin(), accumulators.end(), 0.0f);
+            for (int64_t group = 0; group < w.ng; ++group) {
+                const int64_t meta = neuron * w.ng + group;
+                const uint8_t * packed = quant + meta * qbytes;
+                float scale = 0.0f;
+                float minimum = 0.0f;
+                if (w.q8_zero) {
+                    scale = static_cast<float>(
+                        w.q8_zero_scale.data_ptr<c10::Half>()[meta]);
+                } else {
+                    scale = w.neuron_scale.data_ptr<float>()[neuron] *
+                        static_cast<float>(w.sub_scale.data_ptr<uint8_t>()[meta]);
+                    minimum = w.neuron_min.data_ptr<float>()[neuron] *
+                        static_cast<float>(w.sub_min.data_ptr<uint8_t>()[meta]);
+                }
+                const int64_t valid = std::min<int64_t>(
+                    w.gs, width - group * w.gs);
+                alignas(64) uint8_t weights[64];
+                if (w.q8_zero) {
+                    std::fill(weights, weights + 64, static_cast<uint8_t>(0));
+                    std::memcpy(weights, packed, static_cast<size_t>(valid));
+                } else {
+                    cpu_unpack_nint_group(
+                        packed, static_cast<int>(w.bits),
+                        static_cast<int>(valid), weights);
+                }
+                for (int64_t row = 0; row < rows; ++row) {
+                    const int64_t activation_group =
+                        row * activation.groups + group;
+                    const int8_t * quantized = activation.values.data() +
+                        activation_group * 64;
+                    int32_t dot = 0;
+                    if (w.q8_zero) {
+                        dot = cpu_dot_s8_s8_64(
+                            reinterpret_cast<const int8_t *>(weights), quantized,
+                            activation.sums[
+                                static_cast<size_t>(activation_group)]);
+                        accumulators[static_cast<size_t>(row)] = std::fma(
+                            scale * activation.scales[
+                                static_cast<size_t>(activation_group)],
+                            static_cast<float>(dot),
+                            accumulators[static_cast<size_t>(row)]);
+                    } else {
+                        dot = cpu_dot_u8_s8_64(weights, quantized);
+                        const float activation_scale = activation.scales[
+                            static_cast<size_t>(activation_group)];
+                        const float dot_term = scale * activation_scale *
+                            static_cast<float>(dot);
+                        const float min_term = minimum * activation_scale *
+                            static_cast<float>(activation.sums[
+                                static_cast<size_t>(activation_group)]);
+                        accumulators[static_cast<size_t>(row)] +=
+                            dot_term - min_term;
+                    }
+                }
+            }
+            for (int64_t row = 0; row < rows; ++row) {
+                output[row * outputs + neuron] =
+                    c10::Half(accumulators[static_cast<size_t>(row)]);
+            }
+        }
+    });
+    return result;
+}
+
 static torch::Tensor nvq_matmul(const NvqWeight & w, torch::Tensor x) {
+    if (!x.is_cuda()) return nvq_matmul_cpu(w, std::move(x));
     x = x.contiguous().to(torch::kFloat16);
     x = pad_last(x, w.neuron_len);
     int M = (int)x.size(0);
@@ -8170,6 +8647,15 @@ static torch::Tensor nvq_matmul_input_mul(
     torch::Tensor gate,
     int mode) {
     TORCH_CHECK(mode == 1 || mode == 2, "NVQ input gate mode must be 1(sigmoid) or 2(silu)");
+    if (!x.is_cuda()) {
+        x = x.contiguous().to(torch::kFloat16);
+        gate = gate.contiguous().to(torch::kFloat16);
+        TORCH_CHECK(x.sizes() == gate.sizes(), "NVQ x and gate shapes must match");
+        auto value = mode == 1
+            ? x * torch::sigmoid(gate)
+            : x * torch::silu(gate);
+        return nvq_matmul_cpu(w, value);
+    }
     x = x.contiguous().to(torch::kFloat16);
     gate = gate.contiguous().to(torch::kFloat16);
     TORCH_CHECK(x.sizes() == gate.sizes(), "NVQ x and gate shapes must match");
@@ -8361,6 +8847,7 @@ static Nint3PrefillPath nint3_prefill_path() {
 }
 
 static torch::Tensor nint_matmul(const NintWeight & w, torch::Tensor x) {
+    if (!x.is_cuda()) return nint_matmul_cpu(w, std::move(x));
     x = x.contiguous().to(torch::kFloat16);
     x = pad_last(x, w.neuron_len);
     int M = (int)x.size(0);
@@ -8626,6 +9113,15 @@ static torch::Tensor nint_matmul_groupwise_u8(
 }
 
 static torch::Tensor nint_matmul_input_mul(const NintWeight & w, torch::Tensor x, torch::Tensor gate, int mode) {
+    if (!x.is_cuda()) {
+        x = x.contiguous().to(torch::kFloat16);
+        gate = gate.contiguous().to(torch::kFloat16);
+        TORCH_CHECK(x.sizes() == gate.sizes(), "NINT x and gate shapes must match");
+        auto value = mode == 1
+            ? x * torch::sigmoid(gate)
+            : x * torch::silu(gate);
+        return nint_matmul_cpu(w, value);
+    }
     x = x.contiguous().to(torch::kFloat16);
     gate = gate.contiguous().to(torch::kFloat16);
     x = pad_last(x, w.neuron_len);
@@ -9542,6 +10038,17 @@ struct QuantLinearGroup {
             std::make_shared<CudaIndependentBranchExecutor>();
 
     std::vector<torch::Tensor> forward(torch::Tensor x) const {
+        if (!x.is_cuda()) {
+            TORCH_CHECK(
+                !nint_grouped,
+                "CPU dense offload requires separate compact linear weights");
+            std::vector<torch::Tensor> result;
+            result.reserve(layers.size());
+            for (const auto & layer : layers) {
+                result.push_back(layer.forward(x));
+            }
+            return result;
+        }
         if (nint_grouped) return nint.forward(x);
         if (g_kl_mmq_mode == KlMmqMode::Default &&
                 nvq_prefix2 && nvq_fusion_enabled()) {
@@ -9812,10 +10319,14 @@ static QuantLinear load_quant_linear(
                         std::move(shard));
                 }
             } else {
-                c10::cuda::CUDAGuard guard(
-                    active_weight_load_device());
-                result.nint.w =
-                    to_device_nint8_zero(cpu, true);
+                if (g_loading_cpu_layer) {
+                    result.nint.w = to_device_nint8_zero(cpu, false);
+                } else {
+                    c10::cuda::CUDAGuard guard(
+                        active_weight_load_device());
+                    result.nint.w =
+                        to_device_nint8_zero(cpu, true);
+                }
             }
         } else {
             const auto cpu = unpack_nint(blob);
@@ -9863,10 +10374,14 @@ static QuantLinear load_quant_linear(
                         std::move(shard));
                 }
             } else {
-                c10::cuda::CUDAGuard guard(
-                    active_weight_load_device());
-                result.nint.w =
-                    to_device_nint(cpu, true);
+                if (g_loading_cpu_layer) {
+                    result.nint.w = to_device_nint(cpu, false);
+                } else {
+                    c10::cuda::CUDAGuard guard(
+                        active_weight_load_device());
+                    result.nint.w =
+                        to_device_nint(cpu, true);
+                }
             }
         }
     } else if (is_nvq_linear_dtype(dtype)) {
@@ -9913,9 +10428,13 @@ static QuantLinear load_quant_linear(
                     std::move(shard));
             }
         } else {
-            c10::cuda::CUDAGuard guard(
-                active_weight_load_device());
-            result.nvq.w = to_device_nvq(cpu, true);
+            if (g_loading_cpu_layer) {
+                result.nvq.w = to_device_nvq(cpu, false);
+            } else {
+                c10::cuda::CUDAGuard guard(
+                    active_weight_load_device());
+                result.nvq.w = to_device_nvq(cpu, true);
+            }
         }
     } else if (dtype == "MXFP8") {
         result.kind = QuantLinearKind::Mxfp8;
@@ -9945,6 +10464,10 @@ static QuantLinear load_quant_linear(
                 result.tensor_parallel_shards.push_back(
                     std::move(shard));
             }
+        } else if (g_loading_cpu_layer) {
+            throw std::runtime_error(
+                "CPU dense offload does not yet support MXFP8 tensor: " +
+                name);
         } else {
             result.mxfp8.weight = to_cuda_device_mxfp8(
                 cpu, active_weight_load_device());
@@ -9991,6 +10514,8 @@ static QuantLinear load_quant_linear(
                 result.tensor_parallel_shards.push_back(
                     std::move(shard));
             }
+        } else if (g_loading_cpu_layer) {
+            result.dense = cpu.contiguous();
         } else {
             c10::cuda::CUDAGuard guard(active_weight_load_device());
             result.dense = cpu.to(torch::kCUDA).contiguous();
@@ -10031,13 +10556,13 @@ static QuantLinearGroup make_quant_group(std::vector<QuantLinear> layers) {
         [](const QuantLinear & layer) {
             return layer.tensor_parallel();
         });
-    if (all_nint && !keep_nint_separate &&
+    if (all_nint && !keep_nint_separate && !g_loading_cpu_layer &&
         !any_tensor_parallel) {
         result.nint_grouped = true;
         result.nint = make_linear_group(nint_weights);
     } else {
         result.layers = std::move(layers);
-        result.nvq_prefix2 = result.layers.size() >= 2 &&
+        result.nvq_prefix2 = !g_loading_cpu_layer && result.layers.size() >= 2 &&
             !any_tensor_parallel &&
             result.layers[0].is_nvq() && result.layers[1].is_nvq() &&
             nvq_pair_compatible(result.layers[0].nvq.w, result.layers[1].nvq.w);
@@ -10635,6 +11160,16 @@ static std::string layer_name(const std::string & templ, int i) {
 }
 
 static torch::Tensor qwen_rms_norm(torch::Tensor x, torch::Tensor weight, const Config & c) {
+    if (!x.is_cuda()) {
+        auto xf = x.contiguous().to(torch::kFloat32);
+        auto wf = weight.contiguous().to(torch::kFloat32);
+        if (c.norm_weight_offset != 0.0) {
+            wf = wf + c.norm_weight_offset;
+        }
+        auto inverse = torch::rsqrt(
+            xf.square().mean(-1, true) + c.rms_norm_eps);
+        return (xf * inverse * wf).contiguous();
+    }
     return rms_norm_offset_cuda(x, weight, c.rms_norm_eps, c.norm_weight_offset);
 }
 
@@ -10658,14 +11193,15 @@ struct RopeCache {
         int64_t dim,
         double base,
         int64_t frequency_dim = 0,
-        int64_t active_pairs = -1) : rotary_dim(dim) {
+        int64_t active_pairs = -1,
+        torch::Device device = torch::Device(torch::kCUDA)) : rotary_dim(dim) {
         int64_t half = rotary_dim / 2;
         const int64_t denominator = frequency_dim > 0 ? frequency_dim : rotary_dim;
         if (active_pairs < 0) active_pairs = half;
         if (active_pairs > half) {
             throw std::runtime_error("RoPE active pair count exceeds rotary dimension");
         }
-        auto opts = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
+        auto opts = torch::TensorOptions().device(device).dtype(torch::kFloat32);
         auto pos = torch::arange(max_positions, opts);
         auto ar = torch::arange(0, rotary_dim, 2, opts);
         auto freq = torch::pow(torch::full({half}, base, opts), -ar / (double)denominator);
@@ -10678,9 +11214,55 @@ struct RopeCache {
         sin = torch::sin(ang).contiguous();
         sections = torch::empty({0}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
     }
-    explicit RopeCache(const Config & c)
-        : RopeCache(c.max_position_embeddings, c.rotary_dim, c.rope_base) {}
+    explicit RopeCache(
+        const Config & c,
+        torch::Device device = torch::Device(torch::kCUDA))
+        : RopeCache(
+            c.max_position_embeddings, c.rotary_dim, c.rope_base,
+            0, -1, device) {}
     torch::Tensor apply(torch::Tensor x, torch::Tensor pos, const Config & c) const {
+        if (!x.is_cuda()) {
+            TORCH_CHECK(
+                !cos.is_cuda() && !sin.is_cuda(),
+                "CPU RoPE requires a CPU-resident table");
+            auto positions = pos.contiguous().to(torch::kCPU, torch::kInt64)
+                .clamp(0, cos.size(0) - 1);
+            torch::Tensor selected_cos;
+            torch::Tensor selected_sin;
+            if (positions.dim() == 1) {
+                selected_cos = cos.index_select(0, positions);
+                selected_sin = sin.index_select(0, positions);
+            } else if (sections.numel() == 3) {
+                const int64_t * section = sections.data_ptr<int64_t>();
+                std::vector<torch::Tensor> cos_parts;
+                std::vector<torch::Tensor> sin_parts;
+                int64_t offset = 0;
+                for (int axis = 0; axis < 3; ++axis) {
+                    const int64_t count = section[axis];
+                    auto active = positions.select(0, axis);
+                    cos_parts.push_back(
+                        cos.index_select(0, active).narrow(1, offset, count));
+                    sin_parts.push_back(
+                        sin.index_select(0, active).narrow(1, offset, count));
+                    offset += count;
+                }
+                selected_cos = torch::cat(cos_parts, 1);
+                selected_sin = torch::cat(sin_parts, 1);
+            } else {
+                throw std::runtime_error(
+                    "multi-axis CPU RoPE requires three position sections");
+            }
+            auto xf = x.contiguous().to(torch::kFloat32);
+            const int64_t half = rotary_dim / 2;
+            auto first = xf.narrow(-1, 0, half);
+            auto second = xf.narrow(-1, half, half);
+            auto output = xf.clone();
+            output.narrow(-1, 0, half).copy_(
+                first * selected_cos - second * selected_sin);
+            output.narrow(-1, half, half).copy_(
+                second * selected_cos + first * selected_sin);
+            return output;
+        }
         return rope_table_cuda(x.contiguous().to(torch::kFloat32), pos.contiguous().to(torch::kCUDA, torch::kInt64),
                                cos, sin, rotary_dim, sections);
     }
@@ -11459,9 +12041,15 @@ struct KVCache {
     torch::Tensor v;
     bool ring = false;
     KVCache() = default;
-    KVCache(int64_t B, int64_t H, int64_t max_seq, int64_t D, bool use_ring = false)
+    KVCache(
+            int64_t B,
+            int64_t H,
+            int64_t max_seq,
+            int64_t D,
+            bool use_ring = false,
+            torch::Device device = torch::Device(torch::kCUDA))
         : ring(use_ring) {
-        auto opts = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat16);
+        auto opts = torch::TensorOptions().device(device).dtype(torch::kFloat16);
         k = torch::zeros({B, H, max_seq, D}, opts);
         v = torch::zeros({B, H, max_seq, D}, opts);
     }
@@ -11472,7 +12060,7 @@ struct KVCache {
         auto vh = vv.to(torch::kFloat16).contiguous();
         const char * aten_write_env = std::getenv("MFQ_KV_CACHE_WRITE_ATEN");
         const bool aten_write = aten_write_env != nullptr && aten_write_env[0] == '1';
-        if (aten_write) {
+        if (!k.is_cuda() || aten_write) {
             auto slots = ring ? torch::remainder(pos, k.size(2)) : pos;
             slots = slots.to(torch::kInt64).contiguous();
             k.index_copy_(2, slots, kh);
@@ -11631,6 +12219,7 @@ struct Dsv4SharedState {
 
 struct Block {
     int cuda_device = 0;
+    bool cpu_offloaded = false;
     virtual ~Block() = default;
     virtual void reset(int64_t B) = 0;
     virtual void set_token_ids(const torch::Tensor &) {}
@@ -12456,12 +13045,15 @@ struct FullBlock : Block {
                    : c.max_position_embeddings);
         const RopeCache & active_rope = attention_rope.cos.defined() ? attention_rope : rope;
         if (!cache.k.defined() || cache.k.numel() == 0) {
-            cache = KVCache(B, nkh, cache_capacity, hd, sliding);
-            const int64_t total = B * nh;
-            auto opts = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
-            decode_partial_o = torch::empty({total, kDecodeAttentionMaxParts, hd}, opts);
-            decode_partial_m = torch::empty({total, kDecodeAttentionMaxParts}, opts);
-            decode_partial_l = torch::empty({total, kDecodeAttentionMaxParts}, opts);
+            cache = KVCache(
+                B, nkh, cache_capacity, hd, sliding, x.device());
+            if (x.is_cuda()) {
+                const int64_t total = B * nh;
+                auto opts = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
+                decode_partial_o = torch::empty({total, kDecodeAttentionMaxParts, hd}, opts);
+                decode_partial_m = torch::empty({total, kDecodeAttentionMaxParts}, opts);
+                decode_partial_l = torch::empty({total, kDecodeAttentionMaxParts}, opts);
+            }
         }
         auto residual = x;
         auto xn = g_profiler.measure("full.attn_norm", [&]() {
@@ -12498,6 +13090,45 @@ struct FullBlock : Block {
         torch::Tensor a;
         bool attention_token_major = false;
         a = g_profiler.measure("full.attention", [&]() {
+            if (!x.is_cuda()) {
+                TORCH_CHECK(!sliding, "CPU dense offload does not support sliding attention");
+                auto qh = q.to(torch::kFloat32).contiguous();
+                auto kh = kv.first.to(torch::kFloat32).contiguous();
+                auto vh = kv.second.to(torch::kFloat32).contiguous();
+                if (nkh != nh) {
+                    TORCH_CHECK(nh % nkh == 0, "CPU attention head ratio is invalid");
+                    const int64_t repeat = nh / nkh;
+                    kh = kh.repeat_interleave(repeat, 1);
+                    vh = vh.repeat_interleave(repeat, 1);
+                }
+                c10::optional<torch::Tensor> mask = c10::nullopt;
+                if (T > 1 || seq_len.has_value()) {
+                    const int64_t visible = kh.size(2);
+                    auto key_positions = torch::arange(
+                        visible,
+                        torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt64));
+                    torch::Tensor allowed;
+                    if (T > 1) {
+                        auto query_positions = pos.dim() == 1
+                            ? pos.to(torch::kCPU, torch::kInt64)
+                            : pos.select(0, 0).to(torch::kCPU, torch::kInt64);
+                        allowed = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1);
+                        allowed = allowed.unsqueeze(0).expand({B, T, visible});
+                    } else {
+                        allowed = torch::ones(
+                            {B, T, visible},
+                            torch::TensorOptions().device(torch::kCPU).dtype(torch::kBool));
+                    }
+                    if (seq_len.has_value()) {
+                        auto lengths = seq_len.value().to(torch::kCPU, torch::kInt64)
+                            .reshape({B, 1, 1});
+                        allowed = allowed & (key_positions.reshape({1, 1, visible}) < lengths);
+                    }
+                    mask = allowed.unsqueeze(1);
+                }
+                return at::scaled_dot_product_attention(
+                    qh, kh, vh, mask, 0.0, false, attn_scale, false);
+            }
             auto qh = q.to(torch::kFloat16).contiguous();
             auto kh = k.to(torch::kFloat16).contiguous();
             auto vh = v.to(torch::kFloat16).contiguous();
@@ -12801,6 +13432,13 @@ struct FullBlock : Block {
         auto attn_pair = g_profiler.measure("full.attn_residual_ffn_norm", [&]() {
             auto rr = residual.reshape({-1, H});
             auto oo2 = oo.reshape({-1, H});
+            if (!rr.is_cuda()) {
+                auto summed = (rr.to(torch::kFloat32) + oo2.to(torch::kFloat32))
+                    .to(rr.scalar_type()).contiguous();
+                auto normalized = qwen_rms_norm(
+                    summed.to(torch::kFloat32), ffn_norm, c);
+                return std::vector<torch::Tensor>{summed, normalized};
+            }
             const char * fp32_residual_env =
                 std::getenv("MFQ_DIAGNOSTIC_FP32_RESIDUAL");
             if (fp32_residual_env != nullptr &&
@@ -12823,6 +13461,10 @@ struct FullBlock : Block {
         return g_profiler.measure("full.ffn_residual", [&]() {
             auto rr = residual.reshape({-1, H});
             auto ff2 = ff.reshape({-1, H});
+            if (!rr.is_cuda()) {
+                return (rr.to(torch::kFloat32) + ff2.to(torch::kFloat32))
+                    .to(rr.scalar_type()).reshape({B, T, H}).contiguous();
+            }
             const char * fp32_residual_env =
                 std::getenv("MFQ_DIAGNOSTIC_FP32_RESIDUAL");
             if (fp32_residual_env != nullptr &&
@@ -13163,9 +13805,177 @@ struct LinearBlock : Block {
         gdn_state = torch::Tensor();
     }
 
+    torch::Tensor forward_cpu(torch::Tensor x, const Config & c) {
+        const int64_t B = x.size(0), T = x.size(1), H = x.size(2);
+        const int64_t nk = c.linear_num_key_heads;
+        const int64_t nv = c.linear_num_value_heads;
+        const int64_t dk = c.linear_key_head_dim;
+        const int64_t dv = c.linear_value_head_dim;
+        const int64_t ksz = c.linear_k_size();
+        const int64_t vsz = c.linear_v_size();
+        const int64_t conv_dim = 2 * ksz + vsz;
+        if (!conv_state.defined()) {
+            auto f32 = torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32);
+            conv_state = torch::zeros(
+                {B, c.linear_conv_kernel_dim - 1, conv_dim}, f32);
+            gdn_state = torch::zeros({B, nv, dv, dv}, f32);
+        }
+
+        auto residual = x;
+        auto xn = qwen_rms_norm(
+            x.reshape({B * T, H}).to(torch::kFloat32),
+            attn_norm, c).reshape({B, T, H});
+        torch::Tensor qkv, qk_part, v_part, z, alpha_raw, beta_raw;
+        if (dense_ab_tail) {
+            auto parts = in_proj.forward(xn);
+            qkv = parts[0].to(torch::kFloat32);
+            z = parts[1];
+            auto ab = ab_proj.forward(xn);
+            alpha_raw = ab[0];
+            beta_raw = ab[1];
+        } else if (split_in_proj) {
+            if (split_dense_zab) {
+                auto qkv_parts = qkv_proj.forward(xn);
+                qk_part = qkv_parts[0];
+                v_part = qkv_parts[1];
+                auto zab = zab_proj.forward(xn);
+                z = zab[0];
+                alpha_raw = zab[1];
+                beta_raw = zab[2];
+            } else {
+                auto qkv_parts = qkv_proj.forward(xn);
+                qk_part = qkv_parts[0];
+                v_part = qkv_parts[1];
+                z = z_proj.forward(xn);
+                auto ab = ab_is_nint
+                    ? ab_nint_proj.forward(xn)
+                    : ab_proj.forward(xn);
+                alpha_raw = ab[0];
+                beta_raw = ab[1];
+            }
+            qkv = torch::cat(
+                {qk_part.to(torch::kFloat32), v_part.to(torch::kFloat32)}, -1);
+        } else {
+            auto parts = in_proj.forward(xn);
+            qkv = parts[0].to(torch::kFloat32);
+            z = parts[1];
+            alpha_raw = parts[2];
+            beta_raw = parts[3];
+        }
+
+        auto beta = torch::sigmoid(
+            beta_raw.to(torch::kFloat32).reshape({B, T, nv}));
+        auto alpha = alpha_raw.to(torch::kFloat32).reshape({B, T, nv});
+        auto gate = torch::softplus(
+            alpha + dt_bias.to(torch::kFloat32).reshape({1, 1, nv}));
+        auto coefficient = -torch::exp(a_log.to(torch::kFloat32));
+        gate = gate * coefficient.reshape({1, 1, nv});
+
+        auto conv_input = torch::cat({conv_state, qkv}, 1);
+        conv_state.copy_(conv_input.narrow(
+            1, conv_input.size(1) - (c.linear_conv_kernel_dim - 1),
+            c.linear_conv_kernel_dim - 1));
+        auto weight = conv_weight.to(torch::kFloat32);
+        if (weight.dim() == 3) weight = weight.squeeze(1);
+        if (weight.dim() != 2) {
+            throw std::runtime_error("CPU SSM convolution weight must be rank 2 or 3");
+        }
+        if (weight.size(0) != conv_dim && weight.size(1) == conv_dim) {
+            weight = weight.transpose(0, 1).contiguous();
+        }
+        TORCH_CHECK(
+            weight.size(0) == conv_dim &&
+            weight.size(1) == c.linear_conv_kernel_dim,
+            "CPU SSM convolution geometry mismatch");
+        auto windows = conv_input.unfold(
+            1, c.linear_conv_kernel_dim, 1);
+        auto conv = (windows * weight.reshape(
+            {1, 1, conv_dim, c.linear_conv_kernel_dim})).sum(-1);
+        if (conv_bias.defined()) {
+            conv = conv + conv_bias.to(torch::kFloat32).reshape({1, 1, conv_dim});
+        }
+        conv = torch::silu(conv);
+
+        auto q = conv.narrow(-1, 0, ksz)
+            .reshape({B, T, nk, dk}).transpose(1, 2).contiguous();
+        auto k = conv.narrow(-1, ksz, ksz)
+            .reshape({B, T, nk, dk}).transpose(1, 2).contiguous();
+        auto v = conv.narrow(-1, 2 * ksz, vsz)
+            .reshape({B, T, nv, dv}).transpose(1, 2).contiguous();
+        q = q / torch::sqrt(q.square().sum(-1, true))
+            .clamp_min(c.rms_norm_eps);
+        k = k / torch::sqrt(k.square().sum(-1, true))
+            .clamp_min(c.rms_norm_eps);
+        if (nk != nv) {
+            TORCH_CHECK(nv % nk == 0, "CPU GDN head ratio is invalid");
+            const int64_t repeat = nv / nk;
+            if (tiled_v_heads) {
+                q = q.repeat({1, repeat, 1, 1});
+                k = k.repeat({1, repeat, 1, 1});
+            } else {
+                q = q.repeat_interleave(repeat, 1);
+                k = k.repeat_interleave(repeat, 1);
+            }
+        }
+
+        auto gate_t = gate.transpose(1, 2).contiguous();
+        auto beta_t = beta.transpose(1, 2).contiguous();
+        auto state = gdn_state;
+        std::vector<torch::Tensor> outputs;
+        outputs.reserve(static_cast<size_t>(T));
+        const double retrieve_scale = 1.0 / std::sqrt(static_cast<double>(dk));
+        for (int64_t token = 0; token < T; ++token) {
+            auto qt = q.select(2, token);
+            auto kt = k.select(2, token);
+            auto vt = v.select(2, token);
+            state = state * torch::exp(gate_t.select(2, token))
+                .reshape({B, nv, 1, 1});
+            auto state_k = torch::matmul(
+                state.transpose(-1, -2), kt.unsqueeze(-1)).squeeze(-1);
+            auto delta = (vt - state_k) *
+                beta_t.select(2, token).unsqueeze(-1);
+            state = state + kt.unsqueeze(-1) * delta.unsqueeze(-2);
+            outputs.push_back(
+                torch::matmul(
+                    state.transpose(-1, -2), qt.unsqueeze(-1))
+                    .squeeze(-1) * retrieve_scale);
+        }
+        gdn_state = state.contiguous();
+        auto y = torch::stack(outputs, 2);
+        z = z.reshape({B, T, nv, dv}).transpose(1, 2).contiguous();
+        auto y_flat = y.reshape({-1, dv}).to(torch::kFloat32);
+        auto inverse = torch::rsqrt(
+            y_flat.square().mean(-1, true) + c.rms_norm_eps);
+        auto y_norm = (y_flat * inverse *
+            linear_norm.to(torch::kFloat32)).reshape_as(y);
+        auto yf = y_norm.transpose(1, 2).contiguous().reshape({B, T, vsz});
+        auto zf = z.transpose(1, 2).contiguous().reshape({B, T, vsz});
+        torch::Tensor attention_output;
+        if (dense_out_proj) {
+            auto dtype = out_proj_dense.scalar_type();
+            auto gated = yf.to(dtype) * torch::silu(zf.to(dtype));
+            attention_output = torch::matmul(
+                gated.reshape({B * T, vsz}),
+                out_proj_dense.transpose(0, 1)).reshape({B, T, H});
+        } else {
+            attention_output = out_proj.forward_input_mul(yf, zf, 2);
+        }
+        x = (residual.to(torch::kFloat32) +
+            attention_output.to(torch::kFloat32))
+            .to(residual.scalar_type()).contiguous();
+        residual = x;
+        xn = qwen_rms_norm(
+            x.reshape({B * T, H}).to(torch::kFloat32),
+            ffn_norm, c).reshape({B, T, H});
+        auto ff = ffn.forward(xn.reshape({B * T, H})).reshape({B, T, H});
+        return (residual.to(torch::kFloat32) + ff.to(torch::kFloat32))
+            .to(residual.scalar_type()).contiguous();
+    }
+
     torch::Tensor forward(torch::Tensor x, torch::Tensor pos, int64_t cache_pos,
                           const c10::optional<torch::Tensor> & seq_len,
                           const Config & c, const RopeCache & rope) override {
+        if (!x.is_cuda()) return forward_cpu(std::move(x), c);
         (void)seq_len;
         (void)pos; (void)cache_pos; (void)rope;
         int64_t B = x.size(0), T = x.size(1), H = x.size(2);
@@ -13379,6 +14189,7 @@ struct LinearBlock : Block {
 };
 
 static void prepare_ffn_workspaces(FFN & f) {
+    if (g_loading_cpu_layer) return;
     if (f.down.tensor_parallel()) return;
     if (f.gate_up.nvq_prefix2 && f.gate_up.layers.size() == 2 && f.down.is_nvq() &&
         f.gate_up.outs.size() == 2 && f.gate_up.outs[0] == f.gate_up.outs[1] &&
@@ -14149,6 +14960,7 @@ static std::unique_ptr<Block> load_block(
 struct Model {
     Config c;
     RopeCache rope;
+    RopeCache cpu_rope;
     std::unordered_map<int, RopeCache> device_ropes;
     QuantLinear embed;
     std::vector<std::unique_ptr<Block>> blocks;
@@ -14237,6 +15049,16 @@ struct Model {
         auto pos = pos_override.has_value()
             ? pos_override.value()
             : torch::arange(cache_pos, cache_pos + T, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kInt64));
+        torch::Tensor cpu_ids, cpu_pos;
+        c10::optional<torch::Tensor> cpu_seq_len = c10::nullopt;
+        if (g_dense_cpu_layer_count > 0) {
+            cpu_ids = ids.to(torch::kCPU, torch::kInt64).contiguous();
+            cpu_pos = pos.to(torch::kCPU, torch::kInt64).contiguous();
+            if (seq_len.has_value()) {
+                cpu_seq_len = seq_len.value()
+                    .to(torch::kCPU, torch::kInt64).contiguous();
+            }
+        }
         auto x = g_profiler.measure("model.embed", [&]() { return embed_forward(ids); });
         if (c.is_gemma4()) {
             x = g_profiler.measure("model.embed_scale", [&]() {
@@ -14252,17 +15074,27 @@ struct Model {
         if (block_trace != nullptr) block_trace->push_back(x.to(torch::kFloat32).clone());
         for (auto & b : blocks) {
             c10::cuda::CUDAGuard block_guard(b->cuda_device);
-            auto local_ids = tensor_to_cuda_device(ids, b->cuda_device);
-            auto local_pos = tensor_to_cuda_device(pos, b->cuda_device);
+            auto local_ids = b->cpu_offloaded
+                ? cpu_ids
+                : tensor_to_cuda_device(ids, b->cuda_device);
+            auto local_pos = b->cpu_offloaded
+                ? cpu_pos
+                : tensor_to_cuda_device(pos, b->cuda_device);
             c10::optional<torch::Tensor> local_seq_len = c10::nullopt;
             if (seq_len.has_value()) {
-                local_seq_len = tensor_to_cuda_device(
-                    seq_len.value(), b->cuda_device);
+                local_seq_len = b->cpu_offloaded
+                    ? cpu_seq_len.value()
+                    : tensor_to_cuda_device(
+                        seq_len.value(), b->cuda_device);
             }
-            x = tensor_to_cuda_device(x, b->cuda_device);
+            x = b->cpu_offloaded
+                ? x.to(torch::kCPU).contiguous()
+                : tensor_to_cuda_device(x, b->cuda_device);
             b->set_token_ids(local_ids);
-            const RopeCache & active_rope = device_ropes.empty()
-                ? rope : device_ropes.at(b->cuda_device);
+            const RopeCache & active_rope = b->cpu_offloaded
+                ? cpu_rope
+                : (device_ropes.empty()
+                    ? rope : device_ropes.at(b->cuda_device));
             x = b->forward(
                 x, local_pos, cache_pos, local_seq_len, c, active_rope);
             if (block_trace != nullptr) {
@@ -14386,6 +15218,36 @@ static Model load_model(const std::string & mfq_path, const std::string & config
     MfqFile mfq(mfq_path);
     m.c = load_config(mfq, config_path);
     g_layer_placement.prepare(m.c.num_hidden_layers);
+    g_dense_cpu_layer_count = 0;
+    if (g_n_gpu_layers >= 0) {
+        g_dense_cpu_layer_count = static_cast<int>(std::max<int64_t>(
+            m.c.num_hidden_layers - g_n_gpu_layers, 0));
+        if (g_dense_cpu_layer_count > 0) {
+            if (g_tensor_parallel.enabled() || g_layer_placement.enabled()) {
+                throw std::runtime_error(
+                    "--n-gpu-layers cannot be combined with tensor/layer parallelism");
+            }
+            const bool supported_architecture =
+                !m.c.is_dsv4() && !m.c.is_glm_dsa() && !m.c.is_gemma4() &&
+                m.c.num_experts <= 0 &&
+                std::all_of(
+                    m.c.layer_types.begin(), m.c.layer_types.end(),
+                    [](const std::string & type) {
+                        return type == "full_attention" ||
+                            type == "linear_attention";
+                    });
+            if (!supported_architecture) {
+                throw std::runtime_error(
+                    "--n-gpu-layers currently supports dense Qwen-style blocks only");
+            }
+            std::cerr << "dense_layer_placement cpu=0-"
+                      << (g_dense_cpu_layer_count - 1)
+                      << " gpu=" << g_dense_cpu_layer_count << '-'
+                      << (m.c.num_hidden_layers - 1)
+                      << " cpu_threads=" << at::get_num_threads()
+                      << std::endl;
+        }
+    }
     g_layer_placement.load_device =
         g_layer_placement.primary_device();
     c10::cuda::CUDAGuard model_guard(
@@ -14413,6 +15275,10 @@ static Model load_model(const std::string & mfq_path, const std::string & config
     }
     if (!m.c.is_gemma4() && !m.c.is_dsv4()) {
         m.rope = RopeCache(m.c);
+        if (g_dense_cpu_layer_count > 0) {
+            m.cpu_rope = RopeCache(
+                m.c, torch::Device(torch::kCPU));
+        }
         if (g_layer_placement.enabled()) {
             for (int device : g_layer_placement.devices) {
                 c10::cuda::CUDAGuard rope_guard(device);
@@ -14482,6 +15348,8 @@ static Model load_model(const std::string & mfq_path, const std::string & config
             dsv4_states;
         for (int i = 0; i < m.c.num_hidden_layers; ++i) {
             const int device = g_layer_placement.device_for_layer(i);
+            const bool cpu_offloaded = i < g_dense_cpu_layer_count;
+            g_loading_cpu_layer = cpu_offloaded;
             g_layer_placement.load_device = device;
             c10::cuda::CUDAGuard layer_guard(device);
             std::shared_ptr<GlmDsaSharedState> glm_state;
@@ -14496,14 +15364,18 @@ static Model load_model(const std::string & mfq_path, const std::string & config
                 if (!state) state = std::make_shared<Dsv4SharedState>();
                 dsv4_state = state;
             }
-            std::cerr << "loading layer " << i << " " << m.c.layer_types[(size_t)i] << std::endl;
+            std::cerr << "loading layer " << i << " "
+                      << m.c.layer_types[(size_t)i] << ' '
+                      << (cpu_offloaded ? "CPU" : "CUDA") << std::endl;
             auto block = load_block(
                 mfq, m.c, i, m.c.layer_types[(size_t)i], gguf_names,
                 glm_state, dsv4_state);
             block->cuda_device = device;
+            block->cpu_offloaded = cpu_offloaded;
             m.blocks.push_back(std::move(block));
         }
     }
+    g_loading_cpu_layer = false;
     g_layer_placement.load_device =
         g_layer_placement.primary_device();
     if (g_moe_expert_cache &&
@@ -14875,7 +15747,24 @@ static int run_block_trace_compare(
     int64_t context_size,
     torch::Tensor ids)
 {
-    Model reference = load_model(reference_mfq, config_path, context_size);
+    Model reference = [&]() {
+        if (g_n_gpu_layers < 0) {
+            return load_model(reference_mfq, config_path, context_size);
+        }
+        const int saved_n_gpu_layers = g_n_gpu_layers;
+        const int saved_cpu_layers = g_dense_cpu_layer_count;
+        g_n_gpu_layers = -1;
+        try {
+            auto loaded = load_model(reference_mfq, config_path, context_size);
+            g_n_gpu_layers = saved_n_gpu_layers;
+            g_dense_cpu_layer_count = saved_cpu_layers;
+            return loaded;
+        } catch (...) {
+            g_n_gpu_layers = saved_n_gpu_layers;
+            g_dense_cpu_layer_count = saved_cpu_layers;
+            throw;
+        }
+    }();
     std::vector<torch::Tensor> test_trace;
     std::vector<torch::Tensor> reference_trace;
 
@@ -15485,6 +16374,7 @@ static int32_t generate_server_tokens(
     const bool graph_enabled =
         (graph_env == nullptr || graph_env[0] != '0') &&
         g_dsv4_cpu_offload_layers.empty() &&
+        g_dense_cpu_layer_count == 0 &&
         !g_moe_expert_cache &&
         !g_tensor_parallel.enabled();
     const char * graph_min_env = std::getenv("MFQ_SERVER_CUDA_GRAPH_MIN_TOKENS");
@@ -16910,6 +17800,69 @@ static int run_linear_check(
     std::cout << "production_rel=" << ((y_test - y_ref).norm() / y_ref.norm()).item<float>() << "\n";
     std::cout << "production_mean_abs=" << diff.mean().item<float>() << "\n";
     std::cout << "production_max_abs=" << diff.max().item<float>() << "\n";
+    return 0;
+}
+
+static int run_cpu_linear_check(
+        const std::string & mfq_path,
+        const std::string & name,
+        int rows,
+        int gate_mode,
+        int reps) {
+    TORCH_CHECK(rows >= 1 && rows <= 4096, "--check-linear-m must be in [1, 4096]");
+    TORCH_CHECK(reps >= 1, "--check-linear-reps must be positive");
+    MfqFile mfq(mfq_path);
+    g_loading_cpu_layer = true;
+    auto cpu_linear = load_quant_linear(mfq, name);
+    g_loading_cpu_layer = false;
+    auto cuda_linear = load_quant_linear(mfq, name);
+    const int64_t width = cpu_linear.neuron_len();
+    auto x = torch::arange(
+        static_cast<int64_t>(rows) * width,
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32))
+        .reshape({rows, width});
+    x = ((x.remainder(97) - 48) / 512.0)
+        .to(torch::kFloat16).contiguous();
+    torch::Tensor gate;
+    if (gate_mode != 0) {
+        TORCH_CHECK(gate_mode == 1 || gate_mode == 2, "linear check gate mode must be 0, 1, or 2");
+        gate = ((torch::arange(
+            static_cast<int64_t>(rows) * width,
+            torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32))
+            .reshape({rows, width}).remainder(53) - 26) / 16.0)
+            .to(torch::kFloat16).contiguous();
+    }
+    auto run_cpu = [&]() {
+        return gate_mode == 0
+            ? cpu_linear.forward(x)
+            : cpu_linear.forward_input_mul(x, gate, gate_mode);
+    };
+    torch::Tensor actual = run_cpu();
+    const auto start = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < reps; ++iteration) {
+        actual = run_cpu();
+    }
+    const auto end = std::chrono::steady_clock::now();
+    const double cpu_ms = std::chrono::duration<double, std::milli>(
+        end - start).count() / static_cast<double>(reps);
+
+    auto cuda_x = x.to(torch::kCUDA).contiguous();
+    torch::Tensor cuda_gate;
+    if (gate_mode != 0) cuda_gate = gate.to(torch::kCUDA).contiguous();
+    auto reference = gate_mode == 0
+        ? cuda_linear.forward(cuda_x)
+        : cuda_linear.forward_input_mul(cuda_x, cuda_gate, gate_mode);
+    torch::cuda::synchronize();
+    reference = reference.to(torch::kCPU, torch::kFloat32).contiguous();
+    actual = actual.to(torch::kFloat32).contiguous();
+    auto difference = (actual - reference).abs();
+    std::cout << "cpu_linear=" << name << "\n"
+              << "shape=" << actual.sizes() << "\n"
+              << "cpu_ms=" << cpu_ms << "\n"
+              << "relative_error="
+              << ((actual - reference).norm() / reference.norm()).item<float>() << "\n"
+              << "mean_abs=" << difference.mean().item<float>() << "\n"
+              << "max_abs=" << difference.max().item<float>() << "\n";
     return 0;
 }
 
@@ -19742,7 +20695,7 @@ int main(int argc, char ** argv) {
     } tensor_parallel_collective_cleanup;
     try {
         std::string mfq_path, config_path, ids_arg, ids_file;
-        std::string check_linear, check_linear_gate, kl_base;
+        std::string check_linear, check_linear_cpu, check_linear_gate, kl_base;
         std::string kl_save_logits_f16;
         std::string check_tp_linear;
         std::string check_tp_moe;
@@ -19770,6 +20723,7 @@ int main(int argc, char ** argv) {
         std::string layer_split_arg;
         double moe_gpu_cache_gb = 0.0;
         int gen = 16;
+        int cpu_threads = 0;
         int server_port = 8080;
         int64_t context_size = 0;
         int kl_chunks = -1;
@@ -19831,6 +20785,8 @@ int main(int argc, char ** argv) {
         bool check_runtime_assets = false;
         bool check_mfq_container = false;
         bool kl_allow_overlays = false;
+        bool n_gpu_layers_set = false;
+        bool cpu_threads_set = false;
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
             if (a == "--mfq" && i + 1 < argc) mfq_path = argv[++i];
@@ -19838,6 +20794,9 @@ int main(int argc, char ** argv) {
             else if (a == "--ids" && i + 1 < argc) ids_arg = argv[++i];
             else if (a == "--ids-file" && i + 1 < argc) ids_file = argv[++i];
             else if (a == "--check-linear" && i + 1 < argc) check_linear = argv[++i];
+            else if (a == "--check-linear-cpu" && i + 1 < argc) {
+                check_linear_cpu = argv[++i];
+            }
             else if (a == "--check-tp-linear" && i + 1 < argc) {
                 check_tp_linear = argv[++i];
             }
@@ -19960,12 +20919,20 @@ int main(int argc, char ** argv) {
             else if (a == "--prefill-sweep" && i + 1 < argc) prefill_sweep_arg = argv[++i];
             else if (a == "--prefill-sweep-reps" && i + 1 < argc) prefill_sweep_reps = std::stoi(argv[++i]);
             else if (a == "--gen" && i + 1 < argc) gen = std::stoi(argv[++i]);
+            else if ((a == "--threads" || a == "-t") && i + 1 < argc) {
+                cpu_threads = std::stoi(argv[++i]);
+                cpu_threads_set = true;
+            }
             else if (a == "--server") server_mode = true;
             else if (a == "--host" && i + 1 < argc) server_host = argv[++i];
             else if (a == "--port" && i + 1 < argc) server_port = std::stoi(argv[++i]);
             else if (a == "--ctx-size" && i + 1 < argc) context_size = std::stoll(argv[++i]);
             else if (a == "--cpu-offload-layers" && i + 1 < argc) {
                 cpu_offload_layers_arg = argv[++i];
+            }
+            else if ((a == "--n-gpu-layers" || a == "-ngl") && i + 1 < argc) {
+                g_n_gpu_layers = std::stoi(argv[++i]);
+                n_gpu_layers_set = true;
             }
             else if (a == "--moe-gpu-cache-gb" && i + 1 < argc) {
                 moe_gpu_cache_gb = std::stod(argv[++i]);
@@ -20010,7 +20977,7 @@ int main(int argc, char ** argv) {
                              "[--host 127.0.0.1 --port 8080 --ctx-size 32768 --model-name name "
                              "--tensor-parallel 0,1 --tensor-split 1,1 "
                              "--layer-parallel 0,1 --layer-split 1,1 "
-                             "--cpu-offload-layers 0-7,12 --moe-gpu-cache-gb 8 "
+                             "--n-gpu-layers 60 --threads 32 --cpu-offload-layers 0-7,12 --moe-gpu-cache-gb 8 "
                              "--moe-cache-profile profile.json "
                              "--api-key key --web-root path] | --kl-base reference.bin "
                              "[--kl-evaluator optimized|legacy --kl-chunks -1 "
@@ -20024,12 +20991,25 @@ int main(int argc, char ** argv) {
         }
         g_nint6_mmq_mode =
             parse_nint6_mmq_mode(nint6_mmq_arg);
+        if (cpu_threads_set && cpu_threads <= 0) {
+            throw std::runtime_error("--threads must be positive");
+        }
+        if (cpu_threads > 0) {
+            at::set_num_threads(cpu_threads);
+        }
         configure_tensor_parallel(
             tensor_parallel_arg,
             tensor_split_arg,
             tensor_parallel_test_duplicates);
         configure_layer_placement(
             layer_parallel_arg, layer_split_arg);
+        if (n_gpu_layers_set && g_n_gpu_layers < 0) {
+            throw std::runtime_error("--n-gpu-layers must be non-negative");
+        }
+        if (n_gpu_layers_set && !cpu_offload_layers_arg.empty()) {
+            throw std::runtime_error(
+                "--n-gpu-layers cannot be combined with --cpu-offload-layers");
+        }
         if (moe_gpu_cache_gb < 0.0 ||
                 !std::isfinite(moe_gpu_cache_gb)) {
             throw std::runtime_error(
@@ -20072,6 +21052,20 @@ int main(int argc, char ** argv) {
                         moe_cache_profile_path));
             }
             g_mfq_drop_file_cache = true;
+        }
+        if (!check_linear_cpu.empty()) {
+            if (mfq_path.empty()) {
+                throw std::runtime_error("--check-linear-cpu requires --mfq");
+            }
+            int gate_mode = 0;
+            if (check_linear_gate == "sigmoid") gate_mode = 1;
+            else if (check_linear_gate == "silu") gate_mode = 2;
+            else if (!check_linear_gate.empty()) {
+                throw std::runtime_error("--check-linear-gate must be sigmoid or silu");
+            }
+            return run_cpu_linear_check(
+                mfq_path, check_linear_cpu, check_linear_m,
+                gate_mode, check_linear_reps);
         }
         if (!check_linear.empty()) {
             if (mfq_path.empty()) throw std::runtime_error("--check-linear requires --mfq");
@@ -20873,6 +21867,7 @@ int main(int argc, char ** argv) {
         bool use_cuda_graph =
             (graph_env == nullptr || graph_env[0] != '0') &&
             g_dsv4_cpu_offload_layers.empty() &&
+            g_dense_cpu_layer_count == 0 &&
             !g_moe_expert_cache &&
             !g_tensor_parallel.enabled() &&
             (!profile || profile_cuda_graph) && gen > 1;
