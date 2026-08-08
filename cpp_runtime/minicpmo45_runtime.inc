@@ -1006,7 +1006,7 @@ struct MiniCPMO45TtsDecoder {
                 torch::TensorOptions().device(torch::kCUDA)
                     .dtype(torch::kInt64));
         }
-        auto hidden = input_embeddings.contiguous();
+        auto hidden = input_embeddings.to(torch::kBFloat16).contiguous();
         for (auto & block : blocks) {
             hidden = block->forward(
                 hidden, positions, cache_position,
@@ -1032,16 +1032,26 @@ struct MiniCPMO45TtsDecoder {
             code_head.transpose(0, 1));
     }
 
-    torch::Tensor generate_greedy(
+    torch::Tensor generate_official(
             torch::Tensor condition_embeddings,
             int64_t steps,
             int64_t eos_token = 6561,
-            int64_t minimum_steps = 0,
+            int64_t minimum_steps = 50,
+            double temperature = 0.8,
+            double top_p = 0.85,
+            int64_t top_k = 25,
+            double repetition_penalty = 1.05,
             std::vector<torch::Tensor> * logits_trace = nullptr) {
-        if (steps <= 0 || minimum_steps < 0 || minimum_steps > steps ||
-                eos_token < 0 || eos_token >= 6562) {
+        if (steps <= 0 || minimum_steps < 0 ||
+                eos_token < 0 || eos_token >= 6562 ||
+                temperature <= 0.0 || top_p <= 0.0 || top_p > 1.0 ||
+                top_k < 3 || top_k > 6562 || repetition_penalty <= 0.0) {
             throw std::runtime_error(
                 "MiniCPM-o TTS generation limits are invalid");
+        }
+        if (condition_embeddings.size(0) != 1) {
+            throw std::runtime_error(
+                "official MiniCPM-o TTS generation requires batch size one");
         }
         reset(condition_embeddings.size(0));
         std::vector<torch::Tensor> generated;
@@ -1049,24 +1059,72 @@ struct MiniCPMO45TtsDecoder {
         auto current = condition_embeddings;
         for (int64_t step = 0; step < steps; ++step) {
             auto hidden = hidden_forward(current);
-            auto step_logits = logits(
+            auto raw_step_logits = logits(
                 hidden.index({Slice(), -1, Slice()}))
                 .to(torch::kFloat32);
+            if (logits_trace != nullptr) {
+                logits_trace->push_back(raw_step_logits.clone());
+            }
+            auto step_logits = raw_step_logits / temperature;
+            if (!generated.empty()) {
+                if (repetition_penalty != 1.0) {
+                    auto counts = torch::zeros_like(step_logits);
+                    const size_t begin = generated.size() > 16
+                        ? generated.size() - 16 : 0;
+                    for (size_t index = begin; index < generated.size(); ++index) {
+                        counts.scatter_add_(
+                            1, generated[index].reshape({1, 1}),
+                            torch::ones(
+                                {1, 1}, counts.options()));
+                    }
+                    auto alpha = torch::pow(
+                        torch::full_like(counts, repetition_penalty), counts);
+                    step_logits = torch::where(
+                        step_logits < 0,
+                        step_logits * alpha,
+                        step_logits / alpha);
+                }
+                if (top_p < 1.0) {
+                    auto sorted = step_logits.sort(-1, false);
+                    auto sorted_logits = std::get<0>(sorted);
+                    auto sorted_indices = std::get<1>(sorted);
+                    auto cumulative = torch::cumsum(
+                        torch::softmax(sorted_logits, -1), -1);
+                    auto remove = cumulative <= (1.0 - top_p);
+                    remove.narrow(1, remove.size(1) - 3, 3).fill_(false);
+                    sorted_logits = sorted_logits.masked_fill(
+                        remove, -std::numeric_limits<float>::infinity());
+                    step_logits = torch::full_like(
+                        step_logits,
+                        -std::numeric_limits<float>::infinity());
+                    step_logits.scatter_(1, sorted_indices, sorted_logits);
+                }
+                if (top_k < step_logits.size(1)) {
+                    auto top_values = std::get<0>(
+                        step_logits.topk(top_k, -1, true, true));
+                    auto threshold = top_values.select(1, top_k - 1)
+                        .unsqueeze(1);
+                    step_logits = step_logits.masked_fill(
+                        step_logits < threshold,
+                        -std::numeric_limits<float>::infinity());
+                }
+            }
             if (step < minimum_steps) {
                 step_logits.index_put_({Slice(), eos_token},
                     -std::numeric_limits<float>::infinity());
             }
-            if (logits_trace != nullptr) {
-                logits_trace->push_back(step_logits.clone());
-            }
-            auto token = torch::argmax(step_logits, -1)
-                .to(torch::kInt64);
+            auto token = torch::multinomial(
+                torch::softmax(step_logits, -1), 1)
+                .reshape({1}).to(torch::kInt64);
             generated.push_back(token);
             if (token.eq(eos_token).all().item<bool>()) break;
             current = minicpmo45_embedding(
                 code_embedding, token.unsqueeze(1));
         }
-        return torch::stack(generated, 1).unsqueeze(-1).contiguous();
+        auto sampled = torch::stack(generated, 1);
+        return sampled.narrow(
+            1, 0, std::max<int64_t>(0, sampled.size(1) - 1))
+            .unsqueeze(-1).contiguous();
     }
 };
 
@@ -1148,6 +1206,8 @@ struct MiniCPMO45Runtime {
 
     MiniCPMO45ForwardResult forward(
             torch::Tensor input_ids,
+            torch::Tensor position_ids,
+            torch::Tensor attention_mask,
             torch::Tensor pixels,
             torch::Tensor patch_mask,
             torch::Tensor target_sizes,
@@ -1222,9 +1282,14 @@ struct MiniCPMO45Runtime {
             }
         }
         language.reset(input_ids.size(0));
+        c10::optional<torch::Tensor> positions = c10::nullopt;
+        if (position_ids.defined()) positions = position_ids;
+        c10::optional<torch::Tensor> mask = c10::nullopt;
+        if (attention_mask.defined()) mask = attention_mask;
         result.hidden_states = language.hidden_forward_inputs(
             input_ids, result.input_embeddings,
-            c10::nullopt, c10::nullopt);
+            positions, c10::nullopt, nullptr, mask,
+            position_ids.defined());
         result.logits = language.logits_from_hidden(result.hidden_states);
         return result;
     }
@@ -1289,6 +1354,10 @@ static int run_minicpmo45_composite(
         mfq_path, config_path, context_size);
     const auto input_ids = minicpmo45_load_tensor(
         input_prefix + ".input_ids.pt", true);
+    const auto position_ids = minicpmo45_load_tensor(
+        input_prefix + ".position_ids.pt", false);
+    const auto attention_mask = minicpmo45_load_tensor(
+        input_prefix + ".attention_mask.pt", false);
     const auto pixels = minicpmo45_load_tensor(
         input_prefix + ".pixel_values.pt", false);
     const auto patch_mask = minicpmo45_load_tensor(
@@ -1304,7 +1373,8 @@ static int run_minicpmo45_composite(
     const auto audio_bounds = minicpmo45_load_tensor(
         input_prefix + ".audio_bounds.pt", false);
     auto result = runtime.forward(
-        input_ids, pixels, patch_mask, target_sizes, image_bounds,
+        input_ids, position_ids, attention_mask,
+        pixels, patch_mask, target_sizes, image_bounds,
         audio_features, audio_lengths, audio_bounds);
     minicpmo45_save_tensor(
         result.vision_states, output_prefix + ".vision_states.pt");
@@ -1343,8 +1413,10 @@ static int run_minicpmo45_composite(
             condition = condition.to(torch::kCUDA).contiguous();
         }
         std::vector<torch::Tensor> tts_logits;
-        const auto codes = runtime.tts.generate_greedy(
-            condition, tts_steps, 6561, 0, &tts_logits);
+        const auto codes = runtime.tts.generate_official(
+            condition, tts_steps, 6561,
+            50,
+            0.8, 0.85, 25, 1.05, &tts_logits);
         minicpmo45_save_tensor(
             condition, output_prefix + ".tts_inputs_embeds.pt");
         minicpmo45_save_tensor(

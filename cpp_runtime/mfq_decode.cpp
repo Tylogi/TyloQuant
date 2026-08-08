@@ -10860,6 +10860,9 @@ struct Config {
     bool is_glm_dsa() const { return model_type == "glm_moe_dsa"; }
     bool is_dsv4() const { return model_type == "deepseek_v4"; }
     bool is_minicpmo45() const { return model_type == "minicpmo"; }
+    bool uses_minicpmo45_bf16_graph() const {
+        return model_type == "minicpmo" || model_type == "minicpmtts";
+    }
     int64_t attention_size() const { return num_attention_heads * head_dim; }
     int64_t kv_size() const { return num_key_value_heads * head_dim; }
     int64_t linear_k_size() const { return linear_num_key_heads * linear_key_head_dim; }
@@ -12331,7 +12334,9 @@ struct Block {
     virtual void set_token_ids(const torch::Tensor &) {}
     virtual torch::Tensor forward(torch::Tensor x, torch::Tensor pos, int64_t cache_pos,
                                   const c10::optional<torch::Tensor> & seq_len,
-                                  const Config & c, const RopeCache & rope) = 0;
+                                  const Config & c, const RopeCache & rope,
+                                  const c10::optional<torch::Tensor> & cache_positions = c10::nullopt,
+                                  const c10::optional<torch::Tensor> & attention_mask = c10::nullopt) = 0;
 };
 
 struct Dsv4PoolState {
@@ -12963,7 +12968,11 @@ struct Dsv4Block : Block {
         int64_t cache_pos,
         const c10::optional<torch::Tensor> & seq_len,
         const Config &,
-        const RopeCache &) override {
+        const RopeCache &,
+        const c10::optional<torch::Tensor> & cache_positions = c10::nullopt,
+        const c10::optional<torch::Tensor> & attention_mask = c10::nullopt) override {
+        (void)cache_positions;
+        (void)attention_mask;
         if (!current_ids.defined()) {
             throw std::runtime_error(
                 "DeepSeek V4 block did not receive token ids");
@@ -13137,9 +13146,12 @@ struct FullBlock : Block {
 
     torch::Tensor forward(torch::Tensor x, torch::Tensor pos, int64_t cache_pos,
                           const c10::optional<torch::Tensor> & seq_len,
-                          const Config & c, const RopeCache & rope) override {
+                          const Config & c, const RopeCache & rope,
+                          const c10::optional<torch::Tensor> & cache_positions = c10::nullopt,
+                          const c10::optional<torch::Tensor> & attention_mask = c10::nullopt) override {
         int64_t B = x.size(0), T = x.size(1), H = x.size(2);
-        if (c.is_minicpmo45() && x.scalar_type() != torch::kBFloat16) {
+        const bool official_bf16 = c.uses_minicpmo45_bf16_graph();
+        if (official_bf16 && x.scalar_type() != torch::kBFloat16) {
             x = x.to(torch::kBFloat16).contiguous();
         }
         const int64_t nh = attention_heads > 0 ? attention_heads : c.num_attention_heads;
@@ -13156,7 +13168,7 @@ struct FullBlock : Block {
         if (!cache.k.defined() || cache.k.numel() == 0) {
             cache = KVCache(
                 B, nkh, cache_capacity, hd, sliding, x.device(),
-                c.is_minicpmo45() ? torch::kBFloat16 : torch::kFloat16);
+                official_bf16 ? torch::kBFloat16 : torch::kFloat16);
             if (x.is_cuda()) {
                 const int64_t total = B * nh;
                 auto opts = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
@@ -13167,7 +13179,7 @@ struct FullBlock : Block {
         }
         auto residual = x;
         auto xn = g_profiler.measure("full.attn_norm", [&]() {
-            return c.is_minicpmo45()
+            return official_bf16
                 ? qwen_rms_norm_bf16(
                     x.reshape({B * T, H}), attn_norm, c)
                     .reshape({B, T, H})
@@ -13181,7 +13193,7 @@ struct FullBlock : Block {
         }
         auto q_full = parts[0], k_full = parts[1];
         auto v_full = value_equals_key ? k_full : parts[2];
-        if (c.is_minicpmo45()) {
+        if (official_bf16) {
             q_full = q_full.to(torch::kBFloat16).contiguous();
             k_full = k_full.to(torch::kBFloat16).contiguous();
             v_full = v_full.to(torch::kBFloat16).contiguous();
@@ -13202,7 +13214,7 @@ struct FullBlock : Block {
         auto k = g_profiler.measure("full.k_view", [&]() { return k_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous(); });
         auto v = g_profiler.measure("full.v_view", [&]() { return v_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous(); });
         if (q_norm.defined()) q = g_profiler.measure("full.q_norm", [&]() {
-            return c.is_minicpmo45()
+            return official_bf16
                 ? qwen_rms_norm_bf16(
                     q.reshape({-1, hd}), q_norm, c).reshape_as(q)
                 : qwen_rms_norm(
@@ -13210,7 +13222,7 @@ struct FullBlock : Block {
                     .reshape_as(q);
         });
         if (k_norm.defined()) k = g_profiler.measure("full.k_norm", [&]() {
-            return c.is_minicpmo45()
+            return official_bf16
                 ? qwen_rms_norm_bf16(
                     k.reshape({-1, hd}), k_norm, c).reshape_as(k)
                 : qwen_rms_norm(
@@ -13218,7 +13230,7 @@ struct FullBlock : Block {
                     .reshape_as(k);
         });
         if (v_norm.defined()) v = g_profiler.measure("full.v_norm", [&]() {
-            return c.is_minicpmo45()
+            return official_bf16
                 ? qwen_rms_norm_bf16(
                     v.reshape({-1, hd}), v_norm, c).reshape_as(v)
                 : qwen_rms_norm(
@@ -13226,25 +13238,86 @@ struct FullBlock : Block {
                     .reshape_as(v);
         });
         q = g_profiler.measure("full.q_rope", [&]() {
-            return c.is_minicpmo45()
+            return official_bf16
                 ? active_rope.apply_bf16(q, pos)
                 : active_rope.apply(q, pos, c);
         });
         k = g_profiler.measure("full.k_rope", [&]() {
-            return c.is_minicpmo45()
+            return official_bf16
                 ? active_rope.apply_bf16(k, pos)
                 : active_rope.apply(k, pos, c);
         });
-        auto kv = g_profiler.measure("full.kv_write", [&]() { return cache.append(k, v, pos, cache_pos, cache_pos + T); });
+        auto write_positions = cache_positions.has_value()
+            ? cache_positions.value().to(x.device(), torch::kInt64).contiguous()
+            : pos;
+        if (write_positions.dim() != 1 || write_positions.numel() != T) {
+            throw std::runtime_error(
+                "KV cache positions must have shape [tokens]");
+        }
+        auto kv = g_profiler.measure("full.kv_write", [&]() {
+            return cache.append(
+                k, v, write_positions, cache_pos, cache_pos + T);
+        });
+        auto minicpmo45_attention_mask = [&](int64_t visible_len,
+                                              bool explicit_causal) {
+            c10::optional<torch::Tensor> result = c10::nullopt;
+            if (!official_bf16 ||
+                    (!explicit_causal && !seq_len.has_value() &&
+                     !attention_mask.has_value())) {
+                return result;
+            }
+            auto options = torch::TensorOptions()
+                .device(x.device()).dtype(torch::kInt64);
+            auto key_positions = torch::arange(visible_len, options);
+            auto query_positions = write_positions
+                .to(x.device(), torch::kInt64)
+                .reshape({1, T}).expand({B, T});
+            auto allowed = key_positions.reshape({1, 1, visible_len}) <=
+                query_positions.unsqueeze(-1);
+            if (seq_len.has_value()) {
+                auto lengths = seq_len.value()
+                    .to(x.device(), torch::kInt64).reshape({B, 1, 1});
+                allowed = allowed &
+                    (key_positions.reshape({1, 1, visible_len}) < lengths);
+            }
+            if (attention_mask.has_value()) {
+                auto valid = attention_mask.value().to(x.device());
+                if (valid.dim() != 2 || valid.size(0) != B ||
+                        valid.size(1) < visible_len) {
+                    throw std::runtime_error(
+                        "MiniCPM-o attention_mask must cover [batch,visible_tokens]");
+                }
+                valid = valid.narrow(1, 0, visible_len).ne(0);
+                allowed = allowed & valid.unsqueeze(1);
+                auto attended = allowed.any(-1, true);
+                allowed = torch::where(
+                    attended, allowed, torch::ones_like(allowed));
+            }
+            const auto mask_dtype = official_bf16
+                ? torch::kBFloat16 : x.scalar_type();
+            auto additive = torch::zeros(
+                {B, 1, T, visible_len},
+                torch::TensorOptions().device(x.device())
+                    .dtype(mask_dtype));
+            const double mask_min = static_cast<double>(
+                std::numeric_limits<c10::BFloat16>::lowest());
+            additive.masked_fill_(
+                allowed.logical_not().unsqueeze(1),
+                mask_min);
+            result = additive.contiguous();
+            return result;
+        };
         double attn_scale = attention_scale > 0.0 ? attention_scale : 1.0 / std::sqrt((double)hd);
         torch::Tensor a;
         bool attention_token_major = false;
         a = g_profiler.measure("full.attention", [&]() {
             if (!x.is_cuda()) {
                 TORCH_CHECK(!sliding, "CPU dense offload does not support sliding attention");
-                auto qh = q.to(torch::kFloat32).contiguous();
-                auto kh = kv.first.to(torch::kFloat32).contiguous();
-                auto vh = kv.second.to(torch::kFloat32).contiguous();
+                const auto cpu_attention_dtype = official_bf16
+                    ? torch::kBFloat16 : torch::kFloat32;
+                auto qh = q.to(cpu_attention_dtype).contiguous();
+                auto kh = kv.first.to(cpu_attention_dtype).contiguous();
+                auto vh = kv.second.to(cpu_attention_dtype).contiguous();
                 if (nkh != nh) {
                     TORCH_CHECK(nh % nkh == 0, "CPU attention head ratio is invalid");
                     const int64_t repeat = nh / nkh;
@@ -13252,7 +13325,10 @@ struct FullBlock : Block {
                     vh = vh.repeat_interleave(repeat, 1);
                 }
                 c10::optional<torch::Tensor> mask = c10::nullopt;
-                if (T > 1 || seq_len.has_value()) {
+                if (official_bf16) {
+                    mask = minicpmo45_attention_mask(
+                        kh.size(2), T > 1);
+                } else if (T > 1 || seq_len.has_value()) {
                     const int64_t visible = kh.size(2);
                     auto key_positions = torch::arange(
                         visible,
@@ -13279,13 +13355,13 @@ struct FullBlock : Block {
                 return at::scaled_dot_product_attention(
                     qh, kh, vh, mask, 0.0, false, attn_scale, false);
             }
-            const auto attention_dtype = c.is_minicpmo45()
+            const auto attention_dtype = official_bf16
                 ? torch::kBFloat16 : torch::kFloat16;
             auto qh = q.to(attention_dtype).contiguous();
             auto kh = k.to(attention_dtype).contiguous();
             auto vh = v.to(attention_dtype).contiguous();
             if (cache_pos == 0 && T > 1) {
-                if (c.is_minicpmo45()) {
+                if (official_bf16) {
                     auto repeated_k = kh;
                     auto repeated_v = vh;
                     if (nkh != nh) {
@@ -13296,9 +13372,10 @@ struct FullBlock : Block {
                         repeated_k = kh.repeat_interleave(repeat, 1).contiguous();
                         repeated_v = vh.repeat_interleave(repeat, 1).contiguous();
                     }
+                    auto mask = minicpmo45_attention_mask(T, false);
                     a = at::scaled_dot_product_attention(
-                        qh, repeated_k, repeated_v, std::nullopt,
-                        0.0, true, attn_scale, false);
+                        qh, repeated_k, repeated_v, mask,
+                        0.0, !mask.has_value(), attn_scale, false);
                 } else {
                 const char * llama_flash_env = std::getenv("MFQ_LLAMA_FLASH256");
                 const bool llama_flash_enabled =
@@ -13330,7 +13407,7 @@ struct FullBlock : Block {
                 const int64_t planned_len = g_decode_graph_attention_kv_len > 0
                     ? g_decode_graph_attention_kv_len : cache_pos + T;
                 const char * aten_decode_env = std::getenv("MFQ_ATTENTION_DECODE_ATEN");
-                const bool aten_decode_enabled = c.is_minicpmo45() ||
+                const bool aten_decode_enabled = official_bf16 ||
                     (aten_decode_env != nullptr && aten_decode_env[0] == '1');
                 const char * llama_decode_env = std::getenv("MFQ_LLAMA_FLASH_DECODE");
                 const bool llama_decode_enabled =
@@ -13362,24 +13439,9 @@ struct FullBlock : Block {
                         Slice(), Slice(), Slice(0, visible_len), Slice()}).contiguous();
                     auto cached_v = cache.v.index({
                         Slice(), Slice(), Slice(0, visible_len), Slice()}).contiguous();
-                    c10::optional<torch::Tensor> mask = c10::nullopt;
-                    if (c.is_minicpmo45() && (T > 1 || B > 1)) {
-                        auto options = torch::TensorOptions()
-                            .device(qh.device()).dtype(torch::kInt64);
-                        auto key_positions = torch::arange(visible_len, options);
-                        auto query_positions = pos.dim() == 1
-                            ? pos.to(qh.device(), torch::kInt64)
-                            : pos.select(0, 0).to(qh.device(), torch::kInt64);
-                        auto allowed = key_positions.unsqueeze(0) <=
-                            query_positions.unsqueeze(1);
-                        allowed = allowed.unsqueeze(0).expand({B, T, visible_len});
-                        auto lengths = seq_len.value()
-                            .to(qh.device(), torch::kInt64).reshape({B, 1, 1});
-                        allowed = allowed &
-                            (key_positions.reshape({1, 1, visible_len}) < lengths);
-                        mask = allowed.unsqueeze(1);
-                    }
-                    if (c.is_minicpmo45() && nkh != nh) {
+                    auto mask = minicpmo45_attention_mask(
+                        visible_len, cache_pos > 0 && T > 1);
+                    if (official_bf16 && nkh != nh) {
                         TORCH_CHECK(
                             nh % nkh == 0,
                             "MiniCPM-o Qwen3 attention head ratio is invalid");
@@ -13389,7 +13451,7 @@ struct FullBlock : Block {
                     }
                     a = at::scaled_dot_product_attention(
                         qh, cached_k, cached_v, mask,
-                        0.0, false, attn_scale, !c.is_minicpmo45());
+                        0.0, false, attn_scale, !official_bf16);
                 } else if (sliding && T == 1 && llama_decode_enabled && hd == 256 && nh == 2 * nkh) {
                     const int64_t visible_len = std::min<int64_t>(attention_window, planned_len);
                     prepare_llama_decode_workspace(visible_len, 64);
@@ -13434,7 +13496,7 @@ struct FullBlock : Block {
                                 qh, cache.k, cache.v, seq_len.value(), attn_scale);
                 }
             } else {
-                if (c.is_minicpmo45()) {
+                if (official_bf16) {
                     auto cached_k = kv.first.contiguous();
                     auto cached_v = kv.second.contiguous();
                     if (nkh != nh) {
@@ -13445,9 +13507,11 @@ struct FullBlock : Block {
                         cached_k = cached_k.repeat_interleave(repeat, 1).contiguous();
                         cached_v = cached_v.repeat_interleave(repeat, 1).contiguous();
                     }
+                    auto mask = minicpmo45_attention_mask(
+                        cached_k.size(2), cache_pos > 0 && T > 1);
                     a = at::scaled_dot_product_attention(
-                        qh, cached_k, cached_v, std::nullopt,
-                        0.0, cache_pos == 0 && T > 1,
+                        qh, cached_k, cached_v, mask,
+                        0.0, !mask.has_value() && cache_pos == 0 && T > 1,
                         attn_scale, false);
                 } else {
                     a = sliding
@@ -13476,7 +13540,7 @@ struct FullBlock : Block {
             });
             oo = g_profiler.measure("full.o_proj", [&]() { return o.forward(af); });
         }
-        if (c.is_minicpmo45()) {
+        if (official_bf16) {
             oo = oo.to(torch::kBFloat16).contiguous();
         }
         if (gemma4) {
@@ -13650,7 +13714,7 @@ struct FullBlock : Block {
             if (!rr.is_cuda()) {
                 auto summed = (rr.to(torch::kFloat32) + oo2.to(torch::kFloat32))
                     .to(rr.scalar_type()).contiguous();
-                auto normalized = c.is_minicpmo45()
+                auto normalized = official_bf16
                     ? qwen_rms_norm_bf16(summed, ffn_norm, c)
                     : qwen_rms_norm(
                         summed.to(torch::kFloat32), ffn_norm, c);
@@ -13672,7 +13736,7 @@ struct FullBlock : Block {
             if (rr.scalar_type() == torch::kBFloat16 &&
                     oo2.scalar_type() == torch::kBFloat16) {
                 auto sum = (rr + oo2).contiguous();
-                auto norm = c.is_minicpmo45()
+                auto norm = official_bf16
                     ? qwen_rms_norm_bf16(sum, ffn_norm, c)
                     : qwen_rms_norm(
                         sum.to(torch::kFloat32), ffn_norm, c)
@@ -13686,7 +13750,7 @@ struct FullBlock : Block {
         residual = x;
         xn = attn_pair[1].reshape({B, T, H});
         torch::Tensor ff;
-        if (c.is_minicpmo45()) {
+        if (official_bf16) {
             auto ffn_input = xn.reshape({B * T, H});
             auto gate_up = g_profiler.measure(
                 "full.minicpmo45_ffn_gate_up",
@@ -13857,7 +13921,11 @@ struct GlmDsaBlock : Block {
     torch::Tensor forward(
         torch::Tensor x, torch::Tensor pos, int64_t cache_pos,
         const c10::optional<torch::Tensor> & seq_len,
-        const Config & c, const RopeCache & rope) override {
+        const Config & c, const RopeCache & rope,
+        const c10::optional<torch::Tensor> & cache_positions = c10::nullopt,
+        const c10::optional<torch::Tensor> & attention_mask = c10::nullopt) override {
+        (void)cache_positions;
+        (void)attention_mask;
         const int64_t B = x.size(0);
         const int64_t T = x.size(1);
         const int64_t H = x.size(2);
@@ -14231,7 +14299,11 @@ struct LinearBlock : Block {
 
     torch::Tensor forward(torch::Tensor x, torch::Tensor pos, int64_t cache_pos,
                           const c10::optional<torch::Tensor> & seq_len,
-                          const Config & c, const RopeCache & rope) override {
+                          const Config & c, const RopeCache & rope,
+                          const c10::optional<torch::Tensor> & cache_positions = c10::nullopt,
+                          const c10::optional<torch::Tensor> & attention_mask = c10::nullopt) override {
+        (void)cache_positions;
+        (void)attention_mask;
         if (!x.is_cuda()) return forward_cpu(std::move(x), c);
         (void)seq_len;
         (void)pos; (void)cache_pos; (void)rope;
@@ -15323,7 +15395,9 @@ struct Model {
             torch::Tensor input_embeddings,
             c10::optional<torch::Tensor> pos_override = c10::nullopt,
             c10::optional<torch::Tensor> seq_len = c10::nullopt,
-            std::vector<torch::Tensor> * block_trace = nullptr) {
+            std::vector<torch::Tensor> * block_trace = nullptr,
+            c10::optional<torch::Tensor> attention_mask = c10::nullopt,
+            bool advance_cache_with_position_ids = false) {
         const int primary = g_layer_placement.primary_device();
         c10::cuda::CUDAGuard primary_guard(primary);
         ids = tensor_to_cuda_device(
@@ -15339,20 +15413,48 @@ struct Model {
         const int64_t B = ids.size(0);
         const int64_t T = ids.size(1);
         if (cache_pos == 0) reset(B);
+        auto cache_positions = torch::arange(
+            cache_pos, cache_pos + T,
+            torch::TensorOptions().device(torch::kCUDA)
+                .dtype(torch::kInt64));
         auto pos = pos_override.has_value()
-            ? tensor_to_cuda_device(pos_override.value(), primary)
-            : torch::arange(
-                cache_pos, cache_pos + T,
-                torch::TensorOptions().device(torch::kCUDA)
-                    .dtype(torch::kInt64));
-        torch::Tensor cpu_ids, cpu_pos;
+            ? tensor_to_cuda_device(
+                pos_override.value(), primary).to(torch::kInt64).contiguous()
+            : cache_positions;
+        if (!((pos.dim() == 1 && pos.numel() == T) ||
+              (pos.dim() == 2 && pos.size(0) == B && pos.size(1) == T))) {
+            throw std::runtime_error(
+                "position_ids must have shape [tokens] or [batch,tokens]");
+        }
+        if (attention_mask.has_value()) {
+            auto mask = attention_mask.value();
+            if (mask.dim() != 2 || mask.size(0) != B ||
+                    mask.size(1) < cache_pos + T) {
+                throw std::runtime_error(
+                    "attention_mask must cover [batch,cached_plus_current_tokens]");
+            }
+        }
+        auto effective_attention_mask = attention_mask;
+        if (c.is_minicpmo45() && attention_mask.has_value() &&
+                (T == 1 || cache_pos == 0) &&
+                attention_mask.value().eq(1).all().item<bool>()) {
+            effective_attention_mask = c10::nullopt;
+        }
+        torch::Tensor cpu_ids, cpu_pos, cpu_cache_positions;
+        c10::optional<torch::Tensor> cpu_attention_mask = c10::nullopt;
         c10::optional<torch::Tensor> cpu_seq_len = c10::nullopt;
         if (g_dense_cpu_layer_count > 0) {
             cpu_ids = ids.to(torch::kCPU, torch::kInt64).contiguous();
             cpu_pos = pos.to(torch::kCPU, torch::kInt64).contiguous();
+            cpu_cache_positions = cache_positions
+                .to(torch::kCPU, torch::kInt64).contiguous();
             if (seq_len.has_value()) {
                 cpu_seq_len = seq_len.value()
                     .to(torch::kCPU, torch::kInt64).contiguous();
+            }
+            if (effective_attention_mask.has_value()) {
+                cpu_attention_mask = effective_attention_mask.value()
+                    .to(torch::kCPU).contiguous();
             }
         }
         auto x = tensor_to_cuda_device(
@@ -15380,12 +15482,23 @@ struct Model {
             auto local_pos = b->cpu_offloaded
                 ? cpu_pos
                 : tensor_to_cuda_device(pos, b->cuda_device);
+            auto local_cache_positions = b->cpu_offloaded
+                ? cpu_cache_positions
+                : tensor_to_cuda_device(
+                    cache_positions, b->cuda_device);
             c10::optional<torch::Tensor> local_seq_len = c10::nullopt;
             if (seq_len.has_value()) {
                 local_seq_len = b->cpu_offloaded
                     ? cpu_seq_len.value()
                     : tensor_to_cuda_device(
                         seq_len.value(), b->cuda_device);
+            }
+            c10::optional<torch::Tensor> local_attention_mask = c10::nullopt;
+            if (effective_attention_mask.has_value()) {
+                local_attention_mask = b->cpu_offloaded
+                    ? cpu_attention_mask.value()
+                    : tensor_to_cuda_device(
+                        effective_attention_mask.value(), b->cuda_device);
             }
             x = b->cpu_offloaded
                 ? x.to(torch::kCPU).contiguous()
@@ -15396,14 +15509,21 @@ struct Model {
                 : (device_ropes.empty()
                     ? rope : device_ropes.at(b->cuda_device));
             x = b->forward(
-                x, local_pos, cache_pos, local_seq_len, c, active_rope);
+                x, local_pos, cache_pos, local_seq_len, c, active_rope,
+                c.is_minicpmo45()
+                    ? c10::optional<torch::Tensor>(local_cache_positions)
+                    : c10::nullopt,
+                c.is_minicpmo45()
+                    ? local_attention_mask : c10::nullopt);
             if (block_trace != nullptr) {
                 block_trace->push_back(
                     tensor_to_cuda_device(x, primary)
                         .to(torch::kFloat32).clone());
             }
         }
-        if (!pos_override.has_value()) cache_pos += T;
+        if (!pos_override.has_value() || advance_cache_with_position_ids) {
+            cache_pos += T;
+        }
         x = tensor_to_cuda_device(x, primary);
         return finalize_hidden(x, B, T);
     }
@@ -15437,13 +15557,18 @@ struct Model {
         c10::optional<torch::Tensor> seq_len = c10::nullopt;
         const int64_t token_count = ids.dim() == 1 ? ids.size(0) : ids.size(1);
         const int64_t batch_size = ids.dim() == 1 ? 1 : ids.size(0);
-        if (cache_pos > 0 && token_count == 1) {
+        if (!c.is_minicpmo45() && cache_pos > 0 && token_count == 1) {
             seq_len = torch::full(
                 {batch_size}, cache_pos + 1,
                 torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
         }
         auto y = hidden_forward(ids, c10::nullopt, seq_len);
-        auto last = y.index({Slice(), -1, Slice()}).to(torch::kFloat16).contiguous();
+        auto last = y.index({Slice(), -1, Slice()});
+        if (c.is_minicpmo45()) {
+            return logits_from_hidden(
+                last.to(torch::kBFloat16).contiguous());
+        }
+        last = last.to(torch::kFloat16).contiguous();
         auto logits = lm_head.forward(last);
         if (c.final_logit_softcapping > 0.0) {
             logits = torch::tanh(logits / c.final_logit_softcapping) *
@@ -15454,7 +15579,12 @@ struct Model {
 
     torch::Tensor last_logits_static(torch::Tensor ids, torch::Tensor pos, torch::Tensor seq_len) {
         auto y = hidden_forward(ids, pos, seq_len);
-        auto last = y.index({Slice(), -1, Slice()}).to(torch::kFloat16).contiguous();
+        auto last = y.index({Slice(), -1, Slice()});
+        if (c.is_minicpmo45()) {
+            return logits_from_hidden(
+                last.to(torch::kBFloat16).contiguous());
+        }
+        last = last.to(torch::kFloat16).contiguous();
         auto logits = lm_head.forward(last);
         if (c.final_logit_softcapping > 0.0) {
             logits = torch::tanh(logits / c.final_logit_softcapping) *
@@ -15467,7 +15597,7 @@ struct Model {
         c10::optional<torch::Tensor> seq_len = c10::nullopt;
         const int64_t token_count = ids.dim() == 1 ? ids.size(0) : ids.size(1);
         const int64_t batch_size = ids.dim() == 1 ? 1 : ids.size(0);
-        if (cache_pos > 0 && token_count == 1) {
+        if (!c.is_minicpmo45() && cache_pos > 0 && token_count == 1) {
             seq_len = torch::full(
                 {batch_size}, cache_pos + 1,
                 torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
@@ -15482,7 +15612,13 @@ struct Model {
     }
 
     torch::Tensor next_token_from_hidden(torch::Tensor y) {
-        auto last = y.index({Slice(), -1, Slice()}).to(torch::kFloat16).contiguous();
+        auto last = y.index({Slice(), -1, Slice()});
+        if (c.is_minicpmo45()) {
+            auto logits = logits_from_hidden(
+                last.to(torch::kBFloat16).contiguous());
+            return torch::argmax(logits, -1).to(torch::kInt64);
+        }
+        last = last.to(torch::kFloat16).contiguous();
         const char* use_argmax = std::getenv("MFQ_LM_HEAD_ARGMAX");
         const char* disable_argmax = std::getenv("MFQ_DISABLE_LM_HEAD_ARGMAX");
         bool lm_head_argmax = (disable_argmax == nullptr || disable_argmax[0] != '1') ||

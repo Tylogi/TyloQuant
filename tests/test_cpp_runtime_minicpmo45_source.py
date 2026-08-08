@@ -1,6 +1,5 @@
 from pathlib import Path
 
-
 ROOT = Path(__file__).parents[1]
 DECODE = (ROOT / "cpp_runtime" / "mfq_decode.cpp").read_text(encoding="utf-8")
 GRAPH = (ROOT / "cpp_runtime" / "minicpmo45_runtime.inc").read_text(
@@ -41,8 +40,16 @@ def test_minicpmo45_audio_and_tts_follow_official_attention_contracts():
     assert "torch::baddbmm(" in GRAPH
     assert "at::linear(" in GRAPH
     assert 'result.hf_model_prefix = "tts.model."' in GRAPH
+    assert 'result.model_type = "minicpmtts"' in GRAPH
+    assert 'model_type == "minicpmo" || model_type == "minicpmtts"' in DECODE
     assert "result.norm_weight_offset = 0.0" in GRAPH
     assert "cache_position += tokens" in GRAPH
+    assert "generate_official(" in GRAPH
+    assert "torch::multinomial(" in GRAPH
+    assert "repetition_penalty = 1.05" in GRAPH
+    assert "if (!generated.empty())" in GRAPH
+    assert "sampled.size(1) - 1" in GRAPH
+    assert "logits_trace->push_back(raw_step_logits.clone())" in GRAPH
 
 
 def test_minicpmo45_resampler_requires_exact_numpy_position_asset():
@@ -58,18 +65,26 @@ def test_minicpmo45_supports_python_tensor_files_and_bfloat16_tts():
     assert "rr.scalar_type() == torch::kBFloat16" in DECODE
     assert "ff2.scalar_type() == torch::kBFloat16" in DECODE
     assert "down.is_dense() || down.is_mxfp8()" in DECODE
+    assert "official_bf16 ? torch::kBFloat16" in DECODE
 
 
 def test_minicpmo45_qwen_runtime_follows_official_bfloat16_sdpa_path():
     assert "qwen_rms_norm_bf16" in DECODE
     assert "active_rope.apply_bf16" in DECODE
-    assert "c.is_minicpmo45() ? torch::kBFloat16" in DECODE
+    assert "official_bf16 ? torch::kBFloat16" in DECODE
     assert "k.scalar_type() != torch::kFloat16" in DECODE
-    assert "const bool aten_decode_enabled = c.is_minicpmo45()" in DECODE
+    assert "const bool aten_decode_enabled = official_bf16" in DECODE
     assert "logits = logits.to(torch::kBFloat16)" in DECODE
     assert "repeated_k = kh.repeat_interleave(repeat, 1)" in DECODE
     assert '"full.minicpmo45_ffn_swiglu"' in DECODE
     assert "torch::silu(gate) * up" in DECODE
+    assert "return logits_from_hidden(" in DECODE
+    assert "last.to(torch::kBFloat16)" in DECODE
+    assert "cache_pos > 0 && T > 1" in DECODE
+    assert "minicpmo45_attention_mask" in DECODE
+    assert "std::numeric_limits<c10::BFloat16>::lowest()" in DECODE
+    assert "!c.is_minicpmo45() && cache_pos > 0" in DECODE
+    assert "attention_mask.value().eq(1).all().item<bool>()" in DECODE
 
 
 def test_minicpmo45_cli_exposes_tensor_fixture_contract():
@@ -77,6 +92,8 @@ def test_minicpmo45_cli_exposes_tensor_fixture_contract():
     assert 'a == "--minicpmo-output-prefix"' in DECODE
     assert 'a == "--minicpmo-tts-steps"' in DECODE
     assert 'input_prefix + ".input_ids.pt"' in GRAPH
+    assert 'input_prefix + ".position_ids.pt"' in GRAPH
+    assert 'input_prefix + ".attention_mask.pt"' in GRAPH
     assert 'output_prefix + ".image_embeddings.pt"' in GRAPH
     assert 'output_prefix + ".audio_embeddings.pt"' in GRAPH
     assert 'output_prefix + ".tts_codes.pt"' in GRAPH

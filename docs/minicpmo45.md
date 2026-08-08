@@ -89,6 +89,9 @@ a versioned BF16 runtime asset. The C++ graph requires this asset so
 cross-attention does not depend on platform-specific sin/cos rounding.
 
 - `<prefix>.input_ids.pt` is required.
+- `<prefix>.position_ids.pt` and `<prefix>.attention_mask.pt` are optional.
+  Supplying them preserves the official per-batch RoPE positions and padding
+  mask; omitted position IDs use consecutive cache positions.
 - Image input uses `pixel_values`, `patch_mask`, `target_sizes`, and
   `image_bounds` files. Bounds have rows `[batch, source, begin, end]`.
 - Audio input uses `audio_features`, `audio_lengths`, and `audio_bounds` files
@@ -108,8 +111,12 @@ mfq-decode \
 
 The output prefix receives component states, merged input embeddings, Qwen3
 hidden states and logits, plus TTS code logits and generated codes when TTS is
-enabled. The native graph produces S3 audio codes. Token2wav waveform rendering
-still uses the assets supplied with the official model directory.
+enabled. Qwen3 and TTS keep the official BF16 projection, SDPA, residual, and
+KV-cache boundaries. TTS code generation uses the official default
+temperature, top-p, top-k, 16-token repetition penalty, minimum length, and
+multinomial sampling. The native graph produces S3 audio codes. Token2wav
+waveform rendering still uses the assets supplied with the official model
+directory.
 
 The HTTP server does not yet parse raw MiniCPM-o image and audio requests.
 Quality and performance results require a calibrated checkpoint and

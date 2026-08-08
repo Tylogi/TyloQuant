@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
 from torch import nn
 
+import mfq.runtime.minicpmo45 as minicpmo45_runtime
 from mfq.formats import io
 from mfq.formats.nint import NintSpec
 from mfq.quantize import nint_quant
@@ -71,6 +74,12 @@ def test_minicpmo45_dense_integer_state_is_not_cast_to_bfloat16():
     result = _dense_to_torch(value, "cpu", dtype=torch.bfloat16)
 
     assert result.dtype == torch.int64
+
+
+def test_minicpmo45_loader_requests_official_sdpa_attention():
+    source = Path(minicpmo45_runtime.__file__).read_text(encoding="utf-8")
+
+    assert 'attn_implementation="sdpa"' in source
 
 
 def test_minicpmo45_record_dtype_detection():

@@ -232,7 +232,11 @@ def _load_minicpmo45(
             local_files_only=local_files_only,
         )
         with init_empty_weights(include_buffers=False):
-            model = AutoModel.from_config(config, trust_remote_code=True)
+            model = AutoModel.from_config(
+                config,
+                trust_remote_code=True,
+                attn_implementation="sdpa",
+            )
 
         checkpoint_names = {name for name in store.records if not is_asset_record(name)}
         expected_names = set(model.state_dict())
