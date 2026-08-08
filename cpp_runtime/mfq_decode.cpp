@@ -6066,7 +6066,7 @@ public:
         return stats_;
     }
 
-    void prepare(
+    bool prepare(
         MoeCachedSource & source,
         const std::vector<int32_t> & experts,
         bool prefetch);
@@ -6779,7 +6779,14 @@ public:
                 : stage_cpu_mixed_moe(cpu_);
             return staged.forward(x, route);
         }
-        cache_->prepare(*this, route_experts(route), false);
+        if (!cache_->prepare(
+                *this, route_experts(route), false)) {
+            cache_->count_full_projection_fallback();
+            auto staged = pure_nint_candidate_
+                ? stage_cpu_nint_moe(cpu_)
+                : stage_cpu_mixed_moe(cpu_);
+            return staged.forward(x, route);
+        }
         torch::Tensor output;
         if (pure_nint_) {
             cache_->count_hetero_dispatch();
@@ -6798,7 +6805,14 @@ public:
             throw std::runtime_error(
                 "cached prequantized activation reuse only supports decode-sized routes");
         }
-        cache_->prepare(*this, route_experts(route), false);
+        if (!cache_->prepare(
+                *this, route_experts(route), false)) {
+            cache_->count_full_projection_fallback();
+            auto staged = pure_nint_candidate_
+                ? stage_cpu_nint_moe(cpu_)
+                : stage_cpu_mixed_moe(cpu_);
+            return staged.forward(x, route);
+        }
         torch::Tensor output;
         if (pure_nint_) {
             cache_->count_hetero_dispatch();
@@ -6812,7 +6826,7 @@ public:
 
     void prefetch(const MoeRoutePlan & route) {
         if (use_full_projection(route)) return;
-        cache_->prepare(
+        (void)cache_->prepare(
             *this, route_experts(route), true);
     }
 
@@ -6824,7 +6838,13 @@ public:
             throw std::runtime_error(
                 "cached heterogeneous GLU output requires pure NINT cohorts");
         }
-        cache_->prepare(*this, route_experts(route), false);
+        if (!cache_->prepare(
+                *this, route_experts(route), false)) {
+            cache_->count_full_projection_fallback();
+            auto staged = stage_cpu_nint_moe(cpu_);
+            return staged.forward_glu_output(
+                x, route, gelu);
+        }
         cache_->count_hetero_dispatch();
         auto output =
             pure_nint_->forward_glu_output(x, route, gelu);
@@ -6840,7 +6860,13 @@ public:
             throw std::runtime_error(
                 "cached heterogeneous GLU input requires pure NINT cohorts");
         }
-        cache_->prepare(*this, route_experts(route), false);
+        if (!cache_->prepare(
+                *this, route_experts(route), false)) {
+            cache_->count_full_projection_fallback();
+            auto staged = stage_cpu_nint_moe(cpu_);
+            return staged.forward_glu(
+                gate_up, route, gelu);
+        }
         cache_->count_hetero_dispatch();
         auto output =
             pure_nint_->forward_glu(gate_up, route, gelu);
@@ -6858,7 +6884,13 @@ public:
             return staged.forward_clamped_swiglu(
                 gate_up, route, limit);
         }
-        cache_->prepare(*this, route_experts(route), false);
+        if (!cache_->prepare(
+                *this, route_experts(route), false)) {
+            cache_->count_full_projection_fallback();
+            auto staged = stage_cpu_mixed_moe(cpu_);
+            return staged.forward_clamped_swiglu(
+                gate_up, route, limit);
+        }
         auto output =
             active_->forward_clamped_swiglu(
                 gate_up, route, limit);
@@ -7394,7 +7426,7 @@ void MoeExpertCache::append_source_transfers(
     }
 }
 
-void MoeExpertCache::prepare(
+bool MoeExpertCache::prepare(
         MoeCachedSource & source,
         const std::vector<int32_t> & experts,
         bool prefetch) {
@@ -7402,15 +7434,59 @@ void MoeExpertCache::prepare(
         throw std::runtime_error(
             "MoE cache must be finalized before inference");
     }
+    if (experts.empty()) return false;
+
+    std::unordered_map<
+        MoeGpuArena *,
+        std::unordered_set<mfq::MoeCacheKey, mfq::MoeCacheKeyHash>>
+        arena_demands;
+    for (int expert : experts) {
+        if (expert < 0 || expert >= source.n_experts()) return false;
+        const int cohort_index = source.expert_to_cohort_.at(
+            static_cast<size_t>(expert));
+        auto & cohort = source.cohorts_.at(
+            static_cast<size_t>(cohort_index));
+        arena_demands[cohort.arena].insert(
+            {source.id_, cohort_index, expert});
+    }
+    for (const auto & item : arena_demands) {
+        if (item.second.size() >
+                static_cast<size_t>(item.first->book->capacity())) {
+            return false;
+        }
+    }
+
+    std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> held_slots;
+    for (const auto & item : arena_demands) {
+        auto * book = item.first->book.get();
+        for (const auto & key : item.second) {
+            const int slot = book->slot_for(key);
+            if (slot >= 0 && !book->inflight(slot)) {
+                book->mark_inflight(slot);
+                held_slots.emplace_back(book, slot);
+            }
+        }
+    }
     std::vector<MoeCacheTransfer> transfers;
     bool replaced_occupied = false;
-    append_source_transfers(
-        source, experts, prefetch, transfers,
-        replaced_occupied, nullptr);
-    submit_transfers(
-        transfers,
-        replaced_occupied,
-        !prefetch);
+    try {
+        append_source_transfers(
+            source, experts, prefetch, transfers,
+            replaced_occupied, &held_slots);
+        submit_transfers(
+            transfers,
+            replaced_occupied,
+            !prefetch);
+    } catch (...) {
+        for (const auto & held : held_slots) {
+            held.first->clear_inflight(held.second);
+        }
+        throw;
+    }
+    for (const auto & held : held_slots) {
+        held.first->clear_inflight(held.second);
+    }
+    return true;
 }
 
 bool MoeExpertCache::prepare_bundle(
@@ -15637,6 +15713,13 @@ static int run_kl_eval(
         ? available_chunks
         : std::min(max_chunks, available_chunks);
     if (chunks <= 0) throw std::runtime_error("KL evaluation requires at least one chunk");
+    for (int ci = 0; ci < chunks; ++ci) {
+        if ((int64_t)eval_chunks[(size_t)ci].tokens.size() >
+                model.c.max_position_embeddings) {
+            throw std::runtime_error(
+                "KL reference exceeds model context capacity");
+        }
+    }
     const int64_t execution_n_batch =
         (int64_t)eval_chunks[0].tokens.size();
     if (reference_contract.n_batch != 0) {
@@ -16092,6 +16175,10 @@ static int run_kl_eval_batched(
         ? (reference_contract.n_batch == 0
               ? n_ctx : reference_contract.n_batch)
         : requested_n_batch;
+    if (n_ctx > model.c.max_position_embeddings) {
+        throw std::runtime_error(
+            "KL reference exceeds model context capacity");
+    }
     if (n_ctx <= 0 || n_batch < n_ctx || n_batch % n_ctx != 0) {
         throw std::runtime_error(
             "optimized KL requires --kl-n-batch to be at least n_ctx "

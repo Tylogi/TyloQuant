@@ -1552,6 +1552,7 @@ int run_mfq_server(
     ServerMetrics server_metrics;
     std::atomic<int64_t> active_context{config.max_context};
     std::atomic<bool> reloading{false};
+    std::mutex reload_gate;
     server.set_payload_max_length(16 * 1024 * 1024);
     server.set_read_timeout(300, 0);
     server.set_write_timeout(300, 0);
@@ -1645,21 +1646,26 @@ int run_mfq_server(
                 "unsupported_operation"), 501);
             return;
         }
-        bool expected = false;
-        if (!reloading.compare_exchange_strong(expected, true)) {
-            set_json(res, error_body(
-                "model reload is already in progress", "conflict"), 409);
-            return;
+        {
+            std::lock_guard<std::mutex> gate(reload_gate);
+            bool expected = false;
+            if (!reloading.compare_exchange_strong(expected, true)) {
+                set_json(res, error_body(
+                    "model reload is already in progress", "conflict"), 409);
+                return;
+            }
+            if (server_metrics.active_requests() != 0) {
+                reloading.store(false);
+                set_json(res, error_body(
+                    "cannot reload while a generation request is active",
+                    "conflict"), 409);
+                return;
+            }
         }
         const auto finish_reload = [&] {
             reloading.store(false);
         };
         try {
-            if (server_metrics.active_requests() != 0) {
-                throw ApiError(
-                    409, "conflict",
-                    "cannot reload while a generation request is active");
-            }
             const json body = parse_body(req);
             const int64_t context_size = integer_field(
                 body, "context_size", active_context.load());
@@ -1724,9 +1730,20 @@ int run_mfq_server(
                 sampling_defaults);
             const std::string id = request_id(chat ? "chatcmpl-" : "cmpl-");
             const int64_t created = unix_time_seconds();
+            std::shared_ptr<ActiveRequest> active_request;
+            {
+                std::lock_guard<std::mutex> gate(reload_gate);
+                if (reloading.load()) {
+                    set_json(res, error_body(
+                        "model reload is in progress",
+                        "service_unavailable"), 503);
+                    return;
+                }
+                active_request =
+                    std::make_shared<ActiveRequest>(server_metrics);
+            }
 
             if (!work.stream) {
-                ActiveRequest active_request(server_metrics);
                 RequestMetrics metrics;
                 CompletionResult result = generate_text(
                     work, *tokenizer, generate,
@@ -1739,7 +1756,7 @@ int run_mfq_server(
                 log_request_metrics(
                     id, chat, false, work.prompt.size(), work.sampling,
                     result, metric_values);
-                active_request.complete(
+                active_request->complete(
                     id, chat, false, work.prompt.size(), result, metric_values);
                 json response;
                 if (chat) {
@@ -1778,21 +1795,13 @@ int run_mfq_server(
             res.set_chunked_content_provider(
                 "text/event-stream; charset=utf-8",
                 [work = std::move(work), id, created, &tokenizer, &generate,
-                 &config, &server_metrics, &reloading, chat]
+                 &config, active_request, chat]
                 (size_t offset, httplib::DataSink & sink) mutable -> bool {
                     if (offset != 0) {
                         sink.done();
                         return false;
                     }
-                    if (reloading.load()) {
-                        write_sse(sink, error_body(
-                            "model reload is in progress",
-                            "service_unavailable"));
-                        sink.done();
-                        return false;
-                    }
                     try {
-                        ActiveRequest active_request(server_metrics);
                         if (chat && !write_sse(sink, chat_chunk(id, created, config.model_name,
                                                                 {{"role", "assistant"}, {"content", ""}}, nullptr))) {
                             return false;
@@ -1822,7 +1831,7 @@ int run_mfq_server(
                         log_request_metrics(
                             id, chat, true, work.prompt.size(), work.sampling,
                             result, metric_values);
-                        active_request.complete(
+                        active_request->complete(
                             id, chat, true, work.prompt.size(), result,
                             metric_values);
                         if (!result.client_connected) return false;

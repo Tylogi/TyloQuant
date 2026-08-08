@@ -15,6 +15,10 @@ import numpy as np
 from mfq.formats.nvq import NvqSpec, NvqTensor, codebook_for, validate_codebook
 
 
+def _index_dtype(spec: NvqSpec) -> np.dtype:
+    return np.dtype(np.uint8 if spec.index_bits <= 8 else np.uint16)
+
+
 def _resolve_codebook(spec: NvqSpec, codebook: np.ndarray | None) -> np.ndarray:
     table = codebook_for(spec) if codebook is None else validate_codebook(spec, codebook)
     return np.ascontiguousarray(table, dtype=np.float32)
@@ -106,7 +110,8 @@ def _indices_at_scale(
     scale = scale_per_vector[:, None]
     distance = scale * scale * quad - 2.0 * scale * cross
     if bank is None:
-        return np.argmin(distance, axis=-1).astype(np.uint8)
+        dtype = np.uint8 if distance.shape[1] <= 256 else np.uint16
+        return np.argmin(distance, axis=-1).astype(dtype)
     bank = np.asarray(bank, dtype=np.uint8).reshape(-1)
     if bank.size != distance.shape[0]:
         raise ValueError("index-parity bank count does not match vector count")
@@ -179,7 +184,9 @@ def _search_groups(
     n_groups, gs = xgroup.shape
     vectors_per_group = gs // spec.vector_size
     all_scales = np.empty(n_groups, dtype=np.float32)
-    all_indices = np.empty((n_groups, vectors_per_group), dtype=np.uint8)
+    index_dtype = _index_dtype(spec)
+    all_indices = np.empty(
+        (n_groups, vectors_per_group), dtype=index_dtype)
     qmax = float(codebook.max())
     offsets = np.linspace(-0.12 * qmax, 0.12 * qmax, search_steps, dtype=np.float32)
 
@@ -199,7 +206,8 @@ def _search_groups(
         max_abs = np.max(np.abs(xg), axis=-1)
         best_error = np.full(g, np.inf, dtype=np.float32)
         best_scale = np.zeros(g, dtype=np.float32)
-        best_indices = np.zeros((g, vectors_per_group), dtype=np.uint8)
+        best_indices = np.zeros(
+            (g, vectors_per_group), dtype=index_dtype)
 
         for offset in offsets:
             initial = np.divide(
@@ -242,7 +250,9 @@ def _reassign_at_effective_scales(
 ) -> np.ndarray:
     n_groups, gs = xgroup.shape
     vectors_per_group = gs // spec.vector_size
-    result = np.empty((n_groups, vectors_per_group), dtype=np.uint8)
+    result = np.empty(
+        (n_groups, vectors_per_group),
+        dtype=_index_dtype(spec))
     for start in range(0, n_groups, group_chunk):
         stop = min(start + group_chunk, n_groups)
         g = stop - start
@@ -323,7 +333,9 @@ def _assign_quantized_group_scales(
     qmax = (1 << spec.sub_bits) - 1
     anchors = np.repeat(neuron_scale, ng)
     result_scale = np.zeros(n_groups, dtype=np.uint8)
-    result_indices = np.zeros((n_groups, vectors_per_group), dtype=np.uint8)
+    index_dtype = _index_dtype(spec)
+    result_indices = np.zeros(
+        (n_groups, vectors_per_group), dtype=index_dtype)
 
     for start in range(0, n_groups, group_chunk):
         stop = min(start + group_chunk, n_groups)
@@ -338,7 +350,8 @@ def _assign_quantized_group_scales(
         )
         best_error = np.full(g, np.inf, dtype=np.float32)
         best_q = np.zeros(g, dtype=np.uint8)
-        best_indices = np.zeros((g, vectors_per_group), dtype=np.uint8)
+        best_indices = np.zeros(
+            (g, vectors_per_group), dtype=index_dtype)
         chunk_anchor = anchors[start:stop]
 
         for q in range(qmax + 1):
@@ -379,7 +392,7 @@ def _refine_integer_scales(
     """Alternate exact integer-scale assignment with FP16 row-anchor refits."""
 
     best_scale = sub_scale.reshape(-1).astype(np.uint8, copy=True)
-    best_indices = indices.astype(np.uint8, copy=True)
+    best_indices = indices.astype(_index_dtype(spec), copy=True)
     best_anchor = neuron_scale.astype(np.float32, copy=True)
     best_error = _row_error(
         xgroup,
@@ -578,7 +591,7 @@ def quantize(
         neuron_len=neuron_len,
         neuron_scale=neuron_scale.astype(np.float32),
         sub_scale=sub_scale,
-        indices=flat_indices.astype(np.uint8),
+        indices=flat_indices.astype(_index_dtype(spec)),
         signs=sign_masks[:, :nsign].astype(np.uint8),
         codebook=(
             None

@@ -29,6 +29,8 @@ def _prepare_weight(
 ) -> tuple[torch.Tensor, int, int]:
     if weight.dim() != 2:
         raise ValueError(f"CUDA NVQ quantization expects [out, in], got {tuple(weight.shape)}")
+    if weight.shape[0] <= 0 or weight.shape[1] <= 0:
+        raise ValueError("NVQ input dimensions must be positive")
     value = weight.to(device=device, dtype=torch.float32, non_blocking=True).contiguous()
     if not bool(torch.isfinite(value).all()):
         raise ValueError("NVQ input must contain only finite values")
@@ -248,6 +250,10 @@ def _quantize_nvq(
     custom_codebook: np.ndarray | None,
     native_assignment: bool,
 ) -> NvqTensor:
+    if spec.sign_mode != "even":
+        raise ValueError(
+            "Torch NVQ quantization does not support index-parity signs"
+        )
     value, out, neuron_len = _prepare_weight(weight, device)
     value, objective_weight, ng = _pad_weight(value, spec.groupsize, importance)
     target, signs = _encode_even_parity_signs(value, objective_weight)
@@ -358,6 +364,7 @@ def _quantize_nvq(
     nvec = math.ceil(neuron_len / spec.vector_size)
     nsign = math.ceil(neuron_len / 8)
     indices = indices.reshape(out, -1)[:, :nvec]
+    index_dtype = np.uint8 if spec.index_bits <= 8 else np.uint16
     return NvqTensor(
         spec=spec,
         shape=(out, neuron_len),
@@ -365,7 +372,12 @@ def _quantize_nvq(
         neuron_len=neuron_len,
         neuron_scale=neuron_scale.cpu().numpy().astype(np.float32, copy=False),
         sub_scale=sub_scale.cpu().numpy().astype(np.uint8, copy=False),
-        indices=indices.to(torch.uint8).cpu().numpy(),
+        indices=(
+            indices.to(torch.int32)
+            .cpu()
+            .numpy()
+            .astype(index_dtype, copy=False)
+        ),
         signs=signs[:, :nsign].cpu().numpy().astype(np.uint8, copy=False),
         codebook=(None if custom_codebook is None else codebook_cpu.copy()),
     )

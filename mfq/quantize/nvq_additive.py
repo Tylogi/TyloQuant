@@ -27,6 +27,24 @@ _FIRST_ENTRIES = 256
 _SECOND_ENTRIES = 128
 
 
+def _maximum_additive_code(first: np.ndarray, second: np.ndarray) -> int:
+    first_i16 = first.astype(np.int16)
+    second_i16 = second.astype(np.int16)
+    first_min = first_i16.min(axis=1)
+    first_max = first_i16.max(axis=1)
+    second_min = second_i16.min(axis=1)
+    second_max = second_i16.max(axis=1)
+    endpoint_sums = np.stack(
+        (
+            first_min + second_min,
+            first_min + second_max,
+            first_max + second_min,
+            first_max + second_max,
+        )
+    )
+    return max(int(np.abs(endpoint_sums).max()), 1)
+
+
 @dataclass(frozen=True)
 class NvqAdditiveConfig:
     banks: int = 4
@@ -716,10 +734,7 @@ def quantize_nvq_additive_fixed(
     bank_for_state = torch.as_tensor(bank_np, device=value.device, dtype=torch.int64)
     first_codebooks = torch.as_tensor(first_np, device=value.device, dtype=torch.int8)
     second_codebooks = torch.as_tensor(second_np, device=value.device, dtype=torch.int8)
-    maximum = max(
-        int(np.max(np.abs(first_np.astype(np.int16)) + np.abs(second_np).max())),
-        1,
-    )
+    maximum = _maximum_additive_code(first_np, second_np)
     base_anchor = value.abs().amax(1) / (float(alpha.max().item()) * maximum)
 
     best_row_error = torch.full((out,), torch.inf, device=value.device)

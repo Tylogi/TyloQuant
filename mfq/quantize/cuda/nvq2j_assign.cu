@@ -12,6 +12,7 @@ namespace {
 
 constexpr int kStates = 16;
 constexpr int kBanks = 4;
+constexpr int kStatesPerBank = kStates / kBanks;
 constexpr int kVector = 8;
 constexpr int kVectorsPerGroup = 3;
 constexpr int kGroup = 24;
@@ -1028,6 +1029,20 @@ void check_nvq2j_inputs(
             && bank_for_state.get_device() == device
             && codebooks.get_device() == device,
         "nvq2j_assign: tensors must share one CUDA device");
+    auto bank_host = bank_for_state.cpu().contiguous();
+    const auto* bank_values = bank_host.data_ptr<uint8_t>();
+    int bank_counts[kBanks] = {};
+    for (int state = 0; state < kStates; ++state) {
+        const int bank = bank_values[state];
+        TORCH_CHECK(bank < kBanks,
+                    "nvq2j_assign: bank_for_state contains an invalid bank");
+        ++bank_counts[bank];
+    }
+    for (int bank = 0; bank < kBanks; ++bank) {
+        TORCH_CHECK(
+            bank_counts[bank] == kStatesPerBank,
+            "nvq2j_assign: every bank must own exactly four states");
+    }
 }
 
 }  // namespace

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import pytest
 
+from mfq.quantize.v4f_source import V4FExpertSource
 from mfq.quantize.v4f_plan import (
     allocate_v4f_ew_nvq2j_nint4,
     routed_blob_bytes,
@@ -123,3 +125,24 @@ def test_v4f_incremental_training_tracks_exact_layer_shards(
     assert _source_shards_ready(tmp_path, shards, expected)
     (tmp_path / "model-09.safetensors").write_bytes(b"short")
     assert not _source_shards_ready(tmp_path, shards, expected)
+
+
+def test_v4f_sample_start_rejects_oversized_or_empty_ranges() -> None:
+    with pytest.raises(ValueError, match="within"):
+        V4FExpertSource._sample_start(
+            seed=1,
+            layer=0,
+            expert=0,
+            part="w1",
+            rows=2049,
+            total_rows=2048,
+        )
+    with pytest.raises(ValueError, match="source row"):
+        V4FExpertSource._sample_start(
+            seed=1,
+            layer=0,
+            expert=0,
+            part="w1",
+            rows=1,
+            total_rows=0,
+        )

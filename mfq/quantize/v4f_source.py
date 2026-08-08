@@ -401,6 +401,12 @@ class V4FExpertSource:
         rows: int,
         total_rows: int,
     ) -> int:
+        if total_rows <= 0:
+            raise ValueError("source row count must be positive")
+        if rows <= 0 or rows > total_rows:
+            raise ValueError(
+                f"sample row count {rows} must be within [1, {total_rows}]"
+            )
         key = f"{seed}:{layer}:{expert}:{part}".encode("ascii")
         value = int.from_bytes(hashlib.blake2b(key, digest_size=8).digest(), "little")
         return value % (total_rows - rows + 1)

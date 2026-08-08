@@ -1704,7 +1704,7 @@ class Engine:
 
     @torch.no_grad()
     def generate(self, ids: list[int], max_new: int | None = 128, temp: float = 0.0,
-                 top_p: float = 1.0, callback=None, rep_penalty: float = 1.0,
+                 top_p: float = 1.0, top_k: int = 0, callback=None, rep_penalty: float = 1.0,
                  no_repeat_ngram: int = 0,
                  should_stop: Callable[[], bool] | None = None,
                  kv_baseline_len: int | None = None) -> list[int]:
@@ -1776,7 +1776,7 @@ class Engine:
             if temp <= 1e-6:
                 nxt = int(lg.argmax().item())
             else:
-                nxt = _sample_top_p(lg, temp, top_p)
+                nxt = _sample_top_p(lg, temp, top_p, top_k)
             if nxt in self.eos:
                 break
             out.append(nxt)
@@ -2208,10 +2208,19 @@ class Engine:
         return out
 
 
-def _sample_top_p(logits: torch.Tensor, temp: float, top_p: float) -> int:
-    """top-p（核）采样。"""
-    probs = torch.softmax(logits.float() / max(temp, 1e-6), dim=-1)
-    sp, si = torch.sort(probs, descending=True)
+def _sample_top_p(
+    logits: torch.Tensor,
+    temp: float,
+    top_p: float,
+    top_k: int = 0,
+) -> int:
+    """Apply top-k followed by nucleus sampling."""
+    scaled = logits.float() / max(temp, 1e-6)
+    if 0 < top_k < scaled.numel():
+        sorted_logits, si = torch.topk(scaled, top_k, sorted=True)
+    else:
+        sorted_logits, si = torch.sort(scaled, descending=True)
+    sp = torch.softmax(sorted_logits, dim=-1)
     cum = torch.cumsum(sp, 0)
     keep = (cum - sp) < top_p
     cand = si[keep]

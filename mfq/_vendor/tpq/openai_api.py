@@ -45,6 +45,14 @@ class _OpenAIModel(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
 
+ReasoningEffort = Literal["low", "medium", "high", "max"]
+
+
+class ChatTemplateKwargs(_OpenAIModel):
+    enable_thinking: StrictBool | None = None
+    reasoning_effort: ReasoningEffort | None = None
+
+
 class OpenAIFunction(_OpenAIModel):
     name: StrictStr = Field(min_length=1)
     description: StrictStr | None = None
@@ -118,10 +126,14 @@ class ChatCompletionRequest(_OpenAIModel):
     stream: StrictBool = False
     temperature: float = Field(default=1.0, ge=0.0, le=2.0)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
+    top_k: StrictInt = Field(default=0, ge=0, le=1024)
     max_tokens: StrictInt | None = Field(default=None, ge=0)
     max_completion_tokens: StrictInt | None = Field(default=None, ge=0)
     stop: StrictStr | list[StrictStr] | None = None
-    reasoning_effort: Literal["high", "max"] | None = None
+    reasoning_effort: ReasoningEffort | None = None
+    reasoning_format: Literal["auto"] | None = None
+    enable_thinking: StrictBool | None = None
+    chat_template_kwargs: ChatTemplateKwargs | None = None
     tools: list[OpenAITool] | None = None
     tool_choice: Literal["none", "auto", "required"] | OpenAIToolChoice | None = None
     parallel_tool_calls: StrictBool = True
@@ -395,11 +407,20 @@ def _reasoning_options(
     service: ChatService,
     request: ChatCompletionRequest,
 ) -> tuple[str, str | None]:
+    supported = {"low", "medium", "high", "max"}
     configured = getattr(service, "default_reasoning", None)
     effort = request.reasoning_effort
-    if effort is None and configured in {"high", "max"}:
+    template = request.chat_template_kwargs
+    if effort is None and template is not None:
+        effort = template.reasoning_effort
+    enabled = request.enable_thinking
+    if enabled is None and template is not None:
+        enabled = template.enable_thinking
+    if enabled is False:
+        return "chat", None
+    if effort is None and configured in supported:
         effort = configured
-    if effort in {"high", "max"} or configured is True:
+    if effort in supported or enabled is True or configured is True:
         return "thinking", effort
     return "chat", None
 
@@ -431,6 +452,7 @@ def _options_from_openai(
         temperature=request.temperature,
         top_p=request.top_p,
         max_new=request.effective_max_tokens,
+        top_k=request.top_k,
         stop=stop,
         repetition_penalty=request.repetition_penalty,
         no_repeat_ngram_size=request.no_repeat_ngram_size,
@@ -824,8 +846,16 @@ async def _complete_nonstream(
 
 def install_routes(app: FastAPI) -> None:
     @app.get("/health")
+    @app.get("/api/status")
     def health(request: Request) -> dict[str, Any]:
         service = request.app.state.chat_service
+        adapter_name = str(getattr(getattr(service, "adapter", None), "name", ""))
+        if adapter_name == "kimi_k3":
+            reasoning_efforts = ["low", "medium", "high", "max"]
+        elif adapter_name == "dsv4":
+            reasoning_efforts = ["high", "max"]
+        else:
+            reasoning_efforts = []
         architecture = (
             getattr(service, "architecture", None)
             or getattr(getattr(service, "engine", None), "arch", None)
@@ -838,6 +868,20 @@ def install_routes(app: FastAPI) -> None:
             "model": request.app.state.served_model_name,
             "architecture": architecture,
             "busy": bool(getattr(service, "busy", False)),
+            "sampling_defaults": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": 0,
+                "repetition_penalty": 1.0,
+                "presence_penalty": 0.0,
+                "frequency_penalty": 0.0,
+            },
+            "chat_template_capabilities": {
+                "reasoning_effort": {
+                    "supported": bool(reasoning_efforts),
+                    "values": reasoning_efforts,
+                }
+            },
         }
 
     @app.get("/v1/models")

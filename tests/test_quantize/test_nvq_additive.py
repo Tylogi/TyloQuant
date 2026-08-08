@@ -5,6 +5,7 @@ import torch
 
 from mfq.quantize.nvq_additive import (
     NvqAdditiveConfig,
+    _maximum_additive_code,
     additive_tables_from_tensor,
     dequantize_nvq_additive,
     quantize_nvq_additive_fixed,
@@ -36,6 +37,15 @@ def _configs() -> tuple[NvqJscConfig, NvqAdditiveConfig]:
             seed=31,
         ),
     )
+
+
+def test_nvq_additive_maximum_uses_legal_paired_codes() -> None:
+    first = np.zeros((1, 256, 8), dtype=np.int8)
+    second = np.zeros((1, 128, 8), dtype=np.int8)
+    first[0, 0, 0] = 10
+    second[0, 0, 0] = -7
+    second[0, 1, 0] = 2
+    assert _maximum_additive_code(first, second) == 12
 
 
 def test_nvq_additive_roundtrip_and_rate_on_cpu() -> None:
