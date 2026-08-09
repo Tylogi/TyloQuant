@@ -94,8 +94,15 @@ def test_minicpmo45_preserves_qkv_projection_boundaries():
         'ap + "q_proj.weight", ap + "k_proj.weight", ap + "v_proj.weight"},\n'
         "            2, nullptr, c.is_minicpmo45())"
     ) in DECODE
-    assert "f.down, 2, c.is_minicpmo45()" not in DECODE
+    assert "f.down, 2, c.is_minicpmo45())" in DECODE
     assert "MFQ_DIAGNOSTIC_DISABLE_NINT_GROUP" in DECODE
+
+
+def test_minicpmo45_matches_official_rope_frequency_construction():
+    assert "bool official_reciprocal_frequencies = false" in DECODE
+    assert "torch::reciprocal(" in DECODE
+    assert "freq.copy_(official_freq)" in DECODE
+    assert "0, -1, device, c.is_minicpmo45())" in DECODE
 
 
 def test_minicpmo45_cli_exposes_tensor_fixture_contract():

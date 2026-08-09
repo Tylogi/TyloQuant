@@ -10946,18 +10946,22 @@ static QuantLinearGroup load_paired_gate_up(
         const MfqFile & mfq,
         const std::vector<std::string> & names,
         const QuantLinear & down,
-        size_t required_compatible_prefix = 2) {
+        size_t required_compatible_prefix = 2,
+        bool preserve_projection_boundaries = false) {
     auto slices =
         tensor_parallel_output_slices_for_input(
             down);
     return slices.empty()
         ? load_quant_group(
             mfq, names,
-            required_compatible_prefix)
+            required_compatible_prefix,
+            nullptr,
+            preserve_projection_boundaries)
         : load_quant_group(
             mfq, names,
             required_compatible_prefix,
-            &slices);
+            &slices,
+            preserve_projection_boundaries);
 }
 
 struct DenseLinearGroup {
@@ -11555,7 +11559,8 @@ struct RopeCache {
         double base,
         int64_t frequency_dim = 0,
         int64_t active_pairs = -1,
-        torch::Device device = torch::Device(torch::kCUDA)) : rotary_dim(dim) {
+        torch::Device device = torch::Device(torch::kCUDA),
+        bool official_reciprocal_frequencies = false) : rotary_dim(dim) {
         int64_t half = rotary_dim / 2;
         const int64_t denominator = frequency_dim > 0 ? frequency_dim : rotary_dim;
         if (active_pairs < 0) active_pairs = half;
@@ -11565,7 +11570,18 @@ struct RopeCache {
         auto opts = torch::TensorOptions().device(device).dtype(torch::kFloat32);
         auto pos = torch::arange(max_positions, opts);
         auto ar = torch::arange(0, rotary_dim, 2, opts);
-        auto freq = torch::pow(torch::full({half}, base, opts), -ar / (double)denominator);
+        auto freq = torch::pow(
+            torch::full({half}, base, opts),
+            -ar / (double)denominator);
+        if (official_reciprocal_frequencies) {
+            auto cpu_opts = torch::TensorOptions()
+                .device(torch::kCPU).dtype(torch::kFloat32);
+            auto exponent = torch::arange(0, rotary_dim, 2, cpu_opts) /
+                (double)denominator;
+            auto official_freq = torch::reciprocal(
+                torch::pow(torch::full({half}, base, cpu_opts), exponent));
+            freq.copy_(official_freq);
+        }
         if (active_pairs < half) {
             auto pair = torch::arange(half, opts);
             freq = torch::where(pair < active_pairs, freq, torch::zeros_like(freq));
@@ -11580,7 +11596,7 @@ struct RopeCache {
         torch::Device device = torch::Device(torch::kCUDA))
         : RopeCache(
             c.max_position_embeddings, c.rotary_dim, c.rope_base,
-            0, -1, device) {}
+            0, -1, device, c.is_minicpmo45()) {}
     torch::Tensor apply(torch::Tensor x, torch::Tensor pos, const Config & c) const {
         if (!x.is_cuda()) {
             TORCH_CHECK(
@@ -15093,7 +15109,7 @@ static FFN load_ffn(const MfqFile & mfq, const Config & c, int i, bool gguf_name
         f.down = load_quant_linear(mfq, down_name);
         f.gate_up = load_paired_gate_up(mfq, {
             gate_name, up_name},
-            f.down);
+            f.down, 2, c.is_minicpmo45());
         load_important_neuron_branch(
             mfq, c, f, down_name, gate_name, up_name);
     }
