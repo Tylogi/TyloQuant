@@ -1,3 +1,5 @@
+"""Source contracts for runtime safety and boundary checks."""
+
 from pathlib import Path
 
 
