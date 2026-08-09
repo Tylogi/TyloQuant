@@ -148,10 +148,10 @@ def _patch_host_residency(store) -> None:
         return True
 
     preload_all._mfq_cgroup_resident = True
-    if not hasattr(store.CCCPStore, "drop_dense_file_cache"):
-        store.CCCPStore.drop_dense_file_cache = drop_dense_file_cache
-    if not hasattr(store.CCCPStore, "drop_expert_file_cache"):
-        store.CCCPStore.drop_expert_file_cache = drop_expert_file_cache
+    if not hasattr(store.TPQStore, "drop_dense_file_cache"):
+        store.TPQStore.drop_dense_file_cache = drop_dense_file_cache
+    if not hasattr(store.TPQStore, "drop_expert_file_cache"):
+        store.TPQStore.drop_expert_file_cache = drop_expert_file_cache
     store.ExpertPool.preload_all = preload_all
     store.ExpertPool._mfq_direct_host_pin = True
 
@@ -204,8 +204,8 @@ def _patch_full_gpu_residency(store) -> None:
         self._expert_signature_count_cache = counts
         return counts.copy()
 
-    if not hasattr(store.CCCPStore, "expert_signature_counts"):
-        store.CCCPStore.expert_signature_counts = expert_signature_counts
+    if not hasattr(store.TPQStore, "expert_signature_counts"):
+        store.TPQStore.expert_signature_counts = expert_signature_counts
 
     original_build_gpu_arenas = store.ExpertPool.build_gpu_arenas
 

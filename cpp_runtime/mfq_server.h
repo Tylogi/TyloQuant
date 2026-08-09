@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mfq_token_constraint.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -7,7 +9,7 @@
 #include <vector>
 
 struct MfqSamplingParams {
-    int32_t max_tokens = 256;
+    int32_t max_tokens = 4096;
     double temperature = 1.0;
     int32_t top_k = 20;
     double top_p = 0.95;
@@ -58,7 +60,8 @@ using MfqGenerateFn = std::function<int32_t(
     const MfqSamplingParams & sampling,
     const MfqTokenCallback & on_token,
     const MfqPrefillCallback & on_prefill,
-    const MfqPromptCachePlan & cache_plan)>;
+    const MfqPromptCachePlan & cache_plan,
+    const MfqTokenConstraintPtr & token_constraint)>;
 using MfqReloadFn = std::function<int64_t(int64_t context_size)>;
 
 int run_mfq_server(

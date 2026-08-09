@@ -1,7 +1,7 @@
 #pragma once
 
 #include "mfq_container.h"
-#include "mlx_cccp.h"
+#include "mlx_tpq.h"
 #include "mlx_grouped_linear.h"
 #include "mlx_mx.h"
 #include "mlx_nint.h"
@@ -31,8 +31,8 @@ public:
     explicit MlxLinear(MlxNintWeight weight);
     explicit MlxLinear(MlxNint8ZeroWeight weight);
     explicit MlxLinear(MlxVqWeight weight);
-    explicit MlxLinear(MlxCccpInt4Weight weight);
-    explicit MlxLinear(MlxCccpPqWeight weight);
+    explicit MlxLinear(MlxTpqInt4Weight weight);
+    explicit MlxLinear(MlxTpqPqWeight weight);
     explicit MlxLinear(MlxMxWeight weight);
     explicit MlxLinear(mlx::core::array weight);
 
@@ -40,7 +40,7 @@ public:
 
     // DeepSeek-V4 O-LoRA layout:
     // input [...,groups,K] -> [...,groups,OUT/groups].
-    // CCCP-I4G64 uses its dedicated Metal kernel; every other supported
+    // TPQ-I4G64 uses its dedicated Metal kernel; every other supported
     // linear format takes the exact packed/dense fallback without changing
     // model semantics.
     mlx::core::array grouped_row_matmul(
@@ -68,8 +68,8 @@ private:
         MlxNintWeight,
         MlxNint8ZeroWeight,
         MlxVqWeight,
-        MlxCccpInt4Weight,
-        MlxCccpPqWeight,
+        MlxTpqInt4Weight,
+        MlxTpqPqWeight,
         MlxMxWeight,
         mlx::core::array> weight_;
     int input_size_ = 0;
@@ -85,7 +85,7 @@ public:
     explicit MlxEmbedding(MlxNintWeight weight);
     explicit MlxEmbedding(MlxNint8ZeroWeight weight);
     explicit MlxEmbedding(MlxVqWeight weight);
-    explicit MlxEmbedding(MlxCccpInt4Weight weight);
+    explicit MlxEmbedding(MlxTpqInt4Weight weight);
     explicit MlxEmbedding(MlxMxWeight weight);
     explicit MlxEmbedding(mlx::core::array weight);
 
@@ -111,7 +111,7 @@ private:
         MlxNintWeight,
         MlxNint8ZeroWeight,
         MlxVqWeight,
-        MlxCccpInt4Weight,
+        MlxTpqInt4Weight,
         MlxMxWeight,
         mlx::core::array> weight_;
     int vocabulary_size_ = 0;

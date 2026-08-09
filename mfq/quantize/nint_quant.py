@@ -1,11 +1,11 @@
-"""NINT 张量级量化与反量化。
+"""NINT tensor-level quantization and dequantization.
 
-把 :mod:`mfq.formats.nint` 的 1D neuron codec 提升到 nD 张量：沿指定 ``axis``
-切出每一条 neuron 行（该神经元的全部权重），批量做 neuron-anchored 两级量化。
+Extend the 1D neuron codec from :mod:`mfq.formats.nint` to nD tensors: slice each neuron row
+(all weights for that neuron) along the specified ``axis`` and apply two-level neuron-anchored quantization in batches.
 
-权重张量 ``W[out, in]`` 取 ``axis=0``：每行 = 一个输出神经元，整行共享一个
-f16 neuron scale/min，行内按 ``groupsize`` 切 sub-group。要求 ``weight.ndim >= 2``；
-1D 权重请直接用 :mod:`mfq.formats.nint` 的 1D codec。
+For a weight tensor ``W[out, in]``, use ``axis=0``: each row represents one output neuron and shares one
+f16 neuron scale/minimum, while the row is split into sub-groups of ``groupsize``. ``weight.ndim >= 2`` is required;
+use the 1D codec in :mod:`mfq.formats.nint` directly for 1D weights.
 """
 
 from __future__ import annotations
@@ -26,17 +26,17 @@ _IMATRIX_PRIORITY_PAIR_CHUNK = 64
 
 @dataclass
 class NintTensor:
-    """一个 nD 权重张量的 NINT 表示（所有 neuron 行打包到一起）。"""
+    """NINT representation of an nD weight tensor with all neuron rows packed together."""
 
     spec: NintSpec
     shape: tuple[int, ...]
     axis: int
-    q: np.ndarray               # (out, ng, gs) uint，含尾组补零
+    q: np.ndarray               # (out, ng, gs) uint, including trailing-group padding
     neuron_scale: np.ndarray    # (out,) float32（f16-round-tripped neu_s/K）
     neuron_min: np.ndarray      # (out,) float32（f16-round-tripped neu_m/K）
     sub_scale: np.ndarray       # (out, ng) uint
     sub_min: np.ndarray         # (out, ng) uint
-    neuron_len: int             # 每 neuron 实际有效长度（未含补零）
+    neuron_len: int             # Actual valid length of each neuron (excluding padding)
 
 
 def _importance_as_rows(
@@ -749,11 +749,11 @@ def quantize(
     importance: np.ndarray | None = None,
     use_priority_group_refinement: bool = True,
 ) -> NintTensor:
-    """沿 ``axis`` 把 ``weight`` 切成 neuron 行，批量 neuron-anchored 量化。
+    """Slice ``weight`` into neuron rows along ``axis`` and apply neuron-anchored quantization in batches.
 
-    ``importance`` 是 imatrix 记录的输入通道二阶矩。给定时，组内搜索权重
-    与 llama.cpp K-Quant 一致地乘以 ``sqrt(2*mean(W²) + W²)``；不给定时
-    保持原有 weight-only 路径不变。
+    ``importance`` contains input-channel second moments recorded by the importance matrix. When provided,
+    intra-group search weights are multiplied by ``sqrt(2*mean(W²) + W²)``, matching llama.cpp K-Quant.
+    When omitted, the existing weight-only path is unchanged.
     """
 
     W = np.asarray(weight, dtype=np.float32)
@@ -894,7 +894,7 @@ def quantize(
 
 
 def dequantize(tensor: NintTensor) -> np.ndarray:
-    """反量化回原始 shape 的 float32 张量。"""
+    """Dequantize to a float32 tensor with the original shape."""
 
     spec = tensor.spec
     out, ng, gs = tensor.q.shape
@@ -902,7 +902,7 @@ def dequantize(tensor: NintTensor) -> np.ndarray:
     d_eff = tensor.neuron_scale[:, None] * tensor.sub_scale.astype(np.float32)   # (out, ng)
     m_eff = tensor.neuron_min[:, None] * tensor.sub_min.astype(np.float32)
     recon = d_eff[..., None] * q - m_eff[..., None]                              # (out, ng, gs)
-    recon = recon.reshape(out, ng * gs)[:, :tensor.neuron_len]                  # 去尾组补零
+    recon = recon.reshape(out, ng * gs)[:, :tensor.neuron_len]                  # Remove trailing-group padding
     S, a = tensor.shape, tensor.axis
     wt_shape = (S[a],) + S[:a] + S[a + 1:]
     return np.moveaxis(recon.reshape(wt_shape), 0, a)

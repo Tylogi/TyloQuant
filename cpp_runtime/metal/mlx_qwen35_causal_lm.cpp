@@ -437,7 +437,8 @@ std::int32_t MlxQwen35CausalLm::generate(
     std::int32_t max_tokens,
     const MlxTokenCallback& callback,
     const std::function<void(std::size_t, double)>&
-        prefill_callback) {
+        prefill_callback,
+    const MfqTokenConstraintPtr& token_constraint) {
     if (prompt.empty()) {
         throw std::invalid_argument(
             "Qwen3.5 generation prompt cannot be empty");
@@ -523,11 +524,38 @@ std::int32_t MlxQwen35CausalLm::generate(
                   *counts)
             : sampler.sample(logits);
         sampled.eval();
-        const auto token =
+        auto token =
             sampled.data<std::int32_t>()[0];
         if (token < 0 || token >= vocab) {
             throw std::runtime_error(
                 "Qwen3.5 sampler returned an out-of-range token");
+        }
+        if (token_constraint && token_constraint->allows &&
+            !token_constraint->allows(token)) {
+            auto adjusted = counts.has_value()
+                ? sampler.apply_penalties(logits, *counts)
+                : logits;
+            adjusted = mlx::core::contiguous(
+                mlx::core::astype(
+                    adjusted, mlx::core::float32));
+            adjusted.eval();
+            std::vector<float> masked(
+                adjusted.data<float>(),
+                adjusted.data<float>() + vocab);
+            token_constraint->apply(masked.data(), masked.size());
+            const array constrained_logits(
+                masked.begin(), Shape{1, vocab}, mlx::core::float32);
+            sampled = sampler.sample(constrained_logits);
+            sampled.eval();
+            token = sampled.data<std::int32_t>()[0];
+            if (token < 0 || token >= vocab ||
+                !token_constraint->allows(token)) {
+                throw std::runtime_error(
+                    "Qwen3.5 constrained sampler returned an invalid token");
+            }
+        }
+        if (token_constraint && token_constraint->accept) {
+            token_constraint->accept(token);
         }
 
         const array token_ids(

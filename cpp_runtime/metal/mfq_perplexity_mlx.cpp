@@ -1216,7 +1216,7 @@ std::string inferred_precision(
             dtype.rfind("NPQ", 0) == 0 ||
             dtype.rfind("NEPQ", 0) == 0 ||
             dtype.rfind("TPQ", 0) == 0 ||
-            dtype.rfind("CCCP", 0) == 0) {
+            dtype.rfind("TPQ", 0) == 0) {
             quantized = true;
         }
     }

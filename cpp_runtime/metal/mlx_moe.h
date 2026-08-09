@@ -24,11 +24,11 @@ struct MlxNintMoeProjectionInfo {
     std::vector<std::int32_t> available_experts;
 };
 
-// One transient single-dispatch view over the currently active CCCP experts.
+// One transient single-dispatch view over the currently active TPQ experts.
 // Expert IDs remain global.  Packed indices are assembled only for the active
 // set, while every cohort codebook is retained once by the residency object
 // and shared by all expert views from that projection.
-class MlxCccpRoutedWeight {
+class MlxTpqRoutedWeight {
 public:
     mlx::core::array routed_matmul(
         const mlx::core::array& input,
@@ -42,7 +42,7 @@ public:
 private:
     struct Impl;
 
-    explicit MlxCccpRoutedWeight(
+    explicit MlxTpqRoutedWeight(
         std::shared_ptr<const Impl> impl);
 
     std::shared_ptr<const Impl> impl_;
@@ -72,7 +72,7 @@ public:
         const MlxNintMoeOffloadCache&) = delete;
 
     // Returns false only for a valid non-streamable representation (for
-    // example NIM1 or a mixed non-CCCP NIM2 record).  Malformed CCCP records
+    // example NIM1 or a mixed non-TPQ NIM2 record).  Malformed TPQ records
     // still raise.
     bool can_offload(const std::string& name);
     bool can_stream(const std::string& name) {
@@ -84,7 +84,7 @@ public:
     std::vector<std::uint8_t> availability(
         const std::string& name);
 
-    MlxCccpRoutedWeight grouped(
+    MlxTpqRoutedWeight grouped(
         const std::string& name,
         const std::vector<std::int32_t>& active_experts);
 
@@ -104,10 +104,10 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// Compatibility names for callers that used the original CCCP-specific API.
+// Compatibility names for callers that used the original TPQ-specific API.
 // New model/runtime code must use the generic NINTM names above.
-using MlxCccpProjectionInfo = MlxNintMoeProjectionInfo;
-using MlxCccpExpertResidency = MlxNintMoeOffloadCache;
+using MlxTpqProjectionInfo = MlxNintMoeProjectionInfo;
+using MlxTpqExpertResidency = MlxNintMoeOffloadCache;
 
 // A sorted routed-MoE row block list.  The plan is built once on the GPU and
 // shared by gate/up and down projections so every populated row block can be

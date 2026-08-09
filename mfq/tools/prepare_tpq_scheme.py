@@ -10,11 +10,11 @@ import numpy as np
 
 from mfq.calibration.artifact import CalibrationScheme, save_scheme
 from mfq.calibration.tpq import (
-    CccpTierAllocation,
-    allocate_cccp_tiers,
-    build_cccp_expert_selection,
-    load_cccp_score_profile,
-    load_cccp_tier_profile,
+    TpqTierAllocation,
+    allocate_tpq_tiers,
+    build_tpq_expert_selection,
+    load_tpq_score_profile,
+    load_tpq_tier_profile,
 )
 
 
@@ -31,13 +31,13 @@ def prepare(
     w_coverage: float = 0.997,
     vv_share: float = 0.25,
 ) -> CalibrationScheme:
-    """Create per-layer CCCP selections from scores or ``tiers_per_layer``."""
+    """Create per-layer TPQ selections from scores or ``tiers_per_layer``."""
 
-    fixed_tiers = load_cccp_tier_profile(profile_path)
+    fixed_tiers = load_tpq_tier_profile(profile_path)
     scores = (
         {}
         if fixed_tiers is not None
-        else load_cccp_score_profile(profile_path, field=field)
+        else load_tpq_score_profile(profile_path, field=field)
     )
     layers = fixed_tiers if fixed_tiers is not None else scores
     expert_selections = {}
@@ -45,7 +45,7 @@ def prepare(
     for layer, layer_values in sorted(layers.items()):
         if fixed_tiers is None:
             layer_scores = scores[layer]
-            allocation = allocate_cccp_tiers(
+            allocation = allocate_tpq_tiers(
                 layer_scores,
                 v_coverage=v_coverage,
                 w_coverage=w_coverage,
@@ -54,7 +54,7 @@ def prepare(
         else:
             tiers = tuple(layer_values)
             layer_scores = np.ones(len(tiers), dtype=np.float64)
-            allocation = CccpTierAllocation(
+            allocation = TpqTierAllocation(
                 tiers=tiers,
                 scores=tuple(float(value) for value in layer_scores),
                 boundaries=(
@@ -81,7 +81,7 @@ def prepare(
                 )
                 for tier in set(allocation.tiers)
             }
-            expert_selections[name] = build_cccp_expert_selection(
+            expert_selections[name] = build_tpq_expert_selection(
                 name=name,
                 group=projection,
                 allocation=allocation,

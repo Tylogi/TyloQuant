@@ -1,16 +1,16 @@
-"""逐张量 NintSpec 搜索（profile-based）。
+"""Per-tensor NintSpec search based on profiles.
 
-给定权重与目标 bpw，在 **固定 profile 目录**（`(bits, gs)` 对，见
-:data:`mfq.formats.nint.PROFILE_CATALOG`）中为每个 profile 搜自由的 ``k ∈ [2,8]``，
-取 SNR 最高的 :class:`~mfq.formats.nint.NintSpec`。这是 MFQ「逐张量混合精度」的核心
-（开发文档 v2 §1.7、§2.2）。
+Given weights and a target bpw, search a free ``k in [2,8]`` for every profile in the **fixed profile catalog**
+(the ``(bits, gs)`` pairs in :data:`mfq.formats.nint.PROFILE_CATALOG`) and select the
+:class:`~mfq.formats.nint.NintSpec` with the highest SNR. This is the core of MFQ per-tensor mixed precision
+(development documentation v2 sections 1.7 and 2.2).
 
-为什么固定 gs、自由 k：
-- ``gs`` 决定 kernel tiling，每个不同 gs 需要一个专用 kernel → 限制 gs 种类 = 控制 kernel 数。
-- ``k`` 烘焙进 ``neuron_scale = f16(neu_s/(2^k−1))``，反量化算术里不出现 → **k 对 kernel
-  不可见，可任意变**。故 bpw 细粒度由 k 连续提供，不增加 kernel。
+Why ``gs`` is fixed while ``k`` is free:
+- ``gs`` determines kernel tiling, and every distinct ``gs`` needs a dedicated kernel; limiting ``gs`` values controls kernel count.
+- ``k`` is baked into ``neuron_scale = f16(neu_s/(2^k-1))`` and does not appear in dequantization arithmetic, so **the kernel
+  cannot see ``k`` and it may vary freely**. Thus ``k`` provides fine-grained bpw without adding kernels.
 
-搜索对整个矩阵做 quantize/dequantize 评估 SNR（不采样子集），保证结果严谨可复现。
+The search quantizes and dequantizes the entire matrix to evaluate SNR without subset sampling, ensuring rigorous reproducibility.
 """
 
 from __future__ import annotations
@@ -28,10 +28,10 @@ _K_MIN, _K_MAX = 2, 8
 
 @dataclass(frozen=True)
 class SearchResult:
-    """搜索结果：最优 spec、其 SNR、bpw，以及全部候选。
+    """Search result containing the best spec, its SNR and bpw, and all candidates.
 
-    ``evaluated`` 为 ``(spec, snr_db, bpw)`` 三元组列表，按 SNR 降序排列。
-    SNR 由对**整张权重**量化/反量化后与原值比较得到（非子采样）。
+    ``evaluated`` is a list of ``(spec, snr_db, bpw)`` tuples in descending SNR order.
+    SNR compares the original values against quantization/dequantization of the **entire weight tensor**, not a subsample.
     """
 
     spec: NintSpec
@@ -50,9 +50,9 @@ def search(
     axis: int = 0,
     profiles: tuple[tuple[int, int], ...] = PROFILE_CATALOG,
 ) -> SearchResult:
-    """对每个 profile 搜自由 k，返回预算下 SNR 最优的完整 :class:`SearchResult`。
+    """Search a free k for every profile and return the complete :class:`SearchResult` with the best SNR under budget.
 
-    全量评估：对 ``weight`` 整张做量化/反量化计算 SNR，不做行子采样。
+    Full evaluation: compute SNR by quantizing and dequantizing all of ``weight`` without row subsampling.
     """
 
     W = np.asarray(weight, dtype=np.float32)
@@ -86,6 +86,6 @@ def best_spec(
     axis: int = 0,
     profiles: tuple[tuple[int, int], ...] = PROFILE_CATALOG,
 ) -> NintSpec:
-    """在 ``≤ target_bpw`` 候选中返回 SNR 最高的 NintSpec。"""
+    """Return the NintSpec with the highest SNR among candidates at or below ``target_bpw``."""
 
     return search(weight, target_bpw, axis, profiles).spec

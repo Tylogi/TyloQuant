@@ -1,7 +1,7 @@
 """SwiGLU FFN：``down(silu(gate(x)) * up(x))``。
 
-gate / up / down 都是 :class:`~mfq.runtime.linear.NintLinear`。Hadamard 积耦合正是
-开发文档 v2 §1.10、§2.5 讨论的「乘积误差」目标所在——校准器应按此结构加权。
+Gate, up, and down are all :class:`~mfq.runtime.linear.NintLinear`. Their Hadamard-product coupling is exactly
+the product-error objective discussed in development documentation v2 sections 1.10 and 2.5; the calibrator should weight this structure.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ def silu(x: np.ndarray) -> np.ndarray:
 
 
 class SwiGLUFFN:
-    """三层 NintLinear 组成的 SwiGLU FFN。"""
+    """SwiGLU FFN composed of three NintLinear layers."""
 
     def __init__(self, gate: NintLinear, up: NintLinear, down: NintLinear) -> None:
         self.gate = gate

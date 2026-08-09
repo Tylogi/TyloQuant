@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../mfq_token_constraint.h"
 #include "mlx_qwen35_full_attention.h"
 #include "mlx_qwen35_linear_attention.h"
 #include "mlx_sampling.h"
@@ -92,7 +93,8 @@ public:
         std::int32_t max_tokens,
         const MlxTokenCallback& callback = {},
         const std::function<void(std::size_t, double)>&
-            prefill_callback = {});
+            prefill_callback = {},
+        const MfqTokenConstraintPtr& token_constraint = {});
 
     const Qwen35Config& config() const noexcept {
         return config_;

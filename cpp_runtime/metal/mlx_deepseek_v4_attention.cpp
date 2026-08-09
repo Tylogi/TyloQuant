@@ -1069,7 +1069,10 @@ MlxDeepseekV4PoolState::snapshot() const {
         -> std::optional<array> {
         return value
             ? std::optional<array>(
-                  mlx::core::copy(*value))
+                  mlx::core::astype(
+                      *value,
+                      value->dtype(),
+                      true))
             : std::nullopt;
     };
     MlxDeepseekV4PoolState result(
@@ -1080,13 +1083,61 @@ MlxDeepseekV4PoolState::snapshot() const {
         capacity_,
         dtype_,
         pool_,
-        mlx::core::copy(state_kv_),
-        mlx::core::copy(state_gate_),
+        mlx::core::astype(
+            state_kv_, state_kv_.dtype(), true),
+        mlx::core::astype(
+            state_gate_, state_gate_.dtype(), true),
         copy_optional(prev_kv_),
         copy_optional(prev_gate_));
     result.pool_len_ = pool_len_;
     result.remainder_ = remainder_;
+    if (pool_len_ > 0) {
+        result.pool_prefix_backup_ =
+            mlx::core::astype(
+                pool_prefix(*this),
+                dtype_,
+                true);
+    }
     return result;
+}
+
+void MlxDeepseekV4PoolState::restore_snapshot(
+    MlxDeepseekV4PoolState snapshot) {
+    if (ratio_ != snapshot.ratio_ ||
+        head_dim_ != snapshot.head_dim_ ||
+        overlap_ != snapshot.overlap_ ||
+        batch_ != snapshot.batch_ ||
+        capacity_ != snapshot.capacity_ ||
+        dtype_ != snapshot.dtype_) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 pool snapshot topology mismatch");
+    }
+    state_kv_ = std::move(snapshot.state_kv_);
+    state_gate_ = std::move(snapshot.state_gate_);
+    prev_kv_ = std::move(snapshot.prev_kv_);
+    prev_gate_ = std::move(snapshot.prev_gate_);
+    pool_len_ = snapshot.pool_len_;
+    remainder_ = snapshot.remainder_;
+    if (pool_len_ <= 0) {
+        return;
+    }
+    if (!snapshot.pool_prefix_backup_ ||
+        snapshot.pool_prefix_backup_->shape() != Shape{
+            batch_, pool_len_, head_dim_}) {
+        throw std::runtime_error(
+            "DeepSeek-V4 pool snapshot prefix is unavailable");
+    }
+    auto rows = mlx::core::broadcast_to(
+        mlx::core::reshape(
+            mlx::core::arange(
+                pool_len_,
+                mlx::core::int32),
+            Shape{1, pool_len_}),
+        Shape{batch_, pool_len_});
+    pool_ = dsv4_cache_write_inplace(
+        pool_,
+        *snapshot.pool_prefix_backup_,
+        rows);
 }
 
 MlxDeepseekV4PoolState
@@ -1360,7 +1411,8 @@ MlxDeepseekV4LayerState::MlxDeepseekV4LayerState(
 MlxDeepseekV4LayerState
 MlxDeepseekV4LayerState::snapshot() const {
     MlxDeepseekV4LayerState result(
-        mlx::core::copy(local_),
+        mlx::core::astype(
+            local_, local_.dtype(), true),
         main_
             ? std::optional<MlxDeepseekV4PoolState>(
                   main_->snapshot())
@@ -1371,6 +1423,27 @@ MlxDeepseekV4LayerState::snapshot() const {
             : std::nullopt);
     result.position_ = position_;
     return result;
+}
+
+void MlxDeepseekV4LayerState::restore_snapshot(
+    MlxDeepseekV4LayerState snapshot) {
+    if (static_cast<bool>(main_) !=
+            static_cast<bool>(snapshot.main_) ||
+        static_cast<bool>(indexer_) !=
+            static_cast<bool>(snapshot.indexer_)) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 layer snapshot topology mismatch");
+    }
+    local_ = std::move(snapshot.local_);
+    if (main_) {
+        main_->restore_snapshot(
+            std::move(*snapshot.main_));
+    }
+    if (indexer_) {
+        indexer_->restore_snapshot(
+            std::move(*snapshot.indexer_));
+    }
+    position_ = snapshot.position_;
 }
 
 array MlxDeepseekV4LayerState::local_positions() const {

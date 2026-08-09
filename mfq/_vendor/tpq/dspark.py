@@ -1,37 +1,37 @@
-"""TPQ DSpark 块并行投机解码头（DeepSeek-V4-Flash-DSpark 自带的 mtp.* 三层）。
+"""TPQ DSpark block-parallel speculative decoding head using the three mtp.* layers built into DeepSeek-V4-Flash-DSpark.
 
-结构（已核对原始分片 model-00046/47/48-of-00048 的张量名与形状）：
-  mtp.0/1/2 = 三个 DSpark 层（compress_ratio=0、无 Compressor，其余与主层同构：
-  低秩 Q 注意力 + Hyper-Connections + 256 专家 MoE）；
-  stage 0 另有 main_norm/main_proj [4096, 3·4096]——输入为主模型层 40/41/42 的
-  hc 均值隐态拼接 [., 3·4096]；stage 2 另有 norm、hc_head_fn/base/scale、
-  markov_head.markov_w1/w2 [129280, 256]（低秩 logits 偏置头）与
-  confidence_head.proj（v1 未接）。embed/head 与主模型共享（官方 convert 跳过
-  mtp.*emb* 与 mtp.*head.weight）。
+Structure, verified against tensor names and shapes in source shards model-00046/47/48-of-00048:
+  mtp.0/1/2 are three DSpark layers (compress_ratio=0, no Compressor, otherwise isomorphic to main layers:
+  low-rank Q attention, Hyper-Connections, and a 256-expert MoE).
+  Stage 0 also has main_norm/main_proj [4096, 3*4096], whose input is concatenated mean-HC hidden states
+  [., 3*4096] from main-model layers 40/41/42. Stage 2 also has norm, hc_head_fn/base/scale,
+  markov_head.markov_w1/w2 [129280, 256] (a low-rank logits-bias head), and confidence_head.proj
+  (unused in v1). Embed/head are shared with the main model; the official converter skips mtp.*emb*
+  and mtp.*head.weight.
 
-草稿前向（官方 inference/model.py 的 forward_spec / DSparkAttention 纯 torch 复刻）：
+Draft forward pass, a pure-torch reproduction of forward_spec / DSparkAttention in official inference/model.py:
   main_x = main_norm(main_proj(main_hidden))            # [1,1,D]
-  草稿输入 = [t1, noise_token×4] 的 embedding 复制到 4 个 hc 通道 [1,5,4,D]
-  每层 DSparkAttention：main_kv = wkv(main_x)（相位 start_pos）写入环形槽
-  start_pos%128；5 个草稿位（相位 start_pos+1..+5）对「环内全部活槽 + 自身 5 位」
-  做注意力（块并行：草稿位之间无因果掩码，noise 位不含真实未来信息，与官方一致；
-  softmax 分母含 attn_sink、输出末 64 维反旋转，同主模型）；
-  MoE 为 sqrtsoftplus top-6 + gate.bias 选择（与主模型层≥3 相同）；
-  末层 hc_head → norm → 共享 lm_head 得 5 位 logits，再沿块顺序加 markov 偏置
-  （logits[j] += markov_w2 @ markov_w1[prev_token]）贪心生出 5 个草稿。
+  Replicate embeddings for draft input [t1, noise_token x 4] across four HC channels as [1,5,4,D].
+  In each DSparkAttention layer, write main_kv = wkv(main_x) at phase start_pos into ring slot start_pos%128.
+  Five draft positions at phases start_pos+1..+5 attend to all active ring slots plus their own five positions.
+  This is block-parallel: draft positions have no causal mask, noise positions contain no real future information,
+  matching the official implementation. The softmax denominator includes attn_sink, and the final 64 output dimensions
+  are inverse-rotated as in the main model. MoE uses sqrtsoftplus top-6 plus gate.bias selection, matching main-model
+  layers >=3. The final layer applies hc_head -> norm -> shared lm_head to obtain five-position logits, then adds the
+  Markov bias in block order (logits[j] += markov_w2 @ markov_w1[prev_token]) and greedily produces five drafts.
 
-KV 同步（草稿质量的关键，正确性由主模型贪心验证兜底）：
-  DSpark 环只保存「已验证接受位置」的 main_kv。prefill 后由 prefill_kv 用
-  main_hidden 全量建立（仅留最后 128 个，环形摆放）；每轮验证后由 update_kv
-  写入接受前缀（最末接受位由下一次 draft 调用内部写入，幂等）。被拒草稿
-  从不进入 DSpark 环，无需回滚。
+KV synchronization, critical to draft quality while correctness is ensured by greedy main-model validation:
+  The DSpark ring stores main_kv only for validated accepted positions. After prefill, prefill_kv builds it from
+  all main_hidden states, retaining only the final 128 in ring order. After each validation round, update_kv writes
+  the accepted prefix; the next draft call idempotently writes the final accepted position internally.
+  Rejected drafts never enter the DSpark ring and require no rollback.
 
-权重来源：CCCP 产物目录的 dspark.safetensors（由 `python -m CCCP dspark-export`
-自原始检查点导出，张量名/dtype 原样保留；产物自包含，不依赖原始模型目录）。
-FP8 反量化值在 bf16 中精确可表，大矩阵按 bf16 驻留。routed 专家为 FP4 e2m1
-打包 + ue8m0 缩放：FP4Weight 结构与 Int4Weight 同构（256 字节 LUT 一次取双
-半字节，分块在线反量化 matmul），打包态经 LRU 驻内存（默认 1.5GB，
-TPQ_DSPARK_GB 可调），命中失败读产物文件。
+Weight source: dspark.safetensors in the TPQ artifact directory, exported from the original checkpoint by
+`python -m TPQ dspark-export` while preserving tensor names and dtypes. The artifact is self-contained and does not
+depend on the original model directory. FP8 dequantized values are exactly representable in bf16, so large matrices
+reside in bf16. Routed experts use packed FP4 e2m1 plus ue8m0 scaling. FP4Weight is structurally analogous to
+Int4Weight: a 256-byte LUT retrieves both nibbles and matmul dequantizes online in blocks. Packed weights reside in
+an in-memory LRU (1.5 GB by default, configurable with TPQ_DSPARK_GB), with misses read from the artifact file.
 """
 
 from __future__ import annotations
@@ -50,15 +50,15 @@ from .dsv4 import SafeFile, dequant_fp8, rmsnorm, rope_apply, hc_pre, hc_post, h
 
 from .kernels import VQWeight
 
-# e2m1 全 16 值表（bit3 为符号位；与 CCCP/fp4io.py 一致）
+# Complete 16-value e2m1 table (bit 3 is the sign bit; matches TPQ/fp4io.py)
 _E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
          -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 
-_FP4_GROUP = 32  # ue8m0 缩放粒度（每行每 32 元素一个指数字节）
+_FP4_GROUP = 32  # ue8m0 scaling granularity (one exponent byte per 32 elements in each row)
 
 
 def _make_fp4_lut() -> torch.Tensor:
-    """256 字节 → (低半字节值, 高半字节值)（低半字节在前 = 偶数列先）。"""
+    """Map 256 byte values to (low-nibble value, high-nibble value), with the low nibble/even column first."""
     tab = torch.tensor(_E2M1, dtype=torch.float32)
     t = torch.arange(256)
     return torch.stack([tab[t & 15], tab[t >> 4]], 1)
@@ -78,14 +78,14 @@ def _lut_on(device) -> torch.Tensor:
 
 
 class FP4Weight:
-    """FP4 e2m1 打包权重（I8 [R, C//2] 低半字节在前 + ue8m0 [R, C//32]）。
-    matmul 按行块在线反量化到 f32 后 torch.mm（与 Int4Weight 同构的驻留方案）。"""
+    """Packed FP4 e2m1 weights: I8 [R, C//2] with the low nibble first plus ue8m0 [R, C//32].
+    Matmul dequantizes row blocks online to f32 before torch.mm, using a residency scheme analogous to Int4Weight."""
 
     __slots__ = ("q", "s", "cols")
 
     def __init__(self, q: torch.Tensor, s: torch.Tensor, cols: int):
         self.q = q          # u8 [R, C//2]
-        self.s = s          # u8 [R, C//32]（ue8m0 指数字节）
+        self.s = s          # u8 [R, C//32] (ue8m0 exponent bytes)
         self.cols = cols
 
     @property
@@ -105,7 +105,7 @@ class FP4Weight:
         return w
 
     def matmul_T(self, x: torch.Tensor, chunk: int | None = None) -> torch.Tensor:
-        """y = x @ W.T。x: [T, C] f32 → [T, R] f32，逐行块反量化（块 ≤64MB，自适应）。"""
+        """Compute y = x @ W.T for f32 x [T, C] -> f32 [T, R], dequantizing adaptive row blocks of at most 64 MB."""
         R = self.q.shape[0]
         if chunk is None:
             chunk = max(512, min(R, (64 * 2**20) // max(self.cols * 4, 1)))
@@ -117,9 +117,10 @@ class FP4Weight:
 
 
 class DSparkStore:
-    """产物目录 dspark.safetensors 的读取（产物自包含：读取 TPQ 清单的
-    dspark_file 指引，不依赖原始模型目录）。张量名与原始检查点一致（mtp.*），
-    FP8 伴生 .scale 由导出器原样保留。产物由 `python -m CCCP dspark-export` 生成。"""
+    """Reader for dspark.safetensors in the artifact directory. The self-contained artifact follows the
+    dspark_file reference in the TPQ manifest and does not depend on the original model directory. Tensor names
+    match the original checkpoint (mtp.*), and the exporter preserves companion FP8 .scale tensors verbatim.
+    The artifact is generated by `python -m TPQ dspark-export`."""
 
     def __init__(self, model_dir: str):
         _root, man = load_manifest(model_dir)
@@ -133,14 +134,14 @@ class DSparkStore:
         self.keys = set(self.sf.keys())
 
     def hyper(self) -> dict:
-        """DSpark 超参（block_size/noise_id/targets），manifest 缺省取官方发布值。"""
+        """Return DSpark hyperparameters (block_size/noise_id/targets), using official defaults when absent from the manifest."""
         d = self.man.get("dspark", {})
         return {"block_size": int(d.get("block_size", 5)),
                 "noise_id": int(d.get("noise_id", 128799)),
                 "targets": tuple(d.get("targets", (40, 41, 42)))}
 
     def has_scale(self, name: str) -> bool:
-        # 伴生 scale 命名：X.weight ↔ X.scale（官方 convert 只改名不取倒数）
+        # Companion-scale naming: X.weight <-> X.scale (the official converter only renames it; it does not take the reciprocal)
         sname = name[:-len("weight")] + "scale" if name.endswith("weight") else name + ".scale"
         return sname in self.keys
 
@@ -148,32 +149,32 @@ class DSparkStore:
         return self.sf.get_tensor(name)
 
     def get_f32(self, name: str) -> torch.Tensor:
-        """带伴生 .scale 的走块级 FP8 反量化；其余按存储 dtype 转 f32。"""
+        """Use block-level FP8 dequantization when a companion .scale exists; otherwise convert the stored dtype to f32."""
         sname = name[:-len("weight")] + "scale" if name.endswith("weight") else name + ".scale"
         if sname in self.keys:
             return dequant_fp8(self.get_raw(name), self.get_raw(sname))
         return self.get_raw(name).float()
 
-    # ---- VQ 产物（dspark-vq.safetensors）----
+    # ---- VQ artifact (dspark-vq.safetensors) ----
     def is_vq(self) -> bool:
-        """产物是否为 VQ 量化版（含 stage 码本键）。"""
+        """Return whether the artifact is VQ-quantized and contains stage codebook keys."""
         return "s0.cb.gu" in self.keys
 
     def cb(self, stage: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """stage 共享码本 (cb_gu, cb_dn) f32 [K, dim]。"""
+        """Return stage-shared codebooks (cb_gu, cb_dn) as f32 [K, dim]."""
         return (self.get_raw(f"s{stage}.cb.gu").float(),
                 self.get_raw(f"s{stage}.cb.dn").float())
 
 
 def _linb(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """bf16 大矩阵的线性层（e4m3×2^k 在 bf16 中精确；激活仿官方按 bf16 进 GEMM，
-    输出回 f32 保持后续归一化/softmax 精度）。"""
+    """Linear layer for large bf16 matrices. e4m3*2^k is exact in bf16; activations enter GEMM as bf16
+    to match the official implementation, and outputs return to f32 to preserve later normalization/softmax accuracy."""
     return (x.bfloat16() @ w.t()).float()
 
 
 class DSparkHead:
-    """DeepSeek-V4-Flash-DSpark 的 DSpark 三层草稿头（provider 复用 DSV4TPQModel：
-    embed/head/rope/设备来自主模型；mtp.* 权重自原始分片加载）。"""
+    """Three-layer DSpark draft head for DeepSeek-V4-Flash-DSpark. The provider reuses DSV4TPQModel:
+    embed/head/RoPE/device come from the main model, while mtp.* weights load from the original shards."""
 
     N_STAGES = 3
     WIN = 128
@@ -182,12 +183,12 @@ class DSparkHead:
         self.m = model
         self.device = model.device
         self.cfg = model._cfg_obj()
-        self.store = DSparkStore(model.store.root)   # 只从产物目录加载（dspark_file）
+        self.store = DSparkStore(model.store.root)   # Load only from the artifact directory (dspark_file)
         hp = self.store.hyper()
         self.block_size = hp["block_size"]
         self.noise_id = hp["noise_id"]
         self.targets = hp["targets"]
-        self.rope = model.rope_base          # ratio=0 → theta=10000、无 YaRN
+        self.rope = model.rope_base          # ratio=0 -> theta=10000, without YaRN
         self._stages: dict[int, dict] = {}
         self._experts: OrderedDict[tuple[int, int], tuple[FP4Weight, FP4Weight]] = OrderedDict()
         self._ebytes = 0
@@ -196,7 +197,7 @@ class DSparkHead:
         self.emiss = 0
         self.rings: list[torch.Tensor] | None = None
 
-    # ---- 权重 ----
+    # ---- Weights ----
     def stage_w(self, s: int) -> dict:
         w = self._stages.get(s)
         if w is not None:
@@ -205,7 +206,7 @@ class DSparkHead:
         st = self.store
 
         def bf16(name: str) -> torch.Tensor:
-            # FP8(e4m3×2^k) 反量化值在 bf16 中精确可表；BF16 原样；F32 转 f32 另存
+            # FP8 (e4m3 * 2^k) dequantized values are exactly representable in bf16; preserve BF16 and store F32 separately as f32
             t = st.get_f32(name)
             return t.bfloat16().to(self.device)
 
@@ -249,7 +250,7 @@ class DSparkHead:
         return w
 
     def _cbs(self, stage: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """stage 共享码本的设备副本（懒加载缓存）。"""
+        """Return a lazily cached device copy of a stage-shared codebook."""
         cache = getattr(self, "_cb_cache", None)
         if cache is None:
             cache = self._cb_cache = {}
@@ -261,8 +262,9 @@ class DSparkHead:
         return cb
 
     def _expert(self, stage: int, eid: int) -> tuple:
-        """routed 专家 (gu, dn)。VQ 产物：VQWeight（u8 索引 + stage 共享码本，
-        LUT 免还原矩阵乘，GPU 驻留 LRU）；FP4 产物：FP4Weight（打包态驻内存 LRU）。"""
+        """Return a routed expert (gu, dn). VQ artifacts use VQWeight with u8 indices plus stage-shared
+        codebooks, LUT matmul without matrix reconstruction, and a GPU-resident LRU. FP4 artifacts use
+        FP4Weight with packed weights in an in-memory LRU."""
         key = (stage, eid)
         ent = self._experts.get(key)
         if ent is not None:
@@ -297,7 +299,7 @@ class DSparkHead:
         self._ebytes += nb
         return ent
 
-    # ---- KV 环（只存已接受位置的 main_kv） ----
+    # ---- KV ring (stores main_kv only for accepted positions) ----
     def reset(self) -> None:
         self.rings = None
 
@@ -307,12 +309,12 @@ class DSparkHead:
                       for _ in range(self.N_STAGES)]
 
     def _main_x(self, mh: torch.Tensor) -> torch.Tensor:
-        """main_hidden [., 3D] → main_norm(main_proj(mh)) [., D]（3 层共用）。"""
+        """Map main_hidden [., 3D] to main_norm(main_proj(mh)) [., D], shared by all three layers."""
         w0 = self.stage_w(0)
         return rmsnorm(_linb(mh, w0["main_proj"]), w0["main_norm"], self.cfg.rms_eps)
 
     def _kv_write(self, main_x: torch.Tensor, pos0: int) -> None:
-        """把 positions pos0..pos0+T-1 的 main_kv 写入各层环（槽 = pos % 128）。"""
+        """Write main_kv for positions pos0..pos0+T-1 into each layer's ring, using slot = pos % 128."""
         cfg = self.cfg
         hd, rd = cfg.head_dim, cfg.qk_rope_head_dim
         T = main_x.shape[0]
@@ -327,29 +329,29 @@ class DSparkHead:
 
     @torch.no_grad()
     def prefill_kv(self, mh: torch.Tensor) -> None:
-        """用 prompt 全部位置的 main_hidden [T, 3D] 建环（只留最后 128 个，环形摆放）。"""
+        """Build the ring from main_hidden [T, 3D] at all prompt positions, retaining only the final 128 in ring order."""
         if self.rings is None:
             self._alloc()
         T = mh.shape[0]
         n = min(T, self.WIN)
-        main_x = self._main_x(mh[T - n:])  # 只有最后 128 个位置会留在环内，少算proj
+        main_x = self._main_x(mh[T - n:])  # Only the final 128 positions remain in the ring, avoiding unnecessary projections
         self._kv_write(main_x, T - n)
 
     @torch.no_grad()
     def update_kv(self, mh_rows: torch.Tensor, pos0: int) -> None:
-        """写入一段已接受位置的 main_kv。mh_rows [n, 3D] ↔ positions pos0..pos0+n-1。"""
+        """Write main_kv for a segment of accepted positions, mapping mh_rows [n, 3D] to positions pos0..pos0+n-1."""
         if mh_rows.shape[0] == 0:
             return
         self._kv_write(self._main_x(mh_rows), pos0)
 
-    # ---- 草稿前向 ----
+    # ---- Draft forward pass ----
     def _qkv(self, x: torch.Tensor, w: dict, pos0: int, T: int):
-        """低秩 Q + MQA kv（与 CCCP.dsv4._qkv 同数学，大矩阵走 bf16 GEMM）。"""
+        """Low-rank Q plus MQA KV, mathematically matching TPQ.dsv4._qkv and using bf16 GEMM for large matrices."""
         cfg = self.cfg
         H, hd, rd = cfg.n_heads, cfg.head_dim, cfg.qk_rope_head_dim
         qr = rmsnorm(_linb(x, w["wq_a"]), w["q_norm"], cfg.rms_eps)
         q = _linb(qr, w["wq_b"]).view(1, T, H, hd)
-        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + cfg.rms_eps)  # 逐头无权重 RMS
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + cfg.rms_eps)  # Per-head weightless RMS normalization
         cos = self.rope.cos[pos0:pos0 + T]
         sin = self.rope.sin[pos0:pos0 + T]
         q[..., hd - rd:] = rope_apply(q[..., hd - rd:], cos.view(1, T, 1, -1),
@@ -360,7 +362,7 @@ class DSparkHead:
         return q, kv
 
     def _o_proj(self, o: torch.Tensor, w: dict) -> torch.Tensor:
-        """分组 LoRA O（bf16 GEMM；o [1,T,H*hd] → [1,T,D]）。"""
+        """Grouped LoRA O using bf16 GEMM, mapping o [1,T,H*hd] to [1,T,D]."""
         cfg = self.cfg
         G = cfg.o_groups
         o = o.reshape(1, -1, G, cfg.n_heads * cfg.head_dim // G).bfloat16()
@@ -370,35 +372,35 @@ class DSparkHead:
 
     def _attn(self, x: torch.Tensor, w: dict, ring: torch.Tensor,
               main_x: torch.Tensor, start_pos: int) -> torch.Tensor:
-        """DSparkAttention decode：main_kv 入环（start_pos 槽），5 个草稿位对
-        「环全部活槽 + 自身 5 位」注意力（无草稿间掩码；sink 在分母）。"""
+        """DSparkAttention decode: place main_kv in the start_pos ring slot and let five draft positions attend
+        to all active ring slots plus their own five positions, with no inter-draft mask and sink in the denominator."""
         cfg = self.cfg
         H, hd, rd = cfg.n_heads, cfg.head_dim, cfg.qk_rope_head_dim
         T = self.block_size
-        # main_kv（相位 start_pos）写入环槽 start_pos % win（幂等：同隐态同值）
+        # Write main_kv (phase start_pos) into ring slot start_pos % win (idempotent: the same hidden state yields the same value)
         mkv = rmsnorm(_linb(main_x, w["wkv"]), w["kv_norm"], cfg.rms_eps)  # [1, 1, hd]
         cos1 = self.rope.cos[start_pos:start_pos + 1]
         sin1 = self.rope.sin[start_pos:start_pos + 1]
         mkv[..., hd - rd:] = rope_apply(mkv[..., hd - rd:], cos1.view(1, 1, -1),
                                         sin1.view(1, 1, -1))
         ring[:, start_pos % self.WIN] = mkv[0, 0]
-        # 草稿 q/kv（相位 start_pos+1..+T）
+        # Draft q/kv (phases start_pos+1..+T)
         q, dkv = self._qkv(x, w, start_pos + 1, T)
-        n = min(self.WIN, start_pos + 1)   # 活槽数（prefill 后槽位即位置；满环后全活）
+        n = min(self.WIN, start_pos + 1)   # Number of active slots (after prefill, slots equal positions; all slots are active once the ring is full)
         keys = torch.cat([ring[:, :n], dkv], dim=1)                       # [1, n+T, hd]
         scores = torch.einsum("bthd,bsd->bhts", q * (hd ** -0.5), keys)
-        m = scores.amax(dim=-1)                                   # max 不含 sink
+        m = scores.amax(dim=-1)                                   # Maximum excludes the sink
         e = (scores - m.unsqueeze(-1)).exp()
         denom = e.sum(dim=-1) + (w["attn_sink"].view(1, -1, 1) - m).exp()
         o = torch.einsum("bhts,bsd->bthd", e, keys) / denom.transpose(1, 2).unsqueeze(-1)
         cosT = self.rope.cos[start_pos + 1:start_pos + 1 + T].view(1, T, 1, -1)
         sinT = self.rope.sin[start_pos + 1:start_pos + 1 + T].view(1, T, 1, -1)
-        o[..., hd - rd:] = rope_apply(o[..., hd - rd:], cosT, sinT, inverse=True)  # 输出反旋转
+        o[..., hd - rd:] = rope_apply(o[..., hd - rd:], cosT, sinT, inverse=True)  # Inverse-rotate the output
         return self._o_proj(o.flatten(2), w)
 
     def _moe(self, x: torch.Tensor, w: dict, stage: int, ids: torch.Tensor) -> torch.Tensor:
-        """sqrtsoftplus top-6 路由 + FP4 专家 + 共享专家（数学同主模型 _moe；
-        argsort+searchsorted 分派，避免逐专家 nonzero 的隐式同步）。"""
+        """sqrtsoftplus top-6 routing plus FP4 experts and a shared expert, mathematically matching main-model _moe.
+        Dispatch uses argsort plus searchsorted to avoid implicit synchronization from per-expert nonzero calls."""
         cfg = self.cfg
         B, T, D = x.shape
         xf = x.reshape(B * T, D).float()
@@ -448,11 +450,11 @@ class DSparkHead:
 
     @torch.no_grad()
     def draft(self, t1: int, mh_last: torch.Tensor, start_pos: int) -> list[int]:
-        """一次 DSpark 前向产出 block_size 个草稿 token。
+        """Produce block_size draft tokens in one DSpark forward pass.
 
-        t1: 主模型在当前位置的贪心 token（position start_pos+1 的输入）；
-        mh_last: 主模型在 position start_pos 的 main_hidden [3D] 或 [1, 3D]；
-        start_pos: 最末已接受位置（>0，prefill 后 = prompt_len-1）。
+        t1: Main model's greedy token at the current position, used as input at position start_pos+1.
+        mh_last: Main-model main_hidden [3D] or [1, 3D] at position start_pos.
+        start_pos: Final accepted position (>0; prompt_len-1 after prefill).
         """
         cfg = self.cfg
         T = self.block_size
@@ -465,13 +467,13 @@ class DSparkHead:
         wl = self.stage_w(self.N_STAGES - 1)
         x = hc_head(h, wl["hc_head_fn"], wl["hc_head_scale"], wl["hc_head_base"], cfg)
         x = rmsnorm(x, wl["norm"], cfg.rms_eps)
-        logits = self.m.logits_of(x[0])                # [T, V] f32（共享 lm_head）
+        logits = self.m.logits_of(x[0])                # [T, V] f32 (shared lm_head)
         mw1, mw2 = wl["markov_w1"], wl["markov_w2"]    # [V, 256] bf16
         prev = torch.tensor([t1], dtype=torch.long, device=self.device)
         outs = []
         for j in range(T):
             emb = mw1[prev]                            # [1, 256]
-            logits[j] += (emb @ mw2.t()).float()[0]    # markov 低秩偏置
+            logits[j] += (emb @ mw2.t()).float()[0]    # Low-rank Markov bias
             prev = logits[j].argmax().view(1)
             outs.append(prev)
         return [int(t) for t in outs]

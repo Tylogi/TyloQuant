@@ -1,4 +1,4 @@
-"""不加载 torch 的模型常驻容量计算。"""
+"""Calculate model residency capacity without loading torch."""
 
 from __future__ import annotations
 
@@ -146,11 +146,11 @@ def dsv4_dense_runtime_bytes(
 ) -> int:
     """Return DSV4 Dense's exact steady GPU bytes from its tensor header.
 
-    Int4 张量在 safetensors 中的最后一维为逻辑宽度的一半；展开成 BF16 后，
-    字节数是打包元素数的四倍。未进入 BF16 常驻组的量化张量保持 q+s，普通
-    张量保持源 dtype。``head.weight`` 若本来就是 BF16 也只占源文件中的
-    BF16 字节，不能再按 vocab×hidden×FP32 重复追加；这正是小显存极限模式
-    过去产生约 2 GiB 假 OOM 的原因。
+    The final safetensors dimension of an Int4 tensor is half its logical width. After expansion to BF16,
+    its byte count is four times the number of packed elements. Quantized tensors outside the BF16 residency
+    groups retain q+s, and ordinary tensors retain their source dtype. If ``head.weight`` is already BF16,
+    it consumes only its BF16 bytes from the source file and must not be added again as vocab*hidden*FP32.
+    Double-counting this was the source of a previous false ~2 GiB OOM in low-VRAM extreme mode.
     """
     expand_bf16 = _dense_bf16_all(dense_bf16)
     source = Path(path)

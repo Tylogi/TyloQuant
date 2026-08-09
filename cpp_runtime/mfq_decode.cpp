@@ -1,4 +1,5 @@
 #include <torch/torch.h>
+#include <ATen/Parallel.h>
 #include <ATen/ops/scaled_dot_product_attention.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAGraph.h>
@@ -17,8 +18,10 @@
 #include "moe_cache_profile.h"
 #include "tensor_parallel.h"
 #include "nvq_codebooks.generated.h"
+#include "json.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -47,6 +50,11 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#if defined(__x86_64__) && defined(__GNUC__)
+#include <immintrin.h>
+#define MFQ_CPU_X86_GNU 1
+#endif
 
 #ifndef _WIN32
 #include <fcntl.h>
@@ -90,6 +98,10 @@ torch::Tensor rms_norm_cuda(torch::Tensor x, torch::Tensor weight, double eps);
 torch::Tensor rms_norm_offset_cuda(torch::Tensor x, torch::Tensor weight, double eps, double weight_offset);
 torch::Tensor rms_norm_f16_cuda(torch::Tensor x, torch::Tensor weight, double eps,
                                 double weight_offset);
+std::vector<torch::Tensor> rms_norm_pair_f16_f32_offset_cuda(
+    torch::Tensor first, torch::Tensor second,
+    torch::Tensor first_weight, torch::Tensor second_weight,
+    double eps, double weight_offset);
 torch::Tensor l2_norm_cuda(torch::Tensor x, double eps);
 torch::Tensor acc_cuda(torch::Tensor a, torch::Tensor b);
 std::vector<torch::Tensor> acc_rms_norm_cuda(torch::Tensor a, torch::Tensor b,
@@ -562,6 +574,12 @@ torch::Tensor nvq_gemv_qx_ws_cuda(
     torch::Tensor neuron_scale, torch::Tensor codebook,
     int64_t neuron_len, int64_t gs, int64_t sub_bits, int64_t format, int64_t sign_mode,
     torch::Tensor qx, torch::Tensor xscale);
+torch::Tensor nvq_gemv_qx_residual_ws_cuda(
+    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
+    torch::Tensor neuron_scale, torch::Tensor codebook,
+    int64_t neuron_len, int64_t gs, int64_t sub_bits, int64_t format,
+    int64_t sign_mode, torch::Tensor qx, torch::Tensor xscale,
+    torch::Tensor residual);
 torch::Tensor nvq_gemv_multi2_ws_cuda(
     torch::Tensor first_indices, torch::Tensor first_aux, torch::Tensor first_sub_scale,
     torch::Tensor first_neuron_scale, torch::Tensor first_codebook,
@@ -722,6 +740,11 @@ static int64_t g_kl_mmq_fallback_calls = 0;
 static int64_t g_kl_kv_cache_capacity = 0;
 static std::unordered_set<int> g_dsv4_cpu_offload_layers;
 static int64_t g_dsv4_cpu_offload_host_bytes = 0;
+// llama.cpp-style repeating-layer placement: the first layers stay on CPU and
+// the last n_gpu_layers stay on CUDA.  -1 keeps the historical all-CUDA path.
+static int g_n_gpu_layers = -1;
+static int g_dense_cpu_layer_count = 0;
+static bool g_loading_cpu_layer = false;
 class MoeExpertCache;
 class MoeCachedSource;
 static std::shared_ptr<MoeExpertCache> g_moe_expert_cache;
@@ -4024,6 +4047,9 @@ struct NvqWorkspace {
     torch::Tensor swiglu_scratch;
 };
 
+constexpr int64_t kNvq2JscXlGroupExecKernelFormat = 16;
+constexpr int64_t kNvq3JscLGroupExecKernelFormat = 17;
+
 struct NvqWeight {
     torch::Tensor indices_packed;
     torch::Tensor aux_packed;
@@ -4085,14 +4111,260 @@ static std::vector<uint8_t> repack_nvq2_exec_metadata(const NvqCpu & c) {
     return metadata;
 }
 
+static uint32_t load_compact_bits_cpu(
+        const std::vector<uint8_t> & data, size_t bit, int bits) {
+    const size_t byte = bit >> 3;
+    const int shift = static_cast<int>(bit & 7);
+    uint32_t word = byte < data.size() ? data[byte] : 0;
+    if (byte + 1 < data.size()) word |= static_cast<uint32_t>(data[byte + 1]) << 8;
+    if (byte + 2 < data.size()) word |= static_cast<uint32_t>(data[byte + 2]) << 16;
+    return (word >> shift) & ((1u << bits) - 1u);
+}
+
+static void put_compact_bits96(
+        uint32_t (&words)[3], int bit, int bits, uint32_t value) {
+    const int word = bit >> 5;
+    const int shift = bit & 31;
+    words[word] |= value << shift;
+    if (shift + bits > 32) words[word + 1] |= value >> (32 - shift);
+}
+
+static uint32_t compact_parity7(uint32_t value) {
+    value &= 0x7fu;
+    value ^= value >> 4;
+    value ^= value >> 2;
+    value ^= value >> 1;
+    return value & 1u;
+}
+
+// NVQ2J-XL needs exactly 64 bits per gs24 group (three 12-bit indices, three
+// 8-bit sign masks, and one 4-bit state). NVQ3J-L stores three indices in
+// a 96-bit record per gs24 group (six 10-bit indices, three 8-bit sign masks,
+// and one 4-bit state).
+// This replaces the two independently bit-packed streams on CUDA; it does not
+// keep a second execution copy of the model weights.
+static std::vector<uint8_t> repack_extended_jsc_group_metadata(
+        const NvqCpu & c,
+        const std::array<uint8_t, 16> * state_remap = nullptr,
+        const std::array<std::array<uint16_t, 4096>, 4> * index_remap = nullptr) {
+    if (c.format != 14 && c.format != 15) {
+        throw std::runtime_error("extended JSC group metadata requires NVQ2J-XL or NVQ3J-L");
+    }
+    const int index_bits = c.format == 14 ? 12 : 10;
+    const int vectors_per_group = c.format == 14 ? 3 : 6;
+    const size_t record_bytes = c.format == 14 ? 8 : 12;
+    const size_t group_count = static_cast<size_t>(c.out) * c.ng;
+    std::vector<uint8_t> metadata(group_count * record_bytes, 0);
+    at::parallel_for(0, static_cast<int64_t>(group_count), 4096, [&](int64_t begin, int64_t end) {
+        for (int64_t linear = begin; linear < end; ++linear) {
+            const int64_t row = linear / c.ng;
+            const int group = static_cast<int>(linear - row * c.ng);
+            const size_t vector_base = static_cast<size_t>(row) * c.nvec +
+                static_cast<size_t>(group) * vectors_per_group;
+            const size_t sign_base = static_cast<size_t>(row) * c.nsign +
+                static_cast<size_t>(group) * 3;
+            const uint32_t source_state = load_compact_bits_cpu(
+                c.sub_scale_packed, static_cast<size_t>(linear) * c.sub_bits,
+                c.sub_bits);
+            const uint32_t state = state_remap == nullptr
+                ? source_state
+                : (*state_remap)[source_state];
+            uint8_t * destination = metadata.data() +
+                static_cast<size_t>(linear) * record_bytes;
+            if (c.format == 14) {
+                uint64_t packed = 0;
+                for (int local = 0; local < 3; ++local) {
+                    const size_t vector = vector_base + local;
+                    const uint32_t source_index = vector < static_cast<size_t>((row + 1) * c.nvec)
+                        ? load_compact_bits_cpu(c.indices_packed, vector * index_bits, index_bits)
+                        : 0;
+                    const uint32_t source_bank = static_cast<uint8_t>(
+                        c.codebook[36 + source_state]);
+                    const uint32_t index = index_remap == nullptr
+                        ? source_index
+                        : (*index_remap)[source_bank][source_index];
+                    const size_t sign = sign_base + local;
+                    const uint32_t mask7 = sign < static_cast<size_t>((row + 1) * c.nsign)
+                        ? load_compact_bits_cpu(c.aux_packed, sign * 7, 7)
+                        : 0;
+                    const uint32_t mask8 = mask7 | (compact_parity7(mask7) << 7);
+                    const uint32_t segment = index | (mask8 << index_bits);
+                    packed |= static_cast<uint64_t>(segment) << (local * 20);
+                }
+                packed |= static_cast<uint64_t>(state) << 60;
+                std::memcpy(destination, &packed, sizeof(packed));
+            } else {
+                uint32_t words[3] = {0, 0, 0};
+                for (int local = 0; local < 6; ++local) {
+                    const size_t vector = vector_base + local;
+                    const uint32_t index = vector < static_cast<size_t>((row + 1) * c.nvec)
+                        ? load_compact_bits_cpu(c.indices_packed, vector * index_bits, index_bits)
+                        : 0;
+                    put_compact_bits96(words, local * index_bits, index_bits, index);
+                }
+                for (int local = 0; local < 3; ++local) {
+                    const size_t sign = sign_base + local;
+                    const uint32_t mask7 = sign < static_cast<size_t>((row + 1) * c.nsign)
+                        ? load_compact_bits_cpu(c.aux_packed, sign * 7, 7)
+                        : 0;
+                    const uint32_t mask8 = mask7 | (compact_parity7(mask7) << 7);
+                    put_compact_bits96(words, 60 + local * 8, 8, mask8);
+                }
+                put_compact_bits96(words, 84, 4, state);
+                std::memcpy(destination, words, sizeof(words));
+            }
+        }
+    });
+    return metadata;
+}
+
 static bool nvq2_exec_layout_enabled() {
     const char * disable = std::getenv("MFQ_DISABLE_NVQ2_EXEC");
     if (disable == nullptr) disable = std::getenv("MFQ_DISABLE_NIQ2_EXEC");
     return disable == nullptr || disable[0] != '1';
 }
 
+static bool extended_jsc_group_layout_enabled() {
+    const char * enable = std::getenv("MFQ_NVQ_EXTENDED_GROUP_EXEC");
+    return enable != nullptr && enable[0] == '1';
+}
+
+static std::vector<int8_t> reorder_extended_e8_codebook_for_stage3(
+        const NvqCpu & c,
+        std::array<uint8_t, 16> & state_remap,
+        std::array<std::array<uint16_t, 4096>, 4> & index_remap) {
+    constexpr size_t metadata_bytes = 64;
+    constexpr size_t bank_bytes = 4096 * 8;
+    constexpr int bank_count = 4;
+    if (c.format != 14 ||
+        c.codebook.size() != metadata_bytes + bank_count * bank_bytes ||
+        static_cast<uint8_t>(c.codebook[1]) != bank_count) {
+        throw std::runtime_error("extended E8 runtime layout requires NVQ2J-XL");
+    }
+
+    uint64_t counts[bank_count] = {0, 0, 0, 0};
+    std::vector<uint64_t> index_counts(bank_count * 4096, 0);
+    const size_t groups = static_cast<size_t>(c.out) * c.ng;
+    for (size_t linear = 0; linear < groups; ++linear) {
+        const uint32_t state = load_compact_bits_cpu(
+            c.sub_scale_packed, linear * c.sub_bits, c.sub_bits);
+        const uint32_t bank = static_cast<uint8_t>(c.codebook[36 + state]);
+        if (bank >= bank_count) {
+            throw std::runtime_error("NVQ2J-XL state references an invalid bank");
+        }
+        ++counts[bank];
+        const size_t row = linear / c.ng;
+        const size_t group = linear - row * c.ng;
+        const size_t vector_base = row * c.nvec + group * 3;
+        const size_t vector_end = (row + 1) * c.nvec;
+        for (int local = 0; local < 3; ++local) {
+            const size_t vector = vector_base + local;
+            if (vector >= vector_end) break;
+            const uint32_t index = load_compact_bits_cpu(
+                c.indices_packed, vector * 12, 12);
+            ++index_counts[bank * 4096 + index];
+        }
+    }
+    std::array<int, bank_count> order = {0, 1, 2, 3};
+    std::stable_sort(order.begin(), order.end(), [&](int left, int right) {
+        return counts[left] > counts[right];
+    });
+    std::vector<int8_t> reordered = c.codebook;
+    int runtime_bank[bank_count] = {0, 0, 0, 0};
+    for (int destination = 0; destination < bank_count; ++destination) {
+        const int source = order[destination];
+        runtime_bank[source] = destination;
+        std::array<int, 4096> index_order;
+        std::iota(index_order.begin(), index_order.end(), 0);
+        std::stable_sort(index_order.begin(), index_order.end(),
+            [&](int left, int right) {
+                return index_counts[source * 4096 + left] >
+                    index_counts[source * 4096 + right];
+            });
+        for (int destination_index = 0;
+             destination_index < 4096;
+             ++destination_index) {
+            const int source_index = index_order[destination_index];
+            index_remap[source][source_index] =
+                static_cast<uint16_t>(destination_index);
+            std::memcpy(
+                reordered.data() + metadata_bytes + destination * bank_bytes +
+                    destination_index * 8,
+                c.codebook.data() + metadata_bytes + source * bank_bytes +
+                    source_index * 8,
+                8);
+        }
+    }
+    int bank_state_count[bank_count] = {0, 0, 0, 0};
+    for (int source_state = 0; source_state < 16; ++source_state) {
+        const uint8_t source_bank = static_cast<uint8_t>(
+            c.codebook[36 + source_state]);
+        const int rank_in_bank = bank_state_count[source_bank]++;
+        if (rank_in_bank >= 4) {
+            throw std::runtime_error(
+                "NVQ2J-XL runtime bank has more than four scale states");
+        }
+        const int destination_bank = runtime_bank[source_bank];
+        const int destination_state = rank_in_bank * bank_count + destination_bank;
+        state_remap[source_state] = static_cast<uint8_t>(destination_state);
+        std::memcpy(
+            reordered.data() + 4 + destination_state * sizeof(uint16_t),
+            c.codebook.data() + 4 + source_state * sizeof(uint16_t),
+            sizeof(uint16_t));
+        reordered[36 + destination_state] = static_cast<int8_t>(destination_bank);
+    }
+    for (int bank = 0; bank < bank_count; ++bank) {
+        if (bank_state_count[bank] != 4) {
+            throw std::runtime_error(
+                "NVQ2J-XL runtime bank must have four scale states");
+        }
+    }
+    return reordered;
+}
+
+static std::vector<uint8_t> remap_extended_e8_sub_scale_states(
+        const NvqCpu & c,
+        const std::array<uint8_t, 16> & state_remap) {
+    if (c.format != 14 || c.sub_bits != 4) {
+        throw std::runtime_error(
+            "extended E8 scale-state remap requires 4-bit NVQ2J-XL states");
+    }
+    const size_t state_count = static_cast<size_t>(c.out) * c.ng;
+    const size_t expected_bytes = (state_count + 1) / 2;
+    if (c.sub_scale_packed.size() != expected_bytes) {
+        throw std::runtime_error("NVQ2J-XL scale-state stream length mismatch");
+    }
+    std::vector<uint8_t> remapped(expected_bytes, 0);
+    at::parallel_for(0, static_cast<int64_t>(expected_bytes), 4096,
+        [&](int64_t begin, int64_t end) {
+            for (int64_t byte = begin; byte < end; ++byte) {
+                const uint8_t source = c.sub_scale_packed[byte];
+                const size_t low_state = static_cast<size_t>(byte) * 2;
+                const uint8_t low = state_remap[source & 0x0fu];
+                const uint8_t high = low_state + 1 < state_count
+                    ? state_remap[source >> 4]
+                    : 0;
+                remapped[byte] = low | static_cast<uint8_t>(high << 4);
+            }
+        });
+    return remapped;
+}
+
 static NvqWeight to_device_nvq(const NvqCpu & c, bool cuda) {
     NvqWeight w;
+    std::array<uint8_t, 16> e8_state_remap = {};
+    auto e8_index_remap =
+        std::make_unique<std::array<std::array<uint16_t, 4096>, 4>>();
+    std::vector<int8_t> e8_runtime_codebook;
+    std::vector<uint8_t> e8_runtime_sub_scale;
+    const bool use_extended_e8 =
+        cuda && c.format == 14 && extended_jsc_group_layout_enabled();
+    if (use_extended_e8) {
+        e8_runtime_codebook = reorder_extended_e8_codebook_for_stage3(
+            c, e8_state_remap, *e8_index_remap);
+        e8_runtime_sub_scale = remap_extended_e8_sub_scale_states(
+            c, e8_state_remap);
+    }
     w.format = c.format;
     w.kernel_format = c.format;
     w.sign_mode = c.sign_mode;
@@ -4102,7 +4374,20 @@ static NvqWeight to_device_nvq(const NvqCpu & c, bool cuda) {
     w.ng = c.ng;
     w.neuron_len = c.neuron_len;
     w.shape = c.shape;
-    if ((c.format == 2 || c.format == 5) && nvq2_exec_layout_enabled()) {
+    if (cuda && (c.format == 14 || c.format == 15) &&
+        extended_jsc_group_layout_enabled()) {
+        auto metadata = repack_extended_jsc_group_metadata(
+            c,
+            use_extended_e8 ? &e8_state_remap : nullptr,
+            use_extended_e8 ? e8_index_remap.get() : nullptr);
+        w.indices_packed = cpu_u8_tensor(
+            metadata, {(int64_t)metadata.size()});
+        w.aux_packed = torch::empty(
+            {0}, torch::TensorOptions().dtype(torch::kUInt8));
+        w.kernel_format = c.format == 14
+            ? kNvq2JscXlGroupExecKernelFormat
+            : kNvq3JscLGroupExecKernelFormat;
+    } else if ((c.format == 2 || c.format == 5) && nvq2_exec_layout_enabled()) {
         auto metadata = repack_nvq2_exec_metadata(c);
         w.indices_packed = cpu_u8_tensor(
             metadata, {(int64_t)metadata.size()});
@@ -4123,15 +4408,23 @@ static NvqWeight to_device_nvq(const NvqCpu & c, bool cuda) {
         w.aux_packed = cpu_u8_tensor(
             c.aux_packed, {(int64_t)c.aux_packed.size()});
     }
-    w.sub_scale_packed = cpu_u8_tensor(
-        c.sub_scale_packed, {(int64_t)c.sub_scale_packed.size()});
+    w.sub_scale_packed = use_extended_e8
+        ? cpu_u8_tensor(
+            e8_runtime_sub_scale, {(int64_t)e8_runtime_sub_scale.size()})
+        : cpu_u8_tensor(
+            c.sub_scale_packed, {(int64_t)c.sub_scale_packed.size()});
     w.neuron_scale = cpu_f16_to_f32_tensor(c.neuron_scale_h, c.out);
     if (
         c.format == 5 || c.format == 7 || c.format == 9 ||
         c.format == 10 || c.format == 12 ||
         c.format == 13 || c.format == 14 || c.format == 15) {
-        w.codebook = cpu_i8_tensor(
-            c.codebook, {(int64_t)c.codebook.size()});
+        if (use_extended_e8) {
+            w.codebook = cpu_i8_tensor(
+                e8_runtime_codebook, {(int64_t)e8_runtime_codebook.size()});
+        } else {
+            w.codebook = cpu_i8_tensor(
+                c.codebook, {(int64_t)c.codebook.size()});
+        }
     } else {
         const int dims = nvq_vector_size(c.format);
         const int entries = c.format == 1 ? 2048 : (c.format == 8 ? 1024 : 256);
@@ -5778,6 +6071,7 @@ struct MoeCacheTransfer {
     uint8_t * destination = nullptr;
     int64_t nbytes = 0;
     bool packed_weight = false;
+    const uint8_t * mapped_source = nullptr;
 };
 
 struct MoeCachedCohort;
@@ -5936,6 +6230,9 @@ struct MoeCacheStats {
     int64_t full_projection_fallbacks = 0;
     int64_t h2d_submissions = 0;
     int64_t h2d_descriptors = 0;
+    int64_t mapped_gather_bytes = 0;
+    int64_t mapped_gather_submissions = 0;
+    int64_t mapped_gather_descriptors = 0;
 };
 
 class MoeExpertCache : public std::enable_shared_from_this<MoeExpertCache> {
@@ -5963,9 +6260,29 @@ public:
             MFQ_CUDA_CHECK(cudaEventCreateWithFlags(
                 &stage.done, cudaEventDisableTiming));
         }
+        const char * mapped = std::getenv("MFQ_MOE_MAPPED_GATHER");
+        mapped_gather_enabled_ =
+            mapped != nullptr && std::atoi(mapped) != 0;
+        const char * blocks =
+            std::getenv("MFQ_MOE_MAPPED_COPY_BLOCKS");
+        if (blocks != nullptr) {
+            mapped_copy_blocks_ = std::max(
+                4, std::min(128, std::atoi(blocks)));
+        }
     }
 
     ~MoeExpertCache() {
+        if (!registered_host_fields_.empty() &&
+                weight_stream_ != nullptr) {
+            (void)cudaStreamSynchronize(weight_stream_);
+        }
+        for (auto it = registered_host_fields_.rbegin();
+             it != registered_host_fields_.rend();
+             ++it) {
+            if (it->owned) {
+                (void)cudaHostUnregister(it->host);
+            }
+        }
         for (auto & stage : stages_) {
             if (stage.done != nullptr) cudaEventDestroy(stage.done);
         }
@@ -6062,11 +6379,57 @@ public:
         return allocated_bytes_;
     }
 
+    const uint8_t * register_mapped_field(
+            const torch::Tensor & field) {
+        if (!mapped_gather_enabled_ || !field.defined() ||
+                field.numel() == 0) {
+            return nullptr;
+        }
+        if (!field.is_cpu() || !field.is_contiguous()) {
+            throw std::runtime_error(
+                "mapped MoE cache fields must be contiguous CPU tensors");
+        }
+        auto * host = field.data_ptr();
+        const auto existing = mapped_host_lookup_.find(host);
+        if (existing != mapped_host_lookup_.end()) {
+            return existing->second;
+        }
+        const int64_t bytes = tensor_nbytes(field);
+        if (bytes <= 0 ||
+                static_cast<uint64_t>(bytes) >
+                    std::numeric_limits<size_t>::max()) {
+            throw std::runtime_error(
+                "mapped MoE cache field has an invalid byte count");
+        }
+        cudaError_t status = cudaHostRegister(
+            host,
+            static_cast<size_t>(bytes),
+            cudaHostRegisterMapped);
+        bool owned = true;
+        if (status == cudaErrorHostMemoryAlreadyRegistered) {
+            (void)cudaGetLastError();
+            owned = false;
+        } else {
+            MFQ_CUDA_CHECK(status);
+        }
+        void * device = nullptr;
+        status = cudaHostGetDevicePointer(&device, host, 0);
+        if (status != cudaSuccess) {
+            if (owned) (void)cudaHostUnregister(host);
+            MFQ_CUDA_CHECK(status);
+        }
+        auto * mapped = reinterpret_cast<const uint8_t *>(device);
+        mapped_host_lookup_.emplace(host, mapped);
+        registered_host_fields_.push_back({host, bytes, owned});
+        mapped_registered_bytes_ += bytes;
+        return mapped;
+    }
+
     const MoeCacheStats & stats() const noexcept {
         return stats_;
     }
 
-    void prepare(
+    bool prepare(
         MoeCachedSource & source,
         const std::vector<int32_t> & experts,
         bool prefetch);
@@ -6207,6 +6570,14 @@ public:
                << stats_.h2d_submissions
                << " h2d_descriptors="
                << stats_.h2d_descriptors
+               << " mapped_registered_bytes="
+               << mapped_registered_bytes_
+               << " mapped_gather_bytes="
+               << stats_.mapped_gather_bytes
+               << " mapped_gather_submissions="
+               << stats_.mapped_gather_submissions
+               << " mapped_gather_descriptors="
+               << stats_.mapped_gather_descriptors
                << "\n";
     }
 
@@ -6291,8 +6662,10 @@ private:
             const std::vector<MoeCacheTransfer> & transfers,
             bool waits_for_compute,
             bool wait_on_compute_stream) {
-        int64_t payload_bytes = 0;
+        int64_t staged_payload_bytes = 0;
         int transfer_count = 0;
+        int staged_count = 0;
+        int mapped_count = 0;
         for (const auto & transfer : transfers) {
             if (transfer.nbytes < 0 ||
                 (transfer.nbytes > 0 &&
@@ -6302,15 +6675,22 @@ private:
                     "invalid MoE cache transfer");
             }
             if (transfer.nbytes == 0) continue;
-            payload_bytes =
-                (payload_bytes + 15) & ~int64_t{15};
-            if (transfer.nbytes >
-                    std::numeric_limits<int64_t>::max() -
-                        payload_bytes) {
-                throw std::overflow_error(
-                    "MoE cache transfer byte count overflows int64");
+            const bool direct_mapped =
+                !prewarming_ && transfer.mapped_source != nullptr;
+            if (direct_mapped) {
+                ++mapped_count;
+            } else {
+                staged_payload_bytes =
+                    (staged_payload_bytes + 15) & ~int64_t{15};
+                if (transfer.nbytes >
+                        std::numeric_limits<int64_t>::max() -
+                            staged_payload_bytes) {
+                    throw std::overflow_error(
+                        "MoE cache transfer byte count overflows int64");
+                }
+                staged_payload_bytes += transfer.nbytes;
+                ++staged_count;
             }
-            payload_bytes += transfer.nbytes;
             ++transfer_count;
         }
         if (transfer_count == 0) {
@@ -6325,7 +6705,7 @@ private:
         ++stats_.h2d_submissions;
         stats_.h2d_descriptors += transfer_count;
         if (prewarming_) {
-            auto & stage = acquire_stage(payload_bytes, false);
+            auto & stage = acquire_stage(staged_payload_bytes, false);
             auto * staging = stage.host.data_ptr<uint8_t>();
             int64_t offset = 0;
             for (const auto & transfer : transfers) {
@@ -6359,45 +6739,80 @@ private:
             }
             return;
         }
-        const int64_t descriptor_offset =
-            (payload_bytes + 15) & ~int64_t{15};
-        const int64_t descriptor_bytes =
-            static_cast<int64_t>(transfer_count) *
+        const int64_t scatter_descriptor_offset =
+            (staged_payload_bytes + 15) & ~int64_t{15};
+        const int64_t scatter_descriptor_bytes =
+            static_cast<int64_t>(staged_count) *
             static_cast<int64_t>(
                 sizeof(mfq::MoeCacheScatterDescriptor));
-        if (descriptor_bytes >
+        if (scatter_descriptor_bytes >
                 std::numeric_limits<int64_t>::max() -
-                    descriptor_offset) {
+                    scatter_descriptor_offset) {
             throw std::overflow_error(
                 "MoE cache descriptor byte count overflows int64");
         }
+        const int64_t mapped_descriptor_offset =
+            (scatter_descriptor_offset +
+             scatter_descriptor_bytes + 15) & ~int64_t{15};
+        const int64_t mapped_descriptor_bytes =
+            static_cast<int64_t>(mapped_count) *
+            static_cast<int64_t>(
+                sizeof(mfq::MoeCacheMappedCopyDescriptor));
+        if (mapped_descriptor_bytes >
+                std::numeric_limits<int64_t>::max() -
+                    mapped_descriptor_offset) {
+            throw std::overflow_error(
+                "MoE cache mapped descriptor byte count overflows int64");
+        }
         const int64_t total_bytes =
-            descriptor_offset + descriptor_bytes;
+            mapped_descriptor_offset + mapped_descriptor_bytes;
         auto & stage = acquire_stage(total_bytes, true);
         auto * staging = stage.host.data_ptr<uint8_t>();
-        auto * descriptors =
+        auto * scatter_descriptors =
             reinterpret_cast<mfq::MoeCacheScatterDescriptor *>(
-                staging + descriptor_offset);
+                staging + scatter_descriptor_offset);
+        auto * mapped_descriptors =
+            reinterpret_cast<mfq::MoeCacheMappedCopyDescriptor *>(
+                staging + mapped_descriptor_offset);
         int64_t offset = 0;
-        int descriptor = 0;
+        int scatter_descriptor = 0;
+        int mapped_descriptor = 0;
         for (const auto & transfer : transfers) {
             if (transfer.nbytes == 0) continue;
-            offset = (offset + 15) & ~int64_t{15};
-            std::memcpy(
-                staging + offset,
-                transfer.source,
-                static_cast<size_t>(transfer.nbytes));
-            descriptors[descriptor++] = {
-                static_cast<uint64_t>(
-                    reinterpret_cast<uintptr_t>(
-                        transfer.destination)),
-                static_cast<uint64_t>(offset),
-                static_cast<uint64_t>(transfer.nbytes),
-            };
+            if (transfer.mapped_source != nullptr) {
+                mapped_descriptors[mapped_descriptor++] = {
+                    static_cast<uint64_t>(
+                        reinterpret_cast<uintptr_t>(
+                            transfer.destination)),
+                    static_cast<uint64_t>(
+                        reinterpret_cast<uintptr_t>(
+                            transfer.mapped_source)),
+                    static_cast<uint64_t>(transfer.nbytes),
+                };
+                stats_.mapped_gather_bytes += transfer.nbytes;
+            } else {
+                offset = (offset + 15) & ~int64_t{15};
+                std::memcpy(
+                    staging + offset,
+                    transfer.source,
+                    static_cast<size_t>(transfer.nbytes));
+                scatter_descriptors[scatter_descriptor++] = {
+                    static_cast<uint64_t>(
+                        reinterpret_cast<uintptr_t>(
+                            transfer.destination)),
+                    static_cast<uint64_t>(offset),
+                    static_cast<uint64_t>(transfer.nbytes),
+                };
+                offset += transfer.nbytes;
+            }
             if (transfer.packed_weight) {
                 stats_.h2d_bytes += transfer.nbytes;
             }
-            offset += transfer.nbytes;
+        }
+        if (scatter_descriptor != staged_count ||
+                mapped_descriptor != mapped_count) {
+            throw std::runtime_error(
+                "MoE cache transfer descriptor count mismatch");
         }
         if (waits_for_compute && compute_done_recorded_) {
             MFQ_CUDA_CHECK(cudaStreamWaitEvent(
@@ -6409,11 +6824,26 @@ private:
             static_cast<size_t>(total_bytes),
             cudaMemcpyHostToDevice,
             weight_stream_));
-        mfq::moe_cache_scatter_cuda(
-            stage.device.data_ptr<uint8_t>(),
-            descriptor_offset,
-            transfer_count,
-            weight_stream_);
+        if (staged_count > 0) {
+            mfq::moe_cache_scatter_cuda(
+                stage.device.data_ptr<uint8_t>(),
+                scatter_descriptor_offset,
+                staged_count,
+                weight_stream_);
+        }
+        if (mapped_count > 0) {
+            auto * device_descriptors =
+                reinterpret_cast<const mfq::MoeCacheMappedCopyDescriptor *>(
+                    stage.device.data_ptr<uint8_t>() +
+                    mapped_descriptor_offset);
+            mfq::moe_cache_mapped_gather_cuda(
+                device_descriptors,
+                mapped_count,
+                mapped_copy_blocks_,
+                weight_stream_);
+            ++stats_.mapped_gather_submissions;
+            stats_.mapped_gather_descriptors += mapped_count;
+        }
         MFQ_CUDA_CHECK(cudaEventRecord(stage.done, weight_stream_));
         MFQ_CUDA_CHECK(cudaEventRecord(
             transfer_ready_, weight_stream_));
@@ -6453,6 +6883,16 @@ private:
     std::optional<mfq::MoeCacheProfile> profile_;
     std::vector<mfq::MoeProfileCandidate> prewarm_selected_;
     MoeCacheStats stats_;
+    struct RegisteredHostField {
+        void * host = nullptr;
+        int64_t bytes = 0;
+        bool owned = false;
+    };
+    bool mapped_gather_enabled_ = false;
+    int mapped_copy_blocks_ = 64;
+    int64_t mapped_registered_bytes_ = 0;
+    std::vector<RegisteredHostField> registered_host_fields_;
+    std::unordered_map<void *, const uint8_t *> mapped_host_lookup_;
 };
 
 struct MoeCachedCohort {
@@ -6460,6 +6900,7 @@ struct MoeCachedCohort {
     const MixedMoePool * cpu = nullptr;
     MoeGpuArena * arena = nullptr;
     std::vector<torch::Tensor> cpu_fields;
+    std::vector<const uint8_t *> mapped_fields;
     std::vector<int64_t> bytes_per_expert;
     std::vector<int32_t> expert_to_local;
     std::vector<int32_t> host_map;
@@ -6533,6 +6974,8 @@ public:
                 }
                 cohort.bytes_per_expert.push_back(
                     nbytes / pool.local_experts);
+                cohort.mapped_fields.push_back(
+                    cache_->register_mapped_field(field));
             }
             cohorts_.push_back(std::move(cohort));
         }
@@ -6779,7 +7222,14 @@ public:
                 : stage_cpu_mixed_moe(cpu_);
             return staged.forward(x, route);
         }
-        cache_->prepare(*this, route_experts(route), false);
+        if (!cache_->prepare(
+                *this, route_experts(route), false)) {
+            cache_->count_full_projection_fallback();
+            auto staged = pure_nint_candidate_
+                ? stage_cpu_nint_moe(cpu_)
+                : stage_cpu_mixed_moe(cpu_);
+            return staged.forward(x, route);
+        }
         torch::Tensor output;
         if (pure_nint_) {
             cache_->count_hetero_dispatch();
@@ -6798,7 +7248,14 @@ public:
             throw std::runtime_error(
                 "cached prequantized activation reuse only supports decode-sized routes");
         }
-        cache_->prepare(*this, route_experts(route), false);
+        if (!cache_->prepare(
+                *this, route_experts(route), false)) {
+            cache_->count_full_projection_fallback();
+            auto staged = pure_nint_candidate_
+                ? stage_cpu_nint_moe(cpu_)
+                : stage_cpu_mixed_moe(cpu_);
+            return staged.forward(x, route);
+        }
         torch::Tensor output;
         if (pure_nint_) {
             cache_->count_hetero_dispatch();
@@ -6812,7 +7269,7 @@ public:
 
     void prefetch(const MoeRoutePlan & route) {
         if (use_full_projection(route)) return;
-        cache_->prepare(
+        (void)cache_->prepare(
             *this, route_experts(route), true);
     }
 
@@ -6824,7 +7281,13 @@ public:
             throw std::runtime_error(
                 "cached heterogeneous GLU output requires pure NINT cohorts");
         }
-        cache_->prepare(*this, route_experts(route), false);
+        if (!cache_->prepare(
+                *this, route_experts(route), false)) {
+            cache_->count_full_projection_fallback();
+            auto staged = stage_cpu_nint_moe(cpu_);
+            return staged.forward_glu_output(
+                x, route, gelu);
+        }
         cache_->count_hetero_dispatch();
         auto output =
             pure_nint_->forward_glu_output(x, route, gelu);
@@ -6840,7 +7303,13 @@ public:
             throw std::runtime_error(
                 "cached heterogeneous GLU input requires pure NINT cohorts");
         }
-        cache_->prepare(*this, route_experts(route), false);
+        if (!cache_->prepare(
+                *this, route_experts(route), false)) {
+            cache_->count_full_projection_fallback();
+            auto staged = stage_cpu_nint_moe(cpu_);
+            return staged.forward_glu(
+                gate_up, route, gelu);
+        }
         cache_->count_hetero_dispatch();
         auto output =
             pure_nint_->forward_glu(gate_up, route, gelu);
@@ -6858,7 +7327,13 @@ public:
             return staged.forward_clamped_swiglu(
                 gate_up, route, limit);
         }
-        cache_->prepare(*this, route_experts(route), false);
+        if (!cache_->prepare(
+                *this, route_experts(route), false)) {
+            cache_->count_full_projection_fallback();
+            auto staged = stage_cpu_mixed_moe(cpu_);
+            return staged.forward_clamped_swiglu(
+                gate_up, route, limit);
+        }
         auto output =
             active_->forward_clamped_swiglu(
                 gate_up, route, limit);
@@ -7188,6 +7663,9 @@ void MoeExpertCache::finalize() {
         << " host_bytes=" << host_bytes_
         << " budget_bytes=" << budget_bytes_
         << " allocated_bytes=" << allocated_bytes_
+        << " mapped_gather=" << (mapped_gather_enabled_ ? 1 : 0)
+        << " mapped_registered_bytes=" << mapped_registered_bytes_
+        << " mapped_copy_blocks=" << mapped_copy_blocks_
         << std::endl;
     if (profile_.has_value()) prewarm();
 }
@@ -7339,6 +7817,10 @@ void MoeExpertCache::append_source_transfers(
                         nbytes,
                     nbytes,
                     true,
+                    cohort.mapped_fields.at(field) == nullptr
+                        ? nullptr
+                        : cohort.mapped_fields.at(field) +
+                            static_cast<int64_t>(local_index) * nbytes,
                 });
             }
         }
@@ -7394,7 +7876,7 @@ void MoeExpertCache::append_source_transfers(
     }
 }
 
-void MoeExpertCache::prepare(
+bool MoeExpertCache::prepare(
         MoeCachedSource & source,
         const std::vector<int32_t> & experts,
         bool prefetch) {
@@ -7402,15 +7884,59 @@ void MoeExpertCache::prepare(
         throw std::runtime_error(
             "MoE cache must be finalized before inference");
     }
+    if (experts.empty()) return false;
+
+    std::unordered_map<
+        MoeGpuArena *,
+        std::unordered_set<mfq::MoeCacheKey, mfq::MoeCacheKeyHash>>
+        arena_demands;
+    for (int expert : experts) {
+        if (expert < 0 || expert >= source.n_experts()) return false;
+        const int cohort_index = source.expert_to_cohort_.at(
+            static_cast<size_t>(expert));
+        auto & cohort = source.cohorts_.at(
+            static_cast<size_t>(cohort_index));
+        arena_demands[cohort.arena].insert(
+            {source.id_, cohort_index, expert});
+    }
+    for (const auto & item : arena_demands) {
+        if (item.second.size() >
+                static_cast<size_t>(item.first->book->capacity())) {
+            return false;
+        }
+    }
+
+    std::vector<std::pair<mfq::MoeCacheSlotBook *, int>> held_slots;
+    for (const auto & item : arena_demands) {
+        auto * book = item.first->book.get();
+        for (const auto & key : item.second) {
+            const int slot = book->slot_for(key);
+            if (slot >= 0 && !book->inflight(slot)) {
+                book->mark_inflight(slot);
+                held_slots.emplace_back(book, slot);
+            }
+        }
+    }
     std::vector<MoeCacheTransfer> transfers;
     bool replaced_occupied = false;
-    append_source_transfers(
-        source, experts, prefetch, transfers,
-        replaced_occupied, nullptr);
-    submit_transfers(
-        transfers,
-        replaced_occupied,
-        !prefetch);
+    try {
+        append_source_transfers(
+            source, experts, prefetch, transfers,
+            replaced_occupied, &held_slots);
+        submit_transfers(
+            transfers,
+            replaced_occupied,
+            !prefetch);
+    } catch (...) {
+        for (const auto & held : held_slots) {
+            held.first->clear_inflight(held.second);
+        }
+        throw;
+    }
+    for (const auto & held : held_slots) {
+        held.first->clear_inflight(held.second);
+    }
+    return true;
 }
 
 bool MoeExpertCache::prepare_bundle(
@@ -7651,14 +8177,46 @@ static torch::Tensor nvq_dequant(const NvqWeight & w) {
         w.sub_bits, w.kernel_format, w.sign_mode);
 }
 
+static torch::Tensor dequant_nint8_zero_cpu(const Nint8ZeroCpu & source) {
+    TORCH_CHECK(source.shape.size() == 2,
+        "CPU NINT8-0 dense tensor must be rank 2");
+    auto packed = to_device_nint8_zero(source, false);
+    auto result = torch::empty(
+        source.shape,
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32));
+    const auto * quantized =
+        reinterpret_cast<const int8_t *>(packed.q_packed.data_ptr<uint8_t>());
+    const c10::Half * scales = packed.q8_zero_scale.data_ptr<c10::Half>();
+    float * output = result.data_ptr<float>();
+    at::parallel_for(0, source.out, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t row = begin; row < end; ++row) {
+            for (int64_t group = 0; group < source.ng; ++group) {
+                const int64_t meta = row * source.ng + group;
+                const float scale = static_cast<float>(scales[meta]);
+                const int64_t k0 = group * 32;
+                const int64_t valid = std::min<int64_t>(
+                    32, source.neuron_len - k0);
+                for (int64_t index = 0; index < valid; ++index) {
+                    output[row * source.neuron_len + k0 + index] =
+                        scale * static_cast<float>(quantized[meta * 32 + index]);
+                }
+            }
+        }
+    });
+    return result.contiguous();
+}
+
 static torch::Tensor load_dense_gpu(const MfqFile & mfq, const std::string & name) {
     c10::cuda::CUDAGuard guard(
         active_weight_load_device());
     const auto & rec = mfq.record(name);
     auto blob = mfq.read_blob(name);
     if (rec.dtype == "NINT8-0") {
-        const auto packed = to_gpu_nint8_zero(
-            unpack_nint8_zero(blob));
+        const auto source = unpack_nint8_zero(blob);
+        if (g_loading_cpu_layer) {
+            return dequant_nint8_zero_cpu(source);
+        }
+        const auto packed = to_gpu_nint8_zero(source);
         auto dense = nint8_zero_dequant_cuda(
             packed.q_packed,
             packed.q8_zero_scale,
@@ -7696,7 +8254,9 @@ static torch::Tensor load_dense_gpu(const MfqFile & mfq, const std::string & nam
         throw std::runtime_error("unsupported dense dtype for C++ runtime: " + rec.dtype + " tensor " + name);
     }
     (void)numel;
-    return t.to(torch::kCUDA).contiguous();
+    return g_loading_cpu_layer
+        ? t.contiguous()
+        : t.to(torch::kCUDA).contiguous();
 }
 
 static torch::Tensor load_dense_linear_cpu(
@@ -7881,7 +8441,439 @@ static NvqMatmulPath select_nvq_matmul_path(const NvqWeight & w, int M) {
     return NvqMatmulPath::DequantGemm;
 }
 
+static inline uint32_t cpu_load_packed_bits(
+        const uint8_t * data,
+        int64_t nbytes,
+        int64_t bit,
+        int bits) {
+    const int64_t byte = bit >> 3;
+    const int shift = static_cast<int>(bit & 7);
+    uint32_t word = data[byte];
+    if (byte + 1 < nbytes) word |= static_cast<uint32_t>(data[byte + 1]) << 8;
+    if (byte + 2 < nbytes) word |= static_cast<uint32_t>(data[byte + 2]) << 16;
+    return (word >> shift) & ((1u << bits) - 1u);
+}
+
+#ifdef MFQ_CPU_X86_GNU
+__attribute__((target("avx512f,avx512bw,avx512vnni")))
+static int32_t cpu_dot_s8_s8_vnni(
+        const int8_t * left,
+        const int8_t * right,
+        int32_t right_sum) {
+    const __m512i signed_a = _mm512_loadu_si512(
+        reinterpret_cast<const __m512i *>(left));
+    const __m512i a = _mm512_xor_si512(
+        signed_a, _mm512_set1_epi8(static_cast<char>(-128)));
+    const __m512i b = _mm512_loadu_si512(
+        reinterpret_cast<const __m512i *>(right));
+    const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), a, b);
+    return _mm512_reduce_add_epi32(dot) - 128 * right_sum;
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vnni")))
+static int32_t cpu_dot_u8_s8_vnni(
+        const uint8_t * left,
+        const int8_t * right) {
+    const __m512i a = _mm512_loadu_si512(
+        reinterpret_cast<const __m512i *>(left));
+    const __m512i b = _mm512_loadu_si512(
+        reinterpret_cast<const __m512i *>(right));
+    const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), a, b);
+    return _mm512_reduce_add_epi32(dot);
+}
+
+static bool cpu_has_avx512_vnni() {
+    static const bool supported = []() {
+        __builtin_cpu_init();
+        return __builtin_cpu_supports("avx512f") &&
+            __builtin_cpu_supports("avx512bw") &&
+            __builtin_cpu_supports("avx512vnni");
+    }();
+    return supported;
+}
+#endif
+
+static inline int32_t cpu_dot_s8_s8_64(
+        const int8_t * left,
+        const int8_t * right,
+        int32_t right_sum) {
+#ifdef MFQ_CPU_X86_GNU
+    if (cpu_has_avx512_vnni()) {
+        return cpu_dot_s8_s8_vnni(left, right, right_sum);
+    }
+#endif
+    int32_t result = 0;
+    for (int index = 0; index < 64; ++index) {
+        result += static_cast<int32_t>(left[index]) *
+            static_cast<int32_t>(right[index]);
+    }
+    return result;
+}
+
+static inline int32_t cpu_dot_u8_s8_64(
+        const uint8_t * left,
+        const int8_t * right) {
+#ifdef MFQ_CPU_X86_GNU
+    if (cpu_has_avx512_vnni()) return cpu_dot_u8_s8_vnni(left, right);
+#endif
+    int32_t result = 0;
+    for (int index = 0; index < 64; ++index) {
+        result += static_cast<int32_t>(left[index]) *
+            static_cast<int32_t>(right[index]);
+    }
+    return result;
+}
+
+static inline void cpu_unpack_nint_group(
+        const uint8_t * packed,
+        int bits,
+        int valid,
+        uint8_t * values) {
+    std::fill(values, values + 64, static_cast<uint8_t>(0));
+    if (bits == 8) {
+        std::memcpy(values, packed, static_cast<size_t>(valid));
+        return;
+    }
+    const uint32_t mask = (1u << bits) - 1u;
+    uint32_t reservoir = 0;
+    int available = 0;
+    int source = 0;
+    for (int index = 0; index < valid; ++index) {
+        while (available < bits) {
+            reservoir |= static_cast<uint32_t>(packed[source++]) << available;
+            available += 8;
+        }
+        values[index] = static_cast<uint8_t>(reservoir & mask);
+        reservoir >>= bits;
+        available -= bits;
+    }
+}
+
+struct CpuQuantizedActivation {
+    int64_t rows = 0;
+    int64_t groups = 0;
+    int64_t group_size = 0;
+    std::vector<int8_t> values;
+    std::vector<float> scales;
+    std::vector<int32_t> sums;
+};
+
+static CpuQuantizedActivation cpu_quantize_activation(
+        torch::Tensor x,
+        int64_t width,
+        int64_t group_size,
+        bool with_sums) {
+    TORCH_CHECK(!x.is_cuda(), "CPU activation quantization requires a CPU tensor");
+    x = pad_last(x.contiguous().to(torch::kFloat16), width).contiguous();
+    const int64_t rows = x.size(0);
+    const int64_t groups = (width + group_size - 1) / group_size;
+    TORCH_CHECK(group_size > 0 && group_size <= 64,
+        "CPU compact GEMV group size must be in [1, 64]");
+    CpuQuantizedActivation result;
+    result.rows = rows;
+    result.groups = groups;
+    result.group_size = group_size;
+    result.values.resize(static_cast<size_t>(rows * groups * 64));
+    result.scales.resize(static_cast<size_t>(rows * groups));
+    if (with_sums) {
+        result.sums.resize(static_cast<size_t>(rows * groups));
+    }
+    const c10::Half * input = x.data_ptr<c10::Half>();
+    at::parallel_for(0, rows * groups, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t linear = begin; linear < end; ++linear) {
+            const int64_t row = linear / groups;
+            const int64_t group = linear - row * groups;
+            const int64_t k0 = group * group_size;
+            const int64_t valid = std::min(group_size, width - k0);
+            float maximum = 0.0f;
+            for (int64_t index = 0; index < valid; ++index) {
+                maximum = std::max(
+                    maximum,
+                    std::fabs(static_cast<float>(input[row * width + k0 + index])));
+            }
+            const float scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
+            result.scales[static_cast<size_t>(linear)] = scale;
+            int32_t sum = 0;
+            int8_t * quantized = result.values.data() + linear * 64;
+            for (int64_t index = 0; index < valid; ++index) {
+                int value = static_cast<int>(std::round(
+                    static_cast<float>(input[row * width + k0 + index]) / scale));
+                value = std::max(-127, std::min(127, value));
+                quantized[index] = static_cast<int8_t>(value);
+                sum += value;
+            }
+            std::fill(
+                quantized + valid,
+                quantized + 64,
+                static_cast<int8_t>(0));
+            if (with_sums) {
+                result.sums[static_cast<size_t>(linear)] = sum;
+            }
+        }
+    });
+    return result;
+}
+
+static float cpu_half_from_bytes(const int8_t * bytes, int64_t offset) {
+    uint16_t raw = 0;
+    std::memcpy(&raw, bytes + offset, sizeof(raw));
+    c10::Half value;
+    std::memcpy(&value, &raw, sizeof(raw));
+    return static_cast<float>(value);
+}
+
+static int cpu_nvq_index_bits(int format) {
+    switch (format) {
+        case 10: case 11: return 8;
+        case 13: case 15: return 10;
+        case 14: return 12;
+        default:
+            throw std::runtime_error(
+                "CPU dense offload does not support NVQ kernel format " +
+                std::to_string(format));
+    }
+}
+
+static bool cpu_nvq_d4(int format) {
+    return format == 10 || format == 11 || format == 15;
+}
+
+static const int8_t * cpu_nvq_codebook(
+        const int8_t * metadata,
+        int format,
+        uint32_t state) {
+    constexpr int64_t header = 64;
+    const uint32_t bank = format == 11
+        ? state & 1u
+        : static_cast<uint8_t>(metadata[36 + state]);
+    if (format == 10 || format == 11) {
+        return metadata + header + bank * 256 * 4;
+    }
+    if (format == 13) return metadata + header + bank * 1024 * 8;
+    if (format == 14) return metadata + header + bank * 4096 * 8;
+    if (format == 15) return metadata + header + bank * 1024 * 4;
+    throw std::runtime_error("unsupported CPU NVQ codebook format");
+}
+
+static float cpu_nvq_scale(
+        const int8_t * metadata,
+        int format,
+        float anchor,
+        uint32_t state) {
+    if (format == 11) {
+        return anchor * static_cast<float>((state >> 1) + 1);
+    }
+    return anchor * cpu_half_from_bytes(
+        metadata, 4 + static_cast<int64_t>(state) * 2);
+}
+
+static int cpu_nvq_parity7(uint32_t value) {
+    value &= 0x7fu;
+    value ^= value >> 4;
+    value ^= value >> 2;
+    value ^= value >> 1;
+    return static_cast<int>(value & 1u);
+}
+
+static void cpu_decode_nvq_group(
+        const NvqWeight & w,
+        int row,
+        int group,
+        uint32_t state,
+        int8_t values[64]) {
+    std::fill(values, values + 64, static_cast<int8_t>(0));
+    const int format = static_cast<int>(w.kernel_format);
+    const bool d4 = cpu_nvq_d4(format);
+    const int vector_size = d4 ? 4 : 8;
+    const int nvec = static_cast<int>(
+        (w.neuron_len + vector_size - 1) / vector_size);
+    const int nsign = static_cast<int>((w.neuron_len + 7) / 8);
+    const auto * indices = w.indices_packed.data_ptr<uint8_t>();
+    const auto * aux = w.aux_packed.data_ptr<uint8_t>();
+    const int bits = cpu_nvq_index_bits(format);
+    const int8_t * bank = cpu_nvq_codebook(
+        w.codebook.data_ptr<int8_t>(), format, state);
+    for (int segment = 0; segment < 3; ++segment) {
+        const int vector8 = group * 3 + segment;
+        if (vector8 >= nsign) break;
+        const int64_t sign_linear = static_cast<int64_t>(row) * nsign + vector8;
+        const uint32_t mask7 = cpu_load_packed_bits(
+            aux, w.aux_packed.numel(), sign_linear * 7, 7);
+        const uint32_t mask8 = mask7 |
+            (static_cast<uint32_t>(cpu_nvq_parity7(mask7)) << 7);
+        const int chunks = d4 ? 2 : 1;
+        for (int chunk = 0; chunk < chunks; ++chunk) {
+            const int vector = d4 ? group * 6 + segment * 2 + chunk : vector8;
+            if (vector >= nvec) continue;
+            const int64_t index_linear = static_cast<int64_t>(row) * nvec + vector;
+            const uint32_t code = bits == 8
+                ? indices[index_linear]
+                : cpu_load_packed_bits(
+                    indices, w.indices_packed.numel(), index_linear * bits, bits);
+            const int8_t * source = bank +
+                static_cast<int64_t>(code) * vector_size;
+            const int count = d4 ? 4 : 8;
+            const int destination = segment * 8 + chunk * 4;
+            for (int index = 0; index < count; ++index) {
+                const int sign_index = chunk * 4 + index;
+                values[destination + index] =
+                    ((mask8 >> sign_index) & 1u) != 0
+                    ? static_cast<int8_t>(-source[index])
+                    : source[index];
+            }
+        }
+    }
+}
+
+static torch::Tensor nvq_matmul_cpu(
+        const NvqWeight & w,
+        torch::Tensor x) {
+    TORCH_CHECK(!x.is_cuda(), "CPU NVQ GEMV requires CPU activations");
+    TORCH_CHECK(
+        !w.indices_packed.is_cuda() && !w.sub_scale_packed.is_cuda() &&
+        !w.neuron_scale.is_cuda() && !w.codebook.is_cuda(),
+        "CPU NVQ GEMV requires CPU-resident weights");
+    TORCH_CHECK(w.gs == 24,
+        "CPU NVQ GEMV currently requires 24-value groups");
+    auto activation = cpu_quantize_activation(
+        std::move(x), w.neuron_len, w.gs, true);
+    const int64_t rows = activation.rows;
+    const int64_t outputs = w.out;
+    auto result = torch::empty(
+        {rows, outputs},
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat16));
+    c10::Half * output = result.data_ptr<c10::Half>();
+    const uint8_t * scales = w.sub_scale_packed.data_ptr<uint8_t>();
+    const float * anchors = w.neuron_scale.data_ptr<float>();
+    const int8_t * metadata = w.codebook.data_ptr<int8_t>();
+    const int64_t scale_bytes = w.sub_scale_packed.numel();
+    at::parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
+        std::vector<float> accumulators(static_cast<size_t>(rows));
+        for (int64_t neuron = begin; neuron < end; ++neuron) {
+            std::fill(accumulators.begin(), accumulators.end(), 0.0f);
+            for (int group = 0; group < w.ng; ++group) {
+                const int64_t scale_linear = neuron * w.ng + group;
+                const uint32_t state = cpu_load_packed_bits(
+                    scales, scale_bytes,
+                    scale_linear * w.sub_bits,
+                    static_cast<int>(w.sub_bits));
+                const float scale = cpu_nvq_scale(
+                    metadata, static_cast<int>(w.kernel_format),
+                    anchors[neuron], state);
+                alignas(64) int8_t weights[64];
+                cpu_decode_nvq_group(
+                    w, static_cast<int>(neuron), group, state, weights);
+                for (int64_t row = 0; row < rows; ++row) {
+                    const int8_t * quantized = activation.values.data() +
+                        (row * activation.groups + group) * 64;
+                    const int32_t dot = cpu_dot_s8_s8_64(
+                        weights, quantized,
+                        activation.sums[static_cast<size_t>(
+                            row * activation.groups + group)]);
+                    const float activation_scale = activation.scales[
+                        static_cast<size_t>(row * activation.groups + group)];
+                    accumulators[static_cast<size_t>(row)] = std::fma(
+                        scale * activation_scale,
+                        static_cast<float>(dot),
+                        accumulators[static_cast<size_t>(row)]);
+                }
+            }
+            for (int64_t row = 0; row < rows; ++row) {
+                output[row * outputs + neuron] =
+                    c10::Half(accumulators[static_cast<size_t>(row)]);
+            }
+        }
+    });
+    return result;
+}
+
+static torch::Tensor nint_matmul_cpu(
+        const NintWeight & w,
+        torch::Tensor x) {
+    TORCH_CHECK(!x.is_cuda(), "CPU NINT GEMV requires CPU activations");
+    TORCH_CHECK(!w.q_packed.is_cuda(), "CPU NINT GEMV requires CPU-resident weights");
+    TORCH_CHECK(!w.q5_exec, "CPU NINT GEMV requires the compact MFQ layout");
+    auto activation = cpu_quantize_activation(
+        std::move(x), w.neuron_len, w.gs, true);
+    const int64_t rows = activation.rows;
+    const int64_t width = w.neuron_len;
+    const int64_t outputs = w.out;
+    auto result = torch::empty(
+        {rows, outputs},
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat16));
+    c10::Half * output = result.data_ptr<c10::Half>();
+    const uint8_t * quant = w.q_packed.data_ptr<uint8_t>();
+    const int64_t qbytes = w.qbytes;
+    at::parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
+        std::vector<float> accumulators(static_cast<size_t>(rows));
+        for (int64_t neuron = begin; neuron < end; ++neuron) {
+            std::fill(accumulators.begin(), accumulators.end(), 0.0f);
+            for (int64_t group = 0; group < w.ng; ++group) {
+                const int64_t meta = neuron * w.ng + group;
+                const uint8_t * packed = quant + meta * qbytes;
+                float scale = 0.0f;
+                float minimum = 0.0f;
+                if (w.q8_zero) {
+                    scale = static_cast<float>(
+                        w.q8_zero_scale.data_ptr<c10::Half>()[meta]);
+                } else {
+                    scale = w.neuron_scale.data_ptr<float>()[neuron] *
+                        static_cast<float>(w.sub_scale.data_ptr<uint8_t>()[meta]);
+                    minimum = w.neuron_min.data_ptr<float>()[neuron] *
+                        static_cast<float>(w.sub_min.data_ptr<uint8_t>()[meta]);
+                }
+                const int64_t valid = std::min<int64_t>(
+                    w.gs, width - group * w.gs);
+                alignas(64) uint8_t weights[64];
+                if (w.q8_zero) {
+                    std::fill(weights, weights + 64, static_cast<uint8_t>(0));
+                    std::memcpy(weights, packed, static_cast<size_t>(valid));
+                } else {
+                    cpu_unpack_nint_group(
+                        packed, static_cast<int>(w.bits),
+                        static_cast<int>(valid), weights);
+                }
+                for (int64_t row = 0; row < rows; ++row) {
+                    const int64_t activation_group =
+                        row * activation.groups + group;
+                    const int8_t * quantized = activation.values.data() +
+                        activation_group * 64;
+                    int32_t dot = 0;
+                    if (w.q8_zero) {
+                        dot = cpu_dot_s8_s8_64(
+                            reinterpret_cast<const int8_t *>(weights), quantized,
+                            activation.sums[
+                                static_cast<size_t>(activation_group)]);
+                        accumulators[static_cast<size_t>(row)] = std::fma(
+                            scale * activation.scales[
+                                static_cast<size_t>(activation_group)],
+                            static_cast<float>(dot),
+                            accumulators[static_cast<size_t>(row)]);
+                    } else {
+                        dot = cpu_dot_u8_s8_64(weights, quantized);
+                        const float activation_scale = activation.scales[
+                            static_cast<size_t>(activation_group)];
+                        const float dot_term = scale * activation_scale *
+                            static_cast<float>(dot);
+                        const float min_term = minimum * activation_scale *
+                            static_cast<float>(activation.sums[
+                                static_cast<size_t>(activation_group)]);
+                        accumulators[static_cast<size_t>(row)] +=
+                            dot_term - min_term;
+                    }
+                }
+            }
+            for (int64_t row = 0; row < rows; ++row) {
+                output[row * outputs + neuron] =
+                    c10::Half(accumulators[static_cast<size_t>(row)]);
+            }
+        }
+    });
+    return result;
+}
+
 static torch::Tensor nvq_matmul(const NvqWeight & w, torch::Tensor x) {
+    if (!x.is_cuda()) return nvq_matmul_cpu(w, std::move(x));
     x = x.contiguous().to(torch::kFloat16);
     x = pad_last(x, w.neuron_len);
     int M = (int)x.size(0);
@@ -7937,6 +8929,15 @@ static torch::Tensor nvq_matmul_input_mul(
     torch::Tensor gate,
     int mode) {
     TORCH_CHECK(mode == 1 || mode == 2, "NVQ input gate mode must be 1(sigmoid) or 2(silu)");
+    if (!x.is_cuda()) {
+        x = x.contiguous().to(torch::kFloat16);
+        gate = gate.contiguous().to(torch::kFloat16);
+        TORCH_CHECK(x.sizes() == gate.sizes(), "NVQ x and gate shapes must match");
+        auto value = mode == 1
+            ? x * torch::sigmoid(gate)
+            : x * torch::silu(gate);
+        return nvq_matmul_cpu(w, value);
+    }
     x = x.contiguous().to(torch::kFloat16);
     gate = gate.contiguous().to(torch::kFloat16);
     TORCH_CHECK(x.sizes() == gate.sizes(), "NVQ x and gate shapes must match");
@@ -8033,13 +9034,17 @@ static torch::Tensor nvq_ffn_swiglu_down(
     const NvqWeight & gate,
     const NvqWeight & up,
     const NvqWeight & down,
-    torch::Tensor x) {
+    torch::Tensor x,
+    c10::optional<torch::Tensor> residual = c10::nullopt) {
     if (!nvq_pair_compatible(gate, up) || gate.out != up.out || gate.out != down.neuron_len) {
         throw std::runtime_error("NVQ fused FFN weight layouts are incompatible");
     }
     x = pad_last(x.contiguous().to(torch::kFloat16), gate.neuron_len);
     if (x.size(0) != 1 || (down.gs != 24 && down.gs != 28 && down.gs != 32)) {
-        return nvq_matmul(down, nvq_matmul_swiglu(gate, up, x));
+        auto output = nvq_matmul(down, nvq_matmul_swiglu(gate, up, x));
+        return residual.has_value()
+            ? acc_cuda(residual.value(), output)
+            : output;
     }
     NvqWorkspace & input_ws = gate.workspace(1);
     NvqWorkspace & output_ws = down.workspace(1);
@@ -8060,7 +9065,17 @@ static torch::Tensor nvq_ffn_swiglu_down(
             output_ws.qx, output_ws.xscale, input_ws.swiglu_scratch);
         return 0;
     });
-    return g_profiler.measure("nvq.gemv_qx", [&]() {
+    return g_profiler.measure(
+        residual.has_value() ? "nvq.gemv_qx_residual" : "nvq.gemv_qx",
+        [&]() {
+        if (residual.has_value()) {
+            return nvq_gemv_qx_residual_ws_cuda(
+                down.indices_packed, down.aux_packed, down.sub_scale_packed,
+                down.neuron_scale, down.codebook,
+                down.neuron_len, down.gs, down.sub_bits,
+                down.kernel_format, down.sign_mode,
+                output_ws.qx, output_ws.xscale, residual.value());
+        }
         return nvq_gemv_qx_ws_cuda(
             down.indices_packed, down.aux_packed, down.sub_scale_packed,
             down.neuron_scale, down.codebook,
@@ -8128,6 +9143,7 @@ static Nint3PrefillPath nint3_prefill_path() {
 }
 
 static torch::Tensor nint_matmul(const NintWeight & w, torch::Tensor x) {
+    if (!x.is_cuda()) return nint_matmul_cpu(w, std::move(x));
     x = x.contiguous().to(torch::kFloat16);
     x = pad_last(x, w.neuron_len);
     int M = (int)x.size(0);
@@ -8393,6 +9409,15 @@ static torch::Tensor nint_matmul_groupwise_u8(
 }
 
 static torch::Tensor nint_matmul_input_mul(const NintWeight & w, torch::Tensor x, torch::Tensor gate, int mode) {
+    if (!x.is_cuda()) {
+        x = x.contiguous().to(torch::kFloat16);
+        gate = gate.contiguous().to(torch::kFloat16);
+        TORCH_CHECK(x.sizes() == gate.sizes(), "NINT x and gate shapes must match");
+        auto value = mode == 1
+            ? x * torch::sigmoid(gate)
+            : x * torch::silu(gate);
+        return nint_matmul_cpu(w, value);
+    }
     x = x.contiguous().to(torch::kFloat16);
     gate = gate.contiguous().to(torch::kFloat16);
     x = pad_last(x, w.neuron_len);
@@ -9309,6 +10334,17 @@ struct QuantLinearGroup {
             std::make_shared<CudaIndependentBranchExecutor>();
 
     std::vector<torch::Tensor> forward(torch::Tensor x) const {
+        if (!x.is_cuda()) {
+            TORCH_CHECK(
+                !nint_grouped,
+                "CPU dense offload requires separate compact linear weights");
+            std::vector<torch::Tensor> result;
+            result.reserve(layers.size());
+            for (const auto & layer : layers) {
+                result.push_back(layer.forward(x));
+            }
+            return result;
+        }
         if (nint_grouped) return nint.forward(x);
         if (g_kl_mmq_mode == KlMmqMode::Default &&
                 nvq_prefix2 && nvq_fusion_enabled()) {
@@ -9579,10 +10615,14 @@ static QuantLinear load_quant_linear(
                         std::move(shard));
                 }
             } else {
-                c10::cuda::CUDAGuard guard(
-                    active_weight_load_device());
-                result.nint.w =
-                    to_device_nint8_zero(cpu, true);
+                if (g_loading_cpu_layer) {
+                    result.nint.w = to_device_nint8_zero(cpu, false);
+                } else {
+                    c10::cuda::CUDAGuard guard(
+                        active_weight_load_device());
+                    result.nint.w =
+                        to_device_nint8_zero(cpu, true);
+                }
             }
         } else {
             const auto cpu = unpack_nint(blob);
@@ -9630,10 +10670,14 @@ static QuantLinear load_quant_linear(
                         std::move(shard));
                 }
             } else {
-                c10::cuda::CUDAGuard guard(
-                    active_weight_load_device());
-                result.nint.w =
-                    to_device_nint(cpu, true);
+                if (g_loading_cpu_layer) {
+                    result.nint.w = to_device_nint(cpu, false);
+                } else {
+                    c10::cuda::CUDAGuard guard(
+                        active_weight_load_device());
+                    result.nint.w =
+                        to_device_nint(cpu, true);
+                }
             }
         }
     } else if (is_nvq_linear_dtype(dtype)) {
@@ -9680,9 +10724,13 @@ static QuantLinear load_quant_linear(
                     std::move(shard));
             }
         } else {
-            c10::cuda::CUDAGuard guard(
-                active_weight_load_device());
-            result.nvq.w = to_device_nvq(cpu, true);
+            if (g_loading_cpu_layer) {
+                result.nvq.w = to_device_nvq(cpu, false);
+            } else {
+                c10::cuda::CUDAGuard guard(
+                    active_weight_load_device());
+                result.nvq.w = to_device_nvq(cpu, true);
+            }
         }
     } else if (dtype == "MXFP8") {
         result.kind = QuantLinearKind::Mxfp8;
@@ -9712,6 +10760,10 @@ static QuantLinear load_quant_linear(
                 result.tensor_parallel_shards.push_back(
                     std::move(shard));
             }
+        } else if (g_loading_cpu_layer) {
+            throw std::runtime_error(
+                "CPU dense offload does not yet support MXFP8 tensor: " +
+                name);
         } else {
             result.mxfp8.weight = to_cuda_device_mxfp8(
                 cpu, active_weight_load_device());
@@ -9758,6 +10810,8 @@ static QuantLinear load_quant_linear(
                 result.tensor_parallel_shards.push_back(
                     std::move(shard));
             }
+        } else if (g_loading_cpu_layer) {
+            result.dense = cpu.contiguous();
         } else {
             c10::cuda::CUDAGuard guard(active_weight_load_device());
             result.dense = cpu.to(torch::kCUDA).contiguous();
@@ -9775,7 +10829,9 @@ static bool is_quant_dtype(const std::string & dtype) {
         is_nvq_linear_dtype(dtype) || dtype == "MXFP8";
 }
 
-static QuantLinearGroup make_quant_group(std::vector<QuantLinear> layers) {
+static QuantLinearGroup make_quant_group(
+        std::vector<QuantLinear> layers,
+        bool preserve_projection_boundaries = false) {
     if (layers.empty()) throw std::runtime_error("empty quantized linear group");
     QuantLinearGroup result;
     result.outs.reserve(layers.size());
@@ -9791,20 +10847,21 @@ static QuantLinearGroup make_quant_group(std::vector<QuantLinear> layers) {
     }
     const char * disable_nint_group =
         std::getenv("MFQ_DIAGNOSTIC_DISABLE_NINT_GROUP");
-    const bool keep_nint_separate =
+    const bool diagnostic_keep_nint_separate =
         disable_nint_group != nullptr && disable_nint_group[0] == '1';
     const bool any_tensor_parallel = std::any_of(
         layers.begin(), layers.end(),
         [](const QuantLinear & layer) {
             return layer.tensor_parallel();
         });
-    if (all_nint && !keep_nint_separate &&
+    if (all_nint && !preserve_projection_boundaries &&
+        !diagnostic_keep_nint_separate && !g_loading_cpu_layer &&
         !any_tensor_parallel) {
         result.nint_grouped = true;
         result.nint = make_linear_group(nint_weights);
     } else {
         result.layers = std::move(layers);
-        result.nvq_prefix2 = result.layers.size() >= 2 &&
+        result.nvq_prefix2 = !g_loading_cpu_layer && result.layers.size() >= 2 &&
             !any_tensor_parallel &&
             result.layers[0].is_nvq() && result.layers[1].is_nvq() &&
             nvq_pair_compatible(result.layers[0].nvq.w, result.layers[1].nvq.w);
@@ -9835,7 +10892,8 @@ static QuantLinearGroup load_quant_group(
     const MfqFile & mfq, const std::vector<std::string> & names,
     size_t required_compatible_prefix = 0,
     const std::vector<mfq::TensorParallelSlice> *
-        slices_override = nullptr) {
+        slices_override = nullptr,
+    bool preserve_projection_boundaries = false) {
     std::vector<QuantLinear> layers;
     layers.reserve(names.size());
     for (const auto & name : names) {
@@ -9854,7 +10912,8 @@ static QuantLinearGroup load_quant_group(
     // A compatible prefix is fused opportunistically by make_quant_group().
     // Mixed-precision Q/K and gate/up pairs remain separate QuantLinear
     // branches and preserve the recipe-selected layouts.
-    return make_quant_group(std::move(layers));
+    return make_quant_group(
+        std::move(layers), preserve_projection_boundaries);
 }
 
 static std::vector<mfq::TensorParallelSlice>
@@ -9887,18 +10946,22 @@ static QuantLinearGroup load_paired_gate_up(
         const MfqFile & mfq,
         const std::vector<std::string> & names,
         const QuantLinear & down,
-        size_t required_compatible_prefix = 2) {
+        size_t required_compatible_prefix = 2,
+        bool preserve_projection_boundaries = false) {
     auto slices =
         tensor_parallel_output_slices_for_input(
             down);
     return slices.empty()
         ? load_quant_group(
             mfq, names,
-            required_compatible_prefix)
+            required_compatible_prefix,
+            nullptr,
+            preserve_projection_boundaries)
         : load_quant_group(
             mfq, names,
             required_compatible_prefix,
-            &slices);
+            &slices,
+            preserve_projection_boundaries);
 }
 
 struct DenseLinearGroup {
@@ -10055,6 +11118,8 @@ static DenseLinearGroup make_fp32_quant_group(QuantLinearGroup group) {
 
 struct Config {
     std::string model_type;
+    std::string hf_model_prefix = "model.language_model.";
+    std::string hf_output_name = "lm_head.weight";
     int64_t vocab_size = 0, hidden_size = 0, intermediate_size = 0, num_hidden_layers = 0;
     int64_t num_attention_heads = 0, num_key_value_heads = 0, max_position_embeddings = 0;
     int64_t head_dim = 0;
@@ -10098,6 +11163,10 @@ struct Config {
     bool is_gemma4() const { return model_type == "gemma4" || model_type == "gemma4_text"; }
     bool is_glm_dsa() const { return model_type == "glm_moe_dsa"; }
     bool is_dsv4() const { return model_type == "deepseek_v4"; }
+    bool is_minicpmo45() const { return model_type == "minicpmo"; }
+    bool uses_minicpmo45_bf16_graph() const {
+        return model_type == "minicpmo" || model_type == "minicpmtts";
+    }
     int64_t attention_size() const { return num_attention_heads * head_dim; }
     int64_t kv_size() const { return num_key_value_heads * head_dim; }
     int64_t linear_k_size() const { return linear_num_key_heads * linear_key_head_dim; }
@@ -10195,6 +11264,46 @@ static std::vector<int64_t> json_int_array(
 }
 
 static Config parse_config_json(const std::string & s) {
+    const auto document = nlohmann::json::parse(s, nullptr, false);
+    if (document.is_object() &&
+            document.value("model_type", std::string{}) == "minicpmo") {
+        if (document.value("version", std::string{}) != "4.5") {
+            throw std::runtime_error(
+                "only MiniCPM-o version 4.5 is supported");
+        }
+        Config c;
+        c.model_type = "minicpmo";
+        c.hf_model_prefix = "llm.model.";
+        c.hf_output_name = "llm.lm_head.weight";
+        c.vocab_size = document.at("vocab_size").get<int64_t>();
+        c.hidden_size = document.at("hidden_size").get<int64_t>();
+        c.intermediate_size = document.at("intermediate_size").get<int64_t>();
+        c.num_hidden_layers = document.at("num_hidden_layers").get<int64_t>();
+        c.num_attention_heads = document.at("num_attention_heads").get<int64_t>();
+        c.num_key_value_heads = document.at("num_key_value_heads").get<int64_t>();
+        c.max_position_embeddings =
+            document.at("max_position_embeddings").get<int64_t>();
+        c.head_dim = document.value(
+            "head_dim", c.hidden_size / c.num_attention_heads);
+        c.rope_base = document.value("rope_theta", 1000000.0);
+        c.rotary_dim = c.head_dim;
+        c.rms_norm_eps = document.value("rms_norm_eps", 1e-6);
+        c.tie_word_embeddings =
+            document.value("tie_word_embeddings", false);
+        c.norm_weight_offset = 0.0;
+        c.layer_types.assign(
+            static_cast<size_t>(c.num_hidden_layers), "full_attention");
+        if (c.hidden_size != 4096 || c.intermediate_size != 12288 ||
+            c.num_hidden_layers != 36 || c.num_attention_heads != 32 ||
+            c.num_key_value_heads != 8 || c.head_dim != 128 ||
+            document.value("hidden_act", std::string{}) != "silu" ||
+            document.value("attention_bias", true) ||
+            document.value("use_sliding_window", true)) {
+            throw std::runtime_error(
+                "unsupported MiniCPM-o 4.5 Qwen3 configuration");
+        }
+        return c;
+    }
     Config c;
     c.model_type = json_string(s, "model_type");
     c.vocab_size = json_int(s, "vocab_size");
@@ -10402,7 +11511,31 @@ static std::string layer_name(const std::string & templ, int i) {
 }
 
 static torch::Tensor qwen_rms_norm(torch::Tensor x, torch::Tensor weight, const Config & c) {
+    if (!x.is_cuda()) {
+        auto xf = x.contiguous().to(torch::kFloat32);
+        auto wf = weight.contiguous().to(torch::kFloat32);
+        if (c.norm_weight_offset != 0.0) {
+            wf = wf + c.norm_weight_offset;
+        }
+        auto inverse = torch::rsqrt(
+            xf.square().mean(-1, true) + c.rms_norm_eps);
+        return (xf * inverse * wf).contiguous();
+    }
     return rms_norm_offset_cuda(x, weight, c.rms_norm_eps, c.norm_weight_offset);
+}
+
+static torch::Tensor qwen_rms_norm_bf16(
+        torch::Tensor x, torch::Tensor weight, const Config & c) {
+    auto input = x.contiguous().to(torch::kBFloat16);
+    auto xf = input.to(torch::kFloat32);
+    auto inverse = torch::rsqrt(
+        xf.square().mean(-1, true) + c.rms_norm_eps);
+    auto normalized = (xf * inverse).to(torch::kBFloat16);
+    auto scale = weight.contiguous().to(torch::kBFloat16);
+    if (c.norm_weight_offset != 0.0) {
+        scale = scale + c.norm_weight_offset;
+    }
+    return (scale * normalized).contiguous();
 }
 
 static torch::Tensor gemma_rms_norm_f16(
@@ -10425,17 +11558,30 @@ struct RopeCache {
         int64_t dim,
         double base,
         int64_t frequency_dim = 0,
-        int64_t active_pairs = -1) : rotary_dim(dim) {
+        int64_t active_pairs = -1,
+        torch::Device device = torch::Device(torch::kCUDA),
+        bool official_reciprocal_frequencies = false) : rotary_dim(dim) {
         int64_t half = rotary_dim / 2;
         const int64_t denominator = frequency_dim > 0 ? frequency_dim : rotary_dim;
         if (active_pairs < 0) active_pairs = half;
         if (active_pairs > half) {
             throw std::runtime_error("RoPE active pair count exceeds rotary dimension");
         }
-        auto opts = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
+        auto opts = torch::TensorOptions().device(device).dtype(torch::kFloat32);
         auto pos = torch::arange(max_positions, opts);
         auto ar = torch::arange(0, rotary_dim, 2, opts);
-        auto freq = torch::pow(torch::full({half}, base, opts), -ar / (double)denominator);
+        auto freq = torch::pow(
+            torch::full({half}, base, opts),
+            -ar / (double)denominator);
+        if (official_reciprocal_frequencies) {
+            auto cpu_opts = torch::TensorOptions()
+                .device(torch::kCPU).dtype(torch::kFloat32);
+            auto exponent = torch::arange(0, rotary_dim, 2, cpu_opts) /
+                (double)denominator;
+            auto official_freq = torch::reciprocal(
+                torch::pow(torch::full({half}, base, cpu_opts), exponent));
+            freq.copy_(official_freq);
+        }
         if (active_pairs < half) {
             auto pair = torch::arange(half, opts);
             freq = torch::where(pair < active_pairs, freq, torch::zeros_like(freq));
@@ -10445,11 +11591,95 @@ struct RopeCache {
         sin = torch::sin(ang).contiguous();
         sections = torch::empty({0}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
     }
-    explicit RopeCache(const Config & c)
-        : RopeCache(c.max_position_embeddings, c.rotary_dim, c.rope_base) {}
+    explicit RopeCache(
+        const Config & c,
+        torch::Device device = torch::Device(torch::kCUDA))
+        : RopeCache(
+            c.max_position_embeddings, c.rotary_dim, c.rope_base,
+            0, -1, device, c.is_minicpmo45()) {}
     torch::Tensor apply(torch::Tensor x, torch::Tensor pos, const Config & c) const {
+        if (!x.is_cuda()) {
+            TORCH_CHECK(
+                !cos.is_cuda() && !sin.is_cuda(),
+                "CPU RoPE requires a CPU-resident table");
+            auto positions = pos.contiguous().to(torch::kCPU, torch::kInt64)
+                .clamp(0, cos.size(0) - 1);
+            torch::Tensor selected_cos;
+            torch::Tensor selected_sin;
+            if (positions.dim() == 1) {
+                selected_cos = cos.index_select(0, positions);
+                selected_sin = sin.index_select(0, positions);
+            } else if (sections.numel() == 3) {
+                const int64_t * section = sections.data_ptr<int64_t>();
+                std::vector<torch::Tensor> cos_parts;
+                std::vector<torch::Tensor> sin_parts;
+                int64_t offset = 0;
+                for (int axis = 0; axis < 3; ++axis) {
+                    const int64_t count = section[axis];
+                    auto active = positions.select(0, axis);
+                    cos_parts.push_back(
+                        cos.index_select(0, active).narrow(1, offset, count));
+                    sin_parts.push_back(
+                        sin.index_select(0, active).narrow(1, offset, count));
+                    offset += count;
+                }
+                selected_cos = torch::cat(cos_parts, 1);
+                selected_sin = torch::cat(sin_parts, 1);
+            } else {
+                throw std::runtime_error(
+                    "multi-axis CPU RoPE requires three position sections");
+            }
+            auto xf = x.contiguous().to(torch::kFloat32);
+            const int64_t half = rotary_dim / 2;
+            auto first = xf.narrow(-1, 0, half);
+            auto second = xf.narrow(-1, half, half);
+            auto output = xf.clone();
+            output.narrow(-1, 0, half).copy_(
+                first * selected_cos - second * selected_sin);
+            output.narrow(-1, half, half).copy_(
+                second * selected_cos + first * selected_sin);
+            return output;
+        }
         return rope_table_cuda(x.contiguous().to(torch::kFloat32), pos.contiguous().to(torch::kCUDA, torch::kInt64),
                                cos, sin, rotary_dim, sections);
+    }
+
+    torch::Tensor apply_bf16(torch::Tensor x, torch::Tensor pos) const {
+        TORCH_CHECK(
+            sections.numel() == 0,
+            "Qwen3 BF16 RoPE does not support multi-axis sections");
+        auto positions = pos.contiguous().to(cos.device(), torch::kInt64)
+            .clamp(0, cos.size(0) - 1);
+        torch::Tensor selected_cos;
+        torch::Tensor selected_sin;
+        if (positions.dim() == 1) {
+            selected_cos = cos.index_select(0, positions)
+                .to(torch::kBFloat16).unsqueeze(0).unsqueeze(0);
+            selected_sin = sin.index_select(0, positions)
+                .to(torch::kBFloat16).unsqueeze(0).unsqueeze(0);
+        } else if (positions.dim() == 2) {
+            const int64_t batches = positions.size(0);
+            const int64_t tokens = positions.size(1);
+            selected_cos = cos.index_select(0, positions.reshape({-1}))
+                .reshape({batches, tokens, rotary_dim / 2})
+                .to(torch::kBFloat16).unsqueeze(1);
+            selected_sin = sin.index_select(0, positions.reshape({-1}))
+                .reshape({batches, tokens, rotary_dim / 2})
+                .to(torch::kBFloat16).unsqueeze(1);
+        } else {
+            throw std::runtime_error(
+                "Qwen3 BF16 RoPE positions must be rank one or two");
+        }
+        auto xb = x.contiguous().to(torch::kBFloat16);
+        const int64_t half = rotary_dim / 2;
+        auto first = xb.narrow(-1, 0, half);
+        auto second = xb.narrow(-1, half, half);
+        auto output = xb.clone();
+        output.narrow(-1, 0, half).copy_(
+            first * selected_cos - second * selected_sin);
+        output.narrow(-1, half, half).copy_(
+            second * selected_cos + first * selected_sin);
+        return output.contiguous();
     }
 };
 
@@ -11209,7 +12439,66 @@ struct FFN {
             return g_profiler.measure("ffn.down", [&]() { return down.forward(act); });
         }
         auto parts = g_profiler.measure("ffn.gate_up", [&]() { return gate_up.forward(xh); });
+        if (down.is_dense() || down.is_mxfp8()) {
+            auto activation = g_profiler.measure("ffn.swiglu", [&]() {
+                return (parts[1] * torch::silu(parts[0])).contiguous();
+            });
+            return g_profiler.measure("ffn.down", [&]() {
+                return down.forward(activation);
+            });
+        }
         return g_profiler.measure("ffn.down", [&]() { return down.forward_input_mul(parts[1], parts[0], 2); });
+    }
+
+    bool can_forward_fused_residual(
+        const torch::Tensor & x,
+        const torch::Tensor & residual) const {
+        const char * fp32_residual_env =
+            std::getenv("MFQ_DIAGNOSTIC_FP32_RESIDUAL");
+        if (fp32_residual_env != nullptr && fp32_residual_env[0] == '1') {
+            return false;
+        }
+        if (!nvq_fusion_enabled() || is_moe || geglu ||
+            swiglu_limit > 0.0 || important_neurons ||
+            tensor_parallel_dense_compatible() ||
+            !x.is_cuda() || !residual.is_cuda() ||
+            x.scalar_type() != torch::kFloat16 ||
+            residual.scalar_type() != torch::kFloat16 ||
+            !x.is_contiguous() || !residual.is_contiguous() ||
+            x.dim() < 1 || residual.dim() < 1 ||
+            x.numel() / x.size(-1) != 1 ||
+            residual.numel() / residual.size(-1) != 1 ||
+            gate_up.layers.size() != 2 || !gate_up.nvq_prefix2 ||
+            !gate_up.layers[0].is_nvq() ||
+            !gate_up.layers[1].is_nvq() || !down.is_nvq() ||
+            gate_up.layers[0].tensor_parallel() ||
+            gate_up.layers[1].tensor_parallel() || down.tensor_parallel() ||
+            gate_up.outs.size() != 2 ||
+            gate_up.outs[0] != gate_up.outs[1] ||
+            gate_up.outs[0] != down.nvq.w.neuron_len ||
+            x.size(-1) != gate_up.layers[0].nvq.w.neuron_len ||
+            residual.size(-1) != down.nvq.w.out) {
+            return false;
+        }
+        return down.nvq.w.kernel_format ==
+                kNvq2JscXlGroupExecKernelFormat ||
+            down.nvq.w.kernel_format ==
+                kNvq3JscLGroupExecKernelFormat;
+    }
+
+    torch::Tensor forward_fused_residual(
+        torch::Tensor x,
+        torch::Tensor residual) const {
+        TORCH_CHECK(
+            can_forward_fused_residual(x, residual),
+            "FFN fused residual requires a compatible single-token NVQ FFN");
+        auto shape = x.sizes().vec();
+        shape.back() = down.nvq.w.out;
+        auto output = nvq_ffn_swiglu_down(
+            gate_up.layers[0].nvq.w, gate_up.layers[1].nvq.w,
+            down.nvq.w, x.reshape({1, x.size(-1)}),
+            residual.reshape({1, residual.size(-1)}));
+        return output.reshape(shape);
     }
 
     torch::Tensor forward(
@@ -11226,20 +12515,28 @@ struct KVCache {
     torch::Tensor v;
     bool ring = false;
     KVCache() = default;
-    KVCache(int64_t B, int64_t H, int64_t max_seq, int64_t D, bool use_ring = false)
+    KVCache(
+            int64_t B,
+            int64_t H,
+            int64_t max_seq,
+            int64_t D,
+            bool use_ring = false,
+            torch::Device device = torch::Device(torch::kCUDA),
+            torch::ScalarType dtype = torch::kFloat16)
         : ring(use_ring) {
-        auto opts = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat16);
+        auto opts = torch::TensorOptions().device(device).dtype(dtype);
         k = torch::zeros({B, H, max_seq, D}, opts);
         v = torch::zeros({B, H, max_seq, D}, opts);
     }
     std::pair<torch::Tensor, torch::Tensor> append(
             torch::Tensor kk, torch::Tensor vv, torch::Tensor pos,
             int64_t start_pos, int64_t end_pos) {
-        auto kh = kk.to(torch::kFloat16).contiguous();
-        auto vh = vv.to(torch::kFloat16).contiguous();
+        auto kh = kk.to(k.scalar_type()).contiguous();
+        auto vh = vv.to(v.scalar_type()).contiguous();
         const char * aten_write_env = std::getenv("MFQ_KV_CACHE_WRITE_ATEN");
-        const bool aten_write = aten_write_env != nullptr && aten_write_env[0] == '1';
-        if (aten_write) {
+        const bool aten_write = k.scalar_type() != torch::kFloat16 ||
+            (aten_write_env != nullptr && aten_write_env[0] == '1');
+        if (!k.is_cuda() || aten_write) {
             auto slots = ring ? torch::remainder(pos, k.size(2)) : pos;
             slots = slots.to(torch::kInt64).contiguous();
             k.index_copy_(2, slots, kh);
@@ -11398,12 +12695,15 @@ struct Dsv4SharedState {
 
 struct Block {
     int cuda_device = 0;
+    bool cpu_offloaded = false;
     virtual ~Block() = default;
     virtual void reset(int64_t B) = 0;
     virtual void set_token_ids(const torch::Tensor &) {}
     virtual torch::Tensor forward(torch::Tensor x, torch::Tensor pos, int64_t cache_pos,
                                   const c10::optional<torch::Tensor> & seq_len,
-                                  const Config & c, const RopeCache & rope) = 0;
+                                  const Config & c, const RopeCache & rope,
+                                  const c10::optional<torch::Tensor> & cache_positions = c10::nullopt,
+                                  const c10::optional<torch::Tensor> & attention_mask = c10::nullopt) = 0;
 };
 
 struct Dsv4PoolState {
@@ -12035,7 +13335,11 @@ struct Dsv4Block : Block {
         int64_t cache_pos,
         const c10::optional<torch::Tensor> & seq_len,
         const Config &,
-        const RopeCache &) override {
+        const RopeCache &,
+        const c10::optional<torch::Tensor> & cache_positions = c10::nullopt,
+        const c10::optional<torch::Tensor> & attention_mask = c10::nullopt) override {
+        (void)cache_positions;
+        (void)attention_mask;
         if (!current_ids.defined()) {
             throw std::runtime_error(
                 "DeepSeek V4 block did not receive token ids");
@@ -12209,8 +13513,14 @@ struct FullBlock : Block {
 
     torch::Tensor forward(torch::Tensor x, torch::Tensor pos, int64_t cache_pos,
                           const c10::optional<torch::Tensor> & seq_len,
-                          const Config & c, const RopeCache & rope) override {
+                          const Config & c, const RopeCache & rope,
+                          const c10::optional<torch::Tensor> & cache_positions = c10::nullopt,
+                          const c10::optional<torch::Tensor> & attention_mask = c10::nullopt) override {
         int64_t B = x.size(0), T = x.size(1), H = x.size(2);
+        const bool official_bf16 = c.uses_minicpmo45_bf16_graph();
+        if (official_bf16 && x.scalar_type() != torch::kBFloat16) {
+            x = x.to(torch::kBFloat16).contiguous();
+        }
         const int64_t nh = attention_heads > 0 ? attention_heads : c.num_attention_heads;
         const int64_t nkh = kv_heads > 0 ? kv_heads : c.num_key_value_heads;
         const int64_t hd = attention_head_dim > 0 ? attention_head_dim : c.head_dim;
@@ -12223,16 +13533,26 @@ struct FullBlock : Block {
                    : c.max_position_embeddings);
         const RopeCache & active_rope = attention_rope.cos.defined() ? attention_rope : rope;
         if (!cache.k.defined() || cache.k.numel() == 0) {
-            cache = KVCache(B, nkh, cache_capacity, hd, sliding);
-            const int64_t total = B * nh;
-            auto opts = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
-            decode_partial_o = torch::empty({total, kDecodeAttentionMaxParts, hd}, opts);
-            decode_partial_m = torch::empty({total, kDecodeAttentionMaxParts}, opts);
-            decode_partial_l = torch::empty({total, kDecodeAttentionMaxParts}, opts);
+            cache = KVCache(
+                B, nkh, cache_capacity, hd, sliding, x.device(),
+                official_bf16 ? torch::kBFloat16 : torch::kFloat16);
+            if (x.is_cuda()) {
+                const int64_t total = B * nh;
+                auto opts = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
+                decode_partial_o = torch::empty({total, kDecodeAttentionMaxParts, hd}, opts);
+                decode_partial_m = torch::empty({total, kDecodeAttentionMaxParts}, opts);
+                decode_partial_l = torch::empty({total, kDecodeAttentionMaxParts}, opts);
+            }
         }
         auto residual = x;
         auto xn = g_profiler.measure("full.attn_norm", [&]() {
-            return qwen_rms_norm(x.reshape({B * T, H}).to(torch::kFloat32), attn_norm, c).reshape({B, T, H});
+            return official_bf16
+                ? qwen_rms_norm_bf16(
+                    x.reshape({B * T, H}), attn_norm, c)
+                    .reshape({B, T, H})
+                : qwen_rms_norm(
+                    x.reshape({B * T, H}).to(torch::kFloat32), attn_norm, c)
+                    .reshape({B, T, H});
         });
         auto parts = g_profiler.measure("full.qkv", [&]() { return qkv.forward(xn); });
         if (parts.size() != (value_equals_key ? 2u : 3u)) {
@@ -12240,6 +13560,11 @@ struct FullBlock : Block {
         }
         auto q_full = parts[0], k_full = parts[1];
         auto v_full = value_equals_key ? k_full : parts[2];
+        if (official_bf16) {
+            q_full = q_full.to(torch::kBFloat16).contiguous();
+            k_full = k_full.to(torch::kBFloat16).contiguous();
+            v_full = v_full.to(torch::kBFloat16).contiguous();
+        }
         torch::Tensor q_raw, q_gate;
         g_profiler.measure("full.qkv_view", [&]() {
             if (c.qwen35_attn_q_gate) {
@@ -12255,20 +13580,182 @@ struct FullBlock : Block {
         auto q = g_profiler.measure("full.q_view", [&]() { return q_raw.transpose(1, 2).contiguous(); });
         auto k = g_profiler.measure("full.k_view", [&]() { return k_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous(); });
         auto v = g_profiler.measure("full.v_view", [&]() { return v_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous(); });
-        if (q_norm.defined()) q = g_profiler.measure("full.q_norm", [&]() { return qwen_rms_norm(q.reshape({-1, hd}).to(torch::kFloat32), q_norm, c).reshape_as(q); });
-        if (k_norm.defined()) k = g_profiler.measure("full.k_norm", [&]() { return qwen_rms_norm(k.reshape({-1, hd}).to(torch::kFloat32), k_norm, c).reshape_as(k); });
-        if (v_norm.defined()) v = g_profiler.measure("full.v_norm", [&]() { return qwen_rms_norm(v.reshape({-1, hd}).to(torch::kFloat32), v_norm, c).reshape_as(v); });
-        q = g_profiler.measure("full.q_rope", [&]() { return active_rope.apply(q, pos, c); });
-        k = g_profiler.measure("full.k_rope", [&]() { return active_rope.apply(k, pos, c); });
-        auto kv = g_profiler.measure("full.kv_write", [&]() { return cache.append(k, v, pos, cache_pos, cache_pos + T); });
+        if (!official_bf16 && q_norm.defined() && k_norm.defined() &&
+            q.scalar_type() == torch::kFloat16 &&
+            k.scalar_type() == torch::kFloat16) {
+            auto normalized = g_profiler.measure("full.qk_norm", [&]() {
+                return rms_norm_pair_f16_f32_offset_cuda(
+                    q, k, q_norm, k_norm,
+                    c.rms_norm_eps, c.norm_weight_offset);
+            });
+            q = normalized[0].reshape_as(q);
+            k = normalized[1].reshape_as(k);
+        } else {
+            if (q_norm.defined()) q = g_profiler.measure("full.q_norm", [&]() {
+                return official_bf16
+                    ? qwen_rms_norm_bf16(
+                        q.reshape({-1, hd}), q_norm, c).reshape_as(q)
+                    : qwen_rms_norm(
+                        q.reshape({-1, hd}).to(torch::kFloat32), q_norm, c)
+                        .reshape_as(q);
+            });
+            if (k_norm.defined()) k = g_profiler.measure("full.k_norm", [&]() {
+                return official_bf16
+                    ? qwen_rms_norm_bf16(
+                        k.reshape({-1, hd}), k_norm, c).reshape_as(k)
+                    : qwen_rms_norm(
+                        k.reshape({-1, hd}).to(torch::kFloat32), k_norm, c)
+                        .reshape_as(k);
+            });
+        }
+        if (v_norm.defined()) v = g_profiler.measure("full.v_norm", [&]() {
+            return official_bf16
+                ? qwen_rms_norm_bf16(
+                    v.reshape({-1, hd}), v_norm, c).reshape_as(v)
+                : qwen_rms_norm(
+                    v.reshape({-1, hd}).to(torch::kFloat32), v_norm, c)
+                    .reshape_as(v);
+        });
+        q = g_profiler.measure("full.q_rope", [&]() {
+            return official_bf16
+                ? active_rope.apply_bf16(q, pos)
+                : active_rope.apply(q, pos, c);
+        });
+        k = g_profiler.measure("full.k_rope", [&]() {
+            return official_bf16
+                ? active_rope.apply_bf16(k, pos)
+                : active_rope.apply(k, pos, c);
+        });
+        auto write_positions = cache_positions.has_value()
+            ? cache_positions.value().to(x.device(), torch::kInt64).contiguous()
+            : pos;
+        if (write_positions.dim() != 1 || write_positions.numel() != T) {
+            throw std::runtime_error(
+                "KV cache positions must have shape [tokens]");
+        }
+        auto kv = g_profiler.measure("full.kv_write", [&]() {
+            return cache.append(
+                k, v, write_positions, cache_pos, cache_pos + T);
+        });
+        auto minicpmo45_attention_mask = [&](int64_t visible_len,
+                                              bool explicit_causal) {
+            c10::optional<torch::Tensor> result = c10::nullopt;
+            if (!official_bf16 ||
+                    (!explicit_causal && !seq_len.has_value() &&
+                     !attention_mask.has_value())) {
+                return result;
+            }
+            auto options = torch::TensorOptions()
+                .device(x.device()).dtype(torch::kInt64);
+            auto key_positions = torch::arange(visible_len, options);
+            auto query_positions = write_positions
+                .to(x.device(), torch::kInt64)
+                .reshape({1, T}).expand({B, T});
+            auto allowed = key_positions.reshape({1, 1, visible_len}) <=
+                query_positions.unsqueeze(-1);
+            if (seq_len.has_value()) {
+                auto lengths = seq_len.value()
+                    .to(x.device(), torch::kInt64).reshape({B, 1, 1});
+                allowed = allowed &
+                    (key_positions.reshape({1, 1, visible_len}) < lengths);
+            }
+            if (attention_mask.has_value()) {
+                auto valid = attention_mask.value().to(x.device());
+                if (valid.dim() != 2 || valid.size(0) != B ||
+                        valid.size(1) < visible_len) {
+                    throw std::runtime_error(
+                        "MiniCPM-o attention_mask must cover [batch,visible_tokens]");
+                }
+                valid = valid.narrow(1, 0, visible_len).ne(0);
+                allowed = allowed & valid.unsqueeze(1);
+                auto attended = allowed.any(-1, true);
+                allowed = torch::where(
+                    attended, allowed, torch::ones_like(allowed));
+            }
+            const auto mask_dtype = official_bf16
+                ? torch::kBFloat16 : x.scalar_type();
+            auto additive = torch::zeros(
+                {B, 1, T, visible_len},
+                torch::TensorOptions().device(x.device())
+                    .dtype(mask_dtype));
+            const double mask_min = static_cast<double>(
+                std::numeric_limits<c10::BFloat16>::lowest());
+            additive.masked_fill_(
+                allowed.logical_not().unsqueeze(1),
+                mask_min);
+            result = additive.contiguous();
+            return result;
+        };
         double attn_scale = attention_scale > 0.0 ? attention_scale : 1.0 / std::sqrt((double)hd);
         torch::Tensor a;
         bool attention_token_major = false;
         a = g_profiler.measure("full.attention", [&]() {
-            auto qh = q.to(torch::kFloat16).contiguous();
-            auto kh = k.to(torch::kFloat16).contiguous();
-            auto vh = v.to(torch::kFloat16).contiguous();
+            if (!x.is_cuda()) {
+                TORCH_CHECK(!sliding, "CPU dense offload does not support sliding attention");
+                const auto cpu_attention_dtype = official_bf16
+                    ? torch::kBFloat16 : torch::kFloat32;
+                auto qh = q.to(cpu_attention_dtype).contiguous();
+                auto kh = kv.first.to(cpu_attention_dtype).contiguous();
+                auto vh = kv.second.to(cpu_attention_dtype).contiguous();
+                if (nkh != nh) {
+                    TORCH_CHECK(nh % nkh == 0, "CPU attention head ratio is invalid");
+                    const int64_t repeat = nh / nkh;
+                    kh = kh.repeat_interleave(repeat, 1);
+                    vh = vh.repeat_interleave(repeat, 1);
+                }
+                c10::optional<torch::Tensor> mask = c10::nullopt;
+                if (official_bf16) {
+                    mask = minicpmo45_attention_mask(
+                        kh.size(2), T > 1);
+                } else if (T > 1 || seq_len.has_value()) {
+                    const int64_t visible = kh.size(2);
+                    auto key_positions = torch::arange(
+                        visible,
+                        torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt64));
+                    torch::Tensor allowed;
+                    if (T > 1) {
+                        auto query_positions = pos.dim() == 1
+                            ? pos.to(torch::kCPU, torch::kInt64)
+                            : pos.select(0, 0).to(torch::kCPU, torch::kInt64);
+                        allowed = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1);
+                        allowed = allowed.unsqueeze(0).expand({B, T, visible});
+                    } else {
+                        allowed = torch::ones(
+                            {B, T, visible},
+                            torch::TensorOptions().device(torch::kCPU).dtype(torch::kBool));
+                    }
+                    if (seq_len.has_value()) {
+                        auto lengths = seq_len.value().to(torch::kCPU, torch::kInt64)
+                            .reshape({B, 1, 1});
+                        allowed = allowed & (key_positions.reshape({1, 1, visible}) < lengths);
+                    }
+                    mask = allowed.unsqueeze(1);
+                }
+                return at::scaled_dot_product_attention(
+                    qh, kh, vh, mask, 0.0, false, attn_scale, false);
+            }
+            const auto attention_dtype = official_bf16
+                ? torch::kBFloat16 : torch::kFloat16;
+            auto qh = q.to(attention_dtype).contiguous();
+            auto kh = k.to(attention_dtype).contiguous();
+            auto vh = v.to(attention_dtype).contiguous();
             if (cache_pos == 0 && T > 1) {
+                if (official_bf16) {
+                    auto repeated_k = kh;
+                    auto repeated_v = vh;
+                    if (nkh != nh) {
+                        TORCH_CHECK(
+                            nh % nkh == 0,
+                            "MiniCPM-o Qwen3 attention head ratio is invalid");
+                        const int64_t repeat = nh / nkh;
+                        repeated_k = kh.repeat_interleave(repeat, 1).contiguous();
+                        repeated_v = vh.repeat_interleave(repeat, 1).contiguous();
+                    }
+                    auto mask = minicpmo45_attention_mask(T, false);
+                    a = at::scaled_dot_product_attention(
+                        qh, repeated_k, repeated_v, mask,
+                        0.0, !mask.has_value(), attn_scale, false);
+                } else {
                 const char * llama_flash_env = std::getenv("MFQ_LLAMA_FLASH256");
                 const bool llama_flash_enabled =
                     llama_flash_env == nullptr || llama_flash_env[0] != '0';
@@ -12294,12 +13781,13 @@ struct FullBlock : Block {
                     a = at::scaled_dot_product_attention(
                         qh, kh, vh, std::nullopt, 0.0, true, attn_scale, true);
                 }
+                }
             } else if (seq_len.has_value()) {
                 const int64_t planned_len = g_decode_graph_attention_kv_len > 0
                     ? g_decode_graph_attention_kv_len : cache_pos + T;
                 const char * aten_decode_env = std::getenv("MFQ_ATTENTION_DECODE_ATEN");
-                const bool aten_decode_enabled =
-                    aten_decode_env != nullptr && aten_decode_env[0] == '1';
+                const bool aten_decode_enabled = official_bf16 ||
+                    (aten_decode_env != nullptr && aten_decode_env[0] == '1');
                 const char * llama_decode_env = std::getenv("MFQ_LLAMA_FLASH_DECODE");
                 const bool llama_decode_enabled =
                     llama_decode_env == nullptr || llama_decode_env[0] != '0';
@@ -12330,9 +13818,19 @@ struct FullBlock : Block {
                         Slice(), Slice(), Slice(0, visible_len), Slice()}).contiguous();
                     auto cached_v = cache.v.index({
                         Slice(), Slice(), Slice(0, visible_len), Slice()}).contiguous();
+                    auto mask = minicpmo45_attention_mask(
+                        visible_len, cache_pos > 0 && T > 1);
+                    if (official_bf16 && nkh != nh) {
+                        TORCH_CHECK(
+                            nh % nkh == 0,
+                            "MiniCPM-o Qwen3 attention head ratio is invalid");
+                        const int64_t repeat = nh / nkh;
+                        cached_k = cached_k.repeat_interleave(repeat, 1).contiguous();
+                        cached_v = cached_v.repeat_interleave(repeat, 1).contiguous();
+                    }
                     a = at::scaled_dot_product_attention(
-                        qh, cached_k, cached_v, std::nullopt,
-                        0.0, false, attn_scale, true);
+                        qh, cached_k, cached_v, mask,
+                        0.0, false, attn_scale, !official_bf16);
                 } else if (sliding && T == 1 && llama_decode_enabled && hd == 256 && nh == 2 * nkh) {
                     const int64_t visible_len = std::min<int64_t>(attention_window, planned_len);
                     prepare_llama_decode_workspace(visible_len, 64);
@@ -12377,11 +13875,32 @@ struct FullBlock : Block {
                                 qh, cache.k, cache.v, seq_len.value(), attn_scale);
                 }
             } else {
-                a = sliding
-                    ? attention_swa_cuda(qh, kv.first.contiguous(), kv.second.contiguous(),
-                                         attn_scale, attention_window)
-                    : attention_cuda(qh, kv.first.contiguous(), kv.second.contiguous(),
-                                     attn_scale, true);
+                if (official_bf16) {
+                    auto cached_k = kv.first.contiguous();
+                    auto cached_v = kv.second.contiguous();
+                    if (nkh != nh) {
+                        TORCH_CHECK(
+                            nh % nkh == 0,
+                            "MiniCPM-o Qwen3 attention head ratio is invalid");
+                        const int64_t repeat = nh / nkh;
+                        cached_k = cached_k.repeat_interleave(repeat, 1).contiguous();
+                        cached_v = cached_v.repeat_interleave(repeat, 1).contiguous();
+                    }
+                    auto mask = minicpmo45_attention_mask(
+                        cached_k.size(2), cache_pos > 0 && T > 1);
+                    a = at::scaled_dot_product_attention(
+                        qh, cached_k, cached_v, mask,
+                        0.0, !mask.has_value() && cache_pos == 0 && T > 1,
+                        attn_scale, false);
+                } else {
+                    a = sliding
+                        ? attention_swa_cuda(
+                            qh, kv.first.contiguous(), kv.second.contiguous(),
+                            attn_scale, attention_window)
+                        : attention_cuda(
+                            qh, kv.first.contiguous(), kv.second.contiguous(),
+                            attn_scale, true);
+                }
             }
             return a;
         });
@@ -12399,6 +13918,9 @@ struct FullBlock : Block {
                     a.transpose(1, 2).contiguous().reshape({B, T, attn_width});
             });
             oo = g_profiler.measure("full.o_proj", [&]() { return o.forward(af); });
+        }
+        if (official_bf16) {
+            oo = oo.to(torch::kBFloat16).contiguous();
         }
         if (gemma4) {
             trace_gemma_stage(layer, "attention_output", oo);
@@ -12568,6 +14090,15 @@ struct FullBlock : Block {
         auto attn_pair = g_profiler.measure("full.attn_residual_ffn_norm", [&]() {
             auto rr = residual.reshape({-1, H});
             auto oo2 = oo.reshape({-1, H});
+            if (!rr.is_cuda()) {
+                auto summed = (rr.to(torch::kFloat32) + oo2.to(torch::kFloat32))
+                    .to(rr.scalar_type()).contiguous();
+                auto normalized = official_bf16
+                    ? qwen_rms_norm_bf16(summed, ffn_norm, c)
+                    : qwen_rms_norm(
+                        summed.to(torch::kFloat32), ffn_norm, c);
+                return std::vector<torch::Tensor>{summed, normalized};
+            }
             const char * fp32_residual_env =
                 std::getenv("MFQ_DIAGNOSTIC_FP32_RESIDUAL");
             if (fp32_residual_env != nullptr &&
@@ -12581,15 +14112,64 @@ struct FullBlock : Block {
             if (rr.scalar_type() == torch::kFloat16 && oo2.scalar_type() == torch::kFloat16) {
                 return acc_rms_norm_f16_cuda(rr, oo2, ffn_norm, c.rms_norm_eps, c.norm_weight_offset);
             }
+            if (rr.scalar_type() == torch::kBFloat16 &&
+                    oo2.scalar_type() == torch::kBFloat16) {
+                auto sum = (rr + oo2).contiguous();
+                auto norm = official_bf16
+                    ? qwen_rms_norm_bf16(sum, ffn_norm, c)
+                    : qwen_rms_norm(
+                        sum.to(torch::kFloat32), ffn_norm, c)
+                        .to(torch::kBFloat16)
+                        .contiguous();
+                return std::vector<torch::Tensor>{sum, norm};
+            }
             return acc_rms_norm_cuda(rr, oo2, ffn_norm, c.rms_norm_eps, c.norm_weight_offset);
         });
         x = attn_pair[0].reshape({B, T, H});
         residual = x;
         xn = attn_pair[1].reshape({B, T, H});
-        auto ff = ffn.forward(xn.reshape({B * T, H})).reshape({B, T, H});
-        return g_profiler.measure("full.ffn_residual", [&]() {
+        if (!official_bf16) {
+            auto ffn_input = xn.reshape({B * T, H});
+            auto residual_flat = residual.reshape({B * T, H});
+            if (ffn.can_forward_fused_residual(ffn_input, residual_flat)) {
+                return g_profiler.measure("full.ffn_down_residual", [&]() {
+                    return ffn.forward_fused_residual(
+                        ffn_input, residual_flat).reshape({B, T, H});
+                });
+            }
+        }
+        torch::Tensor ff;
+        if (official_bf16) {
+            auto ffn_input = xn.reshape({B * T, H});
+            auto gate_up = g_profiler.measure(
+                "full.minicpmo45_ffn_gate_up",
+                [&]() { return ffn.gate_up.forward(ffn_input); });
+            TORCH_CHECK(
+                gate_up.size() == 2,
+                "MiniCPM-o Qwen3 FFN requires separate Gate and Up outputs");
+            auto gate = gate_up[0].to(torch::kBFloat16).contiguous();
+            auto up = gate_up[1].to(torch::kBFloat16).contiguous();
+            auto activation = g_profiler.measure(
+                "full.minicpmo45_ffn_swiglu",
+                [&]() {
+                    return (torch::silu(gate) * up).contiguous();
+                });
+            ff = g_profiler.measure(
+                "full.minicpmo45_ffn_down",
+                [&]() { return ffn.down.forward(activation); })
+                .reshape({B, T, H})
+                .to(torch::kBFloat16)
+                .contiguous();
+        } else {
+            ff = ffn.forward(xn.reshape({B * T, H})).reshape({B, T, H});
+        }
+        auto output = g_profiler.measure("full.ffn_residual", [&]() {
             auto rr = residual.reshape({-1, H});
             auto ff2 = ff.reshape({-1, H});
+            if (!rr.is_cuda()) {
+                return (rr.to(torch::kFloat32) + ff2.to(torch::kFloat32))
+                    .to(rr.scalar_type()).reshape({B, T, H}).contiguous();
+            }
             const char * fp32_residual_env =
                 std::getenv("MFQ_DIAGNOSTIC_FP32_RESIDUAL");
             if (fp32_residual_env != nullptr &&
@@ -12597,8 +14177,13 @@ struct FullBlock : Block {
                 rr = rr.to(torch::kFloat32);
                 ff2 = ff2.to(torch::kFloat32);
             }
+            if (rr.scalar_type() == torch::kBFloat16 &&
+                    ff2.scalar_type() == torch::kBFloat16) {
+                return (rr + ff2).contiguous().reshape({B, T, H});
+            }
             return acc_cuda(rr, ff2).reshape({B, T, H});
         });
+        return output;
     }
 };
 
@@ -12725,7 +14310,11 @@ struct GlmDsaBlock : Block {
     torch::Tensor forward(
         torch::Tensor x, torch::Tensor pos, int64_t cache_pos,
         const c10::optional<torch::Tensor> & seq_len,
-        const Config & c, const RopeCache & rope) override {
+        const Config & c, const RopeCache & rope,
+        const c10::optional<torch::Tensor> & cache_positions = c10::nullopt,
+        const c10::optional<torch::Tensor> & attention_mask = c10::nullopt) override {
+        (void)cache_positions;
+        (void)attention_mask;
         const int64_t B = x.size(0);
         const int64_t T = x.size(1);
         const int64_t H = x.size(2);
@@ -12930,9 +14519,181 @@ struct LinearBlock : Block {
         gdn_state = torch::Tensor();
     }
 
+    torch::Tensor forward_cpu(torch::Tensor x, const Config & c) {
+        const int64_t B = x.size(0), T = x.size(1), H = x.size(2);
+        const int64_t nk = c.linear_num_key_heads;
+        const int64_t nv = c.linear_num_value_heads;
+        const int64_t dk = c.linear_key_head_dim;
+        const int64_t dv = c.linear_value_head_dim;
+        const int64_t ksz = c.linear_k_size();
+        const int64_t vsz = c.linear_v_size();
+        const int64_t conv_dim = 2 * ksz + vsz;
+        if (!conv_state.defined()) {
+            auto f32 = torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32);
+            conv_state = torch::zeros(
+                {B, c.linear_conv_kernel_dim - 1, conv_dim}, f32);
+            gdn_state = torch::zeros({B, nv, dv, dv}, f32);
+        }
+
+        auto residual = x;
+        auto xn = qwen_rms_norm(
+            x.reshape({B * T, H}).to(torch::kFloat32),
+            attn_norm, c).reshape({B, T, H});
+        torch::Tensor qkv, qk_part, v_part, z, alpha_raw, beta_raw;
+        if (dense_ab_tail) {
+            auto parts = in_proj.forward(xn);
+            qkv = parts[0].to(torch::kFloat32);
+            z = parts[1];
+            auto ab = ab_proj.forward(xn);
+            alpha_raw = ab[0];
+            beta_raw = ab[1];
+        } else if (split_in_proj) {
+            if (split_dense_zab) {
+                auto qkv_parts = qkv_proj.forward(xn);
+                qk_part = qkv_parts[0];
+                v_part = qkv_parts[1];
+                auto zab = zab_proj.forward(xn);
+                z = zab[0];
+                alpha_raw = zab[1];
+                beta_raw = zab[2];
+            } else {
+                auto qkv_parts = qkv_proj.forward(xn);
+                qk_part = qkv_parts[0];
+                v_part = qkv_parts[1];
+                z = z_proj.forward(xn);
+                auto ab = ab_is_nint
+                    ? ab_nint_proj.forward(xn)
+                    : ab_proj.forward(xn);
+                alpha_raw = ab[0];
+                beta_raw = ab[1];
+            }
+            qkv = torch::cat(
+                {qk_part.to(torch::kFloat32), v_part.to(torch::kFloat32)}, -1);
+        } else {
+            auto parts = in_proj.forward(xn);
+            qkv = parts[0].to(torch::kFloat32);
+            z = parts[1];
+            alpha_raw = parts[2];
+            beta_raw = parts[3];
+        }
+
+        auto beta = torch::sigmoid(
+            beta_raw.to(torch::kFloat32).reshape({B, T, nv}));
+        auto alpha = alpha_raw.to(torch::kFloat32).reshape({B, T, nv});
+        auto gate = torch::softplus(
+            alpha + dt_bias.to(torch::kFloat32).reshape({1, 1, nv}));
+        auto coefficient = -torch::exp(a_log.to(torch::kFloat32));
+        gate = gate * coefficient.reshape({1, 1, nv});
+
+        auto conv_input = torch::cat({conv_state, qkv}, 1);
+        conv_state.copy_(conv_input.narrow(
+            1, conv_input.size(1) - (c.linear_conv_kernel_dim - 1),
+            c.linear_conv_kernel_dim - 1));
+        auto weight = conv_weight.to(torch::kFloat32);
+        if (weight.dim() == 3) weight = weight.squeeze(1);
+        if (weight.dim() != 2) {
+            throw std::runtime_error("CPU SSM convolution weight must be rank 2 or 3");
+        }
+        if (weight.size(0) != conv_dim && weight.size(1) == conv_dim) {
+            weight = weight.transpose(0, 1).contiguous();
+        }
+        TORCH_CHECK(
+            weight.size(0) == conv_dim &&
+            weight.size(1) == c.linear_conv_kernel_dim,
+            "CPU SSM convolution geometry mismatch");
+        auto windows = conv_input.unfold(
+            1, c.linear_conv_kernel_dim, 1);
+        auto conv = (windows * weight.reshape(
+            {1, 1, conv_dim, c.linear_conv_kernel_dim})).sum(-1);
+        if (conv_bias.defined()) {
+            conv = conv + conv_bias.to(torch::kFloat32).reshape({1, 1, conv_dim});
+        }
+        conv = torch::silu(conv);
+
+        auto q = conv.narrow(-1, 0, ksz)
+            .reshape({B, T, nk, dk}).transpose(1, 2).contiguous();
+        auto k = conv.narrow(-1, ksz, ksz)
+            .reshape({B, T, nk, dk}).transpose(1, 2).contiguous();
+        auto v = conv.narrow(-1, 2 * ksz, vsz)
+            .reshape({B, T, nv, dv}).transpose(1, 2).contiguous();
+        q = q / torch::sqrt(q.square().sum(-1, true))
+            .clamp_min(c.rms_norm_eps);
+        k = k / torch::sqrt(k.square().sum(-1, true))
+            .clamp_min(c.rms_norm_eps);
+        if (nk != nv) {
+            TORCH_CHECK(nv % nk == 0, "CPU GDN head ratio is invalid");
+            const int64_t repeat = nv / nk;
+            if (tiled_v_heads) {
+                q = q.repeat({1, repeat, 1, 1});
+                k = k.repeat({1, repeat, 1, 1});
+            } else {
+                q = q.repeat_interleave(repeat, 1);
+                k = k.repeat_interleave(repeat, 1);
+            }
+        }
+
+        auto gate_t = gate.transpose(1, 2).contiguous();
+        auto beta_t = beta.transpose(1, 2).contiguous();
+        auto state = gdn_state;
+        std::vector<torch::Tensor> outputs;
+        outputs.reserve(static_cast<size_t>(T));
+        const double retrieve_scale = 1.0 / std::sqrt(static_cast<double>(dk));
+        for (int64_t token = 0; token < T; ++token) {
+            auto qt = q.select(2, token);
+            auto kt = k.select(2, token);
+            auto vt = v.select(2, token);
+            state = state * torch::exp(gate_t.select(2, token))
+                .reshape({B, nv, 1, 1});
+            auto state_k = torch::matmul(
+                state.transpose(-1, -2), kt.unsqueeze(-1)).squeeze(-1);
+            auto delta = (vt - state_k) *
+                beta_t.select(2, token).unsqueeze(-1);
+            state = state + kt.unsqueeze(-1) * delta.unsqueeze(-2);
+            outputs.push_back(
+                torch::matmul(
+                    state.transpose(-1, -2), qt.unsqueeze(-1))
+                    .squeeze(-1) * retrieve_scale);
+        }
+        gdn_state = state.contiguous();
+        auto y = torch::stack(outputs, 2);
+        z = z.reshape({B, T, nv, dv}).transpose(1, 2).contiguous();
+        auto y_flat = y.reshape({-1, dv}).to(torch::kFloat32);
+        auto inverse = torch::rsqrt(
+            y_flat.square().mean(-1, true) + c.rms_norm_eps);
+        auto y_norm = (y_flat * inverse *
+            linear_norm.to(torch::kFloat32)).reshape_as(y);
+        auto yf = y_norm.transpose(1, 2).contiguous().reshape({B, T, vsz});
+        auto zf = z.transpose(1, 2).contiguous().reshape({B, T, vsz});
+        torch::Tensor attention_output;
+        if (dense_out_proj) {
+            auto dtype = out_proj_dense.scalar_type();
+            auto gated = yf.to(dtype) * torch::silu(zf.to(dtype));
+            attention_output = torch::matmul(
+                gated.reshape({B * T, vsz}),
+                out_proj_dense.transpose(0, 1)).reshape({B, T, H});
+        } else {
+            attention_output = out_proj.forward_input_mul(yf, zf, 2);
+        }
+        x = (residual.to(torch::kFloat32) +
+            attention_output.to(torch::kFloat32))
+            .to(residual.scalar_type()).contiguous();
+        residual = x;
+        xn = qwen_rms_norm(
+            x.reshape({B * T, H}).to(torch::kFloat32),
+            ffn_norm, c).reshape({B, T, H});
+        auto ff = ffn.forward(xn.reshape({B * T, H})).reshape({B, T, H});
+        return (residual.to(torch::kFloat32) + ff.to(torch::kFloat32))
+            .to(residual.scalar_type()).contiguous();
+    }
+
     torch::Tensor forward(torch::Tensor x, torch::Tensor pos, int64_t cache_pos,
                           const c10::optional<torch::Tensor> & seq_len,
-                          const Config & c, const RopeCache & rope) override {
+                          const Config & c, const RopeCache & rope,
+                          const c10::optional<torch::Tensor> & cache_positions = c10::nullopt,
+                          const c10::optional<torch::Tensor> & attention_mask = c10::nullopt) override {
+        (void)cache_positions;
+        (void)attention_mask;
+        if (!x.is_cuda()) return forward_cpu(std::move(x), c);
         (void)seq_len;
         (void)pos; (void)cache_pos; (void)rope;
         int64_t B = x.size(0), T = x.size(1), H = x.size(2);
@@ -13129,7 +14890,15 @@ struct LinearBlock : Block {
         x = attn_pair[0].reshape({B, T, H});
         residual = x;
         xn = attn_pair[1].reshape({B, T, H});
-        auto ff = ffn.forward(xn.reshape({B * T, H})).reshape({B, T, H});
+        auto ffn_input = xn.reshape({B * T, H});
+        auto residual_flat = residual.reshape({B * T, H});
+        if (ffn.can_forward_fused_residual(ffn_input, residual_flat)) {
+            return g_profiler.measure("linear.ffn_down_residual", [&]() {
+                return ffn.forward_fused_residual(
+                    ffn_input, residual_flat).reshape({B, T, H});
+            });
+        }
+        auto ff = ffn.forward(ffn_input).reshape({B, T, H});
         return g_profiler.measure("linear.ffn_residual", [&]() {
             auto rr = residual.reshape({-1, H});
             auto ff2 = ff.reshape({-1, H});
@@ -13146,6 +14915,7 @@ struct LinearBlock : Block {
 };
 
 static void prepare_ffn_workspaces(FFN & f) {
+    if (g_loading_cpu_layer) return;
     if (f.down.tensor_parallel()) return;
     if (f.gate_up.nvq_prefix2 && f.gate_up.layers.size() == 2 && f.down.is_nvq() &&
         f.gate_up.outs.size() == 2 && f.gate_up.outs[0] == f.gate_up.outs[1] &&
@@ -13285,7 +15055,8 @@ static FFN load_ffn(const MfqFile & mfq, const Config & c, int i, bool gguf_name
         load_important_neuron_branch(
             mfq, c, f, down_name, gate_name, up_name);
     } else {
-        std::string p = "model.language_model.layers." + std::to_string(i) + ".mlp.";
+        std::string p = c.hf_model_prefix + "layers." +
+            std::to_string(i) + ".mlp.";
         const std::string expert_gate_up = p + "experts.gate_up_proj";
         const std::string expert_down = p + "experts.down_proj";
         if (mfq.records.count(expert_gate_up) || mfq.records.count(expert_down)) {
@@ -13338,7 +15109,7 @@ static FFN load_ffn(const MfqFile & mfq, const Config & c, int i, bool gguf_name
         f.down = load_quant_linear(mfq, down_name);
         f.gate_up = load_paired_gate_up(mfq, {
             gate_name, up_name},
-            f.down);
+            f.down, 2, c.is_minicpmo45());
         load_important_neuron_branch(
             mfq, c, f, down_name, gate_name, up_name);
     }
@@ -13850,7 +15621,8 @@ static std::unique_ptr<Block> load_block(
         }
         throw std::runtime_error("unsupported layer type: " + type);
     }
-    std::string lp = "model.language_model.layers." + std::to_string(i) + ".";
+    std::string lp = c.hf_model_prefix + "layers." +
+        std::to_string(i) + ".";
     if (type == "full_attention") {
         auto b = std::make_unique<FullBlock>();
         b->layer = i;
@@ -13858,7 +15630,8 @@ static std::unique_ptr<Block> load_block(
         b->ffn_norm = load_dense_gpu(mfq, lp + "post_attention_layernorm.weight");
         const std::string ap = lp + "self_attn.";
         b->qkv = load_quant_group(mfq, {
-            ap + "q_proj.weight", ap + "k_proj.weight", ap + "v_proj.weight"}, 2);
+            ap + "q_proj.weight", ap + "k_proj.weight", ap + "v_proj.weight"},
+            2, nullptr, c.is_minicpmo45());
         b->o = load_quant_linear(mfq, ap + "o_proj.weight");
         if (mfq.records.count(ap + "q_norm.weight")) b->q_norm = load_dense_gpu(mfq, ap + "q_norm.weight");
         if (mfq.records.count(ap + "k_norm.weight")) b->k_norm = load_dense_gpu(mfq, ap + "k_norm.weight");
@@ -13916,6 +15689,7 @@ static std::unique_ptr<Block> load_block(
 struct Model {
     Config c;
     RopeCache rope;
+    RopeCache cpu_rope;
     std::unordered_map<int, RopeCache> device_ropes;
     QuantLinear embed;
     std::vector<std::unique_ptr<Block>> blocks;
@@ -13928,33 +15702,39 @@ struct Model {
 
     torch::Tensor embed_forward(torch::Tensor ids) const {
         auto token_ids = ids.contiguous().to(torch::kCUDA, torch::kInt64);
+        torch::Tensor output;
         if (embed.is_dense()) {
             auto output_shape = token_ids.sizes().vec();
             output_shape.push_back(embed.dense.size(1));
-            return embed.dense.index_select(
+            output = embed.dense.index_select(
                 0, token_ids.reshape({-1})).reshape(output_shape);
-        }
-        if (embed.is_nvq()) {
-            return nvq_embedding(embed.nvq.w, token_ids);
-        }
-        TORCH_CHECK(
-            embed.is_nint(),
-            "MXFP8 token embeddings are not supported by the CUDA runtime");
-        if (embed.nint.w.q8_zero) {
-            return nint8_zero_embedding_lookup_cuda(
+        } else if (embed.is_nvq()) {
+            output = nvq_embedding(embed.nvq.w, token_ids);
+        } else {
+            TORCH_CHECK(
+                embed.is_nint(),
+                "MXFP8 token embeddings are not supported by the CUDA runtime");
+            if (embed.nint.w.q8_zero) {
+                output = nint8_zero_embedding_lookup_cuda(
                 embed.nint.w.q_packed, embed.nint.w.q8_zero_scale,
                 token_ids, embed.nint.w.neuron_len);
-        }
-        if (embed.nint.w.bits == 4) {
-            return nint_embedding_lookup_packed_compact_cuda(
+            } else if (embed.nint.w.bits == 4) {
+                output = nint_embedding_lookup_packed_compact_cuda(
                 embed.nint.w.q_packed, embed.nint.w.sub_scale, embed.nint.w.sub_min,
                 embed.nint.w.neuron_scale, embed.nint.w.neuron_min,
                 token_ids, embed.nint.w.neuron_len, embed.nint.w.gs);
+            } else {
+                output = nint_embedding_lookup_packed_compact_bits_cuda(
+                    embed.nint.w.q_packed, embed.nint.w.sub_scale,
+                    embed.nint.w.sub_min, embed.nint.w.neuron_scale,
+                    embed.nint.w.neuron_min, token_ids,
+                    embed.nint.w.neuron_len, embed.nint.w.gs,
+                    embed.nint.w.bits);
+            }
         }
-        return nint_embedding_lookup_packed_compact_bits_cuda(
-            embed.nint.w.q_packed, embed.nint.w.sub_scale, embed.nint.w.sub_min,
-            embed.nint.w.neuron_scale, embed.nint.w.neuron_min,
-            token_ids, embed.nint.w.neuron_len, embed.nint.w.gs, embed.nint.w.bits);
+        return c.is_minicpmo45()
+            ? output.to(torch::kBFloat16).contiguous()
+            : output;
     }
 
     void reset(int64_t B) {
@@ -13984,9 +15764,13 @@ struct Model {
             });
         }
         return g_profiler.measure("model.output_norm", [&]() {
-            return qwen_rms_norm(
-                x.reshape({B * T, c.hidden_size}).to(torch::kFloat32),
-                output_norm, c).reshape({B, T, c.hidden_size});
+            return c.is_minicpmo45()
+                ? qwen_rms_norm_bf16(
+                    x.reshape({B * T, c.hidden_size}), output_norm, c)
+                    .reshape({B, T, c.hidden_size})
+                : qwen_rms_norm(
+                    x.reshape({B * T, c.hidden_size}).to(torch::kFloat32),
+                    output_norm, c).reshape({B, T, c.hidden_size});
         });
     }
 
@@ -13999,12 +15783,83 @@ struct Model {
         ids = tensor_to_cuda_device(
             ids.to(torch::kInt64), primary);
         if (ids.dim() == 1) ids = ids.unsqueeze(0);
-        int64_t B = ids.size(0), T = ids.size(1);
-        if (cache_pos == 0) reset(B);
-        auto pos = pos_override.has_value()
-            ? pos_override.value()
-            : torch::arange(cache_pos, cache_pos + T, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kInt64));
         auto x = g_profiler.measure("model.embed", [&]() { return embed_forward(ids); });
+        return hidden_forward_inputs(
+            ids, x, pos_override, seq_len, block_trace);
+    }
+
+    torch::Tensor hidden_forward_inputs(
+            torch::Tensor ids,
+            torch::Tensor input_embeddings,
+            c10::optional<torch::Tensor> pos_override = c10::nullopt,
+            c10::optional<torch::Tensor> seq_len = c10::nullopt,
+            std::vector<torch::Tensor> * block_trace = nullptr,
+            c10::optional<torch::Tensor> attention_mask = c10::nullopt,
+            bool advance_cache_with_position_ids = false) {
+        const int primary = g_layer_placement.primary_device();
+        c10::cuda::CUDAGuard primary_guard(primary);
+        ids = tensor_to_cuda_device(
+            ids.to(torch::kInt64), primary);
+        if (ids.dim() == 1) ids = ids.unsqueeze(0);
+        if (input_embeddings.dim() != 3 ||
+                input_embeddings.size(0) != ids.size(0) ||
+                input_embeddings.size(1) != ids.size(1) ||
+                input_embeddings.size(2) != c.hidden_size) {
+            throw std::runtime_error(
+                "inputs_embeds shape must match [batch,tokens,hidden_size]");
+        }
+        const int64_t B = ids.size(0);
+        const int64_t T = ids.size(1);
+        if (cache_pos == 0) reset(B);
+        auto cache_positions = torch::arange(
+            cache_pos, cache_pos + T,
+            torch::TensorOptions().device(torch::kCUDA)
+                .dtype(torch::kInt64));
+        auto pos = pos_override.has_value()
+            ? tensor_to_cuda_device(
+                pos_override.value(), primary).to(torch::kInt64).contiguous()
+            : cache_positions;
+        if (!((pos.dim() == 1 && pos.numel() == T) ||
+              (pos.dim() == 2 && pos.size(0) == B && pos.size(1) == T))) {
+            throw std::runtime_error(
+                "position_ids must have shape [tokens] or [batch,tokens]");
+        }
+        if (attention_mask.has_value()) {
+            auto mask = attention_mask.value();
+            if (mask.dim() != 2 || mask.size(0) != B ||
+                    mask.size(1) < cache_pos + T) {
+                throw std::runtime_error(
+                    "attention_mask must cover [batch,cached_plus_current_tokens]");
+            }
+        }
+        auto effective_attention_mask = attention_mask;
+        if (c.is_minicpmo45() && attention_mask.has_value() &&
+                (T == 1 || cache_pos == 0) &&
+                attention_mask.value().eq(1).all().item<bool>()) {
+            effective_attention_mask = c10::nullopt;
+        }
+        torch::Tensor cpu_ids, cpu_pos, cpu_cache_positions;
+        c10::optional<torch::Tensor> cpu_attention_mask = c10::nullopt;
+        c10::optional<torch::Tensor> cpu_seq_len = c10::nullopt;
+        if (g_dense_cpu_layer_count > 0) {
+            cpu_ids = ids.to(torch::kCPU, torch::kInt64).contiguous();
+            cpu_pos = pos.to(torch::kCPU, torch::kInt64).contiguous();
+            cpu_cache_positions = cache_positions
+                .to(torch::kCPU, torch::kInt64).contiguous();
+            if (seq_len.has_value()) {
+                cpu_seq_len = seq_len.value()
+                    .to(torch::kCPU, torch::kInt64).contiguous();
+            }
+            if (effective_attention_mask.has_value()) {
+                cpu_attention_mask = effective_attention_mask.value()
+                    .to(torch::kCPU).contiguous();
+            }
+        }
+        auto x = tensor_to_cuda_device(
+            input_embeddings, primary).contiguous();
+        if (c.is_minicpmo45()) {
+            x = x.to(torch::kBFloat16).contiguous();
+        }
         if (c.is_gemma4()) {
             x = g_profiler.measure("model.embed_scale", [&]() {
                 return x * c.embed_scale;
@@ -14019,32 +15874,73 @@ struct Model {
         if (block_trace != nullptr) block_trace->push_back(x.to(torch::kFloat32).clone());
         for (auto & b : blocks) {
             c10::cuda::CUDAGuard block_guard(b->cuda_device);
-            auto local_ids = tensor_to_cuda_device(ids, b->cuda_device);
-            auto local_pos = tensor_to_cuda_device(pos, b->cuda_device);
+            auto local_ids = b->cpu_offloaded
+                ? cpu_ids
+                : tensor_to_cuda_device(ids, b->cuda_device);
+            auto local_pos = b->cpu_offloaded
+                ? cpu_pos
+                : tensor_to_cuda_device(pos, b->cuda_device);
+            c10::optional<torch::Tensor> local_cache_positions = c10::nullopt;
+            if (c.is_minicpmo45()) {
+                local_cache_positions = b->cpu_offloaded
+                    ? cpu_cache_positions
+                    : tensor_to_cuda_device(
+                        cache_positions, b->cuda_device);
+            }
             c10::optional<torch::Tensor> local_seq_len = c10::nullopt;
             if (seq_len.has_value()) {
-                local_seq_len = tensor_to_cuda_device(
-                    seq_len.value(), b->cuda_device);
+                local_seq_len = b->cpu_offloaded
+                    ? cpu_seq_len.value()
+                    : tensor_to_cuda_device(
+                        seq_len.value(), b->cuda_device);
             }
-            x = tensor_to_cuda_device(x, b->cuda_device);
+            c10::optional<torch::Tensor> local_attention_mask = c10::nullopt;
+            if (effective_attention_mask.has_value()) {
+                local_attention_mask = b->cpu_offloaded
+                    ? cpu_attention_mask.value()
+                    : tensor_to_cuda_device(
+                        effective_attention_mask.value(), b->cuda_device);
+            }
+            x = b->cpu_offloaded
+                ? x.to(torch::kCPU).contiguous()
+                : tensor_to_cuda_device(x, b->cuda_device);
             b->set_token_ids(local_ids);
-            const RopeCache & active_rope = device_ropes.empty()
-                ? rope : device_ropes.at(b->cuda_device);
+            const RopeCache & active_rope = b->cpu_offloaded
+                ? cpu_rope
+                : (device_ropes.empty()
+                    ? rope : device_ropes.at(b->cuda_device));
             x = b->forward(
-                x, local_pos, cache_pos, local_seq_len, c, active_rope);
+                x, local_pos, cache_pos, local_seq_len, c, active_rope,
+                local_cache_positions,
+                c.is_minicpmo45()
+                    ? local_attention_mask : c10::nullopt);
             if (block_trace != nullptr) {
                 block_trace->push_back(
                     tensor_to_cuda_device(x, primary)
                         .to(torch::kFloat32).clone());
             }
         }
-        if (!pos_override.has_value()) cache_pos += T;
+        if (!pos_override.has_value() || advance_cache_with_position_ids) {
+            cache_pos += T;
+        }
         x = tensor_to_cuda_device(x, primary);
         return finalize_hidden(x, B, T);
     }
 
+    torch::Tensor forward_inputs(
+            torch::Tensor ids,
+            torch::Tensor input_embeddings,
+            c10::optional<torch::Tensor> pos_override = c10::nullopt,
+            c10::optional<torch::Tensor> seq_len = c10::nullopt) {
+        return logits_from_hidden(hidden_forward_inputs(
+            ids, input_embeddings, pos_override, seq_len));
+    }
+
     torch::Tensor logits_from_hidden(torch::Tensor y) {
         auto logits = g_profiler.measure("model.lm_head", [&]() { return lm_head.forward(y); });
+        if (c.is_minicpmo45()) {
+            logits = logits.to(torch::kBFloat16).contiguous();
+        }
         if (c.final_logit_softcapping > 0.0) {
             logits = torch::tanh(logits / c.final_logit_softcapping) *
                 c.final_logit_softcapping;
@@ -14060,13 +15956,18 @@ struct Model {
         c10::optional<torch::Tensor> seq_len = c10::nullopt;
         const int64_t token_count = ids.dim() == 1 ? ids.size(0) : ids.size(1);
         const int64_t batch_size = ids.dim() == 1 ? 1 : ids.size(0);
-        if (cache_pos > 0 && token_count == 1) {
+        if (!c.is_minicpmo45() && cache_pos > 0 && token_count == 1) {
             seq_len = torch::full(
                 {batch_size}, cache_pos + 1,
                 torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
         }
         auto y = hidden_forward(ids, c10::nullopt, seq_len);
-        auto last = y.index({Slice(), -1, Slice()}).to(torch::kFloat16).contiguous();
+        auto last = y.index({Slice(), -1, Slice()});
+        if (c.is_minicpmo45()) {
+            return logits_from_hidden(
+                last.to(torch::kBFloat16).contiguous());
+        }
+        last = last.to(torch::kFloat16).contiguous();
         auto logits = lm_head.forward(last);
         if (c.final_logit_softcapping > 0.0) {
             logits = torch::tanh(logits / c.final_logit_softcapping) *
@@ -14077,7 +15978,12 @@ struct Model {
 
     torch::Tensor last_logits_static(torch::Tensor ids, torch::Tensor pos, torch::Tensor seq_len) {
         auto y = hidden_forward(ids, pos, seq_len);
-        auto last = y.index({Slice(), -1, Slice()}).to(torch::kFloat16).contiguous();
+        auto last = y.index({Slice(), -1, Slice()});
+        if (c.is_minicpmo45()) {
+            return logits_from_hidden(
+                last.to(torch::kBFloat16).contiguous());
+        }
+        last = last.to(torch::kFloat16).contiguous();
         auto logits = lm_head.forward(last);
         if (c.final_logit_softcapping > 0.0) {
             logits = torch::tanh(logits / c.final_logit_softcapping) *
@@ -14090,7 +15996,7 @@ struct Model {
         c10::optional<torch::Tensor> seq_len = c10::nullopt;
         const int64_t token_count = ids.dim() == 1 ? ids.size(0) : ids.size(1);
         const int64_t batch_size = ids.dim() == 1 ? 1 : ids.size(0);
-        if (cache_pos > 0 && token_count == 1) {
+        if (!c.is_minicpmo45() && cache_pos > 0 && token_count == 1) {
             seq_len = torch::full(
                 {batch_size}, cache_pos + 1,
                 torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
@@ -14105,7 +16011,13 @@ struct Model {
     }
 
     torch::Tensor next_token_from_hidden(torch::Tensor y) {
-        auto last = y.index({Slice(), -1, Slice()}).to(torch::kFloat16).contiguous();
+        auto last = y.index({Slice(), -1, Slice()});
+        if (c.is_minicpmo45()) {
+            auto logits = logits_from_hidden(
+                last.to(torch::kBFloat16).contiguous());
+            return torch::argmax(logits, -1).to(torch::kInt64);
+        }
+        last = last.to(torch::kFloat16).contiguous();
         const char* use_argmax = std::getenv("MFQ_LM_HEAD_ARGMAX");
         const char* disable_argmax = std::getenv("MFQ_DISABLE_LM_HEAD_ARGMAX");
         bool lm_head_argmax = (disable_argmax == nullptr || disable_argmax[0] != '1') ||
@@ -14153,6 +16065,36 @@ static Model load_model(const std::string & mfq_path, const std::string & config
     MfqFile mfq(mfq_path);
     m.c = load_config(mfq, config_path);
     g_layer_placement.prepare(m.c.num_hidden_layers);
+    g_dense_cpu_layer_count = 0;
+    if (g_n_gpu_layers >= 0) {
+        g_dense_cpu_layer_count = static_cast<int>(std::max<int64_t>(
+            m.c.num_hidden_layers - g_n_gpu_layers, 0));
+        if (g_dense_cpu_layer_count > 0) {
+            if (g_tensor_parallel.enabled() || g_layer_placement.enabled()) {
+                throw std::runtime_error(
+                    "--n-gpu-layers cannot be combined with tensor/layer parallelism");
+            }
+            const bool supported_architecture =
+                !m.c.is_dsv4() && !m.c.is_glm_dsa() && !m.c.is_gemma4() &&
+                m.c.num_experts <= 0 &&
+                std::all_of(
+                    m.c.layer_types.begin(), m.c.layer_types.end(),
+                    [](const std::string & type) {
+                        return type == "full_attention" ||
+                            type == "linear_attention";
+                    });
+            if (!supported_architecture) {
+                throw std::runtime_error(
+                    "--n-gpu-layers currently supports dense Qwen-style blocks only");
+            }
+            std::cerr << "dense_layer_placement cpu=0-"
+                      << (g_dense_cpu_layer_count - 1)
+                      << " gpu=" << g_dense_cpu_layer_count << '-'
+                      << (m.c.num_hidden_layers - 1)
+                      << " cpu_threads=" << at::get_num_threads()
+                      << std::endl;
+        }
+    }
     g_layer_placement.load_device =
         g_layer_placement.primary_device();
     c10::cuda::CUDAGuard model_guard(
@@ -14180,6 +16122,10 @@ static Model load_model(const std::string & mfq_path, const std::string & config
     }
     if (!m.c.is_gemma4() && !m.c.is_dsv4()) {
         m.rope = RopeCache(m.c);
+        if (g_dense_cpu_layer_count > 0) {
+            m.cpu_rope = RopeCache(
+                m.c, torch::Device(torch::kCPU));
+        }
         if (g_layer_placement.enabled()) {
             for (int device : g_layer_placement.devices) {
                 c10::cuda::CUDAGuard rope_guard(device);
@@ -14189,14 +16135,16 @@ static Model load_model(const std::string & mfq_path, const std::string & config
     }
     const bool gguf_names = mfq.records.count("token_embd.weight") != 0;
     m.c.norm_weight_offset =
-        (gguf_names || m.c.is_gemma4() || m.c.is_glm_dsa()) ? 0.0 : 1.0;
+        (gguf_names || m.c.is_gemma4() || m.c.is_glm_dsa() ||
+         m.c.is_minicpmo45()) ? 0.0 : 1.0;
     const std::string hf_prefix = m.c.is_glm_dsa()
-        ? "model." : "model.language_model.";
+        ? "model." : m.c.hf_model_prefix;
     const std::string embed_name = gguf_names
         ? "token_embd.weight" : hf_prefix + "embed_tokens.weight";
     const std::string norm_name = gguf_names
         ? "output_norm.weight" : hf_prefix + "norm.weight";
-    const std::string output_name = gguf_names ? "output.weight" : "lm_head.weight";
+    const std::string output_name = gguf_names
+        ? "output.weight" : m.c.hf_output_name;
     m.embed = load_quant_linear(mfq, embed_name);
     m.output_norm = load_dense_gpu(mfq, norm_name);
     if (m.c.is_dsv4()) {
@@ -14249,6 +16197,8 @@ static Model load_model(const std::string & mfq_path, const std::string & config
             dsv4_states;
         for (int i = 0; i < m.c.num_hidden_layers; ++i) {
             const int device = g_layer_placement.device_for_layer(i);
+            const bool cpu_offloaded = i < g_dense_cpu_layer_count;
+            g_loading_cpu_layer = cpu_offloaded;
             g_layer_placement.load_device = device;
             c10::cuda::CUDAGuard layer_guard(device);
             std::shared_ptr<GlmDsaSharedState> glm_state;
@@ -14263,14 +16213,18 @@ static Model load_model(const std::string & mfq_path, const std::string & config
                 if (!state) state = std::make_shared<Dsv4SharedState>();
                 dsv4_state = state;
             }
-            std::cerr << "loading layer " << i << " " << m.c.layer_types[(size_t)i] << std::endl;
+            std::cerr << "loading layer " << i << " "
+                      << m.c.layer_types[(size_t)i] << ' '
+                      << (cpu_offloaded ? "CPU" : "CUDA") << std::endl;
             auto block = load_block(
                 mfq, m.c, i, m.c.layer_types[(size_t)i], gguf_names,
                 glm_state, dsv4_state);
             block->cuda_device = device;
+            block->cpu_offloaded = cpu_offloaded;
             m.blocks.push_back(std::move(block));
         }
     }
+    g_loading_cpu_layer = false;
     g_layer_placement.load_device =
         g_layer_placement.primary_device();
     if (g_moe_expert_cache &&
@@ -14280,6 +16234,8 @@ static Model load_model(const std::string & mfq_path, const std::string & config
     }
     return m;
 }
+
+#include "minicpmo45_runtime.inc"
 
 static std::vector<int64_t> parse_ids(const std::string & s) {
     std::vector<int64_t> ids;
@@ -14642,7 +16598,24 @@ static int run_block_trace_compare(
     int64_t context_size,
     torch::Tensor ids)
 {
-    Model reference = load_model(reference_mfq, config_path, context_size);
+    Model reference = [&]() {
+        if (g_n_gpu_layers < 0) {
+            return load_model(reference_mfq, config_path, context_size);
+        }
+        const int saved_n_gpu_layers = g_n_gpu_layers;
+        const int saved_cpu_layers = g_dense_cpu_layer_count;
+        g_n_gpu_layers = -1;
+        try {
+            auto loaded = load_model(reference_mfq, config_path, context_size);
+            g_n_gpu_layers = saved_n_gpu_layers;
+            g_dense_cpu_layer_count = saved_cpu_layers;
+            return loaded;
+        } catch (...) {
+            g_n_gpu_layers = saved_n_gpu_layers;
+            g_dense_cpu_layer_count = saved_cpu_layers;
+            throw;
+        }
+    }();
     std::vector<torch::Tensor> test_trace;
     std::vector<torch::Tensor> reference_trace;
 
@@ -15028,11 +17001,12 @@ static torch::Tensor sample_server_token(
     torch::Tensor random_host,
     torch::Tensor random_cuda,
     std::mt19937_64 & rng,
+    const MfqTokenConstraintPtr & token_constraint,
     cudaEvent_t prefill_finished = nullptr)
 {
     const bool greedy = sampling.temperature <= 0.0 || sampling.top_k == 1;
     const bool has_penalties = sampling_has_penalties(sampling);
-    if (greedy && !has_penalties) {
+    if (greedy && !has_penalties && !token_constraint) {
         auto next = model.next_token(ids);
         if (prefill_finished != nullptr) {
             MFQ_CUDA_CHECK(cudaEventRecord(
@@ -15051,16 +17025,40 @@ static torch::Tensor sample_server_token(
             logits, counts, sampling.presence_penalty,
             sampling.frequency_penalty, sampling.repetition_penalty);
     }
-    if (greedy) return sample_greedy_cuda(logits);
-
     std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
-    *random_host.data_ptr<float>() = uniform(rng);
-    random_cuda.copy_(random_host, true);
-    if (sampling.top_k > 0) {
-        return sample_top_k_top_p_cuda(
-            logits, random_cuda, sampling.temperature, sampling.top_k, sampling.top_p);
+    const auto sample_logits = [&](torch::Tensor candidate_logits) {
+        if (greedy) return sample_greedy_cuda(candidate_logits);
+        *random_host.data_ptr<float>() = uniform(rng);
+        random_cuda.copy_(random_host, true);
+        if (sampling.top_k > 0) {
+            return sample_top_k_top_p_cuda(
+                candidate_logits, random_cuda, sampling.temperature,
+                sampling.top_k, sampling.top_p);
+        }
+        return sample_softmax_cuda(
+            candidate_logits, random_cuda, sampling.temperature);
+    };
+
+    auto next = sample_logits(logits);
+    if (token_constraint && token_constraint->allows &&
+        !token_constraint->allows(next.item<int64_t>())) {
+        auto masked = logits
+            .to(torch::kCPU, torch::kFloat32)
+            .contiguous();
+        token_constraint->apply(
+            masked.data_ptr<float>(),
+            static_cast<std::size_t>(masked.numel()));
+        next = sample_logits(masked.to(logits.device()));
+        const int64_t constrained_token = next.item<int64_t>();
+        if (!token_constraint->allows(constrained_token)) {
+            throw std::runtime_error(
+                "CUDA constrained sampler returned an invalid token");
+        }
     }
-    return sample_softmax_cuda(logits, random_cuda, sampling.temperature);
+    if (token_constraint && token_constraint->accept) {
+        token_constraint->accept(next.item<int64_t>());
+    }
+    return next;
 }
 
 class ServerPrefillCudaTimer {
@@ -15109,7 +17107,8 @@ static int32_t generate_server_tokens(
     const std::vector<int64_t> & prompt,
     const MfqSamplingParams & sampling,
     const MfqTokenCallback & on_token,
-    const MfqPrefillCallback & on_prefill)
+    const MfqPrefillCallback & on_prefill,
+    const MfqTokenConstraintPtr & token_constraint)
 {
     std::lock_guard<std::mutex> lock(model_mutex);
     model.reset(1);
@@ -15132,6 +17131,7 @@ static int32_t generate_server_tokens(
         ServerPrefillCudaTimer prefill_timer;
         auto next = sample_server_token(
             model, ids, sampling, counts, random_host, random_cuda, rng,
+            token_constraint,
             prefill_timer.finished_event());
         const int64_t token = next.item<int64_t>();
         const double prefill_ms = prefill_timer.elapsed_ms();
@@ -15225,13 +17225,18 @@ static int32_t generate_server_tokens(
     const bool graph_enabled =
         (graph_env == nullptr || graph_env[0] != '0') &&
         g_dsv4_cpu_offload_layers.empty() &&
+        g_dense_cpu_layer_count == 0 &&
         !g_moe_expert_cache &&
         !g_tensor_parallel.enabled();
     const char * graph_min_env = std::getenv("MFQ_SERVER_CUDA_GRAPH_MIN_TOKENS");
     const int32_t graph_min_tokens = graph_min_env != nullptr
         ? std::max<int32_t>(2, std::atoi(graph_min_env))
         : 16;
+    // Grammar state advances on the CPU and may require a one-off full-logit
+    // mask, so constrained requests cannot be replayed as a fixed CUDA graph.
+    // Unconstrained decode keeps the existing graph fast path unchanged.
     const bool graph_eligible = graph_enabled && !reprefill &&
+        !token_constraint &&
         sampling.max_tokens >= graph_min_tokens &&
         sampling.max_tokens <= graph_cache.generated_capacity;
     if (graph_eligible) {
@@ -15374,7 +17379,8 @@ static int32_t generate_server_tokens(
             token = first.second;
         } else {
             next = sample_server_token(
-                model, ids, sampling, counts, random_host, random_cuda, rng);
+                model, ids, sampling, counts, random_host, random_cuda, rng,
+                token_constraint);
             token = next.item<int64_t>();
         }
         ++generated;
@@ -15605,6 +17611,13 @@ static int run_kl_eval(
         ? available_chunks
         : std::min(max_chunks, available_chunks);
     if (chunks <= 0) throw std::runtime_error("KL evaluation requires at least one chunk");
+    for (int ci = 0; ci < chunks; ++ci) {
+        if ((int64_t)eval_chunks[(size_t)ci].tokens.size() >
+                model.c.max_position_embeddings) {
+            throw std::runtime_error(
+                "KL reference exceeds model context capacity");
+        }
+    }
     const int64_t execution_n_batch =
         (int64_t)eval_chunks[0].tokens.size();
     if (reference_contract.n_batch != 0) {
@@ -16060,6 +18073,10 @@ static int run_kl_eval_batched(
         ? (reference_contract.n_batch == 0
               ? n_ctx : reference_contract.n_batch)
         : requested_n_batch;
+    if (n_ctx > model.c.max_position_embeddings) {
+        throw std::runtime_error(
+            "KL reference exceeds model context capacity");
+    }
     if (n_ctx <= 0 || n_batch < n_ctx || n_batch % n_ctx != 0) {
         throw std::runtime_error(
             "optimized KL requires --kl-n-batch to be at least n_ctx "
@@ -16634,6 +18651,69 @@ static int run_linear_check(
     std::cout << "production_rel=" << ((y_test - y_ref).norm() / y_ref.norm()).item<float>() << "\n";
     std::cout << "production_mean_abs=" << diff.mean().item<float>() << "\n";
     std::cout << "production_max_abs=" << diff.max().item<float>() << "\n";
+    return 0;
+}
+
+static int run_cpu_linear_check(
+        const std::string & mfq_path,
+        const std::string & name,
+        int rows,
+        int gate_mode,
+        int reps) {
+    TORCH_CHECK(rows >= 1 && rows <= 4096, "--check-linear-m must be in [1, 4096]");
+    TORCH_CHECK(reps >= 1, "--check-linear-reps must be positive");
+    MfqFile mfq(mfq_path);
+    g_loading_cpu_layer = true;
+    auto cpu_linear = load_quant_linear(mfq, name);
+    g_loading_cpu_layer = false;
+    auto cuda_linear = load_quant_linear(mfq, name);
+    const int64_t width = cpu_linear.neuron_len();
+    auto x = torch::arange(
+        static_cast<int64_t>(rows) * width,
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32))
+        .reshape({rows, width});
+    x = ((x.remainder(97) - 48) / 512.0)
+        .to(torch::kFloat16).contiguous();
+    torch::Tensor gate;
+    if (gate_mode != 0) {
+        TORCH_CHECK(gate_mode == 1 || gate_mode == 2, "linear check gate mode must be 0, 1, or 2");
+        gate = ((torch::arange(
+            static_cast<int64_t>(rows) * width,
+            torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32))
+            .reshape({rows, width}).remainder(53) - 26) / 16.0)
+            .to(torch::kFloat16).contiguous();
+    }
+    auto run_cpu = [&]() {
+        return gate_mode == 0
+            ? cpu_linear.forward(x)
+            : cpu_linear.forward_input_mul(x, gate, gate_mode);
+    };
+    torch::Tensor actual = run_cpu();
+    const auto start = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < reps; ++iteration) {
+        actual = run_cpu();
+    }
+    const auto end = std::chrono::steady_clock::now();
+    const double cpu_ms = std::chrono::duration<double, std::milli>(
+        end - start).count() / static_cast<double>(reps);
+
+    auto cuda_x = x.to(torch::kCUDA).contiguous();
+    torch::Tensor cuda_gate;
+    if (gate_mode != 0) cuda_gate = gate.to(torch::kCUDA).contiguous();
+    auto reference = gate_mode == 0
+        ? cuda_linear.forward(cuda_x)
+        : cuda_linear.forward_input_mul(cuda_x, cuda_gate, gate_mode);
+    torch::cuda::synchronize();
+    reference = reference.to(torch::kCPU, torch::kFloat32).contiguous();
+    actual = actual.to(torch::kFloat32).contiguous();
+    auto difference = (actual - reference).abs();
+    std::cout << "cpu_linear=" << name << "\n"
+              << "shape=" << actual.sizes() << "\n"
+              << "cpu_ms=" << cpu_ms << "\n"
+              << "relative_error="
+              << ((actual - reference).norm() / reference.norm()).item<float>() << "\n"
+              << "mean_abs=" << difference.mean().item<float>() << "\n"
+              << "max_abs=" << difference.max().item<float>() << "\n";
     return 0;
 }
 
@@ -17318,6 +19398,7 @@ static int run_gemma_geglu_check(
               << " quant_ms=" << quant_ms << "\n";
     return 0;
 }
+
 
 static double nint_moe_weight_bytes(const NintMoeWeight & weight) {
     double bytes = static_cast<double>(weight.mixed_weight_bytes);
@@ -19466,7 +21547,8 @@ int main(int argc, char ** argv) {
     } tensor_parallel_collective_cleanup;
     try {
         std::string mfq_path, config_path, ids_arg, ids_file;
-        std::string check_linear, check_linear_gate, kl_base;
+        std::string minicpmo_input_prefix, minicpmo_output_prefix;
+        std::string check_linear, check_linear_cpu, check_linear_gate, kl_base;
         std::string kl_save_logits_f16;
         std::string check_tp_linear;
         std::string check_tp_moe;
@@ -19494,8 +21576,10 @@ int main(int argc, char ** argv) {
         std::string layer_split_arg;
         double moe_gpu_cache_gb = 0.0;
         int gen = 16;
+        int cpu_threads = 0;
         int server_port = 8080;
         int64_t context_size = 0;
+        int64_t minicpmo_tts_steps = 0;
         int kl_chunks = -1;
         int kl_score_count = -1;
         int64_t kl_n_batch = 0;
@@ -19555,13 +21639,27 @@ int main(int argc, char ** argv) {
         bool check_runtime_assets = false;
         bool check_mfq_container = false;
         bool kl_allow_overlays = false;
+        bool n_gpu_layers_set = false;
+        bool cpu_threads_set = false;
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
             if (a == "--mfq" && i + 1 < argc) mfq_path = argv[++i];
             else if (a == "--config" && i + 1 < argc) config_path = argv[++i];
             else if (a == "--ids" && i + 1 < argc) ids_arg = argv[++i];
             else if (a == "--ids-file" && i + 1 < argc) ids_file = argv[++i];
+            else if (a == "--minicpmo-input-prefix" && i + 1 < argc) {
+                minicpmo_input_prefix = argv[++i];
+            }
+            else if (a == "--minicpmo-output-prefix" && i + 1 < argc) {
+                minicpmo_output_prefix = argv[++i];
+            }
+            else if (a == "--minicpmo-tts-steps" && i + 1 < argc) {
+                minicpmo_tts_steps = std::stoll(argv[++i]);
+            }
             else if (a == "--check-linear" && i + 1 < argc) check_linear = argv[++i];
+            else if (a == "--check-linear-cpu" && i + 1 < argc) {
+                check_linear_cpu = argv[++i];
+            }
             else if (a == "--check-tp-linear" && i + 1 < argc) {
                 check_tp_linear = argv[++i];
             }
@@ -19684,12 +21782,20 @@ int main(int argc, char ** argv) {
             else if (a == "--prefill-sweep" && i + 1 < argc) prefill_sweep_arg = argv[++i];
             else if (a == "--prefill-sweep-reps" && i + 1 < argc) prefill_sweep_reps = std::stoi(argv[++i]);
             else if (a == "--gen" && i + 1 < argc) gen = std::stoi(argv[++i]);
+            else if ((a == "--threads" || a == "-t") && i + 1 < argc) {
+                cpu_threads = std::stoi(argv[++i]);
+                cpu_threads_set = true;
+            }
             else if (a == "--server") server_mode = true;
             else if (a == "--host" && i + 1 < argc) server_host = argv[++i];
             else if (a == "--port" && i + 1 < argc) server_port = std::stoi(argv[++i]);
             else if (a == "--ctx-size" && i + 1 < argc) context_size = std::stoll(argv[++i]);
             else if (a == "--cpu-offload-layers" && i + 1 < argc) {
                 cpu_offload_layers_arg = argv[++i];
+            }
+            else if ((a == "--n-gpu-layers" || a == "-ngl") && i + 1 < argc) {
+                g_n_gpu_layers = std::stoi(argv[++i]);
+                n_gpu_layers_set = true;
             }
             else if (a == "--moe-gpu-cache-gb" && i + 1 < argc) {
                 moe_gpu_cache_gb = std::stod(argv[++i]);
@@ -19734,7 +21840,7 @@ int main(int argc, char ** argv) {
                              "[--host 127.0.0.1 --port 8080 --ctx-size 32768 --model-name name "
                              "--tensor-parallel 0,1 --tensor-split 1,1 "
                              "--layer-parallel 0,1 --layer-split 1,1 "
-                             "--cpu-offload-layers 0-7,12 --moe-gpu-cache-gb 8 "
+                             "--n-gpu-layers 60 --threads 32 --cpu-offload-layers 0-7,12 --moe-gpu-cache-gb 8 "
                              "--moe-cache-profile profile.json "
                              "--api-key key --web-root path] | --kl-base reference.bin "
                              "[--kl-evaluator optimized|legacy --kl-chunks -1 "
@@ -19748,12 +21854,25 @@ int main(int argc, char ** argv) {
         }
         g_nint6_mmq_mode =
             parse_nint6_mmq_mode(nint6_mmq_arg);
+        if (cpu_threads_set && cpu_threads <= 0) {
+            throw std::runtime_error("--threads must be positive");
+        }
+        if (cpu_threads > 0) {
+            at::set_num_threads(cpu_threads);
+        }
         configure_tensor_parallel(
             tensor_parallel_arg,
             tensor_split_arg,
             tensor_parallel_test_duplicates);
         configure_layer_placement(
             layer_parallel_arg, layer_split_arg);
+        if (n_gpu_layers_set && g_n_gpu_layers < 0) {
+            throw std::runtime_error("--n-gpu-layers must be non-negative");
+        }
+        if (n_gpu_layers_set && !cpu_offload_layers_arg.empty()) {
+            throw std::runtime_error(
+                "--n-gpu-layers cannot be combined with --cpu-offload-layers");
+        }
         if (moe_gpu_cache_gb < 0.0 ||
                 !std::isfinite(moe_gpu_cache_gb)) {
             throw std::runtime_error(
@@ -19796,6 +21915,20 @@ int main(int argc, char ** argv) {
                         moe_cache_profile_path));
             }
             g_mfq_drop_file_cache = true;
+        }
+        if (!check_linear_cpu.empty()) {
+            if (mfq_path.empty()) {
+                throw std::runtime_error("--check-linear-cpu requires --mfq");
+            }
+            int gate_mode = 0;
+            if (check_linear_gate == "sigmoid") gate_mode = 1;
+            else if (check_linear_gate == "silu") gate_mode = 2;
+            else if (!check_linear_gate.empty()) {
+                throw std::runtime_error("--check-linear-gate must be sigmoid or silu");
+            }
+            return run_cpu_linear_check(
+                mfq_path, check_linear_cpu, check_linear_m,
+                gate_mode, check_linear_reps);
         }
         if (!check_linear.empty()) {
             if (mfq_path.empty()) throw std::runtime_error("--check-linear requires --mfq");
@@ -19994,6 +22127,27 @@ int main(int argc, char ** argv) {
         }
         if (check_dsv4_hc) {
             return run_dsv4_hc_check(check_attention_reps);
+        }
+        if (!minicpmo_input_prefix.empty()) {
+            if (mfq_path.empty() || minicpmo_output_prefix.empty()) {
+                throw std::runtime_error(
+                    "--minicpmo-input-prefix requires --mfq and "
+                    "--minicpmo-output-prefix");
+            }
+            if (server_mode || !ids_arg.empty() || !ids_file.empty() ||
+                    !kl_base.empty() || !prefill_sweep_arg.empty()) {
+                throw std::runtime_error(
+                    "MiniCPM-o composite mode cannot be combined with "
+                    "token, server, KL, or prefill modes");
+            }
+            if (minicpmo_tts_steps < 0) {
+                throw std::runtime_error(
+                    "--minicpmo-tts-steps must be non-negative");
+            }
+            return run_minicpmo45_composite(
+                mfq_path, config_path,
+                minicpmo_input_prefix, minicpmo_output_prefix,
+                context_size, minicpmo_tts_steps);
         }
         if (mfq_path.empty() ||
             (!server_mode && ids_arg.empty() && ids_file.empty() &&
@@ -20251,10 +22405,11 @@ int main(int argc, char ** argv) {
                                    const MfqSamplingParams & sampling,
                                    const MfqTokenCallback & on_token,
                                    const MfqPrefillCallback & on_prefill,
-                                   const MfqPromptCachePlan &) {
+                                   const MfqPromptCachePlan &,
+                                   const MfqTokenConstraintPtr & token_constraint) {
                 return generate_server_tokens(
                     model, model_mutex, decode_graph_cache, prompt, sampling,
-                    on_token, on_prefill);
+                    on_token, on_prefill, token_constraint);
             });
             if (g_moe_expert_cache) {
                 g_moe_expert_cache->print_stats(std::cout);
@@ -20596,6 +22751,7 @@ int main(int argc, char ** argv) {
         bool use_cuda_graph =
             (graph_env == nullptr || graph_env[0] != '0') &&
             g_dsv4_cpu_offload_layers.empty() &&
+            g_dense_cpu_layer_count == 0 &&
             !g_moe_expert_cache &&
             !g_tensor_parallel.enabled() &&
             (!profile || profile_cuda_graph) && gen > 1;

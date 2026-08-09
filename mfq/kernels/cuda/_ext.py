@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 _DIR = os.path.dirname(__file__)
+_REPOSITORY_ROOT = str(Path(_DIR).resolve().parents[2])
 _SOURCES = [
     os.path.join(_DIR, "norm.cu"),
     os.path.join(_DIR, "acc.cu"),
@@ -80,6 +81,7 @@ def ext():
         _module = load(
             name="mfq_cuda",
             sources=_SOURCES,
+            extra_include_paths=[_REPOSITORY_ROOT],
             extra_cuda_cflags=["-O3", "--use_fast_math"],
             extra_ldflags=["cublas.lib"] if os.name == "nt" else ["-lcublas"],
             verbose=False,

@@ -468,7 +468,7 @@ MoeFixture make_mixed_moe(
     };
 }
 
-MoeFixture make_cccp_moe(
+MoeFixture make_tpq_moe(
     int output,
     int input,
     int salt,
@@ -486,10 +486,10 @@ MoeFixture make_cccp_moe(
         int bits;
     };
     const std::array<Profile, kExperts> profiles{{
-        {"CCCP-X", 1, 8, 256, 8},
-        {"CCCP-W", 2, 8, 4096, 12},
-        {"CCCP-V", 3, 4, 256, 14},
-        {"CCCP-VV", 4, 4, 4096, 16},
+        {"TPQ-X", 1, 8, 256, 8},
+        {"TPQ-W", 2, 8, 4096, 12},
+        {"TPQ-V", 3, 4, 256, 14},
+        {"TPQ-VV", 4, 4, 4096, 16},
     }};
     std::vector<std::uint8_t> blob{
         'N', 'I', 'M', '2',
@@ -503,7 +503,7 @@ MoeFixture make_cccp_moe(
         true);
     require(
         pool_count > 0,
-        "CCCP MoE fixture requires an expert");
+        "TPQ MoE fixture requires an expert");
     append<std::uint32_t>(
         blob,
         static_cast<std::uint32_t>(
@@ -527,7 +527,7 @@ MoeFixture make_cccp_moe(
                     expert)];
         require(
             input % profile.vector_size == 0,
-            "CCCP MoE fixture vector mismatch");
+            "TPQ MoE fixture vector mismatch");
         const int blocks =
             input / profile.vector_size;
         std::vector<float> codebook(
@@ -787,19 +787,19 @@ MoeFixture concatenate_gate_up_reference(
     return result;
 }
 
-SplitModelFixture make_split_model_fixture(bool cccp) {
+SplitModelFixture make_split_model_fixture(bool tpq) {
     auto reference = make_model_fixture();
-    auto gate = cccp
-        ? make_cccp_moe(kIntermediate, kHidden, 31)
+    auto gate = tpq
+        ? make_tpq_moe(kIntermediate, kHidden, 31)
         : make_mixed_moe(kIntermediate, kHidden, 5);
-    auto up = cccp
-        ? make_cccp_moe(kIntermediate, kHidden, 37)
+    auto up = tpq
+        ? make_tpq_moe(kIntermediate, kHidden, 37)
         : make_mixed_moe(kIntermediate, kHidden, 8);
     reference.routed_gate_up =
         concatenate_gate_up_reference(gate, up);
-    if (cccp) {
+    if (tpq) {
         reference.routed_down =
-            make_cccp_moe(kHidden, kIntermediate, 43);
+            make_tpq_moe(kHidden, kIntermediate, 43);
     }
     return {
         std::move(reference),
@@ -1825,7 +1825,7 @@ void test_split_gate_up_streamed_load_and_forward() {
         "deepseek_v4-ew-mfq");
     const mfq::metal::MfqContainer model(file.path());
     auto residency =
-        std::make_shared<mfq::metal::MlxCccpExpertResidency>(
+        std::make_shared<mfq::metal::MlxTpqExpertResidency>(
             model,
             0,
             kExperts);
@@ -1838,7 +1838,7 @@ void test_split_gate_up_streamed_load_and_forward() {
         residency);
     require(
         moe.uses_streamed_experts(),
-        "split CCCP Gate/Up did not select streamed residency");
+        "split TPQ Gate/Up did not select streamed residency");
 
     const auto run = [&](int rows, int salt) {
         const auto input = input_values(rows, salt);
@@ -1899,15 +1899,15 @@ void test_split_gate_up_requires_pair() {
         "DeepSeek-V4 accepted an incomplete split Gate/Up pair");
 }
 
-void test_streamed_cccp_load_and_forward() {
+void test_streamed_tpq_load_and_forward() {
     auto fixture = make_model_fixture();
     fixture.routed_gate_up =
-        make_cccp_moe(
+        make_tpq_moe(
             2 * kIntermediate,
             kHidden,
             31);
     fixture.routed_down =
-        make_cccp_moe(
+        make_tpq_moe(
             kHidden,
             kIntermediate,
             43);
@@ -1920,7 +1920,7 @@ void test_streamed_cccp_load_and_forward() {
     auto residency =
         std::make_shared<
             mfq::metal::
-                MlxCccpExpertResidency>(
+                MlxTpqExpertResidency>(
             model,
             0,
             kExperts);
@@ -1934,7 +1934,7 @@ void test_streamed_cccp_load_and_forward() {
     require(
         moe.uses_streamed_experts(),
         "DeepSeek-V4 MoE did not select streamed "
-        "CCCP residency");
+        "TPQ residency");
     require(
         moe.uses_grouped_shared_projection(),
         "streamed DeepSeek-V4 shared projections "
@@ -2071,19 +2071,19 @@ void test_streamed_cccp_load_and_forward() {
         Shape{16, kHidden},
         Shape{16},
         8,
-        "16-row streamed CCCP");
+        "16-row streamed TPQ");
     run_rows(
         35,
         Shape{35, kHidden},
         Shape{35},
         9,
-        "35-row streamed CCCP");
+        "35-row streamed TPQ");
     run_rows(
         34,
         Shape{2, 17, kHidden},
         Shape{2, 17},
         10,
-        "batched streamed CCCP");
+        "batched streamed TPQ");
 }
 
 void test_streamed_router_availability_intersection() {
@@ -2114,13 +2114,13 @@ void test_streamed_router_availability_intersection() {
 
     auto fixture = make_model_fixture();
     fixture.routed_gate_up =
-        make_cccp_moe(
+        make_tpq_moe(
             2 * kIntermediate,
             kHidden,
             53,
             gate_available);
     fixture.routed_down =
-        make_cccp_moe(
+        make_tpq_moe(
             kHidden,
             kIntermediate,
             61,
@@ -2134,7 +2134,7 @@ void test_streamed_router_availability_intersection() {
     auto residency =
         std::make_shared<
             mfq::metal::
-                MlxCccpExpertResidency>(
+                MlxTpqExpertResidency>(
             model,
             0,
             kExperts);
@@ -2150,7 +2150,7 @@ void test_streamed_router_availability_intersection() {
     require(
         moe.uses_streamed_experts(),
         "ordinary router did not retain streamed "
-        "CCCP experts");
+        "TPQ experts");
 
     constexpr int rows = 7;
     const auto input = input_values(rows, 17);
@@ -2232,12 +2232,12 @@ int main() {
         test_split_gate_up_eager_load_and_forward();
         test_split_gate_up_streamed_load_and_forward();
         test_split_gate_up_requires_pair();
-        test_streamed_cccp_load_and_forward();
+        test_streamed_tpq_load_and_forward();
         test_streamed_router_availability_intersection();
         test_availability_validation(fixture);
         std::cout
             << "MFQ native DeepSeek-V4 heterogeneous/"
-               "streamed CCCP MoE Metal tests passed\n";
+               "streamed TPQ MoE Metal tests passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr

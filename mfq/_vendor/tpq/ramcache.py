@@ -1,7 +1,7 @@
-"""一次性模型 RAM 镜像：先顺序读取 NAS，再从内存装载 GPU。
+"""One-time model RAM mirror: read the NAS sequentially, then load the GPU from memory.
 
-该镜像只服务启动阶段。全显存 Expert Parallel 完成后，Engine 会解除所有
-SafeFile 对镜像的引用并释放 bytearray，推理期不保留 routed expert 的主机副本。
+This mirror serves only startup. After full-VRAM Expert Parallel loading completes, Engine releases all
+SafeFile references to the mirror and frees the bytearray; no host copies of routed experts remain during inference.
 """
 
 from __future__ import annotations

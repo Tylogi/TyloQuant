@@ -14,8 +14,139 @@
     return LEGACY_LOCAL_ENDPOINT;
   })();
 
+  const UI_LANGUAGES = new Set(["system", "zh-CN", "en"]);
+  const UI_EN = Object.freeze({
+    "主导航": "Main navigation",
+    "关闭导航": "Close navigation",
+    "新对话": "New chat",
+    "对话": "Chat",
+    "监控": "Monitor",
+    "最近": "Recent",
+    "清空历史": "Clear history",
+    "正在连接": "Connecting",
+    "打开导航": "Open navigation",
+    "模型": "Model",
+    "选择模型": "Select model",
+    "连接中": "Connecting",
+    "最近一次生成摘要": "Latest generation summary",
+    "导出当前对话": "Export current chat",
+    "推理设置": "Inference settings",
+    "向模型发送消息": "Message the model",
+    "消息": "Message",
+    "思考": "Thinking",
+    "思考档位": "Reasoning effort",
+    "标准": "Standard",
+    "高": "High",
+    "最大": "Maximum",
+    "Enter 发送 · Shift+Enter 换行": "Enter to send · Shift+Enter for a new line",
+    "发送": "Send",
+    "模型输出可能存在错误，请核对重要信息。": "Model output may be incorrect. Verify important information.",
+    "服务监控": "Server monitor",
+    "等待状态数据": "Waiting for status data",
+    "刷新状态": "Refresh status",
+    "请求": "Requests",
+    "生成吞吐": "Generation throughput",
+    "最近请求的 decode tokens/s": "Decode tokens/s for recent requests",
+    "生成吞吐趋势图": "Generation throughput trend",
+    "当前服务实例": "Current server instance",
+    "架构": "Architecture",
+    "上下文": "Context",
+    "运行时间": "Uptime",
+    "失败请求": "Failed requests",
+    "最近请求": "Latest request",
+    "还没有完成的请求": "No completed requests yet",
+    "输入": "Input",
+    "输出": "Output",
+    "总耗时": "Total time",
+    "结束原因": "Finish reason",
+    "关闭设置": "Close settings",
+    "连接": "Connection",
+    "API 地址": "API endpoint",
+    "未启用认证": "Authentication disabled",
+    "Key 仅保存在当前浏览器会话。": "The key is stored only for this browser session.",
+    "界面语言": "Interface language",
+    "跟随系统": "Follow system",
+    "简体中文": "Simplified Chinese",
+    "预设": "Presets",
+    "采样预设": "Sampling presets",
+    "精确": "Precise",
+    "均衡": "Balanced",
+    "创意": "Creative",
+    "系统提示词": "System prompt",
+    "可选": "Optional",
+    "排除历史思考": "Exclude prior reasoning",
+    "关闭时将思考作为 reasoning_content 传入，由模型模板决定是否保留。": "When disabled, prior reasoning is sent as reasoning_content and handled by the model template.",
+    "上下文窗口 tokens": "Context window tokens",
+    "修改后需要重载模型以重新分配 KV cache。": "Reload the model to reallocate the KV cache after changing this value.",
+    "按此上下文重载模型": "Reload model with this context",
+    "最大生成 tokens": "Maximum generation tokens",
+    "采样": "Sampling",
+    "惩罚": "Penalties",
+    "恢复默认": "Restore defaults",
+    "应用": "Apply",
+    "浏览器存储空间不足，历史记录未保存。": "Browser storage is full. Chat history was not saved.",
+    "对话名称": "Chat name",
+    "重命名对话": "Rename chat",
+    "重命名 {title}": "Rename {title}",
+    "删除对话": "Delete chat",
+    "删除 {title}": "Delete {title}",
+    "本地模型，直接对话": "Chat directly with a local model",
+    "连接 MFQ C++ runtime，支持流式输出、思考过程与完整采样控制。": "Connect to the MFQ C++ runtime with streaming, reasoning, and full sampling controls.",
+    "解释 NINT 的 per-neuron super block 设计": "Explain NINT's per-neuron super-block design",
+    "写一个 CUDA kernel 性能分析清单": "Write a CUDA kernel performance-analysis checklist",
+    "比较稠密模型和 MoE 的量化策略": "Compare quantization strategies for dense and MoE models",
+    "把这段技术结论改写得更简洁": "Rewrite this technical conclusion more concisely",
+    "复制代码": "Copy code",
+    "浏览器拒绝了剪贴板访问。": "The browser denied clipboard access.",
+    "思考过程": "Reasoning",
+    "回答": "Answer",
+    "取消": "Cancel",
+    "保存": "Save",
+    "用户消息不能为空。": "The user message cannot be empty.",
+    "回答和思考过程不能同时为空。": "The answer and reasoning cannot both be empty.",
+    "你": "You",
+    "正在思考": "Thinking",
+    "正在生成": "Generating",
+    "编辑": "Edit",
+    "重新生成": "Regenerate",
+    "停止": "Stop",
+    "服务返回了错误": "The server returned an error",
+    "浏览器未收到流式响应体": "The browser did not receive a streaming response body",
+    "在线": "Online",
+    "已达到生成上限，模型仍处于思考阶段；可提高最大 Token 或关闭深度思考。": "The generation limit was reached while the model was still reasoning. Increase the maximum tokens or disable deep reasoning.",
+    "未生成新内容，已恢复原回答。": "No new content was generated; the previous answer was restored.",
+    "已停止生成。": "Generation stopped.",
+    "请求失败：{error}": "Request failed: {error}",
+    "未知错误": "Unknown error",
+    "连接失败": "Connection failed",
+    "请求失败": "Request failed",
+    "重载中": "Reloading",
+    "生成中": "Generating",
+    "需要 API Key": "API key required",
+    "离线": "Offline",
+    "无法连接服务": "Unable to connect to the server",
+    "最后更新 {time}{legacy}": "Last updated {time}{legacy}",
+    " · 旧版状态接口": " · legacy status endpoint",
+    "服务不可用": "Server unavailable",
+    "完成请求后显示吞吐趋势": "The throughput trend appears after requests complete",
+    "当前已加载 {current}，模型上限 {limit} tokens。重载会卸载当前 runtime 并重新分配 KV cache。": "Currently loaded: {current}; model limit: {limit} tokens. Reloading unloads the current runtime and reallocates the KV cache.",
+    "推理设置已应用。": "Inference settings applied.",
+    "请先停止当前生成再重载模型。": "Stop the current generation before reloading the model.",
+    "以当前 {context} token 上下文重新加载模型？": "Reload the model with the current {context}-token context?",
+    "将模型从 {current} token 上下文重载为 {context}？": "Reload the model from a {current}-token context to {context} tokens?",
+    "重载期间不能生成，通常需要约 1–2 分钟。": "Generation is unavailable during reload, which usually takes about 1–2 minutes.",
+    "正在重载模型…": "Reloading model…",
+    "模型已按 {context} token 上下文重载。": "The model was reloaded with a {context}-token context.",
+    "重载失败": "Reload failed",
+    "模型重载失败": "Model reload failed",
+    "当前对话没有可导出的内容。": "The current chat has no content to export.",
+    "用户": "User",
+    "对话历史已清空。": "Chat history cleared."
+  });
+
   const defaultSettings = {
     endpoint: defaultEndpoint,
+    language: "system",
     model: "",
     systemPrompt: "",
     maxTokens: 4096,
@@ -46,7 +177,7 @@
     topP: 0.8,
     topK: 20,
     repetitionPenalty: 1.05,
-    presencePenalty: 1.35,
+    presencePenalty: 0,
     frequencyPenalty: 0,
   };
 
@@ -98,13 +229,66 @@
 
   const refs = {};
 
+  function resolvedUiLanguage() {
+    const selected = UI_LANGUAGES.has(state.settings.language)
+      ? state.settings.language
+      : "system";
+    if (selected !== "system") return selected;
+    const systemLanguage = String(
+      navigator.languages?.[0] || navigator.language || "en"
+    ).toLowerCase();
+    return systemLanguage.startsWith("zh") ? "zh-CN" : "en";
+  }
+
+  function uiLocale() {
+    return resolvedUiLanguage() === "en" ? "en-US" : "zh-CN";
+  }
+
+  function tr(source, values = {}) {
+    let result = resolvedUiLanguage() === "en"
+      ? UI_EN[source] || source
+      : source;
+    for (const [name, value] of Object.entries(values)) {
+      result = result.replaceAll(`{${name}}`, String(value));
+    }
+    return result;
+  }
+
+  function applyStaticUiLanguage() {
+    const language = resolvedUiLanguage();
+    document.documentElement.lang = language;
+    if (language !== "en") return;
+    const walker = document.createTreeWalker(
+      document.body,
+      NodeFilter.SHOW_TEXT
+    );
+    let node = walker.nextNode();
+    while (node) {
+      const source = node.nodeValue.trim();
+      if (source && UI_EN[source]) {
+        node.nodeValue = node.nodeValue.replace(source, UI_EN[source]);
+      }
+      node = walker.nextNode();
+    }
+    for (const element of document.querySelectorAll(
+      "[title], [aria-label], [placeholder]"
+    )) {
+      for (const attribute of ["title", "aria-label", "placeholder"]) {
+        const source = element.getAttribute(attribute);
+        if (source && UI_EN[source]) {
+          element.setAttribute(attribute, UI_EN[source]);
+        }
+      }
+    }
+  }
+
   function queryRefs() {
     const ids = [
       "sidebar", "sidebar-scrim", "open-sidebar", "close-sidebar",
       "new-chat", "clear-history", "conversation-list",
       "sidebar-status-dot", "sidebar-status-label", "sidebar-endpoint",
       "connection-pill", "active-request-count", "model-select",
-      "top-ttft", "top-prefill-tps", "top-tps", "export-chat", "open-settings",
+      "top-ttft", "top-context-tokens", "top-tps", "export-chat", "open-settings",
       "chat-view", "monitor-view", "message-scroller", "message-list",
       "composer-form", "message-input", "thinking-toggle",
       "reasoning-effort-control", "reasoning-effort-select", "composer-hint",
@@ -118,6 +302,7 @@
       "last-prefill-ms", "last-generation-ms", "last-finish-reason",
       "settings-panel", "settings-scrim",
       "close-settings", "setting-endpoint", "setting-api-key",
+      "setting-language",
       "preset-control", "setting-system-prompt",
       "setting-exclude-reasoning", "setting-context-window",
       "setting-context-limit", "reload-model", "setting-max-tokens",
@@ -181,6 +366,9 @@
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
       if (saved.settings && typeof saved.settings === "object") {
         state.settings = { ...defaultSettings, ...saved.settings };
+        if (!UI_LANGUAGES.has(state.settings.language)) {
+          state.settings.language = "system";
+        }
         if (!["", "high", "max"].includes(state.settings.reasoningEffort)) {
           state.settings.reasoningEffort = "";
         }
@@ -327,6 +515,7 @@
   }
 
   function setConnection(connected, message) {
+    message = tr(message);
     state.connected = connected;
     state.connectionMessage = message;
     refs["connection-pill"].classList.toggle("is-connected", connected);
@@ -346,7 +535,7 @@
   function showToast(message, isError = false) {
     const toast = document.createElement("div");
     toast.className = `toast${isError ? " is-error" : ""}`;
-    toast.textContent = message;
+    toast.textContent = tr(message);
     refs["toast-region"].append(toast);
     window.setTimeout(() => toast.remove(), 3500);
   }
@@ -354,7 +543,7 @@
   function formatNumber(value, maximumFractionDigits = 0) {
     const number = Number(value);
     if (!Number.isFinite(number)) return "--";
-    return new Intl.NumberFormat("zh-CN", {
+    return new Intl.NumberFormat(uiLocale(), {
       maximumFractionDigits,
     }).format(number);
   }
@@ -364,6 +553,12 @@
     const days = Math.floor(seconds / 86400);
     const hours = Math.floor((seconds % 86400) / 3600);
     const minutes = Math.floor((seconds % 3600) / 60);
+    if (resolvedUiLanguage() === "en") {
+      if (days) return `${days}d ${hours}h`;
+      if (hours) return `${hours}h ${minutes}m`;
+      if (minutes) return `${minutes}m ${seconds % 60}s`;
+      return `${seconds}s`;
+    }
     if (days) return `${days}天 ${hours}小时`;
     if (hours) return `${hours}小时 ${minutes}分`;
     if (minutes) return `${minutes}分 ${seconds % 60}秒`;
@@ -373,7 +568,7 @@
   function formatTime(timestamp) {
     const time = Number(timestamp);
     if (!Number.isFinite(time)) return "";
-    return new Intl.DateTimeFormat("zh-CN", {
+    return new Intl.DateTimeFormat(uiLocale(), {
       hour: "2-digit",
       minute: "2-digit",
     }).format(new Date(time));
@@ -405,6 +600,12 @@
     renderConversationList();
   }
 
+  function conversationDisplayTitle(conversation) {
+    return conversation.title === "新对话" || conversation.title === "New chat"
+      ? tr("新对话")
+      : conversation.title;
+  }
+
   function renderConversationList() {
     refs["conversation-list"].replaceChildren();
     const ordered = state.conversations
@@ -415,14 +616,15 @@
       row.className = `conversation-item${conversation.id === state.activeId ? " is-active" : ""}`;
       row.setAttribute("role", "button");
       row.tabIndex = 0;
-      row.title = conversation.title;
+      const displayTitle = conversationDisplayTitle(conversation);
+      row.title = displayTitle;
 
       if (state.renamingConversationId === conversation.id) {
         const input = document.createElement("input");
         input.className = "conversation-rename-input";
-        input.value = conversation.title;
+        input.value = displayTitle;
         input.maxLength = 80;
-        input.setAttribute("aria-label", "对话名称");
+        input.setAttribute("aria-label", tr("对话名称"));
         input.addEventListener("click", (event) => event.stopPropagation());
         input.addEventListener("keydown", (event) => {
           event.stopPropagation();
@@ -446,15 +648,17 @@
         });
       } else {
         const title = document.createElement("span");
-        title.textContent = conversation.title;
+        title.textContent = displayTitle;
         row.append(title);
       }
 
       const rename = document.createElement("button");
       rename.type = "button";
       rename.className = "conversation-action conversation-rename";
-      rename.title = "重命名对话";
-      rename.setAttribute("aria-label", `重命名 ${conversation.title}`);
+      rename.title = tr("重命名对话");
+      rename.setAttribute("aria-label", tr("重命名 {title}", {
+        title: displayTitle,
+      }));
       rename.append(icon("edit"));
       rename.addEventListener("click", (event) => {
         event.stopPropagation();
@@ -467,8 +671,10 @@
       const remove = document.createElement("button");
       remove.type = "button";
       remove.className = "conversation-action conversation-delete";
-      remove.title = "删除对话";
-      remove.setAttribute("aria-label", `删除 ${conversation.title}`);
+      remove.title = tr("删除对话");
+      remove.setAttribute("aria-label", tr("删除 {title}", {
+        title: displayTitle,
+      }));
       remove.append(icon("trash"));
       remove.addEventListener("click", (event) => {
         event.stopPropagation();
@@ -545,9 +751,9 @@
     mark.append(image);
 
     const heading = document.createElement("h1");
-    heading.textContent = "本地模型，直接对话";
+    heading.textContent = tr("本地模型，直接对话");
     const copy = document.createElement("p");
-    copy.textContent = "连接 MFQ C++ runtime，支持流式输出、思考过程与完整采样控制。";
+    copy.textContent = tr("连接 MFQ C++ runtime，支持流式输出、思考过程与完整采样控制。");
 
     const prompts = [
       "解释 NINT 的 per-neuron super block 设计",
@@ -561,9 +767,9 @@
       const button = document.createElement("button");
       button.type = "button";
       button.className = "prompt-suggestion";
-      button.textContent = prompt;
+      button.textContent = tr(prompt);
       button.addEventListener("click", () => {
-        refs["message-input"].value = prompt;
+        refs["message-input"].value = tr(prompt);
         resizeComposer();
         refs["message-input"].focus();
       });
@@ -615,8 +821,8 @@
     const copy = document.createElement("button");
     copy.type = "button";
     copy.className = "code-copy";
-    copy.title = "复制代码";
-    copy.setAttribute("aria-label", "复制代码");
+    copy.title = tr("复制代码");
+    copy.setAttribute("aria-label", tr("复制代码"));
     copy.append(icon("copy"));
     copy.addEventListener("click", async () => {
       try {
@@ -838,7 +1044,7 @@
       const label = document.createElement("label");
       label.className = "message-editor-field";
       const caption = document.createElement("span");
-      caption.textContent = labelText;
+      caption.textContent = tr(labelText);
       const textarea = document.createElement("textarea");
       textarea.className = className;
       textarea.value = value;
@@ -875,7 +1081,7 @@
     const cancel = document.createElement("button");
     cancel.type = "button";
     cancel.className = "secondary-button";
-    cancel.textContent = "取消";
+    cancel.textContent = tr("取消");
     cancel.addEventListener("click", () => {
       state.editingMessage = null;
       renderMessages({ scroll: false });
@@ -883,7 +1089,7 @@
     const save = document.createElement("button");
     save.type = "submit";
     save.className = "primary-button";
-    save.textContent = "保存";
+    save.textContent = tr("保存");
     buttons.append(cancel, save);
     form.append(buttons);
 
@@ -922,9 +1128,10 @@
     const button = document.createElement("button");
     button.type = "button";
     button.className = "message-action";
-    button.title = label;
-    button.setAttribute("aria-label", label);
-    button.append(icon(iconName), document.createTextNode(label));
+    const localizedLabel = tr(label);
+    button.title = localizedLabel;
+    button.setAttribute("aria-label", localizedLabel);
+    button.append(icon(iconName), document.createTextNode(localizedLabel));
     button.addEventListener("click", handler);
     return button;
   }
@@ -949,7 +1156,7 @@
     const meta = document.createElement("div");
     meta.className = "message-meta";
     const name = document.createElement("strong");
-    name.textContent = message.role === "assistant" ? "MFQ" : "你";
+    name.textContent = message.role === "assistant" ? "MFQ" : tr("你");
     const time = document.createElement("span");
     time.textContent = formatTime(message.createdAt);
     meta.append(name, time);
@@ -974,7 +1181,7 @@
       reasoning.open = rememberedOpen ?? isGeneratingMessage;
       const summary = document.createElement("summary");
       summary.append(icon("chevron"), document.createTextNode(
-        isGeneratingMessage ? "正在思考" : "思考过程"));
+        tr(isGeneratingMessage ? "正在思考" : "思考过程")));
       const toggleReasoning = () => {
         const nextOpen = !reasoning.open;
         state.reasoningOpenState.set(message, nextOpen);
@@ -1010,7 +1217,7 @@
     } else if (isGeneratingMessage && message.role === "assistant") {
       const typing = document.createElement("div");
       typing.className = "typing-indicator";
-      typing.setAttribute("aria-label", "正在生成");
+      typing.setAttribute("aria-label", tr("正在生成"));
       typing.append(document.createElement("span"), document.createElement("span"), document.createElement("span"));
       content.append(typing);
     }
@@ -1054,12 +1261,43 @@
     });
   }
 
+  function renderGeneratingMessage() {
+    const conversation = activeConversation();
+    const message = state.generatingMessage;
+    const messageIndex = conversation?.messages.indexOf(message) ?? -1;
+    const existing = refs["message-list"].children[messageIndex];
+    if (
+      !conversation ||
+      !message ||
+      messageIndex < 0 ||
+      !existing?.classList.contains("message")
+    ) {
+      renderMessages();
+      return;
+    }
+
+    const replacement = messageElement(conversation, message);
+    const existingBody = existing.querySelector(".message-body");
+    const replacementBody = replacement.querySelector(".message-body");
+    if (!existingBody || !replacementBody) {
+      renderMessages();
+      return;
+    }
+
+    existing.className = replacement.className;
+    existingBody.replaceWith(replacementBody);
+    if (state.followOutput) {
+      const scroller = refs["message-scroller"];
+      scroller.scrollTop = scroller.scrollHeight;
+    }
+  }
+
   function scheduleMessageRender() {
     if (state.renderPending) return;
     state.renderPending = true;
     requestAnimationFrame(() => {
       state.renderPending = false;
-      renderMessages();
+      renderGeneratingMessage();
     });
   }
 
@@ -1074,8 +1312,11 @@
     state.generating = generating;
     refs["send-button"].classList.toggle("is-generating", generating);
     refs["send-button"].disabled = !generating && !refs["message-input"].value.trim();
-    refs["send-button"].title = generating ? "停止" : "发送";
-    refs["send-button"].setAttribute("aria-label", generating ? "停止" : "发送");
+    refs["send-button"].title = tr(generating ? "停止" : "发送");
+    refs["send-button"].setAttribute(
+      "aria-label",
+      tr(generating ? "停止" : "发送")
+    );
     refs["message-input"].disabled = generating;
     refs["new-chat"].disabled = generating;
     refs["model-select"].disabled = generating;
@@ -1294,8 +1535,9 @@
       } else {
         if (!options.restoreOnFailure) {
           assistant.error = true;
-          assistant.content =
-            assistant.content || `请求失败：${error?.message || "未知错误"}`;
+          assistant.content = assistant.content || tr("请求失败：{error}", {
+            error: tr(error?.message || "未知错误"),
+          });
         }
         setConnection(false, "连接失败");
         showToast(error?.message || "请求失败", true);
@@ -1485,14 +1727,21 @@
     const prefillMs = Number(last?.prefill_ms);
     const decodeTps = Number(last?.decode_tps);
     const ttft = Number(last?.ttft_ms);
+    const lastPromptTokens = Number(last?.prompt_tokens);
+    const lastCompletionTokens = Number(last?.completion_tokens);
+    const contextTokens =
+      Number.isFinite(lastPromptTokens) &&
+      Number.isFinite(lastCompletionTokens)
+        ? lastPromptTokens + lastCompletionTokens
+        : Number.NaN;
     const active = Number(status.active_requests) || 0;
     const promptTokens = Number(status.total_prompt_tokens) || 0;
     const completionTokens = Number(status.total_completion_tokens) || 0;
 
     refs["active-request-count"].textContent = String(active);
     refs["top-ttft"].textContent = Number.isFinite(ttft) ? `${formatNumber(ttft, 1)} ms` : "--";
-    refs["top-prefill-tps"].textContent = Number.isFinite(prefillTps)
-      ? formatNumber(prefillTps, 1)
+    refs["top-context-tokens"].textContent = Number.isFinite(contextTokens)
+      ? formatNumber(contextTokens)
       : "--";
     refs["top-tps"].textContent = Number.isFinite(decodeTps) ? formatNumber(decodeTps, 1) : "--";
     refs["metric-prefill-tps"].textContent = Number.isFinite(prefillTps)
@@ -1514,15 +1763,18 @@
       : formatDuration(status.uptime_seconds);
     refs["runtime-failed"].textContent = formatNumber(status.failed_requests || 0);
     refs["monitor-updated"].textContent = state.connected
-      ? `最后更新 ${new Intl.DateTimeFormat("zh-CN", {
-          hour: "2-digit",
-          minute: "2-digit",
-          second: "2-digit",
-        }).format(new Date())}${status.limited ? " · 旧版状态接口" : ""}`
-      : "服务不可用";
+      ? tr("最后更新 {time}{legacy}", {
+          time: new Intl.DateTimeFormat(uiLocale(), {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+          }).format(new Date()),
+          legacy: status.limited ? tr(" · 旧版状态接口") : "",
+        })
+      : tr("服务不可用");
 
     if (last) {
-      refs["last-request-id"].textContent = last.id || "最近请求";
+      refs["last-request-id"].textContent = last.id || tr("最近请求");
       refs["last-request-state"].textContent = last.finish_reason || "Complete";
       refs["last-prompt-tokens"].textContent = formatNumber(last.prompt_tokens);
       refs["last-completion-tokens"].textContent = formatNumber(last.completion_tokens);
@@ -1540,7 +1792,7 @@
         state.metricSeries = state.metricSeries.slice(-MAX_METRIC_POINTS);
       }
     } else {
-      refs["last-request-id"].textContent = "还没有完成的请求";
+      refs["last-request-id"].textContent = tr("还没有完成的请求");
       refs["last-request-state"].textContent = active ? "Running" : "Idle";
       refs["last-prompt-tokens"].textContent = "--";
       refs["last-completion-tokens"].textContent = "--";
@@ -1629,7 +1881,11 @@
     if (state.metricSeries.length < 2) {
       ctx.fillStyle = "#95a19d";
       ctx.textAlign = "center";
-      ctx.fillText("完成请求后显示吞吐趋势", pad.left + plotWidth / 2, pad.top + plotHeight / 2);
+      ctx.fillText(
+        tr("完成请求后显示吞吐趋势"),
+        pad.left + plotWidth / 2,
+        pad.top + plotHeight / 2
+      );
       return;
     }
 
@@ -1722,6 +1978,9 @@
     const settings = state.settings;
     refs["setting-endpoint"].value = settings.endpoint;
     refs["setting-api-key"].value = state.apiKey;
+    refs["setting-language"].value = UI_LANGUAGES.has(settings.language)
+      ? settings.language
+      : "system";
     refs["setting-system-prompt"].value = settings.systemPrompt;
     refs["setting-exclude-reasoning"].checked =
       settings.excludeReasoningFromContext;
@@ -1736,8 +1995,13 @@
         ? Math.min(Math.floor(serverContext), contextLimit)
         : contextLimit
     );
-    refs["setting-context-limit"].textContent =
-      `当前已加载 ${formatNumber(serverContext || contextLimit)}，模型上限 ${formatNumber(contextLimit)} tokens。重载会卸载当前 runtime 并重新分配 KV cache。`;
+    refs["setting-context-limit"].textContent = tr(
+      "当前已加载 {current}，模型上限 {limit} tokens。重载会卸载当前 runtime 并重新分配 KV cache。",
+      {
+        current: formatNumber(serverContext || contextLimit),
+        limit: formatNumber(contextLimit),
+      }
+    );
     refs["setting-max-tokens"].value = String(settings.maxTokens);
     refs["setting-temperature"].value = String(settings.temperature);
     refs["setting-top-p"].value = String(settings.topP);
@@ -1768,10 +2032,14 @@
 
   function saveSettings() {
     const oldEndpoint = state.settings.endpoint;
+    const oldLanguage = state.settings.language;
     const activePreset = refs.presetButtons.find((button) => button.classList.contains("is-active"));
     const nextSettings = {
       ...state.settings,
       endpoint: normalizeEndpoint(refs["setting-endpoint"].value),
+      language: UI_LANGUAGES.has(refs["setting-language"].value)
+        ? refs["setting-language"].value
+        : "system",
       model: refs["model-select"].value || state.settings.model,
       systemPrompt: refs["setting-system-prompt"].value,
       excludeReasoningFromContext:
@@ -1792,6 +2060,10 @@
     state.apiKey = refs["setting-api-key"].value.trim();
     persistState();
     closeSettings();
+    if (oldLanguage !== state.settings.language) {
+      location.reload();
+      return;
+    }
     setConnection(false, "正在连接");
     if (oldEndpoint !== state.settings.endpoint) {
       state.models = [];
@@ -1822,16 +2094,23 @@
     ));
     const currentContext = Number(state.status?.max_context) || 0;
     const action = currentContext === contextSize
-      ? `以当前 ${formatNumber(contextSize)} token 上下文重新加载模型？`
-      : `将模型从 ${formatNumber(currentContext)} token 上下文重载为 ${formatNumber(contextSize)}？`;
-    if (!window.confirm(`${action}\n\n重载期间不能生成，通常需要约 1–2 分钟。`)) {
+      ? tr("以当前 {context} token 上下文重新加载模型？", {
+          context: formatNumber(contextSize),
+        })
+      : tr("将模型从 {current} token 上下文重载为 {context}？", {
+          current: formatNumber(currentContext),
+          context: formatNumber(contextSize),
+        });
+    if (!window.confirm(
+      `${action}\n\n${tr("重载期间不能生成，通常需要约 1–2 分钟。")}`
+    )) {
       return;
     }
 
     const button = refs["reload-model"];
     const previousLabel = button.textContent;
     button.disabled = true;
-    button.textContent = "正在重载模型…";
+    button.textContent = tr("正在重载模型…");
     refs["setting-context-window"].disabled = true;
     setConnection(true, "重载中");
     try {
@@ -1847,7 +2126,9 @@
       updateMonitor();
       populateSettings();
       setConnection(true, "在线");
-      showToast(`模型已按 ${formatNumber(payload.max_context)} token 上下文重载。`);
+      showToast(tr("模型已按 {context} token 上下文重载。", {
+        context: formatNumber(payload.max_context),
+      }));
     } catch (error) {
       setConnection(false, "重载失败");
       showToast(error?.message || "模型重载失败", true);
@@ -1861,7 +2142,10 @@
 
   function resetSettingsForm() {
     const endpoint = state.settings.endpoint || defaultEndpoint;
-    state.settings = { ...defaultSettings, endpoint };
+    const language = UI_LANGUAGES.has(state.settings.language)
+      ? state.settings.language
+      : "system";
+    state.settings = { ...defaultSettings, endpoint, language };
     if (state.samplingDefaults) {
       Object.assign(state.settings, state.samplingDefaults);
       state.settings.preset = "custom";
@@ -1875,11 +2159,11 @@
       showToast("当前对话没有可导出的内容。", true);
       return;
     }
-    const lines = [`# ${conversation.title}`, ""];
+    const lines = [`# ${conversationDisplayTitle(conversation)}`, ""];
     for (const message of conversation.messages) {
-      lines.push(message.role === "user" ? "## 用户" : "## MFQ", "");
+      lines.push(message.role === "user" ? `## ${tr("用户")}` : "## MFQ", "");
       if (message.reasoning) {
-        lines.push("<details>", "<summary>思考过程</summary>", "", message.reasoning, "", "</details>", "");
+        lines.push("<details>", `<summary>${tr("思考过程")}</summary>`, "", message.reasoning, "", "</details>", "");
       }
       lines.push(message.content, "");
     }
@@ -1887,7 +2171,7 @@
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `${conversation.title.replace(/[\\/:*?"<>|]/g, "_")}.md`;
+    link.download = `${conversationDisplayTitle(conversation).replace(/[\\/:*?"<>|]/g, "_")}.md`;
     link.click();
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
@@ -1963,6 +2247,9 @@
       "setting-presence", "setting-frequency",
     ].forEach((id) => refs[id].addEventListener("input", syncRangeOutputs));
     window.addEventListener("resize", () => requestAnimationFrame(drawChart));
+    window.addEventListener("languagechange", () => {
+      if (state.settings.language === "system") location.reload();
+    });
     document.addEventListener("keydown", (event) => {
       if (event.key !== "Escape") return;
       if (refs["settings-panel"].classList.contains("is-visible")) closeSettings();
@@ -1974,6 +2261,7 @@
   function initialize() {
     queryRefs();
     loadState();
+    applyStaticUiLanguage();
     bindEvents();
     renderModels();
     renderConversationList();

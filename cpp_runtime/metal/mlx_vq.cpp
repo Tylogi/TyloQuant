@@ -1329,7 +1329,8 @@ CanonicalVq parse_nvq(
     }
     if (header.bits <= 0 || header.bits > 8 ||
         header.group_size == 0 ||
-        header.group_size % 8 != 0) {
+        header.group_size % 8 != 0 ||
+        (jsc && header.input_size % profile.vector_size != 0)) {
         throw std::runtime_error(
             "unsupported NVQ group profile");
     }

@@ -1,4 +1,4 @@
-"""NintModel：从 ``.mfq`` 加载量化权重，按需构建 NintLinear。"""
+"""NintModel: load quantized weights from ``.mfq`` and construct NintLinear layers on demand."""
 
 from __future__ import annotations
 
@@ -14,14 +14,14 @@ from mfq.runtime.linear import NintLinear
 
 
 class NintModel:
-    """持有一组命名 NintTensor，按名字构建 :class:`NintLinear`。"""
+    """Hold named NintTensor objects and construct :class:`NintLinear` layers by name."""
 
     def __init__(self, tensors: Mapping[str, NintTensor]) -> None:
         self.tensors = tensors
 
     @classmethod
     def from_mfq(cls, path: str | Path, mmap: bool = False) -> "NintModel":
-        """从 ``.mfq`` 文件加载（见 :mod:`mfq.formats.io`）。"""
+        """Load from an ``.mfq`` file (see :mod:`mfq.formats.io`)."""
         _header, tensors = io.load_mmap(path) if mmap else io.load(path)
         return cls(tensors)
 

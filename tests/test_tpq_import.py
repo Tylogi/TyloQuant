@@ -37,7 +37,7 @@ def test_mfq_tpq_store_reinterprets_bfloat16_dense_bits() -> None:
     )
 
 
-def _cccp_artifact(root: Path) -> tuple[Path, dict[str, np.ndarray]]:
+def _tpq_artifact(root: Path) -> tuple[Path, dict[str, np.ndarray]]:
     root.mkdir()
     rng = np.random.default_rng(20260726)
     packed = rng.integers(0, 256, size=(3, 64), dtype=np.uint8)
@@ -84,7 +84,7 @@ def _cccp_artifact(root: Path) -> tuple[Path, dict[str, np.ndarray]]:
             ].reshape(rows, columns)
     save_file(tensors, str(root / "experts.L00.safetensors"))
     manifest = {
-        "format": "cccp-1",
+        "format": "tpq-1",
         "config": {
             "n_layers": 1,
             "n_experts": 4,
@@ -106,7 +106,7 @@ def _cccp_artifact(root: Path) -> tuple[Path, dict[str, np.ndarray]]:
         "expert_files": {"0": "experts.L00.safetensors"},
         "tokenizer_files": [],
     }
-    (root / "cccp.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (root / "tpq.json").write_text(json.dumps(manifest), encoding="utf-8")
     return root, expected
 
 
@@ -212,7 +212,7 @@ def test_import_projection_tpq_preserves_three_packed_projections(
         header, mapped = load_mmap(output)
         try:
             assert header.extra["source_format"] == "tpq-1"
-            assert "cccp_manifest" not in header.extra
+            assert header.extra["tpq_manifest"]["format"] == "tpq-1"
             assert set(mapped.records).issuperset(
                 {
                     "layers.0.ffn.experts.gate.weight",
@@ -231,13 +231,13 @@ def test_import_projection_tpq_preserves_three_packed_projections(
         store.close()
 
 
-def test_import_cccp_directory_to_native_mfq(tmp_path: Path) -> None:
-    source, expected = _cccp_artifact(tmp_path / "cccp")
+def test_import_tpq_directory_to_native_mfq(tmp_path: Path) -> None:
+    source, expected = _tpq_artifact(tmp_path / "tpq")
     output = convert(source, tmp_path / "model.mfq", row_chunk=2)
     header, store = load_mmap(output)
     try:
         assert header.model_arch == "deepseek_v4-tpq-mfq"
-        assert header.extra["source_format"] == "cccp-1"
+        assert header.extra["source_format"] == "tpq-1"
         assert store.records["dense.weight"].dtype == "TPQ-I4G64"
         dense = store["dense.weight"]
         assert isinstance(dense, TpqInt4Tensor)
@@ -269,7 +269,7 @@ def test_import_cccp_directory_to_native_mfq(tmp_path: Path) -> None:
 def test_import_kimi_tpq2_sharded_dense_and_compact_experts(
     tmp_path: Path,
 ) -> None:
-    source, _expected = _cccp_artifact(tmp_path / "kimi")
+    source, _expected = _tpq_artifact(tmp_path / "kimi")
     dense_root = source / "dense"
     dense_root.mkdir()
     (source / "dense.safetensors").rename(dense_root / "part-1.safetensors")
@@ -291,7 +291,7 @@ def test_import_kimi_tpq2_sharded_dense_and_compact_experts(
     }
     del expert_tensors
     save_file(filtered_experts, str(expert_shard))
-    manifest = json.loads((source / "cccp.json").read_text(encoding="utf-8"))
+    manifest = json.loads((source / "tpq.json").read_text(encoding="utf-8"))
     manifest["model_family"] = "kimi_k3"
     manifest["config"] = {
         "n_layers": 2,
@@ -311,7 +311,7 @@ def test_import_kimi_tpq2_sharded_dense_and_compact_experts(
     manifest["nonexpert"] = {"path": "dense"}
     manifest["expert_files"] = {"1": "experts.L01.safetensors"}
     manifest["tiers_per_layer"] = {"1": "xwvd"}
-    (source / "cccp.json").write_text(
+    (source / "tpq.json").write_text(
         json.dumps(manifest),
         encoding="utf-8",
     )
@@ -345,8 +345,8 @@ def test_import_kimi_tpq2_sharded_dense_and_compact_experts(
         store.close()
 
 
-def test_native_cccp_mfq_exposes_tpq_store_interface(tmp_path: Path) -> None:
-    source, expected = _cccp_artifact(tmp_path / "cccp")
+def test_native_tpq_mfq_exposes_tpq_store_interface(tmp_path: Path) -> None:
+    source, expected = _tpq_artifact(tmp_path / "tpq")
     output = convert(source, tmp_path / "model.mfq", row_chunk=2)
     shards = split_mfq(
         output,
@@ -381,7 +381,7 @@ def test_native_cccp_mfq_exposes_tpq_store_interface(tmp_path: Path) -> None:
     install_mfq_tpq_store(tpq)
     from tpq import dsv4model, kimi_model
 
-    dispatched = dsv4model.CCCPStore(str(entry))
+    dispatched = dsv4model.TPQStore(str(entry))
     try:
         assert isinstance(dispatched, MfqTpqStore)
     finally:
@@ -457,7 +457,7 @@ def test_native_tpq_mfq_reads_legacy_source_exact_fp8_pair(
     ]
     output = tmp_path / "legacy-fp8.mfq"
     manifest = {
-        "format": "cccp-1",
+        "format": "tpq-1",
         "config": {"n_experts": 0},
         "quant": {"vq": {"x": [8, 256]}},
         "expert_files": {},
@@ -469,8 +469,8 @@ def test_native_tpq_mfq_reads_legacy_source_exact_fp8_pair(
             model_arch="deepseek_v4-tpq-mfq",
             num_tensors=2,
             extra={
-                "source_format": "cccp-1",
-                "cccp_manifest": manifest,
+                "source_format": "tpq-1",
+                "tpq_manifest": manifest,
             },
         ),
         records,

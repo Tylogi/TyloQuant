@@ -1,4 +1,4 @@
-"""scheme 精度方案与 label 测试。"""
+"""Tests for scheme precision plans and labels."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ def test_empty_scheme_label():
 
 
 def test_label_weighted_bpw():
-    # 两个 tensor：A 1e6 元素 @ (4,24,6)->4.506bpw；B 1e6 @ (4,32,8)->4.506bpw
+    # Two tensors: A has 1e6 elements at (4,24,6)->4.506 bpw; B has 1e6 at (4,32,8)->4.506 bpw
     sch = Scheme(plans={
         "A": TensorPlan(name="A", weight=NintSpec(4, 24, 6)),
         "B": TensorPlan(name="B", weight=NintSpec(4, 32, 8)),

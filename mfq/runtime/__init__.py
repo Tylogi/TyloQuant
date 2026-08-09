@@ -14,15 +14,10 @@ from mfq.runtime.ffn import SwiGLUFFN, silu
 from mfq.runtime.linear import NintLinear
 from mfq.runtime.model import NintModel
 from mfq.runtime.tpq import (
-    CCCPArtifact,
     TPQArtifact,
-    configure_cccp_memory,
     configure_tpq_memory,
-    load_cccp_model,
     load_tpq_model,
-    open_cccp_artifact,
     open_tpq_artifact,
-    run_cccp_chat,
     run_tpq_chat,
 )
 
@@ -31,6 +26,11 @@ if TYPE_CHECKING:
         TorchNintCausalLM,
         TorchNintCausalLMConfig,
         TorchNintCausalLMNames,
+    )
+    from mfq.runtime.minicpmo45 import (
+        MiniCPMO45LoadReport,
+        TorchMfqMiniCPMO45,
+        load_minicpmo45,
     )
     from mfq.runtime.mlx_attention import MlxKVCache, MlxSlidingWindowKVCache
     from mfq.runtime.mlx_causal_lm import (
@@ -93,18 +93,13 @@ if TYPE_CHECKING:
     )
     from mfq.runtime.mlx_ops import MlxRMSNorm, MlxRoPE
     from mfq.runtime.mlx_tpq import (
-        MlxCccpInt4Embedding,
-        MlxCccpInt4Linear,
-        MlxCccpPqLinear,
         MlxTpqInt4Embedding,
         MlxTpqInt4Linear,
         MlxTpqPqLinear,
     )
     from mfq.runtime.mlx_vq import MlxVqEmbedding, MlxVqLinear
     from mfq.runtime.tpq_mfq import (
-        MfqCccpStore,
         MfqTpqStore,
-        NativeCCCPArtifact,
         NativeTPQArtifact,
     )
 
@@ -114,18 +109,17 @@ _TORCH_EXPORTS = {
     "TorchNintCausalLMConfig",
     "TorchNintCausalLMNames",
 }
+_MINICPMO45_EXPORTS = {
+    "MiniCPMO45LoadReport",
+    "TorchMfqMiniCPMO45",
+    "load_minicpmo45",
+}
 _TPQ_MFQ_EXPORTS = {
-    "MfqCccpStore",
     "MfqTpqStore",
-    "NativeCCCPArtifact",
     "NativeTPQArtifact",
-    "install_mfq_cccp_store",
     "install_mfq_tpq_store",
 }
 _MLX_EXPORTS = {
-    "MlxCccpInt4Embedding",
-    "MlxCccpInt4Linear",
-    "MlxCccpPqLinear",
     "MlxTpqInt4Embedding",
     "MlxTpqInt4Linear",
     "MlxTpqPqLinear",
@@ -155,9 +149,6 @@ _MLX_CAUSAL_LM_EXPORTS = {
     "MlxQwen35LinearAttentionBlock",
 }
 _MLX_TPQ_EXPORTS = {
-    "MlxCccpInt4Embedding",
-    "MlxCccpInt4Linear",
-    "MlxCccpPqLinear",
     "MlxTpqInt4Embedding",
     "MlxTpqInt4Linear",
     "MlxTpqPqLinear",
@@ -211,6 +202,10 @@ def __getattr__(name: str):
         from mfq.runtime import causal_lm
 
         value = getattr(causal_lm, name)
+    elif name in _MINICPMO45_EXPORTS:
+        from mfq.runtime import minicpmo45
+
+        value = getattr(minicpmo45, name)
     elif name in _MLX_OP_EXPORTS:
         from mfq.runtime import mlx_ops
 
@@ -266,15 +261,6 @@ __all__ = [
     "load_tpq_model",
     "open_tpq_artifact",
     "run_tpq_chat",
-    # Legacy public spellings remain aliases for existing integrations.
-    "CCCPArtifact",
-    "NativeCCCPArtifact",
-    "MfqCccpStore",
-    "configure_cccp_memory",
-    "install_mfq_cccp_store",
-    "load_cccp_model",
-    "open_cccp_artifact",
-    "run_cccp_chat",
     "NintModel",
     "NintLinear",
     "SwiGLUFFN",
@@ -285,9 +271,9 @@ __all__ = [
     "TorchNintCausalLM",
     "TorchNintCausalLMConfig",
     "TorchNintCausalLMNames",
-    "MlxCccpInt4Embedding",
-    "MlxCccpInt4Linear",
-    "MlxCccpPqLinear",
+    "MiniCPMO45LoadReport",
+    "TorchMfqMiniCPMO45",
+    "load_minicpmo45",
     "MlxTpqInt4Embedding",
     "MlxTpqInt4Linear",
     "MlxTpqPqLinear",

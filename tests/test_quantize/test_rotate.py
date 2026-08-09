@@ -1,4 +1,4 @@
-"""Hadamard 矩阵基本性质：n 为 2 的幂、正交归一。"""
+"""Basic Hadamard-matrix properties: power-of-two n and orthonormality."""
 
 from __future__ import annotations
 

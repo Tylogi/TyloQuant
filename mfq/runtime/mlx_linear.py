@@ -29,7 +29,7 @@ from mfq.formats.npq0_s import Npq0STensor
 from mfq.formats.nvq import NvqJscTensor, NvqTensor
 from mfq.formats.nvq1_l import Nvq1LTensor
 from mfq.formats.nvq1_s import Nvq1STensor
-from mfq.formats.tpq import CccpInt4Tensor, CccpPqTensor
+from mfq.formats.tpq import TpqInt4Tensor, TpqPqTensor
 from mfq.kernels.metal.grouped_linear import (
     MetalLinearGroupWeight,
     PackedLinearWeight,
@@ -55,8 +55,8 @@ from mfq.kernels.metal.nint8_zero import (
 )
 from mfq.kernels.metal.ops import silu_mul
 from mfq.kernels.metal.tpq import (
-    MetalCccpInt4Weight,
-    MetalCccpPqWeight,
+    MetalTpqInt4Weight,
+    MetalTpqPqWeight,
 )
 from mfq.kernels.metal.vq import (
     MetalVqWeight,
@@ -65,9 +65,9 @@ from mfq.kernels.metal.vq import (
 )
 from mfq.quantize.nint_quant import NintTensor
 from mfq.runtime.mlx_tpq import (
-    MlxCccpInt4Embedding,
-    MlxCccpInt4Linear,
-    MlxCccpPqLinear,
+    MlxTpqInt4Embedding,
+    MlxTpqInt4Linear,
+    MlxTpqPqLinear,
 )
 from mfq.runtime.mlx_vq import MlxVqEmbedding, MlxVqLinear
 
@@ -328,8 +328,8 @@ class MlxLinearGroup:
             | MlxNintLinear
             | MlxNint8ZeroLinear
             | MlxVqLinear
-            | MlxCccpInt4Linear
-            | MlxCccpPqLinear
+            | MlxTpqInt4Linear
+            | MlxTpqPqLinear
             | MlxMxLinear
             | MlxDenseLinear
         ],
@@ -348,8 +348,8 @@ class MlxLinearGroup:
                     MetalNintWeight,
                     MetalNint8ZeroWeight,
                     MetalVqWeight,
-                    MetalCccpInt4Weight,
-                    MetalCccpPqWeight,
+                    MetalTpqInt4Weight,
+                    MetalTpqPqWeight,
                 ),
             ):
                 break
@@ -442,8 +442,8 @@ class MlxNintModel:
         MlxNintLinear
         | MlxNint8ZeroLinear
         | MlxVqLinear
-        | MlxCccpInt4Linear
-        | MlxCccpPqLinear
+        | MlxTpqInt4Linear
+        | MlxTpqPqLinear
         | MlxMxLinear
         | MlxDenseLinear
     ):
@@ -468,7 +468,7 @@ class MlxNintModel:
         MlxNintEmbedding
         | MlxNint8ZeroEmbedding
         | MlxVqEmbedding
-        | MlxCccpInt4Embedding
+        | MlxTpqInt4Embedding
         | MlxMxEmbedding
         | MlxDenseEmbedding
     ):
@@ -491,8 +491,8 @@ class MlxNintModel:
             return MlxNint8ZeroEmbedding(tensor)
         if isinstance(tensor, _VQ_TENSOR_TYPES):
             return MlxVqEmbedding(tensor)
-        if isinstance(tensor, CccpInt4Tensor):
-            return MlxCccpInt4Embedding(tensor)
+        if isinstance(tensor, TpqInt4Tensor):
+            return MlxTpqInt4Embedding(tensor)
         if isinstance(tensor, MxTensor):
             return MlxMxEmbedding(tensor)
         if isinstance(tensor, np.ndarray):
@@ -585,7 +585,7 @@ class MlxNintModel:
 def _unsupported_tensor(tensor: object):
     raise TypeError(
         "the MLX runtime supports MXFP4, MXFP8, NINT, NINT8-0, NVQ, NPQ, "
-        "NEPQ, CCCP, and dense tensors; "
+        "NEPQ, TPQ, and dense tensors; "
         f"received {type(tensor).__name__}"
     )
 
@@ -596,8 +596,8 @@ def _linear(
         | MlxNintLinear
         | MlxNint8ZeroLinear
         | MlxVqLinear
-        | MlxCccpInt4Linear
-        | MlxCccpPqLinear
+        | MlxTpqInt4Linear
+        | MlxTpqPqLinear
         | MlxMxLinear
         | MlxDenseLinear
     ),
@@ -605,8 +605,8 @@ def _linear(
     MlxNintLinear
     | MlxNint8ZeroLinear
     | MlxVqLinear
-    | MlxCccpInt4Linear
-    | MlxCccpPqLinear
+    | MlxTpqInt4Linear
+    | MlxTpqPqLinear
     | MlxMxLinear
     | MlxDenseLinear
 ):
@@ -616,8 +616,8 @@ def _linear(
             MlxNintLinear,
             MlxNint8ZeroLinear,
             MlxVqLinear,
-            MlxCccpInt4Linear,
-            MlxCccpPqLinear,
+            MlxTpqInt4Linear,
+            MlxTpqPqLinear,
             MlxMxLinear,
             MlxDenseLinear,
         ),
@@ -629,10 +629,10 @@ def _linear(
         return MlxNint8ZeroLinear(tensor)
     if isinstance(tensor, _VQ_TENSOR_TYPES):
         return MlxVqLinear(tensor)
-    if isinstance(tensor, CccpInt4Tensor):
-        return MlxCccpInt4Linear(tensor)
-    if isinstance(tensor, CccpPqTensor):
-        return MlxCccpPqLinear(tensor)
+    if isinstance(tensor, TpqInt4Tensor):
+        return MlxTpqInt4Linear(tensor)
+    if isinstance(tensor, TpqPqTensor):
+        return MlxTpqPqLinear(tensor)
     if isinstance(tensor, MxTensor):
         return MlxMxLinear(tensor)
     if isinstance(tensor, np.ndarray):
@@ -641,9 +641,9 @@ def _linear(
 
 
 __all__ = [
-    "MlxCccpInt4Embedding",
-    "MlxCccpInt4Linear",
-    "MlxCccpPqLinear",
+    "MlxTpqInt4Embedding",
+    "MlxTpqInt4Linear",
+    "MlxTpqPqLinear",
     "MlxDenseEmbedding",
     "MlxDenseLinear",
     "MlxLinearGroup",

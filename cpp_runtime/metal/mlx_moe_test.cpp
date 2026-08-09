@@ -1410,7 +1410,7 @@ std::vector<float> evaluated_floats(
     };
 }
 
-struct StreamCccpProfile {
+struct StreamTpqProfile {
     std::string dtype;
     int tier = 0;
     int vector_size = 0;
@@ -1418,15 +1418,15 @@ struct StreamCccpProfile {
     int bits = 0;
 };
 
-struct StreamCccpPoolFixture {
-    StreamCccpProfile profile;
+struct StreamTpqPoolFixture {
+    StreamTpqProfile profile;
     std::vector<std::int32_t> expert_ids;
     std::vector<std::uint8_t> payload;
     std::vector<std::uint8_t> runtime;
     std::vector<float> dense;
 };
 
-struct StreamCccpFixture {
+struct StreamTpqFixture {
     std::vector<std::uint8_t> record;
     std::vector<float> dense;
     std::size_t shared_codebook_nbytes = 0;
@@ -1435,8 +1435,8 @@ struct StreamCccpFixture {
     int input = 0;
 };
 
-StreamCccpPoolFixture make_stream_cccp_pool(
-    StreamCccpProfile profile,
+StreamTpqPoolFixture make_stream_tpq_pool(
+    StreamTpqProfile profile,
     std::vector<std::int32_t> expert_ids,
     int output,
     int input,
@@ -1447,7 +1447,7 @@ StreamCccpPoolFixture make_stream_cccp_pool(
             && output > 0
             && input > 0
             && input % profile.vector_size == 0,
-        "invalid streamed CCCP fixture shape");
+        "invalid streamed TPQ fixture shape");
     const int blocks =
         input / profile.vector_size;
     std::vector<float> codebook(
@@ -1617,7 +1617,7 @@ assemble_stream_nim2(
     int output,
     int input,
     const std::vector<
-        StreamCccpPoolFixture>& pools) {
+        StreamTpqPoolFixture>& pools) {
     std::vector<std::uint8_t> result;
     append_magic(result, "NIM2");
     append<std::uint32_t>(result, experts);
@@ -1657,25 +1657,25 @@ assemble_stream_nim2(
     return result;
 }
 
-StreamCccpFixture
-make_stream_cccp_fixture() {
+StreamTpqFixture
+make_stream_tpq_fixture() {
     constexpr int experts = 14;
     constexpr int output = 1;
     constexpr int input = 24;
-    const std::vector<StreamCccpProfile>
+    const std::vector<StreamTpqProfile>
         profiles{
-            {"CCCP-X", 1, 8, 256, 8},
-            {"CCCP-X", 1, 8, 256, 12},
-            {"CCCP-X", 1, 8, 256, 14},
-            {"CCCP-W", 2, 8, 4096, 12},
-            {"CCCP-W", 2, 8, 4096, 14},
-            {"CCCP-W", 2, 8, 4096, 16},
-            {"CCCP-V", 3, 4, 256, 8},
-            {"CCCP-V", 3, 4, 256, 12},
-            {"CCCP-V", 3, 4, 256, 14},
-            {"CCCP-VV", 4, 4, 4096, 12},
-            {"CCCP-VV", 4, 4, 4096, 14},
-            {"CCCP-VV", 4, 4, 4096, 16},
+            {"TPQ-X", 1, 8, 256, 8},
+            {"TPQ-X", 1, 8, 256, 12},
+            {"TPQ-X", 1, 8, 256, 14},
+            {"TPQ-W", 2, 8, 4096, 12},
+            {"TPQ-W", 2, 8, 4096, 14},
+            {"TPQ-W", 2, 8, 4096, 16},
+            {"TPQ-V", 3, 4, 256, 8},
+            {"TPQ-V", 3, 4, 256, 12},
+            {"TPQ-V", 3, 4, 256, 14},
+            {"TPQ-VV", 4, 4, 4096, 12},
+            {"TPQ-VV", 4, 4, 4096, 14},
+            {"TPQ-VV", 4, 4, 4096, 16},
         };
     const std::vector<
         std::vector<std::int32_t>> ids{
@@ -1692,7 +1692,7 @@ make_stream_cccp_fixture() {
             {5},
             {11},
         };
-    std::vector<StreamCccpPoolFixture> pools;
+    std::vector<StreamTpqPoolFixture> pools;
     pools.reserve(profiles.size());
     std::vector<float> dense(
         static_cast<std::size_t>(
@@ -1705,7 +1705,7 @@ make_stream_cccp_fixture() {
         index < profiles.size();
         ++index
     ) {
-        auto pool = make_stream_cccp_pool(
+        auto pool = make_stream_tpq_pool(
             profiles[index],
             ids[index],
             output,
@@ -1786,13 +1786,13 @@ public:
         : path_(
               std::filesystem::
                   temp_directory_path()
-              / "mfq-metal-streamed-cccp-test.mfq") {
+              / "mfq-metal-streamed-tpq-test.mfq") {
         std::vector<std::uint8_t> file;
         append_magic(file, "MFQ1");
         append<std::uint32_t>(file, 1);
         append_mfq_string(
             file,
-            "streamed-cccp-test");
+            "streamed-tpq-test");
         append<std::uint32_t>(
             file,
             static_cast<std::uint32_t>(
@@ -1819,7 +1819,7 @@ public:
                 | std::ios::trunc);
         if (!stream) {
             throw std::runtime_error(
-                "cannot create streamed CCCP "
+                "cannot create streamed TPQ "
                 "test container");
         }
         stream.write(
@@ -1829,7 +1829,7 @@ public:
                 file.size()));
         if (!stream) {
             throw std::runtime_error(
-                "cannot write streamed CCCP "
+                "cannot write streamed TPQ "
                 "test container");
         }
     }
@@ -1861,20 +1861,20 @@ void require_stream_rejected(
     }
     require(
         rejected,
-        "streamed CCCP malformed fixture was "
+        "streamed TPQ malformed fixture was "
         "accepted: " + context);
 }
 
-void test_streamed_cccp_residency() {
+void test_streamed_tpq_residency() {
     auto fixture =
-        make_stream_cccp_fixture();
+        make_stream_tpq_fixture();
     constexpr int experts = 14;
     constexpr int output = 1;
     constexpr int input = 24;
 
     auto bad_tier_pool =
-        make_stream_cccp_pool(
-            {"CCCP-X", 1, 8, 256, 8},
+        make_stream_tpq_pool(
+            {"TPQ-X", 1, 8, 256, 8},
             {0},
             output,
             input,
@@ -1887,8 +1887,8 @@ void test_streamed_cccp_residency() {
         {bad_tier_pool});
 
     auto bad_padding_pool =
-        make_stream_cccp_pool(
-            {"CCCP-X", 1, 8, 256, 14},
+        make_stream_tpq_pool(
+            {"TPQ-X", 1, 8, 256, 14},
             {0},
             output,
             input,
@@ -1901,8 +1901,8 @@ void test_streamed_cccp_residency() {
         {bad_padding_pool});
 
     auto bad_index_pool =
-        make_stream_cccp_pool(
-            {"CCCP-W", 2, 8, 4096, 14},
+        make_stream_tpq_pool(
+            {"TPQ-W", 2, 8, 4096, 14},
             {0},
             output,
             input,
@@ -1915,22 +1915,22 @@ void test_streamed_cccp_residency() {
         {bad_index_pool});
 
     auto partial_small =
-        make_stream_cccp_pool(
-            {"CCCP-X", 1, 8, 256, 8},
+        make_stream_tpq_pool(
+            {"TPQ-X", 1, 8, 256, 8},
             {0},
             output,
             input,
             31);
     auto partial_large =
-        make_stream_cccp_pool(
-            {"CCCP-W", 2, 8, 4096, 14},
+        make_stream_tpq_pool(
+            {"TPQ-W", 2, 8, 4096, 14},
             {1},
             output,
             input,
             32);
     auto partial_late_failure =
-        make_stream_cccp_pool(
-            {"CCCP-X", 1, 8, 256, 12},
+        make_stream_tpq_pool(
+            {"TPQ-X", 1, 8, 256, 12},
             {3, 2},
             output,
             input,
@@ -1948,8 +1948,8 @@ void test_streamed_cccp_residency() {
             });
 
     auto p12_unaligned_pool =
-        make_stream_cccp_pool(
-            {"CCCP-W", 2, 8, 4096, 12},
+        make_stream_tpq_pool(
+            {"TPQ-W", 2, 8, 4096, 12},
             {2, 5, 7},
             output,
             input,
@@ -1963,8 +1963,8 @@ void test_streamed_cccp_residency() {
 
     constexpr int shifted_output = 3;
     auto p14_shifted_pool =
-        make_stream_cccp_pool(
-            {"CCCP-W", 2, 8, 4096, 14},
+        make_stream_tpq_pool(
+            {"TPQ-W", 2, 8, 4096, 14},
             {1, 3, 5, 7},
             shifted_output,
             input,
@@ -1977,15 +1977,15 @@ void test_streamed_cccp_residency() {
             {p14_shifted_pool});
 
     auto duplicate_first =
-        make_stream_cccp_pool(
-            {"CCCP-X", 1, 8, 256, 8},
+        make_stream_tpq_pool(
+            {"TPQ-X", 1, 8, 256, 8},
             {0},
             output,
             input,
             24);
     auto duplicate_second =
-        make_stream_cccp_pool(
-            {"CCCP-V", 3, 4, 256, 8},
+        make_stream_tpq_pool(
+            {"TPQ-V", 3, 4, 256, 8},
             {0},
             output,
             input,
@@ -2002,7 +2002,7 @@ void test_streamed_cccp_residency() {
     auto trailing = fixture.record;
     trailing.push_back(0);
 
-    StreamCccpPoolFixture fallback_pool;
+    StreamTpqPoolFixture fallback_pool;
     fallback_pool.profile.dtype = "NINT4";
     fallback_pool.expert_ids.resize(experts);
     for (int expert = 0; expert < experts; ++expert) {
@@ -2044,7 +2044,7 @@ void test_streamed_cccp_residency() {
     const mfq::metal::MfqContainer model(
         file.path());
     std::unique_ptr<
-        mfq::metal::MlxCccpExpertResidency>
+        mfq::metal::MlxTpqExpertResidency>
         detached_residency;
     {
         const mfq::metal::MfqContainer
@@ -2052,14 +2052,14 @@ void test_streamed_cccp_residency() {
         detached_residency =
             std::make_unique<
                 mfq::metal::
-                    MlxCccpExpertResidency>(
+                    MlxTpqExpertResidency>(
                 short_lived_model,
                 64,
                 experts);
         require(
             detached_residency->can_stream(
                 "good"),
-            "short-lived container CCCP parse failed");
+            "short-lived container TPQ parse failed");
     }
     const auto detached_weight =
         detached_residency->grouped(
@@ -2133,14 +2133,14 @@ void test_streamed_cccp_residency() {
         detached_expected,
         1.5e-3f);
 
-    mfq::metal::MlxCccpExpertResidency
+    mfq::metal::MlxTpqExpertResidency
         residency(model, 10, experts);
     require(
         residency.can_stream("good"),
-        "valid CCCP NIM2 record was not streamable");
+        "valid TPQ NIM2 record was not streamable");
     require(
         !residency.can_stream("fallback"),
-        "non-CCCP NIM2 record was streamable");
+        "non-TPQ NIM2 record was streamable");
     const auto info =
         residency.projection_info("good");
     require(
@@ -2150,7 +2150,7 @@ void test_streamed_cccp_residency() {
             && info.available_experts.size() == 13
             && info.shared_codebook_nbytes
                 == fixture.shared_codebook_nbytes,
-        "streamed CCCP projection metadata mismatch");
+        "streamed TPQ projection metadata mismatch");
     const auto available =
         residency.availability("good");
     require(
@@ -2158,7 +2158,7 @@ void test_streamed_cccp_residency() {
             && available[0] == 1
             && available[12] == 1
             && available[13] == 0,
-        "streamed CCCP global availability mismatch");
+        "streamed TPQ global availability mismatch");
 
     require_stream_rejected(
         [&] {
@@ -2195,12 +2195,12 @@ void test_streamed_cccp_residency() {
         },
         "missing codeword");
 
-    mfq::metal::MlxCccpExpertResidency
+    mfq::metal::MlxTpqExpertResidency
         transactional(model, 11, experts);
     require(
         transactional.can_stream(
             "partial_failure"),
-        "partial-failure CCCP metadata did not "
+        "partial-failure TPQ metadata did not "
         "parse");
     (void)transactional.grouped(
         "partial_failure",
@@ -2213,7 +2213,7 @@ void test_streamed_cccp_residency() {
             && transactional
                     .resident_packed_bytes()
                 == 9,
-        "transactional CCCP cache seed mismatch");
+        "transactional TPQ cache seed mismatch");
     const auto require_transaction_unchanged =
         [&](
             const auto& operation,
@@ -2228,7 +2228,7 @@ void test_streamed_cccp_residency() {
                     && transactional
                             .resident_packed_bytes()
                         == 9,
-                "failed CCCP grouped transaction "
+                "failed TPQ grouped transaction "
                 "changed cache accounting: "
                     + context);
         };
@@ -2263,15 +2263,15 @@ void test_streamed_cccp_residency() {
             && transactional
                     .resident_packed_bytes()
                 == 11,
-        "failed CCCP transaction changed LRU "
+        "failed TPQ transaction changed LRU "
         "ordering");
 
-    mfq::metal::MlxCccpExpertResidency
+    mfq::metal::MlxTpqExpertResidency
         alignment(model, 128, experts);
     const auto verify_stream_pool =
         [&](
             const std::string& name,
-            const StreamCccpPoolFixture& pool,
+            const StreamTpqPoolFixture& pool,
             int pool_output) {
             const auto routed =
                 alignment.grouped(
@@ -2313,7 +2313,7 @@ void test_streamed_cccp_residency() {
                         * static_cast<
                             std::size_t>(
                             pool_output),
-                "unaligned CCCP output shape "
+                "unaligned TPQ output shape "
                 "mismatch: " + name);
             for (
                 std::size_t local = 0;
@@ -2387,7 +2387,7 @@ void test_streamed_cccp_residency() {
         residency.cached_expert_count() == 2
             && residency.resident_packed_bytes()
                 == 12,
-        "active streamed CCCP experts were "
+        "active streamed TPQ experts were "
         "incorrectly evicted");
     (void)residency.grouped(
         "good",
@@ -2396,7 +2396,7 @@ void test_streamed_cccp_residency() {
         residency.cached_expert_count() == 1
             && residency.resident_packed_bytes()
                 == 5,
-        "streamed CCCP LRU byte eviction mismatch");
+        "streamed TPQ LRU byte eviction mismatch");
 
     std::vector<std::int32_t> active(13);
     for (
@@ -2417,7 +2417,7 @@ void test_streamed_cccp_residency() {
             && weight.neuron_len() == input
             && weight.shared_codebook_nbytes()
                 == fixture.shared_codebook_nbytes,
-        "streamed CCCP routed weight metadata mismatch");
+        "streamed TPQ routed weight metadata mismatch");
 
     constexpr int tokens = 5;
     constexpr int routes = 3;
@@ -2463,7 +2463,7 @@ void test_streamed_cccp_residency() {
         actual.size()
             == static_cast<std::size_t>(
                 tokens * routes * output),
-        "streamed CCCP routed output size mismatch");
+        "streamed TPQ routed output size mismatch");
     for (
         int token = 0;
         token < tokens;
@@ -2522,7 +2522,7 @@ void test_streamed_cccp_residency() {
         residency.cached_expert_count() == 0
             && residency.resident_packed_bytes()
                 == 0,
-        "streamed CCCP record discard mismatch");
+        "streamed TPQ record discard mismatch");
     const auto after_discard =
         evaluated_floats(
             weight.routed_matmul(
@@ -2545,14 +2545,14 @@ void test_streamed_cccp_residency() {
     residency.discard_record("not-present");
     require(
         residency.can_stream("good"),
-        "discarded CCCP projection could not be "
+        "discarded TPQ projection could not be "
         "parsed again");
     residency.clear();
     require(
         residency.cached_expert_count() == 0
             && residency.resident_packed_bytes()
                 == 0,
-        "streamed CCCP residency clear mismatch");
+        "streamed TPQ residency clear mismatch");
 }
 
 void test_all_families_and_projections() {
@@ -3892,10 +3892,10 @@ int main() {
         test_grouped_vq_mmq_prefill();
         test_grouped_mxfp4_vq_mmq_prefill();
         test_container_validation();
-        test_streamed_cccp_residency();
+        test_streamed_tpq_residency();
         std::cout
             << "MFQ native heterogeneous NINTM/streamed "
-               "CCCP routed Metal tests passed\n";
+               "TPQ routed Metal tests passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << "\n";

@@ -1,4 +1,4 @@
-#include "mlx_cccp.h"
+#include "mlx_tpq.h"
 
 #include <mlx/allocator.h>
 
@@ -26,9 +26,9 @@ using mlx::core::array;
 
 constexpr int kInt4GroupSize = 64;
 
-constexpr const char* kCccpIndexHeader = R"METAL(
+constexpr const char* kTpqIndexHeader = R"METAL(
 template <typename Stream>
-inline uint mfq_cccp_read_index(
+inline uint mfq_tpq_read_index(
     Stream indices,
     uint index,
     uint bits
@@ -366,7 +366,7 @@ constexpr const char* kPqMatmulSource = R"METAL(
     for (uint block = lane;
          block < uint(BLOCKS);
          block += 32u) {
-        uint code = mfq_cccp_read_index(
+        uint code = mfq_tpq_read_index(
             indices,
             output * uint(BLOCKS) + block,
             uint(INDEX_BITS));
@@ -430,7 +430,7 @@ constexpr const char* kPqGemvSource = R"METAL(
              ++local) {
             uint output =
                 min(output_base + local, uint(OUT) - 1u);
-            uint code = mfq_cccp_read_index(
+            uint code = mfq_tpq_read_index(
                 indices,
                 output * uint(BLOCKS) + block,
                 uint(INDEX_BITS));
@@ -488,7 +488,7 @@ constexpr const char* kPqMmqSource = R"METAL(
     for (uint block = k_lane;
          block < uint(BLOCKS);
          block += K_LANES) {
-        uint code = mfq_cccp_read_index(
+        uint code = mfq_tpq_read_index(
             indices,
             output * uint(BLOCKS) + block,
             uint(INDEX_BITS));
@@ -543,7 +543,7 @@ constexpr const char* kPqDequantizeSource = R"METAL(
     uint block = column / uint(VECTOR_SIZE);
     uint component =
         column - block * uint(VECTOR_SIZE);
-    uint code = mfq_cccp_read_index(
+    uint code = mfq_tpq_read_index(
         indices,
         output * uint(BLOCKS) + block,
         uint(INDEX_BITS));
@@ -753,20 +753,20 @@ struct PqProfile {
 };
 
 PqProfile pq_profile(std::string_view dtype) {
-    if (dtype == "TPQ-X" || dtype == "CCCP-X") {
+    if (dtype == "TPQ-X") {
         return {std::string(dtype), 1, 8, 256};
     }
-    if (dtype == "TPQ-W" || dtype == "CCCP-W") {
+    if (dtype == "TPQ-W") {
         return {std::string(dtype), 2, 8, 4096};
     }
-    if (dtype == "TPQ-V" || dtype == "CCCP-V") {
+    if (dtype == "TPQ-V") {
         return {std::string(dtype), 3, 4, 256};
     }
-    if (dtype == "TPQ-VV" || dtype == "CCCP-VV") {
+    if (dtype == "TPQ-VV") {
         return {std::string(dtype), 4, 4, 4096};
     }
     throw std::runtime_error(
-        "unsupported native Metal CCCP-PQ dtype: "
+        "unsupported native Metal TPQ-PQ dtype: "
         + std::string(dtype));
 }
 
@@ -807,7 +807,7 @@ mlx::core::fast::CustomKernelFunction make_kernel(
 const mlx::core::fast::CustomKernelFunction&
 int4_matmul_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_cccp_i4_packed_matmul",
+        "mfq_cpp_tpq_i4_packed_matmul",
         {"packed", "scales", "x"},
         kInt4MatmulSource);
     return kernel;
@@ -816,7 +816,7 @@ int4_matmul_kernel() {
 const mlx::core::fast::CustomKernelFunction&
 int4_gemv_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_cccp_i4_packed_gemv",
+        "mfq_cpp_tpq_i4_packed_gemv",
         {"packed", "scales", "x"},
         kInt4GemvSource);
     return kernel;
@@ -825,7 +825,7 @@ int4_gemv_kernel() {
 const mlx::core::fast::CustomKernelFunction&
 int4_mmq_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_cccp_i4_packed_mmq",
+        "mfq_cpp_tpq_i4_packed_mmq",
         {"packed", "scales", "x"},
         kInt4MmqSource);
     return kernel;
@@ -834,7 +834,7 @@ int4_mmq_kernel() {
 const mlx::core::fast::CustomKernelFunction&
 int4_dequantize_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_cccp_i4_dequantize",
+        "mfq_cpp_tpq_i4_dequantize",
         {"packed", "scales"},
         kInt4DequantizeSource);
     return kernel;
@@ -843,7 +843,7 @@ int4_dequantize_kernel() {
 const mlx::core::fast::CustomKernelFunction&
 int4_embedding_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_cccp_i4_embedding",
+        "mfq_cpp_tpq_i4_embedding",
         {"packed", "scales", "token_ids"},
         kInt4EmbeddingSource);
     return kernel;
@@ -852,7 +852,7 @@ int4_embedding_kernel() {
 const mlx::core::fast::CustomKernelFunction&
 int4_grouped_row_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_cccp_i4_grouped_row",
+        "mfq_cpp_tpq_i4_grouped_row",
         {"packed", "scales", "x"},
         kInt4GroupedRowSource);
     return kernel;
@@ -861,40 +861,40 @@ int4_grouped_row_kernel() {
 const mlx::core::fast::CustomKernelFunction&
 pq_matmul_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_cccp_pq_packed_matmul",
+        "mfq_cpp_tpq_pq_packed_matmul",
         {"indices", "codebook", "x"},
         kPqMatmulSource,
-        kCccpIndexHeader);
+        kTpqIndexHeader);
     return kernel;
 }
 
 const mlx::core::fast::CustomKernelFunction&
 pq_gemv_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_cccp_pq_packed_gemv",
+        "mfq_cpp_tpq_pq_packed_gemv",
         {"indices", "codebook", "x"},
         kPqGemvSource,
-        kCccpIndexHeader);
+        kTpqIndexHeader);
     return kernel;
 }
 
 const mlx::core::fast::CustomKernelFunction&
 pq_mmq_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_cccp_pq_packed_mmq",
+        "mfq_cpp_tpq_pq_packed_mmq",
         {"indices", "codebook", "x"},
         kPqMmqSource,
-        kCccpIndexHeader);
+        kTpqIndexHeader);
     return kernel;
 }
 
 const mlx::core::fast::CustomKernelFunction&
 pq_dequantize_kernel() {
     static const auto kernel = make_kernel(
-        "mfq_cpp_cccp_pq_dequantize",
+        "mfq_cpp_tpq_pq_dequantize",
         {"indices", "codebook"},
         kPqDequantizeSource,
-        kCccpIndexHeader);
+        kTpqIndexHeader);
     return kernel;
 }
 
@@ -1058,19 +1058,10 @@ bool is_tpq_dtype(std::string_view dtype) noexcept {
         dtype == "TPQ-X" ||
         dtype == "TPQ-W" ||
         dtype == "TPQ-V" ||
-        dtype == "TPQ-VV" ||
-        dtype == "CCCP-I4G64" ||
-        dtype == "CCCP-X" ||
-        dtype == "CCCP-W" ||
-        dtype == "CCCP-V" ||
-        dtype == "CCCP-VV";
+        dtype == "TPQ-VV";
 }
 
-bool is_cccp_dtype(std::string_view dtype) noexcept {
-    return is_tpq_dtype(dtype);
-}
-
-MlxCccpInt4Weight::MlxCccpInt4Weight(
+MlxTpqInt4Weight::MlxTpqInt4Weight(
     array packed,
     array scales,
     int input_size,
@@ -1084,17 +1075,17 @@ MlxCccpInt4Weight::MlxCccpInt4Weight(
       group_size_(group_size),
       groups_(groups) {}
 
-MlxCccpInt4Weight
-MlxCccpInt4Weight::from_blob(
+MlxTpqInt4Weight
+MlxTpqInt4Weight::from_blob(
     const std::vector<std::uint8_t>& blob) {
-    BlobCursor cursor(blob, "CCCP-I4G64");
+    BlobCursor cursor(blob, "TPQ-I4G64");
     const auto magic = cursor.bytes(4, "magic");
     if (
         std::memcmp(magic.data(), "CI41", 4) != 0 ||
         cursor.scalar<std::uint8_t>("version") != 1
     ) {
         throw std::runtime_error(
-            "invalid CCCP-I4G64 header");
+            "invalid TPQ-I4G64 header");
     }
     const auto padding = cursor.bytes(3, "padding");
     if (
@@ -1106,7 +1097,7 @@ MlxCccpInt4Weight::from_blob(
             })
     ) {
         throw std::runtime_error(
-            "CCCP-I4G64 reserved padding is nonzero");
+            "TPQ-I4G64 reserved padding is nonzero");
     }
     const auto group_size =
         cursor.scalar<std::uint32_t>("group size");
@@ -1126,7 +1117,7 @@ MlxCccpInt4Weight::from_blob(
         dimensions != 2
     ) {
         throw std::runtime_error(
-            "CCCP-I4G64 requires a row-major "
+            "TPQ-I4G64 requires a row-major "
             "group-64 rank-two matrix");
     }
     const auto output_shape =
@@ -1147,36 +1138,36 @@ MlxCccpInt4Weight::from_blob(
                 neuron_len / kInt4GroupSize)
     ) {
         throw std::runtime_error(
-            "inconsistent CCCP-I4G64 dimensions");
+            "inconsistent TPQ-I4G64 dimensions");
     }
     const int output_size =
         checked_positive_int(
             rows,
-            "CCCP-I4G64 row count");
+            "TPQ-I4G64 row count");
     const int input_size =
         checked_positive_int(
             static_cast<std::uint64_t>(neuron_len),
-            "CCCP-I4G64 input width");
+            "TPQ-I4G64 input width");
     const int group_count =
         checked_positive_int(
             groups,
-            "CCCP-I4G64 group count");
+            "TPQ-I4G64 group count");
     const auto packed_count = checked_product(
         static_cast<std::size_t>(output_size),
         static_cast<std::size_t>(input_size / 2),
-        "CCCP-I4G64 packed values");
+        "TPQ-I4G64 packed values");
     const auto scale_count = checked_product(
         static_cast<std::size_t>(output_size),
         static_cast<std::size_t>(group_count),
-        "CCCP-I4G64 scales");
+        "TPQ-I4G64 scales");
     const auto expected = packed_count +
         checked_product(
             scale_count,
             sizeof(std::uint16_t),
-            "CCCP-I4G64 scales");
+            "TPQ-I4G64 scales");
     if (cursor.remaining() != expected) {
         throw std::runtime_error(
-            "invalid CCCP-I4G64 payload length");
+            "invalid TPQ-I4G64 payload length");
     }
     auto packed =
         cursor.bytes(
@@ -1193,15 +1184,15 @@ MlxCccpInt4Weight::from_blob(
             half_to_float(scales[index]);
         if (!std::isfinite(value) || value < 0.0f) {
             throw std::runtime_error(
-                "CCCP-I4G64 scale must be "
+                "TPQ-I4G64 scale must be "
                 "finite and nonnegative");
         }
     }
     if (cursor.remaining() != 0) {
         throw std::runtime_error(
-            "trailing bytes in CCCP-I4G64 tensor");
+            "trailing bytes in TPQ-I4G64 tensor");
     }
-    return MlxCccpInt4Weight(
+    return MlxTpqInt4Weight(
         make_u8_array(
             std::move(packed),
             Shape{
@@ -1221,31 +1212,31 @@ MlxCccpInt4Weight::from_blob(
 }
 
 std::size_t
-MlxCccpInt4Weight::packed_nbytes() const noexcept {
+MlxTpqInt4Weight::packed_nbytes() const noexcept {
     return packed_.nbytes() + scales_.nbytes();
 }
 
-array MlxCccpInt4Weight::dequantize(
+array MlxTpqInt4Weight::dequantize(
     Dtype dtype) const {
     if (
         dtype != mlx::core::float16 &&
         dtype != mlx::core::float32
     ) {
         throw std::runtime_error(
-            "CCCP-I4G64 dequantization requires "
+            "TPQ-I4G64 dequantization requires "
             "float16 or float32 output");
     }
     const auto elements = checked_product(
         static_cast<std::size_t>(output_size_),
         static_cast<std::size_t>(input_size_),
-        "CCCP-I4G64 dequantization");
+        "TPQ-I4G64 dequantization");
     if (
         elements >
             static_cast<std::size_t>(
                 std::numeric_limits<int>::max())
     ) {
         throw std::runtime_error(
-            "CCCP-I4G64 dequantization grid "
+            "TPQ-I4G64 dequantization grid "
             "exceeds MLX limits");
     }
     auto outputs = int4_dequantize_kernel()(
@@ -1274,7 +1265,7 @@ array MlxCccpInt4Weight::dequantize(
     return std::move(outputs.front());
 }
 
-array MlxCccpInt4Weight::embedding(
+array MlxTpqInt4Weight::embedding(
     const array& token_ids,
     Dtype dtype) const {
     if (
@@ -1282,7 +1273,7 @@ array MlxCccpInt4Weight::embedding(
         dtype != mlx::core::float32
     ) {
         throw std::runtime_error(
-            "CCCP-I4G64 embedding requires "
+            "TPQ-I4G64 embedding requires "
             "float16 or float32 output");
     }
     auto ids = token_ids;
@@ -1305,7 +1296,7 @@ array MlxCccpInt4Weight::embedding(
     const auto elements = checked_product(
         count,
         static_cast<std::size_t>(input_size_),
-        "CCCP-I4G64 embedding");
+        "TPQ-I4G64 embedding");
     if (
         count >
             static_cast<std::size_t>(
@@ -1315,7 +1306,7 @@ array MlxCccpInt4Weight::embedding(
                 std::numeric_limits<int>::max())
     ) {
         throw std::runtime_error(
-            "CCCP-I4G64 embedding grid "
+            "TPQ-I4G64 embedding grid "
             "exceeds MLX limits");
     }
     ids = mlx::core::contiguous(
@@ -1357,7 +1348,7 @@ array MlxCccpInt4Weight::embedding(
         std::move(output_shape));
 }
 
-array MlxCccpInt4Weight::prepare_input(
+array MlxTpqInt4Weight::prepare_input(
     const array& input,
     Shape& prefix,
     int& rows) const {
@@ -1366,7 +1357,7 @@ array MlxCccpInt4Weight::prepare_input(
         input.shape(-1) != input_size_
     ) {
         throw std::runtime_error(
-            "CCCP-I4G64 input width does not "
+            "TPQ-I4G64 input width does not "
             "match packed weight");
     }
     auto source = input;
@@ -1388,13 +1379,13 @@ array MlxCccpInt4Weight::prepare_input(
                 static_cast<int>(dimension));
         if (extent < 0) {
             throw std::runtime_error(
-                "invalid CCCP-I4G64 input shape");
+                "invalid TPQ-I4G64 input shape");
         }
         prefix.push_back(extent);
         row_count = checked_product(
             row_count,
             static_cast<std::size_t>(extent),
-            "CCCP-I4G64 input rows");
+            "TPQ-I4G64 input rows");
     }
     if (
         row_count >
@@ -1402,7 +1393,7 @@ array MlxCccpInt4Weight::prepare_input(
                 std::numeric_limits<int>::max())
     ) {
         throw std::runtime_error(
-            "CCCP-I4G64 input row count "
+            "TPQ-I4G64 input row count "
             "exceeds MLX limits");
     }
     rows = static_cast<int>(row_count);
@@ -1412,7 +1403,7 @@ array MlxCccpInt4Weight::prepare_input(
             Shape{rows, input_size_}));
 }
 
-array MlxCccpInt4Weight::reshape_output(
+array MlxTpqInt4Weight::reshape_output(
     array value,
     const Shape& prefix) const {
     Shape output_shape = prefix;
@@ -1422,7 +1413,7 @@ array MlxCccpInt4Weight::reshape_output(
         std::move(output_shape));
 }
 
-array MlxCccpInt4Weight::packed_matmul(
+array MlxTpqInt4Weight::packed_matmul(
     const array& source,
     const Shape& prefix,
     int rows,
@@ -1436,14 +1427,14 @@ array MlxCccpInt4Weight::packed_matmul(
     }
     if (tile_rows <= 0 || tile_rows > 16) {
         throw std::runtime_error(
-            "invalid CCCP-I4G64 packed row tile");
+            "invalid TPQ-I4G64 packed row tile");
     }
     auto [grid, threadgroup, effective_tile, kind] =
         packed_grid(
             rows,
             output_size_,
             tile_rows,
-            "CCCP-I4G64");
+            "TPQ-I4G64");
     auto templates = int4_templates(
         source.dtype(),
         input_size_,
@@ -1476,7 +1467,7 @@ array MlxCccpInt4Weight::packed_matmul(
         prefix);
 }
 
-array MlxCccpInt4Weight::gemv(
+array MlxTpqInt4Weight::gemv(
     const array& input) const {
     Shape prefix;
     int rows = 0;
@@ -1484,7 +1475,7 @@ array MlxCccpInt4Weight::gemv(
         prepare_input(input, prefix, rows);
     if (rows != 1) {
         throw std::runtime_error(
-            "CCCP-I4G64 GEMV requires "
+            "TPQ-I4G64 GEMV requires "
             "exactly one input row");
     }
     return packed_matmul(
@@ -1494,7 +1485,7 @@ array MlxCccpInt4Weight::gemv(
         1);
 }
 
-array MlxCccpInt4Weight::mmq(
+array MlxTpqInt4Weight::mmq(
     const array& input) const {
     Shape prefix;
     int rows = 0;
@@ -1502,7 +1493,7 @@ array MlxCccpInt4Weight::mmq(
         prepare_input(input, prefix, rows);
     if (rows < 2 || rows > 16) {
         throw std::runtime_error(
-            "CCCP-I4G64 MMQ requires "
+            "TPQ-I4G64 MMQ requires "
             "2 to 16 input rows");
     }
     return packed_matmul(
@@ -1512,7 +1503,7 @@ array MlxCccpInt4Weight::mmq(
         rows);
 }
 
-array MlxCccpInt4Weight::gemm(
+array MlxTpqInt4Weight::gemm(
     const array& input) const {
     Shape prefix;
     int rows = 0;
@@ -1525,7 +1516,7 @@ array MlxCccpInt4Weight::gemm(
         8);
 }
 
-array MlxCccpInt4Weight::matmul(
+array MlxTpqInt4Weight::matmul(
     const array& input) const {
     Shape prefix;
     int rows = 0;
@@ -1568,7 +1559,7 @@ array MlxCccpInt4Weight::matmul(
         8);
 }
 
-array MlxCccpInt4Weight::grouped_row_matmul(
+array MlxTpqInt4Weight::grouped_row_matmul(
     const array& input,
     int group_count) const {
     if (
@@ -1579,7 +1570,7 @@ array MlxCccpInt4Weight::grouped_row_matmul(
         output_size_ % group_count != 0
     ) {
         throw std::runtime_error(
-            "CCCP-I4G64 grouped-row input "
+            "TPQ-I4G64 grouped-row input "
             "or weight shape is incompatible");
     }
     auto source = input;
@@ -1598,12 +1589,12 @@ array MlxCccpInt4Weight::grouped_row_matmul(
     for (const int extent : prefix) {
         if (extent < 0) {
             throw std::runtime_error(
-                "invalid CCCP-I4G64 grouped-row shape");
+                "invalid TPQ-I4G64 grouped-row shape");
         }
         row_count = checked_product(
             row_count,
             static_cast<std::size_t>(extent),
-            "CCCP-I4G64 grouped-row rows");
+            "TPQ-I4G64 grouped-row rows");
     }
     const int out_per_group =
         output_size_ / group_count;
@@ -1621,7 +1612,7 @@ array MlxCccpInt4Weight::grouped_row_matmul(
                 std::numeric_limits<int>::max())
     ) {
         throw std::runtime_error(
-            "CCCP-I4G64 grouped-row count "
+            "TPQ-I4G64 grouped-row count "
             "exceeds MLX limits");
     }
     const int rows =
@@ -1638,20 +1629,20 @@ array MlxCccpInt4Weight::grouped_row_matmul(
         checked_product(
             row_count,
             static_cast<std::size_t>(group_count),
-            "CCCP-I4G64 grouped-row tasks"),
+            "TPQ-I4G64 grouped-row tasks"),
         static_cast<std::size_t>(out_per_group),
-        "CCCP-I4G64 grouped-row tasks");
+        "TPQ-I4G64 grouped-row tasks");
     const auto grid_x = checked_product(
         tasks,
         std::size_t{32},
-        "CCCP-I4G64 grouped-row grid");
+        "TPQ-I4G64 grouped-row grid");
     if (
         grid_x >
             static_cast<std::size_t>(
                 std::numeric_limits<int>::max())
     ) {
         throw std::runtime_error(
-            "CCCP-I4G64 grouped-row grid "
+            "TPQ-I4G64 grouped-row grid "
             "exceeds MLX limits");
     }
     auto templates = int4_templates(
@@ -1692,7 +1683,7 @@ array MlxCccpInt4Weight::grouped_row_matmul(
         std::move(output_shape));
 }
 
-MlxCccpPqWeight::MlxCccpPqWeight(
+MlxTpqPqWeight::MlxTpqPqWeight(
     array indices,
     array codebook,
     std::string format_label,
@@ -1712,7 +1703,7 @@ MlxCccpPqWeight::MlxCccpPqWeight(
       entries_(entries),
       index_bits_(index_bits) {}
 
-MlxCccpPqWeight MlxCccpPqWeight::from_blob(
+MlxTpqPqWeight MlxTpqPqWeight::from_blob(
     std::string_view dtype,
     const std::vector<std::uint8_t>& blob) {
     const auto profile = pq_profile(dtype);
@@ -1779,28 +1770,28 @@ MlxCccpPqWeight MlxCccpPqWeight::from_blob(
     const int output_size =
         checked_positive_int(
             rows,
-            "CCCP-PQ row count");
+            "TPQ-PQ row count");
     const int input_size =
         checked_positive_int(
             static_cast<std::uint64_t>(neuron_len),
-            "CCCP-PQ input width");
+            "TPQ-PQ input width");
     const int blocks = input_size / vector_size;
     const auto codebook_values = checked_product(
         static_cast<std::size_t>(profile.entries),
         static_cast<std::size_t>(vector_size),
-        "CCCP-PQ codebook");
+        "TPQ-PQ codebook");
     const auto codebook_bytes = checked_product(
         codebook_values,
         sizeof(float),
-        "CCCP-PQ codebook");
+        "TPQ-PQ codebook");
     const auto index_count = checked_product(
         static_cast<std::size_t>(output_size),
         static_cast<std::size_t>(blocks),
-        "CCCP-PQ indices");
+        "TPQ-PQ indices");
     const auto index_bytes = packed_size(
         index_count,
         index_bits,
-        "CCCP-PQ indices");
+        "TPQ-PQ indices");
     if (
         cursor.remaining() !=
             codebook_bytes + index_bytes
@@ -1848,7 +1839,7 @@ MlxCccpPqWeight MlxCccpPqWeight::from_blob(
             + " tensor");
     }
     indices.insert(indices.end(), 2, 0);
-    return MlxCccpPqWeight(
+    return MlxTpqPqWeight(
         make_u8_array(
             std::move(indices),
             Shape{
@@ -1870,31 +1861,31 @@ MlxCccpPqWeight MlxCccpPqWeight::from_blob(
 }
 
 std::size_t
-MlxCccpPqWeight::packed_nbytes() const noexcept {
+MlxTpqPqWeight::packed_nbytes() const noexcept {
     return indices_.nbytes() + codebook_.nbytes();
 }
 
-array MlxCccpPqWeight::dequantize(
+array MlxTpqPqWeight::dequantize(
     Dtype dtype) const {
     if (
         dtype != mlx::core::float16 &&
         dtype != mlx::core::float32
     ) {
         throw std::runtime_error(
-            "CCCP-PQ dequantization requires "
+            "TPQ-PQ dequantization requires "
             "float16 or float32 output");
     }
     const auto elements = checked_product(
         static_cast<std::size_t>(output_size_),
         static_cast<std::size_t>(input_size_),
-        "CCCP-PQ dequantization");
+        "TPQ-PQ dequantization");
     if (
         elements >
             static_cast<std::size_t>(
                 std::numeric_limits<int>::max())
     ) {
         throw std::runtime_error(
-            "CCCP-PQ dequantization grid "
+            "TPQ-PQ dequantization grid "
             "exceeds MLX limits");
     }
     auto outputs = pq_dequantize_kernel()(
@@ -1924,7 +1915,7 @@ array MlxCccpPqWeight::dequantize(
     return std::move(outputs.front());
 }
 
-array MlxCccpPqWeight::prepare_input(
+array MlxTpqPqWeight::prepare_input(
     const array& input,
     Shape& prefix,
     int& rows) const {
@@ -1933,7 +1924,7 @@ array MlxCccpPqWeight::prepare_input(
         input.shape(-1) != input_size_
     ) {
         throw std::runtime_error(
-            "CCCP-PQ input width does not "
+            "TPQ-PQ input width does not "
             "match packed weight");
     }
     auto source = input;
@@ -1955,13 +1946,13 @@ array MlxCccpPqWeight::prepare_input(
                 static_cast<int>(dimension));
         if (extent < 0) {
             throw std::runtime_error(
-                "invalid CCCP-PQ input shape");
+                "invalid TPQ-PQ input shape");
         }
         prefix.push_back(extent);
         row_count = checked_product(
             row_count,
             static_cast<std::size_t>(extent),
-            "CCCP-PQ input rows");
+            "TPQ-PQ input rows");
     }
     if (
         row_count >
@@ -1969,7 +1960,7 @@ array MlxCccpPqWeight::prepare_input(
                 std::numeric_limits<int>::max())
     ) {
         throw std::runtime_error(
-            "CCCP-PQ input row count "
+            "TPQ-PQ input row count "
             "exceeds MLX limits");
     }
     rows = static_cast<int>(row_count);
@@ -1979,7 +1970,7 @@ array MlxCccpPqWeight::prepare_input(
             Shape{rows, input_size_}));
 }
 
-array MlxCccpPqWeight::reshape_output(
+array MlxTpqPqWeight::reshape_output(
     array value,
     const Shape& prefix) const {
     Shape output_shape = prefix;
@@ -1989,7 +1980,7 @@ array MlxCccpPqWeight::reshape_output(
         std::move(output_shape));
 }
 
-array MlxCccpPqWeight::packed_matmul(
+array MlxTpqPqWeight::packed_matmul(
     const array& source,
     const Shape& prefix,
     int rows,
@@ -2003,14 +1994,14 @@ array MlxCccpPqWeight::packed_matmul(
     }
     if (tile_rows <= 0 || tile_rows > 16) {
         throw std::runtime_error(
-            "invalid CCCP-PQ packed row tile");
+            "invalid TPQ-PQ packed row tile");
     }
     auto [grid, threadgroup, effective_tile, kind] =
         packed_grid(
             rows,
             output_size_,
             tile_rows,
-            "CCCP-PQ");
+            "TPQ-PQ");
     auto templates = pq_templates(
         source.dtype(),
         input_size_,
@@ -2044,7 +2035,7 @@ array MlxCccpPqWeight::packed_matmul(
         prefix);
 }
 
-array MlxCccpPqWeight::gemv(
+array MlxTpqPqWeight::gemv(
     const array& input) const {
     Shape prefix;
     int rows = 0;
@@ -2052,7 +2043,7 @@ array MlxCccpPqWeight::gemv(
         prepare_input(input, prefix, rows);
     if (rows != 1) {
         throw std::runtime_error(
-            "CCCP-PQ GEMV requires exactly "
+            "TPQ-PQ GEMV requires exactly "
             "one input row");
     }
     return packed_matmul(
@@ -2062,7 +2053,7 @@ array MlxCccpPqWeight::gemv(
         1);
 }
 
-array MlxCccpPqWeight::mmq(
+array MlxTpqPqWeight::mmq(
     const array& input) const {
     Shape prefix;
     int rows = 0;
@@ -2070,7 +2061,7 @@ array MlxCccpPqWeight::mmq(
         prepare_input(input, prefix, rows);
     if (rows < 2 || rows > 16) {
         throw std::runtime_error(
-            "CCCP-PQ MMQ requires 2 to 16 "
+            "TPQ-PQ MMQ requires 2 to 16 "
             "input rows");
     }
     return packed_matmul(
@@ -2080,7 +2071,7 @@ array MlxCccpPqWeight::mmq(
         rows);
 }
 
-array MlxCccpPqWeight::gemm(
+array MlxTpqPqWeight::gemm(
     const array& input) const {
     Shape prefix;
     int rows = 0;
@@ -2093,7 +2084,7 @@ array MlxCccpPqWeight::gemm(
         8);
 }
 
-array MlxCccpPqWeight::matmul(
+array MlxTpqPqWeight::matmul(
     const array& input) const {
     Shape prefix;
     int rows = 0;

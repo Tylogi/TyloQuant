@@ -1,7 +1,7 @@
-"""发布版静态检查与容量规划。
+"""Release static checks and capacity planning.
 
-该命令不加载模型权重，也不编译 CUDA 扩展；适合在正式启动前检查模型文件、
-RAM/VRAM 余量、GPU 可见性、P2P 和 GLM TP2–TP8 容量。
+This command does not load model weights or compile CUDA extensions. It is suitable for checking model files,
+RAM/VRAM margins, GPU visibility, P2P, and GLM TP2-TP8 capacity before production startup.
 """
 
 from __future__ import annotations
@@ -126,7 +126,7 @@ def _default_expert_kind(manifest: dict[str, Any]) -> str:
             return kind
     if kinds:
         return next(iter(kinds))
-    raise ValueError("cccp.json 的 quant.vq 为空")
+    raise ValueError("tpq.json 的 quant.vq 为空")
 
 
 def _expert_kind(
@@ -213,8 +213,8 @@ def _slot_bytes(
             total += (indices * bits + 7) // 8
         return total
     base = kind.rstrip("z")
-    # 单字符层配额需要同时区分 v 与 vv；历史 CCCP 清单以大写
-    # ``V`` 表示 vv。容量规划只应规范化存储档位，不应依赖模型架构。
+    # Single-character layer quotas must distinguish v from vv; historical TPQ manifests use uppercase ``V`` for vv.
+    # Capacity planning should normalize storage tiers only and must not depend on model architecture.
     if base == "V" and "vv" in manifest["quant"]["vq"]:
         base = "vv"
     dimensions = manifest["quant"]["vq"].get(base)
@@ -274,7 +274,7 @@ def expert_plan_bytes(
 def _required_files(root: Path, manifest: dict[str, Any]) -> list[Path]:
     expert_files = _expert_files(manifest)
     names = {
-        "tpq.json" if (root / "tpq.json").is_file() else "cccp.json",
+        "tpq.json",
         *expert_files.values(),
     }
     tokenizer_files = manifest.get("tokenizer_files")

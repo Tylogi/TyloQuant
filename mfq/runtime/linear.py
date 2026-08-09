@@ -1,7 +1,7 @@
-"""NintLinear：权重为 :class:`~mfq.quantize.nint_quant.NintTensor` 的线性层。
+"""NintLinear: a linear layer whose weights are :class:`~mfq.quantize.nint_quant.NintTensor`.
 
-惰性反量化（首次访问时算并缓存）+ matmul。numpy 参考实现；真实 kernel 时代
-dequant+matmul 会融合（在 :mod:`mfq.runtime.dequantize` 注册的 backend 里）。
+Lazy dequantization (computed and cached on first access) plus matmul. This is the NumPy reference implementation;
+real kernels will fuse dequantization and matmul in backends registered with :mod:`mfq.runtime.dequantize`.
 """
 
 from __future__ import annotations
@@ -15,11 +15,11 @@ from mfq.runtime.dequantize import dequantize
 
 
 class NintLinear:
-    """``y = x · Wᵀ (+ b)``，W 为 NintTensor（按 neuron 轴 quantize 时的 axis=0）。
+    """``y = x * W^T (+ b)``, where W is an NintTensor (axis=0 for quantization along the neuron axis).
 
     Attributes:
-        weight_tensor: 量化权重（shape 还原后为 ``[out, in]``）。
-        bias: 可选偏置（float32，``[out]``）。
+        weight_tensor: Quantized weights with restored shape ``[out, in]``.
+        bias: Optional float32 bias of shape ``[out]``.
     """
 
     def __init__(self, weight_tensor: NintTensor, bias: Optional[np.ndarray] = None) -> None:
@@ -29,7 +29,7 @@ class NintLinear:
 
     @property
     def weight(self) -> np.ndarray:
-        """惰性反量化并缓存的全精度权重。"""
+        """Full-precision weights that are lazily dequantized and cached."""
         if self._w is None:
             self._w = dequantize(self.weight_tensor)
         return self._w

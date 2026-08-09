@@ -1,4 +1,4 @@
-"""TPQ 通用算子层。"""
+"""TPQ generic operator layer."""
 
 from .api import (
     attention_step,

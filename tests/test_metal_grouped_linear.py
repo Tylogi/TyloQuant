@@ -14,9 +14,9 @@ except RuntimeError:
     pytest.skip("Metal device unavailable", allow_module_level=True)
 
 from mfq.formats.tpq import (  # noqa: E402
-    CccpInt4Tensor,
-    CccpPqSpec,
-    CccpPqTensor,
+    TpqInt4Tensor,
+    TpqPqSpec,
+    TpqPqTensor,
 )
 from mfq.formats.nepq import NEPQ1_S, dequantize_nepq, rotation_signs  # noqa: E402
 from mfq.formats.nint import NintSpec  # noqa: E402
@@ -124,13 +124,13 @@ def test_grouped_linear_mixes_nint_q8_and_vq_with_variable_outputs(rows: int):
         )
 
 
-def test_grouped_linear_mixes_cccp_int4_and_p12():
+def test_grouped_linear_mixes_tpq_int4_and_p12():
     rng = np.random.default_rng(20260820)
     width = 64
     quantized = rng.integers(-8, 8, size=(9, width), dtype=np.int16)
     packed = ((quantized[:, 0::2] + 8) | ((quantized[:, 1::2] + 8) << 4)).astype(np.uint8)
     scales = rng.uniform(0.01, 0.1, size=(9, 1)).astype(np.float16)
-    int4 = CccpInt4Tensor(
+    int4 = TpqInt4Tensor(
         shape=(9, width),
         axis=0,
         neuron_len=width,
@@ -140,7 +140,7 @@ def test_grouped_linear_mixes_cccp_int4_and_p12():
     )
     int4_dense = quantized.astype(np.float32) * scales.astype(np.float32)
 
-    spec = CccpPqSpec("w", 8, 300, storage_bits=12)
+    spec = TpqPqSpec("w", 8, 300, storage_bits=12)
     indices = rng.integers(
         0,
         spec.codebook_entries,
@@ -152,7 +152,7 @@ def test_grouped_linear_mixes_cccp_int4_and_p12():
         0.1,
         size=(spec.codebook_entries, spec.vector_size),
     ).astype(np.float32)
-    pq = CccpPqTensor(
+    pq = TpqPqTensor(
         spec=spec,
         shape=(7, width),
         axis=0,

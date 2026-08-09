@@ -36,9 +36,6 @@ json parse_json(
 json config_object(const json& root) {
     json value = root;
     auto embedded = value.find("tpq_manifest");
-    if (embedded == value.end()) {
-        embedded = value.find("cccp_manifest");
-    }
     if (embedded != value.end()) {
         if (embedded->is_string()) {
             value = parse_json(
@@ -522,27 +519,21 @@ bool is_nint_dtype(std::string_view dtype) {
     return dtype[4] >= '1' && dtype[4] <= '8';
 }
 
-bool is_cccp_pq_dtype(std::string_view dtype) {
+bool is_tpq_pq_dtype(std::string_view dtype) {
     return dtype == "TPQ-X" ||
         dtype == "TPQ-W" ||
         dtype == "TPQ-V" ||
-        dtype == "TPQ-VV" ||
-        dtype == "CCCP-X" ||
-        dtype == "CCCP-W" ||
-        dtype == "CCCP-V" ||
-        dtype == "CCCP-VV";
+        dtype == "TPQ-VV";
 }
 
 bool is_tpq_int4_dtype(std::string_view dtype) {
-    return dtype == "TPQ-I4G64" ||
-        dtype == "CCCP-I4G64";
+    return dtype == "TPQ-I4G64";
 }
 
 bool is_tpq_tier(
     std::string_view dtype,
     std::string_view tier) {
-    return dtype == "TPQ-" + std::string(tier) ||
-        dtype == "CCCP-" + std::string(tier);
+    return dtype == "TPQ-" + std::string(tier);
 }
 
 bool is_linear_dtype(std::string_view dtype) {
@@ -551,7 +542,7 @@ bool is_linear_dtype(std::string_view dtype) {
         is_nint_dtype(dtype) ||
         dtype == "NINT8-0" ||
         is_tpq_int4_dtype(dtype) ||
-        is_cccp_pq_dtype(dtype);
+        is_tpq_pq_dtype(dtype);
 }
 
 bool is_embedding_dtype(std::string_view dtype) {
@@ -716,23 +707,16 @@ DeepseekV4Config DeepseekV4Config::from_mfq(
         return from_json(model.read_text(model_config_asset));
     }
     if (model.header().architecture !=
-            "deepseek_v4-tpq-mfq" &&
-        model.header().architecture !=
-            "deepseek_v4-cccp-mfq") {
+            "deepseek_v4-tpq-mfq") {
         throw std::runtime_error(
             "DeepSeek-V4 C++ loading requires architecture "
-            "deepseek_v4-tpq-mfq (legacy "
-            "deepseek_v4-cccp-mfq is also accepted), received: " +
+            "deepseek_v4-tpq-mfq, received: " +
             model.header().architecture);
     }
     const auto source =
         model.header().extra_json.find("source_format");
     auto manifest =
         model.header().extra_json.find("tpq_manifest");
-    if (manifest == model.header().extra_json.end()) {
-        manifest =
-            model.header().extra_json.find("cccp_manifest");
-    }
     if (source == model.header().extra_json.end() ||
         manifest == model.header().extra_json.end()) {
         throw std::runtime_error(
@@ -748,26 +732,26 @@ DeepseekV4Config DeepseekV4Config::from_mfq(
             error.what());
     }
     if (!source_value.is_string() ||
-        source_value.get<std::string>() != "cccp-1") {
+        source_value.get<std::string>() != "tpq-1") {
         throw std::runtime_error(
-            "DeepSeek-V4 C++ loading requires source_format=cccp-1");
+            "DeepSeek-V4 C++ loading requires source_format=tpq-1");
     }
 
     const auto manifest_value = parse_json(
         manifest->second,
-        "DeepSeek-V4 CCCP manifest");
+        "DeepSeek-V4 TPQ manifest");
     const auto format = manifest_value.find("format");
     if (format != manifest_value.end() &&
         (!format->is_string() ||
-         format->get<std::string>() != "cccp-1")) {
+         format->get<std::string>() != "tpq-1")) {
         throw std::runtime_error(
-            "unsupported DeepSeek-V4 CCCP manifest format");
+            "unsupported DeepSeek-V4 TPQ manifest format");
     }
     const auto config = manifest_value.find("config");
     if (config == manifest_value.end() ||
         !config->is_object()) {
         throw std::runtime_error(
-            "DeepSeek-V4 CCCP manifest lacks config");
+            "DeepSeek-V4 TPQ manifest lacks config");
     }
     return from_json(config->dump());
 }
@@ -1417,31 +1401,31 @@ inspect_deepseek_v4_tensor_metadata(
 
     if (is_tpq_int4_dtype(record.dtype)) {
         result.packed = true;
-        if (cursor.bytes(4, "CCCP-I4 magic") != "CI41" ||
+        if (cursor.bytes(4, "TPQ-I4 magic") != "CI41" ||
             cursor.scalar<std::uint8_t>(
-                "CCCP-I4 version") != 1) {
+                "TPQ-I4 version") != 1) {
             throw std::runtime_error(
-                "invalid DeepSeek-V4 CCCP-I4 header: " +
+                "invalid DeepSeek-V4 TPQ-I4 header: " +
                 name);
         }
-        cursor.skip(3, "CCCP-I4 padding");
+        cursor.skip(3, "TPQ-I4 padding");
         const auto group_size =
             cursor.scalar<std::uint32_t>(
-                "CCCP-I4 group size");
+                "TPQ-I4 group size");
         const auto axis =
-            cursor.scalar<std::int32_t>("CCCP-I4 axis");
+            cursor.scalar<std::int32_t>("TPQ-I4 axis");
         const auto neuron_len =
             cursor.scalar<std::int32_t>(
-                "CCCP-I4 neuron length");
+                "TPQ-I4 neuron length");
         result.shape = read_shape(
             cursor,
             cursor.scalar<std::uint32_t>(
-                "CCCP-I4 dimension count"),
+                "TPQ-I4 dimension count"),
             name);
         const auto rows =
-            cursor.scalar<std::uint32_t>("CCCP-I4 rows");
+            cursor.scalar<std::uint32_t>("TPQ-I4 rows");
         const auto groups =
-            cursor.scalar<std::uint32_t>("CCCP-I4 groups");
+            cursor.scalar<std::uint32_t>("TPQ-I4 groups");
         if (group_size != 64 || axis != 0 ||
             result.shape.size() != 2 ||
             result.shape[0] != rows ||
@@ -1451,7 +1435,7 @@ inspect_deepseek_v4_tensor_metadata(
                 static_cast<std::uint32_t>(
                     neuron_len / 64)) {
             throw std::runtime_error(
-                "inconsistent DeepSeek-V4 CCCP-I4 dimensions: " +
+                "inconsistent DeepSeek-V4 TPQ-I4 dimensions: " +
                 name);
         }
         const auto values = checked_multiply(
@@ -1471,44 +1455,44 @@ inspect_deepseek_v4_tensor_metadata(
             name);
         if (expected != record.nbytes) {
             throw std::runtime_error(
-                "invalid DeepSeek-V4 CCCP-I4 tensor length: " +
+                "invalid DeepSeek-V4 TPQ-I4 tensor length: " +
                 name);
         }
         return result;
     }
 
-    if (is_cccp_pq_dtype(record.dtype)) {
+    if (is_tpq_pq_dtype(record.dtype)) {
         result.packed = true;
-        if (cursor.bytes(4, "CCCP-PQ magic") != "CPQ1" ||
+        if (cursor.bytes(4, "TPQ-PQ magic") != "CPQ1" ||
             cursor.scalar<std::uint8_t>(
-                "CCCP-PQ version") != 1) {
+                "TPQ-PQ version") != 1) {
             throw std::runtime_error(
-                "invalid DeepSeek-V4 CCCP-PQ header: " +
+                "invalid DeepSeek-V4 TPQ-PQ header: " +
                 name);
         }
         const auto tier =
-            cursor.scalar<std::uint8_t>("CCCP-PQ tier");
+            cursor.scalar<std::uint8_t>("TPQ-PQ tier");
         const auto vector_size =
             cursor.scalar<std::uint8_t>(
-                "CCCP-PQ vector size");
+                "TPQ-PQ vector size");
         const auto index_bits =
             cursor.scalar<std::uint8_t>(
-                "CCCP-PQ index bits");
+                "TPQ-PQ index bits");
         const auto axis =
-            cursor.scalar<std::int32_t>("CCCP-PQ axis");
+            cursor.scalar<std::int32_t>("TPQ-PQ axis");
         const auto neuron_len =
             cursor.scalar<std::int32_t>(
-                "CCCP-PQ neuron length");
+                "TPQ-PQ neuron length");
         result.shape = read_shape(
             cursor,
             cursor.scalar<std::uint32_t>(
-                "CCCP-PQ dimension count"),
+                "TPQ-PQ dimension count"),
             name);
         const auto entries =
             cursor.scalar<std::uint32_t>(
-                "CCCP-PQ codebook entries");
+                "TPQ-PQ codebook entries");
         const auto rows =
-            cursor.scalar<std::uint32_t>("CCCP-PQ rows");
+            cursor.scalar<std::uint32_t>("TPQ-PQ rows");
         const bool storage_matches =
             (entries == 256 &&
              (index_bits == 8 ||
@@ -1537,7 +1521,7 @@ inspect_deepseek_v4_tensor_metadata(
             result.shape[1] != neuron_len ||
             neuron_len % vector_size != 0) {
             throw std::runtime_error(
-                "inconsistent DeepSeek-V4 CCCP-PQ dimensions: " +
+                "inconsistent DeepSeek-V4 TPQ-PQ dimensions: " +
                 name);
         }
         const auto codebook = checked_multiply(
@@ -1563,7 +1547,7 @@ inspect_deepseek_v4_tensor_metadata(
             name);
         if (expected != record.nbytes) {
             throw std::runtime_error(
-                "invalid DeepSeek-V4 CCCP-PQ tensor length: " +
+                "invalid DeepSeek-V4 TPQ-PQ tensor length: " +
                 name);
         }
         return result;

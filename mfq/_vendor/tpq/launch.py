@@ -1,4 +1,4 @@
-"""统一启动入口：自动识别模型、加载专属预设，再进入聊天或 API 服务。"""
+"""Unified launcher that detects the model, loads its preset, and enters chat or API service mode."""
 
 from __future__ import annotations
 
@@ -86,7 +86,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--extreme-score-file",
         help=(
-            "可选专家常驻分数 JSON；兼容旧 CCCP expert-preference 审计"
+            "可选专家常驻分数 JSON；兼容旧 TPQ expert-preference 审计"
         ),
     )
     parser.add_argument(
@@ -176,10 +176,10 @@ def _value(args: argparse.Namespace, preset: Any, name: str) -> Any:
 
 
 def _normalize_launch_request(args: argparse.Namespace) -> tuple[str, ...]:
-    """规范化显卡列表，并让卡数成为 auto profile 的 TP 数。
+    """Normalize the device list and use its device count as the TP size for the automatic profile.
 
-    用户只需写 ``--gpus 4,5,6,7``；不再要求同时重复 ``--tp 4`` 和
-    ``--profile parallel``。显式 profile/TP 仍保留给调试和回归使用。
+    Users need only specify ``--gpus 4,5,6,7`` instead of also repeating ``--tp 4`` and
+    ``--profile parallel``. Explicit profile/TP options remain available for debugging and regression tests.
     """
 
     if not args.gpus:
@@ -221,10 +221,10 @@ def _apply_automatic_runtime_defaults(
     args: argparse.Namespace,
     preset: Any,
 ) -> None:
-    """把已验证的公共运行参数收敛到 CLI 自动配置。
+    """Apply validated shared runtime parameters to automatic CLI configuration.
 
-    外部环境变量和显式 CLI 参数始终优先；这里不按模型名选择算子，只按
-    CPU/CUDA 设备能力启用公共注册层。
+    External environment variables and explicit CLI arguments always take precedence. Operators are selected
+    here by CPU/CUDA device capabilities through the shared registry, never by model name.
     """
 
     if _value(args, preset, "device") != "cpu":
@@ -278,8 +278,8 @@ def _apply_environment(
             )
         args.dense_residency = "gpu"
 
-    # 极限模式先写入 0.25GiB 公共安全默认值，再让架构预设通过
-    # setdefault 补齐其他算子环境，避免普通 profile 的 3GiB 余量覆盖极限规划。
+    # Extreme mode first writes the shared safe default of 0.25 GiB, then lets architecture presets fill other
+    # operator settings through setdefault, preventing the normal profile's 3 GiB margin from overriding the extreme plan.
     apply_preset_environment(preset)
 
     dense_bf16 = getattr(args, "dense_bf16", None)
@@ -441,10 +441,10 @@ def _serve_argv(args: argparse.Namespace, preset: Any) -> list[str]:
 
 
 def _validate_extreme_archive(manifest: dict[str, Any]) -> None:
-    """确认归档能在极限模式下保持专家索引紧凑。
+    """Confirm that the archive can keep expert indices compact in extreme mode.
 
-    兼容旧式 projection_layouts 与公共异构专家 VQ 描述。这里按格式能力
-    判断，不按模型名称分支；异构归档还必须让每个精度档位都有 packing。
+    Supports legacy projection_layouts and the shared heterogeneous-expert VQ description. Decisions use format
+    capabilities rather than model-name branches; heterogeneous archives must also define packing for every precision tier.
     """
     quant = manifest.get("quant") or manifest.get("quantization") or {}
     packing = quant.get("index_packing")
@@ -461,7 +461,7 @@ def _validate_extreme_archive(manifest: dict[str, Any]) -> None:
         raise ValueError(
             "--extreme 要求紧凑三投影或异构专家 VQ 归档"
         )
-    if tiering.get("format") != "cccp-heterogeneous-expert-vq-v1":
+    if tiering.get("format") != "tpq-heterogeneous-expert-vq-v1":
         raise ValueError(
             "--extreme 不支持该 heterogeneous_expert_tiering 格式"
         )
@@ -493,7 +493,7 @@ def _maybe_select_auto_extreme(
     args: argparse.Namespace,
     preset: Any,
 ) -> bool:
-    """按公共归档容量自动启用极限模式；返回是否自动激活。"""
+    """Enable extreme mode automatically based on shared archive capacity and return whether it was activated."""
 
     if args.extreme is not None:
         args._extreme_source = "强制" if args.extreme else "禁用"
@@ -551,7 +551,7 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(2) from exc
     requested_extreme = args.extreme
     if args.gpus:
-        # 必须在 detect_auto_extreme 首次导入 torch 前限定物理卡。
+        # Restrict physical devices before detect_auto_extreme first imports torch.
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
     if requested_extreme:
         if args.tp not in (None, 1):
@@ -613,7 +613,7 @@ def main(argv: list[str] | None = None) -> None:
                     tp=1,
                 )
             except ValueError:
-                # 架构未发布 resident 时继续使用安全的 RAM profile。
+                # Continue using the safe RAM profile when the architecture has not published a resident profile.
                 args._profile_source = "自动RAM"
             else:
                 args._profile_source = "自动全显存"

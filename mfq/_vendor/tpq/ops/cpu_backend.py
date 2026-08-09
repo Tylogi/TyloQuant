@@ -1,4 +1,4 @@
-"""CPU 通用量化算子注册。"""
+"""Register generic CPU quantized operators."""
 
 from __future__ import annotations
 

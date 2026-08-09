@@ -637,10 +637,7 @@ class MlxKimiK3:
     ) -> MlxKimiK3:
         if config is None:
             header, tensors = io.load_mmap(path) if mmap else io.load(path)
-            manifest = header.extra.get(
-                "tpq_manifest",
-                header.extra.get("cccp_manifest"),
-            )
+            manifest = header.extra.get("tpq_manifest")
             if not isinstance(manifest, dict):
                 close = getattr(tensors, "close", None)
                 if close is not None:

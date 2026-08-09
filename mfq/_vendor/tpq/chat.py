@@ -1,15 +1,15 @@
-"""TPQ 聊天命令行：统一适配 GLM、DeepSeek-V4 与 Kimi K3。
+"""TPQ chat CLI with unified support for GLM, DeepSeek-V4, and Kimi K3.
 
-对话模板（与模型自带 chat_template 对齐的最小实现，arch 由引擎自动判定）：
-    glm:  [gMASK]<sop>[<|system|>Reasoning Effort: Max]<|user|>{问题}\n<|assistant|><think></think>
-    dsv4: <｜begin▁of▁sentence｜><｜User｜>{问题}<｜Assistant｜>{<think>|</think>}（on 补 <think>，off 补 </think>）
-DSV4 多轮历史保存主模型实际 token IDs；think 模式按 token 切掉推理段，
-不会通过回答文字 decode→encode 重建 prompt。
-命令：/think [off|low|medium|high|max] 调整思维链；/clear 清空上下文与 KV cache；/stats 专家缓存命中；
-/kv 查看主模型 KV 状态；/exit 退出。
-也可 --prompt "..." 单轮非交互运行（冒烟测试用）。
-采样默认 temperature=1.0、top_p=1.0（DeepSeek-V4 官方推荐）；--temp 0 可切回贪心。
-生成实时流式打印，统计行 token 数为实际生成 token 数 len(out)。
+Conversation templates (minimal implementations aligned with each model's chat_template; the engine detects arch automatically):
+    glm:  [gMASK]<sop>[<|system|>Reasoning Effort: Max]<|user|>{question}\n<|assistant|><think></think>
+    dsv4: <｜begin▁of▁sentence｜><｜User｜>{question}<｜Assistant｜>{<think>|</think>} (append <think> when on and </think> when off)
+DSV4 multi-turn history stores the main model's actual token IDs. Think mode removes the reasoning segment by token
+and does not reconstruct prompts by decoding and re-encoding response text.
+Commands: /think [off|low|medium|high|max] adjusts chain-of-thought; /clear clears context and KV cache;
+/stats shows expert-cache hits; /kv shows main-model KV state; /exit quits.
+Use --prompt "..." for a single non-interactive run, such as a smoke test.
+Sampling defaults to temperature=1.0 and top_p=1.0 as officially recommended for DeepSeek-V4; --temp 0 restores greedy mode.
+Generation is printed as a real-time stream; the token count in the statistics line is the actual generated count len(out).
 """
 
 from __future__ import annotations
@@ -24,16 +24,16 @@ from .engine import Engine
 from .dsv4cache import ContextCapacityError
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
-    # Windows GBK 控制台遇到 H₂O 下标等字符会 UnicodeEncodeError，强制 UTF-8 容错
+    # Windows GBK consoles raise UnicodeEncodeError on characters such as the subscript in H2O; force fault-tolerant UTF-8
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-# stdin 容错：管道/重定向里的非法字节按 U+FFFD 替换，而不是 surrogateescape 成
-# 孤代理——孤代理 str 会让 tokenizers Rust 层抛 TypeError: TextInputSequence must be str
+# Fault-tolerant stdin: replace invalid bytes in pipes/redirections with U+FFFD instead of using surrogateescape,
+# because isolated surrogates in str make the tokenizers Rust layer raise TypeError: TextInputSequence must be str
 try:
     sys.stdin.reconfigure(errors="replace")
 except Exception:
     pass
-# store.py 的 torch.frombuffer 零拷贝视图会在首个 decode 打一条 UserWarning，
-# 恰好插在 "DSV4: " 与正文之间，碍眼且无实际风险（只读使用），压掉。
+# The zero-copy torch.frombuffer view in store.py emits a UserWarning on the first decode, exactly between
+# "DSV4: " and the response. It is distracting and harmless because the view is read-only, so suppress it.
 import warnings as _warnings
 _warnings.filterwarnings("ignore", message="The given buffer is not writable")
 
@@ -59,7 +59,7 @@ def _terminal_options(
 
 
 class _TerminalStream:
-    """将 tokenizer 原始流交给架构适配器，绝不显示协议控制标签。"""
+    """Pass the raw tokenizer stream to the architecture adapter without ever displaying protocol control tags."""
 
     def __init__(
         self,
@@ -401,8 +401,8 @@ def main(argv=None, should_stop=None) -> None:
     )
     max_new = None if a.no_max_new else a.max_new
 
-    # GLM 默认使用 MLA latent KV，约 0.09MB/token；缺省仍保持 1024，
-    # 长文运行按需显式提高。DSV4 使用环形窗+压缩槽。
+    # GLM uses latent MLA KV by default at about 0.09 MB/token. Keep the default at 1024 and raise it explicitly
+    # as needed for long-text runs. DSV4 uses a ring window plus compression slots.
     max_ctx = a.max_ctx
     if max_ctx is None:
         arch_hint = "glm"

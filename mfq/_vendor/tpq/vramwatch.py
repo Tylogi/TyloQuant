@@ -1,15 +1,16 @@
-"""TPQ 动态显存监视器（后台线程）：把本进程显存占用动态维持在物理显存以内。
+"""TPQ dynamic VRAM monitor running in a background thread to keep this process within physical VRAM.
 
-动机：WDDM 下分配顶满物理显存会被驱动换页到"共享显存"（系统内存），
-带宽从 HBM ~600GB/s 掉到 PCIe 级且伴随整轮同步卡顿——实测共享显存每换页
-数 GB，decode 速度可掉数倍。静态预留（引擎初始化的分配器硬上限）只能防
-"自己顶满"，防不了：其他进程中途抢占、碎片化、换用更小显卡（如 16GB）。
+Motivation: under WDDM, filling physical VRAM makes the driver page into shared system memory,
+reducing bandwidth from ~600 GB/s HBM to PCIe levels and stalling whole synchronous passes. Measured shared-memory
+paging moves several GB at a time and can reduce decode speed by multiples. A static reserve (the allocator hard limit
+set during engine initialization) prevents this process from filling VRAM but cannot handle mid-run contention from
+other processes, fragmentation, or switching to a smaller device such as 16 GB.
 
-本监视器每 interval 秒查询一次空闲显存，滞回调节专家显存缓存预算：
-  空闲 < low_gb   → 收紧预算 step_gb 并立即 LRU 驱逐 + empty_cache（止血）
-  空闲 > high_gb  → 预算放宽 step_gb（不超过初始上限，缓存按需求自然回填）
-任何显卡（16GB/22GB/48GB）与任何模型档位下都自动找到可用工作点；
-TPQ_VRAM_WATCH=0 可关闭，low/high/interval 可用同名环境变量覆盖。
+The monitor queries free VRAM every ``interval`` seconds and adjusts the expert VRAM cache budget with hysteresis:
+  free < low_gb  -> reduce the budget by step_gb and immediately perform LRU eviction plus empty_cache;
+  free > high_gb -> raise the budget by step_gb, without exceeding the initial cap, and let the cache refill on demand.
+This automatically finds a usable operating point for any device (16/22/48 GB) and model tier.
+Set TPQ_VRAM_WATCH=0 to disable it; override low/high/interval with same-named environment variables.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import torch
 
 
 class VramWatch:
-    """后台滞回调节器：pool 为 ExpertPool（需有 budget 属性与 trim_to 方法）。"""
+    """Background hysteresis controller; pool is an ExpertPool with a budget attribute and trim_to method."""
 
     def __init__(self, pool, max_budget: int, device: int = 0,
                  low_gb: float | None = None, high_gb: float | None = None,
@@ -42,7 +43,7 @@ class VramWatch:
         self.quiet = quiet
         self._stop = threading.Event()
         self._th: threading.Thread | None = None
-        self.trims = 0      # 累计止血次数（诊断/基准记录用）
+        self.trims = 0      # Cumulative emergency-trim count (for diagnostics/benchmark records)
         self.grows = 0
 
     def start(self) -> None:
@@ -78,7 +79,7 @@ class VramWatch:
                           f"显存缓存收紧至 {new / 2**30:.1f}GB", flush=True)
             elif free > self.high * 2**30 and budget < self.max_budget:
                 new = min(self.max_budget, budget + self.step)
-                self.pool.budget = new      # 只放宽上限，缓存按需自然回填
+                self.pool.budget = new      # Raise only the limit; the cache refills naturally on demand
                 self.grows += 1
                 if not self.quiet:
                     print(f"[vramwatch] 空闲 {free / 2**30:.2f}GB > {self.high}GB → "

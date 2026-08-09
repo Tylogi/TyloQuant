@@ -25,7 +25,7 @@ _PACKED_MOE_LOCK = threading.Lock()
 
 
 def configure_cpu_threads() -> int:
-    """为大核数双路 CPU 选择物理核与 SMT 之间的低延迟甜点。"""
+    """Select a low-latency balance between physical cores and SMT on high-core-count dual-socket CPUs."""
     raw = os.environ.get("TPQ_CPU_THREADS", "auto").strip().lower()
     if raw in ("0", "false", "off", "none"):
         return torch.get_num_threads()
@@ -50,7 +50,7 @@ def configure_cpu_threads() -> int:
 
 
 def configure_numa_interleave() -> bool:
-    """让双路 Linux CPU 的后续大块分配均匀落在所有 NUMA 节点。"""
+    """Distribute subsequent large allocations evenly across all NUMA nodes on dual-socket Linux CPUs."""
     mode = os.environ.get("TPQ_CPU_NUMA", "auto").strip().lower()
     if (
         sys.platform != "linux"

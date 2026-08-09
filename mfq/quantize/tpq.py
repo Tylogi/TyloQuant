@@ -10,15 +10,15 @@ import numpy as np
 import torch
 
 from mfq.formats.tpq import (
-    CccpInt4Tensor,
-    CccpPqSpec,
-    CccpPqTensor,
+    TpqInt4Tensor,
+    TpqPqSpec,
+    TpqPqTensor,
 )
 
 
 @dataclass(frozen=True)
-class CccpKmeansConfig:
-    """Training controls for one learned CCCP codebook."""
+class TpqKmeansConfig:
+    """Training controls for one learned TPQ codebook."""
 
     iterations: int = 12
     restarts: int = 2
@@ -28,13 +28,13 @@ class CccpKmeansConfig:
 
     def __post_init__(self) -> None:
         if self.iterations <= 0 or self.restarts <= 0:
-            raise ValueError("CCCP k-means iterations and restarts must be positive")
+            raise ValueError("TPQ k-means iterations and restarts must be positive")
         if self.sample_points <= 0 or self.distance_bytes <= 0:
-            raise ValueError("CCCP k-means sample and distance budget must be positive")
+            raise ValueError("TPQ k-means sample and distance budget must be positive")
 
 
 @dataclass(frozen=True)
-class CccpKmeansResult:
+class TpqKmeansResult:
     codebook: np.ndarray
     sse: float
     history: tuple[float, ...]
@@ -51,9 +51,9 @@ def _validate_points(
 ) -> torch.Tensor:
     values = torch.as_tensor(points, dtype=torch.float32)
     if values.ndim != 2 or values.shape[0] == 0 or values.shape[1] == 0:
-        raise ValueError("CCCP points must be a non-empty [N,D] matrix")
+        raise ValueError("TPQ points must be a non-empty [N,D] matrix")
     if not bool(torch.isfinite(values).all()):
-        raise ValueError("CCCP points must be finite")
+        raise ValueError("TPQ points must be finite")
     return values
 
 
@@ -96,7 +96,7 @@ def _assign_device(
 
 
 @torch.no_grad()
-def assign_cccp_codebook(
+def assign_tpq_codebook(
     points: np.ndarray | torch.Tensor,
     codebook: np.ndarray | torch.Tensor,
     *,
@@ -108,9 +108,9 @@ def assign_cccp_codebook(
     values = _validate_points(points)
     table = torch.as_tensor(codebook, dtype=torch.float32)
     if table.ndim != 2 or table.shape[1] != values.shape[1]:
-        raise ValueError("CCCP codebook must have shape [K,D]")
+        raise ValueError("TPQ codebook must have shape [K,D]")
     if not bool(torch.isfinite(table).all()):
-        raise ValueError("CCCP codebook must be finite")
+        raise ValueError("TPQ codebook must be finite")
     target = _device(device)
     values = values.to(target)
     table = table.to(target)
@@ -170,23 +170,23 @@ def _kmeans_plus_plus(
 
 
 @torch.no_grad()
-def train_cccp_codebook(
+def train_tpq_codebook(
     points: np.ndarray | torch.Tensor,
-    spec: CccpPqSpec,
+    spec: TpqPqSpec,
     *,
-    config: CccpKmeansConfig = CccpKmeansConfig(),
+    config: TpqKmeansConfig = TpqKmeansConfig(),
     device: str | torch.device | None = None,
-) -> CccpKmeansResult:
-    """Train one CCCP codebook with unweighted Euclidean Lloyd updates."""
+) -> TpqKmeansResult:
+    """Train one TPQ codebook with unweighted Euclidean Lloyd updates."""
 
     values = _validate_points(points)
     if values.shape[1] != spec.vector_size:
         raise ValueError(
-            f"CCCP-{spec.tier} expects {spec.vector_size}-D points"
+            f"TPQ-{spec.tier} expects {spec.vector_size}-D points"
         )
     if values.shape[0] < spec.codebook_entries:
         raise ValueError(
-            f"CCCP-{spec.tier} needs at least {spec.codebook_entries} points"
+            f"TPQ-{spec.tier} needs at least {spec.codebook_entries} points"
         )
     take = min(values.shape[0], config.sample_points)
     best_codebook: torch.Tensor | None = None
@@ -239,7 +239,7 @@ def train_cccp_codebook(
             best_history = tuple(history[:-1] + [final_sse])
         del sample, codebook
     assert best_codebook is not None
-    return CccpKmeansResult(
+    return TpqKmeansResult(
         codebook=best_codebook.cpu().numpy().astype(np.float32),
         sse=best_sse,
         history=best_history,
@@ -247,30 +247,30 @@ def train_cccp_codebook(
 
 
 @torch.no_grad()
-def quantize_cccp_pq_fixed(
+def quantize_tpq_pq_fixed(
     weight: np.ndarray | torch.Tensor,
-    spec: CccpPqSpec,
+    spec: TpqPqSpec,
     codebook: np.ndarray | torch.Tensor,
     *,
     device: str | torch.device | None = None,
     distance_bytes: int = 1 << 30,
-) -> CccpPqTensor:
-    """Quantize one matrix with a frozen CCCP codebook."""
+) -> TpqPqTensor:
+    """Quantize one matrix with a frozen TPQ codebook."""
 
     matrix = torch.as_tensor(weight, dtype=torch.float32)
     if matrix.ndim != 2 or matrix.shape[1] % spec.vector_size:
         raise ValueError(
-            f"CCCP-{spec.tier} expects [rows, columns] with columns divisible "
+            f"TPQ-{spec.tier} expects [rows, columns] with columns divisible "
             f"by {spec.vector_size}"
         )
     shape = (int(matrix.shape[0]), int(matrix.shape[1]))
-    indices = assign_cccp_codebook(
+    indices = assign_tpq_codebook(
         matrix.reshape(-1, spec.vector_size),
         codebook,
         device=device,
         distance_bytes=distance_bytes,
     )
-    return CccpPqTensor(
+    return TpqPqTensor(
         spec=spec,
         shape=shape,
         axis=0,
@@ -285,9 +285,9 @@ def quantize_cccp_pq_fixed(
 
 
 @torch.no_grad()
-def cccp_reconstruction_sums(
+def tpq_reconstruction_sums(
     weight: np.ndarray | torch.Tensor,
-    spec: CccpPqSpec,
+    spec: TpqPqSpec,
     codebook: np.ndarray | torch.Tensor,
     *,
     device: str | torch.device | None = None,
@@ -298,7 +298,7 @@ def cccp_reconstruction_sums(
     matrix = torch.as_tensor(weight, dtype=torch.float32)
     if matrix.ndim != 2 or matrix.shape[1] % spec.vector_size:
         raise ValueError(
-            f"CCCP-{spec.tier} expects a compatible 2-D matrix"
+            f"TPQ-{spec.tier} expects a compatible 2-D matrix"
         )
     target = _device(device)
     points = matrix.reshape(-1, spec.vector_size).to(target)
@@ -308,7 +308,7 @@ def cccp_reconstruction_sums(
         spec.vector_size,
     ):
         raise ValueError(
-            f"CCCP-{spec.tier} codebook shape is {tuple(table.shape)}"
+            f"TPQ-{spec.tier} codebook shape is {tuple(table.shape)}"
         )
     chunk = _distance_chunk_rows(spec.codebook_entries, distance_bytes)
     sse = 0.0
@@ -323,25 +323,25 @@ def cccp_reconstruction_sums(
 
 
 @torch.no_grad()
-def train_cccp_pq(
+def train_tpq_pq(
     weight: np.ndarray | torch.Tensor,
-    spec: CccpPqSpec,
+    spec: TpqPqSpec,
     *,
-    config: CccpKmeansConfig = CccpKmeansConfig(),
+    config: TpqKmeansConfig = TpqKmeansConfig(),
     device: str | torch.device | None = None,
-) -> tuple[CccpPqTensor, CccpKmeansResult]:
-    """Train and apply one matrix-level CCCP codebook."""
+) -> tuple[TpqPqTensor, TpqKmeansResult]:
+    """Train and apply one matrix-level TPQ codebook."""
 
     matrix = torch.as_tensor(weight, dtype=torch.float32)
     if matrix.ndim != 2 or matrix.shape[1] % spec.vector_size:
-        raise ValueError("CCCP training expects a compatible 2-D matrix")
-    result = train_cccp_codebook(
+        raise ValueError("TPQ training expects a compatible 2-D matrix")
+    result = train_tpq_codebook(
         matrix.reshape(-1, spec.vector_size),
         spec,
         config=config,
         device=device,
     )
-    tensor = quantize_cccp_pq_fixed(
+    tensor = quantize_tpq_pq_fixed(
         matrix,
         spec,
         result.codebook,
@@ -352,19 +352,19 @@ def train_cccp_pq(
 
 
 @torch.no_grad()
-def train_cccp_expert_codebook(
+def train_tpq_expert_codebook(
     samples: np.ndarray | torch.Tensor,
     expert_ids: np.ndarray | torch.Tensor,
-    spec: CccpPqSpec,
+    spec: TpqPqSpec,
     *,
-    config: CccpKmeansConfig = CccpKmeansConfig(),
+    config: TpqKmeansConfig = TpqKmeansConfig(),
     device: str | torch.device | None = None,
-) -> CccpKmeansResult:
+) -> TpqKmeansResult:
     """Train one layer/tier codebook from sampled ``[E,R,K]`` experts."""
 
     values = torch.as_tensor(samples, dtype=torch.float32)
     if values.ndim != 3 or values.shape[2] % spec.vector_size:
-        raise ValueError("CCCP expert samples must have shape [E,R,K]")
+        raise ValueError("TPQ expert samples must have shape [E,R,K]")
     ids = torch.as_tensor(
         expert_ids,
         dtype=torch.int64,
@@ -373,9 +373,9 @@ def train_cccp_expert_codebook(
     if ids.numel() == 0 or bool((ids < 0).any()) or bool(
         (ids >= values.shape[0]).any()
     ):
-        raise ValueError("CCCP expert cohort IDs are invalid")
+        raise ValueError("TPQ expert cohort IDs are invalid")
     selected = values.index_select(0, ids)
-    return train_cccp_codebook(
+    return train_tpq_codebook(
         selected.reshape(-1, spec.vector_size),
         spec,
         config=config,
@@ -383,17 +383,17 @@ def train_cccp_expert_codebook(
     )
 
 
-def dequantize_cccp_pq(tensor: CccpPqTensor) -> np.ndarray:
-    """Restore a CCCP product-VQ matrix to float32."""
+def dequantize_tpq_pq(tensor: TpqPqTensor) -> np.ndarray:
+    """Restore a TPQ product-VQ matrix to float32."""
 
     indices = tensor.indices.reshape(-1)
     if tensor.spec.index_bits in {12, 14}:
-        from mfq.formats.tpq import unpack_cccp_indices
+        from mfq.formats.tpq import unpack_tpq_indices
 
         count = int(tensor.shape[0]) * (
             int(tensor.shape[1]) // tensor.spec.vector_size
         )
-        indices, offset = unpack_cccp_indices(
+        indices, offset = unpack_tpq_indices(
             memoryview(indices),
             0,
             count,
@@ -402,20 +402,20 @@ def dequantize_cccp_pq(tensor: CccpPqTensor) -> np.ndarray:
         if offset != (
             indices.size * tensor.spec.index_bits + 7
         ) // 8:
-            raise ValueError("CCCP packed index payload has an invalid tail")
+            raise ValueError("TPQ packed index payload has an invalid tail")
     return tensor.codebook[indices].reshape(tensor.shape)
 
 
-def quantize_cccp_int4(
+def quantize_tpq_int4(
     weight: np.ndarray | torch.Tensor,
     *,
     group_size: int = 64,
-) -> CccpInt4Tensor:
-    """Apply CCCP's symmetric int4-g64 dense quantizer."""
+) -> TpqInt4Tensor:
+    """Apply TPQ's symmetric int4-g64 dense quantizer."""
 
     matrix = np.asarray(torch.as_tensor(weight, dtype=torch.float32).cpu())
     if matrix.ndim != 2 or matrix.shape[1] % group_size or matrix.shape[1] % 2:
-        raise ValueError("CCCP-I4 expects a 2-D matrix aligned to its group size")
+        raise ValueError("TPQ-I4 expects a 2-D matrix aligned to its group size")
     rows, columns = matrix.shape
     groups = matrix.reshape(rows, columns // group_size, group_size)
     scales = np.maximum(np.abs(groups).max(axis=2) / 7.0, 1e-12)
@@ -429,7 +429,7 @@ def quantize_cccp_int4(
         values[:, 0::2].astype(np.uint8)
         | (values[:, 1::2].astype(np.uint8) << 4)
     )
-    return CccpInt4Tensor(
+    return TpqInt4Tensor(
         shape=(rows, columns),
         axis=0,
         neuron_len=columns,
@@ -439,8 +439,8 @@ def quantize_cccp_int4(
     )
 
 
-def dequantize_cccp_int4(tensor: CccpInt4Tensor) -> np.ndarray:
-    """Restore a CCCP symmetric int4 matrix to float32."""
+def dequantize_tpq_int4(tensor: TpqInt4Tensor) -> np.ndarray:
+    """Restore a TPQ symmetric int4 matrix to float32."""
 
     low = (tensor.packed & 0x0F).astype(np.int8) - 8
     high = (tensor.packed >> 4).astype(np.int8) - 8
@@ -456,10 +456,10 @@ def dequantize_cccp_int4(tensor: CccpInt4Tensor) -> np.ndarray:
     ).reshape(tensor.shape)
 
 
-def save_cccp_codebook_artifact(
+def save_tpq_codebook_artifact(
     path: str | Path,
-    spec: CccpPqSpec,
-    result: CccpKmeansResult,
+    spec: TpqPqSpec,
+    result: TpqKmeansResult,
 ) -> None:
     """Atomically save one frozen codebook for streaming MFQ conversion."""
 
@@ -481,45 +481,15 @@ def save_cccp_codebook_artifact(
 
 
 __all__ = [
-    "CccpKmeansConfig",
-    "CccpKmeansResult",
-    "assign_cccp_codebook",
-    "cccp_reconstruction_sums",
-    "dequantize_cccp_int4",
-    "dequantize_cccp_pq",
-    "quantize_cccp_int4",
-    "quantize_cccp_pq_fixed",
-    "save_cccp_codebook_artifact",
-    "train_cccp_codebook",
-    "train_cccp_expert_codebook",
-    "train_cccp_pq",
-]
-
-
-# Canonical TPQ API aliases.
-TpqKmeansConfig = CccpKmeansConfig
-TpqKmeansResult = CccpKmeansResult
-assign_tpq_codebook = assign_cccp_codebook
-tpq_reconstruction_sums = cccp_reconstruction_sums
-dequantize_tpq_int4 = dequantize_cccp_int4
-dequantize_tpq_pq = dequantize_cccp_pq
-quantize_tpq_int4 = quantize_cccp_int4
-quantize_tpq_pq_fixed = quantize_cccp_pq_fixed
-save_tpq_codebook_artifact = save_cccp_codebook_artifact
-train_tpq_codebook = train_cccp_codebook
-train_tpq_expert_codebook = train_cccp_expert_codebook
-train_tpq_pq = train_cccp_pq
-
-__all__ += [
     "TpqKmeansConfig",
     "TpqKmeansResult",
     "assign_tpq_codebook",
+    "tpq_reconstruction_sums",
     "dequantize_tpq_int4",
     "dequantize_tpq_pq",
     "quantize_tpq_int4",
     "quantize_tpq_pq_fixed",
     "save_tpq_codebook_artifact",
-    "tpq_reconstruction_sums",
     "train_tpq_codebook",
     "train_tpq_expert_codebook",
     "train_tpq_pq",

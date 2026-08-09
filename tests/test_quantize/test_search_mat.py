@@ -1,4 +1,4 @@
-"""search_mat 逐张量 NintSpec 搜索测试（全量评估）。"""
+"""Full-evaluation tests for per-tensor NintSpec search in search_mat."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def test_best_spec_in_gs_sweet_region():
 
 
 def test_snr_matches_full_recompute():
-    """搜索返回的 snr_db 应与对整张权重重算的 SNR 一致（全量评估，无子采样）。"""
+    """Returned snr_db should match SNR recomputed over all weights without subsampling."""
     W = _gauss(64, 5120, seed=2)
     res = search_mat.search(W, target_bpw=4.6)
     full = snr(W, dequantize(quantize(W, res.spec, axis=0)))
@@ -70,7 +70,7 @@ def test_evaluated_sorted_desc():
 
 
 def test_full_eval_no_max_rows_param():
-    """search 不再接受 max_rows；全量评估是唯一行为。"""
+    """Search no longer accepts max_rows; full evaluation is the only behavior."""
     import inspect
 
     sig = inspect.signature(search_mat.search)

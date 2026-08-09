@@ -41,7 +41,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-ctx", type=int, default=32768)
     parser.add_argument(
-        "--default-reasoning", choices=("chat", "high", "max"), default="chat"
+        "--default-reasoning",
+        choices=("chat", "low", "medium", "high", "max"), default="chat"
     )
     parser.add_argument("--spec", type=int, default=0)
     parser.add_argument("--max-queue", type=int, default=16)

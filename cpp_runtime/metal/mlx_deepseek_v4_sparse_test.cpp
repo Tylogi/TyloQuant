@@ -523,6 +523,35 @@ void test_fixed_cache_write() {
         "fixed cache update");
 }
 
+void test_fixed_cache_snapshot_copy() {
+    auto cache = mlx::core::zeros(
+        Shape{1, 4, 2},
+        mlx::core::float16);
+    cache.eval();
+    auto snapshot = mlx::core::astype(
+        cache,
+        cache.dtype(),
+        true);
+    snapshot.eval();
+    require(
+        snapshot.buffer().ptr() != cache.buffer().ptr(),
+        "fixed cache snapshot copy aliases the source allocation");
+    auto updated = mfq::metal::dsv4_cache_write_inplace(
+        cache,
+        mlx::core::astype(
+            float_array(
+                {3.0f, 4.0f},
+                Shape{1, 1, 2}),
+            mlx::core::float16),
+        int_array({1}, Shape{1, 1}));
+    updated.eval();
+    require_close(
+        evaluated_float(snapshot),
+        std::vector<float>(8, 0.0f),
+        0.0f,
+        "fixed cache snapshot copy changed after in-place write");
+}
+
 void test_overlap_state() {
     const CompressorFixture fixture(128, 2, true);
     const auto token = mlx::core::astype(
@@ -1231,6 +1260,7 @@ int main() {
         test_fp4_sim();
         test_compressor_quantization();
         test_fixed_cache_write();
+        test_fixed_cache_snapshot_copy();
         test_decode_pool_state_and_bounds();
         test_overlap_state();
         test_indexer_paths();

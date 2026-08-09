@@ -1,12 +1,12 @@
-"""torch GPU runtime：权重压缩态常驻 GPU，前向用 llama.cpp 式分解 matmul。
+"""Torch GPU runtime: keep weights compressed on the GPU and use llama.cpp-style decomposed matmul in forward passes.
 
-与 :mod:`mfq.runtime.linear`（numpy 参考）并列；本模块走 GPU。用法::
+This complements the NumPy reference in :mod:`mfq.runtime.linear`; this module uses the GPU. Usage::
 
     model = TorchNintModel.from_mfq("m.mfq", device="cuda")
     gate = model.linear("blk.0.gate")
     y = gate(x_cuda)        # x_cuda: torch.Tensor on cuda
 
-显式导入（本模块 import torch，重依赖）。
+Import explicitly because this module imports torch, a heavy dependency.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ def is_quantized_tensor(tensor: object) -> bool:
 
 
 class TorchNintLinear:
-    """权重为 NintTensor 的 GPU 线性层；forward 走分解 matmul（不常驻 fp16 权重）。"""
+    """GPU linear layer with NintTensor weights; forward uses decomposed matmul without resident fp16 weights."""
 
     def __init__(self, tensor: NintTensor, device: str | torch.device = "cuda") -> None:
         self.g = torch_backend.to_gpu(tensor, device)
@@ -105,7 +105,7 @@ class TorchNintLinear:
 
     @property
     def weight(self) -> torch.Tensor:
-        """全量反量化 fp16 权重（若需常驻缓存，取一次自行持有）。"""
+        """Fully dequantize fp16 weights; callers needing a resident cache should retrieve and retain them once."""
         return torch_backend.dequantize(self.g)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -245,7 +245,7 @@ def _cat_nint_gpu_dicts(gs: Sequence[dict]) -> dict:
 
 
 class TorchNintLinearGroup:
-    """多个同输入 NINT 线性层拼成一次 NINT matmul。"""
+    """Combine multiple NINT linear layers with the same input into one NINT matmul."""
 
     def __init__(self, tensors: Sequence[NintTensor], device: str | torch.device = "cuda") -> None:
         if len(tensors) < 2:
@@ -334,7 +334,7 @@ class TorchLinearGroup:
 
 
 class TorchNintEmbedding:
-    """权重为 NintTensor 的 GPU embedding；只反量化被访问的 token 行。"""
+    """GPU embedding with NintTensor weights; dequantize only accessed token rows."""
 
     def __init__(self, tensor: NintTensor, device: str | torch.device = "cuda") -> None:
         self.g = torch_backend.to_gpu(tensor, device)
@@ -363,7 +363,7 @@ class TorchNvqEmbedding:
 
 
 class TorchSwiGLUFFN:
-    """SwiGLU FFN（gate/up/down 均为 :class:`TorchNintLinear`）。"""
+    """SwiGLU FFN whose gate, up, and down projections are all :class:`TorchNintLinear`."""
 
     def __init__(
         self,
@@ -419,7 +419,7 @@ class TorchSwiGLUFFN:
 
 
 class TorchNintModel:
-    """从 ``.mfq`` 加载，按名字构建 :class:`TorchNintLinear`（权重搬 GPU）。"""
+    """Load from ``.mfq`` and construct :class:`TorchNintLinear` layers by name, moving weights to the GPU."""
 
     def __init__(self, tensors: TensorMapping, device: str | torch.device = "cuda") -> None:
         self.tensors = tensors

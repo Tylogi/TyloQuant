@@ -106,11 +106,16 @@ public:
     prev_gate() const noexcept {
         return prev_gate_;
     }
+    const std::optional<mlx::core::array>&
+    pool_prefix_backup() const noexcept {
+        return pool_prefix_backup_;
+    }
 
-    // Take a rollback snapshot. Rolling compressor state is copied because
-    // decode replaces it, while the fixed pool may share storage: it is
-    // append-only and restored metadata hides rows beyond the checkpoint.
+    // Take a compact rollback snapshot. The fixed-capacity pool is updated
+    // in place, so preserve only its live prefix rather than copying every
+    // unused context row.
     MlxDeepseekV4PoolState snapshot() const;
+    void restore_snapshot(MlxDeepseekV4PoolState snapshot);
 
 private:
     MlxDeepseekV4PoolState(
@@ -137,6 +142,7 @@ private:
     mlx::core::array state_gate_;
     std::optional<mlx::core::array> prev_kv_;
     std::optional<mlx::core::array> prev_gate_;
+    std::optional<mlx::core::array> pool_prefix_backup_;
     int pool_len_ = 0;
     int remainder_ = 0;
 };
@@ -170,6 +176,7 @@ public:
     }
 
     MlxDeepseekV4LayerState snapshot() const;
+    void restore_snapshot(MlxDeepseekV4LayerState snapshot);
 
 private:
     friend class MlxDeepseekV4Attention;

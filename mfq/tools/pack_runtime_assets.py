@@ -16,6 +16,7 @@ from mfq.formats.assets import (
     TOKENIZER_GGUF_ASSET,
     gguf_metadata_asset,
     is_asset_record,
+    minicpmo45_resampler_pos_embed_asset,
     model_config_asset,
     runtime_asset_manifest,
 )
@@ -104,12 +105,20 @@ def pack_runtime_assets(
 ) -> Path:
     source_path = Path(input_path).resolve()
     output = Path(output_path).resolve()
-    config = model_config_asset(Path(config_path).read_bytes())
+    config_bytes = Path(config_path).read_bytes()
+    config_json = json.loads(config_bytes)
+    config = model_config_asset(config_bytes)
     GGUFReader = _load_gguf_reader()
     reader = GGUFReader(Path(tokenizer_gguf).resolve())
     tokenizer = gguf_metadata_asset(reader)
     del reader
-    assets = (config, tokenizer)
+    assets = [config, tokenizer]
+    if (
+        str(config_json.get("model_type", "")).lower() == "minicpmo"
+        and str(config_json.get("version", "")) == "4.5"
+    ):
+        assets.append(minicpmo45_resampler_pos_embed_asset())
+    assets = tuple(assets)
 
     same_path = source_path == output
     if output.exists() and not same_path and not overwrite:

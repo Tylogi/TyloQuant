@@ -211,7 +211,7 @@ std::vector<std::uint8_t> zero_nintm_blob(
     return blob;
 }
 
-std::vector<std::uint8_t> zero_cccp_nintm_blob(
+std::vector<std::uint8_t> zero_tpq_nintm_blob(
     int output_per_expert,
     int input) {
     constexpr int vector_size = 8;
@@ -221,8 +221,8 @@ std::vector<std::uint8_t> zero_cccp_nintm_blob(
         output_per_expert > 0 &&
             input > 0 &&
             input % vector_size == 0,
-        "invalid synthetic CCCP NINTM shape");
-    const std::string dtype = "CCCP-X";
+        "invalid synthetic TPQ NINTM shape");
+    const std::string dtype = "TPQ-X";
     std::vector<std::uint8_t> blob{
         'N', 'I', 'M', '2',
     };
@@ -426,7 +426,7 @@ void write_causal_lm_container(
                     binding.name,
                     "NINTM",
                     streamed_experts
-                    ? zero_cccp_nintm_blob(
+                    ? zero_tpq_nintm_blob(
                           static_cast<int>(
                               binding.shape.at(1)),
                           static_cast<int>(
@@ -448,7 +448,7 @@ void write_causal_lm_container(
         }
     }
     const json manifest{
-        {"format", "cccp-1"},
+        {"format", "tpq-1"},
         {"config", config_json},
         {
             "tiers_per_layer",
@@ -467,7 +467,7 @@ void write_causal_lm_container(
         2);
     write_string(
         stream,
-        "deepseek_v4-cccp-mfq");
+        "deepseek_v4-tpq-mfq");
     write_scalar<std::uint32_t>(
         stream,
         2);
@@ -476,10 +476,10 @@ void write_causal_lm_container(
         "source_format");
     write_string(
         stream,
-        json("cccp-1").dump());
+        json("tpq-1").dump());
     write_string(
         stream,
-        "cccp_manifest");
+        "tpq_manifest");
     write_string(
         stream,
         manifest.dump());
@@ -1345,14 +1345,14 @@ void test_generation_stable_prefix_cache() {
     mfq::metal::MlxSamplingParams sampling;
     sampling.temperature = 0.0;
 
-    auto cached = make_model();
+    auto cached = make_model(true, true);
     std::size_t first_prefill_tokens = 0;
     (void)cached.generate(
         {1, 2, 3},
         sampling,
-        1,
+        2,
         {},
-        std::vector<std::int64_t>{},
+        std::nullopt,
         512,
         [&](std::size_t tokens, double) {
             first_prefill_tokens = tokens;
@@ -1384,7 +1384,7 @@ void test_generation_stable_prefix_cache() {
             cached.cache_position() == 3,
         "DeepSeek-V4 stable prefix was not reused");
 
-    auto fresh = make_model();
+    auto fresh = make_model(true, true);
     std::vector<std::int64_t> fresh_output;
     (void)fresh.generate(
         {1, 2, 4, 5},
@@ -1467,6 +1467,7 @@ void test_generation_stable_prefix_cache() {
         observed == 7 && late_interrupted.cache_position() == 2,
         "DeepSeek-V4 late interruption did not restore its checkpoint");
     std::vector<std::int64_t> restored_output;
+    std::size_t late_interrupted_prefill_tokens = 0;
     (void)late_interrupted.generate(
         {1, 2, 6},
         sampling,
@@ -1477,7 +1478,9 @@ void test_generation_stable_prefix_cache() {
         },
         std::vector<std::int64_t>{},
         512,
-        {},
+        [&](std::size_t tokens, double) {
+            late_interrupted_prefill_tokens = tokens;
+        },
         2);
     auto late_fresh = make_model();
     std::vector<std::int64_t> late_fresh_output;
@@ -1491,8 +1494,110 @@ void test_generation_stable_prefix_cache() {
         },
         std::vector<std::int64_t>{});
     require(
+        late_interrupted_prefill_tokens == 1,
+        "DeepSeek-V4 late interruption lost its checkpoint");
+    require(
         restored_output == late_fresh_output,
         "DeepSeek-V4 interrupted decode corrupted the stable cache");
+
+    // The compressor pool is an in-place fixed-capacity cache. Preserve a
+    // compact copy of its live prefix while a long response appends rows,
+    // then verify a cancelled reroll still reuses that prefix exactly.
+    const std::vector<std::int64_t> long_prompt{
+        1, 2, 3, 4, 5, 6, 7, 1, 2, 3};
+    const std::vector<std::int64_t> long_reroll{
+        1, 2, 3, 4, 5, 6, 7, 1, 4, 5};
+    auto pool_interrupted = make_model();
+    int pool_observed = 0;
+    (void)pool_interrupted.generate(
+        long_prompt,
+        sampling,
+        16,
+        [&](std::int64_t) {
+            return ++pool_observed < 15;
+        },
+        std::vector<std::int64_t>{},
+        512,
+        {},
+        8);
+    std::size_t pool_reroll_prefill_tokens = 0;
+    std::vector<std::int64_t> pool_reroll_output;
+    (void)pool_interrupted.generate(
+        long_reroll,
+        sampling,
+        4,
+        [&](std::int64_t token) {
+            pool_reroll_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{},
+        512,
+        [&](std::size_t tokens, double) {
+            pool_reroll_prefill_tokens = tokens;
+        },
+        8);
+    auto pool_fresh = make_model();
+    std::vector<std::int64_t> pool_fresh_output;
+    (void)pool_fresh.generate(
+        long_reroll,
+        sampling,
+        4,
+        [&](std::int64_t token) {
+            pool_fresh_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{});
+    require(
+        pool_reroll_prefill_tokens == 2,
+        "DeepSeek-V4 compact pool prefix was not reused");
+    require(
+        pool_reroll_output == pool_fresh_output,
+        "DeepSeek-V4 compact pool prefix changed reroll output");
+
+    // A max_tokens boundary discards only the response suffix as well.
+    auto length_truncated = make_model();
+    (void)length_truncated.generate(
+        {1, 2, 3},
+        sampling,
+        8,
+        {},
+        std::vector<std::int64_t>{},
+        512,
+        {},
+        2);
+    std::size_t truncated_prefill_tokens = 0;
+    std::vector<std::int64_t> truncated_output;
+    (void)length_truncated.generate(
+        {1, 2, 6},
+        sampling,
+        4,
+        [&](std::int64_t token) {
+            truncated_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{},
+        512,
+        [&](std::size_t tokens, double) {
+            truncated_prefill_tokens = tokens;
+        },
+        2);
+    auto truncated_fresh = make_model();
+    std::vector<std::int64_t> truncated_fresh_output;
+    (void)truncated_fresh.generate(
+        {1, 2, 6},
+        sampling,
+        4,
+        [&](std::int64_t token) {
+            truncated_fresh_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{});
+    require(
+        truncated_prefill_tokens == 1,
+        "DeepSeek-V4 length-truncated request lost its prefix checkpoint");
+    require(
+        truncated_output == truncated_fresh_output,
+        "DeepSeek-V4 length-truncated reroll differs from a fresh runtime");
 }
 
 void test_mfq_container_load() {

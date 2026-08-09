@@ -1,4 +1,4 @@
-"""utils.tensor 度量测试。"""
+"""Tests for utils.tensor metrics."""
 
 from __future__ import annotations
 

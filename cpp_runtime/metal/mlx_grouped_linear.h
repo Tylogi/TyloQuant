@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mlx_cccp.h"
+#include "mlx_tpq.h"
 #include "mlx_mx.h"
 #include "mlx_nint.h"
 #include "mlx_nint8_zero.h"
@@ -22,8 +22,8 @@ using MlxGroupedLinearWeightRef = std::variant<
     const MlxNintWeight*,
     const MlxNint8ZeroWeight*,
     const MlxVqWeight*,
-    const MlxCccpInt4Weight*,
-    const MlxCccpPqWeight*,
+    const MlxTpqInt4Weight*,
+    const MlxTpqPqWeight*,
     const MlxMxWeight*>;
 
 class MlxGroupedLinearUnsupported : public std::runtime_error {
@@ -34,7 +34,7 @@ public:
 // Single-dispatch heterogeneous packed linear projections.
 //
 // All projections share an input width but may use different output widths
-// and packed NINT, NINT8-0, NVQ, NPQ, CCCP-I4G64, CCCP product-VQ, MXFP4,
+// and packed NINT, NINT8-0, NVQ, NPQ, TPQ-I4G64, TPQ product-VQ, MXFP4,
 // or MXFP8 layouts. Expert-shaped/rotated NEPQ belongs to the MoE path and is
 // rejected here. The decode-oriented kernel intentionally accepts only one
 // through max_rows() flattened input rows. Callers should use their ordinary
@@ -80,7 +80,7 @@ public:
     // Production projection groups bind each source array directly to one
     // Metal dispatch. Larger NINT-only groups use the pooled compatibility
     // kernel; groups which exceed the direct Metal buffer limit and contain
-    // VQ, CCCP, or MX layouts are unsupported.
+    // VQ, TPQ, or MX layouts are unsupported.
     bool uses_zero_copy_storage() const noexcept;
     std::size_t copied_packed_nbytes() const noexcept;
 

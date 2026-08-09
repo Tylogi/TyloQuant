@@ -483,6 +483,8 @@ void check_nvq_inputs(
                 "nvq_quant: codebook must be int8");
     TORCH_CHECK(xgroup.dim() == 2 && xgroup.size(1) == kGroupSize,
                 "nvq_quant: xgroup must have shape [groups, 24]");
+    TORCH_CHECK(xgroup.size(0) > 0,
+                "nvq_quant: xgroup must contain at least one group");
     TORCH_CHECK(wgroup.sizes() == xgroup.sizes(),
                 "nvq_quant: wgroup shape mismatch");
     TORCH_CHECK(vector_size == 4 || vector_size == 8,

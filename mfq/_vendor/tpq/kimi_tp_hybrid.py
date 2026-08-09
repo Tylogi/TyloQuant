@@ -1,7 +1,7 @@
 """Tensor-parallel packed routed experts with a bounded per-rank GPU cache.
 
 This pool is the multi-GPU counterpart of :mod:`tpq.packed_hybrid`.  The full
-CCCP expert payload remains packed in host RAM.  On a cache miss each GPU gets
+TPQ expert payload remains packed in host RAM.  On a cache miss each GPU gets
 only its row/column tensor-parallel shard; neither RAM nor VRAM contains a
 dequantized expert matrix.
 

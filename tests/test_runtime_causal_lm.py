@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import shutil
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -207,3 +207,44 @@ def test_qwen35_hf_config_shape_fields():
     assert cfg.kv_size == 1024
     assert cfg.linear_num_value_heads * cfg.linear_value_head_dim == 6144
     assert cfg.norm_weight_offset == 1.0
+
+
+def test_minicpmo45_hf_config_and_names():
+    cfg = TorchNintCausalLMConfig.from_minicpmo45_hf_config(
+        {
+            "model_type": "minicpmo",
+            "version": "4.5",
+            "vocab_size": 151748,
+            "hidden_size": 4096,
+            "intermediate_size": 12288,
+            "num_hidden_layers": 36,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "max_position_embeddings": 40960,
+            "rope_theta": 1000000,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": False,
+        }
+    )
+    names = TorchNintCausalLMNames.minicpmo45_hf()
+
+    assert cfg.head_dim == 128
+    assert cfg.kv_size == 1024
+    assert cfg.layer_types == ("full_attention",) * 36
+    assert cfg.norm_weight_offset == 0.0
+    assert names.token_embd == "llm.model.embed_tokens.weight"
+    assert names.output == "llm.lm_head.weight"
+
+
+def test_torch_nint_causal_lm_accepts_modality_inputs_embeds():
+    cfg, tensors = _tiny_tensors(23)
+    model = TorchNintCausalLM(tensors, cfg, device="cuda")
+    ids = torch.tensor([[1, 2, 3]], device="cuda", dtype=torch.int64)
+    embeds = model.embed(ids)
+
+    from_ids = model(ids, use_cache=False)
+    from_embeds = model(inputs_embeds=embeds, use_cache=False)
+
+    torch.testing.assert_close(from_embeds, from_ids, atol=0, rtol=0)
+    with pytest.raises(ValueError, match="exactly one"):
+        model(ids, inputs_embeds=embeds, use_cache=False)

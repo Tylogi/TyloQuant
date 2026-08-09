@@ -1,1 +1,1 @@
-"""formats 子包测试。"""
+"""Tests for the formats subpackage."""

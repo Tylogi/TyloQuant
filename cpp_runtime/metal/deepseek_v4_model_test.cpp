@@ -179,14 +179,14 @@ std::vector<std::uint8_t> dense_payload(
     return result;
 }
 
-std::vector<std::uint8_t> cccp_int4_payload(
+std::vector<std::uint8_t> tpq_int4_payload(
     const std::vector<std::int64_t>& shape) {
     require(
         shape.size() == 2 &&
             shape[0] > 0 &&
             shape[1] > 0 &&
             shape[1] % 64 == 0,
-        "invalid synthetic CCCP-I4 shape");
+        "invalid synthetic TPQ-I4 shape");
     const auto rows =
         static_cast<std::uint32_t>(shape[0]);
     const auto columns =
@@ -271,7 +271,7 @@ Record record_for_binding(
         return {
             binding.name,
             "TPQ-I4G64",
-            cccp_int4_payload(binding.shape),
+            tpq_int4_payload(binding.shape),
         };
     }
     return {
@@ -332,12 +332,12 @@ void write_model(
     }
 
     const json manifest{
-        {"format", "cccp-1"},
+        {"format", "tpq-1"},
         {"config", config_json},
         {"quant", json::object()},
     };
     const std::string source_format =
-        json("cccp-1").dump();
+        json("tpq-1").dump();
     const std::string manifest_text = manifest.dump();
 
     std::ofstream stream(path, std::ios::binary);
@@ -389,7 +389,7 @@ void test_manifest_and_hf_normalization() {
     const auto wrapped_model =
         DeepseekV4Config::from_json(
             json{
-                {"format", "cccp-1"},
+                {"format", "tpq-1"},
                 {"config", manifest},
             }.dump());
     const auto hf_model =
@@ -551,7 +551,7 @@ void test_container_bindings(
     write_model(
         missing_path,
         manifest_config(),
-        "deepseek_v4-cccp-mfq",
+        "deepseek_v4-tpq-mfq",
         missing);
     const MfqContainer missing_model(missing_path);
     const auto missing_config =
@@ -569,7 +569,7 @@ void test_container_bindings(
     write_model(
         shape_path,
         manifest_config(),
-        "deepseek_v4-cccp-mfq",
+        "deepseek_v4-tpq-mfq",
         {},
         "layers.2.attn.compressor.ape");
     const MfqContainer shape_model(shape_path);
@@ -588,7 +588,7 @@ void test_container_bindings(
     write_model(
         dtype_path,
         manifest_config(),
-        "deepseek_v4-cccp-mfq",
+        "deepseek_v4-tpq-mfq",
         {},
         {},
         "norm.weight");

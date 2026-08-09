@@ -1,14 +1,15 @@
-"""TPQ 精度策略层：全框架计算路径统一从这里取计算 dtype（中文说明）。
+"""TPQ precision-policy layer: all framework compute paths obtain their compute dtype here.
 
-设计动机：VQ/int4 量化本身的误差（相对 ~0.3-0.4）比半精度 GEMM 的舍入误差
-（fp16 ~1e-3、bf16 ~8e-3）低两个数量级以上，因此 GEMM 内积可走半精度张量核，
-对输出分布的影响可忽略（验收门：dspark_check 贪心/投机逐字一致 + KL 差 <0.01）。
+Motivation: VQ/int4 quantization error (relative ~0.3-0.4) is over two orders of magnitude larger than
+half-precision GEMM rounding error (fp16 ~1e-3, bf16 ~8e-3). GEMM dot products can therefore use
+half-precision tensor cores with negligible impact on output distributions. The acceptance gate requires
+token-for-token agreement between greedy and speculative dspark_check outputs plus a KL difference below 0.01.
 
-auto 策略（按硬件能力自适应，换卡零改动）：
-  - sm_8.x+（Ampere 及更新：3090/4090/A100/H100）→ bf16（动态范围好，无溢出问题）；
-  - sm_7.x（Turing：2080/T4，无 bf16 硬件）→ fp16（张量核，~2× fp32 GEMM）；
-  - CPU / 其他 → fp32（CPU 半精度无加速且部分算子不支持）。
-环境变量 TPQ_COMPUTE_DTYPE=fp32|fp16|bf16 可强制覆盖（调试/对照用）。
+Automatic policy, adapting to hardware capabilities without code changes when switching devices:
+  - sm_8.x+ (Ampere and newer: 3090/4090/A100/H100) -> bf16 for good dynamic range without overflow;
+  - sm_7.x (Turing: 2080/T4, without bf16 hardware) -> fp16 tensor cores at about 2x fp32 GEMM speed;
+  - CPU / other -> fp32 because half precision does not accelerate CPU and some operators do not support it.
+The TPQ_COMPUTE_DTYPE=fp32|fp16|bf16 environment variable can force an override for debugging/comparison.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ _AUTO_CACHE: dict[str, torch.dtype] = {}
 
 
 def compute_dtype(device=None) -> torch.dtype:
-    """返回当前设备应使用的 GEMM 计算 dtype（见模块 docstring 的策略表）。"""
+    """Return the GEMM compute dtype for the current device; see the policy table in the module docstring."""
     ov = os.environ.get("TPQ_COMPUTE_DTYPE", "auto").strip().lower()
     if ov in ("fp32", "float32", "f32"):
         return torch.float32

@@ -11,7 +11,7 @@ try:
 except RuntimeError:
     pytest.skip("Metal device unavailable", allow_module_level=True)
 
-from mfq.formats.tpq import CCCP_X, CccpPqTensor  # noqa: E402
+from mfq.formats.tpq import TPQ_X, TpqPqTensor  # noqa: E402
 from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
 from mfq.runtime.mlx_kimi_k3 import (  # noqa: E402
     MlxKimiK3,
@@ -274,16 +274,16 @@ def _pq_pool(
     codebook = rng.normal(
         0.0,
         0.15,
-        size=(CCCP_X.codebook_entries, CCCP_X.vector_size),
+        size=(TPQ_X.codebook_entries, TPQ_X.vector_size),
     ).astype(np.float32)
     indices = rng.integers(
         0,
-        CCCP_X.codebook_entries,
-        size=(rows, columns // CCCP_X.vector_size),
+        TPQ_X.codebook_entries,
+        size=(rows, columns // TPQ_X.vector_size),
         dtype=np.uint8,
     )
-    tensor = CccpPqTensor(
-        spec=CCCP_X,
+    tensor = TpqPqTensor(
+        spec=TPQ_X,
         shape=(rows, columns),
         axis=0,
         neuron_len=columns,
@@ -296,7 +296,7 @@ def _pq_pool(
     )
 
 
-def test_kimi_routed_situ_executes_cccp_experts_directly():
+def test_kimi_routed_situ_executes_tpq_experts_directly():
     rng = np.random.default_rng(401)
     experts, routed, intermediate = 4, 16, 8
     ids_a = np.array([0, 2], dtype=np.int32)

@@ -19,16 +19,16 @@ from mfq.calibration.artifact import (
     save_scheme,
 )
 from mfq.calibration.tpq import (
-    CccpTierAllocation,
-    build_cccp_expert_selection,
-    cccp_expert_precision,
+    TpqTierAllocation,
+    build_tpq_expert_selection,
+    tpq_expert_precision,
 )
 from mfq.formats.tpq import TPQ_PQ_SPECS_BY_LABEL, normalize_tpq_dtype
 from mfq.quantize.tpq import (
-    CccpKmeansConfig,
-    cccp_reconstruction_sums,
-    save_cccp_codebook_artifact,
-    train_cccp_codebook,
+    TpqKmeansConfig,
+    tpq_reconstruction_sums,
+    save_tpq_codebook_artifact,
+    train_tpq_codebook,
 )
 from mfq.quantize.v4f_source import V4FCheckpoint
 
@@ -42,8 +42,8 @@ def _config(
     precision: ExpertPrecision,
     *,
     default_seed: int,
-) -> CccpKmeansConfig:
-    return CccpKmeansConfig(
+) -> TpqKmeansConfig:
+    return TpqKmeansConfig(
         iterations=int(precision.option("iterations", 12)),
         restarts=int(precision.option("restarts", 2)),
         sample_points=int(precision.option("sample_points", 100_000)),
@@ -93,11 +93,11 @@ def _family_precision(
         if item.descriptor.family == family:
             return item.descriptor
     spec = TPQ_PQ_SPECS_BY_LABEL[family]
-    return cccp_expert_precision(
+    return tpq_expert_precision(
         spec.tier,
         artifact=(
             f"artifacts/layer{layer:02d}-{projection}-"
-            f"cccp-{spec.tier}.npz"
+            f"tpq-{spec.tier}.npz"
         ),
     )
 
@@ -115,17 +115,17 @@ def _load_codebook(
         codebook = np.asarray(payload["codebook"], dtype=np.float32)
     if family != precision.family:
         raise ValueError(
-            f"CCCP artifact family mismatch: {artifact} has {family}, "
+            f"TPQ artifact family mismatch: {artifact} has {family}, "
             f"scheme expects {precision.family}"
         )
     if objective != "euclidean_sse":
         raise ValueError(
-            f"CCCP artifact {artifact} uses objective {objective!r}"
+            f"TPQ artifact {artifact} uses objective {objective!r}"
         )
     spec = TPQ_PQ_SPECS_BY_LABEL[family]
     if codebook.shape != (spec.codebook_entries, spec.vector_size):
         raise ValueError(
-            f"CCCP artifact {artifact} has codebook shape {codebook.shape}"
+            f"TPQ artifact {artifact} has codebook shape {codebook.shape}"
         )
     return codebook
 
@@ -160,10 +160,10 @@ def _sample_original_cohort(
     max_experts: int,
     device: str,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-    """Match CCCP's tier-local, weight-only GU/down point sampling."""
+    """Match TPQ's tier-local, weight-only GU/down point sampling."""
 
     if not expert_ids:
-        raise ValueError("CCCP cohort must contain at least one expert")
+        raise ValueError("TPQ cohort must contain at least one expert")
     rng = np.random.default_rng(layer)
     sampled_experts = list(expert_ids)
     if len(sampled_experts) > max_experts:
@@ -246,13 +246,13 @@ def _audit_error(
         down_source.rows_per_expert,
         device=device,
     )
-    gate_sse, gate_signal = cccp_reconstruction_sums(
+    gate_sse, gate_signal = tpq_reconstruction_sums(
         gate,
         spec,
         codebooks[family]["gate_up"],
         device=device,
     )
-    down_sse, down_signal = cccp_reconstruction_sums(
+    down_sse, down_signal = tpq_reconstruction_sums(
         down,
         spec,
         codebooks[family]["down"],
@@ -270,7 +270,7 @@ def _audit_error(
 def _allocation_from_final_tiers(
     tiers: list[str],
     scores: list[float],
-) -> CccpTierAllocation:
+) -> TpqTierAllocation:
     values = np.asarray(scores, dtype=np.float64)
     labels = np.asarray(tiers)
     total = max(float(values.sum()), 1e-12)
@@ -281,7 +281,7 @@ def _allocation_from_final_tiers(
         )
         for tier in ("vv", "v", "w", "x")
     )
-    return CccpTierAllocation(
+    return TpqTierAllocation(
         tiers=tuple(tiers),
         scores=tuple(float(value) for value in values),
         boundaries=(
@@ -317,15 +317,15 @@ def train(
     layers: set[int] | None = None,
     overwrite: bool = False,
 ) -> list[dict]:
-    """Train every CCCP cohort using the original unweighted CCCP flow."""
+    """Train every TPQ cohort using the original unweighted TPQ flow."""
 
     if points_per_expert <= 0 or vv_points_per_expert <= 0:
-        raise ValueError("CCCP points-per-expert values must be positive")
+        raise ValueError("TPQ points-per-expert values must be positive")
     if max_experts <= 0:
-        raise ValueError("CCCP max-experts must be positive")
+        raise ValueError("TPQ max-experts must be positive")
     scheme = load_scheme(scheme_path)
     if scheme.path is None:
-        raise ValueError("V4F CCCP scheme has no source path")
+        raise ValueError("V4F TPQ scheme has no source path")
     checkpoint = V4FCheckpoint(input_root)
     events: list[dict] = []
     updated_expert_selections = dict(scheme.expert_selections)
@@ -347,7 +347,7 @@ def train(
     for layer, layer_selections in sorted(selections.items()):
         if set(layer_selections) != {"gate_up", "down"}:
             raise ValueError(
-                f"CCCP layer {layer} must contain gate_up and down selections"
+                f"TPQ layer {layer} must contain gate_up and down selections"
             )
         gate_selection = layer_selections["gate_up"]
         down_selection = layer_selections["down"]
@@ -355,7 +355,7 @@ def train(
         down_cohorts = _cohorts(down_selection)
         if gate_cohorts != down_cohorts:
             raise ValueError(
-                f"CCCP layer {layer} assigns different tiers to gate_up and down"
+                f"TPQ layer {layer} assigns different tiers to gate_up and down"
             )
         if not gate_cohorts:
             continue
@@ -407,7 +407,7 @@ def train(
                 else:
                     assert points is not None
                     item_started = time.perf_counter()
-                    result = train_cccp_codebook(
+                    result = train_tpq_codebook(
                         points,
                         spec,
                         config=_config(
@@ -417,7 +417,7 @@ def train(
                         ),
                         device=device,
                     )
-                    save_cccp_codebook_artifact(artifact, spec, result)
+                    save_tpq_codebook_artifact(artifact, spec, result)
                     status = "trained"
                     seconds = time.perf_counter() - item_started
                     sse = result.sse
@@ -559,7 +559,7 @@ def train(
                     ("gate_up", gate_points),
                     ("down", down_points),
                 ):
-                    result = train_cccp_codebook(
+                    result = train_tpq_codebook(
                         points,
                         spec,
                         config=_config(
@@ -569,7 +569,7 @@ def train(
                         ),
                         device=device,
                     )
-                    save_cccp_codebook_artifact(
+                    save_tpq_codebook_artifact(
                         artifacts[projection],
                         spec,
                         result,
@@ -676,9 +676,9 @@ def train(
                 for tier in set(final_tiers)
             }
             if any(path is None for path in artifacts.values()):
-                raise ValueError(f"CCCP layer {layer} has an artifact-less tier")
+                raise ValueError(f"TPQ layer {layer} has an artifact-less tier")
             updated_expert_selections[original.name] = (
-                build_cccp_expert_selection(
+                build_tpq_expert_selection(
                     name=original.name,
                     group=original.group,
                     allocation=allocation,
@@ -729,7 +729,7 @@ def train(
             flush=True,
         )
     if not events:
-        raise ValueError("scheme contains no V4F CCCP expert cohorts")
+        raise ValueError("scheme contains no V4F TPQ expert cohorts")
     metadata = {
         **scheme.metadata,
         "codebook_objective": "euclidean_sse",

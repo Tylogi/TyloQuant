@@ -1,4 +1,4 @@
-"""通用算子注册与能力选择。"""
+"""Generic operator registration and capability selection."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ class OperatorRegistry:
         *,
         priority: int = 0,
     ) -> None:
-        """按稳定名称注册；重复导入同一后端是幂等的。"""
+        """Register by stable name; repeated imports of the same backend are idempotent."""
         normalized = OperatorCapability(
             operation=capability.operation.strip().lower(),
             device_types=tuple(

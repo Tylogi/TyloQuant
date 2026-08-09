@@ -12,12 +12,12 @@ except RuntimeError:
     pytest.skip("Metal device unavailable", allow_module_level=True)
 
 from mfq.formats import io  # noqa: E402
-from mfq.formats.tpq import CCCP_V, CccpPqTensor  # noqa: E402
+from mfq.formats.tpq import TPQ_V, TpqPqTensor  # noqa: E402
 from mfq.formats.header import FileHeader  # noqa: E402
 from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
 from mfq.formats.nint import NintSpec  # noqa: E402
 from mfq.quantize.nint_quant import quantize  # noqa: E402
-from mfq.runtime import load_cccp_model  # noqa: E402
+from mfq.runtime import load_tpq_model  # noqa: E402
 from mfq.runtime.mlx_deepseek_v4 import (  # noqa: E402
     MlxDeepseekV4,
     MlxDeepseekV4Config,
@@ -106,7 +106,7 @@ def _expert(
     )
 
 
-def _cccp_expert(
+def _tpq_expert(
     rng: np.random.Generator,
     *,
     experts: int,
@@ -114,21 +114,21 @@ def _cccp_expert(
     width: int,
 ) -> NintMoeTensor:
     rows = experts * output
-    tensor = CccpPqTensor(
-        spec=CCCP_V,
+    tensor = TpqPqTensor(
+        spec=TPQ_V,
         shape=(rows, width),
         axis=0,
         neuron_len=width,
         indices=rng.integers(
             0,
-            CCCP_V.codebook_entries,
-            size=(rows, width // CCCP_V.vector_size),
+            TPQ_V.codebook_entries,
+            size=(rows, width // TPQ_V.vector_size),
             dtype=np.uint8,
         ),
         codebook=rng.normal(
             0.0,
             0.03,
-            size=(CCCP_V.codebook_entries, CCCP_V.vector_size),
+            size=(TPQ_V.codebook_entries, TPQ_V.vector_size),
         ).astype(np.float32),
     )
     return NintMoeTensor(
@@ -166,7 +166,7 @@ def _write_tiny_model(
         "hc_head_scale": np.ones((1,), dtype=np.float32),
     }
     prefix = "layers.0"
-    expert_factory = _cccp_expert if streamed_experts else _expert
+    expert_factory = _tpq_expert if streamed_experts else _expert
     tensors.update(
         {
             f"{prefix}.attn.wq_a.weight": _dense(rng, (q_rank, hidden)),
@@ -244,7 +244,7 @@ def _write_tiny_model(
             }
         )
     manifest = {
-        "format": "cccp-1",
+        "format": "tpq-1",
         "config": config,
         "quant": {},
         "expert_files": {"0": "experts.L0.safetensors"},
@@ -254,11 +254,11 @@ def _write_tiny_model(
         path,
         FileHeader(
             version=2,
-            model_arch="deepseek_v4-cccp-mfq",
+            model_arch="deepseek_v4-tpq-mfq",
             num_tensors=len(tensors),
             extra={
-                "source_format": "cccp-1",
-                "cccp_manifest": manifest,
+                "source_format": "tpq-1",
+                "tpq_manifest": manifest,
             },
         ),
         tensors,
@@ -398,7 +398,7 @@ def _write_official_shape_model(path, *, ratio: int = 0) -> None:
             }
         )
     manifest = {
-        "format": "cccp-1",
+        "format": "tpq-1",
         "config": config,
         "quant": {},
         "expert_files": {"0": "experts.L0.safetensors"},
@@ -408,11 +408,11 @@ def _write_official_shape_model(path, *, ratio: int = 0) -> None:
         path,
         FileHeader(
             version=2,
-            model_arch="deepseek_v4-cccp-mfq",
+            model_arch="deepseek_v4-tpq-mfq",
             num_tensors=len(tensors),
             extra={
-                "source_format": "cccp-1",
-                "cccp_manifest": manifest,
+                "source_format": "tpq-1",
+                "tpq_manifest": manifest,
             },
         ),
         tensors,
@@ -497,15 +497,15 @@ def test_dsv4_native_mfq_prefill_decode_and_generate(tmp_path):
         assert model.position == 6
 
 
-def test_dsv4_load_cccp_model_dispatches_to_metal_runtime(tmp_path):
+def test_dsv4_load_tpq_model_dispatches_to_metal_runtime(tmp_path):
     path = tmp_path / "tiny-dsv4-entrypoint.mfq"
     _write_tiny_model(path)
-    with load_cccp_model(path, device="metal", max_ctx=7) as model:
+    with load_tpq_model(path, device="metal", max_ctx=7) as model:
         assert isinstance(model, MlxDeepseekV4)
         assert model.max_context == 7
 
 
-def test_dsv4_native_cccp_experts_use_bounded_mmap_residency(tmp_path):
+def test_dsv4_native_tpq_experts_use_bounded_mmap_residency(tmp_path):
     path = tmp_path / "tiny-dsv4-streamed-experts.mfq"
     _write_tiny_model(path, streamed_experts=True)
     ids = np.array([[1, 3, 5]], dtype=np.int32)

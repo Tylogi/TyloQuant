@@ -1,23 +1,29 @@
-"""TPQ 可选 CUDA 融合 kernel 的加载器。
+"""Loader for TPQ's optional fused CUDA kernels.
 
-包含六类融合 kernel（csrc/vq_gemv.cu）：
-  - vq_gemv：VQ 分组 GEMV（码本查表+点积单 kernel，u8/u16 索引、码本/索引广播）；
-  - hc_sinkhorn：Hyper-Connections 4×4 双随机归一化（softmax+20 轮一次 launch）；
-  - rmsnorm：f32 行归一化；rope1：decode 单相位交错 RoPE。
-  - dsv4_attn_decode：单 token 的 score/sink-softmax/value/RoPE。
-  - dsv4_hc_pre：HC 的 RMS/GEMV/Sinkhorn/通道归约整段融合。
+Provides six categories of fused kernels (csrc/vq_gemv.cu):
+  - vq_gemv: grouped VQ GEMV, combining codebook lookup and dot product in a
+    single kernel with u8/u16 indices and codebook/index broadcasting.
+  - hc_sinkhorn: 4×4 doubly stochastic normalization for Hyper-Connections,
+    combining softmax and 20 iterations in one launch.
+  - rmsnorm: f32 row normalization; rope1: single-phase interleaved RoPE for
+    decoding.
+  - dsv4_attn_decode: score/sink-softmax/value/RoPE for a single token.
+  - dsv4_hc_pre: fully fused HC RMS/GEMV/Sinkhorn/channel reduction.
 
-行为：
-  - 导入时尝试用 torch.utils.cpp_extension.load 编译/复用缓存
-    （已编译过走缓存，约 1-2s；未编译且工具链缺失时静默记为不可用）；
-  - 可用时 available() 为 True，grouped.py / dsv4model.py 的钩子优先走融合路径；
-  - 不可用（无 CUDA / 无 nvcc+MSVC+ninja / 编译失败）时自动回退
-    torch 批量路径 —— 推理功能完全不依赖本模块。
+Behavior:
+  - On import, torch.utils.cpp_extension.load attempts to compile or reuse the
+    cache. A compiled extension takes about 1–2 seconds to load from cache; if
+    no extension is compiled and the toolchain is missing, it is silently
+    marked unavailable.
+  - When available, available() returns True and hooks in grouped.py and
+    dsv4model.py prefer the fused path.
+  - Without CUDA, nvcc+MSVC+ninja, or a successful build, callers fall back to
+    the batched torch path. Inference does not depend on this module.
 
-手动预编译（推荐随安装执行一次）：
+Manual precompilation (recommended once during installation):
   python -c "from tpq import fusedext; fusedext.prebuild()"
-环境变量：
-  TPQ_FUSED=0  强制禁用（调试用）。
+Environment variable:
+  TPQ_FUSED=0  Force-disable the extension for debugging.
 """
 
 from __future__ import annotations
@@ -52,11 +58,12 @@ def _apply_cuda_hardware_defaults() -> None:
 
 
 def _ensure_ninja_on_path() -> None:
-    """让 PyTorch JIT 构建能找到 pip 安装的 Ninja 可执行文件。
+    """Make a pip-installed Ninja executable visible to PyTorch JIT builds.
 
-    非交互 SSH 会话不一定继承 ``~/.local/bin``，即使 Python 已经可以
-    导入 ninja 包。PyTorch 在构建前使用 ``shutil.which`` 查找可执行文件，
-    因此在需要时补入该包声明的二进制目录。
+    Non-interactive SSH sessions do not always inherit ``~/.local/bin``, even
+    when Python can import the ninja package. PyTorch locates the executable
+    with ``shutil.which`` before building, so this adds the package-declared
+    binary directory when needed.
     """
     if shutil.which("ninja") is not None:
         return
@@ -78,7 +85,10 @@ def _ensure_ninja_on_path() -> None:
 
 
 def _build(verbose: bool = False):
-    """编译（或命中缓存）并返回扩展模块；失败返回 None 并记录 last_error。"""
+    """Compile or load the cached extension.
+
+    Returns the extension module, or None on failure and records last_error.
+    """
     global _EXT, _ERR
     if _EXT is not None:
         return _EXT
@@ -91,12 +101,12 @@ def _build(verbose: bool = False):
     try:
         _apply_cuda_hardware_defaults()
         _ensure_ninja_on_path()
-        # Windows 下新版 setuptools 的 distutils shim 不自动挂
-        # _msvccompiler 子模块，而 torch._run_ninja_build 以属性方式访问它；
-        # Linux 不得导入该 Windows 专用模块，否则会在编译 CUDA 扩展前失败。
+        # On Windows, the new setuptools distutils shim does not automatically attach the _msvccompiler submodule,
+        # while torch._run_ninja_build accesses it as an attribute. Linux must not import this Windows-only module,
+        # or it will fail before compiling the CUDA extension.
         if os.name == "nt":
             import distutils._msvccompiler  # noqa: F401
-        # 锁定当前卡的 arch（否则 torch 警告"all archs"且按全架构编译，很慢）。
+        # Pin the current device architecture (otherwise torch warns about "all archs" and compiles every architecture, which is slow).
         if "TORCH_CUDA_ARCH_LIST" not in os.environ:
             try:
                 _maj, _min = torch.cuda.get_device_capability(0)
@@ -109,24 +119,24 @@ def _build(verbose: bool = False):
         _EXT = load(name=_EXTENSION_NAME, sources=[src],
                     extra_cuda_cflags=["-O3"], verbose=verbose)
         _ERR = None
-    except Exception as e:  # noqa: BLE001 —— 任何编译/加载失败都回退
+    except Exception as e:  # noqa: BLE001 -- fall back on any compilation/loading failure
         _EXT = None
         _ERR = f"{type(e).__name__}: {e}"
     return _EXT
 
 
 def available() -> bool:
-    """融合 kernel 是否可用。"""
+    """Return whether the fused kernels are available."""
     return _EXT is not None
 
 
 def last_error() -> str | None:
-    """最近一次构建失败的原因（诊断用；可用时返回 None）。"""
+    """Return the most recent build failure for diagnostics, or None if available."""
     return _ERR
 
 
 def prebuild() -> bool:
-    """显式预编译入口，返回是否成功。"""
+    """Explicitly precompile the extension and return whether it succeeded."""
     ok = _build(verbose=True) is not None
     print("[fusedext] 融合 kernel " + ("编译成功并已缓存" if ok else
           f"不可用（{_ERR}），将使用 torch 批量路径"))
@@ -139,8 +149,12 @@ if _EXT is not None:
 
     def vq_gemv_fused(x_rows: torch.Tensor, idx: torch.Tensor,
                       cb: torch.Tensor) -> torch.Tensor:
-        """融合 VQ 分组 GEMV：x_rows [N|1, C] f32，idx u8/u16 [N,R,B]，
-        cb f32 [N|1,K,D]（1 = 同层共享码本广播）→ [N,R] f32。"""
+        """Apply fused grouped VQ GEMV.
+
+        x_rows is f32 [N|1, C], idx is u8/u16 [N,R,B], and cb is f32
+        [N|1,K,D]. A leading dimension of 1 broadcasts a codebook shared by
+        the layer. Returns f32 [N,R].
+        """
         return _EXT.vq_gemv(x_rows.contiguous(), idx.contiguous(), cb.contiguous())
 
     def short_conv3_fused(
@@ -332,7 +346,10 @@ if _EXT is not None:
         out_workspace: torch.Tensor,
         result: torch.Tensor,
     ) -> torch.Tensor:
-        """稳定专家槽 BF16 MLP；四个 kernel 完成 GU/SwiGLU/DN/加权。"""
+        """Apply a BF16 MLP over stable expert slots.
+
+        Four kernels perform GU, SwiGLU, DN, and weighting.
+        """
         return _EXT.moe_mlp_slots(
             x_rows,
             gu_indices,
@@ -513,7 +530,7 @@ if _EXT is not None:
         route_ids_out: torch.Tensor,
         weights_out: torch.Tensor,
     ) -> bool:
-        """一次 peer kernel 完成远端专家输入、ID 和权重分发。"""
+        """Distribute remote-expert inputs, IDs, and weights in one peer kernel."""
         if (
             os.environ.get("TPQ_EP_FUSED_DISPATCH", "1") == "0"
             or not x.is_cuda
@@ -658,10 +675,15 @@ if _EXT is not None:
 
     def hc_split_fused(mixes: torch.Tensor, scale: torch.Tensor, base: torch.Tensor,
                        hc: int, iters: int, eps: float):
-        """融合 HC sinkhorn：mixes [..., 24] f32 CUDA + hc==4 时返回
-        (pre, post, comb)（单次 kernel 完成 softmax + 全部归一化迭代）；
-        不满足条件返回 None（调用方回退 tpq.dsv4.hc_split 的 torch 循环）。
-        数值与 torch 版同序 fp32 计算，差异在 1e-7 量级。"""
+        """Apply fused HC Sinkhorn normalization.
+
+        For f32 CUDA mixes [..., 24] with hc==4, returns (pre, post, comb) from
+        one kernel that performs softmax and all normalization iterations.
+        Returns None when the conditions are not met, allowing the caller to
+        use the torch loop in tpq.dsv4.hc_split. Numerics follow the same-order
+        fp32 computation as the torch implementation, with differences around
+        1e-7.
+        """
         if (hc != 4 or not mixes.is_cuda or mixes.dtype != torch.float32
                 or scale.dtype != torch.float32):
             return None
@@ -677,7 +699,11 @@ if _EXT is not None:
         eps: float,
         output: torch.Tensor | None = None,
     ):
-        """融合 RMSNorm（f32 CUDA）：不满足条件返回 None（回退 torch 路径）。"""
+        """Apply fused RMSNorm to f32 CUDA inputs.
+
+        Returns None when the conditions are not met so callers can use the
+        torch path.
+        """
         if not x.is_cuda or x.dtype != torch.float32 or w.dtype != torch.float32:
             return None
         return _EXT.rmsnorm(x, w, float(eps), output)
@@ -826,9 +852,13 @@ if _EXT is not None:
 
     def rope1_fused(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
                     inverse: bool = False):
-        """融合 RoPE（交错对）：仅 decode 单相位场景——x [..., rd] f32 CUDA 且
-        cos/sin 各 rd/2 个元素（全部行同相位）时生效，否则 None（回退 torch）。
-        数值与 tpq.dsv4.rope_apply 逐项一致。"""
+        """Apply fused RoPE over interleaved pairs for single-phase decoding.
+
+        The fused path applies only when x is f32 CUDA [..., rd] and cos/sin
+        each contain rd/2 elements, meaning all rows share one phase. Returns
+        None otherwise so callers can use torch. Numerics match
+        tpq.dsv4.rope_apply element by element.
+        """
         if (not x.is_cuda or x.dtype != torch.float32
                 or cos.numel() * 2 != x.shape[-1] or sin.numel() * 2 != x.shape[-1]):
             return None
@@ -1020,7 +1050,10 @@ if _EXT is not None:
                                win_pos: torch.Tensor, comp_kv: torch.Tensor,
                                sink: torch.Tensor, cos: torch.Tensor,
                                sin: torch.Tensor, scale: float):
-        """DSV4 B=1,T=1 attention 核；过长或 dtype/shape 不满足时返回 None。"""
+        """Apply the DSV4 B=1, T=1 attention kernel.
+
+        Returns None for overlong inputs or unsupported dtypes or shapes.
+        """
         seq = win_kv.shape[1] + comp_kv.shape[1]
         if (not q.is_cuda or q.dtype != torch.float32 or q.shape[0] != 1
                 or win_kv.dtype != torch.float32 or comp_kv.dtype != torch.float32
@@ -1033,7 +1066,10 @@ if _EXT is not None:
 
     def dsv4_hc_pre_fused(x: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor,
                           base: torch.Tensor, iters: int, eps: float):
-        """融合 HC pre；返回形状与 dsv4.hc_pre 一致，不满足条件时返回 None。"""
+        """Apply fused HC pre with the same output shape as dsv4.hc_pre.
+
+        Returns None when the conditions are not met.
+        """
         if (not x.is_cuda or x.dtype != torch.float32 or x.shape[-2] != 4
                 or fn.dtype not in (torch.float32, torch.bfloat16)
                 or scale.dtype != torch.float32 or base.dtype != torch.float32):
@@ -1062,7 +1098,7 @@ if _EXT is not None:
             torch.Tensor,
         ] | None = None,
     ):
-        """BF16 HC pre + RMSNorm；可复用调用方固定输出缓冲。"""
+        """Apply BF16 HC pre plus RMSNorm using reusable caller-owned output buffers."""
         if (
             not x.is_cuda
             or x.dtype != torch.bfloat16
@@ -1308,7 +1344,7 @@ if _EXT is not None:
         )
         return weights, indices
 
-    # 旧公开名仅保留给外部脚本过渡；模型运行时统一经过 ops.route_topk。
+    # Keep the old public name only for external-script migration; model runtime consistently uses ops.route_topk.
     glm_route_fused = route_topk_sigmoid_fused
 
     def paged_gather_bf16_fused(
@@ -2574,7 +2610,7 @@ else:
         return None
 
 
-# 旧公开名只作为外部脚本的兼容别名；注册层只引用通用名称。
+# The old public name is only a compatibility alias for external scripts; the registry references only the generic name.
 kimi_short_conv3_fused = short_conv3_fused
 kimi_kda_recurrent_fused = kda_recurrent_fused
 kimi_gated_rmsnorm_fused = gated_rmsnorm_fused

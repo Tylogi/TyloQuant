@@ -1,24 +1,24 @@
-"""Gated DeltaNet 线性注意力（对应 ggml gated_delta_net.cu / ops.cpp）。
+"""Gated DeltaNet linear attention corresponding to ggml gated_delta_net.cu / ops.cpp.
 
-Qwen3.5/3.6 占大多数层的 GDN：带门控的 delta-rule 递归状态。逐 token 递推（per head）：
+GDN occupies most Qwen3.5/3.6 layers and uses a gated delta-rule recurrent state. Per-token recurrence for each head:
 
-    S ← decay·S            decay = exp(g)，标量门控或 per-dim diag(exp(g))（KDA）
+    S <- decay*S            decay = exp(g), scalar gating or per-dimension diag(exp(g)) (KDA)
     δ = (v − Sᵀk) · β      delta-rule
-    S ← S + k⊗δ            外积更新
-    o = scale·(Sᵀq)         检索，scale = 1/√D
+    S <- S + k outer delta  outer-product update
+    o = scale*(S^T q)        retrieval, scale = 1/sqrt(D)
 
-参考实现为 T 步 Python 循环（正确性优先，对应 ops.cpp 的朴素递推）。生产级速度需
-chunked-parallel 版（按 T 分块、并行初始化各块状态），对应 ``gated_delta_net.cu`` 的
-chunked kernel——留作后续（torch.compile / 自定义 CUDA）。
+The reference implementation is a T-step Python loop prioritizing correctness and matching the naive recurrence in ops.cpp.
+Production speed requires a chunked-parallel version that partitions T and initializes chunk states in parallel, corresponding
+to the chunked kernel in ``gated_delta_net.cu``. This remains future work for torch.compile or custom CUDA.
 
-张量约定（torch 布局 ``[B, H, T, D]``，对应 ggml 的 ``[D, H, T, B]``）：
+Tensor conventions (torch layout ``[B, H, T, D]``, corresponding to ggml ``[D, H, T, B]``):
 
-    q, k, v : [B, H, T, D]   （GQA 须在调用前把 q/k repeat 到与 v 同 head 数）
-    g       : [B, H, T]（标量门控）或 [B, H, T, D]（per-dim，KDA）
+    q, k, v : [B, H, T, D]   (for GQA, repeat q/k to v's head count before calling)
+    g       : [B, H, T] (scalar gating) or [B, H, T, D] (per-dimension KDA)
     beta    : [B, H, T]
-    state   : [B, H, D, D]   初始递归状态 s0（None → 零）
+    state   : [B, H, D, D]   initial recurrent state s0 (None -> zero)
 
-返回 ``(out [B,H,T,D], new_state [B,H,D,D])``。
+Returns ``(out [B,H,T,D], new_state [B,H,D,D])``.
 """
 
 from __future__ import annotations
@@ -34,12 +34,12 @@ def gated_delta_net(
     beta: torch.Tensor,
     state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gated DeltaNet 前向（参考递推实现）。"""
+    """Gated DeltaNet forward pass using the reference recurrence implementation."""
 
     B, H, T, D = q.shape
     scale = D ** -0.5
     S = q.new_zeros(B, H, D, D) if state is None else state.clone()
-    kda = g.dim() == 4   # per-dim 门控
+    kda = g.dim() == 4   # Per-dimension gating
 
     outs = []
     for t in range(T):

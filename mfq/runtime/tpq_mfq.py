@@ -16,7 +16,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from mfq.formats.tpq import CccpInt4Tensor, CccpPqSpec, CccpPqTensor
+from mfq.formats.tpq import TpqInt4Tensor, TpqPqSpec, TpqPqTensor
 from mfq.formats.tpq import normalize_tpq_dtype, unpack_tpq_indices
 from mfq.formats.io import MMapTensorStore, is_bfloat16_array, load_mmap
 from mfq.formats.moe import NintMoePool, NintMoeTensor
@@ -32,7 +32,7 @@ _CHAR_TO_TIER = {
 
 _NINT_MOE_HEADER = struct.Struct("<4sIIII")
 _NINT_MOE_POOL_V2_HEADER = struct.Struct("<IIQQ")
-_CCCP_PQ_HEADER = struct.Struct("<4sBBBBiiII")
+_TPQ_PQ_HEADER = struct.Struct("<4sBBBBiiII")
 
 
 @dataclass
@@ -171,8 +171,8 @@ class _ManifestView:
 
 
 @dataclass(frozen=True)
-class _DirectCccpPool:
-    spec: CccpPqSpec
+class _DirectTpqPool:
+    spec: TpqPqSpec
     codebook: np.ndarray
     indices_offset: int
     rows_per_expert: int
@@ -188,8 +188,8 @@ class _DirectCccpPool:
 
 
 @dataclass(frozen=True)
-class NativeCCCPArtifact:
-    """Validated native CCCP payloads stored in one MFQ file."""
+class NativeTPQArtifact:
+    """Validated native TPQ payloads stored in one MFQ file."""
 
     path: Path
     manifest: dict[str, Any]
@@ -199,18 +199,15 @@ class NativeCCCPArtifact:
     index_storage: dict[str, int]
 
     @classmethod
-    def open(cls, path: str | Path) -> NativeCCCPArtifact:
+    def open(cls, path: str | Path) -> NativeTPQArtifact:
         resolved = Path(path).resolve()
         header, store = load_mmap(resolved)
         try:
-            manifest = header.extra.get(
-                "tpq_manifest",
-                header.extra.get("cccp_manifest"),
-            )
-            if header.extra.get("source_format") not in {
-                "tpq-1",
-                "cccp-1",
-            } or not isinstance(manifest, dict):
+            manifest = header.extra.get("tpq_manifest")
+            if (
+                header.extra.get("source_format") != "tpq-1"
+                or not isinstance(manifest, dict)
+            ):
                 raise ValueError(
                     f"MFQ file has no native TPQ manifest: {resolved}"
                 )
@@ -223,10 +220,7 @@ class NativeCCCPArtifact:
             index_storage = {
                 str(key): int(value)
                 for key, value in dict(
-                    header.extra.get(
-                        "tpq_index_storage",
-                        header.extra.get("cccp_index_storage", {}),
-                    )
+                    header.extra.get("tpq_index_storage", {})
                 ).items()
             }
             return cls(
@@ -268,8 +262,8 @@ class NativeCCCPArtifact:
         }
 
 
-class MfqCccpStore:
-    """Expose native MFQ records through TyloQuant's CCCPStore interface."""
+class MfqTpqStore:
+    """Expose native MFQ records through TyloQuant's TPQStore interface."""
 
     _mfq_direct_host_pin = True
 
@@ -278,13 +272,8 @@ class MfqCccpStore:
         self.root = str(self.path.parent)
         self.header, self._store = load_mmap(self.path, cache=False)
         source_format = self.header.extra.get("source_format")
-        manifest = self.header.extra.get(
-            "tpq_manifest",
-            self.header.extra.get("cccp_manifest"),
-        )
-        if source_format not in {"tpq-1", "cccp-1"} or not isinstance(
-            manifest, dict
-        ):
+        manifest = self.header.extra.get("tpq_manifest")
+        if source_format != "tpq-1" or not isinstance(manifest, dict):
             self.close()
             raise ValueError(f"MFQ file has no native TPQ manifest: {self.path}")
         config = dict(manifest["config"])
@@ -599,7 +588,7 @@ class MfqCccpStore:
         return False
 
     def get_mtp(self, name: str):
-        raise KeyError(f"native CCCP MFQ has no MTP tensor: {name}")
+        raise KeyError(f"native TPQ MFQ has no MTP tensor: {name}")
 
     def has(self, name: str) -> bool:
         return name in self._store.records
@@ -663,11 +652,11 @@ class MfqCccpStore:
         value = self._store[name]
         if isinstance(value, np.ndarray):
             return self._torch_array(value)
-        if isinstance(value, CccpInt4Tensor):
+        if isinstance(value, TpqInt4Tensor):
             return self._torch_array(value.packed)
         if isinstance(value, MxTensor):
             return self._torch_array(value.values)
-        raise TypeError(f"native CCCP record is not dense: {name}")
+        raise TypeError(f"native TPQ record is not dense: {name}")
 
     def get_dense(self, name: str):
         record = self._store.records[name]
@@ -700,7 +689,7 @@ class MfqCccpStore:
                 128,
             )
         value = self._store[name]
-        if isinstance(value, CccpInt4Tensor):
+        if isinstance(value, TpqInt4Tensor):
             return self._tpq.kernels.Int4Weight(
                 self._torch_array(value.packed),
                 self._torch_array(value.scales),
@@ -726,7 +715,7 @@ class MfqCccpStore:
             )
         if isinstance(value, np.ndarray):
             return self._torch_array(value).float()
-        raise TypeError(f"native CCCP record is not dense: {name}")
+        raise TypeError(f"native TPQ record is not dense: {name}")
 
     def _drop_records_file_cache(self, names: tuple[str, ...]) -> None:
         posix_fadvise = getattr(os, "posix_fadvise", None)
@@ -772,25 +761,25 @@ class MfqCccpStore:
     def _parse_direct_projection(
         self,
         name: str,
-    ) -> dict[int, tuple[_DirectCccpPool, int]]:
+    ) -> dict[int, tuple[_DirectTpqPool, int]]:
         record = self._store.records[name]
         if record.dtype != "NINTM":
-            raise TypeError(f"native CCCP expert record is not NINTM: {name}")
+            raise TypeError(f"native TPQ expert record is not NINTM: {name}")
         mm = self._store.mmap_for(record)
         start = int(record.offset)
         end = start + int(record.nbytes)
         if start + _NINT_MOE_HEADER.size > end:
-            raise ValueError(f"truncated native CCCP expert header: {name}")
+            raise ValueError(f"truncated native TPQ expert header: {name}")
         magic, n_experts, rows_per_expert, columns, pool_count = (
             _NINT_MOE_HEADER.unpack_from(mm, start)
         )
         if magic != b"NIM2" or int(n_experts) != int(self.cfg["n_experts"]):
-            raise ValueError(f"unsupported native CCCP expert container: {name}")
+            raise ValueError(f"unsupported native TPQ expert container: {name}")
         offset = start + _NINT_MOE_HEADER.size
-        result: dict[int, tuple[_DirectCccpPool, int]] = {}
+        result: dict[int, tuple[_DirectTpqPool, int]] = {}
         for _ in range(int(pool_count)):
             if offset + _NINT_MOE_POOL_V2_HEADER.size > end:
-                raise ValueError(f"truncated native CCCP pool header: {name}")
+                raise ValueError(f"truncated native TPQ pool header: {name}")
             expert_count, dtype_nbytes, payload_nbytes, runtime_nbytes = (
                 _NINT_MOE_POOL_V2_HEADER.unpack_from(mm, offset)
             )
@@ -806,7 +795,7 @@ class MfqCccpStore:
                 or dtype_nbytes > 32
                 or payload_end > end
             ):
-                raise ValueError(f"invalid native CCCP pool metadata: {name}")
+                raise ValueError(f"invalid native TPQ pool metadata: {name}")
             expert_ids = np.frombuffer(
                 mm,
                 dtype="<i4",
@@ -819,15 +808,15 @@ class MfqCccpStore:
                 )
             except UnicodeDecodeError as exc:
                 raise ValueError(
-                    f"native CCCP pool dtype is not ASCII: {name}"
+                    f"native TPQ pool dtype is not ASCII: {name}"
                 ) from exc
             if runtime_nbytes:
                 raise ValueError(
-                    f"native CCCP pool has unexpected runtime metadata: {name}"
+                    f"native TPQ pool has unexpected runtime metadata: {name}"
                 )
             payload_start = runtime_end
-            if payload_start + _CCCP_PQ_HEADER.size > payload_end:
-                raise ValueError(f"truncated native CCCP payload: {name}")
+            if payload_start + _TPQ_PQ_HEADER.size > payload_end:
+                raise ValueError(f"truncated native TPQ payload: {name}")
             (
                 pq_magic,
                 pq_version,
@@ -838,7 +827,7 @@ class MfqCccpStore:
                 neuron_len,
                 ndim,
                 codebook_entries,
-            ) = _CCCP_PQ_HEADER.unpack_from(mm, payload_start)
+            ) = _TPQ_PQ_HEADER.unpack_from(mm, payload_start)
             tier_prefix = "TPQ-"
             if (
                 pq_magic != b"CPQ1"
@@ -847,8 +836,8 @@ class MfqCccpStore:
                 or axis != 0
                 or ndim != 2
             ):
-                raise ValueError(f"invalid native CCCP payload header: {name}")
-            spec = CccpPqSpec(
+                raise ValueError(f"invalid native TPQ payload header: {name}")
+            spec = TpqPqSpec(
                 tier=dtype[len(tier_prefix) :].lower(),
                 vector_size=int(vector_size),
                 codebook_entries=int(codebook_entries),
@@ -858,7 +847,7 @@ class MfqCccpStore:
                 raise ValueError(
                     f"native TPQ index width is unsupported: {name}"
                 )
-            payload_offset = payload_start + _CCCP_PQ_HEADER.size
+            payload_offset = payload_start + _TPQ_PQ_HEADER.size
             shape = tuple(
                 int(value)
                 for value in struct.unpack_from("<2q", mm, payload_offset)
@@ -877,14 +866,14 @@ class MfqCccpStore:
                 or shape[1] % spec.vector_size
             ):
                 raise ValueError(
-                    f"native CCCP pool shape mismatch in {name}: "
+                    f"native TPQ pool shape mismatch in {name}: "
                     f"{shape} != {expected_shape}"
                 )
             codebook_count = spec.codebook_entries * spec.vector_size
             codebook_nbytes = codebook_count * np.dtype("<f4").itemsize
             codebook_end = payload_offset + codebook_nbytes
             if codebook_end > payload_end:
-                raise ValueError(f"truncated native CCCP codebook: {name}")
+                raise ValueError(f"truncated native TPQ codebook: {name}")
             codebook = np.frombuffer(
                 mm,
                 dtype="<f4",
@@ -899,9 +888,9 @@ class MfqCccpStore:
             expected_end = codebook_end + (index_count * index_bits + 7) // 8
             if expected_end != payload_end:
                 raise ValueError(
-                    f"native CCCP index payload size mismatch: {name}"
+                    f"native TPQ index payload size mismatch: {name}"
                 )
-            pool = _DirectCccpPool(
+            pool = _DirectTpqPool(
                 spec=spec,
                 codebook=codebook,
                 indices_offset=codebook_end,
@@ -914,24 +903,24 @@ class MfqCccpStore:
                 expert_id = int(expert)
                 if expert_id in result:
                     raise ValueError(
-                        f"duplicate native CCCP expert {expert_id}: {name}"
+                        f"duplicate native TPQ expert {expert_id}: {name}"
                     )
                 result[expert_id] = (pool, local)
             offset = payload_end
         if offset != end:
             raise ValueError(
-                f"invalid native CCCP expert tail: {name} "
+                f"invalid native TPQ expert tail: {name} "
                 f"({end - offset} bytes)"
             )
         return result
 
     def _direct_indices(
         self,
-        pool: _DirectCccpPool,
+        pool: _DirectTpqPool,
         local: int,
     ) -> np.ndarray:
         if local < 0 or local >= pool.expert_count:
-            raise IndexError(f"native CCCP local expert is out of range: {local}")
+            raise IndexError(f"native TPQ local expert is out of range: {local}")
         count = pool.indices_per_expert
         nbytes = (count * pool.spec.index_bits + 7) // 8
         offset = pool.indices_offset + local * nbytes
@@ -948,7 +937,7 @@ class MfqCccpStore:
             pool.columns // pool.spec.vector_size,
         )
 
-    def _direct_raw(self, pool: _DirectCccpPool, local: int) -> np.ndarray:
+    def _direct_raw(self, pool: _DirectTpqPool, local: int) -> np.ndarray:
         if local < 0 or local >= pool.expert_count:
             raise IndexError(f"native TPQ local expert is out of range: {local}")
         count = pool.indices_per_expert
@@ -996,7 +985,7 @@ class MfqCccpStore:
                 if not isinstance(gate, NintMoeTensor) or not isinstance(
                     down, NintMoeTensor
                 ):
-                    raise TypeError(f"native CCCP layer {layer} is not NINTM")
+                    raise TypeError(f"native TPQ layer {layer} is not NINTM")
                 tensors = (gate, down)
                 maps = (
                     self._expert_map(gate),
@@ -1021,7 +1010,7 @@ class MfqCccpStore:
                 return _CHAR_TO_TIER[assignments[int(expert)]]
             except KeyError as exc:
                 raise ValueError(
-                    f"invalid CCCP tier character {assignments[int(expert)]!r}"
+                    f"invalid TPQ tier character {assignments[int(expert)]!r}"
                 ) from exc
         pair = maps[0].get(int(expert))
         if pair is None:
@@ -1048,10 +1037,10 @@ class MfqCccpStore:
     @staticmethod
     def _pool_tensor(
         pair: tuple[NintMoePool, int],
-    ) -> tuple[CccpPqTensor, int]:
+    ) -> tuple[TpqPqTensor, int]:
         pool, local = pair
-        if not isinstance(pool.tensor, CccpPqTensor):
-            raise TypeError("native CCCP pool is not a learned PQ tensor")
+        if not isinstance(pool.tensor, TpqPqTensor):
+            raise TypeError("native TPQ pool is not a learned PQ tensor")
         return pool.tensor, int(local)
 
     def codebooks(
@@ -1070,7 +1059,7 @@ class MfqCccpStore:
             None,
         )
         if expert is None:
-            raise KeyError(f"CCCP layer {layer} has no {base} cohort")
+            raise KeyError(f"TPQ layer {layer} has no {base} cohort")
         gate, _ = maps[0][expert]
         down, _ = maps[1][expert]
         return (
@@ -1121,12 +1110,12 @@ class MfqCccpStore:
             )
         maps = self._direct_maps[int(layer)]
         if expert not in maps[0] or expert not in maps[1]:
-            raise KeyError(f"CCCP expert {layer}/{expert} is absent")
+            raise KeyError(f"TPQ expert {layer}/{expert} is absent")
         gate, gate_local = maps[0][expert]
         down, down_local = maps[1][expert]
         if gate.spec.tier != down.spec.tier:
             raise ValueError(
-                f"CCCP expert {layer}/{expert} has split projection tiers"
+                f"TPQ expert {layer}/{expert} has split projection tiers"
             )
         gate_indices = self._direct_indices(gate, gate_local)
         down_indices = self._direct_indices(down, down_local)
@@ -1208,7 +1197,7 @@ class MfqCccpStore:
         return counts.copy()
 
 
-def install_mfq_cccp_store(tpq: ModuleType) -> None:
+def install_mfq_tpq_store(tpq: ModuleType) -> None:
     """Teach TPQ model constructors to accept a native MFQ path."""
 
     from tpq import dsv4model, kimi_model, store
@@ -1216,7 +1205,7 @@ def install_mfq_cccp_store(tpq: ModuleType) -> None:
     current = getattr(
         dsv4model,
         "TPQStore",
-        getattr(dsv4model, "CCCPStore", None),
+        None,
     )
     if current is None:
         raise AttributeError("TPQ runtime exposes no store constructor")
@@ -1230,37 +1219,23 @@ def install_mfq_cccp_store(tpq: ModuleType) -> None:
         def __new__(cls, root):
             path = Path(root)
             if path.is_file() and path.suffix.lower() == ".mfq":
-                return MfqCccpStore(path, tpq)
+                return MfqTpqStore(path, tpq)
             return original(root)
 
     dsv4model.TPQStore = TPQStoreDispatch
-    dsv4model.CCCPStore = TPQStoreDispatch
     kimi_model.TPQStore = TPQStoreDispatch
-    kimi_model.CCCPStore = TPQStoreDispatch
     store.TPQStoreDispatch = TPQStoreDispatch
-    store.CCCPStoreDispatch = TPQStoreDispatch
 
 
-def inspect_native_cccp(path: str | Path) -> dict[str, Any]:
-    """Validate and summarize one native CCCP MFQ file."""
+def inspect_native_tpq(path: str | Path) -> dict[str, Any]:
+    """Validate and summarize one native TPQ MFQ file."""
 
-    return NativeCCCPArtifact.open(path).summary()
-
-
-# Canonical public names for new callers.
-NativeTPQArtifact = NativeCCCPArtifact
-MfqTpqStore = MfqCccpStore
-inspect_native_tpq = inspect_native_cccp
-install_mfq_tpq_store = install_mfq_cccp_store
+    return NativeTPQArtifact.open(path).summary()
 
 
 __all__ = [
-    "MfqCccpStore",
     "MfqTpqStore",
-    "NativeCCCPArtifact",
     "NativeTPQArtifact",
-    "inspect_native_cccp",
     "inspect_native_tpq",
-    "install_mfq_cccp_store",
     "install_mfq_tpq_store",
 ]

@@ -525,14 +525,20 @@ def _candidate_from_assignment(
     second: torch.Tensor,
     config: NvqLowBitAdditiveConfig,
 ) -> NvqLowBitAdditiveTensor:
+    first_dtype = (
+        np.uint8 if config.first_entries <= 256 else np.uint16)
+    second_dtype = (
+        np.uint8 if config.second_entries <= 256 else np.uint16)
     effective = assignment.indices.astype(np.uint16)
     return NvqLowBitAdditiveTensor(
         shape=assignment.shape,
         neuron_scale=assignment.neuron_scale,
         sub_scale=assignment.sub_scale,
         delta_sign=assignment.delta_sign,
-        first_indices=(effective // config.second_entries).astype(np.uint8),
-        second_indices=(effective % config.second_entries).astype(np.uint8),
+        first_indices=(effective // config.second_entries).astype(
+            first_dtype),
+        second_indices=(effective % config.second_entries).astype(
+            second_dtype),
         codebook_step=np.full(config.banks, config.codebook_step, dtype=np.float32),
         first_codebooks=first.cpu().numpy().astype(np.int8, copy=False),
         second_codebooks=second.cpu().numpy().astype(np.int8, copy=False),

@@ -1,14 +1,14 @@
-"""配置驱动的公共单卡紧凑专家 RAM+GPU 执行池。
+"""Configuration-driven shared single-device compact-expert RAM+GPU execution pool.
 
-与通用 ``ExpertPool`` 的主要区别：
+Key differences from the generic ``ExpertPool``:
 
-* 9..15-bit 索引在 RAM 中保持 CCCP 原始打包格式，不展开为 uint16；
-* 按专家签名预分配稳定 GPU 槽，换专家只覆盖槽内容；
-* 上一个 token 的路由在后台预取，需求路径按层等待；
-* Gate/Up、gated activation、Down、路由加权直接使用公共融合 CUDA 核。
+* 9..15-bit indices retain their original TPQ packed format in RAM instead of expanding to uint16;
+* stable GPU slots are preallocated by expert signature, and replacing an expert only overwrites slot contents;
+* routes from the previous token are prefetched in the background, and the demand path waits by layer;
+* Gate/Up, gated activation, Down, and routing weights directly use shared fused CUDA kernels.
 
-非专家 dense、注意力、共享专家和 KV 路径完全不变。实现按 projection-VQ
-清单和算子能力分派，同时服务 Kimi 与 DeepSeek-V4。
+Non-expert dense, attention, shared-expert, and KV paths remain unchanged. The implementation dispatches by
+the projection-VQ manifest and operator capabilities and serves both Kimi and DeepSeek-V4.
 """
 
 from __future__ import annotations
@@ -255,11 +255,11 @@ def allocate_packed_slots(
     *,
     resident_codebooks: bool = False,
 ) -> dict[PackedExpertSignature, int]:
-    """分配槽位，同时保证任一签名容得下完整 Top-K。
+    """Allocate slots while ensuring that every signature can hold a complete Top-K.
 
-    ``weights`` 表示运行时路由流量，而不是模型中各档专家的静态数量。
-    混合精度模型的高精度专家数量可能很少、调用却很频繁；若仍按静态数量
-    分槽，该档位会在每个 token 内循环淘汰，显著放大 PCIe 传输。
+    ``weights`` represents runtime routing traffic, not the static count of experts in each model tier.
+    Mixed-precision models may have few high-precision experts that are called frequently. Allocating slots
+    by static count would repeatedly evict that tier within every token and substantially amplify PCIe traffic.
     """
     if budget <= 0 or not counts:
         return {}
@@ -580,12 +580,12 @@ class _PackedArenas:
 
 
 class PackedHybridPool:
-    """全量紧凑 RAM + 有界稳定 VRAM 的配置驱动 Top-K 专家池。"""
+    """Configuration-driven Top-K expert pool with complete compact RAM residency and bounded stable VRAM."""
 
     device_routed = True
     full_resident = False
     prefetch_default = False
-    # p8-p16 索引在磁盘、RAM、VRAM 中都保持原始 packed 布局。
+    # Keep p8-p16 indices in their original packed layout on disk, in RAM, and in VRAM.
     expanded_index_bytes = 0
 
     def __init__(
@@ -936,7 +936,7 @@ class PackedHybridPool:
         layer: int,
         expert_id: int,
     ) -> PackedExpertSignature:
-        """只读取共享码本与清单元数据，不读取专家索引主体。"""
+        """Read only shared codebooks and manifest metadata, without reading the expert-index payload."""
 
         if not self.store.man.projection_vq:
             raise RuntimeError(
@@ -1001,7 +1001,7 @@ class PackedHybridPool:
         return PackedExpertSignature(tuple(weights))
 
     def _preload_extreme(self, reserve_gb: float) -> bool:
-        """把完整层分到 RAM/VRAM，运行时不再读取专家文件。"""
+        """Distribute complete layers across RAM/VRAM so expert files are not read at runtime."""
 
         if self.device.type != "cuda":
             raise RuntimeError("极限模式要求单卡 CUDA packed 专家池")
@@ -1035,8 +1035,8 @@ class PackedHybridPool:
             layer_bytes[layer] = sum(
                 signature.raw_slot_bytes for signature in signatures
             )
-        # projection_codebooks() 使用 FP32 作为读取中间态；运行时只保留公共
-        # HostPackedWeight 所引用的 BF16 码本，避免双份码本常驻。
+        # projection_codebooks() uses FP32 as an intermediate read representation. At runtime, retain only the shared
+        # BF16 codebook referenced by HostPackedWeight to avoid keeping two resident copies.
         _clear_codebook_cache(self.store)
         gc.collect()
 
@@ -1279,8 +1279,8 @@ class PackedHybridPool:
             signature.storage_bytes(True) * count
             for signature, count in resident_counts.items()
         )
-        # 受保护 GPU 层永不参与 LRU；其余安全显存用于跨 token 热专家槽。
-        # 重复 staging 仍受常驻倍率约束，不能靠把整模再复制进 VRAM 换速度。
+        # Protected GPU layers never participate in the LRU; the remaining safe VRAM is used for hot-expert slots across tokens.
+        # Repeated staging remains constrained by the residency multiplier; do not trade memory for speed by copying the full model into VRAM again.
         duplicate_limit = max(
             0,
             int((max_ratio - 1.0) * compact_baseline)
@@ -1326,10 +1326,10 @@ class PackedHybridPool:
             )
             for layer in self.extreme_ram_layers
         )
-        # 单一 packed 签名时，每个槽对任意 RAM 层都可复用。只要能保留
-        # 一整轮 Top-K，就保护各层上一 token 的实际路由，杜绝全局 LRU
-        # 从浅层开始把深层即将使用的槽逐层赶走。混合签名模型仍使用
-        # 公共预取路径，避免按错误的档位比例作出过度承诺。
+        # With one packed signature, every slot can be reused by any RAM layer. If a full Top-K round fits,
+        # protect each layer's actual previous-token routes so the global LRU cannot evict slots needed by deeper layers
+        # while progressing from shallow layers. Mixed-signature models continue to use the shared prefetch path
+        # to avoid overcommitting based on an incorrect tier ratio.
         self.extreme_route_history_resident = (
             len(ram_counts) == 1
             and self.extreme_stage_slots >= self.extreme_route_working_set
@@ -1396,7 +1396,7 @@ class PackedHybridPool:
                         flush=True,
                     )
         _clear_codebook_cache(self.store)
-        # GPU-only 层的主机码本不再需要；device 码本已经独立持有。
+        # Host codebooks for GPU-only layers are no longer needed; device codebooks are held independently.
         retained_codebook_ptrs = {
             weight.cb.data_ptr()
             for expert in self.pinned.values()
@@ -1504,7 +1504,7 @@ class PackedHybridPool:
                 self.store.man.expert_files
             ):
                 raise RuntimeError(
-                    "projection-VQ CCCP 专家清单未收敛："
+                    "projection-VQ TPQ 专家清单未收敛："
                     f"声明 {declared_layers} 层，"
                     f"实际只有 {len(self.store.man.expert_files)} 层"
                 )
@@ -1548,7 +1548,7 @@ class PackedHybridPool:
                         f"{index}/{len(keys)}",
                         flush=True,
                     )
-        # 所有运行时专家都只引用 BF16 码本；释放 store 的 FP32 中间副本。
+        # All runtime experts reference only BF16 codebooks; release the store's intermediate FP32 copies.
         _clear_codebook_cache(self.store)
         gc.collect()
         self.ram_bytes = self.host_expert_bytes
@@ -1962,7 +1962,7 @@ class PackedHybridPool:
         staged: list[tuple[tuple[int, int], DeviceExpert]] = []
         with self._lock:
             for key in missing:
-                # 可能已被前一个等待者装入。
+                # A preceding waiter may already have loaded it.
                 value = self.cache.get(key)
                 if value is not None:
                     self.cache.move_to_end(key)
@@ -2026,8 +2026,8 @@ class PackedHybridPool:
                 for future in self._prefetch_futures
                 if not future.done()
             }
-            # 模型在 token 开始时按层提交约 92 个请求；单线程执行保证
-            # 槽位顺序，队列本身必须能容纳一整轮，否则只会预取浅层。
+            # At the start of a token, the model submits about 92 requests by layer. Single-threaded execution preserves
+            # slot order, and the queue itself must hold a full round or it will prefetch only shallow layers.
             if len(self._prefetch_futures) >= 128:
                 return
             if all(key in self.cache for key in keys):
@@ -2639,9 +2639,9 @@ class PackedHybridPool:
             or self._ordered_weights is None
         ):
             raise RuntimeError("packed hybrid pool is not ready")
-        # 这是 RAM 地址选择所需的唯一 GPU→CPU 路由同步；权重计算仍留在 GPU。
-        # 在融合核排入默认流之前不允许后台预取复用槽位。释放锁后，
-        # PinnedStage 的 wait_stream 会把后续覆盖排在本核之后。
+        # This is the only GPU-to-CPU routing synchronization needed for RAM address selection; weight computation stays on the GPU.
+        # Background prefetch cannot reuse slots until the fused kernel is queued on the default stream. After releasing the lock,
+        # PinnedStage.wait_stream schedules subsequent overwrites after this kernel.
         with self._transfer_lock:
             device_hit, expert_ids = self._device_route_metadata(
                 layer,
@@ -2696,9 +2696,9 @@ class PackedHybridPool:
                 return reused
             self._last_ids[layer] = expert_ids
             keys = [(layer, expert_id) for expert_id in expert_ids]
-            # 先释放本层已不再需要的上一轮槽，再为新路由申请槽。
-            # 旧顺序是先 lease 后 unprotect；当保护槽恰好占满时会
-            # 出现“缓存明明够一轮路由却无槽可换”的假容量错误。
+            # Release previous-round slots no longer needed by this layer before leasing slots for new routes.
+            # The old order leased before unprotecting; when protected slots exactly filled the cache, this caused a false
+            # capacity error claiming no slot was available even though the cache could hold one routing round.
             self._release_stale_route_protection(layer, keys)
             async_stage = (
                 os.environ.get("TPQ_KIMI_ASYNC_STAGE", "1") != "0"
@@ -2753,10 +2753,10 @@ class PackedHybridPool:
                 len(p12_positions),
                 identity_order,
             )
-            # 大块 expert DMA 在 copy stream 继续进行时，CPU 已完成指针元数据
-            # 和路由顺序构造；仅在融合核真正读取槽位前建立 GPU 事件依赖。
-            # 这消除每层 cudaEventSynchronize 后的主机唤醒空洞，不改变槽位
-            # 生命周期，也不把 packed 索引展开成中间矩阵。
+            # While large expert DMA continues on the copy stream, the CPU finishes pointer metadata and route ordering.
+            # Establish the GPU event dependency only before the fused kernel actually reads the slots.
+            # This removes the host wake-up gap after each layer's cudaEventSynchronize without changing slot lifetimes
+            # or expanding packed indices into an intermediate matrix.
             if async_stage:
                 self._stage.wait()
             hidden, output, result = self._workspaces

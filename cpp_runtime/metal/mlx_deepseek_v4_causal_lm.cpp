@@ -295,7 +295,7 @@ std::vector<array> expert_availability(
 
     const auto found =
         model.header().extra_json.find(
-            "cccp_manifest");
+            "tpq_manifest");
     if (found ==
         model.header().extra_json.end()) {
         return result;
@@ -307,7 +307,7 @@ std::vector<array> expert_availability(
     } catch (const json::exception& error) {
         throw std::runtime_error(
             std::string(
-                "invalid DeepSeek-V4 CCCP manifest: ") +
+                "invalid DeepSeek-V4 TPQ manifest: ") +
             error.what());
     }
     const auto assignments =
@@ -997,6 +997,9 @@ void MlxDeepseekV4CausalLm::append_state_arrays(
             if (pool.prev_gate()) {
                 arrays.push_back(*pool.prev_gate());
             }
+            if (pool.pool_prefix_backup()) {
+                arrays.push_back(*pool.pool_prefix_backup());
+            }
         };
     if (state.main()) {
         append_pool(*state.main());
@@ -1368,7 +1371,8 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
     int chunk_size,
     const std::function<void(std::size_t, double)>&
         prefill_callback,
-    std::optional<std::size_t> stable_prefix_tokens) {
+    std::optional<std::size_t> stable_prefix_tokens,
+    const MfqTokenConstraintPtr& token_constraint) {
     if (prompt.empty()) {
         throw std::invalid_argument(
             "DeepSeek-V4 generation prompt cannot be empty");
@@ -1499,12 +1503,29 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
             return *saved_states;
         }
 
-        ~StableCacheRestore() {
+        ~StableCacheRestore() noexcept {
             if (!saved_states) return;
-            target_states = std::move(*saved_states);
-            target_position = saved_position;
-            target_batch = saved_batch;
-            target_tokens = std::move(saved_tokens);
+            try {
+                if (target_states.size() !=
+                    saved_states->size()) {
+                    throw std::runtime_error(
+                        "DeepSeek-V4 stable cache layer count changed");
+                }
+                for (std::size_t index = 0;
+                     index < target_states.size();
+                     ++index) {
+                    target_states[index].restore_snapshot(
+                        std::move((*saved_states)[index]));
+                }
+                target_position = saved_position;
+                target_batch = saved_batch;
+                target_tokens = std::move(saved_tokens);
+            } catch (...) {
+                target_states.clear();
+                target_position = 0;
+                target_batch = 0;
+                target_tokens.clear();
+            }
         }
     } stable_restore(
         states_,
@@ -1688,12 +1709,38 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
         } else {
             sampled.eval();
         }
-        const auto token =
+        auto token =
             sampled.data<std::int32_t>()[0];
         if (token < 0 || token >= vocab) {
             throw std::runtime_error(
                 "DeepSeek-V4 sampler returned an "
                 "out-of-range token");
+        }
+        if (token_constraint && token_constraint->allows &&
+            !token_constraint->allows(token)) {
+            auto adjusted = mlx::core::contiguous(
+                mlx::core::astype(
+                    sampler.apply_penalties(logits, counts),
+                    mlx::core::float32));
+            adjusted.eval();
+            std::vector<float> masked(
+                adjusted.data<float>(),
+                adjusted.data<float>() + vocab);
+            token_constraint->apply(masked.data(), masked.size());
+            const array constrained_logits(
+                masked.begin(), Shape{1, vocab}, mlx::core::float32);
+            sampled = sampler.sample(constrained_logits);
+            sampled.eval();
+            token = sampled.data<std::int32_t>()[0];
+            if (token < 0 || token >= vocab ||
+                !token_constraint->allows(token)) {
+                throw std::runtime_error(
+                    "DeepSeek-V4 constrained sampler returned an "
+                    "invalid token");
+            }
+        }
+        if (token_constraint && token_constraint->accept) {
+            token_constraint->accept(token);
         }
         const array token_ids(
             {token},

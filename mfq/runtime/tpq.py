@@ -1,8 +1,4 @@
-"""TPQ artifact inspection and runtime integration.
-
-The ``cccp-1`` directory spelling remains supported as the legacy source
-format used by existing TPQ model archives.
-"""
+"""TPQ artifact inspection and runtime integration."""
 
 from __future__ import annotations
 
@@ -23,7 +19,7 @@ from typing import Any
 _GIB = 1 << 30
 
 
-def _cccp_architecture(manifest: dict[str, Any]) -> str:
+def _tpq_architecture(manifest: dict[str, Any]) -> str:
     config = manifest["config"]
     if (
         str(manifest.get("model_family", "")).lower() == "kimi_k3"
@@ -33,7 +29,7 @@ def _cccp_architecture(manifest: dict[str, Any]) -> str:
     return "deepseek_v4" if "hc_mult" in config else "glm"
 
 
-def _cccp_expert_layers(manifest: dict[str, Any]) -> tuple[int, ...]:
+def _tpq_expert_layers(manifest: dict[str, Any]) -> tuple[int, ...]:
     config = manifest["config"]
     configured = config.get("moe_layers")
     if configured is not None:
@@ -41,15 +37,15 @@ def _cccp_expert_layers(manifest: dict[str, Any]) -> tuple[int, ...]:
     layer_count = int(config.get("n_layers", -1))
     first_layer = (
         int(config.get("first_dense_layers", 0))
-        if _cccp_architecture(manifest) == "kimi_k3"
+        if _tpq_architecture(manifest) == "kimi_k3"
         else 0
     )
     return tuple(range(first_layer, layer_count))
 
 
 @dataclass(frozen=True)
-class CCCPArtifact:
-    """Validated TPQ model directory (legacy class name)."""
+class TPQArtifact:
+    """Validated TPQ model directory."""
 
     root: Path
     manifest: dict[str, Any]
@@ -57,17 +53,13 @@ class CCCPArtifact:
     disk_bytes: int
 
     @classmethod
-    def open(cls, root: str | os.PathLike[str]) -> CCCPArtifact:
+    def open(cls, root: str | os.PathLike[str]) -> TPQArtifact:
         model_root = Path(root).expanduser().resolve()
-        canonical = model_root / "tpq.json"
-        legacy = model_root / "cccp.json"
-        manifest_path = canonical if canonical.is_file() else legacy
+        manifest_path = model_root / "tpq.json"
         if not manifest_path.is_file():
-            raise FileNotFoundError(
-                f"TPQ manifest not found: {canonical} or {legacy}"
-            )
+            raise FileNotFoundError(f"TPQ manifest not found: {manifest_path}")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("format") not in {"tpq-1", "cccp-1"}:
+        if manifest.get("format") != "tpq-1":
             raise ValueError(
                 f"unsupported TPQ format {manifest.get('format')!r}"
             )
@@ -75,7 +67,7 @@ class CCCPArtifact:
         config = manifest.get("config")
         quant = manifest.get("quant")
         if not isinstance(config, dict) or not isinstance(quant, dict):
-            raise ValueError("CCCP manifest is missing config or quant metadata")
+            raise ValueError("TPQ manifest is missing config or quant metadata")
         expert_files = manifest.get("expert_files")
         routed_layers = (
             (manifest.get("routed_experts") or {}).get("layer_files") or {}
@@ -86,7 +78,7 @@ class CCCPArtifact:
                 for layer, item in routed_layers.items()
             }
             manifest["expert_files"] = expert_files
-        expected_layers = _cccp_expert_layers(manifest)
+        expected_layers = _tpq_expert_layers(manifest)
         actual_layers = (
             tuple(sorted(int(layer) for layer in expert_files))
             if isinstance(expert_files, dict)
@@ -94,7 +86,7 @@ class CCCPArtifact:
         )
         if actual_layers != expected_layers:
             raise ValueError(
-                "CCCP expert shard layers do not match configured MoE layers: "
+                "TPQ expert shard layers do not match configured MoE layers: "
                 f"{actual_layers} != {expected_layers}"
             )
 
@@ -135,7 +127,7 @@ class CCCPArtifact:
             for value in manifest.get("expert_audit_files", {}).values()
         )
         if any(not str(value) for value in dense_files):
-            raise ValueError("CCCP manifest contains an empty file name")
+            raise ValueError("TPQ manifest contains an empty file name")
 
         files = tuple(dict.fromkeys(files_list))
         missing = [str(path) for path in files if not path.is_file()]
@@ -143,7 +135,7 @@ class CCCPArtifact:
             preview = ", ".join(missing[:4])
             if len(missing) > 4:
                 preview += f", ... ({len(missing)} missing)"
-            raise FileNotFoundError(f"CCCP artifact is incomplete: {preview}")
+            raise FileNotFoundError(f"TPQ artifact is incomplete: {preview}")
         return cls(
             root=model_root,
             manifest=manifest,
@@ -153,7 +145,7 @@ class CCCPArtifact:
 
     @property
     def architecture(self) -> str:
-        return _cccp_architecture(self.manifest)
+        return _tpq_architecture(self.manifest)
 
     def summary(self) -> dict[str, Any]:
         config = self.manifest["config"]
@@ -189,15 +181,15 @@ class CCCPArtifact:
         )
 
 
-def open_cccp_artifact(model: str | os.PathLike[str]):
-    """Open either a legacy cccp-1 directory or a native TPQ MFQ file."""
+def open_tpq_artifact(model: str | os.PathLike[str]):
+    """Open a TPQ directory or native TPQ MFQ file."""
 
     path = Path(model).expanduser().resolve()
     if path.is_file():
         from mfq.runtime.tpq_mfq import NativeTPQArtifact
 
         return NativeTPQArtifact.open(path)
-    return CCCPArtifact.open(path)
+    return TPQArtifact.open(path)
 
 
 def _read_cgroup_value(path: Path) -> int | None:
@@ -230,8 +222,8 @@ def _read_cgroup_file_cache() -> int:
     return 0
 
 
-def configure_cccp_memory(
-    artifact: CCCPArtifact,
+def configure_tpq_memory(
+    artifact: TPQArtifact,
     *,
     reserve_gib: float = 16.0,
 ) -> dict[str, int | float | bool | None]:
@@ -347,7 +339,7 @@ def load_tpq_package(
     )
 
 
-def load_cccp_model(
+def load_tpq_model(
     model: str | os.PathLike[str],
     *,
     device: str = "cuda",
@@ -357,18 +349,18 @@ def load_cccp_model(
     tp_size: int = 1,
     tpq_root: str | os.PathLike[str] | None = None,
 ):
-    """Load a CCCP model while retaining compressed expert weights."""
+    """Load a TPQ model while retaining compressed expert weights."""
 
-    artifact = open_cccp_artifact(model)
-    configure_cccp_memory(artifact)
+    artifact = open_tpq_artifact(model)
+    configure_tpq_memory(artifact)
     if str(device).lower() in {"metal", "mlx", "mps"}:
         if artifact.architecture not in {"kimi_k3", "deepseek_v4"}:
             raise ValueError(
-                "the MLX CCCP entry point supports Kimi-K3 and DeepSeek-V4"
+                "the MLX TPQ entry point supports Kimi-K3 and DeepSeek-V4"
             )
         if not hasattr(artifact, "path"):
             raise ValueError(
-                "Metal CCCP deployment requires a native CCCP MFQ file; "
+                "Metal TPQ deployment requires a native TPQ MFQ file; "
                 "import the TPQ2 directory with MFQ first"
             )
         if artifact.architecture == "kimi_k3":
@@ -417,7 +409,7 @@ def load_cccp_model(
         )
     else:
         raise ValueError(
-            "load_cccp_model supports DeepSeek-V4 and Kimi-K3 CCCP artifacts"
+            "load_tpq_model supports DeepSeek-V4 and Kimi-K3 TPQ artifacts"
         )
     runtime.preload()
     return runtime
@@ -440,12 +432,12 @@ def _native_tokenizer_host(artifact, tokenizer_root: str | os.PathLike[str]):
             for value in artifact.manifest.get("tokenizer_files", ())
         ),
     }
-    with tempfile.TemporaryDirectory(prefix="mfq-cccp-chat-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="mfq-tpq-chat-") as temporary:
         host = Path(temporary)
-        legacy_manifest = dict(artifact.manifest)
-        legacy_manifest["format"] = "cccp-1"
-        (host / "cccp.json").write_text(
-            json.dumps(legacy_manifest, ensure_ascii=False),
+        manifest = dict(artifact.manifest)
+        manifest["format"] = "tpq-1"
+        (host / "tpq.json").write_text(
+            json.dumps(manifest, ensure_ascii=False),
             encoding="utf-8",
         )
         for name in sorted(requested):
@@ -467,22 +459,22 @@ def _pop_argument(arguments: list[str], option: str) -> str | None:
     return value
 
 
-def run_cccp_chat(
+def run_tpq_chat(
     argv: Sequence[str],
     *,
     tpq_root: str | os.PathLike[str] | None = None,
 ) -> None:
-    """Run TyloQuant's production CCCP chat/generation entry point."""
+    """Run TyloQuant's production TPQ chat/generation entry point."""
 
     arguments = list(argv)
     tokenizer_root = _pop_argument(arguments, "--tokenizer-root")
     try:
         model_index = arguments.index("--model") + 1
-        artifact = open_cccp_artifact(arguments[model_index])
+        artifact = open_tpq_artifact(arguments[model_index])
     except (ValueError, IndexError):
         artifact = None
     if artifact is not None:
-        configure_cccp_memory(artifact)
+        configure_tpq_memory(artifact)
     tpq = load_tpq_package(tpq_root)
     from mfq.runtime.tpq_residency_patch import apply_tpq_residency_patch
 
@@ -493,7 +485,7 @@ def run_cccp_chat(
         chat_main(arguments)
         return
     if tokenizer_root is None:
-        raise ValueError("native CCCP MFQ chat requires --tokenizer-root")
+        raise ValueError("native TPQ MFQ chat requires --tokenizer-root")
     from mfq.runtime.tpq_mfq import install_mfq_tpq_store
 
     install_mfq_tpq_store(tpq)
@@ -539,11 +531,3 @@ def run_cccp_chat(
             chat_main(arguments)
         finally:
             engine_module._make_model = original_make_model
-
-
-# Canonical API names.  Historical names remain callable aliases.
-TPQArtifact = CCCPArtifact
-open_tpq_artifact = open_cccp_artifact
-configure_tpq_memory = configure_cccp_memory
-load_tpq_model = load_cccp_model
-run_tpq_chat = run_cccp_chat

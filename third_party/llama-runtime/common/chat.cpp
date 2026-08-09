@@ -22,6 +22,7 @@
 #include <functional>
 
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -257,6 +258,9 @@ json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
             jtool_calls.push_back(tc);
         }
     }
+    for (const auto & [key, value] : extra_fields) {
+        jmsg[key] = json::parse(value);
+    }
 
     return jmsg;
 }
@@ -455,6 +459,11 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
             }
             if (message.contains("tool_call_id")) {
                 msg.tool_call_id = message.at("tool_call_id");
+            }
+            for (const char * key : {"task", "tools", "response_format"}) {
+                if (message.contains(key)) {
+                    msg.extra_fields[key] = message.at(key).dump();
+                }
             }
 
             msgs.push_back(msg);
@@ -1871,16 +1880,77 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
         "</think>",
     };
 
-    auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
-    auto has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
+    json available_tools = inputs.tools.is_array()
+        ? inputs.tools
+        : json::array();
+    std::set<std::string> available_tool_names;
+    foreach_function(available_tools, [&](const json & tool) {
+        available_tool_names.insert(tool.at("function").at("name"));
+    });
+    json response_schema = inputs.json_schema;
+    auto normalize_response_format = [](json response_format) {
+        if (!response_format.is_object()) {
+            return response_format;
+        }
+        if (response_format.contains("type") &&
+            response_format.at("type").is_string()) {
+            const std::string type = response_format.at("type");
+            if (type == "text") {
+                return json();
+            }
+            if (type == "json_object") {
+                return json{{"type", "object"}};
+            }
+            if (type == "json_schema" &&
+                response_format.contains("json_schema")) {
+                response_format = response_format.at("json_schema");
+            }
+        }
+        if (response_format.is_object() &&
+            response_format.contains("json_schema")) {
+            response_format = response_format.at("json_schema");
+        }
+        if (response_format.is_object() &&
+            response_format.contains("schema")) {
+            response_format = response_format.at("schema");
+        }
+        return response_format;
+    };
+    if (inputs.messages.is_array()) {
+        for (const auto & message : inputs.messages) {
+            if (message.contains("tools") && message.at("tools").is_array()) {
+                foreach_function(message.at("tools"), [&](const json & tool) {
+                    const std::string name = tool.at("function").at("name");
+                    if (available_tool_names.insert(name).second) {
+                        available_tools.push_back(tool);
+                    }
+                });
+            }
+            if ((response_schema.is_null() || response_schema.empty()) &&
+                message.contains("response_format") &&
+                message.at("response_format").is_object()) {
+                response_schema =
+                    normalize_response_format(message.at("response_format"));
+            }
+        }
+    }
+
+    auto has_tools =
+        available_tools.is_array() && !available_tools.empty();
+    auto has_response_format =
+        !response_schema.is_null() && response_schema.is_object();
     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
     auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
 
     const std::string DSML         = "｜DSML｜";
     const std::string THINK_START  = "<think>";
     const std::string THINK_END    = "</think>";
-    const std::string FC_START     = "<" + DSML + "function_calls>";
-    const std::string FC_END       = "</" + DSML + "function_calls>";
+    const bool uses_tool_calls =
+        tmpl.source().find("tool_calls") != std::string::npos;
+    const std::string FC_BLOCK =
+        uses_tool_calls ? "tool_calls" : "function_calls";
+    const std::string FC_START     = "<" + DSML + FC_BLOCK + ">";
+    const std::string FC_END       = "</" + DSML + FC_BLOCK + ">";
     const std::string INVOKE_START = "<" + DSML + "invoke";
     const std::string INVOKE_END   = "</" + DSML + "invoke>";
     const std::string PARAM_START  = "<" + DSML + "parameter";
@@ -1907,14 +1977,20 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
             reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
         } else if (extract_reasoning) {
             // Thinking disabled but reasoning extraction requested: the generation prompt
-            // contains an empty <think></think> pair that must still be consumed.
-            reasoning = p.optional(p.literal(THINK_START) + p.until(THINK_END) + p.literal(THINK_END));
+            // ends in </think>. Continuations may instead contain a complete
+            // <think>...</think> prefix, so accept and suppress either form.
+            reasoning =
+                p.optional(p.literal(THINK_END)) +
+                p.optional(
+                    p.literal(THINK_START) +
+                    p.until(THINK_END) +
+                    p.literal(THINK_END));
         }
 
         if (has_response_format) {
             auto response_format = p.rule("response-format",
                 p.literal("```json") + p.space() +
-                p.content(p.schema(p.json(), "response-format-schema", inputs.json_schema)) +
+                p.content(p.schema(p.json(), "response-format-schema", response_schema)) +
                 p.space() + p.literal("```"));
             return generation_prompt + reasoning + response_format + end;
         }
@@ -1924,7 +2000,7 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
         }
 
         auto tool_choice = p.choice();
-        foreach_function(inputs.tools, [&](const json & tool) {
+        foreach_function(available_tools, [&](const json & tool) {
             const auto & function = tool.at("function");
             std::string  name     = function.at("name");
             auto params   = function.contains("parameters") ? function.at("parameters") : json::object();
@@ -2015,13 +2091,13 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
     if (include_grammar) {
         data.grammar_lazy = !(has_response_format || (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
-            foreach_function(inputs.tools, [&](const json & tool) {
+            foreach_function(available_tools, [&](const json & tool) {
                 const auto & function = tool.at("function");
                 auto         schema   = function.contains("parameters") ? function.at("parameters") : json::object();
                 builder.resolve_refs(schema);
             });
             if (has_response_format) {
-                auto schema = inputs.json_schema;
+                auto schema = response_schema;
                 builder.resolve_refs(schema);
             }
             parser.build_grammar(builder, data.grammar_lazy);
@@ -2598,7 +2674,8 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
     // DeepSeek V3.2 format detection: template defines dsml_token and uses it for tool calls.
     // The template source contains the token as a variable assignment, not as a literal in markup.
     if (src.find("dsml_token") != std::string::npos &&
-        src.find("function_calls") != std::string::npos &&
+        (src.find("function_calls") != std::string::npos ||
+         src.find("tool_calls") != std::string::npos) &&
         src.find("DSML") != std::string::npos) {
         LOG_DBG("Using specialized template: DeepSeek V3.2\n");
         return common_chat_params_init_deepseek_v3_2(tmpl, params);
@@ -2630,8 +2707,14 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
                                                             const struct common_chat_templates_inputs & inputs) {
     autoparser::generation_params params;
     params.tools = common_chat_tools_to_json_oaicompat(inputs.tools);
+    const bool has_message_scoped_tools =
+        std::any_of(inputs.messages.begin(), inputs.messages.end(), [](const common_chat_msg & msg) {
+            return msg.extra_fields.find("tools") != msg.extra_fields.end();
+        });
     const auto & tmpl =
-        params.tools.is_array() && tmpls->template_tool_use ? *tmpls->template_tool_use : *tmpls->template_default;
+        (params.tools.is_array() || has_message_scoped_tools) && tmpls->template_tool_use
+            ? *tmpls->template_tool_use
+            : *tmpls->template_default;
     const auto & src             = tmpl.source();
     const auto & caps            = tmpl.original_caps();
     params.messages              = render_message_to_json(inputs.messages, tmpl.original_caps());

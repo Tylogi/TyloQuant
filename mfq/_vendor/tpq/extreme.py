@@ -1,4 +1,4 @@
-"""单卡 RAM+VRAM 极限常驻模式的公共配置与容量规划。"""
+"""Shared configuration and capacity planning for single-device extreme RAM+VRAM residency mode."""
 
 from __future__ import annotations
 
@@ -22,11 +22,11 @@ def effective_available_memory_bytes(
     cgroup_root: str | os.PathLike[str] = "/sys/fs/cgroup",
     cgroup_file: str | os.PathLike[str] = "/proc/self/cgroup",
 ) -> int:
-    """返回物理机和 cgroup 两种约束下更小的可用内存。
+    """Return the smaller available-memory value under physical-machine and cgroup constraints.
 
-    原生小内存机器由 psutil 正确报告；容器、systemd service 和受限桌面
-    环境还必须扣除 cgroup v2 的 ``memory.current``，否则极限模式会按宿主机
-    总内存规划，直到被 OOM killer 终止。
+    psutil correctly reports native low-memory machines. Containers, systemd services, and restricted desktop
+    environments must also subtract cgroup v2 ``memory.current``; otherwise extreme mode plans against total host
+    memory until terminated by the OOM killer.
     """
 
     if system_available_bytes is None:
@@ -85,7 +85,7 @@ def effective_available_memory_bytes(
 
 @dataclass(frozen=True)
 class ExtremeLayerPlacement:
-    """连续层放置结果；RAM 前缀之后的层全部进入 VRAM。"""
+    """Contiguous-layer placement result; all layers after the RAM prefix enter VRAM."""
 
     ram_layers: tuple[int, ...]
     gpu_layers: tuple[int, ...]
@@ -109,7 +109,7 @@ class ExtremeExpertPlacement:
 
 @dataclass(frozen=True)
 class CompactArchiveCapacity:
-    """模型无关的紧凑三投影归档容量与公共算子签名。"""
+    """Model-independent compact three-projection archive capacity and shared operator signature."""
 
     expert_bytes: int
     layers: tuple[int, ...]
@@ -120,7 +120,7 @@ class CompactArchiveCapacity:
 
 @dataclass(frozen=True)
 class AutoExtremeDecision:
-    """配置驱动的单卡自动放置结论。"""
+    """Configuration-driven automatic single-device placement decision."""
 
     activate: bool
     mode: str
@@ -144,12 +144,12 @@ def plan_auto_extreme(
     load_workspace_bytes: int = int(EXTREME_RAM_LOAD_WORKSPACE_GIB * GIB),
     gpu_reserve_bytes: int = 512 * 2**20,
 ) -> AutoExtremeDecision:
-    """在全显存、普通 RAM、RAM+VRAM 极限放置之间自动选择。
+    """Choose automatically among all-VRAM, normal RAM, and extreme RAM+VRAM placement.
 
-    输入全部来自 Manifest、文件实际字节和当前机器容量，因此不识别模型名。
-    紧凑专家与固定权重能完整进入单卡时优先选择 resident；否则仅在普通
-    RAM 安全容量不足、但紧凑专家溢出部分能进入固定显存余量时激活极限
-    模式；两侧都不足时保留普通路径，让上层给出明确容量诊断。
+    All inputs come from the manifest, actual file bytes, and current machine capacity, so model names are not used.
+    Prefer resident mode when compact experts and fixed weights fit entirely on one device. Otherwise enable extreme mode
+    only when normal safe RAM capacity is insufficient but the compact-expert overflow fits the fixed VRAM margin.
+    When both sides are insufficient, retain the normal path so the upper layer can provide a clear capacity diagnosis.
     """
 
     expert_bytes = max(0, int(compact_expert_bytes))
@@ -217,7 +217,7 @@ def detect_auto_extreme(
     normal_ram_reserve_gib: float = 32.0,
     environment: Mapping[str, str] | None = None,
 ) -> AutoExtremeDecision:
-    """读取公共 Manifest 和当前硬件，给出自动极限模式结论。"""
+    """Read the shared manifest and current hardware to produce an automatic extreme-mode decision."""
 
     if str(device) != "cuda" or int(tp_size) != 1:
         return AutoExtremeDecision(
@@ -293,12 +293,12 @@ def detect_auto_extreme(
 def inspect_compact_projection_archive(
     model_dir: str | os.PathLike[str],
 ) -> CompactArchiveCapacity:
-    """通过公共 Manifest 审计可现场解包的 projection-VQ 归档。
+    """Audit an in-place unpackable projection-VQ archive through the shared manifest.
 
-    这里不识别模型名，也不要求旧版 ``projection_layouts`` 字段。逐层布局和
-    逐专家异构档位都会先由 :class:`Manifest` 规范化，再解析为公共算子能力键。
-    专家容量按实际归档文件计算，包含码本和 safetensors 元数据，因此用于显存
-    fast-path 判定时比只统计索引 payload 更保守。
+    This does not identify model names or require the legacy ``projection_layouts`` field. :class:`Manifest`
+    first normalizes per-layer layouts and per-expert heterogeneous tiers, then resolves them to shared operator
+    capability keys. Expert capacity is calculated from actual archive files, including codebooks and safetensors
+    metadata, making VRAM fast-path decisions more conservative than counting index payload alone.
     """
 
     from .store import Manifest
@@ -307,7 +307,7 @@ def inspect_compact_projection_archive(
     manifest = Manifest(str(root))
     if not manifest.projection_vq:
         raise RuntimeError(
-            "极限模式只接受可由公共 packed 算子直接计算的三投影 CCCP "
+            "极限模式只接受可由公共 packed 算子直接计算的三投影 TPQ "
             "归档；当前模型会展开专家索引。"
         )
     formats: set[str] = set()
@@ -349,7 +349,7 @@ def choose_extreme_strategy(
     fixed_gpu_bytes: int,
     gpu_limit_bytes: int,
 ) -> str:
-    """显存能容纳完整紧凑模型时直接复用 resident 公共 fast-path。"""
+    """Reuse the shared resident fast path directly when VRAM can hold the complete compact model."""
 
     required = int(compact_expert_bytes) + int(fixed_gpu_bytes)
     return "full-gpu" if required <= int(gpu_limit_bytes) else "layered"
@@ -364,12 +364,11 @@ def plan_extreme_layer_placement(
     fixed_ram_bytes: int = 0,
     fixed_gpu_bytes: int = 0,
 ) -> ExtremeLayerPlacement:
-    """把最大连续层前缀放入 RAM，其余完整层放入 VRAM。
+    """Place the largest contiguous layer prefix in RAM and all remaining complete layers in VRAM.
 
-    规划只使用紧凑专家 payload 字节。共享码本和加载 workspace 必须由调用方
-    通过 ``fixed_ram_bytes`` 先行扣除；Dense、KV、GPU workspace 和 staging
-    通过 ``fixed_gpu_bytes`` 扣除。不允许把半层专家拆到两种设备，也不允许
-    回退到运行期磁盘读取。
+    Planning uses only compact expert payload bytes. Callers must first subtract shared codebooks and loading workspace
+    through ``fixed_ram_bytes`` and subtract dense weights, KV, GPU workspace, and staging through ``fixed_gpu_bytes``.
+    Splitting half a layer's experts across devices and falling back to runtime disk reads are both forbidden.
     """
 
     ordered = tuple(sorted((int(k), int(v)) for k, v in layer_bytes.items()))
@@ -426,7 +425,7 @@ def plan_extreme_expert_placement(
 ) -> ExtremeExpertPlacement:
     """Keep precision-budgeted experts on GPU while satisfying RAM capacity.
 
-    CCCP quantizers may assign more packed bits to frequently routed or more
+    TPQ quantizers may assign more packed bits to frequently routed or more
     sensitive experts.  The score is deliberately supplied by the manifest
     adapter: this common planner neither recognizes model names nor assumes a
     particular set of bit widths.
@@ -483,7 +482,7 @@ def plan_extreme_expert_placement(
                     else 0.0
                 )
                 # Rank is primary: each group contributes its hottest expert
-                # before any group contributes its second hottest.  CCCP's
+                # before any group contributes its second hottest.  TPQ's
                 # fixed-per-layer budgets are only comparable within a layer,
                 # while every routed layer runs once per token.
                 ranked_rows.append(
@@ -522,7 +521,7 @@ def load_expert_residency_scores(
 ) -> dict[tuple[int, int], float]:
     """Load portable expert hotness scores without recognizing a model.
 
-    Quantizers can emit either the compact TPQ score schema or CCCP's existing
+    Quantizers can emit either the compact TPQ score schema or TPQ's existing
     expert-preference audit.  Both describe layer/expert coordinates and a
     non-negative score; runtime placement remains independent of architecture.
     """
@@ -539,7 +538,7 @@ def load_expert_residency_scores(
                     "expert residency score keys must use layer:expert"
                 )
             output[(int(layer_text), int(expert_text))] = float(value)
-    elif format_name == "cccp-expert-projection-preference-map-v1":
+    elif format_name == "tpq-expert-projection-preference-map-v1":
         for layer_text, layer_data in (payload.get("layers") or {}).items():
             for expert in layer_data.get("experts", ()):
                 output[(int(layer_text), int(expert["expert"]))] = float(
@@ -557,25 +556,25 @@ def load_expert_residency_scores(
 
 
 def configure_extreme_environment() -> None:
-    """应用统一极限模式；启动器随后仍可用显式 CLI 覆盖 VRAM 预留。"""
+    """Apply unified extreme mode; the launcher may still override the VRAM reserve through explicit CLI arguments."""
 
     os.environ["TPQ_EXTREME_MODE"] = "1"
     os.environ["TPQ_FULL_RESIDENT"] = "1"
     os.environ["TPQ_RAM_MIRROR"] = "0"
     os.environ["TPQ_RAM_RESERVE_GB"] = str(EXTREME_RAM_RESERVE_GIB)
     os.environ["TPQ_RESIDENT_RESERVE_GB"] = str(EXTREME_RAM_RESERVE_GIB)
-    # 极限模式已经把 RAM 压到 1 GiB 安全线。此时再 mlock 数十 GiB 会迫使
-    # 内核把 Python/文件页换出，既不增加容量还会显著拖慢启动和 decode；
-    # 保持普通小型 pinned staging，用户有额外 RAM 时仍可显式覆盖。
+    # Extreme mode already reduces free RAM to the 1 GiB safety threshold. Mlocking tens of GiB here would force
+    # the kernel to swap out Python/file pages, adding no capacity while substantially slowing startup and decode.
+    # Keep the normal small pinned-staging area; users with additional RAM can still override it explicitly.
     os.environ.setdefault("TPQ_HOST_PIN_GB", "0")
-    # 同一时刻只保留少量专家物化临时态，避免 12 个大专家并发把 1 GiB
-    # 系统余量顶入 swap。SSD 顺序读吞吐基本不受这个保守并发数影响。
+    # Keep only a few materialized expert temporaries at once so 12 large concurrent experts do not push the
+    # 1 GiB system margin into swap. This conservative concurrency has little effect on sequential SSD throughput.
     os.environ.setdefault("TPQ_LOAD_WORKERS", "2")
     os.environ.setdefault("TPQ_VRAM_RESERVE_GB", "0.25")
-    # Dense、KV 与公共算子 workspace 都在 packed arena 之前完成实际分配；
-    # 此处只需给 decode 热路径保留小块临时余量。若仍按普通模式再留 1 GiB，
-    # 16 GiB 卡会少约 128 个专家槽，恰好容不下 40 层 Top-8 的一轮路由，
-    # 进而触发跨 token 的环形 LRU 踩踏。
+    # Dense weights, KV, and shared-operator workspaces are physically allocated before the packed arena.
+    # Only a small temporary margin for the decode hot path is needed here. Reserving another 1 GiB as in normal mode
+    # would cost a 16 GiB card about 128 expert slots, leaving it just short of one 40-layer Top-8 routing round
+    # and causing cyclic LRU thrashing across tokens.
     os.environ.setdefault("TPQ_VRAM_RUNTIME_GB", "0.25")
     os.environ["TPQ_VRAM_WATCH"] = "0"
 

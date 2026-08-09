@@ -103,6 +103,7 @@ class ChatOptions:
     stop: tuple[str, ...] = ()
     repetition_penalty: float = 1.0
     no_repeat_ngram_size: int = 0
+    top_k: int = 0
     tools: tuple[dict, ...] = ()
     tool_choice: object = None
     parallel_tool_calls: bool = True
@@ -121,6 +122,10 @@ class ChatOptions:
             raise TypeError("max_new must be an integer or None")
         if self.max_new is not None and self.max_new < 0:
             raise ValueError("max_new must be non-negative")
+        if isinstance(self.top_k, bool) or not isinstance(self.top_k, int):
+            raise TypeError("top_k must be an integer")
+        if not 0 <= self.top_k <= 1024:
+            raise ValueError("top_k must be in [0, 1024]")
         if not isinstance(self.stop, tuple) or not all(
             isinstance(item, str) for item in self.stop
         ):

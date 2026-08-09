@@ -20,7 +20,7 @@ from mfq.runtime.tpq_residency_patch import apply_tpq_residency_patch
 def _artifact(root: Path, *, layers: int = 2) -> Path:
     root.mkdir()
     files = {
-        "cccp.json": b"",
+        "tpq.json": b"",
         "dense.safetensors": b"dense",
         "tokenizer.json": b"{}",
         "tokenizer_config.json": b"{}",
@@ -33,7 +33,7 @@ def _artifact(root: Path, *, layers: int = 2) -> Path:
         files[name] = f"expert-{layer}".encode()
         expert_files[str(layer)] = name
     manifest = {
-        "format": "cccp-1",
+        "format": "tpq-1",
         "config": {
             "n_layers": layers,
             "n_experts": 4,
@@ -56,24 +56,24 @@ def _artifact(root: Path, *, layers: int = 2) -> Path:
         "dspark_file": "dspark-vq.safetensors",
         "dspark": {"n_layers": 3, "targets": [40, 41, 42], "k": 5},
     }
-    files["cccp.json"] = json.dumps(manifest).encode()
+    files["tpq.json"] = json.dumps(manifest).encode()
     for name, value in files.items():
         (root / name).write_bytes(value)
     return root
 
 
-def test_cccp_artifact_validates_and_summarizes(tmp_path: Path) -> None:
+def test_tpq_artifact_validates_and_summarizes(tmp_path: Path) -> None:
     artifact = TPQArtifact.open(_artifact(tmp_path / "model"))
     summary = artifact.summary()
 
     assert artifact.architecture == "deepseek_v4"
-    assert summary["format"] == "cccp-1"
+    assert summary["format"] == "tpq-1"
     assert summary["files"] == 8
     assert summary["expert_tier_counts"] == {"v": 4, "w": 4}
     assert summary["vq"] == {"v": [4, 256], "w": [4, 80]}
 
 
-def test_cccp_artifact_rejects_missing_shard(tmp_path: Path) -> None:
+def test_tpq_artifact_rejects_missing_shard(tmp_path: Path) -> None:
     root = _artifact(tmp_path / "model")
     (root / "experts.L01.safetensors").unlink()
 
@@ -81,7 +81,7 @@ def test_cccp_artifact_rejects_missing_shard(tmp_path: Path) -> None:
         TPQArtifact.open(root)
 
 
-def test_cccp_artifact_recognizes_kimi_dense_shards_and_sparse_moe(
+def test_tpq_artifact_recognizes_kimi_dense_shards_and_sparse_moe(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "kimi"
@@ -95,7 +95,7 @@ def test_cccp_artifact_recognizes_kimi_dense_shards_and_sparse_moe(
         (root / name).write_bytes(f"expert-{layer}".encode())
         expert_files[str(layer)] = name
     manifest = {
-        "format": "cccp-1",
+        "format": "tpq-1",
         "model_family": "kimi_k3",
         "config": {
             "n_layers": 4,
@@ -118,7 +118,7 @@ def test_cccp_artifact_recognizes_kimi_dense_shards_and_sparse_moe(
         "expert_files": expert_files,
         "tiers_per_layer": {"2": "xxxd", "3": "xxxx"},
     }
-    (root / "cccp.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (root / "tpq.json").write_text(json.dumps(manifest), encoding="utf-8")
 
     artifact = TPQArtifact.open(root)
     assert artifact.architecture == "kimi_k3"
@@ -221,7 +221,7 @@ def test_tpq_residency_patch_is_idempotent() -> None:
 
         assert package.store.ExpertPool.preload_gpu_all
         assert package.store.ExpertPool.preload_all._mfq_cgroup_resident
-        assert package.store.CCCPStore.expert_signature_counts
+        assert package.store.TPQStore.expert_signature_counts
     finally:
         for name in list(sys.modules):
             if name == "tpq" or name.startswith("tpq."):
@@ -285,7 +285,7 @@ def test_native_tokenizer_host_materializes_engine_inputs(
     )
     artifact = SimpleNamespace(
         manifest={
-            "format": "cccp-1",
+            "format": "tpq-1",
             "config": {"hc_mult": 4},
             "tokenizer_files": [
                 "tokenizer.json",
@@ -294,7 +294,7 @@ def test_native_tokenizer_host_materializes_engine_inputs(
         }
     )
     with _native_tokenizer_host(artifact, tokenizer_root) as host:
-        assert json.loads((host / "cccp.json").read_text())["format"] == "cccp-1"
+        assert json.loads((host / "tpq.json").read_text())["format"] == "tpq-1"
         assert (host / "tokenizer.json").read_text() == "{}"
         assert (host / "generation_config.json").is_file()
 

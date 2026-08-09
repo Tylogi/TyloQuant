@@ -1,24 +1,25 @@
-"""TPQ 分组 GEMM：把 MoE 一层选中的 top-k 专家矩阵乘合并成少量批量算子。
+"""TPQ grouped GEMM: combine matrix multiplies for a layer's selected top-k MoE experts into a few batched operators.
 
-背景：DSV4-S 档每层 top-6 专家全部是 VQWeight（u8 索引 + 层共享码本）。
-原实现逐专家循环调用 VQWeight.matmul_T：每次 decode 一层 6 个专家 ×
-(gu/dn 两个 matmul + gather + 求和) ≈ 30+ 次 kernel launch，43 层累计上千次，
-WDDM 下 launch 开销成为主要瓶颈之一。
+Background: all top-6 experts in every DSV4-S layer are VQWeight objects with u8 indices and layer-shared codebooks.
+The original implementation called VQWeight.matmul_T in a per-expert loop. Decoding one layer used six experts times
+two gu/dn matmuls plus gather and reduction, or about 30+ kernel launches. Across 43 layers this reached thousands,
+making launch overhead a primary bottleneck under WDDM.
 
-本模块把「同一层的全部选中专家」堆叠成批，一次完成：
-  s = xb @ cb^T          —— 批量码本内积  [N, B, K]
-  g = gather(s, idx^T)   —— 批量查表      [N, B, R]
-  y = g.sum(1)           —— 批量归约      [N, R]
-每层从 30+ 次 launch 降到 ~8 次；数值与 VQWeight.matmul_T 的 LUT 算法逐元素一致
-（同一 f32 表达式，仅批量化；cuBLAS 归约顺序差异在 1e-6 量级，远小于 VQ 量化噪声）。
+This module batches all selected experts in one layer and computes:
+  s = xb @ cb^T          -- batched codebook dot products [N, B, K]
+  g = gather(s, idx^T)   -- batched lookup               [N, B, R]
+  y = g.sum(1)           -- batched reduction            [N, R]
+This reduces each layer from 30+ launches to about eight. Numerics match the VQWeight.matmul_T LUT algorithm
+element by element using the same f32 expression, only batched. cuBLAS reduction-order differences are about 1e-6,
+far below VQ quantization noise.
 
-接口：
-  vq_gemv_batch    —— 通用批量 VQ 矩阵乘（T=1 或 T>1 逐对模式通用）
-  stack_vq         —— 把若干 (gu, dn) 专家堆叠为批量张量
-  moe_mlp_grouped  —— 一层 top-k 专家的完整 SwiGLU MLP（含路由权重加权求和）
-优先调用 fusedext 的 CUDA 融合 kernel（若已编译），否则走本文件的 torch 批量路径。
+Interfaces:
+  vq_gemv_batch    -- generic batched VQ matrix multiplication for T=1 or pairwise T>1 mode
+  stack_vq         -- stack several (gu, dn) experts into batched tensors
+  moe_mlp_grouped  -- complete SwiGLU MLP for one layer's top-k experts, including routing-weighted reduction
+Prefer fused CUDA kernels from fusedext when compiled; otherwise use the torch batched path in this file.
 
-自检（CPU 可跑）：python -m tpq.grouped
+Self-check, runnable on CPU: python -m tpq.grouped
 """
 
 from __future__ import annotations
@@ -37,11 +38,11 @@ _slots_fused_checked = False
 
 
 def _load_slots_fused():
-    """仅在真实 CUDA MoE 调用时加载 CUDA 扩展。
+    """Load the CUDA extension only for an actual CUDA MoE call.
 
-    公共 grouped 模块也承载 CPU 的 SiTU/packed MoE 辅助函数；在模块导入期
-    编译 CUDA 会让纯 CPU CLI 启动和单元测试无故依赖 NVCC。这里缓存一次探测
-    结果，CUDA 行为保持不变，CPU 路径则完全不接触 fusedext。
+    The shared grouped module also provides CPU SiTU/packed-MoE helpers. Compiling CUDA during module import
+    would make CPU-only CLI startup and unit tests depend unnecessarily on NVCC. Cache one probe result here;
+    CUDA behavior remains unchanged while the CPU path never touches fusedext.
     """
     global _slots_fused, _slots_fused_checked
     if _slots_fused_checked:
@@ -155,16 +156,16 @@ def moe_mlp_slots_compatible(
 
 
 def vq_gemv_batch(x_rows: torch.Tensor, idx: torch.Tensor, cb: torch.Tensor) -> torch.Tensor:
-    """批量 VQ 矩阵乘 y[n] = x[n] @ W_n^T，W_n 由 idx[n]/cb[n] 定义。
+    """Batched VQ matrix multiplication y[n] = x[n] @ W_n^T, with W_n defined by idx[n]/cb[n].
 
-    x_rows: [N, C] 或 [1, C]（广播到 N）f32；idx: u8/u16 [N, R, B]；
-    cb: f32 [N, K, dim] 或 [1, K, dim]（同层共享码本广播，免 N 份堆叠拷贝）。
-    返回 [N, R] f32。C = B * dim。
+    x_rows: f32 [N, C] or [1, C] broadcast to N; idx: u8/u16 [N, R, B].
+    cb: f32 [N, K, dim] or [1, K, dim], broadcasting a layer-shared codebook without N stacked copies.
+    Returns f32 [N, R]. C = B * dim.
     """
     N, R, B = (max(x_rows.shape[0], idx.shape[0]),) + idx.shape[1:]
     dim = cb.shape[2]
     if idx.dtype in (torch.uint8, torch.uint16):
-        # CPU/CUDA 都经过同一能力注册层；后端不可用时才走 torch 参考路径。
+        # CPU and CUDA both use the same capability registry; use the torch reference path only when the backend is unavailable.
         from .ops import vq_gemv
 
         registered = vq_gemv(x_rows, idx, cb)
@@ -173,19 +174,19 @@ def vq_gemv_batch(x_rows: torch.Tensor, idx: torch.Tensor, cb: torch.Tensor) -> 
     dt = compute_dtype(x_rows.device)
     cbc = cb_compute(cb, dt)
     xb = x_rows.to(dt).view(-1, B, dim)
-    s = torch.matmul(xb, cbc.transpose(1, 2))          # [N|1, B, K]（广播；半精度 GEMM）
+    s = torch.matmul(xb, cbc.transpose(1, 2))          # [N|1, B, K] (broadcast; half-precision GEMM)
     if s.shape[0] == 1 and N > 1:
-        s = s.expand(N, -1, -1)                        # x/cb 双广播时显式扩到 N
+        s = s.expand(N, -1, -1)                        # Explicitly expand to N when both x and cb are broadcast
     gi = idx.long().permute(0, 2, 1)
     if gi.shape[0] == 1 and N > 1:
-        gi = gi.expand(N, -1, -1)                      # idx 广播（x[N] × idx[1] 模式）
+        gi = gi.expand(N, -1, -1)                      # Broadcast idx (x[N] x idx[1] mode)
     g = s.gather(2, gi)                                # [N, B, R]
-    return g.sum(1, dtype=torch.float32)               # f32 累加
+    return g.sum(1, dtype=torch.float32)               # Accumulate in f32
 
 
 def _stack_cb(cbs: list[torch.Tensor]) -> torch.Tensor:
-    """码本堆叠：全部共享同一张量（同层同档）时返回 [1,K,d] 广播视图，
-    省掉每层 top-k 份 D2D 码本拷贝；混合码本才真正 stack。"""
+    """Stack codebooks. When all experts share one tensor in the same layer/tier, return a [1,K,d] broadcast view
+    to avoid top-k D2D codebook copies per layer; perform a real stack only for mixed codebooks."""
     first = cbs[0]
     if all(c is first or (c.data_ptr() == first.data_ptr() and c.shape == first.shape)
            for c in cbs):
@@ -194,10 +195,10 @@ def _stack_cb(cbs: list[torch.Tensor]) -> torch.Tensor:
 
 
 def stack_vq(experts: list[tuple[VQWeight, VQWeight]]):
-    """把 top-k 个 (gu, dn) 专家堆叠为批量张量（u8 索引 D2D 复制，每层 ≈17MB，可忽略；
-    码本共享时只取一份广播视图）。
+    """Stack top-k (gu, dn) experts into batched tensors. u8 indices use about 17 MB of D2D copies per layer,
+    which is negligible; shared codebooks use one broadcast view.
 
-    返回 (gu_idx [N,Rg,Bg], gu_cb [N|1,K,d], dn_idx [N,Rd,Bd], dn_cb [N|1,K,d])。
+    Returns (gu_idx [N,Rg,Bg], gu_cb [N|1,K,d], dn_idx [N,Rd,Bd], dn_cb [N|1,K,d]).
     """
     gu_idx = torch.stack([g.idx for g, _ in experts])
     gu_cb = _stack_cb([g.cb for g, _ in experts])
@@ -247,11 +248,11 @@ def moe_mlp_grouped_slots(
     result_dtype: torch.dtype = torch.bfloat16,
     activation: str = "silu",
 ) -> torch.Tensor | None:
-    """直接读取固定 arena 视图的 SM120 top-k VQ MLP。
+    """SM120 top-k VQ MLP that directly reads fixed-arena views.
 
-    不再 ``torch.stack`` 复制 GU/DN 索引；四次 launch 完成 GU VQ GEMV、
-    SwiGLU、DN VQ GEMV 和 FP32 路由加权，层间输出为 BF16。签名混排、
-    非 CUDA 或扩展不可用时返回 None，由调用方走原批量实现。
+    GU/DN indices are no longer copied with ``torch.stack``. Four launches perform GU VQ GEMV, SwiGLU,
+    DN VQ GEMV, and FP32 routing weighting, with BF16 output between layers. Return None for mixed signatures,
+    non-CUDA execution, or an unavailable extension so the caller uses the original batched implementation.
     """
     slots_fused = _load_slots_fused() if x_rows.is_cuda else None
     if (
@@ -378,11 +379,11 @@ def moe_mlp_grouped_mixed(
     situ_beta: float = 4.0,
     situ_linear_beta: float | None = 25.0,
 ) -> torch.Tensor:
-    """v/w 混档兼容版：DSV4-S perlayer 档同层混排（v=4D、w=8D，B 不同无法堆叠），
-    按 (gu/dn 形状) 分组后分别批量、按路由权重加和。单组时等同 moe_mlp_grouped。
+    """Mixed v/w-tier compatible path for DSV4-S per-layer mixtures. v=4D and w=8D have different B and cannot stack,
+    so group by gu/dn shapes, batch separately, and sum by routing weights. One group is equivalent to moe_mlp_grouped.
 
-    x_rows: [N, D] 或 [1, D]；experts: top-k 个 (gu, dn)；weights: [K]。
-    返回加权和 [D] f32。
+    x_rows: [N, D] or [1, D]; experts: top-k (gu, dn) pairs; weights: [K].
+    Returns an f32 weighted sum [D].
     """
     if not experts:
         raise ValueError("at least one expert is required")
@@ -730,10 +731,10 @@ def moe_mlp_grouped_situ(
     situ_beta: float = 4.0,
     situ_linear_beta: float | None = 25.0,
 ) -> torch.Tensor:
-    """Kimi/CCCP 的稳定直连入口：混档 VQ MoE + SITU 激活。
+    """Stable direct entry point for Kimi/TPQ: mixed-tier VQ MoE plus SiTU activation.
 
-    保留简单的位置参数签名，量化器运行时无需了解 TPQ 内部的通用
-    ``activation``/``limit`` 选项，也不会因重构通用分组算子而回退。
+    Retain a simple positional signature so quantizer runtime need not understand TPQ's generic
+    ``activation``/``limit`` options and will not regress when shared grouped operators are refactored.
     """
     return moe_mlp_grouped_mixed(
         x_rows,
@@ -755,10 +756,10 @@ def expert_mlp_batched(
     situ_beta: float = 4.0,
     situ_linear_beta: float | None = 25.0,
 ) -> torch.Tensor:
-    """多 token × 单专家的 SwiGLU MLP（投机验证 T>1 路径）。
+    """Multi-token by single-expert SwiGLU MLP for the speculative-validation T>1 path.
 
-    idx 以 [1,R,B] 广播（融合 kernel 的 idxStrideN=0），x_rows [Tn, D] 一次算完，
-    数值与逐 token 调 VQWeight.matmul_T 一致。返回 [Tn, D_out] f32。
+    Broadcast idx as [1,R,B] with idxStrideN=0 in the fused kernel and compute x_rows [Tn, D] in one pass.
+    Numerics match per-token VQWeight.matmul_T calls. Returns f32 [Tn, D_out].
     """
     mi = dn.cols
     h = vq_gemv_batch(x_rows, gu.idx.unsqueeze(0), gu.cb.unsqueeze(0))   # [Tn, 2*mi]
@@ -793,12 +794,12 @@ def moe_mlp_grouped(
     situ_beta: float = 4.0,
     situ_linear_beta: float | None = 25.0,
 ) -> torch.Tensor:
-    """一层 top-k 专家的 SwiGLU MLP（数值同 DSV4TPQModel._expert_mlp_tpq 的逐专家循环）。
+    """SwiGLU MLP for one layer's top-k experts, numerically matching the per-expert loop in DSV4TPQModel._expert_mlp_tpq.
 
-    x_rows: [N, D] 或 [1, D]（N = 专家对数）；weights: [N] 路由权重。
-    返回加权和 [D] f32。
+    x_rows: [N, D] or [1, D], where N is the number of expert pairs; weights: [N] routing weights.
+    Returns an f32 weighted sum [D].
     """
-    mi = dn_idx.shape[2] * dn_cb.shape[2]              # dn 的列数 = moe_inter
+    mi = dn_idx.shape[2] * dn_cb.shape[2]              # Number of dn columns = moe_inter
     h = vq_gemv_batch(x_rows, gu_idx, gu_cb)           # [N, 2*mi]
     g, u = h[:, :mi], h[:, mi:]
     if limit:
@@ -816,7 +817,7 @@ def moe_mlp_grouped(
 
 
 def _selftest() -> None:
-    """与逐专家 VQWeight.matmul_T 循环做数值对照（CPU，随机数据）。"""
+    """Compare numerically against a per-expert VQWeight.matmul_T loop using random CPU data."""
     torch.manual_seed(7)
     N, D, mi, K, dim, limit = 6, 256, 96, 16, 8, 7.0
 
@@ -829,7 +830,7 @@ def _selftest() -> None:
     wts = torch.rand(N)
     experts = [(mk(2 * mi, D), mk(D, mi)) for _ in range(N)]
 
-    # 参照：逐专家循环（即 dsv4model._moe 的原路径）
+    # Reference: per-expert loop (the original dsv4model._moe path)
     ref = torch.zeros(D)
     for (gu, dn), w in zip(experts, wts):
         h = gu.matmul_T(x)
@@ -844,7 +845,7 @@ def _selftest() -> None:
     print(f"grouped 自检: 最大绝对误差 {diff:.3e}（相对 {rel:.3e}）")
     assert rel < 1e-5, f"分组 GEMM 与逐专家循环不一致: rel={rel}"
 
-    # 混档（v=4D / w=8D 混合，DSV4-S perlayer 实际形态）
+    # Mixed tiers (v=4D / w=8D, the actual DSV4-S per-layer form)
     dim2 = 4
     def mk2(rows: int, cols: int) -> VQWeight:
         idx = torch.randint(0, K, (rows, cols // dim2), dtype=torch.uint8)

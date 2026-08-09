@@ -49,10 +49,7 @@ def find_adjacent_model(
     for name in model_names:
         for parent in (package_dir.parent, package_dir.parent.parent):
             candidate = parent / name
-            if any(
-                (candidate / name).is_file()
-                for name in ("tpq.json", "cccp.json")
-            ):
+            if (candidate / "tpq.json").is_file():
                 return str(candidate.resolve())
     return None
 

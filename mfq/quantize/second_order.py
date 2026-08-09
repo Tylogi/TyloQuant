@@ -505,6 +505,9 @@ def refine_nvq2_block24(
 
     if tensor.spec.groupsize != 24 or tensor.spec.vector_size != 8:
         raise ValueError("block24 refinement requires NVQ gs24 with vector size 8")
+    if tensor.spec.sign_mode != "even":
+        raise ValueError(
+            "block24 refinement does not support index-parity signs")
     if outer_iterations < 1 or coordinate_sweeps < 1 or group_chunk <= 0:
         raise ValueError("refinement iteration and chunk counts must be positive")
     value = _as_cuda_matrix(weight, device)
@@ -577,12 +580,16 @@ def refine_nvq2_block24(
         )
         numerator = torch.einsum("ogi,gij,ogj->o", weight_group, hessian, basis)
         denominator = torch.einsum("ogi,gij,ogj->o", basis, hessian, basis)
-        anchor = torch.where(
+        fitted_anchor = torch.where(
             denominator > 0,
             numerator / denominator,
             anchor,
-        ).clamp_min(0)
-        anchor = anchor.to(torch.float16).to(torch.float32)
+        ).clamp_min(0).to(torch.float16).to(torch.float32)
+        old_residual = anchor[:, None, None] * basis - weight_group
+        new_residual = fitted_anchor[:, None, None] * basis - weight_group
+        old_error = torch.einsum("ogi,gij,ogj->o", old_residual, hessian, old_residual)
+        new_error = torch.einsum("ogi,gij,ogj->o", new_residual, hessian, new_residual)
+        anchor = torch.where(new_error <= old_error, fitted_anchor, anchor)
 
         quantized = anchor[:, None, None] * basis
         residual = quantized - weight_group

@@ -1,4 +1,4 @@
-"""nint codec (Neuron-anchored INT) 基本正确性测试。"""
+"""Basic correctness tests for the nint codec (Neuron-anchored INT)."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def test_quantize_dequantize_shape_and_range():
     spec = NintSpec(4, 24, 6)
     code = nint.quantize(x, spec)
     assert code.n == 5120
-    assert code.q.size >= 5120            # 含尾组补零
+    assert code.q.size >= 5120            # Includes trailing-group padding
     assert int(code.q.max()) <= spec.nmax
     K = (1 << spec.sub_bits) - 1
     assert int(code.sub_scale.max()) <= K

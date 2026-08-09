@@ -284,13 +284,15 @@ std::int32_t generate_with_prefill_metrics(
     const MfqTokenCallback& callback,
     const MfqPrefillCallback& on_prefill,
     const MfqPromptCachePlan&,
+    const MfqTokenConstraintPtr& token_constraint,
     int) {
     return runtime.generate(
         prompt,
         sampling,
         max_tokens,
         callback,
-        on_prefill);
+        on_prefill,
+        token_constraint);
 }
 
 std::int32_t generate_with_prefill_metrics(
@@ -301,6 +303,7 @@ std::int32_t generate_with_prefill_metrics(
     const MfqTokenCallback& callback,
     const MfqPrefillCallback& on_prefill,
     const MfqPromptCachePlan& cache_plan,
+    const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size) {
     return runtime.generate(
         prompt,
@@ -313,7 +316,8 @@ std::int32_t generate_with_prefill_metrics(
         cache_plan.stable_prefix_tokens > 0
             ? std::optional<std::size_t>(
                   cache_plan.stable_prefix_tokens)
-            : std::nullopt);
+            : std::nullopt,
+        token_constraint);
 }
 
 template <typename Runtime, typename Loader>
@@ -368,7 +372,8 @@ int serve_loaded_runtime(
             const MfqSamplingParams& sampling,
             const MfqTokenCallback& callback,
             const MfqPrefillCallback& on_prefill,
-            const MfqPromptCachePlan& cache_plan) {
+            const MfqPromptCachePlan& cache_plan,
+            const MfqTokenConstraintPtr& token_constraint) {
             std::lock_guard<std::mutex> lock(*runtime_mutex);
             if (!runtime_holder->has_value()) {
                 throw std::runtime_error(
@@ -396,6 +401,7 @@ int serve_loaded_runtime(
                 callback,
                 on_prefill,
                 cache_plan,
+                token_constraint,
                 prefill_chunk_size);
         };
     const MfqReloadFn reload =

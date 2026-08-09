@@ -1,19 +1,19 @@
-"""torch GPU backend：NINT 反量化 + matmul。
+"""Torch GPU backend for NINT dequantization plus matmul.
 
-仿 llama.cpp 的内存策略：权重以**压缩形式**（q + scales，~4.5 bpw）常驻 GPU，每次前向
-把当前层权重瞬时 dequant 成 fp16 做 cuBLAS GEMM——不常驻全模型 fp16（27B 模型 fp16
-需 54GB，24GB 卡装不下；压缩态 ~15GB 装得下）。
+Following llama.cpp's memory strategy, weights remain compressed on the GPU (q plus scales, about 4.5 bpw).
+Each forward pass temporarily dequantizes the current layer to fp16 for cuBLAS GEMM instead of keeping the full model
+resident in fp16 (a 27B model needs 54 GB in fp16 and does not fit on a 24 GB card, while ~15 GB compressed does).
 
-matmul 走 **llama.cpp 式分解**（仿射零点的分组求和校正）：
+Matmul uses **llama.cpp-style decomposition** with grouped-sum correction for the affine zero point:
 
     y[b,o] = Σ_g d_eff[o,g]·(Σ_{i∈g} q[o,i]·x[b,i]) − Σ_g m_eff[o,g]·(Σ_{i∈g} x[b,i])
            = (Wq · xᵀ)[o,b] − (m_eff · xsᵀ)[o,b]
 
-其中 ``Wq = d_eff·q``（不带 zp 的反量化权重），``xs`` 是 x 的 per-group 求和。
-当前为「Wq materialize + cuBLAS」的基本实现；**真正的 INT-fused-GEMM（dequant-during-GEMM，
-不 materialize Wq）**留作后续 CUDA 扩展（torch.utils.cpp_extension），届时上层零改动。
+Here ``Wq = d_eff*q`` is the dequantized weight without zp, and ``xs`` is the per-group sum of x.
+The current basic implementation materializes Wq and uses cuBLAS. A true INT-fused-GEMM that dequantizes during GEMM
+without materializing Wq remains for a future CUDA extension using torch.utils.cpp_extension, with no upper-layer changes.
 
-注：本模块 import torch（重依赖），故不经 ``mfq.kernels.__init__`` 自动导入，需显式引入。
+This module imports torch, a heavy dependency, so ``mfq.kernels.__init__`` does not import it automatically; import it explicitly.
 """
 
 from __future__ import annotations
@@ -263,7 +263,7 @@ def to_gpu(
 
 
 def dequantize(g: dict, dtype: torch.dtype = torch.float16) -> torch.Tensor:
-    """全量反量化为 ``dtype``（默认 fp16），还原原始 shape。"""
+    """Fully dequantize to ``dtype`` (fp16 by default) and restore the original shape."""
 
     if g.get("q") is not None:
         q = g["q"].to(torch.float32)
@@ -291,9 +291,9 @@ def dequantize(g: dict, dtype: torch.dtype = torch.float16) -> torch.Tensor:
 
 
 def matmul(g: dict, x: torch.Tensor) -> torch.Tensor:
-    """llama.cpp 式分解 matmul：``y = x · Wqᵀ − xs · m_effᵀ``。
+    """llama.cpp-style decomposed matmul: ``y = x * Wq^T - xs * m_eff^T``.
 
-    ``x``: ``[..., in]`` (fp16/f32, 已在 GPU)。返回 ``[..., out]`` (fp16)。
+    ``x``: ``[..., in]`` in fp16/f32 and already on the GPU. Returns ``[..., out]`` in fp16.
     """
 
     out, ng, gs = g["out"], g["ng"], g["gs"]
@@ -306,8 +306,8 @@ def matmul(g: dict, x: torch.Tensor) -> torch.Tensor:
     xb = x.to(torch.float16)
     xin = xb.shape[-1]
     if xin != ng * gs:
-        xb = torch.nn.functional.pad(xb, (0, ng * gs - xin))   # 尾组补零
+        xb = torch.nn.functional.pad(xb, (0, ng * gs - xin))   # Zero-pad the trailing group
     xs = xb.reshape(*xb.shape[:-1], ng, gs).sum(-1).to(torch.float16)   # [..., ng]
     y = xb[..., :xin].to(torch.float16) @ Wq.T                          # [..., out]
-    y = y - xs @ _m_eff(g).to(torch.float16).T                          # zp 校正
+    y = y - xs @ _m_eff(g).to(torch.float16).T                          # Zero-point correction
     return y

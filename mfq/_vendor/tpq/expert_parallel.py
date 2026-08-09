@@ -361,13 +361,13 @@ class _ResidentShard:
             raise ValueError(
                 f"expert tensor shard boundaries must align to VQ dim={dn.dim}"
             )
-        # Gate 和 Up 在原权重中按 [I, I] 连续排列，切片后仍保持
-        # [local gate, local up]，使现有 SwiGLU kernel 无需改数值顺序。
+        # Gate and Up are contiguous as [I, I] in the original weights. After slicing, retain
+        # [local gate, local up] so the existing SwiGLU kernel needs no change to numerical ordering.
         block_start = shard_start // dn.dim
         block_end = shard_end // dn.dim
         local_dn_idx = dn.idx[:, block_start:block_end]
-        # 这里只用视图形状选择 arena；实际写入分两段完成，避免为每个专家
-        # 在 CPU 上执行一次多线程 torch.cat 和分配一个临时拼接副本。
+        # Use only the view shape to select the arena. Perform the actual write in two segments to avoid
+        # a multithreaded torch.cat and a temporary concatenated allocation on CPU for every expert.
         signature_expert = (
             VQWeight(
                 gu.idx[:2 * local_intermediate],
@@ -766,7 +766,7 @@ class GpuResidentExpertParallel:
             histogram: Counter = Counter()
             for route_ids in self._profile_route_ids:
                 if self.tensor_sharded:
-                    # 每个 rank 都处理全部 Top-K，但只计算 1/tp 中间维。
+                    # Every rank processes the full Top-K but computes only 1/tp of the intermediate dimension.
                     owned = [route_ids.numel()] * self.tp_size
                 else:
                     owned = [0] * self.tp_size
@@ -917,12 +917,12 @@ class GpuResidentExpertParallel:
         started = time.time()
         loaded = 0
         if self.tensor_sharded:
-            # 每个专家只从模型文件读取一次，再把不重叠的 intermediate
-            # 切片直接写入各卡；不建立 RAM 镜像，也不重复读盘。
+            # Read each expert from the model file only once, then write non-overlapping intermediate slices directly
+            # to each device without creating a RAM mirror or rereading from disk.
             #
-            # Down-Proj 的列切片在 CPU 上不是连续视图，直接 copy_ 会为
-            # 19K 个专家反复启动多线程打包。先把每个完整索引矩阵连续上传
-            # 到主卡复用 staging，再由各卡 stream 在 GPU 上提取切片。
+            # Down-Proj column slices are non-contiguous views on CPU; direct copy_ repeatedly launches multithreaded packing
+            # for 19K experts. Upload each complete index matrix contiguously to reusable staging on the primary device,
+            # then extract slices on the GPU using each device's stream.
             staging_by_signature: dict[
                 ExpertSignature,
                 tuple[torch.Tensor, torch.Tensor],
@@ -979,8 +979,8 @@ class GpuResidentExpertParallel:
                             shard_end,
                         )
                         stage_consumed[rank].record(shard.stream)
-                # 下一专家复用 staging 前，主卡上传 stream 等待所有分片
-                # copy 完成；只建立设备依赖，不做逐专家 CPU synchronize。
+                # Before the next expert reuses staging, the primary device's upload stream waits for all shard copies.
+                # Establish device dependencies only, without per-expert CPU synchronization.
                 with (
                     torch.cuda.device(self.primary_device),
                     torch.cuda.stream(primary_stream),
@@ -1412,8 +1412,8 @@ class GpuResidentExpertParallel:
                     local_ids = shard.routed_ids
                     local_weights = shard.routed_weights
                 elif rank == 0 and not use_graph:
-                    # 模型残差是 FP32，专家 kernel 的 BF16 边界仍需保留；
-                    # 但 Top-K ID/权重已经是目标 dtype 和设备，不必再复制。
+                    # Model residuals are FP32, so preserve the expert kernel's BF16 boundary. Top-K IDs/weights
+                    # already have the target dtype and device and need no additional copy.
                     shard.routed_x.copy_(
                         x,
                         non_blocking=True,
@@ -1667,8 +1667,8 @@ class GpuResidentExpertParallel:
 
         routed_start = self.profile_event()
         if self.tensor_sharded:
-            # 每卡持有每个专家的不重叠 intermediate 分片，因此两卡都处理
-            # 完整 Top-K；最终 hidden 向量是各分片 Down-Proj 的 FP32 和。
+            # Each device holds a non-overlapping intermediate shard for every expert, so both devices process
+            # the full Top-K. The final hidden vector is the FP32 sum of the sharded Down-Proj outputs.
             positions_by_rank = [
                 list(range(len(expert_ids)))
                 for _ in range(self.tp_size)

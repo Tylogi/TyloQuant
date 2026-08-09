@@ -1,4 +1,4 @@
-"""nint_quant 张量级量化测试。"""
+"""Tensor-level quantization tests for nint_quant."""
 
 from __future__ import annotations
 

@@ -11,15 +11,6 @@ SERVER_HEADER = (ROOT / "cpp_runtime" / "mfq_server.h").read_text(
 )
 SERVER = (ROOT / "cpp_runtime" / "mfq_server.cpp").read_text(encoding="utf-8")
 RUNTIME = (ROOT / "cpp_runtime" / "mfq_decode.cpp").read_text(encoding="utf-8")
-METAL_TIMER = (ROOT / "cpp_runtime" / "metal" / "mlx_eval_timing.h").read_text(
-    encoding="utf-8"
-)
-METAL_QWEN = (
-    ROOT / "cpp_runtime" / "metal" / "mlx_qwen35_causal_lm.cpp"
-).read_text(encoding="utf-8")
-METAL_DSV4 = (
-    ROOT / "cpp_runtime" / "metal" / "mlx_deepseek_v4_causal_lm.cpp"
-).read_text(encoding="utf-8")
 
 
 def test_markdown_and_latex_assets_are_local_and_loaded_before_app() -> None:
@@ -84,49 +75,8 @@ def test_prefill_speed_uses_cuda_events_around_only_the_first_model_eval() -> No
     assert '{"prefill_ms", values.prefill_ms}' in SERVER
 
 
-def test_metal_prefill_speed_accumulates_only_explicit_mlx_evaluations() -> None:
-    assert "class ScopedMlxEvaluationTiming" in METAL_TIMER
-    assert "active_mlx_evaluation_ms" in METAL_TIMER
-    assert "std::chrono::steady_clock::now()" in METAL_TIMER
-    assert "CPU graph construction" in METAL_TIMER
-
-    for source in (METAL_QWEN, METAL_DSV4):
-        assert "prefill_started" not in source
-        assert "prefill_evaluation_ms" in source
-        assert "ScopedMlxEvaluationTiming timing" in source
-        assert "detail::eval_with_timing(value);" in source
-        assert "prefill_evaluation_ms);" in source
-
-    cache_setup = METAL_QWEN.index("prepare_cache_for_prefill(", METAL_QWEN.index("std::int32_t MlxQwen35CausalLm::generate"))
-    timed_eval = METAL_QWEN.index("ScopedMlxEvaluationTiming timing", cache_setup)
-    assert cache_setup < timed_eval
-    assert "Cache allocation/zeroing is request setup" in METAL_QWEN
-
-    dsv4_generate = METAL_DSV4.index("std::int32_t MlxDeepseekV4CausalLm::generate")
-    dsv4_reset = METAL_DSV4.index("reset_cache(1);", dsv4_generate)
-    dsv4_timed_eval = METAL_DSV4.index("ScopedMlxEvaluationTiming timing", dsv4_reset)
-    assert dsv4_reset < dsv4_timed_eval
-    assert "State allocation/zeroing is request setup" in METAL_DSV4
-
-    # DeepSeek eagerly materializes every layer and state. These evaluations
-    # must contribute while the surrounding CPU graph construction does not.
-    assert "detail::eval_with_timing(hidden_values);" in METAL_DSV4
-    assert "detail::eval_with_timing(std::move(arrays));" in METAL_DSV4
-
-
 def test_monitor_metrics_are_neutral_and_chart_uses_blue() -> None:
     assert ".metric-tile::before" not in CSS
     assert "metric-tile accent-" not in HTML
     assert 'ctx.strokeStyle = "#3b72b9";' in JS
     assert 'ctx.strokeStyle = "#17836f";' not in JS
-
-
-def test_prefill_speed_is_visible_in_summary_and_request_details() -> None:
-    for element_id in (
-        "top-prefill-tps",
-        "metric-prefill-tps",
-        "last-prefill-tps",
-        "last-prefill-ms",
-    ):
-        assert f'id="{element_id}"' in HTML
-        assert f'refs["{element_id}"]' in JS

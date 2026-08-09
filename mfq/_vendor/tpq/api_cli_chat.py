@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""通过 OpenAI 兼容接口与已启动的 TPQ 服务进行 CLI 多轮对话。"""
+"""Conduct multi-turn CLI conversations with a running TPQ service through an OpenAI-compatible API."""
 
 import argparse
 import json
