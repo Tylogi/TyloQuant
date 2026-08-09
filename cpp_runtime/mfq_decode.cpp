@@ -21,6 +21,7 @@
 #include "json.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -97,6 +98,10 @@ torch::Tensor rms_norm_cuda(torch::Tensor x, torch::Tensor weight, double eps);
 torch::Tensor rms_norm_offset_cuda(torch::Tensor x, torch::Tensor weight, double eps, double weight_offset);
 torch::Tensor rms_norm_f16_cuda(torch::Tensor x, torch::Tensor weight, double eps,
                                 double weight_offset);
+std::vector<torch::Tensor> rms_norm_pair_f16_f32_offset_cuda(
+    torch::Tensor first, torch::Tensor second,
+    torch::Tensor first_weight, torch::Tensor second_weight,
+    double eps, double weight_offset);
 torch::Tensor l2_norm_cuda(torch::Tensor x, double eps);
 torch::Tensor acc_cuda(torch::Tensor a, torch::Tensor b);
 std::vector<torch::Tensor> acc_rms_norm_cuda(torch::Tensor a, torch::Tensor b,
@@ -569,6 +574,12 @@ torch::Tensor nvq_gemv_qx_ws_cuda(
     torch::Tensor neuron_scale, torch::Tensor codebook,
     int64_t neuron_len, int64_t gs, int64_t sub_bits, int64_t format, int64_t sign_mode,
     torch::Tensor qx, torch::Tensor xscale);
+torch::Tensor nvq_gemv_qx_residual_ws_cuda(
+    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
+    torch::Tensor neuron_scale, torch::Tensor codebook,
+    int64_t neuron_len, int64_t gs, int64_t sub_bits, int64_t format,
+    int64_t sign_mode, torch::Tensor qx, torch::Tensor xscale,
+    torch::Tensor residual);
 torch::Tensor nvq_gemv_multi2_ws_cuda(
     torch::Tensor first_indices, torch::Tensor first_aux, torch::Tensor first_sub_scale,
     torch::Tensor first_neuron_scale, torch::Tensor first_codebook,
@@ -4036,6 +4047,9 @@ struct NvqWorkspace {
     torch::Tensor swiglu_scratch;
 };
 
+constexpr int64_t kNvq2JscXlGroupExecKernelFormat = 16;
+constexpr int64_t kNvq3JscLGroupExecKernelFormat = 17;
+
 struct NvqWeight {
     torch::Tensor indices_packed;
     torch::Tensor aux_packed;
@@ -4097,14 +4111,260 @@ static std::vector<uint8_t> repack_nvq2_exec_metadata(const NvqCpu & c) {
     return metadata;
 }
 
+static uint32_t load_compact_bits_cpu(
+        const std::vector<uint8_t> & data, size_t bit, int bits) {
+    const size_t byte = bit >> 3;
+    const int shift = static_cast<int>(bit & 7);
+    uint32_t word = byte < data.size() ? data[byte] : 0;
+    if (byte + 1 < data.size()) word |= static_cast<uint32_t>(data[byte + 1]) << 8;
+    if (byte + 2 < data.size()) word |= static_cast<uint32_t>(data[byte + 2]) << 16;
+    return (word >> shift) & ((1u << bits) - 1u);
+}
+
+static void put_compact_bits96(
+        uint32_t (&words)[3], int bit, int bits, uint32_t value) {
+    const int word = bit >> 5;
+    const int shift = bit & 31;
+    words[word] |= value << shift;
+    if (shift + bits > 32) words[word + 1] |= value >> (32 - shift);
+}
+
+static uint32_t compact_parity7(uint32_t value) {
+    value &= 0x7fu;
+    value ^= value >> 4;
+    value ^= value >> 2;
+    value ^= value >> 1;
+    return value & 1u;
+}
+
+// NVQ2J-XL needs exactly 64 bits per gs24 group (three 12-bit indices, three
+// 8-bit sign masks, and one 4-bit state). NVQ3J-L stores three indices in
+// a 96-bit record per gs24 group (six 10-bit indices, three 8-bit sign masks,
+// and one 4-bit state).
+// This replaces the two independently bit-packed streams on CUDA; it does not
+// keep a second execution copy of the model weights.
+static std::vector<uint8_t> repack_extended_jsc_group_metadata(
+        const NvqCpu & c,
+        const std::array<uint8_t, 16> * state_remap = nullptr,
+        const std::array<std::array<uint16_t, 4096>, 4> * index_remap = nullptr) {
+    if (c.format != 14 && c.format != 15) {
+        throw std::runtime_error("extended JSC group metadata requires NVQ2J-XL or NVQ3J-L");
+    }
+    const int index_bits = c.format == 14 ? 12 : 10;
+    const int vectors_per_group = c.format == 14 ? 3 : 6;
+    const size_t record_bytes = c.format == 14 ? 8 : 12;
+    const size_t group_count = static_cast<size_t>(c.out) * c.ng;
+    std::vector<uint8_t> metadata(group_count * record_bytes, 0);
+    at::parallel_for(0, static_cast<int64_t>(group_count), 4096, [&](int64_t begin, int64_t end) {
+        for (int64_t linear = begin; linear < end; ++linear) {
+            const int64_t row = linear / c.ng;
+            const int group = static_cast<int>(linear - row * c.ng);
+            const size_t vector_base = static_cast<size_t>(row) * c.nvec +
+                static_cast<size_t>(group) * vectors_per_group;
+            const size_t sign_base = static_cast<size_t>(row) * c.nsign +
+                static_cast<size_t>(group) * 3;
+            const uint32_t source_state = load_compact_bits_cpu(
+                c.sub_scale_packed, static_cast<size_t>(linear) * c.sub_bits,
+                c.sub_bits);
+            const uint32_t state = state_remap == nullptr
+                ? source_state
+                : (*state_remap)[source_state];
+            uint8_t * destination = metadata.data() +
+                static_cast<size_t>(linear) * record_bytes;
+            if (c.format == 14) {
+                uint64_t packed = 0;
+                for (int local = 0; local < 3; ++local) {
+                    const size_t vector = vector_base + local;
+                    const uint32_t source_index = vector < static_cast<size_t>((row + 1) * c.nvec)
+                        ? load_compact_bits_cpu(c.indices_packed, vector * index_bits, index_bits)
+                        : 0;
+                    const uint32_t source_bank = static_cast<uint8_t>(
+                        c.codebook[36 + source_state]);
+                    const uint32_t index = index_remap == nullptr
+                        ? source_index
+                        : (*index_remap)[source_bank][source_index];
+                    const size_t sign = sign_base + local;
+                    const uint32_t mask7 = sign < static_cast<size_t>((row + 1) * c.nsign)
+                        ? load_compact_bits_cpu(c.aux_packed, sign * 7, 7)
+                        : 0;
+                    const uint32_t mask8 = mask7 | (compact_parity7(mask7) << 7);
+                    const uint32_t segment = index | (mask8 << index_bits);
+                    packed |= static_cast<uint64_t>(segment) << (local * 20);
+                }
+                packed |= static_cast<uint64_t>(state) << 60;
+                std::memcpy(destination, &packed, sizeof(packed));
+            } else {
+                uint32_t words[3] = {0, 0, 0};
+                for (int local = 0; local < 6; ++local) {
+                    const size_t vector = vector_base + local;
+                    const uint32_t index = vector < static_cast<size_t>((row + 1) * c.nvec)
+                        ? load_compact_bits_cpu(c.indices_packed, vector * index_bits, index_bits)
+                        : 0;
+                    put_compact_bits96(words, local * index_bits, index_bits, index);
+                }
+                for (int local = 0; local < 3; ++local) {
+                    const size_t sign = sign_base + local;
+                    const uint32_t mask7 = sign < static_cast<size_t>((row + 1) * c.nsign)
+                        ? load_compact_bits_cpu(c.aux_packed, sign * 7, 7)
+                        : 0;
+                    const uint32_t mask8 = mask7 | (compact_parity7(mask7) << 7);
+                    put_compact_bits96(words, 60 + local * 8, 8, mask8);
+                }
+                put_compact_bits96(words, 84, 4, state);
+                std::memcpy(destination, words, sizeof(words));
+            }
+        }
+    });
+    return metadata;
+}
+
 static bool nvq2_exec_layout_enabled() {
     const char * disable = std::getenv("MFQ_DISABLE_NVQ2_EXEC");
     if (disable == nullptr) disable = std::getenv("MFQ_DISABLE_NIQ2_EXEC");
     return disable == nullptr || disable[0] != '1';
 }
 
+static bool extended_jsc_group_layout_enabled() {
+    const char * enable = std::getenv("MFQ_NVQ_EXTENDED_GROUP_EXEC");
+    return enable != nullptr && enable[0] == '1';
+}
+
+static std::vector<int8_t> reorder_extended_e8_codebook_for_stage3(
+        const NvqCpu & c,
+        std::array<uint8_t, 16> & state_remap,
+        std::array<std::array<uint16_t, 4096>, 4> & index_remap) {
+    constexpr size_t metadata_bytes = 64;
+    constexpr size_t bank_bytes = 4096 * 8;
+    constexpr int bank_count = 4;
+    if (c.format != 14 ||
+        c.codebook.size() != metadata_bytes + bank_count * bank_bytes ||
+        static_cast<uint8_t>(c.codebook[1]) != bank_count) {
+        throw std::runtime_error("extended E8 runtime layout requires NVQ2J-XL");
+    }
+
+    uint64_t counts[bank_count] = {0, 0, 0, 0};
+    std::vector<uint64_t> index_counts(bank_count * 4096, 0);
+    const size_t groups = static_cast<size_t>(c.out) * c.ng;
+    for (size_t linear = 0; linear < groups; ++linear) {
+        const uint32_t state = load_compact_bits_cpu(
+            c.sub_scale_packed, linear * c.sub_bits, c.sub_bits);
+        const uint32_t bank = static_cast<uint8_t>(c.codebook[36 + state]);
+        if (bank >= bank_count) {
+            throw std::runtime_error("NVQ2J-XL state references an invalid bank");
+        }
+        ++counts[bank];
+        const size_t row = linear / c.ng;
+        const size_t group = linear - row * c.ng;
+        const size_t vector_base = row * c.nvec + group * 3;
+        const size_t vector_end = (row + 1) * c.nvec;
+        for (int local = 0; local < 3; ++local) {
+            const size_t vector = vector_base + local;
+            if (vector >= vector_end) break;
+            const uint32_t index = load_compact_bits_cpu(
+                c.indices_packed, vector * 12, 12);
+            ++index_counts[bank * 4096 + index];
+        }
+    }
+    std::array<int, bank_count> order = {0, 1, 2, 3};
+    std::stable_sort(order.begin(), order.end(), [&](int left, int right) {
+        return counts[left] > counts[right];
+    });
+    std::vector<int8_t> reordered = c.codebook;
+    int runtime_bank[bank_count] = {0, 0, 0, 0};
+    for (int destination = 0; destination < bank_count; ++destination) {
+        const int source = order[destination];
+        runtime_bank[source] = destination;
+        std::array<int, 4096> index_order;
+        std::iota(index_order.begin(), index_order.end(), 0);
+        std::stable_sort(index_order.begin(), index_order.end(),
+            [&](int left, int right) {
+                return index_counts[source * 4096 + left] >
+                    index_counts[source * 4096 + right];
+            });
+        for (int destination_index = 0;
+             destination_index < 4096;
+             ++destination_index) {
+            const int source_index = index_order[destination_index];
+            index_remap[source][source_index] =
+                static_cast<uint16_t>(destination_index);
+            std::memcpy(
+                reordered.data() + metadata_bytes + destination * bank_bytes +
+                    destination_index * 8,
+                c.codebook.data() + metadata_bytes + source * bank_bytes +
+                    source_index * 8,
+                8);
+        }
+    }
+    int bank_state_count[bank_count] = {0, 0, 0, 0};
+    for (int source_state = 0; source_state < 16; ++source_state) {
+        const uint8_t source_bank = static_cast<uint8_t>(
+            c.codebook[36 + source_state]);
+        const int rank_in_bank = bank_state_count[source_bank]++;
+        if (rank_in_bank >= 4) {
+            throw std::runtime_error(
+                "NVQ2J-XL runtime bank has more than four scale states");
+        }
+        const int destination_bank = runtime_bank[source_bank];
+        const int destination_state = rank_in_bank * bank_count + destination_bank;
+        state_remap[source_state] = static_cast<uint8_t>(destination_state);
+        std::memcpy(
+            reordered.data() + 4 + destination_state * sizeof(uint16_t),
+            c.codebook.data() + 4 + source_state * sizeof(uint16_t),
+            sizeof(uint16_t));
+        reordered[36 + destination_state] = static_cast<int8_t>(destination_bank);
+    }
+    for (int bank = 0; bank < bank_count; ++bank) {
+        if (bank_state_count[bank] != 4) {
+            throw std::runtime_error(
+                "NVQ2J-XL runtime bank must have four scale states");
+        }
+    }
+    return reordered;
+}
+
+static std::vector<uint8_t> remap_extended_e8_sub_scale_states(
+        const NvqCpu & c,
+        const std::array<uint8_t, 16> & state_remap) {
+    if (c.format != 14 || c.sub_bits != 4) {
+        throw std::runtime_error(
+            "extended E8 scale-state remap requires 4-bit NVQ2J-XL states");
+    }
+    const size_t state_count = static_cast<size_t>(c.out) * c.ng;
+    const size_t expected_bytes = (state_count + 1) / 2;
+    if (c.sub_scale_packed.size() != expected_bytes) {
+        throw std::runtime_error("NVQ2J-XL scale-state stream length mismatch");
+    }
+    std::vector<uint8_t> remapped(expected_bytes, 0);
+    at::parallel_for(0, static_cast<int64_t>(expected_bytes), 4096,
+        [&](int64_t begin, int64_t end) {
+            for (int64_t byte = begin; byte < end; ++byte) {
+                const uint8_t source = c.sub_scale_packed[byte];
+                const size_t low_state = static_cast<size_t>(byte) * 2;
+                const uint8_t low = state_remap[source & 0x0fu];
+                const uint8_t high = low_state + 1 < state_count
+                    ? state_remap[source >> 4]
+                    : 0;
+                remapped[byte] = low | static_cast<uint8_t>(high << 4);
+            }
+        });
+    return remapped;
+}
+
 static NvqWeight to_device_nvq(const NvqCpu & c, bool cuda) {
     NvqWeight w;
+    std::array<uint8_t, 16> e8_state_remap = {};
+    auto e8_index_remap =
+        std::make_unique<std::array<std::array<uint16_t, 4096>, 4>>();
+    std::vector<int8_t> e8_runtime_codebook;
+    std::vector<uint8_t> e8_runtime_sub_scale;
+    const bool use_extended_e8 =
+        cuda && c.format == 14 && extended_jsc_group_layout_enabled();
+    if (use_extended_e8) {
+        e8_runtime_codebook = reorder_extended_e8_codebook_for_stage3(
+            c, e8_state_remap, *e8_index_remap);
+        e8_runtime_sub_scale = remap_extended_e8_sub_scale_states(
+            c, e8_state_remap);
+    }
     w.format = c.format;
     w.kernel_format = c.format;
     w.sign_mode = c.sign_mode;
@@ -4114,7 +4374,20 @@ static NvqWeight to_device_nvq(const NvqCpu & c, bool cuda) {
     w.ng = c.ng;
     w.neuron_len = c.neuron_len;
     w.shape = c.shape;
-    if ((c.format == 2 || c.format == 5) && nvq2_exec_layout_enabled()) {
+    if (cuda && (c.format == 14 || c.format == 15) &&
+        extended_jsc_group_layout_enabled()) {
+        auto metadata = repack_extended_jsc_group_metadata(
+            c,
+            use_extended_e8 ? &e8_state_remap : nullptr,
+            use_extended_e8 ? e8_index_remap.get() : nullptr);
+        w.indices_packed = cpu_u8_tensor(
+            metadata, {(int64_t)metadata.size()});
+        w.aux_packed = torch::empty(
+            {0}, torch::TensorOptions().dtype(torch::kUInt8));
+        w.kernel_format = c.format == 14
+            ? kNvq2JscXlGroupExecKernelFormat
+            : kNvq3JscLGroupExecKernelFormat;
+    } else if ((c.format == 2 || c.format == 5) && nvq2_exec_layout_enabled()) {
         auto metadata = repack_nvq2_exec_metadata(c);
         w.indices_packed = cpu_u8_tensor(
             metadata, {(int64_t)metadata.size()});
@@ -4135,15 +4408,23 @@ static NvqWeight to_device_nvq(const NvqCpu & c, bool cuda) {
         w.aux_packed = cpu_u8_tensor(
             c.aux_packed, {(int64_t)c.aux_packed.size()});
     }
-    w.sub_scale_packed = cpu_u8_tensor(
-        c.sub_scale_packed, {(int64_t)c.sub_scale_packed.size()});
+    w.sub_scale_packed = use_extended_e8
+        ? cpu_u8_tensor(
+            e8_runtime_sub_scale, {(int64_t)e8_runtime_sub_scale.size()})
+        : cpu_u8_tensor(
+            c.sub_scale_packed, {(int64_t)c.sub_scale_packed.size()});
     w.neuron_scale = cpu_f16_to_f32_tensor(c.neuron_scale_h, c.out);
     if (
         c.format == 5 || c.format == 7 || c.format == 9 ||
         c.format == 10 || c.format == 12 ||
         c.format == 13 || c.format == 14 || c.format == 15) {
-        w.codebook = cpu_i8_tensor(
-            c.codebook, {(int64_t)c.codebook.size()});
+        if (use_extended_e8) {
+            w.codebook = cpu_i8_tensor(
+                e8_runtime_codebook, {(int64_t)e8_runtime_codebook.size()});
+        } else {
+            w.codebook = cpu_i8_tensor(
+                c.codebook, {(int64_t)c.codebook.size()});
+        }
     } else {
         const int dims = nvq_vector_size(c.format);
         const int entries = c.format == 1 ? 2048 : (c.format == 8 ? 1024 : 256);
@@ -8753,13 +9034,17 @@ static torch::Tensor nvq_ffn_swiglu_down(
     const NvqWeight & gate,
     const NvqWeight & up,
     const NvqWeight & down,
-    torch::Tensor x) {
+    torch::Tensor x,
+    c10::optional<torch::Tensor> residual = c10::nullopt) {
     if (!nvq_pair_compatible(gate, up) || gate.out != up.out || gate.out != down.neuron_len) {
         throw std::runtime_error("NVQ fused FFN weight layouts are incompatible");
     }
     x = pad_last(x.contiguous().to(torch::kFloat16), gate.neuron_len);
     if (x.size(0) != 1 || (down.gs != 24 && down.gs != 28 && down.gs != 32)) {
-        return nvq_matmul(down, nvq_matmul_swiglu(gate, up, x));
+        auto output = nvq_matmul(down, nvq_matmul_swiglu(gate, up, x));
+        return residual.has_value()
+            ? acc_cuda(residual.value(), output)
+            : output;
     }
     NvqWorkspace & input_ws = gate.workspace(1);
     NvqWorkspace & output_ws = down.workspace(1);
@@ -8780,7 +9065,17 @@ static torch::Tensor nvq_ffn_swiglu_down(
             output_ws.qx, output_ws.xscale, input_ws.swiglu_scratch);
         return 0;
     });
-    return g_profiler.measure("nvq.gemv_qx", [&]() {
+    return g_profiler.measure(
+        residual.has_value() ? "nvq.gemv_qx_residual" : "nvq.gemv_qx",
+        [&]() {
+        if (residual.has_value()) {
+            return nvq_gemv_qx_residual_ws_cuda(
+                down.indices_packed, down.aux_packed, down.sub_scale_packed,
+                down.neuron_scale, down.codebook,
+                down.neuron_len, down.gs, down.sub_bits,
+                down.kernel_format, down.sign_mode,
+                output_ws.qx, output_ws.xscale, residual.value());
+        }
         return nvq_gemv_qx_ws_cuda(
             down.indices_packed, down.aux_packed, down.sub_scale_packed,
             down.neuron_scale, down.codebook,
@@ -12139,6 +12434,57 @@ struct FFN {
         return g_profiler.measure("ffn.down", [&]() { return down.forward_input_mul(parts[1], parts[0], 2); });
     }
 
+    bool can_forward_fused_residual(
+        const torch::Tensor & x,
+        const torch::Tensor & residual) const {
+        const char * fp32_residual_env =
+            std::getenv("MFQ_DIAGNOSTIC_FP32_RESIDUAL");
+        if (fp32_residual_env != nullptr && fp32_residual_env[0] == '1') {
+            return false;
+        }
+        if (!nvq_fusion_enabled() || is_moe || geglu ||
+            swiglu_limit > 0.0 || important_neurons ||
+            tensor_parallel_dense_compatible() ||
+            !x.is_cuda() || !residual.is_cuda() ||
+            x.scalar_type() != torch::kFloat16 ||
+            residual.scalar_type() != torch::kFloat16 ||
+            !x.is_contiguous() || !residual.is_contiguous() ||
+            x.dim() < 1 || residual.dim() < 1 ||
+            x.numel() / x.size(-1) != 1 ||
+            residual.numel() / residual.size(-1) != 1 ||
+            gate_up.layers.size() != 2 || !gate_up.nvq_prefix2 ||
+            !gate_up.layers[0].is_nvq() ||
+            !gate_up.layers[1].is_nvq() || !down.is_nvq() ||
+            gate_up.layers[0].tensor_parallel() ||
+            gate_up.layers[1].tensor_parallel() || down.tensor_parallel() ||
+            gate_up.outs.size() != 2 ||
+            gate_up.outs[0] != gate_up.outs[1] ||
+            gate_up.outs[0] != down.nvq.w.neuron_len ||
+            x.size(-1) != gate_up.layers[0].nvq.w.neuron_len ||
+            residual.size(-1) != down.nvq.w.out) {
+            return false;
+        }
+        return down.nvq.w.kernel_format ==
+                kNvq2JscXlGroupExecKernelFormat ||
+            down.nvq.w.kernel_format ==
+                kNvq3JscLGroupExecKernelFormat;
+    }
+
+    torch::Tensor forward_fused_residual(
+        torch::Tensor x,
+        torch::Tensor residual) const {
+        TORCH_CHECK(
+            can_forward_fused_residual(x, residual),
+            "FFN fused residual requires a compatible single-token NVQ FFN");
+        auto shape = x.sizes().vec();
+        shape.back() = down.nvq.w.out;
+        auto output = nvq_ffn_swiglu_down(
+            gate_up.layers[0].nvq.w, gate_up.layers[1].nvq.w,
+            down.nvq.w, x.reshape({1, x.size(-1)}),
+            residual.reshape({1, residual.size(-1)}));
+        return output.reshape(shape);
+    }
+
     torch::Tensor forward(
         torch::Tensor x,
         c10::optional<torch::Tensor> input_ids =
@@ -13218,22 +13564,34 @@ struct FullBlock : Block {
         auto q = g_profiler.measure("full.q_view", [&]() { return q_raw.transpose(1, 2).contiguous(); });
         auto k = g_profiler.measure("full.k_view", [&]() { return k_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous(); });
         auto v = g_profiler.measure("full.v_view", [&]() { return v_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous(); });
-        if (q_norm.defined()) q = g_profiler.measure("full.q_norm", [&]() {
-            return official_bf16
-                ? qwen_rms_norm_bf16(
-                    q.reshape({-1, hd}), q_norm, c).reshape_as(q)
-                : qwen_rms_norm(
-                    q.reshape({-1, hd}).to(torch::kFloat32), q_norm, c)
-                    .reshape_as(q);
-        });
-        if (k_norm.defined()) k = g_profiler.measure("full.k_norm", [&]() {
-            return official_bf16
-                ? qwen_rms_norm_bf16(
-                    k.reshape({-1, hd}), k_norm, c).reshape_as(k)
-                : qwen_rms_norm(
-                    k.reshape({-1, hd}).to(torch::kFloat32), k_norm, c)
-                    .reshape_as(k);
-        });
+        if (!official_bf16 && q_norm.defined() && k_norm.defined() &&
+            q.scalar_type() == torch::kFloat16 &&
+            k.scalar_type() == torch::kFloat16) {
+            auto normalized = g_profiler.measure("full.qk_norm", [&]() {
+                return rms_norm_pair_f16_f32_offset_cuda(
+                    q, k, q_norm, k_norm,
+                    c.rms_norm_eps, c.norm_weight_offset);
+            });
+            q = normalized[0].reshape_as(q);
+            k = normalized[1].reshape_as(k);
+        } else {
+            if (q_norm.defined()) q = g_profiler.measure("full.q_norm", [&]() {
+                return official_bf16
+                    ? qwen_rms_norm_bf16(
+                        q.reshape({-1, hd}), q_norm, c).reshape_as(q)
+                    : qwen_rms_norm(
+                        q.reshape({-1, hd}).to(torch::kFloat32), q_norm, c)
+                        .reshape_as(q);
+            });
+            if (k_norm.defined()) k = g_profiler.measure("full.k_norm", [&]() {
+                return official_bf16
+                    ? qwen_rms_norm_bf16(
+                        k.reshape({-1, hd}), k_norm, c).reshape_as(k)
+                    : qwen_rms_norm(
+                        k.reshape({-1, hd}).to(torch::kFloat32), k_norm, c)
+                        .reshape_as(k);
+            });
+        }
         if (v_norm.defined()) v = g_profiler.measure("full.v_norm", [&]() {
             return official_bf16
                 ? qwen_rms_norm_bf16(
@@ -13754,6 +14112,16 @@ struct FullBlock : Block {
         x = attn_pair[0].reshape({B, T, H});
         residual = x;
         xn = attn_pair[1].reshape({B, T, H});
+        if (!official_bf16) {
+            auto ffn_input = xn.reshape({B * T, H});
+            auto residual_flat = residual.reshape({B * T, H});
+            if (ffn.can_forward_fused_residual(ffn_input, residual_flat)) {
+                return g_profiler.measure("full.ffn_down_residual", [&]() {
+                    return ffn.forward_fused_residual(
+                        ffn_input, residual_flat).reshape({B, T, H});
+                });
+            }
+        }
         torch::Tensor ff;
         if (official_bf16) {
             auto ffn_input = xn.reshape({B * T, H});
@@ -14506,7 +14874,15 @@ struct LinearBlock : Block {
         x = attn_pair[0].reshape({B, T, H});
         residual = x;
         xn = attn_pair[1].reshape({B, T, H});
-        auto ff = ffn.forward(xn.reshape({B * T, H})).reshape({B, T, H});
+        auto ffn_input = xn.reshape({B * T, H});
+        auto residual_flat = residual.reshape({B * T, H});
+        if (ffn.can_forward_fused_residual(ffn_input, residual_flat)) {
+            return g_profiler.measure("linear.ffn_down_residual", [&]() {
+                return ffn.forward_fused_residual(
+                    ffn_input, residual_flat).reshape({B, T, H});
+            });
+        }
+        auto ff = ffn.forward(ffn_input).reshape({B, T, H});
         return g_profiler.measure("linear.ffn_residual", [&]() {
             auto rr = residual.reshape({-1, H});
             auto ff2 = ff.reshape({-1, H});
@@ -15488,10 +15864,13 @@ struct Model {
             auto local_pos = b->cpu_offloaded
                 ? cpu_pos
                 : tensor_to_cuda_device(pos, b->cuda_device);
-            auto local_cache_positions = b->cpu_offloaded
-                ? cpu_cache_positions
-                : tensor_to_cuda_device(
-                    cache_positions, b->cuda_device);
+            c10::optional<torch::Tensor> local_cache_positions = c10::nullopt;
+            if (c.is_minicpmo45()) {
+                local_cache_positions = b->cpu_offloaded
+                    ? cpu_cache_positions
+                    : tensor_to_cuda_device(
+                        cache_positions, b->cuda_device);
+            }
             c10::optional<torch::Tensor> local_seq_len = c10::nullopt;
             if (seq_len.has_value()) {
                 local_seq_len = b->cpu_offloaded
@@ -15516,9 +15895,7 @@ struct Model {
                     ? rope : device_ropes.at(b->cuda_device));
             x = b->forward(
                 x, local_pos, cache_pos, local_seq_len, c, active_rope,
-                c.is_minicpmo45()
-                    ? c10::optional<torch::Tensor>(local_cache_positions)
-                    : c10::nullopt,
+                local_cache_positions,
                 c.is_minicpmo45()
                     ? local_attention_mask : c10::nullopt);
             if (block_trace != nullptr) {
@@ -19005,6 +19382,7 @@ static int run_gemma_geglu_check(
               << " quant_ms=" << quant_ms << "\n";
     return 0;
 }
+
 
 static double nint_moe_weight_bytes(const NintMoeWeight & weight) {
     double bytes = static_cast<double>(weight.mixed_weight_bytes);

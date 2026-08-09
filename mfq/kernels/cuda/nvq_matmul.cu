@@ -39,6 +39,8 @@ constexpr int kNvq3Jsc512 = 12;
 constexpr int kNvq2JscL = 13;
 constexpr int kNvq2JscXL = 14;
 constexpr int kNvq3JscL = 15;
+constexpr int kNvq2JscXLGroupExec = 16;
+constexpr int kNvq3JscLGroupExec = 17;
 constexpr int kGroupSize = 24;
 constexpr int kChunksPerGroup = 6;  // six dp4a chunks of four values
 constexpr int kGroupsPerWarp = 5;   // 5 * 6 <= 32
@@ -48,6 +50,8 @@ constexpr int kJscBankMapOffset = 36;
 constexpr int kJscE8CodebookBytes = 256 * 8;
 constexpr int kJscE8Codebook1024Bytes = 1024 * 8;
 constexpr int kJscE8Codebook4096Bytes = 4096 * 8;
+constexpr int kJscE8PartialEntries = 384;
+constexpr int kJscE8PartialBytes = kJscE8PartialEntries * 8;
 constexpr int kJscD4CodebookBytes = 256 * 4;
 constexpr int kJscD4Codebook512Bytes = 512 * 4;
 constexpr int kJscD4Codebook1024Bytes = 1024 * 4;
@@ -93,24 +97,26 @@ __device__ __forceinline__ const int8_t * nepq_active_table(
 __host__ __device__ constexpr bool is_d4_format(int format) {
     return format == kNvq3 || format == kNvq3Jsc ||
            format == kNvq3Jsc2 || format == kNvq3Jsc512 ||
-           format == kNvq3JscL;
+           format == kNvq3JscL || format == kNvq3JscLGroupExec;
 }
 
 __host__ __device__ constexpr bool is_e8_format(int format) {
     return format == kNvq2 || format == kNvq2Exec ||
            format == kNvq2Jsc || format == kNvq2JscExec ||
-           format == kNvq2JscL || format == kNvq2JscXL;
+           format == kNvq2JscL || format == kNvq2JscXL ||
+           format == kNvq2JscXLGroupExec;
 }
 
 __host__ __device__ constexpr int format_index_bits(int format) {
-    return format == kNvq1L ? 11 :
-        (format == kNvq1S ? 9 :
-         (format == kNpq0L ? 7 :
-          (format == kNpq0S ? 6 :
-           (format == kNvq3Jsc512 ? 9 :
-            (format == kNvq2JscL || format == kNvq3JscL ? 10 :
-             (format == kNvq2JscXL ? 12 :
-              (format == kNvq2Exec || format == kNvq2JscExec ? 16 : 8)))))));
+    if (format == kNvq1L) return 11;
+    if (format == kNvq1S || format == kNvq3Jsc512) return 9;
+    if (format == kNpq0L) return 7;
+    if (format == kNpq0S) return 6;
+    if (format == kNvq2JscL || format == kNvq3JscL ||
+        format == kNvq3JscLGroupExec) return 10;
+    if (format == kNvq2JscXL || format == kNvq2JscXLGroupExec) return 12;
+    if (format == kNvq2Exec || format == kNvq2JscExec) return 16;
+    return 8;
 }
 
 template <int FORMAT>
@@ -132,6 +138,10 @@ __device__ __forceinline__ const int8_t * active_codebook(
         const uint32_t bank = bytes[kJscBankMapOffset + state];
         return metadata + kJscMetadataBytes + bank * kJscE8Codebook4096Bytes;
     }
+    if constexpr (FORMAT == kNvq2JscXLGroupExec) {
+        const uint32_t bank = state & 3u;
+        return metadata + kJscMetadataBytes + bank * kJscE8Codebook4096Bytes;
+    }
     if constexpr (FORMAT == kNvq3Jsc) {
         const uint8_t * bytes = reinterpret_cast<const uint8_t *>(metadata);
         const uint32_t bank = bytes[kJscBankMapOffset + state];
@@ -147,6 +157,11 @@ __device__ __forceinline__ const int8_t * active_codebook(
         return metadata + kJscMetadataBytes + bank * kJscD4Codebook512Bytes;
     }
     if constexpr (FORMAT == kNvq3JscL) {
+        const uint8_t * bytes = reinterpret_cast<const uint8_t *>(metadata);
+        const uint32_t bank = bytes[kJscBankMapOffset + state];
+        return metadata + kJscMetadataBytes + bank * kJscD4Codebook1024Bytes;
+    }
+    if constexpr (FORMAT == kNvq3JscLGroupExec) {
         const uint8_t * bytes = reinterpret_cast<const uint8_t *>(metadata);
         const uint32_t bank = bytes[kJscBankMapOffset + state];
         return metadata + kJscMetadataBytes + bank * kJscD4Codebook1024Bytes;
@@ -167,6 +182,36 @@ __device__ __forceinline__ uint32_t load_packed_bits(
 __device__ __forceinline__ uint32_t load_packed_4(
     const uint8_t * data, int64_t linear) {
     return (data[linear >> 1] >> ((linear & 1) * 4)) & 0x0fu;
+}
+
+__device__ __forceinline__ uint64_t load_group_exec64(
+    const uint8_t * data, int row, int group, int ng) {
+    return reinterpret_cast<const uint64_t *>(data)[
+        static_cast<int64_t>(row) * ng + group];
+}
+
+__device__ __forceinline__ void load_group_exec96_words(
+    const uint8_t * data,
+    int row,
+    int group,
+    int ng,
+    uint32_t (&words)[3]) {
+    const uint32_t * source = reinterpret_cast<const uint32_t *>(data) +
+        (static_cast<int64_t>(row) * ng + group) * 3;
+    words[0] = source[0];
+    words[1] = source[1];
+    words[2] = source[2];
+}
+
+__device__ __forceinline__ uint32_t load_group_exec96_bits(
+    const uint8_t * data, int row, int group, int ng, int bit, int bits) {
+    uint32_t words[3];
+    load_group_exec96_words(data, row, group, ng, words);
+    const int word = bit >> 5;
+    const int shift = bit & 31;
+    uint32_t value = words[word] >> shift;
+    if (shift + bits > 32) value |= words[word + 1] << (32 - shift);
+    return value & ((1u << bits) - 1u);
 }
 
 __device__ __forceinline__ int load_i8x4(const int8_t * p) {
@@ -265,7 +310,30 @@ __device__ __forceinline__ int decode_chunk4(
     int sign_mode,
     uint32_t state) {
     const int vector8 = group * 3 + (chunk >> 1);
-    if constexpr (
+    if constexpr (FORMAT == kNvq2JscXLGroupExec) {
+        if (vector8 >= nvec || vector8 >= nsign) return 0;
+        const int local = vector8 - group * 3;
+        const uint64_t metadata = load_group_exec64(indices, row, group, ng);
+        const uint32_t segment_metadata =
+            (metadata >> (local * 20)) & 0xfffffu;
+        const uint32_t index = segment_metadata & 0xfffu;
+        const uint32_t mask8 = segment_metadata >> 12;
+        const int8_t * bank = active_codebook<FORMAT>(codebook, state);
+        return apply_sign4(
+            load_i8x4(bank + index * 8 + (chunk & 1) * 4),
+            mask8, (chunk & 1) * 4);
+    } else if constexpr (FORMAT == kNvq3JscLGroupExec) {
+        const int vector4 = group * 6 + chunk;
+        if (vector4 >= nvec || vector8 >= nsign) return 0;
+        const uint32_t index = load_group_exec96_bits(
+            indices, row, group, ng, chunk * 10, 10);
+        const int local = vector8 - group * 3;
+        const uint32_t mask8 = load_group_exec96_bits(
+            indices, row, group, ng, 60 + local * 8, 8);
+        const int8_t * bank = active_codebook<FORMAT>(codebook, state);
+        return apply_sign4(
+            load_i8x4(bank + index * 4), mask8, (chunk & 1) * 4);
+    } else if constexpr (
         FORMAT == kNvq3 || FORMAT == kNvq3Jsc ||
         FORMAT == kNvq3Jsc2 || FORMAT == kNvq3Jsc512 ||
         FORMAT == kNvq3JscL) {
@@ -390,14 +458,15 @@ __device__ __forceinline__ float format_scale(
     }
     if constexpr (
         FORMAT == kNvq3Jsc || FORMAT == kNvq3Jsc512 ||
-        FORMAT == kNvq3JscL) {
+        FORMAT == kNvq3JscL || FORMAT == kNvq3JscLGroupExec) {
         const uint8_t * bytes = reinterpret_cast<const uint8_t *>(codebook);
         const __half * lut = reinterpret_cast<const __half *>(bytes + kJscLutOffset);
         return anchor * __half2float(lut[sub_scale]);
     }
     if constexpr (
         FORMAT == kNvq2Jsc || FORMAT == kNvq2JscExec ||
-        FORMAT == kNvq2JscL || FORMAT == kNvq2JscXL) {
+        FORMAT == kNvq2JscL || FORMAT == kNvq2JscXL ||
+        FORMAT == kNvq2JscXLGroupExec) {
         const uint8_t * bytes = reinterpret_cast<const uint8_t *>(codebook);
         const __half * lut = reinterpret_cast<const __half *>(bytes + kJscLutOffset);
         return anchor * __half2float(lut[sub_scale]);
@@ -480,6 +549,7 @@ __global__ void nvq_quantize_x_gs24_kernel(
     const int m = blockIdx.x;
     const int group = blockIdx.y;
     const int lane = threadIdx.x;
+    if (group >= ng) return;
     const int k = group * kGroupSize + lane;
     const bool valid = lane < kGroupSize && k < K;
     const float value = valid ? __half2float(x[static_cast<int64_t>(m) * K + k]) : 0.0f;
@@ -655,6 +725,7 @@ struct NvqDeviceWeight {
     int64_t sub_scale_nbytes;
     const float * neuron_scale;
     const int8_t * codebook;
+    int codebook_nbytes;
     int N;
     int ng;
     int nvec;
@@ -678,7 +749,38 @@ __device__ __forceinline__ NvqVec8Values<FORMAT> load_nvq_vec8(
     int nsign,
     int sign_mode,
     uint32_t state) {
-    if constexpr (
+    if constexpr (FORMAT == kNvq2JscXLGroupExec) {
+        if (segment >= nsign) return {make_int2(0, 0), 0, false};
+        const int local = segment - group * 3;
+        const uint64_t metadata = load_group_exec64(indices, row, group, ng);
+        const uint32_t segment_metadata =
+            (metadata >> (local * 20)) & 0xfffffu;
+        const uint32_t index = segment_metadata & 0xfffu;
+        const uint32_t mask8 = segment_metadata >> 12;
+        const int8_t * bank = active_codebook<FORMAT>(codebook, state);
+        return {apply_sign8(
+            reinterpret_cast<const int2 *>(bank)[index], mask8), 0, true};
+    } else if constexpr (FORMAT == kNvq3JscLGroupExec) {
+        const int vector4 = segment * 2;
+        if (vector4 >= nvec || segment >= nsign) {
+            return {make_int2(0, 0), 0, false};
+        }
+        const int local = segment - group * 3;
+        const uint32_t index0 = load_group_exec96_bits(
+            indices, row, group, ng, local * 20, 10);
+        const uint32_t index1 = vector4 + 1 < nvec
+            ? load_group_exec96_bits(
+                indices, row, group, ng, local * 20 + 10, 10)
+            : 0;
+        const uint32_t mask8 = load_group_exec96_bits(
+            indices, row, group, ng, 60 + local * 8, 8);
+        const int8_t * bank = active_codebook<FORMAT>(codebook, state);
+        return {apply_sign8(
+            make_int2(
+                reinterpret_cast<const int *>(bank)[index0],
+                reinterpret_cast<const int *>(bank)[index1]),
+            mask8), 0, true};
+    } else if constexpr (
         FORMAT == kNvq3 || FORMAT == kNvq3Jsc ||
         FORMAT == kNvq3Jsc2 || FORMAT == kNvq3Jsc512 ||
         FORMAT == kNvq3JscL) {
@@ -1081,7 +1183,7 @@ __global__ void __launch_bounds__(NWARPS * 32, 1) nvq_gemv_m1_vec8_kernel(
     [[maybe_unused]] const NvqDeviceWeight fast_weight{
         indices, indices_nbytes, aux, aux_nbytes,
         sub_scale, sub_scale_nbytes, neuron_scale, codebook,
-        N, ng, nvec, nsign, 4, sign_mode};
+        0, N, ng, nvec, nsign, 4, sign_mode};
     [[maybe_unused]] const int64_t fast_index_row = static_cast<int64_t>(row) * nvec;
     [[maybe_unused]] const int64_t fast_sign_row = static_cast<int64_t>(row) * nsign;
     [[maybe_unused]] const int64_t fast_sub_row = static_cast<int64_t>(row) * ng;
@@ -1212,6 +1314,805 @@ __global__ void __launch_bounds__(NWARPS * 32, 1) nvq3j2_gemv_m1_group_kernel(
             acc += __shfl_xor_sync(0xffffffff, acc, offset);
         }
         if (lane == 0) output[row] = __float2half(acc);
+    }
+}
+
+__device__ __forceinline__ uint32_t extract_group_exec96_bits(
+    const uint32_t (&words)[3], int bit, int bits) {
+    const int word = bit >> 5;
+    const int shift = bit & 31;
+    uint32_t value = words[word] >> shift;
+    if (shift + bits > 32) value |= words[word + 1] << (32 - shift);
+    return value & ((1u << bits) - 1u);
+}
+
+__device__ __forceinline__ int aligned_group_d4_dot_words(
+    const NvqDeviceWeight & weight,
+    int group,
+    const int8_t * qx,
+    const uint32_t (&words)[3],
+    uint32_t & state) {
+    state = extract_group_exec96_bits(words, 84, 4);
+    const int8_t * bank = active_codebook<kNvq3JscLGroupExec>(
+        weight.codebook, state);
+    const uint32_t index00 = extract_group_exec96_bits(words, 0, 10);
+    const uint32_t index01 = extract_group_exec96_bits(words, 10, 10);
+    const uint32_t index10 = extract_group_exec96_bits(words, 20, 10);
+    const uint32_t index11 = extract_group_exec96_bits(words, 30, 10);
+    const uint32_t index20 = extract_group_exec96_bits(words, 40, 10);
+    const uint32_t index21 = extract_group_exec96_bits(words, 50, 10);
+    const uint32_t mask0 = extract_group_exec96_bits(words, 60, 8);
+    const uint32_t mask1 = extract_group_exec96_bits(words, 68, 8);
+    const uint32_t mask2 = extract_group_exec96_bits(words, 76, 8);
+    const int2 values0 = apply_sign8(
+        make_int2(
+            reinterpret_cast<const int *>(bank)[index00],
+            reinterpret_cast<const int *>(bank)[index01]),
+        mask0);
+    const int2 values1 = apply_sign8(
+        make_int2(
+            reinterpret_cast<const int *>(bank)[index10],
+            reinterpret_cast<const int *>(bank)[index11]),
+        mask1);
+    const int2 values2 = apply_sign8(
+        make_int2(
+            reinterpret_cast<const int *>(bank)[index20],
+            reinterpret_cast<const int *>(bank)[index21]),
+        mask2);
+    const int8_t * activation = qx + group * kGroupSize;
+    const int2 x0 = *reinterpret_cast<const int2 *>(activation);
+    const int2 x1 = *reinterpret_cast<const int2 *>(activation + 8);
+    const int2 x2 = *reinterpret_cast<const int2 *>(activation + 16);
+    const int dot0 = __dp4a(values0.y, x0.y, __dp4a(values0.x, x0.x, 0));
+    const int dot1 = __dp4a(values1.y, x1.y, __dp4a(values1.x, x1.x, 0));
+    const int dot2 = __dp4a(values2.y, x2.y, __dp4a(values2.x, x2.x, 0));
+    return dot0 + dot1 + dot2;
+}
+
+template <int FORMAT>
+__device__ __forceinline__ int aligned_group_dot(
+    const NvqDeviceWeight & weight,
+    int row,
+    int group,
+    const int8_t * qx,
+    uint32_t & state) {
+    static_assert(
+        FORMAT == kNvq2JscXLGroupExec ||
+        FORMAT == kNvq3JscLGroupExec);
+    if constexpr (FORMAT == kNvq2JscXLGroupExec) {
+        const uint64_t metadata = load_group_exec64(
+            weight.indices, row, group, weight.ng);
+        state = static_cast<uint32_t>(metadata >> 60);
+        const int8_t * bank = active_codebook<FORMAT>(weight.codebook, state);
+        int dot = 0;
+#pragma unroll
+        for (int local = 0; local < 3; ++local) {
+            const int segment = group * 3 + local;
+            if (segment >= weight.nsign) continue;
+            const uint32_t segment_metadata =
+                (metadata >> (local * 20)) & 0xfffffu;
+            const uint32_t index = segment_metadata & 0xfffu;
+            const uint32_t mask8 = segment_metadata >> 12;
+            const int2 values = apply_sign8(
+                reinterpret_cast<const int2 *>(bank)[index], mask8);
+            const int2 x = *reinterpret_cast<const int2 *>(
+                qx + group * kGroupSize + local * 8);
+            dot = __dp4a(values.y, x.y, __dp4a(values.x, x.x, dot));
+        }
+        return dot;
+    } else {
+        uint32_t words[3];
+        load_group_exec96_words(
+            weight.indices, row, group, weight.ng, words);
+        return aligned_group_d4_dot_words(weight, group, qx, words, state);
+    }
+}
+
+template <int FORMAT>
+__device__ __forceinline__ void aligned_group_pair_dot(
+    const NvqDeviceWeight & gate,
+    const NvqDeviceWeight & up,
+    int row,
+    int group,
+    const int8_t * qx,
+    uint32_t & gate_state,
+    uint32_t & up_state,
+    int & gate_dot,
+    int & up_dot) {
+    static_assert(
+        FORMAT == kNvq2JscXLGroupExec ||
+        FORMAT == kNvq3JscLGroupExec);
+    gate_dot = 0;
+    up_dot = 0;
+    if constexpr (FORMAT == kNvq2JscXLGroupExec) {
+        const uint64_t gate_metadata = load_group_exec64(
+            gate.indices, row, group, gate.ng);
+        const uint64_t up_metadata = load_group_exec64(
+            up.indices, row, group, up.ng);
+        gate_state = static_cast<uint32_t>(gate_metadata >> 60);
+        up_state = static_cast<uint32_t>(up_metadata >> 60);
+        const int8_t * gate_bank = active_codebook<FORMAT>(
+            gate.codebook, gate_state);
+        const int8_t * up_bank = active_codebook<FORMAT>(
+            up.codebook, up_state);
+#pragma unroll
+        for (int local = 0; local < 3; ++local) {
+            const int segment = group * 3 + local;
+            if (segment >= gate.nsign) continue;
+            const uint32_t gate_segment =
+                (gate_metadata >> (local * 20)) & 0xfffffu;
+            const uint32_t up_segment =
+                (up_metadata >> (local * 20)) & 0xfffffu;
+            const uint32_t gate_index = gate_segment & 0xfffu;
+            const uint32_t up_index = up_segment & 0xfffu;
+            const uint32_t gate_mask = gate_segment >> 12;
+            const uint32_t up_mask = up_segment >> 12;
+            const int2 gate_values = apply_sign8(
+                reinterpret_cast<const int2 *>(gate_bank)[gate_index],
+                gate_mask);
+            const int2 up_values = apply_sign8(
+                reinterpret_cast<const int2 *>(up_bank)[up_index],
+                up_mask);
+            const int2 x = *reinterpret_cast<const int2 *>(
+                qx + group * kGroupSize + local * 8);
+            gate_dot = __dp4a(
+                gate_values.y, x.y,
+                __dp4a(gate_values.x, x.x, gate_dot));
+            up_dot = __dp4a(
+                up_values.y, x.y,
+                __dp4a(up_values.x, x.x, up_dot));
+        }
+    } else {
+        uint32_t gate_words[3];
+        uint32_t up_words[3];
+        load_group_exec96_words(
+            gate.indices, row, group, gate.ng, gate_words);
+        load_group_exec96_words(
+            up.indices, row, group, up.ng, up_words);
+        gate_state = extract_group_exec96_bits(gate_words, 84, 4);
+        up_state = extract_group_exec96_bits(up_words, 84, 4);
+        const int8_t * gate_bank = active_codebook<FORMAT>(
+            gate.codebook, gate_state);
+        const int8_t * up_bank = active_codebook<FORMAT>(
+            up.codebook, up_state);
+#pragma unroll
+        for (int local = 0; local < 3; ++local) {
+            const int segment = group * 3 + local;
+            if (segment >= gate.nsign) continue;
+            const int vector4 = segment * 2;
+            const uint32_t gate_index0 = extract_group_exec96_bits(
+                gate_words, local * 20, 10);
+            const uint32_t gate_index1 = vector4 + 1 < gate.nvec
+                ? extract_group_exec96_bits(
+                    gate_words, local * 20 + 10, 10)
+                : 0;
+            const uint32_t up_index0 = extract_group_exec96_bits(
+                up_words, local * 20, 10);
+            const uint32_t up_index1 = vector4 + 1 < up.nvec
+                ? extract_group_exec96_bits(
+                    up_words, local * 20 + 10, 10)
+                : 0;
+            const uint32_t gate_mask = extract_group_exec96_bits(
+                gate_words, 60 + local * 8, 8);
+            const uint32_t up_mask = extract_group_exec96_bits(
+                up_words, 60 + local * 8, 8);
+            const int2 gate_values = apply_sign8(
+                make_int2(
+                    reinterpret_cast<const int *>(gate_bank)[gate_index0],
+                    reinterpret_cast<const int *>(gate_bank)[gate_index1]),
+                gate_mask);
+            const int2 up_values = apply_sign8(
+                make_int2(
+                    reinterpret_cast<const int *>(up_bank)[up_index0],
+                    reinterpret_cast<const int *>(up_bank)[up_index1]),
+                up_mask);
+            const int2 x = *reinterpret_cast<const int2 *>(
+                qx + group * kGroupSize + local * 8);
+            gate_dot = __dp4a(
+                gate_values.y, x.y,
+                __dp4a(gate_values.x, x.x, gate_dot));
+            up_dot = __dp4a(
+                up_values.y, x.y,
+                __dp4a(up_values.x, x.x, up_dot));
+        }
+    }
+}
+
+template <
+    int FORMAT, int NWARPS, int ROWS_PER_BLOCK = 1,
+    bool ADD_RESIDUAL = false>
+__global__ void __launch_bounds__(NWARPS * ROWS_PER_BLOCK * 32, 1)
+aligned_group_gemv_m1_kernel(
+    NvqDeviceWeight weight,
+    const int8_t * qx,
+    const float * xscale,
+    __half * output,
+    const __half * residual) {
+    const int row_slot = threadIdx.y / NWARPS;
+    const int warp = threadIdx.y - row_slot * NWARPS;
+    const int row = blockIdx.x * ROWS_PER_BLOCK + row_slot;
+    const int lane = threadIdx.x;
+    const bool valid = row < weight.N;
+
+    const float anchor = valid ? weight.neuron_scale[row] : 0.0f;
+    float acc = 0.0f;
+    if (valid) {
+        for (int group = warp * 32 + lane;
+             group < weight.ng;
+             group += NWARPS * 32) {
+            uint32_t state = 0;
+            const int dot = aligned_group_dot<FORMAT>(
+                weight, row, group, qx, state);
+            acc = fmaf(
+                format_scale<FORMAT>(anchor, state, weight.codebook) *
+                    xscale[group],
+                static_cast<float>(dot), acc);
+        }
+    }
+
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffff, acc, offset);
+    }
+    __shared__ float partial[ROWS_PER_BLOCK][NWARPS];
+    if (lane == 0) partial[row_slot][warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        acc = lane < NWARPS ? partial[row_slot][lane] : 0.0f;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            acc += __shfl_xor_sync(0xffffffff, acc, offset);
+        }
+        if (lane == 0 && valid) {
+            const __half projected = __float2half(acc);
+            if constexpr (ADD_RESIDUAL) {
+                output[row] = __hadd(residual[row], projected);
+            } else {
+                output[row] = projected;
+            }
+        }
+    }
+}
+
+template <int FORMAT, int NWARPS, int ROWS_PER_BLOCK = 1>
+__global__ void __launch_bounds__(NWARPS * ROWS_PER_BLOCK * 32, 1)
+aligned_group_multi2_m1_kernel(
+    NvqDeviceWeight first,
+    NvqDeviceWeight second,
+    const int8_t * qx,
+    const float * xscale,
+    __half * output) {
+    const int row_slot = threadIdx.y / NWARPS;
+    const int warp = threadIdx.y - row_slot * NWARPS;
+    const int combined_row = blockIdx.x * ROWS_PER_BLOCK + row_slot;
+    const int total_rows = first.N + second.N;
+    const bool valid = combined_row < total_rows;
+    const bool use_second = combined_row >= first.N;
+    const NvqDeviceWeight weight = use_second ? second : first;
+    const int row = use_second ? combined_row - first.N : combined_row;
+    const int lane = threadIdx.x;
+
+    const float anchor = valid ? weight.neuron_scale[row] : 0.0f;
+    float acc = 0.0f;
+    if (valid) {
+        for (int group = warp * 32 + lane;
+             group < weight.ng;
+             group += NWARPS * 32) {
+            uint32_t state = 0;
+            const int dot = aligned_group_dot<FORMAT>(weight, row, group, qx, state);
+            acc = fmaf(
+                format_scale<FORMAT>(anchor, state, weight.codebook) * xscale[group],
+                static_cast<float>(dot), acc);
+        }
+    }
+
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffff, acc, offset);
+    }
+    __shared__ float partial[ROWS_PER_BLOCK][NWARPS];
+    if (lane == 0) partial[row_slot][warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        acc = lane < NWARPS ? partial[row_slot][lane] : 0.0f;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            acc += __shfl_xor_sync(0xffffffff, acc, offset);
+        }
+        if (lane == 0 && valid) output[combined_row] = __float2half(acc);
+    }
+}
+
+template <int FORMAT>
+__device__ __forceinline__ int aligned_group_dot_preloaded(
+    const NvqDeviceWeight & weight,
+    const int8_t * codebook,
+    int row,
+    int group,
+    const int2 & x0,
+    const int2 & x1,
+    const int2 & x2,
+    uint32_t & state) {
+    static_assert(
+        FORMAT == kNvq2JscXLGroupExec ||
+        FORMAT == kNvq3JscLGroupExec);
+    if constexpr (FORMAT == kNvq2JscXLGroupExec) {
+        const uint64_t metadata = load_group_exec64(
+            weight.indices, row, group, weight.ng);
+        state = static_cast<uint32_t>(metadata >> 60);
+        const int8_t * bank = active_codebook<FORMAT>(codebook, state);
+        const uint32_t segment0 = static_cast<uint32_t>(metadata) & 0xfffffu;
+        const uint32_t segment1 = static_cast<uint32_t>(metadata >> 20) & 0xfffffu;
+        const uint32_t segment2 = static_cast<uint32_t>(metadata >> 40) & 0xfffffu;
+        const int2 values0 = apply_sign8(
+            reinterpret_cast<const int2 *>(bank)[segment0 & 0xfffu],
+            segment0 >> 12);
+        const int2 values1 = apply_sign8(
+            reinterpret_cast<const int2 *>(bank)[segment1 & 0xfffu],
+            segment1 >> 12);
+        const int2 values2 = apply_sign8(
+            reinterpret_cast<const int2 *>(bank)[segment2 & 0xfffu],
+            segment2 >> 12);
+        int dot = __dp4a(values0.y, x0.y, __dp4a(values0.x, x0.x, 0));
+        dot = __dp4a(values1.y, x1.y, __dp4a(values1.x, x1.x, dot));
+        return __dp4a(values2.y, x2.y, __dp4a(values2.x, x2.x, dot));
+    } else {
+        uint32_t words[3];
+        load_group_exec96_words(
+            weight.indices, row, group, weight.ng, words);
+        state = extract_group_exec96_bits(words, 84, 4);
+        const int8_t * bank = active_codebook<FORMAT>(codebook, state);
+        const uint32_t index00 = extract_group_exec96_bits(words, 0, 10);
+        const uint32_t index01 = extract_group_exec96_bits(words, 10, 10);
+        const uint32_t index10 = extract_group_exec96_bits(words, 20, 10);
+        const uint32_t index11 = extract_group_exec96_bits(words, 30, 10);
+        const uint32_t index20 = extract_group_exec96_bits(words, 40, 10);
+        const uint32_t index21 = extract_group_exec96_bits(words, 50, 10);
+        const int2 values0 = apply_sign8(
+            make_int2(
+                reinterpret_cast<const int *>(bank)[index00],
+                reinterpret_cast<const int *>(bank)[index01]),
+            extract_group_exec96_bits(words, 60, 8));
+        const int2 values1 = apply_sign8(
+            make_int2(
+                reinterpret_cast<const int *>(bank)[index10],
+                reinterpret_cast<const int *>(bank)[index11]),
+            extract_group_exec96_bits(words, 68, 8));
+        const int2 values2 = apply_sign8(
+            make_int2(
+                reinterpret_cast<const int *>(bank)[index20],
+                reinterpret_cast<const int *>(bank)[index21]),
+            extract_group_exec96_bits(words, 76, 8));
+        const int dot0 = __dp4a(values0.y, x0.y, __dp4a(values0.x, x0.x, 0));
+        const int dot1 = __dp4a(values1.y, x1.y, __dp4a(values1.x, x1.x, 0));
+        const int dot2 = __dp4a(values2.y, x2.y, __dp4a(values2.x, x2.x, 0));
+        return dot0 + dot1 + dot2;
+    }
+}
+
+__device__ __forceinline__ int aligned_group_dot_preloaded_e8_stage3_metadata(
+    const int8_t * global_codebook,
+    const int8_t * shared_codebook,
+    bool table_is_staged,
+    uint64_t metadata,
+    const int2 & x0,
+    const int2 & x1,
+    const int2 & x2,
+    uint32_t & state) {
+    state = static_cast<uint32_t>(metadata >> 60);
+    const uint32_t bank_id = state & 3u;
+    const bool use_staged_bank = table_is_staged && bank_id < 3;
+    const int8_t * bank = use_staged_bank
+        ? shared_codebook + bank_id * kJscE8Codebook4096Bytes
+        : global_codebook + kJscMetadataBytes +
+            bank_id * kJscE8Codebook4096Bytes;
+    const uint32_t segment0 = static_cast<uint32_t>(metadata) & 0xfffffu;
+    const uint32_t segment1 = static_cast<uint32_t>(metadata >> 20) & 0xfffffu;
+    const uint32_t segment2 = static_cast<uint32_t>(metadata >> 40) & 0xfffffu;
+    const uint32_t index0 = segment0 & 0xfffu;
+    const uint32_t index1 = segment1 & 0xfffu;
+    const uint32_t index2 = segment2 & 0xfffu;
+    int2 raw0;
+    int2 raw1;
+    int2 raw2;
+    if (use_staged_bank) {
+        const int * plane = reinterpret_cast<const int *>(bank);
+        constexpr int plane_entries = 4096;
+        raw0 = make_int2(plane[index0], plane[plane_entries + index0]);
+        raw1 = make_int2(plane[index1], plane[plane_entries + index1]);
+        raw2 = make_int2(plane[index2], plane[plane_entries + index2]);
+    } else if (table_is_staged && bank_id == 3) {
+        const int * partial = reinterpret_cast<const int *>(
+            shared_codebook + 3 * kJscE8Codebook4096Bytes);
+        const int2 * global = reinterpret_cast<const int2 *>(bank);
+        raw0 = index0 < kJscE8PartialEntries
+            ? make_int2(
+                partial[index0], partial[kJscE8PartialEntries + index0])
+            : global[index0];
+        raw1 = index1 < kJscE8PartialEntries
+            ? make_int2(
+                partial[index1], partial[kJscE8PartialEntries + index1])
+            : global[index1];
+        raw2 = index2 < kJscE8PartialEntries
+            ? make_int2(
+                partial[index2], partial[kJscE8PartialEntries + index2])
+            : global[index2];
+    } else {
+        raw0 = reinterpret_cast<const int2 *>(bank)[index0];
+        raw1 = reinterpret_cast<const int2 *>(bank)[index1];
+        raw2 = reinterpret_cast<const int2 *>(bank)[index2];
+    }
+    const int2 values0 = apply_sign8(raw0, segment0 >> 12);
+    const int2 values1 = apply_sign8(raw1, segment1 >> 12);
+    const int2 values2 = apply_sign8(raw2, segment2 >> 12);
+    int dot = __dp4a(values0.y, x0.y, __dp4a(values0.x, x0.x, 0));
+    dot = __dp4a(values1.y, x1.y, __dp4a(values1.x, x1.x, dot));
+    return __dp4a(values2.y, x2.y, __dp4a(values2.x, x2.x, dot));
+}
+
+__device__ __forceinline__ int aligned_group_dot_preloaded_e8_stage3(
+    const NvqDeviceWeight & weight,
+    const int8_t * global_codebook,
+    const int8_t * shared_codebook,
+    bool table_is_staged,
+    int row,
+    int group,
+    const int2 & x0,
+    const int2 & x1,
+    const int2 & x2,
+    uint32_t & state) {
+    const uint64_t metadata = load_group_exec64(
+        weight.indices, row, group, weight.ng);
+    return aligned_group_dot_preloaded_e8_stage3_metadata(
+        global_codebook, shared_codebook, table_is_staged, metadata,
+        x0, x1, x2, state);
+}
+
+// TPQ5-style decode geometry: every warp owns several output rows and reuses
+// the same quantized activation values across those rows.  The compact D4
+// tables fit in shared memory and are staged once per CTA; the 128 KiB E8
+// tables remain in the read-only cache path.
+template <
+    int FORMAT, int NWARPS, int ROWS_PER_WARP, bool MULTI2,
+    bool STAGE_E8_THREE_BANKS = false, bool ADD_RESIDUAL = false>
+__global__ void __launch_bounds__(NWARPS * 32, 1)
+aligned_group_row_tiled_m1_kernel(
+    NvqDeviceWeight first,
+    NvqDeviceWeight second,
+    const int8_t * qx,
+    const float * xscale,
+    __half * output,
+    const __half * residual) {
+    static_assert(!ADD_RESIDUAL || !MULTI2);
+    static_assert(NWARPS == 16 || NWARPS == 32);
+    static_assert(
+        ROWS_PER_WARP == 1 || ROWS_PER_WARP == 2 || ROWS_PER_WARP == 4);
+    static_assert(
+        !STAGE_E8_THREE_BANKS ||
+        (FORMAT == kNvq2JscXLGroupExec && NWARPS == 32 &&
+         (ROWS_PER_WARP == 1 || ROWS_PER_WARP == 4)));
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int linear_thread = warp * 32 + lane;
+    const int block_threads = NWARPS * 32;
+    const int k_pad = first.ng * kGroupSize;
+    const int scale_offset = (k_pad + 3) & ~3;
+    const int codebook_offset = scale_offset + first.ng * sizeof(float);
+    extern __shared__ uint8_t shared_storage[];
+    int8_t * shared_qx = reinterpret_cast<int8_t *>(shared_storage);
+    float * shared_xscale = reinterpret_cast<float *>(
+        shared_storage + scale_offset);
+
+    if constexpr (!STAGE_E8_THREE_BANKS) {
+        for (int item = linear_thread; item < k_pad; item += block_threads) {
+            shared_qx[item] = qx[item];
+        }
+        for (int item = linear_thread; item < first.ng; item += block_threads) {
+            shared_xscale[item] = xscale[item];
+        }
+    }
+
+    const int8_t * first_codebook = first.codebook;
+    const int8_t * second_codebook = second.codebook;
+    const int rows_per_block = NWARPS * ROWS_PER_WARP;
+    const int block_row_base = blockIdx.x * rows_per_block;
+    const bool stage_second_table = MULTI2 && block_row_base >= first.N;
+    const int8_t * staged_global_codebook = stage_second_table
+        ? second.codebook
+        : first.codebook;
+    constexpr int stage_min_rows = ROWS_PER_WARP == 1 ? 4096 : 12288;
+    const bool stage_active_table = STAGE_E8_THREE_BANKS &&
+        (stage_second_table
+            ? second.N >= stage_min_rows
+            : first.N >= stage_min_rows);
+    const int8_t * shared_e8_codebook = nullptr;
+    if constexpr (STAGE_E8_THREE_BANKS) {
+        int8_t * staged = reinterpret_cast<int8_t *>(shared_storage);
+        constexpr int entries_per_bank = 4096;
+        constexpr int staged_entries = 3 * entries_per_bank;
+        if (stage_active_table) {
+            for (int item = linear_thread;
+                 item < staged_entries;
+                 item += block_threads) {
+                const int bank = item / entries_per_bank;
+                const int entry = item - bank * entries_per_bank;
+                const int2 value = reinterpret_cast<const int2 *>(
+                    staged_global_codebook + kJscMetadataBytes +
+                    bank * kJscE8Codebook4096Bytes)[entry];
+                int * destination = reinterpret_cast<int *>(
+                    staged + bank * kJscE8Codebook4096Bytes);
+                destination[entry] = value.x;
+                destination[entries_per_bank + entry] = value.y;
+            }
+            int * partial = reinterpret_cast<int *>(
+                staged + 3 * kJscE8Codebook4096Bytes);
+            for (int entry = linear_thread;
+                 entry < kJscE8PartialEntries;
+                 entry += block_threads) {
+                const int2 value = reinterpret_cast<const int2 *>(
+                    staged_global_codebook + kJscMetadataBytes +
+                    3 * kJscE8Codebook4096Bytes)[entry];
+                partial[entry] = value.x;
+                partial[kJscE8PartialEntries + entry] = value.y;
+            }
+        }
+        shared_e8_codebook = staged;
+    }
+    if constexpr (FORMAT == kNvq3JscLGroupExec) {
+        int8_t * shared_first_codebook = reinterpret_cast<int8_t *>(
+            shared_storage + codebook_offset);
+        for (int item = linear_thread;
+             item < first.codebook_nbytes;
+             item += block_threads) {
+            shared_first_codebook[item] = first.codebook[item];
+        }
+        first_codebook = shared_first_codebook;
+        if constexpr (MULTI2) {
+            int8_t * shared_second_codebook =
+                shared_first_codebook + first.codebook_nbytes;
+            for (int item = linear_thread;
+                 item < second.codebook_nbytes;
+                 item += block_threads) {
+                shared_second_codebook[item] = second.codebook[item];
+            }
+            second_codebook = shared_second_codebook;
+        }
+    }
+    __syncthreads();
+
+    const int total_rows = MULTI2 ? first.N + second.N : first.N;
+    const int row_base = blockIdx.x * rows_per_block + warp;
+    float accumulators[ROWS_PER_WARP] = {};
+    float anchors[ROWS_PER_WARP] = {};
+#pragma unroll
+    for (int item = 0; item < ROWS_PER_WARP; ++item) {
+        const int combined_row = row_base + item * NWARPS;
+        if (combined_row < total_rows) {
+            if constexpr (MULTI2) {
+                anchors[item] = combined_row < first.N
+                    ? first.neuron_scale[combined_row]
+                    : second.neuron_scale[combined_row - first.N];
+            } else {
+                anchors[item] = first.neuron_scale[combined_row];
+            }
+        }
+    }
+
+    for (int group = lane; group < first.ng; group += 32) {
+        const int8_t * activation =
+            (STAGE_E8_THREE_BANKS ? qx : shared_qx) + group * kGroupSize;
+        const int2 x0 = *reinterpret_cast<const int2 *>(activation);
+        const int2 x1 = *reinterpret_cast<const int2 *>(activation + 8);
+        const int2 x2 = *reinterpret_cast<const int2 *>(activation + 16);
+        const float activation_scale = STAGE_E8_THREE_BANKS
+            ? xscale[group]
+            : shared_xscale[group];
+        if constexpr (STAGE_E8_THREE_BANKS) {
+            {
+                uint64_t metadata[ROWS_PER_WARP] = {};
+                int rows[ROWS_PER_WARP] = {};
+                bool use_second[ROWS_PER_WARP] = {};
+                bool valid[ROWS_PER_WARP] = {};
+#pragma unroll
+                for (int item = 0; item < ROWS_PER_WARP; ++item) {
+                    const int combined_row = row_base + item * NWARPS;
+                    valid[item] = combined_row < total_rows;
+                    use_second[item] = combined_row >= first.N;
+                    rows[item] = use_second[item]
+                        ? combined_row - first.N
+                        : combined_row;
+                    if (valid[item]) {
+                        const uint8_t * indices = use_second[item]
+                            ? second.indices
+                            : first.indices;
+                        metadata[item] = load_group_exec64(
+                            indices, rows[item], group, first.ng);
+                    }
+                }
+#pragma unroll
+                for (int item = 0; item < ROWS_PER_WARP; ++item) {
+                    if (!valid[item]) continue;
+                    const int8_t * active_table = use_second[item]
+                        ? second_codebook
+                        : first_codebook;
+                    uint32_t state = 0;
+                    const int dot =
+                        aligned_group_dot_preloaded_e8_stage3_metadata(
+                            active_table, shared_e8_codebook,
+                            stage_active_table &&
+                                active_table == staged_global_codebook,
+                            metadata[item], x0, x1, x2, state);
+                    accumulators[item] = fmaf(
+                        format_scale<FORMAT>(
+                            anchors[item], state, active_table) *
+                            activation_scale,
+                        static_cast<float>(dot), accumulators[item]);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int item = 0; item < ROWS_PER_WARP; ++item) {
+                const int combined_row = row_base + item * NWARPS;
+                if (combined_row >= total_rows) continue;
+                uint32_t state = 0;
+                int dot = 0;
+                const int8_t * active_table = first_codebook;
+                if constexpr (MULTI2) {
+                    if (combined_row < first.N) {
+                        if constexpr (STAGE_E8_THREE_BANKS) {
+                            dot = aligned_group_dot_preloaded_e8_stage3(
+                                first, first_codebook, shared_e8_codebook,
+                                stage_active_table &&
+                                    first_codebook == staged_global_codebook,
+                                combined_row, group, x0, x1, x2, state);
+                        } else {
+                            dot = aligned_group_dot_preloaded<FORMAT>(
+                                first, first_codebook, combined_row, group,
+                                x0, x1, x2, state);
+                        }
+                    } else {
+                        const int row = combined_row - first.N;
+                        active_table = second_codebook;
+                        if constexpr (STAGE_E8_THREE_BANKS) {
+                            dot = aligned_group_dot_preloaded_e8_stage3(
+                                second, second_codebook, shared_e8_codebook,
+                                stage_active_table &&
+                                    second_codebook == staged_global_codebook,
+                                row, group, x0, x1, x2, state);
+                        } else {
+                            dot = aligned_group_dot_preloaded<FORMAT>(
+                                second, second_codebook, row, group,
+                                x0, x1, x2, state);
+                        }
+                    }
+                } else {
+                    if constexpr (STAGE_E8_THREE_BANKS) {
+                        dot = aligned_group_dot_preloaded_e8_stage3(
+                            first, first_codebook, shared_e8_codebook,
+                            stage_active_table,
+                            combined_row, group, x0, x1, x2, state);
+                    } else {
+                        dot = aligned_group_dot_preloaded<FORMAT>(
+                            first, first_codebook, combined_row, group,
+                            x0, x1, x2, state);
+                    }
+                }
+                accumulators[item] = fmaf(
+                    format_scale<FORMAT>(anchors[item], state, active_table) *
+                        activation_scale,
+                    static_cast<float>(dot), accumulators[item]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+#pragma unroll
+        for (int item = 0; item < ROWS_PER_WARP; ++item) {
+            accumulators[item] += __shfl_xor_sync(
+                0xffffffff, accumulators[item], offset);
+        }
+    }
+    if constexpr (ADD_RESIDUAL) {
+        auto * projected_rows = reinterpret_cast<__half *>(shared_storage);
+        // Every warp must finish its codebook reads before this storage is
+        // reused for the coalesced residual epilogue.
+        __syncthreads();
+        if (lane == 0) {
+#pragma unroll
+            for (int item = 0; item < ROWS_PER_WARP; ++item) {
+                const int local_row = warp + item * NWARPS;
+                const int combined_row = block_row_base + local_row;
+                if (combined_row < total_rows) {
+                    projected_rows[local_row] =
+                        __float2half(accumulators[item]);
+                }
+            }
+        }
+        __syncthreads();
+        if (linear_thread < rows_per_block) {
+            const int combined_row = block_row_base + linear_thread;
+            if (combined_row < total_rows) {
+                output[combined_row] = __hadd(
+                    residual[combined_row], projected_rows[linear_thread]);
+            }
+        }
+    } else if (lane == 0) {
+#pragma unroll
+        for (int item = 0; item < ROWS_PER_WARP; ++item) {
+            const int combined_row = row_base + item * NWARPS;
+            if (combined_row < total_rows) {
+                output[combined_row] = __float2half(accumulators[item]);
+            }
+        }
+    }
+}
+
+template <int FORMAT, int NWARPS, bool OUTPUT_F32 = false>
+__global__ void __launch_bounds__(NWARPS * 32, 1) aligned_group_swiglu_pair_kernel(
+    NvqDeviceWeight gate,
+    NvqDeviceWeight up,
+    const int8_t * qx,
+    const float * xscale,
+    __half * output_h,
+    float * output_f) {
+    const int row = blockIdx.x;
+    const int warp = threadIdx.y;
+    const int lane = threadIdx.x;
+    if (row >= gate.N) return;
+
+    const float gate_anchor = gate.neuron_scale[row];
+    const float up_anchor = up.neuron_scale[row];
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+    for (int group = warp * 32 + lane;
+         group < gate.ng;
+         group += NWARPS * 32) {
+        uint32_t gate_state = 0;
+        uint32_t up_state = 0;
+        int gate_dot = 0;
+        int up_dot = 0;
+        aligned_group_pair_dot<FORMAT>(
+            gate, up, row, group, qx,
+            gate_state, up_state, gate_dot, up_dot);
+        const float activation_scale = xscale[group];
+        gate_acc = fmaf(
+            format_scale<FORMAT>(gate_anchor, gate_state, gate.codebook) *
+                activation_scale,
+            static_cast<float>(gate_dot), gate_acc);
+        up_acc = fmaf(
+            format_scale<FORMAT>(up_anchor, up_state, up.codebook) *
+                activation_scale,
+            static_cast<float>(up_dot), up_acc);
+    }
+
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        gate_acc += __shfl_xor_sync(0xffffffff, gate_acc, offset);
+        up_acc += __shfl_xor_sync(0xffffffff, up_acc, offset);
+    }
+    __shared__ float partial[2][NWARPS];
+    if (lane == 0) {
+        partial[0][warp] = gate_acc;
+        partial[1][warp] = up_acc;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        gate_acc = lane < NWARPS ? partial[0][lane] : 0.0f;
+        up_acc = lane < NWARPS ? partial[1][lane] : 0.0f;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            gate_acc += __shfl_xor_sync(0xffffffff, gate_acc, offset);
+            up_acc += __shfl_xor_sync(0xffffffff, up_acc, offset);
+        }
+        if (lane == 0) {
+            const float gate_value = __half2float(__float2half(gate_acc));
+            const float up_value = __half2float(__float2half(up_acc));
+            const float sigmoid = 1.0f / (1.0f + expf(-gate_value));
+            const float value = up_value * (gate_value * sigmoid);
+            if constexpr (OUTPUT_F32) output_f[row] = value;
+            else output_h[row] = __float2half(value);
+        }
     }
 }
 
@@ -1578,6 +2479,44 @@ __global__ void nvq_quantize_f32_kernel(
     const int k = group * GS + lane;
     const bool valid = lane < GS && k < K;
     const float value = valid ? input[k] : 0.0f;
+    float maximum = fabsf(value);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset));
+    }
+    const float scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
+    int quant = 0;
+    if (valid) {
+        quant = static_cast<int>(roundf(value / scale));
+        quant = quant < -127 ? -127 : (quant > 127 ? 127 : quant);
+    }
+    if (lane == 0) output_xscale[group] = scale;
+    if (lane < GS && k < K_pad) output_qx[k] = static_cast<int8_t>(quant);
+}
+
+// The aligned group layout is faster when gate/up rows remain independent:
+// 2N blocks expose both projections to the scheduler and keep the GEMV at the
+// lower single-projection register count.  The existing N-float workspace is
+// exactly large enough for the two fp16 projections, so this adds no workspace.
+template <int GS>
+__global__ void nvq_swiglu_quantize_f16_pair_kernel(
+    const __half * gate_up,
+    int8_t * output_qx,
+    float * output_xscale,
+    int K,
+    int K_pad) {
+    const int group = blockIdx.x;
+    const int lane = threadIdx.x;
+    if (group * GS >= K_pad) return;
+    const int k = group * GS + lane;
+    const bool valid = lane < GS && k < K;
+    float value = 0.0f;
+    if (valid) {
+        const float gate_value = __half2float(gate_up[k]);
+        const float up_value = __half2float(gate_up[K + k]);
+        const float sigmoid = 1.0f / (1.0f + expf(-gate_value));
+        value = up_value * (gate_value * sigmoid);
+    }
     float maximum = fabsf(value);
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -3239,8 +4178,8 @@ void check_common(
     int64_t sub_bits,
     int64_t format,
     int64_t sign_mode) {
-    TORCH_CHECK(format >= kNvq1L && format <= kNvq3JscL,
-                "NVQ format must be in [1,15]");
+    TORCH_CHECK(format >= kNvq1L && format <= kNvq3JscLGroupExec,
+                "NVQ format must be in [1,17]");
     TORCH_CHECK(gs == kGroupSize, "NVQ CUDA kernels currently require gs=24");
     TORCH_CHECK(sub_bits >= 1 && sub_bits <= 8, "NVQ sub_bits must be in [1,8]");
     TORCH_CHECK(neuron_len > 0, "NVQ neuron_len must be positive");
@@ -3274,7 +4213,9 @@ void check_common(
                     "NVQ2J codebook metadata has an invalid size");
         TORCH_CHECK(sub_bits == 4 && sign_mode == 0,
                     "NVQ2J requires a 4-bit state and even-parity signs");
-    } else if (format == kNvq2JscL || format == kNvq2JscXL) {
+    } else if (
+        format == kNvq2JscL || format == kNvq2JscXL ||
+        format == kNvq2JscXLGroupExec) {
         const int e8_bank_bytes = format == kNvq2JscL
             ? kJscE8Codebook1024Bytes
             : kJscE8Codebook4096Bytes;
@@ -3287,10 +4228,11 @@ void check_common(
                     "extended NVQ2J requires a 4-bit state and even-parity signs");
     } else if (
         format == kNvq3Jsc || format == kNvq3Jsc2 ||
-        format == kNvq3Jsc512 || format == kNvq3JscL) {
+        format == kNvq3Jsc512 || format == kNvq3JscL ||
+        format == kNvq3JscLGroupExec) {
         const int d4_bank_bytes = format == kNvq3Jsc512
             ? kJscD4Codebook512Bytes
-            : (format == kNvq3JscL
+            : (format == kNvq3JscL || format == kNvq3JscLGroupExec
                ? kJscD4Codebook1024Bytes
                : kJscD4CodebookBytes);
         TORCH_CHECK(codebook.dim() == 1 &&
@@ -3326,14 +4268,20 @@ void check_common(
                          (is_d4_format(format) ? 4 : 8);
     const int64_t nsign = (neuron_len + 7) / 8;
     const bool exec_layout = format == kNvq2Exec || format == kNvq2JscExec;
+    const bool group_exec_layout =
+        format == kNvq2JscXLGroupExec || format == kNvq3JscLGroupExec;
     const int index_bits = format_index_bits(format);
-    const int64_t index_bytes = (N * nvec * index_bits + 7) / 8;
+    const int64_t index_bytes = group_exec_layout
+        ? N * ng * (format == kNvq2JscXLGroupExec ? 8 : 12)
+        : (N * nvec * index_bits + 7) / 8;
     const bool delta_format = format == kNvq1L || format == kNvq1S;
     const bool no_aux_format = format == kNpq0L || format == kNpq0S;
     const int aux_bits = delta_format ? 1 : (no_aux_format ? 0 : 7);
     const int64_t aux_count = delta_format ? N * ng :
         (no_aux_format ? 0 : N * nsign);
-    const int64_t aux_bytes = exec_layout ? 0 : (aux_count * aux_bits + 7) / 8;
+    const int64_t aux_bytes = exec_layout || group_exec_layout
+        ? 0
+        : (aux_count * aux_bits + 7) / 8;
     const int64_t sub_bytes = (N * ng * sub_bits + 7) / 8;
     TORCH_CHECK(indices.numel() == index_bytes, "NVQ index stream length mismatch");
     TORCH_CHECK(aux.numel() == aux_bytes, "NVQ aux stream length mismatch");
@@ -3366,6 +4314,12 @@ void launch_by_format(int format, Launch && launch) {
         case kNvq3JscL:
             launch(std::integral_constant<int, kNvq3JscL>{});
             break;
+        case kNvq2JscXLGroupExec:
+            launch(std::integral_constant<int, kNvq2JscXLGroupExec>{});
+            break;
+        case kNvq3JscLGroupExec:
+            launch(std::integral_constant<int, kNvq3JscLGroupExec>{});
+            break;
         default: TORCH_CHECK(false, "unsupported NVQ format");
     }
 }
@@ -3378,6 +4332,206 @@ void launch_nepq_by_format(int format, Launch && launch) {
         case kNvq1S: launch(std::integral_constant<int, kNvq1S>{}); break;
         case kNpq0S: launch(std::integral_constant<int, kNpq0S>{}); break;
         default: TORCH_CHECK(false, "unsupported NEPQ base format");
+    }
+}
+
+int aligned_group_rows_per_block(int format) {
+    const char * value = std::getenv(
+        format == kNvq2JscXLGroupExec
+            ? "MFQ_NVQ_GROUP_ROWS_E8"
+            : "MFQ_NVQ_GROUP_ROWS_D4");
+    if (value == nullptr) value = std::getenv("MFQ_NVQ_GROUP_ROWS");
+    if (value != nullptr && value[0] == '4') return 4;
+    if (value != nullptr && value[0] == '2') return 2;
+    return 1;
+}
+
+int aligned_group_row_tile(int format) {
+    const char * value = std::getenv(
+        format == kNvq2JscXLGroupExec
+            ? "MFQ_NVQ_ROW_TILE_E8"
+            : "MFQ_NVQ_ROW_TILE_D4");
+    if (value == nullptr) value = std::getenv("MFQ_NVQ_ROW_TILE");
+    return value == nullptr ? 0 : std::atoi(value);
+}
+
+bool aligned_group_e8_down_w32r1_enabled() {
+    static const bool value = [] {
+        const char * text = std::getenv("MFQ_NVQ_E8_STAGE_DOWN_W32R1");
+        return text == nullptr || text[0] != '0';
+    }();
+    return value;
+}
+
+template <
+    int FORMAT, int NWARPS, int ROWS_PER_WARP, bool MULTI2,
+    bool STAGE_E8_THREE_BANKS = false, bool ADD_RESIDUAL = false>
+void launch_aligned_group_row_tiled_m1(
+    const NvqDeviceWeight & first,
+    const NvqDeviceWeight & second,
+    const int8_t * qx,
+    const float * xscale,
+    __half * output,
+    cudaStream_t stream,
+    const __half * residual = nullptr) {
+    static_assert(!ADD_RESIDUAL || !MULTI2);
+    const int total_rows = MULTI2 ? first.N + second.N : first.N;
+    const int rows_per_block = NWARPS * ROWS_PER_WARP;
+    size_t shared_bytes = 0;
+    if constexpr (STAGE_E8_THREE_BANKS) {
+        shared_bytes =
+            3 * kJscE8Codebook4096Bytes + kJscE8PartialBytes;
+        static const cudaError_t attribute_status = cudaFuncSetAttribute(
+            aligned_group_row_tiled_m1_kernel<
+                FORMAT, NWARPS, ROWS_PER_WARP, MULTI2, true, ADD_RESIDUAL>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(shared_bytes));
+        TORCH_CHECK(
+            attribute_status == cudaSuccess,
+            "failed to opt in to the E8 row-tiled shared-memory size");
+    } else {
+        const int k_pad = first.ng * kGroupSize;
+        const int scale_offset = (k_pad + 3) & ~3;
+        shared_bytes = static_cast<size_t>(scale_offset) +
+            static_cast<size_t>(first.ng) * sizeof(float);
+        if constexpr (FORMAT == kNvq3JscLGroupExec) {
+            shared_bytes += static_cast<size_t>(first.codebook_nbytes);
+            if constexpr (MULTI2) {
+                shared_bytes += static_cast<size_t>(second.codebook_nbytes);
+            }
+        }
+    }
+    aligned_group_row_tiled_m1_kernel<
+        FORMAT, NWARPS, ROWS_PER_WARP, MULTI2,
+        STAGE_E8_THREE_BANKS, ADD_RESIDUAL>
+        <<<(total_rows + rows_per_block - 1) / rows_per_block,
+           dim3(32, NWARPS), shared_bytes, stream>>>(
+            first, second, qx, xscale, output, residual);
+}
+
+template <int FORMAT, bool ADD_RESIDUAL = false>
+void launch_aligned_group_m1(
+    const NvqDeviceWeight & weight,
+    const int8_t * qx,
+    const float * xscale,
+    __half * output,
+    cudaStream_t stream,
+    const __half * residual = nullptr) {
+    const int tile = aligned_group_row_tile(FORMAT);
+    if constexpr (FORMAT == kNvq2JscXLGroupExec) {
+        if (tile == 3243 && weight.codebook_nbytes >=
+                kJscMetadataBytes + 4 * kJscE8Codebook4096Bytes) {
+            if (weight.N >= 12288) {
+                launch_aligned_group_row_tiled_m1<
+                    FORMAT, 32, 4, false, true, ADD_RESIDUAL>(
+                    weight, weight, qx, xscale, output, stream, residual);
+                return;
+            }
+            if (weight.N >= 4096 && aligned_group_e8_down_w32r1_enabled()) {
+                launch_aligned_group_row_tiled_m1<
+                    FORMAT, 32, 1, false, true, ADD_RESIDUAL>(
+                    weight, weight, qx, xscale, output, stream, residual);
+                return;
+            }
+        }
+        if (tile == 164) {
+            launch_aligned_group_row_tiled_m1<
+                FORMAT, 16, 4, false, false, ADD_RESIDUAL>(
+                weight, weight, qx, xscale, output, stream, residual);
+            return;
+        }
+        if (tile == 324) {
+            launch_aligned_group_row_tiled_m1<
+                FORMAT, 32, 4, false, false, ADD_RESIDUAL>(
+                weight, weight, qx, xscale, output, stream, residual);
+            return;
+        }
+    } else {
+        if (tile == 162) {
+            launch_aligned_group_row_tiled_m1<
+                FORMAT, 16, 2, false, false, ADD_RESIDUAL>(
+                weight, weight, qx, xscale, output, stream, residual);
+            return;
+        }
+        if (tile == 322) {
+            launch_aligned_group_row_tiled_m1<
+                FORMAT, 32, 2, false, false, ADD_RESIDUAL>(
+                weight, weight, qx, xscale, output, stream, residual);
+            return;
+        }
+    }
+    const int rows = aligned_group_rows_per_block(FORMAT);
+    if (rows == 4) {
+        aligned_group_gemv_m1_kernel<FORMAT, 4, 4, ADD_RESIDUAL>
+            <<<(weight.N + 3) / 4, dim3(32, 16), 0, stream>>>(
+                weight, qx, xscale, output, residual);
+    } else if (rows == 2) {
+        aligned_group_gemv_m1_kernel<FORMAT, 4, 2, ADD_RESIDUAL>
+            <<<(weight.N + 1) / 2, dim3(32, 8), 0, stream>>>(
+                weight, qx, xscale, output, residual);
+    } else {
+        aligned_group_gemv_m1_kernel<FORMAT, 4, 1, ADD_RESIDUAL>
+            <<<weight.N, dim3(32, 4), 0, stream>>>(
+                weight, qx, xscale, output, residual);
+    }
+}
+
+template <int FORMAT>
+void launch_aligned_group_multi2_m1(
+    const NvqDeviceWeight & first,
+    const NvqDeviceWeight & second,
+    const int8_t * qx,
+    const float * xscale,
+    __half * output,
+    cudaStream_t stream) {
+    const int blocks = first.N + second.N;
+    const int tile = aligned_group_row_tile(FORMAT);
+    if constexpr (FORMAT == kNvq2JscXLGroupExec) {
+        if (tile == 3243 &&
+            (first.N >= 12288 || second.N >= 12288) &&
+            first.codebook_nbytes >=
+                kJscMetadataBytes + 4 * kJscE8Codebook4096Bytes &&
+            second.codebook_nbytes >=
+                kJscMetadataBytes + 4 * kJscE8Codebook4096Bytes) {
+            launch_aligned_group_row_tiled_m1<FORMAT, 32, 4, true, true>(
+                first, second, qx, xscale, output, stream);
+            return;
+        }
+        if (tile == 164) {
+            launch_aligned_group_row_tiled_m1<FORMAT, 16, 4, true>(
+                first, second, qx, xscale, output, stream);
+            return;
+        }
+        if (tile == 324) {
+            launch_aligned_group_row_tiled_m1<FORMAT, 32, 4, true>(
+                first, second, qx, xscale, output, stream);
+            return;
+        }
+    } else {
+        if (tile == 162) {
+            launch_aligned_group_row_tiled_m1<FORMAT, 16, 2, true>(
+                first, second, qx, xscale, output, stream);
+            return;
+        }
+        if (tile == 322) {
+            launch_aligned_group_row_tiled_m1<FORMAT, 32, 2, true>(
+                first, second, qx, xscale, output, stream);
+            return;
+        }
+    }
+    const int rows = aligned_group_rows_per_block(FORMAT);
+    if (rows == 4) {
+        aligned_group_multi2_m1_kernel<FORMAT, 4, 4>
+            <<<(blocks + 3) / 4, dim3(32, 16), 0, stream>>>(
+                first, second, qx, xscale, output);
+    } else if (rows == 2) {
+        aligned_group_multi2_m1_kernel<FORMAT, 4, 2>
+            <<<(blocks + 1) / 2, dim3(32, 8), 0, stream>>>(
+                first, second, qx, xscale, output);
+    } else {
+        aligned_group_multi2_m1_kernel<FORMAT, 4, 1>
+            <<<blocks, dim3(32, 4), 0, stream>>>(
+                first, second, qx, xscale, output);
     }
 }
 
@@ -3460,6 +4614,25 @@ void launch_m1_vec8_by_format(
             codebook.data_ptr<int8_t>(), qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
             reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
             N, ng, nvec, nsign);
+        return;
+    }
+    if (format == kNvq2JscXLGroupExec || format == kNvq3JscLGroupExec) {
+        const NvqDeviceWeight weight{
+            indices.data_ptr<uint8_t>(), indices.numel(),
+            aux.data_ptr<uint8_t>(), aux.numel(),
+            sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),
+            neuron_scale.data_ptr<float>(), codebook.data_ptr<int8_t>(),
+            static_cast<int>(codebook.numel()),
+            N, ng, nvec, nsign, sub_bits, sign_mode};
+        if (format == kNvq2JscXLGroupExec) {
+            launch_aligned_group_m1<kNvq2JscXLGroupExec>(
+                weight, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
+                reinterpret_cast<__half *>(output.data_ptr<at::Half>()), stream);
+        } else {
+            launch_aligned_group_m1<kNvq3JscLGroupExec>(
+                weight, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
+                reinterpret_cast<__half *>(output.data_ptr<at::Half>()), stream);
+        }
         return;
     }
     launch_by_format(format, [&](auto tag) {
@@ -3648,6 +4821,7 @@ NvqDeviceWeight make_device_weight(
         aux.data_ptr<uint8_t>(), aux.numel(),
         sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),
         neuron_scale.data_ptr<float>(), codebook.data_ptr<int8_t>(),
+        static_cast<int>(codebook.numel()),
         static_cast<int>(neuron_scale.numel()), ng,
         (neuron_len + (is_d4_format(format) ? 3 : 7)) /
             (is_d4_format(format) ? 4 : 8),
@@ -3715,6 +4889,16 @@ void launch_selected_multi2_vec8(
             case kNvq2JscL: NVQ_MULTI2(kNvq2JscL, 4, 1); break;
             case kNvq2JscXL: NVQ_MULTI2(kNvq2JscXL, 4, 1); break;
             case kNvq3JscL: NVQ_MULTI2(kNvq3JscL, 4, 1); break;
+            case kNvq2JscXLGroupExec:
+                launch_aligned_group_multi2_m1<kNvq2JscXLGroupExec>(
+                    first, second, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
+                    reinterpret_cast<__half *>(output.data_ptr<at::Half>()), stream);
+                break;
+            case kNvq3JscLGroupExec:
+                launch_aligned_group_multi2_m1<kNvq3JscLGroupExec>(
+                    first, second, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
+                    reinterpret_cast<__half *>(output.data_ptr<at::Half>()), stream);
+                break;
         }
     } else if (M <= 4) {
         if (format == kNvq1L || format == kNvq1S) {
@@ -3726,6 +4910,9 @@ void launch_selected_multi2_vec8(
             else if (format == kNvq2JscExec) NVQ_MULTI2(kNvq2JscExec, 4, 4);
             else if (format == kNvq2JscL) NVQ_MULTI2(kNvq2JscL, 4, 4);
             else if (format == kNvq2JscXL) NVQ_MULTI2(kNvq2JscXL, 4, 4);
+            else if (format == kNvq2JscXLGroupExec) {
+                NVQ_MULTI2(kNvq2JscXLGroupExec, 4, 4);
+            }
             else NVQ_MULTI2(kNvq2, 4, 4);
         } else if (format == kNpq0L || format == kNpq0S) {
             if (format == kNpq0S) NVQ_MULTI2(kNpq0S, 4, 4);
@@ -3735,12 +4922,18 @@ void launch_selected_multi2_vec8(
             else if (format == kNvq3Jsc) NVQ_MULTI2(kNvq3Jsc, 2, 4);
             else if (format == kNvq3Jsc512) NVQ_MULTI2(kNvq3Jsc512, 2, 4);
             else if (format == kNvq3JscL) NVQ_MULTI2(kNvq3JscL, 2, 4);
+            else if (format == kNvq3JscLGroupExec) {
+                NVQ_MULTI2(kNvq3JscLGroupExec, 2, 4);
+            }
             else NVQ_MULTI2(kNvq3, 2, 4);
         } else {
             if (format == kNvq3Jsc2) NVQ_MULTI2(kNvq3Jsc2, 4, 4);
             else if (format == kNvq3Jsc) NVQ_MULTI2(kNvq3Jsc, 4, 4);
             else if (format == kNvq3Jsc512) NVQ_MULTI2(kNvq3Jsc512, 4, 4);
             else if (format == kNvq3JscL) NVQ_MULTI2(kNvq3JscL, 4, 4);
+            else if (format == kNvq3JscLGroupExec) {
+                NVQ_MULTI2(kNvq3JscLGroupExec, 4, 4);
+            }
             else NVQ_MULTI2(kNvq3, 4, 4);
         }
     } else if (format == kNvq1L || format == kNvq1S) {
@@ -3752,6 +4945,9 @@ void launch_selected_multi2_vec8(
         else if (format == kNvq2JscExec) NVQ_MULTI2(kNvq2JscExec, 4, 8);
         else if (format == kNvq2JscL) NVQ_MULTI2(kNvq2JscL, 4, 8);
         else if (format == kNvq2JscXL) NVQ_MULTI2(kNvq2JscXL, 4, 8);
+        else if (format == kNvq2JscXLGroupExec) {
+            NVQ_MULTI2(kNvq2JscXLGroupExec, 4, 8);
+        }
         else NVQ_MULTI2(kNvq2, 4, 8);
     } else if (format == kNpq0L || format == kNpq0S) {
         if (format == kNpq0S) NVQ_MULTI2(kNpq0S, 4, 8);
@@ -3761,6 +4957,9 @@ void launch_selected_multi2_vec8(
         else if (format == kNvq3Jsc) NVQ_MULTI2(kNvq3Jsc, 8, 8);
         else if (format == kNvq3Jsc512) NVQ_MULTI2(kNvq3Jsc512, 8, 8);
         else if (format == kNvq3JscL) NVQ_MULTI2(kNvq3JscL, 8, 8);
+        else if (format == kNvq3JscLGroupExec) {
+            NVQ_MULTI2(kNvq3JscLGroupExec, 8, 8);
+        }
         else NVQ_MULTI2(kNvq3, 8, 8);
     }
 #undef NVQ_MULTI2
@@ -5467,6 +6666,70 @@ torch::Tensor nvq_gemv_qx_ws_cuda(
     return output;
 }
 
+torch::Tensor nvq_gemv_qx_residual_ws_cuda(
+    torch::Tensor indices,
+    torch::Tensor aux,
+    torch::Tensor sub_scale,
+    torch::Tensor neuron_scale,
+    torch::Tensor codebook,
+    int64_t neuron_len,
+    int64_t gs,
+    int64_t sub_bits,
+    int64_t format,
+    int64_t sign_mode,
+    torch::Tensor qx,
+    torch::Tensor xscale,
+    torch::Tensor residual) {
+    check_common(indices, aux, sub_scale, neuron_scale, codebook,
+                 neuron_len, gs, sub_bits, format, sign_mode);
+    TORCH_CHECK(
+        format == kNvq2JscXLGroupExec || format == kNvq3JscLGroupExec,
+        "NVQ fused residual requires an aligned group execution format");
+    TORCH_CHECK(
+        qx.is_cuda() && qx.scalar_type() == torch::kInt8 &&
+        qx.is_contiguous() && qx.dim() == 2 && qx.size(0) == 1,
+        "NVQ fused residual qx must be CUDA contiguous int8 [1,K]");
+    TORCH_CHECK(
+        xscale.is_cuda() && xscale.scalar_type() == torch::kFloat32 &&
+        xscale.is_contiguous() && xscale.dim() == 2 && xscale.size(0) >= 1,
+        "NVQ fused residual xscale must be CUDA contiguous fp32 [1,ng]");
+    const int K = static_cast<int>(neuron_len);
+    const int N = static_cast<int>(neuron_scale.numel());
+    const int ng = (K + static_cast<int>(gs) - 1) / static_cast<int>(gs);
+    const int K_pad = ng * static_cast<int>(gs);
+    TORCH_CHECK(qx.size(1) >= K_pad, "NVQ fused residual qx width mismatch");
+    TORCH_CHECK(xscale.size(1) >= ng, "NVQ fused residual xscale width mismatch");
+    TORCH_CHECK(
+        residual.is_cuda() && residual.scalar_type() == torch::kFloat16 &&
+        residual.is_contiguous() && residual.dim() == 2 &&
+        residual.size(0) == 1 && residual.size(1) == N,
+        "NVQ fused residual must be CUDA contiguous fp16 [1,N]");
+
+    const auto weight = make_device_weight(
+        indices, aux, sub_scale, neuron_scale, codebook,
+        K, static_cast<int>(gs), static_cast<int>(sub_bits),
+        static_cast<int>(format), static_cast<int>(sign_mode));
+    auto output = torch::empty_like(residual);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const auto * residual_ptr = reinterpret_cast<const __half *>(
+        residual.data_ptr<at::Half>());
+    auto * output_ptr = reinterpret_cast<__half *>(
+        output.data_ptr<at::Half>());
+    if (format == kNvq2JscXLGroupExec) {
+        launch_aligned_group_m1<kNvq2JscXLGroupExec, true>(
+            weight, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
+            output_ptr, stream, residual_ptr);
+    } else {
+        launch_aligned_group_m1<kNvq3JscLGroupExec, true>(
+            weight, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
+            output_ptr, stream, residual_ptr);
+    }
+    TORCH_CHECK(
+        cudaGetLastError() == cudaSuccess,
+        "NVQ fused residual GEMV kernel launch failed");
+    return output;
+}
+
 torch::Tensor nvq_gemv_multi2_ws_cuda(
     torch::Tensor first_indices,
     torch::Tensor first_aux,
@@ -5580,7 +6843,19 @@ torch::Tensor nvq_gemv_swiglu_ws_cuda(
     nvq_quantize_x_gs24_kernel<<<dim3(1, ng), 32, 0, stream>>>(
         reinterpret_cast<const __half *>(x.data_ptr<at::Half>()), qx.data_ptr<int8_t>(),
         xscale.data_ptr<float>(), 1, K, ng);
-    if (gate_format == kNvq2 && gate_sub_bits == 4 && up_sub_bits == 4) {
+    if (gate_format == kNvq2JscXLGroupExec &&
+        gate_sub_bits == 4 && up_sub_bits == 4) {
+        aligned_group_swiglu_pair_kernel<kNvq2JscXLGroupExec, 4>
+            <<<gate.N, dim3(32, 4), 0, stream>>>(
+                gate, up, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
+                reinterpret_cast<__half *>(output.data_ptr<at::Half>()), nullptr);
+    } else if (gate_format == kNvq3JscLGroupExec &&
+               gate_sub_bits == 4 && up_sub_bits == 4) {
+        aligned_group_swiglu_pair_kernel<kNvq3JscLGroupExec, 4>
+            <<<gate.N, dim3(32, 4), 0, stream>>>(
+                gate, up, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
+                reinterpret_cast<__half *>(output.data_ptr<at::Half>()), nullptr);
+    } else if (gate_format == kNvq2 && gate_sub_bits == 4 && up_sub_bits == 4) {
         nvq_gemv_swiglu_pair_kernel<kNvq2, 4, false, true>
             <<<gate.N, dim3(32, 4), 0, stream>>>(
                 gate, up, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
@@ -5746,10 +7021,23 @@ void nvq_ffn_swiglu_quant_ws_cuda(
     nvq_quantize_x_gs24_kernel<<<dim3(1, ng), 32, 0, stream>>>(
         reinterpret_cast<const __half *>(x.data_ptr<at::Half>()), input_qx.data_ptr<int8_t>(),
         input_xscale.data_ptr<float>(), 1, K, ng);
+    bool aligned_independent_rows = false;
     const char * vec4_env = std::getenv("MFQ_NVQ_SWIGLU_VEC4");
     if (vec4_env == nullptr) vec4_env = std::getenv("MFQ_NIQ_SWIGLU_VEC4");
     const bool use_vec4 = vec4_env == nullptr || vec4_env[0] != '0';
-    if (gate_format == kNvq2Exec && gate_sub_bits == 4 && up_sub_bits == 4) {
+    if (gate_format == kNvq2JscXLGroupExec &&
+        gate_sub_bits == 4 && up_sub_bits == 4) {
+        launch_aligned_group_multi2_m1<kNvq2JscXLGroupExec>(
+            gate, up, input_qx.data_ptr<int8_t>(), input_xscale.data_ptr<float>(),
+            reinterpret_cast<__half *>(swiglu_scratch.data_ptr<float>()), stream);
+        aligned_independent_rows = true;
+    } else if (gate_format == kNvq3JscLGroupExec &&
+               gate_sub_bits == 4 && up_sub_bits == 4) {
+        launch_aligned_group_multi2_m1<kNvq3JscLGroupExec>(
+            gate, up, input_qx.data_ptr<int8_t>(), input_xscale.data_ptr<float>(),
+            reinterpret_cast<__half *>(swiglu_scratch.data_ptr<float>()), stream);
+        aligned_independent_rows = true;
+    } else if (gate_format == kNvq2Exec && gate_sub_bits == 4 && up_sub_bits == 4) {
         nvq_gemv_swiglu_pair_kernel<kNvq2Exec, 4, true, true>
             <<<gate.N, dim3(32, 4), 0, stream>>>(
                 gate, up, input_qx.data_ptr<int8_t>(), input_xscale.data_ptr<float>(),
@@ -5786,19 +7074,40 @@ void nvq_ffn_swiglu_quant_ws_cuda(
     }
     switch (static_cast<int>(down_gs)) {
         case 24:
-            nvq_quantize_f32_kernel<24><<<down_ng, 32, 0, stream>>>(
-                swiglu_scratch.data_ptr<float>(), output_qx.data_ptr<int8_t>(),
-                output_xscale.data_ptr<float>(), N, down_k_pad);
+            if (aligned_independent_rows) {
+                nvq_swiglu_quantize_f16_pair_kernel<24><<<down_ng, 32, 0, stream>>>(
+                    reinterpret_cast<const __half *>(swiglu_scratch.data_ptr<float>()),
+                    output_qx.data_ptr<int8_t>(), output_xscale.data_ptr<float>(),
+                    N, down_k_pad);
+            } else {
+                nvq_quantize_f32_kernel<24><<<down_ng, 32, 0, stream>>>(
+                    swiglu_scratch.data_ptr<float>(), output_qx.data_ptr<int8_t>(),
+                    output_xscale.data_ptr<float>(), N, down_k_pad);
+            }
             break;
         case 28:
-            nvq_quantize_f32_kernel<28><<<down_ng, 32, 0, stream>>>(
-                swiglu_scratch.data_ptr<float>(), output_qx.data_ptr<int8_t>(),
-                output_xscale.data_ptr<float>(), N, down_k_pad);
+            if (aligned_independent_rows) {
+                nvq_swiglu_quantize_f16_pair_kernel<28><<<down_ng, 32, 0, stream>>>(
+                    reinterpret_cast<const __half *>(swiglu_scratch.data_ptr<float>()),
+                    output_qx.data_ptr<int8_t>(), output_xscale.data_ptr<float>(),
+                    N, down_k_pad);
+            } else {
+                nvq_quantize_f32_kernel<28><<<down_ng, 32, 0, stream>>>(
+                    swiglu_scratch.data_ptr<float>(), output_qx.data_ptr<int8_t>(),
+                    output_xscale.data_ptr<float>(), N, down_k_pad);
+            }
             break;
         case 32:
-            nvq_quantize_f32_kernel<32><<<down_ng, 32, 0, stream>>>(
-                swiglu_scratch.data_ptr<float>(), output_qx.data_ptr<int8_t>(),
-                output_xscale.data_ptr<float>(), N, down_k_pad);
+            if (aligned_independent_rows) {
+                nvq_swiglu_quantize_f16_pair_kernel<32><<<down_ng, 32, 0, stream>>>(
+                    reinterpret_cast<const __half *>(swiglu_scratch.data_ptr<float>()),
+                    output_qx.data_ptr<int8_t>(), output_xscale.data_ptr<float>(),
+                    N, down_k_pad);
+            } else {
+                nvq_quantize_f32_kernel<32><<<down_ng, 32, 0, stream>>>(
+                    swiglu_scratch.data_ptr<float>(), output_qx.data_ptr<int8_t>(),
+                    output_xscale.data_ptr<float>(), N, down_k_pad);
+            }
             break;
     }
     TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NVQ fused FFN kernel launch failed");
