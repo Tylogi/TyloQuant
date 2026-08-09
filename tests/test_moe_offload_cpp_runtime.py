@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -14,12 +14,18 @@ if not torch.cuda.is_available():
 from mfq.formats import io  # noqa: E402
 from mfq.formats.header import FileHeader  # noqa: E402
 from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
-from mfq.formats.nepq import NEPQ0_S, NEPQ1_L  # noqa: E402
+from mfq.formats.nepq import (  # noqa: E402
+    NEPQ0_A,
+    NEPQ0_S,
+    NEPQ1_A,
+    NEPQ1_L,
+)
 from mfq.formats.nint import NintSpec  # noqa: E402
 from mfq.formats.nint8_zero import Nint8ZeroTensor  # noqa: E402
 from mfq.quantize.nint_quant import quantize  # noqa: E402
 from tests.mixed_family_fixtures import make_flat_family  # noqa: E402
 from tests.test_formats.test_nepq import _tensor as make_nepq  # noqa: E402
+from tests.test_formats.test_nepq_a import _a_tensor as make_nepq_a  # noqa: E402
 
 
 def _executable() -> Path:
@@ -64,7 +70,11 @@ def _nint8_zero(
 
 
 def _aligned_nepq(spec):
-    tensor = make_nepq(spec)
+    tensor = (
+        make_nepq_a(spec)[0]
+        if spec in (NEPQ0_A, NEPQ1_A)
+        else make_nepq(spec)
+    )
     rows = 8
     indices = np.arange(rows) % tensor.out_per_expert
 
@@ -73,6 +83,18 @@ def _aligned_nepq(spec):
             return None
         return np.take(value, indices, axis=1).copy()
 
+    residual_second_mask = select(tensor.residual_second_mask)
+    residual_second_records = None
+    if residual_second_mask is not None:
+        source_mask = np.asarray(tensor.residual_second_mask).reshape(-1)
+        source_records = np.asarray(tensor.residual_second_records)
+        source_dense = np.full(source_mask.size, -1, dtype=np.int32)
+        source_dense[np.flatnonzero(source_mask)] = source_records
+        source_dense = source_dense.reshape(tensor.residual_second_mask.shape)
+        selected_dense = select(source_dense)
+        residual_second_records = selected_dense[selected_dense >= 0].astype(
+            np.uint16
+        )
     return type(tensor)(
         spec=tensor.spec,
         shape=(tensor.n_experts, rows, tensor.neuron_len),
@@ -84,6 +106,15 @@ def _aligned_nepq(spec):
         table_payloads=tensor.table_payloads.copy(),
         rotation_block=tensor.rotation_block,
         rotation_seed=tensor.rotation_seed,
+        residual_codebook=(
+            None
+            if tensor.residual_codebook is None
+            else tensor.residual_codebook.copy()
+        ),
+        residual_first=select(tensor.residual_first),
+        residual_second_mask=residual_second_mask,
+        residual_second_records=residual_second_records,
+        residual_padding_nbytes=tensor.residual_padding_nbytes,
     )
 
 
@@ -161,6 +192,28 @@ def _container(family: str) -> NintMoeTensor:
                 ),
             ),
         )
+    elif family == "NEPQ0-A":
+        tensor = _aligned_nepq(NEPQ0_A)
+        return NintMoeTensor(
+            tensor.shape,
+            (
+                NintMoePool(
+                    np.arange(tensor.n_experts, dtype=np.int32),
+                    tensor,
+                ),
+            ),
+        )
+    elif family == "NEPQ1-A":
+        tensor = _aligned_nepq(NEPQ1_A)
+        return NintMoeTensor(
+            tensor.shape,
+            (
+                NintMoePool(
+                    np.arange(tensor.n_experts, dtype=np.int32),
+                    tensor,
+                ),
+            ),
+        )
     else:
         raise ValueError(family)
     return NintMoeTensor(
@@ -193,6 +246,7 @@ def _run_check(
     *,
     cached: bool,
     tokens: int = 1,
+    mapped_gather: bool = False,
 ) -> tuple[dict[str, str], dict[str, str] | None]:
     executable = _executable()
     command = [
@@ -210,11 +264,14 @@ def _run_check(
     ]
     if cached:
         command.extend(("--moe-gpu-cache-gb", "0.01"))
+    environment = _runtime_env(executable)
+    if mapped_gather:
+        environment["MFQ_MOE_MAPPED_GATHER"] = "1"
     completed = subprocess.run(
         command,
         check=True,
         capture_output=True,
-        env=_runtime_env(executable),
+        env=environment,
         text=True,
         timeout=60,
     )
@@ -289,6 +346,8 @@ def _run_profile_check(
         "NPQ0-S",
         "NEPQ0-S",
         "NEPQ1-L",
+        "NEPQ0-A",
+        "NEPQ1-A",
     ),
 )
 def test_cached_nintm_is_bit_exact_to_resident(
@@ -315,16 +374,39 @@ def test_cached_nintm_is_bit_exact_to_resident(
     )
 
 
+@pytest.mark.parametrize("family", ("NINT4", "NEPQ0-A", "NEPQ1-A"))
 def test_cached_prefill_fallback_is_bit_exact_to_resident(
     tmp_path: Path,
+    family: str,
 ) -> None:
-    model = _write_fixture(tmp_path, "NINT4")
+    model = _write_fixture(tmp_path, family)
     resident, _ = _run_check(model, cached=False, tokens=13)
     cached, cache_stats = _run_check(model, cached=True, tokens=13)
 
     assert cached["values"] == resident["values"]
     assert cache_stats is not None
     assert int(cache_stats["full_projection_fallbacks"]) > 0
+
+
+@pytest.mark.parametrize("family", ("NEPQ0-A", "NEPQ1-A"))
+def test_cached_nepq_a_mapped_gather_is_bit_exact_to_resident(
+    tmp_path: Path,
+    family: str,
+) -> None:
+    model = _write_fixture(tmp_path, family)
+    resident, _ = _run_check(model, cached=False)
+    cached, cache_stats = _run_check(
+        model,
+        cached=True,
+        mapped_gather=True,
+    )
+
+    assert cached["values"] == resident["values"]
+    assert cached["checksum"] == resident["checksum"]
+    assert cached["sqsum"] == resident["sqsum"]
+    assert cache_stats is not None
+    assert int(cache_stats["mapped_gather_bytes"]) > 0
+    assert int(cache_stats["mapped_gather_submissions"]) > 0
 
 
 def test_cached_prefill_mma_is_bit_exact_to_resident(

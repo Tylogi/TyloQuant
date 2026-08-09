@@ -330,6 +330,18 @@ torch::Tensor nint_mmq_packed_exec_ws_cuda(
 // nepq.cu
 torch::Tensor nepq_hadamard_input_cuda(
     torch::Tensor input, torch::Tensor signs, int64_t block_size);
+torch::Tensor nepq_sparse_residual_matmul_cuda(
+    torch::Tensor dictionary, torch::Tensor first, torch::Tensor second,
+    torch::Tensor input, int64_t position_bits, int64_t block_vectors,
+    torch::Tensor output);
+torch::Tensor nepq_sparse_residual_dequant_cuda(
+    torch::Tensor dictionary, torch::Tensor first, torch::Tensor second,
+    int64_t position_bits, int64_t block_vectors, torch::Tensor weight);
+torch::Tensor nepq_sparse_residual_grouped_cuda(
+    torch::Tensor dictionary, torch::Tensor first, torch::Tensor second,
+    torch::Tensor input, torch::Tensor route_ids, torch::Tensor expert_local,
+    int64_t out_per_expert, int64_t position_bits, int64_t block_vectors,
+    torch::Tensor output);
 torch::Tensor nepq_dequant_cuda(
     torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
     torch::Tensor neuron_scale, torch::Tensor table_pool, torch::Tensor bank_ids,
@@ -590,6 +602,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nint_mmq_packed_u8_ws_cuda", &nint_mmq_packed_u8_ws_cuda, "NINT8 byte-packed tiled dp4a MMQ with caller workspace (CUDA)");
     m.def("nint_mmq_packed_exec_ws_cuda", &nint_mmq_packed_exec_ws_cuda, "NINT INT4-packed MMQ with MMQ execution-format weights (CUDA)");
     m.def("nepq_hadamard_input_cuda", &nepq_hadamard_input_cuda, "NEPQ signed block-Hadamard activation transform (CUDA)");
+    m.def("nepq_sparse_residual_matmul_cuda", &nepq_sparse_residual_matmul_cuda, "NEPQ-A sparse residual matmul (CUDA)");
+    m.def("nepq_sparse_residual_dequant_cuda", &nepq_sparse_residual_dequant_cuda, "NEPQ-A sparse residual dequantization (CUDA)");
+    m.def("nepq_sparse_residual_grouped_cuda", &nepq_sparse_residual_grouped_cuda, "NEPQ-A sparse residual routed matmul (CUDA)");
     m.def("nepq_dequant_cuda", &nepq_dequant_cuda, "NEPQ shared-bank full dequant (CUDA)");
     m.def("nepq_gemv_ws_cuda", &nepq_gemv_ws_cuda, "NEPQ shared-bank q8 GEMV with caller workspace (CUDA)");
     m.def("nepq_mmq_ws_cuda", &nepq_mmq_ws_cuda, "NEPQ shared-bank gs24 int8 Tensor Core MMQ (CUDA)");

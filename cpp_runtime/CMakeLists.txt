@@ -241,6 +241,7 @@ add_executable(mfq-decode
     ../mfq/kernels/cuda/nint_matmul.cu
     ../mfq/kernels/cuda/nvq_matmul.cu
     ../mfq/kernels/cuda/nepq.cu
+    ../mfq/kernels/cuda/nepq_residual.cu
     ../mfq/kernels/cuda/norm.cu
     ../mfq/kernels/cuda/rope.cu
     ../mfq/kernels/cuda/sampling.cu

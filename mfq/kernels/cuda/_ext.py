@@ -32,6 +32,7 @@ _SOURCES = [
     os.path.join(_DIR, "nint_matmul.cu"),
     os.path.join(_DIR, "nvq_matmul.cu"),
     os.path.join(_DIR, "nepq.cu"),
+    os.path.join(_DIR, "nepq_residual.cu"),
     os.path.join(_DIR, "mfq_cuda.cpp"),
 ]
 _module = None

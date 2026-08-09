@@ -44,6 +44,11 @@ from mfq.formats.nvq1_l import (
 )
 from mfq.formats.nvq1_s import Nvq1STensor, pack_nvq1_s_banked_codebook
 from mfq.quantize.nepq import NepqQuantConfig, quantize_nepq_fixed
+from mfq.quantize.nepq_a import (
+    NepqAArtifact,
+    NepqAQuantConfig,
+    quantize_nepq_a_fixed,
+)
 from mfq.quantize.tpq import (
     TpqKmeansConfig,
     dequantize_tpq_pq,
@@ -180,14 +185,18 @@ def _nepq_tables_from_arrays(
     arrays: Mapping[str, np.ndarray],
 ) -> np.ndarray:
     family = precision.family
+    base_family = {
+        "NEPQ0-A": "NEPQ0-S",
+        "NEPQ1-A": "NEPQ1-S",
+    }.get(family, family)
     direct = arrays.get("table_payloads")
     if direct is not None:
         return np.ascontiguousarray(direct, dtype=np.uint8)
-    if family == "NEPQ0-S":
+    if base_family == "NEPQ0-S":
         pack = pack_npq0_s_tables
-    elif family == "NEPQ0-L":
+    elif base_family == "NEPQ0-L":
         pack = pack_npq0_l_tables
-    elif family == "NEPQ1-S":
+    elif base_family == "NEPQ1-S":
         codebooks = np.asarray(arrays["codebooks"])
         return np.stack(
             [
@@ -195,7 +204,7 @@ def _nepq_tables_from_arrays(
                 for table in codebooks
             ]
         )
-    elif family == "NEPQ1-L":
+    elif base_family == "NEPQ1-L":
         codebooks = np.asarray(arrays["codebooks"])
         return np.stack(
             [
@@ -260,7 +269,14 @@ def _load_precision_artifact(
                 _NVQ_SPECS[family],
             )
         if family.startswith("NEPQ"):
-            return _nepq_tables_from_arrays(precision, arrays)
+            tables = _nepq_tables_from_arrays(precision, arrays)
+            if family.endswith("-A"):
+                if "residual_codebook" not in arrays:
+                    raise ValueError(
+                        f"{family} artifact lacks residual_codebook: {path}"
+                    )
+                return NepqAArtifact(tables, arrays["residual_codebook"])
+            return tables
         if "codebook" in arrays:
             return arrays["codebook"]
         raise ValueError(f"{family} artifact lacks a recognized payload: {path}")
@@ -322,6 +338,15 @@ def _numpy_importance(
 def _option_int(precision: ExpertPrecision, name: str, default: int) -> int:
     value = int(precision.option(name, default))
     return value
+
+
+def _optional_option(
+    precision: ExpertPrecision,
+    name: str,
+    convert,
+):
+    value = precision.option(name)
+    return None if value is None else convert(value)
 
 
 def _quantize_flat_cohort(
@@ -538,20 +563,54 @@ def quantize_expertwise(
                 raise ValueError(
                     f"{precision.family} requires a frozen cross-expert table artifact"
                 )
-            tensor = quantize_nepq_fixed(
-                np.ascontiguousarray(values[expert_ids]),
-                precision.family,
-                artifact,
-                importance=cohort_importance,
-                rotation_block=_option_int(precision, "rotation_block", 0),
-                rotation_seed=_option_int(precision, "rotation_seed", 0),
-                config=NepqQuantConfig(
-                    refine_steps=_option_int(precision, "refine_steps", 2),
-                    row_chunk=_option_int(precision, "row_chunk", 8),
-                    bank_chunk=_option_int(precision, "bank_chunk", 8),
-                ),
-                device=device,
+            base_config = NepqQuantConfig(
+                refine_steps=_option_int(precision, "refine_steps", 2),
+                row_chunk=_option_int(precision, "row_chunk", 8),
+                bank_chunk=_option_int(precision, "bank_chunk", 8),
             )
+            if precision.family.endswith("-A"):
+                if not isinstance(artifact, NepqAArtifact):
+                    raise TypeError(
+                        f"{precision.family} artifact must contain NepqAArtifact"
+                    )
+                tensor = quantize_nepq_a_fixed(
+                    np.ascontiguousarray(values[expert_ids]),
+                    precision.family,
+                    artifact,
+                    importance=cohort_importance,
+                    rotation_block=_option_int(precision, "rotation_block", 2048),
+                    rotation_seed=_option_int(precision, "rotation_seed", 0),
+                    second_records=_optional_option(
+                        precision, "second_records", int
+                    ),
+                    target_nbytes=_optional_option(
+                        precision, "target_nbytes", int
+                    ),
+                    target_bpw=_optional_option(
+                        precision, "target_bpw", float
+                    ),
+                    config=NepqAQuantConfig(
+                        base=base_config,
+                        residual_row_chunk=_option_int(
+                            precision, "residual_row_chunk", 128
+                        ),
+                        residual_block_chunk=_option_int(
+                            precision, "residual_block_chunk", 1024
+                        ),
+                    ),
+                    device=device,
+                )
+            else:
+                tensor = quantize_nepq_fixed(
+                    np.ascontiguousarray(values[expert_ids]),
+                    precision.family,
+                    artifact,
+                    importance=cohort_importance,
+                    rotation_block=_option_int(precision, "rotation_block", 0),
+                    rotation_seed=_option_int(precision, "rotation_seed", 0),
+                    config=base_config,
+                    device=device,
+                )
         else:
             rows = np.ascontiguousarray(values[expert_ids]).reshape(
                 expert_ids.size * out_per_expert, neuron_len

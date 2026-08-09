@@ -12,6 +12,7 @@ from mfq.formats.nepq import (
     NEPQ1_S,
     NepqTensor,
     _pack_bits,
+    nepq_base_spec,
     rotation_signs as build_rotation_signs,
     validate_nepq,
 )
@@ -28,15 +29,16 @@ def _cuda_u8(payload: bytes, device: str | torch.device) -> torch.Tensor:
 
 def _runtime_table(payload: np.ndarray, tensor: NepqTensor) -> np.ndarray:
     raw = np.ascontiguousarray(payload, dtype=np.uint8).tobytes()
-    if tensor.spec is NEPQ0_S:
+    base = nepq_base_spec(tensor.spec)
+    if base is NEPQ0_S:
         return np.frombuffer(raw, dtype=np.int8).copy()
-    if tensor.spec is NEPQ0_L:
+    if base is NEPQ0_L:
         return np.frombuffer(raw, dtype=np.int8).copy()
-    if tensor.spec is NEPQ1_S:
+    if base is NEPQ1_S:
         return unpack_nvq1_s_banked_codebook(raw).reshape(-1).astype(
             np.int8, copy=False
         )
-    if tensor.spec is NEPQ1_L:
+    if base is NEPQ1_L:
         return unpack_ternary_codebook(raw).reshape(-1).astype(np.int8, copy=False)
     raise ValueError(f"unsupported NEPQ profile: {tensor.spec.label}")
 
@@ -72,7 +74,7 @@ def to_gpu_nepq(
         device=device,
         dtype=torch.int8,
     ).contiguous()
-    if tensor.spec is NEPQ0_S:
+    if nepq_base_spec(tensor.spec) is NEPQ0_S:
         grouped_tables = np.stack(
             [
                 _npq0_s_expanded_table(payload)
@@ -100,7 +102,7 @@ def to_gpu_nepq(
         if tensor.rotation_block
         else np.empty(0, dtype=np.int8)
     )
-    return {
+    result = {
         "indices_packed": _cuda_u8(
             _pack_bits(np.asarray(tensor.indices), tensor.spec.index_bits), device
         ),
@@ -136,6 +138,99 @@ def to_gpu_nepq(
         "shape": tuple(int(value) for value in tensor.shape),
         "device": torch.device(device),
     }
+    if tensor.spec.is_residual:
+        blocks = tensor.residual_blocks_per_row
+        first = np.asarray(tensor.residual_first, dtype=np.int16).reshape(rows, blocks)
+        second = np.full((rows, blocks), -1, dtype=np.int16)
+        if tensor.spec.residual_second:
+            mask = np.asarray(tensor.residual_second_mask, dtype=np.uint8).reshape(-1)
+            compact = np.asarray(
+                tensor.residual_second_records, dtype=np.int16
+            ).reshape(-1)
+            second.reshape(-1)[np.flatnonzero(mask)] = compact
+        result.update(
+            {
+                "residual_codebook": torch.as_tensor(
+                    np.ascontiguousarray(tensor.residual_codebook, dtype=np.float16),
+                    device=device,
+                    dtype=torch.float16,
+                ).contiguous(),
+                "residual_first": torch.as_tensor(
+                    first, device=device, dtype=torch.int16
+                ).contiguous(),
+                "residual_second": torch.as_tensor(
+                    second, device=device, dtype=torch.int16
+                ).contiguous(),
+                "residual_position_bits": int(
+                    tensor.spec.residual_position_bits
+                ),
+                "residual_block_vectors": int(
+                    tensor.spec.residual_block_vectors
+                ),
+            }
+        )
+    return result
+
+
+def _has_residual(g: dict) -> bool:
+    return "residual_codebook" in g
+
+
+def _add_residual_matmul(
+    g: dict, value: torch.Tensor, output: torch.Tensor
+) -> torch.Tensor:
+    if not _has_residual(g):
+        return output
+    return ext().nepq_sparse_residual_matmul_cuda(
+        g["residual_codebook"],
+        g["residual_first"],
+        g["residual_second"],
+        value,
+        int(g["residual_position_bits"]),
+        int(g["residual_block_vectors"]),
+        output,
+    )
+
+
+def _add_residual_dequant(g: dict, weight: torch.Tensor) -> torch.Tensor:
+    if not _has_residual(g):
+        return weight
+    return ext().nepq_sparse_residual_dequant_cuda(
+        g["residual_codebook"],
+        g["residual_first"],
+        g["residual_second"],
+        int(g["residual_position_bits"]),
+        int(g["residual_block_vectors"]),
+        weight,
+    )
+
+
+def _add_residual_grouped(
+    g: dict,
+    value: torch.Tensor,
+    ids: torch.Tensor,
+    output: torch.Tensor,
+    expert_local: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if not _has_residual(g):
+        return output
+    mapping = (
+        expert_local
+        if expert_local is not None
+        else torch.empty(0, device=value.device, dtype=torch.int32)
+    )
+    return ext().nepq_sparse_residual_grouped_cuda(
+        g["residual_codebook"],
+        g["residual_first"],
+        g["residual_second"],
+        value,
+        ids,
+        mapping,
+        int(g["out_per_expert"]),
+        int(g["residual_position_bits"]),
+        int(g["residual_block_vectors"]),
+        output,
+    )
 
 
 def _kernel_args(g: dict) -> tuple:
@@ -209,6 +304,9 @@ def nepq_dequantize(g: dict) -> torch.Tensor:
         int(g["sub_bits"]),
         int(g["format"]),
     )
+    value = _add_residual_dequant(
+        g, value.reshape(int(g["rows"]), int(g["neuron_len"]))
+    )
     return value.reshape(g["shape"])
 
 
@@ -217,7 +315,7 @@ def nepq_gemv(g: dict, x: torch.Tensor) -> torch.Tensor:
     if not 1 <= value.shape[0] <= 16:
         raise ValueError("NEPQ GEMV requires M in [1,16]")
     qx, xscale = _workspace(g, value)
-    return ext().nepq_gemv_ws_cuda(
+    output = ext().nepq_gemv_ws_cuda(
         *_kernel_args(g),
         value,
         int(g["neuron_len"]),
@@ -226,6 +324,7 @@ def nepq_gemv(g: dict, x: torch.Tensor) -> torch.Tensor:
         qx,
         xscale,
     )
+    return _add_residual_matmul(g, value, output)
 
 
 def nepq_mmq(g: dict, x: torch.Tensor) -> torch.Tensor:
@@ -233,7 +332,7 @@ def nepq_mmq(g: dict, x: torch.Tensor) -> torch.Tensor:
     if not 4 <= value.shape[0] <= 64:
         raise ValueError("NEPQ MMQ requires M in [4,64]")
     qx, xscale = _workspace(g, value)
-    return ext().nepq_mmq_ws_cuda(
+    output = ext().nepq_mmq_ws_cuda(
         *_kernel_args(g),
         value,
         int(g["neuron_len"]),
@@ -242,19 +341,21 @@ def nepq_mmq(g: dict, x: torch.Tensor) -> torch.Tensor:
         qx,
         xscale,
     )
+    return _add_residual_matmul(g, value, output)
 
 
 def nepq_gemm_f16(g: dict, x: torch.Tensor) -> torch.Tensor:
     value = _prepare_input(g, x)
     if not 16 <= value.shape[0] <= 256:
         raise ValueError("NEPQ online FP16 GEMM requires M in [16,256]")
-    return ext().nepq_gemm_f16_cuda(
+    output = ext().nepq_gemm_f16_cuda(
         *_kernel_args(g),
         value,
         int(g["neuron_len"]),
         int(g["sub_bits"]),
         int(g["format"]),
     )
+    return _add_residual_matmul(g, value, output)
 
 
 def nepq_matmul(g: dict, x: torch.Tensor) -> torch.Tensor:
@@ -310,7 +411,7 @@ def nepq_grouped_matmul(
         raise ValueError(f"NEPQ output must be contiguous fp16 {expected}")
     input_rows = tokens * routes if value.dim() == 3 else tokens
     qx, xscale = _moe_workspace(g, value, input_rows)
-    return ext().nepq_moe_grouped_matmul_ws_cuda(
+    output = ext().nepq_moe_grouped_matmul_ws_cuda(
         *_kernel_args(g),
         g["grouped_table_pool"],
         value,
@@ -328,6 +429,7 @@ def nepq_grouped_matmul(
         route.tile_bounds,
         route.tile_experts,
     )
+    return _add_residual_grouped(g, value, route.ids, output)
 
 
 def nepq_grouped_matmul_pool(
@@ -370,7 +472,7 @@ def nepq_grouped_matmul_pool(
         if input_quantized:
             raise ValueError("prequantized NEPQ input requires qx and xscale")
         qx, xscale = _moe_workspace(g, value, input_rows)
-    return ext().nepq_moe_grouped_matmul_pool_ws_cuda(
+    output = ext().nepq_moe_grouped_matmul_pool_ws_cuda(
         *_kernel_args(g),
         g["grouped_table_pool"],
         value,
@@ -390,6 +492,9 @@ def nepq_grouped_matmul_pool(
         route.expert_bounds,
         route.tile_bounds,
         route.tile_experts,
+    )
+    return _add_residual_grouped(
+        g, value, route.ids, output, expert_local=expert_local
     )
 
 

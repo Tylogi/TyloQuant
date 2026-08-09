@@ -327,6 +327,11 @@ torch::Tensor nepq_moe_grouped_matmul_pool_f16_cuda(
     torch::Tensor tile_bounds, torch::Tensor tile_experts);
 torch::Tensor nepq_hadamard_input_cuda(
     torch::Tensor input, torch::Tensor signs, int64_t block_size);
+torch::Tensor nepq_sparse_residual_grouped_cuda(
+    torch::Tensor dictionary, torch::Tensor first, torch::Tensor second,
+    torch::Tensor input, torch::Tensor route_ids, torch::Tensor expert_local,
+    int64_t out_per_expert, int64_t position_bits, int64_t block_vectors,
+    torch::Tensor output);
 torch::Tensor moe_weighted_reduce_cuda(torch::Tensor pair_output, torch::Tensor weights);
 torch::Tensor moe_swiglu_split_cuda(torch::Tensor gate_up);
 torch::Tensor moe_geglu_split_cuda(torch::Tensor gate_up);
@@ -560,6 +565,9 @@ torch::Tensor nepq_dequant_cuda(
     torch::Tensor neuron_scale, torch::Tensor table_pool,
     torch::Tensor bank_ids, int64_t neuron_len,
     int64_t sub_bits, int64_t format);
+torch::Tensor nepq_sparse_residual_dequant_cuda(
+    torch::Tensor dictionary, torch::Tensor first, torch::Tensor second,
+    int64_t position_bits, int64_t block_vectors, torch::Tensor weight);
 torch::Tensor nvq_gemm_f16_cuda(
     torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
     torch::Tensor neuron_scale, torch::Tensor codebook, torch::Tensor x,
@@ -4481,10 +4489,45 @@ struct NepqCpu {
     std::vector<int8_t> grouped_table_pool;
     std::vector<uint8_t> bank_ids;
     std::vector<int8_t> rotation_signs;
+    bool residual = false;
+    bool residual_second = false;
+    int residual_position_bits = 0;
+    int residual_record_bits = 0;
+    int residual_block_vectors = 0;
+    int residual_blocks_per_row = 0;
+    std::vector<uint16_t> residual_codebook_h;
+    std::vector<int16_t> residual_first;
+    std::vector<int16_t> residual_second_dense;
 };
 
 static size_t packed_nbytes(size_t count, int bits) {
     return bits == 0 ? 0 : (count * (size_t)bits + 7) / 8;
+}
+
+static std::vector<uint16_t> unpack_nepq_u16_bits(
+        const std::vector<uint8_t> & blob,
+        size_t & off,
+        size_t count,
+        int bits,
+        const char * label) {
+    const size_t nbytes = packed_nbytes(count, bits);
+    if (off + nbytes > blob.size()) {
+        throw std::runtime_error(std::string("truncated ") + label);
+    }
+    std::vector<uint16_t> result(count, 0);
+    for (size_t index = 0; index < count; ++index) {
+        const size_t first_bit = index * static_cast<size_t>(bits);
+        uint16_t value = 0;
+        for (int bit = 0; bit < bits; ++bit) {
+            const size_t source_bit = first_bit + static_cast<size_t>(bit);
+            value |= static_cast<uint16_t>(
+                ((blob[off + source_bit / 8] >> (source_bit & 7)) & 1u)
+                << bit);
+        }
+        result[index] = value;
+    }
+    off += nbytes;
+    return result;
 }
 
 static void configure_nepq_profile(NepqCpu & value, const std::string & dtype) {
@@ -4520,6 +4563,31 @@ static void configure_nepq_profile(NepqCpu & value, const std::string & dtype) {
         value.aux_bits = 1;
         value.table_bytes = 4096;
         value.runtime_table_bytes = 2048 * 8;
+    } else if (dtype == "NEPQ0-A") {
+        value.profile = 4;
+        value.format = 9;
+        value.state_bits = 2;
+        value.index_bits = 6;
+        value.aux_bits = 0;
+        value.table_bytes = 320;
+        value.runtime_table_bytes = 320;
+        value.residual = true;
+        value.residual_position_bits = 5;
+        value.residual_record_bits = 15;
+        value.residual_block_vectors = 24;
+    } else if (dtype == "NEPQ1-A") {
+        value.profile = 5;
+        value.format = 8;
+        value.state_bits = 4;
+        value.index_bits = 9;
+        value.aux_bits = 1;
+        value.table_bytes = 2048;
+        value.runtime_table_bytes = 1024 * 8;
+        value.residual = true;
+        value.residual_second = true;
+        value.residual_position_bits = 4;
+        value.residual_record_bits = 14;
+        value.residual_block_vectors = 16;
     } else {
         throw std::runtime_error("unsupported NEPQ cohort dtype: " + dtype);
     }
@@ -4529,7 +4597,7 @@ static std::vector<int8_t> expand_nepq_table(
         const uint8_t * source, const NepqCpu & value) {
     std::vector<uint8_t> packed(
         source, source + static_cast<ptrdiff_t>(value.table_bytes));
-    if (value.profile == 0) {
+    if (value.profile == 0 || value.profile == 4) {
         const uint8_t expected[6] = {2, 4, 3, 3, 24, 8};
         for (int i = 0; i < 6; ++i) {
             if (packed[(size_t)i] != expected[i]) {
@@ -4554,7 +4622,8 @@ static std::vector<int8_t> expand_nepq_table(
     std::vector<uint16_t> words((size_t)value.table_bytes / 2);
     std::memcpy(words.data(), packed.data(), packed.size());
     return expand_nvq_codebook(
-        value.profile == 2 ? 8 : 1, words.data(), words.size());
+        (value.profile == 2 || value.profile == 5) ? 8 : 1,
+        words.data(), words.size());
 }
 
 static NepqCpu unpack_nepq(
@@ -4592,6 +4661,9 @@ static NepqCpu unpack_nepq(
          value.neuron_len % value.rotation_block != 0)) {
         throw std::runtime_error("invalid NEPQ Hadamard block");
     }
+    if (value.residual && value.rotation_block == 0) {
+        throw std::runtime_error("NEPQ-A requires a Hadamard rotation");
+    }
     value.ng = (value.neuron_len + 23) / 24;
     value.nvec = value.neuron_len / 8;
     value.nsuper = (value.ng + 3) / 4;
@@ -4606,13 +4678,14 @@ static NepqCpu unpack_nepq(
         (size_t)value.bank_count * value.runtime_table_bytes);
     value.grouped_table_pool.reserve(
         (size_t)value.bank_count *
-        (value.profile == 0 ? 2112 : value.runtime_table_bytes));
+        ((value.profile == 0 || value.profile == 4)
+            ? 2112 : value.runtime_table_bytes));
     for (int bank = 0; bank < value.bank_count; ++bank) {
         const uint8_t * table = blob.data() + off + (size_t)bank * value.table_bytes;
         auto runtime = expand_nepq_table(table, value);
         value.table_pool.insert(
             value.table_pool.end(), runtime.begin(), runtime.end());
-        if (value.profile == 0) {
+        if (value.profile == 0 || value.profile == 4) {
             std::vector<uint8_t> compact(
                 table, table + static_cast<ptrdiff_t>(value.table_bytes));
             auto grouped = expand_npq0_s_runtime_lut(compact);
@@ -4642,6 +4715,108 @@ static NepqCpu unpack_nepq(
         "NEPQ aux stream");
     value.bank_ids = take_bytes(
         blob, off, (size_t)rows * value.nsuper, "NEPQ bank selectors");
+    if (value.residual) {
+        const size_t header = off;
+        if (header + 64 > blob.size() ||
+            std::memcmp(blob.data() + header, "NRA1", 4) != 0) {
+            throw std::runtime_error("invalid NEPQ-A residual header");
+        }
+        off += 4;
+        const uint8_t residual_version = blob[off++];
+        const uint8_t record_bits = blob[off++];
+        const uint8_t position_bits = blob[off++];
+        const uint8_t residual_flags = blob[off++];
+        const uint32_t dictionary_entries = read_u32_from(blob, off);
+        const uint32_t block_count = read_u32_from(blob, off);
+        const uint32_t second_count = read_u32_from(blob, off);
+        const uint32_t padding_nbytes = read_u32_from(blob, off);
+        const uint64_t reserved = read_u64_from(blob, off);
+        value.residual_blocks_per_row =
+            (value.nvec + value.residual_block_vectors - 1) /
+            value.residual_block_vectors;
+        const size_t expected_blocks =
+            static_cast<size_t>(rows) * value.residual_blocks_per_row;
+        const uint8_t expected_flags = value.residual_second ? 1 : 0;
+        if (residual_version != 1 ||
+            record_bits != value.residual_record_bits ||
+            position_bits != value.residual_position_bits ||
+            residual_flags != expected_flags ||
+            dictionary_entries != 1024 ||
+            block_count != expected_blocks ||
+            reserved != 0 ||
+            (!value.residual_second && second_count != 0)) {
+            throw std::runtime_error("unsupported NEPQ-A residual profile");
+        }
+        off = header + 64;
+        const size_t dictionary_values = 1024 * 8;
+        const size_t dictionary_nbytes = dictionary_values * sizeof(uint16_t);
+        if (off + dictionary_nbytes > blob.size()) {
+            throw std::runtime_error("truncated NEPQ-A residual dictionary");
+        }
+        value.residual_codebook_h.resize(dictionary_values);
+        std::memcpy(
+            value.residual_codebook_h.data(), blob.data() + off,
+            dictionary_nbytes);
+        off += dictionary_nbytes;
+        auto first = unpack_nepq_u16_bits(
+            blob, off, expected_blocks, value.residual_record_bits,
+            "NEPQ-A first residual stream");
+        value.residual_first.assign(first.begin(), first.end());
+        value.residual_second_dense.assign(expected_blocks, -1);
+        if (value.residual_second) {
+            auto mask = unpack_nepq_u16_bits(
+                blob, off, expected_blocks, 1,
+                "NEPQ-A second residual bitmap");
+            auto second = unpack_nepq_u16_bits(
+                blob, off, second_count, value.residual_record_bits,
+                "NEPQ-A second residual stream");
+            size_t compact = 0;
+            for (size_t block = 0; block < expected_blocks; ++block) {
+                if (mask[block] != 0) {
+                    if (compact >= second.size()) {
+                        throw std::runtime_error(
+                            "NEPQ-A second residual count mismatch");
+                    }
+                    value.residual_second_dense[block] = second[compact++];
+                }
+            }
+            if (compact != second.size()) {
+                throw std::runtime_error(
+                    "NEPQ-A second residual count mismatch");
+            }
+        }
+        const size_t padding_end = off + padding_nbytes;
+        if (padding_end > blob.size()) {
+            throw std::runtime_error("truncated NEPQ-A residual padding");
+        }
+        for (; off < padding_end; ++off) {
+            if (blob[off] != 0) {
+                throw std::runtime_error(
+                    "NEPQ-A residual padding must be zero");
+            }
+        }
+        const uint32_t position_mask =
+            (1u << value.residual_position_bits) - 1u;
+        for (size_t block = 0; block < expected_blocks; ++block) {
+            const int block_in_row =
+                static_cast<int>(block % value.residual_blocks_per_row);
+            const int available = std::min(
+                value.residual_block_vectors,
+                value.nvec - block_in_row * value.residual_block_vectors);
+            for (int record : {
+                     value.residual_first[block],
+                     value.residual_second_dense[block]}) {
+                if (record < 0) continue;
+                const int position = record & position_mask;
+                const int dictionary_id =
+                    record >> value.residual_position_bits;
+                if (position >= available || dictionary_id >= 1024) {
+                    throw std::runtime_error(
+                        "invalid NEPQ-A residual record");
+                }
+            }
+        }
+    }
     if (off != blob.size()) throw std::runtime_error("invalid NEPQ cohort tail");
     for (uint8_t bank : value.bank_ids) {
         if ((int)bank >= value.bank_count) {
@@ -4696,6 +4871,12 @@ struct NepqWeight {
     int ng = 0;
     int rotation_block = 0;
     uint64_t rotation_seed = 0;
+    bool residual = false;
+    int residual_position_bits = 0;
+    int residual_block_vectors = 0;
+    torch::Tensor residual_codebook;
+    torch::Tensor residual_first;
+    torch::Tensor residual_second;
 };
 
 static NepqWeight to_device_nepq(const NepqCpu & cpu, bool cuda) {
@@ -4708,6 +4889,9 @@ static NepqWeight to_device_nepq(const NepqCpu & cpu, bool cuda) {
     value.ng = cpu.ng;
     value.rotation_block = cpu.rotation_block;
     value.rotation_seed = cpu.rotation_seed;
+    value.residual = cpu.residual;
+    value.residual_position_bits = cpu.residual_position_bits;
+    value.residual_block_vectors = cpu.residual_block_vectors;
     value.indices_packed = cpu_u8_tensor(
         cpu.indices_packed, {(int64_t)cpu.indices_packed.size()});
     value.aux_packed = cpu_u8_tensor(
@@ -4718,7 +4902,9 @@ static NepqWeight to_device_nepq(const NepqCpu & cpu, bool cuda) {
         cpu.neuron_scale_h, cpu.n_experts * cpu.out_per_expert);
     value.table_pool = cpu_i8_tensor(
         cpu.table_pool, {cpu.bank_count, cpu.runtime_table_bytes});
-    const int grouped_stride = cpu.profile == 0 ? 2112 : cpu.runtime_table_bytes;
+    const int grouped_stride =
+        (cpu.profile == 0 || cpu.profile == 4)
+        ? 2112 : cpu.runtime_table_bytes;
     value.grouped_table_pool = cpu_i8_tensor(
         cpu.grouped_table_pool, {cpu.bank_count, grouped_stride});
     value.bank_ids = cpu_u8_tensor(
@@ -4726,6 +4912,20 @@ static NepqWeight to_device_nepq(const NepqCpu & cpu, bool cuda) {
             (int64_t)cpu.n_experts * cpu.out_per_expert, cpu.nsuper});
     value.rotation_signs = cpu_i8_tensor(
         cpu.rotation_signs, {(int64_t)cpu.rotation_signs.size()});
+    if (cpu.residual) {
+        value.residual_codebook = cpu_f16_tensor(
+            cpu.residual_codebook_h, {1024, 8});
+        value.residual_first = torch::from_blob(
+            (void *)cpu.residual_first.data(),
+            {cpu.n_experts * cpu.out_per_expert,
+             cpu.residual_blocks_per_row},
+            torch::TensorOptions().dtype(torch::kInt16)).clone();
+        value.residual_second = torch::from_blob(
+            (void *)cpu.residual_second_dense.data(),
+            {cpu.n_experts * cpu.out_per_expert,
+             cpu.residual_blocks_per_row},
+            torch::TensorOptions().dtype(torch::kInt16)).clone();
+    }
     if (cuda) {
         value.indices_packed =
             value.indices_packed.to(torch::kCUDA).contiguous();
@@ -4743,6 +4943,14 @@ static NepqWeight to_device_nepq(const NepqCpu & cpu, bool cuda) {
             value.bank_ids.to(torch::kCUDA).contiguous();
         value.rotation_signs =
             value.rotation_signs.to(torch::kCUDA).contiguous();
+        if (cpu.residual) {
+            value.residual_codebook =
+                value.residual_codebook.to(torch::kCUDA).contiguous();
+            value.residual_first =
+                value.residual_first.to(torch::kCUDA).contiguous();
+            value.residual_second =
+                value.residual_second.to(torch::kCUDA).contiguous();
+        }
     }
     return value;
 }
@@ -5039,6 +5247,12 @@ static NepqCpu select_nepq_cpu_rows(
         0);
     result.bank_ids.resize(
         rows.size() * source.nsuper);
+    if (source.residual) {
+        result.residual_first.resize(
+            rows.size() * source.residual_blocks_per_row);
+        result.residual_second_dense.resize(
+            rows.size() * source.residual_blocks_per_row);
+    }
     for (size_t destination = 0;
          destination < rows.size(); ++destination) {
         const int64_t source_row = rows[destination];
@@ -5086,6 +5300,24 @@ static NepqCpu select_nepq_cpu_rows(
         result.neuron_scale_h[destination] =
             source.neuron_scale_h[
                 static_cast<size_t>(source_row)];
+        if (source.residual) {
+            std::memcpy(
+                result.residual_first.data()
+                    + destination * source.residual_blocks_per_row,
+                source.residual_first.data()
+                    + static_cast<size_t>(source_row)
+                        * source.residual_blocks_per_row,
+                static_cast<size_t>(source.residual_blocks_per_row)
+                    * sizeof(int16_t));
+            std::memcpy(
+                result.residual_second_dense.data()
+                    + destination * source.residual_blocks_per_row,
+                source.residual_second_dense.data()
+                    + static_cast<size_t>(source_row)
+                        * source.residual_blocks_per_row,
+                static_cast<size_t>(source.residual_blocks_per_row)
+                    * sizeof(int16_t));
+        }
     }
     return result;
 }
@@ -5332,6 +5564,17 @@ struct MixedMoeRuntime {
                         pool.nepq.format, output, route.ids_dst,
                         route.expert_bounds, route.tile_bounds,
                         route.tile_experts);
+                    if (pool.nepq.residual) {
+                        nepq_sparse_residual_grouped_cuda(
+                            pool.nepq.residual_codebook,
+                            pool.nepq.residual_first,
+                            pool.nepq.residual_second,
+                            value, route.ids, pool.expert_local,
+                            out_per_expert,
+                            pool.nepq.residual_position_bits,
+                            pool.nepq.residual_block_vectors,
+                            output);
+                    }
                     continue;
                 }
                 ++g_kl_mmq_fallback_calls;
@@ -5393,6 +5636,17 @@ struct MixedMoeRuntime {
                     pool.nepq.format, input_quantized, output,
                     workspace.qx, workspace.xscale, route.ids_dst,
                     route.expert_bounds, route.tile_bounds, route.tile_experts);
+                if (pool.nepq.residual) {
+                    nepq_sparse_residual_grouped_cuda(
+                        pool.nepq.residual_codebook,
+                        pool.nepq.residual_first,
+                        pool.nepq.residual_second,
+                        value, route.ids, pool.expert_local,
+                        out_per_expert,
+                        pool.nepq.residual_position_bits,
+                        pool.nepq.residual_block_vectors,
+                        output);
+                }
             }
             quantized.insert(activation_key);
         }
@@ -5532,6 +5786,9 @@ static int64_t mixed_moe_storage_bytes(const MixedMoeRuntime & runtime) {
             bytes += tensor_storage_bytes(pool.nepq.grouped_table_pool);
             bytes += tensor_storage_bytes(pool.nepq.bank_ids);
             bytes += tensor_storage_bytes(pool.nepq.rotation_signs);
+            bytes += tensor_storage_bytes(pool.nepq.residual_codebook);
+            bytes += tensor_storage_bytes(pool.nepq.residual_first);
+            bytes += tensor_storage_bytes(pool.nepq.residual_second);
         }
     }
     return bytes;
@@ -5997,6 +6254,14 @@ static NepqWeight copy_cpu_nepq_to_cuda(const NepqWeight & source) {
     result.bank_ids = copy_cpu_weight_to_cuda(source.bank_ids);
     result.rotation_signs =
         copy_cpu_weight_to_cuda(source.rotation_signs);
+    if (source.residual) {
+        result.residual_codebook =
+            copy_cpu_weight_to_cuda(source.residual_codebook);
+        result.residual_first =
+            copy_cpu_weight_to_cuda(source.residual_first);
+        result.residual_second =
+            copy_cpu_weight_to_cuda(source.residual_second);
+    }
     return result;
 }
 
@@ -6111,13 +6376,18 @@ static std::vector<torch::Tensor> moe_cache_fields(
             pool.nvq.neuron_scale,
         };
     }
-    return {
+    std::vector<torch::Tensor> fields{
         pool.nepq.indices_packed,
         pool.nepq.aux_packed,
         pool.nepq.state_packed,
         pool.nepq.neuron_scale,
         pool.nepq.bank_ids,
     };
+    if (pool.nepq.residual) {
+        fields.push_back(pool.nepq.residual_first);
+        fields.push_back(pool.nepq.residual_second);
+    }
+    return fields;
 }
 
 static void validate_nepq_expert_boundaries(
@@ -6135,6 +6405,7 @@ static void validate_nepq_expert_boundaries(
     const int nvec = neuron_len / 8;
     const int ng = (neuron_len + 23) / 24;
     const int nsuper = (ng + 3) / 4;
+    const int rows = pool.local_experts * out_per_expert;
     const std::vector<int64_t> bits{
         static_cast<int64_t>(out_per_expert) * nvec * index_bits,
         static_cast<int64_t>(out_per_expert) * ng * aux_bits,
@@ -6149,6 +6420,35 @@ static void validate_nepq_expert_boundaries(
         })) {
         throw std::runtime_error(
             "NEPQ expert payload is not byte aligned for GPU caching");
+    }
+    if (pool.nepq.residual) {
+        const int blocks =
+            (nvec + pool.nepq.residual_block_vectors - 1) /
+            pool.nepq.residual_block_vectors;
+        if (!pool.nepq.residual_codebook.defined() ||
+                !pool.nepq.residual_codebook.is_cpu() ||
+                !pool.nepq.residual_codebook.is_contiguous() ||
+                pool.nepq.residual_codebook.scalar_type() != torch::kFloat16 ||
+                pool.nepq.residual_codebook.dim() != 2 ||
+                pool.nepq.residual_codebook.size(0) != 1024 ||
+                pool.nepq.residual_codebook.size(1) != 8 ||
+                !pool.nepq.residual_first.defined() ||
+                !pool.nepq.residual_first.is_cpu() ||
+                !pool.nepq.residual_first.is_contiguous() ||
+                pool.nepq.residual_first.scalar_type() != torch::kInt16 ||
+                pool.nepq.residual_first.dim() != 2 ||
+                pool.nepq.residual_first.size(0) != rows ||
+                pool.nepq.residual_first.size(1) != blocks ||
+                !pool.nepq.residual_second.defined() ||
+                !pool.nepq.residual_second.is_cpu() ||
+                !pool.nepq.residual_second.is_contiguous() ||
+                pool.nepq.residual_second.scalar_type() != torch::kInt16 ||
+                pool.nepq.residual_second.dim() != 2 ||
+                pool.nepq.residual_second.size(0) != rows ||
+                pool.nepq.residual_second.size(1) != blocks) {
+            throw std::runtime_error(
+                "NEPQ-A residual fields are incompatible with GPU caching");
+        }
     }
 }
 
@@ -6180,7 +6480,12 @@ static std::string moe_cache_signature(
         stream << ":f" << pool.nepq.format
                << ":s" << pool.nepq.state_bits
                << ":g" << pool.nepq.ng
-               << ":r" << pool.nepq.rotation_block;
+               << ":r" << pool.nepq.rotation_block
+               << ":a" << (pool.nepq.residual ? 1 : 0);
+        if (pool.nepq.residual) {
+            stream << ":p" << pool.nepq.residual_position_bits
+                   << ":v" << pool.nepq.residual_block_vectors;
+        }
     }
     const auto fields = moe_cache_fields(pool);
     for (const auto & field : fields) {
@@ -7133,7 +7438,20 @@ public:
                 pool.nepq.rotation_signs =
                     copy_cpu_weight_to_cuda(
                         source.nepq.rotation_signs);
+                if (pool.nepq.residual) {
+                    pool.nepq.residual_codebook =
+                        copy_cpu_weight_to_cuda(
+                            source.nepq.residual_codebook);
+                    pool.nepq.residual_first =
+                        arena.fields.at(field++);
+                    pool.nepq.residual_second =
+                        arena.fields.at(field++);
+                }
                 pool.nepq.n_experts = arena.slots;
+            }
+            if (field != arena.fields.size()) {
+                throw std::runtime_error(
+                    "MoE cache active field count does not match its arena");
             }
             cohort.active = std::move(pool);
             active_->pools.push_back(cohort.active);
@@ -19662,6 +19980,17 @@ static int run_nintm_tensor_check(
                     packed.table_pool, packed.bank_ids,
                     packed.neuron_len, packed.state_bits,
                     packed.format);
+                if (packed.residual) {
+                    dense_flat = nepq_sparse_residual_dequant_cuda(
+                        packed.residual_codebook,
+                        packed.residual_first,
+                        packed.residual_second,
+                        packed.residual_position_bits,
+                        packed.residual_block_vectors,
+                        dense_flat.reshape({
+                            packed.n_experts * packed.out_per_expert,
+                            packed.neuron_len}));
+                }
                 rotation_block = packed.rotation_block;
                 rotation_signs = packed.rotation_signs;
             } else {

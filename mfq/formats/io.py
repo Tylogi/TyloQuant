@@ -514,7 +514,14 @@ def _unpack_tensor(dtype: str, blob: bytes | memoryview) -> MfqTensor:
                 f"MFQ dtype/blob mismatch: {dtype} contains {tensor.spec.label}"
             )
         return tensor
-    if dtype in {"NEPQ0-S", "NEPQ0-L", "NEPQ1-S", "NEPQ1-L"}:
+    if dtype in {
+        "NEPQ0-S",
+        "NEPQ0-L",
+        "NEPQ1-S",
+        "NEPQ1-L",
+        "NEPQ0-A",
+        "NEPQ1-A",
+    }:
         tensor = unpack_nepq(blob)
         if tensor.spec.label != dtype:
             raise ValueError(
