@@ -1,1 +1,1 @@
-"""quantize 子包测试。"""
+"""Tests for the quantize subpackage."""

@@ -1,4 +1,4 @@
-"""日志辅助。"""
+"""Logging helpers."""
 
 from __future__ import annotations
 

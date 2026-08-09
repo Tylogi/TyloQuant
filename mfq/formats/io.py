@@ -1,12 +1,12 @@
-"""MFQ 文件的序列化 / 反序列化。
+"""MFQ file serialization and deserialization.
 
-两层 API：
+Two API levels:
 
-1. **codec 级** —— :func:`pack_nint`/:func:`unpack_nint` 把单个
-   :class:`~mfq.quantize.nint_quant.NintTensor` 打包成自描述字节流。
-2. **文件级** —— :func:`save`/:func:`load` 把多个命名张量写入单个 ``.mfq`` 文件。
+1. **Codec level** -- :func:`pack_nint`/:func:`unpack_nint` pack one
+   :class:`~mfq.quantize.nint_quant.NintTensor` into a self-describing byte stream.
+2. **File level** -- :func:`save`/:func:`load` write multiple named tensors to one ``.mfq`` file.
 
-二进制布局
+Binary layout
 ----------
 ::
 
@@ -19,9 +19,9 @@
         name        : len(uint32) + utf8
         dtype       : len(uint32) + utf8   # "NINT4" / "NINT5" ...
         blob_nbytes : uint64
-    [blob 0][blob 1]...                     # 各张量紧凑数据，顺序与记录一致
+    [blob 0][blob 1]...                     # Compact tensor data in record order
 
-NINT blob 内部（小端）::
+Inside a little-endian NINT blob::
 
     bits(u8) sub_bits(u8) groupsize(i32) axis(i32) neuron_len(i32)
     ndim(u32) shape(ndim×i64) out(u32) ng(u32)
@@ -29,7 +29,7 @@ NINT blob 内部（小端）::
     sub_scale(out·ng×sub_bits packed) sub_min(out·ng×sub_bits packed)
     q(out·ng·gs×bits packed)
 
-版本 2 开始按 bitstream 存储；loader 保留旧 uint 存储 blob 的读取兼容。
+Version 2 and later use bitstream storage; the loader retains read compatibility with legacy uint-storage blobs.
 """
 
 from __future__ import annotations
@@ -136,7 +136,7 @@ def _read_str(buf: bytes, off: int) -> tuple[str, int]:
 
 
 # ---------------------------------------------------------------------------
-# NINT codec 打包 / 解包
+# NINT codec packing / unpacking
 # ---------------------------------------------------------------------------
 _NINT_HDR = struct.Struct("<BBiii")   # bits, sub_bits, groupsize, axis, neuron_len
 
@@ -641,10 +641,10 @@ def _pack_tensor(tensor: MfqTensor, *, allow_moe: bool = True) -> tuple[str, byt
 
 
 # ---------------------------------------------------------------------------
-# 文件级 save / load
+# File-level save / load
 # ---------------------------------------------------------------------------
 def save(path: str | Path, header: FileHeader, tensors: dict[str, MfqTensor]) -> None:
-    """写入 ``.mfq`` 文件。"""
+    """Write an ``.mfq`` file."""
 
     packed: dict[str, tuple[str, bytes]] = {}
     for name, t in tensors.items():
@@ -686,7 +686,7 @@ def save(path: str | Path, header: FileHeader, tensors: dict[str, MfqTensor]) ->
 
 
 def load(path: str | Path) -> tuple[FileHeader, dict[str, MfqTensor]]:
-    """读取 ``.mfq`` 文件，返回 ``(header, {name: NintTensor})``。"""
+    """Read an ``.mfq`` file and return ``(header, {name: NintTensor})``."""
 
     with open_mmap(path) as store:
         return store.header, {name: store[name] for name in store}

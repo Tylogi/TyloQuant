@@ -1,7 +1,7 @@
-"""FlashInfer MLA decode 的可选适配层。
+"""Optional adapter for FlashInfer MLA decode.
 
-适配层直接复用 TPQ 原有的分离 cKV/kPE 缓冲。依赖缺失、显式关闭或运行
-失败时返回 ``None``，调用方继续执行原 PyTorch MLA 路径。
+The adapter directly reuses TPQ's existing separated cKV/kPE buffers. It returns ``None`` when the dependency
+is missing, the adapter is explicitly disabled, or execution fails; callers then continue with the original PyTorch MLA path.
 """
 
 from __future__ import annotations
@@ -24,8 +24,8 @@ def _ensure_ninja_on_path() -> None:
     if shutil.which("ninja") is not None:
         return
     executable = "ninja.exe" if os.name == "nt" else "ninja"
-    # ``venv/bin/python`` 常是指向系统解释器的符号链接；只调用
-    # ``resolve()`` 会跳出虚拟环境并错过同目录安装的 ninja。
+    # ``venv/bin/python`` is often a symlink to the system interpreter. Calling only ``resolve()``
+    # leaves the virtual environment and misses ninja installed in the same directory.
     directories = (
         Path(sys.executable).parent,
         Path(sys.executable).resolve().parent,
@@ -61,7 +61,7 @@ def _wrapper_cls():
 
 
 class FlashInferMLADecode:
-    """batch=1、query=1 的固定地址 FlashInfer MLA 执行器。"""
+    """Fixed-address FlashInfer MLA executor for batch=1 and query=1."""
 
     page_size = 64
 
@@ -90,7 +90,7 @@ class FlashInferMLADecode:
             max_ctx + self.page_size - 1
         ) // self.page_size
 
-        # FlashInfer 建议 128 MiB split-K workspace。只有显式启用时分配。
+        # FlashInfer recommends a 128 MiB split-K workspace. Allocate it only when explicitly enabled.
         workspace = torch.empty(
             128 * 1024 * 1024,
             dtype=torch.uint8,

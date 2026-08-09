@@ -393,8 +393,8 @@ class KimiK3TPQModel:
                     "[tpq-kimi] CPU NUMA：后续权重与专家内存跨节点交错分配",
                     flush=True,
                 )
-            # 所有 CPU 模型统一使用同一组懒编译原生内核。启动阶段预编译，
-            # 避免首个 token 混入编译耗时。
+            # All CPU models use the same lazily compiled native kernels. Precompile them during startup
+            # so compilation time is not included in the first token.
             from .cpuext import prebuild as prebuild_cpu
 
             prebuild_cpu()

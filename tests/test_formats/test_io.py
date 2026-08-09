@@ -1,4 +1,4 @@
-"""formats.io 序列化往返测试（NINT）。"""
+"""NINT serialization round-trip tests for formats.io."""
 
 from __future__ import annotations
 

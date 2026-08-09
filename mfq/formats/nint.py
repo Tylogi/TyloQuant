@@ -1,19 +1,19 @@
-"""NINT — Neuron-anchored INT quantization (MFQ 核心权重格式).
+"""NINT -- Neuron-anchored INT quantization, MFQ's core weight format.
 
-两级仿射 INT，顶层 scale 锚定在一个 **Neuron**（一条输出神经元的整条权重行），
-而非任意 superblock：
+Two-level affine INT whose top-level scale is anchored to a **neuron** (the complete weight row of one output neuron)
+rather than an arbitrary superblock:
 
     x ≈ (d_neuron · ls) · q − (dmin_neuron · lm)
 
-- ``d_neuron``, ``dmin_neuron``：每个神经元一个 f16 scale/min（整行共享）。
-- ``ls``, ``lm``：每组 k-bit sub-scale/sub-min（相对 neuron max 的比值）。
-- ``q``：每元素 b-bit INT。
+- ``d_neuron``, ``dmin_neuron``: one f16 scale/minimum per neuron, shared across the full row.
+- ``ls``, ``lm``: one k-bit sub-scale/sub-minimum per group, relative to the neuron maximum.
+- ``q``: one b-bit INT per element.
 
-per-group scale/min 由加权最小二乘 (:func:`make_qkx2`) 搜索——与 llama.cpp
-K-quant 同款优化器。Neuron 锚定利用 per-neuron 幅度结构，实测在真实 LLM 权重上
-同等 bpw 比 superblock 锚定的 Q4_K 高约 0.5 dB（INT4/gs=24/k=6 → 23.4 dB @ 4.5 bpw）。
+Per-group scale/minimum values are searched by weighted least squares (:func:`make_qkx2`), using the same optimizer
+as llama.cpp K-quant. Neuron anchoring exploits per-neuron magnitude structure and measures about 0.5 dB higher than
+superblock-anchored Q4_K at equal bpw on real LLM weights (INT4/gs=24/k=6 -> 23.4 dB at 4.5 bpw).
 
-理论 bpw = bits + 32/neuron_len + 2·sub_bits/groupsize
+Theoretical bpw = bits + 32/neuron_len + 2*sub_bits/groupsize
 """
 
 from __future__ import annotations
@@ -25,14 +25,14 @@ import numpy as np
 
 @dataclass(frozen=True)
 class NintSpec:
-    """Neuron-anchored INT 量化规格（量化器逐张量搜索这三个旋钮）。
+    """Neuron-anchored INT quantization specification; the quantizer searches these three controls per tensor.
 
     Attributes:
-        bits: 每元素比特数（2、3、4、5、…）。
-        groupsize: sub-group 大小 gs（INT4 甜点 24；不必整除 neuron_len，
-            尾组自动补零、补零位在优化时置零权重忽略）。
-        sub_bits: sub-scale 位数 k（INT4 甜点 6；过大会让 d_neuron=neu_s/K
-            落入 f16 次正规区而退化，上限约 8）。
+        bits: Bits per element (2, 3, 4, 5, ...).
+        groupsize: Sub-group size gs (24 is the INT4 sweet spot). It need not divide neuron_len;
+            the trailing group is zero-padded, and padded positions receive zero weight during optimization.
+        sub_bits: Number of sub-scale bits k (6 is the INT4 sweet spot). Excessive values make
+            d_neuron=neu_s/K fall into the f16 subnormal range and degrade; the practical upper limit is about 8.
     """
 
     bits: int = 4
@@ -44,23 +44,23 @@ class NintSpec:
         return (1 << self.bits) - 1
 
     def bpw(self, neuron_len: int) -> float:
-        """理论 bits-per-weight（假设 sub-byte 位打包）。"""
+        """Theoretical bits per weight, assuming sub-byte bit packing."""
         return self.bits + 32.0 / neuron_len + 2.0 * self.sub_bits / self.groupsize
 
     @property
     def profile_label(self) -> str:
-        """kernel 分派用的 profile 标签，如 ``NINT4-24``（只看 bits/gs，不含 k）。"""
+        """Profile label for kernel dispatch, such as ``NINT4-24``; includes bits/gs but not k."""
         return profile_label(self.bits, self.groupsize)
 
 
-# 2026-07-26 三维 Pareto 搜索固定点：
+# Fixed point from the three-dimensional Pareto search on 2026-07-26:
 # groupsize=16, scale_bits=min_bits=sub_bits=5, weighted-MSE。
-# K=5120 时 2.63125 bpw；256 行 × 10 个 Qwen3.6-27B 矩阵上为 11.1920 dB。
+# 2.63125 bpw at K=5120; 11.1920 dB over 256 rows x 10 Qwen3.6-27B matrices.
 NINT2_SPEC = NintSpec(bits=2, groupsize=16, sub_bits=5)
 
 
-# 固定 profile 目录：(bits, groupsize)。k 自由（烘焙进 neuron_scale，kernel 不可见）。
-# runtime kernel 按 profile 分派，每个 (bits, gs) 一个 kernel 变体。
+# Fixed profile catalog: (bits, groupsize). k is free (baked into neuron_scale and invisible to the kernel).
+# Runtime kernels dispatch by profile, with one kernel variant per (bits, gs).
 PROFILE_CATALOG: tuple[tuple[int, int], ...] = (
     (2, 16),
     *((4, gs) for gs in (16, 24, 32, 48, 64)),
@@ -84,25 +84,25 @@ RUNTIME_PROFILE_CATALOG: tuple[tuple[int, int], ...] = (
 
 
 def profile_label(bits: int, groupsize: int) -> str:
-    """返回 profile 标签，如 ``NINT4-24``。"""
+    """Return a profile label such as ``NINT4-24``."""
     return f"NINT{bits}-{groupsize}"
 
 
 @dataclass
 class NintCode:
-    """一个 neuron 行经 NINT 量化后的紧凑表示。
+    """Compact representation of one neuron row after NINT quantization.
 
-    存储约定（convention B，与验证实验一致）：``neuron_scale = f16(neu_s / K)``，
-    反量化 ``d_eff = neuron_scale · sub_scale``，其中 sub_scale ∈ [0, K]。
+    Storage convention B, matching validation experiments: ``neuron_scale = f16(neu_s / K)``.
+    Dequantization uses ``d_eff = neuron_scale * sub_scale``, where sub_scale is in [0, K].
     """
 
     spec: NintSpec
-    n: int                       # 有效元素数（≤ 实际存储 q 的长度；尾组补零部分不算）
-    q: np.ndarray                # uint，每元素；长度 = ng·gs（含尾组补零）
-    neuron_scale: np.float32     # f16-round-tripped 的 neu_s/K
-    neuron_min: np.float32       # f16-round-tripped 的 neu_m/K（the_min/K，≥0）
-    sub_scale: np.ndarray        # uint，每组，k-bit
-    sub_min: np.ndarray          # uint，每组，k-bit
+    n: int                       # Number of valid elements (<= stored q length; excludes trailing-group padding)
+    q: np.ndarray                # uint per element; length = ng*gs (including trailing-group padding)
+    neuron_scale: np.float32     # neu_s/K after an f16 round trip
+    neuron_min: np.float32       # neu_m/K after an f16 round trip (the_min/K, >=0)
+    sub_scale: np.ndarray        # k-bit uint per group
+    sub_min: np.ndarray          # k-bit uint per group
 
 
 def _uint_dtype(maxval: int) -> np.dtype:
@@ -110,7 +110,7 @@ def _uint_dtype(maxval: int) -> np.dtype:
 
 
 def _qkx2_search(nmax: int) -> tuple[float, float, int]:
-    """make_qkx2 搜索参数随 nmax 取（对齐 llama.cpp Q4_K/Q5_K 的取值）。"""
+    """Choose make_qkx2 search parameters by nmax, matching llama.cpp Q4_K/Q5_K values."""
     if nmax <= 15:
         return -1.0, 0.1, 20
     return -0.5, 0.1, 15
@@ -119,11 +119,11 @@ def _qkx2_search(nmax: int) -> tuple[float, float, int]:
 def make_qkx2(x: np.ndarray, w: np.ndarray, nmax: int = 15,
               rmin: float | None = None, rdelta: float = 0.1,
               nstep: int | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """加权最小二乘搜索最优仿射 (scale, zp)，每组（最后一维）独立。
+    """Use weighted least squares to find the best affine (scale, zp) independently for each group on the final dimension.
 
-    x, w: ``(..., gs)``。返回 ``(scale, zp)``，重构 ``recon = zp + scale·L``，
-    ``L ∈ [0, nmax]``，``zp ≤ 0``。权重 ``w`` 典型取 ``av_x + |x|``
-    （``av_x`` 为组内 RMS）；``w == 0`` 的元素被忽略（用于尾组补零）。
+    x, w: ``(..., gs)``. Returns ``(scale, zp)`` and reconstructs ``recon = zp + scale*L``, where
+    ``L`` is in [0, nmax] and ``zp <= 0``. Weights ``w`` typically use ``av_x + |x|``, where ``av_x``
+    is the group RMS. Elements with ``w == 0`` are ignored, which supports trailing-group padding.
     """
 
     if rmin is None:
@@ -175,7 +175,7 @@ def make_qkx2(x: np.ndarray, w: np.ndarray, nmax: int = 15,
 
 
 def quantize(x: np.ndarray, spec: NintSpec) -> NintCode:
-    """量化一个 1D neuron 行（该神经元整条权重）为 :class:`NintCode`。"""
+    """Quantize one 1D neuron row, containing all weights for that neuron, into :class:`NintCode`."""
 
     x = np.asarray(x, dtype=np.float32).reshape(-1)
     gs = spec.groupsize
@@ -231,7 +231,7 @@ def quantize(x: np.ndarray, spec: NintSpec) -> NintCode:
 
 
 def dequantize(code: NintCode) -> np.ndarray:
-    """将 :class:`NintCode` 反量化回 1D float32（长度 = ``code.n``）。"""
+    """Dequantize :class:`NintCode` to 1D float32 of length ``code.n``."""
 
     gs = code.spec.groupsize
     k = code.spec.sub_bits

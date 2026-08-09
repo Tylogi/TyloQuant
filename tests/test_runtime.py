@@ -1,4 +1,4 @@
-"""runtime 推理参考实现测试。"""
+"""Tests for the runtime inference reference implementation."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ def test_nintlinear_bias_and_caching():
     assert lin._w is None
     x = rng.normal(0, 1, size=(2, 64)).astype(np.float32)
     y = lin(x)
-    assert lin._w is not None            # 惰性反量化已触发
+    assert lin._w is not None            # Lazy dequantization has been triggered
     np.testing.assert_allclose(y, x @ lin.weight.T + b, atol=1e-5)
 
 
@@ -57,7 +57,7 @@ def test_silu_ffn_matches_float_reference():
     ffn = SwiGLUFFN(NintLinear(_qt(Wg)), NintLinear(_qt(Wu)), NintLinear(_qt(Wd)))
     x = rng.normal(0, 1, size=(3, din)).astype(np.float32)
     y = ffn(x)
-    # float 参考（用反量化权重）
+    # Floating-point reference using dequantized weights
     g = x @ nint_quant.dequantize(_qt(Wg)).T
     u = x @ nint_quant.dequantize(_qt(Wu)).T
     a = g / (1 + np.exp(-g))
@@ -105,7 +105,7 @@ def test_profile_dispatch_uses_registered_backend():
 
     def fake_kernel(tensor):
         calls["n"] += 1
-        return np.ones_like(nint_quant.dequantize(tensor))  # 哨兵：全 1
+        return np.ones_like(nint_quant.dequantize(tensor))  # Sentinel: all ones
 
     try:
         register_backend("NINT4-24", fake_kernel)
@@ -114,7 +114,7 @@ def test_profile_dispatch_uses_registered_backend():
         assert (out == 1.0).all()
     finally:
         clear_backends()
-    # 清除后回退到默认
+    # Fall back to the default after clearing
     out2 = dequantize(t)
     assert not (out2 == 1.0).all()
 

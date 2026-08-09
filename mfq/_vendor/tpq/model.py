@@ -1,9 +1,9 @@
-"""TPQ 模型前向：GLM-5.2（MLA + MoE）在 CPU 上的完整推理实现。
+"""TPQ model forward pass: complete CPU inference implementation of GLM-5.2 with MLA and MoE.
 
-数值与 TPQ/modelmath.py 逐行一致（该实现已对照逐元素朴素实现验证，max_diff<1e-8），
-差异仅在权重来源：dense 走 Int4Weight 分块反量化，专家走 ExpertPool 的 VQ LUT。
-注意力为全量因果注意力（短上下文 <2048 与 DSA top-2048 等价），KV cache 以 f16 存储。
-MTP 层与 DSA indexer 不存在于 TPQ 产物中，本文件亦不实现。
+Numerics match TPQ/modelmath.py line by line and were verified against a naive element-wise implementation with
+max_diff<1e-8. Only the weight source differs: dense weights use blocked Int4Weight dequantization and experts use
+the ExpertPool VQ LUT. Attention is full causal attention, equivalent to DSA top-2048 for short contexts below 2048,
+and KV cache is stored in f16. MTP layers and the DSA indexer are absent from TPQ artifacts and are not implemented here.
 """
 
 from __future__ import annotations
@@ -125,11 +125,11 @@ def _glm_route(
 
 
 class GLMModel:
-    """TPQ 格式 GLM-5.2 的推理模型（CPU / CUDA 双路径）。
+    """Inference model for TPQ-format GLM-5.2 with CPU and CUDA paths.
 
-    device="cpu"：dense int4 打包驻留内存，专家缓存于内存（默认）。
-    device="cuda"：dense 权重（int4 打包态 ≈9.2GB）与 KV cache 常驻显存，
-    专家缓存于显存（vram_cache_gb 预算），未命中从磁盘/内存页缓存上传。
+    device="cpu": packed dense int4 resides in memory and experts are cached in memory by default.
+    device="cuda": dense weights (~9.2 GB packed int4) and KV cache reside in VRAM; experts are cached in VRAM
+    under the vram_cache_gb budget, with misses uploaded from disk or the memory page cache.
     """
 
     def __init__(
@@ -153,8 +153,9 @@ class GLMModel:
             }
         )
         gpu = self.device.type != "cpu"
-        # 热专家静态钉住已证伪：路由热度和输入域强相关（编码提示实测命中仅 14%，
-        # 平均 profile 的 top-32 覆盖 66% 只是跨域平均），LRU 的会话局部性更优
+        # Static pinning of hot experts has been disproven: routing popularity strongly depends on the input domain
+        # (only a 14% measured hit rate for coding prompts; the average profile's 66% top-32 coverage is merely a cross-domain mean).
+        # An LRU makes better use of session locality.
         pin_gb = float(os.environ.get("TPQ_PIN_GB", "0")) if gpu else 0.0
         self._cache_gb = cache_gb
         self._vram_cache_gb = vram_cache_gb
@@ -179,9 +180,9 @@ class GLMModel:
                 ram_gb=cache_gb - pin_gb if gpu else 0.0,
                 pin_gb=pin_gb,
             )
-        # 逻辑上下文可很大，但把整张 RoPE 表一次性放入每层 Graph 的公共
-        # 工作集会拖慢短/中上下文。先固定 32K 地址窗口，跨界时成倍扩展并
-        # 统一重捕获；这不改变 max_ctx 的逻辑准入上限。
+        # The logical context can be large, but placing the entire RoPE table in every layer graph's shared working set
+        # slows short and medium contexts. Start with a fixed 32K address window, double it at boundaries, and recapture
+        # all graphs together. This does not change the logical max_ctx admission limit.
         rope_initial = max(
             2048,
             int(os.environ.get("TPQ_ROPE_INITIAL_CTX", "32768")),
@@ -224,29 +225,29 @@ class GLMModel:
         )
         self._attention_graph_failed = False
         self._masks: dict[int, torch.Tensor] = {}
-        self._prev_ids: dict[int, list[int]] = {}   # 层 → 上一 token 路由专家（预取用）
-        # MLA 潜变量 KV（TPQ_LATENT_KV，默认开）：存 c_kv [S,512] + k_rot [S,64] f16
-        # （≈0.09MB/token），注意力用吸收形式（q_nope@Wuk、ctx@Wuv^T）免逐头展开；
-        # 旧路径（=0）存逐头全量 K/V f16（5.11MB/token，22GB 卡 ctx 受限）。
+        self._prev_ids: dict[int, list[int]] = {}   # Layer -> routed experts for the previous token (used for prefetch)
+        # Latent MLA KV (TPQ_LATENT_KV, enabled by default) stores c_kv [S,512] plus k_rot [S,64] in f16
+        # (~0.09 MB/token). Attention uses absorbed form (q_nope@Wuk, ctx@Wuv^T) without per-head expansion.
+        # The legacy path (=0) stores full per-head K/V in f16 (5.11 MB/token, limiting context on 22 GB cards).
         self.latent_kv = (os.environ.get("TPQ_LATENT_KV", "1") != "0"
                           and self.device.type != "cpu")
-        # 计算 dtype（精度策略层）：GPU 上半精度张量核（Turing→fp16，Ampere+→bf16），
-        # MLA 吸收矩阵与潜变量 KV 按此存储，注意力 einsum 免 .float() 上抛
+        # Compute dtype (precision-policy layer): use half-precision tensor cores on GPU (Turing -> fp16, Ampere+ -> bf16).
+        # Store MLA absorption matrices and latent KV in this dtype so attention einsum needs no promotion via .float().
         self.cdt = compute_dtype(self.device) if gpu else torch.float32
-        self._wuk: dict[int, torch.Tensor] = {}   # [H, nope, R] 计算 dtype
-        self._wuv: dict[int, torch.Tensor] = {}   # [H, v, R] 计算 dtype
-        # 每层 KV cache：latent 模式 (c_kv [S,R] f16, k_rot [S,rd] f16)；
-        # 旧模式 (k [H, S, qk_head_dim] f16, v [H, S, v_head_dim] f16)
+        self._wuk: dict[int, torch.Tensor] = {}   # [H, nope, R] in the compute dtype
+        self._wuv: dict[int, torch.Tensor] = {}   # [H, v, R] in the compute dtype
+        # Per-layer KV cache: latent mode uses c_kv [S,R] f16 and k_rot [S,rd] f16;
+        # legacy mode uses k [H, S, qk_head_dim] f16 and v [H, S, v_head_dim] f16.
         self.kv: list[tuple[torch.Tensor, torch.Tensor] | None] = \
             [None] * self.cfg["n_layers"]
-        # CUDA 潜变量 KV 使用可扩容复用区；self.kv 继续保存已用区间视图，
-        # 保持截断接口不变。decode 直接原位写入一行，不再每层、每 token
-        # 分配两个 torch.cat 结果。
+        # CUDA latent KV uses growable reusable storage; self.kv continues to hold views of the used range,
+        # preserving the truncation interface. Decode writes one row in place instead of allocating two torch.cat
+        # results for every layer and token.
         self._latent_buffers: list[
             tuple[torch.Tensor, torch.Tensor] | None
         ] = [None] * self.cfg["n_layers"]
-        # FlashInfer 直接复用上述分离 KV 缓冲；关闭、缺依赖或失败时原
-        # PyTorch MLA 路径不变。
+        # FlashInfer directly reuses the separated KV buffers above. When disabled, unavailable, or failed,
+        # the original PyTorch MLA path remains unchanged.
         self._flashinfer_mla_runner = None
         self._flashinfer_mla_unavailable = False
         self._flashinfer_mla_state = None
@@ -285,8 +286,8 @@ class GLMModel:
         self.pos = 0
 
     def preload(self) -> None:
-        """GPU 路径：把全部 dense 权重预载到显存（约 13GB，含 lm_head/router 常驻 f32），
-        并把钉住热专家预读到 RAM（消除冷启动拖尾）。"""
+        """GPU path: preload all dense weights into VRAM (about 13 GB, including resident f32 lm_head/router)
+        and preread pinned hot experts into RAM to eliminate the cold-start tail."""
         if self.device.type == "cpu":
             return
         t0 = time.time()
@@ -323,12 +324,12 @@ class GLMModel:
         resident_all = self.pool.preload_all()
         if resident_all:
             self.pool.pin_host_resident()
-        else:   # 内存不够（已警告）时回退热钉住 + LRU
+        else:   # When memory is insufficient (already warned), fall back to hot pinning plus LRU
             self.pool.preload_pinned()
         self.pool.build_gpu_arenas()
 
     def _build_absorbed_layer(self, layer: int) -> None:
-        """单层的 kv_b_proj → Wuk/Wuv 分解（preload 全量或首次按需懒构建）。"""
+        """Decompose one layer's kv_b_proj into Wuk/Wuv, either during full preload or lazily on first demand."""
         c = self.cfg
         H, R = c["n_heads"], c["kv_lora_rank"]
         nope, vd = c["qk_nope_head_dim"], c["v_head_dim"]
@@ -340,8 +341,8 @@ class GLMModel:
         self._wuv[layer] = w[:, nope:].to(self.cdt).to(self.device)
 
     def _build_absorbed(self) -> None:
-        """预分解各层 kv_b_proj 为吸收形式矩阵 Wuk/Wuv（f16 显存常驻，≈2.3GB/78层）。
-        kv_b_proj [H*(nope+v), R] → 每头前 nope 行为 Wuk、后 v 行为 Wuv。"""
+        """Predecompose each layer's kv_b_proj into absorbed-form Wuk/Wuv matrices resident in f16 VRAM (~2.3 GB/78 layers).
+        kv_b_proj [H*(nope+v), R] maps the first nope rows per head to Wuk and the final v rows to Wuv."""
         c = self.cfg
         t0 = time.time()
         for layer in range(c["n_layers"]):
@@ -350,13 +351,13 @@ class GLMModel:
         print(f"[tpq] MLA 吸收矩阵预分解完成（{time.time() - t0:.1f}s，"
               f"KV 潜变量模式 ≈0.09MB/token，显存 {vram:.1f}GB）", flush=True)
 
-    # ---- 权重访问（带缓存） ----
+    # ---- Weight access (with caching) ----
     def w(self, name: str):
         wt = self._wcache.get(name)
         if wt is None:
             wt = self.store.get_dense(name)
             if self.device.type != "cpu":
-                # GPU 路径：全部 dense 上显存（int4 打包态直接上卡，lm_head/router 解到 f32）
+                # GPU path: place all dense weights in VRAM (packed int4 goes directly to the device; lm_head/router dequantize to f32)
                 if isinstance(wt, Int4Weight):
                     if name == "lm_head.weight":
                         packed_lm = Int4Weight(
@@ -381,7 +382,7 @@ class GLMModel:
                     elif self.f32_resident(name):
                         wt = wt.dequant_rows(0, wt.shape[0]).to(self.device)
                     else:
-                        # int4 fp16 计算默认关（TPQ_INT4_HALF=1 开启；见 dsv4model 注释）
+                        # int4 fp16 computation is disabled by default (enable with TPQ_INT4_HALF=1; see the dsv4model comment)
                         wt = Int4Weight(
                             wt.q.to(self.device),
                             wt.s.to(self.device),
@@ -401,8 +402,8 @@ class GLMModel:
                     )
                 else:
                     wt = wt.to(self.device)
-            # 高频大矩阵常驻 f32：lm_head（951M，每 token 全量乘）与各层 router
-            # （gate.weight 118M）。其余 dense 保持 int4 打包 + 分块反量化以省内存。
+            # Keep frequently used large matrices resident in f32: lm_head (951M, multiplied in full for every token)
+            # and each layer's router (118M gate.weight). Other dense weights remain packed int4 with blocked dequantization to save memory.
             elif isinstance(wt, Int4Weight) and self.f32_resident(name):
                 wt = wt.dequant_rows(0, wt.shape[0])
             self._wcache[name] = wt
@@ -418,8 +419,8 @@ class GLMModel:
         self.pos = 0
 
     def truncate_kv(self, keep: int) -> None:
-        """KV 截断到前 keep 位（MTP 投机验证回滚用）。
-        旧格式 k/v [H, S, d] 切 dim1；潜变量格式 ckv/krot [S, d] 切 dim0。"""
+        """Truncate KV to the first ``keep`` positions for rollback after MTP speculative validation.
+        Slice legacy k/v [H, S, d] on dimension 1 and latent ckv/krot [S, d] on dimension 0."""
         if self.latent_kv:
             self.kv = [(k_[:keep], v_[:keep]) if k_ is not None else None
                        for k_, v_ in self.kv]
@@ -434,13 +435,13 @@ class GLMModel:
         layer: int,
         required: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """返回至少能容纳 ``required`` 行的可复用潜变量 KV 缓冲区。"""
+        """Return a reusable latent-KV buffer capable of holding at least ``required`` rows."""
         current = self._latent_buffers[layer]
         if current is not None and current[0].shape[0] >= required:
             return current
         if current is not None and self._attention_graphs:
-            # 每层 Graph 只捕获自己的 KV 地址。某一层扩容不应使其余
-            # 77 层全部失效，否则长上下文边界会退化为逐 token 重捕获。
+            # Each layer graph captures only its own KV address. Growing one layer must not invalidate the other 77 layers,
+            # or long-context boundaries would degrade into per-token recapture.
             self._attention_graphs.pop(layer, None)
         initial = self._latent_initial_capacity(layer)
         old_capacity = 0 if current is None else current[0].shape[0]
@@ -448,8 +449,7 @@ class GLMModel:
             self.max_ctx,
             max(required, initial, old_capacity * 2),
         )
-        # FlashInfer MLA 使用 page=64；额外尾部只是存储容量，不改变
-        # max_ctx 的逻辑上限。
+        # FlashInfer MLA uses page=64; the extra tail is storage capacity only and does not change the logical max_ctx limit.
         capacity = ((capacity + 63) // 64) * 64
         ckv = torch.empty(
             capacity,
@@ -523,7 +523,7 @@ class GLMModel:
         return min(self.max_ctx, graph_window)
 
     def _prepare_flashinfer_mla_decode(self, end: int):
-        """单 token 规划一次 FlashInfer MLA，随后 78 层复用。"""
+        """Plan FlashInfer MLA once per token and reuse it across all 78 layers."""
         if (
             not self.latent_kv
             or self.cdt != torch.bfloat16
@@ -590,11 +590,11 @@ class GLMModel:
             # Captured kernels may still read the old cos/sin addresses.
             torch.cuda.synchronize(self.device)
         if self.rope.ensure_length(min(self.max_ctx + 8, required + 8)):
-            # Attention Graph 直接捕获 cos/sin 地址；扩容后只需在边界
-            # 重捕获一次，不能继续重放旧地址。
+            # The attention graph captures cos/sin addresses directly. After growth, recapture once at the boundary;
+            # the old addresses cannot be replayed.
             self._attention_graphs.clear()
 
-    # ---- 基本件 ----
+    # ---- Primitives ----
     def _decode_workspace(
         self,
         layer: int,
@@ -855,18 +855,18 @@ class GLMModel:
         pos0: int,
         input_norm_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """MLA 吸收形式注意力：KV 只存潜变量（c_kv [S,R] + k_rot [S,rd]，计算 dtype），
-        分数 = (q_nope@Wuk)@c_kv^T + q_rot@k_rot^T，输出 = (attn@c_kv)@Wuv^T。
-        与 _attention_full 数学等价（展开点不同，半精度舍入位置略移），
-        KV 显存 5.11→0.09 MB/token，长上下文不再顶爆 22GB 卡。
-        GEMM 走精度策略层半精度（fp16/bf16 张量核），softmax 保持 f32。"""
+        """Absorbed-form MLA attention stores only latent KV (c_kv [S,R] plus k_rot [S,rd] in compute dtype).
+        Scores = (q_nope@Wuk)@c_kv^T + q_rot@k_rot^T, and output = (attn@c_kv)@Wuv^T.
+        This is mathematically equivalent to _attention_full, with different expansion points slightly shifting
+        half-precision rounding. KV VRAM falls from 5.11 to 0.09 MB/token, so long contexts no longer exhaust 22 GB cards.
+        GEMMs use half precision from the precision policy (fp16/bf16 tensor cores), while softmax remains f32."""
         c = self.cfg
         H = c["n_heads"]
         p = f"model.layers.{layer}.self_attn"
         T = x.shape[0]
         dt = self.cdt
         if layer not in self._wuk:
-            self._build_absorbed_layer(layer)   # 未走 preload 的路径（自检/调试）懒构建
+            self._build_absorbed_layer(layer)   # Lazily build for paths that skipped preload (self-check/debug)
         q_a_weight = self.w(f"{p}.q_a_proj.weight")
         kv_a_weight = self.w(f"{p}.kv_a_proj_with_mqa.weight")
         fused_qkv = (
@@ -1241,7 +1241,7 @@ class GLMModel:
         scores = merge_attention_scores(
             score_nope, score_rope, scale
         )                                                           # [H,T,S] f32
-        if T > 1:  # decode 单 token 时全部历史可见，无需掩码
+        if T > 1:  # During single-token decode, all history is visible and no mask is needed
             kpos = torch.arange(S, device=x.device)
             qpos = torch.arange(pos0, pos0 + T, device=x.device)
             causal = kpos[None, :] > qpos[:, None]
@@ -1342,7 +1342,7 @@ class GLMModel:
 
         scores = (q_f.float() @ k_f.float().transpose(1, 2)) / math.sqrt(c["qk_head_dim"])
         S = scores.shape[-1]
-        if T > 1:  # decode 单 token 时全部历史可见，无需掩码
+        if T > 1:  # During single-token decode, all history is visible and no mask is needed
             kpos = torch.arange(S, device=x.device)
             qpos = torch.arange(pos0, pos0 + T, device=x.device)
             causal = kpos[None, :] > qpos[:, None]
@@ -1467,8 +1467,8 @@ class GLMModel:
             parallel.profile_cuda("final_add", add_start, add_end)
             return result
 
-        # 单 token decode：复用 DSV4 已验证的 top-k VQ grouped/SM120 slot
-        # 路径。共享专家先入队，使 indices DtoH 同步期间 GPU 仍有工作。
+        # Single-token decode reuses DSV4's validated top-k VQ grouped/SM120-slot path.
+        # Queue the shared expert first so the GPU remains busy during the indices DtoH synchronization.
         if x.shape[0] == 1 and os.environ.get("TPQ_GROUPED", "1") != "0":
             from .grouped import moe_mlp_grouped_mixed
 
@@ -1504,10 +1504,10 @@ class GLMModel:
         inter_size = c["moe_inter"]
         y = torch.zeros_like(x)
         uniq = idx.unique()
-        eids = uniq.tolist()                        # 一次 DtoH 同步（原实现两次）
+        eids = uniq.tolist()                        # One DtoH synchronization (the original implementation used two)
         self._prev_ids[layer] = eids
         need = [(layer, e) for e in eids]
-        experts = self.pool.get_many(need)                  # 并行加载/上传
+        experts = self.pool.get_many(need)                  # Parallel loading/upload
         for e in eids:
             toks, slots = (idx == e).nonzero(as_tuple=True)
             gu, dn = experts[(layer, e)]
@@ -1536,7 +1536,7 @@ class GLMModel:
         )
 
     def _mask(self, layer: int) -> torch.Tensor:
-        """该层可用专家掩码（缓存；drop 专家为 False）。"""
+        """Return the cached available-expert mask for this layer, with dropped experts set to False."""
         m = self._masks.get(layer)
         if m is None:
             m = self.store.available_mask(layer).to(self.device)
@@ -1547,7 +1547,7 @@ class GLMModel:
         self,
         ids: list[int] | torch.Tensor,
     ) -> torch.Tensor:
-        """前向一段 token，返回全部位置的最终 hidden [T, hidden]（已过 final norm）。"""
+        """Forward a token segment and return final-normalized hidden states [T, hidden] for all positions."""
         c = self.cfg
         eps = c["rms_eps"]
         if self.pos + len(ids) > self.max_ctx:
@@ -1565,14 +1565,14 @@ class GLMModel:
         )
         x = self.embed(ids)
         if self._prev_ids and len(ids) == 1 and os.environ.get("TPQ_PREFETCH", "1") != "0":
-            # decode 单步：token 级全层预取（窗口 = 整个 token，见 dsv4model.decode）
+            # Single decode step: token-level all-layer prefetch (window = the entire token; see dsv4model.decode)
             for layer_id, expert_ids in self._prev_ids.items():
                 self.pool.prefetch(
                     [(layer_id, expert_id) for expert_id in expert_ids]
                 )
         moe_set = set(c["moe_layers"])
         for layer in range(c["n_layers"]):
-            # 跨层专家预取（B2）：上一 token 本层路由专家与本层 attention 计算重叠
+            # Cross-layer expert prefetch (B2): overlap experts routed by this layer for the previous token with this layer's attention computation
             prev = self._prev_ids.get(layer)
             if prev and len(ids) == 1 and os.environ.get("TPQ_PREFETCH", "1") != "0":
                 self.pool.prefetch([(layer, e) for e in prev])
@@ -1681,7 +1681,7 @@ class GLMModel:
         )
 
     def logits_of(self, h: torch.Tensor) -> torch.Tensor:
-        """hidden [N, hidden] → logits [N, vocab]（lm_head，int4 分块或 f32 直接乘）。"""
+        """Map hidden [N, hidden] to logits [N, vocab] through lm_head using blocked int4 or direct f32 multiplication."""
         lm = self.w("lm_head.weight")
         if (
             self._lm_head_int4 is not None
@@ -1714,6 +1714,6 @@ class GLMModel:
         self,
         ids: list[int] | torch.Tensor,
     ) -> torch.Tensor:
-        """前向一段 token（prefill 或单步 decode），返回最后位置的 f32 logits [vocab]。"""
+        """Forward a token segment for prefill or one-step decode and return final-position f32 logits [vocab]."""
         h = self.forward_hidden(ids)
         return self.logits_of(h[-1:]).squeeze(0)

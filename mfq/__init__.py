@@ -1,21 +1,21 @@
 """MFQ — Mixed Format Quantization.
 
-面向 Blackwell 与 Apple Silicon 的 tensorwise 混合精度量化工具链。
+Tensor-wise mixed-precision quantization toolkit for Blackwell and Apple Silicon.
 
-子包总览
+Subpackage overview
 --------
 formats
-    MFQ 原生格式定义（NINT neuron-anchored INT 编解码、精度方案 scheme、文件头与序列化）。
+    MFQ native-format definitions (NINT neuron-anchored INT codec, precision schemes, headers, and serialization).
 quantize
-    量化执行逻辑（NINT 张量量化、灵敏度分析与精度分配、Hadamard 旋转）。
+    Quantization logic (NINT tensor quantization, sensitivity analysis and precision allocation, and Hadamard rotation).
 calibration
-    逐层校准（收集全精度与量化路径的 hidden、按层分配精度）。
+    Per-layer calibration (collect full-precision and quantized hidden states and allocate precision by layer).
 kernels
-    硬件后端 kernel（CUDA / Metal；torch GPU 参考实现见 runtime）。
+    Hardware backend kernels (CUDA / Metal; see runtime for the torch GPU reference implementation).
 runtime
-    推理引擎。
+    Inference engine.
 utils
-    通用工具（日志、张量辅助）。
+    Common utilities (logging and tensor helpers).
 """
 
 from mfq._version import __version__

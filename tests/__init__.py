@@ -1,1 +1,1 @@
-"""MFQ 测试套件。"""
+"""MFQ test suite."""

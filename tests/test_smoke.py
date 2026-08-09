@@ -1,4 +1,4 @@
-"""冒烟测试：确保包可导入、版本可读、CLI 可解析。"""
+"""Smoke tests ensuring the package imports, the version is readable, and the CLI parses."""
 
 from __future__ import annotations
 

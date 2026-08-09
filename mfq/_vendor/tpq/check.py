@@ -1,7 +1,7 @@
-"""发布版静态检查与容量规划。
+"""Release static checks and capacity planning.
 
-该命令不加载模型权重，也不编译 CUDA 扩展；适合在正式启动前检查模型文件、
-RAM/VRAM 余量、GPU 可见性、P2P 和 GLM TP2–TP8 容量。
+This command does not load model weights or compile CUDA extensions. It is suitable for checking model files,
+RAM/VRAM margins, GPU visibility, P2P, and GLM TP2-TP8 capacity before production startup.
 """
 
 from __future__ import annotations
@@ -213,8 +213,8 @@ def _slot_bytes(
             total += (indices * bits + 7) // 8
         return total
     base = kind.rstrip("z")
-    # 单字符层配额需要同时区分 v 与 vv；历史 TPQ 清单以大写
-    # ``V`` 表示 vv。容量规划只应规范化存储档位，不应依赖模型架构。
+    # Single-character layer quotas must distinguish v from vv; historical TPQ manifests use uppercase ``V`` for vv.
+    # Capacity planning should normalize storage tiers only and must not depend on model architecture.
     if base == "V" and "vv" in manifest["quant"]["vq"]:
         base = "vv"
     dimensions = manifest["quant"]["vq"].get(base)

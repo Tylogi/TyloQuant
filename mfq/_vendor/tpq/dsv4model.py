@@ -1,14 +1,18 @@
-"""TPQ 推理：DeepSeek-V4（TPQ 产物）前向模型。
+"""TPQ inference: the forward model for DeepSeek-V4 TPQ artifacts.
 
-加载 "tpq-1" 格式（tpq.json + dense.safetensors + experts.L*.safetensors），
-前向复用 TPQ/dsv4.py 的公共数学件（hc_pre/hc_post/hc_head/hc_split/rmsnorm/
-rope_apply/compressor_*/attn_* 的无权重依赖部分）；权重路径：
-  - 大 dense 矩阵（wq_a/wq_b/wkv/wo_a/wo_b/shared/head/embed）：Int4Weight 打包驻留
-    （显存/内存），经 _linear 走 LUT 反量化矩阵乘；
-  - 小权重（compressor/norms/hc/gate/attn_sink/ape/tid2eid）：f32 原样；
-  - routed 专家：ExpertPool 两级 LRU 的 VQWeight（LUT 免还原矩阵乘）。
-与 TPQ/dsv4.py 的关系：数值公式一致；为接入 int4/VQ 权重，线性层经本文件的
-_linear 分派（F.linear ↔ Int4Weight.matmul_T ↔ VQWeight.matmul_T）。
+Loads the ``tpq-1`` format (tpq.json + dense.safetensors +
+experts.L*.safetensors). The forward pass reuses the common mathematical
+components in TPQ/dsv4.py that do not depend on weights (hc_pre/hc_post/
+hc_head/hc_split/rmsnorm/rope_apply/compressor_*/attn_*). Weight paths:
+  - Large dense matrices (wq_a/wq_b/wkv/wo_a/wo_b/shared/head/embed) remain
+    packed as Int4Weight in VRAM or RAM and use LUT-based dequantized matrix
+    multiplication through _linear.
+  - Small weights (compressor/norms/hc/gate/attn_sink/ape/tid2eid) remain f32.
+  - Routed experts use VQWeight in ExpertPool's two-level LRU and perform
+    LUT-based matrix multiplication without reconstructing the matrix.
+The numerical formulas match TPQ/dsv4.py. To support int4/VQ weights, linear
+layers are dispatched through this file's _linear implementation
+(F.linear ↔ Int4Weight.matmul_T ↔ VQWeight.matmul_T).
 """
 
 from __future__ import annotations
@@ -151,10 +155,15 @@ def _parse_dense_bf16(value: str | None = None) -> frozenset[str]:
 
 
 def _tpq_lin(x: torch.Tensor, w) -> torch.Tensor:
-    """安装进 TPQ.dsv4._lin 的分派：Int4Weight/VQWeight 走 LUT 矩阵乘，其余 F.linear。
-    权重类的 matmul_T 只收 2D 输入，dsv4 的 3D [B,T,D] 在此压平再还原；
-    dense bf16 常驻后：matmul 与层间 hidden 均保持 bf16；需要稳定归约的算子
-    在各自内部局部升到 f32。"""
+    """Install dispatch into TPQ.dsv4._lin.
+
+    Int4Weight and VQWeight use LUT matrix multiplication; all other weights
+    use F.linear. Weight-class matmul_T methods accept only 2D inputs, so this
+    function flattens dsv4's 3D [B,T,D] inputs and restores their shape.
+    Once dense bf16 weights are resident, matrix multiplication and hidden
+    states between layers remain bf16. Operators requiring stable reductions
+    promote values locally to f32.
+    """
     if isinstance(
         w,
         (Int4Weight, BlockFP8Weight, ProjectionGroup, VQWeight),
@@ -181,8 +190,11 @@ def _tpq_lin(x: torch.Tensor, w) -> torch.Tensor:
 
 from . import dsv4 as _dsv4
 def _o_proj_tpq(o: torch.Tensor, w: dict, cfg) -> torch.Tensor:
-    """分组 LoRA O 的实现：Int4Weight 走逐组 dequant_rows；bf16 常驻张量走原生路径
-    （dtype 对齐）。数值与 TPQ.dsv4._o_proj 一致。"""
+    """Implement grouped LoRA O projection.
+
+    Int4Weight uses per-group dequant_rows. Resident bf16 tensors use the
+    native path with aligned dtypes. Numerics match TPQ.dsv4._o_proj.
+    """
     wo_a = w["wo_a"]
     if not isinstance(wo_a, (Int4Weight, BlockFP8Weight)):
         if o.dtype != wo_a.dtype:
@@ -272,19 +284,20 @@ def _o_proj_tpq(o: torch.Tensor, w: dict, cfg) -> torch.Tensor:
             )
     outs = []
     for g in range(G):
-        wa_g = wo_a.dequant_rows(g * rank, (g + 1) * rank)  # [rank, D]（Int4Weight.half 时 fp16）
+        wa_g = wo_a.dequant_rows(g * rank, (g + 1) * rank)  # [rank, D] (fp16 when Int4Weight.half is set)
         og = o[:, :, g]
         outs.append((og.half() @ wa_g.t()).float() if wa_g.dtype != og.dtype else og @ wa_g.t())
     o = torch.stack(outs, dim=2)
     return _tpq_lin(o.flatten(2), w["wo_b"])
 
 
-_dsv4._lin = _tpq_lin              # 线性层钩子：dsv4.py 全部线性层经此分派
-_dsv4._o_proj_hook = _o_proj_tpq  # O 投影钩子安装（dsv4.py 的 attn 经此走 Int4 分组反量化）
+_dsv4._lin = _tpq_lin              # Linear-layer hook: all linear layers in dsv4.py dispatch through this function
+_dsv4._o_proj_hook = _o_proj_tpq  # Install the O-projection hook (attention in dsv4.py uses grouped Int4 dequantization through it)
 
-# HC sinkhorn 融合钩子：20 轮 4×4 双随机归一化原本每轮 4 次小 kernel（每层 attn/ffn
-# 两次调用，逐 token ~6500 次 launch），融合后一次 launch。无扩展/非 CUDA/f64 时
-# 返回 None 回退原 torch 循环（dspark.py 的 hc_pre/hc_post 同享本钩子）。
+# Fused HC Sinkhorn hook: 20 rounds of 4x4 doubly stochastic normalization originally used four small kernels per round
+# (called twice for attention/FFN in each layer, ~6,500 launches per token); fusion reduces this to one launch.
+# Without the extension, outside CUDA, or for f64, return None to fall back to the original torch loop
+# (hc_pre/hc_post in dspark.py share this hook).
 from .fusedext import hc_split_fused as _hc_fused
 
 _hc_split_orig = _dsv4.hc_split
@@ -299,7 +312,7 @@ def _hc_split_tpq(mixes, scale, base, hc, iters, eps):
 
 _dsv4.hc_split = _hc_split_tpq
 
-# RMSNorm 融合钩子：pow/mean/rsqrt/两次乘 ~6 次 launch → 1 次（dsv4 每层 4+ 处）。
+# Fused RMSNorm hook: reduce ~6 launches for pow/mean/rsqrt/two multiplies to one (used at 4+ sites per dsv4 layer).
 from .fusedext import rmsnorm_fused as _rms_fused
 
 _rmsnorm_orig = _dsv4.rmsnorm
@@ -314,7 +327,7 @@ def _rmsnorm_tpq(x, w, eps):
 
 _dsv4.rmsnorm = _rmsnorm_tpq
 
-# RoPE 融合钩子：decode 单相位（全部行同一 cos/sin）时 1 次 launch 替代 ~8 次
+# Fused RoPE hook: during single-phase decode (all rows share one cos/sin), replace ~8 launches with one
 from .fusedext import rope1_fused as _rope_fused
 
 _rope_orig = _dsv4.rope_apply
@@ -388,7 +401,10 @@ def _hc_pre_norm_tpq(
     cfg,
     output_buffers=None,
 ):
-    """HC pre 与随后 RMSNorm 的 BF16 热路径；归约仍在核内使用 FP32。"""
+    """BF16 hot path for HC pre and the following RMSNorm.
+
+    Reductions still use FP32 inside the kernel.
+    """
     if not x.is_cuda and x.shape[0] * x.shape[1] == 1:
         from .cpuext import hc_pre_norm_cpu
 
@@ -425,7 +441,11 @@ def _hc_pre_norm_tpq(
 
 
 def _linear(x: torch.Tensor, w) -> torch.Tensor:
-    """dense 线性层：Int4Weight 走分块反量化（3D 输入压平再还原），其余按 dtype 对齐 matmul。"""
+    """Apply a dense linear layer.
+
+    Int4Weight uses tiled dequantization, flattening and restoring 3D inputs;
+    other weights use matrix multiplication with aligned dtypes.
+    """
     if isinstance(w, (Int4Weight, BlockFP8Weight)):
         if x.dim() > 2:
             sh = x.shape
@@ -448,7 +468,7 @@ def _linear(x: torch.Tensor, w) -> torch.Tensor:
 
 
 def _qkv_tpq(x, w, cfg, cache, pos0, cpu_outputs=None):
-    """CPU decode 将共享输入的 Q-rank 与 KV INT4 投影合并到一个并行区。"""
+    """Fuse shared-input Q-rank and KV INT4 projections into one CPU parallel region."""
     qkv_group = w.get("qkv_projection_group")
     if cpu_outputs is not None:
         outputs = cpu_outputs
@@ -756,7 +776,7 @@ def _compressor_decode_tpq(
     pos,
     cpu_outputs=None,
 ):
-    """CPU decode 将 Compressor 的 KV/Gate INT4 投影合并。"""
+    """Fuse the compressor's KV and gate INT4 projections for CPU decoding."""
     if cpu_outputs is not None:
         return _compressor_decode_projected(
             x,
@@ -892,7 +912,10 @@ def _shared_expert_mlp_tpq(x, w, limit):
 
 
 class DSV4TPQModel:
-    """DeepSeek-V4 TPQ 产物的推理模型（CPU/CUDA，内存显存自动适配由外层 Engine 定）。"""
+    """Inference model for DeepSeek-V4 TPQ artifacts.
+
+    Supports CPU and CUDA; the outer Engine determines RAM/VRAM adaptation.
+    """
 
     def __init__(self, root: str, cache_gb: float = 16.0, max_ctx: int = 2048,
                  device: str = "cpu", vram_cache_gb: float = 4.0,
@@ -923,8 +946,8 @@ class DSV4TPQModel:
         self._cpu_numa_interleaved = False
         self._cpu_threads = 0
         if self.device.type == "cpu":
-            # RAM/GPU 预设可能携带 BF16；CPU 单 Token GEMV 与融合 HC 的
-            # 已验证热路径是 FP32，除非显式开启实验开关，否则在模型构造前纠正。
+            # RAM/GPU presets may specify BF16. The validated hot path for CPU single-token GEMV and fused HC is FP32;
+            # correct it before model construction unless the experimental switch is explicitly enabled.
             if os.environ.get("TPQ_CPU_BF16", "0") != "1":
                 os.environ["TPQ_COMPUTE_DTYPE"] = "fp32"
                 os.environ["TPQ_DENSE_BF16"] = "none"
@@ -1075,7 +1098,7 @@ class DSV4TPQModel:
             tuple[torch.Tensor, torch.Tensor],
         ] = {}
         self._prefetch_auto = True
-        self._prev_ids: dict[int, list[int]] = {}   # 层 → 上一 token 路由专家（预取用）
+        self._prev_ids: dict[int, list[int]] = {}   # Layer -> routed experts for the previous token (used for prefetch)
         self._profile_enabled = False
         self._profile_records: list[
             tuple[int, tuple[tuple[str, object], ...]]
@@ -1123,7 +1146,7 @@ class DSV4TPQModel:
         c = self.cfg
         ratios = (list(c.get("compress_ratios") or []) + [0] * c["n_layers"])[: c["n_layers"]]
         self.ratios = ratios
-        from .dsv4 import RopeCache  # 复用包内频率预计算（纯 torch 无依赖）
+        from .dsv4 import RopeCache  # Reuse in-package frequency precomputation (pure torch, no dependencies)
         rd = c["qk_rope_head_dim"]
         self.rope_base = RopeCache(rd, max_ctx + 8, c["rope_theta"], None)
         self.rope_cmp = RopeCache(rd, max_ctx + 8, c.get("compress_rope_theta", 160000.0),
@@ -1133,7 +1156,7 @@ class DSV4TPQModel:
                 rc.cos = rc.cos.to(self.device)
                 rc.sin = rc.sin.to(self.device)
 
-    # ---- 权重访问 ----
+    # ---- Weight access ----
     def w(self, name: str):
         wt = self._w.get(name)
         if wt is None:
@@ -1169,12 +1192,12 @@ class DSV4TPQModel:
                         # materializing this small matrix in FP32.
                         wt = wt.dequant_rows(0, wt.shape[0]).to(self.device)
                     elif name == "head.weight":
-                        # lm_head 每 token 全量乘，常驻 f32（2.1GB，与 GLM 的 lm_head 策略一致）
+                        # lm_head is multiplied in full for every token; keep it resident in f32 (2.1 GB, matching GLM's lm_head policy)
                         wt = wt.dequant_rows(0, wt.shape[0]).to(self.device)
                     else:
-                        # int4 dense GEMM 的 fp16 计算：默认关闭（TPQ_INT4_HALF=1 开启）。
-                        # 实测 43 层残差+HC 放大使逐层 hidden rel 差达 1-3%（超 0.5% 门），
-                        # 而内存受限卡上提速可忽略；KL 虽不变，从严回 f32。
+                        # fp16 computation for int4 dense GEMM is disabled by default (enable with TPQ_INT4_HALF=1).
+                        # Across 43 layers, measured residual and HC amplification produced 1-3% relative hidden-state error per layer
+                        # (above the 0.5% gate), while speedup on memory-constrained cards was negligible. KL was unchanged, but use f32 conservatively.
                         wt = Int4Weight(wt.q.to(self.device), wt.s.to(self.device),
                                         wt.cols, wt.gs,
                                         half=os.environ.get("TPQ_INT4_HALF", "0") == "1")
@@ -1192,10 +1215,12 @@ class DSV4TPQModel:
         return raw not in ("0", "false", "off", "no")
 
     def _token_prefetch_enabled(self) -> bool:
-        """整轮预取只适用于按层拥有独立缓存容量的专家池。
+        """Prefetch a full pass only when each layer has independent expert-cache capacity.
 
-        极限模式只有一个可复用 Top-K staging 组；整轮预取会让后层覆盖前层，
-        因此只在每层 Attention 开始时预取该层上一 token 的路由专家。
+        Extreme mode has only one reusable Top-K staging group. Full-pass
+        prefetching would let later layers overwrite earlier ones, so routed
+        experts from the previous token are prefetched only when each layer's
+        attention begins.
         """
 
         return self._prefetch_enabled() and not bool(
@@ -1203,7 +1228,11 @@ class DSV4TPQModel:
         )
 
     def layer(self, i: int) -> dict:
-        """一层 dense 权重（attn/hc/norm/gate/compressor/shared），按键名惰性组装。"""
+        """Lazily assemble one layer's dense weights by key.
+
+        Includes attention, HC, normalization, gate, compressor, and shared
+        weights.
+        """
         w = self._layers.get(i)
         if w is not None:
             return w
@@ -1238,7 +1267,7 @@ class DSV4TPQModel:
             w["cmp"] = {
                 "wkv": self.w(f"{p}.attn.compressor.wkv.weight"),
                 "wgate": self.w(f"{p}.attn.compressor.wgate.weight"),
-                "ape": _f32(self.w(f"{p}.attn.compressor.ape")),  # 需下标切片，须 f32
+                "ape": _f32(self.w(f"{p}.attn.compressor.ape")),  # Indexed slicing requires f32
                 "norm": self.w(f"{p}.attn.compressor.norm.weight"),
             }
         if self.ratios[i] == 4:
@@ -1267,7 +1296,7 @@ class DSV4TPQModel:
         self._layers[i] = w
         return w
 
-    # ---- 前向（数值与 TPQ/dsv4.py 一致；线性层经 _linear 分派） ----
+    # ---- Forward pass (numerically matches TPQ/dsv4.py; linear layers dispatch through _linear) ----
     def _rope(self, i: int):
         return self.rope_cmp if self.ratios[i] else self.rope_base
 
@@ -1287,8 +1316,8 @@ class DSV4TPQModel:
         for i in range(c["n_layers"]):
             ratio = self.ratios[i]
             st = {
-                # 现有 decode attention 核仍以 FP32 做局部 score/value；
-                # SM120 BF16 sparse kernel 接入后再把窗口状态切回 hot_dtype。
+                # The current decode attention kernel still computes local score/value in FP32.
+                # Switch window state back to hot_dtype after integrating the SM120 BF16 sparse kernel.
                 "kv": torch.zeros(
                     B, win, hd, device=device, dtype=torch.float32
                 ),
@@ -1512,16 +1541,19 @@ class DSV4TPQModel:
         self._spec = None
         self._prev_ids.clear()
 
-    # ---- Engine 接口（与 TPQ GLMModel 同名：forward/forward_hidden/logits_of/reset_kv/pos） ----
+    # ---- Engine interface (same names as TPQ GLMModel: forward/forward_hidden/logits_of/reset_kv/pos) ----
     pos: int = 0
 
-    DSPARK_TARGETS = (40, 41, 42)   # DSpark main_hidden 的取材层（hc 均值隐态）
+    DSPARK_TARGETS = (40, 41, 42)   # Layers used for DSpark main_hidden (mean HC hidden states)
 
     def reset_kv(self) -> None:
         self.reset()
 
     def preload(self) -> None:
-        """GPU 路径：全部 dense 权重上显存（int4 打包态 + head f32 常驻）。"""
+        """Load all dense weights into VRAM for the GPU path.
+
+        INT4 weights remain packed, and the f32 head remains resident.
+        """
         if self.device.type == "cpu":
             print(
                 f"[tpq] CPU 推理线程：{self._cpu_threads}",
@@ -1532,11 +1564,11 @@ class DSV4TPQModel:
                     "[tpq] CPU NUMA：专家与 dense 内存跨节点交错分配",
                     flush=True,
                 )
-            # CPU 首次启动时提前编译/装载融合内核，避免首个 decode 卡顿。
+            # Compile/load fused kernels early during the first CPU startup to avoid stalling the first decode.
             from .cpuext import prebuild as prebuild_cpu
             prebuild_cpu()
-            # CPU 也需要真正的 RAM 模式；仅使用 LRU 会让每批新路由专家
-            # 重复承担 zlib 解压和张量构造，即使机器还有数百 GiB 可用内存。
+            # CPU also needs a true RAM mode. Using only an LRU repeats zlib decompression and tensor construction
+            # for every new batch of routed experts even when hundreds of GiB of system memory remain available.
             resident_all = self.pool.preload_all()
             self._prefetch_auto = not resident_all
             if not resident_all:
@@ -1577,8 +1609,8 @@ class DSV4TPQModel:
         vram = torch.cuda.memory_allocated(self.device) / 2**30
         print(f"[tpq] dense 预载完成（{time.time() - t0:.1f}s，显存 {vram:.1f}GB）",
               flush=True)
-        # 公共算子注册已在构造期完成解析。这里只报告最终能力，不能再读取
-        # grouped 模块历史上的私有 ``_fused`` 状态；该变量在公共化后已删除。
+        # Shared operator registration is resolved during construction. Report only final capability here;
+        # do not read the grouped module's former private ``_fused`` state, which was removed when the operator became shared.
         if os.environ.get("TPQ_GROUPED", "1") != "0":
             backend = self.packed_operator_name or "legacy-grouped-adapter"
             print(
@@ -1606,7 +1638,7 @@ class DSV4TPQModel:
             not resident_all
             or (extreme_staging and not route_history_resident)
         )
-        if not resident_all:   # 内存够则全量常驻；不够（已警告）回退热钉住+LRU
+        if not resident_all:   # Keep everything resident when memory permits; otherwise (already warned) fall back to hot pinning plus LRU
             self.pool.preload_pinned()
         else:
             self.pool.pin_host_resident()
@@ -2138,7 +2170,10 @@ class DSV4TPQModel:
         )
 
     def forward(self, ids: list[int]) -> torch.Tensor:
-        """前向一段 token（prefill 或单步 decode），返回最后位置 logits [vocab]。"""
+        """Run a token segment for prefill or one-step decoding.
+
+        Returns logits at the final position with shape [vocab].
+        """
         t = torch.tensor([ids], device=self.device)
         if self.states is None:
             lg = self.prefill(t, full_logits=False)
@@ -2152,7 +2187,10 @@ class DSV4TPQModel:
         return out[-1].squeeze(0)
 
     def forward_hidden(self, ids: list[int]) -> torch.Tensor:
-        """前向一段 token，返回全部位置的最终 hidden [T, hidden]（已过 final norm）。"""
+        """Run a token segment and return final hidden states for every position.
+
+        The returned [T, hidden] tensor has already passed final normalization.
+        """
         t = torch.tensor([ids], device=self.device)
         if self.states is not None and len(ids) == 1:
             raise RuntimeError("forward_hidden 增量模式未实现（投机解码暂未接入 DSV4）")
@@ -2172,7 +2210,7 @@ class DSV4TPQModel:
         y = hc_head(h, *self._hc_head_w(), cfg)
         y = rmsnorm(y, self.w("norm.weight"), cfg.rms_eps)
         self.pos = len(ids)
-        return y.squeeze(0)   # [1,T,D] → [T,D]，与 GLMModel/评测脚本口径一致
+        return y.squeeze(0)   # [1,T,D] -> [T,D], matching GLMModel and the evaluation scripts
 
     def logits_of(self, h: torch.Tensor) -> torch.Tensor:
         """hidden [N, hidden] → logits [N, vocab]。"""
@@ -2199,14 +2237,17 @@ class DSV4TPQModel:
         return _linear(hidden, weight).float()
 
     def _cfg_obj(self):
-        """把 dict 配置包装为 dsv4.py 函数期望的属性对象。"""
+        """Wrap a dict configuration as the attribute object expected by dsv4.py."""
         if getattr(self, "_co", None) is None:
             from .cconfig import DSV4Config
             self._co = DSV4Config.from_json(self.cfg)
         return self._co
 
     def _expert_mlp_tpq(self, x, gu, dn, weights):
-        """VQ 专家 MLP（数值同 dsv4.expert_mlp：up±10、gate≤10、silu(gate)*up）。"""
+        """Apply the VQ expert MLP.
+
+        Numerics match dsv4.expert_mlp: up±10, gate≤10, and silu(gate)*up.
+        """
         limit = self.cfg.get("swiglu_limit", 0.0)
         mi = self.cfg["moe_inter"]
         h = gu.matmul_T(x)                       # [N, 2*mi]
@@ -2218,7 +2259,10 @@ class DSV4TPQModel:
         return out * weights
 
     def _mask(self, layer: int) -> torch.Tensor:
-        """该层可用专家布尔掩码（drop 为 False），缓存。"""
+        """Return and cache the layer's available-expert Boolean mask.
+
+        Dropped experts are False.
+        """
         m = getattr(self, "_masks", {}).get(layer)
         if m is None:
             if not hasattr(self, "_masks"):
@@ -2228,9 +2272,13 @@ class DSV4TPQModel:
         return m
 
     def _route_tpq(self, xf: torch.Tensor, w: dict, cfg, ids: torch.Tensor, layer: int):
-        """带 drop 掩码的 sqrtsoftplus 路由（数值同 dsv4.gate_route；丢弃专家不可选）。
-        learned 层：choice 掩 -inf 后 top-k；hash 层（tid2eid 静态表）：坏槽用
-        「未选中且可用」的最高分专家逐个递补。"""
+        """Apply sqrtsoftplus routing with a drop mask.
+
+        Numerics match dsv4.gate_route, and dropped experts cannot be selected.
+        Learned layers mask choices to -inf before top-k. In hash layers using
+        the static tid2eid table, invalid slots are filled one at a time with
+        the highest-scoring available experts that have not been selected.
+        """
         mask = self._mask(layer)
         gate = w["gate"]
         if (
@@ -2427,9 +2475,9 @@ class DSV4TPQModel:
                 and self._packed_device_pool
                 and hasattr(self.pool, "prepare_run")
             ):
-                # 公共双阶段接口先提交 packed DMA，再让默认流计算共享专家；
-                # finish_run 仅在 routed kernel 真正读取槽位前建立事件依赖。
-                # 这样 RAM→VRAM 与 shared Gate/Up/Down 并行，数学顺序不变。
+                # The shared two-stage interface submits packed DMA first, then computes the shared expert on the default stream.
+                # finish_run establishes the event dependency only before the routed kernel actually reads the slots.
+                # This overlaps RAM-to-VRAM transfer with shared Gate/Up/Down while preserving mathematical order.
                 pending_routed = self.pool.prepare_run(
                     layer,
                     x_rows[:1],
@@ -2578,12 +2626,12 @@ class DSV4TPQModel:
                 indices[0],
             )
             return fused_cpu.view(B, T, D).to(output_dtype)
-        # T=1 解码热路径：把 top-k 专家堆叠成批做分组 GEMM（每层 launch 数 ÷6，
-        # 数值与下方逐专家循环等价，见 tpq/grouped.py 自检）。
-        # 全部选中专家均为 VQWeight 且未设 TPQ_GROUPED=0 时启用，否则回退原循环。
+        # T=1 decode hot path: stack top-k experts into a batched grouped GEMM (six times fewer launches per layer;
+        # numerically equivalent to the per-expert loop below; see the tpq/grouped.py self-check).
+        # Enable when all selected experts are VQWeight and TPQ_GROUPED is not 0; otherwise fall back to the original loop.
         if B * T == 1 and os.environ.get("TPQ_GROUPED", "1") != "0":
             from .grouped import moe_mlp_grouped_mixed
-            # 先发射共享专家 GEMM（不依赖路由结果），CPU 等 indices DtoH 期间 GPU 有活干
+            # Launch the shared-expert GEMM first (it does not depend on routing) so the GPU stays busy while the CPU waits for indices DtoH
             shared = None
             if x_rows.is_cuda:
                 shared = expert_mlp(
@@ -2646,9 +2694,9 @@ class DSV4TPQModel:
                 y += shared
                 return y.view(B, T, D).to(output_dtype)
         y = torch.zeros_like(xf)
-        # 分派：argsort + searchsorted 按专家分段（每层一次 DtoH 同步），替代逐专家
-        # nonzero（每个都隐式同步，投机验证 T=6 时 ~1200 次/轮、WDDM 下约 0.6s）。
-        # 专家遍历顺序仍为升序，与 indices.unique() 一致 → 数值不变。
+        # Dispatch: segment by expert with argsort plus searchsorted (one DtoH synchronization per layer), replacing per-expert
+        # nonzero calls (each synchronizes implicitly: ~1,200 per speculative-validation round at T=6, about 0.6 s under WDDM).
+        # Expert traversal remains ascending, matching indices.unique(), so numerical results are unchanged.
         K = indices.shape[1]
         flat = indices.reshape(-1)
         order = torch.argsort(flat)
@@ -2667,7 +2715,7 @@ class DSV4TPQModel:
             rows, cols = rows_all[sl], cols_all[sl]
             gu, dn = experts[(layer, e)]
             if isinstance(gu, VQWeight) and isinstance(dn, VQWeight):
-                # 投机验证 T>1：idx 广播走融合 kernel（一次调用替代逐 token LUT 循环）
+                # Speculative validation at T>1: broadcast idx through the fused kernel (one call replaces the per-token LUT loop)
                 y[rows] += expert_mlp_batched(xf[rows], gu, dn, limit) \
                     * weights[rows, cols, None]
             else:
@@ -2745,8 +2793,8 @@ class DSV4TPQModel:
         mark("start")
         hc_workspace = self._hc_decode_workspace(h)
         hc_post_workspace = self._hc_post_workspace(h)
-        # 跨层专家预取（B2）：用上一 token 本层路由结果提前装填（时序局部性），
-        # attention 计算与专家 读盘/DMA 重叠；未命中回退正常加载，无正确性风险
+        # Cross-layer expert prefetch (B2): preload using this layer's routing result from the previous token (temporal locality),
+        # overlapping attention computation with expert disk reads/DMA. Misses fall back to normal loading without correctness risk.
         prev = self._prev_ids.get(layer)
         if prev and ids.shape[-1] == 1 and self._prefetch_enabled():
             self.pool.prefetch([(layer, e) for e in prev])
@@ -2983,12 +3031,16 @@ class DSV4TPQModel:
         *,
         tp_context: dict | None = None,
     ) -> torch.Tensor:
-        """批量增量注意力（投机验证用）：T 个 token（positions pos0..pos0+T-1）一次前向。
+        """Run batched incremental attention for speculative verification.
 
-        数学与 TPQ.dsv4.attn_decode 逐步等价：环形窗自因果掩码（含窗约束）、
-        压缩槽可见性 n < (qpos+1)//ratio、sink 在分母、输出末 64 维反旋转。
-        Compressor 为每 token 顺序状态机（逐 token 调用 compressor_decode），
-        并把每步的 ckv/cscore 快照记入 spec["steps"]（供 spec_commit 回滚）。
+        Processes T tokens at positions pos0..pos0+T-1 in one forward pass.
+        The math is stepwise-equivalent to TPQ.dsv4.attn_decode: causal masks
+        over the ring window (including window constraints), compressed-slot
+        visibility n < (qpos+1)//ratio, the sink in the denominator, and
+        inverse rotation of the output's last 64 dimensions. The compressor
+        is a per-token sequential state machine, invoking compressor_decode
+        for each token and recording ckv/cscore snapshots in spec["steps"] so
+        spec_commit can roll back.
         """
         from . import dsv4 as _d
         from .dsv4 import rope_apply
@@ -3558,8 +3610,12 @@ class DSV4TPQModel:
         return _d._o_proj_hook(o.flatten(2), w, cfg)
 
     def _spec_snapshot(self, pos0: int, T: int) -> dict:
-        """验证前快照各层将被触碰的状态：环槽（值+win_pos）、压缩槽、
-        以及 compressor 每步状态容器（在 _attn_batch 中逐步填充）。"""
+        """Snapshot layer state that verification may modify.
+
+        This includes ring slots (values and win_pos), compressed slots, and
+        the compressor's per-step state container, which _attn_batch fills
+        incrementally.
+        """
         cfg = self._cfg_obj()
         win = cfg.sliding_window
         poss = torch.arange(pos0, pos0 + T, device=self.device)
@@ -3592,25 +3648,29 @@ class DSV4TPQModel:
         return spec
 
     def spec_commit(self, keep: int) -> None:
-        """验证后按接受前缀截断：恢复被拒位置的环槽/压缩槽，compressor 状态
-        回滚到「处理完 position keep-1」的快照，model.pos = keep。"""
+        """Truncate state to the accepted prefix after verification.
+
+        Restores ring and compressed slots at rejected positions, rolls the
+        compressor state back to the snapshot after processing position
+        keep-1, and sets model.pos to keep.
+        """
         spec = getattr(self, "_spec", None)
         assert spec is not None, "spec_commit 前须先 forward_verify"
         pos0, T = spec["pos0"], spec["T"]
         cfg = self._cfg_obj()
         win = cfg.sliding_window
-        a = keep - pos0 - 1                     # 最末保留 token 的批内下标
+        a = keep - pos0 - 1                     # Batch index of the final retained token
         assert -1 <= a < T
         for i in range(cfg.n_layers):
             st = self.states[i]
             pre = spec["pre"][i]
-            for j in range(a + 1, T):           # 被拒位置：恢复旧环槽内容
+            for j in range(a + 1, T):           # Rejected positions: restore the old ring-slot contents
                 st["kv"][:, pre["slots"][j]] = pre["kv"][:, j]
                 st["win_pos"][:, pre["slots"][j]] = pre["win_pos"][:, j]
             if self.ratios[i]:
                 ratio = self.ratios[i]
                 for k, n in enumerate(pre["cslots"].tolist()):
-                    if (n + 1) * ratio - 1 >= keep:     # 池化完成于被拒位置 → 恢复
+                    if (n + 1) * ratio - 1 >= keep:     # Pooling completed at a rejected position -> restore
                         st["compressed"].write(
                             n, pre["compressed_values"][:, k]
                         )
@@ -3638,11 +3698,13 @@ class DSV4TPQModel:
 
     @torch.no_grad()
     def forward_verify(self, ids_list: list[int], pos0: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """投机验证：一次批量前向处理 [t1, d1..dk]（positions pos0..pos0+T-1）。
+        """Verify speculation with one batched forward pass over [t1, d1..dk].
 
-        返回 (logits [T, vocab], main_hidden [T, 3·hidden])；KV 状态前进到
-        pos0+T（随后由 spec_commit(keep) 截断到接受前缀）。main_hidden 为
-        DSPARK_TARGETS 各层 hc 均值隐态的拼接（供 DSpark 草稿头）。
+        Tokens occupy positions pos0..pos0+T-1. Returns logits [T, vocab] and
+        main_hidden [T, 3·hidden]. KV state advances to pos0+T and is later
+        truncated to the accepted prefix by spec_commit(keep). main_hidden is
+        the concatenation of mean HC hidden states from the DSPARK_TARGETS
+        layers for the DSpark draft head.
         """
         from .dsv4 import hc_head
         cfg = self._cfg_obj()
@@ -3756,8 +3818,11 @@ class DSV4TPQModel:
 
     @torch.no_grad()
     def prefill_mh(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """prefill + 捕获 DSpark main_hidden。返回 (logits 末位 [1, vocab],
-        main_hidden [1, T, 3·hidden])；同时建立 KV 并置 model.pos = T。"""
+        """Prefill while capturing DSpark main_hidden.
+
+        Returns final-position logits [1, vocab] and main_hidden
+        [1, T, 3·hidden], while building KV state and setting model.pos to T.
+        """
         from .dsv4 import hc_head
         cfg = self._cfg_obj()
         ids = ids.to(self.device).long()
@@ -4116,8 +4181,8 @@ class DSV4TPQModel:
         if self._tp_attention_contexts is not None:
             return self._decode_tp(ids, pos)
         self.ensure_position(pos)
-        # token 级全层预取：上一 token 各层路由专家在本 token 计算窗口内并行读盘/DMA
-        # （时序局部性 70-90%；逐层预取窗口只有 attention 一段，全层预取窗口是整个 token）
+        # Token-level all-layer prefetch: read/DMA experts routed by every layer for the previous token in parallel during this token's compute window.
+        # Temporal locality is 70-90%; per-layer prefetch spans only attention, while all-layer prefetch spans the entire token.
         if self._prev_ids and self._token_prefetch_enabled():
             for l, es in self._prev_ids.items():
                 self.pool.prefetch([(l, e) for e in es])
@@ -4137,7 +4202,10 @@ class DSV4TPQModel:
 
 
 def _f32(w):
-    """Int4Weight → 就地反量化 f32（共享专家走 f32 精确路径，体积小）。"""
+    """Dequantize Int4Weight to f32 in place.
+
+    Shared experts are small and use the exact f32 path.
+    """
     if isinstance(w, Int4Weight):
         return w.dequant_rows(0, w.shape[0])
     if isinstance(w, BlockFP8Weight):

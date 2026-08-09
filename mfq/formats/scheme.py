@@ -1,15 +1,15 @@
-"""精度方案（Precision Scheme）。
+"""Precision schemes.
 
-一个 Scheme 描述「整个模型的每一个 tensor 该用什么精度」。它是校准器
-（``mfq.calibration``）的输出、量化器（``mfq.quantize``）与运行时的输入。
+A scheme describes the precision to use for every tensor in the model. It is the output of the calibrator
+(``mfq.calibration``) and the input to the quantizer (``mfq.quantize``) and runtime.
 
-命名制式
+Naming convention
 --------
-MFQ 用原生格式串描述整体精度画像，例如 ``MFQ-W4.51``：
+MFQ uses a native format string to describe the overall precision profile, for example ``MFQ-W4.51``:
 
-- ``W4.51`` 表示权重平均 4.51 bits-per-weight（BPW）
+- ``W4.51`` means an average weight precision of 4.51 bits per weight (BPW).
 
-非整数 BPW 由 NINT 的 (bits, groupsize, sub_bits) 组合达成。
+Fractional BPW is achieved through NINT combinations of (bits, groupsize, sub_bits).
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from mfq.formats.nint import NintSpec
 
 @dataclass
 class TensorPlan:
-    """单个 tensor 的精度计划。权重与激活可以独立指定。"""
+    """Precision plan for one tensor; weight and activation precision may be specified independently."""
 
     name: str
     weight: NintSpec
@@ -31,15 +31,15 @@ class TensorPlan:
 
 @dataclass
 class Scheme:
-    """整个模型的精度方案。"""
+    """Precision scheme for the complete model."""
 
     plans: dict[str, TensorPlan] = field(default_factory=dict)
 
     def label(self, meta: dict[str, tuple[int, int]] | None = None) -> str:
-        """生成 MFQ 制式串，如 ``MFQ-W4.51``。
+        """Generate an MFQ format string such as ``MFQ-W4.51``.
 
-        ``meta[name] = (numel, neuron_len)`` 提供每个 tensor 的元素数与 neuron 行长
-        （用于算该 tensor 的 bpw）。未提供时返回占位串。
+        ``meta[name] = (numel, neuron_len)`` provides each tensor's element count and neuron-row length
+        for calculating its bpw. Return a placeholder string when metadata is omitted.
         """
 
         if not self.plans:

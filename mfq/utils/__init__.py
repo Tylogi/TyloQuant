@@ -1,4 +1,4 @@
-"""通用工具。"""
+"""General utilities."""
 
 from mfq.utils.logging import get_logger
 from mfq.utils.tensor import mse, snr

@@ -1,12 +1,12 @@
-"""TPQ 数值内核：int4 / VQ 矩阵乘、RMSNorm、交错 RoPE。
+"""TPQ numerical kernels for int4/VQ matrix multiplication, RMSNorm, and interleaved RoPE.
 
-两类量化权重的免还原/分块还原矩阵乘：
-  - Int4Weight：u8 双半字节 [R, C//2] + f16 组缩放 [R, C//64]；matmul 按行块
-    反量化到 f32 后 torch.mm，内存峰值 = 一个行块。
-  - VQWeight：u8 码字索引 [R, C//dim] + 层共享码本 f32 [K, dim]；LUT 算法：
-    y[r] = Σ_b s[b, idx[r, b]]，其中 s[b, c] = x[bd:bd+dim]·cb[c] 只需算 B×K 次，
-    把 O(R·C) 的 matmul 降为 O(B·K + R·B) 的查表加（v 档约快 6 倍）。
-RMSNorm / RoPE 与 TPQ/modelmath.py 逐行一致（单测对照过朴素实现）。
+Matrix multiplication for two quantized-weight types, avoiding or blocking reconstruction:
+  - Int4Weight: two u8 nibbles [R, C//2] plus f16 group scales [R, C//64]. Matmul dequantizes row blocks
+    to f32 before torch.mm, with peak memory equal to one row block.
+  - VQWeight: u8 codeword indices [R, C//dim] plus a layer-shared f32 codebook [K, dim]. The LUT algorithm uses
+    y[r] = sum_b s[b, idx[r, b]], where s[b, c] = x[bd:bd+dim]*cb[c] needs only B*K computations,
+    reducing O(R*C) matmul to O(B*K + R*B) lookup additions and running about six times faster for v tier.
+RMSNorm / RoPE match TPQ/modelmath.py line by line and have unit tests against naive implementations.
 """
 
 from __future__ import annotations
@@ -32,8 +32,8 @@ def rmsnorm(
     eps: float,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """RMSNorm：f32 算方差，乘权重后回原 dtype。
-    CUDA + f32 输入走融合 kernel（1 次 launch 替代 ~6 次），其余回退 torch 表达式。"""
+    """RMSNorm computing variance in f32 and returning to the original dtype after multiplying by weights.
+    CUDA f32 inputs use a fused kernel (one launch instead of about six); other inputs fall back to the torch expression."""
     dt = x.dtype
     if dt == torch.float32 and x.is_cuda:
         fn = _rms_fused()
@@ -57,7 +57,7 @@ def rmsnorm(
 
 
 def _rms_fused():
-    """fusedext.rmsnorm_fused 的懒导入（避免 kernels 被 CPU-only 场景导入时触发扩展编译）。"""
+    """Lazily import fusedext.rmsnorm_fused to avoid extension compilation when kernels is imported in CPU-only contexts."""
     global _RMS_FUSED
     if _RMS_FUSED is None:
         try:
@@ -158,7 +158,7 @@ _GLM_MERGE_SCORES_FUSED = None
 
 
 class RopeCache:
-    """RoPE cos/sin 预计算（交错布局，[T, rope_dim//2]）。"""
+    """Precompute RoPE cos/sin in interleaved layout [T, rope_dim//2]."""
 
     def __init__(self, rope_dim: int, theta: float, max_len: int = 8192):
         self.rope_dim = int(rope_dim)
@@ -185,7 +185,7 @@ class RopeCache:
         return freqs.cos(), freqs.sin()
 
     def ensure_length(self, required: int) -> bool:
-        """按需扩展 RoPE 表；返回地址是否发生变化。"""
+        """Grow the RoPE table on demand and return whether its address changed."""
 
         required = int(required)
         if required <= self.cos.shape[0]:
@@ -198,7 +198,7 @@ class RopeCache:
         return True
 
     def apply(self, q: torch.Tensor, k: torch.Tensor, pos0: int):
-        """q: [H, T, D]；k: [1, T, D] → HF apply_rotary_pos_emb_interleave 的 cat 布局。"""
+        """Map q [H, T, D] and k [1, T, D] to the concatenated layout of HF apply_rotary_pos_emb_interleave."""
         T = q.shape[1]
         cos = self.cos[pos0:pos0 + T]
         sin = self.sin[pos0:pos0 + T]
@@ -217,12 +217,12 @@ class RopeCache:
 
 def dequant_int4(packed: torch.Tensor, scales: torch.Tensor,
                  gs: int = INT4_GROUP, half: bool = False) -> torch.Tensor:
-    """int4 行块反量化：packed u8 [r, C//2]，scales f16 [r, C//gs] → f32/f16 [r, C]。
+    """Dequantize int4 row blocks: packed u8 [r, C//2] and f16 scales [r, C//gs] -> f32/f16 [r, C].
 
-    用 256 字节查找表一次 gather 出 (lo, hi) 两个半字节（连续写，最快路径），
-    再按组就地乘缩放。比逐半字节位运算 + 跨步写快约 2 倍（本机实测）。
-    half=True：LUT 与输出走 fp16（2080 张量核 matmul 提速 + 写出量减半；
-    int4 网格本身 ~6% 误差，fp16 的 0.05% 精度远超所需，无额外损失）。
+    Use a 256-byte lookup table to gather both (lo, hi) nibbles at once with contiguous writes, then multiply
+    scales in place by group. This measured about twice as fast as per-nibble bit operations plus strided writes.
+    With half=True, the LUT and output use fp16, accelerating 2080 tensor-core matmul and halving output traffic.
+    The int4 grid itself has about 6% error, so fp16's 0.05% error is far more precise than required and adds no loss.
     """
     r = packed.shape[0]
     cols = packed.shape[1] * 2
@@ -245,17 +245,18 @@ def _make_lut() -> torch.Tensor:
     return (torch.stack((t & 15, t >> 4), 1).to(torch.float32) - 8)
 
 
-_INT4_LUT = _make_lut()  # [256, 2]：字节 → (低半字节值, 高半字节值)，零点是 8
+_INT4_LUT = _make_lut()  # [256, 2]: byte -> (low-nibble value, high-nibble value), with zero point 8
 _LUTS: dict = {"cpu": _INT4_LUT}
 
-# 码本半精度计算副本缓存：键 = (f32 码本 data_ptr, dtype)，值 = (低精度副本, f32 强引用)。
-# 强引用防 data_ptr 复用后串码本（同 ExpertPool._cb_dev 的竞态教训）；
-# 同层同档专家共享同一码本张量 → 全池天然去重，每 (层,档) 只多一份副本。
+# Cache of half-precision codebook copies for computation: key = (f32 codebook data_ptr, dtype),
+# value = (low-precision copy, strong f32 reference). The strong reference prevents codebook aliasing after data_ptr reuse
+# (the same race encountered by ExpertPool._cb_dev). Experts in the same layer and tier share one codebook tensor,
+# so the pool deduplicates naturally and adds only one copy per (layer, tier).
 _CB_LO: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def cb_compute(cb: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
-    """码本的计算 dtype 副本（fp32 原样返回；半精度按 ptr 去重缓存）。"""
+    """Return a compute-dtype codebook copy, preserving fp32 and caching deduplicated half-precision copies by pointer."""
     if dt == torch.float32 or cb.dtype == dt:
         return cb
     key = (cb.data_ptr(), str(dt))
@@ -268,7 +269,7 @@ def cb_compute(cb: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
 
 
 def _lut_on(device) -> torch.Tensor:
-    """各设备缓存一份 LUT（GPU 推理路径避免跨设备索引）。"""
+    """Cache one LUT per device so the GPU inference path avoids cross-device indexing."""
     key = str(device)
     lut = _LUTS.get(key)
     if lut is None:
@@ -278,8 +279,8 @@ def _lut_on(device) -> torch.Tensor:
 
 
 class Int4Weight:
-    """int4-g64 打包权重；matmul 按行块在线反量化（dense 低内存驻留方案）。
-    half=True：反量化与 matmul 走 fp16（Turing 张量核，~2× fp32；权重仍 int4 驻留）。"""
+    """Packed int4-g64 weights with online row-block dequantization during matmul for low-memory dense residency.
+    With half=True, dequantization and matmul use fp16 Turing tensor cores at about 2x fp32 speed while weights remain int4."""
 
     __slots__ = ("q", "s", "cols", "gs", "half")
 
@@ -303,11 +304,11 @@ class Int4Weight:
         return dequant_int4(self.q[r0:r1], self.s[r0:r1], self.gs, half=self.half)
 
     def matmul_T(self, x: torch.Tensor, chunk: int | None = None) -> torch.Tensor:
-        """y = x @ W.T。x: [T, C] → [T, R] f32（half 时内部 fp16 计算、输出 f32）。
+        """Compute y = x @ W.T, mapping x [T, C] to f32 [T, R], with internal fp16 computation when half is set.
 
-        行块大小自适应： transient 反量化块 ≤64MB（GPU 上 wq_b 级别大矩阵一次
-        成型——原固定 512 行会把单个 GEMM 拆成 64 块 × 5 次 launch，WDDM 下
-        launch 开销远超计算本身；显存代价仅一块临时缓冲）。
+        Row-block size is adaptive, keeping transient dequantization blocks at or below 64 MB. Large wq_b-scale GPU
+        matrices can be formed in one pass; the old fixed 512-row size split one GEMM into 64 blocks times five launches,
+        whose WDDM launch overhead far exceeded computation. The VRAM cost is only one temporary buffer.
         """
         if (
             not x.is_cuda
@@ -370,17 +371,16 @@ class Int4Weight:
         return self.matmul_T(x)
 
     def row(self, r: int) -> torch.Tensor:
-        """反量化单行 [C]（embed 查表用）。"""
+        """Dequantize one row [C] for embedding lookup."""
         return self.dequant_rows(r, r + 1).squeeze(0)
 
 
 class BlockFP8Weight:
-    """原生 E4M3 权重与 128×128 FP32 反量化尺度。
+    """Native E4M3 weights with 128x128 FP32 dequantization scales.
 
-    TPQ ``dense=fp8-native`` 直接保存 FP8 检查点字节，不先展开成
-    BF16/F32。矩阵乘按行块临时反量化，常驻显存仍是 1 byte/weight。
-    CPU 单 token decode 返回每个权重自己的固定缓冲；同一权重的下一次
-    decode 会覆盖该缓冲。
+    TPQ ``dense=fp8-native`` stores FP8 checkpoint bytes directly without first expanding to BF16/F32.
+    Matrix multiplication temporarily dequantizes row blocks while resident VRAM remains one byte per weight.
+    CPU single-token decode returns a fixed buffer owned by each weight; the next decode using the same weight overwrites it.
     """
 
     __slots__ = (
@@ -1315,7 +1315,7 @@ class ProjectionGroup:
 
 
 class VQWeight:
-    """VQ 索引态权重：u8 索引 [R, B] + 码本 [K, dim]，LUT 矩阵乘。"""
+    """VQ indexed weights with u8 indices [R, B] plus codebook [K, dim], using LUT matrix multiplication."""
 
     __slots__ = ("idx", "cb", "cols", "dim")
 
@@ -1334,23 +1334,23 @@ class VQWeight:
         return self.idx.numel() * self.idx.element_size()
 
     def to(self, device, non_blocking: bool = False) -> "VQWeight":
-        """搬移到指定设备（GPU 推理路径，可异步上传）。"""
+        """Move to the specified device, supporting asynchronous upload on the GPU inference path."""
         return VQWeight(self.idx.to(device, non_blocking=non_blocking),
                         self.cb.to(device, non_blocking=non_blocking), self.cols)
 
     def dequant(self) -> torch.Tensor:
-        """还原为 f32 [R, C]（小矩阵或对照测试用）。"""
+        """Reconstruct f32 [R, C] for small matrices or comparison tests."""
         return self.cb[self.idx.reshape(-1).long()].reshape(self.idx.shape[0], self.cols)
 
     def matmul_T(self, x: torch.Tensor) -> torch.Tensor:
-        """LUT 版 y = x @ W.T。x: [T, C] → [T, R] f32。
+        """LUT implementation of y = x @ W.T, mapping x [T, C] to f32 [T, R].
 
-        s[t, b, c] = x 第 b 块与码字 c 的点积（[T, B, K]），随后按索引查表求和。
-        逐 t 循环 gather（峰值 [R,B]）；大码本（k4096）按 token 分块计算 s，
-        峰值 [Tc,B,K] f32 封顶 ~256MB（全量 [T,B,K] 在长 prefill 会爆显存）。
-        GPU 上内积走精度策略层的半精度（fp16/bf16 张量核，fp32 累加），
-        查表求和用 sum(dtype=f32) 保 f32 累加精度——量化噪声比半精度舍入大
-        两个数量级，输出分布不受影响（dspark_check 逐字一致验收过）。
+        s[t, b, c] is the dot product of block b of x and codeword c, with shape [T, B, K], followed by indexed lookup and summation.
+        Gather loops over t with peak [R,B]. For large k4096 codebooks, compute s in token chunks with f32 peak [Tc,B,K]
+        capped at about 256 MB; full [T,B,K] would exhaust VRAM during long prefill. GPU dot products use half precision
+        selected by the precision policy (fp16/bf16 tensor cores with fp32 accumulation), while lookup reduction uses
+        sum(dtype=f32). Quantization noise is two orders of magnitude larger than half-precision rounding, so output
+        distributions are unaffected, as accepted by token-for-token dspark_check agreement.
         """
         T = x.shape[0]
         R, B = self.idx.shape
@@ -1360,14 +1360,14 @@ class VQWeight:
         idxl = self.idx.long()
         barange = torch.arange(B, device=x.device)
         out = torch.empty(T, R, dtype=torch.float32, device=x.device)
-        # 分块大小：让 [Tc, B, K] f32 ≤ 256MB
+        # Chunk size: keep [Tc, B, K] f32 at or below 256 MB
         tchunk = max(1, min(T, (256 * 2**20) // (B * K * 4)))
         for t0 in range(0, T, tchunk):
             t1 = min(t0 + tchunk, T)
             xb = x[t0:t1].to(dt).view(t1 - t0, B, self.dim)
-            s = xb @ cb.t()                        # [Tc, B, K]（半精度 GEMM）
+            s = xb @ cb.t()                        # [Tc, B, K] (half-precision GEMM)
             for t in range(t1 - t0):
-                # g[r, b] = s[t, b, idx[r, b]]；对 [B, K] 用 (行b, 列idx) 高级索引
+                # g[r, b] = s[t, b, idx[r, b]]; use advanced (row b, column idx) indexing on [B, K]
                 g = s[t][barange.unsqueeze(0), idxl]   # [R, B]
-                out[t0 + t] = g.sum(1, dtype=torch.float32)   # f32 累加
+                out[t0 + t] = g.sum(1, dtype=torch.float32)   # Accumulate in f32
         return out

@@ -1,17 +1,24 @@
-"""TPQ 模型仓库层：读取 TPQ 产出的 "tpq-1" 格式（纯文件 I/O，无 mmap）。
+"""TPQ model-store layer for reading ``tpq-1`` artifacts with plain file I/O.
 
-目录结构（GLM-5.2-tpq/）：
-    tpq.json               清单（config + quant 元信息 + 文件映射）
-    dense.safetensors       dense 权重：int4 对（name + name.qs）或 f32 小张量
-    vq-codebooks.safetensors 可选专家级跨层码本池和U8分配表
-    experts.L*.safetensors  每层专家：共享 cb.gu.{档}，或按连续专家分组的
-                            cb.gu.{档}.g{组号} 码本（down 同理）+
-                            e{N}.gu{档}(z)/e{N}.dn{档}(z) 索引（z = zlib 熵编码）
+Directory layout (GLM-5.2-tpq/):
+    tpq.json               Manifest with config, quantization metadata, and
+                           file mappings.
+    dense.safetensors      Dense weights as int4 pairs (name + name.qs) or
+                           small f32 tensors.
+    vq-codebooks.safetensors Optional expert-level cross-layer codebook pool
+                           and U8 assignment table.
+    experts.L*.safetensors Per-layer experts: shared cb.gu.{tier}, or
+                           cb.gu.{tier}.g{group} codebooks grouped by
+                           contiguous experts (likewise for down), plus
+                           e{N}.gu{tier}(z)/e{N}.dn{tier}(z) indices, where z
+                           denotes zlib entropy encoding.
 
-为什么不用 safetensors 的 mmap：Windows 下长进程累积大量映射（75 个专家文件 +
-CUDA 显存预留）会间歇性触发 access violation（实测层 64 附近必现）。
-这里自实现 safetensors 读取（8 字节头长 + JSON 头 + 原始字节），
-普通文件读走页缓存，无映射累积问题，返回的张量全部自持内存。
+Safetensors mmap is avoided because long-running Windows processes accumulate
+many mappings (75 expert files plus CUDA VRAM reservations), which can
+intermittently cause access violations, observed consistently near layer 64.
+This module implements safetensors reading directly from the 8-byte header
+length, JSON header, and raw bytes. Ordinary reads use the page cache, avoid
+accumulated mappings, and return tensors that own their memory.
 """
 
 from __future__ import annotations
@@ -30,11 +37,11 @@ from .expert_slots import ExpertSignature, GpuExpertArenas
 from .kernels import BlockFP8Weight, Int4Weight, VQWeight
 from .ramcache import active_ram_file
 
-# 专家磁盘加载调参（2026-07-20 实测调优，见 tpq/README 缓存×速度基准）：
-#   TPQ_LOAD_WORKERS：并行加载线程数（NVMe 随机读吃队列深度；默认 12）
-#   TPQ_READ_BUF_MB ：每文件句柄读缓冲（默认 2MB——大缓冲无益：get_bytes 是
-#       5-9MB 整块读，Python 对大 read 直写目标缓冲；且线程局部句柄 × 75 层文件
-#       会放大内存占用，16MB×900 句柄实测 OOM 崩溃）
+# Expert disk-loading tuning (measured on 2026-07-20; see the cache-throughput benchmark in tpq/README):
+#   TPQ_LOAD_WORKERS: number of parallel loader threads (NVMe random reads benefit from queue depth; default 12)
+#   TPQ_READ_BUF_MB: read buffer per file handle (default 2 MB; larger buffers do not help because get_bytes performs
+#       5-9 MB whole-block reads and Python writes large reads directly into the destination buffer. Thread-local handles
+#       across 75 layer files also magnify memory use; 16 MB x 900 handles caused a measured OOM crash.)
 _LOAD_WORKERS = int(os.environ.get("TPQ_LOAD_WORKERS", "12"))
 _READ_BUF = int(os.environ.get("TPQ_READ_BUF_MB", "2")) * 1024 * 1024
 _EXEC = None
@@ -43,10 +50,11 @@ _SAFEFILE_THREAD = threading.local()
 
 
 def _unpack_u12(packed: torch.Tensor, count: int) -> torch.Tensor:
-    """把 TPQ 的双 12-bit/3-byte 索引恢复为 u16。
+    """Restore TPQ's two 12-bit indices per 3 bytes as u16.
 
-    产物仅在磁盘/RAM blob 中紧凑保存；进入 GPU 专家 arena 前只解包一次，
-    因而不会给每次专家计算增加位操作。
+    Artifacts remain compact only in disk and RAM blobs. They are unpacked
+    once before entering the GPU expert arena, so expert computation does not
+    incur per-call bit operations.
     """
     raw = packed.view(torch.uint8).reshape(-1).to(torch.int32)
     if raw.numel() % 3:
@@ -61,7 +69,7 @@ def _unpack_u12(packed: torch.Tensor, count: int) -> torch.Tensor:
 
 
 def _unpack_u14(packed: torch.Tensor, count: int) -> torch.Tensor:
-    """把 TPQ 的四 14-bit/7-byte 索引恢复为 u16。"""
+    """Restore TPQ's four 14-bit indices per 7 bytes as u16."""
     raw = packed.view(torch.uint8).reshape(-1).to(torch.int64)
     if raw.numel() % 7:
         raise ValueError(f"u14 packed bytes 必须为 7 的倍数，实际 {raw.numel()}")
@@ -202,7 +210,10 @@ def _safe_arena_budget(
 
 
 def _executor():
-    """常驻加载线程池（避免每层每 token 重建线程的生成开销；线程局部句柄复用 fd）。"""
+    """Resident loading pool that reuses thread-local file descriptors.
+
+    Avoids the overhead of recreating threads for every layer and token.
+    """
     global _EXEC
     if _EXEC is None:
         from concurrent.futures import ThreadPoolExecutor
@@ -211,8 +222,12 @@ def _executor():
 
 
 def _pf_executor():
-    """预取专用小池（4 线程）：与紧急加载池隔离——否则冷启动时 get_many 的
-    紧急 miss 排在数百个预取任务后面（实测 1.57→0.07 tok/s 的饥饿事故）。"""
+    """Small four-thread pool dedicated to prefetching.
+
+    It is isolated from urgent loads; otherwise, during cold starts, urgent
+    get_many misses can queue behind hundreds of prefetch tasks, a starvation
+    scenario observed to reduce throughput from 1.57 to 0.07 tok/s.
+    """
     global _PF_EXEC
     if _PF_EXEC is None:
         from concurrent.futures import ThreadPoolExecutor
@@ -224,9 +239,14 @@ _STAGE_EXEC = None
 
 
 def _stage_executor():
-    """后台 staging 专用单线程：预取的 RAM→VRAM 装槽+DMA 全部在此线程串行完成
-    （单线程队列 = 槽位纪律天然有序，避开上次多线程并行装槽的错配事故），
-    主线程推理不被 host memcpy 阻塞（真并行预加载）。"""
+    """Single background thread dedicated to staging.
+
+    Prefetched RAM-to-VRAM slot filling and DMA run serially on this thread.
+    The single-thread queue naturally preserves slot order and avoids the
+    mismatches previously caused by concurrent slot filling. Host memcpy does
+    not block inference on the main thread, enabling genuinely parallel
+    preloading.
+    """
     global _STAGE_EXEC
     if _STAGE_EXEC is None:
         from concurrent.futures import ThreadPoolExecutor
@@ -235,11 +255,16 @@ def _stage_executor():
 
 
 class PinnedStage:
-    """专家上传的 pinned 分段暂存：host memcpy 进 pinned 槽 + 异步 DMA（真 ~10GB/s），
-    替代页式上传（~3.7GB/s，驱动内部分段复制）。
+    """Pinned segmented staging for expert uploads.
 
-    复用安全：每槽一个事件，复写前等该槽上次 DMA 完成；wait() 让计算流只等
-    拷贝流尾部事件（前序 DMA 按流序天然先行）。索引张量为 u8（槽也按 u8 存取）。
+    Host memcpy fills pinned slots followed by asynchronous DMA at about
+    10 GB/s, replacing pageable uploads at about 3.7 GB/s that the driver
+    copies in segments internally.
+
+    Reuse is safe because each slot has an event and waits for its previous DMA
+    before being overwritten. wait() makes the compute stream wait only for
+    the copy stream's tail event; earlier DMAs precede it by stream ordering.
+    Index tensors and slots are stored as u8.
     """
 
     def __init__(
@@ -266,17 +291,25 @@ class PinnedStage:
         self.i = 0
 
     def upload_batch(self, pairs: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
-        """成批上传：多对 (src CPU, dst GPU) 依次装槽 DMA，一次尾部事件。
-        字节原生处理（u8/u16 索引通用）：槽按字节存取，dtype 由 dst 自带。
-        装槽 host memcpy 串行（并行装槽曾致槽内容错配事故，见 EXPERIENCE §12）。
+        """Upload multiple (CPU src, GPU dst) pairs as a batch.
 
-        跨流安全（NaN 事故的根因修复）：
-          1) 批首 copy stream 等默认流当前队尾——被驱逐释放的显存块之后若被
-             empty_like 复用为 DMA 目标，该块的最后读者（默认流 kernel）必定
-             已在本次 wait 前提交，DMA 按序排在其后，杜绝「计算读旧块 vs
-             DMA 写复用块」并发；
-          2) 每个 dst record_stream(copy stream)——dst 被驱逐释放时 allocator
-             会等 DMA 真正完成才把块给别人（wait_event 只排序不等于完成）。
+        Pairs fill slots and launch DMA sequentially, followed by one tail
+        event. Processing is byte-native for both u8 and u16 indices: slots
+        store bytes and each destination supplies its dtype. Host memcpy for
+        slot filling is serialized because concurrent filling previously
+        mismatched slot contents; see EXPERIENCE §12.
+
+        Cross-stream safety, which fixes the root cause of a NaN incident:
+          1) At batch start, the copy stream waits for the current tail of the
+             default stream. If a VRAM block freed by eviction is later reused
+             by empty_like as a DMA target, its final reader on the default
+             stream was necessarily submitted before this wait. The DMA is
+             ordered afterward, preventing concurrent computation reading the
+             old block and DMA writing the reused block.
+          2) Each destination calls record_stream(copy stream). If it is
+             evicted and freed, the allocator waits for DMA to finish before
+             reusing the block; wait_event orders operations but does not mean
+             they have completed.
         """
         if not pairs:
             return
@@ -323,7 +356,7 @@ class PinnedStage:
             done.record(self.stream)
             self._pinned_inflight.append((done, direct_sources))
         if os.environ.get("TPQ_STAGE_VERIFY", "0") != "0":
-            # 诊断：校验每对 DMA 落盘内容与源一致（定位错字节/错地址）
+            # Diagnostic: verify that every DMA pair writes content identical to its source (locates wrong bytes or addresses)
             torch.cuda.synchronize()
             for src, dst, view in views:
                 s = src.view(torch.uint8).view(-1)
@@ -338,18 +371,21 @@ class PinnedStage:
                           flush=True)
 
     def upload(self, src: torch.Tensor, dst: torch.Tensor) -> None:
-        """src（CPU u8 张量）→ dst（GPU u8 张量）：host memcpy + 异步 DMA。"""
+        """Copy a CPU u8 tensor to a GPU u8 tensor via host memcpy and asynchronous DMA."""
         self.upload_batch([(src, dst)])
 
     def wait(self) -> None:
-        """让当前流等待拷贝流尾部（本批全部 DMA 完成）。"""
+        """Make the current stream wait for the copy-stream tail and all batch DMAs."""
         torch.cuda.current_stream().wait_event(self.last)
 
     def collect_timing(self, *, synchronize: bool = False) -> float:
-        """回收已经完成的 copy-stream 批次，返回累计 staging+H2D 秒数。
+        """Reclaim completed copy-stream batches and return staging plus H2D time.
 
-        计时事件包住逐段 host staging 形成的提交间隙和实际 H2D，因此用于解释
-        端到端关键路径；默认不阻塞，正式结果收集前可在外部全卡同步后调用。
+        Timing events include submission gaps caused by segmented host staging
+        as well as the actual H2D transfer, so the result helps explain the
+        end-to-end critical path. This is nonblocking by default and may be
+        called after external synchronization of all devices before collecting
+        final results.
         """
         if not self._measure:
             return 0.0
@@ -387,7 +423,10 @@ _DTYPE_NBYTES = {
 
 
 class SafeFile:
-    """极简 safetensors 读取器（纯文件 I/O，无 mmap；线程局部句柄支持并发读）。"""
+    """Minimal safetensors reader using plain file I/O without mmap.
+
+    Thread-local handles support concurrent reads.
+    """
 
     def __init__(self, path: str):
         self.path = path
@@ -461,8 +500,11 @@ class SafeFile:
         return f.read(size)
 
     def get_tensor(self, name: str) -> torch.Tensor:
-        """读张量：单次分配 + readinto 直填，省掉 bytes→bytearray 的整块拷贝
-        （专家加载热路径：每 token ~5.9GB，省一次全量 memcpy）。"""
+        """Read a tensor with one allocation filled directly by readinto.
+
+        This avoids a full bytes-to-bytearray copy on the expert-loading hot
+        path, which processes about 5.9 GB per token and saves one full memcpy.
+        """
         info = self.meta[name]
         start = self.data_start + info["data_offsets"][0]
         size = info["data_offsets"][1] - info["data_offsets"][0]
@@ -944,7 +986,7 @@ class Manifest:
             self.vq_dims = {
                 k: tuple(v)
                 for k, v in m["quant"]["vq"].items()
-            }  # 档 -> (dim, k)
+            }  # Tier -> (dim, k)
         layout = m["quant"].get("vq_codebook_layout") or {}
         layout_format = layout.get("format")
         if layout_format not in (
@@ -982,7 +1024,7 @@ class Manifest:
         )
         self.int4_group = m["quant"].get("int4_group", 64)
         self.zlib = m["quant"].get("zlib", False)
-        # 每层每专家档位串（'v'/'w'/'x'/'d'=drop），量化/repack 时写入；缺省 = 全保留
+        # Per-layer, per-expert tier string ('v'/'w'/'x'/'d'=drop), written during quantization/repacking; default keeps all experts
         self.tiers_per_layer = {
             int(l): s
             for l, s in m.get("tiers_per_layer", {}).items()
@@ -1249,9 +1291,9 @@ class TPQStore:
                     )
                 self._vq_assignments[projection] = assignment
         self._mtp: SafeFile | None = None
-        # 可选热度档案（模型目录 profile.json 或 TPQ_PROFILE_JSON）：层 → 按路由
-        # 命中降序的专家号，供 ExpertPool 把最热专家永久钉进内存（LRU 对冷专家的
-        # 一次性缓存会污染热集合，实测命中率仅 ~20%，钉住 top-32 ≈66% 路由质量）
+        # Optional popularity profile (profile.json in the model directory or TPQ_PROFILE_JSON): maps each layer to expert IDs
+        # in descending routing-hit order. ExpertPool permanently pins the hottest experts because one-off caching of cold experts
+        # pollutes the hot set (measured hit rate was only ~20%; pinning the top 32 covers ~66% of routing mass).
         self.heat_ranks: dict[int, list[int]] | None = None
         pj = os.environ.get("TPQ_PROFILE_JSON") or os.path.join(root, "profile.json")
         if os.path.exists(pj):
@@ -1260,7 +1302,7 @@ class TPQStore:
             self.heat_ranks = {
                 int(l): sorted((int(e) for e in cnt), key=lambda e: -cnt[str(e)])
                 for l, cnt in pr.get("counts", {}).items()}
-        # MTP 附件存在时，把第 78 层注册进专家体系（透明复用 ExpertPool/回退掩码）
+        # When an MTP attachment exists, register layer 78 with the expert system (transparently reusing ExpertPool/fallback masks)
         mtp_path = os.path.join(root, "mtp.safetensors")
         l78_path = os.path.join(root, "experts.L78.safetensors")
         if os.path.exists(mtp_path) and os.path.exists(l78_path):
@@ -1301,7 +1343,11 @@ class TPQStore:
         return self._dense.release_ram_blob(), paths
 
     def get_mtp(self, name: str):
-        """MTP dense 权重：attn.* 为 int4 对，router 等小张量 f32 原样。"""
+        """Return MTP dense weights.
+
+        attn.* values are int4 pairs; small tensors such as router weights
+        remain f32.
+        """
         assert self._mtp is not None, "模型目录无 MTP 附件（mtp.safetensors）"
         keys = set(self._mtp.keys())
         if name + ".qs" in keys:
@@ -1315,7 +1361,7 @@ class TPQStore:
         return name in self._dense_keys
 
     def dense_names(self) -> list[str]:
-        """全部 dense 权重名（不含 .qs 缩放键）。"""
+        """Return all dense-weight names, excluding .qs scale keys."""
         return sorted(
             name
             for name in self._dense_keys
@@ -1339,7 +1385,7 @@ class TPQStore:
         return self._dense.resident_nbytes(name)
 
     def get_dense(self, name: str):
-        """返回 f32 张量（小权重）或 Int4Weight（打包大权重）。"""
+        """Return an f32 tensor for small weights or packed Int4Weight for large weights."""
         if name + ".qs" in self._dense_keys:
             q = self._dense.get_tensor(name)
             s = self._dense.get_tensor(name + ".qs")
@@ -1362,7 +1408,7 @@ class TPQStore:
             return value
         return value.float()
 
-    # ---- 专家 ----
+    # ---- Experts ----
     def _eh(self, layer: int) -> SafeFile:
         h = self._expert_handles.get(layer)
         if h is None:
@@ -1383,10 +1429,11 @@ class TPQStore:
         return h
 
     def expert_kind(self, layer: int, eid: int) -> str:
-        """探测专家档位：返回 VQ 档名（可带 z 后缀）或 ``drop``。
+        """Detect an expert tier and return its VQ tier name or ``drop``.
 
-        ``p12`` 是 k=4096 索引的磁盘紧凑编码，不属于新的计算档位，所以
-        对上层仍报告原档名，加载时再透明解包。
+        The tier name may have a z suffix. ``p12`` is a compact on-disk
+        encoding for k=4096 indices, not a new compute tier, so callers still
+        receive the original tier name and loading transparently unpacks it.
         """
         keys = self._expert_keys.get(layer)
         if keys is None:
@@ -1421,7 +1468,10 @@ class TPQStore:
         return "drop"
 
     def available_mask(self, layer: int) -> torch.Tensor:
-        """该层可用专家布尔掩码 [E]（drop 为 False），用于回退路由掩码。"""
+        """Return the layer's [E] available-expert Boolean mask.
+
+        Dropped experts are False; the mask is used for fallback routing.
+        """
         E = self.cfg["n_experts"]
         s = self.man.tier_string(layer)
         if s is not None:
@@ -1433,7 +1483,7 @@ class TPQStore:
                 [c.lower() != "d" for c in s],
                 dtype=torch.bool,
             )
-        return torch.ones(E, dtype=torch.bool)  # 清单无档位串 = 全保留（老产物）
+        return torch.ones(E, dtype=torch.bool)  # No tier string in the manifest means keep all experts (legacy artifact)
 
     @staticmethod
     def _down_codebook_stem(
@@ -1457,7 +1507,11 @@ class TPQStore:
         eid: int | None,
         projection: str,
     ) -> tuple[SafeFile, str, str]:
-        """按专属→专家分配→连续分组→共享解析一个投影的码本。"""
+        """Resolve one projection's codebook.
+
+        Resolution order is dedicated, expert-assigned, contiguous-group, then
+        shared.
+        """
         if projection not in ("gu", "down"):
             raise ValueError(projection)
         self._eh(layer)
@@ -1536,7 +1590,7 @@ class TPQStore:
         kind: str,
         eid: int | None,
     ) -> tuple[str, str]:
-        """返回GU/Down稳定语义键，用于RAM/GPU码本缓存。"""
+        """Return stable semantic GU/Down keys for RAM and GPU codebook caches."""
         gu = self._codebook_reference(
             layer, kind, eid, "gu"
         )[2]
@@ -1551,7 +1605,7 @@ class TPQStore:
         kind: str,
         eid: int | None,
     ) -> str:
-        """旧调用兼容；仅当GU/Down选择相同时返回一个语义键。"""
+        """Support legacy callers by returning one semantic key only when GU and Down match."""
         gu, down = self.codebook_variants(layer, kind, eid)
         return gu if gu == down else f"{gu}|{down}"
 
@@ -1561,7 +1615,7 @@ class TPQStore:
         kind: str,
         eid: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """依次选择专家专属、自适应分配、连续分组、层共享码本。"""
+        """Select dedicated, adaptively assigned, contiguous-group, or layer-shared codebooks."""
         gu_handle, gu_key, gu_variant = self._codebook_reference(
             layer, kind, eid, "gu"
         )
@@ -1618,7 +1672,7 @@ class TPQStore:
         layer: int,
         eid: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """读取三投影独立码本，不把 gate/up 强行拼成同一码本。"""
+        """Read independent three-projection codebooks without forcing gate and up together."""
         if not self.man.projection_vq:
             raise RuntimeError("当前模型不是三投影 VQ 格式")
         handle = self._eh(layer)
@@ -1643,7 +1697,10 @@ class TPQStore:
         layer: int,
         eid: int | None = None,
     ) -> tuple[str, str, str]:
-        """返回稳定的三投影码本语义键，供 RAM/VRAM 缓存隔离。"""
+        """Return stable semantic keys for three-projection codebooks.
+
+        The keys isolate entries in RAM and VRAM caches.
+        """
         return tuple(
             f"L{layer}." + self._projection_codebook_key(
                 layer,
@@ -1654,10 +1711,11 @@ class TPQStore:
         )
 
     def load_expert(self, layer: int, eid: int) -> tuple[VQWeight, VQWeight]:
-        """加载一个专家的 (gu, dn) VQ 权重；zlib blob 就地解压。
+        """Load one expert's (gu, dn) VQ weights, decompressing zlib blobs in place.
 
-        注意：z 后缀在量化端是按张量独立决定的（gu/dn 可能一个压缩一个原始），
-        这里逐张量探测。
+        Quantization assigns the z suffix independently to each tensor, so gu
+        and dn may use different compressed or raw forms. Each tensor is
+        detected separately here.
         """
         kind = self.expert_kind(layer, eid)
         if kind == "drop":
@@ -1716,11 +1774,11 @@ class TPQStore:
                 return _unpack_u12(packed, count).reshape(rows, cols // dim)
             zkey = f"e{eid}.{tag}{base}z"
             if zkey in keys:
-                # get_bytes 纯文件读（无 mmap），zlib 解压后即为索引字节
+                # get_bytes performs ordinary file reads without mmap; zlib output is the index bytes
                 raw = zlib.decompress(h.get_bytes(zkey))
-                # k>256 的档索引为 u16（如 w=8D-k4096），其余 u8
+                # Tiers with k>256 use u16 indices (for example w=8D-k4096); the rest use u8
                 idt = torch.uint16 if self.man.vq_dims[base][1] > 256 else torch.uint8
-                a = torch.frombuffer(raw, dtype=idt)  # bytes 直视图，免拷贝
+                a = torch.frombuffer(raw, dtype=idt)  # Direct byte view; no copy
                 return a.reshape(rows, cols // dim)
             return h.get_tensor(f"e{eid}.{tag}{base}")
 
@@ -2413,12 +2471,14 @@ class PackedCpuExpertPool:
 
 
 class ExpertPool:
-    """专家缓存池（两级）：计算设备缓存 + 可选内存前级缓存。
+    """Two-level expert cache with a compute-device cache and optional RAM front cache.
 
-    CPU 模式：单级内存缓存（budget_gb），未命中从磁盘加载。
-    GPU 模式：显存主缓存（budget_gb）+ 内存前级缓存（ram_gb，远大于显存），
-    显存未命中优先从内存前级上传（PCIe 快），前级也未命中才读磁盘。
-    两级均以 VQ 索引态驻留（v 档 ≈9.4MB/专家，w 档 ≈4.7MB），LRU 驱逐。
+    CPU mode uses a single RAM cache sized by budget_gb and loads misses from
+    disk. GPU mode uses a primary VRAM cache sized by budget_gb plus a much
+    larger RAM front cache sized by ram_gb. VRAM misses upload from the RAM
+    front cache over fast PCIe when possible, reading from disk only when both
+    levels miss. Both levels retain VQ indices and use LRU eviction. The v tier
+    occupies about 9.4 MB per expert and the w tier about 4.7 MB.
     """
 
     def __init__(self, store: TPQStore, budget_gb: float = 16.0, device: str = "cpu",
@@ -2435,25 +2495,25 @@ class ExpertPool:
         self.hits = 0
         self.miss = 0
         self.stage = PinnedStage(self.device) if self.gpu else None
-        self._stage_dirty = False   # 有预取 DMA 在飞（get/get_many 命中路径需先 wait）
-        self._inflight: set = set()  # DMA 在飞的 cache key（落地前禁止驱逐：
-        #   驱逐会释放目标显存被分配器复用，而在飞 DMA 继续写 → 随机覆写 KV/权重，
-        #   曾致 prefill 后 hidden 全零、logits 全等 argmax 恒 0）
-        self._pending: dict = {}    # 后台磁盘加载（预取软提示）：key → Future
+        self._stage_dirty = False   # Prefetch DMA is in flight (get/get_many hit paths must wait first)
+        self._inflight: set = set()  # Cache keys with DMA in flight; eviction is forbidden until arrival:
+        #   eviction releases destination VRAM for allocator reuse while in-flight DMA keeps writing, randomly overwriting KV/weights.
+        #   This once caused all-zero hidden states after prefill, equal logits, and a constant argmax of 0.
+        self._pending: dict = {}    # Background disk loads (soft prefetch hints): key -> Future
         from collections import deque
         import threading
-        self._recent: deque = deque(maxlen=256)   # 近期命中统计（0=hit 1=miss），预取自适应
-        self._stage_lock = threading.RLock()      # staging/缓存突变互斥（后台 staging 线程安全）
-        self._staging: dict = {}                  # 正在后台 staged 的 key → threading.Event
+        self._recent: deque = deque(maxlen=256)   # Recent hit statistics (0=hit, 1=miss) for adaptive prefetch
+        self._stage_lock = threading.RLock()      # Serialize staging/cache mutations (thread-safe background staging)
+        self._staging: dict = {}                  # Keys being staged in the background -> threading.Event
         self._gpu_arenas: GpuExpertArenas | None = None
         self._rebuilding_arenas = False
-        # 热专家钉住区（永不驱逐）：按 profile 热度 top-N 准入，LRU 池只服务冷专家
+        # Pinned hot-expert region (never evicted): admit profile top-N by popularity; the LRU serves only cold experts
         self.pinned: dict[tuple[int, int], tuple[VQWeight, VQWeight]] = {}
         self._pin_sets: dict[int, set[int]] = {}
         if pin_gb > 0 and store.heat_ranks:
             H = store.cfg.get("routed_hidden", store.cfg["hidden"])
             I = store.cfg["moe_inter"]
-            est = 3 * I * H // 4  # v 档索引字节（上界）
+            est = 3 * I * H // 4  # Upper bound for v-tier index bytes
             n_layers = max(1, len(store.man.expert_files))
             pin_n = int(pin_gb * 2**30 // (est * n_layers))
             if pin_n > 0:
@@ -2465,9 +2525,11 @@ class ExpertPool:
         return s is not None and eid in s
 
     def preload_pinned(self) -> None:
-        """启动时把钉住专家全部读入 RAM（消除逐 token 填充的冷启动拖尾）。
+        """Load all pinned experts into RAM at startup.
 
-        只读盘入 RAM 钉住区，不上传显存（显存缓存由 decode 路径按需填充）。
+        This removes cold-start tail latency from per-token filling. Experts
+        are read from disk only into the pinned RAM region and are not uploaded
+        to VRAM; the decoding path fills the VRAM cache on demand.
         """
         keys = [(l, e) for l, es in self._pin_sets.items() for e in es
                 if (l, e) not in self.pinned]
@@ -2488,13 +2550,17 @@ class ExpertPool:
               flush=True)
 
     def preload_all(self, reserve_gb: float | None = None) -> bool:
-        """启动时尝试把全部专家常驻 RAM（钉住，永不驱逐，之后零磁盘读）。
+        """Try to keep all experts permanently resident in RAM at startup.
 
-        判定：专家文件总量 ×1.05 + 预留 ≤ 当前可用物理内存。
-        满足 → 并行全量读入 pinned 区，返回 True；
-        不满足 → 打印醒目警告（列出缺口与建议）并返回 False，调用方回退
-        热专家钉住 + LRU 按需加载。可用 TPQ_FULL_RESIDENT=0 关闭本行为，
-        TPQ_RESIDENT_RESERVE_GB 调整预留（默认 3GB）。
+        Experts are pinned, never evicted, and require no subsequent disk
+        reads. The condition is total expert-file size × 1.05 plus the reserve
+        being no greater than currently available physical memory. When it is
+        satisfied, all experts are read into the pinned region in parallel and
+        the method returns True. Otherwise, it prints a prominent warning with
+        the shortfall and suggestions, returns False, and callers fall back to
+        pinned hot experts plus on-demand LRU loading. TPQ_FULL_RESIDENT=0
+        disables this behavior. TPQ_RESIDENT_RESERVE_GB adjusts the reserve,
+        which defaults to 3 GB.
         """
         if os.environ.get("TPQ_FULL_RESIDENT", "1") == "0":
             return False
@@ -2537,15 +2603,18 @@ class ExpertPool:
         return True
 
     def pin_host_resident(self, budget_gb: float | None = None) -> float:
-        """把常驻 RAM 专家索引转换为真正的 CUDA page-locked 内存。
+        """Convert resident RAM expert indices to true CUDA page-locked memory.
 
-        普通 ``preload_all`` 仅表示 Python 强引用常驻，内存仍是 pageable；每次显存
-        miss 都要先复制进 PinnedStage 槽，再做 DMA。这里替换 idx 为 pin_memory()
-        副本后，上传可直接异步 DMA，省掉逐 token 的 CPU memcpy 与槽位等待。
+        Ordinary ``preload_all`` only keeps strong Python references; the
+        memory remains pageable. Each VRAM miss must first copy into a
+        PinnedStage slot and then launch DMA. Replacing each idx with a
+        pin_memory() copy permits direct asynchronous DMA and avoids per-token
+        CPU memcpy and slot waits.
 
-        TPQ_HOST_PIN_GB 默认 auto：仅当转换后仍能保留足够可用 RAM 时全量启用；
-        数字指定 GiB 上限，0 明确关闭。转换逐专家替换，峰值只多一个专家而非再
-        复制整个模型。
+        TPQ_HOST_PIN_GB defaults to auto, enabling full conversion only when
+        enough free RAM remains afterward. A number sets the GiB limit and 0
+        explicitly disables conversion. Experts are replaced one by one, so
+        peak memory holds only one extra expert rather than another full model.
         """
         if not self.gpu or not self.pinned:
             return 0.0
@@ -2603,11 +2672,13 @@ class ExpertPool:
         return pinned_bytes / 2**30
 
     def build_gpu_arenas(self) -> float:
-        """按显存缓存预算一次性分配稳定的专家索引槽。
+        """Allocate stable expert-index slots once according to the VRAM cache budget.
 
-        码本仍由 ``_cb_dev`` 按层共享；arena 只保存占显存主体的 GU/DN 索引。
-        每种索引 shape/dtype 独立成池，并按模型中该签名的专家数量等比例分配，
-        后续 miss 只覆盖槽位视图，不再调用 CUDA allocator。
+        Codebooks remain shared per layer through ``_cb_dev``. The arena stores
+        only GU/DN indices, which dominate VRAM use. Each index shape and dtype
+        has a separate pool allocated in proportion to the number of experts
+        with that signature. Later misses overwrite slot views without calling
+        the CUDA allocator.
         """
         if not self.gpu:
             return 0.0
@@ -2682,7 +2753,7 @@ class ExpertPool:
                 for signature, count in allocated.items()
             )
 
-        # 极小预算时先收缩到可分配范围；正常服务器预算远高于每签名 top-k。
+        # For extremely small budgets, shrink into the allocatable range first; normal server budgets far exceed each signature's top-k.
         while used_bytes() > self.budget:
             candidates = [
                 signature
@@ -2697,7 +2768,7 @@ class ExpertPool:
             )
             allocated[largest] -= 1
 
-        # 利用取整后的余量，优先补齐当前覆盖率最低的签名。
+        # Use the post-rounding remainder to fill the signature with the lowest current coverage first.
         while True:
             candidates = [
                 signature
@@ -2733,7 +2804,7 @@ class ExpertPool:
 
     @property
     def gpu_storage_bytes(self) -> int:
-        """当前已实际分配的专家索引显存（动态 cache 或固定 arena）。"""
+        """Return currently allocated expert-index VRAM for the dynamic cache or fixed arena."""
         arenas = getattr(self, "_gpu_arenas", None)
         if arenas is None:
             return self.bytes
@@ -2746,12 +2817,12 @@ class ExpertPool:
 
     @property
     def gpu_arena_bytes(self) -> int:
-        """固定专家 arena 当前真实占用；区别于可动态下调的逻辑预算。"""
+        """Return the fixed expert arena's actual current use, distinct from its adjustable budget."""
         arenas = getattr(self, "_gpu_arenas", None)
         return 0 if arenas is None else arenas.nbytes
 
     def _drain_staging_for_arena_resize(self, timeout_s: float) -> None:
-        """等待缩容前已经提交的后台 staging，等待期间不持有池锁。"""
+        """Wait for background staging submitted before shrinking without holding the pool lock."""
         deadline = time.monotonic() + max(0.0, timeout_s)
         while True:
             with self._stage_lock:
@@ -2774,7 +2845,10 @@ class ExpertPool:
         *,
         staging_timeout_s: float = 30.0,
     ) -> tuple[int, int]:
-        """在更小预算下物理重建固定专家槽，并返回 (旧字节数, 新字节数)。"""
+        """Physically rebuild fixed expert slots under a smaller budget.
+
+        Returns (old byte count, new byte count).
+        """
         budget = max(0, int(budget))
         arenas = getattr(self, "_gpu_arenas", None)
         old_bytes = 0 if arenas is None else arenas.nbytes
@@ -2794,21 +2868,21 @@ class ExpertPool:
                     raise RuntimeError(
                         "cannot resize expert arenas while staging is active"
                     )
-                # cache 中的 VQWeight.idx 是 arena GU/DN 张量的视图；必须先清空，
-                # 再删除 arena 本体，才能让 caching allocator 看到真实可释放块。
+                # VQWeight.idx entries in cache are views of the arena GU/DN tensors. Clear them before deleting the arena itself
+                # so the caching allocator can observe the genuinely releasable blocks.
                 self.cache.clear()
                 self.bytes = 0
                 self._inflight.clear()
                 self._gpu_arenas = None
                 self.budget = budget
-            # 局部变量同样持有旧 arena；不删除它，empty_cache 仍无法归还显存。
+            # The local variable also holds the old arena; without deleting it, empty_cache still cannot return VRAM.
             del arenas
             torch.cuda.empty_cache()
             try:
                 self.build_gpu_arenas()
             except torch.cuda.OutOfMemoryError:
-                # 部分构造产生的临时张量在异常展开后已失去引用；清缓存并只降档一次，
-                # 避免在显存压力下反复 OOM。
+                # Temporary tensors from partial construction lose their references during exception unwinding.
+                # Clear the cache and reduce the tier only once to avoid repeated OOMs under VRAM pressure.
                 self._gpu_arenas = None
                 torch.cuda.empty_cache()
                 retry_budget = max(2**29, budget // 2)
@@ -2833,7 +2907,11 @@ class ExpertPool:
             arenas.touch(key)
 
     def _lease_gpu_ent(self, key, cpu_ent, *, use_arena: bool = True):
-        """返回 arena 目标视图；不支持的签名返回 None 走动态分配回退。"""
+        """Return an arena destination view.
+
+        Returns None for unsupported signatures so callers use dynamic
+        allocation.
+        """
         arenas = getattr(self, "_gpu_arenas", None)
         if not use_arena or arenas is None or not arenas.supports(cpu_ent):
             return None
@@ -2862,12 +2940,12 @@ class ExpertPool:
             if skip_inflight and scanned < len(d):
                 key = next(iter(d))
                 if key in self._inflight:
-                    # DMA 在飞的条目不可驱逐（显存复用会被 DMA 覆写），顺延为最新
+                    # Entries with DMA in flight cannot be evicted (DMA would overwrite reused VRAM); move them to most-recent
                     d.move_to_end(key)
                     scanned += 1
                     continue
             elif skip_inflight:
-                break   # 全部在飞：宁可暂超预算也不驱逐（安全优先）
+                break   # All entries are in flight: temporarily exceed the budget instead of evicting (safety first)
             key, (g, dd) = d.popitem(last=False)
             if d is self.cache:
                 self.bytes -= g.nbytes + dd.nbytes
@@ -2876,8 +2954,12 @@ class ExpertPool:
                 self.ram_bytes -= g.nbytes + dd.nbytes
 
     def trim_to(self, budget: int) -> None:
-        """动态收紧显存缓存预算并立即按 LRU 驱逐到预算内（VramWatch 止血用）。
-        先等在飞 DMA 落地：否则驱逐会释放 DMA 目标显存，被覆写后数据随机损坏。"""
+        """Reduce the VRAM cache budget dynamically and evict by LRU immediately.
+
+        Used by VramWatch during memory pressure. In-flight DMA must finish
+        first; otherwise, eviction can free destination VRAM while DMA still
+        writes to it, causing random data corruption.
+        """
         with self._stage_lock:
             if self.gpu and self._stage_dirty:
                 self._wait_stage()
@@ -2907,26 +2989,37 @@ class ExpertPool:
             self.ram_bytes += nb
 
     def _cb_dev(self, cb: torch.Tensor) -> torch.Tensor:
-        """层共享码本的设备副本（按 data_ptr 恒等缓存：消除每专家重复的码本小上传）。
+        """Return the device copy of a layer-shared codebook.
 
-        必须强引用 CPU 码本：并行加载时 codebooks() 竞态会产生重复码本张量，
-        落选者被 LRU 驱逐释放后其 data_ptr 可能被后续分配复用——若只按裸 ptr
-        缓存键，新层码本会命中旧指针，返回**别的层的码本**（GLM 实测 KL 8.9 /
-        输出乱码复读的根因）。强引用使 ptr 永不复用，键恒有效。"""
+        Identity caching by data_ptr eliminates repeated small codebook uploads
+        for each expert. The CPU codebook must be held by a strong reference:
+        during parallel loading, a race in codebooks() can create duplicate
+        codebook tensors. After an unselected duplicate is evicted by LRU and
+        freed, a later allocation may reuse its data_ptr. If a raw pointer alone
+        were used as the cache key, a new layer's codebook could hit the old
+        pointer and return another layer's codebook. This was the root cause of
+        measured GLM KL 8.9 and garbled repetitive output. Strong references
+        prevent pointer reuse and keep keys valid.
+        """
         if not hasattr(self, "_cb_devs"):
             self._cb_devs = {}
         key = cb.data_ptr()
         ent = self._cb_devs.get(key)
         if ent is None:
             d = cb.to(self.device)
-            ent = (d, cb)          # (设备副本, CPU 强引用防 ptr 复用)
+            ent = (d, cb)          # (device copy, strong CPU reference preventing pointer reuse)
             self._cb_devs[key] = ent
         return ent[0]
 
     def _stage_ent(self, key, cpu_ent) -> tuple:
-        """CPU 专家 (VQWeight, VQWeight) 经 pinned 分段上传到 GPU（码本随行）。
-        TPQ_STAGE_SYNC=1（诊断）：走默认流同步 .to() 直传，绕过 pinned/DMA 机制。
-        全程持 _stage_lock：与后台 staging 线程互斥，槽位轮转才不乱。"""
+        """Upload a CPU expert (VQWeight, VQWeight) to GPU through pinned segments.
+
+        Codebooks are uploaded with the weights. For diagnostics,
+        TPQ_STAGE_SYNC=1 performs a synchronous .to() transfer on the default
+        stream and bypasses pinned staging and DMA. _stage_lock is held for the
+        entire operation to exclude the background staging thread and preserve
+        slot rotation order.
+        """
         with self._stage_lock:
             leased = self._lease_gpu_ent(key, cpu_ent)
             if leased is not None:
@@ -2950,8 +3043,11 @@ class ExpertPool:
             return tuple(out)
 
     def _stage_ents(self, keys: list, cpu_ents: list) -> list:
-        """_stage_ent 的成批版：全部索引一次 upload_batch（少 stream/事件开销）。
-        全程持 _stage_lock（见上）。"""
+        """Batch version of _stage_ent using one upload_batch for all indices.
+
+        This reduces stream and event overhead. _stage_lock is held throughout,
+        as described above.
+        """
         if os.environ.get("TPQ_STAGE_SYNC", "0") != "0":
             return [self._stage_ent(k, e) for k, e in zip(keys, cpu_ents)]
         with self._stage_lock:
@@ -2990,38 +3086,42 @@ class ExpertPool:
             return outputs
 
     def prefetch(self, keys: list[tuple[int, int]]) -> None:
-        """跨层专家预取（软提示，不阻塞；预测错误无正确性影响，仅 LRU 轻微污染）。
+        """Prefetch experts across layers as a nonblocking soft hint.
 
-        利用路由时序局部性（相邻 token 专家集实测重合 70-90%）：在计算第 L 层
-        attention 期间，把上一 token 第 L 层的专家集预先装填：
-          - RAM/pinned 已有的 → pinned 分段异步 DMA 上显存（真 ~10GB/s，与计算重叠）；
-          - 仅在磁盘的 → 提交线程池后台加载，get_many 命中时等待结果。
+        Incorrect predictions do not affect correctness and only mildly pollute
+        the LRU. This exploits temporal routing locality: adjacent tokens have
+        been observed to share 70–90% of their expert sets. While computing
+        attention for layer L, the previous token's layer-L experts are staged:
+          - Experts already in RAM or pinned memory use asynchronous segmented
+            DMA to VRAM at about 10 GB/s, overlapping computation.
+          - Experts available only on disk are submitted to the background
+            loading pool, and get_many waits for the result on a hit.
         """
         if not keys:
             return
-        # staging 积压闸门：后台线程消费不过来时直接放弃本轮预取——否则 _staging
-        # 无界增长、staged 条目占满 inflight 无法驱逐、缓存超预算 OOM（GLM 实测）
+        # Staging-backlog gate: skip this prefetch round when background threads cannot keep up. Otherwise _staging grows
+        # without bound, staged entries fill inflight and cannot be evicted, and the cache exceeds its budget and OOMs (measured on GLM).
         with self._stage_lock:
             if self._rebuilding_arenas:
                 return
             staging_backlog = len(self._staging)
         if staging_backlog > 512:
             return
-        # _pending 上限：预测错偏的 Future 永不消费会无限堆积（占内存），超cap丢弃最旧
+        # Bound _pending: futures from incorrect predictions are never consumed and accumulate indefinitely; discard the oldest over the cap
         while len(self._pending) > 256:
-            oldest = next(iter(self._pending))   # 插入序最旧
-            self._pending.pop(oldest).cancel()   # 尽力取消；已运行的读盘结果随引用丢弃
-        # 调试二分：TPQ_PREFETCH_STAGE=0 时只做磁盘预载，不做 RAM→VRAM 异步 DMA
+            oldest = next(iter(self._pending))   # Oldest in insertion order
+            self._pending.pop(oldest).cancel()   # Best-effort cancellation; discard completed disk-read results with the reference
+        # Debug bisection: TPQ_PREFETCH_STAGE=0 performs only disk preloading, without asynchronous RAM-to-VRAM DMA
         do_stage = os.environ.get("TPQ_PREFETCH_STAGE", "1") != "0"
-        # 自适应 1：近期 miss 率过高（RAM 池装不下工作集）时，磁盘带宽全让给
-        # get_many 的紧急 miss，不再为预测预取抢队列（冷启动负优化修复）；
-        # 自适应 2：预取池积压 >64 时暂停提交（get_many 绝不阻塞在预取池 backlog 后）
+        # Adaptation 1: when the recent miss rate is too high (the RAM pool cannot hold the working set), reserve all disk bandwidth
+        # for urgent get_many misses instead of letting predictive prefetch compete for the queue (fixes a cold-start regression).
+        # Adaptation 2: pause submissions when the prefetch-pool backlog exceeds 64 (get_many must never wait behind that backlog).
         recent = self._recent
         disk_ok = (len(self._pending) < 64 and
                    (len(recent) < 64 or (sum(recent) / len(recent)) < 0.5))
         stage_keys, stage_ents = [], []
         for key in keys:
-            # 无锁快速过滤；提交前 _stage_async 会在锁内再次校验并关闭竞争窗口。
+            # Lock-free fast filter; _stage_async checks again under the lock before submission to close the race window.
             if key in self.cache or key in self._staging or key in self._pending:
                 continue
             cpu_ent = self.pinned.get(key)
@@ -3039,8 +3139,13 @@ class ExpertPool:
             self._stage_async(stage_keys, stage_ents)
 
     def _stage_async(self, keys: list, cpu_ents: list) -> None:
-        """后台 staging（真并行预加载）：单线程队列里完成 装槽+DMA+入缓存，
-        主线程推理零阻塞。get_many 经 _staging 事件查重（宁可等待也不重复加载）。"""
+        """Stage experts in the background for genuinely parallel preloading.
+
+        A single-thread queue fills slots, launches DMA, and inserts cache
+        entries without blocking inference on the main thread. get_many uses
+        events in _staging to deduplicate work, waiting instead of loading the
+        same expert twice.
+        """
         import threading
         fresh_keys, fresh_ents = [], []
         dones = {}
@@ -3059,23 +3164,23 @@ class ExpertPool:
 
         def job():
             try:
-                staged = self._stage_ents(keys, cpu_ents)  # 内部持锁（槽位纪律）
+                staged = self._stage_ents(keys, cpu_ents)  # Holds the lock internally (slot discipline)
                 with self._stage_lock:
                     self._inflight.update(keys)
                     self._stage_dirty = True
                     for k, ent in zip(keys, staged):
                         self._put(k, ent)
-                self._wait_stage()          # 本批 DMA 落地即解 inflight，防积压超预算
+                self._wait_stage()          # Clear inflight as soon as this DMA batch arrives to prevent backlog from exceeding the budget
             finally:
                 with self._stage_lock:
                     for k, ev in dones.items():
-                        self._staging.pop(k, None)       # 先入缓存再解除标记
-                        ev.set()                          # 唤醒等待者（走缓存命中）
+                        self._staging.pop(k, None)       # Add to cache before clearing the marker
+                        ev.set()                          # Wake waiters (which take the cache-hit path)
 
         _stage_executor().submit(job)
 
     def _wait_staging_key(self, key):
-        """返回已落地缓存；只等待该 key 的后台 staging，不等待整个拷贝流。"""
+        """Return a completed cache entry after waiting only for this key's background staging."""
         with self._stage_lock:
             ent = self.cache.get(key)
             ev = self._staging.get(key)
@@ -3087,8 +3192,12 @@ class ExpertPool:
             return self.cache.get(key)
 
     def _wait_stage(self) -> None:
-        """有在飞 DMA 时让计算流等待拷贝流尾部（缓存命中路径的安全网）。
-        落地后清除 inflight 标记（对应 cache 条目恢复可驱逐）。"""
+        """Make the compute stream wait for the copy-stream tail when DMA is in flight.
+
+        This protects the cache-hit path. Once transfers complete, inflight
+        markers are cleared and the corresponding cache entries become
+        evictable again.
+        """
         with self._stage_lock:
             if self._stage_dirty:
                 self.stage.wait()
@@ -3116,13 +3225,13 @@ class ExpertPool:
             if cpu_ent is None:
                 fut = self._pending.pop(key, None)
                 if fut is not None and fut.done():
-                    cpu_ent = fut.result()      # 预取已完成：零等待
+                    cpu_ent = fut.result()      # Prefetch completed: no wait
                 else:
                     if fut is not None:
-                        fut.cancel()            # 未完成不在此等待（防预取池 backlog 饥饿）
+                        fut.cancel()            # Do not wait here for incomplete work (prevents starvation behind the prefetch-pool backlog)
                     cpu_ent = self.store.load_expert(layer, eid)
                 if self._hot(layer, eid):
-                    self.pinned[key] = cpu_ent  # 热专家：永久钉住，不占 LRU 预算
+                    self.pinned[key] = cpu_ent  # Hot expert: pin permanently without using the LRU budget
                 else:
                     self._put_ram(key, cpu_ent)
             else:
@@ -3137,8 +3246,11 @@ class ExpertPool:
         return ent
 
     def get_many(self, keys: list[tuple[int, int]]) -> dict[tuple[int, int], tuple[VQWeight, VQWeight]]:
-        """批量取专家：未命中项并行磁盘加载（常驻线程池，NVMe 队列深度受益）
-        + 异步上传显存。decode 每层 8 专家的读路径由此从串行 ~88ms 降到 ~20ms。
+        """Fetch experts in a batch with parallel disk loads and asynchronous VRAM uploads.
+
+        Misses use the resident thread pool to benefit from NVMe queue depth.
+        This reduces the decoding read path for eight experts per layer from
+        about 88 ms serially to about 20 ms.
         """
         out: dict[tuple[int, int], tuple[VQWeight, VQWeight]] = {}
         missing: list[tuple[int, int]] = []
@@ -3200,8 +3312,8 @@ class ExpertPool:
                     out[key] = ent
             demand_upload = True
         if missing:
-            # 后台 staging 查重：正在 staged 的 key 等其完成事件走缓存命中，
-            # 绝不重复读盘（等待 ≪ 磁盘加载；事件在入缓存后 set，无竞态窗）
+            # Deduplicate background staging: wait for the completion event of a key already being staged, then take the cache-hit path.
+            # Never reread it from disk (the wait is far shorter than disk loading; the event is set after cache insertion, leaving no race window).
             still = []
             for k in missing:
                 ev = self._staging.get(k)
@@ -3219,17 +3331,17 @@ class ExpertPool:
             missing = still
         if missing:
             from concurrent.futures import as_completed
-            # 上传与加载重叠：哪个专家先读完就先上传显存，其余仍在后台读盘；
-            # 预取已提交的加载直接复用其 Future（不重复读盘）
+            # Overlap upload with loading: upload each expert to VRAM as soon as its read finishes while others continue in the background.
+            # Reuse futures for loads already submitted by prefetch instead of reading from disk again.
             futs = {}
             for k in missing:
                 fut = self._pending.pop(k, None)
                 if fut is not None and fut.done():
-                    futs[k] = fut               # 预取已完成：零等待直接取结果
+                    futs[k] = fut               # Prefetch completed: retrieve the result without waiting
                 else:
                     if fut is not None:
-                        fut.cancel()            # 未完成的预取：尽力取消，绝不在此等待
-                    #（预取池是 backlog 重灾区的慢池；紧急 miss 一律走 12 线程快池）
+                        fut.cancel()            # Incomplete prefetch: cancel if possible and never wait here
+                    # The prefetch pool is the slow pool most prone to backlog; urgent misses always use the 12-thread fast pool.
                     futs[k] = _executor().submit(self.store.load_expert, *k)
             fmap = {f: k for k, f in futs.items()}
             for fut in as_completed(fmap):
@@ -3238,7 +3350,7 @@ class ExpertPool:
                 self.miss += 1
                 self._recent.append(1)
                 if self._hot(*key):
-                    self.pinned[key] = cpu_ent  # 热专家：永久钉住
+                    self.pinned[key] = cpu_ent  # Hot expert: pin permanently
                 else:
                     self._put_ram(key, cpu_ent)
                 ent = self._stage_ent(key, cpu_ent) if self.gpu else cpu_ent
@@ -3250,6 +3362,6 @@ class ExpertPool:
                 out[key] = ent
         if self.gpu and demand_upload:
             with self._stage_lock:
-                # 只在本批发起了 DMA 时等待；纯缓存命中不阻塞预取流。
+                # Wait only when this batch initiated DMA; pure cache hits do not block the prefetch stream.
                 self._wait_stage()
         return out

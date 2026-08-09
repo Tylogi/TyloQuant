@@ -1,11 +1,11 @@
-"""按 profile 分派 NINT 反量化。
+"""Dispatch NINT dequantization by profile.
 
-numpy 参考实现里所有 profile 走统一的 :func:`mfq.quantize.nint_quant.dequantize`；
-真实硬件 kernel（CUDA / Metal）实现后，用 :func:`register_backend` 按
-``profile_label``（如 ``NINT4-24``）注册专用反量化，本模块自动分派。
+In the NumPy reference implementation, all profiles use :func:`mfq.quantize.nint_quant.dequantize`.
+After real hardware kernels (CUDA / Metal) are implemented, use :func:`register_backend` to register
+specialized dequantization by ``profile_label`` (for example ``NINT4-24``); this module dispatches automatically.
 
-dequant 算术对所有 profile 相同（``d_eff·q − m_eff``），kernel 只随 ``gs`` 变化 tiling；
-``k`` 与 ``bits`` 已烘焙进 scale / q 宽度，对 kernel 不可见（开发文档 v2 §2.1）。
+Dequantization arithmetic is identical for all profiles (``d_eff*q - m_eff``); kernel tiling varies only with ``gs``.
+``k`` and ``bits`` are baked into scale and q width and are invisible to the kernel (development documentation v2 section 2.1).
 """
 
 from __future__ import annotations
@@ -23,16 +23,16 @@ _DEFAULT: _BackendFn = nint_quant.dequantize
 
 
 def register_backend(profile_label: str, fn: _BackendFn) -> None:
-    """为某 profile（如 ``NINT4-24``）注册专用反量化 kernel。"""
+    """Register a specialized dequantization kernel for a profile such as ``NINT4-24``."""
     _BACKENDS[profile_label] = fn
 
 
 def clear_backends() -> None:
-    """清除所有已注册的硬件 backend（回到 numpy 默认）。"""
+    """Clear all registered hardware backends and return to the NumPy default."""
     _BACKENDS.clear()
 
 
 def dequantize(tensor: NintTensor) -> np.ndarray:
-    """按 ``tensor.spec.profile_label`` 分派反量化；未注册则走 numpy 默认。"""
+    """Dispatch dequantization by ``tensor.spec.profile_label``; use the NumPy default when unregistered."""
     fn = _BACKENDS.get(tensor.spec.profile_label, _DEFAULT)
     return fn(tensor)

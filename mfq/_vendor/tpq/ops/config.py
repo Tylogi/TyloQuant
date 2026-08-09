@@ -1,4 +1,4 @@
-"""从 tpq.json 生成统一执行配置。"""
+"""Generate unified execution configuration from tpq.json."""
 
 from __future__ import annotations
 

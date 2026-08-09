@@ -1,9 +1,9 @@
-"""模型识别与发布预设加载。
+"""Model identification and release-preset loading.
 
-发布入口读取 ``tpq.json``：
+The release entry point reads ``tpq.json``:
 
-* 含 ``hc_mult`` 或 ``compress_ratios`` 的模型识别为 DeepSeek-V4；
-* 其他当前 TPQ MoE 模型识别为 GLM。
+* models containing ``hc_mult`` or ``compress_ratios`` are identified as DeepSeek-V4;
+* other current TPQ MoE models are identified as GLM.
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ def load_arch_config(architecture: str) -> dict[str, Any]:
 
 
 def choose_ep_layout(manifest: dict[str, Any], tp: int) -> str:
-    """选择多卡专家布局；不能整除时自动改用 expert-ID 分片。"""
+    """Select a multi-device expert layout; switch automatically to expert-ID sharding when dimensions are not divisible."""
     if tp < 2:
         raise ValueError("并行布局要求 tp >= 2")
     if detect_architecture(manifest) == "kimi_k3":

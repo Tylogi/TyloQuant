@@ -1,4 +1,4 @@
-"""CUDA 通用 packed 算子注册。"""
+"""Register generic CUDA packed operators."""
 
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ def _vq_gemv(**kwargs):
     from ..fusedext import vq_gemv_fused
 
     x_rows = kwargs["x_rows"]
-    # 扩展内部从“当前 CUDA 设备”取得 stream。流水线切到 cuda:1+
-    # 时，张量搬运不会自动修改 Python 当前设备；若不显式守卫，会在
-    # cuda:0 stream 上启动持有其他卡指针的 kernel，造成非法访存。
+    # The extension obtains its stream from the current CUDA device. When the pipeline switches to cuda:1+,
+    # tensor movement does not automatically change Python's current device. Without an explicit guard,
+    # a kernel holding pointers to another device would launch on the cuda:0 stream and cause illegal memory access.
     with torch.cuda.device(x_rows.device):
         return vq_gemv_fused(
             x_rows,

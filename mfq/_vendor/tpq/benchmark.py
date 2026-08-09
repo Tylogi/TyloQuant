@@ -1,8 +1,9 @@
-"""可复核的 TPQ 单请求 decode 基准。
+"""Reproducible TPQ single-request decode benchmark.
 
-该入口只测模型加载完成后的自回归 decode；模型加载、prefill 和 warmup 单独记录，
-不混入 token/s。生成固定步数且忽略 EOS，避免不同量化模型提前结束导致样本长度
-不一致。结果可打印并保存为 JSON。
+This entry point measures only autoregressive decode after model loading. Model loading, prefill, and warmup
+are recorded separately and excluded from tokens per second. It generates a fixed number of steps and ignores EOS
+to prevent early termination by different quantized models from producing inconsistent sample lengths.
+Results can be printed and saved as JSON.
 """
 
 from __future__ import annotations
@@ -111,7 +112,7 @@ def _cpu_hardware(torch: Any) -> dict[str, Any]:
 
 
 def _process_memory() -> dict[str, float | None]:
-    """返回当前进程的常驻内存与历史峰值，单位 GiB。"""
+    """Return resident memory and the historical peak for the current process in GiB."""
     rss_gib = None
     peak_rss_gib = None
     try:
@@ -295,7 +296,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _device_steps(model: Any, logits: Any, steps: int, window: int):
-    """GLM 贪心 decode：token 选择留在 GPU，按窗口回收结果。"""
+    """GLM greedy decode: keep token selection on the GPU and retrieve results by window."""
     import torch
 
     output: list[int] = []
@@ -310,7 +311,7 @@ def _device_steps(model: Any, logits: Any, steps: int, window: int):
 
 
 def _host_steps(model: Any, logits: Any, steps: int):
-    """DeepSeek decode：与当前生产生成循环一致，每步在主机取得 token id。"""
+    """DeepSeek decode matching the current production generation loop, retrieving each token ID on the host."""
     output: list[int] = []
     for _ in range(steps):
         token = int(logits.argmax().item())
@@ -675,7 +676,7 @@ def _apply_preset_environment(args: argparse.Namespace, preset: Any) -> None:
         )
     if preset.ep_layout is not None:
         os.environ.setdefault("TPQ_EP_LAYOUT", preset.ep_layout)
-    # 固定输出缓冲可减少 GLM decode 中不必要的临时分配。
+    # A fixed output buffer reduces unnecessary temporary allocations during GLM decode.
     os.environ.setdefault("TPQ_STATIC_LM_OUTPUT", "1")
 
 
@@ -1270,7 +1271,7 @@ def main(argv: list[str] | None = None) -> None:
     if not args.model:
         raise SystemExit("模型基准需要 --model；算子基准可使用 --kernel")
     if args.gpus:
-        # 自动容量探测会首次导入 torch，必须先限定可见物理卡。
+        # Automatic capacity detection imports torch for the first time, so restrict visible physical devices first.
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
     if (
         args.extreme is None
@@ -1380,7 +1381,7 @@ def main(argv: list[str] | None = None) -> None:
     preset = resolve_preset(args.model, profile=args.profile, tp=args.tp)
     _apply_preset_environment(args, preset)
 
-    # CUDA_VISIBLE_DEVICES 必须在首次导入 torch/Engine 前设置。
+    # Set CUDA_VISIBLE_DEVICES before importing torch/Engine for the first time.
     import torch
 
     from .engine import Engine

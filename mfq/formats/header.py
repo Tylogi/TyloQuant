@@ -1,10 +1,10 @@
-"""MFQ 文件头与张量级元数据。
+"""MFQ file headers and tensor-level metadata.
 
-一个 MFQ 文件由一个全局头 + 若干张量记录组成。头部记录魔数、版本、模型
-结构摘要；每个张量记录记录其精度规格（NINT 变体、groupsize 等）以及压缩后
-的权重 blob 位置。
+An MFQ file consists of one global header and several tensor records. The header stores the magic number,
+version, and model-structure summary. Each tensor record stores its precision specification (NINT variant,
+group size, and so on) and the location of its compressed weight blob.
 
-具体二进制布局见 :mod:`mfq.formats.io`。
+See :mod:`mfq.formats.io` for the binary layout.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ MFQ_MAGIC = b"MFQ1"
 
 @dataclass
 class FileHeader:
-    """MFQ 文件全局头。"""
+    """Global MFQ file header."""
 
     magic: bytes = MFQ_MAGIC
     version: int = 1
@@ -27,12 +27,12 @@ class FileHeader:
 
 @dataclass
 class TensorRecord:
-    """单个张量在文件中的定位与精度元数据。"""
+    """Location and precision metadata for one tensor in the file."""
 
     name: str
     dtype: str          # "NINT4" / "NINT5" ...
     shape: tuple[int, ...]
-    offset: int         # 权重 blob 在文件中的字节偏移
-    nbytes: int         # 权重 blob 字节数
+    offset: int         # Byte offset of the weight blob in the file
+    nbytes: int         # Size of the weight blob in bytes
     groupsize: int = 0
     hadamard: bool = False

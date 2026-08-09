@@ -1,21 +1,21 @@
-"""DeepSeek-V4 FP4 权重反量化（e2m1 打包格式 + ue8m0 块缩放）。
+"""DeepSeek-V4 FP4 weight dequantization using packed e2m1 format plus ue8m0 block scaling.
 
-格式（依据模型仓库 inference/kernel.py 的 fp4_quant_kernel 核实）：
-    权重逻辑矩阵 [R, C] 的 FP4 e2m1 值两个一组打包进 I8 → 存储 [R, C/2]；
-    nibble 顺序：低半字节 = 偶数列（先），高半字节 = 奇数列（后）。
-    缩放：每行每 32 元素一个 ue8m0 缩放（无符号 8 位指数，实际值 = 2^(b-127)），
-    存储 [R, C/32]；反量化 W = e2m1值 × 2^(scale-127)。
-e2m1 数值表（1 符号位 + 2 指数 + 1 尾数，fn 变体）：
-    索引 0..7 = 0, 0.5, 1, 1.5, 2, 3, 4, 6；索引 8..15 为其相反数。
-自检：dequant_fp4_check 按"每 32 块 amax/scale ∈ [3, 6]"验证 nibble 顺序与缩放语义
-（量化时 amax 映射到 [3,6] 区间；nibble 顺序错了该比值会系统性越界）。
+Format, verified against fp4_quant_kernel in the model repository's inference/kernel.py:
+    Pairs of FP4 e2m1 values from logical weight matrix [R, C] are packed into I8 and stored as [R, C/2].
+    Nibble order: low nibble = even column first, high nibble = odd column second.
+    Scaling: one ue8m0 scale per 32 elements of each row (unsigned 8-bit exponent, actual value = 2^(b-127)),
+    stored as [R, C/32]. Dequantization uses W = e2m1_value * 2^(scale-127).
+e2m1 value table (one sign bit, two exponent bits, and one mantissa bit, fn variant):
+    indices 0..7 = 0, 0.5, 1, 1.5, 2, 3, 4, 6; indices 8..15 are their negatives.
+Self-check: dequant_fp4_check verifies nibble order and scaling semantics using amax/scale in [3, 6] for each block of 32.
+Quantization maps amax into [3,6]; incorrect nibble order systematically puts this ratio out of range.
 """
 
 from __future__ import annotations
 
 import torch
 
-# e2m1 全 16 值查找表（bit3 为符号位）
+# Complete 16-value e2m1 lookup table (bit 3 is the sign bit)
 _E2M1_LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
                           -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
                          dtype=torch.float32)
@@ -23,9 +23,9 @@ _E2M1_LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
 
 def dequant_fp4(q: torch.Tensor, scale: torch.Tensor, rows: int, cols: int,
                 device=None) -> torch.Tensor:
-    """I8 打包 FP4 + ue8m0 缩放 → f32 [rows, cols]。
+    """Convert I8-packed FP4 plus ue8m0 scaling to f32 [rows, cols].
 
-    q: [rows, cols//2] int8/uint8；scale: [rows, cols//32]（uint8 语义的指数字节）。
+    q: [rows, cols//2] int8/uint8; scale: [rows, cols//32] exponent bytes with uint8 semantics.
     """
     dev = device or q.device
     lut = _E2M1_LUT.to(dev)
@@ -40,10 +40,10 @@ def dequant_fp4(q: torch.Tensor, scale: torch.Tensor, rows: int, cols: int,
 
 def dequant_fp4_check(q: torch.Tensor, scale: torch.Tensor, rows: int, cols: int,
                       sample_rows: int = 64) -> tuple[float, float]:
-    """格式自检：抽样若干行，返回每 32 块 amax/scale 比值的最小/最大值。
+    """Format self-check: sample rows and return minimum/maximum amax/scale ratios for each block of 32.
 
-    正常应在 [3, 6] 内（e2m1 最大值 6，量化把块内 amax 映射到 [3,6]）；
-    若系统性 <3 或 >6 → nibble 顺序或缩放语义不匹配。
+    Normal values lie in [3, 6] because the maximum e2m1 value is 6 and quantization maps block amax into [3,6].
+    Systematic values below 3 or above 6 indicate mismatched nibble order or scaling semantics.
     """
     r = min(sample_rows, rows)
     w = dequant_fp4(q[:r], scale[:r], r, cols)

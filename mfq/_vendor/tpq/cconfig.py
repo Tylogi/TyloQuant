@@ -1,9 +1,10 @@
-"""模型配置模块：从 HF config.json 读取 GLM-5.2（GlmMoeDsa）架构参数。
+"""Model configuration module that reads GLM-5.2 (GlmMoeDsa) architecture parameters from HF config.json.
 
-只保留量化与推理所需的字段：层数/专家数/top-k/隐维/MLA 注意力参数/RoPE 参数等。
-MTP 层（num_nextn_predict_layers，本模型为第 78 层）按 HF 惯例整体跳过。
-DSA indexer 权重不参与量化（TPQ 在 <2048 短上下文下以全注意力精确等价 top-2048
-稀疏注意力，见 docs/METHODOLOGY.md 附录 B "先全量注意力对齐数值"）。
+Retain only fields needed for quantization and inference: layer and expert counts, top-k, hidden dimensions,
+MLA attention parameters, RoPE parameters, and so on. Skip the entire MTP layer (num_nextn_predict_layers,
+layer 78 in this model) following HF conventions. DSA indexer weights are not quantized because for short
+contexts below 2048, TPQ full attention is exactly equivalent to top-2048 sparse attention. See Appendix B
+of docs/METHODOLOGY.md, "align numerics with full attention first."
 """
 
 from __future__ import annotations
@@ -17,15 +18,15 @@ from .presets import load_manifest as _load_tpq_manifest
 
 @dataclass
 class ModelConfig:
-    """GLM-5.2（GlmMoeDsaForCausalLM）架构描述。"""
+    """Architecture description for GLM-5.2 (GlmMoeDsaForCausalLM)."""
 
-    n_layers: int                 # 主模型层数（不含 MTP 层）
+    n_layers: int                 # Number of main-model layers (excluding the MTP layer)
     hidden: int                   # hidden_size
     n_experts: int                # n_routed_experts
     top_k: int                    # num_experts_per_tok
-    moe_inter: int                # moe_intermediate_size（ routed 专家中间维）
+    moe_inter: int                # moe_intermediate_size (intermediate dimension of routed experts)
     n_shared: int                 # n_shared_experts
-    inter_dense: int              # intermediate_size（稠密层 MLP 中间维）
+    inter_dense: int              # intermediate_size (MLP intermediate dimension of dense layers)
     n_heads: int                  # num_attention_heads
     q_lora_rank: int
     kv_lora_rank: int
@@ -36,7 +37,7 @@ class ModelConfig:
     vocab: int
     rms_eps: float
     rope_theta: float
-    rope_interleave: bool         # 主注意力 RoPE 是否交错（GLM-5.2 = True）
+    rope_interleave: bool         # Whether main-attention RoPE is interleaved (GLM-5.2 = True)
     norm_topk_prob: bool
     routed_scaling: float
     n_group: int
@@ -44,19 +45,19 @@ class ModelConfig:
     scoring_func: str             # sigmoid
     tie_embeddings: bool
     eos_token_id: list[int]
-    moe_layers: list[int] = field(default_factory=list)   # mlp_layer_types == "sparse" 的层号
-    dense_layers: list[int] = field(default_factory=list) # mlp_layer_types == "dense" 的层号
+    moe_layers: list[int] = field(default_factory=list)   # Layer indices where mlp_layer_types == "sparse"
+    dense_layers: list[int] = field(default_factory=list) # Layer indices where mlp_layer_types == "dense"
     max_position_embeddings: int = 0
 
     @classmethod
     def from_hf(cls, path: str) -> "ModelConfig":
-        """从 HF 模型目录的 config.json 构造。path 可为目录或 config.json 文件。"""
+        """Construct from config.json in an HF model directory; path may be a directory or config.json file."""
         p = path if path.endswith(".json") else os.path.join(path, "config.json")
         with open(p, "r", encoding="utf-8") as f:
             c = json.load(f)
-        n_layers = int(c["num_hidden_layers"])  # 78，不含 MTP 层 78
+        n_layers = int(c["num_hidden_layers"])  # 78, excluding MTP layer 78
         types = c.get("mlp_layer_types")
-        if types is None:  # 老配置：前 first_k_dense_replace 层稠密
+        if types is None:  # Legacy configuration: the first first_k_dense_replace layers are dense
             k = int(c.get("first_k_dense_replace", 0))
             types = ["dense" if i < k else "sparse" for i in range(n_layers)]
         types = types[:n_layers]
@@ -107,15 +108,15 @@ class ModelConfig:
 
 @dataclass
 class DSV4Config:
-    """DeepSeek-V4（deepseek_v4，如 DeepSeek-V4-Flash-DSpark）架构描述。
+    """Architecture description for DeepSeek-V4 (deepseek_v4, such as DeepSeek-V4-Flash-DSpark).
 
-    与 GLM 的差异：q LoRA（1024→64头×512）、MQA（kv=1）+ o LoRA（o_groups=8）、
-    head_dim=512（RoPE 仅作用 qk_rope_head_dim=64 段）、KV Compressor + Indexer
-    （DSA 式稀疏注意力）、sliding_window 层、hash 层（tid2eid 静态路由 + hc 表）、
-    sqrtsoftplus 路由（top-6）、专家 FP4（e2m1，32 块 ue8m0）存储、Yarn RoPE。
+    Differences from GLM: q LoRA (1024 to 64 heads x 512), MQA (kv=1) plus o LoRA (o_groups=8),
+    head_dim=512 with RoPE applied only to the qk_rope_head_dim=64 segment, KV Compressor plus Indexer
+    (DSA-style sparse attention), sliding-window layers, hash layers (static tid2eid routing plus hc tables),
+    sqrtsoftplus routing (top-6), FP4 expert storage (e2m1 with ue8m0 blocks of 32), and YaRN RoPE.
     """
 
-    n_layers: int                 # num_hidden_layers（43，不含 MTP 层）
+    n_layers: int                 # num_hidden_layers (43, excluding the MTP layer)
     hidden: int                   # hidden_size
     n_experts: int                # n_routed_experts
     top_k: int                    # num_experts_per_tok（6）
@@ -126,7 +127,7 @@ class DSV4Config:
     q_lora_rank: int
     o_lora_rank: int
     o_groups: int
-    kv_dim: int                   # wkv 输出维（512 = kv_lora + rope 段，由权重形状推定）
+    kv_dim: int                   # wkv output dimension (512 = kv_lora plus RoPE segment, inferred from weight shape)
     qk_rope_head_dim: int
     n_kv_heads: int               # num_key_value_heads（1，MQA）
     vocab: int
@@ -135,7 +136,7 @@ class DSV4Config:
     norm_topk_prob: bool
     routed_scaling: float
     swiglu_limit: float
-    n_hash_layers: int            # num_hash_layers（静态 tid2eid 路由层数）
+    n_hash_layers: int            # num_hash_layers (number of static tid2eid routing layers)
     sliding_window: int
     rope_theta: float
     rope_scaling: dict
@@ -145,15 +146,15 @@ class DSV4Config:
     index_topk: int = 512
     max_position_embeddings: int = 1_048_576
     n_mtp_layers: int = 1
-    hc_mult: int = 4                  # Hyper-Connections 通道数
+    hc_mult: int = 4                  # Number of Hyper-Connections channels
     hc_eps: float = 1e-6
     hc_sinkhorn_iters: int = 20
-    compress_rope_theta: float = 160000.0   # ratio>0 层（压缩层）RoPE theta
-    compress_ratios: list[int] = field(default_factory=list)  # 每层压缩比（0/4/128）
+    compress_rope_theta: float = 160000.0   # RoPE theta for ratio>0 (compression) layers
+    compress_ratios: list[int] = field(default_factory=list)  # Per-layer compression ratio (0/4/128)
 
     @classmethod
     def from_hf(cls, path: str) -> "DSV4Config":
-        """从 HF 模型目录的 config.json 构造。path 可为目录或 config.json 文件。"""
+        """Construct from config.json in an HF model directory; path may be a directory or config.json file."""
         p = path if path.endswith(".json") else os.path.join(path, "config.json")
         with open(p, "r", encoding="utf-8") as f:
             c = json.load(f)
@@ -213,10 +214,10 @@ class DSV4Config:
             values["max_position_embeddings"] = 1_048_576
         return cls(**values)
 
-    # ---- 派生量 ----
+    # ---- Derived values ----
     @property
     def expert_params(self) -> int:
-        """单个 routed 专家参数量（gate + up + down）。"""
+        """Parameter count of one routed expert (gate plus up plus down)."""
         return 3 * self.hidden * self.moe_inter
 
     @property
@@ -339,7 +340,7 @@ class KimiK3Config:
 
 
 def detect_arch(path: str) -> str:
-    """读取 config.json 的 model_type，返回架构标识：glm / deepseek_v4 / qwen3_moe。"""
+    """Read model_type from config.json and return an architecture ID: glm / deepseek_v4 / qwen3_moe."""
     p = path if path.endswith(".json") else os.path.join(path, "config.json")
     with open(p, "r", encoding="utf-8") as f:
         c = json.load(f)
@@ -358,7 +359,7 @@ def detect_arch(path: str) -> str:
 
 
 def load_config(path: str):
-    """按架构加载配置：返回 ModelConfig（glm）或 DSV4Config（deepseek_v4/v3）。"""
+    """Load configuration by architecture, returning ModelConfig for glm or DSV4Config for deepseek_v4/v3."""
     arch = detect_arch(path)
     if arch == "kimi_k3":
         root = path if os.path.isdir(path) else os.path.dirname(path)
@@ -376,10 +377,10 @@ def load_config(path: str):
         return DSV4Config.from_hf(path)
     raise ValueError(f"架构 {arch} 的配置解析尚未实现")
 
-    # ---- 派生量 ----
+    # ---- Derived values ----
     @property
     def expert_params(self) -> int:
-        """单个 routed 专家参数量（gate + up + down）。"""
+        """Parameter count of one routed expert (gate plus up plus down)."""
         return 3 * self.hidden * self.moe_inter
 
     @property

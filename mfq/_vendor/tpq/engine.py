@@ -1,7 +1,7 @@
-"""TPQ 生成引擎：tokenizer 封装 + 自回归生成循环（贪心 / top-p 采样）。
+"""TPQ generation engine: tokenizer wrapper plus autoregressive generation loop with greedy or top-p sampling.
 
-默认 EOS 取自 generation_config（GLM-5.2: [154820, 154827, 154829]），
-<|user|>/<|observation|> 命中即停（对话模板的安全边界）。
+Default EOS comes from generation_config (GLM-5.2: [154820, 154827, 154829]).
+Stop on <|user|>/<|observation|> as a safety boundary for the conversation template.
 """
 
 from __future__ import annotations
@@ -80,7 +80,7 @@ def _make_model(
     tp_size: int = 1,
     extreme_fixed_gpu_bytes: int = 0,
 ):
-    """按 TPQ 清单字段分派 Kimi、DeepSeek-V4 或 GLM。"""
+    """Dispatch Kimi, DeepSeek-V4, or GLM according to TPQ manifest fields."""
     _root, manifest = _load_tpq_manifest(model_dir)
     cfg = manifest["config"]
     if (
@@ -121,11 +121,11 @@ def _make_model(
 
 
 def _dense_need_gb(model_dir: str, arch_hint: str, kv_gb: float) -> float:
-    """按产物清单与 config 实际计算 dense 常驻需求（替代按架构硬编码）：
-    DSV4 全 BF16 路径按 safetensors 头部精确计算展开常驻量；其他路径按
-    dense.safetensors 实际大小 + head f32（vocab×hidden×4）+
-    mtp/DSpark 附件 + 瞬时缓冲 1.5GB + KV。读取失败回退架构经验值。
-    清单驱动使得任意档位产物（S/M/L）与任意显卡（16GB 起）都能正确自适应。"""
+    """Calculate actual dense residency requirements from the artifact manifest and config instead of hard-coding by architecture.
+    For the all-BF16 DSV4 path, calculate expanded residency exactly from safetensors headers. Other paths use the actual
+    dense.safetensors size plus an f32 head (vocab*hidden*4), MTP/DSpark attachments, a 1.5 GB transient buffer, and KV.
+    Fall back to architecture estimates if reading fails. Manifest-driven calculation adapts correctly to any S/M/L artifact
+    and any device with at least 16 GB."""
     fallback = (8.2 if arch_hint == "dsv4" else 13.5) + kv_gb
     try:
         _root, man = _load_tpq_manifest(model_dir)
@@ -191,17 +191,17 @@ def _dense_need_gb(model_dir: str, arch_hint: str, kv_gb: float) -> float:
             dsv4_bf16_resident = str(
                 os.environ.get("TPQ_DENSE_BF16", "")
             ).strip().lower() in {"1", "true", "all"}
-        fn = man.get("dspark_file") or man.get("mtp_file")  # 清单指引（产物自包含）
+        fn = man.get("dspark_file") or man.get("mtp_file")  # Manifest reference (the artifact is self-contained)
         if fn and os.path.exists(os.path.join(model_dir, fn)):
             if man.get("dspark_file"):
-                # DSpark：文件主体是草稿专家权重（驻 RAM/独立 LRU，不占 dense 显存），
-                # dense 显存只需 stage bf16 ≈1.4GB + markov + VQ LRU ≈ 2.5GB
+                # DSpark: the file mainly contains draft-expert weights (resident in RAM with an independent LRU, using no dense VRAM).
+                # Dense VRAM needs only ~1.4 GB for stage bf16 plus ~2.5 GB for Markov state and the VQ LRU.
                 if (
                     not dsv4_bf16_resident
                     or os.environ.get("TPQ_SPEC", "0") == "1"
                 ):
                     mtp_gb = 2.5
-            else:  # GLM MTP：dense 附件整体驻显存，按文件实际大小计
+            else:  # GLM MTP: the entire dense attachment remains in VRAM; use the actual file size
                 mtp_gb = os.path.getsize(os.path.join(model_dir, fn)) / 2**30
         return dense_gb + head_gb + mtp_gb + 1.5 + kv_gb
     except Exception:
@@ -270,15 +270,15 @@ def _trim_process_heap() -> None:
 
 
 class Engine:
-    """GLM-5.2-TPQ 的生成引擎（CPU / CUDA，内存显存自动适配）。
+    """Generation engine for GLM-5.2-TPQ with automatic CPU/CUDA RAM/VRAM adaptation.
 
-    cache_gb / vram_cache_gb 传 None 时自动计算：
-      RAM 预算  = 可用内存 − (运行时 2GB + f32 常驻 4.5GB + KV cache + 安全 3GB)
-      VRAM 预算 = 空闲显存 − (dense 常驻 ≈13.5GB + KV cache + 安全 1GB)
-    显存不足以常驻 dense 时自动回退 CPU 模式并提示。
-    共享显存防线（WDDM）：初始化时按 空闲显存−预留(TPQ_VRAM_RESERVE_GB, 默认 1.25GB)
-    给 torch 分配器设 per-process 硬上限，宁可 OOM 降档重试也不让驱动把显存页
-    换到共享显存（带宽掉到 PCIe 级、整轮同步卡顿）。
+    When cache_gb / vram_cache_gb are None, calculate automatically:
+      RAM budget  = available memory - (2 GB runtime + 4.5 GB f32 residency + KV cache + 3 GB safety)
+      VRAM budget = free VRAM - (~13.5 GB dense residency + KV cache + 1 GB safety)
+    Fall back automatically to CPU mode with a notice when VRAM cannot hold dense weights.
+    Shared-memory guard under WDDM: at initialization, set the torch allocator's per-process hard limit to
+    free VRAM minus the reserve (TPQ_VRAM_RESERVE_GB, default 1.25 GB). Prefer an OOM and lower-tier retry over
+    letting the driver page VRAM into shared memory, which reduces bandwidth to PCIe levels and stalls whole passes.
     """
 
     def __init__(
@@ -328,7 +328,7 @@ class Engine:
         ram_mirror = None
         self._vram_limit_bytes = 0
         self._vram_runtime_reserve_gb = 0.0
-        # 架构判定（先读一次 TPQ 清单，供 RAM/VRAM 开销与模型分派共用）
+        # Detect the architecture (read the TPQ manifest once for both RAM/VRAM accounting and model dispatch)
         arch_hint = "glm"
         _manifest: dict = {}
         try:
@@ -388,10 +388,10 @@ class Engine:
 
             extreme_archive = inspect_compact_projection_archive(model_dir)
             self.extreme_strategy = "layered"
-        # Tokenizer 是运行时硬依赖，必须在数百 GiB 权重加载之前验证并初始化。
-        # 旧顺序在模型完整 preload 后才 import ``tokenizers``，一旦 Python
-        # 环境缺包，会白白消耗数分钟加载时间和大量磁盘读。Kimi 继续使用其
-        # 自身 tokenizer 适配，GLM/DeepSeek 使用标准 tokenizer.json。
+        # The tokenizer is a hard runtime dependency and must be validated and initialized before loading hundreds of GiB of weights.
+        # The old order imported ``tokenizers`` only after the full model preload, wasting minutes and substantial disk I/O
+        # when the Python environment lacked the package. Kimi continues to use its own tokenizer adapter;
+        # GLM/DeepSeek use the standard tokenizer.json.
         if arch_hint == "kimi_k3":
             from .kimi_tokenizer import KimiTokenizer
 
@@ -402,8 +402,8 @@ class Engine:
             prepared_tokenizer = Tokenizer.from_file(
                 os.path.join(model_dir, "tokenizer.json")
             )
-        # RAM 开销按架构。普通 DSV4 允许 paged KV 按需增长；极限模式的
-        # GPU-only 专家不可再收缩，所以必须在放置专家前为完整声明上下文预留。
+        # RAM overhead depends on the architecture. Regular DSV4 permits paged KV to grow on demand.
+        # Extreme mode cannot shrink GPU-only experts further, so reserve the full declared context before placing experts.
         if arch_hint == "dsv4":
             if self.extreme_mode:
                 from .capacity import dsv4_context_runtime_bytes
@@ -414,16 +414,16 @@ class Engine:
                 )
             else:
                 kv_gb = 0.2
-            ram_overhead = 2.0 + 2.1 + kv_gb + 3.0   # f32 2.1 + 安全 3（用户实测调优）
+            ram_overhead = 2.0 + 2.1 + kv_gb + 3.0   # 2.1 GB for f32 plus 3 GB safety margin (tuned from user measurements)
         else:
-            # GLM：MLA 潜变量 KV（默认开）≈0.09MB/token + 吸收矩阵 2.3GB；
-            # TPQ_LATENT_KV=0 回退逐头全量 K/V ≈5MB/token。KV 按需增长，
-            # 启动预算不能把模型声明的逻辑上限当作已分配显存。
+            # GLM: latent MLA KV (enabled by default) uses ~0.09 MB/token plus 2.3 GB for absorption matrices.
+            # TPQ_LATENT_KV=0 falls back to full per-head K/V at ~5 MB/token. KV grows on demand,
+            # so the startup budget must not treat the model's declared logical limit as already allocated VRAM.
             kv_gb = _glm_startup_kv_gb(
                 max_ctx,
                 latent=os.environ.get("TPQ_LATENT_KV", "1") != "0",
             )
-            ram_overhead = 2.0 + 4.5 + kv_gb + 6.0  # 安全余量 6GB
+            ram_overhead = 2.0 + 4.5 + kv_gb + 6.0  # 6 GB safety margin
         if arch_hint == "kimi_k3":
             initial_ctx = min(max(0, int(max_ctx)), 4096)
             kv_gb = 0.5 + 0.027 * initial_ctx / 1024
@@ -492,9 +492,9 @@ class Engine:
                         rank_memory.append(torch.cuda.mem_get_info(rank))
                 free_v = min(item[0] for item in rank_memory) / 2**30
                 total_v = min(item[1] for item in rank_memory) / 2**30
-                # 共享显存防线：WDDM 下分配顶满物理显存会被驱动换页到内存（共享显存，
-                # 带宽掉到 PCIe 级，整轮同步卡顿）。给本进程分配器设硬上限 =
-                # 空闲显存 − 系统预留，宁可 OOM 报错也绝不触发共享显存换页。
+                # Shared-memory guard: under WDDM, filling physical VRAM makes the driver page into system memory,
+                # reducing bandwidth to PCIe levels and stalling the entire synchronous pass. Set a hard allocator limit
+                # for this process to free VRAM minus the system reserve; prefer an OOM error over shared-memory paging.
                 reserve_gb = float(os.environ.get("TPQ_VRAM_RESERVE_GB", "1.25"))
                 extreme_vram_cap_gb = max(
                     0.0,
@@ -547,9 +547,9 @@ class Engine:
                             f"{extreme_vram_cap_gb:.2f}GiB",
                             flush=True,
                         )
-                # dense 常驻需求按架构：GLM ≈13.5GB（int4 9.2 + lm_head 3.8 + router 0.5），
-                # DSV4 ≈10.5GB（dense 一次性反量化 bf16 常驻 ≈7.2 + head bf16 ≈1.1 + DSpark ≈2.2；
-                # bf16 消除逐调用反量化，是 attn 段的关键提速；+ KV + 安全 2GB（悬崖余量）
+                # Resident dense requirements by architecture: GLM ~13.5 GB (9.2 int4 + 3.8 lm_head + 0.5 router),
+                # DSV4 ~10.5 GB (~7.2 for dense weights dequantized once and kept in bf16 + ~1.1 head bf16 + ~2.2 DSpark).
+                # BF16 avoids per-call dequantization and is critical to attention speed; add KV plus a 2 GB safety margin.
                 dense_need = _dense_need_gb(model_dir, arch_hint, kv_gb)
                 if self.extreme_mode and extreme_archive is not None:
                     from .extreme import (
@@ -590,9 +590,9 @@ class Engine:
                             f"策略={self.extreme_strategy}",
                             flush=True,
                         )
-                # 余量按架构：GLM 的 dense 常驻 + 吸收矩阵(2.1GB) + 瞬态反量化块贴近
-                # 分配器硬上限，实测 1-2GB 余量仍会在 decode 中 OOM → GLM 3GB，DSV4 1GB
-                #（GLM 专家本就走 RAM/磁盘流式，显存缓存价值低）
+                # Architecture-specific margin: GLM's resident dense weights, 2.1 GB absorption matrices, and transient
+                # dequantization blocks approach the allocator limit. A measured 1-2 GB margin still OOMs during decode,
+                # so use 3 GB for GLM and 1 GB for DSV4 (GLM experts already stream from RAM/disk, so VRAM caching has little value).
                 margin = (
                     0.0
                     if self.extreme_mode
@@ -609,10 +609,10 @@ class Engine:
                           f"回退 CPU 模式", flush=True)
                     dev = "cpu"
                 elif vram_cache_gb is None:
-                    # 显存余量 2GB（DSV4）：顶到 100% 会触发分配器 cudaFree+同步回收（悬崖 ×4）
-                    # 极限模式把完整可用余量交给 packed pool；pool 会先用
-                    # extreme_fixed_gpu_bytes 建立真实 CUDA 占位，再从剩余空间
-                    # 放置专家。Dense 流式加载时直接复用占位块，不会重复扣除。
+                    # Keep a 2 GB VRAM margin for DSV4: reaching 100% triggers allocator cudaFree plus synchronous reclamation (a 4x cliff).
+                    # Extreme mode gives the entire available margin to the packed pool. The pool first reserves a real CUDA allocation
+                    # using extreme_fixed_gpu_bytes, then places experts in the remaining space. Dense streaming reuses the reservation
+                    # directly, so it is not counted twice.
                     auto_vram = (
                         planning_free_v
                         if self.extreme_mode
@@ -770,8 +770,8 @@ class Engine:
             self._cap_expert_cache(
                 self._vram_runtime_reserve_gb, "dense/运行时安全余量"
             )
-        # 动态显存监测：滞回调节专家显存缓存预算（防其他进程抢占/碎片化/小显卡
-        # 顶满物理显存触发共享显存换页）；TPQ_VRAM_WATCH=0 关闭
+        # Dynamic VRAM monitoring: adjust the expert VRAM cache budget with hysteresis to handle contention from other processes,
+        # fragmentation, and shared-memory paging when small GPUs fill physical VRAM. Disable with TPQ_VRAM_WATCH=0.
         if (
             dev == "cuda"
             and not full_resident
@@ -795,8 +795,8 @@ class Engine:
                 e = json.load(f).get("eos_token_id", DEFAULT_EOS)
                 self.eos = [e] if isinstance(e, int) else list(e)
         self.quiet = quiet
-        self._cache_ids: list[int] | None = None   # KV 中已缓存的 token 前缀（多轮复用）
-        self._cache_via_spec = False   # 缓存是否由投机路径建立（DSpark 环覆盖一致才可直接复用）
+        self._cache_ids: list[int] | None = None   # Token prefix already cached in KV (reused across turns)
+        self._cache_via_spec = False   # Whether the cache was built by the speculative path (direct reuse requires matching DSpark ring coverage)
         self._kv_baseline: _DSV4Baseline | None = None
         self.last_kv_stats: KVPrefillStats | None = None
         self._kv_prefill_events = None
@@ -952,12 +952,13 @@ class Engine:
         if dsp is not None:
             dsp.reset()
 
-    # ---- 多轮 KV 复用（省掉历史重 prefill）----
+    # ---- Multi-turn KV reuse (avoids re-prefilling history) ----
     def _kv_prefix_len(self, ids: list[int]) -> int:
-        """上轮缓存的 token 序列（prompt+回复）仍是本轮 prompt 的严格前缀时返回其长度，
-        调用方只需增量 prefill 后缀；否则 0（全量重置重跑）。
-        逐 token id 精确比对，正确性不依赖 tokenizer decode→encode 往返稳定性；
-        think 开启时思维链不回喂、前缀必然失配 → 自动回退全量（符合官方模板）。"""
+        """Return the length of the previous cached token sequence when prompt plus response remains a strict prefix
+        of the current prompt, allowing the caller to prefill only the suffix. Otherwise return 0 for a full reset and rerun.
+        Compare exact token IDs so correctness does not depend on tokenizer decode/encode round-trip stability.
+        With thinking enabled, chain-of-thought is not fed back and the prefix necessarily differs, automatically
+        falling back to a full pass as required by the official template."""
         cached = getattr(self, "_cache_ids", None)
         if cached and len(cached) < len(ids) and ids[:len(cached)] == cached:
             return len(cached)
@@ -1099,9 +1100,9 @@ class Engine:
 
     @torch.no_grad()
     def _dsv4_prefill_suffix(self, ids: list[int], skip: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """DSV4 增量批量 prefill：复用 forward_verify 通道（快照不回滚，状态自然前进），
-        64 token 分块（< sliding_window=128，避免环槽同批回绕）。
-        返回 (末位 logits [vocab], 后缀全部位置 main_hidden [T, 3·hidden])。"""
+        """Incremental batched DSV4 prefill reusing the forward_verify channel without rolling back snapshots,
+        so state advances naturally. Use 64-token chunks, below sliding_window=128, to avoid ring-slot wraparound
+        within one batch. Returns final-position logits [vocab] and main_hidden [T, 3*hidden] for all suffix positions."""
         m = self.model
         mhs = []
         lg = None
@@ -1111,7 +1112,7 @@ class Engine:
             lg2, mh2 = self._with_kv_capacity_retry(
                 m.forward_verify, chunk, pos
             )
-            m._spec = None            # 增量 prefill 不回滚，丢弃快照
+            m._spec = None            # Incremental prefill is not rolled back; discard the snapshot
             pos += len(chunk)
             mhs.append(mh2)
             lg = lg2
@@ -1708,11 +1709,11 @@ class Engine:
                  no_repeat_ngram: int = 0,
                  should_stop: Callable[[], bool] | None = None,
                  kv_baseline_len: int | None = None) -> list[int]:
-        """自回归生成。temp=0 贪心；callback(tok_id, 增量文本) 逐 token 回调。
+        """Autoregressive generation. temp=0 is greedy; callback(tok_id, incremental_text) runs for each token.
 
-        rep_penalty>1：对已出现 token 的 logits 施加重复惩罚（正除负乘），
-        压制 PTQ 模型自由文本/长生成的复读循环（knee 档已知倾向）。
-        no_repeat_ngram>0：禁止会复现已生成 n-gram 的候选 token。
+        rep_penalty>1 applies a repetition penalty to logits of seen tokens by dividing positive values and multiplying
+        negative values. This suppresses repetition loops in free-text or long generation by PTQ models, a known tendency
+        at the knee tier. no_repeat_ngram>0 bans candidate tokens that would reproduce an already generated n-gram.
         """
         out: list[int] = []
         mc = getattr(self.model, "max_ctx", None)
@@ -1720,7 +1721,7 @@ class Engine:
             print(f"[tpq] prompt 已达到 max_ctx={mc}，无法继续生成", flush=True)
             return out
         if max_new is not None and mc and len(ids) + max_new > mc:
-            # 提前友好报错：越界会在 KV 压缩槽/rope 索引处抛 cryptic IndexError
+            # Fail early with a clear error; otherwise overflow raises a cryptic IndexError in KV compression slots or RoPE indexing
             max_new = max(0, mc - len(ids))
             kv_hint = (
                 "MLA latent KV 约 0.09MB/token"
@@ -1771,7 +1772,7 @@ class Engine:
                 if lg is logits:
                     lg = logits.clone()
                 key = tuple(prev[-(no_repeat_ngram - 1):]) if no_repeat_ngram > 1 else ()
-                for tok in ngram_ban.get(key, ()):  # 禁掉会复现 n-gram 的 token
+                for tok in ngram_ban.get(key, ()):  # Ban tokens that would reproduce the n-gram
                     lg[tok] = float("-inf")
             if temp <= 1e-6:
                 nxt = int(lg.argmax().item())
@@ -1798,7 +1799,7 @@ class Engine:
             if stop_requested:
                 break
         self._cache_ids = list(ids) + out
-        self._cache_via_spec = False   # 非投机路径不写 DSpark 环
+        self._cache_via_spec = False   # The non-speculative path does not write the DSpark ring
         return out
 
     @torch.no_grad()
@@ -1811,11 +1812,10 @@ class Engine:
         should_stop: Callable[[], bool] | None = None,
         kv_baseline_len: int | None = None,
     ) -> list[int]:
-        """MTP/DSpark 投机解码（贪心）。
+        """Greedy MTP/DSpark speculative decoding.
 
-        DSV4 默认严格回退 generate(temp=0)；仅显式设置
-        TPQ_DSPARK_EXPERIMENTAL=1 才运行尚未数值等价的批量验证路径。
-        GLM 仍走 MTP layer 78。
+        DSV4 strictly falls back to generate(temp=0) by default. Run the batch-validation path, which is not yet
+        numerically equivalent, only when TPQ_DSPARK_EXPERIMENTAL=1 is explicitly set. GLM continues to use MTP layer 78.
         """
         if getattr(self, "arch", "glm") == "kimi_k3":
             if (
@@ -1910,17 +1910,17 @@ class Engine:
             return []
         if max_new is not None and mc and len(ids) + max_new > mc:
             max_new = max(0, mc - len(ids))
-        self.reset()           # GLM-MTP 路径不支持增量 prefill，每轮全量重建
+        self.reset()           # The GLM-MTP path does not support incremental prefill; rebuild fully each turn
         mtp = MTPHead(self.model)
         mtp.reset()
         out: list[int] = []
         h_all = self.model.forward_hidden(ids)
         logits = self.model.logits_of(h_all[-1:]).squeeze(0)
-        # MTP prefill 建立第 78 层上下文 KV；草稿首步用主模型 hidden（DeepSeek 流程），
-        # 链式步才回喂 MTP 自身输出 h78
+        # MTP prefill builds layer-78 context KV. The first draft step uses the main model's hidden state (DeepSeek flow);
+        # chained steps feed back MTP's own h78 output.
         mtp.prefill(h_all, ids)
         h_main_last = h_all[-1:]
-        next_pos = len(ids)          # 下一个 MTP 步的 RoPE 位置
+        next_pos = len(ids)          # RoPE position of the next MTP step
         next_t1 = int(logits.argmax())
         stats = {"rounds": 0, "accepted": 0, "drafted": 0}
         stop_requested = False
@@ -1938,7 +1938,7 @@ class Engine:
                 len(out), max_new, len(ids) + len(out), mc
             ):
                 break
-            # 1) 起草：首步输入 = (主模型 hidden, emb(t1))；其后回喂 h78
+            # 1) Draft: first-step input = (main-model hidden, emb(t1)); feed h78 back thereafter
             kv0 = mtp.kv[0].shape[1] if mtp.kv is not None else 0
             h, drafts = h_main_last, []
             draft_count = k
@@ -1950,7 +1950,7 @@ class Engine:
                 h, lg = mtp.step(h, t1 if not drafts else drafts[-1], next_pos + j)
                 drafts.append(int(lg.argmax()))
             stats["drafted"] += len(drafts)
-            # 2) 主模型一次前向验证 [t1, d1..dk]
+            # 2) Validate [t1, d1..dk] in one main-model forward pass
             pos0 = self.model.pos
             h2 = self.model.forward_hidden([t1] + drafts)
             lg2 = self.model.logits_of(h2)
@@ -1973,11 +1973,11 @@ class Engine:
             stats["accepted"] += accepted
             stats["rounds"] += 1
             next_t1 = int(lg2[accepted].argmax())
-            # 3) 主 KV 截断：被拒草稿不得留在上下文（只保留 t1 + 接受的前缀）
+            # 3) Truncate main KV: rejected drafts must not remain in context (keep only t1 plus the accepted prefix)
             keep = pos0 + 1 + accepted
             self.model.truncate_kv(keep)
-            # 4) MTP 状态推进：KV 截断（保留 t1 + 接受前缀，t1 步恒有效）；
-            #    下一轮首步的 hidden = 主模型在最后接受位的 hidden（h2[accepted]）
+            # 4) Advance MTP state: truncate KV (keep t1 plus the accepted prefix; the t1 step is always valid).
+            #    The first-step hidden state for the next round is the main model's hidden state at the last accepted position (h2[accepted]).
             L = kv0 + 1 + accepted
             mtp.kv = (mtp.kv[0][:, :L], mtp.kv[1][:, :L])
             h_main_last = h2[accepted:accepted + 1]
@@ -2111,12 +2111,12 @@ class Engine:
         callback=None,
         should_stop: Callable[[], bool] | None = None,
     ) -> list[int]:
-        """DSV4 DSpark 块并行投机解码（贪心验收，输出与 generate(temp=0) 一致）。
+        """DSV4 DSpark block-parallel speculative decoding with greedy acceptance, matching generate(temp=0).
 
-        每轮：1 次 DSpark 前向并行产出 block_size(=5) 个草稿 → 主模型 1 次批量
-        前向验证 [t1, d1..dk] → 接受最长连续前缀（argmax 比对），首位不匹配的
-        argmax 为奖励 token → 主 KV 按接受前缀截断（spec_commit），DSpark 环
-        写入接受位置的 main_kv。
+        Each round: one DSpark forward pass produces block_size=5 drafts in parallel; one batched main-model
+        forward pass validates [t1, d1..dk]; accept the longest consecutive prefix by argmax comparison and use the
+        argmax at the first mismatch as a bonus token. Truncate main KV to the accepted prefix with spec_commit,
+        then write main_kv for accepted positions into the DSpark ring.
         """
         from .dspark import DSparkHead
         model = self.model
@@ -2132,11 +2132,11 @@ class Engine:
         out: list[int] = []
         skip = self._kv_prefix_len(ids) if self._cache_via_spec else 0
         if skip:
-            # 多轮 KV 复用：主模型只增量 prefill 新后缀，DSpark 环补写新位置的 main_kv
+            # Multi-turn KV reuse: the main model incrementally prefills only the new suffix; fill new main_kv positions in the DSpark ring
             lg_last, mh_suf = self._dsv4_prefill_suffix(ids, skip)
             dsp.update_kv(mh_suf, skip)
             t1 = int(lg_last.argmax())
-            mh_last = mh_suf[-1]                    # 最末位置 main_hidden [3D]
+            mh_last = mh_suf[-1]                    # main_hidden at the final position [3D]
         else:
             self.reset()
             dsp.reset()
@@ -2144,10 +2144,10 @@ class Engine:
                 model.prefill_mh,
                 torch.tensor([ids], device=model.device),
             )
-            dsp.prefill_kv(mh[0])                # DSpark 环：positions 0..T-1
+            dsp.prefill_kv(mh[0])                # DSpark ring: positions 0..T-1
             t1 = int(logits_last[0].argmax())
-            mh_last = mh[0, -1]                  # position p 的 main_hidden [3D]
-        p = len(ids) - 1                         # 最末已处理位置
+            mh_last = mh[0, -1]                  # main_hidden at position p [3D]
+        p = len(ids) - 1                         # Last processed position
         stats = {"rounds": 0, "accepted": 0, "drafted": 0}
         mc = getattr(model, "max_ctx", None)
         stop_requested = False
@@ -2156,7 +2156,7 @@ class Engine:
             and t1 not in self.eos
             and not stop_requested
         ):
-            drafts = dsp.draft(t1, mh_last, p)   # 5 草稿；main_kv@p 写入各层环
+            drafts = dsp.draft(t1, mh_last, p)   # Five drafts; write main_kv@p into each layer's ring
             out.append(t1)
             if callback:
                 callback(t1, self.decode([t1]))
@@ -2197,14 +2197,14 @@ class Engine:
             stats["rounds"] += 1
             next_t1 = int(lg2[accepted].argmax())
             keep = pos0 + 1 + accepted
-            model.spec_commit(keep)               # 主 KV 按接受前缀截断
-            dsp.update_kv(mh2[:accepted], pos0)   # 接受前缀入 DSpark 环（末位下轮 draft 写）
+            model.spec_commit(keep)               # Truncate main KV to the accepted prefix
+            dsp.update_kv(mh2[:accepted], pos0)   # Add the accepted prefix to the DSpark ring (the next draft writes the final position)
             mh_last = mh2[accepted]
             p = keep - 1
             t1 = next_t1
         self.spec_stats = stats
         self._cache_ids = list(ids) + out
-        self._cache_via_spec = True    # DSpark 环已覆盖 prompt+回复全部位置
+        self._cache_via_spec = True    # The DSpark ring now covers every prompt and response position
         return out
 
 

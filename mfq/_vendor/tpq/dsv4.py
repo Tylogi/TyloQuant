@@ -1,40 +1,40 @@
-"""DeepSeek-V4（deepseek_v4，DeepSeek-V4-Flash-DSpark）纯 PyTorch 前向模块。
+"""Pure-PyTorch forward module for DeepSeek-V4 (deepseek_v4, DeepSeek-V4-Flash-DSpark).
 
-用途：TPQ 量化流水线的路由摘选（profile）、KL 评估与后续推理复用。
-逐行对照官方参考实现 inference/model.py（+ kernel.py），全 f32 计算
-（RMSNorm 内部亦 fp32），只依赖 torch（+ TPQ.fp4io），不依赖 tilelang 等官方包。
+Purpose: routing-profile extraction for the TPQ quantization pipeline, KL evaluation, and reuse in later inference.
+This follows the official reference inference/model.py plus kernel.py line by line, computes entirely in f32
+(including RMSNorm internals), and depends only on torch plus TPQ.fp4io, not official packages such as tilelang.
 
-文件结构：
-  1) SafeFile / DSV4Checkpoint —— safetensors 纯文件 I/O 读取（8 字节头长 + JSON 头
-     + 原始字节，无 mmap，模式参考 tpq/store.py），按层/按专家懒加载；
-     FP8（e4m3 值 × 2^(scale-127)，128×128 块，scale 直接乘不取倒数）与
-     FP4（fp4io.dequant_fp4，低半字节在前、e2m1 LUT、32 块 ue8m0）反量化。
-  2) 前向数学 —— Hyper-Connections（4 通道残差流 [B,T,4,D]：hc_pre(sigmoid 混合)
-     → 子层 → hc_post(post + sinkhorn(20 轮) comb)）、低秩 Q（wq_a→q_norm→wq_b→逐头
-     无权重 RMS）+ MQA（64 头共享同一 512 维 kv，key=value）+ 分组 LoRA O（o_groups=8）、
-     相邻复数对 RoPE（仅最后 64 维；ratio>0 层 YaRN theta=160000/factor=16/orig=65536/
-     beta_fast=32/beta_slow=1，无 mscale；ratio=0 层 theta=10000）+ 注意力输出反旋转
-     （value 也被 rope 过）、注意力集合 = 最近 128 原始 token（滑窗环形缓存）+ 全部
-     压缩 token（T≤2048 时 Indexer top-512 恒等于全选，规范 §4，故跳过 Indexer），
-     softmax 分母含 attn_sink（不进分子），scale=512^-0.5。
-     KV Compressor（ratio=4 时 coff=2 overlap：8 窗口 4 步长；ratio=128 时 coff=1）：
-     wkv/wgate → ape 位置偏置 → 分组 softmax 池化 → RMSNorm → 相位=窗口首 token 的
-     RoPE（最后 64 维）→ 写入压缩槽位；decode 增量：每步算 1 token 的 wkv/wgate 入
-     state，每 ratio 步产出 1 个压缩 token。
-     sqrtsoftplus 路由（sqrt(softplus(logits))，fp32）：层 0-2 用 tid2eid 静态表选择
-     + learned 权重（无 bias）；层≥3 noaux_tc top-6（bias 只用于选择不进权重）→
-     权重归一 ×1.5。专家 SwiGLU：up=clamp(±10)、gate=clamp(max=10)、silu(gate)*up→w2。
-     embed 复制到 4 个 hc 通道（官方 model.py generate 流程）；结尾 hc_head（4 通道
-     加权求和，无 sinkhorn）→ final RMSNorm → head。MTP/DSpark 层（43-45）整块跳过。
-  3) DSV4Model —— prefill 批式 + decode 单步（KV 环形缓存 + 压缩槽位 + 增量 Compressor）。
-  4) main() 自包含自检（python -m TPQ.dsv4）：微小合成模型对照逐元素朴素实现。
+File structure:
+  1) SafeFile / DSV4Checkpoint -- safetensors reading through ordinary file I/O (8-byte header length,
+     JSON header, and raw bytes; no mmap; patterned after tpq/store.py), with lazy per-layer/per-expert loading.
+     Dequantizes FP8 (e4m3 value * 2^(scale-127), 128x128 blocks, multiply scale directly without reciprocal)
+     and FP4 (fp4io.dequant_fp4, low nibble first, e2m1 LUT, ue8m0 blocks of 32).
+  2) Forward mathematics -- Hyper-Connections using a four-channel residual stream [B,T,4,D]: hc_pre sigmoid
+     mixing -> sublayer -> hc_post with post plus 20-round Sinkhorn comb. Low-rank Q uses wq_a -> q_norm -> wq_b
+     -> per-head weightless RMS; MQA shares one 512-dimensional KV across 64 heads with key=value; grouped LoRA O
+     uses o_groups=8. Adjacent-complex-pair RoPE affects only the final 64 dimensions. ratio>0 layers use YaRN
+     theta=160000/factor=16/orig=65536/beta_fast=32/beta_slow=1 without mscale; ratio=0 layers use theta=10000.
+     Attention outputs are inverse-rotated because value also receives RoPE. The attention set contains the latest
+     128 original tokens in a sliding-window ring plus all compressed tokens. For T<=2048, Indexer top-512 equals
+     selecting everything (specification section 4), so Indexer is skipped. The softmax denominator includes
+     attn_sink, but the numerator does not; scale=512^-0.5. KV Compressor uses coff=2 overlap at ratio=4
+     (window 8, stride 4) and coff=1 at ratio=128: wkv/wgate -> ape positional bias -> grouped softmax pooling
+     -> RMSNorm -> RoPE at the first-token phase of each window on the final 64 dimensions -> compressed slot.
+     Incremental decode adds one token's wkv/wgate to state each step and emits one compressed token every ratio steps.
+     sqrtsoftplus routing computes sqrt(softplus(logits)) in fp32. Layers 0-2 use static tid2eid selection plus
+     learned unbiased weights; layers >=3 use noaux_tc top-6, where bias affects selection but not weights, followed
+     by normalization times 1.5. Expert SwiGLU uses up=clamp(+/-10), gate=clamp(max=10), then silu(gate)*up -> w2.
+     Embeddings are copied to four HC channels as in official model.py generation. The final hc_head performs a
+     four-channel weighted sum without Sinkhorn, followed by final RMSNorm and head. MTP/DSpark layers 43-45 are skipped.
+  3) DSV4Model -- batched prefill plus single-step decode using KV rings, compressed slots, and incremental Compressor.
+  4) main() -- a self-contained check (python -m TPQ.dsv4) comparing a tiny synthetic model with naive element-wise code.
 
-与官方实现的偏离（语义不变或精度更高，均已在自检中覆盖）：
-  - 省略全部 QAT quant-dequant 模拟（kv 前 448 维 fp8 块 64、indexer Hadamard+fp4）：
-    官方亦注明 "kv could also use fp8, current implementation uses bf16"，此处按 f32 精确算。
-  - Indexer 整块省略：T≤2048 时其 top-512 恒等于全选（规范 §4），数学上精确。
-  - 专家中间结果不转 bf16（官方 w2 前 .to(bf16)），全程 f32，精度更高。
-  - HF 检查点里 wo_a 实为 FP8+scale（官方 convert.py 之后才转 BF16），加载器两者皆可。
+Differences from the official implementation, preserving semantics or improving precision and covered by self-checks:
+  - Omit all QAT quant-dequant simulation (64-element FP8 blocks for the first 448 KV dimensions and Indexer
+    Hadamard plus FP4). The official code notes that KV could use FP8 but currently uses BF16; this code computes exact f32.
+  - Omit Indexer entirely because its top-512 is exactly full selection for T<=2048 (specification section 4).
+  - Keep expert intermediates in f32 instead of converting to bf16 before official w2, improving precision.
+  - In HF checkpoints wo_a is FP8 plus scale and converts to BF16 only after official convert.py; the loader accepts both.
 """
 
 from __future__ import annotations
@@ -52,15 +52,15 @@ import torch.nn.functional as F
 from .cconfig import DSV4Config
 from .fp4io import dequant_fp4
 
-FP8_BLOCK = 128  # 块级 FP8 的块边长
+FP8_BLOCK = 128  # Side length of a block-level FP8 block
 
 def _lin(x, w):
-    """线性层统一入口：默认 torch F.linear；TPQ 推理侧以 Int4Weight/VQWeight
-    分派实现替换（见 tpq/dsv4model.py 的 _tpq_lin），量化感知代码无需改动。"""
+    """Unified linear-layer entry point using torch F.linear by default. TPQ inference replaces it with
+    Int4Weight/VQWeight dispatch in _tpq_lin from tpq/dsv4model.py, without changes to quantization-aware code."""
     return torch.nn.functional.linear(x, w)
 
 
-# safetensors dtype → torch dtype；F8_* 一律按 uint8 原始字节读入，反量化时再解释
+# safetensors dtype -> torch dtype; always read F8_* as raw uint8 bytes and interpret them during dequantization
 _ST_DTYPES = {
     "U8": torch.uint8, "I8": torch.int8, "I16": torch.int16, "I32": torch.int32,
     "I64": torch.int64, "F16": torch.float16, "F32": torch.float32,
@@ -70,7 +70,7 @@ _ST_DTYPES = {
 
 
 class SafeFile:
-    """极简 safetensors 读取器（纯文件 I/O，无 mmap；模式参考 tpq/store.py）。"""
+    """Minimal safetensors reader using ordinary file I/O without mmap, patterned after tpq/store.py."""
 
     def __init__(self, path: str):
         self.path = path
@@ -96,10 +96,10 @@ class SafeFile:
 
 
 def dequant_fp8(w: torch.Tensor, scale: torch.Tensor, block: int = FP8_BLOCK) -> torch.Tensor:
-    """块级 FP8 反量化到 f32：W = e4m3值(w) × 2^(scale-127)，块 128×128。
+    """Block-level FP8 dequantization to f32: W = e4m3_value(w) * 2^(scale-127), in 128x128 blocks.
 
-    w: [R, C] uint8 原始字节（或 float8_e4m3fn）；scale: [ceil(R/128), ceil(C/128)]
-    ue8m0 字节（2 的幂次指数，HF ckpt 的 weight_scale_inv 存的就是正向乘子，直接乘）。
+    w: [R, C] raw uint8 bytes or float8_e4m3fn. scale: [ceil(R/128), ceil(C/128)] ue8m0 bytes
+    containing powers-of-two exponents. HF checkpoint weight_scale_inv stores the forward multiplier, so multiply directly.
     """
     wf = w.view(torch.float8_e4m3fn).float() if w.dtype == torch.uint8 else w.float()
     s = torch.pow(2.0, scale.view(torch.uint8).float() - 127.0)
@@ -108,17 +108,17 @@ def dequant_fp8(w: torch.Tensor, scale: torch.Tensor, block: int = FP8_BLOCK) ->
 
 
 class DSV4Checkpoint:
-    """DeepSeek-V4 HF 检查点（官方 convert 规则命名的分片）流式读取器。
+    """Streaming reader for DeepSeek-V4 HF checkpoints sharded according to official conversion naming rules.
 
-    张量命名（已从本机分片头核实）：
+    Tensor naming, verified from local shard headers:
       layers.{i}.attn.{wq_a,q_norm,wq_b,wkv,kv_norm,attn_sink,wo_a,wo_b}[.weight/.scale]
-      layers.{i}.attn.compressor.{wkv,wgate}.weight / .ape / .norm.weight   （ratio>0 层）
-      layers.{i}.ffn.gate.{weight,bias(层≥3),tid2eid(层0-2,I64)}
-      layers.{i}.ffn.experts.{e}.w{1,2,3}.weight(I8 打包 FP4)/.scale(F8_E8M0)
+      layers.{i}.attn.compressor.{wkv,wgate}.weight / .ape / .norm.weight   (ratio>0 layers)
+      layers.{i}.ffn.gate.{weight,bias(layers >=3),tid2eid(layers 0-2,I64)}
+      layers.{i}.ffn.experts.{e}.w{1,2,3}.weight(I8-packed FP4)/.scale(F8_E8M0)
       layers.{i}.ffn.shared_experts.w{1,2,3}.weight/.scale                  （FP8）
       layers.{i}.{attn_norm,ffn_norm}.weight、layers.{i}.hc_{attn,ffn}_{fn,base,scale}
-      顶层 embed.weight / norm.weight / head.weight / hc_head_{fn,base,scale}
-    FP8 张量 = .weight(F8_E4M3) + .scale(F8_E8M0)。注意 wo_a 在 HF ckpt 中也是 FP8。
+      top-level embed.weight / norm.weight / head.weight / hc_head_{fn,base,scale}
+    FP8 tensor = .weight(F8_E4M3) plus .scale(F8_E8M0). Note that wo_a is also FP8 in the HF checkpoint.
     """
 
     def __init__(self, root: str, device: str | torch.device = "cpu",
@@ -133,21 +133,21 @@ class DSV4Checkpoint:
         if not self.loc:
             raise FileNotFoundError(f"{root} 下未找到 model-*.safetensors 分片")
         self._layer_cache: dict[int, dict] = {}
-        # 层权重驻留上限：prefill 顺序过层，容量 2 足够；旧版无界缓存 43 层 f32
-        # ≈17GB，会把显存顶进共享显存换页（实测 +7.1GB）。
+        # Bound resident layer weights: prefill visits layers sequentially, so capacity 2 is sufficient.
+        # The old unbounded cache held 43 f32 layers (~17 GB), forcing VRAM into shared-memory paging (+7.1 GB measured).
         self._cache_layers = max(1, cache_layers)
 
     def has(self, name: str) -> bool:
         return name in self.loc
 
     def get_raw(self, name: str) -> torch.Tensor:
-        """按存储 dtype 读取（F8_* 为 uint8 原始字节）。"""
+        """Read according to stored dtype, returning F8_* as raw uint8 bytes."""
         return self.loc[name].get_tensor(name)
 
     def get_f32(self, name: str) -> torch.Tensor:
-        """读取并反量化到 f32（带伴生 .scale 的走块级 FP8 反量化；BF16/F32 直转）。
+        """Read and dequantize to f32, using block-level FP8 when a companion .scale exists and directly converting BF16/F32.
 
-        伴生 scale 命名：X.weight ↔ X.scale（官方 convert 把 weight_scale_inv 改名为 scale）。
+        Companion-scale naming: X.weight <-> X.scale; official conversion renames weight_scale_inv to scale.
         """
         sname = name[:-len("weight")] + "scale" if name.endswith("weight") else name + ".scale"
         if self.has(sname):
@@ -156,9 +156,9 @@ class DSV4Checkpoint:
             w = self.get_raw(name).float()
         return w.to(self.device)
 
-    # ---- 按层加载 ----
+    # ---- Per-layer loading ----
     def layer(self, i: int) -> dict:
-        """一层全部非专家权重（f32；tid2eid 转 long）。"""
+        """Return all non-expert weights for one layer as f32, converting tid2eid to long."""
         if i in self._layer_cache:
             return self._layer_cache[i]
         p = f"layers.{i}"
@@ -198,13 +198,13 @@ class DSV4Checkpoint:
         self._layer_cache[i] = w
         while len(self._layer_cache) > self._cache_layers:
             for k in list(self._layer_cache):
-                if k != i:  # 驱逐最老的非当前层（插入序），f32 张量归还分配器
+                if k != i:  # Evict the oldest non-current layer (in insertion order), returning f32 tensors to the allocator
                     del self._layer_cache[k]
                     break
         return w
 
     def expert(self, layer: int, eid: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """单个 routed 专家 (w1, w3, w2)，FP4 反量化到 f32（低半字节在前、e2m1、32 块）。"""
+        """Return one routed expert (w1, w3, w2), dequantizing FP4 to f32 with low nibble first, e2m1, and blocks of 32."""
         p = f"layers.{layer}.ffn.experts.{eid}"
         out = []
         for k in ("w1", "w3", "w2"):
@@ -214,7 +214,7 @@ class DSV4Checkpoint:
             out.append(dequant_fp4(q, s, r, c2 * 2, device=self.device))
         return tuple(out)
 
-    # ---- 顶层 ----
+    # ---- Top level ----
     def embed(self) -> torch.Tensor:
         return self.get_f32("embed.weight")
 
@@ -230,22 +230,22 @@ class DSV4Checkpoint:
 
 
 # =====================================================================
-# 前向数学（全 f32）
+# Forward computation (all f32)
 # =====================================================================
 
 def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
-    """RMSNorm：f32 计算方差，输出保持输入 dtype（无 bias）。"""
+    """RMSNorm computing variance in f32 and preserving the input dtype in the unbiased output."""
     v = x.float().square().mean(-1, keepdim=True)
     out = w.float() * (x.float() * torch.rsqrt(v + eps))
     return out.to(x.dtype)
 
 
 class RopeCache:
-    """RoPE 频率预计算（相邻复数对 (x0,x1),(x2,x3),...；只作用最后 rope_dim 维）。
+    """Precompute RoPE frequencies for adjacent complex pairs (x0,x1),(x2,x3), affecting only the final rope_dim dimensions.
 
-    ratio=0 层：theta=rope_theta(10000)，YaRN 关闭；ratio>0 层：theta=
-    compress_rope_theta(160000) + YaRN（factor/orig/beta_fast/beta_slow 来自
-    rope_scaling，无 mscale 增益）。输出 cos/sin [max_seq, rope_dim//2]。
+    ratio=0 layers use theta=rope_theta(10000) with YaRN disabled. ratio>0 layers use theta=
+    compress_rope_theta(160000) plus YaRN, with factor/orig/beta_fast/beta_slow from rope_scaling and no mscale gain.
+    Returns cos/sin [max_seq, rope_dim//2].
     """
 
     def __init__(self, rope_dim: int, max_seq: int, theta: float, yarn: dict | None = None):
@@ -276,10 +276,10 @@ class RopeCache:
 
 def rope_apply(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
                inverse: bool = False) -> torch.Tensor:
-    """相邻对旋转：最后一维（rope_dim）按 (x0,x1),(x2,x3),... 配对旋转。
+    """Adjacent-pair rotation: rotate the final rope_dim dimensions as pairs (x0,x1),(x2,x3), and so on.
 
-    cos/sin 需已可广播到 x（最后一维 = rope_dim//2）。inverse=True 取共轭
-    （注意力输出反旋转：value 也被 rope 过，输出最后 64 维要反向转回）。
+    cos/sin must already broadcast to x, with final dimension rope_dim//2. inverse=True takes the conjugate
+    to inverse-rotate attention outputs because value also received RoPE and the final 64 output dimensions must rotate back.
     """
     cos = cos.to(x.dtype)
     sin = sin.to(x.dtype)
@@ -296,11 +296,11 @@ def rope_apply(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
 
 def hc_split(mixes: torch.Tensor, scale: torch.Tensor, base: torch.Tensor,
              hc: int, iters: int, eps: float):
-    """24=(2+hc)×hc 维混合系数 → (pre, post, comb)。
+    """Map 24=(2+hc)*hc mixing coefficients to (pre, post, comb).
 
     pre[j]=sigmoid(m[j]*scale[0]+base[j])+eps；post[j]=2*sigmoid(m[hc+j]*scale[1]+base[hc+j])；
-    comb[j,k]=m[2hc+4j+k]*scale[2]+base[...]，然后 sinkhorn：softmax(-1)+eps → 列归一 →
-    19×(行归一+列归一)（共 20 轮，注意首轮顺序：softmax 后先列归一）。
+    comb[j,k]=m[2hc+4j+k]*scale[2]+base[...], followed by Sinkhorn: softmax(-1)+eps -> column normalization ->
+    19 times (row normalization plus column normalization), for 20 rounds total. The first round normalizes columns after softmax.
     """
     pre = torch.sigmoid(mixes[..., :hc] * scale[0] + base[:hc]) + eps
     post = 2.0 * torch.sigmoid(mixes[..., hc:2 * hc] * scale[1] + base[hc:2 * hc])
@@ -315,12 +315,12 @@ def hc_split(mixes: torch.Tensor, scale: torch.Tensor, base: torch.Tensor,
 
 def hc_pre(x: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch.Tensor,
            cfg: DSV4Config):
-    """hc_pre：[B,T,hc,D] → (y [B,T,D], post, comb)；rsqrt 用整 4D 维均方 + rms_eps。"""
+    """hc_pre maps [B,T,hc,D] to (y [B,T,D], post, comb); rsqrt uses the mean square over all four dimensions plus rms_eps."""
     shape = x.shape
     xf = x.flatten(2).float()
     r = torch.rsqrt(xf.square().mean(-1, keepdim=True) + cfg.rms_eps)
-    # CPU 上 TPQ 可能让该矩阵保持 Int4Weight 打包态；已安装的 _lin
-    # 分派器能直接处理，强制调用 .float() 会在首层之前报错。
+    # On CPU, TPQ may keep this matrix packed as Int4Weight. The installed _lin
+    # dispatcher handles it directly; forcing .float() would fail before the first layer.
     mixes = _lin(xf, fn.float() if isinstance(fn, torch.Tensor) else fn) * r
     pre, post, comb = hc_split(mixes, scale.float(), base.float(),
                                cfg.hc_mult, cfg.hc_sinkhorn_iters, cfg.hc_eps)
@@ -331,10 +331,10 @@ def hc_pre(x: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch.T
 
 def hc_post(out: torch.Tensor, residual: torch.Tensor, post: torch.Tensor,
             comb: torch.Tensor) -> torch.Tensor:
-    """hc_post（按官方 model.py）：y[:,:,k,:] = post[k]*out + Σ_j comb[j,k]*residual[:,:,j,:]。
+    """hc_post following official model.py: y[:,:,k,:] = post[k]*out + sum_j comb[j,k]*residual[:,:,j,:].
 
-    注意：spec 伪代码写成 y[j]=Σ_k comb[j,k]*res[k]（comb 的转置），以官方代码为准——
-    comb.unsqueeze(-1)*residual.unsqueeze(-2) 按 dim=2 求和即 y[k]=Σ_j comb[j,k]*res[j]。
+    The specification pseudocode writes y[j]=sum_k comb[j,k]*res[k], transposing comb. Follow the official code:
+    summing comb.unsqueeze(-1)*residual.unsqueeze(-2) over dim=2 gives y[k]=sum_j comb[j,k]*res[j].
     """
     dtype = residual.dtype
     out = out.to(dtype)
@@ -348,7 +348,7 @@ def hc_post(out: torch.Tensor, residual: torch.Tensor, post: torch.Tensor,
 
 def hc_head(x: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch.Tensor,
             cfg: DSV4Config) -> torch.Tensor:
-    """末尾 hc 头：pre=sigmoid(mixes*scale+base)+eps（无 sinkhorn），4 通道加权求和 → [B,T,D]。"""
+    """Final HC head: pre=sigmoid(mixes*scale+base)+eps without Sinkhorn, then a four-channel weighted sum to [B,T,D]."""
     shape = x.shape
     xf = x.flatten(2).float()
     r = torch.rsqrt(xf.square().mean(-1, keepdim=True) + cfg.rms_eps)
@@ -360,8 +360,8 @@ def hc_head(x: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch.
 # ---- KV Compressor ----
 
 def _overlap_transform(t: torch.Tensor, value: float, ratio: int, d: int) -> torch.Tensor:
-    """[B,N,r,2d] → [B,N,2r,d]：槽位 r..2r = 当前组后半通道(d..2d)，
-    槽位 0..r（组 g≥1）= 上一组前半通道(0..d)（即窗口 8 token、步长 4 的重叠池化）。"""
+    """Map [B,N,r,2d] to [B,N,2r,d]. Slots r..2r hold second-half channels d..2d of the current group;
+    slots 0..r for group g>=1 hold first-half channels 0..d of the preceding group, implementing overlap pooling with window 8 and stride 4."""
     B, N = t.shape[0], t.shape[1]
     out = t.new_full((B, N, 2 * ratio, d), value)
     out[:, :, ratio:] = t[:, :, :, d:]
@@ -372,11 +372,11 @@ def _overlap_transform(t: torch.Tensor, value: float, ratio: int, d: int) -> tor
 def compressor_prefill(x: torch.Tensor, w: dict, ratio: int, d: int, rd: int,
                        cos: torch.Tensor, sin: torch.Tensor, eps: float,
                        st: dict) -> torch.Tensor | None:
-    """KV Compressor 批式前向。x [B,T,D] f32；cos/sin: 压缩相位（窗口首 token，[1,N,rd/2]）。
+    """Batched KV Compressor forward pass. x is f32 [B,T,D]; cos/sin use the compression phase of each window's first token [1,N,rd/2].
 
-    末尾 T%ratio 个 token 写入 st['ckv']/st['cscore']（score 已加 ape）；
-    overlap 时另把最后完整窗口存入 state 前 r 槽（供 decode 的重叠池化）。
-    返回压缩 kv [B, T//ratio, d]（无完整窗口时 None）。
+    Write the trailing T%ratio tokens into st['ckv']/st['cscore'], with ape already added to score.
+    Under overlap, also store the final complete window in the first r state slots for overlapping decode pooling.
+    Return compressed KV [B, T//ratio, d], or None when there is no complete window.
     """
     B, T, _ = x.shape
     coff = w["wkv"].shape[0] // d
@@ -409,12 +409,12 @@ def compressor_prefill(x: torch.Tensor, w: dict, ratio: int, d: int, rd: int,
 def compressor_decode(x: torch.Tensor, w: dict, ratio: int, d: int, rd: int,
                       cos: torch.Tensor, sin: torch.Tensor, eps: float,
                       st: dict, pos: int) -> torch.Tensor | None:
-    """KV Compressor 增量单步。x [B,1,D]；cos/sin: 窗口首 token 相位（位置 pos+1-ratio）。
+    """Incremental one-step KV Compressor. x is [B,1,D]; cos/sin use the first-token phase at position pos+1-ratio.
 
-    每步把当前 token 的 wkv/wgate(+ape[pos%r]) 写入 state；仅当 (pos+1)%ratio==0
-    时才池化产出一个压缩 kv [B,1,d]，否则返回 None。
-    overlap：池化用「上一完整窗口（state 前 r 槽，前半通道）+ 当前窗口（后 r 槽，
-    后半通道）」，随后窗口滑动（state[:r]=state[r:]）。
+    Each step writes the current token's wkv/wgate plus ape[pos%r] into state. Pool and emit compressed KV [B,1,d]
+    only when (pos+1)%ratio==0; otherwise return None. Under overlap, pooling combines the preceding complete window
+    in the first r state slots/first-half channels with the current window in the final r slots/second-half channels,
+    then slides the window with state[:r]=state[r:].
     """
     coff = w["wkv"].shape[0] // d
     overlap = coff == 2
@@ -444,15 +444,15 @@ def compressor_decode(x: torch.Tensor, w: dict, ratio: int, d: int, rd: int,
     return pooled
 
 
-# ---- 注意力 ----
+# ---- Attention ----
 
 def _qkv(x: torch.Tensor, w: dict, cfg: DSV4Config, cache: RopeCache, pos0: int):
-    """低秩 Q + MQA kv。x [B,T,D] → q [B,T,H,hd]（逐头无权重 RMS + 末 64 维 RoPE）、
-    kv [B,T,hd]（kv_norm + 末 64 维 RoPE；64 个 q 头共享同一份 kv，key=value）。"""
+    """Low-rank Q plus MQA KV. Map x [B,T,D] to q [B,T,H,hd] with per-head weightless RMS and RoPE on the final 64 dimensions,
+    and to KV [B,T,hd] with kv_norm and final-64-dimensional RoPE. All 64 q heads share one KV, with key=value."""
     B, T, _ = x.shape
     H, hd, rd = cfg.n_heads, cfg.head_dim, cfg.qk_rope_head_dim
-    # QKV/attention 暂保留 FP32 局部状态以命中现有 decode 融合核；层边界
-    # hidden 与 dense GEMM 仍为 BF16。SM120 sparse kernel 将移除此转换。
+    # QKV/attention temporarily keeps local state in FP32 to use the existing fused decode kernel;
+    # hidden states at layer boundaries and dense GEMMs remain BF16. The SM120 sparse kernel will remove this conversion.
     qr = rmsnorm(_lin(x, w["wq_a"]).float(), w["q_norm"], cfg.rms_eps)
     q = _lin(qr, w["wq_b"]).view(B, T, H, hd).float()
     requested_norm_block = int(
@@ -480,7 +480,7 @@ def _qkv(x: torch.Tensor, w: dict, cfg: DSV4Config, cache: RopeCache, pos0: int)
 
 
 def _o_proj(o: torch.Tensor, w: dict, cfg: DSV4Config) -> torch.Tensor:
-    """分组 LoRA O：o [B,T,H*hd] → view [B,T,G,H*hd/G] → 每组独立降维到 o_lora_rank → wo_b。"""
+    """Grouped LoRA O: reshape o [B,T,H*hd] to [B,T,G,H*hd/G], independently reduce each group to o_lora_rank, then apply wo_b."""
     B, T = o.shape[0], o.shape[1]
     G = cfg.o_groups
     o = o.reshape(B, T, G, -1)
@@ -489,9 +489,9 @@ def _o_proj(o: torch.Tensor, w: dict, cfg: DSV4Config) -> torch.Tensor:
     return _lin(o.flatten(2), w["wo_b"])
 
 
-# O 投影钩子：TPQ 推理侧以 Int4Weight 分组反量化实现替换（见 tpq/dsv4model.py）
+# O-projection hook: TPQ inference replaces this with grouped Int4Weight dequantization (see tpq/dsv4model.py)
 _o_proj_hook = _o_proj
-# 单 token attention core 钩子：TPQ CUDA 扩展可融合 score/softmax/value/RoPE。
+# Single-token attention-core hook: the TPQ CUDA extension can fuse score/softmax/value/RoPE.
 _attn_decode_core_hook = None
 
 
@@ -520,11 +520,12 @@ def _compressed_prefix(st: dict, win: int, length: int) -> torch.Tensor:
 
 def attn_prefill(x: torch.Tensor, w: dict, st: dict, cfg: DSV4Config,
                  cache: RopeCache, ratio: int) -> torch.Tensor:
-    """注意力批式前向（start_pos=0）。x [B,T,D]（已过 attn_norm）→ [B,T,D]。
+    """Batched attention forward pass at start_pos=0, mapping attn-normalized x [B,T,D] to [B,T,D].
 
-    集合 = 最近 win 个因果原始 token（带状掩码）+ 压缩 token（query i 可见 j<(i+1)/ratio）；
-    softmax 分母含 attn_sink（exp(sink)/denom，不进分子）；scale=hd^-0.5；输出末 64 维反旋转。
-    同时更新环形窗口缓存（槽位=位置%win）与压缩槽位。
+    The attention set contains the latest ``win`` causal original tokens under a band mask plus compressed tokens,
+    where query i can see j<(i+1)/ratio. The softmax denominator includes attn_sink as exp(sink)/denom but not in
+    the numerator; scale=hd^-0.5. Inverse-rotate the final 64 output dimensions and update the ring-window cache
+    (slot=position%win) and compressed slots together.
     """
     B, T, _ = x.shape
     H, hd, rd = cfg.n_heads, cfg.head_dim, cfg.qk_rope_head_dim
@@ -546,8 +547,8 @@ def attn_prefill(x: torch.Tensor, w: dict, st: dict, cfg: DSV4Config,
             cos = cache.cos[0:n_full * ratio:ratio].view(1, n_full, -1)
             sin = cache.sin[0:n_full * ratio:ratio].view(1, n_full, -1)
         else:
-            # 短序列（T<ratio）无完整窗口：压缩相位不会被使用（pooled=None），
-            # 占位即可；compressor_prefill 仍会把尾部 token 写入 state 供 decode 续接
+            # Short sequences (T < ratio) have no complete window, so the compression phase is unused (pooled=None).
+            # A placeholder is sufficient; compressor_prefill still writes trailing tokens into state for decode continuation.
             cos = cache.cos[:1].view(1, 1, -1)
             sin = cache.sin[:1].view(1, 1, -1)
         ck = compressor_prefill(x, w["cmp"], ratio, hd, rd, cos, sin, cfg.rms_eps, st)
@@ -561,19 +562,19 @@ def attn_prefill(x: torch.Tensor, w: dict, st: dict, cfg: DSV4Config,
             cs = cs.masked_fill(~cmallow, float("-inf"))
             scores = torch.cat([scores, cs], dim=-1)
             values = torch.cat([values, comp], dim=1)
-    m = scores.amax(dim=-1, keepdim=True)                 # max 不含 sink（与 kernel 一致）
+    m = scores.amax(dim=-1, keepdim=True)                 # Maximum excludes the sink (matching the kernel)
     e = (scores - m).exp()
     denom = e.sum(dim=-1) + (w["attn_sink"].view(1, -1, 1) - m.squeeze(-1)).exp()
     o = torch.einsum("bhts,bsd->bthd", e, values) / denom.transpose(1, 2).unsqueeze(-1)
     cos = cache.cos[:T].view(1, T, 1, -1)
     sin = cache.sin[:T].view(1, T, 1, -1)
-    o[..., hd - rd:] = rope_apply(o[..., hd - rd:], cos, sin, inverse=True)   # 输出反旋转，易漏！
+    o[..., hd - rd:] = rope_apply(o[..., hd - rd:], cos, sin, inverse=True)   # Inverse-rotate the output; easy to overlook!
     return _o_proj_hook(o.flatten(2), w, cfg)
 
 
 def attn_decode(x: torch.Tensor, w: dict, st: dict, cfg: DSV4Config,
                 cache: RopeCache, ratio: int, pos: int) -> torch.Tensor:
-    """注意力增量单步。x [B,1,D] → [B,1,D]；pos = 当前 token 绝对位置（>0）。"""
+    """Incremental one-step attention mapping x [B,1,D] to [B,1,D], where pos is the current absolute token position (>0)."""
     B = x.shape[0]
     H, hd, rd = cfg.n_heads, cfg.head_dim, cfg.qk_rope_head_dim
     win = cfg.sliding_window
@@ -583,7 +584,7 @@ def attn_decode(x: torch.Tensor, w: dict, st: dict, cfg: DSV4Config,
     st["win_pos"][:, pos % win] = pos
     nc = 0
     if ratio:
-        cos = cache.cos[pos + 1 - ratio].view(1, 1, -1)   # 窗口首 token 相位
+        cos = cache.cos[pos + 1 - ratio].view(1, 1, -1)   # Phase of the first token in the window
         sin = cache.sin[pos + 1 - ratio].view(1, 1, -1)
         ck = compressor_decode(x, w["cmp"], ratio, hd, rd, cos, sin, cfg.rms_eps, st, pos)
         if ck is not None:
@@ -619,11 +620,11 @@ def attn_decode(x: torch.Tensor, w: dict, st: dict, cfg: DSV4Config,
 # ---- MoE ----
 
 def gate_route(x: torch.Tensor, w: dict, cfg: DSV4Config, ids: torch.Tensor):
-    """sqrtsoftplus 路由。x [N,D] f32，ids [N] long → (weights [N,K], indices [N,K])。
+    """sqrtsoftplus routing from f32 x [N,D] and long ids [N] to weights [N,K] and indices [N,K].
 
-    scores = sqrt(softplus(x@W^T))（fp32）；hash 层：indices = tid2eid[ids]（静态选择，
-    无 bias）；其余层 noaux_tc：scores+bias 选 top-k（bias 只影响选择不进权重）。
-    权重 = gather(原始 scores) → 归一化（norm_topk_prob）→ ×routed_scaling(1.5)。
+    scores = sqrt(softplus(x@W^T)) in fp32. Hash layers use indices = tid2eid[ids] for static unbiased selection.
+    Other noaux_tc layers choose top-k using scores+bias, where bias affects selection but not weights.
+    Weights gather original scores, normalize with norm_topk_prob, and multiply by routed_scaling(1.5).
     """
     scores = F.softplus(_lin(x, w["gate"].float())).sqrt()
     tid2eid = w.get("tid2eid")
@@ -639,8 +640,8 @@ def gate_route(x: torch.Tensor, w: dict, cfg: DSV4Config, ids: torch.Tensor):
 
 def expert_mlp(x: torch.Tensor, w1: torch.Tensor, w3: torch.Tensor, w2: torch.Tensor,
                limit: float, weight: torch.Tensor | None = None) -> torch.Tensor:
-    """专家 SwiGLU（f32）：up=clamp(±limit)、gate=clamp(max=limit)（gate 只截上界）、
-    silu(gate)*up →（可选乘路由权重）→ w2。"""
+    """Expert SwiGLU in f32: up=clamp(+/-limit), gate=clamp(max=limit) with upper-bound-only clamping,
+    then silu(gate)*up, optional multiplication by routing weight, and w2."""
     gate = _lin(x, w1)
     up = _lin(x, w3)
     if limit > 0:
@@ -654,7 +655,7 @@ def expert_mlp(x: torch.Tensor, w1: torch.Tensor, w3: torch.Tensor, w2: torch.Te
 
 def moe_forward(x: torch.Tensor, w: dict, cfg: DSV4Config, ids: torch.Tensor,
                 get_expert, layer: int) -> torch.Tensor:
-    """MoE：top-k routed 专家（按专家循环 gather token，同官方简单路径）+ 1 共享专家。"""
+    """MoE with top-k routed experts, gathering tokens in an expert loop like the official simple path, plus one shared expert."""
     B, T, D = x.shape
     xf = x.reshape(B * T, D).float()
     weights, indices = gate_route(xf, w, cfg, ids.reshape(-1))
@@ -675,7 +676,7 @@ def moe_forward(x: torch.Tensor, w: dict, cfg: DSV4Config, ids: torch.Tensor,
 def block_forward(h: torch.Tensor, w: dict, st: dict, cfg: DSV4Config,
                   cache: RopeCache, ratio: int, ids: torch.Tensor, pos0: int,
                   get_expert, layer: int) -> torch.Tensor:
-    """一个 Block：hc_pre→attn_norm→attn→hc_post；hc_pre→ffn_norm→ffn→hc_post。"""
+    """One block: hc_pre -> attn_norm -> attention -> hc_post; hc_pre -> ffn_norm -> FFN -> hc_post."""
     residual = h
     y, post, comb = hc_pre(h, w["hc_attn_fn"], w["hc_attn_scale"], w["hc_attn_base"], cfg)
     y = rmsnorm(y, w["attn_norm"], cfg.rms_eps)
@@ -692,10 +693,10 @@ def block_forward(h: torch.Tensor, w: dict, st: dict, cfg: DSV4Config,
 
 
 class DSV4Model:
-    """DeepSeek-V4 主模型前向（prefill 批式 + decode 单步；MTP/DSpark 层 43-45 不涉及）。
+    """DeepSeek-V4 main-model forward pass with batched prefill and single-step decode, excluding MTP/DSpark layers 43-45.
 
-    provider 协议：layer(i)->dict、expert(i,e)->(w1,w3,w2)、embed()、head()、
-    final_norm()、hc_head()->(fn,scale,base)。DSV4Checkpoint 即该协议的实现。
+    Provider protocol: layer(i)->dict, expert(i,e)->(w1,w3,w2), embed(), head(), final_norm(),
+    and hc_head()->(fn,scale,base). DSV4Checkpoint implements this protocol.
     """
 
     def __init__(self, cfg: DSV4Config, provider, max_seq: int = 2048, device="cpu"):
@@ -708,7 +709,7 @@ class DSV4Model:
         rd = cfg.qk_rope_head_dim
         self.rope_base = RopeCache(rd, max_seq, cfg.rope_theta, None)
         self.rope_cmp = RopeCache(rd, max_seq, cfg.compress_rope_theta, cfg.rope_scaling or None)
-        for rc in (self.rope_base, self.rope_cmp):  # RopeCache 默认 CPU，与权重设备对齐
+        for rc in (self.rope_base, self.rope_cmp):  # RopeCache defaults to CPU; align it with the weight device
             rc.cos = rc.cos.to(device)
             rc.sin = rc.sin.to(device)
         self._embed = provider.embed().to(device)
@@ -723,8 +724,8 @@ class DSV4Model:
         if w is None:
             w = self.p.layer(i)
             self._layers[i] = w
-            # 模型级层缓存同样有界（容量 2，顺序过层）：旧版无界持有 43 层 f32
-            # ≈17GB，会把显存顶进共享显存换页（实测 +7.1GB）。
+            # The model-level layer cache is also bounded (capacity 2, sequential layer traversal).
+            # The old unbounded cache held 43 f32 layers (~17 GB), forcing VRAM into shared-memory paging (+7.1 GB measured).
             while len(self._layers) > 2:
                 for k in list(self._layers):
                     if k != i:
@@ -736,7 +737,7 @@ class DSV4Model:
         return self.rope_cmp if self.ratios[i] else self.rope_base
 
     def _alloc(self, B: int) -> None:
-        """按 batch 分配每层 KV 缓存（环形窗口 + 压缩槽位）与 Compressor state。"""
+        """Allocate per-layer KV caches (ring windows plus compressed slots) and Compressor state for a batch."""
         cfg = self.cfg
         win, hd = cfg.sliding_window, cfg.head_dim
         self.states = []
@@ -748,7 +749,7 @@ class DSV4Model:
                 "win_pos": torch.full((B, win), -1, dtype=torch.long, device=self.device),
             }
             if ratio:
-                coff = 2 if ratio == 4 else 1       # 规范：ratio=4 → coff=2，ratio=128 → coff=1
+                coff = 2 if ratio == 4 else 1       # Specification: ratio=4 -> coff=2, ratio=128 -> coff=1
                 st["ckv"] = torch.zeros(B, coff * ratio, coff * hd, device=self.device)
                 st["cscore"] = torch.full((B, coff * ratio, coff * hd), float("-inf"),
                                           device=self.device)
@@ -759,12 +760,12 @@ class DSV4Model:
 
     @torch.no_grad()
     def prefill(self, ids: torch.Tensor, full_logits: bool = True) -> torch.Tensor:
-        """批式前向（start_pos=0）。ids [B,T] long → logits [B,T,V]（full_logits=False 时 [B,V] 末位）。"""
+        """Batched forward pass at start_pos=0: long ids [B,T] -> logits [B,T,V], or final-position [B,V] when full_logits=False."""
         ids = ids.to(self.device).long()
         B, T = ids.shape
         self._alloc(B)
         cfg = self.cfg
-        # 嵌入复制到 hc_mult 个通道（官方 model.py：unsqueeze(2).repeat(...)）
+        # Replicate embeddings across hc_mult channels (official model.py: unsqueeze(2).repeat(...))
         h = self._embed[ids].unsqueeze(2).repeat(1, 1, cfg.hc_mult, 1)
         for i in range(cfg.n_layers):
             h = block_forward(h, self._layer(i), self.states[i], cfg, self._rope(i),
@@ -776,7 +777,7 @@ class DSV4Model:
 
     @torch.no_grad()
     def decode(self, ids: torch.Tensor, pos: int) -> torch.Tensor:
-        """增量单步。ids [B] long（位置 pos 的输入 token，pos>0）→ logits [B,V]。"""
+        """Incremental one-step decode: long ids [B] at input position pos>0 -> logits [B,V]."""
         assert self.states is not None and pos > 0, "decode 前须先 prefill"
         ids = ids.to(self.device).long()
         cfg = self.cfg
@@ -790,7 +791,7 @@ class DSV4Model:
 
 
 # =====================================================================
-# 自检：微小合成模型对照逐元素朴素实现（python -m TPQ.dsv4）
+# Self-check: compare a tiny synthetic model against the element-wise naive implementation (python -m TPQ.dsv4)
 # =====================================================================
 
 def _naive_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
@@ -799,7 +800,7 @@ def _naive_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor
 
 
 def _naive_rope_complex(x: torch.Tensor, fc: torch.Tensor, inverse: bool = False) -> torch.Tensor:
-    """官方复数乘法形式的 RoPE（view_as_complex 相邻对），fc 为复数 freqs_cis（已塑形可广播）。"""
+    """Official complex-multiplication RoPE using adjacent view_as_complex pairs; fc is broadcast-shaped complex freqs_cis."""
     xc = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
     if inverse:
         fc = fc.conj()
@@ -831,7 +832,7 @@ def _naive_hc_pre(x, fn, scale, base, cfg):
 
 
 def _naive_hc_post(out, residual, post, comb):
-    # 与官方一致：y[j] = post[j]*out + Σ_k comb[k,j]*res[k]（comb 第一维是残差通道）
+    # Match the official implementation: y[j] = post[j]*out + sum_k comb[k,j]*res[k] (comb's first dimension is the residual channel)
     B, T, hc, D = residual.shape
     y = torch.zeros_like(residual)
     for j in range(hc):
@@ -857,7 +858,7 @@ def _naive_hc_head(x, fn, scale, base, cfg):
 
 
 def _naive_compressor_prefill(x, w, ratio, d, rd, cache: RopeCache, eps):
-    """分组 softmax 池化的逐组朴素实现（overlap 时 8 窗口 4 步长）。"""
+    """Naive per-group implementation of grouped softmax pooling, using window 8 and stride 4 under overlap."""
     B, T, _ = x.shape
     coff = w["wkv"].shape[0] // d
     kv = x @ w["wkv"].t()
@@ -868,11 +869,11 @@ def _naive_compressor_prefill(x, w, ratio, d, rd, cache: RopeCache, eps):
         for b in range(B):
             ks, ss = [], []
             if coff == 2:
-                if g > 0:                       # 上一组前半通道（g=0 时这些槽位为 -inf，跳过）
+                if g > 0:                       # First-half channels of the previous group (these slots are -inf when g=0, so skip them)
                     for s in range(ratio):
                         ks.append(kv[b, (g - 1) * ratio + s, :d])
                         ss.append(score[b, (g - 1) * ratio + s, :d] + w["ape"][s, :d])
-                for s in range(ratio):          # 当前组后半通道
+                for s in range(ratio):          # Second-half channels of the current group
                     ks.append(kv[b, g * ratio + s, d:])
                     ss.append(score[b, g * ratio + s, d:] + w["ape"][s, d:])
             else:
@@ -883,14 +884,14 @@ def _naive_compressor_prefill(x, w, ratio, d, rd, cache: RopeCache, eps):
             S = torch.stack(ss)
             out[b, g] = (K * S.softmax(0)).sum(0)
     out = _naive_rmsnorm(out, w["norm"], eps)
-    fc = torch.complex(cache.cos, cache.sin)    # 相位 = 窗口首 token
+    fc = torch.complex(cache.cos, cache.sin)    # Phase of the first token in the window
     fcs = fc[0:N * ratio:ratio].view(1, N, -1)
     out[..., d - rd:] = _naive_rope_complex(out[..., d - rd:], fcs)
     return out
 
 
 def _naive_attn(x, w, cfg, cache: RopeCache, ratio: int = 0, ckv: torch.Tensor | None = None):
-    """逐 (query, head) 循环的朴素注意力（滑窗因果 + 压缩 token + attn_sink + 输出反旋转）。"""
+    """Naive per-(query, head) attention loop with causal sliding window, compressed tokens, attn_sink, and output inverse rotation."""
     B, T, _ = x.shape
     H, hd, rd = cfg.n_heads, cfg.head_dim, cfg.qk_rope_head_dim
     win = cfg.sliding_window
@@ -993,7 +994,7 @@ def _tiny_cfg() -> DSV4Config:
 
 
 class _TinyProvider:
-    """自备用微型合成权重（DSV4Model 的 provider 协议；层0=tid2eid，层1=ratio4 压缩）。"""
+    """Self-contained tiny synthetic weights implementing DSV4Model's provider protocol, with layer 0 tid2eid and layer 1 ratio-4 compression."""
 
     def __init__(self, cfg: DSV4Config, seed: int = 0):
         g = torch.Generator().manual_seed(seed)
@@ -1029,7 +1030,7 @@ class _TinyProvider:
                     "ape": r(ratio, coff * hd, s=0.1), "norm": 1 + r(hd, s=0.02),
                 }
             if i < cfg.n_hash_layers:
-                # 真实 tid2eid 每行 6 个专家互不相同，此处同样生成不重复索引
+                # Real tid2eid has six distinct experts per row; generate unique indices here as well
                 perm = torch.argsort(torch.rand(cfg.vocab, cfg.n_experts, generator=g), dim=1)
                 w["tid2eid"] = perm[:, :cfg.top_k]
             else:
@@ -1063,7 +1064,7 @@ class _TinyProvider:
 
 
 def _write_safetensors(path: str, tensors: dict) -> None:
-    """极简 safetensors 写入（自检用）：tensors = {name: (dtype_str, shape, raw_bytes)}。"""
+    """Minimal safetensors writer for self-checks: tensors = {name: (dtype_str, shape, raw_bytes)}."""
     header, off, blobs = {}, 0, []
     for name, (dt, shape, raw) in tensors.items():
         header[name] = {"dtype": dt, "shape": list(shape),
@@ -1096,7 +1097,7 @@ def main() -> int:
     rope_base = RopeCache(cfg.qk_rope_head_dim, 32, cfg.rope_theta, None)
     rope_cmp = RopeCache(cfg.qk_rope_head_dim, 32, cfg.compress_rope_theta, cfg.rope_scaling)
 
-    # 1) RoPE 相邻对旋转 vs 官方复数乘法 + 反旋转往返
+    # 1) Adjacent-pair RoPE rotation versus official complex multiplication, plus an inverse-rotation round trip
     x = torch.randn(2, 5, 3, 8)
     cosv = rope_base.cos[:5].view(1, 5, 1, -1)
     sinv = rope_base.sin[:5].view(1, 5, 1, -1)
@@ -1109,7 +1110,7 @@ def main() -> int:
     check("RoPE 旋转 vs 复数乘法 / 反旋转往返", d1 < 1e-6 and d2 < 1e-6,
           f"diff={d1:.2e}/{d2:.2e}")
 
-    # 2) YaRN 频率 vs 手工逐元素公式
+    # 2) YaRN frequencies versus a manual element-wise formula
     yarn = cfg.rope_scaling
     dim = cfg.qk_rope_head_dim
     theta = cfg.compress_rope_theta
@@ -1133,7 +1134,7 @@ def main() -> int:
     check("YaRN 频率（theta=160000/factor=16/orig=65536/beta 32,1）", terr < 1e-6,
           f"err={terr:.2e}")
 
-    # 3) q 逐头无权重 RMS norm
+    # 3) Per-head weightless RMS normalization of q
     q = torch.randn(2, 3, 4, 16)
     mine = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + cfg.rms_eps)
     ref = q.clone()
@@ -1145,7 +1146,7 @@ def main() -> int:
     d = diff(mine, ref)
     check("q 逐头无权重 RMS norm", d < 1e-6, f"diff={d:.2e}")
 
-    # 4) sinkhorn 双随机性 + hc_pre/hc_post vs 朴素逐位置实现
+    # 4) Sinkhorn double stochasticity and hc_pre/hc_post versus a naive per-position implementation
     mixes = torch.randn(2, 3, 24) * 2
     pre, post, comb = hc_split(mixes, prov.layer(0)["hc_attn_scale"],
                                prov.layer(0)["hc_attn_base"], cfg.hc_mult,
@@ -1166,7 +1167,7 @@ def main() -> int:
     check("sinkhorn 双随机性 + hc_pre/hc_post vs 朴素", ok,
           f"row={row_err:.2e} col={col_err:.2e} pre={d_pre:.2e} post={d_post:.2e}")
 
-    # 5) Compressor（ratio=4 overlap）批式池化 vs 手工分组 softmax
+    # 5) Batched Compressor pooling (ratio=4 overlap) versus manual grouped softmax
     w1_ = prov.layer(1)
     xc = torch.randn(1, 11, cfg.hidden)
     st = {"ckv": torch.zeros(1, 8, 32), "cscore": torch.full((1, 8, 32), float("-inf"))}
@@ -1179,7 +1180,7 @@ def main() -> int:
     d = diff(mine, ref)
     check("Compressor 分组 softmax 池化（overlap 8窗4步）vs 朴素", d < 1e-6, f"diff={d:.2e}")
 
-    # 6) ratio=0 层 T≤win：与朴素因果全注意力严格一致
+    # 6) For a ratio=0 layer with T<=win, exactly match naive causal full attention
     w0 = prov.layer(0)
     xa = torch.randn(1, 6, cfg.hidden)
     sta = {"kv": torch.zeros(1, 8, cfg.head_dim),
@@ -1189,7 +1190,7 @@ def main() -> int:
     d = diff(mine, ref)
     check("ratio=0 注意力（滑窗+sink+反旋转）vs 朴素全注意力", d < 1e-6, f"diff={d:.2e}")
 
-    # 7) gate：sqrtsoftplus / noaux_tc（bias 只选择不进权重）/ tid2eid
+    # 7) Gate: sqrtsoftplus / noaux_tc (bias affects selection only, not weights) / tid2eid
     xg = torch.randn(5, cfg.hidden)
     ids_g = torch.randint(0, cfg.vocab, (5,))
     w2_ = prov.layer(2)
@@ -1200,7 +1201,7 @@ def main() -> int:
     ww_ref = ww_ref / ww_ref.sum(-1, keepdim=True) * cfg.routed_scaling
     d_i = 0 if torch.equal(ii, ii_ref) else 1
     d_w = diff(ww, ww_ref)
-    # bias 翻转选择：把低分专家 bias 拉到 +100，应被选中但权重仍取未加 bias 的原始分数
+    # Bias-flipped selection: raise a low-score expert's bias to +100; it should be selected, but its weight still uses the original unbiased score
     w_mod = dict(w2_)
     bias_mod = w2_["gate_bias"].clone()
     low_e = int(scores_ref[0].argmin())
@@ -1211,7 +1212,7 @@ def main() -> int:
     exp_w = scores_ref[0].gather(0, ii2[0])
     exp_w = exp_w / exp_w.sum() * cfg.routed_scaling
     w_small = diff(ww2[0], exp_w) < 1e-6
-    # tid2eid 层：选择完全由 token id 静态决定
+    # tid2eid layer: selection is determined statically and entirely by token ID
     ww3, ii3 = gate_route(xg, w0, cfg, ids_g)
     tid_ok = torch.equal(ii3, w0["tid2eid"][ids_g])
     ww3_ref = scores_ref0 = None
@@ -1223,7 +1224,7 @@ def main() -> int:
     check("gate sqrtsoftplus/noaux_tc(bias仅选择)/tid2eid", ok,
           f"idx={d_i} w={d_w:.2e} flip={sel_flip} tid={tid_ok} w3={d3:.2e}")
 
-    # 8) 专家 clamp：up 截 ±10、gate 只截上界
+    # 8) Expert clamping: clamp up to +/-10 and gate only at the upper bound
     D8, I8 = 8, 16
     w1c = torch.zeros(I8, D8); w3c = torch.zeros(I8, D8)
     w1c[0, 0] = 1.0; w1c[1, 0] = -1.0
@@ -1231,12 +1232,12 @@ def main() -> int:
     w2c = torch.zeros(D8, I8); w2c[0, 0] = 1.0; w2c[1, 1] = 1.0
     xin = torch.tensor([[30.0] + [0.0] * 7])
     out = expert_mlp(xin, w1c, w3c, w2c, 10.0)
-    exp0 = float(F.silu(torch.tensor(10.0)) * 10.0)     # gate=30→截10, up=30→截10
-    exp1 = float(F.silu(torch.tensor(-30.0)) * -10.0)   # gate=-30 不截下界, up=-30→截-10
+    exp0 = float(F.silu(torch.tensor(10.0)) * 10.0)     # gate=30 -> clamp to 10; up=30 -> clamp to 10
+    exp1 = float(F.silu(torch.tensor(-30.0)) * -10.0)   # gate=-30 is not lower-clamped; up=-30 -> clamp to -10
     d = max(abs(float(out[0, 0]) - exp0), abs(float(out[0, 1]) - exp1))
     check("专家 SwiGLU clamp（up±10 / gate 仅上界）", d < 1e-6, f"diff={d:.2e}")
 
-    # 9) 整网 prefill vs 朴素参考
+    # 9) Full-network prefill versus the naive reference
     ids = torch.randint(0, cfg.vocab, (1, 12))
     model = DSV4Model(cfg, prov, max_seq=32)
     logits = model.prefill(ids)
@@ -1244,7 +1245,7 @@ def main() -> int:
     d = diff(logits, ref)
     check("整网前向（3层含 ratio=4 压缩层/tid2eid 层）vs 朴素", d < 1e-5, f"max_diff={d:.2e}")
 
-    # 10) prefill 批式 vs decode 增量逐步（环形缓存 + 增量 Compressor）
+    # 10) Batched prefill versus incremental step-by-step decode (ring buffer plus incremental Compressor)
     model2 = DSV4Model(cfg, _TinyProvider(cfg, seed=0), max_seq=32)
     model2.prefill(ids[:, :8])
     cols = []
@@ -1254,7 +1255,7 @@ def main() -> int:
     d = diff(logits_d, logits[:, 8:12])
     check("decode 增量（Compressor/环形窗）与 prefill 一致", d < 1e-5, f"max_diff={d:.2e}")
 
-    # 11) FP4 反量化往返（低半字节在前、e2m1 LUT、2^(b-127)、32 块）
+    # 11) FP4 dequantization round trip (low nibble first, e2m1 LUT, 2^(b-127), blocks of 32)
     from .fp4io import dequant_fp4_check
     lut = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6., -0., -.5, -1., -1.5, -2., -3., -4., -6.])
     w = torch.randn(8, 64) * 2
@@ -1273,7 +1274,7 @@ def main() -> int:
     check("FP4 反量化往返（nibble 顺序/LUT/ue8m0）", d == 0.0 and 3.0 <= rmin and rmax <= 6.0,
           f"diff={d:.2e} amax/scale=[{rmin:.2f},{rmax:.2f}]")
 
-    # 12) FP8 反量化往返（e4m3 × 2^(scale-127)，128×128 块，非整除形状）
+    # 12) FP8 dequantization round trip (e4m3 * 2^(scale-127), 128x128 blocks, non-divisible shape)
     w = torch.randn(130, 300) * 3
     e = torch.randint(-3, 4, (2, 3))
     sb = (2.0 ** e.float()).repeat_interleave(128, 0).repeat_interleave(128, 1)[:130, :300]
@@ -1284,7 +1285,7 @@ def main() -> int:
     d = diff(dq, ref)
     check("FP8 反量化（e4m3×2^(b-127)，128×128 块）", d == 0.0, f"diff={d:.2e}")
 
-    # 13) SafeFile / DSV4Checkpoint 读取（手写 safetensors 文件往返）
+    # 13) SafeFile / DSV4Checkpoint reading (round trip through a hand-written safetensors file)
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         t_bf = torch.randn(3, 4).bfloat16()

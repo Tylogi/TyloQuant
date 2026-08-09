@@ -1,4 +1,4 @@
-"""kernels.torch_backend + runtime.torch_linear GPU 测试（无 CUDA 则跳过）。"""
+"""GPU tests for kernels.torch_backend and runtime.torch_linear, skipped without CUDA."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ def test_dequant_matches_numpy_all_profiles(bits, gs):
 
 
 def test_matmul_matches_dequant_path():
-    # 分解 matmul 应与 (dequant fp16)@x 一致 —— 验证 llama.cpp 式分解的算术正确性
+    # Decomposed matmul should match (dequant fp16)@x, validating the arithmetic of llama.cpp-style decomposition
     W = _W(1, (32, 96))
     x = _W(2, (4, 96)) * 3
     t = nint_quant.quantize(W, NintSpec(4, 24, 6))

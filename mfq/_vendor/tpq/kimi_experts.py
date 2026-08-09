@@ -246,7 +246,7 @@ def build_primary_dense_packed_plan(store, tp_size: int) -> KimiLayerPlan:
 
 
 class PackedExpertPool:
-    """配置驱动的全显存 packed 专家执行器。"""
+    """Configuration-driven all-VRAM packed-expert executor."""
 
     full_resident = True
 
@@ -630,9 +630,9 @@ class PackedExpertPool:
         ranks: int,
         intermediate: int,
     ) -> tuple[torch.Tensor, int]:
-        """按三投影数学维切分紧凑索引，不展开 p14。
+        """Split compact indices along the mathematical dimensions of three projections without expanding p14.
 
-        gate/up 是 Column-TP，沿输出行切；down 是 Row-TP，沿输入块切。
+        Gate/up use Column-TP and split output rows; down uses Row-TP and splits input blocks.
         """
         row_bits = weight.blocks * weight.bits
         if row_bits % 8:

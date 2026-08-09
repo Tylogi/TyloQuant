@@ -1,4 +1,4 @@
-"""与模型名称无关的算子能力描述。"""
+"""Operator capability descriptions independent of model names."""
 
 from __future__ import annotations
 
@@ -7,10 +7,10 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class OperatorRequest:
-    """一次算子调用需要的能力。
+    """Capabilities required by one operator call.
 
-    Kimi、GLM 和 DeepSeek 的差异只体现在这些字段及模型配置中，不进入
-    注册键的实现名称。
+    Differences among Kimi, GLM, and DeepSeek appear only in these fields and model configuration,
+    never in implementation names within registry keys.
     """
 
     operation: str

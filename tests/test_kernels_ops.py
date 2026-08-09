@@ -1,7 +1,7 @@
-"""kernels 算子参考实现测试（gated_delta_net 递推参考，对照 cuda/ kernel 与 numpy）。
+"""Reference tests for kernel operators, comparing the gated_delta_net recurrence with CUDA kernels and NumPy.
 
-norm/rope/attention/acc 已迁移为原生 CUDA（``mfq.kernels.cuda.*``），其正确性测试见
-``test_kernels_cuda.py``（与 torch 内建实现对照）。
+Norm, RoPE, attention, and accumulation have moved to native CUDA (``mfq.kernels.cuda.*``); see
+``test_kernels_cuda.py`` for correctness tests against built-in torch implementations.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from mfq.kernels.gated_delta_net import gated_delta_net  # noqa: E402
 
 
 def _gdn_ref(q, k, v, g, beta):
-    """numpy 参考递推，同 ops.cpp 算法。"""
+    """NumPy reference recurrence matching the algorithm in ops.cpp."""
     B, H, T, D = q.shape
     S = np.zeros((B, H, D, D))
     kda = g.ndim == 4
@@ -57,7 +57,7 @@ def test_gdn_kda_perdim_gate():
 
 
 def test_gdn_state_carryover():
-    """分段处理 vs 一次处理，最终状态应一致。"""
+    """Segmented and single-pass processing should produce identical final states."""
     torch.manual_seed(4)
     B, H, T, D = 1, 2, 6, 4
     q, k, v = (torch.randn(B, H, T, D) for _ in range(3))

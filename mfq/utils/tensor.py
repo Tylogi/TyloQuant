@@ -1,4 +1,4 @@
-"""张量辅助函数：度量与 reshape 工具。"""
+"""Tensor helpers: metrics and reshape utilities."""
 
 from __future__ import annotations
 
@@ -6,9 +6,9 @@ import numpy as np
 
 
 def snr(original: np.ndarray, approx: np.ndarray) -> float:
-    """信噪比 (dB)：``10·log10(Σx² / Σ(x−x̃)²)``。
+    """Signal-to-noise ratio in dB: ``10*log10(sum(x^2) / sum((x-x_hat)^2))``.
 
-    逐元素比较，长度不等时取较短者。误差为 0 返回 ``inf``。
+    Compare element-wise, using the shorter length when lengths differ. Return ``inf`` for zero error.
     """
 
     o = np.asarray(original, dtype=np.float64).reshape(-1)
@@ -23,7 +23,7 @@ def snr(original: np.ndarray, approx: np.ndarray) -> float:
 
 
 def mse(original: np.ndarray, approx: np.ndarray) -> float:
-    """均方误差。长度不等取较短者。"""
+    """Mean squared error, using the shorter length when lengths differ."""
 
     o = np.asarray(original, dtype=np.float64).reshape(-1)
     a = np.asarray(approx, dtype=np.float64).reshape(-1)

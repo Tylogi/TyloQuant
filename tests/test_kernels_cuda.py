@@ -1,4 +1,4 @@
-"""CUDA kernel 测试（GDN + NINT fused GEMM；需 nvcc + MSVC cl 在 PATH，否则跳过）。"""
+"""CUDA kernel tests for GDN and fused NINT GEMM; skipped unless nvcc and MSVC cl are on PATH."""
 
 from __future__ import annotations
 
@@ -144,7 +144,7 @@ def test_common_f16_nint8_zero_mmq_matches_dequantized_weight():
 
 
 def _dec_g(*shape):
-    """真实衰减门控（g<0，exp(g)<1），避免状态爆炸。"""
+    """Use genuine decay gating (g<0 and exp(g)<1) to avoid state explosion."""
     return -(torch.rand(*shape, device=DEV) * 3 + 0.5)
 
 
@@ -215,7 +215,7 @@ def _gpu_g(W_np, spec):
 
 
 def _ref_out(nt, x):
-    """fp32 反量化权重参考：y = x · Wq^T。"""
+    """FP32 dequantized-weight reference: y = x * Wq^T."""
     Wq = torch.as_tensor(np.ascontiguousarray(nint_dequant(nt)), device=DEV)  # [out, K]
     return (x.to(torch.float32) @ Wq.T).to(torch.float16)
 
@@ -249,7 +249,7 @@ def test_nint_fused_other_profiles(gs):
 
 
 def test_nint_fused_tail_group():
-    """K 不整除 gs（尾组补零）。"""
+    """K is not divisible by gs, requiring trailing-group zero padding."""
     torch.manual_seed(2); np.random.seed(2)
     out, K, M = 48, 250, 12          # 250 % 24 != 0
     W = (np.random.randn(out, K).astype(np.float32)) * 0.05
@@ -262,7 +262,7 @@ def test_nint_fused_tail_group():
 
 
 def test_nint_fused_x_pad():
-    """x 末维 < neuron_len（胶水补零）。"""
+    """The final dimension of x is smaller than neuron_len, requiring adapter padding."""
     torch.manual_seed(3); np.random.seed(3)
     out, K, M = 32, 256, 4
     W = (np.random.randn(out, K).astype(np.float32)) * 0.05
@@ -270,7 +270,7 @@ def test_nint_fused_x_pad():
     Kshort = 200
     x = torch.randn(M, Kshort, device=DEV) * 0.1
     y_fused = fused_matmul(g, x)
-    # 参考：把 x 也补零到 K
+    # Reference: zero-pad x to K as well
     x_full = torch.nn.functional.pad(x, (0, K - Kshort))
     y_ref = _ref_out(nt, x_full)
     rel = ((y_fused - y_ref).norm() / y_ref.norm()).item()
@@ -278,7 +278,7 @@ def test_nint_fused_x_pad():
 
 
 def test_nint_fused_workspace_reuse_changes_input():
-    """同一个 GPU dict 连续调用不同 x，workspace 复用不能残留旧激活。"""
+    """Workspace reuse across different x values with the same GPU dictionary must not retain old activations."""
     torch.manual_seed(33); np.random.seed(33)
     out, K, M = 64, 256, 8
     W = (np.random.randn(out, K).astype(np.float32)) * 0.05
@@ -293,7 +293,7 @@ def test_nint_fused_workspace_reuse_changes_input():
 
 
 def test_nint_fused_small_batch_default_matches_ref():
-    """M2-M6 默认走 batched GEMV，M7 进入 MMQ。"""
+    """M2-M6 use batched GEMV by default, while M7 enters MMQ."""
     torch.manual_seed(37); np.random.seed(37)
     out, K = 96, 280
     W = (np.random.randn(out, K).astype(np.float32)) * 0.05
@@ -307,7 +307,7 @@ def test_nint_fused_small_batch_default_matches_ref():
 
 
 def test_nint_prefill_default_matches_ref():
-    """M>64 默认 prefill 路径应保持 fp16 误差内一致。"""
+    """The default prefill path for M>64 should agree within fp16 error."""
     torch.manual_seed(41); np.random.seed(41)
     out, K, M = 96, 280, 128
     W = (np.random.randn(out, K).astype(np.float32)) * 0.05
@@ -320,7 +320,7 @@ def test_nint_prefill_default_matches_ref():
 
 
 def test_nint_dequant_wq_packed_matches_torch():
-    """CUDA packed Wq materialization 应与 torch_backend 的 Wq 一致。"""
+    """CUDA packed Wq materialization should match Wq from torch_backend."""
     torch.manual_seed(42); np.random.seed(42)
     out, K = 48, 250
     W = (np.random.randn(out, K).astype(np.float32)) * 0.05
@@ -333,7 +333,7 @@ def test_nint_dequant_wq_packed_matches_torch():
 
 
 def test_nint_dequant_full_packed_matches_torch():
-    """CUDA packed full W materialization 应与 torch_backend 的 dequant 权重一致。"""
+    """CUDA packed full-W materialization should match dequantized weights from torch_backend."""
     torch.manual_seed(43); np.random.seed(43)
     out, K = 48, 250
     W = (np.random.randn(out, K).astype(np.float32)) * 0.05
@@ -349,7 +349,7 @@ def test_nint_dequant_full_packed_matches_torch():
 
 
 def test_nint_dequant_full_packed_compact_matches_torch():
-    """Compact deploy metadata full dequant 应与展开 metadata 一致。"""
+    """Full dequantization with compact deployment metadata should match expanded metadata."""
     torch.manual_seed(59); np.random.seed(59)
     out, K = 48, 250
     W = (np.random.randn(out, K).astype(np.float32)) * 0.05
@@ -371,7 +371,7 @@ def test_nint_dequant_full_packed_compact_matches_torch():
 
 
 def test_nint_dequant_full_packed_h2_matches_torch():
-    """CUDA half2 full W materialization 应与 half execution metadata 一致。"""
+    """CUDA half2 full-W materialization should match half-precision execution metadata."""
     torch.manual_seed(44); np.random.seed(44)
     out, K = 48, 250
     W = (np.random.randn(out, K).astype(np.float32)) * 0.05
@@ -387,7 +387,7 @@ def test_nint_dequant_full_packed_h2_matches_torch():
 
 
 def test_nint_dequant_full_packed_gs24_x2_matches_default():
-    """gs24 x2 full dequant 应与默认 f32 metadata kernel 完全一致。"""
+    """gs24 x2 full dequantization should exactly match the default f32 metadata kernel."""
     torch.manual_seed(55); np.random.seed(55)
     out, K = 48, 250
     W = (np.random.randn(out, K).astype(np.float32)) * 0.05
@@ -402,7 +402,7 @@ def test_nint_dequant_full_packed_gs24_x2_matches_default():
 
 
 def test_nint_dequant_full_packed_gs24_x2h2_matches_half2_reference():
-    """gs24 x2 half2 metadata 候选应与 half2 full dequant 误差一致。"""
+    """The gs24 x2 half2 metadata candidate should match the error of half2 full dequantization."""
     torch.manual_seed(56); np.random.seed(56)
     out, K = 48, 250
     W = (np.random.randn(out, K).astype(np.float32)) * 0.05
@@ -417,7 +417,7 @@ def test_nint_dequant_full_packed_gs24_x2h2_matches_half2_reference():
 
 
 def test_nint_batched_gemv_matches_gemv():
-    """MMVQ-style batched GEMV 应与逐 row GEMV 完全一致。"""
+    """MMVQ-style batched GEMV should exactly match per-row GEMV."""
     torch.manual_seed(38); np.random.seed(38)
     out, K, M = 96, 280, 6
     W = (np.random.randn(out, K).astype(np.float32)) * 0.05
@@ -568,7 +568,7 @@ def test_nint8_mmq_env_matches_dequant(monkeypatch):
 
 @pytest.mark.parametrize("M", [2, 3])
 def test_nint_batched_gemv_eff_metadata_matches_gemv(M):
-    """预融合 fp16 execution metadata 的 MMVQ 数值应保持在 fp16 误差内。"""
+    """MMVQ with prefused fp16 execution metadata should remain within fp16 error."""
     torch.manual_seed(39); np.random.seed(39)
     out, K = 96, 280
     W = (np.random.randn(out, K).astype(np.float32)) * 0.05
@@ -588,7 +588,7 @@ def test_nint_batched_gemv_eff_metadata_matches_gemv(M):
 
 @pytest.mark.parametrize("M", [2, 4, 6, 7])
 def test_nint_batched_gemv_eff2_metadata_matches_gemv(M):
-    """half2 execution metadata 的 MMVQ 数值应保持在 fp16 误差内。"""
+    """MMVQ with half2 execution metadata should remain within fp16 error."""
     torch.manual_seed(40); np.random.seed(40)
     out, K = 96, 280
     W = (np.random.randn(out, K).astype(np.float32)) * 0.05
@@ -608,7 +608,7 @@ def test_nint_batched_gemv_eff2_metadata_matches_gemv(M):
 
 @pytest.mark.parametrize("activation", ["sigmoid", "silu"])
 def test_nint_input_mul_compact_decode_matches_materialized(activation):
-    """实际 compact decode 路径应等价于先 materialize gated activation 再 GEMV。"""
+    """The actual compact decode path should equal materializing gated activations before GEMV."""
     torch.manual_seed(60); np.random.seed(60)
     out, K, M = 96, 280, 1
     W = (np.random.randn(out, K).astype(np.float32)) * 0.05
@@ -691,7 +691,7 @@ def test_nint5_linear_out_norm_gate_decode_matches_materialized():
 @pytest.mark.parametrize("activation", ["sigmoid", "silu"])
 @pytest.mark.parametrize("M", [1, 2, 7])
 def test_nint_input_mul_eff2_decode_matches_materialized(M, activation):
-    """half2 metadata decode 路径应等价于先 materialize gated activation 再 GEMV。"""
+    """The half2-metadata decode path should equal materializing gated activations before GEMV."""
     torch.manual_seed(61); np.random.seed(61)
     out, K = 96, 280
     W = (np.random.randn(out, K).astype(np.float32)) * 0.05
@@ -718,7 +718,7 @@ def test_nint_input_mul_eff2_decode_matches_materialized(M, activation):
 
 @pytest.mark.parametrize("M", [16, 32, 64])
 def test_nint_mmq_exec_weight_layout_matches_workspace(M):
-    """MMQ 权重执行格式应与 row-major packed MMQ 一致。"""
+    """The MMQ weight execution format should match row-major packed MMQ."""
     torch.manual_seed(36); np.random.seed(36)
     out, K = 96, 280
     W = (np.random.randn(out, K).astype(np.float32)) * 0.05
@@ -947,7 +947,7 @@ def test_nint6_int8_mmq_requires_explicit_opt_in(monkeypatch):
 
 
 def test_nint_fused_large_shape():
-    """较大形状（FFN 量级切片），检查多 block、无 NaN。"""
+    """Use a larger FFN-scale slice to check multiple blocks and the absence of NaNs."""
     torch.manual_seed(4); np.random.seed(4)
     out, K, M = 512, 768, 64
     W = (np.random.randn(out, K).astype(np.float32)) * 0.05
@@ -961,7 +961,7 @@ def test_nint_fused_large_shape():
 
 
 # ---------------------------------------------------------------------------
-# 标准算子 CUDA kernel（对照 torch 内建实现）
+# Standard-operator CUDA kernels (compared against built-in torch implementations)
 # ---------------------------------------------------------------------------
 def test_rms_norm_cuda():
     torch.manual_seed(0)

@@ -1,4 +1,4 @@
-"""模型运行时使用的公共算子入口。"""
+"""Shared operator entry points used by model runtimes."""
 
 from __future__ import annotations
 
@@ -55,11 +55,11 @@ def linear(
     output_dtype: torch.dtype | None = None,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """通用单 token Linear，直接读取 BF16 或紧凑 block-FP8 权重。
+    """Generic single-token linear operator that directly reads BF16 or compact block-FP8 weights.
 
-    ``ProjectionGroup`` 表示逻辑行拼接；每个成员保持自己的 128 行 scale
-    原点，只拼接 token 大小的输出。这里不按模型名分派，也不生成完整反量化
-    矩阵。调用方需要保持旧 ``F.linear`` dtype 时显式传 ``output_dtype``。
+    ``ProjectionGroup`` represents logical row concatenation. Each member retains its own 128-row scale origin,
+    and only token-sized outputs are concatenated. Dispatch never uses model names and does not generate a complete
+    dequantized matrix. Callers preserving the old ``F.linear`` dtype must pass ``output_dtype`` explicitly.
     """
     from ..kernels import BlockFP8Weight, ProjectionGroup
 
@@ -192,7 +192,7 @@ def vq_gemv(
     indices: torch.Tensor,
     codebook: torch.Tensor,
 ) -> torch.Tensor | None:
-    """按能力分派 VQ GEMV；不在此接口中展开或反量化权重。"""
+    """Dispatch VQ GEMV by capability without expanding or dequantizing weights in this interface."""
     _ensure_builtins()
     if indices.dtype == torch.uint8:
         packed_format = "u8"
@@ -273,7 +273,7 @@ def block_scaled_gemv(
     cols: int | None = None,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
-    """直接读取块缩放紧凑权重执行单 token GEMV。"""
+    """Execute single-token GEMV by directly reading compact block-scaled weights."""
     _ensure_builtins()
     if weights.dtype != torch.uint8 or scales.dtype != torch.float32:
         return None
@@ -811,7 +811,7 @@ def route_topk(
     topk_group: int = 1,
     output_buffers: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """配置驱动的 Top-K 路由；注册键只描述数学与设备能力。"""
+    """Configuration-driven Top-K routing whose registry key describes only mathematical and device capabilities."""
     _ensure_builtins()
     if int(n_group) != 1 or int(topk_group) != 1:
         return None
@@ -860,7 +860,7 @@ def linear_route_topk(
         torch.Tensor,
     ],
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """通用线性投影与 Top-K 路由接口，保持路由权重的源生精度。"""
+    """Generic linear-projection and Top-K routing interface preserving the native precision of routing weights."""
     _ensure_builtins()
     if (
         int(n_group) != 1
@@ -897,9 +897,9 @@ def linear_route_topk(
 
 
 def attention_step(kind: str, device_type: str, **kwargs):
-    """配置驱动的 Attention 注册入口。
+    """Configuration-driven attention registry entry point.
 
-    各注意力数学实现按 ``kind`` 注册；公共运行时不按模型名称分派。
+    Attention implementations register by mathematical ``kind``; the shared runtime never dispatches by model name.
     """
     _ensure_builtins()
     normalized_kind = kind.strip().lower()
@@ -924,7 +924,7 @@ def rmsnorm(
     *,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
-    """设备无关的 RMSNorm 注册入口。"""
+    """Device-independent RMSNorm registry entry point."""
     _ensure_builtins()
     try:
         batch_size = max(1, value.numel() // value.shape[-1])
@@ -962,7 +962,7 @@ def residual_mix(
     workspace: torch.Tensor | None = None,
     residual_inverse: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
-    """配置驱动的残差合并入口。"""
+    """Configuration-driven residual-combination entry point."""
     _ensure_builtins()
     normalized_kind = kind.strip().lower()
     key = (normalized_kind, prefix.device.type)
@@ -997,7 +997,7 @@ def residual_add3(
     routed: torch.Tensor,
     shared: torch.Tensor,
 ) -> torch.Tensor | None:
-    """按源 dtype 顺序计算 ``residual + (routed + shared)``。"""
+    """Compute ``residual + (routed + shared)`` in source-dtype order."""
     _ensure_builtins()
     device_type = residual.device.type
     try:
@@ -1154,7 +1154,7 @@ def gated_activation(
     limit: float = 0.0,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
-    """按激活能力选择融合 Gate×Up 算子。"""
+    """Select a fused Gate-by-Up operator by activation capability."""
     _ensure_builtins()
     normalized = activation.strip().lower()
     key = (gate.device.type, normalized)
@@ -1200,7 +1200,7 @@ def packed_moe_topk(
     codebook_sizes: tuple[int, ...] | None = None,
     limit: float = 0.0,
 ) -> torch.Tensor:
-    """直接读取紧凑索引执行 Top-K MoE，不生成完整反量化矩阵。"""
+    """Execute Top-K MoE by directly reading compact indices without generating a complete dequantized matrix."""
     _ensure_builtins()
     projection_vq = (
         metadata.ndim == 2 and metadata.shape[0] == 15
@@ -1647,7 +1647,7 @@ def create_tensor_parallel(
     devices: tuple[torch.device, ...],
     spec,
 ):
-    """通过公共能力注册创建有状态 TP executor。"""
+    """Create a stateful TP executor through the shared capability registry."""
     _ensure_builtins()
     normalized = kind.strip().lower()
     activation = str(getattr(spec, "activation", "none")).lower()
