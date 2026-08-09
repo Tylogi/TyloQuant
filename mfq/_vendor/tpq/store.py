@@ -1,7 +1,7 @@
-"""TPQ 模型仓库层：读取 CCCP 产出的 "cccp-1" 格式（纯文件 I/O，无 mmap）。
+"""TPQ 模型仓库层：读取 TPQ 产出的 "tpq-1" 格式（纯文件 I/O，无 mmap）。
 
-目录结构（GLM-5.2-cccp/）：
-    cccp.json               清单（config + quant 元信息 + 文件映射）
+目录结构（GLM-5.2-tpq/）：
+    tpq.json               清单（config + quant 元信息 + 文件映射）
     dense.safetensors       dense 权重：int4 对（name + name.qs）或 f32 小张量
     vq-codebooks.safetensors 可选专家级跨层码本池和U8分配表
     experts.L*.safetensors  每层专家：共享 cb.gu.{档}，或按连续专家分组的
@@ -43,7 +43,7 @@ _SAFEFILE_THREAD = threading.local()
 
 
 def _unpack_u12(packed: torch.Tensor, count: int) -> torch.Tensor:
-    """把 CCCP 的双 12-bit/3-byte 索引恢复为 u16。
+    """把 TPQ 的双 12-bit/3-byte 索引恢复为 u16。
 
     产物仅在磁盘/RAM blob 中紧凑保存；进入 GPU 专家 arena 前只解包一次，
     因而不会给每次专家计算增加位操作。
@@ -61,7 +61,7 @@ def _unpack_u12(packed: torch.Tensor, count: int) -> torch.Tensor:
 
 
 def _unpack_u14(packed: torch.Tensor, count: int) -> torch.Tensor:
-    """把 CCCP 的四 14-bit/7-byte 索引恢复为 u16。"""
+    """把 TPQ 的四 14-bit/7-byte 索引恢复为 u16。"""
     raw = packed.view(torch.uint8).reshape(-1).to(torch.int64)
     if raw.numel() % 7:
         raise ValueError(f"u14 packed bytes 必须为 7 的倍数，实际 {raw.numel()}")
@@ -164,7 +164,7 @@ def _unpack_odd_width(
 
 
 def _stored_index_bits(num_bytes: int, count: int) -> int:
-    """Infer standard CCCP index width from exact payload length."""
+    """Infer standard TPQ index width from exact payload length."""
     total_bits = int(num_bytes) * 8
     if count > 0 and total_bits % int(count) == 0:
         bits = total_bits // int(count)
@@ -721,15 +721,13 @@ class SafeTensorCollection:
 
 
 class Manifest:
-    """Read a canonical ``tpq.json`` or a legacy ``cccp.json`` manifest."""
+    """Read a ``tpq.json`` manifest."""
 
     def __init__(self, root: str):
-        canonical = os.path.join(root, "tpq.json")
-        legacy = os.path.join(root, "cccp.json")
-        manifest_path = canonical if os.path.isfile(canonical) else legacy
+        manifest_path = os.path.join(root, "tpq.json")
         with open(manifest_path, "r", encoding="utf-8") as f:
             m = json.load(f)
-        if m.get("format") not in {"tpq-1", "cccp-1"}:
+        if m.get("format") != "tpq-1":
             raise ValueError(f"不支持的 TPQ 格式: {m.get('format')!r}")
         self.root = root
         self.manifest_path = manifest_path
@@ -951,12 +949,12 @@ class Manifest:
         layout_format = layout.get("format")
         if layout_format not in (
             None,
-            "cccp-vq-codebook-layout-v1",
+            "tpq-vq-codebook-layout-v1",
             "expert-assigned-codebook-v1",
         ):
             raise ValueError(f"不支持的 VQ 码本布局: {layout_format}")
         if (
-            layout_format == "cccp-vq-codebook-layout-v1"
+            layout_format == "tpq-vq-codebook-layout-v1"
             and layout.get("assignment") != "contiguous-expert-id"
         ):
             raise ValueError(
@@ -1873,10 +1871,6 @@ class TPQStore:
             packed("gu", 2 * intermediate, hidden),
             packed("dn", hidden, intermediate),
         )
-
-
-# Historical import alias for released CCCP artifacts and downstream callers.
-CCCPStore = TPQStore
 
 
 class PackedVQWeight:

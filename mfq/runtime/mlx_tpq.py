@@ -11,29 +11,29 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
         "MFQ's MLX runtime requires MLX; install with `pip install -e '.[metal]'`"
     ) from exc
 
-from mfq.formats.tpq import CccpInt4Tensor, CccpPqTensor
+from mfq.formats.tpq import TpqInt4Tensor, TpqPqTensor
 from mfq.kernels.metal.tpq import (
-    MetalCccpInt4Weight,
-    MetalCccpPqWeight,
-    cccp_int4_dequantize,
-    cccp_int4_embedding,
-    cccp_int4_matmul,
-    cccp_pq_dequantize,
-    cccp_pq_matmul,
+    MetalTpqInt4Weight,
+    MetalTpqPqWeight,
+    tpq_int4_dequantize,
+    tpq_int4_embedding,
+    tpq_int4_matmul,
+    tpq_pq_dequantize,
+    tpq_pq_matmul,
 )
 
 
-class MlxCccpInt4Linear:
+class MlxTpqInt4Linear:
     """TPQ2 symmetric int4-g64 dense projection."""
 
-    def __init__(self, tensor: CccpInt4Tensor) -> None:
-        self.packed_weight = MetalCccpInt4Weight.from_tensor(tensor)
+    def __init__(self, tensor: TpqInt4Tensor) -> None:
+        self.packed_weight = MetalTpqInt4Weight.from_tensor(tensor)
 
     @classmethod
     def from_packed_weight(
         cls,
-        weight: MetalCccpInt4Weight,
-    ) -> MlxCccpInt4Linear:
+        weight: MetalTpqInt4Weight,
+    ) -> MlxTpqInt4Linear:
         result = object.__new__(cls)
         result.packed_weight = weight
         return result
@@ -44,26 +44,26 @@ class MlxCccpInt4Linear:
 
     @property
     def weight(self) -> mx.array:
-        return cccp_int4_dequantize(self.packed_weight)
+        return tpq_int4_dequantize(self.packed_weight)
 
     def forward(self, x: mx.array | np.ndarray) -> mx.array:
-        return cccp_int4_matmul(self.packed_weight, x)
+        return tpq_int4_matmul(self.packed_weight, x)
 
     def __call__(self, x: mx.array | np.ndarray) -> mx.array:
         return self.forward(x)
 
 
-class MlxCccpInt4Embedding:
+class MlxTpqInt4Embedding:
     """TPQ2 int4 embedding that decodes only requested rows."""
 
-    def __init__(self, tensor: CccpInt4Tensor) -> None:
-        self.packed_weight = MetalCccpInt4Weight.from_tensor(tensor)
+    def __init__(self, tensor: TpqInt4Tensor) -> None:
+        self.packed_weight = MetalTpqInt4Weight.from_tensor(tensor)
 
     @classmethod
     def from_packed_weight(
         cls,
-        weight: MetalCccpInt4Weight,
-    ) -> MlxCccpInt4Embedding:
+        weight: MetalTpqInt4Weight,
+    ) -> MlxTpqInt4Embedding:
         result = object.__new__(cls)
         result.packed_weight = weight
         return result
@@ -74,7 +74,7 @@ class MlxCccpInt4Embedding:
         *,
         dtype: mx.Dtype = mx.float16,
     ) -> mx.array:
-        return cccp_int4_embedding(
+        return tpq_int4_embedding(
             self.packed_weight,
             token_ids,
             dtype=dtype,
@@ -84,17 +84,17 @@ class MlxCccpInt4Embedding:
         return self.forward(token_ids)
 
 
-class MlxCccpPqLinear:
+class MlxTpqPqLinear:
     """TPQ2 learned product-VQ projection."""
 
-    def __init__(self, tensor: CccpPqTensor) -> None:
-        self.packed_weight = MetalCccpPqWeight.from_tensor(tensor)
+    def __init__(self, tensor: TpqPqTensor) -> None:
+        self.packed_weight = MetalTpqPqWeight.from_tensor(tensor)
 
     @classmethod
     def from_packed_weight(
         cls,
-        weight: MetalCccpPqWeight,
-    ) -> MlxCccpPqLinear:
+        weight: MetalTpqPqWeight,
+    ) -> MlxTpqPqLinear:
         result = object.__new__(cls)
         result.packed_weight = weight
         return result
@@ -105,25 +105,17 @@ class MlxCccpPqLinear:
 
     @property
     def weight(self) -> mx.array:
-        return cccp_pq_dequantize(self.packed_weight)
+        return tpq_pq_dequantize(self.packed_weight)
 
     def forward(self, x: mx.array | np.ndarray) -> mx.array:
-        return cccp_pq_matmul(self.packed_weight, x)
+        return tpq_pq_matmul(self.packed_weight, x)
 
     def __call__(self, x: mx.array | np.ndarray) -> mx.array:
         return self.forward(x)
-
-
-MlxTpqInt4Embedding = MlxCccpInt4Embedding
-MlxTpqInt4Linear = MlxCccpInt4Linear
-MlxTpqPqLinear = MlxCccpPqLinear
 
 
 __all__ = [
     "MlxTpqInt4Embedding",
     "MlxTpqInt4Linear",
     "MlxTpqPqLinear",
-    "MlxCccpInt4Embedding",
-    "MlxCccpInt4Linear",
-    "MlxCccpPqLinear",
 ]

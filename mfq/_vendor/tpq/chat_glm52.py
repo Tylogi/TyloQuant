@@ -19,9 +19,9 @@ from tpq.legacy_chat import LegacyChatPreset, run_legacy_chat
 PRESET = LegacyChatPreset(
     label="chat_glm52",
     model_names=(
-        "GLM-5.2-CCCP-L",
-        "GLM-5.2-CCCP-M",
-        "GLM-5.2-CCCP-S",
+        "GLM-5.2-TPQ-L",
+        "GLM-5.2-TPQ-M",
+        "GLM-5.2-TPQ-S",
     ),
     default_spec=0,
     missing_model_message="未找到 GLM-5.2 模型目录，请用 --model 指定",

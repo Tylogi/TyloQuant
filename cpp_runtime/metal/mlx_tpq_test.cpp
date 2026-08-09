@@ -1,4 +1,4 @@
-#include "mlx_cccp.h"
+#include "mlx_tpq.h"
 #include "mlx_tensor.h"
 
 #include <algorithm>
@@ -580,7 +580,7 @@ void test_int4() {
     using namespace mlx::core;
     const auto fixture = make_int4_fixture();
     const auto weight =
-        mfq::metal::MlxCccpInt4Weight::from_blob(
+        mfq::metal::MlxTpqInt4Weight::from_blob(
             fixture.blob);
     require(
         weight.input_size() == kInputSize &&
@@ -588,12 +588,12 @@ void test_int4() {
                 == fixture.output_size &&
             weight.group_size() == 64 &&
             weight.groups() == 2,
-        "CCCP-I4G64 metadata mismatch");
+        "TPQ-I4G64 metadata mismatch");
     require(
         weight.packed_values().dtype() == uint8 &&
             weight.scales().dtype() == float16 &&
             weight.packed_nbytes() > 0,
-        "CCCP-I4G64 resident arrays mismatch");
+        "TPQ-I4G64 resident arrays mismatch");
 
     require_array_close(
         weight.dequantize(float32),
@@ -603,11 +603,11 @@ void test_int4() {
             kInputSize,
         },
         1e-6f,
-        "CCCP-I4G64 dequantize");
+        "TPQ-I4G64 dequantize");
     exercise_projection(
         weight,
         fixture,
-        "CCCP-I4G64");
+        "TPQ-I4G64");
 
     const std::vector<std::int32_t> ids{
         0,
@@ -639,7 +639,7 @@ void test_int4() {
         expected_embedding,
         {2, 2, kInputSize},
         1e-6f,
-        "CCCP-I4G64 embedding");
+        "TPQ-I4G64 embedding");
 
     constexpr int group_count = 4;
     constexpr int grouped_rows = 3;
@@ -715,51 +715,51 @@ void test_int4() {
             out_per_group,
         },
         8e-4f,
-        "CCCP-I4G64 grouped-row");
+        "TPQ-I4G64 grouped-row");
 
     auto bad_magic = fixture.blob;
     bad_magic[0] = 'X';
     require_throws(
         [&]() {
             (void)mfq::metal::
-                MlxCccpInt4Weight::from_blob(
+                MlxTpqInt4Weight::from_blob(
                     bad_magic);
         },
-        "CCCP-I4G64 bad magic was accepted");
+        "TPQ-I4G64 bad magic was accepted");
     auto bad_padding = fixture.blob;
     bad_padding[5] = 1;
     require_throws(
         [&]() {
             (void)mfq::metal::
-                MlxCccpInt4Weight::from_blob(
+                MlxTpqInt4Weight::from_blob(
                     bad_padding);
         },
-        "CCCP-I4G64 reserved padding was accepted");
+        "TPQ-I4G64 reserved padding was accepted");
     auto truncated = fixture.blob;
     truncated.pop_back();
     require_throws(
         [&]() {
             (void)mfq::metal::
-                MlxCccpInt4Weight::from_blob(
+                MlxTpqInt4Weight::from_blob(
                     truncated);
         },
-        "truncated CCCP-I4G64 was accepted");
+        "truncated TPQ-I4G64 was accepted");
 }
 
 std::vector<PqProfile> pq_profiles() {
     return {
         {"TPQ-X", 1, 8, 256, 8},
-        {"CCCP-X", 1, 8, 256, 12},
-        {"CCCP-X", 1, 8, 256, 14},
+        {"TPQ-X", 1, 8, 256, 12},
+        {"TPQ-X", 1, 8, 256, 14},
         {"TPQ-W", 2, 8, 4096, 12},
-        {"CCCP-W", 2, 8, 4096, 14},
-        {"CCCP-W", 2, 8, 4096, 16},
+        {"TPQ-W", 2, 8, 4096, 14},
+        {"TPQ-W", 2, 8, 4096, 16},
         {"TPQ-V", 3, 4, 256, 8},
-        {"CCCP-V", 3, 4, 256, 12},
-        {"CCCP-V", 3, 4, 256, 14},
+        {"TPQ-V", 3, 4, 256, 12},
+        {"TPQ-V", 3, 4, 256, 14},
         {"TPQ-VV", 4, 4, 4096, 12},
-        {"CCCP-VV", 4, 4, 4096, 14},
-        {"CCCP-VV", 4, 4, 4096, 16},
+        {"TPQ-VV", 4, 4, 4096, 14},
+        {"TPQ-VV", 4, 4, 4096, 16},
     };
 }
 
@@ -769,7 +769,7 @@ void test_pq() {
         const auto fixture =
             make_pq_fixture(profile);
         const auto weight =
-            mfq::metal::MlxCccpPqWeight::from_blob(
+            mfq::metal::MlxTpqPqWeight::from_blob(
                 profile.dtype,
                 fixture.blob);
         const auto context =
@@ -817,26 +817,26 @@ void test_pq() {
 
     const auto fixture =
         make_pq_fixture(
-            {"CCCP-X", 1, 8, 256, 8});
+            {"TPQ-X", 1, 8, 256, 8});
     require_throws(
         [&]() {
             (void)mfq::metal::
-                MlxCccpPqWeight::from_blob(
-                    "CCCP-V",
+                MlxTpqPqWeight::from_blob(
+                    "TPQ-V",
                     fixture.blob);
         },
-        "CCCP-PQ dtype mismatch was accepted");
+        "TPQ-PQ dtype mismatch was accepted");
 
     auto bad_bits = fixture.blob;
     bad_bits[7] = 16;
     require_throws(
         [&]() {
             (void)mfq::metal::
-                MlxCccpPqWeight::from_blob(
-                    "CCCP-X",
+                MlxTpqPqWeight::from_blob(
+                    "TPQ-X",
                     bad_bits);
         },
-        "CCCP-X p16 storage was accepted");
+        "TPQ-X p16 storage was accepted");
 
     auto bad_index = fixture.blob;
     const std::size_t header =
@@ -854,11 +854,11 @@ void test_pq() {
     require_throws(
         [&]() {
             (void)mfq::metal::
-                MlxCccpPqWeight::from_blob(
-                    "CCCP-X",
+                MlxTpqPqWeight::from_blob(
+                    "TPQ-X",
                     bad_index);
         },
-        "CCCP-X wrong codebook size was accepted");
+        "TPQ-X wrong codebook size was accepted");
 
     auto nan_codebook = fixture.blob;
     const float nan =
@@ -870,22 +870,22 @@ void test_pq() {
     require_throws(
         [&]() {
             (void)mfq::metal::
-                MlxCccpPqWeight::from_blob(
-                    "CCCP-X",
+                MlxTpqPqWeight::from_blob(
+                    "TPQ-X",
                     nan_codebook);
         },
-        "CCCP-PQ NaN codebook was accepted");
+        "TPQ-PQ NaN codebook was accepted");
 
     auto truncated = fixture.blob;
     truncated.pop_back();
     require_throws(
         [&]() {
             (void)mfq::metal::
-                MlxCccpPqWeight::from_blob(
-                    "CCCP-X",
+                MlxTpqPqWeight::from_blob(
+                    "TPQ-X",
                     truncated);
         },
-        "truncated CCCP-PQ was accepted");
+        "truncated TPQ-PQ was accepted");
 }
 
 void test_generic_tensor_wrappers() {
@@ -899,7 +899,7 @@ void test_generic_tensor_wrappers() {
         linear_source.begin(),
         Shape{5, kInputSize});
     mfq::metal::MlxLinear int4_linear(
-        mfq::metal::MlxCccpInt4Weight::
+        mfq::metal::MlxTpqInt4Weight::
             from_blob(int4_fixture.blob));
     require(
         int4_linear.packed() &&
@@ -909,7 +909,7 @@ void test_generic_tensor_wrappers() {
                 == int4_fixture.output_size &&
             int4_linear.grouped_weight_ref()
                 .has_value(),
-        "MlxLinear CCCP-I4G64 metadata mismatch");
+        "MlxLinear TPQ-I4G64 metadata mismatch");
     require_array_close(
         int4_linear(linear_input),
         reference_matmul(
@@ -918,17 +918,17 @@ void test_generic_tensor_wrappers() {
             int4_fixture),
         {5, int4_fixture.output_size},
         1.2e-3f,
-        "MlxLinear CCCP-I4G64");
+        "MlxLinear TPQ-I4G64");
 
     mfq::metal::MlxEmbedding int4_embedding(
-        mfq::metal::MlxCccpInt4Weight::
+        mfq::metal::MlxTpqInt4Weight::
             from_blob(int4_fixture.blob));
     require(
         int4_embedding.vocabulary_size()
                 == int4_fixture.output_size &&
             int4_embedding.hidden_size()
                 == kInputSize,
-        "MlxEmbedding CCCP-I4G64 metadata mismatch");
+        "MlxEmbedding TPQ-I4G64 metadata mismatch");
     const std::vector<std::int32_t> ids{
         2,
         int4_fixture.output_size - 1,
@@ -957,7 +957,7 @@ void test_generic_tensor_wrappers() {
         embedding_expected,
         {2, 2, kInputSize},
         1e-6f,
-        "MlxEmbedding CCCP-I4G64 lookup");
+        "MlxEmbedding TPQ-I4G64 lookup");
     require_array_close(
         int4_embedding.project(linear_input),
         reference_matmul(
@@ -966,16 +966,16 @@ void test_generic_tensor_wrappers() {
             int4_fixture),
         {5, int4_fixture.output_size},
         1.2e-3f,
-        "MlxEmbedding CCCP-I4G64 project");
+        "MlxEmbedding TPQ-I4G64 project");
 
     const auto pq_fixture =
         make_pq_fixture(
-            {"CCCP-VV", 4, 4, 4096, 14},
+            {"TPQ-VV", 4, 4, 4096, 14},
             7);
     mfq::metal::MlxLinear pq_linear(
-        mfq::metal::MlxCccpPqWeight::
+        mfq::metal::MlxTpqPqWeight::
             from_blob(
-                "CCCP-VV",
+                "TPQ-VV",
                 pq_fixture.blob));
     require(
         pq_linear.packed() &&
@@ -985,7 +985,7 @@ void test_generic_tensor_wrappers() {
                 == pq_fixture.output_size &&
             pq_linear.grouped_weight_ref()
                 .has_value(),
-        "MlxLinear CCCP-VV p14 metadata mismatch");
+        "MlxLinear TPQ-VV p14 metadata mismatch");
     require_array_close(
         pq_linear(linear_input),
         reference_matmul(
@@ -994,7 +994,7 @@ void test_generic_tensor_wrappers() {
             pq_fixture),
         {5, pq_fixture.output_size},
         1.5e-3f,
-        "MlxLinear CCCP-VV p14");
+        "MlxLinear TPQ-VV p14");
 
     constexpr int group_count = 4;
     constexpr int batch_rows = 3;
@@ -1072,7 +1072,7 @@ void test_generic_tensor_wrappers() {
             output_per_group,
         },
         8e-4f,
-        "MlxLinear CCCP-I4G64 grouped-row");
+        "MlxLinear TPQ-I4G64 grouped-row");
 }
 
 } // namespace
@@ -1090,19 +1090,9 @@ int main() {
                     "TPQ-V") &&
                 mfq::metal::is_tpq_dtype(
                     "TPQ-VV") &&
-                mfq::metal::is_cccp_dtype(
-                "CCCP-I4G64") &&
-                mfq::metal::is_cccp_dtype(
-                    "CCCP-X") &&
-                mfq::metal::is_cccp_dtype(
-                    "CCCP-W") &&
-                mfq::metal::is_cccp_dtype(
-                    "CCCP-V") &&
-                mfq::metal::is_cccp_dtype(
-                    "CCCP-VV") &&
-                !mfq::metal::is_cccp_dtype(
+                !mfq::metal::is_tpq_dtype(
                     "NVQ2"),
-            "TPQ/CCCP dtype recognition mismatch");
+            "TPQ dtype recognition mismatch");
         test_int4();
         test_pq();
         test_generic_tensor_wrappers();

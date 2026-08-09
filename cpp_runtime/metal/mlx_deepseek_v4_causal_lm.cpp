@@ -295,7 +295,7 @@ std::vector<array> expert_availability(
 
     const auto found =
         model.header().extra_json.find(
-            "cccp_manifest");
+            "tpq_manifest");
     if (found ==
         model.header().extra_json.end()) {
         return result;
@@ -307,7 +307,7 @@ std::vector<array> expert_availability(
     } catch (const json::exception& error) {
         throw std::runtime_error(
             std::string(
-                "invalid DeepSeek-V4 CCCP manifest: ") +
+                "invalid DeepSeek-V4 TPQ manifest: ") +
             error.what());
     }
     const auto assignments =

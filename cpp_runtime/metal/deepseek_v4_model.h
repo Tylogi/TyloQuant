@@ -19,7 +19,7 @@ struct DeepseekV4RopeScaling {
     std::int64_t original_max_position_embeddings = 0;
 };
 
-// Normalized configuration shared by manifest-form CCCP archives and raw
+// Normalized configuration shared by manifest-form TPQ archives and raw
 // Hugging Face DeepSeek-V4 config.json files.
 struct DeepseekV4Config {
     std::string model_type = "deepseek_v4";
@@ -58,12 +58,12 @@ struct DeepseekV4Config {
     double compress_rope_theta = 160'000.0;
     std::vector<std::int64_t> compress_ratios;
 
-    // Accepts a normalized manifest config, a complete CCCP manifest, or a
+    // Accepts a normalized manifest config, a complete TPQ manifest, or a
     // Hugging Face config. Alias fields are normalized to the members above.
     static DeepseekV4Config from_json(std::string_view payload);
 
-    // Requires a native DeepSeek-V4 CCCP MFQ header and reads the normalized
-    // configuration from header.extra_json["cccp_manifest"]["config"].
+    // Requires a native DeepSeek-V4 TPQ MFQ header and reads the normalized
+    // configuration from header.extra_json["tpq_manifest"]["config"].
     static DeepseekV4Config from_mfq(const MfqContainer& model);
 
     void validate() const;

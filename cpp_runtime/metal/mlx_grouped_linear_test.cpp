@@ -209,7 +209,7 @@ Fixture make_q8_fixture(int output_size) {
     };
 }
 
-Fixture make_cccp_int4_fixture(int output_size) {
+Fixture make_tpq_int4_fixture(int output_size) {
     std::vector<std::int8_t> quantized(
         static_cast<std::size_t>(output_size)
             * kInputSize);
@@ -318,12 +318,12 @@ Fixture make_cccp_int4_fixture(int output_size) {
     };
 }
 
-struct CccpPqFixture {
+struct TpqPqFixture {
     std::string dtype;
     Fixture fixture;
 };
 
-CccpPqFixture make_cccp_pq_fixture(
+TpqPqFixture make_tpq_pq_fixture(
     std::string dtype,
     int tier,
     int vector_size,
@@ -459,33 +459,33 @@ CccpPqFixture make_cccp_pq_fixture(
     };
 }
 
-std::vector<CccpPqFixture>
-make_cccp_pq_fixtures() {
+std::vector<TpqPqFixture>
+make_tpq_pq_fixtures() {
     return {
-        make_cccp_pq_fixture(
-            "CCCP-X", 1, 8, 256, 8, 3),
-        make_cccp_pq_fixture(
-            "CCCP-X", 1, 8, 256, 12, 4),
-        make_cccp_pq_fixture(
-            "CCCP-X", 1, 8, 256, 14, 5),
-        make_cccp_pq_fixture(
-            "CCCP-W", 2, 8, 4096, 12, 3),
-        make_cccp_pq_fixture(
-            "CCCP-W", 2, 8, 4096, 14, 4),
-        make_cccp_pq_fixture(
-            "CCCP-W", 2, 8, 4096, 16, 5),
-        make_cccp_pq_fixture(
-            "CCCP-V", 3, 4, 256, 8, 3),
-        make_cccp_pq_fixture(
-            "CCCP-V", 3, 4, 256, 12, 4),
-        make_cccp_pq_fixture(
-            "CCCP-V", 3, 4, 256, 14, 5),
-        make_cccp_pq_fixture(
-            "CCCP-VV", 4, 4, 4096, 12, 3),
-        make_cccp_pq_fixture(
-            "CCCP-VV", 4, 4, 4096, 14, 4),
-        make_cccp_pq_fixture(
-            "CCCP-VV", 4, 4, 4096, 16, 5),
+        make_tpq_pq_fixture(
+            "TPQ-X", 1, 8, 256, 8, 3),
+        make_tpq_pq_fixture(
+            "TPQ-X", 1, 8, 256, 12, 4),
+        make_tpq_pq_fixture(
+            "TPQ-X", 1, 8, 256, 14, 5),
+        make_tpq_pq_fixture(
+            "TPQ-W", 2, 8, 4096, 12, 3),
+        make_tpq_pq_fixture(
+            "TPQ-W", 2, 8, 4096, 14, 4),
+        make_tpq_pq_fixture(
+            "TPQ-W", 2, 8, 4096, 16, 5),
+        make_tpq_pq_fixture(
+            "TPQ-V", 3, 4, 256, 8, 3),
+        make_tpq_pq_fixture(
+            "TPQ-V", 3, 4, 256, 12, 4),
+        make_tpq_pq_fixture(
+            "TPQ-V", 3, 4, 256, 14, 5),
+        make_tpq_pq_fixture(
+            "TPQ-VV", 4, 4, 4096, 12, 3),
+        make_tpq_pq_fixture(
+            "TPQ-VV", 4, 4, 4096, 14, 4),
+        make_tpq_pq_fixture(
+            "TPQ-VV", 4, 4, 4096, 16, 5),
     };
 }
 
@@ -1174,22 +1174,22 @@ int main() {
                     fixture.dtype,
                     fixture.fixture.blob));
         }
-        const auto cccp_int4_fixture =
-            make_cccp_int4_fixture(6);
-        const auto cccp_int4_weight =
-            mfq::metal::MlxCccpInt4Weight::from_blob(
-                cccp_int4_fixture.blob);
-        auto cccp_pq_fixtures =
-            make_cccp_pq_fixtures();
-        std::vector<mfq::metal::MlxCccpPqWeight>
-            cccp_pq_weights;
-        cccp_pq_weights.reserve(
-            cccp_pq_fixtures.size());
+        const auto tpq_int4_fixture =
+            make_tpq_int4_fixture(6);
+        const auto tpq_int4_weight =
+            mfq::metal::MlxTpqInt4Weight::from_blob(
+                tpq_int4_fixture.blob);
+        auto tpq_pq_fixtures =
+            make_tpq_pq_fixtures();
+        std::vector<mfq::metal::MlxTpqPqWeight>
+            tpq_pq_weights;
+        tpq_pq_weights.reserve(
+            tpq_pq_fixtures.size());
         for (const auto& fixture :
-             cccp_pq_fixtures) {
-            cccp_pq_weights.push_back(
+             tpq_pq_fixtures) {
+            tpq_pq_weights.push_back(
                 mfq::metal::
-                    MlxCccpPqWeight::from_blob(
+                    MlxTpqPqWeight::from_blob(
                         fixture.dtype,
                         fixture.fixture.blob));
         }
@@ -1281,14 +1281,14 @@ int main() {
         }
         {
             auto values =
-                cccp_int4_weight.packed_values();
+                tpq_int4_weight.packed_values();
             auto scales =
-                cccp_int4_weight.scales();
+                tpq_int4_weight.scales();
             values.eval();
             scales.eval();
         }
         for (const auto& weight :
-             cccp_pq_weights) {
+             tpq_pq_weights) {
             auto indices =
                 weight.packed_indices();
             auto codebook =
@@ -1686,17 +1686,17 @@ int main() {
             four_vq_rejected,
             "four-VQ group incorrectly entered the copied fallback");
 
-        // Every legal CCCP tier/storage layout shares its resident index
+        // Every legal TPQ tier/storage layout shares its resident index
         // stream and codebook with an ordinary NINT projection. A second
         // family matrix exercises VQ + I4G64 + product-VQ in one dispatch.
         for (std::size_t index = 0;
-             index < cccp_pq_weights.size();
+             index < tpq_pq_weights.size();
              ++index) {
             const auto active_before =
                 mlx::core::get_active_memory();
             const mfq::metal::MlxGroupedLinear
-                cccp_pair({
-                    &cccp_pq_weights[index],
+                tpq_pair({
+                    &tpq_pq_weights[index],
                     &nint_weights[
                         index % nint_weights.size()
                     ],
@@ -1705,31 +1705,31 @@ int main() {
                 mlx::core::get_active_memory();
             require(
                 active_after <= active_before,
-                cccp_pq_fixtures[index].dtype
+                tpq_pq_fixtures[index].dtype
                     + " grouped construction increased "
                       "active Metal memory");
             require(
-                cccp_pair.uses_zero_copy_storage()
-                    && cccp_pair.copied_packed_nbytes()
+                tpq_pair.uses_zero_copy_storage()
+                    && tpq_pair.copied_packed_nbytes()
                         == 0,
-                cccp_pq_fixtures[index].dtype
+                tpq_pq_fixtures[index].dtype
                     + " pair copied packed streams");
             require(
-                cccp_pair.packed_nbytes()
-                    == cccp_pq_weights[index]
+                tpq_pair.packed_nbytes()
+                    == tpq_pq_weights[index]
                             .packed_nbytes()
                         + nint_weights[
                             index
                                 % nint_weights.size()
                         ].packed_nbytes(),
-                cccp_pq_fixtures[index].dtype
+                tpq_pq_fixtures[index].dtype
                     + " pair logical byte mismatch");
             require_one_row_matches(
-                cccp_pair,
+                tpq_pair,
                 input,
                 source,
                 {
-                    &cccp_pq_fixtures[
+                    &tpq_pq_fixtures[
                         index
                     ].fixture,
                     &fixtures[
@@ -1738,37 +1738,37 @@ int main() {
                     ],
                 },
                 2e-3f,
-                cccp_pq_fixtures[index].dtype
+                tpq_pq_fixtures[index].dtype
                     + " p"
                     + std::to_string(
-                        cccp_pq_weights[index]
+                        tpq_pq_weights[index]
                             .index_bits()));
 
             const mfq::metal::MlxGroupedLinear
-                cccp_heterogeneous({
+                tpq_heterogeneous({
                     &vq_weights[
                         index % vq_weights.size()
                     ],
-                    &cccp_int4_weight,
-                    &cccp_pq_weights[index],
+                    &tpq_int4_weight,
+                    &tpq_pq_weights[index],
                 });
             require(
-                cccp_heterogeneous
+                tpq_heterogeneous
                         .uses_zero_copy_storage()
-                    && cccp_heterogeneous
+                    && tpq_heterogeneous
                             .copied_packed_nbytes()
                         == 0,
                 "VQ/I4/PQ group copied packed streams");
             require_one_row_matches(
-                cccp_heterogeneous,
+                tpq_heterogeneous,
                 input,
                 source,
                 {
                     &vq_fixtures[
                         index % vq_weights.size()
                     ].fixture,
-                    &cccp_int4_fixture,
-                    &cccp_pq_fixtures[
+                    &tpq_int4_fixture,
+                    &tpq_pq_fixtures[
                         index
                     ].fixture,
                 },
@@ -1777,39 +1777,39 @@ int main() {
         }
 
         const mfq::metal::MlxGroupedLinear
-            q8_cccp_qkv({
+            q8_tpq_qkv({
                 &q8_weight,
-                &cccp_int4_weight,
-                &cccp_pq_weights[5],
+                &tpq_int4_weight,
+                &tpq_pq_weights[5],
             });
         require_one_row_matches(
-            q8_cccp_qkv,
+            q8_tpq_qkv,
             input,
             source,
             {
                 &fixtures.back(),
-                &cccp_int4_fixture,
-                &cccp_pq_fixtures[5].fixture,
+                &tpq_int4_fixture,
+                &tpq_pq_fixtures[5].fixture,
             },
             2e-3f,
             "Q8/I4/PQ heterogeneous group");
 
         const mfq::metal::MlxGroupedLinear
-            cccp_row_matrix({
-                &cccp_int4_weight,
-                &cccp_pq_weights[4],
+            tpq_row_matrix({
+                &tpq_int4_weight,
+                &tpq_pq_weights[4],
                 &nint_weights[6],
             });
         for (int rows = 1;
              rows <= 16;
              ++rows) {
-            std::vector<float> cccp_row_source(
+            std::vector<float> tpq_row_source(
                 static_cast<std::size_t>(rows)
                     * kInputSize);
             for (std::size_t index = 0;
-                 index < cccp_row_source.size();
+                 index < tpq_row_source.size();
                  ++index) {
-                cccp_row_source[index] =
+                tpq_row_source[index] =
                     static_cast<float>(
                         static_cast<int>(
                             (
@@ -1819,17 +1819,17 @@ int main() {
                         - 15)
                     / 256.0f;
             }
-            const array cccp_row_input(
-                cccp_row_source.begin(),
+            const array tpq_row_input(
+                tpq_row_source.begin(),
                 Shape{rows, kInputSize});
             require_rows_match(
-                cccp_row_matrix,
-                cccp_row_input,
-                cccp_row_source,
+                tpq_row_matrix,
+                tpq_row_input,
+                tpq_row_source,
                 rows,
                 {
-                    &cccp_int4_fixture,
-                    &cccp_pq_fixtures[4].fixture,
+                    &tpq_int4_fixture,
+                    &tpq_pq_fixtures[4].fixture,
                     &fixtures[6],
                 },
                 2e-3f);
@@ -1837,10 +1837,10 @@ int main() {
 
         std::unique_ptr<
             mfq::metal::MlxGroupedLinear>
-            retained_cccp_group;
-        const auto retained_cccp_fixture =
-            make_cccp_pq_fixture(
-                "CCCP-X",
+            retained_tpq_group;
+        const auto retained_tpq_fixture =
+            make_tpq_pq_fixture(
+                "TPQ-X",
                 1,
                 8,
                 256,
@@ -1849,53 +1849,53 @@ int main() {
         {
             auto temporary =
                 mfq::metal::
-                    MlxCccpPqWeight::from_blob(
-                        retained_cccp_fixture.dtype,
-                        retained_cccp_fixture
+                    MlxTpqPqWeight::from_blob(
+                        retained_tpq_fixture.dtype,
+                        retained_tpq_fixture
                             .fixture.blob);
-            retained_cccp_group =
+            retained_tpq_group =
                 std::make_unique<
                     mfq::metal::MlxGroupedLinear>(
                     std::vector<
                         mfq::metal::
                             MlxGroupedLinearWeightRef>{
                         &temporary,
-                        &cccp_int4_weight,
+                        &tpq_int4_weight,
                     });
         }
         require(
-            retained_cccp_group
+            retained_tpq_group
                     ->copied_packed_nbytes()
                 == 0,
-            "retained CCCP group copied packed storage");
+            "retained TPQ group copied packed storage");
         require_one_row_matches(
-            *retained_cccp_group,
+            *retained_tpq_group,
             input,
             source,
             {
-                &retained_cccp_fixture.fixture,
-                &cccp_int4_fixture,
+                &retained_tpq_fixture.fixture,
+                &tpq_int4_fixture,
             },
             2e-3f,
-            "retained CCCP ownership");
+            "retained TPQ ownership");
 
-        bool four_cccp_rejected = false;
+        bool four_tpq_rejected = false;
         try {
             (void)mfq::metal::MlxGroupedLinear({
-                &cccp_int4_weight,
-                &cccp_pq_weights[0],
-                &cccp_pq_weights[1],
-                &cccp_pq_weights[2],
+                &tpq_int4_weight,
+                &tpq_pq_weights[0],
+                &tpq_pq_weights[1],
+                &tpq_pq_weights[2],
             });
         } catch (
             const mfq::metal::
                 MlxGroupedLinearUnsupported&
         ) {
-            four_cccp_rejected = true;
+            four_tpq_rejected = true;
         }
         require(
-            four_cccp_rejected,
-            "four-projection CCCP group incorrectly "
+            four_tpq_rejected,
+            "four-projection TPQ group incorrectly "
             "entered the copied fallback");
 
         // Exercise every supported small-M row count on one three-family

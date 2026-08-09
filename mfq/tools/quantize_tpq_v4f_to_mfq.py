@@ -15,8 +15,8 @@ import torch
 
 from mfq.calibration.artifact import load_scheme
 from mfq.formats.tpq import (
-    cccp_int4_payload_nbytes,
-    pack_cccp_int4_prefix,
+    tpq_int4_payload_nbytes,
+    pack_tpq_int4_prefix,
 )
 from mfq.formats.tpq import TPQ_PQ_SPECS
 from mfq.formats.header import FileHeader
@@ -52,7 +52,7 @@ def _sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def _cccp_config(root: Path) -> dict:
+def _tpq_config(root: Path) -> dict:
     source = json.loads((root / "config.json").read_text(encoding="utf-8"))
     eos = source.get("eos_token_id", [])
     if isinstance(eos, int):
@@ -164,7 +164,7 @@ def _write_f32_blob(
 ) -> int:
     shape = tuple(int(value) for value in checkpoint.info(name).shape)
     if not shape:
-        raise ValueError(f"CCCP dense scalar is unsupported: {name}")
+        raise ValueError(f"TPQ dense scalar is unsupported: {name}")
     with path.open("wb") as output:
         output.write(struct.pack("<I", len(shape)))
         output.write(struct.pack(f"<{len(shape)}q", *shape))
@@ -198,10 +198,10 @@ def _write_int4_blob(
 ) -> int:
     shape = tuple(int(value) for value in checkpoint.info(name).shape)
     if len(shape) != 2:
-        raise ValueError(f"CCCP int4 source is not a matrix: {name}")
+        raise ValueError(f"TPQ int4 source is not a matrix: {name}")
     rows, columns = shape
-    expected = cccp_int4_payload_nbytes(shape, group_size)
-    prefix = pack_cccp_int4_prefix(shape, group_size)
+    expected = tpq_int4_payload_nbytes(shape, group_size)
+    prefix = pack_tpq_int4_prefix(shape, group_size)
     packed_row_bytes = columns // 2
     scale_row_bytes = columns // group_size * 2
     packed_offset = len(prefix)
@@ -226,7 +226,7 @@ def _write_int4_blob(
             del values, tensor
     actual = path.stat().st_size
     if actual != expected:
-        raise RuntimeError(f"CCCP int4 blob size mismatch: {actual} != {expected}")
+        raise RuntimeError(f"TPQ int4 blob size mismatch: {actual} != {expected}")
     return actual
 
 
@@ -236,7 +236,7 @@ def _expert_precisions(selection) -> tuple:
         for item in selection.selections
     }
     if sorted(by_expert) != list(range(selection.n_experts)):
-        raise ValueError(f"incomplete CCCP expert selection: {selection.name}")
+        raise ValueError(f"incomplete TPQ expert selection: {selection.name}")
     return tuple(by_expert[expert] for expert in range(selection.n_experts))
 
 
@@ -247,17 +247,17 @@ def _tier_strings(scheme, n_layers: int, n_experts: int) -> dict[str, str]:
         try:
             selection = scheme.expert_selections[name]
         except KeyError as exc:
-            raise ValueError(f"CCCP scheme is missing layer {layer}") from exc
+            raise ValueError(f"TPQ scheme is missing layer {layer}") from exc
         families = _expert_precisions(selection)
         if len(families) != n_experts:
-            raise ValueError(f"CCCP layer {layer} expert count differs")
+            raise ValueError(f"TPQ layer {layer} expert count differs")
         try:
             result[str(layer)] = "".join(
                 _TIER_CHARACTER[item.family] for item in families
             )
         except KeyError as exc:
             raise ValueError(
-                f"CCCP layer {layer} contains a non-CCCP precision"
+                f"TPQ layer {layer} contains a non-TPQ precision"
             ) from exc
     return result
 
@@ -333,10 +333,10 @@ def convert(
     split_max_size: int = 0,
     split_max_tensors: int = 0,
 ) -> Path:
-    """Run CCCP's original dense/expert quantization into MFQ output."""
+    """Run TPQ's original dense/expert quantization into MFQ output."""
 
     if row_chunk <= 0:
-        raise ValueError("CCCP row chunk must be positive")
+        raise ValueError("TPQ row chunk must be positive")
     validate_split_limits(split_max_size, split_max_tensors)
     root = Path(input_root).resolve()
     scheme_file = Path(scheme_path).resolve()
@@ -351,11 +351,11 @@ def convert(
 
     scheme = load_scheme(scheme_file)
     if scheme.metadata.get("codebook_objective") != "euclidean_sse":
-        raise ValueError("CCCP quantization requires Euclidean weight-only codebooks")
+        raise ValueError("TPQ quantization requires Euclidean weight-only codebooks")
     if scheme.metadata.get("codebook_calibration_data") != "none":
-        raise ValueError("CCCP quantization cannot consume an imatrix")
+        raise ValueError("TPQ quantization cannot consume an imatrix")
     checkpoint = V4FCheckpoint(root)
-    config = _cccp_config(root)
+    config = _tpq_config(root)
     manifest = _manifest(root, scheme, config)
     artifact_root = scheme_file.parent
     progress_path = run_dir / "convert_progress.jsonl"
@@ -377,7 +377,7 @@ def convert(
         )
         dtype = "TPQ-I4G64" if use_int4 else "F32"
         expected = (
-            cccp_int4_payload_nbytes(shape, 64)
+            tpq_int4_payload_nbytes(shape, 64)
             if use_int4
             else _f32_blob_nbytes(shape)
         )
@@ -387,7 +387,7 @@ def convert(
             status = "reused"
         else:
             if blob.exists():
-                raise ValueError(f"CCCP blob has the wrong size: {blob}")
+                raise ValueError(f"TPQ blob has the wrong size: {blob}")
             temporary = blob.with_suffix(".blob.partial")
             temporary.unlink(missing_ok=True)
             actual = (
@@ -409,7 +409,7 @@ def convert(
             )
             if actual != expected:
                 raise RuntimeError(
-                    f"CCCP dense blob size mismatch for {name}: "
+                    f"TPQ dense blob size mismatch for {name}: "
                     f"{actual} != {expected}"
                 )
             os.replace(temporary, blob)
@@ -453,7 +453,7 @@ def convert(
                 status = "reused"
             else:
                 if blob.exists():
-                    raise ValueError(f"CCCP blob has the wrong size: {blob}")
+                    raise ValueError(f"TPQ blob has the wrong size: {blob}")
                 temporary = blob.with_suffix(".blob.partial")
                 temporary.unlink(missing_ok=True)
                 actual = _write_mixed_moe_axis0_blob(
@@ -470,7 +470,7 @@ def convert(
                 )
                 if actual != expected:
                     raise RuntimeError(
-                        f"CCCP expert blob size mismatch for {target_name}: "
+                        f"TPQ expert blob size mismatch for {target_name}: "
                         f"{actual} != {expected}"
                     )
                 os.replace(temporary, blob)

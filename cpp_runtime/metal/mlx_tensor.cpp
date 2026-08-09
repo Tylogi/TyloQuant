@@ -35,7 +35,7 @@ std::optional<array> unpack_quantized_weight(
                 std::is_same_v<Weight, MlxNintWeight>
                 || std::is_same_v<Weight, MlxNint8ZeroWeight>
                 || std::is_same_v<Weight, MlxVqWeight>
-                || std::is_same_v<Weight, MlxCccpInt4Weight>
+                || std::is_same_v<Weight, MlxTpqInt4Weight>
             ) {
                 return mlx::core::astype(
                     value.embedding(
@@ -43,7 +43,7 @@ std::optional<array> unpack_quantized_weight(
                         mlx::core::float32),
                     mlx::core::float16);
             } else if constexpr (
-                std::is_same_v<Weight, MlxCccpPqWeight>
+                std::is_same_v<Weight, MlxTpqPqWeight>
             ) {
                 return mlx::core::astype(
                     value.dequantize(
@@ -199,13 +199,13 @@ MlxLinear MlxLinear::load(
             MlxVqWeight::from_blob(record.dtype, mapped.view()));
     }
     if (record.dtype == "TPQ-I4G64" ||
-        record.dtype == "CCCP-I4G64") {
+        record.dtype == "TPQ-I4G64") {
         return MlxLinear(
-            MlxCccpInt4Weight::from_blob(model.read(name)));
+            MlxTpqInt4Weight::from_blob(model.read(name)));
     }
-    if (is_cccp_dtype(record.dtype)) {
+    if (is_tpq_dtype(record.dtype)) {
         return MlxLinear(
-            MlxCccpPqWeight::from_blob(
+            MlxTpqPqWeight::from_blob(
                 record.dtype,
                 model.read(name)));
     }
@@ -231,12 +231,12 @@ MlxLinear::MlxLinear(MlxVqWeight weight)
       output_size_(weight.output_size()),
       weight_(std::move(weight)) {}
 
-MlxLinear::MlxLinear(MlxCccpInt4Weight weight)
+MlxLinear::MlxLinear(MlxTpqInt4Weight weight)
     : input_size_(weight.input_size()),
       output_size_(weight.output_size()),
       weight_(std::move(weight)) {}
 
-MlxLinear::MlxLinear(MlxCccpPqWeight weight)
+MlxLinear::MlxLinear(MlxTpqPqWeight weight)
     : input_size_(weight.input_size()),
       output_size_(weight.output_size()),
       weight_(std::move(weight)) {}
@@ -277,11 +277,11 @@ array MlxLinear::operator()(const array& input) const {
         return packed->matmul(input);
     }
     if (const auto* packed =
-            std::get_if<MlxCccpInt4Weight>(&weight_)) {
+            std::get_if<MlxTpqInt4Weight>(&weight_)) {
         return packed->matmul(input);
     }
     if (const auto* packed =
-            std::get_if<MlxCccpPqWeight>(&weight_)) {
+            std::get_if<MlxTpqPqWeight>(&weight_)) {
         return packed->matmul(input);
     }
     if (const auto* packed = std::get_if<MlxMxWeight>(&weight_)) {
@@ -328,7 +328,7 @@ array MlxLinear::grouped_row_matmul(
         }
     }
     if (const auto* packed =
-            std::get_if<MlxCccpInt4Weight>(&weight_)) {
+            std::get_if<MlxTpqInt4Weight>(&weight_)) {
         return packed->grouped_row_matmul(
             input,
             group_count);
@@ -370,7 +370,7 @@ array MlxLinear::grouped_row_matmul(
 
     // The fallback intentionally stays on the original packed representation:
     // project each input group, then keep the output rows assigned to that
-    // group. This matches the reference implementation for NINT/VQ/CCCP-PQ
+    // group. This matches the reference implementation for NINT/VQ/TPQ-PQ
     // and keeps correctness for uncommon O-LoRA weight formats.
     const auto complete = (*this)(input);
     const int output_per_group =
@@ -420,11 +420,11 @@ MlxLinear::grouped_weight_ref() const noexcept {
         return MlxGroupedLinearWeightRef{packed};
     }
     if (const auto* packed =
-            std::get_if<MlxCccpInt4Weight>(&weight_)) {
+            std::get_if<MlxTpqInt4Weight>(&weight_)) {
         return MlxGroupedLinearWeightRef{packed};
     }
     if (const auto* packed =
-            std::get_if<MlxCccpPqWeight>(&weight_)) {
+            std::get_if<MlxTpqPqWeight>(&weight_)) {
         return MlxGroupedLinearWeightRef{packed};
     }
     if (const auto* packed =
@@ -473,13 +473,13 @@ MlxEmbedding MlxEmbedding::load(
             MlxVqWeight::from_blob(record.dtype, mapped.view()));
     }
     if (record.dtype == "TPQ-I4G64" ||
-        record.dtype == "CCCP-I4G64") {
+        record.dtype == "TPQ-I4G64") {
         return MlxEmbedding(
-            MlxCccpInt4Weight::from_blob(model.read(name)));
+            MlxTpqInt4Weight::from_blob(model.read(name)));
     }
-    if (is_cccp_dtype(record.dtype)) {
+    if (is_tpq_dtype(record.dtype)) {
         throw std::runtime_error(
-            "CCCP learned-PQ tensors do not support embedding lookup: " +
+            "TPQ learned-PQ tensors do not support embedding lookup: " +
             name);
     }
     if (is_mx_dtype(record.dtype)) {
@@ -504,7 +504,7 @@ MlxEmbedding::MlxEmbedding(MlxVqWeight weight)
       hidden_size_(weight.input_size()),
       weight_(std::move(weight)) {}
 
-MlxEmbedding::MlxEmbedding(MlxCccpInt4Weight weight)
+MlxEmbedding::MlxEmbedding(MlxTpqInt4Weight weight)
     : vocabulary_size_(weight.output_size()),
       hidden_size_(weight.input_size()),
       weight_(std::move(weight)) {}
@@ -548,7 +548,7 @@ array MlxEmbedding::operator()(
         return finish_quantized(*packed);
     }
     if (const auto* packed =
-            std::get_if<MlxCccpInt4Weight>(&weight_)) {
+            std::get_if<MlxTpqInt4Weight>(&weight_)) {
         return finish_quantized(*packed);
     }
     if (const auto* packed = std::get_if<MlxMxWeight>(&weight_)) {
@@ -591,7 +591,7 @@ array MlxEmbedding::project(const array& input) const {
         return packed->matmul(input);
     }
     if (const auto* packed =
-            std::get_if<MlxCccpInt4Weight>(&weight_)) {
+            std::get_if<MlxTpqInt4Weight>(&weight_)) {
         return packed->matmul(input);
     }
     if (const auto* packed = std::get_if<MlxMxWeight>(&weight_)) {

@@ -1,6 +1,6 @@
 """Metal execution for TPQ dense-int4 and product-VQ weights.
 
-The ``Cccp*`` symbols remain source-compatible aliases for artifacts created
+The ``Tpq*`` symbols remain source-compatible aliases for artifacts created
 before the public format was renamed to TPQ.
 """
 
@@ -17,12 +17,12 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
         "MFQ's Metal backend requires MLX; install with `pip install -e '.[metal]'`"
     ) from exc
 
-from mfq.formats.tpq import CccpInt4Tensor, CccpPqTensor
+from mfq.formats.tpq import TpqInt4Tensor, TpqPqTensor
 from mfq.formats.moe import NintMoeTensor
 
 _PQ_INDEX_HEADER = r"""
 template <typename I>
-METAL_FUNC uint mfq_cccp_read_index(
+METAL_FUNC uint mfq_tpq_read_index(
     device const I* indices,
     uint index,
     uint bits
@@ -44,7 +44,7 @@ METAL_FUNC uint mfq_cccp_read_index(
     return (packed >> shift) & ((1u << bits) - 1u);
 }
 
-METAL_FUNC uint mfq_cccp_read_packed_index(
+METAL_FUNC uint mfq_tpq_read_packed_index(
     device const uchar* indices,
     uint byte_base,
     uint index,
@@ -65,7 +65,7 @@ METAL_FUNC uint mfq_cccp_read_packed_index(
     return (packed >> shift) & ((1u << bits) - 1u);
 }
 
-METAL_FUNC uint mfq_cccp_read_packed_index(
+METAL_FUNC uint mfq_tpq_read_packed_index(
     constant const uchar* indices,
     uint byte_base,
     uint index,
@@ -218,7 +218,7 @@ _PQ_MATMUL_SOURCE = r"""
     uint input_base = row * uint(K);
     float accumulator = 0.0f;
     for (uint block = lane; block < uint(BLOCKS); block += 32u) {
-        uint code = mfq_cccp_read_index(
+        uint code = mfq_tpq_read_index(
             indices,
             index_base + block,
             uint(INDEX_BITS)
@@ -274,7 +274,7 @@ _PQ_ROUTED_SOURCE = r"""
     ) * uint(K);
     float accumulator = 0.0f;
     for (uint block = lane; block < uint(BLOCKS); block += 32u) {
-        uint code = mfq_cccp_read_index(
+        uint code = mfq_tpq_read_index(
             indices,
             index_base + block,
             uint(INDEX_BITS)
@@ -305,7 +305,7 @@ _PQ_DEQUANT_SOURCE = r"""
     uint column = index - row * uint(K);
     uint block = column / uint(VECTOR_SIZE);
     uint component = column - block * uint(VECTOR_SIZE);
-    uint code = mfq_cccp_read_index(
+    uint code = mfq_tpq_read_index(
         indices,
         row * uint(BLOCKS) + block,
         uint(INDEX_BITS)
@@ -355,7 +355,7 @@ _PQ_GROUPED_MOE_SOURCE = r"""
         } else if (bits == 16u) {
             code = uint(indices16[index_offset + linear_index]);
         } else {
-            code = mfq_cccp_read_packed_index(
+            code = mfq_tpq_read_packed_index(
                 indices_packed,
                 index_offset,
                 linear_index,
@@ -380,35 +380,35 @@ _PQ_GROUPED_MOE_SOURCE = r"""
 
 
 _INT4_MATMUL_KERNEL = mx.fast.metal_kernel(
-    name="mfq_cccp_int4_matmul",
+    name="mfq_tpq_int4_matmul",
     input_names=["x", "packed", "scales"],
     output_names=["y"],
     source=_INT4_MATMUL_SOURCE,
     compile_options={"math_mode": "fast"},
 )
 _INT4_GROUPED_ROW_MATMUL_KERNEL = mx.fast.metal_kernel(
-    name="mfq_cccp_int4_grouped_row_matmul",
+    name="mfq_tpq_int4_grouped_row_matmul",
     input_names=["x", "packed", "scales"],
     output_names=["y"],
     source=_INT4_GROUPED_ROW_MATMUL_SOURCE,
     compile_options={"math_mode": "fast"},
 )
 _INT4_DEQUANT_KERNEL = mx.fast.metal_kernel(
-    name="mfq_cccp_int4_dequantize",
+    name="mfq_tpq_int4_dequantize",
     input_names=["packed", "scales"],
     output_names=["output"],
     source=_INT4_DEQUANT_SOURCE,
     compile_options={"math_mode": "fast"},
 )
 _INT4_EMBEDDING_KERNEL = mx.fast.metal_kernel(
-    name="mfq_cccp_int4_embedding",
+    name="mfq_tpq_int4_embedding",
     input_names=["packed", "scales", "ids"],
     output_names=["output"],
     source=_INT4_EMBEDDING_SOURCE,
     compile_options={"math_mode": "fast"},
 )
 _PQ_MATMUL_KERNEL = mx.fast.metal_kernel(
-    name="mfq_cccp_pq_matmul",
+    name="mfq_tpq_pq_matmul",
     input_names=["x", "indices", "codebook"],
     output_names=["y"],
     header=_PQ_INDEX_HEADER,
@@ -416,7 +416,7 @@ _PQ_MATMUL_KERNEL = mx.fast.metal_kernel(
     compile_options={"math_mode": "fast"},
 )
 _PQ_ROUTED_KERNEL = mx.fast.metal_kernel(
-    name="mfq_cccp_pq_routed_matmul",
+    name="mfq_tpq_pq_routed_matmul",
     input_names=["x", "selected_ids", "pool_ids", "indices", "codebook"],
     output_names=["y"],
     header=_PQ_INDEX_HEADER,
@@ -424,7 +424,7 @@ _PQ_ROUTED_KERNEL = mx.fast.metal_kernel(
     compile_options={"math_mode": "fast"},
 )
 _PQ_DEQUANT_KERNEL = mx.fast.metal_kernel(
-    name="mfq_cccp_pq_dequantize",
+    name="mfq_tpq_pq_dequantize",
     input_names=["indices", "codebook"],
     output_names=["output"],
     header=_PQ_INDEX_HEADER,
@@ -432,7 +432,7 @@ _PQ_DEQUANT_KERNEL = mx.fast.metal_kernel(
     compile_options={"math_mode": "fast"},
 )
 _PQ_GROUPED_MOE_KERNEL = mx.fast.metal_kernel(
-    name="mfq_cccp_pq_grouped_moe",
+    name="mfq_tpq_pq_grouped_moe",
     input_names=[
         "descriptors",
         "indices8",
@@ -457,8 +457,8 @@ def _floating(value: mx.array | np.ndarray) -> mx.array:
 
 
 @dataclass(frozen=True)
-class MetalCccpInt4Weight:
-    """Resident CCCP symmetric int4-g64 matrix."""
+class MetalTpqInt4Weight:
+    """Resident TPQ symmetric int4-g64 matrix."""
 
     packed: mx.array
     scales: mx.array
@@ -467,7 +467,7 @@ class MetalCccpInt4Weight:
     group_size: int
 
     @classmethod
-    def from_tensor(cls, tensor: CccpInt4Tensor) -> MetalCccpInt4Weight:
+    def from_tensor(cls, tensor: TpqInt4Tensor) -> MetalTpqInt4Weight:
         return cls(
             packed=mx.array(np.ascontiguousarray(tensor.packed)),
             scales=mx.array(np.ascontiguousarray(tensor.scales)),
@@ -486,7 +486,7 @@ class MetalCccpInt4Weight:
 
 
 @dataclass(frozen=True)
-class MetalCccpPqWeight:
+class MetalTpqPqWeight:
     """Resident TPQ2 product-VQ matrix with a shared FP32 codebook."""
 
     indices: mx.array
@@ -498,7 +498,7 @@ class MetalCccpPqWeight:
     index_bits: int
 
     @classmethod
-    def from_tensor(cls, tensor: CccpPqTensor) -> MetalCccpPqWeight:
+    def from_tensor(cls, tensor: TpqPqTensor) -> MetalTpqPqWeight:
         bits = int(tensor.spec.index_bits)
         index_dtype = mx.uint16 if bits == 16 else mx.uint8
         return cls(
@@ -521,8 +521,8 @@ class MetalCccpPqWeight:
 
 
 @dataclass(frozen=True)
-class MetalCccpMoeWeight:
-    """Single-dispatch heterogeneous CCCP expert projection."""
+class MetalTpqMoeWeight:
+    """Single-dispatch heterogeneous TPQ expert projection."""
 
     descriptors: mx.array
     indices8: mx.array
@@ -534,7 +534,7 @@ class MetalCccpMoeWeight:
     neuron_len: int
 
     @classmethod
-    def from_tensor(cls, tensor: NintMoeTensor) -> MetalCccpMoeWeight:
+    def from_tensor(cls, tensor: NintMoeTensor) -> MetalTpqMoeWeight:
         descriptors = np.zeros((tensor.n_experts, 6), dtype=np.int32)
         streams8: list[mx.array] = []
         streams16: list[mx.array] = []
@@ -545,13 +545,13 @@ class MetalCccpMoeWeight:
         offset_packed = 0
         table_offset = 0
         for pool in tensor.pools:
-            if not isinstance(pool.tensor, CccpPqTensor):
-                raise TypeError("MetalCccpMoeWeight requires exclusively CCCP-PQ cohorts")
-            weight = MetalCccpPqWeight.from_tensor(pool.tensor)
+            if not isinstance(pool.tensor, TpqPqTensor):
+                raise TypeError("MetalTpqMoeWeight requires exclusively TPQ-PQ cohorts")
+            weight = MetalTpqPqWeight.from_tensor(pool.tensor)
             ids = np.asarray(pool.expert_ids, dtype=np.int32).reshape((-1,))
             expected_rows = int(ids.size) * tensor.out_per_expert
             if weight.out != expected_rows:
-                raise ValueError("CCCP MoE cohort row count is inconsistent")
+                raise ValueError("TPQ MoE cohort row count is inconsistent")
             bits = int(pool.tensor.spec.index_bits)
             if bits == 8:
                 index_offset = offset8
@@ -599,12 +599,12 @@ class MetalCccpMoeWeight:
     @classmethod
     def from_expert_weights(
         cls,
-        weights: tuple[tuple[int, MetalCccpPqWeight], ...],
+        weights: tuple[tuple[int, MetalTpqPqWeight], ...],
         *,
         experts: int,
         out_per_expert: int,
         neuron_len: int,
-    ) -> MetalCccpMoeWeight:
+    ) -> MetalTpqMoeWeight:
         """Assemble one transient grouped weight from resident expert slices."""
 
         descriptors = np.zeros((int(experts), 6), dtype=np.int32)
@@ -623,7 +623,7 @@ class MetalCccpMoeWeight:
                 or weight.out != int(out_per_expert)
                 or weight.neuron_len != int(neuron_len)
             ):
-                raise ValueError("resident CCCP expert weight metadata is inconsistent")
+                raise ValueError("resident TPQ expert weight metadata is inconsistent")
             seen.add(expert_id)
             bits = int(weight.index_bits)
             stream_key = bits if bits in (8, 16) else -1
@@ -673,15 +673,15 @@ class MetalCccpMoeWeight:
         )
 
 
-def cccp_int4_matmul(
-    weight: MetalCccpInt4Weight,
+def tpq_int4_matmul(
+    weight: MetalTpqInt4Weight,
     x: mx.array | np.ndarray,
 ) -> mx.array:
     """Apply a packed TPQ2 dense int4 projection without dequantizing it."""
 
     source = _floating(x)
     if source.ndim < 1 or int(source.shape[-1]) != weight.neuron_len:
-        raise ValueError("CCCP int4 input width is incompatible")
+        raise ValueError("TPQ int4 input width is incompatible")
     rows = int(source.size) // weight.neuron_len
     outputs = _INT4_MATMUL_KERNEL(
         inputs=[
@@ -705,8 +705,8 @@ def cccp_int4_matmul(
     return outputs[0]
 
 
-def cccp_int4_grouped_row_matmul(
-    weight: MetalCccpInt4Weight,
+def tpq_int4_grouped_row_matmul(
+    weight: MetalTpqInt4Weight,
     x: mx.array | np.ndarray,
     *,
     groups: int,
@@ -727,7 +727,7 @@ def cccp_int4_grouped_row_matmul(
         or int(source.shape[-1]) != weight.neuron_len
         or weight.out % group_count
     ):
-        raise ValueError("CCCP grouped-row int4 input is incompatible")
+        raise ValueError("TPQ grouped-row int4 input is incompatible")
     rows = int(source.size) // (group_count * weight.neuron_len)
     out_per_group = weight.out // group_count
     return _INT4_GROUPED_ROW_MATMUL_KERNEL(
@@ -752,12 +752,12 @@ def cccp_int4_grouped_row_matmul(
     )[0]
 
 
-def cccp_int4_dequantize(
-    weight: MetalCccpInt4Weight,
+def tpq_int4_dequantize(
+    weight: MetalTpqInt4Weight,
     *,
     dtype: mx.Dtype = mx.float16,
 ) -> mx.array:
-    """Materialize a CCCP int4 matrix for validation or weight absorption."""
+    """Materialize a TPQ int4 matrix for validation or weight absorption."""
 
     size = weight.out * weight.neuron_len
     return _INT4_DEQUANT_KERNEL(
@@ -776,13 +776,13 @@ def cccp_int4_dequantize(
     )[0]
 
 
-def cccp_int4_embedding(
-    weight: MetalCccpInt4Weight,
+def tpq_int4_embedding(
+    weight: MetalTpqInt4Weight,
     ids: mx.array | np.ndarray,
     *,
     dtype: mx.Dtype = mx.float16,
 ) -> mx.array:
-    """Decode only the requested CCCP int4 embedding rows."""
+    """Decode only the requested TPQ int4 embedding rows."""
 
     selected = ids if isinstance(ids, mx.array) else mx.array(ids)
     selected = mx.contiguous(selected.astype(mx.int32))
@@ -805,15 +805,15 @@ def cccp_int4_embedding(
     )[0]
 
 
-def cccp_pq_matmul(
-    weight: MetalCccpPqWeight,
+def tpq_pq_matmul(
+    weight: MetalTpqPqWeight,
     x: mx.array | np.ndarray,
 ) -> mx.array:
     """Apply a TPQ2 codebook matrix without materializing dense weights."""
 
     source = _floating(x)
     if source.ndim < 1 or int(source.shape[-1]) != weight.neuron_len:
-        raise ValueError("CCCP-PQ input width is incompatible")
+        raise ValueError("TPQ-PQ input width is incompatible")
     rows = int(source.size) // weight.neuron_len
     return _PQ_MATMUL_KERNEL(
         inputs=[
@@ -838,15 +838,15 @@ def cccp_pq_matmul(
     )[0]
 
 
-def cccp_pq_routed_matmul(
-    weight: MetalCccpPqWeight,
+def tpq_pq_routed_matmul(
+    weight: MetalTpqPqWeight,
     x: mx.array | np.ndarray,
     selected_ids: mx.array | np.ndarray,
     pool_ids: mx.array | np.ndarray,
     *,
     out_per_expert: int,
 ) -> mx.array:
-    """Evaluate only selected expert rows from one CCCP-PQ cohort."""
+    """Evaluate only selected expert rows from one TPQ-PQ cohort."""
 
     source = _floating(x)
     ids = selected_ids if isinstance(selected_ids, mx.array) else mx.array(selected_ids)
@@ -854,7 +854,7 @@ def cccp_pq_routed_matmul(
     experts = pool_ids if isinstance(pool_ids, mx.array) else mx.array(pool_ids)
     experts = mx.contiguous(experts.astype(mx.int32).reshape((-1,)))
     if ids.ndim != 2:
-        raise ValueError("CCCP routed IDs must have [tokens,routes] shape")
+        raise ValueError("TPQ routed IDs must have [tokens,routes] shape")
     tokens, routes = map(int, ids.shape)
     output_width = int(out_per_expert)
     if source.ndim == 2 and tuple(map(int, source.shape)) == (tokens, weight.neuron_len):
@@ -863,9 +863,9 @@ def cccp_pq_routed_matmul(
             (tokens, routes, weight.neuron_len),
         )
     if tuple(map(int, source.shape)) != (tokens, routes, weight.neuron_len):
-        raise ValueError("CCCP routed input has incompatible shape")
+        raise ValueError("TPQ routed input has incompatible shape")
     if weight.out != int(experts.size) * output_width:
-        raise ValueError("CCCP routed cohort rows do not match pool expert IDs")
+        raise ValueError("TPQ routed cohort rows do not match pool expert IDs")
     return _PQ_ROUTED_KERNEL(
         inputs=[source, ids, experts, weight.indices, weight.codebook],
         template=[
@@ -887,8 +887,8 @@ def cccp_pq_routed_matmul(
     )[0]
 
 
-def cccp_pq_dequantize(
-    weight: MetalCccpPqWeight,
+def tpq_pq_dequantize(
+    weight: MetalTpqPqWeight,
     *,
     dtype: mx.Dtype = mx.float16,
 ) -> mx.array:
@@ -913,8 +913,8 @@ def cccp_pq_dequantize(
     )[0]
 
 
-def cccp_grouped_moe_matmul(
-    weight: MetalCccpMoeWeight,
+def tpq_grouped_moe_matmul(
+    weight: MetalTpqMoeWeight,
     x: mx.array | np.ndarray,
     selected_ids: mx.array | np.ndarray,
 ) -> mx.array:
@@ -924,7 +924,7 @@ def cccp_grouped_moe_matmul(
     ids = selected_ids if isinstance(selected_ids, mx.array) else mx.array(selected_ids)
     ids = mx.contiguous(ids.astype(mx.int32))
     if ids.ndim != 2:
-        raise ValueError("CCCP grouped IDs must have [tokens,routes] shape")
+        raise ValueError("TPQ grouped IDs must have [tokens,routes] shape")
     tokens, routes = map(int, ids.shape)
     shared_input = source.ndim == 2 and tuple(map(int, source.shape)) == (tokens, weight.neuron_len)
     if not shared_input and tuple(map(int, source.shape)) != (
@@ -932,7 +932,7 @@ def cccp_grouped_moe_matmul(
         routes,
         weight.neuron_len,
     ):
-        raise ValueError("CCCP grouped input has incompatible shape")
+        raise ValueError("TPQ grouped input has incompatible shape")
     tasks = tokens * routes * weight.out_per_expert
     return _PQ_GROUPED_MOE_KERNEL(
         inputs=[
@@ -960,35 +960,10 @@ def cccp_grouped_moe_matmul(
     )[0]
 
 
-MetalTpqInt4Weight = MetalCccpInt4Weight
-MetalTpqMoeWeight = MetalCccpMoeWeight
-MetalTpqPqWeight = MetalCccpPqWeight
-
-tpq_grouped_moe_matmul = cccp_grouped_moe_matmul
-tpq_int4_dequantize = cccp_int4_dequantize
-tpq_int4_embedding = cccp_int4_embedding
-tpq_int4_grouped_row_matmul = cccp_int4_grouped_row_matmul
-tpq_int4_matmul = cccp_int4_matmul
-tpq_pq_dequantize = cccp_pq_dequantize
-tpq_pq_matmul = cccp_pq_matmul
-tpq_pq_routed_matmul = cccp_pq_routed_matmul
-
-
 __all__ = [
     "MetalTpqInt4Weight",
     "MetalTpqMoeWeight",
     "MetalTpqPqWeight",
-    "MetalCccpInt4Weight",
-    "MetalCccpMoeWeight",
-    "MetalCccpPqWeight",
-    "cccp_grouped_moe_matmul",
-    "cccp_int4_dequantize",
-    "cccp_int4_embedding",
-    "cccp_int4_grouped_row_matmul",
-    "cccp_int4_matmul",
-    "cccp_pq_dequantize",
-    "cccp_pq_matmul",
-    "cccp_pq_routed_matmul",
     "tpq_grouped_moe_matmul",
     "tpq_int4_dequantize",
     "tpq_int4_embedding",

@@ -19,9 +19,9 @@ from tpq.legacy_chat import LegacyChatPreset, run_legacy_chat
 PRESET = LegacyChatPreset(
     label="chat_dsv4",
     model_names=(
-        "DeepSeek-V4-Flash-DSpark-cccp-m",
-        "DeepSeek-V4-Flash-DSpark-cccp-s",
-        "DeepSeek-V4-Flash-DSpark-cccp-l",
+        "DeepSeek-V4-Flash-DSpark-tpq-m",
+        "DeepSeek-V4-Flash-DSpark-tpq-s",
+        "DeepSeek-V4-Flash-DSpark-tpq-l",
     ),
     default_spec=5,
     missing_model_message="未找到模型目录，请用 --model 指定",

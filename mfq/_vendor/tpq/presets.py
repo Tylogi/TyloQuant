@@ -1,6 +1,6 @@
 """模型识别与发布预设加载。
 
-发布入口优先读取 ``tpq.json``，并兼容旧 ``cccp.json``：
+发布入口读取 ``tpq.json``：
 
 * 含 ``hc_mult`` 或 ``compress_ratios`` 的模型识别为 DeepSeek-V4；
 * 其他当前 TPQ MoE 模型识别为 GLM。
@@ -35,16 +35,14 @@ class ResolvedPreset:
 
 def load_manifest(model_dir: str | os.PathLike[str]) -> tuple[Path, dict[str, Any]]:
     root = Path(model_dir).expanduser().resolve()
-    canonical = root / "tpq.json"
-    legacy = root / "cccp.json"
-    manifest_path = canonical if canonical.is_file() else legacy
+    manifest_path = root / "tpq.json"
     if not root.is_dir():
         raise ValueError(f"模型目录不存在：{root}")
     if not manifest_path.is_file():
-        raise ValueError(f"模型目录缺少 tpq.json/cccp.json：{root}")
+        raise ValueError(f"模型目录缺少 tpq.json：{root}")
     with manifest_path.open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
-    if manifest.get("format") not in {"tpq-1", "cccp-1"}:
+    if manifest.get("format") != "tpq-1":
         raise ValueError(
             f"不支持的 TPQ 模型格式：{manifest.get('format')!r}"
         )

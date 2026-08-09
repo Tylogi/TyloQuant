@@ -23,7 +23,7 @@ from mfq.formats.npq0_s import Npq0STensor
 from mfq.formats.nvq import NvqJscTensor, NvqTensor
 from mfq.formats.nvq1_l import Nvq1LTensor
 from mfq.formats.nvq1_s import Nvq1STensor
-from mfq.formats.tpq import CccpPqTensor
+from mfq.formats.tpq import TpqPqTensor
 from mfq.kernels.metal.kimi_k3 import situ_split
 from mfq.kernels.metal.moe import (
     MetalMoeWeight,
@@ -42,10 +42,10 @@ from mfq.kernels.metal.nint8_zero import (
     nint8_zero_matmul,
 )
 from mfq.kernels.metal.tpq import (
-    MetalCccpMoeWeight,
-    MetalCccpPqWeight,
-    cccp_grouped_moe_matmul,
-    cccp_pq_routed_matmul,
+    MetalTpqMoeWeight,
+    MetalTpqPqWeight,
+    tpq_grouped_moe_matmul,
+    tpq_pq_routed_matmul,
 )
 from mfq.kernels.metal.vq import MetalVqWeight, vq_matmul
 from mfq.quantize.nint_quant import NintTensor
@@ -68,7 +68,7 @@ class _MlxMoePool:
         MetalNintWeight
         | MetalNint8ZeroWeight
         | MetalVqWeight
-        | MetalCccpPqWeight
+        | MetalTpqPqWeight
         | MetalMxWeight
     )
     experts: int
@@ -79,8 +79,8 @@ class _MlxMoePool:
         x: mx.array,
         selected_ids: mx.array,
     ) -> mx.array:
-        if isinstance(self.weight, MetalCccpPqWeight):
-            return cccp_pq_routed_matmul(
+        if isinstance(self.weight, MetalTpqPqWeight):
+            return tpq_pq_routed_matmul(
                 self.weight,
                 x,
                 selected_ids,
@@ -111,13 +111,13 @@ class MlxRoutedLinear:
         self.out_per_expert = tensor.out_per_expert
         self.neuron_len = tensor.neuron_len
         self.grouped_projection: int | None = None
-        self.grouped_weight: MetalMoeWeight | MetalCccpMoeWeight | None = None
-        has_cccp = any(isinstance(pool.tensor, CccpPqTensor) for pool in tensor.pools)
-        all_cccp = all(isinstance(pool.tensor, CccpPqTensor) for pool in tensor.pools)
+        self.grouped_weight: MetalMoeWeight | MetalTpqMoeWeight | None = None
+        has_tpq = any(isinstance(pool.tensor, TpqPqTensor) for pool in tensor.pools)
+        all_tpq = all(isinstance(pool.tensor, TpqPqTensor) for pool in tensor.pools)
         if use_grouped:
-            if all_cccp:
-                self.grouped_weight = MetalCccpMoeWeight.from_tensor(tensor)
-            elif not has_cccp:
+            if all_tpq:
+                self.grouped_weight = MetalTpqMoeWeight.from_tensor(tensor)
+            elif not has_tpq:
                 with suppress(UnsupportedGroupedMoeError):
                     self.grouped_weight = MetalMoeWeight.from_tensor(tensor)
         if self.grouped_weight is not None:
@@ -129,20 +129,20 @@ class MlxRoutedLinear:
             source = pool.tensor
             if isinstance(source, NintTensor):
                 weight: (
-                    MetalNintWeight | MetalNint8ZeroWeight | MetalVqWeight | MetalCccpPqWeight
+                    MetalNintWeight | MetalNint8ZeroWeight | MetalVqWeight | MetalTpqPqWeight
                     | MetalMxWeight
                 ) = MetalNintWeight.from_tensor(source)
             elif isinstance(source, Nint8ZeroTensor):
                 weight = MetalNint8ZeroWeight.from_tensor(source)
             elif isinstance(source, _VQ_TYPES):
                 weight = MetalVqWeight.from_tensor(source)
-            elif isinstance(source, CccpPqTensor):
-                weight = MetalCccpPqWeight.from_tensor(source)
+            elif isinstance(source, TpqPqTensor):
+                weight = MetalTpqPqWeight.from_tensor(source)
             elif isinstance(source, MxTensor) and source.dtype == MXFP4_DTYPE:
                 weight = MetalMxWeight.from_tensor(source)
             else:
                 raise TypeError(
-                    "Metal NINTM supports NINT/NVQ/NPQ/NEPQ/CCCP/MXFP4 cohorts; "
+                    "Metal NINTM supports NINT/NVQ/NPQ/NEPQ/TPQ/MXFP4 cohorts; "
                     f"received {type(source).__name__}"
                 )
             expert_ids = np.ascontiguousarray(pool.expert_ids, dtype=np.int32)
@@ -186,12 +186,12 @@ class MlxRoutedLinear:
     ) -> mx.array:
         if self.grouped_weight is not None:
             result = (
-                cccp_grouped_moe_matmul(
+                tpq_grouped_moe_matmul(
                     self.grouped_weight,
                     x,
                     expert_ids,
                 )
-                if isinstance(self.grouped_weight, MetalCccpMoeWeight)
+                if isinstance(self.grouped_weight, MetalTpqMoeWeight)
                 else grouped_moe_matmul(self.grouped_weight, x, expert_ids)
             )
             if self.grouped_projection is not None:
@@ -227,7 +227,7 @@ class MlxRoutedLinear:
         )
         for pool in self.pools:
             candidates = pool.forward(source, ids)
-            if isinstance(pool.weight, MetalCccpPqWeight):
+            if isinstance(pool.weight, MetalTpqPqWeight):
                 selected = candidates
             else:
                 membership = ids[:, :, None] == pool.expert_ids[None, None, :]

@@ -1,4 +1,4 @@
-"""Apple-silicon tests for TPQ2/CCCP packed Metal kernels."""
+"""Apple-silicon tests for TPQ2/TPQ packed Metal kernels."""
 
 from __future__ import annotations
 
@@ -12,25 +12,25 @@ except RuntimeError:
     pytest.skip("Metal device unavailable", allow_module_level=True)
 
 from mfq.formats.tpq import (  # noqa: E402
-    CCCP_W,
-    CCCP_X,
-    CccpInt4Tensor,
-    CccpPqSpec,
-    CccpPqTensor,
+    TPQ_W,
+    TPQ_X,
+    TpqInt4Tensor,
+    TpqPqSpec,
+    TpqPqTensor,
 )
 from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
 from mfq.kernels.metal.tpq import (  # noqa: E402
-    MetalCccpInt4Weight,
-    MetalCccpMoeWeight,
-    MetalCccpPqWeight,
-    cccp_grouped_moe_matmul,
-    cccp_int4_dequantize,
-    cccp_int4_embedding,
-    cccp_int4_grouped_row_matmul,
-    cccp_int4_matmul,
-    cccp_pq_dequantize,
-    cccp_pq_matmul,
-    cccp_pq_routed_matmul,
+    MetalTpqInt4Weight,
+    MetalTpqMoeWeight,
+    MetalTpqPqWeight,
+    tpq_grouped_moe_matmul,
+    tpq_int4_dequantize,
+    tpq_int4_embedding,
+    tpq_int4_grouped_row_matmul,
+    tpq_int4_matmul,
+    tpq_pq_dequantize,
+    tpq_pq_matmul,
+    tpq_pq_routed_matmul,
 )
 
 
@@ -39,7 +39,7 @@ def _array(value: mx.array) -> np.ndarray:
     return np.asarray(value)
 
 
-def _int4_tensor(seed: int, rows: int, columns: int) -> tuple[CccpInt4Tensor, np.ndarray]:
+def _int4_tensor(seed: int, rows: int, columns: int) -> tuple[TpqInt4Tensor, np.ndarray]:
     rng = np.random.default_rng(seed)
     quantized = rng.integers(-8, 8, size=(rows, columns), dtype=np.int16)
     packed = ((quantized[:, 0::2] + 8) | ((quantized[:, 1::2] + 8) << 4)).astype(np.uint8)
@@ -48,7 +48,7 @@ def _int4_tensor(seed: int, rows: int, columns: int) -> tuple[CccpInt4Tensor, np
         quantized.reshape(rows, columns // 64, 64) * scales.astype(np.float32)[..., None]
     ).reshape(rows, columns)
     return (
-        CccpInt4Tensor(
+        TpqInt4Tensor(
             shape=(rows, columns),
             axis=0,
             neuron_len=columns,
@@ -66,9 +66,9 @@ def _pq_tensor(
     columns: int,
     *,
     wide: bool,
-) -> tuple[CccpPqTensor, np.ndarray]:
+) -> tuple[TpqPqTensor, np.ndarray]:
     rng = np.random.default_rng(seed)
-    spec = CCCP_W if wide else CCCP_X
+    spec = TPQ_W if wide else TPQ_X
     codebook = rng.normal(
         0.0,
         0.2,
@@ -83,7 +83,7 @@ def _pq_tensor(
     )
     dense = codebook[indices].reshape(rows, columns)
     return (
-        CccpPqTensor(
+        TpqPqTensor(
             spec=spec,
             shape=(rows, columns),
             axis=0,
@@ -101,10 +101,10 @@ def _packed_pq_tensor(
     columns: int,
     *,
     bits: int,
-) -> tuple[CccpPqTensor, np.ndarray]:
+) -> tuple[TpqPqTensor, np.ndarray]:
     rng = np.random.default_rng(seed)
     entries = 3000 if bits == 12 else 5000
-    spec = CccpPqSpec(
+    spec = TpqPqSpec(
         "w",
         8,
         entries,
@@ -123,7 +123,7 @@ def _packed_pq_tensor(
     )
     dense = codebook[indices].reshape(rows, columns)
     return (
-        CccpPqTensor(
+        TpqPqTensor(
             spec=spec,
             shape=(rows, columns),
             axis=0,
@@ -135,9 +135,9 @@ def _packed_pq_tensor(
     )
 
 
-def test_cccp_int4_matmul_dequantize_and_embedding():
+def test_tpq_int4_matmul_dequantize_and_embedding():
     tensor, dense = _int4_tensor(10, 11, 128)
-    weight = MetalCccpInt4Weight.from_tensor(tensor)
+    weight = MetalTpqInt4Weight.from_tensor(tensor)
     x = (
         np.random.default_rng(11)
         .normal(
@@ -147,7 +147,7 @@ def test_cccp_int4_matmul_dequantize_and_embedding():
         )
         .astype(np.float16)
     )
-    actual = cccp_int4_matmul(weight, x)
+    actual = tpq_int4_matmul(weight, x)
     np.testing.assert_allclose(
         _array(actual),
         (x.astype(np.float32) @ dense.T).astype(np.float16),
@@ -155,23 +155,23 @@ def test_cccp_int4_matmul_dequantize_and_embedding():
         atol=3e-3,
     )
     np.testing.assert_array_equal(
-        _array(cccp_int4_dequantize(weight)),
+        _array(tpq_int4_dequantize(weight)),
         dense.astype(np.float16),
     )
     ids = np.array([[3, 7], [0, 10]], dtype=np.int32)
     np.testing.assert_array_equal(
-        _array(cccp_int4_embedding(weight, ids)),
+        _array(tpq_int4_embedding(weight, ids)),
         dense[ids].astype(np.float16),
     )
 
 
-def test_cccp_int4_grouped_row_matmul_selects_matching_rows():
+def test_tpq_int4_grouped_row_matmul_selects_matching_rows():
     groups = 4
     rank = 3
     tensor, dense = _int4_tensor(14, groups * rank, 128)
-    weight = MetalCccpInt4Weight.from_tensor(tensor)
+    weight = MetalTpqInt4Weight.from_tensor(tensor)
     source = np.random.default_rng(15).normal(size=(2, groups, 128)).astype(np.float16)
-    actual = _array(cccp_int4_grouped_row_matmul(weight, source, groups=groups))
+    actual = _array(tpq_int4_grouped_row_matmul(weight, source, groups=groups))
     expected = np.einsum(
         "bgk,grk->bgr",
         source.astype(np.float32),
@@ -181,9 +181,9 @@ def test_cccp_int4_grouped_row_matmul_selects_matching_rows():
 
 
 @pytest.mark.parametrize("wide", [False, True])
-def test_cccp_pq_matmul_and_dequantize(wide: bool):
+def test_tpq_pq_matmul_and_dequantize(wide: bool):
     tensor, dense = _pq_tensor(20 + wide, 13, 64, wide=wide)
-    weight = MetalCccpPqWeight.from_tensor(tensor)
+    weight = MetalTpqPqWeight.from_tensor(tensor)
     x = (
         np.random.default_rng(22)
         .normal(
@@ -194,21 +194,21 @@ def test_cccp_pq_matmul_and_dequantize(wide: bool):
         .astype(np.float16)
     )
     np.testing.assert_allclose(
-        _array(cccp_pq_matmul(weight, x)),
+        _array(tpq_pq_matmul(weight, x)),
         (x.astype(np.float32) @ dense.T).astype(np.float16),
         rtol=4e-3,
         atol=3e-3,
     )
     np.testing.assert_array_equal(
-        _array(cccp_pq_dequantize(weight)),
+        _array(tpq_pq_dequantize(weight)),
         dense.astype(np.float16),
     )
 
 
 @pytest.mark.parametrize("bits", [12, 14])
-def test_cccp_packed_pq_matmul_and_dequantize(bits: int):
+def test_tpq_packed_pq_matmul_and_dequantize(bits: int):
     tensor, dense = _packed_pq_tensor(100 + bits, 13, 64, bits=bits)
-    weight = MetalCccpPqWeight.from_tensor(tensor)
+    weight = MetalTpqPqWeight.from_tensor(tensor)
     assert weight.indices.dtype == mx.uint8
     assert weight.index_bits == bits
     assert int(weight.indices.nbytes) == (13 * weight.blocks * bits + 7) // 8
@@ -222,18 +222,18 @@ def test_cccp_packed_pq_matmul_and_dequantize(bits: int):
         .astype(np.float16)
     )
     np.testing.assert_allclose(
-        _array(cccp_pq_matmul(weight, x)),
+        _array(tpq_pq_matmul(weight, x)),
         (x.astype(np.float32) @ dense.T).astype(np.float16),
         rtol=4e-3,
         atol=3e-3,
     )
     np.testing.assert_array_equal(
-        _array(cccp_pq_dequantize(weight)),
+        _array(tpq_pq_dequantize(weight)),
         dense.astype(np.float16),
     )
 
 
-def test_cccp_pq_routed_matmul_selects_only_pool_experts():
+def test_tpq_pq_routed_matmul_selects_only_pool_experts():
     experts, output, columns = 3, 7, 64
     tensor, dense = _pq_tensor(
         30,
@@ -241,7 +241,7 @@ def test_cccp_pq_routed_matmul_selects_only_pool_experts():
         columns,
         wide=False,
     )
-    weight = MetalCccpPqWeight.from_tensor(tensor)
+    weight = MetalTpqPqWeight.from_tensor(tensor)
     pool_ids = np.array([1, 4, 6], dtype=np.int32)
     selected = np.array([[4, 2, 6], [1, 6, 0]], dtype=np.int32)
     x = (
@@ -262,7 +262,7 @@ def test_cccp_pq_routed_matmul_selects_only_pool_experts():
                 expected[token, route] = (
                     x[token, route].astype(np.float32) @ dense[start : start + output].T
                 )
-    actual = cccp_pq_routed_matmul(
+    actual = tpq_pq_routed_matmul(
         weight,
         x,
         selected,
@@ -277,7 +277,7 @@ def test_cccp_pq_routed_matmul_selects_only_pool_experts():
     )
 
 
-def test_cccp_p14_routed_matmul_preserves_packed_indices():
+def test_tpq_p14_routed_matmul_preserves_packed_indices():
     experts, output, columns = 3, 7, 64
     tensor, dense = _packed_pq_tensor(
         130,
@@ -285,7 +285,7 @@ def test_cccp_p14_routed_matmul_preserves_packed_indices():
         columns,
         bits=14,
     )
-    weight = MetalCccpPqWeight.from_tensor(tensor)
+    weight = MetalTpqPqWeight.from_tensor(tensor)
     pool_ids = np.array([1, 4, 6], dtype=np.int32)
     selected = np.array([[4, 2, 6], [1, 6, 0]], dtype=np.int32)
     x = (
@@ -306,7 +306,7 @@ def test_cccp_p14_routed_matmul_preserves_packed_indices():
                 expected[token, route] = (
                     x[token, route].astype(np.float32) @ dense[start : start + output].T
                 )
-    actual = cccp_pq_routed_matmul(
+    actual = tpq_pq_routed_matmul(
         weight,
         x,
         selected,
@@ -321,7 +321,7 @@ def test_cccp_p14_routed_matmul_preserves_packed_indices():
     )
 
 
-def test_cccp_heterogeneous_moe_uses_one_u8_u16_dispatch():
+def test_tpq_heterogeneous_moe_uses_one_u8_u16_dispatch():
     output, columns = 7, 64
     ids8 = np.array([0, 2], dtype=np.int32)
     ids16 = np.array([1, 3], dtype=np.int32)
@@ -344,7 +344,7 @@ def test_cccp_heterogeneous_moe_uses_one_u8_u16_dispatch():
             NintMoePool(expert_ids=ids16, tensor=tensor16),
         ),
     )
-    weight = MetalCccpMoeWeight.from_tensor(tensor)
+    weight = MetalTpqMoeWeight.from_tensor(tensor)
     selected = np.array([[3, 0], [2, 1]], dtype=np.int32)
     x = (
         np.random.default_rng(43)
@@ -370,7 +370,7 @@ def test_cccp_heterogeneous_moe_uses_one_u8_u16_dispatch():
             for token in range(2)
         ]
     )
-    actual = cccp_grouped_moe_matmul(weight, x, selected)
+    actual = tpq_grouped_moe_matmul(weight, x, selected)
     np.testing.assert_allclose(
         _array(actual),
         expected.astype(np.float16),
@@ -379,7 +379,7 @@ def test_cccp_heterogeneous_moe_uses_one_u8_u16_dispatch():
     )
 
 
-def test_cccp_heterogeneous_moe_keeps_p12_p14_streams_packed():
+def test_tpq_heterogeneous_moe_keeps_p12_p14_streams_packed():
     output, columns = 7, 64
     ids12 = np.array([0, 2], dtype=np.int32)
     ids14 = np.array([1, 3], dtype=np.int32)
@@ -402,7 +402,7 @@ def test_cccp_heterogeneous_moe_keeps_p12_p14_streams_packed():
             NintMoePool(expert_ids=ids14, tensor=tensor14),
         ),
     )
-    weight = MetalCccpMoeWeight.from_tensor(tensor)
+    weight = MetalTpqMoeWeight.from_tensor(tensor)
     assert int(weight.indices_packed.nbytes) == (
         int(tensor12.indices.nbytes) + int(tensor14.indices.nbytes)
     )
@@ -431,7 +431,7 @@ def test_cccp_heterogeneous_moe_keeps_p12_p14_streams_packed():
             for token in range(2)
         ]
     )
-    actual = cccp_grouped_moe_matmul(weight, x, selected)
+    actual = tpq_grouped_moe_matmul(weight, x, selected)
     np.testing.assert_allclose(
         _array(actual),
         expected.astype(np.float16),

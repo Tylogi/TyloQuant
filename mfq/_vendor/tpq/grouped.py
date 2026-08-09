@@ -730,7 +730,7 @@ def moe_mlp_grouped_situ(
     situ_beta: float = 4.0,
     situ_linear_beta: float | None = 25.0,
 ) -> torch.Tensor:
-    """Kimi/CCCP 的稳定直连入口：混档 VQ MoE + SITU 激活。
+    """Kimi/TPQ 的稳定直连入口：混档 VQ MoE + SITU 激活。
 
     保留简单的位置参数签名，量化器运行时无需了解 TPQ 内部的通用
     ``activation``/``limit`` 选项，也不会因重构通用分组算子而回退。

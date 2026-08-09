@@ -126,7 +126,7 @@ def _default_expert_kind(manifest: dict[str, Any]) -> str:
             return kind
     if kinds:
         return next(iter(kinds))
-    raise ValueError("cccp.json 的 quant.vq 为空")
+    raise ValueError("tpq.json 的 quant.vq 为空")
 
 
 def _expert_kind(
@@ -213,7 +213,7 @@ def _slot_bytes(
             total += (indices * bits + 7) // 8
         return total
     base = kind.rstrip("z")
-    # 单字符层配额需要同时区分 v 与 vv；历史 CCCP 清单以大写
+    # 单字符层配额需要同时区分 v 与 vv；历史 TPQ 清单以大写
     # ``V`` 表示 vv。容量规划只应规范化存储档位，不应依赖模型架构。
     if base == "V" and "vv" in manifest["quant"]["vq"]:
         base = "vv"
@@ -274,7 +274,7 @@ def expert_plan_bytes(
 def _required_files(root: Path, manifest: dict[str, Any]) -> list[Path]:
     expert_files = _expert_files(manifest)
     names = {
-        "tpq.json" if (root / "tpq.json").is_file() else "cccp.json",
+        "tpq.json",
         *expert_files.values(),
     }
     tokenizer_files = manifest.get("tokenizer_files")

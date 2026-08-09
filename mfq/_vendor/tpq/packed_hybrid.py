@@ -2,7 +2,7 @@
 
 与通用 ``ExpertPool`` 的主要区别：
 
-* 9..15-bit 索引在 RAM 中保持 CCCP 原始打包格式，不展开为 uint16；
+* 9..15-bit 索引在 RAM 中保持 TPQ 原始打包格式，不展开为 uint16；
 * 按专家签名预分配稳定 GPU 槽，换专家只覆盖槽内容；
 * 上一个 token 的路由在后台预取，需求路径按层等待；
 * Gate/Up、gated activation、Down、路由加权直接使用公共融合 CUDA 核。
@@ -1504,7 +1504,7 @@ class PackedHybridPool:
                 self.store.man.expert_files
             ):
                 raise RuntimeError(
-                    "projection-VQ CCCP 专家清单未收敛："
+                    "projection-VQ TPQ 专家清单未收敛："
                     f"声明 {declared_layers} 层，"
                     f"实际只有 {len(self.store.man.expert_files)} 层"
                 )

@@ -1,13 +1,13 @@
-"""TPQ 推理：DeepSeek-V4（CCCP 产物）前向模型。
+"""TPQ 推理：DeepSeek-V4（TPQ 产物）前向模型。
 
-加载 "cccp-1" 格式（cccp.json + dense.safetensors + experts.L*.safetensors），
-前向复用 CCCP/dsv4.py 的公共数学件（hc_pre/hc_post/hc_head/hc_split/rmsnorm/
+加载 "tpq-1" 格式（tpq.json + dense.safetensors + experts.L*.safetensors），
+前向复用 TPQ/dsv4.py 的公共数学件（hc_pre/hc_post/hc_head/hc_split/rmsnorm/
 rope_apply/compressor_*/attn_* 的无权重依赖部分）；权重路径：
   - 大 dense 矩阵（wq_a/wq_b/wkv/wo_a/wo_b/shared/head/embed）：Int4Weight 打包驻留
     （显存/内存），经 _linear 走 LUT 反量化矩阵乘；
   - 小权重（compressor/norms/hc/gate/attn_sink/ape/tid2eid）：f32 原样；
   - routed 专家：ExpertPool 两级 LRU 的 VQWeight（LUT 免还原矩阵乘）。
-与 CCCP/dsv4.py 的关系：数值公式一致；为接入 int4/VQ 权重，线性层经本文件的
+与 TPQ/dsv4.py 的关系：数值公式一致；为接入 int4/VQ 权重，线性层经本文件的
 _linear 分派（F.linear ↔ Int4Weight.matmul_T ↔ VQWeight.matmul_T）。
 """
 
@@ -151,7 +151,7 @@ def _parse_dense_bf16(value: str | None = None) -> frozenset[str]:
 
 
 def _tpq_lin(x: torch.Tensor, w) -> torch.Tensor:
-    """安装进 CCCP.dsv4._lin 的分派：Int4Weight/VQWeight 走 LUT 矩阵乘，其余 F.linear。
+    """安装进 TPQ.dsv4._lin 的分派：Int4Weight/VQWeight 走 LUT 矩阵乘，其余 F.linear。
     权重类的 matmul_T 只收 2D 输入，dsv4 的 3D [B,T,D] 在此压平再还原；
     dense bf16 常驻后：matmul 与层间 hidden 均保持 bf16；需要稳定归约的算子
     在各自内部局部升到 f32。"""
@@ -182,7 +182,7 @@ def _tpq_lin(x: torch.Tensor, w) -> torch.Tensor:
 from . import dsv4 as _dsv4
 def _o_proj_tpq(o: torch.Tensor, w: dict, cfg) -> torch.Tensor:
     """分组 LoRA O 的实现：Int4Weight 走逐组 dequant_rows；bf16 常驻张量走原生路径
-    （dtype 对齐）。数值与 CCCP.dsv4._o_proj 一致。"""
+    （dtype 对齐）。数值与 TPQ.dsv4._o_proj 一致。"""
     wo_a = w["wo_a"]
     if not isinstance(wo_a, (Int4Weight, BlockFP8Weight)):
         if o.dtype != wo_a.dtype:
@@ -892,7 +892,7 @@ def _shared_expert_mlp_tpq(x, w, limit):
 
 
 class DSV4TPQModel:
-    """DeepSeek-V4 CCCP 产物的推理模型（CPU/CUDA，内存显存自动适配由外层 Engine 定）。"""
+    """DeepSeek-V4 TPQ 产物的推理模型（CPU/CUDA，内存显存自动适配由外层 Engine 定）。"""
 
     def __init__(self, root: str, cache_gb: float = 16.0, max_ctx: int = 2048,
                  device: str = "cpu", vram_cache_gb: float = 4.0,
@@ -1267,7 +1267,7 @@ class DSV4TPQModel:
         self._layers[i] = w
         return w
 
-    # ---- 前向（数值与 CCCP/dsv4.py 一致；线性层经 _linear 分派） ----
+    # ---- 前向（数值与 TPQ/dsv4.py 一致；线性层经 _linear 分派） ----
     def _rope(self, i: int):
         return self.rope_cmp if self.ratios[i] else self.rope_base
 
@@ -2985,7 +2985,7 @@ class DSV4TPQModel:
     ) -> torch.Tensor:
         """批量增量注意力（投机验证用）：T 个 token（positions pos0..pos0+T-1）一次前向。
 
-        数学与 CCCP.dsv4.attn_decode 逐步等价：环形窗自因果掩码（含窗约束）、
+        数学与 TPQ.dsv4.attn_decode 逐步等价：环形窗自因果掩码（含窗约束）、
         压缩槽可见性 n < (qpos+1)//ratio、sink 在分母、输出末 64 维反旋转。
         Compressor 为每 token 顺序状态机（逐 token 调用 compressor_decode），
         并把每步的 ckv/cscore 快照记入 spec["steps"]（供 spec_commit 回滚）。

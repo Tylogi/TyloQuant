@@ -129,7 +129,7 @@ configure_file(
 add_library(mfq-metal-runtime STATIC
     deepseek_v4_model.cpp
     mfq_container.cpp
-    mlx_cccp.cpp
+    mlx_tpq.cpp
     mlx_tensor.cpp
     mlx_grouped_linear.cpp
     mlx_deepseek_v4_attention.cpp
@@ -406,22 +406,22 @@ add_test(
     COMMAND mfq-metal-grouped-linear-test
 )
 
-add_executable(mfq-metal-cccp-test
-    mlx_cccp_test.cpp
+add_executable(mfq-metal-tpq-test
+    mlx_tpq_test.cpp
 )
 target_link_libraries(
-    mfq-metal-cccp-test PRIVATE
+    mfq-metal-tpq-test PRIVATE
     mfq-metal-runtime
 )
 target_compile_features(
-    mfq-metal-cccp-test PRIVATE cxx_std_20)
+    mfq-metal-tpq-test PRIVATE cxx_std_20)
 set_target_properties(
-    mfq-metal-cccp-test PROPERTIES
+    mfq-metal-tpq-test PROPERTIES
     BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
 )
 add_test(
-    NAME mfq-metal-cccp-test
-    COMMAND mfq-metal-cccp-test
+    NAME mfq-metal-tpq-test
+    COMMAND mfq-metal-tpq-test
 )
 
 add_executable(mfq-metal-deepseek-v4-hc-test

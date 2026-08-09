@@ -1,4 +1,4 @@
-"""Kimi K3 text inference runtime for CCCP expert archives.
+"""Kimi K3 text inference runtime for TPQ expert archives.
 
 The first production path is one CUDA device with source-native BF16 dense
 weights resident on GPU and routed experts supplied by the existing TPQ

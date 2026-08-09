@@ -11,16 +11,15 @@
 namespace mfq::metal {
 
 bool is_tpq_dtype(std::string_view dtype) noexcept;
-bool is_cccp_dtype(std::string_view dtype) noexcept;
 
-// Native CCCP symmetric int4-g64 matrix.
+// Native TPQ symmetric int4-g64 matrix.
 //
 // The serialized uint8 nibble stream and FP16 group scales stay packed on
 // Metal. Small-M calls decode in the projection kernel; matmul() switches to
 // a temporary dense MLX GEMM at M >= 64.
-class MlxCccpInt4Weight {
+class MlxTpqInt4Weight {
 public:
-    static MlxCccpInt4Weight from_blob(
+    static MlxTpqInt4Weight from_blob(
         const std::vector<std::uint8_t>& blob);
 
     mlx::core::array dequantize(
@@ -66,7 +65,7 @@ public:
     }
 
 private:
-    MlxCccpInt4Weight(
+    MlxTpqInt4Weight(
         mlx::core::array packed,
         mlx::core::array scales,
         int input_size,
@@ -95,15 +94,15 @@ private:
     int groups_ = 0;
 };
 
-// Native CCCP learned product-vector matrix.
+// Native TPQ learned product-vector matrix.
 //
-// CCCP-X/W/V/VV use fixed 8/4-component code vectors and 256/4096-entry
+// TPQ-X/W/V/VV use fixed 8/4-component code vectors and 256/4096-entry
 // codebooks. Index storage may be 8, 12, 14, or 16 bits as permitted by the
 // public tier. The index bitstream remains packed; the shared codebook is
 // retained as FP16, matching the production MLX runtime.
-class MlxCccpPqWeight {
+class MlxTpqPqWeight {
 public:
-    static MlxCccpPqWeight from_blob(
+    static MlxTpqPqWeight from_blob(
         std::string_view dtype,
         const std::vector<std::uint8_t>& blob);
 
@@ -150,7 +149,7 @@ public:
     }
 
 private:
-    MlxCccpPqWeight(
+    MlxTpqPqWeight(
         mlx::core::array indices,
         mlx::core::array codebook,
         std::string format_label,
@@ -184,10 +183,5 @@ private:
     int entries_ = 0;
     int index_bits_ = 0;
 };
-
-// Canonical public names. The implementation class names remain aliases so
-// existing C++ callers and old CCCP-labelled artifacts keep working.
-using MlxTpqInt4Weight = MlxCccpInt4Weight;
-using MlxTpqPqWeight = MlxCccpPqWeight;
 
 } // namespace mfq::metal

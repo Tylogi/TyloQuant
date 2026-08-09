@@ -1,8 +1,8 @@
 """DeepSeek-V4（deepseek_v4，DeepSeek-V4-Flash-DSpark）纯 PyTorch 前向模块。
 
-用途：CCCP 量化流水线的路由摘选（profile）、KL 评估与后续推理复用。
+用途：TPQ 量化流水线的路由摘选（profile）、KL 评估与后续推理复用。
 逐行对照官方参考实现 inference/model.py（+ kernel.py），全 f32 计算
-（RMSNorm 内部亦 fp32），只依赖 torch（+ CCCP.fp4io），不依赖 tilelang 等官方包。
+（RMSNorm 内部亦 fp32），只依赖 torch（+ TPQ.fp4io），不依赖 tilelang 等官方包。
 
 文件结构：
   1) SafeFile / DSV4Checkpoint —— safetensors 纯文件 I/O 读取（8 字节头长 + JSON 头
@@ -27,7 +27,7 @@
      embed 复制到 4 个 hc 通道（官方 model.py generate 流程）；结尾 hc_head（4 通道
      加权求和，无 sinkhorn）→ final RMSNorm → head。MTP/DSpark 层（43-45）整块跳过。
   3) DSV4Model —— prefill 批式 + decode 单步（KV 环形缓存 + 压缩槽位 + 增量 Compressor）。
-  4) main() 自包含自检（python -m CCCP.dsv4）：微小合成模型对照逐元素朴素实现。
+  4) main() 自包含自检（python -m TPQ.dsv4）：微小合成模型对照逐元素朴素实现。
 
 与官方实现的偏离（语义不变或精度更高，均已在自检中覆盖）：
   - 省略全部 QAT quant-dequant 模拟（kv 前 448 维 fp8 块 64、indexer Hadamard+fp4）：
@@ -790,7 +790,7 @@ class DSV4Model:
 
 
 # =====================================================================
-# 自检：微小合成模型对照逐元素朴素实现（python -m CCCP.dsv4）
+# 自检：微小合成模型对照逐元素朴素实现（python -m TPQ.dsv4）
 # =====================================================================
 
 def _naive_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:

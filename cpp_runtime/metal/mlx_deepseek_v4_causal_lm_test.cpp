@@ -211,7 +211,7 @@ std::vector<std::uint8_t> zero_nintm_blob(
     return blob;
 }
 
-std::vector<std::uint8_t> zero_cccp_nintm_blob(
+std::vector<std::uint8_t> zero_tpq_nintm_blob(
     int output_per_expert,
     int input) {
     constexpr int vector_size = 8;
@@ -221,8 +221,8 @@ std::vector<std::uint8_t> zero_cccp_nintm_blob(
         output_per_expert > 0 &&
             input > 0 &&
             input % vector_size == 0,
-        "invalid synthetic CCCP NINTM shape");
-    const std::string dtype = "CCCP-X";
+        "invalid synthetic TPQ NINTM shape");
+    const std::string dtype = "TPQ-X";
     std::vector<std::uint8_t> blob{
         'N', 'I', 'M', '2',
     };
@@ -426,7 +426,7 @@ void write_causal_lm_container(
                     binding.name,
                     "NINTM",
                     streamed_experts
-                    ? zero_cccp_nintm_blob(
+                    ? zero_tpq_nintm_blob(
                           static_cast<int>(
                               binding.shape.at(1)),
                           static_cast<int>(
@@ -448,7 +448,7 @@ void write_causal_lm_container(
         }
     }
     const json manifest{
-        {"format", "cccp-1"},
+        {"format", "tpq-1"},
         {"config", config_json},
         {
             "tiers_per_layer",
@@ -467,7 +467,7 @@ void write_causal_lm_container(
         2);
     write_string(
         stream,
-        "deepseek_v4-cccp-mfq");
+        "deepseek_v4-tpq-mfq");
     write_scalar<std::uint32_t>(
         stream,
         2);
@@ -476,10 +476,10 @@ void write_causal_lm_container(
         "source_format");
     write_string(
         stream,
-        json("cccp-1").dump());
+        json("tpq-1").dump());
     write_string(
         stream,
-        "cccp_manifest");
+        "tpq_manifest");
     write_string(
         stream,
         manifest.dump());

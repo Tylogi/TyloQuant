@@ -1,4 +1,4 @@
-"""从 cccp.json 生成统一执行配置。"""
+"""从 tpq.json 生成统一执行配置。"""
 
 from __future__ import annotations
 

@@ -24,13 +24,13 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
     ) from exc
 
 from mfq.formats import io
-from mfq.formats.tpq import CccpPqSpec
+from mfq.formats.tpq import TpqPqSpec
 from mfq.formats.moe import NintMoeTensor
 from mfq.kernels.metal.tpq import (
-    MetalCccpMoeWeight,
-    MetalCccpPqWeight,
-    cccp_grouped_moe_matmul,
-    cccp_int4_grouped_row_matmul,
+    MetalTpqMoeWeight,
+    MetalTpqPqWeight,
+    tpq_grouped_moe_matmul,
+    tpq_int4_grouped_row_matmul,
 )
 from mfq.kernels.metal.deepseek_v4 import (
     attention_dsv4_sparse,
@@ -50,7 +50,7 @@ from mfq.kernels.metal.moe_ops import (
 from mfq.kernels.metal.ops import rms_norm
 from mfq.kernels.metal.sampling import sample as _sample
 from mfq.kernels.metal.vq import signed_hadamard
-from mfq.runtime.mlx_tpq import MlxCccpInt4Linear
+from mfq.runtime.mlx_tpq import MlxTpqInt4Linear
 from mfq.runtime.mlx_linear import (
     MlxDenseLinear,
     MlxLinearGroup,
@@ -208,7 +208,7 @@ class MlxDeepseekV4Config:
 
 @dataclass(frozen=True)
 class MlxDeepseekV4Names:
-    """Canonical names emitted by the CCCP-to-MFQ importer."""
+    """Canonical names emitted by the TPQ-to-MFQ importer."""
 
     embedding: str = "embed.weight"
     output_norm: str = "norm.weight"
@@ -664,7 +664,7 @@ class _MlxDsv4LayerState:
         return tuple(result)
 
 
-_CCCP_PQ_HEADER = struct.Struct("<4sBBBBiiII")
+_TPQ_PQ_HEADER = struct.Struct("<4sBBBBiiII")
 
 
 class _UnsupportedStreamedExpertsError(TypeError):
@@ -672,8 +672,8 @@ class _UnsupportedStreamedExpertsError(TypeError):
 
 
 @dataclass(frozen=True)
-class _MlxCccpStreamPool:
-    spec: CccpPqSpec
+class _MlxTpqStreamPool:
+    spec: TpqPqSpec
     codebook: mx.array
     indices_offset: int
     rows_per_expert: int
@@ -689,8 +689,8 @@ class _MlxCccpStreamPool:
         return self.rows_per_expert * self.blocks
 
 
-class _MlxCccpExpertResidency:
-    """Bounded per-expert Metal residency over mmap-backed CCCP records."""
+class _MlxTpqExpertResidency:
+    """Bounded per-expert Metal residency over mmap-backed TPQ records."""
 
     def __init__(
         self,
@@ -706,18 +706,18 @@ class _MlxCccpExpertResidency:
         self.cache_limit = int(float(cache_gb) * (1 << 30))
         self.cache: OrderedDict[
             tuple[str, int],
-            MetalCccpPqWeight,
+            MetalTpqPqWeight,
         ] = OrderedDict()
         self.cache_nbytes = 0
         self.projections: dict[
             str,
-            dict[int, tuple[_MlxCccpStreamPool, int]],
+            dict[int, tuple[_MlxTpqStreamPool, int]],
         ] = {}
 
     def _parse_projection(
         self,
         name: str,
-    ) -> dict[int, tuple[_MlxCccpStreamPool, int]]:
+    ) -> dict[int, tuple[_MlxTpqStreamPool, int]]:
         cached = self.projections.get(name)
         if cached is not None:
             return cached
@@ -728,19 +728,19 @@ class _MlxCccpExpertResidency:
         start = int(record.offset)
         end = start + int(record.nbytes)
         if start + io._NINT_MOE_HDR.size > end:
-            raise ValueError(f"truncated native CCCP expert header: {name}")
+            raise ValueError(f"truncated native TPQ expert header: {name}")
         magic, experts, rows_per_expert, columns, pool_count = io._NINT_MOE_HDR.unpack_from(
             source, start
         )
         if magic != b"NIM2" or int(experts) != self.experts:
             raise _UnsupportedStreamedExpertsError(
-                f"expert record {name!r} is not a native CCCP NIM2 container"
+                f"expert record {name!r} is not a native TPQ NIM2 container"
             )
         offset = start + io._NINT_MOE_HDR.size
-        result: dict[int, tuple[_MlxCccpStreamPool, int]] = {}
+        result: dict[int, tuple[_MlxTpqStreamPool, int]] = {}
         for _ in range(int(pool_count)):
             if offset + io._NINT_MOE_POOL_V2_HDR.size > end:
-                raise ValueError(f"truncated native CCCP pool header: {name}")
+                raise ValueError(f"truncated native TPQ pool header: {name}")
             (
                 expert_count,
                 dtype_nbytes,
@@ -754,7 +754,7 @@ class _MlxCccpExpertResidency:
             runtime_end = dtype_end + int(runtime_nbytes)
             payload_end = runtime_end + int(payload_nbytes)
             if expert_count <= 0 or dtype_nbytes <= 0 or dtype_nbytes > 32 or payload_end > end:
-                raise ValueError(f"invalid native CCCP pool metadata: {name}")
+                raise ValueError(f"invalid native TPQ pool metadata: {name}")
             expert_ids = np.frombuffer(
                 source,
                 dtype="<i4",
@@ -762,16 +762,13 @@ class _MlxCccpExpertResidency:
                 offset=offset,
             )
             dtype = bytes(source[ids_end:dtype_end]).decode("ascii")
-            if not (
-                dtype.startswith("TPQ-") or
-                dtype.startswith("CCCP-")
-            ) or runtime_nbytes:
+            if not dtype.startswith("TPQ-") or runtime_nbytes:
                 raise _UnsupportedStreamedExpertsError(
                     f"expert record {name!r} contains non-TPQ cohorts"
                 )
             payload_start = runtime_end
-            if payload_start + _CCCP_PQ_HEADER.size > payload_end:
-                raise ValueError(f"truncated native CCCP payload: {name}")
+            if payload_start + _TPQ_PQ_HEADER.size > payload_end:
+                raise ValueError(f"truncated native TPQ payload: {name}")
             (
                 pq_magic,
                 pq_version,
@@ -782,7 +779,7 @@ class _MlxCccpExpertResidency:
                 neuron_len,
                 ndim,
                 entries,
-            ) = _CCCP_PQ_HEADER.unpack_from(source, payload_start)
+            ) = _TPQ_PQ_HEADER.unpack_from(source, payload_start)
             if (
                 pq_magic != b"CPQ1"
                 or pq_version != 1
@@ -791,20 +788,16 @@ class _MlxCccpExpertResidency:
                 or ndim != 2
             ):
                 raise _UnsupportedStreamedExpertsError(
-                    f"expert record {name!r} is not byte-aligned CCCP"
+                    f"expert record {name!r} is not byte-aligned TPQ"
                 )
-            spec = CccpPqSpec(
-                tier=(
-                    dtype.removeprefix("TPQ-")
-                    .removeprefix("CCCP-")
-                    .lower()
-                ),
+            spec = TpqPqSpec(
+                tier=dtype.removeprefix("TPQ-").lower(),
                 vector_size=int(vector_size),
                 codebook_entries=int(entries),
             )
             if spec.index_bits != int(index_bits):
-                raise ValueError(f"native CCCP tier metadata is inconsistent: {name}")
-            payload_offset = payload_start + _CCCP_PQ_HEADER.size
+                raise ValueError(f"native TPQ tier metadata is inconsistent: {name}")
+            payload_offset = payload_start + _TPQ_PQ_HEADER.size
             shape = tuple(int(value) for value in struct.unpack_from("<2q", source, payload_offset))
             payload_offset += 16
             rows = int(struct.unpack_from("<I", source, payload_offset)[0])
@@ -819,11 +812,11 @@ class _MlxCccpExpertResidency:
                 or int(neuron_len) != shape[1]
                 or shape[1] % spec.vector_size
             ):
-                raise ValueError(f"native CCCP pool shape mismatch in {name}")
+                raise ValueError(f"native TPQ pool shape mismatch in {name}")
             codebook_count = spec.codebook_entries * spec.vector_size
             codebook_end = payload_offset + codebook_count * 4
             if codebook_end > payload_end:
-                raise ValueError(f"truncated native CCCP codebook: {name}")
+                raise ValueError(f"truncated native TPQ codebook: {name}")
             codebook = np.frombuffer(
                 source,
                 dtype="<f4",
@@ -833,8 +826,8 @@ class _MlxCccpExpertResidency:
             index_count = shape[0] * (shape[1] // spec.vector_size)
             expected_end = codebook_end + index_count * (index_bits // 8)
             if expected_end != payload_end:
-                raise ValueError(f"native CCCP index payload size mismatch: {name}")
-            pool = _MlxCccpStreamPool(
+                raise ValueError(f"native TPQ index payload size mismatch: {name}")
+            pool = _MlxTpqStreamPool(
                 spec=spec,
                 codebook=mx.array(np.ascontiguousarray(codebook, dtype=np.float16)),
                 indices_offset=codebook_end,
@@ -845,11 +838,11 @@ class _MlxCccpExpertResidency:
             for local, expert in enumerate(expert_ids):
                 expert_id = int(expert)
                 if expert_id in result:
-                    raise ValueError(f"duplicate native CCCP expert {expert_id}: {name}")
+                    raise ValueError(f"duplicate native TPQ expert {expert_id}: {name}")
                 result[expert_id] = (pool, local)
             offset = payload_end
         if offset != end:
-            raise ValueError(f"invalid native CCCP expert tail: {name}")
+            raise ValueError(f"invalid native TPQ expert tail: {name}")
         self.projections[name] = result
         return result
 
@@ -864,12 +857,12 @@ class _MlxCccpExpertResidency:
         self,
         name: str,
         expert: int,
-    ) -> MetalCccpPqWeight:
+    ) -> MetalTpqPqWeight:
         projection = self._parse_projection(name)
         try:
             pool, local = projection[int(expert)]
         except KeyError as exc:
-            raise KeyError(f"native CCCP expert {expert} is absent from {name}") from exc
+            raise KeyError(f"native TPQ expert {expert} is absent from {name}") from exc
         dtype = np.dtype(np.uint8 if pool.spec.index_bits == 8 else "<u2")
         count = pool.indices_per_expert
         offset = pool.indices_offset + int(local) * count * dtype.itemsize
@@ -880,7 +873,7 @@ class _MlxCccpExpertResidency:
             offset=offset,
         ).reshape((pool.rows_per_expert, pool.blocks))
         index_dtype = mx.uint8 if pool.spec.index_bits == 8 else mx.uint16
-        return MetalCccpPqWeight(
+        return MetalTpqPqWeight(
             indices=mx.array(np.ascontiguousarray(indices)).astype(index_dtype),
             codebook=pool.codebook,
             out=pool.rows_per_expert,
@@ -894,8 +887,8 @@ class _MlxCccpExpertResidency:
         self,
         name: str,
         expert_ids: tuple[int, ...],
-    ) -> tuple[tuple[int, MetalCccpPqWeight], ...]:
-        active: list[tuple[int, MetalCccpPqWeight]] = []
+    ) -> tuple[tuple[int, MetalTpqPqWeight], ...]:
+        active: list[tuple[int, MetalTpqPqWeight]] = []
         for expert in expert_ids:
             key = (name, int(expert))
             weight = self.cache.pop(key, None)
@@ -923,8 +916,8 @@ class _MlxCccpExpertResidency:
         *,
         out_per_expert: int,
         neuron_len: int,
-    ) -> MetalCccpMoeWeight:
-        return MetalCccpMoeWeight.from_expert_weights(
+    ) -> MetalTpqMoeWeight:
+        return MetalTpqMoeWeight.from_expert_weights(
             self.weights(name, expert_ids),
             experts=self.experts,
             out_per_expert=out_per_expert,
@@ -946,7 +939,7 @@ class MlxDeepseekV4MoE:
         config: MlxDeepseekV4Config,
         layer: int,
         available: np.ndarray,
-        residency: _MlxCccpExpertResidency | None,
+        residency: _MlxTpqExpertResidency | None,
     ) -> None:
         prefix = f"layers.{layer}.ffn"
         self.config = config
@@ -1088,7 +1081,7 @@ class MlxDeepseekV4MoE:
                     out_per_expert=2 * config.moe_inter,
                     neuron_len=config.hidden,
                 )
-                gate_up = cccp_grouped_moe_matmul(
+                gate_up = tpq_grouped_moe_matmul(
                     gate_up_weight,
                     source[start:end],
                     chunk_ids,
@@ -1105,7 +1098,7 @@ class MlxDeepseekV4MoE:
                     out_per_expert=config.hidden,
                     neuron_len=config.moe_inter,
                 )
-                down = cccp_grouped_moe_matmul(
+                down = tpq_grouped_moe_matmul(
                     down_weight,
                     hidden,
                     chunk_ids,
@@ -1395,8 +1388,8 @@ class MlxDeepseekV4Attention:
         batch, tokens = map(int, value.shape[:2])
         input_width = config.n_heads * config.head_dim // config.o_groups
         grouped = value.reshape((batch, tokens, config.o_groups, input_width))
-        if isinstance(self.wo_a, MlxCccpInt4Linear):
-            low_rank = cccp_int4_grouped_row_matmul(
+        if isinstance(self.wo_a, MlxTpqInt4Linear):
+            low_rank = tpq_int4_grouped_row_matmul(
                 self.wo_a.packed_weight,
                 grouped,
                 groups=config.o_groups,
@@ -1506,7 +1499,7 @@ class _MlxDeepseekV4Layer:
         max_context: int,
         rope_base: tuple[mx.array, mx.array],
         rope_compressed: tuple[mx.array, mx.array],
-        residency: _MlxCccpExpertResidency | None,
+        residency: _MlxTpqExpertResidency | None,
     ) -> None:
         prefix = f"layers.{index}"
         self.config = config
@@ -1659,7 +1652,7 @@ class MlxDeepseekV4:
         )
         self._availability = self._expert_availability()
         self.expert_residency = (
-            _MlxCccpExpertResidency(
+            _MlxTpqExpertResidency(
                 model.tensors,
                 cache_gb=expert_cache_gb,
                 experts=config.n_experts,
@@ -1684,13 +1677,9 @@ class MlxDeepseekV4:
         header, tensors = io.load_mmap(path) if mmap else io.load(path)
         model = MlxNintModel(tensors)
         try:
-            manifest = header.extra.get(
-                "tpq_manifest",
-                header.extra.get("cccp_manifest"),
-            )
+            manifest = header.extra.get("tpq_manifest")
             if (
-                header.extra.get("source_format")
-                not in {"tpq-1", "cccp-1"}
+                header.extra.get("source_format") != "tpq-1"
                 or not isinstance(manifest, dict)
             ):
                 raise ValueError(

@@ -12,10 +12,9 @@ import numpy as np
 import torch
 
 from mfq.calibration.artifact import ExpertPrecision, nint_expert_precision
-from mfq.formats.tpq import CccpPqTensor
+from mfq.formats.tpq import TpqPqTensor
 from mfq.formats.tpq import (
     TPQ_PQ_SPECS_BY_LABEL,
-    legacy_cccp_dtype,
     normalize_tpq_dtype,
 )
 from mfq.formats.moe import NintMoePool, NintMoeTensor
@@ -46,10 +45,10 @@ from mfq.formats.nvq1_l import (
 from mfq.formats.nvq1_s import Nvq1STensor, pack_nvq1_s_banked_codebook
 from mfq.quantize.nepq import NepqQuantConfig, quantize_nepq_fixed
 from mfq.quantize.tpq import (
-    CccpKmeansConfig,
-    dequantize_cccp_pq,
-    quantize_cccp_pq_fixed,
-    train_cccp_pq,
+    TpqKmeansConfig,
+    dequantize_tpq_pq,
+    quantize_tpq_pq_fixed,
+    train_tpq_pq,
 )
 from mfq.quantize.nint_quant import NintTensor
 from mfq.quantize.nint_quant import dequantize as dequantize_nint
@@ -154,9 +153,6 @@ def _artifact_value(
             return artifacts[precision]
         if precision.family in artifacts:
             return artifacts[precision.family]
-        legacy_family = legacy_cccp_dtype(precision.family)
-        if legacy_family in artifacts:
-            return artifacts[legacy_family]
         if precision.artifact is not None and precision.artifact in artifacts:
             return artifacts[precision.artifact]
     path = _artifact_path(precision, artifact_root)
@@ -363,7 +359,7 @@ def _quantize_flat_cohort(
         )
     if family in TPQ_PQ_SPECS_BY_LABEL:
         spec = TPQ_PQ_SPECS_BY_LABEL[family]
-        config = CccpKmeansConfig(
+        config = TpqKmeansConfig(
             iterations=_option_int(precision, "iterations", 12),
             restarts=_option_int(precision, "restarts", 2),
             sample_points=_option_int(precision, "sample_points", 100_000),
@@ -374,14 +370,14 @@ def _quantize_flat_cohort(
         )
         weight = torch.as_tensor(rows, dtype=torch.float32)
         if artifact is None:
-            tensor, _ = train_cccp_pq(
+            tensor, _ = train_tpq_pq(
                 weight,
                 spec,
                 config=config,
                 device=device,
             )
             return tensor
-        return quantize_cccp_pq_fixed(
+        return quantize_tpq_pq_fixed(
             weight,
             spec,
             np.asarray(artifact, dtype=np.float32),
@@ -585,8 +581,8 @@ def _dequantize_pool(tensor: object) -> np.ndarray:
         from mfq.formats.nepq import dequantize_nepq
 
         return dequantize_nepq(tensor)
-    if isinstance(tensor, CccpPqTensor):
-        return dequantize_cccp_pq(tensor)
+    if isinstance(tensor, TpqPqTensor):
+        return dequantize_tpq_pq(tensor)
     if isinstance(tensor, NvqJscTensor):
         return dequantize_nvq_jsc(tensor)
     if isinstance(tensor, NvqTensor):

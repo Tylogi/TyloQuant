@@ -19,12 +19,12 @@ import torch
 from safetensors import safe_open
 
 from mfq.formats.tpq import (
-    CccpPqSpec,
-    cccp_int4_payload_nbytes,
-    cccp_pq_payload_nbytes,
-    pack_cccp_indices,
-    pack_cccp_int4_prefix,
-    pack_cccp_pq_prefix,
+    TpqPqSpec,
+    tpq_int4_payload_nbytes,
+    tpq_pq_payload_nbytes,
+    pack_tpq_indices,
+    pack_tpq_int4_prefix,
+    pack_tpq_pq_prefix,
 )
 from mfq.formats.header import MFQ_MAGIC, FileHeader
 from mfq.formats.io import (
@@ -71,16 +71,13 @@ class _StreamRecord:
 
 
 def _manifest_path(root: Path) -> Path:
-    canonical = root / "tpq.json"
-    if canonical.is_file():
-        return canonical
-    return root / "cccp.json"
+    return root / "tpq.json"
 
 
 def _manifest(root: Path) -> dict:
     path = _manifest_path(root)
     document = json.loads(path.read_text(encoding="utf-8"))
-    if document.get("format") not in {"tpq-1", "cccp-1"}:
+    if document.get("format") != "tpq-1":
         raise ValueError(
             f"unsupported TPQ artifact format: {document.get('format')!r}"
         )
@@ -97,16 +94,16 @@ def _manifest(root: Path) -> dict:
         }
         document["expert_files"] = expert_files
     if not isinstance(config, dict) or not isinstance(quant, dict):
-        raise ValueError("CCCP manifest lacks config or quant metadata")
+        raise ValueError("TPQ manifest lacks config or quant metadata")
     if not isinstance(expert_files, dict) or not expert_files:
-        raise ValueError("CCCP manifest has no expert shards")
+        raise ValueError("TPQ manifest has no expert shards")
     files = [
         *_dense_paths(root, document),
         *(root / str(name) for name in expert_files.values()),
     ]
     missing = [str(path) for path in files if not path.name or not path.is_file()]
     if missing:
-        raise FileNotFoundError(f"CCCP artifact is incomplete: {missing[:8]}")
+        raise FileNotFoundError(f"TPQ artifact is incomplete: {missing[:8]}")
     return document
 
 
@@ -210,11 +207,11 @@ def _projection_metadata(
     return assignments, {str(name): dict(value) for name, value in specs.items()}
 
 
-def _manifest_specs(manifest: dict) -> dict[str, CccpPqSpec]:
+def _manifest_specs(manifest: dict) -> dict[str, TpqPqSpec]:
     raw = manifest["quant"].get("vq")
     if not isinstance(raw, dict) or not raw:
-        raise ValueError("CCCP manifest has no VQ tier definitions")
-    result: dict[str, CccpPqSpec] = {}
+        raise ValueError("TPQ manifest has no VQ tier definitions")
+    result: dict[str, TpqPqSpec] = {}
     for tier, values in raw.items():
         if tier not in _TIER_ORDER:
             continue
@@ -222,14 +219,14 @@ def _manifest_specs(manifest: dict) -> dict[str, CccpPqSpec]:
             not isinstance(values, (list, tuple))
             or len(values) != 2
         ):
-            raise ValueError(f"invalid CCCP VQ definition for {tier}: {values}")
-        result[tier] = CccpPqSpec(
+            raise ValueError(f"invalid TPQ VQ definition for {tier}: {values}")
+        result[tier] = TpqPqSpec(
             tier=tier,
             vector_size=int(values[0]),
             codebook_entries=int(values[1]),
         )
     if not result:
-        raise ValueError("CCCP manifest defines no supported VQ tiers")
+        raise ValueError("TPQ manifest defines no supported VQ tiers")
     return result
 
 
@@ -300,7 +297,7 @@ def _dense_target_dtype(source_dtype: str) -> tuple[str, np.dtype]:
         return mapping[source_dtype]
     except KeyError as exc:
         raise ValueError(
-            f"CCCP dense tensor uses unsupported dtype {source_dtype!r}"
+            f"TPQ dense tensor uses unsupported dtype {source_dtype!r}"
         ) from exc
 
 
@@ -392,7 +389,7 @@ def _dense_file_records(
             if scale_name in keys:
                 packed_shape = shape
                 if len(packed_shape) != 2:
-                    raise ValueError(f"CCCP int4 tensor is not rank two: {name}")
+                    raise ValueError(f"TPQ int4 tensor is not rank two: {name}")
                 logical_shape = (
                     int(packed_shape[0]),
                     int(packed_shape[1]) * 2,
@@ -404,10 +401,10 @@ def _dense_file_records(
                 )
                 if scale_shape != expected_scale:
                     raise ValueError(
-                        f"CCCP int4 scale shape mismatch for {name}: "
+                        f"TPQ int4 scale shape mismatch for {name}: "
                         f"{scale_shape} != {expected_scale}"
                     )
-                nbytes = cccp_int4_payload_nbytes(
+                nbytes = tpq_int4_payload_nbytes(
                     logical_shape, group_size
                 )
 
@@ -424,7 +421,7 @@ def _dense_file_records(
                     with safe_open(
                         str(_path), framework="pt", device="cpu"
                     ) as source:
-                        output.write(pack_cccp_int4_prefix(_shape, _group))
+                        output.write(pack_tpq_int4_prefix(_shape, _group))
                         _stream_slice(
                             source,
                             _name,
@@ -486,7 +483,7 @@ def _dense_records(
     group_size = int(manifest["quant"].get("int4_group", 64))
     if group_size != 64:
         raise ValueError(
-            f"native CCCP-I4G64 import requires int4_group=64, got {group_size}"
+            f"native TPQ-I4G64 import requires int4_group=64, got {group_size}"
         )
     records: list[_StreamRecord] = []
     names: set[str] = set()
@@ -499,7 +496,7 @@ def _dense_records(
         duplicates = names.intersection(record.name for record in shard_records)
         if duplicates:
             raise ValueError(
-                f"CCCP dense shards repeat tensors: {sorted(duplicates)[:8]}"
+                f"TPQ dense shards repeat tensors: {sorted(duplicates)[:8]}"
             )
         names.update(record.name for record in shard_records)
         records.extend(shard_records)
@@ -515,7 +512,7 @@ def _expert_kind(keys: set[str], expert: int, tag: str) -> str:
     ]
     if len(found) != 1:
         raise ValueError(
-            f"CCCP expert {expert} projection {tag} has tiers {found}"
+            f"TPQ expert {expert} projection {tag} has tiers {found}"
         )
     return found[0]
 
@@ -534,13 +531,13 @@ def _dropped_experts(
     assignments = str(raw)
     if len(assignments) != n_experts:
         raise ValueError(
-            f"CCCP layer {layer} tier count {len(assignments)} "
+            f"TPQ layer {layer} tier count {len(assignments)} "
             f"does not match n_experts={n_experts}"
         )
     invalid = sorted(set(assignments).difference("xwvVd"))
     if invalid:
         raise ValueError(
-            f"CCCP layer {layer} has invalid tier characters {invalid}"
+            f"TPQ layer {layer} has invalid tier characters {invalid}"
         )
     return tuple(
         expert for expert, tier in enumerate(assignments) if tier == "d"
@@ -553,7 +550,7 @@ def _read_expert_indices(
     *,
     expert: int,
     tag: str,
-    spec: CccpPqSpec,
+    spec: TpqPqSpec,
     shape: tuple[int, int],
 ) -> np.ndarray:
     raw_name = f"e{expert}.{tag}{spec.tier}"
@@ -566,16 +563,16 @@ def _read_expert_indices(
     elif raw_name in keys:
         values = _numpy(handle.get_tensor(raw_name)).astype(dtype, copy=False)
     else:
-        raise KeyError(f"CCCP expert index tensor is absent: {raw_name}")
+        raise KeyError(f"TPQ expert index tensor is absent: {raw_name}")
     expected = (shape[0], shape[1] // spec.vector_size)
     if values.size != expected[0] * expected[1]:
         raise ValueError(
-            f"CCCP expert index size mismatch for {raw_name}: "
+            f"TPQ expert index size mismatch for {raw_name}: "
             f"{values.size} != {expected}"
         )
     values = np.ascontiguousarray(values.reshape(expected))
     if values.size and int(values.max()) >= spec.codebook_entries:
-        raise ValueError(f"CCCP expert index exceeds {spec.codebook_entries}")
+        raise ValueError(f"TPQ expert index exceeds {spec.codebook_entries}")
     return values
 
 
@@ -603,16 +600,16 @@ def _expert_projection_layout(
 
 
 def _drop_placeholder_spec(
-    specs: dict[str, CccpPqSpec],
+    specs: dict[str, TpqPqSpec],
     *,
     columns: int,
-) -> CccpPqSpec:
+) -> TpqPqSpec:
     for tier in reversed(_TIER_ORDER):
         spec = specs.get(tier)
         if spec is not None and columns % spec.vector_size == 0:
             return spec
     raise ValueError(
-        f"CCCP dropped-expert placeholder has no VQ tier compatible "
+        f"TPQ dropped-expert placeholder has no VQ tier compatible "
         f"with {columns} columns"
     )
 
@@ -622,7 +619,7 @@ def _expert_record_nbytes(
     *,
     rows_per_expert: int,
     columns: int,
-    specs: dict[str, CccpPqSpec],
+    specs: dict[str, TpqPqSpec],
 ) -> int:
     total = _NINT_MOE_HDR.size
     for tier in _POOL_ORDER:
@@ -636,10 +633,10 @@ def _expert_record_nbytes(
                 spec = specs[tier]
             except KeyError as exc:
                 raise ValueError(
-                    f"CCCP expert uses undefined tier {tier!r}"
+                    f"TPQ expert uses undefined tier {tier!r}"
                 ) from exc
         dtype = spec.label.encode("ascii")
-        payload = cccp_pq_payload_nbytes(
+        payload = tpq_pq_payload_nbytes(
             (len(expert_ids) * rows_per_expert, columns),
             spec,
         )
@@ -660,7 +657,7 @@ def _write_expert_projection(
     rows_per_expert: int,
     columns: int,
     tag: str,
-    specs: dict[str, CccpPqSpec],
+    specs: dict[str, TpqPqSpec],
     workers: int,
     dropped_experts: tuple[int, ...] = (),
 ) -> None:
@@ -691,10 +688,10 @@ def _write_expert_projection(
                     spec = specs[tier]
                 except KeyError as exc:
                     raise ValueError(
-                        f"CCCP expert uses undefined tier {tier!r}"
+                        f"TPQ expert uses undefined tier {tier!r}"
                     ) from exc
             dtype = spec.label.encode("ascii")
-            payload_nbytes = cccp_pq_payload_nbytes(
+            payload_nbytes = tpq_pq_payload_nbytes(
                 (len(expert_ids) * rows_per_expert, columns),
                 spec,
             )
@@ -719,7 +716,7 @@ def _write_expert_projection(
                 ).astype(np.float32, copy=False)
             )
             output.write(
-                pack_cccp_pq_prefix(
+                pack_tpq_pq_prefix(
                     spec,
                     (len(expert_ids) * rows_per_expert, columns),
                     codebook,
@@ -735,7 +732,7 @@ def _write_expert_projection(
                 _is_drop=tier == _DROP_TIER,
             ) -> list[bytes]:
                 if _is_drop:
-                    packed = pack_cccp_indices(
+                    packed = pack_tpq_indices(
                         np.zeros(
                             (
                                 _shape[0],
@@ -752,7 +749,7 @@ def _write_expert_projection(
                     str(shard), framework="pt", device="cpu"
                 ) as worker_handle:
                     return [
-                        pack_cccp_indices(
+                        pack_tpq_indices(
                             _read_expert_indices(
                                 worker_handle,
                                 keys,
@@ -785,7 +782,7 @@ def _write_expert_projection(
                             output.write(payload)
 
 
-def _projection_spec(manifest: dict, layout: str, raw: dict) -> CccpPqSpec:
+def _projection_spec(manifest: dict, layout: str, raw: dict) -> TpqPqSpec:
     dim = int(raw["dim"])
     entries = int(raw["size"])
     packing = str(
@@ -801,7 +798,7 @@ def _projection_spec(manifest: dict, layout: str, raw: dict) -> CccpPqSpec:
             raise ValueError(
                 f"TPQ layout {layout} cannot infer index width from {entries}"
             )
-    return CccpPqSpec("p", dim, entries, bits)
+    return TpqPqSpec("p", dim, entries, bits)
 
 
 def _projection_codebook_key(
@@ -832,7 +829,7 @@ def _projection_pools(
     n_experts: int,
     assignments: dict[int, dict[str, str | tuple[str, ...]]],
     layouts: dict[str, dict],
-) -> tuple[tuple[CccpPqSpec, str, tuple[int, ...]], ...]:
+) -> tuple[tuple[TpqPqSpec, str, tuple[int, ...]], ...]:
     assignment = assignments[layer][projection]
     per_expert = (
         (assignment,) * n_experts
@@ -867,7 +864,7 @@ def _projection_raw_bytes(handle, key: str) -> bytes:
 
 
 def _projection_record_nbytes(
-    pools: tuple[tuple[CccpPqSpec, str, tuple[int, ...]], ...],
+    pools: tuple[tuple[TpqPqSpec, str, tuple[int, ...]], ...],
     *,
     rows_per_expert: int,
     columns: int,
@@ -875,7 +872,7 @@ def _projection_record_nbytes(
     total = _NINT_MOE_HDR.size
     for spec, _codebook_key, experts in pools:
         dtype = spec.label.encode("ascii")
-        payload = cccp_pq_payload_nbytes(
+        payload = tpq_pq_payload_nbytes(
             (len(experts) * rows_per_expert, columns), spec
         )
         total += (
@@ -896,7 +893,7 @@ def _write_projection_vq_record(
     n_experts: int,
     rows_per_expert: int,
     columns: int,
-    pools: tuple[tuple[CccpPqSpec, str, tuple[int, ...]], ...],
+    pools: tuple[tuple[TpqPqSpec, str, tuple[int, ...]], ...],
 ) -> None:
     output.write(
         _NINT_MOE_HDR.pack(
@@ -911,7 +908,7 @@ def _write_projection_vq_record(
         keys = set(handle.keys())
         for spec, codebook_key, expert_ids in pools:
             dtype = spec.label.encode("ascii")
-            payload_nbytes = cccp_pq_payload_nbytes(
+            payload_nbytes = tpq_pq_payload_nbytes(
                 (len(expert_ids) * rows_per_expert, columns), spec
             )
             output.write(
@@ -927,7 +924,7 @@ def _write_projection_vq_record(
                 np.float32, copy=False
             )
             output.write(
-                pack_cccp_pq_prefix(
+                pack_tpq_pq_prefix(
                     spec,
                     (len(expert_ids) * rows_per_expert, columns),
                     codebook,
@@ -1158,7 +1155,7 @@ def _write_mfq(
             actual = output.tell() - start
             if actual != record.nbytes:
                 raise RuntimeError(
-                    f"CCCP import size mismatch for {record.name}: "
+                    f"TPQ import size mismatch for {record.name}: "
                     f"{actual} != {record.nbytes}"
                 )
 
@@ -1171,12 +1168,12 @@ def convert(
     workers: int = 8,
     overwrite: bool = False,
 ) -> Path:
-    """Convert a complete cccp-1 directory into one native MFQ file."""
+    """Convert a complete tpq-1 directory into one native MFQ file."""
 
     if row_chunk <= 0:
-        raise ValueError("CCCP import row chunk must be positive")
+        raise ValueError("TPQ import row chunk must be positive")
     if workers <= 0:
-        raise ValueError("CCCP import workers must be positive")
+        raise ValueError("TPQ import workers must be positive")
     root = Path(input_root).resolve()
     output = Path(output_path).resolve()
     if output.exists() and not overwrite:
@@ -1227,17 +1224,6 @@ def convert(
                 tier: spec.index_bits
                 for tier, spec in specs.items()
             },
-            **(
-                {
-                    "cccp_manifest": manifest,
-                    "cccp_index_storage": {
-                        tier: spec.index_bits
-                        for tier, spec in specs.items()
-                    },
-                }
-                if manifest["format"] == "cccp-1"
-                else {}
-            ),
         },
     )
     try:

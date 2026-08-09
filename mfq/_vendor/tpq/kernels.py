@@ -6,7 +6,7 @@
   - VQWeight：u8 码字索引 [R, C//dim] + 层共享码本 f32 [K, dim]；LUT 算法：
     y[r] = Σ_b s[b, idx[r, b]]，其中 s[b, c] = x[bd:bd+dim]·cb[c] 只需算 B×K 次，
     把 O(R·C) 的 matmul 降为 O(B·K + R·B) 的查表加（v 档约快 6 倍）。
-RMSNorm / RoPE 与 CCCP/modelmath.py 逐行一致（单测对照过朴素实现）。
+RMSNorm / RoPE 与 TPQ/modelmath.py 逐行一致（单测对照过朴素实现）。
 """
 
 from __future__ import annotations
@@ -377,7 +377,7 @@ class Int4Weight:
 class BlockFP8Weight:
     """原生 E4M3 权重与 128×128 FP32 反量化尺度。
 
-    CCCP ``dense=fp8-native`` 直接保存 FP8 检查点字节，不先展开成
+    TPQ ``dense=fp8-native`` 直接保存 FP8 检查点字节，不先展开成
     BF16/F32。矩阵乘按行块临时反量化，常驻显存仍是 1 byte/weight。
     CPU 单 token decode 返回每个权重自己的固定缓冲；同一权重的下一次
     decode 会覆盖该缓冲。

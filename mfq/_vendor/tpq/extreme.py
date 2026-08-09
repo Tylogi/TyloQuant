@@ -307,7 +307,7 @@ def inspect_compact_projection_archive(
     manifest = Manifest(str(root))
     if not manifest.projection_vq:
         raise RuntimeError(
-            "极限模式只接受可由公共 packed 算子直接计算的三投影 CCCP "
+            "极限模式只接受可由公共 packed 算子直接计算的三投影 TPQ "
             "归档；当前模型会展开专家索引。"
         )
     formats: set[str] = set()
@@ -426,7 +426,7 @@ def plan_extreme_expert_placement(
 ) -> ExtremeExpertPlacement:
     """Keep precision-budgeted experts on GPU while satisfying RAM capacity.
 
-    CCCP quantizers may assign more packed bits to frequently routed or more
+    TPQ quantizers may assign more packed bits to frequently routed or more
     sensitive experts.  The score is deliberately supplied by the manifest
     adapter: this common planner neither recognizes model names nor assumes a
     particular set of bit widths.
@@ -483,7 +483,7 @@ def plan_extreme_expert_placement(
                     else 0.0
                 )
                 # Rank is primary: each group contributes its hottest expert
-                # before any group contributes its second hottest.  CCCP's
+                # before any group contributes its second hottest.  TPQ's
                 # fixed-per-layer budgets are only comparable within a layer,
                 # while every routed layer runs once per token.
                 ranked_rows.append(
@@ -522,7 +522,7 @@ def load_expert_residency_scores(
 ) -> dict[tuple[int, int], float]:
     """Load portable expert hotness scores without recognizing a model.
 
-    Quantizers can emit either the compact TPQ score schema or CCCP's existing
+    Quantizers can emit either the compact TPQ score schema or TPQ's existing
     expert-preference audit.  Both describe layer/expert coordinates and a
     non-negative score; runtime placement remains independent of architecture.
     """
@@ -539,7 +539,7 @@ def load_expert_residency_scores(
                     "expert residency score keys must use layer:expert"
                 )
             output[(int(layer_text), int(expert_text))] = float(value)
-    elif format_name == "cccp-expert-projection-preference-map-v1":
+    elif format_name == "tpq-expert-projection-preference-map-v1":
         for layer_text, layer_data in (payload.get("layers") or {}).items():
             for expert in layer_data.get("experts", ()):
                 output[(int(layer_text), int(expert["expert"]))] = float(

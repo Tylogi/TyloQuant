@@ -1,9 +1,9 @@
 """TPQ 模型前向：GLM-5.2（MLA + MoE）在 CPU 上的完整推理实现。
 
-数值与 CCCP/modelmath.py 逐行一致（该实现已对照逐元素朴素实现验证，max_diff<1e-8），
+数值与 TPQ/modelmath.py 逐行一致（该实现已对照逐元素朴素实现验证，max_diff<1e-8），
 差异仅在权重来源：dense 走 Int4Weight 分块反量化，专家走 ExpertPool 的 VQ LUT。
 注意力为全量因果注意力（短上下文 <2048 与 DSA top-2048 等价），KV cache 以 f16 存储。
-MTP 层与 DSA indexer 不存在于 CCCP 产物中，本文件亦不实现。
+MTP 层与 DSA indexer 不存在于 TPQ 产物中，本文件亦不实现。
 """
 
 from __future__ import annotations
@@ -125,7 +125,7 @@ def _glm_route(
 
 
 class GLMModel:
-    """CCCP 格式 GLM-5.2 的推理模型（CPU / CUDA 双路径）。
+    """TPQ 格式 GLM-5.2 的推理模型（CPU / CUDA 双路径）。
 
     device="cpu"：dense int4 打包驻留内存，专家缓存于内存（默认）。
     device="cuda"：dense 权重（int4 打包态 ≈9.2GB）与 KV cache 常驻显存，

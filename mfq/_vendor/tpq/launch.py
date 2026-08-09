@@ -86,7 +86,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--extreme-score-file",
         help=(
-            "可选专家常驻分数 JSON；兼容旧 CCCP expert-preference 审计"
+            "可选专家常驻分数 JSON；兼容旧 TPQ expert-preference 审计"
         ),
     )
     parser.add_argument(
@@ -461,7 +461,7 @@ def _validate_extreme_archive(manifest: dict[str, Any]) -> None:
         raise ValueError(
             "--extreme 要求紧凑三投影或异构专家 VQ 归档"
         )
-    if tiering.get("format") != "cccp-heterogeneous-expert-vq-v1":
+    if tiering.get("format") != "tpq-heterogeneous-expert-vq-v1":
         raise ValueError(
             "--extreme 不支持该 heterogeneous_expert_tiering 格式"
         )

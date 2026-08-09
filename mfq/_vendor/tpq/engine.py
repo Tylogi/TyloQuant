@@ -270,7 +270,7 @@ def _trim_process_heap() -> None:
 
 
 class Engine:
-    """GLM-5.2-CCCP 的生成引擎（CPU / CUDA，内存显存自动适配）。
+    """GLM-5.2-TPQ 的生成引擎（CPU / CUDA，内存显存自动适配）。
 
     cache_gb / vram_cache_gb 传 None 时自动计算：
       RAM 预算  = 可用内存 − (运行时 2GB + f32 常驻 4.5GB + KV cache + 安全 3GB)

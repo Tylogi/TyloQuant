@@ -26,7 +26,7 @@ KV 同步（草稿质量的关键，正确性由主模型贪心验证兜底）�
   写入接受前缀（最末接受位由下一次 draft 调用内部写入，幂等）。被拒草稿
   从不进入 DSpark 环，无需回滚。
 
-权重来源：CCCP 产物目录的 dspark.safetensors（由 `python -m CCCP dspark-export`
+权重来源：TPQ 产物目录的 dspark.safetensors（由 `python -m TPQ dspark-export`
 自原始检查点导出，张量名/dtype 原样保留；产物自包含，不依赖原始模型目录）。
 FP8 反量化值在 bf16 中精确可表，大矩阵按 bf16 驻留。routed 专家为 FP4 e2m1
 打包 + ue8m0 缩放：FP4Weight 结构与 Int4Weight 同构（256 字节 LUT 一次取双
@@ -50,7 +50,7 @@ from .dsv4 import SafeFile, dequant_fp8, rmsnorm, rope_apply, hc_pre, hc_post, h
 
 from .kernels import VQWeight
 
-# e2m1 全 16 值表（bit3 为符号位；与 CCCP/fp4io.py 一致）
+# e2m1 全 16 值表（bit3 为符号位；与 TPQ/fp4io.py 一致）
 _E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
          -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 
@@ -119,7 +119,7 @@ class FP4Weight:
 class DSparkStore:
     """产物目录 dspark.safetensors 的读取（产物自包含：读取 TPQ 清单的
     dspark_file 指引，不依赖原始模型目录）。张量名与原始检查点一致（mtp.*），
-    FP8 伴生 .scale 由导出器原样保留。产物由 `python -m CCCP dspark-export` 生成。"""
+    FP8 伴生 .scale 由导出器原样保留。产物由 `python -m TPQ dspark-export` 生成。"""
 
     def __init__(self, model_dir: str):
         _root, man = load_manifest(model_dir)
@@ -344,7 +344,7 @@ class DSparkHead:
 
     # ---- 草稿前向 ----
     def _qkv(self, x: torch.Tensor, w: dict, pos0: int, T: int):
-        """低秩 Q + MQA kv（与 CCCP.dsv4._qkv 同数学，大矩阵走 bf16 GEMM）。"""
+        """低秩 Q + MQA kv（与 TPQ.dsv4._qkv 同数学，大矩阵走 bf16 GEMM）。"""
         cfg = self.cfg
         H, hd, rd = cfg.n_heads, cfg.head_dim, cfg.qk_rope_head_dim
         qr = rmsnorm(_linb(x, w["wq_a"]), w["q_norm"], cfg.rms_eps)

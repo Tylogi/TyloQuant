@@ -247,7 +247,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--extreme-score-file",
         help=(
-            "可选的公共专家常驻分数 JSON；兼容旧 CCCP expert-preference "
+            "可选的公共专家常驻分数 JSON；兼容旧 TPQ expert-preference "
             "审计，不提供时按 packed bit 预算推断"
         ),
     )

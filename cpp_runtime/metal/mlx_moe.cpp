@@ -2009,15 +2009,15 @@ constexpr const char* kMoeSource = R"METAL(
     }
 )METAL";
 
-constexpr int kCccpDescriptorSize = 5;
-constexpr int kCccpBits = 0;
-constexpr int kCccpIndexOffset = 1;
-constexpr int kCccpCodebookOffset = 2;
-constexpr int kCccpVectorSize = 3;
-constexpr int kCccpBlocks = 4;
+constexpr int kTpqDescriptorSize = 5;
+constexpr int kTpqBits = 0;
+constexpr int kTpqIndexOffset = 1;
+constexpr int kTpqCodebookOffset = 2;
+constexpr int kTpqVectorSize = 3;
+constexpr int kTpqBlocks = 4;
 
-constexpr const char* kCccpMoeHeader = R"METAL(
-inline uint mfq_cccp_moe_read_index(
+constexpr const char* kTpqMoeHeader = R"METAL(
+inline uint mfq_tpq_moe_read_index(
     device const uchar* indices,
     uint byte_base,
     uint value_index,
@@ -2037,7 +2037,7 @@ inline uint mfq_cccp_moe_read_index(
 }
 )METAL";
 
-constexpr const char* kCccpMoeSource = R"METAL(
+constexpr const char* kTpqMoeSource = R"METAL(
     uint lane = thread_index_in_simdgroup;
     uint task = threadgroup_position_in_grid.x;
     uint output = task % uint(OUT);
@@ -2087,7 +2087,7 @@ constexpr const char* kCccpMoeSource = R"METAL(
         block < blocks;
         block += 32u
     ) {
-        uint code = mfq_cccp_moe_read_index(
+        uint code = mfq_tpq_moe_read_index(
             indices,
             index_offset,
             row_base + block,
@@ -2982,12 +2982,12 @@ moe_kernel() {
 }
 
 const mlx::core::fast::CustomKernelFunction&
-cccp_moe_kernel() {
+tpq_moe_kernel() {
     static const auto kernel = [] {
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         return mlx::core::fast::metal_kernel(
-            "mfq_cpp_streamed_cccp_moe",
+            "mfq_cpp_streamed_tpq_moe",
             {
                 "descriptors",
                 "indices",
@@ -2996,8 +2996,8 @@ cccp_moe_kernel() {
                 "expert_ids",
             },
             {"y"},
-            kCccpMoeSource,
-            kCccpMoeHeader,
+            kTpqMoeSource,
+            kTpqMoeHeader,
             true,
             false,
             options);
@@ -4063,43 +4063,42 @@ int descriptor_with_offset(
         name);
 }
 
-class CccpStreamUnsupported final
+class TpqStreamUnsupported final
     : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
 };
 
-struct CccpTierLayout {
+struct TpqTierLayout {
     int tier = 0;
     int vector_size = 0;
     int entries = 0;
 };
 
-CccpTierLayout cccp_tier_layout(
+TpqTierLayout tpq_tier_layout(
     std::string_view dtype) {
-    if (dtype == "TPQ-X" || dtype == "CCCP-X") {
+    if (dtype == "TPQ-X") {
         return {1, 8, 256};
     }
-    if (dtype == "TPQ-W" || dtype == "CCCP-W") {
+    if (dtype == "TPQ-W") {
         return {2, 8, 4096};
     }
-    if (dtype == "TPQ-V" || dtype == "CCCP-V") {
+    if (dtype == "TPQ-V") {
         return {3, 4, 256};
     }
-    if (dtype == "TPQ-VV" || dtype == "CCCP-VV") {
+    if (dtype == "TPQ-VV") {
         return {4, 4, 4096};
     }
-    if (dtype.rfind("TPQ-", 0) == 0 ||
-        dtype.rfind("CCCP-", 0) == 0) {
+    if (dtype.rfind("TPQ-", 0) == 0) {
         throw std::runtime_error(
-            "unsupported streamed CCCP cohort "
+            "unsupported streamed TPQ cohort "
             "dtype: " + std::string(dtype));
     }
-    throw CccpStreamUnsupported(
-        "NINTM contains a non-CCCP cohort");
+    throw TpqStreamUnsupported(
+        "NINTM contains a non-TPQ cohort");
 }
 
-bool cccp_index_layout_allowed(
+bool tpq_index_layout_allowed(
     int entries,
     int bits) {
     if (entries == 256) {
@@ -4125,7 +4124,7 @@ std::uint64_t checked_range_add(
             - right
     ) {
         throw std::runtime_error(
-            std::string("CCCP ") + name
+            std::string("TPQ ") + name
             + " overflows");
     }
     return left + right;
@@ -4142,14 +4141,14 @@ std::uint64_t checked_range_product(
                 / left
     ) {
         throw std::runtime_error(
-            std::string("CCCP ") + name
+            std::string("TPQ ") + name
             + " overflows");
     }
     return left * right;
 }
 
 template <typename T>
-T cccp_scalar(
+T tpq_scalar(
     const std::vector<std::uint8_t>& bytes,
     std::size_t offset,
     const char* name) {
@@ -4158,7 +4157,7 @@ T cccp_scalar(
         || sizeof(T) > bytes.size() - offset
     ) {
         throw std::runtime_error(
-            std::string("truncated CCCP ") + name);
+            std::string("truncated TPQ ") + name);
     }
     T value{};
     std::memcpy(
@@ -4168,7 +4167,7 @@ T cccp_scalar(
     return value;
 }
 
-std::string cccp_ascii(
+std::string tpq_ascii(
     const std::vector<std::uint8_t>& bytes,
     std::size_t offset,
     std::size_t count,
@@ -4178,7 +4177,7 @@ std::string cccp_ascii(
         || count > bytes.size() - offset
     ) {
         throw std::runtime_error(
-            std::string("truncated CCCP ") + name);
+            std::string("truncated TPQ ") + name);
     }
     const auto begin =
         bytes.begin()
@@ -4194,7 +4193,7 @@ std::string cccp_ascii(
             })
     ) {
         throw std::runtime_error(
-            std::string("CCCP ") + name
+            std::string("TPQ ") + name
             + " is not ASCII");
     }
     return {
@@ -4204,7 +4203,7 @@ std::string cccp_ascii(
     };
 }
 
-array make_cccp_codebook(
+array make_tpq_codebook(
     const std::vector<std::uint8_t>& bytes,
     int entries,
     int vector_size,
@@ -4212,16 +4211,16 @@ array make_cccp_codebook(
     const auto elements = checked_product(
         static_cast<std::size_t>(entries),
         static_cast<std::size_t>(vector_size),
-        "CCCP codebook elements");
+        "TPQ codebook elements");
     if (
         bytes.size()
         != checked_product(
             elements,
             sizeof(float),
-            "CCCP codebook bytes")
+            "TPQ codebook bytes")
     ) {
         throw std::runtime_error(
-            "CCCP codebook byte count mismatch: "
+            "TPQ codebook byte count mismatch: "
             + name);
     }
     std::vector<float> values(elements);
@@ -4240,21 +4239,21 @@ array make_cccp_codebook(
             })
     ) {
         throw std::runtime_error(
-            "CCCP codebook contains non-finite values: "
+            "TPQ codebook contains non-finite values: "
             + name);
     }
     const array source(
         values.begin(),
         Shape{checked_int(
             elements,
-            "CCCP codebook elements")});
+            "TPQ codebook elements")});
     return mlx::core::contiguous(
         mlx::core::astype(
             source,
             mlx::core::float16));
 }
 
-struct CccpStreamPool {
+struct TpqStreamPool {
     std::string dtype;
     int vector_size = 0;
     int entries = 0;
@@ -4268,20 +4267,20 @@ struct CccpStreamPool {
     std::size_t indices_per_expert = 0;
 };
 
-struct CccpExpertLocation {
-    std::shared_ptr<const CccpStreamPool> pool;
+struct TpqExpertLocation {
+    std::shared_ptr<const TpqStreamPool> pool;
     int local_expert = 0;
 };
 
-struct CccpStreamProjection {
-    CccpStreamProjection(
+struct TpqStreamProjection {
+    TpqStreamProjection(
         int expert_count,
         int output_width,
         int input_width,
         array tables,
         std::size_t table_bytes,
         std::vector<
-            std::optional<CccpExpertLocation>>
+            std::optional<TpqExpertLocation>>
             locations)
         : experts(expert_count),
           out_per_expert(output_width),
@@ -4296,11 +4295,11 @@ struct CccpStreamProjection {
     array codebooks;
     std::size_t codebook_nbytes = 0;
     std::vector<
-        std::optional<CccpExpertLocation>>
+        std::optional<TpqExpertLocation>>
         experts_by_id;
 };
 
-std::uint32_t cccp_read_packed(
+std::uint32_t tpq_read_packed(
     const std::vector<std::uint8_t>& bytes,
     std::size_t bit_offset,
     int bits) {
@@ -4322,7 +4321,7 @@ std::uint32_t cccp_read_packed(
     ) & ((std::uint32_t{1} << bits) - 1u);
 }
 
-void cccp_write_packed(
+void tpq_write_packed(
     std::vector<std::uint8_t>& bytes,
     std::size_t value_index,
     int bits,
@@ -4342,10 +4341,10 @@ void cccp_write_packed(
     }
 }
 
-struct CccpCachedExpert {
-    CccpCachedExpert(
+struct TpqCachedExpert {
+    TpqCachedExpert(
         std::int32_t global,
-        std::shared_ptr<const CccpStreamPool> source,
+        std::shared_ptr<const TpqStreamPool> source,
         array packed,
         std::size_t bytes)
         : expert(global),
@@ -4354,14 +4353,14 @@ struct CccpCachedExpert {
           packed_nbytes(bytes) {}
 
     std::int32_t expert = 0;
-    std::shared_ptr<const CccpStreamPool> pool;
+    std::shared_ptr<const TpqStreamPool> pool;
     array indices;
     std::size_t packed_nbytes = 0;
 };
 
 } // namespace
 
-struct MlxCccpRoutedWeight::Impl {
+struct MlxTpqRoutedWeight::Impl {
     Impl(
         array descriptor_array,
         array index_array,
@@ -4422,7 +4421,7 @@ struct MlxNintMoeOffloadCache::Impl {
 
     struct CacheValue {
         Key key;
-        std::shared_ptr<const CccpCachedExpert>
+        std::shared_ptr<const TpqCachedExpert>
             weight;
     };
 
@@ -4430,7 +4429,7 @@ struct MlxNintMoeOffloadCache::Impl {
     using ProjectionCache = std::unordered_map<
         std::string,
         std::shared_ptr<
-            const CccpStreamProjection>>;
+            const TpqStreamProjection>>;
     using ExpertCache = std::unordered_map<
         Key,
         Lru::iterator,
@@ -4450,12 +4449,12 @@ struct MlxNintMoeOffloadCache::Impl {
         }
     }
 
-    std::shared_ptr<const CccpStreamProjection>
+    std::shared_ptr<const TpqStreamProjection>
     parse_projection(
         const std::string& name) {
         const auto& record = model.record(name);
         if (record.dtype != "NINTM") {
-            throw CccpStreamUnsupported(
+            throw TpqStreamUnsupported(
                 "expert record is not NINTM: "
                 + name);
         }
@@ -4477,7 +4476,7 @@ struct MlxNintMoeOffloadCache::Impl {
                 header.data()),
             4);
         if (magic == "NIM1") {
-            throw CccpStreamUnsupported(
+            throw TpqStreamUnsupported(
                 "NIM1 expert records are not "
                 "streamable");
         }
@@ -4487,22 +4486,22 @@ struct MlxNintMoeOffloadCache::Impl {
                 + name);
         }
         const auto record_experts =
-            cccp_scalar<std::uint32_t>(
+            tpq_scalar<std::uint32_t>(
                 header,
                 4,
                 "NINTM expert count");
         const auto rows_per_expert =
-            cccp_scalar<std::uint32_t>(
+            tpq_scalar<std::uint32_t>(
                 header,
                 8,
                 "NINTM output width");
         const auto columns =
-            cccp_scalar<std::uint32_t>(
+            tpq_scalar<std::uint32_t>(
                 header,
                 12,
                 "NINTM input width");
         const auto pool_count =
-            cccp_scalar<std::uint32_t>(
+            tpq_scalar<std::uint32_t>(
                 header,
                 16,
                 "NINTM pool count");
@@ -4527,7 +4526,7 @@ struct MlxNintMoeOffloadCache::Impl {
         }
 
         std::vector<
-            std::optional<CccpExpertLocation>>
+            std::optional<TpqExpertLocation>>
             locations(
                 static_cast<std::size_t>(experts));
         std::vector<array> codebooks;
@@ -4555,22 +4554,22 @@ struct MlxNintMoeOffloadCache::Impl {
                     offset,
                     pool_header_size);
             const auto pool_experts =
-                cccp_scalar<std::uint32_t>(
+                tpq_scalar<std::uint32_t>(
                     pool_header,
                     0,
                     "pool expert count");
             const auto dtype_bytes =
-                cccp_scalar<std::uint32_t>(
+                tpq_scalar<std::uint32_t>(
                     pool_header,
                     4,
                     "pool dtype length");
             const auto payload_bytes =
-                cccp_scalar<std::uint64_t>(
+                tpq_scalar<std::uint64_t>(
                     pool_header,
                     8,
                     "pool payload length");
             const auto runtime_bytes =
-                cccp_scalar<std::uint64_t>(
+                tpq_scalar<std::uint64_t>(
                     pool_header,
                     16,
                     "pool runtime length");
@@ -4623,20 +4622,20 @@ struct MlxNintMoeOffloadCache::Impl {
                     name,
                     offset,
                     metadata_bytes);
-            const auto dtype = cccp_ascii(
+            const auto dtype = tpq_ascii(
                 metadata,
                 static_cast<std::size_t>(
                     ids_bytes),
                 dtype_bytes,
                 "pool dtype");
             const auto layout =
-                cccp_tier_layout(dtype);
+                tpq_tier_layout(dtype);
             if (
                 runtime_bytes != 0
                 || payload_bytes < pq_prefix_size
             ) {
                 throw std::runtime_error(
-                    "CCCP pool has invalid runtime/"
+                    "TPQ pool has invalid runtime/"
                     "payload metadata: " + name);
             }
 
@@ -4658,37 +4657,37 @@ struct MlxNintMoeOffloadCache::Impl {
             const int index_bits =
                 prefix.at(7);
             const auto axis =
-                cccp_scalar<std::int32_t>(
+                tpq_scalar<std::int32_t>(
                     prefix,
                     8,
                     "PQ axis");
             const auto neuron_len =
-                cccp_scalar<std::int32_t>(
+                tpq_scalar<std::int32_t>(
                     prefix,
                     12,
                     "PQ neuron length");
             const auto dimensions =
-                cccp_scalar<std::uint32_t>(
+                tpq_scalar<std::uint32_t>(
                     prefix,
                     16,
                     "PQ dimension count");
             const auto entries =
-                cccp_scalar<std::uint32_t>(
+                tpq_scalar<std::uint32_t>(
                     prefix,
                     20,
                     "PQ codebook entries");
             const auto shape_rows =
-                cccp_scalar<std::int64_t>(
+                tpq_scalar<std::int64_t>(
                     prefix,
                     24,
                     "PQ row shape");
             const auto shape_columns =
-                cccp_scalar<std::int64_t>(
+                tpq_scalar<std::int64_t>(
                     prefix,
                     32,
                     "PQ column shape");
             const auto row_tail =
-                cccp_scalar<std::uint32_t>(
+                tpq_scalar<std::uint32_t>(
                     prefix,
                     40,
                     "PQ row count");
@@ -4706,7 +4705,7 @@ struct MlxNintMoeOffloadCache::Impl {
                 || entries
                     != static_cast<std::uint32_t>(
                         layout.entries)
-                || !cccp_index_layout_allowed(
+                || !tpq_index_layout_allowed(
                     layout.entries,
                     index_bits)
                 || axis != 0
@@ -4727,7 +4726,7 @@ struct MlxNintMoeOffloadCache::Impl {
                     != 0
             ) {
                 throw std::runtime_error(
-                    "inconsistent streamed CCCP pool "
+                    "inconsistent streamed TPQ pool "
                     "header: " + name);
             }
             const int blocks =
@@ -4771,7 +4770,7 @@ struct MlxNintMoeOffloadCache::Impl {
                     "payload index end");
             if (payload_bytes != expected_payload) {
                 throw std::runtime_error(
-                    "streamed CCCP pool payload length "
+                    "streamed TPQ pool payload length "
                     "mismatch: " + name);
             }
             const auto table_start =
@@ -4790,7 +4789,7 @@ struct MlxNintMoeOffloadCache::Impl {
                     table_start,
                     table_bytes);
             codebooks.push_back(
-                make_cccp_codebook(
+                make_tpq_codebook(
                     raw_table,
                     layout.entries,
                     vector_size,
@@ -4798,12 +4797,12 @@ struct MlxNintMoeOffloadCache::Impl {
             const auto table_offset =
                 checked_int(
                     codebook_elements,
-                    "CCCP codebook offset");
+                    "TPQ codebook offset");
             codebook_elements = checked_add(
                 codebook_elements,
                 static_cast<std::size_t>(
                     table_elements),
-                "CCCP codebook elements");
+                "TPQ codebook elements");
 
             if (
                 index_bits_total % 8 != 0
@@ -4823,13 +4822,13 @@ struct MlxNintMoeOffloadCache::Impl {
                         0xffu << used);
                 if ((last.front() & padding_mask) != 0) {
                     throw std::runtime_error(
-                        "streamed CCCP index padding is "
+                        "streamed TPQ index padding is "
                         "non-zero: " + name);
                 }
             }
 
             auto pool =
-                std::make_shared<CccpStreamPool>();
+                std::make_shared<TpqStreamPool>();
             pool->dtype = dtype;
             pool->vector_size = vector_size;
             pool->entries = layout.entries;
@@ -4852,7 +4851,7 @@ struct MlxNintMoeOffloadCache::Impl {
                         rows_per_expert),
                     static_cast<std::size_t>(
                         blocks),
-                    "CCCP expert index count");
+                    "TPQ expert index count");
 
             for (
                 std::uint32_t local = 0;
@@ -4860,7 +4859,7 @@ struct MlxNintMoeOffloadCache::Impl {
                 ++local
             ) {
                 const auto expert =
-                    cccp_scalar<std::int32_t>(
+                    tpq_scalar<std::int32_t>(
                         metadata,
                         static_cast<std::size_t>(
                             local)
@@ -4875,13 +4874,13 @@ struct MlxNintMoeOffloadCache::Impl {
                 ) {
                     throw std::runtime_error(
                         "invalid or duplicate streamed "
-                        "CCCP global expert ID: "
+                        "TPQ global expert ID: "
                         + name);
                 }
                 locations[
                     static_cast<std::size_t>(
                         expert)] =
-                    CccpExpertLocation{
+                    TpqExpertLocation{
                         pool,
                         static_cast<int>(local),
                     };
@@ -4900,7 +4899,7 @@ struct MlxNintMoeOffloadCache::Impl {
                     std::move(codebooks),
                     0));
         return std::make_shared<
-            CccpStreamProjection>(
+            TpqStreamProjection>(
                 experts,
                 static_cast<int>(
                     rows_per_expert),
@@ -4909,11 +4908,11 @@ struct MlxNintMoeOffloadCache::Impl {
                 checked_product(
                     codebook_elements,
                     sizeof(std::uint16_t),
-                    "resident CCCP codebook bytes"),
+                    "resident TPQ codebook bytes"),
                 std::move(locations));
     }
 
-    std::shared_ptr<const CccpStreamProjection>
+    std::shared_ptr<const TpqStreamProjection>
     projection_locked(
         const std::string& name) {
         const auto found =
@@ -4926,11 +4925,11 @@ struct MlxNintMoeOffloadCache::Impl {
         return result;
     }
 
-    std::shared_ptr<const CccpCachedExpert>
+    std::shared_ptr<const TpqCachedExpert>
     load_expert(
         const std::string& name,
         std::int32_t expert,
-        const CccpExpertLocation& location) {
+        const TpqExpertLocation& location) {
         const auto& pool = *location.pool;
         if (
             location.local_expert < 0
@@ -4938,7 +4937,7 @@ struct MlxNintMoeOffloadCache::Impl {
                 >= pool.expert_count
         ) {
             throw std::runtime_error(
-                "streamed CCCP local expert is "
+                "streamed TPQ local expert is "
                 "out of range: " + name);
         }
         const auto expert_bits =
@@ -4989,7 +4988,7 @@ struct MlxNintMoeOffloadCache::Impl {
                     std::size_t>::max())
         ) {
             throw std::runtime_error(
-                "streamed CCCP expert index stream "
+                "streamed TPQ expert index stream "
                 "is too large: " + name);
         }
         std::vector<std::uint8_t> packed(
@@ -5002,7 +5001,7 @@ struct MlxNintMoeOffloadCache::Impl {
             ++index
         ) {
             const auto value =
-                cccp_read_packed(
+                tpq_read_packed(
                     raw,
                     source_shift
                         + index
@@ -5016,10 +5015,10 @@ struct MlxNintMoeOffloadCache::Impl {
                     pool.entries)
             ) {
                 throw std::runtime_error(
-                    "streamed CCCP expert references "
+                    "streamed TPQ expert references "
                     "a missing codeword: " + name);
             }
-            cccp_write_packed(
+            tpq_write_packed(
                 packed,
                 index,
                 pool.index_bits,
@@ -5030,7 +5029,7 @@ struct MlxNintMoeOffloadCache::Impl {
                 std::move(packed),
                 mlx::core::uint8);
         return std::make_shared<
-            CccpCachedExpert>(
+            TpqCachedExpert>(
                 expert,
                 location.pool,
                 std::move(indices),
@@ -5050,17 +5049,17 @@ struct MlxNintMoeOffloadCache::Impl {
     std::size_t resident_bytes = 0;
 };
 
-MlxCccpRoutedWeight::MlxCccpRoutedWeight(
+MlxTpqRoutedWeight::MlxTpqRoutedWeight(
     std::shared_ptr<const Impl> impl)
     : impl_(std::move(impl)) {
     if (!impl_) {
         throw std::invalid_argument(
-            "streamed CCCP implementation cannot "
+            "streamed TPQ implementation cannot "
             "be null");
     }
 }
 
-array MlxCccpRoutedWeight::routed_matmul(
+array MlxTpqRoutedWeight::routed_matmul(
     const array& input,
     const array& expert_ids) const {
     auto ids = mlx::core::contiguous(
@@ -5069,7 +5068,7 @@ array MlxCccpRoutedWeight::routed_matmul(
             mlx::core::int32));
     if (ids.ndim() != 2) {
         throw std::invalid_argument(
-            "streamed CCCP expert IDs must have "
+            "streamed TPQ expert IDs must have "
             "[tokens,routes] shape");
     }
     const int tokens = ids.shape(0);
@@ -5089,7 +5088,7 @@ array MlxCccpRoutedWeight::routed_matmul(
         )
     ) {
         throw std::invalid_argument(
-            "streamed CCCP input must have "
+            "streamed TPQ input must have "
             "[tokens,K] or [tokens,routes,K] shape");
     }
     auto source = input;
@@ -5116,24 +5115,24 @@ array MlxCccpRoutedWeight::routed_matmul(
         checked_product(
             static_cast<std::size_t>(tokens),
             static_cast<std::size_t>(routes),
-            "streamed CCCP route count"),
+            "streamed TPQ route count"),
         static_cast<std::size_t>(
             impl_->out_per_expert),
-        "streamed CCCP task count");
+        "streamed TPQ task count");
     const auto grid = checked_product(
         tasks,
         32,
-        "streamed CCCP Metal grid");
+        "streamed TPQ Metal grid");
     if (
         grid
         > static_cast<std::size_t>(
             std::numeric_limits<int>::max())
     ) {
         throw std::runtime_error(
-            "streamed CCCP Metal grid exceeds "
+            "streamed TPQ Metal grid exceeds "
             "MLX limits");
     }
-    auto outputs = cccp_moe_kernel()(
+    auto outputs = tpq_moe_kernel()(
         {
             impl_->descriptors,
             impl_->indices,
@@ -5158,7 +5157,7 @@ array MlxCccpRoutedWeight::routed_matmul(
             {"K", impl_->neuron_len},
             {
                 "DESCRIPTOR_SIZE",
-                kCccpDescriptorSize,
+                kTpqDescriptorSize,
             },
             {
                 "SHARED_INPUT",
@@ -5172,25 +5171,25 @@ array MlxCccpRoutedWeight::routed_matmul(
     return std::move(outputs.front());
 }
 
-int MlxCccpRoutedWeight::experts() const noexcept {
+int MlxTpqRoutedWeight::experts() const noexcept {
     return impl_->experts;
 }
 
-int MlxCccpRoutedWeight::out_per_expert() const noexcept {
+int MlxTpqRoutedWeight::out_per_expert() const noexcept {
     return impl_->out_per_expert;
 }
 
-int MlxCccpRoutedWeight::neuron_len() const noexcept {
+int MlxTpqRoutedWeight::neuron_len() const noexcept {
     return impl_->neuron_len;
 }
 
 std::size_t
-MlxCccpRoutedWeight::packed_nbytes() const noexcept {
+MlxTpqRoutedWeight::packed_nbytes() const noexcept {
     return impl_->packed_bytes;
 }
 
 std::size_t
-MlxCccpRoutedWeight::shared_codebook_nbytes() const noexcept {
+MlxTpqRoutedWeight::shared_codebook_nbytes() const noexcept {
     return impl_->codebook_bytes;
 }
 
@@ -5212,7 +5211,7 @@ bool MlxNintMoeOffloadCache::can_offload(
     try {
         (void)impl_->projection_locked(name);
         return true;
-    } catch (const CccpStreamUnsupported&) {
+    } catch (const TpqStreamUnsupported&) {
         return false;
     }
 }
@@ -5273,7 +5272,7 @@ MlxNintMoeOffloadCache::availability(
     return result;
 }
 
-MlxCccpRoutedWeight
+MlxTpqRoutedWeight
 MlxNintMoeOffloadCache::grouped(
     const std::string& name,
     const std::vector<std::int32_t>&
@@ -5294,7 +5293,7 @@ MlxNintMoeOffloadCache::grouped(
     std::vector<Impl::Key> ordered_keys;
     ordered_keys.reserve(active_experts.size());
     std::vector<std::shared_ptr<
-        const CccpCachedExpert>> active;
+        const TpqCachedExpert>> active;
     active.reserve(active_experts.size());
     std::unordered_set<
         Impl::Key,
@@ -5307,7 +5306,7 @@ MlxNintMoeOffloadCache::grouped(
             || expert >= projection->experts
         ) {
             throw std::out_of_range(
-                "streamed CCCP global expert ID "
+                "streamed TPQ global expert ID "
                 "is out of range");
         }
         const auto& location =
@@ -5316,7 +5315,7 @@ MlxNintMoeOffloadCache::grouped(
                     expert)];
         if (!location.has_value()) {
             throw std::runtime_error(
-                "streamed CCCP global expert "
+                "streamed TPQ global expert "
                 + std::to_string(expert)
                 + " is unavailable in " + name);
         }
@@ -5353,7 +5352,7 @@ MlxNintMoeOffloadCache::grouped(
         staged_bytes = checked_add(
             staged_bytes,
             weight->packed_nbytes,
-            "staged CCCP packed bytes");
+            "staged TPQ packed bytes");
         staged_lru.push_back({
             key,
             weight,
@@ -5366,7 +5365,7 @@ MlxNintMoeOffloadCache::grouped(
                 inserted);
         if (!cached_insert.second) {
             throw std::logic_error(
-                "duplicate staged CCCP expert");
+                "duplicate staged TPQ expert");
         }
         active.push_back(std::move(weight));
     }
@@ -5376,8 +5375,8 @@ MlxNintMoeOffloadCache::grouped(
             static_cast<std::size_t>(
                 projection->experts),
             static_cast<std::size_t>(
-                kCccpDescriptorSize),
-            "CCCP descriptor count"),
+                kTpqDescriptorSize),
+            "TPQ descriptor count"),
         0);
     std::vector<array> index_arrays;
     index_arrays.reserve(active.size() + 1);
@@ -5387,31 +5386,31 @@ MlxNintMoeOffloadCache::grouped(
             static_cast<std::size_t>(
                 weight->expert),
             static_cast<std::size_t>(
-                kCccpDescriptorSize),
-            "CCCP descriptor offset");
+                kTpqDescriptorSize),
+            "TPQ descriptor offset");
         descriptors[
-            base + kCccpBits] =
+            base + kTpqBits] =
             weight->pool->index_bits;
         descriptors[
-            base + kCccpIndexOffset] =
+            base + kTpqIndexOffset] =
             checked_int(
                 index_offset,
-                "CCCP active index offset");
+                "TPQ active index offset");
         descriptors[
-            base + kCccpCodebookOffset] =
+            base + kTpqCodebookOffset] =
             weight->pool->codebook_offset;
         descriptors[
-            base + kCccpVectorSize] =
+            base + kTpqVectorSize] =
             weight->pool->vector_size;
         descriptors[
-            base + kCccpBlocks] =
+            base + kTpqBlocks] =
             weight->pool->blocks;
         index_arrays.push_back(
             weight->indices);
         index_offset = checked_add(
             index_offset,
             weight->packed_nbytes,
-            "CCCP active index bytes");
+            "TPQ active index bytes");
     }
     // The bit reader may issue a three-byte load for the final value.
     index_arrays.push_back(
@@ -5428,15 +5427,15 @@ MlxNintMoeOffloadCache::grouped(
             descriptors,
             Shape{
                 projection->experts,
-                kCccpDescriptorSize,
+                kTpqDescriptorSize,
             });
     const auto packed_bytes = checked_add(
         combined_indices.nbytes(),
         descriptor_array.nbytes(),
-        "CCCP active packed bytes");
-    MlxCccpRoutedWeight result(
+        "TPQ active packed bytes");
+    MlxTpqRoutedWeight result(
         std::make_shared<
-            MlxCccpRoutedWeight::Impl>(
+            MlxTpqRoutedWeight::Impl>(
                 std::move(descriptor_array),
                 std::move(combined_indices),
                 projection->codebooks,
@@ -5448,7 +5447,7 @@ MlxNintMoeOffloadCache::grouped(
     auto committed_bytes = checked_add(
         impl_->resident_bytes,
         staged_bytes,
-        "resident CCCP packed bytes");
+        "resident TPQ packed bytes");
 
     // Preallocate both destination hash tables before publishing any staged
     // node.  reserve() may throw, but it cannot change the logical
@@ -5457,7 +5456,7 @@ MlxNintMoeOffloadCache::grouped(
         checked_add(
             impl_->cache.size(),
             staged_cache.size(),
-            "resident CCCP cache entries"));
+            "resident TPQ cache entries"));
     Impl::ProjectionCache staged_projections;
     if (projection_is_new) {
         staged_projections.emplace(
@@ -5467,7 +5466,7 @@ MlxNintMoeOffloadCache::grouped(
             checked_add(
                 impl_->projections.size(),
                 std::size_t{1},
-                "resident CCCP projections"));
+                "resident TPQ projections"));
     }
 
     // Transferring an unordered_map node does not allocate after reserve.
@@ -5487,7 +5486,7 @@ MlxNintMoeOffloadCache::grouped(
                     std::move(node));
             if (!published.inserted) {
                 throw std::logic_error(
-                    "CCCP staged cache key already "
+                    "TPQ staged cache key already "
                     "exists");
             }
             published_keys.push_back(
@@ -5502,7 +5501,7 @@ MlxNintMoeOffloadCache::grouped(
                     std::move(node));
             if (!published.inserted) {
                 throw std::logic_error(
-                    "CCCP staged projection already "
+                    "TPQ staged projection already "
                     "exists");
             }
             projection_published = true;
