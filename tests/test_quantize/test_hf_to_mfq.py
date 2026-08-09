@@ -155,6 +155,8 @@ def test_recipe_dense_types_preserve_bf16_separately_from_f16():
         ("IQ2_XXS", "NVQ2J"),
         ("IQ3_S", "NVQ3J-L"),
         ("IQ3_XXS", "NVQ3"),
+        ("Q4_0", "NINT4"),
+        ("Q4_1", "NINT4"),
         ("Q8_0", "NINT8"),
     ],
 )
@@ -194,6 +196,13 @@ def test_hf_and_gguf_recipe_family_tables_cannot_diverge():
     from mfq.tools import quantize_gguf_to_mfq as gguf_to_mfq
 
     assert hf_to_mfq._RECIPE_TARGETS == gguf_to_mfq._RECIPE_TARGETS
+
+
+def test_artifact_provenance_omits_local_directories(tmp_path):
+    assert (
+        hf_to_mfq._artifact_provenance_name(str(tmp_path / "Q4_0.gguf"))
+        == "Q4_0.gguf"
+    )
 
 
 @pytest.mark.parametrize(
