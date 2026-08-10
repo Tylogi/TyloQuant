@@ -101,10 +101,108 @@ _VQ_STATE_BANK_OFFSET = 24
 _VQ_BANK_OFFSET = 25
 _VQ_PARAMETER_OFFSET = 26
 _VQ_ROTATION_VARIANT = 27
+_VQ_PROFILE = 28
+_VQ_RESIDUAL_CODEBOOK_OFFSET = 30
+_VQ_RESIDUAL_RECORD_OFFSET = 31
 
 
 class UnsupportedGroupedMoeError(ValueError):
     """The tensor is valid, but cannot safely use the grouped Metal kernel."""
+
+
+_NEPQ_RESIDUAL_ROUTED_SOURCE = r"""
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint logical = threadgroup_position_in_grid.x * 4u + simd_group;
+    uint total = uint(ROUTE_COUNT) * uint(PROJECTIONS) * uint(OUT);
+    if (logical >= total) {
+        return;
+    }
+    uint output = logical % uint(OUT);
+    uint projection_route = logical / uint(OUT);
+    uint projection = projection_route % uint(PROJECTIONS);
+    uint route = projection_route / uint(PROJECTIONS);
+    int expert = expert_ids[route];
+    uint base_index = (
+        route * uint(PROJECTIONS) + projection
+    ) * uint(OUT) + output;
+    if (expert < 0 || expert >= int(EXPERTS)) {
+        if (lane == 0u) {
+            y[base_index] = base[base_index];
+        }
+        return;
+    }
+    uint descriptor_base = (
+        uint(expert) * uint(PROJECTIONS) + projection
+    ) * uint(DESCRIPTOR_SIZE);
+    uint packed_profile = uint(descriptors[descriptor_base + 28u]);
+    uint position_bits = (packed_profile >> 8u) & 255u;
+    uint block_vectors = (packed_profile >> 16u) & 255u;
+    if (position_bits == 0u || block_vectors == 0u) {
+        if (lane == 0u) {
+            y[base_index] = base[base_index];
+        }
+        return;
+    }
+    uint local_expert = uint(descriptors[descriptor_base + 1u]);
+    uint rotation_variant = uint(descriptors[descriptor_base + 27u]);
+    uint blocks = (uint(NVEC) + block_vectors - 1u) / block_vectors;
+    uint pool_output = local_expert * uint(OUT) + output;
+    uint record_offset = uint(descriptors[descriptor_base + 31u]);
+    uint codebook_offset = uint(descriptors[descriptor_base + 30u]);
+    uint input_offset = (
+        rotation_variant * uint(ROUTE_COUNT) + route
+    ) * uint(K);
+    float residual = 0.0f;
+    for (uint block = lane; block < blocks; block += 32u) {
+        uint record_index = record_offset + pool_output * blocks + block;
+        short records[2] = {
+            residual_first[record_index],
+            residual_second[record_index],
+        };
+        for (uint stream = 0u; stream < 2u; ++stream) {
+            int record = int(records[stream]);
+            if (record < 0) {
+                continue;
+            }
+            uint position = uint(record) & ((1u << position_bits) - 1u);
+            uint dictionary_id = uint(record) >> position_bits;
+            uint vector = block * block_vectors + position;
+            if (dictionary_id >= 1024u || vector >= uint(NVEC)) {
+                continue;
+            }
+            for (uint component = 0u; component < 8u; ++component) {
+                residual = fma(
+                    float(x[input_offset + vector * 8u + component]),
+                    float(residual_codebooks[
+                        codebook_offset + dictionary_id * 8u + component
+                    ]),
+                    residual
+                );
+            }
+        }
+    }
+    residual = simd_sum(residual);
+    if (lane == 0u) {
+        y[base_index] = T(float(base[base_index]) + residual);
+    }
+"""
+
+_NEPQ_RESIDUAL_ROUTED_KERNEL = mx.fast.metal_kernel(
+    name="mfq_nepq_sparse_residual_routed",
+    input_names=[
+        "descriptors",
+        "residual_codebooks",
+        "residual_first",
+        "residual_second",
+        "x",
+        "expert_ids",
+        "base",
+    ],
+    output_names=["y"],
+    source=_NEPQ_RESIDUAL_ROUTED_SOURCE,
+    compile_options={"math_mode": "fast"},
+)
 
 
 _GROUPED_HEADER = (
@@ -2059,6 +2157,9 @@ class MetalMoeWeight:
     vq_parameters: mx.array
     mx_values: mx.array
     mx_scales: mx.array
+    residual_codebooks: mx.array
+    residual_first: mx.array
+    residual_second: mx.array
     descriptor_values: np.ndarray
     rotation_specs: tuple[tuple[mx.array, int, int], ...]
     experts: int
@@ -2091,6 +2192,9 @@ class MetalMoeWeight:
         vq_parameters: list[mx.array] = []
         mx_values: list[mx.array] = []
         mx_scales: list[mx.array] = []
+        residual_codebooks: list[mx.array] = []
+        residual_first: list[mx.array] = []
+        residual_second: list[mx.array] = []
 
         offsets = {
             "nint_q": 0,
@@ -2109,6 +2213,8 @@ class MetalMoeWeight:
             "vq_parameter": 0,
             "mx_value": 0,
             "mx_scale": 0,
+            "residual_codebook": 0,
+            "residual_record": 0,
         }
         rotation_variants: dict[tuple[int, int], int] = {}
         rotation_specs: list[tuple[mx.array, int, int]] = []
@@ -2250,6 +2356,17 @@ class MetalMoeWeight:
                 descriptor[_VQ_BANK_OFFSET] = offsets["vq_bank"]
                 descriptor[_VQ_PARAMETER_OFFSET] = offsets["vq_parameter"]
                 descriptor[_VQ_ROTATION_VARIANT] = rotation_variant
+                if weight.residual_position_bits:
+                    descriptor[_VQ_PROFILE] = (
+                        (weight.residual_position_bits << 8)
+                        | (weight.residual_block_vectors << 16)
+                    )
+                    descriptor[_VQ_RESIDUAL_CODEBOOK_OFFSET] = offsets[
+                        "residual_codebook"
+                    ]
+                    descriptor[_VQ_RESIDUAL_RECORD_OFFSET] = offsets[
+                        "residual_record"
+                    ]
 
             vq_indices.append(weight.indices_packed)
             vq_state.append(weight.state_packed)
@@ -2260,6 +2377,10 @@ class MetalMoeWeight:
             vq_state_to_codebank.append(weight.state_to_codebank)
             vq_banks.append(weight.bank_ids)
             vq_parameters.append(weight.parameters)
+            if weight.residual_position_bits:
+                residual_codebooks.append(weight.residual_codebook)
+                residual_first.append(weight.residual_first)
+                residual_second.append(weight.residual_second)
             offsets["vq_indices"] += _size(weight.indices_packed) + 2
             offsets["vq_state"] += _size(weight.state_packed) + 2
             offsets["vq_aux"] += _size(weight.aux_packed) + 2
@@ -2269,6 +2390,9 @@ class MetalMoeWeight:
             offsets["vq_state_bank"] += _size(weight.state_to_codebank)
             offsets["vq_bank"] += _size(weight.bank_ids)
             offsets["vq_parameter"] += _size(weight.parameters)
+            if weight.residual_position_bits:
+                offsets["residual_codebook"] += _size(weight.residual_codebook)
+                offsets["residual_record"] += _size(weight.residual_first)
 
         return cls(
             descriptors=mx.array(descriptors),
@@ -2290,6 +2414,9 @@ class MetalMoeWeight:
             vq_parameters=_join(vq_parameters, dtype=mx.float32),
             mx_values=_join(mx_values, dtype=mx.uint8),
             mx_scales=_join(mx_scales, dtype=mx.uint8),
+            residual_codebooks=_join(residual_codebooks, dtype=mx.float16),
+            residual_first=_join(residual_first, dtype=mx.int16),
+            residual_second=_join(residual_second, dtype=mx.int16),
             descriptor_values=descriptors,
             rotation_specs=tuple(rotation_specs),
             experts=tensor.n_experts,
@@ -2336,6 +2463,9 @@ class MetalMoeWeight:
             "vq_parameters",
             "mx_values",
             "mx_scales",
+            "residual_codebooks",
+            "residual_first",
+            "residual_second",
         )
         offsets = {field: 0 for field in buffer_fields}
         descriptor_sets: list[np.ndarray] = []
@@ -2365,6 +2495,13 @@ class MetalMoeWeight:
                     descriptor[_VQ_STATE_BANK_OFFSET] += offsets["vq_state_to_codebank"]
                     descriptor[_VQ_BANK_OFFSET] += offsets["vq_banks"]
                     descriptor[_VQ_PARAMETER_OFFSET] += offsets["vq_parameters"]
+                    if int(descriptor[_VQ_PROFILE]) >> 8:
+                        descriptor[_VQ_RESIDUAL_CODEBOOK_OFFSET] += offsets[
+                            "residual_codebooks"
+                        ]
+                        descriptor[_VQ_RESIDUAL_RECORD_OFFSET] += offsets[
+                            "residual_first"
+                        ]
                     local_variant = int(descriptor[_VQ_ROTATION_VARIANT])
                     if local_variant:
                         signs, block, seed = weight.rotation_specs[local_variant - 1]
@@ -2412,6 +2549,9 @@ class MetalMoeWeight:
             vq_parameters=combine("vq_parameters"),
             mx_values=combine("mx_values"),
             mx_scales=combine("mx_scales"),
+            residual_codebooks=combine("residual_codebooks"),
+            residual_first=combine("residual_first"),
+            residual_second=combine("residual_second"),
             descriptor_values=descriptor_values,
             rotation_specs=tuple(combined_specs),
             experts=first.experts,
@@ -2442,6 +2582,9 @@ class MetalMoeWeight:
             self.vq_parameters,
             self.mx_values,
             self.mx_scales,
+            self.residual_codebooks,
+            self.residual_first,
+            self.residual_second,
             *(signs for signs, _, _ in self.rotation_specs),
         )
         return sum(int(array.nbytes) for array in arrays)
@@ -2512,6 +2655,45 @@ def grouped_moe_matmul(
             for signs, block, _ in weight.rotation_specs
         )
         source = mx.contiguous(mx.concatenate(variants, axis=0))
+
+    def add_sparse_residual(base: mx.array) -> mx.array:
+        profiles = weight.descriptor_values[:, _VQ_PROFILE]
+        if not bool(np.any((profiles >> 8) != 0)):
+            return base
+        total = route_count * weight.projections * weight.out_per_expert
+        workgroups = (total + 3) // 4
+        return _NEPQ_RESIDUAL_ROUTED_KERNEL(
+            inputs=[
+                weight.descriptors,
+                weight.residual_codebooks,
+                weight.residual_first,
+                weight.residual_second,
+                source,
+                ids.reshape((route_count,)),
+                base.reshape((
+                    route_count,
+                    weight.projections * weight.out_per_expert,
+                )),
+            ],
+            template=[
+                ("T", source.dtype),
+                ("ROUTE_COUNT", route_count),
+                ("EXPERTS", weight.experts),
+                ("OUT", weight.out_per_expert),
+                ("PROJECTIONS", weight.projections),
+                ("K", weight.neuron_len),
+                ("NVEC", weight.neuron_len // 8),
+                ("DESCRIPTOR_SIZE", _DESCRIPTOR_SIZE),
+            ],
+            grid=(workgroups * 128, 1, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(
+                tokens,
+                routes,
+                weight.projections * weight.out_per_expert,
+            )],
+            output_dtypes=[source.dtype],
+        )[0]
 
     inputs = [
         weight.descriptors,
@@ -2628,15 +2810,16 @@ def grouped_moe_matmul(
                 sorted_result,
                 mx.zeros_like(sorted_result),
             ).astype(source.dtype)
-        return sorted_result.reshape(
+        result = sorted_result.reshape(
             (
                 tokens,
                 routes,
                 weight.projections * weight.out_per_expert,
             )
         )
+        return add_sparse_residual(result)
 
-    return _GROUPED_KERNEL(
+    result = _GROUPED_KERNEL(
         inputs=[*inputs, source, ids],
         template=[
             ("T", source.dtype),
@@ -2663,6 +2846,7 @@ def grouped_moe_matmul(
         ],
         output_dtypes=[source.dtype],
     )[0]
+    return add_sparse_residual(result)
 
 
 __all__ = [

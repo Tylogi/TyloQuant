@@ -148,6 +148,24 @@ public:
     const mlx::core::array& parameters() const noexcept {
         return parameters_;
     }
+    const mlx::core::array& residual_codebook() const noexcept {
+        return residual_codebook_;
+    }
+    const mlx::core::array& residual_first() const noexcept {
+        return residual_first_;
+    }
+    const mlx::core::array& residual_second() const noexcept {
+        return residual_second_;
+    }
+    int residual_position_bits() const noexcept {
+        return residual_position_bits_;
+    }
+    int residual_block_vectors() const noexcept {
+        return residual_block_vectors_;
+    }
+    int residual_blocks_per_row() const noexcept {
+        return residual_blocks_per_row_;
+    }
 
 private:
     MlxVqWeight(
@@ -161,6 +179,9 @@ private:
         mlx::core::array bank_ids,
         mlx::core::array rotation_signs,
         mlx::core::array parameters,
+        mlx::core::array residual_codebook,
+        mlx::core::array residual_first,
+        mlx::core::array residual_second,
         std::string format_label,
         std::vector<int> output_shape,
         int input_size,
@@ -180,7 +201,10 @@ private:
         int groups_per_supergroup,
         int supergroups,
         int rotation_block,
-        std::uint64_t rotation_seed);
+        std::uint64_t rotation_seed,
+        int residual_position_bits,
+        int residual_block_vectors,
+        int residual_blocks_per_row);
 
     mlx::core::array prepare_input(
         const mlx::core::array& input,
@@ -205,6 +229,9 @@ private:
     mlx::core::array bank_ids_;
     mlx::core::array rotation_signs_;
     mlx::core::array parameters_;
+    mlx::core::array residual_codebook_;
+    mlx::core::array residual_first_;
+    mlx::core::array residual_second_;
     std::string format_label_;
     std::vector<int> output_shape_;
     int input_size_ = 0;
@@ -225,6 +252,9 @@ private:
     int supergroups_ = 0;
     int rotation_block_ = 0;
     std::uint64_t rotation_seed_ = 0;
+    int residual_position_bits_ = 0;
+    int residual_block_vectors_ = 0;
+    int residual_blocks_per_row_ = 0;
 };
 
 } // namespace mfq::metal

@@ -13,12 +13,12 @@ try:
 except RuntimeError:
     pytest.skip("Metal device unavailable", allow_module_level=True)
 
-from mfq.formats.tpq import (  # noqa: E402
-    TpqInt4Tensor,
-    TpqPqSpec,
-    TpqPqTensor,
+from mfq.formats.nepq import (  # noqa: E402
+    NEPQ0_A,
+    NEPQ1_S,
+    dequantize_nepq,
+    rotation_signs,
 )
-from mfq.formats.nepq import NEPQ1_S, dequantize_nepq, rotation_signs  # noqa: E402
 from mfq.formats.nint import NintSpec  # noqa: E402
 from mfq.formats.nint8_zero import (  # noqa: E402
     dequantize_nint8_zero,
@@ -31,10 +31,16 @@ from mfq.formats.nvq import (  # noqa: E402
     NVQ3_D4_1024,
     NvqTensor,
 )
+from mfq.formats.tpq import (  # noqa: E402
+    TpqInt4Tensor,
+    TpqPqSpec,
+    TpqPqTensor,
+)
 from mfq.quantize.nint_quant import dequantize, quantize  # noqa: E402
 from mfq.quantize.nvq_quant import dequantize as dequantize_nvq  # noqa: E402
 from mfq.runtime.mlx_linear import MlxLinearGroup  # noqa: E402
 from tests.test_formats.test_nepq import _tensor as _nepq_tensor  # noqa: E402
+from tests.test_formats.test_nepq_a import _a_tensor as _nepq_a_tensor  # noqa: E402
 from tests.test_metal_vq import _jsc  # noqa: E402
 
 
@@ -285,6 +291,44 @@ def test_grouped_linear_preserves_rotated_nepq_output_shape():
         rtol=3e-5,
         atol=3e-5,
     )
+
+
+def test_grouped_linear_residual_nepq_falls_back_without_losing_residual():
+    rng = np.random.default_rng(20260892)
+    nepq, _ = _nepq_a_tensor(NEPQ0_A)
+    nint = quantize(
+        rng.normal(0, 0.1, size=(5, nepq.neuron_len)).astype(np.float32),
+        NintSpec(4, 24, 6),
+    )
+    group = MlxLinearGroup((nint, nepq))
+    assert not group.uses_grouped_kernel
+    source = rng.normal(
+        0,
+        0.1,
+        size=(2, nepq.neuron_len),
+    ).astype(np.float16)
+    actual_nint, actual_nepq = (
+        _array(item).astype(np.float32) for item in group(source)
+    )
+    signs = rotation_signs(
+        nepq.neuron_len,
+        nepq.rotation_block,
+        nepq.rotation_seed,
+    )
+    rotated = _fwht_reference(source, nepq.rotation_block, signs)
+    expected_nepq = (
+        rotated @ dequantize_nepq(nepq).reshape(-1, nepq.neuron_len).T
+    ).reshape(2, nepq.n_experts, nepq.out_per_expert)
+    np.testing.assert_allclose(
+        actual_nint,
+        source.astype(np.float32) @ dequantize(nint).T,
+        rtol=8e-4,
+        atol=8e-4,
+    )
+    relative = np.linalg.norm(actual_nepq - expected_nepq) / np.linalg.norm(
+        expected_nepq
+    )
+    assert relative < 1.5e-3
 
 
 def test_grouped_linear_preserves_prefix_shape():

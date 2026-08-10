@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -734,6 +735,174 @@ VqFixture make_rotated_nepq1_s(
         rows,
         input,
     };
+}
+
+VqFixture make_rotated_nepq0_s(
+    int output,
+    int input,
+    std::uint64_t seed = 0x1020304050607080ull) {
+    constexpr int table_banks = 2;
+    constexpr int rotation_block = 8;
+    if (input % 8 != 0) {
+        throw std::runtime_error("invalid NEPQ0-S fixture width");
+    }
+    std::vector<std::uint8_t> blob;
+    append_magic(blob, "NEP1");
+    append<std::uint8_t>(blob, 1);
+    append<std::uint8_t>(blob, 0);
+    append<std::uint8_t>(blob, 4);
+    append<std::uint8_t>(blob, 1);
+    append<std::uint32_t>(blob, 1);
+    append<std::uint32_t>(blob, output);
+    append<std::uint32_t>(blob, input);
+    append<std::uint32_t>(blob, table_banks);
+    append<std::uint32_t>(blob, rotation_block);
+    append<std::uint64_t>(blob, seed);
+    for (int bank = 0; bank < table_banks; ++bank) {
+        append_bytes(blob, npq_table(true, bank));
+    }
+    append_vq_anchors(blob, output);
+    const int groups = (input + 23) / 24;
+    const int vectors = input / 8;
+    const int supergroups = (groups + 3) / 4;
+    append_bytes(
+        blob,
+        pack_vq_values(
+            filled_vq_values(
+                static_cast<std::size_t>(output) * groups,
+                1),
+            2));
+    append_bytes(
+        blob,
+        pack_vq_values(
+            filled_vq_values(
+                static_cast<std::size_t>(output) * vectors,
+                0),
+            6));
+    for (int row = 0; row < output; ++row) {
+        for (int group = 0; group < supergroups; ++group) {
+            append<std::uint8_t>(
+                blob,
+                static_cast<std::uint8_t>(row & 1));
+        }
+    }
+    std::vector<float> dense(
+        static_cast<std::size_t>(output) * input);
+    for (int row = 0; row < output; ++row) {
+        const float first = static_cast<float>(1 + (row & 1) * 2);
+        const float second = first + 1.0f;
+        for (int column = 0; column < input; ++column) {
+            dense[static_cast<std::size_t>(row) * input + column] =
+                (column & 7) < 4 ? first : second;
+        }
+    }
+    std::vector<std::uint8_t> runtime;
+    append_magic(runtime, "HSG1");
+    append<std::uint32_t>(runtime, input);
+    append<std::uint32_t>(runtime, rotation_block);
+    append<std::uint64_t>(runtime, seed);
+    std::vector<std::int8_t> signs(input);
+    for (int column = 0; column < input; ++column) {
+        signs[column] = static_cast<std::int8_t>(
+            column % 3 == 0 ? -1 : 1);
+        append<std::int8_t>(runtime, signs[column]);
+    }
+    return {
+        "NEPQ0-S",
+        std::move(blob),
+        std::move(runtime),
+        std::move(dense),
+        std::move(signs),
+        rotation_block,
+        seed,
+        output,
+        input,
+    };
+}
+
+VqFixture add_nepq_a_residual(
+    VqFixture fixture,
+    bool second_stream) {
+    constexpr int dictionary_entries = 1024;
+    const int position_bits = second_stream ? 4 : 5;
+    const int record_bits = position_bits + 10;
+    const int block_vectors = second_stream ? 16 : 24;
+    const int vectors = fixture.input / 8;
+    const int blocks_per_row =
+        (vectors + block_vectors - 1) / block_vectors;
+    const int block_count = fixture.output * blocks_per_row;
+    fixture.dtype = second_stream ? "NEPQ1-A" : "NEPQ0-A";
+    fixture.blob[5] = static_cast<std::uint8_t>(
+        second_stream ? 5 : 4);
+
+    append_magic(fixture.blob, "NRA1");
+    append<std::uint8_t>(fixture.blob, 1);
+    append<std::uint8_t>(fixture.blob, record_bits);
+    append<std::uint8_t>(fixture.blob, position_bits);
+    append<std::uint8_t>(fixture.blob, second_stream ? 1 : 0);
+    append<std::uint32_t>(fixture.blob, dictionary_entries);
+    append<std::uint32_t>(fixture.blob, block_count);
+    append<std::uint32_t>(
+        fixture.blob,
+        second_stream ? block_count / 2 : 0);
+    append<std::uint32_t>(fixture.blob, 0);
+    append<std::uint64_t>(fixture.blob, 0);
+    fixture.blob.insert(fixture.blob.end(), 32, 0);
+    for (int dictionary = 0;
+         dictionary < dictionary_entries;
+         ++dictionary) {
+        for (int component = 0; component < 8; ++component) {
+            append<std::uint16_t>(
+                fixture.blob,
+                dictionary == 0
+                    ? 0x3800u
+                    : (dictionary == 1 ? 0xb400u : 0u));
+        }
+    }
+    std::vector<std::uint16_t> first(block_count);
+    for (int row = 0; row < fixture.output; ++row) {
+        for (int block = 0; block < blocks_per_row; ++block) {
+            const int available = std::min(
+                block_vectors,
+                vectors - block * block_vectors);
+            const int position = row % available;
+            first[row * blocks_per_row + block] =
+                static_cast<std::uint16_t>(position);
+            for (int component = 0; component < 8; ++component) {
+                fixture.dense[
+                    static_cast<std::size_t>(row) * fixture.input
+                    + (block * block_vectors + position) * 8
+                    + component
+                ] += 0.5f;
+            }
+        }
+    }
+    append_bytes(fixture.blob, pack_vq_values(first, record_bits));
+    if (second_stream) {
+        std::vector<std::uint16_t> mask(block_count, 0);
+        std::vector<std::uint16_t> second;
+        for (int block = 1; block < block_count; block += 2) {
+            const int row = block / blocks_per_row;
+            const int local_block = block % blocks_per_row;
+            const int available = std::min(
+                block_vectors,
+                vectors - local_block * block_vectors);
+            const int position = (row + 1) % available;
+            mask[block] = 1;
+            second.push_back(static_cast<std::uint16_t>(
+                (1 << position_bits) | position));
+            for (int component = 0; component < 8; ++component) {
+                fixture.dense[
+                    static_cast<std::size_t>(row) * fixture.input
+                    + (local_block * block_vectors + position) * 8
+                    + component
+                ] -= 0.25f;
+            }
+        }
+        append_bytes(fixture.blob, pack_vq_values(mask, 1));
+        append_bytes(fixture.blob, pack_vq_values(second, record_bits));
+    }
+    return fixture;
 }
 
 struct TensorFixture {
@@ -3405,6 +3574,367 @@ void test_vq_cohorts_and_ffn() {
     }
 }
 
+void test_nepq_a_routed_and_fused_swiglu() {
+    constexpr int tokens = 2;
+    constexpr int routes = 2;
+    constexpr int width = 24;
+    auto fixture = make_vq_moe_fixture({
+        add_nepq_a_residual(
+            make_rotated_nepq0_s(width, width),
+            false),
+        add_nepq_a_residual(
+            make_rotated_nepq1_s(width, width),
+            true),
+    });
+    const auto weight =
+        mfq::metal::MlxMoeWeight::from_blob(fixture.blob);
+    require(
+        weight.supports_grouped_vq_mmq(),
+        "NEPQ-A must support residual-aware grouped prefill");
+    std::vector<float> input(tokens * width);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] = static_cast<float>(
+            static_cast<int>((index * 7 + 3) % 17) - 8)
+            / 128.0f;
+    }
+    const std::vector<std::int32_t> ids{0, 1, 1, 0};
+    const mlx::core::array input_array(
+        input.begin(),
+        mlx::core::Shape{tokens, width});
+    const mlx::core::array id_array(
+        ids.begin(),
+        mlx::core::Shape{tokens, routes});
+    const auto actual = evaluated_floats(
+        weight.routed_matmul(input_array, id_array));
+    const auto projected_pairs = evaluated_floats(
+        mfq::metal::MlxMoeWeight::concatenate_projections(
+            {weight, weight}).routed_matmul(
+                input_array,
+                id_array));
+    auto fused_fixture = make_vq_moe_fixture({
+        add_nepq_a_residual(
+            make_rotated_nepq0_s(2 * width, width),
+            false),
+        add_nepq_a_residual(
+            make_rotated_nepq1_s(2 * width, width),
+            true),
+    });
+    const auto fused_weight =
+        mfq::metal::MlxMoeWeight::from_blob(fused_fixture.blob);
+    const auto fused = evaluated_floats(
+        fused_weight.routed_swiglu(input_array, id_array));
+    for (int token = 0; token < tokens; ++token) {
+        std::vector<float> source(
+            input.begin() + token * width,
+            input.begin() + (token + 1) * width);
+        for (int route = 0; route < routes; ++route) {
+            const int expert = ids[token * routes + route];
+            for (int output = 0; output < width; ++output) {
+                const float projected_value = routed_vq_dot(
+                    source,
+                    fixture,
+                    expert,
+                    output);
+                const auto offset = static_cast<std::size_t>(
+                    (token * routes + route) * width + output);
+                require_close(actual[offset], projected_value, 3e-3f);
+                require_close(
+                    projected_pairs[
+                        static_cast<std::size_t>(
+                            token * routes + route)
+                            * (2 * width)
+                        + output],
+                    projected_value,
+                    3e-3f);
+                require_close(
+                    projected_pairs[
+                        static_cast<std::size_t>(
+                            token * routes + route)
+                            * (2 * width)
+                        + width + output],
+                    projected_value,
+                    3e-3f);
+                const float gate = routed_vq_dot(
+                    source,
+                    fused_fixture,
+                    expert,
+                    output);
+                const float up = routed_vq_dot(
+                    source,
+                    fused_fixture,
+                    expert,
+                    width + output);
+                const float expected_fused = gate
+                    / (1.0f + std::exp(-gate))
+                    * up;
+                require_close(fused[offset], expected_fused, 8e-3f);
+            }
+        }
+    }
+
+    constexpr int prefill_tokens = 49;
+    std::vector<float> prefill_input(
+        prefill_tokens * width);
+    for (std::size_t index = 0;
+         index < prefill_input.size();
+         ++index) {
+        prefill_input[index] = static_cast<float>(
+            static_cast<int>((index * 11 + 1) % 23) - 11)
+            / 128.0f;
+    }
+    std::vector<std::int32_t> prefill_ids(
+        prefill_tokens * routes);
+    for (int token = 0; token < prefill_tokens; ++token) {
+        prefill_ids[token * routes] = token & 1;
+        prefill_ids[token * routes + 1] = 1 - (token & 1);
+    }
+    const auto prefill_actual = evaluated_floats(
+        weight.routed_matmul(
+            mlx::core::astype(
+                mlx::core::array(
+                    prefill_input.begin(),
+                    mlx::core::Shape{
+                        prefill_tokens,
+                        width,
+                    }),
+                mlx::core::float16),
+            mlx::core::array(
+                prefill_ids.begin(),
+                mlx::core::Shape{
+                    prefill_tokens,
+                    routes,
+                })));
+    for (int token = 0; token < prefill_tokens; ++token) {
+        const std::vector<float> token_input(
+            prefill_input.begin() + token * width,
+            prefill_input.begin() + (token + 1) * width);
+        for (int route = 0; route < routes; ++route) {
+            const int expert = prefill_ids[token * routes + route];
+            for (int output = 0; output < width; ++output) {
+                const auto offset = static_cast<std::size_t>(
+                    (token * routes + route) * width + output);
+                require_close(
+                    prefill_actual[offset],
+                    routed_vq_dot(
+                        token_input,
+                        fixture,
+                        expert,
+                        output),
+                    4e-3f);
+            }
+        }
+    }
+}
+
+mfq::metal::MlxMoeWeight make_v4f_nepq_benchmark_weight(
+    bool residual) {
+    constexpr int experts = 6;
+    constexpr int output = 2048;
+    constexpr int input = 4096;
+    std::vector<VqFixture> weights;
+    weights.reserve(experts);
+    for (int expert = 0; expert < experts; ++expert) {
+        auto weight = make_rotated_nepq0_s(
+            output,
+            input,
+            0x1020304050607080ull);
+        if (residual) {
+            weight = add_nepq_a_residual(
+                std::move(weight),
+                false);
+        }
+        weights.push_back(std::move(weight));
+    }
+    auto fixture = make_vq_moe_fixture(
+        std::move(weights));
+    return mfq::metal::MlxMoeWeight::from_blob(
+        fixture.blob);
+}
+
+double benchmark_v4f_nepq_weight(
+    const mfq::metal::MlxMoeWeight& weight,
+    const mlx::core::array& input,
+    const mlx::core::array& expert_ids,
+    int repetitions) {
+    const auto started =
+        std::chrono::steady_clock::now();
+    for (int repetition = 0;
+         repetition < repetitions;
+         ++repetition) {
+        auto output = weight.routed_matmul(
+            input,
+            expert_ids);
+        output.eval();
+    }
+    const auto elapsed =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now()
+            - started).count();
+    return elapsed / repetitions;
+}
+
+void benchmark_v4f_nepq_a() {
+    constexpr int input_width = 4096;
+    constexpr int routes = 6;
+    constexpr int repetitions = 40;
+    std::vector<float> source(input_width);
+    for (int column = 0;
+         column < input_width;
+         ++column) {
+        source[static_cast<std::size_t>(column)] =
+            static_cast<float>((column * 7) % 29 - 14)
+            / 128.0f;
+    }
+    const std::vector<std::int32_t> ids{
+        0, 1, 2, 3, 4, 5,
+    };
+    const auto input = mlx::core::astype(
+        mlx::core::array(
+            source.begin(),
+            mlx::core::Shape{1, input_width}),
+        mlx::core::float16);
+    const mlx::core::array expert_ids(
+        ids.begin(),
+        mlx::core::Shape{1, routes});
+
+    const auto base =
+        make_v4f_nepq_benchmark_weight(false);
+    const auto residual =
+        make_v4f_nepq_benchmark_weight(true);
+    for (int warmup = 0; warmup < 8; ++warmup) {
+        auto base_output = base.routed_matmul(input, expert_ids);
+        auto residual_output = residual.routed_matmul(input, expert_ids);
+        base_output.eval();
+        residual_output.eval();
+    }
+    std::vector<double> base_samples;
+    std::vector<double> residual_samples;
+    for (int round = 0; round < 9; ++round) {
+        auto measure_base = [&] {
+            base_samples.push_back(
+                benchmark_v4f_nepq_weight(
+                    base,
+                    input,
+                    expert_ids,
+                    repetitions));
+        };
+        auto measure_residual = [&] {
+            residual_samples.push_back(
+                benchmark_v4f_nepq_weight(
+                    residual,
+                    input,
+                    expert_ids,
+                    repetitions));
+        };
+        if ((round & 1) == 0) {
+            measure_base();
+            measure_residual();
+        } else {
+            measure_residual();
+            measure_base();
+        }
+    }
+    const auto median = [](std::vector<double> values) {
+        std::sort(values.begin(), values.end());
+        return values[values.size() / 2];
+    };
+    const double base_ms = median(base_samples);
+    const double residual_ms = median(residual_samples);
+    constexpr int prefill_tokens = 128;
+    constexpr int prefill_repetitions = 8;
+    std::vector<float> prefill_source(
+        prefill_tokens * input_width);
+    for (std::size_t index = 0;
+         index < prefill_source.size();
+         ++index) {
+        prefill_source[index] = static_cast<float>(
+            static_cast<int>((index * 5 + 3) % 31) - 15)
+            / 128.0f;
+    }
+    std::vector<std::int32_t> prefill_id_values(
+        prefill_tokens * routes);
+    for (int token = 0; token < prefill_tokens; ++token) {
+        for (int route = 0; route < routes; ++route) {
+            prefill_id_values[token * routes + route] =
+                (token + route) % routes;
+        }
+    }
+    const auto prefill_input = mlx::core::astype(
+        mlx::core::array(
+            prefill_source.begin(),
+            mlx::core::Shape{
+                prefill_tokens,
+                input_width,
+            }),
+        mlx::core::float16);
+    const mlx::core::array prefill_ids(
+        prefill_id_values.begin(),
+        mlx::core::Shape{
+            prefill_tokens,
+            routes,
+        });
+    for (int warmup = 0; warmup < 4; ++warmup) {
+        auto base_output = base.routed_matmul(
+            prefill_input,
+            prefill_ids);
+        auto residual_output = residual.routed_matmul(
+            prefill_input,
+            prefill_ids);
+        base_output.eval();
+        residual_output.eval();
+    }
+    base_samples.clear();
+    residual_samples.clear();
+    for (int round = 0; round < 7; ++round) {
+        auto measure_base = [&] {
+            base_samples.push_back(
+                benchmark_v4f_nepq_weight(
+                    base,
+                    prefill_input,
+                    prefill_ids,
+                    prefill_repetitions));
+        };
+        auto measure_residual = [&] {
+            residual_samples.push_back(
+                benchmark_v4f_nepq_weight(
+                    residual,
+                    prefill_input,
+                    prefill_ids,
+                    prefill_repetitions));
+        };
+        if ((round & 1) == 0) {
+            measure_base();
+            measure_residual();
+        } else {
+            measure_residual();
+            measure_base();
+        }
+    }
+    const double base_prefill_ms = median(base_samples);
+    const double residual_prefill_ms = median(residual_samples);
+    const auto bandwidth = [](const auto& weight, double ms) {
+        return static_cast<double>(weight.packed_nbytes())
+            / (ms * 1.0e6);
+    };
+    std::cout
+        << "V4F routed MoE decode benchmark"
+        << " in=4096 out=2048 top_k=6 reps="
+        << repetitions << "\n"
+        << "NEPQ0-S " << base_ms << " ms/dispatch "
+        << bandwidth(base, base_ms) << " effective-GB/s\n"
+        << "NEPQ0-A " << residual_ms << " ms/dispatch "
+        << bandwidth(residual, residual_ms)
+        << " effective-GB/s overhead="
+        << (residual_ms / base_ms - 1.0) * 100.0
+        << "%\n"
+        << "grouped-M128 NEPQ0-S " << base_prefill_ms
+        << " ms/dispatch\n"
+        << "grouped-M128 NEPQ0-A " << residual_prefill_ms
+        << " ms/dispatch overhead="
+        << (residual_prefill_ms / base_prefill_ms - 1.0) * 100.0
+        << "%\n";
+}
+
 void test_grouped_vq_mmq_prefill() {
     constexpr int tokens = 49;
     constexpr int routes = 2;
@@ -3883,12 +4413,26 @@ void test_container_validation() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (
+            argc == 2
+            && std::string_view(argv[1])
+                == "--benchmark-nepq-a"
+        ) {
+            benchmark_v4f_nepq_a();
+            return 0;
+        }
+        if (argc != 1) {
+            throw std::runtime_error(
+                "usage: mfq-metal-moe-test "
+                "[--benchmark-nepq-a]");
+        }
         test_all_families_and_projections();
         test_swiglu_ffn();
         test_mxfp4_nintm_and_projection_offsets();
         test_vq_cohorts_and_ffn();
+        test_nepq_a_routed_and_fused_swiglu();
         test_grouped_vq_mmq_prefill();
         test_grouped_mxfp4_vq_mmq_prefill();
         test_container_validation();

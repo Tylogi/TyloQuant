@@ -752,6 +752,83 @@ constexpr const char* kHadamardSource = R"METAL(
     }
 )METAL";
 
+constexpr const char* kResidualMatmulSource = R"METAL(
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint logical = threadgroup_position_in_grid.x * 4u + simd_group;
+    uint total = uint(M) * uint(OUT);
+    if (logical >= total) {
+        return;
+    }
+    uint input_row = logical / uint(OUT);
+    uint output = logical - input_row * uint(OUT);
+    float residual = 0.0f;
+    for (uint block = lane; block < uint(RESIDUAL_BLOCKS); block += 32u) {
+        uint record_index = output * uint(RESIDUAL_BLOCKS) + block;
+        short records[2] = {
+            residual_first[record_index],
+            residual_second[record_index],
+        };
+        for (uint stream = 0u; stream < 2u; ++stream) {
+            int record = int(records[stream]);
+            if (record < 0) {
+                continue;
+            }
+            uint position = uint(record) & ((1u << uint(POSITION_BITS)) - 1u);
+            uint dictionary_id = uint(record) >> uint(POSITION_BITS);
+            uint vector = block * uint(BLOCK_VECTORS) + position;
+            if (dictionary_id >= 1024u || vector >= uint(NVEC)) {
+                continue;
+            }
+            uint input_offset = input_row * uint(K) + vector * 8u;
+            uint dictionary_offset = dictionary_id * 8u;
+            for (uint component = 0u; component < 8u; ++component) {
+                residual = fma(
+                    float(x[input_offset + component]),
+                    float(residual_codebook[dictionary_offset + component]),
+                    residual
+                );
+            }
+        }
+    }
+    residual = simd_sum(residual);
+    if (lane == 0u) {
+        y[logical] = T(float(base[logical]) + residual);
+    }
+)METAL";
+
+constexpr const char* kResidualDequantizeSource = R"METAL(
+    uint logical = thread_position_in_grid.x;
+    uint total = uint(OUT) * uint(K);
+    if (logical >= total) {
+        return;
+    }
+    uint output = logical / uint(K);
+    uint column = logical - output * uint(K);
+    uint vector = column >> 3u;
+    uint component = column & 7u;
+    uint block = vector / uint(BLOCK_VECTORS);
+    uint position_in_block = vector - block * uint(BLOCK_VECTORS);
+    uint record_index = output * uint(RESIDUAL_BLOCKS) + block;
+    short records[2] = {
+        residual_first[record_index],
+        residual_second[record_index],
+    };
+    float value = float(base[logical]);
+    for (uint stream = 0u; stream < 2u; ++stream) {
+        int record = int(records[stream]);
+        if (record < 0) {
+            continue;
+        }
+        uint position = uint(record) & ((1u << uint(POSITION_BITS)) - 1u);
+        uint dictionary_id = uint(record) >> uint(POSITION_BITS);
+        if (position == position_in_block && dictionary_id < 1024u) {
+            value += float(residual_codebook[dictionary_id * 8u + component]);
+        }
+    }
+    y[logical] = T(value);
+)METAL";
+
 class BlobCursor {
 public:
     explicit BlobCursor(std::span<const std::uint8_t> blob)
@@ -834,6 +911,9 @@ struct CanonicalVq {
     detail::StagingVector<std::uint8_t> state_to_codebank;
     detail::StagingVector<std::uint8_t> bank_ids;
     detail::StagingVector<std::int8_t> rotation_signs;
+    detail::StagingVector<float> residual_codebook;
+    detail::StagingVector<std::int16_t> residual_first;
+    detail::StagingVector<std::int16_t> residual_second;
     float parameter = 0.0f;
     std::string label;
     std::vector<int> output_shape;
@@ -855,6 +935,9 @@ struct CanonicalVq {
     int supergroups = 1;
     int rotation_block = 0;
     std::uint64_t rotation_seed = 0;
+    int residual_position_bits = 0;
+    int residual_block_vectors = 0;
+    int residual_blocks_per_row = 0;
 };
 
 bool magic_is(
@@ -929,6 +1012,29 @@ detail::StagingVector<std::uint8_t> padded_stream(
     result.insert(result.end(), 2, 0);
     if (result.size() < 3) {
         result.resize(3, 0);
+    }
+    return result;
+}
+
+detail::StagingVector<std::uint16_t> unpack_u16_stream(
+    BlobCursor& cursor,
+    std::size_t count,
+    int bits,
+    const char* name) {
+    const auto bytes = cursor.bytes(
+        packed_nbytes(count, bits),
+        name);
+    detail::StagingVector<std::uint16_t> result(count, 0);
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto first_bit = index * static_cast<std::size_t>(bits);
+        std::uint16_t value = 0;
+        for (int bit = 0; bit < bits; ++bit) {
+            const auto source_bit = first_bit + static_cast<std::size_t>(bit);
+            value |= static_cast<std::uint16_t>(
+                ((bytes[source_bit / 8] >> (source_bit & 7)) & 1u)
+                << bit);
+        }
+        result[index] = value;
     }
     return result;
 }
@@ -1813,22 +1919,29 @@ CanonicalVq parse_npq(
 struct NepqProfile {
     int id = 0;
     const char* label = "";
+    int base_id = 0;
     int state_bits = 0;
     int index_bits = 0;
     int auxiliary_bits = 0;
     std::size_t table_bytes = 0;
+    int residual_block_vectors = 0;
+    bool residual_second = false;
 };
 
 NepqProfile nepq_profile(int id) {
     switch (id) {
         case 0:
-            return {0, "NEPQ0-S", 2, 6, 0, 320};
+            return {0, "NEPQ0-S", 0, 2, 6, 0, 320, 0, false};
         case 1:
-            return {1, "NEPQ0-L", 3, 7, 0, 832};
+            return {1, "NEPQ0-L", 1, 3, 7, 0, 832, 0, false};
         case 2:
-            return {2, "NEPQ1-S", 4, 9, 1, 2048};
+            return {2, "NEPQ1-S", 2, 4, 9, 1, 2048, 0, false};
         case 3:
-            return {3, "NEPQ1-L", 3, 11, 1, 4096};
+            return {3, "NEPQ1-L", 3, 3, 11, 1, 4096, 0, false};
+        case 4:
+            return {4, "NEPQ0-A", 0, 2, 6, 0, 320, 24, false};
+        case 5:
+            return {5, "NEPQ1-A", 2, 4, 9, 1, 2048, 16, true};
         default:
             throw std::runtime_error(
                 "unknown NEPQ cohort profile");
@@ -1967,6 +2080,10 @@ CanonicalVq parse_nepq(
         throw std::runtime_error(
             "NEPQ rotation seed requires a nonzero block");
     }
+    if (profile.residual_block_vectors != 0 && rotation_block == 0) {
+        throw std::runtime_error(
+            "NEPQ-A requires a Hadamard rotation");
+    }
 
     const auto output_count = checked_product(
         static_cast<std::size_t>(n_experts),
@@ -1998,7 +2115,7 @@ CanonicalVq parse_nepq(
         rotation_block,
         rotation_seed);
 
-    if (profile.id == 0 || profile.id == 1) {
+    if (profile.base_id == 0 || profile.base_id == 1) {
         result.code_banks = result.states;
         result.code_bank_mode = kCodeBankState;
         result.aux_mode = kAuxNone;
@@ -2008,7 +2125,7 @@ CanonicalVq parse_nepq(
             result.state_to_codebank[state] =
                 static_cast<std::uint8_t>(state);
         }
-    } else if (profile.id == 2) {
+    } else if (profile.base_id == 2) {
         result.code_banks = 2;
         result.code_bank_mode = kCodeBankAux;
         result.aux_mode = kAuxDelta;
@@ -2030,11 +2147,11 @@ CanonicalVq parse_nepq(
         const auto* table = cursor.view(
             profile.table_bytes,
             "NEPQ table bank");
-        if (profile.id == 0 || profile.id == 1) {
+        if (profile.base_id == 0 || profile.base_id == 1) {
             append_product_codebook(
                 result,
                 table,
-                profile.id == 0);
+                profile.base_id == 0);
             continue;
         }
         for (int state = 0;
@@ -2043,7 +2160,7 @@ CanonicalVq parse_nepq(
             result.scales.push_back(
                 static_cast<float>(state));
         }
-        if (profile.id == 2) {
+        if (profile.base_id == 2) {
             for (int code_bank = 0;
                  code_bank < 2;
                  ++code_bank) {
@@ -2098,6 +2215,156 @@ CanonicalVq parse_nepq(
             static_cast<std::size_t>(result.supergroups),
             "NEPQ bank-selector count"),
         "NEPQ bank selectors");
+    if (profile.residual_block_vectors != 0) {
+        const auto header_offset = cursor.offset();
+        if (!magic_is(
+                cursor.magic("NEPQ-A residual magic"),
+                "NRA1")) {
+            throw std::runtime_error(
+                "invalid NEPQ-A residual header");
+        }
+        const auto residual_version =
+            cursor.scalar<std::uint8_t>("NEPQ-A residual version");
+        const auto record_bits =
+            cursor.scalar<std::uint8_t>("NEPQ-A residual record bits");
+        const auto position_bits =
+            cursor.scalar<std::uint8_t>("NEPQ-A residual position bits");
+        const auto residual_flags =
+            cursor.scalar<std::uint8_t>("NEPQ-A residual flags");
+        const auto dictionary_entries =
+            cursor.scalar<std::uint32_t>("NEPQ-A dictionary entries");
+        const auto block_count =
+            cursor.scalar<std::uint32_t>("NEPQ-A block count");
+        const auto second_count =
+            cursor.scalar<std::uint32_t>("NEPQ-A second count");
+        const auto padding_nbytes =
+            cursor.scalar<std::uint32_t>("NEPQ-A padding size");
+        const auto reserved =
+            cursor.scalar<std::uint64_t>("NEPQ-A reserved field");
+        const auto consumed_header = cursor.offset() - header_offset;
+        if (consumed_header > 64) {
+            throw std::runtime_error("invalid NEPQ-A residual header size");
+        }
+        const auto header_padding = cursor.bytes(
+            64 - consumed_header,
+            "NEPQ-A residual header padding");
+        if (std::any_of(
+                header_padding.begin(),
+                header_padding.end(),
+                [](std::uint8_t value) { return value != 0; })) {
+            throw std::runtime_error(
+                "NEPQ-A residual header padding must be zero");
+        }
+        int expected_position_bits = 0;
+        for (int capacity = 1;
+             capacity < profile.residual_block_vectors;
+             capacity <<= 1) {
+            ++expected_position_bits;
+        }
+        const int expected_record_bits = expected_position_bits + 10;
+        result.residual_block_vectors = profile.residual_block_vectors;
+        result.residual_position_bits = expected_position_bits;
+        result.residual_blocks_per_row =
+            (result.vectors + result.residual_block_vectors - 1)
+            / result.residual_block_vectors;
+        const auto expected_blocks = checked_product(
+            output_count,
+            static_cast<std::size_t>(result.residual_blocks_per_row),
+            "NEPQ-A residual block count");
+        const auto expected_flags =
+            static_cast<std::uint8_t>(profile.residual_second ? 1 : 0);
+        if (residual_version != 1 ||
+            record_bits != expected_record_bits ||
+            position_bits != expected_position_bits ||
+            residual_flags != expected_flags ||
+            dictionary_entries != 1024 ||
+            block_count != expected_blocks ||
+            reserved != 0 ||
+            (!profile.residual_second && second_count != 0)) {
+            throw std::runtime_error(
+                "unsupported NEPQ-A residual profile");
+        }
+        result.residual_codebook = read_half_values(
+            cursor,
+            1024 * 8,
+            "NEPQ-A residual dictionary",
+            false);
+        const auto first = unpack_u16_stream(
+            cursor,
+            expected_blocks,
+            expected_record_bits,
+            "NEPQ-A first residual stream");
+        result.residual_first.assign(first.begin(), first.end());
+        result.residual_second.assign(expected_blocks, -1);
+        if (profile.residual_second) {
+            const auto mask = unpack_u16_stream(
+                cursor,
+                expected_blocks,
+                1,
+                "NEPQ-A second residual bitmap");
+            const auto second = unpack_u16_stream(
+                cursor,
+                second_count,
+                expected_record_bits,
+                "NEPQ-A second residual stream");
+            std::size_t compact = 0;
+            for (std::size_t block = 0; block < expected_blocks; ++block) {
+                if (mask[block] == 0) {
+                    continue;
+                }
+                if (compact >= second.size()) {
+                    throw std::runtime_error(
+                        "NEPQ-A second residual count mismatch");
+                }
+                result.residual_second[block] =
+                    static_cast<std::int16_t>(second[compact++]);
+            }
+            if (compact != second.size()) {
+                throw std::runtime_error(
+                    "NEPQ-A second residual count mismatch");
+            }
+        }
+        const auto position_mask =
+            (1u << result.residual_position_bits) - 1u;
+        auto validate_record = [&](std::uint16_t record, std::size_t block) {
+            const auto position = record & position_mask;
+            const auto dictionary_id =
+                record >> result.residual_position_bits;
+            const auto block_in_row = static_cast<int>(
+                block % static_cast<std::size_t>(
+                    result.residual_blocks_per_row));
+            const int available = std::min(
+                result.residual_block_vectors,
+                result.vectors
+                    - block_in_row * result.residual_block_vectors);
+            if (dictionary_id >= 1024 ||
+                position >= static_cast<std::uint32_t>(available)) {
+                throw std::runtime_error(
+                    "NEPQ-A residual record is out of range");
+            }
+        };
+        for (std::size_t block = 0; block < expected_blocks; ++block) {
+            validate_record(
+                static_cast<std::uint16_t>(result.residual_first[block]),
+                block);
+            if (result.residual_second[block] >= 0) {
+                validate_record(
+                    static_cast<std::uint16_t>(
+                        result.residual_second[block]),
+                    block);
+            }
+        }
+        const auto padding = cursor.bytes(
+            padding_nbytes,
+            "NEPQ-A residual padding");
+        if (std::any_of(
+                padding.begin(),
+                padding.end(),
+                [](std::uint8_t value) { return value != 0; })) {
+            throw std::runtime_error(
+                "NEPQ-A residual padding must be zero");
+        }
+    }
     if (cursor.remaining() != 0) {
         throw std::runtime_error(
             "invalid NEPQ cohort tail");
@@ -2272,6 +2539,10 @@ VqTensorMetadata inspect_nepq_header(
     if (input_size % 8 != 0 ||
         table_banks > 256 ||
         (
+            profile.residual_block_vectors != 0
+            && rotation_block == 0
+        ) ||
+        (
             rotation_block != 0 &&
             (
                 (rotation_block
@@ -2331,7 +2602,8 @@ CanonicalVq parse_vq(
         return parse_npq(dtype, blob, dtype == "NPQ0-S");
     }
     if (dtype == "NEPQ0-S" || dtype == "NEPQ0-L" ||
-        dtype == "NEPQ1-S" || dtype == "NEPQ1-L") {
+        dtype == "NEPQ1-S" || dtype == "NEPQ1-L" ||
+        dtype == "NEPQ0-A" || dtype == "NEPQ1-A") {
         return parse_nepq(
             dtype,
             blob,
@@ -2536,6 +2808,59 @@ hadamard_kernel() {
     return kernel;
 }
 
+mlx::core::fast::CustomKernelFunction
+make_residual_matmul_kernel() {
+    CompileOptions options;
+    options.math_mode = MathMode::Fast;
+    return mlx::core::fast::metal_kernel(
+        "mfq_cpp_nepq_sparse_residual_matmul",
+        {
+            "base",
+            "x",
+            "residual_codebook",
+            "residual_first",
+            "residual_second",
+        },
+        {"y"},
+        kResidualMatmulSource,
+        "",
+        true,
+        false,
+        options);
+}
+
+const mlx::core::fast::CustomKernelFunction&
+residual_matmul_kernel() {
+    static const auto kernel = make_residual_matmul_kernel();
+    return kernel;
+}
+
+mlx::core::fast::CustomKernelFunction
+make_residual_dequantize_kernel() {
+    CompileOptions options;
+    options.math_mode = MathMode::Fast;
+    return mlx::core::fast::metal_kernel(
+        "mfq_cpp_nepq_sparse_residual_dequantize",
+        {
+            "base",
+            "residual_codebook",
+            "residual_first",
+            "residual_second",
+        },
+        {"y"},
+        kResidualDequantizeSource,
+        "",
+        true,
+        false,
+        options);
+}
+
+const mlx::core::fast::CustomKernelFunction&
+residual_dequantize_kernel() {
+    static const auto kernel = make_residual_dequantize_kernel();
+    return kernel;
+}
+
 std::vector<std::pair<
     std::string,
     mlx::core::fast::TemplateArg>>
@@ -2591,7 +2916,8 @@ VqTensorMetadata inspect_vq_blob(
             + std::string(dtype));
     }
     if (dtype == "NEPQ0-S" || dtype == "NEPQ0-L" ||
-        dtype == "NEPQ1-S" || dtype == "NEPQ1-L") {
+        dtype == "NEPQ1-S" || dtype == "NEPQ1-L" ||
+        dtype == "NEPQ0-A" || dtype == "NEPQ1-A") {
         return inspect_nepq_header(
             dtype,
             blob,
@@ -2604,7 +2930,7 @@ VqTensorMetadata inspect_vq_blob(
 }
 
 bool is_vq_dtype(std::string_view dtype) noexcept {
-    constexpr std::array<std::string_view, 16> dtypes{
+    constexpr std::array<std::string_view, 18> dtypes{
         "NVQ2",
         "NVQ2J",
         "NVQ2J-L",
@@ -2621,6 +2947,8 @@ bool is_vq_dtype(std::string_view dtype) noexcept {
         "NEPQ0-S",
         "NEPQ1-L",
         "NEPQ1-S",
+        "NEPQ0-A",
+        "NEPQ1-A",
     };
     return std::find(
         dtypes.begin(),
@@ -2639,6 +2967,9 @@ MlxVqWeight::MlxVqWeight(
     array bank_ids,
     array rotation_signs,
     array parameters,
+    array residual_codebook,
+    array residual_first,
+    array residual_second,
     std::string format_label,
     std::vector<int> output_shape,
     int input_size,
@@ -2658,7 +2989,10 @@ MlxVqWeight::MlxVqWeight(
     int groups_per_supergroup,
     int supergroups,
     int rotation_block,
-    std::uint64_t rotation_seed)
+    std::uint64_t rotation_seed,
+    int residual_position_bits,
+    int residual_block_vectors,
+    int residual_blocks_per_row)
     : indices_packed_(std::move(indices_packed)),
       state_packed_(std::move(state_packed)),
       aux_packed_(std::move(aux_packed)),
@@ -2669,6 +3003,9 @@ MlxVqWeight::MlxVqWeight(
       bank_ids_(std::move(bank_ids)),
       rotation_signs_(std::move(rotation_signs)),
       parameters_(std::move(parameters)),
+      residual_codebook_(std::move(residual_codebook)),
+      residual_first_(std::move(residual_first)),
+      residual_second_(std::move(residual_second)),
       format_label_(std::move(format_label)),
       output_shape_(std::move(output_shape)),
       input_size_(input_size),
@@ -2688,7 +3025,10 @@ MlxVqWeight::MlxVqWeight(
       groups_per_supergroup_(groups_per_supergroup),
       supergroups_(supergroups),
       rotation_block_(rotation_block),
-      rotation_seed_(rotation_seed) {}
+      rotation_seed_(rotation_seed),
+      residual_position_bits_(residual_position_bits),
+      residual_block_vectors_(residual_block_vectors),
+      residual_blocks_per_row_(residual_blocks_per_row) {}
 
 MlxVqWeight MlxVqWeight::from_blob(
     std::string_view dtype,
@@ -2701,6 +3041,18 @@ MlxVqWeight MlxVqWeight::from_blob(
     auto rotations = parsed.rotation_signs;
     if (rotations.empty()) {
         rotations.push_back(1);
+    }
+    auto residual_codebook = parsed.residual_codebook;
+    auto residual_first = parsed.residual_first;
+    auto residual_second = parsed.residual_second;
+    if (residual_codebook.empty()) {
+        residual_codebook.push_back(0.0f);
+    }
+    if (residual_first.empty()) {
+        residual_first.push_back(-1);
+    }
+    if (residual_second.empty()) {
+        residual_second.push_back(-1);
     }
     return MlxVqWeight(
         make_array(
@@ -2754,6 +3106,15 @@ MlxVqWeight MlxVqWeight::from_blob(
         make_array(
             std::vector<float>{parsed.parameter},
             Shape{1}),
+        make_array(
+            residual_codebook,
+            Shape{static_cast<int>(residual_codebook.size())}),
+        make_array(
+            residual_first,
+            Shape{static_cast<int>(residual_first.size())}),
+        make_array(
+            residual_second,
+            Shape{static_cast<int>(residual_second.size())}),
         std::move(parsed.label),
         std::move(parsed.output_shape),
         parsed.input_size,
@@ -2773,7 +3134,10 @@ MlxVqWeight MlxVqWeight::from_blob(
         parsed.groups_per_supergroup,
         parsed.supergroups,
         parsed.rotation_block,
-        parsed.rotation_seed);
+        parsed.rotation_seed,
+        parsed.residual_position_bits,
+        parsed.residual_block_vectors,
+        parsed.residual_blocks_per_row);
 }
 
 std::size_t MlxVqWeight::packed_nbytes() const noexcept {
@@ -2786,7 +3150,10 @@ std::size_t MlxVqWeight::packed_nbytes() const noexcept {
         + state_to_codebank_.nbytes()
         + bank_ids_.nbytes()
         + rotation_signs_.nbytes()
-        + parameters_.nbytes();
+        + parameters_.nbytes()
+        + residual_codebook_.nbytes()
+        + residual_first_.nbytes()
+        + residual_second_.nbytes();
 }
 
 array MlxVqWeight::dequantize(Dtype dtype) const {
@@ -2849,7 +3216,37 @@ array MlxVqWeight::dequantize(Dtype dtype) const {
         std::nullopt,
         false,
         {});
-    return std::move(outputs.front());
+    auto result = std::move(outputs.front());
+    if (residual_position_bits_ == 0) {
+        return result;
+    }
+    auto residual_outputs = residual_dequantize_kernel()(
+        {
+            result,
+            residual_codebook_,
+            residual_first_,
+            residual_second_,
+        },
+        {Shape{output_size_, input_size_}},
+        {dtype},
+        {static_cast<int>(size), 1, 1},
+        {
+            std::min(256, static_cast<int>(size)),
+            1,
+            1,
+        },
+        {
+            {"T", dtype},
+            {"OUT", output_size_},
+            {"K", input_size_},
+            {"RESIDUAL_BLOCKS", residual_blocks_per_row_},
+            {"POSITION_BITS", residual_position_bits_},
+            {"BLOCK_VECTORS", residual_block_vectors_},
+        },
+        std::nullopt,
+        false,
+        {});
+    return std::move(residual_outputs.front());
 }
 
 array MlxVqWeight::embedding(
@@ -3184,9 +3581,50 @@ array MlxVqWeight::packed_matmul(
         std::nullopt,
         false,
         {});
-    return reshape_output(
-        std::move(outputs.front()),
-        prefix);
+    auto result = std::move(outputs.front());
+    if (residual_position_bits_ != 0) {
+        const auto total = checked_product(
+            static_cast<std::size_t>(rows),
+            static_cast<std::size_t>(output_size_),
+            "NEPQ-A residual output size");
+        const auto workgroups = (total + 3) / 4;
+        const auto residual_grid = checked_product(
+            workgroups,
+            std::size_t{128},
+            "NEPQ-A residual grid");
+        if (residual_grid > static_cast<std::size_t>(
+                std::numeric_limits<int>::max())) {
+            throw std::runtime_error(
+                "NEPQ-A residual grid exceeds MLX limits");
+        }
+        auto residual_outputs = residual_matmul_kernel()(
+            {
+                result,
+                source,
+                residual_codebook_,
+                residual_first_,
+                residual_second_,
+            },
+            {Shape{rows, output_size_}},
+            {source.dtype()},
+            {static_cast<int>(residual_grid), 1, 1},
+            {128, 1, 1},
+            {
+                {"T", source.dtype()},
+                {"M", rows},
+                {"OUT", output_size_},
+                {"K", input_size_},
+                {"NVEC", vectors_},
+                {"RESIDUAL_BLOCKS", residual_blocks_per_row_},
+                {"POSITION_BITS", residual_position_bits_},
+                {"BLOCK_VECTORS", residual_block_vectors_},
+            },
+            std::nullopt,
+            false,
+            {});
+        result = std::move(residual_outputs.front());
+    }
+    return reshape_output(std::move(result), prefix);
 }
 
 array MlxVqWeight::gemv(const array& input) const {

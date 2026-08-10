@@ -20,11 +20,6 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
         "MFQ's Metal backend requires MLX; install with `pip install -e '.[metal]'`"
     ) from exc
 
-from mfq.kernels.metal.tpq import (
-    _PQ_INDEX_HEADER,
-    MetalTpqInt4Weight,
-    MetalTpqPqWeight,
-)
 from mfq.kernels.metal.moe import (
     _DESCRIPTOR_SIZE,
     _FAMILY,
@@ -74,6 +69,11 @@ from mfq.kernels.metal.moe import (
 )
 from mfq.kernels.metal.nint import MetalNintWeight
 from mfq.kernels.metal.nint8_zero import MetalNint8ZeroWeight
+from mfq.kernels.metal.tpq import (
+    _PQ_INDEX_HEADER,
+    MetalTpqInt4Weight,
+    MetalTpqPqWeight,
+)
 from mfq.kernels.metal.vq import MetalVqWeight, signed_hadamard
 
 _FAMILY_TPQ_INT4 = 3
@@ -210,6 +210,8 @@ _GROUPED_LINEAR_SOURCE = r"""
                     vq_state_to_codebank,
                     vq_banks,
                     vq_parameters,
+                    vq_aux,
+                    vq_aux,
                     descriptor_base,
                     output,
                     column,

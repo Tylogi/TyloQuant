@@ -281,9 +281,82 @@ inline void decode_vq_group24(
     }
 }
 
+inline void add_nepq_residual_group24(
+    const device int* d,
+    const device float* codebooks,
+    const device short* first_records,
+    const device short* second_records,
+    threadgroup half* target,
+    uint row,
+    uint group,
+    uint vectors) {
+    uint residual_profile = uint(d[28]);
+    uint position_bits = (residual_profile >> 8u) & 255u;
+    uint block_vectors = (residual_profile >> 16u) & 255u;
+    if (position_bits == 0u || block_vectors == 0u) {
+        return;
+    }
+    uint residual_blocks =
+        (vectors + block_vectors - 1u) / block_vectors;
+    uint codebook_offset = uint(d[30]);
+    uint record_offset = uint(d[31]);
+    uint position_mask = (1u << position_bits) - 1u;
+    uint first_vector = group * 3u;
+    uint last_vector = min(first_vector + 2u, vectors - 1u);
+    uint first_block = first_vector / block_vectors;
+    uint last_block = last_vector / block_vectors;
+    for (uint block = first_block; block <= last_block; ++block) {
+        uint record_index =
+            record_offset + row * residual_blocks + block;
+        short records[2] = {
+            first_records[record_index],
+            second_records[record_index],
+        };
+        for (uint stream = 0u; stream < 2u; ++stream) {
+            int record = int(records[stream]);
+            if (record < 0) {
+                continue;
+            }
+            uint position = uint(record) & position_mask;
+            uint dictionary_id = uint(record) >> position_bits;
+            uint vector = block * block_vectors + position;
+            if (
+                dictionary_id >= 1024u
+                || vector < first_vector
+                || vector > last_vector
+                || vector >= vectors
+            ) {
+                continue;
+            }
+            uint target_offset = (vector - first_vector) * 8u;
+            uint dictionary_offset =
+                codebook_offset + dictionary_id * 8u;
+            for (uint component = 0u; component < 8u; ++component) {
+                target[target_offset + component] += half(
+                    codebooks[dictionary_offset + component]);
+            }
+        }
+    }
+}
+
 } // namespace
 
-template <bool FUSED_SWIGLU>
+struct MfqGroupedVqParams {
+    int route_count;
+    int tokens;
+    int routes;
+    int experts;
+    int output_width;
+    int matrix_output_width;
+    int input_width;
+    int descriptor_size;
+    int variant_stride;
+    int shared_input;
+    int input_sorted;
+    float swiglu_limit;
+};
+
+template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
 [[kernel]] void mfq_grouped_vq_mmq_f16_bm32_bn64_bk96(
     const device int* descriptors [[buffer(0)]],
     const device uchar* vq_indices [[buffer(1)]],
@@ -298,23 +371,15 @@ template <bool FUSED_SWIGLU>
     const device half* x [[buffer(10)]],
     const device int* expert_ids [[buffer(11)]],
     const device int* route_order [[buffer(12)]],
-    const device int* block_meta [[buffer(26)]],
-    const device int* block_count [[buffer(27)]],
-    const device uchar* mx_values [[buffer(28)]],
-    const device uchar* mx_scales [[buffer(29)]],
     device half* y [[buffer(13)]],
-    constant int& route_count [[buffer(14)]],
-    constant int& tokens [[buffer(15)]],
-    constant int& routes [[buffer(16)]],
-    constant int& experts [[buffer(17)]],
-    constant int& output_width [[buffer(18)]],
-    constant int& matrix_output_width [[buffer(19)]],
-    constant int& input_width [[buffer(20)]],
-    constant int& descriptor_size [[buffer(21)]],
-    constant int& variant_stride [[buffer(22)]],
-    constant int& shared_input [[buffer(23)]],
-    constant int& input_sorted [[buffer(24)]],
-    constant float& swiglu_limit [[buffer(25)]],
+    constant MfqGroupedVqParams& params [[buffer(14)]],
+    const device float* vq_residual_codebooks [[buffer(15)]],
+    const device short* vq_residual_first [[buffer(16)]],
+    const device short* vq_residual_second [[buffer(17)]],
+    const device int* block_meta [[buffer(18)]],
+    const device int* block_count [[buffer(19)]],
+    const device uchar* mx_values [[buffer(20)]],
+    const device uchar* mx_scales [[buffer(21)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
@@ -324,6 +389,18 @@ template <bool FUSED_SWIGLU>
     constexpr int BK = 96;
     constexpr int BK_padded = 104;
     constexpr uint TGP_SIZE = 256u;
+    const int route_count = params.route_count;
+    const int tokens = params.tokens;
+    const int routes = params.routes;
+    const int experts = params.experts;
+    const int output_width = params.output_width;
+    const int matrix_output_width = params.matrix_output_width;
+    const int input_width = params.input_width;
+    const int descriptor_size = params.descriptor_size;
+    const int variant_stride = params.variant_stride;
+    const int shared_input = params.shared_input;
+    const int input_sorted = params.input_sorted;
+    const float swiglu_limit = params.swiglu_limit;
     using mma_t = mlx::steel::BlockMMA<
         half,
         half,
@@ -453,6 +530,18 @@ template <bool FUSED_SWIGLU>
                             pool_row,
                             group,
                             uint(input_width));
+                        if constexpr (HAS_NEPQ_RESIDUAL) {
+                            add_nepq_residual_group24(
+                                descriptor,
+                                vq_residual_codebooks,
+                                vq_residual_first,
+                                vq_residual_second,
+                                Ws + output_row * uint(BK_padded)
+                                    + local_group * 24u,
+                                pool_row,
+                                group,
+                                uint(descriptor[7]));
+                        }
                     }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -488,14 +577,24 @@ template <bool FUSED_SWIGLU>
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-#define instantiate_mfq_grouped_vq(name, fused) \
+#define instantiate_mfq_grouped_vq(name, fused, residual) \
     template [[host_name(name)]] [[kernel]] \
-    decltype(mfq_grouped_vq_mmq_f16_bm32_bn64_bk96<fused>) \
-    mfq_grouped_vq_mmq_f16_bm32_bn64_bk96<fused>;
+    decltype(mfq_grouped_vq_mmq_f16_bm32_bn64_bk96<fused, residual>) \
+    mfq_grouped_vq_mmq_f16_bm32_bn64_bk96<fused, residual>;
 
 instantiate_mfq_grouped_vq(
     "mfq_grouped_vq_mmq_f16_bm32_bn64_bk96",
+    false,
     false)
 instantiate_mfq_grouped_vq(
     "mfq_grouped_vq_swiglu_f16_bm32_bn64_bk96",
+    true,
+    false)
+instantiate_mfq_grouped_vq(
+    "mfq_grouped_vq_mmq_f16_bm32_bn64_bk96_nr",
+    false,
+    true)
+instantiate_mfq_grouped_vq(
+    "mfq_grouped_vq_swiglu_f16_bm32_bn64_bk96_nr",
+    true,
     true)

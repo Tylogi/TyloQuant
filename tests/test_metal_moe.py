@@ -13,7 +13,13 @@ except RuntimeError:
 
 from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
 from mfq.formats.mx import MxTensor  # noqa: E402
-from mfq.formats.nepq import NEPQ0_S, dequantize_nepq, rotation_signs  # noqa: E402
+from mfq.formats.nepq import (  # noqa: E402
+    NEPQ0_A,
+    NEPQ0_S,
+    NEPQ1_A,
+    dequantize_nepq,
+    rotation_signs,
+)
 from mfq.formats.nint import NintSpec  # noqa: E402
 from mfq.formats.nint8_zero import (  # noqa: E402
     dequantize_nint8_zero,
@@ -29,6 +35,7 @@ from mfq.kernels.metal.moe import grouped_moe_matmul  # noqa: E402
 from mfq.quantize.nint_quant import dequantize, quantize  # noqa: E402
 from mfq.runtime.mlx_moe import MlxRoutedLinear, MlxRoutedSwiGLUFFN  # noqa: E402
 from tests.test_formats.test_nepq import _tensor as _nepq_tensor  # noqa: E402
+from tests.test_formats.test_nepq_a import _a_tensor as _nepq_a_tensor  # noqa: E402
 from tests.test_metal_vq import (  # noqa: E402
     _fwht_reference,
     _jsc,
@@ -99,6 +106,49 @@ def _mxfp4_rows(rows: int, width: int, seed: int) -> tuple[MxTensor, np.ndarray]
         axis=1,
     )
     return MxTensor("MXFP4", (rows, width), values, scales), decoded
+
+
+@pytest.mark.parametrize("spec", [NEPQ0_A, NEPQ1_A])
+def test_routed_nepq_a_sparse_residual_uses_grouped_dispatch(spec):
+    tensor, _ = _nepq_a_tensor(spec)
+    moe = NintMoeTensor(
+        tensor.shape,
+        (
+            NintMoePool(
+                np.arange(tensor.n_experts, dtype=np.int32),
+                tensor,
+            ),
+        ),
+    )
+    layer = MlxRoutedLinear(moe)
+    assert layer.uses_grouped_kernel
+
+    rng = np.random.default_rng(20260860 + spec.profile_id)
+    source = rng.normal(
+        0.0,
+        0.1,
+        size=(3, tensor.neuron_len),
+    ).astype(np.float16)
+    ids = np.asarray([[0, 1], [1, 0], [0, 0]], dtype=np.int32)
+    actual = _array(layer(source, ids)).astype(np.float32)
+
+    signs = rotation_signs(
+        tensor.neuron_len,
+        tensor.rotation_block,
+        tensor.rotation_seed,
+    )
+    transformed = _fwht_reference(
+        source,
+        tensor.rotation_block,
+        signs,
+    ).astype(np.float32)
+    dense = dequantize_nepq(tensor)
+    expected = np.empty_like(actual)
+    for token in range(ids.shape[0]):
+        for route in range(ids.shape[1]):
+            expected[token, route] = transformed[token] @ dense[ids[token, route]].T
+    relative = np.linalg.norm(actual - expected) / np.linalg.norm(expected)
+    assert relative < 1.5e-3
 
 
 @pytest.mark.parametrize("path", ["direct", "compact", "route_mma", "expert_mma"])

@@ -103,6 +103,8 @@ constexpr int kVqParameterOffset = 26;
 constexpr int kVqRotationVariant = 27;
 constexpr int kVqProfile = 28;
 constexpr int kVqJscExecution = 29;
+constexpr int kVqResidualCodebookOffset = 30;
+constexpr int kVqResidualRecordOffset = 31;
 constexpr int kVqProfileGeneric = 0;
 constexpr int kVqProfileJsc4 = 1;
 constexpr int kVqProfileNpqS = 2;
@@ -1053,7 +1055,7 @@ constexpr const char* kMoeSource = R"METAL(
         }
 
         uint profile =
-            uint(descriptors[descriptor_base + 28u]);
+            uint(descriptors[descriptor_base + 28u]) & 255u;
         if (
             (uint(VQ_PROFILE_MASK) & 2u) != 0u
             && profile == 1u
@@ -1945,6 +1947,73 @@ constexpr const char* kMoeSource = R"METAL(
         }
     }
 
+    if (
+        uint(HAS_NEPQ_RESIDUAL) != 0u
+        && family == 1u
+    ) {
+        uint residual_profile =
+            uint(descriptors[descriptor_base + 28u]);
+        uint position_bits = (residual_profile >> 8u) & 255u;
+        uint block_vectors = (residual_profile >> 16u) & 255u;
+        if (position_bits != 0u && block_vectors != 0u) {
+            uint vectors =
+                uint(descriptors[descriptor_base + 7u]);
+            uint residual_blocks =
+                (vectors + block_vectors - 1u) / block_vectors;
+            uint residual_codebook_offset =
+                uint(descriptors[descriptor_base + 30u]);
+            uint residual_record_offset =
+                uint(descriptors[descriptor_base + 31u]);
+            uint position_mask = (1u << position_bits) - 1u;
+            for (
+                uint block = k_lane;
+                block < residual_blocks;
+                block += K_LANES
+            ) {
+                for (uint row = 0u; row < MATRIX_ROWS; ++row) {
+                    uint output = min(
+                        output_base + (
+                            uint(FUSED_SWIGLU) != 0u
+                                ? (row / ROWS_PER_SIMD) * uint(OUT)
+                                    + row % ROWS_PER_SIMD
+                                : row
+                        ),
+                        uint(MATRIX_OUT) - 1u);
+                    uint pool_output =
+                        local_expert * uint(MATRIX_OUT) + output;
+                    uint record_index = residual_record_offset
+                        + pool_output * residual_blocks + block;
+                    short records[2] = {
+                        vq_residual_first[record_index],
+                        vq_residual_second[record_index],
+                    };
+                    for (uint stream = 0u; stream < 2u; ++stream) {
+                        int record = int(records[stream]);
+                        if (record < 0) {
+                            continue;
+                        }
+                        uint position = uint(record) & position_mask;
+                        uint dictionary_id = uint(record) >> position_bits;
+                        uint vector = block * block_vectors + position;
+                        if (dictionary_id >= 1024u || vector >= vectors) {
+                            continue;
+                        }
+                        uint input_offset = x_offset + vector * 8u;
+                        uint dictionary_offset = residual_codebook_offset
+                            + dictionary_id * 8u;
+                        for (uint component = 0u; component < 8u; ++component) {
+                            accumulators[row] = fma(
+                                float(x[input_offset + component]),
+                                vq_residual_codebooks[
+                                    dictionary_offset + component],
+                                accumulators[row]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if (uint(FUSED_SWIGLU) != 0u) {
         for (
             uint row = 0u;
@@ -2419,6 +2488,7 @@ struct NativeMoeConfig {
     int jsc_execution_layout = 0;
     int family_mask = 0;
     int vq_profile_mask = 0;
+    int has_nepq_residual = 0;
     int npq_grouped_indices = 0;
     int sorted_routes = 0;
     int workgroups = 0;
@@ -2439,8 +2509,26 @@ struct GroupedVqMmqConfig {
     int shared_input = 0;
     int input_sorted = 0;
     int fused_swiglu = 0;
+    int has_nepq_residual = 0;
     float swiglu_limit = 0.0f;
 };
+
+struct GroupedVqMmqParameters {
+    int route_count = 0;
+    int tokens = 0;
+    int routes = 0;
+    int experts = 0;
+    int output_width = 0;
+    int matrix_output_width = 0;
+    int input_width = 0;
+    int descriptor_size = 0;
+    int variant_stride = 0;
+    int shared_input = 0;
+    int input_sorted = 0;
+    float swiglu_limit = 0.0f;
+};
+
+static_assert(sizeof(GroupedVqMmqParameters) == 48);
 
 // Adapted from oMLX's DeepSeek-V4 block-list builder.  The expert IDs have
 // already been sorted, so one GPU thread can find each expert's contiguous
@@ -2613,6 +2701,7 @@ std::string native_moe_kernel_name(
         << "_jl" << config.jsc_execution_layout
         << "_fm" << config.family_mask
         << "_vm" << config.vq_profile_mask
+        << "_nr" << config.has_nepq_residual
         << "_ni" << config.npq_grouped_indices;
     name << "_sr" << config.sorted_routes;
     return name.str();
@@ -2647,13 +2736,16 @@ std::string make_native_moe_source(
         << "device const uchar* vq_state_to_codebank [[buffer(14)]],\n"
         << "device const uchar* vq_banks [[buffer(15)]],\n"
         << "device const float* vq_parameters [[buffer(16)]],\n"
-        << "device const uchar* mx_values [[buffer(17)]],\n"
-        << "device const uchar* mx_scales [[buffer(18)]],\n"
-        << "device const T* x [[buffer(19)]],\n"
-        << "device const int* expert_ids [[buffer(20)]],\n"
-        << "device const int* route_order [[buffer(21)]],\n"
-        << "device const float* params [[buffer(22)]],\n"
-        << "device T* y [[buffer(23)]],\n"
+        << "device const float* vq_residual_codebooks [[buffer(17)]],\n"
+        << "device const short* vq_residual_first [[buffer(18)]],\n"
+        << "device const short* vq_residual_second [[buffer(19)]],\n"
+        << "device const uchar* mx_values [[buffer(20)]],\n"
+        << "device const uchar* mx_scales [[buffer(21)]],\n"
+        << "device const T* x [[buffer(22)]],\n"
+        << "device const int* expert_ids [[buffer(23)]],\n"
+        << "device const int* route_order [[buffer(24)]],\n"
+        << "device const float* params [[buffer(25)]],\n"
+        << "device T* y [[buffer(26)]],\n"
         << "uint thread_index_in_simdgroup "
            "[[thread_index_in_simdgroup]],\n"
         << "uint simdgroup_index_in_threadgroup "
@@ -2685,6 +2777,8 @@ std::string make_native_moe_source(
         << config.family_mask << ";\n"
         << "constexpr int VQ_PROFILE_MASK = "
         << config.vq_profile_mask << ";\n"
+        << "constexpr int HAS_NEPQ_RESIDUAL = "
+        << config.has_nepq_residual << ";\n"
         << "constexpr int NPQ_GROUPED_INDICES = "
         << config.npq_grouped_indices << ";\n"
         << "constexpr int SORTED_ROUTES = "
@@ -2714,7 +2808,7 @@ public:
     void eval_gpu(
         const std::vector<array>& inputs,
         array& output) override {
-        if (inputs.size() != 23) {
+        if (inputs.size() != 26) {
             throw std::logic_error(
                 "native NINTM primitive input count mismatch");
         }
@@ -2740,12 +2834,12 @@ public:
             mlx::core::metal::get_command_encoder(
                 selected_stream);
         encoder.set_compute_pipeline_state(kernel);
-        for (int index = 0; index < 23; ++index) {
+        for (int index = 0; index < 26; ++index) {
             encoder.set_input_array(
                 inputs[static_cast<std::size_t>(index)],
                 index);
         }
-        encoder.set_output_array(output, 23);
+        encoder.set_output_array(output, 26);
         encoder.dispatch_threadgroups(
             MTL::Size(config_.workgroups, 1, 1),
             MTL::Size(64, 1, 1));
@@ -2812,7 +2906,7 @@ public:
     void eval_gpu(
         const std::vector<array>& inputs,
         array& output) override {
-        if (inputs.size() != 25) {
+        if (inputs.size() != 28) {
             throw std::logic_error(
                 "grouped VQ MMQ primitive input count mismatch");
         }
@@ -2824,7 +2918,7 @@ public:
         CompileOptions compile_options;
         compile_options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
-            "mfq_grouped_vq_mmq_v8",
+            "mfq_grouped_vq_mmq_v9",
             compile_options,
             [] {
                 std::string source;
@@ -2850,31 +2944,41 @@ public:
                 inputs[static_cast<std::size_t>(source)],
                 source - 7);
         }
-        for (int source = 19; source <= 21; ++source) {
+        for (int source = 22; source <= 24; ++source) {
             encoder.set_input_array(
                 inputs[static_cast<std::size_t>(source)],
-                source - 9);
+                source - 12);
         }
-        encoder.set_input_array(inputs[23], 26);
-        encoder.set_input_array(inputs[24], 27);
-        encoder.set_input_array(inputs[17], 28);
-        encoder.set_input_array(inputs[18], 29);
+        const GroupedVqMmqParameters parameters{
+            .route_count = config_.route_count,
+            .tokens = config_.tokens,
+            .routes = config_.routes,
+            .experts = config_.experts,
+            .output_width = config_.output_width,
+            .matrix_output_width = config_.matrix_output_width,
+            .input_width = config_.input_width,
+            .descriptor_size = config_.descriptor_size,
+            .variant_stride = config_.variant_stride,
+            .shared_input = config_.shared_input,
+            .input_sorted = config_.input_sorted,
+            .swiglu_limit = config_.swiglu_limit,
+        };
         encoder.set_output_array(output, 13);
-        encoder.set_bytes(config_.route_count, 14);
-        encoder.set_bytes(config_.tokens, 15);
-        encoder.set_bytes(config_.routes, 16);
-        encoder.set_bytes(config_.experts, 17);
-        encoder.set_bytes(config_.output_width, 18);
-        encoder.set_bytes(config_.matrix_output_width, 19);
-        encoder.set_bytes(config_.input_width, 20);
-        encoder.set_bytes(config_.descriptor_size, 21);
-        encoder.set_bytes(config_.variant_stride, 22);
-        encoder.set_bytes(config_.shared_input, 23);
-        encoder.set_bytes(config_.input_sorted, 24);
-        encoder.set_bytes(config_.swiglu_limit, 25);
+        encoder.set_bytes(parameters, 14);
+        encoder.set_input_array(inputs[17], 15);
+        encoder.set_input_array(inputs[18], 16);
+        encoder.set_input_array(inputs[19], 17);
+        encoder.set_input_array(inputs[26], 18);
+        encoder.set_input_array(inputs[27], 19);
+        encoder.set_input_array(inputs[20], 20);
+        encoder.set_input_array(inputs[21], 21);
         const char* kernel_name = config_.fused_swiglu != 0
-            ? "mfq_grouped_vq_swiglu_f16_bm32_bn64_bk96"
-            : "mfq_grouped_vq_mmq_f16_bm32_bn64_bk96";
+            ? (config_.has_nepq_residual != 0
+                ? "mfq_grouped_vq_swiglu_f16_bm32_bn64_bk96_nr"
+                : "mfq_grouped_vq_swiglu_f16_bm32_bn64_bk96")
+            : (config_.has_nepq_residual != 0
+                ? "mfq_grouped_vq_mmq_f16_bm32_bn64_bk96_nr"
+                : "mfq_grouped_vq_mmq_f16_bm32_bn64_bk96");
         auto* kernel = device.get_kernel(
             kernel_name,
             library);
@@ -2905,6 +3009,8 @@ public:
             && primitive->config_.shared_input == config_.shared_input
             && primitive->config_.input_sorted == config_.input_sorted
             && primitive->config_.fused_swiglu == config_.fused_swiglu
+            && primitive->config_.has_nepq_residual
+                == config_.has_nepq_residual
             && primitive->config_.swiglu_limit == config_.swiglu_limit;
     }
 
@@ -2960,6 +3066,9 @@ make_moe_kernel() {
             "vq_state_to_codebank",
             "vq_banks",
             "vq_parameters",
+            "vq_residual_codebooks",
+            "vq_residual_first",
+            "vq_residual_second",
             "mx_values",
             "mx_scales",
             "x",
@@ -3052,6 +3161,9 @@ struct PackedStreams {
         vq_state_to_codebank;
     detail::StagingVector<std::uint8_t> vq_banks;
     detail::StagingVector<std::uint8_t> vq_parameters;
+    detail::StagingVector<std::uint8_t> vq_residual_codebooks;
+    detail::StagingVector<std::uint8_t> vq_residual_first;
+    detail::StagingVector<std::uint8_t> vq_residual_second;
     detail::StagingVector<std::uint8_t> mx_values;
     detail::StagingVector<std::uint8_t> mx_scales;
 };
@@ -3811,6 +3923,14 @@ MlxVqWeight add_vq_pool(
         streams.vq_parameters.size()
             / sizeof(float),
         "VQ parameter offset");
+    const int residual_codebook_offset = checked_int(
+        streams.vq_residual_codebooks.size()
+            / sizeof(float),
+        "VQ residual codebook offset");
+    const int residual_record_offset = checked_int(
+        streams.vq_residual_first.size()
+            / sizeof(std::int16_t),
+        "VQ residual record offset");
     const int rotation =
         rotation_variant(weight, rotations);
 
@@ -3878,7 +3998,7 @@ MlxVqWeight add_vq_pool(
             parameter_offset;
         descriptors[base + kVqRotationVariant] =
             rotation;
-        descriptors[base + kVqProfile] =
+        const int execution_profile =
             dtype == "NVQ2J-L" || dtype == "NVQ2J-XL"
                 ? kVqProfileJscExtended8
                 : dtype == "NVQ2J" || dtype == "NVQ3J"
@@ -3910,8 +4030,16 @@ MlxVqWeight add_vq_pool(
                                 )
                         )
                 );
+        descriptors[base + kVqProfile] =
+            execution_profile
+            | (weight.residual_position_bits() << 8)
+            | (weight.residual_block_vectors() << 16);
         descriptors[base + kVqJscExecution] =
             static_cast<int>(jsc_execution);
+        descriptors[base + kVqResidualCodebookOffset] =
+            residual_codebook_offset;
+        descriptors[base + kVqResidualRecordOffset] =
+            residual_record_offset;
     }
 
     if (jsc_execution) {
@@ -3968,6 +4096,23 @@ MlxVqWeight add_vq_pool(
         weight.parameters(),
         mlx::core::float32,
         "VQ parameters");
+    if (weight.residual_position_bits() != 0) {
+        append_raw(
+            streams.vq_residual_codebooks,
+            weight.residual_codebook(),
+            mlx::core::float32,
+            "VQ residual codebooks");
+        append_raw(
+            streams.vq_residual_first,
+            weight.residual_first(),
+            mlx::core::int16,
+            "VQ first residual records");
+        append_raw(
+            streams.vq_residual_second,
+            weight.residual_second(),
+            mlx::core::int16,
+            "VQ second residual records");
+    }
     return weight;
 }
 
@@ -5627,6 +5772,9 @@ struct MlxNintMoeWeight::Impl {
     array vq_state_to_codebank;
     array vq_banks;
     array vq_parameters;
+    array vq_residual_codebooks;
+    array vq_residual_first;
+    array vq_residual_second;
     array mx_values;
     array mx_scales;
     std::vector<RotationSpec> rotations;
@@ -5642,6 +5790,7 @@ struct MlxNintMoeWeight::Impl {
     bool npq_grouped_indices = true;
     bool native_primitive = true;
     bool grouped_vq_mmq = false;
+    bool has_nepq_residual = false;
     int k_lanes_override = 0;
     std::size_t packed_bytes = 0;
 
@@ -5663,6 +5812,9 @@ struct MlxNintMoeWeight::Impl {
         array vq_state_bank_array,
         array vq_bank_array,
         array vq_parameter_array,
+        array vq_residual_codebook_array,
+        array vq_residual_first_array,
+        array vq_residual_second_array,
         array mx_value_array,
         array mx_scale_array,
         std::vector<RotationSpec> rotation_values,
@@ -5694,6 +5846,12 @@ struct MlxNintMoeWeight::Impl {
           vq_banks(std::move(vq_bank_array)),
           vq_parameters(
               std::move(vq_parameter_array)),
+          vq_residual_codebooks(
+              std::move(vq_residual_codebook_array)),
+          vq_residual_first(
+              std::move(vq_residual_first_array)),
+          vq_residual_second(
+              std::move(vq_residual_second_array)),
           mx_values(std::move(mx_value_array)),
           mx_scales(std::move(mx_scale_array)),
           rotations(std::move(rotation_values)),
@@ -5717,10 +5875,13 @@ struct MlxNintMoeWeight::Impl {
             }
             if (family == kFamilyVq) {
                 const auto profile = descriptor_values[
-                    base + kVqProfile];
+                    base + kVqProfile] & 255;
                 if (profile >= 0 && profile < 8) {
                     vq_profile_mask |= std::uint32_t{1}
                         << static_cast<unsigned>(profile);
+                }
+                if ((descriptor_values[base + kVqProfile] >> 8) != 0) {
+                    has_nepq_residual = true;
                 }
             }
             const bool supported_vq =
@@ -5792,6 +5953,9 @@ struct MlxNintMoeWeight::Impl {
             + vq_state_to_codebank.nbytes()
             + vq_banks.nbytes()
             + vq_parameters.nbytes()
+            + vq_residual_codebooks.nbytes()
+            + vq_residual_first.nbytes()
+            + vq_residual_second.nbytes()
             + mx_values.nbytes()
             + mx_scales.nbytes();
         for (const auto& rotation : rotations) {
@@ -6107,6 +6271,15 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
             std::move(streams.vq_parameters),
             mlx::core::float32),
         make_raw_array(
+            std::move(streams.vq_residual_codebooks),
+            mlx::core::float32),
+        make_raw_array(
+            std::move(streams.vq_residual_first),
+            mlx::core::int16),
+        make_raw_array(
+            std::move(streams.vq_residual_second),
+            mlx::core::int16),
+        make_raw_array(
             std::move(streams.mx_values),
             mlx::core::uint8),
         make_raw_array(
@@ -6188,6 +6361,8 @@ MlxNintMoeWeight MlxNintMoeWeight::concatenate_projections(
     std::size_t vq_state_bank_offset = 0;
     std::size_t vq_bank_offset = 0;
     std::size_t vq_parameter_offset = 0;
+    std::size_t vq_residual_codebook_offset = 0;
+    std::size_t vq_residual_record_offset = 0;
     std::size_t mx_value_offset = 0;
     std::size_t mx_scale_offset = 0;
 
@@ -6207,6 +6382,9 @@ MlxNintMoeWeight MlxNintMoeWeight::concatenate_projections(
     std::vector<array> vq_state_bank_arrays;
     std::vector<array> vq_bank_arrays;
     std::vector<array> vq_parameter_arrays;
+    std::vector<array> vq_residual_codebook_arrays;
+    std::vector<array> vq_residual_first_arrays;
+    std::vector<array> vq_residual_second_arrays;
     std::vector<array> mx_value_arrays;
     std::vector<array> mx_scale_arrays;
     std::vector<RotationSpec> combined_rotations;
@@ -6333,6 +6511,16 @@ MlxNintMoeWeight MlxNintMoeWeight::concatenate_projections(
                             kVqParameterOffset],
                         vq_parameter_offset,
                         "VQ parameter offset");
+                descriptor[kVqResidualCodebookOffset] =
+                    descriptor_with_offset(
+                        descriptor[kVqResidualCodebookOffset],
+                        vq_residual_codebook_offset,
+                        "VQ residual codebook offset");
+                descriptor[kVqResidualRecordOffset] =
+                    descriptor_with_offset(
+                        descriptor[kVqResidualRecordOffset],
+                        vq_residual_record_offset,
+                        "VQ residual record offset");
                 const int local_rotation =
                     descriptor[
                         kVqRotationVariant];
@@ -6394,6 +6582,12 @@ MlxNintMoeWeight MlxNintMoeWeight::concatenate_projections(
         vq_bank_arrays.push_back(source.vq_banks);
         vq_parameter_arrays.push_back(
             source.vq_parameters);
+        vq_residual_codebook_arrays.push_back(
+            source.vq_residual_codebooks);
+        vq_residual_first_arrays.push_back(
+            source.vq_residual_first);
+        vq_residual_second_arrays.push_back(
+            source.vq_residual_second);
         mx_value_arrays.push_back(source.mx_values);
         mx_scale_arrays.push_back(source.mx_scales);
 
@@ -6453,6 +6647,14 @@ MlxNintMoeWeight MlxNintMoeWeight::concatenate_projections(
             vq_parameter_offset,
             source.vq_parameters.size(),
             "VQ parameter stream size");
+        vq_residual_codebook_offset = checked_add(
+            vq_residual_codebook_offset,
+            source.vq_residual_codebooks.size(),
+            "VQ residual codebook stream size");
+        vq_residual_record_offset = checked_add(
+            vq_residual_record_offset,
+            source.vq_residual_first.size(),
+            "VQ residual record stream size");
         mx_value_offset = checked_add(
             mx_value_offset,
             source.mx_values.size(),
@@ -6500,6 +6702,12 @@ MlxNintMoeWeight MlxNintMoeWeight::concatenate_projections(
             std::move(vq_bank_arrays)),
         concatenate_1d(
             std::move(vq_parameter_arrays)),
+        concatenate_1d(
+            std::move(vq_residual_codebook_arrays)),
+        concatenate_1d(
+            std::move(vq_residual_first_arrays)),
+        concatenate_1d(
+            std::move(vq_residual_second_arrays)),
         concatenate_1d(std::move(mx_value_arrays)),
         concatenate_1d(std::move(mx_scale_arrays)),
         std::move(combined_rotations),
@@ -6694,6 +6902,9 @@ array MlxNintMoeWeight::routed_matmul_sorted(
         impl_->vq_state_to_codebank,
         impl_->vq_banks,
         impl_->vq_parameters,
+        impl_->vq_residual_codebooks,
+        impl_->vq_residual_first,
+        impl_->vq_residual_second,
         impl_->mx_values,
         impl_->mx_scales,
         source,
@@ -6745,6 +6956,8 @@ array MlxNintMoeWeight::routed_matmul_sorted(
             .shared_input = static_cast<int>(shared_input),
             .input_sorted = static_cast<int>(input_is_sorted),
             .fused_swiglu = static_cast<int>(fused_swiglu),
+            .has_nepq_residual = static_cast<int>(
+                impl_->has_nepq_residual),
             .swiglu_limit = swiglu_limit,
         });
 }
@@ -6944,6 +7157,9 @@ array MlxNintMoeWeight::routed_matmul_impl(
         impl_->vq_state_to_codebank,
         impl_->vq_banks,
         impl_->vq_parameters,
+        impl_->vq_residual_codebooks,
+        impl_->vq_residual_first,
+        impl_->vq_residual_second,
         impl_->mx_values,
         impl_->mx_scales,
         source,
@@ -6983,6 +7199,8 @@ array MlxNintMoeWeight::routed_matmul_impl(
                 .descriptor_size = kDescriptorSize,
                 .variant_stride = variant_stride,
                 .shared_input = static_cast<int>(shared_input),
+                .has_nepq_residual = static_cast<int>(
+                    impl_->has_nepq_residual),
             });
         auto inverse_order = mlx::core::argsort(route_order);
         auto restored = mlx::core::take(
@@ -7026,6 +7244,8 @@ array MlxNintMoeWeight::routed_matmul_impl(
                 .family_mask = static_cast<int>(impl_->family_mask),
                 .vq_profile_mask = static_cast<int>(
                     impl_->vq_profile_mask),
+                .has_nepq_residual = static_cast<int>(
+                    impl_->has_nepq_residual),
                 .npq_grouped_indices = static_cast<int>(
                     impl_->npq_grouped_indices),
                 .sorted_routes = static_cast<int>(
@@ -7076,6 +7296,11 @@ array MlxNintMoeWeight::routed_matmul_impl(
                 "VQ_PROFILE_MASK",
                 static_cast<int>(
                     impl_->vq_profile_mask),
+            },
+            {
+                "HAS_NEPQ_RESIDUAL",
+                static_cast<int>(
+                    impl_->has_nepq_residual),
             },
             {
                 "NPQ_GROUPED_INDICES",

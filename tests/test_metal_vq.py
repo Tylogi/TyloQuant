@@ -16,8 +16,10 @@ except RuntimeError:
 from mfq.formats import io  # noqa: E402
 from mfq.formats.header import FileHeader  # noqa: E402
 from mfq.formats.nepq import (  # noqa: E402
+    NEPQ0_A,
     NEPQ0_L,
     NEPQ0_S,
+    NEPQ1_A,
     NEPQ1_L,
     NEPQ1_S,
     dequantize_nepq,
@@ -55,6 +57,7 @@ from mfq.kernels.metal.vq import (  # noqa: E402
     vq_matmul,
     vq_mmq,
     vq_swiglu,
+    vq_swiglu_compatible,
 )
 from mfq.quantize.npq0_l import dequantize_npq0_l  # noqa: E402
 from mfq.quantize.npq0_s import dequantize_npq0_s  # noqa: E402
@@ -64,6 +67,7 @@ from mfq.quantize.nvq_jsc import dequantize_nvq_jsc  # noqa: E402
 from mfq.quantize.nvq_quant import dequantize as dequantize_nvq  # noqa: E402
 from mfq.runtime import MlxNintModel, MlxVqEmbedding, MlxVqLinear  # noqa: E402
 from tests.test_formats.test_nepq import _tensor as _nepq_tensor  # noqa: E402
+from tests.test_formats.test_nepq_a import _a_tensor as _nepq_a_tensor  # noqa: E402
 
 
 def _array(value: mx.array) -> np.ndarray:
@@ -427,6 +431,49 @@ def test_nepq_rotation_runs_on_metal_before_matmul():
     np.testing.assert_allclose(actual_dequant, expected, rtol=5e-3, atol=5e-3)
 
 
+@pytest.mark.parametrize("spec", [NEPQ0_A, NEPQ1_A])
+@pytest.mark.parametrize(
+    "rows,operation",
+    [(1, vq_gemv), (4, vq_mmq), (17, vq_gemm)],
+)
+def test_nepq_a_sparse_residual_paths(spec, rows: int, operation):
+    tensor, _ = _nepq_a_tensor(spec)
+    weight = MetalVqWeight.from_tensor(tensor)
+    dense = dequantize_nepq(tensor).reshape(-1, tensor.neuron_len)
+    actual_dense = _array(vq_dequantize(weight)).astype(np.float32)
+    np.testing.assert_allclose(actual_dense, dense, rtol=0, atol=1.1e-3)
+
+    source = (
+        np.random.default_rng(20260840 + spec.profile_id * 100 + rows)
+        .normal(0.0, 0.1, size=(rows, tensor.neuron_len))
+        .astype(np.float16)
+    )
+    signs = rotation_signs(
+        tensor.neuron_len,
+        tensor.rotation_block,
+        tensor.rotation_seed,
+    )
+    transformed = _fwht_reference(
+        source,
+        tensor.rotation_block,
+        signs,
+    ).astype(np.float32)
+    expected = (transformed @ dense.T).reshape(
+        rows,
+        tensor.n_experts,
+        tensor.out_per_expert,
+    )
+    actual = _array(operation(weight, source)).astype(np.float32)
+    relative = np.linalg.norm(actual - expected) / np.linalg.norm(expected)
+    assert relative < 1.5e-3
+
+
+def test_nepq_a_rejects_residual_unaware_vq_swiglu_fusion():
+    tensor, _ = _nepq_a_tensor(NEPQ1_A)
+    weight = MetalVqWeight.from_tensor(tensor)
+    assert not vq_swiglu_compatible(weight, weight)
+
+
 @pytest.mark.parametrize("rows", [1, 8, 32])
 def test_vq_dispatcher_preserves_prefix_shape(rows: int):
     tensor, decoded = _npq(True, 901)
@@ -534,4 +581,44 @@ def test_nepq_mmap_runtime_preserves_expert_output_shape(tmp_path):
         decoded = dequantize_nepq(canonical).reshape(-1, tensor.neuron_len)
         expected = (source @ decoded.T).reshape(3, tensor.n_experts, tensor.out_per_expert)
         np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-5)
+        assert not model.tensors._cache
+
+
+@pytest.mark.parametrize("spec", [NEPQ0_A, NEPQ1_A])
+def test_nepq_a_mmap_runtime_loads_packed_weight(spec, tmp_path):
+    tensor, _ = _nepq_a_tensor(spec)
+    name = "model.layers.0.mlp.experts.gate_up_proj.weight"
+    path = tmp_path / f"metal-{spec.label}.mfq"
+    io.save(
+        path,
+        FileHeader(model_arch="metal-nepq-a", num_tensors=1),
+        {name: tensor},
+    )
+    source = (
+        np.random.default_rng(20260891 + spec.profile_id)
+        .normal(0.0, 0.1, size=(3, tensor.neuron_len))
+        .astype(np.float16)
+    )
+    signs = rotation_signs(
+        tensor.neuron_len,
+        tensor.rotation_block,
+        tensor.rotation_seed,
+    )
+    transformed = _fwht_reference(
+        source,
+        tensor.rotation_block,
+        signs,
+    ).astype(np.float32)
+    dense = dequantize_nepq(tensor).reshape(-1, tensor.neuron_len)
+    expected = (transformed @ dense.T).reshape(
+        3,
+        tensor.n_experts,
+        tensor.out_per_expert,
+    )
+    with MlxNintModel.from_mfq(path) as model:
+        layer = model.linear(name)
+        assert isinstance(layer, MlxVqLinear)
+        actual = _array(layer(source)).astype(np.float32)
+        relative = np.linalg.norm(actual - expected) / np.linalg.norm(expected)
+        assert relative < 1.5e-3
         assert not model.tensors._cache

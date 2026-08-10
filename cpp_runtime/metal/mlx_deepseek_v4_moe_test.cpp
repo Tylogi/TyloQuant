@@ -407,6 +407,86 @@ TensorFixture make_nepq1_s(
     };
 }
 
+TensorFixture add_nepq1_a_residual(
+    TensorFixture fixture) {
+    constexpr int dictionary_entries = 1024;
+    constexpr int position_bits = 4;
+    constexpr int record_bits = 14;
+    constexpr int block_vectors = 16;
+    const int vectors = fixture.input / 8;
+    const int blocks_per_row =
+        (vectors + block_vectors - 1) / block_vectors;
+    const int block_count = fixture.output * blocks_per_row;
+    fixture.dtype = "NEPQ1-A";
+    fixture.blob[5] = 5;
+
+    append_magic(fixture.blob, "NRA1");
+    append<std::uint8_t>(fixture.blob, 1);
+    append<std::uint8_t>(fixture.blob, record_bits);
+    append<std::uint8_t>(fixture.blob, position_bits);
+    append<std::uint8_t>(fixture.blob, 1);
+    append<std::uint32_t>(fixture.blob, dictionary_entries);
+    append<std::uint32_t>(fixture.blob, block_count);
+    append<std::uint32_t>(fixture.blob, block_count / 2);
+    append<std::uint32_t>(fixture.blob, 0);
+    append<std::uint64_t>(fixture.blob, 0);
+    fixture.blob.insert(fixture.blob.end(), 32, 0);
+    for (int dictionary = 0;
+         dictionary < dictionary_entries;
+         ++dictionary) {
+        for (int component = 0; component < 8; ++component) {
+            append<std::uint16_t>(
+                fixture.blob,
+                dictionary == 0
+                    ? 0x3800u
+                    : (dictionary == 1 ? 0xb400u : 0u));
+        }
+    }
+
+    std::vector<std::uint16_t> first(block_count, 0);
+    for (int row = 0; row < fixture.output; ++row) {
+        for (int block = 0; block < blocks_per_row; ++block) {
+            const int vector = block * block_vectors;
+            for (int component = 0; component < 8; ++component) {
+                fixture.dense[
+                    static_cast<std::size_t>(row) * fixture.input
+                    + vector * 8 + component
+                ] += 0.5f;
+            }
+        }
+    }
+    append_bytes(fixture.blob, pack_bits(first, record_bits));
+
+    std::vector<std::uint16_t> second_mask(block_count, 0);
+    std::vector<std::uint16_t> second_records;
+    second_records.reserve(block_count / 2);
+    for (int record = 1; record < block_count; record += 2) {
+        const int block = record % blocks_per_row;
+        const int vector = block * block_vectors + 1;
+        if (vector >= vectors) {
+            continue;
+        }
+        second_mask[record] = 1;
+        second_records.push_back(
+            static_cast<std::uint16_t>(
+                (1 << position_bits) | 1));
+        const int row = record / blocks_per_row;
+        for (int component = 0; component < 8; ++component) {
+            fixture.dense[
+                static_cast<std::size_t>(row) * fixture.input
+                + vector * 8 + component
+            ] -= 0.25f;
+        }
+    }
+    require(
+        second_records.size()
+            == static_cast<std::size_t>(block_count / 2),
+        "NEPQ1-A fixture second-record count mismatch");
+    append_bytes(fixture.blob, pack_bits(second_mask, 1));
+    append_bytes(fixture.blob, pack_bits(second_records, record_bits));
+    return fixture;
+}
+
 struct MoeFixture {
     std::vector<std::uint8_t> blob;
     std::vector<float> dense;
@@ -423,12 +503,13 @@ MoeFixture make_mixed_moe(
     tensors.push_back(make_nint(2, output, input, salt));
     tensors.push_back(make_nvq2(output, input));
     tensors.push_back(make_nint(5, output, input, salt + 7));
-    tensors.push_back(make_nepq1_s(
-        output,
-        input,
-        salt % 3,
-        0x123456789abcdef0ull +
-            static_cast<std::uint64_t>(salt)));
+    tensors.push_back(add_nepq1_a_residual(
+        make_nepq1_s(
+            output,
+            input,
+            salt % 3,
+            0x123456789abcdef0ull +
+                static_cast<std::uint64_t>(salt))));
 
     std::vector<std::uint8_t> blob{'N', 'I', 'M', '2'};
     append<std::uint32_t>(blob, kExperts);

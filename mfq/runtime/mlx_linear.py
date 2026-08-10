@@ -97,6 +97,8 @@ _VQ_DTYPES = {
     "NEPQ0-S",
     "NEPQ1-L",
     "NEPQ1-S",
+    "NEPQ0-A",
+    "NEPQ1-A",
 }
 
 
@@ -354,9 +356,14 @@ class MlxLinearGroup:
             ):
                 break
             packed.append(weight)
+        residual_vq = any(
+            isinstance(weight, MetalVqWeight)
+            and weight.residual_position_bits > 0
+            for weight in packed
+        )
         self.grouped_weight = (
             MetalLinearGroupWeight.from_weights(tuple(packed))
-            if len(packed) == len(self.layers)
+            if len(packed) == len(self.layers) and not residual_vq
             else None
         )
         if grouped_max_rows is not None and int(grouped_max_rows) <= 0:

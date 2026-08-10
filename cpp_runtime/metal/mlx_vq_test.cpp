@@ -730,6 +730,85 @@ Fixture make_nepq(
     };
 }
 
+Fixture make_nepq_a(bool second_stream) {
+    constexpr int output_size = 4;
+    constexpr int vectors = kInputSize / 8;
+    constexpr int blocks_per_row = 1;
+    constexpr int dictionary_entries = 1024;
+    const int position_bits = second_stream ? 4 : 5;
+    const int record_bits = position_bits + 10;
+    auto fixture = make_nepq(second_stream ? 2 : 0, true);
+    fixture.dtype = second_stream ? "NEPQ1-A" : "NEPQ0-A";
+    fixture.blob[5] = static_cast<std::uint8_t>(
+        second_stream ? 5 : 4);
+
+    append_magic(fixture.blob, "NRA1");
+    append<std::uint8_t>(fixture.blob, 1);
+    append<std::uint8_t>(
+        fixture.blob,
+        static_cast<std::uint8_t>(record_bits));
+    append<std::uint8_t>(
+        fixture.blob,
+        static_cast<std::uint8_t>(position_bits));
+    append<std::uint8_t>(
+        fixture.blob,
+        static_cast<std::uint8_t>(second_stream ? 1 : 0));
+    append<std::uint32_t>(fixture.blob, dictionary_entries);
+    append<std::uint32_t>(
+        fixture.blob,
+        output_size * blocks_per_row);
+    append<std::uint32_t>(
+        fixture.blob,
+        second_stream ? output_size / 2 : 0);
+    append<std::uint32_t>(fixture.blob, 0);
+    append<std::uint64_t>(fixture.blob, 0);
+    fixture.blob.insert(fixture.blob.end(), 32, 0);
+
+    for (int dictionary = 0;
+         dictionary < dictionary_entries;
+         ++dictionary) {
+        for (int component = 0; component < 8; ++component) {
+            const std::uint16_t value = dictionary == 0
+                ? 0x3800u
+                : (dictionary == 1 ? 0xb400u : 0u);
+            append<std::uint16_t>(fixture.blob, value);
+        }
+    }
+
+    std::vector<std::uint16_t> first(output_size);
+    for (int output = 0; output < output_size; ++output) {
+        const int position = output % vectors;
+        first[output] = static_cast<std::uint16_t>(position);
+        for (int component = 0; component < 8; ++component) {
+            fixture.dense[
+                static_cast<std::size_t>(output) * kInputSize
+                + position * 8 + component
+            ] += 0.5f;
+        }
+    }
+    append_bytes(fixture.blob, pack_values(first, record_bits));
+
+    if (second_stream) {
+        std::vector<std::uint16_t> mask(output_size, 0);
+        std::vector<std::uint16_t> second;
+        for (int output = 1; output < output_size; output += 2) {
+            mask[output] = 1;
+            const int position = (output + 1) % vectors;
+            second.push_back(static_cast<std::uint16_t>(
+                (1 << position_bits) | position));
+            for (int component = 0; component < 8; ++component) {
+                fixture.dense[
+                    static_cast<std::size_t>(output) * kInputSize
+                    + position * 8 + component
+                ] -= 0.25f;
+            }
+        }
+        append_bytes(fixture.blob, pack_values(mask, 1));
+        append_bytes(fixture.blob, pack_values(second, record_bits));
+    }
+    return fixture;
+}
+
 std::vector<Fixture> fixtures() {
     std::vector<Fixture> result;
     result.push_back(make_plain_nvq("NVQ2", 1, 8));
@@ -748,6 +827,8 @@ std::vector<Fixture> fixtures() {
     result.push_back(make_nepq(0));
     result.push_back(make_nepq(3));
     result.push_back(make_nepq(2));
+    result.push_back(make_nepq_a(false));
+    result.push_back(make_nepq_a(true));
     return result;
 }
 
@@ -1155,7 +1236,7 @@ void test_fixture(const Fixture& fixture) {
 
 int main() {
     try {
-        constexpr std::array<std::string_view, 16> public_dtypes{
+        constexpr std::array<std::string_view, 18> public_dtypes{
             "NVQ2",
             "NVQ2J",
             "NVQ2J-L",
@@ -1172,6 +1253,8 @@ int main() {
             "NEPQ0-S",
             "NEPQ1-L",
             "NEPQ1-S",
+            "NEPQ0-A",
+            "NEPQ1-A",
         };
         for (const auto dtype : public_dtypes) {
             if (!mfq::metal::is_vq_dtype(dtype)) {
@@ -1231,6 +1314,49 @@ int main() {
             },
             "rotated NEPQ corrupt sign");
 
+        auto unrotated_a = make_nepq_a(false);
+        unrotated_a.blob[7] = 0;
+        const std::uint32_t zero_rotation = 0;
+        const std::uint64_t zero_seed = 0;
+        std::memcpy(
+            unrotated_a.blob.data() + 24,
+            &zero_rotation,
+            sizeof(zero_rotation));
+        std::memcpy(
+            unrotated_a.blob.data() + 28,
+            &zero_seed,
+            sizeof(zero_seed));
+        unrotated_a.runtime_payload.clear();
+        require_throws(
+            [&]() {
+                (void)mfq::metal::inspect_vq_blob(
+                    unrotated_a.dtype,
+                    unrotated_a.blob);
+            },
+            "NEPQ-A header without Hadamard rotation");
+
+        auto truncated_a = make_nepq_a(true);
+        truncated_a.blob.pop_back();
+        require_throws(
+            [&]() {
+                (void)mfq::metal::MlxVqWeight::from_blob(
+                    truncated_a.dtype,
+                    truncated_a.blob,
+                    truncated_a.runtime_payload);
+            },
+            "truncated NEPQ-A residual stream");
+
+        auto trailing_a = make_nepq_a(false);
+        trailing_a.blob.push_back(0);
+        require_throws(
+            [&]() {
+                (void)mfq::metal::MlxVqWeight::from_blob(
+                    trailing_a.dtype,
+                    trailing_a.blob,
+                    trailing_a.runtime_payload);
+            },
+            "NEPQ-A residual tail");
+
         auto wrong_dtype = all.front();
         require_throws(
             [&]() {
@@ -1257,7 +1383,7 @@ int main() {
             "VQ trailing bytes");
 
         std::cout
-            << "MFQ native C++/MLX VQ 16-dtype "
+            << "MFQ native C++/MLX VQ 18-dtype "
                "dequant/embedding/GEMV/MMQ/GEMM tests passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -26,6 +26,7 @@ from mfq.formats.nepq import (
     NEPQ1_L,
     NEPQ1_S,
     NepqTensor,
+    nepq_base_spec,
     rotation_signs,
     validate_nepq,
 )
@@ -1193,6 +1194,110 @@ _HADAMARD_KERNEL = mx.fast.metal_kernel(
     compile_options={"math_mode": "fast"},
 )
 
+_NEPQ_RESIDUAL_MATMUL_SOURCE = r"""
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint logical = threadgroup_position_in_grid.x * 4u + simd_group;
+    uint total = uint(M) * uint(OUT);
+    if (logical >= total) {
+        return;
+    }
+    uint input_row = logical / uint(OUT);
+    uint output = logical - input_row * uint(OUT);
+    float residual = 0.0f;
+    for (uint block = lane; block < uint(RESIDUAL_BLOCKS); block += 32u) {
+        uint record_index = output * uint(RESIDUAL_BLOCKS) + block;
+        short records[2] = {
+            residual_first[record_index],
+            residual_second[record_index],
+        };
+        for (uint stream = 0u; stream < 2u; ++stream) {
+            int record = int(records[stream]);
+            if (record < 0) {
+                continue;
+            }
+            uint position = uint(record) & ((1u << uint(POSITION_BITS)) - 1u);
+            uint dictionary_id = uint(record) >> uint(POSITION_BITS);
+            uint vector = block * uint(BLOCK_VECTORS) + position;
+            if (dictionary_id >= 1024u || vector >= uint(NVEC)) {
+                continue;
+            }
+            uint input_offset = input_row * uint(K) + vector * 8u;
+            uint dictionary_offset = dictionary_id * 8u;
+            for (uint component = 0u; component < 8u; ++component) {
+                residual = fma(
+                    float(x[input_offset + component]),
+                    float(residual_codebook[dictionary_offset + component]),
+                    residual
+                );
+            }
+        }
+    }
+    residual = simd_sum(residual);
+    if (lane == 0u) {
+        y[logical] = T(float(base[logical]) + residual);
+    }
+"""
+
+_NEPQ_RESIDUAL_DEQUANT_SOURCE = r"""
+    uint logical = thread_position_in_grid.x;
+    uint total = uint(OUT) * uint(K);
+    if (logical >= total) {
+        return;
+    }
+    uint output = logical / uint(K);
+    uint column = logical - output * uint(K);
+    uint vector = column >> 3u;
+    uint component = column & 7u;
+    uint block = vector / uint(BLOCK_VECTORS);
+    uint position_in_block = vector - block * uint(BLOCK_VECTORS);
+    uint record_index = output * uint(RESIDUAL_BLOCKS) + block;
+    short records[2] = {
+        residual_first[record_index],
+        residual_second[record_index],
+    };
+    float value = float(base[logical]);
+    for (uint stream = 0u; stream < 2u; ++stream) {
+        int record = int(records[stream]);
+        if (record < 0) {
+            continue;
+        }
+        uint position = uint(record) & ((1u << uint(POSITION_BITS)) - 1u);
+        uint dictionary_id = uint(record) >> uint(POSITION_BITS);
+        if (position == position_in_block && dictionary_id < 1024u) {
+            value += float(residual_codebook[dictionary_id * 8u + component]);
+        }
+    }
+    y[logical] = T(value);
+"""
+
+_NEPQ_RESIDUAL_MATMUL_KERNEL = mx.fast.metal_kernel(
+    name="mfq_nepq_sparse_residual_matmul",
+    input_names=[
+        "base",
+        "x",
+        "residual_codebook",
+        "residual_first",
+        "residual_second",
+    ],
+    output_names=["y"],
+    source=_NEPQ_RESIDUAL_MATMUL_SOURCE,
+    compile_options={"math_mode": "fast"},
+)
+
+_NEPQ_RESIDUAL_DEQUANT_KERNEL = mx.fast.metal_kernel(
+    name="mfq_nepq_sparse_residual_dequant",
+    input_names=[
+        "base",
+        "residual_codebook",
+        "residual_first",
+        "residual_second",
+    ],
+    output_names=["y"],
+    source=_NEPQ_RESIDUAL_DEQUANT_SOURCE,
+    compile_options={"math_mode": "fast"},
+)
+
 
 def _pack_bits(values: np.ndarray, bits: int) -> np.ndarray:
     source = np.ascontiguousarray(values).reshape(-1)
@@ -1259,6 +1364,9 @@ class MetalVqWeight:
     bank_ids: mx.array
     rotation_signs: mx.array
     parameters: mx.array
+    residual_codebook: mx.array
+    residual_first: mx.array
+    residual_second: mx.array
     format_label: str
     out: int
     neuron_len: int
@@ -1279,6 +1387,9 @@ class MetalVqWeight:
     output_shape: tuple[int, ...]
     rotation_block: int
     rotation_seed: int
+    residual_position_bits: int
+    residual_block_vectors: int
+    residual_blocks_per_row: int
 
     @classmethod
     def from_tensor(cls, tensor: VqTensor) -> MetalVqWeight:
@@ -1295,6 +1406,12 @@ class MetalVqWeight:
         rotation = np.empty(0, dtype=np.int8)
         rotation_block = 0
         rotation_seed = 0
+        residual_codebook = np.zeros((1, 8), dtype=np.float16)
+        residual_first = np.zeros((1, 1), dtype=np.int16)
+        residual_second = np.full((1, 1), -1, dtype=np.int16)
+        residual_position_bits = 0
+        residual_block_vectors = 0
+        residual_blocks_per_row = 0
 
         if isinstance(tensor, NepqTensor):
             _, vectors, supergroups, table_banks, _ = validate_nepq(tensor)
@@ -1310,6 +1427,33 @@ class MetalVqWeight:
                 if rotation_block
                 else np.empty(0, dtype=np.int8)
             )
+            if tensor.spec.is_residual:
+                residual_blocks_per_row = int(tensor.residual_blocks_per_row)
+                residual_position_bits = int(tensor.spec.residual_position_bits)
+                residual_block_vectors = int(tensor.spec.residual_block_vectors)
+                residual_codebook = np.ascontiguousarray(
+                    tensor.residual_codebook,
+                    dtype=np.float16,
+                )
+                residual_first = np.ascontiguousarray(
+                    tensor.residual_first,
+                    dtype=np.int16,
+                ).reshape(out, residual_blocks_per_row)
+                residual_second = np.full(
+                    (out, residual_blocks_per_row),
+                    -1,
+                    dtype=np.int16,
+                )
+                if tensor.spec.residual_second:
+                    mask = np.asarray(
+                        tensor.residual_second_mask,
+                        dtype=np.uint8,
+                    ).reshape(-1)
+                    compact = np.asarray(
+                        tensor.residual_second_records,
+                        dtype=np.int16,
+                    ).reshape(-1)
+                    residual_second.reshape(-1)[np.flatnonzero(mask)] = compact
 
         aux_mode = _AUX_NONE
         code_bank_mode = _CODE_BANK_FIXED
@@ -1399,6 +1543,7 @@ class MetalVqWeight:
             code_bank_mode = _CODE_BANK_STATE
             label = tensor.spec.label
         elif isinstance(tensor, NepqTensor):
+            base_spec = nepq_base_spec(tensor.spec)
             states = 1 << int(tensor.spec.state_bits)
             entries = 1 << int(tensor.spec.index_bits)
             state = tensor.state
@@ -1409,19 +1554,19 @@ class MetalVqWeight:
             tables = []
             for payload in np.asarray(tensor.table_payloads, dtype=np.uint8):
                 raw = payload.tobytes()
-                if tensor.spec is NEPQ0_S:
+                if base_spec is NEPQ0_S:
                     scale, first, second, _ = unpack_npq0_s_tables(raw)
                     table = _product_codebooks(first, second)
                     labels.append(tensor.spec.label)
-                elif tensor.spec is NEPQ0_L:
+                elif base_spec is NEPQ0_L:
                     scale, first, second, _ = unpack_npq0_l_tables(raw)
                     table = _product_codebooks(first, second)
                     labels.append(tensor.spec.label)
-                elif tensor.spec is NEPQ1_S:
+                elif base_spec is NEPQ1_S:
                     scale = np.arange(states, dtype=np.float32)
                     table = unpack_nvq1_s_banked_codebook(raw)
                     labels.append(tensor.spec.label)
-                elif tensor.spec is NEPQ1_L:
+                elif base_spec is NEPQ1_L:
                     scale = np.arange(states, dtype=np.float32)
                     table = unpack_ternary_codebook(raw)[None, ...]
                     labels.append(tensor.spec.label)
@@ -1432,11 +1577,11 @@ class MetalVqWeight:
             scale_lut = np.ascontiguousarray(np.stack(scales), dtype=np.float32)
             codebooks = np.ascontiguousarray(np.stack(tables), dtype=np.int8)
             label = labels[0]
-            if tensor.spec in (NEPQ0_S, NEPQ0_L):
+            if base_spec in (NEPQ0_S, NEPQ0_L):
                 code_banks = states
                 code_bank_mode = _CODE_BANK_STATE
                 state_to_codebank = np.arange(states, dtype=np.uint8)
-            elif tensor.spec is NEPQ1_S:
+            elif base_spec is NEPQ1_S:
                 code_banks = 2
                 code_bank_mode = _CODE_BANK_AUX
                 state_to_codebank = np.zeros(states, dtype=np.uint8)
@@ -1478,6 +1623,9 @@ class MetalVqWeight:
                 np.ascontiguousarray(rotation if rotation.size else np.zeros(1), dtype=np.int8)
             ),
             parameters=mx.array([delta], dtype=mx.float32),
+            residual_codebook=mx.array(residual_codebook),
+            residual_first=mx.array(residual_first),
+            residual_second=mx.array(residual_second),
             format_label=label,
             out=out,
             neuron_len=neuron_len,
@@ -1498,6 +1646,9 @@ class MetalVqWeight:
             output_shape=output_shape,
             rotation_block=rotation_block,
             rotation_seed=rotation_seed,
+            residual_position_bits=residual_position_bits,
+            residual_block_vectors=residual_block_vectors,
+            residual_blocks_per_row=residual_blocks_per_row,
         )
 
     @classmethod
@@ -1538,6 +1689,10 @@ class MetalVqWeight:
             self.state_to_codebank,
             self.bank_ids,
             self.rotation_signs,
+            self.parameters,
+            self.residual_codebook,
+            self.residual_first,
+            self.residual_second,
         )
         return sum(int(array.nbytes) for array in arrays)
 
@@ -1603,6 +1758,74 @@ def _prepare_input(
     if weight.rotation_block:
         source = signed_hadamard(source, weight.rotation_signs, weight.rotation_block)
     return source, prefix, rows
+
+
+def _has_sparse_residual(weight: MetalVqWeight) -> bool:
+    return weight.residual_position_bits > 0
+
+
+def _add_sparse_residual_matmul(
+    weight: MetalVqWeight,
+    source: mx.array,
+    base: mx.array,
+) -> mx.array:
+    if not _has_sparse_residual(weight):
+        return base
+    rows = int(source.shape[0])
+    total = rows * weight.out
+    workgroups = (total + 3) // 4
+    return _NEPQ_RESIDUAL_MATMUL_KERNEL(
+        inputs=[
+            base,
+            source,
+            weight.residual_codebook,
+            weight.residual_first,
+            weight.residual_second,
+        ],
+        template=[
+            ("T", source.dtype),
+            ("M", rows),
+            ("OUT", weight.out),
+            ("K", weight.neuron_len),
+            ("NVEC", weight.vectors),
+            ("RESIDUAL_BLOCKS", weight.residual_blocks_per_row),
+            ("POSITION_BITS", weight.residual_position_bits),
+            ("BLOCK_VECTORS", weight.residual_block_vectors),
+        ],
+        grid=(workgroups * 128, 1, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(rows, weight.out)],
+        output_dtypes=[source.dtype],
+    )[0]
+
+
+def _add_sparse_residual_dequant(
+    weight: MetalVqWeight,
+    base: mx.array,
+) -> mx.array:
+    if not _has_sparse_residual(weight):
+        return base
+    total = weight.out * weight.neuron_len
+    return _NEPQ_RESIDUAL_DEQUANT_KERNEL(
+        inputs=[
+            base,
+            weight.residual_codebook,
+            weight.residual_first,
+            weight.residual_second,
+        ],
+        template=[
+            ("T", base.dtype),
+            ("OUT", weight.out),
+            ("K", weight.neuron_len),
+            ("RESIDUAL_BLOCKS", weight.residual_blocks_per_row),
+            ("POSITION_BITS", weight.residual_position_bits),
+            ("BLOCK_VECTORS", weight.residual_block_vectors),
+        ],
+        grid=(total, 1, 1),
+        threadgroup=(min(256, total), 1, 1),
+        output_shapes=[(weight.out, weight.neuron_len)],
+        output_dtypes=[base.dtype],
+    )[0]
 
 
 def _matmul(
@@ -1693,6 +1916,7 @@ def _matmul(
         output_shapes=[(rows, weight.out)],
         output_dtypes=[source.dtype],
     )[0]
+    output = _add_sparse_residual_matmul(weight, source, output)
     return output.reshape((*prefix, *weight.output_shape))
 
 
@@ -1753,7 +1977,7 @@ def vq_dequantize(
     size = weight.out * weight.neuron_len
     if size == 0:
         return mx.zeros((weight.out, weight.neuron_len), dtype=dtype)
-    return _VQ_DEQUANT_KERNEL(
+    output = _VQ_DEQUANT_KERNEL(
         inputs=[
             weight.indices_packed,
             weight.state_packed,
@@ -1790,6 +2014,7 @@ def vq_dequantize(
         output_shapes=[(weight.out, weight.neuron_len)],
         output_dtypes=[dtype],
     )[0]
+    return _add_sparse_residual_dequant(weight, output)
 
 
 def vq_dequantize_matmul(
@@ -1870,6 +2095,9 @@ def vq_embedding(
 
 def vq_swiglu_compatible(gate: MetalVqWeight, up: MetalVqWeight) -> bool:
     """Return whether gate/up can share one packed VQ SwiGLU dispatch."""
+
+    if _has_sparse_residual(gate) or _has_sparse_residual(up):
+        return False
 
     fields = (
         "format_label",
