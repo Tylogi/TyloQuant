@@ -90,8 +90,22 @@ export class ApiError extends Error {
   }
 }
 
+let apiBaseUrl = "";
+
+export function setApiBaseUrl(value: string): void {
+  apiBaseUrl = value.trim().replace(/\/+$/, "");
+}
+
+export function getApiBaseUrl(): string {
+  return apiBaseUrl;
+}
+
+function apiUrl(path: string): string {
+  return `${apiBaseUrl}${path}`;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
+  const response = await fetch(apiUrl(path), {
     ...init,
     headers: { "Content-Type": "application/json", ...init?.headers },
   });
@@ -137,7 +151,7 @@ export const api = {
   },
 
   async deleteSession(id: string): Promise<void> {
-    const response = await fetch(`/api/v1/sessions/${id}`, { method: "DELETE" });
+    const response = await fetch(apiUrl(`/api/v1/sessions/${id}`), { method: "DELETE" });
     if (!response.ok) throw await errorFromResponse(response);
   },
 
@@ -159,7 +173,7 @@ export async function streamResponse(
   onFrame: (frame: RealtimeFrame) => void,
   signal: AbortSignal,
 ): Promise<void> {
-  const response = await fetch(`/api/v1/sessions/${sessionId}/responses`, {
+  const response = await fetch(apiUrl(`/api/v1/sessions/${sessionId}/responses`), {
     method: "POST",
     headers: { Accept: "text/event-stream", "Content-Type": "application/json" },
     body: JSON.stringify(body),

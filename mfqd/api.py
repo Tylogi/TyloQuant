@@ -11,6 +11,7 @@ from uuid import UUID
 from fastapi import Body, FastAPI, Header, Query, Response, WebSocket
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -67,6 +68,18 @@ def create_app(
         openapi_version="3.1.0",
         lifespan=lifespan,
     )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "tauri://localhost",
+            "http://tauri.localhost",
+            "https://tauri.localhost",
+            "http://127.0.0.1:5173",
+            "http://localhost:5173",
+        ],
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=["Accept", "Content-Type"],
+    )
 
     def require_service() -> MfqdService:
         if service is None:
@@ -76,6 +89,14 @@ def create_app(
                 "the protocol contract application does not execute requests",
             )
         return service
+
+    @app.get("/health", include_in_schema=False)
+    async def health() -> dict[str, str]:
+        return {
+            "status": "ok",
+            "service": "mfqd",
+            "protocol_version": "1.0",
+        }
 
     @app.exception_handler(ServiceError)
     async def handle_service_error(_: Any, error: ServiceError) -> JSONResponse:

@@ -9,8 +9,16 @@ import {
   Session,
   SessionMode,
   api,
+  setApiBaseUrl,
   streamResponse,
 } from "./api";
+import {
+  StudioConfig,
+  StudioStatus,
+  configureStudio,
+  startLocalStudio,
+  studioStatus,
+} from "./studio";
 
 interface LiveOutput {
   reasoning: string;
@@ -80,6 +88,9 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [capabilities, setCapabilities] = useState<RuntimeCapabilities | null>(null);
+  const [studio, setStudio] = useState<StudioStatus | null>(null);
+  const [studioDraft, setStudioDraft] = useState<StudioConfig | null>(null);
+  const [studioOpen, setStudioOpen] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
 
@@ -99,17 +110,40 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    refreshSessions()
-      .catch((cause) => setError(errorMessage(cause)))
-      .finally(() => setLoading(false));
+    let current = true;
+    async function initialize() {
+      try {
+        let status = await studioStatus();
+        if (status?.config.mode === "local" && !status.reachable) {
+          status = await startLocalStudio();
+        }
+        if (status) {
+          setApiBaseUrl(status.service_url);
+          if (current) setStudio(status);
+        }
+        const [nextCapabilities] = await Promise.all([
+          api.runtimeCapabilities(),
+          refreshSessions(),
+        ]);
+        if (current) setCapabilities(nextCapabilities);
+      } catch (cause) {
+        if (current) setError(errorMessage(cause));
+      } finally {
+        if (current) setLoading(false);
+      }
+    }
+    void initialize();
+    return () => {
+      current = false;
+    };
   }, [refreshSessions]);
 
   useEffect(() => {
-    api
-      .runtimeCapabilities()
-      .then(setCapabilities)
-      .catch((cause) => setError(errorMessage(cause)));
-  }, []);
+    if (!capabilities?.model_capabilities.features.full_duplex ||
+        !capabilities.duplex_available) {
+      setMode("text");
+    }
+  }, [capabilities]);
 
   useEffect(() => {
     if (!activeId) {
@@ -153,6 +187,39 @@ export default function App() {
       await refreshSessions();
     } catch (cause) {
       setError(errorMessage(cause));
+    }
+  }
+
+  function openStudioSettings() {
+    if (!studio) return;
+    setStudioDraft({ ...studio.config });
+    setStudioOpen(true);
+  }
+
+  async function saveStudioSettings(event: FormEvent) {
+    event.preventDefault();
+    if (!studioDraft) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const status = await configureStudio(studioDraft);
+      setApiBaseUrl(status.service_url);
+      setStudio(status);
+      setStudioOpen(false);
+      setMessages([]);
+      setActiveId(null);
+      const [nextCapabilities] = await Promise.all([
+        api.runtimeCapabilities(),
+        refreshSessions(),
+      ]);
+      setCapabilities(nextCapabilities);
+      if (!status.reachable) {
+        setError(`MFQd is not reachable at ${status.service_url}`);
+      }
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -272,18 +339,18 @@ export default function App() {
             onChange={(event) => setModel(event.target.value)}
             placeholder="Model name"
           />
-          <div className="mode-picker" aria-label="Session mode">
-            {(Object.keys(MODE_LABELS) as SessionMode[]).map((item) => (
-              <button
-                className={mode === item ? "selected" : ""}
-                key={item}
-                onClick={() => setMode(item)}
-                type="button"
-              >
-                {MODE_LABELS[item]}
-              </button>
-            ))}
-          </div>
+          {capabilities?.model_capabilities.features.full_duplex && (
+            <button
+              aria-pressed={mode === "full_duplex"}
+              className={`duplex-session-toggle ${mode === "full_duplex" ? "selected" : ""}`}
+              disabled={!capabilities.duplex_available}
+              onClick={() => setMode((current) => current === "full_duplex" ? "text" : "full_duplex")}
+              title={capabilities.duplex_available ? "Use full-duplex voice for new sessions" : "The runtime does not have a duplex worker"}
+              type="button"
+            >
+              Full duplex {mode === "full_duplex" ? "on" : "off"}
+            </button>
+          )}
           <button className="new-session" onClick={createSession} type="button">
             New session
           </button>
@@ -317,35 +384,48 @@ export default function App() {
             <h1>{active?.title || (active ? "Untitled session" : "MFQ workspace")}</h1>
             <p>{active ? active.model : "Create a session to start local inference"}</p>
           </div>
-          {active && (
-            <div className="header-actions">
-              {capabilities && (
-                <div
-                  className="header-capabilities"
-                  title={capabilities.model_capabilities.architecture_family}
-                >
-                  {CAPABILITY_LABELS.filter(
-                    ([feature]) => capabilities.model_capabilities.features[feature],
-                  ).map(([feature, label]) => (
-                    <span
-                      className={
-                        feature === "full_duplex" && !capabilities.duplex_available
-                          ? "unavailable"
-                          : ""
-                      }
-                      key={feature}
-                    >
-                      {label}
-                    </span>
-                  ))}
-                </div>
-              )}
+          <div className="header-actions">
+            {capabilities && (
+              <div
+                className="header-capabilities"
+                title={capabilities.model_capabilities.architecture_family}
+              >
+                {CAPABILITY_LABELS.filter(
+                  ([feature]) => capabilities.model_capabilities.features[feature],
+                ).map(([feature, label]) => (
+                  <span
+                    className={
+                      feature === "full_duplex" && !capabilities.duplex_available
+                        ? "unavailable"
+                        : ""
+                    }
+                    key={feature}
+                  >
+                    {label}
+                  </span>
+                ))}
+              </div>
+            )}
+            {studio && (
+              <button
+                className={`studio-runtime ${studio.reachable ? "reachable" : "unreachable"}`}
+                onClick={openStudioSettings}
+                title={studio.service_url}
+                type="button"
+              >
+                <span aria-hidden="true" />
+                {studio.config.mode === "local" ? "Local" : "Remote"}
+              </button>
+            )}
+            {active && (
+              <>
               <span className={`state state-${active.state}`}>{active.state}</span>
               <button onClick={deleteActive} disabled={busy} type="button">
                 Delete
               </button>
-            </div>
-          )}
+              </>
+            )}
+          </div>
         </header>
 
         <section className="message-list" aria-live="polite">
@@ -458,9 +538,99 @@ export default function App() {
         <div className="capability-card">
           <strong>Current transport</strong>
           <span>REST + typed SSE</span>
-          <p>Voice and full-duplex controls will use the same persisted session.</p>
+          <p>Media and duplex state stay attached to the persisted session.</p>
         </div>
       </aside>
+
+      {studioOpen && studioDraft && (
+        <div className="studio-dialog-backdrop" role="presentation">
+          <form
+            aria-labelledby="studio-dialog-title"
+            className="studio-dialog"
+            onSubmit={saveStudioSettings}
+            role="dialog"
+          >
+            <div className="studio-dialog-header">
+              <div>
+                <h2 id="studio-dialog-title">Runtime connection</h2>
+                <p>MFQ Studio keeps MFQd running when this window closes.</p>
+              </div>
+              <button
+                aria-label="Close runtime settings"
+                onClick={() => setStudioOpen(false)}
+                type="button"
+              >
+                ×
+              </button>
+            </div>
+            <div className="studio-mode-picker" aria-label="Runtime location">
+              {(["local", "remote"] as const).map((item) => (
+                <button
+                  aria-pressed={studioDraft.mode === item}
+                  className={studioDraft.mode === item ? "selected" : ""}
+                  key={item}
+                  onClick={() => setStudioDraft((current) => current && ({ ...current, mode: item }))}
+                  type="button"
+                >
+                  {item === "local" ? "Local MFQd" : "Remote MFQd"}
+                </button>
+              ))}
+            </div>
+            {studioDraft.mode === "local" ? (
+              <>
+                <label htmlFor="studio-backend-url">Local runtime URL</label>
+                <input
+                  id="studio-backend-url"
+                  onChange={(event) => setStudioDraft((current) => current && ({ ...current, local_backend_url: event.target.value }))}
+                  required
+                  type="url"
+                  value={studioDraft.local_backend_url}
+                />
+                <label htmlFor="studio-port">MFQd port</label>
+                <input
+                  id="studio-port"
+                  max={65535}
+                  min={1}
+                  onChange={(event) => setStudioDraft((current) => current && ({ ...current, local_service_port: Number(event.target.value) }))}
+                  required
+                  type="number"
+                  value={studioDraft.local_service_port}
+                />
+                <label htmlFor="studio-executable">MFQd executable</label>
+                <input
+                  id="studio-executable"
+                  onChange={(event) => setStudioDraft((current) => current && ({ ...current, mfqd_executable: event.target.value || null }))}
+                  placeholder="mfqd from PATH"
+                  value={studioDraft.mfqd_executable ?? ""}
+                />
+              </>
+            ) : (
+              <>
+                <label htmlFor="studio-remote-url">Remote MFQd URL</label>
+                <input
+                  id="studio-remote-url"
+                  onChange={(event) => setStudioDraft((current) => current && ({ ...current, remote_url: event.target.value }))}
+                  required
+                  type="url"
+                  value={studioDraft.remote_url}
+                />
+              </>
+            )}
+            <div className="studio-dialog-status">
+              <span className={studio?.reachable ? "reachable" : "unreachable"} />
+              {studio?.reachable ? `Connected to ${studio.service_url}` : "MFQd is offline"}
+            </div>
+            <div className="studio-dialog-actions">
+              <button onClick={() => setStudioOpen(false)} type="button">
+                Cancel
+              </button>
+              <button className="primary" disabled={busy} type="submit">
+                Apply
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 }

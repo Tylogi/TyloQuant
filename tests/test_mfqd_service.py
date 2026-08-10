@@ -195,6 +195,22 @@ def test_executable_api_persists_nonstream_text_responses(tmp_path: Path) -> Non
         service = make_service(tmp_path, backend)
         transport = httpx.ASGITransport(app=create_app(service))
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            health = await client.get("/health")
+            assert health.json() == {
+                "status": "ok",
+                "service": "mfqd",
+                "protocol_version": "1.0",
+            }
+            preflight = await client.options(
+                "/api/v1/sessions",
+                headers={
+                    "Origin": "tauri://localhost",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "content-type",
+                },
+            )
+            assert preflight.status_code == 200
+            assert preflight.headers["access-control-allow-origin"] == "tauri://localhost"
             created = await client.post(
                 "/api/v1/sessions",
                 json={"model": "model-a", "mode": "text"},

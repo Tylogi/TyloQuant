@@ -1,0 +1,19 @@
+[package]
+name = "mfq-studio"
+version = "0.1.0"
+description = "Desktop controller for MFQd"
+edition = "2021"
+publish = false
+
+[build-dependencies]
+icns = "0.4.0"
+ico = "0.5.0"
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tauri = { version = "2.11.5", features = [] }
+tokio = { version = "1", features = ["sync", "time"] }
+url = "2.5.8"

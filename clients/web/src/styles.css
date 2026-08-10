@@ -135,6 +135,21 @@ button:disabled {
   background: #634329;
 }
 
+.duplex-session-toggle {
+  border: 1px solid #4c3e33;
+  border-radius: 8px;
+  padding: 7px 9px;
+  color: #bfae9f;
+  background: transparent;
+  font-size: 11px;
+}
+
+.duplex-session-toggle.selected {
+  border-color: #a87543;
+  color: #fff7ee;
+  background: #634329;
+}
+
 .new-session,
 .send-button {
   border: 0;
@@ -269,6 +284,25 @@ button:disabled {
   padding: 7px 9px;
   color: #745a46;
   background: transparent;
+}
+
+.studio-runtime {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.studio-runtime span,
+.studio-dialog-status span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #b95145;
+}
+
+.studio-runtime.reachable span,
+.studio-dialog-status span.reachable {
+  background: #42936e;
 }
 
 .state {
@@ -502,6 +536,129 @@ button:disabled {
   line-height: 1.5;
 }
 
+.studio-dialog-backdrop {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(24 19 15 / 55%);
+  backdrop-filter: blur(5px);
+}
+
+.studio-dialog {
+  display: grid;
+  width: min(500px, 100%);
+  gap: 9px;
+  border: 1px solid #d8ccc0;
+  border-radius: 16px;
+  padding: 22px;
+  color: #2b211b;
+  background: #fbf8f3;
+  box-shadow: 0 24px 80px rgb(35 23 14 / 30%);
+}
+
+.studio-dialog-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 20px;
+  align-items: flex-start;
+  margin-bottom: 5px;
+}
+
+.studio-dialog h2,
+.studio-dialog p {
+  margin: 0;
+}
+
+.studio-dialog h2 {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 22px;
+  font-weight: 500;
+}
+
+.studio-dialog p {
+  margin-top: 5px;
+  color: #7d6e61;
+  font-size: 12px;
+}
+
+.studio-dialog-header button {
+  border: 0;
+  color: #735f50;
+  background: transparent;
+  font-size: 22px;
+}
+
+.studio-dialog label {
+  margin-top: 5px;
+  color: #756456;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.studio-dialog input {
+  width: 100%;
+  border: 1px solid #d4c7bb;
+  border-radius: 9px;
+  outline: none;
+  padding: 9px 11px;
+  color: #2a211b;
+  background: #fffdf9;
+}
+
+.studio-dialog input:focus {
+  border-color: #a87543;
+  box-shadow: 0 0 0 3px rgb(168 117 67 / 16%);
+}
+
+.studio-mode-picker {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin: 5px 0;
+}
+
+.studio-mode-picker button,
+.studio-dialog-actions button {
+  border: 1px solid #d4c7bb;
+  border-radius: 9px;
+  padding: 8px 11px;
+  color: #735d4b;
+  background: transparent;
+}
+
+.studio-mode-picker button.selected {
+  border-color: #a87543;
+  color: #5d391c;
+  background: #eedcc9;
+}
+
+.studio-dialog-status {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  margin-top: 6px;
+  color: #746559;
+  font-size: 12px;
+}
+
+.studio-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.studio-dialog-actions button.primary {
+  border-color: #8a5a31;
+  color: #fffaf5;
+  background: #8a5a31;
+}
+
 @media (max-width: 1050px) {
   .app-shell {
     grid-template-columns: 240px minmax(0, 1fr);
@@ -533,7 +690,8 @@ button:disabled {
   }
 
   .session-create label,
-  .mode-picker {
+  .mode-picker,
+  .duplex-session-toggle {
     grid-column: 1 / -1;
   }
 
