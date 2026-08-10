@@ -10,16 +10,20 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <iomanip>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <random>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -175,6 +179,16 @@ public:
         out.reserve(static_cast<size_t>(n));
         for (int32_t i = 0; i < n; ++i) out.push_back(tokens[static_cast<size_t>(i)]);
         return out;
+    }
+
+    int64_t special_token_id(const std::string & text) const {
+        const auto tokens = tokenize(text, true, false);
+        if (tokens.size() != 1) {
+            throw std::runtime_error(
+                "tokenizer does not map the required special token to one ID: " +
+                text);
+        }
+        return tokens.front();
     }
 
     bool is_eog(int64_t token) const {
@@ -645,17 +659,26 @@ static double number_field(const json & body, const char * name, double fallback
 static MfqSamplingParams default_sampling_params(
         const MfqServerConfig & config) {
     MfqSamplingParams defaults;
-    if (config.model_type == "deepseek_v4") {
-        defaults.temperature = 1.0;
-        defaults.top_p = 0.8;
-        defaults.repetition_penalty = 1.05;
-        defaults.presence_penalty = 0.0;
+    const auto & profile = config.runtime_profile.chat;
+    if (profile.max_tokens) defaults.max_tokens = *profile.max_tokens;
+    if (profile.temperature) defaults.temperature = *profile.temperature;
+    if (profile.top_k) defaults.top_k = *profile.top_k;
+    if (profile.top_p) defaults.top_p = *profile.top_p;
+    if (profile.presence_penalty) {
+        defaults.presence_penalty = *profile.presence_penalty;
+    }
+    if (profile.frequency_penalty) {
+        defaults.frequency_penalty = *profile.frequency_penalty;
+    }
+    if (profile.repetition_penalty) {
+        defaults.repetition_penalty = *profile.repetition_penalty;
     }
     return defaults;
 }
 
 static json sampling_params_json(const MfqSamplingParams & sampling) {
     return {
+        {"max_tokens", sampling.max_tokens},
         {"temperature", sampling.temperature},
         {"top_k", sampling.top_k},
         {"top_p", sampling.top_p},
@@ -663,6 +686,291 @@ static json sampling_params_json(const MfqSamplingParams & sampling) {
         {"frequency_penalty", sampling.frequency_penalty},
         {"repetition_penalty", sampling.repetition_penalty},
     };
+}
+
+template <typename Value>
+static void merge_optional(std::optional<Value> & target,
+                           const std::optional<Value> & source) {
+    if (source) target = source;
+}
+
+static void merge_runtime_profile(MfqRuntimeProfile & target,
+                                  const MfqRuntimeProfile & source) {
+#define MFQ_MERGE(section, field) \
+    merge_optional(target.section.field, source.section.field)
+    MFQ_MERGE(chat, max_tokens);
+    MFQ_MERGE(chat, temperature);
+    MFQ_MERGE(chat, top_k);
+    MFQ_MERGE(chat, top_p);
+    MFQ_MERGE(chat, presence_penalty);
+    MFQ_MERGE(chat, frequency_penalty);
+    MFQ_MERGE(chat, repetition_penalty);
+    MFQ_MERGE(duplex, system_prompt);
+    MFQ_MERGE(duplex, decode_mode);
+    MFQ_MERGE(duplex, temperature);
+    MFQ_MERGE(duplex, top_k);
+    MFQ_MERGE(duplex, top_p);
+    MFQ_MERGE(duplex, text_repetition_penalty);
+    MFQ_MERGE(duplex, text_repetition_window_size);
+    MFQ_MERGE(duplex, length_penalty);
+    MFQ_MERGE(duplex, listen_prob_scale);
+    MFQ_MERGE(duplex, force_listen_count);
+    MFQ_MERGE(duplex, max_new_speak_tokens_per_chunk);
+    MFQ_MERGE(tts, temperature);
+    MFQ_MERGE(tts, repetition_penalty);
+    MFQ_MERGE(tts, token2wav_steps);
+#undef MFQ_MERGE
+    if (source.source != "generic-defaults") target.source = source.source;
+}
+
+static std::string normalized_identity(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return std::isalnum(c) ? static_cast<char>(std::tolower(c)) : '_';
+    });
+    return value;
+}
+
+static bool identity_matches(const std::vector<std::string> & identities,
+                             const std::string & needle) {
+    return std::any_of(identities.begin(), identities.end(), [&](const auto & value) {
+        return normalized_identity(value).find(needle) != std::string::npos;
+    });
+}
+
+static MfqRuntimeProfile architecture_runtime_profile(
+        const std::vector<std::string> & identities) {
+    MfqRuntimeProfile result;
+    if (identity_matches(identities, "minicpmo")) {
+        result.chat.temperature = 0.7;
+        result.chat.top_k = 100;
+        result.chat.top_p = 0.8;
+        result.chat.repetition_penalty = 1.02;
+        result.duplex.system_prompt = "Streaming Omni Conversation.";
+        result.duplex.decode_mode = "sampling";
+        result.duplex.temperature = 0.7;
+        result.duplex.top_k = 100;
+        result.duplex.top_p = 0.8;
+        result.duplex.text_repetition_penalty = 1.05;
+        result.duplex.text_repetition_window_size = 512;
+        result.duplex.length_penalty = 1.0;
+        result.duplex.listen_prob_scale = 1.0;
+        result.duplex.force_listen_count = 0;
+        result.duplex.max_new_speak_tokens_per_chunk = 20;
+        result.tts.temperature = 0.8;
+        result.tts.repetition_penalty = 1.05;
+        result.tts.token2wav_steps = 10;
+        result.source = "architecture-registry:minicpmo";
+    } else if (identity_matches(identities, "deepseek_v4")) {
+        result.chat.temperature = 1.0;
+        result.chat.top_p = 0.8;
+        result.chat.repetition_penalty = 1.05;
+        result.chat.presence_penalty = 0.0;
+        result.source = "architecture-registry:deepseek_v4";
+    }
+    return result;
+}
+
+static MfqRuntimeProfile exact_model_runtime_profile(
+        const std::vector<std::string> & identities) {
+    MfqRuntimeProfile result;
+    if (identity_matches(identities, "minicpm_o_4_5")) {
+        result = architecture_runtime_profile({"minicpmo"});
+        result.source = "model-registry:minicpm-o-4_5";
+    } else if (identity_matches(identities, "deepseek_v4_flash_0731")) {
+        result = architecture_runtime_profile({"deepseek_v4"});
+        result.source = "model-registry:deepseek-v4-flash-0731";
+    }
+    return result;
+}
+
+static double profile_number(const json & section, const char * name) {
+    if (!section[name].is_number()) {
+        throw std::runtime_error(std::string("runtime profile ") + name + " must be numeric");
+    }
+    const double value = section[name].get<double>();
+    if (!std::isfinite(value)) {
+        throw std::runtime_error(std::string("runtime profile ") + name + " must be finite");
+    }
+    return value;
+}
+
+static int32_t profile_integer(const json & section, const char * name) {
+    if (!section[name].is_number_integer()) {
+        throw std::runtime_error(std::string("runtime profile ") + name + " must be an integer");
+    }
+    const auto value = section[name].get<int64_t>();
+    if (value < std::numeric_limits<int32_t>::min() ||
+        value > std::numeric_limits<int32_t>::max()) {
+        throw std::runtime_error(std::string("runtime profile ") + name + " is out of range");
+    }
+    return static_cast<int32_t>(value);
+}
+
+static MfqRuntimeProfile parse_runtime_profile(const std::string & text,
+                                               const std::string & source) {
+    const json root = json::parse(text);
+    if (!root.is_object()) throw std::runtime_error("runtime profile must be a JSON object");
+    if (root.contains("schema") && root["schema"] != "mfq.runtime.sampling") {
+        throw std::runtime_error("unsupported runtime profile schema");
+    }
+    if (root.contains("version") &&
+        (!root["version"].is_number_integer() || root["version"] != 1)) {
+        throw std::runtime_error("unsupported runtime profile version");
+    }
+    MfqRuntimeProfile result;
+    result.source = source;
+    if (root.contains("chat")) {
+        const auto & value = root["chat"];
+        if (!value.is_object()) throw std::runtime_error("runtime profile chat must be an object");
+#define MFQ_CHAT_NUMBER(field) if (value.contains(#field)) result.chat.field = profile_number(value, #field)
+        if (value.contains("max_tokens")) result.chat.max_tokens = profile_integer(value, "max_tokens");
+        MFQ_CHAT_NUMBER(temperature);
+        if (value.contains("top_k")) result.chat.top_k = profile_integer(value, "top_k");
+        MFQ_CHAT_NUMBER(top_p);
+        MFQ_CHAT_NUMBER(presence_penalty);
+        MFQ_CHAT_NUMBER(frequency_penalty);
+        MFQ_CHAT_NUMBER(repetition_penalty);
+#undef MFQ_CHAT_NUMBER
+    }
+    if (root.contains("duplex")) {
+        const auto & value = root["duplex"];
+        if (!value.is_object()) throw std::runtime_error("runtime profile duplex must be an object");
+        if (value.contains("system_prompt")) {
+            if (!value["system_prompt"].is_string()) {
+                throw std::runtime_error(
+                    "runtime profile duplex.system_prompt must be a string");
+            }
+            result.duplex.system_prompt =
+                value["system_prompt"].get<std::string>();
+        }
+        if (value.contains("decode_mode")) {
+            if (!value["decode_mode"].is_string()) throw std::runtime_error("runtime profile decode_mode must be a string");
+            result.duplex.decode_mode = value["decode_mode"].get<std::string>();
+            if (*result.duplex.decode_mode != "sampling" && *result.duplex.decode_mode != "greedy") {
+                throw std::runtime_error("runtime profile decode_mode is invalid");
+            }
+        }
+#define MFQ_DUPLEX_NUMBER(field) if (value.contains(#field)) result.duplex.field = profile_number(value, #field)
+#define MFQ_DUPLEX_INTEGER(field) if (value.contains(#field)) result.duplex.field = profile_integer(value, #field)
+        MFQ_DUPLEX_NUMBER(temperature);
+        MFQ_DUPLEX_INTEGER(top_k);
+        MFQ_DUPLEX_NUMBER(top_p);
+        MFQ_DUPLEX_NUMBER(text_repetition_penalty);
+        MFQ_DUPLEX_INTEGER(text_repetition_window_size);
+        MFQ_DUPLEX_NUMBER(length_penalty);
+        MFQ_DUPLEX_NUMBER(listen_prob_scale);
+        MFQ_DUPLEX_INTEGER(force_listen_count);
+        MFQ_DUPLEX_INTEGER(max_new_speak_tokens_per_chunk);
+#undef MFQ_DUPLEX_NUMBER
+#undef MFQ_DUPLEX_INTEGER
+    }
+    if (root.contains("tts")) {
+        const auto & value = root["tts"];
+        if (!value.is_object()) throw std::runtime_error("runtime profile tts must be an object");
+        if (value.contains("temperature")) result.tts.temperature = profile_number(value, "temperature");
+        if (value.contains("repetition_penalty")) result.tts.repetition_penalty = profile_number(value, "repetition_penalty");
+        if (value.contains("token2wav_steps")) result.tts.token2wav_steps = profile_integer(value, "token2wav_steps");
+    }
+    const auto bounded = [](const std::optional<double> & value,
+                            double low, double high,
+                            const char * name) {
+        if (value && (*value < low || *value > high)) {
+            throw std::runtime_error(
+                std::string("runtime profile ") + name + " is out of range");
+        }
+    };
+    const auto positive = [](const auto & value, const char * name) {
+        if (value && *value <= 0) {
+            throw std::runtime_error(
+                std::string("runtime profile ") + name + " must be positive");
+        }
+    };
+    bounded(result.chat.temperature, 0.0, 10.0, "chat.temperature");
+    bounded(result.chat.top_p, 0.0, 1.0, "chat.top_p");
+    bounded(result.duplex.temperature, 0.0, 10.0, "duplex.temperature");
+    bounded(result.duplex.top_p, 0.0, 1.0, "duplex.top_p");
+    bounded(result.tts.temperature, 0.0, 10.0, "tts.temperature");
+    if (result.chat.top_k && *result.chat.top_k < 0) {
+        throw std::runtime_error("runtime profile chat.top_k must be non-negative");
+    }
+    if (result.duplex.top_k && *result.duplex.top_k < 0) {
+        throw std::runtime_error("runtime profile duplex.top_k must be non-negative");
+    }
+    positive(result.chat.max_tokens, "chat.max_tokens");
+    positive(result.chat.repetition_penalty, "chat.repetition_penalty");
+    positive(result.duplex.text_repetition_penalty,
+             "duplex.text_repetition_penalty");
+    positive(result.duplex.text_repetition_window_size,
+             "duplex.text_repetition_window_size");
+    positive(result.duplex.length_penalty, "duplex.length_penalty");
+    positive(result.duplex.max_new_speak_tokens_per_chunk,
+             "duplex.max_new_speak_tokens_per_chunk");
+    positive(result.tts.repetition_penalty, "tts.repetition_penalty");
+    positive(result.tts.token2wav_steps, "tts.token2wav_steps");
+    if (result.duplex.listen_prob_scale &&
+        *result.duplex.listen_prob_scale < 0.0) {
+        throw std::runtime_error(
+            "runtime profile duplex.listen_prob_scale must be non-negative");
+    }
+    if (result.duplex.force_listen_count &&
+        (*result.duplex.force_listen_count < 0 ||
+         *result.duplex.force_listen_count > 60)) {
+        throw std::runtime_error(
+            "runtime profile duplex.force_listen_count is out of range");
+    }
+    return result;
+}
+
+static std::string read_profile_file(const std::filesystem::path & path) {
+    std::ifstream input(path);
+    if (!input) throw std::runtime_error("cannot open runtime profile: " + path.string());
+    std::ostringstream content;
+    content << input.rdbuf();
+    return content.str();
+}
+
+static std::vector<std::filesystem::path> profile_sidecar_paths(
+        const std::filesystem::path & mfq_path) {
+    std::vector<std::filesystem::path> result;
+    static const std::regex split_pattern(R"(^(.*)-[0-9]{5}-of-[0-9]{5}\.mfq$)");
+    std::smatch match;
+    const auto filename = mfq_path.filename().string();
+    if (std::regex_match(filename, match, split_pattern)) {
+        result.push_back(mfq_path.parent_path() / (match[1].str() + ".runtime.json"));
+    } else {
+        auto family = mfq_path;
+        family.replace_extension(".runtime.json");
+        result.push_back(std::move(family));
+    }
+    auto exact = std::filesystem::path(mfq_path.string() + ".runtime.json");
+    if (exact != result.front()) result.push_back(std::move(exact));
+    return result;
+}
+
+static json duplex_profile_json(const MfqDuplexSamplingProfile & value) {
+    json result = json::object();
+#define MFQ_SET(field) if (value.field) result[#field] = *value.field
+    MFQ_SET(system_prompt);
+    MFQ_SET(decode_mode);
+    MFQ_SET(temperature);
+    MFQ_SET(top_k);
+    MFQ_SET(top_p);
+    MFQ_SET(text_repetition_penalty);
+    MFQ_SET(text_repetition_window_size);
+    MFQ_SET(length_penalty);
+    MFQ_SET(listen_prob_scale);
+    MFQ_SET(force_listen_count);
+    MFQ_SET(max_new_speak_tokens_per_chunk);
+#undef MFQ_SET
+    return result;
+}
+
+static json tts_profile_json(const MfqTtsSamplingProfile & value) {
+    json result = json::object();
+    if (value.temperature) result["temperature"] = *value.temperature;
+    if (value.repetition_penalty) result["repetition_penalty"] = *value.repetition_penalty;
+    if (value.token2wav_steps) result["token2wav_steps"] = *value.token2wav_steps;
+    return result;
 }
 
 static json chat_template_capabilities_json(
@@ -773,8 +1081,8 @@ static RequestWork parse_work(const json & body, bool chat, const LlamaTokenizer
     }
 
     const int64_t max_tokens = body.contains("max_completion_tokens")
-        ? integer_field(body, "max_completion_tokens", 4096)
-        : integer_field(body, "max_tokens", 4096);
+        ? integer_field(body, "max_completion_tokens", defaults.max_tokens)
+        : integer_field(body, "max_tokens", defaults.max_tokens);
     if (max_tokens < 1 || max_tokens > std::numeric_limits<int32_t>::max()) {
         throw ApiError(400, "invalid_request_error", "max_tokens must be positive", "max_tokens");
     }
@@ -1453,6 +1761,99 @@ static bool authorized(const httplib::Request & req, httplib::Response & res, co
     return false;
 }
 
+static int base64_digit(unsigned char value) {
+    if (value >= 'A' && value <= 'Z') return value - 'A';
+    if (value >= 'a' && value <= 'z') return value - 'a' + 26;
+    if (value >= '0' && value <= '9') return value - '0' + 52;
+    if (value == '+') return 62;
+    if (value == '/') return 63;
+    return -1;
+}
+
+static std::vector<uint8_t> decode_base64(const std::string & encoded) {
+    std::string compact;
+    compact.reserve(encoded.size());
+    for (const unsigned char value : encoded) {
+        if (value == ' ' || value == '\t' || value == '\r' ||
+            value == '\n') {
+            continue;
+        }
+        compact.push_back(static_cast<char>(value));
+    }
+    if (compact.empty() || compact.size() % 4 != 0) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "audio_features must be padded base64", "audio_features");
+    }
+
+    std::vector<uint8_t> output;
+    output.reserve(compact.size() / 4 * 3);
+    for (size_t offset = 0; offset < compact.size(); offset += 4) {
+        const bool pad2 = compact[offset + 2] == '=';
+        const bool pad3 = compact[offset + 3] == '=';
+        if (pad2 && !pad3) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "audio_features has invalid base64 padding",
+                "audio_features");
+        }
+        if ((pad2 || pad3) && offset + 4 != compact.size()) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "audio_features has interior base64 padding",
+                "audio_features");
+        }
+        const int a = base64_digit(compact[offset]);
+        const int b = base64_digit(compact[offset + 1]);
+        const int c = pad2 ? 0 : base64_digit(compact[offset + 2]);
+        const int d = pad3 ? 0 : base64_digit(compact[offset + 3]);
+        if (a < 0 || b < 0 || c < 0 || d < 0) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "audio_features contains invalid base64 data",
+                "audio_features");
+        }
+        const uint32_t merged =
+            (static_cast<uint32_t>(a) << 18) |
+            (static_cast<uint32_t>(b) << 12) |
+            (static_cast<uint32_t>(c) << 6) |
+            static_cast<uint32_t>(d);
+        output.push_back(static_cast<uint8_t>(merged >> 16));
+        if (!pad2) output.push_back(static_cast<uint8_t>(merged >> 8));
+        if (!pad3) output.push_back(static_cast<uint8_t>(merged));
+    }
+    return output;
+}
+
+static std::vector<float> decode_audio_features(
+        const std::string & encoded,
+        int32_t frames) {
+    if (frames < 3 || frames > 4096) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "audio_frames must be in [3, 4096]", "audio_frames");
+    }
+    const auto bytes = decode_base64(encoded);
+    const size_t expected = static_cast<size_t>(frames) * 80 * sizeof(float);
+    if (bytes.size() != expected) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "audio_features byte length does not match audio_frames",
+            "audio_features");
+    }
+    std::vector<float> features(static_cast<size_t>(frames) * 80);
+    std::memcpy(features.data(), bytes.data(), bytes.size());
+    if (!std::all_of(features.begin(), features.end(), [](float value) {
+            return std::isfinite(value);
+        })) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "audio_features contains a non-finite value",
+            "audio_features");
+    }
+    return features;
+}
+
 static json parse_body(const httplib::Request & req) {
     try {
         return json::parse(req.body);
@@ -1466,6 +1867,58 @@ static void handle_api_error(httplib::Response & res, const ApiError & error) {
 }
 
 } // namespace
+
+MfqRuntimeProfile resolve_mfq_runtime_profile(
+        const std::string & mfq_path,
+        const std::string & model_architecture,
+        const std::string & model_type,
+        const std::string & model_name,
+        const std::string & embedded_profile_json,
+        const std::string & model_config_json,
+        const std::string & explicit_profile_path) {
+    std::vector<std::string> identities{
+        model_architecture, model_type, model_name,
+    };
+    if (!model_config_json.empty()) {
+        const json config = json::parse(model_config_json);
+        if (!config.is_object()) {
+            throw std::runtime_error("embedded model config must be a JSON object");
+        }
+        for (const char * key : {"model_type", "_name_or_path", "name_or_path"}) {
+            if (config.contains(key) && config[key].is_string()) {
+                identities.push_back(config[key].get<std::string>());
+            }
+        }
+        if (config.contains("architectures") && config["architectures"].is_array()) {
+            for (const auto & value : config["architectures"]) {
+                if (value.is_string()) identities.push_back(value.get<std::string>());
+            }
+        }
+    }
+
+    // Low to high priority. Every merge is field-wise.
+    MfqRuntimeProfile result = architecture_runtime_profile(identities);
+    merge_runtime_profile(result, exact_model_runtime_profile(identities));
+    if (!embedded_profile_json.empty()) {
+        merge_runtime_profile(result, parse_runtime_profile(
+            embedded_profile_json, "embedded-mfq"));
+    }
+    if (!mfq_path.empty()) {
+        for (const auto & sidecar : profile_sidecar_paths(mfq_path)) {
+            std::error_code error;
+            if (std::filesystem::is_regular_file(sidecar, error) && !error) {
+                merge_runtime_profile(result, parse_runtime_profile(
+                    read_profile_file(sidecar), "sidecar:" + sidecar.filename().string()));
+            }
+        }
+    }
+    if (!explicit_profile_path.empty()) {
+        const std::filesystem::path path(explicit_profile_path);
+        merge_runtime_profile(result, parse_runtime_profile(
+            read_profile_file(path), "server-explicit:" + path.filename().string()));
+    }
+    return result;
+}
 
 MfqTokenizerProbe probe_mfq_tokenizer(
         const std::vector<uint8_t> & tokenizer_gguf,
@@ -1508,7 +1961,8 @@ MfqTokenizerProbe probe_mfq_tokenizer(
 int run_mfq_server(
         const MfqServerConfig & config,
         const MfqGenerateFn & generate,
-        const MfqReloadFn & reload) {
+        const MfqReloadFn & reload,
+        const MfqDuplexBackend & duplex) {
     if (config.tokenizer_gguf.empty() &&
         config.tokenizer_model.empty()) {
         throw std::runtime_error(
@@ -1544,6 +1998,10 @@ int run_mfq_server(
     }
     const MfqSamplingParams sampling_defaults =
         default_sampling_params(config);
+    const json duplex_sampling_defaults =
+        duplex_profile_json(config.runtime_profile.duplex);
+    const json tts_sampling_defaults =
+        tts_profile_json(config.runtime_profile.tts);
     const json chat_template_capabilities =
         chat_template_capabilities_json(
             tokenizer->chat_template());
@@ -1553,6 +2011,38 @@ int run_mfq_server(
     std::atomic<int64_t> active_context{config.max_context};
     std::atomic<bool> reloading{false};
     std::mutex reload_gate;
+    std::mutex duplex_gate;
+    std::string duplex_session_id;
+    httplib::ws::WebSocket * duplex_socket = nullptr;
+    bool duplex_backend_started = false;
+
+    const auto duplex_is_active = [&]() {
+        std::lock_guard<std::mutex> lock(duplex_gate);
+        return !duplex_session_id.empty();
+    };
+    const auto stop_duplex_session = [&](const std::string & session_id,
+                                         bool close_socket) {
+        httplib::ws::WebSocket * socket = nullptr;
+        bool stop_backend = false;
+        {
+            std::lock_guard<std::mutex> lock(duplex_gate);
+            if (duplex_session_id.empty() ||
+                duplex_session_id != session_id) {
+                return false;
+            }
+            socket = duplex_socket;
+            stop_backend = duplex_backend_started;
+            duplex_session_id.clear();
+            duplex_socket = nullptr;
+            duplex_backend_started = false;
+        }
+        if (stop_backend) duplex.stop();
+        if (close_socket && socket != nullptr && socket->is_open()) {
+            socket->close(
+                httplib::ws::CloseStatus::Normal, "session closed");
+        }
+        return true;
+    };
     server.set_payload_max_length(16 * 1024 * 1024);
     server.set_read_timeout(300, 0);
     server.set_write_timeout(300, 0);
@@ -1567,6 +2057,376 @@ int run_mfq_server(
     server.Options(R"(.*)", [](const httplib::Request &, httplib::Response & res) {
         res.status = 204;
     });
+
+    if (duplex) {
+        server.WebSocket("/backend", [&](const httplib::Request & req,
+                                          httplib::ws::WebSocket & ws) {
+            const std::string expected = "Bearer " + config.api_key;
+            if (!config.api_key.empty() &&
+                req.get_header_value("Authorization") != expected) {
+                ws.close(
+                    httplib::ws::CloseStatus::PolicyViolation,
+                    "authentication failed");
+                return;
+            }
+
+            std::string owned_session;
+            std::unordered_set<int64_t> session_controls;
+            const auto send_event = [&](json event) {
+                event["server_send_ts"] =
+                    std::chrono::duration<double>(
+                        std::chrono::system_clock::now()
+                            .time_since_epoch()).count();
+                return ws.send(event.dump());
+            };
+            try {
+                std::string message;
+                while (ws.is_open()) {
+                    const auto read_result = ws.read(message);
+                    if (read_result == httplib::ws::ReadResult::Fail) break;
+                    if (read_result != httplib::ws::ReadResult::Text) {
+                        throw ApiError(
+                            400, "invalid_request_error",
+                            "duplex backend accepts JSON text frames only");
+                    }
+                    json body;
+                    try {
+                        body = json::parse(message);
+                    } catch (const json::parse_error & error) {
+                        throw ApiError(
+                            400, "invalid_request_error",
+                            std::string("invalid duplex JSON: ") +
+                                error.what());
+                    }
+                    if (!body.is_object() || !body.contains("type") ||
+                        !body["type"].is_string()) {
+                        throw ApiError(
+                            400, "invalid_request_error",
+                            "duplex message requires a string type");
+                    }
+                    const std::string type = body["type"].get<std::string>();
+
+                    if (type == "session.init") {
+                        if (!owned_session.empty()) {
+                            throw ApiError(
+                                409, "conflict",
+                                "duplex session is already initialized");
+                        }
+                        const json payload = body.value(
+                            "payload", json::object());
+                        if (!payload.is_object()) {
+                            throw ApiError(
+                                400, "invalid_request_error",
+                                "session.init payload must be an object");
+                        }
+                        const std::string mode = payload.value(
+                            "mode", std::string("full_duplex"));
+                        if (mode != "full_duplex") {
+                            throw ApiError(
+                                400, "unsupported_operation",
+                                "Metal duplex backend supports full_duplex only");
+                        }
+
+                        owned_session = request_id("sess-");
+                        {
+                            std::lock_guard<std::mutex> lock(duplex_gate);
+                            if (!duplex_session_id.empty()) {
+                                owned_session.clear();
+                                throw ApiError(
+                                    409, "conflict",
+                                    "the Metal worker already owns a duplex session");
+                            }
+                            duplex_session_id = owned_session;
+                            duplex_socket = &ws;
+                        }
+
+                        MfqDuplexSessionParams parameters;
+                        const std::string system_prompt = payload.value(
+                            "system_prompt",
+                            config.runtime_profile.duplex.system_prompt.value_or(
+                                "Streaming Omni Conversation."));
+                        const std::string rendered_prefix =
+                            "<|im_start|>system\n" + system_prompt +
+                            "\n<|audio_start|>";
+                        parameters.system_prefix = tokenizer->tokenize(
+                            rendered_prefix, true, false);
+                        parameters.system_suffix = tokenizer->tokenize(
+                            "<|audio_end|><|im_end|>", true, false);
+                        if (payload.contains("reference_audio_features")) {
+                            if (!payload["reference_audio_features"].is_string()) {
+                                throw ApiError(
+                                    400, "invalid_request_error",
+                                    "reference_audio_features must be base64 float32 Mel data",
+                                    "reference_audio_features");
+                            }
+                            parameters.reference_audio_frames =
+                                static_cast<int32_t>(integer_field(
+                                    payload, "reference_audio_frames", 0));
+                            parameters.reference_audio_features =
+                                decode_audio_features(
+                                    payload["reference_audio_features"].get<std::string>(),
+                                    parameters.reference_audio_frames);
+                        }
+                        parameters.special_ids = {
+                            tokenizer->special_token_id("<unit>"),
+                            tokenizer->special_token_id("</unit>"),
+                            tokenizer->special_token_id("<image>"),
+                            tokenizer->special_token_id("</image>"),
+                            tokenizer->special_token_id("<slice>"),
+                            tokenizer->special_token_id("</slice>"),
+                            tokenizer->special_token_id("<|listen|>"),
+                            tokenizer->special_token_id("<|speak|>"),
+                            tokenizer->special_token_id("<|tts_bos|>"),
+                            tokenizer->special_token_id("<|tts_eos|>"),
+                            tokenizer->special_token_id("<|chunk_eos|>"),
+                            tokenizer->special_token_id("<|chunk_tts_eos|>"),
+                            tokenizer->special_token_id("<|turn_eos|>"),
+                            tokenizer->special_token_id("<|tts_pad|>"),
+                            151687,
+                        };
+                        parameters.forbidden_ids = {
+                            tokenizer->special_token_id("<|tts_pad|>"),
+                        };
+                        session_controls = std::unordered_set<int64_t>(
+                            parameters.special_ids.begin(),
+                            parameters.special_ids.end());
+                        const json generation = payload.value(
+                            "config", json::object());
+                        if (!generation.is_object()) {
+                            throw ApiError(
+                                400, "invalid_request_error",
+                                "session config must be an object", "config");
+                        }
+                        const auto & duplex_defaults = config.runtime_profile.duplex;
+                        parameters.greedy = generation.value(
+                            "decode_mode", duplex_defaults.decode_mode.value_or("sampling")) ==
+                            "greedy";
+                        parameters.temperature = number_field(
+                            generation, "temperature", duplex_defaults.temperature.value_or(0.7));
+                        parameters.top_k = static_cast<int32_t>(integer_field(
+                            generation, "top_k", duplex_defaults.top_k.value_or(100)));
+                        parameters.top_p = number_field(
+                            generation, "top_p", duplex_defaults.top_p.value_or(0.8));
+                        parameters.listen_probability_scale = number_field(
+                            generation, "listen_prob_scale", duplex_defaults.listen_prob_scale.value_or(1.0));
+                        parameters.repetition_penalty = number_field(
+                            generation, "text_repetition_penalty", duplex_defaults.text_repetition_penalty.value_or(1.05));
+                        parameters.repetition_window =
+                            static_cast<int32_t>(integer_field(
+                                generation,
+                                "text_repetition_window_size",
+                                duplex_defaults.text_repetition_window_size.value_or(512)));
+                        parameters.length_penalty = number_field(
+                            generation, "length_penalty", duplex_defaults.length_penalty.value_or(1.0));
+                        if (generation.contains("seed")) {
+                            parameters.seed = static_cast<uint64_t>(
+                                integer_field(generation, "seed", 0));
+                        } else {
+                            std::random_device random;
+                            parameters.seed =
+                                (static_cast<uint64_t>(random()) << 32) ^
+                                static_cast<uint64_t>(random());
+                        }
+
+                        try {
+                            duplex.start(parameters);
+                            std::lock_guard<std::mutex> lock(duplex_gate);
+                            if (duplex_session_id == owned_session) {
+                                duplex_backend_started = true;
+                            }
+                        } catch (...) {
+                            std::lock_guard<std::mutex> lock(duplex_gate);
+                            if (duplex_session_id == owned_session) {
+                                duplex_session_id.clear();
+                                duplex_socket = nullptr;
+                            }
+                            owned_session.clear();
+                            throw;
+                        }
+                        send_event({
+                            {"type", "session.created"},
+                            {"session_id", owned_session},
+                            {"mode", "full_duplex"},
+                            {"metrics", {{"backend", "metal"}}},
+                        });
+                        continue;
+                    }
+
+                    if (type != "input.append") {
+                        throw ApiError(
+                            400, "invalid_request_error",
+                            "unsupported duplex message type: " + type);
+                    }
+                    if (owned_session.empty()) {
+                        throw ApiError(
+                            409, "conflict",
+                            "session.init must precede input.append");
+                    }
+                    const json input = body.value("input", json::object());
+                    if (!input.is_object()) {
+                        throw ApiError(
+                            400, "invalid_request_error",
+                            "input must be an object", "input");
+                    }
+                    const bool has_audio = input.contains("audio_features");
+                    const bool has_text = input.contains("text");
+                    if (!has_audio && !has_text) {
+                        throw ApiError(
+                            400, "invalid_request_error",
+                            "input requires audio_features or text", "input");
+                    }
+                    MfqDuplexStepInput step;
+                    if (has_audio) {
+                        if (!input["audio_features"].is_string()) {
+                            throw ApiError(
+                                400, "invalid_request_error",
+                                "input.audio_features must be base64 float32 Mel data",
+                                "audio_features");
+                        }
+                        step.audio_frames = static_cast<int32_t>(integer_field(
+                            input, "audio_frames", 0));
+                        step.audio_features = decode_audio_features(
+                            input["audio_features"].get<std::string>(),
+                            step.audio_frames);
+                        step.audio_prefix_extra_frames = integer_field(
+                            input, "audio_prefix_extra_frames", 0);
+                        step.audio_suffix_extra_frames = integer_field(
+                            input, "audio_suffix_extra_frames", 0);
+                    }
+                    if (has_text) {
+                        if (!input["text"].is_string() ||
+                            input["text"].get_ref<const std::string&>().empty()) {
+                            throw ApiError(
+                                400, "invalid_request_error",
+                                "input.text must be a non-empty string", "text");
+                        }
+                        step.text_tokens = tokenizer->tokenize(
+                            input["text"].get<std::string>(), false, false);
+                        if (step.text_tokens.empty()) {
+                            throw ApiError(
+                                400, "invalid_request_error",
+                                "input.text produced no tokens", "text");
+                        }
+                    }
+                    step.max_new_speak_tokens = static_cast<int32_t>(
+                        integer_field(
+                            input,
+                            "max_new_speak_tokens",
+                            config.runtime_profile.duplex
+                                .max_new_speak_tokens_per_chunk
+                                .value_or(20)));
+                    if (input.contains("force_listen") &&
+                        !input["force_listen"].is_boolean()) {
+                        throw ApiError(
+                            400, "invalid_request_error",
+                            "force_listen must be boolean", "force_listen");
+                    }
+                    step.force_listen = input.value("force_listen", false);
+                    if (input.contains("force_speak") &&
+                        !input["force_speak"].is_boolean()) {
+                        throw ApiError(
+                            400, "invalid_request_error",
+                            "force_speak must be boolean", "force_speak");
+                    }
+                    step.force_speak = input.value("force_speak", false);
+                    if (step.force_listen && step.force_speak) {
+                        throw ApiError(
+                            400, "invalid_request_error",
+                            "force_listen and force_speak are mutually exclusive");
+                    }
+
+                    const auto result = duplex.step(step);
+                    const std::string response_id = request_id("resp-");
+                    json metrics = {
+                        {"backend", "metal"},
+                        {"wall_clock_ms", result.inference_ms},
+                        {"kv_cache_length", result.language_cache_position},
+                        {"audio_cache_length", result.audio_cache_position},
+                        {"tts_cache_length", result.tts_cache_position},
+                        {"audio_chunk_index", result.audio_chunk_index},
+                    };
+
+                    std::string text_delta;
+                    for (const int64_t token : result.generated_tokens) {
+                        if (session_controls.count(token) == 0) {
+                            text_delta += tokenizer->piece(token, false);
+                        }
+                    }
+                    if (!text_delta.empty()) {
+                        send_event({
+                            {"type", "response.output.delta"},
+                            {"kind", "text"},
+                            {"text", text_delta},
+                            {"session_id", owned_session},
+                            {"response_id", response_id},
+                            {"end_of_turn", result.end_of_turn},
+                            {"metrics", metrics},
+                        });
+                    }
+                    if (!result.audio_tokens.empty() ||
+                        (result.end_of_turn && !result.is_listen)) {
+                        send_event({
+                            {"type", "response.output.delta"},
+                            {"kind", "audio_tokens"},
+                            {"audio_tokens", result.audio_tokens},
+                            {"session_id", owned_session},
+                            {"response_id", response_id},
+                            {"end_of_turn", result.end_of_turn},
+                            {"force_flush", result.tts_force_flush},
+                            {"metrics", metrics},
+                        });
+                    }
+                    if (result.is_listen) {
+                        send_event({
+                            {"type", "response.output.delta"},
+                            {"kind", "listen"},
+                            {"session_id", owned_session},
+                            {"response_id", response_id},
+                            {"metrics", metrics},
+                        });
+                    }
+                    send_event({
+                        {"type", "response.step.done"},
+                        {"session_id", owned_session},
+                        {"response_id", response_id},
+                        {"end_of_turn", result.end_of_turn},
+                        {"metrics", metrics},
+                    });
+                }
+            } catch (const std::exception & error) {
+                send_event({
+                    {"type", "session.closed"},
+                    {"session_id", owned_session},
+                    {"reason", "backend_error"},
+                    {"diagnostic", {{"message", error.what()}}},
+                });
+                if (ws.is_open()) {
+                    ws.close(
+                        httplib::ws::CloseStatus::InternalError,
+                        "duplex backend error");
+                }
+            }
+            if (!owned_session.empty()) {
+                stop_duplex_session(owned_session, false);
+            }
+        });
+
+        server.Post(R"(/sessions/([A-Za-z0-9_-]+)/close)",
+            [&](const httplib::Request & req, httplib::Response & res) {
+                if (!authorized(req, res, config.api_key)) return;
+                const std::string session_id = req.matches[1].str();
+                if (!stop_duplex_session(session_id, true)) {
+                    set_json(res, error_body(
+                        "duplex session was not found", "not_found"), 404);
+                    return;
+                }
+                set_json(res, {
+                    {"ok", true},
+                    {"session_id", session_id},
+                    {"closed", true},
+                });
+            });
+    }
 
     bool web_ui_available = false;
     if (!config.web_root.empty()) {
@@ -1611,7 +2471,8 @@ int run_mfq_server(
             {"model", config.model_name},
             {"endpoints", {
                 "/v1/chat/completions", "/v1/completions", "/v1/models",
-                "/health", "/api/status", "/api/reload", "/admin/",
+                "/health", "/api/status", "/api/reload", "/backend",
+                "/admin/",
             }},
         });
     });
@@ -1622,7 +2483,12 @@ int run_mfq_server(
             {"model", config.model_name},
             {"model_type", config.model_type},
             {"max_context", active_context.load()},
+            {"duplex_available", static_cast<bool>(duplex)},
+            {"duplex_active", duplex_is_active()},
             {"sampling_defaults", sampling_params_json(sampling_defaults)},
+            {"duplex_sampling_defaults", duplex_sampling_defaults},
+            {"tts_sampling_defaults", tts_sampling_defaults},
+            {"runtime_profile_source", config.runtime_profile.source},
             {"chat_template_capabilities", chat_template_capabilities},
         });
     });
@@ -1633,8 +2499,13 @@ int run_mfq_server(
             config, active_context.load(), reloading.load());
         status["sampling_defaults"] = sampling_params_json(
             sampling_defaults);
+        status["duplex_sampling_defaults"] = duplex_sampling_defaults;
+        status["tts_sampling_defaults"] = tts_sampling_defaults;
+        status["runtime_profile_source"] = config.runtime_profile.source;
         status["chat_template_capabilities"] =
             chat_template_capabilities;
+        status["duplex_available"] = static_cast<bool>(duplex);
+        status["duplex_active"] = duplex_is_active();
         set_json(res, status);
     });
 
@@ -1654,10 +2525,11 @@ int run_mfq_server(
                     "model reload is already in progress", "conflict"), 409);
                 return;
             }
-            if (server_metrics.active_requests() != 0) {
+            if (server_metrics.active_requests() != 0 ||
+                duplex_is_active()) {
                 reloading.store(false);
                 set_json(res, error_body(
-                    "cannot reload while a generation request is active",
+                    "cannot reload while a generation or duplex session is active",
                     "conflict"), 409);
                 return;
             }
@@ -1717,6 +2589,12 @@ int run_mfq_server(
 
     auto completion_handler = [&](bool chat, const httplib::Request & req, httplib::Response & res) {
         if (!authorized(req, res, config.api_key)) return;
+        if (duplex_is_active()) {
+            set_json(res, error_body(
+                "the model is reserved by an active duplex session",
+                "conflict"), 409);
+            return;
+        }
         if (reloading.load()) {
             set_json(res, error_body(
                 "model reload is in progress", "service_unavailable"), 503);

@@ -22,6 +22,13 @@ pip install -e ".[minicpmo45]"
 The extra pins `transformers==4.51.0` and the official Torch/Torchaudio 2.3–2.8
 range. TTS and streaming install `minicpmo-utils[all]>=1.0.5`.
 
+Apple realtime serving uses a separate media extra so the native model worker
+does not inherit Python runtime dependencies:
+
+```bash
+pip install -e ".[metal,minicpmo45-realtime]"
+```
+
 ## Convert
 
 ```bash
@@ -168,7 +175,58 @@ streaming audio index after every unit. TTS only returns codes that have already
 advanced the TTS KV cache, so the next unit can verify its expected position
 exactly. `reset()` destroys the duplex state and clears all modality caches.
 
-The HTTP servers do not yet parse raw MiniCPM-o image and audio requests.
-Quality and performance results require a calibrated checkpoint and
-modality-specific reference evaluation; structural support alone does not
-establish those results.
+### Apple realtime service
+
+Start the native worker with the modality graph enabled:
+
+```bash
+mfq-decode-metal \
+  --mfq /models/MiniCPM-o-4_5.mfq \
+  --server \
+  --minicpmo-duplex \
+  --host 127.0.0.1 \
+  --port 8081
+```
+
+Then start the media gateway with the official `assets/token2wav` directory and
+`system_ref_audio.wav` available below the assets root:
+
+```bash
+mfq-minicpmo-realtime \
+  --backend http://127.0.0.1:8081 \
+  --assets /models/OpenBMB/MiniCPM-o-4_5 \
+  --host 127.0.0.1 \
+  --port 8090
+```
+
+Open `http://127.0.0.1:8090/` for the standard MFQ WebUI. When the loaded model
+advertises realtime audio capability, a small voice control and a playback
+toggle appear in the existing chat composer. Text responses, when present, are
+added to the current conversation. Audio responses are always produced and
+delivered; the playback toggle only controls whether the browser plays them in
+real time. The gateway keeps the normal chat, monitoring, settings, and
+model-reload UI intact and proxies their HTTP API requests to the native worker.
+Voice sessions use the current official MiniCPM-o Demo defaults: one 16 kHz
+audio unit per second, three initial force-listen units, at most 20 generated
+text tokens per unit, temperature 0.7, top-k 20, top-p 0.8, repetition penalty
+1.05 over 512 tokens, and turn length penalty 1.05. The TTS decoder uses
+temperature 0.8 and repetition penalty 1.05; Token2wav uses 10 flow steps and
+the browser buffers 200 ms before playback. The WebUI uses the official
+language-specific Chinese or English duplex prompt unless the user supplies a
+custom system prompt. Generic chat sampling controls do not override these
+voice defaults.
+
+Its additional public media protocol is
+`WS /v1/realtime?mode=audio`: clients send base64 float32 mono PCM at 16 kHz and
+receive independent text deltas and base64 float32 mono PCM at 24 kHz. The
+gateway uses the official exact streaming Mel geometry, including the 1030 ms
+first window and two-frame CNN boundary context. It renders S3 codes with the
+official Flow and HiFT weights on MPS, with CPU fallback when MPS is unavailable.
+The first TTS chunk follows the official early-flush path; later chunks retain
+three S3 lookahead codes and consume 25 codes at a time.
+
+The current public media gateway is audio-only. Native callers can still use
+the composite graph interfaces for image and mixed-modality requests. Quality
+and performance results require a calibrated checkpoint and modality-specific
+reference evaluation; structural support alone does not establish those
+results.

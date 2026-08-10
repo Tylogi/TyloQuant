@@ -2148,6 +2148,24 @@ public:
             allowed.begin(), Shape{vocab}, mlx::core::uint8);
         auto filtered = mlx::core::astype(logits, mlx::core::float32) *
             factor_array;
+        if (config.length_penalty != 1.0) {
+            const auto adjusted = mlx::core::where(
+                mlx::core::greater_equal(
+                    filtered,
+                    array(0.0f, mlx::core::float32)),
+                filtered / static_cast<float>(config.length_penalty),
+                filtered * static_cast<float>(config.length_penalty));
+            const auto token_ids = mlx::core::arange(
+                0, vocab, 1, mlx::core::int32);
+            filtered = mlx::core::where(
+                mlx::core::equal(
+                    token_ids,
+                    array(
+                        static_cast<std::int32_t>(ids.turn_eos),
+                        mlx::core::int32)),
+                adjusted,
+                filtered);
+        }
         filtered = mlx::core::where(
             mlx::core::astype(allowed_array, mlx::core::bool_),
             filtered,
@@ -2339,7 +2357,9 @@ array MlxMiniCPMO45Runtime::encode_audio_streaming(
 
 void MlxMiniCPMO45Runtime::prepare_duplex(
     const MlxMiniCPMO45DuplexConfig& config,
-    const std::optional<array>& system_ids) {
+    const std::optional<array>& system_prefix_ids,
+    const std::optional<array>& reference_audio_features,
+    const std::optional<array>& system_suffix_ids) {
     if (!implementation_->audio || !implementation_->tts) {
         throw std::runtime_error(
             "MiniCPM-o duplex requires the audio and TTS components");
@@ -2382,7 +2402,9 @@ void MlxMiniCPMO45Runtime::prepare_duplex(
         config.listen_probability_scale < 0.0 ||
         !std::isfinite(config.repetition_penalty) ||
         config.repetition_penalty <= 0.0 ||
-        config.repetition_window <= 0) {
+        config.repetition_window <= 0 ||
+        !std::isfinite(config.length_penalty) ||
+        config.length_penalty <= 0.0) {
         throw std::runtime_error(
             "MiniCPM-o duplex sampling configuration is invalid");
     }
@@ -2394,9 +2416,11 @@ void MlxMiniCPMO45Runtime::prepare_duplex(
     }
 
     int system_tokens = 0;
-    if (system_ids && system_ids->size() > 0) {
-        system_tokens = static_cast<int>(system_ids->size());
-        const auto values = host_i64(*system_ids, "duplex system IDs");
+    const auto validate_system_ids = [&](const std::optional<array>& value,
+                                         const char* label) {
+        if (!value || value->size() == 0) return;
+        system_tokens += static_cast<int>(value->size());
+        const auto values = host_i64(*value, label);
         if (std::any_of(
                 values.begin(),
                 values.end(),
@@ -2406,14 +2430,41 @@ void MlxMiniCPMO45Runtime::prepare_duplex(
             throw std::runtime_error(
                 "MiniCPM-o duplex system token is out of range");
         }
+    };
+    validate_system_ids(system_prefix_ids, "duplex system prefix IDs");
+    validate_system_ids(system_suffix_ids, "duplex system suffix IDs");
+    if (reference_audio_features) {
+        if (reference_audio_features->ndim() != 3 ||
+            reference_audio_features->shape(0) != 1 ||
+            reference_audio_features->shape(1) != 80 ||
+            reference_audio_features->shape(2) < 3) {
+            throw std::runtime_error(
+                "MiniCPM-o duplex reference audio expects [1,80,frames]");
+        }
+        const auto raw_frames = reference_audio_features->shape(2);
+        const auto conv_frames = (raw_frames - 1) / 2 + 1;
+        system_tokens += (conv_frames - 5) / 5 + 1;
     }
     implementation_->language.reset_cache(
         1, std::max(16, system_tokens));
     implementation_->audio->reset();
     implementation_->tts->reset(1);
     implementation_->duplex.emplace(config);
-    if (system_tokens > 0) {
-        implementation_->feed_duplex_ids(*system_ids);
+    if (system_prefix_ids && system_prefix_ids->size() > 0) {
+        implementation_->feed_duplex_ids(*system_prefix_ids);
+    }
+    if (reference_audio_features) {
+        const array lengths(
+            {reference_audio_features->shape(2)},
+            Shape{1},
+            mlx::core::int64);
+        auto embeddings = implementation_->audio->forward(
+            *reference_audio_features, lengths, false);
+        implementation_->feed_duplex_embeddings(embeddings);
+        implementation_->audio->reset();
+    }
+    if (system_suffix_ids && system_suffix_ids->size() > 0) {
+        implementation_->feed_duplex_ids(*system_suffix_ids);
     }
 }
 
@@ -2541,7 +2592,7 @@ MlxMiniCPMO45DuplexResult MlxMiniCPMO45Runtime::duplex_step(
             state.generated_text_ids.push_back(token);
         }
         if (!forced_decision && token == ids.listen &&
-            !state.current_turn_ended) {
+            (!state.current_turn_ended || inputs.force_speak)) {
             token = ids.tts_bos;
         }
         generated.push_back(token);
@@ -2573,6 +2624,7 @@ MlxMiniCPMO45DuplexResult MlxMiniCPMO45Runtime::duplex_step(
         mlx::core::int64);
     auto tts_codes = mlx::core::zeros(
         Shape{1, 0, 1}, mlx::core::int32);
+    bool tts_force_flush = false;
     if (!is_listen) {
         array text_id_tensor = spoken_ids.empty()
             ? mlx::core::zeros(Shape{1, 0}, mlx::core::int64)
@@ -2586,18 +2638,17 @@ MlxMiniCPMO45DuplexResult MlxMiniCPMO45Runtime::duplex_step(
             : mlx::core::concatenate(spoken_hidden, 1);
         auto condition = implementation_->tts->duplex_condition(
             text_id_tensor, hidden_tensor, ids.audio_bos);
-        if (state.tts_text_start_position == 0) {
+        const bool first_tts_chunk = state.tts_text_start_position == 0;
+        if (first_tts_chunk) {
             implementation_->tts->reset(1);
+            tts_force_flush = true;
         }
         if (implementation_->tts->cache_position() !=
             state.tts_text_start_position) {
             throw std::runtime_error(
                 "MiniCPM-o duplex TTS cache position is inconsistent");
         }
-        int minimum_codes = 26;
-        if (end_of_turn || state.tts_text_start_position == 0) {
-            minimum_codes = 0;
-        }
+        const int minimum_codes = end_of_turn || first_tts_chunk ? 0 : 26;
         auto tts_result = implementation_->tts->generate_duplex_chunk(
             condition,
             26,
@@ -2628,6 +2679,7 @@ MlxMiniCPMO45DuplexResult MlxMiniCPMO45Runtime::duplex_step(
         std::move(tts_codes),
         is_listen,
         end_of_turn,
+        tts_force_flush,
         state.audio_chunk_index,
         implementation_->language.cache_position(),
         implementation_->audio->cache_length(),

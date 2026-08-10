@@ -26,6 +26,10 @@ from mfq.formats.assets import (
 )
 from mfq.formats.header import FileHeader
 from mfq.formats.mx import MXFP4_DTYPE, MXFP8_DTYPE, mx_header_bytes
+from mfq.formats.runtime_profile import (
+    RUNTIME_SAMPLING_METADATA_KEY,
+    profile_for_new_mfq,
+)
 from mfq.formats.shards import (
     matching_shard_paths,
     parse_size,
@@ -355,20 +359,28 @@ def convert(args: argparse.Namespace) -> list[Path]:
             fingerprint.update(item.dtype.encode("ascii"))
             fingerprint.update(str(item.shape).encode("ascii"))
         model_type = str(config.get("model_type", "unknown"))
+        extra = {
+            "full_precision_mfq": True,
+            "source_format": "hf-safetensors",
+            "source_name": root.name,
+            "partial_source": partial_source,
+            "tensor_manifest_sha256": fingerprint.hexdigest(),
+            "native_dtypes": counts,
+            "hf_config": config,
+            ASSET_MANIFEST_KEY: runtime_asset_manifest(assets),
+        }
+        runtime_profile = profile_for_new_mfq(
+            root,
+            config,
+            explicit_profile=getattr(args, "sampling_profile", "") or None,
+        )
+        if runtime_profile is not None:
+            extra[RUNTIME_SAMPLING_METADATA_KEY] = runtime_profile
         header = FileHeader(
             version=2,
             model_arch=f"{model_type}-hf-full-mfq",
             num_tensors=len(records),
-            extra={
-                "full_precision_mfq": True,
-                "source_format": "hf-safetensors",
-                "source_name": root.name,
-                "partial_source": partial_source,
-                "tensor_manifest_sha256": fingerprint.hexdigest(),
-                "native_dtypes": counts,
-                "hf_config": config,
-                ASSET_MANIFEST_KEY: runtime_asset_manifest(assets),
-            },
+            extra=extra,
         )
         outputs = write_blob_record_shards(
             output,
@@ -390,6 +402,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--model-config", default="")
+    parser.add_argument("--sampling-profile", default="")
     parser.add_argument("--tokenizer-gguf", default="")
     parser.add_argument("--tensor-pattern", action="append", default=[])
     parser.add_argument("--limit-tensors", type=int, default=0)

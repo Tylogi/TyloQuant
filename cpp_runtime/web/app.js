@@ -3,6 +3,8 @@
 
   const STORAGE_KEY = "mfq.console.v1";
   const API_KEY_STORAGE = "mfq.console.api-key";
+  const AUDIO_DB_NAME = "mfq.console.audio.v1";
+  const AUDIO_STORE_NAME = "clips";
   const MAX_CONVERSATIONS = 40;
   const MAX_METRIC_POINTS = 32;
   const LEGACY_LOCAL_ENDPOINT = "http://127.0.0.1:8080";
@@ -41,6 +43,10 @@
     "Enter 发送 · Shift+Enter 换行": "Enter to send · Shift+Enter for a new line",
     "发送": "Send",
     "模型输出可能存在错误，请核对重要信息。": "Model output may be incorrect. Verify important information.",
+    "语音输入": "Voice input",
+    "实时播放语音": "Play voice responses",
+    "语音回复": "Voice response",
+    "语音回放保存失败。": "The voice replay could not be saved.",
     "服务监控": "Server monitor",
     "等待状态数据": "Waiting for status data",
     "刷新状态": "Refresh status",
@@ -131,7 +137,8 @@
     "完成请求后显示吞吐趋势": "The throughput trend appears after requests complete",
     "当前已加载 {current}，模型上限 {limit} tokens。重载会卸载当前 runtime 并重新分配 KV cache。": "Currently loaded: {current}; model limit: {limit} tokens. Reloading unloads the current runtime and reallocates the KV cache.",
     "推理设置已应用。": "Inference settings applied.",
-    "请先停止当前生成再重载模型。": "Stop the current generation before reloading the model.",
+    "请先停止当前生成。": "Stop the current generation first.",
+    "请先停止当前生成或语音输入再重载模型。": "Stop the current generation or voice input before reloading the model.",
     "以当前 {context} token 上下文重新加载模型？": "Reload the model with the current {context}-token context?",
     "将模型从 {current} token 上下文重载为 {context}？": "Reload the model from a {current}-token context to {context} tokens?",
     "重载期间不能生成，通常需要约 1–2 分钟。": "Generation is unavailable during reload, which usually takes about 1–2 minutes.",
@@ -225,9 +232,18 @@
     reasoningOpenState: new WeakMap(),
     pollTimer: 0,
     samplingDefaults: null,
+    realtimeActive: false,
   };
 
   const refs = {};
+  const audioObjectUrls = new Map();
+  let audioDatabasePromise = null;
+  let realtimeSessionConversation = null;
+  let realtimeConversation = null;
+  let realtimeMessage = null;
+  let realtimeAudioChunks = [];
+  let realtimeAudioSampleRate = 24000;
+  let realtimeRenderPending = false;
 
   function resolvedUiLanguage() {
     const selected = UI_LANGUAGES.has(state.settings.language)
@@ -324,6 +340,114 @@
     return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   }
 
+  function audioDatabase() {
+    if (audioDatabasePromise) return audioDatabasePromise;
+    audioDatabasePromise = new Promise((resolve, reject) => {
+      const request = indexedDB.open(AUDIO_DB_NAME, 1);
+      request.onupgradeneeded = () => {
+        if (!request.result.objectStoreNames.contains(AUDIO_STORE_NAME)) {
+          request.result.createObjectStore(AUDIO_STORE_NAME);
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error("IndexedDB open failed"));
+    });
+    return audioDatabasePromise;
+  }
+
+  async function storeAudioClip(id, blob) {
+    const database = await audioDatabase();
+    await new Promise((resolve, reject) => {
+      const transaction = database.transaction(AUDIO_STORE_NAME, "readwrite");
+      transaction.objectStore(AUDIO_STORE_NAME).put(
+        {blob, createdAt: Date.now()},
+        id
+      );
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(
+        transaction.error || new Error("Audio storage failed")
+      );
+      transaction.onabort = transaction.onerror;
+    });
+  }
+
+  async function loadAudioClip(id) {
+    const database = await audioDatabase();
+    return new Promise((resolve, reject) => {
+      const request = database
+        .transaction(AUDIO_STORE_NAME, "readonly")
+        .objectStore(AUDIO_STORE_NAME)
+        .get(id);
+      request.onsuccess = () => resolve(request.result?.blob || null);
+      request.onerror = () => reject(request.error || new Error("Audio load failed"));
+    });
+  }
+
+  async function deleteAudioClip(id) {
+    if (!id) return;
+    const url = audioObjectUrls.get(id);
+    if (url) URL.revokeObjectURL(url);
+    audioObjectUrls.delete(id);
+    const database = await audioDatabase();
+    await new Promise((resolve, reject) => {
+      const transaction = database.transaction(AUDIO_STORE_NAME, "readwrite");
+      transaction.objectStore(AUDIO_STORE_NAME).delete(id);
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(
+        transaction.error || new Error("Audio deletion failed")
+      );
+      transaction.onabort = transaction.onerror;
+    });
+  }
+
+  async function clearStoredAudio() {
+    for (const url of audioObjectUrls.values()) URL.revokeObjectURL(url);
+    audioObjectUrls.clear();
+    const database = await audioDatabase();
+    await new Promise((resolve, reject) => {
+      const transaction = database.transaction(AUDIO_STORE_NAME, "readwrite");
+      transaction.objectStore(AUDIO_STORE_NAME).clear();
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(
+        transaction.error || new Error("Audio clear failed")
+      );
+      transaction.onabort = transaction.onerror;
+    });
+  }
+
+  function wavBlob(chunks, sampleRate) {
+    const sampleCount = chunks.reduce((total, chunk) => total + chunk.length, 0);
+    const buffer = new ArrayBuffer(44 + sampleCount * 2);
+    const view = new DataView(buffer);
+    const writeText = (offset, value) => {
+      for (let index = 0; index < value.length; index += 1) {
+        view.setUint8(offset + index, value.charCodeAt(index));
+      }
+    };
+    writeText(0, "RIFF");
+    view.setUint32(4, 36 + sampleCount * 2, true);
+    writeText(8, "WAVE");
+    writeText(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeText(36, "data");
+    view.setUint32(40, sampleCount * 2, true);
+    let offset = 44;
+    for (const chunk of chunks) {
+      for (let index = 0; index < chunk.length; index += 1) {
+        const sample = Math.max(-1, Math.min(1, chunk[index]));
+        view.setInt16(offset, sample < 0 ? sample * 32768 : sample * 32767, true);
+        offset += 2;
+      }
+    }
+    return new Blob([buffer], {type: "audio/wav"});
+  }
+
   function newConversation() {
     return {
       id: randomId("chat"),
@@ -347,6 +471,7 @@
         role: message.role,
         content: message.content,
         reasoning: typeof message.reasoning === "string" ? message.reasoning : "",
+        audioId: typeof message.audioId === "string" ? message.audioId : "",
         createdAt: Number(message.createdAt) || Date.now(),
         error: Boolean(message.error),
       }));
@@ -467,6 +592,121 @@
 
   function activeConversation() {
     return state.conversations.find((item) => item.id === state.activeId);
+  }
+
+  function stopRealtimeForConversationChange() {
+    if (!state.realtimeActive) return;
+    state.realtimeActive = false;
+    document.dispatchEvent(new CustomEvent("mfq:realtime-stop", {
+      detail: {reason: "conversation_changed"},
+    }));
+  }
+
+  function beginRealtimeSession() {
+    if (state.generating) {
+      showToast("请先停止当前生成。", true);
+      return null;
+    }
+    realtimeSessionConversation = activeConversation();
+    if (!realtimeSessionConversation) return null;
+    state.realtimeActive = true;
+    const configuredSystemPrompt = state.settings.systemPrompt.trim();
+    return {systemPrompt: configuredSystemPrompt};
+  }
+
+  function scheduleRealtimeRender() {
+    if (realtimeRenderPending) return;
+    realtimeRenderPending = true;
+    requestAnimationFrame(() => {
+      realtimeRenderPending = false;
+      if (realtimeConversation?.id === state.activeId) renderMessages();
+    });
+  }
+
+  function ensureRealtimeMessage() {
+    if (!realtimeMessage) {
+      realtimeConversation = realtimeSessionConversation;
+      if (!realtimeConversation) return null;
+      realtimeMessage = {
+        role: "assistant",
+        content: "",
+        reasoning: "",
+        audioId: "",
+        createdAt: Date.now(),
+        error: false,
+      };
+      realtimeConversation.messages.push(realtimeMessage);
+      state.followOutput = true;
+    }
+    return realtimeMessage;
+  }
+
+  function appendRealtimeText(value) {
+    if (typeof value !== "string" || !value) return;
+    if (!ensureRealtimeMessage()) return;
+    realtimeMessage.content += value;
+    realtimeConversation.updatedAt = Date.now();
+    scheduleRealtimeRender();
+  }
+
+  function appendRealtimeAudio(samples, sampleRate) {
+    if (!(samples instanceof Float32Array) || !samples.length) return;
+    realtimeAudioChunks.push(new Float32Array(samples));
+    if (Number.isFinite(sampleRate) && sampleRate > 0) {
+      realtimeAudioSampleRate = Math.round(sampleRate);
+    }
+  }
+
+  function finishRealtimeTurn() {
+    if (!realtimeMessage && realtimeAudioChunks.length) ensureRealtimeMessage();
+    const conversation = realtimeConversation;
+    const message = realtimeMessage;
+    const audioChunks = realtimeAudioChunks;
+    const sampleRate = realtimeAudioSampleRate;
+    realtimeConversation = null;
+    realtimeMessage = null;
+    realtimeAudioChunks = [];
+    realtimeAudioSampleRate = 24000;
+    if (!conversation || !message) return;
+
+    const finalize = async () => {
+      if (audioChunks.length) {
+        const audioId = randomId("audio");
+        await storeAudioClip(audioId, wavBlob(audioChunks, sampleRate));
+        message.audioId = audioId;
+      }
+      if (!message.content.trim() && !message.audioId) {
+        const index = conversation.messages.indexOf(message);
+        if (index >= 0) conversation.messages.splice(index, 1);
+      }
+      conversation.updatedAt = Date.now();
+      persistState();
+      renderConversationList();
+      if (conversation.id === state.activeId) renderMessages();
+    };
+    void finalize().catch((error) => {
+      console.error(error);
+      showToast("语音回放保存失败。", true);
+    });
+  }
+
+  function installRealtimeBridge() {
+    globalThis.MFQRealtimeBridge = Object.freeze({
+      begin: beginRealtimeSession,
+      appendText: appendRealtimeText,
+      appendAudio: appendRealtimeAudio,
+      finishTurn: finishRealtimeTurn,
+      setActive(active) {
+        state.realtimeActive = Boolean(active);
+        if (!active) {
+          finishRealtimeTurn();
+          realtimeSessionConversation = null;
+        }
+      },
+      notify(message, error = false) {
+        showToast(message, error);
+      },
+    });
   }
 
   function normalizeEndpoint(value) {
@@ -685,6 +925,9 @@
       const activate = () => {
         if (state.generating) return;
         if (state.renamingConversationId === conversation.id) return;
+        if (conversation.id !== state.activeId) {
+          stopRealtimeForConversationChange();
+        }
         state.activeId = conversation.id;
         state.editingMessage = null;
         state.renamingConversationId = "";
@@ -708,6 +951,7 @@
 
   function createConversation() {
     if (state.generating) stopGeneration();
+    stopRealtimeForConversationChange();
     const conversation = newConversation();
     state.conversations.unshift(conversation);
     state.activeId = conversation.id;
@@ -724,6 +968,11 @@
 
   function deleteConversation(id) {
     if (state.generating && id === state.activeId) return;
+    if (id === state.activeId) stopRealtimeForConversationChange();
+    const removed = state.conversations.find((item) => item.id === id);
+    for (const message of removed?.messages || []) {
+      if (message.audioId) void deleteAudioClip(message.audioId).catch(console.error);
+    }
     state.conversations = state.conversations.filter((item) => item.id !== id);
     if (!state.conversations.length) {
       state.conversations.push(newConversation());
@@ -1136,6 +1385,37 @@
     return button;
   }
 
+  function messageAudioElement(audioId) {
+    const wrapper = document.createElement("div");
+    wrapper.className = "message-audio";
+    const player = document.createElement("audio");
+    player.className = "message-audio-player";
+    player.controls = true;
+    player.preload = "metadata";
+    player.dataset.audioId = audioId;
+    player.setAttribute("aria-label", tr("语音回复"));
+    wrapper.append(player);
+
+    const attach = async () => {
+      let url = audioObjectUrls.get(audioId);
+      if (!url) {
+        const blob = await loadAudioClip(audioId);
+        if (!blob) {
+          wrapper.remove();
+          return;
+        }
+        url = URL.createObjectURL(blob);
+        audioObjectUrls.set(audioId, url);
+      }
+      if (player.dataset.audioId === audioId) player.src = url;
+    };
+    void attach().catch((error) => {
+      console.error(error);
+      wrapper.remove();
+    });
+    return wrapper;
+  }
+
   function messageElement(conversation, message) {
     const article = document.createElement("article");
     article.className = `message ${message.role}${message.error ? " is-error" : ""}`;
@@ -1222,6 +1502,9 @@
       content.append(typing);
     }
     body.append(content);
+    if (message.role === "assistant" && message.audioId) {
+      body.append(messageAudioElement(message.audioId));
+    }
 
     let actions = null;
     if (!state.generating) {
@@ -1566,6 +1849,10 @@
       createdAt: assistant.createdAt,
       error: assistant.error,
     };
+    if (assistant.audioId) {
+      void deleteAudioClip(assistant.audioId).catch(console.error);
+      assistant.audioId = "";
+    }
     const requestMessages =
       conversationRequestMessages(conversation, assistantIndex);
     assistant.content = "";
@@ -1601,6 +1888,20 @@
     conversation.messages.push(userMessage);
     updateConversationTitle(conversation, content);
     conversation.updatedAt = Date.now();
+    state.followOutput = true;
+    refs["message-input"].value = "";
+    resizeComposer();
+
+    if (state.realtimeActive) {
+      persistState();
+      renderConversationList();
+      renderMessages();
+      document.dispatchEvent(new CustomEvent(
+        "mfq:realtime-text-input",
+        {detail: {text: content}}
+      ));
+      return;
+    }
 
     const assistant = {
       role: "assistant",
@@ -1613,9 +1914,6 @@
     const assistantIndex = conversation.messages.length - 1;
     const requestMessages =
       conversationRequestMessages(conversation, assistantIndex);
-    state.followOutput = true;
-    refs["message-input"].value = "";
-    resizeComposer();
     await generateAssistant(conversation, assistant, requestMessages, {
       followOutput: true,
       removeIfEmptyOnAbort: true,
@@ -1701,7 +1999,13 @@
         const health = await fetchJson("/health");
         payload = mergeFallbackStatus(health);
       }
+      const capabilityChanged =
+        state.status?.model !== payload?.model ||
+        state.status?.duplex_available !== payload?.duplex_available;
       state.status = payload;
+      if (capabilityChanged) {
+        document.dispatchEvent(new Event("mfq:model-status-changed"));
+      }
       applyServerSamplingDefaults(payload);
       setConnection(
         true,
@@ -2078,8 +2382,8 @@
   }
 
   async function reloadModel() {
-    if (state.generating) {
-      showToast("请先停止当前生成再重载模型。", true);
+    if (state.generating || state.realtimeActive) {
+      showToast("请先停止当前生成或语音输入再重载模型。", true);
       return;
     }
     const capacityValue = Number(state.status?.context_capacity);
@@ -2123,6 +2427,7 @@
         ...payload,
         reloading: false,
       };
+      document.dispatchEvent(new Event("mfq:model-status-changed"));
       updateMonitor();
       populateSettings();
       setConnection(true, "在线");
@@ -2180,6 +2485,8 @@
     refs["new-chat"].addEventListener("click", createConversation);
     refs["clear-history"].addEventListener("click", () => {
       if (state.generating) return;
+      stopRealtimeForConversationChange();
+      void clearStoredAudio().catch(console.error);
       state.conversations = [newConversation()];
       state.activeId = state.conversations[0].id;
       state.editingMessage = null;
@@ -2261,6 +2568,7 @@
   function initialize() {
     queryRefs();
     loadState();
+    installRealtimeBridge();
     applyStaticUiLanguage();
     bindEvents();
     renderModels();

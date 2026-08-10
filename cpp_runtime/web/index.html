@@ -22,6 +22,12 @@
     <symbol id="icon-activity" viewBox="0 0 24 24">
       <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
     </symbol>
+    <symbol id="icon-volume" viewBox="0 0 24 24">
+      <path d="M11 5 6 9H2v6h4l5 4zM15.5 8.5a5 5 0 0 1 0 7M18 6a8.5 8.5 0 0 1 0 12"/>
+    </symbol>
+    <symbol id="icon-volume-off" viewBox="0 0 24 24">
+      <path d="M11 5 6 9H2v6h4l5 4zM22 9l-6 6M16 9l6 6"/>
+    </symbol>
     <symbol id="icon-settings" viewBox="0 0 24 24">
       <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.72l.15-.1a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/>
       <circle cx="12" cy="12" r="3"/>
@@ -166,6 +172,13 @@
           <form class="composer" id="composer-form">
             <textarea id="message-input" rows="1" maxlength="32768" placeholder="向模型发送消息" aria-label="消息"></textarea>
             <div class="composer-toolbar">
+              <button class="voice-orb-toggle" id="voice-input-toggle" type="button" aria-pressed="false" title="语音输入" aria-label="语音输入" hidden>
+                <span></span>
+              </button>
+              <button class="voice-playback-toggle" id="voice-playback-toggle" type="button" aria-pressed="true" title="实时播放语音" aria-label="实时播放语音" hidden>
+                <svg class="voice-playback-on"><use href="#icon-volume"/></svg>
+                <svg class="voice-playback-off"><use href="#icon-volume-off"/></svg>
+              </button>
               <button class="thinking-toggle" id="thinking-toggle" type="button" aria-pressed="true">
                 <svg><use href="#icon-brain"/></svg>
                 <span>思考</span>
@@ -394,5 +407,6 @@
   <script src="vendor/katex/katex.min.js" defer></script>
   <script src="vendor/katex/auto-render.min.js" defer></script>
   <script src="app.js" defer></script>
+  <script src="realtime-audio.js" defer></script>
 </body>
 </html>

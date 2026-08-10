@@ -27,6 +27,10 @@ from mfq.formats.tpq import (
     pack_tpq_pq_prefix,
 )
 from mfq.formats.header import MFQ_MAGIC, FileHeader
+from mfq.formats.runtime_profile import (
+    RUNTIME_SAMPLING_METADATA_KEY,
+    architecture_profile,
+)
 from mfq.formats.io import (
     _NINT_MOE_HDR,
     _NINT_MOE_MAGIC_V2,
@@ -1198,25 +1202,32 @@ def convert(
         *_dense_records(root, manifest, row_chunk=row_chunk),
         *_expert_records(root, manifest, workers=workers),
     ]
+    model_arch = (
+        "deepseek_v4-tpq-mfq"
+        if "hc_mult" in manifest["config"]
+        else (
+            "kimi_k3-tpq-mfq"
+            if (
+                manifest.get("model_family") == "kimi_k3"
+                or (
+                    "kda_layers" in manifest["config"]
+                    and "routed_hidden" in manifest["config"]
+                )
+            )
+            else "tpq-mfq"
+        )
+    )
+    runtime_profile = architecture_profile(model_arch)
     header = FileHeader(
         version=2,
-        model_arch=(
-            "deepseek_v4-tpq-mfq"
-            if "hc_mult" in manifest["config"]
-            else (
-                "kimi_k3-tpq-mfq"
-                if (
-                    manifest.get("model_family") == "kimi_k3"
-                    or (
-                        "kda_layers" in manifest["config"]
-                        and "routed_hidden" in manifest["config"]
-                    )
-                )
-                else "tpq-mfq"
-            )
-        ),
+        model_arch=model_arch,
         num_tensors=len(records),
         extra={
+            **(
+                {RUNTIME_SAMPLING_METADATA_KEY: runtime_profile}
+                if runtime_profile is not None
+                else {}
+            ),
             "source_format": str(manifest["format"]),
             "source_manifest_sha256": _manifest_sha256(root),
             "tpq_manifest": manifest,

@@ -10,6 +10,7 @@ See :mod:`mfq.formats.io` for the binary layout.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 MFQ_MAGIC = b"MFQ1"
 
@@ -22,7 +23,7 @@ class FileHeader:
     version: int = 1
     model_arch: str = ""
     num_tensors: int = 0
-    extra: dict[str, str] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

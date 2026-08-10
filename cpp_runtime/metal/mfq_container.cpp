@@ -452,6 +452,11 @@ MfqContainer::MfqContainer(std::filesystem::path path) {
             throw std::runtime_error(
                 "MFQ shard metadata mismatch: " + paths[index].string());
         }
+        if (index == 0) {
+            // Only shard zero owns global metadata. Canonicalize the header so
+            // starting from any shard yields the same runtime profile/assets.
+            header_ = current;
+        }
         const auto current_expected_records = metadata_uint(
             current,
             "split.records.count",

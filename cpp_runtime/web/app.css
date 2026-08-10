@@ -759,6 +759,17 @@ svg {
   margin-bottom: 0;
 }
 
+.message-audio {
+  width: min(360px, 100%);
+  margin-top: 9px;
+}
+
+.message-audio-player {
+  display: block;
+  width: 100%;
+  height: 34px;
+}
+
 .reasoning-content > :last-child {
   margin-bottom: 0;
 }
@@ -1302,6 +1313,79 @@ svg {
   color: var(--ink-faint);
   font-size: 9px;
   text-align: center;
+}
+
+.voice-orb-toggle,
+.voice-playback-toggle {
+  display: grid;
+  width: 29px;
+  height: 29px;
+  flex: 0 0 auto;
+  padding: 0;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink-faint);
+}
+
+.voice-orb-toggle[hidden],
+.voice-playback-toggle[hidden] {
+  display: none;
+}
+
+.voice-orb-toggle > span {
+  width: 15px;
+  height: 15px;
+  border-radius: 46% 54% 49% 51%;
+  background: radial-gradient(circle at 34% 28%, #d9fff2, #54c5a9 38%, #176d5c 84%);
+  box-shadow: 0 0 8px rgb(23 131 111 / 22%);
+}
+
+.voice-orb-toggle:hover,
+.voice-playback-toggle:hover {
+  border-color: var(--line-strong);
+  background: var(--surface-muted);
+  color: var(--ink);
+}
+
+.voice-orb-toggle[aria-pressed="true"] {
+  border-color: rgb(23 131 111 / 32%);
+  background: var(--teal-soft);
+}
+
+.voice-orb-toggle[aria-pressed="true"] > span {
+  transform: scale(var(--voice-scale, 0.82));
+  box-shadow: 0 0 var(--voice-glow, 8px) rgb(23 131 111 / 42%);
+  transition: transform 70ms linear, box-shadow 70ms linear;
+}
+
+.voice-playback-toggle svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.voice-playback-toggle .voice-playback-off {
+  display: none;
+}
+
+.voice-playback-toggle[aria-pressed="false"] .voice-playback-on {
+  display: none;
+}
+
+.voice-playback-toggle[aria-pressed="false"] .voice-playback-off {
+  display: block;
+}
+
+.voice-playback-toggle.is-speaking {
+  border-color: rgb(23 131 111 / 30%);
+  background: var(--teal-soft);
+  color: var(--teal);
 }
 
 .monitor-view {

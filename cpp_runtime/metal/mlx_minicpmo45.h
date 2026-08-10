@@ -70,6 +70,7 @@ struct MlxMiniCPMO45DuplexConfig {
     double listen_probability_scale = 1.0;
     double repetition_penalty = 1.05;
     std::int32_t repetition_window = 512;
+    double length_penalty = 1.0;
     std::uint64_t seed = 0;
 };
 
@@ -84,6 +85,7 @@ struct MlxMiniCPMO45DuplexInputs {
     std::optional<mlx::core::array> text_ids;
     std::int32_t max_new_speak_tokens = 20;
     bool force_listen = false;
+    bool force_speak = false;
 };
 
 struct MlxMiniCPMO45DuplexResult {
@@ -93,6 +95,7 @@ struct MlxMiniCPMO45DuplexResult {
     mlx::core::array tts_codes;
     bool is_listen = false;
     bool end_of_turn = false;
+    bool tts_force_flush = false;
     std::int64_t audio_chunk_index = 0;
     std::int64_t language_cache_position = 0;
     std::int64_t audio_cache_position = 0;
@@ -139,12 +142,15 @@ public:
         std::int64_t prefix_extra_frames,
         std::int64_t suffix_extra_frames);
 
-    // Start a stateful MiniCPM-o duplex session. The optional system prompt is
-    // consumed once and retained in the language KV cache. Each duplex_step()
-    // then advances the language, streaming-audio and TTS caches exactly once.
+    // Start a stateful MiniCPM-o duplex session. The optional reference audio
+    // is embedded between the system prefix and suffix, then the streaming
+    // audio cache is reset before the first live unit.
     void prepare_duplex(
         const MlxMiniCPMO45DuplexConfig& config,
-        const std::optional<mlx::core::array>& system_ids = std::nullopt);
+        const std::optional<mlx::core::array>& system_prefix_ids = std::nullopt,
+        const std::optional<mlx::core::array>& reference_audio_features =
+            std::nullopt,
+        const std::optional<mlx::core::array>& system_suffix_ids = std::nullopt);
 
     MlxMiniCPMO45DuplexResult duplex_step(
         const MlxMiniCPMO45DuplexInputs& inputs);

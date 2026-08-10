@@ -160,6 +160,20 @@ if(MFQ_BUILD_METAL_RUNTIME)
         add_executable(mfq-metal-tokenizer-test
             metal/mfq_tokenizer_test.cpp
         )
+
+        add_executable(mfq-runtime-profile-test
+            mfq_runtime_profile_test.cpp
+        )
+        target_link_libraries(mfq-runtime-profile-test PRIVATE
+            mfq-server
+        )
+        target_compile_features(mfq-runtime-profile-test PRIVATE
+            cxx_std_17
+        )
+        add_test(
+            NAME mfq-runtime-profile-test
+            COMMAND mfq-runtime-profile-test
+        )
         target_link_libraries(mfq-metal-tokenizer-test PRIVATE
             mfq-metal-runtime
             mfq-server

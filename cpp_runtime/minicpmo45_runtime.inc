@@ -1539,6 +1539,7 @@ struct MiniCPMO45DuplexSession {
     double listen_probability_scale = 1.0;
     double repetition_penalty = 1.05;
     int64_t repetition_window = 512;
+    double length_penalty = 1.0;
 
     MiniCPMO45DuplexSession(
             MiniCPMO45Runtime & runtime_,
@@ -1637,6 +1638,14 @@ struct MiniCPMO45DuplexSession {
                 ? selected / repetition_penalty
                 : selected * (1.0 / repetition_penalty);
             logits.index_copy_(1, recent_tensor, selected);
+        }
+        if (length_penalty != 1.0) {
+            auto selected = logits.index({Slice(), ids.turn_eos});
+            selected = torch::where(
+                selected > 0,
+                selected / length_penalty,
+                selected * length_penalty);
+            logits.index_put_({Slice(), ids.turn_eos}, selected);
         }
         if (listen_probability_scale != 1.0) {
             logits.index_put_(
@@ -1857,15 +1866,14 @@ struct MiniCPMO45DuplexSession {
             }
             auto condition = runtime.tts.duplex_condition(
                 text_id_tensor, hidden_tensor, ids.audio_bos);
-            if (tts_text_start_position == 0) runtime.tts.reset(1);
+            const bool first_tts_chunk = tts_text_start_position == 0;
+            if (first_tts_chunk) runtime.tts.reset(1);
             if (runtime.tts.cache_position != tts_text_start_position) {
                 throw std::runtime_error(
                     "MiniCPM-o duplex TTS cache position is inconsistent");
             }
-            int64_t minimum_codes = 26;
-            if (result.end_of_turn || tts_text_start_position == 0) {
-                minimum_codes = 0;
-            }
+            const int64_t minimum_codes =
+                result.end_of_turn || first_tts_chunk ? 0 : 26;
             auto tts_result = runtime.tts.generate_duplex_chunk(
                 condition, 26, minimum_codes, 6561, 0.8, 1.05);
             result.tts_codes = tts_result.codes;

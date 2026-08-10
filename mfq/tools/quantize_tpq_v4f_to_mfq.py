@@ -20,6 +20,10 @@ from mfq.formats.tpq import (
 )
 from mfq.formats.tpq import TPQ_PQ_SPECS
 from mfq.formats.header import FileHeader
+from mfq.formats.runtime_profile import (
+    RUNTIME_SAMPLING_METADATA_KEY,
+    architecture_profile,
+)
 from mfq.formats.shards import (
     matching_shard_paths,
     parse_size,
@@ -489,11 +493,17 @@ def convert(
             print(json.dumps(event), flush=True)
             del source
 
+    runtime_profile = architecture_profile("deepseek_v4")
     header = FileHeader(
         version=2,
         model_arch="deepseek_v4-tpq-mfq",
         num_tensors=len(records),
         extra={
+            **(
+                {RUNTIME_SAMPLING_METADATA_KEY: runtime_profile}
+                if runtime_profile is not None
+                else {}
+            ),
             "source_format": "tpq-1",
             "source_index_sha256": _sha256(
                 root / "model.safetensors.index.json"

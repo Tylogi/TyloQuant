@@ -23,6 +23,10 @@ from mfq.calibration.artifact import (
     save_scheme,
 )
 from mfq.formats.header import FileHeader
+from mfq.formats.runtime_profile import (
+    RUNTIME_SAMPLING_METADATA_KEY,
+    architecture_profile,
+)
 from mfq.formats.nint import NintSpec
 from mfq.formats.shards import (
     matching_shard_paths,
@@ -1307,6 +1311,9 @@ def convert(args) -> None:
                 "imatrix_chunk_size": imatrix.matrix.chunk_size,
             }
         )
+    runtime_profile = architecture_profile("deepseek_v4")
+    if runtime_profile is not None:
+        extra[RUNTIME_SAMPLING_METADATA_KEY] = runtime_profile
     header = FileHeader(
         version=2,
         model_arch=(

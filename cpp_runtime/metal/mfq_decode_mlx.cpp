@@ -23,6 +23,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <mlx/mlx.h>
@@ -51,6 +52,7 @@ struct Arguments {
     bool list_tensors = false;
     bool self_test_metal = false;
     bool server = false;
+    bool minicpmo_duplex = false;
     std::string host = "127.0.0.1";
     int port = 8080;
     std::int64_t context_size = 32768;
@@ -60,6 +62,7 @@ struct Arguments {
     std::string api_key;
     std::filesystem::path web_root;
     std::filesystem::path tokenizer_gguf;
+    std::filesystem::path sampling_profile;
     bool help = false;
 };
 
@@ -133,6 +136,8 @@ Arguments parse_arguments(int argc, char** argv) {
             result.self_test_metal = true;
         } else if (value == "--server") {
             result.server = true;
+        } else if (value == "--minicpmo-duplex") {
+            result.minicpmo_duplex = true;
         } else if (value == "--host") {
             result.host = require_value("--host");
         } else if (value == "--port") {
@@ -181,6 +186,9 @@ Arguments parse_arguments(int argc, char** argv) {
         } else if (value == "--tokenizer-gguf") {
             result.tokenizer_gguf =
                 require_value("--tokenizer-gguf");
+        } else if (value == "--sampling-profile") {
+            result.sampling_profile =
+                require_value("--sampling-profile");
         } else if (value == "--help" || value == "-h") {
             result.help = true;
         } else {
@@ -210,6 +218,7 @@ void print_help() {
         << "  --benchmark-swiglu     fuse an even-width NINTM gate/up record\n"
         << "  --self-test-metal      execute an MLX C++ graph on Metal\n"
         << "  --server               run the native C++ OpenAI-compatible server\n"
+        << "  --minicpmo-duplex      enable the stateful MiniCPM-o media backend\n"
         << "  --host ADDRESS         server bind address (default 127.0.0.1)\n"
         << "  --port PORT            server port (default 8080)\n"
         << "  --ctx-size TOKENS      runtime/API context limit (default 32768)\n"
@@ -219,7 +228,8 @@ void print_help() {
         << "  --model-name NAME      API model name (default MFQ filename)\n"
         << "  --api-key KEY          optional bearer token\n"
         << "  --web-root PATH        WebUI assets (default beside executable)\n"
-        << "  --tokenizer-gguf PATH  external tokenizer GGUF when not embedded\n";
+        << "  --tokenizer-gguf PATH  external tokenizer GGUF when not embedded\n"
+        << "  --sampling-profile P  explicit runtime sampling profile JSON\n";
 }
 
 std::filesystem::path executable_path() {
@@ -378,6 +388,22 @@ int serve_loaded_runtime(
         maximum_context);
     server.context_capacity = maximum_context;
     server.vocab_size = vocabulary_size;
+    constexpr const char* model_config_asset =
+        "__mfq_asset__/model_config.json";
+    const auto embedded = container.header().extra_json.find(
+        "runtime.sampling.v1");
+    server.runtime_profile = resolve_mfq_runtime_profile(
+        arguments.mfq.string(),
+        container.header().architecture,
+        server.model_type,
+        server.model_name,
+        embedded == container.header().extra_json.end()
+            ? std::string()
+            : embedded->second,
+        container.contains(model_config_asset)
+            ? container.read_text(model_config_asset)
+            : std::string(),
+        arguments.sampling_profile.string());
 
     auto runtime_mutex = std::make_shared<std::mutex>();
     auto runtime_holder =
@@ -477,7 +503,202 @@ int serve_loaded_runtime(
                     "restored: " + message);
             }
         };
-    return run_mfq_server(server, generate, reload);
+    MfqDuplexBackend duplex;
+    if constexpr (std::is_same_v<
+            Runtime, mfq::metal::MlxMiniCPMO45Runtime>) {
+        if (arguments.minicpmo_duplex) {
+            duplex.start =
+                [runtime_mutex, runtime_holder, runtime_stream](
+                    const MfqDuplexSessionParams& parameters) {
+                    if (parameters.special_ids.size() != 15) {
+                        throw std::invalid_argument(
+                            "MiniCPM-o duplex requires 15 special token IDs");
+                    }
+                    std::lock_guard<std::mutex> lock(*runtime_mutex);
+                    if (!runtime_holder->has_value()) {
+                        throw std::runtime_error(
+                            "MiniCPM-o runtime is unavailable");
+                    }
+                    mlx::core::set_default_device(
+                        mlx::core::Device::gpu);
+                    mlx::core::set_default_stream(runtime_stream);
+                    auto& runtime = runtime_holder->value();
+                    runtime.reset();
+
+                    mfq::metal::MlxMiniCPMO45DuplexConfig config;
+                    auto& ids = config.special_ids;
+                    ids.unit_start = parameters.special_ids[0];
+                    ids.unit_end = parameters.special_ids[1];
+                    ids.image_start = parameters.special_ids[2];
+                    ids.image_end = parameters.special_ids[3];
+                    ids.slice_start = parameters.special_ids[4];
+                    ids.slice_end = parameters.special_ids[5];
+                    ids.listen = parameters.special_ids[6];
+                    ids.speak = parameters.special_ids[7];
+                    ids.tts_bos = parameters.special_ids[8];
+                    ids.tts_eos = parameters.special_ids[9];
+                    ids.chunk_eos = parameters.special_ids[10];
+                    ids.chunk_tts_eos = parameters.special_ids[11];
+                    ids.turn_eos = parameters.special_ids[12];
+                    ids.tts_pad = parameters.special_ids[13];
+                    ids.audio_bos = parameters.special_ids[14];
+                    config.forbidden_ids = parameters.forbidden_ids;
+                    config.greedy = parameters.greedy;
+                    config.temperature = parameters.temperature;
+                    config.top_k = parameters.top_k;
+                    config.top_p = parameters.top_p;
+                    config.listen_probability_scale =
+                        parameters.listen_probability_scale;
+                    config.repetition_penalty =
+                        parameters.repetition_penalty;
+                    config.repetition_window =
+                        parameters.repetition_window;
+                    config.length_penalty =
+                        parameters.length_penalty;
+                    config.seed = parameters.seed;
+
+                    std::optional<mlx::core::array> system_prefix_ids;
+                    if (!parameters.system_prefix.empty()) {
+                        system_prefix_ids.emplace(
+                            parameters.system_prefix.begin(),
+                            mlx::core::Shape{
+                                1,
+                                static_cast<int>(
+                                    parameters.system_prefix.size())},
+                            mlx::core::int64);
+                    }
+                    std::optional<mlx::core::array> reference_features;
+                    if (!parameters.reference_audio_features.empty()) {
+                        if (parameters.reference_audio_frames <= 0 ||
+                            parameters.reference_audio_features.size() !=
+                                static_cast<std::size_t>(
+                                    parameters.reference_audio_frames) * 80) {
+                            throw std::invalid_argument(
+                                "MiniCPM-o reference Mel geometry is invalid");
+                        }
+                        reference_features.emplace(
+                            parameters.reference_audio_features.begin(),
+                            mlx::core::Shape{
+                                1, 80, parameters.reference_audio_frames},
+                            mlx::core::float32);
+                    }
+                    std::optional<mlx::core::array> system_suffix_ids;
+                    if (!parameters.system_suffix.empty()) {
+                        system_suffix_ids.emplace(
+                            parameters.system_suffix.begin(),
+                            mlx::core::Shape{
+                                1,
+                                static_cast<int>(
+                                    parameters.system_suffix.size())},
+                            mlx::core::int64);
+                    }
+                    runtime.prepare_duplex(
+                        config,
+                        system_prefix_ids,
+                        reference_features,
+                        system_suffix_ids);
+                    mlx::core::synchronize(runtime_stream);
+                };
+            duplex.step =
+                [runtime_mutex, runtime_holder, runtime_stream](
+                    const MfqDuplexStepInput& input) {
+                    const bool has_audio = input.audio_frames > 0;
+                    const bool has_text = !input.text_tokens.empty();
+                    if (has_audio &&
+                        input.audio_features.size() !=
+                            static_cast<std::size_t>(input.audio_frames) * 80) {
+                        throw std::invalid_argument(
+                            "MiniCPM-o duplex Mel geometry is invalid");
+                    }
+                    if (!has_audio && !has_text) {
+                        throw std::invalid_argument(
+                            "MiniCPM-o duplex step has no input");
+                    }
+                    std::lock_guard<std::mutex> lock(*runtime_mutex);
+                    if (!runtime_holder->has_value()) {
+                        throw std::runtime_error(
+                            "MiniCPM-o runtime is unavailable");
+                    }
+                    mlx::core::set_default_device(
+                        mlx::core::Device::gpu);
+                    mlx::core::set_default_stream(runtime_stream);
+                    auto& runtime = runtime_holder->value();
+                    if (!runtime.duplex_prepared()) {
+                        throw std::runtime_error(
+                            "MiniCPM-o duplex session is not prepared");
+                    }
+
+                    mfq::metal::MlxMiniCPMO45DuplexInputs inputs;
+                    if (has_audio) {
+                        inputs.audio_features.emplace(
+                            input.audio_features.begin(),
+                            mlx::core::Shape{1, 80, input.audio_frames},
+                            mlx::core::float32);
+                    }
+                    if (has_text) {
+                        inputs.text_ids.emplace(
+                            input.text_tokens.begin(),
+                            mlx::core::Shape{
+                                1,
+                                static_cast<int>(input.text_tokens.size())},
+                            mlx::core::int64);
+                    }
+                    inputs.audio_prefix_extra_frames =
+                        input.audio_prefix_extra_frames;
+                    inputs.audio_suffix_extra_frames =
+                        input.audio_suffix_extra_frames;
+                    inputs.max_new_speak_tokens =
+                        input.max_new_speak_tokens;
+                    inputs.force_listen = input.force_listen;
+                    inputs.force_speak = input.force_speak;
+
+                    const auto started =
+                        std::chrono::steady_clock::now();
+                    auto result = runtime.duplex_step(inputs);
+                    result.generated_ids.eval();
+                    result.tts_codes.eval();
+                    mlx::core::synchronize(runtime_stream);
+
+                    MfqDuplexStepResult response;
+                    const auto* generated =
+                        result.generated_ids.template data<std::int64_t>();
+                    response.generated_tokens.assign(
+                        generated,
+                        generated + result.generated_ids.size());
+                    const auto* codes =
+                        result.tts_codes.template data<std::int32_t>();
+                    response.audio_tokens.assign(
+                        codes, codes + result.tts_codes.size());
+                    response.is_listen = result.is_listen;
+                    response.end_of_turn = result.end_of_turn;
+                    response.tts_force_flush = result.tts_force_flush;
+                    response.audio_chunk_index =
+                        result.audio_chunk_index;
+                    response.language_cache_position =
+                        result.language_cache_position;
+                    response.audio_cache_position =
+                        result.audio_cache_position;
+                    response.tts_cache_position =
+                        result.tts_cache_position;
+                    response.inference_ms =
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - started)
+                            .count();
+                    return response;
+                };
+            duplex.stop =
+                [runtime_mutex, runtime_holder, runtime_stream]() {
+                    std::lock_guard<std::mutex> lock(*runtime_mutex);
+                    if (!runtime_holder->has_value()) return;
+                    mlx::core::set_default_device(
+                        mlx::core::Device::gpu);
+                    mlx::core::set_default_stream(runtime_stream);
+                    runtime_holder->value().reset();
+                    mlx::core::synchronize(runtime_stream);
+                };
+        }
+    }
+    return run_mfq_server(server, generate, reload, duplex);
 }
 
 int run_native_server(
@@ -500,6 +721,11 @@ int run_native_server(
         std::chrono::steady_clock::now();
     const auto& architecture =
         container.header().architecture;
+    if (arguments.minicpmo_duplex &&
+        architecture.rfind("minicpmo", 0) != 0) {
+        throw std::runtime_error(
+            "--minicpmo-duplex requires a MiniCPM-o model");
+    }
     if (architecture.rfind(
             "deepseek_v4",
             0) == 0) {
@@ -591,8 +817,8 @@ int run_native_server(
         auto runtime =
             mfq::metal::MlxMiniCPMO45Runtime::load(
                 container,
-                0,
-                false);
+                arguments.context_size,
+                arguments.minicpmo_duplex);
         release_model_load_staging_memory();
         const auto load_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
@@ -604,11 +830,13 @@ int run_native_server(
             << load_seconds << " s"
             << std::endl;
         const auto load_runtime =
-            [&container](std::int64_t requested_context) {
+            [&container,
+             load_modalities = arguments.minicpmo_duplex](
+                std::int64_t requested_context) {
                 return mfq::metal::MlxMiniCPMO45Runtime::load(
                     container,
                     requested_context,
-                    false);
+                    load_modalities);
             };
         return serve_loaded_runtime(
             arguments,
@@ -664,6 +892,9 @@ int main(int argc, char** argv) {
         if (arguments.help) {
             print_help();
             return EXIT_SUCCESS;
+        }
+        if (arguments.minicpmo_duplex && !arguments.server) {
+            usage_error("--minicpmo-duplex requires --server");
         }
         if (arguments.self_test_metal) {
             configure_mlx_metal();

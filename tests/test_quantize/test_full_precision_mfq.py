@@ -12,6 +12,7 @@ from mfq.formats.header import FileHeader
 from mfq.formats.io import BFloat16Array, open_mmap, save
 from mfq.formats.mx import MxTensor
 from mfq.formats.nint import NintSpec
+from mfq.formats.runtime_profile import RUNTIME_SAMPLING_METADATA_KEY
 from mfq.quantize.mfq_source import FullPrecisionMfqCheckpoint
 from mfq.quantize.nint_quant import quantize
 from mfq.tools.convert_hf_to_full_mfq import build_parser as build_full_parser
@@ -111,6 +112,9 @@ def test_native_hf_dtypes_convert_to_self_contained_full_precision_mfq(tmp_path)
         assert checkpoint.info("fp4.weight").shape == (4, 96)
         assert "fp8.scale" not in checkpoint.store.records
         assert "fp4.scale" not in checkpoint.store.records
+        profile = checkpoint.header.extra[RUNTIME_SAMPLING_METADATA_KEY]
+        assert profile["chat"]["top_p"] == 0.8
+        assert "max_tokens" not in profile["chat"]
 
 
 def test_full_precision_mfq_quantizes_bf16_fp8_and_mxfp4(tmp_path):
@@ -146,6 +150,10 @@ def test_full_precision_mfq_quantizes_bf16_fp8_and_mxfp4(tmp_path):
         assert store.records["fp4.weight"].dtype == "NINT3"
         assert MODEL_CONFIG_ASSET in store.records
         assert store.header.extra["source_format"] == "mfq"
+        assert (
+            store.header.extra[RUNTIME_SAMPLING_METADATA_KEY]["chat"]["top_p"]
+            == 0.8
+        )
 
 
 def test_mxfp4_cannot_be_requantized_to_equal_or_higher_precision(tmp_path):

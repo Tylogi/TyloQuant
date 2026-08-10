@@ -1367,6 +1367,7 @@ struct MfqFile {
     std::unordered_map<std::string, Record> records;
     std::unordered_map<std::string, Record> expert_overlays;
     std::unordered_map<std::string, Record> tensor_overlays;
+    MfqRecordHeader header;
 
     explicit MfqFile(std::string p) : path(std::move(p)) {
         source_paths = {path};
@@ -1426,6 +1427,7 @@ struct MfqFile {
             return header;
         };
         MfqRecordHeader probe = load_records(path, records);
+        header = probe;
         const uint64_t split_no = mfq_json_uint(probe.extra_json, "split.no", 0);
         const uint64_t split_count =
             mfq_json_uint(probe.extra_json, "split.count", 1);
@@ -1454,6 +1456,10 @@ struct MfqFile {
                     throw std::runtime_error(
                         "MFQ shard architecture/version mismatch: " +
                         paths[(size_t)i]);
+                }
+                if (i == 0) {
+                    // Global metadata lives only in shard zero.
+                    header = current;
                 }
                 const uint64_t current_expected_records = mfq_json_uint(
                     current.extra_json, "split.records.count",
@@ -23097,6 +23103,7 @@ int main(int argc, char ** argv) {
         std::string check_tokenizer_text =
             "MFQ tokenizer check: hello, world! <think>";
         std::string server_web_root;
+        std::string server_sampling_profile;
         std::string cpu_offload_layers_arg;
         std::string moe_cache_profile_path;
         std::string tensor_parallel_arg;
@@ -23378,6 +23385,9 @@ int main(int argc, char ** argv) {
             else if (a == "--model-name" && i + 1 < argc) server_model_name = argv[++i];
             else if (a == "--api-key" && i + 1 < argc) server_api_key = argv[++i];
             else if (a == "--web-root" && i + 1 < argc) server_web_root = argv[++i];
+            else if (a == "--sampling-profile" && i + 1 < argc) {
+                server_sampling_profile = argv[++i];
+            }
             else if (a == "--profile") profile = true;
             else if (a == "--compare-llama-flash") compare_llama_flash = true;
             else if (a == "--compare-decode-splitk") compare_decode_splitk = true;
@@ -23393,7 +23403,7 @@ int main(int argc, char ** argv) {
                              "--layer-parallel 0,1 --layer-split 1,1 "
                              "--n-gpu-layers 60 --threads 32 --cpu-offload-layers 0-7,12 --moe-gpu-cache-gb 8 "
                              "--moe-cache-profile profile.json "
-                             "--api-key key --web-root path] | --kl-base reference.bin "
+                             "--api-key key --web-root path --sampling-profile profile.json] | --kl-base reference.bin "
                              "[--kl-evaluator optimized|legacy --kl-chunks -1 "
                              "--kl-score-count N --kl-n-batch N "
                              "--kl-reference-n-batch N "
@@ -23971,6 +23981,20 @@ int main(int argc, char ** argv) {
             server_config.web_root = server_web_root;
             server_config.max_context = model.c.max_position_embeddings;
             server_config.vocab_size = model.c.vocab_size;
+            const auto embedded_profile = runtime_assets.header.extra_json.find(
+                "runtime.sampling.v1");
+            server_config.runtime_profile = resolve_mfq_runtime_profile(
+                mfq_path,
+                runtime_assets.header.architecture,
+                server_config.model_type,
+                server_config.model_name,
+                embedded_profile == runtime_assets.header.extra_json.end()
+                    ? std::string()
+                    : embedded_profile->second,
+                runtime_assets.has_record(MFQ_MODEL_CONFIG_ASSET)
+                    ? runtime_assets.read_asset_text(MFQ_MODEL_CONFIG_ASSET)
+                    : std::string(),
+                server_sampling_profile);
             std::mutex model_mutex;
             ServerDecodeGraphCache decode_graph_cache(model.c.max_position_embeddings);
             const int status = run_mfq_server(
