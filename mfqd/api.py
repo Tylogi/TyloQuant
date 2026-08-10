@@ -27,6 +27,7 @@ from mfqd.models import (
     ModelUnloadRequest,
     OperationAccepted,
     ResponseResource,
+    RuntimeCapabilitiesResource,
     RuntimeInstanceList,
     SessionList,
     SessionResource,
@@ -233,6 +234,15 @@ def create_app(
     )
     async def runtime_instances() -> RuntimeInstanceList:
         return await require_service().runtime_instances()
+
+    @app.get(
+        "/api/v1/runtime/capabilities",
+        response_model=RuntimeCapabilitiesResource,
+        responses=ERROR_RESPONSES,
+        tags=["runtime"],
+    )
+    async def runtime_capabilities() -> RuntimeCapabilitiesResource:
+        return await require_service().runtime_capabilities()
 
     @app.websocket("/api/v1/realtime")
     async def realtime(websocket: WebSocket) -> None:

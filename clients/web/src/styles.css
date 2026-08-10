@@ -237,6 +237,32 @@ button:disabled {
   align-items: center;
 }
 
+.header-capabilities {
+  display: flex;
+  max-width: min(48vw, 520px);
+  gap: 5px;
+  overflow: hidden;
+}
+
+.header-capabilities span {
+  flex: 0 0 auto;
+  border: 1px solid #b9d9cb;
+  border-radius: 999px;
+  padding: 4px 7px;
+  color: #276853;
+  background: #e4f1eb;
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.header-capabilities span.unavailable {
+  border-color: #d4c8bc;
+  color: #8c7b6e;
+  background: #eee8e1;
+  text-decoration: line-through;
+}
+
 .header-actions button {
   border: 1px solid #d4c8bc;
   border-radius: 8px;
@@ -521,6 +547,10 @@ button:disabled {
 
   .message-list {
     padding: 24px 16px;
+  }
+
+  .header-capabilities {
+    display: none;
   }
 
   .message {

@@ -12,10 +12,12 @@ import pytest
 
 from mfqd.api import create_app
 from mfqd.backend import BackendDelta, BackendError, BackendToolCallDelta
+from mfqd.capabilities import capabilities_for_architecture
 from mfqd.models import (
     CreateResponseRequest,
     CreateSessionRequest,
     ResponseStatus,
+    RuntimeCapabilitiesResource,
     SamplingParams,
     SessionState,
     TokenUsage,
@@ -72,6 +74,14 @@ class FakeBackend:
     async def close_session(self, session_id: UUID) -> bool:
         self.closed_sessions.append(session_id)
         return True
+
+    async def capabilities(self) -> RuntimeCapabilitiesResource:
+        return RuntimeCapabilitiesResource(
+            model="model-a",
+            model_type="minicpmo",
+            model_capabilities=capabilities_for_architecture("minicpmo"),
+            duplex_available=True,
+        )
 
 
 def make_service(path: Path, backend: FakeBackend) -> MfqdService:
@@ -213,6 +223,16 @@ def test_executable_api_persists_nonstream_text_responses(tmp_path: Path) -> Non
             ]
             runtimes = await client.get("/api/v1/runtime/instances")
             assert runtimes.json() == {"data": []}
+            capabilities = await client.get("/api/v1/runtime/capabilities")
+            assert capabilities.json()["model_capabilities"]["features"] == {
+                "text": True,
+                "image_input": True,
+                "video_input": True,
+                "audio_input": True,
+                "audio_output": True,
+                "full_duplex": True,
+            }
+            assert capabilities.json()["duplex_available"] is True
             invalid = await client.post("/api/v1/sessions", json={"model": ""})
             assert invalid.status_code == 422
             assert invalid.json()["error"]["code"] == "invalid_request"

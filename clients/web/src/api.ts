@@ -37,6 +37,28 @@ export interface Message {
   created_at: string;
 }
 
+export interface ModelFeatureSet {
+  text: boolean;
+  image_input: boolean;
+  video_input: boolean;
+  audio_input: boolean;
+  audio_output: boolean;
+  full_duplex: boolean;
+}
+
+export interface ModelCapabilities {
+  architecture_family: string;
+  source: string;
+  features: ModelFeatureSet;
+}
+
+export interface RuntimeCapabilities {
+  model: string;
+  model_type: string;
+  model_capabilities: ModelCapabilities;
+  duplex_available: boolean;
+}
+
 export interface ApiErrorBody {
   error: {
     code: string;
@@ -117,6 +139,10 @@ export const api = {
   async deleteSession(id: string): Promise<void> {
     const response = await fetch(`/api/v1/sessions/${id}`, { method: "DELETE" });
     if (!response.ok) throw await errorFromResponse(response);
+  },
+
+  runtimeCapabilities(): Promise<RuntimeCapabilities> {
+    return request("/api/v1/runtime/capabilities");
   },
 };
 

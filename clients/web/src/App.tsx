@@ -5,6 +5,7 @@ import {
   ContentPart,
   Message,
   RealtimeFrame,
+  RuntimeCapabilities,
   Session,
   SessionMode,
   api,
@@ -22,6 +23,18 @@ const MODE_LABELS: Record<SessionMode, string> = {
   voice: "Voice",
   full_duplex: "Full duplex",
 };
+
+const CAPABILITY_LABELS: Array<[
+  keyof RuntimeCapabilities["model_capabilities"]["features"],
+  string,
+]> = [
+  ["text", "Text"],
+  ["image_input", "Image"],
+  ["video_input", "Video"],
+  ["audio_input", "Audio in"],
+  ["audio_output", "Audio out"],
+  ["full_duplex", "Full duplex"],
+];
 
 function errorMessage(error: unknown): string {
   if (error instanceof ApiError) return `${error.code}: ${error.message}`;
@@ -66,6 +79,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [capabilities, setCapabilities] = useState<RuntimeCapabilities | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
 
@@ -89,6 +103,13 @@ export default function App() {
       .catch((cause) => setError(errorMessage(cause)))
       .finally(() => setLoading(false));
   }, [refreshSessions]);
+
+  useEffect(() => {
+    api
+      .runtimeCapabilities()
+      .then(setCapabilities)
+      .catch((cause) => setError(errorMessage(cause)));
+  }, []);
 
   useEffect(() => {
     if (!activeId) {
@@ -298,6 +319,27 @@ export default function App() {
           </div>
           {active && (
             <div className="header-actions">
+              {capabilities && (
+                <div
+                  className="header-capabilities"
+                  title={capabilities.model_capabilities.architecture_family}
+                >
+                  {CAPABILITY_LABELS.filter(
+                    ([feature]) => capabilities.model_capabilities.features[feature],
+                  ).map(([feature, label]) => (
+                    <span
+                      className={
+                        feature === "full_duplex" && !capabilities.duplex_available
+                          ? "unavailable"
+                          : ""
+                      }
+                      key={feature}
+                    >
+                      {label}
+                    </span>
+                  ))}
+                </div>
+              )}
               <span className={`state state-${active.state}`}>{active.state}</span>
               <button onClick={deleteActive} disabled={busy} type="button">
                 Delete

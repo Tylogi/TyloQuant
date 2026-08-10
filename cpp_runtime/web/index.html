@@ -149,6 +149,7 @@
           </span>
         </div>
         <div class="topbar-actions">
+          <div class="model-capabilities" id="model-capabilities" aria-label="模型能力" hidden></div>
           <div class="quick-metrics" aria-label="最近一次生成摘要">
             <span><b id="top-ttft">--</b> TTFT</span>
             <span><b id="top-context-tokens">--</b> context</span>
@@ -178,6 +179,9 @@
               <button class="voice-playback-toggle" id="voice-playback-toggle" type="button" aria-pressed="true" title="实时播放语音" aria-label="实时播放语音" hidden>
                 <svg class="voice-playback-on"><use href="#icon-volume"/></svg>
                 <svg class="voice-playback-off"><use href="#icon-volume-off"/></svg>
+              </button>
+              <button class="duplex-mode-toggle" id="duplex-mode-toggle" type="button" aria-pressed="true" title="全双工模式" aria-label="全双工模式" hidden>
+                <span class="duplex-mode-label">全双工</span>
               </button>
               <button class="thinking-toggle" id="thinking-toggle" type="button" aria-pressed="true">
                 <svg><use href="#icon-brain"/></svg>

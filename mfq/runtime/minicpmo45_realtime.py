@@ -49,6 +49,20 @@ def _session_system_prompt(
     return value
 
 
+def _audio_step_flags(
+    input_payload: dict[str, Any],
+    *,
+    chunk_index: int,
+    initial_force_listen_count: int,
+) -> tuple[bool, bool]:
+    force_speak = bool(input_payload.get("force_speak", False))
+    force_listen = (
+        bool(input_payload.get("force_listen", False))
+        or chunk_index < initial_force_listen_count
+    ) and not force_speak
+    return force_listen, force_speak
+
+
 def _encode_f32(values: np.ndarray) -> str:
     data = np.ascontiguousarray(values, dtype="<f4")
     return base64.b64encode(data.tobytes()).decode("ascii")
@@ -513,6 +527,7 @@ class RealtimeGateway:
         while True:
             event = json.loads(await backend.recv())
             if event.get("type") == "response.step.done":
+                await client.send_json(event)
                 return
             if event.get("kind") == "audio_tokens":
                 waveform = await asyncio.to_thread(
@@ -642,9 +657,11 @@ class RealtimeGateway:
                         )
                         chunks = mel_stream.append(audio)
                         for mel, prefix, suffix in chunks:
-                            force_listen = bool(
-                                input_payload.get("force_listen", False)
-                            ) or audio_chunk_count < force_listen_count
+                            force_listen, force_speak = _audio_step_flags(
+                                input_payload,
+                                chunk_index=audio_chunk_count,
+                                initial_force_listen_count=force_listen_count,
+                            )
                             audio_chunk_count += 1
                             await self.forward_step(
                                 backend,
@@ -655,6 +672,7 @@ class RealtimeGateway:
                                     "audio_prefix_extra_frames": prefix,
                                     "audio_suffix_extra_frames": suffix,
                                     "force_listen": force_listen,
+                                    "force_speak": force_speak,
                                     "max_new_speak_tokens": int(
                                         input_payload.get("max_new_speak_tokens", 20)
                                     ),
@@ -743,6 +761,18 @@ def build_app(gateway: RealtimeGateway, web_root: Path | None = None) -> Any:
             tts_defaults = {}
         return {
             "available": available,
+            "architecture_family": (
+                health.get("model_capabilities", {}).get(
+                    "architecture_family", "unknown"
+                )
+                if isinstance(health.get("model_capabilities"), dict)
+                else "unknown"
+            ),
+            "model_capabilities": (
+                health.get("model_capabilities", {})
+                if isinstance(health.get("model_capabilities"), dict)
+                else {}
+            ),
             "input": ["audio"],
             "output": ["text", "audio"],
             "input_sample_rate": SAMPLE_RATE_IN,

@@ -574,6 +574,69 @@
         "title": "MessageRole",
         "type": "string"
       },
+      "ModelCapabilities": {
+        "additionalProperties": false,
+        "properties": {
+          "architecture_family": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Architecture Family",
+            "type": "string"
+          },
+          "features": {
+            "$ref": "#/components/schemas/ModelFeatureSet"
+          },
+          "source": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "architecture_family",
+          "source"
+        ],
+        "title": "ModelCapabilities",
+        "type": "object"
+      },
+      "ModelFeatureSet": {
+        "additionalProperties": false,
+        "properties": {
+          "audio_input": {
+            "default": false,
+            "title": "Audio Input",
+            "type": "boolean"
+          },
+          "audio_output": {
+            "default": false,
+            "title": "Audio Output",
+            "type": "boolean"
+          },
+          "full_duplex": {
+            "default": false,
+            "title": "Full Duplex",
+            "type": "boolean"
+          },
+          "image_input": {
+            "default": false,
+            "title": "Image Input",
+            "type": "boolean"
+          },
+          "text": {
+            "default": true,
+            "title": "Text",
+            "type": "boolean"
+          },
+          "video_input": {
+            "default": false,
+            "title": "Video Input",
+            "type": "boolean"
+          }
+        },
+        "title": "ModelFeatureSet",
+        "type": "object"
+      },
       "ModelLoadRequest": {
         "additionalProperties": false,
         "properties": {
@@ -1138,6 +1201,38 @@
           "index"
         ],
         "title": "ResponseToolCallDelta",
+        "type": "object"
+      },
+      "RuntimeCapabilitiesResource": {
+        "additionalProperties": false,
+        "properties": {
+          "duplex_available": {
+            "default": false,
+            "title": "Duplex Available",
+            "type": "boolean"
+          },
+          "model": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Model",
+            "type": "string"
+          },
+          "model_capabilities": {
+            "$ref": "#/components/schemas/ModelCapabilities"
+          },
+          "model_type": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Model Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model",
+          "model_type",
+          "model_capabilities"
+        ],
+        "title": "RuntimeCapabilitiesResource",
         "type": "object"
       },
       "RuntimeIdentity": {
@@ -2074,6 +2169,97 @@
         "summary": "Unload Model",
         "tags": [
           "models"
+        ]
+      }
+    },
+    "/api/v1/runtime/capabilities": {
+      "get": {
+        "operationId": "runtime_capabilities_api_v1_runtime_capabilities_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeCapabilitiesResource"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Runtime Capabilities",
+        "tags": [
+          "runtime"
         ]
       }
     },

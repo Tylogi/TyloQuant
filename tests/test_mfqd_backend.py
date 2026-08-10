@@ -134,6 +134,40 @@ def test_backend_forwards_runtime_session_lifecycle() -> None:
     ]
 
 
+def test_backend_reads_registered_model_capabilities_from_health() -> None:
+    captured_authorization: list[str | None] = []
+    test_credential = "-".join(("test", "credential"))
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured_authorization.append(request.headers.get("authorization"))
+        return httpx.Response(
+            200,
+            json={
+                "model": "MiniCPM-o-4_5-S4-S",
+                "model_type": "minicpmo",
+                "duplex_available": True,
+            },
+        )
+
+    async def run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        backend = OpenAIChatBackend(
+            "http://backend",
+            api_key=test_credential,
+            client=client,
+        )
+        capabilities = await backend.capabilities()
+        await client.aclose()
+        assert capabilities.model == "MiniCPM-o-4_5-S4-S"
+        assert capabilities.model_capabilities.architecture_family == "minicpmo"
+        assert capabilities.model_capabilities.features.video_input is True
+        assert capabilities.model_capabilities.features.full_duplex is True
+        assert capabilities.duplex_available is True
+
+    asyncio.run(run())
+    assert captured_authorization == [f"Bearer {test_credential}"]
+
+
 def test_backend_session_lifecycle_is_optional_for_older_runtimes() -> None:
     async def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(404)

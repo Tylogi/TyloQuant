@@ -1,9 +1,14 @@
+import asyncio
+import json
+
 import numpy as np
 
 from mfq.runtime.minicpmo45_realtime import (
     AppleToken2Wav,
     DEFAULT_DUPLEX_SYSTEM_PROMPT,
     SAMPLE_RATE_OUT,
+    RealtimeGateway,
+    _audio_step_flags,
     _session_system_prompt,
 )
 
@@ -74,3 +79,61 @@ def test_duplex_system_prompt_uses_profile_then_explicit_api_value():
         == "request prompt"
     )
     assert _session_system_prompt({}, {}) == DEFAULT_DUPLEX_SYSTEM_PROMPT
+
+
+def test_half_duplex_final_chunk_forces_speech_over_initial_listen_window():
+    assert _audio_step_flags(
+        {"force_speak": True},
+        chunk_index=0,
+        initial_force_listen_count=3,
+    ) == (False, True)
+    assert _audio_step_flags(
+        {"force_listen": True},
+        chunk_index=4,
+        initial_force_listen_count=0,
+    ) == (True, False)
+
+
+def test_forward_step_returns_backend_completion_to_client():
+    class Backend:
+        def __init__(self):
+            self.sent = []
+            self.events = [
+                json.dumps({"kind": "text", "text": "ok"}),
+                json.dumps({"type": "response.step.done", "step": 7}),
+            ]
+
+        async def send(self, value):
+            self.sent.append(json.loads(value))
+
+        async def recv(self):
+            return self.events.pop(0)
+
+    class Client:
+        def __init__(self):
+            self.events = []
+
+        async def send_json(self, value):
+            self.events.append(value)
+
+    gateway = RealtimeGateway.__new__(RealtimeGateway)
+    backend = Backend()
+    client = Client()
+    asyncio.run(
+        gateway.forward_step(
+            backend,
+            client,
+            {"audio_frames": 102, "force_speak": True},
+        )
+    )
+
+    assert backend.sent == [
+        {
+            "type": "input.append",
+            "input": {"audio_frames": 102, "force_speak": True},
+        }
+    ]
+    assert client.events == [
+        {"kind": "text", "text": "ok"},
+        {"type": "response.step.done", "step": 7},
+    ]

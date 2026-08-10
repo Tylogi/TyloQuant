@@ -265,6 +265,28 @@ class RuntimeInstanceList(ProtocolModel):
     data: list[RuntimeInstanceResource]
 
 
+class ModelFeatureSet(ProtocolModel):
+    text: bool = True
+    image_input: bool = False
+    video_input: bool = False
+    audio_input: bool = False
+    audio_output: bool = False
+    full_duplex: bool = False
+
+
+class ModelCapabilities(ProtocolModel):
+    architecture_family: str = Field(min_length=1, max_length=128)
+    source: str = Field(min_length=1, max_length=255)
+    features: ModelFeatureSet = Field(default_factory=ModelFeatureSet)
+
+
+class RuntimeCapabilitiesResource(ProtocolModel):
+    model: str = Field(min_length=1, max_length=255)
+    model_type: str = Field(min_length=1, max_length=128)
+    model_capabilities: ModelCapabilities
+    duplex_available: bool = False
+
+
 class OperationAccepted(ProtocolModel):
     operation_id: UUID
     status: Literal["accepted"] = "accepted"

@@ -7,14 +7,20 @@
   const SPEAK_TOKENS = 20;
   const PLAYBACK_DELAY_SECONDS = 0.2;
   const PLAYBACK_STORAGE_KEY = "mfq.console.voice-playback";
+  const DUPLEX_STORAGE_KEY = "mfq.console.full-duplex";
   const element = (id) => document.getElementById(id);
 
   const labels = {
     input: ["语音输入", "Voice input"],
     stopInput: ["停止语音输入", "Stop voice input"],
     connecting: ["语音连接中", "Connecting voice"],
+    processing: ["语音处理中", "Processing voice"],
     playbackOn: ["关闭实时语音播放", "Mute voice responses"],
     playbackOff: ["开启实时语音播放", "Play voice responses"],
+    fullDuplex: ["全双工模式", "Full-duplex mode"],
+    halfDuplex: ["半双工模式", "Half-duplex mode"],
+    fullDuplexShort: ["全双工", "Full duplex"],
+    halfDuplexShort: ["半双工", "Half duplex"],
     failed: ["语音连接失败", "Voice connection failed"],
   };
 
@@ -29,10 +35,15 @@
     pendingLength: 0,
     outboundAudio: [],
     pendingText: [],
+    heldHalfDuplexChunk: null,
+    halfDuplexPendingSteps: 0,
+    awaitingHalfDuplexResponse: false,
     sessionReady: false,
     playAt: 0,
     playing: new Set(),
     playbackEnabled: localStorage.getItem(PLAYBACK_STORAGE_KEY) !== "false",
+    fullDuplexEnabled: localStorage.getItem(DUPLEX_STORAGE_KEY) !== "false",
+    duplexSupported: false,
     stopping: false,
   };
 
@@ -47,10 +58,16 @@
   function setInputState(kind) {
     const button = element("voice-input-toggle");
     const active = kind === "active";
-    button.disabled = kind === "connecting";
+    button.disabled = kind === "connecting" || kind === "processing";
     button.setAttribute("aria-pressed", String(active));
     button.title = label(
-      kind === "active" ? "stopInput" : kind === "connecting" ? "connecting" : "input"
+      kind === "active"
+        ? "stopInput"
+        : kind === "connecting"
+          ? "connecting"
+          : kind === "processing"
+            ? "processing"
+            : "input"
     );
     button.setAttribute("aria-label", button.title);
   }
@@ -60,6 +77,21 @@
     button.setAttribute("aria-pressed", String(state.playbackEnabled));
     button.title = label(state.playbackEnabled ? "playbackOn" : "playbackOff");
     button.setAttribute("aria-label", button.title);
+  }
+
+  function syncDuplexButton() {
+    const button = element("duplex-mode-toggle");
+    button.hidden = !state.duplexSupported;
+    button.disabled = Boolean(state.inputContext || state.awaitingHalfDuplexResponse);
+    button.setAttribute("aria-pressed", String(state.fullDuplexEnabled));
+    button.title = label(state.fullDuplexEnabled ? "fullDuplex" : "halfDuplex");
+    button.setAttribute("aria-label", button.title);
+    const text = button.querySelector(".duplex-mode-label");
+    if (text) {
+      text.textContent = label(
+        state.fullDuplexEnabled ? "fullDuplexShort" : "halfDuplexShort"
+      );
+    }
   }
 
   function float32ToBase64(values) {
@@ -95,18 +127,21 @@
     return output;
   }
 
-  function sendInput(samples) {
+  function sendInput(samples, options = {}) {
     if (state.socket?.readyState !== WebSocket.OPEN || !state.sessionReady) {
-      state.outboundAudio.push(samples);
-      if (state.outboundAudio.length > 4) state.outboundAudio.shift();
+      state.outboundAudio.push({samples, options});
+      if (state.outboundAudio.length > 64) state.outboundAudio.shift();
       return;
     }
+    const input = {
+      audio: float32ToBase64(samples),
+      max_new_speak_tokens: SPEAK_TOKENS,
+    };
+    if (options.forceListen) input.force_listen = true;
+    if (options.forceSpeak) input.force_speak = true;
     state.socket.send(JSON.stringify({
       type: "input.append",
-      input: {
-        audio: float32ToBase64(samples),
-        max_new_speak_tokens: SPEAK_TOKENS,
-      },
+      input,
     }));
   }
 
@@ -154,8 +189,35 @@
         else state.pending[0] = head.subarray(count);
         state.pendingLength -= count;
       }
-      sendInput(chunk);
+      if (state.fullDuplexEnabled) {
+        sendInput(chunk);
+      } else {
+        if (state.heldHalfDuplexChunk) {
+          sendInput(state.heldHalfDuplexChunk, {forceListen: true});
+          state.halfDuplexPendingSteps += 1;
+        }
+        state.heldHalfDuplexChunk = chunk;
+      }
     }
+  }
+
+  function drainPendingAudio() {
+    if (!state.pendingLength) return null;
+    const chunk = new Float32Array(CHUNK_SAMPLES);
+    let offset = 0;
+    while (state.pending.length) {
+      const head = state.pending.shift();
+      const count = Math.min(head.length, CHUNK_SAMPLES - offset);
+      chunk.set(head.subarray(0, count), offset);
+      offset += count;
+      if (count < head.length) {
+        state.pending.unshift(head.subarray(count));
+        break;
+      }
+    }
+    state.pending = [];
+    state.pendingLength = 0;
+    return chunk;
   }
 
   function stopPlayback() {
@@ -204,7 +266,9 @@
       },
     });
     state.inputContext = new AudioContext();
-    state.outputContext = new AudioContext({sampleRate: OUTPUT_RATE});
+    if (!state.outputContext) {
+      state.outputContext = new AudioContext({sampleRate: OUTPUT_RATE});
+    }
     await Promise.all([state.inputContext.resume(), state.outputContext.resume()]);
     await state.inputContext.audioWorklet.addModule("pcm-capture-worklet.js");
     state.source = state.inputContext.createMediaStreamSource(state.stream);
@@ -213,6 +277,43 @@
     silent.gain.value = 0;
     state.source.connect(state.capture).connect(silent).connect(state.inputContext.destination);
     state.capture.port.onmessage = (event) => queueInput(event.data);
+    syncDuplexButton();
+  }
+
+  async function stopInputCapture() {
+    state.stream?.getTracks().forEach((track) => track.stop());
+    state.stream = null;
+    state.source?.disconnect();
+    state.capture?.disconnect();
+    await state.inputContext?.close().catch(() => {});
+    state.inputContext = null;
+    state.source = null;
+    state.capture = null;
+    element("voice-input-toggle").style.removeProperty("--voice-scale");
+    element("voice-input-toggle").style.removeProperty("--voice-glow");
+    syncDuplexButton();
+  }
+
+  async function finishHalfDuplexInput() {
+    if (!state.inputContext || state.fullDuplexEnabled) return;
+    await stopInputCapture();
+    const tail = drainPendingAudio();
+    if (tail && state.heldHalfDuplexChunk) {
+      sendInput(state.heldHalfDuplexChunk, {forceListen: true});
+      state.halfDuplexPendingSteps += 1;
+      state.heldHalfDuplexChunk = null;
+    }
+    const finalChunk = tail || state.heldHalfDuplexChunk;
+    state.heldHalfDuplexChunk = null;
+    if (!finalChunk) {
+      setInputState("idle");
+      return;
+    }
+    sendInput(finalChunk, {forceSpeak: true});
+    state.halfDuplexPendingSteps += 1;
+    state.awaitingHalfDuplexResponse = true;
+    setInputState("processing");
+    syncDuplexButton();
   }
 
   function handleEvent(event, config) {
@@ -225,8 +326,10 @@
       }));
     } else if (event.type === "session.created") {
       state.sessionReady = true;
-      setInputState("active");
-      for (const chunk of state.outboundAudio.splice(0)) sendInput(chunk);
+      setInputState(state.awaitingHalfDuplexResponse ? "processing" : "active");
+      for (const item of state.outboundAudio.splice(0)) {
+        sendInput(item.samples, item.options);
+      }
       for (const text of state.pendingText.splice(0)) sendText(text);
     } else if (event.kind === "text") {
       bridge()?.appendText(event.text || "");
@@ -236,13 +339,31 @@
       playAudio(samples);
     } else if (event.kind === "listen") {
       bridge()?.finishTurn();
+    } else if (event.type === "response.step.done" &&
+        !state.fullDuplexEnabled) {
+      if (state.halfDuplexPendingSteps > 0) {
+        state.halfDuplexPendingSteps -= 1;
+      }
+      if (state.awaitingHalfDuplexResponse &&
+          state.halfDuplexPendingSteps === 0) {
+        state.awaitingHalfDuplexResponse = false;
+        bridge()?.finishTurn();
+        setInputState("idle");
+        syncDuplexButton();
+      }
     } else if (event.type === "error") {
       throw new Error(event.error?.message || label("failed"));
     }
   }
 
   async function start() {
-    if (state.socket || state.inputContext) return;
+    if (state.inputContext || state.awaitingHalfDuplexResponse) return;
+    if (state.socket?.readyState === WebSocket.OPEN && state.sessionReady) {
+      await startAudio();
+      setInputState("active");
+      return;
+    }
+    if (state.socket) return;
     const config = bridge()?.begin();
     if (!config) return;
     setInputState("connecting");
@@ -281,27 +402,22 @@
     const socket = state.socket;
     state.socket = null;
     socket?.close();
-    state.stream?.getTracks().forEach((track) => track.stop());
-    state.stream = null;
-    state.source?.disconnect();
-    state.capture?.disconnect();
+    await stopInputCapture();
     stopPlayback();
-    await state.inputContext?.close().catch(() => {});
     await state.outputContext?.close().catch(() => {});
-    state.inputContext = null;
     state.outputContext = null;
-    state.source = null;
-    state.capture = null;
     state.pending = [];
     state.pendingLength = 0;
     state.outboundAudio = [];
     state.pendingText = [];
+    state.heldHalfDuplexChunk = null;
+    state.halfDuplexPendingSteps = 0;
+    state.awaitingHalfDuplexResponse = false;
     state.sessionReady = false;
     state.playAt = 0;
-    element("voice-input-toggle").style.removeProperty("--voice-scale");
-    element("voice-input-toggle").style.removeProperty("--voice-glow");
     bridge()?.setActive(false);
     setInputState("idle");
+    syncDuplexButton();
     state.stopping = false;
   }
 
@@ -310,24 +426,46 @@
       const response = await fetch("/realtime/capabilities", {cache: "no-store"});
       const payload = response.ok ? await response.json() : null;
       const available = payload?.available === true;
+      state.duplexSupported = available &&
+        payload?.model_capabilities?.features?.full_duplex === true;
       element("voice-input-toggle").hidden = !available;
       element("voice-playback-toggle").hidden = !available;
+      syncDuplexButton();
       if (!available && (state.socket || state.inputContext)) stop(true);
     } catch {
+      state.duplexSupported = false;
       element("voice-input-toggle").hidden = true;
       element("voice-playback-toggle").hidden = true;
+      syncDuplexButton();
     }
   }
 
   element("voice-input-toggle").addEventListener("click", () => {
-    if (state.socket || state.inputContext) stop(true);
-    else start();
+    if (state.inputContext && !state.fullDuplexEnabled) {
+      finishHalfDuplexInput().catch((error) => {
+        console.error(error);
+        bridge()?.notify(error.message || label("failed"), true);
+        stop(false);
+      });
+    } else if (state.inputContext) {
+      stop(true);
+    } else if (!state.awaitingHalfDuplexResponse) {
+      start();
+    }
   });
   element("voice-playback-toggle").addEventListener("click", () => {
     state.playbackEnabled = !state.playbackEnabled;
     localStorage.setItem(PLAYBACK_STORAGE_KEY, String(state.playbackEnabled));
     if (!state.playbackEnabled) stopPlayback();
     syncPlaybackButton();
+  });
+  element("duplex-mode-toggle").addEventListener("click", async () => {
+    if (!state.duplexSupported || state.inputContext ||
+        state.awaitingHalfDuplexResponse) return;
+    if (state.socket) await stop(true);
+    state.fullDuplexEnabled = !state.fullDuplexEnabled;
+    localStorage.setItem(DUPLEX_STORAGE_KEY, String(state.fullDuplexEnabled));
+    syncDuplexButton();
   });
   window.addEventListener("beforeunload", () => stop(true));
   document.addEventListener("mfq:realtime-stop", () => stop(true));
@@ -336,5 +474,6 @@
   });
   document.addEventListener("mfq:model-status-changed", detectRealtimeCapability);
   syncPlaybackButton();
+  syncDuplexButton();
   detectRealtimeCapability();
 })();

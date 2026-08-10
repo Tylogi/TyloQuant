@@ -10,7 +10,13 @@ from uuid import UUID
 
 import httpx
 
-from mfqd.models import SamplingParams, TokenUsage
+from mfqd.capabilities import capabilities_for_architecture
+from mfqd.models import (
+    ModelCapabilities,
+    RuntimeCapabilitiesResource,
+    SamplingParams,
+    TokenUsage,
+)
 
 
 class BackendError(RuntimeError):
@@ -55,6 +61,8 @@ class ChatBackend(Protocol):
     async def fork_session(self, source_session_id: UUID, target_session_id: UUID) -> bool: ...
 
     async def close_session(self, session_id: UUID) -> bool: ...
+
+    async def capabilities(self) -> RuntimeCapabilitiesResource: ...
 
     async def aclose(self) -> None: ...
 
@@ -154,6 +162,48 @@ class OpenAIChatBackend:
         return await self._session_control_request(
             "DELETE",
             f"/api/runtime/sessions/{session_id}",
+        )
+
+    async def capabilities(self) -> RuntimeCapabilitiesResource:
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        try:
+            response = await self._client.get(
+                f"{self.base_url}/health",
+                headers=headers,
+            )
+            if response.status_code >= 400:
+                raise self._http_error(response.status_code, response.content)
+            payload = response.json()
+        except BackendError:
+            raise
+        except (httpx.HTTPError, ValueError) as error:
+            raise BackendError(
+                "backend_capabilities_unavailable",
+                str(error),
+                retryable=True,
+            ) from error
+        if not isinstance(payload, dict):
+            raise BackendProtocolError("backend health must be a JSON object")
+        model = str(payload.get("model") or "mfq-model")
+        model_type = str(payload.get("model_type") or "unknown")
+        raw_capabilities = payload.get("model_capabilities")
+        try:
+            capabilities = (
+                ModelCapabilities.model_validate(raw_capabilities)
+                if isinstance(raw_capabilities, dict)
+                else capabilities_for_architecture(model_type)
+            )
+        except ValueError as error:
+            raise BackendProtocolError(
+                f"backend returned invalid model capabilities: {error}"
+            ) from error
+        return RuntimeCapabilitiesResource(
+            model=model,
+            model_type=model_type,
+            model_capabilities=capabilities,
+            duplex_available=payload.get("duplex_available") is True,
         )
 
     async def _session_control_request(

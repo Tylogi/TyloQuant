@@ -35,6 +35,7 @@ from mfqd.models import (
     ResponseStatus,
     ResponseTextDelta,
     ResponseToolCallDelta,
+    RuntimeCapabilitiesResource,
     RuntimeInstanceList,
     SessionList,
     SessionResource,
@@ -218,6 +219,17 @@ class MfqdService:
 
     async def runtime_instances(self) -> RuntimeInstanceList:
         return RuntimeInstanceList(data=[])
+
+    async def runtime_capabilities(self) -> RuntimeCapabilitiesResource:
+        try:
+            return await self.backend.capabilities()
+        except BackendError as error:
+            raise ServiceError(
+                503,
+                error.code,
+                str(error),
+                retryable=error.retryable,
+            ) from error
 
     async def load_model(self, _: object) -> OperationAccepted:
         raise ServiceError(501, "model_management_unavailable", "model loading is not available")

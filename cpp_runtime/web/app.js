@@ -31,6 +31,16 @@
     "选择模型": "Select model",
     "连接中": "Connecting",
     "最近一次生成摘要": "Latest generation summary",
+    "模型能力": "Model capabilities",
+    "纯文本": "Text",
+    "图像输入": "Image input",
+    "视频输入": "Video input",
+    "音频输入": "Audio input",
+    "音频输出": "Audio output",
+    "全双工": "Full duplex",
+    "半双工": "Half duplex",
+    "全双工模式": "Full-duplex mode",
+    "半双工模式": "Half-duplex mode",
     "导出当前对话": "Export current chat",
     "推理设置": "Inference settings",
     "向模型发送消息": "Message the model",
@@ -304,7 +314,8 @@
       "new-chat", "clear-history", "conversation-list",
       "sidebar-status-dot", "sidebar-status-label", "sidebar-endpoint",
       "connection-pill", "active-request-count", "model-select",
-      "top-ttft", "top-context-tokens", "top-tps", "export-chat", "open-settings",
+      "model-capabilities", "top-ttft", "top-context-tokens", "top-tps",
+      "export-chat", "open-settings",
       "chat-view", "monitor-view", "message-scroller", "message-list",
       "composer-form", "message-input", "thinking-toggle",
       "reasoning-effort-control", "reasoning-effort-select", "composer-hint",
@@ -1936,6 +1947,41 @@
     refs["model-select"].value = state.settings.model;
   }
 
+  function renderModelCapabilities() {
+    const root = refs["model-capabilities"];
+    const profile = state.status?.model_capabilities;
+    const features = profile?.features;
+    if (!root || !features || typeof features !== "object") {
+      if (root) root.hidden = true;
+      return;
+    }
+    const labels = [
+      ["text", "纯文本"],
+      ["image_input", "图像输入"],
+      ["video_input", "视频输入"],
+      ["audio_input", "音频输入"],
+      ["audio_output", "音频输出"],
+      ["full_duplex", "全双工"],
+    ];
+    const items = labels
+      .filter(([feature]) => features[feature] === true)
+      .map(([feature, source]) => {
+        const item = document.createElement("span");
+        item.className = "model-capability";
+        item.dataset.feature = feature;
+        item.textContent = tr(source);
+        if (feature === "full_duplex" && state.status?.duplex_available !== true) {
+          item.classList.add("is-unavailable");
+          item.title = tr("服务不可用");
+        }
+        return item;
+      });
+    root.replaceChildren(...items);
+    root.dataset.family = String(profile.architecture_family || "unknown");
+    root.title = String(profile.architecture_family || "unknown");
+    root.hidden = items.length === 0;
+  }
+
   async function loadModels() {
     try {
       const payload = await fetchJson("/v1/models");
@@ -1956,6 +2002,8 @@
       status: health?.status || "ok",
       model: health?.model || state.settings.model || state.models[0] || "mfq",
       model_type: health?.model_type || "--",
+      model_capabilities: health?.model_capabilities || null,
+      duplex_available: health?.duplex_available === true,
       sampling_defaults: health?.sampling_defaults || null,
       chat_template_capabilities:
         health?.chat_template_capabilities || null,
@@ -2001,8 +2049,11 @@
       }
       const capabilityChanged =
         state.status?.model !== payload?.model ||
-        state.status?.duplex_available !== payload?.duplex_available;
+        state.status?.duplex_available !== payload?.duplex_available ||
+        JSON.stringify(state.status?.model_capabilities || null) !==
+          JSON.stringify(payload?.model_capabilities || null);
       state.status = payload;
+      renderModelCapabilities();
       if (capabilityChanged) {
         document.dispatchEvent(new Event("mfq:model-status-changed"));
       }
@@ -2019,6 +2070,7 @@
       updateMonitor();
     } catch (error) {
       setConnection(false, error?.message?.includes("401") ? "需要 API Key" : "离线");
+      renderModelCapabilities();
       if (!options.quiet) showToast(error?.message || "无法连接服务", true);
       updateMonitor();
     }

@@ -92,6 +92,7 @@ def test_openapi_contract_has_all_native_routes_and_realtime_extension() -> None
         "/api/v1/models/load",
         "/api/v1/models/unload",
         "/api/v1/runtime/instances",
+        "/api/v1/runtime/capabilities",
     }
     assert set(schema["paths"]) == expected_paths
     assert schema["x-mfqd-protocol-version"] == PROTOCOL_VERSION

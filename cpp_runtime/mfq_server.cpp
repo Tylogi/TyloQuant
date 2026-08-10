@@ -770,6 +770,62 @@ static MfqRuntimeProfile architecture_runtime_profile(
     return result;
 }
 
+struct MfqModelCapabilityProfile {
+    std::string family = "unknown";
+    bool text = true;
+    bool image_input = false;
+    bool video_input = false;
+    bool audio_input = false;
+    bool audio_output = false;
+    bool full_duplex = false;
+};
+
+static MfqModelCapabilityProfile architecture_capability_profile(
+        const std::string & model_type) {
+    const std::string identity = normalized_identity(model_type);
+    if (identity == "minicpmo") {
+        return {
+            "minicpmo", true, true, true, true, true, true,
+        };
+    }
+    if (identity == "minicpmtts") {
+        return {
+            "minicpmo_tts", false, false, false, false, true, false,
+        };
+    }
+    if (identity == "deepseek_v4") {
+        return {"deepseek_v4"};
+    }
+    if (identity == "glm_moe_dsa") {
+        return {"glm_dsa"};
+    }
+    if (identity == "gemma4" || identity == "gemma4_text") {
+        return {"gemma4"};
+    }
+    if (identity == "qwen3_5" || identity == "qwen3_5_text") {
+        return {"qwen3_5"};
+    }
+    MfqModelCapabilityProfile result;
+    if (!identity.empty()) result.family = identity;
+    return result;
+}
+
+static json model_capability_profile_json(
+        const MfqModelCapabilityProfile & profile) {
+    return {
+        {"architecture_family", profile.family},
+        {"source", "architecture-registry:" + profile.family},
+        {"features", {
+            {"text", profile.text},
+            {"image_input", profile.image_input},
+            {"video_input", profile.video_input},
+            {"audio_input", profile.audio_input},
+            {"audio_output", profile.audio_output},
+            {"full_duplex", profile.full_duplex},
+        }},
+    };
+}
+
 static MfqRuntimeProfile exact_model_runtime_profile(
         const std::vector<std::string> & identities) {
     MfqRuntimeProfile result;
@@ -2034,6 +2090,10 @@ int run_mfq_server(
     const json chat_template_capabilities =
         chat_template_capabilities_json(
             tokenizer->chat_template());
+    const auto model_capability_profile =
+        architecture_capability_profile(config.model_type);
+    const json model_capabilities =
+        model_capability_profile_json(model_capability_profile);
 
     httplib::Server server;
     ServerMetrics server_metrics;
@@ -2520,6 +2580,7 @@ int run_mfq_server(
             {"status", reloading.load() ? "loading" : "ok"},
             {"model", config.model_name},
             {"model_type", config.model_type},
+            {"model_capabilities", model_capabilities},
             {"max_context", active_context.load()},
             {"duplex_available", static_cast<bool>(duplex)},
             {"duplex_active", duplex_is_active()},
@@ -2542,6 +2603,7 @@ int run_mfq_server(
         status["runtime_profile_source"] = config.runtime_profile.source;
         status["chat_template_capabilities"] =
             chat_template_capabilities;
+        status["model_capabilities"] = model_capabilities;
         status["duplex_available"] = static_cast<bool>(duplex);
         status["duplex_active"] = duplex_is_active();
         set_json(res, status);
