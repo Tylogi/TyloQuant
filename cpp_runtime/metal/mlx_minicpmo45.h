@@ -71,6 +71,8 @@ struct MlxMiniCPMO45DuplexConfig {
     double repetition_penalty = 1.05;
     std::int32_t repetition_window = 512;
     double length_penalty = 1.0;
+    double tts_temperature = 0.8;
+    double tts_repetition_penalty = 1.05;
     std::uint64_t seed = 0;
 };
 

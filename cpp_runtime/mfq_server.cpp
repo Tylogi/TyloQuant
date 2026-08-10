@@ -2029,6 +2029,8 @@ int run_mfq_server(
         duplex_profile_json(config.runtime_profile.duplex);
     const json tts_sampling_defaults =
         tts_profile_json(config.runtime_profile.tts);
+    const std::string duplex_backend_name =
+        duplex.name.empty() ? "native" : duplex.name;
     const json chat_template_capabilities =
         chat_template_capabilities_json(
             tokenizer->chat_template());
@@ -2151,7 +2153,8 @@ int run_mfq_server(
                         if (mode != "full_duplex") {
                             throw ApiError(
                                 400, "unsupported_operation",
-                                "Metal duplex backend supports full_duplex only");
+                                duplex_backend_name +
+                                    " duplex backend supports full_duplex only");
                         }
 
                         owned_session = request_id("sess-");
@@ -2161,7 +2164,8 @@ int run_mfq_server(
                                 owned_session.clear();
                                 throw ApiError(
                                     409, "conflict",
-                                    "the Metal worker already owns a duplex session");
+                                    "the " + duplex_backend_name +
+                                        " worker already owns a duplex session");
                             }
                             duplex_session_id = owned_session;
                             duplex_socket = &ws;
@@ -2245,6 +2249,12 @@ int run_mfq_server(
                                 duplex_defaults.text_repetition_window_size.value_or(512)));
                         parameters.length_penalty = number_field(
                             generation, "length_penalty", duplex_defaults.length_penalty.value_or(1.0));
+                        parameters.tts_temperature = number_field(
+                            generation, "tts_temperature",
+                            config.runtime_profile.tts.temperature.value_or(0.8));
+                        parameters.tts_repetition_penalty = number_field(
+                            generation, "tts_repetition_penalty",
+                            config.runtime_profile.tts.repetition_penalty.value_or(1.05));
                         if (generation.contains("seed")) {
                             parameters.seed = static_cast<uint64_t>(
                                 integer_field(generation, "seed", 0));
@@ -2274,7 +2284,7 @@ int run_mfq_server(
                             {"type", "session.created"},
                             {"session_id", owned_session},
                             {"mode", "full_duplex"},
-                            {"metrics", {{"backend", "metal"}}},
+                            {"metrics", {{"backend", duplex_backend_name}}},
                         });
                         continue;
                     }
@@ -2365,7 +2375,7 @@ int run_mfq_server(
                     const auto result = duplex.step(step);
                     const std::string response_id = request_id("resp-");
                     json metrics = {
-                        {"backend", "metal"},
+                        {"backend", duplex_backend_name},
                         {"wall_clock_ms", result.inference_ms},
                         {"kv_cache_length", result.language_cache_position},
                         {"audio_cache_length", result.audio_cache_position},

@@ -23990,6 +23990,199 @@ static int run_text_session_state_check() {
     return 0;
 }
 
+static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
+        MiniCPMO45Runtime & runtime,
+        std::mutex & model_mutex,
+        std::optional<MiniCPMO45DuplexSession> & session) {
+    MfqDuplexBackend backend;
+    backend.name = "cuda";
+    backend.start = [&](const MfqDuplexSessionParams & parameters) {
+        if (parameters.special_ids.size() != 15) {
+            throw std::invalid_argument(
+                "MiniCPM-o duplex requires 15 special token IDs");
+        }
+        if ((!parameters.greedy &&
+                (!std::isfinite(parameters.temperature) ||
+                 parameters.temperature <= 0.0)) ||
+                parameters.top_k < 0 ||
+                parameters.top_k >
+                    std::min<int64_t>(runtime.language.c.vocab_size, 1024) ||
+                !std::isfinite(parameters.top_p) ||
+                parameters.top_p <= 0.0 || parameters.top_p > 1.0 ||
+                !std::isfinite(parameters.listen_probability_scale) ||
+                parameters.listen_probability_scale < 0.0 ||
+                !std::isfinite(parameters.repetition_penalty) ||
+                parameters.repetition_penalty <= 0.0 ||
+                parameters.repetition_window <= 0 ||
+                !std::isfinite(parameters.length_penalty) ||
+                parameters.length_penalty <= 0.0 ||
+                !std::isfinite(parameters.tts_temperature) ||
+                parameters.tts_temperature <= 0.0 ||
+                !std::isfinite(parameters.tts_repetition_penalty) ||
+                parameters.tts_repetition_penalty <= 0.0) {
+            throw std::invalid_argument(
+                "MiniCPM-o duplex sampling configuration is invalid");
+        }
+        const int64_t audio_bos = parameters.special_ids.back();
+        if (audio_bos < 0 || audio_bos >= 152064 ||
+                std::any_of(
+                    parameters.special_ids.begin(),
+                    parameters.special_ids.end() - 1,
+                    [&](int64_t token) {
+                        return token < 0 ||
+                            token >= runtime.language.c.vocab_size;
+                    }) ||
+                std::any_of(
+                    parameters.forbidden_ids.begin(),
+                    parameters.forbidden_ids.end(),
+                    [&](int64_t token) {
+                        return token < 0 ||
+                            token >= runtime.language.c.vocab_size;
+                    })) {
+            throw std::invalid_argument(
+                "MiniCPM-o duplex token ID is out of range");
+        }
+        if ((parameters.reference_audio_frames == 0) !=
+                parameters.reference_audio_features.empty() ||
+                parameters.reference_audio_frames < 0 ||
+                (!parameters.reference_audio_features.empty() &&
+                 (parameters.reference_audio_frames < 3 ||
+                  parameters.reference_audio_features.size() !=
+                    static_cast<size_t>(
+                        parameters.reference_audio_frames) * 80))) {
+            throw std::invalid_argument(
+                "MiniCPM-o reference Mel geometry is invalid");
+        }
+
+        std::lock_guard<std::mutex> lock(model_mutex);
+        c10::cuda::CUDAGuard guard(
+            g_layer_placement.primary_device());
+        torch::manual_seed(static_cast<int64_t>(parameters.seed));
+        torch::cuda::manual_seed_all(parameters.seed);
+        auto special_ids = MiniCPMO45DuplexSpecialIds::from_tensor(
+            torch::tensor(
+                parameters.special_ids,
+                torch::TensorOptions().dtype(torch::kInt64)));
+        session.reset();
+        session.emplace(
+            runtime, special_ids, parameters.forbidden_ids,
+            parameters.greedy);
+        session->temperature = parameters.temperature;
+        session->top_k = parameters.top_k;
+        session->top_p = parameters.top_p;
+        session->listen_probability_scale =
+            parameters.listen_probability_scale;
+        session->repetition_penalty = parameters.repetition_penalty;
+        session->repetition_window = parameters.repetition_window;
+        session->length_penalty = parameters.length_penalty;
+        session->tts_temperature = parameters.tts_temperature;
+        session->tts_repetition_penalty =
+            parameters.tts_repetition_penalty;
+
+        const auto ids_tensor = [](const std::vector<int64_t> & values) {
+            return values.empty()
+                ? torch::Tensor()
+                : torch::tensor(
+                    values,
+                    torch::TensorOptions().dtype(torch::kInt64));
+        };
+        torch::Tensor reference_features;
+        if (!parameters.reference_audio_features.empty()) {
+            reference_features = torch::tensor(
+                parameters.reference_audio_features,
+                torch::TensorOptions().dtype(torch::kFloat32))
+                .reshape({1, 80, parameters.reference_audio_frames});
+        }
+        session->prepare(
+            ids_tensor(parameters.system_prefix),
+            reference_features,
+            ids_tensor(parameters.system_suffix));
+        torch::cuda::synchronize();
+    };
+    backend.step = [&](const MfqDuplexStepInput & input) {
+        const bool has_audio = input.audio_frames > 0;
+        const bool has_text = !input.text_tokens.empty();
+        if (has_audio && input.audio_features.size() !=
+                static_cast<size_t>(input.audio_frames) * 80) {
+            throw std::invalid_argument(
+                "MiniCPM-o duplex Mel geometry is invalid");
+        }
+        if (!has_audio && !has_text) {
+            throw std::invalid_argument(
+                "MiniCPM-o duplex step has no input");
+        }
+        if (input.max_new_speak_tokens < 2) {
+            throw std::invalid_argument(
+                "MiniCPM-o duplex generation requires at least two token slots");
+        }
+
+        std::lock_guard<std::mutex> lock(model_mutex);
+        c10::cuda::CUDAGuard guard(
+            g_layer_placement.primary_device());
+        if (!session) {
+            throw std::runtime_error(
+                "MiniCPM-o duplex session is not prepared");
+        }
+        torch::Tensor audio_features;
+        if (has_audio) {
+            audio_features = torch::tensor(
+                input.audio_features,
+                torch::TensorOptions().dtype(torch::kFloat32))
+                .reshape({1, 80, input.audio_frames});
+        }
+        torch::Tensor text_ids;
+        if (has_text) {
+            text_ids = torch::tensor(
+                input.text_tokens,
+                torch::TensorOptions().dtype(torch::kInt64))
+                .reshape({1, static_cast<int64_t>(input.text_tokens.size())});
+        }
+        const auto started = std::chrono::steady_clock::now();
+        auto result = session->run_step(
+            {}, {}, {}, {}, audio_features,
+            input.audio_prefix_extra_frames,
+            input.audio_suffix_extra_frames,
+            text_ids,
+            input.max_new_speak_tokens,
+            input.force_listen,
+            input.force_speak);
+
+        MfqDuplexStepResult response;
+        auto generated = result.generated_ids
+            .to(torch::kCPU, torch::kInt64).contiguous().reshape({-1});
+        const auto * generated_data = generated.data_ptr<int64_t>();
+        response.generated_tokens.assign(
+            generated_data, generated_data + generated.numel());
+        auto codes = result.tts_codes
+            .to(torch::kCPU, torch::kInt32).contiguous().reshape({-1});
+        const auto * code_data = codes.data_ptr<int32_t>();
+        response.audio_tokens.assign(
+            code_data, code_data + codes.numel());
+        response.is_listen = result.is_listen;
+        response.end_of_turn = result.end_of_turn;
+        response.tts_force_flush = result.tts_force_flush;
+        response.audio_chunk_index = session->audio_chunk_index;
+        response.language_cache_position = runtime.language.cache_pos;
+        response.audio_cache_position = runtime.audio.cache_length();
+        response.tts_cache_position = runtime.tts.cache_position;
+        response.inference_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - started).count();
+        return response;
+    };
+    backend.stop = [&]() {
+        std::lock_guard<std::mutex> lock(model_mutex);
+        c10::cuda::CUDAGuard guard(
+            g_layer_placement.primary_device());
+        session.reset();
+        runtime.language.reset(1);
+        runtime.audio.reset();
+        runtime.tts.reset(1);
+        torch::cuda::synchronize();
+    };
+    return backend;
+}
+
 int main(int argc, char ** argv) {
     struct TensorParallelCollectiveCleanup {
         ~TensorParallelCollectiveCleanup() {
@@ -24094,6 +24287,7 @@ int main(int argc, char ** argv) {
         bool check_nintm_routed_input = false;
         bool tensor_parallel_test_duplicates = false;
         bool server_mode = false;
+        bool server_minicpmo_duplex = false;
         bool check_runtime_assets = false;
         bool check_mfq_container = false;
         bool minicpmo_duplex_greedy = false;
@@ -24267,6 +24461,9 @@ int main(int argc, char ** argv) {
                 cpu_threads_set = true;
             }
             else if (a == "--server") server_mode = true;
+            else if (a == "--minicpmo-duplex") {
+                server_minicpmo_duplex = true;
+            }
             else if (a == "--host" && i + 1 < argc) server_host = argv[++i];
             else if (a == "--port" && i + 1 < argc) server_port = std::stoi(argv[++i]);
             else if (a == "--ctx-size" && i + 1 < argc) context_size = std::stoll(argv[++i]);
@@ -24325,7 +24522,8 @@ int main(int argc, char ** argv) {
                              "--layer-parallel 0,1 --layer-split 1,1 "
                              "--n-gpu-layers 60 --threads 32 --cpu-offload-layers 0-7,12 --moe-gpu-cache-gb 8 "
                              "--moe-cache-profile profile.json "
-                             "--api-key key --web-root path --sampling-profile profile.json] | --kl-base reference.bin "
+                             "--api-key key --web-root path --sampling-profile profile.json "
+                             "--minicpmo-duplex] | --kl-base reference.bin "
                              "[--kl-evaluator optimized|legacy --kl-chunks -1 "
                              "--kl-score-count N --kl-n-batch N "
                              "--kl-reference-n-batch N "
@@ -24339,6 +24537,10 @@ int main(int argc, char ** argv) {
             parse_nint6_mmq_mode(nint6_mmq_arg);
         if (cpu_threads_set && cpu_threads <= 0) {
             throw std::runtime_error("--threads must be positive");
+        }
+        if (server_minicpmo_duplex && !server_mode) {
+            throw std::runtime_error(
+                "--minicpmo-duplex requires --server");
         }
         if (cpu_threads > 0) {
             at::set_num_threads(cpu_threads);
@@ -24663,7 +24865,7 @@ int main(int argc, char ** argv) {
             std::cerr << "usage: mfq-decode --mfq model.mfq [--config config.json] "
                          "(--ids 1,2,3 --gen 128 | --server "
                          "[--host 127.0.0.1 --port 8080 --ctx-size 32768 --model-name name "
-                         "--api-key key --web-root path] | --kl-base reference.bin "
+                         "--api-key key --web-root path --minicpmo-duplex] | --kl-base reference.bin "
                          "[--kl-evaluator optimized|legacy --kl-chunks -1 "
                          "--kl-score-count N --kl-n-batch N "
                          "--kl-reference-n-batch N "
@@ -24865,10 +25067,23 @@ int main(int argc, char ** argv) {
         }
         auto t0 = std::chrono::steady_clock::now();
         Model model = load_model(mfq_path, config_path, context_size);
+        std::optional<MiniCPMO45Runtime> server_minicpmo_runtime;
+        if (server_minicpmo_duplex) {
+            if (!model.c.is_minicpmo45()) {
+                throw std::runtime_error(
+                    "--minicpmo-duplex requires a MiniCPM-o 4.5 model");
+            }
+            server_minicpmo_runtime.emplace(
+                MiniCPMO45Runtime::load_with_language(
+                    std::move(model), mfq_path));
+        }
         torch::cuda::synchronize();
         auto t1 = std::chrono::steady_clock::now();
         report_cuda_memory("loaded");
         if (server_mode) {
+            Model & server_model = server_minicpmo_runtime
+                ? server_minicpmo_runtime->language
+                : model;
             if (server_api_key.empty()) {
                 const char * env_key = std::getenv("MFQ_API_KEY");
                 if (env_key != nullptr) server_api_key = env_key;
@@ -24894,7 +25109,7 @@ int main(int argc, char ** argv) {
             server_config.host = server_host;
             server_config.port = server_port;
             server_config.model_name = server_model_name;
-            server_config.model_type = model.c.model_type;
+            server_config.model_type = server_model.c.model_type;
             MfqFile runtime_assets(mfq_path);
             if (!runtime_assets.has_record(MFQ_TOKENIZER_GGUF_ASSET)) {
                 throw std::runtime_error(
@@ -24904,8 +25119,9 @@ int main(int argc, char ** argv) {
                 runtime_assets.read_asset(MFQ_TOKENIZER_GGUF_ASSET);
             server_config.api_key = server_api_key;
             server_config.web_root = server_web_root;
-            server_config.max_context = model.c.max_position_embeddings;
-            server_config.vocab_size = model.c.vocab_size;
+            server_config.max_context =
+                server_model.c.max_position_embeddings;
+            server_config.vocab_size = server_model.c.vocab_size;
             const auto embedded_profile = runtime_assets.header.extra_json.find(
                 "runtime.sampling.v1");
             server_config.runtime_profile = resolve_mfq_runtime_profile(
@@ -24921,8 +25137,17 @@ int main(int argc, char ** argv) {
                     : std::string(),
                 server_sampling_profile);
             std::mutex model_mutex;
-            ServerDecodeGraphCache decode_graph_cache(model.c.max_position_embeddings);
+            ServerDecodeGraphCache decode_graph_cache(
+                server_model.c.max_position_embeddings);
             ServerTextSessionCache text_session_cache;
+            std::optional<MiniCPMO45DuplexSession> minicpmo_duplex_session;
+            MfqDuplexBackend duplex_backend;
+            if (server_minicpmo_runtime) {
+                duplex_backend = make_cuda_minicpmo45_duplex_backend(
+                    *server_minicpmo_runtime,
+                    model_mutex,
+                    minicpmo_duplex_session);
+            }
             const int status = run_mfq_server(
                 server_config, [&](const std::vector<int64_t> & prompt,
                                    const MfqSamplingParams & sampling,
@@ -24931,10 +25156,10 @@ int main(int argc, char ** argv) {
                                    const MfqPromptCachePlan & cache_plan,
                                    const MfqTokenConstraintPtr & token_constraint) {
                 return generate_server_tokens(
-                    model, model_mutex, decode_graph_cache,
+                    server_model, model_mutex, decode_graph_cache,
                     text_session_cache, prompt, sampling,
                     on_token, on_prefill, cache_plan, token_constraint);
-            }, {}, {}, {
+            }, {}, duplex_backend, {
                 [&](const std::string & source_session_id,
                         const std::string & target_session_id) {
                     std::lock_guard<std::mutex> lock(model_mutex);

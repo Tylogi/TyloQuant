@@ -504,6 +504,7 @@ int serve_loaded_runtime(
             }
         };
     MfqDuplexBackend duplex;
+    duplex.name = "metal";
     if constexpr (std::is_same_v<
             Runtime, mfq::metal::MlxMiniCPMO45Runtime>) {
         if (arguments.minicpmo_duplex) {
@@ -555,6 +556,10 @@ int serve_loaded_runtime(
                         parameters.repetition_window;
                     config.length_penalty =
                         parameters.length_penalty;
+                    config.tts_temperature =
+                        parameters.tts_temperature;
+                    config.tts_repetition_penalty =
+                        parameters.tts_repetition_penalty;
                     config.seed = parameters.seed;
 
                     std::optional<mlx::core::array> system_prefix_ids;

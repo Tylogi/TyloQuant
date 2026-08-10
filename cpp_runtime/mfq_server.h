@@ -110,6 +110,8 @@ struct MfqDuplexSessionParams {
     double repetition_penalty = 1.05;
     int32_t repetition_window = 512;
     double length_penalty = 1.0;
+    double tts_temperature = 0.8;
+    double tts_repetition_penalty = 1.05;
     uint64_t seed = 0;
 };
 
@@ -138,6 +140,7 @@ struct MfqDuplexStepResult {
 };
 
 struct MfqDuplexBackend {
+    std::string name = "native";
     std::function<void(const MfqDuplexSessionParams &)> start;
     std::function<MfqDuplexStepResult(const MfqDuplexStepInput &)> step;
     std::function<void()> stop;

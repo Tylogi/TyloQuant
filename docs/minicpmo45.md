@@ -175,9 +175,20 @@ streaming audio index after every unit. TTS only returns codes that have already
 advanced the TTS KV cache, so the next unit can verify its expected position
 exactly. `reset()` destroys the duplex state and clears all modality caches.
 
-### Apple realtime service
+### Realtime service
 
-Start the native worker with the modality graph enabled:
+Start the native CUDA or Apple worker with the modality graph enabled:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 mfq-decode \
+  --mfq /models/MiniCPM-o-4_5.mfq \
+  --server \
+  --minicpmo-duplex \
+  --host 127.0.0.1 \
+  --port 8081
+```
+
+On Apple Silicon, use the Metal executable with the same server options:
 
 ```bash
 mfq-decode-metal \
@@ -188,7 +199,7 @@ mfq-decode-metal \
   --port 8081
 ```
 
-Then start the media gateway with the official `assets/token2wav` directory and
+Start the media gateway with the official `assets/token2wav` directory and
 `system_ref_audio.wav` available below the assets root:
 
 ```bash
@@ -214,7 +225,8 @@ temperature 0.8 and repetition penalty 1.05; Token2wav uses 10 flow steps and
 the browser buffers 200 ms before playback. The WebUI uses the official
 language-specific Chinese or English duplex prompt unless the user supplies a
 custom system prompt. Generic chat sampling controls do not override these
-voice defaults.
+voice defaults. The gateway selects CUDA for Token2wav when available, followed
+by Apple MPS and CPU.
 
 Its additional public media protocol is
 `WS /v1/realtime?mode=audio`: clients send base64 float32 mono PCM at 16 kHz and

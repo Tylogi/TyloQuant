@@ -210,7 +210,9 @@ class AppleToken2Wav:
         from stepaudio2.flashcosyvoice.modules.hifigan import HiFTGenerator
         from stepaudio2.token2wav import _setup_cosyvoice2_alias
 
-        if torch.backends.mps.is_available():
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
             self.device = torch.device("mps")
         else:
             self.device = torch.device("cpu")
@@ -534,7 +536,7 @@ class RealtimeGateway:
 
         if self.session_lock.locked():
             await client.send_json(
-                {"type": "error", "error": {"message": "the Metal worker is busy"}}
+                {"type": "error", "error": {"message": "the native worker is busy"}}
             )
             await client.close(code=1013)
             return
@@ -805,7 +807,7 @@ def build_app(gateway: RealtimeGateway, web_root: Path | None = None) -> Any:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="MiniCPM-o 4.5 realtime audio gateway for the MFQ Metal worker"
+        description="MiniCPM-o 4.5 realtime audio gateway for an MFQ native worker"
     )
     parser.add_argument("--backend", default="http://127.0.0.1:8080")
     parser.add_argument("--host", default="127.0.0.1")

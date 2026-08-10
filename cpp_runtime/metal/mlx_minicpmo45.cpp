@@ -2404,7 +2404,11 @@ void MlxMiniCPMO45Runtime::prepare_duplex(
         config.repetition_penalty <= 0.0 ||
         config.repetition_window <= 0 ||
         !std::isfinite(config.length_penalty) ||
-        config.length_penalty <= 0.0) {
+        config.length_penalty <= 0.0 ||
+        !std::isfinite(config.tts_temperature) ||
+        config.tts_temperature <= 0.0 ||
+        !std::isfinite(config.tts_repetition_penalty) ||
+        config.tts_repetition_penalty <= 0.0) {
         throw std::runtime_error(
             "MiniCPM-o duplex sampling configuration is invalid");
     }
@@ -2654,8 +2658,8 @@ MlxMiniCPMO45DuplexResult MlxMiniCPMO45Runtime::duplex_step(
             26,
             minimum_codes,
             6561,
-            0.8,
-            1.05,
+            state.config.tts_temperature,
+            state.config.tts_repetition_penalty,
             state.config.seed + state.tts_seed_counter++);
         tts_codes = std::move(tts_result.codes);
         if (end_of_turn) {

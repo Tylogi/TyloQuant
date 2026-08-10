@@ -1342,9 +1342,15 @@ struct MiniCPMO45Runtime {
             const std::string & mfq_path,
             const std::string & config_path,
             int64_t context_size) {
+        return load_with_language(
+            load_model(mfq_path, config_path, context_size), mfq_path);
+    }
+
+    static MiniCPMO45Runtime load_with_language(
+            Model language,
+            const std::string & mfq_path) {
         MiniCPMO45Runtime result;
-        result.language = load_model(
-            mfq_path, config_path, context_size);
+        result.language = std::move(language);
         if (!result.language.c.is_minicpmo45()) {
             throw std::runtime_error(
                 "native composite graph requires MiniCPM-o 4.5");
@@ -1522,6 +1528,7 @@ struct MiniCPMO45DuplexStepResult {
     torch::Tensor tts_codes;
     bool is_listen = false;
     bool end_of_turn = false;
+    bool tts_force_flush = false;
 };
 
 struct MiniCPMO45DuplexSession {
@@ -1540,6 +1547,8 @@ struct MiniCPMO45DuplexSession {
     double repetition_penalty = 1.05;
     int64_t repetition_window = 512;
     double length_penalty = 1.0;
+    double tts_temperature = 0.8;
+    double tts_repetition_penalty = 1.05;
 
     MiniCPMO45DuplexSession(
             MiniCPMO45Runtime & runtime_,
@@ -1558,7 +1567,10 @@ struct MiniCPMO45DuplexSession {
         }
     }
 
-    void prepare(torch::Tensor system_ids) {
+    void prepare(
+            torch::Tensor system_prefix_ids,
+            torch::Tensor reference_audio_features = torch::Tensor(),
+            torch::Tensor system_suffix_ids = torch::Tensor()) {
         runtime.language.reset(1);
         runtime.audio.reset();
         runtime.tts.reset(1);
@@ -1566,8 +1578,30 @@ struct MiniCPMO45DuplexSession {
         audio_chunk_index = 0;
         tts_text_start_position = 0;
         current_turn_ended = true;
-        if (system_ids.defined() && system_ids.numel() > 0) {
-            feed_ids(system_ids);
+        if (system_prefix_ids.defined() &&
+                system_prefix_ids.numel() > 0) {
+            feed_ids(system_prefix_ids);
+        }
+        if (reference_audio_features.defined()) {
+            if (reference_audio_features.dim() != 3 ||
+                    reference_audio_features.size(0) != 1 ||
+                    reference_audio_features.size(1) != 80 ||
+                    reference_audio_features.size(2) < 3) {
+                throw std::runtime_error(
+                    "MiniCPM-o duplex reference audio expects [1,80,frames]");
+            }
+            auto raw_lengths = torch::tensor(
+                std::vector<int64_t>{reference_audio_features.size(2)},
+                torch::TensorOptions().dtype(torch::kInt64));
+            auto embeddings = runtime.audio.forward(
+                reference_audio_features.to(torch::kCUDA),
+                raw_lengths, false);
+            feed_embeddings(embeddings);
+            runtime.audio.reset();
+        }
+        if (system_suffix_ids.defined() &&
+                system_suffix_ids.numel() > 0) {
+            feed_ids(system_suffix_ids);
         }
     }
 
@@ -1717,7 +1751,8 @@ struct MiniCPMO45DuplexSession {
             int64_t audio_suffix_extra_frames,
             torch::Tensor text_ids,
             int64_t max_new_speak_tokens,
-            bool force_listen) {
+            bool force_listen,
+            bool force_speak = false) {
         if (max_new_speak_tokens < 2) {
             throw std::runtime_error(
                 "MiniCPM-o duplex generation requires at least two token slots");
@@ -1818,7 +1853,7 @@ struct MiniCPMO45DuplexSession {
                 generated_text_ids.push_back(token);
             }
             if (!forced_decision && token == ids.listen &&
-                    !current_turn_ended) {
+                    (!current_turn_ended || force_speak)) {
                 token = ids.tts_bos;
             }
             generated.push_back(token);
@@ -1867,7 +1902,10 @@ struct MiniCPMO45DuplexSession {
             auto condition = runtime.tts.duplex_condition(
                 text_id_tensor, hidden_tensor, ids.audio_bos);
             const bool first_tts_chunk = tts_text_start_position == 0;
-            if (first_tts_chunk) runtime.tts.reset(1);
+            if (first_tts_chunk) {
+                runtime.tts.reset(1);
+                result.tts_force_flush = true;
+            }
             if (runtime.tts.cache_position != tts_text_start_position) {
                 throw std::runtime_error(
                     "MiniCPM-o duplex TTS cache position is inconsistent");
@@ -1875,7 +1913,8 @@ struct MiniCPMO45DuplexSession {
             const int64_t minimum_codes =
                 result.end_of_turn || first_tts_chunk ? 0 : 26;
             auto tts_result = runtime.tts.generate_duplex_chunk(
-                condition, 26, minimum_codes, 6561, 0.8, 1.05);
+                condition, 26, minimum_codes, 6561,
+                tts_temperature, tts_repetition_penalty);
             result.tts_codes = tts_result.codes;
             if (result.end_of_turn) {
                 runtime.tts.reset(1);

@@ -200,6 +200,33 @@ def test_minicpmo45_cli_exposes_native_duplex_tensor_contract():
     assert 'output + ".state.pt"' in GRAPH
 
 
+def test_minicpmo45_cuda_server_binds_the_realtime_backend():
+    assert 'a == "--minicpmo-duplex"' in DECODE
+    assert "make_cuda_minicpmo45_duplex_backend(" in DECODE
+    assert 'backend.name = "cuda"' in DECODE
+    assert "MiniCPMO45Runtime::load_with_language(" in DECODE
+    assert "session->prepare(" in DECODE
+    assert "parameters.reference_audio_features" in DECODE
+    assert "input.force_speak" in DECODE
+    assert "result.tts_force_flush" in DECODE
+
+
+def test_minicpmo45_cuda_duplex_uses_runtime_profile_tts_sampling():
+    assert "double tts_temperature = 0.8" in GRAPH
+    assert "double tts_repetition_penalty = 1.05" in GRAPH
+    assert "tts_temperature, tts_repetition_penalty" in GRAPH
+    assert 'number_field(\n                            generation, "tts_temperature"' in SERVER_SOURCE
+    assert 'number_field(\n                            generation, "tts_repetition_penalty"' in SERVER_SOURCE
+
+
+def test_minicpmo45_realtime_renderer_prefers_cuda_when_available():
+    cuda_probe = "if torch.cuda.is_available():"
+    mps_probe = "elif torch.backends.mps.is_available():"
+    assert cuda_probe in REALTIME_GATEWAY
+    assert mps_probe in REALTIME_GATEWAY
+    assert REALTIME_GATEWAY.index(cuda_probe) < REALTIME_GATEWAY.index(mps_probe)
+
+
 def test_minicpmo45_metal_uses_an_independent_qwen3_backbone():
     assert "class MiniQwen3Block" in METAL_GRAPH
     assert "class MiniQwen3Language" in METAL_GRAPH
