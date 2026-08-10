@@ -118,6 +118,44 @@ multinomial sampling. The native graph produces S3 audio codes. Token2wav
 waveform rendering still uses the assets supplied with the official model
 directory.
 
+## Native full-duplex session
+
+The native CUDA runtime also accepts a sequence of processor-produced units in
+one process. It preserves the official streaming Whisper, Qwen3, and TTS caches
+across units and follows the listen/speak, chunk-end, and turn-end state
+transitions used by `MiniCPMODuplex`.
+
+The session prefix contains:
+
+- `<prefix>.special_ids.pt`: 15 token IDs in this order: unit start/end,
+  image start/end, slice start/end, listen, speak, TTS BOS/EOS, chunk EOS,
+  chunk TTS EOS, turn EOS, TTS pad, and audio BOS.
+- `<prefix>.forbidden_ids.pt`: optional tokenizer `bad_token_ids`.
+- `<prefix>.system_ids.pt`: optional tokenized system prompt.
+
+Each zero-based unit uses `<prefix>.stepNNNN` and may contain image tensors
+(`pixel_values`, `patch_mask`, `target_sizes`, and optional
+`image_slice_counts`), `audio_features`, or `text_ids`. Streaming audio features
+come from the official processor. Optional `audio_prefix_extra_frames`,
+`audio_suffix_extra_frames`, and `force_listen` scalar tensors override their
+official defaults. A `reset_session` scalar clears the Whisper, Qwen3, TTS,
+sampling, and turn state before processing that unit.
+
+```bash
+mfq-decode \
+  --mfq models/MiniCPM-o-4_5-Q4KM-table.mfq \
+  --minicpmo-duplex-input-prefix fixtures/session \
+  --minicpmo-duplex-output-prefix outputs/result \
+  --minicpmo-duplex-steps 4
+```
+
+Every output unit contains decision logits, generated text token IDs, S3 TTS
+codes, and a state tensor. Audio units also contain the pooled Whisper
+embeddings. The six state values are listen, end-of-turn, Qwen cache length,
+Whisper cache length, TTS cache length, and the official streaming time index.
+`--minicpmo-duplex-greedy` and `--minicpmo-duplex-seed` provide deterministic
+validation modes.
+
 The HTTP server does not yet parse raw MiniCPM-o image and audio requests.
 Quality and performance results require a calibrated checkpoint and
 modality-specific reference evaluation; structural support alone does not

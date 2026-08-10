@@ -23075,6 +23075,8 @@ int main(int argc, char ** argv) {
     try {
         std::string mfq_path, config_path, ids_arg, ids_file;
         std::string minicpmo_input_prefix, minicpmo_output_prefix;
+        std::string minicpmo_duplex_input_prefix;
+        std::string minicpmo_duplex_output_prefix;
         std::string check_linear, check_linear_cpu, check_linear_gate, kl_base;
         std::string kl_save_logits_f16;
         std::string check_tp_linear;
@@ -23107,6 +23109,9 @@ int main(int argc, char ** argv) {
         int server_port = 8080;
         int64_t context_size = 0;
         int64_t minicpmo_tts_steps = 0;
+        int64_t minicpmo_duplex_steps = 0;
+        int64_t minicpmo_duplex_max_speak_tokens = 20;
+        int64_t minicpmo_duplex_seed = 0;
         int kl_chunks = -1;
         int kl_score_count = -1;
         int64_t kl_n_batch = 0;
@@ -23165,6 +23170,7 @@ int main(int argc, char ** argv) {
         bool server_mode = false;
         bool check_runtime_assets = false;
         bool check_mfq_container = false;
+        bool minicpmo_duplex_greedy = false;
         bool kl_allow_overlays = false;
         bool n_gpu_layers_set = false;
         bool cpu_threads_set = false;
@@ -23182,6 +23188,24 @@ int main(int argc, char ** argv) {
             }
             else if (a == "--minicpmo-tts-steps" && i + 1 < argc) {
                 minicpmo_tts_steps = std::stoll(argv[++i]);
+            }
+            else if (a == "--minicpmo-duplex-input-prefix" && i + 1 < argc) {
+                minicpmo_duplex_input_prefix = argv[++i];
+            }
+            else if (a == "--minicpmo-duplex-output-prefix" && i + 1 < argc) {
+                minicpmo_duplex_output_prefix = argv[++i];
+            }
+            else if (a == "--minicpmo-duplex-steps" && i + 1 < argc) {
+                minicpmo_duplex_steps = std::stoll(argv[++i]);
+            }
+            else if (a == "--minicpmo-duplex-max-speak-tokens" && i + 1 < argc) {
+                minicpmo_duplex_max_speak_tokens = std::stoll(argv[++i]);
+            }
+            else if (a == "--minicpmo-duplex-seed" && i + 1 < argc) {
+                minicpmo_duplex_seed = std::stoll(argv[++i]);
+            }
+            else if (a == "--minicpmo-duplex-greedy") {
+                minicpmo_duplex_greedy = true;
             }
             else if (a == "--check-linear" && i + 1 < argc) check_linear = argv[++i];
             else if (a == "--check-linear-cpu" && i + 1 < argc) {
@@ -23654,6 +23678,28 @@ int main(int argc, char ** argv) {
         }
         if (check_dsv4_hc) {
             return run_dsv4_hc_check(check_attention_reps);
+        }
+        if (!minicpmo_duplex_input_prefix.empty()) {
+            if (mfq_path.empty() || minicpmo_duplex_output_prefix.empty()) {
+                throw std::runtime_error(
+                    "--minicpmo-duplex-input-prefix requires --mfq and "
+                    "--minicpmo-duplex-output-prefix");
+            }
+            if (!minicpmo_input_prefix.empty() || server_mode ||
+                    !ids_arg.empty() || !ids_file.empty() ||
+                    !kl_base.empty() || !prefill_sweep_arg.empty()) {
+                throw std::runtime_error(
+                    "MiniCPM-o duplex mode cannot be combined with "
+                    "composite, token, server, KL, or prefill modes");
+            }
+            return run_minicpmo45_duplex(
+                mfq_path, config_path,
+                minicpmo_duplex_input_prefix,
+                minicpmo_duplex_output_prefix,
+                context_size, minicpmo_duplex_steps,
+                minicpmo_duplex_max_speak_tokens,
+                minicpmo_duplex_greedy,
+                minicpmo_duplex_seed);
         }
         if (!minicpmo_input_prefix.empty()) {
             if (mfq_path.empty() || minicpmo_output_prefix.empty()) {

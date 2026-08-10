@@ -115,3 +115,59 @@ def test_minicpmo45_cli_exposes_tensor_fixture_contract():
     assert 'output_prefix + ".image_embeddings.pt"' in GRAPH
     assert 'output_prefix + ".audio_embeddings.pt"' in GRAPH
     assert 'output_prefix + ".tts_codes.pt"' in GRAPH
+
+
+def test_minicpmo45_native_duplex_preserves_streaming_caches():
+    assert "forward_streaming(" in GRAPH
+    assert "cache_length() + conv_tokens_before_crop" in GRAPH
+    assert "prefix_extra_frames + 1" in GRAPH
+    assert "suffix_extra_frames + 1" in GRAPH
+    assert "MiniCPMO45DuplexSession" in GRAPH
+    assert "runtime.language.reset(1)" in GRAPH
+    assert "runtime.audio.reset()" in GRAPH
+    assert "runtime.tts.reset(1)" in GRAPH
+    assert "runtime.language.cache_pos" in GRAPH
+    assert "runtime.audio.cache_length()" in GRAPH
+    assert "runtime.tts.cache_position" in GRAPH
+    assert "session.audio_chunk_index" in GRAPH
+
+
+def test_minicpmo45_native_duplex_follows_official_unit_state_machine():
+    assert "feed_id(ids.unit_start)" in GRAPH
+    assert "feed_id(ids.unit_end)" in GRAPH
+    assert "ids.is_chunk_terminator(token)" in GRAPH
+    assert "!forced_decision && token == ids.listen" in GRAPH
+    assert "!current_turn_ended" in GRAPH
+    assert "token = ids.tts_bos" in GRAPH
+    assert "index == max_new_speak_tokens - 1" in GRAPH
+    assert "feed_id(ids.chunk_eos)" in GRAPH
+    assert "if (index != 0)" in GRAPH
+    assert "result.end_of_turn = token == ids.turn_eos" in GRAPH
+    assert "generation_logits = pending.first" in GRAPH
+
+
+def test_minicpmo45_native_duplex_uses_official_sampling_contracts():
+    assert "first_id == ids.chunk_eos" in GRAPH
+    assert "selected / repetition_penalty" in GRAPH
+    assert "logits.index_fill_" in GRAPH
+    assert "logits.topk(top_k" in GRAPH
+    assert "cumulative > top_p" in GRAPH
+    assert "generate_duplex_chunk(" in GRAPH
+    assert "sampled.size() > 16" in GRAPH
+    assert "condition.size(1) + result.tts_codes.size(1)" in GRAPH
+
+
+def test_minicpmo45_cli_exposes_native_duplex_tensor_contract():
+    assert 'a == "--minicpmo-duplex-input-prefix"' in DECODE
+    assert 'a == "--minicpmo-duplex-output-prefix"' in DECODE
+    assert 'a == "--minicpmo-duplex-steps"' in DECODE
+    assert 'a == "--minicpmo-duplex-max-speak-tokens"' in DECODE
+    assert 'a == "--minicpmo-duplex-seed"' in DECODE
+    assert 'a == "--minicpmo-duplex-greedy"' in DECODE
+    assert 'input_prefix + ".special_ids.pt"' in GRAPH
+    assert 'input + ".audio_features.pt"' in GRAPH
+    assert 'input + ".force_listen.pt"' in GRAPH
+    assert 'input + ".reset_session.pt"' in GRAPH
+    assert 'output + ".generated_ids.pt"' in GRAPH
+    assert 'output + ".tts_codes.pt"' in GRAPH
+    assert 'output + ".state.pt"' in GRAPH

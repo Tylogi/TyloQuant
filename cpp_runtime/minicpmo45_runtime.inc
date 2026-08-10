@@ -721,6 +721,90 @@ struct MiniCPMO45AudioEncoder {
         for (auto & layer : layers) layer.reset();
     }
 
+    int64_t cache_length() const {
+        if (layers.empty() || !layers.front().key_cache.defined()) return 0;
+        return layers.front().key_cache.size(2);
+    }
+
+    torch::Tensor forward_streaming(
+            torch::Tensor features,
+            int64_t prefix_extra_frames,
+            int64_t suffix_extra_frames) {
+        if (features.dim() != 3 || features.size(0) != 1 ||
+                features.size(1) != 80 || prefix_extra_frames < 0 ||
+                suffix_extra_frames < 0) {
+            throw std::runtime_error(
+                "MiniCPM-o streaming audio expects [1,80,frames] and "
+                "non-negative extra-frame counts");
+        }
+        const int64_t conv_tokens_before_crop =
+            (features.size(2) - 1) / 2 + 1;
+        if (cache_length() + conv_tokens_before_crop >=
+                position_embedding.size(0)) {
+            reset();
+        }
+
+        auto conv1 = torch::conv1d(
+            features.to(conv1_weight.scalar_type()),
+            conv1_weight, conv1_bias,
+            std::vector<int64_t>{1},
+            std::vector<int64_t>{1},
+            std::vector<int64_t>{1}, 1);
+        auto hidden = torch::gelu(conv1);
+        auto conv2 = torch::conv1d(
+            hidden, conv2_weight, conv2_bias,
+            std::vector<int64_t>{2},
+            std::vector<int64_t>{1},
+            std::vector<int64_t>{1}, 1);
+        hidden = torch::gelu(conv2);
+
+        const int64_t prefix_to_remove =
+            prefix_extra_frames > 0 ? (prefix_extra_frames + 1) / 2 : 0;
+        const int64_t suffix_to_remove =
+            suffix_extra_frames > 0 ? (suffix_extra_frames + 1) / 2 : 0;
+        if (prefix_to_remove + suffix_to_remove >= hidden.size(2)) {
+            throw std::runtime_error(
+                "MiniCPM-o streaming audio extra context removes every frame");
+        }
+        if (prefix_to_remove > 0) {
+            hidden = hidden.narrow(
+                2, prefix_to_remove, hidden.size(2) - prefix_to_remove);
+        }
+        if (suffix_to_remove > 0) {
+            hidden = hidden.narrow(
+                2, 0, hidden.size(2) - suffix_to_remove);
+        }
+        hidden = hidden.transpose(1, 2).contiguous();
+
+        const int64_t past = cache_length();
+        const int64_t tokens = hidden.size(1);
+        if (past + tokens > position_embedding.size(0)) {
+            throw std::runtime_error(
+                "MiniCPM-o streaming Whisper position cache exceeds 1500 frames");
+        }
+        hidden = hidden + position_embedding.narrow(0, past, tokens);
+        auto attention_mask = torch::zeros(
+            {1, 1, tokens, past + tokens},
+            hidden.options());
+        for (auto & layer : layers) {
+            hidden = layer.forward(hidden, attention_mask, true);
+        }
+        hidden = minicpmo45_layer_norm(
+            hidden, final_norm_weight, final_norm_bias, 1e-5);
+        hidden = projector1.forward(hidden);
+        hidden = torch::relu(hidden);
+        hidden = projector2.forward(hidden);
+        if (hidden.size(1) < 5) {
+            throw std::runtime_error(
+                "MiniCPM-o streaming audio chunk is too short for stride-5 pooling");
+        }
+        return torch::avg_pool1d(
+            hidden.transpose(1, 2),
+            std::vector<int64_t>{5},
+            std::vector<int64_t>{5})
+            .transpose(1, 2).contiguous();
+    }
+
     static std::vector<int64_t> pooled_lengths(
             torch::Tensor raw_lengths) {
         auto lengths = raw_lengths.to(torch::kCPU, torch::kInt64).contiguous();
@@ -945,6 +1029,40 @@ struct MiniCPMO45TtsDecoder {
         return torch::cat({merged, suffix}, 1).contiguous();
     }
 
+    torch::Tensor duplex_condition(
+            torch::Tensor text_ids,
+            torch::Tensor language_hidden,
+            int64_t audio_bos_token) const {
+        if (text_ids.dim() == 1) text_ids = text_ids.unsqueeze(0);
+        if (language_hidden.dim() == 2) {
+            language_hidden = language_hidden.unsqueeze(0);
+        }
+        if (text_ids.dim() != 2 || language_hidden.dim() != 3 ||
+                text_ids.size(0) != 1 || language_hidden.size(0) != 1 ||
+                text_ids.size(1) != language_hidden.size(1) ||
+                language_hidden.size(2) != 4096 ||
+                audio_bos_token < 0 || audio_bos_token >= text_embedding.out()) {
+            throw std::runtime_error(
+                "MiniCPM-o duplex TTS condition has invalid geometry or audio BOS");
+        }
+        torch::Tensor condition;
+        if (text_ids.size(1) > 0) {
+            auto text = minicpmo45_embedding(text_embedding, text_ids);
+            auto semantic = semantic_projection(language_hidden)
+                .to(text.scalar_type());
+            condition = (text + semantic).contiguous();
+        }
+        auto bos_ids = torch::tensor(
+            std::vector<int64_t>{audio_bos_token},
+            torch::TensorOptions().dtype(torch::kInt64)
+                .device(torch::kCUDA)).reshape({1, 1});
+        auto bos = minicpmo45_embedding(
+            text_embedding, bos_ids, torch::kBFloat16);
+        return condition.defined()
+            ? torch::cat({condition, bos}, 1).contiguous()
+            : bos.contiguous();
+    }
+
     torch::Tensor hidden_forward(torch::Tensor input_embeddings) {
         if (input_embeddings.dim() != 3 ||
                 input_embeddings.size(2) != config.hidden_size) {
@@ -993,6 +1111,82 @@ struct MiniCPMO45TtsDecoder {
         return torch::matmul(
             hidden.to(code_head.scalar_type()),
             code_head.transpose(0, 1));
+    }
+
+    struct ChunkResult {
+        torch::Tensor codes;
+        bool finished = false;
+    };
+
+    ChunkResult generate_duplex_chunk(
+            torch::Tensor condition_embeddings,
+            int64_t max_new_tokens,
+            int64_t minimum_new_tokens,
+            int64_t eos_token,
+            double temperature,
+            double repetition_penalty) {
+        if (condition_embeddings.dim() != 3 ||
+                condition_embeddings.size(0) != 1 ||
+                condition_embeddings.size(2) != config.hidden_size ||
+                max_new_tokens <= 0 || minimum_new_tokens < 0 ||
+                eos_token < 0 || eos_token >= code_embedding.out() ||
+                temperature <= 0.0 || repetition_penalty <= 0.0) {
+            throw std::runtime_error(
+                "MiniCPM-o duplex TTS generation limits are invalid");
+        }
+        std::vector<torch::Tensor> sampled;
+        sampled.reserve(static_cast<size_t>(max_new_tokens));
+        auto current = condition_embeddings.to(torch::kBFloat16).contiguous();
+        bool finished = false;
+        for (int64_t step = 0; step < max_new_tokens; ++step) {
+            auto hidden = hidden_forward(current);
+            auto step_logits = logits(
+                hidden.index({Slice(), -1, Slice()}))
+                .to(torch::kFloat32) / temperature;
+            if (!sampled.empty() && repetition_penalty != 1.0) {
+                const size_t begin = sampled.size() > 16
+                    ? sampled.size() - 16 : 0;
+                auto counts = torch::zeros_like(step_logits);
+                for (size_t index = begin; index < sampled.size(); ++index) {
+                    counts.scatter_add_(
+                        1, sampled[index].reshape({1, 1}),
+                        torch::ones({1, 1}, counts.options()));
+                }
+                auto alpha = torch::pow(
+                    torch::full_like(counts, repetition_penalty), counts);
+                step_logits = torch::where(
+                    step_logits < 0,
+                    step_logits * alpha,
+                    step_logits / alpha);
+            }
+            if (step < minimum_new_tokens) {
+                step_logits.index_put_(
+                    {Slice(), eos_token},
+                    -std::numeric_limits<float>::infinity());
+            }
+            auto token = torch::multinomial(
+                torch::softmax(step_logits, -1), 1)
+                .reshape({1}).to(torch::kInt64);
+            sampled.push_back(token);
+            finished = token.eq(eos_token).all().item<bool>();
+            if (finished) break;
+            current = minicpmo45_embedding(
+                code_embedding, token.unsqueeze(1));
+        }
+        const int64_t returned = std::max<int64_t>(
+            0, static_cast<int64_t>(sampled.size()) - 1);
+        torch::Tensor codes;
+        if (returned > 0) {
+            codes = torch::stack(sampled, 1)
+                .narrow(1, 0, returned)
+                .unsqueeze(-1).contiguous();
+        } else {
+            codes = torch::empty(
+                {1, 0, 1},
+                torch::TensorOptions().device(torch::kCUDA)
+                    .dtype(torch::kInt64));
+        }
+        return {codes, finished};
     }
 
     torch::Tensor generate_official(
@@ -1258,6 +1452,444 @@ struct MiniCPMO45Runtime {
     }
 };
 
+struct MiniCPMO45DuplexSpecialIds {
+    int64_t unit_start = -1;
+    int64_t unit_end = -1;
+    int64_t image_start = -1;
+    int64_t image_end = -1;
+    int64_t slice_start = -1;
+    int64_t slice_end = -1;
+    int64_t listen = -1;
+    int64_t speak = -1;
+    int64_t tts_bos = -1;
+    int64_t tts_eos = -1;
+    int64_t chunk_eos = -1;
+    int64_t chunk_tts_eos = -1;
+    int64_t turn_eos = -1;
+    int64_t tts_pad = -1;
+    int64_t audio_bos = -1;
+
+    static MiniCPMO45DuplexSpecialIds from_tensor(torch::Tensor value) {
+        value = value.to(torch::kCPU, torch::kInt64).contiguous().reshape({-1});
+        if (value.numel() != 15) {
+            throw std::runtime_error(
+                "MiniCPM-o duplex special_ids must contain 15 token IDs");
+        }
+        const auto * ids = value.data_ptr<int64_t>();
+        MiniCPMO45DuplexSpecialIds result;
+        result.unit_start = ids[0];
+        result.unit_end = ids[1];
+        result.image_start = ids[2];
+        result.image_end = ids[3];
+        result.slice_start = ids[4];
+        result.slice_end = ids[5];
+        result.listen = ids[6];
+        result.speak = ids[7];
+        result.tts_bos = ids[8];
+        result.tts_eos = ids[9];
+        result.chunk_eos = ids[10];
+        result.chunk_tts_eos = ids[11];
+        result.turn_eos = ids[12];
+        result.tts_pad = ids[13];
+        result.audio_bos = ids[14];
+        const int64_t minimum = *std::min_element(ids, ids + 15);
+        if (minimum < 0) {
+            throw std::runtime_error(
+                "MiniCPM-o duplex special token IDs must be non-negative");
+        }
+        return result;
+    }
+
+    bool is_chunk_terminator(int64_t token) const {
+        return token == listen || token == chunk_eos ||
+            token == chunk_tts_eos;
+    }
+
+    bool is_special(int64_t token) const {
+        const std::array<int64_t, 15> values = {
+            unit_start, unit_end, image_start, image_end,
+            slice_start, slice_end, listen, speak, tts_bos,
+            tts_eos, chunk_eos, chunk_tts_eos, turn_eos,
+            tts_pad, audio_bos};
+        return std::find(values.begin(), values.end(), token) != values.end();
+    }
+};
+
+struct MiniCPMO45DuplexStepResult {
+    torch::Tensor decision_logits;
+    torch::Tensor audio_embeddings;
+    torch::Tensor generated_ids;
+    torch::Tensor tts_codes;
+    bool is_listen = false;
+    bool end_of_turn = false;
+};
+
+struct MiniCPMO45DuplexSession {
+    MiniCPMO45Runtime & runtime;
+    MiniCPMO45DuplexSpecialIds ids;
+    std::vector<int64_t> forbidden_ids;
+    std::vector<int64_t> generated_text_ids;
+    int64_t audio_chunk_index = 0;
+    int64_t tts_text_start_position = 0;
+    bool current_turn_ended = true;
+    bool greedy = false;
+    double temperature = 0.7;
+    int64_t top_k = 100;
+    double top_p = 0.8;
+    double listen_probability_scale = 1.0;
+    double repetition_penalty = 1.05;
+    int64_t repetition_window = 512;
+
+    MiniCPMO45DuplexSession(
+            MiniCPMO45Runtime & runtime_,
+            MiniCPMO45DuplexSpecialIds ids_,
+            std::vector<int64_t> forbidden_ids_,
+            bool greedy_)
+        : runtime(runtime_), ids(ids_),
+          forbidden_ids(std::move(forbidden_ids_)), greedy(greedy_) {
+        if (std::find(forbidden_ids.begin(), forbidden_ids.end(),
+                ids.chunk_eos) == forbidden_ids.end()) {
+            forbidden_ids.push_back(ids.chunk_eos);
+        }
+        if (std::find(forbidden_ids.begin(), forbidden_ids.end(),
+                ids.tts_pad) == forbidden_ids.end()) {
+            forbidden_ids.push_back(ids.tts_pad);
+        }
+    }
+
+    void prepare(torch::Tensor system_ids) {
+        runtime.language.reset(1);
+        runtime.audio.reset();
+        runtime.tts.reset(1);
+        generated_text_ids.clear();
+        audio_chunk_index = 0;
+        tts_text_start_position = 0;
+        current_turn_ended = true;
+        if (system_ids.defined() && system_ids.numel() > 0) {
+            feed_ids(system_ids);
+        }
+    }
+
+    std::pair<torch::Tensor, torch::Tensor> feed_embeddings(
+            torch::Tensor embeddings,
+            torch::Tensor token_ids = torch::Tensor()) {
+        if (embeddings.dim() == 2) embeddings = embeddings.unsqueeze(0);
+        if (embeddings.dim() != 3 || embeddings.size(0) != 1 ||
+                embeddings.size(2) != runtime.language.c.hidden_size) {
+            throw std::runtime_error(
+                "MiniCPM-o duplex embeddings must have shape [1,tokens,4096]");
+        }
+        if (!token_ids.defined()) {
+            token_ids = torch::zeros(
+                {1, embeddings.size(1)},
+                torch::TensorOptions().dtype(torch::kInt64)
+                    .device(torch::kCUDA));
+        } else {
+            if (token_ids.dim() == 1) token_ids = token_ids.unsqueeze(0);
+            if (token_ids.dim() != 2 || token_ids.size(0) != 1 ||
+                    token_ids.size(1) != embeddings.size(1)) {
+                throw std::runtime_error(
+                    "MiniCPM-o duplex token IDs do not match embeddings");
+            }
+            token_ids = token_ids.to(torch::kCUDA, torch::kInt64).contiguous();
+        }
+        auto hidden = runtime.language.hidden_forward_inputs(
+            token_ids, embeddings.to(torch::kBFloat16).contiguous());
+        auto logits = runtime.language.logits_from_hidden(
+            hidden.index({Slice(), -1, Slice()}));
+        return {logits, hidden};
+    }
+
+    std::pair<torch::Tensor, torch::Tensor> feed_ids(torch::Tensor token_ids) {
+        if (token_ids.dim() == 0) token_ids = token_ids.reshape({1});
+        if (token_ids.dim() == 1) token_ids = token_ids.unsqueeze(0);
+        token_ids = token_ids.to(torch::kCUDA, torch::kInt64).contiguous();
+        return feed_embeddings(
+            runtime.language.embed_forward(token_ids), token_ids);
+    }
+
+    std::pair<torch::Tensor, torch::Tensor> feed_id(int64_t token) {
+        return feed_ids(torch::tensor(
+            std::vector<int64_t>{token},
+            torch::TensorOptions().dtype(torch::kInt64)
+                .device(torch::kCUDA)));
+    }
+
+    torch::Tensor apply_text_sampling_filters(torch::Tensor logits) const {
+        logits = logits.clone().to(torch::kFloat32);
+        if (!generated_text_ids.empty() && repetition_penalty != 1.0) {
+            const size_t begin = generated_text_ids.size() >
+                    static_cast<size_t>(repetition_window)
+                ? generated_text_ids.size() -
+                    static_cast<size_t>(repetition_window)
+                : 0;
+            std::vector<int64_t> recent(
+                generated_text_ids.begin() +
+                    static_cast<std::ptrdiff_t>(begin),
+                generated_text_ids.end());
+            std::sort(recent.begin(), recent.end());
+            recent.erase(std::unique(recent.begin(), recent.end()), recent.end());
+            auto recent_tensor = torch::tensor(
+                recent, torch::TensorOptions().dtype(torch::kInt64)
+                    .device(logits.device()));
+            auto selected = logits.index_select(1, recent_tensor);
+            selected = repetition_penalty > 1.0
+                ? selected / repetition_penalty
+                : selected * (1.0 / repetition_penalty);
+            logits.index_copy_(1, recent_tensor, selected);
+        }
+        if (listen_probability_scale != 1.0) {
+            logits.index_put_(
+                {Slice(), ids.listen},
+                logits.index({Slice(), ids.listen}) *
+                    listen_probability_scale);
+        }
+        if (!forbidden_ids.empty()) {
+            auto forbidden = torch::tensor(
+                forbidden_ids,
+                torch::TensorOptions().dtype(torch::kInt64)
+                    .device(logits.device()));
+            logits.index_fill_(
+                1, forbidden,
+                -std::numeric_limits<float>::infinity());
+        }
+        if (greedy) return logits;
+        logits = logits / temperature;
+        if (top_k > 0 && top_k < logits.size(1)) {
+            auto values = std::get<0>(logits.topk(top_k, -1, true, true));
+            auto threshold = values.select(1, top_k - 1).unsqueeze(1);
+            logits = logits.masked_fill(
+                logits < threshold,
+                -std::numeric_limits<float>::infinity());
+        }
+        if (top_p < 1.0) {
+            auto sorted = logits.sort(-1, true);
+            auto sorted_logits = std::get<0>(sorted);
+            auto sorted_indices = std::get<1>(sorted);
+            auto cumulative = torch::cumsum(
+                torch::softmax(sorted_logits, -1), -1);
+            auto remove = cumulative > top_p;
+            auto shifted = torch::zeros_like(remove);
+            shifted.narrow(1, 1, remove.size(1) - 1)
+                .copy_(remove.narrow(1, 0, remove.size(1) - 1));
+            sorted_logits = sorted_logits.masked_fill(
+                shifted, -std::numeric_limits<float>::infinity());
+            logits = torch::full_like(
+                logits, -std::numeric_limits<float>::infinity());
+            logits.scatter_(1, sorted_indices, sorted_logits);
+        }
+        return logits;
+    }
+
+    int64_t sample_text_token(torch::Tensor logits, bool force_listen) const {
+        if (force_listen) return ids.listen;
+        auto original = logits.to(torch::kFloat32);
+        auto first = greedy
+            ? torch::argmax(original, -1)
+            : torch::multinomial(torch::softmax(original, -1), 1)
+                .reshape({1});
+        const int64_t first_id = first.item<int64_t>();
+        if (first_id == ids.chunk_eos) return first_id;
+        auto filtered = apply_text_sampling_filters(original);
+        auto sampled = greedy
+            ? torch::argmax(filtered, -1)
+            : torch::multinomial(torch::softmax(filtered, -1), 1)
+                .reshape({1});
+        return sampled.item<int64_t>();
+    }
+
+    MiniCPMO45DuplexStepResult run_step(
+            torch::Tensor pixels,
+            torch::Tensor patch_mask,
+            torch::Tensor target_sizes,
+            torch::Tensor image_slice_counts,
+            torch::Tensor audio_features,
+            int64_t audio_prefix_extra_frames,
+            int64_t audio_suffix_extra_frames,
+            torch::Tensor text_ids,
+            int64_t max_new_speak_tokens,
+            bool force_listen) {
+        if (max_new_speak_tokens < 2) {
+            throw std::runtime_error(
+                "MiniCPM-o duplex generation requires at least two token slots");
+        }
+        auto pending = feed_id(ids.unit_start);
+        torch::Tensor generation_logits;
+        bool has_content = false;
+        torch::Tensor audio_embeddings;
+
+        if (pixels.defined()) {
+            if (!patch_mask.defined() || !target_sizes.defined()) {
+                throw std::runtime_error(
+                    "MiniCPM-o duplex image pixels require patch mask and target sizes");
+            }
+            auto vision_states = runtime.vision.forward(
+                pixels.to(torch::kCUDA), patch_mask, target_sizes);
+            auto image_embeddings = runtime.resampler.forward(
+                vision_states, target_sizes);
+            std::vector<int64_t> counts;
+            if (image_slice_counts.defined()) {
+                auto count_tensor = image_slice_counts
+                    .to(torch::kCPU, torch::kInt64).contiguous().reshape({-1});
+                const auto * values = count_tensor.data_ptr<int64_t>();
+                counts.assign(values, values + count_tensor.numel());
+            } else {
+                counts.assign(
+                    static_cast<size_t>(image_embeddings.size(0)), 1);
+            }
+            int64_t offset = 0;
+            for (const int64_t count : counts) {
+                if (count <= 0 || offset + count > image_embeddings.size(0)) {
+                    throw std::runtime_error(
+                        "MiniCPM-o duplex image slice counts are invalid");
+                }
+                pending = feed_id(ids.image_start);
+                pending = feed_embeddings(image_embeddings.index({offset}));
+                pending = feed_id(ids.image_end);
+                ++offset;
+                for (int64_t slice = 1; slice < count; ++slice) {
+                    pending = feed_id(ids.slice_start);
+                    pending = feed_embeddings(image_embeddings.index({offset}));
+                    pending = feed_id(ids.slice_end);
+                    ++offset;
+                }
+            }
+            if (offset != image_embeddings.size(0)) {
+                throw std::runtime_error(
+                    "MiniCPM-o duplex image slice counts do not cover embeddings");
+            }
+            generation_logits = pending.first;
+            has_content = true;
+        }
+
+        if (audio_features.defined()) {
+            audio_embeddings = runtime.audio.forward_streaming(
+                audio_features.to(torch::kCUDA),
+                audio_prefix_extra_frames,
+                audio_suffix_extra_frames);
+            pending = feed_embeddings(audio_embeddings);
+            generation_logits = pending.first;
+            ++audio_chunk_index;
+            has_content = true;
+        }
+
+        if (text_ids.defined() && text_ids.numel() > 0) {
+            pending = feed_ids(text_ids);
+            if (!generation_logits.defined()) {
+                generation_logits = pending.first;
+            }
+            has_content = true;
+        }
+        if (!has_content) {
+            throw std::runtime_error(
+                "MiniCPM-o duplex step contains no image, audio, or text input");
+        }
+        if (pixels.defined() && !audio_features.defined()) {
+            ++audio_chunk_index;
+        }
+
+        MiniCPMO45DuplexStepResult result;
+        result.decision_logits = generation_logits;
+        result.audio_embeddings = audio_embeddings;
+        std::vector<int64_t> generated;
+        std::vector<int64_t> spoken_ids;
+        std::vector<torch::Tensor> spoken_hidden;
+        auto logits = generation_logits;
+        bool force_current = force_listen;
+        for (int64_t index = 0; index < max_new_speak_tokens; ++index) {
+            if (index == max_new_speak_tokens - 1) {
+                feed_id(ids.chunk_eos);
+                generated.push_back(ids.chunk_eos);
+                break;
+            }
+            const bool forced_decision = force_current;
+            int64_t token = sample_text_token(logits, force_current);
+            force_current = false;
+            if (!forced_decision && token != ids.chunk_eos) {
+                generated_text_ids.push_back(token);
+            }
+            if (!forced_decision && token == ids.listen &&
+                    !current_turn_ended) {
+                token = ids.tts_bos;
+            }
+            generated.push_back(token);
+            result.is_listen = token == ids.listen;
+            if (ids.is_chunk_terminator(token)) {
+                pending = feed_id(token);
+                break;
+            }
+
+            current_turn_ended = false;
+            pending = feed_id(token);
+            logits = pending.first;
+            result.end_of_turn = token == ids.turn_eos;
+            if (result.end_of_turn) current_turn_ended = true;
+            if (index != 0) {
+                spoken_ids.push_back(token);
+                spoken_hidden.push_back(
+                    pending.second.index({Slice(), -1, Slice()}));
+            }
+        }
+        feed_id(ids.unit_end);
+
+        result.generated_ids = torch::tensor(
+            generated,
+            torch::TensorOptions().dtype(torch::kInt64)
+                .device(torch::kCUDA));
+        if (!result.is_listen) {
+            torch::Tensor text_id_tensor;
+            torch::Tensor hidden_tensor;
+            if (spoken_ids.empty()) {
+                text_id_tensor = torch::empty(
+                    {1, 0}, torch::TensorOptions().dtype(torch::kInt64)
+                        .device(torch::kCUDA));
+                hidden_tensor = torch::empty(
+                    {1, 0, runtime.language.c.hidden_size},
+                    torch::TensorOptions().dtype(torch::kBFloat16)
+                        .device(torch::kCUDA));
+            } else {
+                text_id_tensor = torch::tensor(
+                    spoken_ids,
+                    torch::TensorOptions().dtype(torch::kInt64)
+                        .device(torch::kCUDA)).unsqueeze(0);
+                hidden_tensor = torch::stack(spoken_hidden, 1)
+                    .to(torch::kBFloat16).contiguous();
+            }
+            auto condition = runtime.tts.duplex_condition(
+                text_id_tensor, hidden_tensor, ids.audio_bos);
+            if (tts_text_start_position == 0) runtime.tts.reset(1);
+            if (runtime.tts.cache_position != tts_text_start_position) {
+                throw std::runtime_error(
+                    "MiniCPM-o duplex TTS cache position is inconsistent");
+            }
+            int64_t minimum_codes = 26;
+            if (result.end_of_turn || tts_text_start_position == 0) {
+                minimum_codes = 0;
+            }
+            auto tts_result = runtime.tts.generate_duplex_chunk(
+                condition, 26, minimum_codes, 6561, 0.8, 1.05);
+            result.tts_codes = tts_result.codes;
+            if (result.end_of_turn) {
+                runtime.tts.reset(1);
+                tts_text_start_position = 0;
+            } else {
+                tts_text_start_position +=
+                    condition.size(1) + result.tts_codes.size(1);
+                if (runtime.tts.cache_position != tts_text_start_position) {
+                    throw std::runtime_error(
+                        "MiniCPM-o duplex TTS cache did not advance exactly");
+                }
+            }
+        } else {
+            result.tts_codes = torch::empty(
+                {1, 0, 1},
+                torch::TensorOptions().dtype(torch::kInt64)
+                    .device(torch::kCUDA));
+        }
+        return result;
+    }
+};
+
 static torch::Tensor minicpmo45_load_tensor(
         const std::string & path,
         bool required) {
@@ -1297,7 +1929,141 @@ static void minicpmo45_save_tensor(
         const torch::Tensor & value,
         const std::string & path) {
     if (!value.defined()) return;
+    const std::filesystem::path output(path);
+    if (output.has_parent_path()) {
+        std::filesystem::create_directories(output.parent_path());
+    }
     minicpmo45_write_pickle_tensor(value, path);
+}
+
+static int64_t minicpmo45_load_optional_scalar(
+        const std::string & path,
+        int64_t fallback) {
+    auto value = minicpmo45_load_tensor(path, false);
+    if (!value.defined()) return fallback;
+    if (value.numel() != 1) {
+        throw std::runtime_error(
+            "MiniCPM-o scalar tensor must contain one value: " + path);
+    }
+    return value.to(torch::kCPU, torch::kInt64).item<int64_t>();
+}
+
+static std::string minicpmo45_duplex_step_prefix(
+        const std::string & prefix,
+        int64_t step) {
+    std::ostringstream stream;
+    stream << prefix << ".step" << std::setfill('0')
+           << std::setw(4) << step;
+    return stream.str();
+}
+
+static int run_minicpmo45_duplex(
+        const std::string & mfq_path,
+        const std::string & config_path,
+        const std::string & input_prefix,
+        const std::string & output_prefix,
+        int64_t context_size,
+        int64_t steps,
+        int64_t max_speak_tokens,
+        bool greedy,
+        int64_t seed) {
+    torch::NoGradGuard no_grad;
+    g_profiler.enabled = false;
+    if (input_prefix.empty() || output_prefix.empty() || steps <= 0 ||
+            max_speak_tokens < 2 || seed < 0) {
+        throw std::runtime_error(
+            "MiniCPM-o duplex mode requires prefixes, positive steps, "
+            "at least two generation slots, and a non-negative seed");
+    }
+    torch::manual_seed(seed);
+    torch::cuda::manual_seed_all(seed);
+    auto runtime = MiniCPMO45Runtime::load(
+        mfq_path, config_path, context_size);
+    auto special_ids = MiniCPMO45DuplexSpecialIds::from_tensor(
+        minicpmo45_load_tensor(input_prefix + ".special_ids.pt", true));
+    std::vector<int64_t> forbidden_ids;
+    auto forbidden = minicpmo45_load_tensor(
+        input_prefix + ".forbidden_ids.pt", false);
+    if (forbidden.defined()) {
+        forbidden = forbidden.to(torch::kCPU, torch::kInt64)
+            .contiguous().reshape({-1});
+        const auto * values = forbidden.data_ptr<int64_t>();
+        forbidden_ids.assign(values, values + forbidden.numel());
+    }
+    MiniCPMO45DuplexSession session(
+        runtime, special_ids, std::move(forbidden_ids), greedy);
+    const auto system_ids = minicpmo45_load_tensor(
+        input_prefix + ".system_ids.pt", false);
+    session.prepare(system_ids);
+
+    int64_t listen_steps = 0;
+    int64_t speak_steps = 0;
+    for (int64_t step = 0; step < steps; ++step) {
+        const std::string input = minicpmo45_duplex_step_prefix(
+            input_prefix, step);
+        const std::string output = minicpmo45_duplex_step_prefix(
+            output_prefix, step);
+        const bool reset_session = minicpmo45_load_optional_scalar(
+            input + ".reset_session.pt", 0) != 0;
+        if (reset_session) session.prepare(system_ids);
+        const auto pixels = minicpmo45_load_tensor(
+            input + ".pixel_values.pt", false);
+        const auto patch_mask = minicpmo45_load_tensor(
+            input + ".patch_mask.pt", false);
+        const auto target_sizes = minicpmo45_load_tensor(
+            input + ".target_sizes.pt", false);
+        const auto image_slice_counts = minicpmo45_load_tensor(
+            input + ".image_slice_counts.pt", false);
+        const auto audio_features = minicpmo45_load_tensor(
+            input + ".audio_features.pt", false);
+        const auto text_ids = minicpmo45_load_tensor(
+            input + ".text_ids.pt", false);
+        const int64_t prefix_extra = minicpmo45_load_optional_scalar(
+            input + ".audio_prefix_extra_frames.pt",
+            session.audio_chunk_index == 0 ? 0 : 2);
+        const int64_t suffix_extra = minicpmo45_load_optional_scalar(
+            input + ".audio_suffix_extra_frames.pt", 2);
+        const bool force_listen = minicpmo45_load_optional_scalar(
+            input + ".force_listen.pt", 0) != 0;
+
+        auto result = session.run_step(
+            pixels, patch_mask, target_sizes, image_slice_counts,
+            audio_features, prefix_extra, suffix_extra, text_ids,
+            max_speak_tokens, force_listen);
+        minicpmo45_save_tensor(
+            result.decision_logits, output + ".decision_logits.pt");
+        minicpmo45_save_tensor(
+            result.audio_embeddings, output + ".audio_embeddings.pt");
+        minicpmo45_save_tensor(
+            result.generated_ids, output + ".generated_ids.pt");
+        minicpmo45_save_tensor(
+            result.tts_codes, output + ".tts_codes.pt");
+        minicpmo45_save_tensor(
+            torch::tensor(
+                std::vector<int64_t>{
+                    result.is_listen ? 1 : 0,
+                    result.end_of_turn ? 1 : 0,
+                    runtime.language.cache_pos,
+                    runtime.audio.cache_length(),
+                    runtime.tts.cache_position,
+                    session.audio_chunk_index},
+                torch::TensorOptions().dtype(torch::kInt64)),
+            output + ".state.pt");
+        if (result.is_listen) {
+            ++listen_steps;
+        } else {
+            ++speak_steps;
+        }
+    }
+    std::cout << "minicpmo45_duplex=ok"
+              << " steps=" << steps
+              << " listens=" << listen_steps
+              << " speaks=" << speak_steps
+              << " language_cache=" << runtime.language.cache_pos
+              << " audio_cache=" << runtime.audio.cache_length()
+              << " tts_cache=" << runtime.tts.cache_position
+              << " seed=" << seed << "\n";
+    return 0;
 }
 
 static int run_minicpmo45_composite(
