@@ -1036,6 +1036,16 @@ struct RequestWork {
     MfqTokenConstraintPtr token_constraint;
 };
 
+static bool valid_mfq_session_id(const std::string & session_id) {
+    return !session_id.empty() && session_id.size() <= 128 &&
+        std::all_of(
+            session_id.begin(), session_id.end(),
+            [](unsigned char value) {
+                return std::isalnum(value) != 0 || value == '-' ||
+                    value == '_' || value == '.' || value == ':';
+            });
+}
+
 static RequestWork parse_work(const json & body, bool chat, const LlamaTokenizer & tokenizer,
                               const common_chat_templates * templates,
                               int64_t max_context,
@@ -1171,6 +1181,22 @@ static RequestWork parse_work(const json & body, bool chat, const LlamaTokenizer
     }
     work.prompt = tokenizer.tokenize(prompt, parse_special);
     if (work.prompt.empty()) throw ApiError(400, "invalid_request_error", "prompt tokenized to an empty sequence", "prompt");
+    if (body.contains("mfq_session_id") && !body["mfq_session_id"].is_null()) {
+        if (!body["mfq_session_id"].is_string()) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "mfq_session_id must be a string", "mfq_session_id");
+        }
+        work.cache_plan.session_id =
+            body["mfq_session_id"].get<std::string>();
+        if (!valid_mfq_session_id(work.cache_plan.session_id)) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "mfq_session_id must contain 1 to 128 safe identifier bytes",
+                "mfq_session_id");
+        }
+        work.cache_plan.stable_prefix_tokens = work.prompt.size();
+    }
     if (chat && model_type == "deepseek_v4" &&
         boolean_field(body, "add_generation_prompt", true)) {
         const std::string stable_marker =
@@ -1962,7 +1988,8 @@ int run_mfq_server(
         const MfqServerConfig & config,
         const MfqGenerateFn & generate,
         const MfqReloadFn & reload,
-        const MfqDuplexBackend & duplex) {
+        const MfqDuplexBackend & duplex,
+        const MfqSessionControl & session_control) {
     if (config.tokenizer_gguf.empty() &&
         config.tokenizer_model.empty()) {
         throw std::runtime_error(
@@ -2050,7 +2077,7 @@ int run_mfq_server(
     server.set_default_headers({
         {"Access-Control-Allow-Origin", "*"},
         {"Access-Control-Allow-Headers", "Authorization, Content-Type"},
-        {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"},
+        {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"},
         {"X-Content-Type-Options", "nosniff"},
     });
 
@@ -2472,7 +2499,8 @@ int run_mfq_server(
             {"endpoints", {
                 "/v1/chat/completions", "/v1/completions", "/v1/models",
                 "/health", "/api/status", "/api/reload", "/backend",
-                "/admin/",
+                "/api/runtime/sessions/fork",
+                "/api/runtime/sessions/{id}", "/admin/",
             }},
         });
     });
@@ -2508,6 +2536,78 @@ int run_mfq_server(
         status["duplex_active"] = duplex_is_active();
         set_json(res, status);
     });
+
+    server.Post("/api/runtime/sessions/fork", [&] (
+            const httplib::Request & req, httplib::Response & res) {
+        if (!authorized(req, res, config.api_key)) return;
+        if (!session_control.fork) {
+            set_json(res, error_body(
+                "this runtime does not support session forks",
+                "unsupported_operation"), 501);
+            return;
+        }
+        try {
+            const json body = parse_body(req);
+            const auto read_session_id = [&](const char * field) {
+                if (!body.contains(field) || !body[field].is_string()) {
+                    throw ApiError(
+                        400, "invalid_request_error",
+                        std::string(field) + " must be a string", field);
+                }
+                auto session_id = body[field].get<std::string>();
+                if (!valid_mfq_session_id(session_id)) {
+                    throw ApiError(
+                        400, "invalid_request_error",
+                        std::string(field) +
+                            " must contain 1 to 128 safe identifier bytes",
+                        field);
+                }
+                return session_id;
+            };
+            const std::string source_session_id =
+                read_session_id("source_session_id");
+            const std::string target_session_id =
+                read_session_id("target_session_id");
+            if (source_session_id == target_session_id) {
+                throw ApiError(
+                    400, "invalid_request_error",
+                    "source and target sessions must differ",
+                    "target_session_id");
+            }
+            const size_t copied = session_control.fork(
+                source_session_id, target_session_id);
+            set_json(res, {
+                {"status", "ok"},
+                {"copied_snapshots", copied},
+            });
+        } catch (const ApiError & error) {
+            handle_api_error(res, error);
+        } catch (const std::exception & error) {
+            set_json(res, error_body(error.what(), "server_error"), 500);
+        }
+    });
+
+    server.Delete(
+        R"(/api/runtime/sessions/([A-Za-z0-9._:-]{1,128}))",
+        [&] (const httplib::Request & req, httplib::Response & res) {
+            if (!authorized(req, res, config.api_key)) return;
+            if (!session_control.close) {
+                set_json(res, error_body(
+                    "this runtime does not support session close",
+                    "unsupported_operation"), 501);
+                return;
+            }
+            try {
+                const std::string session_id = req.matches[1].str();
+                const size_t released = session_control.close(session_id);
+                set_json(res, {
+                    {"status", "ok"},
+                    {"released_snapshots", released},
+                });
+            } catch (const std::exception & error) {
+                set_json(res, error_body(error.what(), "server_error"), 500);
+            }
+        });
 
     server.Post("/api/reload", [&](const httplib::Request & req, httplib::Response & res) {
         if (!authorized(req, res, config.api_key)) return;

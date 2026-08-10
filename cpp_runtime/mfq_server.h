@@ -61,6 +61,7 @@ struct MfqRuntimeProfile {
 // requests.  A runtime may retain this exact token prefix after generation and
 // reuse it only when the next request starts with the same token sequence.
 struct MfqPromptCachePlan {
+    std::string session_id;
     size_t stable_prefix_tokens = 0;
 };
 
@@ -159,11 +160,19 @@ using MfqGenerateFn = std::function<int32_t(
     const MfqTokenConstraintPtr & token_constraint)>;
 using MfqReloadFn = std::function<int64_t(int64_t context_size)>;
 
+struct MfqSessionControl {
+    std::function<size_t(
+        const std::string & source_session_id,
+        const std::string & target_session_id)> fork;
+    std::function<size_t(const std::string & session_id)> close;
+};
+
 int run_mfq_server(
     const MfqServerConfig & config,
     const MfqGenerateFn & generate,
     const MfqReloadFn & reload = {},
-    const MfqDuplexBackend & duplex = {});
+    const MfqDuplexBackend & duplex = {},
+    const MfqSessionControl & session_control = {});
 MfqTokenizerProbe probe_mfq_tokenizer(
     const std::vector<uint8_t> & tokenizer_gguf,
     const std::string & text,

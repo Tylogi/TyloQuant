@@ -17207,6 +17207,182 @@ static std::unique_ptr<Block> load_block(
     throw std::runtime_error("unsupported layer type: " + type);
 }
 
+struct FullBlockSessionState {
+    torch::Tensor k;
+    torch::Tensor v;
+    int64_t capacity = 0;
+    bool ring = false;
+};
+
+enum class TextSessionStateKind {
+    Unsupported,
+    FullAttention,
+    DeepseekV4,
+    GlmDsa,
+};
+
+struct Dsv4PoolSessionState {
+    int64_t ratio = 0;
+    int64_t head_dim = 0;
+    int64_t cache_quant_mode = 0;
+    int64_t capacity = 0;
+    bool overlap = false;
+    torch::Tensor state_kv;
+    torch::Tensor state_gate;
+    torch::Tensor previous_kv;
+    torch::Tensor previous_gate;
+    torch::Tensor pool;
+};
+
+struct Dsv4BlockSessionState {
+    torch::Tensor local_cache;
+    Dsv4PoolSessionState compressor;
+    Dsv4PoolSessionState indexer_compressor;
+};
+
+struct GlmDsaBlockSessionState {
+    torch::Tensor kv_cache;
+    torch::Tensor index_cache;
+    int64_t kv_capacity = 0;
+    int64_t index_capacity = 0;
+    bool full_indexer = false;
+};
+
+struct TextSessionState {
+    std::vector<int64_t> tokens;
+    TextSessionStateKind kind = TextSessionStateKind::Unsupported;
+    std::vector<FullBlockSessionState> blocks;
+    std::vector<Dsv4BlockSessionState> dsv4_blocks;
+    std::vector<GlmDsaBlockSessionState> glm_dsa_blocks;
+    int64_t cache_pos = 0;
+    size_t bytes = 0;
+    uint64_t last_used = 0;
+};
+
+static size_t session_tensor_bytes(const torch::Tensor & tensor) {
+    if (!tensor.defined()) return 0;
+    return static_cast<size_t>(tensor.numel()) * tensor.element_size();
+}
+
+static bool session_tensor_layout_matches(
+        const torch::Tensor & target,
+        const torch::Tensor & source) {
+    return target.defined() && source.defined() &&
+        target.sizes() == source.sizes() &&
+        target.scalar_type() == source.scalar_type() &&
+        target.device() == source.device();
+}
+
+static void restore_session_tensor(
+        torch::Tensor & target,
+        const torch::Tensor & source) {
+    if (!source.defined()) {
+        target = torch::Tensor();
+        return;
+    }
+    if (!session_tensor_layout_matches(target, source)) {
+        target = torch::empty(source.sizes(), source.options());
+    }
+    target.copy_(source);
+}
+
+static void restore_session_prefix_tensor(
+        torch::Tensor & target,
+        const torch::Tensor & source,
+        int64_t dimension,
+        int64_t capacity) {
+    if (!source.defined() || dimension < 0 ||
+            dimension >= source.dim() || capacity <= 0 ||
+            source.size(dimension) > capacity) {
+        throw std::runtime_error("session prefix tensor layout is invalid");
+    }
+    auto target_shape = source.sizes().vec();
+    target_shape.at(static_cast<size_t>(dimension)) = capacity;
+    const bool compatible = target.defined() &&
+        target.sizes() == torch::IntArrayRef(target_shape) &&
+        target.scalar_type() == source.scalar_type() &&
+        target.device() == source.device();
+    if (!compatible) {
+        target = torch::empty(target_shape, source.options());
+    }
+    if (source.size(dimension) > 0) {
+        target.narrow(dimension, 0, source.size(dimension)).copy_(source);
+    }
+}
+
+static Dsv4PoolSessionState capture_dsv4_pool_session_state(
+        const Dsv4PoolState & source,
+        int64_t cache_pos,
+        size_t & bytes) {
+    Dsv4PoolSessionState state;
+    state.ratio = source.ratio;
+    state.head_dim = source.head_dim;
+    state.cache_quant_mode = source.cache_quant_mode;
+    state.capacity = source.capacity;
+    state.overlap = source.overlap;
+    if (source.ratio <= 0) return state;
+    if (source.capacity <= 0 || !source.state_kv.defined() ||
+            !source.state_gate.defined() || !source.pool.defined() ||
+            source.pool.dim() != 3 || source.pool.size(0) != 1 ||
+            source.pool.size(1) != source.capacity ||
+            (source.overlap &&
+             (!source.previous_kv.defined() ||
+              !source.previous_gate.defined()))) {
+        throw std::runtime_error(
+            "DeepSeek V4 session compressor state is unavailable");
+    }
+    const int64_t visible = std::min<int64_t>(
+        cache_pos / source.ratio, source.capacity);
+    state.state_kv = source.state_kv.clone();
+    state.state_gate = source.state_gate.clone();
+    if (source.overlap) {
+        state.previous_kv = source.previous_kv.clone();
+        state.previous_gate = source.previous_gate.clone();
+    }
+    state.pool = source.pool.narrow(1, 0, visible).clone();
+    bytes += session_tensor_bytes(state.state_kv);
+    bytes += session_tensor_bytes(state.state_gate);
+    bytes += session_tensor_bytes(state.previous_kv);
+    bytes += session_tensor_bytes(state.previous_gate);
+    bytes += session_tensor_bytes(state.pool);
+    return state;
+}
+
+static void restore_dsv4_pool_session_state(
+        Dsv4PoolState & target,
+        const Dsv4PoolSessionState & state) {
+    if (target.ratio != state.ratio ||
+            target.head_dim != state.head_dim ||
+            target.cache_quant_mode != state.cache_quant_mode ||
+            target.overlap != state.overlap) {
+        throw std::runtime_error(
+            "DeepSeek V4 session compressor configuration changed");
+    }
+    if (state.ratio <= 0) return;
+    if (state.capacity <= 0 || !state.state_kv.defined() ||
+            !state.state_gate.defined() || !state.pool.defined() ||
+            state.pool.dim() != 3 || state.pool.size(0) != 1 ||
+            state.pool.size(1) > state.capacity ||
+            (state.overlap &&
+             (!state.previous_kv.defined() ||
+              !state.previous_gate.defined()))) {
+        throw std::runtime_error(
+            "DeepSeek V4 saved compressor state is invalid");
+    }
+    target.capacity = state.capacity;
+    restore_session_tensor(target.state_kv, state.state_kv);
+    restore_session_tensor(target.state_gate, state.state_gate);
+    if (state.overlap) {
+        restore_session_tensor(target.previous_kv, state.previous_kv);
+        restore_session_tensor(target.previous_gate, state.previous_gate);
+    } else {
+        target.previous_kv = torch::Tensor();
+        target.previous_gate = torch::Tensor();
+    }
+    restore_session_prefix_tensor(
+        target.pool, state.pool, 1, state.capacity);
+}
+
 struct Model {
     Config c;
     RopeCache rope;
@@ -17235,6 +17411,235 @@ struct Model {
             c10::cuda::CUDAGuard guard(b->cuda_device);
             b->reset(B);
         }
+    }
+
+    TextSessionStateKind text_session_state_kind() const {
+        if (blocks.empty()) return TextSessionStateKind::Unsupported;
+        if (std::all_of(
+            blocks.begin(), blocks.end(),
+            [](const std::unique_ptr<Block> & block) {
+                return dynamic_cast<const FullBlock *>(block.get()) != nullptr;
+            })) {
+            return TextSessionStateKind::FullAttention;
+        }
+        if (std::all_of(
+            blocks.begin(), blocks.end(),
+            [](const std::unique_ptr<Block> & block) {
+                return dynamic_cast<const Dsv4Block *>(block.get()) != nullptr;
+            })) {
+            return TextSessionStateKind::DeepseekV4;
+        }
+        if (std::all_of(
+            blocks.begin(), blocks.end(),
+            [](const std::unique_ptr<Block> & block) {
+                return dynamic_cast<const GlmDsaBlock *>(block.get()) != nullptr;
+            })) {
+            return TextSessionStateKind::GlmDsa;
+        }
+        return TextSessionStateKind::Unsupported;
+    }
+
+    bool supports_text_session_state() const {
+        return text_session_state_kind() != TextSessionStateKind::Unsupported;
+    }
+
+    TextSessionState capture_text_session_state(
+            const std::vector<int64_t> & tokens) const {
+        if (!supports_text_session_state()) {
+            throw std::runtime_error(
+                "text session state is unsupported by this block layout");
+        }
+        if (cache_pos <= 0 ||
+                static_cast<size_t>(cache_pos) != tokens.size()) {
+            throw std::runtime_error(
+                "text session token count does not match the model cache");
+        }
+        TextSessionState state;
+        state.tokens = tokens;
+        state.kind = text_session_state_kind();
+        state.cache_pos = cache_pos;
+        if (state.kind == TextSessionStateKind::FullAttention) {
+            state.blocks.reserve(blocks.size());
+            for (const auto & block : blocks) {
+                c10::cuda::CUDAGuard guard(block->cuda_device);
+                const auto * full =
+                    dynamic_cast<const FullBlock *>(block.get());
+                if (full == nullptr || !full->cache.k.defined() ||
+                        !full->cache.v.defined()) {
+                    throw std::runtime_error(
+                        "full-attention KV cache is unavailable");
+                }
+                FullBlockSessionState saved;
+                saved.capacity = full->cache.k.size(2);
+                saved.ring = full->cache.ring;
+                const int64_t saved_tokens = saved.ring
+                    ? saved.capacity
+                    : std::min<int64_t>(cache_pos, saved.capacity);
+                saved.k = full->cache.k.narrow(
+                    2, 0, saved_tokens).clone();
+                saved.v = full->cache.v.narrow(
+                    2, 0, saved_tokens).clone();
+                state.bytes += session_tensor_bytes(saved.k);
+                state.bytes += session_tensor_bytes(saved.v);
+                state.blocks.push_back(std::move(saved));
+            }
+        } else if (state.kind == TextSessionStateKind::DeepseekV4) {
+            state.dsv4_blocks.reserve(blocks.size());
+            for (const auto & block : blocks) {
+                c10::cuda::CUDAGuard guard(block->cuda_device);
+                const auto * dsv4 =
+                    dynamic_cast<const Dsv4Block *>(block.get());
+                if (dsv4 == nullptr || !dsv4->local_cache.defined()) {
+                    throw std::runtime_error(
+                        "DeepSeek V4 local session cache is unavailable");
+                }
+                Dsv4BlockSessionState saved;
+                saved.local_cache = dsv4->local_cache.clone();
+                state.bytes += session_tensor_bytes(saved.local_cache);
+                saved.compressor = capture_dsv4_pool_session_state(
+                    dsv4->compressor, cache_pos, state.bytes);
+                saved.indexer_compressor =
+                    capture_dsv4_pool_session_state(
+                        dsv4->indexer_compressor,
+                        cache_pos, state.bytes);
+                state.dsv4_blocks.push_back(std::move(saved));
+            }
+        } else if (state.kind == TextSessionStateKind::GlmDsa) {
+            state.glm_dsa_blocks.reserve(blocks.size());
+            for (const auto & block : blocks) {
+                c10::cuda::CUDAGuard guard(block->cuda_device);
+                const auto * glm =
+                    dynamic_cast<const GlmDsaBlock *>(block.get());
+                if (glm == nullptr || !glm->kv_cache.defined() ||
+                        glm->kv_cache.dim() != 4 ||
+                        glm->kv_cache.size(0) != 1 ||
+                        cache_pos > glm->kv_cache.size(2)) {
+                    throw std::runtime_error(
+                        "GLM DSA session MLA cache is unavailable");
+                }
+                GlmDsaBlockSessionState saved;
+                saved.full_indexer = glm->full_indexer;
+                saved.kv_capacity = glm->kv_cache.size(2);
+                saved.kv_cache = glm->kv_cache.narrow(
+                    2, 0, cache_pos).clone();
+                state.bytes += session_tensor_bytes(saved.kv_cache);
+                if (glm->full_indexer) {
+                    if (!glm->index_cache.defined() ||
+                            glm->index_cache.dim() != 3 ||
+                            glm->index_cache.size(0) != 1 ||
+                            cache_pos > glm->index_cache.size(1)) {
+                        throw std::runtime_error(
+                            "GLM DSA session index cache is unavailable");
+                    }
+                    saved.index_capacity = glm->index_cache.size(1);
+                    saved.index_cache = glm->index_cache.narrow(
+                        1, 0, cache_pos).clone();
+                    state.bytes += session_tensor_bytes(saved.index_cache);
+                }
+                state.glm_dsa_blocks.push_back(std::move(saved));
+            }
+        }
+        return state;
+    }
+
+    void restore_text_session_state(const TextSessionState & state) {
+        if (!supports_text_session_state() ||
+                state.kind != text_session_state_kind() ||
+                state.cache_pos <= 0 ||
+                static_cast<size_t>(state.cache_pos) != state.tokens.size()) {
+            throw std::runtime_error("text session state is incompatible");
+        }
+        if (state.kind == TextSessionStateKind::FullAttention) {
+            if (state.blocks.size() != blocks.size()) {
+                throw std::runtime_error(
+                    "full-attention session layer count changed");
+            }
+            for (size_t index = 0; index < blocks.size(); ++index) {
+                auto & block = blocks[index];
+                c10::cuda::CUDAGuard guard(block->cuda_device);
+                auto * full = dynamic_cast<FullBlock *>(block.get());
+                const auto & saved = state.blocks[index];
+                if (full == nullptr || !saved.k.defined() ||
+                        !saved.v.defined() || saved.capacity <= 0 ||
+                        saved.k.dim() != 4 ||
+                        saved.v.sizes() != saved.k.sizes() ||
+                        saved.k.size(0) != 1 ||
+                        saved.k.size(2) > saved.capacity) {
+                    throw std::runtime_error(
+                        "full-attention session KV layout is invalid");
+                }
+                restore_session_prefix_tensor(
+                    full->cache.k, saved.k, 2, saved.capacity);
+                restore_session_prefix_tensor(
+                    full->cache.v, saved.v, 2, saved.capacity);
+                full->cache.ring = saved.ring;
+            }
+        } else if (state.kind == TextSessionStateKind::DeepseekV4) {
+            if (state.dsv4_blocks.size() != blocks.size()) {
+                throw std::runtime_error(
+                    "DeepSeek V4 session layer count changed");
+            }
+            for (size_t index = 0; index < blocks.size(); ++index) {
+                auto & block = blocks[index];
+                c10::cuda::CUDAGuard guard(block->cuda_device);
+                auto * dsv4 = dynamic_cast<Dsv4Block *>(block.get());
+                const auto & saved = state.dsv4_blocks[index];
+                if (dsv4 == nullptr || !saved.local_cache.defined() ||
+                        saved.local_cache.dim() != 3 ||
+                        saved.local_cache.size(0) != 1 ||
+                        saved.local_cache.size(1) != 128) {
+                    throw std::runtime_error(
+                        "DeepSeek V4 saved local cache is invalid");
+                }
+                restore_session_tensor(
+                    dsv4->local_cache, saved.local_cache);
+                restore_dsv4_pool_session_state(
+                    dsv4->compressor, saved.compressor);
+                restore_dsv4_pool_session_state(
+                    dsv4->indexer_compressor,
+                    saved.indexer_compressor);
+                dsv4->shared_state->ensure();
+            }
+        } else if (state.kind == TextSessionStateKind::GlmDsa) {
+            if (state.glm_dsa_blocks.size() != blocks.size()) {
+                throw std::runtime_error(
+                    "GLM DSA session layer count changed");
+            }
+            for (size_t index = 0; index < blocks.size(); ++index) {
+                auto & block = blocks[index];
+                c10::cuda::CUDAGuard guard(block->cuda_device);
+                auto * glm = dynamic_cast<GlmDsaBlock *>(block.get());
+                const auto & saved = state.glm_dsa_blocks[index];
+                if (glm == nullptr ||
+                        glm->full_indexer != saved.full_indexer ||
+                        !saved.kv_cache.defined() ||
+                        saved.kv_cache.dim() != 4 ||
+                        saved.kv_cache.size(0) != 1 ||
+                        saved.kv_cache.size(2) != state.cache_pos) {
+                    throw std::runtime_error(
+                        "GLM DSA saved MLA cache is invalid");
+                }
+                restore_session_prefix_tensor(
+                    glm->kv_cache, saved.kv_cache,
+                    2, saved.kv_capacity);
+                if (saved.full_indexer) {
+                    if (!saved.index_cache.defined() ||
+                            saved.index_cache.dim() != 3 ||
+                            saved.index_cache.size(0) != 1 ||
+                            saved.index_cache.size(1) != state.cache_pos) {
+                        throw std::runtime_error(
+                            "GLM DSA saved index cache is invalid");
+                    }
+                    restore_session_prefix_tensor(
+                        glm->index_cache, saved.index_cache,
+                        1, saved.index_capacity);
+                } else {
+                    glm->index_cache = torch::Tensor();
+                }
+                glm->shared_state->reset();
+            }
+        }
+        cache_pos = state.cache_pos;
     }
 
     torch::Tensor finalize_hidden(torch::Tensor x, int64_t B, int64_t T) {
@@ -18592,26 +18997,335 @@ private:
     cudaEvent_t finished_ = nullptr;
 };
 
+class ServerTextSessionCache {
+public:
+    ServerTextSessionCache() {
+        const char * entries = std::getenv("MFQ_SERVER_MAX_KV_SESSIONS");
+        if (entries != nullptr) {
+            max_sessions_ = static_cast<size_t>(std::strtoull(
+                entries, nullptr, 10));
+        }
+        const char * snapshots =
+            std::getenv("MFQ_SERVER_MAX_KV_SNAPSHOTS_PER_SESSION");
+        if (snapshots != nullptr) {
+            max_snapshots_per_session_ = static_cast<size_t>(std::strtoull(
+                snapshots, nullptr, 10));
+        }
+        const char * bytes = std::getenv("MFQ_SERVER_KV_SESSION_BYTES");
+        if (bytes != nullptr) {
+            max_bytes_ = static_cast<size_t>(std::strtoull(
+                bytes, nullptr, 10));
+        }
+        const char * trace = std::getenv("MFQ_SERVER_TRACE_SESSION_CACHE");
+        trace_ = trace != nullptr && trace[0] == '1';
+    }
+
+    size_t restore_best(
+            Model & model,
+            const std::string & requested_session,
+            const std::vector<int64_t> & prompt,
+            size_t maximum_prefix_tokens) {
+        if (requested_session.empty() || max_sessions_ == 0 ||
+                max_snapshots_per_session_ == 0 ||
+                max_bytes_ == 0 || !model.supports_text_session_state()) {
+            return 0;
+        }
+        std::string selected_session;
+        size_t selected_snapshot = 0;
+        size_t selected_tokens = 0;
+        for (const auto & [session_id, history] : states_) {
+            for (size_t index = 0; index < history.size(); ++index) {
+                const auto & tokens = history[index].tokens;
+                if (tokens.empty() || tokens.size() >= prompt.size() ||
+                        tokens.size() > maximum_prefix_tokens ||
+                        tokens.size() < selected_tokens ||
+                        !std::equal(
+                            tokens.begin(), tokens.end(), prompt.begin())) {
+                    continue;
+                }
+                const bool requested_tie =
+                    tokens.size() == selected_tokens &&
+                    session_id == requested_session &&
+                    selected_session != requested_session;
+                if (tokens.size() > selected_tokens || requested_tie) {
+                    selected_session = session_id;
+                    selected_snapshot = index;
+                    selected_tokens = tokens.size();
+                }
+            }
+        }
+        if (selected_session.empty()) return 0;
+        auto & selected = states_.at(selected_session)[selected_snapshot];
+        try {
+            model.restore_text_session_state(selected);
+            selected.last_used = ++clock_;
+            if (trace_) {
+                std::cerr << "server_session_cache action=hit session="
+                          << requested_session
+                          << " source=" << selected_session
+                          << " reused_tokens=" << selected_tokens
+                          << " prefill_tokens="
+                          << prompt.size() - selected_tokens << std::endl;
+            }
+            return selected_tokens;
+        } catch (const std::exception & error) {
+            erase_snapshot(selected_session, selected_snapshot, "invalidate");
+            model.reset(1);
+            std::cerr << "server_session_cache action=invalidate session="
+                      << selected_session << " error=" << error.what()
+                      << std::endl;
+            return 0;
+        }
+    }
+
+    void store(
+            const std::string & session_id,
+            TextSessionState state) {
+        if (session_id.empty() || max_sessions_ == 0 ||
+                max_snapshots_per_session_ == 0 || max_bytes_ == 0) {
+            return;
+        }
+        if (state.bytes > max_bytes_) {
+            if (trace_) {
+                std::cerr << "server_session_cache action=skip session="
+                          << session_id << " bytes=" << state.bytes
+                          << " budget=" << max_bytes_ << std::endl;
+            }
+            return;
+        }
+        state.last_used = ++clock_;
+        const uint64_t protected_clock = state.last_used;
+        auto & history = states_[session_id];
+        auto previous = std::find_if(
+            history.begin(), history.end(),
+            [&](const TextSessionState & saved) {
+                return saved.tokens == state.tokens;
+            });
+        if (previous != history.end()) {
+            bytes_ -= previous->bytes;
+            *previous = std::move(state);
+        } else {
+            history.push_back(std::move(state));
+        }
+        const auto stored = std::find_if(
+            history.begin(), history.end(),
+            [&](const TextSessionState & saved) {
+                return saved.last_used == protected_clock;
+            });
+        if (stored == history.end()) {
+            throw std::runtime_error("stored session snapshot is unavailable");
+        }
+        bytes_ += stored->bytes;
+        evict_history_to_limit(session_id, protected_clock);
+        evict_to_budget(session_id, protected_clock);
+        if (trace_) {
+            const auto & saved_history = states_.at(session_id);
+            const auto saved = std::find_if(
+                saved_history.begin(), saved_history.end(),
+                [&](const TextSessionState & candidate) {
+                    return candidate.last_used == protected_clock;
+                });
+            if (saved == saved_history.end()) {
+                throw std::runtime_error(
+                    "protected session snapshot was evicted");
+            }
+            std::cerr << "server_session_cache action=store session="
+                      << session_id << " tokens=" << saved->tokens.size()
+                      << " bytes=" << saved->bytes
+                      << " snapshots=" << saved_history.size()
+                      << " total_bytes=" << bytes_ << std::endl;
+        }
+    }
+
+    size_t fork_session(
+            const std::string & source_session,
+            const std::string & target_session) {
+        if (source_session.empty() || target_session.empty() ||
+                source_session == target_session || max_sessions_ == 0 ||
+                max_snapshots_per_session_ == 0 || max_bytes_ == 0) {
+            return 0;
+        }
+        const auto source = states_.find(source_session);
+        if (source == states_.end()) return 0;
+        std::vector<TextSessionState> copied = source->second;
+        close_session(target_session);
+        auto & target = states_[target_session];
+        uint64_t protected_clock = 0;
+        for (auto & snapshot : copied) {
+            snapshot.last_used = ++clock_;
+            protected_clock = snapshot.last_used;
+            bytes_ += snapshot.bytes;
+            target.push_back(std::move(snapshot));
+        }
+        evict_history_to_limit(target_session, protected_clock);
+        evict_to_budget(target_session, protected_clock);
+        const auto remaining = states_.find(target_session);
+        const size_t copied_snapshots = remaining == states_.end()
+            ? 0 : remaining->second.size();
+        if (trace_) {
+            std::cerr << "server_session_cache action=fork source="
+                      << source_session << " target=" << target_session
+                      << " snapshots=" << copied_snapshots
+                      << " total_bytes=" << bytes_ << std::endl;
+        }
+        return copied_snapshots;
+    }
+
+    size_t close_session(const std::string & session_id) {
+        auto found = states_.find(session_id);
+        if (found == states_.end()) return 0;
+        const size_t released = found->second.size();
+        size_t released_bytes = 0;
+        for (const auto & snapshot : found->second) {
+            released_bytes += snapshot.bytes;
+        }
+        bytes_ -= released_bytes;
+        states_.erase(found);
+        if (trace_) {
+            std::cerr << "server_session_cache action=close session="
+                      << session_id << " snapshots=" << released
+                      << " bytes=" << released_bytes
+                      << " total_bytes=" << bytes_ << std::endl;
+        }
+        return released;
+    }
+
+private:
+    void evict_history_to_limit(
+            const std::string & session_id,
+            uint64_t protected_clock) {
+        auto found = states_.find(session_id);
+        while (found != states_.end() &&
+                found->second.size() > max_snapshots_per_session_) {
+            size_t victim = found->second.size();
+            for (size_t index = 0; index < found->second.size(); ++index) {
+                const auto & snapshot = found->second[index];
+                if (snapshot.last_used == protected_clock) continue;
+                if (victim == found->second.size() ||
+                        snapshot.last_used <
+                            found->second[victim].last_used) {
+                    victim = index;
+                }
+            }
+            if (victim == found->second.size()) break;
+            erase_snapshot(session_id, victim, "history_evict");
+            found = states_.find(session_id);
+        }
+    }
+
+    void evict_to_budget(
+            const std::string & protected_session,
+            uint64_t protected_clock) {
+        while (states_.size() > max_sessions_) {
+            auto victim = states_.end();
+            uint64_t victim_last_used = 0;
+            for (auto it = states_.begin(); it != states_.end(); ++it) {
+                if (it->first == protected_session) continue;
+                uint64_t session_last_used = 0;
+                for (const auto & snapshot : it->second) {
+                    session_last_used = std::max(
+                        session_last_used, snapshot.last_used);
+                }
+                if (victim == states_.end() ||
+                        session_last_used < victim_last_used) {
+                    victim = it;
+                    victim_last_used = session_last_used;
+                }
+            }
+            if (victim == states_.end()) break;
+            close_session(victim->first);
+        }
+        while (bytes_ > max_bytes_) {
+            std::string victim_session;
+            size_t victim_snapshot = 0;
+            uint64_t victim_last_used = 0;
+            bool found_victim = false;
+            for (const auto & [session_id, history] : states_) {
+                for (size_t index = 0; index < history.size(); ++index) {
+                    const auto & snapshot = history[index];
+                    if (session_id == protected_session &&
+                            snapshot.last_used == protected_clock) {
+                        continue;
+                    }
+                    if (!found_victim ||
+                            snapshot.last_used < victim_last_used) {
+                        victim_session = session_id;
+                        victim_snapshot = index;
+                        victim_last_used = snapshot.last_used;
+                        found_victim = true;
+                    }
+                }
+            }
+            if (!found_victim) break;
+            erase_snapshot(victim_session, victim_snapshot, "budget_evict");
+        }
+    }
+
+    void erase_snapshot(
+            const std::string & session_id,
+            size_t index,
+            const char * action) {
+        auto found = states_.find(session_id);
+        if (found == states_.end() || index >= found->second.size()) return;
+        const size_t removed_bytes = found->second[index].bytes;
+        if (trace_) {
+            std::cerr << "server_session_cache action=" << action
+                      << " session=" << session_id
+                      << " tokens=" << found->second[index].tokens.size()
+                      << " bytes=" << removed_bytes << std::endl;
+        }
+        bytes_ -= removed_bytes;
+        found->second.erase(found->second.begin() +
+            static_cast<std::ptrdiff_t>(index));
+        if (found->second.empty()) states_.erase(found);
+    }
+
+    std::unordered_map<
+        std::string, std::vector<TextSessionState>> states_;
+    size_t max_sessions_ = 4;
+    size_t max_snapshots_per_session_ = 4;
+    size_t max_bytes_ = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+    size_t bytes_ = 0;
+    uint64_t clock_ = 0;
+    bool trace_ = false;
+};
+
 static int32_t generate_server_tokens(
     Model & model,
     std::mutex & model_mutex,
     ServerDecodeGraphCache & graph_cache,
+    ServerTextSessionCache & session_cache,
     const std::vector<int64_t> & prompt,
     const MfqSamplingParams & sampling,
     const MfqTokenCallback & on_token,
     const MfqPrefillCallback & on_prefill,
+    const MfqPromptCachePlan & cache_plan,
     const MfqTokenConstraintPtr & token_constraint)
 {
     std::lock_guard<std::mutex> lock(model_mutex);
-    model.reset(1);
     auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
-    auto ids = torch::tensor(prompt, options).reshape({1, -1}).contiguous();
+    const size_t stable_prefix_tokens = std::min(
+        cache_plan.stable_prefix_tokens, prompt.size());
+    const bool session_enabled =
+        !cache_plan.session_id.empty() &&
+        stable_prefix_tokens > 0 &&
+        model.supports_text_session_state();
+    const size_t reused_tokens = session_enabled
+        ? session_cache.restore_best(
+            model, cache_plan.session_id, prompt, stable_prefix_tokens)
+        : 0;
+    if (reused_tokens == 0) model.reset(1);
+    auto full_ids = torch::tensor(prompt, options)
+        .reshape({1, -1}).contiguous();
+    auto ids = full_ids.narrow(
+        1, static_cast<int64_t>(reused_tokens),
+        static_cast<int64_t>(prompt.size() - reused_tokens)).contiguous();
     const bool has_penalties = sampling_has_penalties(sampling);
     graph_cache.ensure_storage(model.c.vocab_size);
     auto counts = has_penalties ? graph_cache.counts : torch::Tensor();
     if (has_penalties) {
         counts.zero_();
-        sample_token_counts_add_cuda(counts, ids);
+        sample_token_counts_add_cuda(counts, full_ids);
     }
 
     auto random_host = torch::empty(
@@ -18619,15 +19333,59 @@ static int32_t generate_server_tokens(
     auto random_cuda = torch::empty(
         {1}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
     std::mt19937_64 rng(sampling.seed);
+    const auto store_session_snapshot = [&](size_t token_count) {
+        if (!session_enabled || model.cache_pos !=
+                static_cast<int64_t>(token_count)) {
+            return;
+        }
+        try {
+            std::vector<int64_t> snapshot_tokens(
+                prompt.begin(), prompt.begin() +
+                    static_cast<std::ptrdiff_t>(token_count));
+            session_cache.store(
+                cache_plan.session_id,
+                model.capture_text_session_state(snapshot_tokens));
+        } catch (const std::exception & error) {
+            std::cerr << "server_session_cache action=skip session="
+                      << cache_plan.session_id
+                      << " error=" << error.what() << std::endl;
+        }
+    };
     auto sample_first_token = [&]() {
         ServerPrefillCudaTimer prefill_timer;
+        if (session_enabled && stable_prefix_tokens < prompt.size()) {
+            if (reused_tokens < stable_prefix_tokens) {
+                auto stable_suffix = full_ids.narrow(
+                    1, static_cast<int64_t>(reused_tokens),
+                    static_cast<int64_t>(
+                        stable_prefix_tokens - reused_tokens)).contiguous();
+                c10::optional<torch::Tensor> stable_seq_len = c10::nullopt;
+                if (!model.c.is_minicpmo45() && model.cache_pos > 0 &&
+                        stable_suffix.size(1) == 1) {
+                    stable_seq_len = torch::full(
+                        {1}, model.cache_pos + 1, options);
+                }
+                (void)model.hidden_forward(
+                    stable_suffix, c10::nullopt, stable_seq_len);
+            }
+            store_session_snapshot(stable_prefix_tokens);
+            ids = full_ids.narrow(
+                1, static_cast<int64_t>(stable_prefix_tokens),
+                static_cast<int64_t>(
+                    prompt.size() - stable_prefix_tokens)).contiguous();
+        }
         auto next = sample_server_token(
             model, ids, sampling, counts, random_host, random_cuda, rng,
             token_constraint,
             prefill_timer.finished_event());
         const int64_t token = next.item<int64_t>();
         const double prefill_ms = prefill_timer.elapsed_ms();
-        if (on_prefill) on_prefill(prompt.size(), prefill_ms);
+        if (stable_prefix_tokens == prompt.size()) {
+            store_session_snapshot(stable_prefix_tokens);
+        }
+        if (on_prefill) {
+            on_prefill(prompt.size() - reused_tokens, prefill_ms);
+        }
         return std::make_pair(std::move(next), token);
     };
     const char * reprefill_env = std::getenv("MFQ_SERVER_REPREFILL");
@@ -23072,6 +23830,166 @@ static int run_dsv4_attention_check(int reps) {
     return 0;
 }
 
+static int run_text_session_state_check() {
+    c10::cuda::CUDAGuard guard(0);
+    auto cuda_float = torch::TensorOptions()
+        .device(torch::kCUDA).dtype(torch::kFloat32);
+    const auto values = [&](std::vector<int64_t> shape,
+                            torch::ScalarType dtype,
+                            float offset) {
+        int64_t elements = 1;
+        for (int64_t extent : shape) elements *= extent;
+        return (torch::arange(elements, cuda_float) + offset)
+            .reshape(shape).to(dtype).contiguous();
+    };
+    const auto require_equal = [](bool condition, const char * message) {
+        if (!condition) throw std::runtime_error(message);
+    };
+
+    Model dsv4_model;
+    auto dsv4 = std::make_unique<Dsv4Block>();
+    auto * dsv4_block = dsv4.get();
+    dsv4_block->cuda_device = 0;
+    dsv4_block->shared_state = std::make_shared<Dsv4SharedState>();
+    dsv4_block->shared_state->attention_meta = torch::empty({1}, cuda_float);
+    dsv4_block->shared_state->hadamard_signs = torch::ones(
+        {128}, cuda_float.dtype(torch::kInt8));
+    dsv4_block->local_cache = values(
+        {1, 128, 8}, torch::kFloat16, 1.0f);
+    const auto initialize_dsv4_pool = [&](Dsv4PoolState & pool,
+                                          int64_t head_dim,
+                                          bool overlap,
+                                          float offset) {
+        pool.ratio = 4;
+        pool.head_dim = head_dim;
+        pool.overlap = overlap;
+        pool.cache_quant_mode = overlap ? 2 : 0;
+        pool.capacity = 16;
+        const int64_t state_width = overlap ? 2 * head_dim : head_dim;
+        pool.state_kv = values(
+            {1, pool.ratio, state_width}, torch::kFloat32, offset);
+        pool.state_gate = values(
+            {1, pool.ratio, state_width}, torch::kFloat32, offset + 100.0f);
+        if (overlap) {
+            pool.previous_kv = values(
+                {1, pool.ratio, head_dim}, torch::kFloat32, offset + 200.0f);
+            pool.previous_gate = values(
+                {1, pool.ratio, head_dim}, torch::kFloat32, offset + 300.0f);
+        }
+        pool.pool = values(
+            {1, pool.capacity, head_dim}, torch::kFloat16, offset + 400.0f);
+    };
+    initialize_dsv4_pool(
+        dsv4_block->compressor, 8, false, 10.0f);
+    initialize_dsv4_pool(
+        dsv4_block->indexer_compressor, 4, true, 20.0f);
+    dsv4_model.blocks.push_back(std::move(dsv4));
+    dsv4_model.cache_pos = 10;
+    std::vector<int64_t> tokens(10);
+    std::iota(tokens.begin(), tokens.end(), 0);
+    const TextSessionState dsv4_state =
+        dsv4_model.capture_text_session_state(tokens);
+    dsv4_block->local_cache.zero_();
+    dsv4_block->compressor.state_kv.zero_();
+    dsv4_block->compressor.state_gate.zero_();
+    dsv4_block->compressor.pool.zero_();
+    dsv4_block->indexer_compressor.state_kv.zero_();
+    dsv4_block->indexer_compressor.state_gate.zero_();
+    dsv4_block->indexer_compressor.previous_kv.zero_();
+    dsv4_block->indexer_compressor.previous_gate.zero_();
+    dsv4_block->indexer_compressor.pool.zero_();
+    dsv4_model.cache_pos = 0;
+    dsv4_model.restore_text_session_state(dsv4_state);
+    const auto & saved_dsv4 = dsv4_state.dsv4_blocks.at(0);
+    require_equal(
+        torch::equal(dsv4_block->local_cache, saved_dsv4.local_cache),
+        "DeepSeek V4 local session cache restore failed");
+    const auto check_dsv4_pool = [&](const Dsv4PoolState & restored,
+                                     const Dsv4PoolSessionState & saved) {
+        require_equal(
+            torch::equal(restored.state_kv, saved.state_kv) &&
+            torch::equal(restored.state_gate, saved.state_gate),
+            "DeepSeek V4 compressor recurrent state restore failed");
+        if (saved.overlap) {
+            require_equal(
+                torch::equal(restored.previous_kv, saved.previous_kv) &&
+                torch::equal(restored.previous_gate, saved.previous_gate),
+                "DeepSeek V4 overlap compressor state restore failed");
+        }
+        require_equal(
+            restored.capacity == saved.capacity &&
+            torch::equal(
+                restored.pool.narrow(1, 0, saved.pool.size(1)),
+                saved.pool),
+            "DeepSeek V4 compressed pool restore failed");
+    };
+    check_dsv4_pool(
+        dsv4_block->compressor, saved_dsv4.compressor);
+    check_dsv4_pool(
+        dsv4_block->indexer_compressor,
+        saved_dsv4.indexer_compressor);
+    require_equal(
+        dsv4_model.cache_pos == 10 && dsv4_state.bytes > 0,
+        "DeepSeek V4 session position restore failed");
+
+    Model glm_model;
+    auto glm_shared = std::make_shared<GlmDsaSharedState>();
+    std::vector<GlmDsaBlock *> glm_blocks;
+    for (int index = 0; index < 2; ++index) {
+        auto glm = std::make_unique<GlmDsaBlock>();
+        glm->cuda_device = 0;
+        glm->full_indexer = index == 0;
+        glm->shared_state = glm_shared;
+        glm->kv_cache = values(
+            {1, 1, 16, 6}, torch::kFloat16,
+            1000.0f + index * 100.0f);
+        if (glm->full_indexer) {
+            glm->index_cache = values(
+                {1, 16, 4}, torch::kFloat16, 2000.0f);
+        }
+        glm_blocks.push_back(glm.get());
+        glm_model.blocks.push_back(std::move(glm));
+    }
+    glm_model.cache_pos = 10;
+    const TextSessionState glm_state =
+        glm_model.capture_text_session_state(tokens);
+    for (auto * glm : glm_blocks) {
+        glm->kv_cache.zero_();
+        if (glm->index_cache.defined()) glm->index_cache.zero_();
+    }
+    glm_shared->topk_indices = torch::ones(
+        {1, 1, 1}, cuda_float.dtype(torch::kInt32));
+    glm_model.cache_pos = 0;
+    glm_model.restore_text_session_state(glm_state);
+    for (size_t index = 0; index < glm_blocks.size(); ++index) {
+        const auto & saved = glm_state.glm_dsa_blocks.at(index);
+        require_equal(
+            glm_blocks[index]->kv_cache.size(2) == saved.kv_capacity &&
+            torch::equal(
+                glm_blocks[index]->kv_cache.narrow(
+                    2, 0, saved.kv_cache.size(2)),
+                saved.kv_cache),
+            "GLM DSA MLA session cache restore failed");
+        if (saved.full_indexer) {
+            require_equal(
+                glm_blocks[index]->index_cache.size(1) ==
+                    saved.index_capacity &&
+                torch::equal(
+                    glm_blocks[index]->index_cache.narrow(
+                        1, 0, saved.index_cache.size(1)),
+                    saved.index_cache),
+                "GLM DSA index session cache restore failed");
+        }
+    }
+    require_equal(
+        glm_model.cache_pos == 10 && glm_state.bytes > 0 &&
+        !glm_shared->topk_indices.defined(),
+        "GLM DSA session metadata restore failed");
+
+    std::cout << "text_session_state_check dsv4=1 glm_dsa=1\n";
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     struct TensorParallelCollectiveCleanup {
         ~TensorParallelCollectiveCleanup() {
@@ -23169,6 +24087,7 @@ int main(int argc, char ** argv) {
         bool check_glm_dsa = false;
         bool check_dsv4_attention = false;
         bool check_dsv4_hc = false;
+        bool check_text_session_state = false;
         bool compare_dsv4_hc_ops = false;
         bool compare_dsv4_hc_model = false;
         bool check_attention_swa_decode = false;
@@ -23285,6 +24204,9 @@ int main(int argc, char ** argv) {
             else if (a == "--check-glm-dsa") check_glm_dsa = true;
             else if (a == "--check-dsv4-attention") check_dsv4_attention = true;
             else if (a == "--check-dsv4-hc") check_dsv4_hc = true;
+            else if (a == "--check-text-session-state") {
+                check_text_session_state = true;
+            }
             else if (a == "--compare-dsv4-hc-ops") compare_dsv4_hc_ops = true;
             else if (a == "--compare-dsv4-hc-model") compare_dsv4_hc_model = true;
             else if (a == "--kl-base" && i + 1 < argc) kl_base = argv[++i];
@@ -23689,6 +24611,9 @@ int main(int argc, char ** argv) {
         if (check_dsv4_hc) {
             return run_dsv4_hc_check(check_attention_reps);
         }
+        if (check_text_session_state) {
+            return run_text_session_state_check();
+        }
         if (!minicpmo_duplex_input_prefix.empty()) {
             if (mfq_path.empty() || minicpmo_duplex_output_prefix.empty()) {
                 throw std::runtime_error(
@@ -23997,16 +24922,29 @@ int main(int argc, char ** argv) {
                 server_sampling_profile);
             std::mutex model_mutex;
             ServerDecodeGraphCache decode_graph_cache(model.c.max_position_embeddings);
+            ServerTextSessionCache text_session_cache;
             const int status = run_mfq_server(
                 server_config, [&](const std::vector<int64_t> & prompt,
                                    const MfqSamplingParams & sampling,
                                    const MfqTokenCallback & on_token,
                                    const MfqPrefillCallback & on_prefill,
-                                   const MfqPromptCachePlan &,
+                                   const MfqPromptCachePlan & cache_plan,
                                    const MfqTokenConstraintPtr & token_constraint) {
                 return generate_server_tokens(
-                    model, model_mutex, decode_graph_cache, prompt, sampling,
-                    on_token, on_prefill, token_constraint);
+                    model, model_mutex, decode_graph_cache,
+                    text_session_cache, prompt, sampling,
+                    on_token, on_prefill, cache_plan, token_constraint);
+            }, {}, {}, {
+                [&](const std::string & source_session_id,
+                        const std::string & target_session_id) {
+                    std::lock_guard<std::mutex> lock(model_mutex);
+                    return text_session_cache.fork_session(
+                        source_session_id, target_session_id);
+                },
+                [&](const std::string & session_id) {
+                    std::lock_guard<std::mutex> lock(model_mutex);
+                    return text_session_cache.close_session(session_id);
+                },
             });
             if (g_moe_expert_cache) {
                 g_moe_expert_cache->print_stats(std::cout);
