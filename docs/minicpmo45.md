@@ -1,10 +1,11 @@
 # MiniCPM-o 4.5 Runtime
 
 MFQ supports the official `OpenBMB/MiniCPM-o-4_5` composite graph in the
-Python/CUDA runtime. The official remote-code modules continue to own image and
-audio preprocessing, SigLIP, the Resampler, Whisper, Qwen3, TTS, attention
-masks, and streaming caches. MFQ replaces supported `Linear` and `Embedding`
-weights with packed CUDA operators.
+Python/CUDA runtime and in the native C++ CUDA and Apple MLX runtimes. The
+Python path delegates graph ownership to the official remote-code modules and
+replaces supported `Linear` and `Embedding` weights with packed operators. The
+native paths implement SigLIP, the Resampler, Whisper, the Qwen3-8B language
+backbone, TTS, attention masks, and streaming caches directly.
 
 This path requires the official model directory at runtime. The directory
 provides the tokenizer, processor, remote-code definitions, and Token2wav
@@ -81,8 +82,13 @@ and arguments used by the official repository.
 ## Native C++ composite graph
 
 `mfq-decode` has a CUDA-native tensor interface for SigLIP, the Resampler,
-Whisper, the audio projector, Qwen3, and the TTS code decoder. It reads tensors
-produced by the official processor from files sharing an input prefix:
+Whisper, the audio projector, Qwen3, and the TTS code decoder. The same graph is
+available on Apple platforms through `MlxMiniCPMO45Runtime`; the Metal HTTP
+server loads its text path directly while native callers can supply the
+processor-produced image and audio arrays programmatically.
+
+The CUDA tensor interface reads tensors produced by the official processor
+from files sharing an input prefix:
 
 The converter embeds the official NumPy-generated Resampler position table as
 a versioned BF16 runtime asset. The C++ graph requires this asset so
@@ -121,9 +127,10 @@ directory.
 ## Native full-duplex session
 
 The native CUDA runtime also accepts a sequence of processor-produced units in
-one process. It preserves the official streaming Whisper, Qwen3, and TTS caches
-across units and follows the listen/speak, chunk-end, and turn-end state
-transitions used by `MiniCPMODuplex`.
+one process. The Apple runtime exposes the equivalent state machine through
+`prepare_duplex()` and `duplex_step()`. Both preserve the official streaming
+Whisper, Qwen3, and TTS caches across units and follow the listen/speak,
+chunk-end, and turn-end state transitions used by `MiniCPMODuplex`.
 
 The session prefix contains:
 
@@ -156,7 +163,12 @@ Whisper cache length, TTS cache length, and the official streaming time index.
 `--minicpmo-duplex-greedy` and `--minicpmo-duplex-seed` provide deterministic
 validation modes.
 
-The HTTP server does not yet parse raw MiniCPM-o image and audio requests.
+On Apple, `MlxMiniCPMO45DuplexResult` reports all three cache positions and the
+streaming audio index after every unit. TTS only returns codes that have already
+advanced the TTS KV cache, so the next unit can verify its expected position
+exactly. `reset()` destroys the duplex state and clears all modality caches.
+
+The HTTP servers do not yet parse raw MiniCPM-o image and audio requests.
 Quality and performance results require a calibrated checkpoint and
 modality-specific reference evaluation; structural support alone does not
 establish those results.

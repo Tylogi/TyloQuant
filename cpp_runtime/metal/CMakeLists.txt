@@ -144,6 +144,7 @@ add_library(mfq-metal-runtime STATIC
     mlx_nint8_zero.cpp
     mlx_vq.cpp
     mlx_linear_attention.cpp
+    mlx_minicpmo45.cpp
     mlx_qwen35_full_attention.cpp
     mlx_qwen35_linear_attention.cpp
     mlx_qwen35_causal_lm.cpp
@@ -706,4 +707,22 @@ set_target_properties(
 add_test(
     NAME mfq-metal-qwen35-causal-lm-test
     COMMAND mfq-metal-qwen35-causal-lm-test
+)
+
+add_executable(mfq-metal-minicpmo45-test
+    mlx_minicpmo45_test.cpp
+)
+target_link_libraries(
+    mfq-metal-minicpmo45-test PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(
+    mfq-metal-minicpmo45-test PRIVATE cxx_std_20)
+set_target_properties(
+    mfq-metal-minicpmo45-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+add_test(
+    NAME mfq-metal-minicpmo45-test
+    COMMAND mfq-metal-minicpmo45-test
 )

@@ -1,5 +1,6 @@
 #include "mfq_container.h"
 #include "mlx_deepseek_v4_causal_lm.h"
+#include "mlx_minicpmo45.h"
 #include "mlx_moe.h"
 #include "mlx_qwen35_causal_lm.h"
 #include "mlx_tensor.h"
@@ -296,6 +297,25 @@ std::int32_t generate_with_prefill_metrics(
 }
 
 std::int32_t generate_with_prefill_metrics(
+    mfq::metal::MlxMiniCPMO45Runtime& runtime,
+    const std::vector<std::int64_t>& prompt,
+    const mfq::metal::MlxSamplingParams& sampling,
+    std::int32_t max_tokens,
+    const MfqTokenCallback& callback,
+    const MfqPrefillCallback& on_prefill,
+    const MfqPromptCachePlan&,
+    const MfqTokenConstraintPtr& token_constraint,
+    int) {
+    return runtime.generate(
+        prompt,
+        sampling,
+        max_tokens,
+        callback,
+        on_prefill,
+        token_constraint);
+}
+
+std::int32_t generate_with_prefill_metrics(
     mfq::metal::MlxDeepseekV4CausalLm& runtime,
     const std::vector<std::int64_t>& prompt,
     const mfq::metal::MlxSamplingParams& sampling,
@@ -560,6 +580,44 @@ int run_native_server(
             config.model_type,
             config.max_position_embeddings,
             config.vocab,
+            runtime_stream);
+    }
+
+    if (architecture.rfind("minicpmo", 0) == 0) {
+        std::cout
+            << "Loading native C++/MLX MiniCPM-o 4.5 Qwen3-8B "
+               "on Apple GPU..."
+            << std::endl;
+        auto runtime =
+            mfq::metal::MlxMiniCPMO45Runtime::load(
+                container,
+                0,
+                false);
+        release_model_load_staging_memory();
+        const auto load_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+        const auto maximum_context = runtime.maximum_context();
+        const auto vocabulary = runtime.vocabulary_size();
+        std::cout
+            << "Loaded " << runtime.layer_count()
+            << " MiniCPM-o Qwen3-8B layers in "
+            << load_seconds << " s"
+            << std::endl;
+        const auto load_runtime =
+            [&container](std::int64_t requested_context) {
+                return mfq::metal::MlxMiniCPMO45Runtime::load(
+                    container,
+                    requested_context,
+                    false);
+            };
+        return serve_loaded_runtime(
+            arguments,
+            container,
+            std::move(runtime),
+            load_runtime,
+            "minicpmo",
+            maximum_context,
+            vocabulary,
             runtime_stream);
     }
 

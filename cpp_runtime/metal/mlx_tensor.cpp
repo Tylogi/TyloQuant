@@ -266,26 +266,32 @@ array MlxLinear::operator()(const array& input) const {
             return dense_reference_matmul(*dense, input);
         }
     }
+    const auto preserve_input_dtype = [&](array result) {
+        return input.dtype() == mlx::core::bfloat16 &&
+                result.dtype() != input.dtype()
+            ? mlx::core::astype(result, input.dtype())
+            : result;
+    };
     if (const auto* packed = std::get_if<MlxNintWeight>(&weight_)) {
-        return packed->matmul(input);
+        return preserve_input_dtype(packed->matmul(input));
     }
     if (const auto* packed =
             std::get_if<MlxNint8ZeroWeight>(&weight_)) {
-        return packed->matmul(input);
+        return preserve_input_dtype(packed->matmul(input));
     }
     if (const auto* packed = std::get_if<MlxVqWeight>(&weight_)) {
-        return packed->matmul(input);
+        return preserve_input_dtype(packed->matmul(input));
     }
     if (const auto* packed =
             std::get_if<MlxTpqInt4Weight>(&weight_)) {
-        return packed->matmul(input);
+        return preserve_input_dtype(packed->matmul(input));
     }
     if (const auto* packed =
             std::get_if<MlxTpqPqWeight>(&weight_)) {
-        return packed->matmul(input);
+        return preserve_input_dtype(packed->matmul(input));
     }
     if (const auto* packed = std::get_if<MlxMxWeight>(&weight_)) {
-        return packed->matmul(input);
+        return preserve_input_dtype(packed->matmul(input));
     }
     const auto& dense = std::get<array>(weight_);
     auto source = input;
@@ -529,13 +535,20 @@ array MlxEmbedding::operator()(
     Dtype dtype) const {
     const bool reference = mlx_reference_enabled();
     const auto finish_quantized = [&](const auto& packed) {
-        return reference
+        auto result = reference
             ? mlx::core::astype(
                   packed.embedding(
                       token_ids,
                       mlx::core::float32),
                   mlx::core::float16)
-            : packed.embedding(token_ids, dtype);
+            : packed.embedding(
+                  token_ids,
+                  dtype == mlx::core::bfloat16
+                      ? mlx::core::float16
+                      : dtype);
+        return result.dtype() == dtype
+            ? result
+            : mlx::core::astype(result, dtype);
     };
     if (const auto* packed = std::get_if<MlxNintWeight>(&weight_)) {
         return finish_quantized(*packed);
@@ -552,7 +565,14 @@ array MlxEmbedding::operator()(
         return finish_quantized(*packed);
     }
     if (const auto* packed = std::get_if<MlxMxWeight>(&weight_)) {
-        return packed->embedding(token_ids, dtype);
+        auto result = packed->embedding(
+            token_ids,
+            dtype == mlx::core::bfloat16
+                ? mlx::core::float16
+                : dtype);
+        return result.dtype() == dtype
+            ? result
+            : mlx::core::astype(result, dtype);
     }
     auto ids = token_ids;
     if (ids.dtype() != mlx::core::int32 &&

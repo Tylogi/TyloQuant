@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -52,7 +53,8 @@ mlx::core::array scaled_dot_product_attention(
     const mlx::core::array& key,
     const mlx::core::array& value,
     bool causal = true,
-    float scale = 0.0f);
+    float scale = 0.0f,
+    const std::optional<mlx::core::array>& mask = std::nullopt);
 
 class MlxKvCache {
 public:

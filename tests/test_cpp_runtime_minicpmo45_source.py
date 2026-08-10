@@ -5,6 +5,15 @@ DECODE = (ROOT / "cpp_runtime" / "mfq_decode.cpp").read_text(encoding="utf-8")
 GRAPH = (ROOT / "cpp_runtime" / "minicpmo45_runtime.inc").read_text(
     encoding="utf-8"
 )
+METAL_GRAPH = (ROOT / "cpp_runtime" / "metal" / "mlx_minicpmo45.cpp").read_text(
+    encoding="utf-8"
+)
+METAL_HEADER = (ROOT / "cpp_runtime" / "metal" / "mlx_minicpmo45.h").read_text(
+    encoding="utf-8"
+)
+METAL_DECODE = (ROOT / "cpp_runtime" / "metal" / "mfq_decode_mlx.cpp").read_text(
+    encoding="utf-8"
+)
 
 
 def test_minicpmo45_uses_native_composite_graph_and_hf_names():
@@ -171,3 +180,44 @@ def test_minicpmo45_cli_exposes_native_duplex_tensor_contract():
     assert 'output + ".generated_ids.pt"' in GRAPH
     assert 'output + ".tts_codes.pt"' in GRAPH
     assert 'output + ".state.pt"' in GRAPH
+
+
+def test_minicpmo45_metal_uses_an_independent_qwen3_backbone():
+    assert "class MiniQwen3Block" in METAL_GRAPH
+    assert "class MiniQwen3Language" in METAL_GRAPH
+    assert '"llm.model.layers."' in METAL_GRAPH
+    assert "result.query_heads != 32" in METAL_GRAPH
+    assert "result.kv_heads != 8" in METAL_GRAPH
+    assert "mlx_qwen35" not in METAL_GRAPH
+    assert "mlx_qwen35" not in METAL_HEADER
+    assert 'architecture.rfind("minicpmo", 0)' in METAL_DECODE
+
+
+def test_minicpmo45_metal_binds_the_complete_composite_graph():
+    for symbol in (
+        "class VisionEncoder",
+        "class Resampler",
+        "class AudioEncoder",
+        "class TtsDecoder",
+        "vpm.embeddings.patch_embedding.weight",
+        "resampler.attn.in_proj_weight",
+        "apm.conv1.weight",
+        "audio_projection_layer.linear1",
+        "tts.emb_text.weight",
+        "tts.head_code.0.parametrizations.weight.original0",
+    ):
+        assert symbol in METAL_GRAPH
+    assert "minicpmo45-resampler-pos-embed-v1.bf16" in METAL_GRAPH
+    assert "MFQRSPB1" in METAL_GRAPH
+
+
+def test_minicpmo45_metal_duplex_tracks_all_cache_lifetimes():
+    assert "prepare_duplex(" in METAL_GRAPH
+    assert "duplex_step(" in METAL_GRAPH
+    assert "tts_text_start_position" in METAL_GRAPH
+    assert "TTS cache did not advance exactly" in METAL_GRAPH
+    assert "audio_chunk_index" in METAL_GRAPH
+    assert "implementation_->duplex.reset()" in METAL_GRAPH
+    assert "language_cache_position" in METAL_HEADER
+    assert "audio_cache_position" in METAL_HEADER
+    assert "tts_cache_position" in METAL_HEADER

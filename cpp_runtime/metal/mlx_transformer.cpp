@@ -33,6 +33,7 @@ constexpr const char* kMropeSource = R"METAL(
     constexpr uint HALF = uint(ROTARY_DIM / 2);
     uint row = index / uint(DIM);
     uint token = row % uint(TOKENS);
+    uint batch = row / uint(HEADS * TOKENS);
     uint pair = column < HALF ? column : column - HALF;
 
     uint axis = 0u;
@@ -51,7 +52,9 @@ constexpr const char* kMropeSource = R"METAL(
         }
     }
 
-    int position = positions[axis * uint(TOKENS) + token];
+    int position = POSITION_BATCH != 0
+        ? positions[batch * uint(TOKENS) + token]
+        : positions[axis * uint(TOKENS) + token];
     float exponent =
         -2.0f * float(pair) / float(ROTARY_DIM);
     float angle =
@@ -129,6 +132,7 @@ array MlxRmsNorm::operator()(const array& input) const {
     }
     auto source = input;
     if (source.dtype() != mlx::core::float16 &&
+        source.dtype() != mlx::core::bfloat16 &&
         source.dtype() != mlx::core::float32) {
         source = mlx::core::astype(source, mlx::core::float16);
     }
@@ -160,6 +164,7 @@ array apply_rope(
     }
     auto source = input;
     if (source.dtype() != mlx::core::float16 &&
+        source.dtype() != mlx::core::bfloat16 &&
         source.dtype() != mlx::core::float32) {
         source = mlx::core::astype(source, mlx::core::float16);
     }
@@ -193,8 +198,14 @@ array apply_rope(
 
     const int tokens = input.shape(-2);
     int position_axes = 0;
+    bool position_batch = false;
     if (positions.ndim() == 1) {
         position_axes = 1;
+    } else if (positions.ndim() == 2 &&
+               positions.shape(0) == input.shape(0) &&
+               sections.empty()) {
+        position_axes = 1;
+        position_batch = positions.shape(0) > 1;
     } else if (positions.ndim() == 2 &&
                (positions.shape(0) == 1 ||
                 positions.shape(0) == 3)) {
@@ -202,7 +213,7 @@ array apply_rope(
     } else {
         throw std::runtime_error(
             "RoPE positions must have [tokens], [1,tokens], "
-            "or [3,tokens] shape");
+            "[batch,tokens], or [3,tokens] shape");
     }
     if (positions.shape(-1) != tokens) {
         throw std::runtime_error(
@@ -237,6 +248,7 @@ array apply_rope(
 
     auto source = input;
     if (source.dtype() != mlx::core::float16 &&
+        source.dtype() != mlx::core::bfloat16 &&
         source.dtype() != mlx::core::float32) {
         source = mlx::core::astype(source, mlx::core::float16);
     }
@@ -263,8 +275,10 @@ array apply_rope(
         {"SIZE", size},
         {"TOKENS", tokens},
         {"DIM", source.shape(-1)},
+        {"HEADS", source.shape(-3)},
         {"ROTARY_DIM", rotary_dimension},
         {"POS_AXES", position_axes},
+        {"POSITION_BATCH", static_cast<int>(position_batch)},
         {"S0", section_values[0]},
         {"S1", section_values[1]},
         {"S2", section_values[2]},
@@ -288,7 +302,8 @@ array scaled_dot_product_attention(
     const array& key,
     const array& value,
     bool causal,
-    float scale) {
+    float scale,
+    const std::optional<array>& mask) {
     require_attention_shape(query, "attention query");
     require_attention_shape(key, "attention key");
     require_attention_shape(value, "attention value");
@@ -301,6 +316,7 @@ array scaled_dot_product_attention(
     }
     auto dtype = query.dtype();
     if (dtype != mlx::core::float16 &&
+        dtype != mlx::core::bfloat16 &&
         dtype != mlx::core::float32) {
         dtype = mlx::core::float16;
     }
@@ -318,7 +334,8 @@ array scaled_dot_product_attention(
         k,
         v,
         scale,
-        causal ? "causal" : "");
+        causal ? "causal" : "",
+        mask);
 }
 
 MlxKvCache::MlxKvCache(
@@ -346,6 +363,7 @@ MlxKvCache::MlxKvCache(
         maximum_sequence_ <= 0 || head_dimension_ <= 0 ||
         initial_capacity < 0 ||
         (dtype_ != mlx::core::float16 &&
+         dtype_ != mlx::core::bfloat16 &&
          dtype_ != mlx::core::float32)) {
         throw std::runtime_error("invalid KV cache dimensions or dtype");
     }
