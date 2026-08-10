@@ -292,9 +292,10 @@ def _validate_tensor(tensor: Npq0STensor) -> tuple[int, int, int]:
         raise ValueError("NPQ0-S shape does not match neuron dimensions")
     ng = math.ceil(tensor.neuron_len / _GROUP_SIZE)
     nvec = tensor.neuron_len // _VECTOR_SIZE
-    anchors = np.asarray(tensor.neuron_scale, dtype=np.float32)
-    if not np.isfinite(anchors).all() or np.any(anchors < 0):
-        raise ValueError("NPQ0-S neuron anchors must be finite and non-negative")
+    with np.errstate(over="ignore", invalid="ignore"):
+        anchors = np.asarray(tensor.neuron_scale, dtype=np.float32).astype(np.float16)
+    if not np.isfinite(anchors).all() or np.signbit(anchors).any():
+        raise ValueError("NPQ0-S neuron anchors must be finite and non-negative in FP16")
     state = np.asarray(tensor.state)
     indices = np.asarray(tensor.indices)
     if state.shape != (out, ng):

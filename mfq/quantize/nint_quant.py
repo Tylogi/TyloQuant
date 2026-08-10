@@ -759,6 +759,8 @@ def quantize(
     W = np.asarray(weight, dtype=np.float32)
     if W.ndim < 2:
         raise ValueError(f"nint_quant 需要 ndim>=2 的张量，得到 shape {W.shape}；1D 请用 mfq.formats.nint")
+    if not np.isfinite(W).all():
+        raise ValueError("NINT weights must be finite")
     shape = W.shape
     Wt = np.moveaxis(W, axis, 0)
     out = Wt.shape[0]

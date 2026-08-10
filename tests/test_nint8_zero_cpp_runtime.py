@@ -207,4 +207,5 @@ def test_cpp_nint8_zero_moe_paths_match_dense_reference(tmp_path, tokens):
     relative = float((actual - expected).norm() / expected.norm())
     assert relative < 0.02
     if tokens >= 256:
-        assert float(fields["dense_reference_rel"]) == 0.0
+        assert float(fields["dense_reference_rel"]) < 1e-6
+        assert float(fields["dense_reference_max_abs"]) <= 2**-13

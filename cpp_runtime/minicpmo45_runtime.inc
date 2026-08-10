@@ -108,44 +108,7 @@ static torch::Tensor minicpmo45_embedding(
         torch::Tensor ids,
         torch::ScalarType output_dtype = torch::kBFloat16) {
     ids = ids.contiguous().to(torch::kCUDA, torch::kInt64);
-    torch::Tensor output;
-    if (embedding.is_dense()) {
-        auto shape = ids.sizes().vec();
-        shape.push_back(embedding.dense.size(1));
-        output = embedding.dense.index_select(
-            0, ids.reshape({-1})).reshape(shape);
-    } else if (embedding.is_nvq()) {
-        output = nvq_embedding(embedding.nvq.w, ids);
-    } else if (embedding.is_nint()) {
-        if (embedding.nint.w.q8_zero) {
-            output = nint8_zero_embedding_lookup_cuda(
-                embedding.nint.w.q_packed,
-                embedding.nint.w.q8_zero_scale,
-                ids, embedding.nint.w.neuron_len);
-        } else if (embedding.nint.w.bits == 4) {
-            output = nint_embedding_lookup_packed_compact_cuda(
-                embedding.nint.w.q_packed,
-                embedding.nint.w.sub_scale,
-                embedding.nint.w.sub_min,
-                embedding.nint.w.neuron_scale,
-                embedding.nint.w.neuron_min,
-                ids, embedding.nint.w.neuron_len,
-                embedding.nint.w.gs);
-        } else {
-            output = nint_embedding_lookup_packed_compact_bits_cuda(
-                embedding.nint.w.q_packed,
-                embedding.nint.w.sub_scale,
-                embedding.nint.w.sub_min,
-                embedding.nint.w.neuron_scale,
-                embedding.nint.w.neuron_min,
-                ids, embedding.nint.w.neuron_len,
-                embedding.nint.w.gs,
-                embedding.nint.w.bits);
-        }
-    } else {
-        throw std::runtime_error(
-            "MiniCPM-o embedding does not support MXFP8");
-    }
+    auto output = quant_embedding_lookup(embedding, ids);
     return output.to(output_dtype).contiguous();
 }
 

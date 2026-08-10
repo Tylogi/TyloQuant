@@ -38,6 +38,7 @@ def test_quantize_nepq_a_fixed_builds_residual_streams_on_cpu(spec):
     )
     assert tensor.spec is spec
     assert tensor.residual_codebook.dtype == np.float16
+    assert np.any(np.all(tensor.residual_codebook == 0, axis=1))
     assert tensor.residual_first.shape == (
         tensor.n_experts,
         tensor.out_per_expert,

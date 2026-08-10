@@ -191,12 +191,17 @@ def unpack_bits(blob: bytes, off: int, count: int, bits: int) -> tuple[np.ndarra
 def pack_nint(tensor: NintTensor) -> bytes:
     s = tensor.spec
     out, ng, _gs = tensor.q.shape
+    with np.errstate(over="ignore", invalid="ignore"):
+        neuron_scale = np.ascontiguousarray(tensor.neuron_scale, dtype=np.float16)
+        neuron_min = np.ascontiguousarray(tensor.neuron_min, dtype=np.float16)
+    if not np.isfinite(neuron_scale).all() or not np.isfinite(neuron_min).all():
+        raise ValueError("NINT neuron metadata must remain finite in FP16 storage")
     parts = [_NINT_HDR.pack(s.bits, s.sub_bits, s.groupsize, tensor.axis, tensor.neuron_len)]
     parts.append(struct.pack("<I", len(tensor.shape)))
     parts.append(struct.pack(f"<{len(tensor.shape)}q", *tensor.shape))
     parts.append(struct.pack("<II", out, ng))
-    parts.append(np.ascontiguousarray(tensor.neuron_scale, dtype=np.float16).tobytes())
-    parts.append(np.ascontiguousarray(tensor.neuron_min, dtype=np.float16).tobytes())
+    parts.append(neuron_scale.tobytes())
+    parts.append(neuron_min.tobytes())
     parts.append(pack_bits(tensor.sub_scale, s.sub_bits))
     parts.append(pack_bits(tensor.sub_min, s.sub_bits))
     parts.append(pack_bits(tensor.q, s.bits))
@@ -218,6 +223,8 @@ def unpack_nint(blob: bytes) -> NintTensor:
     off += out * 2
     neuron_min = np.frombuffer(blob, dtype=np.float16, count=out, offset=off).astype(np.float32)
     off += out * 2
+    if not np.isfinite(neuron_scale).all() or not np.isfinite(neuron_min).all():
+        raise ValueError("NINT neuron metadata must be finite")
     sub_count = out * ng
     q_count = out * ng * groupsize
     packed_tail = ((sub_count * sub_bits + 7) // 8) * 2 + (q_count * bits + 7) // 8

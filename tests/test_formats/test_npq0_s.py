@@ -83,6 +83,13 @@ def test_npq0_s_blob_roundtrip_without_k_padding() -> None:
         )
 
 
+def test_npq0_s_rejects_fp16_anchor_overflow() -> None:
+    tensor = _tensor(24)
+    tensor.neuron_scale[0] = 1e10
+    with pytest.raises(ValueError, match="FP16"):
+        pack_npq0_s(tensor)
+
+
 def test_npq0_s_rejects_the_old_vq64_profile() -> None:
     tensor = _tensor(24)
     table = bytearray(

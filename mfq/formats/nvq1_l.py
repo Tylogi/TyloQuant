@@ -259,6 +259,10 @@ def pack_nvq1_l(tensor: Nvq1LTensor) -> bytes:
         raise ValueError("NVQ1-L codebook index exceeds 11 bits")
     if np.any(np.asarray(tensor.delta_sign) > 1):
         raise ValueError("NVQ1-L delta_sign must contain only 0 or 1")
+    with np.errstate(over="ignore", invalid="ignore"):
+        anchors = np.ascontiguousarray(tensor.neuron_scale, dtype=np.float16)
+    if not np.isfinite(anchors).all() or np.signbit(anchors).any():
+        raise ValueError("NVQ1-L neuron anchors must be finite and non-negative in FP16")
 
     custom_codebook = (
         pack_ternary_codebook(tensor.codebook) if tensor.codebook is not None else b""
@@ -276,7 +280,7 @@ def pack_nvq1_l(tensor: Nvq1LTensor) -> bytes:
         struct.pack(f"<{len(shape)}q", *shape),
         struct.pack("<I", out),
         custom_codebook,
-        np.ascontiguousarray(tensor.neuron_scale, dtype=np.float16).tobytes(),
+        anchors.tobytes(),
         _pack_bits(tensor.sub_scale, spec.sub_bits),
         _pack_bits(tensor.indices, spec.index_bits),
         _pack_bits(tensor.delta_sign, 1),
@@ -325,6 +329,8 @@ def unpack_nvq1_l(blob: bytes) -> Nvq1LTensor:
         count=out,
         offset=off,
     ).astype(np.float32)
+    if not np.isfinite(neuron_scale).all() or np.signbit(neuron_scale).any():
+        raise ValueError("NVQ1-L neuron anchors must be finite and non-negative")
     off += anchor_bytes
     sub_scale, off = _unpack_bits(blob, off, out * ng, spec.sub_bits)
     indices, off = _unpack_bits(blob, off, out * nvec, spec.index_bits)

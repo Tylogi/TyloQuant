@@ -181,13 +181,9 @@ def train_tpq_codebook(
 
     values = _validate_points(points)
     if values.shape[1] != spec.vector_size:
-        raise ValueError(
-            f"TPQ-{spec.tier} expects {spec.vector_size}-D points"
-        )
+        raise ValueError(f"TPQ-{spec.tier} expects {spec.vector_size}-D points")
     if values.shape[0] < spec.codebook_entries:
-        raise ValueError(
-            f"TPQ-{spec.tier} needs at least {spec.codebook_entries} points"
-        )
+        raise ValueError(f"TPQ-{spec.tier} needs at least {spec.codebook_entries} points")
     take = min(values.shape[0], config.sample_points)
     best_codebook: torch.Tensor | None = None
     best_sse = float("inf")
@@ -216,9 +212,7 @@ def train_tpq_codebook(
             )
             numerator = torch.zeros_like(codebook)
             numerator.index_add_(0, labels, sample)
-            denominator = torch.bincount(
-                labels, minlength=spec.codebook_entries
-            ).to(torch.float32)
+            denominator = torch.bincount(labels, minlength=spec.codebook_entries).to(torch.float32)
             live = denominator > 0
             codebook[live] = numerator[live] / denominator[live, None]
             empty = ~live
@@ -260,8 +254,7 @@ def quantize_tpq_pq_fixed(
     matrix = torch.as_tensor(weight, dtype=torch.float32)
     if matrix.ndim != 2 or matrix.shape[1] % spec.vector_size:
         raise ValueError(
-            f"TPQ-{spec.tier} expects [rows, columns] with columns divisible "
-            f"by {spec.vector_size}"
+            f"TPQ-{spec.tier} expects [rows, columns] with columns divisible by {spec.vector_size}"
         )
     shape = (int(matrix.shape[0]), int(matrix.shape[1]))
     indices = assign_tpq_codebook(
@@ -297,9 +290,7 @@ def tpq_reconstruction_sums(
 
     matrix = torch.as_tensor(weight, dtype=torch.float32)
     if matrix.ndim != 2 or matrix.shape[1] % spec.vector_size:
-        raise ValueError(
-            f"TPQ-{spec.tier} expects a compatible 2-D matrix"
-        )
+        raise ValueError(f"TPQ-{spec.tier} expects a compatible 2-D matrix")
     target = _device(device)
     points = matrix.reshape(-1, spec.vector_size).to(target)
     table = torch.as_tensor(codebook, dtype=torch.float32, device=target)
@@ -307,9 +298,7 @@ def tpq_reconstruction_sums(
         spec.codebook_entries,
         spec.vector_size,
     ):
-        raise ValueError(
-            f"TPQ-{spec.tier} codebook shape is {tuple(table.shape)}"
-        )
+        raise ValueError(f"TPQ-{spec.tier} codebook shape is {tuple(table.shape)}")
     chunk = _distance_chunk_rows(spec.codebook_entries, distance_bytes)
     sse = 0.0
     signal = 0.0
@@ -370,9 +359,7 @@ def train_tpq_expert_codebook(
         dtype=torch.int64,
         device=values.device,
     ).reshape(-1)
-    if ids.numel() == 0 or bool((ids < 0).any()) or bool(
-        (ids >= values.shape[0]).any()
-    ):
+    if ids.numel() == 0 or bool((ids < 0).any()) or bool((ids >= values.shape[0]).any()):
         raise ValueError("TPQ expert cohort IDs are invalid")
     selected = values.index_select(0, ids)
     return train_tpq_codebook(
@@ -387,21 +374,17 @@ def dequantize_tpq_pq(tensor: TpqPqTensor) -> np.ndarray:
     """Restore a TPQ product-VQ matrix to float32."""
 
     indices = tensor.indices.reshape(-1)
-    if tensor.spec.index_bits in {12, 14}:
+    if tensor.spec.index_bits not in {8, 16}:
         from mfq.formats.tpq import unpack_tpq_indices
 
-        count = int(tensor.shape[0]) * (
-            int(tensor.shape[1]) // tensor.spec.vector_size
-        )
+        count = int(tensor.shape[0]) * (int(tensor.shape[1]) // tensor.spec.vector_size)
         indices, offset = unpack_tpq_indices(
             memoryview(indices),
             0,
             count,
             tensor.spec.index_bits,
         )
-        if offset != (
-            indices.size * tensor.spec.index_bits + 7
-        ) // 8:
+        if offset != (indices.size * tensor.spec.index_bits + 7) // 8:
             raise ValueError("TPQ packed index payload has an invalid tail")
     return tensor.codebook[indices].reshape(tensor.shape)
 
@@ -425,10 +408,7 @@ def quantize_tpq_int4(
         7,
     ).astype(np.int8)
     values = values.reshape(rows, columns) + 8
-    packed = (
-        values[:, 0::2].astype(np.uint8)
-        | (values[:, 1::2].astype(np.uint8) << 4)
-    )
+    packed = values[:, 0::2].astype(np.uint8) | (values[:, 1::2].astype(np.uint8) << 4)
     return TpqInt4Tensor(
         shape=(rows, columns),
         axis=0,
@@ -451,9 +431,7 @@ def dequantize_tpq_int4(tensor: TpqInt4Tensor) -> np.ndarray:
         columns // tensor.group_size,
         tensor.group_size,
     )
-    return (
-        groups * tensor.scales.astype(np.float32)[:, :, None]
-    ).reshape(tensor.shape)
+    return (groups * tensor.scales.astype(np.float32)[:, :, None]).reshape(tensor.shape)
 
 
 def save_tpq_codebook_artifact(

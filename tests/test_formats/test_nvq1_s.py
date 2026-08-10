@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from mfq.formats.nvq1_s import (
     NVQ1_S,
@@ -71,3 +72,19 @@ def test_nvq1_s_blob_roundtrip_for_both_tail_shapes():
             restored.neuron_scale,
             tensor.neuron_scale.astype(np.float16).astype(np.float32),
         )
+
+
+def test_nvq1_s_rejects_fp16_anchor_overflow() -> None:
+    tensor = Nvq1STensor(
+        spec=NVQ1_S,
+        shape=(1, 24),
+        axis=0,
+        neuron_len=24,
+        neuron_scale=np.asarray([1e10], dtype=np.float32),
+        sub_scale=np.ones((1, 1), dtype=np.uint8),
+        indices=np.asarray([[0, 1, 2]], dtype=np.uint16),
+        delta_sign=np.zeros((1, 1), dtype=np.uint8),
+        codebook=NVQ1_S_BOOTSTRAP_BANKS,
+    )
+    with pytest.raises(ValueError, match="FP16"):
+        pack_nvq1_s(tensor)

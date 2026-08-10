@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from mfq.formats import io
 from mfq.formats.nint import NintSpec
 from mfq.quantize import nint_quant
 
@@ -41,6 +42,18 @@ def test_gaussian_snr():
 def test_rejects_1d():
     with pytest.raises(ValueError):
         nint_quant.quantize(np.zeros(64, dtype=np.float32), NintSpec())
+
+
+def test_rejects_nonfinite_weights_and_fp16_metadata_overflow() -> None:
+    weight = np.zeros((2, 48), dtype=np.float32)
+    weight[0, 0] = np.nan
+    with pytest.raises(ValueError, match="weights must be finite"):
+        nint_quant.quantize(weight, NintSpec(4, 24, 6))
+
+    tensor = nint_quant.quantize(np.zeros((2, 48), dtype=np.float32), NintSpec(4, 24, 6))
+    tensor.neuron_scale[0] = 1e10
+    with pytest.raises(ValueError, match="FP16 storage"):
+        io.pack_nint(tensor)
 
 
 def test_allzero_row_stays_finite():

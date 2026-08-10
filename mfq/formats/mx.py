@@ -60,6 +60,12 @@ class MxTensor:
             raise ValueError("MX values and E8M0 scales must be byte arrays")
         if layout.values_nbytes != values.nbytes:
             raise ValueError("MX values are not a contiguous byte matrix")
+        raw_values = np.ascontiguousarray(values).view(np.uint8)
+        raw_scales = np.ascontiguousarray(scales).view(np.uint8)
+        if np.any(raw_scales == 255):
+            raise ValueError(f"{self.dtype} contains an E8M0 NaN scale")
+        if self.dtype == MXFP8_DTYPE and np.any((raw_values & 0x7F) == 0x7F):
+            raise ValueError("MXFP8 contains an E4M3 NaN code")
 
 
 def validate_mx_shapes(
@@ -90,9 +96,7 @@ def validate_mx_shapes(
         expected_storage = (rows, columns)
         expected_scales = ((rows + 127) // 128, columns // 128)
     if (storage_rows, storage_columns) != expected_storage:
-        raise ValueError(
-            f"{dtype} storage shape {storage_shape} != {expected_storage}"
-        )
+        raise ValueError(f"{dtype} storage shape {storage_shape} != {expected_storage}")
     if (scale_rows, scale_columns) != expected_scales:
         raise ValueError(f"{dtype} scale shape {scale_shape} != {expected_scales}")
     values_nbytes = storage_rows * storage_columns
@@ -155,8 +159,7 @@ def parse_mx_layout(dtype: str, blob: bytes | memoryview) -> MxTensorLayout:
     expected_kind = _KIND_MXFP4 if dtype == MXFP4_DTYPE else _KIND_MXFP8
     if magic != _MAGIC or version != _VERSION or kind != expected_kind or reserved:
         raise ValueError(
-            f"invalid {dtype} payload header: "
-            f"magic={magic!r}, version={version}, kind={kind}"
+            f"invalid {dtype} payload header: magic={magic!r}, version={version}, kind={kind}"
         )
     layout = validate_mx_shapes(
         dtype,
@@ -172,18 +175,26 @@ def parse_mx_layout(dtype: str, blob: bytes | memoryview) -> MxTensorLayout:
 
 def unpack_mx(dtype: str, blob: bytes | memoryview) -> MxTensor:
     layout = parse_mx_layout(dtype, blob)
-    values = np.frombuffer(
-        blob,
-        dtype=np.uint8,
-        count=layout.values_nbytes,
-        offset=layout.values_offset,
-    ).copy().reshape(layout.storage_shape)
-    scales = np.frombuffer(
-        blob,
-        dtype=np.uint8,
-        count=layout.scales_nbytes,
-        offset=layout.scales_offset,
-    ).copy().reshape(layout.scale_shape)
+    values = (
+        np.frombuffer(
+            blob,
+            dtype=np.uint8,
+            count=layout.values_nbytes,
+            offset=layout.values_offset,
+        )
+        .copy()
+        .reshape(layout.storage_shape)
+    )
+    scales = (
+        np.frombuffer(
+            blob,
+            dtype=np.uint8,
+            count=layout.scales_nbytes,
+            offset=layout.scales_offset,
+        )
+        .copy()
+        .reshape(layout.scale_shape)
+    )
     return MxTensor(dtype, layout.shape, values, scales)
 
 

@@ -24,7 +24,6 @@ from mfq.formats.nvq1_s import (
     unpack_nvq1_s_banked_codebook,
 )
 
-
 _GROUP_SIZE = 24
 _VECTOR_SIZE = 8
 _GROUPS_PER_SUPERGROUP = 4
@@ -101,12 +100,16 @@ class NepqSpec:
         bank_count: int = 1,
     ) -> float:
         weights = n_experts * out_per_expert * neuron_len
-        return 8.0 * self.payload_nbytes(
-            n_experts,
-            out_per_expert,
-            neuron_len,
-            bank_count=bank_count,
-        ) / weights
+        return (
+            8.0
+            * self.payload_nbytes(
+                n_experts,
+                out_per_expert,
+                neuron_len,
+                bank_count=bank_count,
+            )
+            / weights
+        )
 
 
 NEPQ0_S = NepqSpec(
@@ -190,9 +193,7 @@ def rotation_signs(width: int, block: int, seed: int) -> np.ndarray:
     """Build the deterministic signed-Hadamard diagonal for one tensor."""
 
     family = f"h{int(block)}"
-    digest = hashlib.blake2b(
-        f"{family}:{int(seed)}:{int(width)}".encode(), digest_size=16
-    ).digest()
+    digest = hashlib.blake2b(f"{family}:{int(seed)}:{int(width)}".encode(), digest_size=16).digest()
     rng = np.random.default_rng(int.from_bytes(digest, "little"))
     return np.where(rng.integers(0, 2, size=int(width)), 1, -1).astype(np.int8)
 
@@ -369,9 +370,7 @@ def _validate_dimensions(
 def _validate_table_payload(spec: NepqSpec, payload: bytes) -> None:
     base = nepq_base_spec(spec)
     if len(payload) != spec.table_bytes:
-        raise ValueError(
-            f"{spec.label} bank must contain {spec.table_bytes} bytes"
-        )
+        raise ValueError(f"{spec.label} bank must contain {spec.table_bytes} bytes")
     if base is NEPQ0_S:
         _, _, _, consumed = unpack_npq0_s_tables(payload)
     elif base is NEPQ0_L:
@@ -421,7 +420,9 @@ def validate_nepq(tensor: NepqTensor) -> tuple[int, int, int, int, int]:
                 f"bad {spec.label} {name} shape: {value.shape}, expected {expected_shape}"
             )
     anchor = np.asarray(tensor.neuron_scale, dtype=np.float32)
-    if not np.isfinite(anchor).all() or np.any(anchor < 0):
+    with np.errstate(over="ignore", invalid="ignore"):
+        stored_anchor = anchor.astype(np.float16)
+    if not np.isfinite(stored_anchor).all() or np.any(stored_anchor < 0):
         raise ValueError(f"{spec.label} anchors must be finite and non-negative")
     state = np.asarray(tensor.state)
     indices = np.asarray(tensor.indices)
@@ -442,9 +443,7 @@ def validate_nepq(tensor: NepqTensor) -> tuple[int, int, int, int, int]:
     aux = np.empty(0, dtype=np.uint8) if tensor.aux is None else np.asarray(tensor.aux)
     expected_aux = (n_experts, out_per_expert, ng) if spec.aux_bits else (0,)
     if aux.shape != expected_aux:
-        raise ValueError(
-            f"bad {spec.label} aux shape: {aux.shape}, expected {expected_aux}"
-        )
+        raise ValueError(f"bad {spec.label} aux shape: {aux.shape}, expected {expected_aux}")
     if spec.aux_bits:
         if not np.issubdtype(aux.dtype, np.integer):
             raise ValueError(f"{spec.label} aux must contain integers")
@@ -483,7 +482,9 @@ def validate_nepq(tensor: NepqTensor) -> tuple[int, int, int, int, int]:
             f"bad {spec.label} residual dictionary shape: {dictionary.shape}, "
             f"expected {expected_dictionary}"
         )
-    if not np.isfinite(dictionary.astype(np.float32)).all():
+    with np.errstate(over="ignore", invalid="ignore"):
+        stored_dictionary = dictionary.astype(np.float16)
+    if not np.isfinite(stored_dictionary).all():
         raise ValueError(f"{spec.label} residual dictionary must be finite")
     blocks_per_row = math.ceil(nvec / spec.residual_block_vectors)
     expected_first = (n_experts, out_per_expert, blocks_per_row)
@@ -507,9 +508,7 @@ def validate_nepq(tensor: NepqTensor) -> tuple[int, int, int, int, int]:
             raise ValueError(f"{spec.label} second residual mask must be binary")
         records = np.asarray(second_records)
         if records.ndim != 1 or records.size != int(np.count_nonzero(mask)):
-            raise ValueError(
-                f"{spec.label} compact second residual count does not match its mask"
-            )
+            raise ValueError(f"{spec.label} compact second residual count does not match its mask")
         _validate_residual_records(
             spec,
             records,
@@ -539,8 +538,7 @@ def _validate_residual_records(
     flat = values.reshape(-1).astype(np.uint32, copy=False)
     if np.any(flat >= (1 << spec.residual_record_bits)):
         raise ValueError(
-            f"{spec.label} {name} residual record exceeds "
-            f"{spec.residual_record_bits} bits"
+            f"{spec.label} {name} residual record exceeds {spec.residual_record_bits} bits"
         )
     position_mask = (1 << spec.residual_position_bits) - 1
     positions = flat & position_mask
@@ -569,26 +567,26 @@ def pack_nepq(tensor: NepqTensor) -> bytes:
     n_experts, out_per_expert, neuron_len = (int(value) for value in tensor.shape)
     aux = np.empty(0, dtype=np.uint8) if tensor.aux is None else np.asarray(tensor.aux)
     parts = [
-            _HEADER.pack(
-                _MAGIC,
-                _VERSION,
-                spec.profile_id,
-                spec.groups_per_supergroup,
-                flags,
-                n_experts,
-                out_per_expert,
-                neuron_len,
-                bank_count,
-                int(tensor.rotation_block),
-                int(tensor.rotation_seed),
-            ),
-            np.ascontiguousarray(tensor.table_payloads, dtype=np.uint8).tobytes(),
-            np.ascontiguousarray(tensor.neuron_scale, dtype="<f2").tobytes(),
-            _pack_bits(np.asarray(tensor.state), spec.state_bits),
-            _pack_bits(np.asarray(tensor.indices), spec.index_bits),
-            _pack_bits(aux, spec.aux_bits),
-            np.ascontiguousarray(tensor.bank_ids, dtype=np.uint8).tobytes(),
-        ]
+        _HEADER.pack(
+            _MAGIC,
+            _VERSION,
+            spec.profile_id,
+            spec.groups_per_supergroup,
+            flags,
+            n_experts,
+            out_per_expert,
+            neuron_len,
+            bank_count,
+            int(tensor.rotation_block),
+            int(tensor.rotation_seed),
+        ),
+        np.ascontiguousarray(tensor.table_payloads, dtype=np.uint8).tobytes(),
+        np.ascontiguousarray(tensor.neuron_scale, dtype="<f2").tobytes(),
+        _pack_bits(np.asarray(tensor.state), spec.state_bits),
+        _pack_bits(np.asarray(tensor.indices), spec.index_bits),
+        _pack_bits(aux, spec.aux_bits),
+        np.ascontiguousarray(tensor.bank_ids, dtype=np.uint8).tobytes(),
+    ]
     if spec.is_residual:
         first = np.asarray(tensor.residual_first)
         second = np.asarray(
@@ -666,16 +664,20 @@ def unpack_nepq(blob: bytes | memoryview) -> NepqTensor:
     table_nbytes = int(bank_count) * spec.table_bytes
     if offset + table_nbytes > len(blob):
         raise ValueError("truncated NEPQ table pool")
-    table_payloads = np.frombuffer(
-        blob, dtype=np.uint8, count=table_nbytes, offset=offset
-    ).copy().reshape(int(bank_count), spec.table_bytes)
+    table_payloads = (
+        np.frombuffer(blob, dtype=np.uint8, count=table_nbytes, offset=offset)
+        .copy()
+        .reshape(int(bank_count), spec.table_bytes)
+    )
     offset += table_nbytes
     anchor_nbytes = 2 * rows
     if offset + anchor_nbytes > len(blob):
         raise ValueError("truncated NEPQ neuron anchors")
-    neuron_scale = np.frombuffer(
-        blob, dtype="<f2", count=rows, offset=offset
-    ).astype(np.float32).reshape(int(n_experts), int(out_per_expert))
+    neuron_scale = (
+        np.frombuffer(blob, dtype="<f2", count=rows, offset=offset)
+        .astype(np.float32)
+        .reshape(int(n_experts), int(out_per_expert))
+    )
     offset += anchor_nbytes
     state, offset = _unpack_bits(blob, offset, rows * ng, spec.state_bits)
     indices, offset = _unpack_bits(blob, offset, rows * nvec, spec.index_bits)
@@ -684,9 +686,11 @@ def unpack_nepq(blob: bytes | memoryview) -> NepqTensor:
     selector_end = offset + selector_count
     if selector_end > len(blob):
         raise ValueError("truncated NEPQ bank selectors")
-    bank_ids = np.frombuffer(
-        blob, dtype=np.uint8, count=selector_count, offset=offset
-    ).copy().reshape(int(n_experts), int(out_per_expert), nsuper)
+    bank_ids = (
+        np.frombuffer(blob, dtype=np.uint8, count=selector_count, offset=offset)
+        .copy()
+        .reshape(int(n_experts), int(out_per_expert), nsuper)
+    )
     offset = selector_end
     residual_codebook = None
     residual_first = None
@@ -727,9 +731,11 @@ def unpack_nepq(blob: bytes | memoryview) -> NepqTensor:
         dictionary_nbytes = dictionary_values * 2
         if offset + dictionary_nbytes > len(blob):
             raise ValueError("truncated NEPQ sparse residual dictionary")
-        residual_codebook = np.frombuffer(
-            blob, dtype="<f2", count=dictionary_values, offset=offset
-        ).copy().reshape(_RESIDUAL_DICTIONARY_ENTRIES, spec.vector_size)
+        residual_codebook = (
+            np.frombuffer(blob, dtype="<f2", count=dictionary_values, offset=offset)
+            .copy()
+            .reshape(_RESIDUAL_DICTIONARY_ENTRIES, spec.vector_size)
+        )
         offset += dictionary_nbytes
         residual_first, offset = _unpack_bits(
             blob, offset, expected_blocks, spec.residual_record_bits
@@ -738,9 +744,7 @@ def unpack_nepq(blob: bytes | memoryview) -> NepqTensor:
             int(n_experts), int(out_per_expert), expected_blocks_per_row
         )
         if spec.residual_second:
-            residual_second_mask, offset = _unpack_bits(
-                blob, offset, expected_blocks, 1
-            )
+            residual_second_mask, offset = _unpack_bits(blob, offset, expected_blocks, 1)
             residual_second_mask = residual_second_mask.reshape(
                 int(n_experts), int(out_per_expert), expected_blocks_per_row
             )
@@ -765,11 +769,7 @@ def unpack_nepq(blob: bytes | memoryview) -> NepqTensor:
         neuron_scale=neuron_scale,
         state=state.reshape(int(n_experts), int(out_per_expert), ng),
         indices=indices.reshape(int(n_experts), int(out_per_expert), nvec),
-        aux=(
-            aux.reshape(int(n_experts), int(out_per_expert), ng)
-            if spec.aux_bits
-            else None
-        ),
+        aux=(aux.reshape(int(n_experts), int(out_per_expert), ng) if spec.aux_bits else None),
         bank_ids=bank_ids,
         table_payloads=table_payloads,
         rotation_block=int(rotation_block),
@@ -841,15 +841,9 @@ def dequantize_nepq_rows(
     indices = np.asarray(tensor.indices, dtype=np.uint16).reshape(rows, nvec)[start:stop]
     anchors = np.asarray(tensor.neuron_scale, dtype=np.float32).reshape(rows)[start:stop]
     bank_ids = np.asarray(tensor.bank_ids, dtype=np.uint8).reshape(rows, -1)[start:stop]
-    group_bank = np.repeat(
-        bank_ids, spec.groups_per_supergroup, axis=1
-    )[:, :ng]
-    vector_bank = np.repeat(group_bank, spec.groupsize // spec.vector_size, axis=1)[
-        :, :nvec
-    ]
-    vector_state = np.repeat(
-        state, spec.groupsize // spec.vector_size, axis=1
-    )[:, :nvec]
+    group_bank = np.repeat(bank_ids, spec.groups_per_supergroup, axis=1)[:, :ng]
+    vector_bank = np.repeat(group_bank, spec.groupsize // spec.vector_size, axis=1)[:, :nvec]
+    vector_state = np.repeat(state, spec.groupsize // spec.vector_size, axis=1)[:, :nvec]
     tables = _decoded_tables(tensor) if decoded_tables is None else decoded_tables
     if base is NEPQ0_S or base is NEPQ0_L:
         scale_lut, first, second = tables
@@ -864,9 +858,7 @@ def dequantize_nepq_rows(
         result = code.astype(np.float32) * scale
     elif base is NEPQ1_S:
         aux = np.asarray(tensor.aux, dtype=np.uint8).reshape(rows, ng)[start:stop]
-        vector_aux = np.repeat(aux, spec.groupsize // spec.vector_size, axis=1)[
-            :, :nvec
-        ]
+        vector_aux = np.repeat(aux, spec.groupsize // spec.vector_size, axis=1)[:, :nvec]
         code = tables[vector_bank, vector_aux, indices]
         delta = np.where(aux != 0, -0.15625, 0.15625).astype(np.float32)
         group_scale = anchors[:, None] * state.astype(np.float32)
@@ -915,9 +907,7 @@ def _add_sparse_residual_rows(
             dictionary_id = record >> position_bits
             vector = block * block_vectors + position
             offset = vector * spec.vector_size
-            result[local_row, offset : offset + spec.vector_size] += dictionary[
-                dictionary_id
-            ]
+            result[local_row, offset : offset + spec.vector_size] += dictionary[dictionary_id]
             if second_dense is not None:
                 record = int(second_dense[local_row, block])
                 if record >= 0:

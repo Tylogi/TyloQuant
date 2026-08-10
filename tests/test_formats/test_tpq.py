@@ -91,6 +91,10 @@ def test_tpq_projection_indices_roundtrip_every_packed_width(bits: int) -> None:
         indices=values,
         codebook=np.arange(entries * 2, dtype=np.float32).reshape(entries, 2),
     )
+    np.testing.assert_array_equal(
+        dequantize_tpq_pq(tensor),
+        tensor.codebook[values].reshape(tensor.shape),
+    )
     decoded = unpack_tpq_pq(pack_tpq_pq(tensor))
     assert decoded.spec == spec
     decoded_payload = (
@@ -105,15 +109,31 @@ def test_tpq_projection_indices_roundtrip_every_packed_width(bits: int) -> None:
         bits,
     )
     np.testing.assert_array_equal(decoded_values.reshape(values.shape), values)
+    np.testing.assert_array_equal(
+        dequantize_tpq_pq(decoded),
+        tensor.codebook[values].reshape(tensor.shape),
+    )
+
+
+def test_tpq_projection_packed_indices_reject_missing_codeword() -> None:
+    spec = TpqPqSpec("p", 2, 300, 12)
+    packed = np.full((4 * 8 * 12 + 7) // 8, 0xFF, dtype=np.uint8)
+    with pytest.raises(ValueError, match="missing codeword"):
+        TpqPqTensor(
+            spec=spec,
+            shape=(4, 16),
+            axis=0,
+            neuron_len=16,
+            indices=packed,
+            codebook=np.zeros((300, 2), dtype=np.float32),
+        )
 
 
 def test_tpq_pq_roundtrip_all_tiers() -> None:
     rng = np.random.default_rng(20260726)
     for spec in (TPQ_X, TPQ_W, TPQ_V, TPQ_VV):
         weight = rng.normal(size=(3, 24)).astype(np.float32)
-        codebook = rng.normal(
-            size=(spec.codebook_entries, spec.vector_size)
-        ).astype(np.float32)
+        codebook = rng.normal(size=(spec.codebook_entries, spec.vector_size)).astype(np.float32)
         tensor = quantize_tpq_pq_fixed(
             weight,
             spec,
@@ -259,9 +279,7 @@ def test_tpq_tiers_and_nintm_roundtrip() -> None:
     rng = np.random.default_rng(81)
     weight = rng.normal(size=(4, 2, 24)).astype(np.float32)
     codebooks = {
-        family: rng.normal(
-            size=(spec.codebook_entries, spec.vector_size)
-        ).astype(np.float32)
+        family: rng.normal(size=(spec.codebook_entries, spec.vector_size)).astype(np.float32)
         for family, spec in {
             "TPQ-X": TPQ_X,
             "TPQ-W": TPQ_W,
@@ -354,9 +372,7 @@ def test_prepare_tpq_scheme_is_consumable(tmp_path: Path) -> None:
         "blk.0.ffn_gate_up_exps.weight",
         "blk.0.ffn_down_exps.weight",
     }
-    assert restored.require_expert(
-        "blk.0.ffn_gate_up_exps.weight"
-    ).precisions[0].family == "TPQ-VV"
+    assert restored.require_expert("blk.0.ffn_gate_up_exps.weight").precisions[0].family == "TPQ-VV"
 
 
 def test_prepare_tpq_scheme_accepts_fixed_tier_fragment(tmp_path: Path) -> None:
@@ -365,9 +381,7 @@ def test_prepare_tpq_scheme_accepts_fixed_tier_fragment(tmp_path: Path) -> None:
         '"tiers_per_layer":{"0":"Vvwx"},',
         encoding="utf-8",
     )
-    assert load_tpq_tier_profile(profile) == {
-        0: ("vv", "v", "w", "x")
-    }
+    assert load_tpq_tier_profile(profile) == {0: ("vv", "v", "w", "x")}
     output = tmp_path / "scheme.json"
     prepare(
         profile_path=profile,
@@ -381,7 +395,5 @@ def test_prepare_tpq_scheme_accepts_fixed_tier_fragment(tmp_path: Path) -> None:
     assert restored.metadata["tier_source"] == "fixed_tiers_per_layer"
     assert tuple(
         precision.family
-        for precision in restored.require_expert(
-            "blk.0.ffn_gate_up_exps.weight"
-        ).precisions
+        for precision in restored.require_expert("blk.0.ffn_gate_up_exps.weight").precisions
     ) == ("TPQ-VV", "TPQ-V", "TPQ-W", "TPQ-X")

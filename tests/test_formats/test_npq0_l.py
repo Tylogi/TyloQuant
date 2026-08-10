@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from mfq.formats.npq0_l import (
     NPQ0_L,
@@ -76,3 +77,10 @@ def test_npq0_l_blob_roundtrip_without_k_padding() -> None:
             restored.neuron_scale,
             tensor.neuron_scale.astype(np.float16).astype(np.float32),
         )
+
+
+def test_npq0_l_rejects_fp16_anchor_overflow() -> None:
+    tensor = _tensor(24)
+    tensor.neuron_scale[0] = 1e10
+    with pytest.raises(ValueError, match="FP16"):
+        pack_npq0_l(tensor)

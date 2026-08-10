@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Iterable
 
 import torch
 
@@ -85,9 +85,9 @@ class ExpertWiseNintWeight:
     _hetero_metadata: dict[str, tuple[torch.Tensor, ...]] = field(
         default_factory=dict, init=False, repr=False
     )
-    _hetero_workspaces: dict[tuple, tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], torch.Tensor]] = field(
-        default_factory=dict, init=False, repr=False
-    )
+    _hetero_workspaces: dict[
+        tuple, tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], torch.Tensor]
+    ] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.n_experts <= 0 or self.out_per_expert <= 0 or self.neuron_len <= 0:
@@ -101,9 +101,7 @@ class ExpertWiseNintWeight:
             g = pool.weight
             expected_rows = len(pool.expert_ids) * self.out_per_expert
             if int(g["out"]) != expected_rows:
-                raise ValueError(
-                    f"pool {pool_index} has {g['out']} rows; expected {expected_rows}"
-                )
+                raise ValueError(f"pool {pool_index} has {g['out']} rows; expected {expected_rows}")
             if int(g["neuron_len"]) != self.neuron_len:
                 raise ValueError(f"pool {pool_index} input width mismatch")
             bits = int(g.get("bits", 4))
@@ -125,7 +123,7 @@ class ExpertWiseNintWeight:
         weight: dict,
         n_experts: int,
         out_per_expert: int | None = None,
-    ) -> "ExpertWiseNintWeight":
+    ) -> ExpertWiseNintWeight:
         if out_per_expert is None:
             if int(weight["out"]) % n_experts:
                 raise ValueError("flattened expert rows are not divisible by n_experts")
@@ -204,7 +202,9 @@ class ExpertWiseNintWeight:
     def hetero_workspace(
         self, x: torch.Tensor, input_rows: int
     ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], torch.Tensor]:
-        profile_shapes = tuple((int(pool.weight["gs"]), int(pool.weight["ng"])) for pool in self.pools)
+        profile_shapes = tuple(
+            (int(pool.weight["gs"]), int(pool.weight["ng"])) for pool in self.pools
+        )
         key = (str(x.device), int(input_rows), profile_shapes)
         cached = self._hetero_workspaces.get(key)
         if cached is not None:
@@ -212,10 +212,8 @@ class ExpertWiseNintWeight:
         qx_list: list[torch.Tensor] = []
         xscale_list: list[torch.Tensor] = []
         pointers: list[list[int]] = []
-        for pool, (gs, groups) in zip(self.pools, profile_shapes, strict=True):
-            qx, xscale = self.activation_workspace(
-                x, gs=gs, groups=groups, input_rows=input_rows
-            )
+        for _pool, (gs, groups) in zip(self.pools, profile_shapes, strict=True):
+            qx, xscale = self.activation_workspace(x, gs=gs, groups=groups, input_rows=input_rows)
             qx_list.append(qx)
             xscale_list.append(xscale)
             pointers.append([int(qx.data_ptr()), int(xscale.data_ptr())])
@@ -247,7 +245,7 @@ class ExpertWiseMixedWeight:
             raise ValueError("expert-wise mixed weight must contain at least one pool")
         owners = [-1] * self.n_experts
         for pool_index, pool in enumerate(self.pools):
-            if pool.family not in {"nint", "nvq", "nepq"}:
+            if pool.family not in {"nint", "nint8_zero", "nvq", "nepq", "mxfp4", "tpq"}:
                 raise ValueError(f"unsupported expert cohort family: {pool.family}")
             if not pool.expert_ids:
                 raise ValueError("expert-wise mixed pool cannot be empty")
@@ -324,13 +322,13 @@ class MoeRoutePlan:
         return self.tokens <= 8 or self.ids_dst.numel() == self.ids.numel()
 
     @classmethod
-    def build(cls, ids: torch.Tensor, n_experts: int) -> "MoeRoutePlan":
+    def build(cls, ids: torch.Tensor, n_experts: int) -> MoeRoutePlan:
         if ids.ndim != 2:
             raise ValueError("ids must have [tokens, routes] shape")
         ids = ids.contiguous().to(device=ids.device, dtype=torch.int32)
         if int(ids.shape[0]) > 8:
-            ids_dst, expert_bounds, tile_bounds, tile_experts, counts = ext().moe_build_expert_map_cuda(
-                ids, int(n_experts), 8
+            ids_dst, expert_bounds, tile_bounds, tile_experts, counts = (
+                ext().moe_build_expert_map_cuda(ids, int(n_experts), 8)
             )
             cursors = torch.empty(0, device=ids.device, dtype=torch.int32)
         else:
@@ -394,9 +392,7 @@ def sqrtsoftplus_weights(
     """Gather hash-selected router weights using DeepSeek V4's transform."""
 
     logits = logits.reshape(-1, logits.shape[-1]).contiguous()
-    ids = ids.reshape(logits.shape[0], -1).contiguous().to(
-        device=logits.device, dtype=torch.int32
-    )
+    ids = ids.reshape(logits.shape[0], -1).contiguous().to(device=logits.device, dtype=torch.int32)
     return ext().moe_sqrtsoftplus_weights_cuda(
         logits,
         ids,
@@ -457,6 +453,45 @@ def _grouped_matmul_mixed(
     quantized: set[tuple] = set()
     for pool in weight.pools:
         g = pool.weight
+        expert_local = pool.local_map(weight.n_experts, x.device)
+        if pool.family == "mxfp4":
+            ext().mxfp4_moe_grouped_matmul_pool_f16_cuda(
+                g["values"],
+                g["scales"],
+                x,
+                route.ids,
+                expert_local,
+                weight.n_experts,
+                len(pool.expert_ids),
+                weight.out_per_expert,
+                weight.neuron_len,
+                out,
+                route.ids_dst,
+                route.expert_bounds,
+                route.tile_bounds,
+                route.tile_experts,
+            )
+            continue
+        if pool.family == "tpq":
+            ext().tpq_pq_moe_grouped_matmul_pool_f16_cuda(
+                g["packed"],
+                g["codebook"],
+                x,
+                route.ids,
+                expert_local,
+                weight.n_experts,
+                len(pool.expert_ids),
+                weight.out_per_expert,
+                weight.neuron_len,
+                int(g["vector_size"]),
+                int(g["index_bits"]),
+                out,
+                route.ids_dst,
+                route.expert_bounds,
+                route.tile_bounds,
+                route.tile_experts,
+            )
+            continue
         if pool.family == "nepq" and int(g.get("rotation_block", 0)):
             transform_key = (
                 "hadamard",
@@ -470,7 +505,7 @@ def _grouped_matmul_mixed(
         else:
             transform_key = ("identity",)
             value = x
-        gs = int(g["gs"])
+        gs = 32 if pool.family == "nint8_zero" else int(g["gs"])
         groups = int(g["ng"])
         activation_key = (transform_key, gs, groups)
         qx, xscale = weight.activation_workspace(
@@ -481,7 +516,6 @@ def _grouped_matmul_mixed(
             transform_key=transform_key,
         )
         input_quantized = activation_key in quantized
-        expert_local = pool.local_map(weight.n_experts, x.device)
         if pool.family == "nint":
             ext().nint_moe_grouped_matmul_pool_ws_cuda(
                 g["q_packed"],
@@ -499,6 +533,29 @@ def _grouped_matmul_mixed(
                 int(g.get("bits", 4)),
                 route.map_ready,
                 input_quantized,
+                out,
+                qx,
+                xscale,
+                route.counts,
+                route.cursors,
+                route.ids_dst,
+                route.expert_bounds,
+                route.tile_bounds,
+                route.tile_experts,
+            )
+        elif pool.family == "nint8_zero":
+            ext().nint8_zero_moe_grouped_matmul_pool_ws_cuda(
+                g["q"],
+                g["scale"],
+                value,
+                route.ids,
+                expert_local,
+                weight.n_experts,
+                len(pool.expert_ids),
+                weight.out_per_expert,
+                route.map_ready,
+                input_quantized,
+                False,
                 out,
                 qx,
                 xscale,
@@ -613,9 +670,7 @@ def grouped_matmul(
         gs = int(g["gs"])
         groups = int(g["ng"])
         key = (gs, groups)
-        qx, xscale = weight.activation_workspace(
-            x, gs=gs, groups=groups, input_rows=input_rows
-        )
+        qx, xscale = weight.activation_workspace(x, gs=gs, groups=groups, input_rows=input_rows)
         ext().nint_moe_grouped_matmul_pool_ws_cuda(
             g["q_packed"],
             g["sub_scale"],
@@ -693,9 +748,7 @@ def weighted_reduce_shared_gate(
         pair_output.contiguous().to(torch.float16),
         weights.contiguous().to(device=pair_output.device, dtype=torch.float32),
         shared.contiguous().to(device=pair_output.device, dtype=torch.float16),
-        gate_logits.reshape(-1, 1).contiguous().to(
-            device=pair_output.device, dtype=torch.float32
-        ),
+        gate_logits.reshape(-1, 1).contiguous().to(device=pair_output.device, dtype=torch.float32),
     )
 
 
@@ -751,12 +804,18 @@ def to_gpu(
 ) -> ExpertWiseNintWeight | ExpertWiseMixedWeight:
     """Upload an :class:`NintMoeTensor` as native execution cohorts."""
 
-    from mfq.formats.nepq import NepqTensor
     from mfq.formats.moe import NintMoeTensor
-    from mfq.quantize.nint_quant import NintTensor
+    from mfq.formats.mx import MxTensor
+    from mfq.formats.nepq import NepqTensor
+    from mfq.formats.nint8_zero import Nint8ZeroTensor
+    from mfq.formats.tpq import TpqPqTensor
+    from mfq.kernels.cuda.mx_matmul import to_gpu_mx
     from mfq.kernels.cuda.nepq_matmul import to_gpu_nepq
+    from mfq.kernels.cuda.nint8_zero_matmul import to_gpu_nint8_zero
     from mfq.kernels.cuda.nvq_matmul import to_gpu_nvq
+    from mfq.kernels.cuda.tpq_matmul import to_gpu_tpq
     from mfq.kernels.torch_backend import to_gpu as nint_to_gpu
+    from mfq.quantize.nint_quant import NintTensor
 
     if not isinstance(tensor, NintMoeTensor):
         raise TypeError("to_gpu expects NintMoeTensor")
@@ -781,9 +840,20 @@ def to_gpu(
         if isinstance(pool.tensor, NintTensor):
             family = "nint"
             packed = nint_to_gpu(pool.tensor, device=device, layout="deploy")
+        elif isinstance(pool.tensor, Nint8ZeroTensor):
+            family = "nint8_zero"
+            packed = to_gpu_nint8_zero(pool.tensor, device=device)
         elif isinstance(pool.tensor, NepqTensor):
             family = "nepq"
             packed = to_gpu_nepq(pool.tensor, device=device)
+        elif isinstance(pool.tensor, MxTensor):
+            if pool.tensor.dtype != "MXFP4":
+                raise ValueError("NINTM CUDA execution supports MXFP4 expert pools")
+            family = "mxfp4"
+            packed = to_gpu_mx(pool.tensor, device=device)
+        elif isinstance(pool.tensor, TpqPqTensor):
+            family = "tpq"
+            packed = to_gpu_tpq(pool.tensor, device=device)
         else:
             family = "nvq"
             packed = to_gpu_nvq(pool.tensor, device=device)

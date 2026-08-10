@@ -23,14 +23,8 @@ class TpqPqSpec:
         if self.vector_size <= 0 or self.codebook_entries <= 1:
             raise ValueError("TPQ vector size and codebook size must be positive")
         bits = self.storage_bits
-        if bits is not None and (
-            not 8 <= bits <= 16
-            or self.codebook_entries > 1 << bits
-        ):
-            raise ValueError(
-                "TPQ storage width must be 8..16 bits and cover "
-                "the complete codebook"
-            )
+        if bits is not None and (not 8 <= bits <= 16 or self.codebook_entries > 1 << bits):
+            raise ValueError("TPQ storage width must be 8..16 bits and cover the complete codebook")
 
     @property
     def index_bits(self) -> int:
@@ -57,10 +51,7 @@ TPQ_VV = TpqPqSpec("vv", 4, 4096)
 # in every payload.  This object is only the public dtype marker.
 TPQ_P = TpqPqSpec("p", 1, 256, 8)
 
-TPQ_PQ_SPECS = {
-    spec.label: spec
-    for spec in (TPQ_X, TPQ_W, TPQ_V, TPQ_VV)
-}
+TPQ_PQ_SPECS = {spec.label: spec for spec in (TPQ_X, TPQ_W, TPQ_V, TPQ_VV)}
 TPQ_PQ_SPECS_BY_LABEL = dict(TPQ_PQ_SPECS)
 
 _SPEC_BY_TIER = {spec.tier: spec for spec in TPQ_PQ_SPECS.values()}
@@ -109,47 +100,40 @@ class TpqPqTensor:
         indices = np.ascontiguousarray(self.indices)
         bits = self.spec.index_bits
         if bits not in {8, 16}:
-            packed_nbytes = (
-                expected_indices[0] * expected_indices[1] * bits + 7
-            ) // 8
+            packed_nbytes = (expected_indices[0] * expected_indices[1] * bits + 7) // 8
             if tuple(indices.shape) == expected_indices:
-                if (
-                    indices.size
-                    and int(indices.max()) >= self.spec.codebook_entries
-                ):
-                    raise ValueError(
-                        "TPQ-PQ index references a missing codeword"
-                    )
+                if indices.size and int(indices.max()) >= self.spec.codebook_entries:
+                    raise ValueError("TPQ-PQ index references a missing codeword")
                 indices = np.frombuffer(
                     pack_tpq_indices(indices, bits),
                     dtype=np.uint8,
                 ).copy()
             else:
-                indices = np.ascontiguousarray(
-                    indices, dtype=np.uint8
-                ).reshape(-1)
+                indices = np.ascontiguousarray(indices, dtype=np.uint8).reshape(-1)
                 if indices.size != packed_nbytes:
                     raise ValueError(
-                        f"TPQ-PQ packed indices have {indices.size} bytes; "
-                        f"expected {packed_nbytes}"
+                        f"TPQ-PQ packed indices have {indices.size} bytes; expected {packed_nbytes}"
                     )
+                decoded, consumed = unpack_tpq_indices(
+                    memoryview(indices),
+                    0,
+                    expected_indices[0] * expected_indices[1],
+                    bits,
+                )
+                if consumed != packed_nbytes:
+                    raise ValueError("TPQ-PQ packed index stream has an invalid tail")
+                if decoded.size and int(decoded.max()) >= self.spec.codebook_entries:
+                    raise ValueError("TPQ-PQ index references a missing codeword")
         else:
             if tuple(indices.shape) != expected_indices:
                 raise ValueError(
-                    f"TPQ-PQ indices have shape {indices.shape}; "
-                    f"expected {expected_indices}"
+                    f"TPQ-PQ indices have shape {indices.shape}; expected {expected_indices}"
                 )
-            expected_dtype = (
-                np.dtype(np.uint8)
-                if bits == 8
-                else np.dtype(np.uint16)
-            )
+            expected_dtype = np.dtype(np.uint8) if bits == 8 else np.dtype(np.uint16)
             if indices.dtype != expected_dtype:
                 indices = indices.astype(expected_dtype)
             if indices.size and int(indices.max()) >= self.spec.codebook_entries:
-                raise ValueError(
-                    "TPQ-PQ index references a missing codeword"
-                )
+                raise ValueError("TPQ-PQ index references a missing codeword")
         codebook = np.ascontiguousarray(self.codebook, dtype=np.float32)
         expected_codebook = (
             self.spec.codebook_entries,
@@ -157,8 +141,7 @@ class TpqPqTensor:
         )
         if tuple(codebook.shape) != expected_codebook:
             raise ValueError(
-                f"TPQ-PQ codebook has shape {codebook.shape}; "
-                f"expected {expected_codebook}"
+                f"TPQ-PQ codebook has shape {codebook.shape}; expected {expected_codebook}"
             )
         if not np.isfinite(codebook).all():
             raise ValueError("TPQ-PQ codebook must be finite")
@@ -231,9 +214,7 @@ def pack_tpq_indices(values: np.ndarray, bits: int) -> bytes:
         raise ValueError(f"TPQ indices require 8..16-bit storage, got {bits}")
     values16 = array.astype(np.uint16, copy=False)
     shifts = np.arange(bits, dtype=np.uint16)
-    stream = (
-        (values16[:, None] >> shifts[None, :]) & 1
-    ).astype(np.uint8)
+    stream = ((values16[:, None] >> shifts[None, :]) & 1).astype(np.uint8)
     return np.packbits(stream.reshape(-1), bitorder="little").tobytes()
 
 
@@ -345,8 +326,7 @@ def pack_tpq_pq(tensor: TpqPqTensor) -> bytes:
     payload = b"".join(parts)
     if len(payload) != tensor.payload_nbytes:
         raise RuntimeError(
-            f"TPQ-PQ payload size mismatch: {len(payload)} != "
-            f"{tensor.payload_nbytes}"
+            f"TPQ-PQ payload size mismatch: {len(payload)} != {tensor.payload_nbytes}"
         )
     return payload
 
@@ -377,11 +357,7 @@ def unpack_tpq_pq(blob: bytes | memoryview) -> TpqPqTensor:
         tier=tier,
         vector_size=int(vector_size),
         codebook_entries=int(codebook_entries),
-        storage_bits=(
-            int(index_bits)
-            if int(index_bits) not in {8, 16} or tier == "p"
-            else None
-        ),
+        storage_bits=(int(index_bits) if int(index_bits) not in {8, 16} or tier == "p" else None),
     )
     if index_bits != spec.index_bits:
         raise ValueError("TPQ-PQ tier metadata is inconsistent")
@@ -398,9 +374,9 @@ def unpack_tpq_pq(blob: bytes | memoryview) -> TpqPqTensor:
     codebook_nbytes = codebook_count * 4
     if offset + codebook_nbytes > len(blob):
         raise ValueError("truncated TPQ-PQ codebook")
-    codebook = np.frombuffer(
-        blob, dtype="<f4", count=codebook_count, offset=offset
-    ).astype(np.float32, copy=True)
+    codebook = np.frombuffer(blob, dtype="<f4", count=codebook_count, offset=offset).astype(
+        np.float32, copy=True
+    )
     codebook = codebook.reshape(spec.codebook_entries, spec.vector_size)
     offset += codebook_nbytes
     index_count = rows * (shape[1] // spec.vector_size)
@@ -414,9 +390,7 @@ def unpack_tpq_pq(blob: bytes | memoryview) -> TpqPqTensor:
         )
         offset += index_nbytes
     else:
-        indices, offset = unpack_tpq_indices(
-            blob, offset, index_count, spec.index_bits
-        )
+        indices, offset = unpack_tpq_indices(blob, offset, index_count, spec.index_bits)
     if offset != len(blob):
         raise ValueError(f"invalid TPQ-PQ tail: {len(blob) - offset} bytes")
     return TpqPqTensor(
@@ -517,16 +491,12 @@ def unpack_tpq_int4(blob: bytes | memoryview) -> TpqInt4Tensor:
     scale_count = rows * groups
     expected_end = offset + packed_count + scale_count * 2
     if expected_end != len(blob):
-        raise ValueError(
-            f"invalid TPQ-I4 payload size: {len(blob)} != {expected_end}"
-        )
-    packed = np.frombuffer(
-        blob, dtype=np.uint8, count=packed_count, offset=offset
-    ).copy()
+        raise ValueError(f"invalid TPQ-I4 payload size: {len(blob)} != {expected_end}")
+    packed = np.frombuffer(blob, dtype=np.uint8, count=packed_count, offset=offset).copy()
     offset += packed_count
-    scales = np.frombuffer(
-        blob, dtype="<f2", count=scale_count, offset=offset
-    ).astype(np.float16, copy=True)
+    scales = np.frombuffer(blob, dtype="<f2", count=scale_count, offset=offset).astype(
+        np.float16, copy=True
+    )
     return TpqInt4Tensor(
         shape=shape,
         axis=int(axis),

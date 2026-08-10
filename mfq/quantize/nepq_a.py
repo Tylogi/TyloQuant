@@ -56,9 +56,14 @@ def _residual_dictionary(value) -> np.ndarray:
         raise ValueError(
             f"NEPQ-A residual dictionary must have shape (1024,8), got {dictionary.shape}"
         )
-    if not np.isfinite(dictionary).all():
+    with np.errstate(over="ignore", invalid="ignore"):
+        stored = dictionary.astype(np.float16)
+    if not np.isfinite(stored).all():
         raise ValueError("NEPQ-A residual dictionary must be finite")
-    return np.ascontiguousarray(dictionary, dtype=np.float16)
+    if not np.any(np.all(stored == 0, axis=1)):
+        zero_id = int(np.argmin(np.square(stored.astype(np.float32)).sum(axis=1)))
+        stored[zero_id] = 0
+    return np.ascontiguousarray(stored)
 
 
 def _best_records(

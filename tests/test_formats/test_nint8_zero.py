@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from mfq.formats.io import _pack_tensor, _unpack_tensor
 from mfq.formats.nint8_zero import (
@@ -69,3 +70,22 @@ def test_nint8_zero_direct_quantization_matches_gguf_q8_0() -> None:
         np.frombuffer(actual[header_nbytes:], dtype=np.uint8).reshape(7, -1),
         expected_blocks,
     )
+
+
+@pytest.mark.parametrize("scale", [np.inf, np.nan, -1.0, 1e10])
+def test_nint8_zero_rejects_invalid_fp16_scales(scale: float) -> None:
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        Nint8ZeroTensor(
+            shape=(1, 32),
+            axis=0,
+            scale=np.asarray([[scale]], dtype=np.float32),
+            q=np.zeros((1, 1, 32), dtype=np.int8),
+            neuron_len=32,
+        )
+
+
+def test_nint8_zero_quantizer_rejects_nonfinite_weights() -> None:
+    weight = np.zeros((1, 32), dtype=np.float32)
+    weight[0, 0] = np.nan
+    with pytest.raises(ValueError, match="weights must be finite"):
+        quantize_nint8_zero(weight)

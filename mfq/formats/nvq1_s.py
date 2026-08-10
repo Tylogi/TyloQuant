@@ -247,6 +247,10 @@ def _validate_tensor(tensor: Nvq1STensor) -> tuple[int, int, int]:
         raise ValueError("NVQ1-S neuron length must be divisible by 8")
     ng = math.ceil(tensor.neuron_len / 24)
     nvec = tensor.neuron_len // 8
+    with np.errstate(over="ignore", invalid="ignore"):
+        anchors = np.asarray(tensor.neuron_scale, dtype=np.float32).astype(np.float16)
+    if not np.isfinite(anchors).all() or np.signbit(anchors).any():
+        raise ValueError("NVQ1-S neuron anchors must be finite and non-negative in FP16")
     expected = {
         "sub_scale": (out, ng),
         "indices": (out, nvec),

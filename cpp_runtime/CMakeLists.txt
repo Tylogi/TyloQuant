@@ -246,6 +246,7 @@ add_executable(mfq-decode
     ../mfq/kernels/cuda/rope.cu
     ../mfq/kernels/cuda/sampling.cu
     ../mfq/kernels/cuda/ssm_conv.cu
+    ../mfq/kernels/cuda/tpq_matmul.cu
 )
 
 target_include_directories(mfq-decode PRIVATE

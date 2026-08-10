@@ -29,10 +29,12 @@ _SOURCES = [
     os.path.join(_DIR, "sampling.cu"),
     os.path.join(_DIR, "ssm_conv.cu"),
     os.path.join(_DIR, "moe.cu"),
+    os.path.join(_DIR, "mx_matmul.cu"),
     os.path.join(_DIR, "nint_matmul.cu"),
     os.path.join(_DIR, "nvq_matmul.cu"),
     os.path.join(_DIR, "nepq.cu"),
     os.path.join(_DIR, "nepq_residual.cu"),
+    os.path.join(_DIR, "tpq_matmul.cu"),
     os.path.join(_DIR, "mfq_cuda.cpp"),
 ]
 _module = None
@@ -77,8 +79,8 @@ def ext():
     if _module is None:
         _ensure_msvc()
         import torch  # noqa: F401  ensure torch imported (cpp_extension depends on it)
-
         from torch.utils.cpp_extension import load
+
         _module = load(
             name="mfq_cuda",
             sources=_SOURCES,

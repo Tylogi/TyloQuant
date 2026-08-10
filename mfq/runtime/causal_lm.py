@@ -13,6 +13,9 @@ import torch.nn.functional as F
 
 from mfq.formats import io
 from mfq.formats.io import MfqTensor
+from mfq.formats.mx import MxTensor
+from mfq.formats.nint8_zero import Nint8ZeroTensor
+from mfq.formats.tpq import TpqInt4Tensor, TpqPqTensor
 from mfq.kernels.cuda.acc import acc
 from mfq.kernels.cuda.attention import attention
 from mfq.kernels.cuda.gated_delta_net import gated_delta_net
@@ -25,12 +28,19 @@ from mfq.quantize.nint_quant import NintTensor
 from mfq.runtime.torch_linear import (
     QuantizedTensor,
     TorchLinearGroup,
+    TorchMxEmbedding,
+    TorchMxLinear,
+    TorchNint8ZeroEmbedding,
+    TorchNint8ZeroLinear,
     TorchNintEmbedding,
     TorchNintLinear,
     TorchNintLinearGroup,
     TorchNvqEmbedding,
     TorchNvqLinear,
     TorchSwiGLUFFN,
+    TorchTpqEmbedding,
+    TorchTpqLinear,
+    is_nvq_tensor,
     is_quantized_tensor,
 )
 
@@ -104,11 +114,22 @@ class TorchNintCausalLMConfig:
             max_position_embeddings=int(text["max_position_embeddings"]),
             attention_head_dim=int(text.get("head_dim", 0)) or None,
             rope_base=float(rope_params.get("rope_theta", 1_000_000.0)),
-            rotary_dim=int(round(float(text.get("partial_rotary_factor", rope_params.get("partial_rotary_factor", 1.0))) * int(text.get("head_dim", text["hidden_size"] // text["num_attention_heads"])))),
+            rotary_dim=int(
+                round(
+                    float(
+                        text.get(
+                            "partial_rotary_factor", rope_params.get("partial_rotary_factor", 1.0)
+                        )
+                    )
+                    * int(text.get("head_dim", text["hidden_size"] // text["num_attention_heads"]))
+                )
+            ),
             rope_sections=tuple(int(v) for v in rope_params.get("mrope_section", ())) or None,
             rms_norm_eps=float(text.get("rms_norm_eps", 1e-6)),
             tie_word_embeddings=bool(text.get("tie_word_embeddings", False)),
-            layer_types=tuple(text.get("layer_types", ("full_attention",) * int(text["num_hidden_layers"]))),
+            layer_types=tuple(
+                text.get("layer_types", ("full_attention",) * int(text["num_hidden_layers"]))
+            ),
             qwen35_attn_q_gate=bool(text.get("attn_output_gate", False)),
             linear_conv_kernel_dim=int(text.get("linear_conv_kernel_dim", 4)),
             linear_key_head_dim=int(text.get("linear_key_head_dim", 128)),
@@ -268,14 +289,18 @@ class TorchFullAttentionBlock:
 
     def reset_cache(self, batch: int) -> None:
         c = self.config
-        self.cache = KVCache(batch, c.num_key_value_heads, c.max_position_embeddings, c.head_dim, device=self.device)
+        self.cache = KVCache(
+            batch, c.num_key_value_heads, c.max_position_embeddings, c.head_dim, device=self.device
+        )
 
     def forward(self, x: torch.Tensor, positions: torch.Tensor, use_cache: bool) -> torch.Tensor:
         c = self.config
         B, T, H = x.shape
         residual = x
         with _profile_scope("full_attn/attn_norm"):
-            xn = _qwen_rms_norm(x.reshape(B * T, H).to(torch.float32), self.attn_norm, c).reshape(B, T, H)
+            xn = _qwen_rms_norm(x.reshape(B * T, H).to(torch.float32), self.attn_norm, c).reshape(
+                B, T, H
+            )
         with _profile_scope("full_attn/qkv_proj"):
             q_full, k_full, v_full = self.qkv_proj(xn)
         if c.qwen35_attn_q_gate:
@@ -289,11 +314,29 @@ class TorchFullAttentionBlock:
         v = v_full.reshape(B, T, c.num_key_value_heads, c.head_dim).transpose(1, 2).contiguous()
         with _profile_scope("full_attn/qk_norm_rope"):
             if self.q_norm is not None:
-                q = _qwen_rms_norm(q.reshape(-1, c.head_dim).to(torch.float32), self.q_norm, c).reshape_as(q)
+                q = _qwen_rms_norm(
+                    q.reshape(-1, c.head_dim).to(torch.float32), self.q_norm, c
+                ).reshape_as(q)
             if self.k_norm is not None:
-                k = _qwen_rms_norm(k.reshape(-1, c.head_dim).to(torch.float32), self.k_norm, c).reshape_as(k)
-            q = rope(q, positions, c.rope_base, c.effective_rotary_dim, c.rope_sections, c.max_position_embeddings)
-            k = rope(k, positions, c.rope_base, c.effective_rotary_dim, c.rope_sections, c.max_position_embeddings)
+                k = _qwen_rms_norm(
+                    k.reshape(-1, c.head_dim).to(torch.float32), self.k_norm, c
+                ).reshape_as(k)
+            q = rope(
+                q,
+                positions,
+                c.rope_base,
+                c.effective_rotary_dim,
+                c.rope_sections,
+                c.max_position_embeddings,
+            )
+            k = rope(
+                k,
+                positions,
+                c.rope_base,
+                c.effective_rotary_dim,
+                c.rope_sections,
+                c.max_position_embeddings,
+            )
         cache_positions = positions[0] if positions.dim() == 2 else positions
         if use_cache:
             if self.cache is None:
@@ -318,7 +361,9 @@ class TorchFullAttentionBlock:
 
         residual = x
         with _profile_scope("full_attn/ffn_norm"):
-            xn = _qwen_rms_norm(x.reshape(B * T, H).to(torch.float32), self.ffn_norm, c).reshape(B, T, H)
+            xn = _qwen_rms_norm(x.reshape(B * T, H).to(torch.float32), self.ffn_norm, c).reshape(
+                B, T, H
+            )
         with _profile_scope("full_attn/ffn"):
             f = self.ffn(xn.reshape(B * T, H)).reshape(B, T, H)
         with _profile_scope("full_attn/ffn_residual"):
@@ -341,8 +386,12 @@ class TorchQwen35LinearAttentionBlock:
         self.gguf_layout = names.linear_qkv == "blk.{i}.attn_qkv.weight"
         self.attn_norm = _dense(tensors, names.layer(names.attn_norm, layer_idx), device)
         self.ffn_norm = _dense(tensors, names.layer(names.ffn_norm, layer_idx), device)
-        linear_qk_name = names.layer(names.linear_qk, layer_idx) if names.linear_qk is not None else None
-        linear_v_name = names.layer(names.linear_v, layer_idx) if names.linear_v is not None else None
+        linear_qk_name = (
+            names.layer(names.linear_qk, layer_idx) if names.linear_qk is not None else None
+        )
+        linear_v_name = (
+            names.layer(names.linear_v, layer_idx) if names.linear_v is not None else None
+        )
         self.split_in_proj = linear_qk_name in tensors and linear_v_name in tensors
         if self.split_in_proj:
             assert linear_qk_name is not None and linear_v_name is not None
@@ -392,7 +441,8 @@ class TorchQwen35LinearAttentionBlock:
         self.conv_weight = _dense(tensors, names.layer(names.linear_conv, layer_idx), device)
         self.conv_bias = (
             _dense_optional(tensors, names.layer(names.linear_conv_bias, layer_idx), device)
-            if names.linear_conv_bias is not None else None
+            if names.linear_conv_bias is not None
+            else None
         )
         self.dt_bias = _dense(tensors, names.layer(names.linear_dt_bias, layer_idx), device)
         self.a = _dense(tensors, names.layer(names.linear_a, layer_idx), device)
@@ -414,8 +464,12 @@ class TorchQwen35LinearAttentionBlock:
             batch, c.linear_conv_kernel_dim - 1, conv_dim, device=self.device, dtype=torch.float32
         )
         self.gdn_state = torch.zeros(
-            batch, self.linear_num_value_heads, self.linear_value_head_dim, self.linear_value_head_dim,
-            device=self.device, dtype=torch.float32,
+            batch,
+            self.linear_num_value_heads,
+            self.linear_value_head_dim,
+            self.linear_value_head_dim,
+            device=self.device,
+            dtype=torch.float32,
         )
 
     @property
@@ -448,7 +502,9 @@ class TorchQwen35LinearAttentionBlock:
         B, T, H = x.shape
         residual = x
         with _profile_scope("linear_attn/attn_norm"):
-            xn = _qwen_rms_norm(x.reshape(B * T, H).to(torch.float32), self.attn_norm, c).reshape(B, T, H)
+            xn = _qwen_rms_norm(x.reshape(B * T, H).to(torch.float32), self.attn_norm, c).reshape(
+                B, T, H
+            )
         with _profile_scope("linear_attn/in_proj"):
             if self.split_in_proj:
                 assert self.linear_qk is not None and self.linear_v is not None
@@ -467,7 +523,9 @@ class TorchQwen35LinearAttentionBlock:
                 qkv, z, alpha_raw, beta_raw = self.in_proj(xn)
         with _profile_scope("linear_attn/gates"):
             qkv = qkv.to(torch.float32)
-            beta = torch.sigmoid(beta_raw.to(torch.float32)).reshape(B, T, self.linear_num_value_heads)
+            beta = torch.sigmoid(beta_raw.to(torch.float32)).reshape(
+                B, T, self.linear_num_value_heads
+            )
             alpha = alpha_raw.to(torch.float32).reshape(B, T, self.linear_num_value_heads)
             gate = F.softplus(alpha + self.dt_bias.view(1, 1, -1))
             a = -torch.exp(self.a) if c.linear_a_is_log else self.a
@@ -481,7 +539,13 @@ class TorchQwen35LinearAttentionBlock:
             self.conv_state = conv_in[:, -int(c.linear_conv_kernel_dim) + 1 :, :].contiguous()
             state = self.gdn_state
         else:
-            pad = torch.zeros(B, int(c.linear_conv_kernel_dim) - 1, qkv.shape[-1], device=x.device, dtype=torch.float32)
+            pad = torch.zeros(
+                B,
+                int(c.linear_conv_kernel_dim) - 1,
+                qkv.shape[-1],
+                device=x.device,
+                dtype=torch.float32,
+            )
             conv_in = torch.cat([pad, qkv], dim=1)
             state = None
 
@@ -490,12 +554,28 @@ class TorchQwen35LinearAttentionBlock:
         q_end = self.linear_k_size
         k_end = q_end + self.linear_k_size
         v_end = k_end + self.linear_v_size
-        q = conv[:, :, :q_end].reshape(B, T, self.linear_num_key_heads, self.linear_key_head_dim).transpose(1, 2)
-        k = conv[:, :, q_end:k_end].reshape(B, T, self.linear_num_key_heads, self.linear_key_head_dim).transpose(1, 2)
-        v = conv[:, :, k_end:v_end].reshape(B, T, self.linear_num_value_heads, self.linear_value_head_dim).transpose(1, 2)
+        q = (
+            conv[:, :, :q_end]
+            .reshape(B, T, self.linear_num_key_heads, self.linear_key_head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            conv[:, :, q_end:k_end]
+            .reshape(B, T, self.linear_num_key_heads, self.linear_key_head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            conv[:, :, k_end:v_end]
+            .reshape(B, T, self.linear_num_value_heads, self.linear_value_head_dim)
+            .transpose(1, 2)
+        )
         with _profile_scope("linear_attn/qk_l2_norm"):
-            q = l2_norm(q.contiguous().reshape(-1, self.linear_key_head_dim), c.rms_norm_eps).reshape_as(q)
-            k = l2_norm(k.contiguous().reshape(-1, self.linear_key_head_dim), c.rms_norm_eps).reshape_as(k)
+            q = l2_norm(
+                q.contiguous().reshape(-1, self.linear_key_head_dim), c.rms_norm_eps
+            ).reshape_as(q)
+            k = l2_norm(
+                k.contiguous().reshape(-1, self.linear_key_head_dim), c.rms_norm_eps
+            ).reshape_as(k)
         if self.linear_num_key_heads != self.linear_num_value_heads:
             rep = self.linear_num_value_heads // self.linear_num_key_heads
             if self.gguf_layout:
@@ -507,13 +587,21 @@ class TorchQwen35LinearAttentionBlock:
         g = gate.transpose(1, 2).contiguous()
         b = beta.transpose(1, 2).contiguous()
         with _profile_scope("linear_attn/gdn"):
-            y, new_state = gated_delta_net(q.contiguous(), k.contiguous(), v.contiguous(), g, b, state)
+            y, new_state = gated_delta_net(
+                q.contiguous(), k.contiguous(), v.contiguous(), g, b, state
+            )
         if use_cache:
             self.gdn_state = new_state
-        z = z.reshape(B, T, self.linear_num_value_heads, self.linear_value_head_dim).transpose(1, 2).contiguous()
+        z = (
+            z.reshape(B, T, self.linear_num_value_heads, self.linear_value_head_dim)
+            .transpose(1, 2)
+            .contiguous()
+        )
         with _profile_scope("linear_attn/gated_norm"):
             y_norm = rms_norm(
-                y.reshape(-1, self.linear_value_head_dim).to(torch.float32), self.linear_norm, c.rms_norm_eps
+                y.reshape(-1, self.linear_value_head_dim).to(torch.float32),
+                self.linear_norm,
+                c.rms_norm_eps,
             ).reshape_as(y)
             y = y_norm.transpose(1, 2).contiguous().reshape(B, T, self.linear_v_size)
             z = z.transpose(1, 2).contiguous().reshape(B, T, self.linear_v_size)
@@ -525,7 +613,9 @@ class TorchQwen35LinearAttentionBlock:
 
         residual = x
         with _profile_scope("linear_attn/ffn_norm"):
-            xn = _qwen_rms_norm(x.reshape(B * T, H).to(torch.float32), self.ffn_norm, c).reshape(B, T, H)
+            xn = _qwen_rms_norm(x.reshape(B * T, H).to(torch.float32), self.ffn_norm, c).reshape(
+                B, T, H
+            )
         with _profile_scope("linear_attn/ffn"):
             f = self.ffn(xn.reshape(B * T, H)).reshape(B, T, H)
         with _profile_scope("linear_attn/ffn_residual"):
@@ -554,11 +644,18 @@ class TorchNintCausalLM:
         self.names = names
         self.device = device
         embed_tensor = _require_quantized(tensors, self.names.token_embd)
-        self.embed = (
-            TorchNintEmbedding(embed_tensor, device)
-            if isinstance(embed_tensor, NintTensor)
-            else TorchNvqEmbedding(embed_tensor, device)
-        )
+        if isinstance(embed_tensor, NintTensor):
+            self.embed = TorchNintEmbedding(embed_tensor, device)
+        elif isinstance(embed_tensor, Nint8ZeroTensor):
+            self.embed = TorchNint8ZeroEmbedding(embed_tensor, device)
+        elif is_nvq_tensor(embed_tensor):
+            self.embed = TorchNvqEmbedding(embed_tensor, device)
+        elif isinstance(embed_tensor, MxTensor):
+            self.embed = TorchMxEmbedding(embed_tensor, device)
+        elif isinstance(embed_tensor, (TpqInt4Tensor, TpqPqTensor)):
+            self.embed = TorchTpqEmbedding(embed_tensor, device)
+        else:
+            raise TypeError("token embedding must be NINT/NVQ/MX/TPQ")
         layer_types = config.layer_types or ("full_attention",) * config.num_hidden_layers
         if len(layer_types) != config.num_hidden_layers:
             raise ValueError("layer_types length must match num_hidden_layers")
@@ -615,7 +712,9 @@ class TorchNintCausalLM:
             B, T, _ = x.shape
         if positions is None:
             cache_pos = self.cache_pos if use_cache else 0
-            positions = torch.arange(cache_pos, cache_pos + T, device=self.device, dtype=torch.int64)
+            positions = torch.arange(
+                cache_pos, cache_pos + T, device=self.device, dtype=torch.int64
+            )
         else:
             positions = torch.as_tensor(positions, device=self.device, dtype=torch.int64)
         if use_cache and self.cache_pos == 0:
@@ -668,7 +767,9 @@ class TorchNintCausalLM:
                 break
             if i + 1 < max_new_tokens:
                 logits = self.forward(next_id[:, None], use_cache=True)
-                next_id = sample(logits[:, -1, :], temperature=temperature, top_k=top_k, top_p=top_p)
+                next_id = sample(
+                    logits[:, -1, :], temperature=temperature, top_k=top_k, top_p=top_p
+                )
         return torch.cat(pieces, dim=1)
 
 
@@ -677,7 +778,7 @@ def _require_quantized(tensors: TensorMapping, name: str) -> QuantizedTensor:
         raise KeyError(f"missing tensor {name!r}")
     tensor = tensors[name]
     if not is_quantized_tensor(tensor):
-        raise TypeError(f"tensor {name!r} must be NINT/NVQ")
+        raise TypeError(f"tensor {name!r} must be NINT/NVQ/MX/TPQ")
     return tensor
 
 
@@ -685,9 +786,19 @@ def _linear(
     tensors: TensorMapping,
     name: str,
     device: str | torch.device,
-) -> TorchNintLinear | TorchNvqLinear:
+) -> TorchNintLinear | TorchNint8ZeroLinear | TorchNvqLinear | TorchMxLinear | TorchTpqLinear:
     tensor = _require_quantized(tensors, name)
-    return TorchNintLinear(tensor, device) if isinstance(tensor, NintTensor) else TorchNvqLinear(tensor, device)
+    if isinstance(tensor, NintTensor):
+        return TorchNintLinear(tensor, device)
+    if isinstance(tensor, Nint8ZeroTensor):
+        return TorchNint8ZeroLinear(tensor, device)
+    if is_nvq_tensor(tensor):
+        return TorchNvqLinear(tensor, device)
+    if isinstance(tensor, MxTensor):
+        return TorchMxLinear(tensor, device)
+    if isinstance(tensor, (TpqInt4Tensor, TpqPqTensor)):
+        return TorchTpqLinear(tensor, device)
+    raise TypeError(f"tensor {name!r} must be NINT/NVQ/MX/TPQ")
 
 
 def _linear_group(
@@ -717,13 +828,17 @@ def _dense(tensors: TensorMapping, name: str, device: str | torch.device) -> tor
     return torch.as_tensor(tensor, device=device, dtype=torch.float32).contiguous()
 
 
-def _dense_optional(tensors: TensorMapping, name: str, device: str | torch.device) -> torch.Tensor | None:
+def _dense_optional(
+    tensors: TensorMapping, name: str, device: str | torch.device
+) -> torch.Tensor | None:
     if name not in tensors:
         return None
     return _dense(tensors, name, device)
 
 
-def _qwen_rms_norm(x: torch.Tensor, weight: torch.Tensor, config: TorchNintCausalLMConfig) -> torch.Tensor:
+def _qwen_rms_norm(
+    x: torch.Tensor, weight: torch.Tensor, config: TorchNintCausalLMConfig
+) -> torch.Tensor:
     if config.norm_weight_offset:
         weight = weight + float(config.norm_weight_offset)
     return rms_norm(x, weight, config.rms_norm_eps)
@@ -744,7 +859,9 @@ def _make_block(
     raise ValueError(f"unsupported layer type: {layer_type!r}")
 
 
-def _causal_depthwise_conv(conv_input: torch.Tensor, conv_weight: torch.Tensor, n_tokens: int) -> torch.Tensor:
+def _causal_depthwise_conv(
+    conv_input: torch.Tensor, conv_weight: torch.Tensor, n_tokens: int
+) -> torch.Tensor:
     if conv_weight.dim() == 3:
         conv_weight = conv_weight.squeeze(1).T.contiguous()
     K = int(conv_weight.shape[0])

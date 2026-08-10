@@ -49,7 +49,8 @@ class Nint8ZeroTensor:
                 f"got {self.neuron_len}"
             )
         ng = self.neuron_len // QK8_0
-        scale = np.ascontiguousarray(self.scale, dtype=np.float16)
+        with np.errstate(over="ignore", invalid="ignore"):
+            scale = np.ascontiguousarray(self.scale, dtype=np.float16)
         q = np.ascontiguousarray(self.q, dtype=np.int8)
         if scale.shape != (out, ng):
             raise ValueError(
@@ -59,6 +60,8 @@ class Nint8ZeroTensor:
             raise ValueError(
                 f"NINT8-0 q shape must be {(out, ng, QK8_0)}, got {q.shape}"
             )
+        if not np.isfinite(scale).all() or np.signbit(scale).any():
+            raise ValueError("NINT8-0 scales must be finite and non-negative")
         self.scale = scale
         self.q = q
 
@@ -111,12 +114,15 @@ def pack_nint8_zero_header(
 def pack_nint8_zero_blocks(scale: np.ndarray, q: np.ndarray) -> bytes:
     """Interleave FP16 scales and signed INT8 values into 34-byte blocks."""
 
-    scale = np.ascontiguousarray(scale, dtype=np.float16)
+    with np.errstate(over="ignore", invalid="ignore"):
+        scale = np.ascontiguousarray(scale, dtype=np.float16)
     q = np.ascontiguousarray(q, dtype=np.int8)
     if scale.ndim != 2 or q.shape != (*scale.shape, QK8_0):
         raise ValueError(
             f"NINT8-0 block shape mismatch: scale={scale.shape}, q={q.shape}"
         )
+    if not np.isfinite(scale).all() or np.signbit(scale).any():
+        raise ValueError("NINT8-0 scales must be finite and non-negative")
     blocks = np.empty((*scale.shape, Q8_0_BLOCK_BYTES), dtype=np.uint8)
     blocks[..., :2] = scale.view(np.uint8).reshape(*scale.shape, 2)
     blocks[..., 2:] = q.view(np.uint8)
@@ -133,6 +139,8 @@ def quantize_nint8_zero(
     values = np.asarray(weight, dtype=np.float32)
     if not values.ndim or not 0 <= axis < values.ndim:
         raise ValueError("NINT8-0 axis is outside the tensor rank")
+    if not np.isfinite(values).all():
+        raise ValueError("NINT8-0 weights must be finite")
     moved = np.moveaxis(values, axis, 0)
     out = moved.shape[0]
     neuron_len = moved.size // out

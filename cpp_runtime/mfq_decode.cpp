@@ -536,8 +536,12 @@ torch::Tensor nint_dequant_full_packed_compact_bits_cuda(
 torch::Tensor nint_cublas_gemm_nt_f32acc_cuda(torch::Tensor x, torch::Tensor w);
 torch::Tensor mxfp8_dequant_cuda(
     torch::Tensor values, torch::Tensor scales);
+torch::Tensor mxfp8_embedding_lookup_cuda(
+    torch::Tensor values, torch::Tensor scales, torch::Tensor token_ids);
 torch::Tensor mxfp8_small_m_cuda(
     torch::Tensor values, torch::Tensor scales, torch::Tensor x);
+torch::Tensor mxfp8_matmul_f16_cuda(
+    torch::Tensor values, torch::Tensor scales, torch::Tensor input);
 torch::Tensor mxfp8_small_m_f32_cuda(
     torch::Tensor values, torch::Tensor scales, torch::Tensor x);
 torch::Tensor mxfp8_gemm_f32_cuda(
@@ -548,11 +552,46 @@ torch::Tensor mxfp8_groupwise_small_m_cuda(
 torch::Tensor mxfp8_groupwise_small_m_f32_cuda(
     torch::Tensor values, torch::Tensor scales,
     torch::Tensor x, int64_t groups);
+torch::Tensor mxfp4_dequant_cuda(
+    torch::Tensor values, torch::Tensor scales);
+torch::Tensor mxfp4_embedding_lookup_cuda(
+    torch::Tensor values, torch::Tensor scales, torch::Tensor token_ids);
+torch::Tensor mxfp4_matmul_f16_cuda(
+    torch::Tensor values, torch::Tensor scales, torch::Tensor input);
 torch::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
     torch::Tensor values, torch::Tensor scales, torch::Tensor input,
     torch::Tensor ids, torch::Tensor expert_local,
     int64_t global_experts, int64_t pool_experts,
     int64_t out_per_expert, int64_t neuron_len,
+    torch::Tensor output, torch::Tensor ids_dst,
+    torch::Tensor expert_bounds, torch::Tensor tile_bounds,
+    torch::Tensor tile_experts);
+torch::Tensor tpq_int4_matmul_f16_cuda(
+    torch::Tensor packed, torch::Tensor scales,
+    torch::Tensor input, int64_t group_size);
+torch::Tensor tpq_int4_dequant_cuda(
+    torch::Tensor packed, torch::Tensor scales, int64_t group_size);
+torch::Tensor tpq_int4_embedding_lookup_cuda(
+    torch::Tensor packed, torch::Tensor scales,
+    torch::Tensor token_ids, int64_t group_size);
+torch::Tensor tpq_pq_matmul_f16_cuda(
+    torch::Tensor indices, torch::Tensor codebook, torch::Tensor input,
+    int64_t outputs, int64_t width,
+    int64_t vector_size, int64_t index_bits);
+torch::Tensor tpq_pq_dequant_cuda(
+    torch::Tensor indices, torch::Tensor codebook,
+    int64_t outputs, int64_t width,
+    int64_t vector_size, int64_t index_bits);
+torch::Tensor tpq_pq_embedding_lookup_cuda(
+    torch::Tensor indices, torch::Tensor codebook, torch::Tensor token_ids,
+    int64_t outputs, int64_t width,
+    int64_t vector_size, int64_t index_bits);
+torch::Tensor tpq_pq_moe_grouped_matmul_pool_f16_cuda(
+    torch::Tensor indices, torch::Tensor codebook,
+    torch::Tensor input, torch::Tensor ids,
+    torch::Tensor expert_local, int64_t global_experts,
+    int64_t pool_experts, int64_t out_per_expert,
+    int64_t width, int64_t vector_size, int64_t index_bits,
     torch::Tensor output, torch::Tensor ids_dst,
     torch::Tensor expert_bounds, torch::Tensor tile_bounds,
     torch::Tensor tile_experts);
@@ -1593,6 +1632,12 @@ static NintCpu unpack_nint(const std::vector<uint8_t> & blob) {
     t.neuron_min_h.resize(t.out);
     std::memcpy(t.neuron_min_h.data(), blob.data() + off, (size_t)t.out * 2);
     off += (size_t)t.out * 2;
+    for (size_t row = 0; row < static_cast<size_t>(t.out); ++row) {
+        if ((t.neuron_scale_h[row] & 0x7c00u) == 0x7c00u ||
+                (t.neuron_min_h[row] & 0x7c00u) == 0x7c00u) {
+            throw std::runtime_error("NINT neuron metadata must be finite");
+        }
+    }
     size_t sub_count = (size_t)t.out * t.ng;
     size_t q_count = sub_count * (size_t)t.gs;
     t.sub_scale = unpack_bits(blob, off, sub_count, t.sub_bits);
@@ -1664,7 +1709,9 @@ static Nint8ZeroCpu unpack_nint8_zero(const std::vector<uint8_t> & blob) {
         throw std::runtime_error("NINT8-0 logical element count mismatch");
     }
     const size_t blocks = static_cast<size_t>(t.out) * t.ng;
-    if (off > blob.size() || blob.size() - off != blocks * block_bytes) {
+    if (off > blob.size() ||
+            blocks > (blob.size() - off) / block_bytes ||
+            blob.size() - off != blocks * block_bytes) {
         throw std::runtime_error("invalid NINT8-0 block payload length");
     }
     t.q.resize(blocks * 32);
@@ -1672,6 +1719,11 @@ static Nint8ZeroCpu unpack_nint8_zero(const std::vector<uint8_t> & blob) {
     for (size_t block = 0; block < blocks; ++block) {
         const uint8_t * source = blob.data() + off + block * block_bytes;
         std::memcpy(&t.scale_h[block], source, sizeof(uint16_t));
+        const uint16_t scale = t.scale_h[block];
+        if ((scale & 0x7c00u) == 0x7c00u || (scale & 0x8000u) != 0u) {
+            throw std::runtime_error(
+                "NINT8-0 scales must be finite and non-negative");
+        }
         std::memcpy(t.q.data() + block * 32, source + 2, 32);
     }
     return t;
@@ -1902,6 +1954,15 @@ static Mxfp8Cpu unpack_mxfp8(
     result.scales.assign(
         blob.begin() + static_cast<ptrdiff_t>(offset),
         blob.end());
+    if (std::any_of(
+            result.values.begin(), result.values.end(),
+            [](uint8_t value) { return (value & 0x7fu) == 0x7fu; })) {
+        throw std::runtime_error("MXFP8 payload contains an E4M3 NaN code");
+    }
+    if (std::find(result.scales.begin(), result.scales.end(), 255u) !=
+            result.scales.end()) {
+        throw std::runtime_error("MXFP8 payload contains an E8M0 NaN scale");
+    }
     return result;
 }
 
@@ -1945,6 +2006,10 @@ static Mxfp4Cpu unpack_mxfp4(
     offset += value_bytes;
     result.scales.assign(
         blob.begin() + static_cast<ptrdiff_t>(offset), blob.end());
+    if (std::find(result.scales.begin(), result.scales.end(), 255u) !=
+            result.scales.end()) {
+        throw std::runtime_error("MXFP4 payload contains an E8M0 NaN scale");
+    }
     return result;
 }
 
@@ -2000,6 +2065,341 @@ static Mxfp4Cpu select_mxfp4_cpu_rows(
             result.scales.data() + destination * scale_row,
             source.scales.data() + static_cast<size_t>(source_row) * scale_row,
             scale_row);
+    }
+    return result;
+}
+
+static Mxfp4Cpu slice_mxfp4_cpu(
+        const Mxfp4Cpu & source,
+        TensorParallelAxis axis,
+        int64_t begin,
+        int64_t end) {
+    if (axis == TensorParallelAxis::Output) {
+        if (begin < 0 || begin >= end || end > source.out) {
+            throw std::runtime_error("invalid MXFP4 output shard");
+        }
+        std::vector<int64_t> rows(static_cast<size_t>(end - begin));
+        std::iota(rows.begin(), rows.end(), begin);
+        return select_mxfp4_cpu_rows(source, rows);
+    }
+    if (axis != TensorParallelAxis::Input || begin < 0 || begin >= end ||
+            end > source.neuron_len || begin % 32 != 0 || end % 32 != 0) {
+        throw std::runtime_error(
+            "MXFP4 input shards must preserve 32-value scale blocks");
+    }
+    Mxfp4Cpu result;
+    result.out = source.out;
+    result.neuron_len = end - begin;
+    const size_t source_value_row =
+        static_cast<size_t>(source.neuron_len / 2);
+    const size_t destination_value_row =
+        static_cast<size_t>(result.neuron_len / 2);
+    const size_t source_scale_row =
+        static_cast<size_t>(source.neuron_len / 32);
+    const size_t destination_scale_row =
+        static_cast<size_t>(result.neuron_len / 32);
+    result.values.resize(static_cast<size_t>(result.out) * destination_value_row);
+    result.scales.resize(static_cast<size_t>(result.out) * destination_scale_row);
+    for (int64_t row = 0; row < result.out; ++row) {
+        std::memcpy(
+            result.values.data() + static_cast<size_t>(row) * destination_value_row,
+            source.values.data() + static_cast<size_t>(row) * source_value_row +
+                static_cast<size_t>(begin / 2),
+            destination_value_row);
+        std::memcpy(
+            result.scales.data() + static_cast<size_t>(row) * destination_scale_row,
+            source.scales.data() + static_cast<size_t>(row) * source_scale_row +
+                static_cast<size_t>(begin / 32),
+            destination_scale_row);
+    }
+    return result;
+}
+
+struct TpqCpu {
+    bool int4 = false;
+    int64_t out = 0;
+    int64_t neuron_len = 0;
+    int group_size = 0;
+    int vector_size = 0;
+    int index_bits = 0;
+    int codebook_entries = 0;
+    std::vector<uint8_t> packed;
+    std::vector<uint16_t> scales_h;
+    std::vector<float> codebook;
+};
+
+static bool is_tpq_pq_dtype(const std::string & dtype) {
+    return dtype == "TPQ-X" || dtype == "TPQ-W" ||
+        dtype == "TPQ-V" || dtype == "TPQ-VV" ||
+        dtype == "TPQ-P" || dtype == "TPQ-PVQ";
+}
+
+static uint32_t read_tpq_index_cpu(
+        const std::vector<uint8_t> & packed,
+        size_t linear,
+        int bits) {
+    const size_t bit = linear * static_cast<size_t>(bits);
+    const size_t byte = bit >> 3;
+    const int shift = static_cast<int>(bit & 7);
+    uint32_t value = byte < packed.size() ? packed[byte] : 0u;
+    if (byte + 1 < packed.size()) {
+        value |= static_cast<uint32_t>(packed[byte + 1]) << 8;
+    }
+    if (byte + 2 < packed.size()) {
+        value |= static_cast<uint32_t>(packed[byte + 2]) << 16;
+    }
+    return (value >> shift) & ((1u << bits) - 1u);
+}
+
+static TpqCpu unpack_tpq_pq(
+        const std::vector<uint8_t> & blob,
+        const std::string & dtype) {
+    constexpr size_t kHeaderBytes = 24;
+    if (!is_tpq_pq_dtype(dtype) || blob.size() < kHeaderBytes ||
+            std::memcmp(blob.data(), "CPQ1", 4) != 0 || blob[4] != 1) {
+        throw std::runtime_error("invalid TPQ-PQ payload header");
+    }
+    const int tier = blob[5];
+    const int vector_size = blob[6];
+    const int index_bits = blob[7];
+    const int expected_tier = dtype == "TPQ-X" ? 1 :
+        (dtype == "TPQ-W" ? 2 :
+         (dtype == "TPQ-V" ? 3 :
+          (dtype == "TPQ-VV" ? 4 : 5)));
+    size_t offset = 8;
+    const int32_t axis = read_i32_from(blob, offset);
+    const int32_t neuron_len = read_i32_from(blob, offset);
+    const uint32_t ndim = read_u32_from(blob, offset);
+    const uint32_t codebook_entries = read_u32_from(blob, offset);
+    if (tier != expected_tier || axis != 0 || ndim != 2 ||
+            neuron_len <= 0 || vector_size <= 0 ||
+            neuron_len % vector_size != 0 ||
+            index_bits < 8 || index_bits > 16 ||
+            codebook_entries <= 1 ||
+            codebook_entries > (1u << index_bits)) {
+        throw std::runtime_error("invalid TPQ-PQ payload geometry");
+    }
+    const uint64_t rows_u64 = read_u64_from(blob, offset);
+    const uint64_t columns_u64 = read_u64_from(blob, offset);
+    const uint32_t rows_tail = read_u32_from(blob, offset);
+    if (rows_u64 == 0 ||
+            rows_u64 > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            columns_u64 != static_cast<uint64_t>(neuron_len) ||
+            rows_tail != rows_u64) {
+        throw std::runtime_error("inconsistent TPQ-PQ matrix dimensions");
+    }
+    const size_t codebook_values = checked_mxfp8_size(
+        codebook_entries, static_cast<uint64_t>(vector_size),
+        "TPQ-PQ codebook size");
+    const size_t codebook_bytes = checked_mxfp8_size(
+        codebook_values, sizeof(float), "TPQ-PQ codebook bytes");
+    if (codebook_bytes > blob.size() - offset) {
+        throw std::runtime_error("truncated TPQ-PQ codebook");
+    }
+    TpqCpu result;
+    result.out = static_cast<int64_t>(rows_u64);
+    result.neuron_len = neuron_len;
+    result.vector_size = vector_size;
+    result.index_bits = index_bits;
+    result.codebook_entries = static_cast<int>(codebook_entries);
+    result.codebook.resize(codebook_values);
+    std::memcpy(result.codebook.data(), blob.data() + offset, codebook_bytes);
+    offset += codebook_bytes;
+    if (std::any_of(
+            result.codebook.begin(), result.codebook.end(),
+            [](float value) { return !std::isfinite(value); })) {
+        throw std::runtime_error("TPQ-PQ codebook must be finite");
+    }
+    const size_t vectors = static_cast<size_t>(neuron_len / vector_size);
+    const size_t index_count = checked_mxfp8_size(
+        rows_u64, vectors, "TPQ-PQ index count");
+    if (index_count > (std::numeric_limits<size_t>::max() - 7) /
+            static_cast<size_t>(index_bits)) {
+        throw std::runtime_error("TPQ-PQ index stream is too large");
+    }
+    const size_t index_bytes =
+        (index_count * static_cast<size_t>(index_bits) + 7) / 8;
+    if (index_bytes != blob.size() - offset) {
+        throw std::runtime_error("invalid TPQ-PQ index stream length");
+    }
+    result.packed.assign(
+        blob.begin() + static_cast<ptrdiff_t>(offset), blob.end());
+    for (size_t linear = 0; linear < index_count; ++linear) {
+        if (read_tpq_index_cpu(result.packed, linear, index_bits) >=
+                codebook_entries) {
+            throw std::runtime_error(
+                "TPQ-PQ index references a missing codeword");
+        }
+    }
+    return result;
+}
+
+static TpqCpu unpack_tpq_int4(const std::vector<uint8_t> & blob) {
+    constexpr size_t kHeaderBytes = 48;
+    if (blob.size() < kHeaderBytes ||
+            std::memcmp(blob.data(), "CI41", 4) != 0 || blob[4] != 1 ||
+            blob[5] != 0 || blob[6] != 0 || blob[7] != 0) {
+        throw std::runtime_error("invalid TPQ-I4 payload header");
+    }
+    size_t offset = 8;
+    const uint32_t group_size = read_u32_from(blob, offset);
+    const int32_t axis = read_i32_from(blob, offset);
+    const int32_t neuron_len = read_i32_from(blob, offset);
+    const uint32_t ndim = read_u32_from(blob, offset);
+    const uint64_t rows_u64 = read_u64_from(blob, offset);
+    const uint64_t columns_u64 = read_u64_from(blob, offset);
+    const uint32_t rows_tail = read_u32_from(blob, offset);
+    const uint32_t groups_tail = read_u32_from(blob, offset);
+    if (group_size != 64 || axis != 0 || ndim != 2 || neuron_len <= 0 ||
+            neuron_len % static_cast<int>(group_size) != 0 ||
+            columns_u64 != static_cast<uint64_t>(neuron_len) ||
+            rows_u64 == 0 || rows_tail != rows_u64 ||
+            groups_tail != static_cast<uint32_t>(neuron_len) / group_size ||
+            rows_u64 > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        throw std::runtime_error("invalid TPQ-I4 payload geometry");
+    }
+    const size_t packed_bytes = checked_mxfp8_size(
+        rows_u64, static_cast<uint64_t>(neuron_len / 2),
+        "TPQ-I4 packed size");
+    const size_t scale_count = checked_mxfp8_size(
+        rows_u64, groups_tail, "TPQ-I4 scale count");
+    const size_t scale_bytes = checked_mxfp8_size(
+        scale_count, sizeof(uint16_t), "TPQ-I4 scale bytes");
+    if (packed_bytes > blob.size() - offset ||
+            scale_bytes != blob.size() - offset - packed_bytes) {
+        throw std::runtime_error("invalid TPQ-I4 payload length");
+    }
+    TpqCpu result;
+    result.int4 = true;
+    result.out = static_cast<int64_t>(rows_u64);
+    result.neuron_len = neuron_len;
+    result.group_size = static_cast<int>(group_size);
+    result.packed.assign(
+        blob.begin() + static_cast<ptrdiff_t>(offset),
+        blob.begin() + static_cast<ptrdiff_t>(offset + packed_bytes));
+    offset += packed_bytes;
+    result.scales_h.resize(scale_count);
+    std::memcpy(result.scales_h.data(), blob.data() + offset, scale_bytes);
+    for (uint16_t raw : result.scales_h) {
+        const bool nonzero_negative =
+            (raw & 0x8000u) != 0 && (raw & 0x7fffu) != 0;
+        if ((raw & 0x7c00u) == 0x7c00u || nonzero_negative) {
+            throw std::runtime_error(
+                "TPQ-I4 scales must be finite and non-negative");
+        }
+    }
+    return result;
+}
+
+static void write_tpq_index_cpu(
+        std::vector<uint8_t> & packed,
+        size_t linear,
+        int bits,
+        uint32_t value) {
+    const size_t bit = linear * static_cast<size_t>(bits);
+    for (int index = 0; index < bits; ++index) {
+        if (((value >> index) & 1u) != 0) {
+            packed[(bit + static_cast<size_t>(index)) >> 3] |=
+                static_cast<uint8_t>(1u << ((bit + index) & 7));
+        }
+    }
+}
+
+static TpqCpu slice_tpq_cpu(
+        const TpqCpu & source,
+        TensorParallelAxis axis,
+        int64_t begin,
+        int64_t end) {
+    if (begin < 0 || begin >= end) {
+        throw std::runtime_error("invalid TPQ tensor-parallel shard");
+    }
+    if (axis == TensorParallelAxis::Output) {
+        if (end > source.out) {
+            throw std::runtime_error("invalid TPQ output shard");
+        }
+        TpqCpu result = source;
+        result.out = end - begin;
+        if (source.int4) {
+            const size_t packed_row = static_cast<size_t>(source.neuron_len / 2);
+            const size_t scale_row = static_cast<size_t>(
+                source.neuron_len / source.group_size);
+            result.packed.assign(
+                source.packed.begin() + static_cast<ptrdiff_t>(begin * packed_row),
+                source.packed.begin() + static_cast<ptrdiff_t>(end * packed_row));
+            result.scales_h.assign(
+                source.scales_h.begin() + static_cast<ptrdiff_t>(begin * scale_row),
+                source.scales_h.begin() + static_cast<ptrdiff_t>(end * scale_row));
+        } else {
+            const size_t vectors = static_cast<size_t>(
+                source.neuron_len / source.vector_size);
+            const size_t count = static_cast<size_t>(result.out) * vectors;
+            result.packed.assign(
+                (count * source.index_bits + 7) / 8, 0);
+            for (size_t row = 0; row < static_cast<size_t>(result.out); ++row) {
+                for (size_t vector = 0; vector < vectors; ++vector) {
+                    const uint32_t code = read_tpq_index_cpu(
+                        source.packed,
+                        (static_cast<size_t>(begin) + row) * vectors + vector,
+                        source.index_bits);
+                    write_tpq_index_cpu(
+                        result.packed, row * vectors + vector,
+                        source.index_bits, code);
+                }
+            }
+        }
+        return result;
+    }
+    const int granularity = source.int4
+        ? source.group_size : source.vector_size;
+    if (axis != TensorParallelAxis::Input || end > source.neuron_len ||
+            begin % granularity != 0 || end % granularity != 0) {
+        throw std::runtime_error(
+            "TPQ input shard does not preserve packed vector boundaries");
+    }
+    TpqCpu result = source;
+    result.neuron_len = end - begin;
+    if (source.int4) {
+        const size_t source_packed_row =
+            static_cast<size_t>(source.neuron_len / 2);
+        const size_t result_packed_row =
+            static_cast<size_t>(result.neuron_len / 2);
+        const size_t source_scale_row = static_cast<size_t>(
+            source.neuron_len / source.group_size);
+        const size_t result_scale_row = static_cast<size_t>(
+            result.neuron_len / result.group_size);
+        result.packed.resize(static_cast<size_t>(result.out) * result_packed_row);
+        result.scales_h.resize(static_cast<size_t>(result.out) * result_scale_row);
+        for (int64_t row = 0; row < result.out; ++row) {
+            std::memcpy(
+                result.packed.data() + static_cast<size_t>(row) * result_packed_row,
+                source.packed.data() + static_cast<size_t>(row) * source_packed_row +
+                    static_cast<size_t>(begin / 2),
+                result_packed_row);
+            std::memcpy(
+                result.scales_h.data() + static_cast<size_t>(row) * result_scale_row,
+                source.scales_h.data() + static_cast<size_t>(row) * source_scale_row +
+                    static_cast<size_t>(begin / source.group_size),
+                result_scale_row * sizeof(uint16_t));
+        }
+    } else {
+        const size_t source_vectors = static_cast<size_t>(
+            source.neuron_len / source.vector_size);
+        const size_t first_vector = static_cast<size_t>(begin / source.vector_size);
+        const size_t result_vectors = static_cast<size_t>(
+            result.neuron_len / result.vector_size);
+        const size_t count = static_cast<size_t>(result.out) * result_vectors;
+        result.packed.assign((count * source.index_bits + 7) / 8, 0);
+        for (size_t row = 0; row < static_cast<size_t>(result.out); ++row) {
+            for (size_t vector = 0; vector < result_vectors; ++vector) {
+                const uint32_t code = read_tpq_index_cpu(
+                    source.packed,
+                    row * source_vectors + first_vector + vector,
+                    source.index_bits);
+                write_tpq_index_cpu(
+                    result.packed, row * result_vectors + vector,
+                    source.index_bits, code);
+            }
+        }
     }
     return result;
 }
@@ -2095,24 +2495,34 @@ struct Mxfp8Weight {
     int64_t neuron_len = 0;
 };
 
-static Mxfp8Weight to_cuda_device_mxfp8(
+static Mxfp8Weight to_device_mxfp8(
         const Mxfp8Cpu & source,
-        int device) {
-    c10::cuda::CUDAGuard guard(device);
+        bool cuda,
+        int device = -1) {
     Mxfp8Weight result;
     result.out = source.out;
     result.neuron_len = source.neuron_len;
     result.values = cpu_u8_tensor(
         source.values,
-        {source.out, source.neuron_len})
-        .to(torch::Device(torch::kCUDA, device), false, false)
-        .contiguous();
+        {source.out, source.neuron_len});
     result.scales = cpu_u8_tensor(
         source.scales,
-        {(source.out + 127) / 128, source.neuron_len / 128})
-        .to(torch::Device(torch::kCUDA, device), false, false)
-        .contiguous();
+        {(source.out + 127) / 128, source.neuron_len / 128});
+    if (cuda) {
+        const int target_device = device >= 0
+            ? device : c10::cuda::current_device();
+        c10::cuda::CUDAGuard guard(target_device);
+        const auto target = torch::Device(torch::kCUDA, target_device);
+        result.values = result.values.to(target, false, false).contiguous();
+        result.scales = result.scales.to(target, false, false).contiguous();
+    }
     return result;
+}
+
+static Mxfp8Weight to_cuda_device_mxfp8(
+        const Mxfp8Cpu & source,
+        int device) {
+    return to_device_mxfp8(source, true, device);
 }
 
 struct Workspace {
@@ -2386,6 +2796,7 @@ struct NintMoeCpuPool {
     NintCpu weight;
     Nint8ZeroCpu q8_zero;
     Mxfp4Cpu mxfp4;
+    TpqCpu tpq;
 };
 
 struct NintMoeCpu {
@@ -2430,12 +2841,27 @@ static NintMoeCpu unpack_nint_moe_impl(
         uint32_t dtype_nbytes = version1 ? 0 : read_u32_from(blob, off);
         uint64_t payload_nbytes = read_u64_from(blob, off);
         uint64_t runtime_nbytes = version1 ? 0 : read_u64_from(blob, off);
+        if (expert_count == 0 || expert_count > static_cast<uint32_t>(result.n_experts) ||
+                expert_count > static_cast<uint32_t>(
+                    std::numeric_limits<int>::max() / result.out_per_expert) ||
+                dtype_nbytes > 32) {
+            throw std::runtime_error("invalid NINTM pool dimensions");
+        }
         size_t ids_nbytes = (size_t)expert_count * sizeof(int32_t);
-        if (expert_count == 0 || off + ids_nbytes > blob.size() ||
-            dtype_nbytes > 32 ||
-            dtype_nbytes + runtime_nbytes > blob.size() - off - ids_nbytes ||
-            payload_nbytes > blob.size() - off - ids_nbytes -
-                dtype_nbytes - runtime_nbytes) {
+        size_t remaining = blob.size() - off;
+        if (ids_nbytes > remaining) {
+            throw std::runtime_error("truncated NINTM pool payload");
+        }
+        remaining -= ids_nbytes;
+        if (dtype_nbytes > remaining) {
+            throw std::runtime_error("truncated NINTM pool payload");
+        }
+        remaining -= dtype_nbytes;
+        if (runtime_nbytes > remaining) {
+            throw std::runtime_error("truncated NINTM pool payload");
+        }
+        remaining -= static_cast<size_t>(runtime_nbytes);
+        if (payload_nbytes > remaining) {
             throw std::runtime_error("truncated NINTM pool payload");
         }
         NintMoeCpuPool pool;
@@ -2470,6 +2896,15 @@ static NintMoeCpu unpack_nint_moe_impl(
                     pool.mxfp4.neuron_len != result.neuron_len) {
                 throw std::runtime_error(
                     "NINTM MXFP4 pool weight shape mismatch");
+            }
+        } else if (!version1 && is_tpq_pq_dtype(pool.dtype)) {
+            pool.tpq = unpack_tpq_pq(pool.payload, pool.dtype);
+            const int expected_rows =
+                static_cast<int>(expert_count) * result.out_per_expert;
+            if (pool.tpq.out != expected_rows ||
+                    pool.tpq.neuron_len != result.neuron_len) {
+                throw std::runtime_error(
+                    "NINTM TPQ-PQ pool weight shape mismatch");
             }
         } else if (!version1 && pool.dtype == "NINT8-0") {
             pool.q8_zero = unpack_nint8_zero(pool.payload);
@@ -4026,6 +4461,12 @@ static NvqCpu unpack_nvq(const std::vector<uint8_t> & blob, const std::string & 
     if (off + anchor_bytes > blob.size()) throw std::runtime_error("truncated NVQ neuron anchors");
     t.neuron_scale_h.resize(t.out);
     std::memcpy(t.neuron_scale_h.data(), blob.data() + off, anchor_bytes);
+    for (uint16_t anchor : t.neuron_scale_h) {
+        if ((anchor & 0x7c00u) == 0x7c00u || (anchor & 0x8000u) != 0u) {
+            throw std::runtime_error(
+                "NVQ neuron anchors must be finite and non-negative");
+        }
+    }
     off += anchor_bytes;
     size_t sub_bytes = ((size_t)t.out * t.ng * t.sub_bits + 7) / 8;
     const size_t index_bits = (size_t)nvq_index_bits(t.format);
@@ -4395,7 +4836,8 @@ static NvqWeight to_device_nvq(const NvqCpu & c, bool cuda) {
         w.kernel_format = c.format == 14
             ? kNvq2JscXlGroupExecKernelFormat
             : kNvq3JscLGroupExecKernelFormat;
-    } else if ((c.format == 2 || c.format == 5) && nvq2_exec_layout_enabled()) {
+    } else if (cuda && (c.format == 2 || c.format == 5) &&
+               nvq2_exec_layout_enabled()) {
         auto metadata = repack_nvq2_exec_metadata(c);
         w.indices_packed = cpu_u8_tensor(
             metadata, {(int64_t)metadata.size()});
@@ -4653,7 +5095,9 @@ static NepqCpu unpack_nepq(
     }
     if (value.n_experts <= 0 || value.out_per_expert <= 0 ||
         value.neuron_len <= 0 || value.neuron_len % 8 != 0 ||
-        value.bank_count <= 0 || value.bank_count > 256) {
+        value.bank_count <= 0 || value.bank_count > 256 ||
+        value.n_experts >
+            std::numeric_limits<int>::max() / value.out_per_expert) {
         throw std::runtime_error("invalid NEPQ cohort dimensions");
     }
     if (value.rotation_block != 0 &&
@@ -4703,6 +5147,13 @@ static NepqCpu unpack_nepq(
     }
     value.neuron_scale_h.resize((size_t)rows);
     std::memcpy(value.neuron_scale_h.data(), blob.data() + off, anchor_bytes);
+    for (uint16_t raw : value.neuron_scale_h) {
+        if ((raw & 0x7c00u) == 0x7c00u ||
+                ((raw & 0x8000u) != 0 && (raw & 0x7fffu) != 0)) {
+            throw std::runtime_error(
+                "NEPQ neuron anchors must be finite and non-negative");
+        }
+    }
     off += anchor_bytes;
     value.state_packed = take_bytes(
         blob, off, packed_nbytes((size_t)rows * value.ng, value.state_bits),
@@ -4757,6 +5208,15 @@ static NepqCpu unpack_nepq(
         std::memcpy(
             value.residual_codebook_h.data(), blob.data() + off,
             dictionary_nbytes);
+        for (size_t row = 0; row < 1024; ++row) {
+            for (size_t column = 0; column < 8; ++column) {
+                const uint16_t raw = value.residual_codebook_h[row * 8 + column];
+                if ((raw & 0x7c00u) == 0x7c00u) {
+                    throw std::runtime_error(
+                        "NEPQ-A residual dictionary must be finite");
+                }
+            }
+        }
         off += dictionary_nbytes;
         auto first = unpack_nepq_u16_bits(
             blob, off, expected_blocks, value.residual_record_bits,
@@ -4785,10 +5245,37 @@ static NepqCpu unpack_nepq(
                     "NEPQ-A second residual count mismatch");
             }
         }
-        const size_t padding_end = off + padding_nbytes;
-        if (padding_end > blob.size()) {
+        auto validate_record = [&](uint16_t record, size_t block) {
+            const uint32_t position_mask =
+                (1u << value.residual_position_bits) - 1u;
+            const uint32_t position = record & position_mask;
+            const uint32_t dictionary_id =
+                record >> value.residual_position_bits;
+            const size_t block_in_row =
+                block % value.residual_blocks_per_row;
+            const int available = std::min(
+                value.residual_block_vectors,
+                value.nvec - static_cast<int>(block_in_row) *
+                    value.residual_block_vectors);
+            if (dictionary_id >= 1024 || position >=
+                    static_cast<uint32_t>(available)) {
+                throw std::runtime_error(
+                    "NEPQ-A residual record is out of range");
+            }
+        };
+        for (size_t block = 0; block < expected_blocks; ++block) {
+            validate_record(value.residual_first[block], block);
+            if (value.residual_second_dense[block] >= 0) {
+                validate_record(
+                    static_cast<uint16_t>(
+                        value.residual_second_dense[block]),
+                    block);
+            }
+        }
+        if (padding_nbytes > blob.size() - off) {
             throw std::runtime_error("truncated NEPQ-A residual padding");
         }
+        const size_t padding_end = off + padding_nbytes;
         for (; off < padding_end; ++off) {
             if (blob[off] != 0) {
                 throw std::runtime_error(
@@ -5116,6 +5603,113 @@ static Nint8ZeroCpu select_nint8_zero_cpu_rows(
     return result;
 }
 
+struct TpqWeight {
+    bool int4 = false;
+    torch::Tensor packed;
+    torch::Tensor scales;
+    torch::Tensor codebook;
+    int64_t out = 0;
+    int64_t neuron_len = 0;
+    int group_size = 0;
+    int vector_size = 0;
+    int index_bits = 0;
+};
+
+static TpqWeight to_device_tpq(
+        const TpqCpu & source, bool cuda, int device = -1) {
+    TpqWeight result;
+    result.int4 = source.int4;
+    result.out = source.out;
+    result.neuron_len = source.neuron_len;
+    result.group_size = source.group_size;
+    result.vector_size = source.vector_size;
+    result.index_bits = source.index_bits;
+    result.packed = cpu_u8_tensor(
+        source.packed,
+        source.int4
+            ? std::initializer_list<int64_t>{
+                source.out, source.neuron_len / 2}
+            : std::initializer_list<int64_t>{
+                static_cast<int64_t>(source.packed.size())});
+    if (source.int4) {
+        result.scales = cpu_f16_tensor(
+            source.scales_h,
+            {source.out, source.neuron_len / source.group_size});
+    } else {
+        result.codebook = torch::from_blob(
+            const_cast<float *>(source.codebook.data()),
+            {source.codebook_entries, source.vector_size},
+            torch::TensorOptions().dtype(torch::kFloat32)).clone();
+    }
+    if (cuda) {
+        const int target_device = device >= 0
+            ? device : c10::cuda::current_device();
+        c10::cuda::CUDAGuard guard(target_device);
+        const auto target = torch::Device(torch::kCUDA, target_device);
+        result.packed = result.packed.to(target, false, false).contiguous();
+        if (source.int4) {
+            result.scales = result.scales.to(target, false, false).contiguous();
+        } else {
+            result.codebook = result.codebook.to(target, false, false).contiguous();
+        }
+    }
+    return result;
+}
+
+static TpqCpu select_tpq_cpu_rows(
+        const TpqCpu & source,
+        const std::vector<int64_t> & rows) {
+    if (rows.empty()) {
+        throw std::runtime_error("cannot create an empty TPQ MoE shard");
+    }
+    TpqCpu result = source;
+    result.out = static_cast<int64_t>(rows.size());
+    if (source.int4) {
+        const size_t packed_row = static_cast<size_t>(source.neuron_len / 2);
+        const size_t scale_row = static_cast<size_t>(
+            source.neuron_len / source.group_size);
+        result.packed.resize(rows.size() * packed_row);
+        result.scales_h.resize(rows.size() * scale_row);
+        for (size_t destination = 0; destination < rows.size(); ++destination) {
+            const int64_t source_row = rows[destination];
+            if (source_row < 0 || source_row >= source.out) {
+                throw std::runtime_error("TPQ MoE shard row is out of range");
+            }
+            std::memcpy(
+                result.packed.data() + destination * packed_row,
+                source.packed.data() +
+                    static_cast<size_t>(source_row) * packed_row,
+                packed_row);
+            std::memcpy(
+                result.scales_h.data() + destination * scale_row,
+                source.scales_h.data() +
+                    static_cast<size_t>(source_row) * scale_row,
+                scale_row * sizeof(uint16_t));
+        }
+        return result;
+    }
+    const size_t vectors = static_cast<size_t>(
+        source.neuron_len / source.vector_size);
+    const size_t count = rows.size() * vectors;
+    result.packed.assign((count * source.index_bits + 7) / 8, 0);
+    for (size_t destination = 0; destination < rows.size(); ++destination) {
+        const int64_t source_row = rows[destination];
+        if (source_row < 0 || source_row >= source.out) {
+            throw std::runtime_error("TPQ MoE shard row is out of range");
+        }
+        for (size_t vector = 0; vector < vectors; ++vector) {
+            const uint32_t code = read_tpq_index_cpu(
+                source.packed,
+                static_cast<size_t>(source_row) * vectors + vector,
+                source.index_bits);
+            write_tpq_index_cpu(
+                result.packed, destination * vectors + vector,
+                source.index_bits, code);
+        }
+    }
+    return result;
+}
+
 static NvqCpu select_nvq_cpu_rows(
         const NvqCpu & source,
         const std::vector<int64_t> & rows) {
@@ -5326,6 +5920,7 @@ enum class MixedMoeFamily {
     Nint,
     Nint8Zero,
     Mxfp4,
+    Tpq,
     Nvq,
     Nepq,
 };
@@ -5335,6 +5930,7 @@ struct MixedMoePool {
     NintWeight nint;
     NintWeight q8_zero;
     Mxfp4Weight mxfp4;
+    TpqWeight tpq;
     NvqWeight nvq;
     NepqWeight nepq;
     torch::Tensor expert_local;
@@ -5423,7 +6019,8 @@ struct MixedMoeRuntime {
             } else if (pool.family == MixedMoeFamily::Nvq) {
                 groups = static_cast<int>(pool.nvq.ng);
                 gs = static_cast<int>(pool.nvq.gs);
-            } else if (pool.family == MixedMoeFamily::Mxfp4) {
+            } else if (pool.family == MixedMoeFamily::Mxfp4 ||
+                    pool.family == MixedMoeFamily::Tpq) {
                 continue;
             } else {
                 groups = pool.nepq.ng;
@@ -5507,7 +6104,8 @@ struct MixedMoeRuntime {
             } else if (pool.family == MixedMoeFamily::Nvq) {
                 gs = (int)pool.nvq.gs;
                 groups = (int)pool.nvq.ng;
-            } else if (pool.family == MixedMoeFamily::Mxfp4) {
+            } else if (pool.family == MixedMoeFamily::Mxfp4 ||
+                    pool.family == MixedMoeFamily::Tpq) {
                 groups = 0;
             } else {
                 groups = pool.nepq.ng;
@@ -5539,6 +6137,16 @@ struct MixedMoeRuntime {
                         route.ids, pool.expert_local, n_experts,
                         pool.local_experts, out_per_expert, neuron_len,
                         output, route.ids_dst, route.expert_bounds,
+                        route.tile_bounds, route.tile_experts);
+                    continue;
+                }
+                if (pool.family == MixedMoeFamily::Tpq) {
+                    tpq_pq_moe_grouped_matmul_pool_f16_cuda(
+                        pool.tpq.packed, pool.tpq.codebook, value,
+                        route.ids, pool.expert_local, n_experts,
+                        pool.local_experts, out_per_expert, neuron_len,
+                        pool.tpq.vector_size, pool.tpq.index_bits, output,
+                        route.ids_dst, route.expert_bounds,
                         route.tile_bounds, route.tile_experts);
                     continue;
                 }
@@ -5587,6 +6195,16 @@ struct MixedMoeRuntime {
                     route.ids, pool.expert_local, n_experts,
                     pool.local_experts, out_per_expert, neuron_len,
                     output, route.ids_dst, route.expert_bounds,
+                    route.tile_bounds, route.tile_experts);
+                continue;
+            }
+            if (pool.family == MixedMoeFamily::Tpq) {
+                tpq_pq_moe_grouped_matmul_pool_f16_cuda(
+                    pool.tpq.packed, pool.tpq.codebook, value,
+                    route.ids, pool.expert_local, n_experts,
+                    pool.local_experts, out_per_expert, neuron_len,
+                    pool.tpq.vector_size, pool.tpq.index_bits, output,
+                    route.ids_dst, route.expert_bounds,
                     route.tile_bounds, route.tile_experts);
                 continue;
             }
@@ -5658,7 +6276,8 @@ struct MixedMoeRuntime {
             pools.begin(), pools.end(), [](const MixedMoePool & pool) {
                 if (pool.family == MixedMoeFamily::Nepq ||
                     pool.family == MixedMoeFamily::Nint8Zero ||
-                    pool.family == MixedMoeFamily::Mxfp4) return false;
+                    pool.family == MixedMoeFamily::Mxfp4 ||
+                    pool.family == MixedMoeFamily::Tpq) return false;
                 const int gs = pool.family == MixedMoeFamily::Nint
                     ? static_cast<int>(pool.nint.gs)
                     : static_cast<int>(pool.nvq.gs);
@@ -5771,6 +6390,9 @@ static int64_t mixed_moe_storage_bytes(const MixedMoeRuntime & runtime) {
         } else if (pool.family == MixedMoeFamily::Mxfp4) {
             bytes += tensor_storage_bytes(pool.mxfp4.values);
             bytes += tensor_storage_bytes(pool.mxfp4.scales);
+        } else if (pool.family == MixedMoeFamily::Tpq) {
+            bytes += tensor_storage_bytes(pool.tpq.packed);
+            bytes += tensor_storage_bytes(pool.tpq.codebook);
         } else if (pool.family == MixedMoeFamily::Nvq) {
             bytes += tensor_storage_bytes(pool.nvq.indices_packed);
             bytes += tensor_storage_bytes(pool.nvq.aux_packed);
@@ -5834,6 +6456,14 @@ static std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
                     pool.mxfp4.neuron_len != cpu.neuron_len) {
                 throw std::runtime_error(
                     "mixed MXFP4 cohort shape mismatch");
+            }
+        } else if (is_tpq_pq_dtype(source.dtype)) {
+            pool.family = MixedMoeFamily::Tpq;
+            pool.tpq = to_device_tpq(source.tpq, cuda);
+            if (pool.tpq.int4 || pool.tpq.out != expected_rows ||
+                    pool.tpq.neuron_len != cpu.neuron_len) {
+                throw std::runtime_error(
+                    "mixed TPQ-PQ cohort shape mismatch");
             }
         } else if (source.dtype != "NINTM" &&
                    source.dtype.rfind("NINT", 0) == 0) {
@@ -5998,6 +6628,10 @@ static NintMoeWeight to_cuda_device_moe_output_slice(
             pool.family = MixedMoeFamily::Mxfp4;
             pool.mxfp4 = to_device_mxfp4(
                 select_mxfp4_cpu_rows(source.mxfp4, rows), true);
+        } else if (is_tpq_pq_dtype(source.dtype)) {
+            pool.family = MixedMoeFamily::Tpq;
+            pool.tpq = to_device_tpq(
+                select_tpq_cpu_rows(source.tpq, rows), true);
         } else if (
                 source.dtype.rfind("NEPQ", 0) == 0) {
             pool.family =
@@ -6117,6 +6751,10 @@ static NintMoeWeight to_cuda_device_moe_expert_slice(
             pool.family = MixedMoeFamily::Mxfp4;
             pool.mxfp4 = to_device_mxfp4(
                 select_mxfp4_cpu_rows(source.mxfp4, rows), true);
+        } else if (is_tpq_pq_dtype(source.dtype)) {
+            pool.family = MixedMoeFamily::Tpq;
+            pool.tpq = to_device_tpq(
+                select_tpq_cpu_rows(source.tpq, rows), true);
         } else if (source.dtype.rfind("NEPQ", 0) == 0) {
             pool.family = MixedMoeFamily::Nepq;
             auto parsed = unpack_nepq(
@@ -6239,6 +6877,14 @@ static Mxfp4Weight copy_cpu_mxfp4_to_cuda(const Mxfp4Weight & source) {
     return result;
 }
 
+static TpqWeight copy_cpu_tpq_to_cuda(const TpqWeight & source) {
+    TpqWeight result = source;
+    result.packed = copy_cpu_weight_to_cuda(source.packed);
+    result.scales = copy_cpu_weight_to_cuda(source.scales);
+    result.codebook = copy_cpu_weight_to_cuda(source.codebook);
+    return result;
+}
+
 static NepqWeight copy_cpu_nepq_to_cuda(const NepqWeight & source) {
     NepqWeight result = source;
     result.indices_packed =
@@ -6285,6 +6931,8 @@ static NintMoeWeight stage_cpu_mixed_moe(
             pool.q8_zero = copy_cpu_nint_to_cuda(source.q8_zero);
         } else if (pool.family == MixedMoeFamily::Mxfp4) {
             pool.mxfp4 = copy_cpu_mxfp4_to_cuda(source.mxfp4);
+        } else if (pool.family == MixedMoeFamily::Tpq) {
+            pool.tpq = copy_cpu_tpq_to_cuda(source.tpq);
         } else if (pool.family == MixedMoeFamily::Nvq) {
             pool.nvq = copy_cpu_nvq_to_cuda(source.nvq);
         } else {
@@ -6367,6 +7015,9 @@ static std::vector<torch::Tensor> moe_cache_fields(
     }
     if (pool.family == MixedMoeFamily::Mxfp4) {
         return {pool.mxfp4.values, pool.mxfp4.scales};
+    }
+    if (pool.family == MixedMoeFamily::Tpq) {
+        return {pool.tpq.packed};
     }
     if (pool.family == MixedMoeFamily::Nvq) {
         return {
@@ -6452,6 +7103,38 @@ static void validate_nepq_expert_boundaries(
     }
 }
 
+static void validate_tpq_expert_boundaries(
+        const MixedMoePool & pool,
+        int out_per_expert,
+        int neuron_len) {
+    if (pool.family != MixedMoeFamily::Tpq) return;
+    if (pool.tpq.vector_size <= 0) {
+        throw std::runtime_error("TPQ-PQ cache vector size must be positive");
+    }
+    const int64_t vectors = neuron_len / pool.tpq.vector_size;
+    const int64_t bits_per_expert =
+        static_cast<int64_t>(out_per_expert) * vectors *
+        pool.tpq.index_bits;
+    if (pool.tpq.int4 ||
+            neuron_len % pool.tpq.vector_size != 0 ||
+            pool.tpq.index_bits < 8 || pool.tpq.index_bits > 16 ||
+            bits_per_expert % 8 != 0 ||
+            !pool.tpq.packed.defined() || !pool.tpq.packed.is_cpu() ||
+            !pool.tpq.packed.is_contiguous() ||
+            pool.tpq.packed.scalar_type() != torch::kUInt8 ||
+            pool.tpq.packed.numel() !=
+                pool.local_experts * bits_per_expert / 8 ||
+            !pool.tpq.codebook.defined() || !pool.tpq.codebook.is_cpu() ||
+            !pool.tpq.codebook.is_contiguous() ||
+            pool.tpq.codebook.scalar_type() != torch::kFloat32 ||
+            pool.tpq.codebook.dim() != 2 ||
+            pool.tpq.codebook.size(0) <= 1 ||
+            pool.tpq.codebook.size(1) != pool.tpq.vector_size) {
+        throw std::runtime_error(
+            "TPQ-PQ expert fields are incompatible with GPU caching");
+    }
+}
+
 static std::string moe_cache_signature(
         const MixedMoePool & pool,
         int out_per_expert,
@@ -6469,6 +7152,9 @@ static std::string moe_cache_signature(
         stream << ":g32:n" << pool.q8_zero.ng;
     } else if (pool.family == MixedMoeFamily::Mxfp4) {
         stream << ":mx4";
+    } else if (pool.family == MixedMoeFamily::Tpq) {
+        stream << ":tpq:v" << pool.tpq.vector_size
+               << ":b" << pool.tpq.index_bits;
     } else if (pool.family == MixedMoeFamily::Nvq) {
         stream << ":f" << pool.nvq.format
                << ":kf" << pool.nvq.kernel_format
@@ -6622,6 +7308,8 @@ public:
                 "cannot register a MoE source after cache finalization");
         }
         validate_nepq_expert_boundaries(
+            pool, out_per_expert, neuron_len);
+        validate_tpq_expert_boundaries(
             pool, out_per_expert, neuron_len);
         const std::string signature =
             moe_cache_signature(pool, out_per_expert, neuron_len);
@@ -7408,6 +8096,13 @@ public:
                 pool.mxfp4.values = arena.fields.at(field++);
                 pool.mxfp4.scales = arena.fields.at(field++);
                 pool.mxfp4.out =
+                    static_cast<int64_t>(arena.slots) *
+                    cpu_->out_per_expert;
+            } else if (pool.family == MixedMoeFamily::Tpq) {
+                pool.tpq.packed = arena.fields.at(field++);
+                pool.tpq.codebook =
+                    copy_cpu_weight_to_cuda(source.tpq.codebook);
+                pool.tpq.out =
                     static_cast<int64_t>(arena.slots) *
                     cpu_->out_per_expert;
             } else if (pool.family == MixedMoeFamily::Nvq) {
@@ -8942,9 +9637,13 @@ static float cpu_half_from_bytes(const int8_t * bytes, int64_t offset) {
 
 static int cpu_nvq_index_bits(int format) {
     switch (format) {
-        case 10: case 11: return 8;
+        case 1: return 11;
+        case 7: return 7;
+        case 8: case 12: return 9;
+        case 9: return 6;
         case 13: case 15: return 10;
         case 14: return 12;
+        case 2: case 3: case 5: case 10: case 11: return 8;
         default:
             throw std::runtime_error(
                 "CPU dense offload does not support NVQ kernel format " +
@@ -8953,7 +9652,8 @@ static int cpu_nvq_index_bits(int format) {
 }
 
 static bool cpu_nvq_d4(int format) {
-    return format == 10 || format == 11 || format == 15;
+    return format == 3 || format == 10 || format == 11 ||
+        format == 12 || format == 15;
 }
 
 static const int8_t * cpu_nvq_codebook(
@@ -8961,12 +9661,17 @@ static const int8_t * cpu_nvq_codebook(
         int format,
         uint32_t state) {
     constexpr int64_t header = 64;
+    if (format == 1 || format == 2 || format == 3 || format == 8) {
+        return metadata;
+    }
     const uint32_t bank = format == 11
         ? state & 1u
         : static_cast<uint8_t>(metadata[36 + state]);
+    if (format == 5) return metadata + header + bank * 256 * 8;
     if (format == 10 || format == 11) {
         return metadata + header + bank * 256 * 4;
     }
+    if (format == 12) return metadata + header + bank * 512 * 4;
     if (format == 13) return metadata + header + bank * 1024 * 8;
     if (format == 14) return metadata + header + bank * 4096 * 8;
     if (format == 15) return metadata + header + bank * 1024 * 4;
@@ -8978,11 +9683,21 @@ static float cpu_nvq_scale(
         int format,
         float anchor,
         uint32_t state) {
+    if (format == 1) {
+        return anchor * static_cast<float>(state) * 0.125f;
+    }
+    if (format == 8) {
+        return anchor * static_cast<float>(state) * 0.03125f;
+    }
+    if (format == 2 || format == 3) {
+        return anchor * static_cast<float>(state);
+    }
     if (format == 11) {
         return anchor * static_cast<float>((state >> 1) + 1);
     }
+    const int64_t lut_offset = (format == 7 || format == 9) ? 8 : 4;
     return anchor * cpu_half_from_bytes(
-        metadata, 4 + static_cast<int64_t>(state) * 2);
+        metadata, lut_offset + static_cast<int64_t>(state) * 2);
 }
 
 static int cpu_nvq_parity7(uint32_t value) {
@@ -9009,36 +9724,83 @@ static void cpu_decode_nvq_group(
     const auto * indices = w.indices_packed.data_ptr<uint8_t>();
     const auto * aux = w.aux_packed.data_ptr<uint8_t>();
     const int bits = cpu_nvq_index_bits(format);
-    const int8_t * bank = cpu_nvq_codebook(
-        w.codebook.data_ptr<int8_t>(), format, state);
-    for (int segment = 0; segment < 3; ++segment) {
-        const int vector8 = group * 3 + segment;
-        if (vector8 >= nsign) break;
-        const int64_t sign_linear = static_cast<int64_t>(row) * nsign + vector8;
-        const uint32_t mask7 = cpu_load_packed_bits(
-            aux, w.aux_packed.numel(), sign_linear * 7, 7);
-        const uint32_t mask8 = mask7 |
-            (static_cast<uint32_t>(cpu_nvq_parity7(mask7)) << 7);
-        const int chunks = d4 ? 2 : 1;
-        for (int chunk = 0; chunk < chunks; ++chunk) {
-            const int vector = d4 ? group * 6 + segment * 2 + chunk : vector8;
-            if (vector >= nvec) continue;
-            const int64_t index_linear = static_cast<int64_t>(row) * nvec + vector;
-            const uint32_t code = bits == 8
-                ? indices[index_linear]
-                : cpu_load_packed_bits(
-                    indices, w.indices_packed.numel(), index_linear * bits, bits);
+    const int8_t * metadata = w.codebook.data_ptr<int8_t>();
+    const int8_t * bank = (format == 7 || format == 9)
+        ? nullptr
+        : cpu_nvq_codebook(metadata, format, state);
+    for (int chunk = 0; chunk < 6; ++chunk) {
+        const int vector8 = group * 3 + (chunk >> 1);
+        const int vector = d4 ? group * 6 + chunk : vector8;
+        if (vector >= nvec) continue;
+        const int64_t index_linear =
+            static_cast<int64_t>(row) * nvec + vector;
+        const uint32_t code = bits == 8
+            ? indices[index_linear]
+            : cpu_load_packed_bits(
+                indices, w.indices_packed.numel(), index_linear * bits, bits);
+        int decoded[4] = {0, 0, 0, 0};
+        if (format == 7) {
+            constexpr int64_t header = 64;
+            constexpr int64_t first_state_bytes = 8 * 4;
+            constexpr int64_t second_offset = header + 8 * first_state_bytes;
+            constexpr int64_t second_state_bytes = 16 * 4;
+            const int8_t * source = (chunk & 1) == 0
+                ? metadata + header + state * first_state_bytes +
+                    (code & 7u) * 4
+                : metadata + second_offset + state * second_state_bytes +
+                    (code >> 3) * 4;
+            for (int index = 0; index < 4; ++index) decoded[index] = source[index];
+        } else if (format == 9) {
+            constexpr int64_t header = 64;
+            const int8_t * source = metadata + header +
+                (static_cast<int64_t>(state) * 64 + code) * 8 +
+                (chunk & 1) * 4;
+            for (int index = 0; index < 4; ++index) decoded[index] = source[index];
+        } else {
             const int8_t * source = bank +
-                static_cast<int64_t>(code) * vector_size;
-            const int count = d4 ? 4 : 8;
-            const int destination = segment * 8 + chunk * 4;
-            for (int index = 0; index < count; ++index) {
-                const int sign_index = chunk * 4 + index;
-                values[destination + index] =
-                    ((mask8 >> sign_index) & 1u) != 0
-                    ? static_cast<int8_t>(-source[index])
-                    : source[index];
+                static_cast<int64_t>(code) * vector_size +
+                (d4 ? 0 : (chunk & 1) * 4);
+            for (int index = 0; index < 4; ++index) decoded[index] = source[index];
+            if (format == 1 || format == 8) {
+                const int64_t delta_linear =
+                    static_cast<int64_t>(row) * w.ng + group;
+                const bool negative = cpu_load_packed_bits(
+                    aux, w.aux_packed.numel(), delta_linear, 1) != 0;
+                const int delta = negative ? -1 : 1;
+                if (format == 8) {
+                    source = metadata +
+                        static_cast<int64_t>(negative) * 512 * 8 +
+                        static_cast<int64_t>(code) * 8 + (chunk & 1) * 4;
+                    for (int index = 0; index < 4; ++index) {
+                        decoded[index] = 32 * source[index] + 5 * delta;
+                    }
+                } else {
+                    for (int index = 0; index < 4; ++index) {
+                        decoded[index] = 8 * decoded[index] + delta;
+                    }
+                }
+            } else {
+                if (vector8 >= nsign) continue;
+                const int64_t sign_linear =
+                    static_cast<int64_t>(row) * nsign + vector8;
+                const uint32_t mask7 = cpu_load_packed_bits(
+                    aux, w.aux_packed.numel(), sign_linear * 7, 7);
+                const uint32_t last =
+                    static_cast<uint32_t>(cpu_nvq_parity7(mask7)) ^
+                    ((format == 2 && w.sign_mode != 0)
+                        ? ((code >> 7) & 1u) : 0u);
+                const uint32_t mask8 = mask7 | (last << 7);
+                const int sign_base = (chunk & 1) * 4;
+                for (int index = 0; index < 4; ++index) {
+                    if (((mask8 >> (sign_base + index)) & 1u) != 0) {
+                        decoded[index] = -decoded[index];
+                    }
+                }
             }
+        }
+        const int destination = chunk * 4;
+        for (int index = 0; index < 4; ++index) {
+            values[destination + index] = static_cast<int8_t>(decoded[index]);
         }
     }
 }
@@ -9510,12 +10272,9 @@ static torch::Tensor nint_matmul(const NintWeight & w, torch::Tensor x) {
                     w.q_packed, w.q8_zero_scale, x, ws.qx, ws.xscale);
             });
         }
-        auto ww = g_profiler.measure("nint8_zero.dequant", [&]() {
-            return nint8_zero_dequant_cuda(
-                w.q_packed, w.q8_zero_scale, w.neuron_len);
-        });
-        return g_profiler.measure("nint8_zero.gemm", [&]() {
-            return torch::matmul(x, ww.transpose(0, 1));
+        return g_profiler.measure("nint8_zero.packed_mmq", [&]() {
+            return nint8_zero_mmq_f16_packed_cuda(
+                w.q_packed, w.q8_zero_scale, x, w.neuron_len);
         });
     }
     if (w.q5_exec) {
@@ -10109,18 +10868,64 @@ static torch::Tensor mxfp8_matmul(
     TORCH_CHECK(
         x.dim() == 2 && x.size(1) == weight.neuron_len,
         "MXFP8 activation width mismatch");
+    if (!x.is_cuda()) {
+        TORCH_CHECK(
+            !weight.values.is_cuda() && !weight.scales.is_cuda(),
+            "CPU MXFP8 matmul requires CPU-resident weights");
+        const int64_t rows = x.size(0);
+        const int64_t outputs = weight.out;
+        const int64_t width = weight.neuron_len;
+        const int64_t scale_columns = width / 128;
+        const auto * input = x.data_ptr<c10::Half>();
+        const auto * values = weight.values.data_ptr<uint8_t>();
+        const auto * scales = weight.scales.data_ptr<uint8_t>();
+        auto result = torch::empty(
+            {rows, outputs},
+            torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat16));
+        auto * output = result.data_ptr<c10::Half>();
+        at::parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
+            std::vector<float> accumulators(static_cast<size_t>(rows));
+            for (int64_t neuron = begin; neuron < end; ++neuron) {
+                std::fill(accumulators.begin(), accumulators.end(), 0.0f);
+                for (int64_t column = 0; column < width; ++column) {
+                    const uint8_t raw = values[neuron * width + column];
+                    const unsigned exponent =
+                        (static_cast<unsigned>(raw) >> 3u) & 15u;
+                    const unsigned mantissa = static_cast<unsigned>(raw) & 7u;
+                    float decoded = exponent == 0u
+                        ? std::ldexp(float(mantissa) * 0.125f, -6)
+                        : std::ldexp(
+                            1.0f + float(mantissa) * 0.125f,
+                            static_cast<int>(exponent) - 7);
+                    if ((raw & 128u) != 0u) decoded = -decoded;
+                    const uint8_t raw_scale = scales[
+                        (neuron / 128) * scale_columns + column / 128];
+                    const float weight_value = decoded * std::ldexp(
+                        1.0f, static_cast<int>(raw_scale) - 127);
+                    for (int64_t row = 0; row < rows; ++row) {
+                        accumulators[static_cast<size_t>(row)] = std::fma(
+                            static_cast<float>(input[row * width + column]),
+                            weight_value,
+                            accumulators[static_cast<size_t>(row)]);
+                    }
+                }
+                for (int64_t row = 0; row < rows; ++row) {
+                    output[row * outputs + neuron] = c10::Half(
+                        accumulators[static_cast<size_t>(row)]);
+                }
+            }
+        });
+        return result;
+    }
     if (x.size(0) <= 8) {
         return g_profiler.measure("mxfp8.small_m", [&]() {
             return mxfp8_small_m_cuda(
                 weight.values, weight.scales, x);
         });
     }
-    auto dense = g_profiler.measure("mxfp8.dequant", [&]() {
-        return mxfp8_dequant_cuda(
-            weight.values, weight.scales);
-    });
-    return g_profiler.measure("mxfp8.gemm", [&]() {
-        return nint_cublas_gemm_nt_f32acc_cuda(x, dense);
+    return g_profiler.measure("mxfp8.packed_matmul", [&]() {
+        return mxfp8_matmul_f16_cuda(
+            weight.values, weight.scales, x);
     });
 }
 
@@ -10268,6 +11073,191 @@ static torch::Tensor mxfp8_groupwise_matmul_f32(
     return torch::cat(outputs, -1).contiguous();
 }
 
+static torch::Tensor mxfp4_matmul(
+        const Mxfp4Weight & weight,
+        torch::Tensor x) {
+    x = x.contiguous().to(torch::kFloat16);
+    TORCH_CHECK(
+        x.dim() == 2 && x.size(1) == weight.neuron_len,
+        "MXFP4 activation width mismatch");
+    if (x.is_cuda()) {
+        TORCH_CHECK(
+            weight.values.is_cuda() && weight.scales.is_cuda(),
+            "CUDA MXFP4 matmul requires CUDA-resident weights");
+        return mxfp4_matmul_f16_cuda(
+            weight.values, weight.scales, x);
+    }
+    TORCH_CHECK(
+        !weight.values.is_cuda() && !weight.scales.is_cuda(),
+        "CPU MXFP4 matmul requires CPU-resident weights");
+    const int64_t rows = x.size(0);
+    const int64_t outputs = weight.out;
+    const int64_t width = weight.neuron_len;
+    const int64_t packed_columns = width / 2;
+    const int64_t scale_columns = width / 32;
+    const auto * input = x.data_ptr<c10::Half>();
+    const auto * values = weight.values.data_ptr<uint8_t>();
+    const auto * scales = weight.scales.data_ptr<uint8_t>();
+    auto result = torch::empty(
+        {rows, outputs},
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat16));
+    auto * output = result.data_ptr<c10::Half>();
+    static constexpr float magnitude[8] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    };
+    at::parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
+        std::vector<float> accumulators(static_cast<size_t>(rows));
+        for (int64_t neuron = begin; neuron < end; ++neuron) {
+            std::fill(accumulators.begin(), accumulators.end(), 0.0f);
+            for (int64_t column = 0; column < width; ++column) {
+                const uint8_t packed = values[
+                    neuron * packed_columns + column / 2];
+                const uint8_t code = static_cast<uint8_t>(
+                    (packed >> ((column & 1) * 4)) & 15u);
+                float decoded = magnitude[code & 7u];
+                if ((code & 8u) != 0u) decoded = -decoded;
+                const uint8_t raw_scale = scales[
+                    neuron * scale_columns + column / 32];
+                const float weight_value = decoded * std::ldexp(
+                    1.0f, static_cast<int>(raw_scale) - 127);
+                for (int64_t row = 0; row < rows; ++row) {
+                    accumulators[static_cast<size_t>(row)] = std::fma(
+                        static_cast<float>(input[row * width + column]),
+                        weight_value,
+                        accumulators[static_cast<size_t>(row)]);
+                }
+            }
+            for (int64_t row = 0; row < rows; ++row) {
+                output[row * outputs + neuron] = c10::Half(
+                    accumulators[static_cast<size_t>(row)]);
+            }
+        }
+    });
+    return result;
+}
+
+static torch::Tensor tpq_matmul(
+        const TpqWeight & weight,
+        torch::Tensor x) {
+    x = x.contiguous().to(torch::kFloat16);
+    TORCH_CHECK(
+        x.dim() == 2 && x.size(1) == weight.neuron_len,
+        "TPQ activation width mismatch");
+    if (x.is_cuda()) {
+        TORCH_CHECK(weight.packed.is_cuda(),
+            "CUDA TPQ matmul requires CUDA-resident weights");
+        return weight.int4
+            ? tpq_int4_matmul_f16_cuda(
+                weight.packed, weight.scales, x, weight.group_size)
+            : tpq_pq_matmul_f16_cuda(
+                weight.packed, weight.codebook, x,
+                weight.out, weight.neuron_len,
+                weight.vector_size, weight.index_bits);
+    }
+    TORCH_CHECK(!weight.packed.is_cuda(),
+        "CPU TPQ matmul requires CPU-resident weights");
+    const int64_t rows = x.size(0);
+    const int64_t outputs = weight.out;
+    const int64_t width = weight.neuron_len;
+    const auto * input = x.data_ptr<c10::Half>();
+    const auto * packed = weight.packed.data_ptr<uint8_t>();
+    auto result = torch::empty(
+        {rows, outputs},
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat16));
+    auto * output = result.data_ptr<c10::Half>();
+    const auto * scales = weight.int4
+        ? weight.scales.data_ptr<c10::Half>() : nullptr;
+    const auto * codebook = weight.int4
+        ? nullptr : weight.codebook.data_ptr<float>();
+    const size_t packed_size = static_cast<size_t>(weight.packed.numel());
+    at::parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
+        std::vector<float> accumulators(static_cast<size_t>(rows));
+        for (int64_t neuron = begin; neuron < end; ++neuron) {
+            std::fill(accumulators.begin(), accumulators.end(), 0.0f);
+            if (weight.int4) {
+                const int64_t packed_columns = width / 2;
+                const int64_t scale_columns = width / weight.group_size;
+                for (int64_t column = 0; column < width; ++column) {
+                    const uint8_t byte = packed[
+                        neuron * packed_columns + column / 2];
+                    const int code = static_cast<int>(
+                        (byte >> ((column & 1) * 4)) & 15u) - 8;
+                    const float value = static_cast<float>(code) *
+                        static_cast<float>(scales[
+                            neuron * scale_columns +
+                            column / weight.group_size]);
+                    for (int64_t row = 0; row < rows; ++row) {
+                        accumulators[static_cast<size_t>(row)] = std::fma(
+                            static_cast<float>(input[row * width + column]),
+                            value, accumulators[static_cast<size_t>(row)]);
+                    }
+                }
+            } else {
+                const int64_t vectors = width / weight.vector_size;
+                for (int64_t vector = 0; vector < vectors; ++vector) {
+                    const size_t linear = static_cast<size_t>(
+                        neuron * vectors + vector);
+                    const size_t bit = linear *
+                        static_cast<size_t>(weight.index_bits);
+                    const size_t byte = bit >> 3;
+                    const int shift = static_cast<int>(bit & 7);
+                    uint32_t code = byte < packed_size ? packed[byte] : 0u;
+                    if (byte + 1 < packed_size) {
+                        code |= static_cast<uint32_t>(packed[byte + 1]) << 8;
+                    }
+                    if (byte + 2 < packed_size) {
+                        code |= static_cast<uint32_t>(packed[byte + 2]) << 16;
+                    }
+                    code = (code >> shift) &
+                        ((1u << weight.index_bits) - 1u);
+                    const float * values = codebook +
+                        static_cast<size_t>(code) * weight.vector_size;
+                    for (int element = 0;
+                         element < weight.vector_size; ++element) {
+                        const int64_t column =
+                            vector * weight.vector_size + element;
+                        for (int64_t row = 0; row < rows; ++row) {
+                            accumulators[static_cast<size_t>(row)] = std::fma(
+                                static_cast<float>(input[row * width + column]),
+                                values[element],
+                                accumulators[static_cast<size_t>(row)]);
+                        }
+                    }
+                }
+            }
+            for (int64_t row = 0; row < rows; ++row) {
+                output[row * outputs + neuron] = c10::Half(
+                    accumulators[static_cast<size_t>(row)]);
+            }
+        }
+    });
+    return result;
+}
+
+struct TpqLinear {
+    TpqWeight weight;
+
+    torch::Tensor forward(torch::Tensor x) const {
+        auto shape = x.sizes().vec();
+        auto y = tpq_matmul(
+            weight, x.reshape({-1, x.size(-1)}));
+        shape.back() = y.size(-1);
+        return y.reshape(shape);
+    }
+};
+
+struct Mxfp4Linear {
+    Mxfp4Weight weight;
+
+    torch::Tensor forward(torch::Tensor x) const {
+        auto shape = x.sizes().vec();
+        auto y = mxfp4_matmul(
+            weight, x.reshape({-1, x.size(-1)}));
+        shape.back() = y.size(-1);
+        return y.reshape(shape);
+    }
+};
+
 struct Mxfp8Linear {
     Mxfp8Weight weight;
 
@@ -10283,7 +11273,9 @@ struct Mxfp8Linear {
 enum class QuantLinearKind {
     Nint,
     Nvq,
+    Mxfp4,
     Mxfp8,
+    Tpq,
     Dense,
 };
 
@@ -10296,7 +11288,9 @@ struct QuantLinearShard {
     QuantLinearKind kind = QuantLinearKind::Nint;
     NintWeight nint;
     NvqWeight nvq;
+    Mxfp4Weight mxfp4;
     Mxfp8Weight mxfp8;
+    TpqWeight tpq;
     torch::Tensor dense;
 };
 
@@ -10318,6 +11312,18 @@ static torch::Tensor run_quant_linear_shard(
             ? nvq_matmul_input_mul(
                 shard.nvq, x, gate.value(), gate_mode)
             : nvq_matmul(shard.nvq, x);
+    }
+    if (shard.kind == QuantLinearKind::Mxfp4) {
+        TORCH_CHECK(
+            !gate.has_value(),
+            "MXFP4 tensor-parallel linear does not support input gating");
+        return mxfp4_matmul(shard.mxfp4, x);
+    }
+    if (shard.kind == QuantLinearKind::Tpq) {
+        TORCH_CHECK(
+            !gate.has_value(),
+            "TPQ tensor-parallel linear does not support input gating");
+        return tpq_matmul(shard.tpq, x);
     }
     if (shard.kind == QuantLinearKind::Dense) {
         auto local = x.to(shard.dense.scalar_type());
@@ -10460,7 +11466,9 @@ struct QuantLinear {
     QuantLinearKind kind = QuantLinearKind::Nint;
     NintLinear nint;
     NvqLinear nvq;
+    Mxfp4Linear mxfp4;
     Mxfp8Linear mxfp8;
+    TpqLinear tpq;
     torch::Tensor dense;
     TensorParallelAxis tensor_parallel_axis =
         TensorParallelAxis::Mirrored;
@@ -10474,7 +11482,9 @@ struct QuantLinear {
 
     bool is_nint() const { return kind == QuantLinearKind::Nint; }
     bool is_nvq() const { return kind == QuantLinearKind::Nvq; }
+    bool is_mxfp4() const { return kind == QuantLinearKind::Mxfp4; }
     bool is_mxfp8() const { return kind == QuantLinearKind::Mxfp8; }
+    bool is_tpq() const { return kind == QuantLinearKind::Tpq; }
     bool is_dense() const { return kind == QuantLinearKind::Dense; }
 
     torch::Tensor forward_tensor_parallel_flat(
@@ -10560,6 +11570,8 @@ struct QuantLinear {
         }
         if (is_nint()) return nint.forward(x);
         if (is_nvq()) return nvq.forward(x);
+        if (is_mxfp4()) return mxfp4.forward(x);
+        if (is_tpq()) return tpq.forward(x);
         if (is_dense()) {
             return torch::matmul(
                 x.to(dense.scalar_type()),
@@ -10612,7 +11624,7 @@ struct QuantLinear {
         if (is_nint()) return nint.forward_input_mul(x, gate, mode);
         if (is_nvq()) return nvq.forward_input_mul(x, gate, mode);
         throw std::runtime_error(
-            "MXFP8/dense linear does not support input gating");
+            "MXFP4/MXFP8/TPQ/dense linear does not support input gating");
     }
     torch::Tensor forward_input_mul_f32_kld(
             torch::Tensor x,
@@ -10629,17 +11641,88 @@ struct QuantLinear {
             ? logical_out
             : (is_nint() ? nint.w.out
                : (is_nvq() ? nvq.w.out
-                  : (is_dense() ? dense.size(0) : mxfp8.weight.out)));
+                  : (is_mxfp4() ? mxfp4.weight.out
+                     : (is_tpq() ? tpq.weight.out
+                        : (is_dense() ? dense.size(0) : mxfp8.weight.out)))));
     }
     int64_t neuron_len() const {
         return tensor_parallel()
             ? logical_neuron_len
             : (is_nint() ? nint.w.neuron_len
                : (is_nvq() ? nvq.w.neuron_len
-                  : (is_dense() ? dense.size(1)
-                     : mxfp8.weight.neuron_len)));
+                  : (is_mxfp4() ? mxfp4.weight.neuron_len
+                     : (is_tpq() ? tpq.weight.neuron_len
+                        : (is_dense() ? dense.size(1)
+                           : mxfp8.weight.neuron_len)))));
     }
 };
+
+static torch::Tensor quant_embedding_lookup(
+        const QuantLinear & embedding,
+        torch::Tensor token_ids) {
+    TORCH_CHECK(
+        !embedding.tensor_parallel(),
+        "quantized embedding does not support tensor-parallel shards");
+    if (embedding.is_dense()) {
+        auto output_shape = token_ids.sizes().vec();
+        output_shape.push_back(embedding.dense.size(1));
+        return embedding.dense.index_select(
+            0, token_ids.reshape({-1})).reshape(output_shape);
+    }
+    if (embedding.is_nvq()) {
+        return nvq_embedding(embedding.nvq.w, token_ids);
+    }
+    if (embedding.is_nint()) {
+        if (embedding.nint.w.q8_zero) {
+            return nint8_zero_embedding_lookup_cuda(
+                embedding.nint.w.q_packed,
+                embedding.nint.w.q8_zero_scale,
+                token_ids, embedding.nint.w.neuron_len);
+        }
+        if (embedding.nint.w.bits == 4) {
+            return nint_embedding_lookup_packed_compact_cuda(
+                embedding.nint.w.q_packed,
+                embedding.nint.w.sub_scale,
+                embedding.nint.w.sub_min,
+                embedding.nint.w.neuron_scale,
+                embedding.nint.w.neuron_min,
+                token_ids, embedding.nint.w.neuron_len,
+                embedding.nint.w.gs);
+        }
+        return nint_embedding_lookup_packed_compact_bits_cuda(
+            embedding.nint.w.q_packed,
+            embedding.nint.w.sub_scale,
+            embedding.nint.w.sub_min,
+            embedding.nint.w.neuron_scale,
+            embedding.nint.w.neuron_min,
+            token_ids, embedding.nint.w.neuron_len,
+            embedding.nint.w.gs, embedding.nint.w.bits);
+    }
+    if (embedding.is_mxfp4()) {
+        return mxfp4_embedding_lookup_cuda(
+            embedding.mxfp4.weight.values,
+            embedding.mxfp4.weight.scales, token_ids);
+    }
+    if (embedding.is_mxfp8()) {
+        return mxfp8_embedding_lookup_cuda(
+            embedding.mxfp8.weight.values,
+            embedding.mxfp8.weight.scales, token_ids);
+    }
+    TORCH_CHECK(embedding.is_tpq(), "unsupported quantized embedding kind");
+    if (embedding.tpq.weight.int4) {
+        return tpq_int4_embedding_lookup_cuda(
+            embedding.tpq.weight.packed,
+            embedding.tpq.weight.scales, token_ids,
+            embedding.tpq.weight.group_size);
+    }
+    return tpq_pq_embedding_lookup_cuda(
+        embedding.tpq.weight.packed,
+        embedding.tpq.weight.codebook, token_ids,
+        embedding.tpq.weight.out,
+        embedding.tpq.weight.neuron_len,
+        embedding.tpq.weight.vector_size,
+        embedding.tpq.weight.index_bits);
+}
 
 struct QuantLinearGroup {
     bool nint_grouped = false;
@@ -11050,6 +12133,40 @@ static QuantLinear load_quant_linear(
                 result.nvq.w = to_device_nvq(cpu, true);
             }
         }
+    } else if (dtype == "MXFP4") {
+        result.kind = QuantLinearKind::Mxfp4;
+        const auto cpu = unpack_mxfp4(mfq.read_blob(name));
+        result.logical_out = cpu.out;
+        result.logical_neuron_len = cpu.neuron_len;
+        if (g_tensor_parallel.enabled() &&
+                axis != TensorParallelAxis::Mirrored) {
+            const int64_t extent = axis == TensorParallelAxis::Output
+                ? cpu.out : cpu.neuron_len;
+            const int64_t preferred = axis == TensorParallelAxis::Output
+                ? 128 : 32;
+            for (const auto & slice : select_slices(extent, preferred)) {
+                auto shard_cpu = slice_mxfp4_cpu(
+                    cpu, axis, slice.begin, slice.end);
+                QuantLinearShard shard;
+                shard.device = slice.device;
+                shard.kind = QuantLinearKind::Mxfp4;
+                shard.output_begin = axis == TensorParallelAxis::Output
+                    ? slice.begin : 0;
+                shard.output_end = axis == TensorParallelAxis::Output
+                    ? slice.end : cpu.out;
+                shard.input_begin = axis == TensorParallelAxis::Input
+                    ? slice.begin : 0;
+                shard.input_end = axis == TensorParallelAxis::Input
+                    ? slice.end : cpu.neuron_len;
+                shard.mxfp4 = to_device_mxfp4(
+                    shard_cpu, true, slice.device);
+                result.tensor_parallel_shards.push_back(std::move(shard));
+            }
+        } else {
+            result.mxfp4.weight = to_device_mxfp4(
+                cpu, !g_loading_cpu_layer,
+                g_loading_cpu_layer ? -1 : active_weight_load_device());
+        }
     } else if (dtype == "MXFP8") {
         result.kind = QuantLinearKind::Mxfp8;
         const auto cpu = unpack_mxfp8(mfq.read_blob(name));
@@ -11079,12 +12196,47 @@ static QuantLinear load_quant_linear(
                     std::move(shard));
             }
         } else if (g_loading_cpu_layer) {
-            throw std::runtime_error(
-                "CPU dense offload does not yet support MXFP8 tensor: " +
-                name);
+            result.mxfp8.weight = to_device_mxfp8(cpu, false);
         } else {
             result.mxfp8.weight = to_cuda_device_mxfp8(
                 cpu, active_weight_load_device());
+        }
+    } else if (dtype == "TPQ-I4G64" || is_tpq_pq_dtype(dtype)) {
+        result.kind = QuantLinearKind::Tpq;
+        const auto cpu = dtype == "TPQ-I4G64"
+            ? unpack_tpq_int4(mfq.read_blob(name))
+            : unpack_tpq_pq(mfq.read_blob(name), dtype);
+        result.logical_out = cpu.out;
+        result.logical_neuron_len = cpu.neuron_len;
+        if (g_tensor_parallel.enabled() &&
+                axis != TensorParallelAxis::Mirrored) {
+            const int64_t extent = axis == TensorParallelAxis::Output
+                ? cpu.out : cpu.neuron_len;
+            const int64_t preferred = axis == TensorParallelAxis::Output
+                ? 8 : (cpu.int4 ? cpu.group_size : cpu.vector_size);
+            for (const auto & slice : select_slices(extent, preferred)) {
+                auto shard_cpu = slice_tpq_cpu(
+                    cpu, axis, slice.begin, slice.end);
+                QuantLinearShard shard;
+                shard.device = slice.device;
+                shard.kind = QuantLinearKind::Tpq;
+                shard.output_begin = axis == TensorParallelAxis::Output
+                    ? slice.begin : 0;
+                shard.output_end = axis == TensorParallelAxis::Output
+                    ? slice.end : cpu.out;
+                shard.input_begin = axis == TensorParallelAxis::Input
+                    ? slice.begin : 0;
+                shard.input_end = axis == TensorParallelAxis::Input
+                    ? slice.end : cpu.neuron_len;
+                shard.tpq = to_device_tpq(
+                    shard_cpu, true, slice.device);
+                result.tensor_parallel_shards.push_back(
+                    std::move(shard));
+            }
+        } else {
+            result.tpq.weight = to_device_tpq(
+                cpu, !g_loading_cpu_layer,
+                g_loading_cpu_layer ? -1 : active_weight_load_device());
         }
     } else if (dtype == "BF16" || dtype == "F16" || dtype == "F32") {
         result.kind = QuantLinearKind::Dense;
@@ -11136,7 +12288,7 @@ static QuantLinear load_quant_linear(
         }
     } else {
         throw std::runtime_error(
-            "linear tensor must be NINT/NVQ/MXFP8/BF16/F16/F32: " +
+            "linear tensor must be NINT/NVQ/MXFP4/MXFP8/TPQ/BF16/F16/F32: " +
             name + " dtype=" + dtype);
     }
     return result;
@@ -11144,7 +12296,8 @@ static QuantLinear load_quant_linear(
 
 static bool is_quant_dtype(const std::string & dtype) {
     return is_nint_linear_dtype(dtype) ||
-        is_nvq_linear_dtype(dtype) || dtype == "MXFP8";
+        is_nvq_linear_dtype(dtype) || dtype == "MXFP4" || dtype == "MXFP8" ||
+        dtype == "TPQ-I4G64" || is_tpq_pq_dtype(dtype);
 }
 
 static QuantLinearGroup make_quant_group(
@@ -11199,6 +12352,19 @@ static bool quant_linear_pair_compatible(const QuantLinear & a, const QuantLinea
     if (a.is_nvq()) return nvq_pair_compatible(a.nvq.w, b.nvq.w);
     if (a.is_mxfp8()) {
         return a.mxfp8.weight.neuron_len == b.mxfp8.weight.neuron_len;
+    }
+    if (a.is_mxfp4()) {
+        return a.mxfp4.weight.neuron_len == b.mxfp4.weight.neuron_len;
+    }
+    if (a.is_tpq()) {
+        return a.tpq.weight.int4 == b.tpq.weight.int4 &&
+            a.tpq.weight.neuron_len == b.tpq.weight.neuron_len &&
+            a.tpq.weight.group_size == b.tpq.weight.group_size &&
+            a.tpq.weight.vector_size == b.tpq.weight.vector_size &&
+            a.tpq.weight.index_bits == b.tpq.weight.index_bits;
+    }
+    if (a.is_dense()) {
+        return a.dense.size(1) == b.dense.size(1);
     }
     const auto & x = a.nint.w;
     const auto & y = b.nint.w;
@@ -11353,6 +12519,23 @@ static torch::Tensor dequant_quant_linear_f32(const QuantLinear & linear) {
                 linear.mxfp8.weight.scales)
                 .to(torch::kFloat32).contiguous();
         }
+        if (linear.is_mxfp4()) {
+            return mxfp4_dequant_cuda(
+                linear.mxfp4.weight.values,
+                linear.mxfp4.weight.scales)
+                .to(torch::kFloat32).contiguous();
+        }
+        if (linear.is_tpq()) {
+            const auto & weight = linear.tpq.weight;
+            auto dense = weight.int4
+                ? tpq_int4_dequant_cuda(
+                    weight.packed, weight.scales, weight.group_size)
+                : tpq_pq_dequant_cuda(
+                    weight.packed, weight.codebook,
+                    weight.out, weight.neuron_len,
+                    weight.vector_size, weight.index_bits);
+            return dense.to(torch::kFloat32).contiguous();
+        }
         if (linear.is_dense()) {
             return linear.dense.to(torch::kFloat32).contiguous();
         }
@@ -11380,6 +12563,20 @@ static torch::Tensor dequant_quant_linear_f32(const QuantLinear & linear) {
                 shard.mxfp8.values,
                 shard.mxfp8.scales)
                 .to(torch::kFloat32).contiguous();
+        } else if (shard.kind == QuantLinearKind::Mxfp4) {
+            part = mxfp4_dequant_cuda(
+                shard.mxfp4.values, shard.mxfp4.scales)
+                .to(torch::kFloat32).contiguous();
+        } else if (shard.kind == QuantLinearKind::Tpq) {
+            part = shard.tpq.int4
+                ? tpq_int4_dequant_cuda(
+                    shard.tpq.packed, shard.tpq.scales,
+                    shard.tpq.group_size)
+                : tpq_pq_dequant_cuda(
+                    shard.tpq.packed, shard.tpq.codebook,
+                    shard.tpq.out, shard.tpq.neuron_len,
+                    shard.tpq.vector_size, shard.tpq.index_bits);
+            part = part.to(torch::kFloat32).contiguous();
         } else if (shard.kind == QuantLinearKind::Dense) {
             part = shard.dense.to(torch::kFloat32).contiguous();
         } else {
@@ -16020,36 +17217,7 @@ struct Model {
 
     torch::Tensor embed_forward(torch::Tensor ids) const {
         auto token_ids = ids.contiguous().to(torch::kCUDA, torch::kInt64);
-        torch::Tensor output;
-        if (embed.is_dense()) {
-            auto output_shape = token_ids.sizes().vec();
-            output_shape.push_back(embed.dense.size(1));
-            output = embed.dense.index_select(
-                0, token_ids.reshape({-1})).reshape(output_shape);
-        } else if (embed.is_nvq()) {
-            output = nvq_embedding(embed.nvq.w, token_ids);
-        } else {
-            TORCH_CHECK(
-                embed.is_nint(),
-                "MXFP8 token embeddings are not supported by the CUDA runtime");
-            if (embed.nint.w.q8_zero) {
-                output = nint8_zero_embedding_lookup_cuda(
-                embed.nint.w.q_packed, embed.nint.w.q8_zero_scale,
-                token_ids, embed.nint.w.neuron_len);
-            } else if (embed.nint.w.bits == 4) {
-                output = nint_embedding_lookup_packed_compact_cuda(
-                embed.nint.w.q_packed, embed.nint.w.sub_scale, embed.nint.w.sub_min,
-                embed.nint.w.neuron_scale, embed.nint.w.neuron_min,
-                token_ids, embed.nint.w.neuron_len, embed.nint.w.gs);
-            } else {
-                output = nint_embedding_lookup_packed_compact_bits_cuda(
-                    embed.nint.w.q_packed, embed.nint.w.sub_scale,
-                    embed.nint.w.sub_min, embed.nint.w.neuron_scale,
-                    embed.nint.w.neuron_min, token_ids,
-                    embed.nint.w.neuron_len, embed.nint.w.gs,
-                    embed.nint.w.bits);
-            }
-        }
+        auto output = quant_embedding_lookup(embed, token_ids);
         return c.is_minicpmo45()
             ? output.to(torch::kBFloat16).contiguous()
             : output;
@@ -18892,8 +20060,12 @@ static int run_linear_check(
 
     const NintWeight * nint = linear.is_nint() ? &linear.nint.w : nullptr;
     const NvqWeight * nvq = linear.is_nvq() ? &linear.nvq.w : nullptr;
+    const Mxfp4Weight * mxfp4 = linear.is_mxfp4()
+        ? &linear.mxfp4.weight : nullptr;
     const Mxfp8Weight * mxfp8 = linear.is_mxfp8()
         ? &linear.mxfp8.weight : nullptr;
+    const TpqWeight * tpq = linear.is_tpq()
+        ? &linear.tpq.weight : nullptr;
     const char * dq_env_name = nint == nullptr ? nullptr :
         (nint->bits == 4 ? "MFQ_NINT4_GS24_DQ_VEC2" :
          (nint->bits == 6 ? "MFQ_NINT6_GS24_DQ_VEC4" : nullptr));
@@ -18924,6 +20096,15 @@ static int run_linear_check(
                   nint->neuron_scale, nint->neuron_min, nint->neuron_len, nint->gs, nint->bits);
     } else if (nvq != nullptr) {
         ww = nvq_dequant(*nvq);
+    } else if (mxfp4 != nullptr) {
+        ww = mxfp4_dequant_cuda(mxfp4->values, mxfp4->scales);
+    } else if (tpq != nullptr) {
+        ww = tpq->int4
+            ? tpq_int4_dequant_cuda(
+                tpq->packed, tpq->scales, tpq->group_size)
+            : tpq_pq_dequant_cuda(
+                tpq->packed, tpq->codebook, tpq->out,
+                tpq->neuron_len, tpq->vector_size, tpq->index_bits);
     } else {
         ww = mxfp8_cpu_reference(*mxfp8);
     }
@@ -18951,6 +20132,12 @@ static int run_linear_check(
         ? (double)nvq->indices_packed.numel() + (double)nvq->aux_packed.numel() +
           (double)nvq->sub_scale_packed.numel() +
           (double)nvq->neuron_scale.numel() * sizeof(float) + (double)nvq->codebook.numel()
+        : mxfp4 != nullptr
+        ? (double)mxfp4->values.numel() + (double)mxfp4->scales.numel()
+        : tpq != nullptr
+        ? (double)tpq->packed.numel() +
+          (double)tpq->scales.numel() * sizeof(c10::Half) +
+          (double)tpq->codebook.numel() * sizeof(float)
         : (double)mxfp8->values.numel() + (double)mxfp8->scales.numel();
     std::cout << "shape=" << y_ref.sizes() << "\n";
     if (nint != nullptr) {
@@ -18960,6 +20147,11 @@ static int run_linear_check(
     } else if (nvq != nullptr) {
         std::cout << "dtype=NVQ" << nvq->format << " gs=" << nvq->gs
                   << " sub_bits=" << nvq->sub_bits << " m=" << M << "\n";
+    } else if (mxfp4 != nullptr) {
+        std::cout << "dtype=MXFP4 block=1x32 m=" << M << "\n";
+    } else if (tpq != nullptr) {
+        std::cout << "dtype=" << (tpq->int4 ? "TPQ-I4G64" : "TPQ-PQ")
+                  << " m=" << M << "\n";
     } else {
         std::cout << "dtype=MXFP8 block=128x128 m=" << M << "\n";
     }
@@ -19970,6 +21162,12 @@ static int run_nintm_tensor_check(
             } else if (pool.dtype == "MXFP4") {
                 dense_flat = dequant_mxfp4_cpu(pool.mxfp4)
                     .to(torch::kCUDA).contiguous();
+            } else if (is_tpq_pq_dtype(pool.dtype)) {
+                auto packed = to_device_tpq(pool.tpq, true);
+                dense_flat = tpq_pq_dequant_cuda(
+                    packed.packed, packed.codebook,
+                    packed.out, packed.neuron_len,
+                    packed.vector_size, packed.index_bits);
             } else if (pool.dtype.rfind("NEPQ", 0) == 0) {
                 auto parsed = unpack_nepq(
                     pool.payload, pool.dtype, pool.runtime_payload);

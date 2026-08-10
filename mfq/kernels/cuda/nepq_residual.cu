@@ -19,10 +19,13 @@ __device__ __forceinline__ float residual_dot(
     int record,
     int position_bits,
     int block_vectors,
-    int block) {
+    int block,
+    int width) {
+    if (record < 0) return 0.0f;
     const int position = record & ((1 << position_bits) - 1);
     const int dictionary_id = record >> position_bits;
     const int vector = block * block_vectors + position;
+    if (dictionary_id >= 1024 || vector >= width / 8) return 0.0f;
     const __half * source = input + static_cast<int64_t>(vector) * 8;
     const __half * code = dictionary + static_cast<int64_t>(dictionary_id) * 8;
     float value = 0.0f;
@@ -75,7 +78,8 @@ __global__ void nepq_sparse_residual_matmul_kernel(
             first_row[block],
             position_bits,
             block_vectors,
-            block);
+            block,
+            width);
         const int record = second_row[block];
         if (record >= 0) {
             value += residual_dot(
@@ -84,7 +88,8 @@ __global__ void nepq_sparse_residual_matmul_kernel(
                 record,
                 position_bits,
                 block_vectors,
-                block);
+                block,
+                width);
         }
     }
     value = warp_sum(value);
@@ -117,6 +122,7 @@ __global__ void nepq_sparse_residual_dequant_kernel(
         const int position = record & ((1 << position_bits) - 1);
         const int dictionary_id = record >> position_bits;
         const int column = (block * block_vectors + position) * 8;
+        if (dictionary_id >= 1024 || column >= width) continue;
         __half * destination = weight + static_cast<int64_t>(row) * width + column;
         const __half * code = dictionary + static_cast<int64_t>(dictionary_id) * 8;
 #pragma unroll
@@ -144,7 +150,9 @@ __global__ void nepq_sparse_residual_grouped_kernel(
     int position_bits,
     int block_vectors,
     bool routed_input,
-    bool mapped_experts) {
+    bool mapped_experts,
+    int global_experts,
+    int local_experts) {
     const int warp = threadIdx.x / kWarpSize;
     const int lane = threadIdx.x % kWarpSize;
     const int64_t logical =
@@ -157,8 +165,11 @@ __global__ void nepq_sparse_residual_grouped_kernel(
     const int token = output_row / routes;
     const int route = output_row - token * routes;
     const int expert = route_ids[static_cast<int64_t>(token) * routes + route];
+    if (expert < 0 ||
+            (mapped_experts ? expert >= global_experts
+                            : expert >= local_experts)) return;
     const int local = mapped_experts ? expert_local[expert] : expert;
-    if (local < 0) return;
+    if (local < 0 || local >= local_experts) return;
     const int row = local * out_per_expert + out;
     const int input_row = routed_input ? output_row : token;
     const __half * source = input + static_cast<int64_t>(input_row) * width;
@@ -172,7 +183,8 @@ __global__ void nepq_sparse_residual_grouped_kernel(
             first_row[block],
             position_bits,
             block_vectors,
-            block);
+            block,
+            width);
         const int record = second_row[block];
         if (record >= 0) {
             value += residual_dot(
@@ -181,7 +193,8 @@ __global__ void nepq_sparse_residual_grouped_kernel(
                 record,
                 position_bits,
                 block_vectors,
-                block);
+                block,
+                width);
         }
     }
     value = warp_sum(value);
@@ -382,7 +395,9 @@ torch::Tensor nepq_sparse_residual_grouped_cuda(
         static_cast<int>(position_bits),
         static_cast<int>(block_vectors),
         input.dim() == 3,
-        expert_local.numel() != 0);
+        expert_local.numel() != 0,
+        static_cast<int>(expert_local.numel()),
+        static_cast<int>(first.size(0) / out_per_expert));
     TORCH_CHECK(cudaGetLastError() == cudaSuccess,
                 "NEPQ-A residual grouped kernel launch failed");
     return output;

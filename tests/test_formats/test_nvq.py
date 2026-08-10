@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from mfq.formats.nvq import (
     D4_256,
@@ -109,6 +110,21 @@ def test_nvq_blob_roundtrip():
     np.testing.assert_array_equal(restored.indices, tensor.indices)
     np.testing.assert_array_equal(restored.signs, tensor.signs)
     np.testing.assert_array_equal(restored.neuron_scale, tensor.neuron_scale.astype(np.float16).astype(np.float32))
+
+
+def test_nvq_rejects_fp16_anchor_overflow() -> None:
+    tensor = NvqTensor(
+        spec=NVQ2_E8,
+        shape=(1, 24),
+        axis=0,
+        neuron_len=24,
+        neuron_scale=np.asarray([1e10], dtype=np.float32),
+        sub_scale=np.asarray([[1]], dtype=np.uint8),
+        indices=np.asarray([[1, 2, 3]], dtype=np.uint8),
+        signs=np.asarray([[1, 2, 3]], dtype=np.uint8),
+    )
+    with pytest.raises(ValueError, match="FP16"):
+        pack_nvq(tensor)
 
 
 def test_legacy_niq_blob_decodes_identically():

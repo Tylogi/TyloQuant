@@ -97,3 +97,17 @@ def test_nepq_a_requires_hadamard_rotation():
     tensor.rotation_seed = 0
     with pytest.raises(ValueError, match="requires a Hadamard"):
         pack_nepq(tensor)
+
+
+def test_nepq_a_rejects_values_that_overflow_serialized_fp16():
+    tensor, _ = _a_tensor(NEPQ0_A)
+    tensor.neuron_scale = tensor.neuron_scale.astype(np.float32)
+    tensor.neuron_scale.reshape(-1)[0] = 70_000.0
+    with pytest.raises(ValueError, match="anchors must be finite"):
+        pack_nepq(tensor)
+
+    tensor, _ = _a_tensor(NEPQ0_A)
+    tensor.residual_codebook = tensor.residual_codebook.astype(np.float32)
+    tensor.residual_codebook[1, 0] = 70_000.0
+    with pytest.raises(ValueError, match="dictionary must be finite"):
+        pack_nepq(tensor)

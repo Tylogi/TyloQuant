@@ -600,6 +600,14 @@ _CUSTOM_CODEBOOK_FLAG = 0x40
 _JSC_FLAG = 0x20
 
 
+def _nonnegative_f16_anchors(value: np.ndarray, label: str) -> np.ndarray:
+    with np.errstate(over="ignore", invalid="ignore"):
+        anchors = np.ascontiguousarray(value, dtype=np.float16)
+    if not np.isfinite(anchors).all() or np.signbit(anchors).any():
+        raise ValueError(f"{label} neuron anchors must be finite and non-negative in FP16")
+    return anchors
+
+
 def pack_nvq(tensor: NvqTensor | NvqJscTensor) -> bytes:
     """Serialize NVQ metadata and all bit-packed streams."""
 
@@ -617,6 +625,7 @@ def pack_nvq(tensor: NvqTensor | NvqJscTensor) -> bytes:
         raise ValueError(f"bad indices shape: {tensor.indices.shape}, expected {(out, nvec)}")
     if tensor.signs.shape != (out, nsign):
         raise ValueError(f"bad signs shape: {tensor.signs.shape}, expected {(out, nsign)}")
+    anchors = _nonnegative_f16_anchors(tensor.neuron_scale, "NVQ")
 
     custom_codebook = (
         pack_codebook(spec, tensor.codebook) if tensor.codebook is not None else b""
@@ -636,7 +645,7 @@ def pack_nvq(tensor: NvqTensor | NvqJscTensor) -> bytes:
         struct.pack(f"<{len(tensor.shape)}q", *tensor.shape),
         struct.pack("<I", out),
         custom_codebook,
-        np.ascontiguousarray(tensor.neuron_scale, dtype=np.float16).tobytes(),
+        anchors.tobytes(),
         _pack_bits(tensor.sub_scale, spec.sub_bits),
         _pack_bits(tensor.indices, spec.index_bits),
         _pack_bits(tensor.signs, 7),
@@ -684,9 +693,7 @@ def pack_nvq_jsc(tensor: NvqJscTensor) -> bytes:
         )
     if not np.issubdtype(signs.dtype, np.integer) or np.any(signs < 0) or np.any(signs > 127):
         raise ValueError("NVQ-JSC signs must be integers in [0,127]")
-    anchors = np.asarray(tensor.neuron_scale, dtype=np.float32)
-    if not np.isfinite(anchors).all() or np.any(anchors < 0):
-        raise ValueError("NVQ-JSC neuron anchors must be finite and non-negative")
+    anchors = _nonnegative_f16_anchors(tensor.neuron_scale, "NVQ-JSC")
 
     return b"".join(
         [
@@ -702,7 +709,7 @@ def pack_nvq_jsc(tensor: NvqJscTensor) -> bytes:
             struct.pack(f"<{len(tensor.shape)}q", *tensor.shape),
             struct.pack("<I", out),
             pack_jsc_metadata(tensor),
-            np.ascontiguousarray(anchors, dtype=np.float16).tobytes(),
+            anchors.tobytes(),
             _pack_bits(state, 4),
             _pack_bits(indices, spec.index_bits),
             _pack_bits(signs, 7),
@@ -760,9 +767,9 @@ def unpack_nvq(blob: bytes | memoryview) -> NvqTensor | NvqJscTensor:
         nsign = math.ceil(neuron_len / 8)
         if off + out * 2 > len(blob):
             raise ValueError("truncated NVQ-JSC neuron anchors")
-        neuron_scale = np.frombuffer(
+        neuron_scale = _nonnegative_f16_anchors(np.frombuffer(
             blob, dtype=np.float16, count=out, offset=off
-        ).astype(np.float32)
+        ), "NVQ-JSC").astype(np.float32)
         off += out * 2
         state, off = _unpack_bits(blob, off, out * ng, 4)
         indices, off = _unpack_bits(blob, off, out * nvec, spec.index_bits)
@@ -799,7 +806,11 @@ def unpack_nvq(blob: bytes | memoryview) -> NvqTensor | NvqJscTensor:
     ng = math.ceil(neuron_len / groupsize)
     nvec = math.ceil(neuron_len / spec.vector_size)
     nsign = math.ceil(neuron_len / 8)
-    neuron_scale = np.frombuffer(blob, dtype=np.float16, count=out, offset=off).astype(np.float32)
+    if off + out * 2 > len(blob):
+        raise ValueError("truncated NVQ neuron anchors")
+    neuron_scale = _nonnegative_f16_anchors(
+        np.frombuffer(blob, dtype=np.float16, count=out, offset=off), "NVQ"
+    ).astype(np.float32)
     off += out * 2
     sub_scale, off = _unpack_bits(blob, off, out * ng, sub_bits)
     indices, off = _unpack_bits(blob, off, out * nvec, spec.index_bits)

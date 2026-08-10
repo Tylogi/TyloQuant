@@ -1,16 +1,12 @@
 #include <ATen/cuda/CUDAContext.h>
-#include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <type_traits>
-
-#define MFQ_MX_CUBLAS_CHECK(expr) \
-    TORCH_CHECK((expr) == CUBLAS_STATUS_SUCCESS, \
-                "MXFP8 cuBLAS call failed: ", #expr)
 
 namespace {
 
@@ -239,6 +235,95 @@ __global__ void mxfp8_dequant_kernel(
     dense[index] = __float2half_rn(decode_e4m3fn(values[index]) * scale);
 }
 
+__global__ void mxfp8_embedding_kernel(
+        const std::uint8_t * __restrict__ values,
+        const std::uint8_t * __restrict__ scales,
+        const int64_t * __restrict__ ids,
+        __half * __restrict__ output,
+        int count,
+        int vocab,
+        int width) {
+    const int64_t total = static_cast<int64_t>(count) * width;
+    for (int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+             threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int token_index = static_cast<int>(linear / width);
+        const int column = static_cast<int>(linear % width);
+        const int64_t token = ids[token_index];
+        float value = 0.0f;
+        if (token >= 0 && token < vocab) {
+            const int scale_columns = width / 128;
+            const float scale = decode_e8m0(scales[
+                (token / 128) * scale_columns + column / 128]);
+            value = decode_e4m3fn(values[token * width + column]) * scale;
+        }
+        output[linear] = __float2half_rn(value);
+    }
+}
+
+template <typename Output>
+__global__ void __launch_bounds__(256) mxfp8_matmul_kernel(
+        const std::uint8_t * __restrict__ values,
+        const std::uint8_t * __restrict__ scales,
+        const __half * __restrict__ input,
+        Output * __restrict__ output,
+        int rows,
+        int outputs,
+        int width,
+        int row_tiles,
+        int output_tiles) {
+    constexpr int kRowsPerTile = 8;
+    constexpr int kOutputsPerTile = 8;
+    const int warp = int(threadIdx.y);
+    const int lane = int(threadIdx.x);
+    const int64_t tasks = static_cast<int64_t>(row_tiles) * output_tiles;
+    for (int64_t task = blockIdx.x; task < tasks; task += gridDim.x) {
+        const int output_tile = static_cast<int>(task % output_tiles);
+        const int row_tile = static_cast<int>(task / output_tiles);
+        const int neuron = output_tile * kOutputsPerTile + warp;
+        if (neuron >= outputs) continue;
+        const int first_row = row_tile * kRowsPerTile;
+        float accumulators[kRowsPerTile];
+#pragma unroll
+        for (int item = 0; item < kRowsPerTile; ++item) {
+            accumulators[item] = 0.0f;
+        }
+        const int scale_columns = width / 128;
+        for (int column = lane; column < width; column += 32) {
+            const float weight = decode_e4m3fn(values[
+                static_cast<int64_t>(neuron) * width + column]) *
+                decode_e8m0(scales[
+                    static_cast<int64_t>(neuron / 128) * scale_columns +
+                    column / 128]);
+#pragma unroll
+            for (int item = 0; item < kRowsPerTile; ++item) {
+                const int row = first_row + item;
+                if (row < rows) {
+                    accumulators[item] = fmaf(
+                        __half2float(input[
+                            static_cast<int64_t>(row) * width + column]),
+                        weight,
+                        accumulators[item]);
+                }
+            }
+        }
+#pragma unroll
+        for (int item = 0; item < kRowsPerTile; ++item) {
+            const float value = warp_sum(accumulators[item]);
+            const int row = first_row + item;
+            if (lane == 0 && row < rows) {
+                if constexpr (std::is_same_v<Output, float>) {
+                    output[static_cast<int64_t>(row) * outputs + neuron] = value;
+                } else {
+                    output[static_cast<int64_t>(row) * outputs + neuron] =
+                        __float2half_rn(value);
+                }
+            }
+        }
+    }
+}
+
 void validate_mxfp8(
         const torch::Tensor & values,
         const torch::Tensor & scales) {
@@ -251,7 +336,10 @@ void validate_mxfp8(
                 "MXFP8 values and scales must be contiguous");
     TORCH_CHECK(values.dim() == 2 && scales.dim() == 2,
                 "MXFP8 values and scales must be rank-2");
-    TORCH_CHECK(values.size(1) % 128 == 0,
+    TORCH_CHECK(values.size(0) > 0 && values.size(1) > 0 &&
+                    values.size(0) <= std::numeric_limits<int>::max() &&
+                    values.size(1) <= std::numeric_limits<int>::max() &&
+                    values.size(1) % 128 == 0,
                 "MXFP8 input width must be divisible by 128");
     TORCH_CHECK(scales.size(0) == (values.size(0) + 127) / 128 &&
                     scales.size(1) == values.size(1) / 128,
@@ -277,6 +365,38 @@ torch::Tensor mxfp8_dequant_cuda(
             int(values.size(0)), int(values.size(1)));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return dense;
+}
+
+torch::Tensor mxfp8_embedding_lookup_cuda(
+        torch::Tensor values,
+        torch::Tensor scales,
+        torch::Tensor token_ids) {
+    validate_mxfp8(values, scales);
+    TORCH_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() &&
+                    token_ids.scalar_type() == torch::kInt64 &&
+                    token_ids.get_device() == values.get_device() &&
+                    token_ids.numel() <= std::numeric_limits<int>::max(),
+                "MXFP8 embedding ids must be contiguous CUDA int64 on the weight device");
+    const int count = static_cast<int>(token_ids.numel());
+    const int vocab = static_cast<int>(values.size(0));
+    const int width = static_cast<int>(values.size(1));
+    auto shape = token_ids.sizes().vec();
+    shape.push_back(width);
+    auto output = torch::empty(shape, values.options().dtype(torch::kFloat16));
+    constexpr int threads = 256;
+    const int64_t total = static_cast<int64_t>(count) * width;
+    const int blocks = static_cast<int>(std::min<int64_t>(
+        (total + threads - 1) / threads, 4096));
+    if (blocks > 0) {
+        mxfp8_embedding_kernel<<<
+            blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                values.data_ptr<std::uint8_t>(),
+                scales.data_ptr<std::uint8_t>(), token_ids.data_ptr<int64_t>(),
+                reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+                count, vocab, width);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return output;
 }
 
 torch::Tensor mxfp8_small_m_cuda(
@@ -309,6 +429,39 @@ torch::Tensor mxfp8_small_m_cuda(
 #undef MFQ_LAUNCH_MXFP8
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
+}
+
+torch::Tensor mxfp8_matmul_f16_cuda(
+        torch::Tensor values,
+        torch::Tensor scales,
+        torch::Tensor input) {
+    validate_mxfp8(values, scales);
+    TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat16 &&
+                    input.is_contiguous() && input.dim() == 2 &&
+                    input.size(0) > 0 && input.size(1) == values.size(1) &&
+                    input.size(0) <= std::numeric_limits<int>::max(),
+                "MXFP8 activation must be non-empty contiguous CUDA fp16 rank-2");
+    const int rows = static_cast<int>(input.size(0));
+    const int outputs = static_cast<int>(values.size(0));
+    const int width = static_cast<int>(input.size(1));
+    auto result = torch::empty({rows, outputs}, input.options());
+    constexpr int kRowsPerTile = 8;
+    constexpr int kOutputsPerTile = 8;
+    const int row_tiles = (rows + kRowsPerTile - 1) / kRowsPerTile;
+    const int output_tiles =
+        (outputs + kOutputsPerTile - 1) / kOutputsPerTile;
+    const int64_t tasks = static_cast<int64_t>(row_tiles) * output_tiles;
+    const int blocks = static_cast<int>(std::min<int64_t>(tasks, 4096));
+    const dim3 threads(32, kOutputsPerTile);
+    mxfp8_matmul_kernel<__half><<<
+        blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            values.data_ptr<std::uint8_t>(),
+            scales.data_ptr<std::uint8_t>(),
+            reinterpret_cast<const __half *>(input.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(result.data_ptr<at::Half>()),
+            rows, outputs, width, row_tiles, output_tiles);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return result;
 }
 
 torch::Tensor mxfp8_small_m_f32_cuda(
@@ -352,27 +505,25 @@ torch::Tensor mxfp8_gemm_f32_cuda(
                     x.is_contiguous() && x.dim() == 2 &&
                     x.size(1) == values.size(1),
                 "MXFP8 FP32-output GEMM activation geometry mismatch");
-    auto weight = mxfp8_dequant_cuda(values, scales);
     const int M = int(x.size(0));
-    const int K = int(x.size(1));
     const int N = int(values.size(0));
     auto y = torch::empty(
         {M, N}, x.options().dtype(torch::kFloat32));
-    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    MFQ_MX_CUBLAS_CHECK(cublasSetStream(handle, stream));
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    MFQ_MX_CUBLAS_CHECK(cublasGemmEx(
-        handle, CUBLAS_OP_T, CUBLAS_OP_N,
-        N, M, K,
-        &alpha,
-        weight.data_ptr<at::Half>(), CUDA_R_16F, K,
-        x.data_ptr<at::Half>(), CUDA_R_16F, K,
-        &beta,
-        y.data_ptr<float>(), CUDA_R_32F, N,
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    constexpr int kRowsPerTile = 8;
+    constexpr int kOutputsPerTile = 8;
+    const int row_tiles = (M + kRowsPerTile - 1) / kRowsPerTile;
+    const int output_tiles = (N + kOutputsPerTile - 1) / kOutputsPerTile;
+    const int64_t tasks = static_cast<int64_t>(row_tiles) * output_tiles;
+    const int blocks = static_cast<int>(std::min<int64_t>(tasks, 4096));
+    const dim3 threads(32, kOutputsPerTile);
+    mxfp8_matmul_kernel<float><<<
+        blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            values.data_ptr<std::uint8_t>(),
+            scales.data_ptr<std::uint8_t>(),
+            reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),
+            y.data_ptr<float>(), M, N, int(x.size(1)),
+            row_tiles, output_tiles);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }
 
@@ -459,6 +610,135 @@ __device__ __forceinline__ float decode_mxfp4_e2m1(std::uint8_t code) {
     };
     const float value = magnitude[code & 7u];
     return (code & 8u) == 0u ? value : -value;
+}
+
+__global__ void mxfp4_dequant_kernel(
+        const std::uint8_t * __restrict__ values,
+        const std::uint8_t * __restrict__ scales,
+        __half * __restrict__ dense,
+        int outputs,
+        int width) {
+    const std::size_t index =
+        std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t count = std::size_t(outputs) * width;
+    if (index >= count) return;
+    const int output = int(index / width);
+    const int column = int(index - std::size_t(output) * width);
+    const std::uint8_t packed = values[
+        std::size_t(output) * (width / 2) + column / 2];
+    const std::uint8_t code = static_cast<std::uint8_t>(
+        (packed >> ((column & 1) * 4)) & 15u);
+    const float scale = decode_e8m0(
+        scales[std::size_t(output) * (width / 32) + column / 32]);
+    dense[index] = __float2half_rn(decode_mxfp4_e2m1(code) * scale);
+}
+
+__global__ void mxfp4_embedding_kernel(
+        const std::uint8_t * __restrict__ values,
+        const std::uint8_t * __restrict__ scales,
+        const int64_t * __restrict__ ids,
+        __half * __restrict__ output,
+        int count,
+        int vocab,
+        int width) {
+    const int64_t total = static_cast<int64_t>(count) * width;
+    for (int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+             threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int token_index = static_cast<int>(linear / width);
+        const int column = static_cast<int>(linear % width);
+        const int64_t token = ids[token_index];
+        float value = 0.0f;
+        if (token >= 0 && token < vocab) {
+            const std::uint8_t byte = values[
+                token * (width / 2) + column / 2];
+            const std::uint8_t code = static_cast<std::uint8_t>(
+                (byte >> ((column & 1) * 4)) & 15u);
+            value = decode_mxfp4_e2m1(code) * decode_e8m0(
+                scales[token * (width / 32) + column / 32]);
+        }
+        output[linear] = __float2half_rn(value);
+    }
+}
+
+__global__ void __launch_bounds__(256) mxfp4_matmul_f16_kernel(
+        const std::uint8_t * __restrict__ values,
+        const std::uint8_t * __restrict__ scales,
+        const __half * __restrict__ input,
+        __half * __restrict__ output,
+        int rows,
+        int outputs,
+        int width,
+        int row_tiles,
+        int output_tiles) {
+    constexpr int kRowsPerTile = 8;
+    constexpr int kOutputsPerTile = 8;
+    const int warp = int(threadIdx.y);
+    const int lane = int(threadIdx.x);
+    const int64_t tasks = static_cast<int64_t>(row_tiles) * output_tiles;
+    for (int64_t task = blockIdx.x; task < tasks; task += gridDim.x) {
+        const int output_tile = static_cast<int>(task % output_tiles);
+        const int row_tile = static_cast<int>(task / output_tiles);
+        const int neuron = output_tile * kOutputsPerTile + warp;
+        if (neuron >= outputs) continue;
+        const int first_row = row_tile * kRowsPerTile;
+        float accumulators[kRowsPerTile];
+#pragma unroll
+        for (int item = 0; item < kRowsPerTile; ++item) {
+            accumulators[item] = 0.0f;
+        }
+        const int packed_columns = width / 2;
+        const int scale_columns = width / 32;
+        for (int column = lane; column < width; column += 32) {
+            const std::uint8_t packed = values[
+                static_cast<int64_t>(neuron) * packed_columns + column / 2];
+            const std::uint8_t code = static_cast<std::uint8_t>(
+                (packed >> ((column & 1) * 4)) & 15u);
+            const float weight = decode_mxfp4_e2m1(code) * decode_e8m0(
+                scales[static_cast<int64_t>(neuron) * scale_columns +
+                       column / 32]);
+#pragma unroll
+            for (int item = 0; item < kRowsPerTile; ++item) {
+                const int row = first_row + item;
+                if (row < rows) {
+                    accumulators[item] = fmaf(
+                        __half2float(input[static_cast<int64_t>(row) * width + column]),
+                        weight,
+                        accumulators[item]);
+                }
+            }
+        }
+#pragma unroll
+        for (int item = 0; item < kRowsPerTile; ++item) {
+            const float value = warp_sum(accumulators[item]);
+            const int row = first_row + item;
+            if (lane == 0 && row < rows) {
+                output[static_cast<int64_t>(row) * outputs + neuron] =
+                    __float2half_rn(value);
+            }
+        }
+    }
+}
+
+void validate_mxfp4_dense(
+        const torch::Tensor & values,
+        const torch::Tensor & scales) {
+    TORCH_CHECK(values.is_cuda() && scales.is_cuda(),
+                "MXFP4 values and scales must be CUDA tensors");
+    TORCH_CHECK(values.scalar_type() == torch::kUInt8 &&
+                    scales.scalar_type() == torch::kUInt8,
+                "MXFP4 values and scales must be uint8");
+    TORCH_CHECK(values.is_contiguous() && scales.is_contiguous(),
+                "MXFP4 values and scales must be contiguous");
+    TORCH_CHECK(values.dim() == 2 && scales.dim() == 2 &&
+                    values.size(0) > 0 && values.size(1) > 0 &&
+                    values.size(0) <= std::numeric_limits<int>::max() &&
+                    values.size(1) <= std::numeric_limits<int>::max() / 2 &&
+                    values.size(1) % 16 == 0 &&
+                    scales.size(0) == values.size(0) &&
+                    scales.size(1) == values.size(1) / 16,
+                "MXFP4 weight geometry mismatch");
 }
 
 template <bool COMPACT_ROUTE>
@@ -609,6 +889,93 @@ void validate_mxfp4_moe(
 }
 
 } // namespace
+
+torch::Tensor mxfp4_dequant_cuda(
+        torch::Tensor values,
+        torch::Tensor scales) {
+    validate_mxfp4_dense(values, scales);
+    const int outputs = static_cast<int>(values.size(0));
+    const int width = static_cast<int>(values.size(1) * 2);
+    auto dense = torch::empty(
+        {outputs, width}, values.options().dtype(torch::kFloat16));
+    const std::size_t count = static_cast<std::size_t>(outputs) * width;
+    constexpr int threads = 256;
+    const int blocks = static_cast<int>((count + threads - 1) / threads);
+    mxfp4_dequant_kernel<<<
+        blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            values.data_ptr<std::uint8_t>(),
+            scales.data_ptr<std::uint8_t>(),
+            reinterpret_cast<__half *>(dense.data_ptr<at::Half>()),
+            outputs, width);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return dense;
+}
+
+torch::Tensor mxfp4_embedding_lookup_cuda(
+        torch::Tensor values,
+        torch::Tensor scales,
+        torch::Tensor token_ids) {
+    validate_mxfp4_dense(values, scales);
+    TORCH_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() &&
+                    token_ids.scalar_type() == torch::kInt64 &&
+                    token_ids.get_device() == values.get_device() &&
+                    token_ids.numel() <= std::numeric_limits<int>::max(),
+                "MXFP4 embedding ids must be contiguous CUDA int64 on the weight device");
+    const int count = static_cast<int>(token_ids.numel());
+    const int vocab = static_cast<int>(values.size(0));
+    const int width = static_cast<int>(values.size(1) * 2);
+    auto shape = token_ids.sizes().vec();
+    shape.push_back(width);
+    auto output = torch::empty(shape, values.options().dtype(torch::kFloat16));
+    constexpr int threads = 256;
+    const int64_t total = static_cast<int64_t>(count) * width;
+    const int blocks = static_cast<int>(std::min<int64_t>(
+        (total + threads - 1) / threads, 4096));
+    if (blocks > 0) {
+        mxfp4_embedding_kernel<<<
+            blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                values.data_ptr<std::uint8_t>(),
+                scales.data_ptr<std::uint8_t>(), token_ids.data_ptr<int64_t>(),
+                reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+                count, vocab, width);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return output;
+}
+
+torch::Tensor mxfp4_matmul_f16_cuda(
+        torch::Tensor values,
+        torch::Tensor scales,
+        torch::Tensor input) {
+    validate_mxfp4_dense(values, scales);
+    TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat16 &&
+                    input.is_contiguous() && input.dim() == 2 &&
+                    input.size(0) > 0 &&
+                    input.size(0) <= std::numeric_limits<int>::max() &&
+                    input.size(1) == values.size(1) * 2,
+                "MXFP4 activation must be contiguous CUDA fp16 rank-2");
+    const int rows = static_cast<int>(input.size(0));
+    const int outputs = static_cast<int>(values.size(0));
+    const int width = static_cast<int>(input.size(1));
+    auto result = torch::empty({rows, outputs}, input.options());
+    constexpr int kRowsPerTile = 8;
+    constexpr int kOutputsPerTile = 8;
+    const int row_tiles = (rows + kRowsPerTile - 1) / kRowsPerTile;
+    const int output_tiles =
+        (outputs + kOutputsPerTile - 1) / kOutputsPerTile;
+    const int64_t tasks = static_cast<int64_t>(row_tiles) * output_tiles;
+    const int blocks = static_cast<int>(std::min<int64_t>(tasks, 4096));
+    const dim3 threads(32, kOutputsPerTile);
+    mxfp4_matmul_f16_kernel<<<
+        blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            values.data_ptr<std::uint8_t>(),
+            scales.data_ptr<std::uint8_t>(),
+            reinterpret_cast<const __half *>(input.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(result.data_ptr<at::Half>()),
+            rows, outputs, width, row_tiles, output_tiles);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return result;
+}
 
 torch::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
         torch::Tensor values,
