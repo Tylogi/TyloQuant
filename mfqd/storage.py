@@ -256,10 +256,22 @@ class SessionStore:
         now: datetime | None = None,
     ) -> SessionResource:
         updated_at = now or _utcnow()
+        assignments: list[str] = []
+        values: list[object] = []
+        if "title" in request.model_fields_set:
+            assignments.append("title = ?")
+            values.append(request.title)
+        if "mode" in request.model_fields_set:
+            assignments.append("mode = ?")
+            values.append(request.mode.value)
+        if not assignments:
+            return self.get_session(session_id)
+        assignments.append("updated_at = ?")
+        values.extend((_timestamp(updated_at), str(session_id)))
         with self._connection() as connection:
             cursor = connection.execute(
-                "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?",
-                (request.title, _timestamp(updated_at), str(session_id)),
+                f"UPDATE sessions SET {', '.join(assignments)} WHERE id = ?",
+                values,
             )
             if cursor.rowcount != 1:
                 raise SessionNotFoundError(str(session_id))

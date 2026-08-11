@@ -15,6 +15,7 @@ from mfqd.models import (
     SessionMode,
     SessionState,
     TokenUsage,
+    UpdateSessionRequest,
 )
 from mfqd.storage import (
     IdempotencyConflictError,
@@ -52,6 +53,22 @@ def test_session_persists_in_wal_mode(tmp_path) -> None:
     assert reopened.journal_mode() == "wal"
     assert reopened.get_session(SESSION_ID) == created
     assert created.revision == 0
+
+
+def test_session_mode_can_change_without_erasing_its_title(tmp_path) -> None:
+    store = make_store(tmp_path)
+    store.create_session(
+        CreateSessionRequest(model="model-a", title="conversation"),
+        session_id=SESSION_ID,
+        now=NOW,
+    )
+    updated = store.update_session(
+        SESSION_ID,
+        UpdateSessionRequest(mode=SessionMode.FULL_DUPLEX),
+        now=NOW,
+    )
+    assert updated.mode == SessionMode.FULL_DUPLEX
+    assert updated.title == "conversation"
 
 
 def test_append_is_revision_guarded_and_persistent(tmp_path) -> None:

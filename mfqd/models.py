@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Annotated, Any, Final, Literal
 from uuid import UUID
 
-from pydantic import AwareDatetime, Base64Bytes, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, Base64Bytes, BaseModel, ConfigDict, Field, model_validator
 
 PROTOCOL_VERSION: Final[Literal["1.0"]] = "1.0"
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -201,6 +201,15 @@ class ForkSessionRequest(ProtocolModel):
 
 class UpdateSessionRequest(ProtocolModel):
     title: str | None = Field(default=None, max_length=512)
+    mode: SessionMode | None = None
+
+    @model_validator(mode="after")
+    def validate_patch(self) -> "UpdateSessionRequest":
+        if not self.model_fields_set:
+            raise ValueError("at least one session field must be provided")
+        if "mode" in self.model_fields_set and self.mode is None:
+            raise ValueError("mode cannot be null")
+        return self
 
 
 class AppendMessageRequest(ProtocolModel):

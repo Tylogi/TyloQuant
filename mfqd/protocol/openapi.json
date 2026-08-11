@@ -225,6 +225,7 @@
         "additionalProperties": false,
         "properties": {
           "metadata": {
+            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -267,6 +268,7 @@
             "type": "string"
           },
           "details": {
+            "additionalProperties": true,
             "title": "Details",
             "type": "object"
           },
@@ -1709,6 +1711,7 @@
             "type": "string"
           },
           "metadata": {
+            "additionalProperties": true,
             "title": "Metadata",
             "type": "object"
           },
@@ -1858,6 +1861,7 @@
         "additionalProperties": false,
         "properties": {
           "arguments": {
+            "additionalProperties": true,
             "title": "Arguments",
             "type": "object"
           },
@@ -1978,6 +1982,16 @@
       "UpdateSessionRequest": {
         "additionalProperties": false,
         "properties": {
+          "mode": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "title": {
             "anyOf": [
               {
@@ -2519,6 +2533,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Runtime Models Api V1 Runtime Models Get",
                   "type": "object"
                 }
@@ -2611,6 +2626,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Realtime Capabilities Api V1 Runtime Realtime Capabilities Get",
                   "type": "object"
                 }
@@ -2713,6 +2729,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Reload Runtime Api V1 Runtime Reload Post",
                   "type": "object"
                 }
@@ -2805,6 +2822,7 @@
             "content": {
               "application/json": {
                 "schema": {
+                  "additionalProperties": true,
                   "title": "Response Runtime Status Api V1 Runtime Status Get",
                   "type": "object"
                 }

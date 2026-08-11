@@ -115,6 +115,19 @@ export interface RuntimeStatus {
   context_capacity?: number;
   reloading?: boolean;
   sampling_defaults?: Partial<SamplingParams>;
+  duplex_sampling_defaults?: {
+    system_prompt?: string;
+    temperature?: number;
+    top_k?: number;
+    top_p?: number;
+    text_repetition_penalty?: number;
+    [key: string]: unknown;
+  };
+  tts_sampling_defaults?: {
+    temperature?: number;
+    repetition_penalty?: number;
+    [key: string]: unknown;
+  };
   chat_template_capabilities?: {
     reasoning_effort?: { supported?: boolean; values?: string[] };
   };
@@ -230,10 +243,13 @@ export const api = {
     return request(`/api/v1/sessions/${id}`);
   },
 
-  updateSession(id: string, title: string | null): Promise<Session> {
+  updateSession(
+    id: string,
+    update: { title?: string | null; mode?: SessionMode },
+  ): Promise<Session> {
     return request(`/api/v1/sessions/${id}`, {
       method: "PATCH",
-      body: JSON.stringify({ title }),
+      body: JSON.stringify(update),
     });
   },
 

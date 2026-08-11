@@ -7,6 +7,9 @@ TAURI = STUDIO / "src-tauri"
 RUST = (TAURI / "src" / "main.rs").read_text(encoding="utf-8")
 BUILD = (TAURI / "build.rs").read_text(encoding="utf-8")
 APP = (ROOT / "MFQStudio" / "web" / "src" / "App.tsx").read_text(encoding="utf-8")
+REALTIME_AUDIO = (ROOT / "MFQStudio" / "web" / "src" / "realtimeAudio.ts").read_text(
+    encoding="utf-8"
+)
 
 
 def test_studio_embeds_the_shared_web_client():
@@ -40,4 +43,19 @@ def test_studio_supports_local_and_remote_mfqd_with_voice_controls():
     assert "Object.keys(MODE_LABELS)" not in APP
     assert "RealtimeAudioController" in APP
     assert '(["text", "voice", "full_duplex"] as SessionMode[])' in APP
-    assert "toggleDuplex" in APP
+    assert "selectInteractionMode" in APP
+
+
+def test_studio_drains_duplex_output_after_microphone_capture_stops():
+    assert "MAX_RESPONSE_DRAIN_STEPS" in REALTIME_AUDIO
+    assert "event.end_of_turn === true" in REALTIME_AUDIO
+    assert "this.sendInput(new Float32Array(CHUNK_SAMPLES))" in REALTIME_AUDIO
+    assert "this.callbacks.onText(this.turnText)" in REALTIME_AUDIO
+
+
+def test_studio_uses_the_model_bound_duplex_system_prompt():
+    assert "modeTemplateSettings" in APP
+    assert 'runtime?.duplex_sampling_defaults ?? realtime?.defaults' in APP
+    assert "system_prompt: config.systemPrompt" in REALTIME_AUDIO
+    assert "text_repetition_penalty: config.repetitionPenalty" in REALTIME_AUDIO
+    assert "submitText(text, realtimeSessionConfig())" in APP

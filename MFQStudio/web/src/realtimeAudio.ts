@@ -4,6 +4,7 @@ const INPUT_RATE = 16_000;
 const OUTPUT_RATE = 24_000;
 const CHUNK_SAMPLES = INPUT_RATE;
 const SPEAK_TOKENS = 20;
+const MAX_RESPONSE_DRAIN_STEPS = 120;
 const PLAYBACK_DELAY_SECONDS = 0.2;
 const AUDIO_DATABASE = "mfq.studio.audio.v1";
 const AUDIO_STORE = "clips";
@@ -16,7 +17,6 @@ export interface RealtimeSessionConfig {
   topP: number;
   topK: number;
   repetitionPenalty: number;
-  seed?: number | null;
 }
 
 export interface VoiceTurn {
@@ -27,6 +27,7 @@ export interface VoiceTurn {
 export interface RealtimeCallbacks {
   onState(state: VoiceState): void;
   onLevel(level: number): void;
+  onText(text: string): void;
   onTurn(turn: VoiceTurn): void;
   onError(message: string): void;
 }
@@ -142,6 +143,8 @@ export class RealtimeAudioController {
   private heldHalfDuplexChunk: Float32Array | null = null;
   private halfDuplexPendingSteps = 0;
   private awaitingHalfDuplexResponse = false;
+  private responseDrainSteps = 0;
+  private currentStepWasListen = false;
   private sessionReady = false;
   private stopping = false;
   private playAt = 0;
@@ -176,16 +179,34 @@ export class RealtimeAudioController {
   }
 
   async start(config: RealtimeSessionConfig): Promise<void> {
+    await this.connect(config, true);
+  }
+
+  async submitText(value: string, config: RealtimeSessionConfig): Promise<void> {
+    const text = value.trim();
+    if (!text || this.awaitingHalfDuplexResponse) return;
+    await this.connect(config, false);
+    this.sendText(text);
+  }
+
+  private async connect(config: RealtimeSessionConfig, capture: boolean): Promise<void> {
     if (this.inputContext || this.awaitingHalfDuplexResponse) return;
     if (this.socket?.readyState === WebSocket.OPEN && this.sessionReady) {
-      await this.startAudio();
-      this.callbacks.onState("listening");
+      if (capture) {
+        await this.startAudio();
+        this.callbacks.onState("listening");
+      }
       return;
     }
     if (this.socket) return;
     this.callbacks.onState("connecting");
     try {
-      await this.startAudio();
+      if (capture) {
+        await this.startAudio();
+      } else {
+        this.outputContext ??= new AudioContext({ sampleRate: OUTPUT_RATE });
+        await this.outputContext.resume();
+      }
       const socket = new WebSocket(runtimeRealtimeUrl());
       this.socket = socket;
       socket.onmessage = (message) => {
@@ -208,7 +229,7 @@ export class RealtimeAudioController {
     if (this.inputContext && !this.fullDuplexEnabled) {
       await this.finishHalfDuplexInput();
     } else if (this.inputContext) {
-      await this.stop();
+      await this.finishFullDuplexInput();
     } else if (!this.awaitingHalfDuplexResponse) {
       await this.start(config);
     }
@@ -217,6 +238,13 @@ export class RealtimeAudioController {
   sendText(value: string): void {
     const text = value.trim();
     if (!text) return;
+    if (!this.inputContext) {
+      this.halfDuplexPendingSteps += 1;
+      this.awaitingHalfDuplexResponse = true;
+      this.responseDrainSteps = 0;
+      this.currentStepWasListen = false;
+      this.callbacks.onState("processing");
+    }
     if (this.socket?.readyState !== WebSocket.OPEN || !this.sessionReady) {
       this.pendingText.push(text);
       return;
@@ -249,6 +277,8 @@ export class RealtimeAudioController {
     this.heldHalfDuplexChunk = null;
     this.halfDuplexPendingSteps = 0;
     this.awaitingHalfDuplexResponse = false;
+    this.responseDrainSteps = 0;
+    this.currentStepWasListen = false;
     this.sessionReady = false;
     this.playAt = 0;
     this.finishTurn();
@@ -362,6 +392,20 @@ export class RealtimeAudioController {
     this.sendInput(finalChunk, { forceSpeak: true });
     this.halfDuplexPendingSteps += 1;
     this.awaitingHalfDuplexResponse = true;
+    this.responseDrainSteps = 0;
+    this.currentStepWasListen = false;
+    this.callbacks.onState("processing");
+  }
+
+  private async finishFullDuplexInput(): Promise<void> {
+    if (!this.inputContext || !this.fullDuplexEnabled) return;
+    await this.stopInputCapture();
+    const finalChunk = this.drainPending() ?? new Float32Array(CHUNK_SAMPLES);
+    this.sendInput(finalChunk, { forceSpeak: true });
+    this.halfDuplexPendingSteps = 1;
+    this.awaitingHalfDuplexResponse = true;
+    this.responseDrainSteps = 0;
+    this.currentStepWasListen = false;
     this.callbacks.onState("processing");
   }
 
@@ -385,19 +429,17 @@ export class RealtimeAudioController {
 
   private handleEvent(event: Record<string, unknown>, config: RealtimeSessionConfig): void {
     if (event.type === "session.queue_done") {
-      const generation: Record<string, unknown> = {
-        temperature: config.temperature,
-        top_p: config.topP,
-        top_k: config.topK,
-        text_repetition_penalty: config.repetitionPenalty,
-      };
-      if (config.seed != null) generation.seed = config.seed;
       this.socket?.send(
         JSON.stringify({
           type: "session.init",
           payload: {
-            system_prompt: config.systemPrompt || undefined,
-            config: generation,
+            system_prompt: config.systemPrompt,
+            config: {
+              temperature: config.temperature,
+              top_p: config.topP,
+              top_k: config.topK,
+              text_repetition_penalty: config.repetitionPenalty,
+            },
           },
         }),
       );
@@ -409,6 +451,7 @@ export class RealtimeAudioController {
     } else if (event.kind === "text") {
       const text = String(event.text ?? "");
       this.turnText += text;
+      this.callbacks.onText(this.turnText);
     } else if (event.kind === "audio") {
       const samples = base64ToFloat32(String(event.audio ?? ""));
       const sampleRate = Number(event.sample_rate) || OUTPUT_RATE;
@@ -416,14 +459,27 @@ export class RealtimeAudioController {
       this.turnAudioRate = sampleRate;
       this.playAudio(samples, sampleRate);
     } else if (event.kind === "listen") {
+      this.currentStepWasListen = true;
       this.finishTurn();
-    } else if (event.type === "response.step.done" && !this.fullDuplexEnabled) {
+    } else if (event.type === "response.step.done") {
       if (this.halfDuplexPendingSteps > 0) this.halfDuplexPendingSteps -= 1;
       if (this.awaitingHalfDuplexResponse && this.halfDuplexPendingSteps === 0) {
-        this.awaitingHalfDuplexResponse = false;
+        const ended = event.end_of_turn === true || this.currentStepWasListen;
+        if (!ended && this.responseDrainSteps < MAX_RESPONSE_DRAIN_STEPS) {
+          this.currentStepWasListen = false;
+          this.responseDrainSteps += 1;
+          this.halfDuplexPendingSteps = 1;
+          this.sendInput(new Float32Array(CHUNK_SAMPLES));
+        } else {
+          this.awaitingHalfDuplexResponse = false;
+          this.responseDrainSteps = 0;
+          this.finishTurn();
+          this.callbacks.onState("idle");
+        }
+      } else if (!this.awaitingHalfDuplexResponse && event.end_of_turn === true) {
         this.finishTurn();
-        this.callbacks.onState("idle");
       }
+      this.currentStepWasListen = false;
     } else if (event.type === "error") {
       const detail = event.error as { message?: string } | undefined;
       throw new Error(detail?.message || "Voice connection failed");
@@ -431,12 +487,14 @@ export class RealtimeAudioController {
   }
 
   private finishTurn(): void {
-    if (!this.turnText.trim() && !this.turnAudio.length) return;
-    const audio = this.turnAudio.length ? wavBlob(this.turnAudio, this.turnAudioRate) : null;
-    this.callbacks.onTurn({ text: this.turnText, audio });
+    if (this.turnText.trim() || this.turnAudio.length) {
+      const audio = this.turnAudio.length ? wavBlob(this.turnAudio, this.turnAudioRate) : null;
+      this.callbacks.onTurn({ text: this.turnText, audio });
+    }
     this.turnText = "";
     this.turnAudio = [];
     this.turnAudioRate = OUTPUT_RATE;
+    this.callbacks.onText("");
   }
 
   private playAudio(samples: Float32Array, sampleRate: number): void {

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 
 import numpy as np
 
@@ -137,3 +138,66 @@ def test_forward_step_returns_backend_completion_to_client():
         {"kind": "text", "text": "ok"},
         {"type": "response.step.done", "step": 7},
     ]
+
+
+def test_intermediate_audio_rendering_does_not_block_the_next_backend_step():
+    release_render = threading.Event()
+
+    class Renderer:
+        def push(self, *_args, **_kwargs):
+            assert release_render.wait(timeout=2.0)
+            return np.ones(1_200, dtype=np.float32)
+
+    class Backend:
+        def __init__(self):
+            self.events = [
+                json.dumps(
+                    {
+                        "kind": "audio_tokens",
+                        "audio_tokens": [1, 2, 3],
+                        "end_of_turn": False,
+                    }
+                ),
+                json.dumps({"type": "response.step.done", "step": 8}),
+            ]
+
+        async def send(self, _value):
+            return None
+
+        async def recv(self):
+            return self.events.pop(0)
+
+    class Client:
+        def __init__(self):
+            self.events = []
+
+        async def send_json(self, value):
+            self.events.append(value)
+
+    async def exercise():
+        gateway = RealtimeGateway.__new__(RealtimeGateway)
+        gateway.renderer = Renderer()
+        client = Client()
+        queue = asyncio.Queue()
+        lock = asyncio.Lock()
+        errors = []
+        worker = asyncio.create_task(
+            gateway.render_audio_worker(queue, client, lock, errors)
+        )
+        await gateway.forward_step(
+            Backend(),
+            client,
+            {},
+            render_queue=queue,
+            send_lock=lock,
+            render_errors=errors,
+        )
+        assert client.events == [{"type": "response.step.done", "step": 8}]
+        release_render.set()
+        await queue.join()
+        await queue.put(None)
+        await worker
+        assert not errors
+        assert [event.get("kind") for event in client.events] == [None, "audio"]
+
+    asyncio.run(exercise())

@@ -4,6 +4,7 @@ import {
   ApiError,
   ContentPart,
   Message,
+  RealtimeCapabilities,
   RealtimeFrame,
   RuntimeCapabilities,
   RuntimeModel,
@@ -104,6 +105,39 @@ const PRESETS: Record<Exclude<PresetName, "custom">, Partial<GenerationSettings>
   balanced: { temperature: 0.7, topP: 0.8, topK: 20, repetitionPenalty: 1 },
   creative: { temperature: 1, topP: 0.95, topK: 50, repetitionPenalty: 1 },
 };
+
+function modeTemplateSettings(
+  current: GenerationSettings,
+  mode: SessionMode,
+  runtime: RuntimeStatus | null,
+  realtime: RealtimeCapabilities | null,
+): GenerationSettings {
+  const voice = mode !== "text";
+  const defaults = (voice
+    ? (runtime?.duplex_sampling_defaults ?? realtime?.defaults ?? {})
+    : (runtime?.sampling_defaults ?? {})) as Record<string, unknown>;
+  const value = (key: string, fallback: number): number => {
+    const candidate = Number(defaults[key]);
+    return Number.isFinite(candidate) ? candidate : fallback;
+  };
+  return {
+    ...current,
+    systemPrompt: voice ? String(defaults.system_prompt ?? "") : "",
+    maxTokens: voice ? current.maxTokens : value("max_tokens", current.maxTokens),
+    temperature: value("temperature", current.temperature),
+    topP: value("top_p", current.topP),
+    topK: value("top_k", current.topK),
+    repetitionPenalty: value(
+      voice ? "text_repetition_penalty" : "repetition_penalty",
+      current.repetitionPenalty,
+    ),
+    presencePenalty: voice ? 0 : value("presence_penalty", current.presencePenalty),
+    frequencyPenalty: voice ? 0 : value("frequency_penalty", current.frequencyPenalty),
+    fullDuplex: mode === "full_duplex",
+    preset: "custom",
+    seed: null,
+  };
+}
 const CAPABILITY_LABELS: Array<[
   keyof RuntimeCapabilities["model_capabilities"]["features"],
   [string, string],
@@ -232,6 +266,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [capabilities, setCapabilities] = useState<RuntimeCapabilities | null>(null);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
+  const [realtime, setRealtime] = useState<RealtimeCapabilities | null>(null);
   const [realtimeAvailable, setRealtimeAvailable] = useState(false);
   const [metricSeries, setMetricSeries] = useState<number[]>([]);
   const [settings, setSettings] = useState<GenerationSettings>(loadSettings);
@@ -246,12 +281,14 @@ export default function App() {
   const [renameValue, setRenameValue] = useState("");
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
   const [voiceLevel, setVoiceLevel] = useState(0);
+  const [liveVoiceText, setLiveVoiceText] = useState("");
   const abortRef = useRef<AbortController | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
   const activeIdRef = useRef<string | null>(null);
   const voiceRef = useRef<RealtimeAudioController | null>(null);
   const lastMetricId = useRef("");
   const hadStoredSettings = useRef(Boolean(localStorage.getItem(SETTINGS_KEY)));
+  const appliedModeTemplate = useRef("");
 
   const english =
     settings.language === "en" ||
@@ -305,6 +342,15 @@ export default function App() {
   }, [activeId]);
 
   useEffect(() => {
+    if (!active || !runtime || voiceRef.current?.active) return;
+    const key = `${runtime.model ?? model}:${active.mode}`;
+    if (appliedModeTemplate.current === key) return;
+    appliedModeTemplate.current = key;
+    void voiceRef.current?.setFullDuplex(active.mode === "full_duplex");
+    setSettings((current) => modeTemplateSettings(current, active.mode, runtime, realtime));
+  }, [active, model, realtime, runtime]);
+
+  useEffect(() => {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
     voiceRef.current?.setPlayback(settings.playbackEnabled);
   }, [settings]);
@@ -318,6 +364,7 @@ export default function App() {
       {
         onState: setVoiceState,
         onLevel: setVoiceLevel,
+        onText: setLiveVoiceText,
         onError: (message) => setError(message),
         onTurn: ({ text, audio }) => {
           const sessionId = activeIdRef.current;
@@ -400,6 +447,7 @@ export default function App() {
           }
         }
         if (results[3].status === "fulfilled") {
+          setRealtime(results[3].value);
           setRealtimeAvailable(results[3].value.available === true);
         }
         if (results[4].status === "fulfilled") {
@@ -466,6 +514,16 @@ export default function App() {
     };
   }
 
+  function realtimeSessionConfig() {
+    return {
+      systemPrompt: settings.systemPrompt,
+      temperature: settings.temperature,
+      topP: settings.topP,
+      topK: settings.topK,
+      repetitionPenalty: settings.repetitionPenalty,
+    };
+  }
+
   async function createSession() {
     const selectedModel = model.trim();
     if (!selectedModel) return;
@@ -511,7 +569,7 @@ export default function App() {
   async function saveRename(session: Session) {
     const title = renameValue.replace(/\s+/g, " ").trim();
     try {
-      const updated = await api.updateSession(session.id, title || null);
+      const updated = await api.updateSession(session.id, { title: title || null });
       setSessions((current) => current.map((item) => (item.id === updated.id ? updated : item)));
       setRenamingId(null);
     } catch (cause) {
@@ -621,8 +679,8 @@ export default function App() {
     const text = draft.trim();
     if (!active || !text || busy) return;
     setDraft("");
-    if (voiceRef.current?.active) {
-      voiceRef.current.sendText(text);
+    if (active.mode !== "text" && voiceRef.current) {
+      await voiceRef.current.submitText(text, realtimeSessionConfig());
       setVoiceMessages((current) => [
         ...current,
         {
@@ -728,21 +786,29 @@ export default function App() {
   }
 
   async function toggleVoice() {
-    if (!active || !realtimeAvailable || busy || !voiceRef.current) return;
-    await voiceRef.current.toggleCapture({
-      systemPrompt: settings.systemPrompt,
-      temperature: settings.temperature,
-      topP: settings.topP,
-      topK: settings.topK,
-      repetitionPenalty: settings.repetitionPenalty,
-      seed: settings.seed,
-    });
+    if (
+      !active ||
+      active.mode === "text" ||
+      !realtimeAvailable ||
+      busy ||
+      !voiceRef.current
+    ) return;
+    await voiceRef.current.toggleCapture(realtimeSessionConfig());
   }
 
-  async function toggleDuplex() {
-    const enabled = !settings.fullDuplex;
-    await voiceRef.current?.setFullDuplex(enabled);
-    setSettings((current) => ({ ...current, fullDuplex: enabled }));
+  async function selectInteractionMode(nextMode: SessionMode) {
+    setMode(nextMode);
+    if (!active || active.mode === nextMode || busy) return;
+    if (voiceRef.current?.active) await voiceRef.current.stop();
+    try {
+      const updated = await api.updateSession(active.id, { mode: nextMode });
+      appliedModeTemplate.current = "";
+      setSessions((current) =>
+        current.map((session) => (session.id === updated.id ? updated : session)),
+      );
+    } catch (cause) {
+      setError(errorMessage(cause));
+    }
   }
 
   function openSettings() {
@@ -800,6 +866,10 @@ export default function App() {
       ]);
       setCapabilities(nextCapabilities);
       setModels(nextModels);
+      const nextRealtime = await api.realtimeCapabilities();
+      setRealtime(nextRealtime);
+      setRealtimeAvailable(nextRealtime.available === true);
+      appliedModeTemplate.current = "";
       await refreshRuntime(false);
     } catch (cause) {
       setError(errorMessage(cause));
@@ -873,7 +943,6 @@ export default function App() {
             <div className="message-scroller">
               <div className="message-list" aria-live="polite">
                 {!active && <div className="welcome"><img src="/mfq-mark.svg" alt="" /><h1>MFQ Studio</h1><p>{tr("创建会话后即可开始本地推理。", "Create a session to start local inference.")}</p><div className="prompt-grid"><button onClick={() => setDraft(tr("介绍一下这个模型。", "Introduce this model."))} type="button">{tr("介绍模型", "Introduce the model")}</button><button onClick={() => setDraft(tr("写一段 Python 示例。", "Write a Python example."))} type="button">{tr("代码示例", "Code example")}</button></div></div>}
-                {active && messages.length === 0 && currentVoiceMessages.length === 0 && !busy && <div className="welcome compact"><h2>{tr("可以开始了", "Ready")}</h2><p>{tr("当前会话会持久保存。", "This session is persisted by MFQd.")}</p></div>}
                 {messages.map((message) => {
                   const parts = textParts(message);
                   const editing = editDraft?.messageId === message.id;
@@ -887,6 +956,7 @@ export default function App() {
                   </article>;
                 })}
                 {currentVoiceMessages.map((message) => <article className={`message message-${message.role}`} key={message.id}><div className="message-avatar">{message.role === "assistant" ? <img src="/mfq-mark.svg" alt="MFQ" /> : <span>{tr("你", "You")}</span>}</div><div className="message-body"><div className="message-meta"><strong>{message.role === "assistant" ? "MFQ" : tr("你", "You")}</strong><span>{tr("语音", "Voice")}</span></div>{message.text && <Markdown text={message.text} />}{message.audioId && <AudioClip audioId={message.audioId} />}</div></article>)}
+                {liveVoiceText && <article className="message message-assistant live-message"><div className="message-avatar"><img src="/mfq-mark.svg" alt="MFQ" /></div><div className="message-body"><div className="message-meta"><strong>MFQ</strong><span>{tr("生成中", "Generating")}</span></div><Markdown live text={liveVoiceText} /></div></article>}
                 {live && <article className="message message-assistant live-message"><div className="message-avatar"><img src="/mfq-mark.svg" alt="MFQ" /></div><div className="message-body"><div className="message-meta"><strong>MFQ</strong><span>{tr("生成中", "Generating")}</span></div>{live.reasoning && <details className="reasoning" open><summary>{tr("正在思考", "Thinking")}</summary><Markdown live text={live.reasoning} /></details>}{live.text && <Markdown live text={live.text} />}{live.tools.map((tool, index) => <pre className="tool-call" key={index}>{tool}</pre>)}{!live.reasoning && !live.text && live.tools.length === 0 && <span className="thinking"><i /><i /><i /></span>}</div></article>}
                 <div ref={endRef} />
               </div>
@@ -896,11 +966,11 @@ export default function App() {
               <form className="composer" onSubmit={send}>
                 <textarea aria-label={tr("消息", "Message")} disabled={!active || busy} maxLength={32768} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} placeholder={active ? tr("向模型发送消息", "Message MFQ") : tr("请先创建会话", "Create a session first")} rows={1} value={draft} />
                 <div className="composer-toolbar">
-                  {realtimeAvailable && <button aria-label={tr("语音输入", "Voice input")} aria-pressed={voiceState !== "idle" && voiceState !== "error"} className="voice-button" disabled={!active || busy} onClick={() => void toggleVoice()} style={{ "--voice-level": voiceLevel } as React.CSSProperties} title={voiceState === "processing" ? tr("语音处理中", "Processing voice") : tr("语音输入", "Voice input")} type="button"><span /></button>}
-                  {realtimeAvailable && <button aria-pressed={settings.playbackEnabled} onClick={() => setSettings((current) => ({ ...current, playbackEnabled: !current.playbackEnabled }))} title={tr("语音播放", "Voice playback")} type="button">{settings.playbackEnabled ? "🔊" : "🔇"}</button>}
-                  {realtimeAvailable && <button aria-pressed={settings.fullDuplex} disabled={voiceState !== "idle"} onClick={() => void toggleDuplex()} type="button">{settings.fullDuplex ? tr("全双工", "Full duplex") : tr("半双工", "Half duplex")}</button>}
-                  <button aria-pressed={settings.enableThinking} onClick={() => setSettings((current) => ({ ...current, enableThinking: !current.enableThinking }))} type="button">◉ {tr("思考", "Thinking")}</button>
-                  {settings.enableThinking && reasoningValues.length > 0 && <select aria-label={tr("思考档位", "Reasoning effort")} onChange={(event) => setSettings((current) => ({ ...current, reasoningEffort: event.target.value }))} value={settings.reasoningEffort}><option value="">{tr("标准", "Standard")}</option>{reasoningValues.map((value) => <option key={value} value={value}>{value}</option>)}</select>}
+                  {realtimeAvailable && <select aria-label={tr("交互模式", "Interaction mode")} disabled={!active || busy || voiceState !== "idle"} onChange={(event) => void selectInteractionMode(event.target.value as SessionMode)} value={active?.mode ?? mode}>{(["text", "voice", "full_duplex"] as SessionMode[]).map((item) => { const feature = capabilities?.model_capabilities.features; const disabled = item === "voice" ? !feature?.audio_input : item === "full_duplex" ? !feature?.full_duplex : false; return <option disabled={disabled} key={item} value={item}>{MODE_LABELS[item][english ? 1 : 0]}</option>; })}</select>}
+                  {realtimeAvailable && <button aria-label={tr("语音输入", "Voice input")} aria-pressed={voiceState !== "idle" && voiceState !== "error"} className="voice-button" disabled={!active || active.mode === "text" || busy} onClick={() => void toggleVoice()} style={{ "--voice-level": voiceLevel } as React.CSSProperties} title={active?.mode === "text" ? tr("请先选择语音或全双工模式", "Select voice or full duplex mode first") : voiceState === "processing" ? tr("语音处理中", "Processing voice") : tr("语音输入", "Voice input")} type="button"><span /></button>}
+                  {realtimeAvailable && active?.mode !== "text" && <button aria-pressed={settings.playbackEnabled} onClick={() => setSettings((current) => ({ ...current, playbackEnabled: !current.playbackEnabled }))} title={tr("语音播放", "Voice playback")} type="button">{settings.playbackEnabled ? "🔊" : "🔇"}</button>}
+                  {active?.mode === "text" && <button aria-pressed={settings.enableThinking} onClick={() => setSettings((current) => ({ ...current, enableThinking: !current.enableThinking }))} type="button">◉ {tr("思考", "Thinking")}</button>}
+                  {active?.mode === "text" && settings.enableThinking && reasoningValues.length > 0 && <select aria-label={tr("思考档位", "Reasoning effort")} onChange={(event) => setSettings((current) => ({ ...current, reasoningEffort: event.target.value }))} value={settings.reasoningEffort}><option value="">{tr("标准", "Standard")}</option>{reasoningValues.map((value) => <option key={value} value={value}>{value}</option>)}</select>}
                   <span className="composer-hint">{voiceState !== "idle" ? voiceState : tr("Enter 发送 · Shift+Enter 换行", "Enter to send · Shift+Enter for newline")}</span>
                   {busy ? <button className="send-button stop" onClick={() => abortRef.current?.abort()} type="button">■</button> : <button className="send-button" disabled={!active || !draft.trim()} type="submit">↑</button>}
                 </div>
@@ -918,7 +988,7 @@ export default function App() {
         )}
       </main>
 
-      {settingsOpen && <><div className="drawer-scrim" onClick={() => setSettingsOpen(false)} /><aside className="settings-panel"><header><div><p>Generation</p><h2>{tr("推理设置", "Inference settings")}</h2></div><button onClick={() => setSettingsOpen(false)} type="button">×</button></header><div className="settings-scroll"><section><h3>{tr("预设", "Presets")}</h3><div className="segmented">{(["precise", "balanced", "creative"] as const).map((name) => <button aria-pressed={settingsDraft.preset === name} key={name} onClick={() => applyPreset(name)} type="button">{name === "precise" ? tr("精确", "Precise") : name === "balanced" ? tr("均衡", "Balanced") : tr("创意", "Creative")}</button>)}</div></section><section><h3>{tr("上下文", "Context")}</h3><label><span>{tr("系统提示词", "System prompt")}</span><textarea onChange={(event) => setSettingsDraft((current) => ({ ...current, systemPrompt: event.target.value }))} rows={4} value={settingsDraft.systemPrompt} /></label><label className="check-field"><span><strong>{tr("排除历史思考", "Exclude reasoning history")}</strong><small>{tr("后续请求不再发送已保存的思考内容。", "Do not send saved reasoning in later requests.")}</small></span><input checked={settingsDraft.excludeReasoning} onChange={(event) => setSettingsDraft((current) => ({ ...current, excludeReasoning: event.target.checked }))} type="checkbox" /></label><label><span>{tr("上下文窗口 tokens", "Context window tokens")}</span><input max={Number(runtime?.context_capacity) || 1048576} min={512} onChange={(event) => setContextSize(Number(event.target.value))} step={512} type="number" value={contextSize} /></label><button className="secondary wide" disabled={busy} onClick={() => void reloadRuntime()} type="button">{tr("按此上下文重载模型", "Reload model with this context")}</button><label><span>{tr("最大生成 tokens", "Maximum output tokens")}</span><input max={65536} min={1} onChange={(event) => setSettingsDraft((current) => ({ ...current, maxTokens: Number(event.target.value) }))} type="number" value={settingsDraft.maxTokens} /></label></section><section><h3>{tr("采样", "Sampling")}</h3><label><span>Temperature <output>{settingsDraft.temperature.toFixed(2)}</output></span><input max={2} min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, temperature: Number(event.target.value), preset: "custom" }))} step={0.05} type="range" value={settingsDraft.temperature} /></label><label><span>Top P <output>{settingsDraft.topP.toFixed(2)}</output></span><input max={1} min={0.05} onChange={(event) => setSettingsDraft((current) => ({ ...current, topP: Number(event.target.value), preset: "custom" }))} step={0.05} type="range" value={settingsDraft.topP} /></label><label><span>Top K</span><input max={1024} min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, topK: Number(event.target.value), preset: "custom" }))} type="number" value={settingsDraft.topK} /></label><label><span>Seed</span><input min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, seed: event.target.value ? Number(event.target.value) : null }))} placeholder={tr("随机", "Random")} type="number" value={settingsDraft.seed ?? ""} /></label></section><section><h3>{tr("惩罚", "Penalties")}</h3>{([["Repetition", "repetitionPenalty", 0.5, 2, 0.01], ["Presence", "presencePenalty", -2, 2, 0.05], ["Frequency", "frequencyPenalty", -2, 2, 0.05]] as const).map(([label, key, min, max, step]) => <label key={key}><span>{label} <output>{settingsDraft[key].toFixed(2)}</output></span><input max={max} min={min} onChange={(event) => setSettingsDraft((current) => ({ ...current, [key]: Number(event.target.value), preset: "custom" }))} step={step} type="range" value={settingsDraft[key]} /></label>)}</section><section><h3>{tr("界面与连接", "Interface and connection")}</h3><label><span>{tr("界面语言", "Interface language")}</span><select onChange={(event) => setSettingsDraft((current) => ({ ...current, language: event.target.value as UiLanguage }))} value={settingsDraft.language}><option value="system">{tr("跟随系统", "System")}</option><option value="zh-CN">简体中文</option><option value="en">English</option></select></label>{studio && <button className="secondary wide" onClick={openStudioSettings} type="button">{tr("配置 MFQd 连接", "Configure MFQd connection")}</button>}</section></div><footer><button onClick={() => setSettingsDraft({ ...DEFAULT_SETTINGS, language: settingsDraft.language })} type="button">{tr("恢复默认", "Reset")}</button><button className="primary" onClick={saveSettings} type="button">{tr("应用", "Apply")}</button></footer></aside></>}
+      {settingsOpen && <><div className="drawer-scrim" onClick={() => setSettingsOpen(false)} /><aside className="settings-panel"><header><div><p>Generation</p><h2>{tr("推理设置", "Inference settings")}</h2></div><button onClick={() => setSettingsOpen(false)} type="button">×</button></header><div className="settings-scroll"><section><h3>{tr("预设", "Presets")}</h3><div className="segmented">{(["precise", "balanced", "creative"] as const).map((name) => <button aria-pressed={settingsDraft.preset === name} key={name} onClick={() => applyPreset(name)} type="button">{name === "precise" ? tr("精确", "Precise") : name === "balanced" ? tr("均衡", "Balanced") : tr("创意", "Creative")}</button>)}</div></section><section><h3>{tr("上下文", "Context")}</h3><label><span>{tr("系统提示词", "System prompt")}</span><textarea onChange={(event) => setSettingsDraft((current) => ({ ...current, systemPrompt: event.target.value }))} rows={4} value={settingsDraft.systemPrompt} /></label><label className="check-field"><span><strong>{tr("排除历史思考", "Exclude reasoning history")}</strong><small>{tr("后续请求不再发送已保存的思考内容。", "Do not send saved reasoning in later requests.")}</small></span><input checked={settingsDraft.excludeReasoning} onChange={(event) => setSettingsDraft((current) => ({ ...current, excludeReasoning: event.target.checked }))} type="checkbox" /></label><label><span>{tr("上下文窗口 tokens", "Context window tokens")}</span><input max={Number(runtime?.context_capacity) || 1048576} min={512} onChange={(event) => setContextSize(Number(event.target.value))} step={512} type="number" value={contextSize} /></label><button className="secondary wide" disabled={busy} onClick={() => void reloadRuntime()} type="button">{tr("按此上下文重载模型", "Reload model with this context")}</button><label><span>{tr("最大生成 tokens", "Maximum output tokens")}</span><input max={65536} min={1} onChange={(event) => setSettingsDraft((current) => ({ ...current, maxTokens: Number(event.target.value) }))} type="number" value={settingsDraft.maxTokens} /></label></section><section><h3>{tr("采样", "Sampling")}</h3><label><span>Temperature <output>{settingsDraft.temperature.toFixed(2)}</output></span><input max={2} min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, temperature: Number(event.target.value), preset: "custom" }))} step={0.05} type="range" value={settingsDraft.temperature} /></label><label><span>Top P <output>{settingsDraft.topP.toFixed(2)}</output></span><input max={1} min={0.05} onChange={(event) => setSettingsDraft((current) => ({ ...current, topP: Number(event.target.value), preset: "custom" }))} step={0.05} type="range" value={settingsDraft.topP} /></label><label><span>Top K</span><input max={1024} min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, topK: Number(event.target.value), preset: "custom" }))} type="number" value={settingsDraft.topK} /></label><label><span>Seed</span><input min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, seed: event.target.value ? Number(event.target.value) : null }))} placeholder={tr("随机", "Random")} type="number" value={settingsDraft.seed ?? ""} /></label></section><section><h3>{tr("惩罚", "Penalties")}</h3>{([["Repetition", "repetitionPenalty", 0.5, 2, 0.01], ["Presence", "presencePenalty", -2, 2, 0.05], ["Frequency", "frequencyPenalty", -2, 2, 0.05]] as const).map(([label, key, min, max, step]) => <label key={key}><span>{label} <output>{settingsDraft[key].toFixed(2)}</output></span><input max={max} min={min} onChange={(event) => setSettingsDraft((current) => ({ ...current, [key]: Number(event.target.value), preset: "custom" }))} step={step} type="range" value={settingsDraft[key]} /></label>)}</section><section><h3>{tr("界面与连接", "Interface and connection")}</h3><label><span>{tr("界面语言", "Interface language")}</span><select onChange={(event) => setSettingsDraft((current) => ({ ...current, language: event.target.value as UiLanguage }))} value={settingsDraft.language}><option value="system">{tr("跟随系统", "System")}</option><option value="zh-CN">简体中文</option><option value="en">English</option></select></label>{studio && <button className="secondary wide" onClick={openStudioSettings} type="button">{tr("配置 MFQd 连接", "Configure MFQd connection")}</button>}</section></div><footer><button onClick={() => setSettingsDraft(modeTemplateSettings({ ...DEFAULT_SETTINGS, language: settingsDraft.language }, active?.mode ?? mode, runtime, realtime))} type="button">{tr("恢复默认", "Reset")}</button><button className="primary" onClick={saveSettings} type="button">{tr("应用", "Apply")}</button></footer></aside></>}
 
       {studioOpen && studioDraft && <div className="dialog-backdrop"><form className="studio-dialog" onSubmit={saveStudioSettings}><header><div><h2>{tr("Runtime 连接", "Runtime connection")}</h2><p>{tr("MFQ Studio 关闭后，MFQd 会继续运行。", "MFQd keeps running after MFQ Studio closes.")}</p></div><button onClick={() => setStudioOpen(false)} type="button">×</button></header><div className="segmented">{(["local", "remote"] as const).map((item) => <button aria-pressed={studioDraft.mode === item} key={item} onClick={() => setStudioDraft((current) => current && ({ ...current, mode: item }))} type="button">{item === "local" ? "Local MFQd" : "Remote MFQd"}</button>)}</div>{studioDraft.mode === "local" ? <><label><span>{tr("Runtime / realtime gateway URL", "Runtime / realtime gateway URL")}</span><input onChange={(event) => setStudioDraft((current) => current && ({ ...current, local_backend_url: event.target.value }))} required type="url" value={studioDraft.local_backend_url} /></label><label><span>MFQd port</span><input max={65535} min={1} onChange={(event) => setStudioDraft((current) => current && ({ ...current, local_service_port: Number(event.target.value) }))} required type="number" value={studioDraft.local_service_port} /></label><label><span>MFQd executable</span><input onChange={(event) => setStudioDraft((current) => current && ({ ...current, mfqd_executable: event.target.value || null }))} placeholder="mfqd from PATH" value={studioDraft.mfqd_executable ?? ""} /></label></> : <label><span>Remote MFQd URL</span><input onChange={(event) => setStudioDraft((current) => current && ({ ...current, remote_url: event.target.value }))} required type="url" value={studioDraft.remote_url} /></label>}<div className="dialog-status"><span className={studio?.reachable ? "online" : "offline"} />{studio?.reachable ? `${tr("已连接", "Connected")}: ${studio.service_url}` : tr("MFQd 离线", "MFQd is offline")}</div><footer><button onClick={() => setStudioOpen(false)} type="button">{tr("取消", "Cancel")}</button><button className="primary" disabled={busy} type="submit">{tr("应用", "Apply")}</button></footer></form></div>}
     </div>

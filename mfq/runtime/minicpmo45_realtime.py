@@ -7,6 +7,7 @@ import copy
 import json
 import os
 import tempfile
+import time
 from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 from typing import Any
@@ -522,29 +523,84 @@ class RealtimeGateway:
         backend: Any,
         client: Any,
         input_payload: dict[str, Any],
+        *,
+        render_queue: asyncio.Queue[dict[str, Any] | None] | None = None,
+        send_lock: asyncio.Lock | None = None,
+        render_errors: list[BaseException] | None = None,
     ) -> None:
+        async def send(value: dict[str, Any]) -> None:
+            if send_lock is None:
+                await client.send_json(value)
+                return
+            async with send_lock:
+                await client.send_json(value)
+
         await backend.send(json.dumps({"type": "input.append", "input": input_payload}))
         while True:
+            if render_errors:
+                raise RuntimeError("streaming audio rendering failed") from render_errors[0]
             event = json.loads(await backend.recv())
             if event.get("type") == "response.step.done":
-                await client.send_json(event)
+                await send(event)
                 return
             if event.get("kind") == "audio_tokens":
-                waveform = await asyncio.to_thread(
-                    self.renderer.push,
-                    event.get("audio_tokens") or [],
-                    end_of_turn=bool(event.get("end_of_turn", False)),
-                    force_flush=bool(event.get("force_flush", False)),
-                )
-                if waveform.size:
-                    event = dict(event)
-                    event["kind"] = "audio"
-                    event.pop("audio_tokens", None)
-                    event["audio"] = _encode_f32(waveform)
-                    event["sample_rate"] = SAMPLE_RATE_OUT
-                else:
+                if render_queue is not None and not event.get("end_of_turn", False):
+                    await render_queue.put(event)
                     continue
-            await client.send_json(event)
+                if render_queue is not None:
+                    await render_queue.join()
+                    if render_errors:
+                        raise RuntimeError("streaming audio rendering failed") from render_errors[0]
+                rendered = await self.render_audio_event(event)
+                if rendered is None:
+                    continue
+                event = rendered
+            await send(event)
+
+    async def render_audio_event(
+        self,
+        event: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        started = time.perf_counter()
+        waveform = await asyncio.to_thread(
+            self.renderer.push,
+            event.get("audio_tokens") or [],
+            end_of_turn=bool(event.get("end_of_turn", False)),
+            force_flush=bool(event.get("force_flush", False)),
+        )
+        if not waveform.size:
+            return None
+        rendered = dict(event)
+        rendered["kind"] = "audio"
+        rendered.pop("audio_tokens", None)
+        rendered["audio"] = _encode_f32(waveform)
+        rendered["sample_rate"] = SAMPLE_RATE_OUT
+        rendered["metrics"] = {
+            **dict(rendered.get("metrics") or {}),
+            "token2wav_ms": (time.perf_counter() - started) * 1000.0,
+        }
+        return rendered
+
+    async def render_audio_worker(
+        self,
+        queue: asyncio.Queue[dict[str, Any] | None],
+        client: Any,
+        send_lock: asyncio.Lock,
+        errors: list[BaseException],
+    ) -> None:
+        while True:
+            event = await queue.get()
+            try:
+                if event is None:
+                    return
+                rendered = await self.render_audio_event(event)
+                if rendered is not None:
+                    async with send_lock:
+                        await client.send_json(rendered)
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                queue.task_done()
 
     async def serve(self, client: Any) -> None:
         import websockets
@@ -559,6 +615,10 @@ class RealtimeGateway:
             await client.send_json({"type": "session.queue_done"})
             backend = None
             temporary_reference: Path | None = None
+            render_queue: asyncio.Queue[dict[str, Any] | None] | None = None
+            render_task: asyncio.Task[None] | None = None
+            render_errors: list[BaseException] = []
+            send_lock = asyncio.Lock()
             try:
                 first = await client.receive_json()
                 if first.get("type") != "session.init":
@@ -620,6 +680,15 @@ class RealtimeGateway:
                 created["config"] = effective_config
                 created["token2wav_steps"] = self.renderer.n_timesteps
                 await client.send_json(created)
+                render_queue = asyncio.Queue()
+                render_task = asyncio.create_task(
+                    self.render_audio_worker(
+                        render_queue,
+                        client,
+                        send_lock,
+                        render_errors,
+                    )
+                )
                 mel_stream = ExactStreamingMel(self.extractor)
                 audio_chunk_count = 0
                 while True:
@@ -648,6 +717,9 @@ class RealtimeGateway:
                                     input_payload.get("max_new_speak_tokens", 20)
                                 ),
                             },
+                            render_queue=render_queue,
+                            send_lock=send_lock,
+                            render_errors=render_errors,
                         )
                         has_input = True
                     if "audio" in input_payload:
@@ -677,11 +749,19 @@ class RealtimeGateway:
                                         input_payload.get("max_new_speak_tokens", 20)
                                     ),
                                 },
+                                render_queue=render_queue,
+                                send_lock=send_lock,
+                                render_errors=render_errors,
                             )
                         has_input = True
                     if not has_input:
                         raise ValueError("input.append requires audio or text")
             finally:
+                if render_queue is not None:
+                    await render_queue.join()
+                    await render_queue.put(None)
+                if render_task is not None:
+                    await render_task
                 if backend is not None:
                     await backend.close()
                 if temporary_reference is not None:
