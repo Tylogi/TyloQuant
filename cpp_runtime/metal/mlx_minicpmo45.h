@@ -3,6 +3,7 @@
 #include "../mfq_token_constraint.h"
 #include "mfq_container.h"
 #include "mlx_sampling.h"
+#include "mlx_transformer.h"
 
 #include <cstdint>
 #include <functional>
@@ -40,6 +41,14 @@ struct MlxMiniCPMO45TtsResult {
     mlx::core::array codes;
     std::vector<mlx::core::array> logits;
     bool finished = false;
+};
+
+struct MlxMiniCPMO45TextSessionState {
+    std::vector<std::int64_t> tokens;
+    std::vector<MlxKvCacheSnapshot> layers;
+    int cache_position = 0;
+    int cache_batch = 0;
+    std::size_t bytes = 0;
 };
 
 struct MlxMiniCPMO45DuplexSpecialIds {
@@ -168,7 +177,17 @@ public:
         const std::function<bool(std::int64_t)>& callback = {},
         const std::function<void(std::size_t, double)>&
             prefill_callback = {},
-        const MfqTokenConstraintPtr& token_constraint = {});
+        const MfqTokenConstraintPtr& token_constraint = {},
+        std::optional<std::size_t> stable_prefix_tokens =
+            std::nullopt);
+
+    MlxMiniCPMO45TextSessionState capture_text_session_state(
+        const std::vector<std::int64_t>& tokens) const;
+    void restore_text_session_state(
+        const MlxMiniCPMO45TextSessionState& state);
+    bool supports_text_session_state() const noexcept {
+        return true;
+    }
 
     std::size_t layer_count() const noexcept;
     std::int64_t maximum_context() const noexcept;

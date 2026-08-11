@@ -369,6 +369,7 @@ void MlxQwen35CausalLm::reset_cache(int batch) {
         });
     cache_position_ = 0;
     cache_batch_ = batch;
+    stable_cache_tokens_.clear();
 }
 
 void MlxQwen35CausalLm::prepare_cache_for_prefill(
@@ -407,6 +408,7 @@ void MlxQwen35CausalLm::prepare_cache_for_prefill(
         });
     cache_position_ = 0;
     cache_batch_ = batch;
+    stable_cache_tokens_.clear();
 }
 
 void MlxQwen35CausalLm::clear_cache() noexcept {
@@ -417,6 +419,79 @@ void MlxQwen35CausalLm::clear_cache() noexcept {
         });
     cache_position_ = 0;
     cache_batch_ = 0;
+    stable_cache_tokens_.clear();
+}
+
+MlxQwen35TextSessionState
+MlxQwen35CausalLm::capture_text_session_state(
+    const std::vector<std::int64_t>& tokens) const {
+    if (cache_batch_ != 1 || cache_position_ <= 0 ||
+        static_cast<std::size_t>(cache_position_) != tokens.size() ||
+        layers_.empty()) {
+        throw std::runtime_error(
+            "Qwen3.5 text session token count does not match the cache");
+    }
+    MlxQwen35TextSessionState state;
+    state.tokens = tokens;
+    state.cache_position = cache_position_;
+    state.cache_batch = cache_batch_;
+    state.layers.reserve(layers_.size());
+    for (const auto& layer : layers_) {
+        std::visit(
+            [&](const auto& block) {
+                auto snapshot = block.snapshot_cache();
+                state.bytes += snapshot.nbytes();
+                state.layers.emplace_back(std::move(snapshot));
+            },
+            layer);
+    }
+    return state;
+}
+
+void MlxQwen35CausalLm::restore_text_session_state(
+    const MlxQwen35TextSessionState& state) {
+    if (state.cache_batch != 1 || state.cache_position <= 0 ||
+        static_cast<std::size_t>(state.cache_position) !=
+            state.tokens.size() ||
+        state.layers.size() != layers_.size()) {
+        throw std::runtime_error(
+            "Qwen3.5 text session state is incompatible");
+    }
+    try {
+        for (std::size_t index = 0; index < layers_.size(); ++index) {
+            std::visit(
+                [&](auto& block) {
+                    using Block = std::decay_t<decltype(block)>;
+                    if constexpr (std::is_same_v<
+                                      Block,
+                                      MlxQwen35FullAttentionBlock>) {
+                        const auto* snapshot = std::get_if<
+                            MlxKvCacheSnapshot>(&state.layers[index]);
+                        if (!snapshot) {
+                            throw std::runtime_error(
+                                "Qwen3.5 session layer type changed");
+                        }
+                        block.restore_cache(*snapshot);
+                    } else {
+                        const auto* snapshot = std::get_if<
+                            MlxQwen35LinearAttentionCacheSnapshot>(
+                                &state.layers[index]);
+                        if (!snapshot) {
+                            throw std::runtime_error(
+                                "Qwen3.5 session layer type changed");
+                        }
+                        block.restore_cache(*snapshot);
+                    }
+                },
+                layers_[index]);
+        }
+        cache_position_ = state.cache_position;
+        cache_batch_ = state.cache_batch;
+        stable_cache_tokens_ = state.tokens;
+    } catch (...) {
+        clear_cache();
+        throw;
+    }
 }
 
 std::string_view MlxQwen35CausalLm::layer_type(
@@ -438,7 +513,8 @@ std::int32_t MlxQwen35CausalLm::generate(
     const MlxTokenCallback& callback,
     const std::function<void(std::size_t, double)>&
         prefill_callback,
-    const MfqTokenConstraintPtr& token_constraint) {
+    const MfqTokenConstraintPtr& token_constraint,
+    std::optional<std::size_t> stable_prefix_tokens) {
     if (prompt.empty()) {
         throw std::invalid_argument(
             "Qwen3.5 generation prompt cannot be empty");
@@ -473,12 +549,25 @@ std::int32_t MlxQwen35CausalLm::generate(
         reset_cache(1);
         return 0;
     }
-    // Cache allocation/zeroing is request setup, not model prefill compute.
-    // Materialize it before the evaluation-only metric starts. Reusing the
-    // cache also avoids rebuilding identical zero states on every request.
-    prepare_cache_for_prefill(
-        1,
-        prompt_count);
+    const std::size_t stable_count = stable_prefix_tokens
+        ? std::min(*stable_prefix_tokens, prompt.size())
+        : 0;
+    std::size_t reused_tokens = 0;
+    if (stable_count > 0 && cache_batch_ == 1 &&
+        cache_position_ == static_cast<int>(stable_cache_tokens_.size()) &&
+        !stable_cache_tokens_.empty() &&
+        stable_cache_tokens_.size() <= stable_count &&
+        stable_cache_tokens_.size() < prompt.size() &&
+        std::equal(
+            stable_cache_tokens_.begin(),
+            stable_cache_tokens_.end(),
+            prompt.begin())) {
+        reused_tokens = stable_cache_tokens_.size();
+    } else {
+        // Cache allocation/zeroing is request setup, not model prefill
+        // compute. Materialize it before the evaluation-only metric starts.
+        prepare_cache_for_prefill(1, prompt_count);
+    }
 
     const array prompt_ids(
         prompt_values.begin(),
@@ -490,14 +579,64 @@ std::int32_t MlxQwen35CausalLm::generate(
             prompt_ids,
             vocab);
     double prefill_evaluation_ms = 0.0;
+    std::optional<MlxQwen35TextSessionState> stable_snapshot;
+    struct StableStateRestore {
+        MlxQwen35CausalLm& model;
+        std::optional<MlxQwen35TextSessionState>& snapshot;
+        ~StableStateRestore() noexcept {
+            if (!snapshot) return;
+            try {
+                model.restore_text_session_state(*snapshot);
+            } catch (...) {
+                model.clear_cache();
+            }
+        }
+    } stable_restore{*this, stable_snapshot};
+
     auto logits = [&]() {
         detail::ScopedMlxEvaluationTiming timing(
             prefill_callback
                 ? &prefill_evaluation_ms
                 : nullptr);
-        auto value = last_token_logits(
-            forward(prompt_ids, true),
-            vocab);
+        const auto forward_range = [&](std::size_t begin, std::size_t end) {
+            if (begin >= end || end > prompt.size()) {
+                throw std::runtime_error(
+                    "Qwen3.5 session prefill range is invalid");
+            }
+            auto ids = mlx::core::slice(
+                prompt_ids,
+                Shape{0, static_cast<int>(begin)},
+                Shape{1, static_cast<int>(end)});
+            return last_token_logits(forward(ids, true), vocab);
+        };
+        std::optional<array> stable_logits;
+        array value = [&]() {
+            if (stable_count == 0) {
+                return forward_range(0, prompt.size());
+            }
+            if (reused_tokens < stable_count) {
+                stable_logits = forward_range(
+                    reused_tokens, stable_count);
+            }
+            if (cache_position_ != static_cast<int>(stable_count)) {
+                throw std::runtime_error(
+                    "Qwen3.5 stable session cache position mismatch");
+            }
+            std::vector<std::int64_t> stable_tokens(
+                prompt.begin(),
+                prompt.begin() +
+                    static_cast<std::ptrdiff_t>(stable_count));
+            stable_snapshot =
+                capture_text_session_state(stable_tokens);
+            if (stable_count < prompt.size()) {
+                return forward_range(stable_count, prompt.size());
+            }
+            if (!stable_logits) {
+                throw std::runtime_error(
+                    "Qwen3.5 stable prefix has no sampling logits");
+            }
+            return std::move(*stable_logits);
+        }();
         if (prefill_callback) {
             // Build the lazy graph before entering eval_with_timing().
             // Only MLX execution/synchronization contributes to prefill.
@@ -507,7 +646,7 @@ std::int32_t MlxQwen35CausalLm::generate(
     }();
     if (prefill_callback) {
         prefill_callback(
-            prompt.size(),
+            prompt.size() - reused_tokens,
             prefill_evaluation_ms);
     }
     MlxSampler sampler(sampling);

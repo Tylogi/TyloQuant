@@ -1082,7 +1082,10 @@ MlxDeepseekV4PoolState::snapshot() const {
         batch_,
         capacity_,
         dtype_,
-        pool_,
+        // A rollback/session snapshot needs only the compact live prefix.
+        // Retaining the fixed-capacity pool here would pin one context-sized
+        // allocation per historical session snapshot after reset_cache().
+        mlx::core::array(0.0f),
         mlx::core::astype(
             state_kv_, state_kv_.dtype(), true),
         mlx::core::astype(
@@ -1092,9 +1095,12 @@ MlxDeepseekV4PoolState::snapshot() const {
     result.pool_len_ = pool_len_;
     result.remainder_ = remainder_;
     if (pool_len_ > 0) {
+        const auto& visible_pool = pool_prefix_backup_
+            ? *pool_prefix_backup_
+            : pool_prefix(*this);
         result.pool_prefix_backup_ =
             mlx::core::astype(
-                pool_prefix(*this),
+                visible_pool,
                 dtype_,
                 true);
     }

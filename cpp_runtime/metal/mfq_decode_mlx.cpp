@@ -24,6 +24,8 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <mlx/mlx.h>
@@ -287,6 +289,320 @@ void self_test_metal() {
 }
 
 #ifdef MFQ_METAL_SERVER
+template <typename Runtime>
+class MlxServerTextSessionCache {
+private:
+    using SessionState = decltype(
+        std::declval<const Runtime&>().capture_text_session_state(
+            std::declval<const std::vector<std::int64_t>&>()));
+
+    struct Entry {
+        SessionState state;
+        std::uint64_t last_used = 0;
+    };
+
+public:
+    MlxServerTextSessionCache() {
+        if (const char* value =
+                std::getenv("MFQ_SERVER_MAX_KV_SESSIONS")) {
+            max_sessions_ = static_cast<std::size_t>(
+                std::strtoull(value, nullptr, 10));
+        }
+        if (const char* value = std::getenv(
+                "MFQ_SERVER_MAX_KV_SNAPSHOTS_PER_SESSION")) {
+            max_snapshots_per_session_ = static_cast<std::size_t>(
+                std::strtoull(value, nullptr, 10));
+        }
+        if (const char* value =
+                std::getenv("MFQ_SERVER_KV_SESSION_BYTES")) {
+            max_bytes_ = static_cast<std::size_t>(
+                std::strtoull(value, nullptr, 10));
+        }
+        if (const char* value =
+                std::getenv("MFQ_SERVER_TRACE_SESSION_CACHE")) {
+            trace_ = value[0] == '1';
+        }
+    }
+
+    std::size_t restore_best(
+        Runtime& runtime,
+        const std::string& requested_session,
+        const std::vector<std::int64_t>& prompt,
+        std::size_t maximum_prefix_tokens) {
+        if (requested_session.empty() || max_sessions_ == 0 ||
+            max_snapshots_per_session_ == 0 || max_bytes_ == 0 ||
+            !runtime.supports_text_session_state()) {
+            return 0;
+        }
+        std::string selected_session;
+        std::size_t selected_snapshot = 0;
+        std::size_t selected_tokens = 0;
+        for (const auto& [session_id, history] : states_) {
+            for (std::size_t index = 0; index < history.size(); ++index) {
+                const auto& tokens = history[index].state.tokens;
+                if (tokens.empty() || tokens.size() >= prompt.size() ||
+                    tokens.size() > maximum_prefix_tokens ||
+                    tokens.size() < selected_tokens ||
+                    !std::equal(
+                        tokens.begin(), tokens.end(), prompt.begin())) {
+                    continue;
+                }
+                const bool requested_tie =
+                    tokens.size() == selected_tokens &&
+                    session_id == requested_session &&
+                    selected_session != requested_session;
+                if (tokens.size() > selected_tokens || requested_tie) {
+                    selected_session = session_id;
+                    selected_snapshot = index;
+                    selected_tokens = tokens.size();
+                }
+            }
+        }
+        if (selected_session.empty()) return 0;
+        auto& selected = states_.at(selected_session)[selected_snapshot];
+        try {
+            runtime.restore_text_session_state(selected.state);
+            selected.last_used = ++clock_;
+            if (trace_) {
+                std::cerr
+                    << "server_session_cache backend=metal action=hit session="
+                    << requested_session << " source=" << selected_session
+                    << " reused_tokens=" << selected_tokens
+                    << " prefill_tokens="
+                    << prompt.size() - selected_tokens << std::endl;
+            }
+            return selected_tokens;
+        } catch (const std::exception& error) {
+            erase_snapshot(
+                selected_session, selected_snapshot, "invalidate");
+            std::cerr
+                << "server_session_cache backend=metal action=invalidate "
+                << "session=" << selected_session
+                << " error=" << error.what() << std::endl;
+            return 0;
+        }
+    }
+
+    void store(const std::string& session_id, SessionState state) {
+        if (session_id.empty() || max_sessions_ == 0 ||
+            max_snapshots_per_session_ == 0 || max_bytes_ == 0) {
+            return;
+        }
+        if (state.bytes > max_bytes_) {
+            if (trace_) {
+                std::cerr
+                    << "server_session_cache backend=metal action=skip session="
+                    << session_id << " bytes=" << state.bytes
+                    << " budget=" << max_bytes_ << std::endl;
+            }
+            return;
+        }
+        Entry entry{std::move(state), ++clock_};
+        const auto protected_clock = entry.last_used;
+        auto& history = states_[session_id];
+        auto previous = std::find_if(
+            history.begin(), history.end(),
+            [&](const Entry& saved) {
+                return saved.state.tokens == entry.state.tokens;
+            });
+        if (previous != history.end()) {
+            bytes_ -= previous->state.bytes;
+            *previous = std::move(entry);
+        } else {
+            history.push_back(std::move(entry));
+        }
+        const auto stored = std::find_if(
+            history.begin(), history.end(),
+            [&](const Entry& saved) {
+                return saved.last_used == protected_clock;
+            });
+        if (stored == history.end()) {
+            throw std::runtime_error(
+                "stored Metal session snapshot is unavailable");
+        }
+        bytes_ += stored->state.bytes;
+        evict_history_to_limit(session_id, protected_clock);
+        evict_to_budget(session_id, protected_clock);
+        if (trace_) {
+            const auto& saved_history = states_.at(session_id);
+            const auto saved = std::find_if(
+                saved_history.begin(), saved_history.end(),
+                [&](const Entry& candidate) {
+                    return candidate.last_used == protected_clock;
+                });
+            if (saved == saved_history.end()) {
+                throw std::runtime_error(
+                    "protected Metal session snapshot was evicted");
+            }
+            std::cerr
+                << "server_session_cache backend=metal action=store session="
+                << session_id << " tokens=" << saved->state.tokens.size()
+                << " bytes=" << saved->state.bytes
+                << " snapshots=" << saved_history.size()
+                << " total_bytes=" << bytes_ << std::endl;
+        }
+    }
+
+    std::size_t fork_session(
+        const std::string& source_session,
+        const std::string& target_session) {
+        if (source_session.empty() || target_session.empty() ||
+            source_session == target_session || max_sessions_ == 0 ||
+            max_snapshots_per_session_ == 0 || max_bytes_ == 0) {
+            return 0;
+        }
+        const auto source = states_.find(source_session);
+        if (source == states_.end()) return 0;
+        auto copied = source->second;
+        close_session(target_session);
+        auto& target = states_[target_session];
+        std::uint64_t protected_clock = 0;
+        for (auto& snapshot : copied) {
+            snapshot.last_used = ++clock_;
+            protected_clock = snapshot.last_used;
+            bytes_ += snapshot.state.bytes;
+            target.push_back(std::move(snapshot));
+        }
+        evict_history_to_limit(target_session, protected_clock);
+        evict_to_budget(target_session, protected_clock);
+        const auto remaining = states_.find(target_session);
+        const std::size_t copied_snapshots = remaining == states_.end()
+            ? 0 : remaining->second.size();
+        if (trace_) {
+            std::cerr
+                << "server_session_cache backend=metal action=fork source="
+                << source_session << " target=" << target_session
+                << " snapshots=" << copied_snapshots
+                << " total_bytes=" << bytes_ << std::endl;
+        }
+        return copied_snapshots;
+    }
+
+    std::size_t close_session(const std::string& session_id) {
+        auto found = states_.find(session_id);
+        if (found == states_.end()) return 0;
+        const std::size_t released = found->second.size();
+        std::size_t released_bytes = 0;
+        for (const auto& snapshot : found->second) {
+            released_bytes += snapshot.state.bytes;
+        }
+        bytes_ -= released_bytes;
+        states_.erase(found);
+        if (trace_) {
+            std::cerr
+                << "server_session_cache backend=metal action=close session="
+                << session_id << " snapshots=" << released
+                << " bytes=" << released_bytes
+                << " total_bytes=" << bytes_ << std::endl;
+        }
+        return released;
+    }
+
+    void clear() noexcept {
+        states_.clear();
+        bytes_ = 0;
+    }
+
+private:
+    void evict_history_to_limit(
+        const std::string& session_id,
+        std::uint64_t protected_clock) {
+        auto found = states_.find(session_id);
+        while (found != states_.end() &&
+               found->second.size() > max_snapshots_per_session_) {
+            std::size_t victim = found->second.size();
+            for (std::size_t index = 0; index < found->second.size(); ++index) {
+                const auto& snapshot = found->second[index];
+                if (snapshot.last_used == protected_clock) continue;
+                if (victim == found->second.size() ||
+                    snapshot.last_used < found->second[victim].last_used) {
+                    victim = index;
+                }
+            }
+            if (victim == found->second.size()) break;
+            erase_snapshot(session_id, victim, "history_evict");
+            found = states_.find(session_id);
+        }
+    }
+
+    void evict_to_budget(
+        const std::string& protected_session,
+        std::uint64_t protected_clock) {
+        while (states_.size() > max_sessions_) {
+            auto victim = states_.end();
+            std::uint64_t victim_last_used = 0;
+            for (auto it = states_.begin(); it != states_.end(); ++it) {
+                if (it->first == protected_session) continue;
+                std::uint64_t session_last_used = 0;
+                for (const auto& snapshot : it->second) {
+                    session_last_used = std::max(
+                        session_last_used, snapshot.last_used);
+                }
+                if (victim == states_.end() ||
+                    session_last_used < victim_last_used) {
+                    victim = it;
+                    victim_last_used = session_last_used;
+                }
+            }
+            if (victim == states_.end()) break;
+            close_session(victim->first);
+        }
+        while (bytes_ > max_bytes_) {
+            std::string victim_session;
+            std::size_t victim_snapshot = 0;
+            std::uint64_t victim_last_used = 0;
+            bool found_victim = false;
+            for (const auto& [session_id, history] : states_) {
+                for (std::size_t index = 0; index < history.size(); ++index) {
+                    const auto& snapshot = history[index];
+                    if (session_id == protected_session &&
+                        snapshot.last_used == protected_clock) {
+                        continue;
+                    }
+                    if (!found_victim ||
+                        snapshot.last_used < victim_last_used) {
+                        victim_session = session_id;
+                        victim_snapshot = index;
+                        victim_last_used = snapshot.last_used;
+                        found_victim = true;
+                    }
+                }
+            }
+            if (!found_victim) break;
+            erase_snapshot(
+                victim_session, victim_snapshot, "budget_evict");
+        }
+    }
+
+    void erase_snapshot(
+        const std::string& session_id,
+        std::size_t index,
+        const char* action) {
+        auto found = states_.find(session_id);
+        if (found == states_.end() || index >= found->second.size()) return;
+        const auto removed_bytes = found->second[index].state.bytes;
+        if (trace_) {
+            std::cerr
+                << "server_session_cache backend=metal action=" << action
+                << " session=" << session_id
+                << " tokens=" << found->second[index].state.tokens.size()
+                << " bytes=" << removed_bytes << std::endl;
+        }
+        bytes_ -= removed_bytes;
+        found->second.erase(
+            found->second.begin() + static_cast<std::ptrdiff_t>(index));
+        if (found->second.empty()) states_.erase(found);
+    }
+
+    std::unordered_map<std::string, std::vector<Entry>> states_;
+    std::size_t max_sessions_ = 4;
+    std::size_t max_snapshots_per_session_ = 4;
+    std::size_t max_bytes_ = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+    std::size_t bytes_ = 0;
+    std::uint64_t clock_ = 0;
+    bool trace_ = false;
+};
+
 std::int32_t generate_with_prefill_metrics(
     mfq::metal::MlxQwen35CausalLm& runtime,
     const std::vector<std::int64_t>& prompt,
@@ -294,7 +610,7 @@ std::int32_t generate_with_prefill_metrics(
     std::int32_t max_tokens,
     const MfqTokenCallback& callback,
     const MfqPrefillCallback& on_prefill,
-    const MfqPromptCachePlan&,
+    const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int) {
     return runtime.generate(
@@ -303,7 +619,11 @@ std::int32_t generate_with_prefill_metrics(
         max_tokens,
         callback,
         on_prefill,
-        token_constraint);
+        token_constraint,
+        cache_plan.stable_prefix_tokens > 0
+            ? std::optional<std::size_t>(
+                  cache_plan.stable_prefix_tokens)
+            : std::nullopt);
 }
 
 std::int32_t generate_with_prefill_metrics(
@@ -313,7 +633,7 @@ std::int32_t generate_with_prefill_metrics(
     std::int32_t max_tokens,
     const MfqTokenCallback& callback,
     const MfqPrefillCallback& on_prefill,
-    const MfqPromptCachePlan&,
+    const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int) {
     return runtime.generate(
@@ -322,7 +642,11 @@ std::int32_t generate_with_prefill_metrics(
         max_tokens,
         callback,
         on_prefill,
-        token_constraint);
+        token_constraint,
+        cache_plan.stable_prefix_tokens > 0
+            ? std::optional<std::size_t>(
+                  cache_plan.stable_prefix_tokens)
+            : std::nullopt);
 }
 
 std::int32_t generate_with_prefill_metrics(
@@ -409,10 +733,12 @@ int serve_loaded_runtime(
     auto runtime_holder =
         std::make_shared<std::optional<Runtime>>(
             std::move(runtime));
+    auto session_cache =
+        std::make_shared<MlxServerTextSessionCache<Runtime>>();
     auto loaded_context =
         std::make_shared<std::int64_t>(server.max_context);
     const MfqGenerateFn generate =
-        [runtime_mutex, runtime_holder, runtime_stream,
+        [runtime_mutex, runtime_holder, session_cache, runtime_stream,
          prefill_chunk_size = arguments.prefill_chunk_size](
             const std::vector<std::int64_t>& prompt,
             const MfqSamplingParams& sampling,
@@ -439,8 +765,22 @@ int serve_loaded_runtime(
             parameters.repetition_penalty =
                 sampling.repetition_penalty;
             parameters.seed = sampling.seed;
-            return generate_with_prefill_metrics(
-                runtime_holder->value(),
+            auto& loaded_runtime = runtime_holder->value();
+            const auto stable_prefix_tokens = std::min(
+                cache_plan.stable_prefix_tokens, prompt.size());
+            const bool session_enabled =
+                !cache_plan.session_id.empty() &&
+                stable_prefix_tokens > 0 &&
+                loaded_runtime.supports_text_session_state();
+            if (session_enabled) {
+                (void)session_cache->restore_best(
+                    loaded_runtime,
+                    cache_plan.session_id,
+                    prompt,
+                    stable_prefix_tokens);
+            }
+            const auto generated = generate_with_prefill_metrics(
+                loaded_runtime,
                 prompt,
                 parameters,
                 sampling.max_tokens,
@@ -449,9 +789,29 @@ int serve_loaded_runtime(
                 cache_plan,
                 token_constraint,
                 prefill_chunk_size);
+            if (session_enabled &&
+                loaded_runtime.cache_position() ==
+                    static_cast<int>(stable_prefix_tokens)) {
+                try {
+                    std::vector<std::int64_t> stable_tokens(
+                        prompt.begin(),
+                        prompt.begin() + static_cast<std::ptrdiff_t>(
+                            stable_prefix_tokens));
+                    session_cache->store(
+                        cache_plan.session_id,
+                        loaded_runtime.capture_text_session_state(
+                            stable_tokens));
+                } catch (const std::exception& error) {
+                    std::cerr
+                        << "server_session_cache backend=metal action=skip "
+                        << "session=" << cache_plan.session_id
+                        << " error=" << error.what() << std::endl;
+                }
+            }
+            return generated;
         };
     const MfqReloadFn reload =
-        [runtime_mutex, runtime_holder, loaded_context,
+        [runtime_mutex, runtime_holder, loaded_context, session_cache,
          load_runtime, runtime_stream](
             std::int64_t requested_context) mutable {
             std::lock_guard<std::mutex> lock(*runtime_mutex);
@@ -461,6 +821,7 @@ int serve_loaded_runtime(
             mlx::core::synchronize();
 
             const auto previous_context = *loaded_context;
+            session_cache->clear();
             runtime_holder->reset();
             release_model_load_staging_memory();
             const auto started =
@@ -703,7 +1064,22 @@ int serve_loaded_runtime(
                 };
         }
     }
-    return run_mfq_server(server, generate, reload, duplex);
+    MfqSessionControl session_control;
+    session_control.fork =
+        [runtime_mutex, session_cache](
+            const std::string& source_session_id,
+            const std::string& target_session_id) {
+            std::lock_guard<std::mutex> lock(*runtime_mutex);
+            return session_cache->fork_session(
+                source_session_id, target_session_id);
+        };
+    session_control.close =
+        [runtime_mutex, session_cache](const std::string& session_id) {
+            std::lock_guard<std::mutex> lock(*runtime_mutex);
+            return session_cache->close_session(session_id);
+        };
+    return run_mfq_server(
+        server, generate, reload, duplex, session_control);
 }
 
 int run_native_server(

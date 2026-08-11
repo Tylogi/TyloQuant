@@ -1600,6 +1600,95 @@ void test_generation_stable_prefix_cache() {
         "DeepSeek-V4 length-truncated reroll differs from a fresh runtime");
 }
 
+void test_text_session_snapshot_restore() {
+    mfq::metal::MlxSamplingParams sampling;
+    sampling.temperature = 0.0;
+
+    auto cached = make_model(true, true);
+    auto prefix_logits = cached.prefill(ids({1, 2}));
+    prefix_logits.eval();
+    const auto snapshot =
+        cached.capture_text_session_state({1, 2});
+    require(
+        snapshot.tokens == std::vector<std::int64_t>({1, 2}) &&
+            snapshot.cache_position == 2 &&
+            snapshot.cache_batch == 1 &&
+            snapshot.layers.size() == cached.layer_count() &&
+            snapshot.bytes > 0,
+        "DeepSeek-V4 text session snapshot metadata mismatch");
+    for (const auto& layer : snapshot.layers) {
+        const auto require_compact_pool = [](const auto& pool) {
+            if (pool) {
+                require(
+                    pool->pool().size() == 1,
+                    "DeepSeek-V4 session snapshot retained a full cache pool");
+            }
+        };
+        require_compact_pool(layer.main());
+        require_compact_pool(layer.indexer());
+    }
+
+    auto discarded = cached.decode(ids({3, 4, 5}));
+    discarded.eval();
+    cached.restore_text_session_state(snapshot);
+    require(
+        cached.cache_position() == 2 && cached.cache_batch() == 1,
+        "DeepSeek-V4 text session restore position mismatch");
+
+    std::size_t reused_prefill_tokens = 0;
+    std::vector<std::int64_t> restored_output;
+    (void)cached.generate(
+        {1, 2, 6},
+        sampling,
+        4,
+        [&](std::int64_t token) {
+            restored_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{},
+        512,
+        [&](std::size_t tokens, double) {
+            reused_prefill_tokens = tokens;
+        },
+        2);
+    require(
+        reused_prefill_tokens == 1 && cached.cache_position() == 2,
+        "DeepSeek-V4 restored session did not evaluate only the suffix");
+
+    auto fresh = make_model(true, true);
+    std::vector<std::int64_t> fresh_output;
+    (void)fresh.generate(
+        {1, 2, 6},
+        sampling,
+        4,
+        [&](std::int64_t token) {
+            fresh_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{});
+    require(
+        restored_output == fresh_output,
+        "DeepSeek-V4 restored session changed generated tokens");
+
+    cached.restore_text_session_state(snapshot);
+    std::vector<std::int64_t> repeated_output;
+    (void)cached.generate(
+        {1, 2, 6},
+        sampling,
+        4,
+        [&](std::int64_t token) {
+            repeated_output.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{},
+        512,
+        {},
+        2);
+    require(
+        repeated_output == fresh_output,
+        "DeepSeek-V4 text session snapshot was mutated by resumed decode");
+}
+
 void test_mfq_container_load() {
     const auto path =
         std::filesystem::temp_directory_path() /
@@ -1782,6 +1871,7 @@ int main() {
         test_prefill_decode_and_chunking();
         test_generation_eos_and_callback();
         test_generation_stable_prefix_cache();
+        test_text_session_snapshot_restore();
         test_mfq_container_load();
         test_streamed_mfq_container_lifetime();
         test_validation();

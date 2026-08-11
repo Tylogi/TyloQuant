@@ -391,6 +391,19 @@ public:
         if (cache_) cache_->materialize();
     }
 
+    MlxKvCacheSnapshot snapshot_cache() const {
+        if (!cache_) {
+            throw std::runtime_error(
+                "MiniCPM-o Qwen3 KV cache is unavailable");
+        }
+        return cache_->snapshot();
+    }
+
+    void restore_cache(const MlxKvCacheSnapshot& snapshot) {
+        reset_cache(snapshot.batch, snapshot.capacity);
+        cache_->restore_snapshot(snapshot);
+    }
+
     array forward(
         const array& input,
         const array* positions,
@@ -599,6 +612,7 @@ public:
         }
         cache_position_ = 0;
         cache_batch_ = batch;
+        stable_cache_tokens_.clear();
     }
 
     void materialize_cache() {
@@ -609,11 +623,59 @@ public:
         for (auto& block : blocks_) block.clear_cache();
         cache_position_ = 0;
         cache_batch_ = 0;
+        stable_cache_tokens_.clear();
+    }
+
+    MlxMiniCPMO45TextSessionState capture_text_session_state(
+        const std::vector<std::int64_t>& tokens) const {
+        if (cache_batch_ != 1 || cache_position_ <= 0 ||
+            static_cast<std::size_t>(cache_position_) != tokens.size() ||
+            blocks_.empty()) {
+            throw std::runtime_error(
+                "MiniCPM-o text session token count does not match cache");
+        }
+        MlxMiniCPMO45TextSessionState state;
+        state.tokens = tokens;
+        state.cache_position = cache_position_;
+        state.cache_batch = cache_batch_;
+        state.layers.reserve(blocks_.size());
+        for (const auto& block : blocks_) {
+            auto snapshot = block.snapshot_cache();
+            state.bytes += snapshot.nbytes();
+            state.layers.push_back(std::move(snapshot));
+        }
+        return state;
+    }
+
+    void restore_text_session_state(
+        const MlxMiniCPMO45TextSessionState& state) {
+        if (state.cache_batch != 1 || state.cache_position <= 0 ||
+            static_cast<std::size_t>(state.cache_position) !=
+                state.tokens.size() ||
+            state.layers.size() != blocks_.size()) {
+            throw std::runtime_error(
+                "MiniCPM-o text session state is incompatible");
+        }
+        try {
+            for (std::size_t index = 0; index < blocks_.size(); ++index) {
+                blocks_[index].restore_cache(state.layers[index]);
+            }
+            cache_position_ = state.cache_position;
+            cache_batch_ = state.cache_batch;
+            stable_cache_tokens_ = state.tokens;
+        } catch (...) {
+            clear_cache();
+            throw;
+        }
     }
 
     const MiniQwen3Config& config() const noexcept { return config_; }
     std::size_t layer_count() const noexcept { return blocks_.size(); }
     int cache_position() const noexcept { return cache_position_; }
+    int cache_batch() const noexcept { return cache_batch_; }
+    const std::vector<std::int64_t>& stable_cache_tokens() const noexcept {
+        return stable_cache_tokens_;
+    }
 
 private:
     MiniQwen3Config config_;
@@ -623,6 +685,7 @@ private:
     std::optional<MlxLinear> output_;
     int cache_position_ = 0;
     int cache_batch_ = 0;
+    std::vector<std::int64_t> stable_cache_tokens_;
 };
 
 std::vector<std::int64_t> host_i64(
@@ -1987,6 +2050,85 @@ void test_minicpmo45_qwen3_cache_equivalence() {
             std::to_string(maximum_position_delta) +
             " cache=" + std::to_string(maximum_cache_delta));
     }
+
+    config.tie_embeddings = true;
+    const auto make_language = [&]() {
+        std::vector<float> embedding_values(
+            static_cast<std::size_t>(config.vocab * config.hidden));
+        for (std::size_t index = 0;
+             index < embedding_values.size(); ++index) {
+            embedding_values[index] = 0.11f * std::sin(
+                static_cast<float>(index + 5) * 0.19f);
+        }
+        std::vector<MiniQwen3Block> blocks;
+        blocks.emplace_back(make_block());
+        return MiniQwen3Language(
+            config,
+            MlxEmbedding(mlx::core::astype(
+                array(
+                    embedding_values.begin(),
+                    Shape{config.vocab, config.hidden}),
+                mlx::core::bfloat16)),
+            std::move(blocks),
+            norm(config.hidden),
+            std::nullopt);
+    };
+    const auto ids = [](std::initializer_list<std::int32_t> values) {
+        return array(
+            values,
+            Shape{1, static_cast<int>(values.size())},
+            mlx::core::int32);
+    };
+    const auto evaluated = [](array value) {
+        value = mlx::core::astype(value, mlx::core::float32);
+        value.eval();
+        return std::vector<float>(
+            value.data<float>(), value.data<float>() + value.size());
+    };
+
+    auto resumed_language = make_language();
+    resumed_language.reset_cache(1, 2);
+    auto prefix_logits = resumed_language.forward(ids({1, 2}), true);
+    prefix_logits.eval();
+    const auto snapshot = resumed_language.capture_text_session_state({1, 2});
+    if (snapshot.cache_position != 2 || snapshot.cache_batch != 1 ||
+        snapshot.layers.size() != 1 || snapshot.bytes == 0) {
+        throw std::runtime_error(
+            "MiniCPM-o Qwen3 text session snapshot metadata mismatch");
+    }
+    auto discarded = resumed_language.forward(ids({3, 4}), true);
+    discarded.eval();
+    resumed_language.restore_text_session_state(snapshot);
+    const auto resumed = evaluated(
+        resumed_language.forward(ids({5}), true));
+
+    auto fresh_language = make_language();
+    fresh_language.reset_cache(1, 3);
+    auto fresh_prefix = fresh_language.forward(ids({1, 2}), true);
+    fresh_prefix.eval();
+    const auto fresh = evaluated(fresh_language.forward(ids({5}), true));
+    if (resumed.size() != fresh.size()) {
+        throw std::runtime_error(
+            "MiniCPM-o Qwen3 restored session shape mismatch");
+    }
+    for (std::size_t index = 0; index < fresh.size(); ++index) {
+        if (!std::isfinite(resumed[index]) ||
+            std::fabs(resumed[index] - fresh[index]) > 0.04f) {
+            throw std::runtime_error(
+                "MiniCPM-o Qwen3 restored session numerical mismatch");
+        }
+    }
+
+    resumed_language.restore_text_session_state(snapshot);
+    const auto repeated = evaluated(
+        resumed_language.forward(ids({5}), true));
+    for (std::size_t index = 0; index < fresh.size(); ++index) {
+        if (!std::isfinite(repeated[index]) ||
+            std::fabs(repeated[index] - fresh[index]) > 0.04f) {
+            throw std::runtime_error(
+                "MiniCPM-o Qwen3 session snapshot was mutated by decode");
+        }
+    }
 }
 
 } // namespace detail
@@ -2708,7 +2850,8 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
     std::int32_t max_tokens,
     const std::function<bool(std::int64_t)>& callback,
     const std::function<void(std::size_t, double)>& prefill_callback,
-    const MfqTokenConstraintPtr& token_constraint) {
+    const MfqTokenConstraintPtr& token_constraint,
+    std::optional<std::size_t> stable_prefix_tokens) {
     const auto& config = implementation_->language.config();
     if (prompt.empty() || max_tokens < 0 ||
         prompt.size() > static_cast<std::size_t>(config.maximum_context)) {
@@ -2728,9 +2871,26 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
         implementation_->language.reset_cache(1);
         return 0;
     }
-    implementation_->language.reset_cache(
-        1, static_cast<int>(values.size()));
-    implementation_->language.materialize_cache();
+    const std::size_t stable_count = stable_prefix_tokens
+        ? std::min(*stable_prefix_tokens, prompt.size())
+        : 0;
+    std::size_t reused_tokens = 0;
+    const auto& stable_tokens =
+        implementation_->language.stable_cache_tokens();
+    if (stable_count > 0 &&
+        implementation_->language.cache_batch() == 1 &&
+        implementation_->language.cache_position() ==
+            static_cast<int>(stable_tokens.size()) &&
+        !stable_tokens.empty() && stable_tokens.size() <= stable_count &&
+        stable_tokens.size() < prompt.size() &&
+        std::equal(
+            stable_tokens.begin(), stable_tokens.end(), prompt.begin())) {
+        reused_tokens = stable_tokens.size();
+    } else {
+        implementation_->language.reset_cache(
+            1, static_cast<int>(values.size()));
+        implementation_->language.materialize_cache();
+    }
     const array prompt_ids(
         values.begin(),
         Shape{1, static_cast<int>(values.size())},
@@ -2742,17 +2902,70 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
             prompt_ids);
     }
     double prefill_ms = 0.0;
+    std::optional<MlxMiniCPMO45TextSessionState> stable_snapshot;
+    struct StableStateRestore {
+        MiniQwen3Language& language;
+        std::optional<MlxMiniCPMO45TextSessionState>& snapshot;
+        ~StableStateRestore() noexcept {
+            if (!snapshot) return;
+            try {
+                language.restore_text_session_state(*snapshot);
+            } catch (...) {
+                language.clear_cache();
+            }
+        }
+    } stable_restore{implementation_->language, stable_snapshot};
+
     auto logits = [&]() {
         detail::ScopedMlxEvaluationTiming timing(
             prefill_callback ? &prefill_ms : nullptr);
-        auto result = last_logits(
-            implementation_->language.forward(prompt_ids, true),
-            config.vocab);
+        const auto forward_range = [&](std::size_t begin, std::size_t end) {
+            if (begin >= end || end > prompt.size()) {
+                throw std::runtime_error(
+                    "MiniCPM-o session prefill range is invalid");
+            }
+            auto ids = mlx::core::slice(
+                prompt_ids,
+                Shape{0, static_cast<int>(begin)},
+                Shape{1, static_cast<int>(end)});
+            return last_logits(
+                implementation_->language.forward(ids, true),
+                config.vocab);
+        };
+        std::optional<array> stable_logits;
+        array result = [&]() {
+            if (stable_count == 0) {
+                return forward_range(0, prompt.size());
+            }
+            if (reused_tokens < stable_count) {
+                stable_logits = forward_range(
+                    reused_tokens, stable_count);
+            }
+            if (implementation_->language.cache_position() !=
+                static_cast<int>(stable_count)) {
+                throw std::runtime_error(
+                    "MiniCPM-o stable session cache position mismatch");
+            }
+            std::vector<std::int64_t> prefix(
+                prompt.begin(),
+                prompt.begin() +
+                    static_cast<std::ptrdiff_t>(stable_count));
+            stable_snapshot = implementation_->language
+                .capture_text_session_state(prefix);
+            if (stable_count < prompt.size()) {
+                return forward_range(stable_count, prompt.size());
+            }
+            if (!stable_logits) {
+                throw std::runtime_error(
+                    "MiniCPM-o stable prefix has no sampling logits");
+            }
+            return std::move(*stable_logits);
+        }();
         if (prefill_callback) detail::eval_with_timing(result);
         return result;
     }();
     if (prefill_callback) {
-        prefill_callback(prompt.size(), prefill_ms);
+        prefill_callback(prompt.size() - reused_tokens, prefill_ms);
     }
 
     MlxSampler sampler(sampling);
@@ -2821,6 +3034,18 @@ std::int64_t MlxMiniCPMO45Runtime::vocabulary_size() const noexcept {
 
 int MlxMiniCPMO45Runtime::cache_position() const noexcept {
     return implementation_->language.cache_position();
+}
+
+MlxMiniCPMO45TextSessionState
+MlxMiniCPMO45Runtime::capture_text_session_state(
+    const std::vector<std::int64_t>& tokens) const {
+    return implementation_->language.capture_text_session_state(tokens);
+}
+
+void MlxMiniCPMO45Runtime::restore_text_session_state(
+    const MlxMiniCPMO45TextSessionState& state) {
+    implementation_->duplex.reset();
+    implementation_->language.restore_text_session_state(state);
 }
 
 } // namespace mfq::metal

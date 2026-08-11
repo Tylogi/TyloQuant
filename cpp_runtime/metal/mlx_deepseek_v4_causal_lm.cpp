@@ -1361,6 +1361,82 @@ void MlxDeepseekV4CausalLm::clear_expert_cache() {
     }
 }
 
+namespace {
+
+std::size_t deepseek_v4_pool_snapshot_nbytes(
+    const std::optional<MlxDeepseekV4PoolState>& pool) {
+    if (!pool) return 0;
+    std::size_t bytes =
+        pool->state_kv().nbytes() + pool->state_gate().nbytes();
+    if (pool->prev_kv()) bytes += pool->prev_kv()->nbytes();
+    if (pool->prev_gate()) bytes += pool->prev_gate()->nbytes();
+    if (pool->pool_prefix_backup()) {
+        bytes += pool->pool_prefix_backup()->nbytes();
+    }
+    return bytes;
+}
+
+std::size_t deepseek_v4_layer_snapshot_nbytes(
+    const MlxDeepseekV4LayerState& state) {
+    return state.local_state().nbytes() +
+        deepseek_v4_pool_snapshot_nbytes(state.main()) +
+        deepseek_v4_pool_snapshot_nbytes(state.indexer());
+}
+
+} // namespace
+
+MlxDeepseekV4TextSessionState
+MlxDeepseekV4CausalLm::capture_text_session_state(
+    const std::vector<std::int64_t>& tokens) const {
+    if (cache_batch_ != 1 || cache_position_ <= 0 ||
+        static_cast<std::size_t>(cache_position_) != tokens.size() ||
+        states_.size() != layers_.size()) {
+        throw std::runtime_error(
+            "DeepSeek-V4 text session token count does not match cache");
+    }
+    MlxDeepseekV4TextSessionState state;
+    state.tokens = tokens;
+    state.cache_position = cache_position_;
+    state.cache_batch = cache_batch_;
+    state.layers.reserve(states_.size());
+    for (const auto& layer : states_) {
+        auto snapshot = layer.snapshot();
+        materialize_state(snapshot);
+        state.bytes += deepseek_v4_layer_snapshot_nbytes(snapshot);
+        state.layers.push_back(std::move(snapshot));
+    }
+    return state;
+}
+
+void MlxDeepseekV4CausalLm::restore_text_session_state(
+    const MlxDeepseekV4TextSessionState& state) {
+    if (state.cache_batch != 1 || state.cache_position <= 0 ||
+        static_cast<std::size_t>(state.cache_position) !=
+            state.tokens.size() ||
+        state.layers.size() != layers_.size()) {
+        throw std::runtime_error(
+            "DeepSeek-V4 text session state is incompatible");
+    }
+    try {
+        if (states_.size() != layers_.size() || cache_batch_ != 1) {
+            reset_cache(1);
+        }
+        for (std::size_t index = 0; index < states_.size(); ++index) {
+            // snapshot() performs the second deep copy required to keep the
+            // saved session immutable while the restored runtime advances.
+            states_[index].restore_snapshot(
+                state.layers[index].snapshot());
+            materialize_state(states_[index]);
+        }
+        cache_position_ = state.cache_position;
+        cache_batch_ = state.cache_batch;
+        stable_cache_tokens_ = state.tokens;
+    } catch (...) {
+        clear_cache();
+        throw;
+    }
+}
+
 std::int32_t MlxDeepseekV4CausalLm::generate(
     const std::vector<std::int64_t>& prompt,
     const MlxSamplingParams& sampling,
@@ -1428,12 +1504,12 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
             Shape{vocab},
             mlx::core::int32),
         prompt_ids);
-    const bool retain_stable_prefix =
-        stable_prefix_tokens.has_value() &&
-        *stable_prefix_tokens > 0 &&
-        *stable_prefix_tokens < prompt.size();
+    const std::size_t requested_stable_count = stable_prefix_tokens
+        ? std::min(*stable_prefix_tokens, prompt.size())
+        : 0;
+    const bool retain_stable_prefix = requested_stable_count > 0;
     const std::size_t stable_count = retain_stable_prefix
-        ? *stable_prefix_tokens
+        ? requested_stable_count
         : 0;
     std::size_t reused_tokens = 0;
     if (retain_stable_prefix &&
@@ -1442,6 +1518,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
             static_cast<int>(stable_cache_tokens_.size()) &&
         !stable_cache_tokens_.empty() &&
         stable_cache_tokens_.size() <= stable_count &&
+        stable_cache_tokens_.size() < prompt.size() &&
         stable_cache_tokens_.size() <= prompt.size() &&
         std::equal(
             stable_cache_tokens_.begin(),

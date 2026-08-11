@@ -2,6 +2,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DECODE = (ROOT / "cpp_runtime" / "mfq_decode.cpp").read_text(encoding="utf-8")
+METAL_DECODE = (ROOT / "cpp_runtime" / "metal" / "mfq_decode_mlx.cpp").read_text(
+    encoding="utf-8"
+)
+METAL_QWEN = (
+    ROOT / "cpp_runtime" / "metal" / "mlx_qwen35_causal_lm.cpp"
+).read_text(encoding="utf-8")
+METAL_DSV4 = (
+    ROOT / "cpp_runtime" / "metal" / "mlx_deepseek_v4_causal_lm.cpp"
+).read_text(encoding="utf-8")
+METAL_MINICPM = (
+    ROOT / "cpp_runtime" / "metal" / "mlx_minicpmo45.cpp"
+).read_text(encoding="utf-8")
 SERVER = (ROOT / "cpp_runtime" / "mfq_server.cpp").read_text(encoding="utf-8")
 HEADER = (ROOT / "cpp_runtime" / "mfq_server.h").read_text(encoding="utf-8")
 
@@ -64,3 +76,21 @@ def test_session_cache_retains_history_and_exposes_lifecycle_controls() -> None:
     assert 'server.Post("/api/runtime/sessions/fork"' in SERVER
     assert 'R"(/api/runtime/sessions/' in SERVER
     assert "MfqSessionControl" in HEADER
+
+
+def test_metal_runtime_matches_native_session_lifecycle_and_limits() -> None:
+    assert "class MlxServerTextSessionCache" in METAL_DECODE
+    assert "MFQ_SERVER_MAX_KV_SESSIONS" in METAL_DECODE
+    assert "MFQ_SERVER_MAX_KV_SNAPSHOTS_PER_SESSION" in METAL_DECODE
+    assert "MFQ_SERVER_KV_SESSION_BYTES" in METAL_DECODE
+    assert "fork_session(" in METAL_DECODE
+    assert "close_session(" in METAL_DECODE
+    assert "MfqSessionControl session_control" in METAL_DECODE
+    assert "backend=metal" in METAL_DECODE
+
+
+def test_all_metal_text_graphs_capture_and_restore_prefix_state() -> None:
+    for source in (METAL_QWEN, METAL_DSV4, METAL_MINICPM):
+        assert "capture_text_session_state" in source
+        assert "restore_text_session_state" in source
+        assert "prompt.size() - reused_tokens" in source

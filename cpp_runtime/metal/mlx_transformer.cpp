@@ -472,4 +472,62 @@ std::pair<array, array> MlxKvCache::view() const {
     };
 }
 
+MlxKvCacheSnapshot MlxKvCache::snapshot() const {
+    if (position_ <= 0 || position_ > capacity()) {
+        throw std::runtime_error(
+            "cannot snapshot an empty or inconsistent KV cache");
+    }
+    auto visible = view();
+    auto key = mlx::core::astype(
+        visible.first, dtype_, true);
+    auto value = mlx::core::astype(
+        visible.second, dtype_, true);
+    mlx::core::eval(key, value);
+    return MlxKvCacheSnapshot{
+        batch_,
+        heads_,
+        maximum_sequence_,
+        head_dimension_,
+        capacity(),
+        position_,
+        dtype_,
+        std::move(key),
+        std::move(value),
+    };
+}
+
+void MlxKvCache::restore_snapshot(
+    const MlxKvCacheSnapshot& snapshot) {
+    if (snapshot.batch != batch_ || snapshot.heads != heads_ ||
+        snapshot.maximum_sequence != maximum_sequence_ ||
+        snapshot.head_dimension != head_dimension_ ||
+        snapshot.dtype != dtype_ || snapshot.capacity <= 0 ||
+        snapshot.capacity > maximum_sequence_ || snapshot.position <= 0 ||
+        snapshot.position > snapshot.capacity || snapshot.key.ndim() != 4 ||
+        snapshot.value.shape() != snapshot.key.shape() ||
+        snapshot.key.shape() != Shape{
+            batch_, heads_, snapshot.position, head_dimension_} ||
+        snapshot.key.dtype() != dtype_ || snapshot.value.dtype() != dtype_) {
+        throw std::runtime_error("KV cache snapshot topology mismatch");
+    }
+    const Shape allocation_shape{
+        batch_, heads_, snapshot.capacity, head_dimension_};
+    auto key = mlx::core::zeros(allocation_shape, dtype_);
+    auto value = mlx::core::zeros(allocation_shape, dtype_);
+    key = mlx::core::slice_update(
+        key,
+        mlx::core::astype(snapshot.key, dtype_, true),
+        Shape{0, 0, 0, 0},
+        Shape{batch_, heads_, snapshot.position, head_dimension_});
+    value = mlx::core::slice_update(
+        value,
+        mlx::core::astype(snapshot.value, dtype_, true),
+        Shape{0, 0, 0, 0},
+        Shape{batch_, heads_, snapshot.position, head_dimension_});
+    mlx::core::eval(key, value);
+    key_ = std::move(key);
+    value_ = std::move(value);
+    position_ = snapshot.position;
+}
+
 } // namespace mfq::metal

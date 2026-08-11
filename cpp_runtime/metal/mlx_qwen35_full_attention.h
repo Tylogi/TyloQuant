@@ -135,6 +135,8 @@ public:
         int initial_capacity = 16);
     void materialize_cache();
     void clear_cache() noexcept;
+    MlxKvCacheSnapshot snapshot_cache() const;
+    void restore_cache(const MlxKvCacheSnapshot& snapshot);
 
     int cache_position() const noexcept;
     int cache_batch() const noexcept {

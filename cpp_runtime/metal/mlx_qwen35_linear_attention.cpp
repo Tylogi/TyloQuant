@@ -424,6 +424,54 @@ void MlxQwen35LinearAttentionBlock::clear_cache() noexcept {
     cache_batch_ = 0;
 }
 
+MlxQwen35LinearAttentionCacheSnapshot
+MlxQwen35LinearAttentionBlock::snapshot_cache() const {
+    if (!convolution_state_ || !recurrent_state_ ||
+        cache_position_ <= 0 || cache_batch_ <= 0) {
+        throw std::runtime_error(
+            "Qwen3.5 linear-attention cache is unavailable");
+    }
+    auto convolution = mlx::core::astype(
+        *convolution_state_, convolution_state_->dtype(), true);
+    auto recurrent = mlx::core::astype(
+        *recurrent_state_, recurrent_state_->dtype(), true);
+    mlx::core::eval(convolution, recurrent);
+    return {
+        std::move(convolution),
+        std::move(recurrent),
+        cache_position_,
+        cache_batch_,
+    };
+}
+
+void MlxQwen35LinearAttentionBlock::restore_cache(
+    const MlxQwen35LinearAttentionCacheSnapshot& snapshot) {
+    const int channels = static_cast<int>(config_.linear_qkv_size());
+    const int kernel = static_cast<int>(config_.linear_conv_kernel_dim);
+    const int value_heads = static_cast<int>(config_.linear_value_heads());
+    const int dimension = static_cast<int>(config_.linear_value_head_dim);
+    if (snapshot.batch <= 0 || snapshot.position <= 0 ||
+        snapshot.position > config_.max_position_embeddings ||
+        snapshot.convolution_state.shape() !=
+            Shape{snapshot.batch, kernel - 1, channels} ||
+        snapshot.recurrent_state.shape() !=
+            Shape{snapshot.batch, value_heads, dimension, dimension} ||
+        snapshot.convolution_state.dtype() != mlx::core::float32 ||
+        snapshot.recurrent_state.dtype() != mlx::core::float32) {
+        throw std::runtime_error(
+            "Qwen3.5 linear-attention cache snapshot topology mismatch");
+    }
+    auto convolution = mlx::core::astype(
+        snapshot.convolution_state, mlx::core::float32, true);
+    auto recurrent = mlx::core::astype(
+        snapshot.recurrent_state, mlx::core::float32, true);
+    mlx::core::eval(convolution, recurrent);
+    convolution_state_ = std::move(convolution);
+    recurrent_state_ = std::move(recurrent);
+    cache_position_ = snapshot.position;
+    cache_batch_ = snapshot.batch;
+}
+
 array MlxQwen35LinearAttentionBlock::forward(
     const array& input,
     bool use_cache) {

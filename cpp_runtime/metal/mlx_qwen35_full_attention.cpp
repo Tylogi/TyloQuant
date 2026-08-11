@@ -380,6 +380,26 @@ void MlxQwen35FullAttentionBlock::clear_cache() noexcept {
     cache_batch_ = 0;
 }
 
+MlxKvCacheSnapshot
+MlxQwen35FullAttentionBlock::snapshot_cache() const {
+    if (!cache_ || cache_batch_ <= 0) {
+        throw std::runtime_error(
+            "Qwen3.5 full-attention cache is unavailable");
+    }
+    return cache_->snapshot();
+}
+
+void MlxQwen35FullAttentionBlock::restore_cache(
+    const MlxKvCacheSnapshot& snapshot) {
+    if (snapshot.batch <= 0 || snapshot.position <= 0) {
+        throw std::runtime_error(
+            "Qwen3.5 full-attention cache snapshot is invalid");
+    }
+    reset_cache(snapshot.batch, snapshot.capacity);
+    cache_->restore_snapshot(snapshot);
+    cache_batch_ = snapshot.batch;
+}
+
 int MlxQwen35FullAttentionBlock::cache_position() const noexcept {
     return cache_ ? cache_->position() : 0;
 }

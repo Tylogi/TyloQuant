@@ -115,6 +115,14 @@ private:
 using MlxDeepseekV4TokenCallback =
     std::function<bool(std::int64_t)>;
 
+struct MlxDeepseekV4TextSessionState {
+    std::vector<std::int64_t> tokens;
+    std::vector<MlxDeepseekV4LayerState> layers;
+    int cache_position = 0;
+    int cache_batch = 0;
+    std::size_t bytes = 0;
+};
+
 // Complete native C++/MLX DeepSeek-V4 text runtime. It owns all layer caches
 // and never invokes Python or a subprocess.
 class MlxDeepseekV4CausalLm {
@@ -219,6 +227,13 @@ public:
     std::size_t expert_resident_packed_bytes() const;
     std::size_t cached_expert_count() const;
     void clear_expert_cache();
+    MlxDeepseekV4TextSessionState capture_text_session_state(
+        const std::vector<std::int64_t>& tokens) const;
+    void restore_text_session_state(
+        const MlxDeepseekV4TextSessionState& state);
+    bool supports_text_session_state() const noexcept {
+        return true;
+    }
 
 private:
     void validate_components() const;

@@ -35,6 +35,18 @@ using MlxQwen35Layer = std::variant<
     MlxQwen35FullAttentionBlock,
     MlxQwen35LinearAttentionBlock>;
 
+using MlxQwen35LayerCacheSnapshot = std::variant<
+    MlxKvCacheSnapshot,
+    MlxQwen35LinearAttentionCacheSnapshot>;
+
+struct MlxQwen35TextSessionState {
+    std::vector<std::int64_t> tokens;
+    std::vector<MlxQwen35LayerCacheSnapshot> layers;
+    int cache_position = 0;
+    int cache_batch = 0;
+    std::size_t bytes = 0;
+};
+
 using MlxTokenCallback = std::function<bool(std::int64_t)>;
 
 class MlxQwen35CausalLm {
@@ -94,7 +106,17 @@ public:
         const MlxTokenCallback& callback = {},
         const std::function<void(std::size_t, double)>&
             prefill_callback = {},
-        const MfqTokenConstraintPtr& token_constraint = {});
+        const MfqTokenConstraintPtr& token_constraint = {},
+        std::optional<std::size_t> stable_prefix_tokens =
+            std::nullopt);
+
+    MlxQwen35TextSessionState capture_text_session_state(
+        const std::vector<std::int64_t>& tokens) const;
+    void restore_text_session_state(
+        const MlxQwen35TextSessionState& state);
+    bool supports_text_session_state() const noexcept {
+        return true;
+    }
 
     const Qwen35Config& config() const noexcept {
         return config_;
@@ -128,6 +150,7 @@ private:
     mlx::core::Dtype activation_dtype_;
     int cache_position_ = 0;
     int cache_batch_ = 0;
+    std::vector<std::int64_t> stable_cache_tokens_;
 };
 
 } // namespace mfq::metal

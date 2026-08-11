@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <utility>
@@ -8,6 +9,22 @@
 #include <mlx/mlx.h>
 
 namespace mfq::metal {
+
+struct MlxKvCacheSnapshot {
+    int batch = 0;
+    int heads = 0;
+    int maximum_sequence = 0;
+    int head_dimension = 0;
+    int capacity = 0;
+    int position = 0;
+    mlx::core::Dtype dtype = mlx::core::float16;
+    mlx::core::array key = mlx::core::array(0.0f);
+    mlx::core::array value = mlx::core::array(0.0f);
+
+    std::size_t nbytes() const noexcept {
+        return key.nbytes() + value.nbytes();
+    }
+};
 
 class MlxRmsNorm {
 public:
@@ -77,6 +94,12 @@ public:
         const mlx::core::array& value);
 
     std::pair<mlx::core::array, mlx::core::array> view() const;
+
+    // Session snapshots own a compact copy of the visible prefix. Restoring
+    // recreates the original allocation capacity without aliasing the saved
+    // arrays, so a resumed decode cannot mutate another session snapshot.
+    MlxKvCacheSnapshot snapshot() const;
+    void restore_snapshot(const MlxKvCacheSnapshot& snapshot);
 
     int position() const noexcept {
         return position_;

@@ -647,6 +647,85 @@ void test_prefill_decode_and_reset() {
         "mixed model clear_cache did not release state");
 }
 
+void test_text_session_snapshot_restore() {
+    mfq::metal::MlxSamplingParams sampling;
+    sampling.temperature = 0.0;
+
+    auto cached = make_model();
+    auto prefix_logits = cached.forward(token_ids({1, 2}), true);
+    prefix_logits.eval();
+    const auto snapshot =
+        cached.capture_text_session_state({1, 2});
+    require(
+        snapshot.tokens == std::vector<std::int64_t>({1, 2}) &&
+            snapshot.cache_position == 2 &&
+            snapshot.cache_batch == 1 &&
+            snapshot.layers.size() == cached.layer_count() &&
+            snapshot.bytes > 0,
+        "Qwen3.5 text session snapshot metadata mismatch");
+
+    // Advance far enough to mutate both the recurrent linear-attention state
+    // and the full-attention KV cache, then restore the saved prefix.
+    auto discarded = cached.forward(token_ids({3, 4}), true);
+    discarded.eval();
+    cached.restore_text_session_state(snapshot);
+    require(
+        cached.cache_position() == 2 && cached.cache_batch() == 1,
+        "Qwen3.5 text session restore position mismatch");
+
+    std::size_t reused_prefill_tokens = 0;
+    std::vector<std::int64_t> restored_output;
+    (void)cached.generate(
+        {1, 2, 5},
+        sampling,
+        3,
+        [&](std::int64_t token) {
+            restored_output.push_back(token);
+            return true;
+        },
+        [&](std::size_t tokens, double) {
+            reused_prefill_tokens = tokens;
+        },
+        {},
+        2);
+    require(
+        reused_prefill_tokens == 1 && cached.cache_position() == 2,
+        "Qwen3.5 restored session did not evaluate only the suffix");
+
+    auto fresh = make_model();
+    std::vector<std::int64_t> fresh_output;
+    (void)fresh.generate(
+        {1, 2, 5},
+        sampling,
+        3,
+        [&](std::int64_t token) {
+            fresh_output.push_back(token);
+            return true;
+        });
+    require(
+        restored_output == fresh_output,
+        "Qwen3.5 restored session changed generated tokens");
+
+    // Reuse the same saved object after a completed decode. Session snapshots
+    // must own their arrays rather than aliasing the runtime cache.
+    cached.restore_text_session_state(snapshot);
+    std::vector<std::int64_t> repeated_output;
+    (void)cached.generate(
+        {1, 2, 5},
+        sampling,
+        3,
+        [&](std::int64_t token) {
+            repeated_output.push_back(token);
+            return true;
+        },
+        {},
+        {},
+        2);
+    require(
+        repeated_output == fresh_output,
+        "Qwen3.5 text session snapshot was mutated by resumed decode");
+}
+
 void test_tied_embedding_forward_cache_and_generate() {
     const auto config = test_config(true);
     const auto ids = token_ids({1, 4, 2});
@@ -1065,6 +1144,7 @@ int main() {
         test_explicit_mrope_cache_continuity();
         test_explicit_position_validation();
         test_prefill_decode_and_reset();
+        test_text_session_snapshot_restore();
         test_tied_embedding_forward_cache_and_generate();
         test_generation_greedy_seed_and_penalties();
         test_callback_stop_count();

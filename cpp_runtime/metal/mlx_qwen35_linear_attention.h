@@ -11,6 +11,17 @@
 
 namespace mfq::metal {
 
+struct MlxQwen35LinearAttentionCacheSnapshot {
+    mlx::core::array convolution_state = mlx::core::array(0.0f);
+    mlx::core::array recurrent_state = mlx::core::array(0.0f);
+    int position = 0;
+    int batch = 0;
+
+    std::size_t nbytes() const noexcept {
+        return convolution_state.nbytes() + recurrent_state.nbytes();
+    }
+};
+
 // Qwen3.5/3.6 Gated DeltaNet decoder block.
 //
 // The block accepts either the combined qkv projection used by GGUF MFQ
@@ -76,6 +87,9 @@ public:
     void reset_cache(int batch);
     void materialize_cache();
     void clear_cache() noexcept;
+    MlxQwen35LinearAttentionCacheSnapshot snapshot_cache() const;
+    void restore_cache(
+        const MlxQwen35LinearAttentionCacheSnapshot& snapshot);
 
     int cache_position() const noexcept {
         return cache_position_;
