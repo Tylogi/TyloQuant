@@ -50,7 +50,7 @@ def test_studio_drains_duplex_output_after_microphone_capture_stops():
     assert "MAX_RESPONSE_DRAIN_STEPS" in REALTIME_AUDIO
     assert "event.end_of_turn === true" in REALTIME_AUDIO
     assert "this.sendInput(new Float32Array(CHUNK_SAMPLES))" in REALTIME_AUDIO
-    assert "this.callbacks.onText(this.turnText)" in REALTIME_AUDIO
+    assert "this.callbacks.onText(target.buffer.sessionId, target.buffer.text)" in REALTIME_AUDIO
 
 
 def test_studio_uses_the_model_bound_duplex_system_prompt():
@@ -58,4 +58,38 @@ def test_studio_uses_the_model_bound_duplex_system_prompt():
     assert 'runtime?.duplex_sampling_defaults ?? realtime?.defaults' in APP
     assert "system_prompt: config.systemPrompt" in REALTIME_AUDIO
     assert "text_repetition_penalty: config.repetitionPenalty" in REALTIME_AUDIO
-    assert "submitText(text, realtimeSessionConfig())" in APP
+    assert "submitText(text, realtimeSessionConfig(active.id))" in APP
+
+
+def test_realtime_turns_remain_bound_to_the_session_that_created_them():
+    assert "sessionId: string;" in REALTIME_AUDIO
+    assert "private clientSessionId: string | null = null" in REALTIME_AUDIO
+    assert "sessionId: buffer.sessionId" in REALTIME_AUDIO
+    assert "onTurn: ({ id, sessionId, text, audio })" in APP
+    assert "activeIdRef" not in APP
+
+
+def test_full_duplex_user_speech_visually_splits_assistant_turns():
+    assert "SPEECH_RMS_THRESHOLD" in REALTIME_AUDIO
+    assert "this.finishTurn();\n    this.inputTurnId = crypto.randomUUID()" in REALTIME_AUDIO
+    assert "this.callbacks.onInputStart" in REALTIME_AUDIO
+    assert "this.callbacks.onInputEnd" in REALTIME_AUDIO
+    assert 'role: "user"' in APP
+    assert "message.pending" in APP
+
+
+def test_full_duplex_routes_pre_interrupt_response_tails_back_to_the_old_turn():
+    assert "private pendingResponseTurns" in REALTIME_AUDIO
+    assert "private responseTurnIds" in REALTIME_AUDIO
+    assert "private currentInputTurnId" in REALTIME_AUDIO
+    assert "private responseMessageIds" in REALTIME_AUDIO
+    assert "private completedTurns" in REALTIME_AUDIO
+    assert "this.lastCompletedByInputTurn.get(inputTurnId)" in REALTIME_AUDIO
+    assert "this.publishTurn(target.buffer)" in REALTIME_AUDIO
+    assert "message.id === id ? { ...message, text }" in APP
+
+
+def test_closing_a_full_duplex_microphone_stops_instead_of_forcing_speech():
+    assert "finishFullDuplexInput" not in REALTIME_AUDIO
+    assert "} else if (this.inputContext) {\n      await this.stop();" in REALTIME_AUDIO
+    assert "this.stopPlayback();" in REALTIME_AUDIO

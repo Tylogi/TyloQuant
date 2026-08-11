@@ -6,12 +6,18 @@ const CHUNK_SAMPLES = INPUT_RATE;
 const SPEAK_TOKENS = 20;
 const MAX_RESPONSE_DRAIN_STEPS = 120;
 const PLAYBACK_DELAY_SECONDS = 0.2;
+const SPEECH_RMS_THRESHOLD = 0.015;
+const SPEECH_START_SAMPLES = Math.round(INPUT_RATE * 0.08);
+const SPEECH_END_SAMPLES = Math.round(INPUT_RATE * 0.7);
+const SPEECH_PREROLL_SAMPLES = Math.round(INPUT_RATE * 0.25);
+const MIN_USER_TURN_SAMPLES = Math.round(INPUT_RATE * 0.12);
 const AUDIO_DATABASE = "mfq.studio.audio.v1";
 const AUDIO_STORE = "clips";
 
 export type VoiceState = "idle" | "connecting" | "listening" | "processing" | "error";
 
 export interface RealtimeSessionConfig {
+  sessionId: string;
   systemPrompt: string;
   temperature: number;
   topP: number;
@@ -20,14 +26,33 @@ export interface RealtimeSessionConfig {
 }
 
 export interface VoiceTurn {
+  id: string;
+  sessionId: string;
   text: string;
   audio: Blob | null;
+}
+
+export interface VoiceInputTurn {
+  id: string;
+  sessionId: string;
+  audio?: Blob | null;
+}
+
+interface BufferedVoiceTurn {
+  id: string;
+  sessionId: string;
+  inputTurnId: string | null;
+  text: string;
+  audio: Float32Array[];
+  audioRate: number;
 }
 
 export interface RealtimeCallbacks {
   onState(state: VoiceState): void;
   onLevel(level: number): void;
-  onText(text: string): void;
+  onText(sessionId: string, text: string): void;
+  onInputStart(turn: VoiceInputTurn): void;
+  onInputEnd(turn: VoiceInputTurn): void;
   onTurn(turn: VoiceTurn): void;
   onError(message: string): void;
 }
@@ -138,20 +163,40 @@ export class RealtimeAudioController {
   private capture: AudioWorkletNode | null = null;
   private pending: Float32Array[] = [];
   private pendingLength = 0;
-  private outbound: Array<{ samples: Float32Array; forceListen?: boolean; forceSpeak?: boolean }> = [];
-  private pendingText: string[] = [];
+  private outbound: Array<{
+    samples: Float32Array;
+    forceListen?: boolean;
+    forceSpeak?: boolean;
+    turnId: string | null;
+  }> = [];
+  private pendingText: Array<{ text: string; turnId: string }> = [];
+  private pendingResponseTurns: Array<string | null> = [];
+  private responseTurnIds = new Map<string, string | null>();
+  private responseTurnOrder: string[] = [];
+  private responseMessageIds = new Map<string, string>();
+  private currentInputTurnId: string | null = null;
   private heldHalfDuplexChunk: Float32Array | null = null;
   private halfDuplexPendingSteps = 0;
   private awaitingHalfDuplexResponse = false;
   private responseDrainSteps = 0;
   private currentStepWasListen = false;
   private sessionReady = false;
+  private clientSessionId: string | null = null;
   private stopping = false;
+  private stopPromise: Promise<void> | null = null;
   private playAt = 0;
   private playing = new Set<AudioBufferSourceNode>();
-  private turnText = "";
-  private turnAudio: Float32Array[] = [];
-  private turnAudioRate = OUTPUT_RATE;
+  private activeTurn: BufferedVoiceTurn | null = null;
+  private completedTurns = new Map<string, BufferedVoiceTurn>();
+  private completedTurnOrder: string[] = [];
+  private lastCompletedByInputTurn = new Map<string | null, string>();
+  private inputTurnId: string | null = null;
+  private inputTurnChunks: Float32Array[] = [];
+  private inputTurnSamples = 0;
+  private speechPreroll: Float32Array[] = [];
+  private speechPrerollSamples = 0;
+  private speechAboveSamples = 0;
+  private speechSilenceSamples = 0;
 
   constructor(
     private readonly callbacks: RealtimeCallbacks,
@@ -190,7 +235,11 @@ export class RealtimeAudioController {
   }
 
   private async connect(config: RealtimeSessionConfig, capture: boolean): Promise<void> {
+    if (this.clientSessionId && this.clientSessionId !== config.sessionId) {
+      await this.stop();
+    }
     if (this.inputContext || this.awaitingHalfDuplexResponse) return;
+    this.clientSessionId = config.sessionId;
     if (this.socket?.readyState === WebSocket.OPEN && this.sessionReady) {
       if (capture) {
         await this.startAudio();
@@ -229,15 +278,17 @@ export class RealtimeAudioController {
     if (this.inputContext && !this.fullDuplexEnabled) {
       await this.finishHalfDuplexInput();
     } else if (this.inputContext) {
-      await this.finishFullDuplexInput();
+      await this.stop();
     } else if (!this.awaitingHalfDuplexResponse) {
       await this.start(config);
     }
   }
 
-  sendText(value: string): void {
+  sendText(value: string, turnId: string = crypto.randomUUID()): void {
     const text = value.trim();
     if (!text) return;
+    this.finishTurn();
+    this.currentInputTurnId = turnId;
     if (!this.inputContext) {
       this.halfDuplexPendingSteps += 1;
       this.awaitingHalfDuplexResponse = true;
@@ -246,9 +297,10 @@ export class RealtimeAudioController {
       this.callbacks.onState("processing");
     }
     if (this.socket?.readyState !== WebSocket.OPEN || !this.sessionReady) {
-      this.pendingText.push(text);
+      this.pendingText.push({ text, turnId });
       return;
     }
+    this.pendingResponseTurns.push(turnId);
     this.socket.send(
       JSON.stringify({
         type: "input.append",
@@ -258,7 +310,17 @@ export class RealtimeAudioController {
   }
 
   async stop(sendClose = true): Promise<void> {
-    if (this.stopping) return;
+    if (this.stopPromise) return this.stopPromise;
+    const pending = this.performStop(sendClose);
+    this.stopPromise = pending;
+    try {
+      await pending;
+    } finally {
+      if (this.stopPromise === pending) this.stopPromise = null;
+    }
+  }
+
+  private async performStop(sendClose: boolean): Promise<void> {
     this.stopping = true;
     if (sendClose && this.socket?.readyState === WebSocket.OPEN) {
       this.socket.send(JSON.stringify({ type: "session.close", reason: "user_stop" }));
@@ -267,6 +329,7 @@ export class RealtimeAudioController {
     this.socket = null;
     socket?.close();
     await this.stopInputCapture();
+    this.finishInputTurn();
     this.stopPlayback();
     await this.outputContext?.close().catch(() => undefined);
     this.outputContext = null;
@@ -274,6 +337,10 @@ export class RealtimeAudioController {
     this.pendingLength = 0;
     this.outbound = [];
     this.pendingText = [];
+    this.pendingResponseTurns = [];
+    this.responseTurnIds.clear();
+    this.responseTurnOrder = [];
+    this.currentInputTurnId = null;
     this.heldHalfDuplexChunk = null;
     this.halfDuplexPendingSteps = 0;
     this.awaitingHalfDuplexResponse = false;
@@ -282,6 +349,12 @@ export class RealtimeAudioController {
     this.sessionReady = false;
     this.playAt = 0;
     this.finishTurn();
+    this.responseMessageIds.clear();
+    this.completedTurns.clear();
+    this.completedTurnOrder = [];
+    this.lastCompletedByInputTurn.clear();
+    this.clientSessionId = null;
+    this.resetSpeechDetector();
     this.callbacks.onLevel(0);
     this.callbacks.onState("idle");
     this.stopping = false;
@@ -323,10 +396,10 @@ export class RealtimeAudioController {
     if (!this.inputContext) return;
     let energy = 0;
     for (const sample of samples) energy += sample * sample;
-    this.callbacks.onLevel(
-      Math.min(1, Math.sqrt(energy / Math.max(1, samples.length)) * 10),
-    );
+    const rms = Math.sqrt(energy / Math.max(1, samples.length));
+    this.callbacks.onLevel(Math.min(1, rms * 10));
     const converted = resample(samples, this.inputContext.sampleRate, INPUT_RATE);
+    this.trackUserInput(converted, rms);
     this.pending.push(converted);
     this.pendingLength += converted.length;
     while (this.pendingLength >= CHUNK_SAMPLES) {
@@ -341,6 +414,86 @@ export class RealtimeAudioController {
         this.heldHalfDuplexChunk = chunk;
       }
     }
+  }
+
+  private beginInputTurn(chunks: Float32Array[] = []): void {
+    if (this.inputTurnId || !this.clientSessionId) return;
+    this.finishTurn();
+    this.inputTurnId = crypto.randomUUID();
+    this.currentInputTurnId = this.inputTurnId;
+    this.inputTurnChunks = chunks.map((chunk) => new Float32Array(chunk));
+    this.inputTurnSamples = this.inputTurnChunks.reduce(
+      (total, chunk) => total + chunk.length,
+      0,
+    );
+    this.callbacks.onInputStart({
+      id: this.inputTurnId,
+      sessionId: this.clientSessionId,
+    });
+  }
+
+  private appendInputTurn(samples: Float32Array): void {
+    if (!this.inputTurnId) this.beginInputTurn();
+    if (!this.inputTurnId) return;
+    this.inputTurnChunks.push(new Float32Array(samples));
+    this.inputTurnSamples += samples.length;
+  }
+
+  private finishInputTurn(): void {
+    const id = this.inputTurnId;
+    const sessionId = this.clientSessionId;
+    if (!id || !sessionId) return;
+    const audio =
+      this.inputTurnSamples >= MIN_USER_TURN_SAMPLES
+        ? wavBlob(this.inputTurnChunks, INPUT_RATE)
+        : null;
+    this.inputTurnId = null;
+    this.inputTurnChunks = [];
+    this.inputTurnSamples = 0;
+    this.callbacks.onInputEnd({ id, sessionId, audio });
+  }
+
+  private trackUserInput(samples: Float32Array, rms: number): void {
+    if (!this.fullDuplexEnabled) {
+      this.appendInputTurn(samples);
+      return;
+    }
+    if (this.inputTurnId) {
+      this.appendInputTurn(samples);
+      this.speechSilenceSamples =
+        rms < SPEECH_RMS_THRESHOLD ? this.speechSilenceSamples + samples.length : 0;
+      if (this.speechSilenceSamples >= SPEECH_END_SAMPLES) {
+        this.finishInputTurn();
+        this.speechSilenceSamples = 0;
+        this.speechAboveSamples = 0;
+      }
+      return;
+    }
+    this.speechPreroll.push(new Float32Array(samples));
+    this.speechPrerollSamples += samples.length;
+    while (
+      this.speechPreroll.length > 1 &&
+      this.speechPrerollSamples > SPEECH_PREROLL_SAMPLES
+    ) {
+      this.speechPrerollSamples -= this.speechPreroll.shift()!.length;
+    }
+    this.speechAboveSamples =
+      rms >= SPEECH_RMS_THRESHOLD ? this.speechAboveSamples + samples.length : 0;
+    if (this.speechAboveSamples >= SPEECH_START_SAMPLES) {
+      const preroll = this.speechPreroll;
+      this.speechPreroll = [];
+      this.speechPrerollSamples = 0;
+      this.speechAboveSamples = 0;
+      this.speechSilenceSamples = 0;
+      this.beginInputTurn(preroll);
+    }
+  }
+
+  private resetSpeechDetector(): void {
+    this.speechPreroll = [];
+    this.speechPrerollSamples = 0;
+    this.speechAboveSamples = 0;
+    this.speechSilenceSamples = 0;
   }
 
   private takeChunk(): Float32Array {
@@ -377,6 +530,7 @@ export class RealtimeAudioController {
   private async finishHalfDuplexInput(): Promise<void> {
     if (!this.inputContext || this.fullDuplexEnabled) return;
     await this.stopInputCapture();
+    this.finishInputTurn();
     const tail = this.drainPending();
     if (tail && this.heldHalfDuplexChunk) {
       this.sendInput(this.heldHalfDuplexChunk, { forceListen: true });
@@ -397,24 +551,13 @@ export class RealtimeAudioController {
     this.callbacks.onState("processing");
   }
 
-  private async finishFullDuplexInput(): Promise<void> {
-    if (!this.inputContext || !this.fullDuplexEnabled) return;
-    await this.stopInputCapture();
-    const finalChunk = this.drainPending() ?? new Float32Array(CHUNK_SAMPLES);
-    this.sendInput(finalChunk, { forceSpeak: true });
-    this.halfDuplexPendingSteps = 1;
-    this.awaitingHalfDuplexResponse = true;
-    this.responseDrainSteps = 0;
-    this.currentStepWasListen = false;
-    this.callbacks.onState("processing");
-  }
-
   private sendInput(
     samples: Float32Array,
     options: { forceListen?: boolean; forceSpeak?: boolean } = {},
+    turnId = this.currentInputTurnId,
   ): void {
     if (this.socket?.readyState !== WebSocket.OPEN || !this.sessionReady) {
-      this.outbound.push({ samples, ...options });
+      this.outbound.push({ samples, ...options, turnId });
       if (this.outbound.length > 64) this.outbound.shift();
       return;
     }
@@ -424,6 +567,7 @@ export class RealtimeAudioController {
     };
     if (options.forceListen) input.force_listen = true;
     if (options.forceSpeak) input.force_speak = true;
+    this.pendingResponseTurns.push(turnId);
     this.socket.send(JSON.stringify({ type: "input.append", input }));
   }
 
@@ -446,22 +590,44 @@ export class RealtimeAudioController {
     } else if (event.type === "session.created") {
       this.sessionReady = true;
       this.callbacks.onState(this.awaitingHalfDuplexResponse ? "processing" : "listening");
-      for (const item of this.outbound.splice(0)) this.sendInput(item.samples, item);
-      for (const text of this.pendingText.splice(0)) this.sendText(text);
+      for (const item of this.outbound.splice(0)) {
+        this.sendInput(item.samples, item, item.turnId);
+      }
+      for (const item of this.pendingText.splice(0)) this.sendText(item.text, item.turnId);
     } else if (event.kind === "text") {
+      const target = this.bufferForResponse(event);
+      if (!target) return;
       const text = String(event.text ?? "");
-      this.turnText += text;
-      this.callbacks.onText(this.turnText);
+      target.buffer.text += text;
+      if (target.late) {
+        this.publishTurn(target.buffer);
+      } else {
+        this.callbacks.onText(target.buffer.sessionId, target.buffer.text);
+      }
     } else if (event.kind === "audio") {
+      const target = this.bufferForResponse(event);
+      if (!target) return;
       const samples = base64ToFloat32(String(event.audio ?? ""));
       const sampleRate = Number(event.sample_rate) || OUTPUT_RATE;
-      this.turnAudio.push(samples);
-      this.turnAudioRate = sampleRate;
-      this.playAudio(samples, sampleRate);
+      target.buffer.audio.push(samples);
+      target.buffer.audioRate = sampleRate;
+      if (target.late) {
+        this.publishTurn(target.buffer);
+      } else {
+        this.playAudio(samples, sampleRate);
+      }
     } else if (event.kind === "listen") {
+      const target = this.bufferForResponse(event);
+      if (!target || target.late) return;
       this.currentStepWasListen = true;
       this.finishTurn();
     } else if (event.type === "response.step.done") {
+      const target = this.bufferForResponse(event);
+      if (this.pendingResponseTurns.length) this.pendingResponseTurns.shift();
+      if (!target || target.late) {
+        this.currentStepWasListen = false;
+        return;
+      }
       if (this.halfDuplexPendingSteps > 0) this.halfDuplexPendingSteps -= 1;
       if (this.awaitingHalfDuplexResponse && this.halfDuplexPendingSteps === 0) {
         const ended = event.end_of_turn === true || this.currentStepWasListen;
@@ -486,15 +652,105 @@ export class RealtimeAudioController {
     }
   }
 
-  private finishTurn(): void {
-    if (this.turnText.trim() || this.turnAudio.length) {
-      const audio = this.turnAudio.length ? wavBlob(this.turnAudio, this.turnAudioRate) : null;
-      this.callbacks.onTurn({ text: this.turnText, audio });
+  private responseId(event: Record<string, unknown>): string {
+    return typeof event.response_id === "string" ? event.response_id : "";
+  }
+
+  private responseTurnId(event: Record<string, unknown>): string | null {
+    const responseId = this.responseId(event);
+    if (responseId && this.responseTurnIds.has(responseId)) {
+      return this.responseTurnIds.get(responseId) ?? null;
     }
-    this.turnText = "";
-    this.turnAudio = [];
-    this.turnAudioRate = OUTPUT_RATE;
-    this.callbacks.onText("");
+    const turnId = this.pendingResponseTurns[0] ?? null;
+    if (responseId) {
+      this.responseTurnIds.set(responseId, turnId);
+      this.responseTurnOrder.push(responseId);
+      if (this.responseTurnOrder.length > 512) {
+        const expired = this.responseTurnOrder.shift();
+        if (expired) {
+          this.responseTurnIds.delete(expired);
+          this.responseMessageIds.delete(expired);
+        }
+      }
+    }
+    return turnId;
+  }
+
+  private createTurn(inputTurnId: string | null): BufferedVoiceTurn | null {
+    if (!this.clientSessionId) return null;
+    return {
+      id: crypto.randomUUID(),
+      sessionId: this.clientSessionId,
+      inputTurnId,
+      text: "",
+      audio: [],
+      audioRate: OUTPUT_RATE,
+    };
+  }
+
+  private rememberCompletedTurn(buffer: BufferedVoiceTurn): void {
+    if (!this.completedTurns.has(buffer.id)) this.completedTurnOrder.push(buffer.id);
+    this.completedTurns.set(buffer.id, buffer);
+    this.lastCompletedByInputTurn.set(buffer.inputTurnId, buffer.id);
+    while (this.completedTurnOrder.length > 64) {
+      const expired = this.completedTurnOrder.shift();
+      if (expired) this.completedTurns.delete(expired);
+    }
+  }
+
+  private bufferForResponse(
+    event: Record<string, unknown>,
+  ): { buffer: BufferedVoiceTurn; late: boolean } | null {
+    const responseId = this.responseId(event);
+    const knownMessageId = responseId ? this.responseMessageIds.get(responseId) : undefined;
+    if (knownMessageId) {
+      if (this.activeTurn?.id === knownMessageId) {
+        return { buffer: this.activeTurn, late: false };
+      }
+      const completed = this.completedTurns.get(knownMessageId);
+      if (completed) return { buffer: completed, late: true };
+    }
+
+    const inputTurnId = this.responseTurnId(event);
+    const stale =
+      this.currentInputTurnId !== null && inputTurnId !== this.currentInputTurnId;
+    let buffer: BufferedVoiceTurn | null = null;
+    if (stale) {
+      const completedId = this.lastCompletedByInputTurn.get(inputTurnId);
+      buffer = completedId ? this.completedTurns.get(completedId) ?? null : null;
+      if (!buffer) {
+        buffer = this.createTurn(inputTurnId);
+        if (buffer) this.rememberCompletedTurn(buffer);
+      }
+    } else {
+      if (this.activeTurn && this.activeTurn.inputTurnId !== inputTurnId) {
+        this.finishTurn();
+      }
+      this.activeTurn ??= this.createTurn(inputTurnId);
+      buffer = this.activeTurn;
+    }
+    if (buffer && responseId) this.responseMessageIds.set(responseId, buffer.id);
+    return buffer ? { buffer, late: stale } : null;
+  }
+
+  private publishTurn(buffer: BufferedVoiceTurn): void {
+    if (!buffer.text.trim() && !buffer.audio.length) return;
+    const audio = buffer.audio.length ? wavBlob(buffer.audio, buffer.audioRate) : null;
+    this.callbacks.onTurn({
+      id: buffer.id,
+      sessionId: buffer.sessionId,
+      text: buffer.text,
+      audio,
+    });
+  }
+
+  private finishTurn(): void {
+    const buffer = this.activeTurn;
+    if (!buffer) return;
+    this.publishTurn(buffer);
+    this.rememberCompletedTurn(buffer);
+    this.activeTurn = null;
+    this.callbacks.onText(buffer.sessionId, "");
   }
 
   private playAudio(samples: Float32Array, sampleRate: number): void {

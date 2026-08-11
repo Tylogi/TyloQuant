@@ -66,7 +66,13 @@ interface VoiceMessage {
   role: "user" | "assistant";
   text: string;
   audioId?: string;
+  pending?: boolean;
   created_at: string;
+}
+
+interface LiveVoiceOutput {
+  sessionId: string;
+  text: string;
 }
 
 interface EditDraft {
@@ -281,11 +287,11 @@ export default function App() {
   const [renameValue, setRenameValue] = useState("");
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
   const [voiceLevel, setVoiceLevel] = useState(0);
-  const [liveVoiceText, setLiveVoiceText] = useState("");
+  const [liveVoice, setLiveVoice] = useState<LiveVoiceOutput | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
-  const activeIdRef = useRef<string | null>(null);
   const voiceRef = useRef<RealtimeAudioController | null>(null);
+  const voiceClipWrites = useRef(new Map<string, Promise<void>>());
   const lastMetricId = useRef("");
   const hadStoredSettings = useRef(Boolean(localStorage.getItem(SETTINGS_KEY)));
   const appliedModeTemplate = useRef("");
@@ -338,10 +344,6 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    activeIdRef.current = activeId;
-  }, [activeId]);
-
-  useEffect(() => {
     if (!active || !runtime || voiceRef.current?.active) return;
     const key = `${runtime.model ?? model}:${active.mode}`;
     if (appliedModeTemplate.current === key) return;
@@ -356,7 +358,10 @@ export default function App() {
   }, [settings]);
 
   useEffect(() => {
-    localStorage.setItem(VOICE_HISTORY_KEY, JSON.stringify(voiceMessages.slice(-200)));
+    const stable = voiceMessages.filter(
+      (message) => !message.pending && (message.text.trim() || message.audioId),
+    );
+    localStorage.setItem(VOICE_HISTORY_KEY, JSON.stringify(stable.slice(-200)));
   }, [voiceMessages]);
 
   useEffect(() => {
@@ -364,28 +369,82 @@ export default function App() {
       {
         onState: setVoiceState,
         onLevel: setVoiceLevel,
-        onText: setLiveVoiceText,
+        onText: (sessionId, text) =>
+          setLiveVoice((current) =>
+            text ? { sessionId, text } : current?.sessionId === sessionId ? null : current,
+          ),
         onError: (message) => setError(message),
-        onTurn: ({ text, audio }) => {
-          const sessionId = activeIdRef.current;
-          if (!sessionId) return;
-          const id = crypto.randomUUID();
-          const audioId = audio ? `voice-${id}` : undefined;
+        onInputStart: ({ id, sessionId }) => {
+          setVoiceMessages((current) => [
+            ...current,
+            {
+              id,
+              sessionId,
+              role: "user",
+              text: "",
+              pending: true,
+              created_at: new Date().toISOString(),
+            },
+          ]);
+        },
+        onInputEnd: ({ id, sessionId, audio }) => {
           const persist = async () => {
-            if (audio && audioId) await saveVoiceClip(audioId, audio);
-            setVoiceMessages((current) => [
+            if (!audio) {
+              setVoiceMessages((current) => current.filter((message) => message.id !== id));
+              return;
+            }
+            const audioId = `voice-${id}`;
+            await saveVoiceClip(audioId, audio);
+            setVoiceMessages((current) =>
+              current.map((message) =>
+                message.id === id && message.sessionId === sessionId
+                  ? { ...message, audioId, pending: false }
+                  : message,
+              ),
+            );
+          };
+          void persist().catch((cause) => setError(errorMessage(cause)));
+        },
+        onTurn: ({ id, sessionId, text, audio }) => {
+          setVoiceMessages((current) => {
+            const existing = current.find((message) => message.id === id);
+            if (existing) {
+              return current.map((message) =>
+                message.id === id ? { ...message, text } : message,
+              );
+            }
+            return [
               ...current,
               {
                 id,
                 sessionId,
                 role: "assistant",
                 text,
-                audioId,
                 created_at: new Date().toISOString(),
               },
-            ]);
-          };
-          void persist().catch((cause) => setError(errorMessage(cause)));
+            ];
+          });
+          if (!audio) return;
+          const audioId = `voice-${id}`;
+          const previous = voiceClipWrites.current.get(audioId) ?? Promise.resolve();
+          const persist = previous
+            .catch(() => undefined)
+            .then(async () => {
+              await saveVoiceClip(audioId, audio);
+              setVoiceMessages((current) =>
+                current.map((message) =>
+                  message.id === id ? { ...message, audioId } : message,
+                ),
+              );
+            });
+          voiceClipWrites.current.set(audioId, persist);
+          void persist
+            .catch((cause) => setError(errorMessage(cause)))
+            .finally(() => {
+              if (voiceClipWrites.current.get(audioId) === persist) {
+                voiceClipWrites.current.delete(audioId);
+              }
+            });
         },
       },
       settings.playbackEnabled,
@@ -491,7 +550,7 @@ export default function App() {
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: busy ? "smooth" : "auto" });
-  }, [messages, currentVoiceMessages, live, busy]);
+  }, [messages, currentVoiceMessages, liveVoice, live, busy]);
 
   useEffect(() => {
     if (capabilities && !capabilities.model_capabilities.features.full_duplex) {
@@ -514,8 +573,9 @@ export default function App() {
     };
   }
 
-  function realtimeSessionConfig() {
+  function realtimeSessionConfig(sessionId: string) {
     return {
+      sessionId,
       systemPrompt: settings.systemPrompt,
       temperature: settings.temperature,
       topP: settings.topP,
@@ -680,7 +740,7 @@ export default function App() {
     if (!active || !text || busy) return;
     setDraft("");
     if (active.mode !== "text" && voiceRef.current) {
-      await voiceRef.current.submitText(text, realtimeSessionConfig());
+      await voiceRef.current.submitText(text, realtimeSessionConfig(active.id));
       setVoiceMessages((current) => [
         ...current,
         {
@@ -793,7 +853,7 @@ export default function App() {
       busy ||
       !voiceRef.current
     ) return;
-    await voiceRef.current.toggleCapture(realtimeSessionConfig());
+    await voiceRef.current.toggleCapture(realtimeSessionConfig(active.id));
   }
 
   async function selectInteractionMode(nextMode: SessionMode) {
@@ -956,7 +1016,7 @@ export default function App() {
                   </article>;
                 })}
                 {currentVoiceMessages.map((message) => <article className={`message message-${message.role}`} key={message.id}><div className="message-avatar">{message.role === "assistant" ? <img src="/mfq-mark.svg" alt="MFQ" /> : <span>{tr("你", "You")}</span>}</div><div className="message-body"><div className="message-meta"><strong>{message.role === "assistant" ? "MFQ" : tr("你", "You")}</strong><span>{tr("语音", "Voice")}</span></div>{message.text && <Markdown text={message.text} />}{message.audioId && <AudioClip audioId={message.audioId} />}</div></article>)}
-                {liveVoiceText && <article className="message message-assistant live-message"><div className="message-avatar"><img src="/mfq-mark.svg" alt="MFQ" /></div><div className="message-body"><div className="message-meta"><strong>MFQ</strong><span>{tr("生成中", "Generating")}</span></div><Markdown live text={liveVoiceText} /></div></article>}
+                {liveVoice?.sessionId === activeId && liveVoice.text && <article className="message message-assistant live-message"><div className="message-avatar"><img src="/mfq-mark.svg" alt="MFQ" /></div><div className="message-body"><div className="message-meta"><strong>MFQ</strong><span>{tr("生成中", "Generating")}</span></div><Markdown live text={liveVoice.text} /></div></article>}
                 {live && <article className="message message-assistant live-message"><div className="message-avatar"><img src="/mfq-mark.svg" alt="MFQ" /></div><div className="message-body"><div className="message-meta"><strong>MFQ</strong><span>{tr("生成中", "Generating")}</span></div>{live.reasoning && <details className="reasoning" open><summary>{tr("正在思考", "Thinking")}</summary><Markdown live text={live.reasoning} /></details>}{live.text && <Markdown live text={live.text} />}{live.tools.map((tool, index) => <pre className="tool-call" key={index}>{tool}</pre>)}{!live.reasoning && !live.text && live.tools.length === 0 && <span className="thinking"><i /><i /><i /></span>}</div></article>}
                 <div ref={endRef} />
               </div>
