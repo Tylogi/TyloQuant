@@ -1,13 +1,12 @@
 import json
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
-STUDIO = ROOT / "clients" / "studio"
+STUDIO = ROOT / "MFQStudio" / "desktop"
 TAURI = STUDIO / "src-tauri"
 RUST = (TAURI / "src" / "main.rs").read_text(encoding="utf-8")
 BUILD = (TAURI / "build.rs").read_text(encoding="utf-8")
-APP = (ROOT / "clients" / "web" / "src" / "App.tsx").read_text(encoding="utf-8")
+APP = (ROOT / "MFQStudio" / "web" / "src" / "App.tsx").read_text(encoding="utf-8")
 
 
 def test_studio_embeds_the_shared_web_client():
@@ -33,10 +32,12 @@ def test_studio_has_detached_windows_and_unix_mfqd_launchers():
     assert "--backend-api-key" not in RUST
 
 
-def test_studio_supports_local_and_remote_mfqd_without_voice_mode_picker():
+def test_studio_supports_local_and_remote_mfqd_with_voice_controls():
     assert "RuntimeMode::Local" in RUST
     assert "RuntimeMode::Remote" in RUST
     assert "studio_configure" in RUST
     assert "studio_start_local" in RUST
     assert "Object.keys(MODE_LABELS)" not in APP
-    assert "duplex-session-toggle" in APP
+    assert "RealtimeAudioController" in APP
+    assert '(["text", "voice", "full_duplex"] as SessionMode[])' in APP
+    assert "toggleDuplex" in APP

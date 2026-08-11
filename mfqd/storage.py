@@ -27,6 +27,7 @@ from mfqd.models import (
     SessionResource,
     SessionState,
     TokenUsage,
+    UpdateSessionRequest,
 )
 
 SCHEMA_VERSION = 1
@@ -247,6 +248,23 @@ class SessionStore:
             ).fetchall()
         return [self._session_from_row(row) for row in rows]
 
+    def update_session(
+        self,
+        session_id: UUID,
+        request: UpdateSessionRequest,
+        *,
+        now: datetime | None = None,
+    ) -> SessionResource:
+        updated_at = now or _utcnow()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?",
+                (request.title, _timestamp(updated_at), str(session_id)),
+            )
+            if cursor.rowcount != 1:
+                raise SessionNotFoundError(str(session_id))
+        return self.get_session(session_id)
+
     def list_messages(self, session_id: UUID) -> list[Message]:
         with self._connection() as connection:
             exists = connection.execute(
@@ -366,6 +384,10 @@ class SessionStore:
                 if target is None:
                     raise MessageNotFoundError(str(request.at_message_id))
                 limit = int(target["ordinal"])
+                if not request.include_message:
+                    limit -= 1
+            elif not request.include_message:
+                raise StorageError("include_message=false requires at_message_id")
             connection.execute(
                 """
                 INSERT INTO sessions(

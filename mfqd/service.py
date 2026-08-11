@@ -13,6 +13,8 @@ from uuid import UUID, uuid4
 
 from mfqd.backend import BackendDelta, BackendError, BackendToolCallDelta, ChatBackend
 from mfqd.models import (
+    AppendMessageRequest,
+    AppendMessageResult,
     AudioPart,
     ContentPart,
     CreateResponseRequest,
@@ -46,6 +48,7 @@ from mfqd.models import (
     ToolCallPart,
     ToolResultPart,
     TranscriptPart,
+    UpdateSessionRequest,
 )
 from mfqd.storage import (
     BeginResponseResult,
@@ -187,12 +190,48 @@ class MfqdService:
         except SessionNotFoundError as error:
             raise ServiceError(404, "session_not_found", str(error)) from error
 
+    async def update_session(
+        self,
+        session_id: UUID,
+        request: UpdateSessionRequest,
+    ) -> SessionResource:
+        try:
+            return await asyncio.to_thread(self.store.update_session, session_id, request)
+        except SessionNotFoundError as error:
+            raise ServiceError(404, "session_not_found", str(error)) from error
+
     async def list_messages(self, session_id: UUID) -> MessageList:
         try:
             messages = await asyncio.to_thread(self.store.list_messages, session_id)
         except SessionNotFoundError as error:
             raise ServiceError(404, "session_not_found", str(error)) from error
         return MessageList(data=messages)
+
+    async def append_message(
+        self,
+        session_id: UUID,
+        request: AppendMessageRequest,
+    ) -> AppendMessageResult:
+        try:
+            session, message = await asyncio.to_thread(
+                self.store.append_message,
+                session_id,
+                request.expected_revision,
+                request.role,
+                request.parts,
+            )
+        except SessionNotFoundError as error:
+            raise ServiceError(404, "session_not_found", str(error)) from error
+        except RevisionConflictError as error:
+            raise ServiceError(
+                409,
+                "revision_conflict",
+                str(error),
+                details={"expected_revision": error.expected, "actual_revision": error.actual},
+            ) from error
+        except StorageError as error:
+            raise ServiceError(409, "session_state_conflict", str(error)) from error
+        return AppendMessageResult(session=session, message=message)
 
     async def fork_session(
         self,
@@ -205,7 +244,10 @@ class MfqdService:
             raise ServiceError(404, "session_not_found", str(error)) from error
         except MessageNotFoundError as error:
             raise ServiceError(404, "message_not_found", str(error)) from error
-        await self.backend.fork_session(session_id, forked.id)
+        except StorageError as error:
+            raise ServiceError(409, "session_state_conflict", str(error)) from error
+        if request.at_message_id is None:
+            await self.backend.fork_session(session_id, forked.id)
         return forked
 
     async def delete_session(self, session_id: UUID) -> None:
@@ -231,6 +273,28 @@ class MfqdService:
                 retryable=error.retryable,
             ) from error
 
+    async def runtime_status(self) -> dict[str, Any]:
+        return await self._runtime_request("runtime_status")
+
+    async def runtime_models(self) -> dict[str, Any]:
+        return await self._runtime_request("runtime_models")
+
+    async def realtime_capabilities(self) -> dict[str, Any]:
+        return await self._runtime_request("realtime_capabilities")
+
+    async def reload_runtime(self, context_size: int) -> dict[str, Any]:
+        return await self._runtime_request("reload_runtime", context_size)
+
+    def realtime_connect(self, *, mode: str = "audio") -> Any:
+        connector = getattr(self.backend, "realtime_connect", None)
+        if connector is None:
+            raise ServiceError(
+                501,
+                "realtime_unavailable",
+                "the configured backend does not expose realtime transport",
+            )
+        return connector(mode=mode)
+
     async def load_model(self, _: object) -> OperationAccepted:
         raise ServiceError(501, "model_management_unavailable", "model loading is not available")
 
@@ -244,7 +308,18 @@ class MfqdService:
     ) -> PreparedResponse:
         try:
             history = await asyncio.to_thread(self.store.list_messages, session_id)
-            backend_messages = tuple(self._message_to_backend(message) for message in history)
+            backend_messages = tuple(
+                self._message_to_backend(
+                    message,
+                    include_reasoning=request.include_reasoning_history,
+                )
+                for message in history
+            )
+            if request.system_prompt and request.system_prompt.strip():
+                backend_messages = (
+                    {"role": "system", "content": request.system_prompt.strip()},
+                    *backend_messages,
+                )
             backend_input = self._parts_to_backend(MessageRole.USER, request.input)
             fingerprint = self._request_fingerprint(request)
             begin = await asyncio.to_thread(
@@ -256,6 +331,19 @@ class MfqdService:
                 request.expected_revision,
                 request.input,
             )
+            if begin.started and begin.session.title is None:
+                title = self._title_from_parts(request.input)
+                if title:
+                    session = await asyncio.to_thread(
+                        self.store.update_session,
+                        session_id,
+                        UpdateSessionRequest(title=title),
+                    )
+                    begin = BeginResponseResult(
+                        session=session,
+                        response=begin.response,
+                        started=True,
+                    )
         except SessionNotFoundError as error:
             raise ServiceError(404, "session_not_found", str(error)) from error
         except RevisionConflictError as error:
@@ -491,13 +579,24 @@ class MfqdService:
         return hashlib.sha256(encoded).hexdigest()
 
     @classmethod
-    def _message_to_backend(cls, message: Message) -> dict[str, Any]:
-        return cls._parts_to_backend(message.role, message.parts)
+    def _message_to_backend(
+        cls,
+        message: Message,
+        *,
+        include_reasoning: bool = True,
+    ) -> dict[str, Any]:
+        return cls._parts_to_backend(
+            message.role,
+            message.parts,
+            include_reasoning=include_reasoning,
+        )
 
     @staticmethod
     def _parts_to_backend(
         role: MessageRole,
         parts: Sequence[ContentPart],
+        *,
+        include_reasoning: bool = True,
     ) -> dict[str, Any]:
         if role == MessageRole.TOOL:
             if len(parts) != 1 or not isinstance(parts[0], ToolResultPart):
@@ -527,7 +626,8 @@ class MfqdService:
                         "unsupported_reasoning_part",
                         "reasoning parts are valid only on assistant messages",
                     )
-                reasoning_fragments.append(part.text)
+                if include_reasoning:
+                    reasoning_fragments.append(part.text)
             elif isinstance(part, ToolCallPart):
                 if role != MessageRole.ASSISTANT:
                     raise ServiceError(
@@ -567,6 +667,36 @@ class MfqdService:
         if tool_calls:
             message["tool_calls"] = tool_calls
         return message
+
+    async def _runtime_request(self, method: str, *args: Any) -> dict[str, Any]:
+        operation = getattr(self.backend, method, None)
+        if operation is None:
+            raise ServiceError(
+                501,
+                "runtime_control_unavailable",
+                f"the configured backend does not implement {method}",
+            )
+        try:
+            return await operation(*args)
+        except BackendError as error:
+            raise ServiceError(
+                503,
+                error.code,
+                str(error),
+                retryable=error.retryable,
+            ) from error
+
+    @staticmethod
+    def _title_from_parts(parts: Sequence[ContentPart]) -> str | None:
+        text = " ".join(
+            part.text.strip()
+            for part in parts
+            if isinstance(part, (TextPart, TranscriptPart)) and part.text.strip()
+        )
+        normalized = " ".join(text.split())
+        if not normalized:
+            return None
+        return normalized if len(normalized) <= 60 else f"{normalized[:59]}…"
 
     @staticmethod
     def _require_finish_reason(accumulator: _OutputAccumulator) -> str:

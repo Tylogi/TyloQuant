@@ -93,11 +93,16 @@ def test_openapi_contract_has_all_native_routes_and_realtime_extension() -> None
         "/api/v1/models/unload",
         "/api/v1/runtime/instances",
         "/api/v1/runtime/capabilities",
+        "/api/v1/runtime/status",
+        "/api/v1/runtime/models",
+        "/api/v1/runtime/realtime/capabilities",
+        "/api/v1/runtime/reload",
     }
     assert set(schema["paths"]) == expected_paths
     assert schema["x-mfqd-protocol-version"] == PROTOCOL_VERSION
     assert schema["x-mfqd-websocket"]["events"] == REALTIME_EVENTS
     assert any(route.path == "/api/v1/realtime" for route in create_contract_app().routes)
+    assert any(route.path == "/api/v1/runtime/realtime" for route in create_contract_app().routes)
 
 
 def test_checked_in_openapi_is_current() -> None:

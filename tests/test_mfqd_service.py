@@ -16,6 +16,7 @@ from mfqd.capabilities import capabilities_for_architecture
 from mfqd.models import (
     CreateResponseRequest,
     CreateSessionRequest,
+    MessageRole,
     ResponseStatus,
     RuntimeCapabilitiesResource,
     SamplingParams,
@@ -82,6 +83,18 @@ class FakeBackend:
             model_capabilities=capabilities_for_architecture("minicpmo"),
             duplex_available=True,
         )
+
+    async def runtime_status(self) -> dict[str, object]:
+        return {"model": "model-a", "max_context": 8192, "active_requests": 0}
+
+    async def runtime_models(self) -> dict[str, object]:
+        return {"object": "list", "data": [{"id": "model-a"}]}
+
+    async def realtime_capabilities(self) -> dict[str, object]:
+        return {"available": True, "input_sample_rate": 16000}
+
+    async def reload_runtime(self, context_size: int) -> dict[str, object]:
+        return {"model": "model-a", "max_context": context_size}
 
 
 def make_service(path: Path, backend: FakeBackend) -> MfqdService:
@@ -184,6 +197,57 @@ def test_service_failure_is_persisted_and_reported(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
+def test_service_applies_console_context_and_sampling_options(tmp_path: Path) -> None:
+    async def run() -> None:
+        backend = FakeBackend(
+            (BackendDelta(content_delta="ok"), BackendDelta(finish_reason="stop"))
+        )
+        service = make_service(tmp_path, backend)
+        await asyncio.to_thread(
+            service.store.create_session,
+            CreateSessionRequest(model="model-a"),
+            session_id=SESSION_ID,
+        )
+        await asyncio.to_thread(
+            service.store.append_message,
+            SESSION_ID,
+            0,
+            MessageRole.USER,
+            [{"type": "text", "text": "first"}],
+        )
+        await asyncio.to_thread(
+            service.store.append_message,
+            SESSION_ID,
+            1,
+            MessageRole.ASSISTANT,
+            [
+                {"type": "reasoning", "text": "private chain"},
+                {"type": "text", "text": "first answer"},
+            ],
+        )
+        request = CreateResponseRequest(
+            request_id=REQUEST_ID,
+            expected_revision=2,
+            input=[{"type": "text", "text": "second question"}],
+            sampling=SamplingParams(enable_thinking=False),
+            system_prompt="Follow the test instruction.",
+            include_reasoning_history=False,
+            stream=False,
+        )
+        prepared = await service.prepare_response(SESSION_ID, request)
+        await service.collect_response(prepared)
+        assert backend.calls[0]["messages"] == [
+            {"role": "system", "content": "Follow the test instruction."},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "second question"},
+        ]
+        assert backend.calls[0]["sampling"].enable_thinking is False
+        assert service.store.get_session(SESSION_ID).title == "second question"
+
+    asyncio.run(run())
+
+
 def test_executable_api_persists_nonstream_text_responses(tmp_path: Path) -> None:
     async def run() -> None:
         backend = FakeBackend(
@@ -237,6 +301,31 @@ def test_executable_api_persists_nonstream_text_responses(tmp_path: Path) -> Non
                 "user",
                 "assistant",
             ]
+            renamed = await client.patch(
+                f"/api/v1/sessions/{session['id']}",
+                json={"title": "renamed"},
+            )
+            assert renamed.json()["title"] == "renamed"
+            edited_branch = await client.post(
+                f"/api/v1/sessions/{session['id']}/fork",
+                json={
+                    "at_message_id": messages.json()["data"][0]["id"],
+                    "include_message": False,
+                    "title": "edited",
+                },
+            )
+            assert edited_branch.status_code == 201
+            assert edited_branch.json()["revision"] == 0
+            appended = await client.post(
+                f"/api/v1/sessions/{edited_branch.json()['id']}/messages",
+                json={
+                    "expected_revision": 0,
+                    "role": "user",
+                    "parts": [{"type": "text", "text": "edited question"}],
+                },
+            )
+            assert appended.status_code == 201
+            assert appended.json()["session"]["revision"] == 1
             runtimes = await client.get("/api/v1/runtime/instances")
             assert runtimes.json() == {"data": []}
             capabilities = await client.get("/api/v1/runtime/capabilities")
@@ -249,6 +338,17 @@ def test_executable_api_persists_nonstream_text_responses(tmp_path: Path) -> Non
                 "full_duplex": True,
             }
             assert capabilities.json()["duplex_available"] is True
+            status = await client.get("/api/v1/runtime/status")
+            assert status.json()["max_context"] == 8192
+            models = await client.get("/api/v1/runtime/models")
+            assert models.json()["data"] == [{"id": "model-a"}]
+            realtime = await client.get("/api/v1/runtime/realtime/capabilities")
+            assert realtime.json()["available"] is True
+            reloaded = await client.post(
+                "/api/v1/runtime/reload",
+                json={"context_size": 16384},
+            )
+            assert reloaded.json()["max_context"] == 16384
             invalid = await client.post("/api/v1/sessions", json={"model": ""})
             assert invalid.status_code == 422
             assert invalid.json()["error"]["code"] == "invalid_request"
@@ -258,20 +358,18 @@ def test_executable_api_persists_nonstream_text_responses(tmp_path: Path) -> Non
             )
             assert forked.status_code == 201
             forked_session = forked.json()
-            assert backend.forks == [
-                (UUID(session["id"]), UUID(forked_session["id"]))
-            ]
+            assert backend.forks == [(UUID(session["id"]), UUID(forked_session["id"]))]
             deleted = await client.delete(f"/api/v1/sessions/{session['id']}")
             assert deleted.status_code == 204
             assert backend.closed_sessions == [UUID(session["id"])]
-            deleted_fork = await client.delete(
-                f"/api/v1/sessions/{forked_session['id']}"
-            )
+            deleted_fork = await client.delete(f"/api/v1/sessions/{forked_session['id']}")
             assert deleted_fork.status_code == 204
             assert backend.closed_sessions == [
                 UUID(session["id"]),
                 UUID(forked_session["id"]),
             ]
+            deleted_edited = await client.delete(f"/api/v1/sessions/{edited_branch.json()['id']}")
+            assert deleted_edited.status_code == 204
 
     asyncio.run(run())
 

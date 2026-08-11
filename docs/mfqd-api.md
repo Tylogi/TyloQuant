@@ -90,11 +90,11 @@ Media upload, realtime audio, and model load or unload endpoints currently
 return an explicit `501` error. Runtime instance listing returns an empty list
 until native worker registration is connected.
 
-The React client lives in `clients/web`. Its development server proxies native
+The React client lives in `MFQStudio/web`. Its development server proxies native
 API requests to MFQd:
 
 ```bash
-cd clients/web
+cd MFQStudio/web
 npm install
 npm run dev
 ```
@@ -104,5 +104,5 @@ MFQd:
 
 ```bash
 npm run build
-mfqd --web-root clients/web/dist
+mfqd --web-root MFQStudio/web/dist
 ```

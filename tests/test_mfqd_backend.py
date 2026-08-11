@@ -65,7 +65,13 @@ def test_backend_stream_parses_cpp_sse_and_preserves_request_fields() -> None:
             async for delta in backend.stream(
                 model="model-a",
                 messages=[{"role": "user", "content": "hello"}],
-                sampling=SamplingParams(max_tokens=12, temperature=0.25, seed=7),
+                sampling=SamplingParams(
+                    max_tokens=12,
+                    temperature=0.25,
+                    seed=7,
+                    enable_thinking=True,
+                    reasoning_effort="high",
+                ),
                 session_id=UUID("11111111-1111-4111-8111-111111111111"),
             )
         ]
@@ -87,6 +93,40 @@ def test_backend_stream_parses_cpp_sse_and_preserves_request_fields() -> None:
     assert payload["max_tokens"] == 12
     assert payload["seed"] == 7
     assert payload["mfq_session_id"] == "11111111-1111-4111-8111-111111111111"
+    assert payload["chat_template_kwargs"] == {
+        "enable_thinking": True,
+        "reasoning_effort": "high",
+    }
+
+
+def test_backend_proxies_runtime_console_resources() -> None:
+    requests: list[tuple[str, str, dict[str, object] | None]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        requests.append((request.method, request.url.path, body))
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "model-a"}]})
+        if request.url.path == "/realtime/capabilities":
+            return httpx.Response(200, json={"available": True})
+        return httpx.Response(200, json={"model": "model-a", "max_context": 8192})
+
+    async def run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        backend = OpenAIChatBackend("http://backend", client=client)
+        assert (await backend.runtime_status())["max_context"] == 8192
+        assert (await backend.runtime_models())["data"][0]["id"] == "model-a"
+        assert (await backend.realtime_capabilities())["available"] is True
+        assert (await backend.reload_runtime(16384))["model"] == "model-a"
+        await client.aclose()
+
+    asyncio.run(run())
+    assert requests == [
+        ("GET", "/api/status", None),
+        ("GET", "/v1/models", None),
+        ("GET", "/realtime/capabilities", None),
+        ("POST", "/api/reload", {"context_size": 16384}),
+    ]
 
 
 def test_backend_forwards_runtime_session_lifecycle() -> None:

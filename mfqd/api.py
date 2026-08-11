@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import Body, FastAPI, Header, Query, Response, WebSocket
+from fastapi import Body, FastAPI, Header, Query, Response, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +18,8 @@ from fastapi.staticfiles import StaticFiles
 
 from mfqd.models import (
     SHA256_PATTERN,
+    AppendMessageRequest,
+    AppendMessageResult,
     CreateResponseRequest,
     CreateSessionRequest,
     ErrorDetail,
@@ -30,8 +33,10 @@ from mfqd.models import (
     ResponseResource,
     RuntimeCapabilitiesResource,
     RuntimeInstanceList,
+    RuntimeReloadRequest,
     SessionList,
     SessionResource,
+    UpdateSessionRequest,
 )
 from mfqd.service import MfqdService, ServiceError
 
@@ -77,7 +82,7 @@ def create_app(
             "http://127.0.0.1:5173",
             "http://localhost:5173",
         ],
-        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Accept", "Content-Type"],
     )
 
@@ -148,6 +153,18 @@ def create_app(
     async def get_session(session_id: UUID) -> SessionResource:
         return await require_service().get_session(session_id)
 
+    @app.patch(
+        "/api/v1/sessions/{session_id}",
+        response_model=SessionResource,
+        responses=ERROR_RESPONSES,
+        tags=["sessions"],
+    )
+    async def update_session(
+        session_id: UUID,
+        body: UpdateSessionRequest,
+    ) -> SessionResource:
+        return await require_service().update_session(session_id, body)
+
     @app.get(
         "/api/v1/sessions/{session_id}/messages",
         response_model=MessageList,
@@ -156,6 +173,19 @@ def create_app(
     )
     async def list_messages(session_id: UUID) -> MessageList:
         return await require_service().list_messages(session_id)
+
+    @app.post(
+        "/api/v1/sessions/{session_id}/messages",
+        response_model=AppendMessageResult,
+        status_code=201,
+        responses=ERROR_RESPONSES,
+        tags=["sessions"],
+    )
+    async def append_message(
+        session_id: UUID,
+        body: AppendMessageRequest,
+    ) -> AppendMessageResult:
+        return await require_service().append_message(session_id, body)
 
     @app.post(
         "/api/v1/sessions/{session_id}/responses",
@@ -264,6 +294,95 @@ def create_app(
     )
     async def runtime_capabilities() -> RuntimeCapabilitiesResource:
         return await require_service().runtime_capabilities()
+
+    @app.get(
+        "/api/v1/runtime/status",
+        response_model=dict[str, Any],
+        responses=ERROR_RESPONSES,
+        tags=["runtime"],
+    )
+    async def runtime_status() -> dict[str, Any]:
+        return await require_service().runtime_status()
+
+    @app.get(
+        "/api/v1/runtime/models",
+        response_model=dict[str, Any],
+        responses=ERROR_RESPONSES,
+        tags=["runtime"],
+    )
+    async def runtime_models() -> dict[str, Any]:
+        return await require_service().runtime_models()
+
+    @app.get(
+        "/api/v1/runtime/realtime/capabilities",
+        response_model=dict[str, Any],
+        responses=ERROR_RESPONSES,
+        tags=["runtime"],
+    )
+    async def realtime_capabilities() -> dict[str, Any]:
+        return await require_service().realtime_capabilities()
+
+    @app.post(
+        "/api/v1/runtime/reload",
+        response_model=dict[str, Any],
+        responses=ERROR_RESPONSES,
+        tags=["runtime"],
+    )
+    async def reload_runtime(body: RuntimeReloadRequest) -> dict[str, Any]:
+        return await require_service().reload_runtime(body.context_size)
+
+    @app.websocket("/api/v1/runtime/realtime")
+    async def runtime_realtime(websocket: WebSocket) -> None:
+        mode = websocket.query_params.get("mode", "audio")
+        if mode != "audio":
+            await websocket.close(code=1008, reason="audio mode is required")
+            return
+        try:
+            connector = require_service().realtime_connect(mode=mode)
+            async with connector as upstream:
+                await websocket.accept()
+
+                async def send_upstream() -> None:
+                    while True:
+                        message = await websocket.receive()
+                        if message["type"] == "websocket.disconnect":
+                            return
+                        if message.get("text") is not None:
+                            await upstream.send(message["text"])
+                        elif message.get("bytes") is not None:
+                            await upstream.send(message["bytes"])
+
+                async def send_client() -> None:
+                    async for message in upstream:
+                        if isinstance(message, bytes):
+                            await websocket.send_bytes(message)
+                        else:
+                            await websocket.send_text(message)
+
+                tasks = {
+                    asyncio.create_task(send_upstream()),
+                    asyncio.create_task(send_client()),
+                }
+                done, pending = await asyncio.wait(
+                    tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                for task in pending:
+                    with suppress(asyncio.CancelledError):
+                        await task
+                for task in done:
+                    task.result()
+                with suppress(Exception):
+                    await websocket.close(code=1000)
+        except WebSocketDisconnect:
+            return
+        except Exception as error:
+            with suppress(Exception):
+                await websocket.send_json({"type": "error", "error": {"message": str(error)}})
+            with suppress(Exception):
+                await websocket.close(code=1011, reason="realtime proxy failed")
 
     @app.websocket("/api/v1/realtime")
     async def realtime(websocket: WebSocket) -> None:

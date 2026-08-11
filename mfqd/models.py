@@ -150,6 +150,8 @@ class SamplingParams(ProtocolModel):
     frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
     repetition_penalty: float = Field(default=1.0, gt=0.0)
     seed: int | None = Field(default=None, ge=0)
+    enable_thinking: bool = True
+    reasoning_effort: str | None = Field(default=None, min_length=1, max_length=32)
 
 
 class RuntimeIdentity(ProtocolModel):
@@ -193,7 +195,23 @@ class MessageList(ProtocolModel):
 
 class ForkSessionRequest(ProtocolModel):
     at_message_id: UUID | None = None
+    include_message: bool = True
     title: str | None = Field(default=None, max_length=512)
+
+
+class UpdateSessionRequest(ProtocolModel):
+    title: str | None = Field(default=None, max_length=512)
+
+
+class AppendMessageRequest(ProtocolModel):
+    expected_revision: int = Field(ge=0)
+    role: MessageRole
+    parts: list[ContentPart] = Field(min_length=1)
+
+
+class AppendMessageResult(ProtocolModel):
+    session: SessionResource
+    message: Message
 
 
 class ErrorDetail(ProtocolModel):
@@ -214,6 +232,8 @@ class CreateResponseRequest(ProtocolModel):
     expected_revision: int = Field(ge=0)
     input: list[ContentPart] = Field(min_length=1)
     sampling: SamplingParams = Field(default_factory=SamplingParams)
+    system_prompt: str | None = Field(default=None, max_length=32768)
+    include_reasoning_history: bool = True
     stream: bool = True
 
 
@@ -290,6 +310,10 @@ class RuntimeCapabilitiesResource(ProtocolModel):
 class OperationAccepted(ProtocolModel):
     operation_id: UUID
     status: Literal["accepted"] = "accepted"
+
+
+class RuntimeReloadRequest(ProtocolModel):
+    context_size: int = Field(ge=512)
 
 
 class ErrorResponse(ProtocolModel):

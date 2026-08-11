@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
+from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
 import httpx
@@ -64,6 +66,16 @@ class ChatBackend(Protocol):
 
     async def capabilities(self) -> RuntimeCapabilitiesResource: ...
 
+    async def runtime_status(self) -> dict[str, Any]: ...
+
+    async def runtime_models(self) -> dict[str, Any]: ...
+
+    async def realtime_capabilities(self) -> dict[str, Any]: ...
+
+    async def reload_runtime(self, context_size: int) -> dict[str, Any]: ...
+
+    def realtime_connect(self, *, mode: str = "audio") -> Any: ...
+
     async def aclose(self) -> None: ...
 
 
@@ -105,7 +117,12 @@ class OpenAIChatBackend:
             "stream": True,
             "stream_options": {"include_usage": True},
             "reasoning_format": "auto",
+            "chat_template_kwargs": {
+                "enable_thinking": sampling.enable_thinking,
+            },
         }
+        if sampling.reasoning_effort:
+            payload["chat_template_kwargs"]["reasoning_effort"] = sampling.reasoning_effort
         if sampling.seed is not None:
             payload["seed"] = sampling.seed
         if session_id is not None:
@@ -205,6 +222,76 @@ class OpenAIChatBackend:
             model_capabilities=capabilities,
             duplex_available=payload.get("duplex_available") is True,
         )
+
+    async def runtime_status(self) -> dict[str, Any]:
+        try:
+            return await self._json_request("GET", "/api/status")
+        except BackendError as error:
+            if error.code not in {"backend_http_404", "not_found"}:
+                raise
+            health = await self._json_request("GET", "/health")
+            return {**health, "limited": True}
+
+    async def runtime_models(self) -> dict[str, Any]:
+        return await self._json_request("GET", "/v1/models")
+
+    async def realtime_capabilities(self) -> dict[str, Any]:
+        return await self._json_request("GET", "/realtime/capabilities")
+
+    async def reload_runtime(self, context_size: int) -> dict[str, Any]:
+        return await self._json_request(
+            "POST",
+            "/api/reload",
+            json_body={"context_size": context_size},
+        )
+
+    def realtime_connect(self, *, mode: str = "audio") -> Any:
+        import websockets
+
+        parsed = urlsplit(self.base_url)
+        scheme = "wss" if parsed.scheme == "https" else "ws"
+        url = urlunsplit((scheme, parsed.netloc, "/v1/realtime", f"mode={mode}", ""))
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else None
+        parameters = inspect.signature(websockets.connect).parameters
+        options: dict[str, Any] = {"max_size": 128 * 1024 * 1024}
+        if "proxy" in parameters:
+            options["proxy"] = None
+        if headers:
+            header_name = (
+                "additional_headers" if "additional_headers" in parameters else "extra_headers"
+            )
+            options[header_name] = headers
+        return websockets.connect(url, **options)
+
+    async def _json_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        try:
+            response = await self._client.request(
+                method,
+                f"{self.base_url}{path}",
+                json=json_body,
+                headers=headers,
+            )
+            if response.status_code >= 400:
+                raise self._http_error(response.status_code, response.content)
+            payload = response.json()
+        except BackendError:
+            raise
+        except httpx.TimeoutException as error:
+            raise BackendError("backend_timeout", str(error), retryable=True) from error
+        except (httpx.HTTPError, ValueError) as error:
+            raise BackendError("backend_protocol_error", str(error), retryable=True) from error
+        if not isinstance(payload, dict):
+            raise BackendProtocolError(f"backend {path} response must be a JSON object")
+        return payload
 
     async def _session_control_request(
         self,

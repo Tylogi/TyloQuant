@@ -41,6 +41,7 @@ daemon = [
     "httpx>=0.27.0",
     "pydantic>=2.8.0",
     "uvicorn>=0.30.0",
+    "websockets>=12.0",
 ]
 train = [
     "scipy>=1.10.0",
