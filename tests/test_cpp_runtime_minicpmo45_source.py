@@ -72,7 +72,7 @@ def test_minicpmo45_audio_and_tts_follow_official_attention_contracts():
     assert "torch::multinomial(" in GRAPH
     assert "repetition_penalty = 1.05" in GRAPH
     assert "if (!generated.empty())" in GRAPH
-    assert "sampled.size(1) - 1" in GRAPH
+    assert "sampled.size(1) - (hit_eos ? 1 : 0)" in GRAPH
     assert "logits_trace->push_back(raw_step_logits.clone())" in GRAPH
 
 
@@ -217,6 +217,43 @@ def test_minicpmo45_cuda_duplex_uses_runtime_profile_tts_sampling():
     assert "tts_temperature, tts_repetition_penalty" in GRAPH
     assert 'number_field(\n                            generation, "tts_temperature"' in SERVER_SOURCE
     assert 'number_field(\n                            generation, "tts_repetition_penalty"' in SERVER_SOURCE
+
+
+def test_minicpmo45_eval_batch_matches_pr_tts_sampler_and_optional_media():
+    assert "std::mt19937 * evaluator_rng = nullptr" in GRAPH
+    assert "std::uniform_real_distribution<float> distribution" in GRAPH
+    assert 'request.value("tts_temperature", 0.8)' in GRAPH
+    assert 'request.value("tts_top_p", 0.85)' in GRAPH
+    assert 'request.value("tts_top_k", int64_t{25})' in GRAPH
+    assert 'request.value("tts_min_tokens_to_keep", int64_t{3})' in GRAPH
+    assert 'input_prefix + ".pixel_values.pt", false' in GRAPH
+    assert '(reuse_prefix_cache &&\n                     prefix_length >= input_ids.size(1))' in GRAPH
+
+
+def test_minicpmo45_eval_batch_maps_each_audio_bound_to_its_source():
+    assert "valid_lengths[bound.source]" in GRAPH
+    assert "bound.source, Slice(0, available), Slice()" in GRAPH
+    assert "used_audio[static_cast<size_t>(bound.source)] = true" in GRAPH
+    assert "MiniCPM-o eval batch has unused Whisper segments" in GRAPH
+
+
+def test_minicpmo45_eval_batch_preserves_pr_teacher_forcing_segments():
+    assert 'current_prefix + ".prefill_splits.pt",' in GRAPH
+    assert "tts_teacher_forcing || require_segmented_prefill" in GRAPH
+    assert "segment_begin == text_begin && segment_end == text_end" in GRAPH
+    assert "teacher_text_hidden = segment_hidden" in GRAPH
+    assert "teacher-forcing splits omit the text span" in GRAPH
+
+
+def test_minicpmo45_eval_batch_can_match_pr_prefill_call_boundaries():
+    assert 'request.value("require_segmented_prefill", false)' in GRAPH
+    assert 'first_prefix + ".prefill_splits.pt"' in GRAPH
+    assert "MiniCPM-o segmented prefill omits the cache boundary" in GRAPH
+    assert "segment_begin = evaluated_prefix_length" in GRAPH
+    assert "MiniCPM-o segmented prefill omits a prompt span" in GRAPH
+    assert "image_embedding_parts.push_back(runtime.resampler.forward(" in GRAPH
+    assert "MiniCPM-o per-segment Whisper length mismatch" in GRAPH
+    assert "Slice(0, raw_lengths[index])" in GRAPH
 
 
 def test_minicpmo45_realtime_renderer_prefers_cuda_when_available():

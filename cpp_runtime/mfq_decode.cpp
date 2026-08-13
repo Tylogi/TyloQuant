@@ -24230,6 +24230,7 @@ int main(int argc, char ** argv) {
         int64_t minicpmo_duplex_steps = 0;
         int64_t minicpmo_duplex_max_speak_tokens = 20;
         int64_t minicpmo_duplex_seed = 0;
+        int64_t minicpmo_eval_vision_batch_size = 16;
         int kl_chunks = -1;
         int kl_score_count = -1;
         int64_t kl_n_batch = 0;
@@ -24291,6 +24292,7 @@ int main(int argc, char ** argv) {
         bool check_runtime_assets = false;
         bool check_mfq_container = false;
         bool minicpmo_duplex_greedy = false;
+        bool minicpmo_eval_batch = false;
         bool kl_allow_overlays = false;
         bool n_gpu_layers_set = false;
         bool cpu_threads_set = false;
@@ -24308,6 +24310,13 @@ int main(int argc, char ** argv) {
             }
             else if (a == "--minicpmo-tts-steps" && i + 1 < argc) {
                 minicpmo_tts_steps = std::stoll(argv[++i]);
+            }
+            else if (a == "--minicpmo-eval-batch") {
+                minicpmo_eval_batch = true;
+            }
+            else if (a == "--minicpmo-eval-vision-batch-size" &&
+                    i + 1 < argc) {
+                minicpmo_eval_vision_batch_size = std::stoll(argv[++i]);
             }
             else if (a == "--minicpmo-duplex-input-prefix" && i + 1 < argc) {
                 minicpmo_duplex_input_prefix = argv[++i];
@@ -24838,6 +24847,27 @@ int main(int argc, char ** argv) {
                 minicpmo_duplex_greedy,
                 minicpmo_duplex_seed);
         }
+        if (minicpmo_eval_batch) {
+            if (mfq_path.empty()) {
+                throw std::runtime_error(
+                    "--minicpmo-eval-batch requires --mfq");
+            }
+            if (!minicpmo_input_prefix.empty() || server_mode ||
+                    !ids_arg.empty() || !ids_file.empty() ||
+                    !kl_base.empty() || !prefill_sweep_arg.empty() ||
+                    !minicpmo_duplex_input_prefix.empty()) {
+                throw std::runtime_error(
+                    "MiniCPM-o eval mode cannot be combined with "
+                    "composite, duplex, token, server, KL, or prefill modes");
+            }
+            if (minicpmo_eval_vision_batch_size <= 0) {
+                throw std::runtime_error(
+                    "--minicpmo-eval-vision-batch-size must be positive");
+            }
+            return run_minicpmo45_eval_batch(
+                mfq_path, config_path, context_size,
+                minicpmo_eval_vision_batch_size);
+        }
         if (!minicpmo_input_prefix.empty()) {
             if (mfq_path.empty() || minicpmo_output_prefix.empty()) {
                 throw std::runtime_error(
@@ -24863,7 +24893,8 @@ int main(int argc, char ** argv) {
             (!server_mode && ids_arg.empty() && ids_file.empty() &&
                 kl_base.empty() && prefill_sweep_arg.empty())) {
             std::cerr << "usage: mfq-decode --mfq model.mfq [--config config.json] "
-                         "(--ids 1,2,3 --gen 128 | --server "
+                         "(--ids 1,2,3 --gen 128 | --minicpmo-eval-batch "
+                         "[--minicpmo-eval-vision-batch-size 16] | --server "
                          "[--host 127.0.0.1 --port 8080 --ctx-size 32768 --model-name name "
                          "--api-key key --web-root path --minicpmo-duplex] | --kl-base reference.bin "
                          "[--kl-evaluator optimized|legacy --kl-chunks -1 "
