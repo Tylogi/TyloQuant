@@ -2294,6 +2294,63 @@ static bool minicpmo45_contains_token(
     return std::find(values.begin(), values.end(), token) != values.end();
 }
 
+static std::vector<std::pair<int64_t, int64_t>>
+minicpmo45_prefill_segments(
+        torch::Tensor boundaries,
+        int64_t range_begin,
+        int64_t range_end,
+        int64_t chunk_tokens) {
+    if (range_begin < 0 || range_end <= range_begin || chunk_tokens < 0) {
+        throw std::runtime_error(
+            "MiniCPM-o prefill segment range is invalid");
+    }
+    boundaries = boundaries.to(
+        torch::kCPU, torch::kInt64).contiguous().reshape({-1});
+    if (boundaries.numel() == 0) {
+        throw std::runtime_error(
+            "MiniCPM-o segmented prefill requires boundaries");
+    }
+    const auto * values = boundaries.data_ptr<int64_t>();
+    std::vector<int64_t> eligible;
+    eligible.reserve(static_cast<size_t>(boundaries.numel()));
+    bool found_begin = range_begin == 0;
+    bool found_end = false;
+    int64_t previous = 0;
+    for (int64_t index = 0; index < boundaries.numel(); ++index) {
+        const int64_t boundary = values[index];
+        if (boundary <= previous) {
+            throw std::runtime_error(
+                "MiniCPM-o prefill boundaries must be increasing");
+        }
+        previous = boundary;
+        if (boundary == range_begin) found_begin = true;
+        if (boundary > range_begin && boundary <= range_end) {
+            eligible.push_back(boundary);
+        }
+        if (boundary == range_end) found_end = true;
+    }
+    if (!found_begin || !found_end) {
+        throw std::runtime_error(
+            "MiniCPM-o segmented prefill omits a prompt span");
+    }
+
+    std::vector<std::pair<int64_t, int64_t>> segments;
+    int64_t segment_begin = range_begin;
+    for (const int64_t boundary : eligible) {
+        if (chunk_tokens == 0 ||
+                boundary == range_end ||
+                boundary - segment_begin >= chunk_tokens) {
+            segments.emplace_back(segment_begin, boundary);
+            segment_begin = boundary;
+        }
+    }
+    if (segments.empty() || segments.back().second != range_end) {
+        throw std::runtime_error(
+            "MiniCPM-o segmented prefill omits a prompt span");
+    }
+    return segments;
+}
+
 static int run_minicpmo45_eval_batch(
         const std::string & mfq_path,
         const std::string & config_path,
@@ -2332,6 +2389,8 @@ static int run_minicpmo45_eval_batch(
             request.value("reuse_prefix_cache", true);
         const bool require_segmented_prefill =
             request.value("require_segmented_prefill", false);
+        const int64_t segmented_prefill_chunk_tokens =
+            request.value("segmented_prefill_chunk_tokens", int64_t{0});
         const int64_t max_new_tokens =
             request.value("max_new_tokens", int64_t{128});
         const double repetition_penalty =
@@ -2367,6 +2426,9 @@ static int run_minicpmo45_eval_batch(
         if (question_count <= 0 || prefix_length < 0 ||
                 (reuse_prefix_cache && prefix_length <= 0) ||
                 max_new_tokens <= 0 || repetition_penalty <= 0.0 ||
+                segmented_prefill_chunk_tokens < 0 ||
+                (segmented_prefill_chunk_tokens > 0 &&
+                 !require_segmented_prefill) ||
                 eos_token_ids.empty()) {
             throw std::runtime_error(
                 "MiniCPM-o eval request has invalid generation settings");
@@ -2385,6 +2447,10 @@ static int run_minicpmo45_eval_batch(
         if (tts_teacher_forcing && !generate_tts) {
             throw std::runtime_error(
                 "MiniCPM-o teacher forcing requires TTS generation");
+        }
+        if (tts_teacher_forcing && segmented_prefill_chunk_tokens > 0) {
+            throw std::runtime_error(
+                "MiniCPM-o teacher forcing requires exact prefill segments");
         }
 
         const auto wall_started = std::chrono::steady_clock::now();
@@ -2522,6 +2588,7 @@ static int run_minicpmo45_eval_batch(
                 "MiniCPM-o common prefix exceeds the first prompt");
         }
         double prefix_seconds = 0.0;
+        int64_t prefix_prefill_calls = 0;
         if (reuse_prefix_cache) {
             runtime.language.reset(1);
             auto prefix_ids = first_ids.narrow(1, 0, prefix_length);
@@ -2535,36 +2602,25 @@ static int run_minicpmo45_eval_batch(
             const auto prefix_started = std::chrono::steady_clock::now();
             torch::Tensor prefix_hidden;
             if (require_segmented_prefill) {
-                first_prefill_splits = first_prefill_splits.to(
-                    torch::kCPU, torch::kInt64).contiguous().reshape({-1});
-                const auto * splits =
-                    first_prefill_splits.data_ptr<int64_t>();
-                int64_t segment_begin = 0;
-                for (int64_t split = 0;
-                        split < first_prefill_splits.numel(); ++split) {
-                    const int64_t segment_end = splits[split];
-                    if (segment_end <= segment_begin ||
-                            segment_end > prefix_length) {
-                        if (segment_begin == prefix_length) break;
-                        throw std::runtime_error(
-                            "MiniCPM-o prefix prefill split is invalid");
-                    }
+                const auto segments = minicpmo45_prefill_segments(
+                    first_prefill_splits, 0, prefix_length,
+                    segmented_prefill_chunk_tokens);
+                for (const auto & segment : segments) {
+                    const int64_t segment_begin = segment.first;
+                    const int64_t segment_end = segment.second;
                     prefix_hidden = runtime.language.hidden_forward_inputs(
                         prefix_ids.narrow(
                             1, segment_begin, segment_end - segment_begin),
                         prefix_embeddings.narrow(
                             1, segment_begin, segment_end - segment_begin),
                         c10::nullopt, c10::nullopt, nullptr, c10::nullopt);
-                    segment_begin = segment_end;
-                }
-                if (segment_begin != prefix_length) {
-                    throw std::runtime_error(
-                        "MiniCPM-o segmented prefill omits the cache boundary");
+                    ++prefix_prefill_calls;
                 }
             } else {
                 prefix_hidden = runtime.language.hidden_forward_inputs(
                     prefix_ids, prefix_embeddings,
                     c10::nullopt, c10::nullopt, nullptr, prefix_mask);
+                prefix_prefill_calls = 1;
             }
             MFQ_CUDA_CHECK(cudaDeviceSynchronize());
             prefix_seconds = std::chrono::duration<double>(
@@ -2634,6 +2690,7 @@ static int run_minicpmo45_eval_batch(
             torch::Tensor hidden;
             torch::Tensor teacher_text_hidden;
             torch::Tensor logits;
+            int64_t suffix_prefill_calls = 0;
             if (tts_teacher_forcing) {
                 if (reuse_prefix_cache || evaluated_prefix_length != 0) {
                     throw std::runtime_error(
@@ -2671,45 +2728,26 @@ static int run_minicpmo45_eval_batch(
                     }
                     hidden = segment_hidden;
                     segment_begin = segment_end;
+                    ++suffix_prefill_calls;
                 }
                 if (segment_begin != input_ids.size(1) || !found_text) {
                     throw std::runtime_error(
                         "MiniCPM-o teacher-forcing splits omit the text span");
                 }
             } else if (require_segmented_prefill) {
-                prefill_splits = prefill_splits.to(
-                    torch::kCPU, torch::kInt64).contiguous().reshape({-1});
-                if (prefill_splits.numel() < 2) {
-                    throw std::runtime_error(
-                        "MiniCPM-o segmented prefill requires boundaries");
-                }
-                const auto * splits = prefill_splits.data_ptr<int64_t>();
-                int64_t segment_begin = evaluated_prefix_length;
-                bool found_cache_boundary = evaluated_prefix_length == 0;
-                for (int64_t split = 0; split < prefill_splits.numel(); ++split) {
-                    const int64_t segment_end = splits[split];
-                    if (segment_end == evaluated_prefix_length) {
-                        found_cache_boundary = true;
-                        continue;
-                    }
-                    if (segment_end < evaluated_prefix_length) continue;
-                    if (segment_end <= segment_begin ||
-                            segment_end > input_ids.size(1)) {
-                        throw std::runtime_error(
-                            "MiniCPM-o segmented prefill boundary is invalid");
-                    }
+                const auto segments = minicpmo45_prefill_segments(
+                    prefill_splits, evaluated_prefix_length,
+                    input_ids.size(1), segmented_prefill_chunk_tokens);
+                for (const auto & segment : segments) {
+                    const int64_t segment_begin = segment.first;
+                    const int64_t segment_end = segment.second;
                     hidden = runtime.language.hidden_forward_inputs(
                         input_ids.narrow(
                             1, segment_begin, segment_end - segment_begin),
                         input_embeddings.narrow(
                             1, segment_begin, segment_end - segment_begin),
                         c10::nullopt, c10::nullopt, nullptr, c10::nullopt);
-                    segment_begin = segment_end;
-                }
-                if (!found_cache_boundary ||
-                        segment_begin != input_ids.size(1)) {
-                    throw std::runtime_error(
-                        "MiniCPM-o segmented prefill omits a prompt span");
+                    ++suffix_prefill_calls;
                 }
                 logits = runtime.language.logits_from_hidden(
                     hidden.index({Slice(), -1, Slice()}));
@@ -2717,6 +2755,7 @@ static int run_minicpmo45_eval_batch(
                 hidden = runtime.language.hidden_forward_inputs(
                     suffix_ids, suffix_embeddings,
                     c10::nullopt, c10::nullopt, nullptr, attention_mask);
+                suffix_prefill_calls = 1;
                 logits = runtime.language.logits_from_hidden(
                     hidden.index({Slice(), -1, Slice()}));
             }
@@ -2843,6 +2882,7 @@ static int run_minicpmo45_eval_batch(
                 {"context_tokens", input_ids.size(1)},
                 {"prefix_tokens", evaluated_prefix_length},
                 {"suffix_tokens", suffix_length},
+                {"suffix_prefill_calls", suffix_prefill_calls},
                 {"generated_token_ids", generated},
                 {"generation_seconds", generation_seconds},
                 {"suffix_prefill_seconds", suffix_prefill_seconds},
@@ -2873,6 +2913,9 @@ static int run_minicpmo45_eval_batch(
             {"vision_seconds", vision_seconds},
             {"audio_seconds", audio_seconds},
             {"prefix_seconds", prefix_seconds},
+            {"prefix_prefill_calls", prefix_prefill_calls},
+            {"segmented_prefill_chunk_tokens",
+                segmented_prefill_chunk_tokens},
             {"wall_seconds", std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - wall_started).count()},
             {"allocated_bytes", stats.allocated_bytes[aggregate].current},
