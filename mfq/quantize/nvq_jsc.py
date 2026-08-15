@@ -28,6 +28,8 @@ from mfq.quantize.nvq_quant_torch import (
 
 _GROUP_SIZE = 24
 _STATE_COUNT = 16
+_METAL_E8_ANCHOR_GROUPS = 8
+_METAL_E8_EXTRA_ITERATIONS = 2
 
 
 @dataclass(frozen=True)
@@ -357,6 +359,25 @@ def _native_e8_jsc_assignment_supported(
     )
 
 
+def _metal_e8_jsc_assignment_supported(
+    codebooks: torch.Tensor,
+    config: NvqJscConfig,
+) -> bool:
+    return (
+        codebooks.device.type == "mps"
+        and codebooks.dtype == torch.int8
+        and config.banks == 4
+        and config.spec.vector_size == 8
+        and config.spec.codebook_entries in {256, 1024, 4096}
+        and tuple(codebooks.shape)
+        == (
+            4,
+            config.spec.codebook_entries,
+            config.spec.vector_size,
+        )
+    )
+
+
 def _native_e8_search_banks(
     xgroup: torch.Tensor,
     wgroup: torch.Tensor,
@@ -394,6 +415,32 @@ def _assign_groups(
     valid_last: int,
     config: NvqJscConfig,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if _metal_e8_jsc_assignment_supported(codebooks, config):
+        from mfq.quantize.metal.nvq_jsc import nvq2j_assign
+
+        padded_width = ng * _GROUP_SIZE
+        valid_width = (ng - 1) * _GROUP_SIZE + valid_last
+        state_2d, indices_3d = nvq2j_assign(
+            xgroup.reshape(out, padded_width),
+            wgroup.reshape(out, padded_width),
+            neuron_scale,
+            alpha,
+            bank_for_state,
+            codebooks,
+            valid_width,
+        )
+        state = state_2d.reshape(-1).to(torch.int64)
+        indices = indices_3d.reshape(
+            -1, _GROUP_SIZE // config.spec.vector_size
+        ).to(torch.int64)
+        bank = bank_for_state[state]
+        code = _codes_for_assignment(codebooks, bank, indices)
+        scale = neuron_scale.repeat_interleave(ng) * alpha[state]
+        error = (
+            wgroup * (scale.unsqueeze(1) * code - xgroup).square()
+        ).sum(1)
+        return state, bank, indices, error
+
     if _native_e8_jsc_assignment_supported(codebooks, config):
         raw_scales, _ = _native_e8_search_banks(
             xgroup,
@@ -857,7 +904,14 @@ def quantize_nvq_jsc_fixed(
                 -1, vectors_per_group
             ).to(torch.int64)
             bank = bank_for_state[state]
-            for _ in range(assignment_refine_steps):
+            # Joint E8 assignment makes repeated full-tensor anchor refits
+            # negligible; D4 still benefits from the configured refinement.
+            metal_refine_steps = (
+                0
+                if spec.vector_size == 8
+                else assignment_refine_steps
+            )
+            for _ in range(metal_refine_steps):
                 neuron_scale, _ = _refit_scale_tables(
                     xgroup,
                     wgroup,
@@ -1070,10 +1124,58 @@ def train_nvq_jsc(
     alpha_cpu, bank_cpu = _initial_state_tables(config)
     alpha = alpha_cpu.to(value.device)
     bank_for_state = bank_cpu.to(value.device)
+    metal_fused_assignment = _metal_e8_jsc_assignment_supported(
+        codebooks, config
+    )
 
-    raw_scales = []
-    raw_errors = []
-    if _native_e8_jsc_assignment_supported(codebooks, config):
+    if metal_fused_assignment:
+        candidate_count = min(_METAL_E8_ANCHOR_GROUPS, ng)
+        group_peak = xgroup.amax(1).reshape(out, ng)
+        candidate_group = group_peak.topk(
+            candidate_count, dim=1, sorted=False
+        ).indices
+        candidate_flat = (
+            torch.arange(out, device=value.device).unsqueeze(1) * ng
+            + candidate_group
+        ).reshape(-1)
+        candidate_x = xgroup[candidate_flat].contiguous()
+        candidate_w = wgroup[candidate_flat].contiguous()
+        raw_scales = []
+        raw_errors = []
+        for bank_id in range(config.banks):
+            raw_scale, raw_index = _search(
+                candidate_x,
+                candidate_w,
+                codebooks[bank_id],
+                candidate_count,
+                _GROUP_SIZE,
+                config,
+            )
+            raw_code = (
+                codebooks[bank_id][raw_index]
+                .reshape_as(candidate_x)
+                .to(torch.float32)
+            )
+            raw_error = (
+                candidate_w
+                * (raw_scale.unsqueeze(1) * raw_code - candidate_x).square()
+            ).sum(1)
+            raw_scales.append(raw_scale)
+            raw_errors.append(raw_error)
+        stacked_error = torch.stack(raw_errors, dim=1)
+        initial_bank = stacked_error.argmin(1)
+        stacked_scale = torch.stack(raw_scales, dim=1)
+        initial_scale = stacked_scale.gather(
+            1, initial_bank.unsqueeze(1)
+        ).squeeze(1)
+        row_max = initial_scale.reshape(out, candidate_count).amax(1)
+        alpha_max = alpha.max()
+        neuron_scale = _fp16_round(
+            torch.where(row_max > 0, row_max / alpha_max, row_max)
+        ).contiguous()
+    elif _native_e8_jsc_assignment_supported(codebooks, config):
+        raw_scales = []
+        raw_errors = []
         native_scales, native_indices = _native_e8_search_banks(
             xgroup,
             wgroup,
@@ -1096,7 +1198,20 @@ def train_nvq_jsc(
             ).sum(1)
             raw_scales.append(raw_scale)
             raw_errors.append(raw_error)
+        stacked_error = torch.stack(raw_errors, dim=1)
+        initial_bank = stacked_error.argmin(1)
+        stacked_scale = torch.stack(raw_scales, dim=1)
+        initial_scale = stacked_scale.gather(
+            1, initial_bank.unsqueeze(1)
+        ).squeeze(1)
+        row_max = initial_scale.reshape(out, ng).amax(1)
+        alpha_max = alpha.max()
+        neuron_scale = _fp16_round(
+            torch.where(row_max > 0, row_max / alpha_max, row_max)
+        )
     else:
+        raw_scales = []
+        raw_errors = []
         for bank_id in range(config.banks):
             raw_scale, raw_index = _search(
                 xgroup,
@@ -1117,21 +1232,26 @@ def train_nvq_jsc(
             ).sum(1)
             raw_scales.append(raw_scale)
             raw_errors.append(raw_error)
-    stacked_error = torch.stack(raw_errors, dim=1)
-    initial_bank = stacked_error.argmin(1)
-    stacked_scale = torch.stack(raw_scales, dim=1)
-    initial_scale = stacked_scale.gather(1, initial_bank.unsqueeze(1)).squeeze(1)
-    row_max = initial_scale.reshape(out, ng).amax(1)
-    alpha_max = alpha.max()
-    neuron_scale = _fp16_round(
-        torch.where(row_max > 0, row_max / alpha_max, row_max)
-    )
+        stacked_error = torch.stack(raw_errors, dim=1)
+        initial_bank = stacked_error.argmin(1)
+        stacked_scale = torch.stack(raw_scales, dim=1)
+        initial_scale = stacked_scale.gather(
+            1, initial_bank.unsqueeze(1)
+        ).squeeze(1)
+        row_max = initial_scale.reshape(out, ng).amax(1)
+        alpha_max = alpha.max()
+        neuron_scale = _fp16_round(
+            torch.where(row_max > 0, row_max / alpha_max, row_max)
+        )
 
     history: list[NvqJscIteration] = []
     best: tuple[float, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     signal = float((wgroup * xgroup.square()).sum().item())
 
-    for iteration in range(config.iterations + 1):
+    iteration_limit = config.iterations
+    if metal_fused_assignment and config.iterations >= 4:
+        iteration_limit += _METAL_E8_EXTRA_ITERATIONS
+    for iteration in range(iteration_limit + 1):
         state, bank, indices, _ = _assign_groups(
             xgroup,
             wgroup,
@@ -1144,7 +1264,10 @@ def train_nvq_jsc(
             valid_last=valid_last,
             config=config,
         )
-        for _ in range(config.assignment_refine_steps):
+        refine_steps = (
+            0 if metal_fused_assignment else config.assignment_refine_steps
+        )
+        for _ in range(refine_steps):
             neuron_scale, alpha = _refit_scale_tables(
                 xgroup,
                 wgroup,
@@ -1209,7 +1332,7 @@ def train_nvq_jsc(
                 indices.clone(),
             )
             best_codebooks = codebooks.clone()
-        if iteration == config.iterations:
+        if iteration == iteration_limit:
             break
         codebooks = _update_codebooks(
             xgroup,
