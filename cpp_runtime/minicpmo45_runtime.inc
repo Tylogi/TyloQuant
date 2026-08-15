@@ -2351,6 +2351,43 @@ minicpmo45_prefill_segments(
     return segments;
 }
 
+static std::vector<std::pair<int64_t, int64_t>>
+minicpmo45_teacher_prefill_segments(
+        torch::Tensor boundaries,
+        int64_t range_end,
+        int64_t text_begin,
+        int64_t text_end,
+        int64_t chunk_tokens) {
+    if (range_end <= 0 || text_begin < 0 || text_end <= text_begin ||
+            text_end > range_end || chunk_tokens < 0) {
+        throw std::runtime_error(
+            "MiniCPM-o teacher-forcing prefill range is invalid");
+    }
+    const auto exact = minicpmo45_prefill_segments(
+        boundaries, 0, range_end, 0);
+    const auto text = std::make_pair(text_begin, text_end);
+    if (std::find(exact.begin(), exact.end(), text) == exact.end()) {
+        throw std::runtime_error(
+            "MiniCPM-o teacher-forcing splits omit the text span");
+    }
+    if (chunk_tokens == 0) return exact;
+
+    std::vector<std::pair<int64_t, int64_t>> segments;
+    const auto append = [&](const auto & parts) {
+        segments.insert(segments.end(), parts.begin(), parts.end());
+    };
+    if (text_begin > 0) {
+        append(minicpmo45_prefill_segments(
+            boundaries, 0, text_begin, chunk_tokens));
+    }
+    segments.emplace_back(text);
+    if (text_end < range_end) {
+        append(minicpmo45_prefill_segments(
+            boundaries, text_end, range_end, chunk_tokens));
+    }
+    return segments;
+}
+
 static int run_minicpmo45_eval_batch(
         const std::string & mfq_path,
         const std::string & config_path,
@@ -2448,11 +2485,6 @@ static int run_minicpmo45_eval_batch(
             throw std::runtime_error(
                 "MiniCPM-o teacher forcing requires TTS generation");
         }
-        if (tts_teacher_forcing && segmented_prefill_chunk_tokens > 0) {
-            throw std::runtime_error(
-                "MiniCPM-o teacher forcing requires exact prefill segments");
-        }
-
         const auto wall_started = std::chrono::steady_clock::now();
         auto pixels = minicpmo45_load_tensor(
             input_prefix + ".pixel_values.pt", false);
@@ -2706,16 +2738,13 @@ static int run_minicpmo45_eval_batch(
                 }
                 const int64_t text_begin = tts_bound[0].item<int64_t>();
                 const int64_t text_end = tts_bound[1].item<int64_t>();
-                const auto * splits = prefill_splits.data_ptr<int64_t>();
-                int64_t segment_begin = 0;
+                const auto segments = minicpmo45_teacher_prefill_segments(
+                    prefill_splits, input_ids.size(1), text_begin, text_end,
+                    segmented_prefill_chunk_tokens);
                 bool found_text = false;
-                for (int64_t split = 0; split < prefill_splits.numel(); ++split) {
-                    const int64_t segment_end = splits[split];
-                    if (segment_end <= segment_begin ||
-                            segment_end > input_ids.size(1)) {
-                        throw std::runtime_error(
-                            "MiniCPM-o teacher-forcing prefill split is invalid");
-                    }
+                for (const auto & segment : segments) {
+                    const int64_t segment_begin = segment.first;
+                    const int64_t segment_end = segment.second;
                     auto segment_hidden = runtime.language.hidden_forward_inputs(
                         input_ids.narrow(
                             1, segment_begin, segment_end - segment_begin),
@@ -2727,10 +2756,9 @@ static int run_minicpmo45_eval_batch(
                         found_text = true;
                     }
                     hidden = segment_hidden;
-                    segment_begin = segment_end;
                     ++suffix_prefill_calls;
                 }
-                if (segment_begin != input_ids.size(1) || !found_text) {
+                if (!found_text) {
                     throw std::runtime_error(
                         "MiniCPM-o teacher-forcing splits omit the text span");
                 }

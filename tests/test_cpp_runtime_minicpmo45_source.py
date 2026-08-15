@@ -250,8 +250,10 @@ def test_minicpmo45_eval_batch_can_match_pr_prefill_call_boundaries():
     assert 'request.value("segmented_prefill_chunk_tokens", int64_t{0})' in GRAPH
     assert 'first_prefix + ".prefill_splits.pt"' in GRAPH
     assert "minicpmo45_prefill_segments(" in GRAPH
+    assert "minicpmo45_teacher_prefill_segments(" in GRAPH
     assert "boundary - segment_begin >= chunk_tokens" in GRAPH
-    assert "teacher forcing requires exact prefill segments" in GRAPH
+    assert "segments.emplace_back(text)" in GRAPH
+    assert "teacher-forcing splits omit the text span" in GRAPH
     assert "MiniCPM-o segmented prefill omits a prompt span" in GRAPH
     assert "image_embedding_parts.push_back(runtime.resampler.forward(" in GRAPH
     assert "MiniCPM-o per-segment Whisper length mismatch" in GRAPH
