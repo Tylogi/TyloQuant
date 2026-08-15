@@ -17,6 +17,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <mma.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
@@ -971,9 +972,9 @@ torch::Tensor nint_dequant_full_packed_h2_cuda(
 //   sum_m      = sum_g xscale[m,g]*sub_min[row,g]  *(sum qx)_g
 // ---------------------------------------------------------------------------
 
-template <int GS, int BD, bool WITH_SUM=false>
+template <int GS, int BD, bool WITH_SUM=false, bool INPUT_BF16=false>
 __global__ void quantize_x_kernel(
-    const __half* __restrict__ x,   // [M, K_real]
+    const void* __restrict__ x,      // [M, K_real], FP16 or BF16
     int8_t* __restrict__ qx,         // [M, K_pad]
     float* __restrict__ xscale,      // [M, ng]
     int32_t* __restrict__ xsum,      // [M, ng]
@@ -985,7 +986,18 @@ __global__ void quantize_x_kernel(
     int ng = gridDim.y;
     int base = g * GS;
     bool real = (tid < GS) && (base + tid < K_real);
-    float xv = (tid < GS && real) ? __half2float(x[(size_t)m * K_real + base + tid]) : 0.0f;
+    float xv = 0.0f;
+    if (tid < GS && real) {
+        const size_t index = (size_t)m * K_real + base + tid;
+        if constexpr (INPUT_BF16) {
+            const float source = __bfloat162float(
+                reinterpret_cast<const __nv_bfloat16*>(x)[index]);
+            xv = __half2float(__float2half(source));
+        } else {
+            xv = __half2float(
+                reinterpret_cast<const __half*>(x)[index]);
+        }
+    }
 
     float amax = block_max<BD / 32>(fabsf(xv));
     float scale = (amax > 0.0f) ? amax / 127.0f : 1.0f;
@@ -2778,7 +2790,7 @@ __global__ void __launch_bounds__(NWARPS * 32, 1) gemv_packed_u8_m1_row_kernel(
     }
 }
 
-template <int NWARPS=4, bool VEC_LOAD=false>
+template <int NWARPS=4, bool VEC_LOAD=false, bool OUTPUT_BF16=false>
 __global__ void __launch_bounds__(256) gemv_packed_gs24_group_kernel(
     const uint8_t* __restrict__ q_packed,
     const uint8_t* __restrict__ sub_scale,
@@ -2788,7 +2800,7 @@ __global__ void __launch_bounds__(256) gemv_packed_gs24_group_kernel(
     const int8_t* __restrict__ qx,
     const float* __restrict__ xscale,
     const int32_t*,
-    __half* __restrict__ out,
+    void* __restrict__ out,
     int M, int N, int ng, int K_pad)
 {
     constexpr int GS = 24;
@@ -2859,7 +2871,118 @@ __global__ void __launch_bounds__(256) gemv_packed_gs24_group_kernel(
             pm += __shfl_xor_sync(0xffffffff, pm, o);
         }
         if (lane == 0) {
-            out[(size_t)m * N + row] = __float2half(neuron_scale[row] * pd - neuron_min[row] * pm);
+            const size_t output_index = (size_t)m * N + row;
+            const __half rounded = __float2half(
+                neuron_scale[row] * pd - neuron_min[row] * pm);
+            if constexpr (OUTPUT_BF16) {
+                reinterpret_cast<__nv_bfloat16*>(out)[output_index] =
+                    __float2bfloat16(__half2float(rounded));
+            } else {
+                reinterpret_cast<__half*>(out)[output_index] = rounded;
+            }
+        }
+    }
+}
+
+struct Nint4Gs24Projection {
+    const uint8_t* q_packed;
+    const uint8_t* sub_scale;
+    const uint8_t* sub_min;
+    const float* neuron_scale;
+    const float* neuron_min;
+    void* out;
+    int n;
+};
+
+template <int NPROJ, bool OUTPUT_BF16>
+__global__ void __launch_bounds__(128) gemv_packed_gs24_multi_group_kernel(
+    Nint4Gs24Projection first,
+    Nint4Gs24Projection second,
+    Nint4Gs24Projection third,
+    const int8_t* __restrict__ qx,
+    const float* __restrict__ xscale,
+    int ng)
+{
+    constexpr int GS = 24;
+    constexpr int NWARPS = 4;
+    int row = blockIdx.x;
+    Nint4Gs24Projection projection = first;
+    if (row >= first.n) {
+        row -= first.n;
+        projection = second;
+        if constexpr (NPROJ == 3) {
+            if (row >= second.n) {
+                row -= second.n;
+                projection = third;
+            }
+        }
+    }
+    if (row >= projection.n) return;
+
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const uint8_t* qrow =
+        projection.q_packed + (size_t)row * ng * (GS / 2);
+    const uint8_t* ssrow = projection.sub_scale + (size_t)row * ng;
+    const uint8_t* smrow = projection.sub_min + (size_t)row * ng;
+    float pd = 0.0f;
+    float pm = 0.0f;
+
+    for (int g = warp * 32 + lane; g < ng; g += NWARPS * 32) {
+        int dsum = 0;
+        int msum = 0;
+        const uint8_t* qgroup = qrow + g * (GS / 2);
+        const uint32_t* qwords =
+            reinterpret_cast<const uint32_t*>(qgroup);
+        const uint32_t qw0 = qwords[0];
+        const uint32_t qw1 = qwords[1];
+        const uint32_t qw2 = qwords[2];
+        #pragma unroll
+        for (int chunk = 0; chunk < 6; ++chunk) {
+            const int base = g * GS + chunk * 4;
+            const int xv = *reinterpret_cast<const int*>(qx + base);
+            const uint32_t qw =
+                chunk < 2 ? qw0 : (chunk < 4 ? qw1 : qw2);
+            const int qv =
+                unpack_int4x4_u16(qw >> ((chunk & 1) * 16));
+            dsum = __dp4a(qv, xv, dsum);
+            msum = __dp4a(0x01010101, xv, msum);
+        }
+        const float xs = xscale[g];
+        pd += xs * (float)ssrow[g] * (float)dsum;
+        pm += xs * (float)smrow[g] * (float)msum;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        pd += __shfl_xor_sync(0xffffffff, pd, offset);
+        pm += __shfl_xor_sync(0xffffffff, pm, offset);
+    }
+    __shared__ float partial_d[NWARPS];
+    __shared__ float partial_m[NWARPS];
+    if (lane == 0) {
+        partial_d[warp] = pd;
+        partial_m[warp] = pm;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        pd = lane < NWARPS ? partial_d[lane] : 0.0f;
+        pm = lane < NWARPS ? partial_m[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            pd += __shfl_xor_sync(0xffffffff, pd, offset);
+            pm += __shfl_xor_sync(0xffffffff, pm, offset);
+        }
+        if (lane == 0) {
+            const __half rounded = __float2half(
+                projection.neuron_scale[row] * pd -
+                projection.neuron_min[row] * pm);
+            if constexpr (OUTPUT_BF16) {
+                reinterpret_cast<__nv_bfloat16*>(projection.out)[row] =
+                    __float2bfloat16(__half2float(rounded));
+            } else {
+                reinterpret_cast<__half*>(projection.out)[row] = rounded;
+            }
         }
     }
 }
@@ -4121,6 +4244,69 @@ torch::Tensor nint_gemv_packed_ws_cuda(
     return out;
 }
 
+torch::Tensor nint4_gs24_gemv_bf16_ws_cuda(
+    torch::Tensor q_packed, torch::Tensor sub_scale,
+    torch::Tensor sub_min, torch::Tensor neuron_scale,
+    torch::Tensor neuron_min, torch::Tensor x,
+    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+{
+    TORCH_CHECK(
+        q_packed.is_cuda() && q_packed.is_contiguous() &&
+        q_packed.scalar_type() == torch::kUInt8 &&
+        q_packed.dim() == 3 && q_packed.size(2) == 12,
+        "direct BF16 NINT4 output requires CUDA packed gs24 weights");
+    TORCH_CHECK(
+        x.is_cuda() && x.is_contiguous() &&
+        (x.scalar_type() == torch::kFloat16 ||
+         x.scalar_type() == torch::kBFloat16) &&
+        x.dim() == 2 && x.size(0) == 1,
+        "direct BF16 NINT4 output requires CUDA contiguous FP16 or BF16 M=1 input");
+    TORCH_CHECK(
+        qx.is_cuda() && qx.is_contiguous() &&
+        qx.scalar_type() == torch::kInt8 &&
+        xscale.is_cuda() && xscale.is_contiguous() &&
+        xscale.scalar_type() == torch::kFloat32 &&
+        xsum.is_cuda() && xsum.is_contiguous() &&
+        xsum.scalar_type() == torch::kInt32,
+        "direct BF16 NINT4 output workspace mismatch");
+    const int N = (int)q_packed.size(0);
+    const int ng = (int)q_packed.size(1);
+    const int K_pad = ng * 24;
+    TORCH_CHECK(
+        x.size(1) <= K_pad && qx.size(0) >= 1 &&
+        qx.size(1) >= K_pad && xscale.size(0) >= 1 &&
+        xscale.size(1) >= ng && xsum.size(0) >= 1 &&
+        xsum.size(1) >= ng,
+        "direct BF16 NINT4 output workspace is too small");
+    auto out = torch::empty(
+        {1, N}, x.options().dtype(torch::kBFloat16));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    if (x.scalar_type() == torch::kBFloat16) {
+        quantize_x_kernel<24, 32, false, true>
+            <<<dim3(1, ng), 32, 0, stream>>>(
+                x.data_ptr(), qx.data_ptr<int8_t>(),
+                xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),
+                1, (int)x.size(1), K_pad);
+    } else {
+        quantize_x_kernel<24, 32>
+            <<<dim3(1, ng), 32, 0, stream>>>(
+                x.data_ptr(), qx.data_ptr<int8_t>(),
+                xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),
+                1, (int)x.size(1), K_pad);
+    }
+    gemv_packed_gs24_group_kernel<4, true, true>
+        <<<dim3(N, 1), dim3(32, 4), 0, stream>>>(
+            q_packed.data_ptr<uint8_t>(),
+            sub_scale.data_ptr<uint8_t>(),
+            sub_min.data_ptr<uint8_t>(),
+            neuron_scale.data_ptr<float>(),
+            neuron_min.data_ptr<float>(),
+            qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
+            xsum.data_ptr<int32_t>(), out.data_ptr(),
+            1, N, ng, K_pad);
+    return out;
+}
+
 // NINT6 packed GEMV with caller workspace. Only valid for 4|gs (the kernel
 // assumes a lane's 4 consecutive elements stay within one group). Covers the
 // NINT6 catalog values 20/24/28/32/36/40/48/64.
@@ -4364,6 +4550,167 @@ torch::Tensor nint_gemv_packed_qx_ws_cuda(
     }
 #undef QXLAUNCH
     return out;
+}
+
+void nint4_gs24_quantize_input_ws_cuda(
+    torch::Tensor x, torch::Tensor qx,
+    torch::Tensor xscale, torch::Tensor xsum)
+{
+    TORCH_CHECK(
+        x.is_cuda() && x.is_contiguous() &&
+        (x.scalar_type() == torch::kHalf ||
+         x.scalar_type() == torch::kBFloat16),
+        "x must be CUDA contiguous FP16 or BF16");
+    TORCH_CHECK(
+        qx.is_cuda() && qx.is_contiguous() &&
+        qx.scalar_type() == torch::kInt8,
+        "qx workspace must be CUDA contiguous int8");
+    TORCH_CHECK(
+        xscale.is_cuda() && xscale.is_contiguous() &&
+        xscale.scalar_type() == torch::kFloat32,
+        "xscale workspace must be CUDA contiguous FP32");
+    TORCH_CHECK(
+        xsum.is_cuda() && xsum.is_contiguous() &&
+        xsum.scalar_type() == torch::kInt32,
+        "xsum workspace must be CUDA contiguous int32");
+    TORCH_CHECK(
+        x.dim() == 2 && x.size(0) == 1,
+        "shared NINT4 activation quantization requires M=1");
+    const int ng = (int)xscale.size(1);
+    const int K_pad = ng * 24;
+    TORCH_CHECK(
+        qx.size(0) == 1 && qx.size(1) >= K_pad,
+        "qx workspace shape mismatch");
+    TORCH_CHECK(
+        xscale.size(0) == 1 && xsum.size(0) == 1 &&
+        xsum.size(1) >= ng,
+        "activation scale workspace shape mismatch");
+    TORCH_CHECK(
+        x.size(1) <= K_pad,
+        "activation width exceeds the padded NINT4 width");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    if (x.scalar_type() == torch::kBFloat16) {
+        quantize_x_kernel<24, 32, false, true>
+            <<<dim3(1, ng), 32, 0, stream>>>(
+                x.data_ptr(), qx.data_ptr<int8_t>(),
+                xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),
+                1, (int)x.size(1), K_pad);
+    } else {
+        quantize_x_kernel<24, 32>
+            <<<dim3(1, ng), 32, 0, stream>>>(
+                x.data_ptr(), qx.data_ptr<int8_t>(),
+                xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),
+                1, (int)x.size(1), K_pad);
+    }
+}
+
+std::vector<torch::Tensor> nint4_gs24_gemv_multi_qx_ws_cuda(
+    const std::vector<torch::Tensor> & q_packed,
+    const std::vector<torch::Tensor> & sub_scale,
+    const std::vector<torch::Tensor> & sub_min,
+    const std::vector<torch::Tensor> & neuron_scale,
+    const std::vector<torch::Tensor> & neuron_min,
+    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum,
+    bool output_bf16)
+{
+    const size_t count = q_packed.size();
+    TORCH_CHECK(
+        count == 2 || count == 3,
+        "multi-projection NINT4 GEMV requires two or three projections");
+    TORCH_CHECK(
+        sub_scale.size() == count && sub_min.size() == count &&
+        neuron_scale.size() == count && neuron_min.size() == count,
+        "multi-projection NINT4 metadata count mismatch");
+    TORCH_CHECK(
+        qx.is_cuda() && qx.is_contiguous() &&
+        qx.scalar_type() == torch::kInt8 && qx.size(0) == 1,
+        "shared qx must be CUDA contiguous int8 with M=1");
+    TORCH_CHECK(
+        xscale.is_cuda() && xscale.is_contiguous() &&
+        xscale.scalar_type() == torch::kFloat32 && xscale.size(0) == 1,
+        "shared xscale must be CUDA contiguous FP32 with M=1");
+    TORCH_CHECK(
+        xsum.is_cuda() && xsum.is_contiguous() &&
+        xsum.scalar_type() == torch::kInt32 && xsum.size(0) == 1,
+        "shared xsum must be CUDA contiguous int32 with M=1");
+    const int ng = (int)xscale.size(1);
+    TORCH_CHECK(
+        qx.size(1) >= (int64_t)ng * 24 && xsum.size(1) >= ng,
+        "shared NINT4 workspace is too small");
+
+    std::vector<torch::Tensor> outputs;
+    outputs.reserve(count);
+    std::vector<Nint4Gs24Projection> projections;
+    projections.reserve(count);
+    int total_rows = 0;
+    for (size_t index = 0; index < count; ++index) {
+        TORCH_CHECK(
+            q_packed[index].is_cuda() &&
+            q_packed[index].is_contiguous() &&
+            q_packed[index].scalar_type() == torch::kUInt8 &&
+            q_packed[index].dim() == 3 &&
+            q_packed[index].size(1) == ng &&
+            q_packed[index].size(2) == 12,
+            "multi-projection NINT4 packed-weight shape mismatch");
+        TORCH_CHECK(
+            sub_scale[index].is_cuda() &&
+            sub_scale[index].is_contiguous() &&
+            sub_scale[index].scalar_type() == torch::kUInt8 &&
+            sub_min[index].is_cuda() &&
+            sub_min[index].is_contiguous() &&
+            sub_min[index].scalar_type() == torch::kUInt8,
+            "multi-projection NINT4 sub-scale metadata mismatch");
+        TORCH_CHECK(
+            neuron_scale[index].is_cuda() &&
+            neuron_scale[index].is_contiguous() &&
+            neuron_scale[index].scalar_type() == torch::kFloat32 &&
+            neuron_min[index].is_cuda() &&
+            neuron_min[index].is_contiguous() &&
+            neuron_min[index].scalar_type() == torch::kFloat32,
+            "multi-projection NINT4 neuron metadata mismatch");
+        const int rows = (int)q_packed[index].size(0);
+        outputs.push_back(torch::empty(
+            {1, rows}, qx.options().dtype(
+                output_bf16 ? torch::kBFloat16 : torch::kFloat16)));
+        projections.push_back({
+            q_packed[index].data_ptr<uint8_t>(),
+            sub_scale[index].data_ptr<uint8_t>(),
+            sub_min[index].data_ptr<uint8_t>(),
+            neuron_scale[index].data_ptr<float>(),
+            neuron_min[index].data_ptr<float>(),
+            outputs.back().data_ptr(),
+            rows,
+        });
+        total_rows += rows;
+    }
+    Nint4Gs24Projection third = projections.back();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    if (count == 2) {
+        if (output_bf16) {
+            gemv_packed_gs24_multi_group_kernel<2, true>
+                <<<total_rows, dim3(32, 4), 0, stream>>>(
+                    projections[0], projections[1], third,
+                    qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), ng);
+        } else {
+            gemv_packed_gs24_multi_group_kernel<2, false>
+                <<<total_rows, dim3(32, 4), 0, stream>>>(
+                    projections[0], projections[1], third,
+                    qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), ng);
+        }
+    } else {
+        if (output_bf16) {
+            gemv_packed_gs24_multi_group_kernel<3, true>
+                <<<total_rows, dim3(32, 4), 0, stream>>>(
+                    projections[0], projections[1], projections[2],
+                    qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), ng);
+        } else {
+            gemv_packed_gs24_multi_group_kernel<3, false>
+                <<<total_rows, dim3(32, 4), 0, stream>>>(
+                    projections[0], projections[1], projections[2],
+                    qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), ng);
+        }
+    }
+    return outputs;
 }
 
 torch::Tensor nint_gemv_packed_gate_ws_cuda(

@@ -1,6 +1,7 @@
 // GLU activation helpers used by materialized prefill paths.
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
@@ -39,14 +40,35 @@ __global__ void silu_mul_f16_kernel(
     }
 }
 
+__global__ void silu_mul_bf16_kernel(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    __nv_bfloat16* __restrict__ out,
+    size_t n)
+{
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < n;
+         i += (size_t)gridDim.x * blockDim.x) {
+        const float g = __bfloat162float(gate[i]);
+        const float u = __bfloat162float(up[i]);
+        const __nv_bfloat16 activated = __float2bfloat16(
+            g / (1.0f + expf(-g)));
+        out[i] = __float2bfloat16(
+            __bfloat162float(activated) * u);
+    }
+}
+
 torch::Tensor silu_mul_cuda(torch::Tensor gate, torch::Tensor up)
 {
     TORCH_CHECK(gate.is_cuda() && gate.is_contiguous(), "silu_mul: gate must be cuda contiguous");
     TORCH_CHECK(up.is_cuda() && up.is_contiguous(), "silu_mul: up must be cuda contiguous");
     TORCH_CHECK(gate.sizes() == up.sizes(), "silu_mul: gate/up shapes must match");
     TORCH_CHECK(gate.scalar_type() == up.scalar_type(), "silu_mul: gate/up dtype must match");
-    TORCH_CHECK(gate.scalar_type() == torch::kFloat32 || gate.scalar_type() == torch::kFloat16,
-                "silu_mul: dtype must be f32 or f16");
+    TORCH_CHECK(
+        gate.scalar_type() == torch::kFloat32 ||
+        gate.scalar_type() == torch::kFloat16 ||
+        gate.scalar_type() == torch::kBFloat16,
+        "silu_mul: dtype must be f32, f16, or bf16");
 
     auto out = torch::empty_like(gate);
     size_t n = (size_t)gate.numel();
@@ -56,11 +78,17 @@ torch::Tensor silu_mul_cuda(torch::Tensor gate, torch::Tensor up)
     if (gate.scalar_type() == torch::kFloat32) {
         silu_mul_f32_kernel<<<grid, BD, 0, at::cuda::getCurrentCUDAStream()>>>(
             gate.data_ptr<float>(), up.data_ptr<float>(), out.data_ptr<float>(), n);
-    } else {
+    } else if (gate.scalar_type() == torch::kFloat16) {
         silu_mul_f16_kernel<<<grid, BD, 0, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const half*>(gate.data_ptr<at::Half>()),
             reinterpret_cast<const half*>(up.data_ptr<at::Half>()),
             reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+            n);
+    } else {
+        silu_mul_bf16_kernel<<<grid, BD, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(gate.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(up.data_ptr<at::BFloat16>()),
+            reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
             n);
     }
     return out;

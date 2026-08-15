@@ -502,8 +502,9 @@ torch::Tensor attention_cache_decode_cuda(torch::Tensor q, torch::Tensor k_cache
                 seq_len.numel() == 1, "attention_cache_decode: seq_len must be cuda int64[1]");
     TORCH_CHECK(q.scalar_type() == k_cache.scalar_type() && q.scalar_type() == v_cache.scalar_type(),
                 "attention_cache_decode: q/k/v dtype mismatch");
-    TORCH_CHECK(q.scalar_type() == torch::kFloat16 || q.scalar_type() == torch::kFloat32,
-                "attention_cache_decode: dtype must be f16 or f32");
+    TORCH_CHECK(q.scalar_type() == torch::kFloat16 || q.scalar_type() == torch::kBFloat16 ||
+                q.scalar_type() == torch::kFloat32,
+                "attention_cache_decode: dtype must be f16, bf16, or f32");
     TORCH_CHECK(q.dim() == 4 && q.size(2) == 1, "attention_cache_decode: q must be [B,Hq,1,D]");
     TORCH_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4 && k_cache.sizes() == v_cache.sizes(),
                 "attention_cache_decode: caches must be [B,Hk,max_seq,D]");
@@ -523,7 +524,9 @@ torch::Tensor attention_cache_decode_cuda(torch::Tensor q, torch::Tensor k_cache
     q.data_ptr<scalar_t>(), k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),          \
     seq_len.data_ptr<int64_t>(), out.data_ptr<scalar_t>(),                                       \
     B, Hq, Hk, max_seq, D, rep, (float)scale)
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(q.scalar_type(), "attention_cache_decode_cuda", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        q.scalar_type(), "attention_cache_decode_cuda", [&] {
         if (D <= 64) { ATT_CACHE(64); }
         else if (D <= 128) { ATT_CACHE(128); }
         else if (D <= 256) { ATT_CACHE(256); }
@@ -592,6 +595,95 @@ __global__ void attention_cache_decode_split_part_kernel(
     }
 }
 
+template <typename scalar_t>
+__global__ void attention_cache_decode_split_gqa4_d128_part_kernel(
+    const scalar_t* __restrict__ q,
+    const scalar_t* __restrict__ k,
+    const scalar_t* __restrict__ v,
+    const int64_t* __restrict__ seq_len,
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_m,
+    float* __restrict__ partial_l,
+    int B, int Hq, int Hk, int max_seq,
+    int parts, int workspace_parts, float scale)
+{
+    constexpr int D = 128;
+    constexpr int REP = 4;
+    constexpr int NW = D / 32;
+    const int part = blockIdx.x % parts;
+    const int kv = blockIdx.x / parts;
+    const int hk = kv % Hk;
+    const int b = kv / Hk;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int hq0 = hk * REP;
+    int Tk = (int)seq_len[0];
+    Tk = Tk < 0 ? 0 : (Tk > max_seq ? max_seq : Tk);
+    const int start = (int)(((int64_t)Tk * part) / parts);
+    const int end = (int)(((int64_t)Tk * (part + 1)) / parts);
+
+    float qv[REP];
+    float m[REP];
+    float l[REP];
+    float O[REP];
+    #pragma unroll
+    for (int r = 0; r < REP; ++r) {
+        qv[r] = (float)q[((size_t)b * Hq + hq0 + r) * D + tid];
+        m[r] = -1e30f;
+        l[r] = 0.0f;
+        O[r] = 0.0f;
+    }
+
+    __shared__ float warp_dot[REP][NW];
+    __shared__ float score[REP];
+    const size_t kv_base = ((size_t)b * Hk + hk) * max_seq * D;
+    for (int s = start; s < end; ++s) {
+        const size_t idx = kv_base + (size_t)s * D + tid;
+        const float kd = (float)k[idx];
+        const float vd = (float)v[idx];
+        #pragma unroll
+        for (int r = 0; r < REP; ++r) {
+            const float dot = warp_sum(qv[r] * kd);
+            if (lane == 0) {
+                warp_dot[r][warp] = dot;
+            }
+        }
+        __syncthreads();
+        if (warp == 0) {
+            #pragma unroll
+            for (int r = 0; r < REP; ++r) {
+                float dot = lane < NW ? warp_dot[r][lane] : 0.0f;
+                dot = warp_sum(dot);
+                if (lane == 0) {
+                    score[r] = dot * scale;
+                }
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int r = 0; r < REP; ++r) {
+            const float m_new = fmaxf(m[r], score[r]);
+            const float fac = expf(m[r] - m_new);
+            const float p = expf(score[r] - m_new);
+            O[r] = O[r] * fac + p * vd;
+            l[r] = l[r] * fac + p;
+            m[r] = m_new;
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < REP; ++r) {
+        const int qv_idx = b * Hq + hq0 + r;
+        const size_t stat_idx = (size_t)qv_idx * workspace_parts + part;
+        partial_o[stat_idx * D + tid] = O[r];
+        if (tid == 0) {
+            partial_m[stat_idx] = start < end ? m[r] : -1e30f;
+            partial_l[stat_idx] = start < end ? l[r] : 0.0f;
+        }
+    }
+}
+
 template <int BD, typename scalar_t>
 __global__ void attention_cache_decode_split_reduce_kernel(
     const float* __restrict__ partial_o,
@@ -639,8 +731,9 @@ torch::Tensor attention_cache_decode_split_cuda(
                 seq_len.numel() == 1, "attention_cache_decode_split: seq_len must be cuda int64[1]");
     TORCH_CHECK(q.scalar_type() == k_cache.scalar_type() && q.scalar_type() == v_cache.scalar_type(),
                 "attention_cache_decode_split: q/k/v dtype mismatch");
-    TORCH_CHECK(q.scalar_type() == torch::kFloat16 || q.scalar_type() == torch::kFloat32,
-                "attention_cache_decode_split: dtype must be f16 or f32");
+    TORCH_CHECK(q.scalar_type() == torch::kFloat16 || q.scalar_type() == torch::kBFloat16 ||
+                q.scalar_type() == torch::kFloat32,
+                "attention_cache_decode_split: dtype must be f16, bf16, or f32");
     TORCH_CHECK(q.dim() == 4 && q.size(2) == 1, "attention_cache_decode_split: q must be [B,Hq,1,D]");
     TORCH_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4 && k_cache.sizes() == v_cache.sizes(),
                 "attention_cache_decode_split: caches must be [B,Hk,max_seq,D]");
@@ -670,16 +763,29 @@ torch::Tensor attention_cache_decode_split_cuda(
     const int rep = Hq / Hk;
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 #define ATT_CACHE_SPLIT(BD) do {                                                                    \
-    attention_cache_decode_split_part_kernel<BD, scalar_t><<<total * (int)parts, BD, shmem, stream>>>( \
-        q.data_ptr<scalar_t>(), k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),           \
-        seq_len.data_ptr<int64_t>(), partial_o.data_ptr<float>(), partial_m.data_ptr<float>(),         \
-        partial_l.data_ptr<float>(), B, Hq, Hk, max_seq, D, rep, (int)parts, workspace_parts,          \
-        (float)scale);                                                                                 \
+    if (D == 128 && rep == 4) {                                                                       \
+        attention_cache_decode_split_gqa4_d128_part_kernel<scalar_t>                                 \
+            <<<B * Hk * (int)parts, 128, 0, stream>>>(                                               \
+                q.data_ptr<scalar_t>(), k_cache.data_ptr<scalar_t>(),                                 \
+                v_cache.data_ptr<scalar_t>(), seq_len.data_ptr<int64_t>(),                            \
+                partial_o.data_ptr<float>(), partial_m.data_ptr<float>(),                             \
+                partial_l.data_ptr<float>(), B, Hq, Hk, max_seq, (int)parts,                         \
+                workspace_parts, (float)scale);                                                       \
+    } else {                                                                                           \
+        attention_cache_decode_split_part_kernel<BD, scalar_t>                                       \
+            <<<total * (int)parts, BD, shmem, stream>>>(                                             \
+                q.data_ptr<scalar_t>(), k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),   \
+                seq_len.data_ptr<int64_t>(), partial_o.data_ptr<float>(), partial_m.data_ptr<float>(), \
+                partial_l.data_ptr<float>(), B, Hq, Hk, max_seq, D, rep, (int)parts, workspace_parts, \
+                (float)scale);                                                                         \
+    }                                                                                                  \
     attention_cache_decode_split_reduce_kernel<BD, scalar_t><<<total, BD, 0, stream>>>(               \
         partial_o.data_ptr<float>(), partial_m.data_ptr<float>(), partial_l.data_ptr<float>(),          \
         out.data_ptr<scalar_t>(), total, (int)parts, workspace_parts, D);                              \
 } while (0)
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(q.scalar_type(), "attention_cache_decode_split_cuda", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        q.scalar_type(), "attention_cache_decode_split_cuda", [&] {
         if (D <= 64) { ATT_CACHE_SPLIT(64); }
         else if (D <= 128) { ATT_CACHE_SPLIT(128); }
         else if (D <= 256) { ATT_CACHE_SPLIT(256); }

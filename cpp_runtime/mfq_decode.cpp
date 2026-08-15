@@ -98,6 +98,20 @@ torch::Tensor rms_norm_cuda(torch::Tensor x, torch::Tensor weight, double eps);
 torch::Tensor rms_norm_offset_cuda(torch::Tensor x, torch::Tensor weight, double eps, double weight_offset);
 torch::Tensor rms_norm_f16_cuda(torch::Tensor x, torch::Tensor weight, double eps,
                                 double weight_offset);
+torch::Tensor qwen_rms_norm_bf16_cuda(
+    torch::Tensor input, torch::Tensor weight, double eps,
+    double weight_offset);
+std::vector<torch::Tensor> qwen_rms_norm_pair_bf16_cuda(
+    torch::Tensor first, torch::Tensor second,
+    torch::Tensor first_weight, torch::Tensor second_weight,
+    double eps, double weight_offset);
+torch::Tensor minicpm_qk_norm_rope_cache_write_bf16_cuda(
+    torch::Tensor q, torch::Tensor k, torch::Tensor v,
+    torch::Tensor q_weight, torch::Tensor k_weight,
+    torch::Tensor rope_pos, torch::Tensor write_pos,
+    torch::Tensor cos, torch::Tensor sin,
+    torch::Tensor k_cache, torch::Tensor v_cache,
+    double eps, double weight_offset);
 std::vector<torch::Tensor> rms_norm_pair_f16_f32_offset_cuda(
     torch::Tensor first, torch::Tensor second,
     torch::Tensor first_weight, torch::Tensor second_weight,
@@ -124,6 +138,14 @@ std::vector<torch::Tensor> linear_gate_beta_cuda(
     torch::Tensor alpha, torch::Tensor beta, torch::Tensor dt_bias, torch::Tensor a_log);
 torch::Tensor rope_table_cuda(torch::Tensor x, torch::Tensor pos, torch::Tensor cos, torch::Tensor sin,
                               int64_t rotary_dim, torch::Tensor sections);
+torch::Tensor rope_table_bf16_cuda(torch::Tensor x, torch::Tensor pos, torch::Tensor cos, torch::Tensor sin,
+                                   int64_t rotary_dim);
+torch::Tensor minicpm_bf16_rope_cache_write_cuda(
+    torch::Tensor q, torch::Tensor k, torch::Tensor v,
+    torch::Tensor rope_pos, torch::Tensor write_pos,
+    torch::Tensor cos, torch::Tensor sin,
+    torch::Tensor k_cache, torch::Tensor v_cache,
+    int64_t rotary_dim);
 torch::Tensor attention_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale, bool causal);
 torch::Tensor attention_swa_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                                  double scale, int64_t window);
@@ -395,10 +417,26 @@ torch::Tensor nint_gemv_packed_ws_cuda(
     torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
     torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x, int64_t gs,
     torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
+torch::Tensor nint4_gs24_gemv_bf16_ws_cuda(
+    torch::Tensor q_packed, torch::Tensor sub_scale,
+    torch::Tensor sub_min, torch::Tensor neuron_scale,
+    torch::Tensor neuron_min, torch::Tensor x,
+    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
 torch::Tensor nint_gemv_packed_qx_ws_cuda(
     torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
     torch::Tensor neuron_scale, torch::Tensor neuron_min, int64_t gs,
     torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
+void nint4_gs24_quantize_input_ws_cuda(
+    torch::Tensor x, torch::Tensor qx,
+    torch::Tensor xscale, torch::Tensor xsum);
+std::vector<torch::Tensor> nint4_gs24_gemv_multi_qx_ws_cuda(
+    const std::vector<torch::Tensor> & q_packed,
+    const std::vector<torch::Tensor> & sub_scale,
+    const std::vector<torch::Tensor> & sub_min,
+    const std::vector<torch::Tensor> & neuron_scale,
+    const std::vector<torch::Tensor> & neuron_min,
+    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum,
+    bool output_bf16);
 torch::Tensor nint_gemv_packed_batch_ws_cuda(
     torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
     torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x, int64_t gs,
@@ -10413,6 +10451,39 @@ static torch::Tensor nint_matmul(const NintWeight & w, torch::Tensor x) {
     return g_profiler.measure("nint.gemm4", [&]() { return nint_cublas_gemm_nt_f32acc_cuda(x, ww); });
 }
 
+static torch::Tensor nint_matmul_bf16_output(
+        const NintWeight & w, torch::Tensor x) {
+    auto shape = x.sizes().vec();
+    auto flat = x.reshape({-1, x.size(-1)});
+    const char * disabled = std::getenv(
+        "MFQ_DISABLE_DECODE_NINT_BF16_OUTPUT");
+    const bool enabled =
+        disabled == nullptr || disabled[0] != '1';
+    if (!enabled || !flat.is_cuda() || flat.size(0) != 1 ||
+            w.bits != 4 || w.gs != 24 || w.q8_zero || w.q5_exec) {
+        auto fallback = nint_matmul(w, flat)
+            .to(torch::kBFloat16).contiguous();
+        shape.back() = fallback.size(-1);
+        return fallback.reshape(shape);
+    }
+    const char * disable_bf16_input = std::getenv(
+        "MFQ_DISABLE_DECODE_NINT_BF16_INPUT_QUANT");
+    flat = flat.contiguous();
+    if (flat.scalar_type() != torch::kBFloat16 ||
+            (disable_bf16_input != nullptr &&
+             disable_bf16_input[0] == '1')) {
+        flat = flat.to(torch::kFloat16);
+    }
+    flat = pad_last(flat, w.neuron_len);
+    Workspace & workspace = w.workspace(1);
+    auto output = nint4_gs24_gemv_bf16_ws_cuda(
+        w.q_packed, w.sub_scale, w.sub_min,
+        w.neuron_scale, w.neuron_min, flat,
+        workspace.qx, workspace.xscale, workspace.xsum);
+    shape.back() = output.size(-1);
+    return output.reshape(shape);
+}
+
 static torch::Tensor nint_matmul_f32_kld(
         const NintWeight & w, torch::Tensor x) {
     TORCH_CHECK(
@@ -10601,6 +10672,9 @@ struct NintLinear {
         auto y = nint_matmul(w, x.reshape({-1, x.size(-1)}));
         shape.back() = y.size(-1);
         return y.reshape(shape);
+    }
+    torch::Tensor forward_bf16_output(torch::Tensor x) const {
+        return nint_matmul_bf16_output(w, x);
     }
     torch::Tensor forward_input_mul(torch::Tensor x, torch::Tensor gate, int mode) const {
         auto shape = x.sizes().vec();
@@ -11585,6 +11659,12 @@ struct QuantLinear {
         }
         return mxfp8.forward(x);
     }
+    torch::Tensor forward_bf16_output(torch::Tensor x) const {
+        if (!tensor_parallel() && is_nint()) {
+            return nint.forward_bf16_output(x);
+        }
+        return forward(x).to(torch::kBFloat16).contiguous();
+    }
     torch::Tensor forward_mxfp8_groupwise(
             torch::Tensor grouped,
             int64_t groups) const {
@@ -11733,9 +11813,16 @@ static torch::Tensor quant_embedding_lookup(
 struct QuantLinearGroup {
     bool nint_grouped = false;
     bool nvq_prefix2 = false;
+    bool decode_branch_parallel = true;
+    bool decode_nint_qx_reuse = false;
     NintLinearGroup nint;
     std::vector<QuantLinear> layers;
     std::vector<int64_t> outs;
+    std::vector<torch::Tensor> nint_q_packed;
+    std::vector<torch::Tensor> nint_sub_scale;
+    std::vector<torch::Tensor> nint_sub_min;
+    std::vector<torch::Tensor> nint_neuron_scale;
+    std::vector<torch::Tensor> nint_neuron_min;
     mutable std::shared_ptr<CudaIndependentBranchExecutor>
         branch_executor =
             std::make_shared<CudaIndependentBranchExecutor>();
@@ -11753,6 +11840,71 @@ struct QuantLinearGroup {
             return result;
         }
         if (nint_grouped) return nint.forward(x);
+        const char * disable_qx_reuse =
+            std::getenv("MFQ_DISABLE_DECODE_NINT_QX_REUSE");
+        if (g_kl_mmq_mode == KlMmqMode::Default &&
+                decode_nint_qx_reuse &&
+                x.numel() / x.size(-1) == 1 &&
+                (disable_qx_reuse == nullptr ||
+                 disable_qx_reuse[0] != '1')) {
+            auto shape = x.sizes().vec();
+            auto flat = x.reshape({1, x.size(-1)});
+            const char * disable_multi =
+                std::getenv("MFQ_DISABLE_DECODE_NINT_MULTI_GEMV");
+            if (disable_multi == nullptr || disable_multi[0] != '1') {
+                const char * disable_bf16_output = std::getenv(
+                    "MFQ_DISABLE_DECODE_NINT_MULTI_BF16_OUTPUT");
+                const bool output_bf16 =
+                    x.scalar_type() == torch::kBFloat16 &&
+                    (disable_bf16_output == nullptr ||
+                     disable_bf16_output[0] != '1');
+                const char * disable_bf16_input = std::getenv(
+                    "MFQ_DISABLE_DECODE_NINT_BF16_INPUT_QUANT");
+                auto quantized_input = flat.contiguous();
+                if (quantized_input.scalar_type() != torch::kBFloat16 ||
+                        (disable_bf16_input != nullptr &&
+                         disable_bf16_input[0] == '1')) {
+                    quantized_input = quantized_input.to(torch::kFloat16);
+                }
+                quantized_input = pad_last(
+                    quantized_input,
+                    layers[0].nint.w.neuron_len);
+                Workspace & shared = layers[0].nint.w.workspace(1);
+                nint4_gs24_quantize_input_ws_cuda(
+                    quantized_input, shared.qx,
+                    shared.xscale, shared.xsum);
+                auto outputs = nint4_gs24_gemv_multi_qx_ws_cuda(
+                    nint_q_packed, nint_sub_scale, nint_sub_min,
+                    nint_neuron_scale, nint_neuron_min,
+                    shared.qx, shared.xscale, shared.xsum,
+                    output_bf16);
+                TORCH_CHECK(
+                    outputs.size() == layers.size(),
+                    "multi-projection NINT output count mismatch");
+                for (size_t index = 0; index < outputs.size(); ++index) {
+                    auto output_shape = shape;
+                    output_shape.back() = outputs[index].size(-1);
+                    outputs[index] = outputs[index].reshape(output_shape);
+                }
+                return outputs;
+            }
+            std::vector<torch::Tensor> result;
+            result.reserve(layers.size());
+
+            auto first = nint_matmul(layers[0].nint.w, flat);
+            auto first_shape = shape;
+            first_shape.back() = first.size(-1);
+            result.push_back(first.reshape(first_shape));
+
+            Workspace & shared = layers[0].nint.w.workspace(1);
+            for (size_t index = 1; index < layers.size(); ++index) {
+                auto output = nint_matmul_qx(layers[index].nint.w, shared);
+                auto output_shape = shape;
+                output_shape.back() = output.size(-1);
+                result.push_back(output.reshape(output_shape));
+            }
+            return result;
+        }
         if (g_kl_mmq_mode == KlMmqMode::Default &&
                 nvq_prefix2 && nvq_fusion_enabled()) {
             auto shape = x.sizes().vec();
@@ -11760,6 +11912,7 @@ struct QuantLinearGroup {
                 x.reshape({-1, x.size(-1)});
             std::vector<torch::Tensor> branch_outputs;
             const bool parallel =
+                decode_branch_parallel &&
                 decode_branch_parallel_enabled(flat.size(0)) &&
                 layers.size() > 2 &&
                 branch_executor->run(
@@ -11797,6 +11950,7 @@ struct QuantLinearGroup {
         }
         std::vector<torch::Tensor> result;
         if (g_kl_mmq_mode == KlMmqMode::Default &&
+                decode_branch_parallel &&
                 decode_branch_parallel_enabled(
                     x.numel() / x.size(-1)) &&
                 branch_executor->run(
@@ -12311,6 +12465,7 @@ static QuantLinearGroup make_quant_group(
         bool preserve_projection_boundaries = false) {
     if (layers.empty()) throw std::runtime_error("empty quantized linear group");
     QuantLinearGroup result;
+    result.decode_branch_parallel = !preserve_projection_boundaries;
     result.outs.reserve(layers.size());
     bool all_nint = true;
     std::vector<NintWeight> nint_weights;
@@ -12331,6 +12486,20 @@ static QuantLinearGroup make_quant_group(
         [](const QuantLinear & layer) {
             return layer.tensor_parallel();
         });
+    result.decode_nint_qx_reuse = preserve_projection_boundaries &&
+        all_nint && !g_loading_cpu_layer && !any_tensor_parallel &&
+        layers.size() > 1 &&
+        std::all_of(
+            layers.begin(), layers.end(),
+            [&](const QuantLinear & layer) {
+                const auto & weight = layer.nint.w;
+                const auto & first = layers[0].nint.w;
+                return weight.bits == 4 && weight.gs == 24 &&
+                    !weight.q8_zero &&
+                    !weight.q5_exec && weight.ng == first.ng &&
+                    weight.gs == first.gs &&
+                    weight.neuron_len == first.neuron_len;
+            });
     if (all_nint && !preserve_projection_boundaries &&
         !diagnostic_keep_nint_separate && !g_loading_cpu_layer &&
         !any_tensor_parallel) {
@@ -12338,6 +12507,21 @@ static QuantLinearGroup make_quant_group(
         result.nint = make_linear_group(nint_weights);
     } else {
         result.layers = std::move(layers);
+        if (result.decode_nint_qx_reuse) {
+            result.nint_q_packed.reserve(result.layers.size());
+            result.nint_sub_scale.reserve(result.layers.size());
+            result.nint_sub_min.reserve(result.layers.size());
+            result.nint_neuron_scale.reserve(result.layers.size());
+            result.nint_neuron_min.reserve(result.layers.size());
+            for (const auto & layer : result.layers) {
+                const auto & weight = layer.nint.w;
+                result.nint_q_packed.push_back(weight.q_packed);
+                result.nint_sub_scale.push_back(weight.sub_scale);
+                result.nint_sub_min.push_back(weight.sub_min);
+                result.nint_neuron_scale.push_back(weight.neuron_scale);
+                result.nint_neuron_min.push_back(weight.neuron_min);
+            }
+        }
         result.nvq_prefix2 = !g_loading_cpu_layer && result.layers.size() >= 2 &&
             !any_tensor_parallel &&
             result.layers[0].is_nvq() && result.layers[1].is_nvq() &&
@@ -13048,6 +13232,13 @@ static torch::Tensor qwen_rms_norm(torch::Tensor x, torch::Tensor weight, const 
 static torch::Tensor qwen_rms_norm_bf16(
         torch::Tensor x, torch::Tensor weight, const Config & c) {
     auto input = x.contiguous().to(torch::kBFloat16);
+    const char * fused_env = std::getenv("MFQ_MINICPM_FUSED_BF16_RMSNORM");
+    if (input.is_cuda() &&
+            (fused_env == nullptr || fused_env[0] != '0')) {
+        return qwen_rms_norm_bf16_cuda(
+            input, weight.contiguous(), c.rms_norm_eps,
+            c.norm_weight_offset);
+    }
     auto xf = input.to(torch::kFloat32);
     auto inverse = torch::rsqrt(
         xf.square().mean(-1, true) + c.rms_norm_eps);
@@ -13169,6 +13360,15 @@ struct RopeCache {
         TORCH_CHECK(
             sections.numel() == 0,
             "Qwen3 BF16 RoPE does not support multi-axis sections");
+        const char * fused_env =
+            std::getenv("MFQ_MINICPM_FUSED_BF16_ROPE");
+        if (x.is_cuda() && pos.dim() == 1 &&
+                (fused_env == nullptr || fused_env[0] != '0')) {
+            return rope_table_bf16_cuda(
+                x.contiguous().to(torch::kBFloat16),
+                pos.contiguous().to(cos.device(), torch::kInt64),
+                cos, sin, rotary_dim);
+        }
         auto positions = pos.contiguous().to(cos.device(), torch::kInt64)
             .clamp(0, cos.size(0) - 1);
         torch::Tensor selected_cos;
@@ -15101,7 +15301,54 @@ struct FullBlock : Block {
         auto q = g_profiler.measure("full.q_view", [&]() { return q_raw.transpose(1, 2).contiguous(); });
         auto k = g_profiler.measure("full.k_view", [&]() { return k_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous(); });
         auto v = g_profiler.measure("full.v_view", [&]() { return v_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous(); });
-        if (!official_bf16 && q_norm.defined() && k_norm.defined() &&
+        auto write_positions = cache_positions.has_value()
+            ? cache_positions.value().to(x.device(), torch::kInt64).contiguous()
+            : pos.to(x.device(), torch::kInt64).contiguous();
+        if (write_positions.dim() != 1 || write_positions.numel() != T) {
+            throw std::runtime_error(
+                "KV cache positions must have shape [tokens]");
+        }
+        const char * fused_qk_rope_kv_env =
+            std::getenv("MFQ_MINICPM_FUSED_QK_NORM_ROPE_KV");
+        const bool fused_qk_rope_kv = official_bf16 && x.is_cuda() &&
+            T == 1 && !cache.ring && !v_norm.defined() &&
+            q_norm.defined() && k_norm.defined() &&
+            active_rope.rotary_dim == 128 &&
+            active_rope.sections.numel() == 0 && nh == 32 && nkh == 8 &&
+            hd == 128 && cache.k.scalar_type() == torch::kBFloat16 &&
+            (fused_qk_rope_kv_env == nullptr ||
+             fused_qk_rope_kv_env[0] != '0');
+        std::pair<torch::Tensor, torch::Tensor> kv;
+        if (fused_qk_rope_kv) {
+            q = g_profiler.measure("full.qk_norm_rope_kv_write", [&]() {
+                return minicpm_qk_norm_rope_cache_write_bf16_cuda(
+                    q.contiguous(), k.contiguous(), v.contiguous(),
+                    q_norm, k_norm,
+                    pos.contiguous().to(x.device(), torch::kInt64),
+                    write_positions, active_rope.cos, active_rope.sin,
+                    cache.k, cache.v, c.rms_norm_eps,
+                    c.norm_weight_offset);
+            });
+            kv = {
+                cache.k.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()}),
+                cache.v.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()})};
+        } else {
+        const char * fused_bf16_norm_env =
+            std::getenv("MFQ_MINICPM_FUSED_BF16_RMSNORM");
+        const bool fused_bf16_norm = official_bf16 &&
+            (fused_bf16_norm_env == nullptr ||
+             fused_bf16_norm_env[0] != '0');
+        if (fused_bf16_norm && q_norm.defined() && k_norm.defined() &&
+                q.scalar_type() == torch::kBFloat16 &&
+                k.scalar_type() == torch::kBFloat16) {
+            auto normalized = g_profiler.measure("full.qk_norm", [&]() {
+                return qwen_rms_norm_pair_bf16_cuda(
+                    q, k, q_norm, k_norm,
+                    c.rms_norm_eps, c.norm_weight_offset);
+            });
+            q = normalized[0].reshape_as(q);
+            k = normalized[1].reshape_as(k);
+        } else if (!official_bf16 && q_norm.defined() && k_norm.defined() &&
             q.scalar_type() == torch::kFloat16 &&
             k.scalar_type() == torch::kFloat16) {
             auto normalized = g_profiler.measure("full.qk_norm", [&]() {
@@ -15137,27 +15384,41 @@ struct FullBlock : Block {
                     v.reshape({-1, hd}).to(torch::kFloat32), v_norm, c)
                     .reshape_as(v);
         });
-        q = g_profiler.measure("full.q_rope", [&]() {
-            return official_bf16
-                ? active_rope.apply_bf16(q, pos)
-                : active_rope.apply(q, pos, c);
-        });
-        k = g_profiler.measure("full.k_rope", [&]() {
-            return official_bf16
-                ? active_rope.apply_bf16(k, pos)
-                : active_rope.apply(k, pos, c);
-        });
-        auto write_positions = cache_positions.has_value()
-            ? cache_positions.value().to(x.device(), torch::kInt64).contiguous()
-            : pos;
-        if (write_positions.dim() != 1 || write_positions.numel() != T) {
-            throw std::runtime_error(
-                "KV cache positions must have shape [tokens]");
+        const char * fused_rope_kv_env =
+            std::getenv("MFQ_MINICPM_FUSED_ROPE_KV");
+        const bool fused_rope_kv = official_bf16 && x.is_cuda() &&
+            T == 1 && !cache.ring && active_rope.rotary_dim == 128 &&
+            active_rope.sections.numel() == 0 && nh == 32 && nkh == 8 &&
+            hd == 128 && cache.k.scalar_type() == torch::kBFloat16 &&
+            (fused_rope_kv_env == nullptr || fused_rope_kv_env[0] != '0');
+        if (fused_rope_kv) {
+            q = g_profiler.measure("full.rope_kv_write", [&]() {
+                return minicpm_bf16_rope_cache_write_cuda(
+                    q.contiguous(), k.contiguous(), v.contiguous(),
+                    pos.contiguous().to(x.device(), torch::kInt64),
+                    write_positions, active_rope.cos, active_rope.sin,
+                    cache.k, cache.v, active_rope.rotary_dim);
+            });
+            kv = {
+                cache.k.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()}),
+                cache.v.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()})};
+        } else {
+            q = g_profiler.measure("full.q_rope", [&]() {
+                return official_bf16
+                    ? active_rope.apply_bf16(q, pos)
+                    : active_rope.apply(q, pos, c);
+            });
+            k = g_profiler.measure("full.k_rope", [&]() {
+                return official_bf16
+                    ? active_rope.apply_bf16(k, pos)
+                    : active_rope.apply(k, pos, c);
+            });
+            kv = g_profiler.measure("full.kv_write", [&]() {
+                return cache.append(
+                    k, v, write_positions, cache_pos, cache_pos + T);
+            });
         }
-        auto kv = g_profiler.measure("full.kv_write", [&]() {
-            return cache.append(
-                k, v, write_positions, cache_pos, cache_pos + T);
-        });
+        }
         auto minicpmo45_attention_mask = [&](int64_t visible_len,
                                               bool explicit_causal) {
             c10::optional<torch::Tensor> result = c10::nullopt;
@@ -15307,7 +15568,10 @@ struct FullBlock : Block {
                 const int64_t planned_len = g_decode_graph_attention_kv_len > 0
                     ? g_decode_graph_attention_kv_len : cache_pos + T;
                 const char * aten_decode_env = std::getenv("MFQ_ATTENTION_DECODE_ATEN");
-                const bool aten_decode_enabled = official_bf16 ||
+                const char * bf16_gqa_env = std::getenv("MFQ_MINICPM_BF16_GQA_DECODE");
+                const bool bf16_gqa_decode = official_bf16 && T == 1 &&
+                    (bf16_gqa_env == nullptr || bf16_gqa_env[0] != '0');
+                const bool aten_decode_enabled = (official_bf16 && !bf16_gqa_decode) ||
                     (aten_decode_env != nullptr && aten_decode_env[0] == '1');
                 const char * llama_decode_env = std::getenv("MFQ_LLAMA_FLASH_DECODE");
                 const bool llama_decode_enabled =
@@ -15438,7 +15702,11 @@ struct FullBlock : Block {
                 return attention_token_major ? a.reshape({B, T, attn_width}) :
                     a.transpose(1, 2).contiguous().reshape({B, T, attn_width});
             });
-            oo = g_profiler.measure("full.o_proj", [&]() { return o.forward(af); });
+            oo = g_profiler.measure("full.o_proj", [&]() {
+                return official_bf16
+                    ? o.forward_bf16_output(af)
+                    : o.forward(af);
+            });
         }
         if (official_bf16) {
             oo = oo.to(torch::kBFloat16).contiguous();
@@ -15673,11 +15941,19 @@ struct FullBlock : Block {
             auto activation = g_profiler.measure(
                 "full.minicpmo45_ffn_swiglu",
                 [&]() {
+                    const char * disabled = std::getenv(
+                        "MFQ_DISABLE_MINICPM_BF16_SWIGLU_FUSION");
+                    if (disabled == nullptr || disabled[0] != '1') {
+                        return silu_mul_cuda(gate, up);
+                    }
                     return (torch::silu(gate) * up).contiguous();
                 });
             ff = g_profiler.measure(
                 "full.minicpmo45_ffn_down",
-                [&]() { return ffn.down.forward(activation); })
+                [&]() {
+                    return ffn.down.forward_bf16_output(
+                        activation);
+                })
                 .reshape({B, T, H})
                 .to(torch::kBFloat16)
                 .contiguous();
@@ -20804,6 +21080,30 @@ static int run_linear_check(
     auto run = [&]() {
         return gate_mode == 0 ? linear.forward(xh) : linear.forward_input_mul(xh, gateh, gate_mode);
     };
+    const char * check_bf16_output_env =
+        std::getenv("MFQ_CHECK_LINEAR_BF16_OUTPUT");
+    if (check_bf16_output_env != nullptr &&
+            check_bf16_output_env[0] == '1') {
+        TORCH_CHECK(
+            gate_mode == 0,
+            "direct BF16 linear check does not support input gating");
+        auto bf16_input = x.to(torch::kBFloat16).contiguous();
+        auto reference = linear.forward(bf16_input)
+            .to(torch::kBFloat16).contiguous();
+        auto candidate = linear.forward_bf16_output(bf16_input);
+        auto difference =
+            (candidate.to(torch::kFloat32) -
+             reference.to(torch::kFloat32)).abs();
+        std::cout << "linear_bf16_output_check"
+                  << " max_abs="
+                  << difference.max().item<double>()
+                  << " equal="
+                  << (candidate.equal(reference) ? 1 : 0)
+                  << "\n";
+        TORCH_CHECK(
+            candidate.equal(reference),
+            "direct BF16 NINT output differs from FP16-then-BF16 reference");
+    }
     torch::Tensor y_test;
     const int warmups = std::min(30, std::max(1, reps));
     for (int i = 0; i < warmups; ++i) y_test = run();
@@ -21095,12 +21395,24 @@ static std::vector<std::string> parse_tensor_names(const std::string & value) {
 static int run_linear_group_check(
         const std::string & mfq_path,
         const std::string & names_arg,
-        int M) {
+        int M,
+        int reps) {
     TORCH_CHECK(M >= 1 && M <= 4096, "--check-linear-m must be in [1, 4096]");
+    TORCH_CHECK(reps >= 1, "--check-linear-reps must be positive");
     const auto names = parse_tensor_names(names_arg);
     TORCH_CHECK(names.size() >= 2, "--check-linear-group requires at least two tensors");
     MfqFile mfq(mfq_path);
-    auto group = load_quant_group(mfq, names, names.size());
+    const char * preserve_env =
+        std::getenv("MFQ_CHECK_LINEAR_GROUP_PRESERVE");
+    const bool preserve_projection_boundaries =
+        preserve_env != nullptr && preserve_env[0] == '1';
+    const char * bf16_env =
+        std::getenv("MFQ_CHECK_LINEAR_GROUP_BF16");
+    const bool check_bf16 =
+        bf16_env != nullptr && bf16_env[0] == '1';
+    auto group = load_quant_group(
+        mfq, names, names.size(), nullptr,
+        preserve_projection_boundaries);
     const int64_t width = group.nint_grouped
         ? (group.nint.split_w.empty()
             ? group.nint.w.neuron_len
@@ -21111,10 +21423,51 @@ static int run_linear_group_check(
         torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
     auto x = (((sequence.remainder(257) - 128.0) / 127.0) +
               0.03125 * torch::sin(sequence * 0.015625))
-                 .to(torch::kFloat16)
+                 .to(check_bf16
+                     ? torch::kBFloat16
+                     : torch::kFloat16)
                  .reshape({M, width})
                  .contiguous();
     auto actual = group.forward(x);
+    const char * check_bf16_swiglu_env =
+        std::getenv("MFQ_CHECK_BF16_SWIGLU");
+    if (check_bf16_swiglu_env != nullptr &&
+            check_bf16_swiglu_env[0] == '1') {
+        TORCH_CHECK(
+            actual.size() == 2 &&
+            actual[0].scalar_type() == torch::kBFloat16 &&
+            actual[1].scalar_type() == torch::kBFloat16,
+            "BF16 SwiGLU check requires two BF16 projection outputs");
+        auto reference =
+            (torch::silu(actual[0]) * actual[1]).contiguous();
+        auto candidate = silu_mul_cuda(
+            actual[0].contiguous(), actual[1].contiguous());
+        auto difference =
+            (candidate.to(torch::kFloat32) -
+             reference.to(torch::kFloat32)).abs();
+        std::cout << "bf16_swiglu_check"
+                  << " max_abs="
+                  << difference.max().item<double>()
+                  << " equal="
+                  << (candidate.equal(reference) ? 1 : 0)
+                  << "\n";
+        TORCH_CHECK(
+            candidate.equal(reference),
+            "fused BF16 SwiGLU differs from the official BF16 expression");
+    }
+    torch::cuda::synchronize();
+    const auto started = std::chrono::steady_clock::now();
+    for (int rep = 0; rep < reps; ++rep) {
+        actual = group.forward(x);
+    }
+    torch::cuda::synchronize();
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count();
+    std::cout << "linear_group_timing"
+              << " preserve=" << (preserve_projection_boundaries ? 1 : 0)
+              << " m=" << M
+              << " reps=" << reps
+              << " mean_ms=" << elapsed_ms / reps << '\n';
     TORCH_CHECK(actual.size() == names.size(), "linear group output count mismatch");
     std::vector<torch::Tensor> graph_actual;
     if (M == 1 && decode_branch_parallel_enabled(M)) {
@@ -21180,15 +21533,22 @@ static int run_linear_group_check(
                   weight.q_packed, weight.sub_scale, weight.sub_min,
                   weight.neuron_scale, weight.neuron_min,
                   weight.neuron_len, weight.gs, weight.bits);
-        separate_production.push_back(linear.forward(x).to(torch::kFloat32));
+        auto separate = linear.forward(x);
+        if (actual[index].scalar_type() == torch::kBFloat16) {
+            separate = separate.to(torch::kBFloat16);
+        }
+        separate_production.push_back(separate.to(torch::kFloat32));
+        auto dense_for_x = dense.to(x.scalar_type());
         separate_dense_references.push_back(
-            torch::matmul(x, dense.transpose(0, 1)).to(torch::kFloat32));
+            torch::matmul(x, dense_for_x.transpose(0, 1))
+                .to(torch::kFloat32));
         fp32_references.push_back(torch::matmul(
             x.to(torch::kFloat32),
             dense.to(torch::kFloat32).transpose(0, 1)));
         dense_weights.push_back(std::move(dense));
     }
-    auto combined_dense = torch::cat(dense_weights, 0).contiguous();
+    auto combined_dense = torch::cat(dense_weights, 0)
+        .to(x.scalar_type()).contiguous();
     auto combined_output =
         torch::matmul(x, combined_dense.transpose(0, 1)).to(torch::kFloat32);
     auto combined_references =
@@ -24667,7 +25027,8 @@ int main(int argc, char ** argv) {
                 throw std::runtime_error("--check-linear-group requires --mfq");
             }
             return run_linear_group_check(
-                mfq_path, check_linear_group, check_linear_m);
+                mfq_path, check_linear_group, check_linear_m,
+                check_linear_reps);
         }
         if (!check_q8_embedding.empty()) {
             if (mfq_path.empty()) {

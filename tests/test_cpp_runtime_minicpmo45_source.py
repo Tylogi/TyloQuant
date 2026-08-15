@@ -2,6 +2,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 DECODE = (ROOT / "cpp_runtime" / "mfq_decode.cpp").read_text(encoding="utf-8")
+ROPE = (ROOT / "mfq" / "kernels" / "cuda" / "rope.cu").read_text(
+    encoding="utf-8"
+)
+ATTENTION = (ROOT / "mfq" / "kernels" / "cuda" / "attention.cu").read_text(
+    encoding="utf-8"
+)
+NORM = (ROOT / "mfq" / "kernels" / "cuda" / "norm.cu").read_text(
+    encoding="utf-8"
+)
 GRAPH = (ROOT / "cpp_runtime" / "minicpmo45_runtime.inc").read_text(
     encoding="utf-8"
 )
@@ -92,12 +101,26 @@ def test_minicpmo45_supports_python_tensor_files_and_bfloat16_tts():
     assert "official_bf16 ? torch::kBFloat16" in DECODE
 
 
-def test_minicpmo45_qwen_runtime_follows_official_bfloat16_sdpa_path():
+def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
     assert "qwen_rms_norm_bf16" in DECODE
+    assert 'std::getenv("MFQ_MINICPM_FUSED_BF16_RMSNORM")' in DECODE
+    assert "qwen_rms_norm_bf16_cuda(" in DECODE
+    assert "qwen_rms_norm_pair_bf16_cuda(" in DECODE
+    assert "qwen_rms_norm_bf16_finalize_kernel" in NORM
+    assert "qwen_rms_norm_pair_bf16_finalize_kernel" in NORM
+    assert "attention_cache_decode_split_gqa4_d128_part_kernel" in ATTENTION
+    assert "at::ScalarType::BFloat16" in ATTENTION
+    assert "minicpm_bf16_rope_cache_write_cuda" in DECODE
+    assert 'std::getenv("MFQ_MINICPM_FUSED_ROPE_KV")' in DECODE
+    assert "minicpm_bf16_rope_cache_write_kernel" in ROPE
+    assert "minicpm_qk_norm_rope_cache_write_bf16_kernel" in NORM
+    assert 'std::getenv("MFQ_MINICPM_FUSED_QK_NORM_ROPE_KV")' in DECODE
     assert "active_rope.apply_bf16" in DECODE
     assert "official_bf16 ? torch::kBFloat16" in DECODE
     assert "k.scalar_type() != torch::kFloat16" in DECODE
-    assert "const bool aten_decode_enabled = official_bf16" in DECODE
+    assert 'std::getenv("MFQ_MINICPM_BF16_GQA_DECODE")' in DECODE
+    assert "const bool bf16_gqa_decode = official_bf16 && T == 1" in DECODE
+    assert "official_bf16 && !bf16_gqa_decode" in DECODE
     assert "logits = logits.to(torch::kBFloat16)" in DECODE
     assert "repeated_k = kh.repeat_interleave(repeat, 1)" in DECODE
     assert '"full.minicpmo45_ffn_swiglu"' in DECODE
@@ -127,6 +150,14 @@ def test_minicpmo45_matches_official_rope_frequency_construction():
     assert "torch::reciprocal(" in DECODE
     assert "freq.copy_(official_freq)" in DECODE
     assert "0, -1, device, c.is_minicpmo45())" in DECODE
+    assert "rope_table_bf16_cuda" in DECODE
+    assert "rope_table_bf16_kernel" in ROPE
+
+
+def test_minicpmo45_serializes_independent_decode_projection_branches():
+    assert "bool decode_branch_parallel = true" in DECODE
+    assert "result.decode_branch_parallel = !preserve_projection_boundaries" in DECODE
+    assert "decode_branch_parallel &&" in DECODE
 
 
 def test_minicpmo45_cli_exposes_tensor_fixture_contract():

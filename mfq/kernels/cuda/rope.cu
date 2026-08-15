@@ -6,6 +6,7 @@
 //   out[t,j+half] = x1*cos + x0*sin
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
@@ -14,6 +15,15 @@ constexpr int ROPE_BD = 256;
 torch::Tensor rope_ext_cuda(torch::Tensor x, torch::Tensor pos, double base, int64_t rotary_dim, torch::Tensor sections);
 torch::Tensor rope_table_cuda(torch::Tensor x, torch::Tensor pos, torch::Tensor cos, torch::Tensor sin,
                               int64_t rotary_dim, torch::Tensor sections);
+torch::Tensor rope_table_bf16_cuda(torch::Tensor x, torch::Tensor pos,
+                                   torch::Tensor cos, torch::Tensor sin,
+                                   int64_t rotary_dim);
+torch::Tensor minicpm_bf16_rope_cache_write_cuda(
+    torch::Tensor q, torch::Tensor k, torch::Tensor v,
+    torch::Tensor rope_pos, torch::Tensor write_pos,
+    torch::Tensor cos, torch::Tensor sin,
+    torch::Tensor k_cache, torch::Tensor v_cache,
+    int64_t rotary_dim);
 
 __device__ int rope_axis_for_pair(int j, int s0, int s1, int s2)
 {
@@ -106,6 +116,121 @@ __global__ void rope_table_kernel(const float* __restrict__ x, const int64_t* __
     }
 }
 
+__global__ void rope_table_bf16_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const int64_t* __restrict__ pos,
+    const float* __restrict__ cos,
+    const float* __restrict__ sin,
+    __nv_bfloat16* __restrict__ out,
+    int rows, int T, int D, int rotary_dim, int table_len)
+{
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int t = row % T;
+    const int half = rotary_dim / 2;
+    const size_t offset = (size_t)row * D;
+    int64_t p = pos[t];
+    p = p < 0 ? 0 : (p >= table_len ? table_len - 1 : p);
+
+    for (int i = threadIdx.x; i < D; i += ROPE_BD) {
+        out[offset + i] = x[offset + i];
+    }
+    __syncthreads();
+
+    for (int j = threadIdx.x; j < half; j += ROPE_BD) {
+        const __nv_bfloat16 cs = __float2bfloat16_rn(
+            cos[(size_t)p * half + j]);
+        const __nv_bfloat16 sn = __float2bfloat16_rn(
+            sin[(size_t)p * half + j]);
+        const __nv_bfloat16 x0 = x[offset + j];
+        const __nv_bfloat16 x1 = x[offset + j + half];
+        const __nv_bfloat16 x0c = __float2bfloat16_rn(
+            __bfloat162float(x0) * __bfloat162float(cs));
+        const __nv_bfloat16 x1s = __float2bfloat16_rn(
+            __bfloat162float(x1) * __bfloat162float(sn));
+        const __nv_bfloat16 x1c = __float2bfloat16_rn(
+            __bfloat162float(x1) * __bfloat162float(cs));
+        const __nv_bfloat16 x0s = __float2bfloat16_rn(
+            __bfloat162float(x0) * __bfloat162float(sn));
+        out[offset + j] = __float2bfloat16_rn(
+            __bfloat162float(x0c) - __bfloat162float(x1s));
+        out[offset + j + half] = __float2bfloat16_rn(
+            __bfloat162float(x1c) + __bfloat162float(x0s));
+    }
+}
+
+__global__ void minicpm_bf16_rope_cache_write_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    const int64_t* __restrict__ rope_pos,
+    const int64_t* __restrict__ write_pos,
+    const float* __restrict__ cos,
+    const float* __restrict__ sin,
+    __nv_bfloat16* __restrict__ q_out,
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    int Hq, int Hk, int D, int half, int table_len, int max_seq)
+{
+    const int row = blockIdx.x;
+    const int hq = row % Hq;
+    const int b = row / Hq;
+    const int tid = threadIdx.x;
+    int64_t p = rope_pos[0];
+    p = p < 0 ? 0 : (p >= table_len ? table_len - 1 : p);
+    const int64_t wp = write_pos[0];
+
+    const size_t q_offset = (size_t)row * D;
+    if (tid < half) {
+        const __nv_bfloat16 cs = __float2bfloat16_rn(
+            cos[(size_t)p * half + tid]);
+        const __nv_bfloat16 sn = __float2bfloat16_rn(
+            sin[(size_t)p * half + tid]);
+        const __nv_bfloat16 x0 = q[q_offset + tid];
+        const __nv_bfloat16 x1 = q[q_offset + tid + half];
+        const __nv_bfloat16 x0c = __float2bfloat16_rn(
+            __bfloat162float(x0) * __bfloat162float(cs));
+        const __nv_bfloat16 x1s = __float2bfloat16_rn(
+            __bfloat162float(x1) * __bfloat162float(sn));
+        const __nv_bfloat16 x1c = __float2bfloat16_rn(
+            __bfloat162float(x1) * __bfloat162float(cs));
+        const __nv_bfloat16 x0s = __float2bfloat16_rn(
+            __bfloat162float(x0) * __bfloat162float(sn));
+        q_out[q_offset + tid] = __float2bfloat16_rn(
+            __bfloat162float(x0c) - __bfloat162float(x1s));
+        q_out[q_offset + tid + half] = __float2bfloat16_rn(
+            __bfloat162float(x1c) + __bfloat162float(x0s));
+    }
+
+    if (hq < Hk && wp >= 0 && wp < max_seq) {
+        const size_t src = ((size_t)b * Hk + hq) * D;
+        const size_t dst = (((size_t)b * Hk + hq) * max_seq + wp) * D;
+        if (tid < half) {
+            const __nv_bfloat16 cs = __float2bfloat16_rn(
+                cos[(size_t)p * half + tid]);
+            const __nv_bfloat16 sn = __float2bfloat16_rn(
+                sin[(size_t)p * half + tid]);
+            const __nv_bfloat16 x0 = k[src + tid];
+            const __nv_bfloat16 x1 = k[src + tid + half];
+            const __nv_bfloat16 x0c = __float2bfloat16_rn(
+                __bfloat162float(x0) * __bfloat162float(cs));
+            const __nv_bfloat16 x1s = __float2bfloat16_rn(
+                __bfloat162float(x1) * __bfloat162float(sn));
+            const __nv_bfloat16 x1c = __float2bfloat16_rn(
+                __bfloat162float(x1) * __bfloat162float(cs));
+            const __nv_bfloat16 x0s = __float2bfloat16_rn(
+                __bfloat162float(x0) * __bfloat162float(sn));
+            k_cache[dst + tid] = __float2bfloat16_rn(
+                __bfloat162float(x0c) - __bfloat162float(x1s));
+            k_cache[dst + tid + half] = __float2bfloat16_rn(
+                __bfloat162float(x1c) + __bfloat162float(x0s));
+        }
+        if (tid < D) {
+            v_cache[dst + tid] = v[src + tid];
+        }
+    }
+}
+
 torch::Tensor rope_cuda(torch::Tensor x, torch::Tensor pos, double base)
 {
     return rope_ext_cuda(
@@ -185,4 +310,105 @@ torch::Tensor rope_table_cuda(torch::Tensor x, torch::Tensor pos, torch::Tensor 
         x.data_ptr<float>(), pos.data_ptr<int64_t>(), cos.data_ptr<float>(), sin.data_ptr<float>(),
         out.data_ptr<float>(), MT * T, T, D, RD, table_len, pos_axes, s0, s1, s2);
     return out;
+}
+
+torch::Tensor rope_table_bf16_cuda(torch::Tensor x, torch::Tensor pos,
+                                   torch::Tensor cos, torch::Tensor sin,
+                                   int64_t rotary_dim)
+{
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous() &&
+                    x.scalar_type() == torch::kBFloat16,
+                "rope_table_bf16: x must be cuda contiguous bf16");
+    TORCH_CHECK(pos.is_cuda() && pos.is_contiguous() &&
+                    pos.scalar_type() == torch::kInt64 && pos.dim() == 1,
+                "rope_table_bf16: pos must be cuda contiguous int64 [T]");
+    TORCH_CHECK(cos.is_cuda() && cos.is_contiguous() &&
+                    cos.scalar_type() == torch::kFloat32,
+                "rope_table_bf16: cos must be cuda contiguous f32");
+    TORCH_CHECK(sin.is_cuda() && sin.is_contiguous() &&
+                    sin.scalar_type() == torch::kFloat32 &&
+                    cos.sizes() == sin.sizes(),
+                "rope_table_bf16: sin must match cos");
+    const int T = (int)x.size(-2);
+    const int D = (int)x.size(-1);
+    const int RD = (int)rotary_dim;
+    TORCH_CHECK(pos.numel() == T,
+                "rope_table_bf16: position count must match T");
+    TORCH_CHECK(RD > 0 && RD <= D && RD % 2 == 0 &&
+                    cos.dim() == 2 && cos.size(1) == RD / 2,
+                "rope_table_bf16: invalid rotary geometry");
+    const int rows = (int)(x.numel() / D);
+    auto out = torch::empty_like(x);
+    rope_table_bf16_kernel<<<
+        rows, ROPE_BD, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(
+            x.data_ptr<at::BFloat16>()),
+        pos.data_ptr<int64_t>(), cos.data_ptr<float>(), sin.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(
+            out.data_ptr<at::BFloat16>()),
+        rows, T, D, RD, (int)cos.size(0));
+    return out;
+}
+
+torch::Tensor minicpm_bf16_rope_cache_write_cuda(
+    torch::Tensor q, torch::Tensor k, torch::Tensor v,
+    torch::Tensor rope_pos, torch::Tensor write_pos,
+    torch::Tensor cos, torch::Tensor sin,
+    torch::Tensor k_cache, torch::Tensor v_cache,
+    int64_t rotary_dim)
+{
+    const auto bf16 = torch::kBFloat16;
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() &&
+                    q.is_contiguous() && k.is_contiguous() && v.is_contiguous() &&
+                    q.scalar_type() == bf16 && k.scalar_type() == bf16 &&
+                    v.scalar_type() == bf16,
+                "minicpm_rope_kv: q/k/v must be cuda contiguous bf16");
+    TORCH_CHECK(k_cache.is_cuda() && v_cache.is_cuda() &&
+                    k_cache.is_contiguous() && v_cache.is_contiguous() &&
+                    k_cache.scalar_type() == bf16 && v_cache.scalar_type() == bf16,
+                "minicpm_rope_kv: caches must be cuda contiguous bf16");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4 &&
+                    k_cache.dim() == 4 && v_cache.dim() == 4,
+                "minicpm_rope_kv: tensors must be rank four");
+    TORCH_CHECK(k.sizes() == v.sizes() && k_cache.sizes() == v_cache.sizes(),
+                "minicpm_rope_kv: k/v shapes must match");
+    TORCH_CHECK(q.size(0) == k.size(0) && q.size(2) == 1 && k.size(2) == 1 &&
+                    q.size(1) == 32 && k.size(1) == 8 &&
+                    q.size(3) == 128 && k.size(3) == 128,
+                "minicpm_rope_kv: expected Bx32x1x128 Q and Bx8x1x128 K/V");
+    TORCH_CHECK(k_cache.size(0) == k.size(0) &&
+                    k_cache.size(1) == k.size(1) &&
+                    k_cache.size(3) == k.size(3),
+                "minicpm_rope_kv: cache shape mismatch");
+    TORCH_CHECK(rope_pos.is_cuda() && write_pos.is_cuda() &&
+                    rope_pos.is_contiguous() && write_pos.is_contiguous() &&
+                    rope_pos.scalar_type() == torch::kInt64 &&
+                    write_pos.scalar_type() == torch::kInt64 &&
+                    rope_pos.numel() == 1 && write_pos.numel() == 1,
+                "minicpm_rope_kv: positions must be cuda contiguous int64[1]");
+    TORCH_CHECK(cos.is_cuda() && sin.is_cuda() &&
+                    cos.is_contiguous() && sin.is_contiguous() &&
+                    cos.scalar_type() == torch::kFloat32 &&
+                    sin.scalar_type() == torch::kFloat32 &&
+                    cos.sizes() == sin.sizes() && cos.dim() == 2,
+                "minicpm_rope_kv: cos/sin must be matching cuda contiguous f32 tables");
+    TORCH_CHECK(rotary_dim == 128 && cos.size(1) == 64,
+                "minicpm_rope_kv: expected rotary_dim 128");
+
+    auto q_out = torch::empty_like(q);
+    const int B = (int)q.size(0);
+    const int Hq = (int)q.size(1);
+    const int Hk = (int)k.size(1);
+    minicpm_bf16_rope_cache_write_kernel<<<
+        B * Hq, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(k.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(v.data_ptr<at::BFloat16>()),
+        rope_pos.data_ptr<int64_t>(), write_pos.data_ptr<int64_t>(),
+        cos.data_ptr<float>(), sin.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(q_out.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(k_cache.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(v_cache.data_ptr<at::BFloat16>()),
+        Hq, Hk, 128, 64, (int)cos.size(0), (int)k_cache.size(2));
+    return q_out;
 }
