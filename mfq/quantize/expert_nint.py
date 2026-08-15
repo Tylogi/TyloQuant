@@ -42,7 +42,11 @@ from mfq.formats.nvq1_l import (
     Nvq1LTensor,
     pack_ternary_codebook,
 )
-from mfq.formats.nvq1_s import Nvq1STensor, pack_nvq1_s_banked_codebook
+from mfq.formats.nvq1_s import (
+    NVQ1_S_SYNTHETIC_BANKS,
+    Nvq1STensor,
+    pack_nvq1_s_banked_codebook,
+)
 from mfq.quantize.nepq import NepqQuantConfig, quantize_nepq_fixed
 from mfq.quantize.nepq_a import (
     NepqAArtifact,
@@ -361,6 +365,19 @@ def _quantize_flat_cohort(
         assert precision.nint_spec is not None
         if artifact is not None:
             raise ValueError(f"{family} does not consume a quantizer artifact")
+        if torch.device(device).type == "mps":
+            from mfq.quantize.nint_quant_torch import quantize_axis0
+
+            return quantize_axis0(
+                torch.from_numpy(rows),
+                precision.nint_spec,
+                device=device,
+                importance=(
+                    importance
+                    if precision.nint_spec.bits in {2, 3, 4, 5, 6}
+                    else None
+                ),
+            )
         return quantize_nint(
             rows,
             precision.nint_spec,
@@ -373,6 +390,18 @@ def _quantize_flat_cohort(
         )
     if family in {"NVQ2", "NVQ3"}:
         codebook = None if artifact is None else np.asarray(artifact)
+        if torch.device(device).type == "mps":
+            from mfq.quantize.nvq_quant_torch import quantize_axis0
+
+            return quantize_axis0(
+                torch.from_numpy(rows),
+                _NVQ_SPECS[family],
+                device=device,
+                importance=importance,
+                search_steps=_option_int(precision, "search_steps", 19),
+                group_chunk=_option_int(precision, "group_chunk", 1024),
+                codebook=codebook,
+            )
         return quantize_nvq(
             rows,
             _NVQ_SPECS[family],
@@ -411,6 +440,18 @@ def _quantize_flat_cohort(
         )
     if family == "NVQ1-L":
         codebook = None if artifact is None else np.asarray(artifact)
+        if torch.device(device).type == "mps":
+            from mfq.quantize.nvq_quant_torch import quantize_axis0
+
+            return quantize_axis0(
+                torch.from_numpy(rows),
+                NVQ1_L_T8_S3,
+                device=device,
+                importance=importance,
+                refine_steps=_option_int(precision, "refine_steps", 2),
+                group_chunk=_option_int(precision, "group_chunk", 64),
+                codebook=codebook,
+            )
         return quantize_nvq1_l(
             rows,
             NVQ1_L_T8_S3,
@@ -421,6 +462,28 @@ def _quantize_flat_cohort(
             codebook=codebook,
         )
     if family == "NVQ1-S":
+        if str(torch.device(device)).startswith("mps"):
+            from mfq.quantize.nvq1_s_quant_torch import quantize_axis0
+
+            return quantize_axis0(
+                torch.from_numpy(rows),
+                device=device,
+                importance=importance,
+                codebook=(
+                    NVQ1_S_SYNTHETIC_BANKS
+                    if artifact is None
+                    else np.asarray(artifact)
+                ),
+                anchor_multipliers=tuple(
+                    float(value)
+                    for value in str(
+                        precision.option(
+                            "anchor_multipliers", "0.75,1.0,1.25"
+                        )
+                    ).split(",")
+                ),
+                refine_steps=_option_int(precision, "refine_steps", 2),
+            )
         kwargs: dict[str, Any] = {}
         if artifact is not None:
             kwargs["codebook"] = np.asarray(artifact)

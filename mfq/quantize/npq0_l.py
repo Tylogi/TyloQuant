@@ -679,6 +679,11 @@ def quantize_npq0_l_fixed(
         from mfq.quantize.cuda._ext import ext
 
         native_assign = ext().npq0_l_assign
+    metal_assign = None
+    if value.device.type == "mps":
+        from mfq.quantize.metal.npq import npq0_l_assign
+
+        metal_assign = npq0_l_assign
 
     assignment_dtype = torch.uint8 if native_assign is not None else torch.int64
     best_row_error = torch.full((out,), torch.inf, device=value.device)
@@ -706,6 +711,55 @@ def quantize_npq0_l_fixed(
             state = state.reshape(-1)
             first_indices = first_indices.reshape(-1, _VECTORS_PER_GROUP)
             second_indices = second_indices.reshape(-1, _VECTORS_PER_GROUP)
+        elif metal_assign is not None:
+            state_2d, first_3d, second_3d, error_2d = metal_assign(
+                value,
+                objective_weight,
+                anchor,
+                scale_lut,
+                first_codebooks,
+                second_codebooks,
+                neuron_len,
+            )
+            state = state_2d.reshape(-1).to(torch.int64)
+            first_indices = first_3d.reshape(-1, _VECTORS_PER_GROUP).to(
+                torch.int64
+            )
+            second_indices = second_3d.reshape(-1, _VECTORS_PER_GROUP).to(
+                torch.int64
+            )
+            for _ in range(config.fixed_refine_steps):
+                anchor, _ = _refit_anchor_and_lut(
+                    xgroup,
+                    wgroup,
+                    state,
+                    first_indices,
+                    second_indices,
+                    anchor,
+                    scale_lut,
+                    first_codebooks,
+                    second_codebooks,
+                    out=out,
+                    ng=ng,
+                    learn_lut=False,
+                )
+                state_2d, first_3d, second_3d, error_2d = metal_assign(
+                    value,
+                    objective_weight,
+                    anchor,
+                    scale_lut,
+                    first_codebooks,
+                    second_codebooks,
+                    neuron_len,
+                )
+                state = state_2d.reshape(-1).to(torch.int64)
+                first_indices = first_3d.reshape(
+                    -1, _VECTORS_PER_GROUP
+                ).to(torch.int64)
+                second_indices = second_3d.reshape(
+                    -1, _VECTORS_PER_GROUP
+                ).to(torch.int64)
+            row_error = error_2d.sum(1)
         else:
             state, first_indices, second_indices, error = _assign_groups(
                 xgroup,

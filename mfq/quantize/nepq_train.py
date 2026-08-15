@@ -267,7 +267,7 @@ def _nearest_subvectors(
     return index, minimum
 
 
-def _assign(
+def _assign_torch(
     xgroup: torch.Tensor,
     wgroup: torch.Tensor,
     neuron_scale: torch.Tensor,
@@ -321,6 +321,42 @@ def _assign(
         best_first = torch.where(better[:, :, None], first_index, best_first)
         best_second = torch.where(better[:, :, None], second_index, best_second)
     return best_state, best_first, best_second, best_error
+
+
+def _assign(
+    xgroup: torch.Tensor,
+    wgroup: torch.Tensor,
+    neuron_scale: torch.Tensor,
+    scale_lut: torch.Tensor,
+    first_codebooks: torch.Tensor,
+    second_codebooks: torch.Tensor,
+    *,
+    rows: int,
+    ng: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if xgroup.device.type == "mps":
+        from mfq.quantize.metal.npq import npq0_s_batched_assign
+
+        return npq0_s_batched_assign(
+            xgroup,
+            wgroup,
+            neuron_scale,
+            scale_lut,
+            first_codebooks,
+            second_codebooks,
+            rows=rows,
+            groups_per_row=ng,
+        )
+    return _assign_torch(
+        xgroup,
+        wgroup,
+        neuron_scale,
+        scale_lut,
+        first_codebooks,
+        second_codebooks,
+        rows=rows,
+        ng=ng,
+    )
 
 
 def _assigned_code(
@@ -644,8 +680,10 @@ def train_nepq0_s_banks(
     config = NepqBankTrainConfig() if config is None else config
     if samples.ndim != 3:
         raise ValueError("samples must have shape [experts,rows,K]")
-    if not samples.is_cuda:
-        raise ValueError("production NEPQ bank training requires CUDA samples")
+    if samples.device.type not in {"cuda", "mps"}:
+        raise ValueError(
+            "production NEPQ bank training requires CUDA or MPS samples"
+        )
     experts = int(samples.shape[0])
     objective = None
     if importance is not None:

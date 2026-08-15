@@ -43,7 +43,11 @@ class TpqKmeansResult:
 def _device(value: str | torch.device | None) -> torch.device:
     if value is not None:
         return torch.device(value)
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 def _validate_points(
@@ -77,6 +81,23 @@ def _distance(
 
 
 def _assign_device(
+    points: torch.Tensor,
+    codebook: torch.Tensor,
+    *,
+    distance_bytes: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if points.device.type == "mps":
+        from mfq.quantize.metal.tpq import assign
+
+        return assign(points, codebook)
+    return _assign_device_torch(
+        points,
+        codebook,
+        distance_bytes=distance_bytes,
+    )
+
+
+def _assign_device_torch(
     points: torch.Tensor,
     codebook: torch.Tensor,
     *,
@@ -396,9 +417,22 @@ def quantize_tpq_int4(
 ) -> TpqInt4Tensor:
     """Apply TPQ's symmetric int4-g64 dense quantizer."""
 
-    matrix = np.asarray(torch.as_tensor(weight, dtype=torch.float32).cpu())
-    if matrix.ndim != 2 or matrix.shape[1] % group_size or matrix.shape[1] % 2:
+    value = torch.as_tensor(weight, dtype=torch.float32)
+    if value.ndim != 2 or value.shape[1] % group_size or value.shape[1] % 2:
         raise ValueError("TPQ-I4 expects a 2-D matrix aligned to its group size")
+    if value.device.type == "mps":
+        from mfq.quantize.metal.tpq import quantize_int4
+
+        packed, scales = quantize_int4(value, group_size)
+        return TpqInt4Tensor(
+            shape=tuple(map(int, value.shape)),
+            axis=0,
+            neuron_len=int(value.shape[1]),
+            group_size=group_size,
+            packed=packed.cpu().numpy(),
+            scales=scales.cpu().numpy(),
+        )
+    matrix = np.asarray(value.cpu())
     rows, columns = matrix.shape
     groups = matrix.reshape(rows, columns // group_size, group_size)
     scales = np.maximum(np.abs(groups).max(axis=2) / 7.0, 1e-12)

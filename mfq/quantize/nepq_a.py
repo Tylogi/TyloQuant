@@ -75,6 +75,16 @@ def _best_records(
     block_chunk: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     total, block_vectors, _ = blocks.shape
+    if blocks.device.type == "mps":
+        from mfq.quantize.metal.nepq_a import best_records
+
+        return best_records(
+            blocks,
+            dictionary,
+            dictionary_norm,
+            valid_vectors,
+            position_bits,
+        )
     records = torch.empty(total, device=blocks.device, dtype=torch.int64)
     gains = torch.empty(total, device=blocks.device, dtype=torch.float32)
     positions = torch.arange(block_vectors, device=blocks.device).reshape(1, -1, 1)

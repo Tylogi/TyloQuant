@@ -1,4 +1,4 @@
-"""Torch/CUDA NINT tensor quantization.
+"""CUDA/Metal NINT tensor quantization.
 
 This mirrors :mod:`mfq.quantize.nint_quant` but keeps the per-group search on
 GPU. The returned object is still the existing CPU-side ``NintTensor`` so the
@@ -194,6 +194,36 @@ def make_qkx3_cuda(
     return scale, minimum
 
 
+def make_qkx2_metal(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    nmax: int = 15,
+    rmin: float | None = None,
+    rdelta: float = 0.1,
+    nstep: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused Metal implementation of :func:`make_qkx2_torch`."""
+
+    from mfq.quantize.metal.nint import make_qkx2
+
+    return make_qkx2(x, w, nmax, rmin, rdelta, nstep)
+
+
+def make_qkx3_metal(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    nmax: int,
+    rmin: float = -0.9,
+    rdelta: float = 0.05,
+    nstep: int = 36,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused Metal implementation of :func:`make_qkx3_torch`."""
+
+    from mfq.quantize.metal.nint import make_qkx3
+
+    return make_qkx3(x, w, nmax, rmin, rdelta, nstep)
+
+
 def make_qp_torch(
     x: torch.Tensor,
     weights: torch.Tensor,
@@ -309,6 +339,18 @@ def make_qp_cuda(
         int(nmax),
     )
     return scale, levels
+
+
+def make_qp_metal(
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    nmax: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused Metal implementation of :func:`make_qp_torch`."""
+
+    from mfq.quantize.metal.nint import make_qp
+
+    return make_qp(x, weights, nmax)
 
 
 def _imatrix_element_weights(
@@ -840,7 +882,12 @@ def quantize_axis0(
     importance: np.ndarray | torch.Tensor | None = None,
     use_cuda_imatrix_kernels: bool = True,
     use_priority_group_refinement: bool = True,
-) -> NintTensor:
+    return_row_sse: bool = False,
+    priority_row_chunk: int | None = None,
+    priority_pair_chunk: int | None = None,
+    use_metal_unweighted_kernels: bool = True,
+    use_metal_imatrix_kernels: bool = True,
+) -> NintTensor | tuple[NintTensor, torch.Tensor]:
     """Quantize a 2D ``[out, in]`` tensor with axis=0 on GPU."""
 
     if weight.dim() != 2:
@@ -862,7 +909,14 @@ def quantize_axis0(
         av = torch.sqrt(sx2 / float(gs))
         ww = av.unsqueeze(-1) + grps.abs()
         if pad:
-            ww[:, -1, gs - pad :] = 0.0
+            # MPS lowers the sliced in-place assignment above to
+            # index_put/nonzero and synchronizes the whole command buffer.
+            # A broadcast mask is equivalent and remains a regular elementwise
+            # GPU operation on every accelerator backend.
+            valid = torch.arange(
+                ng * gs, device=W.device
+            ).reshape(1, ng, gs) < neuron_len
+            ww = ww * valid
     else:
         importance_rows = _importance_as_rows(
             importance, out, neuron_len, device
@@ -876,10 +930,24 @@ def quantize_axis0(
         and W.is_cuda
         and use_cuda_imatrix_kernels
     )
-    if importance is None:
+    metal_imatrix = (
+        importance is not None
+        and W.device.type == "mps"
+        and use_metal_imatrix_kernels
+    )
+    metal_unweighted = (
+        importance is None
+        and W.device.type == "mps"
+        and use_metal_unweighted_kernels
+    )
+    if metal_unweighted:
+        scale, zp = make_qkx2_metal(grps, ww, nmax=nmax)
+    elif importance is None:
         scale, zp = make_qkx2_torch(grps, ww, nmax=nmax)
     elif fused_imatrix:
         scale, zp = make_qkx3_cuda(grps, ww, nmax=nmax)
+    elif metal_imatrix:
+        scale, zp = make_qkx3_metal(grps, ww, nmax=nmax)
     else:
         scale, zp = make_qkx3_torch(grps, ww, nmax=nmax)
     the_min = -zp
@@ -909,6 +977,12 @@ def quantize_axis0(
         neu_dm, sub_min = make_qp_cuda(
             the_min, group_weights, nmax=K
         )
+        neu_d = neu_d.to(torch.float16).to(torch.float32)
+        neu_dm = neu_dm.to(torch.float16).to(torch.float32)
+    elif metal_imatrix:
+        group_weights = ww.sum(dim=-1)
+        neu_d, sub_scale = make_qp_metal(scale, group_weights, nmax=K)
+        neu_dm, sub_min = make_qp_metal(the_min, group_weights, nmax=K)
         neu_d = neu_d.to(torch.float16).to(torch.float32)
         neu_dm = neu_dm.to(torch.float16).to(torch.float32)
     else:
@@ -941,6 +1015,10 @@ def quantize_axis0(
             )
         )
         if use_priority_group_refinement:
+            if priority_row_chunk is None:
+                priority_row_chunk = 256 if W.device.type == "mps" else _IMATRIX_PRIORITY_ROW_CHUNK
+            if priority_pair_chunk is None:
+                priority_pair_chunk = 192 if W.device.type == "mps" else _IMATRIX_PRIORITY_PAIR_CHUNK
             base_q = q.clone()
             base_sub_scale = sub_scale.clone()
             base_sub_min = sub_min.clone()
@@ -955,6 +1033,8 @@ def quantize_axis0(
                     sub_min,
                     nmax=nmax,
                     sub_nmax=K,
+                    row_chunk=priority_row_chunk,
+                    pair_chunk=priority_pair_chunk,
                 )
             )
             base_reconstruction = (
@@ -993,9 +1073,23 @@ def quantize_axis0(
                 candidate_sub_min,
                 base_sub_min.to(candidate_sub_min.dtype),
             )
+    row_sse = None
+    if return_row_sse:
+        reconstruction = (
+            neu_d[:, None, None]
+            * sub_scale[:, :, None].to(torch.float32)
+            * q.to(torch.float32)
+            - neu_dm[:, None, None]
+            * sub_min[:, :, None].to(torch.float32)
+        ).reshape(out, -1)[:, :neuron_len]
+        error = (reconstruction - W[:, :neuron_len]).square()
+        if importance is not None:
+            error = error * importance_rows
+        row_sse = error.sum(dim=1)
+
     sub_dtype = _uint_dtype(K)
     q_dtype = _uint_dtype(nmax)
-    return NintTensor(
+    encoded = NintTensor(
         spec=spec,
         shape=(out, neuron_len),
         axis=0,
@@ -1006,3 +1100,4 @@ def quantize_axis0(
         sub_min=sub_min.to(torch.uint8).cpu().numpy().astype(sub_dtype, copy=False),
         neuron_len=neuron_len,
     )
+    return (encoded, row_sse) if return_row_sse else encoded

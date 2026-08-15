@@ -176,6 +176,27 @@ def _native_search(
     )
 
 
+def _metal_search(
+    xgroup: torch.Tensor,
+    wgroup: torch.Tensor,
+    codebook: torch.Tensor,
+    ng: int,
+    valid_last: int,
+    search_steps: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from mfq.quantize.metal.nvq import nvq_search
+
+    return nvq_search(
+        xgroup,
+        wgroup,
+        codebook,
+        ng,
+        valid_last,
+        search_steps,
+        float(codebook.max().item()),
+    )
+
+
 def _native_reassign(
     xgroup: torch.Tensor,
     wgroup: torch.Tensor,
@@ -197,6 +218,26 @@ def _native_reassign(
     )
 
 
+def _metal_reassign(
+    xgroup: torch.Tensor,
+    wgroup: torch.Tensor,
+    scale: torch.Tensor,
+    codebook: torch.Tensor,
+    ng: int,
+    valid_last: int,
+) -> torch.Tensor:
+    from mfq.quantize.metal.nvq import nvq_reassign
+
+    return nvq_reassign(
+        xgroup,
+        wgroup,
+        scale,
+        codebook,
+        ng,
+        valid_last,
+    )
+
+
 def _search(
     xgroup: torch.Tensor,
     wgroup: torch.Tensor,
@@ -207,6 +248,15 @@ def _search(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if codebook.dtype == torch.int8 and codebook.is_cuda:
         return _native_search(
+            xgroup,
+            wgroup,
+            codebook,
+            ng,
+            valid_last,
+            config.search_steps,
+        )
+    if codebook.dtype == torch.int8 and codebook.device.type == "mps":
+        return _metal_search(
             xgroup,
             wgroup,
             codebook,
@@ -242,6 +292,15 @@ def _reassign(
             ng,
             valid_last,
         )
+    if codebook.dtype == torch.int8 and codebook.device.type == "mps":
+        return _metal_reassign(
+            xgroup,
+            wgroup,
+            scale,
+            codebook,
+            ng,
+            valid_last,
+        )
     return _reassign_nvq(
         xgroup,
         wgroup,
@@ -258,9 +317,13 @@ def _nearest_state(
     bank_for_state: torch.Tensor,
     bank: int,
 ) -> torch.Tensor:
-    candidates = torch.nonzero(bank_for_state == bank, as_tuple=False).flatten()
-    distance = (ratio.unsqueeze(1) - alpha[candidates].unsqueeze(0)).abs()
-    return candidates[distance.argmin(dim=1)]
+    distance = (ratio.unsqueeze(1) - alpha.unsqueeze(0)).abs()
+    distance = torch.where(
+        bank_for_state.unsqueeze(0) == bank,
+        distance,
+        torch.full_like(distance, torch.inf),
+    )
+    return distance.argmin(dim=1)
 
 
 def _codes_for_assignment(
@@ -269,20 +332,10 @@ def _codes_for_assignment(
     indices: torch.Tensor,
 ) -> torch.Tensor:
     vector_size = int(codebooks.shape[2])
-    result = torch.empty(
-        (indices.shape[0], _GROUP_SIZE),
-        device=indices.device,
-        dtype=torch.float32,
-    )
-    for bank_id in range(codebooks.shape[0]):
-        selected = bank == bank_id
-        if bool(selected.any()):
-            result[selected] = (
-                codebooks[bank_id][indices[selected]]
-                .reshape(-1, _GROUP_SIZE)
-                .to(torch.float32)
-            )
-    return result
+    entries = int(codebooks.shape[1])
+    flat_codebooks = codebooks.reshape(-1, vector_size)
+    keys = bank.unsqueeze(1) * entries + indices
+    return flat_codebooks[keys].reshape(-1, _GROUP_SIZE).to(torch.float32)
 
 
 def _native_e8_jsc_assignment_supported(
@@ -419,7 +472,9 @@ def _assign_groups(
                 torch.full_like(best_bank, bank_id),
                 best_bank,
             )
-            best_indices[better] = indices[better]
+            best_indices = torch.where(
+                better.unsqueeze(-1), indices, best_indices
+            )
         return best_state, best_bank, best_indices, best_error
 
     group_anchor = neuron_scale.repeat_interleave(ng)
@@ -464,7 +519,9 @@ def _assign_groups(
             torch.full_like(best_bank, bank),
             best_bank,
         )
-        best_indices[better] = indices[better]
+        best_indices = torch.where(
+            better.unsqueeze(-1), indices, best_indices
+        )
 
     return best_state, best_bank, best_indices, best_error
 
@@ -639,7 +696,11 @@ def quantize_nvq_jsc_fixed(
     xgroup = target.reshape(out * ng, _GROUP_SIZE).contiguous()
     wgroup = objective_weight.reshape_as(xgroup).contiguous()
     valid_last = neuron_len - (ng - 1) * _GROUP_SIZE
-    codebook_dtype = torch.int8 if value.is_cuda else torch.float32
+    codebook_dtype = (
+        torch.int8
+        if value.is_cuda or value.device.type == "mps"
+        else torch.float32
+    )
     codebooks = torch.as_tensor(
         codebooks_np, device=value.device, dtype=codebook_dtype
     ).contiguous()
@@ -668,6 +729,32 @@ def quantize_nvq_jsc_fixed(
             and balanced_banks
         ):
             native_assign = ext().nvq3j_assign
+
+    metal_assign = None
+    if value.device.type == "mps":
+        bank_count = int(codebooks_np.shape[0])
+        balanced_banks = np.array_equal(
+            np.bincount(bank_np, minlength=bank_count),
+            np.full(bank_count, _STATE_COUNT // bank_count),
+        )
+        if (
+            spec.vector_size == 8
+            and spec.codebook_entries in {256, 1024, 4096}
+            and bank_count == 4
+            and balanced_banks
+        ):
+            from mfq.quantize.metal.nvq_jsc import nvq2j_assign
+
+            metal_assign = nvq2j_assign
+        elif (
+            spec.vector_size == 4
+            and spec.codebook_entries in {256, 512, 1024}
+            and bank_count == 2
+            and balanced_banks
+        ):
+            from mfq.quantize.metal.nvq_jsc import nvq3j_assign
+
+            metal_assign = nvq3j_assign
 
     if native_assign is not None:
         bank_u8 = bank_for_state.to(torch.uint8).contiguous()
@@ -710,6 +797,134 @@ def quantize_nvq_jsc_fixed(
                 indices.reshape(out, ng * _GROUP_SIZE // spec.vector_size)[
                     :, :nvec
                 ]
+                .cpu()
+                .numpy()
+                .astype(
+                    np.uint8 if spec.index_bits <= 8 else np.uint16,
+                    copy=False,
+                )
+            ),
+            signs=signs[:, :nsign].cpu().numpy().astype(
+                np.uint8, copy=False
+            ),
+            codebooks=codebooks_np,
+            base_spec=spec,
+        )
+    if metal_assign is not None:
+        bank_peak = codebooks.to(torch.float32).amax((1, 2))
+        maximum_basis = (
+            alpha * bank_peak[bank_for_state]
+        ).amax().clamp_min(1e-20)
+        weighted_target = torch.where(
+            objective_weight > 0,
+            target,
+            torch.zeros((), device=target.device, dtype=target.dtype),
+        )
+        base_neuron_scale = _fp16_round(
+            weighted_target[:, :neuron_len].amax(1) / maximum_basis
+        ).contiguous()
+        anchor_multipliers = (
+            (0.875, 1.0, 1.125, 1.25)
+            if spec.codebook_entries > 256
+            else (1.0,)
+        )
+        vectors_per_group = _GROUP_SIZE // spec.vector_size
+        best_error = torch.full((out,), torch.inf, device=value.device)
+        best_neuron_scale = torch.zeros_like(base_neuron_scale)
+        best_state_2d = torch.zeros(
+            (out, ng), device=value.device, dtype=torch.uint8
+        )
+        best_indices_3d = torch.zeros(
+            (out, ng, vectors_per_group),
+            device=value.device,
+            dtype=torch.int64,
+        )
+        for multiplier in anchor_multipliers:
+            neuron_scale = _fp16_round(
+                base_neuron_scale * float(multiplier)
+            ).contiguous()
+            state_2d, indices_3d = metal_assign(
+                target,
+                objective_weight,
+                neuron_scale,
+                alpha,
+                bank_for_state,
+                codebooks,
+                neuron_len,
+            )
+            state = state_2d.reshape(-1).to(torch.int64)
+            indices = indices_3d.reshape(
+                -1, vectors_per_group
+            ).to(torch.int64)
+            bank = bank_for_state[state]
+            for _ in range(assignment_refine_steps):
+                neuron_scale, _ = _refit_scale_tables(
+                    xgroup,
+                    wgroup,
+                    codebooks,
+                    state,
+                    bank,
+                    indices,
+                    neuron_scale,
+                    alpha,
+                    out=out,
+                    ng=ng,
+                    learned_scale_lut=False,
+                )
+                state_2d, indices_3d = metal_assign(
+                    target,
+                    objective_weight,
+                    neuron_scale,
+                    alpha,
+                    bank_for_state,
+                    codebooks,
+                    neuron_len,
+                )
+                state = state_2d.reshape(-1).to(torch.int64)
+                indices = indices_3d.reshape(
+                    -1, vectors_per_group
+                ).to(torch.int64)
+                bank = bank_for_state[state]
+            code = _codes_for_assignment(codebooks, bank, indices)
+            effective_scale = (
+                neuron_scale.repeat_interleave(ng) * alpha[state]
+            )
+            row_error = (
+                wgroup
+                * (
+                    effective_scale.unsqueeze(1) * code - xgroup
+                ).square()
+            ).reshape(out, ng, _GROUP_SIZE).sum((1, 2))
+            improve = row_error < best_error
+            best_error = torch.where(improve, row_error, best_error)
+            best_neuron_scale = torch.where(
+                improve, neuron_scale, best_neuron_scale
+            )
+            best_state_2d = torch.where(
+                improve.unsqueeze(1), state_2d, best_state_2d
+            )
+            best_indices_3d = torch.where(
+                improve.reshape(out, 1, 1),
+                indices_3d.to(torch.int64),
+                best_indices_3d,
+            )
+        neuron_scale = best_neuron_scale
+        state_2d = best_state_2d
+        indices_3d = best_indices_3d
+        nvec = math.ceil(neuron_len / spec.vector_size)
+        nsign = math.ceil(neuron_len / 8)
+        return NvqJscTensor(
+            shape=(out, neuron_len),
+            axis=0,
+            neuron_len=neuron_len,
+            neuron_scale=neuron_scale.cpu().numpy().astype(
+                np.float32, copy=False
+            ),
+            scale_lut=alpha_np,
+            bank_for_state=bank_np,
+            state=state_2d.cpu().numpy().astype(np.uint8, copy=False),
+            indices=(
+                indices_3d.reshape(out, ng * vectors_per_group)[:, :nvec]
                 .cpu()
                 .numpy()
                 .astype(

@@ -387,6 +387,49 @@ def _select_assignment(
     pool: _Pool,
     bank_chunk: int,
 ) -> _Assignment:
+    if value.device.type == "mps" and pool.spec in {NEPQ0_S, NEPQ0_L}:
+        from mfq.quantize.metal.nepq0_pool import assign_nepq0_pool
+
+        assert pool.scale is not None
+        assert pool.first_codes is not None
+        assert pool.second_codes is not None
+        bank_ids, state, indices, row_error = assign_nepq0_pool(
+            value,
+            objective,
+            anchor,
+            pool.scale,
+            pool.first_codes,
+            pool.second_codes,
+        )
+        return _Assignment(
+            bank_ids=bank_ids,
+            state=state,
+            indices=indices,
+            aux=None,
+            anchor=anchor,
+            row_error=row_error,
+        )
+    if value.device.type == "mps" and pool.spec in {NEPQ1_S, NEPQ1_L}:
+        from mfq.quantize.metal.nepq1 import assign_nepq1
+
+        assert pool.codes is not None
+        bank_ids, state, indices, aux, row_error = assign_nepq1(
+            value,
+            objective,
+            anchor,
+            pool.codes,
+            states=1 << pool.spec.state_bits,
+            delta=0.15625 if pool.spec is NEPQ1_S else 0.125,
+            banked_codebooks=pool.spec is NEPQ1_S,
+        )
+        return _Assignment(
+            bank_ids=bank_ids,
+            state=state,
+            indices=indices,
+            aux=aux,
+            anchor=anchor,
+            row_error=row_error,
+        )
     rows, width = value.shape
     ng = math.ceil(width / 24)
     pad = ng * 24 - width
@@ -538,7 +581,7 @@ def _can_use_native_nepq0_s(
 ) -> bool:
     return (
         pool.spec is NEPQ0_S
-        and value.is_cuda
+        and (value.is_cuda or value.device.type == "mps")
         and importance is None
         and pool.banks == 256
         and config.anchor_multipliers == (1.0,)
@@ -554,13 +597,21 @@ def _project_native_nepq0_s(
     base_anchor: torch.Tensor,
     pool: _Pool,
 ) -> _Assignment:
-    from mfq.quantize.cuda._ext import ext
-
     assert pool.native_scale is not None
     assert pool.native_first_codes is not None
     assert pool.native_second_codes is not None
     initial_anchor = base_anchor.to(torch.float16).to(torch.float32).contiguous()
-    anchor, bank_ids, state, indices = ext().nepq0_s_assign(
+    if value.is_cuda:
+        from mfq.quantize.cuda._ext import ext
+
+        assign = ext().nepq0_s_assign
+    elif value.device.type == "mps":
+        from mfq.quantize.metal.nepq import nepq0_s_assign
+
+        assign = nepq0_s_assign
+    else:
+        raise RuntimeError("native NEPQ0-S assignment requires CUDA or MPS")
+    anchor, bank_ids, state, indices = assign(
         value,
         initial_anchor,
         pool.native_scale,
@@ -632,7 +683,7 @@ def _native_admm_projector_available(
 ) -> bool:
     return (
         pool.spec is NEPQ0_S
-        and value.is_cuda
+        and (value.is_cuda or value.device.type == "mps")
         and pool.banks == 256
         and pool.native_scale is not None
         and pool.native_first_codes is not None

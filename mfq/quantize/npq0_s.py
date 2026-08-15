@@ -688,6 +688,12 @@ def quantize_npq0_s_fixed(
     maximum_scale = max(float(scale_np.max()), 1e-12)
     base_anchor = value.abs().amax(1) / (maximum_code * maximum_scale)
 
+    metal_assign = None
+    if value.device.type == "mps":
+        from mfq.quantize.metal.npq import npq0_s_assign
+
+        metal_assign = npq0_s_assign
+
     if value.is_cuda:
         from mfq.quantize.cuda._ext import ext
 
@@ -740,6 +746,84 @@ def quantize_npq0_s_fixed(
             best_second.reshape(-1, _VECTORS_PER_GROUP),
             native_first,
             native_second,
+        )
+
+    if metal_assign is not None:
+        best_row_error = torch.full((out,), torch.inf, device=value.device)
+        best_anchor = torch.zeros(out, device=value.device)
+        best_state = torch.zeros(out * ng, dtype=torch.int64, device=value.device)
+        best_first = torch.zeros(
+            (out * ng, _VECTORS_PER_GROUP),
+            dtype=torch.int64,
+            device=value.device,
+        )
+        best_second = torch.zeros_like(best_first)
+        for multiplier in config.anchor_multipliers:
+            anchor = _fp16_round(base_anchor * multiplier).contiguous()
+            state_2d, first_3d, second_3d, error_2d = metal_assign(
+                value,
+                objective_weight,
+                anchor,
+                scale_lut,
+                first_codebooks,
+                second_codebooks,
+                neuron_len,
+            )
+            state = state_2d.reshape(-1).to(torch.int64)
+            first_indices = first_3d.reshape(-1, _VECTORS_PER_GROUP).to(
+                torch.int64
+            )
+            second_indices = second_3d.reshape(-1, _VECTORS_PER_GROUP).to(
+                torch.int64
+            )
+            for _ in range(config.fixed_refine_steps):
+                anchor, _ = _refit_anchor_and_lut(
+                    xgroup,
+                    wgroup,
+                    state,
+                    first_indices,
+                    second_indices,
+                    anchor,
+                    scale_lut,
+                    first_codebooks,
+                    second_codebooks,
+                    out=out,
+                    ng=ng,
+                    learn_lut=False,
+                )
+                state_2d, first_3d, second_3d, error_2d = metal_assign(
+                    value,
+                    objective_weight,
+                    anchor,
+                    scale_lut,
+                    first_codebooks,
+                    second_codebooks,
+                    neuron_len,
+                )
+                state = state_2d.reshape(-1).to(torch.int64)
+                first_indices = first_3d.reshape(
+                    -1, _VECTORS_PER_GROUP
+                ).to(torch.int64)
+                second_indices = second_3d.reshape(
+                    -1, _VECTORS_PER_GROUP
+                ).to(torch.int64)
+            row_error = error_2d.sum(1)
+            better = row_error < best_row_error
+            best_row_error = torch.where(better, row_error, best_row_error)
+            best_anchor = torch.where(better, anchor, best_anchor)
+            group_better = better.repeat_interleave(ng)
+            best_state[group_better] = state[group_better]
+            best_first[group_better] = first_indices[group_better]
+            best_second[group_better] = second_indices[group_better]
+        return _tensor_from_assignment(
+            (out, neuron_len),
+            best_anchor,
+            scale_lut,
+            best_state,
+            best_first,
+            best_second,
+            first_codebooks,
+            second_codebooks,
         )
 
     best_row_error = torch.full((out,), torch.inf, device=value.device)

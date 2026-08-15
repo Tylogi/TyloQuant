@@ -1,4 +1,4 @@
-"""CUDA offline quantizers for NVQ1-L, NVQ2, and NVQ3.
+"""Accelerator-backed offline quantizers for NVQ1-L, NVQ2, and NVQ3.
 
 The solvers mirror the NumPy reference objectives. They operate on one row
 chunk at a time and return the existing CPU-side packed tensor classes, so the
@@ -28,7 +28,9 @@ def _prepare_weight(
     device: str | torch.device,
 ) -> tuple[torch.Tensor, int, int]:
     if weight.dim() != 2:
-        raise ValueError(f"CUDA NVQ quantization expects [out, in], got {tuple(weight.shape)}")
+        raise ValueError(
+            f"NVQ accelerator quantization expects [out, in], got {tuple(weight.shape)}"
+        )
     if weight.shape[0] <= 0 or weight.shape[1] <= 0:
         raise ValueError("NVQ input dimensions must be positive")
     value = weight.to(device=device, dtype=torch.float32, non_blocking=True).contiguous()
@@ -182,7 +184,12 @@ def _search_nvq_groups(
             better = error < best_error
             best_error = torch.where(better, error, best_error)
             best_scale = torch.where(better, scale, best_scale)
-            best_indices[better] = idx[better]
+            # Boolean tensor indexing on MPS is implemented through
+            # nonzero(), which forces a command-buffer synchronization for
+            # every search step.  where() keeps the update entirely on GPU.
+            best_indices = torch.where(
+                better.unsqueeze(-1), idx, best_indices
+            )
 
         scales[start:stop] = best_scale
         indices_out[start:stop] = best_indices
@@ -265,21 +272,43 @@ def _quantize_nvq(
         else validate_codebook(spec, custom_codebook)
     )
     codebook = torch.as_tensor(codebook_cpu, device=value.device, dtype=torch.float32)
-    native_codebook = codebook.to(torch.int8).contiguous() if native_assignment else None
+    native_backend = (
+        value.device.type
+        if native_assignment and value.device.type in {"cuda", "mps"}
+        else None
+    )
+    native_codebook = (
+        codebook.to(torch.int8).contiguous()
+        if native_backend is not None
+        else None
+    )
 
     if native_codebook is not None:
-        from mfq.quantize.cuda._ext import ext
+        if native_backend == "cuda":
+            from mfq.quantize.cuda._ext import ext
 
-        raw_scale, indices = ext().nvq_search(
-            xgroup,
-            wgroup.contiguous(),
-            native_codebook,
-            ng,
-            neuron_len - (ng - 1) * spec.groupsize,
-            spec.vector_size,
-            search_steps,
-            float(codebook_cpu.max()),
-        )
+            raw_scale, indices = ext().nvq_search(
+                xgroup,
+                wgroup.contiguous(),
+                native_codebook,
+                ng,
+                neuron_len - (ng - 1) * spec.groupsize,
+                spec.vector_size,
+                search_steps,
+                float(codebook_cpu.max()),
+            )
+        else:
+            from mfq.quantize.metal.nvq import nvq_search
+
+            raw_scale, indices = nvq_search(
+                xgroup,
+                wgroup,
+                native_codebook,
+                ng,
+                neuron_len - (ng - 1) * spec.groupsize,
+                search_steps,
+                float(codebook_cpu.max()),
+            )
     else:
         raw_scale, indices = _search_nvq_groups(
             xgroup,
@@ -302,15 +331,27 @@ def _quantize_nvq(
 
     effective_scale = (neuron_scale.unsqueeze(-1) * sub_scale).reshape(-1)
     if native_codebook is not None:
-        indices = ext().nvq_reassign(
-            xgroup,
-            wgroup.contiguous(),
-            effective_scale.contiguous(),
-            native_codebook,
-            ng,
-            neuron_len - (ng - 1) * spec.groupsize,
-            spec.vector_size,
-        )
+        if native_backend == "cuda":
+            indices = ext().nvq_reassign(
+                xgroup,
+                wgroup.contiguous(),
+                effective_scale.contiguous(),
+                native_codebook,
+                ng,
+                neuron_len - (ng - 1) * spec.groupsize,
+                spec.vector_size,
+            )
+        else:
+            from mfq.quantize.metal.nvq import nvq_reassign
+
+            indices = nvq_reassign(
+                xgroup,
+                wgroup,
+                effective_scale,
+                native_codebook,
+                ng,
+                neuron_len - (ng - 1) * spec.groupsize,
+            )
     else:
         indices = _reassign_nvq(
             xgroup,
@@ -332,15 +373,27 @@ def _quantize_nvq(
     )
     effective_scale = (neuron_scale.unsqueeze(-1) * sub_scale).reshape(-1)
     if native_codebook is not None:
-        indices = ext().nvq_reassign(
-            xgroup,
-            wgroup.contiguous(),
-            effective_scale.contiguous(),
-            native_codebook,
-            ng,
-            neuron_len - (ng - 1) * spec.groupsize,
-            spec.vector_size,
-        )
+        if native_backend == "cuda":
+            indices = ext().nvq_reassign(
+                xgroup,
+                wgroup.contiguous(),
+                effective_scale.contiguous(),
+                native_codebook,
+                ng,
+                neuron_len - (ng - 1) * spec.groupsize,
+                spec.vector_size,
+            )
+        else:
+            from mfq.quantize.metal.nvq import nvq_reassign
+
+            indices = nvq_reassign(
+                xgroup,
+                wgroup,
+                effective_scale,
+                native_codebook,
+                ng,
+                neuron_len - (ng - 1) * spec.groupsize,
+            )
     else:
         indices = _reassign_nvq(
             xgroup,
@@ -692,12 +745,25 @@ def _solve_nvq1_l_from_anchor(
     anchor = _fp16_round(initial_anchor)
     if native_codebook is not None:
         def assign(current_anchor):
-            from mfq.quantize.cuda._ext import ext
+            if xgroup.is_cuda:
+                from mfq.quantize.cuda._ext import ext
 
-            return ext().nvq1_l_assign(
+                return ext().nvq1_l_assign(
+                    xgroup,
+                    wgroup.contiguous(),
+                    current_anchor.repeat_interleave(groups_per_row).contiguous(),
+                    native_codebook,
+                    groups_per_row,
+                    valid_last,
+                    spec.sub_bits,
+                    spec.delta,
+                )
+            from mfq.quantize.metal.nvq import nvq1_l_assign
+
+            return nvq1_l_assign(
                 xgroup,
-                wgroup.contiguous(),
-                current_anchor.repeat_interleave(groups_per_row).contiguous(),
+                wgroup,
+                current_anchor.repeat_interleave(groups_per_row),
                 native_codebook,
                 groups_per_row,
                 valid_last,
@@ -820,7 +886,11 @@ def _quantize_nvq1_l(
     best_indices = torch.zeros((out, ng, 3), device=value.device, dtype=torch.int64)
     best_anchor = torch.zeros(out, device=value.device)
     assignment_cache = None
-    native_codebook = codebook.to(torch.int8).contiguous() if native_assignment else None
+    native_codebook = (
+        codebook.to(torch.int8).contiguous()
+        if native_assignment and value.device.type in {"cuda", "mps"}
+        else None
+    )
     if not candidate_count and not native_assignment and neuron_len % spec.vector_size == 0:
         assignment_cache = _build_nvq1_l_assignment_cache(
             xgroup,
@@ -886,14 +956,16 @@ def quantize_axis0(
     nvq_native_assignment: bool = True,
     nvq1_l_native_assignment: bool = True,
 ) -> NvqTensor | Nvq1LTensor:
-    """Quantize one ``[out, in]`` chunk with the reference NVQ objective on CUDA."""
+    """Quantize one ``[out, in]`` chunk with native CUDA or Metal assignment."""
 
     if group_chunk <= 0:
         raise ValueError("group_chunk must be positive")
     if refine_steps < 0:
         raise ValueError("refine_steps must be non-negative")
+    use_cuda = str(torch.device(device)).startswith("cuda")
     old_tf32 = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False
+    if use_cuda:
+        torch.backends.cuda.matmul.allow_tf32 = False
     try:
         if isinstance(spec, Nvq1LSpec):
             return _quantize_nvq1_l(
@@ -919,4 +991,5 @@ def quantize_axis0(
             native_assignment=nvq_native_assignment,
         )
     finally:
-        torch.backends.cuda.matmul.allow_tf32 = old_tf32
+        if use_cuda:
+            torch.backends.cuda.matmul.allow_tf32 = old_tf32

@@ -1,13 +1,19 @@
-"""Load and resolve llama.cpp importance matrices."""
+"""Load and resolve native MFQ and llama.cpp importance matrices."""
 
 from __future__ import annotations
 
+import json
+import os
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
+
+
+_NATIVE_FORMAT = "mfq.imatrix.v1"
+_NATIVE_METADATA = "__metadata_json__"
 
 
 @dataclass(frozen=True)
@@ -32,6 +38,7 @@ class ImportanceMatrix:
     chunk_count: int
     chunk_size: int
     legacy: bool
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def find(self, names: Iterable[str]) -> tuple[str, ImportanceEntry] | None:
         for name in names:
@@ -136,6 +143,111 @@ def _normalize_entry(
     return ImportanceEntry(np.ascontiguousarray(values), counts)
 
 
+def save_importance_matrix(
+    path: str | Path,
+    entries: dict[str, ImportanceEntry],
+    *,
+    datasets: Iterable[str] = (),
+    chunk_count: int = 0,
+    chunk_size: int = 0,
+    metadata: dict[str, Any] | None = None,
+) -> ImportanceMatrix:
+    """Save a native MFQ imatrix without losing per-expert counts."""
+
+    output = Path(path).resolve()
+    if output.exists():
+        raise FileExistsError(f"imatrix already exists: {output}")
+    if not entries:
+        raise ValueError("cannot save an empty imatrix")
+    if chunk_count < 0 or chunk_size < 0:
+        raise ValueError("imatrix chunk metadata cannot be negative")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    arrays: dict[str, np.ndarray] = {}
+    entry_document: dict[str, Any] = {}
+    normalized: dict[str, ImportanceEntry] = {}
+    for index, (name, raw) in enumerate(sorted(entries.items())):
+        values = np.asarray(raw.values, dtype=np.float32)
+        counts = np.asarray(raw.counts, dtype=np.int64).reshape(-1)
+        if values.ndim != 2 or values.shape[0] != counts.size or not values.shape[1]:
+            raise ValueError(f"invalid native imatrix entry shape for {name!r}")
+        if (
+            not np.isfinite(values).all()
+            or np.any(values < 0)
+            or np.any(counts < 0)
+        ):
+            raise ValueError(f"invalid native imatrix values for {name!r}")
+        prefix = f"entry_{index:05d}"
+        arrays[f"{prefix}_values"] = np.ascontiguousarray(values)
+        arrays[f"{prefix}_counts"] = np.ascontiguousarray(counts)
+        entry_document[name] = {"prefix": prefix, "shape": list(values.shape)}
+        normalized[name] = ImportanceEntry(arrays[f"{prefix}_values"], counts)
+    document = {
+        "format": _NATIVE_FORMAT,
+        "datasets": [str(value) for value in datasets],
+        "chunk_count": int(chunk_count),
+        "chunk_size": int(chunk_size),
+        "metadata": dict(metadata or {}),
+        "entries": entry_document,
+    }
+    arrays[_NATIVE_METADATA] = np.frombuffer(
+        json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        dtype=np.uint8,
+    ).copy()
+    temporary = output.with_name(f"{output.name}.{os.getpid()}.tmp")
+    with temporary.open("xb") as stream:
+        np.savez_compressed(stream, **arrays)
+    os.replace(temporary, output)
+    return ImportanceMatrix(
+        output,
+        normalized,
+        tuple(document["datasets"]),
+        int(chunk_count),
+        int(chunk_size),
+        False,
+        dict(document["metadata"]),
+    )
+
+
+def _load_native(path: Path) -> ImportanceMatrix:
+    with np.load(path, allow_pickle=False) as archive:
+        if _NATIVE_METADATA not in archive.files:
+            raise ValueError(f"native imatrix has no metadata: {path}")
+        try:
+            document = json.loads(archive[_NATIVE_METADATA].tobytes().decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid native imatrix metadata: {path}") from exc
+        if document.get("format") != _NATIVE_FORMAT:
+            raise ValueError(f"unsupported native imatrix format: {document.get('format')!r}")
+        entries: dict[str, ImportanceEntry] = {}
+        for name, item in document.get("entries", {}).items():
+            prefix = str(item["prefix"])
+            values = np.asarray(archive[f"{prefix}_values"], dtype=np.float32)
+            counts = np.asarray(archive[f"{prefix}_counts"], dtype=np.int64).reshape(-1)
+            expected = tuple(int(value) for value in item["shape"])
+            if values.shape != expected or values.ndim != 2 or values.shape[0] != counts.size:
+                raise ValueError(f"native imatrix entry shape mismatch for {name!r}")
+            if (
+                not np.isfinite(values).all()
+                or np.any(values < 0)
+                or np.any(counts < 0)
+            ):
+                raise ValueError(f"native imatrix entry {name!r} is invalid")
+            entries[str(name)] = ImportanceEntry(
+                np.ascontiguousarray(values), np.ascontiguousarray(counts)
+            )
+    if not entries:
+        raise ValueError(f"native imatrix contains no entries: {path}")
+    return ImportanceMatrix(
+        path,
+        entries,
+        tuple(str(value) for value in document.get("datasets", ())),
+        int(document.get("chunk_count", 0)),
+        int(document.get("chunk_size", 0)),
+        False,
+        dict(document.get("metadata", {})),
+    )
+
+
 def _load_gguf(path: Path) -> ImportanceMatrix:
     reader = _load_gguf_reader()(str(path), "r")
     general_type = str(_field_value(reader, "general.type", ""))
@@ -232,4 +344,16 @@ def load_importance_matrix(path: str | Path) -> ImportanceMatrix:
         raise FileNotFoundError(f"imatrix file does not exist: {resolved}")
     with resolved.open("rb") as handle:
         magic = handle.read(4)
-    return _load_gguf(resolved) if magic == b"GGUF" else _load_legacy(resolved)
+    if magic == b"GGUF":
+        return _load_gguf(resolved)
+    if magic.startswith(b"PK"):
+        return _load_native(resolved)
+    return _load_legacy(resolved)
+
+
+__all__ = [
+    "ImportanceEntry",
+    "ImportanceMatrix",
+    "load_importance_matrix",
+    "save_importance_matrix",
+]

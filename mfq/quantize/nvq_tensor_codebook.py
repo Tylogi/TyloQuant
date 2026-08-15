@@ -35,7 +35,7 @@ NvqAnyTensor = NvqTensor | Nvq1LTensor
 class TensorCodebookTrainingConfig:
     iterations: int = 4
     projection_candidates: int = 48
-    quant_backend: Literal["cuda", "cpu"] = "cuda"
+    quant_backend: Literal["cuda", "metal", "cpu"] = "cuda"
     device: str = "cuda"
     group_chunk: int = 32768
     row_chunk: int = 512
@@ -57,7 +57,7 @@ class TensorCodebookTrainingConfig:
             raise ValueError("projection_candidates must be positive")
         if self.group_chunk <= 0 or self.row_chunk <= 0 or self.search_steps <= 0:
             raise ValueError("group_chunk, row_chunk, and search_steps must be positive")
-        if self.quant_backend not in {"cuda", "cpu"}:
+        if self.quant_backend not in {"cuda", "metal", "cpu"}:
             raise ValueError(f"unsupported quant backend: {self.quant_backend}")
         if self.nvq1_l_refine_steps < 0:
             raise ValueError("nvq1_l_refine_steps must be non-negative")
@@ -165,11 +165,13 @@ def _quantize(
     config: TensorCodebookTrainingConfig,
     importance: np.ndarray | None = None,
 ) -> NvqAnyTensor:
-    if config.quant_backend == "cuda":
+    if config.quant_backend in {"cuda", "metal"}:
         import torch
 
-        if not torch.cuda.is_available():
+        if config.quant_backend == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("tensor-wise NVQ training requested CUDA, but CUDA is unavailable")
+        if config.quant_backend == "metal" and not torch.backends.mps.is_available():
+            raise RuntimeError("tensor-wise NVQ training requested Metal, but MPS is unavailable")
         from mfq.quantize.nvq_quant_torch import quantize_axis0
 
         return quantize_axis0(
@@ -183,8 +185,14 @@ def _quantize(
             group_chunk=config.group_chunk,
             nvq1_l_candidates=0,
             codebook=codebook,
-            nvq_native_assignment=config.nvq_native_assignment,
-            nvq1_l_native_assignment=config.nvq1_l_native_assignment,
+            nvq_native_assignment=(
+                config.quant_backend in {"cuda", "metal"}
+                and config.nvq_native_assignment
+            ),
+            nvq1_l_native_assignment=(
+                config.quant_backend in {"cuda", "metal"}
+                and config.nvq1_l_native_assignment
+            ),
         )
     if isinstance(spec, Nvq1LSpec):
         return quantize_nvq1_l_cpu(
