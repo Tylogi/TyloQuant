@@ -75,19 +75,46 @@ function base64ToFloat32(value: string): Float32Array {
   return new Float32Array(bytes.buffer);
 }
 
-function resample(input: Float32Array, sourceRate: number, targetRate: number): Float32Array {
-  if (sourceRate === targetRate) return new Float32Array(input);
-  const length = Math.round((input.length * targetRate) / sourceRate);
-  const output = new Float32Array(length);
-  const scale = sourceRate / targetRate;
-  for (let index = 0; index < length; index += 1) {
-    const position = index * scale;
-    const left = Math.floor(position);
-    const right = Math.min(left + 1, input.length - 1);
-    const mix = position - left;
-    output[index] = input[left] * (1 - mix) + input[right] * mix;
+class StreamingLinearResampler {
+  private buffer = new Float32Array(0);
+  private position = 0;
+  private readonly step: number;
+
+  constructor(
+    private readonly sourceRate: number,
+    private readonly targetRate: number,
+  ) {
+    this.step = sourceRate / targetRate;
   }
-  return output;
+
+  push(input: Float32Array): Float32Array {
+    if (!input.length) return new Float32Array(0);
+    if (this.sourceRate === this.targetRate) return new Float32Array(input);
+
+    const joined = new Float32Array(this.buffer.length + input.length);
+    joined.set(this.buffer);
+    joined.set(input, this.buffer.length);
+    this.buffer = joined;
+
+    let count = 0;
+    for (let cursor = this.position; Math.floor(cursor) + 1 < joined.length; cursor += this.step) {
+      count += 1;
+    }
+    const output = new Float32Array(count);
+    for (let index = 0; index < count; index += 1) {
+      const left = Math.floor(this.position);
+      const mix = this.position - left;
+      output[index] = joined[left] * (1 - mix) + joined[left + 1] * mix;
+      this.position += this.step;
+    }
+
+    const discard = Math.min(joined.length, Math.floor(this.position));
+    if (discard > 0) {
+      this.buffer = joined.slice(discard);
+      this.position -= discard;
+    }
+    return output;
+  }
 }
 
 function wavBlob(chunks: Float32Array[], sampleRate: number): Blob {
@@ -161,6 +188,7 @@ export class RealtimeAudioController {
   private outputContext: AudioContext | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
   private capture: AudioWorkletNode | null = null;
+  private inputResampler: StreamingLinearResampler | null = null;
   private pending: Float32Array[] = [];
   private pendingLength = 0;
   private outbound: Array<{
@@ -369,7 +397,15 @@ export class RealtimeAudioController {
         autoGainControl: true,
       },
     });
-    this.inputContext = new AudioContext();
+    try {
+      this.inputContext = new AudioContext({ sampleRate: INPUT_RATE });
+    } catch {
+      this.inputContext = new AudioContext();
+    }
+    this.inputResampler = new StreamingLinearResampler(
+      this.inputContext.sampleRate,
+      INPUT_RATE,
+    );
     this.outputContext ??= new AudioContext({ sampleRate: OUTPUT_RATE });
     await Promise.all([this.inputContext.resume(), this.outputContext.resume()]);
     await this.inputContext.audioWorklet.addModule("/pcm-capture-worklet.js");
@@ -388,6 +424,7 @@ export class RealtimeAudioController {
     this.capture?.disconnect();
     await this.inputContext?.close().catch(() => undefined);
     this.inputContext = null;
+    this.inputResampler = null;
     this.source = null;
     this.capture = null;
   }
@@ -398,7 +435,8 @@ export class RealtimeAudioController {
     for (const sample of samples) energy += sample * sample;
     const rms = Math.sqrt(energy / Math.max(1, samples.length));
     this.callbacks.onLevel(Math.min(1, rms * 10));
-    const converted = resample(samples, this.inputContext.sampleRate, INPUT_RATE);
+    const converted = this.inputResampler?.push(samples) ?? new Float32Array(samples);
+    if (!converted.length) return;
     this.trackUserInput(converted, rms);
     this.pending.push(converted);
     this.pendingLength += converted.length;

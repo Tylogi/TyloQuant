@@ -270,7 +270,9 @@ def test_hf_to_mfq_cuda_backend_smoke(tmp_path: Path):
 
     convert(Args())
     header, loaded = io.load(out)
-    assert header.extra["quant_backend"] == "cuda"
+    assert "recipe" not in header.extra
+    assert "quant_backend" not in header.extra
+    assert "device" not in header.extra
     assert loaded["model.language_model.layers.0.mlp.gate_proj.weight"].shape == (17, 29)
     assert loaded["model.language_model.layers.0.input_layernorm.weight"].dtype == np.float16
     assert loaded["model.language_model.layers.0.linear_attn.conv1d.weight"].dtype == np.float16

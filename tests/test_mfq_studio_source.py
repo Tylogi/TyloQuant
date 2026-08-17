@@ -53,6 +53,14 @@ def test_studio_drains_duplex_output_after_microphone_capture_stops():
     assert "this.callbacks.onText(target.buffer.sessionId, target.buffer.text)" in REALTIME_AUDIO
 
 
+def test_studio_preserves_resampling_phase_across_audio_worklet_blocks():
+    assert "class StreamingLinearResampler" in REALTIME_AUDIO
+    assert "private position = 0" in REALTIME_AUDIO
+    assert "this.position += this.step" in REALTIME_AUDIO
+    assert "new AudioContext({ sampleRate: INPUT_RATE })" in REALTIME_AUDIO
+    assert "Math.round((input.length * targetRate) / sourceRate)" not in REALTIME_AUDIO
+
+
 def test_studio_uses_the_model_bound_duplex_system_prompt():
     assert "modeTemplateSettings" in APP
     assert 'runtime?.duplex_sampling_defaults ?? realtime?.defaults' in APP

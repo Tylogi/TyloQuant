@@ -338,6 +338,9 @@ def test_minicpmo45_metal_duplex_tracks_all_cache_lifetimes():
     assert "language_cache_position" in METAL_HEADER
     assert "audio_cache_position" in METAL_HEADER
     assert "tts_cache_position" in METAL_HEADER
+    assert "kMinicpmoDuplexCacheLimitBytes" in METAL_DECODE
+    assert "set_cache_limit(kMinicpmoDuplexCacheLimitBytes)" in METAL_DECODE
+    assert "runtime_holder->value().reset();\n                    mlx::core::synchronize(runtime_stream);\n                    mlx::core::clear_cache();" in METAL_DECODE
 
 
 def test_minicpmo45_realtime_uses_official_demo_defaults():

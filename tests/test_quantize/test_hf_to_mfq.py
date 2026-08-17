@@ -713,7 +713,9 @@ def test_hf_convert_matches_llamacpp_mostly_bf16_policy(tmp_path):
         assert header.model_arch == "qwen3_5-hf-mfq-bf16"
         assert header.extra["policy"] == "mostly-BF16;1d-and-special=F32"
         assert header.extra["mostly_bf16"] is True
-        assert header.extra["quant_backend"] == "cpu"
+        assert "recipe" not in header.extra
+        assert "quant_backend" not in header.extra
+        assert "device" not in header.extra
         assert header.extra["target_counts"] == {"BF16": 2, "F32": 2, "I64": 1}
         assert store.records["model.language_model.embed_tokens.weight"].dtype == "BF16"
         assert store.records["lm_head.weight"].dtype == "BF16"

@@ -35,6 +35,9 @@
 
 namespace {
 
+constexpr std::size_t kMinicpmoDuplexCacheLimitBytes =
+    std::size_t{8} << 30;
+
 void release_model_load_staging_memory() {
     // Model conversion and NINTM repacking leave large, now-unused buffers in
     // both the MLX cache and macOS malloc's large-object depot. Keeping those
@@ -886,6 +889,7 @@ int serve_loaded_runtime(
                     mlx::core::set_default_stream(runtime_stream);
                     auto& runtime = runtime_holder->value();
                     runtime.reset();
+                    mlx::core::clear_cache();
 
                     mfq::metal::MlxMiniCPMO45DuplexConfig config;
                     auto& ids = config.special_ids;
@@ -1061,6 +1065,8 @@ int serve_loaded_runtime(
                     mlx::core::set_default_stream(runtime_stream);
                     runtime_holder->value().reset();
                     mlx::core::synchronize(runtime_stream);
+                    mlx::core::clear_cache();
+                    malloc_zone_pressure_relief(nullptr, 0);
                 };
         }
     }
@@ -1201,6 +1207,7 @@ int run_native_server(
                 arguments.context_size,
                 arguments.minicpmo_duplex);
         release_model_load_staging_memory();
+        mlx::core::set_cache_limit(kMinicpmoDuplexCacheLimitBytes);
         const auto load_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
         const auto maximum_context = runtime.maximum_context();
