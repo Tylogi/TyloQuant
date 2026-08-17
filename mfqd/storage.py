@@ -21,6 +21,7 @@ from mfqd.models import (
     ForkSessionRequest,
     Message,
     MessageRole,
+    RewindSessionRequest,
     ResponseResource,
     ResponseStatus,
     SessionMode,
@@ -30,7 +31,7 @@ from mfqd.models import (
     UpdateSessionRequest,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _CONTENT_PARTS = TypeAdapter(list[ContentPart])
 
 
@@ -162,6 +163,7 @@ class SessionStore:
                     request_fingerprint TEXT NOT NULL,
                     status TEXT NOT NULL,
                     input_message_id TEXT NOT NULL REFERENCES messages(id),
+                    output_message_id TEXT,
                     output_json TEXT NOT NULL,
                     finish_reason TEXT,
                     usage_json TEXT,
@@ -181,6 +183,16 @@ class SessionStore:
             if existing is None:
                 connection.execute(
                     "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?)",
+                    (str(SCHEMA_VERSION),),
+                )
+            elif int(existing["value"]) == 1:
+                columns = {
+                    row["name"] for row in connection.execute("PRAGMA table_info(responses)")
+                }
+                if "output_message_id" not in columns:
+                    connection.execute("ALTER TABLE responses ADD COLUMN output_message_id TEXT")
+                connection.execute(
+                    "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (str(SCHEMA_VERSION),),
                 )
             elif int(existing["value"]) != SCHEMA_VERSION:
@@ -431,6 +443,73 @@ class SessionStore:
             )
         return self.get_session(identifier)
 
+    def rewind_session(
+        self,
+        session_id: UUID,
+        request: RewindSessionRequest,
+        *,
+        now: datetime | None = None,
+    ) -> SessionResource:
+        updated_at = now or _utcnow()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            session = connection.execute(
+                "SELECT * FROM sessions WHERE id = ?",
+                (str(session_id),),
+            ).fetchone()
+            if session is None:
+                raise SessionNotFoundError(str(session_id))
+            actual_revision = int(session["revision"])
+            if actual_revision != request.expected_revision:
+                raise RevisionConflictError(request.expected_revision, actual_revision)
+            if session["state"] == SessionState.PROCESSING.value:
+                raise ResponseInProgressError(f"session is {session['state']}")
+            target = connection.execute(
+                """
+                SELECT ordinal FROM session_messages
+                WHERE session_id = ? AND message_id = ?
+                """,
+                (str(session_id), str(request.at_message_id)),
+            ).fetchone()
+            if target is None:
+                raise MessageNotFoundError(str(request.at_message_id))
+            limit = int(target["ordinal"])
+            if not request.include_message:
+                limit -= 1
+            connection.execute(
+                """
+                DELETE FROM responses
+                WHERE session_id = ? AND (
+                    input_message_id IN (
+                        SELECT message_id FROM session_messages
+                        WHERE session_id = ? AND ordinal > ?
+                    ) OR output_message_id IN (
+                        SELECT message_id FROM session_messages
+                        WHERE session_id = ? AND ordinal > ?
+                    )
+                )
+                """,
+                (str(session_id), str(session_id), limit, str(session_id), limit),
+            )
+            connection.execute(
+                "DELETE FROM session_messages WHERE session_id = ? AND ordinal > ?",
+                (str(session_id), limit),
+            )
+            connection.execute(
+                """
+                UPDATE sessions
+                SET revision = ?, state = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    limit,
+                    SessionState.IDLE.value,
+                    _timestamp(updated_at),
+                    str(session_id),
+                ),
+            )
+        return self.get_session(session_id)
+
     def begin_response(
         self,
         session_id: UUID,
@@ -563,6 +642,21 @@ class SessionStore:
             raise ResponseNotFoundError(str(response_id))
         return self._response_from_row(row)
 
+    def list_responses(
+        self, session_id: UUID, *, limit: int = 200
+    ) -> list[ResponseResource]:
+        if limit < 1 or limit > 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM responses WHERE session_id = ?
+                ORDER BY created_at ASC LIMIT ?
+                """,
+                (str(session_id), limit),
+            ).fetchall()
+        return [self._response_from_row(row) for row in rows]
+
     def complete_response(
         self,
         response_id: UUID,
@@ -644,12 +738,13 @@ class SessionStore:
             connection.execute(
                 """
                 UPDATE responses
-                SET status = ?, output_json = ?, finish_reason = ?, usage_json = ?,
+                SET status = ?, output_message_id = ?, output_json = ?, finish_reason = ?, usage_json = ?,
                     error_json = NULL, completed_at = ?
                 WHERE id = ?
                 """,
                 (
                     ResponseStatus.COMPLETED.value,
+                    str(message_id),
                     _CONTENT_PARTS.dump_json(validated_output).decode("utf-8"),
                     finish_reason,
                     usage.model_dump_json() if usage is not None else None,
@@ -757,11 +852,13 @@ class SessionStore:
         usage = TokenUsage.model_validate_json(row["usage_json"]) if row["usage_json"] else None
         error = ErrorDetail.model_validate_json(row["error_json"]) if row["error_json"] else None
         completed_at = row["completed_at"]
+        output_message_id = row["output_message_id"]
         return ResponseResource(
             id=UUID(row["id"]),
             request_id=UUID(row["request_id"]),
             session_id=UUID(row["session_id"]),
             status=ResponseStatus(row["status"]),
+            output_message_id=UUID(output_message_id) if output_message_id else None,
             output=_CONTENT_PARTS.validate_json(row["output_json"]),
             finish_reason=row["finish_reason"],
             usage=usage,

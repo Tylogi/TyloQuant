@@ -31,8 +31,10 @@ from mfqd.models import (
     RealtimeFrame,
     RealtimePayload,
     ReasoningPart,
+    RewindSessionRequest,
     ResponseCompleted,
     ResponseReasoningDelta,
+    ResponseList,
     ResponseResource,
     ResponseStatus,
     ResponseTextDelta,
@@ -207,6 +209,15 @@ class MfqdService:
             raise ServiceError(404, "session_not_found", str(error)) from error
         return MessageList(data=messages)
 
+    async def list_responses(self, session_id: UUID, *, limit: int = 200) -> ResponseList:
+        try:
+            data = await asyncio.to_thread(
+                self.store.list_responses, session_id, limit=limit
+            )
+        except ValueError as error:
+            raise ServiceError(422, "invalid_request", str(error)) from error
+        return ResponseList(data=data)
+
     async def append_message(
         self,
         session_id: UUID,
@@ -249,6 +260,33 @@ class MfqdService:
         if request.at_message_id is None:
             await self.backend.fork_session(session_id, forked.id)
         return forked
+
+    async def rewind_session(
+        self,
+        session_id: UUID,
+        request: RewindSessionRequest,
+    ) -> SessionResource:
+        try:
+            return await asyncio.to_thread(
+                self.store.rewind_session,
+                session_id,
+                request,
+            )
+        except SessionNotFoundError as error:
+            raise ServiceError(404, "session_not_found", str(error)) from error
+        except MessageNotFoundError as error:
+            raise ServiceError(404, "message_not_found", str(error)) from error
+        except RevisionConflictError as error:
+            raise ServiceError(
+                409,
+                "revision_conflict",
+                str(error),
+                details={"expected_revision": error.expected, "actual_revision": error.actual},
+            ) from error
+        except ResponseInProgressError as error:
+            raise ServiceError(409, "response_in_progress", str(error), retryable=True) from error
+        except StorageError as error:
+            raise ServiceError(409, "session_state_conflict", str(error)) from error
 
     async def delete_session(self, session_id: UUID) -> None:
         try:

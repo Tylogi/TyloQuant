@@ -758,26 +758,44 @@ export default function App() {
 
   async function saveEdit(message: Message) {
     if (!active || !editDraft || busy) return;
+    const messageIndex = messages.findIndex((item) => item.id === message.id);
+    if (messageIndex < 0) return;
     const text = editDraft.text.trim();
     const reasoning = editDraft.reasoning.trim();
     if (message.role === "user" && !text) return;
     if (message.role === "assistant" && !text && !reasoning) return;
     setBusy(true);
     try {
-      const branch = await api.forkSession(
+      const rewound = await api.rewindSession(
         active.id,
+        active.revision,
         message.id,
         false,
-        active.title ? `${active.title} · edit` : null,
       );
       const parts: ContentPart[] = [];
       if (reasoning) parts.push({ type: "reasoning", text: reasoning });
       if (text) parts.push({ type: "text", text });
-      const appended = await api.appendMessage(branch.id, branch.revision, message.role, parts);
-      setSessions((current) => [appended.session, ...current]);
-      setActiveId(appended.session.id);
-      setMessages([...(await api.listMessages(appended.session.id))]);
+      const rewoundMessages = messages.slice(0, messageIndex);
+      setSessions((current) =>
+        current.map((session) => session.id === rewound.id ? rewound : session),
+      );
+      setMessages(rewoundMessages);
       setEditDraft(null);
+      if (message.role === "user") {
+        setMessages([...rewoundMessages, { ...message, parts }]);
+        await generate(rewound, text, false);
+      } else {
+        const appended = await api.appendMessage(
+          rewound.id,
+          rewound.revision,
+          message.role,
+          parts,
+        );
+        setSessions((current) =>
+          current.map((session) => session.id === appended.session.id ? appended.session : session),
+        );
+        setMessages([...rewoundMessages, appended.message]);
+      }
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -789,9 +807,11 @@ export default function App() {
     if (!active || busy || message.role !== "assistant") return;
     const index = messages.findIndex((item) => item.id === message.id);
     let user: Message | undefined;
+    let userIndex = -1;
     for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
       if (messages[cursor].role === "user") {
         user = messages[cursor];
+        userIndex = cursor;
         break;
       }
     }
@@ -800,17 +820,18 @@ export default function App() {
     if (!text) return;
     setBusy(true);
     try {
-      const branch = await api.forkSession(
+      const rewound = await api.rewindSession(
         active.id,
+        active.revision,
         user.id,
         false,
-        active.title ? `${active.title} · retry` : null,
       );
-      setSessions((current) => [branch, ...current]);
-      setActiveId(branch.id);
-      setMessages(await api.listMessages(branch.id));
-      setBusy(false);
-      await generate(branch, text);
+      const rewoundMessages = messages.slice(0, userIndex + 1);
+      setSessions((current) =>
+        current.map((session) => session.id === rewound.id ? rewound : session),
+      );
+      setMessages(rewoundMessages);
+      await generate(rewound, text, false);
     } catch (cause) {
       setBusy(false);
       setError(errorMessage(cause));
@@ -1009,8 +1030,10 @@ export default function App() {
                   return <article className={`message message-${message.role}`} key={message.id}>
                     <div className="message-avatar">{message.role === "assistant" ? <img src="/mfq-mark.svg" alt="MFQ" /> : <span>{message.role === "user" ? tr("你", "You") : message.role}</span>}</div>
                     <div className="message-body">
-                      <div className="message-meta"><strong>{message.role === "assistant" ? "MFQ" : message.role === "user" ? tr("你", "You") : message.role}</strong><span>{new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span></div>
-                      {editing ? <div className="message-editor">{message.role === "assistant" && <textarea aria-label={tr("思考过程", "Reasoning")} onChange={(event) => setEditDraft((current) => current && ({ ...current, reasoning: event.target.value }))} placeholder={tr("思考过程", "Reasoning")} value={editDraft.reasoning} />}<textarea aria-label={tr("消息", "Message")} onChange={(event) => setEditDraft((current) => current && ({ ...current, text: event.target.value }))} value={editDraft.text} /><div><button onClick={() => setEditDraft(null)} type="button">{tr("取消", "Cancel")}</button><button className="primary" onClick={() => void saveEdit(message)} type="button">{tr("保存到新分支", "Save as branch")}</button></div></div> : <>{parts.reasoning && <details className="reasoning"><summary>{tr("思考过程", "Reasoning")}</summary><Markdown text={parts.reasoning} /></details>}{parts.text && <Markdown text={parts.text} />}{message.parts.filter(isMediaPart).map((part, index) => <div className="media-part" key={index}>{part.type === "image" ? "Image" : part.type === "audio" ? "Audio" : "Generated audio"} · {part.media.mime_type} · {formatNumber(part.media.byte_size)} bytes</div>)}{message.parts.filter((part) => part.type === "tool_call" || part.type === "tool_result").map((part, index) => <pre className="tool-call" key={index}>{part.type === "tool_call" ? `${part.name}(${JSON.stringify(part.arguments, null, 2)})` : JSON.stringify(part.result, null, 2)}</pre>)}</>}
+                      <div className="message-content">
+                        <div className="message-meta"><strong>{message.role === "assistant" ? "MFQ" : message.role === "user" ? tr("你", "You") : message.role}</strong><span>{new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span></div>
+                        {editing ? <div className="message-editor">{message.role === "assistant" && <textarea aria-label={tr("思考过程", "Reasoning")} onChange={(event) => setEditDraft((current) => current && ({ ...current, reasoning: event.target.value }))} placeholder={tr("思考过程", "Reasoning")} value={editDraft.reasoning} />}<textarea aria-label={tr("消息", "Message")} onChange={(event) => setEditDraft((current) => current && ({ ...current, text: event.target.value }))} value={editDraft.text} /><div><button onClick={() => setEditDraft(null)} type="button">{tr("取消", "Cancel")}</button><button className="primary" onClick={() => void saveEdit(message)} type="button">{tr("保存", "Save")}</button></div></div> : <>{parts.reasoning && <details className="reasoning"><summary>{tr("思考过程", "Reasoning")}</summary><Markdown text={parts.reasoning} /></details>}{parts.text && <Markdown text={parts.text} />}{message.parts.filter(isMediaPart).map((part, index) => <div className="media-part" key={index}>{part.type === "image" ? "Image" : part.type === "audio" ? "Audio" : "Generated audio"} · {part.media.mime_type} · {formatNumber(part.media.byte_size)} bytes</div>)}{message.parts.filter((part) => part.type === "tool_call" || part.type === "tool_result").map((part, index) => <pre className="tool-call" key={index}>{part.type === "tool_call" ? `${part.name}(${JSON.stringify(part.arguments, null, 2)})` : JSON.stringify(part.result, null, 2)}</pre>)}</>}
+                      </div>
                       {!editing && <div className="message-actions"><button onClick={() => void copyMessage(message)} type="button">{tr("复制", "Copy")}</button>{(message.role === "user" || message.role === "assistant") && <button onClick={() => setEditDraft({ messageId: message.id, ...parts })} type="button">{tr("编辑", "Edit")}</button>}{message.role === "assistant" && <button onClick={() => void regenerate(message)} type="button">{tr("重新生成", "Regenerate")}</button>}</div>}
                     </div>
                   </article>;

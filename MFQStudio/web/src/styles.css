@@ -144,7 +144,8 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 .message { display: grid; grid-template-columns: 38px minmax(0, 1fr); gap: 12px; margin-bottom: 28px; }
 .message-user { grid-template-columns: minmax(0, 1fr) 38px; }
 .message-user .message-avatar { grid-column: 2; grid-row: 1; }
-.message-user .message-body { grid-column: 1; grid-row: 1; justify-self: end; width: min(680px, 92%); border: 1px solid #e0d5ca; border-radius: 16px 4px 16px 16px; padding: 13px 15px; background: #f0e6dc; }
+.message-user .message-body { grid-column: 1; grid-row: 1; justify-self: end; width: fit-content; max-width: min(680px, 92%); }
+.message-user .message-content { border: 1px solid #e0d5ca; border-radius: 16px 4px 16px 16px; padding: 13px 15px; background: #f0e6dc; }
 .message-avatar { display: grid; width: 34px; height: 34px; place-items: center; border: 1px solid var(--line); border-radius: 10px; color: #6e5d50; background: white; font-size: 10px; }
 .message-avatar img { width: 22px; height: 22px; }
 .message-body { min-width: 0; }
@@ -152,6 +153,7 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 .message-meta strong { font-size: 12px; }
 .message-meta span { color: #a09388; font-size: 9px; }
 .message-actions { display: flex; gap: 4px; margin-top: 8px; opacity: 0; transition: opacity 120ms; }
+.message-user .message-actions { justify-content: flex-end; }
 .message:hover .message-actions, .message:focus-within .message-actions { opacity: 1; }
 .message-actions button { border: 0; padding: 3px 7px; color: #97887d; background: transparent; font-size: 10px; }
 .message-actions button:hover { color: var(--accent); }
@@ -293,6 +295,8 @@ button.primary { border-color: var(--accent); color: white; background: var(--ac
   .message { grid-template-columns: 30px minmax(0, 1fr); gap: 8px; }
   .message-user { grid-template-columns: minmax(0, 1fr) 30px; }
   .message-avatar { width: 28px; height: 28px; }
+  .message-user .message-body { width: fit-content; max-width: min(100%, 560px); }
+  .message-actions { opacity: 1; }
   .composer-region { padding-inline: 12px; }
   .composer-hint { display: none; }
   .metric-grid { grid-template-columns: 1fr 1fr; }

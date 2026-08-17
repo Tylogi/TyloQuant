@@ -53,6 +53,18 @@ export interface Message {
   created_at: string;
 }
 
+export interface ResponseResource {
+  id: string;
+  request_id: string;
+  session_id: string;
+  status: "queued" | "running" | "completed" | "cancelled" | "failed";
+  output_message_id?: string | null;
+  output: ContentPart[];
+  finish_reason?: string | null;
+  created_at: string;
+  completed_at?: string | null;
+}
+
 export interface SamplingParams {
   max_tokens: number;
   temperature: number;
@@ -257,6 +269,14 @@ export const api = {
     return (await request<{ data: Message[] }>(`/api/v1/sessions/${id}/messages`)).data;
   },
 
+  async listResponses(id: string): Promise<ResponseResource[]> {
+    return (
+      await request<{ data: ResponseResource[] }>(
+        `/api/v1/sessions/${id}/responses?limit=1000`,
+      )
+    ).data;
+  },
+
   appendMessage(
     id: string,
     expectedRevision: number,
@@ -281,6 +301,22 @@ export const api = {
         at_message_id: atMessageId,
         include_message: includeMessage,
         title,
+      }),
+    });
+  },
+
+  rewindSession(
+    id: string,
+    expectedRevision: number,
+    atMessageId: string,
+    includeMessage = true,
+  ): Promise<Session> {
+    return request(`/api/v1/sessions/${id}/rewind`, {
+      method: "POST",
+      body: JSON.stringify({
+        expected_revision: expectedRevision,
+        at_message_id: atMessageId,
+        include_message: includeMessage,
       }),
     });
   },

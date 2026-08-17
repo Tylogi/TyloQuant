@@ -30,6 +30,8 @@ from mfqd.models import (
     ModelLoadRequest,
     ModelUnloadRequest,
     OperationAccepted,
+    RewindSessionRequest,
+    ResponseList,
     ResponseResource,
     RuntimeCapabilitiesResource,
     RuntimeInstanceList,
@@ -187,6 +189,18 @@ def create_app(
     ) -> AppendMessageResult:
         return await require_service().append_message(session_id, body)
 
+    @app.get(
+        "/api/v1/sessions/{session_id}/responses",
+        response_model=ResponseList,
+        responses=ERROR_RESPONSES,
+        tags=["sessions"],
+    )
+    async def list_responses(
+        session_id: UUID,
+        limit: Annotated[int, Query(ge=1, le=1000)] = 200,
+    ) -> ResponseList:
+        return await require_service().list_responses(session_id, limit=limit)
+
     @app.post(
         "/api/v1/sessions/{session_id}/responses",
         response_model=ResponseResource,
@@ -227,6 +241,18 @@ def create_app(
     )
     async def fork_session(session_id: UUID, body: ForkSessionRequest) -> SessionResource:
         return await require_service().fork_session(session_id, body)
+
+    @app.post(
+        "/api/v1/sessions/{session_id}/rewind",
+        response_model=SessionResource,
+        responses=ERROR_RESPONSES,
+        tags=["sessions"],
+    )
+    async def rewind_session(
+        session_id: UUID,
+        body: RewindSessionRequest,
+    ) -> SessionResource:
+        return await require_service().rewind_session(session_id, body)
 
     @app.delete(
         "/api/v1/sessions/{session_id}",

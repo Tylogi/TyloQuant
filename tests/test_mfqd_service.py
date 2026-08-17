@@ -359,6 +359,24 @@ def test_executable_api_persists_nonstream_text_responses(tmp_path: Path) -> Non
             assert forked.status_code == 201
             forked_session = forked.json()
             assert backend.forks == [(UUID(session["id"]), UUID(forked_session["id"]))]
+            rewound = await client.post(
+                f"/api/v1/sessions/{session['id']}/rewind",
+                json={
+                    "expected_revision": 2,
+                    "at_message_id": messages.json()["data"][0]["id"],
+                    "include_message": False,
+                },
+            )
+            assert rewound.status_code == 200
+            assert rewound.json()["id"] == session["id"]
+            assert rewound.json()["revision"] == 0
+            assert (await client.get(
+                f"/api/v1/sessions/{session['id']}/messages"
+            )).json() == {"data": []}
+            assert (await client.get(
+                f"/api/v1/sessions/{session['id']}/responses"
+            )).json() == {"data": []}
+            assert backend.forks == [(UUID(session["id"]), UUID(forked_session["id"]))]
             deleted = await client.delete(f"/api/v1/sessions/{session['id']}")
             assert deleted.status_code == 204
             assert backend.closed_sessions == [UUID(session["id"])]

@@ -11,6 +11,7 @@ from mfqd.models import (
     ErrorDetail,
     ForkSessionRequest,
     MessageRole,
+    RewindSessionRequest,
     ResponseStatus,
     SessionMode,
     SessionState,
@@ -247,6 +248,7 @@ def test_response_lifecycle_is_persistent_and_idempotent(tmp_path) -> None:
         now=NOW,
     )
     assert completed.status == ResponseStatus.COMPLETED
+    assert completed.output_message_id == OUTPUT_MESSAGE_ID
     assert completed.output[0].type == "text"
     assert completed.finish_reason == "stop"
     assert completed.usage is not None and completed.usage.total_tokens == 5
@@ -257,6 +259,54 @@ def test_response_lifecycle_is_persistent_and_idempotent(tmp_path) -> None:
         FIRST_MESSAGE_ID,
         OUTPUT_MESSAGE_ID,
     ]
+
+
+def test_rewind_reuses_session_and_removes_superseded_response(tmp_path) -> None:
+    store = make_store(tmp_path)
+    store.create_session(CreateSessionRequest(model="model-a"), session_id=SESSION_ID, now=NOW)
+    store.begin_response(
+        SESSION_ID,
+        REQUEST_ID,
+        RESPONSE_ID,
+        "request",
+        0,
+        [{"type": "text", "text": "question"}],
+        input_message_id=FIRST_MESSAGE_ID,
+        now=NOW,
+    )
+    store.complete_response(
+        RESPONSE_ID,
+        [{"type": "text", "text": "answer"}],
+        "stop",
+        TokenUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5),
+        output_message_id=OUTPUT_MESSAGE_ID,
+        now=NOW,
+    )
+
+    rewound = store.rewind_session(
+        SESSION_ID,
+        RewindSessionRequest(
+            expected_revision=2,
+            at_message_id=FIRST_MESSAGE_ID,
+            include_message=False,
+        ),
+        now=NOW,
+    )
+
+    assert rewound.id == SESSION_ID
+    assert rewound.revision == 0
+    assert rewound.state == SessionState.IDLE
+    assert store.list_messages(SESSION_ID) == []
+    assert store.list_responses(SESSION_ID) == []
+    with pytest.raises(RevisionConflictError):
+        store.rewind_session(
+            SESSION_ID,
+            RewindSessionRequest(
+                expected_revision=2,
+                at_message_id=FIRST_MESSAGE_ID,
+                include_message=False,
+            ),
+        )
 
 
 def test_failed_response_records_error_and_allows_next_turn(tmp_path) -> None:

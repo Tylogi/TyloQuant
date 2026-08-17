@@ -199,6 +199,12 @@ class ForkSessionRequest(ProtocolModel):
     title: str | None = Field(default=None, max_length=512)
 
 
+class RewindSessionRequest(ProtocolModel):
+    expected_revision: int = Field(ge=0)
+    at_message_id: UUID
+    include_message: bool = True
+
+
 class UpdateSessionRequest(ProtocolModel):
     title: str | None = Field(default=None, max_length=512)
     mode: SessionMode | None = None
@@ -251,12 +257,17 @@ class ResponseResource(ProtocolModel):
     request_id: UUID
     session_id: UUID
     status: ResponseStatus
+    output_message_id: UUID | None = None
     output: list[ContentPart] = Field(default_factory=list)
     finish_reason: str | None = None
     usage: TokenUsage | None = None
     created_at: AwareDatetime
     completed_at: AwareDatetime | None = None
     error: ErrorDetail | None = None
+
+
+class ResponseList(ProtocolModel):
+    data: list[ResponseResource]
 
 
 class MediaResource(ProtocolModel):
