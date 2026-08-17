@@ -289,7 +289,8 @@ export default function App() {
   const [voiceLevel, setVoiceLevel] = useState(0);
   const [liveVoice, setLiveVoice] = useState<LiveVoiceOutput | null>(null);
   const abortRef = useRef<AbortController | null>(null);
-  const endRef = useRef<HTMLDivElement | null>(null);
+  const messageScrollerRef = useRef<HTMLDivElement | null>(null);
+  const autoFollowOutputRef = useRef(true);
   const voiceRef = useRef<RealtimeAudioController | null>(null);
   const voiceClipWrites = useRef(new Map<string, Promise<void>>());
   const lastMetricId = useRef("");
@@ -548,8 +549,24 @@ export default function App() {
     };
   }, [activeId]);
 
+  const handleMessageScroll = useCallback(() => {
+    const scroller = messageScrollerRef.current;
+    if (!scroller) return;
+    const distanceFromBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+    autoFollowOutputRef.current = distanceFromBottom <= 8;
+  }, []);
+
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: busy ? "smooth" : "auto" });
+    autoFollowOutputRef.current = true;
+  }, [activeId]);
+
+  useEffect(() => {
+    const scroller = messageScrollerRef.current;
+    if (!scroller || !autoFollowOutputRef.current) return;
+    const frame = window.requestAnimationFrame(() => {
+      scroller.scrollTop = scroller.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, [messages, currentVoiceMessages, liveVoice, live, busy]);
 
   useEffect(() => {
@@ -1021,7 +1038,7 @@ export default function App() {
 
         {view === "chat" ? (
           <section className="chat-view">
-            <div className="message-scroller">
+            <div className="message-scroller" onScroll={handleMessageScroll} ref={messageScrollerRef}>
               <div className="message-list" aria-live="polite">
                 {!active && <div className="welcome"><img src="/mfq-mark.svg" alt="" /><h1>MFQ Studio</h1><p>{tr("创建会话后即可开始本地推理。", "Create a session to start local inference.")}</p><div className="prompt-grid"><button onClick={() => setDraft(tr("介绍一下这个模型。", "Introduce this model."))} type="button">{tr("介绍模型", "Introduce the model")}</button><button onClick={() => setDraft(tr("写一段 Python 示例。", "Write a Python example."))} type="button">{tr("代码示例", "Code example")}</button></div></div>}
                 {messages.map((message) => {
@@ -1041,7 +1058,6 @@ export default function App() {
                 {currentVoiceMessages.map((message) => <article className={`message message-${message.role}`} key={message.id}><div className="message-avatar">{message.role === "assistant" ? <img src="/mfq-mark.svg" alt="MFQ" /> : <span>{tr("你", "You")}</span>}</div><div className="message-body"><div className="message-meta"><strong>{message.role === "assistant" ? "MFQ" : tr("你", "You")}</strong><span>{tr("语音", "Voice")}</span></div>{message.text && <Markdown text={message.text} />}{message.audioId && <AudioClip audioId={message.audioId} />}</div></article>)}
                 {liveVoice?.sessionId === activeId && liveVoice.text && <article className="message message-assistant live-message"><div className="message-avatar"><img src="/mfq-mark.svg" alt="MFQ" /></div><div className="message-body"><div className="message-meta"><strong>MFQ</strong><span>{tr("生成中", "Generating")}</span></div><Markdown live text={liveVoice.text} /></div></article>}
                 {live && <article className="message message-assistant live-message"><div className="message-avatar"><img src="/mfq-mark.svg" alt="MFQ" /></div><div className="message-body"><div className="message-meta"><strong>MFQ</strong><span>{tr("生成中", "Generating")}</span></div>{live.reasoning && <details className="reasoning" open><summary>{tr("正在思考", "Thinking")}</summary><Markdown live text={live.reasoning} /></details>}{live.text && <Markdown live text={live.text} />}{live.tools.map((tool, index) => <pre className="tool-call" key={index}>{tool}</pre>)}{!live.reasoning && !live.text && live.tools.length === 0 && <span className="thinking"><i /><i /><i /></span>}</div></article>}
-                <div ref={endRef} />
               </div>
             </div>
             {error && <div className="error-banner" role="alert"><span>{error}</span><button onClick={() => setError(null)} type="button">×</button></div>}
