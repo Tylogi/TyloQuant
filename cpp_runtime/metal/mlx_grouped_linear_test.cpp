@@ -1516,6 +1516,69 @@ int main() {
             }
         }
 
+        // Match MiniCPM-o 4.5's production QKV dimensions and require every
+        // FP16 output element to equal the three independent NINT4 matmuls.
+        // Small fixtures can miss dispatch-grid errors in the long Q-only
+        // tail, so keep this as a full-shape regression test.
+        {
+            constexpr int production_input_width = 4096;
+            constexpr int production_q_outputs = 4096;
+            constexpr int production_kv_outputs = 512;
+            const auto q_blob = make_nint4_gs24_blob(
+                production_input_width, production_q_outputs, 1);
+            const auto k_blob = make_nint4_gs24_blob(
+                production_input_width, production_kv_outputs, 3);
+            const auto v_blob = make_nint4_gs24_blob(
+                production_input_width, production_kv_outputs, 5);
+            const auto q_weight =
+                mfq::metal::MlxNintWeight::from_blob(q_blob);
+            const auto k_weight =
+                mfq::metal::MlxNintWeight::from_blob(k_blob);
+            const auto v_weight =
+                mfq::metal::MlxNintWeight::from_blob(v_blob);
+            const mfq::metal::MlxGroupedLinear production_qkv({
+                &q_weight,
+                &k_weight,
+                &v_weight,
+            });
+            std::vector<float> values(production_input_width);
+            for (int column = 0;
+                 column < production_input_width;
+                 ++column) {
+                values[static_cast<std::size_t>(column)] =
+                    static_cast<float>((column * 17) % 127 - 63)
+                    / 512.0f;
+            }
+            const auto production_input = astype(
+                array(
+                    values.begin(),
+                    Shape{1, production_input_width}),
+                float16);
+            auto grouped_outputs = production_qkv(production_input);
+            std::vector<array> references{
+                q_weight.matmul(production_input),
+                k_weight.matmul(production_input),
+                v_weight.matmul(production_input),
+            };
+            require(
+                grouped_outputs.size() == references.size(),
+                "production QKV output count mismatch");
+            for (std::size_t projection = 0;
+                 projection < references.size();
+                 ++projection) {
+                auto difference = max(abs(
+                    astype(grouped_outputs[projection], float32) -
+                    astype(references[projection], float32)));
+                difference.eval();
+                if (!std::isfinite(difference.item<float>()) ||
+                    difference.item<float>() > 0.0f) {
+                    throw std::runtime_error(
+                        "production interleaved QKV changed FP16 values: " +
+                        std::to_string(difference.item<float>()));
+                }
+            }
+        }
+
         // The DeepSeek-V4 shared expert uses an independent dense router and
         // an equal-width NINT gate/up pair.  Decode can therefore keep the
         // pair's limited SwiGLU inside the single-row grouped dispatch.
