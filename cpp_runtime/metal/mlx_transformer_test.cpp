@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -151,6 +152,46 @@ int main() {
             half_normalized_values[1],
             4.0f * inverse,
             2e-3f);
+
+        std::vector<float> wide_input_values(4096);
+        std::vector<float> wide_weight_values(4096);
+        for (int index = 0; index < 4096; ++index) {
+            wide_input_values[static_cast<std::size_t>(index)] =
+                static_cast<float>((index * 37) % 257 - 128) / 31.0f;
+            wide_weight_values[static_cast<std::size_t>(index)] =
+                0.75f + static_cast<float>((index * 13) % 41) / 97.0f;
+        }
+        const mfq::metal::MlxRmsNorm wide_norm(
+            array(
+                wide_weight_values.begin(),
+                Shape{4096},
+                float32),
+            1e-6f);
+        const auto wide_input = astype(
+            array(
+                wide_input_values.begin(),
+                Shape{1, 4096},
+                float32),
+            float16);
+        auto fused_wide = wide_norm(wide_input);
+        auto reference_wide = astype(
+            mlx::core::fast::rms_norm(
+                wide_input,
+                std::optional<array>(wide_norm.weight()),
+                1e-6f),
+            float16);
+        mlx::core::eval(fused_wide, reference_wide);
+        const auto* fused_wide_bits =
+            fused_wide.data<std::uint16_t>();
+        const auto* reference_wide_bits =
+            reference_wide.data<std::uint16_t>();
+        for (int index = 0; index < 4096; ++index) {
+            if (fused_wide_bits[index] != reference_wide_bits[index]) {
+                throw std::runtime_error(
+                    "fused FP16 RMSNorm changed element " +
+                    std::to_string(index));
+            }
+        }
 
         const array rope_input(
             {1.0f, 2.0f, 3.0f, 4.0f},

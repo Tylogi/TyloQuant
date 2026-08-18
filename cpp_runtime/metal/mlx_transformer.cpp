@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -17,6 +19,69 @@ using mlx::core::Shape;
 using mlx::core::array;
 using mlx::core::CompileOptions;
 using mlx::core::MathMode;
+
+const mlx::core::fast::CustomKernelFunction&
+fused_fp16_rms_norm_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_rms_f16_f32_f16_4096_eps1e6_v1",
+            {"x", "w"},
+            {"y"},
+            R"METAL(
+    constexpr uint WIDTH = 4096u;
+    constexpr uint N_READS = 4u;
+    constexpr uint SIMD_SIZE = 32u;
+    uint lid = thread_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint base = lid * N_READS;
+
+    float values[N_READS];
+    half4 packed_input =
+        *reinterpret_cast<device const half4*>(x + base);
+    values[0] = float(packed_input.x);
+    values[1] = float(packed_input.y);
+    values[2] = float(packed_input.z);
+    values[3] = float(packed_input.w);
+    float accumulator = 0.0f;
+    for (uint index = 0u; index < N_READS; ++index) {
+        accumulator += values[index] * values[index];
+    }
+    accumulator = simd_sum(accumulator);
+
+    threadgroup float local_sums[SIMD_SIZE];
+    threadgroup float inverse_rms[1];
+    if (simd_group == 0u) local_sums[lane] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) local_sums[simd_group] = accumulator;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0u) {
+        accumulator = simd_sum(local_sums[lane]);
+        if (lane == 0u) {
+            inverse_rms[0] = metal::precise::rsqrt(
+                accumulator / float(WIDTH) + 1e-6f);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float4 packed_weight =
+        *reinterpret_cast<device const float4*>(w + base);
+    half4 normalized = half4(
+        packed_weight.x * (values[0] * inverse_rms[0]),
+        packed_weight.y * (values[1] * inverse_rms[0]),
+        packed_weight.z * (values[2] * inverse_rms[0]),
+        packed_weight.w * (values[3] * inverse_rms[0]));
+    *reinterpret_cast<device half4*>(y + base) = normalized;
+)METAL",
+            "",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
 
 constexpr const char* kMropeSource = R"METAL(
     uint index = thread_position_in_grid.x;
@@ -135,6 +200,26 @@ array MlxRmsNorm::operator()(const array& input) const {
         source.dtype() != mlx::core::bfloat16 &&
         source.dtype() != mlx::core::float32) {
         source = mlx::core::astype(source, mlx::core::float16);
+    }
+    static const bool fused_enabled = [] {
+        const auto* setting =
+            std::getenv("MFQ_METAL_FUSED_RMS_CAST");
+        return setting == nullptr || std::strcmp(setting, "0") != 0;
+    }();
+    if (fused_enabled && source.dtype() == mlx::core::float16 &&
+        width_ == 4096 && source.size() == 4096 && eps_ == 1e-6f) {
+        auto contiguous = mlx::core::contiguous(
+            mlx::core::reshape(source, Shape{4096}));
+        return fused_fp16_rms_norm_kernel()(
+            {contiguous, weight_},
+            {source.shape()},
+            {mlx::core::float16},
+            {1024, 1, 1},
+            {1024, 1, 1},
+            {},
+            std::nullopt,
+            false,
+            {}).front();
     }
     auto normalized = mlx::core::fast::rms_norm(
         source,

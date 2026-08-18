@@ -1712,7 +1712,8 @@ static CompletionResult generate_text(const RequestWork & work, const LlamaToken
                                       const MfqGenerateFn & generate,
                                       const MfqMultimodalGenerateFn & multimodal_generate,
                                       const std::function<bool(const common_chat_msg_diff &)> & emit,
-                                      RequestMetrics * metrics) {
+                                      RequestMetrics * metrics,
+                                      bool defer_token_parsing) {
     CompletionResult result;
     auto emit_parsed = [&](const common_chat_msg_diff & diff) {
         result.client_connected = emit(diff);
@@ -1733,11 +1734,21 @@ static CompletionResult generate_text(const RequestWork & work, const LlamaToken
         return emit_parsed(diff);
     });
 
+    const bool defer_tokens = defer_token_parsing && work.stops.empty();
+    std::vector<int64_t> deferred_tokens;
+    if (defer_tokens) {
+        deferred_tokens.reserve(
+            static_cast<std::size_t>(std::max(work.sampling.max_tokens, 0)));
+    }
     const auto on_token = [&](int64_t token) {
             if (metrics != nullptr) metrics->mark_token();
             if (tokenizer.is_eog(token)) {
                 result.finish_reason = "stop";
                 return false;
+            }
+            if (defer_tokens) {
+                deferred_tokens.push_back(token);
+                return true;
             }
             const bool preserve =
                 work.preserved_tokens.find(token) !=
@@ -1758,6 +1769,19 @@ static CompletionResult generate_text(const RequestWork & work, const LlamaToken
         : generate(
               work.prompt, work.sampling, on_token, on_prefill,
               work.cache_plan, work.token_constraint);
+    if (defer_tokens) {
+        std::string deferred_text;
+        deferred_text.reserve(deferred_tokens.size() * 8);
+        for (const auto token : deferred_tokens) {
+            const bool preserve =
+                work.preserved_tokens.find(token) !=
+                work.preserved_tokens.end();
+            deferred_text += tokenizer.piece(token, preserve);
+        }
+        if (!deferred_text.empty() && !emitter.append(deferred_text)) {
+            if (emitter.stopped()) result.finish_reason = "stop";
+        }
+    }
     if (result.client_connected && !emitter.stopped()) emitter.flush();
     if (result.client_connected && chat_parser) {
         chat_parser->flush();
@@ -3105,7 +3129,8 @@ int run_mfq_server(
                     [](const common_chat_msg_diff &) {
                         return true;
                     },
-                    &metrics);
+                    &metrics,
+                    true);
                 const RequestMetricValues metric_values =
                     request_metric_values(result, metrics);
                 log_request_metrics(
@@ -3183,7 +3208,7 @@ int run_mfq_server(
                                         sink, chat_chunk(
                                             id, created, config.model_name,
                                             std::move(delta), nullptr));
-                        }, &metrics);
+                        }, &metrics, false);
                         const RequestMetricValues metric_values =
                             request_metric_values(result, metrics);
                         log_request_metrics(

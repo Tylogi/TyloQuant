@@ -350,7 +350,7 @@ public:
         mlx::core::CompileOptions options;
         options.math_mode = mlx::core::MathMode::Fast;
         auto* library = device.get_library(
-            "mfq_minicpmo_qk_norm_rope_cache_v2",
+            "mfq_minicpmo_qk_norm_rope_cache_4head_v1",
             options,
             [] {
                 return std::string(R"METAL(
@@ -364,7 +364,7 @@ struct MiniQkKvCacheParams {
     float capacity;
 };
 
-kernel void mfq_minicpmo_qk_norm_rope_cache_v2(
+kernel void mfq_minicpmo_qk_norm_rope_cache_4head_v1(
     device const half* query [[buffer(0)]],
     device const half* key [[buffer(1)]],
     device const float* query_norm [[buffer(2)]],
@@ -382,7 +382,7 @@ kernel void mfq_minicpmo_qk_norm_rope_cache_v2(
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
     constexpr uint Q_HEADS = 32u;
     constexpr uint HEAD_DIM = 128u;
-    constexpr uint HEADS_PER_TG = 1u;
+    constexpr uint HEADS_PER_TG = 4u;
     constexpr uint SIMD_GROUPS = HEADS_PER_TG * 2u;
     uint head_slot = tid >> 6u;
     uint dimension = tid & 63u;
@@ -438,7 +438,7 @@ kernel void mfq_minicpmo_qk_norm_rope_cache_v2(
 )METAL");
             });
         auto* kernel = device.get_kernel(
-            "mfq_minicpmo_qk_norm_rope_cache_v2",
+            "mfq_minicpmo_qk_norm_rope_cache_4head_v1",
             library);
         auto& encoder = mlx::core::metal::get_command_encoder(
             selected_stream);
@@ -456,8 +456,8 @@ kernel void mfq_minicpmo_qk_norm_rope_cache_v2(
         encoder.set_output_array(output, 8);
         encoder.set_bytes(params_, 9);
         encoder.dispatch_threadgroups(
-            MTL::Size(40, 1, 1),
-            MTL::Size(64, 1, 1));
+            MTL::Size(10, 1, 1),
+            MTL::Size(256, 1, 1));
     }
 
     const char* name() const override {
@@ -5438,6 +5438,10 @@ std::int32_t MlxMiniCPMO45Runtime::generate_multimodal(
     }
 
     MlxSampler sampler(sampling);
+    const bool fused_greedy =
+        sampling.greedy() && !sampling.has_penalties() &&
+        !token_constraint &&
+        implementation_->language.supports_fused_greedy();
     const auto generation_limit = std::min<std::int32_t>(
         max_tokens,
         config.maximum_context - ids.shape(1) + 1);
@@ -5456,9 +5460,12 @@ std::int32_t MlxMiniCPMO45Runtime::generate_multimodal(
             profile_this_step ? &component_profile : nullptr);
         const auto component_started =
             std::chrono::steady_clock::now();
-        auto token_array = counts
-            ? sampler.sample(logits, *counts)
-            : sampler.sample(logits);
+        auto token_array = [&]() {
+            if (fused_greedy && generated > 0) return logits;
+            return counts
+                ? sampler.sample(logits, *counts)
+                : sampler.sample(logits);
+        }();
         if (profile_this_step) {
             detail::profile_eval("minicpmo.sampling", token_array);
         } else {
@@ -5490,8 +5497,8 @@ std::int32_t MlxMiniCPMO45Runtime::generate_multimodal(
         if (token_constraint && token_constraint->accept) {
             token_constraint->accept(token);
         }
-        const array token_ids(
-            {token}, Shape{1, 1}, mlx::core::int32);
+        const auto token_ids = mlx::core::reshape(
+            token_array, Shape{1, 1});
         if (counts) {
             *counts = sample_token_counts_add(*counts, token_ids);
         }
@@ -5505,9 +5512,11 @@ std::int32_t MlxMiniCPMO45Runtime::generate_multimodal(
                 component_profile);
             break;
         }
-        logits = last_logits(
-            implementation_->language.forward(token_ids, true),
-            config.vocab);
+        logits = fused_greedy
+            ? implementation_->language.forward_greedy(token_ids, true)
+            : last_logits(
+                  implementation_->language.forward(token_ids, true),
+                  config.vocab);
         detail::profile_eval("minicpmo.logits", logits);
         report_decode_components(
             profile_this_step,
