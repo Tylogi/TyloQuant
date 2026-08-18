@@ -32,11 +32,11 @@ SERVER_SOURCE = (ROOT / "cpp_runtime" / "mfq_server.cpp").read_text(
 REALTIME_GATEWAY = (
     ROOT / "mfq" / "runtime" / "minicpmo45_realtime.py"
 ).read_text(encoding="utf-8")
-WEB_APP = (ROOT / "cpp_runtime" / "web" / "app.js").read_text(
+STUDIO_APP = (ROOT / "MFQStudio" / "web" / "src" / "App.tsx").read_text(
     encoding="utf-8"
 )
-WEB_REALTIME = (
-    ROOT / "cpp_runtime" / "web" / "realtime-audio.js"
+STUDIO_REALTIME = (
+    ROOT / "MFQStudio" / "web" / "src" / "realtimeAudio.ts"
 ).read_text(encoding="utf-8")
 
 
@@ -242,6 +242,21 @@ def test_minicpmo45_cuda_server_binds_the_realtime_backend():
     assert "result.tts_force_flush" in DECODE
 
 
+def test_minicpmo45_native_servers_share_mfqd_vision_tensors():
+    assert "struct MfqVisionInput" in SERVER_HEADER
+    assert "MfqMultimodalGenerateFn" in SERVER_HEADER
+    assert "parse_mfq_vision(" in SERVER_SOURCE
+    assert 'single_special_token(tokenizer, "<image>")' in SERVER_SOURCE
+    assert "MiniCPM-o image placeholder must contain 64 query tokens" in SERVER_SOURCE
+    assert "generate_server_multimodal_tokens(" in DECODE
+    assert "runtime.forward(" in DECODE
+    assert "sample_server_logits(" in DECODE
+    assert "generate_multimodal(" in METAL_HEADER
+    assert "MlxMiniCPMO45Runtime::generate_multimodal(" in METAL_GRAPH
+    assert "MfqMultimodalGenerateFn multimodal_generate" in METAL_DECODE
+    assert "arguments.server || arguments.minicpmo_duplex" in METAL_DECODE
+
+
 def test_minicpmo45_cuda_duplex_uses_runtime_profile_tts_sampling():
     assert "double tts_temperature = 0.8" in GRAPH
     assert "double tts_repetition_penalty = 1.05" in GRAPH
@@ -328,6 +343,21 @@ def test_minicpmo45_metal_binds_the_complete_composite_graph():
     assert "MFQRSPB1" in METAL_GRAPH
 
 
+def test_minicpmo45_metal_fuses_streaming_audio_projections_safely():
+    assert '"MFQ_METAL_AUDIO_FUSED_QKV"' in METAL_GRAPH
+    assert "mlx::core::concatenate(" in METAL_GRAPH
+    assert "auto pieces = mlx::core::split(" in METAL_GRAPH
+    assert '"MFQ_METAL_AUDIO_STREAMING_NO_MASK"' in METAL_GRAPH
+    assert "? std::nullopt" in METAL_GRAPH
+    assert '"MFQ_METAL_AUDIO_BITWISE_HASH"' in METAL_GRAPH
+
+
+def test_minicpmo45_metal_batches_only_official_vision_geometry():
+    assert "minicpmo_vision_batchable_length" in METAL_GRAPH
+    assert "return tokens >= 900 && tokens <= 1100" in METAL_GRAPH
+    assert METAL_GRAPH.count("!minicpmo_vision_batchable_length(") == 2
+
+
 def test_minicpmo45_metal_duplex_tracks_all_cache_lifetimes():
     assert "prepare_duplex(" in METAL_GRAPH
     assert "duplex_step(" in METAL_GRAPH
@@ -357,10 +387,10 @@ def test_minicpmo45_realtime_uses_official_demo_defaults():
     assert "await self.backend_runtime_defaults()" in REALTIME_GATEWAY
     assert "token2wav_steps: int = 10" in REALTIME_GATEWAY
     assert "DEFAULT_DUPLEX_SYSTEM_PROMPT" in REALTIME_GATEWAY
-    assert "const SPEAK_TOKENS = 20" in WEB_REALTIME
-    assert "const PLAYBACK_DELAY_SECONDS = 0.2" in WEB_REALTIME
-    assert "REALTIME_SYSTEM_PROMPTS" not in WEB_APP
-    assert "systemPrompt: configuredSystemPrompt" in WEB_APP
+    assert "const SPEAK_TOKENS = 20" in STUDIO_REALTIME
+    assert "const PLAYBACK_DELAY_SECONDS = 0.2" in STUDIO_REALTIME
+    assert "REALTIME_SYSTEM_PROMPTS" not in STUDIO_APP
+    assert "systemPrompt: settings.systemPrompt" in STUDIO_APP
 
 
 def test_minicpmo45_realtime_preserves_official_first_tts_flush():

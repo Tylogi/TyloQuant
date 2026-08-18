@@ -333,7 +333,7 @@ void test_direct_top_k_large_vocab_and_stable_ties() {
     logits[vocab + 29] =
         -std::numeric_limits<float>::infinity();
 
-    for (const int top_k : {1, 2, 20, 32, 63, 64}) {
+    for (const int top_k : {1, 2, 20, 32, 63, 64, 100, 128}) {
         expected.clear();
         for (int row = 0; row < rows; ++row) {
             expected.push_back(cpu_sample(
@@ -352,8 +352,31 @@ void test_direct_top_k_large_vocab_and_stable_ties() {
                 top_k,
                 0.82),
             expected,
-            "direct top-k large-vocab merge k=" +
+            "GPU top-k large-vocab merge k=" +
                 std::to_string(top_k));
+    }
+
+    const std::vector<float> single_row(
+        logits.begin(), logits.begin() + vocab);
+    for (const auto dtype :
+         {mlx::core::float32, mlx::core::float16}) {
+        require_ids(
+            mfq::metal::sample_top_k_top_p(
+                floats(single_row, Shape{1, vocab}, dtype),
+                floats({uniforms.front()}, Shape{1}),
+                0.85,
+                100,
+                0.82),
+            {
+                cpu_sample(
+                    single_row.data(),
+                    vocab,
+                    uniforms.front(),
+                    0.85f,
+                    100,
+                    0.82f),
+            },
+            "hierarchical top-k large-vocab single row");
     }
 
     std::vector<float> exceptional(
@@ -469,6 +492,39 @@ void benchmark_direct_top_k() {
         << vocab
         << " top_k=20 f16 rows=1 average_us="
         << elapsed.count() / static_cast<double>(iterations)
+        << " checksum="
+        << checksum
+        << '\n';
+
+    for (int iteration = 0; iteration < 3; ++iteration) {
+        mfq::metal::sample_top_k_top_p(
+            input,
+            random,
+            0.7,
+            100,
+            0.8).eval();
+    }
+    const auto hierarchical_start = std::chrono::steady_clock::now();
+    checksum = 0;
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        auto sampled = mfq::metal::sample_top_k_top_p(
+            input,
+            random,
+            0.7,
+            100,
+            0.8);
+        sampled.eval();
+        checksum += sampled.data<std::int32_t>()[0];
+    }
+    const auto hierarchical_elapsed =
+        std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - hierarchical_start);
+    std::cout
+        << "MFQ hierarchical top-k microbenchmark: vocab="
+        << vocab
+        << " top_k=100 f16 rows=1 average_us="
+        << hierarchical_elapsed.count() /
+            static_cast<double>(iterations)
         << " checksum="
         << checksum
         << '\n';

@@ -18,6 +18,13 @@
 
 namespace mfq::metal {
 
+// Experimental memory-for-bandwidth mode. When enabled before model loading,
+// ordinary packed linear and embedding tensors are materialized once as FP16
+// and their packed runtime objects are released. NINTM expert containers keep
+// their dedicated representation.
+void set_mlx_predequantize_fp16(bool enabled) noexcept;
+bool mlx_predequantize_fp16_enabled() noexcept;
+
 mlx::core::array load_dense_array(
     const std::string& dtype,
     std::span<const std::uint8_t> blob);
@@ -37,6 +44,11 @@ public:
     explicit MlxLinear(mlx::core::array weight);
 
     mlx::core::array operator()(const mlx::core::array& input) const;
+
+    // Returns a token id when the packed layout has a fused single-row
+    // LM-head/greedy implementation; otherwise returns std::nullopt.
+    std::optional<mlx::core::array> greedy_argmax(
+        const mlx::core::array& input) const;
 
     // DeepSeek-V4 O-LoRA layout:
     // input [...,groups,K] -> [...,groups,OUT/groups].
@@ -62,6 +74,8 @@ public:
     const MlxNint8ZeroWeight* nint8_zero_weight_ref() const noexcept;
     const MlxMxWeight* mx_weight_ref() const noexcept;
     const mlx::core::array* dense_weight_ref() const noexcept;
+
+    void materialize_fp16();
 
 private:
     std::variant<
@@ -105,6 +119,8 @@ public:
     int hidden_size() const noexcept {
         return hidden_size_;
     }
+
+    void materialize_fp16();
 
 private:
     std::variant<

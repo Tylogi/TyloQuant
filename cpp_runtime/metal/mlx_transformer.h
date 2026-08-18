@@ -39,6 +39,12 @@ public:
     int width() const noexcept {
         return width_;
     }
+    const mlx::core::array& weight() const noexcept {
+        return weight_;
+    }
+    float eps() const noexcept {
+        return eps_;
+    }
 
 private:
     mlx::core::array weight_;
@@ -93,6 +99,11 @@ public:
         const mlx::core::array& key,
         const mlx::core::array& value);
 
+    // Reserve cache rows without materializing an indexed update. Specialized
+    // decode primitives use this when the projection/post-processing kernel
+    // writes the new K/V row directly into the persistent Metal allocation.
+    void reserve_append(int tokens);
+
     std::pair<mlx::core::array, mlx::core::array> view() const;
 
     // Session snapshots own a compact copy of the visible prefix. Restoring
@@ -106,6 +117,12 @@ public:
     }
     int capacity() const noexcept {
         return key_.shape(2);
+    }
+    const mlx::core::array& key_storage() const noexcept {
+        return key_;
+    }
+    const mlx::core::array& value_storage() const noexcept {
+        return value_;
     }
 
 private:

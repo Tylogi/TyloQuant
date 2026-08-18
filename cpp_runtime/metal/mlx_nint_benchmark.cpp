@@ -11,6 +11,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -167,13 +168,109 @@ void benchmark(
         << maximum << '\n';
 }
 
+std::vector<BenchmarkCase> load_layer_stack(
+    const MfqContainer& model,
+    const std::string& pattern) {
+    constexpr std::string_view marker = "{layer}";
+    const auto marker_at = pattern.find(marker);
+    require(
+        marker_at != std::string::npos,
+        "layer-stack pattern is missing {layer}");
+    std::vector<BenchmarkCase> result;
+    for (int layer = 0;; ++layer) {
+        auto name = pattern;
+        name.replace(
+            marker_at,
+            marker.size(),
+            std::to_string(layer));
+        if (!model.contains(name)) break;
+        result.push_back(load_case(model, name));
+    }
+    require(!result.empty(), "layer-stack pattern matched no tensors");
+    return result;
+}
+
+void benchmark_layer_stack(
+    const MfqContainer& model,
+    const std::string& pattern,
+    int warmup,
+    int repetitions) {
+    auto cases = load_layer_stack(model, pattern);
+    const int input = input_size(cases.front().weight);
+    const int output = output_size(cases.front().weight);
+    std::size_t bytes = 0;
+    for (const auto& item : cases) {
+        require(
+            input_size(item.weight) == input &&
+                output_size(item.weight) == output,
+            "layer-stack tensor shapes disagree");
+        bytes += packed_nbytes(item.weight);
+    }
+    const auto source = make_input(input);
+    const auto execute = [&] {
+        std::vector<array> outputs;
+        outputs.reserve(cases.size());
+        for (const auto& item : cases) {
+            outputs.push_back(matmul(item.weight, source));
+        }
+        mlx::core::eval(outputs);
+        return outputs;
+    };
+
+    auto outputs = execute();
+    for (int index = 0; index < warmup; ++index) {
+        outputs = execute();
+    }
+    mlx::core::synchronize();
+
+    const auto started = Clock::now();
+    for (int index = 0; index < repetitions; ++index) {
+        outputs = execute();
+    }
+    mlx::core::synchronize();
+    const double total_ms = milliseconds_since(started);
+    const auto launches = cases.size();
+    const double mean_dispatch_ms = total_ms /
+        static_cast<double>(repetitions * launches);
+    const double decimal_gbps =
+        static_cast<double>(bytes) * repetitions /
+        (total_ms * 1.0e6);
+
+    auto checked = mlx::core::astype(outputs.back(), mlx::core::float32);
+    mlx::core::eval(checked);
+    const auto* values = checked.data<float>();
+    double checksum = 0.0;
+    float maximum = 0.0f;
+    for (int index = 0; index < output; ++index) {
+        const float value = values[index];
+        require(
+            std::isfinite(value),
+            "layer-stack output contains non-finite values");
+        checksum += static_cast<double>(value);
+        maximum = std::max(maximum, std::fabs(value));
+    }
+
+    std::cout
+        << cases.front().dtype << '\t'
+        << pattern << '\t'
+        << input << 'x' << output << 'x' << launches << '\t'
+        << bytes << '\t'
+        << std::fixed << std::setprecision(3)
+        << mean_dispatch_ms << '\t'
+        << std::setprecision(1) << decimal_gbps << '\t'
+        << launches << '\t'
+        << std::setprecision(6) << checksum << '\t'
+        << maximum << '\n';
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         require(
             argc >= 2,
-            "usage: mfq-metal-nint-benchmark MODEL.mfq [REPETITIONS]");
+            "usage: mfq-metal-nint-benchmark MODEL.mfq [REPETITIONS] "
+            "[TENSOR ...]");
         const int repetitions =
             argc >= 3 ? std::stoi(argv[2]) : 20;
         require(repetitions > 0, "repetitions must be positive");
@@ -182,16 +279,26 @@ int main(int argc, char** argv) {
         std::cout
             << "dtype\ttensor\tshape\tpacked_bytes\tms\tGB/s\t"
                "launches\tchecksum\tmax_abs\n";
-        for (const auto& name : {
-                 "blk.0.ffn_gate.weight",
-                 "blk.0.attn_gate.weight",
-                 "blk.0.ffn_down.weight",
-                 "blk.0.ssm_out.weight",
-                 "blk.3.attn_output.weight",
-                 "blk.3.attn_v.weight",
-                 "output.weight",
-             }) {
-            benchmark(model, name, 3, repetitions);
+        std::vector<std::string> names;
+        if (argc > 3) {
+            names.assign(argv + 3, argv + argc);
+        } else {
+            names = {
+                "blk.0.ffn_gate.weight",
+                "blk.0.attn_gate.weight",
+                "blk.0.ffn_down.weight",
+                "blk.0.ssm_out.weight",
+                "blk.3.attn_output.weight",
+                "blk.3.attn_v.weight",
+                "output.weight",
+            };
+        }
+        for (const auto& name : names) {
+            if (name.find("{layer}") != std::string::npos) {
+                benchmark_layer_stack(model, name, 3, repetitions);
+            } else {
+                benchmark(model, name, 3, repetitions);
+            }
         }
         return 0;
     } catch (const std::exception& error) {

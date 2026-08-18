@@ -458,6 +458,14 @@ std::pair<array, array> MlxKvCache::append(
     return view();
 }
 
+void MlxKvCache::reserve_append(int tokens) {
+    if (tokens <= 0 || position_ > maximum_sequence_ - tokens) {
+        throw std::runtime_error("invalid KV cache reservation");
+    }
+    ensure_capacity(position_ + tokens);
+    position_ += tokens;
+}
+
 std::pair<array, array> MlxKvCache::view() const {
     const Shape start{0, 0, 0, 0};
     const Shape stop{

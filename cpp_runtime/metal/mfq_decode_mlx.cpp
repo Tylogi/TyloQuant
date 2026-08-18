@@ -11,6 +11,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -58,6 +59,7 @@ struct Arguments {
     bool self_test_metal = false;
     bool server = false;
     bool minicpmo_duplex = false;
+    bool predequantize_fp16 = false;
     std::string host = "127.0.0.1";
     int port = 8080;
     std::int64_t context_size = 32768;
@@ -65,7 +67,6 @@ struct Arguments {
     std::optional<double> expert_cache_gb;
     std::string model_name;
     std::string api_key;
-    std::filesystem::path web_root;
     std::filesystem::path tokenizer_gguf;
     std::filesystem::path sampling_profile;
     bool help = false;
@@ -143,6 +144,8 @@ Arguments parse_arguments(int argc, char** argv) {
             result.server = true;
         } else if (value == "--minicpmo-duplex") {
             result.minicpmo_duplex = true;
+        } else if (value == "--metal-predequantize-f16") {
+            result.predequantize_fp16 = true;
         } else if (value == "--host") {
             result.host = require_value("--host");
         } else if (value == "--port") {
@@ -186,8 +189,6 @@ Arguments parse_arguments(int argc, char** argv) {
             result.model_name = require_value("--model-name");
         } else if (value == "--api-key") {
             result.api_key = require_value("--api-key");
-        } else if (value == "--web-root") {
-            result.web_root = require_value("--web-root");
         } else if (value == "--tokenizer-gguf") {
             result.tokenizer_gguf =
                 require_value("--tokenizer-gguf");
@@ -224,6 +225,8 @@ void print_help() {
         << "  --self-test-metal      execute an MLX C++ graph on Metal\n"
         << "  --server               run the native C++ OpenAI-compatible server\n"
         << "  --minicpmo-duplex      enable the stateful MiniCPM-o media backend\n"
+        << "  --metal-predequantize-f16\n"
+        << "                          expand regular weights to FP16 at load time\n"
         << "  --host ADDRESS         server bind address (default 127.0.0.1)\n"
         << "  --port PORT            server port (default 8080)\n"
         << "  --ctx-size TOKENS      runtime/API context limit (default 32768)\n"
@@ -232,7 +235,6 @@ void print_help() {
         << "                          default: full unified-memory residency\n"
         << "  --model-name NAME      API model name (default MFQ filename)\n"
         << "  --api-key KEY          optional bearer token\n"
-        << "  --web-root PATH        WebUI assets (default beside executable)\n"
         << "  --tokenizer-gguf PATH  external tokenizer GGUF when not embedded\n"
         << "  --sampling-profile P  explicit runtime sampling profile JSON\n";
 }
@@ -337,6 +339,7 @@ public:
             !runtime.supports_text_session_state()) {
             return 0;
         }
+        ++queries_;
         std::string selected_session;
         std::size_t selected_snapshot = 0;
         std::size_t selected_tokens = 0;
@@ -366,6 +369,8 @@ public:
         try {
             runtime.restore_text_session_state(selected.state);
             selected.last_used = ++clock_;
+            ++hits_;
+            hit_tokens_ += selected_tokens;
             if (trace_) {
                 std::cerr
                     << "server_session_cache backend=metal action=hit session="
@@ -426,6 +431,7 @@ public:
         bytes_ += stored->state.bytes;
         evict_history_to_limit(session_id, protected_clock);
         evict_to_budget(session_id, protected_clock);
+        sync_telemetry();
         if (trace_) {
             const auto& saved_history = states_.at(session_id);
             const auto saved = std::find_if(
@@ -471,6 +477,7 @@ public:
         const auto remaining = states_.find(target_session);
         const std::size_t copied_snapshots = remaining == states_.end()
             ? 0 : remaining->second.size();
+        sync_telemetry();
         if (trace_) {
             std::cerr
                 << "server_session_cache backend=metal action=fork source="
@@ -491,6 +498,7 @@ public:
         }
         bytes_ -= released_bytes;
         states_.erase(found);
+        sync_telemetry();
         if (trace_) {
             std::cerr
                 << "server_session_cache backend=metal action=close session="
@@ -501,12 +509,51 @@ public:
         return released;
     }
 
-    void clear() noexcept {
+    std::vector<std::pair<std::string, double>> metrics() const {
+        return {
+            {"prefix_cache_queries", static_cast<double>(queries_.load())},
+            {"prefix_cache_hits", static_cast<double>(hits_.load())},
+            {"prefix_cache_hit_tokens", static_cast<double>(hit_tokens_.load())},
+            {"prefix_cache_sessions", static_cast<double>(metric_sessions_.load())},
+            {"prefix_cache_snapshots", static_cast<double>(metric_snapshots_.load())},
+            {"prefix_cache_tokens", static_cast<double>(metric_tokens_.load())},
+            {"prefix_cache_bytes", static_cast<double>(metric_bytes_.load())},
+            {"prefix_cache_max_sessions", static_cast<double>(max_sessions_)},
+            {"prefix_cache_max_snapshots_per_session",
+                static_cast<double>(max_snapshots_per_session_)},
+            {"prefix_cache_max_bytes", static_cast<double>(max_bytes_)},
+        };
+    }
+
+    std::size_t clear() noexcept {
+        std::size_t snapshots = 0;
+        for (const auto& [session_id, history] : states_) {
+            (void)session_id;
+            snapshots += history.size();
+        }
         states_.clear();
         bytes_ = 0;
+        sync_telemetry();
+        return snapshots;
     }
 
 private:
+    void sync_telemetry() noexcept {
+        std::size_t snapshots = 0;
+        std::size_t tokens = 0;
+        for (const auto& [session_id, history] : states_) {
+            (void)session_id;
+            snapshots += history.size();
+            for (const auto& snapshot : history) {
+                tokens += snapshot.state.tokens.size();
+            }
+        }
+        metric_sessions_.store(states_.size());
+        metric_snapshots_.store(snapshots);
+        metric_tokens_.store(tokens);
+        metric_bytes_.store(bytes_);
+    }
+
     void evict_history_to_limit(
         const std::string& session_id,
         std::uint64_t protected_clock) {
@@ -595,6 +642,7 @@ private:
         found->second.erase(
             found->second.begin() + static_cast<std::ptrdiff_t>(index));
         if (found->second.empty()) states_.erase(found);
+        sync_telemetry();
     }
 
     std::unordered_map<std::string, std::vector<Entry>> states_;
@@ -603,6 +651,13 @@ private:
     std::size_t max_bytes_ = 2ULL * 1024ULL * 1024ULL * 1024ULL;
     std::size_t bytes_ = 0;
     std::uint64_t clock_ = 0;
+    std::atomic<std::uint64_t> queries_{0};
+    std::atomic<std::uint64_t> hits_{0};
+    std::atomic<std::uint64_t> hit_tokens_{0};
+    std::atomic<std::size_t> metric_sessions_{0};
+    std::atomic<std::size_t> metric_snapshots_{0};
+    std::atomic<std::size_t> metric_tokens_{0};
+    std::atomic<std::size_t> metric_bytes_{0};
     bool trace_ = false;
 };
 
@@ -616,17 +671,39 @@ std::int32_t generate_with_prefill_metrics(
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int) {
+    std::function<void(std::size_t, double)> report_prefill;
+    if (on_prefill) {
+        report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
+            on_prefill(MfqPrefillTiming{tokens, llm_ms, 0.0, llm_ms});
+        };
+    }
     return runtime.generate(
         prompt,
         sampling,
         max_tokens,
         callback,
-        on_prefill,
+        report_prefill,
         token_constraint,
         cache_plan.stable_prefix_tokens > 0
             ? std::optional<std::size_t>(
                   cache_plan.stable_prefix_tokens)
             : std::nullopt);
+}
+
+mlx::core::Shape checked_mlx_shape(
+    const std::vector<std::int64_t>& dimensions,
+    const char* name) {
+    mlx::core::Shape shape;
+    shape.reserve(dimensions.size());
+    for (const auto dimension : dimensions) {
+        if (dimension <= 0 ||
+            dimension > std::numeric_limits<int>::max()) {
+            throw std::invalid_argument(
+                std::string(name) + " has an invalid MLX dimension");
+        }
+        shape.push_back(static_cast<int>(dimension));
+    }
+    return shape;
 }
 
 std::int32_t generate_with_prefill_metrics(
@@ -639,12 +716,18 @@ std::int32_t generate_with_prefill_metrics(
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int) {
+    std::function<void(std::size_t, double)> report_prefill;
+    if (on_prefill) {
+        report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
+            on_prefill(MfqPrefillTiming{tokens, llm_ms, 0.0, llm_ms});
+        };
+    }
     return runtime.generate(
         prompt,
         sampling,
         max_tokens,
         callback,
-        on_prefill,
+        report_prefill,
         token_constraint,
         cache_plan.stable_prefix_tokens > 0
             ? std::optional<std::size_t>(
@@ -662,6 +745,12 @@ std::int32_t generate_with_prefill_metrics(
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size) {
+    std::function<void(std::size_t, double)> report_prefill;
+    if (on_prefill) {
+        report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
+            on_prefill(MfqPrefillTiming{tokens, llm_ms, 0.0, llm_ms});
+        };
+    }
     return runtime.generate(
         prompt,
         sampling,
@@ -669,7 +758,7 @@ std::int32_t generate_with_prefill_metrics(
         callback,
         std::nullopt,
         prefill_chunk_size,
-        on_prefill,
+        report_prefill,
         cache_plan.stable_prefix_tokens > 0
             ? std::optional<std::size_t>(
                   cache_plan.stable_prefix_tokens)
@@ -704,12 +793,6 @@ int serve_loaded_runtime(
             arguments.tokenizer_gguf.string();
     }
     server.api_key = arguments.api_key;
-    const auto default_web_root =
-        executable_path().parent_path() / "web";
-    server.web_root = (
-        arguments.web_root.empty()
-            ? default_web_root
-            : arguments.web_root).string();
     server.max_context = std::min<std::int64_t>(
         arguments.context_size,
         maximum_context);
@@ -813,6 +896,100 @@ int serve_loaded_runtime(
             }
             return generated;
         };
+    MfqMultimodalGenerateFn multimodal_generate;
+    if constexpr (std::is_same_v<
+            Runtime, mfq::metal::MlxMiniCPMO45Runtime>) {
+        multimodal_generate =
+            [runtime_mutex, runtime_holder, runtime_stream](
+                const std::vector<std::int64_t>& prompt,
+                const MfqVisionInput& vision,
+                const MfqSamplingParams& sampling,
+                const MfqTokenCallback& callback,
+                const MfqPrefillCallback& on_prefill,
+                const MfqTokenConstraintPtr& token_constraint) {
+                std::lock_guard<std::mutex> lock(*runtime_mutex);
+                if (!runtime_holder->has_value()) {
+                    throw std::runtime_error(
+                        "MiniCPM-o runtime is unavailable after a failed reload");
+                }
+                mlx::core::set_default_device(
+                    mlx::core::Device::gpu);
+                mlx::core::set_default_stream(runtime_stream);
+
+                std::vector<std::int32_t> prompt_ids;
+                prompt_ids.reserve(prompt.size());
+                for (const auto token : prompt) {
+                    if (token < 0 ||
+                        token > std::numeric_limits<std::int32_t>::max()) {
+                        throw std::invalid_argument(
+                            "MiniCPM-o prompt token is out of range");
+                    }
+                    prompt_ids.push_back(static_cast<std::int32_t>(token));
+                }
+                mfq::metal::MlxMiniCPMO45Inputs inputs{
+                    mlx::core::array(
+                        prompt_ids.begin(),
+                        mlx::core::Shape{
+                            1, static_cast<int>(prompt_ids.size())},
+                        mlx::core::int32),
+                    std::nullopt,
+                    std::nullopt,
+                    std::nullopt,
+                    std::nullopt,
+                    std::nullopt,
+                    std::nullopt,
+                    std::nullopt,
+                    std::nullopt,
+                    std::nullopt,
+                };
+                inputs.pixel_values = mlx::core::array(
+                    vision.pixel_values.begin(),
+                    checked_mlx_shape(
+                        vision.pixel_shape, "pixel_values"),
+                    mlx::core::float32);
+                inputs.patch_mask = mlx::core::astype(
+                    mlx::core::array(
+                        vision.patch_mask.begin(),
+                        checked_mlx_shape(
+                            vision.patch_mask_shape, "patch_mask"),
+                        mlx::core::uint8),
+                    mlx::core::bool_);
+                inputs.target_sizes = mlx::core::array(
+                    vision.target_sizes.begin(),
+                    checked_mlx_shape(
+                        vision.target_sizes_shape, "target_sizes"),
+                    mlx::core::int32);
+                inputs.image_bounds = mlx::core::array(
+                    vision.image_bounds.begin(),
+                    mlx::core::Shape{
+                        static_cast<int>(vision.image_bounds.size() / 4), 4},
+                    mlx::core::int64);
+
+                mfq::metal::MlxSamplingParams parameters;
+                parameters.temperature = sampling.temperature;
+                parameters.top_k = sampling.top_k;
+                parameters.top_p = sampling.top_p;
+                parameters.presence_penalty = sampling.presence_penalty;
+                parameters.frequency_penalty = sampling.frequency_penalty;
+                parameters.repetition_penalty = sampling.repetition_penalty;
+                parameters.seed = sampling.seed;
+                std::function<void(
+                    std::size_t, double, double, double)> report_prefill;
+                if (on_prefill) {
+                    report_prefill = [on_prefill](
+                        std::size_t tokens,
+                        double llm_ms,
+                        double multimodal_ms,
+                        double model_ms) {
+                        on_prefill(MfqPrefillTiming{
+                            tokens, llm_ms, multimodal_ms, model_ms});
+                    };
+                }
+                return runtime_holder->value().generate_multimodal(
+                    inputs, parameters, sampling.max_tokens,
+                    callback, report_prefill, token_constraint);
+            };
+    }
     const MfqReloadFn reload =
         [runtime_mutex, runtime_holder, loaded_context, session_cache,
          load_runtime, runtime_stream](
@@ -1084,8 +1261,23 @@ int serve_loaded_runtime(
             std::lock_guard<std::mutex> lock(*runtime_mutex);
             return session_cache->close_session(session_id);
         };
+    session_control.metrics = [session_cache] {
+        return session_cache->metrics();
+    };
+    session_control.clear = [runtime_mutex, session_cache] {
+        std::lock_guard<std::mutex> lock(*runtime_mutex);
+        return session_cache->clear();
+    };
     return run_mfq_server(
-        server, generate, reload, duplex, session_control);
+        server, generate, reload, duplex, session_control,
+        multimodal_generate,
+        [] {
+            return std::vector<std::pair<std::string, double>>{
+                {"mlx_active_bytes", static_cast<double>(mlx::core::get_active_memory())},
+                {"mlx_cache_bytes", static_cast<double>(mlx::core::get_cache_memory())},
+                {"mlx_peak_bytes", static_cast<double>(mlx::core::get_peak_memory())},
+            };
+        });
 }
 
 int run_native_server(
@@ -1205,7 +1397,7 @@ int run_native_server(
             mfq::metal::MlxMiniCPMO45Runtime::load(
                 container,
                 arguments.context_size,
-                arguments.minicpmo_duplex);
+                arguments.server || arguments.minicpmo_duplex);
         release_model_load_staging_memory();
         mlx::core::set_cache_limit(kMinicpmoDuplexCacheLimitBytes);
         const auto load_seconds = std::chrono::duration<double>(
@@ -1219,7 +1411,8 @@ int run_native_server(
             << std::endl;
         const auto load_runtime =
             [&container,
-             load_modalities = arguments.minicpmo_duplex](
+             load_modalities = arguments.server ||
+                 arguments.minicpmo_duplex](
                 std::int64_t requested_context) {
                 return mfq::metal::MlxMiniCPMO45Runtime::load(
                     container,
@@ -1277,6 +1470,8 @@ int run_native_server(
 int main(int argc, char** argv) {
     try {
         const auto arguments = parse_arguments(argc, argv);
+        mfq::metal::set_mlx_predequantize_fp16(
+            arguments.predequantize_fp16);
         if (arguments.help) {
             print_help();
             return EXIT_SUCCESS;

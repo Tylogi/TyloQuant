@@ -19166,33 +19166,18 @@ static bool trace_server_cuda_graph() {
     return value != nullptr && std::atoi(value) != 0;
 }
 
-static torch::Tensor sample_server_token(
-    Model & model,
-    torch::Tensor ids,
+static torch::Tensor sample_server_logits(
+    torch::Tensor logits,
     const MfqSamplingParams & sampling,
     torch::Tensor counts,
     torch::Tensor random_host,
     torch::Tensor random_cuda,
     std::mt19937_64 & rng,
-    const MfqTokenConstraintPtr & token_constraint,
-    cudaEvent_t prefill_finished = nullptr)
+    const MfqTokenConstraintPtr & token_constraint)
 {
     const bool greedy = sampling.temperature <= 0.0 || sampling.top_k == 1;
     const bool has_penalties = sampling_has_penalties(sampling);
-    if (greedy && !has_penalties && !token_constraint) {
-        auto next = model.next_token(ids);
-        if (prefill_finished != nullptr) {
-            MFQ_CUDA_CHECK(cudaEventRecord(
-                prefill_finished, at::cuda::getCurrentCUDAStream()));
-        }
-        return next;
-    }
-
-    auto logits = model.last_logits(ids).contiguous().view({1, -1});
-    if (prefill_finished != nullptr) {
-        MFQ_CUDA_CHECK(cudaEventRecord(
-            prefill_finished, at::cuda::getCurrentCUDAStream()));
-    }
+    logits = logits.contiguous().view({1, -1});
     if (has_penalties) {
         sample_apply_penalties_cuda(
             logits, counts, sampling.presence_penalty,
@@ -19232,6 +19217,38 @@ static torch::Tensor sample_server_token(
         token_constraint->accept(next.item<int64_t>());
     }
     return next;
+}
+
+static torch::Tensor sample_server_token(
+    Model & model,
+    torch::Tensor ids,
+    const MfqSamplingParams & sampling,
+    torch::Tensor counts,
+    torch::Tensor random_host,
+    torch::Tensor random_cuda,
+    std::mt19937_64 & rng,
+    const MfqTokenConstraintPtr & token_constraint,
+    cudaEvent_t prefill_finished = nullptr)
+{
+    const bool greedy = sampling.temperature <= 0.0 || sampling.top_k == 1;
+    const bool has_penalties = sampling_has_penalties(sampling);
+    if (greedy && !has_penalties && !token_constraint) {
+        auto next = model.next_token(ids);
+        if (prefill_finished != nullptr) {
+            MFQ_CUDA_CHECK(cudaEventRecord(
+                prefill_finished, at::cuda::getCurrentCUDAStream()));
+        }
+        return next;
+    }
+
+    auto logits = model.last_logits(ids).contiguous().view({1, -1});
+    if (prefill_finished != nullptr) {
+        MFQ_CUDA_CHECK(cudaEventRecord(
+            prefill_finished, at::cuda::getCurrentCUDAStream()));
+    }
+    return sample_server_logits(
+        std::move(logits), sampling, counts, random_host,
+        random_cuda, rng, token_constraint);
 }
 
 class ServerPrefillCudaTimer {
@@ -19306,6 +19323,7 @@ public:
                 max_bytes_ == 0 || !model.supports_text_session_state()) {
             return 0;
         }
+        ++queries_;
         std::string selected_session;
         size_t selected_snapshot = 0;
         size_t selected_tokens = 0;
@@ -19335,6 +19353,8 @@ public:
         try {
             model.restore_text_session_state(selected);
             selected.last_used = ++clock_;
+            ++hits_;
+            hit_tokens_ += selected_tokens;
             if (trace_) {
                 std::cerr << "server_session_cache action=hit session="
                           << requested_session
@@ -19394,6 +19414,7 @@ public:
         bytes_ += stored->bytes;
         evict_history_to_limit(session_id, protected_clock);
         evict_to_budget(session_id, protected_clock);
+        sync_telemetry();
         if (trace_) {
             const auto & saved_history = states_.at(session_id);
             const auto saved = std::find_if(
@@ -19438,6 +19459,7 @@ public:
         const auto remaining = states_.find(target_session);
         const size_t copied_snapshots = remaining == states_.end()
             ? 0 : remaining->second.size();
+        sync_telemetry();
         if (trace_) {
             std::cerr << "server_session_cache action=fork source="
                       << source_session << " target=" << target_session
@@ -19457,6 +19479,7 @@ public:
         }
         bytes_ -= released_bytes;
         states_.erase(found);
+        sync_telemetry();
         if (trace_) {
             std::cerr << "server_session_cache action=close session="
                       << session_id << " snapshots=" << released
@@ -19466,7 +19489,51 @@ public:
         return released;
     }
 
+    std::vector<std::pair<std::string, double>> metrics() const {
+        return {
+            {"prefix_cache_queries", static_cast<double>(queries_.load())},
+            {"prefix_cache_hits", static_cast<double>(hits_.load())},
+            {"prefix_cache_hit_tokens", static_cast<double>(hit_tokens_.load())},
+            {"prefix_cache_sessions", static_cast<double>(metric_sessions_.load())},
+            {"prefix_cache_snapshots", static_cast<double>(metric_snapshots_.load())},
+            {"prefix_cache_tokens", static_cast<double>(metric_tokens_.load())},
+            {"prefix_cache_bytes", static_cast<double>(metric_bytes_.load())},
+            {"prefix_cache_max_sessions", static_cast<double>(max_sessions_)},
+            {"prefix_cache_max_snapshots_per_session",
+                static_cast<double>(max_snapshots_per_session_)},
+            {"prefix_cache_max_bytes", static_cast<double>(max_bytes_)},
+        };
+    }
+
+    size_t clear() noexcept {
+        size_t snapshots = 0;
+        for (const auto & [session_id, history] : states_) {
+            (void)session_id;
+            snapshots += history.size();
+        }
+        states_.clear();
+        bytes_ = 0;
+        sync_telemetry();
+        return snapshots;
+    }
+
 private:
+    void sync_telemetry() noexcept {
+        size_t snapshots = 0;
+        size_t tokens = 0;
+        for (const auto & [session_id, history] : states_) {
+            (void)session_id;
+            snapshots += history.size();
+            for (const auto & snapshot : history) {
+                tokens += snapshot.tokens.size();
+            }
+        }
+        metric_sessions_.store(states_.size());
+        metric_snapshots_.store(snapshots);
+        metric_tokens_.store(tokens);
+        metric_bytes_.store(bytes_);
+    }
+
     void evict_history_to_limit(
             const std::string & session_id,
             uint64_t protected_clock) {
@@ -19554,6 +19621,7 @@ private:
         found->second.erase(found->second.begin() +
             static_cast<std::ptrdiff_t>(index));
         if (found->second.empty()) states_.erase(found);
+        sync_telemetry();
     }
 
     std::unordered_map<
@@ -19563,6 +19631,13 @@ private:
     size_t max_bytes_ = 2ULL * 1024ULL * 1024ULL * 1024ULL;
     size_t bytes_ = 0;
     uint64_t clock_ = 0;
+    std::atomic<uint64_t> queries_{0};
+    std::atomic<uint64_t> hits_{0};
+    std::atomic<uint64_t> hit_tokens_{0};
+    std::atomic<size_t> metric_sessions_{0};
+    std::atomic<size_t> metric_snapshots_{0};
+    std::atomic<size_t> metric_tokens_{0};
+    std::atomic<size_t> metric_bytes_{0};
     bool trace_ = false;
 };
 
@@ -19660,7 +19735,11 @@ static int32_t generate_server_tokens(
             store_session_snapshot(stable_prefix_tokens);
         }
         if (on_prefill) {
-            on_prefill(prompt.size() - reused_tokens, prefill_ms);
+            on_prefill(MfqPrefillTiming{
+                prompt.size() - reused_tokens,
+                prefill_ms,
+                0.0,
+                prefill_ms});
         }
         return std::make_pair(std::move(next), token);
     };
@@ -19914,6 +19993,132 @@ static int32_t generate_server_tokens(
         history.push_back(token);
         if (has_penalties) sample_token_counts_add_cuda(counts, next.contiguous());
         ids = next.reshape({1, 1});
+    }
+    return generated;
+}
+
+static int32_t generate_server_multimodal_tokens(
+    MiniCPMO45Runtime & runtime,
+    std::mutex & model_mutex,
+    const std::vector<int64_t> & prompt,
+    const MfqVisionInput & vision,
+    const MfqSamplingParams & sampling,
+    const MfqTokenCallback & on_token,
+    const MfqPrefillCallback & on_prefill,
+    const MfqTokenConstraintPtr & token_constraint)
+{
+    std::lock_guard<std::mutex> lock(model_mutex);
+    if (prompt.empty() || sampling.max_tokens < 0) {
+        throw std::invalid_argument(
+            "MiniCPM-o multimodal generation input is invalid");
+    }
+    if (sampling.max_tokens == 0) {
+        runtime.language.reset(1);
+        return 0;
+    }
+    const auto generation_limit = std::min<int32_t>(
+        sampling.max_tokens,
+        static_cast<int32_t>(
+            runtime.language.c.max_position_embeddings -
+            static_cast<int64_t>(prompt.size()) + 1));
+    if (generation_limit <= 0) {
+        throw std::invalid_argument(
+            "MiniCPM-o multimodal prompt exceeds the context capacity");
+    }
+
+    const auto cpu_i64 =
+        torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+    const auto cuda_i64 =
+        torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+    auto input_ids = torch::tensor(prompt, cuda_i64)
+        .reshape({1, -1}).contiguous();
+    auto pixels = torch::from_blob(
+        const_cast<float *>(vision.pixel_values.data()),
+        vision.pixel_shape,
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+        .clone();
+    auto patch_mask = torch::from_blob(
+        const_cast<uint8_t *>(vision.patch_mask.data()),
+        vision.patch_mask_shape,
+        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
+        .clone().to(torch::kBool);
+    auto target_sizes = torch::from_blob(
+        const_cast<int32_t *>(vision.target_sizes.data()),
+        vision.target_sizes_shape,
+        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU))
+        .clone();
+    auto image_bounds = torch::from_blob(
+        const_cast<int64_t *>(vision.image_bounds.data()),
+        std::vector<int64_t>{
+            static_cast<int64_t>(vision.image_bounds.size() / 4), 4},
+        cpu_i64).clone();
+
+    const bool has_penalties = sampling_has_penalties(sampling);
+    auto counts = has_penalties
+        ? torch::zeros(
+              {runtime.language.c.vocab_size},
+              torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA))
+        : torch::Tensor();
+    if (has_penalties) {
+        sample_token_counts_add_cuda(counts, input_ids);
+    }
+    auto random_host = torch::empty(
+        {1}, torch::TensorOptions().dtype(torch::kFloat32)
+            .device(torch::kCPU).pinned_memory(true));
+    auto random_cuda = torch::empty(
+        {1}, torch::TensorOptions().dtype(torch::kFloat32)
+            .device(torch::kCUDA));
+    std::mt19937_64 rng(sampling.seed);
+
+    ServerPrefillCudaTimer prefill_timer;
+    auto result = runtime.forward(
+        input_ids,
+        torch::Tensor(),
+        torch::Tensor(),
+        pixels,
+        patch_mask,
+        target_sizes,
+        image_bounds,
+        torch::Tensor(),
+        torch::Tensor(),
+        torch::Tensor());
+    auto logits = result.logits.index({Slice(), -1, Slice()})
+        .contiguous().view({1, -1});
+    MFQ_CUDA_CHECK(cudaEventRecord(
+        prefill_timer.finished_event(),
+        at::cuda::getCurrentCUDAStream()));
+    auto next = sample_server_logits(
+        std::move(logits), sampling, counts, random_host,
+        random_cuda, rng, token_constraint);
+    if (on_prefill) {
+        const double model_ms = prefill_timer.elapsed_ms();
+        // The current CUDA composite timer covers both the multimodal encoder
+        // and language prefill. Keep that total explicit instead of falsely
+        // presenting it as llama.cpp-comparable LLM-only time.
+        on_prefill(MfqPrefillTiming{
+            prompt.size(),
+            0.0,
+            0.0,
+            model_ms});
+    }
+
+    int32_t generated = 0;
+    while (generated < generation_limit) {
+        const int64_t token = next.item<int64_t>();
+        ++generated;
+        if (!on_token(token) || generated >= generation_limit) break;
+        if (has_penalties) {
+            sample_token_counts_add_cuda(counts, next.contiguous());
+        }
+        next = sample_server_token(
+            runtime.language,
+            next.reshape({1, 1}),
+            sampling,
+            counts,
+            random_host,
+            random_cuda,
+            rng,
+            token_constraint);
     }
     return generated;
 }
@@ -24573,7 +24778,6 @@ int main(int argc, char ** argv) {
         std::string tokenizer_model, server_model_name = "mfq-model", server_api_key;
         std::string check_tokenizer_text =
             "MFQ tokenizer check: hello, world! <think>";
-        std::string server_web_root;
         std::string server_sampling_profile;
         std::string cpu_offload_layers_arg;
         std::string moe_cache_profile_path;
@@ -24872,7 +25076,6 @@ int main(int argc, char ** argv) {
             }
             else if (a == "--model-name" && i + 1 < argc) server_model_name = argv[++i];
             else if (a == "--api-key" && i + 1 < argc) server_api_key = argv[++i];
-            else if (a == "--web-root" && i + 1 < argc) server_web_root = argv[++i];
             else if (a == "--sampling-profile" && i + 1 < argc) {
                 server_sampling_profile = argv[++i];
             }
@@ -24891,7 +25094,7 @@ int main(int argc, char ** argv) {
                              "--layer-parallel 0,1 --layer-split 1,1 "
                              "--n-gpu-layers 60 --threads 32 --cpu-offload-layers 0-7,12 --moe-gpu-cache-gb 8 "
                              "--moe-cache-profile profile.json "
-                             "--api-key key --web-root path --sampling-profile profile.json "
+                             "--api-key key --sampling-profile profile.json "
                              "--minicpmo-duplex] | --kl-base reference.bin "
                              "[--kl-evaluator optimized|legacy --kl-chunks -1 "
                              "--kl-score-count N --kl-n-batch N "
@@ -25257,7 +25460,7 @@ int main(int argc, char ** argv) {
                          "(--ids 1,2,3 --gen 128 | --minicpmo-eval-batch "
                          "[--minicpmo-eval-vision-batch-size 16] | --server "
                          "[--host 127.0.0.1 --port 8080 --ctx-size 32768 --model-name name "
-                         "--api-key key --web-root path --minicpmo-duplex] | --kl-base reference.bin "
+                         "--api-key key --minicpmo-duplex] | --kl-base reference.bin "
                          "[--kl-evaluator optimized|legacy --kl-chunks -1 "
                          "--kl-score-count N --kl-n-batch N "
                          "--kl-reference-n-batch N "
@@ -25460,11 +25663,11 @@ int main(int argc, char ** argv) {
         auto t0 = std::chrono::steady_clock::now();
         Model model = load_model(mfq_path, config_path, context_size);
         std::optional<MiniCPMO45Runtime> server_minicpmo_runtime;
-        if (server_minicpmo_duplex) {
-            if (!model.c.is_minicpmo45()) {
-                throw std::runtime_error(
-                    "--minicpmo-duplex requires a MiniCPM-o 4.5 model");
-            }
+        if (server_minicpmo_duplex && !model.c.is_minicpmo45()) {
+            throw std::runtime_error(
+                "--minicpmo-duplex requires a MiniCPM-o 4.5 model");
+        }
+        if (server_mode && model.c.is_minicpmo45()) {
             server_minicpmo_runtime.emplace(
                 MiniCPMO45Runtime::load_with_language(
                     std::move(model), mfq_path));
@@ -25480,23 +25683,6 @@ int main(int argc, char ** argv) {
                 const char * env_key = std::getenv("MFQ_API_KEY");
                 if (env_key != nullptr) server_api_key = env_key;
             }
-            if (server_web_root.empty()) {
-                std::error_code error;
-                auto candidate = std::filesystem::absolute(
-                    std::filesystem::path(argv[0]), error).parent_path() / "web";
-                if (!error && std::filesystem::is_regular_file(
-                        candidate / "index.html", error)) {
-                    server_web_root = candidate.string();
-                } else {
-                    error.clear();
-                    candidate = std::filesystem::current_path(error) /
-                        "cpp_runtime" / "web";
-                    if (!error && std::filesystem::is_regular_file(
-                            candidate / "index.html", error)) {
-                        server_web_root = candidate.string();
-                    }
-                }
-            }
             MfqServerConfig server_config;
             server_config.host = server_host;
             server_config.port = server_port;
@@ -25510,7 +25696,6 @@ int main(int argc, char ** argv) {
             server_config.tokenizer_gguf =
                 runtime_assets.read_asset(MFQ_TOKENIZER_GGUF_ASSET);
             server_config.api_key = server_api_key;
-            server_config.web_root = server_web_root;
             server_config.max_context =
                 server_model.c.max_position_embeddings;
             server_config.vocab_size = server_model.c.vocab_size;
@@ -25534,11 +25719,31 @@ int main(int argc, char ** argv) {
             ServerTextSessionCache text_session_cache;
             std::optional<MiniCPMO45DuplexSession> minicpmo_duplex_session;
             MfqDuplexBackend duplex_backend;
-            if (server_minicpmo_runtime) {
+            if (server_minicpmo_duplex && server_minicpmo_runtime) {
                 duplex_backend = make_cuda_minicpmo45_duplex_backend(
                     *server_minicpmo_runtime,
                     model_mutex,
                     minicpmo_duplex_session);
+            }
+            MfqMultimodalGenerateFn multimodal_generate;
+            if (server_minicpmo_runtime) {
+                multimodal_generate =
+                    [&](const std::vector<int64_t> & prompt,
+                        const MfqVisionInput & vision,
+                        const MfqSamplingParams & sampling,
+                        const MfqTokenCallback & on_token,
+                        const MfqPrefillCallback & on_prefill,
+                        const MfqTokenConstraintPtr & token_constraint) {
+                        return generate_server_multimodal_tokens(
+                            *server_minicpmo_runtime,
+                            model_mutex,
+                            prompt,
+                            vision,
+                            sampling,
+                            on_token,
+                            on_prefill,
+                            token_constraint);
+                    };
             }
             const int status = run_mfq_server(
                 server_config, [&](const std::vector<int64_t> & prompt,
@@ -25562,6 +25767,30 @@ int main(int argc, char ** argv) {
                     std::lock_guard<std::mutex> lock(model_mutex);
                     return text_session_cache.close_session(session_id);
                 },
+                [&] {
+                    return text_session_cache.metrics();
+                },
+                [&] {
+                    std::lock_guard<std::mutex> lock(model_mutex);
+                    return text_session_cache.clear();
+                },
+            }, multimodal_generate, [] {
+                size_t free_bytes = 0;
+                size_t total_bytes = 0;
+                MFQ_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+                const auto stats =
+                    c10::cuda::CUDACachingAllocator::getDeviceStats(
+                        c10::cuda::current_device());
+                constexpr size_t aggregate = static_cast<size_t>(
+                    c10::CachingDeviceAllocator::StatType::AGGREGATE);
+                return std::vector<std::pair<std::string, double>>{
+                    {"device_free_bytes", static_cast<double>(free_bytes)},
+                    {"device_total_bytes", static_cast<double>(total_bytes)},
+                    {"cuda_allocated_bytes", static_cast<double>(
+                        stats.allocated_bytes[aggregate].current)},
+                    {"cuda_reserved_bytes", static_cast<double>(
+                        stats.reserved_bytes[aggregate].current)},
+                };
             });
             if (g_moe_expert_cache) {
                 g_moe_expert_cache->print_stats(std::cout);

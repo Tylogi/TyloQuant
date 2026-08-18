@@ -8,12 +8,18 @@
 #include "../../third_party/nlohmann/json.hpp"
 
 #include <mlx/allocator.h>
+#include <mlx/backend/metal/device.h>
+#include <mlx/primitives.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <iomanip>
+#include <iostream>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -29,6 +35,38 @@ using mlx::core::array;
 
 constexpr const char* kResamplerPositionAsset =
     "__mfq_asset__/minicpmo45-resampler-pos-embed-v1.bf16";
+
+void configure_minicpmo_sdpa() {
+    // MLX otherwise selects 256 partial-reduction blocks for an 8k decode
+    // cache on large Apple GPUs. llama.cpp's vector attention uses far fewer
+    // workgroups; 64 is the measured optimum for MiniCPM-o's 32:8 GQA and
+    // 128-wide heads. Respect an explicit setting for tuning other devices.
+    if (std::getenv("MLX_SDPA_BLOCKS") == nullptr) {
+        ::setenv("MLX_SDPA_BLOCKS", "64", 0);
+    }
+}
+
+int minicpmo_vision_batch_size() noexcept {
+    const auto* value = std::getenv("MFQ_METAL_VISION_BATCH_SIZE");
+    return value == nullptr
+        ? 2
+        : std::max(0, std::atoi(value));
+}
+
+bool minicpmo_vision_batchable_length(int tokens) noexcept {
+    // The official processor normalizes every video frame and image slice to
+    // roughly 448x448, which produces about 1k ViT patches.  Smaller or much
+    // larger raw tensor inputs are valid at the native boundary, but MLX can
+    // select a different GEMM reduction for those uncommon geometries when a
+    // batch is split.  Keep them on the original whole-batch path so batching
+    // remains bitwise transparent for every accepted input geometry.
+    return tokens >= 900 && tokens <= 1100;
+}
+
+bool minicpmo_vision_profile_enabled() noexcept {
+    const auto* value = std::getenv("MFQ_METAL_VISION_PROFILE");
+    return value != nullptr && std::strcmp(value, "0") != 0;
+}
 
 array dense(const MfqContainer& model, const std::string& name) {
     const auto& record = model.record(name);
@@ -46,6 +84,1263 @@ array as_dtype(const array& value, mlx::core::Dtype dtype) {
     return value.dtype() == dtype
         ? value
         : mlx::core::astype(value, dtype);
+}
+
+void log_bitwise_hash(
+    const array& value,
+    const char* environment,
+    const char* label) {
+    const auto* requested = std::getenv(environment);
+    if (requested == nullptr || std::strcmp(requested, "0") == 0) {
+        return;
+    }
+    auto materialized = mlx::core::contiguous(value);
+    materialized.eval();
+    const auto* bytes = materialized.data<std::uint8_t>();
+    std::uint64_t first = 1469598103934665603ULL;
+    std::uint64_t second = 0x9e3779b97f4a7c15ULL;
+    for (std::size_t index = 0; index < materialized.nbytes(); ++index) {
+        first ^= bytes[index];
+        first *= 1099511628211ULL;
+        second ^= static_cast<std::uint64_t>(bytes[index]) +
+            0x9e3779b97f4a7c15ULL + (second << 6U) + (second >> 2U);
+    }
+    std::cerr
+        << label << " bytes="
+        << materialized.nbytes()
+        << " fnv64=0x" << std::hex << first
+        << " mix64=0x" << second << std::dec << '\n';
+}
+
+void log_vision_bitwise_hash(const array& value) {
+    log_bitwise_hash(
+        value,
+        "MFQ_METAL_VISION_BITWISE_HASH",
+        "minicpmo_vision_bitwise_hash");
+}
+
+void log_audio_bitwise_hash(const array& value) {
+    log_bitwise_hash(
+        value,
+        "MFQ_METAL_AUDIO_BITWISE_HASH",
+        "minicpmo_audio_bitwise_hash");
+}
+
+const mlx::core::fast::CustomKernelFunction&
+mini_qk_norm_rope_kernel() {
+    static const auto kernel = [] {
+        mlx::core::CompileOptions options;
+        options.math_mode = mlx::core::MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_minicpmo_qk_norm_rope_4head_32x8x128_f16",
+            {
+                "query",
+                "key",
+                "query_norm",
+                "key_norm",
+                "params",
+            },
+            {"query_out", "key_out"},
+            R"METAL(
+    constexpr uint HEADS_PER_TG = 4u;
+    constexpr uint SIMD_GROUPS = HEADS_PER_TG * 2u;
+    uint tid = thread_index_in_threadgroup;
+    uint head_slot = tid >> 6u;
+    uint dimension = tid & 63u;
+    uint head =
+        threadgroup_position_in_grid.x * HEADS_PER_TG + head_slot;
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    bool is_query = head < uint(Q_HEADS);
+    uint local_head = is_query ? head : head - uint(Q_HEADS);
+    device const T* source = is_query ? query : key;
+    device const float* norm = is_query ? query_norm : key_norm;
+    uint offset = local_head * uint(HEAD_DIM);
+
+    uint half_dim = uint(HEAD_DIM) / 2u;
+    float raw_first = float(source[offset + dimension]);
+    float raw_second = float(
+        source[offset + dimension + half_dim]);
+    float square_sum = simd_sum(
+        raw_first * raw_first + raw_second * raw_second);
+    threadgroup float partials[SIMD_GROUPS];
+    threadgroup float inverse_rms[HEADS_PER_TG];
+    threadgroup float angle_cosines[64];
+    threadgroup float angle_sines[64];
+    if (lane == 0u) partials[simd_group] = square_sum;
+    if (tid < 64u) {
+        float frequency = pow(
+            params[1],
+            -2.0f * float(tid) / float(HEAD_DIM));
+        float angle = params[2] * frequency;
+        angle_cosines[tid] = cos(angle);
+        angle_sines[tid] = sin(angle);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (dimension == 0u) {
+        float total =
+            partials[head_slot * 2u] +
+            partials[head_slot * 2u + 1u];
+        inverse_rms[head_slot] = rsqrt(
+            total / float(HEAD_DIM) + params[0]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = inverse_rms[head_slot];
+
+    float first = float(T(
+        raw_first * norm[dimension] * inv_rms));
+    float second = float(T(
+        raw_second * norm[dimension + half_dim] * inv_rms));
+    float angle_cos = angle_cosines[dimension];
+    float angle_sin = angle_sines[dimension];
+    float rotated_first = first * angle_cos - second * angle_sin;
+    float rotated_second = second * angle_cos + first * angle_sin;
+    if (is_query) {
+        query_out[offset + dimension] = T(rotated_first);
+        query_out[offset + dimension + half_dim] = T(rotated_second);
+    } else {
+        key_out[offset + dimension] = T(rotated_first);
+        key_out[offset + dimension + half_dim] = T(rotated_second);
+    }
+)METAL",
+            "#define T half\n"
+            "#define Q_HEADS 32\n"
+            "#define HEAD_DIM 128\n",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+mini_rope_table_kernel() {
+    static const auto kernel = [] {
+        mlx::core::CompileOptions options;
+        options.math_mode = mlx::core::MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_minicpmo_rope_table_128_f32_v1",
+            {"params"},
+            {"table"},
+            R"METAL(
+    uint dimension = thread_position_in_grid.x;
+    if (dimension >= 64u) return;
+    float frequency = pow(
+        params[0],
+        -2.0f * float(dimension) / 128.0f);
+    float angle = params[1] * frequency;
+    table[dimension * 2u] = cos(angle);
+    table[dimension * 2u + 1u] = sin(angle);
+)METAL",
+            "",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+array mini_rope_table(float base, int position) {
+    const array params(
+        {base, static_cast<float>(position)},
+        mlx::core::float32);
+    auto outputs = mini_rope_table_kernel()(
+        {params},
+        {Shape{64, 2}},
+        {mlx::core::float32},
+        {64, 1, 1},
+        {64, 1, 1},
+        {},
+        std::nullopt,
+        false,
+        {});
+    return std::move(outputs.front());
+}
+
+std::pair<array, array> mini_qk_norm_rope(
+    const array& query,
+    const array& key,
+    const MlxRmsNorm& query_norm,
+    const MlxRmsNorm& key_norm,
+    int query_heads,
+    int key_heads,
+    int head_dim,
+    float base,
+    int position) {
+    if (query.dtype() != mlx::core::float16 ||
+        key.dtype() != query.dtype() ||
+        query.size() != static_cast<std::size_t>(
+            query_heads * head_dim) ||
+        key.size() != static_cast<std::size_t>(
+            key_heads * head_dim) ||
+        query_norm.width() != head_dim ||
+        key_norm.width() != head_dim ||
+        query_norm.eps() != key_norm.eps() ||
+        head_dim != 128 ||
+        position < 0) {
+        throw std::runtime_error(
+            "unsupported MiniCPM-o fused Q/K normalization shape");
+    }
+    const array params(
+        {query_norm.eps(), base, static_cast<float>(position)},
+        mlx::core::float32);
+    auto outputs = mini_qk_norm_rope_kernel()(
+        {
+            mlx::core::contiguous(mlx::core::reshape(
+                query,
+                Shape{query_heads * head_dim})),
+            mlx::core::contiguous(mlx::core::reshape(
+                key,
+                Shape{key_heads * head_dim})),
+            query_norm.weight(),
+            key_norm.weight(),
+            params,
+        },
+        {
+            Shape{1, query_heads, 1, head_dim},
+            Shape{1, key_heads, 1, head_dim},
+        },
+        {query.dtype(), key.dtype()},
+        {(query_heads + key_heads) * (head_dim / 2), 1, 1},
+        {4 * (head_dim / 2), 1, 1},
+        {},
+        std::nullopt,
+        false,
+        {});
+    return {
+        std::move(outputs.at(0)),
+        std::move(outputs.at(1)),
+    };
+}
+
+struct MiniQkKvCacheParams {
+    float eps = 0.0f;
+    float base = 0.0f;
+    float position = 0.0f;
+    float capacity = 0.0f;
+};
+
+class MiniQkKvCachePrimitive final
+    : public mlx::core::UnaryPrimitive {
+public:
+    MiniQkKvCachePrimitive(
+        mlx::core::Stream stream,
+        MiniQkKvCacheParams params)
+        : UnaryPrimitive(stream), params_(params) {}
+
+    void eval_cpu(
+        const std::vector<array>&,
+        array&) override {
+        throw std::runtime_error(
+            "MiniCPM-o inline Q/K cache post-processing requires Metal");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        array& output) override {
+        if (inputs.size() != 8) {
+            throw std::logic_error(
+                "MiniCPM-o inline Q/K cache input mismatch");
+        }
+        output.set_data(
+            mlx::core::allocator::malloc(output.nbytes()));
+        auto& selected_stream = stream();
+        auto& device = mlx::core::metal::device(
+            selected_stream.device);
+        mlx::core::CompileOptions options;
+        options.math_mode = mlx::core::MathMode::Fast;
+        auto* library = device.get_library(
+            "mfq_minicpmo_qk_norm_rope_cache_v2",
+            options,
+            [] {
+                return std::string(R"METAL(
+#include <metal_stdlib>
+using namespace metal;
+
+struct MiniQkKvCacheParams {
+    float eps;
+    float base;
+    float position;
+    float capacity;
+};
+
+kernel void mfq_minicpmo_qk_norm_rope_cache_v2(
+    device const half* query [[buffer(0)]],
+    device const half* key [[buffer(1)]],
+    device const float* query_norm [[buffer(2)]],
+    device const float* key_norm [[buffer(3)]],
+    device const half* value [[buffer(4)]],
+    device half* key_cache [[buffer(5)]],
+    device half* value_cache [[buffer(6)]],
+    device const float* rope_table [[buffer(7)]],
+    device half* query_out [[buffer(8)]],
+    constant MiniQkKvCacheParams& params [[buffer(9)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 threadgroup_position_in_grid
+        [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint Q_HEADS = 32u;
+    constexpr uint HEAD_DIM = 128u;
+    constexpr uint HEADS_PER_TG = 1u;
+    constexpr uint SIMD_GROUPS = HEADS_PER_TG * 2u;
+    uint head_slot = tid >> 6u;
+    uint dimension = tid & 63u;
+    uint head =
+        threadgroup_position_in_grid.x * HEADS_PER_TG + head_slot;
+    bool is_query = head < Q_HEADS;
+    uint local_head = is_query ? head : head - Q_HEADS;
+    device const half* source = is_query ? query : key;
+    device const float* norm = is_query ? query_norm : key_norm;
+    uint offset = local_head * HEAD_DIM;
+
+    uint half_dim = HEAD_DIM / 2u;
+    float raw_first = float(source[offset + dimension]);
+    float raw_second = float(source[offset + dimension + half_dim]);
+    float square_sum = simd_sum(
+        raw_first * raw_first + raw_second * raw_second);
+    threadgroup float partials[SIMD_GROUPS];
+    threadgroup float inverse_rms[HEADS_PER_TG];
+    if (lane == 0u) partials[simd_group] = square_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (dimension == 0u) {
+        float total =
+            partials[head_slot * 2u] +
+            partials[head_slot * 2u + 1u];
+        inverse_rms[head_slot] = rsqrt(
+            total / float(HEAD_DIM) + params.eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = inverse_rms[head_slot];
+
+    float first = float(half(
+        raw_first * norm[dimension] * inv_rms));
+    float second = float(half(
+        raw_second * norm[dimension + half_dim] * inv_rms));
+    float angle_cos = rope_table[dimension * 2u];
+    float angle_sin = rope_table[dimension * 2u + 1u];
+    float rotated_first = first * angle_cos - second * angle_sin;
+    float rotated_second = second * angle_cos + first * angle_sin;
+    if (is_query) {
+        query_out[offset + dimension] = half(rotated_first);
+        query_out[offset + dimension + half_dim] = half(rotated_second);
+    } else {
+        uint capacity = uint(params.capacity);
+        uint cache_base =
+            (local_head * capacity + uint(params.position)) * HEAD_DIM;
+        key_cache[cache_base + dimension] = half(rotated_first);
+        key_cache[cache_base + dimension + half_dim] = half(rotated_second);
+        value_cache[cache_base + dimension] = value[offset + dimension];
+        value_cache[cache_base + dimension + half_dim] =
+            value[offset + dimension + half_dim];
+    }
+}
+)METAL");
+            });
+        auto* kernel = device.get_kernel(
+            "mfq_minicpmo_qk_norm_rope_cache_v2",
+            library);
+        auto& encoder = mlx::core::metal::get_command_encoder(
+            selected_stream);
+        encoder.set_compute_pipeline_state(kernel);
+        for (int index = 0; index < 8; ++index) {
+            encoder.set_input_array(
+                inputs[static_cast<std::size_t>(index)], index);
+        }
+        encoder.set_output_array(output, 8);
+        encoder.set_bytes(params_, 9);
+        encoder.dispatch_threadgroups(
+            MTL::Size(40, 1, 1),
+            MTL::Size(64, 1, 1));
+    }
+
+    const char* name() const override {
+        return "MiniQkKvCachePrimitive";
+    }
+
+    bool is_equivalent(
+        const mlx::core::Primitive& other) const override {
+        const auto* primitive =
+            dynamic_cast<const MiniQkKvCachePrimitive*>(&other);
+        return primitive != nullptr &&
+            primitive->params_.eps == params_.eps &&
+            primitive->params_.base == params_.base &&
+            primitive->params_.position == params_.position &&
+            primitive->params_.capacity == params_.capacity;
+    }
+
+    std::vector<Shape> output_shapes(
+        const std::vector<array>&) override {
+        return {Shape{1, 32, 1, 128}};
+    }
+
+private:
+    MiniQkKvCacheParams params_;
+};
+
+array mini_qk_norm_rope_cache(
+    const array& query,
+    const array& key,
+    const array& value,
+    const array& rope_table,
+    const MlxRmsNorm& query_norm,
+    const MlxRmsNorm& key_norm,
+    float base,
+    int position,
+    const array& key_cache,
+    const array& value_cache,
+    int capacity) {
+    if (query.dtype() != mlx::core::float16 ||
+        key.dtype() != query.dtype() ||
+        value.dtype() != query.dtype() ||
+        query.size() != 32u * 128u ||
+        key.size() != 8u * 128u ||
+        value.size() != 8u * 128u ||
+        query_norm.width() != 128 ||
+        key_norm.width() != 128 ||
+        query_norm.eps() != key_norm.eps() ||
+        rope_table.shape() != Shape{64, 2} ||
+        rope_table.dtype() != mlx::core::float32 ||
+        key_cache.shape() != Shape{1, 8, capacity, 128} ||
+        value_cache.shape() != key_cache.shape() ||
+        key_cache.dtype() != query.dtype() ||
+        value_cache.dtype() != query.dtype() ||
+        position < 0 || position >= capacity) {
+        throw std::runtime_error(
+            "unsupported MiniCPM-o inline Q/K cache shape");
+    }
+    auto stream = mlx::core::default_stream(
+        mlx::core::default_device());
+    if (stream.device != mlx::core::Device::gpu) {
+        throw std::runtime_error(
+            "MiniCPM-o inline Q/K cache post-processing requires Metal");
+    }
+    return array(
+        Shape{1, 32, 1, 128},
+        mlx::core::float16,
+        std::make_shared<MiniQkKvCachePrimitive>(
+            stream,
+            MiniQkKvCacheParams{
+                query_norm.eps(),
+                base,
+                static_cast<float>(position),
+                static_cast<float>(capacity),
+            }),
+        std::vector<array>{
+            mlx::core::contiguous(mlx::core::reshape(
+                query, Shape{32 * 128})),
+            mlx::core::contiguous(mlx::core::reshape(
+                key, Shape{8 * 128})),
+            query_norm.weight(),
+            key_norm.weight(),
+            mlx::core::contiguous(mlx::core::reshape(
+                value, Shape{8 * 128})),
+            key_cache,
+            value_cache,
+            rope_table,
+        });
+}
+
+struct MiniKvCacheWriteParams {
+    std::uint32_t position = 0;
+    std::uint32_t capacity = 0;
+};
+
+class MiniKvCacheWritePrimitive final
+    : public mlx::core::UnaryPrimitive {
+public:
+    MiniKvCacheWritePrimitive(
+        mlx::core::Stream stream,
+        MiniKvCacheWriteParams params)
+        : UnaryPrimitive(stream), params_(params) {}
+
+    void eval_cpu(
+        const std::vector<array>&,
+        array&) override {
+        throw std::runtime_error(
+            "MiniCPM-o combined KV cache write requires Metal");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        array& output) override {
+        if (inputs.size() != 5) {
+            throw std::logic_error(
+                "MiniCPM-o combined KV cache write input mismatch");
+        }
+        // The output aliases the already-computed query. This preserves the
+        // exact Q/K normalization and RoPE graph while making attention depend
+        // on the single command that writes both persistent cache rows.
+        output.copy_shared_buffer(inputs[0]);
+        auto& selected_stream = stream();
+        auto& device = mlx::core::metal::device(
+            selected_stream.device);
+        mlx::core::CompileOptions options;
+        options.math_mode = mlx::core::MathMode::Fast;
+        auto* library = device.get_library(
+            "mfq_minicpmo_kv_cache_write_v1",
+            options,
+            [] {
+                return std::string(R"METAL(
+#include <metal_stdlib>
+using namespace metal;
+
+struct MiniKvCacheWriteParams {
+    uint position;
+    uint capacity;
+};
+
+kernel void mfq_minicpmo_kv_cache_write_v1(
+    device half* query_passthrough [[buffer(0)]],
+    device const half* key [[buffer(1)]],
+    device const half* value [[buffer(2)]],
+    device half* key_cache [[buffer(3)]],
+    device half* value_cache [[buffer(4)]],
+    constant MiniKvCacheWriteParams& params [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]) {
+    constexpr uint HEAD_DIM = 128u;
+    constexpr uint ELEMENTS = 8u * HEAD_DIM;
+    if (tid >= ELEMENTS) return;
+    uint head = tid / HEAD_DIM;
+    uint dimension = tid - head * HEAD_DIM;
+    uint cache_offset =
+        (head * params.capacity + params.position) * HEAD_DIM + dimension;
+    key_cache[cache_offset] = key[tid];
+    value_cache[cache_offset] = value[tid];
+}
+)METAL");
+            });
+        auto* kernel = device.get_kernel(
+            "mfq_minicpmo_kv_cache_write_v1",
+            library);
+        auto& encoder = mlx::core::metal::get_command_encoder(
+            selected_stream);
+        encoder.set_compute_pipeline_state(kernel);
+        encoder.set_output_array(output, 0);
+        for (int index = 1; index < 5; ++index) {
+            encoder.set_input_array(inputs[index], index);
+        }
+        encoder.set_bytes(params_, 5);
+        encoder.dispatch_threads(
+            MTL::Size(8 * 128, 1, 1),
+            MTL::Size(256, 1, 1));
+    }
+
+    const char* name() const override {
+        return "MiniKvCacheWritePrimitive";
+    }
+
+    bool is_equivalent(
+        const mlx::core::Primitive& other) const override {
+        const auto* primitive =
+            dynamic_cast<const MiniKvCacheWritePrimitive*>(&other);
+        return primitive != nullptr &&
+            primitive->params_.position == params_.position &&
+            primitive->params_.capacity == params_.capacity;
+    }
+
+    std::vector<Shape> output_shapes(
+        const std::vector<array>&) override {
+        return {Shape{1, 32, 1, 128}};
+    }
+
+private:
+    MiniKvCacheWriteParams params_;
+};
+
+array mini_kv_cache_write(
+    const array& query,
+    const array& key,
+    const array& value,
+    const array& key_cache,
+    const array& value_cache,
+    int position,
+    int capacity) {
+    if (query.dtype() != mlx::core::float16 ||
+        key.dtype() != query.dtype() ||
+        value.dtype() != query.dtype() ||
+        query.size() != 32u * 128u ||
+        key.size() != 8u * 128u ||
+        value.size() != 8u * 128u ||
+        key_cache.shape() != Shape{1, 8, capacity, 128} ||
+        value_cache.shape() != key_cache.shape() ||
+        key_cache.dtype() != query.dtype() ||
+        value_cache.dtype() != query.dtype() ||
+        position < 0 || position >= capacity) {
+        throw std::runtime_error(
+            "unsupported MiniCPM-o combined KV cache write shape");
+    }
+    auto stream = mlx::core::default_stream(
+        mlx::core::default_device());
+    if (stream.device != mlx::core::Device::gpu) {
+        throw std::runtime_error(
+            "MiniCPM-o combined KV cache write requires Metal");
+    }
+    return array(
+        Shape{1, 32, 1, 128},
+        mlx::core::float16,
+        std::make_shared<MiniKvCacheWritePrimitive>(
+            stream,
+            MiniKvCacheWriteParams{
+                static_cast<std::uint32_t>(position),
+                static_cast<std::uint32_t>(capacity),
+            }),
+        std::vector<array>{
+            query,
+            mlx::core::contiguous(mlx::core::reshape(
+                key, Shape{8 * 128})),
+            mlx::core::contiguous(mlx::core::reshape(
+                value, Shape{8 * 128})),
+            key_cache,
+            value_cache,
+        });
+}
+
+const mlx::core::fast::CustomKernelFunction&
+mini_gqa_partial_kernel() {
+    static const auto kernel = [] {
+        mlx::core::CompileOptions options;
+        options.math_mode = mlx::core::MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_minicpmo_gqa_partial_32x8x128_f16",
+            {"query", "key", "value", "params"},
+            {"stats", "partials"},
+            R"METAL(
+    constexpr uint QUERIES_PER_KV = uint(Q_HEADS) / uint(KV_HEADS);
+    uint lane = thread_index_in_simdgroup;
+    uint dimension = lane * 4u;
+    uint workgroup = threadgroup_position_in_grid.x;
+    uint blocks = uint(params[2]);
+    uint kv_head = workgroup / blocks;
+    uint block = workgroup - kv_head * blocks;
+    uint sequence = uint(params[0]);
+    uint capacity = uint(params[1]);
+    uint tile = uint(params[3]);
+    uint begin = block * tile;
+    uint end = min(begin + tile, sequence);
+    uint query_head_base = kv_head * QUERIES_PER_KV;
+
+    float4 queries[QUERIES_PER_KV];
+    float4 accumulators[QUERIES_PER_KV];
+    float current_max[QUERIES_PER_KV];
+    float current_sum[QUERIES_PER_KV];
+    for (uint query_index = 0u;
+         query_index < QUERIES_PER_KV;
+         ++query_index) {
+        uint query_offset =
+            (query_head_base + query_index) * uint(HEAD_DIM) + dimension;
+        queries[query_index] = float4(
+            *reinterpret_cast<device const half4*>(query + query_offset));
+        accumulators[query_index] = float4(0.0f);
+        current_max[query_index] = -INFINITY;
+        current_sum[query_index] = 0.0f;
+    }
+
+    uint token = begin;
+    for (; token + 3u < end; token += 4u) {
+        uint cache_offset0 =
+            (kv_head * capacity + token) * uint(HEAD_DIM) + dimension;
+        uint cache_offset1 = cache_offset0 + uint(HEAD_DIM);
+        uint cache_offset2 = cache_offset1 + uint(HEAD_DIM);
+        uint cache_offset3 = cache_offset2 + uint(HEAD_DIM);
+        float4 key_value0 = float4(
+            *reinterpret_cast<device const half4*>(key + cache_offset0));
+        float4 key_value1 = float4(
+            *reinterpret_cast<device const half4*>(key + cache_offset1));
+        float4 key_value2 = float4(
+            *reinterpret_cast<device const half4*>(key + cache_offset2));
+        float4 key_value3 = float4(
+            *reinterpret_cast<device const half4*>(key + cache_offset3));
+        float4 value_element0 = float4(
+            *reinterpret_cast<device const half4*>(value + cache_offset0));
+        float4 value_element1 = float4(
+            *reinterpret_cast<device const half4*>(value + cache_offset1));
+        float4 value_element2 = float4(
+            *reinterpret_cast<device const half4*>(value + cache_offset2));
+        float4 value_element3 = float4(
+            *reinterpret_cast<device const half4*>(value + cache_offset3));
+        for (uint query_index = 0u;
+             query_index < QUERIES_PER_KV;
+             ++query_index) {
+            float score0 = simd_sum(dot(
+                queries[query_index], key_value0
+            )) * 0.08838834764831845f;
+            float score1 = simd_sum(dot(
+                queries[query_index], key_value1
+            )) * 0.08838834764831845f;
+            float next_max01 = max(
+                current_max[query_index], max(score0, score1));
+            float previous01 = exp(
+                current_max[query_index] - next_max01);
+            float incoming0 = exp(score0 - next_max01);
+            float incoming1 = exp(score1 - next_max01);
+            current_sum[query_index] =
+                current_sum[query_index] * previous01 +
+                incoming0 + incoming1;
+            current_max[query_index] = next_max01;
+            accumulators[query_index] =
+                accumulators[query_index] * previous01 +
+                value_element0 * incoming0 +
+                value_element1 * incoming1;
+
+            float score2 = simd_sum(dot(
+                queries[query_index], key_value2
+            )) * 0.08838834764831845f;
+            float score3 = simd_sum(dot(
+                queries[query_index], key_value3
+            )) * 0.08838834764831845f;
+            float next_max23 = max(
+                current_max[query_index], max(score2, score3));
+            float previous23 = exp(
+                current_max[query_index] - next_max23);
+            float incoming2 = exp(score2 - next_max23);
+            float incoming3 = exp(score3 - next_max23);
+            current_sum[query_index] =
+                current_sum[query_index] * previous23 +
+                incoming2 + incoming3;
+            current_max[query_index] = next_max23;
+            accumulators[query_index] =
+                accumulators[query_index] * previous23 +
+                value_element2 * incoming2 +
+                value_element3 * incoming3;
+        }
+    }
+    for (; token + 1u < end; token += 2u) {
+        uint cache_offset0 =
+            (kv_head * capacity + token) * uint(HEAD_DIM) + dimension;
+        uint cache_offset1 = cache_offset0 + uint(HEAD_DIM);
+        float4 key_value0 = float4(
+            *reinterpret_cast<device const half4*>(key + cache_offset0));
+        float4 key_value1 = float4(
+            *reinterpret_cast<device const half4*>(key + cache_offset1));
+        float4 value_element0 = float4(
+            *reinterpret_cast<device const half4*>(value + cache_offset0));
+        float4 value_element1 = float4(
+            *reinterpret_cast<device const half4*>(value + cache_offset1));
+        for (uint query_index = 0u;
+             query_index < QUERIES_PER_KV;
+             ++query_index) {
+            float score0 = simd_sum(dot(
+                queries[query_index], key_value0
+            )) * 0.08838834764831845f;
+            float score1 = simd_sum(dot(
+                queries[query_index], key_value1
+            )) * 0.08838834764831845f;
+            float next_max = max(
+                current_max[query_index], max(score0, score1));
+            float previous = exp(
+                current_max[query_index] - next_max);
+            float incoming0 = exp(score0 - next_max);
+            float incoming1 = exp(score1 - next_max);
+            current_sum[query_index] =
+                current_sum[query_index] * previous +
+                incoming0 + incoming1;
+            current_max[query_index] = next_max;
+            accumulators[query_index] =
+                accumulators[query_index] * previous +
+                value_element0 * incoming0 +
+                value_element1 * incoming1;
+        }
+    }
+    if (token < end) {
+        uint cache_offset =
+            (kv_head * capacity + token) * uint(HEAD_DIM) + dimension;
+        float4 key_value = float4(
+            *reinterpret_cast<device const half4*>(key + cache_offset));
+        float4 value_element = float4(
+            *reinterpret_cast<device const half4*>(value + cache_offset));
+        for (uint query_index = 0u;
+             query_index < QUERIES_PER_KV;
+             ++query_index) {
+            float score = simd_sum(dot(
+                queries[query_index], key_value
+            )) * 0.08838834764831845f;
+            float next_max = max(current_max[query_index], score);
+            float previous = exp(current_max[query_index] - next_max);
+            float incoming = exp(score - next_max);
+            current_sum[query_index] =
+                current_sum[query_index] * previous + incoming;
+            current_max[query_index] = next_max;
+            accumulators[query_index] =
+                accumulators[query_index] * previous +
+                value_element * incoming;
+        }
+    }
+
+    for (uint query_index = 0u;
+         query_index < QUERIES_PER_KV;
+         ++query_index) {
+        uint query_head = query_head_base + query_index;
+        uint block_index = query_head * blocks + block;
+        if (lane == 0u) {
+            stats[block_index * 2u] = current_max[query_index];
+            stats[block_index * 2u + 1u] = current_sum[query_index];
+        }
+        uint partial_offset =
+            block_index * uint(HEAD_DIM) + dimension;
+        *reinterpret_cast<device float4*>(partials + partial_offset) =
+            accumulators[query_index];
+    }
+)METAL",
+            "#define T half\n"
+            "#define Q_HEADS 32\n"
+            "#define KV_HEADS 8\n"
+            "#define HEAD_DIM 128\n",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+mini_gqa_hierarchical_partial_kernel() {
+    static const auto kernel = [] {
+        mlx::core::CompileOptions options;
+        options.math_mode = mlx::core::MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_minicpmo_gqa_hierarchical_partial_32x8x128_f16",
+            {"query", "key", "value", "params"},
+            {"stats", "partials"},
+            R"METAL(
+    constexpr uint QUERIES_PER_KV = uint(Q_HEADS) / uint(KV_HEADS);
+    constexpr uint SIMD_GROUPS = 8u;
+    uint lane = thread_index_in_simdgroup;
+    uint dimension = lane * 4u;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint workgroup = threadgroup_position_in_grid.x;
+    uint blocks = uint(params[2]);
+    uint kv_head = workgroup / blocks;
+    uint block = workgroup - kv_head * blocks;
+    uint sequence = uint(params[0]);
+    uint capacity = uint(params[1]);
+    uint tile = uint(params[3]);
+    uint segment_begin = block * tile;
+    uint segment_end = min(segment_begin + tile, sequence);
+    uint segment_size = segment_end - segment_begin;
+    uint simd_tile = (segment_size + SIMD_GROUPS - 1u) / SIMD_GROUPS;
+    uint begin = min(
+        segment_begin + simd_group * simd_tile,
+        segment_end);
+    uint end = min(begin + simd_tile, segment_end);
+    uint query_head_base = kv_head * QUERIES_PER_KV;
+
+    float4 queries[QUERIES_PER_KV];
+    float4 accumulators[QUERIES_PER_KV];
+    float current_max[QUERIES_PER_KV];
+    float current_sum[QUERIES_PER_KV];
+    for (uint query_index = 0u;
+         query_index < QUERIES_PER_KV;
+         ++query_index) {
+        uint query_offset =
+            (query_head_base + query_index) * uint(HEAD_DIM) + dimension;
+        queries[query_index] = float4(
+            *reinterpret_cast<device const half4*>(query + query_offset));
+        accumulators[query_index] = float4(0.0f);
+        current_max[query_index] = -INFINITY;
+        current_sum[query_index] = 0.0f;
+    }
+
+    uint token = begin;
+    for (; token + 3u < end; token += 4u) {
+        uint cache_offset0 =
+            (kv_head * capacity + token) * uint(HEAD_DIM) + dimension;
+        uint cache_offset1 = cache_offset0 + uint(HEAD_DIM);
+        uint cache_offset2 = cache_offset1 + uint(HEAD_DIM);
+        uint cache_offset3 = cache_offset2 + uint(HEAD_DIM);
+        float4 key_value0 = float4(
+            *reinterpret_cast<device const half4*>(key + cache_offset0));
+        float4 key_value1 = float4(
+            *reinterpret_cast<device const half4*>(key + cache_offset1));
+        float4 key_value2 = float4(
+            *reinterpret_cast<device const half4*>(key + cache_offset2));
+        float4 key_value3 = float4(
+            *reinterpret_cast<device const half4*>(key + cache_offset3));
+        float4 value_element0 = float4(
+            *reinterpret_cast<device const half4*>(value + cache_offset0));
+        float4 value_element1 = float4(
+            *reinterpret_cast<device const half4*>(value + cache_offset1));
+        float4 value_element2 = float4(
+            *reinterpret_cast<device const half4*>(value + cache_offset2));
+        float4 value_element3 = float4(
+            *reinterpret_cast<device const half4*>(value + cache_offset3));
+        for (uint query_index = 0u;
+             query_index < QUERIES_PER_KV;
+             ++query_index) {
+            float score0 = simd_sum(dot(
+                queries[query_index], key_value0
+            )) * 0.08838834764831845f;
+            float score1 = simd_sum(dot(
+                queries[query_index], key_value1
+            )) * 0.08838834764831845f;
+            float next_max01 = max(
+                current_max[query_index], max(score0, score1));
+            float previous01 = exp(
+                current_max[query_index] - next_max01);
+            float incoming0 = exp(score0 - next_max01);
+            float incoming1 = exp(score1 - next_max01);
+            current_sum[query_index] =
+                current_sum[query_index] * previous01 +
+                incoming0 + incoming1;
+            current_max[query_index] = next_max01;
+            accumulators[query_index] =
+                accumulators[query_index] * previous01 +
+                value_element0 * incoming0 +
+                value_element1 * incoming1;
+
+            float score2 = simd_sum(dot(
+                queries[query_index], key_value2
+            )) * 0.08838834764831845f;
+            float score3 = simd_sum(dot(
+                queries[query_index], key_value3
+            )) * 0.08838834764831845f;
+            float next_max23 = max(
+                current_max[query_index], max(score2, score3));
+            float previous23 = exp(
+                current_max[query_index] - next_max23);
+            float incoming2 = exp(score2 - next_max23);
+            float incoming3 = exp(score3 - next_max23);
+            current_sum[query_index] =
+                current_sum[query_index] * previous23 +
+                incoming2 + incoming3;
+            current_max[query_index] = next_max23;
+            accumulators[query_index] =
+                accumulators[query_index] * previous23 +
+                value_element2 * incoming2 +
+                value_element3 * incoming3;
+        }
+    }
+    for (; token + 1u < end; token += 2u) {
+        uint cache_offset0 =
+            (kv_head * capacity + token) * uint(HEAD_DIM) + dimension;
+        uint cache_offset1 = cache_offset0 + uint(HEAD_DIM);
+        float4 key_value0 = float4(
+            *reinterpret_cast<device const half4*>(key + cache_offset0));
+        float4 key_value1 = float4(
+            *reinterpret_cast<device const half4*>(key + cache_offset1));
+        float4 value_element0 = float4(
+            *reinterpret_cast<device const half4*>(value + cache_offset0));
+        float4 value_element1 = float4(
+            *reinterpret_cast<device const half4*>(value + cache_offset1));
+        for (uint query_index = 0u;
+             query_index < QUERIES_PER_KV;
+             ++query_index) {
+            float score0 = simd_sum(dot(
+                queries[query_index], key_value0
+            )) * 0.08838834764831845f;
+            float score1 = simd_sum(dot(
+                queries[query_index], key_value1
+            )) * 0.08838834764831845f;
+            float next_max = max(
+                current_max[query_index], max(score0, score1));
+            float previous = exp(
+                current_max[query_index] - next_max);
+            float incoming0 = exp(score0 - next_max);
+            float incoming1 = exp(score1 - next_max);
+            current_sum[query_index] =
+                current_sum[query_index] * previous +
+                incoming0 + incoming1;
+            current_max[query_index] = next_max;
+            accumulators[query_index] =
+                accumulators[query_index] * previous +
+                value_element0 * incoming0 +
+                value_element1 * incoming1;
+        }
+    }
+    if (token < end) {
+        uint cache_offset =
+            (kv_head * capacity + token) * uint(HEAD_DIM) + dimension;
+        float4 key_value = float4(
+            *reinterpret_cast<device const half4*>(key + cache_offset));
+        float4 value_element = float4(
+            *reinterpret_cast<device const half4*>(value + cache_offset));
+        for (uint query_index = 0u;
+             query_index < QUERIES_PER_KV;
+             ++query_index) {
+            float score = simd_sum(dot(
+                queries[query_index], key_value
+            )) * 0.08838834764831845f;
+            float next_max = max(current_max[query_index], score);
+            float previous = exp(current_max[query_index] - next_max);
+            float incoming = exp(score - next_max);
+            current_sum[query_index] =
+                current_sum[query_index] * previous + incoming;
+            current_max[query_index] = next_max;
+            accumulators[query_index] =
+                accumulators[query_index] * previous +
+                value_element * incoming;
+        }
+    }
+
+    threadgroup float group_maxima[QUERIES_PER_KV][SIMD_GROUPS];
+    threadgroup float group_sums[QUERIES_PER_KV][SIMD_GROUPS];
+    threadgroup float group_partials
+        [QUERIES_PER_KV][SIMD_GROUPS][HEAD_DIM];
+    threadgroup float combined_maxima[QUERIES_PER_KV];
+    threadgroup float combined_sums[QUERIES_PER_KV];
+    threadgroup float rescale[QUERIES_PER_KV][SIMD_GROUPS];
+    for (uint query_index = 0u;
+         query_index < QUERIES_PER_KV;
+         ++query_index) {
+        if (lane == 0u) {
+            group_maxima[query_index][simd_group] =
+                current_max[query_index];
+            group_sums[query_index][simd_group] =
+                current_sum[query_index];
+        }
+        *reinterpret_cast<threadgroup float4*>(
+            group_partials[query_index][simd_group] + dimension) =
+            accumulators[query_index];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0u) {
+        for (uint query_index = 0u;
+             query_index < QUERIES_PER_KV;
+             ++query_index) {
+            float candidate = lane < SIMD_GROUPS
+                ? group_maxima[query_index][lane]
+                : -INFINITY;
+            float maximum = simd_max(candidate);
+            float factor = lane < SIMD_GROUPS
+                ? exp(candidate - maximum)
+                : 0.0f;
+            if (lane < SIMD_GROUPS) {
+                rescale[query_index][lane] = factor;
+            }
+            float sum = lane < SIMD_GROUPS
+                ? group_sums[query_index][lane] * factor
+                : 0.0f;
+            sum = simd_sum(sum);
+            if (lane == 0u) {
+                combined_maxima[query_index] = maximum;
+                combined_sums[query_index] = sum;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0u) {
+        for (uint query_index = 0u;
+             query_index < QUERIES_PER_KV;
+             ++query_index) {
+            float4 combined = float4(0.0f);
+            for (uint group = 0u; group < SIMD_GROUPS; ++group) {
+                float4 partial =
+                    *reinterpret_cast<threadgroup float4*>(
+                        group_partials[query_index][group] + dimension);
+                combined += partial * rescale[query_index][group];
+            }
+            uint query_head = query_head_base + query_index;
+            uint block_index = query_head * blocks + block;
+            if (lane == 0u) {
+                stats[block_index * 2u] = combined_maxima[query_index];
+                stats[block_index * 2u + 1u] = combined_sums[query_index];
+            }
+            uint partial_offset =
+                block_index * uint(HEAD_DIM) + dimension;
+            *reinterpret_cast<device float4*>(partials + partial_offset) =
+                combined;
+        }
+    }
+)METAL",
+            "#define T half\n"
+            "#define Q_HEADS 32\n"
+            "#define KV_HEADS 8\n"
+            "#define HEAD_DIM 128\n",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+mini_gqa_reduce_kernel() {
+    static const auto kernel = [] {
+        mlx::core::CompileOptions options;
+        options.math_mode = mlx::core::MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_minicpmo_gqa_reduce_32x128_f16",
+            {"stats", "partials", "params"},
+            {"output"},
+            R"METAL(
+    constexpr uint SIMD_GROUPS = 4u;
+    uint query_head = threadgroup_position_in_grid.x;
+    uint dimension = thread_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint blocks = uint(params[0]);
+    threadgroup float reductions[SIMD_GROUPS];
+
+    float local_max = -INFINITY;
+    for (uint block = dimension; block < blocks; block += uint(HEAD_DIM)) {
+        uint index = query_head * blocks + block;
+        local_max = max(local_max, stats[index * 2u]);
+    }
+    local_max = simd_max(local_max);
+    if (lane == 0u) reductions[simd_group] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0u) {
+        float partial = lane < SIMD_GROUPS ? reductions[lane] : -INFINITY;
+        partial = simd_max(partial);
+        if (lane == 0u) reductions[0] = partial;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float global_max = reductions[0];
+
+    float local_sum = 0.0f;
+    for (uint block = dimension; block < blocks; block += uint(HEAD_DIM)) {
+        uint index = query_head * blocks + block;
+        local_sum += stats[index * 2u + 1u] *
+            exp(stats[index * 2u] - global_max);
+    }
+    local_sum = simd_sum(local_sum);
+    if (lane == 0u) reductions[simd_group] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0u) {
+        float partial = lane < SIMD_GROUPS ? reductions[lane] : 0.0f;
+        partial = simd_sum(partial);
+        if (lane == 0u) reductions[0] = partial;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float global_sum = reductions[0];
+
+    float accumulator = 0.0f;
+    for (uint block = 0u; block < blocks; ++block) {
+        uint index = query_head * blocks + block;
+        accumulator += partials[
+            index * uint(HEAD_DIM) + dimension
+        ] * exp(stats[index * 2u] - global_max);
+    }
+    output[query_head * uint(HEAD_DIM) + dimension] =
+        T(accumulator / global_sum);
+)METAL",
+            "#define T half\n"
+            "#define HEAD_DIM 128\n",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+array mini_gqa_attention(
+    const array& query,
+    const array& key_storage,
+    const array& value_storage,
+    int sequence,
+    int capacity) {
+    constexpr int query_heads = 32;
+    constexpr int key_heads = 8;
+    constexpr int head_dim = 128;
+    if (query.shape() != Shape{1, query_heads, 1, head_dim} ||
+        query.dtype() != mlx::core::float16 ||
+        key_storage.shape() !=
+            Shape{1, key_heads, capacity, head_dim} ||
+        value_storage.shape() != key_storage.shape() ||
+        key_storage.dtype() != query.dtype() ||
+        value_storage.dtype() != query.dtype() ||
+        sequence <= 0 || sequence > capacity) {
+        throw std::runtime_error(
+            "unsupported MiniCPM-o fused GQA attention shape");
+    }
+    const auto* hierarchical_setting = std::getenv(
+        "MFQ_MINICPM_HIERARCHICAL_GQA");
+    const bool hierarchical = hierarchical_setting != nullptr
+        ? std::strcmp(hierarchical_setting, "0") != 0
+        : sequence >= 1'024;
+    const int blocks = hierarchical
+        ? std::min(6, (sequence + 1'023) / 1'024)
+        : std::min(48, (sequence + 127) / 128);
+    const int tile = (sequence + blocks - 1) / blocks;
+    const array partial_params(
+        {sequence, capacity, blocks, tile},
+        mlx::core::int32);
+    const auto& partial_kernel = hierarchical
+        ? mini_gqa_hierarchical_partial_kernel()
+        : mini_gqa_partial_kernel();
+    const int partial_threadgroup = hierarchical ? 256 : 32;
+    auto partial = partial_kernel(
+        {query, key_storage, value_storage, partial_params},
+        {
+            Shape{query_heads, blocks, 2},
+            Shape{query_heads, blocks, head_dim},
+        },
+        {
+            mlx::core::float32,
+            mlx::core::float32,
+        },
+        {key_heads * blocks * partial_threadgroup, 1, 1},
+        {partial_threadgroup, 1, 1},
+        {},
+        std::nullopt,
+        false,
+        {});
+    const array reduce_params({blocks}, mlx::core::int32);
+    auto output = mini_gqa_reduce_kernel()(
+        {partial.at(0), partial.at(1), reduce_params},
+        {Shape{1, query_heads, 1, head_dim}},
+        {query.dtype()},
+        {query_heads * head_dim, 1, 1},
+        {head_dim, 1, 1},
+        {},
+        std::nullopt,
+        false,
+        {}).front();
+    return output;
+}
+
+bool use_mini_gqa_attention(int sequence) {
+    // The paired-token GQA kernel crosses MLX SDPA at roughly 1k cached
+    // tokens on large Apple GPUs and pulls progressively farther ahead as the
+    // cache grows. Keep SDPA for the short-cache region where its launch path
+    // is still cheaper.
+    constexpr int automatic_threshold = 1'024;
+    const auto* setting = std::getenv(
+        "MFQ_MINICPM_FUSED_GQA_ATTENTION");
+    if (setting != nullptr) {
+        if (std::strcmp(setting, "0") == 0) return false;
+        if (std::strcmp(setting, "1") == 0) return true;
+    }
+    return sequence >= automatic_threshold;
+}
+
+void report_decode_components(
+    bool enabled,
+    int step,
+    int cache_position,
+    const std::chrono::steady_clock::time_point& started,
+    const detail::ComponentProfile& profile) {
+    if (!enabled) return;
+    const double wall_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started)
+            .count();
+    const double evaluated_ms = profile.evaluated_ms();
+    std::cout
+        << "component_profile model=minicpmo"
+        << " step=" << step
+        << " cache_position=" << cache_position
+        << " wall_ms=" << std::fixed << std::setprecision(3)
+        << wall_ms
+        << " evaluated_ms=" << evaluated_ms
+        << " unscoped_ms="
+        << std::max(0.0, wall_ms - evaluated_ms)
+        << std::endl;
+    for (const auto& [name, timing] : profile.timings()) {
+        std::cout
+            << "component_cost model=minicpmo"
+            << " step=" << step
+            << " name=" << name
+            << " ms=" << timing.elapsed_ms
+            << " calls=" << timing.evaluations
+            << " pct_evaluated="
+            << (evaluated_ms > 0.0
+                    ? 100.0 * timing.elapsed_ms / evaluated_ms
+                    : 0.0)
+            << std::endl;
+    }
 }
 
 array relu(const array& value) {
@@ -109,10 +1404,52 @@ public:
         return as_dtype(output, dtype);
     }
 
+    array add_to(
+        const array& input,
+        const array& residual) const {
+        const auto* fuse = std::getenv(
+            "MFQ_METAL_FUSE_O_RESIDUAL");
+        if (!bias_ &&
+            (fuse == nullptr || std::strcmp(fuse, "0") != 0)) {
+            if (const auto* weight = weight_.nint_weight_ref()) {
+                return as_dtype(
+                    weight->matmul_add(input, residual),
+                    residual.dtype());
+            }
+        }
+        return residual + (*this)(input);
+    }
+
+    const MlxNintWeight* unbiased_nint_weight() const noexcept {
+        return bias_ ? nullptr : weight_.nint_weight_ref();
+    }
+
+    std::optional<MlxGroupedLinearWeightRef>
+    unbiased_grouped_weight() const noexcept {
+        return bias_ ? std::nullopt : weight_.grouped_weight_ref();
+    }
+
 private:
     MlxLinear weight_;
     std::optional<array> bias_;
 };
+
+std::optional<MlxGroupedLinear> make_mini_grouped_linear(
+    std::initializer_list<const MiniLinear*> projections) {
+    std::vector<MlxGroupedLinearWeightRef> weights;
+    weights.reserve(projections.size());
+    for (const auto* projection : projections) {
+        const auto weight = projection->unbiased_grouped_weight();
+        if (!weight) return std::nullopt;
+        weights.push_back(*weight);
+    }
+    return MlxGroupedLinear(std::move(weights));
+}
+
+bool minicpmo_grouped_qkv_enabled() noexcept {
+    const auto* value = std::getenv("MFQ_MINICPM_GROUPED_QKV");
+    return value == nullptr || std::strcmp(value, "0") != 0;
+}
 
 class MiniLayerNorm {
 public:
@@ -303,11 +1640,43 @@ public:
           down_(std::move(down)) {}
 
     array operator()(const array& input) const {
-        const auto gate = gate_(input);
-        return down_(gate * mlx::core::sigmoid(gate) * up_(input));
+        return forward(input, nullptr);
+    }
+
+    array add_to(
+        const array& input,
+        const array& residual) const {
+        return forward(input, &residual);
     }
 
 private:
+    array forward(
+        const array& input,
+        const array* residual) const {
+        const auto* gate_weight = gate_.unbiased_nint_weight();
+        const auto* up_weight = up_.unbiased_nint_weight();
+        if (input.size() == static_cast<std::size_t>(input.shape(-1)) &&
+            gate_weight != nullptr && up_weight != nullptr &&
+            gate_weight->can_fuse_swiglu(*up_weight)) {
+            auto activated = as_dtype(
+                gate_weight->swiglu(*up_weight, input), input.dtype());
+            detail::profile_eval("minicpmo.ffn_gate_up", activated);
+            auto output = residual != nullptr
+                ? down_.add_to(activated, *residual)
+                : down_(activated);
+            detail::profile_eval("minicpmo.ffn_down", output);
+            return output;
+        }
+        const auto gate = gate_(input);
+        const auto up = up_(input);
+        auto activated = gate * mlx::core::sigmoid(gate) * up;
+        detail::profile_eval("minicpmo.ffn_gate_up", activated);
+        auto output = residual != nullptr
+            ? down_.add_to(activated, *residual)
+            : down_(activated);
+        detail::profile_eval("minicpmo.ffn_down", output);
+        return output;
+    }
     MiniLinear gate_;
     MiniLinear up_;
     MiniLinear down_;
@@ -371,7 +1740,9 @@ public:
           query_norm_(std::move(query_norm)),
           key_norm_(std::move(key_norm)),
           ffn_norm_(std::move(ffn_norm)),
-          ffn_(std::move(ffn)) {}
+          ffn_(std::move(ffn)) {
+        qkv_ = make_mini_grouped_linear({&query_, &key_, &value_});
+    }
 
     void reset_cache(int batch, int initial_capacity = 16) {
         cache_ = std::make_unique<MlxKvCache>(
@@ -380,7 +1751,9 @@ public:
             config_.maximum_context,
             config_.head_dim,
             std::min(initial_capacity, config_.maximum_context),
-            mlx::core::bfloat16);
+            config_.model_type == "minicpmo"
+                ? mlx::core::float16
+                : mlx::core::bfloat16);
     }
 
     void clear_cache() noexcept {
@@ -409,7 +1782,8 @@ public:
         const array* positions,
         int position,
         bool use_cache,
-        const std::optional<array>& mask) {
+        const std::optional<array>& mask,
+        const array* shared_rope_table = nullptr) {
         if (input.ndim() != 3 || input.shape(2) != config_.hidden) {
             throw std::runtime_error(
                 "MiniCPM-o Qwen3 block input shape mismatch");
@@ -417,49 +1791,209 @@ public:
         const int batch = input.shape(0);
         const int tokens = input.shape(1);
         auto normalized = attention_norm_(input);
-        auto query = mlx::core::transpose(
-            mlx::core::reshape(
-                query_(normalized),
-                Shape{batch, tokens, config_.query_heads, config_.head_dim}),
-            {0, 2, 1, 3});
-        auto key = mlx::core::transpose(
-            mlx::core::reshape(
-                key_(normalized),
-                Shape{batch, tokens, config_.kv_heads, config_.head_dim}),
-            {0, 2, 1, 3});
-        auto value = mlx::core::transpose(
-            mlx::core::reshape(
-                value_(normalized),
-                Shape{batch, tokens, config_.kv_heads, config_.head_dim}),
-            {0, 2, 1, 3});
-        if (query_norm_) query = (*query_norm_)(query);
-        if (key_norm_) key = (*key_norm_)(key);
-        if (positions) {
-            query = apply_rope(
-                query, *positions, config_.head_dim, config_.rope_base);
-            key = apply_rope(
-                key, *positions, config_.head_dim, config_.rope_base);
+        detail::profile_eval("minicpmo.attention_norm", normalized);
+        std::vector<array> projections;
+        if (tokens == 1 && minicpmo_grouped_qkv_enabled() &&
+            qkv_ && qkv_->supports(normalized)) {
+            projections = (*qkv_)(normalized);
         } else {
-            query = apply_rope(
-                query, config_.head_dim, config_.rope_base, position);
-            key = apply_rope(
-                key, config_.head_dim, config_.rope_base, position);
+            projections = {
+                query_(normalized),
+                key_(normalized),
+                value_(normalized),
+            };
         }
+        auto query_projection = std::move(projections.at(0));
+        auto key_projection = std::move(projections.at(1));
+        auto value_projection = std::move(projections.at(2));
+        detail::profile_eval("minicpmo.q_proj", query_projection);
+        detail::profile_eval("minicpmo.k_proj", key_projection);
+        detail::profile_eval("minicpmo.v_proj", value_projection);
+        array query = query_projection;
+        array key = key_projection;
+        if (use_cache && !cache_) reset_cache(batch);
+        const auto* fused_qk_post = std::getenv(
+            "MFQ_MINICPM_FUSED_QK_POST");
+        const bool use_fused_qk_post =
+            (fused_qk_post == nullptr ||
+             std::strcmp(fused_qk_post, "0") != 0) &&
+            batch == 1 &&
+            tokens == 1 &&
+            positions == nullptr &&
+            query_norm_ && key_norm_ &&
+            query_projection.dtype() == mlx::core::float16 &&
+            key_projection.dtype() == mlx::core::float16 &&
+            value_projection.dtype() == mlx::core::float16;
+        const auto* fused_kv_post = std::getenv(
+            "MFQ_MINICPM_FUSED_KV_POST");
+        const bool use_combined_kv_write =
+            use_fused_qk_post && use_cache && cache_ &&
+            (fused_kv_post == nullptr ||
+             std::strcmp(fused_kv_post, "0") != 0);
+        const auto* inline_kv_post = std::getenv(
+            "MFQ_MINICPM_INLINE_KV_POST");
+        const bool use_inline_kv_post =
+            use_combined_kv_write && shared_rope_table != nullptr &&
+            (inline_kv_post == nullptr ||
+             std::strcmp(inline_kv_post, "0") != 0);
+        if (use_fused_qk_post) {
+            if (use_inline_kv_post) {
+                const int append_position = cache_->position();
+                cache_->reserve_append(1);
+                query = mini_qk_norm_rope_cache(
+                    query_projection,
+                    key_projection,
+                    value_projection,
+                    *shared_rope_table,
+                    *query_norm_,
+                    *key_norm_,
+                    config_.rope_base,
+                    append_position,
+                    cache_->key_storage(),
+                    cache_->value_storage(),
+                    cache_->capacity());
+            } else {
+                auto fused = mini_qk_norm_rope(
+                    query_projection,
+                    key_projection,
+                    *query_norm_,
+                    *key_norm_,
+                    config_.query_heads,
+                    config_.kv_heads,
+                    config_.head_dim,
+                    config_.rope_base,
+                    position);
+                query = std::move(fused.first);
+                key = std::move(fused.second);
+            }
+        } else {
+            query = mlx::core::transpose(
+                mlx::core::reshape(
+                    query_projection,
+                    Shape{
+                        batch,
+                        tokens,
+                        config_.query_heads,
+                        config_.head_dim}),
+                {0, 2, 1, 3});
+            key = mlx::core::transpose(
+                mlx::core::reshape(
+                    key_projection,
+                    Shape{
+                        batch,
+                        tokens,
+                        config_.kv_heads,
+                        config_.head_dim}),
+                {0, 2, 1, 3});
+            if (query_norm_) query = (*query_norm_)(query);
+            if (key_norm_) key = (*key_norm_)(key);
+            if (positions) {
+                query = apply_rope(
+                    query, *positions, config_.head_dim, config_.rope_base);
+                key = apply_rope(
+                    key, *positions, config_.head_dim, config_.rope_base);
+            } else {
+                query = apply_rope(
+                    query, config_.head_dim, config_.rope_base, position);
+                key = apply_rope(
+                    key, config_.head_dim, config_.rope_base, position);
+            }
+        }
+        auto value = use_combined_kv_write
+            ? value_projection
+            : mlx::core::transpose(
+                  mlx::core::reshape(
+                      value_projection,
+                      Shape{
+                          batch,
+                          tokens,
+                          config_.kv_heads,
+                          config_.head_dim,
+                      }),
+                  {0, 2, 1, 3});
+        if (detail::component_profile_active()) {
+            if (use_inline_kv_post) {
+                detail::profile_eval(
+                    "minicpmo.qkv_norm_rope", query);
+            } else {
+                detail::profile_eval(
+                    "minicpmo.qkv_norm_rope",
+                    std::vector<array>{query, key, value});
+            }
+        }
+        const int attention_length = cache_
+            ? cache_->position() + (use_inline_kv_post ? 0 : 1)
+            : 0;
+        const bool use_fused_gqa =
+            use_cache && tokens == 1 && cache_ &&
+            batch == 1 && !mask &&
+            config_.query_heads == 32 &&
+            config_.kv_heads == 8 &&
+            config_.head_dim == 128 &&
+            query.dtype() == mlx::core::float16 &&
+            use_mini_gqa_attention(attention_length);
         array keys = key;
         array values = value;
         if (use_cache) {
-            if (!cache_) reset_cache(batch);
-            auto cached = cache_->append(key, value);
-            keys = std::move(cached.first);
-            values = std::move(cached.second);
+            if (use_combined_kv_write) {
+                if (!use_inline_kv_post) {
+                    const int append_position = cache_->position();
+                    cache_->reserve_append(1);
+                    query = mini_kv_cache_write(
+                        query,
+                        key,
+                        value,
+                        cache_->key_storage(),
+                        cache_->value_storage(),
+                        append_position,
+                        cache_->capacity());
+                }
+                // The fused GQA path reads persistent storage directly. Do
+                // not create two dead slice nodes for every decoder layer.
+                if (!use_fused_gqa) {
+                    auto cached = cache_->view();
+                    keys = std::move(cached.first);
+                    values = std::move(cached.second);
+                }
+            } else {
+                auto cached = cache_->append(key, value);
+                keys = std::move(cached.first);
+                values = std::move(cached.second);
+            }
+            if (detail::component_profile_active() &&
+                !use_combined_kv_write) {
+                detail::profile_eval(
+                    "minicpmo.kv_append",
+                    std::vector<array>{
+                        cache_->key_storage(),
+                        cache_->value_storage(),
+                    });
+            }
         }
-        auto attended = scaled_dot_product_attention(
-            query, keys, values, true, 0.0f, mask);
+        array attended = use_fused_gqa
+            ? mini_gqa_attention(
+                  query,
+                  cache_->key_storage(),
+                  cache_->value_storage(),
+                  cache_->position(),
+                  cache_->capacity())
+            : scaled_dot_product_attention(
+                  query,
+                  keys,
+                  values,
+                  !(use_cache && tokens == 1),
+                  0.0f,
+                  mask);
         attended = mlx::core::reshape(
             mlx::core::transpose(attended, {0, 2, 1, 3}),
             Shape{batch, tokens, config_.query_heads * config_.head_dim});
-        auto residual = input + output_(attended);
-        return residual + ffn_(ffn_norm_(residual));
+        detail::profile_eval("minicpmo.attention", attended);
+        auto residual = output_.add_to(attended, input);
+        detail::profile_eval(
+            "minicpmo.attention_output", residual);
+        auto output = ffn_.add_to(ffn_norm_(residual), residual);
+        detail::profile_eval("minicpmo.ffn", output);
+        return output;
     }
 
 private:
@@ -469,6 +2003,7 @@ private:
     MiniLinear key_;
     MiniLinear value_;
     MiniLinear output_;
+    std::optional<MlxGroupedLinear> qkv_;
     std::optional<MlxRmsNorm> query_norm_;
     std::optional<MlxRmsNorm> key_norm_;
     MlxRmsNorm ffn_norm_;
@@ -518,7 +2053,11 @@ public:
             throw std::runtime_error(
                 "MiniCPM-o Qwen3 token ids must be [batch,tokens]");
         }
-        return embedding_(ids, mlx::core::bfloat16);
+        return embedding_(
+            ids,
+            config_.model_type == "minicpmo"
+                ? mlx::core::float16
+                : mlx::core::bfloat16);
     }
 
     array hidden_forward(
@@ -579,12 +2118,30 @@ public:
             visible = mlx::core::reshape(
                 mlx::core::astype(visible, mlx::core::bool_),
                 Shape{batch, 1, 1, position + tokens});
-            mask = additive_mask(visible, mlx::core::bfloat16);
+            mask = additive_mask(
+                visible,
+                config_.model_type == "minicpmo"
+                    ? mlx::core::float16
+                    : mlx::core::bfloat16);
         }
-        auto hidden = as_dtype(input_embeddings, mlx::core::bfloat16);
+        const auto activation_dtype = config_.model_type == "minicpmo"
+            ? mlx::core::float16
+            : mlx::core::bfloat16;
+        auto hidden = as_dtype(input_embeddings, activation_dtype);
+        std::optional<array> shared_rope_table;
+        if (tokens == 1 && positions == nullptr && use_cache &&
+            config_.model_type == "minicpmo") {
+            shared_rope_table = mini_rope_table(
+                static_cast<float>(config_.rope_base), position);
+        }
         for (auto& block : blocks_) {
             hidden = block.forward(
-                hidden, positions, position, use_cache, mask);
+                hidden,
+                positions,
+                position,
+                use_cache,
+                mask,
+                shared_rope_table ? &*shared_rope_table : nullptr);
         }
         if (use_cache) cache_position_ += tokens;
         return output_norm_(hidden);
@@ -594,7 +2151,40 @@ public:
         auto result = config_.tie_embeddings
             ? embedding_.project(hidden)
             : (*output_)(hidden);
-        return as_dtype(result, mlx::core::bfloat16);
+        return as_dtype(
+            result,
+            config_.model_type == "minicpmo"
+                ? mlx::core::float16
+                : mlx::core::bfloat16);
+    }
+
+    bool supports_fused_greedy() const noexcept {
+        if (config_.tie_embeddings || !output_) return false;
+        const auto* weight = output_->nint_weight_ref();
+        return weight != nullptr && weight->bits() == 6 &&
+            weight->group_size() == 24 &&
+            !weight->q5_execution_layout();
+    }
+
+    array forward_greedy(const array& ids, bool use_cache = true) {
+        auto hidden = hidden_forward(ids, nullptr, nullptr, use_cache);
+        if (hidden.ndim() != 3 || hidden.shape(0) != 1 ||
+            hidden.shape(1) <= 0 || hidden.shape(2) != config_.hidden) {
+            throw std::runtime_error(
+                "MiniCPM-o fused greedy hidden shape is invalid");
+        }
+        hidden = mlx::core::reshape(
+            mlx::core::slice(
+                hidden,
+                Shape{0, hidden.shape(1) - 1, 0},
+                Shape{1, hidden.shape(1), config_.hidden}),
+            Shape{1, config_.hidden});
+        auto token = output_->greedy_argmax(hidden);
+        if (!token) {
+            throw std::runtime_error(
+                "MiniCPM-o fused greedy layout became unavailable");
+        }
+        return std::move(*token);
     }
 
     array forward(const array& ids, bool use_cache = true) {
@@ -737,6 +2327,30 @@ public:
     static VisionAttention load(
         const MfqContainer& model,
         const std::string& prefix) {
+        const auto* fuse_value = std::getenv(
+            "MFQ_METAL_VISION_FUSED_QKV");
+        const bool fuse_qkv =
+            fuse_value == nullptr || std::strcmp(fuse_value, "0") != 0;
+        if (fuse_qkv) {
+            auto weight = mlx::core::concatenate(
+                {
+                    dense(model, prefix + ".q_proj.weight"),
+                    dense(model, prefix + ".k_proj.weight"),
+                    dense(model, prefix + ".v_proj.weight"),
+                },
+                0);
+            auto bias = mlx::core::concatenate(
+                {
+                    dense(model, prefix + ".q_proj.bias"),
+                    dense(model, prefix + ".k_proj.bias"),
+                    dense(model, prefix + ".v_proj.bias"),
+                },
+                0);
+            return VisionAttention(
+                std::move(weight),
+                std::move(bias),
+                MiniLinear::load(model, prefix + ".out_proj"));
+        }
         return VisionAttention(
             MiniLinear::load(model, prefix + ".q_proj"),
             MiniLinear::load(model, prefix + ".k_proj"),
@@ -754,6 +2368,17 @@ public:
           value_(std::move(value)),
           output_(std::move(output)) {}
 
+    VisionAttention(
+        array qkv_weight,
+        array qkv_bias,
+        MiniLinear output)
+        : qkv_weight_(std::move(qkv_weight)),
+          qkv_bias_(std::move(qkv_bias)),
+          output_(std::move(output)) {
+        qkv_weight_->eval();
+        qkv_bias_->eval();
+    }
+
     array operator()(
         const array& input,
         const std::optional<array>& mask) const {
@@ -766,10 +2391,29 @@ public:
                     Shape{batch, tokens, 16, 72}),
                 {0, 2, 1, 3});
         };
+        array query = input;
+        array key = input;
+        array value = input;
+        if (qkv_weight_) {
+            auto pieces = mlx::core::split(
+                dense_linear(
+                    input,
+                    *qkv_weight_,
+                    qkv_bias_),
+                3,
+                -1);
+            query = std::move(pieces.at(0));
+            key = std::move(pieces.at(1));
+            value = std::move(pieces.at(2));
+        } else {
+            query = (*query_)(input);
+            key = (*key_)(input);
+            value = (*value_)(input);
+        }
         auto attended = scaled_dot_product_attention(
-            project(query_(input)),
-            project(key_(input)),
-            project(value_(input)),
+            project(std::move(query)),
+            project(std::move(key)),
+            project(std::move(value)),
             false,
             1.0f / std::sqrt(72.0f),
             mask);
@@ -780,9 +2424,11 @@ public:
     }
 
 private:
-    MiniLinear query_;
-    MiniLinear key_;
-    MiniLinear value_;
+    std::optional<MiniLinear> query_;
+    std::optional<MiniLinear> key_;
+    std::optional<MiniLinear> value_;
+    std::optional<array> qkv_weight_;
+    std::optional<array> qkv_bias_;
     MiniLinear output_;
 };
 
@@ -906,6 +2552,9 @@ public:
         const auto active_mask = host_bool(mask, "patch mask");
         std::vector<std::int32_t> position_ids(embedded.shape(0) * embedded.shape(1));
         bool all_active = true;
+        bool uniform_geometry = embedded.shape(0) > 0;
+        const auto first_height = embedded.shape(0) > 0 ? sizes.at(0) : 0;
+        const auto first_width = embedded.shape(0) > 0 ? sizes.at(1) : 0;
         for (int batch = 0; batch < embedded.shape(0); ++batch) {
             const auto height = sizes.at(2 * batch);
             const auto width = sizes.at(2 * batch + 1);
@@ -914,6 +2563,8 @@ public:
                 throw std::runtime_error(
                     "MiniCPM-o target patch size is invalid");
             }
+            uniform_geometry = uniform_geometry &&
+                height == first_height && width == first_width;
             std::int64_t active = 0;
             for (int patch = 0; patch < embedded.shape(1); ++patch) {
                 if (!active_mask.at(batch * embedded.shape(1) + patch)) {
@@ -937,13 +2588,28 @@ public:
                     "MiniCPM-o patch mask active count disagrees with target size");
             }
         }
-        const array ids(
-            position_ids.begin(),
-            Shape{embedded.shape(0), embedded.shape(1)},
-            mlx::core::int32);
-        embedded = embedded + as_dtype(
-            mlx::core::take(position_embedding_, ids, 0),
-            embedded.dtype());
+        const auto* shared_position_value = std::getenv(
+            "MFQ_METAL_VISION_SHARED_POSITION");
+        const bool shared_position =
+            shared_position_value == nullptr ||
+            std::strcmp(shared_position_value, "0") != 0;
+        array position = [&] {
+            if (shared_position && uniform_geometry && all_active) {
+                const array ids(
+                    position_ids.begin(),
+                    Shape{embedded.shape(1)},
+                    mlx::core::int32);
+                return mlx::core::expand_dims(
+                    mlx::core::take(position_embedding_, ids, 0),
+                    0);
+            }
+            const array ids(
+                position_ids.begin(),
+                Shape{embedded.shape(0), embedded.shape(1)},
+                mlx::core::int32);
+            return mlx::core::take(position_embedding_, ids, 0);
+        }();
+        embedded = embedded + as_dtype(position, embedded.dtype());
 
         std::optional<array> attention_mask;
         if (!all_active) {
@@ -952,10 +2618,46 @@ public:
                 Shape{embedded.shape(0), 1, 1, embedded.shape(1)});
             attention_mask = additive_mask(visible, embedded.dtype());
         }
-        for (const auto& layer : layers_) {
-            embedded = layer(embedded, attention_mask);
+        const auto encode = [&](array hidden,
+                                const std::optional<array>& local_mask) {
+            for (const auto& layer : layers_) {
+                hidden = layer(hidden, local_mask);
+            }
+            return post_norm_(hidden);
+        };
+        const int chunk_size = minicpmo_vision_batch_size();
+        if (chunk_size <= 0 || embedded.shape(0) <= chunk_size ||
+            !minicpmo_vision_batchable_length(embedded.shape(1)) ||
+            !uniform_geometry || !all_active) {
+            return encode(std::move(embedded), attention_mask);
         }
-        return post_norm_(embedded);
+
+        std::vector<array> chunks;
+        chunks.reserve(
+            (embedded.shape(0) + chunk_size - 1) / chunk_size);
+        for (int begin = 0; begin < embedded.shape(0);) {
+            const int remaining = embedded.shape(0) - begin;
+            const int current_size = remaining == chunk_size + 1
+                ? remaining
+                : std::min(chunk_size, remaining);
+            const int end = begin + current_size;
+            auto chunk = mlx::core::slice(
+                embedded,
+                Shape{begin, 0, 0},
+                Shape{end, embedded.shape(1), embedded.shape(2)});
+            std::optional<array> chunk_mask;
+            if (attention_mask) {
+                chunk_mask = mlx::core::slice(
+                    *attention_mask,
+                    Shape{begin, 0, 0, 0},
+                    Shape{end, 1, 1, attention_mask->shape(3)});
+            }
+            chunk = encode(std::move(chunk), chunk_mask);
+            chunk.eval();
+            chunks.push_back(std::move(chunk));
+            begin = end;
+        }
+        return mlx::core::concatenate(chunks, 0);
     }
 
 private:
@@ -1044,6 +2746,24 @@ public:
             throw std::runtime_error(
                 "MiniCPM-o Resampler tensor shapes disagree with version 4.5");
         }
+
+        // The learned queries and their Q projection are model constants.
+        // Projecting a [batch, 64, 4096] broadcast repeats the same large
+        // GEMM once per image.  Materialize the single [64, 4096] result at
+        // load time and only broadcast the projected queries per request.
+        // This is algebraically identical and matters especially for video
+        // batches containing tens or hundreds of frames.
+        projected_query_ = dense_linear(
+            query_norm_(query_),
+            mlx::core::slice(
+                in_weight_,
+                Shape{0, 0},
+                Shape{4096, 4096}),
+            mlx::core::slice(
+                in_bias_,
+                Shape{0},
+                Shape{4096}));
+        projected_query_.eval();
     }
 
     array operator()(
@@ -1055,11 +2775,67 @@ public:
             throw std::runtime_error(
                 "MiniCPM-o Resampler input geometry is invalid");
         }
+        const int chunk_size = minicpmo_vision_batch_size();
+        bool uniform_full_geometry = input.shape(0) > 0;
+        if (uniform_full_geometry) {
+            const auto sizes = host_i64(
+                target_sizes, "Resampler target sizes");
+            const auto first_height = sizes.at(0);
+            const auto first_width = sizes.at(1);
+            for (int index = 0; index < input.shape(0); ++index) {
+                const auto height = sizes.at(index * 2);
+                const auto width = sizes.at(index * 2 + 1);
+                uniform_full_geometry = uniform_full_geometry &&
+                    height == first_height && width == first_width &&
+                    height * width == input.shape(1);
+            }
+        }
+        if (chunk_size <= 0 || input.shape(0) <= chunk_size ||
+            !minicpmo_vision_batchable_length(input.shape(1)) ||
+            !uniform_full_geometry) {
+            return forward_batch(input, target_sizes);
+        }
+
+        std::vector<array> chunks;
+        chunks.reserve((input.shape(0) + chunk_size - 1) / chunk_size);
+        for (int begin = 0; begin < input.shape(0);) {
+            const int remaining = input.shape(0) - begin;
+            const int current_size = remaining == chunk_size + 1
+                ? remaining
+                : std::min(chunk_size, remaining);
+            const int end = begin + current_size;
+            auto chunk = forward_batch(
+                mlx::core::slice(
+                    input,
+                    Shape{begin, 0, 0},
+                    Shape{end, input.shape(1), input.shape(2)}),
+                mlx::core::slice(
+                    target_sizes,
+                    Shape{begin, 0},
+                    Shape{end, target_sizes.shape(1)}));
+            chunk.eval();
+            chunks.push_back(std::move(chunk));
+            begin = end;
+        }
+        return mlx::core::concatenate(chunks, 0);
+    }
+
+    array forward_batch(
+        const array& input,
+        const array& target_sizes) const {
+        if (input.ndim() != 3 || input.shape(2) != 1152 ||
+            target_sizes.ndim() != 2 || target_sizes.shape(1) != 2 ||
+            target_sizes.shape(0) != input.shape(0)) {
+            throw std::runtime_error(
+                "MiniCPM-o Resampler input geometry is invalid");
+        }
         const int batch = input.shape(0);
         const int length = input.shape(1);
         const auto sizes = host_i64(target_sizes, "Resampler target sizes");
-        std::vector<array> positions;
-        positions.reserve(batch);
+        bool uniform_geometry = batch > 0;
+        bool all_visible = true;
+        const auto first_height = batch > 0 ? sizes.at(0) : 0;
+        const auto first_width = batch > 0 ? sizes.at(1) : 0;
         std::vector<std::uint8_t> visible_values(batch * length, 0);
         for (int index = 0; index < batch; ++index) {
             const auto height = sizes.at(index * 2);
@@ -1070,42 +2846,69 @@ public:
                 throw std::runtime_error(
                     "MiniCPM-o Resampler target size is invalid");
             }
-            auto position = mlx::core::slice(
-                position_embedding_,
-                Shape{0, 0, 0},
-                Shape{static_cast<int>(height), static_cast<int>(width), 4096});
-            position = mlx::core::reshape(
-                position,
-                Shape{static_cast<int>(patches), 4096});
-            if (patches < length) {
-                position = mlx::core::concatenate(
-                    {position,
-                     mlx::core::zeros(
-                         Shape{length - static_cast<int>(patches), 4096},
-                         position.dtype())},
-                    0);
-            }
-            positions.push_back(std::move(position));
+            uniform_geometry = uniform_geometry &&
+                height == first_height && width == first_width;
+            all_visible = all_visible && patches == length;
             for (int patch = 0; patch < patches; ++patch) {
                 visible_values[index * length + patch] = 1;
             }
         }
-        auto position = mlx::core::stack(positions, 0);
-        const array visible_raw(
-            visible_values.begin(),
-            Shape{batch, length},
-            mlx::core::uint8);
-        auto mask = additive_mask(
-            mlx::core::reshape(
-                mlx::core::astype(visible_raw, mlx::core::bool_),
-                Shape{batch, 1, 1, length}),
-            input.dtype());
+        const auto make_position = [&](std::int64_t height,
+                                       std::int64_t width) {
+            const auto patches = height * width;
+            auto value = mlx::core::slice(
+                position_embedding_,
+                Shape{0, 0, 0},
+                Shape{
+                    static_cast<int>(height),
+                    static_cast<int>(width),
+                    4096});
+            value = mlx::core::reshape(
+                value,
+                Shape{static_cast<int>(patches), 4096});
+            if (patches < length) {
+                value = mlx::core::concatenate(
+                    {value,
+                     mlx::core::zeros(
+                         Shape{length - static_cast<int>(patches), 4096},
+                         value.dtype())},
+                    0);
+            }
+            return value;
+        };
+        const auto* shared_position_value = std::getenv(
+            "MFQ_METAL_VISION_SHARED_POSITION");
+        const bool shared_position =
+            shared_position_value == nullptr ||
+            std::strcmp(shared_position_value, "0") != 0;
+        array position = [&] {
+            if (shared_position && uniform_geometry) {
+                return mlx::core::expand_dims(
+                    make_position(first_height, first_width),
+                    0);
+            }
+            std::vector<array> positions;
+            positions.reserve(batch);
+            for (int index = 0; index < batch; ++index) {
+                positions.push_back(make_position(
+                    sizes.at(index * 2),
+                    sizes.at(index * 2 + 1)));
+            }
+            return mlx::core::stack(positions, 0);
+        }();
+        std::optional<array> mask;
+        if (!shared_position || !all_visible) {
+            const array visible_raw(
+                visible_values.begin(),
+                Shape{batch, length},
+                mlx::core::uint8);
+            mask = additive_mask(
+                mlx::core::reshape(
+                    mlx::core::astype(visible_raw, mlx::core::bool_),
+                    Shape{batch, 1, 1, length}),
+                input.dtype());
+        }
 
-        auto kv = kv_norm_(kv_projection_(input));
-        auto normalized_query = query_norm_(query_);
-        auto repeated_query = mlx::core::broadcast_to(
-            mlx::core::expand_dims(normalized_query, 0),
-            Shape{batch, 64, 4096});
         const auto projection = [&](
             const array& value,
             int offset) {
@@ -1120,9 +2923,29 @@ public:
                     Shape{offset},
                     Shape{offset + 4096}));
         };
+        auto kv = kv_norm_(kv_projection_(input));
+        const auto* projected_query_value = std::getenv(
+            "MFQ_METAL_RESAMPLER_PROJECTED_QUERY");
+        const bool use_projected_query =
+            projected_query_value == nullptr ||
+            std::strcmp(projected_query_value, "0") != 0;
+        array repeated_query = [&] {
+            if (use_projected_query) {
+                return mlx::core::contiguous(
+                    mlx::core::broadcast_to(
+                        mlx::core::expand_dims(projected_query_, 0),
+                        Shape{batch, 64, 4096}));
+            }
+            auto normalized_query = query_norm_(query_);
+            return projection(
+                mlx::core::broadcast_to(
+                    mlx::core::expand_dims(normalized_query, 0),
+                    Shape{batch, 64, 4096}),
+                0);
+        }();
         auto query = mlx::core::transpose(
             mlx::core::reshape(
-                projection(repeated_query, 0),
+                repeated_query,
                 Shape{batch, 64, 32, 128}),
             {0, 2, 1, 3});
         auto key = mlx::core::transpose(
@@ -1141,7 +2964,9 @@ public:
             value,
             false,
             1.0f / std::sqrt(128.0f),
-            mask);
+            mask
+                ? std::optional<array>(as_dtype(*mask, query.dtype()))
+                : std::nullopt);
         attended = mlx::core::reshape(
             mlx::core::transpose(attended, {0, 2, 1, 3}),
             Shape{batch, 64, 4096});
@@ -1169,6 +2994,7 @@ private:
     array out_weight_;
     array out_bias_;
     array final_projection_;
+    array projected_query_{0.0f};
 };
 
 class WhisperAttention {
@@ -1176,6 +3002,33 @@ public:
     static WhisperAttention load(
         const MfqContainer& model,
         const std::string& prefix) {
+        const auto* fuse_value = std::getenv(
+            "MFQ_METAL_AUDIO_FUSED_QKV");
+        const bool fuse_qkv =
+            fuse_value == nullptr || std::strcmp(fuse_value, "0") != 0;
+        if (fuse_qkv) {
+            auto query_bias = dense(model, prefix + ".q_proj.bias");
+            auto value_bias = dense(model, prefix + ".v_proj.bias");
+            auto weight = mlx::core::concatenate(
+                {
+                    dense(model, prefix + ".q_proj.weight"),
+                    dense(model, prefix + ".k_proj.weight"),
+                    dense(model, prefix + ".v_proj.weight"),
+                },
+                0);
+            auto bias = mlx::core::concatenate(
+                {
+                    query_bias,
+                    mlx::core::zeros(
+                        Shape{query_bias.shape(0)}, query_bias.dtype()),
+                    value_bias,
+                },
+                0);
+            return WhisperAttention(
+                std::move(weight),
+                std::move(bias),
+                MiniLinear::load(model, prefix + ".out_proj"));
+        }
         return WhisperAttention(
             MiniLinear::load(model, prefix + ".q_proj"),
             MiniLinear::load(model, prefix + ".k_proj", false),
@@ -1193,6 +3046,17 @@ public:
           value_(std::move(value)),
           output_(std::move(output)) {}
 
+    WhisperAttention(
+        array qkv_weight,
+        array qkv_bias,
+        MiniLinear output)
+        : qkv_weight_(std::move(qkv_weight)),
+          qkv_bias_(std::move(qkv_bias)),
+          output_(std::move(output)) {
+        qkv_weight_->eval();
+        qkv_bias_->eval();
+    }
+
     array forward(
         const array& input,
         const std::optional<array>& mask,
@@ -1207,9 +3071,25 @@ public:
                     Shape{batch, tokens, 16, 64}),
                 {0, 2, 1, 3});
         };
-        auto query = project(query_(input));
-        auto key = project(key_(input));
-        auto value = project(value_(input));
+        array query = input;
+        array key = input;
+        array value = input;
+        if (qkv_weight_) {
+            auto pieces = mlx::core::split(
+                dense_linear(input, *qkv_weight_, qkv_bias_),
+                3,
+                -1);
+            query = std::move(pieces.at(0));
+            key = std::move(pieces.at(1));
+            value = std::move(pieces.at(2));
+        } else {
+            query = (*query_)(input);
+            key = (*key_)(input);
+            value = (*value_)(input);
+        }
+        query = project(std::move(query));
+        key = project(std::move(key));
+        value = project(std::move(value));
         if (key_cache && value_cache) {
             if (*key_cache) {
                 key = mlx::core::concatenate({**key_cache, key}, 2);
@@ -1232,9 +3112,11 @@ public:
     }
 
 private:
-    MiniLinear query_;
-    MiniLinear key_;
-    MiniLinear value_;
+    std::optional<MiniLinear> query_;
+    std::optional<MiniLinear> key_;
+    std::optional<MiniLinear> value_;
+    std::optional<array> qkv_weight_;
+    std::optional<array> qkv_bias_;
     MiniLinear output_;
 };
 
@@ -1493,9 +3375,16 @@ public:
                 Shape{past, 0},
                 Shape{past + tokens, 1024}),
             hidden.dtype());
-        const auto mask = mlx::core::zeros(
-            Shape{1, 1, tokens, past + tokens},
-            hidden.dtype());
+        const auto* omit_mask_value = std::getenv(
+            "MFQ_METAL_AUDIO_STREAMING_NO_MASK");
+        const bool omit_mask =
+            omit_mask_value == nullptr ||
+            std::strcmp(omit_mask_value, "0") != 0;
+        const std::optional<array> mask = omit_mask
+            ? std::nullopt
+            : std::optional<array>(mlx::core::zeros(
+                  Shape{1, 1, tokens, past + tokens},
+                  hidden.dtype()));
         for (auto& layer : layers_) {
             hidden = layer.forward(hidden, mask, true);
         }
@@ -1927,6 +3816,285 @@ array last_logits(const array& logits, int vocab) {
 
 namespace detail {
 
+void test_minicpmo45_qk_norm_rope() {
+    constexpr int query_heads = 32;
+    constexpr int key_heads = 8;
+    constexpr int head_dim = 128;
+    constexpr float eps = 1e-6f;
+    constexpr float base = 1'000'000.0f;
+    std::vector<float> query_values(query_heads * head_dim);
+    std::vector<float> key_values(key_heads * head_dim);
+    std::vector<float> value_values(key_heads * head_dim);
+    std::vector<float> norm_values(head_dim);
+    for (std::size_t index = 0;
+         index < query_values.size();
+         ++index) {
+        query_values[index] = 0.4f * std::sin(
+            static_cast<float>(index + 7) * 0.031f);
+    }
+    for (std::size_t index = 0;
+         index < key_values.size();
+         ++index) {
+        key_values[index] = 0.35f * std::cos(
+            static_cast<float>(index + 11) * 0.043f);
+        value_values[index] = 0.3f * std::sin(
+            static_cast<float>(index + 17) * 0.037f);
+    }
+    for (std::size_t index = 0;
+         index < norm_values.size();
+         ++index) {
+        norm_values[index] = 0.8f +
+            0.003f * static_cast<float>(index);
+    }
+    const auto query_projection = mlx::core::astype(
+        array(
+            query_values.begin(),
+            Shape{1, 1, query_heads * head_dim}),
+        mlx::core::float16);
+    const auto key_projection = mlx::core::astype(
+        array(
+            key_values.begin(),
+            Shape{1, 1, key_heads * head_dim}),
+        mlx::core::float16);
+    const auto value_projection = mlx::core::astype(
+        array(
+            value_values.begin(),
+            Shape{1, 1, key_heads * head_dim}),
+        mlx::core::float16);
+    const MlxRmsNorm query_norm(
+        array(norm_values.begin(), Shape{head_dim}),
+        eps);
+    const MlxRmsNorm key_norm(
+        array(norm_values.begin(), Shape{head_dim}),
+        eps);
+
+    for (const int position : {0, 513, 8'556}) {
+        auto fused = mini_qk_norm_rope(
+            query_projection,
+            key_projection,
+            query_norm,
+            key_norm,
+            query_heads,
+            key_heads,
+            head_dim,
+            base,
+            position);
+        auto reference_query = apply_rope(
+            query_norm(mlx::core::transpose(
+                mlx::core::reshape(
+                    query_projection,
+                    Shape{1, 1, query_heads, head_dim}),
+                {0, 2, 1, 3})),
+            head_dim,
+            base,
+            position);
+        auto reference_key = apply_rope(
+            key_norm(mlx::core::transpose(
+                mlx::core::reshape(
+                    key_projection,
+                    Shape{1, 1, key_heads, head_dim}),
+                {0, 2, 1, 3})),
+            head_dim,
+            base,
+            position);
+        auto query_difference = mlx::core::max(mlx::core::abs(
+            mlx::core::astype(fused.first, mlx::core::float32) -
+            mlx::core::astype(reference_query, mlx::core::float32)));
+        auto key_difference = mlx::core::max(mlx::core::abs(
+            mlx::core::astype(fused.second, mlx::core::float32) -
+            mlx::core::astype(reference_key, mlx::core::float32)));
+        mlx::core::eval(query_difference, key_difference);
+        const float maximum = std::max(
+            query_difference.item<float>(),
+            key_difference.item<float>());
+        if (!std::isfinite(maximum) || maximum > 0.002f) {
+            throw std::runtime_error(
+                "MiniCPM-o fused Q/K post-processing mismatch at " +
+                std::to_string(position) + ": " +
+                std::to_string(maximum));
+        }
+    }
+
+    constexpr int capacity = 9'216;
+    constexpr int position = 8'556;
+    auto key_cache = mlx::core::zeros(
+        Shape{1, key_heads, capacity, head_dim},
+        mlx::core::float16);
+    auto value_cache = mlx::core::zeros(
+        key_cache.shape(), mlx::core::float16);
+    mlx::core::eval(key_cache, value_cache);
+    auto normalized = mini_qk_norm_rope(
+        query_projection,
+        key_projection,
+        query_norm,
+        key_norm,
+        query_heads,
+        key_heads,
+        head_dim,
+        base,
+        position);
+    auto reference_value = mlx::core::transpose(
+        mlx::core::reshape(
+            value_projection,
+            Shape{1, 1, key_heads, head_dim}),
+        {0, 2, 1, 3});
+    auto written_query = mini_kv_cache_write(
+        normalized.first,
+        normalized.second,
+        reference_value,
+        key_cache,
+        value_cache,
+        position,
+        capacity);
+    written_query.eval();
+    const auto cached_key = mlx::core::slice(
+        key_cache,
+        Shape{0, 0, position, 0},
+        Shape{1, key_heads, position + 1, head_dim});
+    const auto cached_value = mlx::core::slice(
+        value_cache,
+        Shape{0, 0, position, 0},
+        Shape{1, key_heads, position + 1, head_dim});
+    auto query_difference = mlx::core::max(mlx::core::abs(
+        mlx::core::astype(written_query, mlx::core::float32) -
+        mlx::core::astype(normalized.first, mlx::core::float32)));
+    auto key_difference = mlx::core::max(mlx::core::abs(
+        mlx::core::astype(cached_key, mlx::core::float32) -
+        mlx::core::astype(normalized.second, mlx::core::float32)));
+    auto value_difference = mlx::core::max(mlx::core::abs(
+        mlx::core::astype(cached_value, mlx::core::float32) -
+        mlx::core::astype(reference_value, mlx::core::float32)));
+    mlx::core::eval(
+        query_difference, key_difference, value_difference);
+    const float maximum = std::max({
+        query_difference.item<float>(),
+        key_difference.item<float>(),
+        value_difference.item<float>(),
+    });
+    if (!std::isfinite(maximum) || maximum > 0.0f) {
+        throw std::runtime_error(
+            "MiniCPM-o combined KV cache write mismatch: " +
+            std::to_string(maximum));
+    }
+
+    auto inline_key_cache = mlx::core::zeros(
+        Shape{1, key_heads, capacity, head_dim},
+        mlx::core::float16);
+    auto inline_value_cache = mlx::core::zeros(
+        inline_key_cache.shape(), mlx::core::float16);
+    mlx::core::eval(inline_key_cache, inline_value_cache);
+    auto rope_table = mini_rope_table(base, position);
+    auto inline_query = mini_qk_norm_rope_cache(
+        query_projection,
+        key_projection,
+        value_projection,
+        rope_table,
+        query_norm,
+        key_norm,
+        base,
+        position,
+        inline_key_cache,
+        inline_value_cache,
+        capacity);
+    inline_query.eval();
+    const auto inline_key = mlx::core::slice(
+        inline_key_cache,
+        Shape{0, 0, position, 0},
+        Shape{1, key_heads, position + 1, head_dim});
+    const auto inline_value = mlx::core::slice(
+        inline_value_cache,
+        Shape{0, 0, position, 0},
+        Shape{1, key_heads, position + 1, head_dim});
+    auto inline_query_difference = mlx::core::max(mlx::core::abs(
+        mlx::core::astype(inline_query, mlx::core::float32) -
+        mlx::core::astype(written_query, mlx::core::float32)));
+    auto inline_key_difference = mlx::core::max(mlx::core::abs(
+        mlx::core::astype(inline_key, mlx::core::float32) -
+        mlx::core::astype(cached_key, mlx::core::float32)));
+    auto inline_value_difference = mlx::core::max(mlx::core::abs(
+        mlx::core::astype(inline_value, mlx::core::float32) -
+        mlx::core::astype(cached_value, mlx::core::float32)));
+    mlx::core::eval(
+        inline_query_difference,
+        inline_key_difference,
+        inline_value_difference);
+    const float inline_maximum = std::max({
+        inline_query_difference.item<float>(),
+        inline_key_difference.item<float>(),
+        inline_value_difference.item<float>(),
+    });
+    if (!std::isfinite(inline_maximum) || inline_maximum > 0.0f) {
+        throw std::runtime_error(
+            "MiniCPM-o inline Q/K cache write changed FP16 values: " +
+            std::to_string(inline_maximum));
+    }
+}
+
+void test_minicpmo45_gqa_attention() {
+    constexpr int query_heads = 32;
+    constexpr int key_heads = 8;
+    constexpr int head_dim = 128;
+    constexpr int capacity = 9'216;
+    std::vector<float> query_values(query_heads * head_dim);
+    std::vector<float> key_values(
+        static_cast<std::size_t>(key_heads * capacity * head_dim));
+    std::vector<float> value_values(key_values.size());
+    for (std::size_t index = 0; index < query_values.size(); ++index) {
+        query_values[index] = 0.2f * std::sin(
+            static_cast<float>(index + 13) * 0.017f);
+    }
+    for (std::size_t index = 0; index < key_values.size(); ++index) {
+        key_values[index] = 0.18f * std::cos(
+            static_cast<float>(index + 19) * 0.0031f);
+        value_values[index] = 0.22f * std::sin(
+            static_cast<float>(index + 29) * 0.0027f);
+    }
+    const auto query = mlx::core::astype(
+        array(
+            query_values.begin(),
+            Shape{1, query_heads, 1, head_dim}),
+        mlx::core::float16);
+    const auto keys = mlx::core::astype(
+        array(
+            key_values.begin(),
+            Shape{1, key_heads, capacity, head_dim}),
+        mlx::core::float16);
+    const auto values = mlx::core::astype(
+        array(
+            value_values.begin(),
+            Shape{1, key_heads, capacity, head_dim}),
+        mlx::core::float16);
+
+    for (const int sequence : {257, 1'025, 9'001}) {
+        auto fused = mini_gqa_attention(
+            query, keys, values, sequence, capacity);
+        const auto key_slice = mlx::core::slice(
+            keys,
+            Shape{0, 0, 0, 0},
+            Shape{1, key_heads, sequence, head_dim});
+        const auto value_slice = mlx::core::slice(
+            values,
+            Shape{0, 0, 0, 0},
+            Shape{1, key_heads, sequence, head_dim});
+        auto reference = scaled_dot_product_attention(
+            query,
+            key_slice,
+            value_slice,
+            false);
+        auto difference = mlx::core::max(mlx::core::abs(
+            mlx::core::astype(fused, mlx::core::float32) -
+            mlx::core::astype(reference, mlx::core::float32)));
+        difference.eval();
+        const float maximum = difference.item<float>();
+        if (!std::isfinite(maximum) || maximum > 0.002f) {
+            throw std::runtime_error(
+                "MiniCPM-o fused GQA attention mismatch at " +
+                std::to_string(sequence) + ": " +
+                std::to_string(maximum));
+        }
+    }
+}
+
 void test_minicpmo45_qwen3_cache_equivalence() {
     MiniQwen3Config config;
     config.model_type = "minicpmo-test";
@@ -2324,6 +4492,7 @@ MlxMiniCPMO45Runtime MlxMiniCPMO45Runtime::load(
     const MfqContainer& model,
     std::int64_t context_size,
     bool load_modalities) {
+    configure_minicpmo_sdpa();
     auto config = language_config(model, context_size);
     auto language = MiniQwen3Language::load(
         model, config, language_names());
@@ -2358,7 +4527,7 @@ MlxMiniCPMO45Runtime& MlxMiniCPMO45Runtime::operator=(
 
 MlxMiniCPMO45Runtime::~MlxMiniCPMO45Runtime() = default;
 
-MlxMiniCPMO45ForwardResult MlxMiniCPMO45Runtime::forward(
+MlxMiniCPMO45ForwardResult MlxMiniCPMO45Runtime::prepare_inputs(
     const MlxMiniCPMO45Inputs& inputs) {
     auto ids = inputs.input_ids.ndim() == 1
         ? mlx::core::expand_dims(inputs.input_ids, 0)
@@ -2383,13 +4552,32 @@ MlxMiniCPMO45ForwardResult MlxMiniCPMO45Runtime::forward(
             throw std::runtime_error(
                 "MiniCPM-o image bounds require loaded image components");
         }
+        const bool profile_vision = minicpmo_vision_profile_enabled();
+        const auto vision_started = std::chrono::steady_clock::now();
         result.vision_states = (*implementation_->vision)(
             *inputs.pixel_values,
             *inputs.patch_mask,
             *inputs.target_sizes);
+        if (profile_vision) {
+            result.vision_states->eval();
+            std::cerr << "minicpmo_vision_profile stage=vpm ms="
+                      << std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - vision_started)
+                             .count()
+                      << '\n';
+        }
+        const auto resampler_started = std::chrono::steady_clock::now();
         result.image_embeddings = (*implementation_->resampler)(
             *result.vision_states,
             *inputs.target_sizes);
+        if (profile_vision) {
+            result.image_embeddings->eval();
+            std::cerr << "minicpmo_vision_profile stage=resampler ms="
+                      << std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - resampler_started)
+                             .count()
+                      << '\n';
+        }
         for (const auto& bound : image_bounds) {
             if (bound.batch >= ids.shape(0) ||
                 bound.source >= result.image_embeddings->shape(0) ||
@@ -2422,6 +4610,7 @@ MlxMiniCPMO45ForwardResult MlxMiniCPMO45Runtime::forward(
         implementation_->audio->reset();
         result.audio_embeddings = implementation_->audio->forward(
             *inputs.audio_features, *inputs.audio_lengths, false);
+        log_audio_bitwise_hash(*result.audio_embeddings);
         const auto lengths =
             AudioEncoder::pooled_lengths(*inputs.audio_lengths);
         for (const auto& bound : audio_bounds) {
@@ -2445,7 +4634,15 @@ MlxMiniCPMO45ForwardResult MlxMiniCPMO45Runtime::forward(
         }
     }
 
-    implementation_->language.reset_cache(ids.shape(0), ids.shape(1));
+    return result;
+}
+
+MlxMiniCPMO45ForwardResult MlxMiniCPMO45Runtime::forward(
+    const MlxMiniCPMO45Inputs& inputs) {
+    auto result = prepare_inputs(inputs);
+    const int batch = result.input_embeddings.shape(0);
+    const int tokens = result.input_embeddings.shape(1);
+    implementation_->language.reset_cache(batch, tokens);
     result.hidden_states = implementation_->language.hidden_forward_inputs(
         result.input_embeddings,
         inputs.position_ids ? &*inputs.position_ids : nullptr,
@@ -2493,8 +4690,10 @@ array MlxMiniCPMO45Runtime::encode_audio_streaming(
     if (!implementation_->audio) {
         throw std::runtime_error("MiniCPM-o audio component is not loaded");
     }
-    return implementation_->audio->forward_streaming(
+    auto embeddings = implementation_->audio->forward_streaming(
         features, prefix_extra_frames, suffix_extra_frames);
+    log_audio_bitwise_hash(embeddings);
+    return embeddings;
 }
 
 void MlxMiniCPMO45Runtime::prepare_duplex(
@@ -2606,6 +4805,7 @@ void MlxMiniCPMO45Runtime::prepare_duplex(
             mlx::core::int64);
         auto embeddings = implementation_->audio->forward(
             *reference_audio_features, lengths, false);
+        log_audio_bitwise_hash(embeddings);
         implementation_->feed_duplex_embeddings(embeddings);
         implementation_->audio->reset();
     }
@@ -2698,6 +4898,7 @@ MlxMiniCPMO45DuplexResult MlxMiniCPMO45Runtime::duplex_step(
             *inputs.audio_features,
             inputs.audio_prefix_extra_frames,
             inputs.audio_suffix_extra_frames);
+        log_audio_bitwise_hash(*audio_embeddings);
         pending = implementation_->feed_duplex_embeddings(*audio_embeddings);
         generation_logits = pending.first;
         ++state.audio_chunk_index;
@@ -2901,6 +5102,10 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
             mlx::core::zeros(Shape{config.vocab}, mlx::core::int32),
             prompt_ids);
     }
+    const bool fused_greedy =
+        sampling.greedy() && !sampling.has_penalties() &&
+        !token_constraint &&
+        implementation_->language.supports_fused_greedy();
     double prefill_ms = 0.0;
     std::optional<MlxMiniCPMO45TextSessionState> stable_snapshot;
     struct StableStateRestore {
@@ -2928,6 +5133,9 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
                 prompt_ids,
                 Shape{0, static_cast<int>(begin)},
                 Shape{1, static_cast<int>(end)});
+            if (fused_greedy) {
+                return implementation_->language.forward_greedy(ids, true);
+            }
             return last_logits(
                 implementation_->language.forward(ids, true),
                 config.vocab);
@@ -2974,10 +5182,30 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
         config.maximum_context - static_cast<int>(prompt.size()) + 1);
     std::int32_t generated = 0;
     while (generated < generation_limit) {
-        auto token_array = counts
-            ? sampler.sample(logits, *counts)
-            : sampler.sample(logits);
-        token_array.eval();
+        const int decode_step = generated;
+        const int profile_skip =
+            detail::component_profile_skip_steps();
+        const bool profile_this_step =
+            detail::component_profile_requested() &&
+            decode_step >= profile_skip &&
+            decode_step - profile_skip <
+                detail::component_profile_steps();
+        detail::ComponentProfile component_profile;
+        detail::ScopedComponentProfile profile_scope(
+            profile_this_step ? &component_profile : nullptr);
+        const auto component_started =
+            std::chrono::steady_clock::now();
+        auto token_array = [&]() {
+            if (fused_greedy) return logits;
+            return counts
+                ? sampler.sample(logits, *counts)
+                : sampler.sample(logits);
+        }();
+        if (profile_this_step) {
+            detail::profile_eval("minicpmo.sampling", token_array);
+        } else {
+            token_array.eval();
+        }
         auto token = token_array.data<std::int32_t>()[0];
         if (token_constraint && token_constraint->allows &&
             !token_constraint->allows(token)) {
@@ -3011,11 +5239,185 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
         }
         ++generated;
         if ((callback && !callback(token)) || generated == generation_limit) {
+            report_decode_components(
+                profile_this_step,
+                decode_step,
+                implementation_->language.cache_position(),
+                component_started,
+                component_profile);
+            break;
+        }
+        logits = fused_greedy
+            ? implementation_->language.forward_greedy(token_ids, true)
+            : last_logits(
+                  implementation_->language.forward(token_ids, true),
+                  config.vocab);
+        detail::profile_eval("minicpmo.logits", logits);
+        report_decode_components(
+            profile_this_step,
+            decode_step,
+            implementation_->language.cache_position(),
+            component_started,
+            component_profile);
+    }
+    return generated;
+}
+
+std::int32_t MlxMiniCPMO45Runtime::generate_multimodal(
+    const MlxMiniCPMO45Inputs& inputs,
+    const MlxSamplingParams& sampling,
+    std::int32_t max_tokens,
+    const std::function<bool(std::int64_t)>& callback,
+    const std::function<void(
+        std::size_t, double, double, double)>& prefill_callback,
+    const MfqTokenConstraintPtr& token_constraint) {
+    const auto& config = implementation_->language.config();
+    auto ids = inputs.input_ids.ndim() == 1
+        ? mlx::core::expand_dims(inputs.input_ids, 0)
+        : inputs.input_ids;
+    if (ids.ndim() != 2 || ids.shape(0) != 1 || ids.shape(1) <= 0 ||
+        ids.shape(1) > config.maximum_context || max_tokens < 0) {
+        throw std::invalid_argument(
+            "MiniCPM-o multimodal generation input is invalid");
+    }
+    if (!inputs.pixel_values || !inputs.patch_mask ||
+        !inputs.target_sizes || !inputs.image_bounds) {
+        throw std::invalid_argument(
+            "MiniCPM-o multimodal generation requires image tensors");
+    }
+    if (max_tokens == 0) {
+        implementation_->language.reset_cache(1);
+        return 0;
+    }
+
+    std::optional<array> counts;
+    if (sampling.has_penalties()) {
+        counts = sample_token_counts_add(
+            mlx::core::zeros(Shape{config.vocab}, mlx::core::int32),
+            ids);
+    }
+    double llm_prefill_ms = 0.0;
+    double multimodal_ms = 0.0;
+    double model_prefill_ms = 0.0;
+    array logits = [&]() {
+        const auto model_started = std::chrono::steady_clock::now();
+        const auto multimodal_started = model_started;
+        auto result = prepare_inputs(inputs);
+        if (prefill_callback) {
+            result.input_embeddings.eval();
+            log_vision_bitwise_hash(result.input_embeddings);
+            multimodal_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - multimodal_started)
+                .count();
+        }
+
+        const auto llm_started = std::chrono::steady_clock::now();
+        implementation_->language.reset_cache(
+            ids.shape(0), ids.shape(1));
+        result.hidden_states =
+            implementation_->language.hidden_forward_inputs(
+                result.input_embeddings,
+                inputs.position_ids ? &*inputs.position_ids : nullptr,
+                inputs.attention_mask ? &*inputs.attention_mask : nullptr,
+                true);
+        result.logits =
+            implementation_->language.logits(result.hidden_states);
+        auto value = last_logits(result.logits, config.vocab);
+        if (prefill_callback) detail::eval_with_timing(value);
+        if (prefill_callback) {
+            llm_prefill_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - llm_started).count();
+            model_prefill_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - model_started).count();
+        }
+        return value;
+    }();
+    if (prefill_callback) {
+        prefill_callback(
+            static_cast<std::size_t>(ids.shape(1)),
+            llm_prefill_ms,
+            multimodal_ms,
+            model_prefill_ms);
+    }
+
+    MlxSampler sampler(sampling);
+    const auto generation_limit = std::min<std::int32_t>(
+        max_tokens,
+        config.maximum_context - ids.shape(1) + 1);
+    std::int32_t generated = 0;
+    while (generated < generation_limit) {
+        const int decode_step = generated;
+        const int profile_skip =
+            detail::component_profile_skip_steps();
+        const bool profile_this_step =
+            detail::component_profile_requested() &&
+            decode_step >= profile_skip &&
+            decode_step - profile_skip <
+                detail::component_profile_steps();
+        detail::ComponentProfile component_profile;
+        detail::ScopedComponentProfile profile_scope(
+            profile_this_step ? &component_profile : nullptr);
+        const auto component_started =
+            std::chrono::steady_clock::now();
+        auto token_array = counts
+            ? sampler.sample(logits, *counts)
+            : sampler.sample(logits);
+        if (profile_this_step) {
+            detail::profile_eval("minicpmo.sampling", token_array);
+        } else {
+            token_array.eval();
+        }
+        auto token = token_array.data<std::int32_t>()[0];
+        if (token_constraint && token_constraint->allows &&
+            !token_constraint->allows(token)) {
+            auto adjusted = counts
+                ? sampler.apply_penalties(logits, *counts)
+                : logits;
+            adjusted = mlx::core::contiguous(
+                mlx::core::astype(adjusted, mlx::core::float32));
+            adjusted.eval();
+            std::vector<float> masked(
+                adjusted.data<float>(),
+                adjusted.data<float>() + config.vocab);
+            token_constraint->apply(masked.data(), masked.size());
+            const array constrained(
+                masked.begin(), Shape{1, config.vocab}, mlx::core::float32);
+            token_array = sampler.sample(constrained);
+            token_array.eval();
+            token = token_array.data<std::int32_t>()[0];
+            if (!token_constraint->allows(token)) {
+                throw std::runtime_error(
+                    "MiniCPM-o constrained sampler returned invalid token");
+            }
+        }
+        if (token_constraint && token_constraint->accept) {
+            token_constraint->accept(token);
+        }
+        const array token_ids(
+            {token}, Shape{1, 1}, mlx::core::int32);
+        if (counts) {
+            *counts = sample_token_counts_add(*counts, token_ids);
+        }
+        ++generated;
+        if ((callback && !callback(token)) || generated == generation_limit) {
+            report_decode_components(
+                profile_this_step,
+                decode_step,
+                implementation_->language.cache_position(),
+                component_started,
+                component_profile);
             break;
         }
         logits = last_logits(
             implementation_->language.forward(token_ids, true),
             config.vocab);
+        detail::profile_eval("minicpmo.logits", logits);
+        report_decode_components(
+            profile_this_step,
+            decode_step,
+            implementation_->language.cache_position(),
+            component_started,
+            component_profile);
     }
     return generated;
 }

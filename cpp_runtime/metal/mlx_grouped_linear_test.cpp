@@ -138,6 +138,55 @@ Fixture make_nint_fixture(int bits, int output_size) {
     };
 }
 
+std::vector<std::uint8_t> make_nint4_gs24_blob(
+    int input_size,
+    int output_size,
+    int phase) {
+    constexpr int bits = 4;
+    constexpr int sub_bits = 8;
+    constexpr int group_size = 24;
+    const int groups = (input_size + group_size - 1) / group_size;
+    const auto metadata_count =
+        static_cast<std::size_t>(output_size) * groups;
+    const auto value_count = metadata_count * group_size;
+    std::vector<std::uint8_t> sub_scale(metadata_count);
+    std::vector<std::uint8_t> sub_min(metadata_count);
+    std::vector<std::uint8_t> quantized(value_count);
+    for (std::size_t index = 0; index < metadata_count; ++index) {
+        sub_scale[index] = static_cast<std::uint8_t>(
+            1 + (index + static_cast<std::size_t>(phase)) % 3);
+        sub_min[index] = static_cast<std::uint8_t>(
+            (index + static_cast<std::size_t>(phase)) % 2);
+    }
+    for (std::size_t index = 0; index < value_count; ++index) {
+        quantized[index] = static_cast<std::uint8_t>(
+            (index * static_cast<std::size_t>(phase + 5) + 3) & 15u);
+    }
+
+    std::vector<std::uint8_t> blob;
+    append<std::uint8_t>(blob, bits);
+    append<std::uint8_t>(blob, sub_bits);
+    append<std::int32_t>(blob, group_size);
+    append<std::int32_t>(blob, 0);
+    append<std::int32_t>(blob, input_size);
+    append<std::uint32_t>(blob, 2);
+    append<std::int64_t>(blob, output_size);
+    append<std::int64_t>(blob, input_size);
+    append<std::uint32_t>(blob, output_size);
+    append<std::uint32_t>(blob, groups);
+    for (int output = 0; output < output_size; ++output) {
+        append<std::uint16_t>(blob, 0x3000);
+    }
+    for (int output = 0; output < output_size; ++output) {
+        append<std::uint16_t>(blob, 0x2c00);
+    }
+    blob.insert(blob.end(), sub_scale.begin(), sub_scale.end());
+    blob.insert(blob.end(), sub_min.begin(), sub_min.end());
+    const auto packed = pack_values(quantized, bits);
+    blob.insert(blob.end(), packed.begin(), packed.end());
+    return blob;
+}
+
 Fixture make_q8_fixture(int output_size) {
     constexpr std::uint16_t scale_bits[] = {
         0x2c00,
@@ -1393,6 +1442,79 @@ int main() {
             },
             8e-4f,
             "NINT4/5/6 float32 fallback");
+
+        // MiniCPM uses K=4096 with GS24, so the final packed group has eight
+        // padded weights. Keep non-zero values immediately after the logical
+        // input view and verify that the partitioned QKV kernel never reads
+        // them as activations.
+        {
+            constexpr int tail_input_width = 65;
+            constexpr int backing_width = 73;
+            const auto q_blob = make_nint4_gs24_blob(
+                tail_input_width, 17, 3);
+            const auto k_blob = make_nint4_gs24_blob(
+                tail_input_width, 9, 7);
+            const auto v_blob = make_nint4_gs24_blob(
+                tail_input_width, 9, 11);
+            const auto q_weight =
+                mfq::metal::MlxNintWeight::from_blob(q_blob);
+            const auto k_weight =
+                mfq::metal::MlxNintWeight::from_blob(k_blob);
+            const auto v_weight =
+                mfq::metal::MlxNintWeight::from_blob(v_blob);
+            const mfq::metal::MlxGroupedLinear tail_qkv({
+                &q_weight,
+                &k_weight,
+                &v_weight,
+            });
+            require(
+                tail_qkv.has_single_row_nint_fast_path(),
+                "GS24 tail QKV did not enable the partitioned path");
+
+            std::vector<float> backing_values(backing_width);
+            for (int column = 0; column < tail_input_width; ++column) {
+                backing_values[static_cast<std::size_t>(column)] =
+                    static_cast<float>((column * 13) % 31 - 15) / 96.0f;
+            }
+            for (int column = tail_input_width;
+                 column < backing_width;
+                 ++column) {
+                backing_values[static_cast<std::size_t>(column)] =
+                    6.0f + static_cast<float>(column - tail_input_width);
+            }
+            const auto backing = astype(
+                array(
+                    backing_values.begin(),
+                    Shape{1, backing_width}),
+                float16);
+            const auto tail_input = slice(
+                backing,
+                Shape{0, 0},
+                Shape{1, tail_input_width});
+            auto grouped_outputs = tail_qkv(tail_input);
+            std::vector<array> references{
+                q_weight.matmul(tail_input),
+                k_weight.matmul(tail_input),
+                v_weight.matmul(tail_input),
+            };
+            require(
+                grouped_outputs.size() == references.size(),
+                "GS24 tail QKV output count mismatch");
+            for (std::size_t projection = 0;
+                 projection < references.size();
+                 ++projection) {
+                auto difference = max(abs(
+                    astype(grouped_outputs[projection], float32) -
+                    astype(references[projection], float32)));
+                difference.eval();
+                if (!std::isfinite(difference.item<float>()) ||
+                    difference.item<float>() > 0.0f) {
+                    throw std::runtime_error(
+                        "GS24 interleaved QKV changed FP16 values: " +
+                        std::to_string(difference.item<float>()));
+                }
+            }
+        }
 
         // The DeepSeek-V4 shared expert uses an independent dense router and
         // an equal-width NINT gate/up pair.  Decode can therefore keep the

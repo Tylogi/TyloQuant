@@ -22,6 +22,8 @@ using mlx::core::array;
 constexpr int kThreads = 256;
 constexpr int kMaxTopK = 1024;
 constexpr int kDirectTopK = 64;
+constexpr int kHierarchicalTopK = 128;
+constexpr int kTopKBlock = 1024;
 
 constexpr const char* kGreedySource = R"METAL(
     uint row = threadgroup_position_in_grid.x;
@@ -286,6 +288,201 @@ constexpr const char* kTopKSource = R"METAL(
     }
 )METAL";
 
+// Exact single-row top-k selection for the common 65..128 range. Each pass
+// sorts independent 1024-value tiles and retains 128 candidates. Repeating
+// the pass cannot discard a member of the global top-k, while avoiding the
+// full-vocabulary argpartition/argsort graph used by the generic fallback.
+constexpr const char* kHierarchicalTopKFirstSource = R"METAL(
+    constexpr uint BLOCK = 1024u;
+    constexpr uint KEEP = 128u;
+    uint group = threadgroup_position_in_grid.x;
+    uint tid = thread_index_in_threadgroup;
+    threadgroup float tile_values[BLOCK];
+    threadgroup int tile_indices[BLOCK];
+
+    uint begin = group * BLOCK;
+    for (uint offset = tid; offset < BLOCK; offset += 256u) {
+        uint index = begin + offset;
+        float value = index < uint(COUNT)
+            ? float(logits[index])
+            : -INFINITY;
+        tile_values[offset] = isnan(value) ? -INFINITY : value;
+        tile_indices[offset] = index < uint(COUNT)
+            ? int(index)
+            : INT_MAX;
+    }
+
+    for (uint width = 2u; width <= BLOCK; width <<= 1u) {
+        for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint left = tid; left < BLOCK; left += 256u) {
+                uint right = left ^ stride;
+                if (right <= left) continue;
+                float left_value = tile_values[left];
+                float right_value = tile_values[right];
+                int left_index = tile_indices[left];
+                int right_index = tile_indices[right];
+                bool right_before_left =
+                    right_value > left_value ||
+                    (right_value == left_value && right_index < left_index);
+                bool left_before_right =
+                    left_value > right_value ||
+                    (left_value == right_value && left_index < right_index);
+                bool descending = (left & width) == 0u;
+                if ((descending && right_before_left) ||
+                    (!descending && left_before_right)) {
+                    tile_values[left] = right_value;
+                    tile_values[right] = left_value;
+                    tile_indices[left] = right_index;
+                    tile_indices[right] = left_index;
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < KEEP) {
+        uint output = group * KEEP + tid;
+        scores_out[output] = tile_values[tid];
+        indices_out[output] = tile_indices[tid];
+    }
+)METAL";
+
+constexpr const char* kHierarchicalTopKMergeSource = R"METAL(
+    constexpr uint BLOCK = 1024u;
+    constexpr uint KEEP = 128u;
+    uint group = threadgroup_position_in_grid.x;
+    uint tid = thread_index_in_threadgroup;
+    threadgroup float tile_values[BLOCK];
+    threadgroup int tile_indices[BLOCK];
+
+    uint begin = group * BLOCK;
+    for (uint offset = tid; offset < BLOCK; offset += 256u) {
+        uint index = begin + offset;
+        tile_values[offset] = index < uint(COUNT)
+            ? scores_in[index]
+            : -INFINITY;
+        tile_indices[offset] = index < uint(COUNT)
+            ? indices_in[index]
+            : INT_MAX;
+    }
+
+    for (uint width = 2u; width <= BLOCK; width <<= 1u) {
+        for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint left = tid; left < BLOCK; left += 256u) {
+                uint right = left ^ stride;
+                if (right <= left) continue;
+                float left_value = tile_values[left];
+                float right_value = tile_values[right];
+                int left_index = tile_indices[left];
+                int right_index = tile_indices[right];
+                bool right_before_left =
+                    right_value > left_value ||
+                    (right_value == left_value && right_index < left_index);
+                bool left_before_right =
+                    left_value > right_value ||
+                    (left_value == right_value && left_index < right_index);
+                bool descending = (left & width) == 0u;
+                if ((descending && right_before_left) ||
+                    (!descending && left_before_right)) {
+                    tile_values[left] = right_value;
+                    tile_values[right] = left_value;
+                    tile_indices[left] = right_index;
+                    tile_indices[right] = left_index;
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < KEEP) {
+        uint output = group * KEEP + tid;
+        scores_out[output] = tile_values[tid];
+        indices_out[output] = tile_indices[tid];
+    }
+)METAL";
+
+constexpr const char* kHierarchicalTopKFinalSource = R"METAL(
+    constexpr uint BLOCK = 1024u;
+    uint tid = thread_index_in_threadgroup;
+    threadgroup float tile_values[BLOCK];
+    threadgroup int tile_indices[BLOCK];
+
+    for (uint index = tid; index < BLOCK; index += 256u) {
+        tile_values[index] = index < uint(COUNT)
+            ? scores[index]
+            : -INFINITY;
+        tile_indices[index] = index < uint(COUNT)
+            ? indices[index]
+            : INT_MAX;
+    }
+    for (uint width = 2u; width <= BLOCK; width <<= 1u) {
+        for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint left = tid; left < BLOCK; left += 256u) {
+                uint right = left ^ stride;
+                if (right <= left) continue;
+                float left_value = tile_values[left];
+                float right_value = tile_values[right];
+                int left_index = tile_indices[left];
+                int right_index = tile_indices[right];
+                bool right_before_left =
+                    right_value > left_value ||
+                    (right_value == left_value && right_index < left_index);
+                bool left_before_right =
+                    left_value > right_value ||
+                    (left_value == right_value && left_index < right_index);
+                bool descending = (left & width) == 0u;
+                if ((descending && right_before_left) ||
+                    (!descending && left_before_right)) {
+                    tile_values[left] = right_value;
+                    tile_values[right] = left_value;
+                    tile_indices[left] = right_index;
+                    tile_indices[right] = left_index;
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        float inverse_temperature = 1.0f / params[0];
+        float maximum = tile_values[0] * inverse_temperature;
+        float probabilities[TOP_K];
+        float total = 0.0f;
+        for (uint rank = 0u; rank < uint(TOP_K); ++rank) {
+            float probability = exp(
+                tile_values[rank] * inverse_temperature - maximum);
+            probabilities[rank] = probability;
+            total += probability;
+        }
+        uint keep = uint(TOP_K);
+        float keep_sum = total;
+        if (params[1] > 0.0f && params[1] < 1.0f) {
+            float cutoff = params[1] * total;
+            float cumulative = 0.0f;
+            for (uint rank = 0u; rank < uint(TOP_K); ++rank) {
+                cumulative += probabilities[rank];
+                if (cumulative >= cutoff) {
+                    keep = rank + 1u;
+                    keep_sum = cumulative;
+                    break;
+                }
+            }
+        }
+        float uniform = clamp(random[0], 0.0f, 0.99999994f);
+        float target = uniform * keep_sum;
+        float cumulative = 0.0f;
+        int chosen = tile_indices[keep - 1u];
+        for (uint rank = 0u; rank < keep; ++rank) {
+            cumulative += probabilities[rank];
+            if (cumulative >= target) {
+                chosen = tile_indices[rank];
+                break;
+            }
+        }
+        output[0] = chosen;
+    }
+)METAL";
+
 constexpr const char* kSortedSource = R"METAL(
     uint row = threadgroup_position_in_grid.x;
     uint tid = thread_index_in_threadgroup;
@@ -408,6 +605,51 @@ const mlx::core::fast::CustomKernelFunction& top_k_kernel() {
         "mfq_cpp_sample_top_k_top_p",
         {"logits", "random", "params"},
         kTopKSource);
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+hierarchical_top_k_first_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_sample_top_k_128_first",
+            {"logits"},
+            {"scores_out", "indices_out"},
+            kHierarchicalTopKFirstSource,
+            "",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+hierarchical_top_k_merge_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_sample_top_k_128_merge",
+            {"scores_in", "indices_in"},
+            {"scores_out", "indices_out"},
+            kHierarchicalTopKMergeSource,
+            "",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+hierarchical_top_k_final_kernel() {
+    static const auto kernel = make_kernel(
+        "mfq_cpp_sample_top_k_128_final",
+        {"scores", "indices", "random", "params"},
+        kHierarchicalTopKFinalSource);
     return kernel;
 }
 
@@ -534,15 +776,35 @@ array run_sorted(
             scores,
             -std::numeric_limits<float>::infinity()),
         scores);
-    auto order = mlx::core::flip(
-        mlx::core::argsort(scores, -1),
-        -1);
     const int count =
         top_k <= 0 ? view.vocab : std::min(top_k, view.vocab);
-    order = mlx::core::slice(
-        order,
-        Shape{0, 0},
-        Shape{view.rows, count});
+    auto order = [&]() {
+        if (count >= view.vocab) {
+            return mlx::core::flip(
+            mlx::core::argsort(scores, -1),
+            -1);
+        }
+        const int start = view.vocab - count;
+        auto candidates = mlx::core::slice(
+            mlx::core::argpartition(scores, start, -1),
+            Shape{0, start},
+            Shape{view.rows, view.vocab});
+        candidates = mlx::core::take_along_axis(
+            candidates,
+            mlx::core::argsort(candidates, -1),
+            -1);
+        auto candidate_scores = mlx::core::take_along_axis(
+            scores,
+            candidates,
+            -1);
+        auto candidate_order = mlx::core::argsort(
+            -candidate_scores,
+            -1);
+        return mlx::core::take_along_axis(
+            candidates,
+            candidate_order,
+            -1);
+    }();
     order = mlx::core::contiguous(
         mlx::core::astype(order, mlx::core::int32));
     auto ordered = mlx::core::contiguous(
@@ -564,6 +826,78 @@ array run_sorted(
         false,
         {});
     return mlx::core::reshape(outputs.front(), view.prefix);
+}
+
+array run_hierarchical_top_k(
+    const LogitsView& view,
+    const array& random,
+    double temperature,
+    int top_k,
+    double top_p) {
+    if (view.rows != 1 || top_k < 1 ||
+        top_k > kHierarchicalTopK) {
+        throw std::invalid_argument(
+            "hierarchical top-k requires one row and top_k <= 128");
+    }
+    int count = view.vocab;
+    int groups = (count + kTopKBlock - 1) / kTopKBlock;
+    auto selected = hierarchical_top_k_first_kernel()(
+        {view.values},
+        {
+            Shape{groups * kHierarchicalTopK},
+            Shape{groups * kHierarchicalTopK},
+        },
+        {mlx::core::float32, mlx::core::int32},
+        {groups * kThreads, 1, 1},
+        {kThreads, 1, 1},
+        {{"COUNT", count}},
+        std::nullopt,
+        false,
+        {});
+    auto scores = std::move(selected.at(0));
+    auto indices = std::move(selected.at(1));
+    count = groups * kHierarchicalTopK;
+
+    while (count > kTopKBlock) {
+        groups = (count + kTopKBlock - 1) / kTopKBlock;
+        selected = hierarchical_top_k_merge_kernel()(
+            {scores, indices},
+            {
+                Shape{groups * kHierarchicalTopK},
+                Shape{groups * kHierarchicalTopK},
+            },
+            {mlx::core::float32, mlx::core::int32},
+            {groups * kThreads, 1, 1},
+            {kThreads, 1, 1},
+            {{"COUNT", count}},
+            std::nullopt,
+            false,
+            {});
+        scores = std::move(selected.at(0));
+        indices = std::move(selected.at(1));
+        count = groups * kHierarchicalTopK;
+    }
+
+    const array params(
+        {
+            static_cast<float>(temperature),
+            static_cast<float>(top_p),
+        },
+        mlx::core::float32);
+    auto output = hierarchical_top_k_final_kernel()(
+        {scores, indices, random, params},
+        {Shape{1}},
+        {mlx::core::int32},
+        {kThreads, 1, 1},
+        {kThreads, 1, 1},
+        {
+            {"COUNT", count},
+            {"TOP_K", top_k},
+        },
+        std::nullopt,
+        false,
+        {}).front();
+    return mlx::core::reshape(std::move(output), view.prefix);
 }
 
 } // namespace
@@ -632,6 +966,15 @@ array sample_top_k_top_p(
             "top_k must be in [1,min(vocab,1024)]");
     }
     auto uniforms = normalize_random(random, view.rows);
+    if (view.rows == 1 && view.vocab > kTopKBlock &&
+        top_k <= kHierarchicalTopK) {
+        return run_hierarchical_top_k(
+            view,
+            uniforms,
+            temperature,
+            top_k,
+            top_p);
+    }
     if (top_k > kDirectTopK) {
         return run_sorted(
             view,

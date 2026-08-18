@@ -441,6 +441,62 @@ void verify_nint_gs24_decode(
                     tolerance);
             }
         }
+
+        if (bits == 6 && rows == 1 && dtype == float16) {
+            auto fused = weight.greedy_argmax(input);
+            if (!fused) {
+                throw std::runtime_error(
+                    "NINT6/GS24 fused greedy path was unavailable");
+            }
+            fused->eval();
+            int expected_index = 0;
+            for (int output_row = 1;
+                 output_row < output_size;
+                 ++output_row) {
+                if (values[output_row] > values[expected_index]) {
+                    expected_index = output_row;
+                }
+            }
+            if (fused->data<std::int32_t>()[0] != expected_index) {
+                throw std::runtime_error(
+                    "NINT6/GS24 fused greedy token mismatch");
+            }
+        }
+
+        if (bits == 4) {
+            std::vector<float> residual_values(
+                static_cast<std::size_t>(rows) * output_size);
+            for (std::size_t index = 0;
+                 index < residual_values.size();
+                 ++index) {
+                residual_values[index] =
+                    static_cast<float>(
+                        static_cast<int>(index % 19) - 9) /
+                    64.0f;
+            }
+            const auto residual = astype(
+                array(
+                    residual_values.begin(),
+                    Shape{rows, output_size}),
+                dtype);
+            auto reference = astype(
+                weight.matmul(input) + residual,
+                float32);
+            auto fused = astype(
+                weight.matmul_add(input, residual),
+                float32);
+            eval(reference, fused);
+            const auto* expected = reference.data<float>();
+            const auto* actual = fused.data<float>();
+            for (std::size_t index = 0;
+                 index < residual_values.size();
+                 ++index) {
+                require_close(
+                    actual[index],
+                    expected[index],
+                    dtype == float16 ? 0.001f : 0.0001f);
+            }
+        }
     }
 }
 
@@ -524,6 +580,58 @@ void test_nint4_swiglu() {
                 actual[output],
                 expected[output],
                 tolerance);
+        }
+    }
+
+    // The production MiniCPM decode path uses GS24. Verify the fused
+    // group-affine formulation directly against the established separate
+    // GS24 GEMVs, including both input and output tails.
+    {
+        constexpr int gs24_output = 37;
+        constexpr int gs24_group_size = 24;
+        constexpr int gs24_groups = 5;
+        constexpr int gs24_input = 111;
+        const auto gs24_gate = mfq::metal::MlxNintWeight::from_blob(
+            make_nint_blob(
+                4,
+                gs24_output,
+                gs24_group_size,
+                gs24_groups,
+                gs24_input,
+                11).blob);
+        const auto gs24_up = mfq::metal::MlxNintWeight::from_blob(
+            make_nint_blob(
+                4,
+                gs24_output,
+                gs24_group_size,
+                gs24_groups,
+                gs24_input,
+                17).blob);
+        std::vector<float> gs24_input_values(gs24_input);
+        for (int index = 0; index < gs24_input; ++index) {
+            gs24_input_values[static_cast<std::size_t>(index)] =
+                static_cast<float>((index * 17) % 41 - 20) / 192.0f;
+        }
+        const auto gs24_source = astype(
+            array(
+                gs24_input_values.begin(),
+                Shape{1, 1, gs24_input}),
+            float16);
+        const auto gs24_gate_value = gs24_gate.matmul(gs24_source);
+        const auto gs24_up_value = gs24_up.matmul(gs24_source);
+        auto gs24_reference = astype(
+            gs24_gate_value * sigmoid(gs24_gate_value) * gs24_up_value,
+            float32);
+        auto gs24_fused = astype(
+            gs24_gate.swiglu(gs24_up, gs24_source),
+            float32);
+        auto maximum = max(abs(gs24_fused - gs24_reference));
+        maximum.eval();
+        if (!std::isfinite(maximum.item<float>()) ||
+            maximum.item<float>() > 0.0f) {
+            throw std::runtime_error(
+                "GS24 fused NINT4 SwiGLU changed FP16 values: " +
+                std::to_string(maximum.item<float>()));
         }
     }
 

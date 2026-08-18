@@ -537,6 +537,37 @@ int main() {
             }
         }
 
+        mfq::metal::set_mlx_predequantize_fp16(true);
+        const auto dense_linear =
+            mfq::metal::MlxLinear::load(model, "weight");
+        const auto dense_embedding =
+            mfq::metal::MlxEmbedding::load(model, "weight");
+        mfq::metal::set_mlx_predequantize_fp16(false);
+        require(
+            !dense_linear.packed() &&
+                dense_linear.dense_weight_ref() != nullptr &&
+                dense_linear.dense_weight_ref()->dtype() == float16,
+            "NINT8-0 was not materialized as FP16");
+        auto dense_output = astype(dense_linear(input), float32);
+        auto dense_tied = astype(
+            dense_embedding.project(input),
+            float32);
+        eval(dense_output, dense_tied);
+        const auto* dense_output_values = dense_output.data<float>();
+        const auto* dense_tied_values = dense_tied.data<float>();
+        for (std::size_t index = 0;
+             index < dense_output.size();
+             ++index) {
+            require_close(
+                dense_output_values[index],
+                loaded_values[index],
+                0.05f);
+            require_close(
+                dense_tied_values[index],
+                tied_projection_values[index],
+                0.05f);
+        }
+
         auto bad_magic = fixture.blob;
         bad_magic[0] = 'X';
         require_parse_error(std::move(bad_magic));

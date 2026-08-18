@@ -181,6 +181,16 @@ public:
         std::optional<std::size_t> stable_prefix_tokens =
             std::nullopt);
 
+    std::int32_t generate_multimodal(
+        const MlxMiniCPMO45Inputs& inputs,
+        const MlxSamplingParams& sampling,
+        std::int32_t max_tokens,
+        const std::function<bool(std::int64_t)>& callback = {},
+        const std::function<void(
+            std::size_t, double, double, double)>&
+            prefill_callback = {},
+        const MfqTokenConstraintPtr& token_constraint = {});
+
     MlxMiniCPMO45TextSessionState capture_text_session_state(
         const std::vector<std::int64_t>& tokens) const;
     void restore_text_session_state(
@@ -197,6 +207,8 @@ public:
 private:
     class Impl;
     explicit MlxMiniCPMO45Runtime(std::unique_ptr<Impl> implementation);
+    MlxMiniCPMO45ForwardResult prepare_inputs(
+        const MlxMiniCPMO45Inputs& inputs);
     std::unique_ptr<Impl> implementation_;
 };
 
@@ -205,6 +217,8 @@ namespace detail {
 // Production-block numerical regression used by the native Metal test suite.
 // It compares causal prefill with token-by-token BF16 KV-cache execution.
 void test_minicpmo45_qwen3_cache_equivalence();
+void test_minicpmo45_qk_norm_rope();
+void test_minicpmo45_gqa_attention();
 
 } // namespace detail
 

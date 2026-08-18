@@ -1090,6 +1090,7 @@ struct RequestWork {
     MfqSamplingParams sampling;
     MfqPromptCachePlan cache_plan;
     MfqTokenConstraintPtr token_constraint;
+    std::optional<MfqVisionInput> vision;
 };
 
 static bool valid_mfq_session_id(const std::string & session_id) {
@@ -1439,13 +1440,17 @@ struct RequestMetrics {
     Clock::time_point first_token;
     size_t prefill_tokens = 0;
     double prefill_ms = 0.0;
+    double multimodal_ms = 0.0;
+    double model_prefill_ms = 0.0;
     bool saw_token = false;
     bool saw_prefill = false;
 
-    void mark_prefill(size_t prompt_token_count, double elapsed_ms) {
-        prefill_tokens = prompt_token_count;
-        prefill_ms = elapsed_ms;
-        saw_prefill = elapsed_ms > 0.0;
+    void mark_prefill(const MfqPrefillTiming & timing) {
+        prefill_tokens = timing.prompt_tokens;
+        prefill_ms = timing.llm_ms;
+        multimodal_ms = timing.multimodal_ms;
+        model_prefill_ms = timing.model_ms;
+        saw_prefill = timing.llm_ms > 0.0 || timing.model_ms > 0.0;
     }
 
     void mark_token() {
@@ -1470,10 +1475,39 @@ struct RequestMetricValues {
     double ttft_ms = 0.0;
     double prefill_ms = 0.0;
     double prefill_tps = 0.0;
+    double multimodal_ms = 0.0;
+    double model_prefill_ms = 0.0;
     double decode_ms = 0.0;
     double generation_tps = 0.0;
     double decode_tps = 0.0;
 };
+
+static json request_metric_values_json(
+        const RequestMetricValues & values,
+        const MfqSamplingParams & sampling) {
+    return {
+        {"prefill_tokens", values.prefill_tokens},
+        {"ttft_ms", values.ttft_ms},
+        {"prefill_ms", values.prefill_ms},
+        {"prefill_tps", values.prefill_tps},
+        {"multimodal_ms", values.multimodal_ms},
+        {"model_prefill_ms", values.model_prefill_ms},
+        {"decode_ms", values.decode_ms},
+        {"decode_tps", values.decode_tps},
+        {"generation_ms", values.generation_ms},
+        {"generation_tps", values.generation_tps},
+        {"sampling", {
+            {"max_tokens", sampling.max_tokens},
+            {"temperature", sampling.temperature},
+            {"top_k", sampling.top_k},
+            {"top_p", sampling.top_p},
+            {"presence_penalty", sampling.presence_penalty},
+            {"frequency_penalty", sampling.frequency_penalty},
+            {"repetition_penalty", sampling.repetition_penalty},
+            {"seed", sampling.seed},
+        }},
+    };
+}
 
 static RequestMetricValues request_metric_values(
         const CompletionResult & result, const RequestMetrics & metrics) {
@@ -1489,6 +1523,12 @@ static RequestMetricValues request_metric_values(
               metrics.first_token - metrics.started).count()
         : values.generation_ms;
     values.prefill_ms = metrics.saw_prefill ? metrics.prefill_ms : 0.0;
+    values.multimodal_ms = metrics.saw_prefill
+        ? metrics.multimodal_ms
+        : 0.0;
+    values.model_prefill_ms = metrics.saw_prefill
+        ? metrics.model_prefill_ms
+        : 0.0;
     values.prefill_tps = metrics.saw_prefill && metrics.prefill_ms > 0.0
         ? 1000.0 * metrics.prefill_tokens / metrics.prefill_ms
         : 0.0;
@@ -1529,6 +1569,8 @@ static void log_request_metrics(const std::string & id, bool chat, bool stream,
          << " ttft_ms=" << values.ttft_ms
          << " prefill_ms=" << values.prefill_ms
          << " prefill_tps=" << values.prefill_tps
+         << " multimodal_ms=" << values.multimodal_ms
+         << " model_prefill_ms=" << values.model_prefill_ms
          << " decode_ms=" << values.decode_ms
          << " decode_tps=" << values.decode_tps
          << " generation_ms=" << values.generation_ms
@@ -1579,6 +1621,8 @@ public:
             {"ttft_ms", values.ttft_ms},
             {"prefill_ms", values.prefill_ms},
             {"prefill_tps", values.prefill_tps},
+            {"multimodal_ms", values.multimodal_ms},
+            {"model_prefill_ms", values.model_prefill_ms},
             {"decode_ms", values.decode_ms},
             {"decode_tps", values.decode_tps},
             {"generation_ms", values.generation_ms},
@@ -1666,6 +1710,7 @@ private:
 
 static CompletionResult generate_text(const RequestWork & work, const LlamaTokenizer & tokenizer,
                                       const MfqGenerateFn & generate,
+                                      const MfqMultimodalGenerateFn & multimodal_generate,
                                       const std::function<bool(const common_chat_msg_diff &)> & emit,
                                       RequestMetrics * metrics) {
     CompletionResult result;
@@ -1688,9 +1733,7 @@ static CompletionResult generate_text(const RequestWork & work, const LlamaToken
         return emit_parsed(diff);
     });
 
-    result.completion_tokens = generate(
-        work.prompt, work.sampling,
-        [&](int64_t token) {
+    const auto on_token = [&](int64_t token) {
             if (metrics != nullptr) metrics->mark_token();
             if (tokenizer.is_eog(token)) {
                 result.finish_reason = "stop";
@@ -1704,14 +1747,17 @@ static CompletionResult generate_text(const RequestWork & work, const LlamaToken
                 return false;
             }
             return true;
-        },
-        [&](size_t prompt_tokens, double prefill_ms) {
-            if (metrics != nullptr) {
-                metrics->mark_prefill(prompt_tokens, prefill_ms);
-            }
-        },
-        work.cache_plan,
-        work.token_constraint);
+        };
+    const auto on_prefill = [&](const MfqPrefillTiming & timing) {
+            if (metrics != nullptr) metrics->mark_prefill(timing);
+        };
+    result.completion_tokens = work.vision
+        ? multimodal_generate(
+              work.prompt, *work.vision, work.sampling,
+              on_token, on_prefill, work.token_constraint)
+        : generate(
+              work.prompt, work.sampling, on_token, on_prefill,
+              work.cache_plan, work.token_constraint);
     if (result.client_connected && !emitter.stopped()) emitter.flush();
     if (result.client_connected && chat_parser) {
         chat_parser->flush();
@@ -1852,7 +1898,9 @@ static int base64_digit(unsigned char value) {
     return -1;
 }
 
-static std::vector<uint8_t> decode_base64(const std::string & encoded) {
+static std::vector<uint8_t> decode_base64(
+        const std::string & encoded,
+        const std::string & parameter = "audio_features") {
     std::string compact;
     compact.reserve(encoded.size());
     for (const unsigned char value : encoded) {
@@ -1865,7 +1913,7 @@ static std::vector<uint8_t> decode_base64(const std::string & encoded) {
     if (compact.empty() || compact.size() % 4 != 0) {
         throw ApiError(
             400, "invalid_request_error",
-            "audio_features must be padded base64", "audio_features");
+            parameter + " must be padded base64", parameter);
     }
 
     std::vector<uint8_t> output;
@@ -1876,14 +1924,12 @@ static std::vector<uint8_t> decode_base64(const std::string & encoded) {
         if (pad2 && !pad3) {
             throw ApiError(
                 400, "invalid_request_error",
-                "audio_features has invalid base64 padding",
-                "audio_features");
+                parameter + " has invalid base64 padding", parameter);
         }
         if ((pad2 || pad3) && offset + 4 != compact.size()) {
             throw ApiError(
                 400, "invalid_request_error",
-                "audio_features has interior base64 padding",
-                "audio_features");
+                parameter + " has interior base64 padding", parameter);
         }
         const int a = base64_digit(compact[offset]);
         const int b = base64_digit(compact[offset + 1]);
@@ -1892,8 +1938,7 @@ static std::vector<uint8_t> decode_base64(const std::string & encoded) {
         if (a < 0 || b < 0 || c < 0 || d < 0) {
             throw ApiError(
                 400, "invalid_request_error",
-                "audio_features contains invalid base64 data",
-                "audio_features");
+                parameter + " contains invalid base64 data", parameter);
         }
         const uint32_t merged =
             (static_cast<uint32_t>(a) << 18) |
@@ -1905,6 +1950,220 @@ static std::vector<uint8_t> decode_base64(const std::string & encoded) {
         if (!pad3) output.push_back(static_cast<uint8_t>(merged));
     }
     return output;
+}
+
+static size_t tensor_element_count(
+        const std::vector<int64_t> & shape,
+        const std::string & parameter) {
+    if (shape.empty() || shape.size() > 4) {
+        throw ApiError(
+            400, "invalid_request_error",
+            parameter + " shape must have between 1 and 4 dimensions",
+            parameter);
+    }
+    size_t count = 1;
+    for (const int64_t dimension : shape) {
+        if (dimension <= 0 ||
+            static_cast<uint64_t>(dimension) >
+                static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
+            count > std::numeric_limits<size_t>::max() /
+                static_cast<size_t>(dimension)) {
+            throw ApiError(
+                400, "invalid_request_error",
+                parameter + " has an invalid tensor shape", parameter);
+        }
+        count *= static_cast<size_t>(dimension);
+    }
+    return count;
+}
+
+template <typename Value>
+static std::pair<std::vector<Value>, std::vector<int64_t>> decode_tensor(
+        const json & tensors,
+        const std::string & name,
+        const std::string & expected_dtype) {
+    const std::string parameter = "mfq_multimodal." + name;
+    if (!tensors.contains(name) || !tensors[name].is_object()) {
+        throw ApiError(
+            400, "invalid_request_error",
+            parameter + " must be a tensor object", parameter);
+    }
+    const auto & tensor = tensors[name];
+    if (!tensor.contains("dtype") || !tensor["dtype"].is_string() ||
+        tensor["dtype"].get<std::string>() != expected_dtype) {
+        throw ApiError(
+            400, "invalid_request_error",
+            parameter + " must use dtype " + expected_dtype, parameter);
+    }
+    if (!tensor.contains("shape") || !tensor["shape"].is_array()) {
+        throw ApiError(
+            400, "invalid_request_error",
+            parameter + " must include an integer shape", parameter);
+    }
+    std::vector<int64_t> shape;
+    shape.reserve(tensor["shape"].size());
+    for (const auto & dimension : tensor["shape"]) {
+        if (!dimension.is_number_integer()) {
+            throw ApiError(
+                400, "invalid_request_error",
+                parameter + " shape must contain integers", parameter);
+        }
+        shape.push_back(dimension.get<int64_t>());
+    }
+    const size_t count = tensor_element_count(shape, parameter);
+    if (!tensor.contains("data_base64") ||
+        !tensor["data_base64"].is_string()) {
+        throw ApiError(
+            400, "invalid_request_error",
+            parameter + " must include data_base64", parameter);
+    }
+    const auto bytes = decode_base64(
+        tensor["data_base64"].get<std::string>(), parameter);
+    if (count > std::numeric_limits<size_t>::max() / sizeof(Value) ||
+        bytes.size() != count * sizeof(Value)) {
+        throw ApiError(
+            400, "invalid_request_error",
+            parameter + " byte length does not match its shape", parameter);
+    }
+    std::vector<Value> values(count);
+    std::memcpy(values.data(), bytes.data(), bytes.size());
+    return {std::move(values), std::move(shape)};
+}
+
+static int64_t single_special_token(
+        const LlamaTokenizer & tokenizer,
+        const std::string & marker) {
+    const auto tokens = tokenizer.tokenize(marker, true, false);
+    if (tokens.size() != 1) {
+        throw ApiError(
+            500, "server_error",
+            "MiniCPM-o tokenizer does not encode " + marker +
+                " as one special token");
+    }
+    return tokens.front();
+}
+
+static MfqVisionInput parse_mfq_vision(
+        const json & value,
+        const std::vector<int64_t> & prompt,
+        const LlamaTokenizer & tokenizer) {
+    if (!value.is_object()) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "mfq_multimodal must be an object", "mfq_multimodal");
+    }
+    if (!value.contains("version") || !value["version"].is_number_integer() ||
+        value["version"].get<int>() != 1) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "mfq_multimodal.version must be 1", "mfq_multimodal.version");
+    }
+
+    MfqVisionInput result;
+    auto pixels = decode_tensor<float>(
+        value, "pixel_values", "float32");
+    result.pixel_values = std::move(pixels.first);
+    result.pixel_shape = std::move(pixels.second);
+    auto mask = decode_tensor<uint8_t>(
+        value, "patch_mask", "uint8");
+    result.patch_mask = std::move(mask.first);
+    result.patch_mask_shape = std::move(mask.second);
+    auto sizes = decode_tensor<int32_t>(
+        value, "target_sizes", "int32");
+    result.target_sizes = std::move(sizes.first);
+    result.target_sizes_shape = std::move(sizes.second);
+
+    if (result.pixel_shape.size() != 4 || result.pixel_shape[1] != 3 ||
+        result.pixel_shape[2] != 14 ||
+        result.patch_mask_shape.size() != 2 ||
+        result.target_sizes_shape.size() != 2 ||
+        result.target_sizes_shape[1] != 2 ||
+        result.pixel_shape[0] != result.patch_mask_shape[0] ||
+        result.pixel_shape[0] != result.target_sizes_shape[0] ||
+        result.pixel_shape[3] % 14 != 0 ||
+        result.patch_mask_shape[1] != result.pixel_shape[3] / 14) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "mfq_multimodal tensor geometry is invalid", "mfq_multimodal");
+    }
+    const int64_t source_count = result.pixel_shape[0];
+    if (source_count > 576) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "mfq_multimodal contains too many image slices",
+            "mfq_multimodal.pixel_values");
+    }
+    for (int64_t source = 0; source < source_count; ++source) {
+        const int64_t rows = result.target_sizes[2 * source];
+        const int64_t columns = result.target_sizes[2 * source + 1];
+        if (rows <= 0 || columns <= 0 ||
+            rows * columns > result.patch_mask_shape[1]) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "mfq_multimodal target size disagrees with pixel geometry",
+                "mfq_multimodal.target_sizes");
+        }
+        for (int64_t patch = 0; patch < result.patch_mask_shape[1]; ++patch) {
+            const bool expected = patch < rows * columns;
+            const uint8_t actual = result.patch_mask[
+                static_cast<size_t>(source * result.patch_mask_shape[1] + patch)];
+            if (actual > 1 || static_cast<bool>(actual) != expected) {
+                throw ApiError(
+                    400, "invalid_request_error",
+                    "mfq_multimodal patch mask is not a contiguous active prefix",
+                    "mfq_multimodal.patch_mask");
+            }
+        }
+    }
+    if (!std::all_of(
+            result.pixel_values.begin(), result.pixel_values.end(),
+            [](float item) { return std::isfinite(item); })) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "mfq_multimodal pixel_values contains a non-finite value",
+            "mfq_multimodal.pixel_values");
+    }
+
+    const int64_t image_start = single_special_token(tokenizer, "<image>");
+    const int64_t image_end = single_special_token(tokenizer, "</image>");
+    const int64_t slice_start = single_special_token(tokenizer, "<slice>");
+    const int64_t slice_end = single_special_token(tokenizer, "</slice>");
+    for (size_t index = 0; index < prompt.size(); ++index) {
+        const int64_t token = prompt[index];
+        if (token != image_start && token != slice_start) continue;
+        const int64_t end_token = token == image_start ? image_end : slice_end;
+        const auto found = std::find(
+            prompt.begin() + static_cast<std::ptrdiff_t>(index + 1),
+            prompt.end(), end_token);
+        if (found == prompt.end()) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "MiniCPM-o image placeholder is missing its end token",
+                "messages");
+        }
+        const size_t end = static_cast<size_t>(found - prompt.begin());
+        if (end - index - 1 != 64) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "MiniCPM-o image placeholder must contain 64 query tokens",
+                "messages");
+        }
+        const int64_t source =
+            static_cast<int64_t>(result.image_bounds.size() / 4);
+        result.image_bounds.insert(
+            result.image_bounds.end(),
+            {0, source, static_cast<int64_t>(index + 1),
+             static_cast<int64_t>(end)});
+        index = end;
+    }
+    if (result.image_bounds.size() / 4 !=
+        static_cast<size_t>(source_count)) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "MiniCPM-o image placeholders do not match processed image slices",
+            "messages");
+    }
+    return result;
 }
 
 static std::vector<float> decode_audio_features(
@@ -2045,7 +2304,9 @@ int run_mfq_server(
         const MfqGenerateFn & generate,
         const MfqReloadFn & reload,
         const MfqDuplexBackend & duplex,
-        const MfqSessionControl & session_control) {
+        const MfqSessionControl & session_control,
+        const MfqMultimodalGenerateFn & multimodal_generate,
+        const MfqRuntimeMetricsFn & runtime_metrics) {
     if (config.tokenizer_gguf.empty() &&
         config.tokenizer_model.empty()) {
         throw std::runtime_error(
@@ -2132,7 +2393,8 @@ int run_mfq_server(
         }
         return true;
     };
-    server.set_payload_max_length(16 * 1024 * 1024);
+    server.set_payload_max_length(
+        (multimodal_generate ? 512ULL : 16ULL) * 1024ULL * 1024ULL);
     server.set_read_timeout(300, 0);
     server.set_write_timeout(300, 0);
     server.set_keep_alive_max_count(100);
@@ -2525,58 +2787,36 @@ int run_mfq_server(
             });
     }
 
-    bool web_ui_available = false;
-    if (!config.web_root.empty()) {
-        std::error_code error;
-        const auto web_root = std::filesystem::absolute(
-            std::filesystem::path(config.web_root), error);
-        if (!error &&
-            std::filesystem::is_regular_file(web_root / "index.html", error)) {
-            web_ui_available = server.set_mount_point(
-                "/admin", web_root.string(), {
-                    {"Cache-Control", "no-cache"},
-                    {"Referrer-Policy", "no-referrer"},
-                    {"X-Frame-Options", "DENY"},
-                });
-        }
-        if (!web_ui_available) {
-            std::cerr << "MFQ web UI disabled: cannot read "
-                      << config.web_root << "/index.html" << std::endl;
-        }
-    }
-
-    server.Get("/admin", [web_ui_available](
-            const httplib::Request &, httplib::Response & res) {
-        if (web_ui_available) {
-            res.set_redirect("/admin/");
-        } else {
-            set_json(res, error_body(
-                "MFQ web UI assets are unavailable", "not_found"), 404);
-        }
-    });
-
     server.Get("/", [&](const httplib::Request & req, httplib::Response & res) {
         if (!authorized(req, res, config.api_key)) return;
-        if (web_ui_available &&
-            req.get_header_value("Accept").find("text/html") !=
-                std::string::npos) {
-            res.set_redirect("/admin/");
-            return;
-        }
         set_json(res, {
             {"name", "MFQ C++ inference server"},
             {"model", config.model_name},
             {"endpoints", {
                 "/v1/chat/completions", "/v1/completions", "/v1/models",
                 "/health", "/api/status", "/api/reload", "/backend",
+                "/api/runtime/cache/clear",
                 "/api/runtime/sessions/fork",
-                "/api/runtime/sessions/{id}", "/admin/",
+                "/api/runtime/sessions/{id}",
             }},
         });
     });
 
+    const auto add_runtime_metrics = [&](json & value) {
+        if (!runtime_metrics) return;
+        for (const auto & item : runtime_metrics()) {
+            value[item.first] = item.second;
+        }
+    };
+    const auto add_session_metrics = [&](json & value) {
+        if (!session_control.metrics) return;
+        for (const auto & item : session_control.metrics()) {
+            value[item.first] = item.second;
+        }
+    };
+
     server.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
-        set_json(res, {
+        json health = {
             {"status", reloading.load() ? "loading" : "ok"},
             {"model", config.model_name},
             {"model_type", config.model_type},
@@ -2589,7 +2829,10 @@ int run_mfq_server(
             {"tts_sampling_defaults", tts_sampling_defaults},
             {"runtime_profile_source", config.runtime_profile.source},
             {"chat_template_capabilities", chat_template_capabilities},
-        });
+        };
+        add_runtime_metrics(health);
+        add_session_metrics(health);
+        set_json(res, health);
     });
 
     server.Get("/api/status", [&](const httplib::Request & req, httplib::Response & res) {
@@ -2606,7 +2849,52 @@ int run_mfq_server(
         status["model_capabilities"] = model_capabilities;
         status["duplex_available"] = static_cast<bool>(duplex);
         status["duplex_active"] = duplex_is_active();
+        add_runtime_metrics(status);
+        add_session_metrics(status);
         set_json(res, status);
+    });
+
+    server.Post("/api/runtime/cache/clear", [&] (
+            const httplib::Request & req, httplib::Response & res) {
+        if (!authorized(req, res, config.api_key)) return;
+        if (!session_control.clear) {
+            set_json(res, error_body(
+                "this runtime does not expose a prefix cache",
+                "unsupported_operation"), 501);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> gate(reload_gate);
+            bool expected = false;
+            if (!reloading.compare_exchange_strong(expected, true)) {
+                set_json(res, error_body(
+                    "a runtime control operation is already in progress",
+                    "conflict"), 409);
+                return;
+            }
+            if (server_metrics.active_requests() != 0 ||
+                duplex_is_active()) {
+                reloading.store(false);
+                set_json(res, error_body(
+                    "cannot clear the prefix cache while a generation or "
+                    "duplex session is active",
+                    "conflict"), 409);
+                return;
+            }
+        }
+        try {
+            const size_t released = session_control.clear();
+            json result = {
+                {"status", "ok"},
+                {"released_snapshots", released},
+            };
+            add_session_metrics(result);
+            reloading.store(false);
+            set_json(res, result);
+        } catch (const std::exception & error) {
+            reloading.store(false);
+            set_json(res, error_body(error.what(), "server_error"), 500);
+        }
     });
 
     server.Post("/api/runtime/sessions/fork", [&] (
@@ -2778,6 +3066,23 @@ int run_mfq_server(
                 body, chat, *tokenizer, chat_templates.get(),
                 active_context.load(), config.model_type,
                 sampling_defaults);
+            if (body.contains("mfq_multimodal")) {
+                if (!chat) {
+                    throw ApiError(
+                        400, "invalid_request_error",
+                        "mfq_multimodal is only valid for chat completions",
+                        "mfq_multimodal");
+                }
+                if (!multimodal_generate) {
+                    throw ApiError(
+                        501, "unsupported_parameter",
+                        "the loaded model has no native vision runtime",
+                        "mfq_multimodal");
+                }
+                work.vision = parse_mfq_vision(
+                    body["mfq_multimodal"], work.prompt, *tokenizer);
+                work.cache_plan = {};
+            }
             const std::string id = request_id(chat ? "chatcmpl-" : "cmpl-");
             const int64_t created = unix_time_seconds();
             std::shared_ptr<ActiveRequest> active_request;
@@ -2796,7 +3101,7 @@ int run_mfq_server(
             if (!work.stream) {
                 RequestMetrics metrics;
                 CompletionResult result = generate_text(
-                    work, *tokenizer, generate,
+                    work, *tokenizer, generate, multimodal_generate,
                     [](const common_chat_msg_diff &) {
                         return true;
                     },
@@ -2836,6 +3141,8 @@ int run_mfq_server(
                                                 result.finish_reason,
                                                 usage_json(work.prompt.size(), result.completion_tokens));
                 }
+                response["mfq_metrics"] =
+                    request_metric_values_json(metric_values, work.sampling);
                 set_json(res, response);
                 return;
             }
@@ -2845,7 +3152,7 @@ int run_mfq_server(
             res.set_chunked_content_provider(
                 "text/event-stream; charset=utf-8",
                 [work = std::move(work), id, created, &tokenizer, &generate,
-                 &config, active_request, chat]
+                 &multimodal_generate, &config, active_request, chat]
                 (size_t offset, httplib::DataSink & sink) mutable -> bool {
                     if (offset != 0) {
                         sink.done();
@@ -2859,6 +3166,7 @@ int run_mfq_server(
                         RequestMetrics metrics;
                         CompletionResult result = generate_text(
                             work, *tokenizer, generate,
+                            multimodal_generate,
                             [&](const common_chat_msg_diff & diff) {
                                 if (!chat) {
                                     if (diff.content_delta.empty()) {
@@ -2888,7 +3196,11 @@ int run_mfq_server(
                         const json final_chunk = chat
                             ? chat_chunk(id, created, config.model_name, json::object(), result.finish_reason)
                             : completion_chunk(id, created, config.model_name, "", result.finish_reason);
-                        if (!write_sse(sink, final_chunk)) return false;
+                        json enriched_final_chunk = final_chunk;
+                        enriched_final_chunk["mfq_metrics"] =
+                            request_metric_values_json(
+                                metric_values, work.sampling);
+                        if (!write_sse(sink, enriched_final_chunk)) return false;
                         if (work.include_usage) {
                             const json usage = usage_json(work.prompt.size(), result.completion_tokens);
                             const json usage_chunk = stream_usage_chunk(

@@ -232,6 +232,45 @@ void test_nint_record_dtypes() {
                 record.dtype +
                     " tied embedding projection mismatch");
         }
+
+        mfq::metal::set_mlx_predequantize_fp16(true);
+        const auto dense_linear =
+            mfq::metal::MlxLinear::load(model, record.name);
+        const auto dense_embedding =
+            mfq::metal::MlxEmbedding::load(model, record.name);
+        mfq::metal::set_mlx_predequantize_fp16(false);
+        require(
+            !dense_linear.packed() &&
+                dense_linear.dense_weight_ref() != nullptr &&
+                dense_linear.dense_weight_ref()->dtype() ==
+                    mlx::core::float16,
+            record.dtype + " was not materialized as FP16");
+        auto dense_projection = mlx::core::astype(
+            dense_linear(projection_input),
+            mlx::core::float32);
+        auto dense_tied_projection = mlx::core::astype(
+            dense_embedding.project(projection_input),
+            mlx::core::float32);
+        mlx::core::eval(
+            dense_projection,
+            dense_tied_projection);
+        const auto* dense_values = dense_projection.data<float>();
+        const auto* dense_tied_values =
+            dense_tied_projection.data<float>();
+        for (std::size_t index = 0;
+             index < dense_projection.size();
+             ++index) {
+            require(
+                std::fabs(dense_values[index] - linear_values[index]) <
+                    2e-2f,
+                record.dtype + " FP16 materialization mismatch");
+            require(
+                std::fabs(
+                    dense_tied_values[index] -
+                    tied_values[index]) < 2e-2f,
+                record.dtype +
+                    " FP16 tied materialization mismatch");
+        }
     }
 }
 

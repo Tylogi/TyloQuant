@@ -3,6 +3,7 @@
 
 #include <mlx/allocator.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -18,6 +19,40 @@ namespace {
 using mlx::core::Dtype;
 using mlx::core::Shape;
 using mlx::core::array;
+
+std::atomic_bool g_predequantize_fp16{false};
+
+template <typename Variant>
+array materialize_weight_fp16(
+    const Variant& weight,
+    int output_size) {
+    const auto row_ids = mlx::core::arange(
+        0,
+        output_size,
+        1,
+        mlx::core::int32);
+    auto dense = std::visit(
+        [&](const auto& value) -> array {
+            using Weight = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<Weight, array>) {
+                return value.dtype() == mlx::core::float16
+                    ? value
+                    : mlx::core::astype(value, mlx::core::float16);
+            } else if constexpr (
+                std::is_same_v<Weight, MlxTpqPqWeight>
+                || std::is_same_v<Weight, MlxMxWeight>
+            ) {
+                return value.dequantize(mlx::core::float16);
+            } else {
+                return value.embedding(
+                    row_ids,
+                    mlx::core::float16);
+            }
+        },
+        weight);
+    dense.eval();
+    return dense;
+}
 
 template <typename Variant>
 std::optional<array> unpack_quantized_weight(
@@ -138,6 +173,14 @@ array load_weight(
 
 } // namespace
 
+void set_mlx_predequantize_fp16(bool enabled) noexcept {
+    g_predequantize_fp16.store(enabled, std::memory_order_relaxed);
+}
+
+bool mlx_predequantize_fp16_enabled() noexcept {
+    return g_predequantize_fp16.load(std::memory_order_relaxed);
+}
+
 array load_dense_array(
     const std::string& dtype_name,
     std::span<const std::uint8_t> blob) {
@@ -183,37 +226,44 @@ array load_dense_array(
 MlxLinear MlxLinear::load(
     const MfqContainer& model,
     const std::string& name) {
+    const auto finish = [](MlxLinear result) {
+        if (mlx_predequantize_fp16_enabled()) {
+            result.materialize_fp16();
+        }
+        return result;
+    };
     const auto& record = model.record(name);
     if (is_nint8_zero_dtype(record.dtype)) {
         const auto mapped = model.map_record(name);
-        return MlxLinear(
-            MlxNint8ZeroWeight::from_blob(mapped.view()));
+        return finish(MlxLinear(
+            MlxNint8ZeroWeight::from_blob(mapped.view())));
     }
     if (is_nint_dtype(record.dtype)) {
         const auto mapped = model.map_record(name);
-        return MlxLinear(MlxNintWeight::from_blob(mapped.view()));
+        return finish(MlxLinear(
+            MlxNintWeight::from_blob(mapped.view())));
     }
     if (is_vq_dtype(record.dtype)) {
         const auto mapped = model.map_record(name);
-        return MlxLinear(
-            MlxVqWeight::from_blob(record.dtype, mapped.view()));
+        return finish(MlxLinear(
+            MlxVqWeight::from_blob(record.dtype, mapped.view())));
     }
     if (record.dtype == "TPQ-I4G64" ||
         record.dtype == "TPQ-I4G64") {
-        return MlxLinear(
-            MlxTpqInt4Weight::from_blob(model.read(name)));
+        return finish(MlxLinear(
+            MlxTpqInt4Weight::from_blob(model.read(name))));
     }
     if (is_tpq_dtype(record.dtype)) {
-        return MlxLinear(
+        return finish(MlxLinear(
             MlxTpqPqWeight::from_blob(
                 record.dtype,
-                model.read(name)));
+                model.read(name))));
     }
     if (is_mx_dtype(record.dtype)) {
-        return MlxLinear(
-            MlxMxWeight::from_blob(record.dtype, model.read(name)));
+        return finish(MlxLinear(
+            MlxMxWeight::from_blob(record.dtype, model.read(name))));
     }
-    return MlxLinear(load_weight(model, name));
+    return finish(MlxLinear(load_weight(model, name)));
 }
 
 MlxLinear::MlxLinear(MlxNintWeight weight)
@@ -254,6 +304,14 @@ MlxLinear::MlxLinear(array weight)
     }
     output_size_ = dense.shape(0);
     input_size_ = dense.shape(1);
+}
+
+std::optional<array> MlxLinear::greedy_argmax(
+    const array& input) const {
+    if (const auto* packed = std::get_if<MlxNintWeight>(&weight_)) {
+        return packed->greedy_argmax(input);
+    }
+    return std::nullopt;
 }
 
 array MlxLinear::operator()(const array& input) const {
@@ -459,29 +517,41 @@ const array* MlxLinear::dense_weight_ref() const noexcept {
     return std::get_if<array>(&weight_);
 }
 
+void MlxLinear::materialize_fp16() {
+    if (std::holds_alternative<array>(weight_)) return;
+    auto dense = materialize_weight_fp16(weight_, output_size_);
+    weight_ = std::move(dense);
+}
+
 MlxEmbedding MlxEmbedding::load(
     const MfqContainer& model,
     const std::string& name) {
+    const auto finish = [](MlxEmbedding result) {
+        if (mlx_predequantize_fp16_enabled()) {
+            result.materialize_fp16();
+        }
+        return result;
+    };
     const auto& record = model.record(name);
     if (is_nint8_zero_dtype(record.dtype)) {
         const auto mapped = model.map_record(name);
-        return MlxEmbedding(
-            MlxNint8ZeroWeight::from_blob(mapped.view()));
+        return finish(MlxEmbedding(
+            MlxNint8ZeroWeight::from_blob(mapped.view())));
     }
     if (is_nint_dtype(record.dtype)) {
         const auto mapped = model.map_record(name);
-        return MlxEmbedding(
-            MlxNintWeight::from_blob(mapped.view()));
+        return finish(MlxEmbedding(
+            MlxNintWeight::from_blob(mapped.view())));
     }
     if (is_vq_dtype(record.dtype)) {
         const auto mapped = model.map_record(name);
-        return MlxEmbedding(
-            MlxVqWeight::from_blob(record.dtype, mapped.view()));
+        return finish(MlxEmbedding(
+            MlxVqWeight::from_blob(record.dtype, mapped.view())));
     }
     if (record.dtype == "TPQ-I4G64" ||
         record.dtype == "TPQ-I4G64") {
-        return MlxEmbedding(
-            MlxTpqInt4Weight::from_blob(model.read(name)));
+        return finish(MlxEmbedding(
+            MlxTpqInt4Weight::from_blob(model.read(name))));
     }
     if (is_tpq_dtype(record.dtype)) {
         throw std::runtime_error(
@@ -489,10 +559,10 @@ MlxEmbedding MlxEmbedding::load(
             name);
     }
     if (is_mx_dtype(record.dtype)) {
-        return MlxEmbedding(
-            MlxMxWeight::from_blob(record.dtype, model.read(name)));
+        return finish(MlxEmbedding(
+            MlxMxWeight::from_blob(record.dtype, model.read(name))));
     }
-    return MlxEmbedding(load_weight(model, name));
+    return finish(MlxEmbedding(load_weight(model, name)));
 }
 
 MlxEmbedding::MlxEmbedding(MlxNintWeight weight)
@@ -528,6 +598,12 @@ MlxEmbedding::MlxEmbedding(array weight)
     }
     vocabulary_size_ = dense.shape(0);
     hidden_size_ = dense.shape(1);
+}
+
+void MlxEmbedding::materialize_fp16() {
+    if (std::holds_alternative<array>(weight_)) return;
+    auto dense = materialize_weight_fp16(weight_, vocabulary_size_);
+    weight_ = std::move(dense);
 }
 
 array MlxEmbedding::operator()(

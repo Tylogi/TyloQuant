@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -17,6 +18,13 @@ public:
         std::span<const std::uint8_t> blob);
 
     mlx::core::array matmul(const mlx::core::array& input) const;
+    mlx::core::array matmul_add(
+        const mlx::core::array& input,
+        const mlx::core::array& residual) const;
+    // Decode-only fast path for a single FP16 row. Supported layouts compute
+    // the LM-head projection and greedy argmax without materializing logits.
+    std::optional<mlx::core::array> greedy_argmax(
+        const mlx::core::array& input) const;
     bool can_fuse_swiglu(
         const MlxNintWeight& up) const noexcept;
     mlx::core::array swiglu(
@@ -65,6 +73,10 @@ public:
     }
 
 private:
+    mlx::core::array matmul_impl(
+        const mlx::core::array& input,
+        const mlx::core::array* residual) const;
+
     MlxNintWeight(
         mlx::core::array q_packed,
         mlx::core::array sub_scale,

@@ -7,6 +7,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct MfqSamplingParams {
@@ -65,6 +66,16 @@ struct MfqPromptCachePlan {
     size_t stable_prefix_tokens = 0;
 };
 
+struct MfqVisionInput {
+    std::vector<float> pixel_values;
+    std::vector<int64_t> pixel_shape;
+    std::vector<uint8_t> patch_mask;
+    std::vector<int64_t> patch_mask_shape;
+    std::vector<int32_t> target_sizes;
+    std::vector<int64_t> target_sizes_shape;
+    std::vector<int64_t> image_bounds;
+};
+
 struct MfqServerConfig {
     std::string host = "127.0.0.1";
     int port = 8080;
@@ -73,7 +84,6 @@ struct MfqServerConfig {
     std::vector<uint8_t> tokenizer_gguf;
     std::string tokenizer_model;
     std::string api_key;
-    std::string web_root;
     int64_t max_context = 0;
     int64_t context_capacity = 0;
     int64_t vocab_size = 0;
@@ -152,8 +162,21 @@ struct MfqDuplexBackend {
 };
 
 using MfqTokenCallback = std::function<bool(int64_t token)>;
+
+struct MfqPrefillTiming {
+    size_t prompt_tokens = 0;
+    // Language-model prompt evaluation only. This is the field comparable to
+    // llama.cpp's prompt-eval timing.
+    double llm_ms = 0.0;
+    // Vision/audio encoder and multimodal projector work preceding the LLM.
+    double multimodal_ms = 0.0;
+    // Complete model-side prefill wall time, excluding request parsing,
+    // tokenization, media decoding/preprocessing, queueing and sampling.
+    double model_ms = 0.0;
+};
+
 using MfqPrefillCallback =
-    std::function<void(size_t prompt_tokens, double prefill_ms)>;
+    std::function<void(const MfqPrefillTiming & timing)>;
 using MfqGenerateFn = std::function<int32_t(
     const std::vector<int64_t> & prompt,
     const MfqSamplingParams & sampling,
@@ -161,13 +184,24 @@ using MfqGenerateFn = std::function<int32_t(
     const MfqPrefillCallback & on_prefill,
     const MfqPromptCachePlan & cache_plan,
     const MfqTokenConstraintPtr & token_constraint)>;
+using MfqMultimodalGenerateFn = std::function<int32_t(
+    const std::vector<int64_t> & prompt,
+    const MfqVisionInput & vision,
+    const MfqSamplingParams & sampling,
+    const MfqTokenCallback & on_token,
+    const MfqPrefillCallback & on_prefill,
+    const MfqTokenConstraintPtr & token_constraint)>;
 using MfqReloadFn = std::function<int64_t(int64_t context_size)>;
+using MfqRuntimeMetricsFn =
+    std::function<std::vector<std::pair<std::string, double>>() >;
 
 struct MfqSessionControl {
     std::function<size_t(
         const std::string & source_session_id,
         const std::string & target_session_id)> fork;
     std::function<size_t(const std::string & session_id)> close;
+    std::function<std::vector<std::pair<std::string, double>>()> metrics;
+    std::function<size_t()> clear;
 };
 
 int run_mfq_server(
@@ -175,7 +209,9 @@ int run_mfq_server(
     const MfqGenerateFn & generate,
     const MfqReloadFn & reload = {},
     const MfqDuplexBackend & duplex = {},
-    const MfqSessionControl & session_control = {});
+    const MfqSessionControl & session_control = {},
+    const MfqMultimodalGenerateFn & multimodal_generate = {},
+    const MfqRuntimeMetricsFn & runtime_metrics = {});
 MfqTokenizerProbe probe_mfq_tokenizer(
     const std::vector<uint8_t> & tokenizer_gguf,
     const std::string & text,
