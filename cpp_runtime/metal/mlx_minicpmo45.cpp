@@ -28,6 +28,19 @@
 #include <vector>
 
 namespace mfq::metal {
+
+void configure_minicpmo45_metal_device() {
+    // MiniCPM-o decode has many small dependent kernels per token.  Larger
+    // command buffers reduce submission/fence overhead without changing the
+    // graph.  Keep both knobs overridable for devices with tighter memory.
+    if (std::getenv("MLX_MAX_OPS_PER_BUFFER") == nullptr) {
+        ::setenv("MLX_MAX_OPS_PER_BUFFER", "256", 0);
+    }
+    if (std::getenv("MLX_MAX_MB_PER_BUFFER") == nullptr) {
+        ::setenv("MLX_MAX_MB_PER_BUFFER", "512", 0);
+    }
+}
+
 namespace {
 
 using mlx::core::Shape;
@@ -36,7 +49,8 @@ using mlx::core::array;
 constexpr const char* kResamplerPositionAsset =
     "__mfq_asset__/minicpmo45-resampler-pos-embed-v1.bf16";
 
-void configure_minicpmo_sdpa() {
+void configure_minicpmo_metal() {
+    configure_minicpmo45_metal_device();
     // MLX otherwise selects 256 partial-reduction blocks for an 8k decode
     // cache on large Apple GPUs. llama.cpp's vector attention uses far fewer
     // workgroups; 64 is the measured optimum for MiniCPM-o's 32:8 GQA and
@@ -447,12 +461,10 @@ kernel void mfq_minicpmo_qk_norm_rope_cache_4head_v1(
             encoder.set_input_array(
                 inputs[static_cast<std::size_t>(index)], index);
         }
-        // The kernel mutates both persistent cache buffers in place.  MLX
-        // cannot infer that from set_input_array(), so register the buffers
-        // as outputs as well.  Without this, the following attention kernel
-        // may read the cache before these writes are visible.
+        // One persistent output is sufficient as a synchronization sentinel:
+        // MLX emits a buffers-scope barrier before attention, which also makes
+        // the value-cache writes visible without tracking that full allocation.
         encoder.register_output_array(inputs[5]);
-        encoder.register_output_array(inputs[6]);
         encoder.set_output_array(output, 8);
         encoder.set_bytes(params_, 9);
         encoder.dispatch_threadgroups(
@@ -626,11 +638,9 @@ kernel void mfq_minicpmo_kv_cache_write_v1(
         for (int index = 1; index < 5; ++index) {
             encoder.set_input_array(inputs[index], index);
         }
-        // key_cache and value_cache are in-place outputs even though the
-        // primitive returns the query passthrough.  Register them so MLX
-        // inserts the buffer barrier required by the subsequent attention.
+        // Tracking one cache is enough to trigger the global buffers barrier
+        // that covers both in-place cache writes.
         encoder.register_output_array(inputs[3]);
-        encoder.register_output_array(inputs[4]);
         encoder.set_bytes(params_, 5);
         encoder.dispatch_threads(
             MTL::Size(8 * 128, 1, 1),
@@ -4598,7 +4608,7 @@ MlxMiniCPMO45Runtime MlxMiniCPMO45Runtime::load(
     const MfqContainer& model,
     std::int64_t context_size,
     bool load_modalities) {
-    configure_minicpmo_sdpa();
+    configure_minicpmo_metal();
     auto config = language_config(model, context_size);
     auto language = MiniQwen3Language::load(
         model, config, language_names());

@@ -15,6 +15,10 @@
 
 namespace mfq::metal {
 
+// Configure MiniCPM-o command-buffer defaults before the Metal device is first
+// created. Explicit environment settings always take precedence.
+void configure_minicpmo45_metal_device();
+
 struct MlxMiniCPMO45Inputs {
     mlx::core::array input_ids;
     std::optional<mlx::core::array> position_ids;

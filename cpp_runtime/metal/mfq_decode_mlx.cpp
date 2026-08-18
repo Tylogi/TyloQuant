@@ -1656,6 +1656,11 @@ int main(int argc, char** argv) {
                 << "\n";
         }
         if (arguments.server) {
+            if (model.header().architecture.rfind("minicpmo", 0) == 0) {
+                // Command-buffer limits are captured when MLX first creates
+                // its Metal device, which configure_mlx_metal() does below.
+                mfq::metal::configure_minicpmo45_metal_device();
+            }
             configure_mlx_metal();
 #ifdef MFQ_METAL_SERVER
             return run_native_server(arguments, model);
