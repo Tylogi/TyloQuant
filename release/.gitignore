@@ -1,6 +1,6 @@
-.venv/
-build/
-dist/
-Frameworks/
-Resources/
-sidecars/
+/.venv/
+/build/
+/sidecars/
+/Frameworks/
+/Resources/
+/dist/
