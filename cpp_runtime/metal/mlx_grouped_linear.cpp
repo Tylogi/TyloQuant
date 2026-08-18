@@ -1481,7 +1481,7 @@ std::string make_interleaved_nint4_qkv_source() {
                 activation_sum += activation.x + activation.y
                     + activation.z + activation.w;
                 for (uint row = 0u; row < Q_ROWS_PER_SIMD; ++row) {
-                    uint byte_index = q_metadata_bases[row]
+                    uint byte_index = (q_metadata_bases[row] + group)
                         * GROUP_BYTES + chunk * 2u;
                     uint packed = uint(q_packed_0[byte_index])
                         | (uint(q_packed_0[byte_index + 1u]) << 8u);
@@ -1567,8 +1567,8 @@ std::string make_interleaved_nint4_qkv_source() {
                 + activation.z + activation.w;
 
             for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
-                uint q_byte =
-                    q_metadata_bases[row] * GROUP_BYTES + chunk * 2u;
+                uint q_byte = (q_metadata_bases[row] + group)
+                    * GROUP_BYTES + chunk * 2u;
                 uint q_packed = uint(q_packed_0[q_byte])
                     | (uint(q_packed_0[q_byte + 1u]) << 8u);
                 float4 q_quantized = float4(
@@ -1577,8 +1577,8 @@ std::string make_interleaved_nint4_qkv_source() {
                     float((q_packed >> 8u) & 15u),
                     float((q_packed >> 12u) & 15u));
                 q_quantized_dots[row] += dot(activation, q_quantized);
-                uint k_byte =
-                    k_metadata_bases[row] * GROUP_BYTES + chunk * 2u;
+                uint k_byte = (k_metadata_bases[row] + group)
+                    * GROUP_BYTES + chunk * 2u;
                 uint k_packed = uint(q_packed_1[k_byte])
                     | (uint(q_packed_1[k_byte + 1u]) << 8u);
                 float4 k_quantized = float4(
@@ -1588,8 +1588,8 @@ std::string make_interleaved_nint4_qkv_source() {
                     float((k_packed >> 12u) & 15u));
                 k_quantized_dots[row] += dot(activation, k_quantized);
 
-                uint v_byte =
-                    v_metadata_bases[row] * GROUP_BYTES + chunk * 2u;
+                uint v_byte = (v_metadata_bases[row] + group)
+                    * GROUP_BYTES + chunk * 2u;
                 uint v_packed = uint(q_packed_2[v_byte])
                     | (uint(q_packed_2[v_byte + 1u]) << 8u);
                 float4 v_quantized = float4(

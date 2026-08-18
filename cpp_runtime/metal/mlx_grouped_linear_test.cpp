@@ -1451,11 +1451,11 @@ int main() {
             constexpr int tail_input_width = 65;
             constexpr int backing_width = 73;
             const auto q_blob = make_nint4_gs24_blob(
-                tail_input_width, 17, 3);
+                tail_input_width, 17, 2);
             const auto k_blob = make_nint4_gs24_blob(
-                tail_input_width, 9, 7);
+                tail_input_width, 9, 4);
             const auto v_blob = make_nint4_gs24_blob(
-                tail_input_width, 9, 11);
+                tail_input_width, 9, 6);
             const auto q_weight =
                 mfq::metal::MlxNintWeight::from_blob(q_blob);
             const auto k_weight =

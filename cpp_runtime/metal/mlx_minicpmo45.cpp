@@ -447,6 +447,12 @@ kernel void mfq_minicpmo_qk_norm_rope_cache_v2(
             encoder.set_input_array(
                 inputs[static_cast<std::size_t>(index)], index);
         }
+        // The kernel mutates both persistent cache buffers in place.  MLX
+        // cannot infer that from set_input_array(), so register the buffers
+        // as outputs as well.  Without this, the following attention kernel
+        // may read the cache before these writes are visible.
+        encoder.register_output_array(inputs[5]);
+        encoder.register_output_array(inputs[6]);
         encoder.set_output_array(output, 8);
         encoder.set_bytes(params_, 9);
         encoder.dispatch_threadgroups(
@@ -620,6 +626,11 @@ kernel void mfq_minicpmo_kv_cache_write_v1(
         for (int index = 1; index < 5; ++index) {
             encoder.set_input_array(inputs[index], index);
         }
+        // key_cache and value_cache are in-place outputs even though the
+        // primitive returns the query passthrough.  Register them so MLX
+        // inserts the buffer barrier required by the subsequent attention.
+        encoder.register_output_array(inputs[3]);
+        encoder.register_output_array(inputs[4]);
         encoder.set_bytes(params_, 5);
         encoder.dispatch_threads(
             MTL::Size(8 * 128, 1, 1),
@@ -4027,6 +4038,92 @@ void test_minicpmo45_qk_norm_rope() {
         throw std::runtime_error(
             "MiniCPM-o inline Q/K cache write changed FP16 values: " +
             std::to_string(inline_maximum));
+    }
+
+    // Keep the cache write and its first consumer in one lazy graph.  A
+    // value-only check after query.eval() cannot detect a missing Metal
+    // buffer hazard because the synchronization has already made the cache
+    // writes visible.  At sequence length one, attention must return the
+    // value vector repeated for every GQA query head.
+    constexpr int hazard_capacity = 16;
+    auto combined_key_cache = mlx::core::zeros(
+        Shape{1, key_heads, hazard_capacity, head_dim},
+        mlx::core::float16);
+    auto combined_value_cache = mlx::core::zeros(
+        combined_key_cache.shape(), mlx::core::float16);
+    mlx::core::eval(combined_key_cache, combined_value_cache);
+    auto normalized_zero = mini_qk_norm_rope(
+        query_projection,
+        key_projection,
+        query_norm,
+        key_norm,
+        query_heads,
+        key_heads,
+        head_dim,
+        base,
+        0);
+    auto combined_query = mini_kv_cache_write(
+        normalized_zero.first,
+        normalized_zero.second,
+        reference_value,
+        combined_key_cache,
+        combined_value_cache,
+        0,
+        hazard_capacity);
+    auto combined_attention = mini_gqa_attention(
+        combined_query,
+        combined_key_cache,
+        combined_value_cache,
+        1,
+        hazard_capacity);
+    const auto expected_attention = mlx::core::repeat(
+        reference_value, 4, 1);
+    auto combined_hazard_difference = mlx::core::max(mlx::core::abs(
+        mlx::core::astype(combined_attention, mlx::core::float32) -
+        mlx::core::astype(expected_attention, mlx::core::float32)));
+    combined_hazard_difference.eval();
+    const float combined_hazard_maximum =
+        combined_hazard_difference.item<float>();
+    if (!std::isfinite(combined_hazard_maximum) ||
+        combined_hazard_maximum > 0.0f) {
+        throw std::runtime_error(
+            "MiniCPM-o combined cache write was not visible to attention: " +
+            std::to_string(combined_hazard_maximum));
+    }
+
+    auto hazard_key_cache = mlx::core::zeros(
+        Shape{1, key_heads, hazard_capacity, head_dim},
+        mlx::core::float16);
+    auto hazard_value_cache = mlx::core::zeros(
+        hazard_key_cache.shape(), mlx::core::float16);
+    mlx::core::eval(hazard_key_cache, hazard_value_cache);
+    auto hazard_query = mini_qk_norm_rope_cache(
+        query_projection,
+        key_projection,
+        value_projection,
+        mini_rope_table(base, 0),
+        query_norm,
+        key_norm,
+        base,
+        0,
+        hazard_key_cache,
+        hazard_value_cache,
+        hazard_capacity);
+    auto hazard_attention = mini_gqa_attention(
+        hazard_query,
+        hazard_key_cache,
+        hazard_value_cache,
+        1,
+        hazard_capacity);
+    auto hazard_difference = mlx::core::max(mlx::core::abs(
+        mlx::core::astype(hazard_attention, mlx::core::float32) -
+        mlx::core::astype(expected_attention, mlx::core::float32)));
+    hazard_difference.eval();
+    const float hazard_maximum = hazard_difference.item<float>();
+    if (!std::isfinite(hazard_maximum) || hazard_maximum > 0.0f) {
+        throw std::runtime_error(
+            "MiniCPM-o inline cache write was not visible to attention: " +
+            std::to_string(hazard_maximum));
     }
 }
 
