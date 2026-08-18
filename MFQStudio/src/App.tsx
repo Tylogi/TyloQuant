@@ -1664,7 +1664,10 @@ export default function App() {
           setCapabilities(results[0].value);
           setModel(results[0].value.model);
         }
-        if (results[1].status === "fulfilled") setModels(results[1].value);
+        if (results[1].status === "fulfilled") {
+          setModels(results[1].value);
+          if (results[0].status !== "fulfilled") setModel(results[1].value[0]?.id ?? "");
+        }
         if (results[2].status === "fulfilled") {
           setRuntime(results[2].value);
           if (!hadStoredSettings.current && results[2].value.sampling_defaults) {
@@ -3229,7 +3232,8 @@ export default function App() {
           <summary>{tr("新会话默认设置", "New session defaults")}</summary>
           <label htmlFor="new-model">{tr("模型", "Model")}</label>
           <select id="new-model" value={model} onChange={(event) => setModel(event.target.value)}>
-            {(models.length ? models : [{ id: model }]).map((item) => <option key={item.id} value={item.id}>{item.id}</option>)}
+            {!models.length && <option value="">{tr("尚未加载模型", "No model loaded")}</option>}
+            {models.map((item) => <option key={item.id} value={item.id}>{item.id}</option>)}
           </select>
           <div className="mode-picker">
             {(["text", "voice", "full_duplex"] as SessionMode[]).map((item) => {
@@ -3297,7 +3301,7 @@ export default function App() {
           <section className="chat-view">
             <div className="message-scroller" onScroll={handleMessageScroll} ref={messageScrollerRef}>
               <div className="message-list" aria-live="polite">
-                {!active && <div className="welcome"><img src="/mfq-mark.svg" alt="" /><h1>MFQ Studio</h1><p>{tr("创建会话后即可开始本地推理。", "Create a session to start local inference.")}</p><div className="prompt-grid"><button onClick={() => setDraft(tr("介绍一下这个模型。", "Introduce this model."))} type="button">{tr("介绍模型", "Introduce the model")}</button><button onClick={() => setDraft(tr("写一段 Python 示例。", "Write a Python example."))} type="button">{tr("代码示例", "Code example")}</button></div></div>}
+                {!active && <div className="welcome"><img src="/mfq-mark.svg" alt="" /><h1>MFQ Studio</h1><p>{models.length ? tr("创建会话后即可开始本地推理。", "Create a session to start local inference.") : tr("Server 已启动，请先在“模型与任务”中加载模型。", "The server is ready. Load a model from Models and jobs first.")}</p>{models.length ? <div className="prompt-grid"><button onClick={() => setDraft(tr("介绍一下这个模型。", "Introduce this model."))} type="button">{tr("介绍模型", "Introduce the model")}</button><button onClick={() => setDraft(tr("写一段 Python 示例。", "Write a Python example."))} type="button">{tr("代码示例", "Code example")}</button></div> : <button className="primary" onClick={() => openStudioPage("dashboard", "models")} type="button">{tr("前往加载模型", "Open model manager")}</button>}</div>}
                 {messages.map((message) => {
                   const parts = textParts(message);
                   const editing = editDraft?.messageId === message.id;

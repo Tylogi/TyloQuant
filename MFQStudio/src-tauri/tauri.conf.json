@@ -4,10 +4,10 @@
   "version": "0.1.0",
   "identifier": "com.tylogi.mfq-studio",
   "build": {
-    "beforeDevCommand": "npm --prefix ../web run dev",
-    "beforeBuildCommand": "npm --prefix ../web run build",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
     "devUrl": "http://127.0.0.1:5173",
-    "frontendDist": "../../web/dist"
+    "frontendDist": "../dist"
   },
   "app": {
     "withGlobalTauri": true,

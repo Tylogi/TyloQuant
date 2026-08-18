@@ -85,10 +85,11 @@ is rebuilt from the recipe retained in the manifest:
 mfq serve --host 127.0.0.1 --port 8090
 ```
 
-MFQ Server listens on `127.0.0.1:8090` by default. Users do not launch or manage
-the native executable directly. Public MFQ Server API authentication is optional
-and reads its token from `MFQ_SERVER_API_KEY`; pass `--api-key-env` to select
-another environment variable.
+MFQ Server listens on `127.0.0.1:8090` by default. Source users do not launch or
+manage the native executable directly; packaged launchers may pass their bundled
+worker through `--running-executable`. Public MFQ Server API authentication is
+optional and reads its token from `MFQ_SERVER_API_KEY`; pass `--api-key-env` to
+select another environment variable.
 That value is the root credential for creating scoped subkeys. Subkeys may use
 viewer, operator, or administrator roles and can add explicit inference,
 model-management, job/artifact, or administrative scopes. They may expire and
@@ -203,12 +204,12 @@ connections ignore host proxy settings, and request time, response size, and
 audit logging are bounded. MFQ Server logs the server and tool identity but not tool
 arguments.
 
-The React client lives in `MFQStudio/web`. `mfq serve` builds it automatically
-when its sources are newer than the local output. Its development server can
-also proxy API requests to MFQ Server:
+The React and Tauri clients share the `MFQStudio` package. `mfq serve` builds the
+web client automatically when its sources are newer than the local output. Its
+development server can also proxy API requests to MFQ Server:
 
 ```bash
-cd MFQStudio/web
+cd MFQStudio
 npm install
 npm run dev
 ```
@@ -219,7 +220,22 @@ A prebuilt client can still be selected explicitly:
 
 ```bash
 npm run build
-mfq serve --model path/to/model.mfq --web-root MFQStudio/web/dist
+mfq serve --model path/to/model.mfq --web-root MFQStudio/dist
 ```
 
 Use `--no-web-ui` for an API-only process.
+
+The same package runs and bundles the desktop client through Tauri:
+
+```bash
+npm run tauri dev
+npm run tauri build
+```
+
+In local mode, Studio starts `mfq serve` without an initial model, gives it a
+private application-data model catalog, and then uses the public model load API.
+If a platform runtime is bundled next to the application or in its resource
+directory, Studio passes it through `--running-executable`. The Models and jobs
+page can also open a native file picker and load an arbitrary local `.mfq` file.
+Studio registers the selected path in its private catalog without copying the
+model; selecting one shard registers the complete sibling shard family.

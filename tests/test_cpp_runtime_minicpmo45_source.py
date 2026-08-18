@@ -32,11 +32,11 @@ SERVER_SOURCE = (ROOT / "cpp_runtime" / "mfq_server.cpp").read_text(
 REALTIME_GATEWAY = (
     ROOT / "mfq" / "runtime" / "minicpmo45_realtime.py"
 ).read_text(encoding="utf-8")
-STUDIO_APP = (ROOT / "MFQStudio" / "web" / "src" / "App.tsx").read_text(
+STUDIO_APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
     encoding="utf-8"
 )
 STUDIO_REALTIME = (
-    ROOT / "MFQStudio" / "web" / "src" / "realtimeAudio.ts"
+    ROOT / "MFQStudio" / "src" / "realtimeAudio.ts"
 ).read_text(encoding="utf-8")
 
 

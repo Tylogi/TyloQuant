@@ -166,10 +166,16 @@ an initial model on the command line:
 ```shell
 uv run mfq serve
 uv run mfq serve --model path/to/model.mfq --host 127.0.0.1 --port 8090
+uv run mfq serve --model-dir path/to/models --host 127.0.0.1 --port 8090
 ```
 
 `--host` and `--port` control the public API listener and default to
 `127.0.0.1:8090`. Open the Web UI address printed by the command.
+
+The desktop Studio Models and jobs page can also select and load any local
+`.mfq` file. Studio registers the selected path in its private model catalog
+without copying the model; selecting one shard loads its complete sibling shard
+family.
 
 <img src="./docs/figures/tyloquant-mfq-webui-english.jpg" alt="TyloQuant MFQ local inference WebUI in English" width="100%">
 

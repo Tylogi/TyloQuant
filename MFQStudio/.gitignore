@@ -1,4 +1,8 @@
 node_modules/
+dist/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
 src-tauri/gen/
 src-tauri/icons/
 src-tauri/target/

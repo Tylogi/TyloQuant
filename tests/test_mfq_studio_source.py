@@ -2,25 +2,27 @@ import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-STUDIO = ROOT / "MFQStudio" / "desktop"
+STUDIO = ROOT / "MFQStudio"
 TAURI = STUDIO / "src-tauri"
 RUST = (TAURI / "src" / "main.rs").read_text(encoding="utf-8")
 BUILD = (TAURI / "build.rs").read_text(encoding="utf-8")
-APP = (ROOT / "MFQStudio" / "web" / "src" / "App.tsx").read_text(encoding="utf-8")
-MARKDOWN = (ROOT / "MFQStudio" / "web" / "src" / "Markdown.tsx").read_text(encoding="utf-8")
-MARKDOWN_TEXT = (ROOT / "MFQStudio" / "web" / "src" / "markdownText.ts").read_text(
-    encoding="utf-8"
-)
-STYLES = (ROOT / "MFQStudio" / "web" / "src" / "styles.css").read_text(encoding="utf-8")
-REALTIME_AUDIO = (ROOT / "MFQStudio" / "web" / "src" / "realtimeAudio.ts").read_text(
-    encoding="utf-8"
-)
+APP = (STUDIO / "src" / "App.tsx").read_text(encoding="utf-8")
+MARKDOWN = (STUDIO / "src" / "Markdown.tsx").read_text(encoding="utf-8")
+MARKDOWN_TEXT = (STUDIO / "src" / "markdownText.ts").read_text(encoding="utf-8")
+STUDIO_BRIDGE = (STUDIO / "src" / "studio.ts").read_text(encoding="utf-8")
+STYLES = (STUDIO / "src" / "styles.css").read_text(encoding="utf-8")
+REALTIME_AUDIO = (STUDIO / "src" / "realtimeAudio.ts").read_text(encoding="utf-8")
 
 
-def test_studio_embeds_the_shared_web_client():
+def test_studio_uses_one_package_for_web_and_desktop_clients():
     config = json.loads((TAURI / "tauri.conf.json").read_text(encoding="utf-8"))
-    assert config["build"]["frontendDist"] == "../../web/dist"
-    assert config["build"]["beforeBuildCommand"] == "npm --prefix ../web run build"
+    package = json.loads((STUDIO / "package.json").read_text(encoding="utf-8"))
+    assert not (STUDIO / "web").exists()
+    assert not (STUDIO / "desktop").exists()
+    assert package["name"] == "@mfq/studio"
+    assert package["scripts"]["tauri"] == "tauri"
+    assert config["build"]["frontendDist"] == "../dist"
+    assert config["build"]["beforeBuildCommand"] == "npm run build"
     assert config["identifier"] == "com.tylogi.mfq-studio"
     assert "icons/icon.ico" in config["bundle"]["icon"]
     assert "icons/icon.icns" in config["bundle"]["icon"]
@@ -58,6 +60,28 @@ def test_studio_supports_local_and_remote_server_connections_with_voice_controls
     assert "RealtimeAudioController" in APP
     assert '(["text", "voice", "full_duplex"] as SessionMode[])' in APP
     assert "selectInteractionMode" in APP
+
+
+def test_studio_handles_a_running_server_without_a_loaded_model():
+    assert 'useState("")' in APP
+    assert 'tr("尚未加载模型", "No model loaded")' in APP
+    assert 'disabled={!model}' in APP
+    assert 'statusResult.status === "fulfilled" ? statusResult.value : null' in APP
+    assert "setRuntime(status)" in APP
+    assert "Promise.allSettled([" in APP
+
+
+def test_studio_can_select_and_load_an_external_mfq_file_in_local_mode():
+    assert "rfd::AsyncFileDialog::new()" in RUST
+    assert 'add_filter("MFQ model", &["mfq"])' in RUST
+    assert "studio_select_model_file" in RUST
+    assert 'const MODEL_FILE_INDEX: &str = ".mfq-files.json"' in RUST
+    assert 'tauri.invoke<RegisteredStudioModel | null>("studio_select_model_file")' in STUDIO_BRIDGE
+    assert "selectLocalModelFile" in APP
+    assert "api.modelArtifacts(true)" in APP
+    assert "api.loadModel(artifact.name, contextSize)" in APP
+    assert 'studio?.config.mode === "local"' in APP
+    assert 'tr("选择本地 MFQ", "Choose local MFQ")' in APP
 
 
 def test_studio_drains_duplex_output_after_microphone_capture_stops():

@@ -596,6 +596,7 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
 .mcp-server button { border: 0; color: var(--muted); background: transparent; font-size: 9px; }
 .panel-action { width: 100%; border: 1px solid var(--panel-line); border-radius: 7px; margin-top: 7px; padding: 7px 9px; color: var(--muted); background: var(--panel-control); font-size: 9px; }
 .panel-action:hover { border-color: var(--line-strong); color: var(--ink); background: var(--surface-hover); }
+.model-file-action { display: inline-flex; align-items: center; justify-content: center; gap: 5px; }
 .request-panel { margin-top: 10px; }
 .cache-panel { margin-top: 10px; }
 .profile-panel { margin-top: 10px; }

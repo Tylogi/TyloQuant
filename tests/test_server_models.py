@@ -18,7 +18,12 @@ from mfq.formats.header import FileHeader
 from mfq.formats.io import save
 from mfq.server.api import create_app
 from mfq.server.backend import BackendDelta
-from mfq.server.catalog import DiscoveredModel, DuplicateModelNameError, ModelCatalog
+from mfq.server.catalog import (
+    MODEL_FILE_INDEX,
+    DiscoveredModel,
+    DuplicateModelNameError,
+    ModelCatalog,
+)
 from mfq.server.models import JobStatus, RuntimeInstanceState, SamplingParams
 from mfq.server.runtime_pool import ManagedRuntimePool, RuntimeConflictError, _ManagedRuntime
 from mfq.server.service import ServerService
@@ -29,6 +34,20 @@ from mfq.tools.split_mfq import split_mfq
 class IdleBackend:
     async def aclose(self) -> None:
         return None
+
+
+def test_empty_runtime_pool_reports_an_idle_server() -> None:
+    async def run() -> None:
+        pool = ManagedRuntimePool(ModelCatalog([]), "runtime", backend="metal")
+
+        status = await pool.runtime_status()
+        assert status["runtime_state"] == "idle"
+        assert status["model"] is None
+        assert status["active_requests"] == 0
+        assert await pool.runtime_models() == {"object": "list", "data": []}
+        assert await pool.realtime_capabilities() == {"available": False, "modes": []}
+
+    asyncio.run(run())
 
 
 def _model(path: Path, *, architecture: str = "test-model") -> None:
@@ -256,6 +275,56 @@ def test_catalog_rejects_duplicate_mfq_file_stems(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
+def test_catalog_discovers_a_registered_external_mfq_without_exposing_its_path(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        catalog_root = tmp_path / "catalog"
+        catalog_root.mkdir()
+        external_root = tmp_path / "private-models"
+        external_root.mkdir()
+        model = external_root / "manual.mfq"
+        _model(model)
+        (catalog_root / MODEL_FILE_INDEX).write_text(
+            json.dumps({"version": 1, "files": [str(model)]}),
+            encoding="utf-8",
+        )
+
+        catalog = ModelCatalog([catalog_root], cache_seconds=0)
+        result = await catalog.list()
+
+        assert [item.name for item in result.data] == ["manual"]
+        assert result.data[0].loadable
+        assert str(external_root) not in result.model_dump_json()
+        assert (await catalog.resolve("manual")).path == model
+
+    asyncio.run(run())
+
+
+def test_catalog_registered_shard_resolves_its_complete_external_family(tmp_path: Path) -> None:
+    async def run() -> None:
+        catalog_root = tmp_path / "catalog"
+        catalog_root.mkdir()
+        external_root = tmp_path / "private-models"
+        external_root.mkdir()
+        source = external_root / "source.mfq"
+        _model(source)
+        shards = split_mfq(source, external_root / "manual.mfq", split_max_tensors=1)
+        source.unlink()
+        (catalog_root / MODEL_FILE_INDEX).write_text(
+            json.dumps({"version": 1, "files": [str(shards[1])]}),
+            encoding="utf-8",
+        )
+
+        result = await ModelCatalog([catalog_root], cache_seconds=0).list()
+
+        assert [item.name for item in result.data] == ["manual"]
+        assert result.data[0].complete
+        assert result.data[0].shard_count == 2
+
+    asyncio.run(run())
+
+
 def test_managed_runtime_loads_and_unloads_through_persistent_jobs(tmp_path: Path) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"
@@ -284,6 +353,13 @@ def test_managed_runtime_loads_and_unloads_through_persistent_jobs(tmp_path: Pat
                 assert models.status_code == 200
                 artifact = models.json()["data"][0]
                 assert str(model_dir) not in models.text
+                idle = await client.get("/api/v1/runtime/status")
+                assert idle.status_code == 200
+                assert idle.json()["runtime_state"] == "idle"
+                assert idle.json()["model"] is None
+                realtime = await client.get("/api/v1/runtime/realtime/capabilities")
+                assert realtime.status_code == 200
+                assert realtime.json() == {"available": False, "modes": []}
 
                 accepted = await client.post(
                     "/api/v1/models/load",
@@ -329,6 +405,7 @@ def test_managed_runtime_loads_and_unloads_through_persistent_jobs(tmp_path: Pat
                     await asyncio.sleep(0.025)
                 assert unload_job["status"] == "succeeded", unload_job
                 assert (await client.get("/api/v1/runtime/instances")).json()["data"] == []
+                assert (await client.get("/api/v1/runtime/status")).json()["runtime_state"] == "idle"
                 assert store.get_job(unload_id).status == JobStatus.SUCCEEDED
         finally:
             await service.aclose()
