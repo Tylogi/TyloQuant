@@ -247,6 +247,9 @@ def test_minicpmo45_native_servers_share_mfqd_vision_tensors():
     assert "struct MfqVisionInput" in SERVER_HEADER
     assert "MfqMultimodalGenerateFn" in SERVER_HEADER
     assert "parse_mfq_vision(" in SERVER_SOURCE
+    assert "class TensorFileReader final" in SERVER_SOURCE
+    assert 'value.contains("binary_file")' in SERVER_SOURCE
+    assert "file_reader->read(" in SERVER_SOURCE
     assert 'single_special_token(tokenizer, "<image>")' in SERVER_SOURCE
     assert "MiniCPM-o image placeholder must contain 64 query tokens" in SERVER_SOURCE
     assert "generate_server_multimodal_tokens(" in DECODE

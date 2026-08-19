@@ -6,7 +6,12 @@ import base64
 import copy
 import io
 import math
+import os
+import platform
+import secrets
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -22,6 +27,180 @@ class ProcessedVisionRequest:
     tensors: dict[str, Any]
     source_count: int
     frame_count: int
+    cleanup_paths: tuple[Path, ...] = ()
+
+
+@dataclass(frozen=True)
+class _PreparedVideoFrame:
+    image: Any
+    source_size: tuple[int, int]
+
+
+class _AVFoundationVideoDecoder:
+    def __init__(self, library: str | Path) -> None:
+        import ctypes
+
+        self._ctypes = ctypes
+        self._callback_type = ctypes.CFUNCTYPE(
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_double,
+        )
+        self._library = ctypes.CDLL(str(library))
+        function = self._library.mfq_avfoundation_sample_video
+        function.argtypes = [
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.c_int,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int,
+            self._callback_type,
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+        function.restype = ctypes.c_int
+        self._sample = function
+
+    def decode(
+        self,
+        data: bytes,
+        *,
+        frames_per_second: float,
+        maximum_frames: int,
+        resize: Any,
+    ) -> list[_PreparedVideoFrame]:
+        import av
+
+        descriptor, temporary_path = tempfile.mkstemp(prefix="mfq-video-", suffix=".mp4")
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(data)
+            with av.open(temporary_path, mode="r") as container:
+                streams = [stream for stream in container.streams if stream.type == "video"]
+                if not streams:
+                    raise VisionProcessingError("video contains no video stream")
+                stream = streams[0]
+                if stream.time_base is None:
+                    raise VisionProcessingError("video stream has no time base")
+                time_base = stream.time_base
+                codec = stream.codec_context
+                color_metadata = {
+                    name: getattr(codec, name)
+                    for name in (
+                        "color_range",
+                        "colorspace",
+                        "color_primaries",
+                        "color_trc",
+                    )
+                }
+                packet_pts = sorted(
+                    packet.pts
+                    for packet in container.demux(stream)
+                    if packet.pts is not None
+                )
+            selected_pts: list[int] = []
+            next_timestamp: float | None = None
+            for pts in packet_pts:
+                timestamp = float(pts * time_base)
+                if next_timestamp is not None and timestamp + 1.0e-9 < next_timestamp:
+                    continue
+                selected_pts.append(pts)
+                next_timestamp = timestamp + 1.0 / frames_per_second
+                if len(selected_pts) >= maximum_frames:
+                    break
+            if not selected_pts:
+                raise VisionProcessingError("video contains no decodable frames")
+
+            ctypes = self._ctypes
+            targets = (ctypes.c_int64 * len(selected_pts))(*selected_pts)
+            frames: list[_PreparedVideoFrame | None] = [None] * len(selected_pts)
+            callback_error: list[BaseException] = []
+
+            def receive(
+                _context: Any,
+                target_index: int,
+                y_plane: Any,
+                y_stride: int,
+                _uv_plane: Any,
+                uv_stride: int,
+                width: int,
+                height: int,
+                _presentation_seconds: float,
+            ) -> int:
+                try:
+                    if target_index < 0 or target_index >= len(frames):
+                        raise VisionProcessingError(
+                            "AVFoundation returned an invalid frame index"
+                        )
+                    if y_stride != width or uv_stride != width:
+                        raise VisionProcessingError(
+                            "AVFoundation returned non-compact video planes"
+                        )
+                    raw = np.ctypeslib.as_array(
+                        y_plane,
+                        shape=(width * height * 3 // 2,),
+                    ).reshape(height * 3 // 2, width)
+                    frame = av.VideoFrame.from_ndarray(raw, format="nv12").reformat(
+                        format="yuv420p"
+                    )
+                    for name, value in color_metadata.items():
+                        setattr(frame, name, value)
+                    image = frame.to_image().convert("RGB")
+                    frames[target_index] = (
+                        _PreparedVideoFrame(
+                            image=resize(image),
+                            source_size=image.size,
+                        )
+                    )
+                    return 0
+                except BaseException as error:
+                    callback_error.append(error)
+                    return 1
+
+            callback = self._callback_type(receive)
+            error_message = ctypes.create_string_buffer(1024)
+            configured_parallelism = int(
+                os.environ.get("MFQ_AVFOUNDATION_VIDEO_PARALLELISM", "16")
+            )
+            parallelism = max(1, min(32, configured_parallelism, len(selected_pts)))
+            result = self._sample(
+                os.fsencode(temporary_path),
+                targets,
+                len(selected_pts),
+                time_base.numerator,
+                time_base.denominator,
+                parallelism,
+                callback,
+                None,
+                error_message,
+                len(error_message),
+            )
+            if callback_error:
+                raise callback_error[0]
+            if result != len(selected_pts):
+                message = error_message.value.decode("utf-8", errors="replace")
+                raise VisionProcessingError(
+                    message or "AVFoundation did not return every selected video frame"
+                )
+            if any(frame is None for frame in frames):
+                raise VisionProcessingError(
+                    "AVFoundation omitted a selected video frame"
+                )
+            return [frame for frame in frames if frame is not None]
+        finally:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
 
 
 class MiniCPMO45VisionProcessor:
@@ -33,6 +212,17 @@ class MiniCPMO45VisionProcessor:
     maximum_image_slices = 9
     maximum_video_frames = 64
     video_fps = 1.0
+
+    def __init__(self, avfoundation_library: str | Path | None = None) -> None:
+        library = avfoundation_library or os.environ.get(
+            "MFQ_AVFOUNDATION_VIDEO_LIBRARY"
+        )
+        self._avfoundation_decoder: _AVFoundationVideoDecoder | None = None
+        if platform.system() == "Darwin" and library and Path(library).is_file():
+            try:
+                self._avfoundation_decoder = _AVFoundationVideoDecoder(library)
+            except (OSError, AttributeError):
+                self._avfoundation_decoder = None
 
     @staticmethod
     def _ensure_divide(length: int, divisor: int) -> int:
@@ -284,14 +474,47 @@ class MiniCPMO45VisionProcessor:
             raise VisionProcessingError("video contains no decodable frames")
         return frames
 
+    @classmethod
+    def _resize_video_frame(cls, image: Any) -> Any:
+        from PIL import Image
+
+        return image.resize(
+            cls._best_resize(image.size, allow_upscale=True),
+            resample=Image.Resampling.BICUBIC,
+        )
+
+    def _decode_video_for_request(self, data: bytes) -> list[_PreparedVideoFrame]:
+        decoder = self._avfoundation_decoder
+        if decoder is not None:
+            try:
+                return decoder.decode(
+                    data,
+                    frames_per_second=self.video_fps,
+                    maximum_frames=self.maximum_video_frames,
+                    resize=self._resize_video_frame,
+                )
+            except (OSError, RuntimeError, VisionProcessingError, ValueError):
+                pass
+        return [
+            _PreparedVideoFrame(
+                image=self._resize_video_frame(image),
+                source_size=image.size,
+            )
+            for image in self._decode_video(data)
+        ]
+
     @staticmethod
-    def _tensor(value: np.ndarray, dtype: str) -> dict[str, Any]:
+    def _packed_tensor(value: np.ndarray, dtype: str) -> np.ndarray:
         little_endian = {
             "float32": "<f4",
             "int32": "<i4",
             "uint8": "u1",
         }[dtype]
-        packed = np.ascontiguousarray(value, dtype=little_endian)
+        return np.ascontiguousarray(value, dtype=little_endian)
+
+    @classmethod
+    def _tensor(cls, value: np.ndarray, dtype: str) -> dict[str, Any]:
+        packed = cls._packed_tensor(value, dtype)
         return {
             "dtype": dtype,
             "shape": list(packed.shape),
@@ -299,11 +522,63 @@ class MiniCPMO45VisionProcessor:
         }
 
     @classmethod
+    def _binary_tensors(
+        cls,
+        values: list[tuple[str, np.ndarray, str]],
+    ) -> tuple[dict[str, Any], Path]:
+        magic = b"MFQMM01\0"
+        token = secrets.token_bytes(32)
+        descriptor, raw_path = tempfile.mkstemp(
+            prefix="mfq-multimodal-",
+            suffix=".bin",
+        )
+        path = Path(raw_path)
+        tensors: dict[str, Any] = {
+            "version": 1,
+            "binary_file": {
+                "path": str(path),
+                "token": token.hex(),
+            },
+        }
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(magic)
+                stream.write(token)
+                stream.write(bytes(64 - len(magic) - len(token)))
+                for name, value, dtype in values:
+                    packed = cls._packed_tensor(value, dtype)
+                    offset = stream.tell()
+                    padding = (-offset) % 64
+                    if padding:
+                        stream.write(bytes(padding))
+                        offset += padding
+                    raw = packed.tobytes()
+                    stream.write(raw)
+                    tensors[name] = {
+                        "dtype": dtype,
+                        "shape": list(packed.shape),
+                        "data_offset": offset,
+                        "data_length": len(raw),
+                    }
+                tensors["binary_file"]["size"] = stream.tell()
+            return tensors, path
+        except BaseException:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            path.unlink(missing_ok=True)
+            raise
+
+    @classmethod
     def _pack_tensors(
         cls,
         patches: list[np.ndarray],
         target_sizes: list[tuple[int, int]],
-    ) -> dict[str, Any]:
+        *,
+        use_binary_file: bool = False,
+    ) -> tuple[dict[str, Any], tuple[Path, ...]]:
         if not patches or len(patches) != len(target_sizes):
             raise VisionProcessingError("vision request contains no processed image patches")
         sequences = [patch.reshape(3 * cls.patch_size, -1).T for patch in patches]
@@ -319,16 +594,30 @@ class MiniCPMO45VisionProcessor:
         mask = np.zeros((len(sequences), maximum_patches), dtype=np.uint8)
         for index, (rows, columns) in enumerate(target_sizes):
             mask[index, : rows * columns] = 1
-        return {
-            "version": 1,
-            "pixel_values": cls._tensor(pixels, "float32"),
-            "patch_mask": cls._tensor(mask, "uint8"),
-            "target_sizes": cls._tensor(sizes, "int32"),
-        }
+        values = [
+            ("pixel_values", pixels, "float32"),
+            ("patch_mask", mask, "uint8"),
+            ("target_sizes", sizes, "int32"),
+        ]
+        if use_binary_file:
+            tensors, path = cls._binary_tensors(values)
+            return tensors, (path,)
+        return (
+            {
+                "version": 1,
+                **{
+                    name: cls._tensor(value, dtype)
+                    for name, value, dtype in values
+                },
+            },
+            (),
+        )
 
     def prepare_openai_messages(
         self,
         messages: list[dict[str, Any]],
+        *,
+        use_binary_file: bool = False,
     ) -> ProcessedVisionRequest | None:
         prepared = copy.deepcopy(messages)
         patches: list[np.ndarray] = []
@@ -366,7 +655,10 @@ class MiniCPMO45VisionProcessor:
                         video_spec.get("url"), str
                     ):
                         raise VisionProcessingError("video_url content is missing its URL")
-                    images = self._decode_video(self._decode_data_url(video_spec["url"], "video/"))
+                    video_frames = self._decode_video_for_request(
+                        self._decode_data_url(video_spec["url"], "video/")
+                    )
+                    images = [frame.image for frame in video_frames]
                     maximum_slices = 1
                     source_count += 1
                     frame_count += len(images)
@@ -377,9 +669,18 @@ class MiniCPMO45VisionProcessor:
                 else:
                     raise VisionProcessingError(f"unsupported multimodal content type: {item_type}")
                 found_media = True
-                for image in images:
-                    pieces.append(self._placeholder(image.size, image_index, maximum_slices))
-                    sliced, _ = self._slice_image(image, maximum_slices)
+                for media_index, image in enumerate(images):
+                    source_size = (
+                        video_frames[media_index].source_size
+                        if item_type == "video_url"
+                        else image.size
+                    )
+                    pieces.append(self._placeholder(source_size, image_index, maximum_slices))
+                    sliced = (
+                        [image]
+                        if item_type == "video_url"
+                        else self._slice_image(image, maximum_slices)[0]
+                    )
                     for image_slice in sliced:
                         packed, target = self._reshape_by_patch(image_slice)
                         patches.append(packed)
@@ -388,9 +689,15 @@ class MiniCPMO45VisionProcessor:
             message["content"] = "\n".join(piece for piece in pieces if piece)
         if not found_media:
             return None
+        tensors, cleanup_paths = self._pack_tensors(
+            patches,
+            target_sizes,
+            use_binary_file=use_binary_file,
+        )
         return ProcessedVisionRequest(
             messages=prepared,
-            tensors=self._pack_tensors(patches, target_sizes),
+            tensors=tensors,
             source_count=source_count,
             frame_count=frame_count,
+            cleanup_paths=cleanup_paths,
         )

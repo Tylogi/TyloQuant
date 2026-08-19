@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import uvicorn
 
@@ -48,9 +49,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     api_key = os.environ.get(args.backend_api_key_env, "")
+    backend_host = urlsplit(args.backend_url).hostname
     service = MfqdService(
         SessionStore(args.db),
-        OpenAIChatBackend(args.backend_url, api_key=api_key),
+        OpenAIChatBackend(
+            args.backend_url,
+            api_key=api_key,
+            local_tensor_files=backend_host in {"127.0.0.1", "localhost", "::1"},
+        ),
     )
     uvicorn.run(
         create_app(service, web_root=args.web_root),

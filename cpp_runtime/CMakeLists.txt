@@ -122,6 +122,7 @@ if(MFQ_BUILD_CPP_SERVER)
 endif()
 
 if(MFQ_BUILD_METAL_RUNTIME)
+    enable_language(OBJCXX)
     enable_testing()
     add_subdirectory(metal)
 

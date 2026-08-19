@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
+import json
+import stat
+from pathlib import Path
 
+import httpx
 import numpy as np
 import pytest
 import torch
 from PIL import Image
 
+from mfqd.backend import OpenAIChatBackend
+from mfqd.models import SamplingParams
 from mfqd.vision import MiniCPMO45VisionProcessor
 
 
@@ -26,6 +33,24 @@ def _decode_tensor(tensor: dict[str, object]) -> np.ndarray:
     }
     raw = base64.b64decode(str(tensor["data_base64"]), validate=True)
     return np.frombuffer(raw, dtype=dtypes[str(tensor["dtype"])]).reshape(tuple(tensor["shape"]))
+
+
+def _decode_binary_tensor(tensors: dict[str, object], name: str) -> np.ndarray:
+    dtypes = {
+        "float32": "<f4",
+        "int32": "<i4",
+        "uint8": "u1",
+    }
+    file_spec = tensors["binary_file"]
+    tensor = tensors[name]
+    assert isinstance(file_spec, dict)
+    assert isinstance(tensor, dict)
+    with open(str(file_spec["path"]), "rb") as stream:
+        stream.seek(int(tensor["data_offset"]))
+        raw = stream.read(int(tensor["data_length"]))
+    return np.frombuffer(raw, dtype=dtypes[str(tensor["dtype"])]).reshape(
+        tuple(tensor["shape"])
+    )
 
 
 def test_patch_layout_matches_official_torch_unfold() -> None:
@@ -127,6 +152,17 @@ def test_video_request_samples_frames_and_uses_unsliced_placeholders() -> None:
     assert len(optimized) == len(reference)
     for actual, expected in zip(optimized, reference, strict=True):
         np.testing.assert_array_equal(np.asarray(actual), expected)
+    prepared = MiniCPMO45VisionProcessor()._decode_video_for_request(
+        output.getvalue()
+    )
+    assert [frame.source_size for frame in prepared] == [
+        (image.shape[1], image.shape[0]) for image in reference
+    ]
+    for actual, expected in zip(prepared, reference, strict=True):
+        resized = MiniCPMO45VisionProcessor._resize_video_frame(
+            Image.fromarray(expected, mode="RGB")
+        )
+        np.testing.assert_array_equal(np.asarray(actual.image), np.asarray(resized))
 
     result = MiniCPMO45VisionProcessor().prepare_openai_messages(
         [
@@ -149,3 +185,107 @@ def test_video_request_samples_frames_and_uses_unsliced_placeholders() -> None:
     assert content.count("<image>") == result.frame_count
     assert "<slice>" not in content
     assert _decode_tensor(result.tensors["pixel_values"]).shape[0] == result.frame_count
+
+
+def test_binary_tensor_transport_matches_base64_and_uses_private_file() -> None:
+    class TinyProcessor(MiniCPMO45VisionProcessor):
+        scale_resolution = 28
+        maximum_image_slices = 1
+
+    image = Image.new("RGB", (35, 21), (20, 40, 60))
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": _data_url(image)}}
+            ],
+        }
+    ]
+    processor = TinyProcessor()
+    encoded = processor.prepare_openai_messages(messages)
+    binary = processor.prepare_openai_messages(messages, use_binary_file=True)
+    assert encoded is not None
+    assert binary is not None
+    assert encoded.messages == binary.messages
+    assert binary.source_count == encoded.source_count
+    assert len(binary.cleanup_paths) == 1
+    path = binary.cleanup_paths[0]
+    try:
+        file_spec = binary.tensors["binary_file"]
+        assert file_spec["path"] == str(path)
+        assert path.stat().st_size == file_spec["size"]
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        with path.open("rb") as stream:
+            header = stream.read(64)
+        assert header[:8] == b"MFQMM01\0"
+        assert header[8:40].hex() == file_spec["token"]
+        for name in ("pixel_values", "patch_mask", "target_sizes"):
+            np.testing.assert_array_equal(
+                _decode_binary_tensor(binary.tensors, name),
+                _decode_tensor(encoded.tensors[name]),
+            )
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_backend_cleans_local_binary_tensor_file_after_stream() -> None:
+    captured_path = None
+
+    class TinyProcessor(MiniCPMO45VisionProcessor):
+        scale_resolution = 28
+        maximum_image_slices = 1
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured_path
+        if request.url.path == "/health":
+            return httpx.Response(
+                200,
+                json={"model": "MiniCPM-o", "model_type": "minicpmo"},
+            )
+        payload = json.loads(request.content)
+        captured_path = payload["mfq_multimodal"]["binary_file"]["path"]
+        assert Path(captured_path).is_file()
+        body = (
+            'data: {"choices":[{"delta":{"content":"ok"},'
+            '"finish_reason":"stop"}]}\n\n'
+            "data: [DONE]\n\n"
+        )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=body,
+        )
+
+    async def run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        backend = OpenAIChatBackend(
+            "http://backend",
+            client=client,
+            local_tensor_files=True,
+        )
+        backend._vision_processor = TinyProcessor()
+        image = Image.new("RGB", (28, 28), (20, 40, 60))
+        deltas = [
+            item
+            async for item in backend.stream(
+                model="MiniCPM-o",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": _data_url(image)},
+                            }
+                        ],
+                    }
+                ],
+                sampling=SamplingParams(max_tokens=4),
+            )
+        ]
+        await client.aclose()
+        assert deltas[0].content_delta == "ok"
+
+    asyncio.run(run())
+    assert captured_path is not None
+    assert not Path(captured_path).exists()

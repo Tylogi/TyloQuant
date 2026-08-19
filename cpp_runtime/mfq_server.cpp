@@ -8,8 +8,10 @@
 #include "common/common.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cctype>
 #include <cmath>
 #include <cstring>
@@ -30,6 +32,12 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -2025,11 +2033,193 @@ static size_t tensor_element_count(
     return count;
 }
 
+static uint8_t hex_digit_value(char value, const std::string & parameter) {
+    if (value >= '0' && value <= '9') {
+        return static_cast<uint8_t>(value - '0');
+    }
+    if (value >= 'a' && value <= 'f') {
+        return static_cast<uint8_t>(value - 'a' + 10);
+    }
+    if (value >= 'A' && value <= 'F') {
+        return static_cast<uint8_t>(value - 'A' + 10);
+    }
+    throw ApiError(
+        400, "invalid_request_error",
+        parameter + " contains an invalid hexadecimal token", parameter);
+}
+
+static std::array<uint8_t, 32> decode_file_token(
+        const std::string & encoded,
+        const std::string & parameter) {
+    if (encoded.size() != 64) {
+        throw ApiError(
+            400, "invalid_request_error",
+            parameter + " must contain a 32-byte token", parameter);
+    }
+    std::array<uint8_t, 32> result{};
+    for (size_t index = 0; index < result.size(); ++index) {
+        result[index] = static_cast<uint8_t>(
+            (hex_digit_value(encoded[2 * index], parameter) << 4) |
+            hex_digit_value(encoded[2 * index + 1], parameter));
+    }
+    return result;
+}
+
+class TensorFileReader final {
+public:
+    explicit TensorFileReader(const json & tensors) {
+        const std::string parameter = "mfq_multimodal.binary_file";
+        if (!tensors.contains("binary_file") ||
+            !tensors["binary_file"].is_object()) {
+            throw ApiError(
+                400, "invalid_request_error",
+                parameter + " must be an object", parameter);
+        }
+        const auto & spec = tensors["binary_file"];
+        if (!spec.contains("path") || !spec["path"].is_string() ||
+            !spec.contains("token") || !spec["token"].is_string() ||
+            !spec.contains("size") || !spec["size"].is_number_integer()) {
+            throw ApiError(
+                400, "invalid_request_error",
+                parameter + " must include path, token, and size", parameter);
+        }
+        const auto declared_size = spec["size"].get<int64_t>();
+        if (declared_size < 64 || declared_size > 1024LL * 1024LL * 1024LL) {
+            throw ApiError(
+                400, "invalid_request_error",
+                parameter + " has an invalid size", parameter);
+        }
+        size_ = static_cast<size_t>(declared_size);
+        const std::filesystem::path path(spec["path"].get<std::string>());
+        const std::string filename = path.filename().string();
+        if (!path.is_absolute() ||
+            filename.rfind("mfq-multimodal-", 0) != 0 ||
+            path.extension() != ".bin") {
+            throw ApiError(
+                400, "invalid_request_error",
+                parameter + " path is not an MFQ temporary tensor file", parameter);
+        }
+        const auto token = decode_file_token(
+            spec["token"].get<std::string>(), parameter + ".token");
+#ifdef _WIN32
+        (void) token;
+        throw ApiError(
+            400, "invalid_request_error",
+            parameter + " is unavailable on this platform", parameter);
+#else
+        int flags = O_RDONLY;
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+        flags |= O_NOFOLLOW;
+#endif
+        descriptor_ = ::open(path.c_str(), flags);
+        if (descriptor_ < 0) {
+            throw ApiError(
+                400, "invalid_request_error",
+                parameter + " cannot be opened", parameter);
+        }
+        struct stat metadata {};
+        if (::fstat(descriptor_, &metadata) != 0 ||
+            !S_ISREG(metadata.st_mode) || metadata.st_nlink != 1 ||
+            metadata.st_uid != ::geteuid() ||
+            (metadata.st_mode & 0077) != 0 ||
+            metadata.st_size < 0 ||
+            static_cast<uint64_t>(metadata.st_size) != size_) {
+            close_descriptor();
+            throw ApiError(
+                400, "invalid_request_error",
+                parameter + " failed ownership, mode, or size validation", parameter);
+        }
+        std::array<uint8_t, 64> header{};
+        read_exact(0, header.data(), header.size(), parameter);
+        constexpr std::array<uint8_t, 8> magic{
+            'M', 'F', 'Q', 'M', 'M', '0', '1', 0};
+        if (!std::equal(magic.begin(), magic.end(), header.begin()) ||
+            !std::equal(token.begin(), token.end(), header.begin() + 8)) {
+            close_descriptor();
+            throw ApiError(
+                400, "invalid_request_error",
+                parameter + " header or token does not match", parameter);
+        }
+#endif
+    }
+
+    ~TensorFileReader() {
+        close_descriptor();
+    }
+
+    TensorFileReader(const TensorFileReader &) = delete;
+    TensorFileReader & operator=(const TensorFileReader &) = delete;
+
+    void read(
+            size_t offset,
+            void * destination,
+            size_t length,
+            const std::string & parameter) const {
+        if (offset < 64 || offset % 64 != 0 ||
+            length > size_ || offset > size_ - length) {
+            throw ApiError(
+                400, "invalid_request_error",
+                parameter + " byte range is outside the tensor file", parameter);
+        }
+        read_exact(offset, destination, length, parameter);
+    }
+
+private:
+    void close_descriptor() noexcept {
+#ifndef _WIN32
+        if (descriptor_ >= 0) {
+            ::close(descriptor_);
+            descriptor_ = -1;
+        }
+#endif
+    }
+
+    void read_exact(
+            size_t offset,
+            void * destination,
+            size_t length,
+            const std::string & parameter) const {
+#ifdef _WIN32
+        (void) offset;
+        (void) destination;
+        (void) length;
+        throw ApiError(
+            400, "invalid_request_error",
+            parameter + " is unavailable on this platform", parameter);
+#else
+        auto * output = static_cast<uint8_t *>(destination);
+        size_t completed = 0;
+        while (completed < length) {
+            const ssize_t count = ::pread(
+                descriptor_, output + completed, length - completed,
+                static_cast<off_t>(offset + completed));
+            if (count > 0) {
+                completed += static_cast<size_t>(count);
+                continue;
+            }
+            if (count < 0 && errno == EINTR) continue;
+            throw ApiError(
+                400, "invalid_request_error",
+                parameter + " could not be read completely", parameter);
+        }
+#endif
+    }
+
+    size_t size_ = 0;
+#ifndef _WIN32
+    mutable int descriptor_ = -1;
+#endif
+};
+
 template <typename Value>
 static std::pair<std::vector<Value>, std::vector<int64_t>> decode_tensor(
         const json & tensors,
         const std::string & name,
-        const std::string & expected_dtype) {
+        const std::string & expected_dtype,
+        const TensorFileReader * file_reader) {
     const std::string parameter = "mfq_multimodal." + name;
     if (!tensors.contains(name) || !tensors[name].is_object()) {
         throw ApiError(
@@ -2059,22 +2249,46 @@ static std::pair<std::vector<Value>, std::vector<int64_t>> decode_tensor(
         shape.push_back(dimension.get<int64_t>());
     }
     const size_t count = tensor_element_count(shape, parameter);
-    if (!tensor.contains("data_base64") ||
-        !tensor["data_base64"].is_string()) {
-        throw ApiError(
-            400, "invalid_request_error",
-            parameter + " must include data_base64", parameter);
-    }
-    const auto bytes = decode_base64(
-        tensor["data_base64"].get<std::string>(), parameter);
-    if (count > std::numeric_limits<size_t>::max() / sizeof(Value) ||
-        bytes.size() != count * sizeof(Value)) {
+    if (count > std::numeric_limits<size_t>::max() / sizeof(Value)) {
         throw ApiError(
             400, "invalid_request_error",
             parameter + " byte length does not match its shape", parameter);
     }
+    const size_t expected_bytes = count * sizeof(Value);
     std::vector<Value> values(count);
-    std::memcpy(values.data(), bytes.data(), bytes.size());
+    if (tensor.contains("data_base64") &&
+        tensor["data_base64"].is_string()) {
+        const auto bytes = decode_base64(
+            tensor["data_base64"].get<std::string>(), parameter);
+        if (bytes.size() != expected_bytes) {
+            throw ApiError(
+                400, "invalid_request_error",
+                parameter + " byte length does not match its shape", parameter);
+        }
+        std::memcpy(values.data(), bytes.data(), bytes.size());
+    } else {
+        if (file_reader == nullptr ||
+            !tensor.contains("data_offset") ||
+            !tensor["data_offset"].is_number_integer() ||
+            !tensor.contains("data_length") ||
+            !tensor["data_length"].is_number_integer()) {
+            throw ApiError(
+                400, "invalid_request_error",
+                parameter + " must include data_base64 or a binary file range",
+                parameter);
+        }
+        const int64_t raw_offset = tensor["data_offset"].get<int64_t>();
+        const int64_t raw_length = tensor["data_length"].get<int64_t>();
+        if (raw_offset < 0 || raw_length < 0 ||
+            static_cast<uint64_t>(raw_length) != expected_bytes) {
+            throw ApiError(
+                400, "invalid_request_error",
+                parameter + " byte length does not match its shape", parameter);
+        }
+        file_reader->read(
+            static_cast<size_t>(raw_offset), values.data(), expected_bytes,
+            parameter);
+    }
     return {std::move(values), std::move(shape)};
 }
 
@@ -2108,16 +2322,20 @@ static MfqVisionInput parse_mfq_vision(
     }
 
     MfqVisionInput result;
+    std::unique_ptr<TensorFileReader> file_reader;
+    if (value.contains("binary_file")) {
+        file_reader = std::make_unique<TensorFileReader>(value);
+    }
     auto pixels = decode_tensor<float>(
-        value, "pixel_values", "float32");
+        value, "pixel_values", "float32", file_reader.get());
     result.pixel_values = std::move(pixels.first);
     result.pixel_shape = std::move(pixels.second);
     auto mask = decode_tensor<uint8_t>(
-        value, "patch_mask", "uint8");
+        value, "patch_mask", "uint8", file_reader.get());
     result.patch_mask = std::move(mask.first);
     result.patch_mask_shape = std::move(mask.second);
     auto sizes = decode_tensor<int32_t>(
-        value, "target_sizes", "int32");
+        value, "target_sizes", "int32", file_reader.get());
     result.target_sizes = std::move(sizes.first);
     result.target_sizes_shape = std::move(sizes.second);
 

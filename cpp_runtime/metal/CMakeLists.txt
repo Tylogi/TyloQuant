@@ -46,6 +46,24 @@ find_library(MFQ_METAL_FRAMEWORK Metal REQUIRED)
 find_library(MFQ_FOUNDATION_FRAMEWORK Foundation REQUIRED)
 find_library(MFQ_QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
 find_library(MFQ_ACCELERATE_FRAMEWORK Accelerate REQUIRED)
+find_library(MFQ_AVFOUNDATION_FRAMEWORK AVFoundation REQUIRED)
+find_library(MFQ_COREMEDIA_FRAMEWORK CoreMedia REQUIRED)
+find_library(MFQ_COREVIDEO_FRAMEWORK CoreVideo REQUIRED)
+
+add_library(mfq-avfoundation-video SHARED
+    mfq_avfoundation_video.mm
+)
+target_compile_features(mfq-avfoundation-video PRIVATE cxx_std_20)
+target_compile_options(mfq-avfoundation-video PRIVATE -fobjc-arc)
+target_link_libraries(mfq-avfoundation-video PRIVATE
+    ${MFQ_FOUNDATION_FRAMEWORK}
+    ${MFQ_AVFOUNDATION_FRAMEWORK}
+    ${MFQ_COREMEDIA_FRAMEWORK}
+    ${MFQ_COREVIDEO_FRAMEWORK}
+)
+set_target_properties(mfq-avfoundation-video PROPERTIES
+    OUTPUT_NAME "mfq_avfoundation_video"
+)
 
 # MLX's runtime Metal compiler does not expose filesystem include paths.  Fold
 # the Steel MMA implementation into the NINTM prefill source at configure time
@@ -176,6 +194,7 @@ target_compile_definitions(mfq-metal-runtime PUBLIC
 add_executable(mfq-decode-metal
     mfq_decode_mlx.cpp
 )
+add_dependencies(mfq-decode-metal mfq-avfoundation-video)
 target_link_libraries(mfq-decode-metal PRIVATE
     mfq-metal-runtime
 )

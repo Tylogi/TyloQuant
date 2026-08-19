@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
+import os
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
@@ -19,6 +22,7 @@ from mfqd.models import (
     SamplingParams,
     TokenUsage,
 )
+from mfqd.vision import MiniCPMO45VisionProcessor, VisionProcessingError
 
 
 class BackendError(RuntimeError):
@@ -88,13 +92,22 @@ class OpenAIChatBackend:
         *,
         api_key: str = "",
         client: httpx.AsyncClient | None = None,
+        avfoundation_video_library: str | Path | None = None,
+        local_tensor_files: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self._owns_client = client is None
+        hostname = urlsplit(self.base_url).hostname
         self._client = client or httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5.0, read=None, write=30.0, pool=5.0)
+            timeout=httpx.Timeout(connect=5.0, read=None, write=30.0, pool=5.0),
+            trust_env=hostname not in {"127.0.0.1", "localhost", "::1"},
         )
+        self._model_type: str | None = None
+        self._vision_processor = MiniCPMO45VisionProcessor(
+            avfoundation_library=avfoundation_video_library
+        )
+        self._local_tensor_files = local_tensor_files and os.name == "posix"
 
     async def stream(
         self,
@@ -104,9 +117,33 @@ class OpenAIChatBackend:
         sampling: SamplingParams,
         session_id: UUID | None = None,
     ) -> AsyncIterator[BackendDelta]:
+        backend_messages = list(messages)
+        multimodal: dict[str, Any] | None = None
+        cleanup_paths: tuple[Path, ...] = ()
+        if self._contains_media(backend_messages):
+            if self._model_type is None:
+                await self.capabilities()
+            if self._model_type == "minicpmo":
+                try:
+                    processed = await asyncio.to_thread(
+                        self._vision_processor.prepare_openai_messages,
+                        backend_messages,
+                        use_binary_file=self._local_tensor_files,
+                    )
+                except VisionProcessingError as error:
+                    raise BackendError("media_processing_error", str(error)) from error
+                if processed is not None:
+                    backend_messages = processed.messages
+                    multimodal = processed.tensors
+                    cleanup_paths = processed.cleanup_paths
+            else:
+                raise BackendError(
+                    "media_processing_unsupported",
+                    f"the loaded {self._model_type or 'unknown'} model has no registered media processor",
+                )
         payload = {
             "model": model,
-            "messages": list(messages),
+            "messages": backend_messages,
             "max_tokens": sampling.max_tokens,
             "temperature": sampling.temperature,
             "top_k": sampling.top_k,
@@ -127,6 +164,8 @@ class OpenAIChatBackend:
             payload["seed"] = sampling.seed
         if session_id is not None:
             payload["mfq_session_id"] = str(session_id)
+        if multimodal is not None:
+            payload["mfq_multimodal"] = multimodal
         headers = {"Accept": "text/event-stream"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -160,6 +199,9 @@ class OpenAIChatBackend:
             raise BackendError("backend_timeout", str(error), retryable=True) from error
         except httpx.HTTPError as error:
             raise BackendError("backend_connection_error", str(error), retryable=True) from error
+        finally:
+            for path in cleanup_paths:
+                path.unlink(missing_ok=True)
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -205,6 +247,7 @@ class OpenAIChatBackend:
             raise BackendProtocolError("backend health must be a JSON object")
         model = str(payload.get("model") or "mfq-model")
         model_type = str(payload.get("model_type") or "unknown")
+        self._model_type = model_type
         raw_capabilities = payload.get("model_capabilities")
         try:
             capabilities = (
@@ -222,6 +265,20 @@ class OpenAIChatBackend:
             model_capabilities=capabilities,
             duplex_available=payload.get("duplex_available") is True,
         )
+
+    @staticmethod
+    def _contains_media(messages: Sequence[dict[str, Any]]) -> bool:
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            if any(
+                isinstance(item, dict)
+                and item.get("type") in {"image_url", "video_url", "input_audio"}
+                for item in content
+            ):
+                return True
+        return False
 
     async def runtime_status(self) -> dict[str, Any]:
         try:
