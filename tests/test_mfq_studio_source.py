@@ -54,6 +54,14 @@ def test_studio_supports_local_and_remote_server_connections_with_voice_controls
     assert "studio_start_local" in RUST
     assert "studio_select_model_file" in RUST
     assert "selectLocalModelFile" in APP
+    assert "const canChooseLocalModel = isStudio()" in APP
+    assert 'tr("选择本地模型文件", "Choose a local model file")' in APP
+    assert 'tr("加载本地模型或连接模型服务后即可开始。", "Load a local model or connect to a model server to get started.")' in APP
+    assert 'tr("选择本地模型", "Choose local model")' in APP
+    assert "访达" not in APP
+    assert "Finder" not in APP
+    assert 'className="open-local-model"' in APP
+    assert APP.count("chooseLocalModelFile()") >= 4
     assert "Object.keys(MODE_LABELS)" not in APP
     assert "RealtimeAudioController" in APP
     assert '(["text", "voice", "full_duplex"] as SessionMode[])' in APP

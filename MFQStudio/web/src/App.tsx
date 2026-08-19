@@ -47,6 +47,7 @@ import {
   StudioConfig,
   StudioStatus,
   configureStudio,
+  isStudio,
   saveStudioCredential,
   selectLocalModelFile,
   startLocalStudio,
@@ -716,6 +717,7 @@ type IconName =
   | "flask"
   | "download"
   | "edit"
+  | "folder"
   | "lightbulb"
   | "menu"
   | "paperclip"
@@ -745,6 +747,7 @@ function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
       {name === "flask" && <><path d="M9 3h6M10 3v6l-5.7 9.2A1.8 1.8 0 0 0 5.8 21h12.4a1.8 1.8 0 0 0 1.5-2.8L14 9V3" /><path d="M7.5 15h9" /></>}
       {name === "download" && <><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></>}
       {name === "edit" && <><path d="M4 20h4l11-11a2.8 2.8 0 0 0-4-4L4 16z" /><path d="m13.5 6.5 4 4" /></>}
+      {name === "folder" && <path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H10l2 2h6.5A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z" />}
       {name === "lightbulb" && <><path d="M9 18h6M10 22h4" /><path d="M8.4 14.7A6 6 0 1 1 15.6 14.7 4.1 4.1 0 0 0 14 18h-4a4.1 4.1 0 0 0-1.6-3.3z" /></>}
       {name === "menu" && <><path d="M4 7h16M4 12h16M4 17h16" /></>}
       {name === "paperclip" && <><path d="m20.5 11.5-8.8 8.8a6 6 0 0 1-8.5-8.5l9.5-9.5a4 4 0 0 1 5.7 5.7l-9.6 9.5a2 2 0 0 1-2.8-2.8l8.8-8.8" /></>}
@@ -1313,6 +1316,7 @@ export default function App() {
     settings.language === "en" ||
     (settings.language === "system" && !navigator.language.toLowerCase().startsWith("zh"));
   const tr = useCallback((zh: string, en: string) => (english ? en : zh), [english]);
+  const canChooseLocalModel = isStudio() && studio?.config.mode !== "remote";
   const panelLabels = useMemo(() => ({
     collapse: tr("收起面板", "Collapse panel"),
     drag: tr("拖动面板", "Drag panel"),
@@ -3032,7 +3036,7 @@ export default function App() {
   }
 
   async function chooseLocalModelFile() {
-    if (busy || studio?.config.mode !== "local") return;
+    if (busy || !canChooseLocalModel) return;
     setBusy(true);
     try {
       const registered = await selectLocalModelFile();
@@ -3225,8 +3229,9 @@ export default function App() {
           })}
         </nav>
         <button className="new-session" onClick={createRole} type="button"><Icon name="plus" size={14} />{tr("新角色", "New role")}</button>
-        <details className="session-create">
+        <details className="session-create" open={!model}>
           <summary>{tr("新会话默认设置", "New session defaults")}</summary>
+          {canChooseLocalModel && <button className="open-local-model" disabled={busy} onClick={() => void chooseLocalModelFile()} type="button"><Icon name="folder" size={14} />{tr("打开本地模型", "Open local model")}</button>}
           <label htmlFor="new-model">{tr("模型", "Model")}</label>
           <select id="new-model" value={model} onChange={(event) => setModel(event.target.value)}>
             {(models.length ? models : [{ id: model }]).map((item) => <option key={item.id} value={item.id}>{item.id}</option>)}
@@ -3283,11 +3288,12 @@ export default function App() {
         <header className="topbar">
           <div className="topbar-identity">
             <button aria-controls="studio-sidebar" aria-expanded={sidebarOpen} aria-label={tr("打开侧栏", "Open sidebar")} className="sidebar-toggle" onClick={() => setSidebarOpen(true)} type="button"><Icon name="menu" /></button>
-            <div className="topbar-model"><span>{active?.model || model}</span><small>{capabilities?.model_type || runtime?.model_type || "runtime"}</small></div>
+            <div className="topbar-model"><span>{active?.model || model || tr("尚未加载模型", "No model loaded")}</span><small>{capabilities?.model_type || runtime?.model_type || "runtime"}</small></div>
           </div>
           <div className="topbar-actions">
             {capabilities && <div className="capabilities">{CAPABILITY_LABELS.filter(([feature]) => capabilities.model_capabilities.features[feature]).map(([feature, label]) => <span className={feature === "full_duplex" && !realtimeAvailable ? "muted" : ""} key={feature}>{label[english ? 1 : 0]}</span>)}</div>}
             <div className="quick-metrics"><span><b>{lastTtftMs == null ? "--" : `${formatNumber(lastTtftMs, 1)} ms`}</b> TTFT</span><span><b>{last ? formatNumber(contextTokens) : "--"}</b> context</span><span><b>{last?.decode_tps == null ? "--" : formatNumber(last.decode_tps, 1)}</b> tok/s</span></div>
+            {canChooseLocalModel && <button aria-label={tr("打开本地模型", "Open local model")} disabled={busy} onClick={() => void chooseLocalModelFile()} title={tr("选择本地模型文件", "Choose a local model file")} type="button"><Icon name="folder" /></button>}
             <button aria-label={tr("导出会话", "Export chat")} disabled={!active} onClick={exportConversation} title={tr("导出会话", "Export chat")} type="button"><Icon name="download" /></button>
             <button aria-label={tr("推理设置", "Inference settings")} onClick={openSettings} title={tr("推理设置", "Inference settings")} type="button"><Icon name="settings" /></button>
           </div>
@@ -3297,7 +3303,7 @@ export default function App() {
           <section className="chat-view">
             <div className="message-scroller" onScroll={handleMessageScroll} ref={messageScrollerRef}>
               <div className="message-list" aria-live="polite">
-                {!active && <div className="welcome"><img src="/mfq-mark.svg" alt="" /><h1>MFQ Studio</h1><p>{tr("创建会话后即可开始本地推理。", "Create a session to start local inference.")}</p><div className="prompt-grid"><button onClick={() => setDraft(tr("介绍一下这个模型。", "Introduce this model."))} type="button">{tr("介绍模型", "Introduce the model")}</button><button onClick={() => setDraft(tr("写一段 Python 示例。", "Write a Python example."))} type="button">{tr("代码示例", "Code example")}</button></div></div>}
+                {!active && <div className="welcome"><img src="/mfq-mark.svg" alt="" />{!model ? <><h1>{tr("加载模型", "Load a model")}</h1><p>{tr("加载本地模型或连接模型服务后即可开始。", "Load a local model or connect to a model server to get started.")}</p>{canChooseLocalModel && <button className="open-model-primary" disabled={busy} onClick={() => void chooseLocalModelFile()} type="button"><Icon name="folder" />{tr("选择本地模型", "Choose local model")}</button>}</> : <><h1>MFQ Studio</h1><p>{tr("创建会话后即可开始本地推理。", "Create a session to start local inference.")}</p><div className="prompt-grid"><button onClick={() => setDraft(tr("介绍一下这个模型。", "Introduce this model."))} type="button">{tr("介绍模型", "Introduce the model")}</button><button onClick={() => setDraft(tr("写一段 Python 示例。", "Write a Python example."))} type="button">{tr("代码示例", "Code example")}</button></div></>}</div>}
                 {messages.map((message) => {
                   const parts = textParts(message);
                   const editing = editDraft?.messageId === message.id;
