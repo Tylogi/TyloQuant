@@ -20,23 +20,18 @@ METAL_DECODE = (
 METAL_DSV4 = (
     ROOT / "cpp_runtime" / "metal" / "mlx_deepseek_v4_causal_lm.cpp"
 ).read_text(encoding="utf-8")
+STUDIO_APP = (ROOT / "MFQStudio" / "web" / "src" / "App.tsx").read_text(
+    encoding="utf-8"
+)
+STUDIO_API = (ROOT / "MFQStudio" / "web" / "src" / "api.ts").read_text(
+    encoding="utf-8"
+)
 LLAMA_CHAT = (
     ROOT / "third_party" / "llama-runtime" / "common" / "chat.cpp"
 ).read_text(encoding="utf-8")
 LLAMA_CHAT_H = (
     ROOT / "third_party" / "llama-runtime" / "common" / "chat.h"
 ).read_text(encoding="utf-8")
-WEB_JS = (ROOT / "cpp_runtime" / "web" / "app.js").read_text(
-    encoding="utf-8"
-)
-WEB_HTML = (ROOT / "cpp_runtime" / "web" / "index.html").read_text(
-    encoding="utf-8"
-)
-WEB_CSS = (ROOT / "cpp_runtime" / "web" / "app.css").read_text(
-    encoding="utf-8"
-)
-
-
 def _section(text: str, start: str, end: str) -> str:
     start_index = text.index(start)
     end_index = text.index(end, start_index)
@@ -89,33 +84,30 @@ def test_server_rejects_external_runtime_assets() -> None:
     assert "server_config.tokenizer_model" not in DECODE
 
 
-def test_webui_keeps_reasoning_separate_and_template_controlled() -> None:
-    assert 'reasoning_format: "auto"' in WEB_JS
-    assert "requestMessage.reasoning_content = message.reasoning" in WEB_JS
-    assert "excludeReasoningFromContext: false" in WEB_JS
-    assert "state.generatingMessage === message" in WEB_JS
-    assert "reasoning.open = rememberedOpen ?? isGeneratingMessage" in WEB_JS
-    assert 'id="setting-exclude-reasoning"' in WEB_HTML
+def test_studio_keeps_reasoning_separate_and_template_controlled() -> None:
+    assert "reasoning: string;" in STUDIO_APP
+    assert "include_reasoning_history: !settings.excludeReasoning" in STUDIO_APP
+    assert "settings.enableThinking" in STUDIO_APP
+    assert "settings.excludeReasoning" in STUDIO_APP
 
 
-def test_webui_exposes_template_gated_reasoning_effort() -> None:
+def test_studio_exposes_template_gated_reasoning_effort() -> None:
     assert "chat_template_capabilities_json" in SERVER
     assert '{"chat_template_capabilities", chat_template_capabilities}' in SERVER
-    assert 'id="reasoning-effort-control" hidden' in WEB_HTML
-    assert 'id="reasoning-effort-select"' in WEB_HTML
-    assert '<option value="high">高</option>' in WEB_HTML
-    assert '<option value="max">最大</option>' in WEB_HTML
-    assert "state.status?.chat_template_capabilities?.reasoning_effort" in WEB_JS
-    assert "supportedReasoningEfforts.includes(state.settings.reasoningEffort)" in WEB_JS
-    assert "chatTemplateKwargs.reasoning_effort = state.settings.reasoningEffort" in WEB_JS
-    assert "control.hidden = !supported || !state.settings.enableThinking" in WEB_JS
-    assert ".reasoning-effort-control[hidden]" in WEB_CSS
+    assert 'chat_template.find("enable_thinking")' in SERVER
+    assert 'runtime?.chat_template_capabilities?.thinking?.supported' in STUDIO_APP
+    assert "runtime?.chat_template_capabilities?.reasoning_effort?.values" in STUDIO_APP
+    assert "settings.enableThinking && reasoningValues.length > 0" in STUDIO_APP
+    assert "reasoning_effort: settings.reasoningEffort || null" in STUDIO_APP
 
 
-def test_webui_uses_the_bundled_server_origin() -> None:
-    assert "return location.origin;" in WEB_JS
-    assert "LEGACY_LOCAL_ENDPOINT" in WEB_JS
-    assert 'streamState.finishReason === "length"' in WEB_JS
+def test_native_server_does_not_bundle_or_mount_a_webui() -> None:
+    assert "mfq-web-assets" not in CMAKE
+    assert "Copying MFQ WebUI assets" not in METAL_CMAKE
+    assert "--web-root" not in DECODE
+    assert "--web-root" not in METAL_DECODE
+    assert 'server.Get("/admin"' not in SERVER
+    assert "set_mount_point" not in SERVER
 
 
 def test_dsv4_server_uses_exact_stable_prefix_kv_reuse() -> None:
@@ -126,10 +118,10 @@ def test_dsv4_server_uses_exact_stable_prefix_kv_reuse() -> None:
     assert '{"prefill_tokens", values.prefill_tokens}' in SERVER
 
 
-def test_webui_can_reload_model_with_a_new_context() -> None:
-    assert 'id="setting-context-window"' in WEB_HTML
-    assert 'id="reload-model"' in WEB_HTML
-    assert 'fetchJson("/api/reload"' in WEB_JS
+def test_studio_can_reload_model_with_a_new_context() -> None:
+    assert "async function reloadRuntime()" in STUDIO_APP
+    assert "api.reloadRuntime(contextSize)" in STUDIO_APP
+    assert 'request("/api/v1/runtime/reload"' in STUDIO_API
     assert 'server.Post("/api/reload"' in SERVER
     assert "context_size must be within the model context capacity" in SERVER
 

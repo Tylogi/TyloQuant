@@ -3,9 +3,7 @@ export type StudioRuntimeMode = "local" | "remote";
 export interface StudioConfig {
   mode: StudioRuntimeMode;
   remote_url: string;
-  local_backend_url: string;
   local_service_port: number;
-  mfqd_executable: string | null;
 }
 
 export interface StudioStatus {
@@ -44,8 +42,13 @@ export async function configureStudio(config: StudioConfig): Promise<StudioStatu
   return tauri.invoke<StudioStatus>("studio_configure", { config });
 }
 
-export async function startLocalStudio(): Promise<StudioStatus> {
+export async function studioCredential(): Promise<string> {
   const tauri = internals();
-  if (!tauri) throw new Error("MFQ Studio runtime is unavailable");
-  return tauri.invoke<StudioStatus>("studio_start_local");
+  return tauri ? tauri.invoke<string>("studio_credential_get") : "";
+}
+
+export async function saveStudioCredential(token: string): Promise<void> {
+  const tauri = internals();
+  if (!tauri) return;
+  await tauri.invoke<void>("studio_credential_set", { token });
 }

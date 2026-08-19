@@ -1,4 +1,4 @@
-"""NintLinear: a linear layer whose weights are :class:`~mfq.quantize.nint_quant.NintTensor`.
+"""NintLinear: a linear layer whose weights are :class:`~mfq.formats.nint.NintTensor`.
 
 Lazy dequantization (computed and cached on first access) plus matmul. This is the NumPy reference implementation;
 real kernels will fuse dequantization and matmul in backends registered with :mod:`mfq.runtime.dequantize`.
@@ -10,7 +10,7 @@ from typing import Optional
 
 import numpy as np
 
-from mfq.quantize.nint_quant import NintTensor
+from mfq.formats.nint import NintTensor
 from mfq.runtime.dequantize import dequantize
 
 

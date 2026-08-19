@@ -24,7 +24,7 @@ from collections.abc import Mapping, Sequence
 import numpy as np
 import torch
 
-from mfq.quantize.nint_quant import NintTensor
+from mfq.formats.nint import NintTensor
 
 
 def _pack_q4(q: torch.Tensor) -> torch.Tensor:
@@ -65,6 +65,32 @@ def _unpack_q4(q_packed: torch.Tensor, gs: int) -> torch.Tensor:
     q[..., 0::2] = q_packed & 0x0F
     q[..., 1::2] = q_packed >> 4
     return q
+
+
+def _unpack_qbits(q_packed: torch.Tensor, gs: int, bits: int) -> torch.Tensor:
+    """Unpack one little-endian NINT group on any Torch device.
+
+    CUDA keeps its fused unpack path.  This portable implementation is used by
+    Metal/MPS calibration, where packed candidates are decoded only while a
+    layer is resident.
+    """
+
+    bits = int(bits)
+    gs = int(gs)
+    if bits == 4:
+        return _unpack_q4(q_packed, gs)
+    if bits == 8:
+        return q_packed[..., :gs].contiguous()
+    if bits <= 0 or bits >= 8:
+        raise ValueError(f"unsupported NINT bit width: {bits}")
+    bit_offsets = torch.arange(gs, device=q_packed.device, dtype=torch.int64) * bits
+    byte_offsets = torch.div(bit_offsets, 8, rounding_mode="floor")
+    shifts = (bit_offsets % 8).to(torch.int32)
+    padded = torch.nn.functional.pad(q_packed, (0, 1))
+    low = padded.index_select(-1, byte_offsets).to(torch.int32)
+    high = padded.index_select(-1, byte_offsets + 1).to(torch.int32)
+    words = low | (high << 8)
+    return ((words >> shifts) & ((1 << bits) - 1)).to(torch.uint8)
 
 
 def nint_deploy_arrays(tensor: NintTensor) -> dict[str, np.ndarray]:
@@ -269,7 +295,7 @@ def dequantize(g: dict, dtype: torch.dtype = torch.float16) -> torch.Tensor:
         q = g["q"].to(torch.float32)
     else:
         bits = int(g.get("bits", 4))
-        if bits != 4:
+        if bits != 4 and g["q_packed"].device.type == "cuda":
             from mfq.kernels.cuda._ext import ext
 
             return ext().nint_dequant_full_packed_compact_bits_cuda(
@@ -282,7 +308,7 @@ def dequantize(g: dict, dtype: torch.dtype = torch.float16) -> torch.Tensor:
                 int(g["gs"]),
                 bits,
             ).to(dtype)
-        q = _unpack_q4(g["q_packed"], int(g["gs"])).to(torch.float32)
+        q = _unpack_qbits(g["q_packed"], int(g["gs"]), bits).to(torch.float32)
     recon = (_d_eff(g)[:, :, None] * q - _m_eff(g)[:, :, None])   # [out,ng,gs]
     recon = recon.reshape(g["out"], -1)[:, : g["neuron_len"]]     # [out, neuron_len]
     S, a = g["shape"], g["axis"]

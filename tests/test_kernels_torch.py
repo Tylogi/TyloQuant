@@ -9,11 +9,17 @@ torch = pytest.importorskip("torch")
 if not torch.cuda.is_available():
     pytest.skip("CUDA 不可用", allow_module_level=True)
 
-from mfq.formats.nint import NintSpec, RUNTIME_PROFILE_CATALOG  # noqa: E402
+from mfq.formats.nint import RUNTIME_PROFILE_CATALOG, NintSpec  # noqa: E402
 from mfq.kernels import torch_backend  # noqa: E402
 from mfq.kernels.cuda.activation import silu_mul  # noqa: E402
+from mfq.kernels.cuda.moe import MoeRoutePlan  # noqa: E402
 from mfq.quantize import nint_quant  # noqa: E402
-from mfq.runtime.torch_linear import TorchNintEmbedding, TorchNintLinear, TorchNintLinearGroup, TorchSwiGLUFFN  # noqa: E402
+from mfq.runtime.torch_linear import (  # noqa: E402
+    TorchNintEmbedding,
+    TorchNintLinear,
+    TorchNintLinearGroup,
+    TorchSwiGLUFFN,
+)
 
 DEV = "cuda"
 
@@ -109,6 +115,7 @@ def test_linear_forward_m9_uses_prefill_path():
     ref = (x @ nint_quant.dequantize(nint_quant.quantize(W, NintSpec(4, 24, 6))).T).astype(np.float32)
     assert y.shape == (9, 32)
     np.testing.assert_allclose(y, ref, rtol=0.1, atol=0.05)
+
 
 
 def test_linear_group_matches_separate_linears():

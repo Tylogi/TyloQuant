@@ -14,7 +14,8 @@ from mfq.formats.tpq import normalize_tpq_dtype
 
 _FORMAT_V1 = "mfq.calibration-scheme.v1"
 _FORMAT_V2 = "mfq.calibration-scheme.v2"
-_FORMAT = "mfq.calibration-scheme.v3"
+_FORMAT_V3 = "mfq.calibration-scheme.v3"
+_FORMAT = _FORMAT_V3
 
 EXPERT_PRECISION_FAMILIES = frozenset(
     {
@@ -24,6 +25,7 @@ EXPERT_PRECISION_FAMILIES = frozenset(
         "NINT5",
         "NINT6",
         "NINT8",
+        "NINT8-0",
         "MXFP4",
         "NVQ1-L",
         "NVQ1-S",
@@ -65,7 +67,10 @@ class ExpertPrecision:
         family = normalize_tpq_dtype(str(self.family))
         if family not in EXPERT_PRECISION_FAMILIES:
             raise ValueError(f"unsupported expert precision family: {family}")
-        if family.startswith("NINT"):
+        if family == "NINT8-0":
+            if self.nint_spec is not None:
+                raise ValueError("NINT8-0 cannot carry an affine NINT spec")
+        elif family.startswith("NINT"):
             if self.nint_spec is None:
                 raise ValueError(f"{family} requires a NINT spec")
             if family != f"NINT{self.nint_spec.bits}":
@@ -108,12 +113,23 @@ def nint_expert_precision(spec: NintSpec) -> ExpertPrecision:
 class TensorSelection:
     name: str
     group: str
-    spec: NintSpec
+    spec: NintSpec | None
     rows: int
     columns: int
     storage_bits: int
     train_loss: float
     validation_loss: float
+    precision: ExpertPrecision | None = None
+
+    @property
+    def descriptor(self) -> ExpertPrecision:
+        if self.precision is None:
+            if self.spec is None:
+                raise ValueError(f"tensor {self.name!r} has no precision descriptor")
+            return nint_expert_precision(self.spec)
+        if self.spec is not None and self.precision.nint_spec != self.spec:
+            raise ValueError(f"tensor {self.name!r} has conflicting precision descriptors")
+        return self.precision
 
 
 @dataclass(frozen=True)
@@ -167,7 +183,7 @@ class ExpertTensorSelection:
                 raise ValueError(f"expert {item.expert_id} has more than one precision selection")
             if item.storage_bits <= 0:
                 raise ValueError(f"expert {item.expert_id} has invalid storage_bits")
-            item.descriptor
+            _ = item.descriptor
             owners[item.expert_id] = True
 
     @property
@@ -267,6 +283,18 @@ def _precision_from_document(raw: Mapping[str, Any]) -> ExpertPrecision:
     )
 
 
+def precision_document(precision: ExpertPrecision) -> dict[str, Any]:
+    """Return the stable JSON representation of one precision descriptor."""
+
+    return _precision_document(precision)
+
+
+def precision_from_document(raw: Mapping[str, Any]) -> ExpertPrecision:
+    """Parse one precision descriptor from its stable JSON representation."""
+
+    return _precision_from_document(raw)
+
+
 def save_scheme(path: str | Path, scheme: CalibrationScheme) -> None:
     output = Path(path).resolve()
     if output.exists():
@@ -284,7 +312,12 @@ def save_scheme(path: str | Path, scheme: CalibrationScheme) -> None:
         "selections": {
             name: {
                 "group": item.group,
-                "spec": _spec_document(item.spec),
+                "precision": _precision_document(item.descriptor),
+                **(
+                    {"spec": _spec_document(item.spec)}
+                    if item.spec is not None
+                    else {}
+                ),
                 "rows": int(item.rows),
                 "columns": int(item.columns),
                 "storage_bits": int(item.storage_bits),
@@ -324,11 +357,16 @@ def load_scheme(path: str | Path) -> CalibrationScheme:
     if not resolved.is_file():
         raise FileNotFoundError(f"calibration scheme does not exist: {resolved}")
     document = json.loads(resolved.read_text(encoding="utf-8"))
-    if document.get("format") not in {_FORMAT_V1, _FORMAT_V2, _FORMAT}:
+    if document.get("format") not in {_FORMAT_V1, _FORMAT_V2, _FORMAT_V3, _FORMAT}:
         raise ValueError(f"unsupported calibration scheme format: {document.get('format')!r}")
     selections: dict[str, TensorSelection] = {}
     for name, raw in document.get("selections", {}).items():
-        spec = NintSpec(**raw["spec"])
+        if "precision" in raw:
+            precision = _precision_from_document(raw["precision"])
+            spec = precision.nint_spec
+        else:
+            spec = NintSpec(**raw["spec"])
+            precision = nint_expert_precision(spec)
         item = TensorSelection(
             name=str(name),
             group=str(raw["group"]),
@@ -338,6 +376,7 @@ def load_scheme(path: str | Path) -> CalibrationScheme:
             storage_bits=int(raw["storage_bits"]),
             train_loss=float(raw["train_loss"]),
             validation_loss=float(raw["validation_loss"]),
+            precision=precision,
         )
         if item.rows <= 0 or item.columns <= 0 or item.storage_bits <= 0:
             raise ValueError(f"invalid tensor selection for {name}")
@@ -395,7 +434,16 @@ def load_scheme(path: str | Path) -> CalibrationScheme:
 
 
 def scheme_specs(scheme: CalibrationScheme) -> Mapping[str, NintSpec]:
-    return {name: item.spec for name, item in scheme.selections.items()}
+    result: dict[str, NintSpec] = {}
+    for name, item in scheme.selections.items():
+        if item.descriptor.nint_spec is None:
+            raise TypeError(f"tensor {name!r} uses non-NINT precision {item.descriptor.family}")
+        result[name] = item.descriptor.nint_spec
+    return result
+
+
+def scheme_precisions(scheme: CalibrationScheme) -> Mapping[str, ExpertPrecision]:
+    return {name: item.descriptor for name, item in scheme.selections.items()}
 
 
 def scheme_expert_specs(scheme: CalibrationScheme) -> Mapping[str, tuple[NintSpec, ...]]:
@@ -417,8 +465,11 @@ __all__ = [
     "TensorSelection",
     "load_scheme",
     "nint_expert_precision",
+    "precision_document",
+    "precision_from_document",
     "save_scheme",
     "scheme_expert_precisions",
     "scheme_expert_specs",
+    "scheme_precisions",
     "scheme_specs",
 ]

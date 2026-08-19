@@ -2,23 +2,33 @@ import DOMPurify from "dompurify";
 import renderMathInElement from "katex/contrib/auto-render";
 import { marked } from "marked";
 import { useEffect, useMemo, useRef } from "react";
+import { normalizeEscapedMarkdownLineBreaks } from "./markdownText";
 
 interface MarkdownProps {
   text: string;
   live?: boolean;
+  normalizeEscapedLineBreaks?: boolean;
 }
 
-export function Markdown({ text, live = false }: MarkdownProps) {
+export function Markdown({
+  text,
+  live = false,
+  normalizeEscapedLineBreaks = false,
+}: MarkdownProps) {
   const rootRef = useRef<HTMLDivElement>(null);
+  const markdown = useMemo(
+    () => normalizeEscapedLineBreaks ? normalizeEscapedMarkdownLineBreaks(text) : text,
+    [normalizeEscapedLineBreaks, text],
+  );
   const html = useMemo(
     () =>
       DOMPurify.sanitize(
-        marked.parse(text, {
+        marked.parse(markdown, {
           breaks: true,
           gfm: true,
         }) as string,
       ),
-    [text],
+    [markdown],
   );
 
   useEffect(() => {

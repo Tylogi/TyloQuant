@@ -807,6 +807,7 @@ def to_gpu(
     from mfq.formats.moe import NintMoeTensor
     from mfq.formats.mx import MxTensor
     from mfq.formats.nepq import NepqTensor
+    from mfq.formats.nint import NintTensor
     from mfq.formats.nint8_zero import Nint8ZeroTensor
     from mfq.formats.tpq import TpqPqTensor
     from mfq.kernels.cuda.mx_matmul import to_gpu_mx
@@ -815,7 +816,6 @@ def to_gpu(
     from mfq.kernels.cuda.nvq_matmul import to_gpu_nvq
     from mfq.kernels.cuda.tpq_matmul import to_gpu_tpq
     from mfq.kernels.torch_backend import to_gpu as nint_to_gpu
-    from mfq.quantize.nint_quant import NintTensor
 
     if not isinstance(tensor, NintMoeTensor):
         raise TypeError("to_gpu expects NintMoeTensor")

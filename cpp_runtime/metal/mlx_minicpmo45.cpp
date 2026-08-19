@@ -11,6 +11,8 @@
 #include <mlx/backend/metal/device.h>
 #include <mlx/primitives.h>
 
+#include <sys/sysctl.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -29,10 +31,64 @@
 
 namespace mfq::metal {
 
+namespace {
+
+enum class MiniCPMOMetalProfile {
+    baseline,
+    m3,
+};
+
+std::string apple_chip_name() {
+    std::size_t size = 0;
+    if (::sysctlbyname(
+            "machdep.cpu.brand_string", nullptr, &size, nullptr, 0) != 0 ||
+        size <= 1) {
+        return {};
+    }
+    std::string value(size, '\0');
+    if (::sysctlbyname(
+            "machdep.cpu.brand_string", value.data(), &size, nullptr, 0) !=
+        0) {
+        return {};
+    }
+    if (!value.empty() && value.back() == '\0') value.pop_back();
+    return value;
+}
+
+MiniCPMOMetalProfile minicpmo_metal_profile_for_chip_name(
+    const std::string& chip_name) {
+    return chip_name.rfind("Apple M3", 0) == 0
+        ? MiniCPMOMetalProfile::m3
+        : MiniCPMOMetalProfile::baseline;
+}
+
+MiniCPMOMetalProfile minicpmo_metal_profile() {
+    static const auto profile = [] {
+        if (const auto* requested = std::getenv(
+                "MFQ_MINICPM_METAL_PROFILE")) {
+            if (std::strcmp(requested, "m3") == 0) {
+                return MiniCPMOMetalProfile::m3;
+            }
+            if (std::strcmp(requested, "baseline") == 0) {
+                return MiniCPMOMetalProfile::baseline;
+            }
+        }
+        return minicpmo_metal_profile_for_chip_name(apple_chip_name());
+    }();
+    return profile;
+}
+
+bool minicpmo_uses_m3_profile() {
+    return minicpmo_metal_profile() == MiniCPMOMetalProfile::m3;
+}
+
+} // namespace
+
 void configure_minicpmo45_metal_device() {
-    // MiniCPM-o decode has many small dependent kernels per token.  Larger
-    // command buffers reduce submission/fence overhead without changing the
-    // graph.  Keep both knobs overridable for devices with tighter memory.
+    // The larger command buffers are used across the M3 family. M4, M5, and
+    // unknown future devices retain MLX's native per-device defaults. Keep
+    // explicit user settings above either profile.
+    if (!minicpmo_uses_m3_profile()) return;
     if (std::getenv("MLX_MAX_OPS_PER_BUFFER") == nullptr) {
         ::setenv("MLX_MAX_OPS_PER_BUFFER", "256", 0);
     }
@@ -461,10 +517,12 @@ kernel void mfq_minicpmo_qk_norm_rope_cache_4head_v1(
             encoder.set_input_array(
                 inputs[static_cast<std::size_t>(index)], index);
         }
-        // One persistent output is sufficient as a synchronization sentinel:
-        // MLX emits a buffers-scope barrier before attention, which also makes
-        // the value-cache writes visible without tracking that full allocation.
+        // The kernel mutates both persistent cache buffers in place.  MLX
+        // cannot infer that from set_input_array(), so register the buffers
+        // as outputs as well.  Without this, the following attention kernel
+        // may read the cache before these writes are visible.
         encoder.register_output_array(inputs[5]);
+        encoder.register_output_array(inputs[6]);
         encoder.set_output_array(output, 8);
         encoder.set_bytes(params_, 9);
         encoder.dispatch_threadgroups(
@@ -638,9 +696,11 @@ kernel void mfq_minicpmo_kv_cache_write_v1(
         for (int index = 1; index < 5; ++index) {
             encoder.set_input_array(inputs[index], index);
         }
-        // Tracking one cache is enough to trigger the global buffers barrier
-        // that covers both in-place cache writes.
+        // key_cache and value_cache are in-place outputs even though the
+        // primitive returns the query passthrough.  Register them so MLX
+        // inserts the buffer barrier required by the subsequent attention.
         encoder.register_output_array(inputs[3]);
+        encoder.register_output_array(inputs[4]);
         encoder.set_bytes(params_, 5);
         encoder.dispatch_threads(
             MTL::Size(8 * 128, 1, 1),
@@ -1271,11 +1331,13 @@ array mini_gqa_attention(
     const bool hierarchical = hierarchical_setting != nullptr
         ? std::strcmp(hierarchical_setting, "0") != 0
         : sequence >= 1'024;
-    // The hierarchical kernel has eight SIMD groups per block.  Keep enough
-    // blocks to occupy large Apple GPUs at the 1k crossover, then scale to 16
-    // by 4k.  More than 16 increases the final-reduction cost on M3 Ultra.
+    // The M3 family uses the wider schedule tuned on M3 Ultra. M4, M5, and
+    // unknown future devices retain the previously validated reduction tree
+    // so their FP16 results do not change with the M3 tuning.
     int blocks = hierarchical
-        ? std::clamp((sequence + 255) / 256, 8, 16)
+        ? (minicpmo_uses_m3_profile()
+              ? std::clamp((sequence + 255) / 256, 8, 16)
+              : std::min(6, (sequence + 1'023) / 1'024))
         : std::min(48, (sequence + 127) / 128);
     if (const auto* setting = std::getenv("MFQ_MINICPM_GQA_BLOCKS")) {
         const int configured = std::atoi(setting);
@@ -3845,6 +3907,41 @@ array last_logits(const array& logits, int vocab) {
 } // namespace
 
 namespace detail {
+
+void test_minicpmo45_metal_profile_dispatch() {
+    const std::vector<std::string> m3_chips{
+        "Apple M3",
+        "Apple M3 Pro",
+        "Apple M3 Max",
+        "Apple M3 Ultra",
+    };
+    for (const auto& chip : m3_chips) {
+        if (minicpmo_metal_profile_for_chip_name(chip) !=
+            MiniCPMOMetalProfile::m3) {
+            throw std::runtime_error(
+                "MiniCPM-o failed to select the M3 Metal profile for " +
+                chip);
+        }
+    }
+    const std::vector<std::string> baseline_chips{
+        "Apple M4",
+        "Apple M4 Pro",
+        "Apple M4 Max",
+        "Apple M5",
+        "Apple M5 Pro",
+        "Apple M5 Max",
+        "Apple Future",
+        "",
+    };
+    for (const auto& chip : baseline_chips) {
+        if (minicpmo_metal_profile_for_chip_name(chip) !=
+            MiniCPMOMetalProfile::baseline) {
+            throw std::runtime_error(
+                "MiniCPM-o failed to select the baseline Metal profile for " +
+                chip);
+        }
+    }
+}
 
 void test_minicpmo45_qk_norm_rope() {
     constexpr int query_heads = 32;

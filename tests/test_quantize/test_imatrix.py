@@ -11,7 +11,43 @@ from mfq.quantize.imatrix import (
     ImportanceMatrix,
     _load_gguf_reader,
     load_importance_matrix,
+    save_importance_matrix,
 )
+
+
+def test_native_imatrix_round_trip_preserves_experts_and_metadata(tmp_path: Path):
+    path = tmp_path / "calibration.imatrix"
+    saved = save_importance_matrix(
+        path,
+        {
+            "model.layers.0.experts.gate_up_proj": ImportanceEntry(
+                values=np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+                counts=np.asarray([11, 7], dtype=np.int64),
+            )
+        },
+        datasets=("balanced-corpus",),
+        chunk_count=3,
+        chunk_size=128,
+        metadata={"backend": "metal", "manifest_sha256": "abc"},
+    )
+
+    loaded = load_importance_matrix(path)
+
+    assert saved.metadata == loaded.metadata == {
+        "backend": "metal",
+        "manifest_sha256": "abc",
+    }
+    assert loaded.datasets == ("balanced-corpus",)
+    assert loaded.chunk_count == 3
+    assert loaded.chunk_size == 128
+    np.testing.assert_array_equal(
+        loaded.entries["model.layers.0.experts.gate_up_proj"].values,
+        [[1.0, 2.0], [3.0, 4.0]],
+    )
+    np.testing.assert_array_equal(
+        loaded.entries["model.layers.0.experts.gate_up_proj"].counts,
+        [11, 7],
+    )
 
 
 def test_load_legacy_imatrix_normalizes_values(tmp_path: Path):

@@ -56,10 +56,6 @@ from mfq.formats.io import (
     pack_bits,
 )
 from mfq.formats.mx import mx_header_bytes
-from mfq.formats.runtime_profile import (
-    RUNTIME_SAMPLING_METADATA_KEY,
-    profile_for_new_mfq,
-)
 from mfq.formats.nepq import (
     _FLAG_ROTATED as _NEPQ_FLAG_ROTATED,
 )
@@ -68,9 +64,6 @@ from mfq.formats.nepq import (
 )
 from mfq.formats.nepq import (
     _MAGIC as _NEPQ_MAGIC,
-)
-from mfq.formats.nepq import (
-    _VERSION as _NEPQ_VERSION,
 )
 from mfq.formats.nepq import (
     _RESIDUAL_DICTIONARY_ENTRIES,
@@ -85,6 +78,9 @@ from mfq.formats.nepq import (
     NEPQ1_L,
     NEPQ1_S,
     validate_nepq,
+)
+from mfq.formats.nepq import (
+    _VERSION as _NEPQ_VERSION,
 )
 from mfq.formats.nepq import (
     _pack_bits as _pack_nepq_bits,
@@ -174,6 +170,10 @@ from mfq.formats.nvq1_s import (
     NVQ1_S_SYNTHETIC_BANKS,
     pack_nvq1_s_banked_codebook,
 )
+from mfq.formats.runtime_profile import (
+    RUNTIME_SAMPLING_METADATA_KEY,
+    profile_for_new_mfq,
+)
 from mfq.formats.shards import (
     matching_shard_paths,
     parse_size,
@@ -182,9 +182,15 @@ from mfq.formats.shards import (
 )
 from mfq.formats.tpq import (
     TPQ_PQ_SPECS_BY_LABEL,
-    tpq_pq_payload_nbytes,
     pack_tpq_indices,
     pack_tpq_pq_prefix,
+    tpq_pq_payload_nbytes,
+)
+from mfq.quantize.backend import (
+    ACCELERATOR_BACKENDS,
+    QUANT_BACKENDS,
+    resolve_quant_backend,
+    resolve_row_chunk,
 )
 from mfq.quantize.expert_nint import (
     quantize_flat_cohort,
@@ -199,15 +205,9 @@ from mfq.quantize.nepq_a import (
 )
 from mfq.quantize.nint_quant import quantize as nint_quantize
 from mfq.quantize.nint_quant_torch import quantize_axis0 as nint_quantize_axis0_torch
-from mfq.quantize.npq0_l import Npq0LTables
-from mfq.quantize.npq0_s import Npq0STables
+from mfq.quantize.npq0_l import Npq0LConfig, Npq0LTables, quantize_npq0_l_fixed
+from mfq.quantize.npq0_s import Npq0SConfig, Npq0STables, quantize_npq0_s_fixed
 from mfq.quantize.nvq_jsc import NvqJscConfig, NvqJscTables, initial_jsc_tables
-from mfq.quantize.backend import (
-    ACCELERATOR_BACKENDS,
-    QUANT_BACKENDS,
-    resolve_quant_backend,
-    resolve_row_chunk,
-)
 from mfq.quantize.tpq import quantize_tpq_pq_fixed
 
 
@@ -549,7 +549,7 @@ _RECIPE_TARGETS = {
     "IQ2_XS": "NVQ2J-L",
     "IQ2_XXS": "NVQ2J",
     "IQ3_S": "NVQ3J-L",
-    "IQ3_XXS": "NVQ3",
+    "IQ3_XXS": "NVQ3J",
     "IQ4_NL": "NINT4",
     "IQ4_XS": "NINT4",
     "Q2_K": "NINT2",
@@ -1083,7 +1083,7 @@ def _apply_recipe_family_mappings(
         target = item.target_dtype
         if npq0_l and target == "NVQ1-L":
             target = "NPQ0-L"
-        if target == "NVQ3":
+        if item.gguf_type == "IQ3_XXS" and target in {"NVQ3", "NVQ3J"}:
             if nvq3_jsc or nvq3_jsc_512:
                 target = "NVQ3J-512" if nvq3_jsc_512 else "NVQ3J"
             elif nvq3_to_nint3:
@@ -3769,6 +3769,26 @@ def convert(args: argparse.Namespace) -> None:
         group_chunk=int(getattr(args, "npq0_l_group_chunk", 512)),
         seed=int(getattr(args, "nvq_codebook_seed", 20260716)),
     )
+    row_importance_path = getattr(args, "nvq_jsc_row_importance", "")
+    row_importance = (
+        gguf_quantizer.load_row_importance(Path(row_importance_path))
+        if row_importance_path
+        else None
+    )
+    if row_importance is not None:
+        if imatrix is None or calibration_mode != "group24":
+            raise ValueError(
+                "--nvq-jsc-row-importance requires --imatrix and "
+                "--nvq-calibration group24"
+            )
+        if nvq_codebook_scope != "tensor":
+            raise ValueError(
+                "--nvq-jsc-row-importance requires --nvq-codebook-scope tensor"
+            )
+        for item in plan:
+            if item.target_dtype in _JSC_DTYPES:
+                row_importance.require(item.name, int(item.shape[0]))
+
     temp_dir_arg = getattr(args, "temp_dir", "")
     tmp_root = (
         Path(temp_dir_arg).resolve()
@@ -4033,6 +4053,7 @@ def convert(args: argparse.Namespace) -> None:
                                     quant_device,
                                     imatrix,
                                     imatrix_binding,
+                                    row_importance,
                                 )
                             )
                             codebook_results[item.name] = metrics
@@ -4411,6 +4432,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--q8-to-nint8-zero", action="store_true")
     parser.add_argument("--nvq3-jsc-banks", type=int, choices=(1, 2, 4), default=2)
     parser.add_argument("--nvq3-jsc-learned-scale", action="store_true")
+    parser.add_argument("--nvq-jsc-row-importance", default="")
     parser.add_argument("--npq0-l", action="store_true")
     parser.add_argument("--npq0-l-iterations", type=int, default=4)
     parser.add_argument("--npq0-l-assignment-refine-steps", type=int, default=2)

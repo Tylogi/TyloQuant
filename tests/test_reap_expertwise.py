@@ -5,7 +5,7 @@ import json
 import numpy as np
 import torch
 
-from mfq.calibration.nint_profiles import NINT_CALIBRATION_PROFILES, nint_storage_bits
+from mfq.calibration.evaluator import NINT_CALIBRATION_PROFILES, nint_storage_bits
 from mfq.calibration.reap_expertwise import (
     ExpertProfileEvaluation,
     allocate_expert_profiles,
@@ -79,6 +79,48 @@ def test_quantization_sse_matches_production_quantizer_reconstruction():
     expected_signal = (weight * weight).sum(dim=1)
     torch.testing.assert_close(row_sse, expected_sse, rtol=2e-5, atol=2e-7)
     torch.testing.assert_close(row_signal, expected_signal, rtol=0, atol=0)
+
+
+def test_imatrix_quantization_sse_matches_production_reconstruction():
+    generator = torch.Generator().manual_seed(20260813)
+    weight = torch.randn((5, 37), generator=generator, dtype=torch.float32) * 0.05
+    importance = torch.rand((5, 37), generator=generator, dtype=torch.float32) + 0.01
+    spec = NintSpec(3, 24, 6)
+    row_sse, row_signal = _quantization_sse_by_row(weight, spec, importance)
+    encoded = quantize_axis0(weight, spec, device="cpu", importance=importance)
+    reconstruction = torch.from_numpy(dequantize(encoded))
+    expected_sse = (importance * (reconstruction - weight).square()).sum(dim=1)
+    expected_signal = (importance * weight.square()).sum(dim=1)
+    torch.testing.assert_close(row_sse, expected_sse, rtol=2e-5, atol=2e-7)
+    torch.testing.assert_close(row_signal, expected_signal, rtol=0, atol=0)
+
+
+def test_priority_refinement_tile_sizes_do_not_change_encoding():
+    generator = torch.Generator().manual_seed(20260813)
+    weight = torch.randn((19, 193), generator=generator, dtype=torch.float32) * 0.05
+    importance = torch.rand((19, 193), generator=generator, dtype=torch.float32) + 0.01
+    spec = NintSpec(3, 24, 5)
+    reference = quantize_axis0(
+        weight,
+        spec,
+        device="cpu",
+        importance=importance,
+        priority_row_chunk=4,
+        priority_pair_chunk=17,
+    )
+    tiled = quantize_axis0(
+        weight,
+        spec,
+        device="cpu",
+        importance=importance,
+        priority_row_chunk=11,
+        priority_pair_chunk=97,
+    )
+    np.testing.assert_array_equal(tiled.q, reference.q)
+    np.testing.assert_array_equal(tiled.sub_scale, reference.sub_scale)
+    np.testing.assert_array_equal(tiled.sub_min, reference.sub_min)
+    np.testing.assert_array_equal(tiled.neuron_scale, reference.neuron_scale)
+    np.testing.assert_array_equal(tiled.neuron_min, reference.neuron_min)
 
 
 def test_global_expert_allocation_preserves_gate_down_coupling_and_budget():

@@ -23,6 +23,7 @@ from mfq.tools.quantize_hf_to_mfq import (
     _GlmExpertRowSource,
     _hf_to_gguf_name,
     _minicpmo45_quantizable_matrix,
+    _normalize_hf_expert_storage,
     _RawSafeTensorSlice,
     _transform_glm_kv_b,
     _validate_runtime_fused_pairs,
@@ -42,6 +43,27 @@ def _plan(name: str, spec: NintSpec) -> TensorPlan:
         target_dtype=f"NINT{spec.bits}",
         target_spec=spec,
     )
+
+
+def test_normalize_hf_expert_storage_preserves_mixed_nintm_plan() -> None:
+    precisions = (
+        ExpertPrecision("NINT2", nint_spec=NintSpec(2, 16, 5)),
+        ExpertPrecision("NINT5", nint_spec=NintSpec(5, 24, 7)),
+    )
+    item = TensorPlan(
+        name="model.language_model.layers.0.mlp.experts.down_proj.weight",
+        shard="model.safetensors",
+        shape=(2, 3, 48),
+        source_dtype="BF16",
+        target_dtype="NINTM",
+        expert_shape=(2, 3, 48),
+        expert_precisions=precisions,
+    )
+
+    normalized = _normalize_hf_expert_storage([item])
+
+    assert normalized == [item]
+    assert normalized[0].expert_precisions == precisions
 
 
 def test_raw_safetensor_slice_streams_bfloat16_rows_and_expert_rows(tmp_path):
@@ -105,7 +127,9 @@ def test_runtime_fused_pairs_accept_identical_precision_layout():
     "suffix,gguf_suffix",
     [
         ("mlp.experts.down_proj", "ffn_down_exps.weight"),
+        ("mlp.experts.down_proj.weight", "ffn_down_exps.weight"),
         ("mlp.experts.gate_up_proj", "ffn_gate_up_exps.weight"),
+        ("mlp.experts.gate_up_proj.weight", "ffn_gate_up_exps.weight"),
         ("mlp.gate.weight", "ffn_gate_inp.weight"),
         ("mlp.shared_expert.down_proj.weight", "ffn_down_shexp.weight"),
         ("mlp.shared_expert.gate_proj.weight", "ffn_gate_shexp.weight"),
@@ -154,7 +178,7 @@ def test_recipe_dense_types_preserve_bf16_separately_from_f16():
         ("IQ2_XS", "NVQ2J-L"),
         ("IQ2_XXS", "NVQ2J"),
         ("IQ3_S", "NVQ3J-L"),
-        ("IQ3_XXS", "NVQ3"),
+        ("IQ3_XXS", "NVQ3J"),
         ("Q4_0", "NINT4"),
         ("Q4_1", "NINT4"),
         ("Q8_0", "NINT8"),
@@ -190,6 +214,48 @@ def test_hf_recipe_plan_keeps_iq_tensor_as_vq(tmp_path):
     assert len(plan) == 1
     assert plan[0].target_dtype == "NVQ2J"
     assert plan[0].gguf_type == "IQ2_XXS"
+
+
+def test_hf_recipe_family_flags_remap_the_default_iq3_xxs_profile(tmp_path):
+    root = tmp_path / "hf-recipe-iq3"
+    root.mkdir()
+    name = "model.language_model.layers.0.mlp.down_proj.weight"
+    save_file(
+        {name: torch.zeros((8, 24), dtype=torch.bfloat16)},
+        root / "model.safetensors",
+    )
+    (root / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5"}),
+        encoding="utf-8",
+    )
+    plan = build_hf_plan(
+        root,
+        False,
+        {"blk.0.ffn_down.weight": "IQ3_XXS"},
+        "F32",
+    )
+
+    mapped = hf_to_mfq._apply_recipe_family_mappings(
+        plan,
+        npq0_l=False,
+        nvq3_jsc=False,
+        nvq3_jsc_512=True,
+        nvq3_to_nint3=False,
+        iq2_s_to_nint2=False,
+        q8_to_nint8_zero=False,
+    )
+    assert mapped[0].target_dtype == "NVQ3J-512"
+
+    mapped = hf_to_mfq._apply_recipe_family_mappings(
+        plan,
+        npq0_l=False,
+        nvq3_jsc=False,
+        nvq3_jsc_512=False,
+        nvq3_to_nint3=True,
+        iq2_s_to_nint2=False,
+        q8_to_nint8_zero=False,
+    )
+    assert mapped[0].target_dtype == "NINT3"
 
 
 def test_hf_and_gguf_recipe_family_tables_cannot_diverge():

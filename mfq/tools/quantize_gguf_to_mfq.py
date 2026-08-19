@@ -170,6 +170,7 @@ from mfq.quantize.nvq_tensor_codebook import (
     TensorCodebookTrainingConfig,
     train_tensor_codebook,
 )
+from mfq.quantize.row_importance import RowImportance, load_row_importance
 from mfq.quantize.second_order import diagonal_regressed_gain
 from mfq.tools.quantize_hf_to_mfq import (
     _RECIPE_SPECS,
@@ -234,7 +235,7 @@ _RECIPE_TARGETS = {
     "IQ2_XS": "NVQ2J-L",
     "IQ2_XXS": "NVQ2J",
     "IQ3_S": "NVQ3J-L",
-    "IQ3_XXS": "NVQ3",
+    "IQ3_XXS": "NVQ3J",
     "IQ4_NL": "NINT4",
     "IQ4_XS": "NINT4",
     "Q2_K": "NINT2",
@@ -773,7 +774,8 @@ def _apply_nvq3_jsc_mapping(
         return plan
     return [
         replace(item, target_dtype=target_dtype)
-        if item.target_dtype == "NVQ3"
+        if item.recipe_type == "IQ3_XXS"
+        and item.target_dtype in {"NVQ3", "NVQ3J"}
         else item
         for item in plan
     ]
@@ -787,7 +789,8 @@ def _apply_nvq3_to_nint3_mapping(
         return plan
     return [
         replace(item, target_dtype="NINT3")
-        if item.target_dtype == "NVQ3"
+        if item.recipe_type == "IQ3_XXS"
+        and item.target_dtype in {"NVQ3", "NVQ3J"}
         else item
         for item in plan
     ]
@@ -1054,6 +1057,40 @@ def _canonical_artifact_signature(value: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _factorized_jsc_importance(
+    item: GgufTensorPlan,
+    row_ids: np.ndarray,
+    imatrix_binding: ImatrixBinding,
+    row_importance: RowImportance,
+) -> np.ndarray:
+    indices = np.asarray(row_ids, dtype=np.int64).reshape(-1)
+    if not indices.size:
+        raise ValueError(f"empty JSC importance selection for {item.name}")
+    rows, width = map(int, item.storage_shape)
+    if int(indices.min()) < 0 or int(indices.max()) >= rows:
+        raise IndexError(f"JSC importance selection is outside {rows} rows")
+    row_weight = row_importance.require(item.name, rows)[indices]
+    column_weight = np.asarray(imatrix_binding.selected(indices), dtype=np.float32)
+    if column_weight.ndim == 1:
+        if column_weight.shape != (width,):
+            raise ValueError(
+                f"imatrix for {item.name} has shape {column_weight.shape}, expected {(width,)}"
+            )
+        column_weight = np.broadcast_to(column_weight, (indices.size, width))
+    elif column_weight.shape != (indices.size, width):
+        raise ValueError(
+            f"imatrix for {item.name} has shape {column_weight.shape}, "
+            f"expected {(indices.size, width)}"
+        )
+    result = np.ascontiguousarray(
+        row_weight[:, None].astype(np.float32, copy=False) * column_weight,
+        dtype=np.float32,
+    )
+    if not np.isfinite(result).all() or np.any(result < 0) or not np.any(result > 0):
+        raise ValueError(f"invalid factorized JSC importance for {item.name}")
+    return result
+
+
 def _train_or_load_jsc_tables(
     source: GgufRowSource,
     item: GgufTensorPlan,
@@ -1067,20 +1104,28 @@ def _train_or_load_jsc_tables(
     device: str,
     imatrix: ImportanceMatrix | None = None,
     imatrix_binding: ImatrixBinding | None = None,
+    row_importance: RowImportance | None = None,
 ) -> tuple[NvqJscTables, dict[str, Any]]:
     """Fit/reuse tensor-wise JSC tables on deterministic rows."""
 
     if imatrix_binding is not None and imatrix is None:
         raise ValueError("an imatrix binding requires its source imatrix")
+    if row_importance is not None and (imatrix is None or imatrix_binding is None):
+        raise ValueError("row-Fisher JSC training requires a bound imatrix")
+
     train_index, validation_index = _sample_codebook_rows(
         item, train_rows, validation_rows, seed
     )
     if not train_index.size or not validation_index.size:
         raise ValueError(f"tensor-wise JSC training needs non-empty splits: {item.name}")
     objective = (
-        "imatrix_weighted_sse"
-        if imatrix_binding is not None
-        else "unweighted_weight_sse"
+        "factorized_row_fisher_x_imatrix_sse"
+        if row_importance is not None
+        else (
+            "imatrix_weighted_sse"
+            if imatrix_binding is not None
+            else "unweighted_weight_sse"
+        )
     )
     signature = {
         "source": _file_identity(source_path),
@@ -1103,6 +1148,16 @@ def _train_or_load_jsc_tables(
             }
         ),
     }
+    if row_importance is not None:
+        signature.update(
+            {
+                "row_importance": {
+                    "file": _file_identity(row_importance.path),
+                    "entry": item.name,
+                    "metadata": row_importance.metadata,
+                },
+            }
+        )
     artifact_root.mkdir(parents=True, exist_ok=True)
     artifact_path = _existing_codebook_artifact_path(
         _codebook_artifact_path(artifact_root, item)
@@ -1132,7 +1187,15 @@ def _train_or_load_jsc_tables(
 
     train_weight = source.read_rows(train_index)
     train_importance = (
-        None if imatrix_binding is None else imatrix_binding.selected(train_index)
+        (
+            None
+            if imatrix_binding is None
+            else imatrix_binding.selected(train_index)
+        )
+        if row_importance is None
+        else _factorized_jsc_importance(
+            item, train_index, imatrix_binding, row_importance
+        )
     )
     trained, history = train_nvq_jsc(
         train_weight,
@@ -1143,9 +1206,15 @@ def _train_or_load_jsc_tables(
     tables = jsc_tables_from_tensor(trained)
     validation_weight = source.read_rows(validation_index)
     validation_importance = (
-        None
-        if imatrix_binding is None
-        else imatrix_binding.selected(validation_index)
+        (
+            None
+            if imatrix_binding is None
+            else imatrix_binding.selected(validation_index)
+        )
+        if row_importance is None
+        else _factorized_jsc_importance(
+            item, validation_index, imatrix_binding, row_importance
+        )
     )
     validation = quantize_nvq_jsc_fixed(
         validation_weight,
@@ -1183,6 +1252,12 @@ def _train_or_load_jsc_tables(
     }
     if imatrix_binding is not None:
         metrics["imatrix_entry"] = imatrix_binding.entry_name
+    if row_importance is not None:
+        metrics.update(
+            {
+                "row_importance_entry": item.name,
+            }
+        )
     payload = _pack_jsc_tables(
         tables.scale_lut, tables.bank_for_state, tables.codebooks
     )
@@ -2112,6 +2187,26 @@ def convert(args: argparse.Namespace) -> None:
     imatrix_bindings = {} if imatrix is None else _bind_imatrix(imatrix, plan)
     reuse_path_arg = getattr(args, "reuse_unweighted_from", "")
     reuse_store = open_mmap(Path(reuse_path_arg).resolve()) if reuse_path_arg else None
+    row_importance_path_arg = getattr(args, "nvq_jsc_row_importance", "")
+    row_importance = (
+        load_row_importance(Path(row_importance_path_arg))
+        if row_importance_path_arg
+        else None
+    )
+    if row_importance is not None:
+        if imatrix is None or calibration_mode != "group24":
+            raise ValueError(
+                "--nvq-jsc-row-importance requires --imatrix and "
+                "--nvq-calibration group24"
+            )
+        if args.nvq_codebook_scope != "tensor":
+            raise ValueError(
+                "--nvq-jsc-row-importance requires --nvq-codebook-scope tensor"
+            )
+        for item in plan:
+            if item.target_dtype in _JSC_DTYPES:
+                row_importance.require(item.name, int(item.storage_shape[0]))
+
     selected_backend = resolve_quant_backend(args.quant_backend, args.device)
     quant_backend = selected_backend.name
     quant_device = selected_backend.device
@@ -2274,6 +2369,13 @@ def convert(args: argparse.Namespace) -> None:
             "chunk_count": imatrix.chunk_count,
             "chunk_size": imatrix.chunk_size,
             "legacy": imatrix.legacy,
+        },
+        "nvq_jsc_row_importance": None if row_importance is None else {
+            "path": str(row_importance.path),
+            "file": _file_identity(row_importance.path),
+            "entries": len(row_importance.entries),
+            "objective": "factorized_row_fisher_x_imatrix_sse",
+            "metadata": row_importance.metadata,
         },
         "weight_only_default": not bool(imatrix_path_arg),
     }
@@ -2488,6 +2590,7 @@ def convert(args: argparse.Namespace) -> None:
                         quant_device,
                         imatrix,
                         imatrix_binding,
+                        row_importance,
                     )
                     codebook_results[item.name] = codebook_metrics
                     print(
@@ -2733,6 +2836,13 @@ def convert(args: argparse.Namespace) -> None:
                         for key, value in _codebook_config_dict(codebook_config).items()
                         if key not in {"quant_backend", "device"}
                     },
+                    "jsc_row_importance": None if row_importance is None else {
+                        "path": str(row_importance.path),
+                        "file": _file_identity(row_importance.path),
+                        "entries": len(row_importance.entries),
+                        "objective": "factorized_row_fisher_x_imatrix_sse",
+                        "metadata": row_importance.metadata,
+                    },
                     "imatrix": None if imatrix is None else {
                         "path": str(imatrix.path),
                         "file": _file_identity(imatrix.path),
@@ -2893,6 +3003,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--nvq3-jsc-learned-scale",
         action="store_true",
         help="learn the NVQ3J scale LUT instead of using the analytic state layout",
+    )
+    parser.add_argument(
+        "--nvq-jsc-row-importance",
+        default="",
+        help="optional per-output-row Fisher artifact for tensor-wise JSC training",
     )
     parser.add_argument(
         "--npq0-l",

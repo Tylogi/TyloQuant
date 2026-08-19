@@ -7,14 +7,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from mfq.formats.nint import NintSpec
-
 
 @dataclass(frozen=True)
 class GroupCandidate:
     group: str
     profile: str
-    specs: Mapping[str, NintSpec]
+    specs: Mapping[str, object]
     storage_bits: int
     train_loss: float
     validation_loss: float
@@ -170,4 +168,134 @@ def allocate(
     )
 
 
-__all__ = ["AllocationResult", "GroupCandidate", "allocate"]
+def allocate_lp_rounded(
+    candidates: Iterable[GroupCandidate],
+    target_storage_bits: int,
+) -> AllocationResult:
+    """Solve the LP relaxation and round its at-most-one fractional group down."""
+
+    try:
+        from scipy.optimize import linprog
+        from scipy.sparse import csr_matrix
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("global precision allocation requires scipy") from exc
+
+    values = list(candidates)
+    if not values:
+        raise ValueError("no precision candidates were provided")
+    if target_storage_bits <= 0:
+        raise ValueError("target_storage_bits must be positive")
+    by_group: dict[str, list[int]] = {}
+    for index, item in enumerate(values):
+        if item.storage_bits <= 0:
+            raise ValueError(f"candidate {item.group}/{item.profile} has invalid storage cost")
+        if not np.isfinite(item.train_loss) or item.train_loss < 0:
+            raise ValueError(f"candidate {item.group}/{item.profile} has invalid train loss")
+        if not np.isfinite(item.validation_loss) or item.validation_loss < 0:
+            raise ValueError(f"candidate {item.group}/{item.profile} has invalid validation loss")
+        if not item.specs:
+            raise ValueError(f"candidate {item.group}/{item.profile} contains no tensors")
+        by_group.setdefault(item.group, []).append(index)
+
+    minimum = sum(
+        min(values[index].storage_bits for index in indices) for indices in by_group.values()
+    )
+    maximum = sum(
+        max(values[index].storage_bits for index in indices) for indices in by_group.values()
+    )
+    if target_storage_bits < minimum:
+        raise ValueError(
+            f"target budget {target_storage_bits} bits is below minimum feasible {minimum} bits"
+        )
+    target_storage_bits = min(int(target_storage_bits), int(maximum))
+
+    group_names = sorted(by_group)
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+    for row, group in enumerate(group_names):
+        for index in by_group[group]:
+            rows.append(row)
+            cols.append(index)
+            data.append(1.0)
+    equality = csr_matrix(
+        (data, (rows, cols)),
+        shape=(len(group_names), len(values)),
+    )
+    cost_scale = float(target_storage_bits)
+    budget = csr_matrix(
+        (
+            [item.storage_bits / cost_scale for item in values],
+            ([0] * len(values), list(range(len(values)))),
+        ),
+        shape=(1, len(values)),
+    )
+    losses = np.asarray([item.train_loss for item in values], dtype=np.float64)
+    positive = losses[losses > 0]
+    objective_scale = float(np.median(positive)) if positive.size else 1.0
+    objective = losses / objective_scale
+    objective += np.asarray(
+        [item.storage_bits / cost_scale for item in values], dtype=np.float64
+    ) * 1e-12
+    result = linprog(
+        objective,
+        A_ub=budget,
+        b_ub=np.asarray([1.0]),
+        A_eq=equality,
+        b_eq=np.ones(len(group_names)),
+        bounds=(0.0, 1.0),
+        method="highs",
+        options={"presolve": True},
+    )
+    if not result.success or result.x is None:
+        raise RuntimeError(f"global precision LP allocation failed: {result.message}")
+
+    tolerance = 1e-8
+    selected_indices: dict[str, int] = {}
+    fractional_groups: list[str] = []
+    for group in group_names:
+        indices = by_group[group]
+        positive_indices = [index for index in indices if result.x[index] > tolerance]
+        if not positive_indices:
+            positive_indices = [max(indices, key=lambda index: result.x[index])]
+        if len(positive_indices) > 1:
+            fractional_groups.append(group)
+        selected_indices[group] = min(
+            positive_indices,
+            key=lambda index: (values[index].storage_bits, values[index].train_loss),
+        )
+
+    actual = sum(values[index].storage_bits for index in selected_indices.values())
+    if actual > target_storage_bits:
+        raise RuntimeError("rounded precision LP allocation exceeds the storage budget")
+
+    # A basic LP solution has at most one fractional precision group. Spend any
+    # remaining capacity on its best feasible integer option. The loop also
+    # handles numerically degenerate solutions with more than one such group.
+    for group in fractional_groups:
+        current = selected_indices[group]
+        available = target_storage_bits - actual + values[current].storage_bits
+        feasible = [
+            index
+            for index in by_group[group]
+            if values[index].storage_bits <= available
+        ]
+        replacement = min(
+            feasible,
+            key=lambda index: (values[index].train_loss, values[index].storage_bits),
+        )
+        actual += values[replacement].storage_bits - values[current].storage_bits
+        selected_indices[group] = replacement
+
+    selected = {group: values[index] for group, index in selected_indices.items()}
+    return AllocationResult(
+        selected=selected,
+        target_storage_bits=target_storage_bits,
+        actual_storage_bits=actual,
+        train_loss=float(sum(item.train_loss for item in selected.values())),
+        validation_loss=float(sum(item.validation_loss for item in selected.values())),
+        solver="scipy.optimize.linprog/highs+integer-rounding",
+    )
+
+
+__all__ = ["AllocationResult", "GroupCandidate", "allocate", "allocate_lp_rounded"]

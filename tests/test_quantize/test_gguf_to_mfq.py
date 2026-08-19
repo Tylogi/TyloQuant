@@ -14,7 +14,7 @@ from mfq.calibration.artifact import (
     ExpertSelection,
     ExpertTensorSelection,
 )
-from mfq.calibration.nint_profiles import nint_storage_bits
+from mfq.calibration.evaluator import nint_storage_bits
 from mfq.formats.nint import NintSpec
 from mfq.formats.npq0_l import NPQ0_L, unpack_npq0_l
 from mfq.formats.nvq import (
@@ -42,6 +42,7 @@ from mfq.quantize.nvq_quant import (
     quantize as quantize_nvq,
 )
 from mfq.quantize.nvq_tensor_codebook import TensorCodebookTrainingConfig
+from mfq.quantize.row_importance import RowImportance
 from mfq.tools.quantize_gguf_to_mfq import (
     GgufRowSource,
     GgufTensorPlan,
@@ -57,6 +58,7 @@ from mfq.tools.quantize_gguf_to_mfq import (
     _canonical_artifact_signature,
     _estimate_blob_bytes,
     _existing_codebook_artifact_path,
+    _factorized_jsc_importance,
     _hf_output_name_map,
     _load_tensor_precision_overrides,
     _load_gguf,
@@ -166,7 +168,7 @@ def test_iq_recipe_maps_to_supported_nint_profiles():
     assert _target_dtype("IQ2_XXS") == "NVQ2J"
     assert _target_dtype("IQ3_S") == "NVQ3J-L"
     assert _target_dtype("Q2_K") == "NINT2"
-    assert _target_dtype("IQ3_XXS") == "NVQ3"
+    assert _target_dtype("IQ3_XXS") == "NVQ3J"
     assert _target_dtype("Q3_K") == "NINT3"
     for qtype in ("IQ4_NL", "IQ4_XS", "Q4_K"):
         assert _target_dtype(qtype) == "NINT4"
@@ -284,7 +286,7 @@ def test_nvq3_jsc_mode_only_replaces_nvq3_recipe_tensors():
             target_dtype=dtype,
         )
         for index, (recipe, dtype) in enumerate(
-            (("IQ3_XXS", "NVQ3"), ("IQ2_XXS", "NVQ2J"), ("Q4_K", "NINT4"))
+            (("IQ3_XXS", "NVQ3J"), ("IQ2_XXS", "NVQ2J"), ("Q4_K", "NINT4"))
         )
     ]
     mapped = _apply_nvq3_jsc_mapping(plan, True)
@@ -312,7 +314,7 @@ def test_nvq3_to_nint3_mode_only_replaces_nvq3_recipe_tensors():
         )
         for index, (recipe, dtype) in enumerate(
             (
-                ("IQ3_S", "NVQ3"),
+                ("IQ3_XXS", "NVQ3J"),
                 ("Q3_K", "NINT3"),
                 ("Q4_K", "NINT4"),
             )
@@ -1276,6 +1278,133 @@ def test_tensor_npq0_l_artifact_is_reused(tmp_path):
         first_tables.second_codebooks,
         second_tables.second_codebooks,
     )
+
+
+def test_factorized_jsc_importance_is_row_fisher_outer_column_imatrix(tmp_path):
+    item = SimpleNamespace(
+        name="blk.0.test.weight",
+        source_name="blk.0.test.weight",
+        target_dtype="NVQ2J",
+        storage_shape=(3, 4),
+        original_shape=(3, 4),
+    )
+    imatrix = ImportanceMatrix(
+        path=tmp_path / "imatrix.gguf",
+        entries={
+            item.name: ImportanceEntry(
+                values=np.asarray([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32),
+                counts=np.asarray([8], dtype=np.int64),
+            )
+        },
+        datasets=(),
+        chunk_count=1,
+        chunk_size=4,
+        legacy=False,
+    )
+    binding = _bind_imatrix(imatrix, [item])[item.name]
+    row_importance = RowImportance(
+        tmp_path / "rows.npz",
+        {item.name: np.asarray([0.5, 1.0, 2.0], dtype=np.float32)},
+        {},
+    )
+
+    actual = _factorized_jsc_importance(
+        item, np.asarray([2, 0]), binding, row_importance
+    )
+
+    expected = np.asarray(
+        [[2.0, 4.0, 6.0, 8.0], [0.5, 1.0, 1.5, 2.0]], dtype=np.float32
+    )
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_tensor_jsc_artifact_uses_row_fisher_and_imatrix(tmp_path):
+    weight = np.random.default_rng(20260801).normal(0, 0.05, size=(8, 24)).astype(
+        np.float32
+    )
+
+    class Source:
+        def read_rows(self, indices):
+            return torch.from_numpy(weight[np.asarray(indices)])
+
+    item = SimpleNamespace(
+        name="blk.0.test.weight",
+        source_name="blk.0.test.weight",
+        target_dtype="NVQ2J",
+        storage_shape=(8, 24),
+        original_shape=(8, 24),
+    )
+    source_path = tmp_path / "source.gguf"
+    recipe_path = tmp_path / "recipe.gguf"
+    imatrix_path = tmp_path / "imatrix.gguf"
+    row_path = tmp_path / "rows.npz"
+    source_path.write_bytes(b"source")
+    recipe_path.write_bytes(b"recipe")
+    imatrix_path.write_bytes(b"imatrix")
+    row_path.write_bytes(b"row-fisher")
+    imatrix = ImportanceMatrix(
+        path=imatrix_path,
+        entries={
+            item.name: ImportanceEntry(
+                values=np.geomspace(0.1, 10.0, 24, dtype=np.float32)[None, :],
+                counts=np.asarray([1024], dtype=np.int64),
+            )
+        },
+        datasets=("calibration.txt",),
+        chunk_count=8,
+        chunk_size=128,
+        legacy=False,
+    )
+    binding = _bind_imatrix(imatrix, [item])[item.name]
+    row_importance = RowImportance(
+        row_path,
+        {item.name: np.geomspace(0.25, 4.0, 8, dtype=np.float32)},
+        {"samples": 8},
+    )
+    config = NvqJscConfig(
+        banks=1,
+        iterations=0,
+        assignment_refine_steps=0,
+        search_steps=1,
+        group_chunk=8,
+    )
+
+    _tables, first = _train_or_load_jsc_tables(
+        Source(),
+        item,
+        source_path,
+        recipe_path,
+        tmp_path / "artifacts",
+        config,
+        4,
+        2,
+        7,
+        "cpu",
+        imatrix,
+        binding,
+        row_importance,
+    )
+    _tables, second = _train_or_load_jsc_tables(
+        Source(),
+        item,
+        source_path,
+        recipe_path,
+        tmp_path / "artifacts",
+        config,
+        4,
+        2,
+        7,
+        "cpu",
+        imatrix,
+        binding,
+        row_importance,
+    )
+
+    assert first["objective"] == "factorized_row_fisher_x_imatrix_sse"
+    assert first["imatrix_entry"] == item.name
+    assert first["row_importance_entry"] == item.name
+    assert not first["loaded"]
+    assert second["loaded"]
 
 
 def test_tensor_codebook_artifact_uses_bound_imatrix(tmp_path):

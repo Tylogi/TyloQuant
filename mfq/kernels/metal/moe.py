@@ -22,6 +22,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
 from mfq.formats.moe import NintMoeTensor
 from mfq.formats.mx import MXFP4_DTYPE, MxTensor
 from mfq.formats.nepq import NepqTensor
+from mfq.formats.nint import NintTensor
 from mfq.formats.nint8_zero import Nint8ZeroTensor
 from mfq.formats.npq0_l import Npq0LTensor
 from mfq.formats.npq0_s import Npq0STensor
@@ -32,7 +33,6 @@ from mfq.kernels.metal.mx import MetalMxWeight
 from mfq.kernels.metal.nint import MetalNintWeight
 from mfq.kernels.metal.nint8_zero import MetalNint8ZeroWeight
 from mfq.kernels.metal.vq import _BITSTREAM_HEADER, MetalVqWeight, signed_hadamard
-from mfq.quantize.nint_quant import NintTensor
 
 _VQ_TYPES = (
     NvqTensor,

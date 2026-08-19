@@ -75,6 +75,19 @@ def test_pack_roundtrip_fields():
     np.testing.assert_allclose(t2.neuron_min, t.neuron_min)
 
 
+@pytest.mark.parametrize("bits", range(1, 8))
+@pytest.mark.parametrize("count", (0, 1, 7, 8, 9, 31, 257))
+def test_pack_bits_matches_little_endian_reference(bits: int, count: int) -> None:
+    rng = np.random.default_rng(bits * 1000 + count)
+    values = rng.integers(0, 1 << bits, count, dtype=np.uint8)
+    bit_rows = np.unpackbits(values[:, None], axis=1, bitorder="little")[:, :bits]
+    expected = np.packbits(bit_rows.reshape(-1), bitorder="little").tobytes()
+
+    packed = io.pack_bits(values, bits)
+
+    assert packed == expected
+
+
 def test_pack_roundtrip_dequant():
     t = _mk(5)
     t2 = io.unpack_nint(io.pack_nint(t))

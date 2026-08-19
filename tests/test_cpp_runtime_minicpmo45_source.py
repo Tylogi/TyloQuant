@@ -262,6 +262,31 @@ def test_minicpmo45_native_servers_share_mfqd_vision_tensors():
     assert "Runtime, mfq::metal::MlxMiniCPMO45Runtime" in METAL_DECODE
 
 
+def test_minicpmo45_metal_dispatches_m3_family_tuning_by_device():
+    assert 'sysctlbyname(\n            "machdep.cpu.brand_string"' in METAL_GRAPH
+    assert '"MFQ_MINICPM_METAL_PROFILE"' in METAL_GRAPH
+    assert 'std::strcmp(requested, "m3") == 0' in METAL_GRAPH
+    assert 'std::strcmp(requested, "baseline") == 0' in METAL_GRAPH
+    assert 'chip_name.rfind("Apple M3", 0) == 0' in METAL_GRAPH
+    assert '"Apple M3 Pro"' in METAL_GRAPH
+    assert '"Apple M3 Ultra"' in METAL_GRAPH
+    assert '"Apple M4 Max"' in METAL_GRAPH
+    assert '"Apple M5 Max"' in METAL_GRAPH
+    assert "std::clamp((sequence + 255) / 256, 8, 16)" in METAL_GRAPH
+    assert "std::min(6, (sequence + 1'023) / 1'024)" in METAL_GRAPH
+
+
+def test_minicpmo45_metal_tracks_both_in_place_kv_cache_outputs():
+    assert (
+        "encoder.register_output_array(inputs[5]);\n"
+        "        encoder.register_output_array(inputs[6]);"
+    ) in METAL_GRAPH
+    assert (
+        "encoder.register_output_array(inputs[3]);\n"
+        "        encoder.register_output_array(inputs[4]);"
+    ) in METAL_GRAPH
+
+
 def test_minicpmo45_cuda_duplex_uses_runtime_profile_tts_sampling():
     assert "double tts_temperature = 0.8" in GRAPH
     assert "double tts_repetition_penalty = 1.05" in GRAPH

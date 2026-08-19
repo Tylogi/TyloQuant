@@ -236,6 +236,10 @@ export class RealtimeAudioController {
     return Boolean(this.inputContext || this.awaitingHalfDuplexResponse || this.socket);
   }
 
+  get capturing(): boolean {
+    return Boolean(this.inputContext);
+  }
+
   get fullDuplex(): boolean {
     return this.fullDuplexEnabled;
   }

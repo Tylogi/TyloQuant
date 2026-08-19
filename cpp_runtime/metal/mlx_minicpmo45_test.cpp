@@ -5,6 +5,7 @@
 
 int main(int argc, char** argv) {
     try {
+        mfq::metal::detail::test_minicpmo45_metal_profile_dispatch();
         mfq::metal::detail::test_minicpmo45_qwen3_cache_equivalence();
         mfq::metal::detail::test_minicpmo45_qk_norm_rope();
         mfq::metal::detail::test_minicpmo45_gqa_attention();

@@ -18,7 +18,7 @@ from mfq.calibration.artifact import (
     ExpertSelection,
     ExpertTensorSelection,
 )
-from mfq.calibration.nint_profiles import NINT_EXPERT_PROFILES, nint_storage_bits
+from mfq.calibration.evaluator import NINT_EXPERT_PROFILES, nint_storage_bits
 from mfq.formats.nint import NintSpec
 
 

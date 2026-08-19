@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from mfq.calibration.artifact import load_scheme
-from mfq.calibration.nint_profiles import (
+from mfq.calibration.evaluator import (
     NINT_EXPERT_PROFILES,
     nint_storage_bits,
 )

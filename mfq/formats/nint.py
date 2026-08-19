@@ -53,6 +53,21 @@ class NintSpec:
         return profile_label(self.bits, self.groupsize)
 
 
+@dataclass
+class NintTensor:
+    """Serialized/runtime representation of an nD NINT weight tensor."""
+
+    spec: NintSpec
+    shape: tuple[int, ...]
+    axis: int
+    q: np.ndarray               # (out, ng, gs) uint, including trailing-group padding
+    neuron_scale: np.ndarray    # (out,) float32 (f16-round-tripped neu_s/K)
+    neuron_min: np.ndarray      # (out,) float32 (f16-round-tripped neu_m/K)
+    sub_scale: np.ndarray       # (out, ng) uint
+    sub_min: np.ndarray         # (out, ng) uint
+    neuron_len: int             # Valid length of each neuron, excluding padding
+
+
 # Fixed point from the three-dimensional Pareto search on 2026-07-26:
 # groupsize=16, scale_bits=min_bits=sub_bits=5, weighted-MSE。
 # 2.63125 bpw at K=5120; 11.1920 dB over 256 rows x 10 Qwen3.6-27B matrices.

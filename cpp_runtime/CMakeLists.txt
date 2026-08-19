@@ -336,14 +336,6 @@ if(WIN32)
     endforeach()
 endif()
 
-add_custom_target(mfq-web-assets ALL
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_CURRENT_SOURCE_DIR}/web"
-        "$<TARGET_FILE_DIR:mfq-decode>/web"
-    COMMENT "Copying MFQ WebUI assets"
-)
-add_dependencies(mfq-decode mfq-web-assets)
-
 add_executable(mfq-moe-cache-policy-test
     moe_cache_policy_test.cpp
 )

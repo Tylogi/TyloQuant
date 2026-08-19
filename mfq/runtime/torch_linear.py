@@ -12,6 +12,7 @@ Import explicitly because this module imports torch, a heavy dependency.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -20,7 +21,7 @@ import torch
 from mfq.formats import io
 from mfq.formats.io import MfqTensor
 from mfq.formats.mx import MxTensor
-from mfq.formats.nint import NintSpec
+from mfq.formats.nint import NintSpec, NintTensor
 from mfq.formats.nint8_zero import Nint8ZeroTensor
 from mfq.formats.npq0_l import Npq0LTensor
 from mfq.formats.npq0_s import Npq0STensor
@@ -54,12 +55,16 @@ from mfq.kernels.cuda.tpq_matmul import (
     tpq_embedding,
     tpq_matmul,
 )
-from mfq.quantize.nint_quant import NintTensor
 
 TensorMapping = Mapping[str, MfqTensor]
 NvqAnyTensor = NvqTensor | NvqJscTensor | Npq0LTensor | Npq0STensor | Nvq1LTensor | Nvq1STensor
 TpqTensor = TpqInt4Tensor | TpqPqTensor
 QuantizedTensor = NintTensor | Nint8ZeroTensor | NvqAnyTensor | MxTensor | TpqTensor
+
+
+def _device_guard(device: str | torch.device):
+    value = torch.device(device)
+    return torch.cuda.device(value) if value.type == "cuda" else nullcontext()
 
 
 def is_nvq_tensor(tensor: object) -> bool:
@@ -121,15 +126,93 @@ class TorchNintLinear:
         result.device = self.device
         return result
 
+    def row_slice(self, ranges: Sequence[tuple[int, int]]) -> TorchNintLinear:
+        """Return a packed row shard without materializing the dense weight."""
+
+        if int(self.g["axis"]) != 0 or len(self.g["shape"]) != 2:
+            raise ValueError("packed NINT row slicing requires an axis-0 matrix")
+        normalized = tuple((int(start), int(end)) for start, end in ranges)
+        if not normalized or any(
+            start < 0 or end <= start or end > int(self.g["out"])
+            for start, end in normalized
+        ):
+            raise ValueError("invalid packed NINT row ranges")
+        result = object.__new__(TorchNintLinear)
+        result.g = dict(self.g)
+        for key in ("q_packed", "sub_scale", "sub_min", "neuron_scale", "neuron_min"):
+            result.g[key] = torch.cat(
+                [self.g[key][start:end] for start, end in normalized], dim=0
+            ).contiguous()
+        for key in tuple(result.g):
+            if key.startswith("_") or key in {
+                "q",
+                "eff_pair_h",
+                "d_eff",
+                "m_eff",
+                "d_eff_h",
+                "m_eff_h",
+                "q_mmq_packed",
+                "sub_scale_mmq",
+                "sub_min_mmq",
+                "d_eff_mmq",
+                "m_eff_mmq",
+            }:
+                result.g.pop(key, None)
+        rows = sum(end - start for start, end in normalized)
+        result.g["out"] = rows
+        result.g["shape"] = (rows, int(self.g["shape"][1]))
+        result.device = self.device
+        return result
+
+    def row_range(self, start: int, end: int) -> TorchNintLinear:
+        """Return one contiguous packed row range as zero-copy tensor views."""
+
+        if int(self.g["axis"]) != 0 or len(self.g["shape"]) != 2:
+            raise ValueError("packed NINT row ranges require an axis-0 matrix")
+        start = int(start)
+        end = int(end)
+        if start < 0 or end <= start or end > int(self.g["out"]):
+            raise ValueError("invalid packed NINT row range")
+        result = object.__new__(TorchNintLinear)
+        result.g = dict(self.g)
+        for key in ("q_packed", "sub_scale", "sub_min", "neuron_scale", "neuron_min"):
+            result.g[key] = self.g[key][start:end]
+        for key in tuple(result.g):
+            if key.startswith("_") or key in {
+                "q",
+                "eff_pair_h",
+                "d_eff",
+                "m_eff",
+                "d_eff_h",
+                "m_eff_h",
+                "q_mmq_packed",
+                "sub_scale_mmq",
+                "sub_min_mmq",
+                "d_eff_mmq",
+                "m_eff_mmq",
+            }:
+                result.g.pop(key, None)
+        result.g["out"] = end - start
+        result.g["shape"] = (end - start, int(self.g["shape"][1]))
+        result.device = self.device
+        return result
+
     @property
     def weight(self) -> torch.Tensor:
         """Fully dequantize fp16 weights; callers needing a resident cache should retrieve and retain them once."""
-        return torch_backend.dequantize(self.g)
+        with _device_guard(self.device):
+            return torch_backend.dequantize(self.g)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.as_tensor(x, device=self.device)
         x2 = x.reshape(-1, x.shape[-1])
-        y = nint_matmul(self.g, x2)
+        device = torch.device(self.device)
+        with _device_guard(device):
+            y = (
+                nint_matmul(self.g, x2)
+                if device.type == "cuda"
+                else torch_backend.matmul(self.g, x2)
+            )
         return y.reshape(*x.shape[:-1], y.shape[-1])
 
     def forward_input_mul(
@@ -143,7 +226,17 @@ class TorchNintLinear:
             )
         x2 = x.reshape(-1, x.shape[-1])
         gate2 = gate.reshape(-1, gate.shape[-1])
-        y = nint_matmul_input_mul(self.g, x2, gate2, activation)
+        if torch.device(self.device).type == "cuda":
+            with _device_guard(self.device):
+                y = nint_matmul_input_mul(self.g, x2, gate2, activation)
+        else:
+            if activation == "silu":
+                value = x2 * torch.nn.functional.silu(gate2)
+            elif activation == "sigmoid":
+                value = x2 * torch.sigmoid(gate2)
+            else:
+                raise ValueError(f"unsupported activation: {activation}")
+            y = self.forward(value).reshape(-1, int(self.g["out"]))
         return y.reshape(*x.shape[:-1], y.shape[-1])
 
     def forward_swiglu(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
@@ -162,10 +255,12 @@ class TorchNvqLinear:
 
     @property
     def weight(self) -> torch.Tensor:
-        return nvq_dequantize(self.g)
+        with _device_guard(self.device):
+            return nvq_dequantize(self.g)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return nvq_matmul(self.g, torch.as_tensor(x, device=self.device))
+        with _device_guard(self.device):
+            return nvq_matmul(self.g, torch.as_tensor(x, device=self.device))
 
     def forward_input_mul(
         self, x: torch.Tensor, gate: torch.Tensor, activation: str
@@ -176,7 +271,8 @@ class TorchNvqLinear:
             raise ValueError(
                 f"x and gate must have the same shape, got {tuple(x.shape)} and {tuple(gate.shape)}"
             )
-        return nvq_matmul_input_mul(self.g, x, gate, activation)
+        with _device_guard(self.device):
+            return nvq_matmul_input_mul(self.g, x, gate, activation)
 
     def forward_swiglu(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
         return self.forward_input_mul(up, gate, "silu")
@@ -238,10 +334,12 @@ class TorchNint8ZeroLinear:
 
     @property
     def weight(self) -> torch.Tensor:
-        return nint8_zero_dequantize(self.g)
+        with _device_guard(self.device):
+            return nint8_zero_dequantize(self.g)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return nint8_zero_matmul(self.g, x)
+        with _device_guard(self.device):
+            return nint8_zero_matmul(self.g, x)
 
     def forward_input_mul(
         self,

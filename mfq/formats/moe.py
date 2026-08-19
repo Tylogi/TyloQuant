@@ -7,16 +7,16 @@ from typing import TypeAlias
 
 import numpy as np
 
-from mfq.formats.tpq import TpqPqTensor
 from mfq.formats.mx import MxTensor
 from mfq.formats.nepq import NepqTensor
+from mfq.formats.nint import NintTensor
 from mfq.formats.nint8_zero import Nint8ZeroTensor
 from mfq.formats.npq0_l import Npq0LTensor
 from mfq.formats.npq0_s import Npq0STensor
 from mfq.formats.nvq import NvqJscTensor, NvqTensor
 from mfq.formats.nvq1_l import Nvq1LTensor
 from mfq.formats.nvq1_s import Nvq1STensor
-from mfq.quantize.nint_quant import NintTensor
+from mfq.formats.tpq import TpqPqTensor
 
 ExpertPoolTensor: TypeAlias = (
     NintTensor

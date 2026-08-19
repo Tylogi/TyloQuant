@@ -370,10 +370,13 @@ def _unweighted_rms(value: mx.array, eps: float) -> mx.array:
 
 def _mxfp8_fake_quant_prefix(value: mx.array, block_size: int = 64) -> mx.array:
     """Match V4F's in-place UE8M0/E4M3 activation simulation."""
-    if value.shape[-1] % block_size:
-        raise ValueError("MXFP8 fake-quant width must be block aligned")
     dtype = value.dtype
-    grouped = value.astype(mx.float32).reshape((*value.shape[:-1], -1, block_size))
+    width = value.shape[-1]
+    padding = (-width) % block_size
+    source = value.astype(mx.float32)
+    if padding:
+        source = mx.pad(source, [(0, 0)] * (source.ndim - 1) + [(0, padding)])
+    grouped = source.reshape((*source.shape[:-1], -1, block_size))
     amax = mx.maximum(mx.max(mx.abs(grouped), axis=-1, keepdims=True), 1.0e-4)
     scale = mx.power(2.0, mx.ceil(mx.log2(amax / 448.0)))
     normalized = mx.clip(grouped / scale, -448.0, 448.0)
@@ -384,7 +387,8 @@ def _mxfp8_fake_quant_prefix(value: mx.array, block_size: int = 64) -> mx.array:
     normal = mx.minimum(mx.round(magnitude / step) * step, 448.0)
     quantized = mx.where(magnitude < 2.0**-6, subnormal, normal)
     restored = mx.sign(normalized) * quantized * scale
-    return restored.reshape(value.shape).astype(dtype)
+    restored = restored.reshape(source.shape)[..., :width]
+    return restored.astype(dtype)
 
 
 def _limited_swiglu(

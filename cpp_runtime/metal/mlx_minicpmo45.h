@@ -220,6 +220,7 @@ namespace detail {
 
 // Production-block numerical regression used by the native Metal test suite.
 // It compares causal prefill with token-by-token BF16 KV-cache execution.
+void test_minicpmo45_metal_profile_dispatch();
 void test_minicpmo45_qwen3_cache_equivalence();
 void test_minicpmo45_qk_norm_rope();
 void test_minicpmo45_gqa_attention();

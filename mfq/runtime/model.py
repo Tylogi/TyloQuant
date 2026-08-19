@@ -9,7 +9,7 @@ from typing import Optional
 import numpy as np
 
 from mfq.formats import io
-from mfq.quantize.nint_quant import NintTensor
+from mfq.formats.nint import NintTensor
 from mfq.runtime.linear import NintLinear
 
 

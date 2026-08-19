@@ -4,66 +4,55 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
-const MARK: [(f64, f64); 12] = [
-    (9.0, 27.0),
-    (9.0, 12.0),
-    (14.0, 12.0),
-    (20.0, 20.25),
-    (26.0, 12.0),
-    (31.0, 12.0),
-    (31.0, 27.0),
-    (26.0, 27.0),
-    (26.0, 19.8),
-    (20.0, 27.5),
-    (14.0, 19.8),
-    (14.0, 27.0),
-];
-
-fn inside_mark(x: f64, y: f64) -> bool {
-    let mut inside = false;
-    let mut previous = MARK.len() - 1;
-    for current in 0..MARK.len() {
-        let (cx, cy) = MARK[current];
-        let (px, py) = MARK[previous];
-        if (cy > y) != (py > y) && x < (px - cx) * (y - cy) / (py - cy) + cx {
-            inside = !inside;
-        }
-        previous = current;
-    }
-    inside
-}
-
-fn inside_background(x: f64, y: f64) -> bool {
-    let qx = (x - 20.0).abs() - 12.0;
-    let qy = (y - 20.0).abs() - 12.0;
+fn inside_background(x: f64, y: f64, inset: f64) -> bool {
+    let half = 20.0 - inset;
+    let radius = 9.375 - inset * 0.5;
+    let qx = (x - 20.0).abs() - (half - radius);
+    let qy = (y - 20.0).abs() - (half - radius);
     let outside = qx.max(0.0).hypot(qy.max(0.0));
     let inside = qx.max(qy).min(0.0);
-    outside + inside <= 8.0
+    outside + inside <= radius
 }
 
-fn inside_underline(x: f64, y: f64) -> bool {
-    let nearest_x = x.clamp(11.0, 29.0);
-    (x - nearest_x).hypot(y - 31.0) <= 1.5
+fn distance_to_segment(x: f64, y: f64, ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
+    let dx = bx - ax;
+    let dy = by - ay;
+    let length_squared = dx * dx + dy * dy;
+    let t = if length_squared == 0.0 {
+        0.0
+    } else {
+        (((x - ax) * dx + (y - ay) * dy) / length_squared).clamp(0.0, 1.0)
+    };
+    (x - (ax + t * dx)).hypot(y - (ay + t * dy))
+}
+
+fn inside_mark(x: f64, y: f64) -> bool {
+    const POINTS: [(f64, f64); 5] = [
+        (10.0, 27.5),
+        (10.0, 12.5),
+        (20.0, 23.125),
+        (30.0, 12.5),
+        (30.0, 27.5),
+    ];
+    POINTS
+        .windows(2)
+        .any(|pair| distance_to_segment(x, y, pair[0].0, pair[0].1, pair[1].0, pair[1].1) <= 1.875)
 }
 
 fn sample(x: f64, y: f64) -> [u8; 4] {
-    if !inside_background(x, y) {
+    if !inside_background(x, y, 0.625) {
         return [0, 0, 0, 0];
     }
-    if inside_underline(x, y) {
-        return [185, 133, 76, 255];
+    if !inside_background(x, y, 0.9375) {
+        return [222, 223, 218, 255];
+    }
+    if (x - 30.0).hypot(y - 27.5) <= 1.875 {
+        return [184, 115, 67, 255];
     }
     if inside_mark(x, y) {
-        let t = (((x + y) * 0.5 - 8.0) / 23.5).clamp(0.0, 1.0);
-        let channel = |start: f64, end: f64| (start + (end - start) * t).round() as u8;
-        return [
-            channel(154.0, 59.0),
-            channel(106.0, 36.0),
-            channel(58.0, 20.0),
-            255,
-        ];
+        return [32, 34, 35, 255];
     }
-    [251, 247, 242, 255]
+    [244, 244, 240, 255]
 }
 
 fn render(size: u32) -> Vec<u8> {

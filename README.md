@@ -70,42 +70,45 @@ matched to llama.cpp `IQ*` use `V`, while scalar-quantized models matched to
 
 - Python `>=3.10`
 - Git
-- An NVIDIA GPU and CUDA toolkit for CUDA inference
-- CMake, Ninja, and a C++ toolchain for the native runtime
+- [uv](https://docs.astral.sh/uv/)
+- CMake and a native C++ toolchain
+- Node.js and npm for the browser Web UI
+- NVIDIA GPU and CUDA toolkit for CUDA acceleration on Windows or Linux
+- Apple silicon for Metal acceleration on macOS
 
 ### Install from source
 
-```powershell
-git clone REPOSITORY_URL MFQ
+`mfq` is the only public CLI. Use the same commands in Windows PowerShell,
+macOS Terminal, or a Linux shell:
+
+```shell
+git clone https://github.com/mfq/mfq.git MFQ
 cd MFQ
-python -m venv .venv
+# CUDA (Windows or Linux)
+uv sync --extra train --extra calibration --extra daemon
+
+# Metal (Apple silicon)
+uv sync --extra train --extra calibration --extra daemon --extra metal
+uv run mfq build
 ```
 
-Activate the environment:
+`mfq build` detects the host OS and accelerator. To customize CMake
+configuration, put extra arguments after `--`:
 
-```powershell
-# Windows PowerShell
-.\.venv\Scripts\Activate.ps1
+```shell
+uv run mfq build -- -DCMAKE_CUDA_ARCHITECTURES=90
 ```
 
-```bash
-# Linux
-source .venv/bin/activate
-```
-
-Install the quantization and calibration toolchain:
-
-```bash
-python -m pip install --upgrade pip
-python -m pip install -e ".[train,calibration]"
-```
+After a successful build, `mfq` records the actual artifact and build recipe in
+its managed manifest. `mfq serve` therefore finds builds made with a custom
+`--build-dir` automatically and can recreate a missing artifact with the same
+configuration.
 
 Verify the installation:
 
-```bash
-mfq --help
-mfq quantize --help
-python -m mfq.tools.split_mfq --help
+```shell
+uv run mfq --help
+uv run mfq quantize --help
 ```
 
 ### Quantization
@@ -114,54 +117,57 @@ python -m mfq.tools.split_mfq --help
 safetensors directory, a full-precision MFQ, or a full-precision GGUF and calls
 the existing production converter directly:
 
-```bash
+`mfq calibrate` creates calibration artifacts, including reusable importance
+matrices for `mfq quantize --imatrix`.
+
+```shell
 # Copy HF native storage exactly into a full-precision MFQ. BF16 stays BF16;
 # block FP8/MXFP4 values and their E8M0 scales remain self-contained and exact.
 # This command performs no MFQ quantization.
-mfq quantize model-hf model-full.mfq --full-precision
+uv run mfq quantize model-hf model-full.mfq --full-precision
 
 # Quantize that full-precision MFQ through the same NINT/VQ/NPQ/NEPQ/TPQ path.
-mfq quantize model-full.mfq model-NINT3.mfq \
+uv run mfq quantize model-full.mfq model-NINT3.mfq \
   --bits 3 --groupsize 24 --sub-bits 5 --backend cpu --device cpu
 
 # Mixed recipe from a BF16 GGUF source
-mfq quantize model-bf16.gguf model-S4-L.mfq \
+uv run mfq quantize model-bf16.gguf model-S4-L.mfq \
   --recipe UD-Q4_K_XL.gguf --imatrix imatrix.gguf \
   --q8-mode nint8-0 --device cuda
 
 # HF source with an expert-wise precision scheme
-mfq quantize model-hf model-EW.mfq \
+uv run mfq quantize model-hf model-EW.mfq \
   --recipe UD-Q4_K_XL.gguf --ew-scheme expert-precision.json
 
+# Collect a reusable activation imatrix from the prepared corpus. CUDA uses
+# FP64 accumulation by default; Apple silicon uses BF16 forward + FP32 Metal
+# accumulation. The output is accepted directly by `mfq quantize --imatrix`.
+uv run mfq calibrate imatrix \
+  --model model-hf --corpus calibration-corpus \
+  --output calibration.imatrix --backend cuda
+
+uv run mfq calibrate imatrix \
+  --model model-hf --corpus calibration-corpus \
+  --output calibration.imatrix --backend metal
+
 # Important Neurons (IN); layer count is read from the recipe when possible
-mfq quantize model-bf16.gguf model-IN.mfq \
+uv run mfq quantize model-bf16.gguf model-IN.mfq \
   --recipe UD-Q4_K_XL.gguf --imatrix imatrix.gguf \
   --important-neurons 1024 --target-size 15G
 ```
 
-The older `python -m mfq.tools.quantize_*` commands remain available for
-experimental quantizer tuning. `mfq quantize` intentionally exposes only
-model-level inputs, precision artifacts, sharding, and restart controls.
+## Web UI
 
-### Build the C++ runtime
+`mfq serve` builds or updates the runtime when needed, loads the model, and
+starts the API and Web UI. It is the only server entry point; the native C++
+worker stays private and is managed by the CLI:
 
-From a Visual Studio x64 Developer PowerShell:
-
-```powershell
-cmake -S cpp_runtime -B build/cpp_runtime -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build/cpp_runtime -j 8
+```shell
+uv run mfq serve --model path/to/model.mfq --host 127.0.0.1 --port 8090
 ```
 
-The native runtime builds with the bundled llama.cpp runtime subset.
-
-## WebUI
-
-The C++ runtime includes a local WebUI at
-[`http://127.0.0.1:8080/admin/`](http://127.0.0.1:8080/admin/). It provides
-streaming chat, reasoning display, sampling controls, conversation history,
-connection status, and runtime monitoring. The server executes each model's
-embedded Jinja chat template and keeps reasoning, final content, and tool calls
-as separate OpenAI-compatible channels.
+`--host` and `--port` control the public API listener and default to
+`127.0.0.1:8090`. Open the Web UI address printed by the command.
 
 <img src="./docs/figures/tyloquant-mfq-webui-english.jpg" alt="TyloQuant MFQ local inference WebUI in English" width="100%">
 
@@ -194,7 +200,8 @@ direct packed execution.
 - Numbered MFQ shards with direct quantizer output and transparent Python/C++ loading
 - OpenAI-compatible chat/completions API with SSE
 
-The full-model server remains a single-GPU CUDA research prototype. Apple
+The current CUDA inference implementation remains a single-GPU research
+prototype. Apple
 silicon now has packed NINT/NVQ/NPQ/NEPQ group-vectorized GEMV, qmv_wide
 small-M MMQ, online-decode `simdgroup_matrix` GEMM, and CUDA-style temporary
 dequantize plus MLX GEMM at the measured large-M crossover. Compatible

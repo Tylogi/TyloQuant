@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from mfq.formats.nvq import NvqSpec
+from mfq.calibration.inint import _solve_milp
 from mfq.quantize.nvq_quant import _indices_at_scale, quantize
 from mfq.quantize.nvq_quant_torch import quantize_axis0
 from mfq.quantize.second_order import refine_nvq2_block24
@@ -69,3 +70,31 @@ def test_torch_quantizer_rejects_empty_dimensions(shape: tuple[int, int]) -> Non
     spec = NvqSpec("e8_256", groupsize=24, sub_bits=4)
     with pytest.raises(ValueError, match="dimensions must be positive"):
         quantize_axis0(torch.zeros(shape), spec, device="cpu")
+
+
+def test_inint_milp_tightens_constraint_after_rounding_overshoot(monkeypatch) -> None:
+    from scipy import optimize
+
+    upper_bounds: list[float] = []
+
+    class _Result:
+        success = True
+        message = ""
+
+        def __init__(self, x: np.ndarray) -> None:
+            self.x = x
+
+    def fake_milp(*, constraints, **_kwargs):
+        upper_bounds.append(float(constraints.ub[0]))
+        if len(upper_bounds) == 1:
+            return _Result(np.asarray([1.0, 1.0]))
+        return _Result(np.asarray([1.0, 0.0]))
+
+    monkeypatch.setattr(optimize, "milp", fake_milp)
+    selected = _solve_milp(
+        np.asarray([2.0, 1.0]),
+        np.asarray([6, 5], dtype=np.int64),
+        10,
+    )
+    np.testing.assert_array_equal(selected, np.asarray([True, False]))
+    assert upper_bounds[1] < upper_bounds[0]

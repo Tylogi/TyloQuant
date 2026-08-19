@@ -8,15 +8,11 @@ import json
 import os
 from dataclasses import replace
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
-from mfq.calibration.artifact import ExpertPrecision, save_scheme
-from mfq.calibration.ew_solver import (
-    EwCandidateTable,
-    load_budget,
-    load_candidate_table,
-    load_importance_table,
-    solve_ew_budget,
-)
+if TYPE_CHECKING:
+    from mfq.calibration.artifact import ExpertPrecision
+    from mfq.calibration.ew_solver import EwCandidateTable
 
 
 def _sha256(path: Path) -> str:
@@ -41,7 +37,7 @@ def _rebase_precision(
     return replace(precision, artifact=Path(relative).as_posix())
 
 
-def _rebase_scheme_artifacts(scheme, candidate_table: EwCandidateTable, output: Path):
+def _rebase_scheme_artifacts(scheme: Any, candidate_table: EwCandidateTable, output: Path) -> Any:
     expert_selections = {}
     for name, tensor in scheme.expert_selections.items():
         experts = tuple(
@@ -60,6 +56,14 @@ def _rebase_scheme_artifacts(scheme, candidate_table: EwCandidateTable, output: 
 
 
 def run(args: argparse.Namespace) -> int:
+    from mfq.calibration.artifact import save_scheme
+    from mfq.calibration.ew_solver import (
+        load_budget,
+        load_candidate_table,
+        load_importance_table,
+        solve_ew_budget,
+    )
+
     importance_path = Path(args.importance).resolve()
     candidate_path = Path(args.candidates).resolve()
     budget_path = Path(args.budget).resolve()

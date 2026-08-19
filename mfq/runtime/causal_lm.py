@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from mfq.formats import io
 from mfq.formats.io import MfqTensor
 from mfq.formats.mx import MxTensor
+from mfq.formats.nint import NintTensor
 from mfq.formats.nint8_zero import Nint8ZeroTensor
 from mfq.formats.tpq import TpqInt4Tensor, TpqPqTensor
 from mfq.kernels.cuda.acc import acc
@@ -24,7 +25,6 @@ from mfq.kernels.cuda.norm import l2_norm, rms_norm
 from mfq.kernels.cuda.rope import rope
 from mfq.kernels.cuda.sampling import sample
 from mfq.kernels.cuda.ssm_conv import ssm_conv_silu
-from mfq.quantize.nint_quant import NintTensor
 from mfq.runtime.torch_linear import (
     QuantizedTensor,
     TorchLinearGroup,

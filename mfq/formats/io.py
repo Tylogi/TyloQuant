@@ -3,7 +3,7 @@
 Two API levels:
 
 1. **Codec level** -- :func:`pack_nint`/:func:`unpack_nint` pack one
-   :class:`~mfq.quantize.nint_quant.NintTensor` into a self-describing byte stream.
+   :class:`~mfq.formats.nint.NintTensor` into a self-describing byte stream.
 2. **File level** -- :func:`save`/:func:`load` write multiple named tensors to one ``.mfq`` file.
 
 Binary layout
@@ -49,7 +49,7 @@ from mfq.formats.header import MFQ_MAGIC, FileHeader
 from mfq.formats.moe import NintMoePool, NintMoeTensor
 from mfq.formats.mx import MX_DTYPES, MxTensor, pack_mx, unpack_mx
 from mfq.formats.nepq import NepqTensor, pack_nepq, rotation_signs, unpack_nepq
-from mfq.formats.nint import NintSpec, _uint_dtype
+from mfq.formats.nint import NintSpec, NintTensor, _uint_dtype
 from mfq.formats.nint8_zero import (
     Nint8ZeroTensor,
     pack_nint8_zero,
@@ -70,7 +70,6 @@ from mfq.formats.tpq import (
     unpack_tpq_int4,
     unpack_tpq_pq,
 )
-from mfq.quantize.nint_quant import NintTensor
 
 MfqTensor: TypeAlias = (
     NintTensor
@@ -153,10 +152,23 @@ def pack_bits(values: np.ndarray, bits: int) -> bytes:
             u = np.concatenate([u, np.zeros(1, dtype=np.uint8)])
         packed = u[0::2] | (u[1::2] << 4)
         return np.ascontiguousarray(packed, dtype=np.uint8).tobytes()
-    if bits < 8:
-        u = arr.astype(np.uint8, copy=False)
-        bit_rows = np.unpackbits(u[:, None], axis=1, bitorder="little")[:, :bits]
-        return np.packbits(bit_rows.reshape(-1), bitorder="little").tobytes()
+    if 0 < bits < 8:
+        count = arr.size
+        u = arr.astype(np.uint8, copy=False) & ((1 << bits) - 1)
+        if u.size % 8:
+            u = np.concatenate(
+                [u, np.zeros((-u.size) % 8, dtype=np.uint8)]
+            )
+        blocks = u.reshape(-1, 8)
+        packed = np.zeros((blocks.shape[0], bits), dtype=np.uint8)
+        for value_index in range(8):
+            bit_position = value_index * bits
+            byte_index, shift = divmod(bit_position, 8)
+            packed[:, byte_index] |= blocks[:, value_index] << shift
+            if shift + bits > 8:
+                packed[:, byte_index + 1] |= blocks[:, value_index] >> (8 - shift)
+        nbytes = (count * bits + 7) // 8
+        return packed.reshape(-1)[:nbytes].tobytes()
     maxval = (1 << bits) - 1
     udt = _uint_dtype(maxval)
     return arr.astype(udt, copy=False).tobytes()
@@ -260,6 +272,95 @@ _NINT_MOE_MAGIC_V2 = b"NIM2"
 _NINT_MOE_HDR = struct.Struct("<4sIIII")
 _NINT_MOE_POOL_V1_HDR = struct.Struct("<IQ")
 _NINT_MOE_POOL_V2_HDR = struct.Struct("<IIQQ")
+
+
+@dataclass(frozen=True)
+class NintMoePoolMetadata:
+    expert_ids: tuple[int, ...]
+    dtype: str
+    nint_spec: NintSpec | None
+
+
+def inspect_nint_moe_header(
+    blob: bytes | memoryview,
+) -> tuple[tuple[int, int, int], tuple[NintMoePoolMetadata, ...]]:
+    """Read NINTM pool assignments without decoding packed tensor arrays."""
+
+    if len(blob) < _NINT_MOE_HDR.size:
+        raise ValueError("truncated NINTM header")
+    magic, n_experts, out_per_expert, neuron_len, pool_count = (
+        _NINT_MOE_HDR.unpack_from(blob, 0)
+    )
+    if magic != _NINT_MOE_MAGIC_V2:
+        raise ValueError("NINTM metadata inspection requires the NIM2 format")
+    if pool_count == 0 or pool_count > n_experts:
+        raise ValueError("invalid NINTM pool count")
+    off = _NINT_MOE_HDR.size
+    pools = []
+    owners = np.full(int(n_experts), -1, dtype=np.int32)
+    for pool_index in range(pool_count):
+        if off + _NINT_MOE_POOL_V2_HDR.size > len(blob):
+            raise ValueError("truncated NINTM v2 pool header")
+        expert_count, dtype_nbytes, payload_nbytes, runtime_nbytes = (
+            _NINT_MOE_POOL_V2_HDR.unpack_from(blob, off)
+        )
+        off += _NINT_MOE_POOL_V2_HDR.size
+        if expert_count == 0 or dtype_nbytes == 0 or dtype_nbytes > 32:
+            raise ValueError("invalid NINTM v2 pool metadata")
+        ids_nbytes = int(expert_count) * np.dtype(np.int32).itemsize
+        dtype_end = off + ids_nbytes + int(dtype_nbytes)
+        payload_off = dtype_end + int(runtime_nbytes)
+        payload_end = payload_off + int(payload_nbytes)
+        if payload_end > len(blob):
+            raise ValueError("truncated NINTM v2 pool payload")
+        expert_id_array = np.frombuffer(
+            blob, dtype=np.int32, count=int(expert_count), offset=off
+        )
+        if (
+            np.any(expert_id_array < 0)
+            or np.any(expert_id_array >= n_experts)
+            or np.unique(expert_id_array).size != expert_id_array.size
+            or np.any(owners[expert_id_array] >= 0)
+        ):
+            raise ValueError("invalid or repeated NINTM expert id")
+        owners[expert_id_array] = pool_index
+        expert_ids = tuple(int(value) for value in expert_id_array)
+        off += ids_nbytes
+        try:
+            dtype = bytes(blob[off:dtype_end]).decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ValueError("NINTM cohort dtype must be ASCII") from exc
+        nint_spec = None
+        if dtype.startswith("NINT") and dtype != "NINT8-0":
+            if payload_nbytes < _NINT_HDR.size:
+                raise ValueError("truncated NINTM NINT cohort header")
+            bits, sub_bits, groupsize, _axis, _width = _NINT_HDR.unpack_from(
+                blob, payload_off
+            )
+            nint_spec = NintSpec(
+                bits=int(bits),
+                groupsize=int(groupsize),
+                sub_bits=int(sub_bits),
+            )
+            if dtype != f"NINT{nint_spec.bits}":
+                raise ValueError("NINTM cohort dtype/spec mismatch")
+        pools.append(
+            NintMoePoolMetadata(
+                expert_ids=expert_ids,
+                dtype=dtype,
+                nint_spec=nint_spec,
+            )
+        )
+        off = payload_end
+    if off != len(blob):
+        raise ValueError(f"invalid NINTM tail: {len(blob) - off} extra bytes")
+    missing = np.flatnonzero(owners < 0)
+    if missing.size:
+        raise ValueError(f"NINTM pools do not cover experts {missing[:16].tolist()}")
+    return (
+        (int(n_experts), int(out_per_expert), int(neuron_len)),
+        tuple(pools),
+    )
 _NINT_MOE_ROTATION_HDR = struct.Struct("<4sIIQ")
 _NINT_MOE_ROTATION_MAGIC = b"HSG1"
 
@@ -594,6 +695,12 @@ def unpack_tensor_payload(dtype: str, blob: bytes | memoryview) -> MfqTensor:
     """Decode one self-contained tensor payload using its public MFQ dtype."""
 
     return _unpack_tensor(dtype, blob)
+
+
+def pack_tensor_payload(tensor: MfqTensor) -> tuple[str, bytes]:
+    """Encode one tensor into its public MFQ dtype and self-contained payload."""
+
+    return _pack_tensor(tensor)
 
 
 def _pack_tensor(tensor: MfqTensor, *, allow_moe: bool = True) -> tuple[str, bytes]:

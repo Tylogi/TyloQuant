@@ -7,6 +7,11 @@ TAURI = STUDIO / "src-tauri"
 RUST = (TAURI / "src" / "main.rs").read_text(encoding="utf-8")
 BUILD = (TAURI / "build.rs").read_text(encoding="utf-8")
 APP = (ROOT / "MFQStudio" / "web" / "src" / "App.tsx").read_text(encoding="utf-8")
+MARKDOWN = (ROOT / "MFQStudio" / "web" / "src" / "Markdown.tsx").read_text(encoding="utf-8")
+MARKDOWN_TEXT = (ROOT / "MFQStudio" / "web" / "src" / "markdownText.ts").read_text(
+    encoding="utf-8"
+)
+STYLES = (ROOT / "MFQStudio" / "web" / "src" / "styles.css").read_text(encoding="utf-8")
 REALTIME_AUDIO = (ROOT / "MFQStudio" / "web" / "src" / "realtimeAudio.ts").read_text(
     encoding="utf-8"
 )
@@ -23,23 +28,27 @@ def test_studio_embeds_the_shared_web_client():
     assert "IconFamily::new" in BUILD
 
 
-def test_studio_has_detached_windows_and_unix_mfqd_launchers():
-    assert "#[cfg(windows)]" in RUST
-    assert "DETACHED_PROCESS" in RUST
-    assert "CREATE_NEW_PROCESS_GROUP" in RUST
-    assert "#[cfg(unix)]" in RUST
-    assert "command.process_group(0)" in RUST
-    assert '.arg("--backend-url")' in RUST
-    assert '.arg("--db")' in RUST
-    assert 'command.arg("-m").arg("mfqd.cli")' in RUST
-    assert "--backend-api-key" not in RUST
+def test_assistant_markdown_recovers_fully_escaped_structural_line_breaks():
+    assert "normalizeEscapedMarkdownLineBreaks" in MARKDOWN
+    assert "normalizeEscapedLineBreaks={normalizeEscapedLineBreaks}" in APP
+    assert 'message.role === "assistant"' in APP
+    assert "isJsonDocument" in MARKDOWN_TEXT
+    assert 'text.includes("```")' in MARKDOWN_TEXT
+    assert "hasEscapedMarkdownStructure" in MARKDOWN_TEXT
 
 
-def test_studio_supports_local_and_remote_mfqd_with_voice_controls():
+def test_studio_connects_to_the_server_without_starting_a_private_entry_point():
+    assert 'Some("mfq-server")' in RUST
+    assert "std::process::Command" not in RUST
+    assert "studio_start_local" not in RUST
+    assert "mfq.server.cli" not in RUST
+
+
+def test_studio_supports_local_and_remote_server_connections_with_voice_controls():
     assert "RuntimeMode::Local" in RUST
     assert "RuntimeMode::Remote" in RUST
     assert "studio_configure" in RUST
-    assert "studio_start_local" in RUST
+    assert "studio_start_local" not in RUST
     assert "Object.keys(MODE_LABELS)" not in APP
     assert "RealtimeAudioController" in APP
     assert '(["text", "voice", "full_duplex"] as SessionMode[])' in APP
@@ -101,3 +110,47 @@ def test_closing_a_full_duplex_microphone_stops_instead_of_forcing_speech():
     assert "finishFullDuplexInput" not in REALTIME_AUDIO
     assert "} else if (this.inputContext) {\n      await this.stop();" in REALTIME_AUDIO
     assert "this.stopPlayback();" in REALTIME_AUDIO
+
+
+def test_dashboard_and_lab_use_subpages_and_reorderable_collapsible_panels():
+    assert 'type DashboardPage = "overview" | "cache" | "models" | "connections"' in APP
+    assert 'type LabPage = "models" | "evaluations" | "quantization"' in APP
+    assert "function PanelDeck" in APP
+    assert "PANEL_LAYOUT_KEY" in APP
+    assert "PANEL_COLLAPSED_KEY" in APP
+    assert "function panelKey" in APP
+    assert "const minimumX = -baseLeft" in APP
+    assert "const minimumY = -baseTop" in APP
+    assert "onDoubleClick={() => bringPanelToFront(id)}" in APP
+    assert "getBoundingClientRect()" in APP
+    assert "interface PanelOverlap" in APP
+    assert "panel-overlap-boundary" in APP
+    assert "left: left - deckRect.left" in APP
+    assert "const covering = firstZ > secondZ ? first : second" in APP
+    assert 'overlap.drawTop ? " edge-top"' in APP
+    assert ".panel-overlap-boundary.edge-top.edge-left" in STYLES
+    assert "border-top-left-radius: 11px" in STYLES
+    assert ".panel-drag { right: 38px;" in STYLES
+    assert "place-content: center" in STYLES
+    assert "function panelResizeEdges" in APP
+    assert "function beginPanelResize" in APP
+    assert "width: placement?.width" in APP
+    assert ".panel-item-clipped" in STYLES
+    assert "@container (max-width: 620px)" in STYLES
+    assert 'aria-label={tr("重置当前布局", "Reset current layout")}' in APP
+    assert "delete updated[page]" in APP
+    assert "setDashboardLayoutReset((current) => current + 1)" in APP
+    assert "setLabLayoutReset((current) => current + 1)" in APP
+    assert "overlapResettingRef.current = true" in APP
+    assert "if (overlapResettingRef.current)" in APP
+    assert "}, 180);" in APP
+    assert 'aria-label={tr("刷新状态", "Refresh status")}' not in APP
+    assert 'dashboardPage === "overview"' in APP
+    assert 'page="lab-quantization"' in APP
+    assert 'tr("量化工作台", "Quantization workspace")' in APP
+    assert "Run, track, and reproduce MFQ workloads" not in APP
+    assert "Runtime health and request performance" not in APP
+    assert "<p>Dashboard</p>" not in APP
+    assert "<p>Lab</p>" not in APP
+    assert 'page="lab-imatrix"' not in APP
+    assert 'page="lab-jobs"' not in APP

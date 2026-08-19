@@ -1,15 +1,14 @@
 from pathlib import Path
 
-from mfqd.capabilities import capabilities_for_architecture
+from mfq.server.capabilities import capabilities_for_architecture
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = (ROOT / "cpp_runtime" / "mfq_server.cpp").read_text(encoding="utf-8")
-WEB_APP = (ROOT / "cpp_runtime" / "web" / "app.js").read_text(encoding="utf-8")
-WEB_AUDIO = (ROOT / "cpp_runtime" / "web" / "realtime-audio.js").read_text(
+STUDIO_APP = (ROOT / "MFQStudio" / "web" / "src" / "App.tsx").read_text(
     encoding="utf-8"
 )
-WEB_HTML = (ROOT / "cpp_runtime" / "web" / "index.html").read_text(
+STUDIO_AUDIO = (ROOT / "MFQStudio" / "web" / "src" / "realtimeAudio.ts").read_text(
     encoding="utf-8"
 )
 
@@ -72,20 +71,20 @@ def test_cpp_server_publishes_the_same_architecture_capability_contract() -> Non
     assert '{"model_capabilities", model_capabilities}' in SERVER
 
 
-def test_webui_displays_capabilities_and_exposes_only_the_duplex_mode_switch() -> None:
-    assert 'id="model-capabilities"' in WEB_HTML
-    assert 'id="duplex-mode-toggle"' in WEB_HTML
-    assert "renderModelCapabilities()" in WEB_APP
+def test_studio_displays_capabilities_and_gates_voice_modes() -> None:
+    assert "CAPABILITY_LABELS" in STUDIO_APP
+    assert '(["text", "voice", "full_duplex"] as SessionMode[])' in STUDIO_APP
     for feature in (
-        "text",
         "image_input",
         "video_input",
         "audio_input",
         "audio_output",
         "full_duplex",
     ):
-        assert f'["{feature}",' in WEB_APP
-    assert "heldHalfDuplexChunk" in WEB_AUDIO
-    assert "forceListen: true" in WEB_AUDIO
-    assert "forceSpeak: true" in WEB_AUDIO
-    assert 'event.type === "response.step.done"' in WEB_AUDIO
+        assert f'["{feature}",' in STUDIO_APP
+    assert "!feature?.audio_input" in STUDIO_APP
+    assert "!feature?.full_duplex" in STUDIO_APP
+    assert "heldHalfDuplexChunk" in STUDIO_AUDIO
+    assert "forceListen: true" in STUDIO_AUDIO
+    assert "forceSpeak: true" in STUDIO_AUDIO
+    assert 'event.type === "response.step.done"' in STUDIO_AUDIO

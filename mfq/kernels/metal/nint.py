@@ -33,7 +33,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
         "MFQ's Metal backend requires MLX; install with `pip install -e '.[metal]'`"
     ) from exc
 
-from mfq.quantize.nint_quant import NintTensor
+from mfq.formats.nint import NintTensor
 
 _NINT_HEADER = struct.Struct("<BBiii")
 

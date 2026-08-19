@@ -91,8 +91,18 @@ and arguments used by the official repository.
 `mfq-decode` has a CUDA-native tensor interface for SigLIP, the Resampler,
 Whisper, the audio projector, Qwen3, and the TTS code decoder. The same graph is
 available on Apple platforms through `MlxMiniCPMO45Runtime`; the Metal HTTP
-server loads its text path directly while native callers can supply the
-processor-produced image and audio arrays programmatically.
+server loads the full visual graph for MiniCPM-o models.
+
+MFQd is the shared processor boundary for HTTP image and video input. It ports
+the official MiniCPM-o image processor exactly: optional 448-pixel slicing,
+bicubic resize, `[0, 1]` conversion, mean/std normalization, 14-pixel patch
+packing, contiguous patch masks, and 64-query placeholders. Video is decoded
+at one frame per second with no per-frame slicing. MFQd sends the same versioned
+`pixel_values`, `patch_mask`, and `target_sizes` package to CUDA and Metal. The
+native server applies the model chat template, tokenizes it, derives
+`image_bounds` from `<image>` and `<slice>` spans, and then injects Resampler
+outputs into the Qwen3 prefill graph. This keeps tokenizer behavior native while
+ensuring both device backends receive identical processor tensors.
 
 The CUDA tensor interface reads tensors produced by the official processor
 from files sharing an input prefix:

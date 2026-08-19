@@ -12,14 +12,14 @@ import numpy as np
 import torch
 
 from mfq.calibration.artifact import ExpertPrecision, nint_expert_precision
-from mfq.formats.tpq import TpqPqTensor
-from mfq.formats.tpq import (
-    TPQ_PQ_SPECS_BY_LABEL,
-    normalize_tpq_dtype,
-)
 from mfq.formats.moe import NintMoePool, NintMoeTensor
 from mfq.formats.nepq import NepqTensor
 from mfq.formats.nint import NintSpec
+from mfq.formats.nint8_zero import (
+    Nint8ZeroTensor,
+    dequantize_nint8_zero,
+    quantize_nint8_zero,
+)
 from mfq.formats.npq0_l import (
     Npq0LTensor,
     pack_npq0_l_tables,
@@ -47,17 +47,16 @@ from mfq.formats.nvq1_s import (
     Nvq1STensor,
     pack_nvq1_s_banked_codebook,
 )
+from mfq.formats.tpq import (
+    TPQ_PQ_SPECS_BY_LABEL,
+    TpqPqTensor,
+    normalize_tpq_dtype,
+)
 from mfq.quantize.nepq import NepqQuantConfig, quantize_nepq_fixed
 from mfq.quantize.nepq_a import (
     NepqAArtifact,
     NepqAQuantConfig,
     quantize_nepq_a_fixed,
-)
-from mfq.quantize.tpq import (
-    TpqKmeansConfig,
-    dequantize_tpq_pq,
-    quantize_tpq_pq_fixed,
-    train_tpq_pq,
 )
 from mfq.quantize.nint_quant import NintTensor
 from mfq.quantize.nint_quant import dequantize as dequantize_nint
@@ -84,11 +83,18 @@ from mfq.quantize.nvq_jsc import (
     NvqJscConfig,
     NvqJscTables,
     dequantize_nvq_jsc,
+    jsc_tables_from_tensor,
     quantize_nvq_jsc_fixed,
     train_nvq_jsc,
 )
 from mfq.quantize.nvq_quant import dequantize as dequantize_nvq
 from mfq.quantize.nvq_quant import quantize as quantize_nvq
+from mfq.quantize.tpq import (
+    TpqKmeansConfig,
+    dequantize_tpq_pq,
+    quantize_tpq_pq_fixed,
+    train_tpq_pq,
+)
 
 ExpertProfile = NintSpec | ExpertPrecision
 ArtifactMap = Mapping[ExpertPrecision | str, object]
@@ -344,6 +350,15 @@ def _option_int(precision: ExpertPrecision, name: str, default: int) -> int:
     return value
 
 
+def _option_bool(precision: ExpertPrecision, name: str, default: bool) -> bool:
+    value = precision.option(name, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    raise ValueError(f"expert precision option {name!r} must be boolean")
+
+
 def _optional_option(
     precision: ExpertPrecision,
     name: str,
@@ -361,6 +376,10 @@ def _quantize_flat_cohort(
     device: str | torch.device,
 ):
     family = precision.family
+    if family == "NINT8-0":
+        if artifact is not None:
+            raise ValueError("NINT8-0 does not consume a quantizer artifact")
+        return quantize_nint8_zero(rows, axis=0)
     if family.startswith("NINT"):
         assert precision.nint_spec is not None
         if artifact is not None:
@@ -390,7 +409,7 @@ def _quantize_flat_cohort(
         )
     if family in {"NVQ2", "NVQ3"}:
         codebook = None if artifact is None else np.asarray(artifact)
-        if torch.device(device).type == "mps":
+        if torch.device(device).type in {"cuda", "mps"}:
             from mfq.quantize.nvq_quant_torch import quantize_axis0
 
             return quantize_axis0(
@@ -503,20 +522,50 @@ def _quantize_flat_cohort(
     }:
         spec = _NVQ_SPECS[family]
         config = NvqJscConfig(
-            banks=_option_int(precision, "banks", 4),
+            banks=_option_int(
+                precision, "banks", 4 if family == "NVQ2J-XL" else 2
+            ),
             iterations=_option_int(precision, "iterations", 4),
             assignment_refine_steps=_option_int(
                 precision, "assignment_refine_steps", 2
             ),
             search_steps=_option_int(precision, "search_steps", 19),
+            raw_multiplier=_option_int(precision, "raw_multiplier", 8),
+            learned_scale_lut=_option_bool(
+                precision, "learned_scale_lut", family == "NVQ2J-XL"
+            ),
             group_chunk=_option_int(precision, "group_chunk", 1024),
+            seed=_option_int(precision, "seed", 20260716),
             spec=spec,
         )
         if artifact is None:
-            tensor, _ = train_nvq_jsc(
-                weight, importance=importance, config=config, device=device
+            train_rows = _option_int(precision, "codebook_train_rows", 0)
+            training_weight = weight
+            if train_rows > 0 and int(weight.shape[0]) > train_rows:
+                generator = np.random.default_rng(config.seed)
+                selected = np.sort(
+                    generator.choice(int(weight.shape[0]), train_rows, replace=False)
+                )
+                training_weight = weight.index_select(
+                    0,
+                    torch.as_tensor(
+                        selected, dtype=torch.int64, device=weight.device
+                    ),
+                )
+            trained, _ = train_nvq_jsc(
+                training_weight, importance=importance, config=config, device=device
             )
-            return tensor
+            if training_weight is weight:
+                return trained
+            return quantize_nvq_jsc_fixed(
+                weight,
+                jsc_tables_from_tensor(trained),
+                importance=importance,
+                assignment_refine_steps=config.assignment_refine_steps,
+                search_steps=config.search_steps,
+                group_chunk=config.group_chunk,
+                device=device,
+            )
         if not isinstance(artifact, NvqJscTables):
             raise TypeError(f"{family} artifact must contain NvqJscTables")
         return quantize_nvq_jsc_fixed(
@@ -699,6 +748,8 @@ def quantize_expertwise(
 def _dequantize_pool(tensor: object) -> np.ndarray:
     if isinstance(tensor, NintTensor):
         return dequantize_nint(tensor)
+    if isinstance(tensor, Nint8ZeroTensor):
+        return dequantize_nint8_zero(tensor)
     if isinstance(tensor, NepqTensor):
         from mfq.formats.nepq import dequantize_nepq
 
@@ -720,6 +771,12 @@ def _dequantize_pool(tensor: object) -> np.ndarray:
     raise TypeError(f"unsupported NINTM cohort tensor: {type(tensor)!r}")
 
 
+def dequantize_flat_precision(tensor: object) -> np.ndarray:
+    """Dequantize one non-MoE compact precision tensor to float32."""
+
+    return np.ascontiguousarray(_dequantize_pool(tensor), dtype=np.float32)
+
+
 def dequantize_expertwise(tensor: NintMoeTensor) -> np.ndarray:
     """Restore any NINTM family combination to ``float32 [experts,out,K]``."""
 
@@ -737,6 +794,7 @@ __all__ = [
     "ArtifactMap",
     "ExpertProfile",
     "dequantize_expertwise",
+    "dequantize_flat_precision",
     "quantize_flat_cohort",
     "quantize_expertwise",
     "resolve_precision_artifact",

@@ -13,7 +13,8 @@ import re
 from pathlib import Path
 
 from mfq.formats.shards import parse_size
-from mfq.quantize.backend import QUANT_BACKENDS
+
+QUANT_BACKENDS = ("auto", "cuda", "metal", "cpu")
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -102,6 +103,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         default="tensor",
     )
     precision.add_argument("--nvq-codebook-artifact-dir", default="")
+    precision.add_argument("--nvq-jsc-row-importance", default="")
     precision.add_argument(
         "--dense-dtype",
         choices=("f16", "f32"),
@@ -259,6 +261,7 @@ def _append_vq_arguments(argv: list[str], args: argparse.Namespace) -> None:
         ("--nvq-calibration", args.nvq_calibration),
         ("--nvq-codebook-scope", args.nvq_codebook_scope),
         ("--nvq-codebook-artifact-dir", args.nvq_codebook_artifact_dir),
+        ("--nvq-jsc-row-importance", args.nvq_jsc_row_importance),
         ("--nvq-group-chunk", args.nvq_group_chunk),
         ("--nvq-search-steps", args.nvq_search_steps),
         ("--nvq-assignment", args.nvq_assignment),

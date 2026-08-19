@@ -14,8 +14,8 @@ from typing import Callable
 
 import numpy as np
 
+from mfq.formats.nint import NintTensor
 from mfq.quantize import nint_quant
-from mfq.quantize.nint_quant import NintTensor
 
 _BackendFn = Callable[[NintTensor], np.ndarray]
 _BACKENDS: dict[str, _BackendFn] = {}

@@ -1,19 +1,5 @@
 <div align="center">
 
-# TyloQuant MFQ
-
-<img src="./docs/figures/tylogi-ai-lab.svg" alt="Tylogi AI Lab" width="520">
-
-**Neuron-anchored mixed-format quantization and high-fidelity LLM inference**
-
-**Every Bit. Maximum Fidelity.**
-
-**TyloQuant 的愿景，是用更少的比特承载更多智能，让前沿模型跨越硬件边界，在每一台设备上高效运行。**
-
-NINT · NVQ/NPQ · NEPQ · TPQ · Expert-Wise MoE · CUDA/C++ Runtime
-
-</div>
-
 <p align="center">
   <a href="./README.md">English</a> | <strong>中文</strong>
 </p>
@@ -53,41 +39,43 @@ LLM 部署。项目支持 `0.84-8.30 bpw` 的自定义权重编码，可按计�
 
 - Python `>=3.10`
 - Git
+- [uv](https://docs.astral.sh/uv/)
+- 浏览器 WebUI 需要 Node.js 与 npm
 - CUDA 推理需要 NVIDIA GPU 与 CUDA Toolkit
-- 构建原生 runtime 需要 CMake、Ninja 与 C++ 工具链
+- 构建原生 runtime 需要 CMake 与 C++ 工具链
 
 ### 从源码安装
 
-```powershell
-git clone REPOSITORY_URL MFQ
+`mfq` 是唯一的公开命令行入口。Windows PowerShell、macOS Terminal 和 Linux
+shell 使用相同的命令：
+
+```shell
+git clone https://github.com/mfq/mfq.git MFQ
 cd MFQ
-python -m venv .venv
+# CUDA（Windows 或 Linux）
+uv sync --extra train --extra calibration --extra daemon
+
+# Metal（Apple silicon）
+uv sync --extra train --extra calibration --extra daemon --extra metal
+uv run mfq build
 ```
 
-激活虚拟环境：
+`mfq build` 会自动探测操作系统和推理加速器。自定义 CMake 配置参数放在 `--`
+之后，例如：
 
-```powershell
-# Windows PowerShell
-.\.venv\Scripts\Activate.ps1
+```shell
+uv run mfq build -- -DCMAKE_CUDA_ARCHITECTURES=90
 ```
 
-```bash
-# Linux
-source .venv/bin/activate
-```
-
-安装量化与校准工具链：
-
-```bash
-python -m pip install --upgrade pip
-python -m pip install -e ".[train,calibration]"
-```
+成功构建后，`mfq` 会把实际产物及其构建配方记录在托管清单中。即使使用
+`--build-dir` 指定了自定义目录，后续 `mfq serve` 也会自动找到该产物；产物丢失时
+会在原目录按相同配置重建。
 
 验证安装：
 
-```bash
-mfq --help
-mfq quantize --help
+```shell
+uv run mfq --help
+uv run mfq quantize --help
 ```
 
 ### 量化
@@ -122,34 +110,30 @@ mfq quantize model-bf16.gguf model-IN.mfq \
 原有 `python -m mfq.tools.quantize_*` 高级入口继续保留，用于量化算法实验。
 统一入口只暴露模型级输入、精度产物、分片与恢复参数。
 
-### 构建 C++ Runtime
-
-在 Visual Studio x64 Developer PowerShell 中运行：
-
-```powershell
-cmake -S cpp_runtime -B build/cpp_runtime -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build/cpp_runtime -j 8
-```
-
-原生 runtime 使用仓库内置的 llama.cpp runtime 子集。
-
 ## WebUI
 
-C++ runtime 内置本地 WebUI，启动服务后可访问
-[`http://127.0.0.1:8080/admin/`](http://127.0.0.1:8080/admin/)。界面支持流式对话、
+`mfq serve` 会按需构建或更新 runtime、加载模型，然后启动 API 和 WebUI：
+
+```shell
+uv run mfq serve --model path/to/model.mfq --host 127.0.0.1 --port 8090
+```
+
+`mfq serve` 是唯一的 server 启动入口；原生 C++ worker 对用户不可见，其编译、
+定位、启动和退出均由 CLI 管理。`--host` 和 `--port` 分别控制公开 API 的监听地址
+和端口，默认值为 `127.0.0.1` 和 `8090`。浏览器打开命令输出的 WebUI 地址即可。界面支持流式对话、
 思考过程展示、采样参数控制、对话历史、连接状态和运行监控。
 
 <img src="./docs/figures/tyloquant-mfq-webui.jpg" alt="TyloQuant MFQ 本地推理 WebUI" width="100%">
 
 ## 工作原理
 
-| 层次 | 设计 | 作用 |
-|---|---|---|
-| 权重格式 | NINT、NVQ、NPQ、NEPQ | 提供从 8 bit 到低于 1 bit 的质量档 |
-| Dense 分配 | 重要度感知分配 | 按计算组选择精度 |
-| MoE 分配 | Expert-Wise Precision | 将码率集中到期望输出贡献更高的专家 |
-| 专家容器 | NINTM v2 | 在同一 MoE tensor 中保存异构格式 |
-| 推理系统 | CUDA kernel + C++ runtime | 不展开完整 FP16 权重，直接执行 packed 权重 |
+| 层次       | 设计                      | 作用                                       |
+| ---------- | ------------------------- | ------------------------------------------ |
+| 权重格式   | NINT、NVQ、NPQ、NEPQ      | 提供从 8 bit 到低于 1 bit 的质量档         |
+| Dense 分配 | 重要性感知分配            | 按计算组选择精度                           |
+| MoE 分配   | Expert-Wise Precision     | 将码率集中到期望输出贡献更高的专家         |
+| 专家容器   | NINTM v2                  | 在同一 MoE tensor 中保存异构格式           |
+| 推理系统   | CUDA kernel + C++ runtime | 不展开完整 FP16 权重，直接执行 packed 权重 |
 
 NINT 沿输出神经元权重行共享顶层仿射元数据，并把节省的预算用于更短的局部 group。
 低于 4 bit 时，NVQ、NPQ 与 NEPQ 使用短向量编码和专家感知的码本共享。分配器依据真实

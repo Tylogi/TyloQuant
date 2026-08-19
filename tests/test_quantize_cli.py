@@ -57,6 +57,29 @@ def test_quantize_routes_hf_common_options(tmp_path: Path, monkeypatch) -> None:
     assert args.dry_run is True
 
 
+def test_quantize_routes_metal_backend(tmp_path: Path, monkeypatch) -> None:
+    source = _hf_source(tmp_path)
+    captured: list[argparse.Namespace] = []
+    monkeypatch.setattr(
+        "mfq.tools.quantize_hf_to_mfq.convert", captured.append
+    )
+
+    assert (
+        cli.main(
+            [
+                "quantize",
+                str(source),
+                str(tmp_path / "model.mfq"),
+                "--backend",
+                "metal",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    assert captured[0].quant_backend == "metal"
+
+
 def test_quantize_routes_gguf_imatrix_and_q8_mode(
     tmp_path: Path, monkeypatch
 ) -> None:

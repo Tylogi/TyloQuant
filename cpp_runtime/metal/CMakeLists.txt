@@ -206,13 +206,6 @@ set_target_properties(mfq-decode-metal PROPERTIES
     INSTALL_RPATH "@executable_path/lib"
 )
 
-add_custom_command(TARGET mfq-decode-metal POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_CURRENT_SOURCE_DIR}/../web"
-        "$<TARGET_FILE_DIR:mfq-decode-metal>/web"
-    COMMENT "Copying MFQ WebUI assets"
-)
-
 set(_MFQ_LLAMA_RUNTIME_DYLIBS)
 if(TARGET mfq-server AND DEFINED MFQ_LLAMA_RUNTIME_DIR)
     file(GLOB _MFQ_LLAMA_RUNTIME_DYLIBS

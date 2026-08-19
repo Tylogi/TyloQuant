@@ -10,33 +10,15 @@ use the 1D codec in :mod:`mfq.formats.nint` directly for 1D weights.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 
-from mfq.formats.nint import NintSpec, _uint_dtype, make_qkx2
-
+from mfq.formats.nint import NintSpec, NintTensor, _uint_dtype, make_qkx2
 
 _IMATRIX_SUPERBLOCK = 256
 _IMATRIX_PRIORITY_GROUPS = 64
 _IMATRIX_PRIORITY_RADIUS = 8
 _IMATRIX_PRIORITY_ROW_CHUNK = 64
 _IMATRIX_PRIORITY_PAIR_CHUNK = 64
-
-
-@dataclass
-class NintTensor:
-    """NINT representation of an nD weight tensor with all neuron rows packed together."""
-
-    spec: NintSpec
-    shape: tuple[int, ...]
-    axis: int
-    q: np.ndarray               # (out, ng, gs) uint, including trailing-group padding
-    neuron_scale: np.ndarray    # (out,) float32（f16-round-tripped neu_s/K）
-    neuron_min: np.ndarray      # (out,) float32（f16-round-tripped neu_m/K）
-    sub_scale: np.ndarray       # (out, ng) uint
-    sub_min: np.ndarray         # (out, ng) uint
-    neuron_len: int             # Actual valid length of each neuron (excluding padding)
 
 
 def _importance_as_rows(

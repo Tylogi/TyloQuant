@@ -18,7 +18,7 @@ import torch
 from safetensors import safe_open
 
 from mfq.calibration.artifact import save_scheme
-from mfq.calibration.nint_profiles import NINT_EXPERT_PROFILES
+from mfq.calibration.evaluator import NINT_EXPERT_PROFILES
 from mfq.calibration.reap_expertwise import (
     ExpertProfileEvaluation,
     allocate_expert_profiles,
@@ -27,6 +27,8 @@ from mfq.calibration.reap_expertwise import (
 )
 from mfq.formats.nint import NintSpec
 from mfq.quantize.nint_quant_torch import make_qkx2_torch
+from mfq.quantize.nint_quant_torch import quantize_axis0
+from mfq.runtime.torch_linear import TorchNintLinear
 
 
 @dataclass(frozen=True)
@@ -122,6 +124,7 @@ def _sha256(path: Path) -> str:
 def _quantization_sse_by_row(
     weight: torch.Tensor,
     spec: NintSpec,
+    importance: torch.Tensor | np.ndarray | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return exact quantizer reconstruction SSE and signal for every row."""
 
@@ -129,6 +132,28 @@ def _quantization_sse_by_row(
         raise ValueError("weight must be a floating-point [rows, columns] tensor")
     original = weight.to(dtype=torch.float32).contiguous()
     rows, neuron_len = (int(original.shape[0]), int(original.shape[1]))
+    if importance is not None:
+        metric = torch.as_tensor(
+            importance,
+            dtype=torch.float32,
+            device=original.device,
+        )
+        if tuple(metric.shape) != (rows, neuron_len):
+            raise ValueError(
+                f"candidate imatrix shape {tuple(metric.shape)} differs from "
+                f"{(rows, neuron_len)}"
+            )
+        encoded, row_sse = quantize_axis0(
+            original,
+            spec,
+            device=original.device,
+            importance=metric,
+            return_row_sse=True,
+        )
+        return (
+            row_sse,
+            (metric * original.square()).sum(dim=1),
+        )
     gs = int(spec.groupsize)
     nmax = int(spec.nmax)
     levels = float((1 << int(spec.sub_bits)) - 1)
@@ -192,10 +217,31 @@ def _evaluate_expert_tensor(
     *,
     device: torch.device,
     expert_batch: int,
+    importance: np.ndarray | None = None,
+    cache_outputs: dict[NintSpec, tuple[Path, dict[str, object]]] | None = None,
 ) -> tuple[dict[str, np.ndarray], np.ndarray]:
     experts, rows_per_expert, columns = shape
     profile_sse = {name: np.zeros(experts, dtype=np.float64) for name in profiles}
     signal = np.zeros(experts, dtype=np.float64)
+    outputs: dict[NintSpec, dict[str, np.memmap]] = {}
+    metadata_by_spec: dict[NintSpec, dict[str, object]] = {}
+    if cache_outputs:
+        for spec, (directory, metadata) in cache_outputs.items():
+            if directory.is_dir():
+                metadata_by_spec[spec] = {
+                    "directory": str(directory),
+                    "metadata": metadata,
+                    "reused": True,
+                }
+                continue
+            directory.parent.mkdir(parents=True, exist_ok=True)
+            temporary = directory.with_name(f"{directory.name}.{os.getpid()}.tmp")
+            temporary.mkdir(parents=False, exist_ok=False)
+            metadata_by_spec[spec] = {
+                "temporary": str(temporary),
+                "metadata": metadata,
+                "reused": False,
+            }
     for start in range(0, experts, expert_batch):
         end = min(start + expert_batch, experts)
         host = source[start:end]
@@ -205,10 +251,28 @@ def _evaluate_expert_tensor(
         weight = host.reshape((end - start) * rows_per_expert, columns).to(
             device=device, dtype=torch.float32, non_blocking=False
         )
-        local_signal = (weight * weight).sum(dim=1).reshape(end - start, rows_per_expert)
+        metric = None
+        if importance is not None:
+            values = torch.as_tensor(
+                importance[start:end],
+                dtype=torch.float32,
+                device=device,
+            )
+            metric = values.repeat_interleave(rows_per_expert, dim=0)
+        local_signal = (
+            (weight * weight).sum(dim=1)
+            if metric is None
+            else (metric * weight.square()).sum(dim=1)
+        ).reshape(end - start, rows_per_expert)
         signal[start:end] = local_signal.sum(dim=1).cpu().numpy().astype(np.float64)
         for profile, spec in profiles.items():
-            row_sse, _row_signal = _quantization_sse_by_row(weight, spec)
+            encoded, row_sse = quantize_axis0(
+                weight,
+                spec,
+                device=device,
+                importance=metric,
+                return_row_sse=True,
+            )
             profile_sse[profile][start:end] = (
                 row_sse.reshape(end - start, rows_per_expert)
                 .sum(dim=1)
@@ -216,7 +280,42 @@ def _evaluate_expert_tensor(
                 .numpy()
                 .astype(np.float64)
             )
+            cache_output = None if cache_outputs is None else cache_outputs.get(spec)
+            if cache_output is not None and not metadata_by_spec[spec]["reused"]:
+                arrays = TorchNintLinear.deploy_arrays(encoded)
+                if spec not in outputs:
+                    temporary = Path(metadata_by_spec[spec]["temporary"])
+                    outputs[spec] = {
+                        name: np.lib.format.open_memmap(
+                            temporary / f"{name}.npy",
+                            mode="w+",
+                            dtype=np.asarray(value).dtype,
+                            shape=(experts * rows_per_expert, *np.asarray(value).shape[1:]),
+                        )
+                        for name, value in arrays.items()
+                    }
+                row_start = start * rows_per_expert
+                row_end = end * rows_per_expert
+                for name, output in outputs[spec].items():
+                    output[row_start:row_end] = np.asarray(arrays[name])
+            del encoded, row_sse
         del host, weight, local_signal
+    if cache_outputs:
+        for spec, (directory, _metadata) in cache_outputs.items():
+            if metadata_by_spec[spec]["reused"]:
+                continue
+            temporary = Path(metadata_by_spec[spec]["temporary"])
+            for output in outputs[spec].values():
+                output.flush()
+            outputs[spec].clear()
+            metadata = metadata_by_spec[spec].get("metadata")
+            if not isinstance(metadata, dict):
+                raise RuntimeError("candidate cache metadata was not configured")
+            (temporary / "metadata.json").write_text(
+                json.dumps(metadata, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, directory)
     return profile_sse, signal
 
 
@@ -284,6 +383,9 @@ def _layer_documents(
     *,
     device: torch.device,
     expert_batch: int,
+    imatrix=None,
+    candidate_cache_dir: str | Path | None = None,
+    imatrix_sha256: str = "",
 ) -> list[dict[str, Any]]:
     gate_name = layout.gate_template.format(layer=layer)
     down_name = layout.down_template.format(layer=layer)
@@ -295,6 +397,46 @@ def _layer_documents(
         raise ValueError(
             f"layer {layer} expert shape mismatch: gate={gate_shape}, down={down_shape}"
         )
+    gate_importance = None
+    down_importance = None
+    if imatrix is not None:
+        try:
+            gate_entry = imatrix.entries[gate_name]
+            down_entry = imatrix.entries[down_name]
+        except KeyError as exc:
+            raise ValueError(f"imatrix lacks routed tensor {exc.args[0]}") from exc
+        if gate_entry.values.shape != (layout.experts, gate_shape[2]):
+            raise ValueError(f"imatrix shape differs for {gate_name}")
+        if down_entry.values.shape != (layout.experts, down_shape[2]):
+            raise ValueError(f"imatrix shape differs for {down_name}")
+        if not np.any(gate_entry.counts > 0) or not np.any(down_entry.counts > 0):
+            raise ValueError(f"imatrix has no observed routed experts at layer {layer}")
+        gate_importance = gate_entry.values
+        down_importance = down_entry.values
+    gate_cache = None
+    down_cache = None
+    if candidate_cache_dir is not None:
+        from mfq.calibration.grouped_cache import grouped_expert_cache_layout
+        from mfq.calibration.qwen35 import HfSafetensorIndex
+
+        index = HfSafetensorIndex(root)
+
+        def cache_map(name: str):
+            result = {}
+            for spec in profiles.values():
+                directory, metadata = grouped_expert_cache_layout(
+                    root,
+                    index,
+                    name,
+                    spec,
+                    candidate_cache_dir,
+                    imatrix_sha256=imatrix_sha256,
+                )
+                result[spec] = (directory, metadata)
+            return result
+
+        gate_cache = cache_map(gate_name)
+        down_cache = cache_map(down_name)
 
     # torch-backed safetensors slices can fault at offsets above 2 GiB on
     # Windows. Read the BF16 payload through a NumPy memmap and copy each
@@ -308,6 +450,8 @@ def _layer_documents(
             profiles,
             device=device,
             expert_batch=expert_batch,
+            importance=gate_importance,
+            cache_outputs=gate_cache,
         )
 
     with open_bfloat16_memmap_tensor(
@@ -319,6 +463,8 @@ def _layer_documents(
             profiles,
             device=device,
             expert_batch=expert_batch,
+            importance=down_importance,
+            cache_outputs=down_cache,
         )
 
     rows: list[dict[str, Any]] = []

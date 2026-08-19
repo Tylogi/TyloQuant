@@ -231,8 +231,8 @@ def nint_matmul(g: dict, x: torch.Tensor) -> torch.Tensor:
     bits = int(g.get("bits", 4))
     packed = q_packed is not None
     if packed and bits != 4 and g.get("sub_scale") is not None:
-        qx, xscale, xsum = _workspace(g, x)
         if bits == 8 and M <= 8:
+            qx, xscale, xsum = _workspace(g, x)
             return ext().nint_gemv_packed_u8_ws_cuda(
                 q_packed,
                 g["sub_scale"],
@@ -246,6 +246,7 @@ def nint_matmul(g: dict, x: torch.Tensor) -> torch.Tensor:
                 xsum,
             )
         if M <= 8:
+            qx, xscale, xsum = _workspace(g, x)
             if bits == 6 and (int(g["gs"]) % 4) == 0:
                 return ext().nint_gemv_packed_int6_ws_cuda(
                     q_packed,
@@ -331,6 +332,7 @@ def nint_matmul(g: dict, x: torch.Tensor) -> torch.Tensor:
                 6,
             )
         if bits == 8 and M <= 64 and os.environ.get("MFQ_NINT8_MMQ") == "1":
+            qx, xscale, xsum = _workspace(g, x)
             return ext().nint_mmq_packed_u8_ws_cuda(
                 q_packed,
                 g["sub_scale"],
