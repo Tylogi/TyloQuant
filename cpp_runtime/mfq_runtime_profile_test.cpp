@@ -26,6 +26,9 @@ int main() {
     require(registry.chat.temperature.has_value(), "registry temperature missing");
     require(std::abs(*registry.chat.temperature - 0.7) < 1e-12,
             "registry temperature mismatch");
+    require(registry.chat.enable_thinking.has_value() &&
+                !*registry.chat.enable_thinking,
+            "registry thinking default mismatch");
     require(registry.duplex.force_listen_count.value_or(-1) == 0,
             "registry duplex defaults missing");
     require(registry.duplex.system_prompt.value_or("") ==

@@ -18,6 +18,7 @@ struct MfqSamplingParams {
     double presence_penalty = 0.0;
     double frequency_penalty = 0.0;
     double repetition_penalty = 1.0;
+    bool enable_thinking = true;
     uint64_t seed = 0;
 };
 
@@ -29,6 +30,7 @@ struct MfqChatSamplingProfile {
     std::optional<double> presence_penalty;
     std::optional<double> frequency_penalty;
     std::optional<double> repetition_penalty;
+    std::optional<bool> enable_thinking;
 };
 
 struct MfqDuplexSamplingProfile {

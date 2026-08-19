@@ -139,6 +139,11 @@ function modeTemplateSettings(
     ),
     presencePenalty: voice ? 0 : value("presence_penalty", current.presencePenalty),
     frequencyPenalty: voice ? 0 : value("frequency_penalty", current.frequencyPenalty),
+    enableThinking: voice
+      ? false
+      : typeof defaults.enable_thinking === "boolean"
+        ? defaults.enable_thinking
+        : current.enableThinking,
     fullDuplex: mode === "full_duplex",
     preset: "custom",
     seed: null,
@@ -202,6 +207,58 @@ function formatNumber(value: unknown, digits = 0): string {
   return Number.isFinite(number)
     ? new Intl.NumberFormat(undefined, { maximumFractionDigits: digits }).format(number)
     : "--";
+}
+
+interface PrefillMetricLike {
+  prompt_tokens?: number;
+  prefill_tokens?: number;
+  ttft_ms?: number;
+  prefill_ms?: number;
+  prefill_tps?: number;
+  model_prefill_ms?: number;
+  complete_prefill_ms?: number;
+}
+
+function displayPrefillMetric(metrics?: PrefillMetricLike | null): {
+  milliseconds: number | undefined;
+  tokensPerSecond: number | undefined;
+} {
+  if (!metrics) return { milliseconds: undefined, tokensPerSecond: undefined };
+  const nativeMilliseconds = Number(metrics.ttft_ms);
+  if (Number.isFinite(nativeMilliseconds) && nativeMilliseconds > 0) {
+    const tokens = Number(metrics.prefill_tokens ?? metrics.prompt_tokens);
+    return {
+      milliseconds: nativeMilliseconds,
+      tokensPerSecond:
+        Number.isFinite(tokens) && tokens > 0
+          ? (tokens * 1000) / nativeMilliseconds
+          : undefined,
+    };
+  }
+  const modelMilliseconds = Number(metrics.model_prefill_ms);
+  const languageMilliseconds = Number(metrics.prefill_ms);
+  const milliseconds =
+    Number.isFinite(modelMilliseconds) && modelMilliseconds > 0
+      ? modelMilliseconds
+      : Number.isFinite(languageMilliseconds) && languageMilliseconds > 0
+        ? languageMilliseconds
+        : undefined;
+  const tokens = Number(metrics.prefill_tokens ?? metrics.prompt_tokens);
+  if (milliseconds !== undefined && Number.isFinite(tokens) && tokens > 0) {
+    return { milliseconds, tokensPerSecond: (tokens * 1000) / milliseconds };
+  }
+  const reported = Number(metrics.prefill_tps);
+  return {
+    milliseconds,
+    tokensPerSecond: Number.isFinite(reported) ? reported : undefined,
+  };
+}
+
+function preferPositiveMetric(primary: unknown, fallback: unknown): number | undefined {
+  const preferred = Number(primary);
+  if (Number.isFinite(preferred) && preferred > 0) return preferred;
+  const fallbackNumber = Number(fallback);
+  return Number.isFinite(fallbackNumber) ? fallbackNumber : undefined;
 }
 
 function formatDuration(value: unknown): string {
@@ -313,6 +370,8 @@ export default function App() {
     const values = runtime?.chat_template_capabilities?.reasoning_effort?.values;
     return Array.isArray(values) ? values : [];
   }, [runtime]);
+  const thinkingSupported =
+    runtime?.chat_template_capabilities?.thinking?.supported === true;
 
   const refreshSessions = useCallback(async (preferredId?: string) => {
     const next = await api.listSessions();
@@ -585,7 +644,7 @@ export default function App() {
       frequency_penalty: settings.frequencyPenalty,
       repetition_penalty: settings.repetitionPenalty,
       seed: settings.seed,
-      enable_thinking: settings.enableThinking,
+      enable_thinking: thinkingSupported && settings.enableThinking,
       reasoning_effort: settings.reasoningEffort || null,
     };
   }
@@ -977,6 +1036,12 @@ export default function App() {
   }
 
   const last = runtime?.last_request;
+  const lastPrefill = displayPrefillMetric(last);
+  const lastTtftMs = preferPositiveMetric(last?.ttft_ms, last?.complete_prefill_ms);
+  const lastGenerationMs = preferPositiveMetric(
+    last?.generation_ms,
+    last?.complete_generation_ms,
+  );
   const contextTokens = Number(last?.prompt_tokens || 0) + Number(last?.completion_tokens || 0);
 
   return (
@@ -1030,7 +1095,7 @@ export default function App() {
           <div className="topbar-model"><span>{active?.model || model}</span><small>{capabilities?.model_type || runtime?.model_type || "runtime"}</small></div>
           <div className="topbar-actions">
             {capabilities && <div className="capabilities">{CAPABILITY_LABELS.filter(([feature]) => capabilities.model_capabilities.features[feature]).map(([feature, label]) => <span className={feature === "full_duplex" && !realtimeAvailable ? "muted" : ""} key={feature}>{label[english ? 1 : 0]}</span>)}</div>}
-            <div className="quick-metrics"><span><b>{last?.ttft_ms == null ? "--" : `${formatNumber(last.ttft_ms, 1)} ms`}</b> TTFT</span><span><b>{last ? formatNumber(contextTokens) : "--"}</b> context</span><span><b>{last?.decode_tps == null ? "--" : formatNumber(last.decode_tps, 1)}</b> tok/s</span></div>
+            <div className="quick-metrics"><span><b>{lastTtftMs == null ? "--" : `${formatNumber(lastTtftMs, 1)} ms`}</b> TTFT</span><span><b>{last ? formatNumber(contextTokens) : "--"}</b> context</span><span><b>{last?.decode_tps == null ? "--" : formatNumber(last.decode_tps, 1)}</b> tok/s</span></div>
             <button disabled={!active} onClick={exportConversation} title={tr("导出会话", "Export chat")} type="button">⇩</button>
             <button onClick={openSettings} title={tr("推理设置", "Inference settings")} type="button">⚙</button>
           </div>
@@ -1068,8 +1133,8 @@ export default function App() {
                   {realtimeAvailable && <select aria-label={tr("交互模式", "Interaction mode")} disabled={!active || busy || voiceState !== "idle"} onChange={(event) => void selectInteractionMode(event.target.value as SessionMode)} value={active?.mode ?? mode}>{(["text", "voice", "full_duplex"] as SessionMode[]).map((item) => { const feature = capabilities?.model_capabilities.features; const disabled = item === "voice" ? !feature?.audio_input : item === "full_duplex" ? !feature?.full_duplex : false; return <option disabled={disabled} key={item} value={item}>{MODE_LABELS[item][english ? 1 : 0]}</option>; })}</select>}
                   {realtimeAvailable && <button aria-label={tr("语音输入", "Voice input")} aria-pressed={voiceState !== "idle" && voiceState !== "error"} className="voice-button" disabled={!active || active.mode === "text" || busy} onClick={() => void toggleVoice()} style={{ "--voice-level": voiceLevel } as React.CSSProperties} title={active?.mode === "text" ? tr("请先选择语音或全双工模式", "Select voice or full duplex mode first") : voiceState === "processing" ? tr("语音处理中", "Processing voice") : tr("语音输入", "Voice input")} type="button"><span /></button>}
                   {realtimeAvailable && active?.mode !== "text" && <button aria-pressed={settings.playbackEnabled} onClick={() => setSettings((current) => ({ ...current, playbackEnabled: !current.playbackEnabled }))} title={tr("语音播放", "Voice playback")} type="button">{settings.playbackEnabled ? "🔊" : "🔇"}</button>}
-                  {active?.mode === "text" && <button aria-pressed={settings.enableThinking} onClick={() => setSettings((current) => ({ ...current, enableThinking: !current.enableThinking }))} type="button">◉ {tr("思考", "Thinking")}</button>}
-                  {active?.mode === "text" && settings.enableThinking && reasoningValues.length > 0 && <select aria-label={tr("思考档位", "Reasoning effort")} onChange={(event) => setSettings((current) => ({ ...current, reasoningEffort: event.target.value }))} value={settings.reasoningEffort}><option value="">{tr("标准", "Standard")}</option>{reasoningValues.map((value) => <option key={value} value={value}>{value}</option>)}</select>}
+                  {active?.mode === "text" && <button aria-pressed={thinkingSupported && settings.enableThinking} disabled={!thinkingSupported} onClick={() => setSettings((current) => ({ ...current, enableThinking: !current.enableThinking }))} type="button">◉ {tr("思考", "Thinking")}</button>}
+                  {active?.mode === "text" && thinkingSupported && settings.enableThinking && reasoningValues.length > 0 && <select aria-label={tr("思考档位", "Reasoning effort")} onChange={(event) => setSettings((current) => ({ ...current, reasoningEffort: event.target.value }))} value={settings.reasoningEffort}><option value="">{tr("标准", "Standard")}</option>{reasoningValues.map((value) => <option key={value} value={value}>{value}</option>)}</select>}
                   <span className="composer-hint">{voiceState !== "idle" ? voiceState : tr("Enter 发送 · Shift+Enter 换行", "Enter to send · Shift+Enter for newline")}</span>
                   {busy ? <button className="send-button stop" onClick={() => abortRef.current?.abort()} type="button">■</button> : <button className="send-button" disabled={!active || !draft.trim()} type="submit">↑</button>}
                 </div>
@@ -1080,9 +1145,9 @@ export default function App() {
         ) : (
           <section className="monitor-view">
             <div className="monitor-heading"><div><p>Runtime</p><h1>{tr("服务监控", "Runtime monitor")}</h1><span>{runtime ? tr("状态已连接", "Status connected") : tr("等待状态数据", "Waiting for status")}</span></div><button onClick={() => void refreshRuntime(false)} type="button">↻</button></div>
-            <div className="metric-grid"><article><span>Prefill</span><strong>{formatNumber(last?.prefill_tps, 1)}</strong><small>tokens / second</small></article><article><span>Decode</span><strong>{formatNumber(last?.decode_tps, 1)}</strong><small>tokens / second</small></article><article><span>TTFT</span><strong>{formatNumber(last?.ttft_ms, 1)}</strong><small>milliseconds</small></article><article><span>{tr("请求", "Requests")}</span><strong>{formatNumber(runtime?.total_requests || 0)}</strong><small>{formatNumber(runtime?.active_requests || 0)} active</small></article><article><span>Tokens</span><strong>{formatNumber(Number(runtime?.total_prompt_tokens || 0) + Number(runtime?.total_completion_tokens || 0))}</strong><small>prompt + completion</small></article></div>
+            <div className="metric-grid"><article><span>Prefill</span><strong>{formatNumber(lastPrefill.tokensPerSecond, 1)}</strong><small>tokens / second</small></article><article><span>Decode</span><strong>{formatNumber(last?.decode_tps, 1)}</strong><small>tokens / second</small></article><article><span>TTFT</span><strong>{formatNumber(lastTtftMs, 1)}</strong><small>milliseconds</small></article><article><span>{tr("请求", "Requests")}</span><strong>{formatNumber(runtime?.total_requests || 0)}</strong><small>{formatNumber(runtime?.active_requests || 0)} active</small></article><article><span>Tokens</span><strong>{formatNumber(Number(runtime?.total_prompt_tokens || 0) + Number(runtime?.total_completion_tokens || 0))}</strong><small>prompt + completion</small></article></div>
             <div className="monitor-grid"><section className="monitor-panel chart-panel"><div className="panel-heading"><div><h2>{tr("生成吞吐", "Decode throughput")}</h2><p>{tr("最近请求的 decode tokens/s", "Decode tokens/s for recent requests")}</p></div><b>{formatNumber(last?.decode_tps, 1)} tok/s</b></div><RuntimeChart values={metricSeries} /></section><section className="monitor-panel"><div className="panel-heading"><div><h2>Runtime</h2><p>{tr("当前服务实例", "Current runtime instance")}</p></div></div><dl><div><dt>{tr("模型", "Model")}</dt><dd>{runtime?.model || model}</dd></div><div><dt>{tr("架构", "Architecture")}</dt><dd>{runtime?.model_type || "--"}</dd></div><div><dt>{tr("上下文", "Context")}</dt><dd>{formatNumber(runtime?.max_context)}</dd></div><div><dt>{tr("运行时间", "Uptime")}</dt><dd>{formatDuration(runtime?.uptime_seconds)}</dd></div><div><dt>{tr("失败请求", "Failed")}</dt><dd>{formatNumber(runtime?.failed_requests || 0)}</dd></div></dl></section></div>
-            <section className="monitor-panel request-panel"><div className="panel-heading"><div><h2>{tr("最近请求", "Last request")}</h2><p>{last?.id || tr("还没有完成的请求", "No completed requests")}</p></div><b>{last?.finish_reason || (runtime?.active_requests ? "Running" : "Idle")}</b></div><div className="request-stats"><div><span>{tr("输入", "Input")}</span><strong>{formatNumber(last?.prompt_tokens)}</strong><small>tokens</small></div><div><span>{tr("输出", "Output")}</span><strong>{formatNumber(last?.completion_tokens)}</strong><small>tokens</small></div><div><span>Prefill</span><strong>{formatNumber(last?.prefill_tps, 1)}</strong><small>{formatNumber(last?.prefill_ms, 1)} ms</small></div><div><span>{tr("总耗时", "Total")}</span><strong>{formatNumber(last?.generation_ms, 1)}</strong><small>ms</small></div><div><span>{tr("结束原因", "Finish")}</span><strong>{last?.finish_reason || "--"}</strong><small>finish reason</small></div></div></section>
+            <section className="monitor-panel request-panel"><div className="panel-heading"><div><h2>{tr("最近请求", "Last request")}</h2><p>{last?.id || tr("还没有完成的请求", "No completed requests")}</p></div><b>{last?.finish_reason || (runtime?.active_requests ? "Running" : "Idle")}</b></div><div className="request-stats"><div><span>{tr("输入", "Input")}</span><strong>{formatNumber(last?.prompt_tokens)}</strong><small>tokens</small></div><div><span>{tr("输出", "Output")}</span><strong>{formatNumber(last?.completion_tokens)}</strong><small>tokens</small></div><div><span>Prefill</span><strong>{formatNumber(lastPrefill.tokensPerSecond, 1)}</strong><small>{formatNumber(lastPrefill.milliseconds, 1)} ms</small></div><div><span>{tr("总耗时", "Total")}</span><strong>{formatNumber(lastGenerationMs, 1)}</strong><small>ms</small></div><div><span>{tr("结束原因", "Finish")}</span><strong>{last?.finish_reason || "--"}</strong><small>finish reason</small></div></div></section>
           </section>
         )}
       </main>

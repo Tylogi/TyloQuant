@@ -395,7 +395,7 @@ static MfqTokenConstraintPtr make_token_constraint(
     return constraint;
 }
 
-static bool request_enable_thinking(const json & body) {
+static bool request_enable_thinking(const json & body, bool fallback) {
     if (body.contains("enable_thinking") && !body["enable_thinking"].is_null()) {
         if (!body["enable_thinking"].is_boolean()) {
             throw ApiError(400, "invalid_request_error", "enable_thinking must be boolean", "enable_thinking");
@@ -415,7 +415,7 @@ static bool request_enable_thinking(const json & body) {
             return kwargs["enable_thinking"].get<bool>();
         }
     }
-    return true;
+    return fallback;
 }
 
 static common_reasoning_format request_reasoning_format(const json & body) {
@@ -519,7 +519,8 @@ static std::string request_json_schema(const json & body) {
 }
 
 static common_chat_params apply_chat_template(
-        const json & body, const common_chat_templates * templates) {
+        const json & body, const common_chat_templates * templates,
+        bool enable_thinking_default) {
     if (!body.contains("messages") || !body["messages"].is_array() ||
         body["messages"].empty()) {
         throw ApiError(
@@ -533,7 +534,8 @@ static common_chat_params apply_chat_template(
             common_chat_msgs_parse_oaicompat(body["messages"]);
         inputs.json_schema = request_json_schema(body);
         inputs.reasoning_format = request_reasoning_format(body);
-        inputs.enable_thinking = request_enable_thinking(body);
+        inputs.enable_thinking = request_enable_thinking(
+            body, enable_thinking_default);
         inputs.use_jinja = true;
         inputs.add_generation_prompt =
             boolean_field(body, "add_generation_prompt", true);
@@ -673,6 +675,9 @@ static MfqSamplingParams default_sampling_params(
     if (profile.repetition_penalty) {
         defaults.repetition_penalty = *profile.repetition_penalty;
     }
+    if (profile.enable_thinking) {
+        defaults.enable_thinking = *profile.enable_thinking;
+    }
     return defaults;
 }
 
@@ -685,6 +690,7 @@ static json sampling_params_json(const MfqSamplingParams & sampling) {
         {"presence_penalty", sampling.presence_penalty},
         {"frequency_penalty", sampling.frequency_penalty},
         {"repetition_penalty", sampling.repetition_penalty},
+        {"enable_thinking", sampling.enable_thinking},
     };
 }
 
@@ -705,6 +711,7 @@ static void merge_runtime_profile(MfqRuntimeProfile & target,
     MFQ_MERGE(chat, presence_penalty);
     MFQ_MERGE(chat, frequency_penalty);
     MFQ_MERGE(chat, repetition_penalty);
+    MFQ_MERGE(chat, enable_thinking);
     MFQ_MERGE(duplex, system_prompt);
     MFQ_MERGE(duplex, decode_mode);
     MFQ_MERGE(duplex, temperature);
@@ -745,6 +752,7 @@ static MfqRuntimeProfile architecture_runtime_profile(
         result.chat.top_k = 100;
         result.chat.top_p = 0.8;
         result.chat.repetition_penalty = 1.02;
+        result.chat.enable_thinking = false;
         result.duplex.system_prompt = "Streaming Omni Conversation.";
         result.duplex.decode_mode = "sampling";
         result.duplex.temperature = 0.7;
@@ -886,6 +894,14 @@ static MfqRuntimeProfile parse_runtime_profile(const std::string & text,
         MFQ_CHAT_NUMBER(presence_penalty);
         MFQ_CHAT_NUMBER(frequency_penalty);
         MFQ_CHAT_NUMBER(repetition_penalty);
+        if (value.contains("enable_thinking")) {
+            if (!value["enable_thinking"].is_boolean()) {
+                throw std::runtime_error(
+                    "runtime profile chat.enable_thinking must be boolean");
+            }
+            result.chat.enable_thinking =
+                value["enable_thinking"].get<bool>();
+        }
 #undef MFQ_CHAT_NUMBER
     }
     if (root.contains("duplex")) {
@@ -1031,6 +1047,8 @@ static json tts_profile_json(const MfqTtsSamplingProfile & value) {
 
 static json chat_template_capabilities_json(
         const std::string & chat_template) {
+    const bool supports_thinking =
+        chat_template.find("enable_thinking") != std::string::npos;
     json reasoning_effort_values = json::array();
     if (chat_template.find("reasoning_effort") != std::string::npos) {
         const auto supports_value = [&](const char * value) {
@@ -1048,6 +1066,9 @@ static json chat_template_capabilities_json(
         }
     }
     return {
+        {"thinking", {
+            {"supported", supports_thinking},
+        }},
         {"reasoning_effort", {
             {"supported", !reasoning_effort_values.empty()},
             {"values", std::move(reasoning_effort_values)},
@@ -1165,6 +1186,8 @@ static RequestWork parse_work(const json & body, bool chat, const LlamaTokenizer
         body, "frequency_penalty", defaults.frequency_penalty);
     work.sampling.repetition_penalty = number_field(
         body, "repetition_penalty", defaults.repetition_penalty);
+    work.sampling.enable_thinking = request_enable_thinking(
+        body, defaults.enable_thinking);
     if (work.sampling.temperature < 0.0 || work.sampling.temperature > 10.0) {
         throw ApiError(400, "invalid_request_error", "temperature must be in [0, 10]", "temperature");
     }
@@ -1198,7 +1221,8 @@ static RequestWork parse_work(const json & body, bool chat, const LlamaTokenizer
     bool parse_special = false;
     if (chat) {
         const common_chat_params chat_params =
-            apply_chat_template(body, templates);
+            apply_chat_template(
+                body, templates, work.sampling.enable_thinking);
         work.token_constraint =
             make_token_constraint(tokenizer, chat_params);
         prompt = chat_params.prompt;
@@ -1257,7 +1281,7 @@ static RequestWork parse_work(const json & body, bool chat, const LlamaTokenizer
     if (chat && model_type == "deepseek_v4" &&
         boolean_field(body, "add_generation_prompt", true)) {
         const std::string stable_marker =
-            request_enable_thinking(body) ? "<think>" : "</think>";
+            work.sampling.enable_thinking ? "<think>" : "</think>";
         const auto marker_tokens =
             tokenizer.tokenize(stable_marker, true);
         if (!marker_tokens.empty() &&

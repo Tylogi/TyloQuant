@@ -26,6 +26,7 @@ _CHAT_FIELDS = {
     "presence_penalty": float,
     "frequency_penalty": float,
     "repetition_penalty": float,
+    "enable_thinking": bool,
 }
 _DUPLEX_FIELDS = {
     "system_prompt": str,
@@ -86,6 +87,7 @@ _ARCHITECTURE_REGISTRY: dict[str, dict[str, Any]] = {
             "top_k": 100,
             "top_p": 0.8,
             "repetition_penalty": 1.02,
+            "enable_thinking": False,
         },
         duplex={
             "system_prompt": "Streaming Omni Conversation.",
@@ -125,6 +127,7 @@ _MODEL_REGISTRY: dict[str, dict[str, Any]] = {
             "top_k": 100,
             "top_p": 0.8,
             "repetition_penalty": 1.02,
+            "enable_thinking": False,
         },
         duplex={
             "system_prompt": "Streaming Omni Conversation.",
@@ -185,6 +188,13 @@ def _validate_section(
             result[str(key)] = copy.deepcopy(item)
             continue
         expected = fields[key]
+        if expected is bool:
+            if not isinstance(item, bool):
+                raise ValueError(
+                    f"runtime profile {name}.{key} must be a boolean"
+                )
+            result[key] = item
+            continue
         if expected is str:
             if not isinstance(item, str):
                 raise ValueError(f"runtime profile {name}.{key} must be a string")

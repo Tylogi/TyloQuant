@@ -232,8 +232,9 @@ def test_minicpmo45_cli_exposes_native_duplex_tensor_contract():
 
 
 def test_minicpmo45_cuda_server_binds_the_realtime_backend():
-    assert 'a == "--minicpmo-duplex"' in DECODE
+    assert 'a == "--minicpmo-duplex"' not in DECODE
     assert "make_cuda_minicpmo45_duplex_backend(" in DECODE
+    assert "if (server_minicpmo_runtime)" in DECODE
     assert 'backend.name = "cuda"' in DECODE
     assert "MiniCPMO45Runtime::load_with_language(" in DECODE
     assert "session->prepare(" in DECODE
@@ -254,7 +255,8 @@ def test_minicpmo45_native_servers_share_mfqd_vision_tensors():
     assert "generate_multimodal(" in METAL_HEADER
     assert "MlxMiniCPMO45Runtime::generate_multimodal(" in METAL_GRAPH
     assert "MfqMultimodalGenerateFn multimodal_generate" in METAL_DECODE
-    assert "arguments.server || arguments.minicpmo_duplex" in METAL_DECODE
+    assert "arguments.minicpmo_duplex" not in METAL_DECODE
+    assert "Runtime, mfq::metal::MlxMiniCPMO45Runtime" in METAL_DECODE
 
 
 def test_minicpmo45_cuda_duplex_uses_runtime_profile_tts_sampling():

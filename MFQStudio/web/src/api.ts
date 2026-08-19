@@ -104,11 +104,18 @@ export interface RuntimeRequestMetrics {
   id?: string;
   prompt_tokens?: number;
   completion_tokens?: number;
+  prefill_tokens?: number;
   prefill_tps?: number;
   prefill_ms?: number;
+  multimodal_ms?: number;
+  model_prefill_ms?: number;
+  processor_ms?: number;
+  complete_prefill_ms?: number;
+  complete_prefill_tps?: number;
   decode_tps?: number;
   ttft_ms?: number;
   generation_ms?: number;
+  complete_generation_ms?: number;
   finish_reason?: string;
 }
 
@@ -141,6 +148,7 @@ export interface RuntimeStatus {
     [key: string]: unknown;
   };
   chat_template_capabilities?: {
+    thinking?: { supported?: boolean };
     reasoning_effort?: { supported?: boolean; values?: string[] };
   };
   last_request?: RuntimeRequestMetrics | null;

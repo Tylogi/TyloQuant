@@ -177,13 +177,13 @@ exactly. `reset()` destroys the duplex state and clears all modality caches.
 
 ### Realtime service
 
-Start the native CUDA or Apple worker with the modality graph enabled:
+Start the native CUDA or Apple worker. MiniCPM-o models expose their realtime
+duplex capability automatically; it is not a server launch option:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 mfq-decode \
   --mfq /models/MiniCPM-o-4_5.mfq \
   --server \
-  --minicpmo-duplex \
   --host 127.0.0.1 \
   --port 8081
 ```
@@ -194,7 +194,6 @@ On Apple Silicon, use the Metal executable with the same server options:
 mfq-decode-metal \
   --mfq /models/MiniCPM-o-4_5.mfq \
   --server \
-  --minicpmo-duplex \
   --host 127.0.0.1 \
   --port 8081
 ```

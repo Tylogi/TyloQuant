@@ -20,6 +20,7 @@ def test_architecture_registry_is_partial() -> None:
     profile = architecture_profile("MiniCPMOForCausalLM")
     assert profile is not None
     assert profile["chat"]["temperature"] == 0.7
+    assert profile["chat"]["enable_thinking"] is False
     assert profile["duplex"]["force_listen_count"] == 0
     assert profile["duplex"]["system_prompt"] == "Streaming Omni Conversation."
     assert "max_tokens" not in profile["chat"]
@@ -81,6 +82,8 @@ def test_invalid_profile_fails_closed() -> None:
         validate_runtime_profile({"chat": {"temperature": float("nan")}})
     with pytest.raises(ValueError, match="version"):
         validate_runtime_profile({"version": 2, "chat": {"top_p": 0.8}})
+    with pytest.raises(ValueError, match="boolean"):
+        validate_runtime_profile({"chat": {"enable_thinking": 0}})
 
 
 def test_metadata_key_is_versioned() -> None:

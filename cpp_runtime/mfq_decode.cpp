@@ -24852,7 +24852,6 @@ int main(int argc, char ** argv) {
         bool check_nintm_routed_input = false;
         bool tensor_parallel_test_duplicates = false;
         bool server_mode = false;
-        bool server_minicpmo_duplex = false;
         bool check_runtime_assets = false;
         bool check_mfq_container = false;
         bool minicpmo_duplex_greedy = false;
@@ -25034,9 +25033,6 @@ int main(int argc, char ** argv) {
                 cpu_threads_set = true;
             }
             else if (a == "--server") server_mode = true;
-            else if (a == "--minicpmo-duplex") {
-                server_minicpmo_duplex = true;
-            }
             else if (a == "--host" && i + 1 < argc) server_host = argv[++i];
             else if (a == "--port" && i + 1 < argc) server_port = std::stoi(argv[++i]);
             else if (a == "--ctx-size" && i + 1 < argc) context_size = std::stoll(argv[++i]);
@@ -25094,8 +25090,7 @@ int main(int argc, char ** argv) {
                              "--layer-parallel 0,1 --layer-split 1,1 "
                              "--n-gpu-layers 60 --threads 32 --cpu-offload-layers 0-7,12 --moe-gpu-cache-gb 8 "
                              "--moe-cache-profile profile.json "
-                             "--api-key key --sampling-profile profile.json "
-                             "--minicpmo-duplex] | --kl-base reference.bin "
+                             "--api-key key --sampling-profile profile.json] | --kl-base reference.bin "
                              "[--kl-evaluator optimized|legacy --kl-chunks -1 "
                              "--kl-score-count N --kl-n-batch N "
                              "--kl-reference-n-batch N "
@@ -25109,10 +25104,6 @@ int main(int argc, char ** argv) {
             parse_nint6_mmq_mode(nint6_mmq_arg);
         if (cpu_threads_set && cpu_threads <= 0) {
             throw std::runtime_error("--threads must be positive");
-        }
-        if (server_minicpmo_duplex && !server_mode) {
-            throw std::runtime_error(
-                "--minicpmo-duplex requires --server");
         }
         if (cpu_threads > 0) {
             at::set_num_threads(cpu_threads);
@@ -25460,7 +25451,7 @@ int main(int argc, char ** argv) {
                          "(--ids 1,2,3 --gen 128 | --minicpmo-eval-batch "
                          "[--minicpmo-eval-vision-batch-size 16] | --server "
                          "[--host 127.0.0.1 --port 8080 --ctx-size 32768 --model-name name "
-                         "--api-key key --minicpmo-duplex] | --kl-base reference.bin "
+                         "--api-key key] | --kl-base reference.bin "
                          "[--kl-evaluator optimized|legacy --kl-chunks -1 "
                          "--kl-score-count N --kl-n-batch N "
                          "--kl-reference-n-batch N "
@@ -25663,10 +25654,6 @@ int main(int argc, char ** argv) {
         auto t0 = std::chrono::steady_clock::now();
         Model model = load_model(mfq_path, config_path, context_size);
         std::optional<MiniCPMO45Runtime> server_minicpmo_runtime;
-        if (server_minicpmo_duplex && !model.c.is_minicpmo45()) {
-            throw std::runtime_error(
-                "--minicpmo-duplex requires a MiniCPM-o 4.5 model");
-        }
         if (server_mode && model.c.is_minicpmo45()) {
             server_minicpmo_runtime.emplace(
                 MiniCPMO45Runtime::load_with_language(
@@ -25719,7 +25706,7 @@ int main(int argc, char ** argv) {
             ServerTextSessionCache text_session_cache;
             std::optional<MiniCPMO45DuplexSession> minicpmo_duplex_session;
             MfqDuplexBackend duplex_backend;
-            if (server_minicpmo_duplex && server_minicpmo_runtime) {
+            if (server_minicpmo_runtime) {
                 duplex_backend = make_cuda_minicpmo45_duplex_backend(
                     *server_minicpmo_runtime,
                     model_mutex,

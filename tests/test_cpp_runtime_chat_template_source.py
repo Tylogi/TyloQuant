@@ -121,7 +121,7 @@ def test_webui_uses_the_bundled_server_origin() -> None:
 def test_dsv4_server_uses_exact_stable_prefix_kv_reuse() -> None:
     assert "MfqPromptCachePlan" in SERVER
     assert 'model_type == "deepseek_v4"' in SERVER
-    assert 'request_enable_thinking(body) ? "<think>" : "</think>"' in SERVER
+    assert 'work.sampling.enable_thinking ? "<think>" : "</think>"' in SERVER
     assert "stable_prefix_tokens" in SERVER
     assert '{"prefill_tokens", values.prefill_tokens}' in SERVER
 

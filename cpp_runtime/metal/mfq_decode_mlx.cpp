@@ -58,7 +58,6 @@ struct Arguments {
     bool list_tensors = false;
     bool self_test_metal = false;
     bool server = false;
-    bool minicpmo_duplex = false;
     bool predequantize_fp16 = false;
     std::string host = "127.0.0.1";
     int port = 8080;
@@ -142,8 +141,6 @@ Arguments parse_arguments(int argc, char** argv) {
             result.self_test_metal = true;
         } else if (value == "--server") {
             result.server = true;
-        } else if (value == "--minicpmo-duplex") {
-            result.minicpmo_duplex = true;
         } else if (value == "--metal-predequantize-f16") {
             result.predequantize_fp16 = true;
         } else if (value == "--host") {
@@ -224,7 +221,6 @@ void print_help() {
         << "  --benchmark-swiglu     fuse an even-width NINTM gate/up record\n"
         << "  --self-test-metal      execute an MLX C++ graph on Metal\n"
         << "  --server               run the native C++ OpenAI-compatible server\n"
-        << "  --minicpmo-duplex      enable the stateful MiniCPM-o media backend\n"
         << "  --metal-predequantize-f16\n"
         << "                          expand regular weights to FP16 at load time\n"
         << "  --host ADDRESS         server bind address (default 127.0.0.1)\n"
@@ -1048,8 +1044,7 @@ int serve_loaded_runtime(
     duplex.name = "metal";
     if constexpr (std::is_same_v<
             Runtime, mfq::metal::MlxMiniCPMO45Runtime>) {
-        if (arguments.minicpmo_duplex) {
-            duplex.start =
+        duplex.start =
                 [runtime_mutex, runtime_holder, runtime_stream](
                     const MfqDuplexSessionParams& parameters) {
                     if (parameters.special_ids.size() != 15) {
@@ -1245,7 +1240,6 @@ int serve_loaded_runtime(
                     mlx::core::clear_cache();
                     malloc_zone_pressure_relief(nullptr, 0);
                 };
-        }
     }
     MfqSessionControl session_control;
     session_control.fork =
@@ -1300,11 +1294,6 @@ int run_native_server(
         std::chrono::steady_clock::now();
     const auto& architecture =
         container.header().architecture;
-    if (arguments.minicpmo_duplex &&
-        architecture.rfind("minicpmo", 0) != 0) {
-        throw std::runtime_error(
-            "--minicpmo-duplex requires a MiniCPM-o model");
-    }
     if (architecture.rfind(
             "deepseek_v4",
             0) == 0) {
@@ -1397,7 +1386,7 @@ int run_native_server(
             mfq::metal::MlxMiniCPMO45Runtime::load(
                 container,
                 arguments.context_size,
-                arguments.server || arguments.minicpmo_duplex);
+                arguments.server);
         release_model_load_staging_memory();
         mlx::core::set_cache_limit(kMinicpmoDuplexCacheLimitBytes);
         const auto load_seconds = std::chrono::duration<double>(
@@ -1411,8 +1400,7 @@ int run_native_server(
             << std::endl;
         const auto load_runtime =
             [&container,
-             load_modalities = arguments.server ||
-                 arguments.minicpmo_duplex](
+             load_modalities = arguments.server](
                 std::int64_t requested_context) {
                 return mfq::metal::MlxMiniCPMO45Runtime::load(
                     container,
@@ -1475,9 +1463,6 @@ int main(int argc, char** argv) {
         if (arguments.help) {
             print_help();
             return EXIT_SUCCESS;
-        }
-        if (arguments.minicpmo_duplex && !arguments.server) {
-            usage_error("--minicpmo-duplex requires --server");
         }
         if (arguments.self_test_metal) {
             configure_mlx_metal();

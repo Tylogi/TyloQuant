@@ -53,14 +53,18 @@ def test_prefill_speed_uses_cuda_events_around_only_the_first_model_eval() -> No
     assert "prefill_timer.finished_event()" in RUNTIME
     assert "const int64_t token = next.item<int64_t>();" in RUNTIME
     assert "const double prefill_ms = prefill_timer.elapsed_ms();" in RUNTIME
-    assert "on_prefill(prompt.size(), prefill_ms);" in RUNTIME
+    assert "on_prefill(MfqPrefillTiming{" in RUNTIME
+    assert "prompt.size() - reused_tokens" in RUNTIME
 
     sample = RUNTIME.split("static torch::Tensor sample_server_token(", 1)[1]
     sample = sample.split("class ServerPrefillCudaTimer", 1)[0]
     logits = sample.index("auto logits = model.last_logits(ids)")
     finished = sample.index("cudaEventRecord(", logits)
-    penalties = sample.index("sample_apply_penalties_cuda(", logits)
-    assert logits < finished < penalties
+    sampling = sample.index("sample_server_logits(", logits)
+    assert logits < finished < sampling
+    sampler = RUNTIME.split("static torch::Tensor sample_server_logits(", 1)[1]
+    sampler = sampler.split("static torch::Tensor sample_server_token(", 1)[0]
+    assert "sample_apply_penalties_cuda(" in sampler
 
     first = RUNTIME.split("auto sample_first_token = [&]()", 1)[1]
     first = first.split("const char * reprefill_env", 1)[0]
