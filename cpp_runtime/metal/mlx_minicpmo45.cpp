@@ -1261,9 +1261,18 @@ array mini_gqa_attention(
     const bool hierarchical = hierarchical_setting != nullptr
         ? std::strcmp(hierarchical_setting, "0") != 0
         : sequence >= 1'024;
-    const int blocks = hierarchical
-        ? std::min(6, (sequence + 1'023) / 1'024)
+    // The hierarchical kernel has eight SIMD groups per block.  Keep enough
+    // blocks to occupy large Apple GPUs at the 1k crossover, then scale to 16
+    // by 4k.  More than 16 increases the final-reduction cost on M3 Ultra.
+    int blocks = hierarchical
+        ? std::clamp((sequence + 255) / 256, 8, 16)
         : std::min(48, (sequence + 127) / 128);
+    if (const auto* setting = std::getenv("MFQ_MINICPM_GQA_BLOCKS")) {
+        const int configured = std::atoi(setting);
+        if (configured > 0) {
+            blocks = std::min({configured, sequence, 64});
+        }
+    }
     const int tile = (sequence + blocks - 1) / blocks;
     const array partial_params(
         {sequence, capacity, blocks, tile},
