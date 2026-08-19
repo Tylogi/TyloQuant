@@ -76,13 +76,13 @@ inference begins.
 ## Text gateway
 
 `mfq serve` is the only public server entry point. It resolves the native
-runtime from the build manifest written by `mfq build`, starts that worker on a
-private loopback port, loads the requested model, and exposes the persistent MFQ
-Server API around it. A missing artifact is rebuilt from the recipe retained in
-the manifest:
+runtime from the build manifest written by `mfq build` and exposes the
+persistent MFQ Server API. The server may remain idle with no model, or it can
+start a requested model on a private loopback port. A missing native executable
+is rebuilt from the recipe retained in the manifest:
 
 ```bash
-mfq serve --model path/to/model.mfq --host 127.0.0.1 --port 8090
+mfq serve --host 127.0.0.1 --port 8090
 ```
 
 MFQ Server listens on `127.0.0.1:8090` by default. Users do not launch or manage
@@ -214,7 +214,8 @@ npm run dev
 ```
 
 For a same-origin local deployment, `mfq serve` builds and serves the client
-automatically. A prebuilt client can still be selected explicitly:
+automatically. It can start empty and load or switch models through the catalog.
+A prebuilt client can still be selected explicitly:
 
 ```bash
 npm run build

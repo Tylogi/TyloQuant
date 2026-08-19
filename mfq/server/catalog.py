@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,8 +12,10 @@ from time import monotonic
 
 from mfq.formats.assets import is_asset_record
 from mfq.formats.io import open_mmap
-from mfq.formats.shards import parse_shard_path
+from mfq.formats.shards import matching_shard_paths, parse_shard_path
 from mfq.server.models import ModelArtifactList, ModelArtifactResource
+
+MODEL_FILE_INDEX = ".mfq-files.json"
 
 
 class ModelArtifactNotFoundError(LookupError):
@@ -124,7 +127,8 @@ class ModelCatalog:
             if not root.is_dir():
                 continue
             grouped: dict[Path, list[Path]] = {}
-            for path in sorted(root.rglob("*.mfq")):
+            paths = {*root.rglob("*.mfq"), *self._registered_paths(root)}
+            for path in sorted(paths):
                 try:
                     parsed = parse_shard_path(path)
                 except ValueError:
@@ -139,7 +143,8 @@ class ModelCatalog:
                     ),
                     paths[0],
                 )
-                discovered = self._inspect(root, path)
+                privacy_root = root if path.is_relative_to(root) else path.parent
+                discovered = self._inspect(privacy_root, path)
                 canonical_path = self._canonical_model_path(discovered.path)
                 previous_path = model_paths.get(discovered.resource.name)
                 if previous_path is not None and previous_path != canonical_path:
@@ -150,6 +155,40 @@ class ModelCatalog:
                 previous = result.get(discovered.resource.id)
                 if previous is None or str(path) < str(previous.path):
                     result[discovered.resource.id] = discovered
+        return result
+
+    @staticmethod
+    def _registered_paths(root: Path) -> set[Path]:
+        index = root / MODEL_FILE_INDEX
+        try:
+            document = json.loads(index.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return set()
+        if not isinstance(document, dict) or document.get("version") != 1:
+            return set()
+        values = document.get("files")
+        if not isinstance(values, list):
+            return set()
+        result: set[Path] = set()
+        for value in values:
+            if not isinstance(value, str):
+                continue
+            path = Path(value).expanduser()
+            if path.suffix.casefold() != ".mfq":
+                continue
+            try:
+                resolved = path.resolve(strict=True)
+            except OSError:
+                continue
+            if resolved.is_file():
+                try:
+                    parsed = parse_shard_path(resolved)
+                except ValueError:
+                    continue
+                if parsed is None:
+                    result.add(resolved)
+                else:
+                    result.update(matching_shard_paths(parsed[0]))
         return result
 
     @staticmethod

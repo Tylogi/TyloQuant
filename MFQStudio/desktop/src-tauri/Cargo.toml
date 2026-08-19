@@ -13,6 +13,7 @@ tauri-build = { version = "2.6.3", features = [] }
 [dependencies]
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 keyring = "3.6.3"
+rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tauri = { version = "2.11.5", features = [] }

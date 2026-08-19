@@ -196,6 +196,7 @@ class ToolJobPaths:
     huggingface: Path | None
     runtime: Path | None
     perplexity: Path | None
+    standalone_cli: bool = False
 
 
 class ToolJobHandlers:
@@ -203,6 +204,13 @@ class ToolJobHandlers:
         self.catalog = catalog
         self.paths = paths
         self.root = paths.work_root.expanduser().resolve()
+
+    def _mfq_command(self, *arguments: str) -> list[str]:
+        command = [str(self.paths.python)]
+        if not self.paths.standalone_cli:
+            command.extend(["-m", "mfq.cli"])
+        command.extend(arguments)
+        return command
 
     def handlers(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -254,10 +262,7 @@ class ToolJobHandlers:
         resolved_backend = self._resolve_imatrix_backend(backend)
         resolved_device = device or ("mps" if resolved_backend == "metal" else "cuda:0")
         output.parent.mkdir(parents=True, exist_ok=True)
-        argv = [
-            str(self.paths.python),
-            "-m",
-            "mfq.cli",
+        argv = self._mfq_command(
             "calibrate",
             "imatrix",
             "--model",
@@ -282,7 +287,7 @@ class ToolJobHandlers:
             str(seed),
             "--accumulation-dtype",
             accumulation_dtype,
-        ]
+        )
         if work_dir is not None:
             work_dir.parent.mkdir(parents=True, exist_ok=True)
             argv.extend(["--work-dir", str(work_dir)])
@@ -538,10 +543,7 @@ class ToolJobHandlers:
         elif request.imatrix is not None:
             imatrix = self._input(request.imatrix)
             source_uris.append(self._artifact_uri(imatrix))
-        argv = [
-            str(self.paths.python),
-            "-m",
-            "mfq.cli",
+        argv = self._mfq_command(
             "quantize",
             str(source),
             str(output),
@@ -553,7 +555,7 @@ class ToolJobHandlers:
             request.backend,
             "--device",
             request.device,
-        ]
+        )
         for name in ("recipe", "scheme", "tokenizer", "sampling_profile"):
             value = getattr(request, name)
             if value is not None:

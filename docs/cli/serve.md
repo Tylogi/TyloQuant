@@ -1,8 +1,9 @@
 # `mfq serve`
 
-`mfq serve` starts the MFQ API and Web UI for one MFQ model. It owns the native
-worker lifecycle: MFQ selects the C++ executable, runs it on a private loopback
-port, and stops it with the application server.
+`mfq serve` starts the MFQ API and Web UI. It may start with an initial model or
+with an empty model catalog. MFQ owns every native worker lifecycle: it selects
+the C++ executable, runs workers on private loopback ports, and stops them with
+the application server.
 
 ## Quick start
 
@@ -17,14 +18,15 @@ On a CUDA host, use `uv sync --extra daemon --extra train` instead. Then start
 the server:
 
 ```shell
-uv run mfq serve --model /models/model.mfq
+uv run mfq serve
 ```
 
 The public server listens on `http://127.0.0.1:8090` by default. Stop it with
 `Ctrl-C`; MFQ then stops the private native worker as part of server shutdown.
 
-`--model` is the only required option. The value must point to an existing
-`.mfq` file.
+Open the model catalog in MFQ Studio or the Web UI to load a discovered model.
+Pass `--model /models/model.mfq` only when one model should be loaded before the
+server becomes available.
 
 The command must run through uv in the source checkout that contains the native
 runtime sources. MFQ derives that checkout from the installed Python package,
@@ -54,9 +56,11 @@ uses `<repo>/cpp_runtime` as its source and `<repo>/build/cpp_runtime` as its
 build directory. `--build-dir` changes only the CMake build tree; the manifest
 remains under `<repo>/build`.
 
-Users therefore do not pass the native executable to `mfq serve`. A custom
-directory selected earlier with `mfq build --build-dir` is resolved
-automatically.
+Normal source installations do not pass the native executable to `mfq serve`.
+A custom directory selected earlier with `mfq build --build-dir` is resolved
+automatically. Self-contained distributions use `--running-executable` to bind
+the packaged server to its bundled native worker without compiling or consulting
+a source-tree build manifest.
 
 ## Application and private listeners
 
@@ -148,9 +152,10 @@ uv run mfq serve --model /models/model.mfq --no-web-ui
 
 ## Model discovery and runtime pool
 
-The model passed through `--model` is loaded by the initial private worker. Its
-parent directory is also added to the model catalog. Add more discovery roots
-by repeating `--model-dir`:
+When present, the model passed through `--model` is loaded by the initial private
+worker and its parent directory is added to the model catalog. Without it, the
+server remains idle until a model is loaded through Studio, the Web UI, or the
+model-management API. Add discovery roots by repeating `--model-dir`:
 
 ```shell
 uv run mfq serve \
@@ -207,7 +212,8 @@ uv run mfq serve \
 
 | Option | Meaning | Default |
 | --- | --- | --- |
-| `--model PATH` | Initial MFQ model file. | Required |
+| `--model PATH` | Optional initial MFQ model file. | None |
+| `--running-executable PATH` | Prebuilt native worker used by packaged deployments. | Managed build |
 | `--host HOST` | Public API bind address. | `127.0.0.1` |
 | `--port PORT` | Public API port, from 1 to 65535. | `8090` |
 | `--context-size N` | Native context size; `0` keeps the runtime default. | `0` |
@@ -228,8 +234,8 @@ uv run mfq serve \
 
 ### The model file is rejected immediately
 
-`--model` must be an existing file. Check the path before debugging runtime or
-server startup.
+When supplied, `--model` must be an existing file. Check the path before
+debugging runtime or server startup.
 
 ### Native startup times out
 

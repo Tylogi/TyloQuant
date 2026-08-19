@@ -11,6 +11,9 @@ if(NOT MFQ_MLX_ROOT)
     endif()
 endif()
 
+set(MFQ_MLX_METALLIB_DEFAULT "${MFQ_MLX_ROOT}/lib/mlx.metallib" CACHE STRING
+    "Default mlx.metallib path embedded in the native Metal runtime; leave empty for relocatable packages")
+
 foreach(_MFQ_MLX_REQUIRED
         "${MFQ_MLX_ROOT}/include/mlx/mlx.h"
         "${MFQ_MLX_ROOT}/lib/libmlx.dylib"
@@ -188,7 +191,7 @@ target_link_libraries(mfq-metal-runtime PUBLIC
 target_compile_features(mfq-metal-runtime PUBLIC cxx_std_20)
 target_compile_definitions(mfq-metal-runtime PUBLIC
     MFQ_NATIVE_MLX_RUNTIME=1
-    MFQ_MLX_METALLIB_DEFAULT="${MFQ_MLX_ROOT}/lib/mlx.metallib"
+    MFQ_MLX_METALLIB_DEFAULT="${MFQ_MLX_METALLIB_DEFAULT}"
 )
 
 add_executable(mfq-decode-metal

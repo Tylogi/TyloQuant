@@ -564,6 +564,8 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
   .panel-heading p { display: none; }
 }
 .panel-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.panel-heading-actions { display: flex; align-items: center; gap: 8px; }
+.panel-heading-actions button { min-height: 28px; padding: 5px 9px; }
 .panel-heading h2 { margin: 0 0 3px; font-size: 14px; font-weight: 630; }
 .panel-heading p { color: var(--muted); letter-spacing: 0; text-transform: none; }
 .panel-heading b { color: #81563a; font-size: 10px; font-weight: 620; }

@@ -1,5 +1,7 @@
 #include "mlx_qwen35_linear_attention.h"
 
+#include "mlx_detached_copy.h"
+
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -431,10 +433,8 @@ MlxQwen35LinearAttentionBlock::snapshot_cache() const {
         throw std::runtime_error(
             "Qwen3.5 linear-attention cache is unavailable");
     }
-    auto convolution = mlx::core::astype(
-        *convolution_state_, convolution_state_->dtype(), true);
-    auto recurrent = mlx::core::astype(
-        *recurrent_state_, recurrent_state_->dtype(), true);
+    auto convolution = detached_copy(*convolution_state_);
+    auto recurrent = detached_copy(*recurrent_state_);
     mlx::core::eval(convolution, recurrent);
     return {
         std::move(convolution),
@@ -461,10 +461,8 @@ void MlxQwen35LinearAttentionBlock::restore_cache(
         throw std::runtime_error(
             "Qwen3.5 linear-attention cache snapshot topology mismatch");
     }
-    auto convolution = mlx::core::astype(
-        snapshot.convolution_state, mlx::core::float32, true);
-    auto recurrent = mlx::core::astype(
-        snapshot.recurrent_state, mlx::core::float32, true);
+    auto convolution = detached_copy(snapshot.convolution_state);
+    auto recurrent = detached_copy(snapshot.recurrent_state);
     mlx::core::eval(convolution, recurrent);
     convolution_state_ = std::move(convolution);
     recurrent_state_ = std::move(recurrent);

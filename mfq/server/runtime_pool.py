@@ -259,8 +259,11 @@ class ManagedRuntimePool:
             async with self._lock:
                 self._loading_model_names.discard(model_name)
             raise
-        avfoundation_video_library = self.executable.with_name(
-            "libmfq_avfoundation_video.dylib"
+        configured_video_library = os.environ.get("MFQ_AVFOUNDATION_VIDEO_LIBRARY")
+        avfoundation_video_library = (
+            Path(configured_video_library).expanduser().resolve()
+            if configured_video_library
+            else self.executable.with_name("libmfq_avfoundation_video.dylib")
         )
         backend = OpenAIChatBackend(
             f"http://127.0.0.1:{port}",
@@ -505,7 +508,16 @@ class ManagedRuntimePool:
     async def runtime_status(self) -> dict[str, Any]:
         backend = await self._current_backend()
         if backend is None:
-            raise BackendError("model_not_loaded", "no runtime is available")
+            return {
+                "runtime_state": "idle",
+                "model": None,
+                "active_requests": 0,
+                "total_requests": 0,
+                "failed_requests": 0,
+                "total_prompt_tokens": 0,
+                "total_completion_tokens": 0,
+                "reloading": False,
+            }
         status = dict(await backend.runtime_status())
         async with self._lock:
             instance = (
@@ -544,7 +556,7 @@ class ManagedRuntimePool:
     async def realtime_capabilities(self) -> dict[str, Any]:
         backend = await self._current_backend()
         if backend is None:
-            raise BackendError("model_not_loaded", "no runtime is available")
+            return {"available": False, "modes": []}
         return await backend.realtime_capabilities()
 
     async def reload_runtime(self, context_size: int) -> dict[str, Any]:

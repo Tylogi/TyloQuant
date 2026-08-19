@@ -48,6 +48,8 @@ import {
   StudioStatus,
   configureStudio,
   saveStudioCredential,
+  selectLocalModelFile,
+  startLocalStudio,
   studioCredential,
   studioStatus,
 } from "./studio";
@@ -1255,7 +1257,7 @@ export default function App() {
   const [hubResults, setHubResults] = useState<HubModelSummary[]>([]);
   const [hubModel, setHubModel] = useState<HubModelInfo | null>(null);
   const [runtimeLogs, setRuntimeLogs] = useState<RuntimeLogEntry[]>([]);
-  const [model, setModel] = useState("default");
+  const [model, setModel] = useState("");
   const [mode, setMode] = useState<SessionMode>("text");
   const [view, setView] = useState<ViewName>("chat");
   const [dashboardPage, setDashboardPage] = useState<DashboardPage>("overview");
@@ -1384,9 +1386,14 @@ export default function App() {
 
   const refreshRuntime = useCallback(async (quiet = true) => {
     try {
-      const [status, metricHistory, nextArtifacts, nextInstances, nextProfiles, nextJobs, nextLogs, nextKinds, nextLineage, nextDatasets, nextEvaluations, nextNodes] =
-        await Promise.all([
+      const [runtimeResults, management] = await Promise.all([
+        Promise.allSettled([
+          api.runtimeCapabilities(),
+          api.runtimeModels(),
           api.runtimeStatus(),
+          api.realtimeCapabilities(),
+        ]),
+        Promise.all([
           api.runtimeMetrics(200),
           api.modelArtifacts(),
           api.runtimeInstances(),
@@ -1398,8 +1405,31 @@ export default function App() {
           api.datasets(),
           api.evaluations(),
           api.remoteNodes(),
-        ]);
+        ]),
+      ]);
+      const [capabilityResult, modelResult, statusResult, realtimeResult] = runtimeResults;
+      const [metricHistory, nextArtifacts, nextInstances, nextProfiles, nextJobs, nextLogs, nextKinds, nextLineage, nextDatasets, nextEvaluations, nextNodes] = management;
+      if (capabilityResult.status === "fulfilled") {
+        setCapabilities(capabilityResult.value);
+        setModel(capabilityResult.value.model);
+      } else {
+        setCapabilities(null);
+      }
+      if (modelResult.status === "fulfilled") {
+        setModels(modelResult.value);
+        if (capabilityResult.status !== "fulfilled") {
+          setModel((current) => current || modelResult.value[0]?.id || "");
+        }
+      }
+      const status = statusResult.status === "fulfilled" ? statusResult.value : null;
       setRuntime(status);
+      if (realtimeResult.status === "fulfilled") {
+        setRealtime(realtimeResult.value);
+        setRealtimeAvailable(realtimeResult.value.available === true);
+      } else {
+        setRealtime(null);
+        setRealtimeAvailable(false);
+      }
       setArtifacts(nextArtifacts);
       setInstances(nextInstances);
       setRuntimeProfiles(nextProfiles);
@@ -1425,14 +1455,14 @@ export default function App() {
           .filter(Number.isFinite)
           .slice(-32),
       );
-      const request = status.last_request;
+      const request = status?.last_request;
       const requestId = String(request?.id ?? "");
       const decode = Number(request?.decode_tps);
       if (request && requestId && requestId !== lastMetricId.current && Number.isFinite(decode)) {
         lastMetricId.current = requestId;
         setMetricSeries((current) => [...current, decode].slice(-32));
       }
-      const currentContext = Number(status.max_context);
+      const currentContext = Number(status?.max_context);
       if (Number.isFinite(currentContext) && currentContext > 0) {
         setContextSize(Math.floor(currentContext));
       }
@@ -1597,7 +1627,10 @@ export default function App() {
     let current = true;
     async function initialize() {
       try {
-        const status = await studioStatus();
+        let status = await studioStatus();
+        if (status?.config.mode === "local" && !status.reachable) {
+          status = await startLocalStudio();
+        }
         if (status) {
           setApiBaseUrl(status.service_url);
           const token = await studioCredential();
@@ -2735,15 +2768,6 @@ export default function App() {
       setMessages([]);
       setActiveId(null);
       await refreshSessions();
-      const [nextCapabilities, nextModels] = await Promise.all([
-        api.runtimeCapabilities(),
-        api.runtimeModels(),
-      ]);
-      setCapabilities(nextCapabilities);
-      setModels(nextModels);
-      const nextRealtime = await api.realtimeCapabilities();
-      setRealtime(nextRealtime);
-      setRealtimeAvailable(nextRealtime.available === true);
       appliedModeTemplate.current = "";
       await refreshRuntime(false);
     } catch (cause) {
@@ -3007,6 +3031,37 @@ export default function App() {
     }
   }
 
+  async function chooseLocalModelFile() {
+    if (busy || studio?.config.mode !== "local") return;
+    setBusy(true);
+    try {
+      const registered = await selectLocalModelFile();
+      if (!registered) return;
+      const nextArtifacts = await api.modelArtifacts(true);
+      setArtifacts(nextArtifacts);
+      const artifact = nextArtifacts.find((item) => item.name === registered.name);
+      if (!artifact) {
+        throw new Error(tr("所选模型没有出现在本地目录中。", "The selected model was not registered in the local catalog."));
+      }
+      if (!artifact.loadable) {
+        throw new Error(artifact.error || tr("所选模型不完整或无法加载。", "The selected model is incomplete or cannot be loaded."));
+      }
+      const loaded = instances.some((item) => item.model === artifact.name && item.state !== "failed")
+        || runtime?.model === artifact.name;
+      if (!loaded) {
+        const accepted = await api.loadModel(artifact.name, contextSize);
+        setSelectedJobId(accepted.operation_id);
+      }
+      setDashboardPage("models");
+      setView("dashboard");
+      await refreshRuntime(false);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function saveRuntimeProfile() {
     const name = profileName.replace(/\s+/g, " ").trim();
     const artifact = artifacts.find((item) => item.name === runtime?.model);
@@ -3184,7 +3239,7 @@ export default function App() {
             })}
           </div>
         </details>
-        <div className="history-heading"><span>{tr("会话", "Sessions")}</span><div><button aria-label={tr("新会话", "New session")} onClick={() => void createSession()} title={tr("新会话", "New session")} type="button"><Icon name="plus" size={14} /></button><button aria-label={tr("清空当前角色会话", "Clear role sessions")} onClick={clearSessions} title={tr("清空当前角色会话", "Clear role sessions")} type="button"><Icon name="trash" size={14} /></button></div></div>
+        <div className="history-heading"><span>{tr("会话", "Sessions")}</span><div><button aria-label={tr("新会话", "New session")} disabled={!model} onClick={() => void createSession()} title={model ? tr("新会话", "New session") : tr("请先加载模型", "Load a model first")} type="button"><Icon name="plus" size={14} /></button><button aria-label={tr("清空当前角色会话", "Clear role sessions")} onClick={clearSessions} title={tr("清空当前角色会话", "Clear role sessions")} type="button"><Icon name="trash" size={14} /></button></div></div>
         <nav className="session-list" aria-label="Sessions">
           {loading && <span className="empty-note">{tr("加载中…", "Loading…")}</span>}
           {!loading && assistantSessions.length === 0 && <span className="empty-note">{tr("这个角色还没有会话", "No sessions for this role")}</span>}
@@ -3297,7 +3352,7 @@ export default function App() {
             {dashboardPage === "overview" && <PanelDeck labels={panelLabels} page="dashboard-overview" resetVersion={dashboardLayoutReset}>
               <div className="metric-grid" key="metrics"><article><span>Prefill</span><strong>{formatNumber(lastPrefill.tokensPerSecond, 1)}</strong><small>tokens / second</small></article><article><span>Decode</span><strong>{formatNumber(last?.decode_tps, 1)}</strong><small>tokens / second</small></article><article><span>TTFT</span><strong>{formatNumber(lastTtftMs, 1)}</strong><small>milliseconds</small></article><article><span>{tr("内存", "Memory")}</span><strong>{runtimeMemory ? `${formatNumber(runtimeMemory / 2 ** 30, 1)} GB` : "--"}</strong><small>{runtimeCache ? `${formatNumber(runtimeCache / 2 ** 30, 1)} GB cache` : tr("未上报缓存", "cache unavailable")}</small></article><article><span>{tr("任务", "Jobs")}</span><strong>{activeJobs.length}</strong><small>{formatNumber(runtime?.active_requests || 0)} active requests</small></article></div>
               <section className="dashboard-panel chart-panel" key="throughput"><div className="panel-heading"><div><h2>{tr("生成吞吐", "Decode throughput")}</h2><p>{tr("MFQ Server 保存的已完成请求", "Completed requests retained by MFQ Server")}</p></div><b>{formatNumber(last?.decode_tps, 1)} tok/s</b></div><RuntimeChart values={metricSeries} /></section>
-              <section className="dashboard-panel" key="runtime"><div className="panel-heading"><div><h2>Runtime</h2><p>{instances.length ? `${instances.length} ${tr("个托管实例", "managed instances")}` : tr("外部 Runtime", "External runtime")}</p></div></div><dl><div><dt>{tr("模型", "Model")}</dt><dd>{runtime?.model || model}</dd></div><div><dt>{tr("架构", "Architecture")}</dt><dd>{runtime?.model_type || "--"}</dd></div><div><dt>{tr("状态", "State")}</dt><dd>{runtime?.runtime_state || (runtime?.reloading ? "loading" : "ready")}</dd></div><div><dt>{tr("上下文", "Context")}</dt><dd>{formatNumber(runtime?.max_context)} / {formatNumber(runtime?.context_capacity)}</dd></div><div><dt>{tr("运行时间", "Uptime")}</dt><dd>{formatDuration(runtime?.uptime_seconds)}</dd></div><div><dt>{tr("失败请求", "Failed")}</dt><dd>{formatNumber(runtime?.failed_requests || 0)}</dd></div></dl><button className="panel-action" onClick={openSettings} type="button">{tr("调整上下文与推理设置", "Context and inference settings")}</button></section>
+              <section className="dashboard-panel" key="runtime"><div className="panel-heading"><div><h2>Runtime</h2><p>{instances.length ? `${instances.length} ${tr("个托管实例", "managed instances")}` : runtime?.model ? tr("外部 Runtime", "External runtime") : tr("尚未加载模型", "No model loaded")}</p></div></div><dl><div><dt>{tr("模型", "Model")}</dt><dd>{runtime?.model || model || "--"}</dd></div><div><dt>{tr("架构", "Architecture")}</dt><dd>{runtime?.model_type || "--"}</dd></div><div><dt>{tr("状态", "State")}</dt><dd>{runtime?.runtime_state || (runtime?.reloading ? "loading" : "unavailable")}</dd></div><div><dt>{tr("上下文", "Context")}</dt><dd>{formatNumber(runtime?.max_context)} / {formatNumber(runtime?.context_capacity)}</dd></div><div><dt>{tr("运行时间", "Uptime")}</dt><dd>{formatDuration(runtime?.uptime_seconds)}</dd></div><div><dt>{tr("失败请求", "Failed")}</dt><dd>{formatNumber(runtime?.failed_requests || 0)}</dd></div></dl><button className="panel-action" disabled={!runtime?.model} onClick={openSettings} type="button">{tr("调整上下文与推理设置", "Context and inference settings")}</button></section>
               <section className="dashboard-panel request-panel" key="request"><div className="panel-heading"><div><h2>{tr("最近请求性能", "Last request performance")}</h2><p>{last?.id || tr("还没有完成的请求", "No completed requests")}</p></div>{(last?.finish_reason || Number(runtime?.active_requests || 0) > 0) && <b>{last?.finish_reason || "Running"}</b>}</div><div className="request-stats"><div><span>{tr("输入", "Input")}</span><strong>{formatNumber(last?.prompt_tokens)}</strong><small>tokens</small></div><div><span>{tr("输出", "Output")}</span><strong>{formatNumber(last?.completion_tokens)}</strong><small>tokens</small></div><div><span>TTFT</span><strong>{formatNumber(lastTtftMs, 1)}</strong><small>ms</small></div><div><span>Prefill</span><strong>{formatNumber(lastPrefill.tokensPerSecond, 1)}</strong><small>{formatNumber(lastPrefill.milliseconds, 1)} ms</small></div><div><span>Decode</span><strong>{formatNumber(last?.decode_tps, 1)}</strong><small>{formatNumber(last?.decode_ms, 1)} ms</small></div><div><span>{tr("总耗时", "Total")}</span><strong>{formatNumber(lastGenerationMs, 1)}</strong><small>ms</small></div></div></section>
             </PanelDeck>}
             {dashboardPage === "cache" && <PanelDeck labels={panelLabels} page="dashboard-cache" resetVersion={dashboardLayoutReset}>
@@ -3305,7 +3360,7 @@ export default function App() {
               <section className="dashboard-panel profile-panel" key="profiles"><div className="panel-heading"><div><h2>{tr("运行配置档案", "Runtime profiles")}</h2><p>{tr("将加载参数和采样默认值绑定到模型产物", "Bind load and sampling defaults to a model artifact")}</p></div><b>{runtimeProfiles.length}</b></div><div className="profile-create"><input maxLength={64} onChange={(event) => setProfileName(event.target.value)} placeholder={tr("当前配置名称", "Current configuration name")} value={profileName} /><button disabled={busy || !profileName.trim() || !artifacts.some((item) => item.name === runtime?.model)} onClick={() => void saveRuntimeProfile()} type="button">{tr("保存当前配置", "Save current")}</button></div>{runtimeProfiles.length > 0 && <div className="profile-list">{runtimeProfiles.map((profile) => <div className={`profile-row ${profile.drifted ? "drifted" : ""}`} key={profile.id}><div><strong>{profile.name}</strong><small>{profile.load.context_size.toLocaleString()} ctx · {profile.load.prefill_chunk_size.toLocaleString()} chunk{profile.drifted ? ` · ${tr("模型已变化", "artifact changed")}` : ""}</small></div><button disabled={busy} onClick={() => void loadRuntimeProfile(profile)} type="button">{tr("加载", "Load")}</button><button aria-label={tr("删除配置档案", "Delete profile")} disabled={busy} onClick={() => void deleteRuntimeProfile(profile.id)} type="button"><Icon name="trash" size={14} /></button></div>)}</div>}</section>
             </PanelDeck>}
             {dashboardPage === "models" && <PanelDeck labels={panelLabels} page="dashboard-models" resetVersion={dashboardLayoutReset}>
-              <section className="dashboard-panel" key="catalog"><div className="panel-heading"><div><h2>{tr("模型目录", "Model catalog")}</h2></div><b>{artifacts.length}</b></div>{artifacts.length > 0 && <div className="model-list">{artifacts.slice(0, 8).map((item) => { const instance = instances.find((candidate) => candidate.model === item.name && candidate.state !== "failed"); const loaded = Boolean(instance) || item.name === runtime?.model; return <div className="model-row" key={item.id}><span className={loaded ? "model-state active" : item.loadable ? "model-state" : "model-state failed"} /><div><strong>{item.name}</strong><small>{item.architecture} · {item.shard_count} shards · {formatNumber(item.total_bytes / 2 ** 30, 1)} GB</small></div>{instance ? <button disabled={busy || instance.state === "busy"} onClick={() => void unloadInstance(instance.id)} type="button">{tr("卸载", "Unload")}</button> : loaded ? <em>{tr("已加载", "Loaded")}</em> : !item.loadable ? <em className="failed">{tr("不可用", "Invalid")}</em> : <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">{tr("加载", "Load")}</button>}</div>; })}</div>}</section>
+              <section className="dashboard-panel" key="catalog"><div className="panel-heading"><div><h2>{tr("模型目录", "Model catalog")}</h2></div><div className="panel-heading-actions">{studio?.config.mode === "local" && <button disabled={busy} onClick={() => void chooseLocalModelFile()} type="button">{tr("选择本地 MFQ", "Choose local MFQ")}</button>}<b>{artifacts.length}</b></div></div>{artifacts.length > 0 && <div className="model-list">{artifacts.slice(0, 8).map((item) => { const instance = instances.find((candidate) => candidate.model === item.name && candidate.state !== "failed"); const loaded = Boolean(instance) || item.name === runtime?.model; return <div className="model-row" key={item.id}><span className={loaded ? "model-state active" : item.loadable ? "model-state" : "model-state failed"} /><div><strong>{item.name}</strong><small>{item.architecture} · {item.shard_count} shards · {formatNumber(item.total_bytes / 2 ** 30, 1)} GB</small></div>{instance ? <button disabled={busy || instance.state === "busy"} onClick={() => void unloadInstance(instance.id)} type="button">{tr("卸载", "Unload")}</button> : loaded ? <em>{tr("已加载", "Loaded")}</em> : !item.loadable ? <em className="failed">{tr("不可用", "Invalid")}</em> : <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">{tr("加载", "Load")}</button>}</div>; })}</div>}</section>
               <section className="dashboard-panel" key="requests"><div className="panel-heading"><div><h2>{tr("最近请求", "Recent requests")}</h2></div></div>{requestHistory.length > 0 && <div className="request-table">{requestHistory.slice(0, 8).map((request) => <div className="request-row" key={request.id}><div><strong>{request.id}</strong><small>{request.completed_at ? new Date(request.completed_at * 1000).toLocaleTimeString() : request.endpoint || "completion"}</small></div><span>{formatNumber(request.prompt_tokens)} → {formatNumber(request.completion_tokens)}</span><b>{formatNumber(request.decode_tps, 1)} tok/s</b></div>)}</div>}</section>
               <section className="dashboard-panel" key="jobs"><div className="panel-heading"><div><h2>{tr("后台任务", "Background jobs")}</h2></div><b>{jobs.length}</b></div>{jobs.length > 0 && <div className="request-table">{jobs.slice(0, 8).map((job) => <div className="job-row" key={job.id}><div><strong>{job.kind}</strong><small>{new Date(job.updated_at).toLocaleTimeString()} · {job.status}</small></div><progress max={1} value={job.progress} /><b>{formatNumber(job.progress * 100)}%</b></div>)}</div>}</section>
               <section className="dashboard-panel" key="logs"><div className="panel-heading"><div><h2>{tr("Runtime 日志", "Runtime logs")}</h2></div><b>{runtimeLogs.length}</b></div>{runtimeLogs.length > 0 && <div className="runtime-log-list">{runtimeLogs.slice(-8).reverse().map((entry) => <div className={`runtime-log ${entry.level}`} key={entry.sequence}><span>{new Date(entry.created_at).toLocaleTimeString()}</span><p>{entry.message}</p></div>)}</div>}</section>

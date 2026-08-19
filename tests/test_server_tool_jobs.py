@@ -24,6 +24,30 @@ def test_cli_preserves_the_active_environment_entry_point_directory(tmp_path: Pa
     assert _console_script_dir(executable) == executable.parent
 
 
+def test_standalone_cli_jobs_reinvoke_the_unified_mfq_binary(tmp_path: Path) -> None:
+    catalog = ModelCatalog([tmp_path])
+    executable = tmp_path / "mfq"
+    handlers = ToolJobHandlers(
+        catalog,
+        ToolJobPaths(
+            tmp_path,
+            executable,
+            None,
+            None,
+            None,
+            None,
+            standalone_cli=True,
+        ),
+    )
+
+    assert handlers._mfq_command("quantize", "input", "output") == [
+        str(executable),
+        "quantize",
+        "input",
+        "output",
+    ]
+
+
 def _executable(path: Path, source: str) -> Path:
     path.write_text(textwrap.dedent(source), encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)

@@ -1,5 +1,7 @@
 #include "mlx_transformer.h"
 
+#include "mlx_detached_copy.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -571,10 +573,8 @@ MlxKvCacheSnapshot MlxKvCache::snapshot() const {
             "cannot snapshot an empty or inconsistent KV cache");
     }
     auto visible = view();
-    auto key = mlx::core::astype(
-        visible.first, dtype_, true);
-    auto value = mlx::core::astype(
-        visible.second, dtype_, true);
+    auto key = detached_copy(visible.first);
+    auto value = detached_copy(visible.second);
     mlx::core::eval(key, value);
     return MlxKvCacheSnapshot{
         batch_,
@@ -609,12 +609,12 @@ void MlxKvCache::restore_snapshot(
     auto value = mlx::core::zeros(allocation_shape, dtype_);
     key = mlx::core::slice_update(
         key,
-        mlx::core::astype(snapshot.key, dtype_, true),
+        detached_copy(snapshot.key),
         Shape{0, 0, 0, 0},
         Shape{batch_, heads_, snapshot.position, head_dimension_});
     value = mlx::core::slice_update(
         value,
-        mlx::core::astype(snapshot.value, dtype_, true),
+        detached_copy(snapshot.value),
         Shape{0, 0, 0, 0},
         Shape{batch_, heads_, snapshot.position, head_dimension_});
     mlx::core::eval(key, value);

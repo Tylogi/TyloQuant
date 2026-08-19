@@ -37,18 +37,23 @@ def test_assistant_markdown_recovers_fully_escaped_structural_line_breaks():
     assert "hasEscapedMarkdownStructure" in MARKDOWN_TEXT
 
 
-def test_studio_connects_to_the_server_without_starting_a_private_entry_point():
+def test_studio_starts_the_unified_local_server_and_bundled_runtime():
     assert 'Some("mfq-server")' in RUST
-    assert "std::process::Command" not in RUST
-    assert "studio_start_local" not in RUST
-    assert "mfq.server.cli" not in RUST
+    assert "Command::new" in RUST
+    assert "studio_start_local" in RUST
+    assert '.arg("serve")' in RUST
+    assert 'command.arg("--running-executable")' in RUST
+    assert "MFQ_MLX_METALLIB" in RUST
+    assert "MFQ_AVFOUNDATION_VIDEO_LIBRARY" in RUST
 
 
 def test_studio_supports_local_and_remote_server_connections_with_voice_controls():
     assert "RuntimeMode::Local" in RUST
     assert "RuntimeMode::Remote" in RUST
     assert "studio_configure" in RUST
-    assert "studio_start_local" not in RUST
+    assert "studio_start_local" in RUST
+    assert "studio_select_model_file" in RUST
+    assert "selectLocalModelFile" in APP
     assert "Object.keys(MODE_LABELS)" not in APP
     assert "RealtimeAudioController" in APP
     assert '(["text", "voice", "full_duplex"] as SessionMode[])' in APP

@@ -64,6 +64,19 @@ def test_serve_exposes_public_host_and_port_options(tmp_path: Path) -> None:
     assert args.port == 9001
 
 
+def test_serve_accepts_an_empty_initial_model_catalog() -> None:
+    args = _build_parser().parse_args(["serve"])
+
+    assert args.model is None
+
+
+def test_serve_accepts_a_prebuilt_native_runtime(tmp_path: Path) -> None:
+    executable = tmp_path / "mfq-decode-metal"
+    executable.write_bytes(b"runtime")
+
+    assert _resolve_runtime_executable("metal", executable) == executable.resolve()
+
+
 def test_serve_uses_the_runtime_recorded_by_mfq_build(tmp_path: Path, monkeypatch) -> None:
     executable = tmp_path / "custom" / "metal" / "mfq-decode-metal"
     executable.parent.mkdir(parents=True)
@@ -212,3 +225,39 @@ def test_serve_can_disable_web_ui_build(monkeypatch) -> None:
     )
 
     assert _prepare_web_root(None, disabled=True) is None
+
+
+def test_serve_starts_without_loading_an_initial_model(tmp_path: Path, monkeypatch) -> None:
+    executable = tmp_path / "mfq-decode-metal"
+    executable.write_bytes(b"runtime")
+    args = _build_parser().parse_args(
+        [
+            "serve",
+            "--no-web-ui",
+            "--backend",
+            "metal",
+            "--running-executable",
+            str(executable),
+            "--db",
+            str(tmp_path / "server.sqlite3"),
+            "--model-dir",
+            str(tmp_path / "models"),
+            "--work-dir",
+            str(tmp_path / "work"),
+        ]
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "mfq.server.native.NativeRuntime.start",
+        lambda _: (_ for _ in ()).throw(AssertionError("must not start a model runtime")),
+    )
+
+    def run(app, **options):
+        captured["app"] = app
+        captured.update(options)
+
+    monkeypatch.setattr("uvicorn.run", run)
+
+    assert _run(args) == 0
+    assert captured["host"] == "127.0.0.1"
+    assert captured["port"] == 8090

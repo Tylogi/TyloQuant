@@ -102,6 +102,11 @@ minicpmo45-realtime = [
 mfq = "mfq.cli:main"
 mfq-minicpmo-realtime = "mfq.runtime.minicpmo45_realtime:main"
 
+[dependency-groups]
+release = [
+    "pyinstaller==6.21.0",
+]
+
 [project.urls]
 Repository = "https://github.com/mfq/mfq"
 

@@ -6,12 +6,13 @@ import argparse
 import asyncio
 import math
 import os
+import platform
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from mfq.commands.build import build_runtime, detect_backend, load_managed_build
+from mfq.commands.build import BuildError, build_runtime, detect_backend, load_managed_build
 
 
 def _positive_int(value: str) -> int:
@@ -111,7 +112,18 @@ def _prepare_web_root(configured: Path | None, *, disabled: bool) -> Path | None
     return output
 
 
-def _resolve_runtime_executable(backend: str) -> Path:
+def _resolve_runtime_executable(
+    backend: str,
+    configured: Path | None = None,
+) -> Path:
+    if configured is not None:
+        executable = configured.expanduser().resolve()
+        if not executable.is_file():
+            raise FileNotFoundError(
+                f"--running-executable does not exist or is not a file: {executable}"
+            )
+        print(f"Using configured native runtime: {executable}", flush=True)
+        return executable
     managed = load_managed_build(backend)
     if managed is not None and managed.executable.is_file():
         print(f"Using managed native runtime: {managed.executable}", flush=True)
@@ -129,6 +141,38 @@ def _resolve_runtime_executable(backend: str) -> Path:
             cmake_args=managed.cmake_args,
         )
     return build_runtime(backend=backend)
+
+
+def _select_backend(requested: str, running_executable: Path | None) -> str:
+    if running_executable is None:
+        return detect_backend(requested)
+    system = platform.system()
+    machine = platform.machine().lower()
+    if requested == "auto":
+        if system == "Darwin" and machine in {"arm64", "aarch64"}:
+            return "metal"
+        if system in {"Linux", "Windows"}:
+            return "cuda"
+        raise BuildError(f"no prebuilt MFQ runtime backend is supported on {system} {machine}")
+    if requested == "metal":
+        if system != "Darwin" or machine not in {"arm64", "aarch64"}:
+            raise BuildError("the Metal runtime requires Apple silicon and macOS")
+        return "metal"
+    if requested == "cuda":
+        if system not in {"Linux", "Windows"}:
+            raise BuildError("the CUDA runtime is supported on Linux and Windows")
+        return "cuda"
+    raise BuildError(f"unsupported inference backend: {requested}")
+
+
+def _avfoundation_video_library(executable: Path) -> Path | None:
+    configured = os.environ.get("MFQ_AVFOUNDATION_VIDEO_LIBRARY")
+    candidate = (
+        Path(configured).expanduser().resolve()
+        if configured
+        else executable.with_name("libmfq_avfoundation_video.dylib")
+    )
+    return candidate if candidate.is_file() else None
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -149,58 +193,53 @@ def _run(args: argparse.Namespace) -> int:
     from mfq.server.storage import SessionStore
     from mfq.server.tool_jobs import ToolJobHandlers, ToolJobPaths
 
-    model = args.model.expanduser().resolve()
-    if not model.is_file():
+    model = args.model.expanduser().resolve() if args.model is not None else None
+    if model is not None and not model.is_file():
         raise FileNotFoundError(model)
     web_root = _prepare_web_root(args.web_root, disabled=args.no_web_ui)
-    selected_backend = detect_backend(args.backend)
-    executable = _resolve_runtime_executable(selected_backend)
+    selected_backend = _select_backend(args.backend, args.running_executable)
+    executable = _resolve_runtime_executable(selected_backend, args.running_executable)
     configured_roots = [path.expanduser().resolve() for path in args.model_dir]
     if not configured_roots:
         configured_roots = _environment_paths("MFQ_SERVER_MODEL_DIRS")
-    if model.parent not in configured_roots:
+    if model is not None and model.parent not in configured_roots:
         configured_roots.append(model.parent)
     catalog = ModelCatalog(configured_roots)
-    initial_artifact = asyncio.run(catalog.resolve_path(model))
-    runtime = NativeRuntime(
-        executable=executable,
-        model=model,
-        model_name=initial_artifact.resource.name,
-        backend=selected_backend,
-        context_size=args.context_size,
-        prefill_chunk_size=args.prefill_chunk_size,
-        startup_timeout=args.runtime_startup_timeout,
-    )
+    runtime = None
     try:
-        runtime.start()
-        if runtime.process is None or runtime.port is None:
-            raise RuntimeError("initial native runtime did not expose its process and port")
-        avfoundation_video_library = executable.with_name(
-            "libmfq_avfoundation_video.dylib"
-        )
-        external_backend = OpenAIChatBackend(
-            runtime.base_url,
-            local_tensor_files=True,
-            avfoundation_video_library=(
-                avfoundation_video_library
-                if avfoundation_video_library.is_file()
-                else None
-            ),
-        )
         runtime_manager = ManagedRuntimePool(
             catalog,
             executable,
+            startup_timeout_seconds=args.runtime_startup_timeout,
             max_instances=args.max_runtime_instances,
             max_requests_per_instance=args.max_requests_per_runtime,
             backend=selected_backend,
         )
-        runtime_manager.register_started(
-            artifact=initial_artifact,
-            process=runtime.process,
-            backend=external_backend,
-            port=runtime.port,
-            context_size=args.context_size,
-        )
+        if model is not None:
+            initial_artifact = asyncio.run(catalog.resolve_path(model))
+            runtime = NativeRuntime(
+                executable=executable,
+                model=model,
+                model_name=initial_artifact.resource.name,
+                backend=selected_backend,
+                context_size=args.context_size,
+                prefill_chunk_size=args.prefill_chunk_size,
+                startup_timeout=args.runtime_startup_timeout,
+            )
+            runtime.start()
+            if runtime.process is None or runtime.port is None:
+                raise RuntimeError("initial native runtime did not expose its process and port")
+            runtime_manager.register_started(
+                artifact=initial_artifact,
+                process=runtime.process,
+                backend=OpenAIChatBackend(
+                    runtime.base_url,
+                    local_tensor_files=True,
+                    avfoundation_video_library=_avfoundation_video_library(executable),
+                ),
+                port=runtime.port,
+                context_size=args.context_size,
+            )
         store = SessionStore(args.db.expanduser().resolve())
         backend = ClusterBackend(runtime_manager, store)
         binary_dir = _console_script_dir(sys.executable)
@@ -216,6 +255,7 @@ def _run(args: argparse.Namespace) -> int:
                 huggingface=(binary_dir / "hf") if (binary_dir / "hf").is_file() else None,
                 runtime=executable,
                 perplexity=perplexity if perplexity.is_file() else None,
+                standalone_cli=bool(getattr(sys, "frozen", False)),
             ),
         )
         jobs = JobManager(store, handlers.handlers())
@@ -241,20 +281,26 @@ def _run(args: argparse.Namespace) -> int:
             log_level=args.log_level,
         )
     finally:
-        runtime.stop()
+        if runtime is not None:
+            runtime.stop()
     return 0
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser(
         "serve",
-        help="build the native runtime and start the MFQ inference server",
+        help="start the MFQ inference server and optionally load a model",
         description=(
-            "Build the native runtime for this machine, load one MFQ model, and expose "
-            "the MFQ API and Web UI. The native worker is private and managed by this command."
+            "Resolve the native runtime for this machine and expose the MFQ API and Web UI. "
+            "An initial MFQ model is optional; additional models can be loaded through the API."
         ),
     )
-    parser.add_argument("--model", required=True, type=Path)
+    parser.add_argument("--model", type=Path, help="optional MFQ model to load at startup")
+    parser.add_argument(
+        "--running-executable",
+        type=Path,
+        help="prebuilt native runtime executable; skips managed runtime lookup and compilation",
+    )
     parser.add_argument(
         "--host",
         default="127.0.0.1",

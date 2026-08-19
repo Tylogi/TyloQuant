@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import stat
 import subprocess
 import sys
@@ -121,6 +122,120 @@ def test_catalog_validates_complete_and_incomplete_shards(tmp_path: Path) -> Non
         assert not incomplete.data[0].loadable
         assert "missing MFQ shard" in (incomplete.data[0].error or "")
         assert str(model_dir) not in incomplete.model_dump_json()
+
+    asyncio.run(run())
+
+
+def test_catalog_loads_registered_external_mfq_files(tmp_path: Path) -> None:
+    async def run() -> None:
+        model_dir = tmp_path / "catalog"
+        model_dir.mkdir()
+        external_dir = tmp_path / "external"
+        external_dir.mkdir()
+        external = external_dir / "portable.mfq"
+        _model(external, architecture="qwen35")
+        (model_dir / ".mfq-files.json").write_text(
+            json.dumps({"version": 1, "files": [str(external)]}),
+            encoding="utf-8",
+        )
+
+        catalog = ModelCatalog([model_dir], cache_seconds=0)
+        artifacts = await catalog.list()
+
+        assert [artifact.name for artifact in artifacts.data] == ["portable"]
+        assert artifacts.data[0].architecture == "qwen35"
+        assert artifacts.data[0].loadable
+
+    asyncio.run(run())
+
+
+def test_catalog_expands_registered_external_shard_set(tmp_path: Path) -> None:
+    async def run() -> None:
+        source = tmp_path / "source.mfq"
+        _model(source, architecture="qwen35")
+        external_dir = tmp_path / "external"
+        external_dir.mkdir()
+        shards = split_mfq(source, external_dir / "portable.mfq", split_max_tensors=1)
+        model_dir = tmp_path / "catalog"
+        model_dir.mkdir()
+        (model_dir / ".mfq-files.json").write_text(
+            json.dumps({"version": 1, "files": [str(shards[1])]}),
+            encoding="utf-8",
+        )
+
+        catalog = ModelCatalog([model_dir], cache_seconds=0)
+        artifacts = await catalog.list()
+
+        assert [artifact.name for artifact in artifacts.data] == ["portable"]
+        assert artifacts.data[0].complete
+        assert artifacts.data[0].loadable
+        assert artifacts.data[0].shard_count == 2
+
+    asyncio.run(run())
+
+
+def test_empty_runtime_pool_reports_idle_state(tmp_path: Path) -> None:
+    async def run() -> None:
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        pool = ManagedRuntimePool(ModelCatalog([model_dir]), tmp_path / "runtime")
+
+        assert await pool.runtime_status() == {
+            "runtime_state": "idle",
+            "model": None,
+            "active_requests": 0,
+            "total_requests": 0,
+            "failed_requests": 0,
+            "total_prompt_tokens": 0,
+            "total_completion_tokens": 0,
+            "reloading": False,
+        }
+        assert await pool.realtime_capabilities() == {"available": False, "modes": []}
+
+    asyncio.run(run())
+
+
+def test_empty_runtime_pool_keeps_management_api_available(tmp_path: Path) -> None:
+    async def run() -> None:
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        catalog = ModelCatalog([model_dir], cache_seconds=0)
+        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+        service = ServerService(
+            SessionStore(tmp_path / "mfq.server.sqlite3"),
+            pool,
+            catalog=catalog,
+            runtime_manager=pool,
+        )
+        transport = httpx.ASGITransport(app=create_app(service))
+        try:
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                health = await client.get("/health")
+                assert health.status_code == 200
+                assert health.json()["service"] == "mfq-server"
+
+                models = await client.get("/api/v1/models")
+                assert models.status_code == 200
+                assert models.json()["data"] == []
+
+                runtime_models = await client.get("/api/v1/runtime/models")
+                assert runtime_models.status_code == 200
+                assert runtime_models.json() == {"object": "list", "data": []}
+
+                status = await client.get("/api/v1/runtime/status")
+                assert status.status_code == 200
+                assert status.json()["runtime_state"] == "idle"
+                assert status.json()["model"] is None
+
+                realtime = await client.get("/api/v1/runtime/realtime/capabilities")
+                assert realtime.status_code == 200
+                assert realtime.json() == {"available": False, "modes": []}
+
+                capabilities = await client.get("/api/v1/runtime/capabilities")
+                assert capabilities.status_code == 503
+                assert capabilities.json()["error"]["code"] == "model_not_loaded"
+        finally:
+            await service.aclose()
 
     asyncio.run(run())
 

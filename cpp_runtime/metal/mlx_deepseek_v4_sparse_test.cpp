@@ -1,5 +1,7 @@
 #include "mlx_deepseek_v4_sparse.h"
 
+#include "mlx_detached_copy.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -528,10 +530,7 @@ void test_fixed_cache_snapshot_copy() {
         Shape{1, 4, 2},
         mlx::core::float16);
     cache.eval();
-    auto snapshot = mlx::core::astype(
-        cache,
-        cache.dtype(),
-        true);
+    auto snapshot = mfq::metal::detached_copy(cache);
     snapshot.eval();
     require(
         snapshot.buffer().ptr() != cache.buffer().ptr(),

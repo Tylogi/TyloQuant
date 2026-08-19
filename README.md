@@ -158,11 +158,13 @@ uv run mfq quantize model-bf16.gguf model-IN.mfq \
 
 ## Web UI
 
-`mfq serve` builds or updates the runtime when needed, loads the model, and
-starts the API and Web UI. It is the only server entry point; the native C++
-worker stays private and is managed by the CLI:
+`mfq serve` builds or updates the runtime when needed and starts the API and Web
+UI. It is the only server entry point; the native C++ worker stays private and
+is managed by the CLI. Start empty and load a model from the catalog, or provide
+an initial model on the command line:
 
 ```shell
+uv run mfq serve
 uv run mfq serve --model path/to/model.mfq --host 127.0.0.1 --port 8090
 ```
 
@@ -226,6 +228,8 @@ sampling-penalty kernels remain GPU-resident.
 
 - [MiniCPM-o 4.5 Python Runtime](./docs/minicpmo45.md)
 - [Expert-Wise Joint Budget Solver](./docs/ew-joint-solver.md)
+- [`mfq serve` and model management](./docs/cli/serve.md)
+- [Self-contained macOS release](./docs/release-macos.md)
 
 ## Acknowledgements
 
