@@ -104,6 +104,10 @@ public:
     // writes the new K/V row directly into the persistent Metal allocation.
     void reserve_append(int tokens);
 
+    // Discard an appended speculative suffix. Storage is intentionally kept;
+    // the next append overwrites the now-invisible rows.
+    void trim(int tokens);
+
     std::pair<mlx::core::array, mlx::core::array> view() const;
 
     // Session snapshots own a compact copy of the visible prefix. Restoring

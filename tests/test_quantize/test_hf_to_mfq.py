@@ -163,6 +163,101 @@ def test_qwen35_mtp_hf_to_gguf_name_mapping(name, gguf_name):
     assert _hf_to_gguf_name(name) == gguf_name
 
 
+def test_qwen35_mtp_mapping_uses_dynamic_backbone_layer_count():
+    assert _hf_to_gguf_name(
+        "mtp.fc.weight", mtp_layer_index=64
+    ) == "blk.64.nextn.eh_proj.weight"
+    assert _hf_to_gguf_name(
+        "mtp.layers.0.self_attn.o_proj.weight",
+        mtp_layer_index=64,
+    ) == "blk.64.attn_output.weight"
+
+
+def test_qwen35_mtp_inventory_is_all_or_nothing():
+    names = set(hf_to_mfq._MTP_PROTECTED_TENSORS)
+    prefix = "mtp.layers.0."
+    names.update(
+        {
+            prefix + "input_layernorm.weight",
+            prefix + "post_attention_layernorm.weight",
+            prefix + "self_attn.q_proj.weight",
+            prefix + "self_attn.k_proj.weight",
+            prefix + "self_attn.v_proj.weight",
+            prefix + "self_attn.o_proj.weight",
+            prefix + "self_attn.q_norm.weight",
+            prefix + "self_attn.k_norm.weight",
+            prefix + "mlp.gate_proj.weight",
+            prefix + "mlp.up_proj.weight",
+            prefix + "mlp.down_proj.weight",
+        }
+    )
+    inventory = {name: None for name in names}
+    assert hf_to_mfq._mtp_inventory_status(
+        inventory, {"mtp_num_hidden_layers": 1}
+    ) == (True, 1)
+
+    inventory.pop("mtp.fc.weight")
+    with pytest.raises(ValueError, match="incomplete Qwen MTP head"):
+        hf_to_mfq._mtp_inventory_status(
+            inventory, {"mtp_num_hidden_layers": 1}
+        )
+
+
+def test_qwen35_mtp_plan_preserves_complete_head_and_protected_weights(tmp_path):
+    names = set(hf_to_mfq._MTP_PROTECTED_TENSORS)
+    prefix = "mtp.layers.0."
+    names.update(
+        {
+            prefix + "input_layernorm.weight",
+            prefix + "post_attention_layernorm.weight",
+            prefix + "self_attn.q_proj.weight",
+            prefix + "self_attn.k_proj.weight",
+            prefix + "self_attn.v_proj.weight",
+            prefix + "self_attn.o_proj.weight",
+            prefix + "self_attn.q_norm.weight",
+            prefix + "self_attn.k_norm.weight",
+            prefix + "mlp.gate_proj.weight",
+            prefix + "mlp.up_proj.weight",
+            prefix + "mlp.down_proj.weight",
+        }
+    )
+    inventory = {}
+    for name in names:
+        is_norm = "norm" in name
+        shape = (4,) if is_norm else ((4, 8) if name == "mtp.fc.weight" else (4, 4))
+        inventory[name] = hf_to_mfq.SourceTensorMetadata(
+            name=name,
+            shard="model.safetensors",
+            shape=shape,
+            dtype="F32" if is_norm else "BF16",
+        )
+
+    plan = build_hf_plan(
+        tmp_path,
+        text_only=True,
+        recipe_types={},
+        dense_dtype="F16",
+        source_inventory=inventory,
+        source_config={
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "num_hidden_layers": 64,
+                "mtp_num_hidden_layers": 1,
+            }
+        },
+    )
+
+    by_name = {item.name: item for item in plan}
+    assert set(by_name) == names
+    assert by_name["mtp.fc.weight"].target_dtype == "BF16"
+    assert by_name["mtp.pre_fc_norm_hidden.weight"].target_dtype == "F32"
+    assert by_name[prefix + "self_attn.q_proj.weight"].target_dtype == "NINT4"
+    assert (
+        by_name[prefix + "self_attn.q_proj.weight"].gguf_name
+        == "blk.64.attn_q.weight"
+    )
+
+
 def test_recipe_dense_types_preserve_bf16_separately_from_f16():
     assert _dtype_for_recipe_type("F32", "F32") == "F32"
     assert _dtype_for_recipe_type("F32", "F16") == "F32"

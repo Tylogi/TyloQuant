@@ -1432,7 +1432,8 @@ int run_native_server(
     std::cout
         << "Loaded " << runtime.layer_count()
         << " Qwen3.5 layers in "
-        << load_seconds << " s"
+        << load_seconds << " s; native_mtp="
+        << (runtime.supports_mtp() ? "greedy" : "disabled")
         << std::endl;
     const auto load_runtime =
         [&container](std::int64_t) {

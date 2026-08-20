@@ -126,6 +126,205 @@ detail::qwen35_generation_token_counts(
         prompt_ids);
 }
 
+std::optional<MlxQwen35MtpModule>
+MlxQwen35MtpModule::load_if_present(
+    const MfqContainer& model,
+    const Qwen35Config& config,
+    const Qwen35TensorNames& names) {
+    const auto base = static_cast<std::size_t>(
+        std::max<std::int64_t>(0, config.num_hidden_layers));
+    const std::string gguf_prefix =
+        "blk." + std::to_string(base) + ".nextn.";
+    const bool hf_layout = model.contains("mtp.fc.weight");
+    const bool gguf_layout = model.contains(
+        gguf_prefix + "eh_proj.weight");
+    bool has_any = false;
+    for (const auto& [name, _record] : model.records()) {
+        if (name.starts_with("mtp.") ||
+            name.starts_with(gguf_prefix) ||
+            name.starts_with("blk." + std::to_string(base) + ".")) {
+            has_any = true;
+            break;
+        }
+    }
+    if (!hf_layout && !gguf_layout) {
+        if (has_any) {
+            throw std::runtime_error(
+                "Qwen3.5 MFQ contains an incomplete MTP head");
+        }
+        return std::nullopt;
+    }
+    if (hf_layout == gguf_layout) {
+        throw std::runtime_error(
+            "Qwen3.5 MFQ has ambiguous MTP tensor layouts");
+    }
+    if (config.mtp_num_hidden_layers <= 0) {
+        throw std::runtime_error(
+            "Qwen3.5 MFQ contains MTP tensors but the model config "
+            "does not advertise an MTP layer");
+    }
+    if (config.mtp_use_dedicated_embeddings) {
+        throw std::runtime_error(
+            "Qwen3.5 dedicated MTP embeddings are not supported");
+    }
+
+    Qwen35Config mtp_config = config;
+    Qwen35TensorNames mtp_names = names;
+    std::size_t first_layer = 0;
+    if (hf_layout) {
+        mtp_config.num_hidden_layers = config.mtp_num_hidden_layers;
+        mtp_config.layer_types.assign(
+            static_cast<std::size_t>(config.mtp_num_hidden_layers),
+            "full_attention");
+        mtp_names.attention_norm =
+            "mtp.layers.{i}.input_layernorm.weight";
+        mtp_names.attention_query =
+            "mtp.layers.{i}.self_attn.q_proj.weight";
+        mtp_names.attention_key =
+            "mtp.layers.{i}.self_attn.k_proj.weight";
+        mtp_names.attention_value =
+            "mtp.layers.{i}.self_attn.v_proj.weight";
+        mtp_names.attention_output =
+            "mtp.layers.{i}.self_attn.o_proj.weight";
+        mtp_names.attention_query_norm =
+            "mtp.layers.{i}.self_attn.q_norm.weight";
+        mtp_names.attention_key_norm =
+            "mtp.layers.{i}.self_attn.k_norm.weight";
+        mtp_names.ffn_norm =
+            "mtp.layers.{i}.post_attention_layernorm.weight";
+        mtp_names.ffn_gate =
+            "mtp.layers.{i}.mlp.gate_proj.weight";
+        mtp_names.ffn_up =
+            "mtp.layers.{i}.mlp.up_proj.weight";
+        mtp_names.ffn_down =
+            "mtp.layers.{i}.mlp.down_proj.weight";
+    } else {
+        first_layer = base;
+        mtp_config.num_hidden_layers =
+            config.num_hidden_layers + config.mtp_num_hidden_layers;
+        mtp_config.layer_types.resize(
+            static_cast<std::size_t>(mtp_config.num_hidden_layers),
+            "full_attention");
+    }
+
+    std::vector<MlxQwen35FullAttentionBlock> layers;
+    layers.reserve(
+        static_cast<std::size_t>(config.mtp_num_hidden_layers));
+    for (std::size_t index = 0;
+         index < static_cast<std::size_t>(config.mtp_num_hidden_layers);
+         ++index) {
+        layers.emplace_back(
+            MlxQwen35FullAttentionBlock::load(
+                model,
+                mtp_config,
+                mtp_names,
+                first_layer + index));
+    }
+
+    const auto root = [&](std::string_view hf, std::string_view gguf) {
+        return hf_layout
+            ? std::string(hf)
+            : gguf_prefix + std::string(gguf);
+    };
+    return MlxQwen35MtpModule(
+        mtp_config,
+        load_qwen35_rms_norm(
+            model,
+            root("mtp.pre_fc_norm_hidden.weight", "hnorm.weight"),
+            config.rms_norm_eps,
+            config.norm_weight_offset),
+        load_qwen35_rms_norm(
+            model,
+            root("mtp.pre_fc_norm_embedding.weight", "enorm.weight"),
+            config.rms_norm_eps,
+            config.norm_weight_offset),
+        Qwen35Linear::load(
+            model,
+            root("mtp.fc.weight", "eh_proj.weight")),
+        std::move(layers),
+        load_qwen35_rms_norm(
+            model,
+            root("mtp.norm.weight", "shared_head_norm.weight"),
+            config.rms_norm_eps,
+            config.norm_weight_offset));
+}
+
+MlxQwen35MtpModule::MlxQwen35MtpModule(
+    Qwen35Config config,
+    MlxRmsNorm hidden_norm,
+    MlxRmsNorm embedding_norm,
+    Qwen35Linear fusion,
+    std::vector<MlxQwen35FullAttentionBlock> layers,
+    MlxRmsNorm output_norm)
+    : config_(std::move(config)),
+      hidden_norm_(std::move(hidden_norm)),
+      embedding_norm_(std::move(embedding_norm)),
+      fusion_(std::move(fusion)),
+      layers_(std::move(layers)),
+      output_norm_(std::move(output_norm)) {
+    validate_components();
+}
+
+void MlxQwen35MtpModule::validate_components() const {
+    const int hidden = checked_positive_int(
+        config_.hidden_size, "MTP hidden_size");
+    if (layers_.empty() ||
+        fusion_.input_size() != hidden * 2 ||
+        fusion_.output_size() != hidden ||
+        hidden_norm_.width() != hidden ||
+        embedding_norm_.width() != hidden ||
+        output_norm_.width() != hidden) {
+        throw std::runtime_error(
+            "Qwen3.5 MTP component dimensions are incompatible");
+    }
+}
+
+array MlxQwen35MtpModule::forward(
+    const array& hidden_states,
+    const array& next_token_ids,
+    const Qwen35Embedding& embedding,
+    bool use_cache) {
+    if (hidden_states.ndim() != 3 || next_token_ids.ndim() != 2 ||
+        hidden_states.shape(0) != next_token_ids.shape(0) ||
+        hidden_states.shape(1) != next_token_ids.shape(1) ||
+        hidden_states.shape(2) != config_.hidden_size) {
+        throw std::runtime_error(
+            "Qwen3.5 MTP inputs have incompatible shapes");
+    }
+    auto embedded = embedding(next_token_ids, hidden_states.dtype());
+    auto fused = fusion_(mlx::core::concatenate(
+        {embedding_norm_(embedded), hidden_norm_(hidden_states)},
+        -1));
+    for (auto& layer : layers_) {
+        fused = layer.forward(fused, use_cache);
+    }
+    return output_norm_(fused);
+}
+
+void MlxQwen35MtpModule::reset_cache(
+    int batch,
+    int initial_capacity) {
+    for (auto& layer : layers_) {
+        layer.reset_cache(batch, initial_capacity);
+    }
+}
+
+void MlxQwen35MtpModule::materialize_cache() {
+    for (auto& layer : layers_) {
+        layer.materialize_cache();
+    }
+}
+
+void MlxQwen35MtpModule::clear_cache() noexcept {
+    for (auto& layer : layers_) {
+        layer.clear_cache();
+    }
+}
+
+int MlxQwen35MtpModule::cache_position() const noexcept {
+    return layers_.empty() ? 0 : layers_.front().cache_position();
+}
+
 MlxQwen35CausalLm MlxQwen35CausalLm::load(
     const MfqContainer& model) {
     const auto config = Qwen35Config::from_mfq(model);
@@ -181,6 +380,10 @@ MlxQwen35CausalLm MlxQwen35CausalLm::load(
         output.emplace(
             Qwen35Linear::load(model, names.output));
     }
+    auto mtp = MlxQwen35MtpModule::load_if_present(
+        model,
+        runtime_config,
+        names);
 
     return MlxQwen35CausalLm(
         runtime_config,
@@ -191,7 +394,9 @@ MlxQwen35CausalLm MlxQwen35CausalLm::load(
             names.output_norm,
             runtime_config.rms_norm_eps,
             runtime_config.norm_weight_offset),
-        std::move(output));
+        std::move(output),
+        mlx::core::float16,
+        std::move(mtp));
 }
 
 MlxQwen35CausalLm::MlxQwen35CausalLm(
@@ -200,13 +405,15 @@ MlxQwen35CausalLm::MlxQwen35CausalLm(
     std::vector<MlxQwen35Layer> layers,
     MlxRmsNorm output_norm,
     std::optional<Qwen35Linear> output,
-    mlx::core::Dtype activation_dtype)
+    mlx::core::Dtype activation_dtype,
+    std::optional<MlxQwen35MtpModule> mtp)
     : config_(std::move(config)),
       embedding_(std::move(embedding)),
       layers_(std::move(layers)),
       output_norm_(std::move(output_norm)),
       output_(std::move(output)),
-      activation_dtype_(activation_dtype) {
+      activation_dtype_(activation_dtype),
+      mtp_(std::move(mtp)) {
     validate_components();
 }
 
@@ -296,7 +503,9 @@ array MlxQwen35CausalLm::forward(
 array MlxQwen35CausalLm::forward_impl(
     const array& token_ids,
     const array* positions,
-    bool use_cache) {
+    bool use_cache,
+    array* hidden_output,
+    int speculative_confirmed) {
     if (token_ids.ndim() != 2 ||
         token_ids.shape(0) <= 0 ||
         token_ids.shape(1) <= 0) {
@@ -305,6 +514,12 @@ array MlxQwen35CausalLm::forward_impl(
     }
     const int batch = token_ids.shape(0);
     const int tokens = token_ids.shape(1);
+    if (speculative_confirmed < 0 ||
+        speculative_confirmed >= tokens ||
+        (speculative_confirmed > 0 && (!use_cache || positions))) {
+        throw std::runtime_error(
+            "Qwen3.5 speculative forward configuration is invalid");
+    }
     const int maximum_sequence =
         static_cast<int>(config_.max_position_embeddings);
     const int position = use_cache ? cache_position_ : 0;
@@ -333,6 +548,17 @@ array MlxQwen35CausalLm::forward_impl(
     for (auto& layer : layers_) {
         hidden = std::visit(
             [&](auto& block) {
+                using Block = std::decay_t<decltype(block)>;
+                if constexpr (std::is_same_v<
+                                  Block,
+                                  MlxQwen35LinearAttentionBlock>) {
+                    if (speculative_confirmed > 0) {
+                        return block.forward_speculative(
+                            hidden,
+                            position,
+                            speculative_confirmed);
+                    }
+                }
                 if (explicit_positions) {
                     return block.forward(
                         hidden,
@@ -347,14 +573,79 @@ array MlxQwen35CausalLm::forward_impl(
             },
             layer);
     }
-    auto normalized = output_norm_(hidden);
-    auto logits = config_.tie_word_embeddings
-        ? embedding_.project(normalized)
-        : (*output_)(normalized);
+    if (hidden_output) {
+        *hidden_output = hidden;
+    }
+    auto logits = project_logits(hidden);
     if (use_cache) {
         cache_position_ += tokens;
     }
     return logits;
+}
+
+std::pair<array, array>
+MlxQwen35CausalLm::forward_with_hidden(
+    const array& token_ids,
+    bool use_cache,
+    int speculative_confirmed) {
+    array hidden(0.0f);
+    auto logits = forward_impl(
+        token_ids,
+        nullptr,
+        use_cache,
+        &hidden,
+        speculative_confirmed);
+    return {std::move(logits), std::move(hidden)};
+}
+
+array MlxQwen35CausalLm::project_logits(
+    const array& hidden) const {
+    return project_normalized(output_norm_(hidden));
+}
+
+array MlxQwen35CausalLm::project_normalized(
+    const array& hidden) const {
+    return config_.tie_word_embeddings
+        ? embedding_.project(hidden)
+        : (*output_)(hidden);
+}
+
+void MlxQwen35CausalLm::commit_speculative() {
+    for (auto& layer : layers_) {
+        std::visit(
+            [](auto& block) {
+                using Block = std::decay_t<decltype(block)>;
+                if constexpr (std::is_same_v<
+                                  Block,
+                                  MlxQwen35LinearAttentionBlock>) {
+                    block.commit_speculative();
+                }
+            },
+            layer);
+    }
+}
+
+void MlxQwen35CausalLm::rollback_speculative(
+    int rejected_tokens) {
+    if (rejected_tokens <= 0 || rejected_tokens > cache_position_) {
+        throw std::runtime_error(
+            "Qwen3.5 speculative rollback length is invalid");
+    }
+    for (auto& layer : layers_) {
+        std::visit(
+            [rejected_tokens](auto& block) {
+                using Block = std::decay_t<decltype(block)>;
+                if constexpr (std::is_same_v<
+                                  Block,
+                                  MlxQwen35LinearAttentionBlock>) {
+                    block.rollback_speculative();
+                } else {
+                    block.trim_cache(rejected_tokens);
+                }
+            },
+            layer);
+    }
+    cache_position_ -= rejected_tokens;
 }
 
 void MlxQwen35CausalLm::reset_cache(int batch) {
@@ -370,6 +661,9 @@ void MlxQwen35CausalLm::reset_cache(int batch) {
     cache_position_ = 0;
     cache_batch_ = batch;
     stable_cache_tokens_.clear();
+    if (mtp_) {
+        mtp_->reset_cache(batch);
+    }
 }
 
 void MlxQwen35CausalLm::prepare_cache_for_prefill(
@@ -409,6 +703,10 @@ void MlxQwen35CausalLm::prepare_cache_for_prefill(
     cache_position_ = 0;
     cache_batch_ = batch;
     stable_cache_tokens_.clear();
+    if (mtp_) {
+        mtp_->reset_cache(batch, initial_capacity);
+        mtp_->materialize_cache();
+    }
 }
 
 void MlxQwen35CausalLm::clear_cache() noexcept {
@@ -420,6 +718,9 @@ void MlxQwen35CausalLm::clear_cache() noexcept {
     cache_position_ = 0;
     cache_batch_ = 0;
     stable_cache_tokens_.clear();
+    if (mtp_) {
+        mtp_->clear_cache();
+    }
 }
 
 MlxQwen35TextSessionState
@@ -488,6 +789,9 @@ void MlxQwen35CausalLm::restore_text_session_state(
         cache_position_ = state.cache_position;
         cache_batch_ = state.cache_batch;
         stable_cache_tokens_ = state.tokens;
+        if (mtp_) {
+            mtp_->clear_cache();
+        }
     } catch (...) {
         clear_cache();
         throw;
@@ -549,7 +853,15 @@ std::int32_t MlxQwen35CausalLm::generate(
         reset_cache(1);
         return 0;
     }
-    const std::size_t stable_count = stable_prefix_tokens
+    const bool mtp_candidate =
+        mtp_.has_value() && sampling.greedy() &&
+        !sampling.has_penalties() && !token_constraint &&
+        max_tokens > 1;
+    // MTP head state is not yet part of the persistent session snapshot.
+    // Prefer a complete MTP prefill over restoring only the backbone, which
+    // would leave the proposal head with an invalid history.
+    const std::size_t stable_count =
+        !mtp_candidate && stable_prefix_tokens
         ? std::min(*stable_prefix_tokens, prompt.size())
         : 0;
     std::size_t reused_tokens = 0;
@@ -568,6 +880,11 @@ std::int32_t MlxQwen35CausalLm::generate(
         // compute. Materialize it before the evaluation-only metric starts.
         prepare_cache_for_prefill(1, prompt_count);
     }
+    const bool mtp_active =
+        mtp_candidate &&
+        stable_count == 0 &&
+        reused_tokens == 0 &&
+        max_tokens > 1;
 
     const array prompt_ids(
         prompt_values.begin(),
@@ -579,6 +896,7 @@ std::int32_t MlxQwen35CausalLm::generate(
             prompt_ids,
             vocab);
     double prefill_evaluation_ms = 0.0;
+    std::optional<array> prefill_hidden;
     std::optional<MlxQwen35TextSessionState> stable_snapshot;
     struct StableStateRestore {
         MlxQwen35CausalLm& model;
@@ -607,6 +925,11 @@ std::int32_t MlxQwen35CausalLm::generate(
                 prompt_ids,
                 Shape{0, static_cast<int>(begin)},
                 Shape{1, static_cast<int>(end)});
+            if (mtp_active && begin == 0 && end == prompt.size()) {
+                auto result = forward_with_hidden(ids, true);
+                prefill_hidden = std::move(result.second);
+                return last_token_logits(result.first, vocab);
+            }
             return last_token_logits(forward(ids, true), vocab);
         };
         std::optional<array> stable_logits;
@@ -656,6 +979,139 @@ std::int32_t MlxQwen35CausalLm::generate(
         std::min(max_tokens, context_samples);
 
     std::int32_t generated = 0;
+    if (mtp_active) {
+        if (!prefill_hidden) {
+            throw std::runtime_error(
+                "Qwen3.5 MTP prefill did not retain backbone hidden states");
+        }
+        const auto emit = [&](std::int32_t token) {
+            ++generated;
+            return !callback || callback(token);
+        };
+        const auto greedy_token = [&](const array& value) {
+            auto sampled = sampler.sample(value);
+            sampled.eval();
+            const auto token = sampled.data<std::int32_t>()[0];
+            if (token < 0 || token >= vocab) {
+                throw std::runtime_error(
+                    "Qwen3.5 MTP sampler returned an out-of-range token");
+            }
+            return token;
+        };
+        const auto make_draft = [&](const array& hidden, int token) {
+            const array ids(
+                {token},
+                Shape{1, 1},
+                mlx::core::int32);
+            auto head_hidden = mtp_->forward(
+                hidden,
+                ids,
+                embedding_,
+                true);
+            auto head_logits = last_token_logits(
+                project_normalized(head_hidden),
+                vocab);
+            return greedy_token(head_logits);
+        };
+
+        const int next_main = greedy_token(logits);
+        if (!emit(next_main) || generated == generation_limit) {
+            return generated;
+        }
+
+        // Prime the MTP attention history from teacher-forced prompt pairs.
+        // The final prompt hidden is reserved for the first live proposal.
+        if (prompt_count > 1) {
+            auto hidden_prefix = mlx::core::slice(
+                *prefill_hidden,
+                Shape{0, 0, 0},
+                Shape{1, prompt_count - 1,
+                      static_cast<int>(config_.hidden_size)});
+            auto shifted_ids = mlx::core::slice(
+                prompt_ids,
+                Shape{0, 1},
+                Shape{1, prompt_count});
+            auto primed = mtp_->forward(
+                hidden_prefix,
+                shifted_ids,
+                embedding_,
+                true);
+            primed.eval();
+        }
+        auto last_hidden = mlx::core::slice(
+            *prefill_hidden,
+            Shape{0, prompt_count - 1, 0},
+            Shape{1, prompt_count,
+                  static_cast<int>(config_.hidden_size)});
+        int pending_main = next_main;
+        int draft = make_draft(last_hidden, pending_main);
+
+        while (generated < generation_limit) {
+            if (cache_position_ > maximum_sequence - 2) {
+                const array ids(
+                    {pending_main},
+                    Shape{1, 1},
+                    mlx::core::int32);
+                const int final_token = greedy_token(
+                    last_token_logits(forward(ids, true), vocab));
+                emit(final_token);
+                return generated;
+            }
+            const array verify_ids(
+                {pending_main, draft},
+                Shape{1, 2},
+                mlx::core::int32);
+            auto verified = forward_with_hidden(
+                verify_ids,
+                true,
+                1);
+            auto target_tokens = sampler.sample(
+                mlx::core::reshape(
+                    verified.first,
+                    Shape{2, vocab}));
+            target_tokens.eval();
+            const auto* target =
+                target_tokens.data<std::int32_t>();
+            const int verify_token = target[0];
+            const int bonus_token = target[1];
+            if (verify_token < 0 || verify_token >= vocab ||
+                bonus_token < 0 || bonus_token >= vocab) {
+                throw std::runtime_error(
+                    "Qwen3.5 MTP verification returned an invalid token");
+            }
+
+            if (verify_token == draft) {
+                commit_speculative();
+                if (!emit(draft) || generated == generation_limit) {
+                    return generated;
+                }
+                if (!emit(bonus_token) || generated == generation_limit) {
+                    return generated;
+                }
+                auto draft_hidden = mlx::core::slice(
+                    verified.second,
+                    Shape{0, 1, 0},
+                    Shape{1, 2,
+                          static_cast<int>(config_.hidden_size)});
+                pending_main = bonus_token;
+                draft = make_draft(draft_hidden, pending_main);
+            } else {
+                rollback_speculative(1);
+                if (!emit(verify_token) || generated == generation_limit) {
+                    return generated;
+                }
+                auto confirmed_hidden = mlx::core::slice(
+                    verified.second,
+                    Shape{0, 0, 0},
+                    Shape{1, 1,
+                          static_cast<int>(config_.hidden_size)});
+                pending_main = verify_token;
+                draft = make_draft(confirmed_hidden, pending_main);
+            }
+        }
+        return generated;
+    }
+
     while (generated < generation_limit) {
         auto sampled = counts.has_value()
             ? sampler.sample(

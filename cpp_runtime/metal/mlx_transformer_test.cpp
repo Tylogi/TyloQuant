@@ -423,6 +423,19 @@ int main() {
                 cached_values[index],
                 expected_cached_values[index]);
         }
+        cache.trim(1);
+        auto rewritten = cache.append(
+            array({13.0f, 14.0f}, Shape{1, 1, 1, 2}),
+            array({15.0f, 16.0f}, Shape{1, 1, 1, 2}));
+        rewritten.first.eval();
+        rewritten.second.eval();
+        if (cache.position() != 3) {
+            throw std::runtime_error("KV cache trim did not rewind position");
+        }
+        require_close(rewritten.first.data<float>()[4], 13.0f);
+        require_close(rewritten.first.data<float>()[5], 14.0f);
+        require_close(rewritten.second.data<float>()[4], 15.0f);
+        require_close(rewritten.second.data<float>()[5], 16.0f);
 
         const array query(
             {0.0f, 0.0f, 0.0f, 0.0f},

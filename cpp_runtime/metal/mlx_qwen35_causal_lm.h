@@ -11,6 +11,7 @@
 #include <functional>
 #include <optional>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -49,6 +50,45 @@ struct MlxQwen35TextSessionState {
 
 using MlxTokenCallback = std::function<bool(std::int64_t)>;
 
+class MlxQwen35MtpModule {
+public:
+    static std::optional<MlxQwen35MtpModule> load_if_present(
+        const MfqContainer& model,
+        const Qwen35Config& config,
+        const Qwen35TensorNames& names);
+
+    MlxQwen35MtpModule(
+        Qwen35Config config,
+        MlxRmsNorm hidden_norm,
+        MlxRmsNorm embedding_norm,
+        Qwen35Linear fusion,
+        std::vector<MlxQwen35FullAttentionBlock> layers,
+        MlxRmsNorm output_norm);
+
+    mlx::core::array forward(
+        const mlx::core::array& hidden_states,
+        const mlx::core::array& next_token_ids,
+        const Qwen35Embedding& embedding,
+        bool use_cache = true);
+    void reset_cache(int batch = 1, int initial_capacity = 16);
+    void materialize_cache();
+    void clear_cache() noexcept;
+    int cache_position() const noexcept;
+    std::size_t layer_count() const noexcept {
+        return layers_.size();
+    }
+
+private:
+    void validate_components() const;
+
+    Qwen35Config config_;
+    MlxRmsNorm hidden_norm_;
+    MlxRmsNorm embedding_norm_;
+    Qwen35Linear fusion_;
+    std::vector<MlxQwen35FullAttentionBlock> layers_;
+    MlxRmsNorm output_norm_;
+};
+
 class MlxQwen35CausalLm {
 public:
     static MlxQwen35CausalLm load(const MfqContainer& model);
@@ -64,7 +104,8 @@ public:
         std::vector<MlxQwen35Layer> layers,
         MlxRmsNorm output_norm,
         std::optional<Qwen35Linear> output,
-        mlx::core::Dtype activation_dtype = mlx::core::float16);
+        mlx::core::Dtype activation_dtype = mlx::core::float16,
+        std::optional<MlxQwen35MtpModule> mtp = std::nullopt);
 
     // token_ids must be a non-empty [batch,tokens] array. Cached calls append
     // contiguously; uncached calls do not mutate existing cache state.
@@ -131,6 +172,9 @@ public:
     int cache_batch() const noexcept {
         return cache_batch_;
     }
+    bool supports_mtp() const noexcept {
+        return mtp_.has_value();
+    }
 
 private:
     void validate_components() const;
@@ -140,7 +184,20 @@ private:
     mlx::core::array forward_impl(
         const mlx::core::array& token_ids,
         const mlx::core::array* positions,
-        bool use_cache);
+        bool use_cache,
+        mlx::core::array* hidden_output = nullptr,
+        int speculative_confirmed = 0);
+    std::pair<mlx::core::array, mlx::core::array>
+    forward_with_hidden(
+        const mlx::core::array& token_ids,
+        bool use_cache,
+        int speculative_confirmed = 0);
+    void commit_speculative();
+    void rollback_speculative(int rejected_tokens);
+    mlx::core::array project_logits(
+        const mlx::core::array& hidden) const;
+    mlx::core::array project_normalized(
+        const mlx::core::array& hidden) const;
 
     Qwen35Config config_;
     Qwen35Embedding embedding_;
@@ -148,6 +205,7 @@ private:
     MlxRmsNorm output_norm_;
     std::optional<Qwen35Linear> output_;
     mlx::core::Dtype activation_dtype_;
+    std::optional<MlxQwen35MtpModule> mtp_;
     int cache_position_ = 0;
     int cache_batch_ = 0;
     std::vector<std::int64_t> stable_cache_tokens_;

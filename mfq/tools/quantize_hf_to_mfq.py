@@ -748,7 +748,11 @@ _LAYER_NAME_MAP = {
 }
 
 
-def _hf_to_gguf_name(name: str) -> str | None:
+def _hf_to_gguf_name(
+    name: str,
+    *,
+    mtp_layer_index: int = 40,
+) -> str | None:
     if name == "llm.lm_head.weight":
         return "output.weight"
     if name == "llm.model.embed_tokens.weight":
@@ -762,13 +766,13 @@ def _hf_to_gguf_name(name: str) -> str | None:
     if name == "model.language_model.norm.weight":
         return "output_norm.weight"
     if name == "mtp.fc.weight":
-        return "blk.40.nextn.eh_proj.weight"
+        return f"blk.{mtp_layer_index}.nextn.eh_proj.weight"
     if name == "mtp.pre_fc_norm_embedding.weight":
-        return "blk.40.nextn.enorm.weight"
+        return f"blk.{mtp_layer_index}.nextn.enorm.weight"
     if name == "mtp.pre_fc_norm_hidden.weight":
-        return "blk.40.nextn.hnorm.weight"
+        return f"blk.{mtp_layer_index}.nextn.hnorm.weight"
     if name == "mtp.norm.weight":
-        return "blk.40.nextn.shared_head_norm.weight"
+        return f"blk.{mtp_layer_index}.nextn.shared_head_norm.weight"
 
     prefix = "model.language_model.layers."
     if name.startswith(prefix):
@@ -790,12 +794,70 @@ def _hf_to_gguf_name(name: str) -> str | None:
         )
         return f"blk.{layer}.{mapped}" if mapped is not None else None
 
-    mtp_prefix = "mtp.layers.0."
-    if name.startswith(mtp_prefix):
-        suffix = name[len(mtp_prefix):]
+    mtp_match = re.match(r"^mtp\.layers\.(\d+)\.(.+)$", name)
+    if mtp_match is not None:
+        layer = mtp_layer_index + int(mtp_match.group(1))
+        suffix = mtp_match.group(2)
         mapped = _LAYER_NAME_MAP.get(suffix)
-        return f"blk.40.{mapped}" if mapped is not None else None
+        return (
+            f"blk.{layer}.{mapped}"
+            if mapped is not None
+            else None
+        )
     return None
+
+
+_MTP_PROTECTED_TENSORS = {
+    "mtp.fc.weight",
+    "mtp.pre_fc_norm_embedding.weight",
+    "mtp.pre_fc_norm_hidden.weight",
+    "mtp.norm.weight",
+}
+
+
+def _mtp_inventory_status(
+    inventory: dict[str, SourceTensorMetadata],
+    model_config: dict[str, object],
+) -> tuple[bool, int]:
+    """Validate that a Qwen MTP head is either complete or absent."""
+
+    count = int(model_config.get("mtp_num_hidden_layers", 0) or 0)
+    names = {name for name in inventory if name.startswith("mtp.")}
+    if count <= 0:
+        if names:
+            raise ValueError(
+                "checkpoint contains mtp.* tensors but "
+                "mtp_num_hidden_layers is not positive"
+            )
+        return False, 0
+    if not names:
+        return False, count
+
+    required = set(_MTP_PROTECTED_TENSORS)
+    for index in range(count):
+        prefix = f"mtp.layers.{index}."
+        required.update(
+            {
+                prefix + "input_layernorm.weight",
+                prefix + "post_attention_layernorm.weight",
+                prefix + "self_attn.q_proj.weight",
+                prefix + "self_attn.k_proj.weight",
+                prefix + "self_attn.v_proj.weight",
+                prefix + "self_attn.o_proj.weight",
+                prefix + "self_attn.q_norm.weight",
+                prefix + "self_attn.k_norm.weight",
+                prefix + "mlp.gate_proj.weight",
+                prefix + "mlp.up_proj.weight",
+                prefix + "mlp.down_proj.weight",
+            }
+        )
+    missing = sorted(required - names)
+    if missing:
+        raise ValueError(
+            "incomplete Qwen MTP head; missing tensors: "
+            + ", ".join(missing[:8])
+        )
+    return True, count
 
 
 ImportanceRows = Callable[[int, int], np.ndarray | None]
@@ -1252,9 +1314,15 @@ def _target_for_recipe_name(
     gguf_type: str | None,
     recipe_types: dict[str, str] | None,
     dense_dtype: str,
+    *,
+    mtp_layer_index: int = 40,
 ) -> tuple[str, str | None, str | None]:
     anchor = _recipe_group_anchor(name) if recipe_types is not None else None
-    anchor_gguf_name = _hf_to_gguf_name(anchor) if anchor is not None else None
+    anchor_gguf_name = (
+        _hf_to_gguf_name(anchor, mtp_layer_index=mtp_layer_index)
+        if anchor is not None
+        else None
+    )
     if anchor_gguf_name is not None and anchor_gguf_name in recipe_types:
         anchor_type = recipe_types[anchor_gguf_name]
         return _dtype_for_recipe_type(anchor_type, dense_dtype), anchor_gguf_name, anchor_type
@@ -1584,6 +1652,13 @@ def _plan(
     else:
         raw_config = source_config
     model_config = raw_config.get("text_config", raw_config)
+    if not isinstance(model_config, dict):
+        raise ValueError("HF text_config must be an object")
+    mtp_included, _mtp_layers = _mtp_inventory_status(
+        inventory,
+        model_config,
+    )
+    mtp_layer_index = int(model_config.get("num_hidden_layers", 0) or 0)
     is_glm_dsa = model_config.get("model_type") == "glm_moe_dsa"
     is_minicpmo45 = _is_minicpmo45_config(raw_config)
     if is_glm_dsa and recipe_types is not None:
@@ -1600,6 +1675,7 @@ def _plan(
     for name, shard in weight_map.items():
         if text_only and not (
             name.startswith("model.language_model.")
+            or (mtp_included and name.startswith("mtp."))
             or (is_glm_dsa and name.startswith("model."))
             or name == "lm_head.weight"
             or (is_minicpmo45 and name.startswith("llm."))
@@ -1610,12 +1686,20 @@ def _plan(
             if layer_index is not None and layer_index >= glm_layers:
                 continue
         if recipe_types is not None:
-            gguf_name = _hf_to_gguf_name(name)
+            gguf_name = _hf_to_gguf_name(
+                name,
+                mtp_layer_index=mtp_layer_index,
+            )
             if is_minicpmo45 and not name.startswith("llm."):
                 # The official MiniCPM-o 4.5 Q4_K_M GGUF contains only the
                 # language model.  Keep every other official component at its
                 # source precision so the resulting MFQ still represents the
                 # complete vision/audio/TTS graph.
+                pass
+            elif name.startswith("mtp."):
+                # MTP is an all-or-nothing model capability.  Preserve the
+                # complete head even when an older GGUF recipe omitted it;
+                # protected fusion/norm tensors remain at source precision.
                 pass
             elif gguf_name is None or gguf_name not in recipe_types:
                 if is_minicpmo45:
@@ -1645,9 +1729,26 @@ def _plan(
                     source_shapes[name] = shape
                     source_dtypes[name] = source_dtype
                     continue
-                gguf_name = _hf_to_gguf_name(name) if recipe_types is not None else None
-                gguf_type = recipe_types[gguf_name] if gguf_name is not None and recipe_types is not None else None
-                if mostly_bf16:
+                gguf_name = (
+                    _hf_to_gguf_name(
+                        name,
+                        mtp_layer_index=mtp_layer_index,
+                    )
+                    if recipe_types is not None
+                    else None
+                )
+                gguf_type = (
+                    recipe_types.get(gguf_name)
+                    if gguf_name is not None and recipe_types is not None
+                    else None
+                )
+                if name in _MTP_PROTECTED_TENSORS:
+                    target = (
+                        source_dtype
+                        if source_dtype in {"BF16", "F16", "F32"}
+                        else dense_dtype
+                    )
+                elif mostly_bf16:
                     target = _mostly_bf16_target(name, shape, source_dtype)
                 elif recipe_types is not None:
                     if is_minicpmo45 and not name.startswith("llm."):
@@ -1657,6 +1758,12 @@ def _plan(
                             in {"BF16", "F16", "F32", "I32", "I64"}
                             else dense_dtype
                         )
+                    elif name.startswith("mtp.") and gguf_type is None:
+                        target = (
+                            default_nint_dtype
+                            if len(shape) in (2, 3)
+                            else dense_dtype
+                        )
                     else:
                         target, anchor_gguf_name, anchor_type = (
                             _target_for_recipe_name(
@@ -1664,6 +1771,7 @@ def _plan(
                                 gguf_type,
                                 recipe_types,
                                 dense_dtype,
+                                mtp_layer_index=mtp_layer_index,
                             )
                         )
                         if anchor_gguf_name is not None:
@@ -4165,6 +4273,22 @@ def convert(args: argparse.Namespace) -> None:
                 if config_path.exists()
                 else {}
             )
+        config_text = config.get("text_config", config)
+        mtp_plan_names = [item.name for item in plan if item.name.startswith("mtp.")]
+        mtp_config_layers = (
+            int(config_text.get("mtp_num_hidden_layers", 0) or 0)
+            if isinstance(config_text, dict)
+            else 0
+        )
+        mtp_included = bool(mtp_plan_names)
+        if mtp_config_layers > 0 and not mtp_included:
+            # A stripped head must not leave a capability bit behind.  Copy
+            # through JSON so callers' config dictionaries remain untouched.
+            config = json.loads(json.dumps(config))
+            config_text = config.get("text_config", config)
+            if isinstance(config_text, dict):
+                config_text["mtp_num_hidden_layers"] = 0
+                config_text["mtp_use_dedicated_embeddings"] = False
         model_type = str(config.get("model_type", "unknown"))
         runtime_assets: list[RuntimeAsset] = []
         if mfq_checkpoint is not None:
@@ -4312,6 +4436,16 @@ def convert(args: argparse.Namespace) -> None:
                 "dense_dtype": "MOSTLY_BF16" if mostly_bf16 else dense_dtype,
                 "mostly_bf16": mostly_bf16,
                 "text_only": bool(args.text_only),
+                "mtp": {
+                    "included": mtp_included,
+                    "hidden_layers": mtp_config_layers if mtp_included else 0,
+                    "tensor_count": len(mtp_plan_names),
+                    "protected_full_precision": sorted(
+                        name
+                        for name in mtp_plan_names
+                        if name in _MTP_PROTECTED_TENSORS
+                    ),
+                },
                 "hf_config": config,
                 ASSET_MANIFEST_KEY: runtime_asset_manifest(runtime_assets),
                 "target_counts": target_counts,

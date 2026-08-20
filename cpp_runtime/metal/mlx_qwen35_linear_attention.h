@@ -22,6 +22,13 @@ struct MlxQwen35LinearAttentionCacheSnapshot {
     }
 };
 
+struct MlxQwen35LinearAttentionRollback {
+    mlx::core::array convolution_state;
+    mlx::core::array recurrent_state;
+    int position = 0;
+    int batch = 0;
+};
+
 // Qwen3.5/3.6 Gated DeltaNet decoder block.
 //
 // The block accepts either the combined qkv projection used by GGUF MFQ
@@ -63,6 +70,15 @@ public:
         const mlx::core::array& input,
         int position_offset,
         bool use_cache);
+
+    // Verify a confirmed prefix and speculative suffix while retaining the
+    // exact functional recurrent state after the confirmed rows.
+    mlx::core::array forward_speculative(
+        const mlx::core::array& input,
+        int position_offset,
+        int confirmed_tokens);
+    void commit_speculative() noexcept;
+    void rollback_speculative();
 
     // Gated DeltaNet has no RoPE dependency. These overloads preserve the
     // mixed-layer model interface while intentionally ignoring position
@@ -151,6 +167,8 @@ private:
     int zero_cache_batch_ = 0;
     int cache_position_ = 0;
     int cache_batch_ = 0;
+    std::optional<MlxQwen35LinearAttentionRollback>
+        speculative_rollback_;
 };
 
 } // namespace mfq::metal

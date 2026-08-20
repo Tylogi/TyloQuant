@@ -137,6 +137,7 @@ public:
     void clear_cache() noexcept;
     MlxKvCacheSnapshot snapshot_cache() const;
     void restore_cache(const MlxKvCacheSnapshot& snapshot);
+    void trim_cache(int tokens);
 
     int cache_position() const noexcept;
     int cache_batch() const noexcept {

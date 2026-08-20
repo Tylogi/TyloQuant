@@ -26,6 +26,7 @@ using mfq::metal::MlxQwen35DenseSwiGlu;
 using mfq::metal::MlxQwen35FullAttentionBlock;
 using mfq::metal::MlxQwen35Layer;
 using mfq::metal::MlxQwen35LinearAttentionBlock;
+using mfq::metal::MlxQwen35MtpModule;
 using mfq::metal::MlxRmsNorm;
 using mfq::metal::Qwen35Config;
 using mfq::metal::Qwen35Embedding;
@@ -321,11 +322,29 @@ std::vector<MlxQwen35Layer> make_layers(
 
 MlxQwen35CausalLm make_model(
     bool zero_output = false,
-    bool tied = false) {
-    const auto config = test_config(tied);
+    bool tied = false,
+    bool with_mtp = false) {
+    auto config = test_config(tied);
+    config.mtp_num_hidden_layers = with_mtp ? 1 : 0;
     std::optional<Qwen35Linear> output;
     if (!tied) {
         output.emplace(make_output(config, zero_output));
+    }
+    std::optional<MlxQwen35MtpModule> mtp;
+    if (with_mtp) {
+        const int hidden = static_cast<int>(config.hidden_size);
+        std::vector<MlxQwen35FullAttentionBlock> mtp_layers;
+        mtp_layers.emplace_back(make_full_block(config));
+        mtp.emplace(
+            config,
+            hidden_norm(config),
+            hidden_norm(config),
+            Qwen35Linear(MlxLinear(matrix(
+                hidden,
+                hidden * 2,
+                patterned(hidden * hidden * 2, 0.017f, 13, 6)))),
+            std::move(mtp_layers),
+            hidden_norm(config));
     }
     return MlxQwen35CausalLm(
         config,
@@ -333,7 +352,8 @@ MlxQwen35CausalLm make_model(
         make_layers(config),
         hidden_norm(config),
         std::move(output),
-        mlx::core::float32);
+        mlx::core::float32,
+        std::move(mtp));
 }
 
 array token_ids(std::initializer_list<int> values) {
@@ -645,6 +665,82 @@ void test_prefill_decode_and_reset() {
         decode_model.cache_position() == 0 &&
             decode_model.cache_batch() == 0,
         "mixed model clear_cache did not release state");
+}
+
+void test_mtp_greedy_identity() {
+    mfq::metal::MlxSamplingParams sampling;
+    sampling.temperature = 0.0;
+    const std::vector<std::int64_t> prompt{1, 4, 2};
+
+    auto baseline = make_model();
+    auto speculative = make_model(false, false, true);
+    require(speculative.supports_mtp(), "synthetic MTP head was not attached");
+
+    std::vector<std::int64_t> expected;
+    std::vector<std::int64_t> actual;
+    const auto expected_count = baseline.generate(
+        prompt,
+        sampling,
+        8,
+        [&](std::int64_t token) {
+            expected.push_back(token);
+            return true;
+        });
+    const auto actual_count = speculative.generate(
+        prompt,
+        sampling,
+        8,
+        [&](std::int64_t token) {
+            actual.push_back(token);
+            return true;
+        });
+    require(
+        expected_count == 8 && actual_count == 8 && actual == expected,
+        "MTP greedy generation changed the target token sequence");
+
+    auto repeated = make_model(false, false, true);
+    std::vector<std::int64_t> stopped;
+    const auto stopped_count = repeated.generate(
+        prompt,
+        sampling,
+        8,
+        [&](std::int64_t token) {
+            stopped.push_back(token);
+            return stopped.size() < 3;
+        });
+    require(
+        stopped_count == 3 &&
+            stopped == std::vector<std::int64_t>(expected.begin(), expected.begin() + 3),
+        "MTP callback stop semantics changed");
+
+    mfq::metal::MlxSamplingParams stochastic;
+    stochastic.temperature = 0.8;
+    stochastic.top_k = 4;
+    stochastic.top_p = 0.9;
+    stochastic.seed = 1729;
+    auto sampled_baseline = make_model();
+    auto sampled_fallback = make_model(false, false, true);
+    std::vector<std::int64_t> expected_sampled;
+    std::vector<std::int64_t> actual_sampled;
+    sampled_baseline.generate(
+        prompt,
+        stochastic,
+        8,
+        [&](std::int64_t token) {
+            expected_sampled.push_back(token);
+            return true;
+        });
+    sampled_fallback.generate(
+        prompt,
+        stochastic,
+        8,
+        [&](std::int64_t token) {
+            actual_sampled.push_back(token);
+            return true;
+        });
+    require(
+        actual_sampled == expected_sampled,
+        "MTP stochastic fallback changed the target token sequence");
 }
 
 void test_text_session_snapshot_restore() {
@@ -1131,7 +1227,7 @@ void test_validation() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
 #ifdef MFQ_MLX_METALLIB_DEFAULT
         mlx::core::metal::set_metallib_path(
@@ -1139,11 +1235,28 @@ int main() {
         mlx::core::set_default_device(
             mlx::core::Device::gpu);
 #endif
+        if (argc == 2) {
+            const mfq::metal::MfqContainer container(argv[1]);
+            const auto config = Qwen35Config::from_mfq(container);
+            auto mtp = MlxQwen35MtpModule::load_if_present(
+                container,
+                config,
+                mfq::metal::Qwen35TensorNames::hugging_face());
+            require(mtp.has_value(), "real MFQ MTP head was not loaded");
+            require(
+                mtp->layer_count() ==
+                    static_cast<std::size_t>(config.mtp_num_hidden_layers),
+                "real MFQ MTP layer count mismatch");
+            std::cout << "MFQ C++ Qwen3.5 MTP container load passed\n";
+            return 0;
+        }
+        require(argc == 1, "usage: qwen35 causal test [MTP_ONLY.mfq]");
         test_layer_order_and_forward();
         test_explicit_mrope_semantics();
         test_explicit_mrope_cache_continuity();
         test_explicit_position_validation();
         test_prefill_decode_and_reset();
+        test_mtp_greedy_identity();
         test_text_session_snapshot_restore();
         test_tied_embedding_forward_cache_and_generate();
         test_generation_greedy_seed_and_penalties();

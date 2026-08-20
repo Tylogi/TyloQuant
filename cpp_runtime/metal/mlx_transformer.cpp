@@ -553,6 +553,13 @@ void MlxKvCache::reserve_append(int tokens) {
     position_ += tokens;
 }
 
+void MlxKvCache::trim(int tokens) {
+    if (tokens < 0 || tokens > position_) {
+        throw std::runtime_error("invalid KV cache trim");
+    }
+    position_ -= tokens;
+}
+
 std::pair<array, array> MlxKvCache::view() const {
     const Shape start{0, 0, 0, 0};
     const Shape stop{

@@ -400,6 +400,14 @@ void MlxQwen35FullAttentionBlock::restore_cache(
     cache_batch_ = snapshot.batch;
 }
 
+void MlxQwen35FullAttentionBlock::trim_cache(int tokens) {
+    if (!cache_ || cache_batch_ <= 0) {
+        throw std::runtime_error(
+            "Qwen3.5 full-attention cache is unavailable");
+    }
+    cache_->trim(tokens);
+}
+
 int MlxQwen35FullAttentionBlock::cache_position() const noexcept {
     return cache_ ? cache_->position() : 0;
 }

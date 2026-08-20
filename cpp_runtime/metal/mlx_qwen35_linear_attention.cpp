@@ -406,6 +406,7 @@ void MlxQwen35LinearAttentionBlock::reset_cache(int batch) {
     recurrent_state_ = *zero_recurrent_state_;
     cache_position_ = 0;
     cache_batch_ = batch;
+    speculative_rollback_.reset();
 }
 
 void MlxQwen35LinearAttentionBlock::materialize_cache() {
@@ -424,6 +425,7 @@ void MlxQwen35LinearAttentionBlock::clear_cache() noexcept {
     zero_cache_batch_ = 0;
     cache_position_ = 0;
     cache_batch_ = 0;
+    speculative_rollback_.reset();
 }
 
 MlxQwen35LinearAttentionCacheSnapshot
@@ -667,6 +669,72 @@ array MlxQwen35LinearAttentionBlock::forward(
             activation_dtype));
     residual = residual + ffn_(ffn_norm_(residual));
     return residual;
+}
+
+array MlxQwen35LinearAttentionBlock::forward_speculative(
+    const array& input,
+    int position_offset,
+    int confirmed_tokens) {
+    if (input.ndim() != 3 || input.shape(0) <= 0 ||
+        input.shape(1) <= confirmed_tokens || confirmed_tokens <= 0 ||
+        input.shape(2) != config_.hidden_size) {
+        throw std::runtime_error(
+            "Qwen3.5 speculative linear-attention input is invalid");
+    }
+    speculative_rollback_.reset();
+    const int batch = input.shape(0);
+    const int tokens = input.shape(1);
+    auto confirmed = mlx::core::slice(
+        input,
+        mlx::core::Shape{0, 0, 0},
+        mlx::core::Shape{batch, confirmed_tokens, input.shape(2)});
+    auto suffix = mlx::core::slice(
+        input,
+        mlx::core::Shape{0, confirmed_tokens, 0},
+        mlx::core::Shape{batch, tokens, input.shape(2)});
+    auto confirmed_output = forward(
+        confirmed,
+        position_offset,
+        true);
+    if (!convolution_state_ || !recurrent_state_) {
+        throw std::runtime_error(
+            "Qwen3.5 speculative recurrent checkpoint is unavailable");
+    }
+    speculative_rollback_.emplace(
+        MlxQwen35LinearAttentionRollback{
+            *convolution_state_,
+            *recurrent_state_,
+            cache_position_,
+            cache_batch_,
+        });
+    try {
+        auto suffix_output = forward(
+            suffix,
+            position_offset + confirmed_tokens,
+            true);
+        return mlx::core::concatenate(
+            {confirmed_output, suffix_output},
+            1);
+    } catch (...) {
+        rollback_speculative();
+        throw;
+    }
+}
+
+void MlxQwen35LinearAttentionBlock::commit_speculative() noexcept {
+    speculative_rollback_.reset();
+}
+
+void MlxQwen35LinearAttentionBlock::rollback_speculative() {
+    if (!speculative_rollback_) {
+        throw std::runtime_error(
+            "Qwen3.5 speculative recurrent checkpoint is unavailable");
+    }
+    convolution_state_ = speculative_rollback_->convolution_state;
+    recurrent_state_ = speculative_rollback_->recurrent_state;
+    cache_position_ = speculative_rollback_->position;
+    cache_batch_ = speculative_rollback_->batch;
+    speculative_rollback_.reset();
 }
 
 array MlxQwen35LinearAttentionBlock::forward(
