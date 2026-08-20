@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from mfq.cli import _build_parser
-from mfq.server.cli import _prepare_web_root, _resolve_runtime_executable, _run, _select_backend
+from mfq.commands.serve import _prepare_web_root, _resolve_runtime_executable, _run, _select_backend
 from mfq.server.native import NativeRuntime
 
 
@@ -20,7 +20,7 @@ import sys
 for name in (
     'mfq.server.api',
     'mfq.server.catalog',
-    'mfq.server.cli',
+    'mfq.commands.serve',
     'mfq.server.native',
     'mfq.server.runtime_pool',
     'mfq.server.service',
@@ -84,9 +84,9 @@ def test_serve_uses_the_runtime_recorded_by_mfq_build(tmp_path: Path, monkeypatc
     executable.parent.mkdir(parents=True)
     executable.write_bytes(b"runtime")
     managed = SimpleNamespace(executable=executable)
-    monkeypatch.setattr("mfq.server.cli.load_managed_build", lambda _: managed)
+    monkeypatch.setattr("mfq.commands.serve.load_managed_build", lambda _: managed)
     monkeypatch.setattr(
-        "mfq.server.cli.build_runtime",
+        "mfq.commands.serve.build_runtime",
         lambda **_: (_ for _ in ()).throw(AssertionError("must not rebuild")),
     )
 
@@ -100,11 +100,11 @@ def test_serve_uses_an_explicit_prebuilt_runtime_without_managed_lookup(
     executable.parent.mkdir(parents=True)
     executable.write_bytes(b"runtime")
     monkeypatch.setattr(
-        "mfq.server.cli.load_managed_build",
+        "mfq.commands.serve.load_managed_build",
         lambda _: (_ for _ in ()).throw(AssertionError("must not inspect managed builds")),
     )
     monkeypatch.setattr(
-        "mfq.server.cli.build_runtime",
+        "mfq.commands.serve.build_runtime",
         lambda **_: (_ for _ in ()).throw(AssertionError("must not build")),
     )
 
@@ -119,10 +119,10 @@ def test_serve_rejects_a_missing_explicit_prebuilt_runtime(tmp_path: Path) -> No
 
 
 def test_prebuilt_cuda_runtime_does_not_require_a_local_compiler(monkeypatch) -> None:
-    monkeypatch.setattr("mfq.server.cli.platform.system", lambda: "Linux")
-    monkeypatch.setattr("mfq.server.cli.platform.machine", lambda: "x86_64")
+    monkeypatch.setattr("mfq.commands.serve.platform.system", lambda: "Linux")
+    monkeypatch.setattr("mfq.commands.serve.platform.machine", lambda: "x86_64")
     monkeypatch.setattr(
-        "mfq.server.cli.detect_backend",
+        "mfq.commands.serve.detect_backend",
         lambda _: (_ for _ in ()).throw(AssertionError("must not require nvcc")),
     )
 
@@ -141,9 +141,9 @@ def test_serve_rebuilds_a_missing_runtime_from_its_recorded_recipe(
     )
     captured: dict[str, object] = {}
     rebuilt = tmp_path / "rebuilt-runtime"
-    monkeypatch.setattr("mfq.server.cli.load_managed_build", lambda _: managed)
+    monkeypatch.setattr("mfq.commands.serve.load_managed_build", lambda _: managed)
     monkeypatch.setattr(
-        "mfq.server.cli.build_runtime",
+        "mfq.commands.serve.build_runtime",
         lambda **options: captured.update(options) or rebuilt,
     )
 
@@ -197,8 +197,8 @@ def test_serve_builds_web_ui_when_the_source_is_newer(tmp_path: Path, monkeypatc
     (web / "package.json").write_text("{}", encoding="utf-8")
     (web / "package-lock.json").write_text("{}", encoding="utf-8")
     calls: list[list[str]] = []
-    monkeypatch.setattr("mfq.server.cli._studio_dir", lambda: web)
-    monkeypatch.setattr("mfq.server.cli.shutil.which", lambda _: "/usr/bin/npm")
+    monkeypatch.setattr("mfq.commands.serve._studio_dir", lambda: web)
+    monkeypatch.setattr("mfq.commands.serve.shutil.which", lambda _: "/usr/bin/npm")
 
     def run(command, **_):
         calls.append(command)
@@ -206,7 +206,7 @@ def test_serve_builds_web_ui_when_the_source_is_newer(tmp_path: Path, monkeypatc
             (web / "dist").mkdir()
             (web / "dist" / "index.html").write_text("ready", encoding="utf-8")
 
-    monkeypatch.setattr("mfq.server.cli.subprocess.run", run)
+    monkeypatch.setattr("mfq.commands.serve.subprocess.run", run)
 
     assert _prepare_web_root(None, disabled=False) == web / "dist"
     assert calls == [["/usr/bin/npm", "ci"], ["/usr/bin/npm", "run", "build"]]
@@ -248,7 +248,7 @@ def test_serve_validates_web_ui_before_backend_build_or_model_load(
         ]
     )
     monkeypatch.setattr(
-        "mfq.server.cli.detect_backend",
+        "mfq.commands.serve.detect_backend",
         lambda _: (_ for _ in ()).throw(AssertionError("backend detection must not run")),
     )
 
@@ -258,7 +258,7 @@ def test_serve_validates_web_ui_before_backend_build_or_model_load(
 
 def test_serve_can_disable_web_ui_build(monkeypatch) -> None:
     monkeypatch.setattr(
-        "mfq.server.cli._studio_dir",
+        "mfq.commands.serve._studio_dir",
         lambda: (_ for _ in ()).throw(AssertionError("should not inspect Studio")),
     )
 

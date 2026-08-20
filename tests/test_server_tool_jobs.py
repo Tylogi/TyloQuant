@@ -8,11 +8,11 @@ from pathlib import Path
 
 import numpy as np
 
+from mfq.commands.serve import _console_script_dir
 from mfq.formats.header import FileHeader
 from mfq.formats.io import save
 from mfq.quantize.imatrix import ImportanceEntry, save_importance_matrix
 from mfq.server.catalog import ModelCatalog
-from mfq.server.cli import _console_script_dir
 from mfq.server.jobs import JobManager
 from mfq.server.models import CreateJobRequest, JobStatus
 from mfq.server.storage import SessionStore
