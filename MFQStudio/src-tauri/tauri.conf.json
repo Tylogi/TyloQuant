@@ -27,29 +27,12 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["dmg"],
-    "externalBin": [
-      "../../release/sidecars/mfq-decode-metal",
-      "../../release/sidecars/mfq-perplexity"
-    ],
-    "resources": {
-      "../../release/Resources/mlx.metallib": "mlx.metallib",
-      "../../release/Resources/mfq-cli": "mfq-cli"
-    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/256x256.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ],
-    "macOS": {
-      "minimumSystemVersion": "26.2",
-      "frameworks": [
-        "../../release/Frameworks/libmlx.dylib",
-        "../../release/Frameworks/libjaccl.dylib",
-        "../../release/Frameworks/libmfq_avfoundation_video.dylib"
-      ]
-    }
+    ]
   }
 }

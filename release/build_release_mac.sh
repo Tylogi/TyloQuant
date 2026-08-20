@@ -173,7 +173,9 @@ npm ci
 npm run check
 CI=true \
 APPLE_SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:-${mfq_signing_identity}}" \
-  npm run tauri build -- --target "${mfq_tauri_target}"
+  npm run tauri -- build \
+    --config src-tauri/tauri.release-macos.conf.json \
+    --target "${mfq_tauri_target}"
 
 [[ -d "${mfq_dmg_dir}" ]] || fail "Tauri did not create a DMG directory"
 mfq_dmg_path="$(find "${mfq_dmg_dir}" -maxdepth 1 -type f -name '*.dmg' -print -quit)"

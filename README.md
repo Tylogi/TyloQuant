@@ -236,6 +236,7 @@ sampling-penalty kernels remain GPU-resident.
 - [Expert-Wise Joint Budget Solver](./docs/ew-joint-solver.md)
 - [`mfq serve` and model management](./docs/cli/serve.md)
 - [Self-contained macOS release](./docs/release-macos.md)
+- [Self-contained Windows release](./docs/release-windows.md)
 
 ## Acknowledgements
 

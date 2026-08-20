@@ -1,0 +1,21 @@
+{
+  "bundle": {
+    "targets": ["dmg"],
+    "externalBin": [
+      "../../release/sidecars/mfq-decode-metal",
+      "../../release/sidecars/mfq-perplexity"
+    ],
+    "resources": {
+      "../../release/Resources/mlx.metallib": "mlx.metallib",
+      "../../release/Resources/mfq-cli": "mfq-cli"
+    },
+    "macOS": {
+      "minimumSystemVersion": "26.2",
+      "frameworks": [
+        "../../release/Frameworks/libmlx.dylib",
+        "../../release/Frameworks/libjaccl.dylib",
+        "../../release/Frameworks/libmfq_avfoundation_video.dylib"
+      ]
+    }
+  }
+}
