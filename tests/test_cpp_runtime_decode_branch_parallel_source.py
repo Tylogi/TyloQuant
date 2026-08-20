@@ -11,7 +11,7 @@ def test_decode_branch_executor_forks_and_joins_cuda_streams() -> None:
     assert "struct CudaIndependentBranchExecutor" in SOURCE
     assert "cudaEventRecord(" in SOURCE
     assert "cudaStreamWaitEvent(" in SOURCE
-    assert "CUDACachingAllocator::recordStream(" in SOURCE
+    assert "mfq_cuda_record_stream(" in SOURCE
 
 
 def test_decode_branch_parallelism_is_decode_only_and_graph_safe() -> None:

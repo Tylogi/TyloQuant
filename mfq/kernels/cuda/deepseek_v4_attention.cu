@@ -1,6 +1,5 @@
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
 #include <cuda_runtime.h>
+#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #if CUDART_VERSION >= 12080
@@ -981,13 +980,13 @@ __global__ void dsv4_sparse_attention_kernel(
 }
 
 template<int ncols1, int ncols2>
-torch::Tensor launch_dsv4_sparse_attention(
-    torch::Tensor q,
-    torch::Tensor kv,
-    torch::Tensor indices,
-    torch::Tensor mask,
-    torch::Tensor sinks,
-    torch::Tensor meta,
+mfq_tensor_backend::Tensor launch_dsv4_sparse_attention(
+    mfq_tensor_backend::Tensor q,
+    mfq_tensor_backend::Tensor kv,
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor mask,
+    mfq_tensor_backend::Tensor sinks,
+    mfq_tensor_backend::Tensor meta,
     double scale)
 {
     constexpr int ncols = ncols1 * ncols2;
@@ -997,10 +996,10 @@ torch::Tensor launch_dsv4_sparse_attention(
     const int selected = static_cast<int>(indices.size(2));
     int device = 0;
     cudaDeviceProp properties{};
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         cudaGetDevice(&device) == cudaSuccess,
         "dsv4_sparse_attention: cudaGetDevice failed");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         cudaGetDeviceProperties(&properties, device) == cudaSuccess,
         "dsv4_sparse_attention: cudaGetDeviceProperties failed");
     const int cc = properties.major * 100 + properties.minor * 10;
@@ -1038,14 +1037,14 @@ torch::Tensor launch_dsv4_sparse_attention(
         &dsv4_sparse_attention_kernel<ncols1, ncols2>);
     Kernel kernel = dsv4_sparse_attention_kernel<ncols1, ncols2>;
     static bool shmem_set[32] = {};
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         device >= 0 && device < 32,
         "dsv4_sparse_attention: unsupported CUDA device index");
     if (!shmem_set[device]) {
         const cudaError_t status = cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
             static_cast<int>(shmem));
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             status == cudaSuccess,
             "dsv4_sparse_attention: shared-memory attribute failed: ",
             cudaGetErrorString(status));
@@ -1058,7 +1057,7 @@ torch::Tensor launch_dsv4_sparse_attention(
     int max_blocks_per_sm = 0;
     cudaError_t status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &max_blocks_per_sm, kernel, nthreads, shmem);
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         status == cudaSuccess && max_blocks_per_sm > 0,
         "dsv4_sparse_attention: occupancy query failed: ",
         cudaGetErrorString(status));
@@ -1072,26 +1071,26 @@ torch::Tensor launch_dsv4_sparse_attention(
     const size_t meta_float2 =
         static_cast<size_t>(rounded_blocks) * ncols *
         (2 + kHeadDim / 2);
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         blocks_per_tile == 1 ||
             static_cast<size_t>(meta.numel()) >= 2 * meta_float2,
         "dsv4_sparse_attention: meta workspace too small, need ",
         2 * meta_float2, " float elements");
 
-    auto out = torch::empty({B, M, kHeads, kHeadDim}, q.options());
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto out = mfq_tensor_backend::empty({B, M, kHeads, kHeadDim}, q.options());
+    auto stream = mfq_current_cuda_stream();
     kernel<<<rounded_blocks, dim3(32, nwarps, 1), shmem, stream>>>(
         q.data_ptr<float>(),
-        reinterpret_cast<const half *>(kv.data_ptr<at::Half>()),
+        reinterpret_cast<const half *>(kv.data_ptr<mfq_half>()),
         indices.data_ptr<int>(),
-        reinterpret_cast<const half *>(mask.data_ptr<at::Half>()),
+        reinterpret_cast<const half *>(mask.data_ptr<mfq_half>()),
         sinks.data_ptr<float>(),
         out.data_ptr<float>(),
         reinterpret_cast<float2 *>(meta.data_ptr<float>()),
         static_cast<float>(scale), B, M, max_seq, selected,
         init_fastdiv_values(M));
     status = cudaGetLastError();
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         status == cudaSuccess,
         "dsv4_sparse_attention launch failed: ",
         cudaGetErrorString(status));
@@ -1108,7 +1107,7 @@ torch::Tensor launch_dsv4_sparse_attention(
                 M, kHeads, 1, rounded_blocks, kHeads,
                 blocks_per_tile, fd0, fd1, fd2);
         status = cudaGetLastError();
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             status == cudaSuccess,
             "dsv4_sparse_attention fixup failed: ",
             cudaGetErrorString(status));
@@ -1118,83 +1117,83 @@ torch::Tensor launch_dsv4_sparse_attention(
 
 } // namespace
 
-torch::Tensor dsv4_fp4_sim_cuda(torch::Tensor input) {
-    TORCH_CHECK(
+mfq_tensor_backend::Tensor dsv4_fp4_sim_cuda(mfq_tensor_backend::Tensor input) {
+    MFQ_RUNTIME_CHECK(
         input.is_cuda() && input.is_contiguous() &&
-            input.scalar_type() == torch::kFloat16 &&
+            input.scalar_type() == mfq_tensor_backend::kFloat16 &&
             input.dim() >= 1 && input.size(-1) % 32 == 0,
         "dsv4_fp4_sim: expected contiguous CUDA f16 with last dimension divisible by 32");
-    auto output = torch::empty_like(input);
+    auto output = mfq_tensor_backend::empty_like(input);
     const int64_t groups = input.numel() / 32;
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         groups > 0 && groups <= std::numeric_limits<int>::max(),
         "dsv4_fp4_sim: invalid group count");
     dsv4_fp4_sim_kernel<<<
         static_cast<int>(groups), 32, 0,
-        at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const half *>(input.data_ptr<at::Half>()),
-        reinterpret_cast<half *>(output.data_ptr<at::Half>()));
+        mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const half *>(input.data_ptr<mfq_half>()),
+        reinterpret_cast<half *>(output.data_ptr<mfq_half>()));
     const cudaError_t status = cudaGetLastError();
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         status == cudaSuccess,
         "dsv4_fp4_sim launch failed: ",
         cudaGetErrorString(status));
     return output;
 }
 
-torch::Tensor dsv4_compress_cuda(
-    torch::Tensor kv,
-    torch::Tensor gate,
-    torch::Tensor ape,
-    torch::Tensor norm,
-    torch::Tensor prev_kv,
-    torch::Tensor prev_gate,
-    torch::Tensor positions,
-    torch::Tensor cos,
-    torch::Tensor sin,
+mfq_tensor_backend::Tensor dsv4_compress_cuda(
+    mfq_tensor_backend::Tensor kv,
+    mfq_tensor_backend::Tensor gate,
+    mfq_tensor_backend::Tensor ape,
+    mfq_tensor_backend::Tensor norm,
+    mfq_tensor_backend::Tensor prev_kv,
+    mfq_tensor_backend::Tensor prev_gate,
+    mfq_tensor_backend::Tensor positions,
+    mfq_tensor_backend::Tensor cos,
+    mfq_tensor_backend::Tensor sin,
     int64_t ratio,
     bool overlap,
     int64_t quant_mode,
     double eps)
 {
     const auto scalar_type = kv.scalar_type();
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         kv.is_cuda() && kv.is_contiguous() &&
-            (scalar_type == torch::kFloat16 ||
-             scalar_type == torch::kFloat32) &&
+            (scalar_type == mfq_tensor_backend::kFloat16 ||
+             scalar_type == mfq_tensor_backend::kFloat32) &&
             gate.is_cuda() && gate.is_contiguous() &&
             gate.scalar_type() == scalar_type &&
             kv.sizes() == gate.sizes(),
         "dsv4_compress: kv/gate must be matching contiguous CUDA f16/f32");
     const int64_t head_dim = norm.numel();
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         (head_dim == kHeadDim || head_dim == kIndexerDim) &&
             kv.dim() == 4 && kv.size(2) == ratio &&
             ratio > 0 && ratio <= 128 &&
             kv.size(3) == (overlap ? 2 * head_dim : head_dim),
         "dsv4_compress: expected [B,W,ratio,D or 2D], D=128 or 512");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         ape.is_cuda() && ape.is_contiguous() &&
-            ape.scalar_type() == torch::kFloat32 &&
+            ape.scalar_type() == mfq_tensor_backend::kFloat32 &&
             ape.dim() == 2 && ape.size(0) == ratio &&
             ape.size(1) == kv.size(3) &&
             norm.is_cuda() && norm.is_contiguous() &&
-            norm.scalar_type() == torch::kFloat32 &&
+            norm.scalar_type() == mfq_tensor_backend::kFloat32 &&
             norm.numel() == head_dim,
         "dsv4_compress: invalid APE or norm");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         positions.is_cuda() && positions.is_contiguous() &&
-            positions.scalar_type() == torch::kInt64 &&
+            positions.scalar_type() == mfq_tensor_backend::kInt64 &&
             positions.numel() == kv.size(0) * kv.size(1) &&
             cos.is_cuda() && cos.is_contiguous() &&
-            cos.scalar_type() == torch::kFloat32 &&
+            cos.scalar_type() == mfq_tensor_backend::kFloat32 &&
             sin.is_cuda() && sin.is_contiguous() &&
-            sin.scalar_type() == torch::kFloat32 &&
+            sin.scalar_type() == mfq_tensor_backend::kFloat32 &&
             cos.dim() == 2 && sin.sizes() == cos.sizes() &&
             cos.size(1) >= 32,
         "dsv4_compress: invalid positions or RoPE table");
     const bool has_prev = prev_kv.numel() != 0;
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         !has_prev ||
             (overlap && prev_kv.is_cuda() && prev_kv.is_contiguous() &&
              prev_kv.scalar_type() == scalar_type &&
@@ -1204,21 +1203,21 @@ torch::Tensor dsv4_compress_cuda(
              prev_kv.dim() == 3 && prev_kv.size(0) == kv.size(0) &&
              prev_kv.size(1) == ratio && prev_kv.size(2) == head_dim),
         "dsv4_compress: invalid overlap state");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         quant_mode == 0 ||
             (quant_mode == 1 && head_dim == kHeadDim) ||
             (quant_mode == 2 && head_dim == kIndexerDim),
         "dsv4_compress: quant_mode must match D=512 FP8 or D=128 FP4 cache");
-    auto out = torch::empty(
+    auto out = mfq_tensor_backend::empty(
         {kv.size(0), kv.size(1), head_dim},
-        kv.options().dtype(torch::kFloat16));
+        kv.options().dtype(mfq_tensor_backend::kFloat16));
     const int blocks =
         static_cast<int>(kv.size(0) * kv.size(1));
     auto launch = [&](auto scalar_tag, auto head_tag) {
         using scalar_t = typename decltype(scalar_tag)::type;
         constexpr int D = decltype(head_tag)::value;
         dsv4_compress_kernel<scalar_t, D><<<
-            blocks, D, 0, at::cuda::getCurrentCUDAStream()>>>(
+            blocks, D, 0, mfq_current_cuda_stream()>>>(
             reinterpret_cast<const scalar_t *>(kv.data_ptr()),
             reinterpret_cast<const scalar_t *>(gate.data_ptr()),
             ape.data_ptr<float>(), norm.data_ptr<float>(),
@@ -1230,17 +1229,17 @@ torch::Tensor dsv4_compress_cuda(
                 : nullptr,
             positions.data_ptr<int64_t>(), cos.data_ptr<float>(),
             sin.data_ptr<float>(),
-            reinterpret_cast<half *>(out.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(out.data_ptr<mfq_half>()),
             static_cast<int>(kv.size(0)), static_cast<int>(kv.size(1)),
             static_cast<int>(ratio), static_cast<int>(kv.size(3)),
             overlap ? 1 : 0, has_prev ? 1 : 0, 64,
             static_cast<int>(cos.size(1)), static_cast<int>(quant_mode),
             static_cast<float>(eps));
     };
-    if (scalar_type == torch::kFloat32 && head_dim == kHeadDim) {
+    if (scalar_type == mfq_tensor_backend::kFloat32 && head_dim == kHeadDim) {
         launch(Dsv4TypeTag<float>{},
                std::integral_constant<int, kHeadDim>{});
-    } else if (scalar_type == torch::kFloat32) {
+    } else if (scalar_type == mfq_tensor_backend::kFloat32) {
         launch(Dsv4TypeTag<float>{},
                std::integral_constant<int, kIndexerDim>{});
     } else if (head_dim == kHeadDim) {
@@ -1251,25 +1250,25 @@ torch::Tensor dsv4_compress_cuda(
                std::integral_constant<int, kIndexerDim>{});
     }
     const cudaError_t status = cudaGetLastError();
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         status == cudaSuccess,
         "dsv4_compress launch failed: ", cudaGetErrorString(status));
     return out;
 }
 
-torch::Tensor dsv4_decode_pool_update_cuda(
-    torch::Tensor kv_token,
-    torch::Tensor gate_token,
-    torch::Tensor ape,
-    torch::Tensor norm,
-    torch::Tensor state_kv,
-    torch::Tensor state_gate,
-    torch::Tensor prev_kv,
-    torch::Tensor prev_gate,
-    torch::Tensor pool,
-    torch::Tensor seq_len,
-    torch::Tensor cos,
-    torch::Tensor sin,
+mfq_tensor_backend::Tensor dsv4_decode_pool_update_cuda(
+    mfq_tensor_backend::Tensor kv_token,
+    mfq_tensor_backend::Tensor gate_token,
+    mfq_tensor_backend::Tensor ape,
+    mfq_tensor_backend::Tensor norm,
+    mfq_tensor_backend::Tensor state_kv,
+    mfq_tensor_backend::Tensor state_gate,
+    mfq_tensor_backend::Tensor prev_kv,
+    mfq_tensor_backend::Tensor prev_gate,
+    mfq_tensor_backend::Tensor pool,
+    mfq_tensor_backend::Tensor seq_len,
+    mfq_tensor_backend::Tensor cos,
+    mfq_tensor_backend::Tensor sin,
     int64_t ratio,
     bool overlap,
     int64_t quant_mode,
@@ -1277,14 +1276,14 @@ torch::Tensor dsv4_decode_pool_update_cuda(
 {
     const int64_t head_dim = norm.numel();
     const auto scalar_type = kv_token.scalar_type();
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         head_dim == kHeadDim || head_dim == kIndexerDim,
         "dsv4_decode_pool_update: D must be 128 or 512");
     const int64_t out_dim = overlap ? 2 * head_dim : head_dim;
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         kv_token.is_cuda() && kv_token.is_contiguous() &&
-            (scalar_type == torch::kFloat16 ||
-             scalar_type == torch::kFloat32) &&
+            (scalar_type == mfq_tensor_backend::kFloat16 ||
+             scalar_type == mfq_tensor_backend::kFloat32) &&
             gate_token.is_cuda() && gate_token.is_contiguous() &&
             gate_token.scalar_type() == scalar_type &&
             kv_token.sizes() == gate_token.sizes() &&
@@ -1292,7 +1291,7 @@ torch::Tensor dsv4_decode_pool_update_cuda(
             kv_token.size(2) == out_dim,
         "dsv4_decode_pool_update: invalid projected token");
     const int64_t B = kv_token.size(0);
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         state_kv.is_cuda() && state_kv.is_contiguous() &&
             state_kv.scalar_type() == scalar_type &&
             state_gate.is_cuda() && state_gate.is_contiguous() &&
@@ -1302,7 +1301,7 @@ torch::Tensor dsv4_decode_pool_update_cuda(
             state_kv.size(1) == ratio && state_kv.size(2) == out_dim &&
             ratio > 0 && ratio <= 128,
         "dsv4_decode_pool_update: invalid remainder state");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         !overlap ||
             (prev_kv.is_cuda() && prev_kv.is_contiguous() &&
              prev_kv.scalar_type() == scalar_type &&
@@ -1312,31 +1311,31 @@ torch::Tensor dsv4_decode_pool_update_cuda(
              prev_kv.dim() == 3 && prev_kv.size(0) == B &&
              prev_kv.size(1) == ratio && prev_kv.size(2) == head_dim),
         "dsv4_decode_pool_update: invalid overlap history");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         pool.is_cuda() && pool.is_contiguous() &&
-            pool.scalar_type() == torch::kFloat16 &&
+            pool.scalar_type() == mfq_tensor_backend::kFloat16 &&
             pool.dim() == 3 && pool.size(0) == B &&
             pool.size(1) > 0 && pool.size(2) == head_dim &&
             seq_len.is_cuda() && seq_len.is_contiguous() &&
-            seq_len.scalar_type() == torch::kInt64 &&
+            seq_len.scalar_type() == mfq_tensor_backend::kInt64 &&
             seq_len.numel() == B,
         "dsv4_decode_pool_update: invalid pool or sequence length");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         ape.is_cuda() && ape.is_contiguous() &&
-            ape.scalar_type() == torch::kFloat32 &&
+            ape.scalar_type() == mfq_tensor_backend::kFloat32 &&
             ape.dim() == 2 && ape.size(0) == ratio &&
             ape.size(1) == out_dim &&
             norm.is_cuda() && norm.is_contiguous() &&
-            norm.scalar_type() == torch::kFloat32 &&
+            norm.scalar_type() == mfq_tensor_backend::kFloat32 &&
             norm.numel() == head_dim &&
             cos.is_cuda() && cos.is_contiguous() &&
-            cos.scalar_type() == torch::kFloat32 &&
+            cos.scalar_type() == mfq_tensor_backend::kFloat32 &&
             sin.is_cuda() && sin.is_contiguous() &&
-            sin.scalar_type() == torch::kFloat32 &&
+            sin.scalar_type() == mfq_tensor_backend::kFloat32 &&
             cos.dim() == 2 && sin.sizes() == cos.sizes() &&
             cos.size(1) >= 32,
         "dsv4_decode_pool_update: invalid compressor parameters");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         quant_mode == 0 ||
             (quant_mode == 1 && head_dim == kHeadDim) ||
             (quant_mode == 2 && head_dim == kIndexerDim),
@@ -1348,7 +1347,7 @@ torch::Tensor dsv4_decode_pool_update_cuda(
             reinterpret_cast<scalar_t *>(state_kv.data_ptr());
         dsv4_decode_pool_update_kernel<scalar_t, D><<<
             static_cast<int>(B), D, 0,
-            at::cuda::getCurrentCUDAStream()>>>(
+            mfq_current_cuda_stream()>>>(
             reinterpret_cast<const scalar_t *>(kv_token.data_ptr()),
             reinterpret_cast<const scalar_t *>(gate_token.data_ptr()),
             ape.data_ptr<float>(), norm.data_ptr<float>(),
@@ -1360,7 +1359,7 @@ torch::Tensor dsv4_decode_pool_update_cuda(
             overlap
                 ? reinterpret_cast<scalar_t *>(prev_gate.data_ptr())
                 : empty_state,
-            reinterpret_cast<half *>(pool.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(pool.data_ptr<mfq_half>()),
             seq_len.data_ptr<int64_t>(), cos.data_ptr<float>(),
             sin.data_ptr<float>(), static_cast<int>(B),
             static_cast<int>(ratio), static_cast<int>(out_dim),
@@ -1368,10 +1367,10 @@ torch::Tensor dsv4_decode_pool_update_cuda(
             static_cast<int>(cos.size(1)), static_cast<int>(quant_mode),
             static_cast<float>(eps));
     };
-    if (scalar_type == torch::kFloat32 && head_dim == kHeadDim) {
+    if (scalar_type == mfq_tensor_backend::kFloat32 && head_dim == kHeadDim) {
         launch(Dsv4TypeTag<float>{},
                std::integral_constant<int, kHeadDim>{});
-    } else if (scalar_type == torch::kFloat32) {
+    } else if (scalar_type == mfq_tensor_backend::kFloat32) {
         launch(Dsv4TypeTag<float>{},
                std::integral_constant<int, kIndexerDim>{});
     } else if (head_dim == kHeadDim) {
@@ -1382,29 +1381,29 @@ torch::Tensor dsv4_decode_pool_update_cuda(
                std::integral_constant<int, kIndexerDim>{});
     }
     const cudaError_t status = cudaGetLastError();
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         status == cudaSuccess,
         "dsv4_decode_pool_update launch failed: ",
         cudaGetErrorString(status));
     return pool;
 }
 
-torch::Tensor dsv4_indexer_scores_cuda(
-    torch::Tensor q,
-    torch::Tensor k,
-    torch::Tensor weights,
+mfq_tensor_backend::Tensor dsv4_indexer_scores_cuda(
+    mfq_tensor_backend::Tensor q,
+    mfq_tensor_backend::Tensor k,
+    mfq_tensor_backend::Tensor weights,
     int64_t query_offset,
     int64_t ratio)
 {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         q.is_cuda() && q.is_contiguous() &&
-            q.scalar_type() == torch::kFloat16 &&
+            q.scalar_type() == mfq_tensor_backend::kFloat16 &&
             k.is_cuda() && k.is_contiguous() &&
-            k.scalar_type() == torch::kFloat16 &&
+            k.scalar_type() == mfq_tensor_backend::kFloat16 &&
             weights.is_cuda() && weights.is_contiguous() &&
-            weights.scalar_type() == torch::kFloat16,
+            weights.scalar_type() == mfq_tensor_backend::kFloat16,
         "dsv4_indexer_scores: tensors must be contiguous CUDA f16");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         q.dim() == 4 && q.size(2) == kIndexerHeads &&
             q.size(3) == kIndexerDim &&
             k.dim() == 3 && k.size(0) == q.size(0) &&
@@ -1417,32 +1416,32 @@ torch::Tensor dsv4_indexer_scores_cuda(
     const int B = static_cast<int>(q.size(0));
     const int M = static_cast<int>(q.size(1));
     const int K = static_cast<int>(k.size(1));
-    auto out = torch::empty({B, M, K}, q.options());
+    auto out = mfq_tensor_backend::empty({B, M, K}, q.options());
     const dim3 grid(
         (K + kIndexerKeysPerTile - 1) / kIndexerKeysPerTile, M, B);
     dsv4_indexer_scores_kernel<<<
         grid, dim3(32, 16, 1), 0,
-        at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const half *>(q.data_ptr<at::Half>()),
-        reinterpret_cast<const half *>(k.data_ptr<at::Half>()),
-        reinterpret_cast<const half *>(weights.data_ptr<at::Half>()),
-        reinterpret_cast<half *>(out.data_ptr<at::Half>()),
+        mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const half *>(q.data_ptr<mfq_half>()),
+        reinterpret_cast<const half *>(k.data_ptr<mfq_half>()),
+        reinterpret_cast<const half *>(weights.data_ptr<mfq_half>()),
+        reinterpret_cast<half *>(out.data_ptr<mfq_half>()),
         B, M, K, static_cast<int>(query_offset),
         static_cast<int>(ratio),
         1.0f / std::sqrt(
             static_cast<float>(kIndexerDim * kIndexerHeads)));
     const cudaError_t status = cudaGetLastError();
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         status == cudaSuccess,
         "dsv4_indexer_scores launch failed: ",
         cudaGetErrorString(status));
     return out;
 }
 
-torch::Tensor dsv4_topk512_cuda(torch::Tensor scores) {
-    TORCH_CHECK(
+mfq_tensor_backend::Tensor dsv4_topk512_cuda(mfq_tensor_backend::Tensor scores) {
+    MFQ_RUNTIME_CHECK(
         scores.is_cuda() && scores.is_contiguous() &&
-            scores.scalar_type() == torch::kFloat16 &&
+            scores.scalar_type() == mfq_tensor_backend::kFloat16 &&
             scores.dim() == 3 && scores.size(2) > 0 &&
             scores.size(0) * scores.size(1) <= INT_MAX &&
             scores.size(2) <= INT_MAX,
@@ -1450,31 +1449,31 @@ torch::Tensor dsv4_topk512_cuda(torch::Tensor scores) {
     const int rows =
         static_cast<int>(scores.size(0) * scores.size(1));
     const int K = static_cast<int>(scores.size(2));
-    auto out = torch::empty(
+    auto out = mfq_tensor_backend::empty(
         {scores.size(0), scores.size(1), kIndexerTopK},
-        scores.options().dtype(torch::kInt32));
+        scores.options().dtype(mfq_tensor_backend::kInt32));
     dsv4_topk_indices_kernel<kIndexerTopK><<<
-        rows, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const half *>(scores.data_ptr<at::Half>()),
+        rows, 256, 0, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const half *>(scores.data_ptr<mfq_half>()),
         out.data_ptr<int>(), rows, K);
     const cudaError_t status = cudaGetLastError();
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         status == cudaSuccess,
         "dsv4_topk512 launch failed: ", cudaGetErrorString(status));
     return out;
 }
 
-std::vector<torch::Tensor> dsv4_build_prefill_plan_cuda(
-    torch::Tensor topk,
+std::vector<mfq_tensor_backend::Tensor> dsv4_build_prefill_plan_cuda(
+    mfq_tensor_backend::Tensor topk,
     int64_t query_offset,
     int64_t local_history,
     int64_t pool_len,
     int64_t ratio,
     int64_t window)
 {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         topk.is_cuda() && topk.is_contiguous() &&
-            topk.scalar_type() == torch::kInt32 &&
+            topk.scalar_type() == mfq_tensor_backend::kInt32 &&
             topk.dim() == 3 && topk.size(1) > 0 &&
             query_offset >= 0 && local_history >= 0 &&
             pool_len >= 0 && ratio > 0 && window > 0,
@@ -1484,43 +1483,43 @@ std::vector<torch::Tensor> dsv4_build_prefill_plan_cuda(
     const int topk_count = static_cast<int>(topk.size(2));
     const int selected =
         ((static_cast<int>(window) + topk_count + 31) / 32) * 32;
-    auto indices = torch::empty(
+    auto indices = mfq_tensor_backend::empty(
         {B, M, selected}, topk.options());
-    auto mask = torch::empty(
+    auto mask = mfq_tensor_backend::empty(
         {B, M, selected},
-        topk.options().dtype(torch::kFloat16));
+        topk.options().dtype(mfq_tensor_backend::kFloat16));
     const int64_t total =
         static_cast<int64_t>(B) * M * selected;
     const int blocks = std::min<int64_t>(
         65535, std::max<int64_t>(1, (total + 255) / 256));
     dsv4_prefill_plan_kernel<<<
-        blocks, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        blocks, 256, 0, mfq_current_cuda_stream()>>>(
         topk.data_ptr<int>(), indices.data_ptr<int>(),
-        reinterpret_cast<half *>(mask.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(mask.data_ptr<mfq_half>()),
         B, M, topk_count, selected, static_cast<int>(query_offset),
         static_cast<int>(local_history), static_cast<int>(pool_len),
         static_cast<int>(ratio), static_cast<int>(window));
     const cudaError_t status = cudaGetLastError();
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         status == cudaSuccess,
         "dsv4_prefill_plan launch failed: ",
         cudaGetErrorString(status));
     return {indices, mask};
 }
 
-std::vector<torch::Tensor> dsv4_build_decode_plan_cuda(
-    torch::Tensor topk,
-    torch::Tensor seq_len,
+std::vector<mfq_tensor_backend::Tensor> dsv4_build_decode_plan_cuda(
+    mfq_tensor_backend::Tensor topk,
+    mfq_tensor_backend::Tensor seq_len,
     int64_t pool_len,
     int64_t ratio,
     int64_t window)
 {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         topk.is_cuda() && topk.is_contiguous() &&
-            topk.scalar_type() == torch::kInt32 &&
+            topk.scalar_type() == mfq_tensor_backend::kInt32 &&
             topk.dim() == 3 && topk.size(1) == 1 &&
             seq_len.is_cuda() && seq_len.is_contiguous() &&
-            seq_len.scalar_type() == torch::kInt64 &&
+            seq_len.scalar_type() == mfq_tensor_backend::kInt64 &&
             seq_len.numel() == topk.size(0) &&
             pool_len >= 0 && ratio > 0 && window > 0,
         "dsv4_decode_plan: invalid input");
@@ -1528,53 +1527,53 @@ std::vector<torch::Tensor> dsv4_build_decode_plan_cuda(
     const int topk_count = static_cast<int>(topk.size(2));
     const int selected =
         ((static_cast<int>(window) + topk_count + 31) / 32) * 32;
-    auto indices = torch::empty(
+    auto indices = mfq_tensor_backend::empty(
         {B, 1, selected}, topk.options());
-    auto mask = torch::empty(
+    auto mask = mfq_tensor_backend::empty(
         {B, 1, selected},
-        topk.options().dtype(torch::kFloat16));
+        topk.options().dtype(mfq_tensor_backend::kFloat16));
     const int64_t total = static_cast<int64_t>(B) * selected;
     const int blocks = std::min<int64_t>(
         65535, std::max<int64_t>(1, (total + 255) / 256));
     dsv4_decode_plan_kernel<<<
-        blocks, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        blocks, 256, 0, mfq_current_cuda_stream()>>>(
         topk.data_ptr<int>(), seq_len.data_ptr<int64_t>(),
         indices.data_ptr<int>(),
-        reinterpret_cast<half *>(mask.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(mask.data_ptr<mfq_half>()),
         B, topk_count, selected, static_cast<int>(pool_len),
         static_cast<int>(ratio), static_cast<int>(window));
     const cudaError_t status = cudaGetLastError();
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         status == cudaSuccess,
         "dsv4_decode_plan launch failed: ",
         cudaGetErrorString(status));
     return {indices, mask};
 }
 
-torch::Tensor attention_dsv4_sparse_cuda(
-    torch::Tensor q,
-    torch::Tensor kv,
-    torch::Tensor indices,
-    torch::Tensor mask,
-    torch::Tensor sinks,
-    torch::Tensor meta,
+mfq_tensor_backend::Tensor attention_dsv4_sparse_cuda(
+    mfq_tensor_backend::Tensor q,
+    mfq_tensor_backend::Tensor kv,
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor mask,
+    mfq_tensor_backend::Tensor sinks,
+    mfq_tensor_backend::Tensor meta,
     double scale)
 {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         q.is_cuda() && q.is_contiguous() &&
-            q.scalar_type() == torch::kFloat32 &&
+            q.scalar_type() == mfq_tensor_backend::kFloat32 &&
             kv.is_cuda() && kv.is_contiguous() &&
-            kv.scalar_type() == torch::kFloat16 &&
+            kv.scalar_type() == mfq_tensor_backend::kFloat16 &&
             indices.is_cuda() && indices.is_contiguous() &&
-            indices.scalar_type() == torch::kInt32 &&
+            indices.scalar_type() == mfq_tensor_backend::kInt32 &&
             mask.is_cuda() && mask.is_contiguous() &&
-            mask.scalar_type() == torch::kFloat16 &&
+            mask.scalar_type() == mfq_tensor_backend::kFloat16 &&
             sinks.is_cuda() && sinks.is_contiguous() &&
-            sinks.scalar_type() == torch::kFloat32 &&
+            sinks.scalar_type() == mfq_tensor_backend::kFloat32 &&
             meta.is_cuda() && meta.is_contiguous() &&
-            meta.scalar_type() == torch::kFloat32,
+            meta.scalar_type() == mfq_tensor_backend::kFloat32,
         "dsv4_sparse_attention: unsupported dtype or placement");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         q.dim() == 4 && q.size(1) == kHeads &&
             q.size(3) == kHeadDim &&
             kv.dim() == 3 && kv.size(0) == q.size(0) &&

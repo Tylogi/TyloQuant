@@ -42,7 +42,7 @@ def test_prefill_speed_uses_cuda_events_around_only_the_first_model_eval() -> No
     assert "cudaEventRecord(started_, stream_)" in RUNTIME
     assert "cudaEvent_t prefill_finished = nullptr" in RUNTIME
     assert RUNTIME.count(
-        "prefill_finished, at::cuda::getCurrentCUDAStream()"
+        "prefill_finished, mfq_get_current_cuda_stream()"
     ) == 2
     assert "prefill_timer.finished_event()" in RUNTIME
     assert "const int64_t token = next.item<int64_t>();" in RUNTIME
@@ -50,14 +50,20 @@ def test_prefill_speed_uses_cuda_events_around_only_the_first_model_eval() -> No
     assert "on_prefill(MfqPrefillTiming{" in RUNTIME
     assert "prompt.size() - reused_tokens,\n                prefill_ms,\n                0.0,\n                prefill_ms" in RUNTIME
 
-    sample = RUNTIME.split("static torch::Tensor sample_server_token(", 1)[1]
+    sample = RUNTIME.split(
+        "static mfq_tensor_backend::Tensor sample_server_token(", 1
+    )[1]
     sample = sample.split("class ServerPrefillCudaTimer", 1)[0]
     logits = sample.index("auto logits = model.last_logits(ids)")
     finished = sample.index("cudaEventRecord(", logits)
     sampling = sample.index("sample_server_logits(", logits)
     assert logits < finished < sampling
-    sampler = RUNTIME.split("static torch::Tensor sample_server_logits(", 1)[1]
-    sampler = sampler.split("static torch::Tensor sample_server_token(", 1)[0]
+    sampler = RUNTIME.split(
+        "static mfq_tensor_backend::Tensor sample_server_logits(", 1
+    )[1]
+    sampler = sampler.split(
+        "static mfq_tensor_backend::Tensor sample_server_token(", 1
+    )[0]
     assert "sample_apply_penalties_cuda(" in sampler
 
     first = RUNTIME.split("auto sample_first_token = [&]()", 1)[1]

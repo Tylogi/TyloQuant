@@ -84,12 +84,19 @@ macOS Terminal, or a Linux shell:
 ```shell
 git clone https://github.com/mfq/mfq.git MFQ
 cd MFQ
-# CUDA (Windows or Linux)
-uv sync --extra train --extra calibration --extra daemon
+# CUDA inference (Windows or Linux; no PyTorch/LibTorch required)
+uv sync --extra daemon
 
-# Metal (Apple silicon)
-uv sync --extra train --extra calibration --extra daemon --extra metal
+# Metal inference (Apple silicon)
+uv sync --extra daemon --extra metal
 uv run mfq build
+```
+
+Training and calibration are separate development workflows. Install their
+extras only on machines that use them:
+
+```shell
+uv sync --extra train --extra calibration
 ```
 
 `mfq build` detects the host OS and accelerator. To customize CMake

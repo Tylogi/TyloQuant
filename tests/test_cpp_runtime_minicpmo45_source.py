@@ -69,16 +69,16 @@ def test_minicpmo45_graph_binds_all_checkpoint_components():
 def test_minicpmo45_audio_and_tts_follow_official_attention_contracts():
     assert "query_positions / 50 + 1" in GRAPH
     assert "raw_lengths.to(" in GRAPH
-    assert "at::scaled_dot_product_attention(" in GRAPH
-    assert "torch::baddbmm(" in GRAPH
-    assert "at::linear(" in GRAPH
+    assert "mfq_scaled_dot_product_attention(" in GRAPH
+    assert "mfq_tensor_backend::baddbmm(" in GRAPH
+    assert "mfq_linear(" in GRAPH
     assert 'result.hf_model_prefix = "tts.model."' in GRAPH
     assert 'result.model_type = "minicpmtts"' in GRAPH
     assert 'model_type == "minicpmo" || model_type == "minicpmtts"' in DECODE
     assert "result.norm_weight_offset = 0.0" in GRAPH
     assert "cache_position += tokens" in GRAPH
     assert "generate_official(" in GRAPH
-    assert "torch::multinomial(" in GRAPH
+    assert "mfq_tensor_backend::multinomial(" in GRAPH
     assert "repetition_penalty = 1.05" in GRAPH
     assert "if (!generated.empty())" in GRAPH
     assert "sampled.size(1) - (hit_eos ? 1 : 0)" in GRAPH
@@ -92,13 +92,16 @@ def test_minicpmo45_resampler_requires_exact_numpy_position_asset():
     assert "sincos_position" not in GRAPH
 
 
-def test_minicpmo45_supports_python_tensor_files_and_bfloat16_tts():
-    assert "torch::pickle_load(bytes)" in GRAPH
-    assert "torch::pickle_save(" in GRAPH
-    assert "rr.scalar_type() == torch::kBFloat16" in DECODE
-    assert "ff2.scalar_type() == torch::kBFloat16" in DECODE
+def test_minicpmo45_supports_native_tensor_files_and_bfloat16_tts():
+    assert "mfq_tensor_backend::pickle_load(bytes)" in GRAPH
+    assert "mfq_tensor_backend::pickle_save(" in GRAPH
+    assert "MFQTNSR1" in (ROOT / "cpp_runtime" / "cuda" / "mfq_native_tensor.cpp").read_text(
+        encoding="utf-8"
+    )
+    assert "rr.scalar_type() == mfq_tensor_backend::kBFloat16" in DECODE
+    assert "ff2.scalar_type() == mfq_tensor_backend::kBFloat16" in DECODE
     assert "down.is_dense() || down.is_mxfp8()" in DECODE
-    assert "official_bf16 ? torch::kBFloat16" in DECODE
+    assert "official_bf16 ? mfq_tensor_backend::kBFloat16" in DECODE
 
 
 def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
@@ -109,27 +112,27 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
     assert "qwen_rms_norm_bf16_finalize_kernel" in NORM
     assert "qwen_rms_norm_pair_bf16_finalize_kernel" in NORM
     assert "attention_cache_decode_split_gqa4_d128_part_kernel" in ATTENTION
-    assert "at::ScalarType::BFloat16" in ATTENTION
+    assert "mfq_dispatch_bfloat16" in ATTENTION
     assert "minicpm_bf16_rope_cache_write_cuda" in DECODE
     assert 'std::getenv("MFQ_MINICPM_FUSED_ROPE_KV")' in DECODE
     assert "minicpm_bf16_rope_cache_write_kernel" in ROPE
     assert "minicpm_qk_norm_rope_cache_write_bf16_kernel" in NORM
     assert 'std::getenv("MFQ_MINICPM_FUSED_QK_NORM_ROPE_KV")' in DECODE
     assert "active_rope.apply_bf16" in DECODE
-    assert "official_bf16 ? torch::kBFloat16" in DECODE
-    assert "k.scalar_type() != torch::kFloat16" in DECODE
+    assert "official_bf16 ? mfq_tensor_backend::kBFloat16" in DECODE
+    assert "k.scalar_type() != mfq_tensor_backend::kFloat16" in DECODE
     assert 'std::getenv("MFQ_MINICPM_BF16_GQA_DECODE")' in DECODE
     assert "const bool bf16_gqa_decode = official_bf16 && T == 1" in DECODE
     assert "official_bf16 && !bf16_gqa_decode" in DECODE
-    assert "logits = logits.to(torch::kBFloat16)" in DECODE
+    assert "logits = logits.to(mfq_tensor_backend::kBFloat16)" in DECODE
     assert "repeated_k = kh.repeat_interleave(repeat, 1)" in DECODE
     assert '"full.minicpmo45_ffn_swiglu"' in DECODE
-    assert "torch::silu(gate) * up" in DECODE
+    assert "mfq_tensor_backend::silu(gate) * up" in DECODE
     assert "return logits_from_hidden(" in DECODE
-    assert "last.to(torch::kBFloat16)" in DECODE
+    assert "last.to(mfq_tensor_backend::kBFloat16)" in DECODE
     assert "cache_pos > 0 && T > 1" in DECODE
     assert "minicpmo45_attention_mask" in DECODE
-    assert "std::numeric_limits<c10::BFloat16>::lowest()" in DECODE
+    assert "std::numeric_limits<mfq_bfloat16>::lowest()" in DECODE
     assert "!c.is_minicpmo45() && cache_pos > 0" in DECODE
     assert "attention_mask.value().eq(1).all().item<bool>()" in DECODE
 
@@ -147,7 +150,7 @@ def test_minicpmo45_preserves_qkv_projection_boundaries():
 
 def test_minicpmo45_matches_official_rope_frequency_construction():
     assert "bool official_reciprocal_frequencies = false" in DECODE
-    assert "torch::reciprocal(" in DECODE
+    assert "mfq_tensor_backend::reciprocal(" in DECODE
     assert "freq.copy_(official_freq)" in DECODE
     assert "0, -1, device, c.is_minicpmo45())" in DECODE
     assert "rope_table_bf16_cuda" in DECODE
@@ -205,7 +208,8 @@ def test_minicpmo45_native_duplex_uses_official_sampling_contracts():
     assert "first_id == ids.chunk_eos" in GRAPH
     assert "selected / repetition_penalty" in GRAPH
     assert "logits.index_fill_" in GRAPH
-    assert "logits.topk(top_k" in GRAPH
+    assert "mfq_tensor_backend::topk(" in GRAPH
+    assert "logits, top_k, -1, true, true" in GRAPH
     assert "cumulative > top_p" in GRAPH
     assert "generate_duplex_chunk(" in GRAPH
     assert "sampled.size() > 16" in GRAPH

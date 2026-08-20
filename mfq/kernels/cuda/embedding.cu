@@ -3,9 +3,8 @@
 // NINT path: selected-row dequant from compressed token embedding rows.
 
 #include <cuda_fp16.h>
+#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
 #include <cuda_runtime.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
 
 template <int BITS>
 __device__ __forceinline__ uint8_t nint_unpack_qbits_one(const uint8_t* p, int lane)
@@ -218,206 +217,206 @@ __global__ void nint8_zero_embedding_lookup_kernel(
     }
 }
 
-torch::Tensor embedding_lookup_cuda(torch::Tensor weight, torch::Tensor token_ids)
+mfq_tensor_backend::Tensor embedding_lookup_cuda(mfq_tensor_backend::Tensor weight, mfq_tensor_backend::Tensor token_ids)
 {
-    TORCH_CHECK(weight.is_cuda() && weight.is_contiguous(), "embedding_lookup: weight must be cuda contiguous");
-    TORCH_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() && token_ids.scalar_type() == torch::kInt64,
+    MFQ_RUNTIME_CHECK(weight.is_cuda() && weight.is_contiguous(), "embedding_lookup: weight must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() && token_ids.scalar_type() == mfq_tensor_backend::kInt64,
                 "embedding_lookup: token_ids must be cuda contiguous int64");
-    TORCH_CHECK(weight.dim() == 2, "embedding_lookup: weight must be [vocab,D]");
-    TORCH_CHECK(weight.scalar_type() == torch::kFloat32 || weight.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(weight.dim() == 2, "embedding_lookup: weight must be [vocab,D]");
+    MFQ_RUNTIME_CHECK(weight.scalar_type() == mfq_tensor_backend::kFloat32 || weight.scalar_type() == mfq_tensor_backend::kFloat16,
                 "embedding_lookup: weight dtype must be f32 or f16");
     int vocab = (int)weight.size(0);
     int D = (int)weight.size(1);
     int N = (int)token_ids.numel();
     auto out_shape = token_ids.sizes().vec();
     out_shape.push_back(D);
-    auto out = torch::empty(out_shape, weight.options());
+    auto out = mfq_tensor_backend::empty(out_shape, weight.options());
     constexpr int BD = 256;
     size_t total = (size_t)N * D;
     int grid = (int)((total + BD - 1) / BD);
     grid = grid > 4096 ? 4096 : grid;
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(weight.scalar_type(), "embedding_lookup_cuda", [&] {
-        embedding_lookup_kernel<scalar_t><<<grid, BD, 0, at::cuda::getCurrentCUDAStream()>>>(
+    MFQ_DISPATCH_FLOATING_TYPES_AND_HALF(weight.scalar_type(), "embedding_lookup_cuda", [&] {
+        embedding_lookup_kernel<scalar_t><<<grid, BD, 0, mfq_current_cuda_stream()>>>(
             weight.data_ptr<scalar_t>(), token_ids.data_ptr<int64_t>(), out.data_ptr<scalar_t>(), N, D, vocab);
     });
     return out;
 }
 
-torch::Tensor nint_embedding_lookup_cuda(
-    torch::Tensor q,
-    torch::Tensor d_eff,
-    torch::Tensor m_eff,
-    torch::Tensor token_ids,
+mfq_tensor_backend::Tensor nint_embedding_lookup_cuda(
+    mfq_tensor_backend::Tensor q,
+    mfq_tensor_backend::Tensor d_eff,
+    mfq_tensor_backend::Tensor m_eff,
+    mfq_tensor_backend::Tensor token_ids,
     int64_t neuron_len,
     int64_t gs)
 {
-    TORCH_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == torch::kUInt8,
+    MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == mfq_tensor_backend::kUInt8,
                 "nint_embedding_lookup: q must be cuda contiguous uint8");
-    TORCH_CHECK(d_eff.is_cuda() && d_eff.is_contiguous() && d_eff.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(d_eff.is_cuda() && d_eff.is_contiguous() && d_eff.scalar_type() == mfq_tensor_backend::kFloat32,
                 "nint_embedding_lookup: d_eff must be cuda contiguous f32");
-    TORCH_CHECK(m_eff.is_cuda() && m_eff.is_contiguous() && m_eff.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(m_eff.is_cuda() && m_eff.is_contiguous() && m_eff.scalar_type() == mfq_tensor_backend::kFloat32,
                 "nint_embedding_lookup: m_eff must be cuda contiguous f32");
-    TORCH_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() && token_ids.scalar_type() == torch::kInt64,
+    MFQ_RUNTIME_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() && token_ids.scalar_type() == mfq_tensor_backend::kInt64,
                 "nint_embedding_lookup: token_ids must be cuda contiguous int64");
-    TORCH_CHECK(q.dim() == 3, "nint_embedding_lookup: q must be [vocab,ng,gs]");
+    MFQ_RUNTIME_CHECK(q.dim() == 3, "nint_embedding_lookup: q must be [vocab,ng,gs]");
     int vocab = (int)q.size(0);
     int ng = (int)q.size(1);
-    TORCH_CHECK(q.size(2) == gs, "nint_embedding_lookup: q gs mismatch");
-    TORCH_CHECK(d_eff.size(0) == vocab && d_eff.size(1) == ng && m_eff.sizes() == d_eff.sizes(),
+    MFQ_RUNTIME_CHECK(q.size(2) == gs, "nint_embedding_lookup: q gs mismatch");
+    MFQ_RUNTIME_CHECK(d_eff.size(0) == vocab && d_eff.size(1) == ng && m_eff.sizes() == d_eff.sizes(),
                 "nint_embedding_lookup: metadata shape mismatch");
     int D = (int)neuron_len;
     int N = (int)token_ids.numel();
     auto out_shape = token_ids.sizes().vec();
     out_shape.push_back(D);
-    auto out = torch::empty(out_shape, q.options().dtype(torch::kFloat16));
+    auto out = mfq_tensor_backend::empty(out_shape, q.options().dtype(mfq_tensor_backend::kFloat16));
     constexpr int BD = 256;
     size_t total = (size_t)N * D;
     int grid = (int)((total + BD - 1) / BD);
     grid = grid > 4096 ? 4096 : grid;
-    nint_embedding_lookup_kernel<<<grid, BD, 0, at::cuda::getCurrentCUDAStream()>>>(
+    nint_embedding_lookup_kernel<<<grid, BD, 0, mfq_current_cuda_stream()>>>(
         q.data_ptr<uint8_t>(), d_eff.data_ptr<float>(), m_eff.data_ptr<float>(),
-        token_ids.data_ptr<int64_t>(), reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        token_ids.data_ptr<int64_t>(), reinterpret_cast<half*>(out.data_ptr<mfq_half>()),
         N, vocab, ng, (int)gs, D);
     return out;
 }
 
-torch::Tensor nint_embedding_lookup_packed_eff_cuda(
-    torch::Tensor q_packed,
-    torch::Tensor eff_pair,
-    torch::Tensor token_ids,
+mfq_tensor_backend::Tensor nint_embedding_lookup_packed_eff_cuda(
+    mfq_tensor_backend::Tensor q_packed,
+    mfq_tensor_backend::Tensor eff_pair,
+    mfq_tensor_backend::Tensor token_ids,
     int64_t neuron_len,
     int64_t gs)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.is_contiguous() && q_packed.scalar_type() == torch::kUInt8,
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.is_contiguous() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8,
                 "nint_embedding_lookup_packed_eff: q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(eff_pair.is_cuda() && eff_pair.is_contiguous() && eff_pair.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(eff_pair.is_cuda() && eff_pair.is_contiguous() && eff_pair.scalar_type() == mfq_tensor_backend::kFloat16,
                 "nint_embedding_lookup_packed_eff: eff_pair must be cuda contiguous f16");
-    TORCH_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() && token_ids.scalar_type() == torch::kInt64,
+    MFQ_RUNTIME_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() && token_ids.scalar_type() == mfq_tensor_backend::kInt64,
                 "nint_embedding_lookup_packed_eff: token_ids must be cuda contiguous int64");
-    TORCH_CHECK(q_packed.dim() == 3, "nint_embedding_lookup_packed_eff: q_packed must be [vocab,ng,gs/2]");
-    TORCH_CHECK(eff_pair.dim() == 3 && eff_pair.size(2) == 2,
+    MFQ_RUNTIME_CHECK(q_packed.dim() == 3, "nint_embedding_lookup_packed_eff: q_packed must be [vocab,ng,gs/2]");
+    MFQ_RUNTIME_CHECK(eff_pair.dim() == 3 && eff_pair.size(2) == 2,
                 "nint_embedding_lookup_packed_eff: eff_pair must be [vocab,ng,2]");
     int vocab = (int)q_packed.size(0);
     int ng = (int)q_packed.size(1);
     int qbytes = (int)q_packed.size(2);
-    TORCH_CHECK(qbytes * 2 == gs, "nint_embedding_lookup_packed_eff: q_packed gs mismatch");
-    TORCH_CHECK(eff_pair.size(0) == vocab && eff_pair.size(1) == ng,
+    MFQ_RUNTIME_CHECK(qbytes * 2 == gs, "nint_embedding_lookup_packed_eff: q_packed gs mismatch");
+    MFQ_RUNTIME_CHECK(eff_pair.size(0) == vocab && eff_pair.size(1) == ng,
                 "nint_embedding_lookup_packed_eff: metadata shape mismatch");
     int D = (int)neuron_len;
     int N = (int)token_ids.numel();
     auto out_shape = token_ids.sizes().vec();
     out_shape.push_back(D);
-    auto out = torch::empty(out_shape, q_packed.options().dtype(torch::kFloat16));
+    auto out = mfq_tensor_backend::empty(out_shape, q_packed.options().dtype(mfq_tensor_backend::kFloat16));
     constexpr int BD = 256;
     size_t total = (size_t)N * D;
     int grid = (int)((total + BD - 1) / BD);
     grid = grid > 4096 ? 4096 : grid;
-    nint_embedding_lookup_packed_eff_kernel<<<grid, BD, 0, at::cuda::getCurrentCUDAStream()>>>(
-        q_packed.data_ptr<uint8_t>(), reinterpret_cast<const half2*>(eff_pair.data_ptr<at::Half>()),
-        token_ids.data_ptr<int64_t>(), reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+    nint_embedding_lookup_packed_eff_kernel<<<grid, BD, 0, mfq_current_cuda_stream()>>>(
+        q_packed.data_ptr<uint8_t>(), reinterpret_cast<const half2*>(eff_pair.data_ptr<mfq_half>()),
+        token_ids.data_ptr<int64_t>(), reinterpret_cast<half*>(out.data_ptr<mfq_half>()),
         N, vocab, ng, (int)gs, qbytes, D);
     return out;
 }
 
-torch::Tensor nint_embedding_lookup_packed_compact_cuda(
-    torch::Tensor q_packed,
-    torch::Tensor sub_scale,
-    torch::Tensor sub_min,
-    torch::Tensor neuron_scale,
-    torch::Tensor neuron_min,
-    torch::Tensor token_ids,
+mfq_tensor_backend::Tensor nint_embedding_lookup_packed_compact_cuda(
+    mfq_tensor_backend::Tensor q_packed,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor neuron_min,
+    mfq_tensor_backend::Tensor token_ids,
     int64_t neuron_len,
     int64_t gs)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.is_contiguous() && q_packed.scalar_type() == torch::kUInt8,
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.is_contiguous() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8,
                 "nint_embedding_lookup_packed_compact: q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.is_contiguous() && sub_scale.scalar_type() == torch::kUInt8,
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.is_contiguous() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8,
                 "nint_embedding_lookup_packed_compact: sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.is_contiguous() && sub_min.scalar_type() == torch::kUInt8,
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.is_contiguous() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8,
                 "nint_embedding_lookup_packed_compact: sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.is_contiguous() && neuron_scale.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.is_contiguous() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32,
                 "nint_embedding_lookup_packed_compact: neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.is_contiguous() && neuron_min.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.is_contiguous() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32,
                 "nint_embedding_lookup_packed_compact: neuron_min must be cuda contiguous f32");
-    TORCH_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() && token_ids.scalar_type() == torch::kInt64,
+    MFQ_RUNTIME_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() && token_ids.scalar_type() == mfq_tensor_backend::kInt64,
                 "nint_embedding_lookup_packed_compact: token_ids must be cuda contiguous int64");
-    TORCH_CHECK(q_packed.dim() == 3, "nint_embedding_lookup_packed_compact: q_packed must be [vocab,ng,gs/2]");
+    MFQ_RUNTIME_CHECK(q_packed.dim() == 3, "nint_embedding_lookup_packed_compact: q_packed must be [vocab,ng,gs/2]");
     int vocab = (int)q_packed.size(0);
     int ng = (int)q_packed.size(1);
     int qbytes = (int)q_packed.size(2);
-    TORCH_CHECK(qbytes * 2 == gs, "nint_embedding_lookup_packed_compact: q_packed gs mismatch");
-    TORCH_CHECK(sub_scale.size(0) == vocab && sub_scale.size(1) == ng,
+    MFQ_RUNTIME_CHECK(qbytes * 2 == gs, "nint_embedding_lookup_packed_compact: q_packed gs mismatch");
+    MFQ_RUNTIME_CHECK(sub_scale.size(0) == vocab && sub_scale.size(1) == ng,
                 "nint_embedding_lookup_packed_compact: sub_scale shape mismatch");
-    TORCH_CHECK(sub_min.sizes() == sub_scale.sizes(), "nint_embedding_lookup_packed_compact: sub_min shape mismatch");
-    TORCH_CHECK(neuron_scale.size(0) == vocab && neuron_min.size(0) == vocab,
+    MFQ_RUNTIME_CHECK(sub_min.sizes() == sub_scale.sizes(), "nint_embedding_lookup_packed_compact: sub_min shape mismatch");
+    MFQ_RUNTIME_CHECK(neuron_scale.size(0) == vocab && neuron_min.size(0) == vocab,
                 "nint_embedding_lookup_packed_compact: neuron metadata shape mismatch");
     int D = (int)neuron_len;
     int N = (int)token_ids.numel();
     auto out_shape = token_ids.sizes().vec();
     out_shape.push_back(D);
-    auto out = torch::empty(out_shape, q_packed.options().dtype(torch::kFloat16));
+    auto out = mfq_tensor_backend::empty(out_shape, q_packed.options().dtype(mfq_tensor_backend::kFloat16));
     constexpr int BD = 256;
     size_t total = (size_t)N * D;
     int grid = (int)((total + BD - 1) / BD);
     grid = grid > 4096 ? 4096 : grid;
-    nint_embedding_lookup_packed_compact_kernel<<<grid, BD, 0, at::cuda::getCurrentCUDAStream()>>>(
+    nint_embedding_lookup_packed_compact_kernel<<<grid, BD, 0, mfq_current_cuda_stream()>>>(
         q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(),
         neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(),
-        token_ids.data_ptr<int64_t>(), reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        token_ids.data_ptr<int64_t>(), reinterpret_cast<half*>(out.data_ptr<mfq_half>()),
         N, vocab, ng, (int)gs, qbytes, D);
     return out;
 }
 
-torch::Tensor nint_embedding_lookup_packed_compact_bits_cuda(
-    torch::Tensor q_packed,
-    torch::Tensor sub_scale,
-    torch::Tensor sub_min,
-    torch::Tensor neuron_scale,
-    torch::Tensor neuron_min,
-    torch::Tensor token_ids,
+mfq_tensor_backend::Tensor nint_embedding_lookup_packed_compact_bits_cuda(
+    mfq_tensor_backend::Tensor q_packed,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor neuron_min,
+    mfq_tensor_backend::Tensor token_ids,
     int64_t neuron_len,
     int64_t gs,
     int64_t bits)
 {
-    TORCH_CHECK(bits == 2 || bits == 3 || bits == 5 || bits == 6 || bits == 8,
+    MFQ_RUNTIME_CHECK(bits == 2 || bits == 3 || bits == 5 || bits == 6 || bits == 8,
                 "packed-bits embedding supports bits in {2,3,5,6,8}, got ", bits);
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.is_contiguous() && q_packed.scalar_type() == torch::kUInt8,
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.is_contiguous() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8,
                 "nint_embedding_lookup_packed_compact_bits: q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.is_contiguous() && sub_scale.scalar_type() == torch::kUInt8,
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.is_contiguous() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8,
                 "nint_embedding_lookup_packed_compact_bits: sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.is_contiguous() && sub_min.scalar_type() == torch::kUInt8,
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.is_contiguous() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8,
                 "nint_embedding_lookup_packed_compact_bits: sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.is_contiguous() && neuron_scale.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.is_contiguous() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32,
                 "nint_embedding_lookup_packed_compact_bits: neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.is_contiguous() && neuron_min.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.is_contiguous() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32,
                 "nint_embedding_lookup_packed_compact_bits: neuron_min must be cuda contiguous f32");
-    TORCH_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() && token_ids.scalar_type() == torch::kInt64,
+    MFQ_RUNTIME_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() && token_ids.scalar_type() == mfq_tensor_backend::kInt64,
                 "nint_embedding_lookup_packed_compact_bits: token_ids must be cuda contiguous int64");
-    TORCH_CHECK(q_packed.dim() == 3, "nint_embedding_lookup_packed_compact_bits: q_packed must be [vocab,ng,qbytes]");
+    MFQ_RUNTIME_CHECK(q_packed.dim() == 3, "nint_embedding_lookup_packed_compact_bits: q_packed must be [vocab,ng,qbytes]");
     int vocab = (int)q_packed.size(0);
     int ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) == (((int)gs * (int)bits + 7) / 8),
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) == (((int)gs * (int)bits + 7) / 8),
                 "nint_embedding_lookup_packed_compact_bits: q_packed gs/bits mismatch");
-    TORCH_CHECK(sub_scale.size(0) == vocab && sub_scale.size(1) == ng,
+    MFQ_RUNTIME_CHECK(sub_scale.size(0) == vocab && sub_scale.size(1) == ng,
                 "nint_embedding_lookup_packed_compact_bits: sub_scale shape mismatch");
-    TORCH_CHECK(sub_min.sizes() == sub_scale.sizes(), "nint_embedding_lookup_packed_compact_bits: sub_min shape mismatch");
-    TORCH_CHECK(neuron_scale.size(0) == vocab && neuron_min.size(0) == vocab,
+    MFQ_RUNTIME_CHECK(sub_min.sizes() == sub_scale.sizes(), "nint_embedding_lookup_packed_compact_bits: sub_min shape mismatch");
+    MFQ_RUNTIME_CHECK(neuron_scale.size(0) == vocab && neuron_min.size(0) == vocab,
                 "nint_embedding_lookup_packed_compact_bits: neuron metadata shape mismatch");
     int D = (int)neuron_len;
     int N = (int)token_ids.numel();
     auto out_shape = token_ids.sizes().vec();
     out_shape.push_back(D);
-    auto out = torch::empty(out_shape, q_packed.options().dtype(torch::kFloat16));
+    auto out = mfq_tensor_backend::empty(out_shape, q_packed.options().dtype(mfq_tensor_backend::kFloat16));
     constexpr int BD = 256;
     size_t total = (size_t)N * D;
     int grid = (int)((total + BD - 1) / BD);
     grid = grid > 4096 ? 4096 : grid;
 
 #define NINT_EMB_BITS_LAUNCH(BITSVAL, GSVAL)                                           \
-    nint_embedding_lookup_packed_compact_bits_kernel<BITSVAL, GSVAL><<<grid, BD, 0, at::cuda::getCurrentCUDAStream()>>>( \
+    nint_embedding_lookup_packed_compact_bits_kernel<BITSVAL, GSVAL><<<grid, BD, 0, mfq_current_cuda_stream()>>>( \
         q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
         neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), token_ids.data_ptr<int64_t>(), \
-        reinterpret_cast<half*>(out.data_ptr<at::Half>()), N, vocab, ng, D)
+        reinterpret_cast<half*>(out.data_ptr<mfq_half>()), N, vocab, ng, D)
 
 #define NINT_EMB_BITS_GS_SWITCH(BITSVAL)                                                \
     switch ((int)gs) {                                                                  \
@@ -434,7 +433,7 @@ torch::Tensor nint_embedding_lookup_packed_compact_bits_cuda(
         case 40: NINT_EMB_BITS_LAUNCH(BITSVAL, 40); break;                              \
         case 48: NINT_EMB_BITS_LAUNCH(BITSVAL, 48); break;                              \
         case 64: NINT_EMB_BITS_LAUNCH(BITSVAL, 64); break;                              \
-        default: TORCH_CHECK(false, "packed-bits embedding unsupported gs ", gs);        \
+        default: MFQ_RUNTIME_CHECK(false, "packed-bits embedding unsupported gs ", gs);        \
     }
 
     if (bits == 2) {
@@ -453,27 +452,27 @@ torch::Tensor nint_embedding_lookup_packed_compact_bits_cuda(
     return out;
 }
 
-torch::Tensor nint8_zero_embedding_lookup_cuda(
-    torch::Tensor q,
-    torch::Tensor scale,
-    torch::Tensor token_ids,
+mfq_tensor_backend::Tensor nint8_zero_embedding_lookup_cuda(
+    mfq_tensor_backend::Tensor q,
+    mfq_tensor_backend::Tensor scale,
+    mfq_tensor_backend::Tensor token_ids,
     int64_t neuron_len)
 {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         q.is_cuda() && q.is_contiguous() &&
-            q.scalar_type() == torch::kUInt8 && q.dim() == 3 &&
+            q.scalar_type() == mfq_tensor_backend::kUInt8 && q.dim() == 3 &&
             q.size(2) == 32,
         "NINT8-0 embedding q must be contiguous CUDA uint8 [vocab,ng,32]");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         scale.is_cuda() && scale.is_contiguous() &&
-            scale.scalar_type() == torch::kFloat16 && scale.dim() == 2 &&
+            scale.scalar_type() == mfq_tensor_backend::kFloat16 && scale.dim() == 2 &&
             scale.size(0) == q.size(0) && scale.size(1) == q.size(1),
         "NINT8-0 embedding scale must be contiguous CUDA f16 [vocab,ng]");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         token_ids.is_cuda() && token_ids.is_contiguous() &&
-            token_ids.scalar_type() == torch::kInt64,
+            token_ids.scalar_type() == mfq_tensor_backend::kInt64,
         "NINT8-0 embedding token_ids must be contiguous CUDA int64");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         neuron_len > 0 && neuron_len <= q.size(1) * 32,
         "NINT8-0 embedding neuron_len is invalid");
     const int vocab = static_cast<int>(q.size(0));
@@ -481,18 +480,18 @@ torch::Tensor nint8_zero_embedding_lookup_cuda(
     const int count = static_cast<int>(token_ids.numel());
     auto shape = token_ids.sizes().vec();
     shape.push_back(neuron_len);
-    auto out = torch::empty(shape, q.options().dtype(torch::kFloat16));
+    auto out = mfq_tensor_backend::empty(shape, q.options().dtype(mfq_tensor_backend::kFloat16));
     constexpr int threads = 256;
     const size_t total = static_cast<size_t>(count) * neuron_len;
     int blocks = static_cast<int>((total + threads - 1) / threads);
     blocks = std::min(blocks, 4096);
     nint8_zero_embedding_lookup_kernel<<<
-        blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        blocks, threads, 0, mfq_current_cuda_stream()>>>(
         reinterpret_cast<const int8_t *>(q.data_ptr<uint8_t>()),
-        reinterpret_cast<const half *>(scale.data_ptr<at::Half>()),
+        reinterpret_cast<const half *>(scale.data_ptr<mfq_half>()),
         token_ids.data_ptr<int64_t>(),
-        reinterpret_cast<half *>(out.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(out.data_ptr<mfq_half>()),
         count, vocab, ng, static_cast<int>(neuron_len));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }

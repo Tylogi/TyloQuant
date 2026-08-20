@@ -1,6 +1,30 @@
 cmake_minimum_required(VERSION 3.26)
 project(mfq_cpp_runtime LANGUAGES CXX)
 
+include(CTest)
+
+if(BUILD_TESTING)
+    add_executable(mfq-cuda-tensor-view-test
+        cuda/mfq_cuda_tensor_view_test.cpp
+    )
+    target_include_directories(mfq-cuda-tensor-view-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/cuda
+    )
+    target_compile_features(mfq-cuda-tensor-view-test PRIVATE cxx_std_20)
+    add_test(NAME mfq-cuda-tensor-view-test COMMAND mfq-cuda-tensor-view-test)
+
+    add_executable(mfq-native-tensor-test
+        cuda/mfq_native_tensor.cpp
+        cuda/mfq_native_tensor_cpu_test_stubs.cpp
+        cuda/mfq_native_tensor_test.cpp
+    )
+    target_include_directories(mfq-native-tensor-test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/cuda
+    )
+    target_compile_features(mfq-native-tensor-test PRIVATE cxx_std_20)
+    add_test(NAME mfq-native-tensor-test COMMAND mfq-native-tensor-test)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -209,10 +233,185 @@ if(NOT APPLE)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    set(MFQ_CUDA_ARCHITECTURES "86" CACHE STRING
+        "CUDA architectures compiled into MFQ CUDA targets")
 
     find_package(CUDAToolkit REQUIRED)
-    find_package(Python REQUIRED COMPONENTS Interpreter Development)
+
+    add_library(mfq-cuda-core STATIC
+        cuda/mfq_cuda_context.cu
+        cuda/mfq_native_tensor.cpp
+        cuda/mfq_native_tensor.cu
+        cuda/mfq_native_tensor_ops.cu
+    )
+    target_include_directories(mfq-cuda-core PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/cuda
+        ${CUDAToolkit_INCLUDE_DIRS}
+    )
+    target_link_libraries(mfq-cuda-core PUBLIC
+        CUDA::cudart
+        CUDA::cublas
+    )
+    target_compile_features(mfq-cuda-core PUBLIC cxx_std_20)
+    set_target_properties(mfq-cuda-core PROPERTIES
+        CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+        POSITION_INDEPENDENT_CODE ON
+    )
+    set(MFQ_CUDA_KERNEL_SOURCES
+        ../mfq/kernels/cuda/acc.cu
+        ../mfq/kernels/cuda/activation.cu
+        ../mfq/kernels/cuda/attention.cu
+        ../mfq/kernels/cuda/attention_llama.cu
+        ../mfq/kernels/cuda/deepseek_v4_attention.cu
+        ../mfq/kernels/cuda/deepseek_v4_hc.cu
+        ../mfq/kernels/cuda/embedding.cu
+        ../mfq/kernels/cuda/gated_delta_net.cu
+        ../mfq/kernels/cuda/glm_dsa.cu
+        ../mfq/kernels/cuda/kv_cache.cu
+        ../mfq/kernels/cuda/moe.cu
+        ../mfq/kernels/cuda/mx_matmul.cu
+        ../mfq/kernels/cuda/nepq.cu
+        ../mfq/kernels/cuda/nepq_residual.cu
+        ../mfq/kernels/cuda/nint_matmul.cu
+        ../mfq/kernels/cuda/norm.cu
+        ../mfq/kernels/cuda/nvq_matmul.cu
+        ../mfq/kernels/cuda/rope.cu
+        ../mfq/kernels/cuda/sampling.cu
+        ../mfq/kernels/cuda/ssm_conv.cu
+        ../mfq/kernels/cuda/tpq_matmul.cu
+    )
+    add_library(mfq-cuda-native-kernels STATIC
+        ${MFQ_CUDA_KERNEL_SOURCES}
+    )
+    target_compile_definitions(mfq-cuda-native-kernels PRIVATE
+        MFQ_NATIVE_CUDA_RUNTIME=1
+    )
+    target_include_directories(mfq-cuda-native-kernels PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/cuda
+        ${CMAKE_CURRENT_SOURCE_DIR}/../mfq/kernels/cuda
+        ${CUDAToolkit_INCLUDE_DIRS}
+        ${MFQ_LLAMA_SOURCE_DIR}
+        ${MFQ_LLAMA_SOURCE_DIR}/ggml/include
+        ${MFQ_LLAMA_SOURCE_DIR}/ggml/src
+        ${MFQ_LLAMA_SOURCE_DIR}/ggml/src/ggml-cuda
+    )
+    target_link_libraries(mfq-cuda-native-kernels PUBLIC mfq-cuda-core)
+    set_target_properties(mfq-cuda-native-kernels PROPERTIES
+        CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+        POSITION_INDEPENDENT_CODE ON
+    )
+    if(BUILD_TESTING)
+        add_executable(mfq-cuda-context-test
+            cuda/mfq_cuda_context_test.cu
+        )
+        target_link_libraries(mfq-cuda-context-test PRIVATE mfq-cuda-core)
+        set_target_properties(mfq-cuda-context-test PROPERTIES
+            CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
+        )
+        add_test(NAME mfq-cuda-context-test COMMAND mfq-cuda-context-test)
+        set_tests_properties(mfq-cuda-context-test PROPERTIES SKIP_RETURN_CODE 77)
+
+        add_executable(mfq-cuda-activation-test
+            cuda/mfq_cuda_activation_test.cu
+        )
+        target_link_libraries(mfq-cuda-activation-test PRIVATE
+            mfq-cuda-core
+            mfq-cuda-native-kernels
+        )
+        set_target_properties(mfq-cuda-activation-test PROPERTIES
+            CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
+        )
+        add_test(NAME mfq-cuda-activation-test COMMAND mfq-cuda-activation-test)
+        set_tests_properties(mfq-cuda-activation-test PROPERTIES SKIP_RETURN_CODE 77)
+
+        add_executable(mfq-native-tensor-cuda-test
+            cuda/mfq_native_tensor_cuda_test.cu
+        )
+        target_link_libraries(mfq-native-tensor-cuda-test PRIVATE mfq-cuda-core)
+        set_target_properties(mfq-native-tensor-cuda-test PROPERTIES
+            CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
+            CUDA_STANDARD 20
+            CUDA_STANDARD_REQUIRED ON
+        )
+        add_test(NAME mfq-native-tensor-cuda-test COMMAND mfq-native-tensor-cuda-test)
+        set_tests_properties(mfq-native-tensor-cuda-test PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
     find_package(Threads REQUIRED)
+    set(MFQ_NCCL_ROOT "" CACHE PATH
+        "Optional NCCL installation root for tensor-parallel inference")
+    if(UNIX)
+        find_library(MFQ_NCCL_LIBRARY
+            NAMES nccl libnccl.so.2
+            HINTS
+                "${MFQ_NCCL_ROOT}/lib"
+                "${MFQ_NCCL_ROOT}/lib64"
+                "$ENV{NCCL_ROOT}/lib"
+                "$ENV{NCCL_ROOT}/lib64")
+        find_path(MFQ_NCCL_INCLUDE_DIR
+            NAMES nccl.h
+            HINTS
+                "${MFQ_NCCL_ROOT}/include"
+                "$ENV{NCCL_ROOT}/include")
+    endif()
+
+add_executable(mfq-decode
+    mfq_decode.cpp
+    ggml_cuda_compat.cu
+)
+
+target_include_directories(mfq-decode PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/cuda
+    ${CUDAToolkit_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/nlohmann
+    ${MFQ_LLAMA_SOURCE_DIR}
+    ${MFQ_LLAMA_SOURCE_DIR}/common
+    ${MFQ_LLAMA_SOURCE_DIR}/include
+    ${MFQ_LLAMA_SOURCE_DIR}/ggml/include
+    ${MFQ_LLAMA_SOURCE_DIR}/ggml/src
+    ${MFQ_LLAMA_SOURCE_DIR}/ggml/src/ggml-cuda
+    ${MFQ_LLAMA_SOURCE_DIR}/vendor
+)
+target_link_libraries(mfq-decode PRIVATE
+    CUDA::cuda_driver
+    CUDA::cudart
+    CUDA::cublas
+    mfq-cuda-core
+    mfq-cuda-native-kernels
+    mfq-server
+)
+target_compile_definitions(mfq-decode PRIVATE
+    MFQ_NATIVE_CUDA_RUNTIME=1
+    NOMINMAX
+)
+target_compile_features(mfq-decode PRIVATE cxx_std_20)
+find_package(OpenMP QUIET)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(mfq-decode PRIVATE OpenMP::OpenMP_CXX)
+endif()
+if (MFQ_NCCL_LIBRARY AND MFQ_NCCL_INCLUDE_DIR)
+    target_include_directories(mfq-decode PRIVATE
+        "${MFQ_NCCL_INCLUDE_DIR}")
+    target_link_libraries(mfq-decode PRIVATE "${MFQ_NCCL_LIBRARY}")
+    target_compile_definitions(mfq-decode PRIVATE MFQ_HAVE_NCCL=1)
+endif()
+if (MSVC)
+    target_compile_options(mfq-decode PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>" "$<$<COMPILE_LANGUAGE:CXX>:/EHsc>")
+endif()
+
+option(
+    MFQ_BUILD_TORCH_REFERENCE_RUNTIME
+    "Build the optional LibTorch CUDA runtime used only for A/B validation"
+    OFF
+)
+if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
+    find_package(Python REQUIRED COMPONENTS Interpreter Development)
     if(NOT TARGET CUDA::nvToolsExt)
         find_library(NVTOOLSEXT_LIBRARY
             NAMES nvToolsExt nvToolsExt64_1
@@ -227,84 +426,53 @@ if(NOT APPLE)
         endif()
     endif()
     find_package(Torch REQUIRED)
-    if(UNIX)
-        get_filename_component(MFQ_PYTHON_SITE_PACKAGES
-            "${Torch_DIR}/../../../.." ABSOLUTE)
-        find_library(MFQ_NCCL_LIBRARY
-            NAMES nccl libnccl.so.2
-            HINTS "${MFQ_PYTHON_SITE_PACKAGES}/nvidia/nccl/lib")
-        find_path(MFQ_NCCL_INCLUDE_DIR
-            NAMES nccl.h
-            HINTS "${MFQ_PYTHON_SITE_PACKAGES}/nvidia/nccl/include")
+    add_executable(mfq-decode-torch
+        mfq_decode.cpp
+        ggml_cuda_compat.cu
+        ${MFQ_CUDA_KERNEL_SOURCES}
+    )
+    target_include_directories(mfq-decode-torch PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/cuda
+        ${CUDAToolkit_INCLUDE_DIRS}
+        ${Python_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/nlohmann
+        ${MFQ_LLAMA_SOURCE_DIR}
+        ${MFQ_LLAMA_SOURCE_DIR}/common
+        ${MFQ_LLAMA_SOURCE_DIR}/include
+        ${MFQ_LLAMA_SOURCE_DIR}/ggml/include
+        ${MFQ_LLAMA_SOURCE_DIR}/ggml/src
+        ${MFQ_LLAMA_SOURCE_DIR}/ggml/src/ggml-cuda
+        ${MFQ_LLAMA_SOURCE_DIR}/vendor
+    )
+    target_link_libraries(mfq-decode-torch PRIVATE
+        ${TORCH_LIBRARIES}
+        Python::Python
+        CUDA::cuda_driver
+        CUDA::cudart
+        CUDA::cublas
+        mfq-server
+    )
+    target_compile_definitions(mfq-decode-torch PRIVATE NOMINMAX)
+    target_compile_features(mfq-decode-torch PRIVATE cxx_std_17)
+    set_property(TARGET mfq-decode-torch PROPERTY
+        CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}")
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(mfq-decode-torch PRIVATE OpenMP::OpenMP_CXX)
     endif()
-
-add_executable(mfq-decode
-    mfq_decode.cpp
-    ggml_cuda_compat.cu
-    ../mfq/kernels/cuda/acc.cu
-    ../mfq/kernels/cuda/activation.cu
-    ../mfq/kernels/cuda/attention.cu
-    ../mfq/kernels/cuda/attention_llama.cu
-    ../mfq/kernels/cuda/deepseek_v4_attention.cu
-    ../mfq/kernels/cuda/deepseek_v4_hc.cu
-    ../mfq/kernels/cuda/embedding.cu
-    ../mfq/kernels/cuda/gated_delta_net.cu
-    ../mfq/kernels/cuda/glm_dsa.cu
-    ../mfq/kernels/cuda/kv_cache.cu
-    ../mfq/kernels/cuda/moe.cu
-    ../mfq/kernels/cuda/mx_matmul.cu
-    ../mfq/kernels/cuda/nint_matmul.cu
-    ../mfq/kernels/cuda/nvq_matmul.cu
-    ../mfq/kernels/cuda/nepq.cu
-    ../mfq/kernels/cuda/nepq_residual.cu
-    ../mfq/kernels/cuda/norm.cu
-    ../mfq/kernels/cuda/rope.cu
-    ../mfq/kernels/cuda/sampling.cu
-    ../mfq/kernels/cuda/ssm_conv.cu
-    ../mfq/kernels/cuda/tpq_matmul.cu
-)
-
-target_include_directories(mfq-decode PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/..
-    ${CUDAToolkit_INCLUDE_DIRS}
-    ${Python_INCLUDE_DIRS}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/nlohmann
-    ${MFQ_LLAMA_SOURCE_DIR}
-    ${MFQ_LLAMA_SOURCE_DIR}/common
-    ${MFQ_LLAMA_SOURCE_DIR}/include
-    ${MFQ_LLAMA_SOURCE_DIR}/ggml/include
-    ${MFQ_LLAMA_SOURCE_DIR}/ggml/src
-    ${MFQ_LLAMA_SOURCE_DIR}/ggml/src/ggml-cuda
-    ${MFQ_LLAMA_SOURCE_DIR}/vendor
-)
-target_link_libraries(mfq-decode PRIVATE
-    ${TORCH_LIBRARIES}
-    Python::Python
-    CUDA::cuda_driver
-    CUDA::cudart
-    CUDA::cublas
-    mfq-server
-)
-find_package(OpenMP QUIET)
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(mfq-decode PRIVATE OpenMP::OpenMP_CXX)
-endif()
-if (MFQ_NCCL_LIBRARY AND MFQ_NCCL_INCLUDE_DIR)
-    target_include_directories(mfq-decode PRIVATE
-        "${MFQ_NCCL_INCLUDE_DIR}")
-    target_link_libraries(mfq-decode PRIVATE "${MFQ_NCCL_LIBRARY}")
-    target_compile_definitions(mfq-decode PRIVATE MFQ_HAVE_NCCL=1)
-endif()
-target_compile_definitions(mfq-decode PRIVATE
-    NOMINMAX
-)
-
-if (MSVC)
-    target_compile_options(mfq-decode PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>" "$<$<COMPILE_LANGUAGE:CXX>:/EHsc>")
+    if(MFQ_NCCL_LIBRARY AND MFQ_NCCL_INCLUDE_DIR)
+        target_include_directories(mfq-decode-torch PRIVATE
+            "${MFQ_NCCL_INCLUDE_DIR}")
+        target_link_libraries(mfq-decode-torch PRIVATE "${MFQ_NCCL_LIBRARY}")
+        target_compile_definitions(mfq-decode-torch PRIVATE MFQ_HAVE_NCCL=1)
+    endif()
+    if(MSVC)
+        target_compile_options(mfq-decode-torch PRIVATE
+            "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>"
+            "$<$<COMPILE_LANGUAGE:CXX>:/EHsc>")
+    endif()
 endif()
 
-set(MFQ_CUDA_ARCHITECTURES "86" CACHE STRING
-    "CUDA architectures compiled into mfq-decode")
 set_property(TARGET mfq-decode PROPERTY
     CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}")
 if (NOT WIN32)

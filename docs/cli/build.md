@@ -18,8 +18,14 @@ cd /path/to/MFQ
 uv sync --extra metal
 ```
 
-On a CUDA host, use `uv sync --extra train` instead. Then let MFQ detect the
-backend and build it:
+On a CUDA host, the native build itself needs no Python accelerator package.
+Install the daemon extra only when serving through the HTTP API:
+
+```shell
+uv sync --extra daemon
+```
+
+Then let MFQ detect the backend and build it:
 
 ```shell
 uv run mfq build
@@ -142,7 +148,13 @@ uv run mfq build
 - Linux or Windows;
 - CMake 3.26 or newer;
 - a C++/CUDA toolchain with `nvcc`;
-- PyTorch, used to locate the CMake package for LibTorch.
+- CUDA Toolkit 12 or newer, including `nvcc`, cuBLAS, and the CUDA runtime.
+
+The default CUDA inference runtime is self-contained and does not require
+Python, PyTorch, or LibTorch. Developers doing migration A/B validation may
+explicitly configure `-DMFQ_BUILD_TORCH_REFERENCE_RUNTIME=ON`; that optional
+reference target has its own Python and LibTorch requirements and is not part
+of the normal runtime build.
 
 MFQ checks `CUDACXX`, `PATH`, `CUDA_HOME`, and `CUDA_PATH` when locating
 `nvcc`.

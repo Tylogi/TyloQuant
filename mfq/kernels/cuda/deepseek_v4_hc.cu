@@ -1,6 +1,5 @@
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
 #include <cuda_fp16.h>
+#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -247,96 +246,96 @@ __global__ void dsv4_hc_post_kernel(
 
 } // namespace
 
-std::vector<torch::Tensor> dsv4_hc_pre_cuda(
-    torch::Tensor x,
-    torch::Tensor mixes,
-    torch::Tensor scale,
-    torch::Tensor base,
+std::vector<mfq_tensor_backend::Tensor> dsv4_hc_pre_cuda(
+    mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor mixes,
+    mfq_tensor_backend::Tensor scale,
+    mfq_tensor_backend::Tensor base,
     int64_t iterations,
     double eps)
 {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         x.is_cuda() && x.is_contiguous() &&
-            x.scalar_type() == torch::kFloat16 &&
+            x.scalar_type() == mfq_tensor_backend::kFloat16 &&
             x.dim() == 4 && x.size(2) == kHyperConnections &&
             x.size(3) == 4096,
         "dsv4_hc_pre: x must be contiguous CUDA f16 [B,T,4,4096]");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         mixes.is_cuda() && mixes.is_contiguous() &&
-            mixes.scalar_type() == torch::kFloat32 &&
+            mixes.scalar_type() == mfq_tensor_backend::kFloat32 &&
             mixes.dim() == 3 && mixes.size(0) == x.size(0) &&
             mixes.size(1) == x.size(1) &&
             mixes.size(2) == kHyperMixWidth,
         "dsv4_hc_pre: mixes must be contiguous CUDA f32 [B,T,24]");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         scale.is_cuda() && scale.is_contiguous() &&
-            scale.scalar_type() == torch::kFloat32 &&
+            scale.scalar_type() == mfq_tensor_backend::kFloat32 &&
             scale.numel() == 3 &&
             base.is_cuda() && base.is_contiguous() &&
-            base.scalar_type() == torch::kFloat32 &&
+            base.scalar_type() == mfq_tensor_backend::kFloat32 &&
             base.numel() == kHyperMixWidth &&
             iterations == kHyperSinkhornIterations &&
             std::isfinite(eps) && eps > 0.0,
         "dsv4_hc_pre: invalid scale, base, iterations, or epsilon");
     const int64_t rows64 = x.size(0) * x.size(1);
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         rows64 > 0 && rows64 <= INT_MAX,
         "dsv4_hc_pre: row count is out of range");
     const int rows = static_cast<int>(rows64);
     const int hidden = static_cast<int>(x.size(3));
-    auto reduced = torch::empty(
+    auto reduced = mfq_tensor_backend::empty(
         {x.size(0), x.size(1), hidden}, x.options());
-    auto post = torch::empty(
+    auto post = mfq_tensor_backend::empty(
         {x.size(0), x.size(1), kHyperConnections},
         mixes.options());
-    auto combination = torch::empty(
+    auto combination = mfq_tensor_backend::empty(
         {x.size(0), x.size(1),
          kHyperConnections, kHyperConnections},
         mixes.options());
     dsv4_hc_pre_finalize_kernel<<<
-        rows, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
+        rows, 256, 0, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const half *>(x.data_ptr<mfq_half>()),
         mixes.data_ptr<float>(), scale.data_ptr<float>(),
         base.data_ptr<float>(),
-        reinterpret_cast<half *>(reduced.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(reduced.data_ptr<mfq_half>()),
         post.data_ptr<float>(), combination.data_ptr<float>(),
         rows, hidden, static_cast<float>(eps));
     const cudaError_t status = cudaGetLastError();
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         status == cudaSuccess,
         "dsv4_hc_pre launch failed: ", cudaGetErrorString(status));
     return {reduced, post, combination};
 }
 
-torch::Tensor dsv4_hc_post_cuda(
-    torch::Tensor x,
-    torch::Tensor residual,
-    torch::Tensor post,
-    torch::Tensor combination)
+mfq_tensor_backend::Tensor dsv4_hc_post_cuda(
+    mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor residual,
+    mfq_tensor_backend::Tensor post,
+    mfq_tensor_backend::Tensor combination)
 {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         x.is_cuda() && x.is_contiguous() &&
-            x.scalar_type() == torch::kFloat16 &&
+            x.scalar_type() == mfq_tensor_backend::kFloat16 &&
             x.dim() == 3 && x.size(2) == 4096,
         "dsv4_hc_post: x must be contiguous CUDA f16 [B,T,4096]");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         residual.is_cuda() && residual.is_contiguous() &&
-            residual.scalar_type() == torch::kFloat16 &&
+            residual.scalar_type() == mfq_tensor_backend::kFloat16 &&
             residual.dim() == 4 &&
             residual.size(0) == x.size(0) &&
             residual.size(1) == x.size(1) &&
             residual.size(2) == kHyperConnections &&
             residual.size(3) == x.size(2),
         "dsv4_hc_post: residual shape mismatch");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         post.is_cuda() && post.is_contiguous() &&
-            post.scalar_type() == torch::kFloat32 &&
+            post.scalar_type() == mfq_tensor_backend::kFloat32 &&
             post.dim() == 3 &&
             post.size(0) == x.size(0) &&
             post.size(1) == x.size(1) &&
             post.size(2) == kHyperConnections &&
             combination.is_cuda() && combination.is_contiguous() &&
-            combination.scalar_type() == torch::kFloat32 &&
+            combination.scalar_type() == mfq_tensor_backend::kFloat32 &&
             combination.dim() == 4 &&
             combination.size(0) == x.size(0) &&
             combination.size(1) == x.size(1) &&
@@ -344,24 +343,24 @@ torch::Tensor dsv4_hc_post_cuda(
             combination.size(3) == kHyperConnections,
         "dsv4_hc_post: post or combination shape mismatch");
     const int64_t rows64 = x.size(0) * x.size(1);
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         rows64 > 0 && rows64 <= 65535,
         "dsv4_hc_post: row count is out of range");
     const int rows = static_cast<int>(rows64);
     const int hidden = static_cast<int>(x.size(2));
-    auto output = torch::empty(
+    auto output = mfq_tensor_backend::empty(
         {x.size(0), x.size(1), kHyperConnections, hidden},
         residual.options());
     dsv4_hc_post_kernel<<<
         dim3((hidden + 255) / 256, rows, kHyperConnections),
-        256, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
-        reinterpret_cast<const half *>(residual.data_ptr<at::Half>()),
+        256, 0, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const half *>(x.data_ptr<mfq_half>()),
+        reinterpret_cast<const half *>(residual.data_ptr<mfq_half>()),
         post.data_ptr<float>(), combination.data_ptr<float>(),
-        reinterpret_cast<half *>(output.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(output.data_ptr<mfq_half>()),
         rows, hidden);
     const cudaError_t status = cudaGetLastError();
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         status == cudaSuccess,
         "dsv4_hc_post launch failed: ", cudaGetErrorString(status));
     return output;

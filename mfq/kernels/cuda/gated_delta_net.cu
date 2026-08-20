@@ -7,8 +7,7 @@
 // 64KB shared-mem opt-in via cudaFuncSetAttribute).
 
 #include <cuda_runtime.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
+#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
 #include <vector>
 #include <cstdlib>
 
@@ -291,67 +290,67 @@ __global__ void gdn_warp_column_kernel(
                 if (D == 32) { LAUNCH_GDN_WARP(32, true, true, TILED_VAL); }           \
                 else if (D == 64) { LAUNCH_GDN_WARP(64, true, true, TILED_VAL); }      \
                 else if (D == 128) { LAUNCH_GDN_WARP(128, true, true, TILED_VAL); }    \
-                else TORCH_CHECK(false, "GDN CUDA: D must be in {32,64,128}, got ", D); \
+                else MFQ_RUNTIME_CHECK(false, "GDN CUDA: D must be in {32,64,128}, got ", D); \
             } else {                                                                   \
                 if (D == 32) { LAUNCH_GDN_WARP(32, false, true, TILED_VAL); }          \
                 else if (D == 64) { LAUNCH_GDN_WARP(64, false, true, TILED_VAL); }     \
                 else if (D == 128) { LAUNCH_GDN_WARP(128, false, true, TILED_VAL); }   \
-                else TORCH_CHECK(false, "GDN CUDA: D must be in {32,64,128}, got ", D); \
+                else MFQ_RUNTIME_CHECK(false, "GDN CUDA: D must be in {32,64,128}, got ", D); \
             }                                                                          \
         } else if (kda) {                                                              \
             if (D == 32) { LAUNCH_GDN_WARP(32, true, false, TILED_VAL); }              \
             else if (D == 64) { LAUNCH_GDN_WARP(64, true, false, TILED_VAL); }         \
             else if (D == 128) { LAUNCH_GDN_WARP(128, true, false, TILED_VAL); }       \
-            else TORCH_CHECK(false, "GDN CUDA: D must be in {32,64,128}, got ", D);   \
+            else MFQ_RUNTIME_CHECK(false, "GDN CUDA: D must be in {32,64,128}, got ", D);   \
         } else {                                                                       \
             if (D == 32) { LAUNCH_GDN_WARP(32, false, false, TILED_VAL); }             \
             else if (D == 64) { LAUNCH_GDN_WARP(64, false, false, TILED_VAL); }        \
             else if (D == 128) { LAUNCH_GDN_WARP(128, false, false, TILED_VAL); }      \
-            else TORCH_CHECK(false, "GDN CUDA: D must be in {32,64,128}, got ", D);   \
+            else MFQ_RUNTIME_CHECK(false, "GDN CUDA: D must be in {32,64,128}, got ", D);   \
         }                                                                              \
     } while (0)
 
-static std::vector<torch::Tensor> gdn_cuda_impl(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v,
-    torch::Tensor g, torch::Tensor beta, c10::optional<torch::Tensor> state,
+static std::vector<mfq_tensor_backend::Tensor> gdn_cuda_impl(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
+    mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, MfqOptional<mfq_tensor_backend::Tensor> state,
     bool inplace_state, bool transposed_state=false, bool tiled_heads=false)
 {
-    TORCH_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == mfq_tensor_backend::kFloat32,
                 "q must be cuda contiguous f32");
     int B = q.size(0), Hq = q.size(1), T = q.size(2), D = q.size(3);
     int Hv = v.size(1);
     int H = Hv;
     int kda = (g.dim() == 4) ? 1 : 0;
     auto opts = q.options();
-    TORCH_CHECK(k.is_cuda() && k.is_contiguous() && k.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(k.is_cuda() && k.is_contiguous() && k.scalar_type() == mfq_tensor_backend::kFloat32,
                 "k must be cuda contiguous f32");
-    TORCH_CHECK(v.is_cuda() && v.is_contiguous() && v.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(v.is_cuda() && v.is_contiguous() && v.scalar_type() == mfq_tensor_backend::kFloat32,
                 "v must be cuda contiguous f32");
-    TORCH_CHECK(k.size(0) == B && k.size(1) == Hq && k.size(2) == T && k.size(3) == D,
+    MFQ_RUNTIME_CHECK(k.size(0) == B && k.size(1) == Hq && k.size(2) == T && k.size(3) == D,
                 "GDN CUDA: k shape mismatch");
-    TORCH_CHECK(v.size(0) == B && v.size(2) == T && v.size(3) == D,
+    MFQ_RUNTIME_CHECK(v.size(0) == B && v.size(2) == T && v.size(3) == D,
                 "GDN CUDA: v shape mismatch");
-    TORCH_CHECK(Hv % Hq == 0, "GDN CUDA: value heads must be divisible by key heads");
-    TORCH_CHECK(beta.is_cuda() && beta.is_contiguous() && beta.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(Hv % Hq == 0, "GDN CUDA: value heads must be divisible by key heads");
+    MFQ_RUNTIME_CHECK(beta.is_cuda() && beta.is_contiguous() && beta.scalar_type() == mfq_tensor_backend::kFloat32,
                 "beta must be cuda contiguous f32");
-    TORCH_CHECK(beta.dim() == 3 && beta.size(0) == B && beta.size(1) == Hv && beta.size(2) == T,
+    MFQ_RUNTIME_CHECK(beta.dim() == 3 && beta.size(0) == B && beta.size(1) == Hv && beta.size(2) == T,
                 "GDN CUDA: beta must be [B,Hv,T]");
-    TORCH_CHECK(g.is_cuda() && g.is_contiguous() && g.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(g.is_cuda() && g.is_contiguous() && g.scalar_type() == mfq_tensor_backend::kFloat32,
                 "g must be cuda contiguous f32");
     if (kda) {
-        TORCH_CHECK(g.size(0) == B && g.size(1) == Hv && g.size(2) == T && g.size(3) == D,
+        MFQ_RUNTIME_CHECK(g.size(0) == B && g.size(1) == Hv && g.size(2) == T && g.size(3) == D,
                     "GDN CUDA: KDA g must be [B,Hv,T,D]");
     } else {
-        TORCH_CHECK(g.dim() == 3 && g.size(0) == B && g.size(1) == Hv && g.size(2) == T,
+        MFQ_RUNTIME_CHECK(g.dim() == 3 && g.size(0) == B && g.size(1) == Hv && g.size(2) == T,
                     "GDN CUDA: g must be [B,Hv,T]");
     }
-    auto out = torch::empty({B, Hv, T, D}, opts);
-    TORCH_CHECK(!inplace_state || (state.has_value() && state->defined() && state->numel() > 0),
+    auto out = mfq_tensor_backend::empty({B, Hv, T, D}, opts);
+    MFQ_RUNTIME_CHECK(!inplace_state || (state.has_value() && state->defined() && state->numel() > 0),
                 "GDN CUDA inplace: state is required");
-    auto s_out = inplace_state ? state.value() : torch::empty({B, Hv, D, D}, opts);
-    TORCH_CHECK(s_out.is_cuda() && s_out.is_contiguous() && s_out.scalar_type() == torch::kFloat32,
+    auto s_out = inplace_state ? state.value() : mfq_tensor_backend::empty({B, Hv, D, D}, opts);
+    MFQ_RUNTIME_CHECK(s_out.is_cuda() && s_out.is_contiguous() && s_out.scalar_type() == mfq_tensor_backend::kFloat32,
                 "GDN CUDA: output state must be cuda contiguous f32");
-    TORCH_CHECK(s_out.size(0) == B && s_out.size(1) == Hv && s_out.size(2) == D && s_out.size(3) == D,
+    MFQ_RUNTIME_CHECK(s_out.size(0) == B && s_out.size(1) == Hv && s_out.size(2) == D && s_out.size(3) == D,
                 "GDN CUDA: state shape must be [B,Hv,D,D]");
 
     const float *qd = q.data_ptr<float>(), *kd = k.data_ptr<float>(), *vd = v.data_ptr<float>();
@@ -360,7 +359,7 @@ static std::vector<torch::Tensor> gdn_cuda_impl(
                           ? state->contiguous().data_ptr<float>() : nullptr;
     float* od = out.data_ptr<float>();
     float* sod = s_out.data_ptr<float>();
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
     int shmem = D * D * (int)sizeof(float);
 
     const char* col_env = std::getenv("MFQ_GDN_COLUMN");
@@ -370,53 +369,53 @@ static std::vector<torch::Tensor> gdn_cuda_impl(
         if (tiled_heads) { DISPATCH_GDN_WARP(true); }
         else { DISPATCH_GDN_WARP(false); }
     } else if (T <= 4 && col_env && col_env[0] == '1') {
-        TORCH_CHECK(Hq == Hv, "GDN CUDA column path requires repeated q/k heads");
+        MFQ_RUNTIME_CHECK(Hq == Hv, "GDN CUDA column path requires repeated q/k heads");
         if (D == 32) { LAUNCH_GDN_COL(32); }
         else if (D == 64) { LAUNCH_GDN_COL(64); }
         else if (D == 128) { LAUNCH_GDN_COL(128); }
-        else TORCH_CHECK(false, "GDN CUDA: D must be in {32,64,128}, got ", D);
+        else MFQ_RUNTIME_CHECK(false, "GDN CUDA: D must be in {32,64,128}, got ", D);
     } else {
-        TORCH_CHECK(Hq == Hv, "GDN CUDA shared-memory path requires repeated q/k heads");
+        MFQ_RUNTIME_CHECK(Hq == Hv, "GDN CUDA shared-memory path requires repeated q/k heads");
         if (D == 32) { LAUNCH_GDN(32); }
         else if (D == 64) { LAUNCH_GDN(64); }
         else if (D == 128) { LAUNCH_GDN(128); }
-        else TORCH_CHECK(false, "GDN CUDA: D must be in {32,64,128}, got ", D);
+        else MFQ_RUNTIME_CHECK(false, "GDN CUDA: D must be in {32,64,128}, got ", D);
     }
 
     return {out, s_out};
 }
 
-std::vector<torch::Tensor> gdn_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v,
-    torch::Tensor g, torch::Tensor beta, c10::optional<torch::Tensor> state)
+std::vector<mfq_tensor_backend::Tensor> gdn_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
+    mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, MfqOptional<mfq_tensor_backend::Tensor> state)
 {
     return gdn_cuda_impl(q, k, v, g, beta, state, false, false);
 }
 
-std::vector<torch::Tensor> gdn_inplace_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v,
-    torch::Tensor g, torch::Tensor beta, torch::Tensor state)
+std::vector<mfq_tensor_backend::Tensor> gdn_inplace_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
+    mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, mfq_tensor_backend::Tensor state)
 {
     return gdn_cuda_impl(q, k, v, g, beta, state, true, false);
 }
 
-std::vector<torch::Tensor> gdn_inplace_transposed_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v,
-    torch::Tensor g, torch::Tensor beta, torch::Tensor state)
+std::vector<mfq_tensor_backend::Tensor> gdn_inplace_transposed_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
+    mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, mfq_tensor_backend::Tensor state)
 {
     return gdn_cuda_impl(q, k, v, g, beta, state, true, true);
 }
 
-std::vector<torch::Tensor> gdn_inplace_tiled_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v,
-    torch::Tensor g, torch::Tensor beta, torch::Tensor state)
+std::vector<mfq_tensor_backend::Tensor> gdn_inplace_tiled_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
+    mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, mfq_tensor_backend::Tensor state)
 {
     return gdn_cuda_impl(q, k, v, g, beta, state, true, false, true);
 }
 
-std::vector<torch::Tensor> gdn_inplace_transposed_tiled_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v,
-    torch::Tensor g, torch::Tensor beta, torch::Tensor state)
+std::vector<mfq_tensor_backend::Tensor> gdn_inplace_transposed_tiled_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
+    mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, mfq_tensor_backend::Tensor state)
 {
     return gdn_cuda_impl(q, k, v, g, beta, state, true, true, true);
 }

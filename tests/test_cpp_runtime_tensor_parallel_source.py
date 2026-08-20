@@ -61,11 +61,13 @@ def test_deepseek_v4_split_gate_up_uses_existing_moe_runtime_and_cache():
     assert 'true, i, "gate"' in SOURCE
     assert 'true, i, "up"' in SOURCE
     assert '"moe.gate_up_split"' in SOURCE
-    assert "torch::cat({gate, up}, -1).contiguous()" in SOURCE
+    assert "mfq_tensor_backend::cat({gate, up}, -1).contiguous()" in SOURCE
 
 
 def test_native_float_linears_are_supported_without_forcing_tp_shards():
     assert "QuantLinearKind::Dense" in SOURCE
     assert 'dtype == "BF16" || dtype == "F16" || dtype == "F32"' in SOURCE
     assert 'std::getenv("MFQ_TP_SHARD_NATIVE_FLOAT")' in SOURCE
-    assert "result.dense = cpu.to(torch::kCUDA).contiguous()" in SOURCE
+    assert (
+        "result.dense = cpu.to(mfq_tensor_backend::kCUDA).contiguous()" in SOURCE
+    )

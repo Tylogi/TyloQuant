@@ -1,10 +1,4 @@
-#include <torch/torch.h>
-#include <ATen/Parallel.h>
-#include <ATen/ops/scaled_dot_product_attention.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <ATen/cuda/CUDAGraph.h>
-#include <c10/cuda/CUDACachingAllocator.h>
-#include <c10/cuda/CUDAGuard.h>
+#include "cuda/mfq_tensor_backend.h"
 #include <cuda_profiler_api.h>
 #include <cuda_runtime_api.h>
 
@@ -61,12 +55,14 @@
 #include <unistd.h>
 #endif
 
+#ifndef MFQ_CUDA_CHECK
 #define MFQ_CUDA_CHECK(expr) do { \
     cudaError_t err__ = (expr); \
     if (err__ != cudaSuccess) { \
         throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(err__)); \
     } \
 } while (0)
+#endif
 
 #ifdef MFQ_HAVE_NCCL
 #define MFQ_NCCL_CHECK(expr) do { \
@@ -94,625 +90,625 @@ static void mfq_set_env(const char * name, const char * value) {
 #endif
 }
 
-torch::Tensor rms_norm_cuda(torch::Tensor x, torch::Tensor weight, double eps);
-torch::Tensor rms_norm_offset_cuda(torch::Tensor x, torch::Tensor weight, double eps, double weight_offset);
-torch::Tensor rms_norm_f16_cuda(torch::Tensor x, torch::Tensor weight, double eps,
+mfq_tensor_backend::Tensor rms_norm_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, double eps);
+mfq_tensor_backend::Tensor rms_norm_offset_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, double eps, double weight_offset);
+mfq_tensor_backend::Tensor rms_norm_f16_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, double eps,
                                 double weight_offset);
-torch::Tensor qwen_rms_norm_bf16_cuda(
-    torch::Tensor input, torch::Tensor weight, double eps,
+mfq_tensor_backend::Tensor qwen_rms_norm_bf16_cuda(
+    mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor weight, double eps,
     double weight_offset);
-std::vector<torch::Tensor> qwen_rms_norm_pair_bf16_cuda(
-    torch::Tensor first, torch::Tensor second,
-    torch::Tensor first_weight, torch::Tensor second_weight,
+std::vector<mfq_tensor_backend::Tensor> qwen_rms_norm_pair_bf16_cuda(
+    mfq_tensor_backend::Tensor first, mfq_tensor_backend::Tensor second,
+    mfq_tensor_backend::Tensor first_weight, mfq_tensor_backend::Tensor second_weight,
     double eps, double weight_offset);
-torch::Tensor minicpm_qk_norm_rope_cache_write_bf16_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v,
-    torch::Tensor q_weight, torch::Tensor k_weight,
-    torch::Tensor rope_pos, torch::Tensor write_pos,
-    torch::Tensor cos, torch::Tensor sin,
-    torch::Tensor k_cache, torch::Tensor v_cache,
+mfq_tensor_backend::Tensor minicpm_qk_norm_rope_cache_write_bf16_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
+    mfq_tensor_backend::Tensor q_weight, mfq_tensor_backend::Tensor k_weight,
+    mfq_tensor_backend::Tensor rope_pos, mfq_tensor_backend::Tensor write_pos,
+    mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
+    mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
     double eps, double weight_offset);
-std::vector<torch::Tensor> rms_norm_pair_f16_f32_offset_cuda(
-    torch::Tensor first, torch::Tensor second,
-    torch::Tensor first_weight, torch::Tensor second_weight,
+std::vector<mfq_tensor_backend::Tensor> rms_norm_pair_f16_f32_offset_cuda(
+    mfq_tensor_backend::Tensor first, mfq_tensor_backend::Tensor second,
+    mfq_tensor_backend::Tensor first_weight, mfq_tensor_backend::Tensor second_weight,
     double eps, double weight_offset);
-torch::Tensor l2_norm_cuda(torch::Tensor x, double eps);
-torch::Tensor acc_cuda(torch::Tensor a, torch::Tensor b);
-std::vector<torch::Tensor> acc_rms_norm_cuda(torch::Tensor a, torch::Tensor b,
-                                             torch::Tensor weight, double eps,
+mfq_tensor_backend::Tensor l2_norm_cuda(mfq_tensor_backend::Tensor x, double eps);
+mfq_tensor_backend::Tensor acc_cuda(mfq_tensor_backend::Tensor a, mfq_tensor_backend::Tensor b);
+std::vector<mfq_tensor_backend::Tensor> acc_rms_norm_cuda(mfq_tensor_backend::Tensor a, mfq_tensor_backend::Tensor b,
+                                             mfq_tensor_backend::Tensor weight, double eps,
                                              double weight_offset);
-std::vector<torch::Tensor> acc_rms_norm_f16_cuda(torch::Tensor a, torch::Tensor b,
-                                                 torch::Tensor weight, double eps,
+std::vector<mfq_tensor_backend::Tensor> acc_rms_norm_f16_cuda(mfq_tensor_backend::Tensor a, mfq_tensor_backend::Tensor b,
+                                                 mfq_tensor_backend::Tensor weight, double eps,
                                                  double weight_offset);
-std::vector<torch::Tensor> gemma4_attn_residual_pre_norms_f16_cuda(
-    torch::Tensor residual, torch::Tensor attn,
-    torch::Tensor attn_post_weight, torch::Tensor dense_pre_weight,
-    torch::Tensor router_weight, torch::Tensor moe_pre_weight, double eps);
-torch::Tensor gemma4_ffn_merge_f16_cuda(
-    torch::Tensor dense, torch::Tensor moe, torch::Tensor residual,
-    torch::Tensor dense_post_weight, torch::Tensor moe_post_weight,
-    torch::Tensor final_post_weight, torch::Tensor layer_scale, double eps);
-void decode_graph_commit_cuda(torch::Tensor next, torch::Tensor generated, torch::Tensor step,
-                              torch::Tensor input, torch::Tensor pos, torch::Tensor len);
-std::vector<torch::Tensor> linear_gate_beta_cuda(
-    torch::Tensor alpha, torch::Tensor beta, torch::Tensor dt_bias, torch::Tensor a_log);
-torch::Tensor rope_table_cuda(torch::Tensor x, torch::Tensor pos, torch::Tensor cos, torch::Tensor sin,
-                              int64_t rotary_dim, torch::Tensor sections);
-torch::Tensor rope_table_bf16_cuda(torch::Tensor x, torch::Tensor pos, torch::Tensor cos, torch::Tensor sin,
+std::vector<mfq_tensor_backend::Tensor> gemma4_attn_residual_pre_norms_f16_cuda(
+    mfq_tensor_backend::Tensor residual, mfq_tensor_backend::Tensor attn,
+    mfq_tensor_backend::Tensor attn_post_weight, mfq_tensor_backend::Tensor dense_pre_weight,
+    mfq_tensor_backend::Tensor router_weight, mfq_tensor_backend::Tensor moe_pre_weight, double eps);
+mfq_tensor_backend::Tensor gemma4_ffn_merge_f16_cuda(
+    mfq_tensor_backend::Tensor dense, mfq_tensor_backend::Tensor moe, mfq_tensor_backend::Tensor residual,
+    mfq_tensor_backend::Tensor dense_post_weight, mfq_tensor_backend::Tensor moe_post_weight,
+    mfq_tensor_backend::Tensor final_post_weight, mfq_tensor_backend::Tensor layer_scale, double eps);
+void decode_graph_commit_cuda(mfq_tensor_backend::Tensor next, mfq_tensor_backend::Tensor generated, mfq_tensor_backend::Tensor step,
+                              mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor pos, mfq_tensor_backend::Tensor len);
+std::vector<mfq_tensor_backend::Tensor> linear_gate_beta_cuda(
+    mfq_tensor_backend::Tensor alpha, mfq_tensor_backend::Tensor beta, mfq_tensor_backend::Tensor dt_bias, mfq_tensor_backend::Tensor a_log);
+mfq_tensor_backend::Tensor rope_table_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
+                              int64_t rotary_dim, mfq_tensor_backend::Tensor sections);
+mfq_tensor_backend::Tensor rope_table_bf16_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
                                    int64_t rotary_dim);
-torch::Tensor minicpm_bf16_rope_cache_write_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v,
-    torch::Tensor rope_pos, torch::Tensor write_pos,
-    torch::Tensor cos, torch::Tensor sin,
-    torch::Tensor k_cache, torch::Tensor v_cache,
+mfq_tensor_backend::Tensor minicpm_bf16_rope_cache_write_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
+    mfq_tensor_backend::Tensor rope_pos, mfq_tensor_backend::Tensor write_pos,
+    mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
+    mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
     int64_t rotary_dim);
-torch::Tensor attention_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale, bool causal);
-torch::Tensor attention_swa_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+mfq_tensor_backend::Tensor attention_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale, bool causal);
+mfq_tensor_backend::Tensor attention_swa_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
                                  double scale, int64_t window);
-torch::Tensor attention_cache_swa_cuda(
-    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
-    torch::Tensor seq_len, double scale, int64_t window);
-torch::Tensor attention_cache_swa_planned_cuda(
-    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
-    torch::Tensor seq_len, double scale, int64_t window, int64_t planned_length);
-torch::Tensor attention_llama_flash256_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale);
-torch::Tensor attention_llama_flash512_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale);
-torch::Tensor attention_llama_flash256_swa_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale, int64_t window);
-torch::Tensor attention_llama_flash256_decode_cuda(
-    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
-    torch::Tensor seq_len, double scale, int64_t planned_len,
-    torch::Tensor mask, torch::Tensor kv_max, torch::Tensor meta);
-torch::Tensor attention_llama_flash512_decode_cuda(
-    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
-    torch::Tensor seq_len, double scale, int64_t planned_len,
-    torch::Tensor mask, torch::Tensor kv_max, torch::Tensor meta);
-torch::Tensor attention_glm_mla576_cuda(
-    torch::Tensor q, torch::Tensor kv, double scale);
-torch::Tensor attention_glm_mla576_cached_cuda(
-    torch::Tensor q, torch::Tensor kv_cache, int64_t logical_len,
-    torch::Tensor mask, torch::Tensor kv_max, torch::Tensor meta,
+mfq_tensor_backend::Tensor attention_cache_swa_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    mfq_tensor_backend::Tensor seq_len, double scale, int64_t window);
+mfq_tensor_backend::Tensor attention_cache_swa_planned_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    mfq_tensor_backend::Tensor seq_len, double scale, int64_t window, int64_t planned_length);
+mfq_tensor_backend::Tensor attention_llama_flash256_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale);
+mfq_tensor_backend::Tensor attention_llama_flash512_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale);
+mfq_tensor_backend::Tensor attention_llama_flash256_swa_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale, int64_t window);
+mfq_tensor_backend::Tensor attention_llama_flash256_decode_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    mfq_tensor_backend::Tensor seq_len, double scale, int64_t planned_len,
+    mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor kv_max, mfq_tensor_backend::Tensor meta);
+mfq_tensor_backend::Tensor attention_llama_flash512_decode_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    mfq_tensor_backend::Tensor seq_len, double scale, int64_t planned_len,
+    mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor kv_max, mfq_tensor_backend::Tensor meta);
+mfq_tensor_backend::Tensor attention_glm_mla576_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv, double scale);
+mfq_tensor_backend::Tensor attention_glm_mla576_cached_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv_cache, int64_t logical_len,
+    mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor kv_max, mfq_tensor_backend::Tensor meta,
     double scale);
-torch::Tensor attention_glm_mla576_decode_cuda(
-    torch::Tensor q, torch::Tensor kv_cache, torch::Tensor seq_len,
-    double scale, int64_t planned_len, torch::Tensor mask,
-    torch::Tensor kv_max, torch::Tensor meta);
-torch::Tensor glm_interleaved_rope_cuda(
-    torch::Tensor x, torch::Tensor positions,
-    torch::Tensor cos, torch::Tensor sin, int64_t rotary_dim);
-torch::Tensor glm_dsa_indexer_layer_norm_cuda(
-    torch::Tensor x, torch::Tensor weight, torch::Tensor bias, double eps);
-torch::Tensor glm_dsa_cache_write_cuda(
-    torch::Tensor cache, torch::Tensor values, torch::Tensor positions);
-torch::Tensor glm_dsa_indexer_scores_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor weights,
+mfq_tensor_backend::Tensor attention_glm_mla576_decode_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv_cache, mfq_tensor_backend::Tensor seq_len,
+    double scale, int64_t planned_len, mfq_tensor_backend::Tensor mask,
+    mfq_tensor_backend::Tensor kv_max, mfq_tensor_backend::Tensor meta);
+mfq_tensor_backend::Tensor glm_interleaved_rope_cuda(
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor positions,
+    mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin, int64_t rotary_dim);
+mfq_tensor_backend::Tensor glm_dsa_indexer_layer_norm_cuda(
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, mfq_tensor_backend::Tensor bias, double eps);
+mfq_tensor_backend::Tensor glm_dsa_cache_write_cuda(
+    mfq_tensor_backend::Tensor cache, mfq_tensor_backend::Tensor values, mfq_tensor_backend::Tensor positions);
+mfq_tensor_backend::Tensor glm_dsa_indexer_scores_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor weights,
     int64_t query_offset, int64_t logical_k);
-torch::Tensor glm_dsa_indexer_scores_decode_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor weights,
-    torch::Tensor seq_len, int64_t planned_k);
-torch::Tensor attention_glm_mla_sparse_cuda(
-    torch::Tensor q, torch::Tensor kv, torch::Tensor indices,
-    torch::Tensor meta, double scale);
-torch::Tensor dsv4_compress_cuda(
-    torch::Tensor kv, torch::Tensor gate, torch::Tensor ape,
-    torch::Tensor norm, torch::Tensor prev_kv, torch::Tensor prev_gate,
-    torch::Tensor positions, torch::Tensor cos, torch::Tensor sin,
+mfq_tensor_backend::Tensor glm_dsa_indexer_scores_decode_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor weights,
+    mfq_tensor_backend::Tensor seq_len, int64_t planned_k);
+mfq_tensor_backend::Tensor attention_glm_mla_sparse_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv, mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor meta, double scale);
+mfq_tensor_backend::Tensor dsv4_compress_cuda(
+    mfq_tensor_backend::Tensor kv, mfq_tensor_backend::Tensor gate, mfq_tensor_backend::Tensor ape,
+    mfq_tensor_backend::Tensor norm, mfq_tensor_backend::Tensor prev_kv, mfq_tensor_backend::Tensor prev_gate,
+    mfq_tensor_backend::Tensor positions, mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
     int64_t ratio, bool overlap, int64_t quant_mode, double eps);
-torch::Tensor dsv4_fp4_sim_cuda(torch::Tensor input);
-std::vector<torch::Tensor> dsv4_hc_pre_cuda(
-    torch::Tensor x, torch::Tensor mixes, torch::Tensor scale,
-    torch::Tensor base, int64_t iterations, double eps);
-torch::Tensor dsv4_hc_post_cuda(
-    torch::Tensor x, torch::Tensor residual, torch::Tensor post,
-    torch::Tensor combination);
-torch::Tensor dsv4_decode_pool_update_cuda(
-    torch::Tensor kv_token, torch::Tensor gate_token,
-    torch::Tensor ape, torch::Tensor norm,
-    torch::Tensor state_kv, torch::Tensor state_gate,
-    torch::Tensor prev_kv, torch::Tensor prev_gate,
-    torch::Tensor pool, torch::Tensor seq_len,
-    torch::Tensor cos, torch::Tensor sin,
+mfq_tensor_backend::Tensor dsv4_fp4_sim_cuda(mfq_tensor_backend::Tensor input);
+std::vector<mfq_tensor_backend::Tensor> dsv4_hc_pre_cuda(
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor mixes, mfq_tensor_backend::Tensor scale,
+    mfq_tensor_backend::Tensor base, int64_t iterations, double eps);
+mfq_tensor_backend::Tensor dsv4_hc_post_cuda(
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor residual, mfq_tensor_backend::Tensor post,
+    mfq_tensor_backend::Tensor combination);
+mfq_tensor_backend::Tensor dsv4_decode_pool_update_cuda(
+    mfq_tensor_backend::Tensor kv_token, mfq_tensor_backend::Tensor gate_token,
+    mfq_tensor_backend::Tensor ape, mfq_tensor_backend::Tensor norm,
+    mfq_tensor_backend::Tensor state_kv, mfq_tensor_backend::Tensor state_gate,
+    mfq_tensor_backend::Tensor prev_kv, mfq_tensor_backend::Tensor prev_gate,
+    mfq_tensor_backend::Tensor pool, mfq_tensor_backend::Tensor seq_len,
+    mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
     int64_t ratio, bool overlap, int64_t quant_mode, double eps);
-torch::Tensor dsv4_indexer_scores_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor weights,
+mfq_tensor_backend::Tensor dsv4_indexer_scores_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor weights,
     int64_t query_offset, int64_t ratio);
-torch::Tensor dsv4_topk512_cuda(torch::Tensor scores);
-std::vector<torch::Tensor> dsv4_build_prefill_plan_cuda(
-    torch::Tensor topk, int64_t query_offset, int64_t local_history,
+mfq_tensor_backend::Tensor dsv4_topk512_cuda(mfq_tensor_backend::Tensor scores);
+std::vector<mfq_tensor_backend::Tensor> dsv4_build_prefill_plan_cuda(
+    mfq_tensor_backend::Tensor topk, int64_t query_offset, int64_t local_history,
     int64_t pool_len, int64_t ratio, int64_t window);
-std::vector<torch::Tensor> dsv4_build_decode_plan_cuda(
-    torch::Tensor topk, torch::Tensor seq_len, int64_t pool_len,
+std::vector<mfq_tensor_backend::Tensor> dsv4_build_decode_plan_cuda(
+    mfq_tensor_backend::Tensor topk, mfq_tensor_backend::Tensor seq_len, int64_t pool_len,
     int64_t ratio, int64_t window);
-torch::Tensor attention_dsv4_sparse_cuda(
-    torch::Tensor q, torch::Tensor kv, torch::Tensor indices,
-    torch::Tensor mask, torch::Tensor sinks, torch::Tensor meta,
+mfq_tensor_backend::Tensor attention_dsv4_sparse_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv, mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor sinks, mfq_tensor_backend::Tensor meta,
     double scale);
-torch::Tensor attention_llama_flash256_swa_decode_cuda(
-    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
-    torch::Tensor seq_len, double scale, int64_t planned_len,
-    torch::Tensor mask, torch::Tensor kv_max, torch::Tensor meta);
-torch::Tensor attention_cache_decode_cuda(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
-                                          torch::Tensor seq_len, double scale);
-torch::Tensor attention_cache_decode_split_cuda(
-    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
-    torch::Tensor seq_len, double scale,
-    torch::Tensor partial_o, torch::Tensor partial_m, torch::Tensor partial_l,
+mfq_tensor_backend::Tensor attention_llama_flash256_swa_decode_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    mfq_tensor_backend::Tensor seq_len, double scale, int64_t planned_len,
+    mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor kv_max, mfq_tensor_backend::Tensor meta);
+mfq_tensor_backend::Tensor attention_cache_decode_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+                                          mfq_tensor_backend::Tensor seq_len, double scale);
+mfq_tensor_backend::Tensor attention_cache_decode_split_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    mfq_tensor_backend::Tensor seq_len, double scale,
+    mfq_tensor_backend::Tensor partial_o, mfq_tensor_backend::Tensor partial_m, mfq_tensor_backend::Tensor partial_l,
     int64_t parts);
-torch::Tensor silu_mul_cuda(torch::Tensor gate, torch::Tensor up);
-torch::Tensor gelu_mul_cuda(torch::Tensor gate, torch::Tensor up);
-std::vector<torch::Tensor> moe_topk_cuda(
-    torch::Tensor logits, int64_t top_k, bool use_sigmoid, bool use_sqrt_softplus,
+mfq_tensor_backend::Tensor silu_mul_cuda(mfq_tensor_backend::Tensor gate, mfq_tensor_backend::Tensor up);
+mfq_tensor_backend::Tensor gelu_mul_cuda(mfq_tensor_backend::Tensor gate, mfq_tensor_backend::Tensor up);
+std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
+    mfq_tensor_backend::Tensor logits, int64_t top_k, bool use_sigmoid, bool use_sqrt_softplus,
     bool normalize,
-    bool delayed_softmax, c10::optional<torch::Tensor> bias, double norm_floor,
+    bool delayed_softmax, MfqOptional<mfq_tensor_backend::Tensor> bias, double norm_floor,
     double scale);
-torch::Tensor moe_sqrtsoftplus_weights_cuda(
-    torch::Tensor logits, torch::Tensor ids, double norm_floor, double scale);
-std::vector<torch::Tensor> moe_build_expert_map_cuda(
-    torch::Tensor ids, int64_t n_experts, int64_t tile_m);
+mfq_tensor_backend::Tensor moe_sqrtsoftplus_weights_cuda(
+    mfq_tensor_backend::Tensor logits, mfq_tensor_backend::Tensor ids, double norm_floor, double scale);
+std::vector<mfq_tensor_backend::Tensor> moe_build_expert_map_cuda(
+    mfq_tensor_backend::Tensor ids, int64_t n_experts, int64_t tile_m);
 void nint_moe_quantize_input_ws_cuda(
-    torch::Tensor x, int64_t gs, torch::Tensor qx, torch::Tensor xscale);
+    mfq_tensor_backend::Tensor x, int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
 void nint_moe_quantize_24_28_ws_cuda(
-    torch::Tensor x, torch::Tensor qx24, torch::Tensor xscale24,
-    torch::Tensor qx28, torch::Tensor xscale28);
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor qx24, mfq_tensor_backend::Tensor xscale24,
+    mfq_tensor_backend::Tensor qx28, mfq_tensor_backend::Tensor xscale28);
 void nint_moe_quantize_swiglu_input_ws_cuda(
-    torch::Tensor gate_up, int64_t gs, torch::Tensor qx, torch::Tensor xscale);
+    mfq_tensor_backend::Tensor gate_up, int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
 void nint_moe_quantize_swiglu_clamped_input_ws_cuda(
-    torch::Tensor gate_up, int64_t gs, double limit,
-    torch::Tensor qx, torch::Tensor xscale);
+    mfq_tensor_backend::Tensor gate_up, int64_t gs, double limit,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
 void nint_moe_quantize_swiglu_24_28_ws_cuda(
-    torch::Tensor gate_up, torch::Tensor qx24, torch::Tensor xscale24,
-    torch::Tensor qx28, torch::Tensor xscale28);
+    mfq_tensor_backend::Tensor gate_up, mfq_tensor_backend::Tensor qx24, mfq_tensor_backend::Tensor xscale24,
+    mfq_tensor_backend::Tensor qx28, mfq_tensor_backend::Tensor xscale28);
 void nint_moe_quantize_geglu_input_ws_cuda(
-    torch::Tensor gate_up, int64_t gs, torch::Tensor qx, torch::Tensor xscale);
+    mfq_tensor_backend::Tensor gate_up, int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
 void nint_moe_quantize_geglu_24_28_ws_cuda(
-    torch::Tensor gate_up, torch::Tensor qx24, torch::Tensor xscale24,
-    torch::Tensor qx28, torch::Tensor xscale28);
-torch::Tensor nint_moe_grouped_matmul_hetero_qx_cuda(
-    torch::Tensor weight_ptrs, torch::Tensor pool_params, torch::Tensor activation_ptrs,
-    torch::Tensor expert_pool, torch::Tensor expert_local, torch::Tensor ids,
+    mfq_tensor_backend::Tensor gate_up, mfq_tensor_backend::Tensor qx24, mfq_tensor_backend::Tensor xscale24,
+    mfq_tensor_backend::Tensor qx28, mfq_tensor_backend::Tensor xscale28);
+mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_qx_cuda(
+    mfq_tensor_backend::Tensor weight_ptrs, mfq_tensor_backend::Tensor pool_params, mfq_tensor_backend::Tensor activation_ptrs,
+    mfq_tensor_backend::Tensor expert_pool, mfq_tensor_backend::Tensor expert_local, mfq_tensor_backend::Tensor ids,
     int64_t profile_mask, int64_t n_experts, int64_t out_per_expert,
-    int64_t input_width, bool routed_input, torch::Tensor out,
-    torch::Tensor ids_dst, torch::Tensor expert_bounds, torch::Tensor tile_bounds,
-    torch::Tensor tile_experts);
-torch::Tensor nint_moe_grouped_matmul_hetero_glu_qx_cuda(
-    torch::Tensor weight_ptrs, torch::Tensor pool_params, torch::Tensor activation_ptrs,
-    torch::Tensor expert_pool, torch::Tensor expert_local, torch::Tensor ids,
+    int64_t input_width, bool routed_input, mfq_tensor_backend::Tensor out,
+    mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
+    mfq_tensor_backend::Tensor tile_experts);
+mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_glu_qx_cuda(
+    mfq_tensor_backend::Tensor weight_ptrs, mfq_tensor_backend::Tensor pool_params, mfq_tensor_backend::Tensor activation_ptrs,
+    mfq_tensor_backend::Tensor expert_pool, mfq_tensor_backend::Tensor expert_local, mfq_tensor_backend::Tensor ids,
     int64_t profile_mask, int64_t n_experts, int64_t hidden_width,
-    bool gelu, torch::Tensor out);
-torch::Tensor nint_moe_grouped_matmul_hetero_f16_cuda(
-    torch::Tensor weight_ptrs, torch::Tensor pool_params,
-    torch::Tensor expert_pool, torch::Tensor expert_local,
-    torch::Tensor x, torch::Tensor ids,
+    bool gelu, mfq_tensor_backend::Tensor out);
+mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_cuda(
+    mfq_tensor_backend::Tensor weight_ptrs, mfq_tensor_backend::Tensor pool_params,
+    mfq_tensor_backend::Tensor expert_pool, mfq_tensor_backend::Tensor expert_local,
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor ids,
     int64_t n_experts, int64_t out_per_expert, int64_t input_width,
-    bool routed_input, torch::Tensor out,
-    torch::Tensor ids_dst, torch::Tensor expert_bounds, torch::Tensor tile_bounds,
-    torch::Tensor tile_experts);
-torch::Tensor nint_moe_grouped_matmul_hetero_f16_slice_cuda(
-    torch::Tensor weight_ptrs, torch::Tensor pool_params,
-    torch::Tensor expert_pool, torch::Tensor expert_local,
-    torch::Tensor x, torch::Tensor ids,
+    bool routed_input, mfq_tensor_backend::Tensor out,
+    mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
+    mfq_tensor_backend::Tensor tile_experts);
+mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_slice_cuda(
+    mfq_tensor_backend::Tensor weight_ptrs, mfq_tensor_backend::Tensor pool_params,
+    mfq_tensor_backend::Tensor expert_pool, mfq_tensor_backend::Tensor expert_local,
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor ids,
     int64_t n_experts, int64_t out_per_expert, int64_t input_width,
-    bool routed_input, torch::Tensor out,
-    torch::Tensor ids_dst, torch::Tensor expert_bounds, torch::Tensor tile_bounds,
-    torch::Tensor tile_experts, int64_t weight_out_stride,
+    bool routed_input, mfq_tensor_backend::Tensor out,
+    mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
+    mfq_tensor_backend::Tensor tile_experts, int64_t weight_out_stride,
     int64_t weight_row_offset);
-torch::Tensor nint_moe_grouped_matmul_pool_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    torch::Tensor ids, torch::Tensor expert_local, int64_t n_experts,
+mfq_tensor_backend::Tensor nint_moe_grouped_matmul_pool_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor expert_local, int64_t n_experts,
     int64_t n_local_experts, int64_t out_per_expert, int64_t gs, int64_t bits,
-    bool route_map_ready, bool input_quantized, torch::Tensor out,
-    torch::Tensor qx, torch::Tensor xscale, torch::Tensor counts,
-    torch::Tensor cursors, torch::Tensor ids_dst, torch::Tensor expert_bounds,
-    torch::Tensor tile_bounds, torch::Tensor tile_experts);
-torch::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
-    torch::Tensor q, torch::Tensor scale, torch::Tensor x,
-    torch::Tensor ids, torch::Tensor expert_local, int64_t n_experts,
+    bool route_map_ready, bool input_quantized, mfq_tensor_backend::Tensor out,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor counts,
+    mfq_tensor_backend::Tensor cursors, mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds,
+    mfq_tensor_backend::Tensor tile_bounds, mfq_tensor_backend::Tensor tile_experts);
+mfq_tensor_backend::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor expert_local, int64_t n_experts,
     int64_t n_local_experts, int64_t out_per_expert, bool route_map_ready,
-    bool input_quantized, bool use_f16_mma, torch::Tensor out, torch::Tensor qx,
-    torch::Tensor xscale, torch::Tensor counts, torch::Tensor cursors,
-    torch::Tensor ids_dst, torch::Tensor expert_bounds,
-    torch::Tensor tile_bounds, torch::Tensor tile_experts);
-torch::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
-    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
-    torch::Tensor neuron_scale, torch::Tensor codebook, torch::Tensor x,
-    torch::Tensor ids, torch::Tensor expert_local, int64_t n_experts,
+    bool input_quantized, bool use_f16_mma, mfq_tensor_backend::Tensor out, mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor counts, mfq_tensor_backend::Tensor cursors,
+    mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds,
+    mfq_tensor_backend::Tensor tile_bounds, mfq_tensor_backend::Tensor tile_experts);
+mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor codebook, mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor expert_local, int64_t n_experts,
     int64_t pool_experts, int64_t out_per_expert, int64_t neuron_len,
     int64_t gs, int64_t sub_bits, int64_t format, int64_t sign_mode,
-    bool input_quantized, torch::Tensor out, torch::Tensor qx,
-    torch::Tensor xscale, torch::Tensor ids_dst, torch::Tensor expert_bounds,
-    torch::Tensor tile_bounds, torch::Tensor tile_experts);
-torch::Tensor nvq_moe_grouped_matmul_pool_f16_cuda(
-    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
-    torch::Tensor neuron_scale, torch::Tensor codebook, torch::Tensor x,
-    torch::Tensor expert_local, int64_t n_experts, int64_t pool_experts,
+    bool input_quantized, mfq_tensor_backend::Tensor out, mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds,
+    mfq_tensor_backend::Tensor tile_bounds, mfq_tensor_backend::Tensor tile_experts);
+mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_pool_f16_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor codebook, mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor expert_local, int64_t n_experts, int64_t pool_experts,
     int64_t out_per_expert, int64_t neuron_len, int64_t gs,
     int64_t sub_bits, int64_t format, int64_t sign_mode,
-    torch::Tensor out, torch::Tensor ids_dst, torch::Tensor expert_bounds,
-    torch::Tensor tile_bounds, torch::Tensor tile_experts);
-torch::Tensor nepq_moe_grouped_matmul_pool_ws_cuda(
-    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
-    torch::Tensor neuron_scale, torch::Tensor table_pool, torch::Tensor bank_ids,
-    torch::Tensor grouped_table_pool, torch::Tensor x, torch::Tensor ids,
-    torch::Tensor expert_local, int64_t n_experts, int64_t pool_experts,
+    mfq_tensor_backend::Tensor out, mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds,
+    mfq_tensor_backend::Tensor tile_bounds, mfq_tensor_backend::Tensor tile_experts);
+mfq_tensor_backend::Tensor nepq_moe_grouped_matmul_pool_ws_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor table_pool, mfq_tensor_backend::Tensor bank_ids,
+    mfq_tensor_backend::Tensor grouped_table_pool, mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor ids,
+    mfq_tensor_backend::Tensor expert_local, int64_t n_experts, int64_t pool_experts,
     int64_t out_per_expert, int64_t neuron_len, int64_t sub_bits, int64_t format,
-    bool input_quantized, torch::Tensor out, torch::Tensor qx,
-    torch::Tensor xscale, torch::Tensor ids_dst, torch::Tensor expert_bounds,
-    torch::Tensor tile_bounds, torch::Tensor tile_experts);
-torch::Tensor nepq_moe_grouped_matmul_pool_f16_cuda(
-    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
-    torch::Tensor neuron_scale, torch::Tensor table_pool,
-    torch::Tensor bank_ids, torch::Tensor x, torch::Tensor expert_local,
+    bool input_quantized, mfq_tensor_backend::Tensor out, mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds,
+    mfq_tensor_backend::Tensor tile_bounds, mfq_tensor_backend::Tensor tile_experts);
+mfq_tensor_backend::Tensor nepq_moe_grouped_matmul_pool_f16_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor table_pool,
+    mfq_tensor_backend::Tensor bank_ids, mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor expert_local,
     int64_t n_experts, int64_t pool_experts, int64_t out_per_expert,
     int64_t neuron_len, int64_t sub_bits, int64_t format,
-    torch::Tensor out, torch::Tensor ids_dst, torch::Tensor expert_bounds,
-    torch::Tensor tile_bounds, torch::Tensor tile_experts);
-torch::Tensor nepq_hadamard_input_cuda(
-    torch::Tensor input, torch::Tensor signs, int64_t block_size);
-torch::Tensor nepq_sparse_residual_grouped_cuda(
-    torch::Tensor dictionary, torch::Tensor first, torch::Tensor second,
-    torch::Tensor input, torch::Tensor route_ids, torch::Tensor expert_local,
+    mfq_tensor_backend::Tensor out, mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds,
+    mfq_tensor_backend::Tensor tile_bounds, mfq_tensor_backend::Tensor tile_experts);
+mfq_tensor_backend::Tensor nepq_hadamard_input_cuda(
+    mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor signs, int64_t block_size);
+mfq_tensor_backend::Tensor nepq_sparse_residual_grouped_cuda(
+    mfq_tensor_backend::Tensor dictionary, mfq_tensor_backend::Tensor first, mfq_tensor_backend::Tensor second,
+    mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor route_ids, mfq_tensor_backend::Tensor expert_local,
     int64_t out_per_expert, int64_t position_bits, int64_t block_vectors,
-    torch::Tensor output);
-torch::Tensor moe_weighted_reduce_cuda(torch::Tensor pair_output, torch::Tensor weights);
-torch::Tensor moe_swiglu_split_cuda(torch::Tensor gate_up);
-torch::Tensor moe_geglu_split_cuda(torch::Tensor gate_up);
-torch::Tensor moe_apply_expert_scale_cuda(
-    torch::Tensor weights, torch::Tensor ids, torch::Tensor scales);
-torch::Tensor moe_add_shared_gate_cuda(
-    torch::Tensor routed, torch::Tensor shared, torch::Tensor gate_logits);
-torch::Tensor moe_weighted_reduce_shared_gate_cuda(
-    torch::Tensor pair_output, torch::Tensor weights,
-    torch::Tensor shared, torch::Tensor gate_logits);
+    mfq_tensor_backend::Tensor output);
+mfq_tensor_backend::Tensor moe_weighted_reduce_cuda(mfq_tensor_backend::Tensor pair_output, mfq_tensor_backend::Tensor weights);
+mfq_tensor_backend::Tensor moe_swiglu_split_cuda(mfq_tensor_backend::Tensor gate_up);
+mfq_tensor_backend::Tensor moe_geglu_split_cuda(mfq_tensor_backend::Tensor gate_up);
+mfq_tensor_backend::Tensor moe_apply_expert_scale_cuda(
+    mfq_tensor_backend::Tensor weights, mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor scales);
+mfq_tensor_backend::Tensor moe_add_shared_gate_cuda(
+    mfq_tensor_backend::Tensor routed, mfq_tensor_backend::Tensor shared, mfq_tensor_backend::Tensor gate_logits);
+mfq_tensor_backend::Tensor moe_weighted_reduce_shared_gate_cuda(
+    mfq_tensor_backend::Tensor pair_output, mfq_tensor_backend::Tensor weights,
+    mfq_tensor_backend::Tensor shared, mfq_tensor_backend::Tensor gate_logits);
 void nint_moe_set_small_mmq_cuda(int64_t mode);
-std::vector<torch::Tensor> gdn_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v,
-                                    torch::Tensor g, torch::Tensor beta, c10::optional<torch::Tensor> state);
-std::vector<torch::Tensor> gdn_inplace_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v,
-                                             torch::Tensor g, torch::Tensor beta, torch::Tensor state);
-std::vector<torch::Tensor> gdn_inplace_transposed_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v,
-    torch::Tensor g, torch::Tensor beta, torch::Tensor state);
-std::vector<torch::Tensor> gdn_inplace_tiled_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v,
-    torch::Tensor g, torch::Tensor beta, torch::Tensor state);
-std::vector<torch::Tensor> gdn_inplace_transposed_tiled_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v,
-    torch::Tensor g, torch::Tensor beta, torch::Tensor state);
-std::vector<torch::Tensor> kv_cache_write_cuda(torch::Tensor k_cache, torch::Tensor v_cache,
-                                               torch::Tensor k, torch::Tensor v, torch::Tensor positions);
-std::vector<torch::Tensor> kv_cache_write_ring_cuda(
-    torch::Tensor k_cache, torch::Tensor v_cache,
-    torch::Tensor k, torch::Tensor v, int64_t position_start);
-std::vector<torch::Tensor> kv_cache_write_ring_positions_cuda(
-    torch::Tensor k_cache, torch::Tensor v_cache,
-    torch::Tensor k, torch::Tensor v, torch::Tensor positions);
-torch::Tensor ssm_conv_silu_cuda(torch::Tensor conv_input, torch::Tensor weight, torch::Tensor bias, int64_t n_tokens);
-torch::Tensor ssm_conv_silu_decode_cuda(torch::Tensor state, torch::Tensor x, torch::Tensor weight, torch::Tensor bias);
-std::vector<torch::Tensor> linear_conv_qkv_decode_cuda(
-    torch::Tensor state, torch::Tensor qk, torch::Tensor v, torch::Tensor weight, torch::Tensor bias,
+std::vector<mfq_tensor_backend::Tensor> gdn_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
+                                    mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, MfqOptional<mfq_tensor_backend::Tensor> state);
+std::vector<mfq_tensor_backend::Tensor> gdn_inplace_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
+                                             mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, mfq_tensor_backend::Tensor state);
+std::vector<mfq_tensor_backend::Tensor> gdn_inplace_transposed_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
+    mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, mfq_tensor_backend::Tensor state);
+std::vector<mfq_tensor_backend::Tensor> gdn_inplace_tiled_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
+    mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, mfq_tensor_backend::Tensor state);
+std::vector<mfq_tensor_backend::Tensor> gdn_inplace_transposed_tiled_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
+    mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, mfq_tensor_backend::Tensor state);
+std::vector<mfq_tensor_backend::Tensor> kv_cache_write_cuda(mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+                                               mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, mfq_tensor_backend::Tensor positions);
+std::vector<mfq_tensor_backend::Tensor> kv_cache_write_ring_cuda(
+    mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, int64_t position_start);
+std::vector<mfq_tensor_backend::Tensor> kv_cache_write_ring_positions_cuda(
+    mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, mfq_tensor_backend::Tensor positions);
+mfq_tensor_backend::Tensor ssm_conv_silu_cuda(mfq_tensor_backend::Tensor conv_input, mfq_tensor_backend::Tensor weight, mfq_tensor_backend::Tensor bias, int64_t n_tokens);
+mfq_tensor_backend::Tensor ssm_conv_silu_decode_cuda(mfq_tensor_backend::Tensor state, mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, mfq_tensor_backend::Tensor bias);
+std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_decode_cuda(
+    mfq_tensor_backend::Tensor state, mfq_tensor_backend::Tensor qk, mfq_tensor_backend::Tensor v, mfq_tensor_backend::Tensor weight, mfq_tensor_backend::Tensor bias,
     int64_t nk, int64_t nv, int64_t dk, int64_t dv, double eps);
-std::vector<torch::Tensor> linear_conv_qkv_prefill_cuda(
-    torch::Tensor state, torch::Tensor qk, torch::Tensor v, torch::Tensor weight, torch::Tensor bias,
+std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_prefill_cuda(
+    mfq_tensor_backend::Tensor state, mfq_tensor_backend::Tensor qk, mfq_tensor_backend::Tensor v, mfq_tensor_backend::Tensor weight, mfq_tensor_backend::Tensor bias,
     int64_t nk, int64_t nv, int64_t dk, int64_t dv, double eps);
-torch::Tensor nint_embedding_lookup_packed_compact_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor token_ids,
+mfq_tensor_backend::Tensor nint_embedding_lookup_packed_compact_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor token_ids,
     int64_t neuron_len, int64_t gs);
-torch::Tensor nint_embedding_lookup_packed_compact_bits_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor token_ids,
+mfq_tensor_backend::Tensor nint_embedding_lookup_packed_compact_bits_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor token_ids,
     int64_t neuron_len, int64_t gs, int64_t bits);
-torch::Tensor nint8_zero_embedding_lookup_cuda(
-    torch::Tensor q, torch::Tensor scale, torch::Tensor token_ids,
+mfq_tensor_backend::Tensor nint8_zero_embedding_lookup_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, mfq_tensor_backend::Tensor token_ids,
     int64_t neuron_len);
-torch::Tensor sample_greedy_cuda(torch::Tensor logits);
-torch::Tensor sample_softmax_cuda(torch::Tensor logits, torch::Tensor random, double temperature);
-torch::Tensor sample_top_k_top_p_cuda(
-    torch::Tensor logits, torch::Tensor random, double temperature, int64_t top_k, double top_p);
-void sample_token_counts_add_cuda(torch::Tensor counts, torch::Tensor tokens);
-torch::Tensor sample_apply_penalties_cuda(
-    torch::Tensor logits, torch::Tensor counts,
+mfq_tensor_backend::Tensor sample_greedy_cuda(mfq_tensor_backend::Tensor logits);
+mfq_tensor_backend::Tensor sample_softmax_cuda(mfq_tensor_backend::Tensor logits, mfq_tensor_backend::Tensor random, double temperature);
+mfq_tensor_backend::Tensor sample_top_k_top_p_cuda(
+    mfq_tensor_backend::Tensor logits, mfq_tensor_backend::Tensor random, double temperature, int64_t top_k, double top_p);
+void sample_token_counts_add_cuda(mfq_tensor_backend::Tensor counts, mfq_tensor_backend::Tensor tokens);
+mfq_tensor_backend::Tensor sample_apply_penalties_cuda(
+    mfq_tensor_backend::Tensor logits, mfq_tensor_backend::Tensor counts,
     double presence_penalty, double frequency_penalty, double repetition_penalty);
-torch::Tensor nint_gemv_packed_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x, int64_t gs,
-    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
-torch::Tensor nint4_gs24_gemv_bf16_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale,
-    torch::Tensor sub_min, torch::Tensor neuron_scale,
-    torch::Tensor neuron_min, torch::Tensor x,
-    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
-torch::Tensor nint_gemv_packed_qx_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, int64_t gs,
-    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
+mfq_tensor_backend::Tensor nint_gemv_packed_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
+mfq_tensor_backend::Tensor nint4_gs24_gemv_bf16_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor sub_min, mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
+mfq_tensor_backend::Tensor nint_gemv_packed_qx_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, int64_t gs,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
 void nint4_gs24_quantize_input_ws_cuda(
-    torch::Tensor x, torch::Tensor qx,
-    torch::Tensor xscale, torch::Tensor xsum);
-std::vector<torch::Tensor> nint4_gs24_gemv_multi_qx_ws_cuda(
-    const std::vector<torch::Tensor> & q_packed,
-    const std::vector<torch::Tensor> & sub_scale,
-    const std::vector<torch::Tensor> & sub_min,
-    const std::vector<torch::Tensor> & neuron_scale,
-    const std::vector<torch::Tensor> & neuron_min,
-    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum,
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
+std::vector<mfq_tensor_backend::Tensor> nint4_gs24_gemv_multi_qx_ws_cuda(
+    const std::vector<mfq_tensor_backend::Tensor> & q_packed,
+    const std::vector<mfq_tensor_backend::Tensor> & sub_scale,
+    const std::vector<mfq_tensor_backend::Tensor> & sub_min,
+    const std::vector<mfq_tensor_backend::Tensor> & neuron_scale,
+    const std::vector<mfq_tensor_backend::Tensor> & neuron_min,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum,
     bool output_bf16);
-torch::Tensor nint_gemv_packed_batch_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x, int64_t gs,
-    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
-torch::Tensor nint_gemv_packed_gate_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x, torch::Tensor gate,
-    int64_t gs, int64_t mode, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
-torch::Tensor nint_gemv_packed_swiglu_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t gs, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
-torch::Tensor nint_gemv_packed_geglu_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t gs, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
-torch::Tensor nint_mmq_gs24_group32_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    torch::Tensor qx_mmq, torch::Tensor xscale, torch::Tensor xsum,
-    int64_t split_k, torch::Tensor partial);
-torch::Tensor nint_mmq_gs24_f16_nint3_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x);
-torch::Tensor nint_mmq_gs24_f16_nint4_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x);
-torch::Tensor nint_mmq_gs24_f16_nint6_split4_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    torch::Tensor partial);
-std::vector<torch::Tensor> nint8_one_quantize_reconstruct_cuda(
-    torch::Tensor x);
-torch::Tensor nint_mmq_f16_packed_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
+mfq_tensor_backend::Tensor nint_gemv_packed_batch_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
+mfq_tensor_backend::Tensor nint_gemv_packed_gate_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate,
+    int64_t gs, int64_t mode, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
+mfq_tensor_backend::Tensor nint_gemv_packed_swiglu_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
+mfq_tensor_backend::Tensor nint_gemv_packed_geglu_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
+mfq_tensor_backend::Tensor nint_mmq_gs24_group32_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor qx_mmq, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum,
+    int64_t split_k, mfq_tensor_backend::Tensor partial);
+mfq_tensor_backend::Tensor nint_mmq_gs24_f16_nint3_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x);
+mfq_tensor_backend::Tensor nint_mmq_gs24_f16_nint4_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x);
+mfq_tensor_backend::Tensor nint_mmq_gs24_f16_nint6_split4_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor partial);
+std::vector<mfq_tensor_backend::Tensor> nint8_one_quantize_reconstruct_cuda(
+    mfq_tensor_backend::Tensor x);
+mfq_tensor_backend::Tensor nint_mmq_f16_packed_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
     int64_t gs, int64_t bits);
-torch::Tensor nint_mmq_f32_packed_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
+mfq_tensor_backend::Tensor nint_mmq_f32_packed_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
     int64_t gs, int64_t bits);
-torch::Tensor nint8_zero_mmq_f16_packed_cuda(
-    torch::Tensor q, torch::Tensor scale, torch::Tensor x,
+mfq_tensor_backend::Tensor nint8_zero_mmq_f16_packed_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, mfq_tensor_backend::Tensor x,
     int64_t neuron_len);
-torch::Tensor nint8_zero_mmq_f32_packed_cuda(
-    torch::Tensor q, torch::Tensor scale, torch::Tensor x,
+mfq_tensor_backend::Tensor nint8_zero_mmq_f32_packed_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, mfq_tensor_backend::Tensor x,
     int64_t neuron_len);
-torch::Tensor nint_gemv_packed_bits_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x, int64_t gs,
-    int64_t bits, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
-torch::Tensor nint_gemv_packed_int6_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x, int64_t gs,
-    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
-torch::Tensor nint_gemv_packed_bits_qx_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, int64_t gs, int64_t bits,
-    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
-torch::Tensor nint_gemv_packed_bits_swiglu_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x, int64_t gs,
-    int64_t bits, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
-torch::Tensor nint_gemv_packed_bits_geglu_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x, int64_t gs,
-    int64_t bits, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
+mfq_tensor_backend::Tensor nint_gemv_packed_bits_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
+    int64_t bits, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
+mfq_tensor_backend::Tensor nint_gemv_packed_int6_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
+mfq_tensor_backend::Tensor nint_gemv_packed_bits_qx_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, int64_t gs, int64_t bits,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
+mfq_tensor_backend::Tensor nint_gemv_packed_bits_swiglu_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
+    int64_t bits, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
+mfq_tensor_backend::Tensor nint_gemv_packed_bits_geglu_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
+    int64_t bits, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
 void nint_ffn_gate_up_swiglu_quant_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
     int64_t gu_gs, int64_t gu_bits, int64_t down_gs,
-    torch::Tensor gu_qx, torch::Tensor gu_xscale, torch::Tensor gu_xsum,
-    torch::Tensor down_qx, torch::Tensor down_xscale, torch::Tensor down_xsum);
+    mfq_tensor_backend::Tensor gu_qx, mfq_tensor_backend::Tensor gu_xscale, mfq_tensor_backend::Tensor gu_xsum,
+    mfq_tensor_backend::Tensor down_qx, mfq_tensor_backend::Tensor down_xscale, mfq_tensor_backend::Tensor down_xsum);
 void nint_ffn_gate_up_geglu_quant_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
     int64_t gu_gs, int64_t gu_bits, int64_t down_gs,
-    torch::Tensor gu_qx, torch::Tensor gu_xscale, torch::Tensor gu_xsum,
-    torch::Tensor down_qx, torch::Tensor down_xscale, torch::Tensor down_xsum);
-torch::Tensor nint_gemv_packed_bits_argmax_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x, int64_t gs,
-    int64_t bits, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum,
-    torch::Tensor block_vals, torch::Tensor block_idxs);
-torch::Tensor nint5_gs28_q5_repack_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min);
-torch::Tensor nint5_gs28_q5_dequant_cuda(
-    torch::Tensor q_packed, torch::Tensor neuron_scale, torch::Tensor neuron_min,
+    mfq_tensor_backend::Tensor gu_qx, mfq_tensor_backend::Tensor gu_xscale, mfq_tensor_backend::Tensor gu_xsum,
+    mfq_tensor_backend::Tensor down_qx, mfq_tensor_backend::Tensor down_xscale, mfq_tensor_backend::Tensor down_xsum);
+mfq_tensor_backend::Tensor nint_gemv_packed_bits_argmax_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
+    int64_t bits, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum,
+    mfq_tensor_backend::Tensor block_vals, mfq_tensor_backend::Tensor block_idxs);
+mfq_tensor_backend::Tensor nint5_gs28_q5_repack_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min);
+mfq_tensor_backend::Tensor nint5_gs28_q5_dequant_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
     int64_t neuron_len);
-torch::Tensor nint5_gs28_q5_gemv_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor neuron_scale, torch::Tensor neuron_min,
-    torch::Tensor x, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
-torch::Tensor nint_gemv_packed_bits_m1_out_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x, int64_t gs,
-    int64_t bits, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum,
-    torch::Tensor out);
-torch::Tensor nint_gemv_packed_bits_linear_out_norm_gate_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min,
-    torch::Tensor y, torch::Tensor z, torch::Tensor norm_weight,
+mfq_tensor_backend::Tensor nint5_gs28_q5_gemv_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
+mfq_tensor_backend::Tensor nint_gemv_packed_bits_m1_out_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
+    int64_t bits, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum,
+    mfq_tensor_backend::Tensor out);
+mfq_tensor_backend::Tensor nint_gemv_packed_bits_linear_out_norm_gate_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
+    mfq_tensor_backend::Tensor y, mfq_tensor_backend::Tensor z, mfq_tensor_backend::Tensor norm_weight,
     int64_t gs, int64_t bits, int64_t dv, double eps,
-    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum, torch::Tensor rinv);
-torch::Tensor nint_gemv_packed_bits_gate_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x, torch::Tensor gate,
-    int64_t gs, int64_t bits, int64_t mode, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
-torch::Tensor nint_gemv_packed_u8_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x, int64_t gs,
-    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
-torch::Tensor nint_gemv_packed_u8_groupwise_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t gs, int64_t groups, torch::Tensor qx, torch::Tensor xscale,
-    torch::Tensor xsum);
-torch::Tensor nint_mmq_packed_u8_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x, int64_t gs,
-    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum);
-torch::Tensor nint8_zero_gemv_ws_cuda(
-    torch::Tensor q, torch::Tensor scale, torch::Tensor x,
-    torch::Tensor qx, torch::Tensor xscale);
-torch::Tensor nint8_zero_mmq_ws_cuda(
-    torch::Tensor q, torch::Tensor scale, torch::Tensor x,
-    torch::Tensor qx, torch::Tensor xscale);
-torch::Tensor nint8_zero_dequant_cuda(
-    torch::Tensor q, torch::Tensor scale, int64_t neuron_len);
-torch::Tensor nint_dequant_full_packed_compact_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, int64_t neuron_len, int64_t gs);
-torch::Tensor nint_dequant_full_packed_compact_bits_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, int64_t neuron_len, int64_t gs, int64_t bits);
-torch::Tensor nint_cublas_gemm_nt_f32acc_cuda(torch::Tensor x, torch::Tensor w);
-torch::Tensor mxfp8_dequant_cuda(
-    torch::Tensor values, torch::Tensor scales);
-torch::Tensor mxfp8_embedding_lookup_cuda(
-    torch::Tensor values, torch::Tensor scales, torch::Tensor token_ids);
-torch::Tensor mxfp8_small_m_cuda(
-    torch::Tensor values, torch::Tensor scales, torch::Tensor x);
-torch::Tensor mxfp8_matmul_f16_cuda(
-    torch::Tensor values, torch::Tensor scales, torch::Tensor input);
-torch::Tensor mxfp8_small_m_f32_cuda(
-    torch::Tensor values, torch::Tensor scales, torch::Tensor x);
-torch::Tensor mxfp8_gemm_f32_cuda(
-    torch::Tensor values, torch::Tensor scales, torch::Tensor x);
-torch::Tensor mxfp8_groupwise_small_m_cuda(
-    torch::Tensor values, torch::Tensor scales,
-    torch::Tensor x, int64_t groups);
-torch::Tensor mxfp8_groupwise_small_m_f32_cuda(
-    torch::Tensor values, torch::Tensor scales,
-    torch::Tensor x, int64_t groups);
-torch::Tensor mxfp4_dequant_cuda(
-    torch::Tensor values, torch::Tensor scales);
-torch::Tensor mxfp4_embedding_lookup_cuda(
-    torch::Tensor values, torch::Tensor scales, torch::Tensor token_ids);
-torch::Tensor mxfp4_matmul_f16_cuda(
-    torch::Tensor values, torch::Tensor scales, torch::Tensor input);
-torch::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
-    torch::Tensor values, torch::Tensor scales, torch::Tensor input,
-    torch::Tensor ids, torch::Tensor expert_local,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum, mfq_tensor_backend::Tensor rinv);
+mfq_tensor_backend::Tensor nint_gemv_packed_bits_gate_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate,
+    int64_t gs, int64_t bits, int64_t mode, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
+mfq_tensor_backend::Tensor nint_gemv_packed_u8_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
+mfq_tensor_backend::Tensor nint_gemv_packed_u8_groupwise_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t gs, int64_t groups, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale,
+    mfq_tensor_backend::Tensor xsum);
+mfq_tensor_backend::Tensor nint_mmq_packed_u8_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, int64_t gs,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum);
+mfq_tensor_backend::Tensor nint8_zero_gemv_ws_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
+mfq_tensor_backend::Tensor nint8_zero_mmq_ws_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
+mfq_tensor_backend::Tensor nint8_zero_dequant_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, int64_t neuron_len);
+mfq_tensor_backend::Tensor nint_dequant_full_packed_compact_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, int64_t neuron_len, int64_t gs);
+mfq_tensor_backend::Tensor nint_dequant_full_packed_compact_bits_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, int64_t neuron_len, int64_t gs, int64_t bits);
+mfq_tensor_backend::Tensor nint_cublas_gemm_nt_f32acc_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor w);
+mfq_tensor_backend::Tensor mxfp8_dequant_cuda(
+    mfq_tensor_backend::Tensor values, mfq_tensor_backend::Tensor scales);
+mfq_tensor_backend::Tensor mxfp8_embedding_lookup_cuda(
+    mfq_tensor_backend::Tensor values, mfq_tensor_backend::Tensor scales, mfq_tensor_backend::Tensor token_ids);
+mfq_tensor_backend::Tensor mxfp8_small_m_cuda(
+    mfq_tensor_backend::Tensor values, mfq_tensor_backend::Tensor scales, mfq_tensor_backend::Tensor x);
+mfq_tensor_backend::Tensor mxfp8_matmul_f16_cuda(
+    mfq_tensor_backend::Tensor values, mfq_tensor_backend::Tensor scales, mfq_tensor_backend::Tensor input);
+mfq_tensor_backend::Tensor mxfp8_small_m_f32_cuda(
+    mfq_tensor_backend::Tensor values, mfq_tensor_backend::Tensor scales, mfq_tensor_backend::Tensor x);
+mfq_tensor_backend::Tensor mxfp8_gemm_f32_cuda(
+    mfq_tensor_backend::Tensor values, mfq_tensor_backend::Tensor scales, mfq_tensor_backend::Tensor x);
+mfq_tensor_backend::Tensor mxfp8_groupwise_small_m_cuda(
+    mfq_tensor_backend::Tensor values, mfq_tensor_backend::Tensor scales,
+    mfq_tensor_backend::Tensor x, int64_t groups);
+mfq_tensor_backend::Tensor mxfp8_groupwise_small_m_f32_cuda(
+    mfq_tensor_backend::Tensor values, mfq_tensor_backend::Tensor scales,
+    mfq_tensor_backend::Tensor x, int64_t groups);
+mfq_tensor_backend::Tensor mxfp4_dequant_cuda(
+    mfq_tensor_backend::Tensor values, mfq_tensor_backend::Tensor scales);
+mfq_tensor_backend::Tensor mxfp4_embedding_lookup_cuda(
+    mfq_tensor_backend::Tensor values, mfq_tensor_backend::Tensor scales, mfq_tensor_backend::Tensor token_ids);
+mfq_tensor_backend::Tensor mxfp4_matmul_f16_cuda(
+    mfq_tensor_backend::Tensor values, mfq_tensor_backend::Tensor scales, mfq_tensor_backend::Tensor input);
+mfq_tensor_backend::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
+    mfq_tensor_backend::Tensor values, mfq_tensor_backend::Tensor scales, mfq_tensor_backend::Tensor input,
+    mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor expert_local,
     int64_t global_experts, int64_t pool_experts,
     int64_t out_per_expert, int64_t neuron_len,
-    torch::Tensor output, torch::Tensor ids_dst,
-    torch::Tensor expert_bounds, torch::Tensor tile_bounds,
-    torch::Tensor tile_experts);
-torch::Tensor tpq_int4_matmul_f16_cuda(
-    torch::Tensor packed, torch::Tensor scales,
-    torch::Tensor input, int64_t group_size);
-torch::Tensor tpq_int4_dequant_cuda(
-    torch::Tensor packed, torch::Tensor scales, int64_t group_size);
-torch::Tensor tpq_int4_embedding_lookup_cuda(
-    torch::Tensor packed, torch::Tensor scales,
-    torch::Tensor token_ids, int64_t group_size);
-torch::Tensor tpq_pq_matmul_f16_cuda(
-    torch::Tensor indices, torch::Tensor codebook, torch::Tensor input,
+    mfq_tensor_backend::Tensor output, mfq_tensor_backend::Tensor ids_dst,
+    mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
+    mfq_tensor_backend::Tensor tile_experts);
+mfq_tensor_backend::Tensor tpq_int4_matmul_f16_cuda(
+    mfq_tensor_backend::Tensor packed, mfq_tensor_backend::Tensor scales,
+    mfq_tensor_backend::Tensor input, int64_t group_size);
+mfq_tensor_backend::Tensor tpq_int4_dequant_cuda(
+    mfq_tensor_backend::Tensor packed, mfq_tensor_backend::Tensor scales, int64_t group_size);
+mfq_tensor_backend::Tensor tpq_int4_embedding_lookup_cuda(
+    mfq_tensor_backend::Tensor packed, mfq_tensor_backend::Tensor scales,
+    mfq_tensor_backend::Tensor token_ids, int64_t group_size);
+mfq_tensor_backend::Tensor tpq_pq_matmul_f16_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor codebook, mfq_tensor_backend::Tensor input,
     int64_t outputs, int64_t width,
     int64_t vector_size, int64_t index_bits);
-torch::Tensor tpq_pq_dequant_cuda(
-    torch::Tensor indices, torch::Tensor codebook,
+mfq_tensor_backend::Tensor tpq_pq_dequant_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor codebook,
     int64_t outputs, int64_t width,
     int64_t vector_size, int64_t index_bits);
-torch::Tensor tpq_pq_embedding_lookup_cuda(
-    torch::Tensor indices, torch::Tensor codebook, torch::Tensor token_ids,
+mfq_tensor_backend::Tensor tpq_pq_embedding_lookup_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor codebook, mfq_tensor_backend::Tensor token_ids,
     int64_t outputs, int64_t width,
     int64_t vector_size, int64_t index_bits);
-torch::Tensor tpq_pq_moe_grouped_matmul_pool_f16_cuda(
-    torch::Tensor indices, torch::Tensor codebook,
-    torch::Tensor input, torch::Tensor ids,
-    torch::Tensor expert_local, int64_t global_experts,
+mfq_tensor_backend::Tensor tpq_pq_moe_grouped_matmul_pool_f16_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor codebook,
+    mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor ids,
+    mfq_tensor_backend::Tensor expert_local, int64_t global_experts,
     int64_t pool_experts, int64_t out_per_expert,
     int64_t width, int64_t vector_size, int64_t index_bits,
-    torch::Tensor output, torch::Tensor ids_dst,
-    torch::Tensor expert_bounds, torch::Tensor tile_bounds,
-    torch::Tensor tile_experts);
-torch::Tensor nvq_dequant_cuda(
-    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
-    torch::Tensor neuron_scale, torch::Tensor codebook,
+    mfq_tensor_backend::Tensor output, mfq_tensor_backend::Tensor ids_dst,
+    mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
+    mfq_tensor_backend::Tensor tile_experts);
+mfq_tensor_backend::Tensor nvq_dequant_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor codebook,
     int64_t neuron_len, int64_t gs, int64_t sub_bits, int64_t format, int64_t sign_mode);
-torch::Tensor nepq_dequant_cuda(
-    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
-    torch::Tensor neuron_scale, torch::Tensor table_pool,
-    torch::Tensor bank_ids, int64_t neuron_len,
+mfq_tensor_backend::Tensor nepq_dequant_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor table_pool,
+    mfq_tensor_backend::Tensor bank_ids, int64_t neuron_len,
     int64_t sub_bits, int64_t format);
-torch::Tensor nepq_sparse_residual_dequant_cuda(
-    torch::Tensor dictionary, torch::Tensor first, torch::Tensor second,
-    int64_t position_bits, int64_t block_vectors, torch::Tensor weight);
-torch::Tensor nvq_gemm_f16_cuda(
-    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
-    torch::Tensor neuron_scale, torch::Tensor codebook, torch::Tensor x,
+mfq_tensor_backend::Tensor nepq_sparse_residual_dequant_cuda(
+    mfq_tensor_backend::Tensor dictionary, mfq_tensor_backend::Tensor first, mfq_tensor_backend::Tensor second,
+    int64_t position_bits, int64_t block_vectors, mfq_tensor_backend::Tensor weight);
+mfq_tensor_backend::Tensor nvq_gemm_f16_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor codebook, mfq_tensor_backend::Tensor x,
     int64_t neuron_len, int64_t gs, int64_t sub_bits, int64_t format, int64_t sign_mode);
-torch::Tensor nvq_gemv_ws_cuda(
-    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
-    torch::Tensor neuron_scale, torch::Tensor codebook, torch::Tensor x,
+mfq_tensor_backend::Tensor nvq_gemv_ws_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor codebook, mfq_tensor_backend::Tensor x,
     int64_t neuron_len, int64_t gs, int64_t sub_bits, int64_t format, int64_t sign_mode,
-    torch::Tensor qx, torch::Tensor xscale);
-torch::Tensor nvq_gemv_qx_ws_cuda(
-    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
-    torch::Tensor neuron_scale, torch::Tensor codebook,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
+mfq_tensor_backend::Tensor nvq_gemv_qx_ws_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor codebook,
     int64_t neuron_len, int64_t gs, int64_t sub_bits, int64_t format, int64_t sign_mode,
-    torch::Tensor qx, torch::Tensor xscale);
-torch::Tensor nvq_gemv_qx_residual_ws_cuda(
-    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
-    torch::Tensor neuron_scale, torch::Tensor codebook,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
+mfq_tensor_backend::Tensor nvq_gemv_qx_residual_ws_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor codebook,
     int64_t neuron_len, int64_t gs, int64_t sub_bits, int64_t format,
-    int64_t sign_mode, torch::Tensor qx, torch::Tensor xscale,
-    torch::Tensor residual);
-torch::Tensor nvq_gemv_multi2_ws_cuda(
-    torch::Tensor first_indices, torch::Tensor first_aux, torch::Tensor first_sub_scale,
-    torch::Tensor first_neuron_scale, torch::Tensor first_codebook,
-    torch::Tensor second_indices, torch::Tensor second_aux, torch::Tensor second_sub_scale,
-    torch::Tensor second_neuron_scale, torch::Tensor second_codebook,
-    torch::Tensor x, int64_t neuron_len, int64_t gs,
+    int64_t sign_mode, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale,
+    mfq_tensor_backend::Tensor residual);
+mfq_tensor_backend::Tensor nvq_gemv_multi2_ws_cuda(
+    mfq_tensor_backend::Tensor first_indices, mfq_tensor_backend::Tensor first_aux, mfq_tensor_backend::Tensor first_sub_scale,
+    mfq_tensor_backend::Tensor first_neuron_scale, mfq_tensor_backend::Tensor first_codebook,
+    mfq_tensor_backend::Tensor second_indices, mfq_tensor_backend::Tensor second_aux, mfq_tensor_backend::Tensor second_sub_scale,
+    mfq_tensor_backend::Tensor second_neuron_scale, mfq_tensor_backend::Tensor second_codebook,
+    mfq_tensor_backend::Tensor x, int64_t neuron_len, int64_t gs,
     int64_t first_sub_bits, int64_t first_format, int64_t first_sign_mode,
     int64_t second_sub_bits, int64_t second_format, int64_t second_sign_mode,
-    torch::Tensor qx, torch::Tensor xscale);
-torch::Tensor nvq_gemv_swiglu_ws_cuda(
-    torch::Tensor gate_indices, torch::Tensor gate_aux, torch::Tensor gate_sub_scale,
-    torch::Tensor gate_neuron_scale, torch::Tensor gate_codebook,
-    torch::Tensor up_indices, torch::Tensor up_aux, torch::Tensor up_sub_scale,
-    torch::Tensor up_neuron_scale, torch::Tensor up_codebook,
-    torch::Tensor x, int64_t neuron_len, int64_t gs,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
+mfq_tensor_backend::Tensor nvq_gemv_swiglu_ws_cuda(
+    mfq_tensor_backend::Tensor gate_indices, mfq_tensor_backend::Tensor gate_aux, mfq_tensor_backend::Tensor gate_sub_scale,
+    mfq_tensor_backend::Tensor gate_neuron_scale, mfq_tensor_backend::Tensor gate_codebook,
+    mfq_tensor_backend::Tensor up_indices, mfq_tensor_backend::Tensor up_aux, mfq_tensor_backend::Tensor up_sub_scale,
+    mfq_tensor_backend::Tensor up_neuron_scale, mfq_tensor_backend::Tensor up_codebook,
+    mfq_tensor_backend::Tensor x, int64_t neuron_len, int64_t gs,
     int64_t gate_sub_bits, int64_t gate_format, int64_t gate_sign_mode,
     int64_t up_sub_bits, int64_t up_format, int64_t up_sign_mode,
-    torch::Tensor qx, torch::Tensor xscale);
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
 void nvq_ffn_swiglu_quant_ws_cuda(
-    torch::Tensor gate_indices, torch::Tensor gate_aux, torch::Tensor gate_sub_scale,
-    torch::Tensor gate_neuron_scale, torch::Tensor gate_codebook,
-    torch::Tensor up_indices, torch::Tensor up_aux, torch::Tensor up_sub_scale,
-    torch::Tensor up_neuron_scale, torch::Tensor up_codebook,
-    torch::Tensor x, int64_t neuron_len, int64_t gs,
+    mfq_tensor_backend::Tensor gate_indices, mfq_tensor_backend::Tensor gate_aux, mfq_tensor_backend::Tensor gate_sub_scale,
+    mfq_tensor_backend::Tensor gate_neuron_scale, mfq_tensor_backend::Tensor gate_codebook,
+    mfq_tensor_backend::Tensor up_indices, mfq_tensor_backend::Tensor up_aux, mfq_tensor_backend::Tensor up_sub_scale,
+    mfq_tensor_backend::Tensor up_neuron_scale, mfq_tensor_backend::Tensor up_codebook,
+    mfq_tensor_backend::Tensor x, int64_t neuron_len, int64_t gs,
     int64_t gate_sub_bits, int64_t gate_format, int64_t gate_sign_mode,
     int64_t up_sub_bits, int64_t up_format, int64_t up_sign_mode, int64_t down_gs,
-    torch::Tensor input_qx, torch::Tensor input_xscale,
-    torch::Tensor output_qx, torch::Tensor output_xscale, torch::Tensor swiglu_scratch);
-torch::Tensor nvq_gemv_gate_ws_cuda(
-    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
-    torch::Tensor neuron_scale, torch::Tensor codebook, torch::Tensor x, torch::Tensor gate,
+    mfq_tensor_backend::Tensor input_qx, mfq_tensor_backend::Tensor input_xscale,
+    mfq_tensor_backend::Tensor output_qx, mfq_tensor_backend::Tensor output_xscale, mfq_tensor_backend::Tensor swiglu_scratch);
+mfq_tensor_backend::Tensor nvq_gemv_gate_ws_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor codebook, mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate,
     int64_t neuron_len, int64_t gs, int64_t sub_bits, int64_t format, int64_t sign_mode,
-    int64_t mode, torch::Tensor qx, torch::Tensor xscale);
-torch::Tensor nvq_mmq_ws_cuda(
-    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
-    torch::Tensor neuron_scale, torch::Tensor codebook, torch::Tensor x,
+    int64_t mode, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
+mfq_tensor_backend::Tensor nvq_mmq_ws_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor codebook, mfq_tensor_backend::Tensor x,
     int64_t neuron_len, int64_t gs, int64_t sub_bits, int64_t format, int64_t sign_mode,
-    torch::Tensor qx, torch::Tensor xscale);
-torch::Tensor nvq_mmq_gate_ws_cuda(
-    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
-    torch::Tensor neuron_scale, torch::Tensor codebook, torch::Tensor x, torch::Tensor gate,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
+mfq_tensor_backend::Tensor nvq_mmq_gate_ws_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor codebook, mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate,
     int64_t neuron_len, int64_t gs, int64_t sub_bits, int64_t format, int64_t sign_mode,
-    int64_t mode, torch::Tensor qx, torch::Tensor xscale);
-torch::Tensor nvq_embedding_lookup_cuda(
-    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
-    torch::Tensor neuron_scale, torch::Tensor codebook, torch::Tensor token_ids,
+    int64_t mode, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
+mfq_tensor_backend::Tensor nvq_embedding_lookup_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor codebook, mfq_tensor_backend::Tensor token_ids,
     int64_t neuron_len, int64_t gs, int64_t sub_bits, int64_t format, int64_t sign_mode);
-using torch::indexing::Slice;
+using mfq_tensor_backend::indexing::Slice;
 
 struct ProfileStat {
     double ms = 0.0;
@@ -749,7 +745,7 @@ struct CudaProfiler {
         cudaEvent_t start, stop;
         cudaEventCreate(&start);
         cudaEventCreate(&stop);
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        auto stream = mfq_get_current_cuda_stream().stream();
         if (graph_events) {
             cudaEventRecordWithFlags(start, stream, cudaEventRecordExternal);
         } else {
@@ -835,7 +831,7 @@ class MoeCachedSource;
 static std::shared_ptr<MoeExpertCache> g_moe_expert_cache;
 static int g_moe_cache_registration_min_slots = 8;
 static int g_gemma_trace_layer = -1;
-static std::vector<std::pair<std::string, torch::Tensor>> * g_gemma_stage_trace = nullptr;
+static std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>> * g_gemma_stage_trace = nullptr;
 
 enum class TensorParallelAxis {
     Mirrored,
@@ -860,13 +856,13 @@ struct TensorParallelConfig {
 static TensorParallelConfig g_tensor_parallel;
 
 struct TensorParallelCollectiveRuntime {
-    using Stream = decltype(at::cuda::getStreamFromPool(false));
+    using Stream = decltype(mfq_get_stream_from_pool(false));
 
     std::vector<int> devices;
     std::vector<Stream> streams;
     std::vector<cudaEvent_t> ready;
     std::vector<cudaEvent_t> completed;
-    std::vector<torch::Tensor> reduction_buffers;
+    std::vector<mfq_tensor_backend::Tensor> reduction_buffers;
 #ifdef MFQ_HAVE_NCCL
     std::vector<ncclComm_t> communicators;
 #endif
@@ -878,9 +874,8 @@ struct TensorParallelCollectiveRuntime {
 
     void reset() noexcept {
         // Release CUDA-owned state while every device context is still alive.
-        // Relying on static destruction is too late: libtorch's CUDA allocator
-        // may already be shutting down when tensors on secondary TP devices are
-        // destroyed.
+        // Static destruction is too late: the CUDA allocator may already be
+        // shutting down when tensors on secondary TP devices are destroyed.
         for (int device : devices) {
             (void)cudaSetDevice(device);
             (void)cudaDeviceSynchronize();
@@ -923,9 +918,9 @@ struct TensorParallelCollectiveRuntime {
         completed.resize(devices.size(), nullptr);
         reduction_buffers.resize(devices.size());
         for (size_t index = 0; index < devices.size(); ++index) {
-            c10::cuda::CUDAGuard guard(devices[index]);
+            MfqCudaGuard guard(devices[index]);
             streams.push_back(
-                at::cuda::getStreamFromPool(false, devices[index]));
+                mfq_get_stream_from_pool(false, devices[index]));
             MFQ_CUDA_CHECK(cudaEventCreateWithFlags(
                 &ready[index], cudaEventDisableTiming));
             MFQ_CUDA_CHECK(cudaEventCreateWithFlags(
@@ -1042,7 +1037,7 @@ struct KlKvCacheCapacityScope {
     }
 };
 
-static torch::Tensor kl_mmq_prepare_activation(torch::Tensor x) {
+static mfq_tensor_backend::Tensor kl_mmq_prepare_activation(mfq_tensor_backend::Tensor x) {
     if (g_kl_mmq_mode != KlMmqMode::Nint8One) {
         return x;
     }
@@ -1054,11 +1049,11 @@ static torch::Tensor kl_mmq_prepare_activation(torch::Tensor x) {
 }
 
 struct MoeRouteLayerStats {
-    torch::Tensor counts;
-    torch::Tensor weight_sum;
-    torch::Tensor weight_sq_sum;
-    torch::Tensor output_energy;
-    torch::Tensor weighted_output_energy;
+    mfq_tensor_backend::Tensor counts;
+    mfq_tensor_backend::Tensor weight_sum;
+    mfq_tensor_backend::Tensor weight_sq_sum;
+    mfq_tensor_backend::Tensor output_energy;
+    mfq_tensor_backend::Tensor weighted_output_energy;
 };
 
 static std::unordered_map<int, MoeRouteLayerStats> g_moe_route_stats;
@@ -1075,34 +1070,34 @@ static bool moe_route_output_energy_enabled() {
 
 static void record_moe_route_stats(
         int layer,
-        const torch::Tensor & ids,
-        const torch::Tensor & weights,
-        const torch::Tensor & output,
+        const mfq_tensor_backend::Tensor & ids,
+        const mfq_tensor_backend::Tensor & weights,
+        const mfq_tensor_backend::Tensor & output,
         int n_experts) {
     if (layer < 0 || moe_route_stats_path() == nullptr) return;
     auto found = g_moe_route_stats.find(layer);
     if (found == g_moe_route_stats.end()) {
-        auto options = torch::TensorOptions()
-            .device(ids.device()).dtype(torch::kFloat64);
+        auto options = mfq_tensor_backend::TensorOptions()
+            .device(ids.device()).dtype(mfq_tensor_backend::kFloat64);
         MoeRouteLayerStats value{
-            torch::zeros({n_experts}, options),
-            torch::zeros({n_experts}, options),
-            torch::zeros({n_experts}, options),
-            torch::zeros({n_experts}, options),
-            torch::zeros({n_experts}, options),
+            mfq_tensor_backend::zeros({n_experts}, options),
+            mfq_tensor_backend::zeros({n_experts}, options),
+            mfq_tensor_backend::zeros({n_experts}, options),
+            mfq_tensor_backend::zeros({n_experts}, options),
+            mfq_tensor_backend::zeros({n_experts}, options),
         };
         found = g_moe_route_stats.emplace(layer, std::move(value)).first;
     }
-    auto flat_ids = ids.reshape({-1}).to(torch::kInt64);
-    auto flat_weights = weights.reshape({-1}).to(torch::kFloat64);
-    auto ones = torch::ones_like(flat_weights);
+    auto flat_ids = ids.reshape({-1}).to(mfq_tensor_backend::kInt64);
+    auto flat_weights = weights.reshape({-1}).to(mfq_tensor_backend::kFloat64);
+    auto ones = mfq_tensor_backend::ones_like(flat_weights);
     found->second.counts.scatter_add_(0, flat_ids, ones);
     found->second.weight_sum.scatter_add_(0, flat_ids, flat_weights);
     found->second.weight_sq_sum.scatter_add_(
         0, flat_ids, flat_weights.square());
     if (moe_route_output_energy_enabled()) {
         auto energy = output.reshape({flat_ids.numel(), output.size(-1)})
-            .to(torch::kFloat32).square().sum(1).to(torch::kFloat64);
+            .to(mfq_tensor_backend::kFloat32).square().sum(1).to(mfq_tensor_backend::kFloat64);
         found->second.output_energy.scatter_add_(0, flat_ids, energy);
         found->second.weighted_output_energy.scatter_add_(
             0, flat_ids, energy * flat_weights.square());
@@ -1112,7 +1107,7 @@ static void record_moe_route_stats(
 static void write_moe_route_stats() {
     const char * path_value = moe_route_stats_path();
     if (path_value == nullptr || g_moe_route_stats.empty()) return;
-    torch::cuda::synchronize();
+    mfq_cuda_synchronize();
     std::filesystem::path path(path_value);
     if (path.has_parent_path()) {
         std::filesystem::create_directories(path.parent_path());
@@ -1131,12 +1126,12 @@ static void write_moe_route_stats() {
     out << std::setprecision(17);
     for (int layer : layers) {
         const auto & value = g_moe_route_stats.at(layer);
-        auto counts = value.counts.to(torch::kCPU).contiguous();
-        auto weight_sum = value.weight_sum.to(torch::kCPU).contiguous();
-        auto weight_sq_sum = value.weight_sq_sum.to(torch::kCPU).contiguous();
-        auto output_energy = value.output_energy.to(torch::kCPU).contiguous();
+        auto counts = value.counts.to(mfq_tensor_backend::kCPU).contiguous();
+        auto weight_sum = value.weight_sum.to(mfq_tensor_backend::kCPU).contiguous();
+        auto weight_sq_sum = value.weight_sq_sum.to(mfq_tensor_backend::kCPU).contiguous();
+        auto output_energy = value.output_energy.to(mfq_tensor_backend::kCPU).contiguous();
         auto weighted_output_energy =
-            value.weighted_output_energy.to(torch::kCPU).contiguous();
+            value.weighted_output_energy.to(mfq_tensor_backend::kCPU).contiguous();
         const auto n_experts = counts.numel();
         const double * count_data = counts.data_ptr<double>();
         const double * weight_data = weight_sum.data_ptr<double>();
@@ -1159,10 +1154,10 @@ static void write_moe_route_stats() {
               << (moe_route_output_energy_enabled() ? 1 : 0) << "\n";
 }
 
-static void trace_gemma_stage(int layer, const char * name, const torch::Tensor & value) {
+static void trace_gemma_stage(int layer, const char * name, const mfq_tensor_backend::Tensor & value) {
     if (g_gemma_stage_trace != nullptr && layer == g_gemma_trace_layer) {
         g_gemma_stage_trace->emplace_back(
-            name, value.to(torch::kFloat32).contiguous().clone());
+            name, value.to(mfq_tensor_backend::kFloat32).contiguous().clone());
     }
 }
 
@@ -1177,25 +1172,22 @@ static void report_cuda_memory(const char * stage) {
     size_t free_bytes = 0;
     size_t total_bytes = 0;
     MFQ_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-    const auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(
-        c10::cuda::current_device());
-    constexpr size_t aggregate = static_cast<size_t>(
-        c10::CachingDeviceAllocator::StatType::AGGREGATE);
+    const auto stats = mfq_cuda_memory_stats(mfq_current_cuda_device());
     constexpr double mib = 1024.0 * 1024.0;
     std::cout << "cuda_memory_stage=" << stage
               << " free_mib=" << free_bytes / mib
               << " used_mib=" << (total_bytes - free_bytes) / mib
               << " total_mib=" << total_bytes / mib
-              << " allocated_mib=" << stats.allocated_bytes[aggregate].current / mib
-              << " active_mib=" << stats.active_bytes[aggregate].current / mib
-              << " reserved_mib=" << stats.reserved_bytes[aggregate].current / mib
+              << " allocated_mib=" << stats.allocated_bytes / mib
+              << " active_mib=" << stats.active_bytes / mib
+              << " reserved_mib=" << stats.reserved_bytes / mib
               << " inactive_split_mib="
-              << stats.inactive_split_bytes[aggregate].current / mib
-              << " requested_mib=" << stats.requested_bytes[aggregate].current / mib
-              << " allocations=" << stats.allocation[aggregate].current
-              << " segments=" << stats.segment[aggregate].current
-              << " retries=" << stats.num_alloc_retries
-              << " ooms=" << stats.num_ooms << "\n";
+              << stats.inactive_split_bytes / mib
+              << " requested_mib=" << stats.requested_bytes / mib
+              << " allocations=" << stats.allocations
+              << " segments=" << stats.segments
+              << " retries=" << stats.retries
+              << " ooms=" << stats.ooms << "\n";
 }
 
 static bool moe_small_hetero_enabled(int tokens) {
@@ -2057,10 +2049,10 @@ static Mxfp4Cpu unpack_mxfp4(
     return result;
 }
 
-static torch::Tensor dequant_mxfp4_cpu(const Mxfp4Cpu & source) {
-    auto dense = torch::empty(
+static mfq_tensor_backend::Tensor dequant_mxfp4_cpu(const Mxfp4Cpu & source) {
+    auto dense = mfq_tensor_backend::empty(
         {source.out, source.neuron_len},
-        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32));
+        mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat32));
     float * destination = dense.data_ptr<float>();
     static constexpr float magnitude[8] = {
         0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
@@ -2083,7 +2075,7 @@ static torch::Tensor dequant_mxfp4_cpu(const Mxfp4Cpu & source) {
                 (code & 8u) == 0u ? value : -value;
         }
     }
-    return dense.to(torch::kFloat16);
+    return dense.to(mfq_tensor_backend::kFloat16);
 }
 
 static Mxfp4Cpu select_mxfp4_cpu_rows(
@@ -2515,26 +2507,26 @@ static Mxfp8Cpu slice_mxfp8_cpu(
     return result;
 }
 
-static torch::Tensor cpu_u8_tensor(const std::vector<uint8_t> & v, std::initializer_list<int64_t> shape) {
-    return torch::from_blob((void *)v.data(), shape, torch::TensorOptions().dtype(torch::kUInt8)).clone();
+static mfq_tensor_backend::Tensor cpu_u8_tensor(const std::vector<uint8_t> & v, std::initializer_list<int64_t> shape) {
+    return mfq_tensor_backend::from_blob((void *)v.data(), shape, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kUInt8)).clone();
 }
 
-static torch::Tensor cpu_f16_tensor(
+static mfq_tensor_backend::Tensor cpu_f16_tensor(
         const std::vector<uint16_t> & v,
         std::initializer_list<int64_t> shape) {
-    return torch::from_blob(
+    return mfq_tensor_backend::from_blob(
         (void *)v.data(), shape,
-        torch::TensorOptions().dtype(torch::kFloat16)).clone();
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat16)).clone();
 }
 
-static torch::Tensor cpu_f16_to_f32_tensor(const std::vector<uint16_t> & v, int64_t n) {
-    auto h = torch::from_blob((void *)v.data(), {n}, torch::TensorOptions().dtype(torch::kFloat16)).clone();
-    return h.to(torch::kFloat32).contiguous();
+static mfq_tensor_backend::Tensor cpu_f16_to_f32_tensor(const std::vector<uint16_t> & v, int64_t n) {
+    auto h = mfq_tensor_backend::from_blob((void *)v.data(), {n}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat16)).clone();
+    return h.to(mfq_tensor_backend::kFloat32).contiguous();
 }
 
 struct Mxfp8Weight {
-    torch::Tensor values;
-    torch::Tensor scales;
+    mfq_tensor_backend::Tensor values;
+    mfq_tensor_backend::Tensor scales;
     int64_t out = 0;
     int64_t neuron_len = 0;
 };
@@ -2554,9 +2546,9 @@ static Mxfp8Weight to_device_mxfp8(
         {(source.out + 127) / 128, source.neuron_len / 128});
     if (cuda) {
         const int target_device = device >= 0
-            ? device : c10::cuda::current_device();
-        c10::cuda::CUDAGuard guard(target_device);
-        const auto target = torch::Device(torch::kCUDA, target_device);
+            ? device : mfq_current_cuda_device();
+        MfqCudaGuard guard(target_device);
+        const auto target = mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA, target_device);
         result.values = result.values.to(target, false, false).contiguous();
         result.scales = result.scales.to(target, false, false).contiguous();
     }
@@ -2573,24 +2565,24 @@ struct Workspace {
     int M = 0;
     int K_pad = 0;
     int argmax_blocks = 0;
-    torch::Tensor qx;
-    torch::Tensor xscale;
-    torch::Tensor xsum;
-    torch::Tensor argmax_vals;
-    torch::Tensor argmax_idxs;
-    torch::Tensor out_buf;
-    torch::Tensor rinv;
-    torch::Tensor mmq_partial;
-    torch::Tensor mmq_qx;
+    mfq_tensor_backend::Tensor qx;
+    mfq_tensor_backend::Tensor xscale;
+    mfq_tensor_backend::Tensor xsum;
+    mfq_tensor_backend::Tensor argmax_vals;
+    mfq_tensor_backend::Tensor argmax_idxs;
+    mfq_tensor_backend::Tensor out_buf;
+    mfq_tensor_backend::Tensor rinv;
+    mfq_tensor_backend::Tensor mmq_partial;
+    mfq_tensor_backend::Tensor mmq_qx;
 };
 
 struct NintWeight {
-    torch::Tensor q_packed;
-    torch::Tensor q8_zero_scale;
-    torch::Tensor sub_scale;
-    torch::Tensor sub_min;
-    torch::Tensor neuron_scale;
-    torch::Tensor neuron_min;
+    mfq_tensor_backend::Tensor q_packed;
+    mfq_tensor_backend::Tensor q8_zero_scale;
+    mfq_tensor_backend::Tensor sub_scale;
+    mfq_tensor_backend::Tensor sub_min;
+    mfq_tensor_backend::Tensor neuron_scale;
+    mfq_tensor_backend::Tensor neuron_min;
     int64_t out = 0;
     int64_t ng = 0;
     int64_t gs = 0;
@@ -2609,9 +2601,9 @@ struct NintWeight {
         Workspace ws;
         ws.M = M;
         ws.K_pad = K_pad;
-        ws.qx = torch::empty({M, K_pad}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kInt8));
-        ws.xscale = torch::empty({M, ng}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
-        ws.xsum = torch::empty({M, ng}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kInt32));
+        ws.qx = mfq_tensor_backend::empty({M, K_pad}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt8));
+        ws.xscale = mfq_tensor_backend::empty({M, ng}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
+        ws.xsum = mfq_tensor_backend::empty({M, ng}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt32));
         auto res = workspaces.emplace(M, std::move(ws));
         return res.first->second;
     }
@@ -2620,23 +2612,23 @@ struct NintWeight {
         int nb = (int)((out + 3) / 4);
         if (ws.argmax_vals.defined() && ws.argmax_blocks >= nb) return;
         ws.argmax_blocks = nb;
-        ws.argmax_vals = torch::empty({nb}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
-        ws.argmax_idxs = torch::empty({nb}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kInt32));
+        ws.argmax_vals = mfq_tensor_backend::empty({nb}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
+        ws.argmax_idxs = mfq_tensor_backend::empty({nb}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt32));
     }
 
     void ensure_output_workspace(Workspace & ws) const {
         if (ws.out_buf.defined() && ws.out_buf.size(0) == 1 && ws.out_buf.size(1) == out) return;
-        ws.out_buf = torch::empty({1, out}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat16));
+        ws.out_buf = mfq_tensor_backend::empty({1, out}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat16));
     }
 
     void ensure_rinv_workspace(Workspace & ws, int64_t n) const {
         if (ws.rinv.defined() && ws.rinv.numel() >= n) return;
-        ws.rinv = torch::empty({n}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
+        ws.rinv = mfq_tensor_backend::empty({n}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
     }
 
     void ensure_mmq_partial_workspace(Workspace & ws, int64_t n) const {
         if (ws.mmq_partial.defined() && ws.mmq_partial.numel() >= n) return;
-        ws.mmq_partial = torch::empty({n}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
+        ws.mmq_partial = mfq_tensor_backend::empty({n}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
     }
 
     void ensure_mmq_qx_workspace(Workspace & ws, int M) const {
@@ -2645,7 +2637,7 @@ struct NintWeight {
         int nchunks = ((int)ng + 7) / 8;
         int64_t n = (int64_t)nchunks * m_pad * kStride;
         if (ws.mmq_qx.defined() && ws.mmq_qx.numel() >= n) return;
-        ws.mmq_qx = torch::empty({n}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kInt32));
+        ws.mmq_qx = mfq_tensor_backend::empty({n}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt32));
     }
 };
 
@@ -2683,7 +2675,7 @@ struct NintPrefillStreamKeyHash {
 
 static Workspace & nint_prefill_mmq_workspace(
         const NintWeight & weight,
-        const torch::Tensor & x,
+        const mfq_tensor_backend::Tensor & x,
         int M) {
     constexpr size_t kWorkspaceSlots = 3;
     thread_local std::unordered_map<
@@ -2692,7 +2684,7 @@ static Workspace & nint_prefill_mmq_workspace(
         NintPrefillStreamKeyHash> rings;
 
     const auto cuda_stream =
-        at::cuda::getCurrentCUDAStream().stream();
+        mfq_get_current_cuda_stream().stream();
     const NintPrefillStreamKey key{
         x.get_device(),
         reinterpret_cast<std::uintptr_t>(cuda_stream)};
@@ -2736,12 +2728,12 @@ static Workspace & nint_prefill_mmq_workspace(
             workspace.xscale.size(0) < M ||
             workspace.xscale.size(1) != weight.ng) {
         const auto float_options =
-            x.options().dtype(torch::kFloat32);
-        workspace.xscale = torch::empty(
+            x.options().dtype(mfq_tensor_backend::kFloat32);
+        workspace.xscale = mfq_tensor_backend::empty(
             {rows, weight.ng}, float_options);
-        workspace.xsum = torch::empty(
+        workspace.xsum = mfq_tensor_backend::empty(
             {rows, weight.ng},
-            x.options().dtype(torch::kInt32));
+            x.options().dtype(mfq_tensor_backend::kInt32));
     }
     return workspace;
 }
@@ -2768,11 +2760,11 @@ static NintWeight to_device_nint(const NintCpu & c, bool cuda) {
     w.neuron_scale = cpu_f16_to_f32_tensor(c.neuron_scale_h, c.out);
     w.neuron_min = cpu_f16_to_f32_tensor(c.neuron_min_h, c.out);
     if (cuda) {
-        w.q_packed = w.q_packed.to(torch::kCUDA).contiguous();
-        w.sub_scale = w.sub_scale.to(torch::kCUDA).contiguous();
-        w.sub_min = w.sub_min.to(torch::kCUDA).contiguous();
-        w.neuron_scale = w.neuron_scale.to(torch::kCUDA).contiguous();
-        w.neuron_min = w.neuron_min.to(torch::kCUDA).contiguous();
+        w.q_packed = w.q_packed.to(mfq_tensor_backend::kCUDA).contiguous();
+        w.sub_scale = w.sub_scale.to(mfq_tensor_backend::kCUDA).contiguous();
+        w.sub_min = w.sub_min.to(mfq_tensor_backend::kCUDA).contiguous();
+        w.neuron_scale = w.neuron_scale.to(mfq_tensor_backend::kCUDA).contiguous();
+        w.neuron_min = w.neuron_min.to(mfq_tensor_backend::kCUDA).contiguous();
     }
     return w;
 }
@@ -2783,7 +2775,7 @@ static NintWeight to_gpu_nint(const NintCpu & c) {
 
 static NintWeight to_cuda_device_nint(
         const NintCpu & c, int device) {
-    c10::cuda::CUDAGuard guard(device);
+    MfqCudaGuard guard(device);
     return to_device_nint(c, true);
 }
 
@@ -2805,8 +2797,8 @@ static NintWeight to_device_nint8_zero(
     w.q_packed = cpu_u8_tensor(c.q, {c.out, c.ng, 32});
     w.q8_zero_scale = cpu_f16_tensor(c.scale_h, {c.out, c.ng});
     if (cuda) {
-        w.q_packed = w.q_packed.to(torch::kCUDA).contiguous();
-        w.q8_zero_scale = w.q8_zero_scale.to(torch::kCUDA).contiguous();
+        w.q_packed = w.q_packed.to(mfq_tensor_backend::kCUDA).contiguous();
+        w.q8_zero_scale = w.q8_zero_scale.to(mfq_tensor_backend::kCUDA).contiguous();
     }
     return w;
 }
@@ -2817,7 +2809,7 @@ static NintWeight to_gpu_nint8_zero(const Nint8ZeroCpu & c) {
 
 static NintWeight to_cuda_device_nint8_zero(
         const Nint8ZeroCpu & c, int device) {
-    c10::cuda::CUDAGuard guard(device);
+    MfqCudaGuard guard(device);
     return to_device_nint8_zero(c, true);
 }
 
@@ -2998,7 +2990,7 @@ static NintMoeCpu unpack_nint_moe_delta(
 
 struct NintMoePoolWeight {
     NintWeight weight;
-    torch::Tensor expert_local;
+    mfq_tensor_backend::Tensor expert_local;
     int local_experts = 0;
     int profile_code = -1;
 };
@@ -3036,13 +3028,13 @@ struct MoeActivationKeyHash {
 };
 
 struct MoeActivationWorkspace {
-    torch::Tensor qx;
-    torch::Tensor xscale;
+    mfq_tensor_backend::Tensor qx;
+    mfq_tensor_backend::Tensor xscale;
 };
 
 struct Mxfp4Weight {
-    torch::Tensor values;
-    torch::Tensor scales;
+    mfq_tensor_backend::Tensor values;
+    mfq_tensor_backend::Tensor scales;
     int64_t out = 0;
     int64_t neuron_len = 0;
 };
@@ -3058,9 +3050,9 @@ static Mxfp4Weight to_device_mxfp4(
         source.scales, {source.out, source.neuron_len / 32});
     if (cuda) {
         const int target_device = device >= 0
-            ? device : c10::cuda::current_device();
-        c10::cuda::CUDAGuard guard(target_device);
-        const auto target = torch::Device(torch::kCUDA, target_device);
+            ? device : mfq_current_cuda_device();
+        MfqCudaGuard guard(target_device);
+        const auto target = mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA, target_device);
         result.values = result.values.to(target, false, false).contiguous();
         result.scales = result.scales.to(target, false, false).contiguous();
     }
@@ -3081,19 +3073,19 @@ struct MoeActivationGeometry {
 };
 
 struct MoeHeteroWorkspace {
-    std::vector<torch::Tensor> qx;
-    std::vector<torch::Tensor> xscale;
-    torch::Tensor activation_ptrs;
+    std::vector<mfq_tensor_backend::Tensor> qx;
+    std::vector<mfq_tensor_backend::Tensor> xscale;
+    mfq_tensor_backend::Tensor activation_ptrs;
 };
 
 struct MoeRoutePlan {
-    torch::Tensor ids;
-    torch::Tensor ids_dst;
-    torch::Tensor expert_bounds;
-    torch::Tensor tile_bounds;
-    torch::Tensor tile_experts;
-    torch::Tensor counts;
-    torch::Tensor cursors;
+    mfq_tensor_backend::Tensor ids;
+    mfq_tensor_backend::Tensor ids_dst;
+    mfq_tensor_backend::Tensor expert_bounds;
+    mfq_tensor_backend::Tensor tile_bounds;
+    mfq_tensor_backend::Tensor tile_experts;
+    mfq_tensor_backend::Tensor counts;
+    mfq_tensor_backend::Tensor cursors;
     int n_experts = 0;
     bool map_ready = false;
     uint64_t generation = 0;
@@ -3103,16 +3095,16 @@ struct MoeRoutePlan {
 
 static std::atomic<uint64_t> g_moe_route_generation{1};
 
-static torch::Tensor moe_tensor_to_device(
-        torch::Tensor value, int device) {
+static mfq_tensor_backend::Tensor moe_tensor_to_device(
+        mfq_tensor_backend::Tensor value, int device) {
     if (!value.defined()) return value;
     if (value.is_cuda() && value.get_device() == device) {
         return value.contiguous();
     }
-    c10::cuda::CUDAGuard guard(device);
+    MfqCudaGuard guard(device);
     return value.to(
         value.options().device(
-            torch::Device(torch::kCUDA, device)),
+            mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA, device)),
         true, false).contiguous();
 }
 
@@ -3137,26 +3129,26 @@ public:
 
 private:
     static void copy_tensor(
-            torch::Tensor & destination,
-            const torch::Tensor & source,
+            mfq_tensor_backend::Tensor & destination,
+            const mfq_tensor_backend::Tensor & source,
             int device) {
         if (!source.defined()) {
-            destination = torch::Tensor();
+            destination = mfq_tensor_backend::Tensor();
             return;
         }
         if (source.is_cuda() && source.get_device() == device) {
             destination = source.contiguous();
             return;
         }
-        c10::cuda::CUDAGuard guard(device);
+        MfqCudaGuard guard(device);
         auto options = source.options().device(
-            torch::Device(torch::kCUDA, device));
+            mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA, device));
         if (!destination.defined() ||
                 destination.sizes() != source.sizes() ||
                 destination.scalar_type() != source.scalar_type() ||
                 !destination.is_cuda() ||
                 destination.get_device() != device) {
-            destination = torch::empty(source.sizes(), options);
+            destination = mfq_tensor_backend::empty(source.sizes(), options);
         }
         destination.copy_(source, true);
     }
@@ -3188,8 +3180,8 @@ static MoeRoutePlan moe_route_to_device(
     return g_moe_route_replica_cache.get(source, device);
 }
 
-static MoeRoutePlan build_moe_route_plan(torch::Tensor ids, int n_experts) {
-    if (!ids.is_cuda() || ids.scalar_type() != torch::kInt32 || ids.dim() != 2) {
+static MoeRoutePlan build_moe_route_plan(mfq_tensor_backend::Tensor ids, int n_experts) {
+    if (!ids.is_cuda() || ids.scalar_type() != mfq_tensor_backend::kInt32 || ids.dim() != 2) {
         throw std::runtime_error("MoE ids must be CUDA int32 [tokens, routes]");
     }
     MoeRoutePlan result;
@@ -3197,7 +3189,7 @@ static MoeRoutePlan build_moe_route_plan(torch::Tensor ids, int n_experts) {
         1, std::memory_order_relaxed);
     result.ids = ids.contiguous();
     result.n_experts = n_experts;
-    auto empty = torch::empty({0}, result.ids.options());
+    auto empty = mfq_tensor_backend::empty({0}, result.ids.options());
     result.ids_dst = empty;
     result.expert_bounds = empty;
     result.tile_bounds = empty;
@@ -3217,8 +3209,8 @@ static MoeRoutePlan build_moe_route_plan(torch::Tensor ids, int n_experts) {
     return result;
 }
 
-static torch::Tensor reduce_tensor_parallel_outputs(
-    std::vector<torch::Tensor> outputs);
+static mfq_tensor_backend::Tensor reduce_tensor_parallel_outputs(
+    std::vector<mfq_tensor_backend::Tensor> outputs);
 
 struct NintMoeWeight {
     struct TensorParallelShard {
@@ -3233,10 +3225,10 @@ struct NintMoeWeight {
     int neuron_len = 0;
     std::vector<NintMoePoolWeight> pools;
     bool hetero_supported = false;
-    torch::Tensor weight_ptrs;
-    torch::Tensor pool_params;
-    torch::Tensor expert_pool;
-    torch::Tensor expert_local;
+    mfq_tensor_backend::Tensor weight_ptrs;
+    mfq_tensor_backend::Tensor pool_params;
+    mfq_tensor_backend::Tensor expert_pool;
+    mfq_tensor_backend::Tensor expert_local;
     std::vector<int> quantize_pool_indices;
     int gs24_quantize_index = -1;
     int gs28_quantize_index = -1;
@@ -3249,22 +3241,22 @@ struct NintMoeWeight {
         tensor_parallel_shards;
     std::function<void(const MoeRoutePlan &)> cache_prefetch;
     std::function<void(const MoeRoutePlan &)> cache_prefetch_begin;
-    std::function<torch::Tensor(torch::Tensor, const MoeRoutePlan &)> mixed_forward;
-    std::function<torch::Tensor(torch::Tensor, const MoeRoutePlan &)>
+    std::function<mfq_tensor_backend::Tensor(mfq_tensor_backend::Tensor, const MoeRoutePlan &)> mixed_forward;
+    std::function<mfq_tensor_backend::Tensor(mfq_tensor_backend::Tensor, const MoeRoutePlan &)>
         mixed_prequantized_forward;
-    std::function<torch::Tensor(
-        torch::Tensor, const MoeRoutePlan &, bool)> mixed_glu_output_forward;
-    std::function<torch::Tensor(
-        torch::Tensor, const MoeRoutePlan &, bool)> mixed_glu_forward;
-    std::function<torch::Tensor(
-        torch::Tensor, const MoeRoutePlan &, double)> mixed_clamped_swiglu_forward;
+    std::function<mfq_tensor_backend::Tensor(
+        mfq_tensor_backend::Tensor, const MoeRoutePlan &, bool)> mixed_glu_output_forward;
+    std::function<mfq_tensor_backend::Tensor(
+        mfq_tensor_backend::Tensor, const MoeRoutePlan &, bool)> mixed_glu_forward;
+    std::function<mfq_tensor_backend::Tensor(
+        mfq_tensor_backend::Tensor, const MoeRoutePlan &, double)> mixed_clamped_swiglu_forward;
     mutable std::unordered_map<int, MoeHeteroWorkspace> hetero_workspaces;
     std::vector<MoeActivationGeometry> activation_geometries;
     int activation_workspace_domain = 0;
     std::shared_ptr<MoeCachedSource> cached_source;
 
     MoeActivationWorkspace & activation_workspace(
-            torch::Tensor x, int input_rows, int groups, int gs) const {
+            mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs) const {
         // Decode Gate and Up consume the same activation.  A process thread
         // therefore owns one stable workspace per activation geometry; the
         // explicit forward_prequantized() entry point below is the only path
@@ -3276,15 +3268,15 @@ struct NintMoeWeight {
         auto it = shared_activation_workspaces.find(key);
         if (it != shared_activation_workspaces.end()) return it->second;
         MoeActivationWorkspace workspace;
-        workspace.qx = torch::empty(
-            {input_rows, groups * gs}, x.options().dtype(torch::kInt8));
-        workspace.xscale = torch::empty(
-            {input_rows, groups}, x.options().dtype(torch::kFloat32));
+        workspace.qx = mfq_tensor_backend::empty(
+            {input_rows, groups * gs}, x.options().dtype(mfq_tensor_backend::kInt8));
+        workspace.xscale = mfq_tensor_backend::empty(
+            {input_rows, groups}, x.options().dtype(mfq_tensor_backend::kFloat32));
         return shared_activation_workspaces.emplace(
             key, std::move(workspace)).first->second;
     }
 
-    MoeHeteroWorkspace & hetero_workspace(torch::Tensor x, int input_rows) const {
+    MoeHeteroWorkspace & hetero_workspace(mfq_tensor_backend::Tensor x, int input_rows) const {
         auto found = hetero_workspaces.find(input_rows);
         if (found != hetero_workspaces.end()) return found->second;
         MoeHeteroWorkspace workspace;
@@ -3303,9 +3295,9 @@ struct NintMoeWeight {
             pointers.push_back(static_cast<int64_t>(
                 reinterpret_cast<uintptr_t>(activation.xscale.data_ptr<float>())));
         }
-        workspace.activation_ptrs = torch::from_blob(
+        workspace.activation_ptrs = mfq_tensor_backend::from_blob(
             pointers.data(), {static_cast<int64_t>(pools.size()), 2},
-            torch::TensorOptions().dtype(torch::kInt64)).clone().to(torch::kCUDA).contiguous();
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64)).clone().to(mfq_tensor_backend::kCUDA).contiguous();
         return hetero_workspaces.emplace(input_rows, std::move(workspace)).first->second;
     }
 
@@ -3319,19 +3311,19 @@ struct NintMoeWeight {
     }
 
     template <typename Forward>
-    torch::Tensor forward_tensor_parallel(
-            torch::Tensor x,
+    mfq_tensor_backend::Tensor forward_tensor_parallel(
+            mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route,
             bool paired_output,
             Forward && forward) const {
-        std::vector<torch::Tensor> outputs;
+        std::vector<mfq_tensor_backend::Tensor> outputs;
         outputs.reserve(tensor_parallel_shards.size());
         for (const auto & shard : tensor_parallel_shards) {
             if (!shard.weight) {
                 throw std::runtime_error(
                     "tensor-parallel MoE shard is missing");
             }
-            c10::cuda::CUDAGuard guard(shard.device);
+            MfqCudaGuard guard(shard.device);
             auto local_x =
                 moe_tensor_to_device(x, shard.device);
             auto local_route =
@@ -3344,16 +3336,16 @@ struct NintMoeWeight {
         }
         const int primary =
             g_tensor_parallel.primary_device();
-        c10::cuda::CUDAGuard primary_guard(primary);
+        MfqCudaGuard primary_guard(primary);
         if (!paired_output) {
             for (auto & output : outputs) {
                 output =
                     moe_tensor_to_device(output, primary);
             }
-            return torch::cat(outputs, -1).contiguous();
+            return mfq_tensor_backend::cat(outputs, -1).contiguous();
         }
-        std::vector<torch::Tensor> first;
-        std::vector<torch::Tensor> second;
+        std::vector<mfq_tensor_backend::Tensor> first;
+        std::vector<mfq_tensor_backend::Tensor> second;
         first.reserve(outputs.size());
         second.reserve(outputs.size());
         for (auto & output : outputs) {
@@ -3371,9 +3363,9 @@ struct NintMoeWeight {
             second.push_back(
                 output.narrow(-1, half, half));
         }
-        return torch::cat(
-            {torch::cat(first, -1),
-             torch::cat(second, -1)},
+        return mfq_tensor_backend::cat(
+            {mfq_tensor_backend::cat(first, -1),
+             mfq_tensor_backend::cat(second, -1)},
             -1).contiguous();
     }
 
@@ -3415,20 +3407,20 @@ struct NintMoeWeight {
             });
     }
 
-    torch::Tensor forward(
-            torch::Tensor x,
+    mfq_tensor_backend::Tensor forward(
+            mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route) const {
         return forward_impl(x, route, false);
     }
 
-    torch::Tensor forward_prequantized(
-            torch::Tensor x,
+    mfq_tensor_backend::Tensor forward_prequantized(
+            mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route) const {
         return forward_impl(x, route, true);
     }
 
-    torch::Tensor forward_impl(
-            torch::Tensor x,
+    mfq_tensor_backend::Tensor forward_impl(
+            mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route,
             bool input_prequantized) const {
         if (tensor_parallel()) {
@@ -3437,10 +3429,10 @@ struct NintMoeWeight {
                     "prequantized MoE activation reuse is unavailable with tensor parallelism");
             }
             if (tensor_parallel_experts) {
-                std::vector<torch::Tensor> partials;
+                std::vector<mfq_tensor_backend::Tensor> partials;
                 partials.reserve(tensor_parallel_shards.size());
                 for (const auto & shard : tensor_parallel_shards) {
-                    c10::cuda::CUDAGuard guard(shard.device);
+                    MfqCudaGuard guard(shard.device);
                     auto local_x = moe_tensor_to_device(x, shard.device);
                     auto local_route = moe_route_to_device(route, shard.device);
                     partials.push_back(
@@ -3453,7 +3445,7 @@ struct NintMoeWeight {
                 x, route,
                 tensor_parallel_paired_output,
                 [](const NintMoeWeight & shard,
-                   torch::Tensor local_x,
+                   mfq_tensor_backend::Tensor local_x,
                    const MoeRoutePlan & local_route) {
                     return shard.forward(
                         local_x, local_route);
@@ -3467,7 +3459,7 @@ struct NintMoeWeight {
             throw std::runtime_error(
                 "prequantized MoE activation reuse requires heterogeneous NINT dispatch");
         }
-        if (!x.is_cuda() || !x.is_contiguous() || x.scalar_type() != torch::kFloat16 ||
+        if (!x.is_cuda() || !x.is_contiguous() || x.scalar_type() != mfq_tensor_backend::kFloat16 ||
             (x.dim() != 2 && x.dim() != 3) || x.size(-1) != neuron_len) {
             throw std::runtime_error("NINTM input must be contiguous CUDA f16 with exact K");
         }
@@ -3479,14 +3471,14 @@ struct NintMoeWeight {
         }
         int input_rows = x.dim() == 3 ? tokens * routes : tokens;
         auto output = partial_experts
-            ? torch::zeros(
+            ? mfq_tensor_backend::zeros(
                 {tokens, routes, out_per_expert},
-                x.options().dtype(torch::kFloat16))
-            : torch::empty(
+                x.options().dtype(mfq_tensor_backend::kFloat16))
+            : mfq_tensor_backend::empty(
                 {tokens, routes, out_per_expert},
-                x.options().dtype(torch::kFloat16));
+                x.options().dtype(mfq_tensor_backend::kFloat16));
         if (g_kl_mmq_mode != KlMmqMode::Default) {
-            TORCH_CHECK(
+            MFQ_RUNTIME_CHECK(
                 hetero_supported && route.map_ready &&
                 route.ids_dst.numel() == route.ids.numel(),
                 "KLD common MMQ requires the routed packed-FP16 path");
@@ -3519,7 +3511,7 @@ struct NintMoeWeight {
                 hetero_workspaces.find(input_rows) == hetero_workspaces.end()) {
             cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
             MFQ_CUDA_CHECK(cudaStreamIsCapturing(
-                at::cuda::getCurrentCUDAStream().stream(), &capture_status));
+                mfq_get_current_cuda_stream().stream(), &capture_status));
             if (capture_status == cudaStreamCaptureStatusNone) {
                 hetero_workspace(x, input_rows);
             }
@@ -3580,14 +3572,14 @@ struct NintMoeWeight {
         return output;
     }
 
-    torch::Tensor forward_glu_output(
-            torch::Tensor x, const MoeRoutePlan & route, bool gelu) const {
+    mfq_tensor_backend::Tensor forward_glu_output(
+            mfq_tensor_backend::Tensor x, const MoeRoutePlan & route, bool gelu) const {
         if (tensor_parallel()) {
             return forward_tensor_parallel(
                 x, route, false,
                 [gelu](
                     const NintMoeWeight & shard,
-                    torch::Tensor local_x,
+                    mfq_tensor_backend::Tensor local_x,
                     const MoeRoutePlan & local_route) {
                     return shard.forward_glu_output(
                         local_x, local_route, gelu);
@@ -3597,7 +3589,7 @@ struct NintMoeWeight {
             return mixed_glu_output_forward(x, route, gelu);
         }
         if (!hetero_supported || !x.is_cuda() || !x.is_contiguous() ||
-            x.scalar_type() != torch::kFloat16 || x.dim() != 2 ||
+            x.scalar_type() != mfq_tensor_backend::kFloat16 || x.dim() != 2 ||
             x.size(0) < 1 || x.size(0) > 4 ||
             x.size(1) != neuron_len || out_per_expert <= 0 || out_per_expert % 2 != 0 ||
             route.ids.size(0) != x.size(0) || route.n_experts != n_experts) {
@@ -3608,12 +3600,12 @@ struct NintMoeWeight {
         const int hidden_width = out_per_expert / 2;
         const int routes = static_cast<int>(route.ids.size(1));
         auto output = partial_experts
-            ? torch::zeros(
+            ? mfq_tensor_backend::zeros(
                 {tokens, routes, hidden_width},
-                x.options().dtype(torch::kFloat16))
-            : torch::empty(
+                x.options().dtype(mfq_tensor_backend::kFloat16))
+            : mfq_tensor_backend::empty(
                 {tokens, routes, hidden_width},
-                x.options().dtype(torch::kFloat16));
+                x.options().dtype(mfq_tensor_backend::kFloat16));
         auto & workspace = hetero_workspace(x, tokens);
         if (supports_dual_quant()) {
             nint_moe_quantize_24_28_ws_cuda(
@@ -3637,14 +3629,14 @@ struct NintMoeWeight {
             hidden_width, gelu, output);
     }
 
-    torch::Tensor forward_glu(
-            torch::Tensor gate_up, const MoeRoutePlan & route, bool gelu) const {
+    mfq_tensor_backend::Tensor forward_glu(
+            mfq_tensor_backend::Tensor gate_up, const MoeRoutePlan & route, bool gelu) const {
         if (tensor_parallel()) {
             return forward_tensor_parallel(
                 gate_up, route, false,
                 [gelu](
                     const NintMoeWeight & shard,
-                    torch::Tensor local_gate_up,
+                    mfq_tensor_backend::Tensor local_gate_up,
                     const MoeRoutePlan & local_route) {
                     return shard.forward_glu(
                         local_gate_up,
@@ -3655,7 +3647,7 @@ struct NintMoeWeight {
             return mixed_glu_forward(gate_up, route, gelu);
         }
         if (!hetero_supported || !gate_up.is_cuda() || !gate_up.is_contiguous() ||
-            gate_up.scalar_type() != torch::kFloat16 || gate_up.dim() != 3 ||
+            gate_up.scalar_type() != mfq_tensor_backend::kFloat16 || gate_up.dim() != 3 ||
             gate_up.size(2) != 2 * neuron_len) {
             throw std::runtime_error("fused NINTM GLU input has an unsupported layout");
         }
@@ -3667,12 +3659,12 @@ struct NintMoeWeight {
         }
         const int input_rows = tokens * routes;
         auto output = partial_experts
-            ? torch::zeros(
+            ? mfq_tensor_backend::zeros(
                 {tokens, routes, out_per_expert},
-                gate_up.options().dtype(torch::kFloat16))
-            : torch::empty(
+                gate_up.options().dtype(mfq_tensor_backend::kFloat16))
+            : mfq_tensor_backend::empty(
                 {tokens, routes, out_per_expert},
-                gate_up.options().dtype(torch::kFloat16));
+                gate_up.options().dtype(mfq_tensor_backend::kFloat16));
         auto & workspace = hetero_workspace(gate_up, input_rows);
         if (supports_dual_quant() && neuron_len <= 4096) {
             if (gelu) {
@@ -3710,7 +3702,7 @@ struct NintMoeWeight {
             route.ids_dst, route.expert_bounds, route.tile_bounds, route.tile_experts);
     }
 
-    torch::Tensor forward_swiglu(torch::Tensor gate_up, const MoeRoutePlan & route) const {
+    mfq_tensor_backend::Tensor forward_swiglu(mfq_tensor_backend::Tensor gate_up, const MoeRoutePlan & route) const {
         return forward_glu(gate_up, route, false);
     }
 
@@ -3728,8 +3720,8 @@ struct NintMoeWeight {
         return static_cast<bool>(mixed_clamped_swiglu_forward);
     }
 
-    torch::Tensor forward_clamped_swiglu(
-            torch::Tensor gate_up,
+    mfq_tensor_backend::Tensor forward_clamped_swiglu(
+            mfq_tensor_backend::Tensor gate_up,
             const MoeRoutePlan & route,
             double limit) const {
         if (tensor_parallel()) {
@@ -3737,7 +3729,7 @@ struct NintMoeWeight {
                 gate_up, route, false,
                 [limit](
                     const NintMoeWeight & shard,
-                    torch::Tensor local_gate_up,
+                    mfq_tensor_backend::Tensor local_gate_up,
                     const MoeRoutePlan & local_route) {
                     return shard.forward_clamped_swiglu(
                         local_gate_up,
@@ -3751,7 +3743,7 @@ struct NintMoeWeight {
         return mixed_clamped_swiglu_forward(gate_up, route, limit);
     }
 
-    torch::Tensor forward_geglu(torch::Tensor gate_up, const MoeRoutePlan & route) const {
+    mfq_tensor_backend::Tensor forward_geglu(mfq_tensor_backend::Tensor gate_up, const MoeRoutePlan & route) const {
         return forward_glu(gate_up, route, true);
     }
 };
@@ -3830,26 +3822,26 @@ static void initialize_nint_moe_dispatch(
         pool_params.push_back(
             static_cast<int32_t>(pool.weight.ng));
     }
-    result.weight_ptrs = torch::from_blob(
+    result.weight_ptrs = mfq_tensor_backend::from_blob(
         weight_ptrs.data(),
         {static_cast<int64_t>(result.pools.size()), 5},
-        torch::TensorOptions().dtype(torch::kInt64))
-        .clone().to(torch::kCUDA).contiguous();
-    result.pool_params = torch::from_blob(
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
+        .clone().to(mfq_tensor_backend::kCUDA).contiguous();
+    result.pool_params = mfq_tensor_backend::from_blob(
         pool_params.data(),
         {static_cast<int64_t>(result.pools.size()), 2},
-        torch::TensorOptions().dtype(torch::kInt32))
-        .clone().to(torch::kCUDA).contiguous();
-    result.expert_pool = torch::from_blob(
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+        .clone().to(mfq_tensor_backend::kCUDA).contiguous();
+    result.expert_pool = mfq_tensor_backend::from_blob(
         const_cast<int32_t *>(expert_pool.data()),
         {static_cast<int64_t>(expert_pool.size())},
-        torch::TensorOptions().dtype(torch::kInt32))
-        .clone().to(torch::kCUDA).contiguous();
-    result.expert_local = torch::from_blob(
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+        .clone().to(mfq_tensor_backend::kCUDA).contiguous();
+    result.expert_local = mfq_tensor_backend::from_blob(
         const_cast<int32_t *>(expert_local.data()),
         {static_cast<int64_t>(expert_local.size())},
-        torch::TensorOptions().dtype(torch::kInt32))
-        .clone().to(torch::kCUDA).contiguous();
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+        .clone().to(mfq_tensor_backend::kCUDA).contiguous();
 }
 
 static NintMoeWeight to_gpu_nint_moe(const NintMoeCpu & cpu) {
@@ -3880,9 +3872,9 @@ static NintMoeWeight to_gpu_nint_moe(const NintMoeCpu & cpu) {
             expert_pool[static_cast<size_t>(expert)] = pool_index;
             expert_local[static_cast<size_t>(expert)] = index;
         }
-        pool.expert_local = torch::from_blob(
-            local.data(), {(int64_t)local.size()}, torch::TensorOptions().dtype(torch::kInt32))
-            .clone().to(torch::kCUDA).contiguous();
+        pool.expert_local = mfq_tensor_backend::from_blob(
+            local.data(), {(int64_t)local.size()}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+            .clone().to(mfq_tensor_backend::kCUDA).contiguous();
         result.pools.push_back(std::move(pool));
     }
     initialize_nint_moe_dispatch(
@@ -3901,12 +3893,12 @@ static NintMoeWeight load_nint_moe_gpu(
     int layer_id = -1,
     const std::string & projection_role = {});
 
-static std::vector<torch::Tensor> nint_moe_ffn_forward(
+static std::vector<mfq_tensor_backend::Tensor> nint_moe_ffn_forward(
         const NintMoeWeight & gate_up, const NintMoeWeight & down,
-        torch::Tensor x, torch::Tensor router_logits,
+        mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor router_logits,
         int top_k, bool use_sigmoid, bool use_sqrt_softplus,
         bool normalize, bool delayed_softmax,
-        c10::optional<torch::Tensor> router_bias, double router_scale) {
+        MfqOptional<mfq_tensor_backend::Tensor> router_bias, double router_scale) {
     if (gate_up.n_experts != down.n_experts ||
         gate_up.out_per_expert != 2 * down.neuron_len ||
         down.out_per_expert != gate_up.neuron_len) {
@@ -4452,7 +4444,7 @@ static NvqCpu unpack_nvq(const std::vector<uint8_t> & blob, const std::string & 
                     : (vector_size == 4
                         ? (float)(rank + 1)
                         : 15.0f * (float)(rank + 1) / (float)(16 / banks));
-                const c10::Half expected_half(expected_scale);
+                const mfq_half expected_half(expected_scale);
                 uint16_t expected_alpha_h;
                 std::memcpy(&expected_alpha_h, &expected_half, sizeof(expected_alpha_h));
                 if (header[36 + state] != expected_bank || alpha_h != expected_alpha_h) {
@@ -4528,27 +4520,27 @@ static NvqCpu unpack_nvq(const std::vector<uint8_t> & blob, const std::string & 
     return t;
 }
 
-static torch::Tensor cpu_i8_tensor(const std::vector<int8_t> & v, std::initializer_list<int64_t> shape) {
-    return torch::from_blob((void *)v.data(), shape, torch::TensorOptions().dtype(torch::kInt8)).clone();
+static mfq_tensor_backend::Tensor cpu_i8_tensor(const std::vector<int8_t> & v, std::initializer_list<int64_t> shape) {
+    return mfq_tensor_backend::from_blob((void *)v.data(), shape, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt8)).clone();
 }
 
 struct NvqWorkspace {
     int M = 0;
     int K_pad = 0;
-    torch::Tensor qx;
-    torch::Tensor xscale;
-    torch::Tensor swiglu_scratch;
+    mfq_tensor_backend::Tensor qx;
+    mfq_tensor_backend::Tensor xscale;
+    mfq_tensor_backend::Tensor swiglu_scratch;
 };
 
 constexpr int64_t kNvq2JscXlGroupExecKernelFormat = 16;
 constexpr int64_t kNvq3JscLGroupExecKernelFormat = 17;
 
 struct NvqWeight {
-    torch::Tensor indices_packed;
-    torch::Tensor aux_packed;
-    torch::Tensor sub_scale_packed;
-    torch::Tensor neuron_scale;
-    torch::Tensor codebook;
+    mfq_tensor_backend::Tensor indices_packed;
+    mfq_tensor_backend::Tensor aux_packed;
+    mfq_tensor_backend::Tensor sub_scale_packed;
+    mfq_tensor_backend::Tensor neuron_scale;
+    mfq_tensor_backend::Tensor codebook;
     int64_t format = 0;
     int64_t kernel_format = 0;
     int64_t sign_mode = 0;
@@ -4567,8 +4559,8 @@ struct NvqWeight {
         NvqWorkspace ws;
         ws.M = M;
         ws.K_pad = K_pad;
-        ws.qx = torch::empty({M, K_pad}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kInt8));
-        ws.xscale = torch::empty({M, ng}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
+        ws.qx = mfq_tensor_backend::empty({M, K_pad}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt8));
+        ws.xscale = mfq_tensor_backend::empty({M, ng}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
         return workspaces.emplace(M, std::move(ws)).first->second;
     }
 };
@@ -4648,7 +4640,7 @@ static std::vector<uint8_t> repack_extended_jsc_group_metadata(
     const size_t record_bytes = c.format == 14 ? 8 : 12;
     const size_t group_count = static_cast<size_t>(c.out) * c.ng;
     std::vector<uint8_t> metadata(group_count * record_bytes, 0);
-    at::parallel_for(0, static_cast<int64_t>(group_count), 4096, [&](int64_t begin, int64_t end) {
+    mfq_parallel_for(0, static_cast<int64_t>(group_count), 4096, [&](int64_t begin, int64_t end) {
         for (int64_t linear = begin; linear < end; ++linear) {
             const int64_t row = linear / c.ng;
             const int group = static_cast<int>(linear - row * c.ng);
@@ -4828,7 +4820,7 @@ static std::vector<uint8_t> remap_extended_e8_sub_scale_states(
         throw std::runtime_error("NVQ2J-XL scale-state stream length mismatch");
     }
     std::vector<uint8_t> remapped(expected_bytes, 0);
-    at::parallel_for(0, static_cast<int64_t>(expected_bytes), 4096,
+    mfq_parallel_for(0, static_cast<int64_t>(expected_bytes), 4096,
         [&](int64_t begin, int64_t end) {
             for (int64_t byte = begin; byte < end; ++byte) {
                 const uint8_t source = c.sub_scale_packed[byte];
@@ -4875,8 +4867,8 @@ static NvqWeight to_device_nvq(const NvqCpu & c, bool cuda) {
             use_extended_e8 ? e8_index_remap.get() : nullptr);
         w.indices_packed = cpu_u8_tensor(
             metadata, {(int64_t)metadata.size()});
-        w.aux_packed = torch::empty(
-            {0}, torch::TensorOptions().dtype(torch::kUInt8));
+        w.aux_packed = mfq_tensor_backend::empty(
+            {0}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kUInt8));
         w.kernel_format = c.format == 14
             ? kNvq2JscXlGroupExecKernelFormat
             : kNvq3JscLGroupExecKernelFormat;
@@ -4885,8 +4877,8 @@ static NvqWeight to_device_nvq(const NvqCpu & c, bool cuda) {
         auto metadata = repack_nvq2_exec_metadata(c);
         w.indices_packed = cpu_u8_tensor(
             metadata, {(int64_t)metadata.size()});
-        w.aux_packed = torch::empty(
-            {0}, torch::TensorOptions().dtype(torch::kUInt8));
+        w.aux_packed = mfq_tensor_backend::empty(
+            {0}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kUInt8));
         w.kernel_format = c.format == 5 ? 6 : 4;
     } else if (
         c.format == 10 && c.codebook.size() >= 64 &&
@@ -4925,12 +4917,12 @@ static NvqWeight to_device_nvq(const NvqCpu & c, bool cuda) {
         w.codebook = cpu_i8_tensor(c.codebook, {entries, dims});
     }
     if (cuda) {
-        w.indices_packed = w.indices_packed.to(torch::kCUDA).contiguous();
-        w.aux_packed = w.aux_packed.to(torch::kCUDA).contiguous();
+        w.indices_packed = w.indices_packed.to(mfq_tensor_backend::kCUDA).contiguous();
+        w.aux_packed = w.aux_packed.to(mfq_tensor_backend::kCUDA).contiguous();
         w.sub_scale_packed =
-            w.sub_scale_packed.to(torch::kCUDA).contiguous();
-        w.neuron_scale = w.neuron_scale.to(torch::kCUDA).contiguous();
-        w.codebook = w.codebook.to(torch::kCUDA).contiguous();
+            w.sub_scale_packed.to(mfq_tensor_backend::kCUDA).contiguous();
+        w.neuron_scale = w.neuron_scale.to(mfq_tensor_backend::kCUDA).contiguous();
+        w.codebook = w.codebook.to(mfq_tensor_backend::kCUDA).contiguous();
         (void)w.workspace(1);
     }
     return w;
@@ -4942,7 +4934,7 @@ static NvqWeight to_gpu_nvq(const NvqCpu & c) {
 
 static NvqWeight to_cuda_device_nvq(
         const NvqCpu & c, int device) {
-    c10::cuda::CUDAGuard guard(device);
+    MfqCudaGuard guard(device);
     return to_device_nvq(c, true);
 }
 
@@ -5386,14 +5378,14 @@ static NepqCpu unpack_nepq(
 }
 
 struct NepqWeight {
-    torch::Tensor indices_packed;
-    torch::Tensor aux_packed;
-    torch::Tensor state_packed;
-    torch::Tensor neuron_scale;
-    torch::Tensor table_pool;
-    torch::Tensor grouped_table_pool;
-    torch::Tensor bank_ids;
-    torch::Tensor rotation_signs;
+    mfq_tensor_backend::Tensor indices_packed;
+    mfq_tensor_backend::Tensor aux_packed;
+    mfq_tensor_backend::Tensor state_packed;
+    mfq_tensor_backend::Tensor neuron_scale;
+    mfq_tensor_backend::Tensor table_pool;
+    mfq_tensor_backend::Tensor grouped_table_pool;
+    mfq_tensor_backend::Tensor bank_ids;
+    mfq_tensor_backend::Tensor rotation_signs;
     int format = 0;
     int state_bits = 0;
     int n_experts = 0;
@@ -5405,9 +5397,9 @@ struct NepqWeight {
     bool residual = false;
     int residual_position_bits = 0;
     int residual_block_vectors = 0;
-    torch::Tensor residual_codebook;
-    torch::Tensor residual_first;
-    torch::Tensor residual_second;
+    mfq_tensor_backend::Tensor residual_codebook;
+    mfq_tensor_backend::Tensor residual_first;
+    mfq_tensor_backend::Tensor residual_second;
 };
 
 static NepqWeight to_device_nepq(const NepqCpu & cpu, bool cuda) {
@@ -5446,41 +5438,41 @@ static NepqWeight to_device_nepq(const NepqCpu & cpu, bool cuda) {
     if (cpu.residual) {
         value.residual_codebook = cpu_f16_tensor(
             cpu.residual_codebook_h, {1024, 8});
-        value.residual_first = torch::from_blob(
+        value.residual_first = mfq_tensor_backend::from_blob(
             (void *)cpu.residual_first.data(),
             {cpu.n_experts * cpu.out_per_expert,
              cpu.residual_blocks_per_row},
-            torch::TensorOptions().dtype(torch::kInt16)).clone();
-        value.residual_second = torch::from_blob(
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt16)).clone();
+        value.residual_second = mfq_tensor_backend::from_blob(
             (void *)cpu.residual_second_dense.data(),
             {cpu.n_experts * cpu.out_per_expert,
              cpu.residual_blocks_per_row},
-            torch::TensorOptions().dtype(torch::kInt16)).clone();
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt16)).clone();
     }
     if (cuda) {
         value.indices_packed =
-            value.indices_packed.to(torch::kCUDA).contiguous();
+            value.indices_packed.to(mfq_tensor_backend::kCUDA).contiguous();
         value.aux_packed =
-            value.aux_packed.to(torch::kCUDA).contiguous();
+            value.aux_packed.to(mfq_tensor_backend::kCUDA).contiguous();
         value.state_packed =
-            value.state_packed.to(torch::kCUDA).contiguous();
+            value.state_packed.to(mfq_tensor_backend::kCUDA).contiguous();
         value.neuron_scale =
-            value.neuron_scale.to(torch::kCUDA).contiguous();
+            value.neuron_scale.to(mfq_tensor_backend::kCUDA).contiguous();
         value.table_pool =
-            value.table_pool.to(torch::kCUDA).contiguous();
+            value.table_pool.to(mfq_tensor_backend::kCUDA).contiguous();
         value.grouped_table_pool =
-            value.grouped_table_pool.to(torch::kCUDA).contiguous();
+            value.grouped_table_pool.to(mfq_tensor_backend::kCUDA).contiguous();
         value.bank_ids =
-            value.bank_ids.to(torch::kCUDA).contiguous();
+            value.bank_ids.to(mfq_tensor_backend::kCUDA).contiguous();
         value.rotation_signs =
-            value.rotation_signs.to(torch::kCUDA).contiguous();
+            value.rotation_signs.to(mfq_tensor_backend::kCUDA).contiguous();
         if (cpu.residual) {
             value.residual_codebook =
-                value.residual_codebook.to(torch::kCUDA).contiguous();
+                value.residual_codebook.to(mfq_tensor_backend::kCUDA).contiguous();
             value.residual_first =
-                value.residual_first.to(torch::kCUDA).contiguous();
+                value.residual_first.to(mfq_tensor_backend::kCUDA).contiguous();
             value.residual_second =
-                value.residual_second.to(torch::kCUDA).contiguous();
+                value.residual_second.to(mfq_tensor_backend::kCUDA).contiguous();
         }
     }
     return value;
@@ -5649,9 +5641,9 @@ static Nint8ZeroCpu select_nint8_zero_cpu_rows(
 
 struct TpqWeight {
     bool int4 = false;
-    torch::Tensor packed;
-    torch::Tensor scales;
-    torch::Tensor codebook;
+    mfq_tensor_backend::Tensor packed;
+    mfq_tensor_backend::Tensor scales;
+    mfq_tensor_backend::Tensor codebook;
     int64_t out = 0;
     int64_t neuron_len = 0;
     int group_size = 0;
@@ -5680,16 +5672,16 @@ static TpqWeight to_device_tpq(
             source.scales_h,
             {source.out, source.neuron_len / source.group_size});
     } else {
-        result.codebook = torch::from_blob(
+        result.codebook = mfq_tensor_backend::from_blob(
             const_cast<float *>(source.codebook.data()),
             {source.codebook_entries, source.vector_size},
-            torch::TensorOptions().dtype(torch::kFloat32)).clone();
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32)).clone();
     }
     if (cuda) {
         const int target_device = device >= 0
-            ? device : c10::cuda::current_device();
-        c10::cuda::CUDAGuard guard(target_device);
-        const auto target = torch::Device(torch::kCUDA, target_device);
+            ? device : mfq_current_cuda_device();
+        MfqCudaGuard guard(target_device);
+        const auto target = mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA, target_device);
         result.packed = result.packed.to(target, false, false).contiguous();
         if (source.int4) {
             result.scales = result.scales.to(target, false, false).contiguous();
@@ -5977,7 +5969,7 @@ struct MixedMoePool {
     TpqWeight tpq;
     NvqWeight nvq;
     NepqWeight nepq;
-    torch::Tensor expert_local;
+    mfq_tensor_backend::Tensor expert_local;
     int local_experts = 0;
 };
 
@@ -6029,7 +6021,7 @@ struct MixedMoeRuntime {
     bool partial_experts = false;
     std::vector<MixedMoePool> pools;
     MoeActivationWorkspace & activation_workspace(
-            torch::Tensor x, int input_rows, int groups, int gs,
+            mfq_tensor_backend::Tensor x, int input_rows, int groups, int gs,
             MixedMoeTransformKey transform) const {
         static thread_local std::unordered_map<
             MixedMoeActivationKey, MoeActivationWorkspace,
@@ -6039,10 +6031,10 @@ struct MixedMoeRuntime {
         auto found = shared_activation_workspaces.find(key);
         if (found != shared_activation_workspaces.end()) return found->second;
         MoeActivationWorkspace value;
-        value.qx = torch::empty(
-            {input_rows, groups * gs}, x.options().dtype(torch::kInt8));
-        value.xscale = torch::empty(
-            {input_rows, groups}, x.options().dtype(torch::kFloat32));
+        value.qx = mfq_tensor_backend::empty(
+            {input_rows, groups * gs}, x.options().dtype(mfq_tensor_backend::kInt8));
+        value.xscale = mfq_tensor_backend::empty(
+            {input_rows, groups}, x.options().dtype(mfq_tensor_backend::kFloat32));
         return shared_activation_workspaces.emplace(
             key, std::move(value)).first->second;
     }
@@ -6080,12 +6072,12 @@ struct MixedMoeRuntime {
         return result;
     }
 
-    torch::Tensor forward(
-            torch::Tensor x,
+    mfq_tensor_backend::Tensor forward(
+            mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route,
             bool input_prequantized = false) const {
         if (!x.is_cuda() || !x.is_contiguous() ||
-            x.scalar_type() != torch::kFloat16 ||
+            x.scalar_type() != mfq_tensor_backend::kFloat16 ||
             (x.dim() != 2 && x.dim() != 3) || x.size(-1) != neuron_len) {
             throw std::runtime_error(
                 "mixed NINTM input must be contiguous CUDA f16 with exact K");
@@ -6098,14 +6090,14 @@ struct MixedMoeRuntime {
         }
         const int input_rows = x.dim() == 3 ? tokens * routes : tokens;
         auto output = partial_experts
-            ? torch::zeros(
+            ? mfq_tensor_backend::zeros(
                 {tokens, routes, out_per_expert},
-                x.options().dtype(torch::kFloat16))
-            : torch::empty(
+                x.options().dtype(mfq_tensor_backend::kFloat16))
+            : mfq_tensor_backend::empty(
                 {tokens, routes, out_per_expert},
-                x.options().dtype(torch::kFloat16));
+                x.options().dtype(mfq_tensor_backend::kFloat16));
         std::unordered_map<
-            MixedMoeTransformKey, torch::Tensor,
+            MixedMoeTransformKey, mfq_tensor_backend::Tensor,
             MixedMoeTransformKeyHash> prepared_inputs;
         const MixedMoeTransformKey identity{};
         prepared_inputs.emplace(identity, x);
@@ -6129,7 +6121,7 @@ struct MixedMoeRuntime {
                 "mixed prequantized activation reuse is unavailable in KLD MMQ mode");
         }
         if (use_kl_mmq) {
-            TORCH_CHECK(
+            MFQ_RUNTIME_CHECK(
                 route.map_ready && route.ids_dst.numel() == route.ids.numel(),
                 "KLD mixed routed FP16 requires the compact route map");
         }
@@ -6138,7 +6130,7 @@ struct MixedMoeRuntime {
             int gs = 24;
             int groups = 0;
             MixedMoeTransformKey transform{};
-            torch::Tensor value = x;
+            mfq_tensor_backend::Tensor value = x;
             if (pool.family == MixedMoeFamily::Nint) {
                 gs = (int)pool.nint.gs;
                 groups = (int)pool.nint.ng;
@@ -6329,13 +6321,13 @@ struct MixedMoeRuntime {
             });
     }
 
-    torch::Tensor forward_clamped_swiglu(
-            torch::Tensor gate_up,
+    mfq_tensor_backend::Tensor forward_clamped_swiglu(
+            mfq_tensor_backend::Tensor gate_up,
             const MoeRoutePlan & route,
             double limit) const {
         if (!supports_clamped_swiglu() ||
             !gate_up.is_cuda() || !gate_up.is_contiguous() ||
-            gate_up.scalar_type() != torch::kFloat16 ||
+            gate_up.scalar_type() != mfq_tensor_backend::kFloat16 ||
             gate_up.dim() != 3 || gate_up.size(2) != 2 * neuron_len) {
             throw std::runtime_error(
                 "mixed NINTM clamped SwiGLU input is unsupported");
@@ -6349,12 +6341,12 @@ struct MixedMoeRuntime {
         }
         const int input_rows = tokens * routes;
         auto output = partial_experts
-            ? torch::zeros(
+            ? mfq_tensor_backend::zeros(
                 {tokens, routes, out_per_expert},
-                gate_up.options().dtype(torch::kFloat16))
-            : torch::empty(
+                gate_up.options().dtype(mfq_tensor_backend::kFloat16))
+            : mfq_tensor_backend::empty(
                 {tokens, routes, out_per_expert},
-                gate_up.options().dtype(torch::kFloat16));
+                gate_up.options().dtype(mfq_tensor_backend::kFloat16));
         const MixedMoeTransformKey identity{};
         std::unordered_set<
             MixedMoeActivationKey, MixedMoeActivationKeyHash> quantized;
@@ -6412,7 +6404,7 @@ struct MixedMoeRuntime {
     }
 };
 
-static int64_t tensor_storage_bytes(const torch::Tensor & value) {
+static int64_t tensor_storage_bytes(const mfq_tensor_backend::Tensor & value) {
     return value.defined()
         ? value.numel() * (int64_t)value.element_size()
         : 0;
@@ -6474,13 +6466,13 @@ static std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
         for (int index = 0; index < pool.local_experts; ++index) {
             local[(size_t)source.expert_ids[(size_t)index]] = index;
         }
-        pool.expert_local = torch::from_blob(
+        pool.expert_local = mfq_tensor_backend::from_blob(
             local.data(), {(int64_t)local.size()},
-            torch::TensorOptions().dtype(torch::kInt32))
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
             .clone();
         if (cuda) {
             pool.expert_local =
-                pool.expert_local.to(torch::kCUDA).contiguous();
+                pool.expert_local.to(mfq_tensor_backend::kCUDA).contiguous();
         }
         const int expected_rows = pool.local_experts * cpu.out_per_expert;
         if (source.dtype == "NINT8-0") {
@@ -6558,16 +6550,16 @@ static NintMoeWeight wrap_mixed_moe_runtime(
     result.activation_geometries = runtime->activation_geometry();
     result.activation_workspace_domain = 2;
     result.mixed_forward = [runtime](
-            torch::Tensor x, const MoeRoutePlan & route) {
+            mfq_tensor_backend::Tensor x, const MoeRoutePlan & route) {
         return runtime->forward(x, route);
     };
     result.mixed_prequantized_forward = [runtime](
-            torch::Tensor x, const MoeRoutePlan & route) {
+            mfq_tensor_backend::Tensor x, const MoeRoutePlan & route) {
         return runtime->forward(x, route, true);
     };
     if (runtime->supports_clamped_swiglu()) {
         result.mixed_clamped_swiglu_forward = [runtime](
-                torch::Tensor gate_up,
+                mfq_tensor_backend::Tensor gate_up,
                 const MoeRoutePlan & route,
                 double limit) {
             return runtime->forward_clamped_swiglu(gate_up, route, limit);
@@ -6597,7 +6589,7 @@ static NintMoeWeight to_cuda_device_moe_output_slice(
                 pool.dtype != "NINT8-0" &&
                 pool.dtype.rfind("NINT", 0) == 0;
         });
-    c10::cuda::CUDAGuard guard(device);
+    MfqCudaGuard guard(device);
     if (all_nint) {
         NintMoeCpu sliced = cpu;
         sliced.out_per_expert =
@@ -6642,12 +6634,12 @@ static NintMoeWeight to_cuda_device_moe_output_slice(
                     static_cast<size_t>(index)])] =
                 index;
         }
-        pool.expert_local = torch::from_blob(
+        pool.expert_local = mfq_tensor_backend::from_blob(
             local.data(),
             {static_cast<int64_t>(local.size())},
-            torch::TensorOptions().dtype(
-                torch::kInt32))
-            .clone().to(torch::kCUDA).contiguous();
+            mfq_tensor_backend::TensorOptions().dtype(
+                mfq_tensor_backend::kInt32))
+            .clone().to(mfq_tensor_backend::kCUDA).contiguous();
         auto rows = moe_output_row_indices(
             pool.local_experts,
             cpu.out_per_expert,
@@ -6721,7 +6713,7 @@ static NintMoeWeight to_cuda_device_moe_expert_slice(
                 pool.dtype != "NINT8-0" &&
                 pool.dtype.rfind("NINT", 0) == 0;
         });
-    c10::cuda::CUDAGuard guard(device);
+    MfqCudaGuard guard(device);
     if (all_nint) {
         NintMoeCpu sliced = cpu;
         sliced.pools.clear();
@@ -6777,11 +6769,11 @@ static NintMoeWeight to_cuda_device_moe_expert_slice(
             local_map[static_cast<size_t>(expert_ids[local])] =
                 static_cast<int32_t>(local);
         }
-        pool.expert_local = torch::from_blob(
+        pool.expert_local = mfq_tensor_backend::from_blob(
             local_map.data(),
             {static_cast<int64_t>(local_map.size())},
-            torch::TensorOptions().dtype(torch::kInt32))
-            .clone().to(torch::kCUDA).contiguous();
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+            .clone().to(mfq_tensor_backend::kCUDA).contiguous();
         if (source.dtype == "NINT8-0") {
             pool.family = MixedMoeFamily::Nint8Zero;
             pool.q8_zero = to_gpu_nint8_zero(
@@ -6821,11 +6813,11 @@ static NintMoeWeight to_cuda_device_moe_expert_slice(
     return wrap_mixed_moe_runtime(runtime);
 }
 
-static torch::Tensor copy_cpu_weight_to_cuda(
-        const torch::Tensor & source) {
+static mfq_tensor_backend::Tensor copy_cpu_weight_to_cuda(
+        const mfq_tensor_backend::Tensor & source) {
     return source.defined()
-        ? source.to(torch::kCUDA).contiguous()
-        : torch::Tensor();
+        ? source.to(mfq_tensor_backend::kCUDA).contiguous()
+        : mfq_tensor_backend::Tensor();
 }
 
 static NintWeight copy_cpu_nint_to_cuda(const NintWeight & source) {
@@ -6862,7 +6854,7 @@ static NintMoeWeight stage_cpu_nint_moe(
         if (source.family != MixedMoeFamily::Nint ||
                 !source.expert_local.is_cpu() ||
                 !source.expert_local.is_contiguous() ||
-                source.expert_local.scalar_type() != torch::kInt32 ||
+                source.expert_local.scalar_type() != mfq_tensor_backend::kInt32 ||
                 source.expert_local.numel() != cpu->n_experts) {
             throw std::runtime_error(
                 "pure NINT MoE staging received an incompatible pool");
@@ -7034,13 +7026,13 @@ struct MoeCacheTransfer {
 struct MoeCachedCohort;
 class MoeCachedSource;
 
-static int64_t tensor_nbytes(const torch::Tensor & value) {
+static int64_t tensor_nbytes(const mfq_tensor_backend::Tensor & value) {
     return value.defined()
         ? value.numel() * static_cast<int64_t>(value.element_size())
         : 0;
 }
 
-static std::vector<torch::Tensor> moe_cache_fields(
+static std::vector<mfq_tensor_backend::Tensor> moe_cache_fields(
         const MixedMoePool & pool) {
     if (pool.family == MixedMoeFamily::Nint) {
         return {
@@ -7071,7 +7063,7 @@ static std::vector<torch::Tensor> moe_cache_fields(
             pool.nvq.neuron_scale,
         };
     }
-    std::vector<torch::Tensor> fields{
+    std::vector<mfq_tensor_backend::Tensor> fields{
         pool.nepq.indices_packed,
         pool.nepq.aux_packed,
         pool.nepq.state_packed,
@@ -7123,21 +7115,21 @@ static void validate_nepq_expert_boundaries(
         if (!pool.nepq.residual_codebook.defined() ||
                 !pool.nepq.residual_codebook.is_cpu() ||
                 !pool.nepq.residual_codebook.is_contiguous() ||
-                pool.nepq.residual_codebook.scalar_type() != torch::kFloat16 ||
+                pool.nepq.residual_codebook.scalar_type() != mfq_tensor_backend::kFloat16 ||
                 pool.nepq.residual_codebook.dim() != 2 ||
                 pool.nepq.residual_codebook.size(0) != 1024 ||
                 pool.nepq.residual_codebook.size(1) != 8 ||
                 !pool.nepq.residual_first.defined() ||
                 !pool.nepq.residual_first.is_cpu() ||
                 !pool.nepq.residual_first.is_contiguous() ||
-                pool.nepq.residual_first.scalar_type() != torch::kInt16 ||
+                pool.nepq.residual_first.scalar_type() != mfq_tensor_backend::kInt16 ||
                 pool.nepq.residual_first.dim() != 2 ||
                 pool.nepq.residual_first.size(0) != rows ||
                 pool.nepq.residual_first.size(1) != blocks ||
                 !pool.nepq.residual_second.defined() ||
                 !pool.nepq.residual_second.is_cpu() ||
                 !pool.nepq.residual_second.is_contiguous() ||
-                pool.nepq.residual_second.scalar_type() != torch::kInt16 ||
+                pool.nepq.residual_second.scalar_type() != mfq_tensor_backend::kInt16 ||
                 pool.nepq.residual_second.dim() != 2 ||
                 pool.nepq.residual_second.size(0) != rows ||
                 pool.nepq.residual_second.size(1) != blocks) {
@@ -7165,12 +7157,12 @@ static void validate_tpq_expert_boundaries(
             bits_per_expert % 8 != 0 ||
             !pool.tpq.packed.defined() || !pool.tpq.packed.is_cpu() ||
             !pool.tpq.packed.is_contiguous() ||
-            pool.tpq.packed.scalar_type() != torch::kUInt8 ||
+            pool.tpq.packed.scalar_type() != mfq_tensor_backend::kUInt8 ||
             pool.tpq.packed.numel() !=
                 pool.local_experts * bits_per_expert / 8 ||
             !pool.tpq.codebook.defined() || !pool.tpq.codebook.is_cpu() ||
             !pool.tpq.codebook.is_contiguous() ||
-            pool.tpq.codebook.scalar_type() != torch::kFloat32 ||
+            pool.tpq.codebook.scalar_type() != mfq_tensor_backend::kFloat32 ||
             pool.tpq.codebook.dim() != 2 ||
             pool.tpq.codebook.size(0) <= 1 ||
             pool.tpq.codebook.size(1) != pool.tpq.vector_size) {
@@ -7240,15 +7232,15 @@ struct MoeGpuArena {
     int registered_experts = 0;
     int prototype_experts = 0;
     int slots = 0;
-    std::vector<torch::Tensor> prototypes;
+    std::vector<mfq_tensor_backend::Tensor> prototypes;
     std::vector<int64_t> elements_per_expert;
-    std::vector<torch::Tensor> fields;
+    std::vector<mfq_tensor_backend::Tensor> fields;
     std::unique_ptr<mfq::MoeCacheSlotBook> book;
 };
 
 struct MoePinnedStage {
-    torch::Tensor host;
-    torch::Tensor device;
+    mfq_tensor_backend::Tensor host;
+    mfq_tensor_backend::Tensor device;
     cudaEvent_t done = nullptr;
     bool pending = false;
 };
@@ -7417,7 +7409,7 @@ public:
     }
 
     const uint8_t * register_mapped_field(
-            const torch::Tensor & field) {
+            const mfq_tensor_backend::Tensor & field) {
         if (!mapped_gather_enabled_ || !field.defined() ||
                 field.numel() == 0) {
             return nullptr;
@@ -7483,7 +7475,7 @@ public:
         if (route.host_unique_experts) return;
         const auto & ids = route.ids;
         if (!ids.is_cuda() || !ids.is_contiguous() ||
-                ids.scalar_type() != torch::kInt32 ||
+                ids.scalar_type() != mfq_tensor_backend::kInt32 ||
                 ids.dim() != 2) {
             throw std::runtime_error(
                 "cached MoE routes must be contiguous CUDA int32");
@@ -7504,15 +7496,15 @@ public:
         }
         if (!route_host_.defined() ||
                 route_host_.numel() < count) {
-            route_host_ = torch::empty(
+            route_host_ = mfq_tensor_backend::empty(
                 {count},
-                torch::TensorOptions()
-                    .device(torch::kCPU)
-                    .dtype(torch::kInt32)
+                mfq_tensor_backend::TensorOptions()
+                    .device(mfq_tensor_backend::kCPU)
+                    .dtype(mfq_tensor_backend::kInt32)
                     .pinned_memory(true));
         }
         auto current =
-            at::cuda::getCurrentCUDAStream().stream();
+            mfq_get_current_cuda_stream().stream();
         MFQ_CUDA_CHECK(cudaEventRecord(
             route_input_ready_, current));
         MFQ_CUDA_CHECK(cudaStreamWaitEvent(
@@ -7574,7 +7566,7 @@ public:
     void record_compute_use() {
         MFQ_CUDA_CHECK(cudaEventRecord(
             compute_done_,
-            at::cuda::getCurrentCUDAStream().stream()));
+            mfq_get_current_cuda_stream().stream()));
         compute_done_recorded_ = true;
     }
 
@@ -7644,11 +7636,11 @@ private:
                         stage.host.numel() < required_bytes) {
                     int64_t capacity = 1;
                     while (capacity < required_bytes) capacity *= 2;
-                    stage.host = torch::empty(
+                    stage.host = mfq_tensor_backend::empty(
                         {capacity},
-                        torch::TensorOptions()
-                            .device(torch::kCPU)
-                            .dtype(torch::kUInt8)
+                        mfq_tensor_backend::TensorOptions()
+                            .device(mfq_tensor_backend::kCPU)
+                            .dtype(mfq_tensor_backend::kUInt8)
                             .pinned_memory(true));
                 }
                 if (require_device &&
@@ -7656,11 +7648,11 @@ private:
                          stage.device.numel() < required_bytes)) {
                     int64_t capacity = 1;
                     while (capacity < required_bytes) capacity *= 2;
-                    stage.device = torch::empty(
+                    stage.device = mfq_tensor_backend::empty(
                         {capacity},
-                        torch::TensorOptions()
-                            .device(torch::kCUDA)
-                            .dtype(torch::kUInt8));
+                        mfq_tensor_backend::TensorOptions()
+                            .device(mfq_tensor_backend::kCUDA)
+                            .dtype(mfq_tensor_backend::kUInt8));
                 }
                 return stage;
             }
@@ -7674,11 +7666,11 @@ private:
                 stage.host.numel() < required_bytes) {
             int64_t capacity = 1;
             while (capacity < required_bytes) capacity *= 2;
-            stage.host = torch::empty(
+            stage.host = mfq_tensor_backend::empty(
                 {capacity},
-                torch::TensorOptions()
-                    .device(torch::kCPU)
-                    .dtype(torch::kUInt8)
+                mfq_tensor_backend::TensorOptions()
+                    .device(mfq_tensor_backend::kCPU)
+                    .dtype(mfq_tensor_backend::kUInt8)
                     .pinned_memory(true));
         }
         if (require_device &&
@@ -7686,11 +7678,11 @@ private:
                  stage.device.numel() < required_bytes)) {
             int64_t capacity = 1;
             while (capacity < required_bytes) capacity *= 2;
-            stage.device = torch::empty(
+            stage.device = mfq_tensor_backend::empty(
                 {capacity},
-                torch::TensorOptions()
-                    .device(torch::kCUDA)
-                    .dtype(torch::kUInt8));
+                mfq_tensor_backend::TensorOptions()
+                    .device(mfq_tensor_backend::kCUDA)
+                    .dtype(mfq_tensor_backend::kUInt8));
         }
         return stage;
     }
@@ -7734,7 +7726,7 @@ private:
             if (wait_on_compute_stream &&
                     transfer_ready_recorded_) {
                 MFQ_CUDA_CHECK(cudaStreamWaitEvent(
-                    at::cuda::getCurrentCUDAStream().stream(),
+                    mfq_get_current_cuda_stream().stream(),
                     transfer_ready_, 0));
             }
             return;
@@ -7771,7 +7763,7 @@ private:
             stage.pending = true;
             if (wait_on_compute_stream) {
                 MFQ_CUDA_CHECK(cudaStreamWaitEvent(
-                    at::cuda::getCurrentCUDAStream().stream(),
+                    mfq_get_current_cuda_stream().stream(),
                     transfer_ready_, 0));
             }
             return;
@@ -7888,7 +7880,7 @@ private:
         stage.pending = true;
         if (wait_on_compute_stream) {
             MFQ_CUDA_CHECK(cudaStreamWaitEvent(
-                at::cuda::getCurrentCUDAStream().stream(),
+                mfq_get_current_cuda_stream().stream(),
                 transfer_ready_, 0));
         }
     }
@@ -7908,7 +7900,7 @@ private:
     bool transfer_ready_recorded_ = false;
     cudaEvent_t route_input_ready_ = nullptr;
     cudaEvent_t route_done_ = nullptr;
-    torch::Tensor route_host_;
+    mfq_tensor_backend::Tensor route_host_;
     uint64_t pending_route_generation_ = 0;
     int64_t pending_route_count_ = 0;
     int pending_route_n_experts_ = 0;
@@ -7936,7 +7928,7 @@ struct MoeCachedCohort {
     int index = -1;
     const MixedMoePool * cpu = nullptr;
     MoeGpuArena * arena = nullptr;
-    std::vector<torch::Tensor> cpu_fields;
+    std::vector<mfq_tensor_backend::Tensor> cpu_fields;
     std::vector<const uint8_t *> mapped_fields;
     std::vector<int64_t> bytes_per_expert;
     std::vector<int32_t> expert_to_local;
@@ -8107,11 +8099,11 @@ public:
             auto & arena = *cohort.arena;
             MixedMoePool pool = source;
             pool.local_experts = arena.slots;
-            pool.expert_local = torch::full(
+            pool.expert_local = mfq_tensor_backend::full(
                 {cpu_->n_experts}, -1,
-                torch::TensorOptions()
-                    .device(torch::kCUDA)
-                    .dtype(torch::kInt32));
+                mfq_tensor_backend::TensorOptions()
+                    .device(mfq_tensor_backend::kCUDA)
+                    .dtype(mfq_tensor_backend::kInt32));
             size_t field = 0;
             if (pool.family == MixedMoeFamily::Nint) {
                 pool.nint.workspaces.clear();
@@ -8269,8 +8261,8 @@ public:
         return route.ids.size(0) > 8;
     }
 
-    torch::Tensor forward(
-            torch::Tensor x,
+    mfq_tensor_backend::Tensor forward(
+            mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route) {
         if (use_full_projection(route)) {
             cache_->count_full_projection_fallback();
@@ -8287,7 +8279,7 @@ public:
                 : stage_cpu_mixed_moe(cpu_);
             return staged.forward(x, route);
         }
-        torch::Tensor output;
+        mfq_tensor_backend::Tensor output;
         if (pure_nint_) {
             cache_->count_hetero_dispatch();
             output = pure_nint_->forward(x, route);
@@ -8298,8 +8290,8 @@ public:
         return output;
     }
 
-    torch::Tensor forward_prequantized(
-            torch::Tensor x,
+    mfq_tensor_backend::Tensor forward_prequantized(
+            mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route) {
         if (use_full_projection(route)) {
             throw std::runtime_error(
@@ -8313,7 +8305,7 @@ public:
                 : stage_cpu_mixed_moe(cpu_);
             return staged.forward(x, route);
         }
-        torch::Tensor output;
+        mfq_tensor_backend::Tensor output;
         if (pure_nint_) {
             cache_->count_hetero_dispatch();
             output = pure_nint_->forward_prequantized(x, route);
@@ -8330,8 +8322,8 @@ public:
             *this, route_experts(route), true);
     }
 
-    torch::Tensor forward_glu_output(
-            torch::Tensor x,
+    mfq_tensor_backend::Tensor forward_glu_output(
+            mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route,
             bool gelu) {
         if (!pure_nint_) {
@@ -8352,8 +8344,8 @@ public:
         return output;
     }
 
-    torch::Tensor forward_glu(
-            torch::Tensor gate_up,
+    mfq_tensor_backend::Tensor forward_glu(
+            mfq_tensor_backend::Tensor gate_up,
             const MoeRoutePlan & route,
             bool gelu) {
         if (!pure_nint_) {
@@ -8374,8 +8366,8 @@ public:
         return output;
     }
 
-    torch::Tensor forward_clamped_swiglu(
-            torch::Tensor gate_up,
+    mfq_tensor_backend::Tensor forward_clamped_swiglu(
+            mfq_tensor_backend::Tensor gate_up,
             const MoeRoutePlan & route,
             double limit) {
         if (use_full_projection(route)) {
@@ -8686,10 +8678,10 @@ void MoeExpertCache::finalize() {
                 prototype.size(0) /
                 arena.prototype_experts *
                 arena.slots;
-            arena.fields.push_back(torch::empty(
+            arena.fields.push_back(mfq_tensor_backend::empty(
                 shape,
-                torch::TensorOptions()
-                    .device(torch::kCUDA)
+                mfq_tensor_backend::TensorOptions()
+                    .device(mfq_tensor_backend::kCUDA)
                     .dtype(prototype.scalar_type())));
         }
         arena.book =
@@ -9080,25 +9072,25 @@ static NintMoeWeight wrap_cached_moe_source(
         source->begin_prefetch(route);
     };
     result.mixed_forward = [source](
-            torch::Tensor x,
+            mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route) {
         return source->forward(x, route);
     };
     result.mixed_prequantized_forward = [source](
-            torch::Tensor x,
+            mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route) {
         return source->forward_prequantized(x, route);
     };
     if (source->supports_nint_hetero()) {
         result.mixed_glu_output_forward = [source](
-                torch::Tensor x,
+                mfq_tensor_backend::Tensor x,
                 const MoeRoutePlan & route,
                 bool gelu) {
             return source->forward_glu_output(
                 x, route, gelu);
         };
         result.mixed_glu_forward = [source](
-                torch::Tensor gate_up,
+                mfq_tensor_backend::Tensor gate_up,
                 const MoeRoutePlan & route,
                 bool gelu) {
             return source->forward_glu(
@@ -9107,7 +9099,7 @@ static NintMoeWeight wrap_cached_moe_source(
     }
     if (source->supports_clamped_swiglu()) {
         result.mixed_clamped_swiglu_forward = [source](
-                torch::Tensor gate_up,
+                mfq_tensor_backend::Tensor gate_up,
                 const MoeRoutePlan & route,
                 double limit) {
             return source->forward_clamped_swiglu(
@@ -9208,13 +9200,13 @@ static void enable_nint5_q5_exec(NintWeight & w) {
         throw std::runtime_error("NINT5 Q5 execution layout requires NINT5 gs28 source weights");
     }
     auto q_exec = nint5_gs28_q5_repack_cuda(w.q_packed, w.sub_scale, w.sub_min);
-    torch::cuda::synchronize();
+    mfq_cuda_synchronize();
     w.q_packed = std::move(q_exec);
-    w.sub_scale = torch::Tensor();
-    w.sub_min = torch::Tensor();
+    w.sub_scale = mfq_tensor_backend::Tensor();
+    w.sub_min = mfq_tensor_backend::Tensor();
     w.qbytes = 20;
     w.q5_exec = true;
-    c10::cuda::CUDACachingAllocator::emptyCache();
+    mfq_cuda_empty_cache();
 }
 
 static bool nint5_q5_exec_enabled() {
@@ -9227,25 +9219,25 @@ static NvqWeight load_nvq_gpu(const MfqFile & mfq, const std::string & name) {
     return to_gpu_nvq(unpack_nvq(mfq.read_blob(name), rec.dtype));
 }
 
-static torch::Tensor nvq_dequant(const NvqWeight & w) {
+static mfq_tensor_backend::Tensor nvq_dequant(const NvqWeight & w) {
     return nvq_dequant_cuda(
         w.indices_packed, w.aux_packed, w.sub_scale_packed,
         w.neuron_scale, w.codebook, w.neuron_len, w.gs,
         w.sub_bits, w.kernel_format, w.sign_mode);
 }
 
-static torch::Tensor dequant_nint8_zero_cpu(const Nint8ZeroCpu & source) {
-    TORCH_CHECK(source.shape.size() == 2,
+static mfq_tensor_backend::Tensor dequant_nint8_zero_cpu(const Nint8ZeroCpu & source) {
+    MFQ_RUNTIME_CHECK(source.shape.size() == 2,
         "CPU NINT8-0 dense tensor must be rank 2");
     auto packed = to_device_nint8_zero(source, false);
-    auto result = torch::empty(
+    auto result = mfq_tensor_backend::empty(
         source.shape,
-        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32));
+        mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat32));
     const auto * quantized =
         reinterpret_cast<const int8_t *>(packed.q_packed.data_ptr<uint8_t>());
-    const c10::Half * scales = packed.q8_zero_scale.data_ptr<c10::Half>();
+    const mfq_half * scales = packed.q8_zero_scale.data_ptr<mfq_half>();
     float * output = result.data_ptr<float>();
-    at::parallel_for(0, source.out, 1, [&](int64_t begin, int64_t end) {
+    mfq_parallel_for(0, source.out, 1, [&](int64_t begin, int64_t end) {
         for (int64_t row = begin; row < end; ++row) {
             for (int64_t group = 0; group < source.ng; ++group) {
                 const int64_t meta = row * source.ng + group;
@@ -9263,8 +9255,8 @@ static torch::Tensor dequant_nint8_zero_cpu(const Nint8ZeroCpu & source) {
     return result.contiguous();
 }
 
-static torch::Tensor load_dense_gpu(const MfqFile & mfq, const std::string & name) {
-    c10::cuda::CUDAGuard guard(
+static mfq_tensor_backend::Tensor load_dense_gpu(const MfqFile & mfq, const std::string & name) {
+    MfqCudaGuard guard(
         active_weight_load_device());
     const auto & rec = mfq.record(name);
     auto blob = mfq.read_blob(name);
@@ -9278,7 +9270,7 @@ static torch::Tensor load_dense_gpu(const MfqFile & mfq, const std::string & nam
             packed.q_packed,
             packed.q8_zero_scale,
             packed.neuron_len)
-            .to(torch::kFloat32)
+            .to(mfq_tensor_backend::kFloat32)
             .contiguous();
         if (packed.shape.size() != 2 ||
             dense.size(0) != packed.shape[0] ||
@@ -9296,27 +9288,27 @@ static torch::Tensor load_dense_gpu(const MfqFile & mfq, const std::string & nam
         shape[i] = read_i64_from(blob, off);
         numel *= shape[i];
     }
-    torch::Tensor t;
+    mfq_tensor_backend::Tensor t;
     if (rec.dtype == "F32") {
-        t = torch::from_blob(blob.data() + off, shape, torch::TensorOptions().dtype(torch::kFloat32)).clone();
+        t = mfq_tensor_backend::from_blob(blob.data() + off, shape, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32)).clone();
     } else if (rec.dtype == "BF16") {
-        t = torch::from_blob(blob.data() + off, shape, torch::TensorOptions().dtype(torch::kBFloat16)).clone().to(torch::kFloat32);
+        t = mfq_tensor_backend::from_blob(blob.data() + off, shape, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kBFloat16)).clone().to(mfq_tensor_backend::kFloat32);
     } else if (rec.dtype == "F16") {
-        t = torch::from_blob(blob.data() + off, shape, torch::TensorOptions().dtype(torch::kFloat16)).clone().to(torch::kFloat32);
+        t = mfq_tensor_backend::from_blob(blob.data() + off, shape, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat16)).clone().to(mfq_tensor_backend::kFloat32);
     } else if (rec.dtype == "I64") {
-        t = torch::from_blob(blob.data() + off, shape, torch::TensorOptions().dtype(torch::kInt64)).clone();
+        t = mfq_tensor_backend::from_blob(blob.data() + off, shape, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64)).clone();
     } else if (rec.dtype == "I32") {
-        t = torch::from_blob(blob.data() + off, shape, torch::TensorOptions().dtype(torch::kInt32)).clone();
+        t = mfq_tensor_backend::from_blob(blob.data() + off, shape, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32)).clone();
     } else {
         throw std::runtime_error("unsupported dense dtype for C++ runtime: " + rec.dtype + " tensor " + name);
     }
     (void)numel;
     return g_loading_cpu_layer
         ? t.contiguous()
-        : t.to(torch::kCUDA).contiguous();
+        : t.to(mfq_tensor_backend::kCUDA).contiguous();
 }
 
-static torch::Tensor load_dense_linear_cpu(
+static mfq_tensor_backend::Tensor load_dense_linear_cpu(
         const MfqFile & mfq,
         const std::string & name) {
     const auto & rec = mfq.record(name);
@@ -9331,19 +9323,19 @@ static torch::Tensor load_dense_linear_cpu(
         throw std::runtime_error(
             "dense linear tensor must be rank 2: " + name);
     }
-    torch::Tensor value;
+    mfq_tensor_backend::Tensor value;
     if (rec.dtype == "BF16") {
-        value = torch::from_blob(
+        value = mfq_tensor_backend::from_blob(
             blob.data() + off, shape,
-            torch::TensorOptions().dtype(torch::kBFloat16)).clone();
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kBFloat16)).clone();
     } else if (rec.dtype == "F16") {
-        value = torch::from_blob(
+        value = mfq_tensor_backend::from_blob(
             blob.data() + off, shape,
-            torch::TensorOptions().dtype(torch::kFloat16)).clone();
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat16)).clone();
     } else if (rec.dtype == "F32") {
-        value = torch::from_blob(
+        value = mfq_tensor_backend::from_blob(
             blob.data() + off, shape,
-            torch::TensorOptions().dtype(torch::kFloat32)).clone();
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32)).clone();
     } else {
         throw std::runtime_error(
             "unsupported dense linear dtype: " + rec.dtype +
@@ -9352,19 +9344,19 @@ static torch::Tensor load_dense_linear_cpu(
     return value.contiguous();
 }
 
-static torch::Tensor load_dense_linear_gpu(
+static mfq_tensor_backend::Tensor load_dense_linear_gpu(
         const MfqFile & mfq,
         const std::string & name) {
-    c10::cuda::CUDAGuard guard(active_weight_load_device());
+    MfqCudaGuard guard(active_weight_load_device());
     return load_dense_linear_cpu(mfq, name)
-        .to(torch::kCUDA).contiguous();
+        .to(mfq_tensor_backend::kCUDA).contiguous();
 }
 
 static NintWeight cat_weights(const std::vector<NintWeight> & ws) {
     if (ws.empty()) throw std::runtime_error("empty NINT group");
     const auto & a = ws[0];
     if (a.q5_exec) throw std::runtime_error("NINT5 Q5 execution weights cannot be concatenated");
-    std::vector<torch::Tensor> qp, q8s, ss, sm, ns, nm;
+    std::vector<mfq_tensor_backend::Tensor> qp, q8s, ss, sm, ns, nm;
     int64_t out = 0;
     for (const auto & w : ws) {
         if (w.q5_exec) throw std::runtime_error("NINT5 Q5 execution weights cannot be concatenated");
@@ -9395,22 +9387,22 @@ static NintWeight cat_weights(const std::vector<NintWeight> & ws) {
     g.q8_zero = a.q8_zero;
     g.shape = a.shape;
     g.shape[0] = out;
-    g.q_packed = torch::cat(qp, 0).contiguous();
+    g.q_packed = mfq_tensor_backend::cat(qp, 0).contiguous();
     if (a.q8_zero) {
-        g.q8_zero_scale = torch::cat(q8s, 0).contiguous();
+        g.q8_zero_scale = mfq_tensor_backend::cat(q8s, 0).contiguous();
         return g;
     }
-    g.sub_scale = torch::cat(ss, 0).contiguous();
-    g.sub_min = torch::cat(sm, 0).contiguous();
-    g.neuron_scale = torch::cat(ns, 0).contiguous();
-    g.neuron_min = torch::cat(nm, 0).contiguous();
+    g.sub_scale = mfq_tensor_backend::cat(ss, 0).contiguous();
+    g.sub_min = mfq_tensor_backend::cat(sm, 0).contiguous();
+    g.neuron_scale = mfq_tensor_backend::cat(ns, 0).contiguous();
+    g.neuron_min = mfq_tensor_backend::cat(nm, 0).contiguous();
     return g;
 }
 
-static torch::Tensor pad_last(torch::Tensor x, int64_t target) {
+static mfq_tensor_backend::Tensor pad_last(mfq_tensor_backend::Tensor x, int64_t target) {
     if (x.size(1) == target) return x;
     if (x.size(1) > target) throw std::runtime_error("activation width exceeds neuron_len");
-    return torch::constant_pad_nd(x, {0, target - x.size(1)}, 0);
+    return mfq_tensor_backend::constant_pad_nd(x, {0, target - x.size(1)}, 0);
 }
 
 enum class NvqMatmulPath {
@@ -9616,15 +9608,15 @@ struct CpuQuantizedActivation {
 };
 
 static CpuQuantizedActivation cpu_quantize_activation(
-        torch::Tensor x,
+        mfq_tensor_backend::Tensor x,
         int64_t width,
         int64_t group_size,
         bool with_sums) {
-    TORCH_CHECK(!x.is_cuda(), "CPU activation quantization requires a CPU tensor");
-    x = pad_last(x.contiguous().to(torch::kFloat16), width).contiguous();
+    MFQ_RUNTIME_CHECK(!x.is_cuda(), "CPU activation quantization requires a CPU tensor");
+    x = pad_last(x.contiguous().to(mfq_tensor_backend::kFloat16), width).contiguous();
     const int64_t rows = x.size(0);
     const int64_t groups = (width + group_size - 1) / group_size;
-    TORCH_CHECK(group_size > 0 && group_size <= 64,
+    MFQ_RUNTIME_CHECK(group_size > 0 && group_size <= 64,
         "CPU compact GEMV group size must be in [1, 64]");
     CpuQuantizedActivation result;
     result.rows = rows;
@@ -9635,8 +9627,8 @@ static CpuQuantizedActivation cpu_quantize_activation(
     if (with_sums) {
         result.sums.resize(static_cast<size_t>(rows * groups));
     }
-    const c10::Half * input = x.data_ptr<c10::Half>();
-    at::parallel_for(0, rows * groups, 1, [&](int64_t begin, int64_t end) {
+    const mfq_half * input = x.data_ptr<mfq_half>();
+    mfq_parallel_for(0, rows * groups, 1, [&](int64_t begin, int64_t end) {
         for (int64_t linear = begin; linear < end; ++linear) {
             const int64_t row = linear / groups;
             const int64_t group = linear - row * groups;
@@ -9674,7 +9666,7 @@ static CpuQuantizedActivation cpu_quantize_activation(
 static float cpu_half_from_bytes(const int8_t * bytes, int64_t offset) {
     uint16_t raw = 0;
     std::memcpy(&raw, bytes + offset, sizeof(raw));
-    c10::Half value;
+    mfq_half value;
     std::memcpy(&value, &raw, sizeof(raw));
     return static_cast<float>(value);
 }
@@ -9849,29 +9841,29 @@ static void cpu_decode_nvq_group(
     }
 }
 
-static torch::Tensor nvq_matmul_cpu(
+static mfq_tensor_backend::Tensor nvq_matmul_cpu(
         const NvqWeight & w,
-        torch::Tensor x) {
-    TORCH_CHECK(!x.is_cuda(), "CPU NVQ GEMV requires CPU activations");
-    TORCH_CHECK(
+        mfq_tensor_backend::Tensor x) {
+    MFQ_RUNTIME_CHECK(!x.is_cuda(), "CPU NVQ GEMV requires CPU activations");
+    MFQ_RUNTIME_CHECK(
         !w.indices_packed.is_cuda() && !w.sub_scale_packed.is_cuda() &&
         !w.neuron_scale.is_cuda() && !w.codebook.is_cuda(),
         "CPU NVQ GEMV requires CPU-resident weights");
-    TORCH_CHECK(w.gs == 24,
+    MFQ_RUNTIME_CHECK(w.gs == 24,
         "CPU NVQ GEMV currently requires 24-value groups");
     auto activation = cpu_quantize_activation(
         std::move(x), w.neuron_len, w.gs, true);
     const int64_t rows = activation.rows;
     const int64_t outputs = w.out;
-    auto result = torch::empty(
+    auto result = mfq_tensor_backend::empty(
         {rows, outputs},
-        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat16));
-    c10::Half * output = result.data_ptr<c10::Half>();
+        mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat16));
+    mfq_half * output = result.data_ptr<mfq_half>();
     const uint8_t * scales = w.sub_scale_packed.data_ptr<uint8_t>();
     const float * anchors = w.neuron_scale.data_ptr<float>();
     const int8_t * metadata = w.codebook.data_ptr<int8_t>();
     const int64_t scale_bytes = w.sub_scale_packed.numel();
-    at::parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
+    mfq_parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
         std::vector<float> accumulators(static_cast<size_t>(rows));
         for (int64_t neuron = begin; neuron < end; ++neuron) {
             std::fill(accumulators.begin(), accumulators.end(), 0.0f);
@@ -9904,31 +9896,31 @@ static torch::Tensor nvq_matmul_cpu(
             }
             for (int64_t row = 0; row < rows; ++row) {
                 output[row * outputs + neuron] =
-                    c10::Half(accumulators[static_cast<size_t>(row)]);
+                    mfq_half(accumulators[static_cast<size_t>(row)]);
             }
         }
     });
     return result;
 }
 
-static torch::Tensor nint_matmul_cpu(
+static mfq_tensor_backend::Tensor nint_matmul_cpu(
         const NintWeight & w,
-        torch::Tensor x) {
-    TORCH_CHECK(!x.is_cuda(), "CPU NINT GEMV requires CPU activations");
-    TORCH_CHECK(!w.q_packed.is_cuda(), "CPU NINT GEMV requires CPU-resident weights");
-    TORCH_CHECK(!w.q5_exec, "CPU NINT GEMV requires the compact MFQ layout");
+        mfq_tensor_backend::Tensor x) {
+    MFQ_RUNTIME_CHECK(!x.is_cuda(), "CPU NINT GEMV requires CPU activations");
+    MFQ_RUNTIME_CHECK(!w.q_packed.is_cuda(), "CPU NINT GEMV requires CPU-resident weights");
+    MFQ_RUNTIME_CHECK(!w.q5_exec, "CPU NINT GEMV requires the compact MFQ layout");
     auto activation = cpu_quantize_activation(
         std::move(x), w.neuron_len, w.gs, true);
     const int64_t rows = activation.rows;
     const int64_t width = w.neuron_len;
     const int64_t outputs = w.out;
-    auto result = torch::empty(
+    auto result = mfq_tensor_backend::empty(
         {rows, outputs},
-        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat16));
-    c10::Half * output = result.data_ptr<c10::Half>();
+        mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat16));
+    mfq_half * output = result.data_ptr<mfq_half>();
     const uint8_t * quant = w.q_packed.data_ptr<uint8_t>();
     const int64_t qbytes = w.qbytes;
-    at::parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
+    mfq_parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
         std::vector<float> accumulators(static_cast<size_t>(rows));
         for (int64_t neuron = begin; neuron < end; ++neuron) {
             std::fill(accumulators.begin(), accumulators.end(), 0.0f);
@@ -9939,7 +9931,7 @@ static torch::Tensor nint_matmul_cpu(
                 float minimum = 0.0f;
                 if (w.q8_zero) {
                     scale = static_cast<float>(
-                        w.q8_zero_scale.data_ptr<c10::Half>()[meta]);
+                        w.q8_zero_scale.data_ptr<mfq_half>()[meta]);
                 } else {
                     scale = w.neuron_scale.data_ptr<float>()[neuron] *
                         static_cast<float>(w.sub_scale.data_ptr<uint8_t>()[meta]);
@@ -9989,20 +9981,20 @@ static torch::Tensor nint_matmul_cpu(
             }
             for (int64_t row = 0; row < rows; ++row) {
                 output[row * outputs + neuron] =
-                    c10::Half(accumulators[static_cast<size_t>(row)]);
+                    mfq_half(accumulators[static_cast<size_t>(row)]);
             }
         }
     });
     return result;
 }
 
-static torch::Tensor nvq_matmul(const NvqWeight & w, torch::Tensor x) {
+static mfq_tensor_backend::Tensor nvq_matmul(const NvqWeight & w, mfq_tensor_backend::Tensor x) {
     if (!x.is_cuda()) return nvq_matmul_cpu(w, std::move(x));
-    x = x.contiguous().to(torch::kFloat16);
+    x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
     int M = (int)x.size(0);
     if (g_kl_mmq_mode != KlMmqMode::Default) {
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             M >= 16,
             "KLD common NVQ MMQ requires at least 16 activation rows");
         x = kl_mmq_prepare_activation(x);
@@ -10047,24 +10039,24 @@ static torch::Tensor nvq_matmul(const NvqWeight & w, torch::Tensor x) {
     });
 }
 
-static torch::Tensor nvq_matmul_input_mul(
+static mfq_tensor_backend::Tensor nvq_matmul_input_mul(
     const NvqWeight & w,
-    torch::Tensor x,
-    torch::Tensor gate,
+    mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor gate,
     int mode) {
-    TORCH_CHECK(mode == 1 || mode == 2, "NVQ input gate mode must be 1(sigmoid) or 2(silu)");
+    MFQ_RUNTIME_CHECK(mode == 1 || mode == 2, "NVQ input gate mode must be 1(sigmoid) or 2(silu)");
     if (!x.is_cuda()) {
-        x = x.contiguous().to(torch::kFloat16);
-        gate = gate.contiguous().to(torch::kFloat16);
-        TORCH_CHECK(x.sizes() == gate.sizes(), "NVQ x and gate shapes must match");
+        x = x.contiguous().to(mfq_tensor_backend::kFloat16);
+        gate = gate.contiguous().to(mfq_tensor_backend::kFloat16);
+        MFQ_RUNTIME_CHECK(x.sizes() == gate.sizes(), "NVQ x and gate shapes must match");
         auto value = mode == 1
-            ? x * torch::sigmoid(gate)
-            : x * torch::silu(gate);
+            ? x * mfq_tensor_backend::sigmoid(gate)
+            : x * mfq_tensor_backend::silu(gate);
         return nvq_matmul_cpu(w, value);
     }
-    x = x.contiguous().to(torch::kFloat16);
-    gate = gate.contiguous().to(torch::kFloat16);
-    TORCH_CHECK(x.sizes() == gate.sizes(), "NVQ x and gate shapes must match");
+    x = x.contiguous().to(mfq_tensor_backend::kFloat16);
+    gate = gate.contiguous().to(mfq_tensor_backend::kFloat16);
+    MFQ_RUNTIME_CHECK(x.sizes() == gate.sizes(), "NVQ x and gate shapes must match");
     x = pad_last(x, w.neuron_len);
     gate = pad_last(gate, w.neuron_len);
     int M = (int)x.size(0);
@@ -10087,7 +10079,7 @@ static torch::Tensor nvq_matmul_input_mul(
                 w.sub_bits, w.kernel_format, w.sign_mode, mode, ws.qx, ws.xscale);
         });
     }
-    torch::Tensor value = mode == 1 ? x * torch::sigmoid(gate) : x * torch::silu(gate);
+    mfq_tensor_backend::Tensor value = mode == 1 ? x * mfq_tensor_backend::sigmoid(gate) : x * mfq_tensor_backend::silu(gate);
     return nvq_matmul(w, value);
 }
 
@@ -10103,16 +10095,16 @@ static bool nvq_fusion_enabled() {
     return disable == nullptr || disable[0] != '1';
 }
 
-static torch::Tensor nvq_matmul_multi2(
+static mfq_tensor_backend::Tensor nvq_matmul_multi2(
     const NvqWeight & first,
     const NvqWeight & second,
-    torch::Tensor x) {
+    mfq_tensor_backend::Tensor x) {
     if (!nvq_pair_compatible(first, second)) {
         throw std::runtime_error("NVQ multi-projection requires compatible formats and input layouts");
     }
-    x = pad_last(x.contiguous().to(torch::kFloat16), first.neuron_len);
+    x = pad_last(x.contiguous().to(mfq_tensor_backend::kFloat16), first.neuron_len);
     const int M = (int)x.size(0);
-    if (M > 8) return torch::cat({nvq_matmul(first, x), nvq_matmul(second, x)}, -1);
+    if (M > 8) return mfq_tensor_backend::cat({nvq_matmul(first, x), nvq_matmul(second, x)}, -1);
     NvqWorkspace & ws = first.workspace(M);
     return g_profiler.measure("nvq.gemv_multi2", [&]() {
         return nvq_gemv_multi2_ws_cuda(
@@ -10127,18 +10119,18 @@ static torch::Tensor nvq_matmul_multi2(
     });
 }
 
-static torch::Tensor nvq_matmul_swiglu(
+static mfq_tensor_backend::Tensor nvq_matmul_swiglu(
     const NvqWeight & gate,
     const NvqWeight & up,
-    torch::Tensor x) {
+    mfq_tensor_backend::Tensor x) {
     if (!nvq_pair_compatible(gate, up) || gate.out != up.out) {
         throw std::runtime_error("NVQ SwiGLU requires compatible equal-width gate/up weights");
     }
-    x = pad_last(x.contiguous().to(torch::kFloat16), gate.neuron_len);
+    x = pad_last(x.contiguous().to(mfq_tensor_backend::kFloat16), gate.neuron_len);
     if (x.size(0) != 1) {
         auto pair = nvq_matmul_multi2(gate, up, x);
         auto parts = pair.split_with_sizes({gate.out, up.out}, -1);
-        return torch::silu(parts[0]) * parts[1];
+        return mfq_tensor_backend::silu(parts[0]) * parts[1];
     }
     NvqWorkspace & ws = gate.workspace(1);
     return g_profiler.measure("nvq.gemv_swiglu", [&]() {
@@ -10154,16 +10146,16 @@ static torch::Tensor nvq_matmul_swiglu(
     });
 }
 
-static torch::Tensor nvq_ffn_swiglu_down(
+static mfq_tensor_backend::Tensor nvq_ffn_swiglu_down(
     const NvqWeight & gate,
     const NvqWeight & up,
     const NvqWeight & down,
-    torch::Tensor x,
-    c10::optional<torch::Tensor> residual = c10::nullopt) {
+    mfq_tensor_backend::Tensor x,
+    MfqOptional<mfq_tensor_backend::Tensor> residual = mfq_nullopt) {
     if (!nvq_pair_compatible(gate, up) || gate.out != up.out || gate.out != down.neuron_len) {
         throw std::runtime_error("NVQ fused FFN weight layouts are incompatible");
     }
-    x = pad_last(x.contiguous().to(torch::kFloat16), gate.neuron_len);
+    x = pad_last(x.contiguous().to(mfq_tensor_backend::kFloat16), gate.neuron_len);
     if (x.size(0) != 1 || (down.gs != 24 && down.gs != 28 && down.gs != 32)) {
         auto output = nvq_matmul(down, nvq_matmul_swiglu(gate, up, x));
         return residual.has_value()
@@ -10173,8 +10165,8 @@ static torch::Tensor nvq_ffn_swiglu_down(
     NvqWorkspace & input_ws = gate.workspace(1);
     NvqWorkspace & output_ws = down.workspace(1);
     if (!input_ws.swiglu_scratch.defined() || input_ws.swiglu_scratch.numel() < gate.out) {
-        input_ws.swiglu_scratch = torch::empty(
-            {gate.out}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
+        input_ws.swiglu_scratch = mfq_tensor_backend::empty(
+            {gate.out}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
     }
     g_profiler.measure("nvq.ffn_swiglu_quant", [&]() {
         nvq_ffn_swiglu_quant_ws_cuda(
@@ -10208,7 +10200,7 @@ static torch::Tensor nvq_ffn_swiglu_down(
     });
 }
 
-static torch::Tensor nvq_embedding(const NvqWeight & w, torch::Tensor token_ids) {
+static mfq_tensor_backend::Tensor nvq_embedding(const NvqWeight & w, mfq_tensor_backend::Tensor token_ids) {
     return nvq_embedding_lookup_cuda(
         w.indices_packed, w.aux_packed, w.sub_scale_packed,
         w.neuron_scale, w.codebook, token_ids, w.neuron_len, w.gs,
@@ -10266,26 +10258,26 @@ static Nint3PrefillPath nint3_prefill_path() {
         "MFQ_NINT3_PREFILL_PATH must be group32, f16, or dequant");
 }
 
-static torch::Tensor nint_matmul(const NintWeight & w, torch::Tensor x) {
+static mfq_tensor_backend::Tensor nint_matmul(const NintWeight & w, mfq_tensor_backend::Tensor x) {
     if (!x.is_cuda()) return nint_matmul_cpu(w, std::move(x));
-    x = x.contiguous().to(torch::kFloat16);
+    x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
     int M = (int)x.size(0);
     if (g_kl_mmq_mode != KlMmqMode::Default) {
         const int original_m = M;
-        TORCH_CHECK(original_m > 0, "KLD common MMQ requires activation rows");
+        MFQ_RUNTIME_CHECK(original_m > 0, "KLD common MMQ requires activation rows");
         if (M < 16) {
-            auto padding = torch::zeros(
+            auto padding = mfq_tensor_backend::zeros(
                 {16 - M, x.size(1)}, x.options());
-            x = torch::cat({x, padding}, 0).contiguous();
+            x = mfq_tensor_backend::cat({x, padding}, 0).contiguous();
             M = 16;
         }
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             !w.q5_exec,
             "KLD common MMQ requires original NINT5 packed weights");
         x = kl_mmq_prepare_activation(x);
         ++g_kl_mmq_dense_calls;
-        torch::Tensor result;
+        mfq_tensor_backend::Tensor result;
         if (w.q8_zero) {
             result = g_profiler.measure("kld_mmq.nint8_zero.fp16", [&]() {
                 return nint8_zero_mmq_f16_packed_cuda(
@@ -10335,7 +10327,7 @@ static torch::Tensor nint_matmul(const NintWeight & w, torch::Tensor x) {
                 w.q_packed, w.neuron_scale, w.neuron_min, w.neuron_len);
         });
         return g_profiler.measure("nint.q5_exec_gemm", [&]() {
-            return torch::matmul(x, ww.transpose(0, 1));
+            return mfq_tensor_backend::matmul(x, ww.transpose(0, 1));
         });
     }
     const Nint3PrefillPath nint3_path =
@@ -10430,7 +10422,7 @@ static torch::Tensor nint_matmul(const NintWeight & w, torch::Tensor x) {
                                                                w.neuron_scale, w.neuron_min,
                                                                w.neuron_len, w.gs, w.bits);
         });
-        return g_profiler.measure("nint.gemm_hi", [&]() { return torch::matmul(x, ww.transpose(0, 1)); });
+        return g_profiler.measure("nint.gemm_hi", [&]() { return mfq_tensor_backend::matmul(x, ww.transpose(0, 1)); });
     }
     if (M == 1) {
         Workspace & ws = w.workspace(M);
@@ -10451,8 +10443,8 @@ static torch::Tensor nint_matmul(const NintWeight & w, torch::Tensor x) {
     return g_profiler.measure("nint.gemm4", [&]() { return nint_cublas_gemm_nt_f32acc_cuda(x, ww); });
 }
 
-static torch::Tensor nint_matmul_bf16_output(
-        const NintWeight & w, torch::Tensor x) {
+static mfq_tensor_backend::Tensor nint_matmul_bf16_output(
+        const NintWeight & w, mfq_tensor_backend::Tensor x) {
     auto shape = x.sizes().vec();
     auto flat = x.reshape({-1, x.size(-1)});
     const char * disabled = std::getenv(
@@ -10462,17 +10454,17 @@ static torch::Tensor nint_matmul_bf16_output(
     if (!enabled || !flat.is_cuda() || flat.size(0) != 1 ||
             w.bits != 4 || w.gs != 24 || w.q8_zero || w.q5_exec) {
         auto fallback = nint_matmul(w, flat)
-            .to(torch::kBFloat16).contiguous();
+            .to(mfq_tensor_backend::kBFloat16).contiguous();
         shape.back() = fallback.size(-1);
         return fallback.reshape(shape);
     }
     const char * disable_bf16_input = std::getenv(
         "MFQ_DISABLE_DECODE_NINT_BF16_INPUT_QUANT");
     flat = flat.contiguous();
-    if (flat.scalar_type() != torch::kBFloat16 ||
+    if (flat.scalar_type() != mfq_tensor_backend::kBFloat16 ||
             (disable_bf16_input != nullptr &&
              disable_bf16_input[0] == '1')) {
-        flat = flat.to(torch::kFloat16);
+        flat = flat.to(mfq_tensor_backend::kFloat16);
     }
     flat = pad_last(flat, w.neuron_len);
     Workspace & workspace = w.workspace(1);
@@ -10484,18 +10476,18 @@ static torch::Tensor nint_matmul_bf16_output(
     return output.reshape(shape);
 }
 
-static torch::Tensor nint_matmul_f32_kld(
-        const NintWeight & w, torch::Tensor x) {
-    TORCH_CHECK(
+static mfq_tensor_backend::Tensor nint_matmul_f32_kld(
+        const NintWeight & w, mfq_tensor_backend::Tensor x) {
+    MFQ_RUNTIME_CHECK(
         g_kl_mmq_mode == KlMmqMode::Fp16,
         "FP32-output NINT MMQ is restricted to the FP16 KLD path");
     x = pad_last(
-        x.contiguous().to(torch::kFloat16),
+        x.contiguous().to(mfq_tensor_backend::kFloat16),
         w.neuron_len);
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         x.size(0) >= 16,
         "FP32-output NINT MMQ requires at least 16 activation rows");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         !w.q5_exec,
         "FP32-output NINT MMQ requires original NINT5 packed weights");
     ++g_kl_mmq_dense_calls;
@@ -10516,42 +10508,42 @@ static torch::Tensor nint_matmul_f32_kld(
         });
 }
 
-static torch::Tensor nint_matmul_input_mul_f32_kld(
+static mfq_tensor_backend::Tensor nint_matmul_input_mul_f32_kld(
         const NintWeight & w,
-        torch::Tensor x,
-        torch::Tensor gate,
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor gate,
         int mode) {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         mode == 1 || mode == 2,
         "FP32-output NINT input gate mode must be sigmoid or SiLU");
     x = pad_last(
-        x.contiguous().to(torch::kFloat16),
+        x.contiguous().to(mfq_tensor_backend::kFloat16),
         w.neuron_len);
     gate = pad_last(
-        gate.contiguous().to(torch::kFloat16),
+        gate.contiguous().to(mfq_tensor_backend::kFloat16),
         w.neuron_len);
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         x.sizes() == gate.sizes(),
         "FP32-output NINT x and gate shapes must match");
     auto activation = mode == 1
-        ? x * torch::sigmoid(gate)
-        : x * torch::silu(gate);
+        ? x * mfq_tensor_backend::sigmoid(gate)
+        : x * mfq_tensor_backend::silu(gate);
     return nint_matmul_f32_kld(
         w, activation.contiguous());
 }
 
-static torch::Tensor nint_matmul_groupwise_u8(
-        const NintWeight & w, torch::Tensor x, int64_t groups) {
-    TORCH_CHECK(
+static mfq_tensor_backend::Tensor nint_matmul_groupwise_u8(
+        const NintWeight & w, mfq_tensor_backend::Tensor x, int64_t groups) {
+    MFQ_RUNTIME_CHECK(
         w.bits == 8 && w.gs == 48,
         "groupwise NINT projection requires NINT8 gs48");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         x.dim() == 3 && x.size(1) == groups && x.size(2) == w.neuron_len,
         "groupwise NINT projection expects [B, groups, K]");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         w.out % groups == 0,
         "groupwise NINT projection output rows must divide groups");
-    x = x.contiguous().to(torch::kFloat16);
+    x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     const int input_rows = (int)(x.size(0) * groups);
     Workspace & ws = w.workspace(input_rows);
     return g_profiler.measure("nint.groupwise_u8", [&]() {
@@ -10562,24 +10554,24 @@ static torch::Tensor nint_matmul_groupwise_u8(
     });
 }
 
-static torch::Tensor nint_matmul_input_mul(const NintWeight & w, torch::Tensor x, torch::Tensor gate, int mode) {
+static mfq_tensor_backend::Tensor nint_matmul_input_mul(const NintWeight & w, mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate, int mode) {
     if (!x.is_cuda()) {
-        x = x.contiguous().to(torch::kFloat16);
-        gate = gate.contiguous().to(torch::kFloat16);
-        TORCH_CHECK(x.sizes() == gate.sizes(), "NINT x and gate shapes must match");
+        x = x.contiguous().to(mfq_tensor_backend::kFloat16);
+        gate = gate.contiguous().to(mfq_tensor_backend::kFloat16);
+        MFQ_RUNTIME_CHECK(x.sizes() == gate.sizes(), "NINT x and gate shapes must match");
         auto value = mode == 1
-            ? x * torch::sigmoid(gate)
-            : x * torch::silu(gate);
+            ? x * mfq_tensor_backend::sigmoid(gate)
+            : x * mfq_tensor_backend::silu(gate);
         return nint_matmul_cpu(w, value);
     }
-    x = x.contiguous().to(torch::kFloat16);
-    gate = gate.contiguous().to(torch::kFloat16);
+    x = x.contiguous().to(mfq_tensor_backend::kFloat16);
+    gate = gate.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
     gate = pad_last(gate, w.neuron_len);
     int M = (int)x.size(0);
     if (w.q8_zero) {
-        if (mode == 1) return nint_matmul(w, x * torch::sigmoid(gate));
-        return nint_matmul(w, x * torch::silu(gate));
+        if (mode == 1) return nint_matmul(w, x * mfq_tensor_backend::sigmoid(gate));
+        return nint_matmul(w, x * mfq_tensor_backend::silu(gate));
     }
     if (w.bits == 4 && M == 1) {
         Workspace & ws = w.workspace(M);
@@ -10591,11 +10583,11 @@ static torch::Tensor nint_matmul_input_mul(const NintWeight & w, torch::Tensor x
         return nint_gemv_packed_bits_gate_ws_cuda(w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
                                                   x, gate, w.gs, w.bits, mode, ws.qx, ws.xscale, ws.xsum);
     }
-    if (mode == 1) return nint_matmul(w, x * torch::sigmoid(gate));
-    return nint_matmul(w, x * torch::silu(gate));
+    if (mode == 1) return nint_matmul(w, x * mfq_tensor_backend::sigmoid(gate));
+    return nint_matmul(w, x * mfq_tensor_backend::silu(gate));
 }
 
-static torch::Tensor nint_matmul_qx(const NintWeight & w, Workspace & ws) {
+static mfq_tensor_backend::Tensor nint_matmul_qx(const NintWeight & w, Workspace & ws) {
     if (w.q8_zero) {
         throw std::runtime_error(
             "NINT8-0 prequantized activation path is not enabled");
@@ -10613,13 +10605,13 @@ static torch::Tensor nint_matmul_qx(const NintWeight & w, Workspace & ws) {
     throw std::runtime_error("NINT prequantized GEMV unsupported bit width");
 }
 
-static torch::Tensor nint_matmul_swiglu(const NintWeight & w, torch::Tensor x) {
-    x = x.contiguous().to(torch::kFloat16);
+static mfq_tensor_backend::Tensor nint_matmul_swiglu(const NintWeight & w, mfq_tensor_backend::Tensor x) {
+    x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
     int M = (int)x.size(0);
     if (w.q8_zero) {
         auto parts = nint_matmul(w, x).chunk(2, -1);
-        return torch::silu(parts[0]) * parts[1];
+        return mfq_tensor_backend::silu(parts[0]) * parts[1];
     }
     if (M != 1) {
         throw std::runtime_error("NINT SwiGLU fusion supports only decode M=1");
@@ -10638,8 +10630,8 @@ static torch::Tensor nint_matmul_swiglu(const NintWeight & w, torch::Tensor x) {
     throw std::runtime_error("NINT SwiGLU fusion unsupported bit width");
 }
 
-static torch::Tensor nint_matmul_geglu(const NintWeight & w, torch::Tensor x) {
-    x = x.contiguous().to(torch::kFloat16);
+static mfq_tensor_backend::Tensor nint_matmul_geglu(const NintWeight & w, mfq_tensor_backend::Tensor x) {
+    x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
     int M = (int)x.size(0);
     if (w.q8_zero) {
@@ -10665,7 +10657,7 @@ static torch::Tensor nint_matmul_geglu(const NintWeight & w, torch::Tensor x) {
 
 struct NintLinear {
     NintWeight w;
-    torch::Tensor forward(torch::Tensor x) const {
+    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x) const {
         auto shape = x.sizes().vec();
         int64_t last = shape.back();
         (void)last;
@@ -10673,18 +10665,18 @@ struct NintLinear {
         shape.back() = y.size(-1);
         return y.reshape(shape);
     }
-    torch::Tensor forward_bf16_output(torch::Tensor x) const {
+    mfq_tensor_backend::Tensor forward_bf16_output(mfq_tensor_backend::Tensor x) const {
         return nint_matmul_bf16_output(w, x);
     }
-    torch::Tensor forward_input_mul(torch::Tensor x, torch::Tensor gate, int mode) const {
+    mfq_tensor_backend::Tensor forward_input_mul(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate, int mode) const {
         auto shape = x.sizes().vec();
         auto y = nint_matmul_input_mul(w, x.reshape({-1, x.size(-1)}), gate.reshape({-1, gate.size(-1)}), mode);
         shape.back() = y.size(-1);
         return y.reshape(shape);
     }
-    torch::Tensor forward_input_mul_f32_kld(
-            torch::Tensor x,
-            torch::Tensor gate,
+    mfq_tensor_backend::Tensor forward_input_mul_f32_kld(
+            mfq_tensor_backend::Tensor x,
+            mfq_tensor_backend::Tensor gate,
             int mode) const {
         auto shape = x.sizes().vec();
         auto y = nint_matmul_input_mul_f32_kld(
@@ -10706,7 +10698,7 @@ static bool decode_branch_parallel_enabled(int64_t rows) {
 
 struct CudaIndependentBranchExecutor {
     using Stream =
-        decltype(at::cuda::getStreamFromPool(false));
+        decltype(mfq_get_stream_from_pool(false));
 
     int device = -1;
     cudaEvent_t ready = nullptr;
@@ -10746,7 +10738,7 @@ struct CudaIndependentBranchExecutor {
         }
         while (streams.size() < branches) {
             streams.push_back(
-                at::cuda::getStreamFromPool(false, device));
+                mfq_get_stream_from_pool(false, device));
             cudaEvent_t event = nullptr;
             MFQ_CUDA_CHECK(cudaEventCreateWithFlags(
                 &event, cudaEventDisableTiming));
@@ -10759,12 +10751,12 @@ struct CudaIndependentBranchExecutor {
     bool run(
             size_t branches,
             Fn && fn,
-            std::vector<torch::Tensor> & outputs) {
+            std::vector<mfq_tensor_backend::Tensor> & outputs) {
         if (branches < 2) {
             return false;
         }
         const Stream parent =
-            at::cuda::getCurrentCUDAStream();
+            mfq_get_current_cuda_stream();
         if (!ensure(branches, parent)) {
             return false;
         }
@@ -10777,7 +10769,7 @@ struct CudaIndependentBranchExecutor {
             MFQ_CUDA_CHECK(cudaStreamWaitEvent(
                 branch_stream.stream(), ready, 0));
             {
-                c10::cuda::CUDAStreamGuard guard(
+                MfqCudaStreamGuard guard(
                     branch_stream);
                 outputs[index] = fn(index);
             }
@@ -10788,9 +10780,7 @@ struct CudaIndependentBranchExecutor {
             MFQ_CUDA_CHECK(cudaStreamWaitEvent(
                 parent.stream(), completed[index], 0));
             if (outputs[index].defined()) {
-                c10::cuda::CUDACachingAllocator::recordStream(
-                    outputs[index].storage().data_ptr(),
-                    parent);
+                mfq_cuda_record_stream(outputs[index], parent);
             }
         }
         return true;
@@ -10806,9 +10796,9 @@ struct NintLinearGroup {
     mutable std::shared_ptr<CudaIndependentBranchExecutor>
         branch_executor =
             std::make_shared<CudaIndependentBranchExecutor>();
-    std::vector<torch::Tensor> forward(torch::Tensor x) const {
+    std::vector<mfq_tensor_backend::Tensor> forward(mfq_tensor_backend::Tensor x) const {
         auto shape = x.sizes().vec();
-        std::vector<torch::Tensor> parts;
+        std::vector<mfq_tensor_backend::Tensor> parts;
         auto xf = x.reshape({-1, x.size(-1)});
         if (w.q8_zero && xf.size(0) > 64 &&
                 projection_w.size() == outs.size()) {
@@ -10818,7 +10808,7 @@ struct NintLinearGroup {
             }
         } else if (!split_w.empty()) {
             parts.reserve(outs.size());
-            std::vector<torch::Tensor> grouped_outputs;
+            std::vector<mfq_tensor_backend::Tensor> grouped_outputs;
             const bool parallel =
                 decode_branch_parallel_enabled(xf.size(0)) &&
                 branch_executor->run(
@@ -10846,7 +10836,7 @@ struct NintLinearGroup {
         }
         return parts;
     }
-    torch::Tensor forward_swiglu(torch::Tensor x) const {
+    mfq_tensor_backend::Tensor forward_swiglu(mfq_tensor_backend::Tensor x) const {
         if (!split_w.empty() || outs.size() != 2 || outs[0] != outs[1]) {
             throw std::runtime_error("NINT SwiGLU fusion requires one packed [gate, up] group");
         }
@@ -10855,7 +10845,7 @@ struct NintLinearGroup {
         shape.back() = y.size(-1);
         return y.reshape(shape);
     }
-    torch::Tensor forward_geglu(torch::Tensor x) const {
+    mfq_tensor_backend::Tensor forward_geglu(mfq_tensor_backend::Tensor x) const {
         if (!split_w.empty() || outs.size() != 2 || outs[0] != outs[1]) {
             throw std::runtime_error("NINT GeGLU fusion requires one packed [gate, up] group");
         }
@@ -10896,7 +10886,7 @@ static NintLinearGroup make_linear_group(const std::vector<NintWeight> & ws) {
                 g.projection_w.push_back(std::move(projection));
                 offset += source.out;
             }
-            TORCH_CHECK(offset == g.w.out,
+            MFQ_RUNTIME_CHECK(offset == g.w.out,
                         "Q8 projection views do not cover grouped output");
         }
     } else {
@@ -10926,13 +10916,13 @@ static NintLinearGroup make_linear_group(const std::vector<NintWeight> & ws) {
 
 struct NvqLinear {
     NvqWeight w;
-    torch::Tensor forward(torch::Tensor x) const {
+    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x) const {
         auto shape = x.sizes().vec();
         auto y = nvq_matmul(w, x.reshape({-1, x.size(-1)}));
         shape.back() = y.size(-1);
         return y.reshape(shape);
     }
-    torch::Tensor forward_input_mul(torch::Tensor x, torch::Tensor gate, int mode) const {
+    mfq_tensor_backend::Tensor forward_input_mul(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate, int mode) const {
         auto shape = x.sizes().vec();
         auto y = nvq_matmul_input_mul(
             w, x.reshape({-1, x.size(-1)}), gate.reshape({-1, gate.size(-1)}), mode);
@@ -10941,29 +10931,29 @@ struct NvqLinear {
     }
 };
 
-static torch::Tensor mxfp8_matmul(
+static mfq_tensor_backend::Tensor mxfp8_matmul(
         const Mxfp8Weight & weight,
-        torch::Tensor x) {
-    x = x.contiguous().to(torch::kFloat16);
-    TORCH_CHECK(
+        mfq_tensor_backend::Tensor x) {
+    x = x.contiguous().to(mfq_tensor_backend::kFloat16);
+    MFQ_RUNTIME_CHECK(
         x.dim() == 2 && x.size(1) == weight.neuron_len,
         "MXFP8 activation width mismatch");
     if (!x.is_cuda()) {
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             !weight.values.is_cuda() && !weight.scales.is_cuda(),
             "CPU MXFP8 matmul requires CPU-resident weights");
         const int64_t rows = x.size(0);
         const int64_t outputs = weight.out;
         const int64_t width = weight.neuron_len;
         const int64_t scale_columns = width / 128;
-        const auto * input = x.data_ptr<c10::Half>();
+        const auto * input = x.data_ptr<mfq_half>();
         const auto * values = weight.values.data_ptr<uint8_t>();
         const auto * scales = weight.scales.data_ptr<uint8_t>();
-        auto result = torch::empty(
+        auto result = mfq_tensor_backend::empty(
             {rows, outputs},
-            torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat16));
-        auto * output = result.data_ptr<c10::Half>();
-        at::parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
+            mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat16));
+        auto * output = result.data_ptr<mfq_half>();
+        mfq_parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
             std::vector<float> accumulators(static_cast<size_t>(rows));
             for (int64_t neuron = begin; neuron < end; ++neuron) {
                 std::fill(accumulators.begin(), accumulators.end(), 0.0f);
@@ -10990,7 +10980,7 @@ static torch::Tensor mxfp8_matmul(
                     }
                 }
                 for (int64_t row = 0; row < rows; ++row) {
-                    output[row * outputs + neuron] = c10::Half(
+                    output[row * outputs + neuron] = mfq_half(
                         accumulators[static_cast<size_t>(row)]);
                 }
             }
@@ -11009,11 +10999,11 @@ static torch::Tensor mxfp8_matmul(
     });
 }
 
-static torch::Tensor mxfp8_matmul_f32(
+static mfq_tensor_backend::Tensor mxfp8_matmul_f32(
         const Mxfp8Weight & weight,
-        torch::Tensor x) {
-    x = x.contiguous().to(torch::kFloat16);
-    TORCH_CHECK(
+        mfq_tensor_backend::Tensor x) {
+    x = x.contiguous().to(mfq_tensor_backend::kFloat16);
+    MFQ_RUNTIME_CHECK(
         x.dim() == 2 && x.size(1) == weight.neuron_len,
         "MXFP8 FP32-output activation width mismatch");
     if (x.size(0) <= 8) {
@@ -11028,10 +11018,10 @@ static torch::Tensor mxfp8_matmul_f32(
     });
 }
 
-static torch::Tensor mxfp8_cpu_reference(
+static mfq_tensor_backend::Tensor mxfp8_cpu_reference(
         const Mxfp8Weight & weight) {
-    auto values = weight.values.to(torch::kCPU).contiguous();
-    auto scales = weight.scales.to(torch::kCPU).contiguous();
+    auto values = weight.values.to(mfq_tensor_backend::kCPU).contiguous();
+    auto scales = weight.scales.to(mfq_tensor_backend::kCPU).contiguous();
     const auto * value_bytes = values.data_ptr<uint8_t>();
     const auto * scale_bytes = scales.data_ptr<uint8_t>();
     const int64_t scale_columns = weight.neuron_len / 128;
@@ -11067,25 +11057,25 @@ static torch::Tensor mxfp8_cpu_reference(
                 row * weight.neuron_len + column)] = value * scale;
         }
     }
-    return torch::from_blob(
+    return mfq_tensor_backend::from_blob(
         dense.data(), {weight.out, weight.neuron_len},
-        torch::TensorOptions().dtype(torch::kFloat32))
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32))
         .clone().to(weight.values.device())
-        .to(torch::kFloat16).contiguous();
+        .to(mfq_tensor_backend::kFloat16).contiguous();
 }
 
-static torch::Tensor mxfp8_groupwise_matmul(
+static mfq_tensor_backend::Tensor mxfp8_groupwise_matmul(
         const Mxfp8Weight & weight,
-        torch::Tensor grouped,
+        mfq_tensor_backend::Tensor grouped,
         int64_t groups) {
-    grouped = grouped.contiguous().to(torch::kFloat16);
-    TORCH_CHECK(
+    grouped = grouped.contiguous().to(mfq_tensor_backend::kFloat16);
+    MFQ_RUNTIME_CHECK(
         grouped.dim() == 3 && grouped.size(1) == groups &&
             grouped.size(2) == weight.neuron_len &&
             weight.out % groups == 0,
         "MXFP8 groupwise projection geometry mismatch");
     const int64_t outputs_per_group = weight.out / groups;
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         outputs_per_group % 128 == 0,
         "MXFP8 groupwise output width must preserve scale blocks");
     if (grouped.size(0) <= 8) {
@@ -11094,7 +11084,7 @@ static torch::Tensor mxfp8_groupwise_matmul(
                 weight.values, weight.scales, grouped, groups);
         });
     }
-    std::vector<torch::Tensor> outputs;
+    std::vector<mfq_tensor_backend::Tensor> outputs;
     outputs.reserve(static_cast<size_t>(groups));
     const int64_t scale_rows_per_group = outputs_per_group / 128;
     for (int64_t group = 0; group < groups; ++group) {
@@ -11110,21 +11100,21 @@ static torch::Tensor mxfp8_groupwise_matmul(
         outputs.push_back(mxfp8_matmul(
             shard, grouped.select(1, group).contiguous()));
     }
-    return torch::cat(outputs, -1).contiguous();
+    return mfq_tensor_backend::cat(outputs, -1).contiguous();
 }
 
-static torch::Tensor mxfp8_groupwise_matmul_f32(
+static mfq_tensor_backend::Tensor mxfp8_groupwise_matmul_f32(
         const Mxfp8Weight & weight,
-        torch::Tensor grouped,
+        mfq_tensor_backend::Tensor grouped,
         int64_t groups) {
-    grouped = grouped.contiguous().to(torch::kFloat16);
-    TORCH_CHECK(
+    grouped = grouped.contiguous().to(mfq_tensor_backend::kFloat16);
+    MFQ_RUNTIME_CHECK(
         grouped.dim() == 3 && grouped.size(1) == groups &&
             grouped.size(2) == weight.neuron_len &&
             weight.out % groups == 0,
         "MXFP8 groupwise FP32-output projection geometry mismatch");
     const int64_t outputs_per_group = weight.out / groups;
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         outputs_per_group % 128 == 0,
         "MXFP8 groupwise output width must preserve scale blocks");
     if (grouped.size(0) <= 8) {
@@ -11134,7 +11124,7 @@ static torch::Tensor mxfp8_groupwise_matmul_f32(
                     weight.values, weight.scales, grouped, groups);
             });
     }
-    std::vector<torch::Tensor> outputs;
+    std::vector<mfq_tensor_backend::Tensor> outputs;
     outputs.reserve(static_cast<size_t>(groups));
     const int64_t scale_rows_per_group = outputs_per_group / 128;
     for (int64_t group = 0; group < groups; ++group) {
@@ -11150,24 +11140,24 @@ static torch::Tensor mxfp8_groupwise_matmul_f32(
         outputs.push_back(mxfp8_matmul_f32(
             shard, grouped.select(1, group).contiguous()));
     }
-    return torch::cat(outputs, -1).contiguous();
+    return mfq_tensor_backend::cat(outputs, -1).contiguous();
 }
 
-static torch::Tensor mxfp4_matmul(
+static mfq_tensor_backend::Tensor mxfp4_matmul(
         const Mxfp4Weight & weight,
-        torch::Tensor x) {
-    x = x.contiguous().to(torch::kFloat16);
-    TORCH_CHECK(
+        mfq_tensor_backend::Tensor x) {
+    x = x.contiguous().to(mfq_tensor_backend::kFloat16);
+    MFQ_RUNTIME_CHECK(
         x.dim() == 2 && x.size(1) == weight.neuron_len,
         "MXFP4 activation width mismatch");
     if (x.is_cuda()) {
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             weight.values.is_cuda() && weight.scales.is_cuda(),
             "CUDA MXFP4 matmul requires CUDA-resident weights");
         return mxfp4_matmul_f16_cuda(
             weight.values, weight.scales, x);
     }
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         !weight.values.is_cuda() && !weight.scales.is_cuda(),
         "CPU MXFP4 matmul requires CPU-resident weights");
     const int64_t rows = x.size(0);
@@ -11175,17 +11165,17 @@ static torch::Tensor mxfp4_matmul(
     const int64_t width = weight.neuron_len;
     const int64_t packed_columns = width / 2;
     const int64_t scale_columns = width / 32;
-    const auto * input = x.data_ptr<c10::Half>();
+    const auto * input = x.data_ptr<mfq_half>();
     const auto * values = weight.values.data_ptr<uint8_t>();
     const auto * scales = weight.scales.data_ptr<uint8_t>();
-    auto result = torch::empty(
+    auto result = mfq_tensor_backend::empty(
         {rows, outputs},
-        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat16));
-    auto * output = result.data_ptr<c10::Half>();
+        mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat16));
+    auto * output = result.data_ptr<mfq_half>();
     static constexpr float magnitude[8] = {
         0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
     };
-    at::parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
+    mfq_parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
         std::vector<float> accumulators(static_cast<size_t>(rows));
         for (int64_t neuron = begin; neuron < end; ++neuron) {
             std::fill(accumulators.begin(), accumulators.end(), 0.0f);
@@ -11208,7 +11198,7 @@ static torch::Tensor mxfp4_matmul(
                 }
             }
             for (int64_t row = 0; row < rows; ++row) {
-                output[row * outputs + neuron] = c10::Half(
+                output[row * outputs + neuron] = mfq_half(
                     accumulators[static_cast<size_t>(row)]);
             }
         }
@@ -11216,15 +11206,15 @@ static torch::Tensor mxfp4_matmul(
     return result;
 }
 
-static torch::Tensor tpq_matmul(
+static mfq_tensor_backend::Tensor tpq_matmul(
         const TpqWeight & weight,
-        torch::Tensor x) {
-    x = x.contiguous().to(torch::kFloat16);
-    TORCH_CHECK(
+        mfq_tensor_backend::Tensor x) {
+    x = x.contiguous().to(mfq_tensor_backend::kFloat16);
+    MFQ_RUNTIME_CHECK(
         x.dim() == 2 && x.size(1) == weight.neuron_len,
         "TPQ activation width mismatch");
     if (x.is_cuda()) {
-        TORCH_CHECK(weight.packed.is_cuda(),
+        MFQ_RUNTIME_CHECK(weight.packed.is_cuda(),
             "CUDA TPQ matmul requires CUDA-resident weights");
         return weight.int4
             ? tpq_int4_matmul_f16_cuda(
@@ -11234,23 +11224,23 @@ static torch::Tensor tpq_matmul(
                 weight.out, weight.neuron_len,
                 weight.vector_size, weight.index_bits);
     }
-    TORCH_CHECK(!weight.packed.is_cuda(),
+    MFQ_RUNTIME_CHECK(!weight.packed.is_cuda(),
         "CPU TPQ matmul requires CPU-resident weights");
     const int64_t rows = x.size(0);
     const int64_t outputs = weight.out;
     const int64_t width = weight.neuron_len;
-    const auto * input = x.data_ptr<c10::Half>();
+    const auto * input = x.data_ptr<mfq_half>();
     const auto * packed = weight.packed.data_ptr<uint8_t>();
-    auto result = torch::empty(
+    auto result = mfq_tensor_backend::empty(
         {rows, outputs},
-        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat16));
-    auto * output = result.data_ptr<c10::Half>();
+        mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat16));
+    auto * output = result.data_ptr<mfq_half>();
     const auto * scales = weight.int4
-        ? weight.scales.data_ptr<c10::Half>() : nullptr;
+        ? weight.scales.data_ptr<mfq_half>() : nullptr;
     const auto * codebook = weight.int4
         ? nullptr : weight.codebook.data_ptr<float>();
     const size_t packed_size = static_cast<size_t>(weight.packed.numel());
-    at::parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
+    mfq_parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
         std::vector<float> accumulators(static_cast<size_t>(rows));
         for (int64_t neuron = begin; neuron < end; ++neuron) {
             std::fill(accumulators.begin(), accumulators.end(), 0.0f);
@@ -11306,7 +11296,7 @@ static torch::Tensor tpq_matmul(
                 }
             }
             for (int64_t row = 0; row < rows; ++row) {
-                output[row * outputs + neuron] = c10::Half(
+                output[row * outputs + neuron] = mfq_half(
                     accumulators[static_cast<size_t>(row)]);
             }
         }
@@ -11317,7 +11307,7 @@ static torch::Tensor tpq_matmul(
 struct TpqLinear {
     TpqWeight weight;
 
-    torch::Tensor forward(torch::Tensor x) const {
+    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x) const {
         auto shape = x.sizes().vec();
         auto y = tpq_matmul(
             weight, x.reshape({-1, x.size(-1)}));
@@ -11329,7 +11319,7 @@ struct TpqLinear {
 struct Mxfp4Linear {
     Mxfp4Weight weight;
 
-    torch::Tensor forward(torch::Tensor x) const {
+    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x) const {
         auto shape = x.sizes().vec();
         auto y = mxfp4_matmul(
             weight, x.reshape({-1, x.size(-1)}));
@@ -11341,7 +11331,7 @@ struct Mxfp4Linear {
 struct Mxfp8Linear {
     Mxfp8Weight weight;
 
-    torch::Tensor forward(torch::Tensor x) const {
+    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x) const {
         auto shape = x.sizes().vec();
         auto y = mxfp8_matmul(
             weight, x.reshape({-1, x.size(-1)}));
@@ -11371,16 +11361,16 @@ struct QuantLinearShard {
     Mxfp4Weight mxfp4;
     Mxfp8Weight mxfp8;
     TpqWeight tpq;
-    torch::Tensor dense;
+    mfq_tensor_backend::Tensor dense;
 };
 
-static torch::Tensor run_quant_linear_shard(
+static mfq_tensor_backend::Tensor run_quant_linear_shard(
         const QuantLinearShard & shard,
-        torch::Tensor x,
-        c10::optional<torch::Tensor> gate =
-            c10::nullopt,
+        mfq_tensor_backend::Tensor x,
+        MfqOptional<mfq_tensor_backend::Tensor> gate =
+            mfq_nullopt,
         int gate_mode = 0) {
-    c10::cuda::CUDAGuard guard(shard.device);
+    MfqCudaGuard guard(shard.device);
     if (shard.kind == QuantLinearKind::Nint) {
         return gate.has_value()
             ? nint_matmul_input_mul(
@@ -11394,13 +11384,13 @@ static torch::Tensor run_quant_linear_shard(
             : nvq_matmul(shard.nvq, x);
     }
     if (shard.kind == QuantLinearKind::Mxfp4) {
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             !gate.has_value(),
             "MXFP4 tensor-parallel linear does not support input gating");
         return mxfp4_matmul(shard.mxfp4, x);
     }
     if (shard.kind == QuantLinearKind::Tpq) {
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             !gate.has_value(),
             "TPQ tensor-parallel linear does not support input gating");
         return tpq_matmul(shard.tpq, x);
@@ -11408,35 +11398,35 @@ static torch::Tensor run_quant_linear_shard(
     if (shard.kind == QuantLinearKind::Dense) {
         auto local = x.to(shard.dense.scalar_type());
         if (gate.has_value()) {
-            TORCH_CHECK(
+            MFQ_RUNTIME_CHECK(
                 gate_mode == 1 || gate_mode == 2,
                 "dense input gate mode must be sigmoid or SiLU");
             auto local_gate = gate.value().to(local.scalar_type());
             local = gate_mode == 1
-                ? local * torch::sigmoid(local_gate)
-                : local * torch::silu(local_gate);
+                ? local * mfq_tensor_backend::sigmoid(local_gate)
+                : local * mfq_tensor_backend::silu(local_gate);
         }
-        return torch::matmul(local, shard.dense.transpose(0, 1));
+        return mfq_tensor_backend::matmul(local, shard.dense.transpose(0, 1));
     }
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         !gate.has_value(),
         "MXFP8 tensor-parallel linear does not support input gating");
     return mxfp8_matmul(shard.mxfp8, x);
 }
 
-static torch::Tensor tensor_to_cuda_device(
-        torch::Tensor value, int device) {
+static mfq_tensor_backend::Tensor tensor_to_cuda_device(
+        mfq_tensor_backend::Tensor value, int device) {
     if (value.is_cuda() && value.get_device() == device) {
         return value.contiguous();
     }
-    c10::cuda::CUDAGuard guard(device);
+    MfqCudaGuard guard(device);
     return value.to(
-        value.options().device(torch::Device(torch::kCUDA, device)),
+        value.options().device(mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA, device)),
         true, false).contiguous();
 }
 
-static torch::Tensor reduce_tensor_parallel_outputs(
-        std::vector<torch::Tensor> outputs) {
+static mfq_tensor_backend::Tensor reduce_tensor_parallel_outputs(
+        std::vector<mfq_tensor_backend::Tensor> outputs) {
     if (outputs.empty()) {
         throw std::runtime_error(
             "cannot reduce an empty tensor-parallel output");
@@ -11457,26 +11447,25 @@ static torch::Tensor reduce_tensor_parallel_outputs(
                 throw std::runtime_error(
                     "NCCL tensor-parallel reduction received mismatched shards");
             }
-            c10::cuda::CUDAGuard guard(device);
+            MfqCudaGuard guard(device);
             const auto producer =
-                at::cuda::getCurrentCUDAStream(device);
+                mfq_get_current_cuda_stream(device);
             MFQ_CUDA_CHECK(cudaEventRecord(
                 runtime.ready[index], producer.stream()));
             const auto communication = runtime.streams[index];
             MFQ_CUDA_CHECK(cudaStreamWaitEvent(
                 communication.stream(), runtime.ready[index], 0));
             {
-                c10::cuda::CUDAStreamGuard stream_guard(communication);
+                MfqCudaStreamGuard stream_guard(communication);
                 auto & buffer = runtime.reduction_buffers[index];
                 if (!buffer.defined() || buffer.sizes().vec() != shape ||
                         buffer.get_device() != device) {
-                    buffer = torch::empty(
+                    buffer = mfq_tensor_backend::empty(
                         shape,
-                        outputs[index].options().dtype(torch::kFloat32));
+                        outputs[index].options().dtype(mfq_tensor_backend::kFloat32));
                 }
                 buffer.copy_(outputs[index], true);
-                c10::cuda::CUDACachingAllocator::recordStream(
-                    outputs[index].storage().data_ptr(), communication);
+                mfq_cuda_record_stream(outputs[index], communication);
             }
         }
 
@@ -11494,13 +11483,13 @@ static torch::Tensor reduce_tensor_parallel_outputs(
         }
         MFQ_NCCL_CHECK(ncclGroupEnd());
 
-        torch::Tensor result;
+        mfq_tensor_backend::Tensor result;
         const int primary = g_tensor_parallel.primary_device();
         for (size_t index = 0; index < outputs.size(); ++index) {
-            c10::cuda::CUDAGuard guard(runtime.devices[index]);
+            MfqCudaGuard guard(runtime.devices[index]);
             const auto communication = runtime.streams[index];
             if (runtime.devices[index] == primary) {
-                c10::cuda::CUDAStreamGuard stream_guard(communication);
+                MfqCudaStreamGuard stream_guard(communication);
                 result = runtime.reduction_buffers[index]
                     .to(output_dtype).contiguous();
             }
@@ -11511,28 +11500,27 @@ static torch::Tensor reduce_tensor_parallel_outputs(
             throw std::runtime_error(
                 "tensor-parallel primary device is absent from NCCL ranks");
         }
-        c10::cuda::CUDAGuard primary_guard(primary);
-        const auto parent = at::cuda::getCurrentCUDAStream(primary);
+        MfqCudaGuard primary_guard(primary);
+        const auto parent = mfq_get_current_cuda_stream(primary);
         const auto primary_rank = static_cast<size_t>(
             std::find(runtime.devices.begin(), runtime.devices.end(), primary) -
             runtime.devices.begin());
         MFQ_CUDA_CHECK(cudaStreamWaitEvent(
             parent.stream(), runtime.completed[primary_rank], 0));
-        c10::cuda::CUDACachingAllocator::recordStream(
-            result.storage().data_ptr(), parent);
+        mfq_cuda_record_stream(result, parent);
         return result;
     }
 #endif
     const int primary =
         g_tensor_parallel.primary_device();
-    c10::cuda::CUDAGuard primary_guard(primary);
+    MfqCudaGuard primary_guard(primary);
     const auto output_dtype =
         outputs.front().scalar_type();
-    torch::Tensor reduced;
+    mfq_tensor_backend::Tensor reduced;
     for (auto & output : outputs) {
         auto partial =
             tensor_to_cuda_device(output, primary)
-                .to(torch::kFloat32);
+                .to(mfq_tensor_backend::kFloat32);
         if (!reduced.defined()) {
             reduced = std::move(partial);
         } else {
@@ -11549,7 +11537,7 @@ struct QuantLinear {
     Mxfp4Linear mxfp4;
     Mxfp8Linear mxfp8;
     TpqLinear tpq;
-    torch::Tensor dense;
+    mfq_tensor_backend::Tensor dense;
     TensorParallelAxis tensor_parallel_axis =
         TensorParallelAxis::Mirrored;
     std::vector<QuantLinearShard> tensor_parallel_shards;
@@ -11567,23 +11555,23 @@ struct QuantLinear {
     bool is_tpq() const { return kind == QuantLinearKind::Tpq; }
     bool is_dense() const { return kind == QuantLinearKind::Dense; }
 
-    torch::Tensor forward_tensor_parallel_flat(
-            torch::Tensor x,
-            c10::optional<torch::Tensor> gate,
+    mfq_tensor_backend::Tensor forward_tensor_parallel_flat(
+            mfq_tensor_backend::Tensor x,
+            MfqOptional<mfq_tensor_backend::Tensor> gate,
             int gate_mode) const {
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             tensor_parallel(),
             "tensor-parallel linear has no shards");
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             tensor_parallel_axis == TensorParallelAxis::Output ||
             tensor_parallel_axis == TensorParallelAxis::Input,
             "tensor-parallel linear has an invalid axis");
-        std::vector<torch::Tensor> local_outputs;
+        std::vector<mfq_tensor_backend::Tensor> local_outputs;
         local_outputs.reserve(tensor_parallel_shards.size());
         for (const auto & shard : tensor_parallel_shards) {
-            c10::cuda::CUDAGuard guard(shard.device);
-            torch::Tensor local_x = x;
-            torch::Tensor local_gate;
+            MfqCudaGuard guard(shard.device);
+            mfq_tensor_backend::Tensor local_x = x;
+            mfq_tensor_backend::Tensor local_gate;
             if (tensor_parallel_axis == TensorParallelAxis::Input) {
                 local_x = x.narrow(
                     -1, shard.input_begin,
@@ -11603,7 +11591,7 @@ struct QuantLinear {
             }
             if (is_mxfp8() &&
                     tensor_parallel_axis == TensorParallelAxis::Input) {
-                TORCH_CHECK(
+                MFQ_RUNTIME_CHECK(
                     !gate.has_value(),
                     "MXFP8 input-axis tensor parallelism does not support gating");
                 local_outputs.push_back(
@@ -11613,23 +11601,23 @@ struct QuantLinear {
                     run_quant_linear_shard(
                         shard, local_x,
                         gate.has_value()
-                            ? c10::optional<torch::Tensor>(
+                            ? MfqOptional<mfq_tensor_backend::Tensor>(
                                 local_gate)
-                            : c10::nullopt,
+                            : mfq_nullopt,
                         gate_mode));
             }
         }
 
         const int primary = g_tensor_parallel.primary_device();
-        c10::cuda::CUDAGuard primary_guard(primary);
+        MfqCudaGuard primary_guard(primary);
         if (tensor_parallel_axis == TensorParallelAxis::Output) {
-            std::vector<torch::Tensor> gathered;
+            std::vector<mfq_tensor_backend::Tensor> gathered;
             gathered.reserve(local_outputs.size());
             for (auto & output : local_outputs) {
                 gathered.push_back(
                     tensor_to_cuda_device(output, primary));
             }
-            return torch::cat(gathered, -1).contiguous();
+            return mfq_tensor_backend::cat(gathered, -1).contiguous();
         }
 
         auto reduced = reduce_tensor_parallel_outputs(
@@ -11639,12 +11627,12 @@ struct QuantLinear {
             : reduced;
     }
 
-    torch::Tensor forward(torch::Tensor x) const {
+    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x) const {
         if (tensor_parallel()) {
             auto shape = x.sizes().vec();
             auto y = forward_tensor_parallel_flat(
                 x.reshape({-1, x.size(-1)}),
-                c10::nullopt, 0);
+                mfq_nullopt, 0);
             shape.back() = y.size(-1);
             return y.reshape(shape);
         }
@@ -11653,38 +11641,38 @@ struct QuantLinear {
         if (is_mxfp4()) return mxfp4.forward(x);
         if (is_tpq()) return tpq.forward(x);
         if (is_dense()) {
-            return torch::matmul(
+            return mfq_tensor_backend::matmul(
                 x.to(dense.scalar_type()),
                 dense.transpose(0, 1));
         }
         return mxfp8.forward(x);
     }
-    torch::Tensor forward_bf16_output(torch::Tensor x) const {
+    mfq_tensor_backend::Tensor forward_bf16_output(mfq_tensor_backend::Tensor x) const {
         if (!tensor_parallel() && is_nint()) {
             return nint.forward_bf16_output(x);
         }
-        return forward(x).to(torch::kBFloat16).contiguous();
+        return forward(x).to(mfq_tensor_backend::kBFloat16).contiguous();
     }
-    torch::Tensor forward_mxfp8_groupwise(
-            torch::Tensor grouped,
+    mfq_tensor_backend::Tensor forward_mxfp8_groupwise(
+            mfq_tensor_backend::Tensor grouped,
             int64_t groups) const {
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             is_mxfp8(),
             "groupwise MXFP8 projection requires an MXFP8 tensor");
         if (!tensor_parallel()) {
             return mxfp8_groupwise_matmul(
                 mxfp8.weight, grouped, groups);
         }
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             tensor_parallel_axis == TensorParallelAxis::Input,
             "groupwise MXFP8 tensor parallelism requires input-axis shards");
-        std::vector<torch::Tensor> partials;
+        std::vector<mfq_tensor_backend::Tensor> partials;
         partials.reserve(tensor_parallel_shards.size());
         for (const auto & shard : tensor_parallel_shards) {
-            TORCH_CHECK(
+            MFQ_RUNTIME_CHECK(
                 shard.kind == QuantLinearKind::Mxfp8,
                 "groupwise MXFP8 tensor-parallel shard kind mismatch");
-            c10::cuda::CUDAGuard guard(shard.device);
+            MfqCudaGuard guard(shard.device);
             auto local = grouped.narrow(
                 -1, shard.input_begin,
                 shard.input_end - shard.input_begin);
@@ -11697,7 +11685,7 @@ struct QuantLinear {
             std::move(partials))
             .to(grouped.scalar_type()).contiguous();
     }
-    torch::Tensor forward_input_mul(torch::Tensor x, torch::Tensor gate, int mode) const {
+    mfq_tensor_backend::Tensor forward_input_mul(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate, int mode) const {
         if (tensor_parallel()) {
             auto shape = x.sizes().vec();
             auto y = forward_tensor_parallel_flat(
@@ -11712,11 +11700,11 @@ struct QuantLinear {
         throw std::runtime_error(
             "MXFP4/MXFP8/TPQ/dense linear does not support input gating");
     }
-    torch::Tensor forward_input_mul_f32_kld(
-            torch::Tensor x,
-            torch::Tensor gate,
+    mfq_tensor_backend::Tensor forward_input_mul_f32_kld(
+            mfq_tensor_backend::Tensor x,
+            mfq_tensor_backend::Tensor gate,
             int mode) const {
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             !tensor_parallel() && is_nint(),
             "FP32-output KLD down projection requires a local NINT tensor");
         return nint.forward_input_mul_f32_kld(
@@ -11743,10 +11731,10 @@ struct QuantLinear {
     }
 };
 
-static torch::Tensor quant_embedding_lookup(
+static mfq_tensor_backend::Tensor quant_embedding_lookup(
         const QuantLinear & embedding,
-        torch::Tensor token_ids) {
-    TORCH_CHECK(
+        mfq_tensor_backend::Tensor token_ids) {
+    MFQ_RUNTIME_CHECK(
         !embedding.tensor_parallel(),
         "quantized embedding does not support tensor-parallel shards");
     if (embedding.is_dense()) {
@@ -11794,7 +11782,7 @@ static torch::Tensor quant_embedding_lookup(
             embedding.mxfp8.weight.values,
             embedding.mxfp8.weight.scales, token_ids);
     }
-    TORCH_CHECK(embedding.is_tpq(), "unsupported quantized embedding kind");
+    MFQ_RUNTIME_CHECK(embedding.is_tpq(), "unsupported quantized embedding kind");
     if (embedding.tpq.weight.int4) {
         return tpq_int4_embedding_lookup_cuda(
             embedding.tpq.weight.packed,
@@ -11818,21 +11806,21 @@ struct QuantLinearGroup {
     NintLinearGroup nint;
     std::vector<QuantLinear> layers;
     std::vector<int64_t> outs;
-    std::vector<torch::Tensor> nint_q_packed;
-    std::vector<torch::Tensor> nint_sub_scale;
-    std::vector<torch::Tensor> nint_sub_min;
-    std::vector<torch::Tensor> nint_neuron_scale;
-    std::vector<torch::Tensor> nint_neuron_min;
+    std::vector<mfq_tensor_backend::Tensor> nint_q_packed;
+    std::vector<mfq_tensor_backend::Tensor> nint_sub_scale;
+    std::vector<mfq_tensor_backend::Tensor> nint_sub_min;
+    std::vector<mfq_tensor_backend::Tensor> nint_neuron_scale;
+    std::vector<mfq_tensor_backend::Tensor> nint_neuron_min;
     mutable std::shared_ptr<CudaIndependentBranchExecutor>
         branch_executor =
             std::make_shared<CudaIndependentBranchExecutor>();
 
-    std::vector<torch::Tensor> forward(torch::Tensor x) const {
+    std::vector<mfq_tensor_backend::Tensor> forward(mfq_tensor_backend::Tensor x) const {
         if (!x.is_cuda()) {
-            TORCH_CHECK(
+            MFQ_RUNTIME_CHECK(
                 !nint_grouped,
                 "CPU dense offload requires separate compact linear weights");
-            std::vector<torch::Tensor> result;
+            std::vector<mfq_tensor_backend::Tensor> result;
             result.reserve(layers.size());
             for (const auto & layer : layers) {
                 result.push_back(layer.forward(x));
@@ -11855,16 +11843,16 @@ struct QuantLinearGroup {
                 const char * disable_bf16_output = std::getenv(
                     "MFQ_DISABLE_DECODE_NINT_MULTI_BF16_OUTPUT");
                 const bool output_bf16 =
-                    x.scalar_type() == torch::kBFloat16 &&
+                    x.scalar_type() == mfq_tensor_backend::kBFloat16 &&
                     (disable_bf16_output == nullptr ||
                      disable_bf16_output[0] != '1');
                 const char * disable_bf16_input = std::getenv(
                     "MFQ_DISABLE_DECODE_NINT_BF16_INPUT_QUANT");
                 auto quantized_input = flat.contiguous();
-                if (quantized_input.scalar_type() != torch::kBFloat16 ||
+                if (quantized_input.scalar_type() != mfq_tensor_backend::kBFloat16 ||
                         (disable_bf16_input != nullptr &&
                          disable_bf16_input[0] == '1')) {
-                    quantized_input = quantized_input.to(torch::kFloat16);
+                    quantized_input = quantized_input.to(mfq_tensor_backend::kFloat16);
                 }
                 quantized_input = pad_last(
                     quantized_input,
@@ -11878,7 +11866,7 @@ struct QuantLinearGroup {
                     nint_neuron_scale, nint_neuron_min,
                     shared.qx, shared.xscale, shared.xsum,
                     output_bf16);
-                TORCH_CHECK(
+                MFQ_RUNTIME_CHECK(
                     outputs.size() == layers.size(),
                     "multi-projection NINT output count mismatch");
                 for (size_t index = 0; index < outputs.size(); ++index) {
@@ -11888,7 +11876,7 @@ struct QuantLinearGroup {
                 }
                 return outputs;
             }
-            std::vector<torch::Tensor> result;
+            std::vector<mfq_tensor_backend::Tensor> result;
             result.reserve(layers.size());
 
             auto first = nint_matmul(layers[0].nint.w, flat);
@@ -11910,7 +11898,7 @@ struct QuantLinearGroup {
             auto shape = x.sizes().vec();
             const auto flat =
                 x.reshape({-1, x.size(-1)});
-            std::vector<torch::Tensor> branch_outputs;
+            std::vector<mfq_tensor_backend::Tensor> branch_outputs;
             const bool parallel =
                 decode_branch_parallel &&
                 decode_branch_parallel_enabled(flat.size(0)) &&
@@ -11933,7 +11921,7 @@ struct QuantLinearGroup {
                     layers[0].nvq.w, layers[1].nvq.w,
                     flat);
             auto pair = combined.split_with_sizes({outs[0], outs[1]}, -1);
-            std::vector<torch::Tensor> result;
+            std::vector<mfq_tensor_backend::Tensor> result;
             result.reserve(layers.size());
             for (size_t i = 0; i < 2; ++i) {
                 auto part_shape = shape;
@@ -11948,7 +11936,7 @@ struct QuantLinearGroup {
             }
             return result;
         }
-        std::vector<torch::Tensor> result;
+        std::vector<mfq_tensor_backend::Tensor> result;
         if (g_kl_mmq_mode == KlMmqMode::Default &&
                 decode_branch_parallel &&
                 decode_branch_parallel_enabled(
@@ -11967,7 +11955,7 @@ struct QuantLinearGroup {
         }
         return result;
     }
-    torch::Tensor forward_swiglu(torch::Tensor x) const {
+    mfq_tensor_backend::Tensor forward_swiglu(mfq_tensor_backend::Tensor x) const {
         if (g_kl_mmq_mode == KlMmqMode::Default &&
                 nint_grouped && nint.split_w.empty() &&
                 x.numel() / x.size(-1) == 1) {
@@ -11987,9 +11975,9 @@ struct QuantLinearGroup {
             throw std::runtime_error("SwiGLU requires equal gate/up output widths");
         }
         auto parts = forward(x);
-        return torch::silu(parts[0]) * parts[1];
+        return mfq_tensor_backend::silu(parts[0]) * parts[1];
     }
-    torch::Tensor forward_geglu(torch::Tensor x) const {
+    mfq_tensor_backend::Tensor forward_geglu(mfq_tensor_backend::Tensor x) const {
         if (g_kl_mmq_mode == KlMmqMode::Default &&
                 nint_grouped && nint.split_w.empty() &&
                 x.numel() / x.size(-1) == 1) {
@@ -12179,7 +12167,7 @@ static QuantLinear load_quant_linear(
                 if (g_loading_cpu_layer) {
                     result.nint.w = to_device_nint8_zero(cpu, false);
                 } else {
-                    c10::cuda::CUDAGuard guard(
+                    MfqCudaGuard guard(
                         active_weight_load_device());
                     result.nint.w =
                         to_device_nint8_zero(cpu, true);
@@ -12234,7 +12222,7 @@ static QuantLinear load_quant_linear(
                 if (g_loading_cpu_layer) {
                     result.nint.w = to_device_nint(cpu, false);
                 } else {
-                    c10::cuda::CUDAGuard guard(
+                    MfqCudaGuard guard(
                         active_weight_load_device());
                     result.nint.w =
                         to_device_nint(cpu, true);
@@ -12288,7 +12276,7 @@ static QuantLinear load_quant_linear(
             if (g_loading_cpu_layer) {
                 result.nvq.w = to_device_nvq(cpu, false);
             } else {
-                c10::cuda::CUDAGuard guard(
+                MfqCudaGuard guard(
                     active_weight_load_device());
                 result.nvq.w = to_device_nvq(cpu, true);
             }
@@ -12431,11 +12419,11 @@ static QuantLinear load_quant_linear(
                     ? slice.end : cpu.size(1);
                 const int64_t dimension =
                     axis == TensorParallelAxis::Output ? 0 : 1;
-                c10::cuda::CUDAGuard guard(slice.device);
+                MfqCudaGuard guard(slice.device);
                 shard.dense = cpu.narrow(
                         dimension, slice.begin,
                         slice.end - slice.begin)
-                    .to(torch::Device(torch::kCUDA, slice.device))
+                    .to(mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA, slice.device))
                     .contiguous();
                 result.tensor_parallel_shards.push_back(
                     std::move(shard));
@@ -12443,8 +12431,8 @@ static QuantLinear load_quant_linear(
         } else if (g_loading_cpu_layer) {
             result.dense = cpu.contiguous();
         } else {
-            c10::cuda::CUDAGuard guard(active_weight_load_device());
-            result.dense = cpu.to(torch::kCUDA).contiguous();
+            MfqCudaGuard guard(active_weight_load_device());
+            result.dense = cpu.to(mfq_tensor_backend::kCUDA).contiguous();
         }
     } else {
         throw std::runtime_error(
@@ -12639,12 +12627,12 @@ static QuantLinearGroup load_paired_gate_up(
 }
 
 struct DenseLinearGroup {
-    torch::Tensor w;
+    mfq_tensor_backend::Tensor w;
     std::vector<int64_t> outs;
 
-    std::vector<torch::Tensor> forward(torch::Tensor x) const {
+    std::vector<mfq_tensor_backend::Tensor> forward(mfq_tensor_backend::Tensor x) const {
         auto shape = x.sizes().vec();
-        auto y = torch::matmul(x.reshape({-1, x.size(-1)}).to(torch::kFloat32), w.transpose(0, 1));
+        auto y = mfq_tensor_backend::matmul(x.reshape({-1, x.size(-1)}).to(mfq_tensor_backend::kFloat32), w.transpose(0, 1));
         auto parts = y.split_with_sizes(outs, -1);
         for (auto & p : parts) {
             auto s = shape;
@@ -12655,10 +12643,10 @@ struct DenseLinearGroup {
     }
 };
 
-static DenseLinearGroup make_dense_group(const std::vector<torch::Tensor> & ws) {
+static DenseLinearGroup make_dense_group(const std::vector<mfq_tensor_backend::Tensor> & ws) {
     if (ws.empty()) throw std::runtime_error("empty dense group");
     DenseLinearGroup g;
-    std::vector<torch::Tensor> parts;
+    std::vector<mfq_tensor_backend::Tensor> parts;
     parts.reserve(ws.size());
     for (const auto & w : ws) {
         if (w.dim() != 2) throw std::runtime_error("dense linear group expects 2D weights");
@@ -12666,14 +12654,14 @@ static DenseLinearGroup make_dense_group(const std::vector<torch::Tensor> & ws) 
             throw std::runtime_error("cannot group dense tensors with different input width");
         }
         g.outs.push_back(w.size(0));
-        parts.push_back(w.to(torch::kFloat32));
+        parts.push_back(w.to(mfq_tensor_backend::kFloat32));
     }
-    g.w = torch::cat(parts, 0).contiguous();
+    g.w = mfq_tensor_backend::cat(parts, 0).contiguous();
     return g;
 }
 
-static torch::Tensor dequant_nint_dense_f32(const NintWeight & w) {
-    torch::Tensor dense;
+static mfq_tensor_backend::Tensor dequant_nint_dense_f32(const NintWeight & w) {
+    mfq_tensor_backend::Tensor dense;
     if (w.q8_zero) {
         dense = nint8_zero_dequant_cuda(
             w.q_packed, w.q8_zero_scale, w.neuron_len);
@@ -12691,29 +12679,29 @@ static torch::Tensor dequant_nint_dense_f32(const NintWeight & w) {
                 w.neuron_scale, w.neuron_min,
                 w.neuron_len, w.gs, w.bits);
     }
-    return dense.to(torch::kFloat32).contiguous();
+    return dense.to(mfq_tensor_backend::kFloat32).contiguous();
 }
 
-static torch::Tensor dequant_quant_linear_f32(const QuantLinear & linear) {
+static mfq_tensor_backend::Tensor dequant_quant_linear_f32(const QuantLinear & linear) {
     if (!linear.tensor_parallel()) {
         if (linear.is_nint()) {
             return dequant_nint_dense_f32(linear.nint.w);
         }
         if (linear.is_nvq()) {
             return nvq_dequant(linear.nvq.w)
-                .to(torch::kFloat32).contiguous();
+                .to(mfq_tensor_backend::kFloat32).contiguous();
         }
         if (linear.is_mxfp8()) {
             return mxfp8_dequant_cuda(
                 linear.mxfp8.weight.values,
                 linear.mxfp8.weight.scales)
-                .to(torch::kFloat32).contiguous();
+                .to(mfq_tensor_backend::kFloat32).contiguous();
         }
         if (linear.is_mxfp4()) {
             return mxfp4_dequant_cuda(
                 linear.mxfp4.weight.values,
                 linear.mxfp4.weight.scales)
-                .to(torch::kFloat32).contiguous();
+                .to(mfq_tensor_backend::kFloat32).contiguous();
         }
         if (linear.is_tpq()) {
             const auto & weight = linear.tpq.weight;
@@ -12724,10 +12712,10 @@ static torch::Tensor dequant_quant_linear_f32(const QuantLinear & linear) {
                     weight.packed, weight.codebook,
                     weight.out, weight.neuron_len,
                     weight.vector_size, weight.index_bits);
-            return dense.to(torch::kFloat32).contiguous();
+            return dense.to(mfq_tensor_backend::kFloat32).contiguous();
         }
         if (linear.is_dense()) {
-            return linear.dense.to(torch::kFloat32).contiguous();
+            return linear.dense.to(mfq_tensor_backend::kFloat32).contiguous();
         }
         throw std::runtime_error(
             "unsupported linear kind for FP32 reconstruction");
@@ -12738,25 +12726,25 @@ static torch::Tensor dequant_quant_linear_f32(const QuantLinear & linear) {
             "cannot reconstruct a mirrored tensor-parallel linear");
     }
     const int primary = g_tensor_parallel.primary_device();
-    std::vector<torch::Tensor> parts;
+    std::vector<mfq_tensor_backend::Tensor> parts;
     parts.reserve(linear.tensor_parallel_shards.size());
     for (const auto & shard : linear.tensor_parallel_shards) {
-        c10::cuda::CUDAGuard shard_guard(shard.device);
-        torch::Tensor part;
+        MfqCudaGuard shard_guard(shard.device);
+        mfq_tensor_backend::Tensor part;
         if (shard.kind == QuantLinearKind::Nint) {
             part = dequant_nint_dense_f32(shard.nint);
         } else if (shard.kind == QuantLinearKind::Nvq) {
             part = nvq_dequant(shard.nvq)
-                .to(torch::kFloat32).contiguous();
+                .to(mfq_tensor_backend::kFloat32).contiguous();
         } else if (shard.kind == QuantLinearKind::Mxfp8) {
             part = mxfp8_dequant_cuda(
                 shard.mxfp8.values,
                 shard.mxfp8.scales)
-                .to(torch::kFloat32).contiguous();
+                .to(mfq_tensor_backend::kFloat32).contiguous();
         } else if (shard.kind == QuantLinearKind::Mxfp4) {
             part = mxfp4_dequant_cuda(
                 shard.mxfp4.values, shard.mxfp4.scales)
-                .to(torch::kFloat32).contiguous();
+                .to(mfq_tensor_backend::kFloat32).contiguous();
         } else if (shard.kind == QuantLinearKind::Tpq) {
             part = shard.tpq.int4
                 ? tpq_int4_dequant_cuda(
@@ -12766,19 +12754,19 @@ static torch::Tensor dequant_quant_linear_f32(const QuantLinear & linear) {
                     shard.tpq.packed, shard.tpq.codebook,
                     shard.tpq.out, shard.tpq.neuron_len,
                     shard.tpq.vector_size, shard.tpq.index_bits);
-            part = part.to(torch::kFloat32).contiguous();
+            part = part.to(mfq_tensor_backend::kFloat32).contiguous();
         } else if (shard.kind == QuantLinearKind::Dense) {
-            part = shard.dense.to(torch::kFloat32).contiguous();
+            part = shard.dense.to(mfq_tensor_backend::kFloat32).contiguous();
         } else {
             throw std::runtime_error(
                 "unsupported tensor-parallel shard kind for reconstruction");
         }
         parts.push_back(
             tensor_to_cuda_device(part, primary)
-                .to(torch::kFloat32).contiguous());
+                .to(mfq_tensor_backend::kFloat32).contiguous());
     }
-    c10::cuda::CUDAGuard primary_guard(primary);
-    auto dense = torch::cat(
+    MfqCudaGuard primary_guard(primary);
+    auto dense = mfq_tensor_backend::cat(
         parts,
         linear.tensor_parallel_axis == TensorParallelAxis::Output
             ? 0 : 1).contiguous();
@@ -12797,22 +12785,22 @@ static DenseLinearGroup make_fp32_quant_group(QuantLinearGroup group) {
         if (group.nint.split_w.empty()) {
             dense.w = dequant_nint_dense_f32(group.nint.w);
         } else {
-            std::vector<torch::Tensor> parts;
+            std::vector<mfq_tensor_backend::Tensor> parts;
             parts.reserve(group.nint.split_w.size());
             for (const auto & weight : group.nint.split_w) {
                 parts.push_back(dequant_nint_dense_f32(weight));
             }
-            dense.w = torch::cat(parts, 0).contiguous();
+            dense.w = mfq_tensor_backend::cat(parts, 0).contiguous();
         }
     } else {
-        std::vector<torch::Tensor> parts;
+        std::vector<mfq_tensor_backend::Tensor> parts;
         parts.reserve(group.layers.size());
         for (const auto & linear : group.layers) {
             parts.push_back(dequant_quant_linear_f32(linear));
         }
-        dense.w = torch::cat(parts, 0).contiguous();
+        dense.w = mfq_tensor_backend::cat(parts, 0).contiguous();
     }
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         dense.w.dim() == 2 &&
             dense.w.size(0) ==
                 std::accumulate(
@@ -13159,7 +13147,7 @@ static Config parse_config_json(const std::string & s) {
     if (c.is_gemma4()) {
         c.norm_weight_offset = 0.0;
         c.embed_scale = static_cast<float>(
-            at::BFloat16(static_cast<float>(std::sqrt((double)c.hidden_size))));
+            mfq_bfloat16(static_cast<float>(std::sqrt((double)c.hidden_size))));
     }
     if (c.is_dsv4()) {
         c.norm_weight_offset = 0.0;
@@ -13215,23 +13203,23 @@ static std::string layer_name(const std::string & templ, int i) {
     return s;
 }
 
-static torch::Tensor qwen_rms_norm(torch::Tensor x, torch::Tensor weight, const Config & c) {
+static mfq_tensor_backend::Tensor qwen_rms_norm(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, const Config & c) {
     if (!x.is_cuda()) {
-        auto xf = x.contiguous().to(torch::kFloat32);
-        auto wf = weight.contiguous().to(torch::kFloat32);
+        auto xf = x.contiguous().to(mfq_tensor_backend::kFloat32);
+        auto wf = weight.contiguous().to(mfq_tensor_backend::kFloat32);
         if (c.norm_weight_offset != 0.0) {
             wf = wf + c.norm_weight_offset;
         }
-        auto inverse = torch::rsqrt(
+        auto inverse = mfq_tensor_backend::rsqrt(
             xf.square().mean(-1, true) + c.rms_norm_eps);
         return (xf * inverse * wf).contiguous();
     }
     return rms_norm_offset_cuda(x, weight, c.rms_norm_eps, c.norm_weight_offset);
 }
 
-static torch::Tensor qwen_rms_norm_bf16(
-        torch::Tensor x, torch::Tensor weight, const Config & c) {
-    auto input = x.contiguous().to(torch::kBFloat16);
+static mfq_tensor_backend::Tensor qwen_rms_norm_bf16(
+        mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, const Config & c) {
+    auto input = x.contiguous().to(mfq_tensor_backend::kBFloat16);
     const char * fused_env = std::getenv("MFQ_MINICPM_FUSED_BF16_RMSNORM");
     if (input.is_cuda() &&
             (fused_env == nullptr || fused_env[0] != '0')) {
@@ -13239,29 +13227,29 @@ static torch::Tensor qwen_rms_norm_bf16(
             input, weight.contiguous(), c.rms_norm_eps,
             c.norm_weight_offset);
     }
-    auto xf = input.to(torch::kFloat32);
-    auto inverse = torch::rsqrt(
+    auto xf = input.to(mfq_tensor_backend::kFloat32);
+    auto inverse = mfq_tensor_backend::rsqrt(
         xf.square().mean(-1, true) + c.rms_norm_eps);
-    auto normalized = (xf * inverse).to(torch::kBFloat16);
-    auto scale = weight.contiguous().to(torch::kBFloat16);
+    auto normalized = (xf * inverse).to(mfq_tensor_backend::kBFloat16);
+    auto scale = weight.contiguous().to(mfq_tensor_backend::kBFloat16);
     if (c.norm_weight_offset != 0.0) {
         scale = scale + c.norm_weight_offset;
     }
     return (scale * normalized).contiguous();
 }
 
-static torch::Tensor gemma_rms_norm_f16(
-    torch::Tensor x, torch::Tensor weight, const Config & c) {
-    TORCH_CHECK(x.scalar_type() == torch::kFloat16,
+static mfq_tensor_backend::Tensor gemma_rms_norm_f16(
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, const Config & c) {
+    MFQ_RUNTIME_CHECK(x.scalar_type() == mfq_tensor_backend::kFloat16,
                 "gemma_rms_norm_f16: activation must remain f16");
     return rms_norm_f16_cuda(
         x.contiguous(), weight, c.rms_norm_eps, c.norm_weight_offset);
 }
 
 struct RopeCache {
-    torch::Tensor cos;
-    torch::Tensor sin;
-    torch::Tensor sections;
+    mfq_tensor_backend::Tensor cos;
+    mfq_tensor_backend::Tensor sin;
+    mfq_tensor_backend::Tensor sections;
     int64_t rotary_dim = 0;
 
     RopeCache() = default;
@@ -13271,7 +13259,7 @@ struct RopeCache {
         double base,
         int64_t frequency_dim = 0,
         int64_t active_pairs = -1,
-        torch::Device device = torch::Device(torch::kCUDA),
+        mfq_tensor_backend::Device device = mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA),
         bool official_reciprocal_frequencies = false) : rotary_dim(dim) {
         int64_t half = rotary_dim / 2;
         const int64_t denominator = frequency_dim > 0 ? frequency_dim : rotary_dim;
@@ -13279,52 +13267,52 @@ struct RopeCache {
         if (active_pairs > half) {
             throw std::runtime_error("RoPE active pair count exceeds rotary dimension");
         }
-        auto opts = torch::TensorOptions().device(device).dtype(torch::kFloat32);
-        auto pos = torch::arange(max_positions, opts);
-        auto ar = torch::arange(0, rotary_dim, 2, opts);
-        auto freq = torch::pow(
-            torch::full({half}, base, opts),
+        auto opts = mfq_tensor_backend::TensorOptions().device(device).dtype(mfq_tensor_backend::kFloat32);
+        auto pos = mfq_tensor_backend::arange(max_positions, opts);
+        auto ar = mfq_tensor_backend::arange(0, rotary_dim, 2, opts);
+        auto freq = mfq_tensor_backend::pow(
+            mfq_tensor_backend::full({half}, base, opts),
             -ar / (double)denominator);
         if (official_reciprocal_frequencies) {
-            auto cpu_opts = torch::TensorOptions()
-                .device(torch::kCPU).dtype(torch::kFloat32);
-            auto exponent = torch::arange(0, rotary_dim, 2, cpu_opts) /
+            auto cpu_opts = mfq_tensor_backend::TensorOptions()
+                .device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat32);
+            auto exponent = mfq_tensor_backend::arange(0, rotary_dim, 2, cpu_opts) /
                 (double)denominator;
-            auto official_freq = torch::reciprocal(
-                torch::pow(torch::full({half}, base, cpu_opts), exponent));
+            auto official_freq = mfq_tensor_backend::reciprocal(
+                mfq_tensor_backend::pow(mfq_tensor_backend::full({half}, base, cpu_opts), exponent));
             freq.copy_(official_freq);
         }
         if (active_pairs < half) {
-            auto pair = torch::arange(half, opts);
-            freq = torch::where(pair < active_pairs, freq, torch::zeros_like(freq));
+            auto pair = mfq_tensor_backend::arange(half, opts);
+            freq = mfq_tensor_backend::where(pair < active_pairs, freq, mfq_tensor_backend::zeros_like(freq));
         }
         auto ang = pos.unsqueeze(1) * freq.unsqueeze(0);
-        cos = torch::cos(ang).contiguous();
-        sin = torch::sin(ang).contiguous();
-        sections = torch::empty({0}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+        cos = mfq_tensor_backend::cos(ang).contiguous();
+        sin = mfq_tensor_backend::sin(ang).contiguous();
+        sections = mfq_tensor_backend::empty({0}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCPU));
     }
     explicit RopeCache(
         const Config & c,
-        torch::Device device = torch::Device(torch::kCUDA))
+        mfq_tensor_backend::Device device = mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA))
         : RopeCache(
             c.max_position_embeddings, c.rotary_dim, c.rope_base,
             0, -1, device, c.is_minicpmo45()) {}
-    torch::Tensor apply(torch::Tensor x, torch::Tensor pos, const Config & c) const {
+    mfq_tensor_backend::Tensor apply(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, const Config & c) const {
         if (!x.is_cuda()) {
-            TORCH_CHECK(
+            MFQ_RUNTIME_CHECK(
                 !cos.is_cuda() && !sin.is_cuda(),
                 "CPU RoPE requires a CPU-resident table");
-            auto positions = pos.contiguous().to(torch::kCPU, torch::kInt64)
+            auto positions = pos.contiguous().to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64)
                 .clamp(0, cos.size(0) - 1);
-            torch::Tensor selected_cos;
-            torch::Tensor selected_sin;
+            mfq_tensor_backend::Tensor selected_cos;
+            mfq_tensor_backend::Tensor selected_sin;
             if (positions.dim() == 1) {
                 selected_cos = cos.index_select(0, positions);
                 selected_sin = sin.index_select(0, positions);
             } else if (sections.numel() == 3) {
                 const int64_t * section = sections.data_ptr<int64_t>();
-                std::vector<torch::Tensor> cos_parts;
-                std::vector<torch::Tensor> sin_parts;
+                std::vector<mfq_tensor_backend::Tensor> cos_parts;
+                std::vector<mfq_tensor_backend::Tensor> sin_parts;
                 int64_t offset = 0;
                 for (int axis = 0; axis < 3; ++axis) {
                     const int64_t count = section[axis];
@@ -13335,13 +13323,13 @@ struct RopeCache {
                         sin.index_select(0, active).narrow(1, offset, count));
                     offset += count;
                 }
-                selected_cos = torch::cat(cos_parts, 1);
-                selected_sin = torch::cat(sin_parts, 1);
+                selected_cos = mfq_tensor_backend::cat(cos_parts, 1);
+                selected_sin = mfq_tensor_backend::cat(sin_parts, 1);
             } else {
                 throw std::runtime_error(
                     "multi-axis CPU RoPE requires three position sections");
             }
-            auto xf = x.contiguous().to(torch::kFloat32);
+            auto xf = x.contiguous().to(mfq_tensor_backend::kFloat32);
             const int64_t half = rotary_dim / 2;
             auto first = xf.narrow(-1, 0, half);
             auto second = xf.narrow(-1, half, half);
@@ -13352,12 +13340,12 @@ struct RopeCache {
                 second * selected_cos + first * selected_sin);
             return output;
         }
-        return rope_table_cuda(x.contiguous().to(torch::kFloat32), pos.contiguous().to(torch::kCUDA, torch::kInt64),
+        return rope_table_cuda(x.contiguous().to(mfq_tensor_backend::kFloat32), pos.contiguous().to(mfq_tensor_backend::kCUDA, mfq_tensor_backend::kInt64),
                                cos, sin, rotary_dim, sections);
     }
 
-    torch::Tensor apply_bf16(torch::Tensor x, torch::Tensor pos) const {
-        TORCH_CHECK(
+    mfq_tensor_backend::Tensor apply_bf16(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos) const {
+        MFQ_RUNTIME_CHECK(
             sections.numel() == 0,
             "Qwen3 BF16 RoPE does not support multi-axis sections");
         const char * fused_env =
@@ -13365,33 +13353,33 @@ struct RopeCache {
         if (x.is_cuda() && pos.dim() == 1 &&
                 (fused_env == nullptr || fused_env[0] != '0')) {
             return rope_table_bf16_cuda(
-                x.contiguous().to(torch::kBFloat16),
-                pos.contiguous().to(cos.device(), torch::kInt64),
+                x.contiguous().to(mfq_tensor_backend::kBFloat16),
+                pos.contiguous().to(cos.device(), mfq_tensor_backend::kInt64),
                 cos, sin, rotary_dim);
         }
-        auto positions = pos.contiguous().to(cos.device(), torch::kInt64)
+        auto positions = pos.contiguous().to(cos.device(), mfq_tensor_backend::kInt64)
             .clamp(0, cos.size(0) - 1);
-        torch::Tensor selected_cos;
-        torch::Tensor selected_sin;
+        mfq_tensor_backend::Tensor selected_cos;
+        mfq_tensor_backend::Tensor selected_sin;
         if (positions.dim() == 1) {
             selected_cos = cos.index_select(0, positions)
-                .to(torch::kBFloat16).unsqueeze(0).unsqueeze(0);
+                .to(mfq_tensor_backend::kBFloat16).unsqueeze(0).unsqueeze(0);
             selected_sin = sin.index_select(0, positions)
-                .to(torch::kBFloat16).unsqueeze(0).unsqueeze(0);
+                .to(mfq_tensor_backend::kBFloat16).unsqueeze(0).unsqueeze(0);
         } else if (positions.dim() == 2) {
             const int64_t batches = positions.size(0);
             const int64_t tokens = positions.size(1);
             selected_cos = cos.index_select(0, positions.reshape({-1}))
                 .reshape({batches, tokens, rotary_dim / 2})
-                .to(torch::kBFloat16).unsqueeze(1);
+                .to(mfq_tensor_backend::kBFloat16).unsqueeze(1);
             selected_sin = sin.index_select(0, positions.reshape({-1}))
                 .reshape({batches, tokens, rotary_dim / 2})
-                .to(torch::kBFloat16).unsqueeze(1);
+                .to(mfq_tensor_backend::kBFloat16).unsqueeze(1);
         } else {
             throw std::runtime_error(
                 "Qwen3 BF16 RoPE positions must be rank one or two");
         }
-        auto xb = x.contiguous().to(torch::kBFloat16);
+        auto xb = x.contiguous().to(mfq_tensor_backend::kBFloat16);
         const int64_t half = rotary_dim / 2;
         auto first = xb.narrow(-1, 0, half);
         auto second = xb.narrow(-1, half, half);
@@ -13422,10 +13410,10 @@ struct FFN {
     std::shared_ptr<MixedMoeRuntime> cpu_moe_gate;
     std::shared_ptr<MixedMoeRuntime> cpu_moe_up;
     std::shared_ptr<MixedMoeRuntime> cpu_moe_down;
-    torch::Tensor moe_router;
-    torch::Tensor moe_shared_gate;
-    torch::Tensor moe_router_bias;
-    torch::Tensor moe_hash_ids;
+    mfq_tensor_backend::Tensor moe_router;
+    mfq_tensor_backend::Tensor moe_shared_gate;
+    mfq_tensor_backend::Tensor moe_router_bias;
+    mfq_tensor_backend::Tensor moe_hash_ids;
     std::unique_ptr<FFN> shared;
     int moe_top_k = 0;
     bool moe_use_sigmoid = false;
@@ -13484,12 +13472,12 @@ struct FFN {
         return true;
     }
 
-    torch::Tensor forward_tensor_parallel_dense(
-            torch::Tensor xh) const {
+    mfq_tensor_backend::Tensor forward_tensor_parallel_dense(
+            mfq_tensor_backend::Tensor xh) const {
         auto shape = xh.sizes().vec();
         auto flat = xh.reshape(
             {-1, xh.size(-1)});
-        std::vector<torch::Tensor> partials;
+        std::vector<mfq_tensor_backend::Tensor> partials;
         partials.reserve(
             down.tensor_parallel_shards.size());
         for (size_t index = 0;
@@ -13504,7 +13492,7 @@ struct FFN {
                     .tensor_parallel_shards[index];
             const auto & down_shard =
                 down.tensor_parallel_shards[index];
-            c10::cuda::CUDAGuard guard(
+            MfqCudaGuard guard(
                 gate_shard.device);
             auto local_x =
                 tensor_to_cuda_device(
@@ -13515,30 +13503,30 @@ struct FFN {
             auto up_output =
                 run_quant_linear_shard(
                     up_shard, local_x);
-            torch::Tensor activation;
+            mfq_tensor_backend::Tensor activation;
             if (geglu) {
                 activation = gelu_mul_cuda(
                     gate_output.contiguous(),
                     up_output.contiguous());
             } else if (swiglu_limit > 0.0) {
                 auto clipped_gate =
-                    torch::clamp_max(
+                    mfq_tensor_backend::clamp_max(
                         gate_output.to(
-                            torch::kFloat32),
+                            mfq_tensor_backend::kFloat32),
                         swiglu_limit);
-                auto clipped_up = torch::clamp(
+                auto clipped_up = mfq_tensor_backend::clamp(
                     up_output.to(
-                            torch::kFloat32),
+                            mfq_tensor_backend::kFloat32),
                         -swiglu_limit,
                         swiglu_limit);
                 activation =
-                    (torch::silu(clipped_gate) *
+                    (mfq_tensor_backend::silu(clipped_gate) *
                      clipped_up)
-                        .to(torch::kFloat16)
+                        .to(mfq_tensor_backend::kFloat16)
                         .contiguous();
             } else {
                 activation =
-                    (torch::silu(gate_output) *
+                    (mfq_tensor_backend::silu(gate_output) *
                      up_output).contiguous();
             }
             partials.push_back(
@@ -13575,12 +13563,12 @@ struct FFN {
         return true;
     }
 
-    torch::Tensor forward_tensor_parallel_moe(
-            torch::Tensor x,
+    mfq_tensor_backend::Tensor forward_tensor_parallel_moe(
+            mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route,
-            torch::Tensor route_weights) const {
-        std::vector<torch::Tensor> routed_partials;
-        std::vector<torch::Tensor> down_partials;
+            mfq_tensor_backend::Tensor route_weights) const {
+        std::vector<mfq_tensor_backend::Tensor> routed_partials;
+        std::vector<mfq_tensor_backend::Tensor> down_partials;
         routed_partials.reserve(
             moe_gate_up.tensor_parallel_shards.size());
         const bool collect_output_energy =
@@ -13601,7 +13589,7 @@ struct FFN {
                 moe_gate_up.tensor_parallel_shards[index];
             const auto & down_shard =
                 moe_down.tensor_parallel_shards[index];
-            c10::cuda::CUDAGuard guard(gate_shard.device);
+            MfqCudaGuard guard(gate_shard.device);
             auto local_x = tensor_to_cuda_device(x, gate_shard.device);
             auto local_weights = tensor_to_cuda_device(
                 route_weights, gate_shard.device);
@@ -13609,7 +13597,7 @@ struct FFN {
                 route, gate_shard.device);
             auto gate_up_pair = gate_shard.weight->forward(
                 local_x, local_route);
-            torch::Tensor down_pair;
+            mfq_tensor_backend::Tensor down_pair;
             const bool allow_fusion =
                 !g_force_moe_materialized_swiglu &&
                 !disable_swiglu_quant_fusion &&
@@ -13624,21 +13612,21 @@ struct FFN {
                 down_pair = down_shard.weight->forward_clamped_swiglu(
                     gate_up_pair, local_route, swiglu_limit);
             } else {
-                torch::Tensor hidden;
+                mfq_tensor_backend::Tensor hidden;
                 if (swiglu_limit <= 0.0) {
                     hidden = moe_swiglu_split_cuda(gate_up_pair);
                 } else {
                     const int64_t width = gate_up_pair.size(-1) / 2;
-                    auto gate = torch::clamp_max(
+                    auto gate = mfq_tensor_backend::clamp_max(
                         gate_up_pair.slice(-1, 0, width)
-                            .to(torch::kFloat32),
+                            .to(mfq_tensor_backend::kFloat32),
                         swiglu_limit);
-                    auto up = torch::clamp(
+                    auto up = mfq_tensor_backend::clamp(
                         gate_up_pair.slice(-1, width, 2 * width)
-                            .to(torch::kFloat32),
+                            .to(mfq_tensor_backend::kFloat32),
                         -swiglu_limit, swiglu_limit);
-                    hidden = (torch::silu(gate) * up)
-                        .to(torch::kFloat16).contiguous();
+                    hidden = (mfq_tensor_backend::silu(gate) * up)
+                        .to(mfq_tensor_backend::kFloat16).contiguous();
                 }
                 down_pair = down_shard.weight->forward(
                     hidden, local_route);
@@ -13651,7 +13639,7 @@ struct FFN {
                     down_pair, local_weights));
         }
         if (moe_route_stats_path() != nullptr) {
-            torch::Tensor complete_down;
+            mfq_tensor_backend::Tensor complete_down;
             if (collect_output_energy) {
                 complete_down = reduce_tensor_parallel_outputs(
                     std::move(down_partials));
@@ -13664,9 +13652,9 @@ struct FFN {
             std::move(routed_partials));
     }
 
-    torch::Tensor forward_dense_f32_down_kld(
-            torch::Tensor xh) const {
-        TORCH_CHECK(
+    mfq_tensor_backend::Tensor forward_dense_f32_down_kld(
+            mfq_tensor_backend::Tensor xh) const {
+        MFQ_RUNTIME_CHECK(
             !is_moe && !tensor_parallel_dense_compatible() &&
             !geglu && swiglu_limit <= 0.0,
             "FP32-output IN diagnostic requires a local dense SiLU FFN");
@@ -13681,15 +13669,15 @@ struct FFN {
             });
     }
 
-    torch::Tensor forward_impl(
-        torch::Tensor x,
-        c10::optional<torch::Tensor> input_ids,
+    mfq_tensor_backend::Tensor forward_impl(
+        mfq_tensor_backend::Tensor x,
+        MfqOptional<mfq_tensor_backend::Tensor> input_ids,
         bool allow_important_neurons) const {
-        torch::Tensor xh;
-        if (x.scalar_type() == torch::kFloat16) {
+        mfq_tensor_backend::Tensor xh;
+        if (x.scalar_type() == mfq_tensor_backend::kFloat16) {
             xh = x;
         } else {
-            xh = g_profiler.measure("ffn.input_cast", [&]() { return x.to(torch::kFloat16); });
+            xh = g_profiler.measure("ffn.input_cast", [&]() { return x.to(mfq_tensor_backend::kFloat16); });
         }
         if (allow_important_neurons && important_neurons) {
             if (is_moe) {
@@ -13715,7 +13703,7 @@ struct FFN {
                 return g_profiler.measure(
                     "ffn.in.combine.fp32", [&]() {
                         return (low + high)
-                            .to(torch::kFloat16)
+                            .to(mfq_tensor_backend::kFloat16)
                             .contiguous();
                     });
             }
@@ -13725,7 +13713,7 @@ struct FFN {
                     : important_neurons->forward_impl(
                         xh, input_ids, false);
             };
-            std::vector<torch::Tensor> outputs;
+            std::vector<mfq_tensor_backend::Tensor> outputs;
             const char * disable_parallel =
                 std::getenv("MFQ_DISABLE_IN_BRANCH_PARALLEL");
             const bool parallel =
@@ -13756,13 +13744,13 @@ struct FFN {
             }
             auto xf = xh.reshape({-1, xh.size(-1)}).contiguous();
             auto xf32 = g_profiler.measure("moe.input_f32", [&]() {
-                return xf.to(torch::kFloat32);
+                return xf.to(mfq_tensor_backend::kFloat32);
             });
             auto router_logits = g_profiler.measure("moe.router", [&]() {
-                return torch::matmul(xf32, moe_router.transpose(0, 1));
+                return mfq_tensor_backend::matmul(xf32, moe_router.transpose(0, 1));
             });
-            torch::Tensor shared_gate_logits;
-            std::vector<torch::Tensor> selected;
+            mfq_tensor_backend::Tensor shared_gate_logits;
+            std::vector<mfq_tensor_backend::Tensor> selected;
             if (moe_hash_ids.defined()) {
                 if (!input_ids.has_value()) {
                     throw std::runtime_error(
@@ -13771,12 +13759,12 @@ struct FFN {
                 selected = g_profiler.measure("moe.hash_route", [&]() {
                     auto ids = moe_hash_ids.index_select(
                         0, input_ids.value().reshape({-1})
-                               .to(torch::kCUDA, torch::kInt64))
-                        .to(torch::kInt32).contiguous();
+                               .to(mfq_tensor_backend::kCUDA, mfq_tensor_backend::kInt64))
+                        .to(mfq_tensor_backend::kInt32).contiguous();
                     auto weights = moe_sqrtsoftplus_weights_cuda(
                         router_logits.contiguous(), ids, 1e-20,
                         moe_router_scale);
-                    return std::vector<torch::Tensor>{ids, weights};
+                    return std::vector<mfq_tensor_backend::Tensor>{ids, weights};
                 });
             } else {
                 selected = g_profiler.measure("moe.topk", [&]() {
@@ -13785,8 +13773,8 @@ struct FFN {
                         moe_use_sigmoid, moe_use_sqrt_softplus,
                         moe_normalize, moe_delayed_softmax,
                         moe_router_bias.defined()
-                            ? c10::optional<torch::Tensor>(moe_router_bias)
-                            : c10::nullopt,
+                            ? MfqOptional<mfq_tensor_backend::Tensor>(moe_router_bias)
+                            : mfq_nullopt,
                         1e-20, moe_router_scale);
                 });
             }
@@ -13804,7 +13792,7 @@ struct FFN {
                 auto shared_output = shared->forward(xf);
                 auto shared_half = shared_output
                     .reshape({xf.size(0), xf.size(1)})
-                    .contiguous().to(torch::kFloat16);
+                    .contiguous().to(mfq_tensor_backend::kFloat16);
                 if (moe_shared_ungated) {
                     return g_profiler.measure("moe.combine", [&]() {
                         return acc_cuda(
@@ -13813,7 +13801,7 @@ struct FFN {
                 }
                 shared_gate_logits = g_profiler.measure(
                     "moe.shared_gate", [&]() {
-                        return torch::matmul(
+                        return mfq_tensor_backend::matmul(
                             xf32,
                             moe_shared_gate.transpose(0, 1))
                             .contiguous();
@@ -13855,7 +13843,7 @@ struct FFN {
             if (!moe_split_gate_up && !moe_shared_ungated) {
                 shared_gate_logits = g_profiler.measure(
                     "moe.shared_gate", [&]() {
-                    return torch::matmul(
+                    return mfq_tensor_backend::matmul(
                         xf32,
                         moe_shared_gate.transpose(0, 1))
                         .contiguous();
@@ -13888,7 +13876,7 @@ struct FFN {
             const NintMoeWeight * active_gate_up = &moe_gate_up;
             const NintMoeWeight * active_gate = &moe_gate;
             const NintMoeWeight * active_up = &moe_up;
-            torch::Tensor gate_up_pair;
+            mfq_tensor_backend::Tensor gate_up_pair;
             if (moe_split_gate_up) {
                 if (cpu_moe_gate) {
                     staged_gate.emplace(g_profiler.measure(
@@ -13923,7 +13911,7 @@ struct FFN {
                             !shared_gate_logits.defined()) {
                         shared_gate_logits = g_profiler.measure(
                             "moe.shared_gate", [&]() {
-                                return torch::matmul(
+                                return mfq_tensor_backend::matmul(
                                     xf32,
                                     moe_shared_gate.transpose(0, 1))
                                     .contiguous();
@@ -13932,7 +13920,7 @@ struct FFN {
                     auto up = reuse_gate_activation
                         ? active_up->forward_prequantized(xf, route)
                         : active_up->forward(xf, route);
-                    return torch::cat({gate, up}, -1).contiguous();
+                    return mfq_tensor_backend::cat({gate, up}, -1).contiguous();
                 });
             } else {
                 if (cpu_moe_gate_up) {
@@ -13965,7 +13953,7 @@ struct FFN {
                 const char * value = std::getenv("MFQ_DISABLE_MOE_SWIGLU_QUANT_FUSION");
                 return value != nullptr && std::atoi(value) != 0;
             }();
-            torch::Tensor down_pair;
+            mfq_tensor_backend::Tensor down_pair;
             const bool allow_swiglu_quant_fusion =
                 !g_force_moe_materialized_swiglu &&
                 !disable_swiglu_quant_fusion &&
@@ -13988,15 +13976,15 @@ struct FFN {
                         return moe_swiglu_split_cuda(gate_up_pair);
                     }
                     const int64_t width = gate_up_pair.size(-1) / 2;
-                    auto gate = torch::clamp_max(
-                        gate_up_pair.slice(-1, 0, width).to(torch::kFloat32),
+                    auto gate = mfq_tensor_backend::clamp_max(
+                        gate_up_pair.slice(-1, 0, width).to(mfq_tensor_backend::kFloat32),
                         swiglu_limit);
-                    auto up = torch::clamp(
+                    auto up = mfq_tensor_backend::clamp(
                         gate_up_pair.slice(-1, width, 2 * width)
-                            .to(torch::kFloat32),
+                            .to(mfq_tensor_backend::kFloat32),
                         -swiglu_limit, swiglu_limit);
-                    return (torch::silu(gate) * up)
-                        .to(torch::kFloat16).contiguous();
+                    return (mfq_tensor_backend::silu(gate) * up)
+                        .to(mfq_tensor_backend::kFloat16).contiguous();
                 });
                 down_pair = g_profiler.measure("moe.down", [&]() {
                     return active_down->forward(hidden, route);
@@ -14013,7 +14001,7 @@ struct FFN {
             const bool fuse_reduce_gate = !g_force_moe_unfused_reduce &&
                 !disable_reduce_gate_fusion && !moe_shared_ungated &&
                 down_pair.size(0) <= 8;
-            torch::Tensor routed;
+            mfq_tensor_backend::Tensor routed;
             if (!fuse_reduce_gate) {
                 routed = g_profiler.measure("moe.reduce", [&]() {
                     return moe_weighted_reduce_cuda(down_pair, selected.at(1));
@@ -14021,10 +14009,10 @@ struct FFN {
             }
             if (!moe_shared_ungated && !shared_gate_logits.defined()) {
                 shared_gate_logits = g_profiler.measure("moe.shared_gate", [&]() {
-                    return torch::matmul(xf32, moe_shared_gate.transpose(0, 1)).contiguous();
+                    return mfq_tensor_backend::matmul(xf32, moe_shared_gate.transpose(0, 1)).contiguous();
                 });
             }
-            auto shared_half = shared_output.reshape({xf.size(0), xf.size(1)}).contiguous().to(torch::kFloat16);
+            auto shared_half = shared_output.reshape({xf.size(0), xf.size(1)}).contiguous().to(mfq_tensor_backend::kFloat16);
             if (moe_shared_ungated) {
                 return g_profiler.measure("moe.combine", [&]() {
                     return acc_cuda(routed.contiguous(), shared_half);
@@ -14098,13 +14086,13 @@ struct FFN {
                 return gate_up.forward(xh);
             });
             auto act = g_profiler.measure("ffn.swiglu_clamped", [&]() {
-                auto gate = torch::clamp_max(
-                    parts[0].to(torch::kFloat32), swiglu_limit);
-                auto up = torch::clamp(
-                    parts[1].to(torch::kFloat32),
+                auto gate = mfq_tensor_backend::clamp_max(
+                    parts[0].to(mfq_tensor_backend::kFloat32), swiglu_limit);
+                auto up = mfq_tensor_backend::clamp(
+                    parts[1].to(mfq_tensor_backend::kFloat32),
                     -swiglu_limit, swiglu_limit);
-                return (torch::silu(gate) * up)
-                    .to(torch::kFloat16).contiguous();
+                return (mfq_tensor_backend::silu(gate) * up)
+                    .to(mfq_tensor_backend::kFloat16).contiguous();
             });
             return g_profiler.measure("ffn.down", [&]() {
                 return down.forward(act);
@@ -14162,7 +14150,7 @@ struct FFN {
         auto parts = g_profiler.measure("ffn.gate_up", [&]() { return gate_up.forward(xh); });
         if (down.is_dense() || down.is_mxfp8()) {
             auto activation = g_profiler.measure("ffn.swiglu", [&]() {
-                return (parts[1] * torch::silu(parts[0])).contiguous();
+                return (parts[1] * mfq_tensor_backend::silu(parts[0])).contiguous();
             });
             return g_profiler.measure("ffn.down", [&]() {
                 return down.forward(activation);
@@ -14172,8 +14160,8 @@ struct FFN {
     }
 
     bool can_forward_fused_residual(
-        const torch::Tensor & x,
-        const torch::Tensor & residual) const {
+        const mfq_tensor_backend::Tensor & x,
+        const mfq_tensor_backend::Tensor & residual) const {
         const char * fp32_residual_env =
             std::getenv("MFQ_DIAGNOSTIC_FP32_RESIDUAL");
         if (fp32_residual_env != nullptr && fp32_residual_env[0] == '1') {
@@ -14183,8 +14171,8 @@ struct FFN {
             swiglu_limit > 0.0 || important_neurons ||
             tensor_parallel_dense_compatible() ||
             !x.is_cuda() || !residual.is_cuda() ||
-            x.scalar_type() != torch::kFloat16 ||
-            residual.scalar_type() != torch::kFloat16 ||
+            x.scalar_type() != mfq_tensor_backend::kFloat16 ||
+            residual.scalar_type() != mfq_tensor_backend::kFloat16 ||
             !x.is_contiguous() || !residual.is_contiguous() ||
             x.dim() < 1 || residual.dim() < 1 ||
             x.numel() / x.size(-1) != 1 ||
@@ -14207,10 +14195,10 @@ struct FFN {
                 kNvq3JscLGroupExecKernelFormat;
     }
 
-    torch::Tensor forward_fused_residual(
-        torch::Tensor x,
-        torch::Tensor residual) const {
-        TORCH_CHECK(
+    mfq_tensor_backend::Tensor forward_fused_residual(
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor residual) const {
+        MFQ_RUNTIME_CHECK(
             can_forward_fused_residual(x, residual),
             "FFN fused residual requires a compatible single-token NVQ FFN");
         auto shape = x.sizes().vec();
@@ -14222,18 +14210,18 @@ struct FFN {
         return output.reshape(shape);
     }
 
-    torch::Tensor forward(
-        torch::Tensor x,
-        c10::optional<torch::Tensor> input_ids =
-            c10::nullopt) const {
+    mfq_tensor_backend::Tensor forward(
+        mfq_tensor_backend::Tensor x,
+        MfqOptional<mfq_tensor_backend::Tensor> input_ids =
+            mfq_nullopt) const {
         return forward_impl(
             std::move(x), input_ids, true);
     }
 };
 
 struct KVCache {
-    torch::Tensor k;
-    torch::Tensor v;
+    mfq_tensor_backend::Tensor k;
+    mfq_tensor_backend::Tensor v;
     bool ring = false;
     KVCache() = default;
     KVCache(
@@ -14242,24 +14230,24 @@ struct KVCache {
             int64_t max_seq,
             int64_t D,
             bool use_ring = false,
-            torch::Device device = torch::Device(torch::kCUDA),
-            torch::ScalarType dtype = torch::kFloat16)
+            mfq_tensor_backend::Device device = mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA),
+            mfq_tensor_backend::ScalarType dtype = mfq_tensor_backend::kFloat16)
         : ring(use_ring) {
-        auto opts = torch::TensorOptions().device(device).dtype(dtype);
-        k = torch::zeros({B, H, max_seq, D}, opts);
-        v = torch::zeros({B, H, max_seq, D}, opts);
+        auto opts = mfq_tensor_backend::TensorOptions().device(device).dtype(dtype);
+        k = mfq_tensor_backend::zeros({B, H, max_seq, D}, opts);
+        v = mfq_tensor_backend::zeros({B, H, max_seq, D}, opts);
     }
-    std::pair<torch::Tensor, torch::Tensor> append(
-            torch::Tensor kk, torch::Tensor vv, torch::Tensor pos,
+    std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> append(
+            mfq_tensor_backend::Tensor kk, mfq_tensor_backend::Tensor vv, mfq_tensor_backend::Tensor pos,
             int64_t start_pos, int64_t end_pos) {
         auto kh = kk.to(k.scalar_type()).contiguous();
         auto vh = vv.to(v.scalar_type()).contiguous();
         const char * aten_write_env = std::getenv("MFQ_KV_CACHE_WRITE_ATEN");
-        const bool aten_write = k.scalar_type() != torch::kFloat16 ||
+        const bool aten_write = k.scalar_type() != mfq_tensor_backend::kFloat16 ||
             (aten_write_env != nullptr && aten_write_env[0] == '1');
         if (!k.is_cuda() || aten_write) {
-            auto slots = ring ? torch::remainder(pos, k.size(2)) : pos;
-            slots = slots.to(torch::kInt64).contiguous();
+            auto slots = ring ? mfq_tensor_backend::remainder(pos, k.size(2)) : pos;
+            slots = slots.to(mfq_tensor_backend::kInt64).contiguous();
             k.index_copy_(2, slots, kh);
             v.index_copy_(2, slots, vh);
         } else {
@@ -14275,9 +14263,9 @@ struct KVCache {
 };
 
 struct Dsv4RopeTable {
-    torch::Tensor cos;
-    torch::Tensor sin;
-    torch::Tensor negative_sin;
+    mfq_tensor_backend::Tensor cos;
+    mfq_tensor_backend::Tensor sin;
+    mfq_tensor_backend::Tensor negative_sin;
 
     Dsv4RopeTable() = default;
 
@@ -14288,11 +14276,11 @@ struct Dsv4RopeTable {
             1, c.max_position_embeddings);
         const double base = compress_ratio > 0
             ? c.compress_rope_base : c.rope_base;
-        auto opts = torch::TensorOptions()
-            .device(torch::kCUDA).dtype(torch::kFloat32);
-        auto dims = torch::arange(0, rotary_dim, 2, opts);
-        auto freqs = torch::pow(
-            torch::full({half}, base, opts),
+        auto opts = mfq_tensor_backend::TensorOptions()
+            .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32);
+        auto dims = mfq_tensor_backend::arange(0, rotary_dim, 2, opts);
+        auto freqs = mfq_tensor_backend::pow(
+            mfq_tensor_backend::full({half}, base, opts),
             -dims / static_cast<double>(rotary_dim));
         if (compress_ratio > 0 && c.rope_original_positions > 0) {
             auto correction = [&](double rotations) {
@@ -14309,24 +14297,24 @@ struct Dsv4RopeTable {
                 std::ceil(correction(c.rope_beta_slow)));
             const double denominator =
                 high == low ? 0.001 : high - low;
-            auto ramp = torch::clamp(
-                (torch::arange(half, opts) - low) / denominator,
+            auto ramp = mfq_tensor_backend::clamp(
+                (mfq_tensor_backend::arange(half, opts) - low) / denominator,
                 0.0, 1.0);
             auto smooth = 1.0 - ramp;
             freqs = freqs / c.rope_factor * (1.0 - smooth) +
                 freqs * smooth;
         }
-        auto angles = torch::arange(positions, opts).unsqueeze(1) *
+        auto angles = mfq_tensor_backend::arange(positions, opts).unsqueeze(1) *
             freqs.unsqueeze(0);
-        cos = torch::cos(angles).contiguous();
-        sin = torch::sin(angles).contiguous();
+        cos = mfq_tensor_backend::cos(angles).contiguous();
+        sin = mfq_tensor_backend::sin(angles).contiguous();
         negative_sin = (-sin).contiguous();
     }
 };
 
-static torch::Tensor dsv4_rotate_rope_tail(
-    torch::Tensor x,
-    torch::Tensor positions,
+static mfq_tensor_backend::Tensor dsv4_rotate_rope_tail(
+    mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor positions,
     const Dsv4RopeTable & table,
     bool inverse = false) {
     if (x.dim() != 4 || x.size(-1) < 64) {
@@ -14337,30 +14325,30 @@ static torch::Tensor dsv4_rotate_rope_tail(
     auto head = x.slice(-1, 0, width - 64).contiguous();
     auto tail = x.slice(-1, width - 64, width).contiguous();
     auto rotated = glm_interleaved_rope_cuda(
-        tail, positions.contiguous().to(torch::kCUDA, torch::kInt64),
+        tail, positions.contiguous().to(mfq_tensor_backend::kCUDA, mfq_tensor_backend::kInt64),
         table.cos, inverse ? table.negative_sin : table.sin, 64);
-    return torch::cat({head, rotated}, -1).contiguous();
+    return mfq_tensor_backend::cat({head, rotated}, -1).contiguous();
 }
 
-static std::vector<torch::Tensor> dsv4_hc_split_sinkhorn(
-    torch::Tensor mixes,
-    torch::Tensor scale,
-    torch::Tensor base,
+static std::vector<mfq_tensor_backend::Tensor> dsv4_hc_split_sinkhorn(
+    mfq_tensor_backend::Tensor mixes,
+    mfq_tensor_backend::Tensor scale,
+    mfq_tensor_backend::Tensor base,
     int64_t hc_mult,
     int64_t iterations,
     double eps) {
     const int64_t prefix = 2 * hc_mult;
-    auto pre = torch::sigmoid(
+    auto pre = mfq_tensor_backend::sigmoid(
         mixes.slice(-1, 0, hc_mult) * scale.index({0}) +
         base.slice(0, 0, hc_mult)) + eps;
-    auto post = 2.0 * torch::sigmoid(
+    auto post = 2.0 * mfq_tensor_backend::sigmoid(
         mixes.slice(-1, hc_mult, prefix) * scale.index({1}) +
         base.slice(0, hc_mult, prefix));
     auto comb = (
         mixes.slice(-1, prefix, mixes.size(-1)) * scale.index({2}) +
         base.slice(0, prefix, base.size(0)))
         .reshape({mixes.size(0), mixes.size(1), hc_mult, hc_mult});
-    comb = torch::softmax(comb, -1) + eps;
+    comb = mfq_tensor_backend::softmax(comb, -1) + eps;
     comb = comb / (comb.sum(-2, true) + eps);
     for (int64_t i = 1; i < iterations; ++i) {
         comb = comb / (comb.sum(-1, true) + eps);
@@ -14376,11 +14364,11 @@ static void dsv4_report_hc_difference(
     int layer,
     const char * stage,
     const char * tensor_name,
-    const torch::Tensor & reference,
-    const torch::Tensor & candidate)
+    const mfq_tensor_backend::Tensor & reference,
+    const mfq_tensor_backend::Tensor & candidate)
 {
-    auto reference_f32 = reference.to(torch::kFloat32);
-    auto candidate_f32 = candidate.to(torch::kFloat32);
+    auto reference_f32 = reference.to(mfq_tensor_backend::kFloat32);
+    auto candidate_f32 = candidate.to(mfq_tensor_backend::kFloat32);
     auto difference = candidate_f32 - reference_f32;
     const double reference_norm = std::max(
         reference_f32.norm().item<double>(), 1.0e-30);
@@ -14398,18 +14386,18 @@ static void dsv4_report_hc_difference(
 }
 
 struct Dsv4SharedState {
-    torch::Tensor attention_meta;
-    torch::Tensor hadamard_signs;
+    mfq_tensor_backend::Tensor attention_meta;
+    mfq_tensor_backend::Tensor hadamard_signs;
 
     void ensure() {
-        auto cuda = torch::TensorOptions().device(torch::kCUDA);
+        auto cuda = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA);
         if (!attention_meta.defined()) {
-            attention_meta = torch::empty(
-                {8 * 1024 * 1024}, cuda.dtype(torch::kFloat32));
+            attention_meta = mfq_tensor_backend::empty(
+                {8 * 1024 * 1024}, cuda.dtype(mfq_tensor_backend::kFloat32));
         }
         if (!hadamard_signs.defined()) {
-            hadamard_signs = torch::ones(
-                {128}, cuda.dtype(torch::kInt8));
+            hadamard_signs = mfq_tensor_backend::ones(
+                {128}, cuda.dtype(mfq_tensor_backend::kInt8));
         }
     }
 };
@@ -14419,12 +14407,12 @@ struct Block {
     bool cpu_offloaded = false;
     virtual ~Block() = default;
     virtual void reset(int64_t B) = 0;
-    virtual void set_token_ids(const torch::Tensor &) {}
-    virtual torch::Tensor forward(torch::Tensor x, torch::Tensor pos, int64_t cache_pos,
-                                  const c10::optional<torch::Tensor> & seq_len,
+    virtual void set_token_ids(const mfq_tensor_backend::Tensor &) {}
+    virtual mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, int64_t cache_pos,
+                                  const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
                                   const Config & c, const RopeCache & rope,
-                                  const c10::optional<torch::Tensor> & cache_positions = c10::nullopt,
-                                  const c10::optional<torch::Tensor> & attention_mask = c10::nullopt) = 0;
+                                  const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
+                                  const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) = 0;
 };
 
 struct Dsv4PoolState {
@@ -14434,22 +14422,22 @@ struct Dsv4PoolState {
     int64_t cache_quant_mode = 0;
     int64_t capacity = 0;
     DenseLinearGroup projection;
-    torch::Tensor ape;
-    torch::Tensor norm;
-    torch::Tensor state_kv;
-    torch::Tensor state_gate;
-    torch::Tensor previous_kv;
-    torch::Tensor previous_gate;
-    torch::Tensor pool;
+    mfq_tensor_backend::Tensor ape;
+    mfq_tensor_backend::Tensor norm;
+    mfq_tensor_backend::Tensor state_kv;
+    mfq_tensor_backend::Tensor state_gate;
+    mfq_tensor_backend::Tensor previous_kv;
+    mfq_tensor_backend::Tensor previous_gate;
+    mfq_tensor_backend::Tensor pool;
 
     void reset(int64_t batch, int64_t max_positions) {
         if (ratio <= 0 || head_dim <= 0) return;
         capacity = std::max<int64_t>(
             1, (max_positions + ratio - 1) / ratio);
         const int64_t output_dim = overlap ? 2 * head_dim : head_dim;
-        auto fp32 = torch::TensorOptions()
-            .device(torch::kCUDA).dtype(torch::kFloat32);
-        auto half = fp32.dtype(torch::kFloat16);
+        auto fp32 = mfq_tensor_backend::TensorOptions()
+            .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32);
+        auto half = fp32.dtype(mfq_tensor_backend::kFloat16);
         if (state_kv.defined() && state_kv.size(0) == batch &&
             pool.size(1) == capacity) {
             state_kv.zero_();
@@ -14462,39 +14450,39 @@ struct Dsv4PoolState {
             pool.zero_();
             return;
         }
-        state_kv = torch::zeros({batch, ratio, output_dim}, fp32);
-        state_gate = torch::full(
+        state_kv = mfq_tensor_backend::zeros({batch, ratio, output_dim}, fp32);
+        state_gate = mfq_tensor_backend::full(
             {batch, ratio, output_dim},
             -std::numeric_limits<float>::infinity(), fp32);
         if (overlap) {
-            previous_kv = torch::zeros(
+            previous_kv = mfq_tensor_backend::zeros(
                 {batch, ratio, head_dim}, fp32);
-            previous_gate = torch::full(
+            previous_gate = mfq_tensor_backend::full(
                 {batch, ratio, head_dim},
                 -std::numeric_limits<float>::infinity(), fp32);
         } else {
-            previous_kv = torch::empty({0}, fp32);
-            previous_gate = torch::empty({0}, fp32);
+            previous_kv = mfq_tensor_backend::empty({0}, fp32);
+            previous_gate = mfq_tensor_backend::empty({0}, fp32);
         }
-        pool = torch::zeros({batch, capacity, head_dim}, half);
+        pool = mfq_tensor_backend::zeros({batch, capacity, head_dim}, half);
     }
 
-    std::vector<torch::Tensor> project(
-        torch::Tensor x, int64_t batch, int64_t tokens) const {
-        auto parts = projection.forward(x.to(torch::kFloat32));
+    std::vector<mfq_tensor_backend::Tensor> project(
+        mfq_tensor_backend::Tensor x, int64_t batch, int64_t tokens) const {
+        auto parts = projection.forward(x.to(mfq_tensor_backend::kFloat32));
         const int64_t output_dim = overlap ? 2 * head_dim : head_dim;
         return {
             parts.at(0).reshape({batch, tokens, output_dim})
-                .to(torch::kFloat32).contiguous(),
+                .to(mfq_tensor_backend::kFloat32).contiguous(),
             parts.at(1).reshape({batch, tokens, output_dim})
-                .to(torch::kFloat32).contiguous(),
+                .to(mfq_tensor_backend::kFloat32).contiguous(),
         };
     }
 
     void update(
-        torch::Tensor kv,
-        torch::Tensor gate,
-        torch::Tensor length,
+        mfq_tensor_backend::Tensor kv,
+        mfq_tensor_backend::Tensor gate,
+        mfq_tensor_backend::Tensor length,
         const Dsv4RopeTable & rope) {
         dsv4_decode_pool_update_cuda(
             kv, gate, ape, norm, state_kv, state_gate,
@@ -14504,8 +14492,8 @@ struct Dsv4PoolState {
     }
 
     int64_t prefill(
-        const torch::Tensor & kv,
-        const torch::Tensor & gate,
+        const mfq_tensor_backend::Tensor & kv,
+        const mfq_tensor_backend::Tensor & gate,
         const Dsv4RopeTable & rope) {
         if (ratio <= 0) return 0;
         if (kv.dim() != 3 || gate.sizes() != kv.sizes()) {
@@ -14526,12 +14514,12 @@ struct Dsv4PoolState {
                 .reshape({batch, windows, ratio, output_dim}).contiguous();
             auto grouped_gate = gate.narrow(1, 0, cutoff)
                 .reshape({batch, windows, ratio, output_dim}).contiguous();
-            auto positions = torch::arange(
+            auto positions = mfq_tensor_backend::arange(
                 windows,
-                torch::TensorOptions()
-                    .device(kv.device()).dtype(torch::kInt64))
+                mfq_tensor_backend::TensorOptions()
+                    .device(kv.device()).dtype(mfq_tensor_backend::kInt64))
                 .reshape({1, windows}).expand({batch, windows}).contiguous();
-            auto empty = torch::empty({0}, kv.options());
+            auto empty = mfq_tensor_backend::empty({0}, kv.options());
             auto compressed = dsv4_compress_cuda(
                 grouped_kv, grouped_gate, ape, norm, empty, empty,
                 positions, rope.cos, rope.sin, ratio, overlap,
@@ -14572,19 +14560,19 @@ struct Dsv4Block : Block {
     double eps = 1e-6;
     double hc_eps = 1e-6;
     std::shared_ptr<Dsv4SharedState> shared_state;
-    torch::Tensor current_ids;
+    mfq_tensor_backend::Tensor current_ids;
 
-    torch::Tensor attn_norm;
-    torch::Tensor ffn_norm;
-    torch::Tensor q_a_norm;
-    torch::Tensor kv_norm;
-    torch::Tensor sinks;
-    torch::Tensor hc_attn_fn;
-    torch::Tensor hc_attn_scale;
-    torch::Tensor hc_attn_base;
-    torch::Tensor hc_ffn_fn;
-    torch::Tensor hc_ffn_scale;
-    torch::Tensor hc_ffn_base;
+    mfq_tensor_backend::Tensor attn_norm;
+    mfq_tensor_backend::Tensor ffn_norm;
+    mfq_tensor_backend::Tensor q_a_norm;
+    mfq_tensor_backend::Tensor kv_norm;
+    mfq_tensor_backend::Tensor sinks;
+    mfq_tensor_backend::Tensor hc_attn_fn;
+    mfq_tensor_backend::Tensor hc_attn_scale;
+    mfq_tensor_backend::Tensor hc_attn_base;
+    mfq_tensor_backend::Tensor hc_ffn_fn;
+    mfq_tensor_backend::Tensor hc_ffn_scale;
+    mfq_tensor_backend::Tensor hc_ffn_base;
     QuantLinear q_a;
     QuantLinear q_b;
     QuantLinear kv;
@@ -14593,17 +14581,17 @@ struct Dsv4Block : Block {
     Dsv4PoolState compressor;
     Dsv4PoolState indexer_compressor;
     QuantLinear indexer_q;
-    torch::Tensor indexer_weight;
+    mfq_tensor_backend::Tensor indexer_weight;
     FFN ffn;
     Dsv4RopeTable attention_rope;
 
-    torch::Tensor local_cache;
+    mfq_tensor_backend::Tensor local_cache;
 
     void reset(int64_t batch) override {
-        auto half = torch::TensorOptions()
-            .device(torch::kCUDA).dtype(torch::kFloat16);
+        auto half = mfq_tensor_backend::TensorOptions()
+            .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat16);
         if (!local_cache.defined() || local_cache.size(0) != batch) {
-            local_cache = torch::zeros(
+            local_cache = mfq_tensor_backend::zeros(
                 {batch, 128, head_dim}, half);
         } else {
             local_cache.zero_();
@@ -14613,35 +14601,35 @@ struct Dsv4Block : Block {
         shared_state->ensure();
     }
 
-    void set_token_ids(const torch::Tensor & ids) override {
+    void set_token_ids(const mfq_tensor_backend::Tensor & ids) override {
         current_ids = ids;
     }
 
-    std::vector<torch::Tensor> hc_pre(
-        torch::Tensor x,
-        torch::Tensor function,
-        torch::Tensor scale,
-        torch::Tensor base,
+    std::vector<mfq_tensor_backend::Tensor> hc_pre(
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor function,
+        mfq_tensor_backend::Tensor scale,
+        mfq_tensor_backend::Tensor base,
         const char * stage) const {
-        auto flat = x.flatten(2).to(torch::kFloat32);
-        auto inverse_rms = torch::rsqrt(
+        auto flat = x.flatten(2).to(mfq_tensor_backend::kFloat32);
+        auto inverse_rms = mfq_tensor_backend::rsqrt(
             flat.square().mean(-1, true) + eps);
-        auto mixes = torch::matmul(
+        auto mixes = mfq_tensor_backend::matmul(
             flat, function.transpose(0, 1)) * inverse_rms;
-        std::vector<torch::Tensor> candidate;
+        std::vector<mfq_tensor_backend::Tensor> candidate;
         if (g_dsv4_fused_hc || g_dsv4_compare_hc_ops) {
             candidate = dsv4_hc_pre_cuda(
                 x, mixes.contiguous(), scale, base,
                 hc_iterations, hc_eps);
         }
-        std::vector<torch::Tensor> reference;
+        std::vector<mfq_tensor_backend::Tensor> reference;
         if (!g_dsv4_fused_hc || g_dsv4_compare_hc_ops) {
             auto split = dsv4_hc_split_sinkhorn(
                 mixes, scale, base, hc_mult, hc_iterations, hc_eps);
             auto reduced = (
                 split.at(0).unsqueeze(-1) *
                 flat.reshape(x.sizes()))
-                .sum(2).to(torch::kFloat16).contiguous();
+                .sum(2).to(mfq_tensor_backend::kFloat16).contiguous();
             reference = {reduced, split.at(1), split.at(2)};
         }
         if (g_dsv4_compare_hc_ops && layer == 0) {
@@ -14655,25 +14643,25 @@ struct Dsv4Block : Block {
         return g_dsv4_fused_hc ? candidate : reference;
     }
 
-    torch::Tensor hc_post(
-        torch::Tensor x,
-        torch::Tensor residual,
-        torch::Tensor post,
-        torch::Tensor combination,
+    mfq_tensor_backend::Tensor hc_post(
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor residual,
+        mfq_tensor_backend::Tensor post,
+        mfq_tensor_backend::Tensor combination,
         const char * stage) const {
-        torch::Tensor candidate;
+        mfq_tensor_backend::Tensor candidate;
         if (g_dsv4_fused_hc || g_dsv4_compare_hc_ops) {
             candidate = dsv4_hc_post_cuda(
                 x.contiguous(), residual.contiguous(),
                 post.contiguous(), combination.contiguous());
         }
-        torch::Tensor reference;
+        mfq_tensor_backend::Tensor reference;
         if (!g_dsv4_fused_hc || g_dsv4_compare_hc_ops) {
             reference = (
                 post.unsqueeze(-1) * x.unsqueeze(-2) +
                 (combination.unsqueeze(-1) *
-                 residual.to(torch::kFloat32).unsqueeze(-2)).sum(2))
-                .to(torch::kFloat16).contiguous();
+                 residual.to(mfq_tensor_backend::kFloat32).unsqueeze(-2)).sum(2))
+                .to(mfq_tensor_backend::kFloat16).contiguous();
         }
         if (g_dsv4_compare_hc_ops && layer == 0) {
             dsv4_report_hc_difference(
@@ -14682,13 +14670,13 @@ struct Dsv4Block : Block {
         return g_dsv4_fused_hc ? candidate : reference;
     }
 
-    torch::Tensor output_projection(torch::Tensor attention) const {
+    mfq_tensor_backend::Tensor output_projection(mfq_tensor_backend::Tensor attention) const {
         const int64_t batch = attention.size(0);
         const int64_t tokens = attention.size(1);
         const int64_t rows = batch * tokens;
         auto grouped = attention.contiguous()
             .reshape({rows, groups, heads / groups * head_dim})
-            .to(torch::kFloat16);
+            .to(mfq_tensor_backend::kFloat16);
         static const bool groupwise_enabled = [] {
             const char * value = std::getenv("MFQ_DSV4_GROUPWISE_OUTPUT_A");
             return value == nullptr || value[0] != '0';
@@ -14722,47 +14710,47 @@ struct Dsv4Block : Block {
                 grouped.reshape({rows * groups, grouped.size(-1)}))
                 .reshape({rows, groups, groups, o_rank});
         });
-        std::vector<torch::Tensor> diagonal;
+        std::vector<mfq_tensor_backend::Tensor> diagonal;
         diagonal.reserve(static_cast<size_t>(groups));
         for (int64_t group = 0; group < groups; ++group) {
             diagonal.push_back(
                 expanded.index({Slice(), group, group, Slice()}));
         }
-        auto low_rank = torch::stack(diagonal, 1)
+        auto low_rank = mfq_tensor_backend::stack(diagonal, 1)
             .reshape({rows, groups * o_rank})
-            .to(torch::kFloat16).contiguous();
+            .to(mfq_tensor_backend::kFloat16).contiguous();
         return g_profiler.measure("dsv4.output_b", [&]() {
             return output_b.forward(low_rank)
                 .reshape({batch, tokens, hidden_size});
         });
     }
 
-    torch::Tensor attention_forward(
-        torch::Tensor x,
-        torch::Tensor positions,
+    mfq_tensor_backend::Tensor attention_forward(
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor positions,
         int64_t cache_pos,
-        const c10::optional<torch::Tensor> & seq_len) {
+        const MfqOptional<mfq_tensor_backend::Tensor> & seq_len) {
         const int64_t batch = x.size(0);
         const int64_t tokens = x.size(1);
         auto flat = x.reshape({batch * tokens, hidden_size})
-            .to(torch::kFloat16).contiguous();
+            .to(mfq_tensor_backend::kFloat16).contiguous();
 
         auto qr = g_profiler.measure("dsv4.q_a", [&]() {
             return q_a.forward(flat);
         });
         qr = g_profiler.measure("dsv4.q_a_norm", [&]() {
             return rms_norm_cuda(
-                qr.reshape({-1, qr.size(-1)}).to(torch::kFloat32),
-                q_a_norm, eps).to(torch::kFloat16).contiguous();
+                qr.reshape({-1, qr.size(-1)}).to(mfq_tensor_backend::kFloat32),
+                q_a_norm, eps).to(mfq_tensor_backend::kFloat16).contiguous();
         });
         auto queries = g_profiler.measure("dsv4.q_b", [&]() {
             return q_b.forward(qr)
                 .reshape({batch, tokens, heads, head_dim})
                 .transpose(1, 2).contiguous()
-                .to(torch::kFloat32);
+                .to(mfq_tensor_backend::kFloat32);
         });
         queries = g_profiler.measure("dsv4.q_norm_rope", [&]() {
-            auto normalized = queries * torch::rsqrt(
+            auto normalized = queries * mfq_tensor_backend::rsqrt(
                 queries.square().mean(-1, true) + eps);
             return dsv4_rotate_rope_tail(
                 normalized, positions, attention_rope, false);
@@ -14774,23 +14762,23 @@ struct Dsv4Block : Block {
         });
         values = g_profiler.measure("dsv4.kv_norm_rope", [&]() {
             auto normalized = rms_norm_cuda(
-                values.reshape({-1, head_dim}).to(torch::kFloat32),
+                values.reshape({-1, head_dim}).to(mfq_tensor_backend::kFloat32),
                 kv_norm, eps).reshape({batch, tokens, head_dim})
-                .to(torch::kFloat16);
+                .to(mfq_tensor_backend::kFloat16);
             auto values_heads = normalized.unsqueeze(1).contiguous();
             values_heads = dsv4_rotate_rope_tail(
                 values_heads, positions, attention_rope, false);
             return values_heads.squeeze(1).contiguous();
         });
 
-        std::vector<torch::Tensor> compressor_parts;
+        std::vector<mfq_tensor_backend::Tensor> compressor_parts;
         if (compress_ratio > 0) {
             compressor_parts = g_profiler.measure(
                 "dsv4.compressor_proj", [&]() {
                     return compressor.project(flat, batch, tokens);
                 });
         }
-        std::vector<torch::Tensor> indexer_parts;
+        std::vector<mfq_tensor_backend::Tensor> indexer_parts;
         if (compress_ratio == 4) {
             indexer_parts = g_profiler.measure(
                 "dsv4.indexer_compressor_proj", [&]() {
@@ -14802,7 +14790,7 @@ struct Dsv4Block : Block {
             const int64_t local_tokens = std::min<int64_t>(tokens, 128);
             auto local_positions = positions.narrow(
                 0, tokens - local_tokens, local_tokens)
-                .remainder(128).to(torch::kInt64).contiguous();
+                .remainder(128).to(mfq_tensor_backend::kInt64).contiguous();
             g_profiler.measure("dsv4.local_cache_prefill", [&]() {
                 local_cache.index_copy_(
                     1, local_positions,
@@ -14832,9 +14820,9 @@ struct Dsv4Block : Block {
                 }
             }
 
-            torch::Tensor selected;
-            auto int_options = torch::TensorOptions()
-                .device(x.device()).dtype(torch::kInt32);
+            mfq_tensor_backend::Tensor selected;
+            auto int_options = mfq_tensor_backend::TensorOptions()
+                .device(x.device()).dtype(mfq_tensor_backend::kInt32);
             if (compress_ratio == 4 && visible > 512) {
                 auto index_query = g_profiler.measure(
                     "dsv4.indexer_q_prefill", [&]() {
@@ -14847,18 +14835,18 @@ struct Dsv4Block : Block {
                     .transpose(1, 2).contiguous();
                 index_query = nepq_hadamard_input_cuda(
                     index_query.reshape({batch * tokens * heads, 128})
-                        .to(torch::kFloat16).contiguous(),
+                        .to(mfq_tensor_backend::kFloat16).contiguous(),
                     shared_state->hadamard_signs, 128)
                     .reshape({batch, tokens, heads, 128});
                 index_query = dsv4_fp4_sim_cuda(index_query.contiguous());
                 auto weights = g_profiler.measure(
                     "dsv4.indexer_weight_prefill", [&]() {
-                        return torch::matmul(
+                        return mfq_tensor_backend::matmul(
                             x.reshape({batch * tokens, hidden_size})
-                                .to(torch::kFloat32),
+                                .to(mfq_tensor_backend::kFloat32),
                             indexer_weight.transpose(0, 1))
                             .reshape({batch, tokens, heads})
-                            .to(torch::kFloat16).contiguous();
+                            .to(mfq_tensor_backend::kFloat16).contiguous();
                     });
                 auto scores = g_profiler.measure(
                     "dsv4.indexer_scores_prefill", [&]() {
@@ -14873,11 +14861,11 @@ struct Dsv4Block : Block {
                         return dsv4_topk512_cuda(scores);
                     });
             } else if (visible > 0) {
-                selected = torch::arange(visible, int_options)
+                selected = mfq_tensor_backend::arange(visible, int_options)
                     .reshape({1, 1, visible})
                     .expand({batch, tokens, visible}).contiguous();
             } else {
-                selected = torch::zeros({batch, tokens, 1}, int_options);
+                selected = mfq_tensor_backend::zeros({batch, tokens, 1}, int_options);
             }
 
             const int64_t plan_ratio =
@@ -14890,7 +14878,7 @@ struct Dsv4Block : Block {
             auto cache = g_profiler.measure(
                 "dsv4.attention_cache_prefill", [&]() {
                     return visible > 0
-                        ? torch::cat({
+                        ? mfq_tensor_backend::cat({
                             values,
                             compressor.pool.narrow(1, 0, visible)}, 1)
                             .contiguous()
@@ -14913,13 +14901,13 @@ struct Dsv4Block : Block {
             return output_projection(attention);
         }
 
-        std::vector<torch::Tensor> outputs;
+        std::vector<mfq_tensor_backend::Tensor> outputs;
         outputs.reserve(static_cast<size_t>(tokens));
         for (int64_t token = 0; token < tokens; ++token) {
             const int64_t absolute_length = cache_pos + token + 1;
             auto position = positions.narrow(0, token, 1);
-            auto slot = torch::remainder(position, 128)
-                .to(torch::kInt64).contiguous();
+            auto slot = mfq_tensor_backend::remainder(position, 128)
+                .to(mfq_tensor_backend::kInt64).contiguous();
             g_profiler.measure("dsv4.local_cache_write", [&]() {
                 glm_dsa_cache_write_cuda(
                     local_cache,
@@ -14928,14 +14916,14 @@ struct Dsv4Block : Block {
                 return 0;
             });
 
-            torch::Tensor length;
+            mfq_tensor_backend::Tensor length;
             if (tokens == 1 && seq_len.has_value()) {
                 length = seq_len.value().contiguous();
             } else {
-                length = torch::full(
+                length = mfq_tensor_backend::full(
                     {batch}, absolute_length,
-                    torch::TensorOptions()
-                        .device(torch::kCUDA).dtype(torch::kInt64));
+                    mfq_tensor_backend::TensorOptions()
+                        .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt64));
             }
             if (compress_ratio > 0) {
                 g_profiler.measure("dsv4.compressor_update", [&]() {
@@ -14963,9 +14951,9 @@ struct Dsv4Block : Block {
 
             const int64_t visible = compress_ratio > 0
                 ? absolute_length / compress_ratio : 0;
-            torch::Tensor selected;
-            auto int_options = torch::TensorOptions()
-                .device(torch::kCUDA).dtype(torch::kInt32);
+            mfq_tensor_backend::Tensor selected;
+            auto int_options = mfq_tensor_backend::TensorOptions()
+                .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt32);
             if (compress_ratio == 4 && visible > 512) {
                 auto qr_token = qr.reshape(
                     {batch, tokens, qr.size(-1)})
@@ -14983,20 +14971,20 @@ struct Dsv4Block : Block {
                     .transpose(1, 2).contiguous();
                 index_query = nepq_hadamard_input_cuda(
                     index_query.reshape({batch * heads, 128})
-                        .to(torch::kFloat16).contiguous(),
+                        .to(mfq_tensor_backend::kFloat16).contiguous(),
                     shared_state->hadamard_signs, 128)
                     .reshape({batch, 1, heads, 128});
                 index_query = dsv4_fp4_sim_cuda(
                     index_query.contiguous());
                 auto weights = g_profiler.measure(
                     "dsv4.indexer_weight", [&]() {
-                        return torch::matmul(
+                        return mfq_tensor_backend::matmul(
                             x.narrow(1, token, 1)
                                 .reshape({batch, hidden_size})
-                                .to(torch::kFloat32),
+                                .to(mfq_tensor_backend::kFloat32),
                             indexer_weight.transpose(0, 1))
                             .reshape({batch, 1, heads})
-                            .to(torch::kFloat16).contiguous();
+                            .to(mfq_tensor_backend::kFloat16).contiguous();
                     });
                 auto scores = g_profiler.measure(
                     "dsv4.indexer_scores", [&]() {
@@ -15011,7 +14999,7 @@ struct Dsv4Block : Block {
                         return dsv4_topk512_cuda(scores);
                     });
             } else {
-                selected = torch::arange(visible, int_options)
+                selected = mfq_tensor_backend::arange(visible, int_options)
                     .reshape({1, 1, visible})
                     .expand({batch, 1, visible}).contiguous();
             }
@@ -15024,7 +15012,7 @@ struct Dsv4Block : Block {
             });
             auto cache = g_profiler.measure("dsv4.attention_cache", [&]() {
                 return visible > 0
-                    ? torch::cat({
+                    ? mfq_tensor_backend::cat({
                         local_cache,
                         compressor.pool.narrow(1, 0, visible)}, 1)
                         .contiguous()
@@ -15047,18 +15035,18 @@ struct Dsv4Block : Block {
                 });
             outputs.push_back(output_projection(attention));
         }
-        return torch::cat(outputs, 1);
+        return mfq_tensor_backend::cat(outputs, 1);
     }
 
-    torch::Tensor forward(
-        torch::Tensor x,
-        torch::Tensor pos,
+    mfq_tensor_backend::Tensor forward(
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor pos,
         int64_t cache_pos,
-        const c10::optional<torch::Tensor> & seq_len,
+        const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
         const Config &,
         const RopeCache &,
-        const c10::optional<torch::Tensor> & cache_positions = c10::nullopt,
-        const c10::optional<torch::Tensor> & attention_mask = c10::nullopt) override {
+        const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
+        const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override {
         (void)cache_positions;
         (void)attention_mask;
         if (!current_ids.defined()) {
@@ -15075,10 +15063,10 @@ struct Dsv4Block : Block {
         auto normalized = g_profiler.measure("dsv4.attn_norm", [&]() {
             return rms_norm_cuda(
                 pre.at(0).reshape({batch * tokens, hidden_size})
-                    .to(torch::kFloat32),
+                    .to(mfq_tensor_backend::kFloat32),
                 attn_norm, eps)
                 .reshape({batch, tokens, hidden_size})
-                .to(torch::kFloat16);
+                .to(mfq_tensor_backend::kFloat16);
         });
         auto attention = attention_forward(
             normalized, pos, cache_pos, seq_len);
@@ -15095,10 +15083,10 @@ struct Dsv4Block : Block {
         normalized = g_profiler.measure("dsv4.ffn_norm", [&]() {
             return rms_norm_cuda(
                 pre.at(0).reshape({batch * tokens, hidden_size})
-                    .to(torch::kFloat32),
+                    .to(mfq_tensor_backend::kFloat32),
                 ffn_norm, eps)
                 .reshape({batch, tokens, hidden_size})
-                .to(torch::kFloat16);
+                .to(mfq_tensor_backend::kFloat16);
         });
         auto feed_forward = ffn.forward(
             normalized.reshape({batch * tokens, hidden_size}),
@@ -15113,18 +15101,18 @@ struct Dsv4Block : Block {
 };
 
 struct GlmDsaSharedState {
-    torch::Tensor topk_indices;
+    mfq_tensor_backend::Tensor topk_indices;
     int64_t dense_prefix_rows = 0;
     std::unordered_map<int64_t, MoeRoutePlan> head_routes;
     MoeRoutePlan transient_head_route;
     int64_t transient_head_route_key = -1;
-    torch::Tensor dense_mask;
-    torch::Tensor decode_mask;
-    torch::Tensor kv_max;
-    torch::Tensor attention_meta;
+    mfq_tensor_backend::Tensor dense_mask;
+    mfq_tensor_backend::Tensor decode_mask;
+    mfq_tensor_backend::Tensor kv_max;
+    mfq_tensor_backend::Tensor attention_meta;
 
     void reset() {
-        topk_indices = torch::Tensor();
+        topk_indices = mfq_tensor_backend::Tensor();
         dense_prefix_rows = 0;
     }
 
@@ -15132,9 +15120,9 @@ struct GlmDsaSharedState {
         const int64_t key = rows * 4096 + heads;
         if (rows != heads) {
             if (transient_head_route_key != key) {
-                auto options = torch::TensorOptions()
-                    .device(torch::kCUDA).dtype(torch::kInt32);
-                auto ids = torch::remainder(torch::arange(rows, options), heads)
+                auto options = mfq_tensor_backend::TensorOptions()
+                    .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt32);
+                auto ids = mfq_tensor_backend::remainder(mfq_tensor_backend::arange(rows, options), heads)
                     .reshape({rows, 1}).contiguous();
                 transient_head_route = build_moe_route_plan(ids, heads);
                 transient_head_route_key = key;
@@ -15143,9 +15131,9 @@ struct GlmDsaSharedState {
         }
         auto found = head_routes.find(key);
         if (found != head_routes.end()) return found->second;
-        auto options = torch::TensorOptions()
-            .device(torch::kCUDA).dtype(torch::kInt32);
-        auto ids = torch::remainder(torch::arange(rows, options), heads)
+        auto options = mfq_tensor_backend::TensorOptions()
+            .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt32);
+        auto ids = mfq_tensor_backend::remainder(mfq_tensor_backend::arange(rows, options), heads)
             .reshape({rows, 1}).contiguous();
         return head_routes.emplace(
             key, build_moe_route_plan(ids, heads)).first->second;
@@ -15153,37 +15141,37 @@ struct GlmDsaSharedState {
 
     void ensure_meta() {
         constexpr int64_t kMetaFloats = 8 * 1024 * 1024;
-        auto cuda = torch::TensorOptions().device(torch::kCUDA);
+        auto cuda = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA);
         if (!attention_meta.defined() || attention_meta.numel() < kMetaFloats) {
-            attention_meta = torch::empty(
-                {kMetaFloats}, cuda.dtype(torch::kFloat32));
+            attention_meta = mfq_tensor_backend::empty(
+                {kMetaFloats}, cuda.dtype(mfq_tensor_backend::kFloat32));
         }
     }
 
     void ensure_dense_workspace(int64_t B, int64_t M, int64_t logical_len) {
         const int64_t stride = (logical_len + 63) / 64 * 64;
-        auto cuda = torch::TensorOptions().device(torch::kCUDA);
+        auto cuda = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA);
         if (!dense_mask.defined() || dense_mask.size(0) < M ||
             dense_mask.size(1) < stride) {
-            dense_mask = torch::empty(
-                {M, stride}, cuda.dtype(torch::kFloat16));
+            dense_mask = mfq_tensor_backend::empty(
+                {M, stride}, cuda.dtype(mfq_tensor_backend::kFloat16));
         }
         if (!kv_max.defined() || kv_max.numel() < B * M) {
-            kv_max = torch::empty({B * M}, cuda.dtype(torch::kInt32));
+            kv_max = mfq_tensor_backend::empty({B * M}, cuda.dtype(mfq_tensor_backend::kInt32));
         }
         ensure_meta();
     }
 
     void ensure_decode_workspace(int64_t B, int64_t planned_len) {
         const int64_t stride = (planned_len + 63) / 64 * 64;
-        auto cuda = torch::TensorOptions().device(torch::kCUDA);
+        auto cuda = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA);
         if (!decode_mask.defined() || decode_mask.size(0) != B ||
             decode_mask.size(1) < stride) {
-            decode_mask = torch::empty(
-                {B, stride}, cuda.dtype(torch::kFloat16));
+            decode_mask = mfq_tensor_backend::empty(
+                {B, stride}, cuda.dtype(mfq_tensor_backend::kFloat16));
         }
         if (!kv_max.defined() || kv_max.numel() < B) {
-            kv_max = torch::empty({B}, cuda.dtype(torch::kInt32));
+            kv_max = mfq_tensor_backend::empty({B}, cuda.dtype(mfq_tensor_backend::kInt32));
         }
         ensure_meta();
     }
@@ -15202,45 +15190,45 @@ struct FullBlock : Block {
     int64_t attention_window = 0;
     double attention_scale = 0.0;
     RopeCache attention_rope;
-    torch::Tensor attn_norm, ffn_norm, q_norm, k_norm;
-    torch::Tensor v_norm, attn_post_norm;
-    torch::Tensor ffn_post_norm, ffn_post_norm_1, ffn_pre_norm_2, ffn_post_norm_2;
-    torch::Tensor layer_scale;
+    mfq_tensor_backend::Tensor attn_norm, ffn_norm, q_norm, k_norm;
+    mfq_tensor_backend::Tensor v_norm, attn_post_norm;
+    mfq_tensor_backend::Tensor ffn_post_norm, ffn_post_norm_1, ffn_pre_norm_2, ffn_post_norm_2;
+    mfq_tensor_backend::Tensor layer_scale;
     QuantLinearGroup qkv;
     QuantLinear o;
     FFN ffn;
     NintMoeWeight gemma_moe_gate_up;
     NintMoeWeight gemma_moe_down;
-    torch::Tensor gemma_router;
-    torch::Tensor gemma_router_norm_scale;
-    torch::Tensor gemma_expert_scale;
+    mfq_tensor_backend::Tensor gemma_router;
+    mfq_tensor_backend::Tensor gemma_router_norm_scale;
+    mfq_tensor_backend::Tensor gemma_expert_scale;
     int gemma_top_k = 0;
     KVCache cache;
-    torch::Tensor decode_partial_o, decode_partial_m, decode_partial_l;
-    torch::Tensor decode_llama_mask, decode_llama_kv_max, decode_llama_meta;
+    mfq_tensor_backend::Tensor decode_partial_o, decode_partial_m, decode_partial_l;
+    mfq_tensor_backend::Tensor decode_llama_mask, decode_llama_kv_max, decode_llama_meta;
 
     static constexpr int64_t kDecodeAttentionMaxParts = 16;
 
     void reset(int64_t B) override {
         if (cache.k.defined() && cache.k.size(0) == B) return;
         cache = KVCache();
-        decode_partial_o = torch::Tensor();
-        decode_partial_m = torch::Tensor();
-        decode_partial_l = torch::Tensor();
-        decode_llama_mask = torch::Tensor();
-        decode_llama_kv_max = torch::Tensor();
-        decode_llama_meta = torch::Tensor();
+        decode_partial_o = mfq_tensor_backend::Tensor();
+        decode_partial_m = mfq_tensor_backend::Tensor();
+        decode_partial_l = mfq_tensor_backend::Tensor();
+        decode_llama_mask = mfq_tensor_backend::Tensor();
+        decode_llama_kv_max = mfq_tensor_backend::Tensor();
+        decode_llama_meta = mfq_tensor_backend::Tensor();
     }
 
-    torch::Tensor forward(torch::Tensor x, torch::Tensor pos, int64_t cache_pos,
-                          const c10::optional<torch::Tensor> & seq_len,
+    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, int64_t cache_pos,
+                          const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
                           const Config & c, const RopeCache & rope,
-                          const c10::optional<torch::Tensor> & cache_positions = c10::nullopt,
-                          const c10::optional<torch::Tensor> & attention_mask = c10::nullopt) override {
+                          const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
+                          const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override {
         int64_t B = x.size(0), T = x.size(1), H = x.size(2);
         const bool official_bf16 = c.uses_minicpmo45_bf16_graph();
-        if (official_bf16 && x.scalar_type() != torch::kBFloat16) {
-            x = x.to(torch::kBFloat16).contiguous();
+        if (official_bf16 && x.scalar_type() != mfq_tensor_backend::kBFloat16) {
+            x = x.to(mfq_tensor_backend::kBFloat16).contiguous();
         }
         const int64_t nh = attention_heads > 0 ? attention_heads : c.num_attention_heads;
         const int64_t nkh = kv_heads > 0 ? kv_heads : c.num_key_value_heads;
@@ -15256,13 +15244,13 @@ struct FullBlock : Block {
         if (!cache.k.defined() || cache.k.numel() == 0) {
             cache = KVCache(
                 B, nkh, cache_capacity, hd, sliding, x.device(),
-                official_bf16 ? torch::kBFloat16 : torch::kFloat16);
+                official_bf16 ? mfq_tensor_backend::kBFloat16 : mfq_tensor_backend::kFloat16);
             if (x.is_cuda()) {
                 const int64_t total = B * nh;
-                auto opts = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
-                decode_partial_o = torch::empty({total, kDecodeAttentionMaxParts, hd}, opts);
-                decode_partial_m = torch::empty({total, kDecodeAttentionMaxParts}, opts);
-                decode_partial_l = torch::empty({total, kDecodeAttentionMaxParts}, opts);
+                auto opts = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32);
+                decode_partial_o = mfq_tensor_backend::empty({total, kDecodeAttentionMaxParts, hd}, opts);
+                decode_partial_m = mfq_tensor_backend::empty({total, kDecodeAttentionMaxParts}, opts);
+                decode_partial_l = mfq_tensor_backend::empty({total, kDecodeAttentionMaxParts}, opts);
             }
         }
         auto residual = x;
@@ -15272,7 +15260,7 @@ struct FullBlock : Block {
                     x.reshape({B * T, H}), attn_norm, c)
                     .reshape({B, T, H})
                 : qwen_rms_norm(
-                    x.reshape({B * T, H}).to(torch::kFloat32), attn_norm, c)
+                    x.reshape({B * T, H}).to(mfq_tensor_backend::kFloat32), attn_norm, c)
                     .reshape({B, T, H});
         });
         auto parts = g_profiler.measure("full.qkv", [&]() { return qkv.forward(xn); });
@@ -15282,11 +15270,11 @@ struct FullBlock : Block {
         auto q_full = parts[0], k_full = parts[1];
         auto v_full = value_equals_key ? k_full : parts[2];
         if (official_bf16) {
-            q_full = q_full.to(torch::kBFloat16).contiguous();
-            k_full = k_full.to(torch::kBFloat16).contiguous();
-            v_full = v_full.to(torch::kBFloat16).contiguous();
+            q_full = q_full.to(mfq_tensor_backend::kBFloat16).contiguous();
+            k_full = k_full.to(mfq_tensor_backend::kBFloat16).contiguous();
+            v_full = v_full.to(mfq_tensor_backend::kBFloat16).contiguous();
         }
-        torch::Tensor q_raw, q_gate;
+        mfq_tensor_backend::Tensor q_raw, q_gate;
         g_profiler.measure("full.qkv_view", [&]() {
             if (c.qwen35_attn_q_gate) {
             auto qp = q_full.reshape({B, T, nh, hd * 2});
@@ -15302,8 +15290,8 @@ struct FullBlock : Block {
         auto k = g_profiler.measure("full.k_view", [&]() { return k_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous(); });
         auto v = g_profiler.measure("full.v_view", [&]() { return v_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous(); });
         auto write_positions = cache_positions.has_value()
-            ? cache_positions.value().to(x.device(), torch::kInt64).contiguous()
-            : pos.to(x.device(), torch::kInt64).contiguous();
+            ? cache_positions.value().to(x.device(), mfq_tensor_backend::kInt64).contiguous()
+            : pos.to(x.device(), mfq_tensor_backend::kInt64).contiguous();
         if (write_positions.dim() != 1 || write_positions.numel() != T) {
             throw std::runtime_error(
                 "KV cache positions must have shape [tokens]");
@@ -15315,16 +15303,16 @@ struct FullBlock : Block {
             q_norm.defined() && k_norm.defined() &&
             active_rope.rotary_dim == 128 &&
             active_rope.sections.numel() == 0 && nh == 32 && nkh == 8 &&
-            hd == 128 && cache.k.scalar_type() == torch::kBFloat16 &&
+            hd == 128 && cache.k.scalar_type() == mfq_tensor_backend::kBFloat16 &&
             (fused_qk_rope_kv_env == nullptr ||
              fused_qk_rope_kv_env[0] != '0');
-        std::pair<torch::Tensor, torch::Tensor> kv;
+        std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> kv;
         if (fused_qk_rope_kv) {
             q = g_profiler.measure("full.qk_norm_rope_kv_write", [&]() {
                 return minicpm_qk_norm_rope_cache_write_bf16_cuda(
                     q.contiguous(), k.contiguous(), v.contiguous(),
                     q_norm, k_norm,
-                    pos.contiguous().to(x.device(), torch::kInt64),
+                    pos.contiguous().to(x.device(), mfq_tensor_backend::kInt64),
                     write_positions, active_rope.cos, active_rope.sin,
                     cache.k, cache.v, c.rms_norm_eps,
                     c.norm_weight_offset);
@@ -15339,8 +15327,8 @@ struct FullBlock : Block {
             (fused_bf16_norm_env == nullptr ||
              fused_bf16_norm_env[0] != '0');
         if (fused_bf16_norm && q_norm.defined() && k_norm.defined() &&
-                q.scalar_type() == torch::kBFloat16 &&
-                k.scalar_type() == torch::kBFloat16) {
+                q.scalar_type() == mfq_tensor_backend::kBFloat16 &&
+                k.scalar_type() == mfq_tensor_backend::kBFloat16) {
             auto normalized = g_profiler.measure("full.qk_norm", [&]() {
                 return qwen_rms_norm_pair_bf16_cuda(
                     q, k, q_norm, k_norm,
@@ -15349,8 +15337,8 @@ struct FullBlock : Block {
             q = normalized[0].reshape_as(q);
             k = normalized[1].reshape_as(k);
         } else if (!official_bf16 && q_norm.defined() && k_norm.defined() &&
-            q.scalar_type() == torch::kFloat16 &&
-            k.scalar_type() == torch::kFloat16) {
+            q.scalar_type() == mfq_tensor_backend::kFloat16 &&
+            k.scalar_type() == mfq_tensor_backend::kFloat16) {
             auto normalized = g_profiler.measure("full.qk_norm", [&]() {
                 return rms_norm_pair_f16_f32_offset_cuda(
                     q, k, q_norm, k_norm,
@@ -15364,7 +15352,7 @@ struct FullBlock : Block {
                     ? qwen_rms_norm_bf16(
                         q.reshape({-1, hd}), q_norm, c).reshape_as(q)
                     : qwen_rms_norm(
-                        q.reshape({-1, hd}).to(torch::kFloat32), q_norm, c)
+                        q.reshape({-1, hd}).to(mfq_tensor_backend::kFloat32), q_norm, c)
                         .reshape_as(q);
             });
             if (k_norm.defined()) k = g_profiler.measure("full.k_norm", [&]() {
@@ -15372,7 +15360,7 @@ struct FullBlock : Block {
                     ? qwen_rms_norm_bf16(
                         k.reshape({-1, hd}), k_norm, c).reshape_as(k)
                     : qwen_rms_norm(
-                        k.reshape({-1, hd}).to(torch::kFloat32), k_norm, c)
+                        k.reshape({-1, hd}).to(mfq_tensor_backend::kFloat32), k_norm, c)
                         .reshape_as(k);
             });
         }
@@ -15381,7 +15369,7 @@ struct FullBlock : Block {
                 ? qwen_rms_norm_bf16(
                     v.reshape({-1, hd}), v_norm, c).reshape_as(v)
                 : qwen_rms_norm(
-                    v.reshape({-1, hd}).to(torch::kFloat32), v_norm, c)
+                    v.reshape({-1, hd}).to(mfq_tensor_backend::kFloat32), v_norm, c)
                     .reshape_as(v);
         });
         const char * fused_rope_kv_env =
@@ -15389,13 +15377,13 @@ struct FullBlock : Block {
         const bool fused_rope_kv = official_bf16 && x.is_cuda() &&
             T == 1 && !cache.ring && active_rope.rotary_dim == 128 &&
             active_rope.sections.numel() == 0 && nh == 32 && nkh == 8 &&
-            hd == 128 && cache.k.scalar_type() == torch::kBFloat16 &&
+            hd == 128 && cache.k.scalar_type() == mfq_tensor_backend::kBFloat16 &&
             (fused_rope_kv_env == nullptr || fused_rope_kv_env[0] != '0');
         if (fused_rope_kv) {
             q = g_profiler.measure("full.rope_kv_write", [&]() {
                 return minicpm_bf16_rope_cache_write_cuda(
                     q.contiguous(), k.contiguous(), v.contiguous(),
-                    pos.contiguous().to(x.device(), torch::kInt64),
+                    pos.contiguous().to(x.device(), mfq_tensor_backend::kInt64),
                     write_positions, active_rope.cos, active_rope.sin,
                     cache.k, cache.v, active_rope.rotary_dim);
             });
@@ -15421,23 +15409,23 @@ struct FullBlock : Block {
         }
         auto minicpmo45_attention_mask = [&](int64_t visible_len,
                                               bool explicit_causal) {
-            c10::optional<torch::Tensor> result = c10::nullopt;
+            MfqOptional<mfq_tensor_backend::Tensor> result = mfq_nullopt;
             if (!official_bf16 ||
                     (!explicit_causal && !seq_len.has_value() &&
                      !attention_mask.has_value())) {
                 return result;
             }
-            auto options = torch::TensorOptions()
-                .device(x.device()).dtype(torch::kInt64);
-            auto key_positions = torch::arange(visible_len, options);
+            auto options = mfq_tensor_backend::TensorOptions()
+                .device(x.device()).dtype(mfq_tensor_backend::kInt64);
+            auto key_positions = mfq_tensor_backend::arange(visible_len, options);
             auto query_positions = write_positions
-                .to(x.device(), torch::kInt64)
+                .to(x.device(), mfq_tensor_backend::kInt64)
                 .reshape({1, T}).expand({B, T});
             auto allowed = key_positions.reshape({1, 1, visible_len}) <=
                 query_positions.unsqueeze(-1);
             if (seq_len.has_value()) {
                 auto lengths = seq_len.value()
-                    .to(x.device(), torch::kInt64).reshape({B, 1, 1});
+                    .to(x.device(), mfq_tensor_backend::kInt64).reshape({B, 1, 1});
                 allowed = allowed &
                     (key_positions.reshape({1, 1, visible_len}) < lengths);
             }
@@ -15451,17 +15439,17 @@ struct FullBlock : Block {
                 valid = valid.narrow(1, 0, visible_len).ne(0);
                 allowed = allowed & valid.unsqueeze(1);
                 auto attended = allowed.any(-1, true);
-                allowed = torch::where(
-                    attended, allowed, torch::ones_like(allowed));
+                allowed = mfq_tensor_backend::where(
+                    attended, allowed, mfq_tensor_backend::ones_like(allowed));
             }
             const auto mask_dtype = official_bf16
-                ? torch::kBFloat16 : x.scalar_type();
-            auto additive = torch::zeros(
+                ? mfq_tensor_backend::kBFloat16 : x.scalar_type();
+            auto additive = mfq_tensor_backend::zeros(
                 {B, 1, T, visible_len},
-                torch::TensorOptions().device(x.device())
+                mfq_tensor_backend::TensorOptions().device(x.device())
                     .dtype(mask_dtype));
             const double mask_min = static_cast<double>(
-                std::numeric_limits<c10::BFloat16>::lowest());
+                std::numeric_limits<mfq_bfloat16>::lowest());
             additive.masked_fill_(
                 allowed.logical_not().unsqueeze(1),
                 mask_min);
@@ -15469,55 +15457,55 @@ struct FullBlock : Block {
             return result;
         };
         double attn_scale = attention_scale > 0.0 ? attention_scale : 1.0 / std::sqrt((double)hd);
-        torch::Tensor a;
+        mfq_tensor_backend::Tensor a;
         bool attention_token_major = false;
         a = g_profiler.measure("full.attention", [&]() {
             if (!x.is_cuda()) {
-                TORCH_CHECK(!sliding, "CPU dense offload does not support sliding attention");
+                MFQ_RUNTIME_CHECK(!sliding, "CPU dense offload does not support sliding attention");
                 const auto cpu_attention_dtype = official_bf16
-                    ? torch::kBFloat16 : torch::kFloat32;
+                    ? mfq_tensor_backend::kBFloat16 : mfq_tensor_backend::kFloat32;
                 auto qh = q.to(cpu_attention_dtype).contiguous();
                 auto kh = kv.first.to(cpu_attention_dtype).contiguous();
                 auto vh = kv.second.to(cpu_attention_dtype).contiguous();
                 if (nkh != nh) {
-                    TORCH_CHECK(nh % nkh == 0, "CPU attention head ratio is invalid");
+                    MFQ_RUNTIME_CHECK(nh % nkh == 0, "CPU attention head ratio is invalid");
                     const int64_t repeat = nh / nkh;
                     kh = kh.repeat_interleave(repeat, 1);
                     vh = vh.repeat_interleave(repeat, 1);
                 }
-                c10::optional<torch::Tensor> mask = c10::nullopt;
+                MfqOptional<mfq_tensor_backend::Tensor> mask = mfq_nullopt;
                 if (official_bf16) {
                     mask = minicpmo45_attention_mask(
                         kh.size(2), T > 1);
                 } else if (T > 1 || seq_len.has_value()) {
                     const int64_t visible = kh.size(2);
-                    auto key_positions = torch::arange(
+                    auto key_positions = mfq_tensor_backend::arange(
                         visible,
-                        torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt64));
-                    torch::Tensor allowed;
+                        mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kInt64));
+                    mfq_tensor_backend::Tensor allowed;
                     if (T > 1) {
                         auto query_positions = pos.dim() == 1
-                            ? pos.to(torch::kCPU, torch::kInt64)
-                            : pos.select(0, 0).to(torch::kCPU, torch::kInt64);
+                            ? pos.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64)
+                            : pos.select(0, 0).to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64);
                         allowed = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1);
                         allowed = allowed.unsqueeze(0).expand({B, T, visible});
                     } else {
-                        allowed = torch::ones(
+                        allowed = mfq_tensor_backend::ones(
                             {B, T, visible},
-                            torch::TensorOptions().device(torch::kCPU).dtype(torch::kBool));
+                            mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kBool));
                     }
                     if (seq_len.has_value()) {
-                        auto lengths = seq_len.value().to(torch::kCPU, torch::kInt64)
+                        auto lengths = seq_len.value().to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64)
                             .reshape({B, 1, 1});
                         allowed = allowed & (key_positions.reshape({1, 1, visible}) < lengths);
                     }
                     mask = allowed.unsqueeze(1);
                 }
-                return at::scaled_dot_product_attention(
+                return mfq_scaled_dot_product_attention(
                     qh, kh, vh, mask, 0.0, false, attn_scale, false);
             }
             const auto attention_dtype = official_bf16
-                ? torch::kBFloat16 : torch::kFloat16;
+                ? mfq_tensor_backend::kBFloat16 : mfq_tensor_backend::kFloat16;
             auto qh = q.to(attention_dtype).contiguous();
             auto kh = k.to(attention_dtype).contiguous();
             auto vh = v.to(attention_dtype).contiguous();
@@ -15526,7 +15514,7 @@ struct FullBlock : Block {
                     auto repeated_k = kh;
                     auto repeated_v = vh;
                     if (nkh != nh) {
-                        TORCH_CHECK(
+                        MFQ_RUNTIME_CHECK(
                             nh % nkh == 0,
                             "MiniCPM-o Qwen3 attention head ratio is invalid");
                         const int64_t repeat = nh / nkh;
@@ -15534,7 +15522,7 @@ struct FullBlock : Block {
                         repeated_v = vh.repeat_interleave(repeat, 1).contiguous();
                     }
                     auto mask = minicpmo45_attention_mask(T, false);
-                    a = at::scaled_dot_product_attention(
+                    a = mfq_scaled_dot_product_attention(
                         qh, repeated_k, repeated_v, mask,
                         0.0, !mask.has_value(), attn_scale, false);
                 } else {
@@ -15544,23 +15532,23 @@ struct FullBlock : Block {
                 if (!sliding && T % 256 == 0 && hd == 512 && nh == 8 * nkh &&
                     llama_flash_enabled) {
                     a = attention_llama_flash512_cuda(
-                        q.to(torch::kFloat32).contiguous(), kh, vh, attn_scale);
+                        q.to(mfq_tensor_backend::kFloat32).contiguous(), kh, vh, attn_scale);
                     attention_token_major = true;
                 } else if (sliding && T >= 32 && hd == 256 && nh == 2 * nkh &&
                     llama_flash_enabled) {
                     a = attention_llama_flash256_swa_cuda(
-                        q.to(torch::kFloat32).contiguous(), kh, vh,
+                        q.to(mfq_tensor_backend::kFloat32).contiguous(), kh, vh,
                         attn_scale, attention_window);
                     attention_token_major = true;
                 } else if (!sliding && T >= 32 && hd == 256 && nh == 4 * nkh &&
                            llama_flash_enabled) {
                     a = attention_llama_flash256_cuda(
-                        q.to(torch::kFloat32).contiguous(), kh, vh, attn_scale);
+                        q.to(mfq_tensor_backend::kFloat32).contiguous(), kh, vh, attn_scale);
                     attention_token_major = true;
                 } else if (sliding) {
                     a = attention_swa_cuda(qh, kh, vh, attn_scale, attention_window);
                 } else {
-                    a = at::scaled_dot_product_attention(
+                    a = mfq_scaled_dot_product_attention(
                         qh, kh, vh, std::nullopt, 0.0, true, attn_scale, true);
                 }
                 }
@@ -15581,18 +15569,18 @@ struct FullBlock : Block {
                     const int64_t ntiles_kv = (visible_len + kv_tile - 1) / kv_tile;
                     const int64_t max_blocks = B * nkh * ntiles_kv;
                     const int64_t meta_float2 = max_blocks * 8 * (2 + hd / 2);
-                    auto cuda = torch::TensorOptions().device(torch::kCUDA);
+                    auto cuda = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA);
                     if (!decode_llama_mask.defined() || decode_llama_mask.size(0) != B ||
                         decode_llama_mask.size(1) < mask_stride) {
-                        decode_llama_mask = torch::empty(
-                            {B, mask_stride}, cuda.dtype(torch::kFloat16));
+                        decode_llama_mask = mfq_tensor_backend::empty(
+                            {B, mask_stride}, cuda.dtype(mfq_tensor_backend::kFloat16));
                     }
                     if (!decode_llama_kv_max.defined() || decode_llama_kv_max.numel() < B) {
-                        decode_llama_kv_max = torch::empty({B}, cuda.dtype(torch::kInt32));
+                        decode_llama_kv_max = mfq_tensor_backend::empty({B}, cuda.dtype(mfq_tensor_backend::kInt32));
                     }
                     if (!decode_llama_meta.defined() || decode_llama_meta.numel() < 2 * meta_float2) {
-                        decode_llama_meta = torch::empty(
-                            {2 * meta_float2}, cuda.dtype(torch::kFloat32));
+                        decode_llama_meta = mfq_tensor_backend::empty(
+                            {2 * meta_float2}, cuda.dtype(mfq_tensor_backend::kFloat32));
                     }
                 };
                 if (aten_decode_enabled) {
@@ -15606,21 +15594,21 @@ struct FullBlock : Block {
                     auto mask = minicpmo45_attention_mask(
                         visible_len, cache_pos > 0 && T > 1);
                     if (official_bf16 && nkh != nh) {
-                        TORCH_CHECK(
+                        MFQ_RUNTIME_CHECK(
                             nh % nkh == 0,
                             "MiniCPM-o Qwen3 attention head ratio is invalid");
                         const int64_t repeat = nh / nkh;
                         cached_k = cached_k.repeat_interleave(repeat, 1).contiguous();
                         cached_v = cached_v.repeat_interleave(repeat, 1).contiguous();
                     }
-                    a = at::scaled_dot_product_attention(
+                    a = mfq_scaled_dot_product_attention(
                         qh, cached_k, cached_v, mask,
                         0.0, false, attn_scale, !official_bf16);
                 } else if (sliding && T == 1 && llama_decode_enabled && hd == 256 && nh == 2 * nkh) {
                     const int64_t visible_len = std::min<int64_t>(attention_window, planned_len);
                     prepare_llama_decode_workspace(visible_len, 64);
                     a = attention_llama_flash256_swa_decode_cuda(
-                        q.to(torch::kFloat32).contiguous(), cache.k, cache.v,
+                        q.to(mfq_tensor_backend::kFloat32).contiguous(), cache.k, cache.v,
                         seq_len.value(), attn_scale, visible_len,
                         decode_llama_mask, decode_llama_kv_max, decode_llama_meta);
                     attention_token_major = true;
@@ -15630,11 +15618,11 @@ struct FullBlock : Block {
                     prepare_llama_decode_workspace(planned_len, kv_tile);
                     a = hd == 512
                         ? attention_llama_flash512_decode_cuda(
-                            q.to(torch::kFloat32).contiguous(), cache.k, cache.v,
+                            q.to(mfq_tensor_backend::kFloat32).contiguous(), cache.k, cache.v,
                             seq_len.value(), attn_scale, planned_len,
                             decode_llama_mask, decode_llama_kv_max, decode_llama_meta)
                         : attention_llama_flash256_decode_cuda(
-                            q.to(torch::kFloat32).contiguous(), cache.k, cache.v,
+                            q.to(mfq_tensor_backend::kFloat32).contiguous(), cache.k, cache.v,
                             seq_len.value(), attn_scale, planned_len,
                             decode_llama_mask, decode_llama_kv_max, decode_llama_meta);
                     attention_token_major = true;
@@ -15664,7 +15652,7 @@ struct FullBlock : Block {
                     auto cached_k = kv.first.contiguous();
                     auto cached_v = kv.second.contiguous();
                     if (nkh != nh) {
-                        TORCH_CHECK(
+                        MFQ_RUNTIME_CHECK(
                             nh % nkh == 0,
                             "MiniCPM-o Qwen3 attention head ratio is invalid");
                         const int64_t repeat = nh / nkh;
@@ -15673,7 +15661,7 @@ struct FullBlock : Block {
                     }
                     auto mask = minicpmo45_attention_mask(
                         cached_k.size(2), cache_pos > 0 && T > 1);
-                    a = at::scaled_dot_product_attention(
+                    a = mfq_scaled_dot_product_attention(
                         qh, cached_k, cached_v, mask,
                         0.0, !mask.has_value() && cache_pos == 0 && T > 1,
                         attn_scale, false);
@@ -15689,7 +15677,7 @@ struct FullBlock : Block {
             }
             return a;
         });
-        torch::Tensor oo;
+        mfq_tensor_backend::Tensor oo;
         if (q_gate.defined()) {
             auto af = g_profiler.measure("full.attn_out_view", [&]() {
                 return attention_token_major ? a.reshape({B, T, attn_width}) :
@@ -15709,16 +15697,16 @@ struct FullBlock : Block {
             });
         }
         if (official_bf16) {
-            oo = oo.to(torch::kBFloat16).contiguous();
+            oo = oo.to(mfq_tensor_backend::kBFloat16).contiguous();
         }
         if (gemma4) {
             trace_gemma_stage(layer, "attention_output", oo);
             const bool fused_norms = gemma4_moe &&
                 gemma4_fused_norms_enabled() &&
                 g_gemma_stage_trace == nullptr && layer_scale.defined();
-            torch::Tensor dense_input;
-            torch::Tensor router_input;
-            torch::Tensor moe_input;
+            mfq_tensor_backend::Tensor dense_input;
+            mfq_tensor_backend::Tensor router_input;
+            mfq_tensor_backend::Tensor moe_input;
             if (fused_norms) {
                 auto prepared = g_profiler.measure("gemma.attn_residual_pre_norms", [&]() {
                     return gemma4_attn_residual_pre_norms_f16_cuda(
@@ -15748,7 +15736,7 @@ struct FullBlock : Block {
                 if (gemma4_moe) {
                     router_input = g_profiler.measure("gemma.router_norm", [&]() {
                         return qwen_rms_norm(
-                            x.reshape({B * T, H}).to(torch::kFloat32),
+                            x.reshape({B * T, H}).to(mfq_tensor_backend::kFloat32),
                             gemma_router_norm_scale, c);
                     });
                     moe_input = g_profiler.measure("gemma.ffn_pre_norm_2", [&]() {
@@ -15762,12 +15750,12 @@ struct FullBlock : Block {
             });
             if (!gemma4_moe) {
                 auto dense_post = g_profiler.measure("gemma.ffn_post_norm", [&]() {
-                    return dense_output.scalar_type() == torch::kFloat16
+                    return dense_output.scalar_type() == mfq_tensor_backend::kFloat16
                         ? gemma_rms_norm_f16(dense_output, ffn_post_norm, c)
                         : qwen_rms_norm(
-                            dense_output.to(torch::kFloat32),
+                            dense_output.to(mfq_tensor_backend::kFloat32),
                             ffn_post_norm, c)
-                            .to(torch::kFloat16)
+                            .to(mfq_tensor_backend::kFloat16)
                             .contiguous();
                 });
                 auto result = g_profiler.measure("gemma.ffn_residual", [&]() {
@@ -15791,12 +15779,12 @@ struct FullBlock : Block {
                 trace_gemma_stage(layer, "dense_output", dense_output);
             }
             auto router_logits = g_profiler.measure("gemma.router", [&]() {
-                return torch::matmul(router_input, gemma_router.transpose(0, 1));
+                return mfq_tensor_backend::matmul(router_input, gemma_router.transpose(0, 1));
             });
             auto selected = g_profiler.measure("gemma.topk", [&]() {
                 return moe_topk_cuda(
                     router_logits.contiguous(), gemma_top_k,
-                    false, false, false, true, c10::nullopt, 1e-20, 1.0);
+                    false, false, false, true, mfq_nullopt, 1e-20, 1.0);
             });
             trace_gemma_stage(layer, "route_ids", selected.at(0));
             trace_gemma_stage(layer, "route_weights_before_scale", selected.at(1));
@@ -15808,7 +15796,7 @@ struct FullBlock : Block {
             auto route = g_profiler.measure("gemma.route_map", [&]() {
                 return build_moe_route_plan(selected.at(0), gemma_moe_gate_up.n_experts);
             });
-            torch::Tensor down_pair;
+            mfq_tensor_backend::Tensor down_pair;
             const bool tracing_layer =
                 g_gemma_stage_trace != nullptr && layer == g_gemma_trace_layer;
             if (!tracing_layer && moe_input.dim() == 2 && moe_input.size(0) <= 4 &&
@@ -15880,37 +15868,37 @@ struct FullBlock : Block {
             auto rr = residual.reshape({-1, H});
             auto oo2 = oo.reshape({-1, H});
             if (!rr.is_cuda()) {
-                auto summed = (rr.to(torch::kFloat32) + oo2.to(torch::kFloat32))
+                auto summed = (rr.to(mfq_tensor_backend::kFloat32) + oo2.to(mfq_tensor_backend::kFloat32))
                     .to(rr.scalar_type()).contiguous();
                 auto normalized = official_bf16
                     ? qwen_rms_norm_bf16(summed, ffn_norm, c)
                     : qwen_rms_norm(
-                        summed.to(torch::kFloat32), ffn_norm, c);
-                return std::vector<torch::Tensor>{summed, normalized};
+                        summed.to(mfq_tensor_backend::kFloat32), ffn_norm, c);
+                return std::vector<mfq_tensor_backend::Tensor>{summed, normalized};
             }
             const char * fp32_residual_env =
                 std::getenv("MFQ_DIAGNOSTIC_FP32_RESIDUAL");
             if (fp32_residual_env != nullptr &&
                     fp32_residual_env[0] == '1') {
                 return acc_rms_norm_cuda(
-                    rr.to(torch::kFloat32),
-                    oo2.to(torch::kFloat32),
+                    rr.to(mfq_tensor_backend::kFloat32),
+                    oo2.to(mfq_tensor_backend::kFloat32),
                     ffn_norm, c.rms_norm_eps,
                     c.norm_weight_offset);
             }
-            if (rr.scalar_type() == torch::kFloat16 && oo2.scalar_type() == torch::kFloat16) {
+            if (rr.scalar_type() == mfq_tensor_backend::kFloat16 && oo2.scalar_type() == mfq_tensor_backend::kFloat16) {
                 return acc_rms_norm_f16_cuda(rr, oo2, ffn_norm, c.rms_norm_eps, c.norm_weight_offset);
             }
-            if (rr.scalar_type() == torch::kBFloat16 &&
-                    oo2.scalar_type() == torch::kBFloat16) {
+            if (rr.scalar_type() == mfq_tensor_backend::kBFloat16 &&
+                    oo2.scalar_type() == mfq_tensor_backend::kBFloat16) {
                 auto sum = (rr + oo2).contiguous();
                 auto norm = official_bf16
                     ? qwen_rms_norm_bf16(sum, ffn_norm, c)
                     : qwen_rms_norm(
-                        sum.to(torch::kFloat32), ffn_norm, c)
-                        .to(torch::kBFloat16)
+                        sum.to(mfq_tensor_backend::kFloat32), ffn_norm, c)
+                        .to(mfq_tensor_backend::kBFloat16)
                         .contiguous();
-                return std::vector<torch::Tensor>{sum, norm};
+                return std::vector<mfq_tensor_backend::Tensor>{sum, norm};
             }
             return acc_rms_norm_cuda(rr, oo2, ffn_norm, c.rms_norm_eps, c.norm_weight_offset);
         });
@@ -15927,17 +15915,17 @@ struct FullBlock : Block {
                 });
             }
         }
-        torch::Tensor ff;
+        mfq_tensor_backend::Tensor ff;
         if (official_bf16) {
             auto ffn_input = xn.reshape({B * T, H});
             auto gate_up = g_profiler.measure(
                 "full.minicpmo45_ffn_gate_up",
                 [&]() { return ffn.gate_up.forward(ffn_input); });
-            TORCH_CHECK(
+            MFQ_RUNTIME_CHECK(
                 gate_up.size() == 2,
                 "MiniCPM-o Qwen3 FFN requires separate Gate and Up outputs");
-            auto gate = gate_up[0].to(torch::kBFloat16).contiguous();
-            auto up = gate_up[1].to(torch::kBFloat16).contiguous();
+            auto gate = gate_up[0].to(mfq_tensor_backend::kBFloat16).contiguous();
+            auto up = gate_up[1].to(mfq_tensor_backend::kBFloat16).contiguous();
             auto activation = g_profiler.measure(
                 "full.minicpmo45_ffn_swiglu",
                 [&]() {
@@ -15946,7 +15934,7 @@ struct FullBlock : Block {
                     if (disabled == nullptr || disabled[0] != '1') {
                         return silu_mul_cuda(gate, up);
                     }
-                    return (torch::silu(gate) * up).contiguous();
+                    return (mfq_tensor_backend::silu(gate) * up).contiguous();
                 });
             ff = g_profiler.measure(
                 "full.minicpmo45_ffn_down",
@@ -15955,7 +15943,7 @@ struct FullBlock : Block {
                         activation);
                 })
                 .reshape({B, T, H})
-                .to(torch::kBFloat16)
+                .to(mfq_tensor_backend::kBFloat16)
                 .contiguous();
         } else {
             ff = ffn.forward(xn.reshape({B * T, H})).reshape({B, T, H});
@@ -15964,18 +15952,18 @@ struct FullBlock : Block {
             auto rr = residual.reshape({-1, H});
             auto ff2 = ff.reshape({-1, H});
             if (!rr.is_cuda()) {
-                return (rr.to(torch::kFloat32) + ff2.to(torch::kFloat32))
+                return (rr.to(mfq_tensor_backend::kFloat32) + ff2.to(mfq_tensor_backend::kFloat32))
                     .to(rr.scalar_type()).reshape({B, T, H}).contiguous();
             }
             const char * fp32_residual_env =
                 std::getenv("MFQ_DIAGNOSTIC_FP32_RESIDUAL");
             if (fp32_residual_env != nullptr &&
                     fp32_residual_env[0] == '1') {
-                rr = rr.to(torch::kFloat32);
-                ff2 = ff2.to(torch::kFloat32);
+                rr = rr.to(mfq_tensor_backend::kFloat32);
+                ff2 = ff2.to(mfq_tensor_backend::kFloat32);
             }
-            if (rr.scalar_type() == torch::kBFloat16 &&
-                    ff2.scalar_type() == torch::kBFloat16) {
+            if (rr.scalar_type() == mfq_tensor_backend::kBFloat16 &&
+                    ff2.scalar_type() == mfq_tensor_backend::kBFloat16) {
                 return (rr + ff2).contiguous().reshape({B, T, H});
             }
             return acc_cuda(rr, ff2).reshape({B, T, H});
@@ -15988,27 +15976,27 @@ struct GlmDsaBlock : Block {
     int layer = -1;
     bool full_indexer = false;
     std::shared_ptr<GlmDsaSharedState> shared_state;
-    torch::Tensor attn_norm, ffn_norm;
-    torch::Tensor q_a_norm, kv_a_norm;
-    torch::Tensor index_k_norm, index_k_bias;
+    mfq_tensor_backend::Tensor attn_norm, ffn_norm;
+    mfq_tensor_backend::Tensor q_a_norm, kv_a_norm;
+    mfq_tensor_backend::Tensor index_k_norm, index_k_bias;
     QuantLinearGroup input_proj;
     QuantLinearGroup q_proj;
     NintMoeWeight embed_q;
     NintMoeWeight unembed_out;
     QuantLinear o_proj;
     FFN ffn;
-    torch::Tensor kv_cache;
-    torch::Tensor index_cache;
+    mfq_tensor_backend::Tensor kv_cache;
+    mfq_tensor_backend::Tensor index_cache;
 
     void reset(int64_t B) override {
         shared_state->reset();
         if (kv_cache.defined() && kv_cache.size(0) == B) return;
-        kv_cache = torch::Tensor();
-        index_cache = torch::Tensor();
+        kv_cache = mfq_tensor_backend::Tensor();
+        index_cache = mfq_tensor_backend::Tensor();
     }
 
-    torch::Tensor headwise_project(
-        const NintMoeWeight & weight, torch::Tensor x,
+    mfq_tensor_backend::Tensor headwise_project(
+        const NintMoeWeight & weight, mfq_tensor_backend::Tensor x,
         int64_t B, int64_t T, int64_t heads) const {
         if (x.dim() != 4 || x.size(0) != B || x.size(1) != T ||
             x.size(2) != heads || x.size(3) != weight.neuron_len ||
@@ -16021,9 +16009,9 @@ struct GlmDsaBlock : Block {
         return y.reshape({B, T, heads, weight.out_per_expert});
     }
 
-    torch::Tensor dense_attention(
-        torch::Tensor q, int64_t logical_len, int64_t B,
-        const c10::optional<torch::Tensor> & seq_len,
+    mfq_tensor_backend::Tensor dense_attention(
+        mfq_tensor_backend::Tensor q, int64_t logical_len, int64_t B,
+        const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
         double scale) const {
         if (seq_len.has_value() && q.size(2) == 1 && B == 1) {
             const int64_t planned_len = g_decode_graph_attention_kv_len > 0
@@ -16041,13 +16029,13 @@ struct GlmDsaBlock : Block {
     }
 
     void update_indexer(
-        torch::Tensor index_q, torch::Tensor index_weights,
+        mfq_tensor_backend::Tensor index_q, mfq_tensor_backend::Tensor index_weights,
         int64_t B, int64_t T, int64_t cache_pos,
-        const c10::optional<torch::Tensor> & seq_len,
+        const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
         const Config & c) const {
         const int64_t logical_len = cache_pos + T;
         if (logical_len <= c.index_topk) {
-            shared_state->topk_indices = torch::Tensor();
+            shared_state->topk_indices = mfq_tensor_backend::Tensor();
             shared_state->dense_prefix_rows = T;
             return;
         }
@@ -16061,10 +16049,10 @@ struct GlmDsaBlock : Block {
                     seq_len.value(), planned_len);
             });
             auto selected = g_profiler.measure("glm.indexer_topk", [&]() {
-                return torch::topk(scores, c.index_topk, -1, true, false);
+                return mfq_tensor_backend::topk(scores, c.index_topk, -1, true, false);
             });
             shared_state->topk_indices =
-                std::get<1>(selected).to(torch::kInt32).contiguous();
+                std::get<1>(selected).to(mfq_tensor_backend::kInt32).contiguous();
             shared_state->dense_prefix_rows = 0;
             return;
         }
@@ -16073,13 +16061,13 @@ struct GlmDsaBlock : Block {
             0, std::min<int64_t>(T, c.index_topk - cache_pos));
         const int64_t sparse_rows = T - prefix_rows;
         if (sparse_rows <= 0) {
-            shared_state->topk_indices = torch::Tensor();
+            shared_state->topk_indices = mfq_tensor_backend::Tensor();
             shared_state->dense_prefix_rows = T;
             return;
         }
-        auto indices = torch::empty(
+        auto indices = mfq_tensor_backend::empty(
             {B, sparse_rows, c.index_topk},
-            torch::TensorOptions().device(torch::kCUDA).dtype(torch::kInt32));
+            mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt32));
         constexpr int64_t kMaxScoreElements = 32 * 1024 * 1024;
         int64_t rows_per_chunk = std::max<int64_t>(
             1, kMaxScoreElements / std::max<int64_t>(1, B * logical_len));
@@ -16095,21 +16083,21 @@ struct GlmDsaBlock : Block {
                     cache_pos + prefix_rows + start, logical_len);
             });
             auto selected = g_profiler.measure("glm.indexer_topk", [&]() {
-                return torch::topk(scores, c.index_topk, -1, true, false);
+                return mfq_tensor_backend::topk(scores, c.index_topk, -1, true, false);
             });
             indices.narrow(1, start, count).copy_(
-                std::get<1>(selected).to(torch::kInt32));
+                std::get<1>(selected).to(mfq_tensor_backend::kInt32));
         }
         shared_state->topk_indices = indices;
         shared_state->dense_prefix_rows = prefix_rows;
     }
 
-    torch::Tensor forward(
-        torch::Tensor x, torch::Tensor pos, int64_t cache_pos,
-        const c10::optional<torch::Tensor> & seq_len,
+    mfq_tensor_backend::Tensor forward(
+        mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, int64_t cache_pos,
+        const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
         const Config & c, const RopeCache & rope,
-        const c10::optional<torch::Tensor> & cache_positions = c10::nullopt,
-        const c10::optional<torch::Tensor> & attention_mask = c10::nullopt) override {
+        const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
+        const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override {
         (void)cache_positions;
         (void)attention_mask;
         const int64_t B = x.size(0);
@@ -16123,18 +16111,18 @@ struct GlmDsaBlock : Block {
         constexpr int64_t kValue = 256;
         const int64_t logical_len = cache_pos + T;
         if (!kv_cache.defined()) {
-            auto options = torch::TensorOptions()
-                .device(torch::kCUDA).dtype(torch::kFloat16);
-            kv_cache = torch::empty(
+            auto options = mfq_tensor_backend::TensorOptions()
+                .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat16);
+            kv_cache = mfq_tensor_backend::empty(
                 {B, 1, c.max_position_embeddings, kMlaWidth}, options);
             if (full_indexer) {
-                index_cache = torch::empty(
+                index_cache = mfq_tensor_backend::empty(
                     {B, c.max_position_embeddings, c.index_head_dim}, options);
             }
         }
 
-        auto residual = x.scalar_type() == torch::kFloat16
-            ? x.contiguous() : x.to(torch::kFloat16).contiguous();
+        auto residual = x.scalar_type() == mfq_tensor_backend::kFloat16
+            ? x.contiguous() : x.to(mfq_tensor_backend::kFloat16).contiguous();
         auto xn = g_profiler.measure("glm.attn_norm", [&]() {
             return rms_norm_f16_cuda(
                 residual.reshape({B * T, H}), attn_norm,
@@ -16149,7 +16137,7 @@ struct GlmDsaBlock : Block {
         }
         auto qr = g_profiler.measure("glm.q_a_norm", [&]() {
             return rms_norm_f16_cuda(
-                first[0].reshape({B * T, c.q_lora_rank}).to(torch::kFloat16).contiguous(),
+                first[0].reshape({B * T, c.q_lora_rank}).to(mfq_tensor_backend::kFloat16).contiguous(),
                 q_a_norm, 1e-6, 0.0).reshape({B, T, c.q_lora_rank});
         });
         auto second = g_profiler.measure("glm.q_proj", [&]() {
@@ -16160,7 +16148,7 @@ struct GlmDsaBlock : Block {
             throw std::runtime_error("GLM DSA q projection count mismatch");
         }
 
-        auto q_main = second[0].to(torch::kFloat16)
+        auto q_main = second[0].to(mfq_tensor_backend::kFloat16)
             .reshape({B, T, kHeads, kNope + kRope});
         auto q_nope = q_main.index({Slice(), Slice(), Slice(), Slice(0, kNope)})
             .contiguous();
@@ -16171,7 +16159,7 @@ struct GlmDsaBlock : Block {
                 q_pe, pos.contiguous(), rope.cos, rope.sin, kRope);
         });
 
-        auto compressed = first[1].to(torch::kFloat16)
+        auto compressed = first[1].to(mfq_tensor_backend::kFloat16)
             .reshape({B, T, kLatent + kRope});
         auto kv_latent = g_profiler.measure("glm.kv_a_norm", [&]() {
             auto raw = compressed.index({Slice(), Slice(), Slice(0, kLatent)})
@@ -16186,7 +16174,7 @@ struct GlmDsaBlock : Block {
             return glm_interleaved_rope_cuda(
                 k_pe, pos.contiguous(), rope.cos, rope.sin, kRope);
         });
-        auto kv_rows = torch::cat({
+        auto kv_rows = mfq_tensor_backend::cat({
             kv_latent,
             k_pe.permute({0, 2, 1, 3}).reshape({B, T, kRope})}, -1)
             .contiguous();
@@ -16199,7 +16187,7 @@ struct GlmDsaBlock : Block {
         if (full_indexer) {
             auto index_k = g_profiler.measure("glm.indexer_k_norm", [&]() {
                 return glm_dsa_indexer_layer_norm_cuda(
-                    first[2].to(torch::kFloat16).reshape({B, T, c.index_head_dim}).contiguous(),
+                    first[2].to(mfq_tensor_backend::kFloat16).reshape({B, T, c.index_head_dim}).contiguous(),
                     index_k_norm, index_k_bias, 1e-5);
             });
             index_k = glm_interleaved_rope_cuda(
@@ -16211,14 +16199,14 @@ struct GlmDsaBlock : Block {
                 return glm_dsa_cache_write_cuda(
                     index_cache, index_k, pos.contiguous());
             });
-            auto index_q = second[1].to(torch::kFloat16)
+            auto index_q = second[1].to(mfq_tensor_backend::kFloat16)
                 .reshape({B, T, c.index_n_heads, c.index_head_dim})
                 .permute({0, 2, 1, 3}).contiguous();
             index_q = glm_interleaved_rope_cuda(
                 index_q, pos.contiguous(), rope.cos, rope.sin, kRope)
                 .permute({0, 2, 1, 3}).contiguous();
             auto index_weights = first[3].reshape({B, T, c.index_n_heads})
-                .to(torch::kFloat32).contiguous();
+                .to(mfq_tensor_backend::kFloat32).contiguous();
             update_indexer(
                 index_q, index_weights, B, T, cache_pos, seq_len, c);
         }
@@ -16226,11 +16214,11 @@ struct GlmDsaBlock : Block {
         auto q_absorbed = g_profiler.measure("glm.embed_q", [&]() {
             return headwise_project(embed_q, q_nope, B, T, kHeads);
         }).permute({0, 2, 1, 3}).contiguous();
-        auto q_mla = torch::cat({q_absorbed, q_pe}, -1)
-            .to(torch::kFloat32).contiguous();
+        auto q_mla = mfq_tensor_backend::cat({q_absorbed, q_pe}, -1)
+            .to(mfq_tensor_backend::kFloat32).contiguous();
         const double scale = 1.0 / std::sqrt(
             static_cast<double>(kNope + kRope));
-        torch::Tensor attended;
+        mfq_tensor_backend::Tensor attended;
         if (!shared_state->topk_indices.defined()) {
             attended = g_profiler.measure("glm.attention_dense", [&]() {
                 return dense_attention(q_mla, logical_len, B, seq_len, scale);
@@ -16241,12 +16229,12 @@ struct GlmDsaBlock : Block {
             if (prefix + sparse_rows != T) {
                 throw std::runtime_error("GLM DSA shared index state has the wrong row count");
             }
-            torch::Tensor dense_out;
+            mfq_tensor_backend::Tensor dense_out;
             if (prefix > 0) {
                 dense_out = g_profiler.measure("glm.attention_dense_prefix", [&]() {
                     return dense_attention(
                         q_mla.narrow(2, 0, prefix).contiguous(),
-                        cache_pos + prefix, B, c10::nullopt, scale);
+                        cache_pos + prefix, B, mfq_nullopt, scale);
                 });
             }
             shared_state->ensure_meta();
@@ -16258,11 +16246,11 @@ struct GlmDsaBlock : Block {
                     shared_state->attention_meta, scale);
             });
             attended = prefix > 0
-                ? torch::cat({dense_out, sparse_out}, 1) : sparse_out;
+                ? mfq_tensor_backend::cat({dense_out, sparse_out}, 1) : sparse_out;
         }
         auto value_heads = g_profiler.measure("glm.unembed_out", [&]() {
             return headwise_project(
-                unembed_out, attended.to(torch::kFloat16).contiguous(),
+                unembed_out, attended.to(mfq_tensor_backend::kFloat16).contiguous(),
                 B, T, kHeads);
         });
         auto attn_out = g_profiler.measure("glm.o_proj", [&]() {
@@ -16272,7 +16260,7 @@ struct GlmDsaBlock : Block {
         auto attn_pair = g_profiler.measure("glm.attn_residual_ffn_norm", [&]() {
             return acc_rms_norm_f16_cuda(
                 residual.reshape({B * T, H}),
-                attn_out.reshape({B * T, H}).to(torch::kFloat16).contiguous(),
+                attn_out.reshape({B * T, H}).to(mfq_tensor_backend::kFloat16).contiguous(),
                 ffn_norm, c.rms_norm_eps, 0.0);
         });
         auto hidden = attn_pair[0].reshape({B, T, H});
@@ -16286,7 +16274,7 @@ struct GlmDsaBlock : Block {
 };
 
 struct LinearBlock : Block {
-    torch::Tensor attn_norm, ffn_norm, conv_weight, conv_bias, dt_bias, a_log, linear_norm;
+    mfq_tensor_backend::Tensor attn_norm, ffn_norm, conv_weight, conv_bias, dt_bias, a_log, linear_norm;
     bool split_in_proj = false;
     bool split_dense_zab = false;
     bool dense_ab_tail = false;
@@ -16301,9 +16289,9 @@ struct LinearBlock : Block {
     DenseLinearGroup ab_proj;
     DenseLinearGroup zab_proj;
     QuantLinear out_proj;
-    torch::Tensor out_proj_dense;
+    mfq_tensor_backend::Tensor out_proj_dense;
     FFN ffn;
-    torch::Tensor conv_state, gdn_state;
+    mfq_tensor_backend::Tensor conv_state, gdn_state;
 
     void reset(int64_t B) override {
         if (conv_state.defined() && gdn_state.defined() &&
@@ -16312,11 +16300,11 @@ struct LinearBlock : Block {
             gdn_state.zero_();
             return;
         }
-        conv_state = torch::Tensor();
-        gdn_state = torch::Tensor();
+        conv_state = mfq_tensor_backend::Tensor();
+        gdn_state = mfq_tensor_backend::Tensor();
     }
 
-    torch::Tensor forward_cpu(torch::Tensor x, const Config & c) {
+    mfq_tensor_backend::Tensor forward_cpu(mfq_tensor_backend::Tensor x, const Config & c) {
         const int64_t B = x.size(0), T = x.size(1), H = x.size(2);
         const int64_t nk = c.linear_num_key_heads;
         const int64_t nv = c.linear_num_value_heads;
@@ -16326,20 +16314,20 @@ struct LinearBlock : Block {
         const int64_t vsz = c.linear_v_size();
         const int64_t conv_dim = 2 * ksz + vsz;
         if (!conv_state.defined()) {
-            auto f32 = torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32);
-            conv_state = torch::zeros(
+            auto f32 = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat32);
+            conv_state = mfq_tensor_backend::zeros(
                 {B, c.linear_conv_kernel_dim - 1, conv_dim}, f32);
-            gdn_state = torch::zeros({B, nv, dv, dv}, f32);
+            gdn_state = mfq_tensor_backend::zeros({B, nv, dv, dv}, f32);
         }
 
         auto residual = x;
         auto xn = qwen_rms_norm(
-            x.reshape({B * T, H}).to(torch::kFloat32),
+            x.reshape({B * T, H}).to(mfq_tensor_backend::kFloat32),
             attn_norm, c).reshape({B, T, H});
-        torch::Tensor qkv, qk_part, v_part, z, alpha_raw, beta_raw;
+        mfq_tensor_backend::Tensor qkv, qk_part, v_part, z, alpha_raw, beta_raw;
         if (dense_ab_tail) {
             auto parts = in_proj.forward(xn);
-            qkv = parts[0].to(torch::kFloat32);
+            qkv = parts[0].to(mfq_tensor_backend::kFloat32);
             z = parts[1];
             auto ab = ab_proj.forward(xn);
             alpha_raw = ab[0];
@@ -16364,29 +16352,29 @@ struct LinearBlock : Block {
                 alpha_raw = ab[0];
                 beta_raw = ab[1];
             }
-            qkv = torch::cat(
-                {qk_part.to(torch::kFloat32), v_part.to(torch::kFloat32)}, -1);
+            qkv = mfq_tensor_backend::cat(
+                {qk_part.to(mfq_tensor_backend::kFloat32), v_part.to(mfq_tensor_backend::kFloat32)}, -1);
         } else {
             auto parts = in_proj.forward(xn);
-            qkv = parts[0].to(torch::kFloat32);
+            qkv = parts[0].to(mfq_tensor_backend::kFloat32);
             z = parts[1];
             alpha_raw = parts[2];
             beta_raw = parts[3];
         }
 
-        auto beta = torch::sigmoid(
-            beta_raw.to(torch::kFloat32).reshape({B, T, nv}));
-        auto alpha = alpha_raw.to(torch::kFloat32).reshape({B, T, nv});
-        auto gate = torch::softplus(
-            alpha + dt_bias.to(torch::kFloat32).reshape({1, 1, nv}));
-        auto coefficient = -torch::exp(a_log.to(torch::kFloat32));
+        auto beta = mfq_tensor_backend::sigmoid(
+            beta_raw.to(mfq_tensor_backend::kFloat32).reshape({B, T, nv}));
+        auto alpha = alpha_raw.to(mfq_tensor_backend::kFloat32).reshape({B, T, nv});
+        auto gate = mfq_tensor_backend::softplus(
+            alpha + dt_bias.to(mfq_tensor_backend::kFloat32).reshape({1, 1, nv}));
+        auto coefficient = -mfq_tensor_backend::exp(a_log.to(mfq_tensor_backend::kFloat32));
         gate = gate * coefficient.reshape({1, 1, nv});
 
-        auto conv_input = torch::cat({conv_state, qkv}, 1);
+        auto conv_input = mfq_tensor_backend::cat({conv_state, qkv}, 1);
         conv_state.copy_(conv_input.narrow(
             1, conv_input.size(1) - (c.linear_conv_kernel_dim - 1),
             c.linear_conv_kernel_dim - 1));
-        auto weight = conv_weight.to(torch::kFloat32);
+        auto weight = conv_weight.to(mfq_tensor_backend::kFloat32);
         if (weight.dim() == 3) weight = weight.squeeze(1);
         if (weight.dim() != 2) {
             throw std::runtime_error("CPU SSM convolution weight must be rank 2 or 3");
@@ -16394,7 +16382,7 @@ struct LinearBlock : Block {
         if (weight.size(0) != conv_dim && weight.size(1) == conv_dim) {
             weight = weight.transpose(0, 1).contiguous();
         }
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             weight.size(0) == conv_dim &&
             weight.size(1) == c.linear_conv_kernel_dim,
             "CPU SSM convolution geometry mismatch");
@@ -16403,9 +16391,9 @@ struct LinearBlock : Block {
         auto conv = (windows * weight.reshape(
             {1, 1, conv_dim, c.linear_conv_kernel_dim})).sum(-1);
         if (conv_bias.defined()) {
-            conv = conv + conv_bias.to(torch::kFloat32).reshape({1, 1, conv_dim});
+            conv = conv + conv_bias.to(mfq_tensor_backend::kFloat32).reshape({1, 1, conv_dim});
         }
-        conv = torch::silu(conv);
+        conv = mfq_tensor_backend::silu(conv);
 
         auto q = conv.narrow(-1, 0, ksz)
             .reshape({B, T, nk, dk}).transpose(1, 2).contiguous();
@@ -16413,12 +16401,12 @@ struct LinearBlock : Block {
             .reshape({B, T, nk, dk}).transpose(1, 2).contiguous();
         auto v = conv.narrow(-1, 2 * ksz, vsz)
             .reshape({B, T, nv, dv}).transpose(1, 2).contiguous();
-        q = q / torch::sqrt(q.square().sum(-1, true))
+        q = q / mfq_tensor_backend::sqrt(q.square().sum(-1, true))
             .clamp_min(c.rms_norm_eps);
-        k = k / torch::sqrt(k.square().sum(-1, true))
+        k = k / mfq_tensor_backend::sqrt(k.square().sum(-1, true))
             .clamp_min(c.rms_norm_eps);
         if (nk != nv) {
-            TORCH_CHECK(nv % nk == 0, "CPU GDN head ratio is invalid");
+            MFQ_RUNTIME_CHECK(nv % nk == 0, "CPU GDN head ratio is invalid");
             const int64_t repeat = nv / nk;
             if (tiled_v_heads) {
                 q = q.repeat({1, repeat, 1, 1});
@@ -16432,62 +16420,62 @@ struct LinearBlock : Block {
         auto gate_t = gate.transpose(1, 2).contiguous();
         auto beta_t = beta.transpose(1, 2).contiguous();
         auto state = gdn_state;
-        std::vector<torch::Tensor> outputs;
+        std::vector<mfq_tensor_backend::Tensor> outputs;
         outputs.reserve(static_cast<size_t>(T));
         const double retrieve_scale = 1.0 / std::sqrt(static_cast<double>(dk));
         for (int64_t token = 0; token < T; ++token) {
             auto qt = q.select(2, token);
             auto kt = k.select(2, token);
             auto vt = v.select(2, token);
-            state = state * torch::exp(gate_t.select(2, token))
+            state = state * mfq_tensor_backend::exp(gate_t.select(2, token))
                 .reshape({B, nv, 1, 1});
-            auto state_k = torch::matmul(
+            auto state_k = mfq_tensor_backend::matmul(
                 state.transpose(-1, -2), kt.unsqueeze(-1)).squeeze(-1);
             auto delta = (vt - state_k) *
                 beta_t.select(2, token).unsqueeze(-1);
             state = state + kt.unsqueeze(-1) * delta.unsqueeze(-2);
             outputs.push_back(
-                torch::matmul(
+                mfq_tensor_backend::matmul(
                     state.transpose(-1, -2), qt.unsqueeze(-1))
                     .squeeze(-1) * retrieve_scale);
         }
         gdn_state = state.contiguous();
-        auto y = torch::stack(outputs, 2);
+        auto y = mfq_tensor_backend::stack(outputs, 2);
         z = z.reshape({B, T, nv, dv}).transpose(1, 2).contiguous();
-        auto y_flat = y.reshape({-1, dv}).to(torch::kFloat32);
-        auto inverse = torch::rsqrt(
+        auto y_flat = y.reshape({-1, dv}).to(mfq_tensor_backend::kFloat32);
+        auto inverse = mfq_tensor_backend::rsqrt(
             y_flat.square().mean(-1, true) + c.rms_norm_eps);
         auto y_norm = (y_flat * inverse *
-            linear_norm.to(torch::kFloat32)).reshape_as(y);
+            linear_norm.to(mfq_tensor_backend::kFloat32)).reshape_as(y);
         auto yf = y_norm.transpose(1, 2).contiguous().reshape({B, T, vsz});
         auto zf = z.transpose(1, 2).contiguous().reshape({B, T, vsz});
-        torch::Tensor attention_output;
+        mfq_tensor_backend::Tensor attention_output;
         if (dense_out_proj) {
             auto dtype = out_proj_dense.scalar_type();
-            auto gated = yf.to(dtype) * torch::silu(zf.to(dtype));
-            attention_output = torch::matmul(
+            auto gated = yf.to(dtype) * mfq_tensor_backend::silu(zf.to(dtype));
+            attention_output = mfq_tensor_backend::matmul(
                 gated.reshape({B * T, vsz}),
                 out_proj_dense.transpose(0, 1)).reshape({B, T, H});
         } else {
             attention_output = out_proj.forward_input_mul(yf, zf, 2);
         }
-        x = (residual.to(torch::kFloat32) +
-            attention_output.to(torch::kFloat32))
+        x = (residual.to(mfq_tensor_backend::kFloat32) +
+            attention_output.to(mfq_tensor_backend::kFloat32))
             .to(residual.scalar_type()).contiguous();
         residual = x;
         xn = qwen_rms_norm(
-            x.reshape({B * T, H}).to(torch::kFloat32),
+            x.reshape({B * T, H}).to(mfq_tensor_backend::kFloat32),
             ffn_norm, c).reshape({B, T, H});
         auto ff = ffn.forward(xn.reshape({B * T, H})).reshape({B, T, H});
-        return (residual.to(torch::kFloat32) + ff.to(torch::kFloat32))
+        return (residual.to(mfq_tensor_backend::kFloat32) + ff.to(mfq_tensor_backend::kFloat32))
             .to(residual.scalar_type()).contiguous();
     }
 
-    torch::Tensor forward(torch::Tensor x, torch::Tensor pos, int64_t cache_pos,
-                          const c10::optional<torch::Tensor> & seq_len,
+    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, int64_t cache_pos,
+                          const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
                           const Config & c, const RopeCache & rope,
-                          const c10::optional<torch::Tensor> & cache_positions = c10::nullopt,
-                          const c10::optional<torch::Tensor> & attention_mask = c10::nullopt) override {
+                          const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
+                          const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override {
         (void)cache_positions;
         (void)attention_mask;
         if (!x.is_cuda()) return forward_cpu(std::move(x), c);
@@ -16499,17 +16487,17 @@ struct LinearBlock : Block {
         int64_t ksz = c.linear_k_size(), vsz = c.linear_v_size();
         int64_t conv_dim = 2 * ksz + vsz;
         if (!conv_state.defined()) {
-            conv_state = torch::zeros({B, c.linear_conv_kernel_dim - 1, conv_dim}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
-            gdn_state = torch::zeros({B, nv, dv, dv}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
+            conv_state = mfq_tensor_backend::zeros({B, c.linear_conv_kernel_dim - 1, conv_dim}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
+            gdn_state = mfq_tensor_backend::zeros({B, nv, dv, dv}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
         }
         auto residual = x;
         auto xn = g_profiler.measure("linear.attn_norm", [&]() {
-            return qwen_rms_norm(x.reshape({B * T, H}).to(torch::kFloat32), attn_norm, c).reshape({B, T, H});
+            return qwen_rms_norm(x.reshape({B * T, H}).to(mfq_tensor_backend::kFloat32), attn_norm, c).reshape({B, T, H});
         });
-        torch::Tensor qkv, qk_part, v_part, z, alpha_raw, beta_raw;
+        mfq_tensor_backend::Tensor qkv, qk_part, v_part, z, alpha_raw, beta_raw;
         if (dense_ab_tail) {
             auto parts = g_profiler.measure("linear.in_proj", [&]() { return in_proj.forward(xn); });
-            qkv = g_profiler.measure("linear.qkv_cast", [&]() { return parts[0].to(torch::kFloat32); });
+            qkv = g_profiler.measure("linear.qkv_cast", [&]() { return parts[0].to(mfq_tensor_backend::kFloat32); });
             z = parts[1];
             auto ab = g_profiler.measure("linear.ab_proj", [&]() { return ab_proj.forward(xn); });
             alpha_raw = ab[0];
@@ -16536,7 +16524,7 @@ struct LinearBlock : Block {
             }
         } else {
             auto parts = g_profiler.measure("linear.in_proj", [&]() { return in_proj.forward(xn); });
-            qkv = g_profiler.measure("linear.qkv_cast", [&]() { return parts[0].to(torch::kFloat32); });
+            qkv = g_profiler.measure("linear.qkv_cast", [&]() { return parts[0].to(mfq_tensor_backend::kFloat32); });
             z = parts[1];
             alpha_raw = parts[2];
             beta_raw = parts[3];
@@ -16546,8 +16534,8 @@ struct LinearBlock : Block {
         });
         auto gate_t = gates[0];
         auto beta_t = gates[1];
-        auto bias = conv_bias.defined() ? conv_bias : torch::empty({0}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
-        torch::Tensor q, k, v;
+        auto bias = conv_bias.defined() ? conv_bias : mfq_tensor_backend::empty({0}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
+        mfq_tensor_backend::Tensor q, k, v;
         const char * fused_prefill_env = std::getenv("MFQ_LINEAR_CONV_PREFILL_FUSED");
         bool fused_prefill = T >= 256 && (fused_prefill_env == nullptr || fused_prefill_env[0] != '0');
         if (T > 1 && split_in_proj && fused_prefill) {
@@ -16589,17 +16577,17 @@ struct LinearBlock : Block {
         } else {
             if (split_in_proj) {
                 qkv = g_profiler.measure("linear.qkv_cat", [&]() {
-                    return torch::cat({qk_part.to(torch::kFloat32), v_part.to(torch::kFloat32)}, -1);
+                    return mfq_tensor_backend::cat({qk_part.to(mfq_tensor_backend::kFloat32), v_part.to(mfq_tensor_backend::kFloat32)}, -1);
                 });
             }
-            torch::Tensor conv;
+            mfq_tensor_backend::Tensor conv;
             if (T == 1) {
             conv = g_profiler.measure("linear.conv_silu_decode", [&]() {
                 return ssm_conv_silu_decode_cuda(conv_state, qkv, conv_weight, bias);
             });
             } else {
-            auto conv_in = g_profiler.measure("linear.conv_input", [&]() { return torch::cat({conv_state, qkv}, 1); });
-            auto next_conv_state = g_profiler.measure("linear.conv_state_update", [&]() { return conv_in.index({Slice(), Slice(-(c.linear_conv_kernel_dim - 1), torch::indexing::None), Slice()}).contiguous(); });
+            auto conv_in = g_profiler.measure("linear.conv_input", [&]() { return mfq_tensor_backend::cat({conv_state, qkv}, 1); });
+            auto next_conv_state = g_profiler.measure("linear.conv_state_update", [&]() { return conv_in.index({Slice(), Slice(-(c.linear_conv_kernel_dim - 1), mfq_tensor_backend::indexing::None), Slice()}).contiguous(); });
             conv_state.copy_(next_conv_state);
             conv = g_profiler.measure("linear.conv_silu", [&]() { return ssm_conv_silu_cuda(conv_in, conv_weight, bias, T); });
             }
@@ -16630,13 +16618,13 @@ struct LinearBlock : Block {
         });
         auto y = gd[0];
         gdn_state = gd[1];
-        torch::Tensor oo;
+        mfq_tensor_backend::Tensor oo;
         const NintWeight * out_nint =
             !dense_out_proj && out_proj.is_nint() &&
             !out_proj.tensor_parallel()
                 ? &out_proj.nint.w : nullptr;
         if (out_nint != nullptr && B == 1 && T == 1 && out_nint->bits == 5 && out_nint->gs == 28 &&
-            y.scalar_type() == torch::kFloat32 && z.scalar_type() == torch::kFloat16) {
+            y.scalar_type() == mfq_tensor_backend::kFloat32 && z.scalar_type() == mfq_tensor_backend::kFloat16) {
             oo = g_profiler.measure("linear.out_norm_gate_proj", [&]() {
                 Workspace & ws = out_nint->workspace(1);
                 out_nint->ensure_rinv_workspace(ws, nv);
@@ -16649,14 +16637,14 @@ struct LinearBlock : Block {
             });
         } else {
             z = g_profiler.measure("linear.z_view", [&]() { return z.reshape({B, T, nv, dv}).transpose(1, 2).contiguous(); });
-            auto y_norm = g_profiler.measure("linear.out_norm", [&]() { return rms_norm_cuda(y.reshape({-1, dv}).to(torch::kFloat32), linear_norm, c.rms_norm_eps).reshape_as(y); });
+            auto y_norm = g_profiler.measure("linear.out_norm", [&]() { return rms_norm_cuda(y.reshape({-1, dv}).to(mfq_tensor_backend::kFloat32), linear_norm, c.rms_norm_eps).reshape_as(y); });
             auto yf = g_profiler.measure("linear.y_view", [&]() { return y_norm.transpose(1, 2).contiguous().reshape({B, T, vsz}); });
             auto zf = g_profiler.measure("linear.zf_view", [&]() { return z.transpose(1, 2).contiguous().reshape({B, T, vsz}); });
             if (dense_out_proj) {
                 oo = g_profiler.measure("linear.out_proj_gate_dense", [&]() {
                     auto dtype = out_proj_dense.scalar_type();
-                    auto gated = yf.to(dtype) * torch::silu(zf.to(dtype));
-                    return torch::matmul(
+                    auto gated = yf.to(dtype) * mfq_tensor_backend::silu(zf.to(dtype));
+                    return mfq_tensor_backend::matmul(
                         gated.reshape({B * T, vsz}),
                         out_proj_dense.transpose(0, 1)).reshape({B, T, H});
                 });
@@ -16674,12 +16662,12 @@ struct LinearBlock : Block {
             if (fp32_residual_env != nullptr &&
                     fp32_residual_env[0] == '1') {
                 return acc_rms_norm_cuda(
-                    rr.to(torch::kFloat32),
-                    oo2.to(torch::kFloat32),
+                    rr.to(mfq_tensor_backend::kFloat32),
+                    oo2.to(mfq_tensor_backend::kFloat32),
                     ffn_norm, c.rms_norm_eps,
                     c.norm_weight_offset);
             }
-            if (rr.scalar_type() == torch::kFloat16 && oo2.scalar_type() == torch::kFloat16) {
+            if (rr.scalar_type() == mfq_tensor_backend::kFloat16 && oo2.scalar_type() == mfq_tensor_backend::kFloat16) {
                 return acc_rms_norm_f16_cuda(rr, oo2, ffn_norm, c.rms_norm_eps, c.norm_weight_offset);
             }
             return acc_rms_norm_cuda(rr, oo2, ffn_norm, c.rms_norm_eps, c.norm_weight_offset);
@@ -16703,8 +16691,8 @@ struct LinearBlock : Block {
                 std::getenv("MFQ_DIAGNOSTIC_FP32_RESIDUAL");
             if (fp32_residual_env != nullptr &&
                     fp32_residual_env[0] == '1') {
-                rr = rr.to(torch::kFloat32);
-                ff2 = ff2.to(torch::kFloat32);
+                rr = rr.to(mfq_tensor_backend::kFloat32);
+                ff2 = ff2.to(mfq_tensor_backend::kFloat32);
             }
             return acc_cuda(rr, ff2).reshape({B, T, H});
         });
@@ -16718,8 +16706,8 @@ static void prepare_ffn_workspaces(FFN & f) {
         f.gate_up.outs.size() == 2 && f.gate_up.outs[0] == f.gate_up.outs[1] &&
         f.gate_up.outs[0] == f.down.nvq.w.neuron_len) {
         NvqWorkspace & ws = f.gate_up.layers[0].nvq.w.workspace(1);
-        ws.swiglu_scratch = torch::empty(
-            {f.gate_up.outs[0]}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
+        ws.swiglu_scratch = mfq_tensor_backend::empty(
+            {f.gate_up.outs[0]}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
         (void)f.down.nvq.w.workspace(1);
     }
     if (f.important_neurons) {
@@ -16793,10 +16781,10 @@ static FFN load_ffn(const MfqFile & mfq, const Config & c, int i, bool gguf_name
             f.moe_down = load_nint_moe_gpu(
                 mfq, expert_down, true, i, "down");
             f.moe_router = load_dense_gpu(
-                mfq, p + "gate.weight").to(torch::kFloat32).contiguous();
+                mfq, p + "gate.weight").to(mfq_tensor_backend::kFloat32).contiguous();
             f.moe_router_bias = load_dense_gpu(
                 mfq, p + "gate.e_score_correction_bias")
-                .to(torch::kFloat32).contiguous();
+                .to(mfq_tensor_backend::kFloat32).contiguous();
             f.moe_top_k = static_cast<int>(c.num_experts_per_tok);
             f.moe_use_sigmoid = true;
             f.moe_use_sqrt_softplus = false;
@@ -16869,9 +16857,9 @@ static FFN load_ffn(const MfqFile & mfq, const Config & c, int i, bool gguf_name
                 mfq, expert_gate_up, true, i, "gate_up");
             f.moe_down = load_nint_moe_gpu(
                 mfq, expert_down, true, i, "down");
-            f.moe_router = load_dense_gpu(mfq, p + "gate.weight").to(torch::kFloat32).contiguous();
+            f.moe_router = load_dense_gpu(mfq, p + "gate.weight").to(mfq_tensor_backend::kFloat32).contiguous();
             f.moe_shared_gate = load_dense_gpu(
-                mfq, p + "shared_expert_gate.weight").to(torch::kFloat32).contiguous();
+                mfq, p + "shared_expert_gate.weight").to(mfq_tensor_backend::kFloat32).contiguous();
             f.moe_top_k = static_cast<int>(c.num_experts_per_tok);
             f.moe_use_sqrt_softplus = c.expert_gating_func == "sqrtsoftplus";
             if (f.moe_use_sqrt_softplus) {
@@ -16955,25 +16943,25 @@ static std::unique_ptr<Block> load_block(
             mfq, p + "attn_kv_a_norm.weight");
         b->sinks = load_dense_gpu(
             mfq, p + "attn_sinks.weight")
-            .to(torch::kFloat32).contiguous();
+            .to(mfq_tensor_backend::kFloat32).contiguous();
         b->hc_attn_fn = load_dense_gpu(
             mfq, p + "hc_attn_fn.weight")
-            .to(torch::kFloat32).contiguous();
+            .to(mfq_tensor_backend::kFloat32).contiguous();
         b->hc_attn_scale = load_dense_gpu(
             mfq, p + "hc_attn_scale.weight")
-            .to(torch::kFloat32).contiguous();
+            .to(mfq_tensor_backend::kFloat32).contiguous();
         b->hc_attn_base = load_dense_gpu(
             mfq, p + "hc_attn_base.weight")
-            .to(torch::kFloat32).contiguous();
+            .to(mfq_tensor_backend::kFloat32).contiguous();
         b->hc_ffn_fn = load_dense_gpu(
             mfq, p + "hc_ffn_fn.weight")
-            .to(torch::kFloat32).contiguous();
+            .to(mfq_tensor_backend::kFloat32).contiguous();
         b->hc_ffn_scale = load_dense_gpu(
             mfq, p + "hc_ffn_scale.weight")
-            .to(torch::kFloat32).contiguous();
+            .to(mfq_tensor_backend::kFloat32).contiguous();
         b->hc_ffn_base = load_dense_gpu(
             mfq, p + "hc_ffn_base.weight")
-            .to(torch::kFloat32).contiguous();
+            .to(mfq_tensor_backend::kFloat32).contiguous();
         b->q_a = load_quant_linear(
             mfq, p + "attn_q_a.weight");
         b->q_b = load_quant_linear(
@@ -16999,10 +16987,10 @@ static std::unique_ptr<Block> load_block(
                     p + "attn_compressor_gate.weight"}));
             b->compressor.ape = load_dense_gpu(
                 mfq, p + "attn_compressor_ape.weight")
-                .to(torch::kFloat32).contiguous();
+                .to(mfq_tensor_backend::kFloat32).contiguous();
             b->compressor.norm = load_dense_gpu(
                 mfq, p + "attn_compressor_norm.weight")
-                .to(torch::kFloat32).contiguous();
+                .to(mfq_tensor_backend::kFloat32).contiguous();
         }
         if (b->compress_ratio == 4) {
             b->indexer_compressor.ratio = 4;
@@ -17015,15 +17003,15 @@ static std::unique_ptr<Block> load_block(
                     p + "indexer_compressor_gate.weight"}));
             b->indexer_compressor.ape = load_dense_gpu(
                 mfq, p + "indexer_compressor_ape.weight")
-                .to(torch::kFloat32).contiguous();
+                .to(mfq_tensor_backend::kFloat32).contiguous();
             b->indexer_compressor.norm = load_dense_gpu(
                 mfq, p + "indexer_compressor_norm.weight")
-                .to(torch::kFloat32).contiguous();
+                .to(mfq_tensor_backend::kFloat32).contiguous();
             b->indexer_q = load_quant_linear(
                 mfq, p + "indexer.attn_q_b.weight");
             b->indexer_weight = load_dense_gpu(
                 mfq, p + "indexer.proj.weight")
-                .to(torch::kFloat32).contiguous();
+                .to(mfq_tensor_backend::kFloat32).contiguous();
         }
 
         b->ffn.is_moe = true;
@@ -17093,16 +17081,16 @@ static std::unique_ptr<Block> load_block(
         }
         b->ffn.moe_router = load_dense_gpu(
             mfq, p + "ffn_gate_inp.weight")
-            .to(torch::kFloat32).contiguous();
+            .to(mfq_tensor_backend::kFloat32).contiguous();
         if (mfq.records.count(p + "exp_probs_b.bias")) {
             b->ffn.moe_router_bias = load_dense_gpu(
                 mfq, p + "exp_probs_b.bias")
-                .to(torch::kFloat32).contiguous();
+                .to(mfq_tensor_backend::kFloat32).contiguous();
         }
         if (i < c.dsv4_hash_layer_count) {
             b->ffn.moe_hash_ids = load_dense_gpu(
                 mfq, p + "ffn_gate_tid2eid.weight")
-                .to(torch::kInt32).contiguous();
+                .to(mfq_tensor_backend::kInt32).contiguous();
         }
         b->ffn.moe_top_k =
             static_cast<int>(c.num_experts_per_tok);
@@ -17280,9 +17268,9 @@ static std::unique_ptr<Block> load_block(
             mfq, lp + "post_attention_layernorm.weight");
         b->q_norm = load_dense_gpu(mfq, ap + "q_norm.weight");
         b->k_norm = load_dense_gpu(mfq, ap + "k_norm.weight");
-        b->v_norm = torch::ones(
+        b->v_norm = mfq_tensor_backend::ones(
             {b->attention_head_dim},
-            torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
+            mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
         std::vector<std::string> projections = {
             ap + "q_proj.weight", ap + "k_proj.weight"};
         if (!b->value_equals_key) projections.push_back(ap + "v_proj.weight");
@@ -17294,7 +17282,7 @@ static std::unique_ptr<Block> load_block(
         b->ffn_post_norm = load_dense_gpu(
             mfq, lp + "post_feedforward_layernorm.weight");
         b->layer_scale = load_dense_gpu(mfq, lp + "layer_scalar")
-            .to(torch::kFloat16).contiguous();
+            .to(mfq_tensor_backend::kFloat16).contiguous();
         if (b->gemma4_moe) {
             b->ffn_post_norm_1 = load_dense_gpu(
                 mfq, lp + "post_feedforward_layernorm_1.weight");
@@ -17321,12 +17309,12 @@ static std::unique_ptr<Block> load_block(
             mfq, lp + "experts.down_proj",
             true, i, "down");
         b->gemma_router = load_dense_gpu(
-            mfq, lp + "router.proj.weight").to(torch::kFloat32).contiguous();
+            mfq, lp + "router.proj.weight").to(mfq_tensor_backend::kFloat32).contiguous();
         b->gemma_router_norm_scale = (
-            load_dense_gpu(mfq, lp + "router.scale").to(torch::kFloat32) /
+            load_dense_gpu(mfq, lp + "router.scale").to(mfq_tensor_backend::kFloat32) /
             std::sqrt((double)c.hidden_size)).contiguous();
         b->gemma_expert_scale = load_dense_gpu(
-            mfq, lp + "router.per_expert_scale").to(torch::kFloat32).contiguous();
+            mfq, lp + "router.per_expert_scale").to(mfq_tensor_backend::kFloat32).contiguous();
         b->gemma_top_k = static_cast<int>(c.num_experts_per_tok);
 
         if (b->gemma_moe_gate_up.n_experts != c.num_experts ||
@@ -17396,7 +17384,7 @@ static std::unique_ptr<Block> load_block(
                 b->conv_bias = load_dense_gpu(mfq, p + "ssm_conv1d.bias");
             }
             b->dt_bias = load_dense_gpu(mfq, p + "ssm_dt.bias");
-            b->a_log = torch::log(-load_dense_gpu(mfq, p + "ssm_a"));
+            b->a_log = mfq_tensor_backend::log(-load_dense_gpu(mfq, p + "ssm_a"));
             b->linear_norm = load_dense_gpu(mfq, p + "ssm_norm.weight");
             const std::string out_name = p + "ssm_out.weight";
             if (is_quant_dtype(mfq.record(out_name).dtype)) {
@@ -17406,7 +17394,7 @@ static std::unique_ptr<Block> load_block(
                 b->out_proj_dense = load_dense_gpu(mfq, out_name);
                 if (mfq.record(out_name).dtype == "F16") {
                     b->out_proj_dense =
-                        b->out_proj_dense.to(torch::kFloat16).contiguous();
+                        b->out_proj_dense.to(mfq_tensor_backend::kFloat16).contiguous();
                 }
                 if (b->out_proj_dense.dim() != 2) {
                     throw std::runtime_error(
@@ -17484,8 +17472,8 @@ static std::unique_ptr<Block> load_block(
 }
 
 struct FullBlockSessionState {
-    torch::Tensor k;
-    torch::Tensor v;
+    mfq_tensor_backend::Tensor k;
+    mfq_tensor_backend::Tensor v;
     int64_t capacity = 0;
     bool ring = false;
 };
@@ -17503,22 +17491,22 @@ struct Dsv4PoolSessionState {
     int64_t cache_quant_mode = 0;
     int64_t capacity = 0;
     bool overlap = false;
-    torch::Tensor state_kv;
-    torch::Tensor state_gate;
-    torch::Tensor previous_kv;
-    torch::Tensor previous_gate;
-    torch::Tensor pool;
+    mfq_tensor_backend::Tensor state_kv;
+    mfq_tensor_backend::Tensor state_gate;
+    mfq_tensor_backend::Tensor previous_kv;
+    mfq_tensor_backend::Tensor previous_gate;
+    mfq_tensor_backend::Tensor pool;
 };
 
 struct Dsv4BlockSessionState {
-    torch::Tensor local_cache;
+    mfq_tensor_backend::Tensor local_cache;
     Dsv4PoolSessionState compressor;
     Dsv4PoolSessionState indexer_compressor;
 };
 
 struct GlmDsaBlockSessionState {
-    torch::Tensor kv_cache;
-    torch::Tensor index_cache;
+    mfq_tensor_backend::Tensor kv_cache;
+    mfq_tensor_backend::Tensor index_cache;
     int64_t kv_capacity = 0;
     int64_t index_capacity = 0;
     bool full_indexer = false;
@@ -17535,14 +17523,14 @@ struct TextSessionState {
     uint64_t last_used = 0;
 };
 
-static size_t session_tensor_bytes(const torch::Tensor & tensor) {
+static size_t session_tensor_bytes(const mfq_tensor_backend::Tensor & tensor) {
     if (!tensor.defined()) return 0;
     return static_cast<size_t>(tensor.numel()) * tensor.element_size();
 }
 
 static bool session_tensor_layout_matches(
-        const torch::Tensor & target,
-        const torch::Tensor & source) {
+        const mfq_tensor_backend::Tensor & target,
+        const mfq_tensor_backend::Tensor & source) {
     return target.defined() && source.defined() &&
         target.sizes() == source.sizes() &&
         target.scalar_type() == source.scalar_type() &&
@@ -17550,21 +17538,21 @@ static bool session_tensor_layout_matches(
 }
 
 static void restore_session_tensor(
-        torch::Tensor & target,
-        const torch::Tensor & source) {
+        mfq_tensor_backend::Tensor & target,
+        const mfq_tensor_backend::Tensor & source) {
     if (!source.defined()) {
-        target = torch::Tensor();
+        target = mfq_tensor_backend::Tensor();
         return;
     }
     if (!session_tensor_layout_matches(target, source)) {
-        target = torch::empty(source.sizes(), source.options());
+        target = mfq_tensor_backend::empty(source.sizes(), source.options());
     }
     target.copy_(source);
 }
 
 static void restore_session_prefix_tensor(
-        torch::Tensor & target,
-        const torch::Tensor & source,
+        mfq_tensor_backend::Tensor & target,
+        const mfq_tensor_backend::Tensor & source,
         int64_t dimension,
         int64_t capacity) {
     if (!source.defined() || dimension < 0 ||
@@ -17575,11 +17563,11 @@ static void restore_session_prefix_tensor(
     auto target_shape = source.sizes().vec();
     target_shape.at(static_cast<size_t>(dimension)) = capacity;
     const bool compatible = target.defined() &&
-        target.sizes() == torch::IntArrayRef(target_shape) &&
+        target.sizes() == mfq_tensor_backend::IntArrayRef(target_shape) &&
         target.scalar_type() == source.scalar_type() &&
         target.device() == source.device();
     if (!compatible) {
-        target = torch::empty(target_shape, source.options());
+        target = mfq_tensor_backend::empty(target_shape, source.options());
     }
     if (source.size(dimension) > 0) {
         target.narrow(dimension, 0, source.size(dimension)).copy_(source);
@@ -17652,8 +17640,8 @@ static void restore_dsv4_pool_session_state(
         restore_session_tensor(target.previous_kv, state.previous_kv);
         restore_session_tensor(target.previous_gate, state.previous_gate);
     } else {
-        target.previous_kv = torch::Tensor();
-        target.previous_gate = torch::Tensor();
+        target.previous_kv = mfq_tensor_backend::Tensor();
+        target.previous_gate = mfq_tensor_backend::Tensor();
     }
     restore_session_prefix_tensor(
         target.pool, state.pool, 1, state.capacity);
@@ -17666,25 +17654,25 @@ struct Model {
     std::unordered_map<int, RopeCache> device_ropes;
     QuantLinear embed;
     std::vector<std::unique_ptr<Block>> blocks;
-    torch::Tensor output_norm;
+    mfq_tensor_backend::Tensor output_norm;
     QuantLinear lm_head;
-    torch::Tensor dsv4_hc_head_fn;
-    torch::Tensor dsv4_hc_head_scale;
-    torch::Tensor dsv4_hc_head_base;
+    mfq_tensor_backend::Tensor dsv4_hc_head_fn;
+    mfq_tensor_backend::Tensor dsv4_hc_head_scale;
+    mfq_tensor_backend::Tensor dsv4_hc_head_base;
     int64_t cache_pos = 0;
 
-    torch::Tensor embed_forward(torch::Tensor ids) const {
-        auto token_ids = ids.contiguous().to(torch::kCUDA, torch::kInt64);
+    mfq_tensor_backend::Tensor embed_forward(mfq_tensor_backend::Tensor ids) const {
+        auto token_ids = ids.contiguous().to(mfq_tensor_backend::kCUDA, mfq_tensor_backend::kInt64);
         auto output = quant_embedding_lookup(embed, token_ids);
         return c.is_minicpmo45()
-            ? output.to(torch::kBFloat16).contiguous()
+            ? output.to(mfq_tensor_backend::kBFloat16).contiguous()
             : output;
     }
 
     void reset(int64_t B) {
         cache_pos = 0;
         for (auto & b : blocks) {
-            c10::cuda::CUDAGuard guard(b->cuda_device);
+            MfqCudaGuard guard(b->cuda_device);
             b->reset(B);
         }
     }
@@ -17737,7 +17725,7 @@ struct Model {
         if (state.kind == TextSessionStateKind::FullAttention) {
             state.blocks.reserve(blocks.size());
             for (const auto & block : blocks) {
-                c10::cuda::CUDAGuard guard(block->cuda_device);
+                MfqCudaGuard guard(block->cuda_device);
                 const auto * full =
                     dynamic_cast<const FullBlock *>(block.get());
                 if (full == nullptr || !full->cache.k.defined() ||
@@ -17762,7 +17750,7 @@ struct Model {
         } else if (state.kind == TextSessionStateKind::DeepseekV4) {
             state.dsv4_blocks.reserve(blocks.size());
             for (const auto & block : blocks) {
-                c10::cuda::CUDAGuard guard(block->cuda_device);
+                MfqCudaGuard guard(block->cuda_device);
                 const auto * dsv4 =
                     dynamic_cast<const Dsv4Block *>(block.get());
                 if (dsv4 == nullptr || !dsv4->local_cache.defined()) {
@@ -17783,7 +17771,7 @@ struct Model {
         } else if (state.kind == TextSessionStateKind::GlmDsa) {
             state.glm_dsa_blocks.reserve(blocks.size());
             for (const auto & block : blocks) {
-                c10::cuda::CUDAGuard guard(block->cuda_device);
+                MfqCudaGuard guard(block->cuda_device);
                 const auto * glm =
                     dynamic_cast<const GlmDsaBlock *>(block.get());
                 if (glm == nullptr || !glm->kv_cache.defined() ||
@@ -17832,7 +17820,7 @@ struct Model {
             }
             for (size_t index = 0; index < blocks.size(); ++index) {
                 auto & block = blocks[index];
-                c10::cuda::CUDAGuard guard(block->cuda_device);
+                MfqCudaGuard guard(block->cuda_device);
                 auto * full = dynamic_cast<FullBlock *>(block.get());
                 const auto & saved = state.blocks[index];
                 if (full == nullptr || !saved.k.defined() ||
@@ -17857,7 +17845,7 @@ struct Model {
             }
             for (size_t index = 0; index < blocks.size(); ++index) {
                 auto & block = blocks[index];
-                c10::cuda::CUDAGuard guard(block->cuda_device);
+                MfqCudaGuard guard(block->cuda_device);
                 auto * dsv4 = dynamic_cast<Dsv4Block *>(block.get());
                 const auto & saved = state.dsv4_blocks[index];
                 if (dsv4 == nullptr || !saved.local_cache.defined() ||
@@ -17883,7 +17871,7 @@ struct Model {
             }
             for (size_t index = 0; index < blocks.size(); ++index) {
                 auto & block = blocks[index];
-                c10::cuda::CUDAGuard guard(block->cuda_device);
+                MfqCudaGuard guard(block->cuda_device);
                 auto * glm = dynamic_cast<GlmDsaBlock *>(block.get());
                 const auto & saved = state.glm_dsa_blocks[index];
                 if (glm == nullptr ||
@@ -17910,7 +17898,7 @@ struct Model {
                         glm->index_cache, saved.index_cache,
                         1, saved.index_capacity);
                 } else {
-                    glm->index_cache = torch::Tensor();
+                    glm->index_cache = mfq_tensor_backend::Tensor();
                 }
                 glm->shared_state->reset();
             }
@@ -17918,22 +17906,22 @@ struct Model {
         cache_pos = state.cache_pos;
     }
 
-    torch::Tensor finalize_hidden(torch::Tensor x, int64_t B, int64_t T) {
+    mfq_tensor_backend::Tensor finalize_hidden(mfq_tensor_backend::Tensor x, int64_t B, int64_t T) {
         if (c.is_dsv4()) {
             x = g_profiler.measure("model.dsv4_hc_head", [&]() {
-                auto flat = x.flatten(2).to(torch::kFloat32);
-                auto inverse_rms = torch::rsqrt(
+                auto flat = x.flatten(2).to(mfq_tensor_backend::kFloat32);
+                auto inverse_rms = mfq_tensor_backend::rsqrt(
                     flat.square().mean(-1, true) + c.rms_norm_eps);
-                auto mixes = torch::matmul(
+                auto mixes = mfq_tensor_backend::matmul(
                     flat, dsv4_hc_head_fn.transpose(0, 1)) *
                     inverse_rms;
-                auto pre = torch::sigmoid(
+                auto pre = mfq_tensor_backend::sigmoid(
                     mixes * dsv4_hc_head_scale +
                     dsv4_hc_head_base) + c.hc_eps;
                 return (
                     pre.unsqueeze(-1) *
                     flat.reshape({B, T, c.hc_mult, c.hidden_size}))
-                    .sum(2).to(torch::kFloat16).contiguous();
+                    .sum(2).to(mfq_tensor_backend::kFloat16).contiguous();
             });
         }
         return g_profiler.measure("model.output_norm", [&]() {
@@ -17942,37 +17930,37 @@ struct Model {
                     x.reshape({B * T, c.hidden_size}), output_norm, c)
                     .reshape({B, T, c.hidden_size})
                 : qwen_rms_norm(
-                    x.reshape({B * T, c.hidden_size}).to(torch::kFloat32),
+                    x.reshape({B * T, c.hidden_size}).to(mfq_tensor_backend::kFloat32),
                     output_norm, c).reshape({B, T, c.hidden_size});
         });
     }
 
-    torch::Tensor hidden_forward(torch::Tensor ids,
-                                 c10::optional<torch::Tensor> pos_override = c10::nullopt,
-                                 c10::optional<torch::Tensor> seq_len = c10::nullopt,
-                                 std::vector<torch::Tensor> * block_trace = nullptr) {
+    mfq_tensor_backend::Tensor hidden_forward(mfq_tensor_backend::Tensor ids,
+                                 MfqOptional<mfq_tensor_backend::Tensor> pos_override = mfq_nullopt,
+                                 MfqOptional<mfq_tensor_backend::Tensor> seq_len = mfq_nullopt,
+                                 std::vector<mfq_tensor_backend::Tensor> * block_trace = nullptr) {
         const int primary = g_layer_placement.primary_device();
-        c10::cuda::CUDAGuard primary_guard(primary);
+        MfqCudaGuard primary_guard(primary);
         ids = tensor_to_cuda_device(
-            ids.to(torch::kInt64), primary);
+            ids.to(mfq_tensor_backend::kInt64), primary);
         if (ids.dim() == 1) ids = ids.unsqueeze(0);
         auto x = g_profiler.measure("model.embed", [&]() { return embed_forward(ids); });
         return hidden_forward_inputs(
             ids, x, pos_override, seq_len, block_trace);
     }
 
-    torch::Tensor hidden_forward_inputs(
-            torch::Tensor ids,
-            torch::Tensor input_embeddings,
-            c10::optional<torch::Tensor> pos_override = c10::nullopt,
-            c10::optional<torch::Tensor> seq_len = c10::nullopt,
-            std::vector<torch::Tensor> * block_trace = nullptr,
-            c10::optional<torch::Tensor> attention_mask = c10::nullopt,
+    mfq_tensor_backend::Tensor hidden_forward_inputs(
+            mfq_tensor_backend::Tensor ids,
+            mfq_tensor_backend::Tensor input_embeddings,
+            MfqOptional<mfq_tensor_backend::Tensor> pos_override = mfq_nullopt,
+            MfqOptional<mfq_tensor_backend::Tensor> seq_len = mfq_nullopt,
+            std::vector<mfq_tensor_backend::Tensor> * block_trace = nullptr,
+            MfqOptional<mfq_tensor_backend::Tensor> attention_mask = mfq_nullopt,
             bool advance_cache_with_position_ids = false) {
         const int primary = g_layer_placement.primary_device();
-        c10::cuda::CUDAGuard primary_guard(primary);
+        MfqCudaGuard primary_guard(primary);
         ids = tensor_to_cuda_device(
-            ids.to(torch::kInt64), primary);
+            ids.to(mfq_tensor_backend::kInt64), primary);
         if (ids.dim() == 1) ids = ids.unsqueeze(0);
         if (input_embeddings.dim() != 3 ||
                 input_embeddings.size(0) != ids.size(0) ||
@@ -17984,13 +17972,13 @@ struct Model {
         const int64_t B = ids.size(0);
         const int64_t T = ids.size(1);
         if (cache_pos == 0) reset(B);
-        auto cache_positions = torch::arange(
+        auto cache_positions = mfq_tensor_backend::arange(
             cache_pos, cache_pos + T,
-            torch::TensorOptions().device(torch::kCUDA)
-                .dtype(torch::kInt64));
+            mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA)
+                .dtype(mfq_tensor_backend::kInt64));
         auto pos = pos_override.has_value()
             ? tensor_to_cuda_device(
-                pos_override.value(), primary).to(torch::kInt64).contiguous()
+                pos_override.value(), primary).to(mfq_tensor_backend::kInt64).contiguous()
             : cache_positions;
         if (!((pos.dim() == 1 && pos.numel() == T) ||
               (pos.dim() == 2 && pos.size(0) == B && pos.size(1) == T))) {
@@ -18009,29 +17997,29 @@ struct Model {
         if (c.is_minicpmo45() && attention_mask.has_value() &&
                 (T == 1 || cache_pos == 0) &&
                 attention_mask.value().eq(1).all().item<bool>()) {
-            effective_attention_mask = c10::nullopt;
+            effective_attention_mask = mfq_nullopt;
         }
-        torch::Tensor cpu_ids, cpu_pos, cpu_cache_positions;
-        c10::optional<torch::Tensor> cpu_attention_mask = c10::nullopt;
-        c10::optional<torch::Tensor> cpu_seq_len = c10::nullopt;
+        mfq_tensor_backend::Tensor cpu_ids, cpu_pos, cpu_cache_positions;
+        MfqOptional<mfq_tensor_backend::Tensor> cpu_attention_mask = mfq_nullopt;
+        MfqOptional<mfq_tensor_backend::Tensor> cpu_seq_len = mfq_nullopt;
         if (g_dense_cpu_layer_count > 0) {
-            cpu_ids = ids.to(torch::kCPU, torch::kInt64).contiguous();
-            cpu_pos = pos.to(torch::kCPU, torch::kInt64).contiguous();
+            cpu_ids = ids.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
+            cpu_pos = pos.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
             cpu_cache_positions = cache_positions
-                .to(torch::kCPU, torch::kInt64).contiguous();
+                .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
             if (seq_len.has_value()) {
                 cpu_seq_len = seq_len.value()
-                    .to(torch::kCPU, torch::kInt64).contiguous();
+                    .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
             }
             if (effective_attention_mask.has_value()) {
                 cpu_attention_mask = effective_attention_mask.value()
-                    .to(torch::kCPU).contiguous();
+                    .to(mfq_tensor_backend::kCPU).contiguous();
             }
         }
         auto x = tensor_to_cuda_device(
             input_embeddings, primary).contiguous();
         if (c.is_minicpmo45()) {
-            x = x.to(torch::kBFloat16).contiguous();
+            x = x.to(mfq_tensor_backend::kBFloat16).contiguous();
         }
         if (c.is_gemma4()) {
             x = g_profiler.measure("model.embed_scale", [&]() {
@@ -18039,35 +18027,35 @@ struct Model {
             });
         }
         if (c.is_dsv4()) {
-            x = x.to(torch::kFloat16)
+            x = x.to(mfq_tensor_backend::kFloat16)
                 .unsqueeze(2)
                 .expand({B, T, c.hc_mult, c.hidden_size})
                 .contiguous();
         }
-        if (block_trace != nullptr) block_trace->push_back(x.to(torch::kFloat32).clone());
+        if (block_trace != nullptr) block_trace->push_back(x.to(mfq_tensor_backend::kFloat32).clone());
         for (auto & b : blocks) {
-            c10::cuda::CUDAGuard block_guard(b->cuda_device);
+            MfqCudaGuard block_guard(b->cuda_device);
             auto local_ids = b->cpu_offloaded
                 ? cpu_ids
                 : tensor_to_cuda_device(ids, b->cuda_device);
             auto local_pos = b->cpu_offloaded
                 ? cpu_pos
                 : tensor_to_cuda_device(pos, b->cuda_device);
-            c10::optional<torch::Tensor> local_cache_positions = c10::nullopt;
+            MfqOptional<mfq_tensor_backend::Tensor> local_cache_positions = mfq_nullopt;
             if (c.is_minicpmo45()) {
                 local_cache_positions = b->cpu_offloaded
                     ? cpu_cache_positions
                     : tensor_to_cuda_device(
                         cache_positions, b->cuda_device);
             }
-            c10::optional<torch::Tensor> local_seq_len = c10::nullopt;
+            MfqOptional<mfq_tensor_backend::Tensor> local_seq_len = mfq_nullopt;
             if (seq_len.has_value()) {
                 local_seq_len = b->cpu_offloaded
                     ? cpu_seq_len.value()
                     : tensor_to_cuda_device(
                         seq_len.value(), b->cuda_device);
             }
-            c10::optional<torch::Tensor> local_attention_mask = c10::nullopt;
+            MfqOptional<mfq_tensor_backend::Tensor> local_attention_mask = mfq_nullopt;
             if (effective_attention_mask.has_value()) {
                 local_attention_mask = b->cpu_offloaded
                     ? cpu_attention_mask.value()
@@ -18075,7 +18063,7 @@ struct Model {
                         effective_attention_mask.value(), b->cuda_device);
             }
             x = b->cpu_offloaded
-                ? x.to(torch::kCPU).contiguous()
+                ? x.to(mfq_tensor_backend::kCPU).contiguous()
                 : tensor_to_cuda_device(x, b->cuda_device);
             b->set_token_ids(local_ids);
             const RopeCache & active_rope = b->cpu_offloaded
@@ -18086,11 +18074,11 @@ struct Model {
                 x, local_pos, cache_pos, local_seq_len, c, active_rope,
                 local_cache_positions,
                 c.is_minicpmo45()
-                    ? local_attention_mask : c10::nullopt);
+                    ? local_attention_mask : mfq_nullopt);
             if (block_trace != nullptr) {
                 block_trace->push_back(
                     tensor_to_cuda_device(x, primary)
-                        .to(torch::kFloat32).clone());
+                        .to(mfq_tensor_backend::kFloat32).clone());
             }
         }
         if (!pos_override.has_value() || advance_cache_with_position_ids) {
@@ -18100,97 +18088,97 @@ struct Model {
         return finalize_hidden(x, B, T);
     }
 
-    torch::Tensor forward_inputs(
-            torch::Tensor ids,
-            torch::Tensor input_embeddings,
-            c10::optional<torch::Tensor> pos_override = c10::nullopt,
-            c10::optional<torch::Tensor> seq_len = c10::nullopt) {
+    mfq_tensor_backend::Tensor forward_inputs(
+            mfq_tensor_backend::Tensor ids,
+            mfq_tensor_backend::Tensor input_embeddings,
+            MfqOptional<mfq_tensor_backend::Tensor> pos_override = mfq_nullopt,
+            MfqOptional<mfq_tensor_backend::Tensor> seq_len = mfq_nullopt) {
         return logits_from_hidden(hidden_forward_inputs(
             ids, input_embeddings, pos_override, seq_len));
     }
 
-    torch::Tensor logits_from_hidden(torch::Tensor y) {
+    mfq_tensor_backend::Tensor logits_from_hidden(mfq_tensor_backend::Tensor y) {
         auto logits = g_profiler.measure("model.lm_head", [&]() { return lm_head.forward(y); });
         if (c.is_minicpmo45()) {
-            logits = logits.to(torch::kBFloat16).contiguous();
+            logits = logits.to(mfq_tensor_backend::kBFloat16).contiguous();
         }
         if (c.final_logit_softcapping > 0.0) {
-            logits = torch::tanh(logits / c.final_logit_softcapping) *
+            logits = mfq_tensor_backend::tanh(logits / c.final_logit_softcapping) *
                 c.final_logit_softcapping;
         }
         return logits;
     }
 
-    torch::Tensor forward(torch::Tensor ids) {
+    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor ids) {
         return logits_from_hidden(hidden_forward(ids));
     }
 
-    torch::Tensor last_logits(torch::Tensor ids) {
-        c10::optional<torch::Tensor> seq_len = c10::nullopt;
+    mfq_tensor_backend::Tensor last_logits(mfq_tensor_backend::Tensor ids) {
+        MfqOptional<mfq_tensor_backend::Tensor> seq_len = mfq_nullopt;
         const int64_t token_count = ids.dim() == 1 ? ids.size(0) : ids.size(1);
         const int64_t batch_size = ids.dim() == 1 ? 1 : ids.size(0);
         if (!c.is_minicpmo45() && cache_pos > 0 && token_count == 1) {
-            seq_len = torch::full(
+            seq_len = mfq_tensor_backend::full(
                 {batch_size}, cache_pos + 1,
-                torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
+                mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
         }
-        auto y = hidden_forward(ids, c10::nullopt, seq_len);
+        auto y = hidden_forward(ids, mfq_nullopt, seq_len);
         auto last = y.index({Slice(), -1, Slice()});
         if (c.is_minicpmo45()) {
             return logits_from_hidden(
-                last.to(torch::kBFloat16).contiguous());
+                last.to(mfq_tensor_backend::kBFloat16).contiguous());
         }
-        last = last.to(torch::kFloat16).contiguous();
+        last = last.to(mfq_tensor_backend::kFloat16).contiguous();
         auto logits = lm_head.forward(last);
         if (c.final_logit_softcapping > 0.0) {
-            logits = torch::tanh(logits / c.final_logit_softcapping) *
+            logits = mfq_tensor_backend::tanh(logits / c.final_logit_softcapping) *
                 c.final_logit_softcapping;
         }
         return logits;
     }
 
-    torch::Tensor last_logits_static(torch::Tensor ids, torch::Tensor pos, torch::Tensor seq_len) {
+    mfq_tensor_backend::Tensor last_logits_static(mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor pos, mfq_tensor_backend::Tensor seq_len) {
         auto y = hidden_forward(ids, pos, seq_len);
         auto last = y.index({Slice(), -1, Slice()});
         if (c.is_minicpmo45()) {
             return logits_from_hidden(
-                last.to(torch::kBFloat16).contiguous());
+                last.to(mfq_tensor_backend::kBFloat16).contiguous());
         }
-        last = last.to(torch::kFloat16).contiguous();
+        last = last.to(mfq_tensor_backend::kFloat16).contiguous();
         auto logits = lm_head.forward(last);
         if (c.final_logit_softcapping > 0.0) {
-            logits = torch::tanh(logits / c.final_logit_softcapping) *
+            logits = mfq_tensor_backend::tanh(logits / c.final_logit_softcapping) *
                 c.final_logit_softcapping;
         }
         return logits;
     }
 
-    torch::Tensor next_token(torch::Tensor ids) {
-        c10::optional<torch::Tensor> seq_len = c10::nullopt;
+    mfq_tensor_backend::Tensor next_token(mfq_tensor_backend::Tensor ids) {
+        MfqOptional<mfq_tensor_backend::Tensor> seq_len = mfq_nullopt;
         const int64_t token_count = ids.dim() == 1 ? ids.size(0) : ids.size(1);
         const int64_t batch_size = ids.dim() == 1 ? 1 : ids.size(0);
         if (!c.is_minicpmo45() && cache_pos > 0 && token_count == 1) {
-            seq_len = torch::full(
+            seq_len = mfq_tensor_backend::full(
                 {batch_size}, cache_pos + 1,
-                torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
+                mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
         }
-        auto y = hidden_forward(ids, c10::nullopt, seq_len);
+        auto y = hidden_forward(ids, mfq_nullopt, seq_len);
         return next_token_from_hidden(y);
     }
 
-    torch::Tensor next_token_static(torch::Tensor ids, torch::Tensor pos, torch::Tensor seq_len) {
+    mfq_tensor_backend::Tensor next_token_static(mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor pos, mfq_tensor_backend::Tensor seq_len) {
         auto y = hidden_forward(ids, pos, seq_len);
         return next_token_from_hidden(y);
     }
 
-    torch::Tensor next_token_from_hidden(torch::Tensor y) {
+    mfq_tensor_backend::Tensor next_token_from_hidden(mfq_tensor_backend::Tensor y) {
         auto last = y.index({Slice(), -1, Slice()});
         if (c.is_minicpmo45()) {
             auto logits = logits_from_hidden(
-                last.to(torch::kBFloat16).contiguous());
-            return torch::argmax(logits, -1).to(torch::kInt64);
+                last.to(mfq_tensor_backend::kBFloat16).contiguous());
+            return mfq_tensor_backend::argmax(logits, -1).to(mfq_tensor_backend::kInt64);
         }
-        last = last.to(torch::kFloat16).contiguous();
+        last = last.to(mfq_tensor_backend::kFloat16).contiguous();
         const char* use_argmax = std::getenv("MFQ_LM_HEAD_ARGMAX");
         const char* disable_argmax = std::getenv("MFQ_DISABLE_LM_HEAD_ARGMAX");
         bool lm_head_argmax = (disable_argmax == nullptr || disable_argmax[0] != '1') ||
@@ -18264,13 +18252,13 @@ static Model load_model(const std::string & mfq_path, const std::string & config
                       << (g_dense_cpu_layer_count - 1)
                       << " gpu=" << g_dense_cpu_layer_count << '-'
                       << (m.c.num_hidden_layers - 1)
-                      << " cpu_threads=" << at::get_num_threads()
+                      << " cpu_threads=" << mfq_get_num_threads()
                       << std::endl;
         }
     }
     g_layer_placement.load_device =
         g_layer_placement.primary_device();
-    c10::cuda::CUDAGuard model_guard(
+    MfqCudaGuard model_guard(
         g_layer_placement.primary_device());
     if (!g_dsv4_cpu_offload_layers.empty()) {
         if (!m.c.is_dsv4()) {
@@ -18297,11 +18285,11 @@ static Model load_model(const std::string & mfq_path, const std::string & config
         m.rope = RopeCache(m.c);
         if (g_dense_cpu_layer_count > 0) {
             m.cpu_rope = RopeCache(
-                m.c, torch::Device(torch::kCPU));
+                m.c, mfq_tensor_backend::Device(mfq_tensor_backend::kCPU));
         }
         if (g_layer_placement.enabled()) {
             for (int device : g_layer_placement.devices) {
-                c10::cuda::CUDAGuard rope_guard(device);
+                MfqCudaGuard rope_guard(device);
                 m.device_ropes.emplace(device, RopeCache(m.c));
             }
         }
@@ -18323,13 +18311,13 @@ static Model load_model(const std::string & mfq_path, const std::string & config
     if (m.c.is_dsv4()) {
         m.dsv4_hc_head_fn = load_dense_gpu(
             mfq, "output_hc_fn.weight")
-            .to(torch::kFloat32).contiguous();
+            .to(mfq_tensor_backend::kFloat32).contiguous();
         m.dsv4_hc_head_scale = load_dense_gpu(
             mfq, "output_hc_scale.weight")
-            .to(torch::kFloat32).contiguous();
+            .to(mfq_tensor_backend::kFloat32).contiguous();
         m.dsv4_hc_head_base = load_dense_gpu(
             mfq, "output_hc_base.weight")
-            .to(torch::kFloat32).contiguous();
+            .to(mfq_tensor_backend::kFloat32).contiguous();
     }
     if (m.c.tie_word_embeddings || !mfq.records.count(output_name)) {
         m.lm_head = g_tensor_parallel.enabled()
@@ -18355,7 +18343,7 @@ static Model load_model(const std::string & mfq_path, const std::string & config
         std::cerr << "repacking lm_head NINT5 gs28 execution layout" << std::endl;
         if (m.lm_head.tensor_parallel()) {
             for (auto & shard : m.lm_head.tensor_parallel_shards) {
-                c10::cuda::CUDAGuard guard(shard.device);
+                MfqCudaGuard guard(shard.device);
                 enable_nint5_q5_exec(shard.nint);
             }
         } else {
@@ -18373,7 +18361,7 @@ static Model load_model(const std::string & mfq_path, const std::string & config
             const bool cpu_offloaded = i < g_dense_cpu_layer_count;
             g_loading_cpu_layer = cpu_offloaded;
             g_layer_placement.load_device = device;
-            c10::cuda::CUDAGuard layer_guard(device);
+            MfqCudaGuard layer_guard(device);
             std::shared_ptr<GlmDsaSharedState> glm_state;
             std::shared_ptr<Dsv4SharedState> dsv4_state;
             if (m.c.is_glm_dsa()) {
@@ -18729,15 +18717,15 @@ static int run_prefill_sweep(
     std::vector<int64_t> token_ids((size_t)max_m);
     const int64_t token_span = std::max<int64_t>(1, std::min<int64_t>(1024, model.c.vocab_size - 2));
     for (int64_t i = 0; i < max_m; ++i) token_ids[(size_t)i] = 1 + i % token_span;
-    auto all_ids = torch::tensor(
-        token_ids, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA)).unsqueeze(0);
+    auto all_ids = mfq_tensor_backend::tensor(
+        token_ids, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA)).unsqueeze(0);
 
     for (int64_t m : sizes) {
         auto ids = all_ids.narrow(1, 0, m);
         for (int warmup = 0; warmup < 2; ++warmup) {
             model.reset(1);
             (void)model.last_logits(ids);
-            torch::cuda::synchronize();
+            mfq_cuda_synchronize();
         }
 
         std::vector<double> elapsed_ms;
@@ -18747,7 +18735,7 @@ static int run_prefill_sweep(
             model.reset(1);
             auto started = std::chrono::steady_clock::now();
             auto logits = model.last_logits(ids);
-            torch::cuda::synchronize();
+            mfq_cuda_synchronize();
             auto ended = std::chrono::steady_clock::now();
             elapsed_ms.push_back(std::chrono::duration<double, std::milli>(ended - started).count());
             if (repeat == 0) top = logits.argmax(-1).item<int64_t>();
@@ -18769,7 +18757,7 @@ static int run_block_trace_compare(
     const std::string & reference_mfq,
     const std::string & config_path,
     int64_t context_size,
-    torch::Tensor ids)
+    mfq_tensor_backend::Tensor ids)
 {
     Model reference = [&]() {
         if (g_n_gpu_layers < 0) {
@@ -18789,22 +18777,22 @@ static int run_block_trace_compare(
             throw;
         }
     }();
-    std::vector<torch::Tensor> test_trace;
-    std::vector<torch::Tensor> reference_trace;
+    std::vector<mfq_tensor_backend::Tensor> test_trace;
+    std::vector<mfq_tensor_backend::Tensor> reference_trace;
 
     test.reset(ids.size(0));
-    auto test_hidden = test.hidden_forward(ids, c10::nullopt, c10::nullopt, &test_trace);
+    auto test_hidden = test.hidden_forward(ids, mfq_nullopt, mfq_nullopt, &test_trace);
     reference.reset(ids.size(0));
     auto reference_hidden = reference.hidden_forward(
-        ids, c10::nullopt, c10::nullopt, &reference_trace);
-    torch::cuda::synchronize();
+        ids, mfq_nullopt, mfq_nullopt, &reference_trace);
+    mfq_cuda_synchronize();
 
     if (test_trace.size() != reference_trace.size()) {
         throw std::runtime_error("block trace stage count mismatch");
     }
     for (size_t i = 0; i < test_trace.size(); ++i) {
-        auto ref = reference_trace[i].reshape({-1}).to(torch::kFloat64);
-        auto got = test_trace[i].reshape({-1}).to(torch::kFloat64);
+        auto ref = reference_trace[i].reshape({-1}).to(mfq_tensor_backend::kFloat64);
+        auto got = test_trace[i].reshape({-1}).to(mfq_tensor_backend::kFloat64);
         if (ref.numel() != got.numel()) {
             throw std::runtime_error("block trace tensor size mismatch");
         }
@@ -18813,7 +18801,7 @@ static int run_block_trace_compare(
         const double ref_norm_value = ref_norm.item<double>();
         const double denominator = std::max(ref_norm_value, 1.0e-30);
         const double relative_l2 = (got - ref).norm().item<double>() / denominator;
-        const double cosine = torch::dot(ref, got).item<double>() /
+        const double cosine = mfq_tensor_backend::dot(ref, got).item<double>() /
             std::max(ref_norm_value * got_norm.item<double>(), 1.0e-30);
         const double norm_ratio = got_norm.item<double>() / denominator;
         const double reference_rms = ref.square().mean().sqrt().item<double>();
@@ -18829,8 +18817,8 @@ static int run_block_trace_compare(
                   << " test_rms=" << test_rms << "\n";
     }
 
-    auto reference_logits = reference.lm_head.forward(reference_hidden).to(torch::kFloat32);
-    auto test_logits = test.lm_head.forward(test_hidden).to(torch::kFloat32);
+    auto reference_logits = reference.lm_head.forward(reference_hidden).to(mfq_tensor_backend::kFloat32);
+    auto test_logits = test.lm_head.forward(test_hidden).to(mfq_tensor_backend::kFloat32);
     double kl_sum = 0.0;
     int64_t same_top = 0;
     int64_t rows = 0;
@@ -18841,16 +18829,16 @@ static int run_block_trace_compare(
         const int64_t end = std::min(start + 8, tokens);
         auto ref_chunk = ref2.index({Slice(start, end)});
         auto got_chunk = got2.index({Slice(start, end)});
-        auto ref_logp = torch::log_softmax(ref_chunk, -1);
-        auto got_logp = torch::log_softmax(got_chunk, -1);
+        auto ref_logp = mfq_tensor_backend::log_softmax(ref_chunk, -1);
+        auto got_logp = mfq_tensor_backend::log_softmax(got_chunk, -1);
         kl_sum += (ref_logp.exp() * (ref_logp - got_logp)).sum(-1)
-            .to(torch::kFloat64).sum().item<double>();
+            .to(mfq_tensor_backend::kFloat64).sum().item<double>();
         same_top += ref_chunk.argmax(-1).eq(got_chunk.argmax(-1)).sum().item<int64_t>();
         rows += end - start;
     }
     const double logits_relative_l2 =
-        (test_logits.to(torch::kFloat64) - reference_logits.to(torch::kFloat64)).norm().item<double>() /
-        std::max(reference_logits.to(torch::kFloat64).norm().item<double>(), 1.0e-30);
+        (test_logits.to(mfq_tensor_backend::kFloat64) - reference_logits.to(mfq_tensor_backend::kFloat64)).norm().item<double>() /
+        std::max(reference_logits.to(mfq_tensor_backend::kFloat64).norm().item<double>(), 1.0e-30);
     std::cout << "block_trace_logits kld=" << (kl_sum / std::max<int64_t>(rows, 1))
               << " same_top=" << ((double)same_top / std::max<int64_t>(rows, 1))
               << " relative_l2=" << logits_relative_l2 << "\n";
@@ -18860,7 +18848,7 @@ static int run_block_trace_compare(
 static int run_block_trace_dump(
     Model & model,
     const std::string & output_dir,
-    torch::Tensor ids,
+    mfq_tensor_backend::Tensor ids,
     int64_t token_start,
     int64_t token_count)
 {
@@ -18880,12 +18868,12 @@ static int run_block_trace_dump(
     }
 
     model.reset(ids.size(0));
-    std::vector<torch::Tensor> trace;
+    std::vector<mfq_tensor_backend::Tensor> trace;
     auto final_hidden = model.hidden_forward(
-        ids, c10::nullopt, c10::nullopt, &trace);
-    torch::cuda::synchronize();
+        ids, mfq_nullopt, mfq_nullopt, &trace);
+    mfq_cuda_synchronize();
 
-    auto ids_cpu = ids.to(torch::kCPU, torch::kInt32).contiguous();
+    auto ids_cpu = ids.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt32).contiguous();
     {
         std::ofstream output(root / "tokens.i32", std::ios::binary);
         if (!output) throw std::runtime_error("cannot create block trace token file");
@@ -18897,7 +18885,7 @@ static int run_block_trace_dump(
 
     std::ofstream metadata(root / "trace_meta.jsonl");
     if (!metadata) throw std::runtime_error("cannot create block trace metadata");
-    auto token_slice = [&](torch::Tensor value) {
+    auto token_slice = [&](mfq_tensor_backend::Tensor value) {
         if (value.dim() >= 3 && value.size(1) == total_tokens) {
             return value.narrow(1, token_start, token_count);
         }
@@ -18905,7 +18893,7 @@ static int run_block_trace_dump(
     };
     for (size_t index = 0; index < trace.size(); ++index) {
         auto value = token_slice(trace[index])
-            .to(torch::kCPU, torch::kFloat32).contiguous();
+            .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kFloat32).contiguous();
         const std::string stage = index == 0
             ? "embedding"
             : "block_" + std::to_string(index - 1);
@@ -18930,8 +18918,8 @@ static int run_block_trace_dump(
         std::cout << "block_trace_dump stage=" << stage
                   << " values=" << value.numel() << "\n";
     }
-    auto dump_terminal = [&](const std::string & stage, torch::Tensor value) {
-        value = value.to(torch::kCPU, torch::kFloat32).contiguous();
+    auto dump_terminal = [&](const std::string & stage, mfq_tensor_backend::Tensor value) {
+        value = value.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kFloat32).contiguous();
         const std::filesystem::path file = root / (stage + ".f32");
         std::ofstream output(file, std::ios::binary);
         if (!output) {
@@ -18958,7 +18946,7 @@ static int run_block_trace_dump(
     dump_terminal("final_norm", final_hidden);
     auto logits = model.lm_head.forward(final_hidden);
     if (model.c.final_logit_softcapping > 0.0) {
-        logits = torch::tanh(logits / model.c.final_logit_softcapping) *
+        logits = mfq_tensor_backend::tanh(logits / model.c.final_logit_softcapping) *
             model.c.final_logit_softcapping;
     }
     dump_terminal("logits", logits);
@@ -18969,34 +18957,34 @@ static int run_block_trace_dump(
 
 static int run_dsv4_hc_model_compare(
     Model & model,
-    torch::Tensor ids)
+    mfq_tensor_backend::Tensor ids)
 {
-    std::vector<torch::Tensor> reference_trace;
-    std::vector<torch::Tensor> candidate_trace;
-    std::vector<torch::Tensor> repeat_trace;
+    std::vector<mfq_tensor_backend::Tensor> reference_trace;
+    std::vector<mfq_tensor_backend::Tensor> candidate_trace;
+    std::vector<mfq_tensor_backend::Tensor> repeat_trace;
 
     g_dsv4_fused_hc = false;
     model.reset(ids.size(0));
     auto reference_hidden = model.hidden_forward(
-        ids, c10::nullopt, c10::nullopt, &reference_trace);
+        ids, mfq_nullopt, mfq_nullopt, &reference_trace);
     auto reference_logits =
-        model.lm_head.forward(reference_hidden).to(torch::kFloat32);
+        model.lm_head.forward(reference_hidden).to(mfq_tensor_backend::kFloat32);
 
     g_dsv4_fused_hc = true;
     model.reset(ids.size(0));
     auto candidate_hidden = model.hidden_forward(
-        ids, c10::nullopt, c10::nullopt, &candidate_trace);
+        ids, mfq_nullopt, mfq_nullopt, &candidate_trace);
     auto candidate_logits =
-        model.lm_head.forward(candidate_hidden).to(torch::kFloat32);
+        model.lm_head.forward(candidate_hidden).to(mfq_tensor_backend::kFloat32);
 
     g_dsv4_fused_hc = false;
     model.reset(ids.size(0));
     auto repeat_hidden = model.hidden_forward(
-        ids, c10::nullopt, c10::nullopt, &repeat_trace);
+        ids, mfq_nullopt, mfq_nullopt, &repeat_trace);
     auto repeat_logits =
-        model.lm_head.forward(repeat_hidden).to(torch::kFloat32);
+        model.lm_head.forward(repeat_hidden).to(mfq_tensor_backend::kFloat32);
     g_dsv4_fused_hc = true;
-    torch::cuda::synchronize();
+    mfq_cuda_synchronize();
 
     if (reference_trace.size() != candidate_trace.size() ||
             reference_trace.size() != repeat_trace.size()) {
@@ -19007,8 +18995,8 @@ static int run_dsv4_hc_model_compare(
         auto reference = reference_trace[index].reshape({-1});
         auto candidate = candidate_trace[index].reshape({-1});
         auto repeat = repeat_trace[index].reshape({-1});
-        auto reference_f64 = reference.to(torch::kFloat64);
-        auto candidate_f64 = candidate.to(torch::kFloat64);
+        auto reference_f64 = reference.to(mfq_tensor_backend::kFloat64);
+        auto candidate_f64 = candidate.to(mfq_tensor_backend::kFloat64);
         const double denominator = std::max(
             reference_f64.norm().item<double>(), 1.0e-30);
         const std::string stage = index == 0
@@ -19032,8 +19020,8 @@ static int run_dsv4_hc_model_compare(
                   << "\n";
     }
 
-    auto reference_logp = torch::log_softmax(reference_logits, -1);
-    auto candidate_logp = torch::log_softmax(candidate_logits, -1);
+    auto reference_logp = mfq_tensor_backend::log_softmax(reference_logits, -1);
+    auto candidate_logp = mfq_tensor_backend::log_softmax(candidate_logits, -1);
     const double kld_candidate_reference = (
         candidate_logp.exp() *
         (candidate_logp - reference_logp))
@@ -19043,8 +19031,8 @@ static int run_dsv4_hc_model_compare(
         (reference_logp - candidate_logp))
         .sum(-1).mean().item<double>();
     auto logit_diff = (
-        candidate_logits.to(torch::kFloat64) -
-        reference_logits.to(torch::kFloat64));
+        candidate_logits.to(mfq_tensor_backend::kFloat64) -
+        reference_logits.to(mfq_tensor_backend::kFloat64));
     std::cout << std::scientific << std::setprecision(9)
               << "dsv4_hc_model_logits"
               << " mean_kld_candidate_reference="
@@ -19054,7 +19042,7 @@ static int run_dsv4_hc_model_compare(
               << " relative_l2="
               << logit_diff.norm().item<double>() /
                     std::max(
-                        reference_logits.to(torch::kFloat64)
+                        reference_logits.to(mfq_tensor_backend::kFloat64)
                             .norm().item<double>(),
                         1.0e-30)
               << " mean_abs="
@@ -19064,7 +19052,7 @@ static int run_dsv4_hc_model_compare(
               << " same_top="
               << candidate_logits.argmax(-1)
                      .eq(reference_logits.argmax(-1))
-                     .to(torch::kFloat32).mean().item<double>()
+                     .to(mfq_tensor_backend::kFloat32).mean().item<double>()
               << " repeat_logits_equal="
               << (repeat_logits.equal(reference_logits) ? 1 : 0)
               << "\n";
@@ -19078,16 +19066,16 @@ static bool sampling_has_penalties(const MfqSamplingParams & sampling) {
 }
 
 struct ServerDecodeGraphCache {
-    decltype(at::cuda::getStreamFromPool(false)) stream;
-    std::unique_ptr<at::cuda::CUDAGraph> graph;
-    torch::Tensor static_input;
-    torch::Tensor static_pos;
-    torch::Tensor static_len;
-    torch::Tensor static_step;
-    torch::Tensor generated;
-    torch::Tensor random;
-    torch::Tensor counts;
-    torch::Tensor static_next;
+    decltype(mfq_get_stream_from_pool(false)) stream;
+    std::unique_ptr<MfqCudaGraph> graph;
+    mfq_tensor_backend::Tensor static_input;
+    mfq_tensor_backend::Tensor static_pos;
+    mfq_tensor_backend::Tensor static_len;
+    mfq_tensor_backend::Tensor static_step;
+    mfq_tensor_backend::Tensor generated;
+    mfq_tensor_backend::Tensor random;
+    mfq_tensor_backend::Tensor counts;
+    mfq_tensor_backend::Tensor static_next;
     int64_t generated_capacity = 0;
     int64_t planned_len = 0;
     bool greedy = false;
@@ -19102,7 +19090,7 @@ struct ServerDecodeGraphCache {
     bool valid = false;
 
     explicit ServerDecodeGraphCache(int64_t context_capacity)
-        : stream(at::cuda::getStreamFromPool(false)),
+        : stream(mfq_get_stream_from_pool(false)),
           generated_capacity(std::max<int64_t>(context_capacity, 2048)) {}
 
     bool matches(int64_t candidate_len, const MfqSamplingParams & sampling,
@@ -19117,26 +19105,26 @@ struct ServerDecodeGraphCache {
     }
 
     void ensure_storage(int64_t vocab_size) {
-        auto i64 = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
-        if (!static_input.defined()) static_input = torch::empty({1, 1}, i64);
-        if (!static_pos.defined()) static_pos = torch::empty({1}, i64);
-        if (!static_len.defined()) static_len = torch::empty({1}, i64);
-        if (!static_step.defined()) static_step = torch::empty({1}, i64);
-        if (!generated.defined()) generated = torch::empty({generated_capacity}, i64);
+        auto i64 = mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA);
+        if (!static_input.defined()) static_input = mfq_tensor_backend::empty({1, 1}, i64);
+        if (!static_pos.defined()) static_pos = mfq_tensor_backend::empty({1}, i64);
+        if (!static_len.defined()) static_len = mfq_tensor_backend::empty({1}, i64);
+        if (!static_step.defined()) static_step = mfq_tensor_backend::empty({1}, i64);
+        if (!generated.defined()) generated = mfq_tensor_backend::empty({generated_capacity}, i64);
         if (!random.defined()) {
-            random = torch::empty(
-                {1}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+            random = mfq_tensor_backend::empty(
+                {1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32).device(mfq_tensor_backend::kCUDA));
         }
         if (!counts.defined()) {
-            counts = torch::empty(
-                {vocab_size}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+            counts = mfq_tensor_backend::empty(
+                {vocab_size}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32).device(mfq_tensor_backend::kCUDA));
         }
     }
 
     void invalidate() {
         if (graph) graph->reset();
         graph.reset();
-        static_next = torch::Tensor();
+        static_next = mfq_tensor_backend::Tensor();
         valid = false;
     }
 
@@ -19166,12 +19154,12 @@ static bool trace_server_cuda_graph() {
     return value != nullptr && std::atoi(value) != 0;
 }
 
-static torch::Tensor sample_server_logits(
-    torch::Tensor logits,
+static mfq_tensor_backend::Tensor sample_server_logits(
+    mfq_tensor_backend::Tensor logits,
     const MfqSamplingParams & sampling,
-    torch::Tensor counts,
-    torch::Tensor random_host,
-    torch::Tensor random_cuda,
+    mfq_tensor_backend::Tensor counts,
+    mfq_tensor_backend::Tensor random_host,
+    mfq_tensor_backend::Tensor random_cuda,
     std::mt19937_64 & rng,
     const MfqTokenConstraintPtr & token_constraint)
 {
@@ -19184,7 +19172,7 @@ static torch::Tensor sample_server_logits(
             sampling.frequency_penalty, sampling.repetition_penalty);
     }
     std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
-    const auto sample_logits = [&](torch::Tensor candidate_logits) {
+    const auto sample_logits = [&](mfq_tensor_backend::Tensor candidate_logits) {
         if (greedy) return sample_greedy_cuda(candidate_logits);
         *random_host.data_ptr<float>() = uniform(rng);
         random_cuda.copy_(random_host, true);
@@ -19201,7 +19189,7 @@ static torch::Tensor sample_server_logits(
     if (token_constraint && token_constraint->allows &&
         !token_constraint->allows(next.item<int64_t>())) {
         auto masked = logits
-            .to(torch::kCPU, torch::kFloat32)
+            .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kFloat32)
             .contiguous();
         token_constraint->apply(
             masked.data_ptr<float>(),
@@ -19219,13 +19207,13 @@ static torch::Tensor sample_server_logits(
     return next;
 }
 
-static torch::Tensor sample_server_token(
+static mfq_tensor_backend::Tensor sample_server_token(
     Model & model,
-    torch::Tensor ids,
+    mfq_tensor_backend::Tensor ids,
     const MfqSamplingParams & sampling,
-    torch::Tensor counts,
-    torch::Tensor random_host,
-    torch::Tensor random_cuda,
+    mfq_tensor_backend::Tensor counts,
+    mfq_tensor_backend::Tensor random_host,
+    mfq_tensor_backend::Tensor random_cuda,
     std::mt19937_64 & rng,
     const MfqTokenConstraintPtr & token_constraint,
     cudaEvent_t prefill_finished = nullptr)
@@ -19236,7 +19224,7 @@ static torch::Tensor sample_server_token(
         auto next = model.next_token(ids);
         if (prefill_finished != nullptr) {
             MFQ_CUDA_CHECK(cudaEventRecord(
-                prefill_finished, at::cuda::getCurrentCUDAStream()));
+                prefill_finished, mfq_get_current_cuda_stream()));
         }
         return next;
     }
@@ -19244,7 +19232,7 @@ static torch::Tensor sample_server_token(
     auto logits = model.last_logits(ids).contiguous().view({1, -1});
     if (prefill_finished != nullptr) {
         MFQ_CUDA_CHECK(cudaEventRecord(
-            prefill_finished, at::cuda::getCurrentCUDAStream()));
+            prefill_finished, mfq_get_current_cuda_stream()));
     }
     return sample_server_logits(
         std::move(logits), sampling, counts, random_host,
@@ -19254,7 +19242,7 @@ static torch::Tensor sample_server_token(
 class ServerPrefillCudaTimer {
 public:
     ServerPrefillCudaTimer()
-        : stream_(at::cuda::getCurrentCUDAStream()) {
+        : stream_(mfq_get_current_cuda_stream()) {
         MFQ_CUDA_CHECK(cudaEventCreate(&started_));
         try {
             MFQ_CUDA_CHECK(cudaEventCreate(&finished_));
@@ -19654,7 +19642,7 @@ static int32_t generate_server_tokens(
     const MfqTokenConstraintPtr & token_constraint)
 {
     std::lock_guard<std::mutex> lock(model_mutex);
-    auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+    auto options = mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA);
     const size_t stable_prefix_tokens = std::min(
         cache_plan.stable_prefix_tokens, prompt.size());
     const bool session_enabled =
@@ -19666,23 +19654,23 @@ static int32_t generate_server_tokens(
             model, cache_plan.session_id, prompt, stable_prefix_tokens)
         : 0;
     if (reused_tokens == 0) model.reset(1);
-    auto full_ids = torch::tensor(prompt, options)
+    auto full_ids = mfq_tensor_backend::tensor(prompt, options)
         .reshape({1, -1}).contiguous();
     auto ids = full_ids.narrow(
         1, static_cast<int64_t>(reused_tokens),
         static_cast<int64_t>(prompt.size() - reused_tokens)).contiguous();
     const bool has_penalties = sampling_has_penalties(sampling);
     graph_cache.ensure_storage(model.c.vocab_size);
-    auto counts = has_penalties ? graph_cache.counts : torch::Tensor();
+    auto counts = has_penalties ? graph_cache.counts : mfq_tensor_backend::Tensor();
     if (has_penalties) {
         counts.zero_();
         sample_token_counts_add_cuda(counts, full_ids);
     }
 
-    auto random_host = torch::empty(
-        {1}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true));
-    auto random_cuda = torch::empty(
-        {1}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    auto random_host = mfq_tensor_backend::empty(
+        {1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32).device(mfq_tensor_backend::kCPU).pinned_memory(true));
+    auto random_cuda = mfq_tensor_backend::empty(
+        {1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32).device(mfq_tensor_backend::kCUDA));
     std::mt19937_64 rng(sampling.seed);
     const auto store_session_snapshot = [&](size_t token_count) {
         if (!session_enabled || model.cache_pos !=
@@ -19710,14 +19698,14 @@ static int32_t generate_server_tokens(
                     1, static_cast<int64_t>(reused_tokens),
                     static_cast<int64_t>(
                         stable_prefix_tokens - reused_tokens)).contiguous();
-                c10::optional<torch::Tensor> stable_seq_len = c10::nullopt;
+                MfqOptional<mfq_tensor_backend::Tensor> stable_seq_len = mfq_nullopt;
                 if (!model.c.is_minicpmo45() && model.cache_pos > 0 &&
                         stable_suffix.size(1) == 1) {
-                    stable_seq_len = torch::full(
+                    stable_seq_len = mfq_tensor_backend::full(
                         {1}, model.cache_pos + 1, options);
                 }
                 (void)model.hidden_forward(
-                    stable_suffix, c10::nullopt, stable_seq_len);
+                    stable_suffix, mfq_nullopt, stable_seq_len);
             }
             store_session_snapshot(stable_prefix_tokens);
             ids = full_ids.narrow(
@@ -19753,37 +19741,37 @@ static int32_t generate_server_tokens(
         auto [first, first_token] = sample_first_token();
         if (!on_token(first_token)) return 1;
 
-        std::vector<torch::Tensor> incremental_trace;
-        std::vector<torch::Tensor> full_trace;
-        std::vector<std::pair<std::string, torch::Tensor>> incremental_gemma_trace;
-        std::vector<std::pair<std::string, torch::Tensor>> full_gemma_trace;
+        std::vector<mfq_tensor_backend::Tensor> incremental_trace;
+        std::vector<mfq_tensor_backend::Tensor> full_trace;
+        std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>> incremental_gemma_trace;
+        std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>> full_gemma_trace;
         const int64_t decode_len = model.cache_pos + 1;
-        auto seq_len = torch::tensor({decode_len}, options);
+        auto seq_len = mfq_tensor_backend::tensor({decode_len}, options);
         g_gemma_trace_layer = 0;
         g_gemma_stage_trace = &incremental_gemma_trace;
         auto incremental_hidden = model.hidden_forward(
-            first.reshape({1, 1}), c10::nullopt, seq_len, &incremental_trace);
+            first.reshape({1, 1}), mfq_nullopt, seq_len, &incremental_trace);
         g_gemma_stage_trace = nullptr;
 
         history.push_back(first_token);
         model.reset(1);
-        auto full_ids = torch::tensor(history, options).reshape({1, -1}).contiguous();
+        auto full_ids = mfq_tensor_backend::tensor(history, options).reshape({1, -1}).contiguous();
         g_gemma_stage_trace = &full_gemma_trace;
         auto full_hidden = model.hidden_forward(
-            full_ids, c10::nullopt, c10::nullopt, &full_trace);
+            full_ids, mfq_nullopt, mfq_nullopt, &full_trace);
         g_gemma_stage_trace = nullptr;
         g_gemma_trace_layer = -1;
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
 
         if (incremental_trace.size() != full_trace.size()) {
             throw std::runtime_error("incremental trace stage count mismatch");
         }
         for (size_t i = 0; i < incremental_trace.size(); ++i) {
-            auto got = incremental_trace[i].reshape({-1}).to(torch::kFloat64);
-            auto ref = full_trace[i].index({Slice(), -1, Slice()}).reshape({-1}).to(torch::kFloat64);
+            auto got = incremental_trace[i].reshape({-1}).to(mfq_tensor_backend::kFloat64);
+            auto ref = full_trace[i].index({Slice(), -1, Slice()}).reshape({-1}).to(mfq_tensor_backend::kFloat64);
             const double denominator = std::max(ref.norm().item<double>(), 1.0e-30);
             const double relative_l2 = (got - ref).norm().item<double>() / denominator;
-            const double cosine = torch::dot(got, ref).item<double>() /
+            const double cosine = mfq_tensor_backend::dot(got, ref).item<double>() /
                 std::max(got.norm().item<double>() * denominator, 1.0e-30);
             std::cerr << "incremental_trace stage="
                       << (i == 0 ? "embedding" : "block_" + std::to_string(i - 1))
@@ -19800,13 +19788,13 @@ static int32_t generate_server_tokens(
                 full_tensor.numel() < got_tensor.numel()) {
                 throw std::runtime_error("incremental Gemma stage layout mismatch");
             }
-            auto got = got_tensor.reshape({-1}).to(torch::kFloat64);
+            auto got = got_tensor.reshape({-1}).to(mfq_tensor_backend::kFloat64);
             auto full_flat = full_tensor.reshape({-1});
             auto ref = full_flat.narrow(
-                0, full_flat.numel() - got_tensor.numel(), got_tensor.numel()).to(torch::kFloat64);
+                0, full_flat.numel() - got_tensor.numel(), got_tensor.numel()).to(mfq_tensor_backend::kFloat64);
             const double denominator = std::max(ref.norm().item<double>(), 1.0e-30);
             const double relative_l2 = (got - ref).norm().item<double>() / denominator;
-            const double cosine = torch::dot(got, ref).item<double>() /
+            const double cosine = mfq_tensor_backend::dot(got, ref).item<double>() /
                 std::max(got.norm().item<double>() * denominator, 1.0e-30);
             std::cerr << "incremental_gemma_trace stage="
                       << incremental_gemma_trace[i].first
@@ -19814,12 +19802,12 @@ static int32_t generate_server_tokens(
                       << " cosine=" << cosine << std::endl;
         }
         auto incremental_logits = model.lm_head.forward(
-            incremental_hidden.index({Slice(), -1, Slice()}).to(torch::kFloat16).contiguous());
+            incremental_hidden.index({Slice(), -1, Slice()}).to(mfq_tensor_backend::kFloat16).contiguous());
         auto full_logits = model.lm_head.forward(
-            full_hidden.index({Slice(), -1, Slice()}).to(torch::kFloat16).contiguous());
+            full_hidden.index({Slice(), -1, Slice()}).to(mfq_tensor_backend::kFloat16).contiguous());
         const double logits_relative_l2 =
-            (incremental_logits.to(torch::kFloat64) - full_logits.to(torch::kFloat64)).norm().item<double>() /
-            std::max(full_logits.to(torch::kFloat64).norm().item<double>(), 1.0e-30);
+            (incremental_logits.to(mfq_tensor_backend::kFloat64) - full_logits.to(mfq_tensor_backend::kFloat64)).norm().item<double>() /
+            std::max(full_logits.to(mfq_tensor_backend::kFloat64).norm().item<double>(), 1.0e-30);
         std::cerr << "incremental_trace logits_relative_l2=" << logits_relative_l2
                   << " incremental_top=" << incremental_logits.argmax(-1).item<int64_t>()
                   << " full_top=" << full_logits.argmax(-1).item<int64_t>() << std::endl;
@@ -19829,6 +19817,7 @@ static int32_t generate_server_tokens(
     const char * graph_env = std::getenv("MFQ_SERVER_CUDA_GRAPH");
     const bool graph_enabled =
         (graph_env == nullptr || graph_env[0] != '0') &&
+        mfq_cuda_graph_capture_supported() &&
         g_dsv4_cpu_offload_layers.empty() &&
         g_dense_cpu_layer_count == 0 &&
         !g_moe_expert_cache &&
@@ -19850,7 +19839,7 @@ static int32_t generate_server_tokens(
         int32_t generated = 1;
         if (!on_token(first_token) || generated >= sampling.max_tokens) return generated;
 
-        c10::cuda::CUDAStreamGuard graph_guard(graph_cache.stream);
+        MfqCudaStreamGuard graph_guard(graph_cache.stream);
         cudaStream_t graph_raw_stream = graph_cache.stream.stream();
         if (has_penalties) {
             sample_token_counts_add_cuda(graph_cache.counts, first.contiguous());
@@ -19908,7 +19897,7 @@ static int32_t generate_server_tokens(
         const bool cache_hit = graph_cache.matches(planned_len, sampling, greedy);
         if (!cache_hit) {
             graph_cache.invalidate();
-            c10::cuda::CUDACachingAllocator::emptyCache();
+            mfq_cuda_empty_cache();
             g_decode_graph_attention_kv_len = planned_len;
             g_decode_graph_attention_parts = planned_len >= 192 ? (planned_len + 127) / 128 : 1;
             g_decode_graph_attention_parts = std::min<int64_t>(
@@ -19919,7 +19908,7 @@ static int32_t generate_server_tokens(
                     MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
                 }
 
-                graph_cache.graph = std::make_unique<at::cuda::CUDAGraph>();
+                graph_cache.graph = std::make_unique<MfqCudaGraph>();
                 graph_cache.graph->capture_begin();
                 graph_cache.static_next = sample_static();
                 if (has_penalties) {
@@ -19974,9 +19963,9 @@ static int32_t generate_server_tokens(
     while (generated < sampling.max_tokens) {
         if (reprefill && generated > 0) {
             model.reset(1);
-            ids = torch::tensor(history, options).reshape({1, -1}).contiguous();
+            ids = mfq_tensor_backend::tensor(history, options).reshape({1, -1}).contiguous();
         }
-        torch::Tensor next;
+        mfq_tensor_backend::Tensor next;
         int64_t token = 0;
         if (generated == 0) {
             auto first = sample_first_token();
@@ -20027,27 +20016,27 @@ static int32_t generate_server_multimodal_tokens(
     }
 
     const auto cpu_i64 =
-        torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCPU);
     const auto cuda_i64 =
-        torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
-    auto input_ids = torch::tensor(prompt, cuda_i64)
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA);
+    auto input_ids = mfq_tensor_backend::tensor(prompt, cuda_i64)
         .reshape({1, -1}).contiguous();
-    auto pixels = torch::from_blob(
+    auto pixels = mfq_tensor_backend::from_blob(
         const_cast<float *>(vision.pixel_values.data()),
         vision.pixel_shape,
-        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32).device(mfq_tensor_backend::kCPU))
         .clone();
-    auto patch_mask = torch::from_blob(
+    auto patch_mask = mfq_tensor_backend::from_blob(
         const_cast<uint8_t *>(vision.patch_mask.data()),
         vision.patch_mask_shape,
-        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU))
-        .clone().to(torch::kBool);
-    auto target_sizes = torch::from_blob(
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kUInt8).device(mfq_tensor_backend::kCPU))
+        .clone().to(mfq_tensor_backend::kBool);
+    auto target_sizes = mfq_tensor_backend::from_blob(
         const_cast<int32_t *>(vision.target_sizes.data()),
         vision.target_sizes_shape,
-        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU))
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32).device(mfq_tensor_backend::kCPU))
         .clone();
-    auto image_bounds = torch::from_blob(
+    auto image_bounds = mfq_tensor_backend::from_blob(
         const_cast<int64_t *>(vision.image_bounds.data()),
         std::vector<int64_t>{
             static_cast<int64_t>(vision.image_bounds.size() / 4), 4},
@@ -20055,38 +20044,38 @@ static int32_t generate_server_multimodal_tokens(
 
     const bool has_penalties = sampling_has_penalties(sampling);
     auto counts = has_penalties
-        ? torch::zeros(
+        ? mfq_tensor_backend::zeros(
               {runtime.language.c.vocab_size},
-              torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA))
-        : torch::Tensor();
+              mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32).device(mfq_tensor_backend::kCUDA))
+        : mfq_tensor_backend::Tensor();
     if (has_penalties) {
         sample_token_counts_add_cuda(counts, input_ids);
     }
-    auto random_host = torch::empty(
-        {1}, torch::TensorOptions().dtype(torch::kFloat32)
-            .device(torch::kCPU).pinned_memory(true));
-    auto random_cuda = torch::empty(
-        {1}, torch::TensorOptions().dtype(torch::kFloat32)
-            .device(torch::kCUDA));
+    auto random_host = mfq_tensor_backend::empty(
+        {1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32)
+            .device(mfq_tensor_backend::kCPU).pinned_memory(true));
+    auto random_cuda = mfq_tensor_backend::empty(
+        {1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32)
+            .device(mfq_tensor_backend::kCUDA));
     std::mt19937_64 rng(sampling.seed);
 
     ServerPrefillCudaTimer prefill_timer;
     auto result = runtime.forward(
         input_ids,
-        torch::Tensor(),
-        torch::Tensor(),
+        mfq_tensor_backend::Tensor(),
+        mfq_tensor_backend::Tensor(),
         pixels,
         patch_mask,
         target_sizes,
         image_bounds,
-        torch::Tensor(),
-        torch::Tensor(),
-        torch::Tensor());
+        mfq_tensor_backend::Tensor(),
+        mfq_tensor_backend::Tensor(),
+        mfq_tensor_backend::Tensor());
     auto logits = result.logits.index({Slice(), -1, Slice()})
         .contiguous().view({1, -1});
     MFQ_CUDA_CHECK(cudaEventRecord(
         prefill_timer.finished_event(),
-        at::cuda::getCurrentCUDAStream()));
+        mfq_get_current_cuda_stream()));
     auto next = sample_server_logits(
         std::move(logits), sampling, counts, random_host,
         random_cuda, rng, token_constraint);
@@ -20396,9 +20385,9 @@ static int run_kl_eval(
         for (size_t j = 0; j < chunk.tokens.size(); ++j) {
             chunk_tokens[j] = chunk.tokens[j];
         }
-        auto ids = torch::from_blob(chunk_tokens.data(), {1, (int64_t)chunk_tokens.size()},
-                                    torch::TensorOptions().dtype(torch::kInt64)).clone().to(torch::kCUDA);
-        torch::Tensor pred;
+        auto ids = mfq_tensor_backend::from_blob(chunk_tokens.data(), {1, (int64_t)chunk_tokens.size()},
+                                    mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64)).clone().to(mfq_tensor_backend::kCUDA);
+        mfq_tensor_backend::Tensor pred;
         if (optimized) {
             auto hidden = model.hidden_forward(ids);
             auto selected_hidden = hidden.index({
@@ -20415,23 +20404,23 @@ static int run_kl_eval(
         }
         if (pred.size(1) != n_vocab) throw std::runtime_error("KL vocab size mismatch");
 
-        torch::Tensor optimized_kld_sum;
-        torch::Tensor optimized_reverse_kld_sum;
-        torch::Tensor optimized_bf16_ce_sum;
-        torch::Tensor optimized_mfq_ce_sum;
-        torch::Tensor optimized_same_top;
+        mfq_tensor_backend::Tensor optimized_kld_sum;
+        mfq_tensor_backend::Tensor optimized_reverse_kld_sum;
+        mfq_tensor_backend::Tensor optimized_bf16_ce_sum;
+        mfq_tensor_backend::Tensor optimized_mfq_ce_sum;
+        mfq_tensor_backend::Tensor optimized_same_top;
         if (optimized) {
-            const auto cuda = torch::TensorOptions().device(torch::kCUDA);
-            optimized_kld_sum = torch::zeros(
-                {}, cuda.dtype(torch::kFloat64));
-            optimized_reverse_kld_sum = torch::zeros(
-                {}, cuda.dtype(torch::kFloat64));
-            optimized_bf16_ce_sum = torch::zeros(
-                {}, cuda.dtype(torch::kFloat64));
-            optimized_mfq_ce_sum = torch::zeros(
-                {}, cuda.dtype(torch::kFloat64));
-            optimized_same_top = torch::zeros(
-                {}, cuda.dtype(torch::kInt64));
+            const auto cuda = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA);
+            optimized_kld_sum = mfq_tensor_backend::zeros(
+                {}, cuda.dtype(mfq_tensor_backend::kFloat64));
+            optimized_reverse_kld_sum = mfq_tensor_backend::zeros(
+                {}, cuda.dtype(mfq_tensor_backend::kFloat64));
+            optimized_bf16_ce_sum = mfq_tensor_backend::zeros(
+                {}, cuda.dtype(mfq_tensor_backend::kFloat64));
+            optimized_mfq_ce_sum = mfq_tensor_backend::zeros(
+                {}, cuda.dtype(mfq_tensor_backend::kFloat64));
+            optimized_same_top = mfq_tensor_backend::zeros(
+                {}, cuda.dtype(mfq_tensor_backend::kInt64));
         }
         f.seekg(chunk.row_offset);
         for (int s = 0; s < score_count; s += KL_BATCH) {
@@ -20448,41 +20437,41 @@ static int run_kl_eval(
                 std::memcpy(&mins[r], row + 2, sizeof(float));
                 for (int v = 0; v < n_vocab; ++v) codes[(size_t)r * n_vocab + v] = row[4 + v];
             }
-            auto scale = torch::from_blob(scales.data(), {b}, torch::TensorOptions().dtype(torch::kFloat32)).clone().to(torch::kCUDA);
-            auto min_lp = torch::from_blob(mins.data(), {b}, torch::TensorOptions().dtype(torch::kFloat32)).clone().to(torch::kCUDA);
-            auto base_codes = torch::from_blob(
-                codes.data(), {b, n_vocab}, torch::TensorOptions().dtype(torch::kInt32))
-                .clone().to(torch::kCUDA);
-            auto base_logp = base_codes.to(torch::kFloat32) * scale.unsqueeze(1) +
+            auto scale = mfq_tensor_backend::from_blob(scales.data(), {b}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32)).clone().to(mfq_tensor_backend::kCUDA);
+            auto min_lp = mfq_tensor_backend::from_blob(mins.data(), {b}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32)).clone().to(mfq_tensor_backend::kCUDA);
+            auto base_codes = mfq_tensor_backend::from_blob(
+                codes.data(), {b, n_vocab}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+                .clone().to(mfq_tensor_backend::kCUDA);
+            auto base_logp = base_codes.to(mfq_tensor_backend::kFloat32) * scale.unsqueeze(1) +
                 min_lp.unsqueeze(1);
-            auto q = pred.index({Slice(s, s + b), Slice()}).to(torch::kFloat32);
-            auto lse = torch::logsumexp(q, -1);
+            auto q = pred.index({Slice(s, s + b), Slice()}).to(mfq_tensor_backend::kFloat32);
+            auto lse = mfq_tensor_backend::logsumexp(q, -1);
             auto quant_logp = q - lse.unsqueeze(1);
             auto normalized_base_logp =
-                base_logp - torch::logsumexp(base_logp, -1, true);
-            auto p_base = torch::exp(base_logp).masked_fill(base_codes.eq(0), 0.0f);
+                base_logp - mfq_tensor_backend::logsumexp(base_logp, -1, true);
+            auto p_base = mfq_tensor_backend::exp(base_logp).masked_fill(base_codes.eq(0), 0.0f);
             auto kld = (p_base * (base_logp - q + lse.unsqueeze(1))).sum(-1);
             auto reverse_kld =
-                (torch::exp(quant_logp) * (quant_logp - normalized_base_logp)).sum(-1);
+                (mfq_tensor_backend::exp(quant_logp) * (quant_logp - normalized_base_logp)).sum(-1);
             if (optimized) {
-                optimized_kld_sum.add_(kld.to(torch::kFloat64).sum());
+                optimized_kld_sum.add_(kld.to(mfq_tensor_backend::kFloat64).sum());
                 optimized_reverse_kld_sum.add_(
-                    reverse_kld.to(torch::kFloat64).sum());
+                    reverse_kld.to(mfq_tensor_backend::kFloat64).sum());
             } else {
-                kld_sum += kld.to(torch::kFloat64).sum().item<double>();
+                kld_sum += kld.to(mfq_tensor_backend::kFloat64).sum().item<double>();
                 reverse_kld_sum +=
-                    reverse_kld.to(torch::kFloat64).sum().item<double>();
+                    reverse_kld.to(mfq_tensor_backend::kFloat64).sum().item<double>();
             }
             std::vector<int64_t> target_ids(b);
             for (int r = 0; r < b; ++r) {
                 target_ids[r] = chunk_tokens[(size_t)chunk.target_start + s + r];
             }
-            auto target = torch::from_blob(target_ids.data(), {b, 1},
-                                            torch::TensorOptions().dtype(torch::kInt64))
-                              .clone().to(torch::kCUDA);
+            auto target = mfq_tensor_backend::from_blob(target_ids.data(), {b, 1},
+                                            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
+                              .clone().to(mfq_tensor_backend::kCUDA);
             if (chunk.target_log_probs.empty()) {
                 auto batch_bf16_ce =
-                    -base_logp.gather(1, target).to(torch::kFloat64).sum();
+                    -base_logp.gather(1, target).to(mfq_tensor_backend::kFloat64).sum();
                 if (optimized) {
                     optimized_bf16_ce_sum.add_(batch_bf16_ce);
                 } else {
@@ -20494,7 +20483,7 @@ static int run_kl_eval(
                 }
             }
             auto batch_mfq_ce = (lse.unsqueeze(1) - q.gather(1, target))
-                                     .to(torch::kFloat64).sum();
+                                     .to(mfq_tensor_backend::kFloat64).sum();
             auto batch_same_top =
                 q.argmax(-1).eq(base_logp.argmax(-1)).sum();
             if (optimized) {
@@ -20515,7 +20504,7 @@ static int run_kl_eval(
             mfq_ce_sum += optimized_mfq_ce_sum.item<double>();
             same_top += optimized_same_top.item<int64_t>();
         }
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
         std::cout << "cpp_kl_chunk=" << (ci + 1)
                   << " mean=" << (kld_sum / (double)count)
                   << " mean_kld_q_ref=" << (reverse_kld_sum / (double)count)
@@ -20675,7 +20664,7 @@ static StreamedKlInput load_streamed_kl_input(
     return input;
 }
 
-static torch::Tensor streamed_kl_ids(
+static mfq_tensor_backend::Tensor streamed_kl_ids(
     const StreamedKlInput & input,
     int begin,
     int count,
@@ -20688,10 +20677,10 @@ static torch::Tensor streamed_kl_ids(
                 source[(size_t)ti];
         }
     }
-    return torch::from_blob(
+    return mfq_tensor_backend::from_blob(
         token_ids.data(), {count, n_ctx},
-        torch::TensorOptions().dtype(torch::kInt64))
-        .clone().to(torch::kCUDA);
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
+        .clone().to(mfq_tensor_backend::kCUDA);
 }
 
 struct KlEvalMetrics {
@@ -20707,7 +20696,7 @@ static void accumulate_streamed_kl_chunk(
     std::ifstream & f,
     const StreamedKlInput & input,
     int chunk_index,
-    torch::Tensor pred,
+    mfq_tensor_backend::Tensor pred,
     int score_count,
     KlEvalMetrics & metrics) {
     constexpr int KL_BATCH = 8;
@@ -20731,50 +20720,50 @@ static void accumulate_streamed_kl_chunk(
                 codes[(size_t)r * input.n_vocab + v] = row[4 + v];
             }
         }
-        auto scale = torch::from_blob(
+        auto scale = mfq_tensor_backend::from_blob(
             scales.data(), {b},
-            torch::TensorOptions().dtype(torch::kFloat32))
-            .clone().to(torch::kCUDA);
-        auto min_lp = torch::from_blob(
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32))
+            .clone().to(mfq_tensor_backend::kCUDA);
+        auto min_lp = mfq_tensor_backend::from_blob(
             mins.data(), {b},
-            torch::TensorOptions().dtype(torch::kFloat32))
-            .clone().to(torch::kCUDA);
-        auto base_codes = torch::from_blob(
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32))
+            .clone().to(mfq_tensor_backend::kCUDA);
+        auto base_codes = mfq_tensor_backend::from_blob(
             codes.data(), {b, input.n_vocab},
-            torch::TensorOptions().dtype(torch::kInt32))
-            .clone().to(torch::kCUDA);
-        auto base_logp = base_codes.to(torch::kFloat32) *
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+            .clone().to(mfq_tensor_backend::kCUDA);
+        auto base_logp = base_codes.to(mfq_tensor_backend::kFloat32) *
             scale.unsqueeze(1) + min_lp.unsqueeze(1);
-        auto q = pred.index({Slice(s, s + b), Slice()}).to(torch::kFloat32);
-        auto lse = torch::logsumexp(q, -1);
+        auto q = pred.index({Slice(s, s + b), Slice()}).to(mfq_tensor_backend::kFloat32);
+        auto lse = mfq_tensor_backend::logsumexp(q, -1);
         auto quant_logp = q - lse.unsqueeze(1);
         auto normalized_base_logp =
-            base_logp - torch::logsumexp(base_logp, -1, true);
+            base_logp - mfq_tensor_backend::logsumexp(base_logp, -1, true);
         auto p_base =
-            torch::exp(base_logp).masked_fill(base_codes.eq(0), 0.0f);
+            mfq_tensor_backend::exp(base_logp).masked_fill(base_codes.eq(0), 0.0f);
         auto kld =
             (p_base * (base_logp - q + lse.unsqueeze(1))).sum(-1);
         auto reverse_kld =
-            (torch::exp(quant_logp) *
+            (mfq_tensor_backend::exp(quant_logp) *
              (quant_logp - normalized_base_logp)).sum(-1);
         metrics.kld_sum +=
-            kld.to(torch::kFloat64).sum().item<double>();
+            kld.to(mfq_tensor_backend::kFloat64).sum().item<double>();
         metrics.reverse_kld_sum +=
-            reverse_kld.to(torch::kFloat64).sum().item<double>();
+            reverse_kld.to(mfq_tensor_backend::kFloat64).sum().item<double>();
 
         std::vector<int64_t> target_ids(b);
         for (int r = 0; r < b; ++r) {
             target_ids[r] =
                 chunk.tokens[(size_t)chunk.target_start + s + r];
         }
-        auto target = torch::from_blob(
+        auto target = mfq_tensor_backend::from_blob(
             target_ids.data(), {b, 1},
-            torch::TensorOptions().dtype(torch::kInt64))
-            .clone().to(torch::kCUDA);
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
+            .clone().to(mfq_tensor_backend::kCUDA);
         if (chunk.target_log_probs.empty()) {
             metrics.reference_ce_sum +=
                 -base_logp.gather(1, target)
-                    .to(torch::kFloat64).sum().item<double>();
+                    .to(mfq_tensor_backend::kFloat64).sum().item<double>();
         } else {
             for (int r = 0; r < b; ++r) {
                 metrics.reference_ce_sum -=
@@ -20783,7 +20772,7 @@ static void accumulate_streamed_kl_chunk(
         }
         metrics.quant_ce_sum +=
             (lse.unsqueeze(1) - q.gather(1, target))
-                .to(torch::kFloat64).sum().item<double>();
+                .to(mfq_tensor_backend::kFloat64).sum().item<double>();
         metrics.same_top +=
             q.argmax(-1).eq(base_logp.argmax(-1)).sum().item<int64_t>();
         metrics.count += b;
@@ -20901,7 +20890,7 @@ static int run_kl_eval_batched(
                           (double)metrics.count)
                       << "\n";
         }
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
     }
     auto ended = std::chrono::steady_clock::now();
     std::cout << "cpp_kl_result chunks=" << chunks
@@ -21074,12 +21063,12 @@ static int run_kl_eval_streamed(
 
     const int64_t hidden_bytes =
         (int64_t)chunks * n_ctx * model.c.hc_mult *
-        model.c.hidden_size * (int64_t)sizeof(c10::Half);
-    auto hidden_cpu = torch::empty(
+        model.c.hidden_size * (int64_t)sizeof(mfq_half);
+    auto hidden_cpu = mfq_tensor_backend::empty(
         {chunks, n_ctx, model.c.hc_mult, model.c.hidden_size},
-        torch::TensorOptions()
-            .device(torch::kCPU)
-            .dtype(torch::kFloat16)
+        mfq_tensor_backend::TensorOptions()
+            .device(mfq_tensor_backend::kCPU)
+            .dtype(mfq_tensor_backend::kFloat16)
             .pinned_memory(true));
     std::cout << "cpp_kl_stream_begin chunks=" << chunks
               << " ctx=" << n_ctx
@@ -21103,7 +21092,7 @@ static int run_kl_eval_streamed(
                 count, n_ctx, model.c.hc_mult, model.c.hidden_size})
             .contiguous();
         hidden_cpu.narrow(0, begin, count).copy_(x, true);
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
     }
     std::cout << "cpp_kl_stream_phase=embedding completed_chunks="
               << chunks << "\n";
@@ -21129,23 +21118,23 @@ static int run_kl_eval_streamed(
         for (int begin = 0; begin < chunks; begin += chunk_batch) {
             const int count = std::min(chunk_batch, chunks - begin);
             auto ids = streamed_kl_ids(input, begin, count, n_ctx);
-            auto pos = torch::arange(
+            auto pos = mfq_tensor_backend::arange(
                 0, n_ctx,
-                torch::TensorOptions()
-                    .device(torch::kCUDA).dtype(torch::kInt64));
-            auto x = hidden_cpu.narrow(0, begin, count).to(torch::kCUDA);
+                mfq_tensor_backend::TensorOptions()
+                    .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt64));
+            auto x = hidden_cpu.narrow(0, begin, count).to(mfq_tensor_backend::kCUDA);
             for (auto & block : blocks) {
                 block->reset(count);
                 block->set_token_ids(ids);
                 x = block->forward(
-                    x, pos, 0, c10::nullopt, model.c, model.rope);
+                    x, pos, 0, mfq_nullopt, model.c, model.rope);
             }
             hidden_cpu.narrow(0, begin, count).copy_(x, true);
-            torch::cuda::synchronize();
+            mfq_cuda_synchronize();
         }
         blocks.clear();
         dsv4_state.reset();
-        c10::cuda::CUDACachingAllocator::emptyCache();
+        mfq_cuda_empty_cache();
         auto group_ended = std::chrono::steady_clock::now();
         std::cout << "cpp_kl_stream_layers begin=" << layer_begin
                   << " end=" << layer_end
@@ -21163,24 +21152,24 @@ static int run_kl_eval_streamed(
     KlEvalMetrics metrics;
     for (int begin = 0; begin < chunks; begin += chunk_batch) {
         const int count = std::min(chunk_batch, chunks - begin);
-        auto x = hidden_cpu.narrow(0, begin, count).to(torch::kCUDA);
+        auto x = hidden_cpu.narrow(0, begin, count).to(mfq_tensor_backend::kCUDA);
         auto y = model.finalize_hidden(x, count, n_ctx);
         auto selected =
             y.index({Slice(), Slice(first, first + score_count), Slice()});
         auto logits = model.lm_head.forward(selected);
         if (model.c.final_logit_softcapping > 0.0) {
-            logits = torch::tanh(
+            logits = mfq_tensor_backend::tanh(
                 logits / model.c.final_logit_softcapping) *
                 model.c.final_logit_softcapping;
         }
         if (logits_output.is_open()) {
-            auto saved = logits.to(torch::kCPU, torch::kFloat16)
+            auto saved = logits.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kFloat16)
                              .contiguous();
             logits_output.write(
                 reinterpret_cast<const char *>(
-                    saved.data_ptr<c10::Half>()),
+                    saved.data_ptr<mfq_half>()),
                 static_cast<std::streamsize>(
-                    saved.numel() * sizeof(c10::Half)));
+                    saved.numel() * sizeof(mfq_half)));
             if (!logits_output) {
                 throw std::runtime_error(
                     "failed while writing saved KL logits: " +
@@ -21202,7 +21191,7 @@ static int run_kl_eval_streamed(
                           (double)metrics.count)
                       << "\n";
         }
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
     }
     auto ended = std::chrono::steady_clock::now();
     if (logits_output.is_open()) {
@@ -21267,20 +21256,20 @@ static int run_linear_check(
         linear.nint.w.bits == 5 && linear.nint.w.gs == 28) {
         enable_nint5_q5_exec(linear.nint.w);
     }
-    TORCH_CHECK(M >= 1 && M <= 4096, "--check-linear-m must be in [1, 4096]");
-    TORCH_CHECK(reps >= 1, "--check-linear-reps must be positive");
+    MFQ_RUNTIME_CHECK(M >= 1 && M <= 4096, "--check-linear-m must be in [1, 4096]");
+    MFQ_RUNTIME_CHECK(reps >= 1, "--check-linear-reps must be positive");
     int64_t neuron_len = linear.neuron_len();
-    auto x = torch::arange((int64_t)M * neuron_len,
-                           torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32))
+    auto x = mfq_tensor_backend::arange((int64_t)M * neuron_len,
+                           mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32))
                  .reshape({M, neuron_len});
     x = (x.remainder(97) - 48) / 512.0;
-    auto xh = x.to(torch::kFloat16).contiguous();
-    torch::Tensor gateh;
+    auto xh = x.to(mfq_tensor_backend::kFloat16).contiguous();
+    mfq_tensor_backend::Tensor gateh;
     if (gate_mode != 0) {
-        TORCH_CHECK(gate_mode == 1 || gate_mode == 2, "linear check gate mode must be 0, 1, or 2");
-        gateh = ((torch::arange((int64_t)M * neuron_len, x.options()).reshape({M, neuron_len})
+        MFQ_RUNTIME_CHECK(gate_mode == 1 || gate_mode == 2, "linear check gate mode must be 0, 1, or 2");
+        gateh = ((mfq_tensor_backend::arange((int64_t)M * neuron_len, x.options()).reshape({M, neuron_len})
                     .remainder(53) - 26) / 16.0)
-                    .to(torch::kFloat16).contiguous();
+                    .to(mfq_tensor_backend::kFloat16).contiguous();
     }
     auto run = [&]() {
         return gate_mode == 0 ? linear.forward(xh) : linear.forward_input_mul(xh, gateh, gate_mode);
@@ -21289,34 +21278,34 @@ static int run_linear_check(
         std::getenv("MFQ_CHECK_LINEAR_BF16_OUTPUT");
     if (check_bf16_output_env != nullptr &&
             check_bf16_output_env[0] == '1') {
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             gate_mode == 0,
             "direct BF16 linear check does not support input gating");
-        auto bf16_input = x.to(torch::kBFloat16).contiguous();
+        auto bf16_input = x.to(mfq_tensor_backend::kBFloat16).contiguous();
         auto reference = linear.forward(bf16_input)
-            .to(torch::kBFloat16).contiguous();
+            .to(mfq_tensor_backend::kBFloat16).contiguous();
         auto candidate = linear.forward_bf16_output(bf16_input);
         auto difference =
-            (candidate.to(torch::kFloat32) -
-             reference.to(torch::kFloat32)).abs();
+            (candidate.to(mfq_tensor_backend::kFloat32) -
+             reference.to(mfq_tensor_backend::kFloat32)).abs();
         std::cout << "linear_bf16_output_check"
                   << " max_abs="
                   << difference.max().item<double>()
                   << " equal="
                   << (candidate.equal(reference) ? 1 : 0)
                   << "\n";
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             candidate.equal(reference),
             "direct BF16 NINT output differs from FP16-then-BF16 reference");
     }
-    torch::Tensor y_test;
+    mfq_tensor_backend::Tensor y_test;
     const int warmups = std::min(30, std::max(1, reps));
     for (int i = 0; i < warmups; ++i) y_test = run();
-    torch::cuda::synchronize();
+    mfq_cuda_synchronize();
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    auto stream = mfq_get_current_cuda_stream().stream();
     cudaEventRecord(start, stream);
     for (int i = 0; i < reps; ++i) y_test = run();
     cudaEventRecord(stop, stream);
@@ -21325,7 +21314,7 @@ static int run_linear_check(
     cudaEventElapsedTime(&elapsed_ms, start, stop);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
-    y_test = y_test.to(torch::kFloat32);
+    y_test = y_test.to(mfq_tensor_backend::kFloat32);
 
     const NintWeight * nint = linear.is_nint() ? &linear.nint.w : nullptr;
     const NvqWeight * nvq = linear.is_nvq() ? &linear.nvq.w : nullptr;
@@ -21348,7 +21337,7 @@ static int run_linear_check(
         }
         mfq_set_env(dq_env_name, "0");
     }
-    torch::Tensor ww;
+    mfq_tensor_backend::Tensor ww;
     if (nint != nullptr) {
         ww = nint->q8_zero
             ? nint8_zero_dequant_cuda(
@@ -21377,11 +21366,11 @@ static int run_linear_check(
     } else {
         ww = mxfp8_cpu_reference(*mxfp8);
     }
-    torch::Tensor ref_input = xh;
-    if (gate_mode == 1) ref_input = xh * torch::sigmoid(gateh);
-    else if (gate_mode == 2) ref_input = xh * torch::silu(gateh);
-    auto y_ref = torch::matmul(ref_input, ww.transpose(0, 1)).to(torch::kFloat32);
-    torch::cuda::synchronize();
+    mfq_tensor_backend::Tensor ref_input = xh;
+    if (gate_mode == 1) ref_input = xh * mfq_tensor_backend::sigmoid(gateh);
+    else if (gate_mode == 2) ref_input = xh * mfq_tensor_backend::silu(gateh);
+    auto y_ref = mfq_tensor_backend::matmul(ref_input, ww.transpose(0, 1)).to(mfq_tensor_backend::kFloat32);
+    mfq_cuda_synchronize();
     if (dq_env_name != nullptr) {
         mfq_set_env(dq_env_name, had_dq_env ? dq_env_saved.c_str() : "");
     }
@@ -21390,7 +21379,7 @@ static int run_linear_check(
     double weight_bytes = nint != nullptr
         ? (double)nint->q_packed.numel() +
           (nint->q8_zero
-              ? (double)nint->q8_zero_scale.numel() * sizeof(c10::Half)
+              ? (double)nint->q8_zero_scale.numel() * sizeof(mfq_half)
               : (nint->q5_exec
                     ? 0.0
                     : (double)(nint->sub_scale.numel() +
@@ -21405,7 +21394,7 @@ static int run_linear_check(
         ? (double)mxfp4->values.numel() + (double)mxfp4->scales.numel()
         : tpq != nullptr
         ? (double)tpq->packed.numel() +
-          (double)tpq->scales.numel() * sizeof(c10::Half) +
+          (double)tpq->scales.numel() * sizeof(mfq_half) +
           (double)tpq->codebook.numel() * sizeof(float)
         : (double)mxfp8->values.numel() + (double)mxfp8->scales.numel();
     std::cout << "shape=" << y_ref.sizes() << "\n";
@@ -21439,35 +21428,35 @@ static int run_cpu_linear_check(
         int rows,
         int gate_mode,
         int reps) {
-    TORCH_CHECK(rows >= 1 && rows <= 4096, "--check-linear-m must be in [1, 4096]");
-    TORCH_CHECK(reps >= 1, "--check-linear-reps must be positive");
+    MFQ_RUNTIME_CHECK(rows >= 1 && rows <= 4096, "--check-linear-m must be in [1, 4096]");
+    MFQ_RUNTIME_CHECK(reps >= 1, "--check-linear-reps must be positive");
     MfqFile mfq(mfq_path);
     g_loading_cpu_layer = true;
     auto cpu_linear = load_quant_linear(mfq, name);
     g_loading_cpu_layer = false;
     auto cuda_linear = load_quant_linear(mfq, name);
     const int64_t width = cpu_linear.neuron_len();
-    auto x = torch::arange(
+    auto x = mfq_tensor_backend::arange(
         static_cast<int64_t>(rows) * width,
-        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32))
+        mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat32))
         .reshape({rows, width});
     x = ((x.remainder(97) - 48) / 512.0)
-        .to(torch::kFloat16).contiguous();
-    torch::Tensor gate;
+        .to(mfq_tensor_backend::kFloat16).contiguous();
+    mfq_tensor_backend::Tensor gate;
     if (gate_mode != 0) {
-        TORCH_CHECK(gate_mode == 1 || gate_mode == 2, "linear check gate mode must be 0, 1, or 2");
-        gate = ((torch::arange(
+        MFQ_RUNTIME_CHECK(gate_mode == 1 || gate_mode == 2, "linear check gate mode must be 0, 1, or 2");
+        gate = ((mfq_tensor_backend::arange(
             static_cast<int64_t>(rows) * width,
-            torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32))
+            mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat32))
             .reshape({rows, width}).remainder(53) - 26) / 16.0)
-            .to(torch::kFloat16).contiguous();
+            .to(mfq_tensor_backend::kFloat16).contiguous();
     }
     auto run_cpu = [&]() {
         return gate_mode == 0
             ? cpu_linear.forward(x)
             : cpu_linear.forward_input_mul(x, gate, gate_mode);
     };
-    torch::Tensor actual = run_cpu();
+    mfq_tensor_backend::Tensor actual = run_cpu();
     const auto start = std::chrono::steady_clock::now();
     for (int iteration = 0; iteration < reps; ++iteration) {
         actual = run_cpu();
@@ -21476,15 +21465,15 @@ static int run_cpu_linear_check(
     const double cpu_ms = std::chrono::duration<double, std::milli>(
         end - start).count() / static_cast<double>(reps);
 
-    auto cuda_x = x.to(torch::kCUDA).contiguous();
-    torch::Tensor cuda_gate;
-    if (gate_mode != 0) cuda_gate = gate.to(torch::kCUDA).contiguous();
+    auto cuda_x = x.to(mfq_tensor_backend::kCUDA).contiguous();
+    mfq_tensor_backend::Tensor cuda_gate;
+    if (gate_mode != 0) cuda_gate = gate.to(mfq_tensor_backend::kCUDA).contiguous();
     auto reference = gate_mode == 0
         ? cuda_linear.forward(cuda_x)
         : cuda_linear.forward_input_mul(cuda_x, cuda_gate, gate_mode);
-    torch::cuda::synchronize();
-    reference = reference.to(torch::kCPU, torch::kFloat32).contiguous();
-    actual = actual.to(torch::kFloat32).contiguous();
+    mfq_cuda_synchronize();
+    reference = reference.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kFloat32).contiguous();
+    actual = actual.to(mfq_tensor_backend::kFloat32).contiguous();
     auto difference = (actual - reference).abs();
     std::cout << "cpu_linear=" << name << "\n"
               << "shape=" << actual.sizes() << "\n"
@@ -21501,14 +21490,14 @@ static int run_tensor_parallel_linear_check(
         const std::string & name,
         TensorParallelAxis axis,
         int M) {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         g_tensor_parallel.enabled(),
         "--check-tp-linear requires --tensor-parallel");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         axis == TensorParallelAxis::Output ||
         axis == TensorParallelAxis::Input,
         "--check-tp-axis must be output or input");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         M >= 1 && M <= 4096,
         "--check-tp-m must be in [1, 4096]");
     MfqFile mfq(mfq_path);
@@ -21522,24 +21511,24 @@ static int run_tensor_parallel_linear_check(
     g_tensor_parallel = saved;
     auto sharded = load_quant_linear(
         mfq, name, axis);
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         sharded.tensor_parallel(),
         "tensor-parallel diagnostic did not create shards");
 
     const int64_t width = full.neuron_len();
-    auto x = torch::arange(
+    auto x = mfq_tensor_backend::arange(
         static_cast<int64_t>(M) * width,
-        torch::TensorOptions()
-            .device(torch::Device(
-                torch::kCUDA,
+        mfq_tensor_backend::TensorOptions()
+            .device(mfq_tensor_backend::Device(
+                mfq_tensor_backend::kCUDA,
                 saved.primary_device()))
-            .dtype(torch::kFloat32))
+            .dtype(mfq_tensor_backend::kFloat32))
         .reshape({M, width});
     x = ((x.remainder(127) - 63) / 384.0)
-        .to(torch::kFloat16).contiguous();
-    auto reference = full.forward(x).to(torch::kFloat32);
-    auto test = sharded.forward(x).to(torch::kFloat32);
-    torch::cuda::synchronize();
+        .to(mfq_tensor_backend::kFloat16).contiguous();
+    auto reference = full.forward(x).to(mfq_tensor_backend::kFloat32);
+    auto test = sharded.forward(x).to(mfq_tensor_backend::kFloat32);
+    mfq_cuda_synchronize();
     const auto difference = (test - reference).abs();
     const double denominator =
         std::max(
@@ -21571,7 +21560,7 @@ static int run_tensor_parallel_linear_check(
         ? 5.0e-4
         : axis == TensorParallelAxis::Output
         ? 1.0e-6 : 5.0e-3;
-    if (!torch::isfinite(test).all().item<bool>() ||
+    if (!mfq_tensor_backend::isfinite(test).all().item<bool>() ||
         relative > tolerance) {
         throw std::runtime_error(
             "tensor-parallel linear numerical check failed");
@@ -21602,10 +21591,10 @@ static int run_linear_group_check(
         const std::string & names_arg,
         int M,
         int reps) {
-    TORCH_CHECK(M >= 1 && M <= 4096, "--check-linear-m must be in [1, 4096]");
-    TORCH_CHECK(reps >= 1, "--check-linear-reps must be positive");
+    MFQ_RUNTIME_CHECK(M >= 1 && M <= 4096, "--check-linear-m must be in [1, 4096]");
+    MFQ_RUNTIME_CHECK(reps >= 1, "--check-linear-reps must be positive");
     const auto names = parse_tensor_names(names_arg);
-    TORCH_CHECK(names.size() >= 2, "--check-linear-group requires at least two tensors");
+    MFQ_RUNTIME_CHECK(names.size() >= 2, "--check-linear-group requires at least two tensors");
     MfqFile mfq(mfq_path);
     const char * preserve_env =
         std::getenv("MFQ_CHECK_LINEAR_GROUP_PRESERVE");
@@ -21623,14 +21612,14 @@ static int run_linear_group_check(
             ? group.nint.w.neuron_len
             : group.nint.split_w.front().neuron_len)
         : group.layers.front().neuron_len();
-    auto sequence = torch::arange(
+    auto sequence = mfq_tensor_backend::arange(
         (int64_t)M * width,
-        torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
+        mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
     auto x = (((sequence.remainder(257) - 128.0) / 127.0) +
-              0.03125 * torch::sin(sequence * 0.015625))
+              0.03125 * mfq_tensor_backend::sin(sequence * 0.015625))
                  .to(check_bf16
-                     ? torch::kBFloat16
-                     : torch::kFloat16)
+                     ? mfq_tensor_backend::kBFloat16
+                     : mfq_tensor_backend::kFloat16)
                  .reshape({M, width})
                  .contiguous();
     auto actual = group.forward(x);
@@ -21638,34 +21627,34 @@ static int run_linear_group_check(
         std::getenv("MFQ_CHECK_BF16_SWIGLU");
     if (check_bf16_swiglu_env != nullptr &&
             check_bf16_swiglu_env[0] == '1') {
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             actual.size() == 2 &&
-            actual[0].scalar_type() == torch::kBFloat16 &&
-            actual[1].scalar_type() == torch::kBFloat16,
+            actual[0].scalar_type() == mfq_tensor_backend::kBFloat16 &&
+            actual[1].scalar_type() == mfq_tensor_backend::kBFloat16,
             "BF16 SwiGLU check requires two BF16 projection outputs");
         auto reference =
-            (torch::silu(actual[0]) * actual[1]).contiguous();
+            (mfq_tensor_backend::silu(actual[0]) * actual[1]).contiguous();
         auto candidate = silu_mul_cuda(
             actual[0].contiguous(), actual[1].contiguous());
         auto difference =
-            (candidate.to(torch::kFloat32) -
-             reference.to(torch::kFloat32)).abs();
+            (candidate.to(mfq_tensor_backend::kFloat32) -
+             reference.to(mfq_tensor_backend::kFloat32)).abs();
         std::cout << "bf16_swiglu_check"
                   << " max_abs="
                   << difference.max().item<double>()
                   << " equal="
                   << (candidate.equal(reference) ? 1 : 0)
                   << "\n";
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             candidate.equal(reference),
             "fused BF16 SwiGLU differs from the official BF16 expression");
     }
-    torch::cuda::synchronize();
+    mfq_cuda_synchronize();
     const auto started = std::chrono::steady_clock::now();
     for (int rep = 0; rep < reps; ++rep) {
         actual = group.forward(x);
     }
-    torch::cuda::synchronize();
+    mfq_cuda_synchronize();
     const double elapsed_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - started).count();
     std::cout << "linear_group_timing"
@@ -21673,52 +21662,52 @@ static int run_linear_group_check(
               << " m=" << M
               << " reps=" << reps
               << " mean_ms=" << elapsed_ms / reps << '\n';
-    TORCH_CHECK(actual.size() == names.size(), "linear group output count mismatch");
-    std::vector<torch::Tensor> graph_actual;
+    MFQ_RUNTIME_CHECK(actual.size() == names.size(), "linear group output count mismatch");
+    std::vector<mfq_tensor_backend::Tensor> graph_actual;
     if (M == 1 && decode_branch_parallel_enabled(M)) {
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
         const auto graph_stream =
-            at::cuda::getStreamFromPool(false);
-        c10::cuda::CUDAStreamGuard graph_guard(
+            mfq_get_stream_from_pool(false);
+        MfqCudaStreamGuard graph_guard(
             graph_stream);
-        at::cuda::CUDAGraph graph;
+        MfqCudaGraph graph;
         graph.capture_begin();
         graph_actual = group.forward(x);
         graph.capture_end();
         graph.replay();
         MFQ_CUDA_CHECK(cudaStreamSynchronize(
             graph_stream.stream()));
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             graph_actual.size() == actual.size(),
             "linear group CUDA Graph output count mismatch");
         for (size_t index = 0;
              index < graph_actual.size(); ++index) {
             const auto difference =
-                (graph_actual[index].to(torch::kFloat32) -
-                 actual[index].to(torch::kFloat32)).abs();
+                (graph_actual[index].to(mfq_tensor_backend::kFloat32) -
+                 actual[index].to(mfq_tensor_backend::kFloat32)).abs();
             const double maximum =
                 difference.max().item<double>();
             std::cout
                 << "linear_group_graph_check"
                 << " tensor=" << names[index]
                 << " max_abs=" << maximum << "\n";
-            TORCH_CHECK(
+            MFQ_RUNTIME_CHECK(
                 maximum == 0.0,
                 "linear group CUDA Graph replay differs from eager output");
         }
     }
-    at::globalContext().setAllowTF32CuBLAS(false);
-    std::vector<torch::Tensor> dense_weights;
-    std::vector<torch::Tensor> separate_dense_references;
-    std::vector<torch::Tensor> fp32_references;
-    std::vector<torch::Tensor> separate_production;
+    mfq_disable_tf32_cublas();
+    std::vector<mfq_tensor_backend::Tensor> dense_weights;
+    std::vector<mfq_tensor_backend::Tensor> separate_dense_references;
+    std::vector<mfq_tensor_backend::Tensor> fp32_references;
+    std::vector<mfq_tensor_backend::Tensor> separate_production;
     dense_weights.reserve(names.size());
     separate_dense_references.reserve(names.size());
     fp32_references.reserve(names.size());
     separate_production.reserve(names.size());
     for (size_t index = 0; index < names.size(); ++index) {
         auto linear = load_quant_linear(mfq, names[index]);
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             linear.is_nint(),
             "--check-linear-group currently requires NINT tensors");
         const auto & weight = linear.nint.w;
@@ -21739,23 +21728,23 @@ static int run_linear_group_check(
                   weight.neuron_scale, weight.neuron_min,
                   weight.neuron_len, weight.gs, weight.bits);
         auto separate = linear.forward(x);
-        if (actual[index].scalar_type() == torch::kBFloat16) {
-            separate = separate.to(torch::kBFloat16);
+        if (actual[index].scalar_type() == mfq_tensor_backend::kBFloat16) {
+            separate = separate.to(mfq_tensor_backend::kBFloat16);
         }
-        separate_production.push_back(separate.to(torch::kFloat32));
+        separate_production.push_back(separate.to(mfq_tensor_backend::kFloat32));
         auto dense_for_x = dense.to(x.scalar_type());
         separate_dense_references.push_back(
-            torch::matmul(x, dense_for_x.transpose(0, 1))
-                .to(torch::kFloat32));
-        fp32_references.push_back(torch::matmul(
-            x.to(torch::kFloat32),
-            dense.to(torch::kFloat32).transpose(0, 1)));
+            mfq_tensor_backend::matmul(x, dense_for_x.transpose(0, 1))
+                .to(mfq_tensor_backend::kFloat32));
+        fp32_references.push_back(mfq_tensor_backend::matmul(
+            x.to(mfq_tensor_backend::kFloat32),
+            dense.to(mfq_tensor_backend::kFloat32).transpose(0, 1)));
         dense_weights.push_back(std::move(dense));
     }
-    auto combined_dense = torch::cat(dense_weights, 0)
+    auto combined_dense = mfq_tensor_backend::cat(dense_weights, 0)
         .to(x.scalar_type()).contiguous();
     auto combined_output =
-        torch::matmul(x, combined_dense.transpose(0, 1)).to(torch::kFloat32);
+        mfq_tensor_backend::matmul(x, combined_dense.transpose(0, 1)).to(mfq_tensor_backend::kFloat32);
     auto combined_references =
         combined_output.split_with_sizes(group.outs, -1);
     for (size_t index = 0; index < names.size(); ++index) {
@@ -21763,7 +21752,7 @@ static int run_linear_group_check(
         auto separate_dense_reference = separate_dense_references[index];
         auto fp32_reference = fp32_references[index];
         auto separate_candidate = separate_production[index];
-        auto candidate = actual[index].to(torch::kFloat32);
+        auto candidate = actual[index].to(mfq_tensor_backend::kFloat32);
         auto combined_dense_difference = candidate - combined_reference;
         auto grouped_vs_separate = candidate - separate_candidate;
         auto separate_dense_difference =
@@ -21816,39 +21805,39 @@ static int run_linear_group_check(
     return 0;
 }
 
-static torch::Tensor read_f32_tensor(
+static mfq_tensor_backend::Tensor read_f32_tensor(
         const std::filesystem::path & path,
         const std::vector<int64_t> & shape) {
     const int64_t count = std::accumulate(
         shape.begin(), shape.end(), int64_t{1}, std::multiplies<int64_t>());
     std::vector<float> values(static_cast<size_t>(count));
     std::ifstream input(path, std::ios::binary);
-    TORCH_CHECK(input, "failed to open ", path.string());
+    MFQ_RUNTIME_CHECK(input, "failed to open ", path.string());
     input.read(
         reinterpret_cast<char *>(values.data()),
         static_cast<std::streamsize>(values.size() * sizeof(float)));
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         input.gcount() ==
             static_cast<std::streamsize>(values.size() * sizeof(float)),
         "short f32 tensor read from ", path.string());
-    return torch::from_blob(
+    return mfq_tensor_backend::from_blob(
                values.data(), shape,
-               torch::TensorOptions().dtype(torch::kFloat32))
+               mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32))
         .clone()
-        .to(torch::kCUDA)
+        .to(mfq_tensor_backend::kCUDA)
         .contiguous();
 }
 
 static void write_f32_tensor(
         const std::filesystem::path & path,
-        const torch::Tensor & tensor) {
-    auto host = tensor.to(torch::kCPU).to(torch::kFloat32).contiguous();
+        const mfq_tensor_backend::Tensor & tensor) {
+    auto host = tensor.to(mfq_tensor_backend::kCPU).to(mfq_tensor_backend::kFloat32).contiguous();
     std::ofstream output(path, std::ios::binary);
-    TORCH_CHECK(output, "failed to create ", path.string());
+    MFQ_RUNTIME_CHECK(output, "failed to create ", path.string());
     output.write(
         reinterpret_cast<const char *>(host.data_ptr<float>()),
         static_cast<std::streamsize>(host.numel() * sizeof(float)));
-    TORCH_CHECK(output, "failed to write ", path.string());
+    MFQ_RUNTIME_CHECK(output, "failed to write ", path.string());
 }
 
 static int run_gdn_operator_check(
@@ -21859,10 +21848,10 @@ static int run_gdn_operator_check(
         int64_t q_heads,
         int64_t v_heads,
         int64_t head_dim) {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         tokens >= 1 && q_heads >= 1 && v_heads >= q_heads && head_dim >= 1,
         "invalid GDN diagnostic shape");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         v_heads % q_heads == 0,
         "GDN diagnostic value heads must be divisible by query heads");
     const std::filesystem::path root(input_dir);
@@ -21912,7 +21901,7 @@ static int run_linear_conv_operator_check(
         int64_t value_dim,
         int64_t kernel_size,
         double eps) {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         tokens >= 2 && q_heads >= 1 && v_heads >= 1 &&
             key_dim >= 1 && value_dim >= 1 &&
             kernel_size >= 2 && kernel_size <= 8,
@@ -21929,26 +21918,26 @@ static int run_linear_conv_operator_check(
     auto qk = read_f32_tensor(
                   input_root / "qk.bin",
                   {1, tokens, qk_width})
-                  .to(torch::kHalf)
+                  .to(mfq_tensor_backend::kHalf)
                   .contiguous();
     auto v = read_f32_tensor(
                  input_root / "v.bin",
                  {1, tokens, v_width})
-                 .to(torch::kHalf)
+                 .to(mfq_tensor_backend::kHalf)
                  .contiguous();
     auto weight = read_f32_tensor(
         input_root / "weight.bin",
         {channels, 1, kernel_size});
-    torch::Tensor bias;
+    mfq_tensor_backend::Tensor bias;
     if (std::filesystem::exists(input_root / "bias.bin")) {
         bias = read_f32_tensor(
             input_root / "bias.bin", {channels});
     } else {
-        bias = torch::empty(
+        bias = mfq_tensor_backend::empty(
             {0},
-            torch::TensorOptions()
-                .device(torch::kCUDA)
-                .dtype(torch::kFloat32));
+            mfq_tensor_backend::TensorOptions()
+                .device(mfq_tensor_backend::kCUDA)
+                .dtype(mfq_tensor_backend::kFloat32));
     }
     auto result = linear_conv_qkv_prefill_cuda(
         state, qk, v, weight, bias,
@@ -21973,7 +21962,7 @@ static int run_q8_embedding_check(
         const std::string & name) {
     MfqFile mfq(mfq_path);
     auto linear = load_quant_linear(mfq, name);
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         linear.is_nint() && linear.nint.w.q8_zero,
         "--check-q8-embedding requires an NINT8-0 tensor");
     const int64_t vocab = linear.nint.w.out;
@@ -21985,11 +21974,11 @@ static int run_q8_embedding_check(
         std::min<int64_t>(255999, vocab - 1),
         vocab - 1,
     };
-    auto ids = torch::from_blob(
+    auto ids = mfq_tensor_backend::from_blob(
         host_ids.data(), {(int64_t)host_ids.size()},
-        torch::TensorOptions().dtype(torch::kInt64))
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
                    .clone()
-                   .to(torch::kCUDA)
+                   .to(mfq_tensor_backend::kCUDA)
                    .contiguous();
     auto candidate = nint8_zero_embedding_lookup_cuda(
         linear.nint.w.q_packed, linear.nint.w.q8_zero_scale,
@@ -21999,7 +21988,7 @@ static int run_q8_embedding_check(
         linear.nint.w.neuron_len);
     auto reference = dense.index_select(0, ids);
     auto difference =
-        candidate.to(torch::kFloat32) - reference.to(torch::kFloat32);
+        candidate.to(mfq_tensor_backend::kFloat32) - reference.to(mfq_tensor_backend::kFloat32);
     std::cout << std::fixed << std::setprecision(9)
               << "q8_embedding_check"
               << " tensor=" << name
@@ -22009,7 +21998,7 @@ static int run_q8_embedding_check(
               << " equal=" << (candidate.equal(reference) ? 1 : 0)
               << " rel="
               << (difference.norm() /
-                  reference.to(torch::kFloat32).norm()).item<double>()
+                  reference.to(mfq_tensor_backend::kFloat32).norm()).item<double>()
               << " mean_abs=" << difference.abs().mean().item<double>()
               << " max_abs=" << difference.abs().max().item<double>()
               << "\n";
@@ -22022,7 +22011,7 @@ static int run_dsv4_output_a_check(
         int batch,
         int reps) {
     constexpr int64_t kGroups = 8;
-    TORCH_CHECK(batch > 0 && reps > 0, "DSV4 output_a check requires positive batch and reps");
+    MFQ_RUNTIME_CHECK(batch > 0 && reps > 0, "DSV4 output_a check requires positive batch and reps");
     MfqFile mfq(mfq_path);
     auto linear = load_quant_linear(
         mfq, name, TensorParallelAxis::Input);
@@ -22030,22 +22019,22 @@ static int run_dsv4_output_a_check(
         linear.is_nint() &&
         linear.nint.w.bits == 8 &&
         linear.nint.w.gs == 48;
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         supported_nint || linear.is_mxfp8(),
         "DSV4 output_a check requires NINT8 gs48 or MXFP8");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         linear.out() % kGroups == 0,
         "DSV4 output_a rows must divide eight groups");
 
     const int64_t width = linear.neuron_len();
     const int64_t rows_per_group = linear.out() / kGroups;
-    auto sequence = torch::arange(
+    auto sequence = mfq_tensor_backend::arange(
         (int64_t)batch * kGroups * width,
-        torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
+        mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
     auto grouped = (
         (sequence.remainder(257) - 128.0) / 127.0 +
-        0.03125 * torch::sin(sequence * 0.015625))
-        .to(torch::kFloat16)
+        0.03125 * mfq_tensor_backend::sin(sequence * 0.015625))
+        .to(mfq_tensor_backend::kFloat16)
         .reshape({batch, kGroups, width})
         .contiguous();
 
@@ -22053,13 +22042,13 @@ static int run_dsv4_output_a_check(
         auto expanded = linear.forward(
             grouped.reshape({batch * kGroups, width}))
             .reshape({batch, kGroups, kGroups, rows_per_group});
-        std::vector<torch::Tensor> diagonal;
+        std::vector<mfq_tensor_backend::Tensor> diagonal;
         diagonal.reserve(kGroups);
         for (int64_t group = 0; group < kGroups; ++group) {
             diagonal.push_back(
                 expanded.index({Slice(), group, group, Slice()}));
         }
-        return torch::stack(diagonal, 1).reshape({batch, linear.out()});
+        return mfq_tensor_backend::stack(diagonal, 1).reshape({batch, linear.out()});
     };
     auto groupwise = [&]() {
         return linear.is_mxfp8()
@@ -22068,13 +22057,13 @@ static int run_dsv4_output_a_check(
                 linear.nint.w, grouped, kGroups);
     };
     auto time_ms = [&](auto && fn) {
-        torch::Tensor output;
+        mfq_tensor_backend::Tensor output;
         for (int warmup = 0; warmup < 10; ++warmup) output = fn();
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
         cudaEvent_t start, stop;
         MFQ_CUDA_CHECK(cudaEventCreate(&start));
         MFQ_CUDA_CHECK(cudaEventCreate(&stop));
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        auto stream = mfq_get_current_cuda_stream().stream();
         MFQ_CUDA_CHECK(cudaEventRecord(start, stream));
         for (int iteration = 0; iteration < reps; ++iteration) output = fn();
         MFQ_CUDA_CHECK(cudaEventRecord(stop, stream));
@@ -22083,13 +22072,13 @@ static int run_dsv4_output_a_check(
         MFQ_CUDA_CHECK(cudaEventElapsedTime(&elapsed, start, stop));
         MFQ_CUDA_CHECK(cudaEventDestroy(start));
         MFQ_CUDA_CHECK(cudaEventDestroy(stop));
-        return std::pair<float, torch::Tensor>(elapsed / reps, output);
+        return std::pair<float, mfq_tensor_backend::Tensor>(elapsed / reps, output);
     };
 
     auto legacy_result = time_ms(legacy);
     auto groupwise_result = time_ms(groupwise);
-    auto reference = legacy_result.second.to(torch::kFloat32);
-    auto candidate = groupwise_result.second.to(torch::kFloat32);
+    auto reference = legacy_result.second.to(mfq_tensor_backend::kFloat32);
+    auto candidate = groupwise_result.second.to(mfq_tensor_backend::kFloat32);
     auto diff = (candidate - reference).abs();
     const float relative =
         ((candidate - reference).norm() / reference.norm()).item<float>();
@@ -22111,13 +22100,13 @@ static int run_dsv4_output_a_check(
               << " checksum=" << candidate.sum().item<double>()
               << "\n";
     if (linear.is_mxfp8()) {
-        TORCH_CHECK(
-            torch::isfinite(candidate).all().item<bool>() &&
+        MFQ_RUNTIME_CHECK(
+            mfq_tensor_backend::isfinite(candidate).all().item<bool>() &&
                 relative <= 5.0e-4f,
             "DSV4 MXFP8 groupwise output_a exceeded the FP16 GEMM "
             "reduction-order tolerance");
     } else {
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             candidate.equal(reference),
             "DSV4 NINT groupwise output_a must be bit-exact with the "
             "legacy path");
@@ -22144,10 +22133,10 @@ static int run_gemma_geglu_check(
     }
 
     const int64_t hidden = gate_up.nint.w.neuron_len;
-    auto xf = torch::arange(
-        hidden, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
+    auto xf = mfq_tensor_backend::arange(
+        hidden, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
     auto x = (((xf.remainder(257) - 128.0) / 64.0) +
-              0.125 * torch::sin(xf * 0.03125)).to(torch::kFloat16).reshape({1, hidden}).contiguous();
+              0.125 * mfq_tensor_backend::sin(xf * 0.03125)).to(mfq_tensor_backend::kFloat16).reshape({1, hidden}).contiguous();
 
     auto materialized_activation = [&]() {
         auto parts = gate_up.forward(x);
@@ -22179,14 +22168,14 @@ static int run_gemma_geglu_check(
               << " up_out=" << gate_up.outs[1]
               << " down_bits=" << down.nint.w.bits
               << " down_gs=" << down.nint.w.gs << "\n";
-    auto report = [&](const char * name, torch::Tensor value, torch::Tensor reference) {
-        auto got = value.to(torch::kFloat64);
-        auto ref = reference.to(torch::kFloat64);
+    auto report = [&](const char * name, mfq_tensor_backend::Tensor value, mfq_tensor_backend::Tensor reference) {
+        auto got = value.to(mfq_tensor_backend::kFloat64);
+        auto ref = reference.to(mfq_tensor_backend::kFloat64);
         const double ref_norm = std::max(ref.norm().item<double>(), 1.0e-30);
         const double got_norm = std::max(got.norm().item<double>(), 1.0e-30);
         std::cout << "gemma_geglu_check path=" << name
                   << " relative_l2=" << (got - ref).norm().item<double>() / ref_norm
-                  << " cosine=" << torch::dot(got.reshape({-1}), ref.reshape({-1})).item<double>() /
+                  << " cosine=" << mfq_tensor_backend::dot(got.reshape({-1}), ref.reshape({-1})).item<double>() /
                          (got_norm * ref_norm)
                   << " max_abs=" << (got - ref).abs().max().item<double>() << "\n";
     };
@@ -22204,11 +22193,11 @@ static int run_gemma_geglu_check(
 
     auto time_ms = [&](auto && fn) {
         for (int i = 0; i < 10; ++i) (void)fn();
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
         cudaEvent_t start, stop;
         MFQ_CUDA_CHECK(cudaEventCreate(&start));
         MFQ_CUDA_CHECK(cudaEventCreate(&stop));
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        auto stream = mfq_get_current_cuda_stream().stream();
         MFQ_CUDA_CHECK(cudaEventRecord(start, stream));
         for (int i = 0; i < reps; ++i) (void)fn();
         MFQ_CUDA_CHECK(cudaEventRecord(stop, stream));
@@ -22263,13 +22252,13 @@ static int run_tensor_parallel_moe_check(
         const std::string & tensor_name,
         int tokens,
         int routes) {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         g_tensor_parallel.enabled(),
         "--check-tp-moe requires --tensor-parallel");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         tokens >= 1 && tokens <= 4096,
         "--check-tp-moe-tokens must be in [1, 4096]");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         routes >= 1,
         "--check-tp-moe-routes must be positive");
     MfqFile mfq(mfq_path);
@@ -22286,34 +22275,34 @@ static int run_tensor_parallel_moe_check(
     g_tensor_parallel = saved;
     auto sharded = load_nint_moe_gpu(
         mfq, tensor_name, false, 0, role);
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         sharded.tensor_parallel(),
         "tensor-parallel MoE diagnostic did not create shards");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         full.n_experts == sharded.n_experts &&
         full.out_per_expert == sharded.out_per_expert &&
         full.neuron_len == sharded.neuron_len,
         "tensor-parallel MoE metadata differs");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         routes <= full.n_experts,
         "--check-tp-moe-routes exceeds the expert count");
 
-    c10::cuda::CUDAGuard primary_guard(
+    MfqCudaGuard primary_guard(
         saved.primary_device());
     const int64_t count =
         static_cast<int64_t>(tokens) *
         full.neuron_len;
-    auto sequence = torch::arange(
+    auto sequence = mfq_tensor_backend::arange(
         count,
-        torch::TensorOptions()
-            .device(torch::Device(
-                torch::kCUDA,
+        mfq_tensor_backend::TensorOptions()
+            .device(mfq_tensor_backend::Device(
+                mfq_tensor_backend::kCUDA,
                 saved.primary_device()))
-            .dtype(torch::kFloat32));
+            .dtype(mfq_tensor_backend::kFloat32));
     auto x = (
         (sequence.remainder(257) - 128.0) / 127.0 +
-        0.03125 * torch::sin(sequence * 0.015625))
-        .to(torch::kFloat16)
+        0.03125 * mfq_tensor_backend::sin(sequence * 0.015625))
+        .to(mfq_tensor_backend::kFloat16)
         .reshape({tokens, full.neuron_len})
         .contiguous();
     std::vector<int32_t> host_ids(
@@ -22328,12 +22317,12 @@ static int run_tensor_parallel_moe_check(
                 full.n_experts;
         }
     }
-    auto ids = torch::from_blob(
+    auto ids = mfq_tensor_backend::from_blob(
         host_ids.data(), {tokens, routes},
-        torch::TensorOptions().dtype(torch::kInt32))
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
         .clone()
-        .to(torch::Device(
-            torch::kCUDA,
+        .to(mfq_tensor_backend::Device(
+            mfq_tensor_backend::kCUDA,
             saved.primary_device()))
         .contiguous();
     auto route =
@@ -22341,11 +22330,11 @@ static int run_tensor_parallel_moe_check(
             ids, full.n_experts);
     auto reference =
         full.forward(x, route)
-            .to(torch::kFloat32);
+            .to(mfq_tensor_backend::kFloat32);
     auto test =
         sharded.forward(x, route)
-            .to(torch::kFloat32);
-    torch::cuda::synchronize();
+            .to(mfq_tensor_backend::kFloat32);
+    mfq_cuda_synchronize();
     auto difference = test - reference;
     const double denominator =
         std::max(
@@ -22376,7 +22365,7 @@ static int run_tensor_parallel_moe_check(
         << " mean_abs=" << mean_abs
         << " max_abs=" << max_abs
         << '\n';
-    if (!torch::isfinite(test).all().item<bool>() ||
+    if (!mfq_tensor_backend::isfinite(test).all().item<bool>() ||
         relative > 1.0e-6) {
         throw std::runtime_error(
             "tensor-parallel MoE numerical check failed");
@@ -22415,13 +22404,13 @@ static int run_nintm_tensor_check(
     }
     const int64_t count =
         (int64_t)tokens * (routed_input ? routes : 1) * weight.neuron_len;
-    auto sequence = torch::arange(
+    auto sequence = mfq_tensor_backend::arange(
         count,
-        torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
+        mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
     auto x = (
         (sequence.remainder(257) - 128.0) / 127.0 +
-        0.03125 * torch::sin(sequence * 0.015625))
-        .to(torch::kFloat16)
+        0.03125 * mfq_tensor_backend::sin(sequence * 0.015625))
+        .to(mfq_tensor_backend::kFloat16)
         .reshape(
             routed_input
                 ? std::vector<int64_t>{tokens, routes, weight.neuron_len}
@@ -22434,21 +22423,21 @@ static int run_nintm_tensor_check(
                 (token * routes + route * 3) % weight.n_experts;
         }
     }
-    auto ids = torch::from_blob(
+    auto ids = mfq_tensor_backend::from_blob(
         host_ids.data(), {tokens, routes},
-        torch::TensorOptions().dtype(torch::kInt32))
-        .clone().to(torch::kCUDA).contiguous();
+        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+        .clone().to(mfq_tensor_backend::kCUDA).contiguous();
     auto route = build_moe_route_plan(ids, weight.n_experts);
-    torch::Tensor output;
+    mfq_tensor_backend::Tensor output;
     for (int warmup = 0; warmup < 5; ++warmup) {
         output = weight.forward(x, route);
         if (warmup == 0) weight.prefetch(route);
     }
-    torch::cuda::synchronize();
+    mfq_cuda_synchronize();
     cudaEvent_t start, stop;
     MFQ_CUDA_CHECK(cudaEventCreate(&start));
     MFQ_CUDA_CHECK(cudaEventCreate(&stop));
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    auto stream = mfq_get_current_cuda_stream().stream();
     MFQ_CUDA_CHECK(cudaEventRecord(start, stream));
     for (int index = 0; index < reps; ++index) output = weight.forward(x, route);
     MFQ_CUDA_CHECK(cudaEventRecord(stop, stream));
@@ -22462,13 +22451,13 @@ static int run_nintm_tensor_check(
     double dense_reference_max_abs = -1.0;
     if (split_width == 0) {
         auto cpu_reference = unpack_nint_moe(mfq.read_blob(tensor_name));
-        auto reference = torch::empty(
+        auto reference = mfq_tensor_backend::empty(
             {tokens * routes, weight.out_per_expert},
-            output.options().dtype(torch::kFloat16));
+            output.options().dtype(mfq_tensor_backend::kFloat16));
         for (const auto & pool : cpu_reference.pools) {
-            torch::Tensor dense_flat;
+            mfq_tensor_backend::Tensor dense_flat;
             int rotation_block = 0;
-            torch::Tensor rotation_signs;
+            mfq_tensor_backend::Tensor rotation_signs;
             if (pool.dtype == "NINT8-0") {
                 auto packed = to_gpu_nint8_zero(pool.q8_zero);
                 dense_flat = nint8_zero_dequant_cuda(
@@ -22490,7 +22479,7 @@ static int run_nintm_tensor_check(
                           packed.gs, packed.bits);
             } else if (pool.dtype == "MXFP4") {
                 dense_flat = dequant_mxfp4_cpu(pool.mxfp4)
-                    .to(torch::kCUDA).contiguous();
+                    .to(mfq_tensor_backend::kCUDA).contiguous();
             } else if (is_tpq_pq_dtype(pool.dtype)) {
                 auto packed = to_device_tpq(pool.tpq, true);
                 dense_flat = tpq_pq_dequant_cuda(
@@ -22541,16 +22530,16 @@ static int run_nintm_tensor_check(
                     }
                 }
                 if (pair_indices.empty()) continue;
-                auto pair_index = torch::from_blob(
+                auto pair_index = mfq_tensor_backend::from_blob(
                     pair_indices.data(),
                     {static_cast<int64_t>(pair_indices.size())},
-                    torch::TensorOptions().dtype(torch::kInt64))
-                    .clone().to(torch::kCUDA);
-                auto token_index = torch::from_blob(
+                    mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
+                    .clone().to(mfq_tensor_backend::kCUDA);
+                auto token_index = mfq_tensor_backend::from_blob(
                     token_indices.data(),
                     {static_cast<int64_t>(token_indices.size())},
-                    torch::TensorOptions().dtype(torch::kInt64))
-                    .clone().to(torch::kCUDA);
+                    mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
+                    .clone().to(mfq_tensor_backend::kCUDA);
                 auto selected = routed_input
                     ? x.reshape({tokens * routes, weight.neuron_len})
                           .index_select(0, pair_index)
@@ -22560,17 +22549,17 @@ static int run_nintm_tensor_check(
                         selected.contiguous(), rotation_signs,
                         rotation_block);
                 }
-                auto expected = torch::matmul(
+                auto expected = mfq_tensor_backend::matmul(
                     selected, dense.index({static_cast<int64_t>(local)})
                                   .transpose(0, 1));
                 reference.index_copy_(0, pair_index, expected);
             }
         }
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
         auto actual_f32 =
             output.reshape({tokens * routes, weight.out_per_expert})
-                .to(torch::kFloat32);
-        auto reference_f32 = reference.to(torch::kFloat32);
+                .to(mfq_tensor_backend::kFloat32);
+        auto reference_f32 = reference.to(mfq_tensor_backend::kFloat32);
         auto difference = actual_f32 - reference_f32;
         dense_reference_rel =
             (difference.norm() / reference_f32.norm()).item<double>();
@@ -22579,8 +22568,8 @@ static int run_nintm_tensor_check(
         dense_reference_max_abs =
             difference.abs().max().item<double>();
     }
-    auto flat = output.to(torch::kFloat32).cpu().reshape({-1});
-    if (!torch::isfinite(flat).all().item<bool>()) {
+    auto flat = output.to(mfq_tensor_backend::kFloat32).cpu().reshape({-1});
+    if (!mfq_tensor_backend::isfinite(flat).all().item<bool>()) {
         throw std::runtime_error("NINTM tensor check produced a non-finite value");
     }
     std::cout << std::fixed << std::setprecision(9)
@@ -22617,9 +22606,9 @@ static int run_nintm_tensor_check(
                 "NINTM merged/split check requires the grouped MMA route map");
         }
         auto run_segment = [&](int width, int row_offset) {
-            auto segment = torch::empty(
+            auto segment = mfq_tensor_backend::empty(
                 {tokens, routes, width},
-                x.options().dtype(torch::kFloat16));
+                x.options().dtype(mfq_tensor_backend::kFloat16));
             return nint_moe_grouped_matmul_hetero_f16_slice_cuda(
                 weight.weight_ptrs, weight.pool_params,
                 weight.expert_pool, weight.expert_local,
@@ -22629,26 +22618,26 @@ static int run_nintm_tensor_check(
                 route.tile_bounds, route.tile_experts,
                 weight.out_per_expert, row_offset);
         };
-        torch::Tensor merged;
-        torch::Tensor left;
-        torch::Tensor right;
+        mfq_tensor_backend::Tensor merged;
+        mfq_tensor_backend::Tensor left;
+        mfq_tensor_backend::Tensor right;
         for (int warmup = 0; warmup < 3; ++warmup) {
             merged = run_segment(weight.out_per_expert, 0);
             left = run_segment(split_width, 0);
             right = run_segment(
                 weight.out_per_expert - split_width, split_width);
         }
-        torch::cuda::synchronize();
-        auto split = torch::cat({left, right}, 2).contiguous();
+        mfq_cuda_synchronize();
+        auto split = mfq_tensor_backend::cat({left, right}, 2).contiguous();
         auto difference =
-            merged.to(torch::kFloat32) - split.to(torch::kFloat32);
+            merged.to(mfq_tensor_backend::kFloat32) - split.to(mfq_tensor_backend::kFloat32);
         const int64_t left_differing =
             merged.slice(2, 0, split_width).ne(left).sum().item<int64_t>();
         const int64_t right_differing =
             merged.slice(2, split_width, weight.out_per_expert)
                 .ne(right).sum().item<int64_t>();
         const int64_t differing = left_differing + right_differing;
-        const double merged_norm = merged.to(torch::kFloat32).norm().item<double>();
+        const double merged_norm = merged.to(mfq_tensor_backend::kFloat32).norm().item<double>();
         std::cout << std::scientific << std::setprecision(9)
                   << "nintm_merged_split_check"
                   << " tensor=" << tensor_name
@@ -22712,14 +22701,14 @@ static int run_nintm_tensor_check(
         auto candidate = weight.forward(x, route);
         set_env("MFQ_NVQ_MOE_EXACT_REDUCTION", "0");
         auto baseline = weight.forward(x, route);
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
         restore_env(
             "MFQ_NVQ_MOE_WARPS", had_original_env, original_value);
         restore_env(
             "MFQ_NVQ_MOE_EXACT_REDUCTION",
             had_original_exact_env, original_exact_value);
-        auto candidate_f32 = candidate.to(torch::kFloat32);
-        auto baseline_f32 = baseline.to(torch::kFloat32);
+        auto candidate_f32 = candidate.to(mfq_tensor_backend::kFloat32);
+        auto baseline_f32 = baseline.to(mfq_tensor_backend::kFloat32);
         auto diff = candidate_f32 - baseline_f32;
         const double baseline_norm = baseline_f32.norm().item<double>();
         std::cout << std::scientific << std::setprecision(9)
@@ -22744,13 +22733,13 @@ static int run_nintm_tensor_check(
         }
         const int64_t gate_up_count =
             static_cast<int64_t>(tokens) * routes * 2 * weight.neuron_len;
-        auto gate_up_sequence = torch::arange(
+        auto gate_up_sequence = mfq_tensor_backend::arange(
             gate_up_count,
-            torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
+            mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
         auto gate_up = (
-            12.0 * torch::sin(gate_up_sequence * 0.013671875) +
-            0.5 * torch::cos(gate_up_sequence * 0.00390625))
-            .to(torch::kFloat16)
+            12.0 * mfq_tensor_backend::sin(gate_up_sequence * 0.013671875) +
+            0.5 * mfq_tensor_backend::cos(gate_up_sequence * 0.00390625))
+            .to(mfq_tensor_backend::kFloat16)
             .reshape({tokens, routes, 2 * weight.neuron_len})
             .contiguous();
         auto run_candidate = [&]() {
@@ -22758,29 +22747,29 @@ static int run_nintm_tensor_check(
         };
         auto run_baseline = [&]() {
             const int64_t width = weight.neuron_len;
-            auto gate = torch::clamp_max(
-                gate_up.slice(-1, 0, width).to(torch::kFloat32), limit);
-            auto up = torch::clamp(
-                gate_up.slice(-1, width, 2 * width).to(torch::kFloat32),
+            auto gate = mfq_tensor_backend::clamp_max(
+                gate_up.slice(-1, 0, width).to(mfq_tensor_backend::kFloat32), limit);
+            auto up = mfq_tensor_backend::clamp(
+                gate_up.slice(-1, width, 2 * width).to(mfq_tensor_backend::kFloat32),
                 -limit, limit);
-            auto hidden = (torch::silu(gate) * up)
-                .to(torch::kFloat16).contiguous();
+            auto hidden = (mfq_tensor_backend::silu(gate) * up)
+                .to(mfq_tensor_backend::kFloat16).contiguous();
             return weight.forward(hidden, route);
         };
-        torch::Tensor candidate;
-        torch::Tensor baseline;
+        mfq_tensor_backend::Tensor candidate;
+        mfq_tensor_backend::Tensor baseline;
         for (int warmup = 0; warmup < 5; ++warmup) {
             candidate = run_candidate();
             baseline = run_baseline();
         }
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
         auto time_ms = [&](auto && fn) {
             cudaEvent_t begin, end;
             MFQ_CUDA_CHECK(cudaEventCreate(&begin));
             MFQ_CUDA_CHECK(cudaEventCreate(&end));
-            auto cuda_stream = at::cuda::getCurrentCUDAStream().stream();
+            auto cuda_stream = mfq_get_current_cuda_stream().stream();
             MFQ_CUDA_CHECK(cudaEventRecord(begin, cuda_stream));
-            torch::Tensor value;
+            mfq_tensor_backend::Tensor value;
             for (int iteration = 0; iteration < reps; ++iteration) {
                 value = fn();
             }
@@ -22791,15 +22780,15 @@ static int run_nintm_tensor_check(
                 &elapsed_ms, begin, end));
             MFQ_CUDA_CHECK(cudaEventDestroy(begin));
             MFQ_CUDA_CHECK(cudaEventDestroy(end));
-            return std::pair<double, torch::Tensor>(
+            return std::pair<double, mfq_tensor_backend::Tensor>(
                 elapsed_ms / reps, std::move(value));
         };
         auto candidate_timing = time_ms(run_candidate);
         auto baseline_timing = time_ms(run_baseline);
         candidate = std::move(candidate_timing.second);
         baseline = std::move(baseline_timing.second);
-        auto candidate_f32 = candidate.to(torch::kFloat32);
-        auto baseline_f32 = baseline.to(torch::kFloat32);
+        auto candidate_f32 = candidate.to(mfq_tensor_backend::kFloat32);
+        auto baseline_f32 = baseline.to(mfq_tensor_backend::kFloat32);
         auto diff = candidate_f32 - baseline_f32;
         const double baseline_norm = baseline_f32.norm().item<double>();
         std::cout << std::scientific << std::setprecision(9)
@@ -22841,7 +22830,7 @@ static int run_gemma_moe_check(
     }
     const int routes = static_cast<int>(config.num_experts_per_tok);
     const int experts = static_cast<int>(config.num_experts);
-    TORCH_CHECK(routes > 0 && routes <= 8 && experts > routes,
+    MFQ_RUNTIME_CHECK(routes > 0 && routes <= 8 && experts > routes,
         "Gemma MoE benchmark requires 1..8 routes and more experts than routes");
     const char * dense_reference_env =
         std::getenv("MFQ_CHECK_GEMMA_MOE_DENSE_REFERENCE");
@@ -22849,11 +22838,11 @@ static int run_gemma_moe_check(
         dense_reference_env != nullptr && std::atoi(dense_reference_env) != 0;
     auto materialize_dense_moe = [&](const std::string & name) {
         auto cpu = unpack_nint_moe(mfq.read_blob(name));
-        auto dense = torch::empty(
+        auto dense = mfq_tensor_backend::empty(
             {cpu.n_experts, cpu.out_per_expert, cpu.neuron_len},
-            torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat16));
+            mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat16));
         for (const auto & pool : cpu.pools) {
-            torch::Tensor local_flat;
+            mfq_tensor_backend::Tensor local_flat;
             if (pool.dtype == "NINT8-0") {
                 auto packed = to_gpu_nint8_zero(pool.q8_zero);
                 local_flat = nint8_zero_dequant_cuda(
@@ -22879,17 +22868,17 @@ static int run_gemma_moe_check(
             auto local = local_flat.reshape({
                 static_cast<int64_t>(pool.expert_ids.size()),
                 cpu.out_per_expert, cpu.neuron_len});
-            auto expert_index = torch::from_blob(
+            auto expert_index = mfq_tensor_backend::from_blob(
                 const_cast<int32_t *>(pool.expert_ids.data()),
                 {static_cast<int64_t>(pool.expert_ids.size())},
-                torch::TensorOptions().dtype(torch::kInt32))
-                .clone().to(torch::kCUDA).to(torch::kInt64);
+                mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+                .clone().to(mfq_tensor_backend::kCUDA).to(mfq_tensor_backend::kInt64);
             dense.index_copy_(0, expert_index, local);
         }
         return dense;
     };
-    torch::Tensor dense_gate_up;
-    torch::Tensor dense_down;
+    mfq_tensor_backend::Tensor dense_gate_up;
+    mfq_tensor_backend::Tensor dense_down;
     if (dense_reference_enabled) {
         dense_gate_up = materialize_dense_moe(prefix + "gate_up_proj");
         dense_down = materialize_dense_moe(prefix + "down_proj");
@@ -22906,9 +22895,9 @@ static int run_gemma_moe_check(
               << nint_moe_weight_bytes(gate_up) + nint_moe_weight_bytes(down)
               << "\n";
 
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    auto stream = mfq_get_current_cuda_stream().stream();
     auto time_ms = [&](auto && fn, int iterations) {
-        torch::Tensor output;
+        mfq_tensor_backend::Tensor output;
         for (int warmup = 0; warmup < 5; ++warmup) output = fn();
         cudaEvent_t start, stop;
         cudaEventCreate(&start);
@@ -22921,34 +22910,34 @@ static int run_gemma_moe_check(
         cudaEventElapsedTime(&elapsed, start, stop);
         cudaEventDestroy(start);
         cudaEventDestroy(stop);
-        return std::pair<double, torch::Tensor>(elapsed / iterations, output);
+        return std::pair<double, mfq_tensor_backend::Tensor>(elapsed / iterations, output);
     };
 
-    auto topk_logits = torch::randn(
-        {1, experts}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
+    auto topk_logits = mfq_tensor_backend::randn(
+        {1, experts}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
     auto selected = moe_topk_cuda(
-        topk_logits, routes, false, false, false, true, c10::nullopt, 1e-20, 1.0);
-    auto reference = torch::topk(topk_logits, routes, 1, true, true);
-    auto reference_weights = torch::softmax(std::get<0>(reference), 1);
-    torch::cuda::synchronize();
+        topk_logits, routes, false, false, false, true, mfq_nullopt, 1e-20, 1.0);
+    auto reference = mfq_tensor_backend::topk(topk_logits, routes, 1, true, true);
+    auto reference_weights = mfq_tensor_backend::softmax(std::get<0>(reference), 1);
+    mfq_cuda_synchronize();
     auto topk_timing = time_ms([&]() {
         return moe_topk_cuda(
             topk_logits, routes, false, false, false, true,
-            c10::nullopt, 1e-20, 1.0).at(1);
+            mfq_nullopt, 1e-20, 1.0).at(1);
     }, reps);
     std::cout << std::fixed << std::setprecision(6)
               << "gemma_topk_check"
               << " ids_equal="
-              << (selected.at(0).equal(std::get<1>(reference).to(torch::kInt32)) ? 1 : 0)
+              << (selected.at(0).equal(std::get<1>(reference).to(mfq_tensor_backend::kInt32)) ? 1 : 0)
               << " weights_max_abs="
               << (selected.at(1) - reference_weights).abs().max().item<float>()
               << " cuda_ms=" << topk_timing.first << "\n";
 
-    torch::manual_seed(20260721 + layer);
+    mfq_tensor_backend::manual_seed(20260721 + layer);
     for (int64_t tokens : token_sizes) {
-        auto x = torch::randn(
+        auto x = mfq_tensor_backend::randn(
             {tokens, gate_up.neuron_len},
-            torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat16));
+            mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat16));
         std::vector<int32_t> host_ids(static_cast<size_t>(tokens) * routes);
         for (int64_t token = 0; token < tokens; ++token) {
             for (int route_index = 0; route_index < routes; ++route_index) {
@@ -22957,12 +22946,12 @@ static int run_gemma_moe_check(
                         (token * routes + route_index) % experts);
             }
         }
-        auto ids = torch::from_blob(
-            host_ids.data(), {tokens, routes}, torch::TensorOptions().dtype(torch::kInt32))
-            .clone().to(torch::kCUDA).contiguous();
-        auto weights = torch::full(
+        auto ids = mfq_tensor_backend::from_blob(
+            host_ids.data(), {tokens, routes}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
+            .clone().to(mfq_tensor_backend::kCUDA).contiguous();
+        auto weights = mfq_tensor_backend::full(
             {tokens, routes}, 1.0 / routes,
-            torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
+            mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
         auto forward_materialized = [&]() {
             auto route = build_moe_route_plan(ids, experts);
             auto gate_pair = gate_up.forward(x, route);
@@ -22982,12 +22971,12 @@ static int run_gemma_moe_check(
         auto fused_check = forward();
         auto materialized_check = forward_materialized();
         auto gate_glu_check = tokens <= 4 ? forward_gate_glu() : fused_check;
-        torch::cuda::synchronize();
-        auto fused_diff = (fused_check - materialized_check).abs().to(torch::kFloat32);
+        mfq_cuda_synchronize();
+        auto fused_diff = (fused_check - materialized_check).abs().to(mfq_tensor_backend::kFloat32);
         auto fused_time = time_ms(forward, reps);
         auto materialized_time = time_ms(forward_materialized, reps);
         auto gate_glu_time = tokens <= 4 ? time_ms(forward_gate_glu, reps) : fused_time;
-        auto gate_glu_diff = (gate_glu_check - materialized_check).abs().to(torch::kFloat32);
+        auto gate_glu_diff = (gate_glu_check - materialized_check).abs().to(mfq_tensor_backend::kFloat32);
         std::cout << std::fixed << std::setprecision(6)
                   << "gemma_moe_geglu_quant_fusion"
                   << " tokens=" << tokens
@@ -23004,7 +22993,7 @@ static int run_gemma_moe_check(
             auto stage_route = build_moe_route_plan(ids, experts);
             auto stage_hidden = gate_up.forward_glu_output(x, stage_route, true);
             auto stage_down = down.forward(stage_hidden, stage_route);
-            torch::cuda::synchronize();
+            mfq_cuda_synchronize();
             auto gate_stage = time_ms(
                 [&]() { return gate_up.forward_glu_output(x, stage_route, true); }, reps);
             auto down_stage = time_ms(
@@ -23023,15 +23012,15 @@ static int run_gemma_moe_check(
             auto mma = time_ms(forward, reps);
             auto mma_first = mma.second.clone();
             auto mma_repeat = forward().clone();
-            torch::cuda::synchronize();
+            mfq_cuda_synchronize();
             g_force_moe_prefill_mma_off = true;
             nint_moe_set_small_mmq_cuda(0);
             auto baseline = time_ms(forward, reps);
-            torch::cuda::synchronize();
+            mfq_cuda_synchronize();
             g_force_moe_prefill_mma_off = false;
             nint_moe_set_small_mmq_cuda(-1);
-            auto repeat_diff = (mma_repeat - mma_first).abs().to(torch::kFloat32);
-            auto baseline_diff = (mma_first - baseline.second).abs().to(torch::kFloat32);
+            auto repeat_diff = (mma_repeat - mma_first).abs().to(mfq_tensor_backend::kFloat32);
+            auto baseline_diff = (mma_first - baseline.second).abs().to(mfq_tensor_backend::kFloat32);
             std::cout << std::setprecision(6)
                       << "gemma_moe_prefill_ab"
                       << " tokens=" << tokens
@@ -23041,22 +23030,22 @@ static int run_gemma_moe_check(
                       << " repeat_equal=" << (mma_repeat.equal(mma_first) ? 1 : 0)
                       << " repeat_max_abs=" << repeat_diff.max().item<float>()
                       << " baseline_rel="
-                      << ((mma_first - baseline.second).to(torch::kFloat32).norm() /
-                          baseline.second.to(torch::kFloat32).norm()).item<float>()
+                      << ((mma_first - baseline.second).to(mfq_tensor_backend::kFloat32).norm() /
+                          baseline.second.to(mfq_tensor_backend::kFloat32).norm()).item<float>()
                       << " baseline_max_abs=" << baseline_diff.max().item<float>()
                       << "\n";
             if (dense_reference_enabled) {
-                auto dense_route_forward = [&](const torch::Tensor & dense,
-                                               const torch::Tensor & input) {
-                    auto result = torch::empty(
+                auto dense_route_forward = [&](const mfq_tensor_backend::Tensor & dense,
+                                               const mfq_tensor_backend::Tensor & input) {
+                    auto result = mfq_tensor_backend::empty(
                         {tokens, routes, dense.size(1)},
-                        input.options().dtype(torch::kFloat16));
+                        input.options().dtype(mfq_tensor_backend::kFloat16));
                     for (int route_index = 0; route_index < routes; ++route_index) {
                         const int expert = (route_index * 17) % experts;
                         auto selected = input.dim() == 3
                             ? input.select(1, route_index)
                             : input;
-                        result.select(1, route_index).copy_(torch::matmul(
+                        result.select(1, route_index).copy_(mfq_tensor_backend::matmul(
                             selected,
                             dense.index({expert}).transpose(0, 1)));
                     }
@@ -23071,10 +23060,10 @@ static int run_gemma_moe_check(
                 auto dense_output =
                     moe_weighted_reduce_cuda(dense_down_pair, weights);
                 auto dense_difference =
-                    mma_first.to(torch::kFloat32) -
-                    dense_output.to(torch::kFloat32);
+                    mma_first.to(mfq_tensor_backend::kFloat32) -
+                    dense_output.to(mfq_tensor_backend::kFloat32);
                 const double dense_norm =
-                    dense_output.to(torch::kFloat32).norm().item<double>();
+                    dense_output.to(mfq_tensor_backend::kFloat32).norm().item<double>();
                 std::cout << std::scientific << std::setprecision(9)
                           << "gemma_moe_dense_reference"
                           << " tokens=" << tokens
@@ -23131,19 +23120,19 @@ static int run_moe_check(
               << " routed_weight_bytes=" << std::fixed << std::setprecision(0)
               << routed_weight_bytes << "\n";
 
-    torch::manual_seed(20260720 + layer);
-    torch::Tensor output;
+    mfq_tensor_backend::manual_seed(20260720 + layer);
+    mfq_tensor_backend::Tensor output;
     for (int64_t tokens : token_sizes) {
-        auto x = torch::randn(
+        auto x = mfq_tensor_backend::randn(
             {tokens, config.hidden_size},
-            torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat16));
+            mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat16));
         for (int warmup = 0; warmup < 10; ++warmup) output = ffn.forward(x);
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
 
         cudaEvent_t start, stop;
         cudaEventCreate(&start);
         cudaEventCreate(&stop);
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        auto stream = mfq_get_current_cuda_stream().stream();
         auto wall_start = std::chrono::steady_clock::now();
         cudaEventRecord(start, stream);
         for (int iteration = 0; iteration < reps; ++iteration) output = ffn.forward(x);
@@ -23157,7 +23146,7 @@ static int run_moe_check(
         const double cuda_ms = static_cast<double>(elapsed_ms) / reps;
         const double wall_ms =
             std::chrono::duration<double, std::milli>(wall_stop - wall_start).count() / reps;
-        const double checksum = output.to(torch::kFloat32).sum().item<double>();
+        const double checksum = output.to(mfq_tensor_backend::kFloat32).sum().item<double>();
         if (!std::isfinite(checksum)) throw std::runtime_error("non-finite MoE benchmark output");
         std::cout << std::setprecision(6)
                   << "moe_bench_result"
@@ -23174,10 +23163,10 @@ static int run_moe_check(
             auto candidate = output.clone();
             g_force_moe_prefill_mma_off = true;
             auto baseline = ffn.forward(x);
-            torch::cuda::synchronize();
+            mfq_cuda_synchronize();
             g_force_moe_prefill_mma_off = false;
-            auto diff = (candidate - baseline).to(torch::kFloat32);
-            const double baseline_norm = baseline.to(torch::kFloat32).norm().item<double>();
+            auto diff = (candidate - baseline).to(mfq_tensor_backend::kFloat32);
+            const double baseline_norm = baseline.to(mfq_tensor_backend::kFloat32).norm().item<double>();
             std::cout << "moe_prefill_mma_ab"
                       << " tokens=" << tokens
                       << " equal=" << (candidate.equal(baseline) ? 1 : 0)
@@ -23195,10 +23184,10 @@ static int run_moe_check(
             auto candidate = ffn.forward(x);
             nint_moe_set_small_mmq_cuda(0);
             auto baseline = ffn.forward(x);
-            torch::cuda::synchronize();
+            mfq_cuda_synchronize();
             nint_moe_set_small_mmq_cuda(-1);
-            auto candidate_f32 = candidate.to(torch::kFloat32);
-            auto baseline_f32 = baseline.to(torch::kFloat32);
+            auto candidate_f32 = candidate.to(mfq_tensor_backend::kFloat32);
+            auto baseline_f32 = baseline.to(mfq_tensor_backend::kFloat32);
             auto diff = candidate_f32 - baseline_f32;
             const double baseline_norm = baseline_f32.norm().item<double>();
             std::cout << "moe_small_mmq_ab"
@@ -23220,11 +23209,11 @@ static int run_moe_check(
             g_force_moe_unfused_reduce = true;
             g_force_moe_materialized_swiglu = true;
             auto baseline = ffn.forward(x);
-            torch::cuda::synchronize();
+            mfq_cuda_synchronize();
             g_force_moe_pool_path = false;
             g_force_moe_unfused_reduce = false;
             g_force_moe_materialized_swiglu = false;
-            auto diff = (candidate - baseline).abs().to(torch::kFloat32);
+            auto diff = (candidate - baseline).abs().to(mfq_tensor_backend::kFloat32);
             std::cout << "moe_exact_result"
                       << " equal=" << (candidate.equal(baseline) ? 1 : 0)
                       << " differing=" << candidate.ne(baseline).sum().item<int64_t>()
@@ -23236,7 +23225,7 @@ static int run_moe_check(
         g_profiler.enabled = true;
         const int profile_reps = std::min(reps, 10);
         for (int iteration = 0; iteration < profile_reps; ++iteration) output = ffn.forward(x);
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
         g_profiler.report("moe_layer" + std::to_string(layer) + "_m" + std::to_string(tokens));
         g_profiler.enabled = false;
         g_profiler.reset();
@@ -23266,23 +23255,23 @@ static int run_attention_decode_check(int length, int reps, int D, bool sliding,
     const int visible_len = sliding ? std::min(length, window) : length;
     const int max_seq = sliding ? window : (length + kv_tile - 1) / kv_tile * kv_tile;
     const int parts = std::min(max_parts, std::max(1, (length + 127) / 128));
-    auto cuda = torch::TensorOptions().device(torch::kCUDA);
-    torch::manual_seed(20260720);
-    auto q = torch::randn({B, Hq, 1, D}, cuda.dtype(torch::kFloat32));
-    auto k = torch::randn({B, Hk, max_seq, D}, cuda.dtype(torch::kFloat16));
-    auto v = torch::randn({B, Hk, max_seq, D}, cuda.dtype(torch::kFloat16));
-    auto seq_len = torch::tensor({length}, cuda.dtype(torch::kInt64));
-    auto partial_o = torch::empty({B * Hq, max_parts, D}, cuda.dtype(torch::kFloat32));
-    auto partial_m = torch::empty({B * Hq, max_parts}, cuda.dtype(torch::kFloat32));
-    auto partial_l = torch::empty({B * Hq, max_parts}, cuda.dtype(torch::kFloat32));
-    auto qh = q.to(torch::kFloat16);
+    auto cuda = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA);
+    mfq_tensor_backend::manual_seed(20260720);
+    auto q = mfq_tensor_backend::randn({B, Hq, 1, D}, cuda.dtype(mfq_tensor_backend::kFloat32));
+    auto k = mfq_tensor_backend::randn({B, Hk, max_seq, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+    auto v = mfq_tensor_backend::randn({B, Hk, max_seq, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+    auto seq_len = mfq_tensor_backend::tensor({length}, cuda.dtype(mfq_tensor_backend::kInt64));
+    auto partial_o = mfq_tensor_backend::empty({B * Hq, max_parts, D}, cuda.dtype(mfq_tensor_backend::kFloat32));
+    auto partial_m = mfq_tensor_backend::empty({B * Hq, max_parts}, cuda.dtype(mfq_tensor_backend::kFloat32));
+    auto partial_l = mfq_tensor_backend::empty({B * Hq, max_parts}, cuda.dtype(mfq_tensor_backend::kFloat32));
+    auto qh = q.to(mfq_tensor_backend::kFloat16);
     const int mask_stride = (visible_len + kv_tile - 1) / kv_tile * kv_tile;
     const int ntiles_kv = (visible_len + kv_tile - 1) / kv_tile;
     const int64_t max_blocks = B * Hk * ntiles_kv;
     const int64_t meta_float2 = max_blocks * 8 * (2 + D / 2);
-    auto mask = torch::empty({B, mask_stride}, cuda.dtype(torch::kFloat16));
-    auto kv_max = torch::empty({B}, cuda.dtype(torch::kInt32));
-    auto meta = torch::empty({2 * meta_float2}, cuda.dtype(torch::kFloat32));
+    auto mask = mfq_tensor_backend::empty({B, mask_stride}, cuda.dtype(mfq_tensor_backend::kFloat16));
+    auto kv_max = mfq_tensor_backend::empty({B}, cuda.dtype(mfq_tensor_backend::kInt32));
+    auto meta = mfq_tensor_backend::empty({2 * meta_float2}, cuda.dtype(mfq_tensor_backend::kFloat32));
     const double scale = 1.0 / std::sqrt((double)D);
     auto run_ref = [&]() {
         if (sliding) {
@@ -23305,17 +23294,17 @@ static int run_attention_decode_check(int length, int reps, int D, bool sliding,
             : attention_llama_flash256_decode_cuda(
                 q, k, v, seq_len, scale, length, mask, kv_max, meta);
     };
-    torch::Tensor ref, test;
+    mfq_tensor_backend::Tensor ref, test;
     for (int i = 0; i < 10; ++i) {
         ref = run_ref();
         test = run_test();
     }
-    torch::cuda::synchronize();
+    mfq_cuda_synchronize();
     auto time_ms = [&](auto && fn) {
         cudaEvent_t start, stop;
         cudaEventCreate(&start);
         cudaEventCreate(&stop);
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        auto stream = mfq_get_current_cuda_stream().stream();
         cudaEventRecord(start, stream);
         for (int i = 0; i < reps; ++i) fn();
         cudaEventRecord(stop, stream);
@@ -23328,9 +23317,9 @@ static int run_attention_decode_check(int length, int reps, int D, bool sliding,
     };
     const float ref_ms = time_ms(run_ref);
     const float test_ms = time_ms(run_test);
-    ref = run_ref().to(torch::kFloat32);
+    ref = run_ref().to(mfq_tensor_backend::kFloat32);
     test = run_test().permute({0, 2, 1, 3}).contiguous();
-    torch::cuda::synchronize();
+    mfq_cuda_synchronize();
     auto diff = (test - ref).abs();
     std::cout << "attention_decode_check mode=" << (sliding ? "swa" : "full")
               << " head_dim=" << D << " length=" << length
@@ -23342,7 +23331,7 @@ static int run_attention_decode_check(int length, int reps, int D, bool sliding,
     std::cout << "attention_decode_mean_abs=" << diff.mean().item<float>() << "\n";
     std::cout << "attention_decode_max_abs=" << diff.max().item<float>() << "\n";
     std::cout << "attention_decode_test_finite="
-              << (torch::isfinite(test).all().item<bool>() ? 1 : 0) << "\n";
+              << (mfq_tensor_backend::isfinite(test).all().item<bool>() ? 1 : 0) << "\n";
     return 0;
 }
 
@@ -23353,8 +23342,8 @@ static int run_gemma4_swa_check(int reps) {
     constexpr int Hk = 16;
     constexpr int D = 256;
     const double scale = 1.0 / std::sqrt((double)D);
-    auto cuda = torch::TensorOptions().device(torch::kCUDA);
-    torch::manual_seed(20260721);
+    auto cuda = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA);
+    mfq_tensor_backend::manual_seed(20260721);
 
     struct Shape {
         int tokens;
@@ -23367,19 +23356,19 @@ static int run_gemma4_swa_check(int reps) {
     double worst_mean_abs = 0.0;
     double worst_max_abs = 0.0;
     for (const auto shape : shapes) {
-        auto q = torch::randn({B, Hq, shape.tokens, D}, cuda.dtype(torch::kFloat32));
-        auto k = torch::randn({B, Hk, shape.tokens, D}, cuda.dtype(torch::kFloat16));
-        auto v = torch::randn({B, Hk, shape.tokens, D}, cuda.dtype(torch::kFloat16));
+        auto q = mfq_tensor_backend::randn({B, Hq, shape.tokens, D}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto k = mfq_tensor_backend::randn({B, Hk, shape.tokens, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto v = mfq_tensor_backend::randn({B, Hk, shape.tokens, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
         auto ref = attention_swa_cuda(
-            q, k.to(torch::kFloat32), v.to(torch::kFloat32), scale, shape.window);
+            q, k.to(mfq_tensor_backend::kFloat32), v.to(mfq_tensor_backend::kFloat32), scale, shape.window);
         auto test = attention_llama_flash256_swa_cuda(q, k, v, scale, shape.window)
             .permute({0, 2, 1, 3}).contiguous();
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
         auto diff = (test - ref).abs();
         const double rel = ((test - ref).norm() / ref.norm()).item<double>();
         const double mean_abs = diff.mean().item<double>();
         const double max_abs = diff.max().item<double>();
-        const bool finite = torch::isfinite(test).all().item<bool>();
+        const bool finite = mfq_tensor_backend::isfinite(test).all().item<bool>();
         worst_rel = std::max(worst_rel, rel);
         worst_mean_abs = std::max(worst_mean_abs, mean_abs);
         worst_max_abs = std::max(worst_max_abs, max_abs);
@@ -23397,17 +23386,17 @@ static int run_gemma4_swa_check(int reps) {
     for (const int tokens : {33, 256}) {
         constexpr int full_hq = 16;
         constexpr int full_hk = 4;
-        auto q = torch::randn({B, full_hq, tokens, D}, cuda.dtype(torch::kFloat32));
-        auto k = torch::randn({B, full_hk, tokens, D}, cuda.dtype(torch::kFloat16));
-        auto v = torch::randn({B, full_hk, tokens, D}, cuda.dtype(torch::kFloat16));
+        auto q = mfq_tensor_backend::randn({B, full_hq, tokens, D}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto k = mfq_tensor_backend::randn({B, full_hk, tokens, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto v = mfq_tensor_backend::randn({B, full_hk, tokens, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
         auto ref = attention_cuda(
-            q, k.to(torch::kFloat32), v.to(torch::kFloat32), scale, true);
+            q, k.to(mfq_tensor_backend::kFloat32), v.to(mfq_tensor_backend::kFloat32), scale, true);
         auto test = attention_llama_flash256_cuda(q, k, v, scale)
             .permute({0, 2, 1, 3}).contiguous();
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
         auto diff = (test - ref).abs();
         const double rel = ((test - ref).norm() / ref.norm()).item<double>();
-        const bool finite = torch::isfinite(test).all().item<bool>();
+        const bool finite = mfq_tensor_backend::isfinite(test).all().item<bool>();
         std::cout << "flash256_full_check tokens=" << tokens
                   << " rel=" << rel
                   << " mean_abs=" << diff.mean().item<double>()
@@ -23422,17 +23411,17 @@ static int run_gemma4_swa_check(int reps) {
         constexpr int full_hq = 16;
         constexpr int full_hk = 2;
         constexpr int full_d = 512;
-        auto q = torch::randn({B, full_hq, tokens, full_d}, cuda.dtype(torch::kFloat32));
-        auto k = torch::randn({B, full_hk, tokens, full_d}, cuda.dtype(torch::kFloat16));
-        auto v = torch::randn({B, full_hk, tokens, full_d}, cuda.dtype(torch::kFloat16));
+        auto q = mfq_tensor_backend::randn({B, full_hq, tokens, full_d}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto k = mfq_tensor_backend::randn({B, full_hk, tokens, full_d}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto v = mfq_tensor_backend::randn({B, full_hk, tokens, full_d}, cuda.dtype(mfq_tensor_backend::kFloat16));
         auto ref = attention_cuda(
-            q, k.to(torch::kFloat32), v.to(torch::kFloat32), 1.0, true);
+            q, k.to(mfq_tensor_backend::kFloat32), v.to(mfq_tensor_backend::kFloat32), 1.0, true);
         auto test = attention_llama_flash512_cuda(q, k, v, 1.0)
             .permute({0, 2, 1, 3}).contiguous();
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
         auto diff = (test - ref).abs();
         const double rel = ((test - ref).norm() / ref.norm()).item<double>();
-        const bool finite = torch::isfinite(test).all().item<bool>();
+        const bool finite = mfq_tensor_backend::isfinite(test).all().item<bool>();
         std::cout << "gemma4_flash512_check tokens=" << tokens
                   << " rel=" << rel
                   << " mean_abs=" << diff.mean().item<double>()
@@ -23445,11 +23434,11 @@ static int run_gemma4_swa_check(int reps) {
 
     constexpr int bench_tokens = 256;
     constexpr int bench_window = 128;
-    auto q = torch::randn({B, Hq, bench_tokens, D}, cuda.dtype(torch::kFloat32));
-    auto k = torch::randn({B, Hk, bench_tokens, D}, cuda.dtype(torch::kFloat16));
-    auto v = torch::randn({B, Hk, bench_tokens, D}, cuda.dtype(torch::kFloat16));
-    auto kf = k.to(torch::kFloat32);
-    auto vf = v.to(torch::kFloat32);
+    auto q = mfq_tensor_backend::randn({B, Hq, bench_tokens, D}, cuda.dtype(mfq_tensor_backend::kFloat32));
+    auto k = mfq_tensor_backend::randn({B, Hk, bench_tokens, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+    auto v = mfq_tensor_backend::randn({B, Hk, bench_tokens, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+    auto kf = k.to(mfq_tensor_backend::kFloat32);
+    auto vf = v.to(mfq_tensor_backend::kFloat32);
     auto run_ref = [&]() { return attention_swa_cuda(q, kf, vf, scale, bench_window); };
     auto run_test = [&]() {
         return attention_llama_flash256_swa_cuda(q, k, v, scale, bench_window);
@@ -23458,12 +23447,12 @@ static int run_gemma4_swa_check(int reps) {
         run_ref();
         run_test();
     }
-    torch::cuda::synchronize();
+    mfq_cuda_synchronize();
     auto time_ms = [&](auto && fn) {
         cudaEvent_t start, stop;
         MFQ_CUDA_CHECK(cudaEventCreate(&start));
         MFQ_CUDA_CHECK(cudaEventCreate(&stop));
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        auto stream = mfq_get_current_cuda_stream().stream();
         MFQ_CUDA_CHECK(cudaEventRecord(start, stream));
         for (int i = 0; i < reps; ++i) fn();
         MFQ_CUDA_CHECK(cudaEventRecord(stop, stream));
@@ -23490,30 +23479,30 @@ static int run_gemma4_swa_check(int reps) {
 
 static int run_glm_dsa_check(int reps) {
     if (reps < 1) throw std::runtime_error("--check-attention-reps must be positive");
-    torch::NoGradGuard no_grad;
-    auto cuda = torch::TensorOptions().device(torch::kCUDA);
-    torch::manual_seed(20260722);
+    mfq_tensor_backend::NoGradGuard no_grad;
+    auto cuda = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA);
+    mfq_tensor_backend::manual_seed(20260722);
 
     {
         constexpr int B = 2, H = 3, T = 5, D = 128, RD = 64;
-        auto x = torch::randn({B, H, T, D}, cuda.dtype(torch::kFloat32));
-        auto pos = torch::arange(7, 7 + T, cuda.dtype(torch::kInt64));
-        auto freq = torch::pow(
-            torch::full({RD / 2}, 8000000.0, cuda.dtype(torch::kFloat32)),
-            -torch::arange(0, RD, 2, cuda.dtype(torch::kFloat32)) / (double)RD);
-        auto angle = torch::arange(32, cuda.dtype(torch::kFloat32)).unsqueeze(1) * freq.unsqueeze(0);
-        auto cos = torch::cos(angle).contiguous();
-        auto sin = torch::sin(angle).contiguous();
+        auto x = mfq_tensor_backend::randn({B, H, T, D}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto pos = mfq_tensor_backend::arange(7, 7 + T, cuda.dtype(mfq_tensor_backend::kInt64));
+        auto freq = mfq_tensor_backend::pow(
+            mfq_tensor_backend::full({RD / 2}, 8000000.0, cuda.dtype(mfq_tensor_backend::kFloat32)),
+            -mfq_tensor_backend::arange(0, RD, 2, cuda.dtype(mfq_tensor_backend::kFloat32)) / (double)RD);
+        auto angle = mfq_tensor_backend::arange(32, cuda.dtype(mfq_tensor_backend::kFloat32)).unsqueeze(1) * freq.unsqueeze(0);
+        auto cos = mfq_tensor_backend::cos(angle).contiguous();
+        auto sin = mfq_tensor_backend::sin(angle).contiguous();
         auto test = glm_interleaved_rope_cuda(x, pos, cos, sin, RD);
         auto paired = x.index({Slice(), Slice(), Slice(), Slice(0, RD)})
             .reshape({B, H, T, RD / 2, 2});
         auto c = cos.index_select(0, pos).reshape({1, 1, T, RD / 2});
         auto s = sin.index_select(0, pos).reshape({1, 1, T, RD / 2});
-        auto rotated = torch::stack({
+        auto rotated = mfq_tensor_backend::stack({
             paired.select(-1, 0) * c - paired.select(-1, 1) * s,
             paired.select(-1, 1) * c + paired.select(-1, 0) * s,
         }, -1).reshape({B, H, T, RD});
-        auto ref = torch::cat({
+        auto ref = mfq_tensor_backend::cat({
             rotated, x.index({Slice(), Slice(), Slice(), Slice(RD, D)})}, -1);
         const double max_abs = (test - ref).abs().max().item<double>();
         std::cout << "glm_rope_max_abs=" << max_abs << "\n";
@@ -23522,13 +23511,13 @@ static int run_glm_dsa_check(int reps) {
 
     {
         constexpr int ROWS = 17, D = 128;
-        auto x = torch::randn({ROWS, D}, cuda.dtype(torch::kFloat16));
-        auto weight = torch::randn({D}, cuda.dtype(torch::kFloat32));
-        auto bias = torch::randn({D}, cuda.dtype(torch::kFloat32));
+        auto x = mfq_tensor_backend::randn({ROWS, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto weight = mfq_tensor_backend::randn({D}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto bias = mfq_tensor_backend::randn({D}, cuda.dtype(mfq_tensor_backend::kFloat32));
         auto test = glm_dsa_indexer_layer_norm_cuda(x, weight, bias, 1e-5);
-        auto ref = torch::layer_norm(
-            x.to(torch::kFloat32), {D}, weight, bias, 1e-5).to(torch::kFloat16);
-        const double max_abs = (test.to(torch::kFloat32) - ref.to(torch::kFloat32))
+        auto ref = mfq_tensor_backend::layer_norm(
+            x.to(mfq_tensor_backend::kFloat32), {D}, weight, bias, 1e-5).to(mfq_tensor_backend::kFloat16);
+        const double max_abs = (test.to(mfq_tensor_backend::kFloat32) - ref.to(mfq_tensor_backend::kFloat32))
             .abs().max().item<double>();
         std::cout << "glm_indexer_layer_norm_max_abs=" << max_abs << "\n";
         if (max_abs > 0.004) {
@@ -23538,18 +23527,18 @@ static int run_glm_dsa_check(int reps) {
 
     {
         constexpr int ROWS = 3, EXPERTS = 256, TOPK = 8;
-        auto logits = torch::randn({ROWS, EXPERTS}, cuda.dtype(torch::kFloat32));
-        auto bias = torch::randn({EXPERTS}, cuda.dtype(torch::kFloat32));
+        auto logits = mfq_tensor_backend::randn({ROWS, EXPERTS}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto bias = mfq_tensor_backend::randn({EXPERTS}, cuda.dtype(mfq_tensor_backend::kFloat32));
         auto selected = moe_topk_cuda(
             logits, TOPK, true, false, true, false, bias, 1e-20, 2.5);
-        auto sigmoid = torch::sigmoid(logits);
-        auto expected_topk = torch::topk(
+        auto sigmoid = mfq_tensor_backend::sigmoid(logits);
+        auto expected_topk = mfq_tensor_backend::topk(
             sigmoid + bias.unsqueeze(0), TOPK, 1, true, true);
         auto expected_ids = std::get<1>(expected_topk);
         auto expected_weights = sigmoid.gather(1, expected_ids);
         expected_weights = expected_weights /
             expected_weights.sum(1, true).clamp_min(1e-20) * 2.5;
-        const bool ids_equal = selected[0].to(torch::kInt64).equal(expected_ids);
+        const bool ids_equal = selected[0].to(mfq_tensor_backend::kInt64).equal(expected_ids);
         const double max_abs = (selected[1] - expected_weights)
             .abs().max().item<double>();
         std::cout << "glm_moe_route_ids_equal=" << (ids_equal ? 1 : 0)
@@ -23561,25 +23550,25 @@ static int run_glm_dsa_check(int reps) {
 
     {
         constexpr int B = 1, M = 3, K = 2112, H = 32, D = 128;
-        auto q = torch::randn({B, M, H, D}, cuda.dtype(torch::kFloat16));
-        auto k = torch::randn({B, K, D}, cuda.dtype(torch::kFloat16));
-        auto weights = torch::randn({B, M, H}, cuda.dtype(torch::kFloat32));
+        auto q = mfq_tensor_backend::randn({B, M, H, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto k = mfq_tensor_backend::randn({B, K, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto weights = mfq_tensor_backend::randn({B, M, H}, cuda.dtype(mfq_tensor_backend::kFloat32));
         const int offset = K - M;
         auto test = glm_dsa_indexer_scores_cuda(q, k, weights, offset, K);
-        auto heads = torch::einsum(
-            "bmhd,bkd->bmhk", {q.to(torch::kFloat32), k.to(torch::kFloat32)}) /
+        auto heads = mfq_tensor_backend::einsum(
+            "bmhd,bkd->bmhk", {q.to(mfq_tensor_backend::kFloat32), k.to(mfq_tensor_backend::kFloat32)}) /
             std::sqrt(128.0);
-        auto ref = (torch::relu(heads) * weights.unsqueeze(-1)).sum(2) / std::sqrt(32.0);
-        auto key_pos = torch::arange(K, cuda.dtype(torch::kInt64)).reshape({1, 1, K});
-        auto query_pos = torch::arange(offset, offset + M, cuda.dtype(torch::kInt64)).reshape({1, M, 1});
+        auto ref = (mfq_tensor_backend::relu(heads) * weights.unsqueeze(-1)).sum(2) / std::sqrt(32.0);
+        auto key_pos = mfq_tensor_backend::arange(K, cuda.dtype(mfq_tensor_backend::kInt64)).reshape({1, 1, K});
+        auto query_pos = mfq_tensor_backend::arange(offset, offset + M, cuda.dtype(mfq_tensor_backend::kInt64)).reshape({1, M, 1});
         ref = ref.masked_fill(key_pos > query_pos, -std::numeric_limits<float>::infinity());
-        auto finite = torch::isfinite(ref);
-        auto diff = torch::where(finite, (test - ref).abs(), torch::zeros_like(ref));
-        const double rel = torch::where(finite, test - ref, torch::zeros_like(ref)).norm().item<double>() /
-            std::max(torch::where(finite, ref, torch::zeros_like(ref)).norm().item<double>(), 1e-30);
+        auto finite = mfq_tensor_backend::isfinite(ref);
+        auto diff = mfq_tensor_backend::where(finite, (test - ref).abs(), mfq_tensor_backend::zeros_like(ref));
+        const double rel = mfq_tensor_backend::where(finite, test - ref, mfq_tensor_backend::zeros_like(ref)).norm().item<double>() /
+            std::max(mfq_tensor_backend::where(finite, ref, mfq_tensor_backend::zeros_like(ref)).norm().item<double>(), 1e-30);
         const double max_abs = diff.max().item<double>();
         std::cout << "glm_indexer_rel=" << rel << " max_abs=" << max_abs << "\n";
-        if (!torch::isneginf(test.masked_select(~finite)).all().item<bool>() || rel > 0.003) {
+        if (!mfq_tensor_backend::isneginf(test.masked_select(~finite)).all().item<bool>() || rel > 0.003) {
             throw std::runtime_error("GLM indexer score numerical check failed");
         }
     }
@@ -23587,24 +23576,24 @@ static int run_glm_dsa_check(int reps) {
     {
         constexpr int B = 1, M = 1, VISIBLE = 2112, PLANNED = 2176;
         constexpr int H = 32, D = 128;
-        auto q = torch::randn({B, M, H, D}, cuda.dtype(torch::kFloat16));
-        auto k = torch::randn({B, PLANNED, D}, cuda.dtype(torch::kFloat16));
-        auto weights = torch::randn({B, M, H}, cuda.dtype(torch::kFloat32));
-        auto seq_len = torch::tensor({VISIBLE}, cuda.dtype(torch::kInt64));
+        auto q = mfq_tensor_backend::randn({B, M, H, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto k = mfq_tensor_backend::randn({B, PLANNED, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto weights = mfq_tensor_backend::randn({B, M, H}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto seq_len = mfq_tensor_backend::tensor({VISIBLE}, cuda.dtype(mfq_tensor_backend::kInt64));
         auto test = glm_dsa_indexer_scores_decode_cuda(
             q, k, weights, seq_len, PLANNED);
-        auto ref = (torch::relu(torch::einsum(
+        auto ref = (mfq_tensor_backend::relu(mfq_tensor_backend::einsum(
             "bmhd,bkd->bmhk",
-            {q.to(torch::kFloat32), k.to(torch::kFloat32)}) / std::sqrt(128.0)) *
+            {q.to(mfq_tensor_backend::kFloat32), k.to(mfq_tensor_backend::kFloat32)}) / std::sqrt(128.0)) *
             weights.unsqueeze(-1)).sum(2) / std::sqrt(32.0);
         ref.index({Slice(), Slice(), Slice(VISIBLE, PLANNED)})
             .fill_(-std::numeric_limits<float>::infinity());
-        auto finite = torch::isfinite(ref);
-        const double rel = torch::where(
-            finite, test - ref, torch::zeros_like(ref)).norm().item<double>() /
-            std::max(torch::where(
-                finite, ref, torch::zeros_like(ref)).norm().item<double>(), 1e-30);
-        const bool future_inf = torch::isneginf(
+        auto finite = mfq_tensor_backend::isfinite(ref);
+        const double rel = mfq_tensor_backend::where(
+            finite, test - ref, mfq_tensor_backend::zeros_like(ref)).norm().item<double>() /
+            std::max(mfq_tensor_backend::where(
+                finite, ref, mfq_tensor_backend::zeros_like(ref)).norm().item<double>(), 1e-30);
+        const bool future_inf = mfq_tensor_backend::isneginf(
             test.index({Slice(), Slice(), Slice(VISIBLE, PLANNED)})).all().item<bool>();
         std::cout << "glm_indexer_decode_rel=" << rel
                   << " future_inf=" << (future_inf ? 1 : 0) << "\n";
@@ -23616,28 +23605,28 @@ static int run_glm_dsa_check(int reps) {
     {
         constexpr int B = 1, H = 64, T = 33, DQ = 576, DV = 512;
         const double scale = 1.0 / std::sqrt(256.0);
-        auto q = torch::randn({B, H, T, DQ}, cuda.dtype(torch::kFloat32));
-        auto kv = torch::randn({B, 1, T, DQ}, cuda.dtype(torch::kFloat16));
-        auto kv_cache = torch::zeros({B, 1, 64, DQ}, cuda.dtype(torch::kFloat16));
+        auto q = mfq_tensor_backend::randn({B, H, T, DQ}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto kv = mfq_tensor_backend::randn({B, 1, T, DQ}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto kv_cache = mfq_tensor_backend::zeros({B, 1, 64, DQ}, cuda.dtype(mfq_tensor_backend::kFloat16));
         kv_cache.index({Slice(), Slice(), Slice(0, T), Slice()}).copy_(kv);
-        auto mask = torch::empty({T, 64}, cuda.dtype(torch::kFloat16));
-        auto kv_max = torch::empty({B * ((T + 3) / 4)}, cuda.dtype(torch::kInt32));
-        auto meta = torch::empty({8 * 1024 * 1024}, cuda.dtype(torch::kFloat32));
+        auto mask = mfq_tensor_backend::empty({T, 64}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto kv_max = mfq_tensor_backend::empty({B * ((T + 3) / 4)}, cuda.dtype(mfq_tensor_backend::kInt32));
+        auto meta = mfq_tensor_backend::empty({8 * 1024 * 1024}, cuda.dtype(mfq_tensor_backend::kFloat32));
         auto test = attention_glm_mla576_cached_cuda(
             q, kv_cache, T, mask, kv_max, meta, scale);
-        auto q_ref = q.to(torch::kFloat16).to(torch::kFloat32);
-        auto k_ref = kv.to(torch::kFloat32).expand({B, H, T, DQ});
-        auto scores = torch::matmul(q_ref, k_ref.transpose(-1, -2)) * scale;
-        auto causal = torch::ones({T, T}, cuda.dtype(torch::kBool)).tril();
+        auto q_ref = q.to(mfq_tensor_backend::kFloat16).to(mfq_tensor_backend::kFloat32);
+        auto k_ref = kv.to(mfq_tensor_backend::kFloat32).expand({B, H, T, DQ});
+        auto scores = mfq_tensor_backend::matmul(q_ref, k_ref.transpose(-1, -2)) * scale;
+        auto causal = mfq_tensor_backend::ones({T, T}, cuda.dtype(mfq_tensor_backend::kBool)).tril();
         scores = scores.masked_fill(~causal, -std::numeric_limits<float>::infinity());
-        auto ref = torch::matmul(
-            torch::softmax(scores, -1),
+        auto ref = mfq_tensor_backend::matmul(
+            mfq_tensor_backend::softmax(scores, -1),
             k_ref.index({Slice(), Slice(), Slice(), Slice(0, DV)}))
             .permute({0, 2, 1, 3}).contiguous();
         const double rel = (test - ref).norm().item<double>() / ref.norm().item<double>();
         const double max_abs = (test - ref).abs().max().item<double>();
         std::cout << "glm_dense_mla_rel=" << rel << " max_abs=" << max_abs << "\n";
-        if (!torch::isfinite(test).all().item<bool>() || rel > 0.02) {
+        if (!mfq_tensor_backend::isfinite(test).all().item<bool>() || rel > 0.02) {
             throw std::runtime_error("GLM dense MLA numerical check failed");
         }
     }
@@ -23646,60 +23635,60 @@ static int run_glm_dsa_check(int reps) {
         constexpr int B = 1, H = 64, VISIBLE = 33, PLANNED = 64;
         constexpr int DQ = 576, DV = 512;
         const double scale = 1.0 / std::sqrt(256.0);
-        auto q = torch::randn({B, H, 1, DQ}, cuda.dtype(torch::kFloat32));
-        auto kv = torch::randn({B, 1, PLANNED, DQ}, cuda.dtype(torch::kFloat16));
-        auto seq_len = torch::tensor({VISIBLE}, cuda.dtype(torch::kInt64));
-        auto mask = torch::empty({B, PLANNED}, cuda.dtype(torch::kFloat16));
-        auto kv_max = torch::empty({B}, cuda.dtype(torch::kInt32));
-        auto meta = torch::empty({8 * 1024 * 1024}, cuda.dtype(torch::kFloat32));
+        auto q = mfq_tensor_backend::randn({B, H, 1, DQ}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto kv = mfq_tensor_backend::randn({B, 1, PLANNED, DQ}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto seq_len = mfq_tensor_backend::tensor({VISIBLE}, cuda.dtype(mfq_tensor_backend::kInt64));
+        auto mask = mfq_tensor_backend::empty({B, PLANNED}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto kv_max = mfq_tensor_backend::empty({B}, cuda.dtype(mfq_tensor_backend::kInt32));
+        auto meta = mfq_tensor_backend::empty({8 * 1024 * 1024}, cuda.dtype(mfq_tensor_backend::kFloat32));
         auto test = attention_glm_mla576_decode_cuda(
             q, kv, seq_len, scale, PLANNED, mask, kv_max, meta);
         auto selected = kv.index({Slice(), Slice(), Slice(0, VISIBLE), Slice()})
-            .to(torch::kFloat32).expand({B, H, VISIBLE, DQ});
-        auto ref = torch::matmul(
-            torch::softmax(torch::matmul(q, selected.transpose(-1, -2)) * scale, -1),
+            .to(mfq_tensor_backend::kFloat32).expand({B, H, VISIBLE, DQ});
+        auto ref = mfq_tensor_backend::matmul(
+            mfq_tensor_backend::softmax(mfq_tensor_backend::matmul(q, selected.transpose(-1, -2)) * scale, -1),
             selected.index({Slice(), Slice(), Slice(), Slice(0, DV)}))
             .permute({0, 2, 1, 3}).contiguous();
         const double rel = (test - ref).norm().item<double>() /
             std::max(ref.norm().item<double>(), 1e-30);
         std::cout << "glm_dense_decode_rel=" << rel << "\n";
-        if (!torch::isfinite(test).all().item<bool>() || rel > 0.02) {
+        if (!mfq_tensor_backend::isfinite(test).all().item<bool>() || rel > 0.02) {
             throw std::runtime_error("GLM dense decode numerical check failed");
         }
     }
 
     constexpr int B = 1, H = 64, M = 3, K = 2112, TOPK = 2048, DQ = 576, DV = 512;
     const double scale = 1.0 / std::sqrt(256.0);
-    auto q = torch::randn({B, H, M, DQ}, cuda.dtype(torch::kFloat32));
-    auto kv = torch::randn({B, K, DQ}, cuda.dtype(torch::kFloat16));
-    std::vector<torch::Tensor> rows;
+    auto q = mfq_tensor_backend::randn({B, H, M, DQ}, cuda.dtype(mfq_tensor_backend::kFloat32));
+    auto kv = mfq_tensor_backend::randn({B, K, DQ}, cuda.dtype(mfq_tensor_backend::kFloat16));
+    std::vector<mfq_tensor_backend::Tensor> rows;
     rows.reserve(M);
     for (int row = 0; row < M; ++row) {
-        rows.push_back(torch::randperm(K - M + row + 1, cuda.dtype(torch::kInt64))
-            .narrow(0, 0, TOPK).to(torch::kInt32));
+        rows.push_back(mfq_tensor_backend::randperm(K - M + row + 1, cuda.dtype(mfq_tensor_backend::kInt64))
+            .narrow(0, 0, TOPK).to(mfq_tensor_backend::kInt32));
     }
-    auto indices = torch::stack(rows, 0).unsqueeze(0).contiguous();
-    auto meta = torch::empty({8 * 1024 * 1024}, cuda.dtype(torch::kFloat32));
+    auto indices = mfq_tensor_backend::stack(rows, 0).unsqueeze(0).contiguous();
+    auto meta = mfq_tensor_backend::empty({8 * 1024 * 1024}, cuda.dtype(mfq_tensor_backend::kFloat32));
     auto run_sparse = [&]() {
         return attention_glm_mla_sparse_cuda(q, kv, indices, meta, scale);
     };
     auto test = run_sparse();
-    std::vector<torch::Tensor> refs;
+    std::vector<mfq_tensor_backend::Tensor> refs;
     refs.reserve(M);
-    auto q_ref = q.to(torch::kFloat16).to(torch::kFloat32);
+    auto q_ref = q.to(mfq_tensor_backend::kFloat16).to(mfq_tensor_backend::kFloat32);
     for (int row = 0; row < M; ++row) {
-        auto idx = indices.index({0, row}).to(torch::kInt64);
-        auto selected = kv.index_select(1, idx).index({0}).to(torch::kFloat32);
-        auto score = torch::matmul(q_ref.index({0, Slice(), row}), selected.transpose(0, 1)) * scale;
-        refs.push_back(torch::matmul(
-            torch::softmax(score, -1), selected.index({Slice(), Slice(0, DV)})));
+        auto idx = indices.index({0, row}).to(mfq_tensor_backend::kInt64);
+        auto selected = kv.index_select(1, idx).index({0}).to(mfq_tensor_backend::kFloat32);
+        auto score = mfq_tensor_backend::matmul(q_ref.index({0, Slice(), row}), selected.transpose(0, 1)) * scale;
+        refs.push_back(mfq_tensor_backend::matmul(
+            mfq_tensor_backend::softmax(score, -1), selected.index({Slice(), Slice(0, DV)})));
     }
-    auto ref = torch::stack(refs, 0).unsqueeze(0);
-    torch::cuda::synchronize();
+    auto ref = mfq_tensor_backend::stack(refs, 0).unsqueeze(0);
+    mfq_cuda_synchronize();
     const double rel = (test - ref).norm().item<double>() / ref.norm().item<double>();
     const double max_abs = (test - ref).abs().max().item<double>();
     std::cout << "glm_sparse_mla_rel=" << rel << " max_abs=" << max_abs << "\n";
-    if (!torch::isfinite(test).all().item<bool>() || rel > 0.02) {
+    if (!mfq_tensor_backend::isfinite(test).all().item<bool>() || rel > 0.02) {
         throw std::runtime_error("GLM sparse MLA numerical check failed");
     }
 
@@ -23707,7 +23696,7 @@ static int run_glm_dsa_check(int reps) {
         cudaEvent_t start, stop;
         MFQ_CUDA_CHECK(cudaEventCreate(&start));
         MFQ_CUDA_CHECK(cudaEventCreate(&stop));
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        auto stream = mfq_get_current_cuda_stream().stream();
         MFQ_CUDA_CHECK(cudaEventRecord(start, stream));
         for (int i = 0; i < reps; ++i) fn();
         MFQ_CUDA_CHECK(cudaEventRecord(stop, stream));
@@ -23729,41 +23718,41 @@ static int run_dsv4_hc_check(int reps) {
     if (reps < 1) {
         throw std::runtime_error("--check-attention-reps must be positive");
     }
-    torch::NoGradGuard no_grad;
-    auto cuda = torch::TensorOptions().device(torch::kCUDA);
+    mfq_tensor_backend::NoGradGuard no_grad;
+    auto cuda = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA);
     constexpr int64_t hc = 4;
     constexpr int64_t hidden = 4096;
     constexpr int64_t mix_width = 24;
     constexpr double eps = 1e-6;
 
-    auto x_sequence = torch::arange(
-        hc * hidden, cuda.dtype(torch::kFloat32));
+    auto x_sequence = mfq_tensor_backend::arange(
+        hc * hidden, cuda.dtype(mfq_tensor_backend::kFloat32));
     auto x = (
         (x_sequence.remainder(251) - 125.0) / 64.0 +
-        0.125 * torch::sin(x_sequence * 0.015625))
-        .to(torch::kFloat16)
+        0.125 * mfq_tensor_backend::sin(x_sequence * 0.015625))
+        .to(mfq_tensor_backend::kFloat16)
         .reshape({1, 1, hc, hidden})
         .contiguous();
-    auto function_sequence = torch::arange(
-        mix_width * hc * hidden, cuda.dtype(torch::kFloat32));
+    auto function_sequence = mfq_tensor_backend::arange(
+        mix_width * hc * hidden, cuda.dtype(mfq_tensor_backend::kFloat32));
     auto function = (
-        0.003 * torch::sin(function_sequence * 0.001953125) +
-        0.001 * torch::cos(function_sequence * 0.0078125))
+        0.003 * mfq_tensor_backend::sin(function_sequence * 0.001953125) +
+        0.001 * mfq_tensor_backend::cos(function_sequence * 0.0078125))
         .reshape({mix_width, hc * hidden})
         .contiguous();
     auto scale = (
-        0.7 + 0.2 * torch::arange(3, cuda.dtype(torch::kFloat32)))
+        0.7 + 0.2 * mfq_tensor_backend::arange(3, cuda.dtype(mfq_tensor_backend::kFloat32)))
         .contiguous();
     auto base = (
-        0.1 * torch::sin(
-            torch::arange(
-                mix_width, cuda.dtype(torch::kFloat32)) * 0.3125))
+        0.1 * mfq_tensor_backend::sin(
+            mfq_tensor_backend::arange(
+                mix_width, cuda.dtype(mfq_tensor_backend::kFloat32)) * 0.3125))
         .contiguous();
-    auto flat = x.flatten(2).to(torch::kFloat32);
-    auto inverse_rms = torch::rsqrt(
+    auto flat = x.flatten(2).to(mfq_tensor_backend::kFloat32);
+    auto inverse_rms = mfq_tensor_backend::rsqrt(
         flat.square().mean(-1, true) + eps);
     auto mixes = (
-        torch::matmul(flat, function.transpose(0, 1)) * inverse_rms)
+        mfq_tensor_backend::matmul(flat, function.transpose(0, 1)) * inverse_rms)
         .contiguous();
 
     auto reference_split = dsv4_hc_split_sinkhorn(
@@ -23771,7 +23760,7 @@ static int run_dsv4_hc_check(int reps) {
     auto reference_reduced = (
         reference_split.at(0).unsqueeze(-1) *
         flat.reshape({1, 1, hc, hidden}))
-        .sum(2).to(torch::kFloat16).contiguous();
+        .sum(2).to(mfq_tensor_backend::kFloat16).contiguous();
     auto candidate = dsv4_hc_pre_cuda(
         x, mixes, scale, base, 20, eps);
 
@@ -23781,17 +23770,17 @@ static int run_dsv4_hc_check(int reps) {
         reference_split.at(1).unsqueeze(-1) *
             direct.unsqueeze(-2) +
         (reference_split.at(2).unsqueeze(-1) *
-            x.to(torch::kFloat32).unsqueeze(-2)).sum(2))
-        .to(torch::kFloat16).contiguous();
+            x.to(mfq_tensor_backend::kFloat32).unsqueeze(-2)).sum(2))
+        .to(mfq_tensor_backend::kFloat16).contiguous();
     auto candidate_post = dsv4_hc_post_cuda(
         direct, x, candidate.at(1), candidate.at(2));
-    torch::cuda::synchronize();
+    mfq_cuda_synchronize();
 
     auto compare = [](const char * name,
-                      torch::Tensor reference,
-                      torch::Tensor value) {
-        auto reference_f32 = reference.to(torch::kFloat32);
-        auto value_f32 = value.to(torch::kFloat32);
+                      mfq_tensor_backend::Tensor reference,
+                      mfq_tensor_backend::Tensor value) {
+        auto reference_f32 = reference.to(mfq_tensor_backend::kFloat32);
+        auto value_f32 = value.to(mfq_tensor_backend::kFloat32);
         auto diff = value_f32 - reference_f32;
         const double norm = reference_f32.norm().item<double>();
         std::cout << std::scientific << std::setprecision(9)
@@ -23814,11 +23803,11 @@ static int run_dsv4_hc_check(int reps) {
 
     auto time_ms = [&](auto && fn) {
         for (int warmup = 0; warmup < 10; ++warmup) fn();
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
         cudaEvent_t begin, end;
         MFQ_CUDA_CHECK(cudaEventCreate(&begin));
         MFQ_CUDA_CHECK(cudaEventCreate(&end));
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        auto stream = mfq_get_current_cuda_stream().stream();
         MFQ_CUDA_CHECK(cudaEventRecord(begin, stream));
         for (int iteration = 0; iteration < reps; ++iteration) fn();
         MFQ_CUDA_CHECK(cudaEventRecord(end, stream));
@@ -23835,7 +23824,7 @@ static int run_dsv4_hc_check(int reps) {
         return (
             split.at(0).unsqueeze(-1) *
             flat.reshape({1, 1, hc, hidden}))
-            .sum(2).to(torch::kFloat16).contiguous();
+            .sum(2).to(mfq_tensor_backend::kFloat16).contiguous();
     });
     const float candidate_pre_ms = time_ms([&]() {
         return dsv4_hc_pre_cuda(
@@ -23846,8 +23835,8 @@ static int run_dsv4_hc_check(int reps) {
             reference_split.at(1).unsqueeze(-1) *
                 direct.unsqueeze(-2) +
             (reference_split.at(2).unsqueeze(-1) *
-                x.to(torch::kFloat32).unsqueeze(-2)).sum(2))
-            .to(torch::kFloat16).contiguous();
+                x.to(mfq_tensor_backend::kFloat32).unsqueeze(-2)).sum(2))
+            .to(mfq_tensor_backend::kFloat16).contiguous();
     });
     const float candidate_post_ms = time_ms([&]() {
         return dsv4_hc_post_cuda(
@@ -23869,40 +23858,40 @@ static int run_dsv4_attention_check(int reps) {
     if (reps < 1) {
         throw std::runtime_error("--check-attention-reps must be positive");
     }
-    torch::NoGradGuard no_grad;
-    auto cuda = torch::TensorOptions().device(torch::kCUDA);
-    torch::manual_seed(20260723);
+    mfq_tensor_backend::NoGradGuard no_grad;
+    auto cuda = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA);
+    mfq_tensor_backend::manual_seed(20260723);
 
     {
         constexpr int EXPERTS = 256, TOPK = 6;
-        auto logits = torch::randn({1, EXPERTS}, cuda.dtype(torch::kFloat32)) * 3.0;
-        auto bias = torch::randn({EXPERTS}, cuda.dtype(torch::kFloat32)) * 0.05;
+        auto logits = mfq_tensor_backend::randn({1, EXPERTS}, cuda.dtype(mfq_tensor_backend::kFloat32)) * 3.0;
+        auto bias = mfq_tensor_backend::randn({EXPERTS}, cuda.dtype(mfq_tensor_backend::kFloat32)) * 0.05;
         auto selected = moe_topk_cuda(
             logits, TOPK, false, true, true, false, bias, 1e-20, 1.5);
-        auto transformed = torch::sqrt(torch::where(
-            logits > 20.0, logits, torch::log1p(torch::exp(logits))));
-        auto expected_topk = torch::topk(
+        auto transformed = mfq_tensor_backend::sqrt(mfq_tensor_backend::where(
+            logits > 20.0, logits, mfq_tensor_backend::log1p(mfq_tensor_backend::exp(logits))));
+        auto expected_topk = mfq_tensor_backend::topk(
             transformed + bias.unsqueeze(0), TOPK, 1, true, true);
         auto expected_ids = std::get<1>(expected_topk);
         auto expected_weights = transformed.gather(1, expected_ids);
         expected_weights = expected_weights /
             expected_weights.sum(1, true).clamp_min(1e-20) * 1.5;
         const bool ids_equal =
-            selected.at(0).to(torch::kInt64).equal(expected_ids);
+            selected.at(0).to(mfq_tensor_backend::kInt64).equal(expected_ids);
         const double max_abs = (selected.at(1) - expected_weights)
             .abs().max().item<double>();
 
-        auto hash_ids = torch::randint(
-            0, EXPERTS, {7, TOPK}, cuda.dtype(torch::kInt32));
+        auto hash_ids = mfq_tensor_backend::randint(
+            0, EXPERTS, {7, TOPK}, cuda.dtype(mfq_tensor_backend::kInt32));
         auto hash_logits =
-            torch::randn({7, EXPERTS}, cuda.dtype(torch::kFloat32)) * 3.0;
+            mfq_tensor_backend::randn({7, EXPERTS}, cuda.dtype(mfq_tensor_backend::kFloat32)) * 3.0;
         auto hash_weights = moe_sqrtsoftplus_weights_cuda(
             hash_logits, hash_ids, 1e-20, 1.5);
-        auto hash_transformed = torch::sqrt(torch::where(
+        auto hash_transformed = mfq_tensor_backend::sqrt(mfq_tensor_backend::where(
             hash_logits > 20.0, hash_logits,
-            torch::log1p(torch::exp(hash_logits))));
+            mfq_tensor_backend::log1p(mfq_tensor_backend::exp(hash_logits))));
         auto expected_hash = hash_transformed.gather(
-            1, hash_ids.to(torch::kInt64));
+            1, hash_ids.to(mfq_tensor_backend::kInt64));
         expected_hash = expected_hash /
             expected_hash.sum(1, true).clamp_min(1e-20) * 1.5;
         const double hash_max_abs = (hash_weights - expected_hash)
@@ -23920,41 +23909,41 @@ static int run_dsv4_attention_check(int reps) {
     constexpr int D = 512;
     constexpr int RD = 64;
     constexpr double eps = 1e-6;
-    auto norm = torch::randn({D}, cuda.dtype(torch::kFloat32));
+    auto norm = mfq_tensor_backend::randn({D}, cuda.dtype(mfq_tensor_backend::kFloat32));
 
     {
         constexpr int W = 2, R = 128;
-        auto kv = torch::randn({B, W, R, D}, cuda.dtype(torch::kFloat16));
-        auto gate = torch::randn({B, W, R, D}, cuda.dtype(torch::kFloat16));
-        auto ape = torch::randn({R, D}, cuda.dtype(torch::kFloat32));
-        auto empty = torch::empty({0}, cuda.dtype(torch::kFloat16));
-        auto positions = torch::arange(W, cuda.dtype(torch::kInt64)).reshape({B, W});
-        auto cos = torch::ones({W + 1, RD / 2}, cuda.dtype(torch::kFloat32));
-        auto sin = torch::zeros_like(cos);
+        auto kv = mfq_tensor_backend::randn({B, W, R, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto gate = mfq_tensor_backend::randn({B, W, R, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto ape = mfq_tensor_backend::randn({R, D}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto empty = mfq_tensor_backend::empty({0}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto positions = mfq_tensor_backend::arange(W, cuda.dtype(mfq_tensor_backend::kInt64)).reshape({B, W});
+        auto cos = mfq_tensor_backend::ones({W + 1, RD / 2}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto sin = mfq_tensor_backend::zeros_like(cos);
         auto test = dsv4_compress_cuda(
             kv, gate, ape, norm, empty, empty, positions, cos, sin,
             R, false, 1, eps);
-        auto score = gate.to(torch::kFloat32) +
+        auto score = gate.to(mfq_tensor_backend::kFloat32) +
             ape.reshape({1, 1, R, D});
-        auto pooled = (kv.to(torch::kFloat32) *
-            torch::softmax(score, 2)).sum(2);
-        auto ref = pooled * torch::rsqrt(
+        auto pooled = (kv.to(mfq_tensor_backend::kFloat32) *
+            mfq_tensor_backend::softmax(score, 2)).sum(2);
+        auto ref = pooled * mfq_tensor_backend::rsqrt(
             pooled.square().mean(-1, true) + eps) * norm;
-        ref = ref.to(torch::kBFloat16).to(torch::kFloat32);
+        ref = ref.to(mfq_tensor_backend::kBFloat16).to(mfq_tensor_backend::kFloat32);
         auto ref_nope = ref.slice(-1, 0, D - RD)
             .reshape({-1, (D - RD) / 64, 64});
         auto fp8_scale = ref_nope.abs().amax(-1, true)
             .clamp_min(1e-4) / 448.0;
         ref_nope = (ref_nope / fp8_scale)
             .clamp(-448.0, 448.0)
-            .to(c10::kFloat8_e4m3fn)
-            .to(torch::kFloat32) * fp8_scale;
+            .to(mfq_tensor_backend::kFloat8E4M3FN)
+            .to(mfq_tensor_backend::kFloat32) * fp8_scale;
         ref.slice(-1, 0, D - RD).copy_(
             ref_nope.reshape({B, W, D - RD}));
-        ref = ref.to(torch::kBFloat16)
-            .to(torch::kFloat16).to(torch::kFloat32);
+        ref = ref.to(mfq_tensor_backend::kBFloat16)
+            .to(mfq_tensor_backend::kFloat16).to(mfq_tensor_backend::kFloat32);
         const double rel =
-            (test.to(torch::kFloat32) - ref).norm().item<double>() /
+            (test.to(mfq_tensor_backend::kFloat32) - ref).norm().item<double>() /
             std::max(ref.norm().item<double>(), 1e-30);
         std::cout << "dsv4_hca_compressor_rel=" << rel << "\n";
         if (rel > 0.002) {
@@ -23965,18 +23954,18 @@ static int run_dsv4_attention_check(int reps) {
 
     {
         constexpr int W = 3, R = 4, OD = 2 * D;
-        auto kv = torch::randn({B, W, R, OD}, cuda.dtype(torch::kFloat16));
-        auto gate = torch::randn({B, W, R, OD}, cuda.dtype(torch::kFloat16));
-        auto prev_kv = torch::randn({B, R, D}, cuda.dtype(torch::kFloat16));
-        auto prev_gate = torch::randn({B, R, D}, cuda.dtype(torch::kFloat16));
-        auto ape = torch::randn({R, OD}, cuda.dtype(torch::kFloat32));
-        auto positions = torch::arange(W, cuda.dtype(torch::kInt64)).reshape({B, W});
-        auto cos = torch::ones({W + 1, RD / 2}, cuda.dtype(torch::kFloat32));
-        auto sin = torch::zeros_like(cos);
+        auto kv = mfq_tensor_backend::randn({B, W, R, OD}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto gate = mfq_tensor_backend::randn({B, W, R, OD}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto prev_kv = mfq_tensor_backend::randn({B, R, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto prev_gate = mfq_tensor_backend::randn({B, R, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto ape = mfq_tensor_backend::randn({R, OD}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto positions = mfq_tensor_backend::arange(W, cuda.dtype(mfq_tensor_backend::kInt64)).reshape({B, W});
+        auto cos = mfq_tensor_backend::ones({W + 1, RD / 2}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto sin = mfq_tensor_backend::zeros_like(cos);
         auto test = dsv4_compress_cuda(
             kv, gate, ape, norm, prev_kv, prev_gate, positions,
             cos, sin, R, true, 0, eps);
-        std::vector<torch::Tensor> ref_rows;
+        std::vector<mfq_tensor_backend::Tensor> ref_rows;
         for (int w = 0; w < W; ++w) {
             auto left_kv = w == 0
                 ? prev_kv
@@ -23988,22 +23977,22 @@ static int run_dsv4_attention_check(int reps) {
                 kv.index({Slice(), w, Slice(), Slice(D, OD)});
             auto right_gate =
                 gate.index({Slice(), w, Slice(), Slice(D, OD)});
-            auto values = torch::cat({left_kv, right_kv}, 1)
-                .to(torch::kFloat32);
-            auto score = torch::cat({
-                left_gate.to(torch::kFloat32) +
+            auto values = mfq_tensor_backend::cat({left_kv, right_kv}, 1)
+                .to(mfq_tensor_backend::kFloat32);
+            auto score = mfq_tensor_backend::cat({
+                left_gate.to(mfq_tensor_backend::kFloat32) +
                     ape.index({Slice(), Slice(0, D)}).unsqueeze(0),
-                right_gate.to(torch::kFloat32) +
+                right_gate.to(mfq_tensor_backend::kFloat32) +
                     ape.index({Slice(), Slice(D, OD)}).unsqueeze(0)}, 1);
-            auto pooled = (values * torch::softmax(score, 1)).sum(1);
+            auto pooled = (values * mfq_tensor_backend::softmax(score, 1)).sum(1);
             ref_rows.push_back(
-                pooled * torch::rsqrt(
+                pooled * mfq_tensor_backend::rsqrt(
                     pooled.square().mean(-1, true) + eps) * norm);
         }
-        auto ref = torch::stack(ref_rows, 1)
-            .to(torch::kFloat16).to(torch::kFloat32);
+        auto ref = mfq_tensor_backend::stack(ref_rows, 1)
+            .to(mfq_tensor_backend::kFloat16).to(mfq_tensor_backend::kFloat32);
         const double rel =
-            (test.to(torch::kFloat32) - ref).norm().item<double>() /
+            (test.to(mfq_tensor_backend::kFloat32) - ref).norm().item<double>() /
             std::max(ref.norm().item<double>(), 1e-30);
         std::cout << "dsv4_csa_overlap_compressor_rel=" << rel << "\n";
         if (rel > 0.002) {
@@ -24014,27 +24003,27 @@ static int run_dsv4_attention_check(int reps) {
 
     {
         constexpr int T = 12, R = 4, W = T / R, OD = 2 * D;
-        auto kv = torch::randn({B, T, OD}, cuda.dtype(torch::kFloat32));
-        auto gate = torch::randn({B, T, OD}, cuda.dtype(torch::kFloat32));
-        auto ape = torch::randn({R, OD}, cuda.dtype(torch::kFloat32));
-        auto empty = torch::empty({0}, cuda.dtype(torch::kFloat16));
-        auto positions = torch::arange(W, cuda.dtype(torch::kInt64)).reshape({B, W});
-        auto cos = torch::ones({W + 1, RD / 2}, cuda.dtype(torch::kFloat32));
-        auto sin = torch::zeros_like(cos);
+        auto kv = mfq_tensor_backend::randn({B, T, OD}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto gate = mfq_tensor_backend::randn({B, T, OD}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto ape = mfq_tensor_backend::randn({R, OD}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto empty = mfq_tensor_backend::empty({0}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto positions = mfq_tensor_backend::arange(W, cuda.dtype(mfq_tensor_backend::kInt64)).reshape({B, W});
+        auto cos = mfq_tensor_backend::ones({W + 1, RD / 2}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto sin = mfq_tensor_backend::zeros_like(cos);
         auto batch = dsv4_compress_cuda(
             kv.reshape({B, W, R, OD}).contiguous(),
             gate.reshape({B, W, R, OD}).contiguous(),
             ape, norm, empty, empty, positions, cos, sin,
             R, true, 1, eps);
-        auto state_kv = torch::zeros(
-            {B, R, OD}, cuda.dtype(torch::kFloat32));
-        auto state_gate = torch::zeros_like(state_kv);
-        auto prev_kv = torch::zeros(
-            {B, R, D}, cuda.dtype(torch::kFloat32));
-        auto prev_gate = torch::zeros_like(prev_kv);
-        auto pool = torch::zeros(
-            {B, W, D}, cuda.dtype(torch::kFloat16));
-        auto seq_len = torch::zeros({B}, cuda.dtype(torch::kInt64));
+        auto state_kv = mfq_tensor_backend::zeros(
+            {B, R, OD}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto state_gate = mfq_tensor_backend::zeros_like(state_kv);
+        auto prev_kv = mfq_tensor_backend::zeros(
+            {B, R, D}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto prev_gate = mfq_tensor_backend::zeros_like(prev_kv);
+        auto pool = mfq_tensor_backend::zeros(
+            {B, W, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto seq_len = mfq_tensor_backend::zeros({B}, cuda.dtype(mfq_tensor_backend::kInt64));
         for (int t = 0; t < T; ++t) {
             seq_len.fill_(t + 1);
             dsv4_decode_pool_update_cuda(
@@ -24044,9 +24033,9 @@ static int run_dsv4_attention_check(int reps) {
                 pool, seq_len, cos, sin, R, true, 1, eps);
         }
         const double rel =
-            (pool.to(torch::kFloat32) - batch.to(torch::kFloat32))
+            (pool.to(mfq_tensor_backend::kFloat32) - batch.to(mfq_tensor_backend::kFloat32))
                 .norm().item<double>() /
-            std::max(batch.to(torch::kFloat32).norm().item<double>(), 1e-30);
+            std::max(batch.to(mfq_tensor_backend::kFloat32).norm().item<double>(), 1e-30);
         std::cout << "dsv4_decode_pool_state_rel=" << rel << "\n";
         if (rel > 0.002) {
             throw std::runtime_error(
@@ -24057,35 +24046,35 @@ static int run_dsv4_attention_check(int reps) {
     {
         constexpr int ID = 128, T = 12, R = 4, W = T / R;
         constexpr int OD = 2 * ID;
-        auto index_norm = torch::randn(
-            {ID}, cuda.dtype(torch::kFloat32));
-        auto kv = torch::randn(
-            {B, T, OD}, cuda.dtype(torch::kFloat32));
-        auto gate = torch::randn(
-            {B, T, OD}, cuda.dtype(torch::kFloat32));
-        auto ape = torch::randn(
-            {R, OD}, cuda.dtype(torch::kFloat32));
-        auto empty = torch::empty({0}, cuda.dtype(torch::kFloat16));
-        auto positions = torch::arange(
-            W, cuda.dtype(torch::kInt64)).reshape({B, W});
-        auto cos = torch::ones(
-            {W + 1, RD / 2}, cuda.dtype(torch::kFloat32));
-        auto sin = torch::zeros_like(cos);
+        auto index_norm = mfq_tensor_backend::randn(
+            {ID}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto kv = mfq_tensor_backend::randn(
+            {B, T, OD}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto gate = mfq_tensor_backend::randn(
+            {B, T, OD}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto ape = mfq_tensor_backend::randn(
+            {R, OD}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto empty = mfq_tensor_backend::empty({0}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto positions = mfq_tensor_backend::arange(
+            W, cuda.dtype(mfq_tensor_backend::kInt64)).reshape({B, W});
+        auto cos = mfq_tensor_backend::ones(
+            {W + 1, RD / 2}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto sin = mfq_tensor_backend::zeros_like(cos);
         auto batch = dsv4_compress_cuda(
             kv.reshape({B, W, R, OD}).contiguous(),
             gate.reshape({B, W, R, OD}).contiguous(),
             ape, index_norm, empty, empty, positions, cos, sin,
             R, true, 2, eps);
-        auto state_kv = torch::zeros(
-            {B, R, OD}, cuda.dtype(torch::kFloat32));
-        auto state_gate = torch::zeros_like(state_kv);
-        auto prev_kv = torch::zeros(
-            {B, R, ID}, cuda.dtype(torch::kFloat32));
-        auto prev_gate = torch::zeros_like(prev_kv);
-        auto pool = torch::zeros(
-            {B, W, ID}, cuda.dtype(torch::kFloat16));
-        auto seq_len = torch::zeros(
-            {B}, cuda.dtype(torch::kInt64));
+        auto state_kv = mfq_tensor_backend::zeros(
+            {B, R, OD}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto state_gate = mfq_tensor_backend::zeros_like(state_kv);
+        auto prev_kv = mfq_tensor_backend::zeros(
+            {B, R, ID}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto prev_gate = mfq_tensor_backend::zeros_like(prev_kv);
+        auto pool = mfq_tensor_backend::zeros(
+            {B, W, ID}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto seq_len = mfq_tensor_backend::zeros(
+            {B}, cuda.dtype(mfq_tensor_backend::kInt64));
         for (int t = 0; t < T; ++t) {
             seq_len.fill_(t + 1);
             dsv4_decode_pool_update_cuda(
@@ -24096,10 +24085,10 @@ static int run_dsv4_attention_check(int reps) {
                 R, true, 2, eps);
         }
         const double rel =
-            (pool.to(torch::kFloat32) - batch.to(torch::kFloat32))
+            (pool.to(mfq_tensor_backend::kFloat32) - batch.to(mfq_tensor_backend::kFloat32))
                 .norm().item<double>() /
             std::max(
-                batch.to(torch::kFloat32).norm().item<double>(),
+                batch.to(mfq_tensor_backend::kFloat32).norm().item<double>(),
                 1e-30);
         std::cout << "dsv4_indexer_pool_state_rel=" << rel << "\n";
         if (rel > 0.002) {
@@ -24110,16 +24099,16 @@ static int run_dsv4_attention_check(int reps) {
 
     {
         constexpr int ID = 128, T = 14, R = 4, OD = 2 * ID;
-        auto index_norm = torch::randn(
-            {ID}, cuda.dtype(torch::kFloat32));
-        auto kv = torch::randn(
-            {B, T, OD}, cuda.dtype(torch::kFloat32));
-        auto gate = torch::randn(
-            {B, T, OD}, cuda.dtype(torch::kFloat32));
+        auto index_norm = mfq_tensor_backend::randn(
+            {ID}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto kv = mfq_tensor_backend::randn(
+            {B, T, OD}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        auto gate = mfq_tensor_backend::randn(
+            {B, T, OD}, cuda.dtype(mfq_tensor_backend::kFloat32));
         Dsv4RopeTable rope;
-        rope.cos = torch::ones(
-            {T + 1, RD / 2}, cuda.dtype(torch::kFloat32));
-        rope.sin = torch::zeros_like(rope.cos);
+        rope.cos = mfq_tensor_backend::ones(
+            {T + 1, RD / 2}, cuda.dtype(mfq_tensor_backend::kFloat32));
+        rope.sin = mfq_tensor_backend::zeros_like(rope.cos);
         rope.negative_sin = -rope.sin;
 
         Dsv4PoolState batched;
@@ -24127,8 +24116,8 @@ static int run_dsv4_attention_check(int reps) {
         batched.head_dim = ID;
         batched.overlap = true;
         batched.cache_quant_mode = 2;
-        batched.ape = torch::randn(
-            {R, OD}, cuda.dtype(torch::kFloat32));
+        batched.ape = mfq_tensor_backend::randn(
+            {R, OD}, cuda.dtype(mfq_tensor_backend::kFloat32));
         batched.norm = index_norm;
         batched.reset(B, T);
 
@@ -24142,8 +24131,8 @@ static int run_dsv4_attention_check(int reps) {
         decoded.reset(B, T);
 
         const int64_t windows = batched.prefill(kv, gate, rope);
-        auto seq_len = torch::zeros(
-            {B}, cuda.dtype(torch::kInt64));
+        auto seq_len = mfq_tensor_backend::zeros(
+            {B}, cuda.dtype(mfq_tensor_backend::kInt64));
         for (int t = 0; t < T; ++t) {
             seq_len.fill_(t + 1);
             decoded.update(
@@ -24155,10 +24144,10 @@ static int run_dsv4_attention_check(int reps) {
         auto reference_pool = decoded.pool.narrow(1, 0, pool_width);
         auto candidate_pool = batched.pool.narrow(1, 0, pool_width);
         const double pool_rel =
-            (candidate_pool.to(torch::kFloat32) -
-             reference_pool.to(torch::kFloat32)).norm().item<double>() /
+            (candidate_pool.to(mfq_tensor_backend::kFloat32) -
+             reference_pool.to(mfq_tensor_backend::kFloat32)).norm().item<double>() /
             std::max(
-                reference_pool.to(torch::kFloat32).norm().item<double>(),
+                reference_pool.to(mfq_tensor_backend::kFloat32).norm().item<double>(),
                 1e-30);
         const double state_rel =
             (batched.state_kv - decoded.state_kv)
@@ -24192,40 +24181,40 @@ static int run_dsv4_attention_check(int reps) {
 
     {
         constexpr int ROWS = 9, WIDTH = 128;
-        auto input = torch::randn(
-            {ROWS, WIDTH}, cuda.dtype(torch::kFloat16)) * 2.0;
+        auto input = mfq_tensor_backend::randn(
+            {ROWS, WIDTH}, cuda.dtype(mfq_tensor_backend::kFloat16)) * 2.0;
         auto test = dsv4_fp4_sim_cuda(input.contiguous());
-        auto grouped = input.to(torch::kFloat32)
+        auto grouped = input.to(mfq_tensor_backend::kFloat32)
             .reshape({ROWS, WIDTH / 32, 32});
-        auto scale = torch::exp2(torch::ceil(torch::log2(
+        auto scale = mfq_tensor_backend::exp2(mfq_tensor_backend::ceil(mfq_tensor_backend::log2(
             grouped.abs().amax(-1, true)
                 .clamp_min(6.0 * std::ldexp(1.0, -126)) / 6.0)));
         auto normalized = (grouped / scale).clamp(-6.0, 6.0);
         auto magnitude = normalized.abs();
-        auto quantized = torch::where(
-            magnitude <= 0.25, torch::zeros_like(magnitude),
-            torch::where(
-                magnitude < 0.75, torch::full_like(magnitude, 0.5),
-                torch::where(
-                    magnitude <= 1.25, torch::ones_like(magnitude),
-                    torch::where(
+        auto quantized = mfq_tensor_backend::where(
+            magnitude <= 0.25, mfq_tensor_backend::zeros_like(magnitude),
+            mfq_tensor_backend::where(
+                magnitude < 0.75, mfq_tensor_backend::full_like(magnitude, 0.5),
+                mfq_tensor_backend::where(
+                    magnitude <= 1.25, mfq_tensor_backend::ones_like(magnitude),
+                    mfq_tensor_backend::where(
                         magnitude < 1.75,
-                        torch::full_like(magnitude, 1.5),
-                        torch::where(
+                        mfq_tensor_backend::full_like(magnitude, 1.5),
+                        mfq_tensor_backend::where(
                             magnitude <= 2.5,
-                            torch::full_like(magnitude, 2.0),
-                            torch::where(
+                            mfq_tensor_backend::full_like(magnitude, 2.0),
+                            mfq_tensor_backend::where(
                                 magnitude < 3.5,
-                                torch::full_like(magnitude, 3.0),
-                                torch::where(
+                                mfq_tensor_backend::full_like(magnitude, 3.0),
+                                mfq_tensor_backend::where(
                                     magnitude <= 5.0,
-                                    torch::full_like(magnitude, 4.0),
-                                    torch::full_like(
+                                    mfq_tensor_backend::full_like(magnitude, 4.0),
+                                    mfq_tensor_backend::full_like(
                                         magnitude, 6.0))))))));
-        quantized = torch::where(
+        quantized = mfq_tensor_backend::where(
             normalized < 0, -quantized, quantized);
         auto reference = (quantized * scale)
-            .reshape({ROWS, WIDTH}).to(torch::kFloat16);
+            .reshape({ROWS, WIDTH}).to(mfq_tensor_backend::kFloat16);
         const double max_abs = (test - reference)
             .abs().max().item<double>();
         std::cout << "dsv4_fp4_sim_max_abs=" << max_abs << "\n";
@@ -24237,30 +24226,30 @@ static int run_dsv4_attention_check(int reps) {
 
     {
         constexpr int M = 3, K = 768, H = 64, ID = 128;
-        auto q = torch::randn({B, M, H, ID}, cuda.dtype(torch::kFloat16));
-        auto k = torch::randn({B, K, ID}, cuda.dtype(torch::kFloat16));
-        auto weights = torch::randn({B, M, H}, cuda.dtype(torch::kFloat16));
+        auto q = mfq_tensor_backend::randn({B, M, H, ID}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto k = mfq_tensor_backend::randn({B, K, ID}, cuda.dtype(mfq_tensor_backend::kFloat16));
+        auto weights = mfq_tensor_backend::randn({B, M, H}, cuda.dtype(mfq_tensor_backend::kFloat16));
         auto test = dsv4_indexer_scores_cuda(q, k, weights, 4096, 4);
-        auto dot = torch::einsum(
+        auto dot = mfq_tensor_backend::einsum(
             "bmhd,bkd->bmhk",
-            {q.to(torch::kFloat32), k.to(torch::kFloat32)});
-        auto ref = (torch::relu(dot) *
-            weights.to(torch::kFloat32).unsqueeze(-1)).sum(2) /
+            {q.to(mfq_tensor_backend::kFloat32), k.to(mfq_tensor_backend::kFloat32)});
+        auto ref = (mfq_tensor_backend::relu(dot) *
+            weights.to(mfq_tensor_backend::kFloat32).unsqueeze(-1)).sum(2) /
             std::sqrt(static_cast<double>(H * ID));
-        ref = ref.to(torch::kFloat16);
+        ref = ref.to(mfq_tensor_backend::kFloat16);
         const double rel =
-            (test.to(torch::kFloat32) - ref.to(torch::kFloat32))
+            (test.to(mfq_tensor_backend::kFloat32) - ref.to(mfq_tensor_backend::kFloat32))
                 .norm().item<double>() /
-            std::max(ref.to(torch::kFloat32).norm().item<double>(), 1e-30);
+            std::max(ref.to(mfq_tensor_backend::kFloat32).norm().item<double>(), 1e-30);
         auto selected = dsv4_topk512_cuda(test);
-        auto expected_topk = torch::topk(test, 512, -1, true, false);
+        auto expected_topk = mfq_tensor_backend::topk(test, 512, -1, true, false);
         auto expected_scores = std::get<0>(expected_topk);
         auto expected = std::get<1>(expected_topk);
-        auto selected_i64 = selected.to(torch::kInt64);
+        auto selected_i64 = selected.to(mfq_tensor_backend::kInt64);
         auto selected_sorted = std::get<0>(
-            torch::sort(selected_i64, -1));
+            mfq_tensor_backend::sort(selected_i64, -1));
         auto expected_sorted = std::get<0>(
-            torch::sort(expected.to(torch::kInt64), -1));
+            mfq_tensor_backend::sort(expected.to(mfq_tensor_backend::kInt64), -1));
         const bool topk_id_equal = selected_sorted.equal(expected_sorted);
         const bool topk_ids_valid =
             (selected_i64 >= 0).all().item<bool>() &&
@@ -24273,9 +24262,9 @@ static int run_dsv4_attention_check(int reps) {
         if (topk_ids_valid) {
             auto selected_scores = test.gather(-1, selected_i64);
             auto selected_score_sorted = std::get<0>(
-                torch::sort(selected_scores, -1));
+                mfq_tensor_backend::sort(selected_scores, -1));
             auto expected_score_sorted = std::get<0>(
-                torch::sort(expected_scores, -1));
+                mfq_tensor_backend::sort(expected_scores, -1));
             topk_scores_equal =
                 selected_score_sorted.equal(expected_score_sorted);
         }
@@ -24300,30 +24289,30 @@ static int run_dsv4_attention_check(int reps) {
     constexpr int TOPK = 512;
     constexpr int WINDOW = 128;
     const double scale = 1.0 / std::sqrt(static_cast<double>(D));
-    auto q = torch::randn({B, H, M, D}, cuda.dtype(torch::kFloat32));
-    auto raw = torch::randn({B, HISTORY + M, D}, cuda.dtype(torch::kFloat16));
-    auto pooled = torch::randn({B, POOL, D}, cuda.dtype(torch::kFloat16));
-    auto kv = torch::cat({raw, pooled}, 1).contiguous();
-    std::vector<torch::Tensor> topk_rows;
+    auto q = mfq_tensor_backend::randn({B, H, M, D}, cuda.dtype(mfq_tensor_backend::kFloat32));
+    auto raw = mfq_tensor_backend::randn({B, HISTORY + M, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+    auto pooled = mfq_tensor_backend::randn({B, POOL, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
+    auto kv = mfq_tensor_backend::cat({raw, pooled}, 1).contiguous();
+    std::vector<mfq_tensor_backend::Tensor> topk_rows;
     for (int row = 0; row < M; ++row) {
         topk_rows.push_back(
-            torch::randperm(POOL, cuda.dtype(torch::kInt64))
-                .narrow(0, 0, TOPK).to(torch::kInt32));
+            mfq_tensor_backend::randperm(POOL, cuda.dtype(mfq_tensor_backend::kInt64))
+                .narrow(0, 0, TOPK).to(mfq_tensor_backend::kInt32));
     }
-    auto topk = torch::stack(topk_rows, 0).unsqueeze(0).contiguous();
+    auto topk = mfq_tensor_backend::stack(topk_rows, 0).unsqueeze(0).contiguous();
     auto plan = dsv4_build_prefill_plan_cuda(
         topk, 4096, HISTORY, POOL, 4, WINDOW);
     {
-        auto seq_len = torch::tensor({4097}, cuda.dtype(torch::kInt64));
+        auto seq_len = mfq_tensor_backend::tensor({4097}, cuda.dtype(mfq_tensor_backend::kInt64));
         auto decode_plan = dsv4_build_decode_plan_cuda(
             topk.narrow(1, 0, 1).contiguous(),
             seq_len, POOL, 4, WINDOW);
         auto expected_local =
-            torch::arange(4097 - WINDOW, 4097, cuda.dtype(torch::kInt64))
+            mfq_tensor_backend::arange(4097 - WINDOW, 4097, cuda.dtype(mfq_tensor_backend::kInt64))
                 .remainder(WINDOW);
         const bool local_equal = decode_plan[0]
             .index({0, 0, Slice(0, WINDOW)})
-            .to(torch::kInt64).equal(expected_local);
+            .to(mfq_tensor_backend::kInt64).equal(expected_local);
         const bool pooled_equal = decode_plan[0]
             .index({0, 0, Slice(WINDOW, WINDOW + TOPK)})
             .equal(topk.index({0, 0}) + WINDOW);
@@ -24337,38 +24326,38 @@ static int run_dsv4_attention_check(int reps) {
                 "DeepSeek V4 decode cache plan check failed");
         }
     }
-    auto sinks = torch::randn({H}, cuda.dtype(torch::kFloat32));
-    auto meta = torch::empty(
-        {8 * 1024 * 1024}, cuda.dtype(torch::kFloat32));
+    auto sinks = mfq_tensor_backend::randn({H}, cuda.dtype(mfq_tensor_backend::kFloat32));
+    auto meta = mfq_tensor_backend::empty(
+        {8 * 1024 * 1024}, cuda.dtype(mfq_tensor_backend::kFloat32));
     auto run_sparse = [&]() {
         return attention_dsv4_sparse_cuda(
             q, kv, plan[0], plan[1], sinks, meta, scale);
     };
     auto test = run_sparse();
-    std::vector<torch::Tensor> ref_rows;
-    auto q_ref = q.to(torch::kFloat16).to(torch::kFloat32);
+    std::vector<mfq_tensor_backend::Tensor> ref_rows;
+    auto q_ref = q.to(mfq_tensor_backend::kFloat16).to(mfq_tensor_backend::kFloat32);
     for (int row = 0; row < M; ++row) {
-        auto idx = plan[0].index({0, row}).to(torch::kInt64);
+        auto idx = plan[0].index({0, row}).to(mfq_tensor_backend::kInt64);
         auto selected = kv.index_select(1, idx).index({0})
-            .to(torch::kFloat32);
-        auto score = torch::matmul(
+            .to(mfq_tensor_backend::kFloat32);
+        auto score = mfq_tensor_backend::matmul(
             q_ref.index({0, Slice(), row}),
             selected.transpose(0, 1)) * scale;
         score = score + plan[1].index({0, row})
-            .to(torch::kFloat32).unsqueeze(0);
-        auto logits = torch::cat({score, sinks.unsqueeze(1)}, 1);
-        auto probabilities = torch::softmax(logits, -1)
+            .to(mfq_tensor_backend::kFloat32).unsqueeze(0);
+        auto logits = mfq_tensor_backend::cat({score, sinks.unsqueeze(1)}, 1);
+        auto probabilities = mfq_tensor_backend::softmax(logits, -1)
             .index({Slice(), Slice(0, score.size(1))});
-        ref_rows.push_back(torch::matmul(probabilities, selected));
+        ref_rows.push_back(mfq_tensor_backend::matmul(probabilities, selected));
     }
-    auto ref = torch::stack(ref_rows, 0).unsqueeze(0);
-    torch::cuda::synchronize();
+    auto ref = mfq_tensor_backend::stack(ref_rows, 0).unsqueeze(0);
+    mfq_cuda_synchronize();
     const double rel = (test - ref).norm().item<double>() /
         std::max(ref.norm().item<double>(), 1e-30);
     const double max_abs = (test - ref).abs().max().item<double>();
     std::cout << "dsv4_sparse_attention_rel=" << rel
               << " max_abs=" << max_abs << "\n";
-    if (!torch::isfinite(test).all().item<bool>() || rel > 0.02) {
+    if (!mfq_tensor_backend::isfinite(test).all().item<bool>() || rel > 0.02) {
         throw std::runtime_error(
             "DeepSeek V4 sparse attention numerical check failed");
     }
@@ -24377,7 +24366,7 @@ static int run_dsv4_attention_check(int reps) {
         cudaEvent_t start, stop;
         MFQ_CUDA_CHECK(cudaEventCreate(&start));
         MFQ_CUDA_CHECK(cudaEventCreate(&stop));
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        auto stream = mfq_get_current_cuda_stream().stream();
         for (int i = 0; i < 5; ++i) fn();
         MFQ_CUDA_CHECK(cudaEventRecord(start, stream));
         for (int i = 0; i < reps; ++i) fn();
@@ -24396,15 +24385,15 @@ static int run_dsv4_attention_check(int reps) {
 }
 
 static int run_text_session_state_check() {
-    c10::cuda::CUDAGuard guard(0);
-    auto cuda_float = torch::TensorOptions()
-        .device(torch::kCUDA).dtype(torch::kFloat32);
+    MfqCudaGuard guard(0);
+    auto cuda_float = mfq_tensor_backend::TensorOptions()
+        .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32);
     const auto values = [&](std::vector<int64_t> shape,
-                            torch::ScalarType dtype,
+                            mfq_tensor_backend::ScalarType dtype,
                             float offset) {
         int64_t elements = 1;
         for (int64_t extent : shape) elements *= extent;
-        return (torch::arange(elements, cuda_float) + offset)
+        return (mfq_tensor_backend::arange(elements, cuda_float) + offset)
             .reshape(shape).to(dtype).contiguous();
     };
     const auto require_equal = [](bool condition, const char * message) {
@@ -24416,11 +24405,11 @@ static int run_text_session_state_check() {
     auto * dsv4_block = dsv4.get();
     dsv4_block->cuda_device = 0;
     dsv4_block->shared_state = std::make_shared<Dsv4SharedState>();
-    dsv4_block->shared_state->attention_meta = torch::empty({1}, cuda_float);
-    dsv4_block->shared_state->hadamard_signs = torch::ones(
-        {128}, cuda_float.dtype(torch::kInt8));
+    dsv4_block->shared_state->attention_meta = mfq_tensor_backend::empty({1}, cuda_float);
+    dsv4_block->shared_state->hadamard_signs = mfq_tensor_backend::ones(
+        {128}, cuda_float.dtype(mfq_tensor_backend::kInt8));
     dsv4_block->local_cache = values(
-        {1, 128, 8}, torch::kFloat16, 1.0f);
+        {1, 128, 8}, mfq_tensor_backend::kFloat16, 1.0f);
     const auto initialize_dsv4_pool = [&](Dsv4PoolState & pool,
                                           int64_t head_dim,
                                           bool overlap,
@@ -24432,17 +24421,17 @@ static int run_text_session_state_check() {
         pool.capacity = 16;
         const int64_t state_width = overlap ? 2 * head_dim : head_dim;
         pool.state_kv = values(
-            {1, pool.ratio, state_width}, torch::kFloat32, offset);
+            {1, pool.ratio, state_width}, mfq_tensor_backend::kFloat32, offset);
         pool.state_gate = values(
-            {1, pool.ratio, state_width}, torch::kFloat32, offset + 100.0f);
+            {1, pool.ratio, state_width}, mfq_tensor_backend::kFloat32, offset + 100.0f);
         if (overlap) {
             pool.previous_kv = values(
-                {1, pool.ratio, head_dim}, torch::kFloat32, offset + 200.0f);
+                {1, pool.ratio, head_dim}, mfq_tensor_backend::kFloat32, offset + 200.0f);
             pool.previous_gate = values(
-                {1, pool.ratio, head_dim}, torch::kFloat32, offset + 300.0f);
+                {1, pool.ratio, head_dim}, mfq_tensor_backend::kFloat32, offset + 300.0f);
         }
         pool.pool = values(
-            {1, pool.capacity, head_dim}, torch::kFloat16, offset + 400.0f);
+            {1, pool.capacity, head_dim}, mfq_tensor_backend::kFloat16, offset + 400.0f);
     };
     initialize_dsv4_pool(
         dsv4_block->compressor, 8, false, 10.0f);
@@ -24467,23 +24456,23 @@ static int run_text_session_state_check() {
     dsv4_model.restore_text_session_state(dsv4_state);
     const auto & saved_dsv4 = dsv4_state.dsv4_blocks.at(0);
     require_equal(
-        torch::equal(dsv4_block->local_cache, saved_dsv4.local_cache),
+        mfq_tensor_backend::equal(dsv4_block->local_cache, saved_dsv4.local_cache),
         "DeepSeek V4 local session cache restore failed");
     const auto check_dsv4_pool = [&](const Dsv4PoolState & restored,
                                      const Dsv4PoolSessionState & saved) {
         require_equal(
-            torch::equal(restored.state_kv, saved.state_kv) &&
-            torch::equal(restored.state_gate, saved.state_gate),
+            mfq_tensor_backend::equal(restored.state_kv, saved.state_kv) &&
+            mfq_tensor_backend::equal(restored.state_gate, saved.state_gate),
             "DeepSeek V4 compressor recurrent state restore failed");
         if (saved.overlap) {
             require_equal(
-                torch::equal(restored.previous_kv, saved.previous_kv) &&
-                torch::equal(restored.previous_gate, saved.previous_gate),
+                mfq_tensor_backend::equal(restored.previous_kv, saved.previous_kv) &&
+                mfq_tensor_backend::equal(restored.previous_gate, saved.previous_gate),
                 "DeepSeek V4 overlap compressor state restore failed");
         }
         require_equal(
             restored.capacity == saved.capacity &&
-            torch::equal(
+            mfq_tensor_backend::equal(
                 restored.pool.narrow(1, 0, saved.pool.size(1)),
                 saved.pool),
             "DeepSeek V4 compressed pool restore failed");
@@ -24506,11 +24495,11 @@ static int run_text_session_state_check() {
         glm->full_indexer = index == 0;
         glm->shared_state = glm_shared;
         glm->kv_cache = values(
-            {1, 1, 16, 6}, torch::kFloat16,
+            {1, 1, 16, 6}, mfq_tensor_backend::kFloat16,
             1000.0f + index * 100.0f);
         if (glm->full_indexer) {
             glm->index_cache = values(
-                {1, 16, 4}, torch::kFloat16, 2000.0f);
+                {1, 16, 4}, mfq_tensor_backend::kFloat16, 2000.0f);
         }
         glm_blocks.push_back(glm.get());
         glm_model.blocks.push_back(std::move(glm));
@@ -24522,15 +24511,15 @@ static int run_text_session_state_check() {
         glm->kv_cache.zero_();
         if (glm->index_cache.defined()) glm->index_cache.zero_();
     }
-    glm_shared->topk_indices = torch::ones(
-        {1, 1, 1}, cuda_float.dtype(torch::kInt32));
+    glm_shared->topk_indices = mfq_tensor_backend::ones(
+        {1, 1, 1}, cuda_float.dtype(mfq_tensor_backend::kInt32));
     glm_model.cache_pos = 0;
     glm_model.restore_text_session_state(glm_state);
     for (size_t index = 0; index < glm_blocks.size(); ++index) {
         const auto & saved = glm_state.glm_dsa_blocks.at(index);
         require_equal(
             glm_blocks[index]->kv_cache.size(2) == saved.kv_capacity &&
-            torch::equal(
+            mfq_tensor_backend::equal(
                 glm_blocks[index]->kv_cache.narrow(
                     2, 0, saved.kv_cache.size(2)),
                 saved.kv_cache),
@@ -24539,7 +24528,7 @@ static int run_text_session_state_check() {
             require_equal(
                 glm_blocks[index]->index_cache.size(1) ==
                     saved.index_capacity &&
-                torch::equal(
+                mfq_tensor_backend::equal(
                     glm_blocks[index]->index_cache.narrow(
                         1, 0, saved.index_cache.size(1)),
                     saved.index_cache),
@@ -24620,14 +24609,14 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
         }
 
         std::lock_guard<std::mutex> lock(model_mutex);
-        c10::cuda::CUDAGuard guard(
+        MfqCudaGuard guard(
             g_layer_placement.primary_device());
-        torch::manual_seed(static_cast<int64_t>(parameters.seed));
-        torch::cuda::manual_seed_all(parameters.seed);
+        mfq_tensor_backend::manual_seed(static_cast<int64_t>(parameters.seed));
+        mfq_cuda_manual_seed_all(parameters.seed);
         auto special_ids = MiniCPMO45DuplexSpecialIds::from_tensor(
-            torch::tensor(
+            mfq_tensor_backend::tensor(
                 parameters.special_ids,
-                torch::TensorOptions().dtype(torch::kInt64)));
+                mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64)));
         session.reset();
         session.emplace(
             runtime, special_ids, parameters.forbidden_ids,
@@ -24646,23 +24635,23 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
 
         const auto ids_tensor = [](const std::vector<int64_t> & values) {
             return values.empty()
-                ? torch::Tensor()
-                : torch::tensor(
+                ? mfq_tensor_backend::Tensor()
+                : mfq_tensor_backend::tensor(
                     values,
-                    torch::TensorOptions().dtype(torch::kInt64));
+                    mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64));
         };
-        torch::Tensor reference_features;
+        mfq_tensor_backend::Tensor reference_features;
         if (!parameters.reference_audio_features.empty()) {
-            reference_features = torch::tensor(
+            reference_features = mfq_tensor_backend::tensor(
                 parameters.reference_audio_features,
-                torch::TensorOptions().dtype(torch::kFloat32))
+                mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32))
                 .reshape({1, 80, parameters.reference_audio_frames});
         }
         session->prepare(
             ids_tensor(parameters.system_prefix),
             reference_features,
             ids_tensor(parameters.system_suffix));
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
     };
     backend.step = [&](const MfqDuplexStepInput & input) {
         const bool has_audio = input.audio_frames > 0;
@@ -24682,24 +24671,24 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
         }
 
         std::lock_guard<std::mutex> lock(model_mutex);
-        c10::cuda::CUDAGuard guard(
+        MfqCudaGuard guard(
             g_layer_placement.primary_device());
         if (!session) {
             throw std::runtime_error(
                 "MiniCPM-o duplex session is not prepared");
         }
-        torch::Tensor audio_features;
+        mfq_tensor_backend::Tensor audio_features;
         if (has_audio) {
-            audio_features = torch::tensor(
+            audio_features = mfq_tensor_backend::tensor(
                 input.audio_features,
-                torch::TensorOptions().dtype(torch::kFloat32))
+                mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32))
                 .reshape({1, 80, input.audio_frames});
         }
-        torch::Tensor text_ids;
+        mfq_tensor_backend::Tensor text_ids;
         if (has_text) {
-            text_ids = torch::tensor(
+            text_ids = mfq_tensor_backend::tensor(
                 input.text_tokens,
-                torch::TensorOptions().dtype(torch::kInt64))
+                mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
                 .reshape({1, static_cast<int64_t>(input.text_tokens.size())});
         }
         const auto started = std::chrono::steady_clock::now();
@@ -24714,12 +24703,12 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
 
         MfqDuplexStepResult response;
         auto generated = result.generated_ids
-            .to(torch::kCPU, torch::kInt64).contiguous().reshape({-1});
+            .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous().reshape({-1});
         const auto * generated_data = generated.data_ptr<int64_t>();
         response.generated_tokens.assign(
             generated_data, generated_data + generated.numel());
         auto codes = result.tts_codes
-            .to(torch::kCPU, torch::kInt32).contiguous().reshape({-1});
+            .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt32).contiguous().reshape({-1});
         const auto * code_data = codes.data_ptr<int32_t>();
         response.audio_tokens.assign(
             code_data, code_data + codes.numel());
@@ -24737,13 +24726,13 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
     };
     backend.stop = [&]() {
         std::lock_guard<std::mutex> lock(model_mutex);
-        c10::cuda::CUDAGuard guard(
+        MfqCudaGuard guard(
             g_layer_placement.primary_device());
         session.reset();
         runtime.language.reset(1);
         runtime.audio.reset();
         runtime.tts.reset(1);
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
     };
     return backend;
 }
@@ -25106,7 +25095,7 @@ int main(int argc, char ** argv) {
             throw std::runtime_error("--threads must be positive");
         }
         if (cpu_threads > 0) {
-            at::set_num_threads(cpu_threads);
+            mfq_set_num_threads(cpu_threads);
         }
         configure_tensor_parallel(
             tensor_parallel_arg,
@@ -25596,7 +25585,7 @@ int main(int argc, char ** argv) {
             }
         }
         g_profiler.enabled = false;
-        torch::NoGradGuard no_grad;
+        mfq_tensor_backend::NoGradGuard no_grad;
         if (!kl_base.empty()) std::cout << std::unitbuf;
         if (!kl_base.empty()) {
             std::cout << "cpp_kl_contract"
@@ -25659,7 +25648,7 @@ int main(int argc, char ** argv) {
                 MiniCPMO45Runtime::load_with_language(
                     std::move(model), mfq_path));
         }
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
         auto t1 = std::chrono::steady_clock::now();
         report_cuda_memory("loaded");
         if (server_mode) {
@@ -25765,18 +25754,15 @@ int main(int argc, char ** argv) {
                 size_t free_bytes = 0;
                 size_t total_bytes = 0;
                 MFQ_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-                const auto stats =
-                    c10::cuda::CUDACachingAllocator::getDeviceStats(
-                        c10::cuda::current_device());
-                constexpr size_t aggregate = static_cast<size_t>(
-                    c10::CachingDeviceAllocator::StatType::AGGREGATE);
+                const auto stats = mfq_cuda_memory_stats(
+                    mfq_current_cuda_device());
                 return std::vector<std::pair<std::string, double>>{
                     {"device_free_bytes", static_cast<double>(free_bytes)},
                     {"device_total_bytes", static_cast<double>(total_bytes)},
                     {"cuda_allocated_bytes", static_cast<double>(
-                        stats.allocated_bytes[aggregate].current)},
+                        stats.allocated_bytes)},
                     {"cuda_reserved_bytes", static_cast<double>(
-                        stats.reserved_bytes[aggregate].current)},
+                        stats.reserved_bytes)},
                 };
             });
             if (g_moe_expert_cache) {
@@ -25849,13 +25835,13 @@ int main(int argc, char ** argv) {
             return status;
         }
         auto ids_vec = ids_file.empty() ? parse_ids(ids_arg) : load_ids_file(ids_file);
-        auto ids = torch::tensor(ids_vec, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA)).unsqueeze(0);
+        auto ids = mfq_tensor_backend::tensor(ids_vec, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA)).unsqueeze(0);
         if (compare_dsv4_hc_ops) {
             g_dsv4_compare_hc_ops = true;
             g_dsv4_fused_hc = false;
             model.reset(1);
             (void)model.forward(ids);
-            torch::cuda::synchronize();
+            mfq_cuda_synchronize();
             return 0;
         }
         if (compare_dsv4_hc_model) {
@@ -25873,7 +25859,7 @@ int main(int argc, char ** argv) {
         if (profile) {
             model.reset(1);
             (void)model.next_token(ids);
-            torch::cuda::synchronize();
+            mfq_cuda_synchronize();
             model.reset(1);
             g_profiler.reset();
             g_profiler.enabled = true;
@@ -25884,18 +25870,18 @@ int main(int argc, char ** argv) {
                 model.reset(1);
                 (void)model.hidden_forward(ids);
                 const int64_t decode_len = model.cache_pos + 1;
-                auto seq_len = torch::tensor({decode_len}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
+                auto seq_len = mfq_tensor_backend::tensor({decode_len}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
                 auto decode_id = ids.index({Slice(), -1}).reshape({1, 1});
-                auto hidden = model.hidden_forward(decode_id, c10::nullopt, seq_len);
-                auto last = hidden.index({Slice(), -1, Slice()}).to(torch::kFloat16).contiguous();
-                auto logits = model.lm_head.forward(last).to(torch::kFloat32);
-                torch::cuda::synchronize();
+                auto hidden = model.hidden_forward(decode_id, mfq_nullopt, seq_len);
+                auto last = hidden.index({Slice(), -1, Slice()}).to(mfq_tensor_backend::kFloat16).contiguous();
+                auto logits = model.lm_head.forward(last).to(mfq_tensor_backend::kFloat32);
+                mfq_cuda_synchronize();
                 return logits;
             };
             auto ref = run("0");
             auto test = run("1");
-            auto ref_logp = torch::log_softmax(ref, -1);
-            auto test_logp = torch::log_softmax(test, -1);
+            auto ref_logp = mfq_tensor_backend::log_softmax(ref, -1);
+            auto test_logp = mfq_tensor_backend::log_softmax(test, -1);
             auto kl = (ref_logp.exp() * (ref_logp - test_logp)).sum(-1);
             auto diff = (ref - test).abs();
             std::cout << "decode_splitk_compare_kl=" << kl.item<float>() << "\n";
@@ -25910,8 +25896,8 @@ int main(int argc, char ** argv) {
             if (compare_llama_decode_steps < 1) {
                 throw std::runtime_error("--compare-llama-decode-steps must be positive");
             }
-            auto cuda_i64 = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
-            std::vector<torch::Tensor> reference_logits;
+            auto cuda_i64 = mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA);
+            std::vector<mfq_tensor_backend::Tensor> reference_logits;
             std::vector<int64_t> teacher_tokens;
             reference_logits.reserve(compare_llama_decode_steps);
             teacher_tokens.reserve(compare_llama_decode_steps);
@@ -25921,14 +25907,14 @@ int main(int argc, char ** argv) {
             const int64_t initial_teacher_token = input.item<int64_t>();
             for (int step = 0; step < compare_llama_decode_steps; ++step) {
                 const int64_t decode_len = model.cache_pos + 1;
-                auto seq_len = torch::tensor({decode_len}, cuda_i64);
-                auto hidden = model.hidden_forward(input, c10::nullopt, seq_len);
-                auto last = hidden.index({Slice(), -1, Slice()}).to(torch::kFloat16).contiguous();
-                auto logits = model.lm_head.forward(last).to(torch::kFloat32);
+                auto seq_len = mfq_tensor_backend::tensor({decode_len}, cuda_i64);
+                auto hidden = model.hidden_forward(input, mfq_nullopt, seq_len);
+                auto last = hidden.index({Slice(), -1, Slice()}).to(mfq_tensor_backend::kFloat16).contiguous();
+                auto logits = model.lm_head.forward(last).to(mfq_tensor_backend::kFloat32);
                 reference_logits.push_back(logits.clone());
                 const int64_t next = logits.argmax(-1).item<int64_t>();
                 teacher_tokens.push_back(next);
-                input = torch::tensor({next}, cuda_i64).reshape({1, 1});
+                input = mfq_tensor_backend::tensor({next}, cuda_i64).reshape({1, 1});
             }
             mfq_set_env("MFQ_LLAMA_FLASH256_DECODE", "1");
             g_decode_graph_attention_kv_len = compare_llama_decode_planned_len > 0
@@ -25939,7 +25925,7 @@ int main(int argc, char ** argv) {
             }
             model.reset(1);
             (void)model.next_token(ids);
-            input = torch::tensor({initial_teacher_token}, cuda_i64).reshape({1, 1});
+            input = mfq_tensor_backend::tensor({initial_teacher_token}, cuda_i64).reshape({1, 1});
             double kl_sum = 0.0;
             double kl_max = 0.0;
             double abs_sum = 0.0;
@@ -25951,13 +25937,13 @@ int main(int argc, char ** argv) {
             int64_t values = 0;
             for (int step = 0; step < compare_llama_decode_steps; ++step) {
                 const int64_t decode_len = model.cache_pos + 1;
-                auto seq_len = torch::tensor({decode_len}, cuda_i64);
-                auto hidden = model.hidden_forward(input, c10::nullopt, seq_len);
-                auto last = hidden.index({Slice(), -1, Slice()}).to(torch::kFloat16).contiguous();
-                auto test = model.lm_head.forward(last).to(torch::kFloat32);
+                auto seq_len = mfq_tensor_backend::tensor({decode_len}, cuda_i64);
+                auto hidden = model.hidden_forward(input, mfq_nullopt, seq_len);
+                auto last = hidden.index({Slice(), -1, Slice()}).to(mfq_tensor_backend::kFloat16).contiguous();
+                auto test = model.lm_head.forward(last).to(mfq_tensor_backend::kFloat32);
                 const auto & ref = reference_logits[(size_t)step];
-                auto ref_logp = torch::log_softmax(ref, -1);
-                auto test_logp = torch::log_softmax(test, -1);
+                auto ref_logp = mfq_tensor_backend::log_softmax(ref, -1);
+                auto test_logp = mfq_tensor_backend::log_softmax(test, -1);
                 const double kl = (ref_logp.exp() * (ref_logp - test_logp)).sum(-1).item<double>();
                 auto delta = test - ref;
                 kl_sum += kl;
@@ -25970,9 +25956,9 @@ int main(int argc, char ** argv) {
                 const bool top_equal = test.argmax(-1).eq(ref.argmax(-1)).item<bool>();
                 same_top += top_equal ? 1 : 0;
                 if (!top_equal && first_top_difference < 0) first_top_difference = step;
-                input = torch::tensor({teacher_tokens[(size_t)step]}, cuda_i64).reshape({1, 1});
+                input = mfq_tensor_backend::tensor({teacher_tokens[(size_t)step]}, cuda_i64).reshape({1, 1});
             }
-            torch::cuda::synchronize();
+            mfq_cuda_synchronize();
             g_decode_graph_attention_kv_len = 0;
             std::cout << std::setprecision(10)
                       << "llama_decode_compare_steps=" << compare_llama_decode_steps << "\n"
@@ -25989,16 +25975,16 @@ int main(int argc, char ** argv) {
             auto run = [&](const char * enabled) {
                 mfq_set_env("MFQ_NVQ_SWIGLU_VEC4", enabled);
                 model.reset(1);
-                auto logits = model.last_logits(ids).to(torch::kFloat32);
-                torch::cuda::synchronize();
+                auto logits = model.last_logits(ids).to(mfq_tensor_backend::kFloat32);
+                mfq_cuda_synchronize();
                 return logits;
             };
             auto ref = run("0");
             auto repeat = run("0");
             auto test = run("1");
-            auto ref_logp = torch::log_softmax(ref, -1);
-            auto repeat_logp = torch::log_softmax(repeat, -1);
-            auto test_logp = torch::log_softmax(test, -1);
+            auto ref_logp = mfq_tensor_backend::log_softmax(ref, -1);
+            auto repeat_logp = mfq_tensor_backend::log_softmax(repeat, -1);
+            auto test_logp = mfq_tensor_backend::log_softmax(test, -1);
             auto repeat_kl = (ref_logp.exp() * (ref_logp - repeat_logp)).sum(-1);
             auto kl = (ref_logp.exp() * (ref_logp - test_logp)).sum(-1);
             auto diff = (ref - test).abs();
@@ -26017,28 +26003,28 @@ int main(int argc, char ** argv) {
         if (prefill_repeat > 0) {
             const char * trace_env = std::getenv("MFQ_CHECK_PREFILL_REPEAT_TRACE");
             const bool trace_repeat = trace_env != nullptr && std::atoi(trace_env) != 0;
-            std::vector<torch::Tensor> reference_trace;
-            std::vector<std::pair<std::string, torch::Tensor>> reference_gemma_trace;
+            std::vector<mfq_tensor_backend::Tensor> reference_trace;
+            std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>> reference_gemma_trace;
             for (int i = 0; i < prefill_repeat; ++i) {
                 model.reset(1);
                 auto run_t0 = std::chrono::steady_clock::now();
-                std::vector<torch::Tensor> trace;
-                std::vector<std::pair<std::string, torch::Tensor>> gemma_trace;
-                torch::Tensor logits;
+                std::vector<mfq_tensor_backend::Tensor> trace;
+                std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>> gemma_trace;
+                mfq_tensor_backend::Tensor logits;
                 if (trace_repeat) {
                     g_gemma_trace_layer = 0;
                     g_gemma_stage_trace = &gemma_trace;
                     auto hidden = model.hidden_forward(
-                        ids, c10::nullopt, c10::nullopt, &trace);
+                        ids, mfq_nullopt, mfq_nullopt, &trace);
                     g_gemma_stage_trace = nullptr;
                     g_gemma_trace_layer = -1;
                     auto last = hidden.index({Slice(), -1, Slice()})
-                        .to(torch::kFloat16).contiguous();
+                        .to(mfq_tensor_backend::kFloat16).contiguous();
                     logits = model.lm_head.forward(last);
                 } else {
                     logits = model.last_logits(ids);
                 }
-                torch::cuda::synchronize();
+                mfq_cuda_synchronize();
                 auto run_t1 = std::chrono::steady_clock::now();
                 std::cout << "prefill_repeat=" << (i + 1)
                           << " sec=" << std::chrono::duration<double>(run_t1 - run_t0).count()
@@ -26078,14 +26064,14 @@ int main(int argc, char ** argv) {
         }
         if (compare_llama_flash) {
             mfq_set_env("MFQ_LLAMA_FLASH256", "0");
-            auto ref = model.last_logits(ids).to(torch::kFloat32);
-            torch::cuda::synchronize();
+            auto ref = model.last_logits(ids).to(mfq_tensor_backend::kFloat32);
+            mfq_cuda_synchronize();
             model.reset(1);
             mfq_set_env("MFQ_LLAMA_FLASH256", "1");
-            auto test = model.last_logits(ids).to(torch::kFloat32);
-            torch::cuda::synchronize();
-            auto ref_logp = torch::log_softmax(ref, -1);
-            auto test_logp = torch::log_softmax(test, -1);
+            auto test = model.last_logits(ids).to(mfq_tensor_backend::kFloat32);
+            mfq_cuda_synchronize();
+            auto ref_logp = mfq_tensor_backend::log_softmax(ref, -1);
+            auto test_logp = mfq_tensor_backend::log_softmax(test, -1);
             auto kl = (ref_logp.exp() * (ref_logp - test_logp)).sum(-1);
             auto diff = (ref - test).abs();
             auto same_top = ref.argmax(-1).eq(test.argmax(-1));
@@ -26097,18 +26083,18 @@ int main(int argc, char ** argv) {
         }
         g_profiler.reset();
         auto next = model.next_token(ids);
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
         auto t2 = std::chrono::steady_clock::now();
         report_cuda_memory("prefill");
         const char * empty_cache_env = std::getenv("MFQ_EMPTY_CACHE_BEFORE_GRAPH");
         if (empty_cache_env != nullptr && std::atoi(empty_cache_env) != 0) {
-            c10::cuda::CUDACachingAllocator::emptyCache();
+            mfq_cuda_empty_cache();
             report_cuda_memory("prefill_empty_cache");
         }
         g_profiler.report("prefill");
         g_profiler.reset();
-        auto generated_cuda = torch::empty({gen}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+        auto generated_cuda = mfq_tensor_backend::empty({gen}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
+        cudaStream_t stream = mfq_get_current_cuda_stream().stream();
         MFQ_CUDA_CHECK(cudaMemcpyAsync(generated_cuda.data_ptr<int64_t>(), next.data_ptr<int64_t>(),
                                    sizeof(int64_t), cudaMemcpyDeviceToDevice, stream));
         const char* graph_env = std::getenv("MFQ_CUDA_GRAPH");
@@ -26118,6 +26104,7 @@ int main(int argc, char ** argv) {
         g_profiler.graph_events = profile_cuda_graph;
         bool use_cuda_graph =
             (graph_env == nullptr || graph_env[0] != '0') &&
+            mfq_cuda_graph_capture_supported() &&
             g_dsv4_cpu_offload_layers.empty() &&
             g_dense_cpu_layer_count == 0 &&
             !g_moe_expert_cache &&
@@ -26129,12 +26116,12 @@ int main(int argc, char ** argv) {
         auto decode_replay_t0 = t2;
         if (cuda_profiler_range) MFQ_CUDA_CHECK(cudaProfilerStart());
         if (use_cuda_graph) {
-            auto static_input = torch::empty({1, 1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
-            auto static_pos = torch::empty({1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
-            auto static_len = torch::empty({1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
-            auto static_step = torch::empty({1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
-            auto graph_stream = at::cuda::getStreamFromPool(false);
-            c10::cuda::CUDAStreamGuard graph_guard(graph_stream);
+            auto static_input = mfq_tensor_backend::empty({1, 1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
+            auto static_pos = mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
+            auto static_len = mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
+            auto static_step = mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
+            auto graph_stream = mfq_get_stream_from_pool(false);
+            MfqCudaStreamGuard graph_guard(graph_stream);
             cudaStream_t graph_raw_stream = graph_stream.stream();
 
             int64_t pos_h = model.cache_pos;
@@ -26150,8 +26137,8 @@ int main(int argc, char ** argv) {
                                        sizeof(int64_t), cudaMemcpyHostToDevice, graph_raw_stream));
             MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
 
-            at::cuda::CUDAGraph graph;
-            torch::Tensor static_next;
+            MfqCudaGraph graph;
+            mfq_tensor_backend::Tensor static_next;
             const int64_t planned_len = model.cache_pos + gen;
             g_decode_graph_attention_kv_len = planned_len;
             g_decode_graph_attention_parts = planned_len >= 192 ? (planned_len + 127) / 128 : 1;
@@ -26184,11 +26171,11 @@ int main(int argc, char ** argv) {
                                            sizeof(int64_t), cudaMemcpyDeviceToDevice, stream));
             }
         }
-        torch::cuda::synchronize();
+        mfq_cuda_synchronize();
         if (cuda_profiler_range) MFQ_CUDA_CHECK(cudaProfilerStop());
         auto t3 = std::chrono::steady_clock::now();
         g_profiler.report("decode");
-        auto generated_tensor = generated_cuda.to(torch::kCPU).contiguous();
+        auto generated_tensor = generated_cuda.to(mfq_tensor_backend::kCPU).contiguous();
         auto generated_ptr = generated_tensor.data_ptr<int64_t>();
         double load_s = std::chrono::duration<double>(t1 - t0).count();
         double prefill_s = std::chrono::duration<double>(t2 - t1).count();
@@ -26212,8 +26199,8 @@ int main(int argc, char ** argv) {
             g_moe_expert_cache->print_stats(std::cout);
         }
         return 0;
-    } catch (const c10::Error & e) {
-        std::cerr << "c10_error: " << e.what() << "\n";
+    } catch (const MfqBackendError & e) {
+        std::cerr << "backend_error: " << e.what() << "\n";
         return 1;
     } catch (const std::exception & e) {
         std::cerr << "error: " << e.what() << "\n";

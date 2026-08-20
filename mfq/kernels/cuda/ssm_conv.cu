@@ -2,9 +2,8 @@
 // conv_input [B, K - 1 + T, C], weight [C,1,K], [C,K], or [K,C], output [B,T,C].
 
 #include <cuda_runtime.h>
+#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
 #include <cuda_fp16.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
 #include <vector>
 
 #include "reduce.cuh"
@@ -47,41 +46,41 @@ __global__ void ssm_conv_silu_kernel(
     }
 }
 
-torch::Tensor ssm_conv_silu_cuda(torch::Tensor conv_input, torch::Tensor weight, torch::Tensor bias, int64_t n_tokens)
+mfq_tensor_backend::Tensor ssm_conv_silu_cuda(mfq_tensor_backend::Tensor conv_input, mfq_tensor_backend::Tensor weight, mfq_tensor_backend::Tensor bias, int64_t n_tokens)
 {
-    TORCH_CHECK(conv_input.is_cuda() && conv_input.is_contiguous() && conv_input.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(conv_input.is_cuda() && conv_input.is_contiguous() && conv_input.scalar_type() == mfq_tensor_backend::kFloat32,
                 "ssm_conv_silu: conv_input must be cuda contiguous f32");
-    TORCH_CHECK(weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == mfq_tensor_backend::kFloat32,
                 "ssm_conv_silu: weight must be cuda contiguous f32");
-    TORCH_CHECK(bias.is_cuda() && bias.is_contiguous() && bias.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(bias.is_cuda() && bias.is_contiguous() && bias.scalar_type() == mfq_tensor_backend::kFloat32,
                 "ssm_conv_silu: bias must be cuda contiguous f32");
-    TORCH_CHECK(conv_input.dim() == 3, "ssm_conv_silu: conv_input must be [B,K-1+T,C]");
+    MFQ_RUNTIME_CHECK(conv_input.dim() == 3, "ssm_conv_silu: conv_input must be [B,K-1+T,C]");
     int B = (int)conv_input.size(0);
     int C = (int)conv_input.size(2);
     int has_bias = (int)(bias.numel() > 0);
-    TORCH_CHECK(!has_bias || (bias.dim() == 1 && bias.size(0) == C), "ssm_conv_silu: bias must be [C]");
+    MFQ_RUNTIME_CHECK(!has_bias || (bias.dim() == 1 && bias.size(0) == C), "ssm_conv_silu: bias must be [C]");
     int K = 0;
     int layout = 0; // 0: channel-major [C,1,K]/[C,K], 1: [K,C]
     if (weight.dim() == 3) {
-        TORCH_CHECK(weight.size(0) == C && weight.size(1) == 1, "ssm_conv_silu: [C,1,K] weight mismatch");
+        MFQ_RUNTIME_CHECK(weight.size(0) == C && weight.size(1) == 1, "ssm_conv_silu: [C,1,K] weight mismatch");
         K = (int)weight.size(2);
         layout = 0;
     } else {
-        TORCH_CHECK(weight.dim() == 2, "ssm_conv_silu: weight must be [C,1,K], [C,K], or [K,C]");
+        MFQ_RUNTIME_CHECK(weight.dim() == 2, "ssm_conv_silu: weight must be [C,1,K], [C,K], or [K,C]");
         if (weight.size(0) == C) {
             K = (int)weight.size(1);
             layout = 0;
         } else {
-            TORCH_CHECK(weight.size(1) == C, "ssm_conv_silu: 2D weight must be [C,K] or [K,C]");
+            MFQ_RUNTIME_CHECK(weight.size(1) == C, "ssm_conv_silu: 2D weight must be [C,K] or [K,C]");
             K = (int)weight.size(0);
             layout = 1;
         }
     }
     int T = (int)n_tokens;
-    TORCH_CHECK(T > 0 && conv_input.size(1) == T + K - 1, "ssm_conv_silu: conv_input length must be K-1+T");
-    auto out = torch::empty({B, T, C}, conv_input.options());
+    MFQ_RUNTIME_CHECK(T > 0 && conv_input.size(1) == T + K - 1, "ssm_conv_silu: conv_input length must be K-1+T");
+    auto out = mfq_tensor_backend::empty({B, T, C}, conv_input.options());
     dim3 blocks(B, (C + SSM_CONV_BD - 1) / SSM_CONV_BD);
-    ssm_conv_silu_kernel<<<blocks, SSM_CONV_BD, 0, at::cuda::getCurrentCUDAStream()>>>(
+    ssm_conv_silu_kernel<<<blocks, SSM_CONV_BD, 0, mfq_current_cuda_stream()>>>(
         conv_input.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), out.data_ptr<float>(),
         B, T, C, K, layout, has_bias);
     return out;
@@ -124,43 +123,43 @@ __global__ void ssm_conv_silu_decode_kernel(
     state[state_base + (size_t)(K - 2) * (size_t)C] = x_cur;
 }
 
-torch::Tensor ssm_conv_silu_decode_cuda(torch::Tensor state, torch::Tensor x, torch::Tensor weight, torch::Tensor bias)
+mfq_tensor_backend::Tensor ssm_conv_silu_decode_cuda(mfq_tensor_backend::Tensor state, mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, mfq_tensor_backend::Tensor bias)
 {
-    TORCH_CHECK(state.is_cuda() && state.is_contiguous() && state.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(state.is_cuda() && state.is_contiguous() && state.scalar_type() == mfq_tensor_backend::kFloat32,
                 "ssm_conv_silu_decode: state must be cuda contiguous f32");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kFloat32,
                 "ssm_conv_silu_decode: x must be cuda contiguous f32");
-    TORCH_CHECK(weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == mfq_tensor_backend::kFloat32,
                 "ssm_conv_silu_decode: weight must be cuda contiguous f32");
-    TORCH_CHECK(bias.is_cuda() && bias.is_contiguous() && bias.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(bias.is_cuda() && bias.is_contiguous() && bias.scalar_type() == mfq_tensor_backend::kFloat32,
                 "ssm_conv_silu_decode: bias must be cuda contiguous f32");
-    TORCH_CHECK(state.dim() == 3, "ssm_conv_silu_decode: state must be [B,K-1,C]");
-    TORCH_CHECK(x.dim() == 3 && x.size(1) == 1, "ssm_conv_silu_decode: x must be [B,1,C]");
+    MFQ_RUNTIME_CHECK(state.dim() == 3, "ssm_conv_silu_decode: state must be [B,K-1,C]");
+    MFQ_RUNTIME_CHECK(x.dim() == 3 && x.size(1) == 1, "ssm_conv_silu_decode: x must be [B,1,C]");
     int B = (int)state.size(0);
     int K = (int)state.size(1) + 1;
     int C = (int)state.size(2);
-    TORCH_CHECK(x.size(0) == B && x.size(2) == C, "ssm_conv_silu_decode: x shape mismatch");
+    MFQ_RUNTIME_CHECK(x.size(0) == B && x.size(2) == C, "ssm_conv_silu_decode: x shape mismatch");
     int has_bias = (int)(bias.numel() > 0);
-    TORCH_CHECK(!has_bias || (bias.dim() == 1 && bias.size(0) == C), "ssm_conv_silu_decode: bias must be [C]");
+    MFQ_RUNTIME_CHECK(!has_bias || (bias.dim() == 1 && bias.size(0) == C), "ssm_conv_silu_decode: bias must be [C]");
     int layout = 0;
     if (weight.dim() == 3) {
-        TORCH_CHECK(weight.size(0) == C && weight.size(1) == 1 && weight.size(2) == K,
+        MFQ_RUNTIME_CHECK(weight.size(0) == C && weight.size(1) == 1 && weight.size(2) == K,
                     "ssm_conv_silu_decode: [C,1,K] weight mismatch");
         layout = 0;
     } else {
-        TORCH_CHECK(weight.dim() == 2,
+        MFQ_RUNTIME_CHECK(weight.dim() == 2,
                     "ssm_conv_silu_decode: weight must be [C,1,K], [C,K], or [K,C]");
         if (weight.size(0) == C && weight.size(1) == K) {
             layout = 0;
         } else {
-            TORCH_CHECK(weight.size(0) == K && weight.size(1) == C,
+            MFQ_RUNTIME_CHECK(weight.size(0) == K && weight.size(1) == C,
                         "ssm_conv_silu_decode: 2D weight must be [C,K] or [K,C]");
             layout = 1;
         }
     }
-    auto out = torch::empty({B, 1, C}, x.options());
+    auto out = mfq_tensor_backend::empty({B, 1, C}, x.options());
     dim3 blocks(B, (C + SSM_CONV_BD - 1) / SSM_CONV_BD);
-    ssm_conv_silu_decode_kernel<<<blocks, SSM_CONV_BD, 0, at::cuda::getCurrentCUDAStream()>>>(
+    ssm_conv_silu_decode_kernel<<<blocks, SSM_CONV_BD, 0, mfq_current_cuda_stream()>>>(
         state.data_ptr<float>(), x.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(),
         out.data_ptr<float>(), B, C, K, layout, has_bias);
     return out;
@@ -297,67 +296,67 @@ __global__ void ssm_conv_v_decode_kernel(
     state[state_base + (size_t)(K - 2) * (size_t)C] = x_cur;
 }
 
-std::vector<torch::Tensor> linear_conv_qkv_decode_cuda(
-    torch::Tensor state,
-    torch::Tensor qk,
-    torch::Tensor v,
-    torch::Tensor weight,
-    torch::Tensor bias,
+std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_decode_cuda(
+    mfq_tensor_backend::Tensor state,
+    mfq_tensor_backend::Tensor qk,
+    mfq_tensor_backend::Tensor v,
+    mfq_tensor_backend::Tensor weight,
+    mfq_tensor_backend::Tensor bias,
     int64_t nk,
     int64_t nv,
     int64_t dk,
     int64_t dv,
     double eps)
 {
-    TORCH_CHECK(state.is_cuda() && state.is_contiguous() && state.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(state.is_cuda() && state.is_contiguous() && state.scalar_type() == mfq_tensor_backend::kFloat32,
                 "linear_conv_qkv_decode: state must be cuda contiguous f32");
-    TORCH_CHECK(qk.is_cuda() && qk.is_contiguous() && qk.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(qk.is_cuda() && qk.is_contiguous() && qk.scalar_type() == mfq_tensor_backend::kHalf,
                 "linear_conv_qkv_decode: qk must be cuda contiguous f16");
-    TORCH_CHECK(v.is_cuda() && v.is_contiguous() && v.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(v.is_cuda() && v.is_contiguous() && v.scalar_type() == mfq_tensor_backend::kHalf,
                 "linear_conv_qkv_decode: v must be cuda contiguous f16");
-    TORCH_CHECK(weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == mfq_tensor_backend::kFloat32,
                 "linear_conv_qkv_decode: weight must be cuda contiguous f32");
-    TORCH_CHECK(bias.is_cuda() && bias.is_contiguous() && bias.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(bias.is_cuda() && bias.is_contiguous() && bias.scalar_type() == mfq_tensor_backend::kFloat32,
                 "linear_conv_qkv_decode: bias must be cuda contiguous f32");
-    TORCH_CHECK(state.dim() == 3, "linear_conv_qkv_decode: state must be [B,K-1,C]");
-    TORCH_CHECK(qk.dim() == 3 && qk.size(1) == 1, "linear_conv_qkv_decode: qk must be [B,1,2*nk*dk]");
-    TORCH_CHECK(v.dim() == 3 && v.size(1) == 1, "linear_conv_qkv_decode: v must be [B,1,nv*dv]");
+    MFQ_RUNTIME_CHECK(state.dim() == 3, "linear_conv_qkv_decode: state must be [B,K-1,C]");
+    MFQ_RUNTIME_CHECK(qk.dim() == 3 && qk.size(1) == 1, "linear_conv_qkv_decode: qk must be [B,1,2*nk*dk]");
+    MFQ_RUNTIME_CHECK(v.dim() == 3 && v.size(1) == 1, "linear_conv_qkv_decode: v must be [B,1,nv*dv]");
     int B = (int)state.size(0);
     int K = (int)state.size(1) + 1;
     int qkC = (int)(2 * nk * dk);
     int vsz = (int)(nv * dv);
     int C = qkC + vsz;
-    TORCH_CHECK(qk.size(0) == B && qk.size(2) == qkC, "linear_conv_qkv_decode: qk shape mismatch");
-    TORCH_CHECK(v.size(0) == B && v.size(2) == vsz, "linear_conv_qkv_decode: v shape mismatch");
-    TORCH_CHECK(state.size(2) == C, "linear_conv_qkv_decode: state width mismatch");
-    TORCH_CHECK(nv % nk == 0, "linear_conv_qkv_decode: nv must be divisible by nk");
-    TORCH_CHECK(dk <= 256, "linear_conv_qkv_decode: dk > 256 is unsupported");
+    MFQ_RUNTIME_CHECK(qk.size(0) == B && qk.size(2) == qkC, "linear_conv_qkv_decode: qk shape mismatch");
+    MFQ_RUNTIME_CHECK(v.size(0) == B && v.size(2) == vsz, "linear_conv_qkv_decode: v shape mismatch");
+    MFQ_RUNTIME_CHECK(state.size(2) == C, "linear_conv_qkv_decode: state width mismatch");
+    MFQ_RUNTIME_CHECK(nv % nk == 0, "linear_conv_qkv_decode: nv must be divisible by nk");
+    MFQ_RUNTIME_CHECK(dk <= 256, "linear_conv_qkv_decode: dk > 256 is unsupported");
     int has_bias = (int)(bias.numel() > 0);
-    TORCH_CHECK(!has_bias || (bias.dim() == 1 && bias.size(0) == C), "linear_conv_qkv_decode: bias must be [C]");
+    MFQ_RUNTIME_CHECK(!has_bias || (bias.dim() == 1 && bias.size(0) == C), "linear_conv_qkv_decode: bias must be [C]");
     int layout = 0;
     if (weight.dim() == 3) {
-        TORCH_CHECK(weight.size(0) == C && weight.size(1) == 1 && weight.size(2) == K,
+        MFQ_RUNTIME_CHECK(weight.size(0) == C && weight.size(1) == 1 && weight.size(2) == K,
                     "linear_conv_qkv_decode: [C,1,K] weight mismatch");
         layout = 0;
     } else {
-        TORCH_CHECK(weight.dim() == 2 && weight.size(0) == K && weight.size(1) == C,
+        MFQ_RUNTIME_CHECK(weight.dim() == 2 && weight.size(0) == K && weight.size(1) == C,
                     "linear_conv_qkv_decode: weight must be [C,1,K] or [K,C]");
         layout = 1;
     }
     auto opts = state.options();
-    auto q = torch::empty({B, (int)nk, 1, (int)dk}, opts);
-    auto k = torch::empty({B, (int)nk, 1, (int)dk}, opts);
-    auto vo = torch::empty({B, (int)nv, 1, (int)dv}, opts);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto q = mfq_tensor_backend::empty({B, (int)nk, 1, (int)dk}, opts);
+    auto k = mfq_tensor_backend::empty({B, (int)nk, 1, (int)dk}, opts);
+    auto vo = mfq_tensor_backend::empty({B, (int)nv, 1, (int)dv}, opts);
+    cudaStream_t stream = mfq_current_cuda_stream();
     ssm_conv_qk_norm_decode_kernel<256><<<B * 2 * (int)nk, 256, 0, stream>>>(
-        state.data_ptr<float>(), reinterpret_cast<const __half*>(qk.data_ptr<at::Half>()),
-        reinterpret_cast<const __half*>(v.data_ptr<at::Half>()), weight.data_ptr<float>(),
+        state.data_ptr<float>(), reinterpret_cast<const __half*>(qk.data_ptr<mfq_half>()),
+        reinterpret_cast<const __half*>(v.data_ptr<mfq_half>()), weight.data_ptr<float>(),
         bias.data_ptr<float>(), q.data_ptr<float>(), k.data_ptr<float>(), B, (int)nk, (int)nv,
         (int)dk, (int)dv, K, layout, has_bias, (float)eps);
     dim3 v_blocks(B, (vsz + SSM_CONV_BD - 1) / SSM_CONV_BD);
     ssm_conv_v_decode_kernel<<<v_blocks, SSM_CONV_BD, 0, stream>>>(
-        state.data_ptr<float>(), reinterpret_cast<const __half*>(qk.data_ptr<at::Half>()),
-        reinterpret_cast<const __half*>(v.data_ptr<at::Half>()), weight.data_ptr<float>(),
+        state.data_ptr<float>(), reinterpret_cast<const __half*>(qk.data_ptr<mfq_half>()),
+        reinterpret_cast<const __half*>(v.data_ptr<mfq_half>()), weight.data_ptr<float>(),
         bias.data_ptr<float>(), vo.data_ptr<float>(), B, (int)nk, (int)nv, (int)dk, (int)dv,
         K, layout, has_bias);
     return {q, k, vo};
@@ -480,29 +479,29 @@ __global__ void linear_conv_state_prefill_kernel(
     }
 }
 
-std::vector<torch::Tensor> linear_conv_qkv_prefill_cuda(
-    torch::Tensor state,
-    torch::Tensor qk,
-    torch::Tensor v,
-    torch::Tensor weight,
-    torch::Tensor bias,
+std::vector<mfq_tensor_backend::Tensor> linear_conv_qkv_prefill_cuda(
+    mfq_tensor_backend::Tensor state,
+    mfq_tensor_backend::Tensor qk,
+    mfq_tensor_backend::Tensor v,
+    mfq_tensor_backend::Tensor weight,
+    mfq_tensor_backend::Tensor bias,
     int64_t nk,
     int64_t nv,
     int64_t dk,
     int64_t dv,
     double eps)
 {
-    TORCH_CHECK(state.is_cuda() && state.is_contiguous() && state.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(state.is_cuda() && state.is_contiguous() && state.scalar_type() == mfq_tensor_backend::kFloat32,
                 "linear_conv_qkv_prefill: state must be contiguous CUDA f32");
-    TORCH_CHECK(qk.is_cuda() && qk.is_contiguous() && qk.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(qk.is_cuda() && qk.is_contiguous() && qk.scalar_type() == mfq_tensor_backend::kHalf,
                 "linear_conv_qkv_prefill: qk must be contiguous CUDA f16");
-    TORCH_CHECK(v.is_cuda() && v.is_contiguous() && v.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(v.is_cuda() && v.is_contiguous() && v.scalar_type() == mfq_tensor_backend::kHalf,
                 "linear_conv_qkv_prefill: v must be contiguous CUDA f16");
-    TORCH_CHECK(weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == mfq_tensor_backend::kFloat32,
                 "linear_conv_qkv_prefill: weight must be contiguous CUDA f32");
-    TORCH_CHECK(bias.is_cuda() && bias.is_contiguous() && bias.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(bias.is_cuda() && bias.is_contiguous() && bias.scalar_type() == mfq_tensor_backend::kFloat32,
                 "linear_conv_qkv_prefill: bias must be contiguous CUDA f32");
-    TORCH_CHECK(state.dim() == 3 && qk.dim() == 3 && v.dim() == 3,
+    MFQ_RUNTIME_CHECK(state.dim() == 3 && qk.dim() == 3 && v.dim() == 3,
                 "linear_conv_qkv_prefill: state/qk/v must be rank 3");
     int B = (int)qk.size(0);
     int T = (int)qk.size(1);
@@ -510,40 +509,40 @@ std::vector<torch::Tensor> linear_conv_qkv_prefill_cuda(
     int qkC = (int)(2 * nk * dk);
     int vsz = (int)(nv * dv);
     int C = qkC + vsz;
-    TORCH_CHECK(T > 1 && qk.size(2) == qkC && v.size(0) == B && v.size(1) == T && v.size(2) == vsz,
+    MFQ_RUNTIME_CHECK(T > 1 && qk.size(2) == qkC && v.size(0) == B && v.size(1) == T && v.size(2) == vsz,
                 "linear_conv_qkv_prefill: qk/v shape mismatch");
-    TORCH_CHECK(state.size(0) == B && state.size(2) == C, "linear_conv_qkv_prefill: state shape mismatch");
-    TORCH_CHECK(dk <= 256 && K <= 8, "linear_conv_qkv_prefill: requires dk<=256 and K<=8");
+    MFQ_RUNTIME_CHECK(state.size(0) == B && state.size(2) == C, "linear_conv_qkv_prefill: state shape mismatch");
+    MFQ_RUNTIME_CHECK(dk <= 256 && K <= 8, "linear_conv_qkv_prefill: requires dk<=256 and K<=8");
     int layout = 0;
     if (weight.dim() == 3) {
-        TORCH_CHECK(weight.size(0) == C && weight.size(1) == 1 && weight.size(2) == K,
+        MFQ_RUNTIME_CHECK(weight.size(0) == C && weight.size(1) == 1 && weight.size(2) == K,
                     "linear_conv_qkv_prefill: [C,1,K] weight mismatch");
     } else {
-        TORCH_CHECK(weight.dim() == 2 && weight.size(0) == K && weight.size(1) == C,
+        MFQ_RUNTIME_CHECK(weight.dim() == 2 && weight.size(0) == K && weight.size(1) == C,
                     "linear_conv_qkv_prefill: weight must be [C,1,K] or [K,C]");
         layout = 1;
     }
     int has_bias = (int)(bias.numel() > 0);
-    TORCH_CHECK(!has_bias || (bias.dim() == 1 && bias.size(0) == C), "linear_conv_qkv_prefill: bias shape mismatch");
+    MFQ_RUNTIME_CHECK(!has_bias || (bias.dim() == 1 && bias.size(0) == C), "linear_conv_qkv_prefill: bias shape mismatch");
 
     auto opts = state.options();
-    auto qo = torch::empty({B, (int)nk, T, (int)dk}, opts);
-    auto ko = torch::empty_like(qo);
-    auto vo = torch::empty({B, (int)nv, T, (int)dv}, opts);
-    auto new_state = torch::empty_like(state);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto qo = mfq_tensor_backend::empty({B, (int)nk, T, (int)dk}, opts);
+    auto ko = mfq_tensor_backend::empty_like(qo);
+    auto vo = mfq_tensor_backend::empty({B, (int)nv, T, (int)dv}, opts);
+    auto new_state = mfq_tensor_backend::empty_like(state);
+    cudaStream_t stream = mfq_current_cuda_stream();
     linear_conv_qk_norm_prefill_kernel<256><<<B * T * 2 * (int)nk, 256, 0, stream>>>(
-        state.data_ptr<float>(), reinterpret_cast<const __half*>(qk.data_ptr<at::Half>()),
+        state.data_ptr<float>(), reinterpret_cast<const __half*>(qk.data_ptr<mfq_half>()),
         weight.data_ptr<float>(), bias.data_ptr<float>(), qo.data_ptr<float>(), ko.data_ptr<float>(),
         B, T, (int)nk, (int)dk, C, K, layout, has_bias, (float)eps);
     linear_conv_v_prefill_kernel<<<dim3(B * T, (vsz + 255) / 256), 256, 0, stream>>>(
-        state.data_ptr<float>(), reinterpret_cast<const __half*>(v.data_ptr<at::Half>()),
+        state.data_ptr<float>(), reinterpret_cast<const __half*>(v.data_ptr<mfq_half>()),
         weight.data_ptr<float>(), bias.data_ptr<float>(), vo.data_ptr<float>(),
         B, T, (int)nk, (int)nv, (int)dk, (int)dv, C, K, layout, has_bias);
     int state_total = B * (K - 1) * C;
     linear_conv_state_prefill_kernel<<<(state_total + 255) / 256, 256, 0, stream>>>(
-        state.data_ptr<float>(), reinterpret_cast<const __half*>(qk.data_ptr<at::Half>()),
-        reinterpret_cast<const __half*>(v.data_ptr<at::Half>()), new_state.data_ptr<float>(),
+        state.data_ptr<float>(), reinterpret_cast<const __half*>(qk.data_ptr<mfq_half>()),
+        reinterpret_cast<const __half*>(v.data_ptr<mfq_half>()), new_state.data_ptr<float>(),
         B, T, qkC, vsz, C, K);
     return {qo, ko, vo, new_state};
 }
