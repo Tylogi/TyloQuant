@@ -361,6 +361,29 @@ set_target_properties(mfq-metal-nint-benchmark PROPERTIES
     BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
 )
 
+add_executable(mfq-metal-vq-benchmark
+    mlx_vq_benchmark.cpp
+)
+target_link_libraries(mfq-metal-vq-benchmark PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(mfq-metal-vq-benchmark PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-vq-benchmark PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+
+add_executable(mfq-metal-grouped-linear-benchmark
+    mlx_grouped_linear_benchmark.cpp
+)
+target_link_libraries(mfq-metal-grouped-linear-benchmark PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(
+    mfq-metal-grouped-linear-benchmark PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-grouped-linear-benchmark PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+
 add_executable(mfq-metal-qwen35-projection-profile
     qwen35_projection_profile.cpp
 )

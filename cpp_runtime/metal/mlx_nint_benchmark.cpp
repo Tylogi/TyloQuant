@@ -41,14 +41,19 @@ void require(bool condition, const std::string& message) {
     }
 }
 
-array make_input(int width) {
-    std::vector<float> values(static_cast<std::size_t>(width));
-    for (int index = 0; index < width; ++index) {
-        values[static_cast<std::size_t>(index)] =
-            static_cast<float>((index * 17 + 11) % 127 - 63) / 256.0f;
+array make_input(int rows, int width) {
+    std::vector<float> values(
+        static_cast<std::size_t>(rows) * width);
+    for (int row = 0; row < rows; ++row) {
+        for (int index = 0; index < width; ++index) {
+            values[
+                static_cast<std::size_t>(row) * width + index
+            ] = static_cast<float>(
+                (index * 17 + row * 29 + 11) % 127 - 63) / 256.0f;
+        }
     }
     return mlx::core::astype(
-        array(values.begin(), Shape{1, width}),
+        array(values.begin(), Shape{rows, width}),
         mlx::core::float16);
 }
 
@@ -115,13 +120,14 @@ double milliseconds_since(Clock::time_point start) {
 void benchmark(
     const MfqContainer& model,
     const std::string& name,
+    int rows,
     int warmup,
     int repetitions) {
     auto benchmark_case = load_case(model, name);
     const int input = input_size(benchmark_case.weight);
     const int output = output_size(benchmark_case.weight);
     const auto bytes = packed_nbytes(benchmark_case.weight);
-    const auto source = make_input(input);
+    const auto source = make_input(rows, input);
 
     array result = matmul(benchmark_case.weight, source);
     mlx::core::eval(result);
@@ -147,7 +153,7 @@ void benchmark(
     const auto* values = checked.data<float>();
     double checksum = 0.0;
     float maximum = 0.0f;
-    for (int index = 0; index < output; ++index) {
+    for (int index = 0; index < rows * output; ++index) {
         const float value = values[index];
         require(
             std::isfinite(value),
@@ -159,11 +165,11 @@ void benchmark(
     std::cout
         << benchmark_case.dtype << '\t'
         << name << '\t'
-        << input << 'x' << output << '\t'
+        << rows << 'x' << input << 'x' << output << '\t'
         << bytes << '\t'
         << std::fixed << std::setprecision(3) << mean_ms << '\t'
         << std::setprecision(1) << decimal_gbps << '\t'
-        << "1\t"
+        << rows << '\t'
         << std::setprecision(6) << checksum << '\t'
         << maximum << '\n';
 }
@@ -193,6 +199,7 @@ std::vector<BenchmarkCase> load_layer_stack(
 void benchmark_layer_stack(
     const MfqContainer& model,
     const std::string& pattern,
+    int rows,
     int warmup,
     int repetitions) {
     auto cases = load_layer_stack(model, pattern);
@@ -206,7 +213,7 @@ void benchmark_layer_stack(
             "layer-stack tensor shapes disagree");
         bytes += packed_nbytes(item.weight);
     }
-    const auto source = make_input(input);
+    const auto source = make_input(rows, input);
     const auto execute = [&] {
         std::vector<array> outputs;
         outputs.reserve(cases.size());
@@ -241,7 +248,7 @@ void benchmark_layer_stack(
     const auto* values = checked.data<float>();
     double checksum = 0.0;
     float maximum = 0.0f;
-    for (int index = 0; index < output; ++index) {
+    for (int index = 0; index < rows * output; ++index) {
         const float value = values[index];
         require(
             std::isfinite(value),
@@ -253,7 +260,7 @@ void benchmark_layer_stack(
     std::cout
         << cases.front().dtype << '\t'
         << pattern << '\t'
-        << input << 'x' << output << 'x' << launches << '\t'
+        << rows << 'x' << input << 'x' << output << 'x' << launches << '\t'
         << bytes << '\t'
         << std::fixed << std::setprecision(3)
         << mean_dispatch_ms << '\t'
@@ -270,18 +277,25 @@ int main(int argc, char** argv) {
         require(
             argc >= 2,
             "usage: mfq-metal-nint-benchmark MODEL.mfq [REPETITIONS] "
-            "[TENSOR ...]");
+            "[--rows ROWS] [TENSOR ...]");
         const int repetitions =
             argc >= 3 ? std::stoi(argv[2]) : 20;
+        int rows = 1;
+        int first_tensor = 3;
+        if (argc >= 5 && std::string_view(argv[3]) == "--rows") {
+            rows = std::stoi(argv[4]);
+            first_tensor = 5;
+        }
         require(repetitions > 0, "repetitions must be positive");
+        require(rows >= 1 && rows <= 16, "rows must be in [1, 16]");
 
         const MfqContainer model(argv[1]);
         std::cout
             << "dtype\ttensor\tshape\tpacked_bytes\tms\tGB/s\t"
                "launches\tchecksum\tmax_abs\n";
         std::vector<std::string> names;
-        if (argc > 3) {
-            names.assign(argv + 3, argv + argc);
+        if (argc > first_tensor) {
+            names.assign(argv + first_tensor, argv + argc);
         } else {
             names = {
                 "blk.0.ffn_gate.weight",
@@ -295,9 +309,9 @@ int main(int argc, char** argv) {
         }
         for (const auto& name : names) {
             if (name.find("{layer}") != std::string::npos) {
-                benchmark_layer_stack(model, name, 3, repetitions);
+                benchmark_layer_stack(model, name, rows, 3, repetitions);
             } else {
-                benchmark(model, name, 3, repetitions);
+                benchmark(model, name, rows, 3, repetitions);
             }
         }
         return 0;

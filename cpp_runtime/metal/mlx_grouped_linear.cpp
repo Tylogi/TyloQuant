@@ -738,8 +738,21 @@ std::vector<std::string> direct_input_names(
 }
 
 std::string make_direct_source(
-    const std::vector<DirectProjectionLayout>& layouts) {
-    std::string source = R"METAL(
+    const std::vector<DirectProjectionLayout>& layouts,
+    bool batch_rows) {
+    std::string source = batch_rows ? R"METAL(
+    constexpr uint ROWS_PER_SIMD = 4u;
+    constexpr uint ROWS_PER_TG = 8u;
+
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint global_tile = threadgroup_position_in_grid.x;
+
+    uint projection = 0u;
+    uint local_tile = 0u;
+    uint output_width = 0u;
+    uint output_offset = 0u;
+)METAL" : R"METAL(
     constexpr uint ROWS_PER_SIMD = 4u;
     constexpr uint ROWS_PER_TG = 8u;
 
@@ -795,7 +808,41 @@ std::string make_direct_source(
         source += "    }";
     }
 
-    source += R"METAL(
+    source += batch_rows ? R"METAL(
+    uint output_base =
+        local_tile * ROWS_PER_TG
+        + simd_group * ROWS_PER_SIMD;
+
+    float accumulators[ROWS][ROWS_PER_SIMD];
+    for (uint input_row = 0u;
+         input_row < uint(ROWS);
+         ++input_row) {
+        for (uint local_row = 0u;
+             local_row < ROWS_PER_SIMD;
+             ++local_row) {
+            accumulators[input_row][local_row] = 0.0f;
+        }
+    }
+    for (uint column = lane; column < uint(K); column += 32u) {
+        float activations[ROWS];
+        for (uint input_row = 0u;
+             input_row < uint(ROWS);
+             ++input_row) {
+            activations[input_row] =
+                float(x[input_row * uint(K) + column]);
+        }
+        for (
+            uint local_row = 0u;
+            local_row < ROWS_PER_SIMD;
+            ++local_row
+        ) {
+            uint output = output_base + local_row;
+            if (output >= output_width) {
+                continue;
+            }
+
+            float weight = 0.0f;
+)METAL" : R"METAL(
     uint output_base =
         local_tile * ROWS_PER_TG
         + simd_group * ROWS_PER_SIMD;
@@ -958,7 +1005,38 @@ std::string make_direct_source(
         source += "            }";
     }
 
-    source += R"METAL(
+    source += batch_rows ? R"METAL(
+            for (uint input_row = 0u;
+                 input_row < uint(ROWS);
+                 ++input_row) {
+                accumulators[input_row][local_row] = fma(
+                    activations[input_row],
+                    weight,
+                    accumulators[input_row][local_row]);
+            }
+        }
+    }
+
+    for (uint input_row = 0u;
+         input_row < uint(ROWS);
+         ++input_row) {
+        for (
+            uint local_row = 0u;
+            local_row < ROWS_PER_SIMD;
+            ++local_row
+        ) {
+            float total = simd_sum(
+                accumulators[input_row][local_row]);
+            uint output = output_base + local_row;
+            if (lane == 0u && output < output_width) {
+                y[
+                    input_row * uint(TOTAL_OUT)
+                    + output_offset + output
+                ] = T(total);
+            }
+        }
+    }
+)METAL" : R"METAL(
             accumulators[local_row] = fma(
                 activation,
                 weight,
@@ -985,15 +1063,17 @@ std::string make_direct_source(
 }
 
 mlx::core::fast::CustomKernelFunction make_direct_kernel(
-    const std::vector<DirectProjectionLayout>& layouts) {
+    const std::vector<DirectProjectionLayout>& layouts,
+    bool batch_rows) {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
-    const auto key = direct_kernel_key(layouts);
+    const auto key = direct_kernel_key(layouts)
+        + (batch_rows ? "_m234" : "_rows");
     return mlx::core::fast::metal_kernel(
         "mfq_cpp_zero_copy_grouped_linear_" + key,
         direct_input_names(layouts),
         {"y"},
-        make_direct_source(layouts),
+        make_direct_source(layouts, batch_rows),
         kGroupedHeader,
         true,
         false,
@@ -1001,19 +1081,21 @@ mlx::core::fast::CustomKernelFunction make_direct_kernel(
 }
 
 mlx::core::fast::CustomKernelFunction direct_kernel(
-    const std::vector<DirectProjectionLayout>& layouts) {
+    const std::vector<DirectProjectionLayout>& layouts,
+    bool batch_rows) {
     static std::mutex mutex;
     static std::unordered_map<
         std::string,
         mlx::core::fast::CustomKernelFunction> kernels;
 
-    const auto key = direct_kernel_key(layouts);
+    const auto key = direct_kernel_key(layouts)
+        + (batch_rows ? "_m234" : "_rows");
     std::lock_guard<std::mutex> lock(mutex);
     const auto found = kernels.find(key);
     if (found != kernels.end()) {
         return found->second;
     }
-    auto kernel = make_direct_kernel(layouts);
+    auto kernel = make_direct_kernel(layouts, batch_rows);
     kernels.emplace(key, kernel);
     return kernel;
 }
@@ -3015,6 +3097,13 @@ std::vector<array> MlxGroupedLinear::matmul(
         rows == 1 &&
         source.dtype() == mlx::core::float16 &&
         impl_->has_single_row_mxfp8_fast_path();
+    // MTP verification overwhelmingly uses two through four rows. Keep all
+    // rows in one threadgroup tile so every decoded packed weight is reused
+    // across M instead of replaying the same GEMV M times. The per-row column
+    // traversal and SIMD reduction order remain identical to the legacy path.
+    const bool use_small_m_batched_path =
+        rows >= 2 && rows <= 4 &&
+        impl_->uses_zero_copy_storage();
     const int work_tiles = use_partitioned_nint4_qkv
         ? impl_->partitioned_nint4_tiles
         : use_single_row_mxfp8_fast_path
@@ -3022,7 +3111,7 @@ std::vector<array> MlxGroupedLinear::matmul(
         : use_single_row_nint_fast_path
         ? impl_->single_row_tiles
         : impl_->total_tiles;
-    const auto grid = rows
+    const auto grid = (use_small_m_batched_path ? 1 : rows)
         * static_cast<std::size_t>(work_tiles)
         * static_cast<std::size_t>(
             use_single_row_mxfp8_fast_path
@@ -3267,7 +3356,9 @@ std::vector<array> MlxGroupedLinear::matmul(
                         layout.bits);
                 }
             }
-            return direct_kernel(impl_->direct_layouts)(
+            return direct_kernel(
+                impl_->direct_layouts,
+                use_small_m_batched_path)(
                 inputs,
                 output_shapes,
                 output_dtypes,
