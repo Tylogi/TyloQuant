@@ -686,6 +686,17 @@ function displayPrefillMetric(metrics?: PrefillMetricLike | null): {
   };
 }
 
+const TERMINAL_JOB_STATUSES = new Set<JobResource["status"]>([
+  "succeeded",
+  "failed",
+  "cancelled",
+  "interrupted",
+]);
+
+function isTerminalJob(job: JobResource): boolean {
+  return TERMINAL_JOB_STATUSES.has(job.status);
+}
+
 function preferPositiveMetric(primary: unknown, fallback: unknown): number | undefined {
   const preferred = Number(primary);
   if (Number.isFinite(preferred) && preferred > 0) return preferred;
@@ -1279,6 +1290,7 @@ export default function App() {
   const [evaluationComparison, setEvaluationComparison] = useState<EvaluationComparison | null>(null);
   const [datasetDraft, setDatasetDraft] = useState({ name: "", artifact_uri: "", kind: "custom" as DatasetResource["kind"] });
   const [jobs, setJobs] = useState<JobResource[]>([]);
+  const [jobCleanupBusy, setJobCleanupBusy] = useState(false);
   const [jobKinds, setJobKinds] = useState<JobKindResource[]>([]);
   const [mcpServers, setMcpServers] = useState<McpServerResource[]>([]);
   const [mcpTools, setMcpTools] = useState<McpToolResource[]>([]);
@@ -1336,6 +1348,7 @@ export default function App() {
   const [studioOpen, setStudioOpen] = useState(false);
   const [modelBrowser, setModelBrowser] = useState<ModelDirectoryList | null>(null);
   const [modelBrowserOpen, setModelBrowserOpen] = useState(false);
+  const [modelDirectoryPath, setModelDirectoryPath] = useState("");
   const [studioToken, setStudioToken] = useState("");
   const [editDraft, setEditDraft] = useState<EditDraft | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -2929,6 +2942,40 @@ export default function App() {
     }
   }
 
+  async function deleteJobRecord(id: string) {
+    if (jobCleanupBusy) return;
+    setJobCleanupBusy(true);
+    try {
+      await api.deleteJob(id);
+      setJobs((current) => current.filter((item) => item.id !== id));
+      if (selectedJobId === id) {
+        setSelectedJobId(null);
+        setJobLogs([]);
+      }
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setJobCleanupBusy(false);
+    }
+  }
+
+  async function clearCompletedJobRecords() {
+    if (jobCleanupBusy) return;
+    setJobCleanupBusy(true);
+    try {
+      await api.clearCompletedJobs();
+      setJobs((current) => current.filter((item) => !isTerminalJob(item)));
+      if (selectedJob && isTerminalJob(selectedJob)) {
+        setSelectedJobId(null);
+        setJobLogs([]);
+      }
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setJobCleanupBusy(false);
+    }
+  }
+
   async function searchHub(event: FormEvent) {
     event.preventDefault();
     const query = hubQuery.trim();
@@ -3131,17 +3178,26 @@ export default function App() {
     await refreshRuntime(false);
   }
 
-  async function openModelDirectory(directoryId?: string | null) {
+  async function openModelDirectory(directoryId?: string | null, path?: string | null) {
     if (busy) return;
     setBusy(true);
     try {
-      setModelBrowser(await api.modelDirectories(directoryId));
+      const listing = await api.modelDirectories(directoryId, path);
+      setModelBrowser(listing);
+      setModelDirectoryPath(listing.current_path ?? "");
       setModelBrowserOpen(true);
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
       setBusy(false);
     }
+  }
+
+  async function jumpToModelDirectory(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const path = modelDirectoryPath.trim();
+    if (!path) return;
+    await openModelDirectory(null, path);
   }
 
   async function chooseModelDirectory() {
@@ -3268,6 +3324,7 @@ export default function App() {
   const activeJobs = jobs.filter((job) =>
     ["queued", "running", "cancelling"].includes(job.status),
   );
+  const completedJobs = jobs.filter(isTerminalJob);
   const runtimeMemory = Number(
     runtime?.mlx_active_bytes ??
       runtime?.cuda_allocated_bytes ??
@@ -3480,7 +3537,14 @@ export default function App() {
             {dashboardPage === "models" && <PanelDeck labels={panelLabels} page="dashboard-models" resetVersion={dashboardLayoutReset}>
               <section className="dashboard-panel" key="catalog"><div className="panel-heading"><div><h2>{tr("模型目录", "Model catalog")}</h2></div><div className="panel-heading-actions"><button disabled={busy} onClick={() => void chooseModelDirectory()} type="button">{tr("添加模型文件夹", "Add model folder")}</button><b>{artifacts.length}</b></div></div>{artifacts.length > 0 && <div className="model-list">{artifacts.slice(0, 8).map((item) => { const instance = instances.find((candidate) => candidate.model === item.name && candidate.state !== "failed"); const loaded = Boolean(instance) || item.name === runtime?.model; return <div className="model-row" key={item.id}><span className={loaded ? "model-state active" : item.loadable ? "model-state" : "model-state failed"} /><div><strong>{item.name}</strong><small>{item.architecture} · {item.shard_count} shards · {formatNumber(item.total_bytes / 2 ** 30, 1)} GB</small></div>{instance ? <button disabled={busy || instance.state === "busy"} onClick={() => void unloadInstance(instance.id)} type="button">{tr("卸载", "Unload")}</button> : loaded ? <em>{tr("已加载", "Loaded")}</em> : !item.loadable ? <em className="failed">{tr("不可用", "Invalid")}</em> : <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">{tr("加载", "Load")}</button>}</div>; })}</div>}</section>
               <section className="dashboard-panel" key="requests"><div className="panel-heading"><div><h2>{tr("最近请求", "Recent requests")}</h2></div></div>{requestHistory.length > 0 && <div className="request-table">{requestHistory.slice(0, 8).map((request) => <div className="request-row" key={request.id}><div><strong>{request.id}</strong><small>{request.completed_at ? new Date(request.completed_at * 1000).toLocaleTimeString() : request.endpoint || "completion"}</small></div><span>{formatNumber(request.prompt_tokens)} → {formatNumber(request.completion_tokens)}</span><b>{formatNumber(request.decode_tps, 1)} tok/s</b></div>)}</div>}</section>
-              <section className="dashboard-panel" key="jobs"><div className="panel-heading"><div><h2>{tr("后台任务", "Background jobs")}</h2></div><b>{jobs.length}</b></div>{jobs.length > 0 && <div className="request-table">{jobs.slice(0, 8).map((job) => <div className="job-row" key={job.id}><div><strong>{job.kind}</strong><small>{new Date(job.updated_at).toLocaleTimeString()} · {job.status}</small></div><progress max={1} value={job.progress} /><b>{formatNumber(job.progress * 100)}%</b></div>)}</div>}</section>
+              <section className="dashboard-panel" key="jobs">
+                <div className="panel-heading"><div><h2>{tr("后台任务", "Background jobs")}</h2></div><b>{activeJobs.length}</b></div>
+                {activeJobs.length > 0 && <div className="request-table">{activeJobs.slice(0, 8).map((job) => <div className="job-row" key={job.id}><div><strong>{job.kind}</strong><small>{new Date(job.updated_at).toLocaleTimeString()} · {job.status}</small></div><progress max={1} value={job.progress} /><b>{formatNumber(job.progress * 100)}%</b></div>)}</div>}
+                {completedJobs.length > 0 && <details className="completed-jobs">
+                  <summary><span>{tr("已完成", "Completed")} <b>{completedJobs.length}</b></span><button disabled={jobCleanupBusy} onClick={(event) => { event.preventDefault(); void clearCompletedJobRecords(); }} type="button">{tr("清理已完成", "Clear completed")}</button></summary>
+                  <div className="request-table">{completedJobs.slice(0, 8).map((job) => <div className="job-row completed" key={job.id}><div><strong>{job.kind}</strong><small>{new Date(job.updated_at).toLocaleTimeString()} · {job.status}</small></div><progress max={1} value={job.progress} /><b>{formatNumber(job.progress * 100)}%</b><button aria-label={tr("移出任务历史", "Remove from job history")} disabled={jobCleanupBusy} onClick={() => void deleteJobRecord(job.id)} type="button"><Icon name="trash" size={12} /></button></div>)}</div>
+                </details>}
+              </section>
               <section className="dashboard-panel" key="logs"><div className="panel-heading"><div><h2>{tr("Runtime 日志", "Runtime logs")}</h2></div><b>{runtimeLogs.length}</b></div>{runtimeLogs.length > 0 && <div className="runtime-log-list">{runtimeLogs.slice(-8).reverse().map((entry) => <div className={`runtime-log ${entry.level}`} key={entry.sequence}><span>{new Date(entry.created_at).toLocaleTimeString()}</span><p>{entry.message}</p></div>)}</div>}</section>
             </PanelDeck>}
             {dashboardPage === "connections" && <PanelDeck labels={panelLabels} page="dashboard-connections" resetVersion={dashboardLayoutReset}>
@@ -3541,8 +3605,15 @@ export default function App() {
                   <button className="job-run" disabled={busy || !selectedJobKind} type="submit"><Icon name="play" size={12} />{tr("运行", "Run")}</button>
                 </div>
               </form>
-              <section className="dashboard-panel job-history" key="history"><div className="panel-heading"><div><h2>{tr("任务历史", "Job history")}</h2></div><b>{jobs.length}</b></div><div className="job-list">{jobs.map((job) => <button className={job.id === selectedJobId ? "active" : ""} key={job.id} onClick={() => setSelectedJobId(job.id)} type="button"><span className={`job-status ${job.status}`} /><div><strong>{job.kind}</strong><small>{job.status} · {new Date(job.updated_at).toLocaleString()}</small></div><b>{formatNumber(job.progress * 100)}%</b></button>)}</div></section>
-              {selectedJob && <section className="dashboard-panel job-detail" key="detail"><div className="panel-heading"><div><h2>{selectedJob.kind}</h2><p>{selectedJob.id}</p></div><b>{selectedJob.status}</b></div><progress max={1} value={selectedJob.progress} /><div className="job-result-grid"><div><span>{tr("进度", "Progress")}</span><strong>{formatNumber(selectedJob.progress * 100)}%</strong></div><div><span>{tr("更新时间", "Updated")}</span><strong>{new Date(selectedJob.updated_at).toLocaleTimeString()}</strong></div></div><div className="job-actions">{["queued", "running", "cancelling"].includes(selectedJob.status) && <button className="secondary" disabled={selectedJob.status === "cancelling"} onClick={() => void cancelSelectedJob()} type="button">{tr("取消任务", "Cancel job")}</button>}{["failed", "cancelled", "interrupted"].includes(selectedJob.status) && <button className="secondary" disabled={busy} onClick={() => void retrySelectedJob()} type="button">{tr("重试", "Retry")}</button>}{String(selectedJob.result?.artifact || "").startsWith("workspace://") && <button className="secondary danger" disabled={busy} onClick={() => void removeSelectedArtifact()} type="button">{tr("删除本地产物", "Delete local artifact")}</button>}</div>{selectedJob.error && <div className="job-error">{selectedJob.error.message}</div>}{selectedJob.result && <pre>{JSON.stringify(selectedJob.result, null, 2)}</pre>}<div className="job-log"><header><span>{tr("事件与日志", "Events and logs")}</span></header>{jobLogs.map((entry) => <div className={entry.level} key={entry.sequence}><time>{new Date(entry.created_at).toLocaleTimeString()}</time><code>{entry.message}</code></div>)}</div></section>}
+              <section className="dashboard-panel job-history" key="history">
+                <div className="panel-heading"><div><h2>{tr("任务历史", "Job history")}</h2></div><b>{activeJobs.length}</b></div>
+                {activeJobs.length > 0 && <div className="job-list">{activeJobs.map((job) => <button className={job.id === selectedJobId ? "active" : ""} key={job.id} onClick={() => setSelectedJobId(job.id)} type="button"><span className={`job-status ${job.status}`} /><div><strong>{job.kind}</strong><small>{job.status} · {new Date(job.updated_at).toLocaleString()}</small></div><b>{formatNumber(job.progress * 100)}%</b></button>)}</div>}
+                {completedJobs.length > 0 && <details className="completed-jobs">
+                  <summary><span>{tr("已完成", "Completed")} <b>{completedJobs.length}</b></span><button disabled={jobCleanupBusy} onClick={(event) => { event.preventDefault(); void clearCompletedJobRecords(); }} type="button">{tr("清理已完成", "Clear completed")}</button></summary>
+                  <div className="job-list">{completedJobs.map((job) => <button className={job.id === selectedJobId ? "active" : ""} key={job.id} onClick={() => setSelectedJobId(job.id)} type="button"><span className={`job-status ${job.status}`} /><div><strong>{job.kind}</strong><small>{job.status} · {new Date(job.updated_at).toLocaleString()}</small></div><b>{formatNumber(job.progress * 100)}%</b></button>)}</div>
+                </details>}
+              </section>
+              {selectedJob && <section className="dashboard-panel job-detail" key="detail"><div className="panel-heading"><div><h2>{selectedJob.kind}</h2><p>{selectedJob.id}</p></div><b>{selectedJob.status}</b></div><progress max={1} value={selectedJob.progress} /><div className="job-result-grid"><div><span>{tr("进度", "Progress")}</span><strong>{formatNumber(selectedJob.progress * 100)}%</strong></div><div><span>{tr("更新时间", "Updated")}</span><strong>{new Date(selectedJob.updated_at).toLocaleTimeString()}</strong></div></div><div className="job-actions">{["queued", "running", "cancelling"].includes(selectedJob.status) && <button className="secondary" disabled={selectedJob.status === "cancelling"} onClick={() => void cancelSelectedJob()} type="button">{tr("取消任务", "Cancel job")}</button>}{["failed", "cancelled", "interrupted"].includes(selectedJob.status) && <button className="secondary" disabled={busy} onClick={() => void retrySelectedJob()} type="button">{tr("重试", "Retry")}</button>}{isTerminalJob(selectedJob) && <button className="secondary" disabled={jobCleanupBusy} onClick={() => void deleteJobRecord(selectedJob.id)} type="button">{tr("移出任务历史", "Remove from history")}</button>}{String(selectedJob.result?.artifact || "").startsWith("workspace://") && <button className="secondary danger" disabled={busy} onClick={() => void removeSelectedArtifact()} type="button">{tr("删除本地产物", "Delete local artifact")}</button>}</div>{selectedJob.error && <div className="job-error">{selectedJob.error.message}</div>}{selectedJob.result && <pre>{JSON.stringify(selectedJob.result, null, 2)}</pre>}<div className="job-log"><header><span>{tr("事件与日志", "Events and logs")}</span></header>{jobLogs.map((entry) => <div className={entry.level} key={entry.sequence}><time>{new Date(entry.created_at).toLocaleTimeString()}</time><code>{entry.message}</code></div>)}</div></section>}
             </PanelDeck>}
           </section>
         )}
@@ -3697,7 +3768,7 @@ export default function App() {
         </aside>
       </>}
 
-      {modelBrowserOpen && modelBrowser && <div className="dialog-backdrop"><section className="studio-dialog model-browser-dialog"><header><div><h2>{tr("选择模型文件夹", "Choose model folder")}</h2><p>{tr("浏览 MFQ Server 所在设备上的文件夹。", "Browse folders on the MFQ Server host.")}</p></div><button onClick={() => setModelBrowserOpen(false)} type="button">×</button></header><div className="model-browser-location"><button disabled={busy || !modelBrowser.current_id} onClick={() => void openModelDirectory(modelBrowser.parent_id)} type="button">{tr("上一级", "Up")}</button><strong>{modelBrowser.current_name ?? tr("位置", "Locations")}</strong>{modelBrowser.current_id && <span>{modelBrowser.model_file_count} MFQ</span>}</div><div className="model-browser-list">{modelBrowser.data.map((directory) => <button disabled={busy} key={directory.id} onClick={() => void openModelDirectory(directory.id)} type="button"><Icon name="folder" /><span>{directory.name}</span>{directory.model_file_count > 0 && <b>{directory.model_file_count} MFQ</b>}</button>)}{modelBrowser.data.length === 0 && <p>{tr("这个文件夹中没有子文件夹。", "This folder has no subfolders.")}</p>}</div><footer><button onClick={() => setModelBrowserOpen(false)} type="button">{tr("取消", "Cancel")}</button><button className="primary" disabled={busy || !modelBrowser.current_id} onClick={() => void registerCurrentModelDirectory()} type="button">{tr("使用此文件夹", "Use this folder")}</button></footer></section></div>}
+      {modelBrowserOpen && modelBrowser && <div className="dialog-backdrop"><section className="studio-dialog model-browser-dialog"><header><div><h2>{tr("选择模型文件夹", "Choose model folder")}</h2><p>{tr("浏览 MFQ Server 所在设备上的文件夹。", "Browse folders on the MFQ Server host.")}</p></div><button onClick={() => setModelBrowserOpen(false)} type="button">×</button></header><form className="model-browser-location" onSubmit={jumpToModelDirectory}><button disabled={busy || !modelBrowser.current_id} onClick={() => void openModelDirectory(modelBrowser.parent_id)} type="button">{tr("上一级", "Up")}</button><input aria-label={tr("当前目录", "Current directory")} onChange={(event) => setModelDirectoryPath(event.target.value)} placeholder={tr("输入服务器上的完整目录", "Enter a full directory on the server")} spellCheck={false} value={modelDirectoryPath} /><button disabled={busy || !modelDirectoryPath.trim()} type="submit">{tr("前往", "Go")}</button>{modelBrowser.current_id && <span>{modelBrowser.model_file_count} MFQ</span>}</form><div className="model-browser-list">{modelBrowser.data.map((directory) => <button disabled={busy} key={directory.id} onClick={() => void openModelDirectory(directory.id)} type="button"><Icon name="folder" /><span>{directory.name}</span>{directory.model_file_count > 0 && <b>{directory.model_file_count} MFQ</b>}</button>)}{modelBrowser.data.length === 0 && <p>{tr("这个文件夹中没有子文件夹。", "This folder has no subfolders.")}</p>}</div><footer><button onClick={() => setModelBrowserOpen(false)} type="button">{tr("取消", "Cancel")}</button><button className="primary" disabled={busy || !modelBrowser.current_id} onClick={() => void registerCurrentModelDirectory()} type="button">{tr("使用此文件夹", "Use this folder")}</button></footer></section></div>}
       {studioOpen && studioDraft && <div className="dialog-backdrop"><form className="studio-dialog" onSubmit={saveStudioSettings}><header><div><h2>{tr("Runtime 连接", "Runtime connection")}</h2><p>{tr("MFQ Studio 关闭后，MFQ Server 会继续运行。", "MFQ Server keeps running after MFQ Studio closes.")}</p></div><button onClick={() => setStudioOpen(false)} type="button">×</button></header><div className="segmented">{(["local", "remote"] as const).map((item) => <button aria-pressed={studioDraft.mode === item} key={item} onClick={() => setStudioDraft((current) => current && ({ ...current, mode: item }))} type="button">{item === "local" ? "Local MFQ Server" : "Remote MFQ Server"}</button>)}</div>{studioDraft.mode === "local" ? <><label><span>MFQ Server port</span><input max={65535} min={1} onChange={(event) => setStudioDraft((current) => current && ({ ...current, local_service_port: Number(event.target.value) }))} required type="number" value={studioDraft.local_service_port} /></label></> : <><label><span>Remote MFQ Server URL</span><input onChange={(event) => setStudioDraft((current) => current && ({ ...current, remote_url: event.target.value }))} required type="url" value={studioDraft.remote_url} /></label><label><span>Remote MFQ Server API key</span><input autoComplete="off" onChange={(event) => setStudioToken(event.target.value)} placeholder={tr("保存在系统凭据库", "Stored in the system credential vault")} type="password" value={studioToken} /></label></>}<div className="dialog-status"><span className={studio?.reachable ? "online" : "offline"} />{studio?.reachable ? `${tr("已连接", "Connected")}: ${studio.service_url}` : tr("MFQ Server 离线", "MFQ Server is offline")}</div><footer><button onClick={() => setStudioOpen(false)} type="button">{tr("取消", "Cancel")}</button><button className="primary" disabled={busy} type="submit">{tr("应用", "Apply")}</button></footer></form></div>}
 
       {roleEditor && <div className="dialog-backdrop role-dialog-backdrop" onMouseDown={(event) => {

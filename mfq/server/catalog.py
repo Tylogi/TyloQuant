@@ -133,10 +133,15 @@ class ModelCatalog:
                 raise ModelArtifactNotFoundError(f"ambiguous model path: {path}")
         raise ModelArtifactNotFoundError(str(path))
 
-    async def browse_directories(self, directory_id: str | None = None) -> ModelDirectoryList:
-        """List server-side directories using opaque process-local identifiers."""
+    async def browse_directories(
+        self,
+        directory_id: str | None = None,
+        *,
+        path: str | Path | None = None,
+    ) -> ModelDirectoryList:
+        """List server-side directories by opaque identifier or explicit path."""
 
-        return await asyncio.to_thread(self._browse_directories, directory_id)
+        return await asyncio.to_thread(self._browse_directories, directory_id, path)
 
     async def register_directory(
         self,
@@ -236,14 +241,24 @@ class ModelCatalog:
             model_file_count=self._immediate_model_count(path),
         )
 
-    def _browse_directories(self, directory_id: str | None) -> ModelDirectoryList:
-        if directory_id is None:
+    def _browse_directories(
+        self,
+        directory_id: str | None,
+        path: str | Path | None,
+    ) -> ModelDirectoryList:
+        if directory_id is None and path is None:
             return ModelDirectoryList(
                 data=[self._directory_entry(path) for path in self._browse_roots()]
             )
-        current = self._directory_ids.get(directory_id)
+        if path is not None:
+            try:
+                current = Path(path).expanduser().resolve(strict=True)
+            except OSError as error:
+                raise ModelDirectoryNotFoundError(str(path)) from error
+        else:
+            current = self._directory_ids.get(directory_id or "")
         if current is None or not current.is_dir():
-            raise ModelDirectoryNotFoundError(directory_id)
+            raise ModelDirectoryNotFoundError(str(path) if path is not None else directory_id)
         try:
             children = sorted(
                 (item.resolve() for item in current.iterdir() if item.is_dir()),
@@ -255,6 +270,7 @@ class ModelCatalog:
         return ModelDirectoryList(
             current_id=self._directory_id(current),
             current_name=self._directory_name(current),
+            current_path=str(current),
             parent_id=self._directory_id(parent) if parent is not None else None,
             model_file_count=self._immediate_model_count(current),
             data=[self._directory_entry(path) for path in children],

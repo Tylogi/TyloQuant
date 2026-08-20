@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import socket
 import subprocess
 from collections.abc import AsyncIterator, Sequence
@@ -31,6 +30,7 @@ from mfq.server.models import (
     ToolChoice,
     ToolDefinition,
 )
+from mfq.server.native import find_native_runtime_resource, native_runtime_environment
 
 
 class RuntimeManagementError(RuntimeError):
@@ -231,7 +231,7 @@ class ManagedRuntimePool:
             command.extend(["--prefill-chunk-size", str(request.prefill_chunk_size)])
         if request.moe_gpu_cache_gb is not None:
             command.extend(["--moe-gpu-cache-gb", str(request.moe_gpu_cache_gb)])
-        process_environment = os.environ.copy()
+        process_environment = native_runtime_environment(self.executable, self.backend)
         cache_environment = {
             "MFQ_SERVER_MAX_KV_SESSIONS": request.prefix_cache_max_sessions,
             "MFQ_SERVER_MAX_KV_SNAPSHOTS_PER_SESSION": (
@@ -259,18 +259,22 @@ class ManagedRuntimePool:
             async with self._lock:
                 self._loading_model_names.discard(model_name)
             raise
-        configured_video_library = os.environ.get("MFQ_AVFOUNDATION_VIDEO_LIBRARY")
+        configured_video_library = process_environment.get("MFQ_AVFOUNDATION_VIDEO_LIBRARY")
         avfoundation_video_library = (
             Path(configured_video_library).expanduser().resolve()
             if configured_video_library
-            else self.executable.with_name("libmfq_avfoundation_video.dylib")
+            else find_native_runtime_resource(
+                self.executable,
+                "libmfq_avfoundation_video.dylib",
+            )
         )
         backend = OpenAIChatBackend(
             f"http://127.0.0.1:{port}",
             local_tensor_files=True,
             avfoundation_video_library=(
                 avfoundation_video_library
-                if avfoundation_video_library.is_file()
+                if avfoundation_video_library is not None
+                and avfoundation_video_library.is_file()
                 else None
             ),
         )

@@ -65,6 +65,10 @@ def test_studio_supports_local_and_remote_server_connections_with_voice_controls
     assert 'className="open-local-model"' in APP
     assert APP.count("chooseModelDirectory()") >= 4
     assert "registerCurrentModelDirectory" in APP
+    assert "modelDirectoryPath" in APP
+    assert "jumpToModelDirectory" in APP
+    assert "listing.current_path" in APP
+    assert 'tr("前往", "Go")' in APP
     assert "Object.keys(MODE_LABELS)" not in APP
     assert "RealtimeAudioController" in APP
     assert '(["text", "voice", "full_duplex"] as SessionMode[])' in APP
@@ -128,6 +132,15 @@ def test_studio_exposes_theme_selection_without_using_sidebar_status_space():
     assert 'onClick={() => setUiTheme("dark")}' in APP
     assert "connection-card" not in APP
     assert ".connection-card" not in STYLES
+
+
+def test_studio_uses_theme_aware_model_actions_and_readable_errors():
+    assert ".panel-heading-actions button {" in STYLES
+    assert "border: 1px solid var(--accent-border)" in STYLES
+    assert ".mcp-form button { min-width: 64px;" in STYLES
+    assert ".job-actions .secondary { border: 1px solid var(--panel-line);" in STYLES
+    assert ".runtime-log p { min-width: 0; overflow-wrap: anywhere;" in STYLES
+    assert ".error-banner span { min-width: 0; overflow-wrap: anywhere;" in STYLES
 
 
 def test_realtime_turns_remain_bound_to_the_session_that_created_them():
@@ -206,3 +219,8 @@ def test_dashboard_and_lab_use_subpages_and_reorderable_collapsible_panels():
     assert "<p>Lab</p>" not in APP
     assert 'page="lab-imatrix"' not in APP
     assert 'page="lab-jobs"' not in APP
+    assert 'tr("已完成", "Completed")' in APP
+    assert 'tr("清理已完成", "Clear completed")' in APP
+    assert "api.clearCompletedJobs()" in APP
+    assert "api.deleteJob(id)" in APP
+    assert ".completed-jobs" in STYLES

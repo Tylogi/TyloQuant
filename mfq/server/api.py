@@ -462,6 +462,16 @@ def create_app(
             offset=offset,
         )
 
+    @app.delete(
+        "/api/v1/jobs/completed",
+        status_code=204,
+        responses=ERROR_RESPONSES,
+        tags=["jobs"],
+    )
+    async def clear_completed_jobs() -> Response:
+        await require_service().clear_completed_jobs()
+        return Response(status_code=204)
+
     @app.get(
         "/api/v1/jobs/{job_id}",
         response_model=JobResource,
@@ -470,6 +480,16 @@ def create_app(
     )
     async def get_job(job_id: UUID) -> JobResource:
         return await require_service().get_job(job_id)
+
+    @app.delete(
+        "/api/v1/jobs/{job_id}",
+        status_code=204,
+        responses=ERROR_RESPONSES,
+        tags=["jobs"],
+    )
+    async def delete_job(job_id: UUID) -> Response:
+        await require_service().delete_job(job_id)
+        return Response(status_code=204)
 
     @app.post(
         "/api/v1/jobs/{job_id}/cancel",
@@ -851,8 +871,12 @@ def create_app(
             str | None,
             Query(pattern=r"^[0-9a-f]{32}$"),
         ] = None,
+        path: Annotated[
+            str | None,
+            Query(min_length=1, max_length=4096),
+        ] = None,
     ) -> ModelDirectoryList:
-        return await require_service().model_directories(directory_id=directory_id)
+        return await require_service().model_directories(directory_id=directory_id, path=path)
 
     @app.post(
         "/api/v1/models/directories/register",

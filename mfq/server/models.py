@@ -771,6 +771,7 @@ class ModelDirectoryEntry(ProtocolModel):
 class ModelDirectoryList(ProtocolModel):
     current_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     current_name: str | None = Field(default=None, max_length=512)
+    current_path: str | None = Field(default=None, min_length=1, max_length=4096)
     parent_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     model_file_count: int = Field(default=0, ge=0)
     data: list[ModelDirectoryEntry]

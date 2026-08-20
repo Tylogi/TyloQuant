@@ -210,7 +210,23 @@ def test_common_server_browses_and_registers_external_model_directories(
                 )
                 assert listing.status_code == 200
                 assert listing.json()["current_name"] == "external-model"
+                assert listing.json()["current_path"] == str(external_dir.resolve())
                 assert listing.json()["model_file_count"] == 1
+
+                jumped = await client.get(
+                    "/api/v1/models/directories",
+                    params={"path": str(native_picker_dir)},
+                )
+                assert jumped.status_code == 200
+                assert jumped.json()["current_name"] == "native-picker-model"
+                assert jumped.json()["current_path"] == str(native_picker_dir.resolve())
+
+                ambiguous = await client.get(
+                    "/api/v1/models/directories",
+                    params={"directory_id": directory_id, "path": str(external_dir)},
+                )
+                assert ambiguous.status_code == 400
+                assert ambiguous.json()["error"]["code"] == "invalid_model_directory_source"
 
                 registered = await client.post(
                     "/api/v1/models/directories/register",

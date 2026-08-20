@@ -124,6 +124,7 @@ def test_openapi_contract_has_all_native_routes_and_realtime_extension() -> None
         "/api/v1/sessions/import",
         "/api/v1/jobs",
         "/api/v1/jobs/kinds",
+        "/api/v1/jobs/completed",
         "/api/v1/jobs/{job_id}",
         "/api/v1/jobs/{job_id}/cancel",
         "/api/v1/jobs/{job_id}/retry",

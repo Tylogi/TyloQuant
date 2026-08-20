@@ -348,6 +348,17 @@ class ServerService:
         except InvalidJobStateError as error:
             raise ServiceError(409, "job_state_conflict", str(error)) from error
 
+    async def delete_job(self, job_id: UUID) -> None:
+        try:
+            await self.jobs.archive(job_id)
+        except JobNotFoundError as error:
+            raise ServiceError(404, "job_not_found", str(error)) from error
+        except InvalidJobStateError as error:
+            raise ServiceError(409, "job_state_conflict", str(error)) from error
+
+    async def clear_completed_jobs(self) -> int:
+        return await self.jobs.archive_completed()
+
     async def search_hub_models(
         self, provider: HubProvider, query: str, limit: int
     ) -> HubModelSearchResult:
@@ -903,6 +914,7 @@ class ServerService:
         self,
         *,
         directory_id: str | None = None,
+        path: str | None = None,
     ) -> ModelDirectoryList:
         if self.catalog is None:
             raise ServiceError(
@@ -910,8 +922,14 @@ class ServerService:
                 "model_catalog_unavailable",
                 "model directory browsing is not available",
             )
+        if directory_id is not None and path is not None:
+            raise ServiceError(
+                400,
+                "invalid_model_directory_source",
+                "directory_id and path cannot be used together",
+            )
         try:
-            return await self.catalog.browse_directories(directory_id)
+            return await self.catalog.browse_directories(directory_id, path=path)
         except ModelDirectoryNotFoundError as error:
             raise ServiceError(
                 404,

@@ -295,6 +295,7 @@ export interface ModelDirectoryEntry {
 export interface ModelDirectoryList {
   current_id: string | null;
   current_name: string | null;
+  current_path: string | null;
   parent_id: string | null;
   model_file_count: number;
   data: ModelDirectoryEntry[];
@@ -798,9 +799,12 @@ export const api = {
     ).data;
   },
 
-  modelDirectories(directoryId?: string | null): Promise<ModelDirectoryList> {
-    const query = directoryId ? `?directory_id=${encodeURIComponent(directoryId)}` : "";
-    return request(`/api/v1/models/directories${query}`);
+  modelDirectories(directoryId?: string | null, path?: string | null): Promise<ModelDirectoryList> {
+    const query = new URLSearchParams();
+    if (directoryId) query.set("directory_id", directoryId);
+    else if (path?.trim()) query.set("path", path.trim());
+    const suffix = query.size ? `?${query.toString()}` : "";
+    return request(`/api/v1/models/directories${suffix}`);
   },
 
   async registerModelDirectory(directoryId: string): Promise<ModelArtifact[]> {
@@ -988,6 +992,22 @@ export const api = {
 
   async jobs(limit = 100): Promise<JobResource[]> {
     return (await request<{ data: JobResource[] }>(`/api/v1/jobs?limit=${limit}`)).data;
+  },
+
+  async deleteJob(id: string): Promise<void> {
+    const response = await fetch(apiUrl(`/api/v1/jobs/${id}`), {
+      method: "DELETE",
+      headers: authorizedHeaders(),
+    });
+    if (!response.ok) throw await errorFromResponse(response);
+  },
+
+  async clearCompletedJobs(): Promise<void> {
+    const response = await fetch(apiUrl("/api/v1/jobs/completed"), {
+      method: "DELETE",
+      headers: authorizedHeaders(),
+    });
+    if (!response.ok) throw await errorFromResponse(response);
   },
 
   async jobKinds(): Promise<JobKindResource[]> {
