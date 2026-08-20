@@ -91,6 +91,33 @@ def test_studio_uses_the_model_bound_duplex_system_prompt():
     assert "submitText(text, realtimeSessionConfig(active.id))" in APP
 
 
+def test_studio_resolves_model_global_and_role_inference_settings_in_order():
+    assert "inheritModelDefaults: true" in APP
+    assert "function roleGenerationSettings" in APP
+    assert "if (role.inheritGlobalSettings)" in APP
+    assert "const resolvedGlobalSettings = useMemo" in APP
+    assert "const effectiveSettings = useMemo" in APP
+    assert "roleGenerationSettings(resolvedGlobalSettings, activeRolePreset)" in APP
+    assert "sampling: samplingParams()" in APP
+    assert "max_tokens: effectiveSettings.maxTokens" in APP
+    assert "system_prompt: effectiveSettings.systemPrompt || null" in APP
+    assert "setSettings((current) => ({ ...current, ...rolePreset.settings" not in APP
+
+
+def test_studio_defaults_global_and_role_editors_to_inherited_parameters():
+    assert 'className="settings-inherited-fields" disabled={settingsDraft.inheritModelDefaults}' in APP
+    assert 'checked={settingsDraft.inheritModelDefaults}' in APP
+    assert 'inheritGlobalSettings: preset?.inheritGlobalSettings ?? true' not in APP
+    assert "const inheritGlobalSettings = preset?.inheritGlobalSettings ?? true" in APP
+    assert 'className="role-inherited-fields" disabled={roleEditor.inheritGlobalSettings}' in APP
+    assert 'checked={roleEditor.inheritGlobalSettings}' in APP
+    assert "inherit_global_settings: preset.inheritGlobalSettings" in APP
+    assert 'typeof raw.inheritGlobalSettings === "boolean" ? raw.inheritGlobalSettings : true' in APP
+    assert 'typeof preset.metadata?.inherit_global_settings === "boolean"' in APP
+    assert ".settings-inherited-fields:disabled section" in STYLES
+    assert ".role-inherited-fields:disabled" in STYLES
+
+
 def test_realtime_turns_remain_bound_to_the_session_that_created_them():
     assert "sessionId: string;" in REALTIME_AUDIO
     assert "private clientSessionId: string | null = null" in REALTIME_AUDIO

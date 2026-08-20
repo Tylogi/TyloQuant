@@ -86,9 +86,9 @@ def test_server_rejects_external_runtime_assets() -> None:
 
 def test_studio_keeps_reasoning_separate_and_template_controlled() -> None:
     assert "reasoning: string;" in STUDIO_APP
-    assert "include_reasoning_history: !settings.excludeReasoning" in STUDIO_APP
-    assert "settings.enableThinking" in STUDIO_APP
-    assert "settings.excludeReasoning" in STUDIO_APP
+    assert "include_reasoning_history: !effectiveSettings.excludeReasoning" in STUDIO_APP
+    assert "effectiveSettings.enableThinking" in STUDIO_APP
+    assert "effectiveSettings.excludeReasoning" in STUDIO_APP
 
 
 def test_studio_exposes_template_gated_reasoning_effort() -> None:
@@ -97,8 +97,8 @@ def test_studio_exposes_template_gated_reasoning_effort() -> None:
     assert 'chat_template.find("enable_thinking")' in SERVER
     assert 'runtime?.chat_template_capabilities?.thinking?.supported' in STUDIO_APP
     assert "runtime?.chat_template_capabilities?.reasoning_effort?.values" in STUDIO_APP
-    assert "settings.enableThinking && reasoningValues.length > 0" in STUDIO_APP
-    assert "reasoning_effort: settings.reasoningEffort || null" in STUDIO_APP
+    assert "effectiveSettings.enableThinking && reasoningValues.length > 0" in STUDIO_APP
+    assert "reasoning_effort: effectiveSettings.reasoningEffort || null" in STUDIO_APP
 
 
 def test_native_server_does_not_bundle_or_mount_a_webui() -> None:

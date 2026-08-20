@@ -420,7 +420,7 @@ def test_minicpmo45_realtime_uses_official_demo_defaults():
     assert "const SPEAK_TOKENS = 20" in STUDIO_REALTIME
     assert "const PLAYBACK_DELAY_SECONDS = 0.2" in STUDIO_REALTIME
     assert "REALTIME_SYSTEM_PROMPTS" not in STUDIO_APP
-    assert "systemPrompt: settings.systemPrompt" in STUDIO_APP
+    assert "systemPrompt: effectiveSettings.systemPrompt" in STUDIO_APP
 
 
 def test_minicpmo45_realtime_preserves_official_first_tts_flush():

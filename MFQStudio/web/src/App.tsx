@@ -90,6 +90,7 @@ type PresetName = "precise" | "balanced" | "creative" | "custom";
 interface GenerationSettings {
   language: UiLanguage;
   theme: UiTheme;
+  inheritModelDefaults: boolean;
   systemPrompt: string;
   maxTokens: number;
   temperature: number;
@@ -127,6 +128,7 @@ interface StoredPreset {
   id?: string;
   name: string;
   settings: StoredPresetSettings;
+  inheritGlobalSettings: boolean;
   contextSize: number;
   model?: string | null;
   mode?: SessionMode | null;
@@ -147,6 +149,7 @@ interface RoleEditorDraft {
   model: string;
   mode: SessionMode;
   contextSize: number;
+  inheritGlobalSettings: boolean;
   settings: StoredPresetSettings;
 }
 
@@ -256,6 +259,7 @@ const MODE_LABELS: Record<SessionMode, [string, string]> = {
 const DEFAULT_SETTINGS: GenerationSettings = {
   language: "system",
   theme: "system",
+  inheritModelDefaults: true,
   systemPrompt: "",
   maxTokens: 4096,
   temperature: 0.7,
@@ -313,6 +317,26 @@ function modeTemplateSettings(
     fullDuplex: mode === "full_duplex",
     preset: "custom",
     seed: null,
+  };
+}
+
+function roleGenerationSettings(
+  globalSettings: GenerationSettings,
+  role: StoredPreset | undefined,
+): GenerationSettings {
+  if (!role) return globalSettings;
+  if (role.inheritGlobalSettings) {
+    return {
+      ...globalSettings,
+      systemPrompt: role.settings.systemPrompt.trim()
+        ? role.settings.systemPrompt
+        : globalSettings.systemPrompt,
+    };
+  }
+  return {
+    ...globalSettings,
+    ...role.settings,
+    preset: "custom",
   };
 }
 const CAPABILITY_LABELS: Array<[
@@ -401,6 +425,8 @@ function loadStoredPresets(): StoredPreset[] {
               ? null
               : number("seed", fallback.seed ?? 0),
         },
+        inheritGlobalSettings:
+          typeof raw.inheritGlobalSettings === "boolean" ? raw.inheritGlobalSettings : true,
         contextSize:
           Number.isFinite(contextSize) && contextSize >= 512
             ? Math.floor(contextSize)
@@ -439,6 +465,10 @@ function storedPresetFromResource(preset: GenerationPresetResource): StoredPrese
       excludeReasoning: !preset.settings.include_reasoning_history,
       seed: sampling.seed ?? null,
     },
+    inheritGlobalSettings:
+      typeof preset.metadata?.inherit_global_settings === "boolean"
+        ? preset.metadata.inherit_global_settings
+        : true,
     contextSize: preset.context_size,
     model: preset.model,
     mode: preset.mode,
@@ -477,7 +507,10 @@ function presetResourceBody(
       response_format: { type: "text" },
     },
     context_size: preset.contextSize,
-    metadata: { icon: preset.icon || preset.name.slice(0, 1).toLocaleUpperCase() },
+    metadata: {
+      icon: preset.icon || preset.name.slice(0, 1).toLocaleUpperCase(),
+      inherit_global_settings: preset.inheritGlobalSettings,
+    },
   };
 }
 
@@ -1308,7 +1341,6 @@ export default function App() {
   const voiceRef = useRef<RealtimeAudioController | null>(null);
   const voiceClipWrites = useRef(new Map<string, Promise<void>>());
   const lastMetricId = useRef("");
-  const hadStoredSettings = useRef(Boolean(localStorage.getItem(SETTINGS_KEY)));
   const appliedModeTemplate = useRef("");
   const settingsCloseRef = useRef<HTMLButtonElement | null>(null);
 
@@ -1350,6 +1382,28 @@ export default function App() {
   const currentVoiceMessages = useMemo(
     () => voiceMessages.filter((message) => message.sessionId === activeId),
     [activeId, voiceMessages],
+  );
+  const activeRolePreset = useMemo(
+    () => active
+      ? storedPresets.find(
+          (preset) =>
+            assistantIdForPreset(preset) === canonicalSessionAssistantId(active, storedPresets),
+        )
+      : undefined,
+    [active, storedPresets],
+  );
+  const resolvedGlobalSettings = useMemo(
+    () => settings.inheritModelDefaults
+      ? modeTemplateSettings(settings, active?.mode ?? mode, runtime, realtime)
+      : settings,
+    [active?.mode, mode, realtime, runtime, settings],
+  );
+  const effectiveSettings = useMemo(
+    () => roleGenerationSettings(resolvedGlobalSettings, activeRolePreset),
+    [activeRolePreset, resolvedGlobalSettings],
+  );
+  const roleOverridesInference = Boolean(
+    activeRolePreset && !activeRolePreset.inheritGlobalSettings,
   );
   useEffect(() => {
     if (active) setSelectedAssistantId(canonicalSessionAssistantId(active, storedPresets));
@@ -1481,13 +1535,7 @@ export default function App() {
     if (appliedModeTemplate.current === key) return;
     appliedModeTemplate.current = key;
     void voiceRef.current?.setFullDuplex(active.mode === "full_duplex");
-    const rolePreset = storedPresets.find(
-      (preset) => assistantIdForPreset(preset) === canonicalSessionAssistantId(active, storedPresets),
-    );
-    setSettings((current) => rolePreset
-      ? { ...current, ...rolePreset.settings, preset: "custom" }
-      : modeTemplateSettings(current, active.mode, runtime, realtime));
-  }, [active, model, realtime, runtime, storedPresets]);
+  }, [active, model, runtime]);
 
   useEffect(() => {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
@@ -1669,32 +1717,7 @@ export default function App() {
           setModel(results[0].value.model);
         }
         if (results[1].status === "fulfilled") setModels(results[1].value);
-        if (results[2].status === "fulfilled") {
-          setRuntime(results[2].value);
-          if (!hadStoredSettings.current && results[2].value.sampling_defaults) {
-            const defaults = results[2].value.sampling_defaults;
-            setSettings((current) => ({
-              ...current,
-              maxTokens: Number(defaults.max_tokens ?? current.maxTokens),
-              temperature: Number(defaults.temperature ?? current.temperature),
-              topP: Number(defaults.top_p ?? current.topP),
-              topK: Number(defaults.top_k ?? current.topK),
-              repetitionPenalty: Number(
-                defaults.repetition_penalty ?? current.repetitionPenalty,
-              ),
-              presencePenalty: Number(defaults.presence_penalty ?? current.presencePenalty),
-              frequencyPenalty: Number(
-                defaults.frequency_penalty ?? current.frequencyPenalty,
-              ),
-              enableThinking:
-                typeof defaults.enable_thinking === "boolean"
-                  ? defaults.enable_thinking
-                  : current.enableThinking,
-              preset: "custom",
-            }));
-            hadStoredSettings.current = true;
-          }
-        }
+        if (results[2].status === "fulfilled") setRuntime(results[2].value);
         if (results[5].status === "fulfilled") setArtifacts(results[5].value);
         if (results[6].status === "fulfilled") setInstances(results[6].value);
         if (results[7].status === "fulfilled") setJobs(results[7].value);
@@ -1822,27 +1845,27 @@ export default function App() {
 
   function samplingParams(): SamplingParams {
     return {
-      max_tokens: settings.maxTokens,
-      temperature: settings.temperature,
-      top_k: settings.topK,
-      top_p: settings.topP,
-      presence_penalty: settings.presencePenalty,
-      frequency_penalty: settings.frequencyPenalty,
-      repetition_penalty: settings.repetitionPenalty,
-      seed: settings.seed,
-      enable_thinking: thinkingSupported && settings.enableThinking,
-      reasoning_effort: settings.reasoningEffort || null,
+      max_tokens: effectiveSettings.maxTokens,
+      temperature: effectiveSettings.temperature,
+      top_k: effectiveSettings.topK,
+      top_p: effectiveSettings.topP,
+      presence_penalty: effectiveSettings.presencePenalty,
+      frequency_penalty: effectiveSettings.frequencyPenalty,
+      repetition_penalty: effectiveSettings.repetitionPenalty,
+      seed: effectiveSettings.seed,
+      enable_thinking: thinkingSupported && effectiveSettings.enableThinking,
+      reasoning_effort: effectiveSettings.reasoningEffort || null,
     };
   }
 
   function realtimeSessionConfig(sessionId: string) {
     return {
       sessionId,
-      systemPrompt: settings.systemPrompt,
-      temperature: settings.temperature,
-      topP: settings.topP,
-      topK: settings.topK,
-      repetitionPenalty: settings.repetitionPenalty,
+      systemPrompt: effectiveSettings.systemPrompt,
+      temperature: effectiveSettings.temperature,
+      topP: effectiveSettings.topP,
+      topK: effectiveSettings.topK,
+      repetitionPenalty: effectiveSettings.repetitionPenalty,
     };
   }
 
@@ -1851,7 +1874,6 @@ export default function App() {
     const nextSession = sessions.find((session) => canonicalSessionAssistantId(session, storedPresets) === role.id);
     setActiveId(nextSession?.id ?? null);
     if (role.preset) {
-      setSettings((current) => ({ ...current, ...role.preset?.settings, preset: "custom" }));
       if (role.preset.model) setModel(role.preset.model);
       if (role.preset.mode) setMode(role.preset.mode);
     }
@@ -1861,14 +1883,25 @@ export default function App() {
 
   function editRole(role: AssistantRole) {
     const preset = role.preset;
+    const inheritGlobalSettings = preset?.inheritGlobalSettings ?? true;
+    const roleMode = preset?.mode || mode;
+    const roleGlobalSettings = settings.inheritModelDefaults
+      ? modeTemplateSettings(settings, roleMode, runtime, realtime)
+      : settings;
     setRoleEditor({
       roleId: role.id,
       name: role.name,
       icon: preset?.icon || role.name.slice(0, 1).toLocaleUpperCase(),
       model: preset?.model || model,
-      mode: preset?.mode || mode,
+      mode: roleMode,
       contextSize: preset?.contextSize || contextSize,
-      settings: preset?.settings || presetSnapshot(settings),
+      inheritGlobalSettings,
+      settings: inheritGlobalSettings
+        ? {
+            ...presetSnapshot(roleGlobalSettings),
+            systemPrompt: preset?.settings.systemPrompt ?? "",
+          }
+        : preset?.settings || presetSnapshot(roleGlobalSettings),
     });
   }
 
@@ -1884,7 +1917,12 @@ export default function App() {
       model,
       mode,
       contextSize,
-      settings: presetSnapshot(settings),
+      inheritGlobalSettings: true,
+      settings: presetSnapshot(
+        settings.inheritModelDefaults
+          ? modeTemplateSettings(settings, mode, runtime, realtime)
+          : settings,
+      ),
     });
   }
 
@@ -1905,6 +1943,7 @@ export default function App() {
       model: roleEditor.model || null,
       mode: roleEditor.mode,
       contextSize: Math.max(512, Math.floor(roleEditor.contextSize)),
+      inheritGlobalSettings: roleEditor.inheritGlobalSettings,
       settings: roleEditor.settings,
       updatedAt: new Date().toISOString(),
     };
@@ -1927,7 +1966,6 @@ export default function App() {
       setSelectedAssistantId(nextId);
       setModel(saved.model || model);
       setMode(saved.mode || mode);
-      setSettings((current) => ({ ...current, ...saved.settings, preset: "custom" }));
       setRoleEditor(null);
     } catch (cause) {
       setError(errorMessage(cause));
@@ -2079,8 +2117,8 @@ export default function App() {
           input,
           input_role: inputRole,
           sampling: samplingParams(),
-          system_prompt: settings.systemPrompt || null,
-          include_reasoning_history: !settings.excludeReasoning,
+          system_prompt: effectiveSettings.systemPrompt || null,
+          include_reasoning_history: !effectiveSettings.excludeReasoning,
           tools: mcpTools
             .filter((tool) => selectedTools.includes(tool.qualified_name))
             .map((tool) => ({
@@ -2493,7 +2531,7 @@ export default function App() {
   }
 
   function openSettings() {
-    setSettingsDraft(settings);
+    setSettingsDraft(resolvedGlobalSettings);
     const current = Number(runtime?.max_context);
     setContextSize(Number.isFinite(current) && current > 0 ? current : contextSize);
     setSettingsOpen(true);
@@ -2518,7 +2556,12 @@ export default function App() {
   });
 
   function applyPreset(name: Exclude<PresetName, "custom">) {
-    setSettingsDraft((current) => ({ ...current, ...PRESETS[name], preset: name }));
+    setSettingsDraft((current) => ({
+      ...current,
+      ...PRESETS[name],
+      inheritModelDefaults: false,
+      preset: name,
+    }));
     setSelectedStoredPreset("");
     setStoredPresetName("");
     setPresetStatus(null);
@@ -2534,7 +2577,12 @@ export default function App() {
     const stored = storedPresets.find((preset) => preset.name === name);
     if (!stored) return;
     setStoredPresetName(stored.name);
-    setSettingsDraft((current) => ({ ...current, ...stored.settings, preset: "custom" }));
+    setSettingsDraft((current) => ({
+      ...current,
+      ...stored.settings,
+      inheritModelDefaults: false,
+      preset: "custom",
+    }));
     setContextSize(stored.contextSize);
     setPresetStatus({ error: false, text: tr("预设已载入。", "Preset loaded.") });
   }
@@ -2548,6 +2596,7 @@ export default function App() {
     const next: StoredPreset = {
       name,
       settings: presetSnapshot(settingsDraft),
+      inheritGlobalSettings: false,
       contextSize,
       model: active?.model ?? model,
       mode: active?.mode ?? mode,
@@ -2579,7 +2628,10 @@ export default function App() {
         response_format: { type: "text" as const },
       },
       context_size: next.contextSize,
-      metadata: selected?.icon ? { icon: selected.icon } : {},
+      metadata: {
+        ...(selected?.icon ? { icon: selected.icon } : {}),
+        inherit_global_settings: false,
+      },
     };
     try {
       const saved = selected?.id
@@ -2618,12 +2670,13 @@ export default function App() {
     }
   }
 
-  function renderPresetManager() {
+  function renderPresetManager(disabled = false) {
     return (
       <div className="saved-presets">
         <label>
           <span>{tr("已保存预设", "Saved presets")}</span>
           <select
+            disabled={disabled}
             onChange={(event) => loadStoredPreset(event.target.value)}
             value={selectedStoredPreset}
           >
@@ -2640,6 +2693,7 @@ export default function App() {
         <div className="preset-save-row">
           <input
             aria-label={tr("预设名称", "Preset name")}
+            disabled={disabled}
             maxLength={64}
             onChange={(event) => {
               setStoredPresetName(event.target.value);
@@ -2654,7 +2708,7 @@ export default function App() {
             placeholder={tr("预设名称", "Preset name")}
             value={storedPresetName}
           />
-          <button onClick={() => void saveStoredPreset()} type="button">
+          <button disabled={disabled} onClick={() => void saveStoredPreset()} type="button">
             {selectedStoredPreset && storedPresetName.trim() === selectedStoredPreset
               ? tr("覆盖", "Update")
               : tr("保存", "Save")}
@@ -2662,7 +2716,7 @@ export default function App() {
           <button
             aria-label={tr("删除预设", "Delete preset")}
             className="preset-delete"
-            disabled={!selectedStoredPreset}
+            disabled={disabled || !selectedStoredPreset}
             onClick={() => void deleteStoredPreset()}
             title={tr("删除预设", "Delete preset")}
             type="button"
@@ -2681,41 +2735,40 @@ export default function App() {
             "Stores the system prompt, context, and generation parameters; interface and playback preferences stay separate.",
           )}
         </small>
-        <div className="portable-actions">
-          <button onClick={exportStudioData} type="button">{tr("导出", "Export")}</button>
-          <label>
-            {tr("导入", "Import")}
-            <input
-              accept="application/json,.json"
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                if (file) void importStudioData(file);
-                event.target.value = "";
-              }}
-              type="file"
-            />
-          </label>
-        </div>
-        <label>
-          <span>{tr("主题", "Theme")}</span>
-          <select
-            onChange={(event) => setSettingsDraft((current) => ({ ...current, theme: event.target.value as UiTheme }))}
-            value={settingsDraft.theme}
-          >
-            <option value="system">{tr("跟随系统", "System")}</option>
-            <option value="light">{tr("浅色", "Light")}</option>
-            <option value="dark">{tr("深色", "Dark")}</option>
-          </select>
-        </label>
       </div>
     );
   }
 
-  const presetManager = renderPresetManager();
+  const presetManager = renderPresetManager(settingsDraft.inheritModelDefaults);
+
+  function setModelDefaultInheritance(enabled: boolean) {
+    setSettingsDraft((current) => ({
+      ...(enabled
+        ? modeTemplateSettings(current, active?.mode ?? mode, runtime, realtime)
+        : current),
+      inheritModelDefaults: enabled,
+    }));
+    if (enabled) {
+      setSelectedStoredPreset("");
+      setStoredPresetName("");
+      setPresetStatus(null);
+    }
+  }
 
   function saveSettings() {
     setSettings(settingsDraft);
     setSettingsOpen(false);
+  }
+
+  function updateGlobalInference(patch: Partial<GenerationSettings>) {
+    setSettings((current) => ({
+      ...(current.inheritModelDefaults
+        ? modeTemplateSettings(current, active?.mode ?? mode, runtime, realtime)
+        : current),
+      ...patch,
+      inheritModelDefaults: false,
+      preset: "custom",
+    }));
   }
 
   async function reloadRuntime() {
@@ -3007,7 +3060,11 @@ export default function App() {
       for (const preset of payload.presets) {
         if (!preset.name || !preset.settings || !Number.isFinite(preset.contextSize)) continue;
         const existing = storedPresets.find((item) => item.name === preset.name);
-        const resource = presetResourceBody({ ...preset, id: existing?.id }, model, mode);
+        const resource = presetResourceBody({
+          ...preset,
+          id: existing?.id,
+          inheritGlobalSettings: preset.inheritGlobalSettings !== false,
+        }, model, mode);
         if (existing?.id) await api.updateGenerationPreset(existing.id, resource);
         else await api.createGenerationPreset(resource);
       }
@@ -3081,16 +3138,16 @@ export default function App() {
           context_size: contextSize,
           prefill_chunk_size: 2048,
           sampling_defaults: {
-            max_tokens: settings.maxTokens,
-            temperature: settings.temperature,
-            top_k: settings.topK,
-            top_p: settings.topP,
-            presence_penalty: settings.presencePenalty,
-            frequency_penalty: settings.frequencyPenalty,
-            repetition_penalty: settings.repetitionPenalty,
-            seed: settings.seed,
-            enable_thinking: thinkingSupported && settings.enableThinking,
-            reasoning_effort: settings.reasoningEffort || null,
+            max_tokens: resolvedGlobalSettings.maxTokens,
+            temperature: resolvedGlobalSettings.temperature,
+            top_k: resolvedGlobalSettings.topK,
+            top_p: resolvedGlobalSettings.topP,
+            presence_penalty: resolvedGlobalSettings.presencePenalty,
+            frequency_penalty: resolvedGlobalSettings.frequencyPenalty,
+            repetition_penalty: resolvedGlobalSettings.repetitionPenalty,
+            seed: resolvedGlobalSettings.seed,
+            enable_thinking: thinkingSupported && resolvedGlobalSettings.enableThinking,
+            reasoning_effort: resolvedGlobalSettings.reasoningEffort || null,
           },
         },
       });
@@ -3343,8 +3400,8 @@ export default function App() {
                   {realtimeAvailable && <select aria-label={tr("交互模式", "Interaction mode")} disabled={!active || busy || voiceState !== "idle"} onChange={(event) => void selectInteractionMode(event.target.value as SessionMode)} value={active?.mode ?? mode}>{(["text", "voice", "full_duplex"] as SessionMode[]).map((item) => { const feature = capabilities?.model_capabilities.features; const disabled = item === "voice" ? !feature?.audio_input : item === "full_duplex" ? !feature?.full_duplex : false; return <option disabled={disabled} key={item} value={item}>{MODE_LABELS[item][english ? 1 : 0]}</option>; })}</select>}
                   {realtimeAvailable && <button aria-label={tr("语音输入", "Voice input")} aria-pressed={voiceState !== "idle" && voiceState !== "error"} className="voice-button" disabled={!active || active.mode === "text" || busy} onClick={() => void toggleVoice()} style={{ "--voice-level": voiceLevel } as React.CSSProperties} title={active?.mode === "text" ? tr("请先选择语音或全双工模式", "Select voice or full duplex mode first") : voiceState === "processing" ? tr("语音处理中", "Processing voice") : tr("语音输入", "Voice input")} type="button"><span /></button>}
                   {realtimeAvailable && active?.mode !== "text" && <button aria-label={tr("语音播放", "Voice playback")} aria-pressed={settings.playbackEnabled} onClick={() => setSettings((current) => ({ ...current, playbackEnabled: !current.playbackEnabled }))} title={tr("语音播放", "Voice playback")} type="button"><Icon name={settings.playbackEnabled ? "volume" : "volume-off"} /></button>}
-                  {active?.mode === "text" && <button aria-pressed={thinkingSupported && settings.enableThinking} disabled={!thinkingSupported} onClick={() => setSettings((current) => ({ ...current, enableThinking: !current.enableThinking }))} type="button"><Icon name="lightbulb" />{tr("思考", "Thinking")}</button>}
-                  {active?.mode === "text" && thinkingSupported && settings.enableThinking && reasoningValues.length > 0 && <select aria-label={tr("思考档位", "Reasoning effort")} onChange={(event) => setSettings((current) => ({ ...current, reasoningEffort: event.target.value }))} value={settings.reasoningEffort}><option value="">{tr("标准", "Standard")}</option>{reasoningValues.map((value) => <option key={value} value={value}>{value}</option>)}</select>}
+                  {active?.mode === "text" && <button aria-pressed={thinkingSupported && effectiveSettings.enableThinking} disabled={!thinkingSupported || roleOverridesInference} onClick={() => updateGlobalInference({ enableThinking: !effectiveSettings.enableThinking })} title={roleOverridesInference ? tr("该参数由当前角色覆盖", "This setting is overridden by the current role") : undefined} type="button"><Icon name="lightbulb" />{tr("思考", "Thinking")}</button>}
+                  {active?.mode === "text" && thinkingSupported && effectiveSettings.enableThinking && reasoningValues.length > 0 && <select aria-label={tr("思考档位", "Reasoning effort")} disabled={roleOverridesInference} onChange={(event) => updateGlobalInference({ reasoningEffort: event.target.value })} value={effectiveSettings.reasoningEffort}><option value="">{tr("标准", "Standard")}</option>{reasoningValues.map((value) => <option key={value} value={value}>{value}</option>)}</select>}
                   <span className="composer-hint">{voiceState !== "idle" ? voiceState : tr("Enter 发送 · Shift+Enter 换行", "Enter to send · Shift+Enter for newline")}</span>
                   {busy ? <button aria-label={tr("停止生成", "Stop generation")} className="send-button stop" onClick={() => abortRef.current?.abort()} type="button"><Icon name="stop" size={14} /></button> : <button aria-label={tr("发送", "Send")} className="send-button" disabled={!active || (!draft.trim() && !attachments.length)} type="submit"><Icon name="send" size={15} /></button>}
                 </div>
@@ -3436,7 +3493,154 @@ export default function App() {
         )}
       </main>
 
-      {settingsOpen && <><div className="drawer-scrim" onClick={() => setSettingsOpen(false)} /><aside className="settings-panel"><header><div><p>Generation</p><h2>{tr("推理设置", "Inference settings")}</h2></div><button onClick={() => setSettingsOpen(false)} type="button">×</button></header><div className="settings-scroll"><section><h3>{tr("预设", "Presets")}</h3><div className="segmented">{(["precise", "balanced", "creative"] as const).map((name) => <button aria-pressed={settingsDraft.preset === name} key={name} onClick={() => applyPreset(name)} type="button">{name === "precise" ? tr("精确", "Precise") : name === "balanced" ? tr("均衡", "Balanced") : tr("创意", "Creative")}</button>)}</div>{presetManager}</section><section><h3>{tr("上下文", "Context")}</h3><label><span>{tr("系统提示词", "System prompt")}</span><textarea onChange={(event) => setSettingsDraft((current) => ({ ...current, systemPrompt: event.target.value }))} rows={4} value={settingsDraft.systemPrompt} /></label><label className="check-field"><span><strong>{tr("排除历史思考", "Exclude reasoning history")}</strong><small>{tr("后续请求不再发送已保存的思考内容。", "Do not send saved reasoning in later requests.")}</small></span><input checked={settingsDraft.excludeReasoning} onChange={(event) => setSettingsDraft((current) => ({ ...current, excludeReasoning: event.target.checked }))} type="checkbox" /></label><label><span>{tr("上下文窗口 tokens", "Context window tokens")}</span><input max={Number(runtime?.context_capacity) || 1048576} min={512} onChange={(event) => setContextSize(Number(event.target.value))} step={512} type="number" value={contextSize} /></label><button className="secondary wide" disabled={busy} onClick={() => void reloadRuntime()} type="button">{tr("按此上下文重载模型", "Reload model with this context")}</button><label><span>{tr("最大生成 tokens", "Maximum output tokens")}</span><input max={65536} min={1} onChange={(event) => setSettingsDraft((current) => ({ ...current, maxTokens: Number(event.target.value) }))} type="number" value={settingsDraft.maxTokens} /></label></section><section><h3>{tr("采样", "Sampling")}</h3><label><span>Temperature <output>{settingsDraft.temperature.toFixed(2)}</output></span><input max={2} min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, temperature: Number(event.target.value), preset: "custom" }))} step={0.05} type="range" value={settingsDraft.temperature} /></label><label><span>Top P <output>{settingsDraft.topP.toFixed(2)}</output></span><input max={1} min={0.05} onChange={(event) => setSettingsDraft((current) => ({ ...current, topP: Number(event.target.value), preset: "custom" }))} step={0.05} type="range" value={settingsDraft.topP} /></label><label><span>Top K</span><input max={1024} min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, topK: Number(event.target.value), preset: "custom" }))} type="number" value={settingsDraft.topK} /></label><label><span>Seed</span><input min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, seed: event.target.value ? Number(event.target.value) : null }))} placeholder={tr("随机", "Random")} type="number" value={settingsDraft.seed ?? ""} /></label></section><section><h3>{tr("惩罚", "Penalties")}</h3>{([["Repetition", "repetitionPenalty", 0.5, 2, 0.01], ["Presence", "presencePenalty", -2, 2, 0.05], ["Frequency", "frequencyPenalty", -2, 2, 0.05]] as const).map(([label, key, min, max, step]) => <label key={key}><span>{label} <output>{settingsDraft[key].toFixed(2)}</output></span><input max={max} min={min} onChange={(event) => setSettingsDraft((current) => ({ ...current, [key]: Number(event.target.value), preset: "custom" }))} step={step} type="range" value={settingsDraft[key]} /></label>)}</section><section><h3>{tr("界面与连接", "Interface and connection")}</h3><label><span>{tr("界面语言", "Interface language")}</span><select onChange={(event) => setSettingsDraft((current) => ({ ...current, language: event.target.value as UiLanguage }))} value={settingsDraft.language}><option value="system">{tr("跟随系统", "System")}</option><option value="zh-CN">简体中文</option><option value="en">English</option></select></label>{studio && <button className="secondary wide" onClick={openStudioSettings} type="button">{tr("配置 MFQ Server 连接", "Configure MFQ Server connection")}</button>}</section></div><footer><button onClick={() => setSettingsDraft(modeTemplateSettings({ ...DEFAULT_SETTINGS, language: settingsDraft.language }, active?.mode ?? mode, runtime, realtime))} type="button">{tr("恢复默认", "Reset")}</button><button className="primary" onClick={saveSettings} type="button">{tr("应用", "Apply")}</button></footer></aside></>}
+      {settingsOpen && <>
+        <div className="drawer-scrim" onClick={() => setSettingsOpen(false)} />
+        <aside className="settings-panel">
+          <header>
+            <div><p>Generation</p><h2>{tr("推理设置", "Inference settings")}</h2></div>
+            <button onClick={() => setSettingsOpen(false)} ref={settingsCloseRef} type="button">×</button>
+          </header>
+          <div className="settings-scroll">
+            <section className="settings-inheritance">
+              <label className="check-field inheritance-toggle">
+                <span>
+                  <strong>{tr("随模型 / 架构默认值", "Use model / architecture defaults")}</strong>
+                  <small>{tr(
+                    "优先读取模型元数据，缺失字段由模型型号或架构默认值补齐。",
+                    "Read model metadata first, then fill missing fields from model or architecture defaults.",
+                  )}</small>
+                </span>
+                <input
+                  checked={settingsDraft.inheritModelDefaults}
+                  onChange={(event) => setModelDefaultInheritance(event.target.checked)}
+                  type="checkbox"
+                />
+              </label>
+            </section>
+            <fieldset className="settings-inherited-fields" disabled={settingsDraft.inheritModelDefaults}>
+              <section>
+                <h3>{tr("预设", "Presets")}</h3>
+                <div className="segmented">
+                  {(["precise", "balanced", "creative"] as const).map((name) => (
+                    <button
+                      aria-pressed={settingsDraft.preset === name}
+                      key={name}
+                      onClick={() => applyPreset(name)}
+                      type="button"
+                    >
+                      {name === "precise"
+                        ? tr("精确", "Precise")
+                        : name === "balanced"
+                          ? tr("均衡", "Balanced")
+                          : tr("创意", "Creative")}
+                    </button>
+                  ))}
+                </div>
+                {presetManager}
+              </section>
+              <section>
+                <h3>{tr("提示与输出", "Prompt and output")}</h3>
+                <label>
+                  <span>{tr("系统提示词", "System prompt")}</span>
+                  <textarea
+                    onChange={(event) => setSettingsDraft((current) => ({ ...current, systemPrompt: event.target.value }))}
+                    rows={4}
+                    value={settingsDraft.systemPrompt}
+                  />
+                </label>
+                <label className="check-field">
+                  <span>
+                    <strong>{tr("排除历史思考", "Exclude reasoning history")}</strong>
+                    <small>{tr("后续请求不再发送已保存的思考内容。", "Do not send saved reasoning in later requests.")}</small>
+                  </span>
+                  <input
+                    checked={settingsDraft.excludeReasoning}
+                    onChange={(event) => setSettingsDraft((current) => ({ ...current, excludeReasoning: event.target.checked }))}
+                    type="checkbox"
+                  />
+                </label>
+                <label>
+                  <span>{tr("最大生成 tokens", "Maximum output tokens")}</span>
+                  <input
+                    max={65536}
+                    min={1}
+                    onChange={(event) => setSettingsDraft((current) => ({ ...current, maxTokens: Number(event.target.value) }))}
+                    type="number"
+                    value={settingsDraft.maxTokens}
+                  />
+                </label>
+              </section>
+              <section>
+                <h3>{tr("采样", "Sampling")}</h3>
+                <label>
+                  <span>Temperature <output>{settingsDraft.temperature.toFixed(2)}</output></span>
+                  <input max={2} min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, temperature: Number(event.target.value), preset: "custom" }))} step={0.05} type="range" value={settingsDraft.temperature} />
+                </label>
+                <label>
+                  <span>Top P <output>{settingsDraft.topP.toFixed(2)}</output></span>
+                  <input max={1} min={0.05} onChange={(event) => setSettingsDraft((current) => ({ ...current, topP: Number(event.target.value), preset: "custom" }))} step={0.05} type="range" value={settingsDraft.topP} />
+                </label>
+                <label><span>Top K</span><input max={1024} min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, topK: Number(event.target.value), preset: "custom" }))} type="number" value={settingsDraft.topK} /></label>
+                <label><span>Seed</span><input min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, seed: event.target.value ? Number(event.target.value) : null }))} placeholder={tr("随机", "Random")} type="number" value={settingsDraft.seed ?? ""} /></label>
+              </section>
+              <section>
+                <h3>{tr("惩罚", "Penalties")}</h3>
+                {([["Repetition", "repetitionPenalty", 0.5, 2, 0.01], ["Presence", "presencePenalty", -2, 2, 0.05], ["Frequency", "frequencyPenalty", -2, 2, 0.05]] as const).map(([label, key, min, max, step]) => (
+                  <label key={key}>
+                    <span>{label} <output>{settingsDraft[key].toFixed(2)}</output></span>
+                    <input max={max} min={min} onChange={(event) => setSettingsDraft((current) => ({ ...current, [key]: Number(event.target.value), preset: "custom" }))} step={step} type="range" value={settingsDraft[key]} />
+                  </label>
+                ))}
+              </section>
+            </fieldset>
+            <section>
+              <h3>{tr("上下文", "Context")}</h3>
+              <label><span>{tr("上下文窗口 tokens", "Context window tokens")}</span><input max={Number(runtime?.context_capacity) || 1048576} min={512} onChange={(event) => setContextSize(Number(event.target.value))} step={512} type="number" value={contextSize} /></label>
+              <button className="secondary wide" disabled={busy} onClick={() => void reloadRuntime()} type="button">{tr("按此上下文重载模型", "Reload model with this context")}</button>
+            </section>
+            <section>
+              <h3>{tr("界面与连接", "Interface and connection")}</h3>
+              <label><span>{tr("界面语言", "Interface language")}</span><select onChange={(event) => setSettingsDraft((current) => ({ ...current, language: event.target.value as UiLanguage }))} value={settingsDraft.language}><option value="system">{tr("跟随系统", "System")}</option><option value="zh-CN">简体中文</option><option value="en">English</option></select></label>
+              <label>
+                <span>{tr("主题", "Theme")}</span>
+                <select onChange={(event) => setSettingsDraft((current) => ({ ...current, theme: event.target.value as UiTheme }))} value={settingsDraft.theme}>
+                  <option value="system">{tr("跟随系统", "System")}</option>
+                  <option value="light">{tr("浅色", "Light")}</option>
+                  <option value="dark">{tr("深色", "Dark")}</option>
+                </select>
+              </label>
+              <div className="portable-actions">
+                <button onClick={exportStudioData} type="button">{tr("导出", "Export")}</button>
+                <label>
+                  {tr("导入", "Import")}
+                  <input
+                    accept="application/json,.json"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      if (file) void importStudioData(file);
+                      event.target.value = "";
+                    }}
+                    type="file"
+                  />
+                </label>
+              </div>
+              {studio && <button className="secondary wide" onClick={openStudioSettings} type="button">{tr("配置 MFQ Server 连接", "Configure MFQ Server connection")}</button>}
+            </section>
+          </div>
+          <footer>
+            <button onClick={() => setSettingsDraft({
+              ...modeTemplateSettings({
+                ...DEFAULT_SETTINGS,
+                language: settingsDraft.language,
+                theme: settingsDraft.theme,
+                playbackEnabled: settingsDraft.playbackEnabled,
+              }, active?.mode ?? mode, runtime, realtime),
+              inheritModelDefaults: true,
+            })} type="button">{tr("恢复默认", "Reset")}</button>
+            <button className="primary" onClick={saveSettings} type="button">{tr("应用", "Apply")}</button>
+          </footer>
+        </aside>
+      </>}
 
       {studioOpen && studioDraft && <div className="dialog-backdrop"><form className="studio-dialog" onSubmit={saveStudioSettings}><header><div><h2>{tr("Runtime 连接", "Runtime connection")}</h2><p>{tr("MFQ Studio 关闭后，MFQ Server 会继续运行。", "MFQ Server keeps running after MFQ Studio closes.")}</p></div><button onClick={() => setStudioOpen(false)} type="button">×</button></header><div className="segmented">{(["local", "remote"] as const).map((item) => <button aria-pressed={studioDraft.mode === item} key={item} onClick={() => setStudioDraft((current) => current && ({ ...current, mode: item }))} type="button">{item === "local" ? "Local MFQ Server" : "Remote MFQ Server"}</button>)}</div>{studioDraft.mode === "local" ? <><label><span>MFQ Server port</span><input max={65535} min={1} onChange={(event) => setStudioDraft((current) => current && ({ ...current, local_service_port: Number(event.target.value) }))} required type="number" value={studioDraft.local_service_port} /></label></> : <><label><span>Remote MFQ Server URL</span><input onChange={(event) => setStudioDraft((current) => current && ({ ...current, remote_url: event.target.value }))} required type="url" value={studioDraft.remote_url} /></label><label><span>Remote MFQ Server API key</span><input autoComplete="off" onChange={(event) => setStudioToken(event.target.value)} placeholder={tr("保存在系统凭据库", "Stored in the system credential vault")} type="password" value={studioToken} /></label></>}<div className="dialog-status"><span className={studio?.reachable ? "online" : "offline"} />{studio?.reachable ? `${tr("已连接", "Connected")}: ${studio.service_url}` : tr("MFQ Server 离线", "MFQ Server is offline")}</div><footer><button onClick={() => setStudioOpen(false)} type="button">{tr("取消", "Cancel")}</button><button className="primary" disabled={busy} type="submit">{tr("应用", "Apply")}</button></footer></form></div>}
 
@@ -3466,9 +3670,22 @@ export default function App() {
               <h3>{tr("对话默认值", "Conversation defaults")}</h3>
               <div className="role-form-grid">
                 <label><span>{tr("模型", "Model")}</span><input onChange={(event) => setRoleEditor((current) => current && ({ ...current, model: event.target.value }))} value={roleEditor.model} /></label>
-                <label><span>{tr("交互模式", "Interaction mode")}</span><select onChange={(event) => setRoleEditor((current) => current && ({ ...current, mode: event.target.value as SessionMode }))} value={roleEditor.mode}>{(["text", "voice", "full_duplex"] as SessionMode[]).map((item) => <option key={item} value={item}>{MODE_LABELS[item][english ? 1 : 0]}</option>)}</select></label>
+                <label><span>{tr("交互模式", "Interaction mode")}</span><select onChange={(event) => {
+                  const nextMode = event.target.value as SessionMode;
+                  setRoleEditor((current) => current && ({
+                    ...current,
+                    mode: nextMode,
+                    settings: current.inheritGlobalSettings
+                      ? {
+                          ...presetSnapshot(settings.inheritModelDefaults
+                            ? modeTemplateSettings(settings, nextMode, runtime, realtime)
+                            : settings),
+                          systemPrompt: current.settings.systemPrompt,
+                        }
+                      : current.settings,
+                  }));
+                }} value={roleEditor.mode}>{(["text", "voice", "full_duplex"] as SessionMode[]).map((item) => <option key={item} value={item}>{MODE_LABELS[item][english ? 1 : 0]}</option>)}</select></label>
                 <label><span>{tr("上下文 tokens", "Context tokens")}</span><input min={512} onChange={(event) => setRoleEditor((current) => current && ({ ...current, contextSize: Number(event.target.value) }))} step={512} type="number" value={roleEditor.contextSize} /></label>
-                <label><span>{tr("最大生成 tokens", "Maximum output tokens")}</span><input min={1} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, maxTokens: Number(event.target.value) } }))} type="number" value={roleEditor.settings.maxTokens} /></label>
               </div>
             </section>
             <section>
@@ -3476,21 +3693,48 @@ export default function App() {
               <label><textarea onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, systemPrompt: event.target.value } }))} placeholder={tr("该角色开始新会话时使用的默认提示词", "Default instructions for new sessions with this role")} rows={6} value={roleEditor.settings.systemPrompt} /></label>
             </section>
             <section>
-              <h3>{tr("采样默认值", "Sampling defaults")}</h3>
-              <div className="role-form-grid">
-                <label><span>Temperature</span><input max={2} min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, temperature: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.temperature} /></label>
-                <label><span>Top P</span><input max={1} min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, topP: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.topP} /></label>
-                <label><span>Top K</span><input min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, topK: Number(event.target.value) } }))} type="number" value={roleEditor.settings.topK} /></label>
-                <label><span>Repetition penalty</span><input min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, repetitionPenalty: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.repetitionPenalty} /></label>
-                <label><span>Presence penalty</span><input max={2} min={-2} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, presencePenalty: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.presencePenalty} /></label>
-                <label><span>Frequency penalty</span><input max={2} min={-2} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, frequencyPenalty: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.frequencyPenalty} /></label>
-                <label><span>Seed</span><input min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, seed: event.target.value ? Number(event.target.value) : null } }))} placeholder={tr("随机", "Random")} type="number" value={roleEditor.settings.seed ?? ""} /></label>
-                <label><span>{tr("思考档位", "Reasoning effort")}</span><select onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, reasoningEffort: event.target.value } }))} value={roleEditor.settings.reasoningEffort}><option value="">{tr("自动", "Auto")}</option>{reasoningValues.map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+              <div className="role-section-heading">
+                <h3>{tr("推理参数", "Inference parameters")}</h3>
+                <label className="role-inheritance-toggle">
+                  <input
+                    checked={roleEditor.inheritGlobalSettings}
+                    onChange={(event) => {
+                      const enabled = event.target.checked;
+                      setRoleEditor((current) => current && ({
+                        ...current,
+                        inheritGlobalSettings: enabled,
+                        settings: enabled
+                          ? {
+                              ...presetSnapshot(settings.inheritModelDefaults
+                                ? modeTemplateSettings(settings, current.mode, runtime, realtime)
+                                : settings),
+                              systemPrompt: current.settings.systemPrompt,
+                            }
+                          : current.settings,
+                      }));
+                    }}
+                    type="checkbox"
+                  />
+                  <span>{tr("随全局设置", "Use global settings")}</span>
+                </label>
               </div>
-              <div className="role-checks">
-                <label><input checked={thinkingSupported && roleEditor.settings.enableThinking} disabled={!thinkingSupported} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, enableThinking: event.target.checked } }))} type="checkbox" /><span>{tr("默认开启思考", "Enable thinking by default")}</span></label>
-                <label><input checked={roleEditor.settings.excludeReasoning} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, excludeReasoning: event.target.checked } }))} type="checkbox" /><span>{tr("排除历史思考", "Exclude reasoning history")}</span></label>
-              </div>
+              <fieldset className="role-inherited-fields" disabled={roleEditor.inheritGlobalSettings}>
+                <div className="role-form-grid">
+                  <label><span>{tr("最大生成 tokens", "Maximum output tokens")}</span><input min={1} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, maxTokens: Number(event.target.value) } }))} type="number" value={roleEditor.settings.maxTokens} /></label>
+                  <label><span>Temperature</span><input max={2} min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, temperature: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.temperature} /></label>
+                  <label><span>Top P</span><input max={1} min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, topP: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.topP} /></label>
+                  <label><span>Top K</span><input min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, topK: Number(event.target.value) } }))} type="number" value={roleEditor.settings.topK} /></label>
+                  <label><span>Repetition penalty</span><input min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, repetitionPenalty: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.repetitionPenalty} /></label>
+                  <label><span>Presence penalty</span><input max={2} min={-2} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, presencePenalty: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.presencePenalty} /></label>
+                  <label><span>Frequency penalty</span><input max={2} min={-2} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, frequencyPenalty: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.frequencyPenalty} /></label>
+                  <label><span>Seed</span><input min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, seed: event.target.value ? Number(event.target.value) : null } }))} placeholder={tr("随机", "Random")} type="number" value={roleEditor.settings.seed ?? ""} /></label>
+                  <label><span>{tr("思考档位", "Reasoning effort")}</span><select onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, reasoningEffort: event.target.value } }))} value={roleEditor.settings.reasoningEffort}><option value="">{tr("自动", "Auto")}</option>{reasoningValues.map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+                </div>
+                <div className="role-checks">
+                  <label><input checked={thinkingSupported && roleEditor.settings.enableThinking} disabled={!thinkingSupported} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, enableThinking: event.target.checked } }))} type="checkbox" /><span>{tr("默认开启思考", "Enable thinking by default")}</span></label>
+                  <label><input checked={roleEditor.settings.excludeReasoning} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, excludeReasoning: event.target.checked } }))} type="checkbox" /><span>{tr("排除历史思考", "Exclude reasoning history")}</span></label>
+                </div>
+              </fieldset>
             </section>
           </div>
           <footer><button onClick={() => setRoleEditor(null)} type="button">{tr("取消", "Cancel")}</button><button className="primary" disabled={busy || !roleEditor.name.trim()} type="submit">{tr("保存角色", "Save role")}</button></footer>
