@@ -17,6 +17,7 @@ import {
   McpToolResource,
   Message,
   ModelArtifact,
+  ModelDirectoryList,
   RealtimeCapabilities,
   RealtimeFrame,
   ResponseResource,
@@ -49,7 +50,7 @@ import {
   configureStudio,
   isStudio,
   saveStudioCredential,
-  selectLocalModelFile,
+  selectLocalModelDirectory,
   startLocalStudio,
   studioCredential,
   studioStatus,
@@ -752,6 +753,7 @@ type IconName =
   | "edit"
   | "folder"
   | "lightbulb"
+  | "moon"
   | "menu"
   | "paperclip"
   | "play"
@@ -760,6 +762,8 @@ type IconName =
   | "send"
   | "settings"
   | "stop"
+  | "sun"
+  | "sun-moon"
   | "trash"
   | "upload"
   | "volume"
@@ -782,6 +786,7 @@ function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
       {name === "edit" && <><path d="M4 20h4l11-11a2.8 2.8 0 0 0-4-4L4 16z" /><path d="m13.5 6.5 4 4" /></>}
       {name === "folder" && <path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H10l2 2h6.5A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z" />}
       {name === "lightbulb" && <><path d="M9 18h6M10 22h4" /><path d="M8.4 14.7A6 6 0 1 1 15.6 14.7 4.1 4.1 0 0 0 14 18h-4a4.1 4.1 0 0 0-1.6-3.3z" /></>}
+      {name === "moon" && <path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5 8.5 8.5 0 1 0 20.5 14.2z" />}
       {name === "menu" && <><path d="M4 7h16M4 12h16M4 17h16" /></>}
       {name === "paperclip" && <><path d="m20.5 11.5-8.8 8.8a6 6 0 0 1-8.5-8.5l9.5-9.5a4 4 0 0 1 5.7 5.7l-9.6 9.5a2 2 0 0 1-2.8-2.8l8.8-8.8" /></>}
       {name === "play" && <path d="m8 5 11 7-11 7z" fill="currentColor" stroke="none" />}
@@ -790,6 +795,8 @@ function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
       {name === "send" && <><path d="m5 12 7-7 7 7M12 5v14" /></>}
       {name === "settings" && <><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1z" /></>}
       {name === "stop" && <><rect height="9" rx="1" width="9" x="7.5" y="7.5" /></>}
+      {name === "sun" && <><circle cx="12" cy="12" r="3.5" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></>}
+      {name === "sun-moon" && <><path d="M8.5 3.5A6.5 6.5 0 1 0 15 10a5 5 0 0 1-6.5-6.5z" /><path d="M17 3v2M17 9v2M13 7h2M19 7h2" /></>}
       {name === "trash" && <><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5" /></>}
       {name === "upload" && <><path d="M12 21V9" /><path d="m7 14 5-5 5 5" /><path d="M5 3h14" /></>}
       {name === "volume" && <><path d="M11 5 6.5 9H3v6h3.5L11 19z" /><path d="M15 9a4 4 0 0 1 0 6M18 6a8 8 0 0 1 0 12" /></>}
@@ -1327,6 +1334,8 @@ export default function App() {
   const [studio, setStudio] = useState<StudioStatus | null>(null);
   const [studioDraft, setStudioDraft] = useState<StudioConfig | null>(null);
   const [studioOpen, setStudioOpen] = useState(false);
+  const [modelBrowser, setModelBrowser] = useState<ModelDirectoryList | null>(null);
+  const [modelBrowserOpen, setModelBrowserOpen] = useState(false);
   const [studioToken, setStudioToken] = useState("");
   const [editDraft, setEditDraft] = useState<EditDraft | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -1348,7 +1357,7 @@ export default function App() {
     settings.language === "en" ||
     (settings.language === "system" && !navigator.language.toLowerCase().startsWith("zh"));
   const tr = useCallback((zh: string, en: string) => (english ? en : zh), [english]);
-  const canChooseLocalModel = isStudio() && studio?.config.mode !== "remote";
+  const canUseNativeModelPicker = isStudio() && studio?.config.mode !== "remote";
   const panelLabels = useMemo(() => ({
     collapse: tr("收起面板", "Collapse panel"),
     drag: tr("拖动面板", "Drag panel"),
@@ -2760,6 +2769,11 @@ export default function App() {
     setSettingsOpen(false);
   }
 
+  function setUiTheme(theme: UiTheme) {
+    setSettings((current) => ({ ...current, theme }));
+    setSettingsDraft((current) => ({ ...current, theme }));
+  }
+
   function updateGlobalInference(patch: Partial<GenerationSettings>) {
     setSettings((current) => ({
       ...(current.inheritModelDefaults
@@ -3092,18 +3106,15 @@ export default function App() {
     }
   }
 
-  async function chooseLocalModelFile() {
-    if (busy || !canChooseLocalModel) return;
-    setBusy(true);
-    try {
-      const registered = await selectLocalModelFile();
-      if (!registered) return;
-      const nextArtifacts = await api.modelArtifacts(true);
-      setArtifacts(nextArtifacts);
-      const artifact = nextArtifacts.find((item) => item.name === registered.name);
-      if (!artifact) {
-        throw new Error(tr("所选模型没有出现在本地目录中。", "The selected model was not registered in the local catalog."));
-      }
+  async function finishModelRegistration(names: string[]) {
+    const nextArtifacts = await api.modelArtifacts(true);
+    setArtifacts(nextArtifacts);
+    const registered = nextArtifacts.filter((item) => names.includes(item.name));
+    if (!registered.length) {
+      throw new Error(tr("所选目录中的模型没有出现在模型目录中。", "Models from the selected folder were not registered in the catalog."));
+    }
+    if (registered.length === 1) {
+      const artifact = registered[0];
       if (!artifact.loadable) {
         throw new Error(artifact.error || tr("所选模型不完整或无法加载。", "The selected model is incomplete or cannot be loaded."));
       }
@@ -3113,9 +3124,49 @@ export default function App() {
         const accepted = await api.loadModel(artifact.name, contextSize);
         setSelectedJobId(accepted.operation_id);
       }
-      setDashboardPage("models");
-      setView("dashboard");
-      await refreshRuntime(false);
+    }
+    setModelBrowserOpen(false);
+    setDashboardPage("models");
+    setView("dashboard");
+    await refreshRuntime(false);
+  }
+
+  async function openModelDirectory(directoryId?: string | null) {
+    if (busy) return;
+    setBusy(true);
+    try {
+      setModelBrowser(await api.modelDirectories(directoryId));
+      setModelBrowserOpen(true);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function chooseModelDirectory() {
+    if (busy) return;
+    if (!canUseNativeModelPicker) {
+      await openModelDirectory();
+      return;
+    }
+    setBusy(true);
+    try {
+      const names = await selectLocalModelDirectory();
+      if (names) await finishModelRegistration(names);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function registerCurrentModelDirectory() {
+    if (busy || !modelBrowser?.current_id) return;
+    setBusy(true);
+    try {
+      const registered = await api.registerModelDirectory(modelBrowser.current_id);
+      await finishModelRegistration(registered.map((item) => item.name));
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -3288,7 +3339,7 @@ export default function App() {
         <button className="new-session" onClick={createRole} type="button"><Icon name="plus" size={14} />{tr("新角色", "New role")}</button>
         <details className="session-create" open={!model}>
           <summary>{tr("新会话默认设置", "New session defaults")}</summary>
-          {canChooseLocalModel && <button className="open-local-model" disabled={busy} onClick={() => void chooseLocalModelFile()} type="button"><Icon name="folder" size={14} />{tr("打开本地模型", "Open local model")}</button>}
+          <button className="open-local-model" disabled={busy} onClick={() => void chooseModelDirectory()} type="button"><Icon name="folder" size={14} />{tr("打开模型文件夹", "Open model folder")}</button>
           <label htmlFor="new-model">{tr("模型", "Model")}</label>
           <select id="new-model" value={model} onChange={(event) => setModel(event.target.value)}>
             {(models.length ? models : [{ id: model }]).map((item) => <option key={item.id} value={item.id}>{item.id}</option>)}
@@ -3337,7 +3388,6 @@ export default function App() {
             <button className={labPage === "quantization" ? "active" : ""} onClick={() => openStudioPage("lab", "quantization")} type="button">{tr("量化工作台", "Quantization workspace")}</button>
           </nav>
         </div>
-        <div className={`connection-card ${studio?.reachable === false ? "offline" : ""}`}><span /><div><strong>{studio?.reachable === false ? tr("离线", "Offline") : tr("在线", "Online")}</strong><small>{studio?.service_url || window.location.origin}</small></div></div>
       </aside>
       <button aria-label={tr("关闭侧栏", "Close sidebar")} className={`mobile-scrim ${sidebarOpen ? "open" : ""}`} onClick={() => setSidebarOpen(false)} type="button" />
 
@@ -3350,7 +3400,12 @@ export default function App() {
           <div className="topbar-actions">
             {capabilities && <div className="capabilities">{CAPABILITY_LABELS.filter(([feature]) => capabilities.model_capabilities.features[feature]).map(([feature, label]) => <span className={feature === "full_duplex" && !realtimeAvailable ? "muted" : ""} key={feature}>{label[english ? 1 : 0]}</span>)}</div>}
             <div className="quick-metrics"><span><b>{lastTtftMs == null ? "--" : `${formatNumber(lastTtftMs, 1)} ms`}</b> TTFT</span><span><b>{last ? formatNumber(contextTokens) : "--"}</b> context</span><span><b>{last?.decode_tps == null ? "--" : formatNumber(last.decode_tps, 1)}</b> tok/s</span></div>
-            {canChooseLocalModel && <button aria-label={tr("打开本地模型", "Open local model")} disabled={busy} onClick={() => void chooseLocalModelFile()} title={tr("选择本地模型文件", "Choose a local model file")} type="button"><Icon name="folder" /></button>}
+            <div aria-label={tr("外观", "Appearance")} className="theme-switcher" role="group">
+              <button aria-label={tr("自动主题", "Auto theme")} aria-pressed={settings.theme === "system"} onClick={() => setUiTheme("system")} title={tr("跟随系统", "Auto")} type="button"><Icon name="sun-moon" size={13} /><span>Auto</span></button>
+              <button aria-label={tr("浅色主题", "Light theme")} aria-pressed={settings.theme === "light"} onClick={() => setUiTheme("light")} title={tr("浅色", "Light")} type="button"><Icon name="sun" size={13} /><span>Light</span></button>
+              <button aria-label={tr("深色主题", "Dark theme")} aria-pressed={settings.theme === "dark"} onClick={() => setUiTheme("dark")} title={tr("深色", "Dark")} type="button"><Icon name="moon" size={13} /><span>Dark</span></button>
+            </div>
+            <button aria-label={tr("打开模型文件夹", "Open model folder")} disabled={busy} onClick={() => void chooseModelDirectory()} title={tr("选择包含 MFQ 模型的文件夹", "Choose a folder containing MFQ models")} type="button"><Icon name="folder" /></button>
             <button aria-label={tr("导出会话", "Export chat")} disabled={!active} onClick={exportConversation} title={tr("导出会话", "Export chat")} type="button"><Icon name="download" /></button>
             <button aria-label={tr("推理设置", "Inference settings")} onClick={openSettings} title={tr("推理设置", "Inference settings")} type="button"><Icon name="settings" /></button>
           </div>
@@ -3360,7 +3415,7 @@ export default function App() {
           <section className="chat-view">
             <div className="message-scroller" onScroll={handleMessageScroll} ref={messageScrollerRef}>
               <div className="message-list" aria-live="polite">
-                {!active && <div className="welcome"><img src="/mfq-mark.svg" alt="" />{!model ? <><h1>{tr("加载模型", "Load a model")}</h1><p>{tr("加载本地模型或连接模型服务后即可开始。", "Load a local model or connect to a model server to get started.")}</p>{canChooseLocalModel && <button className="open-model-primary" disabled={busy} onClick={() => void chooseLocalModelFile()} type="button"><Icon name="folder" />{tr("选择本地模型", "Choose local model")}</button>}</> : <><h1>MFQ Studio</h1><p>{tr("创建会话后即可开始本地推理。", "Create a session to start local inference.")}</p><div className="prompt-grid"><button onClick={() => setDraft(tr("介绍一下这个模型。", "Introduce this model."))} type="button">{tr("介绍模型", "Introduce the model")}</button><button onClick={() => setDraft(tr("写一段 Python 示例。", "Write a Python example."))} type="button">{tr("代码示例", "Code example")}</button></div></>}</div>}
+                {!active && <div className="welcome"><img src="/mfq-mark.svg" alt="" />{!model ? <><h1>{tr("加载模型", "Load a model")}</h1><p>{tr("从服务器文件夹加载模型，或连接已有模型服务。", "Load a model from a server folder or connect to an existing model server.")}</p><button className="open-model-primary" disabled={busy} onClick={() => void chooseModelDirectory()} type="button"><Icon name="folder" />{tr("选择模型文件夹", "Choose model folder")}</button></> : <><h1>MFQ Studio</h1><p>{tr("创建会话后即可开始本地推理。", "Create a session to start local inference.")}</p><div className="prompt-grid"><button onClick={() => setDraft(tr("介绍一下这个模型。", "Introduce this model."))} type="button">{tr("介绍模型", "Introduce the model")}</button><button onClick={() => setDraft(tr("写一段 Python 示例。", "Write a Python example."))} type="button">{tr("代码示例", "Code example")}</button></div></>}</div>}
                 {messages.map((message) => {
                   const parts = textParts(message);
                   const editing = editDraft?.messageId === message.id;
@@ -3423,7 +3478,7 @@ export default function App() {
               <section className="dashboard-panel profile-panel" key="profiles"><div className="panel-heading"><div><h2>{tr("运行配置档案", "Runtime profiles")}</h2><p>{tr("将加载参数和采样默认值绑定到模型产物", "Bind load and sampling defaults to a model artifact")}</p></div><b>{runtimeProfiles.length}</b></div><div className="profile-create"><input maxLength={64} onChange={(event) => setProfileName(event.target.value)} placeholder={tr("当前配置名称", "Current configuration name")} value={profileName} /><button disabled={busy || !profileName.trim() || !artifacts.some((item) => item.name === runtime?.model)} onClick={() => void saveRuntimeProfile()} type="button">{tr("保存当前配置", "Save current")}</button></div>{runtimeProfiles.length > 0 && <div className="profile-list">{runtimeProfiles.map((profile) => <div className={`profile-row ${profile.drifted ? "drifted" : ""}`} key={profile.id}><div><strong>{profile.name}</strong><small>{profile.load.context_size.toLocaleString()} ctx · {profile.load.prefill_chunk_size.toLocaleString()} chunk{profile.drifted ? ` · ${tr("模型已变化", "artifact changed")}` : ""}</small></div><button disabled={busy} onClick={() => void loadRuntimeProfile(profile)} type="button">{tr("加载", "Load")}</button><button aria-label={tr("删除配置档案", "Delete profile")} disabled={busy} onClick={() => void deleteRuntimeProfile(profile.id)} type="button"><Icon name="trash" size={14} /></button></div>)}</div>}</section>
             </PanelDeck>}
             {dashboardPage === "models" && <PanelDeck labels={panelLabels} page="dashboard-models" resetVersion={dashboardLayoutReset}>
-              <section className="dashboard-panel" key="catalog"><div className="panel-heading"><div><h2>{tr("模型目录", "Model catalog")}</h2></div><div className="panel-heading-actions">{studio?.config.mode === "local" && <button disabled={busy} onClick={() => void chooseLocalModelFile()} type="button">{tr("选择本地 MFQ", "Choose local MFQ")}</button>}<b>{artifacts.length}</b></div></div>{artifacts.length > 0 && <div className="model-list">{artifacts.slice(0, 8).map((item) => { const instance = instances.find((candidate) => candidate.model === item.name && candidate.state !== "failed"); const loaded = Boolean(instance) || item.name === runtime?.model; return <div className="model-row" key={item.id}><span className={loaded ? "model-state active" : item.loadable ? "model-state" : "model-state failed"} /><div><strong>{item.name}</strong><small>{item.architecture} · {item.shard_count} shards · {formatNumber(item.total_bytes / 2 ** 30, 1)} GB</small></div>{instance ? <button disabled={busy || instance.state === "busy"} onClick={() => void unloadInstance(instance.id)} type="button">{tr("卸载", "Unload")}</button> : loaded ? <em>{tr("已加载", "Loaded")}</em> : !item.loadable ? <em className="failed">{tr("不可用", "Invalid")}</em> : <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">{tr("加载", "Load")}</button>}</div>; })}</div>}</section>
+              <section className="dashboard-panel" key="catalog"><div className="panel-heading"><div><h2>{tr("模型目录", "Model catalog")}</h2></div><div className="panel-heading-actions"><button disabled={busy} onClick={() => void chooseModelDirectory()} type="button">{tr("添加模型文件夹", "Add model folder")}</button><b>{artifacts.length}</b></div></div>{artifacts.length > 0 && <div className="model-list">{artifacts.slice(0, 8).map((item) => { const instance = instances.find((candidate) => candidate.model === item.name && candidate.state !== "failed"); const loaded = Boolean(instance) || item.name === runtime?.model; return <div className="model-row" key={item.id}><span className={loaded ? "model-state active" : item.loadable ? "model-state" : "model-state failed"} /><div><strong>{item.name}</strong><small>{item.architecture} · {item.shard_count} shards · {formatNumber(item.total_bytes / 2 ** 30, 1)} GB</small></div>{instance ? <button disabled={busy || instance.state === "busy"} onClick={() => void unloadInstance(instance.id)} type="button">{tr("卸载", "Unload")}</button> : loaded ? <em>{tr("已加载", "Loaded")}</em> : !item.loadable ? <em className="failed">{tr("不可用", "Invalid")}</em> : <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">{tr("加载", "Load")}</button>}</div>; })}</div>}</section>
               <section className="dashboard-panel" key="requests"><div className="panel-heading"><div><h2>{tr("最近请求", "Recent requests")}</h2></div></div>{requestHistory.length > 0 && <div className="request-table">{requestHistory.slice(0, 8).map((request) => <div className="request-row" key={request.id}><div><strong>{request.id}</strong><small>{request.completed_at ? new Date(request.completed_at * 1000).toLocaleTimeString() : request.endpoint || "completion"}</small></div><span>{formatNumber(request.prompt_tokens)} → {formatNumber(request.completion_tokens)}</span><b>{formatNumber(request.decode_tps, 1)} tok/s</b></div>)}</div>}</section>
               <section className="dashboard-panel" key="jobs"><div className="panel-heading"><div><h2>{tr("后台任务", "Background jobs")}</h2></div><b>{jobs.length}</b></div>{jobs.length > 0 && <div className="request-table">{jobs.slice(0, 8).map((job) => <div className="job-row" key={job.id}><div><strong>{job.kind}</strong><small>{new Date(job.updated_at).toLocaleTimeString()} · {job.status}</small></div><progress max={1} value={job.progress} /><b>{formatNumber(job.progress * 100)}%</b></div>)}</div>}</section>
               <section className="dashboard-panel" key="logs"><div className="panel-heading"><div><h2>{tr("Runtime 日志", "Runtime logs")}</h2></div><b>{runtimeLogs.length}</b></div>{runtimeLogs.length > 0 && <div className="runtime-log-list">{runtimeLogs.slice(-8).reverse().map((entry) => <div className={`runtime-log ${entry.level}`} key={entry.sequence}><span>{new Date(entry.created_at).toLocaleTimeString()}</span><p>{entry.message}</p></div>)}</div>}</section>
@@ -3642,6 +3697,7 @@ export default function App() {
         </aside>
       </>}
 
+      {modelBrowserOpen && modelBrowser && <div className="dialog-backdrop"><section className="studio-dialog model-browser-dialog"><header><div><h2>{tr("选择模型文件夹", "Choose model folder")}</h2><p>{tr("浏览 MFQ Server 所在设备上的文件夹。", "Browse folders on the MFQ Server host.")}</p></div><button onClick={() => setModelBrowserOpen(false)} type="button">×</button></header><div className="model-browser-location"><button disabled={busy || !modelBrowser.current_id} onClick={() => void openModelDirectory(modelBrowser.parent_id)} type="button">{tr("上一级", "Up")}</button><strong>{modelBrowser.current_name ?? tr("位置", "Locations")}</strong>{modelBrowser.current_id && <span>{modelBrowser.model_file_count} MFQ</span>}</div><div className="model-browser-list">{modelBrowser.data.map((directory) => <button disabled={busy} key={directory.id} onClick={() => void openModelDirectory(directory.id)} type="button"><Icon name="folder" /><span>{directory.name}</span>{directory.model_file_count > 0 && <b>{directory.model_file_count} MFQ</b>}</button>)}{modelBrowser.data.length === 0 && <p>{tr("这个文件夹中没有子文件夹。", "This folder has no subfolders.")}</p>}</div><footer><button onClick={() => setModelBrowserOpen(false)} type="button">{tr("取消", "Cancel")}</button><button className="primary" disabled={busy || !modelBrowser.current_id} onClick={() => void registerCurrentModelDirectory()} type="button">{tr("使用此文件夹", "Use this folder")}</button></footer></section></div>}
       {studioOpen && studioDraft && <div className="dialog-backdrop"><form className="studio-dialog" onSubmit={saveStudioSettings}><header><div><h2>{tr("Runtime 连接", "Runtime connection")}</h2><p>{tr("MFQ Studio 关闭后，MFQ Server 会继续运行。", "MFQ Server keeps running after MFQ Studio closes.")}</p></div><button onClick={() => setStudioOpen(false)} type="button">×</button></header><div className="segmented">{(["local", "remote"] as const).map((item) => <button aria-pressed={studioDraft.mode === item} key={item} onClick={() => setStudioDraft((current) => current && ({ ...current, mode: item }))} type="button">{item === "local" ? "Local MFQ Server" : "Remote MFQ Server"}</button>)}</div>{studioDraft.mode === "local" ? <><label><span>MFQ Server port</span><input max={65535} min={1} onChange={(event) => setStudioDraft((current) => current && ({ ...current, local_service_port: Number(event.target.value) }))} required type="number" value={studioDraft.local_service_port} /></label></> : <><label><span>Remote MFQ Server URL</span><input onChange={(event) => setStudioDraft((current) => current && ({ ...current, remote_url: event.target.value }))} required type="url" value={studioDraft.remote_url} /></label><label><span>Remote MFQ Server API key</span><input autoComplete="off" onChange={(event) => setStudioToken(event.target.value)} placeholder={tr("保存在系统凭据库", "Stored in the system credential vault")} type="password" value={studioToken} /></label></>}<div className="dialog-status"><span className={studio?.reachable ? "online" : "offline"} />{studio?.reachable ? `${tr("已连接", "Connected")}: ${studio.service_url}` : tr("MFQ Server 离线", "MFQ Server is offline")}</div><footer><button onClick={() => setStudioOpen(false)} type="button">{tr("取消", "Cancel")}</button><button className="primary" disabled={busy} type="submit">{tr("应用", "Apply")}</button></footer></form></div>}
 
       {roleEditor && <div className="dialog-backdrop role-dialog-backdrop" onMouseDown={(event) => {

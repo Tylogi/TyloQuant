@@ -157,6 +157,8 @@ def test_openapi_contract_has_all_native_routes_and_realtime_extension() -> None
         "/api/v1/mcp/tools",
         "/api/v1/mcp/tools/call",
         "/api/v1/models",
+        "/api/v1/models/directories",
+        "/api/v1/models/directories/register",
         "/api/v1/models/load",
         "/api/v1/models/unload",
         "/api/v1/hub/models",

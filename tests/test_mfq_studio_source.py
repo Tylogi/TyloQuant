@@ -52,16 +52,19 @@ def test_studio_supports_local_and_remote_server_connections_with_voice_controls
     assert "RuntimeMode::Remote" in RUST
     assert "studio_configure" in RUST
     assert "studio_start_local" in RUST
-    assert "studio_select_model_file" in RUST
-    assert "selectLocalModelFile" in APP
-    assert "const canChooseLocalModel = isStudio()" in APP
-    assert 'tr("选择本地模型文件", "Choose a local model file")' in APP
-    assert 'tr("加载本地模型或连接模型服务后即可开始。", "Load a local model or connect to a model server to get started.")' in APP
-    assert 'tr("选择本地模型", "Choose local model")' in APP
+    assert "studio_select_model_directory" in RUST
+    assert "selectLocalModelDirectory" in APP
+    assert "/api/v1/models/directories/register" in RUST
+    assert ".mfq-files.json" not in RUST
+    assert "canUseNativeModelPicker" in APP
+    assert 'tr("选择包含 MFQ 模型的文件夹", "Choose a folder containing MFQ models")' in APP
+    assert 'tr("从服务器文件夹加载模型，或连接已有模型服务。", "Load a model from a server folder or connect to an existing model server.")' in APP
+    assert 'tr("选择模型文件夹", "Choose model folder")' in APP
     assert "访达" not in APP
     assert "Finder" not in APP
     assert 'className="open-local-model"' in APP
-    assert APP.count("chooseLocalModelFile()") >= 4
+    assert APP.count("chooseModelDirectory()") >= 4
+    assert "registerCurrentModelDirectory" in APP
     assert "Object.keys(MODE_LABELS)" not in APP
     assert "RealtimeAudioController" in APP
     assert '(["text", "voice", "full_duplex"] as SessionMode[])' in APP
@@ -116,6 +119,15 @@ def test_studio_defaults_global_and_role_editors_to_inherited_parameters():
     assert 'typeof preset.metadata?.inherit_global_settings === "boolean"' in APP
     assert ".settings-inherited-fields:disabled section" in STYLES
     assert ".role-inherited-fields:disabled" in STYLES
+
+
+def test_studio_exposes_theme_selection_without_using_sidebar_status_space():
+    assert 'className="theme-switcher"' in APP
+    assert 'onClick={() => setUiTheme("system")}' in APP
+    assert 'onClick={() => setUiTheme("light")}' in APP
+    assert 'onClick={() => setUiTheme("dark")}' in APP
+    assert "connection-card" not in APP
+    assert ".connection-card" not in STYLES
 
 
 def test_realtime_turns_remain_bound_to_the_session_that_created_them():

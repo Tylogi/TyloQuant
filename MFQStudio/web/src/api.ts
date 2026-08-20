@@ -286,6 +286,20 @@ export interface ModelArtifact {
   error?: string | null;
 }
 
+export interface ModelDirectoryEntry {
+  id: string;
+  name: string;
+  model_file_count: number;
+}
+
+export interface ModelDirectoryList {
+  current_id: string | null;
+  current_name: string | null;
+  parent_id: string | null;
+  model_file_count: number;
+  data: ModelDirectoryEntry[];
+}
+
 export interface RuntimeInstance {
   id: string;
   model: string;
@@ -781,6 +795,20 @@ export const api = {
       await request<{ data: ModelArtifact[] }>(
         `/api/v1/models${refresh ? "?refresh=true" : ""}`,
       )
+    ).data;
+  },
+
+  modelDirectories(directoryId?: string | null): Promise<ModelDirectoryList> {
+    const query = directoryId ? `?directory_id=${encodeURIComponent(directoryId)}` : "";
+    return request(`/api/v1/models/directories${query}`);
+  },
+
+  async registerModelDirectory(directoryId: string): Promise<ModelArtifact[]> {
+    return (
+      await request<{ data: ModelArtifact[] }>("/api/v1/models/directories/register", {
+        method: "POST",
+        body: JSON.stringify({ directory_id: directoryId }),
+      })
     ).data;
   },
 

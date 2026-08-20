@@ -202,8 +202,12 @@ def _run(args: argparse.Namespace) -> int:
     configured_roots = [path.expanduser().resolve() for path in args.model_dir]
     if not configured_roots:
         configured_roots = _environment_paths("MFQ_SERVER_MODEL_DIRS")
+    if not configured_roots:
+        configured_roots = [args.work_dir.expanduser().resolve() / "models"]
+    configured_roots = [path.expanduser().resolve() for path in configured_roots]
     if model is not None and model.parent not in configured_roots:
         configured_roots.append(model.parent)
+    configured_roots[0].mkdir(parents=True, exist_ok=True)
     catalog = ModelCatalog(configured_roots)
     runtime = None
     try:

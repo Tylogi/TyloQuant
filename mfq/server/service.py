@@ -14,7 +14,13 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from mfq.server.backend import BackendDelta, BackendError, BackendToolCallDelta, ChatBackend
-from mfq.server.catalog import ModelArtifactNotFoundError, ModelCatalog
+from mfq.server.catalog import (
+    DuplicateModelNameError,
+    ModelArtifactNotFoundError,
+    ModelCatalog,
+    ModelDirectoryNotFoundError,
+    ModelRegistrationError,
+)
 from mfq.server.documents import DocumentExtractionError, extract_document
 from mfq.server.hub import HubCatalog, HubError, HubProvider
 from mfq.server.jobs import (
@@ -74,6 +80,7 @@ from mfq.server.models import (
     MessageList,
     MessageRole,
     ModelArtifactList,
+    ModelDirectoryList,
     ModelLoadRequest,
     ModelUnloadRequest,
     OperationAccepted,
@@ -82,6 +89,7 @@ from mfq.server.models import (
     RealtimeFrame,
     RealtimePayload,
     ReasoningPart,
+    RegisterModelDirectoryRequest,
     RemoteNodeList,
     RemoteNodeResource,
     ResponseCompleted,
@@ -890,6 +898,52 @@ class ServerService:
         if self.catalog is None:
             return ModelArtifactList(data=[])
         return await self.catalog.list(refresh=refresh)
+
+    async def model_directories(
+        self,
+        *,
+        directory_id: str | None = None,
+    ) -> ModelDirectoryList:
+        if self.catalog is None:
+            raise ServiceError(
+                501,
+                "model_catalog_unavailable",
+                "model directory browsing is not available",
+            )
+        try:
+            return await self.catalog.browse_directories(directory_id)
+        except ModelDirectoryNotFoundError as error:
+            raise ServiceError(
+                404,
+                "model_directory_not_found",
+                "model directory is unavailable",
+            ) from error
+
+    async def register_model_directory(
+        self,
+        request: RegisterModelDirectoryRequest,
+    ) -> ModelArtifactList:
+        if self.catalog is None:
+            raise ServiceError(
+                501,
+                "model_catalog_unavailable",
+                "model directory registration is not available",
+            )
+        try:
+            return await self.catalog.register_directory(
+                directory_id=request.directory_id,
+                path=request.path,
+            )
+        except ModelDirectoryNotFoundError as error:
+            raise ServiceError(
+                404,
+                "model_directory_not_found",
+                "model directory is unavailable",
+            ) from error
+        except ModelRegistrationError as error:
+            raise ServiceError(400, "model_registration_failed", str(error)) from error
+        except DuplicateModelNameError as error:
+            raise ServiceError(409, "duplicate_model_name", str(error)) from error
 
     async def artifact_lineage(
         self, *, artifact_uri: str | None, limit: int

@@ -44,7 +44,20 @@ def test_scoped_keys_rotate_revoke_and_never_persist_plaintext(tmp_path: Path) -
             operator_header = {"Authorization": f"Bearer {operator.json()['token']}"}
             assert (await client.get("/api/v1/jobs", headers=operator_header)).status_code == 501
             assert (
+                await client.get("/api/v1/models/directories", headers=operator_header)
+            ).status_code == 501
+            assert (
                 await client.get("/api/v1/auth/keys", headers=operator_header)
+            ).status_code == 403
+
+            viewer = await client.post(
+                "/api/v1/auth/keys",
+                headers=root,
+                json={"name": "viewer", "role": "viewer"},
+            )
+            viewer_header = {"Authorization": f"Bearer {viewer.json()['token']}"}
+            assert (
+                await client.get("/api/v1/models/directories", headers=viewer_header)
             ).status_code == 403
 
             rotated = await client.post(f"/api/v1/auth/keys/{key_id}/rotate", headers=root)

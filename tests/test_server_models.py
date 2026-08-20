@@ -174,6 +174,112 @@ def test_catalog_expands_registered_external_shard_set(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
+def test_common_server_browses_and_registers_external_model_directories(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        model_dir = tmp_path / "catalog"
+        model_dir.mkdir()
+        external_dir = tmp_path / "external-model"
+        external_dir.mkdir()
+        _model(external_dir / "portable.mfq", architecture="qwen35")
+        native_picker_dir = tmp_path / "native-picker-model"
+        native_picker_dir.mkdir()
+        _model(native_picker_dir / "desktop.mfq", architecture="minicpmo45")
+        catalog = ModelCatalog(
+            [model_dir],
+            cache_seconds=0,
+            browse_roots=[external_dir],
+        )
+        service = ServerService(
+            SessionStore(tmp_path / "mfq.server.sqlite3"),
+            IdleBackend(),
+            catalog=catalog,
+        )
+        transport = httpx.ASGITransport(app=create_app(service))
+        try:
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                roots = await client.get("/api/v1/models/directories")
+                assert roots.status_code == 200
+                assert [entry["name"] for entry in roots.json()["data"]] == ["external-model"]
+                directory_id = roots.json()["data"][0]["id"]
+
+                listing = await client.get(
+                    "/api/v1/models/directories",
+                    params={"directory_id": directory_id},
+                )
+                assert listing.status_code == 200
+                assert listing.json()["current_name"] == "external-model"
+                assert listing.json()["model_file_count"] == 1
+
+                registered = await client.post(
+                    "/api/v1/models/directories/register",
+                    json={"directory_id": directory_id},
+                )
+                assert registered.status_code == 200
+                assert [artifact["name"] for artifact in registered.json()["data"]] == [
+                    "portable"
+                ]
+                assert registered.json()["data"][0]["loadable"]
+
+                native_registered = await client.post(
+                    "/api/v1/models/directories/register",
+                    json={"path": str(native_picker_dir)},
+                )
+                assert native_registered.status_code == 200
+                assert [
+                    artifact["name"] for artifact in native_registered.json()["data"]
+                ] == ["desktop"]
+                models = await client.get("/api/v1/models", params={"refresh": True})
+                assert [artifact["name"] for artifact in models.json()["data"]] == [
+                    "desktop",
+                    "portable",
+                ]
+                index = json.loads((model_dir / ".mfq-files.json").read_text())
+                assert index["version"] == 1
+                assert index["files"] == sorted(
+                    [
+                        str(external_dir / "portable.mfq"),
+                        str(native_picker_dir / "desktop.mfq"),
+                    ]
+                )
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+def test_common_server_rejects_directories_without_mfq_models(tmp_path: Path) -> None:
+    async def run() -> None:
+        model_dir = tmp_path / "catalog"
+        model_dir.mkdir()
+        empty_dir = tmp_path / "empty"
+        empty_dir.mkdir()
+        catalog = ModelCatalog([model_dir], cache_seconds=0, browse_roots=[empty_dir])
+        service = ServerService(
+            SessionStore(tmp_path / "mfq.server.sqlite3"),
+            IdleBackend(),
+            catalog=catalog,
+        )
+        transport = httpx.ASGITransport(app=create_app(service))
+        try:
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                directory_id = (await client.get("/api/v1/models/directories")).json()[
+                    "data"
+                ][0]["id"]
+                response = await client.post(
+                    "/api/v1/models/directories/register",
+                    json={"directory_id": directory_id},
+                )
+                assert response.status_code == 400
+                assert response.json()["error"]["code"] == "model_registration_failed"
+                assert not (model_dir / ".mfq-files.json").exists()
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
+
+
 def test_empty_runtime_pool_reports_idle_state(tmp_path: Path) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"

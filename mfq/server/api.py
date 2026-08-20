@@ -65,9 +65,11 @@ from mfq.server.models import (
     MediaResource,
     MessageList,
     ModelArtifactList,
+    ModelDirectoryList,
     ModelLoadRequest,
     ModelUnloadRequest,
     OperationAccepted,
+    RegisterModelDirectoryRequest,
     RemoteNodeList,
     RemoteNodeResource,
     ResponseList,
@@ -837,6 +839,31 @@ def create_app(
     )
     async def model_artifacts(refresh: bool = False) -> ModelArtifactList:
         return await require_service().model_artifacts(refresh=refresh)
+
+    @app.get(
+        "/api/v1/models/directories",
+        response_model=ModelDirectoryList,
+        responses=ERROR_RESPONSES,
+        tags=["models"],
+    )
+    async def model_directories(
+        directory_id: Annotated[
+            str | None,
+            Query(pattern=r"^[0-9a-f]{32}$"),
+        ] = None,
+    ) -> ModelDirectoryList:
+        return await require_service().model_directories(directory_id=directory_id)
+
+    @app.post(
+        "/api/v1/models/directories/register",
+        response_model=ModelArtifactList,
+        responses=ERROR_RESPONSES,
+        tags=["models"],
+    )
+    async def register_model_directory(
+        body: RegisterModelDirectoryRequest,
+    ) -> ModelArtifactList:
+        return await require_service().register_model_directory(body)
 
     @app.get(
         "/api/v1/artifacts/lineage",
