@@ -182,9 +182,9 @@ Bearer 凭据。
 
 ### 3.1 创建、读取和修改会话
 
-**接口描述**：创建会话。  
-**请求方式**：<code>POST</code>  
-**请求地址**：<code>/api/v1/sessions</code>  
+**接口描述**：创建会话。<br>
+**请求方式**：<code>POST</code><br>
+**请求地址**：<code>/api/v1/sessions</code><br>
 **成功响应**：<code>201 SessionResource</code>
 
 | Body 字段 | 类型 | 必填 | 默认值 | 描述 |
@@ -266,8 +266,8 @@ Bearer 凭据。
 ### 3.3 创建生成响应
 
 **接口描述**：在会话内追加输入并生成 assistant 响应；使用同一 <code>request_id</code> 可避免
-网络重试造成重复生成。  
-**请求方式**：<code>POST</code>  
+网络重试造成重复生成。<br>
+**请求方式**：<code>POST</code><br>
 **请求地址**：<code>/api/v1/sessions/{session_id}/responses</code>
 
 | Body 字段 | 类型 | 必填 | 默认值 | 描述 |
@@ -413,7 +413,7 @@ JSON Schema 名称使用同一函数名规则，<code>description</code> 可选�
 
 ### 4.2 媒体上传和读取
 
-**上传接口**：<code>POST /api/v1/media</code>  
+**上传接口**：<code>POST /api/v1/media</code><br>
 **成功响应**：<code>201 MediaResource</code>
 
 | 位置 | 参数 | 类型 | 必填 | 描述 |
@@ -802,7 +802,7 @@ data: <JobEventResource JSON>
 
 ## 12. 健康检查
 
-**请求方式**：<code>GET</code>  
+**请求方式**：<code>GET</code><br>
 **请求地址**：<code>/health</code>
 
 ~~~
