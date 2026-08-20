@@ -12,7 +12,6 @@ const DATABASE_FILE: &str = "mfq-server.sqlite3";
 const LOG_FILE: &str = "mfq-server.log";
 const PID_FILE: &str = "mfq-server.pid";
 const MODEL_DIRECTORY: &str = "models";
-const MODEL_FILE_INDEX: &str = ".mfq-files.json";
 const CREDENTIAL_SERVICE: &str = "MFQ Studio";
 const CREDENTIAL_ACCOUNT: &str = "mfq-server-api-key";
 
@@ -47,25 +46,14 @@ struct StudioStatus {
     managed_pid: Option<u32>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct ModelFileIndex {
-    version: u8,
-    files: Vec<String>,
-}
-
-impl Default for ModelFileIndex {
-    fn default() -> Self {
-        Self {
-            version: 1,
-            files: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize)]
 struct RegisteredModel {
     name: String,
-    file_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisteredModelList {
+    data: Vec<RegisteredModel>,
 }
 
 #[derive(Default)]
@@ -120,72 +108,6 @@ fn save_config(app: &AppHandle, config: &StudioConfig) -> Result<(), String> {
     let path = config_path(app)?;
     let bytes = serde_json::to_vec_pretty(config).map_err(|error| error.to_string())?;
     fs::write(path, bytes).map_err(|error| error.to_string())
-}
-
-fn catalog_model_name(path: &Path) -> Result<String, String> {
-    let is_mfq = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.eq_ignore_ascii_case("mfq"))
-        .unwrap_or(false);
-    if !is_mfq {
-        return Err("selected file must have the .mfq extension".into());
-    }
-    let stem = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| "selected MFQ file name is not valid UTF-8".to_string())?;
-    if let Some((prefix_and_index, count)) = stem.rsplit_once("-of-") {
-        if count.len() == 5 && count.chars().all(|value| value.is_ascii_digit()) {
-            if let Some((prefix, index)) = prefix_and_index.rsplit_once('-') {
-                if index.len() == 5 && index.chars().all(|value| value.is_ascii_digit()) {
-                    return Ok(prefix.to_string());
-                }
-            }
-        }
-    }
-    Ok(stem.to_string())
-}
-
-fn register_model_file(app: &AppHandle, selected: &Path) -> Result<RegisteredModel, String> {
-    let selected = selected
-        .canonicalize()
-        .map_err(|error| format!("cannot open selected MFQ file: {error}"))?;
-    if !selected.is_file() {
-        return Err("selected MFQ path is not a file".into());
-    }
-    let name = catalog_model_name(&selected)?;
-    let file_name = selected
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| "selected MFQ file name is not valid UTF-8".to_string())?
-        .to_string();
-    let selected_text = selected
-        .to_str()
-        .ok_or_else(|| "selected MFQ path is not valid UTF-8".to_string())?
-        .to_string();
-    let model_dir = app_data_dir(app)?.join(MODEL_DIRECTORY);
-    fs::create_dir_all(&model_dir).map_err(|error| error.to_string())?;
-    let index_path = model_dir.join(MODEL_FILE_INDEX);
-    let mut index = if index_path.is_file() {
-        let bytes = fs::read(&index_path).map_err(|error| error.to_string())?;
-        serde_json::from_slice::<ModelFileIndex>(&bytes).map_err(|error| error.to_string())?
-    } else {
-        ModelFileIndex::default()
-    };
-    if index.version != 1 {
-        return Err(format!(
-            "unsupported MFQ model index version: {}",
-            index.version
-        ));
-    }
-    if !index.files.contains(&selected_text) {
-        index.files.push(selected_text);
-        index.files.sort();
-    }
-    let bytes = serde_json::to_vec_pretty(&index).map_err(|error| error.to_string())?;
-    fs::write(index_path, bytes).map_err(|error| error.to_string())?;
-    Ok(RegisteredModel { name, file_name })
 }
 
 fn local_service_url(config: &StudioConfig) -> String {
@@ -469,19 +391,47 @@ async fn studio_start_local(
 }
 
 #[tauri::command]
-async fn studio_select_model_file(app: AppHandle) -> Result<Option<RegisteredModel>, String> {
-    if !matches!(load_config(&app)?.mode, RuntimeMode::Local) {
-        return Err("manual MFQ file loading is available only for the local server".into());
+async fn studio_select_model_directory(app: AppHandle) -> Result<Option<Vec<String>>, String> {
+    let config = load_config(&app)?;
+    if !matches!(config.mode, RuntimeMode::Local) {
+        return Err("the native directory picker is available only for the local server".into());
     }
     let selected = rfd::AsyncFileDialog::new()
-        .set_title("Select an MFQ model")
-        .add_filter("MFQ model", &["mfq"])
-        .pick_file()
+        .set_title("Select a folder containing MFQ models")
+        .pick_folder()
         .await;
-    match selected {
-        Some(file) => register_model_file(&app, file.path()).map(Some),
-        None => Ok(None),
+    let Some(directory) = selected else {
+        return Ok(None);
+    };
+    let path = directory
+        .path()
+        .to_str()
+        .ok_or_else(|| "selected model directory is not valid UTF-8".to_string())?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .post(format!(
+            "{}/api/v1/models/directories/register",
+            local_service_url(&config)
+        ))
+        .json(&serde_json::json!({"path": path}))
+        .send()
+        .await
+        .map_err(|error| format!("failed to register model directory: {error}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        return Err(format!("model directory registration failed ({status}): {detail}"));
     }
+    let registered = response
+        .json::<RegisteredModelList>()
+        .await
+        .map_err(|error| format!("invalid model registration response: {error}"))?;
+    Ok(Some(
+        registered.data.into_iter().map(|model| model.name).collect(),
+    ))
 }
 
 #[tauri::command]
@@ -517,7 +467,7 @@ fn main() {
             studio_status,
             studio_configure,
             studio_start_local,
-            studio_select_model_file,
+            studio_select_model_directory,
             studio_credential_get,
             studio_credential_set
         ])

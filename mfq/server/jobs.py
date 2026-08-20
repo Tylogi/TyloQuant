@@ -301,6 +301,12 @@ class JobManager:
             CreateJobRequest(kind=previous.kind, payload=dict(previous.payload))
         )
 
+    async def archive(self, job_id: UUID) -> None:
+        await asyncio.to_thread(self.store.archive_job, job_id)
+
+    async def archive_completed(self) -> int:
+        return await asyncio.to_thread(self.store.archive_completed_jobs)
+
     def _schedule(self, job_id: UUID) -> None:
         if self._closing or job_id in self._tasks:
             return

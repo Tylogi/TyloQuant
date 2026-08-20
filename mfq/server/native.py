@@ -3,17 +3,57 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import subprocess
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 
 class NativeRuntimeError(RuntimeError):
     """Raised when the private native worker cannot be started."""
+
+
+def find_native_runtime_resource(executable: str | Path, name: str) -> Path | None:
+    """Find a native resource in build, release, or application layouts."""
+
+    executable_path = Path(executable).expanduser().resolve()
+    directory = executable_path.parent
+    candidates = (
+        directory / name,
+        directory / "lib" / name,
+        directory.parent / "Resources" / name,
+        directory.parent / "Frameworks" / name,
+    )
+    return next((candidate for candidate in candidates if candidate.is_file()), None)
+
+
+def native_runtime_environment(
+    executable: str | Path,
+    backend: str,
+    base: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return a worker environment with relocatable Metal resources resolved."""
+
+    environment = dict(os.environ if base is None else base)
+    if backend != "metal":
+        return environment
+    if not environment.get("MFQ_MLX_METALLIB"):
+        metallib = find_native_runtime_resource(executable, "mlx.metallib")
+        if metallib is not None:
+            environment["MFQ_MLX_METALLIB"] = str(metallib)
+    if not environment.get("MFQ_AVFOUNDATION_VIDEO_LIBRARY"):
+        video_library = find_native_runtime_resource(
+            executable,
+            "libmfq_avfoundation_video.dylib",
+        )
+        if video_library is not None:
+            environment["MFQ_AVFOUNDATION_VIDEO_LIBRARY"] = str(video_library)
+    return environment
 
 
 def reserve_loopback_port() -> int:
@@ -73,7 +113,11 @@ class NativeRuntime:
             subprocess.list2cmdline(command),
             flush=True,
         )
-        self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL)
+        self.process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            env=native_runtime_environment(self.executable, self.backend),
+        )
         self._wait_until_ready()
 
     def _wait_until_ready(self) -> None:

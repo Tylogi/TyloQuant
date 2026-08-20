@@ -65,9 +65,11 @@ from mfq.server.models import (
     MediaResource,
     MessageList,
     ModelArtifactList,
+    ModelDirectoryList,
     ModelLoadRequest,
     ModelUnloadRequest,
     OperationAccepted,
+    RegisterModelDirectoryRequest,
     RemoteNodeList,
     RemoteNodeResource,
     ResponseList,
@@ -460,6 +462,16 @@ def create_app(
             offset=offset,
         )
 
+    @app.delete(
+        "/api/v1/jobs/completed",
+        status_code=204,
+        responses=ERROR_RESPONSES,
+        tags=["jobs"],
+    )
+    async def clear_completed_jobs() -> Response:
+        await require_service().clear_completed_jobs()
+        return Response(status_code=204)
+
     @app.get(
         "/api/v1/jobs/{job_id}",
         response_model=JobResource,
@@ -468,6 +480,16 @@ def create_app(
     )
     async def get_job(job_id: UUID) -> JobResource:
         return await require_service().get_job(job_id)
+
+    @app.delete(
+        "/api/v1/jobs/{job_id}",
+        status_code=204,
+        responses=ERROR_RESPONSES,
+        tags=["jobs"],
+    )
+    async def delete_job(job_id: UUID) -> Response:
+        await require_service().delete_job(job_id)
+        return Response(status_code=204)
 
     @app.post(
         "/api/v1/jobs/{job_id}/cancel",
@@ -837,6 +859,35 @@ def create_app(
     )
     async def model_artifacts(refresh: bool = False) -> ModelArtifactList:
         return await require_service().model_artifacts(refresh=refresh)
+
+    @app.get(
+        "/api/v1/models/directories",
+        response_model=ModelDirectoryList,
+        responses=ERROR_RESPONSES,
+        tags=["models"],
+    )
+    async def model_directories(
+        directory_id: Annotated[
+            str | None,
+            Query(pattern=r"^[0-9a-f]{32}$"),
+        ] = None,
+        path: Annotated[
+            str | None,
+            Query(min_length=1, max_length=4096),
+        ] = None,
+    ) -> ModelDirectoryList:
+        return await require_service().model_directories(directory_id=directory_id, path=path)
+
+    @app.post(
+        "/api/v1/models/directories/register",
+        response_model=ModelArtifactList,
+        responses=ERROR_RESPONSES,
+        tags=["models"],
+    )
+    async def register_model_directory(
+        body: RegisterModelDirectoryRequest,
+    ) -> ModelArtifactList:
+        return await require_service().register_model_directory(body)
 
     @app.get(
         "/api/v1/artifacts/lineage",

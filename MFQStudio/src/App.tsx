@@ -17,6 +17,7 @@ import {
   McpToolResource,
   Message,
   ModelArtifact,
+  ModelDirectoryList,
   RealtimeCapabilities,
   RealtimeFrame,
   ResponseResource,
@@ -47,8 +48,9 @@ import {
   StudioConfig,
   StudioStatus,
   configureStudio,
+  isStudio,
   saveStudioCredential,
-  selectLocalModelFile,
+  selectLocalModelDirectory,
   startLocalStudio,
   studioCredential,
   studioStatus,
@@ -89,6 +91,7 @@ type PresetName = "precise" | "balanced" | "creative" | "custom";
 interface GenerationSettings {
   language: UiLanguage;
   theme: UiTheme;
+  inheritModelDefaults: boolean;
   systemPrompt: string;
   maxTokens: number;
   temperature: number;
@@ -126,6 +129,7 @@ interface StoredPreset {
   id?: string;
   name: string;
   settings: StoredPresetSettings;
+  inheritGlobalSettings: boolean;
   contextSize: number;
   model?: string | null;
   mode?: SessionMode | null;
@@ -146,6 +150,7 @@ interface RoleEditorDraft {
   model: string;
   mode: SessionMode;
   contextSize: number;
+  inheritGlobalSettings: boolean;
   settings: StoredPresetSettings;
 }
 
@@ -255,6 +260,7 @@ const MODE_LABELS: Record<SessionMode, [string, string]> = {
 const DEFAULT_SETTINGS: GenerationSettings = {
   language: "system",
   theme: "system",
+  inheritModelDefaults: true,
   systemPrompt: "",
   maxTokens: 4096,
   temperature: 0.7,
@@ -312,6 +318,26 @@ function modeTemplateSettings(
     fullDuplex: mode === "full_duplex",
     preset: "custom",
     seed: null,
+  };
+}
+
+function roleGenerationSettings(
+  globalSettings: GenerationSettings,
+  role: StoredPreset | undefined,
+): GenerationSettings {
+  if (!role) return globalSettings;
+  if (role.inheritGlobalSettings) {
+    return {
+      ...globalSettings,
+      systemPrompt: role.settings.systemPrompt.trim()
+        ? role.settings.systemPrompt
+        : globalSettings.systemPrompt,
+    };
+  }
+  return {
+    ...globalSettings,
+    ...role.settings,
+    preset: "custom",
   };
 }
 const CAPABILITY_LABELS: Array<[
@@ -400,6 +426,8 @@ function loadStoredPresets(): StoredPreset[] {
               ? null
               : number("seed", fallback.seed ?? 0),
         },
+        inheritGlobalSettings:
+          typeof raw.inheritGlobalSettings === "boolean" ? raw.inheritGlobalSettings : true,
         contextSize:
           Number.isFinite(contextSize) && contextSize >= 512
             ? Math.floor(contextSize)
@@ -438,6 +466,10 @@ function storedPresetFromResource(preset: GenerationPresetResource): StoredPrese
       excludeReasoning: !preset.settings.include_reasoning_history,
       seed: sampling.seed ?? null,
     },
+    inheritGlobalSettings:
+      typeof preset.metadata?.inherit_global_settings === "boolean"
+        ? preset.metadata.inherit_global_settings
+        : true,
     contextSize: preset.context_size,
     model: preset.model,
     mode: preset.mode,
@@ -476,7 +508,10 @@ function presetResourceBody(
       response_format: { type: "text" },
     },
     context_size: preset.contextSize,
-    metadata: { icon: preset.icon || preset.name.slice(0, 1).toLocaleUpperCase() },
+    metadata: {
+      icon: preset.icon || preset.name.slice(0, 1).toLocaleUpperCase(),
+      inherit_global_settings: preset.inheritGlobalSettings,
+    },
   };
 }
 
@@ -651,6 +686,17 @@ function displayPrefillMetric(metrics?: PrefillMetricLike | null): {
   };
 }
 
+const TERMINAL_JOB_STATUSES = new Set<JobResource["status"]>([
+  "succeeded",
+  "failed",
+  "cancelled",
+  "interrupted",
+]);
+
+function isTerminalJob(job: JobResource): boolean {
+  return TERMINAL_JOB_STATUSES.has(job.status);
+}
+
 function preferPositiveMetric(primary: unknown, fallback: unknown): number | undefined {
   const preferred = Number(primary);
   if (Number.isFinite(preferred) && preferred > 0) return preferred;
@@ -716,7 +762,9 @@ type IconName =
   | "flask"
   | "download"
   | "edit"
+  | "folder"
   | "lightbulb"
+  | "moon"
   | "menu"
   | "paperclip"
   | "play"
@@ -725,6 +773,8 @@ type IconName =
   | "send"
   | "settings"
   | "stop"
+  | "sun"
+  | "sun-moon"
   | "trash"
   | "upload"
   | "volume"
@@ -745,7 +795,9 @@ function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
       {name === "flask" && <><path d="M9 3h6M10 3v6l-5.7 9.2A1.8 1.8 0 0 0 5.8 21h12.4a1.8 1.8 0 0 0 1.5-2.8L14 9V3" /><path d="M7.5 15h9" /></>}
       {name === "download" && <><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></>}
       {name === "edit" && <><path d="M4 20h4l11-11a2.8 2.8 0 0 0-4-4L4 16z" /><path d="m13.5 6.5 4 4" /></>}
+      {name === "folder" && <path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H10l2 2h6.5A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z" />}
       {name === "lightbulb" && <><path d="M9 18h6M10 22h4" /><path d="M8.4 14.7A6 6 0 1 1 15.6 14.7 4.1 4.1 0 0 0 14 18h-4a4.1 4.1 0 0 0-1.6-3.3z" /></>}
+      {name === "moon" && <path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5 8.5 8.5 0 1 0 20.5 14.2z" />}
       {name === "menu" && <><path d="M4 7h16M4 12h16M4 17h16" /></>}
       {name === "paperclip" && <><path d="m20.5 11.5-8.8 8.8a6 6 0 0 1-8.5-8.5l9.5-9.5a4 4 0 0 1 5.7 5.7l-9.6 9.5a2 2 0 0 1-2.8-2.8l8.8-8.8" /></>}
       {name === "play" && <path d="m8 5 11 7-11 7z" fill="currentColor" stroke="none" />}
@@ -754,6 +806,8 @@ function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
       {name === "send" && <><path d="m5 12 7-7 7 7M12 5v14" /></>}
       {name === "settings" && <><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1z" /></>}
       {name === "stop" && <><rect height="9" rx="1" width="9" x="7.5" y="7.5" /></>}
+      {name === "sun" && <><circle cx="12" cy="12" r="3.5" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></>}
+      {name === "sun-moon" && <><path d="M8.5 3.5A6.5 6.5 0 1 0 15 10a5 5 0 0 1-6.5-6.5z" /><path d="M17 3v2M17 9v2M13 7h2M19 7h2" /></>}
       {name === "trash" && <><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5" /></>}
       {name === "upload" && <><path d="M12 21V9" /><path d="m7 14 5-5 5 5" /><path d="M5 3h14" /></>}
       {name === "volume" && <><path d="M11 5 6.5 9H3v6h3.5L11 19z" /><path d="M15 9a4 4 0 0 1 0 6M18 6a8 8 0 0 1 0 12" /></>}
@@ -1236,6 +1290,7 @@ export default function App() {
   const [evaluationComparison, setEvaluationComparison] = useState<EvaluationComparison | null>(null);
   const [datasetDraft, setDatasetDraft] = useState({ name: "", artifact_uri: "", kind: "custom" as DatasetResource["kind"] });
   const [jobs, setJobs] = useState<JobResource[]>([]);
+  const [jobCleanupBusy, setJobCleanupBusy] = useState(false);
   const [jobKinds, setJobKinds] = useState<JobKindResource[]>([]);
   const [mcpServers, setMcpServers] = useState<McpServerResource[]>([]);
   const [mcpTools, setMcpTools] = useState<McpToolResource[]>([]);
@@ -1291,6 +1346,9 @@ export default function App() {
   const [studio, setStudio] = useState<StudioStatus | null>(null);
   const [studioDraft, setStudioDraft] = useState<StudioConfig | null>(null);
   const [studioOpen, setStudioOpen] = useState(false);
+  const [modelBrowser, setModelBrowser] = useState<ModelDirectoryList | null>(null);
+  const [modelBrowserOpen, setModelBrowserOpen] = useState(false);
+  const [modelDirectoryPath, setModelDirectoryPath] = useState("");
   const [studioToken, setStudioToken] = useState("");
   const [editDraft, setEditDraft] = useState<EditDraft | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -1305,7 +1363,6 @@ export default function App() {
   const voiceRef = useRef<RealtimeAudioController | null>(null);
   const voiceClipWrites = useRef(new Map<string, Promise<void>>());
   const lastMetricId = useRef("");
-  const hadStoredSettings = useRef(Boolean(localStorage.getItem(SETTINGS_KEY)));
   const appliedModeTemplate = useRef("");
   const settingsCloseRef = useRef<HTMLButtonElement | null>(null);
 
@@ -1313,6 +1370,7 @@ export default function App() {
     settings.language === "en" ||
     (settings.language === "system" && !navigator.language.toLowerCase().startsWith("zh"));
   const tr = useCallback((zh: string, en: string) => (english ? en : zh), [english]);
+  const canUseNativeModelPicker = isStudio() && studio?.config.mode !== "remote";
   const panelLabels = useMemo(() => ({
     collapse: tr("收起面板", "Collapse panel"),
     drag: tr("拖动面板", "Drag panel"),
@@ -1346,6 +1404,28 @@ export default function App() {
   const currentVoiceMessages = useMemo(
     () => voiceMessages.filter((message) => message.sessionId === activeId),
     [activeId, voiceMessages],
+  );
+  const activeRolePreset = useMemo(
+    () => active
+      ? storedPresets.find(
+          (preset) =>
+            assistantIdForPreset(preset) === canonicalSessionAssistantId(active, storedPresets),
+        )
+      : undefined,
+    [active, storedPresets],
+  );
+  const resolvedGlobalSettings = useMemo(
+    () => settings.inheritModelDefaults
+      ? modeTemplateSettings(settings, active?.mode ?? mode, runtime, realtime)
+      : settings,
+    [active?.mode, mode, realtime, runtime, settings],
+  );
+  const effectiveSettings = useMemo(
+    () => roleGenerationSettings(resolvedGlobalSettings, activeRolePreset),
+    [activeRolePreset, resolvedGlobalSettings],
+  );
+  const roleOverridesInference = Boolean(
+    activeRolePreset && !activeRolePreset.inheritGlobalSettings,
   );
   useEffect(() => {
     if (active) setSelectedAssistantId(canonicalSessionAssistantId(active, storedPresets));
@@ -1477,13 +1557,7 @@ export default function App() {
     if (appliedModeTemplate.current === key) return;
     appliedModeTemplate.current = key;
     void voiceRef.current?.setFullDuplex(active.mode === "full_duplex");
-    const rolePreset = storedPresets.find(
-      (preset) => assistantIdForPreset(preset) === canonicalSessionAssistantId(active, storedPresets),
-    );
-    setSettings((current) => rolePreset
-      ? { ...current, ...rolePreset.settings, preset: "custom" }
-      : modeTemplateSettings(current, active.mode, runtime, realtime));
-  }, [active, model, realtime, runtime, storedPresets]);
+  }, [active, model, runtime]);
 
   useEffect(() => {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
@@ -1665,35 +1739,13 @@ export default function App() {
           setModel(results[0].value.model);
         }
         if (results[1].status === "fulfilled") {
-          setModels(results[1].value);
-          if (results[0].status !== "fulfilled") setModel(results[1].value[0]?.id ?? "");
-        }
-        if (results[2].status === "fulfilled") {
-          setRuntime(results[2].value);
-          if (!hadStoredSettings.current && results[2].value.sampling_defaults) {
-            const defaults = results[2].value.sampling_defaults;
-            setSettings((current) => ({
-              ...current,
-              maxTokens: Number(defaults.max_tokens ?? current.maxTokens),
-              temperature: Number(defaults.temperature ?? current.temperature),
-              topP: Number(defaults.top_p ?? current.topP),
-              topK: Number(defaults.top_k ?? current.topK),
-              repetitionPenalty: Number(
-                defaults.repetition_penalty ?? current.repetitionPenalty,
-              ),
-              presencePenalty: Number(defaults.presence_penalty ?? current.presencePenalty),
-              frequencyPenalty: Number(
-                defaults.frequency_penalty ?? current.frequencyPenalty,
-              ),
-              enableThinking:
-                typeof defaults.enable_thinking === "boolean"
-                  ? defaults.enable_thinking
-                  : current.enableThinking,
-              preset: "custom",
-            }));
-            hadStoredSettings.current = true;
+          const nextModels = results[1].value;
+          setModels(nextModels);
+          if (results[0].status !== "fulfilled") {
+            setModel((current) => current || nextModels[0]?.id || "");
           }
         }
+        if (results[2].status === "fulfilled") setRuntime(results[2].value);
         if (results[5].status === "fulfilled") setArtifacts(results[5].value);
         if (results[6].status === "fulfilled") setInstances(results[6].value);
         if (results[7].status === "fulfilled") setJobs(results[7].value);
@@ -1821,27 +1873,27 @@ export default function App() {
 
   function samplingParams(): SamplingParams {
     return {
-      max_tokens: settings.maxTokens,
-      temperature: settings.temperature,
-      top_k: settings.topK,
-      top_p: settings.topP,
-      presence_penalty: settings.presencePenalty,
-      frequency_penalty: settings.frequencyPenalty,
-      repetition_penalty: settings.repetitionPenalty,
-      seed: settings.seed,
-      enable_thinking: thinkingSupported && settings.enableThinking,
-      reasoning_effort: settings.reasoningEffort || null,
+      max_tokens: effectiveSettings.maxTokens,
+      temperature: effectiveSettings.temperature,
+      top_k: effectiveSettings.topK,
+      top_p: effectiveSettings.topP,
+      presence_penalty: effectiveSettings.presencePenalty,
+      frequency_penalty: effectiveSettings.frequencyPenalty,
+      repetition_penalty: effectiveSettings.repetitionPenalty,
+      seed: effectiveSettings.seed,
+      enable_thinking: thinkingSupported && effectiveSettings.enableThinking,
+      reasoning_effort: effectiveSettings.reasoningEffort || null,
     };
   }
 
   function realtimeSessionConfig(sessionId: string) {
     return {
       sessionId,
-      systemPrompt: settings.systemPrompt,
-      temperature: settings.temperature,
-      topP: settings.topP,
-      topK: settings.topK,
-      repetitionPenalty: settings.repetitionPenalty,
+      systemPrompt: effectiveSettings.systemPrompt,
+      temperature: effectiveSettings.temperature,
+      topP: effectiveSettings.topP,
+      topK: effectiveSettings.topK,
+      repetitionPenalty: effectiveSettings.repetitionPenalty,
     };
   }
 
@@ -1850,7 +1902,6 @@ export default function App() {
     const nextSession = sessions.find((session) => canonicalSessionAssistantId(session, storedPresets) === role.id);
     setActiveId(nextSession?.id ?? null);
     if (role.preset) {
-      setSettings((current) => ({ ...current, ...role.preset?.settings, preset: "custom" }));
       if (role.preset.model) setModel(role.preset.model);
       if (role.preset.mode) setMode(role.preset.mode);
     }
@@ -1860,14 +1911,25 @@ export default function App() {
 
   function editRole(role: AssistantRole) {
     const preset = role.preset;
+    const inheritGlobalSettings = preset?.inheritGlobalSettings ?? true;
+    const roleMode = preset?.mode || mode;
+    const roleGlobalSettings = settings.inheritModelDefaults
+      ? modeTemplateSettings(settings, roleMode, runtime, realtime)
+      : settings;
     setRoleEditor({
       roleId: role.id,
       name: role.name,
       icon: preset?.icon || role.name.slice(0, 1).toLocaleUpperCase(),
       model: preset?.model || model,
-      mode: preset?.mode || mode,
+      mode: roleMode,
       contextSize: preset?.contextSize || contextSize,
-      settings: preset?.settings || presetSnapshot(settings),
+      inheritGlobalSettings,
+      settings: inheritGlobalSettings
+        ? {
+            ...presetSnapshot(roleGlobalSettings),
+            systemPrompt: preset?.settings.systemPrompt ?? "",
+          }
+        : preset?.settings || presetSnapshot(roleGlobalSettings),
     });
   }
 
@@ -1883,7 +1945,12 @@ export default function App() {
       model,
       mode,
       contextSize,
-      settings: presetSnapshot(settings),
+      inheritGlobalSettings: true,
+      settings: presetSnapshot(
+        settings.inheritModelDefaults
+          ? modeTemplateSettings(settings, mode, runtime, realtime)
+          : settings,
+      ),
     });
   }
 
@@ -1904,6 +1971,7 @@ export default function App() {
       model: roleEditor.model || null,
       mode: roleEditor.mode,
       contextSize: Math.max(512, Math.floor(roleEditor.contextSize)),
+      inheritGlobalSettings: roleEditor.inheritGlobalSettings,
       settings: roleEditor.settings,
       updatedAt: new Date().toISOString(),
     };
@@ -1926,7 +1994,6 @@ export default function App() {
       setSelectedAssistantId(nextId);
       setModel(saved.model || model);
       setMode(saved.mode || mode);
-      setSettings((current) => ({ ...current, ...saved.settings, preset: "custom" }));
       setRoleEditor(null);
     } catch (cause) {
       setError(errorMessage(cause));
@@ -2078,8 +2145,8 @@ export default function App() {
           input,
           input_role: inputRole,
           sampling: samplingParams(),
-          system_prompt: settings.systemPrompt || null,
-          include_reasoning_history: !settings.excludeReasoning,
+          system_prompt: effectiveSettings.systemPrompt || null,
+          include_reasoning_history: !effectiveSettings.excludeReasoning,
           tools: mcpTools
             .filter((tool) => selectedTools.includes(tool.qualified_name))
             .map((tool) => ({
@@ -2492,7 +2559,7 @@ export default function App() {
   }
 
   function openSettings() {
-    setSettingsDraft(settings);
+    setSettingsDraft(resolvedGlobalSettings);
     const current = Number(runtime?.max_context);
     setContextSize(Number.isFinite(current) && current > 0 ? current : contextSize);
     setSettingsOpen(true);
@@ -2517,7 +2584,12 @@ export default function App() {
   });
 
   function applyPreset(name: Exclude<PresetName, "custom">) {
-    setSettingsDraft((current) => ({ ...current, ...PRESETS[name], preset: name }));
+    setSettingsDraft((current) => ({
+      ...current,
+      ...PRESETS[name],
+      inheritModelDefaults: false,
+      preset: name,
+    }));
     setSelectedStoredPreset("");
     setStoredPresetName("");
     setPresetStatus(null);
@@ -2533,7 +2605,12 @@ export default function App() {
     const stored = storedPresets.find((preset) => preset.name === name);
     if (!stored) return;
     setStoredPresetName(stored.name);
-    setSettingsDraft((current) => ({ ...current, ...stored.settings, preset: "custom" }));
+    setSettingsDraft((current) => ({
+      ...current,
+      ...stored.settings,
+      inheritModelDefaults: false,
+      preset: "custom",
+    }));
     setContextSize(stored.contextSize);
     setPresetStatus({ error: false, text: tr("预设已载入。", "Preset loaded.") });
   }
@@ -2547,6 +2624,7 @@ export default function App() {
     const next: StoredPreset = {
       name,
       settings: presetSnapshot(settingsDraft),
+      inheritGlobalSettings: false,
       contextSize,
       model: active?.model ?? model,
       mode: active?.mode ?? mode,
@@ -2578,7 +2656,10 @@ export default function App() {
         response_format: { type: "text" as const },
       },
       context_size: next.contextSize,
-      metadata: selected?.icon ? { icon: selected.icon } : {},
+      metadata: {
+        ...(selected?.icon ? { icon: selected.icon } : {}),
+        inherit_global_settings: false,
+      },
     };
     try {
       const saved = selected?.id
@@ -2617,12 +2698,13 @@ export default function App() {
     }
   }
 
-  function renderPresetManager() {
+  function renderPresetManager(disabled = false) {
     return (
       <div className="saved-presets">
         <label>
           <span>{tr("已保存预设", "Saved presets")}</span>
           <select
+            disabled={disabled}
             onChange={(event) => loadStoredPreset(event.target.value)}
             value={selectedStoredPreset}
           >
@@ -2639,6 +2721,7 @@ export default function App() {
         <div className="preset-save-row">
           <input
             aria-label={tr("预设名称", "Preset name")}
+            disabled={disabled}
             maxLength={64}
             onChange={(event) => {
               setStoredPresetName(event.target.value);
@@ -2653,7 +2736,7 @@ export default function App() {
             placeholder={tr("预设名称", "Preset name")}
             value={storedPresetName}
           />
-          <button onClick={() => void saveStoredPreset()} type="button">
+          <button disabled={disabled} onClick={() => void saveStoredPreset()} type="button">
             {selectedStoredPreset && storedPresetName.trim() === selectedStoredPreset
               ? tr("覆盖", "Update")
               : tr("保存", "Save")}
@@ -2661,7 +2744,7 @@ export default function App() {
           <button
             aria-label={tr("删除预设", "Delete preset")}
             className="preset-delete"
-            disabled={!selectedStoredPreset}
+            disabled={disabled || !selectedStoredPreset}
             onClick={() => void deleteStoredPreset()}
             title={tr("删除预设", "Delete preset")}
             type="button"
@@ -2680,41 +2763,45 @@ export default function App() {
             "Stores the system prompt, context, and generation parameters; interface and playback preferences stay separate.",
           )}
         </small>
-        <div className="portable-actions">
-          <button onClick={exportStudioData} type="button">{tr("导出", "Export")}</button>
-          <label>
-            {tr("导入", "Import")}
-            <input
-              accept="application/json,.json"
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                if (file) void importStudioData(file);
-                event.target.value = "";
-              }}
-              type="file"
-            />
-          </label>
-        </div>
-        <label>
-          <span>{tr("主题", "Theme")}</span>
-          <select
-            onChange={(event) => setSettingsDraft((current) => ({ ...current, theme: event.target.value as UiTheme }))}
-            value={settingsDraft.theme}
-          >
-            <option value="system">{tr("跟随系统", "System")}</option>
-            <option value="light">{tr("浅色", "Light")}</option>
-            <option value="dark">{tr("深色", "Dark")}</option>
-          </select>
-        </label>
       </div>
     );
   }
 
-  const presetManager = renderPresetManager();
+  const presetManager = renderPresetManager(settingsDraft.inheritModelDefaults);
+
+  function setModelDefaultInheritance(enabled: boolean) {
+    setSettingsDraft((current) => ({
+      ...(enabled
+        ? modeTemplateSettings(current, active?.mode ?? mode, runtime, realtime)
+        : current),
+      inheritModelDefaults: enabled,
+    }));
+    if (enabled) {
+      setSelectedStoredPreset("");
+      setStoredPresetName("");
+      setPresetStatus(null);
+    }
+  }
 
   function saveSettings() {
     setSettings(settingsDraft);
     setSettingsOpen(false);
+  }
+
+  function setUiTheme(theme: UiTheme) {
+    setSettings((current) => ({ ...current, theme }));
+    setSettingsDraft((current) => ({ ...current, theme }));
+  }
+
+  function updateGlobalInference(patch: Partial<GenerationSettings>) {
+    setSettings((current) => ({
+      ...(current.inheritModelDefaults
+        ? modeTemplateSettings(current, active?.mode ?? mode, runtime, realtime)
+        : current),
+      ...patch,
+      inheritModelDefaults: false,
+      preset: "custom",
+    }));
   }
 
   async function reloadRuntime() {
@@ -2858,6 +2945,40 @@ export default function App() {
       setError(errorMessage(cause));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function deleteJobRecord(id: string) {
+    if (jobCleanupBusy) return;
+    setJobCleanupBusy(true);
+    try {
+      await api.deleteJob(id);
+      setJobs((current) => current.filter((item) => item.id !== id));
+      if (selectedJobId === id) {
+        setSelectedJobId(null);
+        setJobLogs([]);
+      }
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setJobCleanupBusy(false);
+    }
+  }
+
+  async function clearCompletedJobRecords() {
+    if (jobCleanupBusy) return;
+    setJobCleanupBusy(true);
+    try {
+      await api.clearCompletedJobs();
+      setJobs((current) => current.filter((item) => !isTerminalJob(item)));
+      if (selectedJob && isTerminalJob(selectedJob)) {
+        setSelectedJobId(null);
+        setJobLogs([]);
+      }
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setJobCleanupBusy(false);
     }
   }
 
@@ -3006,7 +3127,11 @@ export default function App() {
       for (const preset of payload.presets) {
         if (!preset.name || !preset.settings || !Number.isFinite(preset.contextSize)) continue;
         const existing = storedPresets.find((item) => item.name === preset.name);
-        const resource = presetResourceBody({ ...preset, id: existing?.id }, model, mode);
+        const resource = presetResourceBody({
+          ...preset,
+          id: existing?.id,
+          inheritGlobalSettings: preset.inheritGlobalSettings !== false,
+        }, model, mode);
         if (existing?.id) await api.updateGenerationPreset(existing.id, resource);
         else await api.createGenerationPreset(resource);
       }
@@ -3034,18 +3159,15 @@ export default function App() {
     }
   }
 
-  async function chooseLocalModelFile() {
-    if (busy || studio?.config.mode !== "local") return;
-    setBusy(true);
-    try {
-      const registered = await selectLocalModelFile();
-      if (!registered) return;
-      const nextArtifacts = await api.modelArtifacts(true);
-      setArtifacts(nextArtifacts);
-      const artifact = nextArtifacts.find((item) => item.name === registered.name);
-      if (!artifact) {
-        throw new Error(tr("所选模型没有出现在本地目录中。", "The selected model was not registered in the local catalog."));
-      }
+  async function finishModelRegistration(names: string[]) {
+    const nextArtifacts = await api.modelArtifacts(true);
+    setArtifacts(nextArtifacts);
+    const registered = nextArtifacts.filter((item) => names.includes(item.name));
+    if (!registered.length) {
+      throw new Error(tr("所选目录中的模型没有出现在模型目录中。", "Models from the selected folder were not registered in the catalog."));
+    }
+    if (registered.length === 1) {
+      const artifact = registered[0];
       if (!artifact.loadable) {
         throw new Error(artifact.error || tr("所选模型不完整或无法加载。", "The selected model is incomplete or cannot be loaded."));
       }
@@ -3055,9 +3177,58 @@ export default function App() {
         const accepted = await api.loadModel(artifact.name, contextSize);
         setSelectedJobId(accepted.operation_id);
       }
-      setDashboardPage("models");
-      setView("dashboard");
-      await refreshRuntime(false);
+    }
+    setModelBrowserOpen(false);
+    setDashboardPage("models");
+    setView("dashboard");
+    await refreshRuntime(false);
+  }
+
+  async function openModelDirectory(directoryId?: string | null, path?: string | null) {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const listing = await api.modelDirectories(directoryId, path);
+      setModelBrowser(listing);
+      setModelDirectoryPath(listing.current_path ?? "");
+      setModelBrowserOpen(true);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function jumpToModelDirectory(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const path = modelDirectoryPath.trim();
+    if (!path) return;
+    await openModelDirectory(null, path);
+  }
+
+  async function chooseModelDirectory() {
+    if (busy) return;
+    if (!canUseNativeModelPicker) {
+      await openModelDirectory();
+      return;
+    }
+    setBusy(true);
+    try {
+      const names = await selectLocalModelDirectory();
+      if (names) await finishModelRegistration(names);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function registerCurrentModelDirectory() {
+    if (busy || !modelBrowser?.current_id) return;
+    setBusy(true);
+    try {
+      const registered = await api.registerModelDirectory(modelBrowser.current_id);
+      await finishModelRegistration(registered.map((item) => item.name));
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -3080,16 +3251,16 @@ export default function App() {
           context_size: contextSize,
           prefill_chunk_size: 2048,
           sampling_defaults: {
-            max_tokens: settings.maxTokens,
-            temperature: settings.temperature,
-            top_k: settings.topK,
-            top_p: settings.topP,
-            presence_penalty: settings.presencePenalty,
-            frequency_penalty: settings.frequencyPenalty,
-            repetition_penalty: settings.repetitionPenalty,
-            seed: settings.seed,
-            enable_thinking: thinkingSupported && settings.enableThinking,
-            reasoning_effort: settings.reasoningEffort || null,
+            max_tokens: resolvedGlobalSettings.maxTokens,
+            temperature: resolvedGlobalSettings.temperature,
+            top_k: resolvedGlobalSettings.topK,
+            top_p: resolvedGlobalSettings.topP,
+            presence_penalty: resolvedGlobalSettings.presencePenalty,
+            frequency_penalty: resolvedGlobalSettings.frequencyPenalty,
+            repetition_penalty: resolvedGlobalSettings.repetitionPenalty,
+            seed: resolvedGlobalSettings.seed,
+            enable_thinking: thinkingSupported && resolvedGlobalSettings.enableThinking,
+            reasoning_effort: resolvedGlobalSettings.reasoningEffort || null,
           },
         },
       });
@@ -3159,6 +3330,7 @@ export default function App() {
   const activeJobs = jobs.filter((job) =>
     ["queued", "running", "cancelling"].includes(job.status),
   );
+  const completedJobs = jobs.filter(isTerminalJob);
   const runtimeMemory = Number(
     runtime?.mlx_active_bytes ??
       runtime?.cuda_allocated_bytes ??
@@ -3228,8 +3400,9 @@ export default function App() {
           })}
         </nav>
         <button className="new-session" onClick={createRole} type="button"><Icon name="plus" size={14} />{tr("新角色", "New role")}</button>
-        <details className="session-create">
+        <details className="session-create" open={!model}>
           <summary>{tr("新会话默认设置", "New session defaults")}</summary>
+          <button className="open-local-model" disabled={busy} onClick={() => void chooseModelDirectory()} type="button"><Icon name="folder" size={14} />{tr("打开模型文件夹", "Open model folder")}</button>
           <label htmlFor="new-model">{tr("模型", "Model")}</label>
           <select id="new-model" value={model} onChange={(event) => setModel(event.target.value)}>
             {!models.length && <option value="">{tr("尚未加载模型", "No model loaded")}</option>}
@@ -3279,7 +3452,6 @@ export default function App() {
             <button className={labPage === "quantization" ? "active" : ""} onClick={() => openStudioPage("lab", "quantization")} type="button">{tr("量化工作台", "Quantization workspace")}</button>
           </nav>
         </div>
-        <div className={`connection-card ${studio?.reachable === false ? "offline" : ""}`}><span /><div><strong>{studio?.reachable === false ? tr("离线", "Offline") : tr("在线", "Online")}</strong><small>{studio?.service_url || window.location.origin}</small></div></div>
       </aside>
       <button aria-label={tr("关闭侧栏", "Close sidebar")} className={`mobile-scrim ${sidebarOpen ? "open" : ""}`} onClick={() => setSidebarOpen(false)} type="button" />
 
@@ -3287,11 +3459,17 @@ export default function App() {
         <header className="topbar">
           <div className="topbar-identity">
             <button aria-controls="studio-sidebar" aria-expanded={sidebarOpen} aria-label={tr("打开侧栏", "Open sidebar")} className="sidebar-toggle" onClick={() => setSidebarOpen(true)} type="button"><Icon name="menu" /></button>
-            <div className="topbar-model"><span>{active?.model || model}</span><small>{capabilities?.model_type || runtime?.model_type || "runtime"}</small></div>
+            <div className="topbar-model"><span>{active?.model || model || tr("尚未加载模型", "No model loaded")}</span><small>{capabilities?.model_type || runtime?.model_type || "runtime"}</small></div>
           </div>
           <div className="topbar-actions">
             {capabilities && <div className="capabilities">{CAPABILITY_LABELS.filter(([feature]) => capabilities.model_capabilities.features[feature]).map(([feature, label]) => <span className={feature === "full_duplex" && !realtimeAvailable ? "muted" : ""} key={feature}>{label[english ? 1 : 0]}</span>)}</div>}
             <div className="quick-metrics"><span><b>{lastTtftMs == null ? "--" : `${formatNumber(lastTtftMs, 1)} ms`}</b> TTFT</span><span><b>{last ? formatNumber(contextTokens) : "--"}</b> context</span><span><b>{last?.decode_tps == null ? "--" : formatNumber(last.decode_tps, 1)}</b> tok/s</span></div>
+            <div aria-label={tr("外观", "Appearance")} className="theme-switcher" role="group">
+              <button aria-label={tr("自动主题", "Auto theme")} aria-pressed={settings.theme === "system"} onClick={() => setUiTheme("system")} title={tr("跟随系统", "Auto")} type="button"><Icon name="sun-moon" size={13} /><span>Auto</span></button>
+              <button aria-label={tr("浅色主题", "Light theme")} aria-pressed={settings.theme === "light"} onClick={() => setUiTheme("light")} title={tr("浅色", "Light")} type="button"><Icon name="sun" size={13} /><span>Light</span></button>
+              <button aria-label={tr("深色主题", "Dark theme")} aria-pressed={settings.theme === "dark"} onClick={() => setUiTheme("dark")} title={tr("深色", "Dark")} type="button"><Icon name="moon" size={13} /><span>Dark</span></button>
+            </div>
+            <button aria-label={tr("打开模型文件夹", "Open model folder")} disabled={busy} onClick={() => void chooseModelDirectory()} title={tr("选择包含 MFQ 模型的文件夹", "Choose a folder containing MFQ models")} type="button"><Icon name="folder" /></button>
             <button aria-label={tr("导出会话", "Export chat")} disabled={!active} onClick={exportConversation} title={tr("导出会话", "Export chat")} type="button"><Icon name="download" /></button>
             <button aria-label={tr("推理设置", "Inference settings")} onClick={openSettings} title={tr("推理设置", "Inference settings")} type="button"><Icon name="settings" /></button>
           </div>
@@ -3301,7 +3479,7 @@ export default function App() {
           <section className="chat-view">
             <div className="message-scroller" onScroll={handleMessageScroll} ref={messageScrollerRef}>
               <div className="message-list" aria-live="polite">
-                {!active && <div className="welcome"><img src="/mfq-mark.svg" alt="" /><h1>MFQ Studio</h1><p>{models.length ? tr("创建会话后即可开始本地推理。", "Create a session to start local inference.") : tr("Server 已启动，请先在“模型与任务”中加载模型。", "The server is ready. Load a model from Models and jobs first.")}</p>{models.length ? <div className="prompt-grid"><button onClick={() => setDraft(tr("介绍一下这个模型。", "Introduce this model."))} type="button">{tr("介绍模型", "Introduce the model")}</button><button onClick={() => setDraft(tr("写一段 Python 示例。", "Write a Python example."))} type="button">{tr("代码示例", "Code example")}</button></div> : <button className="primary" onClick={() => openStudioPage("dashboard", "models")} type="button">{tr("前往加载模型", "Open model manager")}</button>}</div>}
+                {!active && <div className="welcome"><img src="/mfq-mark.svg" alt="" />{!model ? <><h1>{tr("加载模型", "Load a model")}</h1><p>{tr("从服务器文件夹加载模型，或连接已有模型服务。", "Load a model from a server folder or connect to an existing model server.")}</p><button className="open-model-primary" disabled={busy} onClick={() => void chooseModelDirectory()} type="button"><Icon name="folder" />{tr("选择模型文件夹", "Choose model folder")}</button></> : <><h1>MFQ Studio</h1><p>{tr("创建会话后即可开始本地推理。", "Create a session to start local inference.")}</p><div className="prompt-grid"><button onClick={() => setDraft(tr("介绍一下这个模型。", "Introduce this model."))} type="button">{tr("介绍模型", "Introduce the model")}</button><button onClick={() => setDraft(tr("写一段 Python 示例。", "Write a Python example."))} type="button">{tr("代码示例", "Code example")}</button></div></>}</div>}
                 {messages.map((message) => {
                   const parts = textParts(message);
                   const editing = editDraft?.messageId === message.id;
@@ -3341,8 +3519,8 @@ export default function App() {
                   {realtimeAvailable && <select aria-label={tr("交互模式", "Interaction mode")} disabled={!active || busy || voiceState !== "idle"} onChange={(event) => void selectInteractionMode(event.target.value as SessionMode)} value={active?.mode ?? mode}>{(["text", "voice", "full_duplex"] as SessionMode[]).map((item) => { const feature = capabilities?.model_capabilities.features; const disabled = item === "voice" ? !feature?.audio_input : item === "full_duplex" ? !feature?.full_duplex : false; return <option disabled={disabled} key={item} value={item}>{MODE_LABELS[item][english ? 1 : 0]}</option>; })}</select>}
                   {realtimeAvailable && <button aria-label={tr("语音输入", "Voice input")} aria-pressed={voiceState !== "idle" && voiceState !== "error"} className="voice-button" disabled={!active || active.mode === "text" || busy} onClick={() => void toggleVoice()} style={{ "--voice-level": voiceLevel } as React.CSSProperties} title={active?.mode === "text" ? tr("请先选择语音或全双工模式", "Select voice or full duplex mode first") : voiceState === "processing" ? tr("语音处理中", "Processing voice") : tr("语音输入", "Voice input")} type="button"><span /></button>}
                   {realtimeAvailable && active?.mode !== "text" && <button aria-label={tr("语音播放", "Voice playback")} aria-pressed={settings.playbackEnabled} onClick={() => setSettings((current) => ({ ...current, playbackEnabled: !current.playbackEnabled }))} title={tr("语音播放", "Voice playback")} type="button"><Icon name={settings.playbackEnabled ? "volume" : "volume-off"} /></button>}
-                  {active?.mode === "text" && <button aria-pressed={thinkingSupported && settings.enableThinking} disabled={!thinkingSupported} onClick={() => setSettings((current) => ({ ...current, enableThinking: !current.enableThinking }))} type="button"><Icon name="lightbulb" />{tr("思考", "Thinking")}</button>}
-                  {active?.mode === "text" && thinkingSupported && settings.enableThinking && reasoningValues.length > 0 && <select aria-label={tr("思考档位", "Reasoning effort")} onChange={(event) => setSettings((current) => ({ ...current, reasoningEffort: event.target.value }))} value={settings.reasoningEffort}><option value="">{tr("标准", "Standard")}</option>{reasoningValues.map((value) => <option key={value} value={value}>{value}</option>)}</select>}
+                  {active?.mode === "text" && <button aria-pressed={thinkingSupported && effectiveSettings.enableThinking} disabled={!thinkingSupported || roleOverridesInference} onClick={() => updateGlobalInference({ enableThinking: !effectiveSettings.enableThinking })} title={roleOverridesInference ? tr("该参数由当前角色覆盖", "This setting is overridden by the current role") : undefined} type="button"><Icon name="lightbulb" />{tr("思考", "Thinking")}</button>}
+                  {active?.mode === "text" && thinkingSupported && effectiveSettings.enableThinking && reasoningValues.length > 0 && <select aria-label={tr("思考档位", "Reasoning effort")} disabled={roleOverridesInference} onChange={(event) => updateGlobalInference({ reasoningEffort: event.target.value })} value={effectiveSettings.reasoningEffort}><option value="">{tr("标准", "Standard")}</option>{reasoningValues.map((value) => <option key={value} value={value}>{value}</option>)}</select>}
                   <span className="composer-hint">{voiceState !== "idle" ? voiceState : tr("Enter 发送 · Shift+Enter 换行", "Enter to send · Shift+Enter for newline")}</span>
                   {busy ? <button aria-label={tr("停止生成", "Stop generation")} className="send-button stop" onClick={() => abortRef.current?.abort()} type="button"><Icon name="stop" size={14} /></button> : <button aria-label={tr("发送", "Send")} className="send-button" disabled={!active || (!draft.trim() && !attachments.length)} type="submit"><Icon name="send" size={15} /></button>}
                 </div>
@@ -3364,9 +3542,16 @@ export default function App() {
               <section className="dashboard-panel profile-panel" key="profiles"><div className="panel-heading"><div><h2>{tr("运行配置档案", "Runtime profiles")}</h2><p>{tr("将加载参数和采样默认值绑定到模型产物", "Bind load and sampling defaults to a model artifact")}</p></div><b>{runtimeProfiles.length}</b></div><div className="profile-create"><input maxLength={64} onChange={(event) => setProfileName(event.target.value)} placeholder={tr("当前配置名称", "Current configuration name")} value={profileName} /><button disabled={busy || !profileName.trim() || !artifacts.some((item) => item.name === runtime?.model)} onClick={() => void saveRuntimeProfile()} type="button">{tr("保存当前配置", "Save current")}</button></div>{runtimeProfiles.length > 0 && <div className="profile-list">{runtimeProfiles.map((profile) => <div className={`profile-row ${profile.drifted ? "drifted" : ""}`} key={profile.id}><div><strong>{profile.name}</strong><small>{profile.load.context_size.toLocaleString()} ctx · {profile.load.prefill_chunk_size.toLocaleString()} chunk{profile.drifted ? ` · ${tr("模型已变化", "artifact changed")}` : ""}</small></div><button disabled={busy} onClick={() => void loadRuntimeProfile(profile)} type="button">{tr("加载", "Load")}</button><button aria-label={tr("删除配置档案", "Delete profile")} disabled={busy} onClick={() => void deleteRuntimeProfile(profile.id)} type="button"><Icon name="trash" size={14} /></button></div>)}</div>}</section>
             </PanelDeck>}
             {dashboardPage === "models" && <PanelDeck labels={panelLabels} page="dashboard-models" resetVersion={dashboardLayoutReset}>
-              <section className="dashboard-panel" key="catalog"><div className="panel-heading"><div><h2>{tr("模型目录", "Model catalog")}</h2></div><div className="panel-heading-actions">{studio?.config.mode === "local" && <button disabled={busy} onClick={() => void chooseLocalModelFile()} type="button">{tr("选择本地 MFQ", "Choose local MFQ")}</button>}<b>{artifacts.length}</b></div></div>{artifacts.length > 0 && <div className="model-list">{artifacts.slice(0, 8).map((item) => { const instance = instances.find((candidate) => candidate.model === item.name && candidate.state !== "failed"); const loaded = Boolean(instance) || item.name === runtime?.model; return <div className="model-row" key={item.id}><span className={loaded ? "model-state active" : item.loadable ? "model-state" : "model-state failed"} /><div><strong>{item.name}</strong><small>{item.architecture} · {item.shard_count} shards · {formatNumber(item.total_bytes / 2 ** 30, 1)} GB</small></div>{instance ? <button disabled={busy || instance.state === "busy"} onClick={() => void unloadInstance(instance.id)} type="button">{tr("卸载", "Unload")}</button> : loaded ? <em>{tr("已加载", "Loaded")}</em> : !item.loadable ? <em className="failed">{tr("不可用", "Invalid")}</em> : <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">{tr("加载", "Load")}</button>}</div>; })}</div>}</section>
+              <section className="dashboard-panel" key="catalog"><div className="panel-heading"><div><h2>{tr("模型目录", "Model catalog")}</h2></div><div className="panel-heading-actions"><button disabled={busy} onClick={() => void chooseModelDirectory()} type="button">{tr("添加模型文件夹", "Add model folder")}</button><b>{artifacts.length}</b></div></div>{artifacts.length > 0 && <div className="model-list">{artifacts.slice(0, 8).map((item) => { const instance = instances.find((candidate) => candidate.model === item.name && candidate.state !== "failed"); const loaded = Boolean(instance) || item.name === runtime?.model; return <div className="model-row" key={item.id}><span className={loaded ? "model-state active" : item.loadable ? "model-state" : "model-state failed"} /><div><strong>{item.name}</strong><small>{item.architecture} · {item.shard_count} shards · {formatNumber(item.total_bytes / 2 ** 30, 1)} GB</small></div>{instance ? <button disabled={busy || instance.state === "busy"} onClick={() => void unloadInstance(instance.id)} type="button">{tr("卸载", "Unload")}</button> : loaded ? <em>{tr("已加载", "Loaded")}</em> : !item.loadable ? <em className="failed">{tr("不可用", "Invalid")}</em> : <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">{tr("加载", "Load")}</button>}</div>; })}</div>}</section>
               <section className="dashboard-panel" key="requests"><div className="panel-heading"><div><h2>{tr("最近请求", "Recent requests")}</h2></div></div>{requestHistory.length > 0 && <div className="request-table">{requestHistory.slice(0, 8).map((request) => <div className="request-row" key={request.id}><div><strong>{request.id}</strong><small>{request.completed_at ? new Date(request.completed_at * 1000).toLocaleTimeString() : request.endpoint || "completion"}</small></div><span>{formatNumber(request.prompt_tokens)} → {formatNumber(request.completion_tokens)}</span><b>{formatNumber(request.decode_tps, 1)} tok/s</b></div>)}</div>}</section>
-              <section className="dashboard-panel" key="jobs"><div className="panel-heading"><div><h2>{tr("后台任务", "Background jobs")}</h2></div><b>{jobs.length}</b></div>{jobs.length > 0 && <div className="request-table">{jobs.slice(0, 8).map((job) => <div className="job-row" key={job.id}><div><strong>{job.kind}</strong><small>{new Date(job.updated_at).toLocaleTimeString()} · {job.status}</small></div><progress max={1} value={job.progress} /><b>{formatNumber(job.progress * 100)}%</b></div>)}</div>}</section>
+              <section className="dashboard-panel" key="jobs">
+                <div className="panel-heading"><div><h2>{tr("后台任务", "Background jobs")}</h2></div><b>{activeJobs.length}</b></div>
+                {activeJobs.length > 0 && <div className="request-table">{activeJobs.slice(0, 8).map((job) => <div className="job-row" key={job.id}><div><strong>{job.kind}</strong><small>{new Date(job.updated_at).toLocaleTimeString()} · {job.status}</small></div><progress max={1} value={job.progress} /><b>{formatNumber(job.progress * 100)}%</b></div>)}</div>}
+                {completedJobs.length > 0 && <details className="completed-jobs">
+                  <summary><span>{tr("已完成", "Completed")} <b>{completedJobs.length}</b></span><button disabled={jobCleanupBusy} onClick={(event) => { event.preventDefault(); void clearCompletedJobRecords(); }} type="button">{tr("清理已完成", "Clear completed")}</button></summary>
+                  <div className="request-table">{completedJobs.slice(0, 8).map((job) => <div className="job-row completed" key={job.id}><div><strong>{job.kind}</strong><small>{new Date(job.updated_at).toLocaleTimeString()} · {job.status}</small></div><progress max={1} value={job.progress} /><b>{formatNumber(job.progress * 100)}%</b><button aria-label={tr("移出任务历史", "Remove from job history")} disabled={jobCleanupBusy} onClick={() => void deleteJobRecord(job.id)} type="button"><Icon name="trash" size={12} /></button></div>)}</div>
+                </details>}
+              </section>
               <section className="dashboard-panel" key="logs"><div className="panel-heading"><div><h2>{tr("Runtime 日志", "Runtime logs")}</h2></div><b>{runtimeLogs.length}</b></div>{runtimeLogs.length > 0 && <div className="runtime-log-list">{runtimeLogs.slice(-8).reverse().map((entry) => <div className={`runtime-log ${entry.level}`} key={entry.sequence}><span>{new Date(entry.created_at).toLocaleTimeString()}</span><p>{entry.message}</p></div>)}</div>}</section>
             </PanelDeck>}
             {dashboardPage === "connections" && <PanelDeck labels={panelLabels} page="dashboard-connections" resetVersion={dashboardLayoutReset}>
@@ -3427,15 +3612,170 @@ export default function App() {
                   <button className="job-run" disabled={busy || !selectedJobKind} type="submit"><Icon name="play" size={12} />{tr("运行", "Run")}</button>
                 </div>
               </form>
-              <section className="dashboard-panel job-history" key="history"><div className="panel-heading"><div><h2>{tr("任务历史", "Job history")}</h2></div><b>{jobs.length}</b></div><div className="job-list">{jobs.map((job) => <button className={job.id === selectedJobId ? "active" : ""} key={job.id} onClick={() => setSelectedJobId(job.id)} type="button"><span className={`job-status ${job.status}`} /><div><strong>{job.kind}</strong><small>{job.status} · {new Date(job.updated_at).toLocaleString()}</small></div><b>{formatNumber(job.progress * 100)}%</b></button>)}</div></section>
-              {selectedJob && <section className="dashboard-panel job-detail" key="detail"><div className="panel-heading"><div><h2>{selectedJob.kind}</h2><p>{selectedJob.id}</p></div><b>{selectedJob.status}</b></div><progress max={1} value={selectedJob.progress} /><div className="job-result-grid"><div><span>{tr("进度", "Progress")}</span><strong>{formatNumber(selectedJob.progress * 100)}%</strong></div><div><span>{tr("更新时间", "Updated")}</span><strong>{new Date(selectedJob.updated_at).toLocaleTimeString()}</strong></div></div><div className="job-actions">{["queued", "running", "cancelling"].includes(selectedJob.status) && <button className="secondary" disabled={selectedJob.status === "cancelling"} onClick={() => void cancelSelectedJob()} type="button">{tr("取消任务", "Cancel job")}</button>}{["failed", "cancelled", "interrupted"].includes(selectedJob.status) && <button className="secondary" disabled={busy} onClick={() => void retrySelectedJob()} type="button">{tr("重试", "Retry")}</button>}{String(selectedJob.result?.artifact || "").startsWith("workspace://") && <button className="secondary danger" disabled={busy} onClick={() => void removeSelectedArtifact()} type="button">{tr("删除本地产物", "Delete local artifact")}</button>}</div>{selectedJob.error && <div className="job-error">{selectedJob.error.message}</div>}{selectedJob.result && <pre>{JSON.stringify(selectedJob.result, null, 2)}</pre>}<div className="job-log"><header><span>{tr("事件与日志", "Events and logs")}</span></header>{jobLogs.map((entry) => <div className={entry.level} key={entry.sequence}><time>{new Date(entry.created_at).toLocaleTimeString()}</time><code>{entry.message}</code></div>)}</div></section>}
+              <section className="dashboard-panel job-history" key="history">
+                <div className="panel-heading"><div><h2>{tr("任务历史", "Job history")}</h2></div><b>{activeJobs.length}</b></div>
+                {activeJobs.length > 0 && <div className="job-list">{activeJobs.map((job) => <button className={job.id === selectedJobId ? "active" : ""} key={job.id} onClick={() => setSelectedJobId(job.id)} type="button"><span className={`job-status ${job.status}`} /><div><strong>{job.kind}</strong><small>{job.status} · {new Date(job.updated_at).toLocaleString()}</small></div><b>{formatNumber(job.progress * 100)}%</b></button>)}</div>}
+                {completedJobs.length > 0 && <details className="completed-jobs">
+                  <summary><span>{tr("已完成", "Completed")} <b>{completedJobs.length}</b></span><button disabled={jobCleanupBusy} onClick={(event) => { event.preventDefault(); void clearCompletedJobRecords(); }} type="button">{tr("清理已完成", "Clear completed")}</button></summary>
+                  <div className="job-list">{completedJobs.map((job) => <button className={job.id === selectedJobId ? "active" : ""} key={job.id} onClick={() => setSelectedJobId(job.id)} type="button"><span className={`job-status ${job.status}`} /><div><strong>{job.kind}</strong><small>{job.status} · {new Date(job.updated_at).toLocaleString()}</small></div><b>{formatNumber(job.progress * 100)}%</b></button>)}</div>
+                </details>}
+              </section>
+              {selectedJob && <section className="dashboard-panel job-detail" key="detail"><div className="panel-heading"><div><h2>{selectedJob.kind}</h2><p>{selectedJob.id}</p></div><b>{selectedJob.status}</b></div><progress max={1} value={selectedJob.progress} /><div className="job-result-grid"><div><span>{tr("进度", "Progress")}</span><strong>{formatNumber(selectedJob.progress * 100)}%</strong></div><div><span>{tr("更新时间", "Updated")}</span><strong>{new Date(selectedJob.updated_at).toLocaleTimeString()}</strong></div></div><div className="job-actions">{["queued", "running", "cancelling"].includes(selectedJob.status) && <button className="secondary" disabled={selectedJob.status === "cancelling"} onClick={() => void cancelSelectedJob()} type="button">{tr("取消任务", "Cancel job")}</button>}{["failed", "cancelled", "interrupted"].includes(selectedJob.status) && <button className="secondary" disabled={busy} onClick={() => void retrySelectedJob()} type="button">{tr("重试", "Retry")}</button>}{isTerminalJob(selectedJob) && <button className="secondary" disabled={jobCleanupBusy} onClick={() => void deleteJobRecord(selectedJob.id)} type="button">{tr("移出任务历史", "Remove from history")}</button>}{String(selectedJob.result?.artifact || "").startsWith("workspace://") && <button className="secondary danger" disabled={busy} onClick={() => void removeSelectedArtifact()} type="button">{tr("删除本地产物", "Delete local artifact")}</button>}</div>{selectedJob.error && <div className="job-error">{selectedJob.error.message}</div>}{selectedJob.result && <pre>{JSON.stringify(selectedJob.result, null, 2)}</pre>}<div className="job-log"><header><span>{tr("事件与日志", "Events and logs")}</span></header>{jobLogs.map((entry) => <div className={entry.level} key={entry.sequence}><time>{new Date(entry.created_at).toLocaleTimeString()}</time><code>{entry.message}</code></div>)}</div></section>}
             </PanelDeck>}
           </section>
         )}
       </main>
 
-      {settingsOpen && <><div className="drawer-scrim" onClick={() => setSettingsOpen(false)} /><aside className="settings-panel"><header><div><p>Generation</p><h2>{tr("推理设置", "Inference settings")}</h2></div><button onClick={() => setSettingsOpen(false)} type="button">×</button></header><div className="settings-scroll"><section><h3>{tr("预设", "Presets")}</h3><div className="segmented">{(["precise", "balanced", "creative"] as const).map((name) => <button aria-pressed={settingsDraft.preset === name} key={name} onClick={() => applyPreset(name)} type="button">{name === "precise" ? tr("精确", "Precise") : name === "balanced" ? tr("均衡", "Balanced") : tr("创意", "Creative")}</button>)}</div>{presetManager}</section><section><h3>{tr("上下文", "Context")}</h3><label><span>{tr("系统提示词", "System prompt")}</span><textarea onChange={(event) => setSettingsDraft((current) => ({ ...current, systemPrompt: event.target.value }))} rows={4} value={settingsDraft.systemPrompt} /></label><label className="check-field"><span><strong>{tr("排除历史思考", "Exclude reasoning history")}</strong><small>{tr("后续请求不再发送已保存的思考内容。", "Do not send saved reasoning in later requests.")}</small></span><input checked={settingsDraft.excludeReasoning} onChange={(event) => setSettingsDraft((current) => ({ ...current, excludeReasoning: event.target.checked }))} type="checkbox" /></label><label><span>{tr("上下文窗口 tokens", "Context window tokens")}</span><input max={Number(runtime?.context_capacity) || 1048576} min={512} onChange={(event) => setContextSize(Number(event.target.value))} step={512} type="number" value={contextSize} /></label><button className="secondary wide" disabled={busy} onClick={() => void reloadRuntime()} type="button">{tr("按此上下文重载模型", "Reload model with this context")}</button><label><span>{tr("最大生成 tokens", "Maximum output tokens")}</span><input max={65536} min={1} onChange={(event) => setSettingsDraft((current) => ({ ...current, maxTokens: Number(event.target.value) }))} type="number" value={settingsDraft.maxTokens} /></label></section><section><h3>{tr("采样", "Sampling")}</h3><label><span>Temperature <output>{settingsDraft.temperature.toFixed(2)}</output></span><input max={2} min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, temperature: Number(event.target.value), preset: "custom" }))} step={0.05} type="range" value={settingsDraft.temperature} /></label><label><span>Top P <output>{settingsDraft.topP.toFixed(2)}</output></span><input max={1} min={0.05} onChange={(event) => setSettingsDraft((current) => ({ ...current, topP: Number(event.target.value), preset: "custom" }))} step={0.05} type="range" value={settingsDraft.topP} /></label><label><span>Top K</span><input max={1024} min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, topK: Number(event.target.value), preset: "custom" }))} type="number" value={settingsDraft.topK} /></label><label><span>Seed</span><input min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, seed: event.target.value ? Number(event.target.value) : null }))} placeholder={tr("随机", "Random")} type="number" value={settingsDraft.seed ?? ""} /></label></section><section><h3>{tr("惩罚", "Penalties")}</h3>{([["Repetition", "repetitionPenalty", 0.5, 2, 0.01], ["Presence", "presencePenalty", -2, 2, 0.05], ["Frequency", "frequencyPenalty", -2, 2, 0.05]] as const).map(([label, key, min, max, step]) => <label key={key}><span>{label} <output>{settingsDraft[key].toFixed(2)}</output></span><input max={max} min={min} onChange={(event) => setSettingsDraft((current) => ({ ...current, [key]: Number(event.target.value), preset: "custom" }))} step={step} type="range" value={settingsDraft[key]} /></label>)}</section><section><h3>{tr("界面与连接", "Interface and connection")}</h3><label><span>{tr("界面语言", "Interface language")}</span><select onChange={(event) => setSettingsDraft((current) => ({ ...current, language: event.target.value as UiLanguage }))} value={settingsDraft.language}><option value="system">{tr("跟随系统", "System")}</option><option value="zh-CN">简体中文</option><option value="en">English</option></select></label>{studio && <button className="secondary wide" onClick={openStudioSettings} type="button">{tr("配置 MFQ Server 连接", "Configure MFQ Server connection")}</button>}</section></div><footer><button onClick={() => setSettingsDraft(modeTemplateSettings({ ...DEFAULT_SETTINGS, language: settingsDraft.language }, active?.mode ?? mode, runtime, realtime))} type="button">{tr("恢复默认", "Reset")}</button><button className="primary" onClick={saveSettings} type="button">{tr("应用", "Apply")}</button></footer></aside></>}
+      {settingsOpen && <>
+        <div className="drawer-scrim" onClick={() => setSettingsOpen(false)} />
+        <aside className="settings-panel">
+          <header>
+            <div><p>Generation</p><h2>{tr("推理设置", "Inference settings")}</h2></div>
+            <button onClick={() => setSettingsOpen(false)} ref={settingsCloseRef} type="button">×</button>
+          </header>
+          <div className="settings-scroll">
+            <section className="settings-inheritance">
+              <label className="check-field inheritance-toggle">
+                <span>
+                  <strong>{tr("随模型 / 架构默认值", "Use model / architecture defaults")}</strong>
+                  <small>{tr(
+                    "优先读取模型元数据，缺失字段由模型型号或架构默认值补齐。",
+                    "Read model metadata first, then fill missing fields from model or architecture defaults.",
+                  )}</small>
+                </span>
+                <input
+                  checked={settingsDraft.inheritModelDefaults}
+                  onChange={(event) => setModelDefaultInheritance(event.target.checked)}
+                  type="checkbox"
+                />
+              </label>
+            </section>
+            <fieldset className="settings-inherited-fields" disabled={settingsDraft.inheritModelDefaults}>
+              <section>
+                <h3>{tr("预设", "Presets")}</h3>
+                <div className="segmented">
+                  {(["precise", "balanced", "creative"] as const).map((name) => (
+                    <button
+                      aria-pressed={settingsDraft.preset === name}
+                      key={name}
+                      onClick={() => applyPreset(name)}
+                      type="button"
+                    >
+                      {name === "precise"
+                        ? tr("精确", "Precise")
+                        : name === "balanced"
+                          ? tr("均衡", "Balanced")
+                          : tr("创意", "Creative")}
+                    </button>
+                  ))}
+                </div>
+                {presetManager}
+              </section>
+              <section>
+                <h3>{tr("提示与输出", "Prompt and output")}</h3>
+                <label>
+                  <span>{tr("系统提示词", "System prompt")}</span>
+                  <textarea
+                    onChange={(event) => setSettingsDraft((current) => ({ ...current, systemPrompt: event.target.value }))}
+                    rows={4}
+                    value={settingsDraft.systemPrompt}
+                  />
+                </label>
+                <label className="check-field">
+                  <span>
+                    <strong>{tr("排除历史思考", "Exclude reasoning history")}</strong>
+                    <small>{tr("后续请求不再发送已保存的思考内容。", "Do not send saved reasoning in later requests.")}</small>
+                  </span>
+                  <input
+                    checked={settingsDraft.excludeReasoning}
+                    onChange={(event) => setSettingsDraft((current) => ({ ...current, excludeReasoning: event.target.checked }))}
+                    type="checkbox"
+                  />
+                </label>
+                <label>
+                  <span>{tr("最大生成 tokens", "Maximum output tokens")}</span>
+                  <input
+                    max={65536}
+                    min={1}
+                    onChange={(event) => setSettingsDraft((current) => ({ ...current, maxTokens: Number(event.target.value) }))}
+                    type="number"
+                    value={settingsDraft.maxTokens}
+                  />
+                </label>
+              </section>
+              <section>
+                <h3>{tr("采样", "Sampling")}</h3>
+                <label>
+                  <span>Temperature <output>{settingsDraft.temperature.toFixed(2)}</output></span>
+                  <input max={2} min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, temperature: Number(event.target.value), preset: "custom" }))} step={0.05} type="range" value={settingsDraft.temperature} />
+                </label>
+                <label>
+                  <span>Top P <output>{settingsDraft.topP.toFixed(2)}</output></span>
+                  <input max={1} min={0.05} onChange={(event) => setSettingsDraft((current) => ({ ...current, topP: Number(event.target.value), preset: "custom" }))} step={0.05} type="range" value={settingsDraft.topP} />
+                </label>
+                <label><span>Top K</span><input max={1024} min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, topK: Number(event.target.value), preset: "custom" }))} type="number" value={settingsDraft.topK} /></label>
+                <label><span>Seed</span><input min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, seed: event.target.value ? Number(event.target.value) : null }))} placeholder={tr("随机", "Random")} type="number" value={settingsDraft.seed ?? ""} /></label>
+              </section>
+              <section>
+                <h3>{tr("惩罚", "Penalties")}</h3>
+                {([["Repetition", "repetitionPenalty", 0.5, 2, 0.01], ["Presence", "presencePenalty", -2, 2, 0.05], ["Frequency", "frequencyPenalty", -2, 2, 0.05]] as const).map(([label, key, min, max, step]) => (
+                  <label key={key}>
+                    <span>{label} <output>{settingsDraft[key].toFixed(2)}</output></span>
+                    <input max={max} min={min} onChange={(event) => setSettingsDraft((current) => ({ ...current, [key]: Number(event.target.value), preset: "custom" }))} step={step} type="range" value={settingsDraft[key]} />
+                  </label>
+                ))}
+              </section>
+            </fieldset>
+            <section>
+              <h3>{tr("上下文", "Context")}</h3>
+              <label><span>{tr("上下文窗口 tokens", "Context window tokens")}</span><input max={Number(runtime?.context_capacity) || 1048576} min={512} onChange={(event) => setContextSize(Number(event.target.value))} step={512} type="number" value={contextSize} /></label>
+              <button className="secondary wide" disabled={busy} onClick={() => void reloadRuntime()} type="button">{tr("按此上下文重载模型", "Reload model with this context")}</button>
+            </section>
+            <section>
+              <h3>{tr("界面与连接", "Interface and connection")}</h3>
+              <label><span>{tr("界面语言", "Interface language")}</span><select onChange={(event) => setSettingsDraft((current) => ({ ...current, language: event.target.value as UiLanguage }))} value={settingsDraft.language}><option value="system">{tr("跟随系统", "System")}</option><option value="zh-CN">简体中文</option><option value="en">English</option></select></label>
+              <label>
+                <span>{tr("主题", "Theme")}</span>
+                <select onChange={(event) => setSettingsDraft((current) => ({ ...current, theme: event.target.value as UiTheme }))} value={settingsDraft.theme}>
+                  <option value="system">{tr("跟随系统", "System")}</option>
+                  <option value="light">{tr("浅色", "Light")}</option>
+                  <option value="dark">{tr("深色", "Dark")}</option>
+                </select>
+              </label>
+              <div className="portable-actions">
+                <button onClick={exportStudioData} type="button">{tr("导出", "Export")}</button>
+                <label>
+                  {tr("导入", "Import")}
+                  <input
+                    accept="application/json,.json"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      if (file) void importStudioData(file);
+                      event.target.value = "";
+                    }}
+                    type="file"
+                  />
+                </label>
+              </div>
+              {studio && <button className="secondary wide" onClick={openStudioSettings} type="button">{tr("配置 MFQ Server 连接", "Configure MFQ Server connection")}</button>}
+            </section>
+          </div>
+          <footer>
+            <button onClick={() => setSettingsDraft({
+              ...modeTemplateSettings({
+                ...DEFAULT_SETTINGS,
+                language: settingsDraft.language,
+                theme: settingsDraft.theme,
+                playbackEnabled: settingsDraft.playbackEnabled,
+              }, active?.mode ?? mode, runtime, realtime),
+              inheritModelDefaults: true,
+            })} type="button">{tr("恢复默认", "Reset")}</button>
+            <button className="primary" onClick={saveSettings} type="button">{tr("应用", "Apply")}</button>
+          </footer>
+        </aside>
+      </>}
 
+      {modelBrowserOpen && modelBrowser && <div className="dialog-backdrop"><section className="studio-dialog model-browser-dialog"><header><div><h2>{tr("选择模型文件夹", "Choose model folder")}</h2><p>{tr("浏览 MFQ Server 所在设备上的文件夹。", "Browse folders on the MFQ Server host.")}</p></div><button onClick={() => setModelBrowserOpen(false)} type="button">×</button></header><form className="model-browser-location" onSubmit={jumpToModelDirectory}><button disabled={busy || !modelBrowser.current_id} onClick={() => void openModelDirectory(modelBrowser.parent_id)} type="button">{tr("上一级", "Up")}</button><input aria-label={tr("当前目录", "Current directory")} onChange={(event) => setModelDirectoryPath(event.target.value)} placeholder={tr("输入服务器上的完整目录", "Enter a full directory on the server")} spellCheck={false} value={modelDirectoryPath} /><button disabled={busy || !modelDirectoryPath.trim()} type="submit">{tr("前往", "Go")}</button>{modelBrowser.current_id && <span>{modelBrowser.model_file_count} MFQ</span>}</form><div className="model-browser-list">{modelBrowser.data.map((directory) => <button disabled={busy} key={directory.id} onClick={() => void openModelDirectory(directory.id)} type="button"><Icon name="folder" /><span>{directory.name}</span>{directory.model_file_count > 0 && <b>{directory.model_file_count} MFQ</b>}</button>)}{modelBrowser.data.length === 0 && <p>{tr("这个文件夹中没有子文件夹。", "This folder has no subfolders.")}</p>}</div><footer><button onClick={() => setModelBrowserOpen(false)} type="button">{tr("取消", "Cancel")}</button><button className="primary" disabled={busy || !modelBrowser.current_id} onClick={() => void registerCurrentModelDirectory()} type="button">{tr("使用此文件夹", "Use this folder")}</button></footer></section></div>}
       {studioOpen && studioDraft && <div className="dialog-backdrop"><form className="studio-dialog" onSubmit={saveStudioSettings}><header><div><h2>{tr("Runtime 连接", "Runtime connection")}</h2><p>{tr("MFQ Studio 关闭后，MFQ Server 会继续运行。", "MFQ Server keeps running after MFQ Studio closes.")}</p></div><button onClick={() => setStudioOpen(false)} type="button">×</button></header><div className="segmented">{(["local", "remote"] as const).map((item) => <button aria-pressed={studioDraft.mode === item} key={item} onClick={() => setStudioDraft((current) => current && ({ ...current, mode: item }))} type="button">{item === "local" ? "Local MFQ Server" : "Remote MFQ Server"}</button>)}</div>{studioDraft.mode === "local" ? <><label><span>MFQ Server port</span><input max={65535} min={1} onChange={(event) => setStudioDraft((current) => current && ({ ...current, local_service_port: Number(event.target.value) }))} required type="number" value={studioDraft.local_service_port} /></label></> : <><label><span>Remote MFQ Server URL</span><input onChange={(event) => setStudioDraft((current) => current && ({ ...current, remote_url: event.target.value }))} required type="url" value={studioDraft.remote_url} /></label><label><span>Remote MFQ Server API key</span><input autoComplete="off" onChange={(event) => setStudioToken(event.target.value)} placeholder={tr("保存在系统凭据库", "Stored in the system credential vault")} type="password" value={studioToken} /></label></>}<div className="dialog-status"><span className={studio?.reachable ? "online" : "offline"} />{studio?.reachable ? `${tr("已连接", "Connected")}: ${studio.service_url}` : tr("MFQ Server 离线", "MFQ Server is offline")}</div><footer><button onClick={() => setStudioOpen(false)} type="button">{tr("取消", "Cancel")}</button><button className="primary" disabled={busy} type="submit">{tr("应用", "Apply")}</button></footer></form></div>}
 
       {roleEditor && <div className="dialog-backdrop role-dialog-backdrop" onMouseDown={(event) => {
@@ -3464,9 +3804,22 @@ export default function App() {
               <h3>{tr("对话默认值", "Conversation defaults")}</h3>
               <div className="role-form-grid">
                 <label><span>{tr("模型", "Model")}</span><input onChange={(event) => setRoleEditor((current) => current && ({ ...current, model: event.target.value }))} value={roleEditor.model} /></label>
-                <label><span>{tr("交互模式", "Interaction mode")}</span><select onChange={(event) => setRoleEditor((current) => current && ({ ...current, mode: event.target.value as SessionMode }))} value={roleEditor.mode}>{(["text", "voice", "full_duplex"] as SessionMode[]).map((item) => <option key={item} value={item}>{MODE_LABELS[item][english ? 1 : 0]}</option>)}</select></label>
+                <label><span>{tr("交互模式", "Interaction mode")}</span><select onChange={(event) => {
+                  const nextMode = event.target.value as SessionMode;
+                  setRoleEditor((current) => current && ({
+                    ...current,
+                    mode: nextMode,
+                    settings: current.inheritGlobalSettings
+                      ? {
+                          ...presetSnapshot(settings.inheritModelDefaults
+                            ? modeTemplateSettings(settings, nextMode, runtime, realtime)
+                            : settings),
+                          systemPrompt: current.settings.systemPrompt,
+                        }
+                      : current.settings,
+                  }));
+                }} value={roleEditor.mode}>{(["text", "voice", "full_duplex"] as SessionMode[]).map((item) => <option key={item} value={item}>{MODE_LABELS[item][english ? 1 : 0]}</option>)}</select></label>
                 <label><span>{tr("上下文 tokens", "Context tokens")}</span><input min={512} onChange={(event) => setRoleEditor((current) => current && ({ ...current, contextSize: Number(event.target.value) }))} step={512} type="number" value={roleEditor.contextSize} /></label>
-                <label><span>{tr("最大生成 tokens", "Maximum output tokens")}</span><input min={1} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, maxTokens: Number(event.target.value) } }))} type="number" value={roleEditor.settings.maxTokens} /></label>
               </div>
             </section>
             <section>
@@ -3474,21 +3827,48 @@ export default function App() {
               <label><textarea onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, systemPrompt: event.target.value } }))} placeholder={tr("该角色开始新会话时使用的默认提示词", "Default instructions for new sessions with this role")} rows={6} value={roleEditor.settings.systemPrompt} /></label>
             </section>
             <section>
-              <h3>{tr("采样默认值", "Sampling defaults")}</h3>
-              <div className="role-form-grid">
-                <label><span>Temperature</span><input max={2} min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, temperature: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.temperature} /></label>
-                <label><span>Top P</span><input max={1} min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, topP: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.topP} /></label>
-                <label><span>Top K</span><input min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, topK: Number(event.target.value) } }))} type="number" value={roleEditor.settings.topK} /></label>
-                <label><span>Repetition penalty</span><input min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, repetitionPenalty: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.repetitionPenalty} /></label>
-                <label><span>Presence penalty</span><input max={2} min={-2} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, presencePenalty: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.presencePenalty} /></label>
-                <label><span>Frequency penalty</span><input max={2} min={-2} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, frequencyPenalty: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.frequencyPenalty} /></label>
-                <label><span>Seed</span><input min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, seed: event.target.value ? Number(event.target.value) : null } }))} placeholder={tr("随机", "Random")} type="number" value={roleEditor.settings.seed ?? ""} /></label>
-                <label><span>{tr("思考档位", "Reasoning effort")}</span><select onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, reasoningEffort: event.target.value } }))} value={roleEditor.settings.reasoningEffort}><option value="">{tr("自动", "Auto")}</option>{reasoningValues.map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+              <div className="role-section-heading">
+                <h3>{tr("推理参数", "Inference parameters")}</h3>
+                <label className="role-inheritance-toggle">
+                  <input
+                    checked={roleEditor.inheritGlobalSettings}
+                    onChange={(event) => {
+                      const enabled = event.target.checked;
+                      setRoleEditor((current) => current && ({
+                        ...current,
+                        inheritGlobalSettings: enabled,
+                        settings: enabled
+                          ? {
+                              ...presetSnapshot(settings.inheritModelDefaults
+                                ? modeTemplateSettings(settings, current.mode, runtime, realtime)
+                                : settings),
+                              systemPrompt: current.settings.systemPrompt,
+                            }
+                          : current.settings,
+                      }));
+                    }}
+                    type="checkbox"
+                  />
+                  <span>{tr("随全局设置", "Use global settings")}</span>
+                </label>
               </div>
-              <div className="role-checks">
-                <label><input checked={thinkingSupported && roleEditor.settings.enableThinking} disabled={!thinkingSupported} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, enableThinking: event.target.checked } }))} type="checkbox" /><span>{tr("默认开启思考", "Enable thinking by default")}</span></label>
-                <label><input checked={roleEditor.settings.excludeReasoning} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, excludeReasoning: event.target.checked } }))} type="checkbox" /><span>{tr("排除历史思考", "Exclude reasoning history")}</span></label>
-              </div>
+              <fieldset className="role-inherited-fields" disabled={roleEditor.inheritGlobalSettings}>
+                <div className="role-form-grid">
+                  <label><span>{tr("最大生成 tokens", "Maximum output tokens")}</span><input min={1} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, maxTokens: Number(event.target.value) } }))} type="number" value={roleEditor.settings.maxTokens} /></label>
+                  <label><span>Temperature</span><input max={2} min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, temperature: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.temperature} /></label>
+                  <label><span>Top P</span><input max={1} min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, topP: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.topP} /></label>
+                  <label><span>Top K</span><input min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, topK: Number(event.target.value) } }))} type="number" value={roleEditor.settings.topK} /></label>
+                  <label><span>Repetition penalty</span><input min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, repetitionPenalty: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.repetitionPenalty} /></label>
+                  <label><span>Presence penalty</span><input max={2} min={-2} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, presencePenalty: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.presencePenalty} /></label>
+                  <label><span>Frequency penalty</span><input max={2} min={-2} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, frequencyPenalty: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.frequencyPenalty} /></label>
+                  <label><span>Seed</span><input min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, seed: event.target.value ? Number(event.target.value) : null } }))} placeholder={tr("随机", "Random")} type="number" value={roleEditor.settings.seed ?? ""} /></label>
+                  <label><span>{tr("思考档位", "Reasoning effort")}</span><select onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, reasoningEffort: event.target.value } }))} value={roleEditor.settings.reasoningEffort}><option value="">{tr("自动", "Auto")}</option>{reasoningValues.map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+                </div>
+                <div className="role-checks">
+                  <label><input checked={thinkingSupported && roleEditor.settings.enableThinking} disabled={!thinkingSupported} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, enableThinking: event.target.checked } }))} type="checkbox" /><span>{tr("默认开启思考", "Enable thinking by default")}</span></label>
+                  <label><input checked={roleEditor.settings.excludeReasoning} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, excludeReasoning: event.target.checked } }))} type="checkbox" /><span>{tr("排除历史思考", "Exclude reasoning history")}</span></label>
+                </div>
+              </fieldset>
             </section>
           </div>
           <footer><button onClick={() => setRoleEditor(null)} type="button">{tr("取消", "Cancel")}</button><button className="primary" disabled={busy || !roleEditor.name.trim()} type="submit">{tr("保存角色", "Save role")}</button></footer>

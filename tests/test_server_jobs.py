@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import UUID
 
 import httpx
+import pytest
 
 from mfq.server.api import create_app
 from mfq.server.jobs import JobManager
@@ -17,7 +18,7 @@ from mfq.server.models import (
     JobStatus,
 )
 from mfq.server.service import ServerService
-from mfq.server.storage import SessionStore
+from mfq.server.storage import InvalidJobStateError, JobNotFoundError, SessionStore
 
 JOB_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 NOW = datetime(2026, 8, 11, tzinfo=timezone.utc)
@@ -51,6 +52,42 @@ def test_job_storage_lifecycle_and_restart_recovery(tmp_path: Path) -> None:
     assert interrupted.status == JobStatus.INTERRUPTED
     assert interrupted.error is not None and interrupted.error.retryable
     assert [event.sequence for event in reopened.list_job_events(JOB_ID)] == [1, 2, 3, 4, 5]
+
+
+def test_only_terminal_job_records_can_be_deleted(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    active = store.create_job("test.active", {}, now=NOW)
+    with pytest.raises(InvalidJobStateError):
+        store.archive_job(active.id)
+
+    completed = store.create_job("test.complete", {}, now=NOW)
+    store.claim_job(completed.id, now=NOW)
+    store.complete_job(completed.id, {"artifact": "workspace://kept.bin"}, now=NOW)
+    store.record_artifact_lineage(
+        artifact_uri="workspace://kept.bin",
+        artifact_name="kept.bin",
+        producer_job_id=completed.id,
+        now=NOW,
+    )
+    store.archive_job(completed.id)
+    with pytest.raises(JobNotFoundError):
+        store.get_job(completed.id)
+    assert store.list_job_events(completed.id)
+    assert store.list_artifact_lineage()[0].artifact_uri == "workspace://kept.bin"
+    assert store.get_job(active.id).status == JobStatus.QUEUED
+
+
+def test_clear_completed_jobs_preserves_active_jobs(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    active = store.create_job("test.active", {}, now=NOW)
+    completed = store.create_job("test.complete", {}, now=NOW)
+    store.claim_job(completed.id, now=NOW)
+    store.complete_job(completed.id, {}, now=NOW)
+    cancelled = store.create_job("test.cancelled", {}, now=NOW)
+    store.request_job_cancel(cancelled.id, now=NOW)
+
+    assert store.archive_completed_jobs() == 2
+    assert [job.id for job in store.list_jobs()] == [active.id]
 
 
 def test_job_manager_completes_and_cancels_registered_handlers(tmp_path: Path) -> None:
@@ -161,6 +198,10 @@ def test_job_api_streams_persisted_events_and_rejects_unknown_kinds(tmp_path: Pa
                 if line.startswith("data: ")
             ]
             assert [event["sequence"] for event in resumed_payloads] == [payloads[-1]["sequence"]]
+            deleted = await client.delete(f"/api/v1/jobs/{job_id}")
+            assert deleted.status_code == 204
+            assert (await client.get(f"/api/v1/jobs/{job_id}")).status_code == 404
+            assert (await client.delete("/api/v1/jobs/completed")).status_code == 204
         await service.aclose()
 
     asyncio.run(run())

@@ -762,6 +762,32 @@ class ModelArtifactList(ProtocolModel):
     data: list[ModelArtifactResource]
 
 
+class ModelDirectoryEntry(ProtocolModel):
+    id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    name: str = Field(min_length=1, max_length=512)
+    model_file_count: int = Field(default=0, ge=0)
+
+
+class ModelDirectoryList(ProtocolModel):
+    current_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    current_name: str | None = Field(default=None, max_length=512)
+    current_path: str | None = Field(default=None, min_length=1, max_length=4096)
+    parent_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    model_file_count: int = Field(default=0, ge=0)
+    data: list[ModelDirectoryEntry]
+
+
+class RegisterModelDirectoryRequest(ProtocolModel):
+    directory_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    path: str | None = Field(default=None, min_length=1, max_length=4096)
+
+    @model_validator(mode="after")
+    def validate_source(self) -> RegisterModelDirectoryRequest:
+        if (self.directory_id is None) == (self.path is None):
+            raise ValueError("exactly one of directory_id or path is required")
+        return self
+
+
 class HubModelSummary(ProtocolModel):
     provider: Literal["huggingface", "modelscope"]
     repo_id: str = Field(min_length=3, max_length=255)

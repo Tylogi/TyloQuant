@@ -166,13 +166,15 @@ def _select_backend(requested: str, running_executable: Path | None) -> str:
 
 
 def _avfoundation_video_library(executable: Path) -> Path | None:
+    from mfq.server.native import find_native_runtime_resource
+
     configured = os.environ.get("MFQ_AVFOUNDATION_VIDEO_LIBRARY")
     candidate = (
         Path(configured).expanduser().resolve()
         if configured
-        else executable.with_name("libmfq_avfoundation_video.dylib")
+        else find_native_runtime_resource(executable, "libmfq_avfoundation_video.dylib")
     )
-    return candidate if candidate.is_file() else None
+    return candidate if candidate is not None and candidate.is_file() else None
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -202,8 +204,12 @@ def _run(args: argparse.Namespace) -> int:
     configured_roots = [path.expanduser().resolve() for path in args.model_dir]
     if not configured_roots:
         configured_roots = _environment_paths("MFQ_SERVER_MODEL_DIRS")
+    if not configured_roots:
+        configured_roots = [args.work_dir.expanduser().resolve() / "models"]
+    configured_roots = [path.expanduser().resolve() for path in configured_roots]
     if model is not None and model.parent not in configured_roots:
         configured_roots.append(model.parent)
+    configured_roots[0].mkdir(parents=True, exist_ok=True)
     catalog = ModelCatalog(configured_roots)
     runtime = None
     try:

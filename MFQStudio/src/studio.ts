@@ -13,11 +13,6 @@ export interface StudioStatus {
   managed_pid: number | null;
 }
 
-export interface RegisteredStudioModel {
-  name: string;
-  file_name: string;
-}
-
 interface TauriInternals {
   invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>;
 }
@@ -53,10 +48,10 @@ export async function startLocalStudio(): Promise<StudioStatus> {
   return tauri.invoke<StudioStatus>("studio_start_local");
 }
 
-export async function selectLocalModelFile(): Promise<RegisteredStudioModel | null> {
+export async function selectLocalModelDirectory(): Promise<string[] | null> {
   const tauri = internals();
   if (!tauri) throw new Error("MFQ Studio runtime is unavailable");
-  return tauri.invoke<RegisteredStudioModel | null>("studio_select_model_file");
+  return tauri.invoke<string[] | null>("studio_select_model_directory");
 }
 
 export async function studioCredential(): Promise<string> {

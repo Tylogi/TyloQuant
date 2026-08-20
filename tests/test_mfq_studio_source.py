@@ -54,8 +54,23 @@ def test_studio_supports_local_and_remote_server_connections_with_voice_controls
     assert "RuntimeMode::Remote" in RUST
     assert "studio_configure" in RUST
     assert "studio_start_local" in RUST
-    assert "studio_select_model_file" in RUST
-    assert "selectLocalModelFile" in APP
+    assert "studio_select_model_directory" in RUST
+    assert "selectLocalModelDirectory" in APP
+    assert "/api/v1/models/directories/register" in RUST
+    assert ".mfq-files.json" not in RUST
+    assert "canUseNativeModelPicker" in APP
+    assert 'tr("选择包含 MFQ 模型的文件夹", "Choose a folder containing MFQ models")' in APP
+    assert 'tr("从服务器文件夹加载模型，或连接已有模型服务。", "Load a model from a server folder or connect to an existing model server.")' in APP
+    assert 'tr("选择模型文件夹", "Choose model folder")' in APP
+    assert "访达" not in APP
+    assert "Finder" not in APP
+    assert 'className="open-local-model"' in APP
+    assert APP.count("chooseModelDirectory()") >= 4
+    assert "registerCurrentModelDirectory" in APP
+    assert "modelDirectoryPath" in APP
+    assert "jumpToModelDirectory" in APP
+    assert "listing.current_path" in APP
+    assert 'tr("前往", "Go")' in APP
     assert "Object.keys(MODE_LABELS)" not in APP
     assert "RealtimeAudioController" in APP
     assert '(["text", "voice", "full_duplex"] as SessionMode[])' in APP
@@ -71,17 +86,17 @@ def test_studio_handles_a_running_server_without_a_loaded_model():
     assert "Promise.allSettled([" in APP
 
 
-def test_studio_can_select_and_load_an_external_mfq_file_in_local_mode():
+def test_studio_can_select_and_load_an_external_mfq_directory_in_local_mode():
     assert "rfd::AsyncFileDialog::new()" in RUST
-    assert 'add_filter("MFQ model", &["mfq"])' in RUST
-    assert "studio_select_model_file" in RUST
-    assert 'const MODEL_FILE_INDEX: &str = ".mfq-files.json"' in RUST
-    assert 'tauri.invoke<RegisteredStudioModel | null>("studio_select_model_file")' in STUDIO_BRIDGE
-    assert "selectLocalModelFile" in APP
+    assert ".pick_folder()" in RUST
+    assert "studio_select_model_directory" in RUST
+    assert "/api/v1/models/directories/register" in RUST
+    assert 'tauri.invoke<string[] | null>("studio_select_model_directory")' in STUDIO_BRIDGE
+    assert "selectLocalModelDirectory" in APP
     assert "api.modelArtifacts(true)" in APP
     assert "api.loadModel(artifact.name, contextSize)" in APP
-    assert 'studio?.config.mode === "local"' in APP
-    assert 'tr("选择本地 MFQ", "Choose local MFQ")' in APP
+    assert "canUseNativeModelPicker" in APP
+    assert 'tr("选择模型文件夹", "Choose model folder")' in APP
 
 
 def test_studio_drains_duplex_output_after_microphone_capture_stops():
@@ -105,6 +120,51 @@ def test_studio_uses_the_model_bound_duplex_system_prompt():
     assert "system_prompt: config.systemPrompt" in REALTIME_AUDIO
     assert "text_repetition_penalty: config.repetitionPenalty" in REALTIME_AUDIO
     assert "submitText(text, realtimeSessionConfig(active.id))" in APP
+
+
+def test_studio_resolves_model_global_and_role_inference_settings_in_order():
+    assert "inheritModelDefaults: true" in APP
+    assert "function roleGenerationSettings" in APP
+    assert "if (role.inheritGlobalSettings)" in APP
+    assert "const resolvedGlobalSettings = useMemo" in APP
+    assert "const effectiveSettings = useMemo" in APP
+    assert "roleGenerationSettings(resolvedGlobalSettings, activeRolePreset)" in APP
+    assert "sampling: samplingParams()" in APP
+    assert "max_tokens: effectiveSettings.maxTokens" in APP
+    assert "system_prompt: effectiveSettings.systemPrompt || null" in APP
+    assert "setSettings((current) => ({ ...current, ...rolePreset.settings" not in APP
+
+
+def test_studio_defaults_global_and_role_editors_to_inherited_parameters():
+    assert 'className="settings-inherited-fields" disabled={settingsDraft.inheritModelDefaults}' in APP
+    assert 'checked={settingsDraft.inheritModelDefaults}' in APP
+    assert 'inheritGlobalSettings: preset?.inheritGlobalSettings ?? true' not in APP
+    assert "const inheritGlobalSettings = preset?.inheritGlobalSettings ?? true" in APP
+    assert 'className="role-inherited-fields" disabled={roleEditor.inheritGlobalSettings}' in APP
+    assert 'checked={roleEditor.inheritGlobalSettings}' in APP
+    assert "inherit_global_settings: preset.inheritGlobalSettings" in APP
+    assert 'typeof raw.inheritGlobalSettings === "boolean" ? raw.inheritGlobalSettings : true' in APP
+    assert 'typeof preset.metadata?.inherit_global_settings === "boolean"' in APP
+    assert ".settings-inherited-fields:disabled section" in STYLES
+    assert ".role-inherited-fields:disabled" in STYLES
+
+
+def test_studio_exposes_theme_selection_without_using_sidebar_status_space():
+    assert 'className="theme-switcher"' in APP
+    assert 'onClick={() => setUiTheme("system")}' in APP
+    assert 'onClick={() => setUiTheme("light")}' in APP
+    assert 'onClick={() => setUiTheme("dark")}' in APP
+    assert "connection-card" not in APP
+    assert ".connection-card" not in STYLES
+
+
+def test_studio_uses_theme_aware_model_actions_and_readable_errors():
+    assert ".panel-heading-actions button {" in STYLES
+    assert "border: 1px solid var(--accent-border)" in STYLES
+    assert ".mcp-form button { min-width: 64px;" in STYLES
+    assert ".job-actions .secondary { border: 1px solid var(--panel-line);" in STYLES
+    assert ".runtime-log p { min-width: 0; overflow-wrap: anywhere;" in STYLES
+    assert ".error-banner span { min-width: 0; overflow-wrap: anywhere;" in STYLES
 
 
 def test_realtime_turns_remain_bound_to_the_session_that_created_them():
@@ -183,3 +243,8 @@ def test_dashboard_and_lab_use_subpages_and_reorderable_collapsible_panels():
     assert "<p>Lab</p>" not in APP
     assert 'page="lab-imatrix"' not in APP
     assert 'page="lab-jobs"' not in APP
+    assert 'tr("已完成", "Completed")' in APP
+    assert 'tr("清理已完成", "Clear completed")' in APP
+    assert "api.clearCompletedJobs()" in APP
+    assert "api.deleteJob(id)" in APP
+    assert ".completed-jobs" in STYLES

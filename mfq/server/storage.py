@@ -68,7 +68,7 @@ from mfq.server.models import (
     UpdateSessionRequest,
 )
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 _CONTENT_PARTS = TypeAdapter(list[ContentPart])
 
 
@@ -399,7 +399,8 @@ class SessionStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     started_at TEXT,
-                    completed_at TEXT
+                    completed_at TEXT,
+                    archived_at TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS jobs_status_created
@@ -449,7 +450,9 @@ class SessionStore:
                     "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
-            elif int(existing["value"]) in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}:
+            elif int(existing["value"]) in {
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+            }:
                 columns = {
                     row["name"] for row in connection.execute("PRAGMA table_info(responses)")
                 }
@@ -472,6 +475,11 @@ class SessionStore:
                     connection.execute(
                         "ALTER TABLE generation_presets ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
                     )
+                job_columns = {
+                    row["name"] for row in connection.execute("PRAGMA table_info(jobs)")
+                }
+                if "archived_at" not in job_columns:
+                    connection.execute("ALTER TABLE jobs ADD COLUMN archived_at TEXT")
                 connection.execute(
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (str(SCHEMA_VERSION),),
@@ -1991,8 +1999,8 @@ class SessionStore:
                 INSERT INTO jobs(
                     id, kind, status, payload_json, progress, cancel_requested,
                     result_json, error_json, created_at, updated_at,
-                    started_at, completed_at
-                ) VALUES (?, ?, ?, ?, 0, 0, NULL, NULL, ?, ?, NULL, NULL)
+                    started_at, completed_at, archived_at
+                ) VALUES (?, ?, ?, ?, 0, 0, NULL, NULL, ?, ?, NULL, NULL, NULL)
                 """,
                 (
                     str(identifier),
@@ -2017,7 +2025,7 @@ class SessionStore:
     def get_job(self, job_id: UUID) -> JobResource:
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT * FROM jobs WHERE id = ?",
+                "SELECT * FROM jobs WHERE id = ? AND archived_at IS NULL",
                 (str(job_id),),
             ).fetchone()
         if row is None:
@@ -2036,7 +2044,7 @@ class SessionStore:
             raise ValueError("limit must be between 1 and 200")
         if offset < 0:
             raise ValueError("offset must be non-negative")
-        clauses: list[str] = []
+        clauses: list[str] = ["archived_at IS NULL"]
         values: list[object] = []
         if status is not None:
             clauses.append("status = ?")
@@ -2056,6 +2064,54 @@ class SessionStore:
                 values,
             ).fetchall()
         return [self._job_from_row(row) for row in rows]
+
+    def archive_job(self, job_id: UUID) -> None:
+        terminal_statuses = (
+            JobStatus.SUCCEEDED.value,
+            JobStatus.FAILED.value,
+            JobStatus.CANCELLED.value,
+            JobStatus.INTERRUPTED.value,
+        )
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status FROM jobs WHERE id = ? AND archived_at IS NULL",
+                (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise JobNotFoundError(str(job_id))
+            if row["status"] not in terminal_statuses:
+                raise InvalidJobStateError(
+                    f"cannot delete job in state {row['status']}"
+                )
+            connection.execute(
+                "UPDATE jobs SET archived_at = ? WHERE id = ?",
+                (_timestamp(_utcnow()), str(job_id)),
+            )
+
+    def archive_completed_jobs(self) -> int:
+        terminal_statuses = (
+            JobStatus.SUCCEEDED.value,
+            JobStatus.FAILED.value,
+            JobStatus.CANCELLED.value,
+            JobStatus.INTERRUPTED.value,
+        )
+        placeholders = ", ".join("?" for _ in terminal_statuses)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            count = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM jobs "
+                    f"WHERE archived_at IS NULL AND status IN ({placeholders})",
+                    terminal_statuses,
+                ).fetchone()[0]
+            )
+            connection.execute(
+                f"UPDATE jobs SET archived_at = ? "
+                f"WHERE archived_at IS NULL AND status IN ({placeholders})",
+                (_timestamp(_utcnow()), *terminal_statuses),
+            )
+        return count
 
     def list_queued_job_ids(self) -> list[UUID]:
         with self._connection() as connection:

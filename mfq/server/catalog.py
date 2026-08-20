@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,7 +14,12 @@ from time import monotonic
 from mfq.formats.assets import is_asset_record
 from mfq.formats.io import open_mmap
 from mfq.formats.shards import matching_shard_paths, parse_shard_path
-from mfq.server.models import ModelArtifactList, ModelArtifactResource
+from mfq.server.models import (
+    ModelArtifactList,
+    ModelArtifactResource,
+    ModelDirectoryEntry,
+    ModelDirectoryList,
+)
 
 MODEL_FILE_INDEX = ".mfq-files.json"
 
@@ -26,6 +32,14 @@ class DuplicateModelNameError(RuntimeError):
     pass
 
 
+class ModelDirectoryNotFoundError(LookupError):
+    pass
+
+
+class ModelRegistrationError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class DiscoveredModel:
     resource: ModelArtifactResource
@@ -35,12 +49,26 @@ class DiscoveredModel:
 class ModelCatalog:
     """Discover complete MFQ containers under explicitly configured roots."""
 
-    def __init__(self, roots: list[str | Path], *, cache_seconds: float = 5.0) -> None:
+    def __init__(
+        self,
+        roots: list[str | Path],
+        *,
+        cache_seconds: float = 5.0,
+        browse_roots: list[str | Path] | None = None,
+    ) -> None:
         self.roots = tuple(Path(root).expanduser().resolve() for root in roots)
+        self.browse_roots = (
+            None
+            if browse_roots is None
+            else tuple(Path(root).expanduser().resolve() for root in browse_roots)
+        )
         self.cache_seconds = max(0.0, cache_seconds)
         self._models: dict[str, DiscoveredModel] = {}
         self._last_scan = float("-inf")
         self._lock = asyncio.Lock()
+        self._registration_lock = asyncio.Lock()
+        self._directory_ids: dict[str, Path] = {}
+        self._directory_secret = os.urandom(32)
 
     async def list(self, *, refresh: bool = False) -> ModelArtifactList:
         models = await self._snapshot(refresh=refresh)
@@ -104,6 +132,219 @@ class ModelCatalog:
             if len(matches) > 1:
                 raise ModelArtifactNotFoundError(f"ambiguous model path: {path}")
         raise ModelArtifactNotFoundError(str(path))
+
+    async def browse_directories(
+        self,
+        directory_id: str | None = None,
+        *,
+        path: str | Path | None = None,
+    ) -> ModelDirectoryList:
+        """List server-side directories by opaque identifier or explicit path."""
+
+        return await asyncio.to_thread(self._browse_directories, directory_id, path)
+
+    async def register_directory(
+        self,
+        *,
+        directory_id: str | None = None,
+        path: str | Path | None = None,
+    ) -> ModelArtifactList:
+        """Register every MFQ container below one server-side directory."""
+
+        if (directory_id is None) == (path is None):
+            raise ModelRegistrationError("exactly one directory source is required")
+        if directory_id is not None:
+            selected = self._directory_ids.get(directory_id)
+            if selected is None:
+                raise ModelDirectoryNotFoundError(directory_id)
+        else:
+            try:
+                selected = Path(path or "").expanduser().resolve(strict=True)
+            except OSError as error:
+                raise ModelDirectoryNotFoundError(str(path)) from error
+        if not selected.is_dir():
+            raise ModelRegistrationError("selected model path is not a directory")
+        if not self.roots:
+            raise ModelRegistrationError("the server has no writable model catalog")
+
+        async with self._registration_lock:
+            registration_paths = await asyncio.to_thread(
+                self._registration_paths,
+                selected,
+            )
+            if not registration_paths:
+                raise ModelRegistrationError("selected directory contains no MFQ model files")
+            index_path = self.roots[0] / MODEL_FILE_INDEX
+            previous = index_path.read_bytes() if index_path.is_file() else None
+            await asyncio.to_thread(self._write_registered_paths, index_path, registration_paths)
+            try:
+                models = await self._snapshot(refresh=True)
+            except Exception:
+                await asyncio.to_thread(self._restore_index, index_path, previous)
+                await self._snapshot(refresh=True)
+                raise
+
+        selected_models = [
+            item.resource
+            for item in models.values()
+            if item.path.resolve().is_relative_to(selected)
+        ]
+        return ModelArtifactList(
+            data=sorted(selected_models, key=lambda item: (item.name.casefold(), item.id))
+        )
+
+    def _directory_id(self, path: Path) -> str:
+        resolved = path.resolve()
+        identifier = hashlib.sha256(
+            self._directory_secret + os.fsencode(resolved)
+        ).hexdigest()[:32]
+        self._directory_ids[identifier] = resolved
+        return identifier
+
+    def _browse_roots(self) -> list[Path]:
+        candidates = (
+            [*self.roots, Path.home(), Path(Path.home().anchor or os.sep)]
+            if self.browse_roots is None
+            else list(self.browse_roots)
+        )
+        result: list[Path] = []
+        seen: set[Path] = set()
+        for candidate in candidates:
+            try:
+                resolved = candidate.expanduser().resolve(strict=True)
+            except OSError:
+                continue
+            if not resolved.is_dir() or resolved in seen:
+                continue
+            seen.add(resolved)
+            result.append(resolved)
+        return result
+
+    @staticmethod
+    def _directory_name(path: Path) -> str:
+        return path.name or path.anchor or str(path)
+
+    @staticmethod
+    def _immediate_model_count(path: Path) -> int:
+        try:
+            return sum(
+                item.is_file() and item.suffix.casefold() == ".mfq"
+                for item in path.iterdir()
+            )
+        except OSError:
+            return 0
+
+    def _directory_entry(self, path: Path) -> ModelDirectoryEntry:
+        return ModelDirectoryEntry(
+            id=self._directory_id(path),
+            name=self._directory_name(path),
+            model_file_count=self._immediate_model_count(path),
+        )
+
+    def _browse_directories(
+        self,
+        directory_id: str | None,
+        path: str | Path | None,
+    ) -> ModelDirectoryList:
+        if directory_id is None and path is None:
+            return ModelDirectoryList(
+                data=[self._directory_entry(path) for path in self._browse_roots()]
+            )
+        if path is not None:
+            try:
+                current = Path(path).expanduser().resolve(strict=True)
+            except OSError as error:
+                raise ModelDirectoryNotFoundError(str(path)) from error
+        else:
+            current = self._directory_ids.get(directory_id or "")
+        if current is None or not current.is_dir():
+            raise ModelDirectoryNotFoundError(str(path) if path is not None else directory_id)
+        try:
+            children = sorted(
+                (item.resolve() for item in current.iterdir() if item.is_dir()),
+                key=lambda item: (item.name.casefold(), item.name),
+            )
+        except OSError as error:
+            raise ModelDirectoryNotFoundError(self._directory_name(current)) from error
+        parent = current.parent if current.parent != current else None
+        return ModelDirectoryList(
+            current_id=self._directory_id(current),
+            current_name=self._directory_name(current),
+            current_path=str(current),
+            parent_id=self._directory_id(parent) if parent is not None else None,
+            model_file_count=self._immediate_model_count(current),
+            data=[self._directory_entry(path) for path in children],
+        )
+
+    @staticmethod
+    def _registration_paths(directory: Path) -> list[Path]:
+        grouped: dict[Path, list[Path]] = {}
+        try:
+            candidates = sorted(directory.rglob("*.mfq"))
+        except OSError as error:
+            raise ModelRegistrationError("cannot scan selected model directory") from error
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            try:
+                parsed = parse_shard_path(candidate)
+            except ValueError as error:
+                raise ModelRegistrationError(str(error)) from error
+            grouped.setdefault(parsed[0] if parsed is not None else candidate, []).append(candidate)
+        result: list[Path] = []
+        for paths in grouped.values():
+            result.append(
+                next(
+                    (
+                        item
+                        for item in paths
+                        if (parsed := parse_shard_path(item)) is None or parsed[1] == 1
+                    ),
+                    paths[0],
+                ).resolve()
+            )
+        return result
+
+    @staticmethod
+    def _write_registered_paths(index: Path, paths: list[Path]) -> None:
+        index.parent.mkdir(parents=True, exist_ok=True)
+        document: dict[str, object] = {"version": 1, "files": []}
+        if index.is_file():
+            try:
+                loaded = json.loads(index.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                raise ModelRegistrationError("the model catalog index is invalid") from error
+            if not isinstance(loaded, dict) or loaded.get("version") != 1:
+                raise ModelRegistrationError("the model catalog index version is unsupported")
+            document = loaded
+        existing = document.get("files")
+        files = {value for value in existing if isinstance(value, str)} if isinstance(existing, list) else set()
+        files.update(str(path) for path in paths)
+        payload = json.dumps(
+            {"version": 1, "files": sorted(files)},
+            ensure_ascii=False,
+            indent=2,
+        ).encode("utf-8") + b"\n"
+        temporary = index.with_name(f".{index.name}.{os.getpid()}.tmp")
+        try:
+            temporary.write_bytes(payload)
+            temporary.chmod(0o600)
+            os.replace(temporary, index)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _restore_index(index: Path, previous: bytes | None) -> None:
+        if previous is None:
+            index.unlink(missing_ok=True)
+            return
+        temporary = index.with_name(f".{index.name}.{os.getpid()}.restore")
+        try:
+            temporary.write_bytes(previous)
+            temporary.chmod(0o600)
+            os.replace(temporary, index)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _canonical_model_path(path: Path) -> Path:

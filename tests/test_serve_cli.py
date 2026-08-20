@@ -9,7 +9,7 @@ import pytest
 
 from mfq.cli import _build_parser
 from mfq.commands.serve import _prepare_web_root, _resolve_runtime_executable, _run, _select_backend
-from mfq.server.native import NativeRuntime
+from mfq.server.native import NativeRuntime, native_runtime_environment
 
 
 def test_server_imports_framework_without_loading_quantization_stack() -> None:
@@ -187,6 +187,41 @@ def test_native_metal_worker_receives_prefill_chunk_size(tmp_path: Path) -> None
     command = runtime.command(43123)
 
     assert command[command.index("--prefill-chunk-size") + 1] == "4096"
+
+
+def test_native_metal_worker_finds_release_resources(tmp_path: Path) -> None:
+    executable = tmp_path / "sidecars" / "mfq-decode-metal"
+    executable.parent.mkdir()
+    executable.touch()
+    resources = tmp_path / "Resources"
+    resources.mkdir()
+    metallib = resources / "mlx.metallib"
+    metallib.touch()
+    frameworks = tmp_path / "Frameworks"
+    frameworks.mkdir()
+    video_library = frameworks / "libmfq_avfoundation_video.dylib"
+    video_library.touch()
+
+    environment = native_runtime_environment(executable, "metal", {})
+
+    assert environment["MFQ_MLX_METALLIB"] == str(metallib)
+    assert environment["MFQ_AVFOUNDATION_VIDEO_LIBRARY"] == str(video_library)
+
+
+def test_native_runtime_environment_preserves_explicit_resource_paths(tmp_path: Path) -> None:
+    environment = native_runtime_environment(
+        tmp_path / "mfq-decode-metal",
+        "metal",
+        {
+            "MFQ_MLX_METALLIB": "/configured/mlx.metallib",
+            "MFQ_AVFOUNDATION_VIDEO_LIBRARY": "/configured/video.dylib",
+        },
+    )
+
+    assert environment == {
+        "MFQ_MLX_METALLIB": "/configured/mlx.metallib",
+        "MFQ_AVFOUNDATION_VIDEO_LIBRARY": "/configured/video.dylib",
+    }
 
 
 def test_serve_builds_web_ui_when_the_source_is_newer(tmp_path: Path, monkeypatch) -> None:

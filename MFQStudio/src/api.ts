@@ -286,6 +286,21 @@ export interface ModelArtifact {
   error?: string | null;
 }
 
+export interface ModelDirectoryEntry {
+  id: string;
+  name: string;
+  model_file_count: number;
+}
+
+export interface ModelDirectoryList {
+  current_id: string | null;
+  current_name: string | null;
+  current_path: string | null;
+  parent_id: string | null;
+  model_file_count: number;
+  data: ModelDirectoryEntry[];
+}
+
 export interface RuntimeInstance {
   id: string;
   model: string;
@@ -784,6 +799,23 @@ export const api = {
     ).data;
   },
 
+  modelDirectories(directoryId?: string | null, path?: string | null): Promise<ModelDirectoryList> {
+    const query = new URLSearchParams();
+    if (directoryId) query.set("directory_id", directoryId);
+    else if (path?.trim()) query.set("path", path.trim());
+    const suffix = query.size ? `?${query.toString()}` : "";
+    return request(`/api/v1/models/directories${suffix}`);
+  },
+
+  async registerModelDirectory(directoryId: string): Promise<ModelArtifact[]> {
+    return (
+      await request<{ data: ModelArtifact[] }>("/api/v1/models/directories/register", {
+        method: "POST",
+        body: JSON.stringify({ directory_id: directoryId }),
+      })
+    ).data;
+  },
+
   async runtimeInstances(): Promise<RuntimeInstance[]> {
     return (await request<{ data: RuntimeInstance[] }>("/api/v1/runtime/instances")).data;
   },
@@ -960,6 +992,22 @@ export const api = {
 
   async jobs(limit = 100): Promise<JobResource[]> {
     return (await request<{ data: JobResource[] }>(`/api/v1/jobs?limit=${limit}`)).data;
+  },
+
+  async deleteJob(id: string): Promise<void> {
+    const response = await fetch(apiUrl(`/api/v1/jobs/${id}`), {
+      method: "DELETE",
+      headers: authorizedHeaders(),
+    });
+    if (!response.ok) throw await errorFromResponse(response);
+  },
+
+  async clearCompletedJobs(): Promise<void> {
+    const response = await fetch(apiUrl("/api/v1/jobs/completed"), {
+      method: "DELETE",
+      headers: authorizedHeaders(),
+    });
+    if (!response.ok) throw await errorFromResponse(response);
   },
 
   async jobKinds(): Promise<JobKindResource[]> {

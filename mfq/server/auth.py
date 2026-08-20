@@ -70,6 +70,8 @@ def required_scope(method: str, path: str) -> ApiKeyScope:
         return "admin"
     if path.startswith("/api/v1/cluster/"):
         return "admin"
+    if path.startswith("/api/v1/models/directories"):
+        return "models"
     if path.startswith(("/api/v1/models", "/api/v1/runtime", "/api/v1/hub")):
         return "models" if method != "GET" else "inference"
     if path.startswith(
