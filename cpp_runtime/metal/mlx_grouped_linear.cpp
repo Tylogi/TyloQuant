@@ -736,6 +736,53 @@ bool supports_single_row_mxfp8_fast_path(
     return found_mxfp8;
 }
 
+bool supports_small_m_group64_output_tile(
+    const std::vector<DirectProjectionLayout>& layouts) noexcept {
+    if (layouts.size() != 2) {
+        return false;
+    }
+    for (const auto& layout : layouts) {
+        if (layout.family != kFamilyVq ||
+            layout.execution_layout != 1 ||
+            layout.group_size != 24 ||
+            layout.vector_size != 8 ||
+            layout.index_bits != 12 ||
+            layout.state_bits != 4 ||
+            layout.entries != 4096 ||
+            layout.code_bank_mode == 2 ||
+            layout.aux_mode < 1 || layout.aux_mode > 2) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool supports_small_m_qkv_output_tile(
+    const std::vector<DirectProjectionLayout>& layouts) noexcept {
+    if (layouts.size() != 3) {
+        return false;
+    }
+    for (std::size_t index = 0; index < 2; ++index) {
+        const auto& layout = layouts[index];
+        if (layout.family != kFamilyVq ||
+            layout.execution_layout != 0 ||
+            layout.group_size != 24 ||
+            layout.vector_size != 4 ||
+            layout.index_bits != 8 ||
+            layout.entries != 256 ||
+            layout.code_bank_mode == 2 ||
+            layout.aux_mode < 1 || layout.aux_mode > 2) {
+            return false;
+        }
+    }
+    const auto& value = layouts[2];
+    return value.family == kFamilyNint &&
+        value.bits == 4 &&
+        !value.q5_execution &&
+        value.group_size > 0 &&
+        (value.group_size % 4) == 0;
+}
+
 std::string single_row_nint_kernel_key(
     const std::vector<DirectProjectionLayout>& layouts) {
     std::string key = "m1";
@@ -2129,30 +2176,541 @@ std::string make_direct_small_m_blockwise_source(
     return source;
 }
 
+std::string make_direct_small_m_group64_output_tile_source(
+    const std::vector<DirectProjectionLayout>& layouts,
+    int outputs_per_simd,
+    int simd_groups) {
+    std::string source =
+        "    constexpr uint SIMD_GROUPS = "
+        + std::to_string(simd_groups) + "u;\n";
+    source += "    constexpr uint OUTPUTS_PER_SIMD = "
+        + std::to_string(outputs_per_simd) + "u;\n";
+    source += R"METAL(
+    constexpr uint OUTPUTS_PER_TG = SIMD_GROUPS * OUTPUTS_PER_SIMD;
+
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint global_tile = threadgroup_position_in_grid.x;
+)METAL";
+
+    for (std::size_t projection = 0;
+         projection < layouts.size();
+         ++projection) {
+        const auto& layout = layouts[projection];
+        const auto suffix = std::to_string(projection);
+        source += projection == 0 ? "    if (" : "    else if (";
+        source += "global_tile >= uint(P" + suffix
+            + "_TILE_BEGIN) && global_tile < uint(P" + suffix
+            + "_TILE_END)) {\n";
+        source +=
+            "        uint local_tile = global_tile - uint(P" + suffix
+            + "_TILE_BEGIN);\n"
+            "        uint output_base = local_tile * OUTPUTS_PER_TG"
+            " + simd_group * OUTPUTS_PER_SIMD;\n"
+            "        uint output_group_bases[OUTPUTS_PER_SIMD];\n"
+            "        uint output_super_bases[OUTPUTS_PER_SIMD];\n"
+            "        float output_anchors[OUTPUTS_PER_SIMD];\n"
+            "        float accumulators[OUTPUTS_PER_SIMD][ROWS];\n"
+            "        for (uint output_row = 0u;"
+            " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
+            "            uint output = min(output_base + output_row,"
+            " uint(P" + suffix + "_OUT) - 1u);\n"
+            "            output_group_bases[output_row] ="
+            " output * uint(P" + suffix + "_NG);\n"
+            "            output_super_bases[output_row] ="
+            " output * uint(P" + suffix + "_NSUPER);\n"
+            "            output_anchors[output_row] ="
+            " vq_anchors_" + suffix + "[output];\n"
+            "            for (uint row = 0u; row < uint(ROWS); ++row) {\n"
+            "                accumulators[output_row][row] = 0.0f;\n"
+            "            }\n"
+            "        }\n"
+            "        for (uint group = lane; group < uint(P" + suffix
+            + "_NG); group += 32u) {\n"
+            "            uint2 records[OUTPUTS_PER_SIMD];\n"
+            "            float weight_scales[OUTPUTS_PER_SIMD];\n"
+            "            uint table_banks[OUTPUTS_PER_SIMD];\n"
+            "            uint code_banks[OUTPUTS_PER_SIMD];\n"
+            "            for (uint output_row = 0u;"
+            " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
+            "                uint2 record = mfq_grouped_vq_read_group64("
+            "vq_indices_" + suffix
+            + ", output_group_bases[output_row] + group);\n"
+            "                records[output_row] = record;\n"
+            "                uint state = record.y >> 28u;\n"
+            "                uint table_bank = 0u;\n";
+        if (layout.table_banks > 1) {
+            source +=
+                "                table_bank = uint(vq_bank_ids_" + suffix
+                + "[output_super_bases[output_row]"
+                " + group / uint(P" + suffix
+                + "_GROUPS_PER_SUPER)]);\n";
+        }
+        source +=
+            "                table_banks[output_row] = table_bank;\n"
+            "                uint code_bank = 0u;\n";
+        if (layout.code_bank_mode == 1) {
+            source +=
+                "                code_bank = uint(vq_state_banks_" + suffix
+                + "[state]);\n";
+        } else if (layout.code_bank_mode == 2) {
+            source +=
+                "                code_bank ="
+                " mfq_grouped_vq_group64_segment(record, 0u) >> 12u;\n";
+        }
+        source +=
+            "                code_banks[output_row] = code_bank;\n"
+            "                weight_scales[output_row] ="
+            " output_anchors[output_row] * vq_scales_" + suffix
+            + "[table_bank * uint(P" + suffix
+            + "_STATES) + state];\n"
+            "            }\n"
+            "            #pragma clang loop unroll(full)\n"
+            "            for (uint local_vector = 0u;"
+            " local_vector < 3u; ++local_vector) {\n"
+            "                uint column_base = group * 24u"
+            " + local_vector * 8u;\n"
+            "                if (column_base >= uint(K)) { break; }\n"
+            "                for (uint output_row = 0u;"
+            " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
+            "                    uint segment ="
+            " mfq_grouped_vq_group64_segment("
+            "records[output_row], local_vector);\n"
+            "                    uint index = segment & 4095u;\n"
+            "                    uint sign_value = segment >> 12u;\n"
+            "                    uint code_base = ((("
+            "table_banks[output_row] * uint(P" + suffix
+            + "_CODE_BANKS) + code_banks[output_row])"
+            " * uint(P" + suffix + "_ENTRIES) + index) * 8u);\n"
+            "                    uint2 packed_words ="
+            " *(device const uint2*)(vq_codebooks_" + suffix
+            + " + code_base);\n"
+            "                    char4 packed_codes0 ="
+            " as_type<char4>(packed_words.x);\n"
+            "                    char4 packed_codes1 ="
+            " as_type<char4>(packed_words.y);\n"
+            "                    float4 codes0 = float4("
+            "float(packed_codes0.x), float(packed_codes0.y),"
+            " float(packed_codes0.z), float(packed_codes0.w));\n"
+            "                    float4 codes1 = float4("
+            "float(packed_codes1.x), float(packed_codes1.y),"
+            " float(packed_codes1.z), float(packed_codes1.w));\n"
+            "                    for (uint component = 0u;"
+            " component < 4u; ++component) {\n"
+            "                        if (((sign_value >> component)"
+            " & 1u) != 0u) { codes0[component] = -codes0[component]; }\n"
+            "                    }\n"
+            "                    for (uint component = 0u;"
+            " component < 4u; ++component) {\n"
+            "                        uint sign_position = component + 4u;\n"
+            "                        uint negative ="
+            " (sign_value >> sign_position) & 1u;\n";
+        if (layout.aux_mode == 2) {
+            source +=
+                "                        if (sign_position == 7u)"
+                " { negative ^= (index >> 7u) & 1u; }\n";
+        }
+        source +=
+            "                        if (negative != 0u)"
+            " { codes1[component] = -codes1[component]; }\n"
+            "                    }\n"
+            "                    float scale = weight_scales[output_row];\n"
+            "                    float4 weights0 = scale * codes0;\n"
+            "                    float4 weights1 = scale * codes1;\n"
+            "                    for (uint row = 0u;"
+            " row < uint(ROWS); ++row) {\n"
+            "                        uint input_base ="
+            " row * uint(K) + column_base;\n"
+            "                        float4 activation0 = float4("
+            "*(device const half4*)(x + input_base));\n"
+            "                        float4 activation1 = float4("
+            "*(device const half4*)(x + input_base + 4u));\n"
+            "                        accumulators[output_row][row] +="
+            " dot(activation0, weights0);\n"
+            "                        accumulators[output_row][row] +="
+            " dot(activation1, weights1);\n"
+            "                    }\n"
+            "                }\n"
+            "            }\n"
+            "        }\n"
+            "        for (uint output_row = 0u;"
+            " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
+            "            uint output_index = output_base + output_row;\n"
+            "            for (uint row = 0u; row < uint(ROWS); ++row) {\n"
+            "                float total ="
+            " simd_sum(accumulators[output_row][row]);\n"
+            "                if (lane == 0u &&"
+            " output_index < uint(P" + suffix + "_OUT)) {\n"
+            "                    y[row * uint(TOTAL_OUT) + uint(P" + suffix
+            + "_OUT_OFFSET) + output_index] = T(total);\n"
+            "                }\n"
+            "            }\n"
+            "        }\n"
+            "    }\n";
+    }
+    return source;
+}
+
+std::string make_direct_small_m_qkv_output_tile_source(
+    const std::vector<DirectProjectionLayout>& layouts,
+    int outputs_per_simd,
+    int simd_groups) {
+    std::string source =
+        "    constexpr uint SIMD_GROUPS = "
+        + std::to_string(simd_groups) + "u;\n";
+    source += "    constexpr uint OUTPUTS_PER_SIMD = "
+        + std::to_string(outputs_per_simd) + "u;\n";
+    source += R"METAL(
+    constexpr uint OUTPUTS_PER_TG = SIMD_GROUPS * OUTPUTS_PER_SIMD;
+
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint global_tile = threadgroup_position_in_grid.x;
+)METAL";
+
+    for (std::size_t projection = 0;
+         projection < layouts.size();
+         ++projection) {
+        const auto& layout = layouts[projection];
+        const auto suffix = std::to_string(projection);
+        source += projection == 0 ? "    if (" : "    else if (";
+        source += "global_tile >= uint(P" + suffix
+            + "_TILE_BEGIN) && global_tile < uint(P" + suffix
+            + "_TILE_END)) {\n";
+        source +=
+            "        uint local_tile = global_tile - uint(P" + suffix
+            + "_TILE_BEGIN);\n"
+            "        uint output_base = local_tile * OUTPUTS_PER_TG"
+            " + simd_group * OUTPUTS_PER_SIMD;\n"
+            "        float accumulators[OUTPUTS_PER_SIMD][ROWS];\n"
+            "        for (uint output_row = 0u;"
+            " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
+            "            for (uint row = 0u; row < uint(ROWS); ++row) {\n"
+            "                accumulators[output_row][row] = 0.0f;\n"
+            "            }\n"
+            "        }\n";
+
+        if (layout.family == kFamilyVq) {
+            source +=
+                "        uint output_group_bases[OUTPUTS_PER_SIMD];\n"
+                "        uint output_vector_bases[OUTPUTS_PER_SIMD];\n"
+                "        uint output_sign_bases[OUTPUTS_PER_SIMD];\n"
+                "        uint output_super_bases[OUTPUTS_PER_SIMD];\n"
+                "        float output_anchors[OUTPUTS_PER_SIMD];\n"
+                "        for (uint output_row = 0u;"
+                " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
+                "            uint output = min(output_base + output_row,"
+                " uint(P" + suffix + "_OUT) - 1u);\n"
+                "            output_group_bases[output_row] ="
+                " output * uint(P" + suffix + "_NG);\n"
+                "            output_vector_bases[output_row] ="
+                " output * uint(P" + suffix + "_NVEC);\n"
+                "            output_sign_bases[output_row] ="
+                " output * ((uint(K) + 7u) / 8u);\n"
+                "            output_super_bases[output_row] ="
+                " output * uint(P" + suffix + "_NSUPER);\n"
+                "            output_anchors[output_row] ="
+                " vq_anchors_" + suffix + "[output];\n"
+                "        }\n"
+                "        for (uint group = lane; group < uint(P" + suffix
+                + "_NG); group += 32u) {\n"
+                "            float weight_scales[OUTPUTS_PER_SIMD];\n"
+                "            uint table_banks[OUTPUTS_PER_SIMD];\n"
+                "            uint code_banks[OUTPUTS_PER_SIMD];\n"
+                "            uint group_signs[OUTPUTS_PER_SIMD];\n"
+                "            for (uint output_row = 0u;"
+                " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
+                "                uint state_index ="
+                " output_group_bases[output_row] + group;\n";
+            append_blockwise_vq_read(
+                source,
+                "state",
+                "vq_state_" + suffix,
+                "state_index",
+                layout.state_bits);
+            source +=
+                "                uint table_bank = 0u;\n";
+            if (layout.table_banks > 1) {
+                source +=
+                    "                table_bank = uint(vq_bank_ids_" + suffix
+                    + "[output_super_bases[output_row]"
+                    " + group / uint(P" + suffix
+                    + "_GROUPS_PER_SUPER)]);\n";
+            }
+            source +=
+                "                uint code_bank = 0u;\n";
+            if (layout.code_bank_mode == 1) {
+                source +=
+                    "                code_bank = uint(vq_state_banks_"
+                    + suffix + "[state]);\n";
+            }
+            source +=
+                "                table_banks[output_row] = table_bank;\n"
+                "                code_banks[output_row] = code_bank;\n"
+                "                weight_scales[output_row] ="
+                " output_anchors[output_row] * vq_scales_" + suffix
+                + "[table_bank * uint(P" + suffix
+                + "_STATES) + state];\n"
+                "                uint sign_bit ="
+                " (output_sign_bases[output_row] + group * 3u) * 7u;\n"
+                "                uint sign_byte = sign_bit >> 3u;\n"
+                "                uint packed_signs ="
+                " uint(vq_aux_" + suffix + "[sign_byte])"
+                " | (uint(vq_aux_" + suffix
+                + "[sign_byte + 1u]) << 8u)"
+                " | (uint(vq_aux_" + suffix
+                + "[sign_byte + 2u]) << 16u)"
+                " | (uint(vq_aux_" + suffix
+                + "[sign_byte + 3u]) << 24u);\n"
+                "                group_signs[output_row] ="
+                " packed_signs >> (sign_bit & 7u);\n"
+                "            }\n"
+                "            #pragma clang loop unroll(full)\n"
+                "            for (uint local_pair = 0u;"
+                " local_pair < 3u; ++local_pair) {\n"
+                "                uint column_base = group * 24u"
+                " + local_pair * 8u;\n"
+                "                if (column_base >= uint(K)) { break; }\n"
+                "                for (uint output_row = 0u;"
+                " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
+                "                    uint index_position ="
+                " output_vector_bases[output_row] + group * 6u"
+                " + local_pair * 2u;\n"
+                "                    uchar2 pair_indices ="
+                " *(device const uchar2*)(vq_indices_" + suffix
+                + " + index_position);\n"
+                "                    uint index0 = uint(pair_indices.x);\n"
+                "                    uint index1 = uint(pair_indices.y);\n"
+                "                    uint sign_value ="
+                " (group_signs[output_row] >> (local_pair * 7u))"
+                " & 127u;\n"
+                "                    uint code_base0 = (("
+                "(table_banks[output_row] * uint(P" + suffix
+                + "_CODE_BANKS) + code_banks[output_row])"
+                " * uint(P" + suffix + "_ENTRIES) + index0) * 4u);\n"
+                "                    uint code_base1 = (("
+                "(table_banks[output_row] * uint(P" + suffix
+                + "_CODE_BANKS) + code_banks[output_row])"
+                " * uint(P" + suffix + "_ENTRIES) + index1) * 4u);\n"
+                "                    char4 packed_codes0 ="
+                " *(device const char4*)(vq_codebooks_" + suffix
+                + " + code_base0);\n"
+                "                    char4 packed_codes1 ="
+                " *(device const char4*)(vq_codebooks_" + suffix
+                + " + code_base1);\n"
+                "                    float4 codes0 = float4("
+                "float(packed_codes0.x), float(packed_codes0.y),"
+                " float(packed_codes0.z), float(packed_codes0.w));\n"
+                "                    float4 codes1 = float4("
+                "float(packed_codes1.x), float(packed_codes1.y),"
+                " float(packed_codes1.z), float(packed_codes1.w));\n"
+                "                    for (uint component = 0u;"
+                " component < 4u; ++component) {\n"
+                "                        if (((sign_value >> component)"
+                " & 1u) != 0u) { codes0[component] = -codes0[component]; }\n"
+                "                    }\n"
+                "                    for (uint component = 0u;"
+                " component < 4u; ++component) {\n"
+                "                        uint sign_position ="
+                " component + 4u;\n"
+                "                        uint negative ="
+                " sign_position < 7u"
+                " ? ((sign_value >> sign_position) & 1u)"
+                " : (popcount(sign_value) & 1u);\n";
+            if (layout.aux_mode == 2) {
+                source +=
+                    "                        if (sign_position == 7u)"
+                    " { negative ^= (index1 >> 7u) & 1u; }\n";
+            }
+            source +=
+                "                        if (negative != 0u)"
+                " { codes1[component] = -codes1[component]; }\n"
+                "                    }\n"
+                "                    float scale ="
+                " weight_scales[output_row];\n"
+                "                    float4 weights0 = scale * codes0;\n"
+                "                    float4 weights1 = scale * codes1;\n"
+                "                    for (uint row = 0u;"
+                " row < uint(ROWS); ++row) {\n"
+                "                        uint input_base ="
+                " row * uint(K) + column_base;\n"
+                "                        float4 activation0 = float4("
+                "*(device const half4*)(x + input_base));\n"
+                "                        float4 activation1 = float4("
+                "*(device const half4*)(x + input_base + 4u));\n"
+                "                        accumulators[output_row][row] +="
+                " dot(activation0, weights0);\n"
+                "                        accumulators[output_row][row] +="
+                " dot(activation1, weights1);\n"
+                "                    }\n"
+                "                }\n"
+                "            }\n"
+                "        }\n";
+        } else {
+            source +=
+                "        uint output_group_bases[OUTPUTS_PER_SIMD];\n"
+                "        float output_scales[OUTPUTS_PER_SIMD];\n"
+                "        float output_minimums[OUTPUTS_PER_SIMD];\n"
+                "        for (uint output_row = 0u;"
+                " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
+                "            uint output = min(output_base + output_row,"
+                " uint(P" + suffix + "_OUT) - 1u);\n"
+                "            output_group_bases[output_row] ="
+                " output * uint(P" + suffix + "_NG);\n"
+                "            output_scales[output_row] ="
+                " neuron_scale_" + suffix + "[output];\n"
+                "            output_minimums[output_row] ="
+                " neuron_min_" + suffix + "[output];\n"
+                "        }\n"
+                "        for (uint group = lane; group < uint(P" + suffix
+                + "_NG); group += 32u) {\n"
+                "            for (uint element = 0u;"
+                " element < uint(P" + suffix + "_GS); element += 4u) {\n"
+                "                uint column = group * uint(P" + suffix
+                + "_GS) + element;\n"
+                "                if (column >= uint(K)) { break; }\n"
+                "                for (uint output_row = 0u;"
+                " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
+                "                    uint metadata_index ="
+                " output_group_bases[output_row] + group;\n"
+                "                    float scale ="
+                " output_scales[output_row]"
+                " * float(sub_scale_" + suffix + "[metadata_index]);\n"
+                "                    float minimum ="
+                " output_minimums[output_row]"
+                " * float(sub_min_" + suffix + "[metadata_index]);\n"
+                "                    uint quantized_index ="
+                " metadata_index * uint(P" + suffix + "_GS) + element;\n"
+                "                    uint packed ="
+                " uint(q_packed_" + suffix
+                + "[quantized_index >> 1u])"
+                " | (uint(q_packed_" + suffix
+                + "[(quantized_index >> 1u) + 1u]) << 8u);\n"
+                "                    float4 weights = scale * float4("
+                "float(packed & 15u),"
+                " float((packed >> 4u) & 15u),"
+                " float((packed >> 8u) & 15u),"
+                " float((packed >> 12u) & 15u)) - float4(minimum);\n"
+                "                    for (uint row = 0u;"
+                " row < uint(ROWS); ++row) {\n"
+                "                        uint input_base ="
+                " row * uint(K) + column;\n"
+                "                        float4 activation = float4("
+                "*(device const half4*)(x + input_base));\n"
+                "                        accumulators[output_row][row] +="
+                " activation.x * weights.x;\n"
+                "                        accumulators[output_row][row] +="
+                " activation.y * weights.y;\n"
+                "                        accumulators[output_row][row] +="
+                " activation.z * weights.z;\n"
+                "                        accumulators[output_row][row] +="
+                " activation.w * weights.w;\n"
+                "                    }\n"
+                "                }\n"
+                "            }\n"
+                "        }\n";
+        }
+
+        source +=
+            "        for (uint output_row = 0u;"
+            " output_row < OUTPUTS_PER_SIMD; ++output_row) {\n"
+            "            uint output = output_base + output_row;\n"
+            "            for (uint row = 0u; row < uint(ROWS); ++row) {\n"
+            "                float total ="
+            " simd_sum(accumulators[output_row][row]);\n"
+            "                if (lane == 0u &&"
+            " output < uint(P" + suffix + "_OUT)) {\n"
+            "                    y[row * uint(TOTAL_OUT) + uint(P" + suffix
+            + "_OUT_OFFSET) + output] = T(total);\n"
+            "                }\n"
+            "            }\n"
+            "        }\n"
+            "    }\n";
+    }
+    return source;
+}
+
+mlx::core::fast::CustomKernelFunction make_direct_small_m_qkv_kernel(
+    const std::vector<DirectProjectionLayout>& layouts,
+    int outputs_per_simd,
+    int simd_groups) {
+    CompileOptions options;
+    options.math_mode = MathMode::Fast;
+    return mlx::core::fast::metal_kernel(
+        "mfq_cpp_zero_copy_grouped_linear_"
+            + direct_kernel_key(layouts)
+            + "_m2_qkv_o" + std::to_string(outputs_per_simd)
+            + "s" + std::to_string(simd_groups),
+        direct_input_names(layouts),
+        {"y"},
+        make_direct_small_m_qkv_output_tile_source(
+            layouts,
+            outputs_per_simd,
+            simd_groups),
+        kGroupedHeader,
+        true,
+        false,
+        options);
+}
+
+mlx::core::fast::CustomKernelFunction direct_small_m_qkv_kernel(
+    const std::vector<DirectProjectionLayout>& layouts,
+    int outputs_per_simd,
+    int simd_groups) {
+    static std::mutex mutex;
+    static std::unordered_map<
+        std::string,
+        mlx::core::fast::CustomKernelFunction> kernels;
+    const auto key = direct_kernel_key(layouts)
+        + "_m2_qkv_o" + std::to_string(outputs_per_simd)
+        + "s" + std::to_string(simd_groups);
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto found = kernels.find(key);
+    if (found != kernels.end()) {
+        return found->second;
+    }
+    auto kernel = make_direct_small_m_qkv_kernel(
+        layouts,
+        outputs_per_simd,
+        simd_groups);
+    kernels.emplace(key, kernel);
+    return kernel;
+}
+
 mlx::core::fast::CustomKernelFunction make_direct_kernel(
     const std::vector<DirectProjectionLayout>& layouts,
     bool batch_rows,
     bool blockwise,
-    bool vectorized_fp16) {
+    bool vectorized_fp16,
+    int group64_outputs_per_simd,
+    int group64_simd_groups) {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
     const auto key = direct_kernel_key(layouts)
-        + (batch_rows
+        + (group64_outputs_per_simd > 0
+            ? "_m234_group64_o" + std::to_string(group64_outputs_per_simd)
+                + "s" + std::to_string(group64_simd_groups)
+            : (batch_rows
             ? (blockwise
                 ? (vectorized_fp16
                     ? "_m234_block_vec"
                     : "_m234_block")
                 : "_m234")
-            : "_rows");
+            : "_rows"));
     return mlx::core::fast::metal_kernel(
         "mfq_cpp_zero_copy_grouped_linear_" + key,
         direct_input_names(layouts),
         {"y"},
-        blockwise
+        group64_outputs_per_simd > 0
+            ? make_direct_small_m_group64_output_tile_source(
+                layouts,
+                group64_outputs_per_simd,
+                group64_simd_groups)
+            : (blockwise
             ? make_direct_small_m_blockwise_source(
                 layouts,
                 vectorized_fp16)
-            : make_direct_source(layouts, batch_rows),
+            : make_direct_source(layouts, batch_rows)),
         kGroupedHeader,
         true,
         false,
@@ -2163,20 +2721,25 @@ mlx::core::fast::CustomKernelFunction direct_kernel(
     const std::vector<DirectProjectionLayout>& layouts,
     bool batch_rows,
     bool blockwise = false,
-    bool vectorized_fp16 = false) {
+    bool vectorized_fp16 = false,
+    int group64_outputs_per_simd = 0,
+    int group64_simd_groups = 2) {
     static std::mutex mutex;
     static std::unordered_map<
         std::string,
         mlx::core::fast::CustomKernelFunction> kernels;
 
     const auto key = direct_kernel_key(layouts)
-        + (batch_rows
+        + (group64_outputs_per_simd > 0
+            ? "_m234_group64_o" + std::to_string(group64_outputs_per_simd)
+                + "s" + std::to_string(group64_simd_groups)
+            : (batch_rows
             ? (blockwise
                 ? (vectorized_fp16
                     ? "_m234_block_vec"
                     : "_m234_block")
                 : "_m234")
-            : "_rows");
+            : "_rows"));
     std::lock_guard<std::mutex> lock(mutex);
     const auto found = kernels.find(key);
     if (found != kernels.end()) {
@@ -2186,7 +2749,9 @@ mlx::core::fast::CustomKernelFunction direct_kernel(
         layouts,
         batch_rows,
         blockwise,
-        vectorized_fp16);
+        vectorized_fp16,
+        group64_outputs_per_simd,
+        group64_simd_groups);
     kernels.emplace(key, kernel);
     return kernel;
 }
@@ -4216,13 +4781,72 @@ std::vector<array> MlxGroupedLinear::matmul(
     const bool use_vectorized_fp16 =
         use_small_m_blockwise &&
         source.dtype() == mlx::core::float16;
+    int group64_outputs_per_simd = 0;
+    int group64_simd_groups = 8;
+    if (use_vectorized_fp16 &&
+        (impl_->input_size % 8) == 0 &&
+        supports_small_m_group64_output_tile(impl_->direct_layouts)) {
+        group64_outputs_per_simd = rows == 4 ? 5 : 8;
+        if (const auto* value = std::getenv(
+                "MFQ_METAL_GROUPED_GROUP64_OUTPUT_TILE")) {
+            group64_outputs_per_simd = 0;
+            if (value[1] == '\0' && value[0] >= '1' && value[0] <= '8') {
+                group64_outputs_per_simd = value[0] - '0';
+            }
+        }
+        if (const auto* value = std::getenv(
+                "MFQ_METAL_GROUPED_GROUP64_SIMD_GROUPS")) {
+            if (std::strcmp(value, "4") == 0) {
+                group64_simd_groups = 4;
+            } else if (std::strcmp(value, "8") == 0) {
+                group64_simd_groups = 8;
+            }
+        }
+    }
+    int qkv_outputs_per_simd = 0;
+    int qkv_simd_groups = 4;
+    if (rows == 2 &&
+        use_vectorized_fp16 &&
+        (impl_->input_size % 8) == 0 &&
+        supports_small_m_qkv_output_tile(impl_->direct_layouts)) {
+        qkv_outputs_per_simd = 3;
+        if (const auto* value = std::getenv(
+                "MFQ_METAL_GROUPED_QKV_OUTPUT_TILE")) {
+            qkv_outputs_per_simd = 0;
+            if (value[1] == '\0' && value[0] >= '1' && value[0] <= '8') {
+                qkv_outputs_per_simd = value[0] - '0';
+            }
+        }
+        if (const auto* value = std::getenv(
+                "MFQ_METAL_GROUPED_QKV_SIMD_GROUPS")) {
+            if (std::strcmp(value, "4") == 0) {
+                qkv_simd_groups = 4;
+            } else if (std::strcmp(value, "8") == 0) {
+                qkv_simd_groups = 8;
+            }
+        }
+    }
+    const int specialized_outputs_per_simd =
+        group64_outputs_per_simd > 0
+        ? group64_outputs_per_simd
+        : qkv_outputs_per_simd;
+    const int specialized_simd_groups =
+        group64_outputs_per_simd > 0
+        ? group64_simd_groups
+        : qkv_simd_groups;
+    const int small_m_outputs_per_tile =
+        specialized_outputs_per_simd > 0
+        ? specialized_simd_groups * specialized_outputs_per_simd
+        : 8;
     int small_m_blockwise_tiles = 0;
     if (use_small_m_blockwise) {
         for (const auto& layout : impl_->direct_layouts) {
             small_m_blockwise_tiles = checked_int(
                 static_cast<std::size_t>(small_m_blockwise_tiles)
                     + static_cast<std::size_t>(
-                        (layout.output_size + 7) / 8),
+                        (layout.output_size
+                            + small_m_outputs_per_tile - 1)
+                        / small_m_outputs_per_tile),
                 "small-M blockwise tile count");
         }
     }
@@ -4235,14 +4859,15 @@ std::vector<array> MlxGroupedLinear::matmul(
         : (use_small_m_blockwise
             ? small_m_blockwise_tiles
             : impl_->total_tiles);
+    const int grouped_threads =
+        specialized_outputs_per_simd > 0
+        ? specialized_simd_groups * 32
+        : (use_single_row_mxfp8_fast_path
+            ? 128
+            : (use_partitioned_nint4_qkv ? 256 : 64));
     const auto grid = (use_small_m_batched_path ? 1 : rows)
         * static_cast<std::size_t>(work_tiles)
-        * static_cast<std::size_t>(
-            use_single_row_mxfp8_fast_path
-                ? 128
-                : (use_partitioned_nint4_qkv
-                    ? 256
-                    : 64));
+        * static_cast<std::size_t>(grouped_threads);
     if (grid >
         static_cast<std::size_t>(
             std::numeric_limits<int>::max())) {
@@ -4264,11 +4889,7 @@ std::vector<array> MlxGroupedLinear::matmul(
         1,
     };
     const auto threadgroup = std::tuple<int, int, int>{
-        use_single_row_mxfp8_fast_path
-            ? 128
-            : (use_partitioned_nint4_qkv
-                ? 256
-                : 64),
+        grouped_threads,
         1,
         1,
     };
@@ -4401,7 +5022,9 @@ std::vector<array> MlxGroupedLinear::matmul(
                 const int execution_tile_end =
                     use_small_m_blockwise
                     ? execution_tile_begin
-                        + (layout.output_size + 7) / 8
+                        + (layout.output_size
+                            + small_m_outputs_per_tile - 1)
+                            / small_m_outputs_per_tile
                     : layout.tile_end;
                 templates.emplace_back(
                     prefix + "OUT",
@@ -4496,11 +5119,19 @@ std::vector<array> MlxGroupedLinear::matmul(
                         layout.bits);
                 }
             }
-            return direct_kernel(
-                impl_->direct_layouts,
-                use_small_m_batched_path,
-                use_small_m_blockwise,
-                use_vectorized_fp16)(
+            auto kernel = qkv_outputs_per_simd > 0
+                ? direct_small_m_qkv_kernel(
+                    impl_->direct_layouts,
+                    qkv_outputs_per_simd,
+                    qkv_simd_groups)
+                : direct_kernel(
+                    impl_->direct_layouts,
+                    use_small_m_batched_path,
+                    use_small_m_blockwise,
+                    use_vectorized_fp16,
+                    group64_outputs_per_simd,
+                    group64_simd_groups);
+            return kernel(
                 inputs,
                 output_shapes,
                 output_dtypes,

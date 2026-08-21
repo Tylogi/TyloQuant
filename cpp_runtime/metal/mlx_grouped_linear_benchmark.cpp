@@ -206,6 +206,82 @@ int main(int argc, char** argv) {
                 << "\tmax_abs=" << delta.maximum_absolute << '\n';
         }
 
+        if (const auto* tile = std::getenv(
+                "MFQ_METAL_GROUPED_COMPARE_GROUP64_TILE")) {
+            const auto* previous = std::getenv(
+                "MFQ_METAL_GROUPED_GROUP64_OUTPUT_TILE");
+            const std::string saved = previous == nullptr ? "" : previous;
+            const bool had_previous = previous != nullptr;
+            setenv(
+                "MFQ_METAL_GROUPED_GROUP64_OUTPUT_TILE",
+                "legacy",
+                1);
+            auto reference = grouped(source);
+            mlx::core::eval(reference);
+            setenv(
+                "MFQ_METAL_GROUPED_GROUP64_OUTPUT_TILE",
+                tile,
+                1);
+            auto candidate = grouped(source);
+            mlx::core::eval(candidate);
+            mlx::core::synchronize();
+            const auto delta = compare_outputs(
+                std::move(reference),
+                std::move(candidate));
+            if (had_previous) {
+                setenv(
+                    "MFQ_METAL_GROUPED_GROUP64_OUTPUT_TILE",
+                    saved.c_str(),
+                    1);
+            } else {
+                unsetenv("MFQ_METAL_GROUPED_GROUP64_OUTPUT_TILE");
+            }
+            std::cerr
+                << "group64_tile_delta\telements=" << delta.elements
+                << "\tdifferent=" << delta.different
+                << "\tmean_abs=" << std::setprecision(9)
+                << delta.mean_absolute
+                << "\tmax_abs=" << delta.maximum_absolute << '\n';
+        }
+
+        if (const auto* tile = std::getenv(
+                "MFQ_METAL_GROUPED_COMPARE_QKV_TILE")) {
+            const auto* previous = std::getenv(
+                "MFQ_METAL_GROUPED_QKV_OUTPUT_TILE");
+            const std::string saved = previous == nullptr ? "" : previous;
+            const bool had_previous = previous != nullptr;
+            setenv(
+                "MFQ_METAL_GROUPED_QKV_OUTPUT_TILE",
+                "legacy",
+                1);
+            auto reference = grouped(source);
+            mlx::core::eval(reference);
+            setenv(
+                "MFQ_METAL_GROUPED_QKV_OUTPUT_TILE",
+                tile,
+                1);
+            auto candidate = grouped(source);
+            mlx::core::eval(candidate);
+            mlx::core::synchronize();
+            const auto delta = compare_outputs(
+                std::move(reference),
+                std::move(candidate));
+            if (had_previous) {
+                setenv(
+                    "MFQ_METAL_GROUPED_QKV_OUTPUT_TILE",
+                    saved.c_str(),
+                    1);
+            } else {
+                unsetenv("MFQ_METAL_GROUPED_QKV_OUTPUT_TILE");
+            }
+            std::cerr
+                << "qkv_tile_delta\telements=" << delta.elements
+                << "\tdifferent=" << delta.different
+                << "\tmean_abs=" << std::setprecision(9)
+                << delta.mean_absolute
+                << "\tmax_abs=" << delta.maximum_absolute << '\n';
+        }
+
         auto outputs = grouped(source);
         mlx::core::eval(outputs);
         for (int index = 0; index < 4; ++index) {

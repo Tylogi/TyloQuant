@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -693,6 +694,141 @@ constexpr const char* kMmqSource = R"METAL(
             y[
                 row * uint(OUT) + output_index
             ] = T(accumulators[input]);
+        }
+    }
+)METAL";
+
+constexpr const char* kGroup64MmqSource = R"METAL(
+    constexpr uint SIMD_GROUPS = 2u;
+    constexpr uint OUTPUTS_PER_TG =
+        SIMD_GROUPS * uint(OUTPUTS_PER_SIMD);
+
+    uint lane = thread_index_in_simdgroup;
+    uint output_base =
+        threadgroup_position_in_grid.x * OUTPUTS_PER_TG
+        + simdgroup_index_in_threadgroup * uint(OUTPUTS_PER_SIMD);
+    float accumulators[OUTPUTS_PER_SIMD][TILE_M];
+    uint output_group_bases[OUTPUTS_PER_SIMD];
+    uint output_super_bases[OUTPUTS_PER_SIMD];
+    float output_anchors[OUTPUTS_PER_SIMD];
+    for (uint output_row = 0u;
+         output_row < uint(OUTPUTS_PER_SIMD);
+         ++output_row) {
+        uint output = min(
+            output_base + output_row,
+            uint(OUT) - 1u);
+        output_group_bases[output_row] = output * uint(NG);
+        output_super_bases[output_row] = output * uint(NSUPER);
+        output_anchors[output_row] = anchors[output];
+        for (uint row = 0u; row < uint(TILE_M); ++row) {
+            accumulators[output_row][row] = 0.0f;
+        }
+    }
+
+    for (uint group = lane; group < uint(NG); group += 32u) {
+        uint2 records[OUTPUTS_PER_SIMD];
+        uint table_banks[OUTPUTS_PER_SIMD];
+        uint code_banks[OUTPUTS_PER_SIMD];
+        float weight_scales[OUTPUTS_PER_SIMD];
+        for (uint output_row = 0u;
+             output_row < uint(OUTPUTS_PER_SIMD);
+             ++output_row) {
+            uint2 record = mfq_vq_read_group64(
+                indices_packed,
+                output_group_bases[output_row] + group);
+            records[output_row] = record;
+            uint state = record.y >> 28u;
+            uint table_bank = HAS_TABLE_BANKS != 0
+                ? uint(bank_ids[
+                    output_super_bases[output_row]
+                    + group / uint(GROUPS_PER_SUPER)])
+                : 0u;
+            uint code_bank = CODE_BANK_MODE == 1
+                ? uint(state_to_codebank[state])
+                : 0u;
+            table_banks[output_row] = table_bank;
+            code_banks[output_row] = code_bank;
+            weight_scales[output_row] = output_anchors[output_row]
+                * scale_lut[table_bank * uint(STATES) + state];
+        }
+        #pragma clang loop unroll(full)
+        for (uint local_vector = 0u;
+             local_vector < 3u;
+             ++local_vector) {
+            uint column_base = group * 24u + local_vector * 8u;
+            if (column_base >= uint(K)) {
+                break;
+            }
+            for (uint output_row = 0u;
+                 output_row < uint(OUTPUTS_PER_SIMD);
+                 ++output_row) {
+                uint segment = mfq_vq_group64_segment(
+                    records[output_row],
+                    local_vector);
+                uint index = segment & 4095u;
+                uint sign_value = segment >> 12u;
+                uint code_bank = CODE_BANK_MODE == 2
+                    ? sign_value
+                    : code_banks[output_row];
+                uint code_base = (((
+                    table_banks[output_row] * uint(CODE_BANKS)
+                    + code_bank) * uint(ENTRIES) + index) * 8u);
+                uint2 packed_words = *(device const uint2*)(
+                    codebooks + code_base);
+                char4 packed_codes0 = as_type<char4>(packed_words.x);
+                char4 packed_codes1 = as_type<char4>(packed_words.y);
+                float4 codes0 = float4(
+                    float(packed_codes0.x),
+                    float(packed_codes0.y),
+                    float(packed_codes0.z),
+                    float(packed_codes0.w));
+                float4 codes1 = float4(
+                    float(packed_codes1.x),
+                    float(packed_codes1.y),
+                    float(packed_codes1.z),
+                    float(packed_codes1.w));
+                for (uint component = 0u; component < 4u; ++component) {
+                    if (((sign_value >> component) & 1u) != 0u) {
+                        codes0[component] = -codes0[component];
+                    }
+                }
+                for (uint component = 0u; component < 4u; ++component) {
+                    uint sign_position = component + 4u;
+                    uint negative = (sign_value >> sign_position) & 1u;
+                    if (AUX_MODE == 2 && sign_position == 7u) {
+                        negative ^= (index >> 7u) & 1u;
+                    }
+                    if (negative != 0u) {
+                        codes1[component] = -codes1[component];
+                    }
+                }
+                float scale = weight_scales[output_row];
+                float4 weights0 = scale * codes0;
+                float4 weights1 = scale * codes1;
+                for (uint row = 0u; row < uint(TILE_M); ++row) {
+                    uint input_base = row * uint(K) + column_base;
+                    float4 activation0 = float4(
+                        *(device const half4*)(x + input_base));
+                    float4 activation1 = float4(
+                        *(device const half4*)(x + input_base + 4u));
+                    accumulators[output_row][row] +=
+                        dot(activation0, weights0);
+                    accumulators[output_row][row] +=
+                        dot(activation1, weights1);
+                }
+            }
+        }
+    }
+
+    for (uint output_row = 0u;
+         output_row < uint(OUTPUTS_PER_SIMD);
+         ++output_row) {
+        uint output = output_base + output_row;
+        for (uint row = 0u; row < uint(TILE_M); ++row) {
+            float total = simd_sum(accumulators[output_row][row]);
+            if (lane == 0u && output < uint(OUT)) {
+                y[row * uint(OUT) + output] = T(total);
+            }
         }
     }
 )METAL";
@@ -2868,6 +3004,37 @@ vq_mmq_kernel() {
     return kernel;
 }
 
+mlx::core::fast::CustomKernelFunction make_vq_group64_mmq_kernel() {
+    CompileOptions options;
+    options.math_mode = MathMode::Fast;
+    return mlx::core::fast::metal_kernel(
+        "mfq_cpp_vq_group64_mmq",
+        {
+            "indices_packed",
+            "state_packed",
+            "aux_packed",
+            "anchors",
+            "codebooks",
+            "scale_lut",
+            "state_to_codebank",
+            "bank_ids",
+            "parameters",
+            "x",
+        },
+        {"y"},
+        kGroup64MmqSource,
+        kBitstreamHeader,
+        true,
+        false,
+        options);
+}
+
+const mlx::core::fast::CustomKernelFunction&
+vq_group64_mmq_kernel() {
+    static const auto kernel = make_vq_group64_mmq_kernel();
+    return kernel;
+}
+
 mlx::core::fast::CustomKernelFunction
 make_vq_dequantize_kernel() {
     CompileOptions options;
@@ -3607,6 +3774,32 @@ array MlxVqWeight::packed_matmul(
         rows >= 2 && rows <= 16
         && tile_rows == rows
         && execution_layout_ == kExecutionStreams;
+    int group64_outputs_per_simd = 0;
+    const bool supports_group64_mmq =
+        rows >= 2 && rows <= 4 &&
+        tile_rows == rows &&
+        source.dtype() == mlx::core::float16 &&
+        (input_size_ % 8) == 0 &&
+        execution_layout_ == kExecutionGroup64 &&
+        group_size_ == 24 &&
+        vector_size_ == 8 &&
+        index_bits_ == 12 &&
+        state_bits_ == 4 &&
+        entries_ == 4096 &&
+        (aux_mode_ == kAuxSignEven ||
+            aux_mode_ == kAuxSignIndexParity) &&
+        code_bank_mode_ != kCodeBankAux;
+    if (supports_group64_mmq) {
+        group64_outputs_per_simd = rows == 4 ? 4 : 3;
+        if (const auto* value = std::getenv(
+                "MFQ_METAL_VQ_GROUP64_OUTPUT_TILE")) {
+            group64_outputs_per_simd = 0;
+            if (value[1] == '\0' && value[0] >= '1' && value[0] <= '4') {
+                group64_outputs_per_simd = value[0] - '0';
+            }
+        }
+    }
+    const bool group64_mmq = group64_outputs_per_simd > 0;
     int effective_tile_rows = tile_rows;
     std::tuple<int, int, int> grid;
     std::tuple<int, int, int> threadgroup;
@@ -3625,6 +3818,29 @@ array MlxVqWeight::packed_matmul(
                 std::numeric_limits<int>::max())) {
             throw std::runtime_error(
                 "VQ GEMV grid exceeds MLX limits");
+        }
+        grid = {
+            static_cast<int>(grid_x),
+            1,
+            1,
+        };
+        threadgroup = {64, 1, 1};
+    } else if (group64_mmq) {
+        const int outputs_per_threadgroup =
+            2 * group64_outputs_per_simd;
+        const auto output_tiles =
+            (static_cast<std::size_t>(output_size_)
+                + outputs_per_threadgroup - 1)
+            / outputs_per_threadgroup;
+        const auto grid_x = checked_product(
+            output_tiles,
+            std::size_t{64},
+            "group64 MMQ grid");
+        if (grid_x >
+            static_cast<std::size_t>(
+                std::numeric_limits<int>::max())) {
+            throw std::runtime_error(
+                "VQ group64 MMQ grid exceeds MLX limits");
         }
         grid = {
             static_cast<int>(grid_x),
@@ -3714,12 +3930,19 @@ array MlxVqWeight::packed_matmul(
             "SIMD_GROUPS",
             index_bits_ <= 8 ? 2 : 4);
     }
+    if (group64_mmq) {
+        templates.emplace_back(
+            "OUTPUTS_PER_SIMD",
+            group64_outputs_per_simd);
+    }
     const auto& kernel = fast_gemv
         ? vq_gemv_kernel()
         : (
-            wide_mmq
+            group64_mmq
+            ? vq_group64_mmq_kernel()
+            : (wide_mmq
             ? vq_mmq_kernel()
-            : vq_matmul_kernel()
+            : vq_matmul_kernel())
         );
     auto outputs = kernel(
         {
