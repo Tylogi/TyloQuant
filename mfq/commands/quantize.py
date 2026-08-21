@@ -47,6 +47,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="GGUF whose tensor types define the mixed-precision recipe",
     )
     precision.add_argument(
+        "--base-mfq",
+        default="",
+        help=(
+            "augment this existing quantized MFQ with the complete MTP head "
+            "from the input BF16 checkpoint"
+        ),
+    )
+    precision.add_argument(
         "--scheme",
         "--ew-scheme",
         dest="scheme",
@@ -387,6 +395,7 @@ def _hf_arguments(
         args.dense_dtype,
     ]
     _append_value(argv, "--recipe-gguf", args.recipe)
+    _append_value(argv, "--base-mfq", args.base_mfq)
     _append_value(argv, "--tokenizer-gguf", args.tokenizer)
     _append_value(argv, "--model-config", args.model_config)
     _append_value(argv, "--sampling-profile", args.sampling_profile)
@@ -471,6 +480,14 @@ def _run_in(args: argparse.Namespace, baseline: Path, output: Path) -> None:
 
 
 def _validate(args: argparse.Namespace, source_format: str) -> None:
+    if args.base_mfq:
+        if source_format not in {"hf", "mfq"}:
+            raise ValueError("--base-mfq requires an HF or full-precision MFQ source")
+        if args.bf16 or args.recipe or args.scheme or args.imatrix or args.tensor_overrides:
+            raise ValueError(
+                "--base-mfq derives MTP precision from the base and cannot use "
+                "full-precision, recipe, scheme, imatrix, or tensor overrides"
+            )
     if args.bf16 and source_format != "hf":
         raise ValueError("--full-precision requires an HF safetensors source")
     if args.bf16 and (args.recipe or args.scheme or args.imatrix):

@@ -11,8 +11,9 @@ from safetensors.torch import save_file
 
 import mfq.tools.quantize_hf_to_mfq as hf_to_mfq
 from mfq.calibration.artifact import ExpertPrecision
-from mfq.formats.assets import is_asset_record
-from mfq.formats.io import is_bfloat16_array, load_mmap
+from mfq.formats.assets import MODEL_CONFIG_ASSET, is_asset_record
+from mfq.formats.header import FileHeader
+from mfq.formats.io import is_bfloat16_array, load_mmap, open_mmap, save
 from mfq.formats.nint import NintSpec
 from mfq.formats.shards import format_shard_path
 from mfq.quantize.imatrix import ImportanceEntry, ImportanceMatrix
@@ -256,6 +257,115 @@ def test_qwen35_mtp_plan_preserves_complete_head_and_protected_weights(tmp_path)
         by_name[prefix + "self_attn.q_proj.weight"].gguf_name
         == "blk.64.attn_q.weight"
     )
+
+
+def test_qwen35_mtp_augmentation_copies_base_and_mirrors_backbone_policy(tmp_path):
+    root = tmp_path / "hf"
+    root.mkdir()
+    config = {
+        "model_type": "qwen3_5_text",
+        "num_hidden_layers": 1,
+        "mtp_num_hidden_layers": 1,
+        "mtp_use_dedicated_embeddings": False,
+    }
+    (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    layer_suffixes = (
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+        "self_attn.q_norm.weight",
+        "self_attn.k_norm.weight",
+        "mlp.gate_proj.weight",
+        "mlp.up_proj.weight",
+        "mlp.down_proj.weight",
+    )
+    source_tensors = {
+        "mtp.fc.weight": torch.arange(32, dtype=torch.float32)
+        .reshape(4, 8)
+        .to(torch.bfloat16),
+        "mtp.pre_fc_norm_embedding.weight": torch.arange(
+            4, dtype=torch.float32
+        ).to(torch.bfloat16),
+        "mtp.pre_fc_norm_hidden.weight": torch.arange(
+            4, dtype=torch.float32
+        ).to(torch.bfloat16),
+        "mtp.norm.weight": torch.arange(4, dtype=torch.float32).to(
+            torch.bfloat16
+        ),
+    }
+    base_tensors = {
+        "sentinel.weight": np.arange(6, dtype=np.float32).reshape(2, 3),
+        MODEL_CONFIG_ASSET: json.dumps(config).encode(),
+        # An incomplete old head must be replaced, not retained.
+        "mtp.norm.weight": np.zeros(4, dtype=np.float16),
+    }
+    for suffix in layer_suffixes:
+        is_norm = "norm" in suffix
+        shape = (4,) if is_norm else (4, 4)
+        source_tensors[f"mtp.layers.0.{suffix}"] = torch.arange(
+            int(np.prod(shape)), dtype=torch.float32
+        ).reshape(shape).to(torch.bfloat16)
+        base_tensors[f"model.language_model.layers.0.{suffix}"] = (
+            np.arange(int(np.prod(shape)), dtype=np.float32).reshape(shape)
+            if is_norm
+            else np.arange(int(np.prod(shape)), dtype=np.float16).reshape(shape)
+        )
+    save_file(source_tensors, root / "model.safetensors")
+
+    base = tmp_path / "base.mfq"
+    save(
+        base,
+        FileHeader(
+            version=2,
+            model_arch="qwen-test",
+            extra={"hf_config": config, "custom_base_metadata": "preserved"},
+        ),
+        base_tensors,
+    )
+    output = tmp_path / "augmented.mfq"
+    convert(
+        hf_to_mfq.build_parser().parse_args(
+            [
+                "--input",
+                str(root),
+                "--base-mfq",
+                str(base),
+                "--output",
+                str(output),
+                "--quant-backend",
+                "cpu",
+                "--device",
+                "cpu",
+                "--row-chunk",
+                "4",
+            ]
+        )
+    )
+
+    with open_mmap(base) as before, open_mmap(output) as after:
+        assert after.header.model_arch == "qwen-test"
+        assert after.header.extra["custom_base_metadata"] == "preserved"
+        assert after.header.extra["mtp"]["included"] is True
+        assert after.header.extra["mtp"]["tensor_count"] == 15
+        assert after.read_blob("sentinel.weight") == before.read_blob(
+            "sentinel.weight"
+        )
+        mtp_names = {name for name in after if name.startswith("mtp.")}
+        assert len(mtp_names) == 15
+        assert after.records["mtp.fc.weight"].dtype == "BF16"
+        assert after.records["mtp.norm.weight"].dtype == "BF16"
+        assert (
+            after.records["mtp.layers.0.self_attn.q_proj.weight"].dtype
+            == "F16"
+        )
+        assert (
+            after.records["mtp.layers.0.input_layernorm.weight"].dtype
+            == "F32"
+        )
 
 
 def test_recipe_dense_types_preserve_bf16_separately_from_f16():

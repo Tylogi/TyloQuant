@@ -139,6 +139,12 @@ uv run mfq quantize model-bf16.gguf model-S4-L.mfq \
 uv run mfq quantize model-hf model-EW.mfq \
   --recipe UD-Q4_K_XL.gguf --ew-scheme expert-precision.json
 
+# Add the complete MTP head from the original BF16 checkpoint to an existing
+# quantized model. The backbone blobs stay byte-identical; each MTP decoder
+# projection mirrors the corresponding final backbone layer precision.
+uv run mfq quantize model-hf model-with-MTP.mfq \
+  --base-mfq model-quantized.mfq --backend metal --device mps
+
 # Collect a reusable activation imatrix from the prepared corpus. CUDA uses
 # FP64 accumulation by default; Apple silicon uses BF16 forward + FP32 Metal
 # accumulation. The output is accepted directly by `mfq quantize --imatrix`.

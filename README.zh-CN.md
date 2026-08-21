@@ -101,6 +101,11 @@ mfq quantize model-bf16.gguf model-S4-L.mfq \
 mfq quantize model-hf model-EW.mfq \
   --recipe UD-Q4_K_XL.gguf --ew-scheme expert-precision.json
 
+# 从原版 BF16 权重给既有量化模型补齐完整 MTP 头。主干 blob 逐字节保持
+# 不变，MTP decoder 的投影精度跟随主干最后一层对应张量。
+mfq quantize model-hf model-with-MTP.mfq \
+  --base-mfq model-quantized.mfq --backend metal --device mps
+
 # Important Neurons（IN）；可从 recipe 自动读取层数
 mfq quantize model-bf16.gguf model-IN.mfq \
   --recipe UD-Q4_K_XL.gguf --imatrix imatrix.gguf \

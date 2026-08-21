@@ -53,6 +53,7 @@ from mfq.formats.io import (
     _NINT_MOE_ROTATION_HDR,
     _pack_nint_moe_runtime,
     _u32,
+    open_mmap,
     pack_bits,
 )
 from mfq.formats.mx import mx_header_bytes
@@ -178,6 +179,7 @@ from mfq.formats.runtime_profile import (
     profile_for_new_mfq,
 )
 from mfq.formats.shards import (
+    SPLIT_KEYS,
     matching_shard_paths,
     parse_size,
     validate_split_limits,
@@ -252,6 +254,7 @@ class BlobRecord:
     dtype: str
     nbytes: int
     path: Path
+    offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -861,6 +864,180 @@ def _mtp_inventory_status(
             + ", ".join(missing[:8])
         )
     return True, count
+
+
+def _text_model_config(config: dict[str, object]) -> dict[str, object]:
+    value = config.get("text_config", config)
+    if not isinstance(value, dict):
+        raise ValueError("model text_config must be an object")
+    return value
+
+
+def _mtp_backbone_analogue(
+    name: str,
+    *,
+    backbone_layers: int,
+    mtp_layers: int,
+) -> str | None:
+    """Map an MTP decoder tensor to the backbone tensor defining its policy."""
+
+    match = re.match(r"^mtp\.layers\.(\d+)\.(.+)$", name)
+    if match is None:
+        return None
+    mtp_index = int(match.group(1))
+    if mtp_index >= mtp_layers:
+        raise ValueError(f"MTP layer index is outside the configured head: {name}")
+    if backbone_layers < mtp_layers:
+        raise ValueError(
+            f"backbone has fewer layers than its MTP head: {backbone_layers} < {mtp_layers}"
+        )
+    layer = backbone_layers - mtp_layers + mtp_index
+    return f"model.language_model.layers.{layer}.{match.group(2)}"
+
+
+def _base_model_config(store) -> dict[str, object]:
+    record = store.records.get(MODEL_CONFIG_ASSET)
+    if record is not None and record.dtype == ASSET_DTYPE:
+        value = json.loads(store.read_blob(MODEL_CONFIG_ASSET))
+    else:
+        value = store.header.extra.get("hf_config", {})
+    if not isinstance(value, dict):
+        raise ValueError("base MFQ model config is not a JSON object")
+    return value
+
+
+def _mtp_plan_from_base(
+    plan: Sequence[TensorPlan],
+    inventory: dict[str, SourceTensorMetadata],
+    source_config: dict[str, object],
+    base_store,
+) -> list[TensorPlan]:
+    """Select a complete MTP head and mirror the base backbone precision policy."""
+
+    source_text = _text_model_config(source_config)
+    included, mtp_layers = _mtp_inventory_status(inventory, source_text)
+    if not included:
+        raise ValueError("source checkpoint does not contain a complete MTP head")
+    backbone_layers = int(source_text.get("num_hidden_layers", 0) or 0)
+    if backbone_layers <= 0:
+        raise ValueError("source checkpoint lacks a positive num_hidden_layers")
+
+    base_text = _text_model_config(_base_model_config(base_store))
+    source_type = str(source_text.get("model_type", ""))
+    base_type = str(base_text.get("model_type", ""))
+    if source_type and base_type and source_type != base_type:
+        raise ValueError(
+            f"MTP source/base model_type mismatch: {source_type} != {base_type}"
+        )
+    base_layers = int(base_text.get("num_hidden_layers", 0) or 0)
+    if base_layers and base_layers != backbone_layers:
+        raise ValueError(
+            f"MTP source/base layer-count mismatch: {backbone_layers} != {base_layers}"
+        )
+    for key in (
+        "hidden_size",
+        "intermediate_size",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "vocab_size",
+    ):
+        source_value = source_text.get(key)
+        base_value = base_text.get(key)
+        if (
+            source_value is not None
+            and base_value is not None
+            and source_value != base_value
+        ):
+            raise ValueError(
+                f"MTP source/base {key} mismatch: {source_value} != {base_value}"
+            )
+
+    hidden_size = int(source_text.get("hidden_size", 0) or 0)
+    expected_root_shapes = (
+        {
+            "mtp.fc.weight": (hidden_size, 2 * hidden_size),
+            "mtp.pre_fc_norm_embedding.weight": (hidden_size,),
+            "mtp.pre_fc_norm_hidden.weight": (hidden_size,),
+            "mtp.norm.weight": (hidden_size,),
+        }
+        if hidden_size > 0
+        else {}
+    )
+
+    selected: list[TensorPlan] = []
+    for item in plan:
+        if not item.name.startswith("mtp."):
+            continue
+        analogue = _mtp_backbone_analogue(
+            item.name,
+            backbone_layers=backbone_layers,
+            mtp_layers=mtp_layers,
+        )
+        if analogue is None:
+            expected_shape = expected_root_shapes.get(item.name)
+            if expected_shape is not None and item.shape != expected_shape:
+                raise ValueError(
+                    f"invalid MTP root tensor shape: {item.name} "
+                    f"{item.shape} != {expected_shape}"
+                )
+            target_dtype = (
+                item.source_dtype
+                if item.source_dtype in {"BF16", "F16", "F32"}
+                else "F16"
+            )
+            selected.append(
+                replace(
+                    item,
+                    target_dtype=target_dtype,
+                    target_spec=None,
+                    gguf_type=target_dtype,
+                )
+            )
+            continue
+
+        base_record = base_store.records.get(analogue)
+        if base_record is None:
+            raise ValueError(
+                f"base MFQ lacks the backbone tensor required for MTP policy: {analogue}"
+            )
+        source_analogue = inventory.get(analogue)
+        if source_analogue is not None and source_analogue.shape != item.shape:
+            raise ValueError(
+                f"MTP/backbone shape mismatch: {item.name} {item.shape} != "
+                f"{analogue} {source_analogue.shape}"
+            )
+        base_tensor = base_store[analogue]
+        base_shape = tuple(int(value) for value in base_tensor.shape)
+        if base_shape != item.shape:
+            raise ValueError(
+                f"MTP/base shape mismatch: {item.name} {item.shape} != "
+                f"{analogue} {base_shape}"
+            )
+        if base_record.dtype == "NINTM":
+            raise ValueError(
+                f"MTP decoder policy cannot currently mirror NINTM: {analogue}"
+            )
+        target_spec = None
+        if base_record.dtype.startswith("NINT") and base_record.dtype != "NINT8-0":
+            target_spec = getattr(base_tensor, "spec", None)
+            if target_spec is None:
+                raise ValueError(f"base NINT tensor lacks its precision spec: {analogue}")
+        selected.append(
+            replace(
+                item,
+                target_dtype=base_record.dtype,
+                target_spec=target_spec,
+                gguf_type=base_record.dtype,
+            )
+        )
+
+    selected_names = {item.name for item in selected}
+    _mtp_inventory_status(
+        {name: inventory[name] for name in selected_names},
+        source_text,
+    )
+    return selected
 
 
 ImportanceRows = Callable[[int, int], np.ndarray | None]
@@ -3646,6 +3823,7 @@ def convert(args: argparse.Namespace) -> None:
     input_mfq_arg = getattr(args, "input_mfq", "")
     root = Path(input_mfq_arg or args.input).resolve()
     mfq_checkpoint = None
+    base_store = None
     source_inventory = None
     source_config = None
     if input_mfq_arg:
@@ -3663,12 +3841,17 @@ def convert(args: argparse.Namespace) -> None:
             )
             for name, info in mfq_checkpoint.infos.items()
         }
+    base_mfq_arg = getattr(args, "base_mfq", "")
+    if base_mfq_arg:
+        base_store = open_mmap(Path(base_mfq_arg).resolve())
     output = Path(args.output).resolve()
     split_max_size = int(getattr(args, "split_max_size", 0))
     split_max_tensors = int(getattr(args, "split_max_tensors", 0))
     validate_split_limits(split_max_size, split_max_tensors)
     if (output.exists() or matching_shard_paths(output)) and not args.overwrite:
         raise FileExistsError(f"output exists: {output}")
+    if base_store is not None and output in {path.resolve() for path in base_store.paths}:
+        raise ValueError("MTP augmentation requires an output distinct from the base MFQ")
     output.parent.mkdir(parents=True, exist_ok=True)
 
     spec = NintSpec(bits=args.bits, groupsize=args.groupsize, sub_bits=args.sub_bits)
@@ -3702,6 +3885,17 @@ def convert(args: argparse.Namespace) -> None:
     dense_dtype = getattr(args, "dense_dtype", "f16").upper()
     if mostly_bf16 and (recipe_types is not None or calibration_scheme is not None):
         raise ValueError("--bf16 cannot be combined with a recipe or calibration scheme")
+    if base_store is not None and (
+        mostly_bf16
+        or recipe_types is not None
+        or calibration_scheme is not None
+        or getattr(args, "imatrix", "")
+        or getattr(args, "tensor_precision_overrides", "")
+    ):
+        raise ValueError(
+            "--base-mfq derives the complete MTP precision policy from the base; "
+            "it cannot be combined with BF16, recipe, scheme, imatrix, or tensor overrides"
+        )
     plan = _plan(
         root,
         text_only=args.text_only,
@@ -3735,9 +3929,23 @@ def convert(args: argparse.Namespace) -> None:
         tensor_precision_overrides,
     )
     plan = _normalize_hf_expert_storage(plan)
+    if base_store is not None:
+        if source_inventory is None:
+            source_inventory = _hf_source_inventory(root)
+        if source_config is None:
+            config_path = root / "config.json"
+            source_config = json.loads(config_path.read_text(encoding="utf-8"))
+        plan = _mtp_plan_from_base(
+            plan,
+            source_inventory,
+            source_config,
+            base_store,
+        )
     _validate_native_source_precision(plan)
     _validate_runtime_fused_pairs(plan)
     if args.limit_tensors:
+        if base_store is not None:
+            raise ValueError("--limit-tensors cannot truncate an all-or-nothing MTP head")
         plan = plan[: args.limit_tensors]
     imatrix_path_arg = getattr(args, "imatrix", "")
     if mostly_bf16 and imatrix_path_arg:
@@ -3848,6 +4056,8 @@ def convert(args: argparse.Namespace) -> None:
     if getattr(args, "dry_run", False):
         if mfq_checkpoint is not None:
             mfq_checkpoint.close()
+        if base_store is not None:
+            base_store.close()
         return
 
     # Reuse the mature GGUF-source tensor-wise VQ trainers and blob writer.
@@ -4323,8 +4533,11 @@ def convert(args: argparse.Namespace) -> None:
                 config_text["mtp_use_dedicated_embeddings"] = False
         model_type = str(config.get("model_type", "unknown"))
         runtime_assets: list[RuntimeAsset] = []
-        if mfq_checkpoint is not None:
-            manifest = mfq_checkpoint.header.extra.get(ASSET_MANIFEST_KEY, {})
+        asset_store = base_store or (
+            mfq_checkpoint.store if mfq_checkpoint is not None else None
+        )
+        if asset_store is not None:
+            manifest = asset_store.header.extra.get(ASSET_MANIFEST_KEY, {})
             manifest_assets = (
                 manifest.get("assets", {}) if isinstance(manifest, dict) else {}
             )
@@ -4339,14 +4552,15 @@ def convert(args: argparse.Namespace) -> None:
                 RuntimeAsset(
                     name,
                     media_by_record.get(name, "application/octet-stream"),
-                    mfq_checkpoint.store.read_blob(name),
+                    asset_store.read_blob(name),
                 )
-                for name, record in mfq_checkpoint.store.records.items()
+                for name, record in asset_store.records.items()
                 if is_asset_record(name) and record.dtype == ASSET_DTYPE
             )
         assets_by_name = {asset.name: asset for asset in runtime_assets}
         if config and (
-            mfq_checkpoint is None
+            asset_store is None
+            or base_store is not None
             or config_path_arg
             or MODEL_CONFIG_ASSET not in assets_by_name
         ):
@@ -4383,8 +4597,8 @@ def convert(args: argparse.Namespace) -> None:
                 BlobRecord(asset.name, ASSET_DTYPE, len(asset.data), asset_path)
             )
         inherited_profile = (
-            mfq_checkpoint.header.extra.get(RUNTIME_SAMPLING_METADATA_KEY)
-            if mfq_checkpoint is not None
+            asset_store.header.extra.get(RUNTIME_SAMPLING_METADATA_KEY)
+            if asset_store is not None
             else None
         )
         runtime_profile = profile_for_new_mfq(
@@ -4414,19 +4628,99 @@ def convert(args: argparse.Namespace) -> None:
         }
         if runtime_profile is not None:
             header_extra[RUNTIME_SAMPLING_METADATA_KEY] = runtime_profile
-        header = FileHeader(
-            version=2,
-            model_arch=(
-                f"{model_type}-hf-mfq-bf16"
-                if mostly_bf16
-                else (
-                    f"{model_type}-full-mfq-nint-recipe"
-                    if mfq_checkpoint is not None
-                    else f"{model_type}-hf-mfq-nint-recipe"
+        if base_store is not None:
+            header_extra = {
+                key: value
+                for key, value in base_store.header.extra.items()
+                if key not in SPLIT_KEYS
+            }
+            header_extra.update(
+                {
+                    "mtp_source": root.name,
+                    "hf_config": config,
+                    ASSET_MANIFEST_KEY: runtime_asset_manifest(runtime_assets),
+                }
+            )
+
+            generated_tensors = [
+                record for record in records if not is_asset_record(record.name)
+            ]
+            generated_assets = [
+                record for record in records if is_asset_record(record.name)
+            ]
+            copied_tensors = [
+                BlobRecord(
+                    record.name,
+                    record.dtype,
+                    record.nbytes,
+                    base_store.paths[record.source_index],
+                    record.offset,
                 )
+                for record in base_store.records.values()
+                if not is_asset_record(record.name)
+                and not record.name.startswith("mtp.")
+            ]
+            records = copied_tensors + generated_tensors + generated_assets
+
+            inherited_counts = base_store.header.extra.get("target_counts", {})
+            merged_counts = (
+                dict(inherited_counts)
+                if isinstance(inherited_counts, dict) and inherited_counts
+                else {
+                    dtype: sum(
+                        1
+                        for record in base_store.records.values()
+                        if not is_asset_record(record.name) and record.dtype == dtype
+                    )
+                    for dtype in {
+                        record.dtype
+                        for record in base_store.records.values()
+                        if not is_asset_record(record.name)
+                    }
+                }
+            )
+            for record in base_store.records.values():
+                if record.name.startswith("mtp."):
+                    merged_counts[record.dtype] = int(merged_counts.get(record.dtype, 0)) - 1
+            for record in generated_tensors:
+                merged_counts[record.dtype] = int(merged_counts.get(record.dtype, 0)) + 1
+            target_counts = {
+                key: value for key, value in merged_counts.items() if int(value) > 0
+            }
+            inherited_codebooks = header_extra.get("nvq_codebooks", {})
+            header_extra["nvq_codebooks"] = {
+                **(inherited_codebooks if isinstance(inherited_codebooks, dict) else {}),
+                **codebook_results,
+            }
+            inherited_gains = header_extra.get("nvq_gain_calibration", {})
+            header_extra["nvq_gain_calibration"] = {
+                **(inherited_gains if isinstance(inherited_gains, dict) else {}),
+                **gain_results,
+            }
+            header_extra["target_counts"] = target_counts
+        mtp_metadata = {
+            "included": mtp_included,
+            "hidden_layers": mtp_config_layers if mtp_included else 0,
+            "tensor_count": len(mtp_plan_names),
+            "protected_full_precision": sorted(
+                name
+                for name in mtp_plan_names
+                if name in _MTP_PROTECTED_TENSORS
             ),
-            num_tensors=len(records),
-            extra={
+        }
+        if base_store is not None:
+            output_extra = {
+                **header_extra,
+                "mtp": mtp_metadata,
+                "hf_config": config,
+                ASSET_MANIFEST_KEY: runtime_asset_manifest(runtime_assets),
+                "target_counts": target_counts,
+            }
+        else:
+            # Preserve the established metadata field order for ordinary
+            # conversions so this incremental feature does not perturb their
+            # deterministic container bytes.
+            output_extra = {
                 **header_extra,
                 "calibration_scheme": (
                     _artifact_provenance_name(calibration_scheme_path)
@@ -4454,7 +4748,11 @@ def convert(args: argparse.Namespace) -> None:
                     "linear_attention": "qk_group,v_separate,z_separate,ab_recipe_group",
                     "ffn": "gate_up_group,down_separate",
                 } if recipe_gguf else None,
-                "default_spec": {"bits": spec.bits, "groupsize": spec.groupsize, "sub_bits": spec.sub_bits},
+                "default_spec": {
+                    "bits": spec.bits,
+                    "groupsize": spec.groupsize,
+                    "sub_bits": spec.sub_bits,
+                },
                 "recipe_specs": {
                     "Q4_0": {"bits": 4, "groupsize": 24, "sub_bits": 6},
                     "Q4_1": {"bits": 4, "groupsize": 24, "sub_bits": 6},
@@ -4468,16 +4766,7 @@ def convert(args: argparse.Namespace) -> None:
                 "dense_dtype": "MOSTLY_BF16" if mostly_bf16 else dense_dtype,
                 "mostly_bf16": mostly_bf16,
                 "text_only": bool(args.text_only),
-                "mtp": {
-                    "included": mtp_included,
-                    "hidden_layers": mtp_config_layers if mtp_included else 0,
-                    "tensor_count": len(mtp_plan_names),
-                    "protected_full_precision": sorted(
-                        name
-                        for name in mtp_plan_names
-                        if name in _MTP_PROTECTED_TENSORS
-                    ),
-                },
+                "mtp": mtp_metadata,
                 "hf_config": config,
                 ASSET_MANIFEST_KEY: runtime_asset_manifest(runtime_assets),
                 "target_counts": target_counts,
@@ -4489,7 +4778,23 @@ def convert(args: argparse.Namespace) -> None:
                 "nvq_codebook_scope": nvq_codebook_scope,
                 "nvq_codebooks": codebook_results,
                 "nvq_gain_calibration": gain_results,
-            },
+            }
+        header = FileHeader(
+            version=2,
+            model_arch=(
+                base_store.header.model_arch
+                if base_store is not None
+                else
+                f"{model_type}-hf-mfq-bf16"
+                if mostly_bf16
+                else (
+                    f"{model_type}-full-mfq-nint-recipe"
+                    if mfq_checkpoint is not None
+                    else f"{model_type}-hf-mfq-nint-recipe"
+                )
+            ),
+            num_tensors=len(records),
+            extra=output_extra,
         )
         outputs = write_blob_record_shards(
             output,
@@ -4523,6 +4828,8 @@ def convert(args: argparse.Namespace) -> None:
             shutil.rmtree(tmp_root)
         if mfq_checkpoint is not None:
             mfq_checkpoint.close()
+        if base_store is not None:
+            base_store.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -4538,6 +4845,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="full-precision MFQ containing no NINT/NVQ/NPQ/NEPQ/TPQ tensors",
     )
     parser.add_argument("--output", required=True, help="output .mfq path")
+    parser.add_argument(
+        "--base-mfq",
+        default="",
+        help=(
+            "existing quantized MFQ whose non-MTP tensors are copied byte-for-byte; "
+            "the complete MTP head is taken from the BF16 source and mirrors the "
+            "last backbone layer precision policy"
+        ),
+    )
     parser.add_argument("--bits", type=int, default=4)
     parser.add_argument("--groupsize", type=int, default=24)
     parser.add_argument("--sub-bits", type=int, default=6)

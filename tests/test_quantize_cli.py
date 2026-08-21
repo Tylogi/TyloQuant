@@ -80,6 +80,33 @@ def test_quantize_routes_metal_backend(tmp_path: Path, monkeypatch) -> None:
     assert captured[0].quant_backend == "metal"
 
 
+def test_quantize_routes_incremental_mtp_base(tmp_path: Path, monkeypatch) -> None:
+    source = _hf_source(tmp_path)
+    base = tmp_path / "base.mfq"
+    base.write_bytes(b"MFQ1")
+    captured: list[argparse.Namespace] = []
+    monkeypatch.setattr(
+        "mfq.tools.quantize_hf_to_mfq.convert", captured.append
+    )
+
+    assert (
+        cli.main(
+            [
+                "quantize",
+                str(source),
+                str(tmp_path / "model.mfq"),
+                "--base-mfq",
+                str(base),
+                "--backend",
+                "metal",
+            ]
+        )
+        == 0
+    )
+    assert captured[0].base_mfq == str(base)
+    assert captured[0].quant_backend == "metal"
+
+
 def test_quantize_routes_gguf_imatrix_and_q8_mode(
     tmp_path: Path, monkeypatch
 ) -> None:
