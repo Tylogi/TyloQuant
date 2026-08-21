@@ -143,6 +143,35 @@ inline uint mfq_grouped_vq_read_bits(
         & ((1u << bits) - 1u);
 }
 
+template <typename Stream>
+inline uint mfq_grouped_vq_read_4(
+    Stream stream,
+    uint value_index
+) {
+    uint packed = uint(stream[value_index >> 1u]);
+    return (packed >> ((value_index & 1u) * 4u)) & 15u;
+}
+
+template <typename Stream>
+inline uint mfq_grouped_vq_read_8(
+    Stream stream,
+    uint value_index
+) {
+    return uint(stream[value_index]);
+}
+
+template <typename Stream>
+inline uint mfq_grouped_vq_read_12(
+    Stream stream,
+    uint value_index
+) {
+    uint odd = value_index & 1u;
+    uint byte_index = (value_index >> 1u) * 3u + odd;
+    uint packed = uint(stream[byte_index])
+        | (uint(stream[byte_index + 1u]) << 8u);
+    return (packed >> (odd * 4u)) & 4095u;
+}
+
 inline float mfq_grouped_mx_e8m0(uchar raw) {
     if (raw == 255u) {
         return NAN;
@@ -737,9 +766,264 @@ std::vector<std::string> direct_input_names(
     return names;
 }
 
+std::string make_direct_small_m_source(
+    const std::vector<DirectProjectionLayout>& layouts) {
+    std::string source = R"METAL(
+    constexpr uint ROWS_PER_SIMD = 4u;
+    constexpr uint ROWS_PER_TG = 8u;
+
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint global_tile = threadgroup_position_in_grid.x;
+)METAL";
+
+    for (std::size_t projection = 0;
+         projection < layouts.size();
+         ++projection) {
+        const auto suffix = std::to_string(projection);
+        source += projection == 0 ? "    if (" : "    else if (";
+        source += "global_tile >= uint(P" + suffix
+            + "_TILE_BEGIN) && global_tile < uint(P" + suffix
+            + "_TILE_END)) {\n";
+        source +=
+            "        uint local_tile = global_tile - uint(P" + suffix
+            + "_TILE_BEGIN);\n"
+            "        uint output_base = local_tile * ROWS_PER_TG"
+            " + simd_group * ROWS_PER_SIMD;\n"
+            "        float accumulators[ROWS][ROWS_PER_SIMD];\n"
+            "        for (uint input_row = 0u; input_row < uint(ROWS);"
+            " ++input_row) {\n"
+            "            for (uint local_row = 0u;"
+            " local_row < ROWS_PER_SIMD; ++local_row) {\n"
+            "                accumulators[input_row][local_row] = 0.0f;\n"
+            "            }\n"
+            "        }\n"
+            "        for (uint column = lane; column < uint(K);"
+            " column += 32u) {\n"
+            "            float activations[ROWS];\n"
+            "            for (uint input_row = 0u;"
+            " input_row < uint(ROWS); ++input_row) {\n"
+            "                activations[input_row] ="
+            " float(x[input_row * uint(K) + column]);\n"
+            "            }\n"
+            "            for (uint local_row = 0u;"
+            " local_row < ROWS_PER_SIMD; ++local_row) {\n"
+            "                uint output = output_base + local_row;\n"
+            "                if (output >= uint(P" + suffix
+            + "_OUT)) { continue; }\n"
+            "                float weight = 0.0f;\n";
+
+        if (layouts[projection].family == kFamilyNint) {
+            source +=
+                "                uint group = column / uint(P" + suffix
+                + "_GS);\n"
+                "                uint element = column - group * uint(P"
+                + suffix + "_GS);\n"
+                "                uint metadata_index = output * uint(P"
+                + suffix + "_NG) + group;\n"
+                "                uint quantized_index = metadata_index"
+                " * uint(P" + suffix + "_GS) + element;\n"
+                "                uint quantized = ";
+            if (layouts[projection].bits == 2
+                && !layouts[projection].q5_execution) {
+                source +=
+                    "(uint(q_packed_" + suffix
+                    + "[quantized_index >> 2u])"
+                    " >> ((quantized_index & 3u) * 2u)) & 3u;\n";
+            } else if (layouts[projection].bits == 4
+                && !layouts[projection].q5_execution) {
+                source +=
+                    "(uint(q_packed_" + suffix
+                    + "[quantized_index >> 1u])"
+                    " >> ((quantized_index & 1u) * 4u)) & 15u;\n";
+            } else if (layouts[projection].bits == 8
+                && !layouts[projection].q5_execution) {
+                source +=
+                    "uint(q_packed_" + suffix
+                    + "[quantized_index]);\n";
+            } else {
+                source +=
+                    "mfq_grouped_nint_read_value(\n"
+                    "                    q_packed_" + suffix + ",\n"
+                    "                    quantized_index,\n"
+                    "                    uint(P" + suffix + "_BITS),\n"
+                    "                    uint(P" + suffix + "_GS),\n"
+                    "                    "
+                    + std::string(
+                        layouts[projection].q5_execution ? "1u" : "0u")
+                    + ");\n";
+            }
+            source +=
+                "                float scale = neuron_scale_" + suffix
+                + "[output] * float(sub_scale_" + suffix
+                + "[metadata_index]);\n"
+                "                float minimum = neuron_min_" + suffix
+                + "[output] * float(sub_min_" + suffix
+                + "[metadata_index]);\n"
+                "                weight = scale * float(quantized)"
+                " - minimum;\n";
+        } else if (layouts[projection].family == kFamilyNint8Zero) {
+            source +=
+                "                uint group = column >> 5;\n"
+                "                weight = float(q8_scales_" + suffix
+                + "[output * uint(P" + suffix + "_NG) + group])"
+                " * float(q8_q_" + suffix
+                + "[output * uint(K) + column]);\n";
+        } else {
+            source +=
+                "                uint group = column / uint(P" + suffix
+                + "_GS);\n"
+                "                uint vector = column / uint(P" + suffix
+                + "_VECTOR_SIZE);\n"
+                "                uint component = column - vector"
+                " * uint(P" + suffix + "_VECTOR_SIZE);\n"
+                "                uint state_index = output * uint(P"
+                + suffix + "_NG) + group;\n"
+                "                uint state = ";
+            if (layouts[projection].state_bits == 4) {
+                source += "mfq_grouped_vq_read_4(vq_state_" + suffix
+                    + ", state_index);\n";
+            } else if (layouts[projection].state_bits == 8) {
+                source += "mfq_grouped_vq_read_8(vq_state_" + suffix
+                    + ", state_index);\n";
+            } else {
+                source +=
+                    "mfq_grouped_vq_read_bits(vq_state_" + suffix
+                    + ", state_index, uint(P" + suffix
+                    + "_STATE_BITS));\n";
+            }
+            source +=
+                "                uint table_bank = 0u;\n";
+            if (layouts[projection].table_banks > 1) {
+                source +=
+                    "                table_bank = uint(vq_bank_ids_"
+                    + suffix + "[output * uint(P" + suffix
+                    + "_NSUPER) + group / uint(P" + suffix
+                    + "_GROUPS_PER_SUPER)]);\n";
+            }
+            source += "                uint auxiliary = 0u;\n";
+            if (layouts[projection].aux_mode == 3) {
+                source +=
+                    "                auxiliary ="
+                    " mfq_grouped_vq_read_bits(\n"
+                    "                    vq_aux_" + suffix + ",\n"
+                    "                    state_index, 1u);\n";
+            }
+            source +=
+                "                uint index_position = output * uint(P"
+                + suffix + "_NVEC) + vector;\n"
+                "                uint index = ";
+            if (layouts[projection].index_bits == 4) {
+                source += "mfq_grouped_vq_read_4(vq_indices_" + suffix
+                    + ", index_position);\n";
+            } else if (layouts[projection].index_bits == 8) {
+                source += "mfq_grouped_vq_read_8(vq_indices_" + suffix
+                    + ", index_position);\n";
+            } else if (layouts[projection].index_bits == 12) {
+                source += "mfq_grouped_vq_read_12(vq_indices_" + suffix
+                    + ", index_position);\n";
+            } else {
+                source +=
+                    "mfq_grouped_vq_read_bits(vq_indices_" + suffix
+                    + ", index_position, uint(P" + suffix
+                    + "_INDEX_BITS));\n";
+            }
+            if (layouts[projection].aux_mode == 1
+                || layouts[projection].aux_mode == 2) {
+                source +=
+                    "                auxiliary ="
+                    " mfq_grouped_vq_read_bits(\n"
+                    "                    vq_aux_" + suffix + ",\n"
+                    "                    output * ((uint(K) + 7u) / 8u)"
+                    " + column / 8u, 7u);\n";
+            }
+            source += "                uint code_bank = 0u;\n";
+            if (layouts[projection].code_bank_mode == 1) {
+                source +=
+                    "                code_bank = uint(vq_state_banks_"
+                    + suffix + "[state]);\n";
+            } else if (layouts[projection].code_bank_mode == 2) {
+                source +=
+                    "                code_bank = auxiliary;\n";
+            }
+            source +=
+                "                uint code_offset = (((table_bank"
+                " * uint(P" + suffix + "_CODE_BANKS) + code_bank)"
+                " * uint(P" + suffix + "_ENTRIES) + index)"
+                " * uint(P" + suffix + "_VECTOR_SIZE) + component);\n"
+                "                float code ="
+                " float(vq_codebooks_" + suffix + "[code_offset]);\n";
+            if (layouts[projection].aux_mode == 1
+                || layouts[projection].aux_mode == 2) {
+                source +=
+                    "                uint sign_position = column & 7u;\n"
+                    "                uint negative = sign_position < 7u"
+                    " ? ((auxiliary >> sign_position) & 1u)"
+                    " : (popcount(auxiliary) & 1u);\n";
+                if (layouts[projection].aux_mode == 2) {
+                    source +=
+                        "                if (sign_position == 7u) {"
+                        " negative ^= (index >> 7u) & 1u; }\n";
+                }
+                source +=
+                    "                code = negative != 0u"
+                    " ? -code : code;\n";
+            } else if (layouts[projection].aux_mode == 3) {
+                source +=
+                    "                code += auxiliary != 0u"
+                    " ? -vq_parameters_" + suffix + "[0]"
+                    " : vq_parameters_" + suffix + "[0];\n";
+            }
+            source +=
+                "                weight = vq_anchors_" + suffix
+                + "[output] * vq_scales_" + suffix
+                + "[table_bank * uint(P" + suffix
+                + "_STATES) + state] * code;\n";
+        }
+
+        source +=
+            "                for (uint input_row = 0u;"
+            " input_row < uint(ROWS); ++input_row) {\n"
+            "                    accumulators[input_row][local_row] = fma(\n"
+            "                        activations[input_row], weight,\n"
+            "                        accumulators[input_row][local_row]);\n"
+            "                }\n"
+            "            }\n"
+            "        }\n"
+            "        for (uint input_row = 0u;"
+            " input_row < uint(ROWS); ++input_row) {\n"
+            "            for (uint local_row = 0u;"
+            " local_row < ROWS_PER_SIMD; ++local_row) {\n"
+            "                float total ="
+            " simd_sum(accumulators[input_row][local_row]);\n"
+            "                uint output = output_base + local_row;\n"
+            "                if (lane == 0u && output < uint(P" + suffix
+            + "_OUT)) {\n"
+            "                    y[input_row * uint(TOTAL_OUT) + uint(P"
+            + suffix + "_OUT_OFFSET) + output] = T(total);\n"
+            "                }\n"
+            "            }\n"
+            "        }\n"
+            "    }\n";
+    }
+    return source;
+}
+
 std::string make_direct_source(
     const std::vector<DirectProjectionLayout>& layouts,
     bool batch_rows) {
+    const bool supports_small_m_specialization =
+        batch_rows && std::all_of(
+            layouts.begin(),
+            layouts.end(),
+            [](const DirectProjectionLayout& layout) {
+                return layout.family == kFamilyNint
+                    || layout.family == kFamilyNint8Zero
+                    || layout.family == kFamilyVq;
+            });
+    if (supports_small_m_specialization) {
+        return make_direct_small_m_source(layouts);
+    }
     std::string source = batch_rows ? R"METAL(
     constexpr uint ROWS_PER_SIMD = 4u;
     constexpr uint ROWS_PER_TG = 8u;

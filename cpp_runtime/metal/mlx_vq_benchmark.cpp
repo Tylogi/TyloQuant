@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
@@ -60,6 +61,20 @@ double milliseconds_since(Clock::time_point start) {
         Clock::now() - start).count();
 }
 
+std::uint64_t output_hash(array output) {
+    constexpr std::uint64_t offset = 1469598103934665603ull;
+    constexpr std::uint64_t prime = 1099511628211ull;
+    output = mlx::core::contiguous(std::move(output));
+    output.eval();
+    const auto* bytes = output.data<std::uint8_t>();
+    std::uint64_t result = offset;
+    for (std::size_t index = 0; index < output.nbytes(); ++index) {
+        result ^= bytes[index];
+        result *= prime;
+    }
+    return result;
+}
+
 void benchmark(
     const MfqContainer& model,
     const std::string& name,
@@ -103,17 +118,21 @@ void benchmark(
         checksum += values[index];
         maximum = std::max(maximum, std::fabs(values[index]));
     }
+    const auto hash = output_hash(result);
 
     std::cout
         << record.dtype << '\t'
         << name << '\t'
         << rows << 'x' << weight.input_size() << 'x'
         << weight.output_size() << '\t'
+        << weight.group_size() << 'x' << weight.vector_size()
+        << 'x' << weight.index_bits() << 'x'
+        << weight.state_bits() << '\t'
         << weight.packed_nbytes() << '\t'
         << std::fixed << std::setprecision(3) << mean_ms << '\t'
         << std::setprecision(1) << decimal_gbps << '\t'
         << std::setprecision(6) << checksum << '\t'
-        << maximum << '\n';
+        << maximum << '\t' << std::hex << hash << std::dec << '\n';
 }
 
 } // namespace
@@ -131,8 +150,8 @@ int main(int argc, char** argv) {
 
         const MfqContainer model(argv[1]);
         std::cout
-            << "dtype\ttensor\tshape\tpacked_bytes\tms\tGB/s\t"
-               "checksum\tmax_abs\n";
+            << "dtype\ttensor\tshape\tlayout\tpacked_bytes\tms\tGB/s\t"
+               "checksum\tmax_abs\thash\n";
         for (int index = 4; index < argc; ++index) {
             benchmark(model, argv[index], rows, 3, repetitions);
         }

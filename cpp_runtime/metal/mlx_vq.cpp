@@ -79,6 +79,35 @@ inline uint mfq_vq_read_bits(
     return (packed >> shift) & ((1u << bits) - 1u);
 }
 
+template <typename Stream>
+inline uint mfq_vq_read_4(
+    Stream stream,
+    uint value_index
+) {
+    uint packed = uint(stream[value_index >> 1u]);
+    return (packed >> ((value_index & 1u) * 4u)) & 15u;
+}
+
+template <typename Stream>
+inline uint mfq_vq_read_8(
+    Stream stream,
+    uint value_index
+) {
+    return uint(stream[value_index]);
+}
+
+template <typename Stream>
+inline uint mfq_vq_read_12(
+    Stream stream,
+    uint value_index
+) {
+    uint odd = value_index & 1u;
+    uint byte_index = (value_index >> 1u) * 3u + odd;
+    uint packed = uint(stream[byte_index])
+        | (uint(stream[byte_index + 1u]) << 8u);
+    return (packed >> (odd * 4u)) & 4095u;
+}
+
 template <
     typename IndicesPtr,
     typename StatePtr,
@@ -425,7 +454,6 @@ constexpr const char* kGemvSource = R"METAL(
 )METAL";
 
 constexpr const char* kMmqSource = R"METAL(
-    constexpr uint SIMD_GROUPS = 2u;
     constexpr uint K_LANES = 8u;
     constexpr uint ROWS_PER_SIMD =
         32u / K_LANES;
@@ -449,6 +477,11 @@ constexpr const char* kMmqSource = R"METAL(
     uint first_row =
         threadgroup_position_in_grid.x
         * uint(TILE_M);
+    uint output_group_base = output * uint(NG);
+    uint output_vector_base = output * uint(NVEC);
+    uint output_sign_base = output * uint(NSIGN);
+    uint output_super_base = output * uint(NSUPER);
+    float output_anchor = anchors[output];
 
     float accumulators[TILE_M];
     for (uint row = 0u;
@@ -460,16 +493,19 @@ constexpr const char* kMmqSource = R"METAL(
     for (uint group = k_lane;
          group < uint(NG);
          group += K_LANES) {
-        uint state_index =
-            output * uint(NG) + group;
-        uint state = mfq_vq_read_bits(
-            state_packed,
-            state_index,
-            uint(STATE_BITS));
+        uint state_index = output_group_base + group;
+        uint state = STATE_BITS == 4
+            ? mfq_vq_read_4(state_packed, state_index)
+            : (STATE_BITS == 8
+                ? mfq_vq_read_8(state_packed, state_index)
+                : mfq_vq_read_bits(
+                    state_packed,
+                    state_index,
+                    uint(STATE_BITS)));
         uint table_bank = 0u;
         if (HAS_TABLE_BANKS != 0) {
             table_bank = uint(bank_ids[
-                output * uint(NSUPER)
+                output_super_base
                 + group / uint(GROUPS_PER_SUPER)
             ]);
         }
@@ -486,7 +522,7 @@ constexpr const char* kMmqSource = R"METAL(
         } else if (CODE_BANK_MODE == 2) {
             code_bank = delta_value;
         }
-        float weight_scale = anchors[output]
+        float weight_scale = output_anchor
             * scale_lut[
                 table_bank * uint(STATES)
                 + state
@@ -503,18 +539,36 @@ constexpr const char* kMmqSource = R"METAL(
             }
             uint vector =
                 column_base / uint(VECTOR_SIZE);
-            uint index = mfq_vq_read_bits(
-                indices_packed,
-                output * uint(NVEC) + vector,
-                uint(INDEX_BITS));
+            uint index_position = output_vector_base + vector;
+            uint index = INDEX_BITS == 4
+                ? mfq_vq_read_4(indices_packed, index_position)
+                : (INDEX_BITS == 8
+                    ? mfq_vq_read_8(indices_packed, index_position)
+                    : (INDEX_BITS == 12
+                        ? mfq_vq_read_12(
+                            indices_packed,
+                            index_position)
+                        : mfq_vq_read_bits(
+                            indices_packed,
+                            index_position,
+                            uint(INDEX_BITS))));
             uint sign_value = 0u;
             if (AUX_MODE == 1 || AUX_MODE == 2) {
                 sign_value = mfq_vq_read_bits(
                     aux_packed,
-                    output * uint(NSIGN)
-                        + column_base / 8u,
+                    output_sign_base + column_base / 8u,
                     7u);
             }
+            uint code_base = (
+                (
+                    (
+                        table_bank * uint(CODE_BANKS)
+                        + code_bank
+                    )
+                    * uint(ENTRIES) + index
+                )
+                * uint(VECTOR_SIZE)
+            );
             for (uint component = 0u;
                  component < uint(VECTOR_SIZE);
                  ++component) {
@@ -523,19 +577,8 @@ constexpr const char* kMmqSource = R"METAL(
                 if (column >= uint(K)) {
                     break;
                 }
-                uint code_offset = (
-                    (
-                        (
-                            table_bank
-                                * uint(CODE_BANKS)
-                            + code_bank
-                        )
-                        * uint(ENTRIES) + index
-                    )
-                    * uint(VECTOR_SIZE) + component
-                );
                 float code =
-                    float(codebooks[code_offset]);
+                    float(codebooks[code_base + component]);
                 if (AUX_MODE == 1 ||
                     AUX_MODE == 2) {
                     uint sign_position =
@@ -3480,18 +3523,20 @@ array MlxVqWeight::packed_matmul(
         };
         threadgroup = {64, 1, 1};
     } else if (wide_mmq) {
+        const int mmq_simd_groups = index_bits_ <= 8 ? 2 : 4;
+        constexpr int mmq_rows_per_simd = 4;
         const int row_tiles = (rows + 4) / 5;
         effective_tile_rows =
             (rows + row_tiles - 1) / row_tiles;
         const auto grid_x = checked_product(
             static_cast<std::size_t>(row_tiles),
-            std::size_t{64},
+            static_cast<std::size_t>(mmq_simd_groups * 32),
             "MMQ row grid");
         const auto grid_y =
             (
                 static_cast<std::size_t>(output_size_)
-                + 7
-            ) / 8;
+                + mmq_simd_groups * mmq_rows_per_simd - 1
+            ) / (mmq_simd_groups * mmq_rows_per_simd);
         if (grid_x >
                 static_cast<std::size_t>(
                     std::numeric_limits<int>::max()) ||
@@ -3506,7 +3551,7 @@ array MlxVqWeight::packed_matmul(
             static_cast<int>(grid_y),
             1,
         };
-        threadgroup = {64, 1, 1};
+        threadgroup = {mmq_simd_groups * 32, 1, 1};
     } else {
         const auto row_tiles =
             (rows + tile_rows - 1) / tile_rows;
@@ -3553,6 +3598,11 @@ array MlxVqWeight::packed_matmul(
     templates.emplace_back(
         "TILE_M",
         effective_tile_rows);
+    if (wide_mmq) {
+        templates.emplace_back(
+            "SIMD_GROUPS",
+            index_bits_ <= 8 ? 2 : 4);
+    }
     const auto& kernel = fast_gemv
         ? vq_gemv_kernel()
         : (

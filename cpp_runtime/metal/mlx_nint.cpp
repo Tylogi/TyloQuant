@@ -93,12 +93,24 @@ constexpr const char* kNintMatmul = R"METAL(
         float scale = neuron_scale[output] * float(sub_scale[metadata_index]);
         float minimum = neuron_min[output] * float(sub_min[metadata_index]);
         uint quantized_index = metadata_index * uint(GS) + element;
-        uint quantized = mfq_nint_read_value(
-            q_packed,
-            quantized_index,
-            uint(BITS),
-            uint(GS),
-            uint(Q5_EXEC));
+        uint quantized = BITS == 2 && Q5_EXEC == 0
+            ? (
+                uint(q_packed[quantized_index >> 2u])
+                >> ((quantized_index & 3u) * 2u)
+              ) & 3u
+            : (BITS == 4 && Q5_EXEC == 0
+            ? (
+                uint(q_packed[quantized_index >> 1u])
+                >> ((quantized_index & 1u) * 4u)
+              ) & 15u
+            : (BITS == 8 && Q5_EXEC == 0
+            ? uint(q_packed[quantized_index])
+            : mfq_nint_read_value(
+                q_packed,
+                quantized_index,
+                uint(BITS),
+                uint(GS),
+                uint(Q5_EXEC))));
         float weight = scale * float(quantized) - minimum;
         for (uint local_row = 0u; local_row < uint(TILE_M); ++local_row) {
             uint row = first_row + local_row;

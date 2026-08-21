@@ -81,6 +81,20 @@ std::size_t packed_nbytes(const PackedWeight& weight) {
         weight);
 }
 
+std::uint64_t output_hash(array output) {
+    constexpr std::uint64_t offset = 1469598103934665603ull;
+    constexpr std::uint64_t prime = 1099511628211ull;
+    output = mlx::core::contiguous(std::move(output));
+    output.eval();
+    const auto* bytes = output.data<std::uint8_t>();
+    std::uint64_t result = offset;
+    for (std::size_t index = 0; index < output.nbytes(); ++index) {
+        result ^= bytes[index];
+        result *= prime;
+    }
+    return result;
+}
+
 array matmul(const PackedWeight& weight, const array& input) {
     return std::visit(
         [&](const auto& value) {
@@ -161,6 +175,7 @@ void benchmark(
         checksum += static_cast<double>(value);
         maximum = std::max(maximum, std::fabs(value));
     }
+    const auto hash = output_hash(result);
 
     std::cout
         << benchmark_case.dtype << '\t'
@@ -171,7 +186,7 @@ void benchmark(
         << std::setprecision(1) << decimal_gbps << '\t'
         << rows << '\t'
         << std::setprecision(6) << checksum << '\t'
-        << maximum << '\n';
+        << maximum << '\t' << std::hex << hash << std::dec << '\n';
 }
 
 std::vector<BenchmarkCase> load_layer_stack(
@@ -292,7 +307,7 @@ int main(int argc, char** argv) {
         const MfqContainer model(argv[1]);
         std::cout
             << "dtype\ttensor\tshape\tpacked_bytes\tms\tGB/s\t"
-               "launches\tchecksum\tmax_abs\n";
+               "launches\tchecksum\tmax_abs\thash\n";
         std::vector<std::string> names;
         if (argc > first_tensor) {
             names.assign(argv + first_tensor, argv + argc);
