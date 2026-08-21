@@ -2,13 +2,12 @@ from pathlib import Path
 
 from mfq.server.capabilities import capabilities_for_architecture
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = (ROOT / "cpp_runtime" / "mfq_server.cpp").read_text(encoding="utf-8")
-STUDIO_APP = (ROOT / "MFQStudio" / "web" / "src" / "App.tsx").read_text(
+STUDIO_APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
     encoding="utf-8"
 )
-STUDIO_AUDIO = (ROOT / "MFQStudio" / "web" / "src" / "realtimeAudio.ts").read_text(
+STUDIO_AUDIO = (ROOT / "MFQStudio" / "src" / "realtimeAudio.ts").read_text(
     encoding="utf-8"
 )
 

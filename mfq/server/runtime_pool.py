@@ -541,7 +541,11 @@ class ManagedRuntimePool:
 
     async def runtime_models(self) -> dict[str, Any]:
         async with self._lock:
-            managed = list(self._instances.values())
+            managed = [
+                item
+                for item in self._instances.values()
+                if item.state in {RuntimeInstanceState.READY, RuntimeInstanceState.BUSY}
+            ]
         data = []
         for instance in managed:
             data.append(

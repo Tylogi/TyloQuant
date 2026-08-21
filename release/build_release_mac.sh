@@ -14,9 +14,9 @@ mfq_spec_dir="${mfq_build_root}/spec"
 mfq_sidecar_dir="${mfq_script_dir}/sidecars"
 mfq_framework_dir="${mfq_script_dir}/Frameworks"
 mfq_resource_dir="${mfq_script_dir}/Resources"
-mfq_desktop_dir="${mfq_project_dir}/MFQStudio/desktop"
+mfq_studio_dir="${mfq_project_dir}/MFQStudio"
 mfq_tauri_target="aarch64-apple-darwin"
-mfq_dmg_dir="${mfq_desktop_dir}/src-tauri/target/${mfq_tauri_target}/release/bundle/dmg"
+mfq_dmg_dir="${mfq_studio_dir}/src-tauri/target/${mfq_tauri_target}/release/bundle/dmg"
 mfq_output_dir="${MFQ_RELEASE_OUTPUT_DIR:-${mfq_script_dir}/dist}"
 mfq_cli_name="mfq-cli"
 mfq_runtime_name="mfq-decode-metal-aarch64-apple-darwin"
@@ -168,12 +168,14 @@ codesign --verify --strict --verbose=2 "${mfq_cli_path}"
 "${mfq_cli_path}" calibrate --help >/dev/null
 "${mfq_cli_path}" tpq --help >/dev/null
 
-cd "${mfq_desktop_dir}"
+cd "${mfq_studio_dir}"
 npm ci
 npm run check
 CI=true \
 APPLE_SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:-${mfq_signing_identity}}" \
-  npm run build -- --target "${mfq_tauri_target}"
+  npm run tauri -- build \
+    --config src-tauri/tauri.release-macos.conf.json \
+    --target "${mfq_tauri_target}"
 
 [[ -d "${mfq_dmg_dir}" ]] || fail "Tauri did not create a DMG directory"
 mfq_dmg_path="$(find "${mfq_dmg_dir}" -maxdepth 1 -type f -name '*.dmg' -print -quit)"

@@ -1,11 +1,10 @@
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
-CSS = (ROOT / "MFQStudio" / "web" / "src" / "styles.css").read_text(
+CSS = (ROOT / "MFQStudio" / "src" / "styles.css").read_text(
     encoding="utf-8"
 )
-APP = (ROOT / "MFQStudio" / "web" / "src" / "App.tsx").read_text(
+APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
     encoding="utf-8"
 )
 

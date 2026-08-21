@@ -1,0 +1,12 @@
+{
+  "bundle": {
+    "targets": ["nsis"],
+    "externalBin": [
+      "../../release/sidecars/mfq-decode"
+    ],
+    "resources": {
+      "../../release/windows-runtime/": "",
+      "../../release/Resources/mfq-cli": "mfq-cli"
+    }
+  }
+}

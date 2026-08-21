@@ -1,6 +1,5 @@
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = (ROOT / "cpp_runtime" / "mfq_server.cpp").read_text(
     encoding="utf-8"
@@ -20,10 +19,10 @@ METAL_DECODE = (
 METAL_DSV4 = (
     ROOT / "cpp_runtime" / "metal" / "mlx_deepseek_v4_causal_lm.cpp"
 ).read_text(encoding="utf-8")
-STUDIO_APP = (ROOT / "MFQStudio" / "web" / "src" / "App.tsx").read_text(
+STUDIO_APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
     encoding="utf-8"
 )
-STUDIO_API = (ROOT / "MFQStudio" / "web" / "src" / "api.ts").read_text(
+STUDIO_API = (ROOT / "MFQStudio" / "src" / "api.ts").read_text(
     encoding="utf-8"
 )
 LLAMA_CHAT = (

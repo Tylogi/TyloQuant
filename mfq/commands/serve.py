@@ -51,8 +51,8 @@ def _environment_paths(name: str) -> list[Path]:
     return [Path(value) for value in os.environ.get(name, "").split(os.pathsep) if value]
 
 
-def _studio_web_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "MFQStudio" / "web"
+def _studio_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "MFQStudio"
 
 
 def _validate_web_root(path: Path, *, source: str) -> Path:
@@ -76,7 +76,7 @@ def _prepare_web_root(configured: Path | None, *, disabled: bool) -> Path | None
             Path(environment_root),
             source="MFQ_SERVER_WEB_ROOT",
         )
-    web_dir = _studio_web_dir()
+    web_dir = _studio_dir()
     package = web_dir / "package.json"
     output = web_dir / "dist"
     index = output / "index.html"

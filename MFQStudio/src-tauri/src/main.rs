@@ -308,6 +308,19 @@ async fn start_local(app: &AppHandle, config: StudioConfig) -> Result<StudioStat
     if let Some(runtime) = packaged_runtime(app) {
         command.arg("--running-executable").arg(runtime);
     }
+    #[cfg(windows)]
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        // The CUDA, PyTorch, and MSVC DLLs are bundled as resources rather
+        // than alongside the signed Studio executable.  Put that directory
+        // first in the worker's inherited DLL search path.
+        let mut paths = vec![resource_dir];
+        if let Some(existing) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        if let Ok(path) = std::env::join_paths(paths) {
+            command.env("PATH", path);
+        }
+    }
     if let Some(metallib) = packaged_resource(app, "mlx.metallib") {
         command.env("MFQ_MLX_METALLIB", metallib);
     }

@@ -112,16 +112,21 @@ mfq quantize model-bf16.gguf model-IN.mfq \
 
 ## WebUI
 
-`mfq serve` 会按需构建或更新 runtime、加载模型，然后启动 API 和 WebUI：
+`mfq serve` 会按需构建或更新 runtime，然后启动 API 和 WebUI；既可以在启动时
+加载模型，也可以先空载启动、再通过 API 或 Studio 加载：
 
 ```shell
 uv run mfq serve --model path/to/model.mfq --host 127.0.0.1 --port 8090
+uv run mfq serve --model-dir path/to/models --host 127.0.0.1 --port 8090
 ```
 
 `mfq serve` 是唯一的 server 启动入口；原生 C++ worker 对用户不可见，其编译、
 定位、启动和退出均由 CLI 管理。`--host` 和 `--port` 分别控制公开 API 的监听地址
 和端口，默认值为 `127.0.0.1` 和 `8090`。浏览器打开命令输出的 WebUI 地址即可。界面支持流式对话、
 思考过程展示、采样参数控制、对话历史、连接状态和运行监控。
+
+桌面版 Studio 的“模型与任务”页面还可以直接选择本机 `.mfq` 文件并加载。Studio
+只在私有模型目录中登记所选路径，不会复制模型文件；选择任一分片时会自动加载同目录下的完整分片组。
 
 <img src="./docs/figures/tyloquant-mfq-webui.jpg" alt="TyloQuant MFQ 本地推理 WebUI" width="100%">
 

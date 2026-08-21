@@ -14,36 +14,43 @@ cd /path/to/MFQ
 uv sync --extra daemon --extra metal
 ```
 
-On a CUDA host, use `uv sync --extra daemon --extra train` instead. Then start
-the server:
+On a CUDA host, use `uv sync --extra daemon --extra train` instead. Start with
+an initial model:
 
 ```shell
 uv run mfq serve
 ```
 
-The public server listens on `http://127.0.0.1:8090` by default. Stop it with
-`Ctrl-C`; MFQ then stops the private native worker as part of server shutdown.
+Or start an idle server and load a discovered model later through MFQ Studio or
+the model API:
 
 Open the model catalog in MFQ Studio or the Web UI to load a discovered model.
 Pass `--model /models/model.mfq` only when one model should be loaded before the
 server becomes available.
 
-The command must run through uv in the source checkout that contains the native
-runtime sources. MFQ derives that checkout from the installed Python package,
-not from the current working directory. `mfq serve` may compile the runtime on
-first use, so the backend requirements in
-[`mfq build`](build.md#backend-requirements) still apply.
+The public server listens on `http://127.0.0.1:8090` by default. Stop it with
+`Ctrl-C`; MFQ then stops every private native worker as part of server shutdown.
+When supplied, `--model` must point to an existing `.mfq` file.
+
+Without `--running-executable`, run the command through uv in the source checkout
+that contains the native runtime sources. MFQ derives that checkout from the
+installed Python package, not from the current working directory. This mode may
+compile the runtime on first use, so the backend requirements in
+[`mfq build`](build.md#backend-requirements) still apply. A packaged prebuilt
+runtime does not require CMake, `nvcc`, or the source tree.
 
 ## How the native runtime is selected
 
-`mfq serve` detects the host backend and reads the build manifest written by
-[`mfq build`](build.md):
+`mfq serve` detects the host backend and selects the runtime in this order:
 
-1. If the recorded executable exists, MFQ uses it directly.
-2. If the manifest exists but the executable is missing, MFQ rebuilds it in the
+1. `--running-executable` uses that prebuilt binary directly. This is intended
+   for packaged releases and skips managed-build lookup, compiler detection,
+   and compilation.
+2. If the recorded executable exists, MFQ uses it directly.
+3. If the manifest exists but the executable is missing, MFQ rebuilds it in the
    recorded build directory with the recorded generator, build type, and CMake
    arguments.
-3. If no matching manifest exists, MFQ performs a default build and creates the
+4. If no matching manifest exists, MFQ performs a default build and creates the
    manifest.
 
 A manifest is accepted only for the same source checkout, operating system,
@@ -125,7 +132,7 @@ When Web UI assets are available, open the listener root, such as
 2. `--web-root` uses the specified prebuilt directory.
 3. `MFQ_SERVER_WEB_ROOT` supplies a prebuilt directory when the CLI option is
    absent.
-4. Otherwise, MFQ looks for `MFQStudio/web` in the source checkout.
+4. Otherwise, MFQ looks for `MFQStudio` in the source checkout.
 
 A prebuilt directory must contain `index.html` at its root. MFQ validates
 explicit and environment-provided directories before detecting or building the
@@ -168,6 +175,17 @@ If no `--model-dir` is supplied, `MFQ_SERVER_MODEL_DIRS` is read as an
 OS-separated path list. `--max-runtime-instances` limits managed workers and
 `--max-requests-per-runtime` limits concurrent inference requests accepted by
 each worker.
+
+Load a catalog model after startup with:
+
+```shell
+curl -X POST http://127.0.0.1:8090/api/v1/models/load \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"model","context_size":32768}'
+```
+
+The request returns `202 Accepted`; model loading continues as a background
+job whose identifier is returned as `operation_id`.
 
 The catalog name is the MFQ filename without its `.mfq` suffix. Split files
 such as `model-00001-of-00003.mfq` use `model` as the catalog name. Catalog
@@ -250,5 +268,5 @@ does not need configuration.
 
 ### Web UI assets are missing
 
-Install Node.js/npm so MFQ can build `MFQStudio/web`, pass a valid
+Install Node.js/npm so MFQ can build `MFQStudio`, pass a valid
 `--web-root`, or use `--no-web-ui` for an API-only process.

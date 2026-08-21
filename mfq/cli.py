@@ -817,8 +817,8 @@ def _add_calibration_parsers(sub: argparse._SubParsersAction) -> None:
 def _build_parser() -> argparse.ArgumentParser:
     from mfq.commands.build import add_parser as add_build_parser
     from mfq.commands.quantize import add_parser as add_quantize_parser
+    from mfq.commands.serve import add_parser as add_serve_parser
     from mfq.commands.solve_ew import add_parser as add_solve_ew_parser
-    from mfq.server.cli import add_parser as add_serve_parser
 
     parser = argparse.ArgumentParser(prog="mfq", description="Mixed Format Quantization toolchain.")
     parser.add_argument("-V", "--version", action="version", version=f"mfq {__version__}")

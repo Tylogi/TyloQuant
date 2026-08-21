@@ -1738,7 +1738,13 @@ export default function App() {
           setCapabilities(results[0].value);
           setModel(results[0].value.model);
         }
-        if (results[1].status === "fulfilled") setModels(results[1].value);
+        if (results[1].status === "fulfilled") {
+          const nextModels = results[1].value;
+          setModels(nextModels);
+          if (results[0].status !== "fulfilled") {
+            setModel((current) => current || nextModels[0]?.id || "");
+          }
+        }
         if (results[2].status === "fulfilled") setRuntime(results[2].value);
         if (results[5].status === "fulfilled") setArtifacts(results[5].value);
         if (results[6].status === "fulfilled") setInstances(results[6].value);
@@ -3399,7 +3405,8 @@ export default function App() {
           <button className="open-local-model" disabled={busy} onClick={() => void chooseModelDirectory()} type="button"><Icon name="folder" size={14} />{tr("打开模型文件夹", "Open model folder")}</button>
           <label htmlFor="new-model">{tr("模型", "Model")}</label>
           <select id="new-model" value={model} onChange={(event) => setModel(event.target.value)}>
-            {(models.length ? models : [{ id: model }]).map((item) => <option key={item.id} value={item.id}>{item.id}</option>)}
+            {!models.length && <option value="">{tr("尚未加载模型", "No model loaded")}</option>}
+            {models.map((item) => <option key={item.id} value={item.id}>{item.id}</option>)}
           </select>
           <div className="mode-picker">
             {(["text", "voice", "full_duplex"] as SessionMode[]).map((item) => {
