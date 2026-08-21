@@ -283,7 +283,8 @@ Fixture make_jsc(
     std::string dtype,
     int codebook_id,
     int vector_size,
-    int index_bits) {
+    int index_bits,
+    bool group64 = false) {
     constexpr std::uint8_t kJsc = 0x20;
     constexpr int entries_base = 1;
     const int entries = entries_base << index_bits;
@@ -296,7 +297,7 @@ Fixture make_jsc(
         24,
         kMatrixOutput,
         kInputSize);
-    append<std::uint8_t>(blob, 1);
+    append<std::uint8_t>(blob, group64 ? 2 : 1);
     append<std::uint8_t>(blob, 2);
     append<std::uint8_t>(blob, 16);
     append<std::uint8_t>(blob, 0);
@@ -308,7 +309,8 @@ Fixture make_jsc(
             blob,
             static_cast<std::uint8_t>(state & 1));
     }
-    blob.insert(blob.end(), 12, 0);
+    append<std::uint8_t>(blob, group64 ? 1 : 0);
+    blob.insert(blob.end(), 11, 0);
     for (int bank = 0; bank < 2; ++bank) {
         for (int entry = 0; entry < entries; ++entry) {
             for (int component = 0;
@@ -320,16 +322,23 @@ Fixture make_jsc(
             }
         }
     }
-    append_matrix_streams(
-        blob,
-        kMatrixOutput,
-        kInputSize,
-        24,
-        vector_size,
-        4,
-        index_bits,
-        7,
-        true);
+    if (group64) {
+        append_anchors(blob, kMatrixOutput);
+        for (int output = 0; output < kMatrixOutput; ++output) {
+            append<std::uint64_t>(blob, std::uint64_t{1} << 60);
+        }
+    } else {
+        append_matrix_streams(
+            blob,
+            kMatrixOutput,
+            kInputSize,
+            24,
+            vector_size,
+            4,
+            index_bits,
+            7,
+            true);
+    }
     return {
         std::move(dtype),
         std::move(blob),
@@ -1286,6 +1295,7 @@ int main() {
         for (const auto& fixture : all) {
             test_fixture(fixture);
         }
+        test_fixture(make_jsc("NVQ2J-XL", 5, 8, 12, true));
 
         auto rotated = make_nepq(0, true);
         test_fixture(rotated);

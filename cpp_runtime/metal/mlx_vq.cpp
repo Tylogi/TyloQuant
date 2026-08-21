@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -37,6 +38,9 @@ constexpr int kAuxDelta = 3;
 constexpr int kCodeBankFixed = 0;
 constexpr int kCodeBankState = 1;
 constexpr int kCodeBankAux = 2;
+
+constexpr int kExecutionStreams = 0;
+constexpr int kExecutionGroup64 = 1;
 
 constexpr const char* kBitstreamHeader = R"METAL(
 #include <metal_simdgroup_matrix>
@@ -108,6 +112,26 @@ inline uint mfq_vq_read_12(
     return (packed >> (odd * 4u)) & 4095u;
 }
 
+inline uint2 mfq_vq_read_group64(
+    device const uchar* stream,
+    uint record_index
+) {
+    return *(device const uint2*)(stream + record_index * 8u);
+}
+
+inline uint mfq_vq_group64_segment(
+    uint2 record,
+    uint local_vector
+) {
+    if (local_vector == 0u) {
+        return record.x & 0xfffffu;
+    }
+    if (local_vector == 1u) {
+        return ((record.x >> 20u) | (record.y << 12u)) & 0xfffffu;
+    }
+    return (record.y >> 8u) & 0xfffffu;
+}
+
 template <
     typename IndicesPtr,
     typename StatePtr,
@@ -142,6 +166,7 @@ inline float mfq_vq_decode_weight(
     uint code_banks,
     uint aux_mode,
     uint code_bank_mode,
+    uint execution_layout,
     uint has_table_banks,
     uint groups_per_super,
     uint supergroups,
@@ -151,25 +176,39 @@ inline float mfq_vq_decode_weight(
     uint vector = column / vector_size;
     uint component = column - vector * vector_size;
     uint state_index = output * groups + group;
-    uint state = mfq_vq_read_bits(
-        state_packed, state_index, state_bits);
+    uint state;
+    uint index;
+    uint aux_value = 0u;
+    if (execution_layout == 1u) {
+        uint2 record = mfq_vq_read_group64(
+            indices_packed,
+            state_index);
+        uint segment = mfq_vq_group64_segment(
+            record,
+            (column - group * groupsize) / vector_size);
+        state = record.y >> 28u;
+        index = segment & 4095u;
+        aux_value = segment >> 12u;
+    } else {
+        state = mfq_vq_read_bits(
+            state_packed, state_index, state_bits);
+        index = mfq_vq_read_bits(
+            indices_packed,
+            output * vectors + vector,
+            index_bits);
+        if (aux_mode == 1u || aux_mode == 2u) {
+            aux_value = mfq_vq_read_bits(
+                aux_packed, output * signs + column / 8u, 7u);
+        } else if (aux_mode == 3u) {
+            aux_value = mfq_vq_read_bits(
+                aux_packed, state_index, 1u);
+        }
+    }
     uint table_bank = 0u;
     if (has_table_banks != 0u) {
         table_bank = uint(bank_ids[
             output * supergroups + group / groups_per_super
         ]);
-    }
-    uint index = mfq_vq_read_bits(
-        indices_packed,
-        output * vectors + vector,
-        index_bits);
-    uint aux_value = 0u;
-    if (aux_mode == 1u || aux_mode == 2u) {
-        aux_value = mfq_vq_read_bits(
-            aux_packed, output * signs + column / 8u, 7u);
-    } else if (aux_mode == 3u) {
-        aux_value = mfq_vq_read_bits(
-            aux_packed, state_index, 1u);
     }
     uint code_bank = 0u;
     if (code_bank_mode == 1u) {
@@ -187,9 +226,11 @@ inline float mfq_vq_decode_weight(
     float code = float(codebooks[code_offset]);
     if (aux_mode == 1u || aux_mode == 2u) {
         uint sign_position = column & 7u;
-        uint negative = sign_position < 7u
+        uint negative = execution_layout == 1u
             ? ((aux_value >> sign_position) & 1u)
-            : (popcount(aux_value) & 1u);
+            : (sign_position < 7u
+                ? ((aux_value >> sign_position) & 1u)
+                : (popcount(aux_value) & 1u));
         if (aux_mode == 2u && sign_position == 7u) {
             negative ^= (index >> 7u) & 1u;
         }
@@ -246,6 +287,7 @@ constexpr const char* kMatmulSource = R"METAL(
             uint(CODE_BANKS),
             uint(AUX_MODE),
             uint(CODE_BANK_MODE),
+            uint(EXECUTION_LAYOUT),
             uint(HAS_TABLE_BANKS),
             uint(GROUPS_PER_SUPER),
             uint(NSUPER),
@@ -685,6 +727,7 @@ constexpr const char* kDequantizeSource = R"METAL(
         uint(CODE_BANKS),
         uint(AUX_MODE),
         uint(CODE_BANK_MODE),
+        uint(EXECUTION_LAYOUT),
         uint(HAS_TABLE_BANKS),
         uint(GROUPS_PER_SUPER),
         uint(NSUPER),
@@ -727,6 +770,7 @@ constexpr const char* kEmbeddingSource = R"METAL(
         uint(CODE_BANKS),
         uint(AUX_MODE),
         uint(CODE_BANK_MODE),
+        uint(EXECUTION_LAYOUT),
         uint(HAS_TABLE_BANKS),
         uint(GROUPS_PER_SUPER),
         uint(NSUPER),
@@ -973,6 +1017,7 @@ struct CanonicalVq {
     int code_banks = 0;
     int aux_mode = kAuxNone;
     int code_bank_mode = kCodeBankFixed;
+    int execution_layout = kExecutionStreams;
     int table_banks = 1;
     int groups_per_supergroup = 0;
     int supergroups = 1;
@@ -1530,7 +1575,7 @@ CanonicalVq parse_nvq(
         const auto state_mode =
             cursor.scalar<std::uint8_t>(
                 "NVQ-JSC state mode");
-        if (version != 1 ||
+        if ((version != 1 && version != 2) ||
             (banks != 1 && banks != 2 && banks != 4) ||
             states != 16 ||
             state_mode > 1) {
@@ -1543,8 +1588,16 @@ CanonicalVq parse_nvq(
             "NVQ-JSC scale LUT");
         result.state_to_codebank =
             cursor.bytes(16, "NVQ-JSC bank map");
+        const auto storage_layout =
+            cursor.scalar<std::uint8_t>(
+                "NVQ-JSC storage layout");
         const auto reserved =
-            cursor.bytes(12, "NVQ-JSC reserved metadata");
+            cursor.bytes(11, "NVQ-JSC reserved metadata");
+        if ((version == 1 && storage_layout != 0) ||
+            (version == 2 && storage_layout != 1)) {
+            throw std::runtime_error(
+                "unsupported NVQ-JSC storage layout");
+        }
         if (std::any_of(
                 reserved.begin(),
                 reserved.end(),
@@ -1577,6 +1630,14 @@ CanonicalVq parse_nvq(
                 + static_cast<std::ptrdiff_t>(codebook_size));
         result.aux_mode = kAuxSignEven;
         result.code_bank_mode = kCodeBankState;
+        result.execution_layout = version == 2
+            ? kExecutionGroup64
+            : kExecutionStreams;
+        if (result.execution_layout == kExecutionGroup64 &&
+            profile.id != 5) {
+            throw std::runtime_error(
+                "NVQ-JSC group64 storage requires NVQ2J-XL");
+        }
     } else {
         result.code_banks = 1;
         result.state_to_codebank.assign(
@@ -1623,32 +1684,72 @@ CanonicalVq parse_nvq(
         cursor,
         static_cast<std::size_t>(result.output_size),
         "neuron anchors");
-    result.states_packed = padded_stream(
-        cursor,
-        checked_product(
+    if (result.execution_layout == kExecutionGroup64) {
+        const auto records = checked_product(
             static_cast<std::size_t>(result.output_size),
             static_cast<std::size_t>(result.groups),
-            "state count"),
-        result.state_bits,
-        "state stream");
-    result.indices = padded_stream(
-        cursor,
-        checked_product(
-            static_cast<std::size_t>(result.output_size),
-            static_cast<std::size_t>(result.vectors),
-            "index count"),
-        result.index_bits,
-        "index stream");
-    const int signs =
-        (result.input_size + 7) / 8;
-    result.auxiliary = padded_stream(
-        cursor,
-        checked_product(
-            static_cast<std::size_t>(result.output_size),
-            static_cast<std::size_t>(signs),
-            "sign count"),
-        7,
-        "sign stream");
+            "group64 record count");
+        result.indices = cursor.bytes(
+            checked_product(records, std::size_t{8},
+                "group64 stream size"),
+            "group64 stream");
+        for (std::size_t record = 0; record < records; ++record) {
+            std::uint64_t packed{};
+            std::memcpy(
+                &packed,
+                result.indices.data() + record * 8,
+                sizeof(packed));
+            const auto group = record
+                % static_cast<std::size_t>(result.groups);
+            for (int local = 0; local < 3; ++local) {
+                const auto segment = static_cast<std::uint32_t>(
+                    (packed >> (local * 20)) & 0xfffffu);
+                const auto sign = (segment >> 12) & 0xffu;
+                const auto sign7 = sign & 0x7fu;
+                if ((sign >> 7) !=
+                    (std::popcount(sign7) & 1u)) {
+                    throw std::runtime_error(
+                        "invalid NVQ-JSC group64 parity bit");
+                }
+                if (group * 3 + static_cast<std::size_t>(local) >=
+                        static_cast<std::size_t>(result.vectors) &&
+                    segment != 0) {
+                    throw std::runtime_error(
+                        "NVQ-JSC group64 padding must be zero");
+                }
+            }
+        }
+        result.indices.insert(result.indices.end(), 2, 0);
+        result.states_packed.assign(3, 0);
+        result.auxiliary.assign(3, 0);
+    } else {
+        result.states_packed = padded_stream(
+            cursor,
+            checked_product(
+                static_cast<std::size_t>(result.output_size),
+                static_cast<std::size_t>(result.groups),
+                "state count"),
+            result.state_bits,
+            "state stream");
+        result.indices = padded_stream(
+            cursor,
+            checked_product(
+                static_cast<std::size_t>(result.output_size),
+                static_cast<std::size_t>(result.vectors),
+                "index count"),
+            result.index_bits,
+            "index stream");
+        const int signs =
+            (result.input_size + 7) / 8;
+        result.auxiliary = padded_stream(
+            cursor,
+            checked_product(
+                static_cast<std::size_t>(result.output_size),
+                static_cast<std::size_t>(signs),
+                "sign count"),
+            7,
+            "sign stream");
+    }
     if (cursor.remaining() != 0) {
         throw std::runtime_error(
             "invalid NVQ tensor tail");
@@ -2922,6 +3023,7 @@ common_templates(
     int code_banks,
     int aux_mode,
     int code_bank_mode,
+    int execution_layout,
     int table_banks,
     int groups_per_supergroup,
     int supergroups) {
@@ -2940,6 +3042,7 @@ common_templates(
         {"CODE_BANKS", code_banks},
         {"AUX_MODE", aux_mode},
         {"CODE_BANK_MODE", code_bank_mode},
+        {"EXECUTION_LAYOUT", execution_layout},
         {"HAS_TABLE_BANKS", static_cast<int>(table_banks > 1)},
         {"GROUPS_PER_SUPER", groups_per_supergroup},
         {"NSUPER", supergroups},
@@ -3028,6 +3131,7 @@ MlxVqWeight::MlxVqWeight(
     int code_banks,
     int aux_mode,
     int code_bank_mode,
+    int execution_layout,
     int table_banks,
     int groups_per_supergroup,
     int supergroups,
@@ -3064,6 +3168,7 @@ MlxVqWeight::MlxVqWeight(
       code_banks_(code_banks),
       aux_mode_(aux_mode),
       code_bank_mode_(code_bank_mode),
+      execution_layout_(execution_layout),
       table_banks_(table_banks),
       groups_per_supergroup_(groups_per_supergroup),
       supergroups_(supergroups),
@@ -3173,6 +3278,7 @@ MlxVqWeight MlxVqWeight::from_blob(
         parsed.code_banks,
         parsed.aux_mode,
         parsed.code_bank_mode,
+        parsed.execution_layout,
         parsed.table_banks,
         parsed.groups_per_supergroup,
         parsed.supergroups,
@@ -3230,6 +3336,7 @@ array MlxVqWeight::dequantize(Dtype dtype) const {
         code_banks_,
         aux_mode_,
         code_bank_mode_,
+        execution_layout_,
         table_banks_,
         groups_per_supergroup_,
         supergroups_);
@@ -3352,6 +3459,7 @@ array MlxVqWeight::embedding(
         code_banks_,
         aux_mode_,
         code_bank_mode_,
+        execution_layout_,
         table_banks_,
         groups_per_supergroup_,
         supergroups_);
@@ -3493,10 +3601,12 @@ array MlxVqWeight::packed_matmul(
             "invalid VQ packed row tile");
     }
     const bool fast_gemv =
-        rows == 1 && tile_rows == 1;
+        rows == 1 && tile_rows == 1
+        && execution_layout_ == kExecutionStreams;
     const bool wide_mmq =
         rows >= 2 && rows <= 16
-        && tile_rows == rows;
+        && tile_rows == rows
+        && execution_layout_ == kExecutionStreams;
     int effective_tile_rows = tile_rows;
     std::tuple<int, int, int> grid;
     std::tuple<int, int, int> threadgroup;
@@ -3591,6 +3701,7 @@ array MlxVqWeight::packed_matmul(
         code_banks_,
         aux_mode_,
         code_bank_mode_,
+        execution_layout_,
         table_banks_,
         groups_per_supergroup_,
         supergroups_);

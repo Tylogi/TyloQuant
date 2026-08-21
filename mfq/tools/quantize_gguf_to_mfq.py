@@ -89,6 +89,9 @@ from mfq.formats.nvq import (
     NVQ3_D4,
     NVQ3_D4_512,
     NVQ3_D4_1024,
+    jsc_payload_nbytes,
+    pack_jsc_group64,
+    resolve_jsc_storage_layout,
 )
 from mfq.formats.nvq import (
     _HEADER as _NVQ_HEADER,
@@ -1670,7 +1673,7 @@ def _estimate_blob_bytes(
             header
             + 64
             + jsc_banks * spec.codebook_entries * spec.vector_size
-            + spec.payload_nbytes(out, neuron_len)
+            + jsc_payload_nbytes(spec, out, neuron_len)
         )
     if item.target_dtype in {"NVQ2", "NVQ3"}:
         spec = _NVQ_SPECS[item.target_dtype]
@@ -1927,12 +1930,15 @@ def _write_nvq_blob(
                 f"{target_dtype} table base mismatch: {jsc_tables.spec.codebook}"
             )
         ng = math.ceil(neuron_len / spec.groupsize)
+        storage_layout = resolve_jsc_storage_layout(spec)
         nvec = math.ceil(neuron_len / spec.vector_size)
         nsign = math.ceil(neuron_len / 8)
-        _check_row_stream_alignment(
-            row_chunk,
-            [ng * 4, nvec * spec.index_bits, nsign * 7],
+        stream_bits = (
+            [ng * 64]
+            if storage_layout == "group64"
+            else [ng * 4, nvec * spec.index_bits, nsign * 7]
         )
+        _check_row_stream_alignment(row_chunk, stream_bits)
         header = _NVQ_HEADER.pack(
             _NVQ_MAGIC,
             _CODEBOOK_ID[spec.codebook] | _JSC_FLAG,
@@ -1942,11 +1948,11 @@ def _write_nvq_blob(
             neuron_len,
             len(shape),
         )
-        stream_bits = [ng * 4, nvec * spec.index_bits, nsign * 7]
         codebook_payload = _pack_jsc_tables(
             jsc_tables.scale_lut,
             jsc_tables.bank_for_state,
             jsc_tables.codebooks,
+            storage_layout=storage_layout,
         )
     else:
         spec = _NVQ_SPECS[target_dtype]
@@ -2035,6 +2041,15 @@ def _write_nvq_blob(
                 f.write(_pack_nvq1_l_bits(tensor.indices, spec.index_bits))
                 f.seek(stream_offsets[2] + (start * stream_bits[2]) // 8)
                 f.write(_pack_nvq1_l_bits(tensor.delta_sign, 1))
+            elif target_dtype in _JSC_DTYPES and storage_layout == "group64":
+                f.write(
+                    pack_jsc_group64(
+                        tensor.state,
+                        tensor.indices,
+                        tensor.signs,
+                        neuron_len=neuron_len,
+                    )
+                )
             else:
                 f.write(_pack_nvq_bits(tensor.sub_scale, spec.sub_bits))
                 f.seek(stream_offsets[1] + (start * stream_bits[1]) // 8)

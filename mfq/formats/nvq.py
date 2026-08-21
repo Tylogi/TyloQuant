@@ -23,7 +23,9 @@ The first two profiles intentionally use the original 256-entry E8/D4 grids:
 
 ``NVQ2_E8_1024`` / ``NVQ2_E8_4096``
     Ten- and twelve-bit E8 indices.  With the common JSC state and parity
-    streams their asymptotic payloads are 2.2917 and 2.5417 bpw.
+    streams their asymptotic information payloads are 2.2917 and 2.5417 bpw.
+    NVQ2J-XL may instead store each 24-weight group in one aligned 64-bit
+    execution record (2.6667 bpw) to avoid a duplicate runtime cache.
 
 ``NVQ3_D4_1024``
     One 10-bit D4 index per four weights.  With JSC state and parity streams
@@ -344,7 +346,12 @@ class NvqTensor:
 _JSC_STATE_COUNT = 16
 _JSC_METADATA_BYTES = 64
 _JSC_VERSION = 1
+_JSC_GROUP_LAYOUT_VERSION = 2
 _JSC_ANALYTIC_STATE = 1
+_JSC_GROUP64_LAYOUT = 1
+_JSC_STREAM_LAYOUT = "streams"
+_JSC_AUTO_LAYOUT = "auto"
+_JSC_GROUP64_LAYOUT_NAME = "group64"
 
 
 def _analytic_jsc_tables(
@@ -429,6 +436,7 @@ class NvqJscTensor:
     signs: np.ndarray
     codebooks: np.ndarray
     base_spec: NvqSpec = NVQ2_E8
+    storage_layout: str = _JSC_AUTO_LAYOUT
 
     @property
     def spec(self) -> NvqSpec:
@@ -444,6 +452,9 @@ class NvqJscTensor:
     def payload_nbytes(self) -> int:
         out = int(np.asarray(self.neuron_scale).size)
         tables = _JSC_METADATA_BYTES + int(np.asarray(self.codebooks).size)
+        if _resolve_jsc_storage_layout(self) == _JSC_GROUP64_LAYOUT_NAME:
+            groups = math.ceil(self.neuron_len / self.spec.groupsize)
+            return tables + out * 2 + out * groups * 8
         return tables + self.spec.payload_nbytes(out, self.neuron_len)
 
     @property
@@ -455,6 +466,8 @@ def pack_jsc_tables(
     scale_lut: np.ndarray,
     bank_for_state: np.ndarray,
     codebooks: np.ndarray,
+    *,
+    storage_layout: str = _JSC_STREAM_LAYOUT,
 ) -> bytes:
     """Pack the fixed 64-byte JSC header and raw int8 codebook banks."""
 
@@ -474,8 +487,22 @@ def pack_jsc_tables(
     if np.any(bank_for_state >= banks):
         raise ValueError("NVQ-JSC bank_for_state references a missing bank")
 
+    if storage_layout not in {
+        _JSC_STREAM_LAYOUT,
+        _JSC_GROUP64_LAYOUT_NAME,
+    }:
+        raise ValueError(f"unsupported NVQ-JSC storage layout: {storage_layout}")
+    if (
+        storage_layout == _JSC_GROUP64_LAYOUT_NAME
+        and codebooks.shape[1:] != (4096, 8)
+    ):
+        raise ValueError("NVQ-JSC group64 storage requires 4096-entry 8-D codebooks")
     header = bytearray(_JSC_METADATA_BYTES)
-    header[0] = _JSC_VERSION
+    header[0] = (
+        _JSC_GROUP_LAYOUT_VERSION
+        if storage_layout == _JSC_GROUP64_LAYOUT_NAME
+        else _JSC_VERSION
+    )
     header[1] = banks
     header[2] = _JSC_STATE_COUNT
     analytic_scale, analytic_bank = _analytic_jsc_tables(
@@ -487,6 +514,8 @@ def pack_jsc_tables(
         header[3] = _JSC_ANALYTIC_STATE
     header[4:36] = np.ascontiguousarray(scale_lut, dtype="<f2").tobytes()
     header[36:52] = bank_for_state.tobytes()
+    if storage_layout == _JSC_GROUP64_LAYOUT_NAME:
+        header[52] = _JSC_GROUP64_LAYOUT
     return bytes(header) + codebooks.tobytes()
 
 
@@ -495,6 +524,7 @@ def pack_jsc_metadata(tensor: NvqJscTensor) -> bytes:
         tensor.scale_lut,
         tensor.bank_for_state,
         tensor.codebooks,
+        storage_layout=_resolve_jsc_storage_layout(tensor),
     )
 
 
@@ -506,18 +536,43 @@ def unpack_jsc_metadata(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """Decode JSC metadata and return ``(lut, bank_map, codebooks, bytes)``."""
 
+    scale_lut, bank_for_state, codebooks, consumed, _ = (
+        _unpack_jsc_metadata_profile(
+            payload,
+            vector_size=vector_size,
+            codebook_entries=codebook_entries,
+        )
+    )
+    return scale_lut, bank_for_state, codebooks, consumed
+
+
+def _unpack_jsc_metadata_profile(
+    payload: bytes | memoryview,
+    *,
+    vector_size: int = 8,
+    codebook_entries: int = 256,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, str]:
+    """Decode JSC tables plus their physical storage-layout contract."""
+
     if len(payload) < _JSC_METADATA_BYTES:
         raise ValueError("truncated NVQ-JSC metadata header")
     header = memoryview(payload)[:_JSC_METADATA_BYTES]
     version = int(header[0])
     banks = int(header[1])
     states = int(header[2])
-    if version != _JSC_VERSION:
+    if version not in {_JSC_VERSION, _JSC_GROUP_LAYOUT_VERSION}:
         raise ValueError(f"unsupported NVQ-JSC metadata version: {version}")
     if banks not in {1, 2, 4} or states != _JSC_STATE_COUNT:
         raise ValueError(f"invalid NVQ-JSC table dimensions: banks={banks}, states={states}")
     state_mode = int(header[3])
-    if state_mode not in {0, _JSC_ANALYTIC_STATE} or any(header[52:64]):
+    layout = _JSC_STREAM_LAYOUT
+    if version == _JSC_GROUP_LAYOUT_VERSION:
+        if int(header[52]) != _JSC_GROUP64_LAYOUT or any(header[53:64]):
+            raise ValueError("invalid NVQ-JSC v2 storage layout")
+        layout = _JSC_GROUP64_LAYOUT_NAME
+    elif any(header[52:64]):
+        raise ValueError("NVQ-JSC v1 reserved metadata bytes must be zero")
+    if state_mode not in {0, _JSC_ANALYTIC_STATE}:
         raise ValueError("NVQ-JSC reserved metadata bytes must be zero")
     scale_lut = np.frombuffer(header[4:36], dtype="<f2").astype(np.float32)
     bank_for_state = np.frombuffer(header[36:52], dtype=np.uint8).copy()
@@ -553,7 +608,147 @@ def unpack_jsc_metadata(
             bank_for_state, expected_bank
         ):
             raise ValueError("invalid analytic NVQ-JSC state tables")
-    return scale_lut, bank_for_state, codebooks, consumed
+    return scale_lut, bank_for_state, codebooks, consumed, layout
+
+
+def _resolve_jsc_storage_layout(tensor: NvqJscTensor) -> str:
+    return resolve_jsc_storage_layout(tensor.spec, tensor.storage_layout)
+
+
+def resolve_jsc_storage_layout(
+    spec: NvqSpec,
+    storage_layout: str = _JSC_AUTO_LAYOUT,
+) -> str:
+    """Resolve and validate the physical JSC stream layout for ``spec``."""
+
+    layout = storage_layout
+    if layout == _JSC_AUTO_LAYOUT:
+        layout = (
+            _JSC_GROUP64_LAYOUT_NAME
+            if spec.codebook == "e8_4096"
+            else _JSC_STREAM_LAYOUT
+        )
+    if layout not in {_JSC_STREAM_LAYOUT, _JSC_GROUP64_LAYOUT_NAME}:
+        raise ValueError(f"unsupported NVQ-JSC storage layout: {layout}")
+    if layout == _JSC_GROUP64_LAYOUT_NAME and (
+        spec.codebook != "e8_4096"
+        or spec.vector_size != 8
+        or spec.index_bits != 12
+        or spec.groupsize != 24
+        or spec.sub_bits != 4
+    ):
+        raise ValueError("NVQ-JSC group64 storage requires NVQ2J-XL")
+    return layout
+
+
+def jsc_payload_nbytes(
+    spec: NvqSpec,
+    out: int,
+    neuron_len: int,
+    *,
+    storage_layout: str = _JSC_AUTO_LAYOUT,
+) -> int:
+    """Return anchor plus JSC stream bytes, excluding the table metadata."""
+
+    layout = resolve_jsc_storage_layout(spec, storage_layout)
+    if layout == _JSC_GROUP64_LAYOUT_NAME:
+        return out * 2 + out * math.ceil(neuron_len / 24) * 8
+    return spec.payload_nbytes(out, neuron_len)
+
+
+def pack_jsc_group64(
+    state: np.ndarray,
+    indices: np.ndarray,
+    signs: np.ndarray,
+    *,
+    neuron_len: int,
+) -> bytes:
+    """Pack NVQ2J-XL state, index, and sign rows as aligned 64-bit groups."""
+
+    groups = math.ceil(neuron_len / 24)
+    vectors = math.ceil(neuron_len / 8)
+    state_values = np.asarray(state)
+    if state_values.ndim != 2 or state_values.shape[1] != groups:
+        raise ValueError(f"bad group64 state shape; expected [rows,{groups}]")
+    out = int(state_values.shape[0])
+    index_values = np.asarray(indices)
+    sign_values = np.asarray(signs)
+    if index_values.shape != (out, vectors):
+        raise ValueError(f"bad group64 index shape; expected {(out, vectors)}")
+    if sign_values.shape != (out, vectors):
+        raise ValueError(f"bad group64 sign shape; expected {(out, vectors)}")
+    for label, values, maximum in (
+        ("state", state_values, 15),
+        ("index", index_values, 4095),
+        ("sign", sign_values, 127),
+    ):
+        if (
+            not np.issubdtype(values.dtype, np.integer)
+            or np.any(values < 0)
+            or np.any(values > maximum)
+        ):
+            raise ValueError(f"group64 {label} values must be integers in [0,{maximum}]")
+    states = state_values.astype(np.uint64, copy=False)
+    indices = index_values.astype(np.uint64, copy=False)
+    signs = sign_values.astype(np.uint8, copy=False)
+    padded_indices = np.zeros((out, groups * 3), dtype=np.uint64)
+    padded_signs = np.zeros((out, groups * 3), dtype=np.uint8)
+    padded_indices[:, :vectors] = indices
+    padded_signs[:, :vectors] = signs
+    padded_indices = padded_indices.reshape(out, groups, 3)
+    padded_signs = padded_signs.reshape(out, groups, 3)
+    parity = np.bitwise_xor.reduce(
+        (padded_signs[..., None] >> np.arange(7, dtype=np.uint8)) & 1,
+        axis=-1,
+    ).astype(np.uint64)
+    sign8 = padded_signs.astype(np.uint64) | (parity << 7)
+    records = states << np.uint64(60)
+    for local in range(3):
+        segment = padded_indices[..., local] | (sign8[..., local] << np.uint64(12))
+        records |= segment << np.uint64(local * 20)
+    return np.ascontiguousarray(records, dtype="<u8").tobytes()
+
+
+def _pack_jsc_group64(tensor: NvqJscTensor) -> bytes:
+    return pack_jsc_group64(
+        tensor.state,
+        tensor.indices,
+        tensor.signs,
+        neuron_len=tensor.neuron_len,
+    )
+
+
+def _unpack_jsc_group64(
+    blob: bytes | memoryview,
+    off: int,
+    *,
+    out: int,
+    groups: int,
+    vectors: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    count = out * groups
+    nbytes = count * 8
+    if off + nbytes > len(blob):
+        raise ValueError("truncated NVQ-JSC group64 stream")
+    records = np.frombuffer(blob, dtype="<u8", count=count, offset=off).copy()
+    records = records.reshape(out, groups)
+    state = (records >> np.uint64(60)).astype(np.uint8)
+    indices = np.zeros((out, groups * 3), dtype=np.uint16)
+    signs = np.zeros((out, groups * 3), dtype=np.uint8)
+    parity_table = np.asarray([int(value).bit_count() & 1 for value in range(128)])
+    for local in range(3):
+        segment = (records >> np.uint64(local * 20)) & np.uint64((1 << 20) - 1)
+        indices[:, local::3] = (segment & np.uint64(0xFFF)).astype(np.uint16)
+        sign8 = (segment >> np.uint64(12)).astype(np.uint8)
+        sign7 = sign8 & np.uint8(0x7F)
+        if np.any((sign8 >> np.uint8(7)) != parity_table[sign7]):
+            raise ValueError("invalid NVQ-JSC group64 parity bit")
+        signs[:, local::3] = sign7
+    if vectors < groups * 3 and (
+        np.any(indices[:, vectors:]) or np.any(signs[:, vectors:])
+    ):
+        raise ValueError("NVQ-JSC group64 padding must be zero")
+    return state, indices[:, :vectors], signs[:, :vectors], off + nbytes
 
 
 def _pack_bits(values: np.ndarray, bits: int) -> bytes:
@@ -694,6 +889,15 @@ def pack_nvq_jsc(tensor: NvqJscTensor) -> bytes:
     if not np.issubdtype(signs.dtype, np.integer) or np.any(signs < 0) or np.any(signs > 127):
         raise ValueError("NVQ-JSC signs must be integers in [0,127]")
     anchors = _nonnegative_f16_anchors(tensor.neuron_scale, "NVQ-JSC")
+    storage_layout = _resolve_jsc_storage_layout(tensor)
+    if storage_layout == _JSC_GROUP64_LAYOUT_NAME:
+        packed_streams = [_pack_jsc_group64(tensor)]
+    else:
+        packed_streams = [
+            _pack_bits(state, 4),
+            _pack_bits(indices, spec.index_bits),
+            _pack_bits(signs, 7),
+        ]
 
     return b"".join(
         [
@@ -710,9 +914,7 @@ def pack_nvq_jsc(tensor: NvqJscTensor) -> bytes:
             struct.pack("<I", out),
             pack_jsc_metadata(tensor),
             anchors.tobytes(),
-            _pack_bits(state, 4),
-            _pack_bits(indices, spec.index_bits),
-            _pack_bits(signs, 7),
+            *packed_streams,
         ]
     )
 
@@ -756,11 +958,19 @@ def unpack_nvq(blob: bytes | memoryview) -> NvqTensor | NvqJscTensor:
             sub_bits=sub_bits,
             sign_mode=sign_mode,
         )
-        scale_lut, bank_for_state, codebooks, consumed = unpack_jsc_metadata(
+        (
+            scale_lut,
+            bank_for_state,
+            codebooks,
+            consumed,
+            storage_layout,
+        ) = _unpack_jsc_metadata_profile(
             memoryview(blob)[off:],
             vector_size=spec.vector_size,
             codebook_entries=spec.codebook_entries,
         )
+        if storage_layout == _JSC_GROUP64_LAYOUT_NAME and spec.codebook != "e8_4096":
+            raise ValueError("NVQ-JSC group64 storage requires NVQ2J-XL")
         off += consumed
         ng = math.ceil(neuron_len / groupsize)
         nvec = math.ceil(neuron_len / spec.vector_size)
@@ -771,9 +981,21 @@ def unpack_nvq(blob: bytes | memoryview) -> NvqTensor | NvqJscTensor:
             blob, dtype=np.float16, count=out, offset=off
         ), "NVQ-JSC").astype(np.float32)
         off += out * 2
-        state, off = _unpack_bits(blob, off, out * ng, 4)
-        indices, off = _unpack_bits(blob, off, out * nvec, spec.index_bits)
-        signs, off = _unpack_bits(blob, off, out * nsign, 7)
+        if storage_layout == _JSC_GROUP64_LAYOUT_NAME:
+            state, indices, signs, off = _unpack_jsc_group64(
+                blob,
+                off,
+                out=out,
+                groups=ng,
+                vectors=nvec,
+            )
+            state = state.reshape(-1)
+            indices = indices.reshape(-1)
+            signs = signs.reshape(-1)
+        else:
+            state, off = _unpack_bits(blob, off, out * ng, 4)
+            indices, off = _unpack_bits(blob, off, out * nvec, spec.index_bits)
+            signs, off = _unpack_bits(blob, off, out * nsign, 7)
         if off != len(blob):
             raise ValueError(f"invalid NVQ-JSC blob tail: consumed={off}, size={len(blob)}")
         return NvqJscTensor(
@@ -788,6 +1010,7 @@ def unpack_nvq(blob: bytes | memoryview) -> NvqTensor | NvqJscTensor:
             signs=signs.reshape(out, nsign),
             codebooks=codebooks,
             base_spec=spec,
+            storage_layout=storage_layout,
         )
 
     spec = NvqSpec(

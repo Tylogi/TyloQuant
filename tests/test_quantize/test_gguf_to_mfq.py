@@ -731,6 +731,19 @@ def test_streaming_nvq_blob_roundtrip(tmp_path, target_dtype):
     assert result.nbytes == len(payload)
     assert result.gain_calibration is None
     assert restored.shape == tuple(weight.shape)
+    if target_dtype == "NVQ2J-XL":
+        assert restored.storage_layout == "group64"
+        item = GgufTensorPlan(
+            name="w",
+            source_name="w",
+            source_shape=tuple(weight.shape),
+            original_shape=tuple(weight.shape),
+            storage_shape=tuple(weight.shape),
+            source_type="BF16",
+            recipe_type="IQ2_S",
+            target_dtype=target_dtype,
+        )
+        assert result.nbytes == _estimate_blob_bytes(item, jsc_banks=2)
 
 
 def test_streaming_jsc_none_calibration_keeps_bound_imatrix(

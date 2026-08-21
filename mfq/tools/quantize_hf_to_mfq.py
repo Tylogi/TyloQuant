@@ -129,8 +129,11 @@ from mfq.formats.nvq import (
     NVQ3_D4,
     NVQ3_D4_512,
     NVQ3_D4_1024,
+    jsc_payload_nbytes,
     pack_codebook,
+    pack_jsc_group64,
     pack_jsc_tables,
+    resolve_jsc_storage_layout,
 )
 from mfq.formats.nvq import (
     _HEADER as _NVQ_HEADER,
@@ -2739,10 +2742,12 @@ def _write_flat_family_axis0_blob(
             if not isinstance(artifact, NvqJscTables):
                 raise TypeError(f"{family} stream artifact must contain NvqJscTables")
             encoded_codebook = _CODEBOOK_ID[spec.codebook] | _JSC_FLAG
+            storage_layout = resolve_jsc_storage_layout(spec)
             table_payload = pack_jsc_tables(
                 artifact.scale_lut,
                 artifact.bank_for_state,
                 artifact.codebooks,
+                storage_layout=storage_layout,
             )
         else:
             encoded_codebook = _CODEBOOK_ID[spec.codebook]
@@ -2762,9 +2767,17 @@ def _write_flat_family_axis0_blob(
             neuron_len,
             len(shape),
         )
-        stream_bits = (ng * spec.sub_bits, nvec * spec.index_bits, nsign * 7)
-        packer = _pack_nvq_bits
-        fields = ("sub_scale", "indices", "signs")
+        if family in {
+            "NVQ2J", "NVQ2J-L", "NVQ2J-XL",
+            "NVQ3J", "NVQ3J-512", "NVQ3J-L",
+        } and storage_layout == "group64":
+            stream_bits = (ng * 64,)
+            packer = None
+            fields = ("group64",)
+        else:
+            stream_bits = (ng * spec.sub_bits, nvec * spec.index_bits, nsign * 7)
+            packer = _pack_nvq_bits
+            fields = ("sub_scale", "indices", "signs")
     else:
         raise ValueError(f"unsupported flat expert precision: {family}")
 
@@ -2857,6 +2870,16 @@ def _write_flat_family_axis0_blob(
                 stream_offsets, stream_bits, fields, strict=True
             ):
                 output.seek(stream_offset + (start * bits) // 8)
+                if field == "group64":
+                    output.write(
+                        pack_jsc_group64(
+                            tensor.state,
+                            tensor.indices,
+                            tensor.signs,
+                            neuron_len=neuron_len,
+                        )
+                    )
+                    continue
                 if field in {"delta_sign"}:
                     packed_bits = 1
                 elif field == "signs":
@@ -2867,6 +2890,8 @@ def _write_flat_family_axis0_blob(
                     packed_bits = spec.state_bits
                 else:
                     packed_bits = spec.sub_bits
+                if packer is None:
+                    raise AssertionError("missing compact stream packer")
                 output.write(packer(np.asarray(getattr(tensor, field)), packed_bits))
             del tensor
     return blob_path.stat().st_size
@@ -3414,7 +3439,14 @@ def _mixed_moe_blob_nbytes(
                 _NVQ_HEADER.size
                 + flat_shape_header
                 + table_nbytes
-                + spec.payload_nbytes(rows, columns)
+                + (
+                    jsc_payload_nbytes(spec, rows, columns)
+                    if precision.family in {
+                        "NVQ2J", "NVQ2J-L", "NVQ2J-XL",
+                        "NVQ3J", "NVQ3J-512", "NVQ3J-L",
+                    }
+                    else spec.payload_nbytes(rows, columns)
+                )
             )
         elif precision.family in _NEPQ_SPECS:
             if artifact is None:

@@ -101,6 +101,9 @@ public:
     int code_bank_mode() const noexcept {
         return code_bank_mode_;
     }
+    int execution_layout() const noexcept {
+        return execution_layout_;
+    }
     int table_banks() const noexcept {
         return table_banks_;
     }
@@ -197,6 +200,7 @@ private:
         int code_banks,
         int aux_mode,
         int code_bank_mode,
+        int execution_layout,
         int table_banks,
         int groups_per_supergroup,
         int supergroups,
@@ -247,6 +251,7 @@ private:
     int code_banks_ = 0;
     int aux_mode_ = 0;
     int code_bank_mode_ = 0;
+    int execution_layout_ = 0;
     int table_banks_ = 0;
     int groups_per_supergroup_ = 0;
     int supergroups_ = 0;

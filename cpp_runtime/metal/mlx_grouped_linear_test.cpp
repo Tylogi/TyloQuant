@@ -720,7 +720,8 @@ NamedVqFixture make_jsc_vq(
     int profile,
     int vector_size,
     int index_bits,
-    int output_size) {
+    int output_size,
+    bool group64 = false) {
     const int entries = 1 << index_bits;
     std::vector<std::uint8_t> blob;
     append_matrix_header(
@@ -729,7 +730,7 @@ NamedVqFixture make_jsc_vq(
         static_cast<std::uint8_t>(profile | 0x20),
         4,
         output_size);
-    append<std::uint8_t>(blob, 1);
+    append<std::uint8_t>(blob, group64 ? 2 : 1);
     append<std::uint8_t>(blob, 2);
     append<std::uint8_t>(blob, 16);
     append<std::uint8_t>(blob, 0);
@@ -739,7 +740,8 @@ NamedVqFixture make_jsc_vq(
             blob,
             static_cast<std::uint8_t>(state & 1));
     }
-    blob.insert(blob.end(), 12, 0);
+    append<std::uint8_t>(blob, group64 ? 1 : 0);
+    blob.insert(blob.end(), 11, 0);
     for (int bank = 0; bank < 2; ++bank) {
         for (int entry = 0;
              entry < entries;
@@ -753,14 +755,24 @@ NamedVqFixture make_jsc_vq(
             }
         }
     }
-    append_vq_streams(
-        blob,
-        output_size,
-        vector_size,
-        4,
-        index_bits,
-        7,
-        true);
+    if (group64) {
+        constexpr int groups = (kInputSize + 23) / 24;
+        append_ones(blob, output_size);
+        for (int output = 0; output < output_size; ++output) {
+            for (int group = 0; group < groups; ++group) {
+                append<std::uint64_t>(blob, std::uint64_t{1} << 60);
+            }
+        }
+    } else {
+        append_vq_streams(
+            blob,
+            output_size,
+            vector_size,
+            4,
+            index_bits,
+            7,
+            true);
+    }
     return {
         std::move(dtype),
         {
@@ -958,6 +970,8 @@ std::vector<NamedVqFixture> make_vq_fixtures() {
         make_jsc_vq("NVQ2J-L", 4, 8, 10, 5));
     result.push_back(
         make_jsc_vq("NVQ2J-XL", 5, 8, 12, 3));
+    result.push_back(
+        make_jsc_vq("NVQ2J-XL", 5, 8, 12, 3, true));
     result.push_back(
         make_plain_vq("NVQ3", 2, 4, 4));
     result.push_back(

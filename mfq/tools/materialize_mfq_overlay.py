@@ -527,31 +527,73 @@ def _subset_nvq_jsc_payload(
 
     metadata_offset = pool.payload_offset + header_nbytes
     metadata_header = _read_exact(handle, metadata_offset, 64)
+    metadata_version = int(metadata_header[0])
     banks = int(metadata_header[1])
     state_count = int(metadata_header[2])
-    if banks not in {1, 2, 4} or state_count != 16:
+    storage_layout = int(metadata_header[52])
+    if (
+        metadata_version not in {1, 2}
+        or banks not in {1, 2, 4}
+        or state_count != 16
+        or (metadata_version == 1 and storage_layout != 0)
+        or (metadata_version == 2 and storage_layout != 1)
+        or any(metadata_header[53 if metadata_version == 2 else 52 : 64])
+    ):
         raise ValueError(f"{pool.dtype} has invalid JSC metadata")
+    group64 = metadata_version == 2
+    if group64 and (
+        pool.dtype != "NVQ2J-XL"
+        or codebook_id != 5
+        or vector_size != 8
+        or index_bits != 12
+        or groupsize != 24
+        or sub_bits != 4
+    ):
+        raise ValueError("JSC group64 slicing requires NVQ2J-XL")
     metadata_nbytes = 64 + banks * codebook_entries * vector_size
     groups = (neuron_len + groupsize - 1) // groupsize
     vectors = (neuron_len + vector_size - 1) // vector_size
     signs = (neuron_len + 7) // 8
     anchors_per_expert = rows_per_expert * 2
-    state_bits_per_expert = rows_per_expert * groups * sub_bits
-    index_bits_per_expert = rows_per_expert * vectors * index_bits
-    sign_bits_per_expert = rows_per_expert * signs * 7
-    if state_bits_per_expert % 8 or index_bits_per_expert % 8 or sign_bits_per_expert % 8:
-        raise ValueError(f"{pool.dtype} expert streams are not byte-aligned for structural slicing")
-    state_per_expert = state_bits_per_expert // 8
-    index_per_expert = index_bits_per_expert // 8
-    sign_per_expert = sign_bits_per_expert // 8
-
     anchors_offset = metadata_offset + metadata_nbytes
-    state_offset = anchors_offset + int(out) * 2
-    indices_offset = state_offset + (int(out) * groups * sub_bits + 7) // 8
-    signs_offset = indices_offset + (int(out) * vectors * index_bits + 7) // 8
-    payload_end = signs_offset + (int(out) * signs * 7 + 7) // 8
-    if payload_end != pool.payload_offset + pool.payload_nbytes:
-        raise ValueError(f"{pool.dtype} payload size does not match its metadata")
+    if group64:
+        records_per_expert = rows_per_expert * groups
+        records_offset = anchors_offset + int(out) * 2
+        payload_end = records_offset + int(out) * groups * 8
+        if payload_end != pool.payload_offset + pool.payload_nbytes:
+            raise ValueError(f"{pool.dtype} payload size does not match its metadata")
+        stream_layout = (
+            (anchors_offset, anchors_per_expert),
+            (records_offset, records_per_expert * 8),
+        )
+    else:
+        state_bits_per_expert = rows_per_expert * groups * sub_bits
+        index_bits_per_expert = rows_per_expert * vectors * index_bits
+        sign_bits_per_expert = rows_per_expert * signs * 7
+        if (
+            state_bits_per_expert % 8
+            or index_bits_per_expert % 8
+            or sign_bits_per_expert % 8
+        ):
+            raise ValueError(
+                f"{pool.dtype} expert streams are not byte-aligned for structural slicing"
+            )
+        state_per_expert = state_bits_per_expert // 8
+        index_per_expert = index_bits_per_expert // 8
+        sign_per_expert = sign_bits_per_expert // 8
+
+        state_offset = anchors_offset + int(out) * 2
+        indices_offset = state_offset + (int(out) * groups * sub_bits + 7) // 8
+        signs_offset = indices_offset + (int(out) * vectors * index_bits + 7) // 8
+        payload_end = signs_offset + (int(out) * signs * 7 + 7) // 8
+        if payload_end != pool.payload_offset + pool.payload_nbytes:
+            raise ValueError(f"{pool.dtype} payload size does not match its metadata")
+        stream_layout = (
+            (anchors_offset, anchors_per_expert),
+            (state_offset, state_per_expert),
+            (indices_offset, index_per_expert),
+            (signs_offset, sign_per_expert),
+        )
 
     selected_count = len(selected_positions)
     new_out = selected_count * rows_per_expert
@@ -575,12 +617,7 @@ def _subset_nvq_jsc_payload(
         _literal(new_header),
         _source(pool.source, metadata_offset, metadata_nbytes),
     ]
-    for offset, stride in (
-        (anchors_offset, anchors_per_expert),
-        (state_offset, state_per_expert),
-        (indices_offset, index_per_expert),
-        (signs_offset, sign_per_expert),
-    ):
+    for offset, stride in stream_layout:
         segments.extend(
             _selected_stream_segments(
                 source=pool.source,

@@ -816,6 +816,7 @@ def _add_calibration_parsers(sub: argparse._SubParsersAction) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     from mfq.commands.build import add_parser as add_build_parser
+    from mfq.commands.optimize import add_parser as add_optimize_parser
     from mfq.commands.quantize import add_parser as add_quantize_parser
     from mfq.commands.serve import add_parser as add_serve_parser
     from mfq.commands.solve_ew import add_parser as add_solve_ew_parser
@@ -824,6 +825,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-V", "--version", action="version", version=f"mfq {__version__}")
     sub = parser.add_subparsers(dest="command", metavar="<command>")
     add_build_parser(sub)
+    add_optimize_parser(sub)
     add_serve_parser(sub)
     add_quantize_parser(sub)
     add_solve_ew_parser(sub)

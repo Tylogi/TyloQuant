@@ -89,6 +89,56 @@ def test_extended_nvq_jsc_blob_roundtrip():
         np.testing.assert_array_equal(restored.codebooks, tensor.codebooks)
 
 
+def test_nvq2j_xl_group64_layout_and_legacy_stream_roundtrip():
+    rng = np.random.default_rng(20260821)
+    out, neuron_len = 2, 50
+    groups = 3
+    vectors = 7
+    tensor = NvqJscTensor(
+        shape=(out, neuron_len),
+        axis=0,
+        neuron_len=neuron_len,
+        neuron_scale=np.asarray([0.01, 0.02], dtype=np.float32),
+        scale_lut=np.arange(16, dtype=np.float32),
+        bank_for_state=np.zeros(16, dtype=np.uint8),
+        state=rng.integers(0, 16, size=(out, groups), dtype=np.uint8),
+        indices=rng.integers(0, 4096, size=(out, vectors), dtype=np.uint16),
+        signs=rng.integers(0, 128, size=(out, vectors), dtype=np.uint8),
+        codebooks=E8_4096[None].astype(np.int8),
+        base_spec=NVQ2_E8_4096,
+    )
+    group64 = pack_nvq(tensor)
+    assert group64[40] == 2
+    assert group64[92] == 1
+    restored = unpack_nvq(group64)
+    assert isinstance(restored, NvqJscTensor)
+    assert restored.storage_layout == "group64"
+    np.testing.assert_array_equal(restored.state, tensor.state)
+    np.testing.assert_array_equal(restored.indices, tensor.indices)
+    np.testing.assert_array_equal(restored.signs, tensor.signs)
+
+    legacy_tensor = NvqJscTensor(
+        **{**tensor.__dict__, "storage_layout": "streams"},
+    )
+    legacy = pack_nvq(legacy_tensor)
+    assert legacy[40] == 1
+    legacy_stream_bytes = (
+        (out * groups * 4 + 7) // 8
+        + (out * vectors * 12 + 7) // 8
+        + (out * vectors * 7 + 7) // 8
+    )
+    assert len(group64) - len(legacy) == out * groups * 8 - legacy_stream_bytes
+    legacy_restored = unpack_nvq(legacy)
+    assert isinstance(legacy_restored, NvqJscTensor)
+    assert legacy_restored.storage_layout == "streams"
+    np.testing.assert_array_equal(legacy_restored.indices, tensor.indices)
+
+    corrupted = bytearray(group64)
+    corrupted[-out * groups * 8 + 2] ^= 0x08
+    with pytest.raises(ValueError, match="parity"):
+        unpack_nvq(corrupted)
+
+
 def test_nvq_blob_roundtrip():
     rng = np.random.default_rng(5)
     out, neuron_len = 3, 80

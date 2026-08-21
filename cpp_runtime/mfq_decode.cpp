@@ -4263,6 +4263,25 @@ static std::vector<uint8_t> take_bytes(
     return result;
 }
 
+static void store_compact_bits_cpu(
+        std::vector<uint8_t> & destination,
+        size_t bit,
+        int bits,
+        uint32_t value) {
+    const size_t byte = bit >> 3;
+    const int shift = static_cast<int>(bit & 7);
+    const int bytes = (shift + bits + 7) >> 3;
+    if (bits <= 0 || bits > 24 || byte + bytes > destination.size() ||
+            value >= (1u << bits)) {
+        throw std::runtime_error("invalid compact bitstream write");
+    }
+    const uint32_t shifted = value << shift;
+    for (int index = 0; index < bytes; ++index) {
+        destination[byte + index] |= static_cast<uint8_t>(
+            shifted >> (index * 8));
+    }
+}
+
 static NvqCpu unpack_nvq(const std::vector<uint8_t> & blob, const std::string & dtype) {
     if (blob.size() < 20) throw std::runtime_error("truncated NVQ header");
     NvqCpu t;
@@ -4310,6 +4329,7 @@ static NvqCpu unpack_nvq(const std::vector<uint8_t> & blob, const std::string & 
     }
 
     bool custom = false;
+    bool group64_storage = false;
     if (t.format == 7) {
         if (profile != 1 || t.sub_bits != 3) {
             throw std::runtime_error("unsupported NPQ0-L profile");
@@ -4429,8 +4449,21 @@ static NvqCpu unpack_nvq(const std::vector<uint8_t> & blob, const std::string & 
         }
         const uint8_t * header = blob.data() + off;
         const int banks = header[1];
-        if (header[0] != 1 || (banks != 1 && banks != 2 && banks != 4) || header[2] != 16) {
+        const int metadata_version = header[0];
+        if ((metadata_version != 1 && metadata_version != 2) ||
+                (banks != 1 && banks != 2 && banks != 4) || header[2] != 16) {
             throw std::runtime_error("unsupported NVQ2J metadata dimensions");
+        }
+        if (metadata_version == 1) {
+            if (header[52] != 0) {
+                throw std::runtime_error("invalid NVQ-JSC v1 storage layout");
+            }
+        } else {
+            if (t.format != 14 || header[52] != 1) {
+                throw std::runtime_error(
+                    "NVQ-JSC group64 storage requires NVQ2J-XL");
+            }
+            group64_storage = true;
         }
         if (header[3] != 0 && header[3] != 1) {
             throw std::runtime_error("invalid NVQ-JSC state mode");
@@ -4460,7 +4493,8 @@ static NvqCpu unpack_nvq(const std::vector<uint8_t> & blob, const std::string & 
                 }
             }
         }
-        for (size_t i = 52; i < kHeaderBytes; ++i) {
+        const size_t reserved_begin = metadata_version == 1 ? 52 : 53;
+        for (size_t i = reserved_begin; i < kHeaderBytes; ++i) {
             if (header[i] != 0) throw std::runtime_error("invalid NVQ-JSC reserved metadata bytes");
         }
         const size_t metadata_bytes = kHeaderBytes + (size_t)banks * kBankBytes;
@@ -4521,9 +4555,56 @@ static NvqCpu unpack_nvq(const std::vector<uint8_t> & blob, const std::string & 
         (no_aux_format ? 0 : (size_t)t.out * t.nsign);
     size_t aux_bits = delta_format ? 1 : (no_aux_format ? 0 : 7);
     size_t aux_bytes = (aux_count * aux_bits + 7) / 8;
-    t.sub_scale_packed = take_bytes(blob, off, sub_bytes, "sub-scale stream");
-    t.indices_packed = take_bytes(blob, off, index_bytes, "index stream");
-    t.aux_packed = take_bytes(blob, off, aux_bytes, "aux stream");
+    if (group64_storage) {
+        const size_t record_count = static_cast<size_t>(t.out) * t.ng;
+        const auto records = take_bytes(
+            blob, off, record_count * 8, "group64 stream");
+        t.sub_scale_packed.assign(sub_bytes, 0);
+        t.indices_packed.assign(index_bytes, 0);
+        t.aux_packed.assign(aux_bytes, 0);
+        for (size_t linear = 0; linear < record_count; ++linear) {
+            uint64_t packed = 0;
+            std::memcpy(&packed, records.data() + linear * 8, sizeof(packed));
+            const uint32_t state = static_cast<uint32_t>(packed >> 60);
+            store_compact_bits_cpu(
+                t.sub_scale_packed, linear * t.sub_bits, t.sub_bits, state);
+            const size_t row = linear / static_cast<size_t>(t.ng);
+            const size_t group = linear - row * static_cast<size_t>(t.ng);
+            for (int local = 0; local < 3; ++local) {
+                const uint32_t segment = static_cast<uint32_t>(
+                    (packed >> (local * 20)) & 0xfffffu);
+                const uint32_t index = segment & 0xfffu;
+                const uint32_t mask8 = segment >> 12;
+                uint32_t parity = mask8 & 0x7fu;
+                parity ^= parity >> 4;
+                parity ^= parity >> 2;
+                parity ^= parity >> 1;
+                if ((mask8 >> 7) != (parity & 1u)) {
+                    throw std::runtime_error(
+                        "invalid NVQ-JSC group64 parity bit");
+                }
+                const size_t local_vector = group * 3 + local;
+                if (local_vector >= static_cast<size_t>(t.nvec)) {
+                    if (segment != 0) {
+                        throw std::runtime_error(
+                            "NVQ-JSC group64 padding must be zero");
+                    }
+                    continue;
+                }
+                const size_t vector = row * static_cast<size_t>(t.nvec) +
+                    local_vector;
+                store_compact_bits_cpu(
+                    t.indices_packed, vector * index_bits,
+                    static_cast<int>(index_bits), index);
+                store_compact_bits_cpu(
+                    t.aux_packed, vector * 7, 7, mask8 & 0x7fu);
+            }
+        }
+    } else {
+        t.sub_scale_packed = take_bytes(blob, off, sub_bytes, "sub-scale stream");
+        t.indices_packed = take_bytes(blob, off, index_bytes, "index stream");
+        t.aux_packed = take_bytes(blob, off, aux_bytes, "aux stream");
+    }
     if (off != blob.size()) throw std::runtime_error("invalid NVQ blob tail");
     return t;
 }

@@ -65,6 +65,7 @@ struct DirectProjectionLayout {
     int code_banks = 0;
     int aux_mode = 0;
     int code_bank_mode = 0;
+    int execution_layout = 0;
     int table_banks = 0;
     int groups_per_supergroup = 0;
     int supergroups = 0;
@@ -170,6 +171,27 @@ inline uint mfq_grouped_vq_read_12(
     uint packed = uint(stream[byte_index])
         | (uint(stream[byte_index + 1u]) << 8u);
     return (packed >> (odd * 4u)) & 4095u;
+}
+
+template <typename Stream>
+inline uint2 mfq_grouped_vq_read_group64(
+    Stream stream,
+    uint record_index
+) {
+    return *(device const uint2*)(stream + record_index * 8u);
+}
+
+inline uint mfq_grouped_vq_group64_segment(
+    uint2 record,
+    uint local_vector
+) {
+    if (local_vector == 0u) {
+        return record.x & 0xfffffu;
+    }
+    if (local_vector == 1u) {
+        return ((record.x >> 20u) | (record.y << 12u)) & 0xfffffu;
+    }
+    return (record.y >> 8u) & 0xfffffu;
 }
 
 inline float mfq_grouped_mx_e8m0(uchar raw) {
@@ -291,6 +313,7 @@ inline float mfq_grouped_vq_decode_weight(
     uint code_banks,
     uint aux_mode,
     uint code_bank_mode,
+    uint execution_layout,
     uint has_table_banks,
     uint groups_per_supergroup,
     uint supergroups,
@@ -302,32 +325,46 @@ inline float mfq_grouped_vq_decode_weight(
         column - vector * vector_size;
     uint state_index =
         output * groups + group;
-    uint state = mfq_grouped_vq_read_bits(
-        state_packed,
-        state_index,
-        state_bits);
+    uint state;
+    uint index;
+    uint auxiliary = 0u;
+    if (execution_layout == 1u) {
+        uint2 record = mfq_grouped_vq_read_group64(
+            indices_packed,
+            state_index);
+        uint segment = mfq_grouped_vq_group64_segment(
+            record,
+            (column - group * group_size) / vector_size);
+        state = record.y >> 28u;
+        index = segment & 4095u;
+        auxiliary = segment >> 12u;
+    } else {
+        state = mfq_grouped_vq_read_bits(
+            state_packed,
+            state_index,
+            state_bits);
+        index = mfq_grouped_vq_read_bits(
+            indices_packed,
+            output * vectors + vector,
+            index_bits);
+        if (aux_mode == 1u || aux_mode == 2u) {
+            auxiliary = mfq_grouped_vq_read_bits(
+                aux_packed,
+                output * sign_groups + column / 8u,
+                7u);
+        } else if (aux_mode == 3u) {
+            auxiliary = mfq_grouped_vq_read_bits(
+                aux_packed,
+                state_index,
+                1u);
+        }
+    }
     uint table_bank = 0u;
     if (has_table_banks != 0u) {
         table_bank = uint(bank_ids[
             output * supergroups
             + group / groups_per_supergroup
         ]);
-    }
-    uint index = mfq_grouped_vq_read_bits(
-        indices_packed,
-        output * vectors + vector,
-        index_bits);
-    uint auxiliary = 0u;
-    if (aux_mode == 1u || aux_mode == 2u) {
-        auxiliary = mfq_grouped_vq_read_bits(
-            aux_packed,
-            output * sign_groups + column / 8u,
-            7u);
-    } else if (aux_mode == 3u) {
-        auxiliary = mfq_grouped_vq_read_bits(
-            aux_packed,
-            state_index,
-            1u);
     }
     uint code_bank = 0u;
     if (code_bank_mode == 1u) {
@@ -349,9 +386,11 @@ inline float mfq_grouped_vq_decode_weight(
     float code = float(codebooks[code_offset]);
     if (aux_mode == 1u || aux_mode == 2u) {
         uint sign_position = column & 7u;
-        uint negative = sign_position < 7u
+        uint negative = execution_layout == 1u
             ? ((auxiliary >> sign_position) & 1u)
-            : (popcount(auxiliary) & 1u);
+            : (sign_position < 7u
+                ? ((auxiliary >> sign_position) & 1u)
+                : (popcount(auxiliary) & 1u));
         if (
             aux_mode == 2u
             && sign_position == 7u
@@ -600,7 +639,7 @@ std::string direct_kernel_key(
         if (layout.family == kFamilyNint8Zero) {
             key += "q8";
         } else if (layout.family == kFamilyVq) {
-            key += "vq";
+            key += layout.execution_layout == 1 ? "vqg64" : "vq";
         } else if (
             layout.family == kFamilyTpqInt4
         ) {
@@ -1017,9 +1056,10 @@ std::string make_direct_source(
             layouts.begin(),
             layouts.end(),
             [](const DirectProjectionLayout& layout) {
-                return layout.family == kFamilyNint
+                return (layout.family == kFamilyNint
                     || layout.family == kFamilyNint8Zero
-                    || layout.family == kFamilyVq;
+                    || layout.family == kFamilyVq)
+                    && layout.execution_layout == 0;
             });
     if (supports_small_m_specialization) {
         return make_direct_small_m_source(layouts);
@@ -1231,6 +1271,7 @@ std::string make_direct_source(
                 "                    uint(P" + suffix + "_CODE_BANKS),\n"
                 "                    uint(P" + suffix + "_AUX_MODE),\n"
                 "                    uint(P" + suffix + "_CODE_BANK_MODE),\n"
+                "                    uint(P" + suffix + "_EXECUTION_LAYOUT),\n"
                 "                    uint(P" + suffix + "_HAS_TABLE_BANKS),\n"
                 "                    uint(P" + suffix + "_GROUPS_PER_SUPER),\n"
                 "                    uint(P" + suffix + "_NSUPER),\n"
@@ -1424,6 +1465,7 @@ std::string make_direct_small_m_blockwise_source(
                 (layout.aux_mode == 1 || layout.aux_mode == 2);
             const bool use_grouped_indices_vq8 =
                 use_grouped_signs_vq8 && layout.index_bits == 12;
+            const bool use_group64 = layout.execution_layout == 1;
             source +=
                 "        uint output_group_base = output * uint(P" + suffix
                 + "_NG);\n"
@@ -1443,12 +1485,20 @@ std::string make_direct_small_m_blockwise_source(
                 "        for (uint group = k_lane; group < uint(P" + suffix
                 + "_NG); group += K_LANES) {\n"
                 "            uint state_index = output_group_base + group;\n";
-            append_blockwise_vq_read(
-                source,
-                "state",
-                "vq_state_" + suffix,
-                "state_index",
-                layout.state_bits);
+            if (use_group64) {
+                source +=
+                    "            uint2 group_record ="
+                    " mfq_grouped_vq_read_group64(vq_indices_" + suffix
+                    + ", state_index);\n"
+                    "            uint state = group_record.y >> 28u;\n";
+            } else {
+                append_blockwise_vq_read(
+                    source,
+                    "state",
+                    "vq_state_" + suffix,
+                    "state_index",
+                    layout.state_bits);
+            }
             source += "            uint table_bank = 0u;\n";
             if (layout.table_banks > 1) {
                 source +=
@@ -1591,7 +1641,7 @@ std::string make_direct_small_m_blockwise_source(
                     "                    }\n"
                     "                }\n";
             } else {
-                if (use_grouped_signs_vq8) {
+                if (use_grouped_signs_vq8 && !use_group64) {
                     source +=
                         "            uint group_signs = 0u;\n"
                         "            if (uint(ROWS) == 2u) {\n"
@@ -1610,7 +1660,7 @@ std::string make_direct_small_m_blockwise_source(
                         " packed_signs >> (sign_bit & 7u);\n"
                         "            }\n";
                 }
-                if (use_grouped_indices_vq8) {
+                if (use_grouped_indices_vq8 && !use_group64) {
                     source +=
                         "            uint grouped_indices = 0u;\n"
                         "            uint grouped_index_high = 0u;\n"
@@ -1646,7 +1696,13 @@ std::string make_direct_small_m_blockwise_source(
                 + "_VECTOR_SIZE);\n"
                 "                uint index_position = output_vector_base"
                 " + vector;\n";
-            if (use_grouped_indices_vq8) {
+            if (use_group64) {
+                source +=
+                    "                uint group_segment ="
+                    " mfq_grouped_vq_group64_segment(group_record,"
+                    " local_vector);\n"
+                    "                uint index = group_segment & 4095u;\n";
+            } else if (use_grouped_indices_vq8) {
                 source +=
                     "                uint index;\n"
                     "                if (uint(ROWS) == 2u) {\n"
@@ -1672,9 +1728,18 @@ std::string make_direct_small_m_blockwise_source(
                     "index_position",
                     layout.index_bits);
             }
-            source += "                uint sign_value = 0u;\n";
+            if (use_group64) {
+                source +=
+                    "                uint sign_value ="
+                    " group_segment >> 12u;\n";
+            } else {
+                source += "                uint sign_value = 0u;\n";
+            }
             if (layout.aux_mode == 1 || layout.aux_mode == 2) {
-                if (use_grouped_signs_vq8) {
+                if (use_group64) {
+                    // The 8-bit group64 sign mask already includes the even
+                    // parity completion bit used by component seven.
+                } else if (use_grouped_signs_vq8) {
                     source +=
                         "                if (uint(ROWS) == 2u) {\n"
                         "                    sign_value ="
@@ -1724,10 +1789,16 @@ std::string make_direct_small_m_blockwise_source(
                     " component < 4u; ++component) {\n"
                     "                    uint sign_position ="
                     " component + 4u;\n"
-                    "                    uint negative ="
-                    " sign_position < 7u"
-                    " ? ((sign_value >> sign_position) & 1u)"
-                    " : (popcount(sign_value) & 1u);\n";
+                    "                    uint negative =";
+                if (use_group64) {
+                    source +=
+                        " (sign_value >> sign_position) & 1u;\n";
+                } else {
+                    source +=
+                        " sign_position < 7u"
+                        " ? ((sign_value >> sign_position) & 1u)"
+                        " : (popcount(sign_value) & 1u);\n";
+                }
                 if (layout.aux_mode == 2) {
                     source +=
                         "                    if (sign_position == 7u)"
@@ -1774,10 +1845,16 @@ std::string make_direct_small_m_blockwise_source(
                         " packed_component < 4u; ++packed_component) {\n"
                         "                        uint sign_position ="
                         " (column + packed_component) & 7u;\n"
-                        "                        uint negative ="
-                        " sign_position < 7u"
-                        " ? ((sign_value >> sign_position) & 1u)"
-                        " : (popcount(sign_value) & 1u);\n";
+                        "                        uint negative =";
+                    if (use_group64) {
+                        source +=
+                            " (sign_value >> sign_position) & 1u;\n";
+                    } else {
+                        source +=
+                            " sign_position < 7u"
+                            " ? ((sign_value >> sign_position) & 1u)"
+                            " : (popcount(sign_value) & 1u);\n";
+                    }
                     if (layout.aux_mode == 2) {
                         source +=
                             "                        if (sign_position == 7u)"
@@ -3545,6 +3622,8 @@ MlxGroupedLinear::MlxGroupedLinear(
                             weight->aux_mode();
                         layout.code_bank_mode =
                             weight->code_bank_mode();
+                        layout.execution_layout =
+                            weight->execution_layout();
                         layout.table_banks =
                             weight->table_banks();
                         layout.groups_per_supergroup =
@@ -4380,6 +4459,9 @@ std::vector<array> MlxGroupedLinear::matmul(
                     templates.emplace_back(
                         prefix + "CODE_BANK_MODE",
                         layout.code_bank_mode);
+                    templates.emplace_back(
+                        prefix + "EXECUTION_LAYOUT",
+                        layout.execution_layout);
                     templates.emplace_back(
                         prefix + "HAS_TABLE_BANKS",
                         static_cast<int>(

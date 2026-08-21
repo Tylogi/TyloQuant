@@ -299,7 +299,8 @@ inline void mfq_moe_jsc_profile(
     uint signs,
     uint k_lane,
     uint k_lanes,
-    uint k_size
+    uint k_size,
+    uint execution_layout
 ) {
     constexpr uint VECTOR_SHIFT =
         VECTOR_SIZE == 4u ? 2u : 3u;
@@ -312,14 +313,30 @@ inline void mfq_moe_jsc_profile(
     ) {
         uint selected_code_banks[MATRIX_ROWS];
         float weight_scales[MATRIX_ROWS];
+        uint2 group_records[MATRIX_ROWS];
         for (uint row = 0u; row < MATRIX_ROWS; ++row) {
             uint state_index = outputs[row] * groups + group;
-            uint state_byte = uint(state_stream[
-                state_offset + (state_index >> 1)
-            ]);
-            uint state = (
-                state_byte >> ((state_index & 1u) * 4u)
-            ) & 15u;
+            uint state;
+            if (EXECUTION_LAYOUT != 0u && execution_layout == 2u) {
+                uint record_offset = indices_offset + state_index * 8u;
+                group_records[row] = uint2(
+                    uint(indices_stream[record_offset])
+                        | (uint(indices_stream[record_offset + 1u]) << 8u)
+                        | (uint(indices_stream[record_offset + 2u]) << 16u)
+                        | (uint(indices_stream[record_offset + 3u]) << 24u),
+                    uint(indices_stream[record_offset + 4u])
+                        | (uint(indices_stream[record_offset + 5u]) << 8u)
+                        | (uint(indices_stream[record_offset + 6u]) << 16u)
+                        | (uint(indices_stream[record_offset + 7u]) << 24u));
+                state = group_records[row].y >> 28u;
+            } else {
+                uint state_byte = uint(state_stream[
+                    state_offset + (state_index >> 1)
+                ]);
+                state = (
+                    state_byte >> ((state_index & 1u) * 4u)
+                ) & 15u;
+            }
             selected_code_banks[row] = uint(
                 state_bank_stream[state_bank_offset + state]);
             weight_scales[row] =
@@ -350,7 +367,17 @@ inline void mfq_moe_jsc_profile(
                 uint index0;
                 uint index1 = 0u;
                 uint sign_value;
-                if (EXECUTION_LAYOUT != 0u) {
+                if (EXECUTION_LAYOUT != 0u && execution_layout == 2u) {
+                    uint2 record = group_records[row];
+                    uint segment = sign_block == 0u
+                        ? record.x & 0xfffffu
+                        : (sign_block == 1u
+                            ? ((record.x >> 20u) | (record.y << 12u))
+                                & 0xfffffu
+                            : (record.y >> 8u) & 0xfffffu);
+                    index0 = segment & 4095u;
+                    sign_value = segment >> 12u;
+                } else if (EXECUTION_LAYOUT != 0u && execution_layout == 1u) {
                     uint execution_offset = indices_offset + (
                         outputs[row] * signs + column_base / 8u
                     ) * BYTES_PER_SIGN;
@@ -402,7 +429,7 @@ inline void mfq_moe_jsc_profile(
                     (sign_value & 16u) != 0u,
                     (sign_value & 32u) != 0u,
                     (sign_value & 64u) != 0u,
-                    EXECUTION_LAYOUT != 0u
+                    EXECUTION_LAYOUT != 0u && execution_layout != 0u
                         ? (sign_value & 128u) != 0u
                         : (popcount(sign_value) & 1u) != 0u);
                 float4 code0 = mfq_moe_load_code4(
@@ -1056,6 +1083,8 @@ constexpr const char* kMoeSource = R"METAL(
 
         uint profile =
             uint(descriptors[descriptor_base + 28u]) & 255u;
+        uint cohort_jsc_layout =
+            uint(descriptors[descriptor_base + 29u]);
         if (
             (uint(VQ_PROFILE_MASK) & 2u) != 0u
             && profile == 1u
@@ -1222,7 +1251,8 @@ constexpr const char* kMoeSource = R"METAL(
                 signs,
                 k_lane,
                 K_LANES,
-                uint(K));
+                uint(K),
+                cohort_jsc_layout);
         } else if (
             (uint(VQ_PROFILE_MASK) & 128u) != 0u
             && profile == 7u
@@ -1233,7 +1263,7 @@ constexpr const char* kMoeSource = R"METAL(
             mfq_moe_jsc_profile<
                 8u,
                 MATRIX_ROWS,
-                0u
+                JSC_EXECUTION_LAYOUT
             >(
                 x,
                 vq_indices,
@@ -1259,7 +1289,8 @@ constexpr const char* kMoeSource = R"METAL(
                 signs,
                 k_lane,
                 K_LANES,
-                uint(K));
+                uint(K),
+                cohort_jsc_layout);
         } else if (
             (uint(VQ_PROFILE_MASK) & 4u) != 0u
             && profile == 2u
@@ -3795,15 +3826,20 @@ MlxVqWeight add_vq_pool(
     // kernel instead of independent packed index and 7-bit auxiliary reads.
     const char* jsc_exec_env = std::getenv(
         "MFQ_METAL_NINTM_JSC_EXEC");
-    const bool jsc_execution =
+    const bool packed_jsc_execution =
         (dtype == "NVQ2J" || dtype == "NVQ3J")
         && (
             jsc_exec_env == nullptr
             || std::string_view(jsc_exec_env) != "0"
         );
+    const bool group64_execution =
+        dtype == "NVQ2J-XL"
+        && weight.execution_layout() == 1;
+    const bool jsc_execution =
+        packed_jsc_execution || group64_execution;
     detail::StagingVector<std::uint8_t>
         jsc_execution_indices;
-    if (jsc_execution) {
+    if (packed_jsc_execution) {
         auto packed_indices = weight.packed_indices();
         auto packed_aux = weight.packed_auxiliary();
         packed_indices.eval();
@@ -3895,6 +3931,11 @@ MlxVqWeight add_vq_pool(
         }
     }
 
+    if (group64_execution) {
+        while ((streams.vq_indices.size() & 7u) != 0u) {
+            streams.vq_indices.push_back(0);
+        }
+    }
     const int indices_offset = checked_int(
         streams.vq_indices.size(),
         "VQ index offset");
@@ -4035,14 +4076,22 @@ MlxVqWeight add_vq_pool(
             | (weight.residual_position_bits() << 8)
             | (weight.residual_block_vectors() << 16);
         descriptors[base + kVqJscExecution] =
-            static_cast<int>(jsc_execution);
+            group64_execution
+                ? 2
+                : static_cast<int>(packed_jsc_execution);
         descriptors[base + kVqResidualCodebookOffset] =
             residual_codebook_offset;
         descriptors[base + kVqResidualRecordOffset] =
             residual_record_offset;
     }
 
-    if (jsc_execution) {
+    if (group64_execution) {
+        append_raw(
+            streams.vq_indices,
+            weight.packed_indices(),
+            mlx::core::uint8,
+            "VQ group64 values");
+    } else if (packed_jsc_execution) {
         streams.vq_indices.insert(
             streams.vq_indices.end(),
             jsc_execution_indices.begin(),

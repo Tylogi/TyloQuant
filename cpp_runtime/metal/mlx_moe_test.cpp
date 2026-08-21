@@ -387,7 +387,8 @@ VqFixture make_jsc_nvq(
     std::string dtype = "NVQ2J",
     int codebook_id = 1,
     int vector_size = 8,
-    int index_bits = 8) {
+    int index_bits = 8,
+    bool group64 = false) {
     constexpr std::uint8_t jsc = 0x20;
     std::vector<std::uint8_t> blob;
     append_vq_matrix_header(
@@ -399,7 +400,7 @@ VqFixture make_jsc_nvq(
         24,
         output,
         input);
-    append<std::uint8_t>(blob, 1);
+    append<std::uint8_t>(blob, group64 ? 2 : 1);
     append<std::uint8_t>(blob, 2);
     append<std::uint8_t>(blob, 16);
     append<std::uint8_t>(blob, 0);
@@ -412,7 +413,8 @@ VqFixture make_jsc_nvq(
             static_cast<std::uint8_t>(
                 state & 1));
     }
-    blob.insert(blob.end(), 12, 0);
+    append<std::uint8_t>(blob, group64 ? 1 : 0);
+    blob.insert(blob.end(), 11, 0);
     for (int bank = 0; bank < 2; ++bank) {
         for (
             int entry = 0;
@@ -429,16 +431,26 @@ VqFixture make_jsc_nvq(
             }
         }
     }
-    append_vq_matrix_streams(
-        blob,
-        output,
-        input,
-        24,
-        vector_size,
-        4,
-        index_bits,
-        7,
-        true);
+    if (group64) {
+        const int groups = (input + 23) / 24;
+        append_vq_anchors(blob, output);
+        for (int row = 0; row < output; ++row) {
+            for (int group = 0; group < groups; ++group) {
+                append<std::uint64_t>(blob, std::uint64_t{1} << 60);
+            }
+        }
+    } else {
+        append_vq_matrix_streams(
+            blob,
+            output,
+            input,
+            24,
+            vector_size,
+            4,
+            index_bits,
+            7,
+            true);
+    }
     return {
         std::move(dtype),
         std::move(blob),
@@ -3279,7 +3291,8 @@ void test_vq_cohorts_and_ffn() {
             "NVQ2J-XL",
             5,
             8,
-            12),
+            12,
+            true),
         make_nvq1_s(width, width),
         make_npq(width, width),
         make_rotated_nepq1_s(width, width),

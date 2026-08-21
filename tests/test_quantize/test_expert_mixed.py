@@ -141,6 +141,8 @@ def test_streaming_flat_family_blob_roundtrip(tmp_path, family: str):
     assert nbytes == path.stat().st_size
     assert expert_tensor_family(tensor) == family
     assert tensor.shape == (6, 96)
+    if family == "NVQ2J-XL":
+        assert tensor.storage_layout == "group64"
 
 
 def test_quantize_expertwise_mixes_flat_and_cross_expert_families():
