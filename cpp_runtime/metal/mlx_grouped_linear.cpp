@@ -1346,18 +1346,403 @@ std::string make_direct_source(
     return source;
 }
 
+void append_blockwise_vq_read(
+    std::string& source,
+    const std::string& target,
+    const std::string& stream,
+    const std::string& position,
+    int bits) {
+    source += "                uint " + target + " = ";
+    if (bits == 4) {
+        source += "mfq_grouped_vq_read_4(" + stream + ", "
+            + position + ");\n";
+    } else if (bits == 8) {
+        source += "mfq_grouped_vq_read_8(" + stream + ", "
+            + position + ");\n";
+    } else if (bits == 12) {
+        source += "mfq_grouped_vq_read_12(" + stream + ", "
+            + position + ");\n";
+    } else {
+        source += "mfq_grouped_vq_read_bits(" + stream + ", "
+            + position + ", " + std::to_string(bits) + "u);\n";
+    }
+}
+
+std::string make_direct_small_m_blockwise_source(
+    const std::vector<DirectProjectionLayout>& layouts) {
+    std::string source = R"METAL(
+    constexpr uint SIMD_GROUPS = 2u;
+    constexpr uint K_LANES = 8u;
+    constexpr uint ROWS_PER_SIMD = 4u;
+    constexpr uint ROWS_PER_TG = SIMD_GROUPS * ROWS_PER_SIMD;
+
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint k_lane = lane & (K_LANES - 1u);
+    uint simd_row = lane / K_LANES;
+    uint global_tile = threadgroup_position_in_grid.x;
+)METAL";
+
+    for (std::size_t projection = 0;
+         projection < layouts.size();
+         ++projection) {
+        const auto& layout = layouts[projection];
+        const auto suffix = std::to_string(projection);
+        source += projection == 0 ? "    if (" : "    else if (";
+        source += "global_tile >= uint(P" + suffix
+            + "_TILE_BEGIN) && global_tile < uint(P" + suffix
+            + "_TILE_END)) {\n";
+        source +=
+            "        uint local_tile = global_tile - uint(P" + suffix
+            + "_TILE_BEGIN);\n"
+            "        uint output_index = local_tile * ROWS_PER_TG"
+            " + simd_group * ROWS_PER_SIMD + simd_row;\n"
+            "        uint output = min(output_index, uint(P" + suffix
+            + "_OUT) - 1u);\n"
+            "        float accumulators[ROWS];\n"
+            "        for (uint row = 0u; row < uint(ROWS); ++row) {\n"
+            "            accumulators[row] = 0.0f;\n"
+            "        }\n";
+
+        if (layout.family == kFamilyVq) {
+            const int vectors_per_group =
+                (layout.group_size + layout.vector_size - 1)
+                / layout.vector_size;
+            source +=
+                "        uint output_group_base = output * uint(P" + suffix
+                + "_NG);\n"
+                "        uint output_vector_base = output * uint(P" + suffix
+                + "_NVEC);\n"
+                "        uint output_sign_base = output"
+                " * ((uint(K) + 7u) / 8u);\n"
+                "        uint output_super_base = output * uint(P" + suffix
+                + "_NSUPER);\n"
+                "        float output_anchor = vq_anchors_" + suffix
+                + "[output];\n"
+                "        for (uint group = k_lane; group < uint(P" + suffix
+                + "_NG); group += K_LANES) {\n"
+                "            uint state_index = output_group_base + group;\n";
+            append_blockwise_vq_read(
+                source,
+                "state",
+                "vq_state_" + suffix,
+                "state_index",
+                layout.state_bits);
+            source += "            uint table_bank = 0u;\n";
+            if (layout.table_banks > 1) {
+                source +=
+                    "            table_bank = uint(vq_bank_ids_" + suffix
+                    + "[output_super_base + group / uint(P" + suffix
+                    + "_GROUPS_PER_SUPER)]);\n";
+            }
+            source += "            uint auxiliary = 0u;\n";
+            if (layout.aux_mode == 3) {
+                source +=
+                    "            auxiliary = mfq_grouped_vq_read_bits("
+                    "vq_aux_" + suffix + ", state_index, 1u);\n";
+            }
+            source += "            uint code_bank = 0u;\n";
+            if (layout.code_bank_mode == 1) {
+                source +=
+                    "            code_bank = uint(vq_state_banks_" + suffix
+                    + "[state]);\n";
+            } else if (layout.code_bank_mode == 2) {
+                source += "            code_bank = auxiliary;\n";
+            }
+            source +=
+                "            float weight_scale = output_anchor"
+                " * vq_scales_" + suffix + "[table_bank * uint(P" + suffix
+                + "_STATES) + state];\n"
+                "            for (uint local_vector = 0u; local_vector < "
+                + std::to_string(vectors_per_group)
+                + "u; ++local_vector) {\n"
+                "                uint column_base = group * uint(P" + suffix
+                + "_GS) + local_vector * uint(P" + suffix
+                + "_VECTOR_SIZE);\n"
+                "                if (column_base >= uint(K)) { break; }\n"
+                "                uint vector = column_base / uint(P" + suffix
+                + "_VECTOR_SIZE);\n"
+                "                uint index_position = output_vector_base"
+                " + vector;\n";
+            append_blockwise_vq_read(
+                source,
+                "index",
+                "vq_indices_" + suffix,
+                "index_position",
+                layout.index_bits);
+            source += "                uint sign_value = 0u;\n";
+            if (layout.aux_mode == 1 || layout.aux_mode == 2) {
+                source +=
+                    "                sign_value ="
+                    " mfq_grouped_vq_read_bits(vq_aux_" + suffix
+                    + ", output_sign_base + column_base / 8u, 7u);\n";
+            }
+            source +=
+                "                uint code_base = (((table_bank * uint(P"
+                + suffix + "_CODE_BANKS) + code_bank) * uint(P" + suffix
+                + "_ENTRIES) + index) * uint(P" + suffix
+                + "_VECTOR_SIZE));\n";
+            if ((layout.vector_size % 4) == 0) {
+                source +=
+                    "                for (uint component_base = 0u;"
+                    " component_base < uint(P" + suffix
+                    + "_VECTOR_SIZE); component_base += 4u) {\n"
+                    "                    uint column = column_base"
+                    " + component_base;\n"
+                    "                    char4 packed_codes ="
+                    " *(device const char4*)(vq_codebooks_" + suffix
+                    + " + code_base + component_base);\n"
+                    "                    float4 codes = float4("
+                    "float(packed_codes.x), float(packed_codes.y),"
+                    " float(packed_codes.z), float(packed_codes.w));\n";
+                if (layout.aux_mode == 1 || layout.aux_mode == 2) {
+                    source +=
+                        "                    for (uint packed_component = 0u;"
+                        " packed_component < 4u; ++packed_component) {\n"
+                        "                        uint sign_position ="
+                        " (column + packed_component) & 7u;\n"
+                        "                        uint negative ="
+                        " sign_position < 7u"
+                        " ? ((sign_value >> sign_position) & 1u)"
+                        " : (popcount(sign_value) & 1u);\n";
+                    if (layout.aux_mode == 2) {
+                        source +=
+                            "                        if (sign_position == 7u)"
+                            " { negative ^= (index >> 7u) & 1u; }\n";
+                    }
+                    source +=
+                        "                        codes[packed_component] ="
+                        " negative != 0u ? -codes[packed_component]"
+                        " : codes[packed_component];\n"
+                        "                    }\n";
+                } else if (layout.aux_mode == 3) {
+                    source +=
+                        "                    codes += float4("
+                        "auxiliary != 0u ? -vq_parameters_" + suffix
+                        + "[0] : vq_parameters_" + suffix + "[0]);\n";
+                }
+                source +=
+                    "                    float4 weights ="
+                    " weight_scale * codes;\n"
+                    "                    for (uint row = 0u;"
+                    " row < uint(ROWS); ++row) {\n"
+                    "                        uint input_base ="
+                    " row * uint(K) + column;\n"
+                    "                        float4 activation = float4(\n"
+                    "                            column < uint(K)"
+                    " ? float(x[input_base]) : 0.0f,\n"
+                    "                            column + 1u < uint(K)"
+                    " ? float(x[input_base + 1u]) : 0.0f,\n"
+                    "                            column + 2u < uint(K)"
+                    " ? float(x[input_base + 2u]) : 0.0f,\n"
+                    "                            column + 3u < uint(K)"
+                    " ? float(x[input_base + 3u]) : 0.0f);\n"
+                    "                        accumulators[row] +="
+                    " activation.x * weights.x;\n"
+                    "                        if (column + 1u < uint(K))"
+                    " accumulators[row] += activation.y * weights.y;\n"
+                    "                        if (column + 2u < uint(K))"
+                    " accumulators[row] += activation.z * weights.z;\n"
+                    "                        if (column + 3u < uint(K))"
+                    " accumulators[row] += activation.w * weights.w;\n"
+                    "                    }\n"
+                    "                }\n";
+            } else {
+                source +=
+                    "                for (uint component = 0u;"
+                    " component < uint(P" + suffix
+                    + "_VECTOR_SIZE); ++component) {\n"
+                    "                    uint column = column_base"
+                    " + component;\n"
+                    "                    if (column >= uint(K))"
+                    " { break; }\n"
+                    "                    float code = float(vq_codebooks_"
+                    + suffix + "[code_base + component]);\n";
+                if (layout.aux_mode == 1 || layout.aux_mode == 2) {
+                    source +=
+                        "                    uint sign_position ="
+                        " column & 7u;\n"
+                        "                    uint negative ="
+                        " sign_position < 7u"
+                        " ? ((sign_value >> sign_position) & 1u)"
+                        " : (popcount(sign_value) & 1u);\n";
+                    if (layout.aux_mode == 2) {
+                        source +=
+                            "                    if (sign_position == 7u)"
+                            " { negative ^= (index >> 7u) & 1u; }\n";
+                    }
+                    source +=
+                        "                    code = negative != 0u"
+                        " ? -code : code;\n";
+                } else if (layout.aux_mode == 3) {
+                    source +=
+                        "                    code += auxiliary != 0u"
+                        " ? -vq_parameters_" + suffix + "[0]"
+                        " : vq_parameters_" + suffix + "[0];\n";
+                }
+                source +=
+                    "                    float weight ="
+                    " weight_scale * code;\n"
+                    "                    for (uint row = 0u;"
+                    " row < uint(ROWS); ++row) {\n"
+                    "                        accumulators[row] += float("
+                    "x[row * uint(K) + column]) * weight;\n"
+                    "                    }\n"
+                    "                }\n";
+            }
+            source +=
+                "            }\n"
+                "        }\n";
+        } else if (layout.family == kFamilyNint) {
+            source +=
+                "        uint output_metadata_base = output * uint(P" + suffix
+                + "_NG);\n"
+                "        float output_scale = neuron_scale_" + suffix
+                + "[output];\n"
+                "        float output_minimum = neuron_min_" + suffix
+                + "[output];\n"
+                "        for (uint group = k_lane; group < uint(P" + suffix
+                + "_NG); group += K_LANES) {\n"
+                "            uint metadata_index ="
+                " output_metadata_base + group;\n"
+                "            float scale = output_scale"
+                " * float(sub_scale_" + suffix + "[metadata_index]);\n"
+                "            float minimum = output_minimum"
+                " * float(sub_min_" + suffix + "[metadata_index]);\n";
+            if (layout.bits == 4 && !layout.q5_execution &&
+                (layout.group_size % 4) == 0) {
+                source +=
+                    "            for (uint element = 0u; element < uint(P"
+                    + suffix + "_GS); element += 4u) {\n"
+                    "                uint column = group * uint(P" + suffix
+                    + "_GS) + element;\n"
+                    "                if (column >= uint(K)) { break; }\n"
+                    "                uint quantized_index = metadata_index"
+                    " * uint(P" + suffix + "_GS) + element;\n"
+                    "                uint packed = uint(q_packed_" + suffix
+                    + "[quantized_index >> 1u])"
+                    " | (uint(q_packed_" + suffix
+                    + "[(quantized_index >> 1u) + 1u]) << 8u);\n"
+                    "                float4 weights = scale * float4(\n"
+                    "                    float(packed & 15u),\n"
+                    "                    float((packed >> 4u) & 15u),\n"
+                    "                    float((packed >> 8u) & 15u),\n"
+                    "                    float((packed >> 12u) & 15u))"
+                    " - float4(minimum);\n"
+                    "                for (uint row = 0u; row < uint(ROWS);"
+                    " ++row) {\n"
+                    "                    uint input_base = row * uint(K)"
+                    " + column;\n"
+                    "                    float4 activation = float4(\n"
+                    "                        column < uint(K)"
+                    " ? float(x[input_base]) : 0.0f,\n"
+                    "                        element + 1u < uint(P" + suffix
+                    + "_GS) && column + 1u < uint(K)"
+                    " ? float(x[input_base + 1u]) : 0.0f,\n"
+                    "                        element + 2u < uint(P" + suffix
+                    + "_GS) && column + 2u < uint(K)"
+                    " ? float(x[input_base + 2u]) : 0.0f,\n"
+                    "                        element + 3u < uint(P" + suffix
+                    + "_GS) && column + 3u < uint(K)"
+                    " ? float(x[input_base + 3u]) : 0.0f);\n"
+                    "                    accumulators[row] +="
+                    " activation.x * weights.x;\n"
+                    "                    if (element + 1u < uint(P" + suffix
+                    + "_GS) && column + 1u < uint(K))"
+                    " accumulators[row] += activation.y * weights.y;\n"
+                    "                    if (element + 2u < uint(P" + suffix
+                    + "_GS) && column + 2u < uint(K))"
+                    " accumulators[row] += activation.z * weights.z;\n"
+                    "                    if (element + 3u < uint(P" + suffix
+                    + "_GS) && column + 3u < uint(K))"
+                    " accumulators[row] += activation.w * weights.w;\n"
+                    "                }\n"
+                    "            }\n";
+            } else {
+                source +=
+                "            for (uint element = 0u; element < uint(P"
+                + suffix + "_GS); ++element) {\n"
+                "                uint column = group * uint(P" + suffix
+                + "_GS) + element;\n"
+                "                if (column >= uint(K)) { break; }\n"
+                "                uint quantized_index = metadata_index"
+                " * uint(P" + suffix + "_GS) + element;\n"
+                "                uint quantized ="
+                " mfq_grouped_nint_read_value(q_packed_" + suffix
+                + ", quantized_index, uint(P" + suffix + "_BITS), uint(P"
+                + suffix + "_GS), "
+                + std::string(layout.q5_execution ? "1u" : "0u")
+                + ");\n"
+                "                float weight = scale * float(quantized)"
+                " - minimum;\n"
+                "                for (uint row = 0u; row < uint(ROWS);"
+                " ++row) {\n"
+                "                    accumulators[row] += float("
+                "x[row * uint(K) + column]) * weight;\n"
+                "                }\n"
+                "            }\n";
+            }
+            source += "        }\n";
+        } else {
+            source +=
+                "        uint output_group_base = output * uint(P" + suffix
+                + "_NG);\n"
+                "        for (uint group = k_lane; group < uint(P" + suffix
+                + "_NG); group += K_LANES) {\n"
+                "            float scale = float(q8_scales_" + suffix
+                + "[output_group_base + group]);\n"
+                "            for (uint element = 0u; element < 32u;"
+                " ++element) {\n"
+                "                uint column = group * 32u + element;\n"
+                "                if (column >= uint(K)) { break; }\n"
+                "                float weight = scale * float(q8_q_" + suffix
+                + "[output * uint(K) + column]);\n"
+                "                for (uint row = 0u; row < uint(ROWS);"
+                " ++row) {\n"
+                "                    accumulators[row] += float("
+                "x[row * uint(K) + column]) * weight;\n"
+                "                }\n"
+                "            }\n"
+                "        }\n";
+        }
+
+        source += R"METAL(
+        for (uint row = 0u; row < uint(ROWS); ++row) {
+            accumulators[row] += simd_shuffle_down(accumulators[row], 4);
+            accumulators[row] += simd_shuffle_down(accumulators[row], 2);
+            accumulators[row] += simd_shuffle_down(accumulators[row], 1);
+)METAL";
+        source +=
+            "            if (k_lane == 0u && output_index < uint(P" + suffix
+            + "_OUT)) {\n"
+            "                y[row * uint(TOTAL_OUT) + uint(P" + suffix
+            + "_OUT_OFFSET) + output_index] = T(accumulators[row]);\n"
+            "            }\n"
+            "        }\n"
+            "    }\n";
+    }
+    return source;
+}
+
 mlx::core::fast::CustomKernelFunction make_direct_kernel(
     const std::vector<DirectProjectionLayout>& layouts,
-    bool batch_rows) {
+    bool batch_rows,
+    bool blockwise) {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
     const auto key = direct_kernel_key(layouts)
-        + (batch_rows ? "_m234" : "_rows");
+        + (batch_rows
+            ? (blockwise
+                ? "_m234_block"
+                : "_m234")
+            : "_rows");
     return mlx::core::fast::metal_kernel(
         "mfq_cpp_zero_copy_grouped_linear_" + key,
         direct_input_names(layouts),
         {"y"},
-        make_direct_source(layouts, batch_rows),
+        blockwise
+            ? make_direct_small_m_blockwise_source(layouts)
+            : make_direct_source(layouts, batch_rows),
         kGroupedHeader,
         true,
         false,
@@ -1366,20 +1751,25 @@ mlx::core::fast::CustomKernelFunction make_direct_kernel(
 
 mlx::core::fast::CustomKernelFunction direct_kernel(
     const std::vector<DirectProjectionLayout>& layouts,
-    bool batch_rows) {
+    bool batch_rows,
+    bool blockwise = false) {
     static std::mutex mutex;
     static std::unordered_map<
         std::string,
         mlx::core::fast::CustomKernelFunction> kernels;
 
     const auto key = direct_kernel_key(layouts)
-        + (batch_rows ? "_m234" : "_rows");
+        + (batch_rows
+            ? (blockwise
+                ? "_m234_block"
+                : "_m234")
+            : "_rows");
     std::lock_guard<std::mutex> lock(mutex);
     const auto found = kernels.find(key);
     if (found != kernels.end()) {
         return found->second;
     }
-    auto kernel = make_direct_kernel(layouts, batch_rows);
+    auto kernel = make_direct_kernel(layouts, batch_rows, blockwise);
     kernels.emplace(key, kernel);
     return kernel;
 }
@@ -3382,25 +3772,55 @@ std::vector<array> MlxGroupedLinear::matmul(
         source.dtype() == mlx::core::float16 &&
         impl_->has_single_row_mxfp8_fast_path();
     // MTP verification overwhelmingly uses two through four rows. Keep all
-    // rows in one threadgroup tile so every decoded packed weight is reused
-    // across M instead of replaying the same GEMV M times. The per-row column
-    // traversal and SIMD reduction order remain identical to the legacy path.
+    // rows in one threadgroup tile so every decoded packed group is reused
+    // across M instead of replaying the same GEMV M times. Eight lanes reduce
+    // one output; this changes only the floating-point reduction order.
     const bool use_small_m_batched_path =
         rows >= 2 && rows <= 4 &&
         impl_->uses_zero_copy_storage();
+    const bool supports_small_m_blockwise =
+        use_small_m_batched_path &&
+        std::all_of(
+            impl_->direct_layouts.begin(),
+            impl_->direct_layouts.end(),
+            [](const DirectProjectionLayout& layout) {
+                return layout.family == kFamilyNint
+                    || layout.family == kFamilyNint8Zero
+                    || layout.family == kFamilyVq;
+            });
+    const auto* grouped_small_m_layout =
+        std::getenv("MFQ_METAL_GROUPED_SMALL_M_LAYOUT");
+    const bool use_small_m_blockwise =
+        supports_small_m_blockwise &&
+        (grouped_small_m_layout == nullptr ||
+         std::strcmp(grouped_small_m_layout, "scalar") != 0);
+    int small_m_blockwise_tiles = 0;
+    if (use_small_m_blockwise) {
+        for (const auto& layout : impl_->direct_layouts) {
+            small_m_blockwise_tiles = checked_int(
+                static_cast<std::size_t>(small_m_blockwise_tiles)
+                    + static_cast<std::size_t>(
+                        (layout.output_size + 7) / 8),
+                "small-M blockwise tile count");
+        }
+    }
     const int work_tiles = use_partitioned_nint4_qkv
         ? impl_->partitioned_nint4_tiles
         : use_single_row_mxfp8_fast_path
         ? impl_->single_row_mxfp8_tiles
         : use_single_row_nint_fast_path
         ? impl_->single_row_tiles
-        : impl_->total_tiles;
+        : (use_small_m_blockwise
+            ? small_m_blockwise_tiles
+            : impl_->total_tiles);
     const auto grid = (use_small_m_batched_path ? 1 : rows)
         * static_cast<std::size_t>(work_tiles)
         * static_cast<std::size_t>(
             use_single_row_mxfp8_fast_path
                 ? 128
-                : (use_partitioned_nint4_qkv ? 256 : 64));
+                : (use_partitioned_nint4_qkv
+                    ? 256
+                    : 64));
     if (grid >
         static_cast<std::size_t>(
             std::numeric_limits<int>::max())) {
@@ -3424,7 +3844,9 @@ std::vector<array> MlxGroupedLinear::matmul(
     const auto threadgroup = std::tuple<int, int, int>{
         use_single_row_mxfp8_fast_path
             ? 128
-            : (use_partitioned_nint4_qkv ? 256 : 64),
+            : (use_partitioned_nint4_qkv
+                ? 256
+                : 64),
         1,
         1,
     };
@@ -3544,6 +3966,7 @@ std::vector<array> MlxGroupedLinear::matmul(
                     {"TOTAL_OUT", impl_->total_output_size},
                     {"TOTAL_TILES", impl_->total_tiles},
                 };
+            int execution_tile_begin = 0;
             for (
                 std::size_t projection = 0;
                 projection < impl_->direct_layouts.size();
@@ -3553,15 +3976,23 @@ std::vector<array> MlxGroupedLinear::matmul(
                     impl_->direct_layouts[projection];
                 const auto prefix =
                     "P" + std::to_string(projection) + "_";
+                const int execution_tile_end =
+                    use_small_m_blockwise
+                    ? execution_tile_begin
+                        + (layout.output_size + 7) / 8
+                    : layout.tile_end;
                 templates.emplace_back(
                     prefix + "OUT",
                     layout.output_size);
                 templates.emplace_back(
                     prefix + "TILE_BEGIN",
-                    layout.tile_begin);
+                    use_small_m_blockwise
+                        ? execution_tile_begin
+                        : layout.tile_begin);
                 templates.emplace_back(
                     prefix + "TILE_END",
-                    layout.tile_end);
+                    execution_tile_end);
+                execution_tile_begin = execution_tile_end;
                 templates.emplace_back(
                     prefix + "OUT_OFFSET",
                     layout.output_offset);
@@ -3642,7 +4073,8 @@ std::vector<array> MlxGroupedLinear::matmul(
             }
             return direct_kernel(
                 impl_->direct_layouts,
-                use_small_m_batched_path)(
+                use_small_m_batched_path,
+                use_small_m_blockwise)(
                 inputs,
                 output_shapes,
                 output_dtypes,

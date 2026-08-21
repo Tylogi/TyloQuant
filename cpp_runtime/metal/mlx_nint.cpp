@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -126,6 +127,155 @@ constexpr const char* kNintMatmul = R"METAL(
         uint row = first_row + local_row;
         if (lane == 0u && row < uint(M)) {
             y[row * uint(OUT) + output] = T(total);
+        }
+    }
+)METAL";
+
+// Decode-oriented M=2/3/4 path. Eight lanes own the quantization-group
+// traversal for one output row, while the four lane subgroups in a SIMD group
+// produce four output rows. A packed group is decoded once and immediately
+// dotted against every input row, so MTP verification does not replay the
+// weight stream once per candidate.
+constexpr const char* kNintMmq = R"METAL(
+    constexpr uint K_LANES = 8u;
+    constexpr uint ROWS_PER_SIMD = 4u;
+    constexpr uint SIMD_GROUPS = 2u;
+    constexpr uint ROWS_PER_TG =
+        SIMD_GROUPS * ROWS_PER_SIMD;
+
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint k_lane = lane & (K_LANES - 1u);
+    uint simd_row = lane / K_LANES;
+    uint output_index =
+        threadgroup_position_in_grid.y * ROWS_PER_TG
+        + simd_group * ROWS_PER_SIMD
+        + simd_row;
+    uint output = min(output_index, uint(OUT) - 1u);
+    uint first_row =
+        threadgroup_position_in_grid.x * uint(TILE_M);
+
+    float accumulators[TILE_M];
+    for (uint row = 0u; row < uint(TILE_M); ++row) {
+        accumulators[row] = 0.0f;
+    }
+
+    uint output_metadata_base = output * uint(NG);
+    float output_scale = neuron_scale[output];
+    float output_minimum = neuron_min[output];
+    for (uint group = k_lane;
+         group < uint(NG);
+         group += K_LANES) {
+        uint metadata_index = output_metadata_base + group;
+        float scale = output_scale * float(sub_scale[metadata_index]);
+        float minimum = output_minimum * float(sub_min[metadata_index]);
+        if (BITS == 4 && Q5_EXEC == 0 && (uint(GS) & 3u) == 0u) {
+            for (uint element = 0u;
+                 element < uint(GS);
+                 element += 4u) {
+                uint column = group * uint(GS) + element;
+                if (column >= uint(K)) {
+                    break;
+                }
+                uint quantized_index =
+                    metadata_index * uint(GS) + element;
+                uint packed =
+                    uint(q_packed[quantized_index >> 1u])
+                    | (uint(q_packed[
+                        (quantized_index >> 1u) + 1u]) << 8u);
+                float4 weights = scale * float4(
+                    float(packed & 15u),
+                    float((packed >> 4u) & 15u),
+                    float((packed >> 8u) & 15u),
+                    float((packed >> 12u) & 15u))
+                    - float4(minimum);
+                for (uint local_row = 0u;
+                     local_row < uint(TILE_M);
+                     ++local_row) {
+                    uint row = min(
+                        first_row + local_row,
+                        uint(M) - 1u);
+                    uint input_base = row * uint(K) + column;
+                    float4 activation = float4(
+                        column < uint(K)
+                        ? float(x[input_base]) : 0.0f,
+                        element + 1u < uint(GS) && column + 1u < uint(K)
+                        ? float(x[input_base + 1u]) : 0.0f,
+                        element + 2u < uint(GS) && column + 2u < uint(K)
+                        ? float(x[input_base + 2u]) : 0.0f,
+                        element + 3u < uint(GS) && column + 3u < uint(K)
+                        ? float(x[input_base + 3u]) : 0.0f);
+                    accumulators[local_row] +=
+                        activation.x * weights.x;
+                    if (element + 1u < uint(GS) &&
+                        column + 1u < uint(K)) {
+                        accumulators[local_row] +=
+                            activation.y * weights.y;
+                    }
+                    if (element + 2u < uint(GS) &&
+                        column + 2u < uint(K)) {
+                        accumulators[local_row] +=
+                            activation.z * weights.z;
+                    }
+                    if (element + 3u < uint(GS) &&
+                        column + 3u < uint(K)) {
+                        accumulators[local_row] +=
+                            activation.w * weights.w;
+                    }
+                }
+            }
+        } else {
+            for (uint element = 0u; element < uint(GS); ++element) {
+                uint column = group * uint(GS) + element;
+                if (column >= uint(K)) {
+                    break;
+                }
+                uint quantized_index =
+                    metadata_index * uint(GS) + element;
+                uint quantized = BITS == 2 && Q5_EXEC == 0
+                    ? (
+                        uint(q_packed[quantized_index >> 2u])
+                        >> ((quantized_index & 3u) * 2u)
+                      ) & 3u
+                    : (BITS == 8 && Q5_EXEC == 0
+                    ? uint(q_packed[quantized_index])
+                    : mfq_nint_read_value(
+                        q_packed,
+                        quantized_index,
+                        uint(BITS),
+                        uint(GS),
+                        uint(Q5_EXEC)));
+                float weight = scale * float(quantized) - minimum;
+                for (uint local_row = 0u;
+                     local_row < uint(TILE_M);
+                     ++local_row) {
+                    uint row = min(
+                        first_row + local_row,
+                        uint(M) - 1u);
+                    accumulators[local_row] +=
+                        float(x[row * uint(K) + column]) * weight;
+                }
+            }
+        }
+    }
+
+    for (uint local_row = 0u;
+         local_row < uint(TILE_M);
+         ++local_row) {
+        accumulators[local_row] +=
+            simd_shuffle_down(accumulators[local_row], 4);
+        accumulators[local_row] +=
+            simd_shuffle_down(accumulators[local_row], 2);
+        accumulators[local_row] +=
+            simd_shuffle_down(accumulators[local_row], 1);
+        uint row = first_row + local_row;
+        if (
+            k_lane == 0u
+            && output_index < uint(OUT)
+            && row < uint(M)
+        ) {
+            y[row * uint(OUT) + output_index] =
+                T(accumulators[local_row]);
         }
     }
 )METAL";
@@ -1269,6 +1419,32 @@ const mlx::core::fast::CustomKernelFunction& nint_kernel() {
     return kernel;
 }
 
+mlx::core::fast::CustomKernelFunction make_nint_mmq_kernel() {
+    CompileOptions options;
+    options.math_mode = MathMode::Fast;
+    return mlx::core::fast::metal_kernel(
+        "mfq_cpp_nint_packed_mmq_m234",
+        {
+            "q_packed",
+            "sub_scale",
+            "sub_min",
+            "neuron_scale",
+            "neuron_min",
+            "x",
+        },
+        {"y"},
+        kNintMmq,
+        kNintHeader,
+        true,
+        false,
+        options);
+}
+
+const mlx::core::fast::CustomKernelFunction& nint_mmq_kernel() {
+    static const auto kernel = make_nint_mmq_kernel();
+    return kernel;
+}
+
 mlx::core::fast::CustomKernelFunction make_nint4_kernel() {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
@@ -2188,7 +2364,15 @@ array MlxNintWeight::matmul_impl(
         bits_ != 4 &&
         !use_nint5_gs28_gemv &&
         !use_nint6_gs24_gemv;
-    const auto grid_x = use_nint4_gs24_gemv
+    const auto* small_m_layout =
+        std::getenv("MFQ_METAL_NINT_SMALL_M_LAYOUT");
+    const bool use_small_m_mmq =
+        rows >= 2 && rows <= 4 &&
+        (small_m_layout == nullptr ||
+         std::strcmp(small_m_layout, "scalar") != 0);
+    const auto grid_x = use_small_m_mmq
+        ? row_tiles * 64
+        : (use_nint4_gs24_gemv
         ? static_cast<std::int64_t>(
               (output_size_ + 15) / 16) * 256
         : (use_nint5_gs28_gemv
@@ -2202,8 +2386,12 @@ array MlxNintWeight::matmul_impl(
                                    (output_size_ + 7) / 8) * 64
                              : row_tiles *
                                    static_cast<std::int64_t>(
-                                       output_size_) * 32)));
-    if (grid_x > std::numeric_limits<int>::max()) {
+                                       output_size_) * 32))));
+    const auto grid_y = use_small_m_mmq
+        ? (static_cast<std::int64_t>(output_size_) + 7) / 8
+        : 1;
+    if (grid_x > std::numeric_limits<int>::max() ||
+        grid_y > std::numeric_limits<int>::max()) {
         throw std::runtime_error("NINT Metal grid exceeds MLX limits");
     }
 
@@ -2220,7 +2408,9 @@ array MlxNintWeight::matmul_impl(
             {"Q5_EXEC", static_cast<int>(q5_execution_layout_)},
         };
     const mlx::core::fast::CustomKernelFunction* kernel = nullptr;
-    if (use_nint4_gs24_gemv) {
+    if (use_small_m_mmq) {
+        kernel = &nint_mmq_kernel();
+    } else if (use_nint4_gs24_gemv) {
         kernel = &specialized_nint4_gs24_gemv_kernel(
             groups_, input_size_, output_size_, fuse_residual);
     } else if (use_nint5_gs28_gemv) {
@@ -2239,13 +2429,15 @@ array MlxNintWeight::matmul_impl(
         templates.clear();
     }
     const int threadgroup =
-        use_nint4_gs24_gemv
+        use_small_m_mmq
+        ? 64
+        : (use_nint4_gs24_gemv
         ? 256
         : (use_nint5_gs28_gemv
                ? 128
                : (use_nint6_gs24_gemv
                       ? 256
-                      : (use_fast_gemv ? 64 : 32)));
+                      : (use_fast_gemv ? 64 : 32))));
     std::vector<array> inputs{
         q_packed_,
         sub_scale_,
@@ -2272,7 +2464,11 @@ array MlxNintWeight::matmul_impl(
             },
         },
         {source.dtype()},
-        {static_cast<int>(grid_x), 1, 1},
+        {
+            static_cast<int>(grid_x),
+            static_cast<int>(grid_y),
+            1,
+        },
         {threadgroup, 1, 1},
         std::move(templates),
         std::nullopt,
