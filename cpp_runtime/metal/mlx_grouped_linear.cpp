@@ -1416,6 +1416,14 @@ std::string make_direct_small_m_blockwise_source(
                 layout.index_bits == 8 &&
                 vectors_per_group == 6 &&
                 (layout.aux_mode == 1 || layout.aux_mode == 2);
+            const bool use_grouped_signs_vq8 =
+                vectorized_fp16 &&
+                layout.group_size == 24 &&
+                layout.vector_size == 8 &&
+                vectors_per_group == 3 &&
+                (layout.aux_mode == 1 || layout.aux_mode == 2);
+            const bool use_grouped_indices_vq8 =
+                use_grouped_signs_vq8 && layout.index_bits == 12;
             source +=
                 "        uint output_group_base = output * uint(P" + suffix
                 + "_NG);\n"
@@ -1583,6 +1591,49 @@ std::string make_direct_small_m_blockwise_source(
                     "                    }\n"
                     "                }\n";
             } else {
+                if (use_grouped_signs_vq8) {
+                    source +=
+                        "            uint group_signs = 0u;\n"
+                        "            if (uint(ROWS) == 2u) {\n"
+                        "                uint sign_bit ="
+                        " (output_sign_base + group * 3u) * 7u;\n"
+                        "                uint sign_byte = sign_bit >> 3u;\n"
+                        "                uint packed_signs ="
+                        " uint(vq_aux_" + suffix + "[sign_byte])"
+                        " | (uint(vq_aux_" + suffix
+                        + "[sign_byte + 1u]) << 8u)"
+                        " | (uint(vq_aux_" + suffix
+                        + "[sign_byte + 2u]) << 16u)"
+                        " | (uint(vq_aux_" + suffix
+                        + "[sign_byte + 3u]) << 24u);\n"
+                        "                group_signs ="
+                        " packed_signs >> (sign_bit & 7u);\n"
+                        "            }\n";
+                }
+                if (use_grouped_indices_vq8) {
+                    source +=
+                        "            uint grouped_indices = 0u;\n"
+                        "            uint grouped_index_high = 0u;\n"
+                        "            uint grouped_index_shift = 0u;\n"
+                        "            if (uint(ROWS) == 2u) {\n"
+                        "                uint index_bit ="
+                        " (output_vector_base + group * 3u) * 12u;\n"
+                        "                uint index_byte = index_bit >> 3u;\n"
+                        "                grouped_index_shift ="
+                        " index_bit & 7u;\n"
+                        "                grouped_indices ="
+                        " uint(vq_indices_" + suffix + "[index_byte])"
+                        " | (uint(vq_indices_" + suffix
+                        + "[index_byte + 1u]) << 8u)"
+                        " | (uint(vq_indices_" + suffix
+                        + "[index_byte + 2u]) << 16u)"
+                        " | (uint(vq_indices_" + suffix
+                        + "[index_byte + 3u]) << 24u);\n"
+                        "                grouped_index_high ="
+                        " uint(vq_indices_" + suffix
+                        + "[index_byte + 4u]);\n"
+                        "            }\n";
+                }
                 source +=
                 "            for (uint local_vector = 0u; local_vector < "
                 + std::to_string(vectors_per_group)
@@ -1595,18 +1646,50 @@ std::string make_direct_small_m_blockwise_source(
                 + "_VECTOR_SIZE);\n"
                 "                uint index_position = output_vector_base"
                 " + vector;\n";
-            append_blockwise_vq_read(
-                source,
-                "index",
-                "vq_indices_" + suffix,
-                "index_position",
-                layout.index_bits);
+            if (use_grouped_indices_vq8) {
+                source +=
+                    "                uint index;\n"
+                    "                if (uint(ROWS) == 2u) {\n"
+                    "                    uint local_index_bit ="
+                    " grouped_index_shift + local_vector * 12u;\n"
+                    "                    if (local_index_bit < 24u) {\n"
+                    "                        index = (grouped_indices >>"
+                    " local_index_bit) & 4095u;\n"
+                    "                    } else {\n"
+                    "                        index = ((grouped_indices >>"
+                    " local_index_bit) | (grouped_index_high <<"
+                    " (32u - local_index_bit))) & 4095u;\n"
+                    "                    }\n"
+                    "                } else {\n"
+                    "                    index = mfq_grouped_vq_read_12("
+                    "vq_indices_" + suffix + ", index_position);\n"
+                    "                }\n";
+            } else {
+                append_blockwise_vq_read(
+                    source,
+                    "index",
+                    "vq_indices_" + suffix,
+                    "index_position",
+                    layout.index_bits);
+            }
             source += "                uint sign_value = 0u;\n";
             if (layout.aux_mode == 1 || layout.aux_mode == 2) {
-                source +=
-                    "                sign_value ="
-                    " mfq_grouped_vq_read_bits(vq_aux_" + suffix
-                    + ", output_sign_base + column_base / 8u, 7u);\n";
+                if (use_grouped_signs_vq8) {
+                    source +=
+                        "                if (uint(ROWS) == 2u) {\n"
+                        "                    sign_value ="
+                        " (group_signs >> (local_vector * 7u)) & 127u;\n"
+                        "                } else {\n"
+                        "                    sign_value ="
+                        " mfq_grouped_vq_read_bits(vq_aux_" + suffix
+                        + ", output_sign_base + column_base / 8u, 7u);\n"
+                        "                }\n";
+                } else {
+                    source +=
+                        "                sign_value ="
+                        " mfq_grouped_vq_read_bits(vq_aux_" + suffix
+                        + ", output_sign_base + column_base / 8u, 7u);\n";
+                }
             }
             source +=
                 "                uint code_base = (((table_bank * uint(P"

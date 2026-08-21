@@ -158,6 +158,15 @@ int main(int argc, char** argv) {
         }
         MlxGroupedLinear grouped(std::move(refs));
         const auto source = make_input(rows, input_width);
+        int eval_batch = 1;
+        if (const auto* value =
+                std::getenv("MFQ_METAL_GROUPED_EVAL_BATCH")) {
+            eval_batch = std::stoi(value);
+            require(eval_batch > 0, "eval batch must be positive");
+        }
+        if (eval_batch != 1) {
+            std::cerr << "eval_batch\t" << eval_batch << '\n';
+        }
 
         if (std::getenv("MFQ_METAL_GROUPED_COMPARE_LAYOUTS") != nullptr &&
             rows >= 2 && rows <= 4) {
@@ -206,9 +215,19 @@ int main(int argc, char** argv) {
         mlx::core::synchronize();
 
         const auto started = Clock::now();
-        for (int index = 0; index < repetitions; ++index) {
-            outputs = grouped(source);
-            mlx::core::eval(outputs);
+        for (int index = 0; index < repetitions; index += eval_batch) {
+            std::vector<array> pending;
+            const int count = std::min(eval_batch, repetitions - index);
+            pending.reserve(
+                static_cast<std::size_t>(count) * linears.size());
+            for (int item = 0; item < count; ++item) {
+                outputs = grouped(source);
+                pending.insert(
+                    pending.end(),
+                    outputs.begin(),
+                    outputs.end());
+            }
+            mlx::core::eval(std::move(pending));
         }
         mlx::core::synchronize();
         const double mean_ms = elapsed_ms(started) / repetitions;
