@@ -1369,7 +1369,8 @@ void append_blockwise_vq_read(
 }
 
 std::string make_direct_small_m_blockwise_source(
-    const std::vector<DirectProjectionLayout>& layouts) {
+    const std::vector<DirectProjectionLayout>& layouts,
+    bool vectorized_fp16) {
     std::string source = R"METAL(
     constexpr uint SIMD_GROUPS = 2u;
     constexpr uint K_LANES = 8u;
@@ -1408,6 +1409,13 @@ std::string make_direct_small_m_blockwise_source(
             const int vectors_per_group =
                 (layout.group_size + layout.vector_size - 1)
                 / layout.vector_size;
+            const bool use_wide_vq4 =
+                vectorized_fp16 &&
+                layout.group_size == 24 &&
+                layout.vector_size == 4 &&
+                layout.index_bits == 8 &&
+                vectors_per_group == 6 &&
+                (layout.aux_mode == 1 || layout.aux_mode == 2);
             source +=
                 "        uint output_group_base = output * uint(P" + suffix
                 + "_NG);\n"
@@ -1452,7 +1460,104 @@ std::string make_direct_small_m_blockwise_source(
             source +=
                 "            float weight_scale = output_anchor"
                 " * vq_scales_" + suffix + "[table_bank * uint(P" + suffix
-                + "_STATES) + state];\n"
+                + "_STATES) + state];\n";
+            if (use_wide_vq4) {
+                source +=
+                    "            for (uint local_pair = 0u;"
+                    " local_pair < 3u; ++local_pair) {\n"
+                    "                uint column_base ="
+                    " group * uint(P" + suffix
+                    + "_GS) + local_pair * 8u;\n"
+                    "                if (column_base >= uint(K))"
+                    " { break; }\n"
+                    "                uint vector = column_base >> 2u;\n"
+                    "                uint index_position ="
+                    " output_vector_base + vector;\n"
+                    "                uchar2 pair_indices ="
+                    " *(device const uchar2*)(vq_indices_" + suffix
+                    + " + index_position);\n"
+                    "                uint index0 = uint(pair_indices.x);\n"
+                    "                uint index1 = uint(pair_indices.y);\n"
+                    "                uint sign_value ="
+                    " mfq_grouped_vq_read_bits(vq_aux_" + suffix
+                    + ", output_sign_base + column_base / 8u, 7u);\n"
+                    "                uint code_base0 ="
+                    " (((table_bank * uint(P" + suffix
+                    + "_CODE_BANKS) + code_bank) * uint(P" + suffix
+                    + "_ENTRIES) + index0) * 4u);\n"
+                    "                uint code_base1 ="
+                    " (((table_bank * uint(P" + suffix
+                    + "_CODE_BANKS) + code_bank) * uint(P" + suffix
+                    + "_ENTRIES) + index1) * 4u);\n"
+                    "                char4 packed_codes0 ="
+                    " *(device const char4*)(vq_codebooks_" + suffix
+                    + " + code_base0);\n"
+                    "                char4 packed_codes1 ="
+                    " *(device const char4*)(vq_codebooks_" + suffix
+                    + " + code_base1);\n"
+                    "                float4 codes0 = float4("
+                    "float(packed_codes0.x), float(packed_codes0.y),"
+                    " float(packed_codes0.z), float(packed_codes0.w));\n"
+                    "                float4 codes1 = float4("
+                    "float(packed_codes1.x), float(packed_codes1.y),"
+                    " float(packed_codes1.z), float(packed_codes1.w));\n"
+                    "                for (uint component = 0u;"
+                    " component < 4u; ++component) {\n"
+                    "                    uint negative ="
+                    " (sign_value >> component) & 1u;\n"
+                    "                    codes0[component] ="
+                    " negative != 0u ? -codes0[component]"
+                    " : codes0[component];\n"
+                    "                }\n"
+                    "                for (uint component = 0u;"
+                    " component < 4u; ++component) {\n"
+                    "                    uint sign_position ="
+                    " component + 4u;\n"
+                    "                    uint negative ="
+                    " sign_position < 7u"
+                    " ? ((sign_value >> sign_position) & 1u)"
+                    " : (popcount(sign_value) & 1u);\n";
+                if (layout.aux_mode == 2) {
+                    source +=
+                        "                    if (sign_position == 7u)"
+                        " { negative ^= (index1 >> 7u) & 1u; }\n";
+                }
+                source +=
+                    "                    codes1[component] ="
+                    " negative != 0u ? -codes1[component]"
+                    " : codes1[component];\n"
+                    "                }\n"
+                    "                float4 weights0 ="
+                    " weight_scale * codes0;\n"
+                    "                float4 weights1 ="
+                    " weight_scale * codes1;\n"
+                    "                for (uint row = 0u;"
+                    " row < uint(ROWS); ++row) {\n"
+                    "                    uint input_base ="
+                    " row * uint(K) + column_base;\n"
+                    "                    float4 activation0 = float4("
+                    "*(device const half4*)(x + input_base));\n"
+                    "                    float4 activation1 = float4("
+                    "*(device const half4*)(x + input_base + 4u));\n"
+                    "                    accumulators[row] +="
+                    " activation0.x * weights0.x;\n"
+                    "                    accumulators[row] +="
+                    " activation0.y * weights0.y;\n"
+                    "                    accumulators[row] +="
+                    " activation0.z * weights0.z;\n"
+                    "                    accumulators[row] +="
+                    " activation0.w * weights0.w;\n"
+                    "                    accumulators[row] +="
+                    " activation1.x * weights1.x;\n"
+                    "                    accumulators[row] +="
+                    " activation1.y * weights1.y;\n"
+                    "                    accumulators[row] +="
+                    " activation1.z * weights1.z;\n"
+                    "                    accumulators[row] +="
+                    " activation1.w * weights1.w;\n"
+                    "                }\n";
+            } else {
+                source +=
                 "            for (uint local_vector = 0u; local_vector < "
                 + std::to_string(vectors_per_group)
                 + "u; ++local_vector) {\n"
@@ -1482,7 +1587,66 @@ std::string make_direct_small_m_blockwise_source(
                 + suffix + "_CODE_BANKS) + code_bank) * uint(P" + suffix
                 + "_ENTRIES) + index) * uint(P" + suffix
                 + "_VECTOR_SIZE));\n";
-            if ((layout.vector_size % 4) == 0) {
+            if (vectorized_fp16 && layout.vector_size == 8 &&
+                (layout.aux_mode == 1 || layout.aux_mode == 2)) {
+                source +=
+                    "                uint2 packed_words ="
+                    " *(device const uint2*)(vq_codebooks_" + suffix
+                    + " + code_base);\n"
+                    "                char4 packed_codes0 ="
+                    " as_type<char4>(packed_words.x);\n"
+                    "                char4 packed_codes1 ="
+                    " as_type<char4>(packed_words.y);\n"
+                    "                float4 codes0 = float4("
+                    "float(packed_codes0.x), float(packed_codes0.y),"
+                    " float(packed_codes0.z), float(packed_codes0.w));\n"
+                    "                float4 codes1 = float4("
+                    "float(packed_codes1.x), float(packed_codes1.y),"
+                    " float(packed_codes1.z), float(packed_codes1.w));\n"
+                    "                for (uint component = 0u;"
+                    " component < 4u; ++component) {\n"
+                    "                    uint negative ="
+                    " (sign_value >> component) & 1u;\n"
+                    "                    codes0[component] ="
+                    " negative != 0u ? -codes0[component]"
+                    " : codes0[component];\n"
+                    "                }\n"
+                    "                for (uint component = 0u;"
+                    " component < 4u; ++component) {\n"
+                    "                    uint sign_position ="
+                    " component + 4u;\n"
+                    "                    uint negative ="
+                    " sign_position < 7u"
+                    " ? ((sign_value >> sign_position) & 1u)"
+                    " : (popcount(sign_value) & 1u);\n";
+                if (layout.aux_mode == 2) {
+                    source +=
+                        "                    if (sign_position == 7u)"
+                        " { negative ^= (index >> 7u) & 1u; }\n";
+                }
+                source +=
+                    "                    codes1[component] ="
+                    " negative != 0u ? -codes1[component]"
+                    " : codes1[component];\n"
+                    "                }\n"
+                    "                float4 weights0 ="
+                    " weight_scale * codes0;\n"
+                    "                float4 weights1 ="
+                    " weight_scale * codes1;\n"
+                    "                for (uint row = 0u;"
+                    " row < uint(ROWS); ++row) {\n"
+                    "                    uint input_base ="
+                    " row * uint(K) + column_base;\n"
+                    "                    float4 activation0 = float4("
+                    "*(device const half4*)(x + input_base));\n"
+                    "                    float4 activation1 = float4("
+                    "*(device const half4*)(x + input_base + 4u));\n"
+                    "                    accumulators[row] +="
+                    " dot(activation0, weights0);\n"
+                    "                    accumulators[row] +="
+                    " dot(activation1, weights1);\n"
+                    "                }\n";
+            } else if ((layout.vector_size % 4) == 0) {
                 source +=
                     "                for (uint component_base = 0u;"
                     " component_base < uint(P" + suffix
@@ -1527,24 +1691,52 @@ std::string make_direct_small_m_blockwise_source(
                     "                    for (uint row = 0u;"
                     " row < uint(ROWS); ++row) {\n"
                     "                        uint input_base ="
-                    " row * uint(K) + column;\n"
-                    "                        float4 activation = float4(\n"
-                    "                            column < uint(K)"
-                    " ? float(x[input_base]) : 0.0f,\n"
-                    "                            column + 1u < uint(K)"
-                    " ? float(x[input_base + 1u]) : 0.0f,\n"
-                    "                            column + 2u < uint(K)"
-                    " ? float(x[input_base + 2u]) : 0.0f,\n"
-                    "                            column + 3u < uint(K)"
-                    " ? float(x[input_base + 3u]) : 0.0f);\n"
-                    "                        accumulators[row] +="
-                    " activation.x * weights.x;\n"
-                    "                        if (column + 1u < uint(K))"
-                    " accumulators[row] += activation.y * weights.y;\n"
-                    "                        if (column + 2u < uint(K))"
-                    " accumulators[row] += activation.z * weights.z;\n"
-                    "                        if (column + 3u < uint(K))"
-                    " accumulators[row] += activation.w * weights.w;\n"
+                    " row * uint(K) + column;\n";
+                if (vectorized_fp16) {
+                    source +=
+                        "                        float4 activation;\n"
+                        "                        if (column + 3u < uint(K)) {\n"
+                        "                            activation = float4("
+                        "*(device const half4*)(x + input_base));\n"
+                        "                        } else {\n"
+                        "                            activation = float4(\n"
+                        "                                column < uint(K)"
+                        " ? float(x[input_base]) : 0.0f,\n"
+                        "                                column + 1u < uint(K)"
+                        " ? float(x[input_base + 1u]) : 0.0f,\n"
+                        "                                column + 2u < uint(K)"
+                        " ? float(x[input_base + 2u]) : 0.0f,\n"
+                        "                                column + 3u < uint(K)"
+                        " ? float(x[input_base + 3u]) : 0.0f);\n"
+                        "                        }\n";
+                } else {
+                    source +=
+                        "                        float4 activation = float4(\n"
+                        "                            column < uint(K)"
+                        " ? float(x[input_base]) : 0.0f,\n"
+                        "                            column + 1u < uint(K)"
+                        " ? float(x[input_base + 1u]) : 0.0f,\n"
+                        "                            column + 2u < uint(K)"
+                        " ? float(x[input_base + 2u]) : 0.0f,\n"
+                        "                            column + 3u < uint(K)"
+                        " ? float(x[input_base + 3u]) : 0.0f);\n";
+                }
+                if (vectorized_fp16 && layout.vector_size == 8) {
+                    source +=
+                        "                        accumulators[row] +="
+                        " dot(activation, weights);\n";
+                } else {
+                    source +=
+                        "                        accumulators[row] +="
+                        " activation.x * weights.x;\n"
+                        "                        if (column + 1u < uint(K))"
+                        " accumulators[row] += activation.y * weights.y;\n"
+                        "                        if (column + 2u < uint(K))"
+                        " accumulators[row] += activation.z * weights.z;\n"
+                        "                        if (column + 3u < uint(K))"
+                        " accumulators[row] += activation.w * weights.w;\n";
+                }
+                source +=
                     "                    }\n"
                     "                }\n";
             } else {
@@ -1590,6 +1782,7 @@ std::string make_direct_small_m_blockwise_source(
                     "                    }\n"
                     "                }\n";
             }
+            }
             source +=
                 "            }\n"
                 "        }\n";
@@ -1632,19 +1825,44 @@ std::string make_direct_small_m_blockwise_source(
                     "                for (uint row = 0u; row < uint(ROWS);"
                     " ++row) {\n"
                     "                    uint input_base = row * uint(K)"
-                    " + column;\n"
-                    "                    float4 activation = float4(\n"
-                    "                        column < uint(K)"
-                    " ? float(x[input_base]) : 0.0f,\n"
-                    "                        element + 1u < uint(P" + suffix
-                    + "_GS) && column + 1u < uint(K)"
-                    " ? float(x[input_base + 1u]) : 0.0f,\n"
-                    "                        element + 2u < uint(P" + suffix
-                    + "_GS) && column + 2u < uint(K)"
-                    " ? float(x[input_base + 2u]) : 0.0f,\n"
-                    "                        element + 3u < uint(P" + suffix
-                    + "_GS) && column + 3u < uint(K)"
-                    " ? float(x[input_base + 3u]) : 0.0f);\n"
+                    " + column;\n";
+                if (vectorized_fp16) {
+                    source +=
+                        "                    float4 activation;\n"
+                        "                    if (element + 3u < uint(P" + suffix
+                        + "_GS) && column + 3u < uint(K)) {\n"
+                        "                        activation = float4("
+                        "*(device const half4*)(x + input_base));\n"
+                        "                    } else {\n"
+                        "                        activation = float4(\n"
+                        "                            column < uint(K)"
+                        " ? float(x[input_base]) : 0.0f,\n"
+                        "                            element + 1u < uint(P" + suffix
+                        + "_GS) && column + 1u < uint(K)"
+                        " ? float(x[input_base + 1u]) : 0.0f,\n"
+                        "                            element + 2u < uint(P" + suffix
+                        + "_GS) && column + 2u < uint(K)"
+                        " ? float(x[input_base + 2u]) : 0.0f,\n"
+                        "                            element + 3u < uint(P" + suffix
+                        + "_GS) && column + 3u < uint(K)"
+                        " ? float(x[input_base + 3u]) : 0.0f);\n"
+                        "                    }\n";
+                } else {
+                    source +=
+                        "                    float4 activation = float4(\n"
+                        "                        column < uint(K)"
+                        " ? float(x[input_base]) : 0.0f,\n"
+                        "                        element + 1u < uint(P" + suffix
+                        + "_GS) && column + 1u < uint(K)"
+                        " ? float(x[input_base + 1u]) : 0.0f,\n"
+                        "                        element + 2u < uint(P" + suffix
+                        + "_GS) && column + 2u < uint(K)"
+                        " ? float(x[input_base + 2u]) : 0.0f,\n"
+                        "                        element + 3u < uint(P" + suffix
+                        + "_GS) && column + 3u < uint(K)"
+                        " ? float(x[input_base + 3u]) : 0.0f);\n";
+                }
+                source +=
                     "                    accumulators[row] +="
                     " activation.x * weights.x;\n"
                     "                    if (element + 1u < uint(P" + suffix
@@ -1655,7 +1873,8 @@ std::string make_direct_small_m_blockwise_source(
                     " accumulators[row] += activation.z * weights.z;\n"
                     "                    if (element + 3u < uint(P" + suffix
                     + "_GS) && column + 3u < uint(K))"
-                    " accumulators[row] += activation.w * weights.w;\n"
+                    " accumulators[row] += activation.w * weights.w;\n";
+                source +=
                     "                }\n"
                     "            }\n";
             } else {
@@ -1727,13 +1946,16 @@ std::string make_direct_small_m_blockwise_source(
 mlx::core::fast::CustomKernelFunction make_direct_kernel(
     const std::vector<DirectProjectionLayout>& layouts,
     bool batch_rows,
-    bool blockwise) {
+    bool blockwise,
+    bool vectorized_fp16) {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
     const auto key = direct_kernel_key(layouts)
         + (batch_rows
             ? (blockwise
-                ? "_m234_block"
+                ? (vectorized_fp16
+                    ? "_m234_block_vec"
+                    : "_m234_block")
                 : "_m234")
             : "_rows");
     return mlx::core::fast::metal_kernel(
@@ -1741,7 +1963,9 @@ mlx::core::fast::CustomKernelFunction make_direct_kernel(
         direct_input_names(layouts),
         {"y"},
         blockwise
-            ? make_direct_small_m_blockwise_source(layouts)
+            ? make_direct_small_m_blockwise_source(
+                layouts,
+                vectorized_fp16)
             : make_direct_source(layouts, batch_rows),
         kGroupedHeader,
         true,
@@ -1752,7 +1976,8 @@ mlx::core::fast::CustomKernelFunction make_direct_kernel(
 mlx::core::fast::CustomKernelFunction direct_kernel(
     const std::vector<DirectProjectionLayout>& layouts,
     bool batch_rows,
-    bool blockwise = false) {
+    bool blockwise = false,
+    bool vectorized_fp16 = false) {
     static std::mutex mutex;
     static std::unordered_map<
         std::string,
@@ -1761,7 +1986,9 @@ mlx::core::fast::CustomKernelFunction direct_kernel(
     const auto key = direct_kernel_key(layouts)
         + (batch_rows
             ? (blockwise
-                ? "_m234_block"
+                ? (vectorized_fp16
+                    ? "_m234_block_vec"
+                    : "_m234_block")
                 : "_m234")
             : "_rows");
     std::lock_guard<std::mutex> lock(mutex);
@@ -1769,7 +1996,11 @@ mlx::core::fast::CustomKernelFunction direct_kernel(
     if (found != kernels.end()) {
         return found->second;
     }
-    auto kernel = make_direct_kernel(layouts, batch_rows, blockwise);
+    auto kernel = make_direct_kernel(
+        layouts,
+        batch_rows,
+        blockwise,
+        vectorized_fp16);
     kernels.emplace(key, kernel);
     return kernel;
 }
@@ -3794,6 +4025,9 @@ std::vector<array> MlxGroupedLinear::matmul(
         supports_small_m_blockwise &&
         (grouped_small_m_layout == nullptr ||
          std::strcmp(grouped_small_m_layout, "scalar") != 0);
+    const bool use_vectorized_fp16 =
+        use_small_m_blockwise &&
+        source.dtype() == mlx::core::float16;
     int small_m_blockwise_tiles = 0;
     if (use_small_m_blockwise) {
         for (const auto& layout : impl_->direct_layouts) {
@@ -4074,7 +4308,8 @@ std::vector<array> MlxGroupedLinear::matmul(
             return direct_kernel(
                 impl_->direct_layouts,
                 use_small_m_batched_path,
-                use_small_m_blockwise)(
+                use_small_m_blockwise,
+                use_vectorized_fp16)(
                 inputs,
                 output_shapes,
                 output_dtypes,
