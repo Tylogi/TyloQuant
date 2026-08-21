@@ -1426,7 +1426,12 @@ std::string make_direct_small_m_blockwise_source(
                 "        uint output_super_base = output * uint(P" + suffix
                 + "_NSUPER);\n"
                 "        float output_anchor = vq_anchors_" + suffix
-                + "[output];\n"
+                + "[output];\n";
+            if (use_wide_vq4) {
+                source +=
+                    "        #pragma clang loop unroll_count(2)\n";
+            }
+            source +=
                 "        for (uint group = k_lane; group < uint(P" + suffix
                 + "_NG); group += K_LANES) {\n"
                 "            uint state_index = output_group_base + group;\n";
@@ -1463,6 +1468,20 @@ std::string make_direct_small_m_blockwise_source(
                 + "_STATES) + state];\n";
             if (use_wide_vq4) {
                 source +=
+                    "            uint sign_bit ="
+                    " (output_sign_base + group * 3u) * 7u;\n"
+                    "            uint sign_byte = sign_bit >> 3u;\n"
+                    "            uint packed_signs ="
+                    " uint(vq_aux_" + suffix + "[sign_byte])"
+                    " | (uint(vq_aux_" + suffix
+                    + "[sign_byte + 1u]) << 8u)"
+                    " | (uint(vq_aux_" + suffix
+                    + "[sign_byte + 2u]) << 16u)"
+                    " | (uint(vq_aux_" + suffix
+                    + "[sign_byte + 3u]) << 24u);\n"
+                    "            uint group_signs ="
+                    " packed_signs >> (sign_bit & 7u);\n"
+                    "            #pragma clang loop unroll(full)\n"
                     "            for (uint local_pair = 0u;"
                     " local_pair < 3u; ++local_pair) {\n"
                     "                uint column_base ="
@@ -1479,8 +1498,7 @@ std::string make_direct_small_m_blockwise_source(
                     "                uint index0 = uint(pair_indices.x);\n"
                     "                uint index1 = uint(pair_indices.y);\n"
                     "                uint sign_value ="
-                    " mfq_grouped_vq_read_bits(vq_aux_" + suffix
-                    + ", output_sign_base + column_base / 8u, 7u);\n"
+                    " (group_signs >> (local_pair * 7u)) & 127u;\n"
                     "                uint code_base0 ="
                     " (((table_bank * uint(P" + suffix
                     + "_CODE_BANKS) + code_bank) * uint(P" + suffix
@@ -1531,6 +1549,7 @@ std::string make_direct_small_m_blockwise_source(
                     " weight_scale * codes0;\n"
                     "                float4 weights1 ="
                     " weight_scale * codes1;\n"
+                    "                #pragma clang loop unroll(full)\n"
                     "                for (uint row = 0u;"
                     " row < uint(ROWS); ++row) {\n"
                     "                    uint input_base ="
@@ -1539,22 +1558,29 @@ std::string make_direct_small_m_blockwise_source(
                     "*(device const half4*)(x + input_base));\n"
                     "                    float4 activation1 = float4("
                     "*(device const half4*)(x + input_base + 4u));\n"
-                    "                    accumulators[row] +="
+                    "                    if (uint(ROWS) <= 3u) {\n"
+                    "                        accumulators[row] +="
+                    " dot(activation0, weights0);\n"
+                    "                        accumulators[row] +="
+                    " dot(activation1, weights1);\n"
+                    "                    } else {\n"
+                    "                        accumulators[row] +="
                     " activation0.x * weights0.x;\n"
-                    "                    accumulators[row] +="
+                    "                        accumulators[row] +="
                     " activation0.y * weights0.y;\n"
-                    "                    accumulators[row] +="
+                    "                        accumulators[row] +="
                     " activation0.z * weights0.z;\n"
-                    "                    accumulators[row] +="
+                    "                        accumulators[row] +="
                     " activation0.w * weights0.w;\n"
-                    "                    accumulators[row] +="
+                    "                        accumulators[row] +="
                     " activation1.x * weights1.x;\n"
-                    "                    accumulators[row] +="
+                    "                        accumulators[row] +="
                     " activation1.y * weights1.y;\n"
-                    "                    accumulators[row] +="
+                    "                        accumulators[row] +="
                     " activation1.z * weights1.z;\n"
-                    "                    accumulators[row] +="
+                    "                        accumulators[row] +="
                     " activation1.w * weights1.w;\n"
+                    "                    }\n"
                     "                }\n";
             } else {
                 source +=
