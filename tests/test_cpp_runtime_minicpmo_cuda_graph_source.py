@@ -34,6 +34,21 @@ def test_minicpmo_persistent_decode_workspaces_are_warmed_before_capture() -> No
     assert len(warmup_gates) == 2
 
 
+def test_graph_stage_events_start_after_decode_workspace_warmup() -> None:
+    graph_path = SOURCE.rsplit(
+        "MfqCudaGraph graph;", 1
+    )[1].split(
+        "graph.capture_end();", 1
+    )[0]
+    warmup = graph_path.index("model.next_token_static(static_input, static_pos, static_len)")
+    profiler_reset = graph_path.index("g_profiler.reset();")
+    external_events = graph_path.index(
+        "g_profiler.graph_events = profile_cuda_graph;"
+    )
+    capture = graph_path.index("graph.capture_begin();")
+    assert warmup < profiler_reset < external_events < capture
+
+
 def test_graph_attention_tracks_eager_split_count_from_device_length() -> None:
     assert "attention_cache_decode_dynamic_cuda" in SOURCE
     assert "g_decode_graph_attention_parts > 1" in SOURCE

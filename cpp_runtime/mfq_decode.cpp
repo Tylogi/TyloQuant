@@ -26233,7 +26233,6 @@ int main(int argc, char ** argv) {
         const char * profile_graph_env = std::getenv("MFQ_PROFILE_CUDA_GRAPH");
         const bool profile_cuda_graph = profile && profile_graph_env != nullptr &&
             std::atoi(profile_graph_env) != 0;
-        g_profiler.graph_events = profile_cuda_graph;
         bool use_cuda_graph =
             (graph_env == nullptr || graph_env[0] != '0') &&
             mfq_cuda_graph_capture_supported() &&
@@ -26285,6 +26284,8 @@ int main(int argc, char ** argv) {
                 (void)model.next_token_static(static_input, static_pos, static_len);
                 MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
             }
+            g_profiler.reset();
+            g_profiler.graph_events = profile_cuda_graph;
             graph.capture_begin();
             static_next = model.next_token_static(static_input, static_pos, static_len);
             decode_graph_commit_cuda(static_next, generated_cuda, static_step, static_input, static_pos, static_len);
