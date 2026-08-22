@@ -411,6 +411,26 @@ std::int64_t matmul_batch_offset(
     return result;
 }
 
+__global__ void scale_causal_bf16_kernel(
+    const __nv_bfloat16* source,
+    __nv_bfloat16* destination,
+    std::int64_t elements,
+    std::int64_t query_rows,
+    std::int64_t keys,
+    double factor) {
+    for (std::int64_t linear =
+             static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         linear < elements;
+         linear += static_cast<std::int64_t>(blockDim.x) * gridDim.x) {
+        const auto key = linear % keys;
+        const auto query = (linear / keys) % query_rows;
+        destination[linear] = key <= query
+            ? store_number<__nv_bfloat16>(load_number(source, linear) * factor)
+            : store_number<__nv_bfloat16>(
+                -std::numeric_limits<double>::infinity());
+    }
+}
+
 bool matrix_layout_supported(const Tensor& tensor) {
     return tensor.stride(-1) == 1 || tensor.stride(-2) == 1;
 }
@@ -2028,8 +2048,28 @@ Tensor scaled_dot_product_attention(
     }
     const auto factor = scale.value_or(
         1.0 / std::sqrt(static_cast<double>(query_source.size(-1))));
-    auto scores = matmul(query_source, key.transpose(-2, -1)) * factor;
-    if (causal) {
+    auto scores = matmul(query_source, key.transpose(-2, -1));
+    const char* fused_causal_scale_disabled =
+        std::getenv("MFQ_DISABLE_NATIVE_FUSED_CAUSAL_SCALE");
+    const bool fused_causal_scale = causal && !mask.has_value() &&
+        scores.scalar_type() == kBFloat16 && scores.is_contiguous() &&
+        scores.dim() >= 2 && scores.size(-2) > 0 && scores.size(-1) > 0 &&
+        (fused_causal_scale_disabled == nullptr ||
+         fused_causal_scale_disabled[0] != '1');
+    if (fused_causal_scale) {
+        auto fused_scores = empty(scores.sizes(), scores.options());
+        const auto [blocks, threads] = launch_geometry(scores.numel());
+        const auto stream = current_stream(scores.get_device()).stream();
+        scale_causal_bf16_kernel<<<blocks, threads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(scores.data_ptr()),
+            static_cast<__nv_bfloat16*>(fused_scores.data_ptr()),
+            scores.numel(), scores.size(-2), scores.size(-1), factor);
+        MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
+        scores = std::move(fused_scores);
+    } else {
+        scores = scores * factor;
+    }
+    if (causal && !fused_causal_scale) {
         if (mask.has_value()) {
             throw std::invalid_argument("attention cannot combine explicit and causal masks");
         }

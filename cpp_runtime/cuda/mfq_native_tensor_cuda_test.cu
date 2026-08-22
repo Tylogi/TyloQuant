@@ -183,6 +183,21 @@ int main() {
     require_close(attended[3], (1.0f - high) * 20.0f + high * 40.0f,
                   2.0e-5f, "attention query one");
 
+    set_test_environment("MFQ_DISABLE_NATIVE_FUSED_CAUSAL_SCALE", "1");
+    const auto causal_scale_reference = host_values(
+        scaled_dot_product_attention(
+            attention_left, attention_left, attention_left,
+            std::nullopt, 0.0, true, 0.08838834764831845, false));
+    set_test_environment("MFQ_DISABLE_NATIVE_FUSED_CAUSAL_SCALE", "0");
+    const auto causal_scale_candidate = host_values(
+        scaled_dot_product_attention(
+            attention_left, attention_left, attention_left,
+            std::nullopt, 0.0, true, 0.08838834764831845, false));
+    set_test_environment("MFQ_DISABLE_NATIVE_FUSED_CAUSAL_SCALE", "1");
+    require(
+        causal_scale_candidate == causal_scale_reference,
+        "fused BF16 causal scale exactness");
+
     auto signal = tensor<float>({1, 2, 3, 4}).reshape({1, 1, 4}).to(cuda_device);
     auto filter = tensor<float>({1, 1}).reshape({1, 1, 2}).to(cuda_device);
     constexpr std::array<std::int64_t, 1> stride1{1};
