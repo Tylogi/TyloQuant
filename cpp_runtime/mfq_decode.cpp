@@ -13357,10 +13357,24 @@ struct RopeCache {
         if (official_reciprocal_frequencies) {
             auto cpu_opts = mfq_tensor_backend::TensorOptions()
                 .device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat32);
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+            std::vector<float> official_values(static_cast<size_t>(half));
+            const float official_base = static_cast<float>(base);
+            const float official_denominator = static_cast<float>(denominator);
+            for (int64_t index = 0; index < half; ++index) {
+                const float exponent =
+                    static_cast<float>(index * 2) / official_denominator;
+                official_values[static_cast<size_t>(index)] =
+                    1.0f / std::pow(official_base, exponent);
+            }
+            auto official_freq = mfq_tensor_backend::tensor(
+                official_values, cpu_opts);
+#else
             auto exponent = mfq_tensor_backend::arange(0, rotary_dim, 2, cpu_opts) /
                 (double)denominator;
             auto official_freq = mfq_tensor_backend::reciprocal(
                 mfq_tensor_backend::pow(mfq_tensor_backend::full({half}, base, cpu_opts), exponent));
+#endif
             freq.copy_(official_freq);
         }
         if (active_pairs < half) {
@@ -19896,8 +19910,17 @@ static int32_t generate_server_tokens(
     }
 
     const char * graph_env = std::getenv("MFQ_SERVER_CUDA_GRAPH");
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    // MiniCPM-o's composite BF16 decode path is not graph-safe in the native
+    // backend yet. Keep its eager path correct while preserving CUDA graphs
+    // for the other architectures and the Torch reference runtime.
+    const bool graph_architecture_supported = !model.c.is_minicpmo45();
+#else
+    const bool graph_architecture_supported = true;
+#endif
     const bool graph_enabled =
         (graph_env == nullptr || graph_env[0] != '0') &&
+        graph_architecture_supported &&
         mfq_cuda_graph_capture_supported() &&
         g_dsv4_cpu_offload_layers.empty() &&
         g_dense_cpu_layer_count == 0 &&
