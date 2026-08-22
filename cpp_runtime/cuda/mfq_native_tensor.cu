@@ -119,6 +119,27 @@ __global__ void convert_strided_kernel(
     }
 }
 
+__global__ void materialize_bf16_head_to_token_d128_kernel(
+    const uint4* source,
+    uint4* destination,
+    std::int64_t tokens,
+    std::int64_t heads) {
+    constexpr std::int64_t depth_packs = 16;
+    const auto head = static_cast<std::int64_t>(blockIdx.x);
+    const auto token =
+        static_cast<std::int64_t>(blockIdx.y) * blockDim.y + threadIdx.y;
+    const auto batch_index = static_cast<std::int64_t>(blockIdx.z);
+    const auto depth_pack = static_cast<std::int64_t>(threadIdx.x);
+    if (token >= tokens) return;
+    const auto source_index =
+        ((batch_index * heads + head) * tokens + token) * depth_packs +
+        depth_pack;
+    const auto destination_index =
+        ((batch_index * tokens + token) * heads + head) * depth_packs +
+        depth_pack;
+    destination[destination_index] = source[source_index];
+}
+
 template <typename Destination>
 __global__ void fill_kernel(TensorView destination, double value, std::int64_t elements) {
     auto* output = static_cast<Destination*>(destination.data);
@@ -197,6 +218,42 @@ void launch_convert(
     constexpr int threads = 256;
     const auto blocks = static_cast<int>(std::min<std::int64_t>(
         4096, (source.numel() + threads - 1) / threads));
+    if constexpr (
+            std::is_same_v<Destination, __nv_bfloat16> &&
+            std::is_same_v<Source, __nv_bfloat16>) {
+        const auto batch = source.dim() == 4 ? source.size(0) : 0;
+        const auto tokens = source.dim() == 4 ? source.size(1) : 0;
+        const auto heads = source.dim() == 4 ? source.size(2) : 0;
+        const auto depth = source.dim() == 4 ? source.size(3) : 0;
+        const bool head_to_token_layout =
+            source.dim() == 4 && destination.dim() == 4 &&
+            destination.size(0) == batch && destination.size(1) == tokens &&
+            destination.size(2) == heads && destination.size(3) == depth &&
+            destination.is_contiguous() && batch > 0 && tokens > 0 &&
+            heads > 0 && batch <= 65535 && heads <= 2147483647 &&
+            (tokens + 7) / 8 <= 65535 && depth == 128 &&
+            source.stride(3) == 1 && source.stride(1) == depth &&
+            source.stride(2) == tokens * depth &&
+            source.stride(0) == heads * tokens * depth &&
+            reinterpret_cast<std::uintptr_t>(source.data_ptr()) %
+                    alignof(uint4) == 0 &&
+            reinterpret_cast<std::uintptr_t>(destination.data_ptr()) %
+                    alignof(uint4) == 0;
+        if (head_to_token_layout) {
+            const dim3 block(16, 8);
+            const dim3 grid(
+                static_cast<unsigned int>(heads),
+                static_cast<unsigned int>((tokens + block.y - 1) / block.y),
+                static_cast<unsigned int>(batch));
+            materialize_bf16_head_to_token_d128_kernel<<<
+                grid, block, 0, stream>>>(
+                reinterpret_cast<const uint4*>(source.data_ptr()),
+                reinterpret_cast<uint4*>(destination.data_ptr()),
+                tokens, heads);
+            MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
     convert_strided_kernel<Destination, Source><<<blocks, threads, 0, stream>>>(
         destination.view_descriptor(), source.view_descriptor(), source.numel());
     MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());

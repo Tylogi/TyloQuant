@@ -17,6 +17,9 @@ CONTEXT_SOURCE = (
 NATIVE_OPS_SOURCE = (
     Path(__file__).parents[1] / "cpp_runtime" / "cuda" / "mfq_native_tensor_ops.cu"
 ).read_text(encoding="utf-8")
+NATIVE_TENSOR_SOURCE = (
+    Path(__file__).parents[1] / "cpp_runtime" / "cuda" / "mfq_native_tensor.cu"
+).read_text(encoding="utf-8")
 
 
 def test_minicpmo_native_server_keeps_cuda_graph_enabled() -> None:
@@ -115,6 +118,24 @@ def test_cuda_profiler_filter_supports_low_perturbation_eager_attribution() -> N
     )[0]
     assert 'g_profiler.measure("decode.eager_model"' in eager_path
     assert 'g_profiler.measure("decode.eager_commit"' in eager_path
+
+
+def test_bf16_head_to_token_candidate_is_exactly_stride_bounded() -> None:
+    assert "materialize_bf16_head_to_token_d128_kernel" in NATIVE_TENSOR_SOURCE
+    assert "MFQ_NATIVE_BF16_HEAD_TO_TOKEN_CONTIGUOUS" not in NATIVE_TENSOR_SOURCE
+    selection = NATIVE_TENSOR_SOURCE.split(
+        "const bool head_to_token_layout =", 1
+    )[1].split("if (head_to_token_layout)", 1)[0]
+    assert "source.dim() == 4" in selection
+    assert "destination.dim() == 4" in selection
+    assert "destination.size(1) == tokens" in selection
+    assert "destination.is_contiguous()" in selection
+    assert "batch > 0 && tokens > 0" in selection
+    assert "depth == 128" in selection
+    assert "source.stride(1) == depth" in selection
+    assert "source.stride(2) == tokens * depth" in selection
+    assert "source.stride(0) == heads * tokens * depth" in selection
+    assert "alignof(uint4)" in selection
 
 
 def test_graph_attention_tracks_eager_split_count_from_device_length() -> None:

@@ -79,6 +79,31 @@ int main() {
     const std::vector<float> expected_transposed{1, 4, 2, 5, 3, 6};
     require(transposed == expected_transposed, "non-contiguous materialization order");
 
+    std::vector<float> head_major_values(1 * 2 * 3 * 128);
+    for (std::size_t index = 0; index < head_major_values.size(); ++index) {
+        head_major_values[index] = static_cast<float>(index % 64);
+    }
+    auto head_major = tensor<float>(head_major_values)
+        .reshape({1, 2, 3, 128})
+        .to(cuda_device)
+        .to(kBFloat16);
+    const auto token_major = host_values(
+        head_major.transpose(1, 2).contiguous());
+    std::vector<float> expected_token_major;
+    expected_token_major.reserve(head_major_values.size());
+    for (std::int64_t token = 0; token < 3; ++token) {
+        for (std::int64_t head = 0; head < 2; ++head) {
+            const auto begin = (head * 3 + token) * 128;
+            expected_token_major.insert(
+                expected_token_major.end(),
+                head_major_values.begin() + begin,
+                head_major_values.begin() + begin + 128);
+        }
+    }
+    require(
+        token_major == expected_token_major,
+        "BF16 head-to-token materialization order");
+
     auto right = tensor<float>({7, 8, 9, 10, 11, 12})
         .reshape({3, 2})
         .to(cuda_device);
