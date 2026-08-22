@@ -10,10 +10,9 @@
 // path expands only one 64x96 fp16 weight tile at a time for Tensor Core GEMM.
 
 #include <cuda_runtime.h>
+#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
 #include <cuda_fp16.h>
 #include <mma.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
 #include <algorithm>
 #include <cstdlib>
 #include <cstdint>
@@ -4114,46 +4113,46 @@ __global__ void __launch_bounds__(128) nepq_moe_grouped_tile_kernel(
 }
 
 void check_nepq_common(
-    const torch::Tensor & indices,
-    const torch::Tensor & aux,
-    const torch::Tensor & sub_scale,
-    const torch::Tensor & neuron_scale,
-    const torch::Tensor & table_pool,
-    const torch::Tensor & bank_ids,
+    const mfq_tensor_backend::Tensor & indices,
+    const mfq_tensor_backend::Tensor & aux,
+    const mfq_tensor_backend::Tensor & sub_scale,
+    const mfq_tensor_backend::Tensor & neuron_scale,
+    const mfq_tensor_backend::Tensor & table_pool,
+    const mfq_tensor_backend::Tensor & bank_ids,
     int64_t neuron_len,
     int64_t sub_bits,
     int64_t format) {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         format == kNvq1L || format == kNpq0L ||
         format == kNvq1S || format == kNpq0S,
         "NEPQ base format must be NVQ1-L/NPQ0-L/NVQ1-S/NPQ0-S");
-    TORCH_CHECK(neuron_len > 0 && neuron_len % 8 == 0,
+    MFQ_RUNTIME_CHECK(neuron_len > 0 && neuron_len % 8 == 0,
                 "NEPQ neuron_len must be a positive multiple of 8");
     const int expected_sub_bits = format == kNvq1S ? 4 :
         (format == kNpq0S ? 2 : 3);
-    TORCH_CHECK(sub_bits == expected_sub_bits, "NEPQ state width mismatch");
+    MFQ_RUNTIME_CHECK(sub_bits == expected_sub_bits, "NEPQ state width mismatch");
     for (const auto * tensor : {&indices, &aux, &sub_scale, &bank_ids}) {
-        TORCH_CHECK(tensor->is_cuda() && tensor->scalar_type() == torch::kUInt8 &&
+        MFQ_RUNTIME_CHECK(tensor->is_cuda() && tensor->scalar_type() == mfq_tensor_backend::kUInt8 &&
                     tensor->is_contiguous(),
                     "NEPQ packed streams must be CUDA contiguous uint8");
     }
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 &&
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 &&
                 neuron_scale.is_contiguous() && neuron_scale.dim() == 1,
                 "NEPQ neuron_scale must be CUDA contiguous float32 rank-1");
-    TORCH_CHECK(table_pool.is_cuda() && table_pool.scalar_type() == torch::kInt8 &&
+    MFQ_RUNTIME_CHECK(table_pool.is_cuda() && table_pool.scalar_type() == mfq_tensor_backend::kInt8 &&
                 table_pool.is_contiguous() && table_pool.dim() == 2 &&
                 table_pool.size(0) >= 1 && table_pool.size(0) <= 256,
                 "NEPQ table pool must be CUDA contiguous int8 [1..256,stride]");
     const int table_stride = format == kNvq1L ? 2048 * 8 :
         (format == kNvq1S ? 1024 * 8 :
          (format == kNpq0L ? kNpq0LTableBytes : kNepq0SCompactTableBytes));
-    TORCH_CHECK(table_pool.size(1) == table_stride, "NEPQ table stride mismatch");
+    MFQ_RUNTIME_CHECK(table_pool.size(1) == table_stride, "NEPQ table stride mismatch");
     const int64_t N = neuron_scale.numel();
     const int64_t ng = (neuron_len + kGroupSize - 1) / kGroupSize;
     const int64_t nvec = neuron_len / 8;
     const int64_t nsuper = (ng + kNepqGroupsPerSupergroup - 1) /
         kNepqGroupsPerSupergroup;
-    TORCH_CHECK(bank_ids.dim() == 2 && bank_ids.size(0) == N &&
+    MFQ_RUNTIME_CHECK(bank_ids.dim() == 2 && bank_ids.size(0) == N &&
                 bank_ids.size(1) == nsuper,
                 "NEPQ bank selectors must have shape [rows,ceil(groups/4)]");
     const int index_bits = format == kNvq1L ? 11 :
@@ -4162,56 +4161,56 @@ void check_nepq_common(
     const bool delta_format = format == kNvq1L || format == kNvq1S;
     const int64_t aux_bytes = delta_format ? (N * ng + 7) / 8 : 0;
     const int64_t sub_bytes = (N * ng * sub_bits + 7) / 8;
-    TORCH_CHECK(indices.numel() == index_bytes, "NEPQ index stream length mismatch");
-    TORCH_CHECK(aux.numel() == aux_bytes, "NEPQ aux stream length mismatch");
-    TORCH_CHECK(sub_scale.numel() == sub_bytes, "NEPQ state stream length mismatch");
+    MFQ_RUNTIME_CHECK(indices.numel() == index_bytes, "NEPQ index stream length mismatch");
+    MFQ_RUNTIME_CHECK(aux.numel() == aux_bytes, "NEPQ aux stream length mismatch");
+    MFQ_RUNTIME_CHECK(sub_scale.numel() == sub_bytes, "NEPQ state stream length mismatch");
 }
 
 void check_common(
-    const torch::Tensor & indices,
-    const torch::Tensor & aux,
-    const torch::Tensor & sub_scale,
-    const torch::Tensor & neuron_scale,
-    const torch::Tensor & codebook,
+    const mfq_tensor_backend::Tensor & indices,
+    const mfq_tensor_backend::Tensor & aux,
+    const mfq_tensor_backend::Tensor & sub_scale,
+    const mfq_tensor_backend::Tensor & neuron_scale,
+    const mfq_tensor_backend::Tensor & codebook,
     int64_t neuron_len,
     int64_t gs,
     int64_t sub_bits,
     int64_t format,
     int64_t sign_mode) {
-    TORCH_CHECK(format >= kNvq1L && format <= kNvq3JscLGroupExec,
+    MFQ_RUNTIME_CHECK(format >= kNvq1L && format <= kNvq3JscLGroupExec,
                 "NVQ format must be in [1,17]");
-    TORCH_CHECK(gs == kGroupSize, "NVQ CUDA kernels currently require gs=24");
-    TORCH_CHECK(sub_bits >= 1 && sub_bits <= 8, "NVQ sub_bits must be in [1,8]");
-    TORCH_CHECK(neuron_len > 0, "NVQ neuron_len must be positive");
-    TORCH_CHECK(sign_mode == 0 ||
+    MFQ_RUNTIME_CHECK(gs == kGroupSize, "NVQ CUDA kernels currently require gs=24");
+    MFQ_RUNTIME_CHECK(sub_bits >= 1 && sub_bits <= 8, "NVQ sub_bits must be in [1,8]");
+    MFQ_RUNTIME_CHECK(neuron_len > 0, "NVQ neuron_len must be positive");
+    MFQ_RUNTIME_CHECK(sign_mode == 0 ||
                 (sign_mode == 1 && (format == kNvq2 || format == kNvq2Exec)),
                 "index-parity sign mode is valid only for NVQ2");
     for (const auto * tensor : {&indices, &aux, &sub_scale}) {
-        TORCH_CHECK(tensor->is_cuda() && tensor->scalar_type() == torch::kUInt8 && tensor->is_contiguous(),
+        MFQ_RUNTIME_CHECK(tensor->is_cuda() && tensor->scalar_type() == mfq_tensor_backend::kUInt8 && tensor->is_contiguous(),
                     "NVQ packed streams must be CUDA contiguous uint8");
     }
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 &&
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 &&
                 neuron_scale.is_contiguous(), "NVQ neuron_scale must be CUDA contiguous float32");
-    TORCH_CHECK(codebook.is_cuda() && codebook.scalar_type() == torch::kInt8 && codebook.is_contiguous(),
+    MFQ_RUNTIME_CHECK(codebook.is_cuda() && codebook.scalar_type() == mfq_tensor_backend::kInt8 && codebook.is_contiguous(),
                 "NVQ codebook must be CUDA contiguous int8");
     if (format == kNvq1L) {
-        TORCH_CHECK(codebook.dim() == 2 && codebook.size(0) == 2048 && codebook.size(1) == 8,
+        MFQ_RUNTIME_CHECK(codebook.dim() == 2 && codebook.size(0) == 2048 && codebook.size(1) == 8,
                     "NVQ1-L codebook must have shape [2048,8]");
     } else if (format == kNvq1S) {
-        TORCH_CHECK(codebook.dim() == 2 && codebook.size(0) == 1024 && codebook.size(1) == 8,
+        MFQ_RUNTIME_CHECK(codebook.dim() == 2 && codebook.size(0) == 1024 && codebook.size(1) == 8,
                     "NVQ1-S codebook must have shape [1024,8]");
-        TORCH_CHECK(sub_bits == 4 && sign_mode == 0,
+        MFQ_RUNTIME_CHECK(sub_bits == 4 && sign_mode == 0,
                     "NVQ1-S requires a 4-bit scale and no sign mode");
     } else if (format == kNvq2 || format == kNvq2Exec) {
-        TORCH_CHECK(codebook.dim() == 2 && codebook.size(0) == 256 && codebook.size(1) == 8,
+        MFQ_RUNTIME_CHECK(codebook.dim() == 2 && codebook.size(0) == 256 && codebook.size(1) == 8,
                     "NVQ2 codebook must have shape [256,8]");
     } else if (format == kNvq2Jsc || format == kNvq2JscExec) {
-        TORCH_CHECK(codebook.dim() == 1 &&
+        MFQ_RUNTIME_CHECK(codebook.dim() == 1 &&
                     (codebook.numel() == kJscMetadataBytes + kJscE8CodebookBytes ||
                      codebook.numel() == kJscMetadataBytes + 2 * kJscE8CodebookBytes ||
                      codebook.numel() == kJscMetadataBytes + 4 * kJscE8CodebookBytes),
                     "NVQ2J codebook metadata has an invalid size");
-        TORCH_CHECK(sub_bits == 4 && sign_mode == 0,
+        MFQ_RUNTIME_CHECK(sub_bits == 4 && sign_mode == 0,
                     "NVQ2J requires a 4-bit state and even-parity signs");
     } else if (
         format == kNvq2JscL || format == kNvq2JscXL ||
@@ -4219,12 +4218,12 @@ void check_common(
         const int e8_bank_bytes = format == kNvq2JscL
             ? kJscE8Codebook1024Bytes
             : kJscE8Codebook4096Bytes;
-        TORCH_CHECK(codebook.dim() == 1 &&
+        MFQ_RUNTIME_CHECK(codebook.dim() == 1 &&
                     (codebook.numel() == kJscMetadataBytes + e8_bank_bytes ||
                      codebook.numel() == kJscMetadataBytes + 2 * e8_bank_bytes ||
                      codebook.numel() == kJscMetadataBytes + 4 * e8_bank_bytes),
                     "extended NVQ2J codebook metadata has an invalid size");
-        TORCH_CHECK(sub_bits == 4 && sign_mode == 0,
+        MFQ_RUNTIME_CHECK(sub_bits == 4 && sign_mode == 0,
                     "extended NVQ2J requires a 4-bit state and even-parity signs");
     } else if (
         format == kNvq3Jsc || format == kNvq3Jsc2 ||
@@ -4235,30 +4234,30 @@ void check_common(
             : (format == kNvq3JscL || format == kNvq3JscLGroupExec
                ? kJscD4Codebook1024Bytes
                : kJscD4CodebookBytes);
-        TORCH_CHECK(codebook.dim() == 1 &&
+        MFQ_RUNTIME_CHECK(codebook.dim() == 1 &&
                     (codebook.numel() == kJscMetadataBytes + d4_bank_bytes ||
                      codebook.numel() == kJscMetadataBytes + 2 * d4_bank_bytes ||
                      codebook.numel() == kJscMetadataBytes + 4 * d4_bank_bytes),
                     "NVQ3J codebook metadata has an invalid size");
         if (format == kNvq3Jsc2) {
-            TORCH_CHECK(
+            MFQ_RUNTIME_CHECK(
                 codebook.numel() == kJscMetadataBytes + 2 * kJscD4CodebookBytes,
                 "NVQ3J analytic-2 requires exactly two D4 banks");
         }
-        TORCH_CHECK(sub_bits == 4 && sign_mode == 0,
+        MFQ_RUNTIME_CHECK(sub_bits == 4 && sign_mode == 0,
                     "NVQ3J requires a 4-bit state and even-parity signs");
     } else if (format == kNpq0L) {
-        TORCH_CHECK(codebook.dim() == 1 && codebook.numel() == kNpq0LTableBytes,
+        MFQ_RUNTIME_CHECK(codebook.dim() == 1 && codebook.numel() == kNpq0LTableBytes,
                     "NPQ0-L codebook metadata must contain 832 bytes");
-        TORCH_CHECK(sub_bits == 3 && sign_mode == 0,
+        MFQ_RUNTIME_CHECK(sub_bits == 3 && sign_mode == 0,
                     "NPQ0-L requires a 3-bit state and no sign stream");
     } else if (format == kNpq0S) {
-        TORCH_CHECK(codebook.dim() == 1 && codebook.numel() == kNpq0STableBytes,
+        MFQ_RUNTIME_CHECK(codebook.dim() == 1 && codebook.numel() == kNpq0STableBytes,
                     "NPQ0-S expanded PQ3+3 runtime LUT must contain 2112 bytes");
-        TORCH_CHECK(sub_bits == 2 && sign_mode == 0,
+        MFQ_RUNTIME_CHECK(sub_bits == 2 && sign_mode == 0,
                     "NPQ0-S requires a 2-bit state and no sign stream");
     } else {
-        TORCH_CHECK(codebook.dim() == 2 && codebook.size(0) == 256 && codebook.size(1) == 4,
+        MFQ_RUNTIME_CHECK(codebook.dim() == 2 && codebook.size(0) == 256 && codebook.size(1) == 4,
                     "NVQ3 codebook must have shape [256,4]");
     }
 
@@ -4283,9 +4282,9 @@ void check_common(
         ? 0
         : (aux_count * aux_bits + 7) / 8;
     const int64_t sub_bytes = (N * ng * sub_bits + 7) / 8;
-    TORCH_CHECK(indices.numel() == index_bytes, "NVQ index stream length mismatch");
-    TORCH_CHECK(aux.numel() == aux_bytes, "NVQ aux stream length mismatch");
-    TORCH_CHECK(sub_scale.numel() == sub_bytes, "NVQ sub-scale stream length mismatch");
+    MFQ_RUNTIME_CHECK(indices.numel() == index_bytes, "NVQ index stream length mismatch");
+    MFQ_RUNTIME_CHECK(aux.numel() == aux_bytes, "NVQ aux stream length mismatch");
+    MFQ_RUNTIME_CHECK(sub_scale.numel() == sub_bytes, "NVQ sub-scale stream length mismatch");
 }
 
 template <typename Launch>
@@ -4320,7 +4319,7 @@ void launch_by_format(int format, Launch && launch) {
         case kNvq3JscLGroupExec:
             launch(std::integral_constant<int, kNvq3JscLGroupExec>{});
             break;
-        default: TORCH_CHECK(false, "unsupported NVQ format");
+        default: MFQ_RUNTIME_CHECK(false, "unsupported NVQ format");
     }
 }
 
@@ -4331,7 +4330,7 @@ void launch_nepq_by_format(int format, Launch && launch) {
         case kNpq0L: launch(std::integral_constant<int, kNpq0L>{}); break;
         case kNvq1S: launch(std::integral_constant<int, kNvq1S>{}); break;
         case kNpq0S: launch(std::integral_constant<int, kNpq0S>{}); break;
-        default: TORCH_CHECK(false, "unsupported NEPQ base format");
+        default: MFQ_RUNTIME_CHECK(false, "unsupported NEPQ base format");
     }
 }
 
@@ -4386,7 +4385,7 @@ void launch_aligned_group_row_tiled_m1(
                 FORMAT, NWARPS, ROWS_PER_WARP, MULTI2, true, ADD_RESIDUAL>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             static_cast<int>(shared_bytes));
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             attribute_status == cudaSuccess,
             "failed to opt in to the E8 row-tiled shared-memory size");
     } else {
@@ -4538,14 +4537,14 @@ void launch_aligned_group_multi2_m1(
 template <int NWARPS>
 void launch_m1_vec8_by_format(
     int format,
-    const torch::Tensor & indices,
-    const torch::Tensor & aux,
-    const torch::Tensor & sub_scale,
-    const torch::Tensor & neuron_scale,
-    const torch::Tensor & codebook,
-    const torch::Tensor & qx,
-    const torch::Tensor & xscale,
-    torch::Tensor & output,
+    const mfq_tensor_backend::Tensor & indices,
+    const mfq_tensor_backend::Tensor & aux,
+    const mfq_tensor_backend::Tensor & sub_scale,
+    const mfq_tensor_backend::Tensor & neuron_scale,
+    const mfq_tensor_backend::Tensor & codebook,
+    const mfq_tensor_backend::Tensor & qx,
+    const mfq_tensor_backend::Tensor & xscale,
+    mfq_tensor_backend::Tensor & output,
     int N,
     int ng,
     int nvec,
@@ -4558,7 +4557,7 @@ void launch_m1_vec8_by_format(
             indices.data_ptr<uint8_t>(), indices.numel(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-            reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
             N, ng, nvec, nsign, sub_bits, sign_mode);
         return;
     }
@@ -4567,7 +4566,7 @@ void launch_m1_vec8_by_format(
             indices.data_ptr<uint8_t>(), indices.numel(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-            reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
             N, ng, nvec, nsign, sub_bits, sign_mode);
         return;
     }
@@ -4576,7 +4575,7 @@ void launch_m1_vec8_by_format(
             indices.data_ptr<uint8_t>(), indices.numel(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-            reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
             N, ng, nvec, nsign, sub_bits, sign_mode);
         return;
     }
@@ -4585,7 +4584,7 @@ void launch_m1_vec8_by_format(
             indices.data_ptr<uint8_t>(), indices.numel(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-            reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
             N, ng, nvec, nsign, sub_bits, sign_mode);
         return;
     }
@@ -4594,7 +4593,7 @@ void launch_m1_vec8_by_format(
             indices.data_ptr<uint8_t>(), indices.numel(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-            reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
             N, ng, nvec, nsign, sub_bits, sign_mode);
         return;
     }
@@ -4603,7 +4602,7 @@ void launch_m1_vec8_by_format(
             indices.data_ptr<uint8_t>(), indices.numel(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-            reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
             N, ng, nvec, nsign, sub_bits, sign_mode);
         return;
     }
@@ -4612,7 +4611,7 @@ void launch_m1_vec8_by_format(
             indices.data_ptr<uint8_t>(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-            reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
             N, ng, nvec, nsign);
         return;
     }
@@ -4627,11 +4626,11 @@ void launch_m1_vec8_by_format(
         if (format == kNvq2JscXLGroupExec) {
             launch_aligned_group_m1<kNvq2JscXLGroupExec>(
                 weight, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-                reinterpret_cast<__half *>(output.data_ptr<at::Half>()), stream);
+                reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), stream);
         } else {
             launch_aligned_group_m1<kNvq3JscLGroupExec>(
                 weight, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-                reinterpret_cast<__half *>(output.data_ptr<at::Half>()), stream);
+                reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), stream);
         }
         return;
     }
@@ -4641,7 +4640,7 @@ void launch_m1_vec8_by_format(
             indices.data_ptr<uint8_t>(), indices.numel(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-            reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
             N, ng, nvec, nsign, sub_bits, sign_mode);
     });
 }
@@ -4649,14 +4648,14 @@ void launch_m1_vec8_by_format(
 template <int NWARPS, int MAX_M>
 void launch_batch_vec8_by_format(
     int format,
-    const torch::Tensor & indices,
-    const torch::Tensor & aux,
-    const torch::Tensor & sub_scale,
-    const torch::Tensor & neuron_scale,
-    const torch::Tensor & codebook,
-    const torch::Tensor & qx,
-    const torch::Tensor & xscale,
-    torch::Tensor & output,
+    const mfq_tensor_backend::Tensor & indices,
+    const mfq_tensor_backend::Tensor & aux,
+    const mfq_tensor_backend::Tensor & sub_scale,
+    const mfq_tensor_backend::Tensor & neuron_scale,
+    const mfq_tensor_backend::Tensor & codebook,
+    const mfq_tensor_backend::Tensor & qx,
+    const mfq_tensor_backend::Tensor & xscale,
+    mfq_tensor_backend::Tensor & output,
     int M,
     int N,
     int ng,
@@ -4671,21 +4670,21 @@ void launch_batch_vec8_by_format(
             indices.data_ptr<uint8_t>(), indices.numel(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-            reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
             M, N, ng, nvec, nsign, sub_bits, sign_mode);
     });
 }
 
 void launch_selected_batch_vec8(
     int format,
-    const torch::Tensor & indices,
-    const torch::Tensor & aux,
-    const torch::Tensor & sub_scale,
-    const torch::Tensor & neuron_scale,
-    const torch::Tensor & codebook,
-    const torch::Tensor & qx,
-    const torch::Tensor & xscale,
-    torch::Tensor & output,
+    const mfq_tensor_backend::Tensor & indices,
+    const mfq_tensor_backend::Tensor & aux,
+    const mfq_tensor_backend::Tensor & sub_scale,
+    const mfq_tensor_backend::Tensor & neuron_scale,
+    const mfq_tensor_backend::Tensor & codebook,
+    const mfq_tensor_backend::Tensor & qx,
+    const mfq_tensor_backend::Tensor & xscale,
+    mfq_tensor_backend::Tensor & output,
     int M,
     int N,
     int ng,
@@ -4774,14 +4773,14 @@ void launch_selected_batch_vec8(
 
 void launch_selected_m1_vec8(
     int format,
-    const torch::Tensor & indices,
-    const torch::Tensor & aux,
-    const torch::Tensor & sub_scale,
-    const torch::Tensor & neuron_scale,
-    const torch::Tensor & codebook,
-    const torch::Tensor & qx,
-    const torch::Tensor & xscale,
-    torch::Tensor & output,
+    const mfq_tensor_backend::Tensor & indices,
+    const mfq_tensor_backend::Tensor & aux,
+    const mfq_tensor_backend::Tensor & sub_scale,
+    const mfq_tensor_backend::Tensor & neuron_scale,
+    const mfq_tensor_backend::Tensor & codebook,
+    const mfq_tensor_backend::Tensor & qx,
+    const mfq_tensor_backend::Tensor & xscale,
+    mfq_tensor_backend::Tensor & output,
     int N,
     int ng,
     int nvec,
@@ -4805,11 +4804,11 @@ void launch_selected_m1_vec8(
 }
 
 NvqDeviceWeight make_device_weight(
-    const torch::Tensor & indices,
-    const torch::Tensor & aux,
-    const torch::Tensor & sub_scale,
-    const torch::Tensor & neuron_scale,
-    const torch::Tensor & codebook,
+    const mfq_tensor_backend::Tensor & indices,
+    const mfq_tensor_backend::Tensor & aux,
+    const mfq_tensor_backend::Tensor & sub_scale,
+    const mfq_tensor_backend::Tensor & neuron_scale,
+    const mfq_tensor_backend::Tensor & codebook,
     int neuron_len,
     int gs,
     int sub_bits,
@@ -4832,24 +4831,24 @@ template <int FORMAT, int NWARPS, int MAX_M, bool FAST_NVQ2_S4 = false>
 void launch_multi2_vec8(
     const NvqDeviceWeight & first,
     const NvqDeviceWeight & second,
-    const torch::Tensor & qx,
-    const torch::Tensor & xscale,
-    torch::Tensor & output,
+    const mfq_tensor_backend::Tensor & qx,
+    const mfq_tensor_backend::Tensor & xscale,
+    mfq_tensor_backend::Tensor & output,
     int M,
     cudaStream_t stream) {
     nvq_gemv_multi2_vec8_kernel<FORMAT, NWARPS, MAX_M, FAST_NVQ2_S4>
         <<<first.N + second.N, dim3(32, NWARPS), 0, stream>>>(
             first, second, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-            reinterpret_cast<__half *>(output.data_ptr<at::Half>()), M);
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), M);
 }
 
 void launch_selected_multi2_vec8(
     int format,
     const NvqDeviceWeight & first,
     const NvqDeviceWeight & second,
-    const torch::Tensor & qx,
-    const torch::Tensor & xscale,
-    torch::Tensor & output,
+    const mfq_tensor_backend::Tensor & qx,
+    const mfq_tensor_backend::Tensor & xscale,
+    mfq_tensor_backend::Tensor & output,
     int M,
     cudaStream_t stream) {
 #define NVQ_MULTI2(F, NW, MAX_M) \
@@ -4892,12 +4891,12 @@ void launch_selected_multi2_vec8(
             case kNvq2JscXLGroupExec:
                 launch_aligned_group_multi2_m1<kNvq2JscXLGroupExec>(
                     first, second, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-                    reinterpret_cast<__half *>(output.data_ptr<at::Half>()), stream);
+                    reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), stream);
                 break;
             case kNvq3JscLGroupExec:
                 launch_aligned_group_multi2_m1<kNvq3JscLGroupExec>(
                     first, second, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-                    reinterpret_cast<__half *>(output.data_ptr<at::Half>()), stream);
+                    reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), stream);
                 break;
         }
     } else if (M <= 4) {
@@ -4968,13 +4967,13 @@ void launch_selected_multi2_vec8(
 
 }  // namespace
 
-torch::Tensor nepq_dequant_cuda(
-    torch::Tensor indices,
-    torch::Tensor aux,
-    torch::Tensor sub_scale,
-    torch::Tensor neuron_scale,
-    torch::Tensor table_pool,
-    torch::Tensor bank_ids,
+mfq_tensor_backend::Tensor nepq_dequant_cuda(
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor aux,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor table_pool,
+    mfq_tensor_backend::Tensor bank_ids,
     int64_t neuron_len,
     int64_t sub_bits,
     int64_t format) {
@@ -4989,11 +4988,11 @@ torch::Tensor nepq_dequant_cuda(
     const int nsuper = (ng + kNepqGroupsPerSupergroup - 1) /
         kNepqGroupsPerSupergroup;
     const int table_stride = static_cast<int>(table_pool.size(1));
-    auto output = torch::empty({N, K}, neuron_scale.options().dtype(torch::kFloat16));
+    auto output = mfq_tensor_backend::empty({N, K}, neuron_scale.options().dtype(mfq_tensor_backend::kFloat16));
     const int block = 256;
     const int grid = static_cast<int>(std::min<int64_t>(
         (static_cast<int64_t>(N) * nsign + block - 1) / block, 65535));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
     launch_nepq_by_format(static_cast<int>(format), [&](auto tag) {
         constexpr int F = decltype(tag)::value;
         nepq_dequant_kernel<F><<<grid, block, 0, stream>>>(
@@ -5002,31 +5001,31 @@ torch::Tensor nepq_dequant_cuda(
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),
             neuron_scale.data_ptr<float>(), table_pool.data_ptr<int8_t>(),
             bank_ids.data_ptr<uint8_t>(),
-            reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
             N, K, ng, nvec, nsign, nsuper, table_stride,
             static_cast<int>(sub_bits), 0);
     });
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NEPQ dequant kernel launch failed");
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NEPQ dequant kernel launch failed");
     return output;
 }
 
-torch::Tensor nepq_gemv_ws_cuda(
-    torch::Tensor indices,
-    torch::Tensor aux,
-    torch::Tensor sub_scale,
-    torch::Tensor neuron_scale,
-    torch::Tensor table_pool,
-    torch::Tensor bank_ids,
-    torch::Tensor x,
+mfq_tensor_backend::Tensor nepq_gemv_ws_cuda(
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor aux,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor table_pool,
+    mfq_tensor_backend::Tensor bank_ids,
+    mfq_tensor_backend::Tensor x,
     int64_t neuron_len,
     int64_t sub_bits,
     int64_t format,
-    torch::Tensor qx,
-    torch::Tensor xscale) {
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale) {
     check_nepq_common(
         indices, aux, sub_scale, neuron_scale, table_pool, bank_ids,
         neuron_len, sub_bits, format);
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
                 x.is_contiguous() && x.dim() == 2,
                 "NEPQ x must be CUDA contiguous fp16 rank-2");
     const int M = static_cast<int>(x.size(0));
@@ -5034,12 +5033,12 @@ torch::Tensor nepq_gemv_ws_cuda(
     const int N = static_cast<int>(neuron_scale.numel());
     const int ng = (K + kGroupSize - 1) / kGroupSize;
     const int K_pad = ng * kGroupSize;
-    TORCH_CHECK(x.size(1) == K && M >= 1 && M <= 16,
+    MFQ_RUNTIME_CHECK(x.size(1) == K && M >= 1 && M <= 16,
                 "NEPQ GEMV input must be [M,K] with M in [1,16]");
-    TORCH_CHECK(qx.is_cuda() && qx.scalar_type() == torch::kInt8 &&
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.scalar_type() == mfq_tensor_backend::kInt8 &&
                 qx.is_contiguous() && qx.numel() >= static_cast<int64_t>(M) * K_pad,
                 "NEPQ qx workspace mismatch");
-    TORCH_CHECK(xscale.is_cuda() && xscale.scalar_type() == torch::kFloat32 &&
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.scalar_type() == mfq_tensor_backend::kFloat32 &&
                 xscale.is_contiguous() && xscale.numel() >= static_cast<int64_t>(M) * ng,
                 "NEPQ xscale workspace mismatch");
     const int nvec = K / 8;
@@ -5047,10 +5046,10 @@ torch::Tensor nepq_gemv_ws_cuda(
     const int nsuper = (ng + kNepqGroupsPerSupergroup - 1) /
         kNepqGroupsPerSupergroup;
     const int table_stride = static_cast<int>(table_pool.size(1));
-    auto output = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto output = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     nvq_quantize_x_gs24_kernel<<<dim3(M, ng), 32, 0, stream>>>(
-        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
         qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), M, K, ng);
 
 #define NEPQ_GEMV_LAUNCH(NWARPS_VALUE, MAX_M_VALUE)                               \
@@ -5062,7 +5061,7 @@ torch::Tensor nepq_gemv_ws_cuda(
         neuron_scale.data_ptr<float>(), table_pool.data_ptr<int8_t>(),            \
         bank_ids.data_ptr<uint8_t>(), qx.data_ptr<int8_t>(),                      \
         xscale.data_ptr<float>(),                                                 \
-        reinterpret_cast<__half *>(output.data_ptr<at::Half>()),                  \
+        reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),                  \
         M, N, ng, nvec, nsign, nsuper, table_stride,                              \
         static_cast<int>(sub_bits), 0)
     launch_nepq_by_format(static_cast<int>(format), [&](auto tag) {
@@ -5092,27 +5091,27 @@ torch::Tensor nepq_gemv_ws_cuda(
         }
     });
 #undef NEPQ_GEMV_LAUNCH
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NEPQ GEMV kernel launch failed");
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NEPQ GEMV kernel launch failed");
     return output;
 }
 
-torch::Tensor nepq_mmq_ws_cuda(
-    torch::Tensor indices,
-    torch::Tensor aux,
-    torch::Tensor sub_scale,
-    torch::Tensor neuron_scale,
-    torch::Tensor table_pool,
-    torch::Tensor bank_ids,
-    torch::Tensor x,
+mfq_tensor_backend::Tensor nepq_mmq_ws_cuda(
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor aux,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor table_pool,
+    mfq_tensor_backend::Tensor bank_ids,
+    mfq_tensor_backend::Tensor x,
     int64_t neuron_len,
     int64_t sub_bits,
     int64_t format,
-    torch::Tensor qx,
-    torch::Tensor xscale) {
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale) {
     check_nepq_common(
         indices, aux, sub_scale, neuron_scale, table_pool, bank_ids,
         neuron_len, sub_bits, format);
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
                 x.is_contiguous() && x.dim() == 2,
                 "NEPQ x must be CUDA contiguous fp16 rank-2");
     const int M = static_cast<int>(x.size(0));
@@ -5120,12 +5119,12 @@ torch::Tensor nepq_mmq_ws_cuda(
     const int N = static_cast<int>(neuron_scale.numel());
     const int ng = (K + kGroupSize - 1) / kGroupSize;
     const int K_pad = ng * kGroupSize;
-    TORCH_CHECK(x.size(1) == K && M >= 4 && M <= 64,
+    MFQ_RUNTIME_CHECK(x.size(1) == K && M >= 4 && M <= 64,
                 "NEPQ MMQ input must be [M,K] with M in [4,64]");
-    TORCH_CHECK(qx.is_cuda() && qx.scalar_type() == torch::kInt8 &&
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.scalar_type() == mfq_tensor_backend::kInt8 &&
                 qx.is_contiguous() && qx.numel() >= static_cast<int64_t>(M) * K_pad,
                 "NEPQ qx workspace mismatch");
-    TORCH_CHECK(xscale.is_cuda() && xscale.scalar_type() == torch::kFloat32 &&
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.scalar_type() == mfq_tensor_backend::kFloat32 &&
                 xscale.is_contiguous() && xscale.numel() >= static_cast<int64_t>(M) * ng,
                 "NEPQ xscale workspace mismatch");
     const int nvec = K / 8;
@@ -5133,10 +5132,10 @@ torch::Tensor nepq_mmq_ws_cuda(
     const int nsuper = (ng + kNepqGroupsPerSupergroup - 1) /
         kNepqGroupsPerSupergroup;
     const int table_stride = static_cast<int>(table_pool.size(1));
-    auto output = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto output = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     nvq_quantize_x_gs24_kernel<<<dim3(M, ng), 32, 0, stream>>>(
-        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
         qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), M, K, ng);
     const dim3 block(32, 8);
 #define NEPQ_MMQ_LAUNCH(MTILES_VALUE, NEED_CHECK_VALUE)                           \
@@ -5148,7 +5147,7 @@ torch::Tensor nepq_mmq_ws_cuda(
         neuron_scale.data_ptr<float>(), table_pool.data_ptr<int8_t>(),           \
         bank_ids.data_ptr<uint8_t>(), qx.data_ptr<int8_t>(),                     \
         xscale.data_ptr<float>(),                                                \
-        reinterpret_cast<__half *>(output.data_ptr<at::Half>()),                 \
+        reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),                 \
         M, N, ng, nvec, nsign, nsuper, table_stride,                             \
         static_cast<int>(sub_bits), 0)
     launch_nepq_by_format(static_cast<int>(format), [&](auto tag) {
@@ -5168,40 +5167,40 @@ torch::Tensor nepq_mmq_ws_cuda(
         }
     });
 #undef NEPQ_MMQ_LAUNCH
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NEPQ MMQ kernel launch failed");
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NEPQ MMQ kernel launch failed");
     return output;
 }
 
-torch::Tensor nepq_gemm_f16_cuda(
-    torch::Tensor indices,
-    torch::Tensor aux,
-    torch::Tensor sub_scale,
-    torch::Tensor neuron_scale,
-    torch::Tensor table_pool,
-    torch::Tensor bank_ids,
-    torch::Tensor x,
+mfq_tensor_backend::Tensor nepq_gemm_f16_cuda(
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor aux,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor table_pool,
+    mfq_tensor_backend::Tensor bank_ids,
+    mfq_tensor_backend::Tensor x,
     int64_t neuron_len,
     int64_t sub_bits,
     int64_t format) {
     check_nepq_common(
         indices, aux, sub_scale, neuron_scale, table_pool, bank_ids,
         neuron_len, sub_bits, format);
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
                 x.is_contiguous() && x.dim() == 2,
                 "NEPQ x must be CUDA contiguous fp16 rank-2");
     const int M = static_cast<int>(x.size(0));
     const int K = static_cast<int>(neuron_len);
     const int N = static_cast<int>(neuron_scale.numel());
     const int ng = (K + kGroupSize - 1) / kGroupSize;
-    TORCH_CHECK(x.size(1) == K && M >= 16 && M <= 256,
+    MFQ_RUNTIME_CHECK(x.size(1) == K && M >= 16 && M <= 256,
                 "NEPQ online GEMM input must be [M,K] with M in [16,256]");
     const int nvec = K / 8;
     const int nsign = (K + 7) / 8;
     const int nsuper = (ng + kNepqGroupsPerSupergroup - 1) /
         kNepqGroupsPerSupergroup;
     const int table_stride = static_cast<int>(table_pool.size(1));
-    auto output = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto output = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     const dim3 block(32, 8);
 #define NEPQ_GEMM_LAUNCH(MTILES_VALUE, NEED_CHECK_VALUE)                          \
     nepq_gemm_f16_gs24_kernel<F, MTILES_VALUE, NEED_CHECK_VALUE><<<              \
@@ -5212,8 +5211,8 @@ torch::Tensor nepq_gemm_f16_cuda(
         sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),                         \
         neuron_scale.data_ptr<float>(), table_pool.data_ptr<int8_t>(),            \
         bank_ids.data_ptr<uint8_t>(),                                             \
-        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),                 \
-        reinterpret_cast<__half *>(output.data_ptr<at::Half>()),                  \
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),                 \
+        reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),                  \
         M, N, K, ng, nvec, nsign, nsuper, table_stride,                           \
         static_cast<int>(sub_bits), 0)
     launch_nepq_by_format(static_cast<int>(format), [&](auto tag) {
@@ -5236,67 +5235,67 @@ torch::Tensor nepq_gemm_f16_cuda(
         }
     });
 #undef NEPQ_GEMM_LAUNCH
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NEPQ online GEMM kernel launch failed");
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NEPQ online GEMM kernel launch failed");
     return output;
 }
 
-torch::Tensor nepq_moe_grouped_matmul_ws_cuda(
-    torch::Tensor indices,
-    torch::Tensor aux,
-    torch::Tensor sub_scale,
-    torch::Tensor neuron_scale,
-    torch::Tensor table_pool,
-    torch::Tensor bank_ids,
-    torch::Tensor grouped_table_pool,
-    torch::Tensor x,
-    torch::Tensor ids,
+mfq_tensor_backend::Tensor nepq_moe_grouped_matmul_ws_cuda(
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor aux,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor table_pool,
+    mfq_tensor_backend::Tensor bank_ids,
+    mfq_tensor_backend::Tensor grouped_table_pool,
+    mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor ids,
     int64_t n_experts,
     int64_t out_per_expert,
     int64_t neuron_len,
     int64_t sub_bits,
     int64_t format,
-    torch::Tensor out,
-    torch::Tensor qx,
-    torch::Tensor xscale,
-    torch::Tensor ids_dst,
-    torch::Tensor expert_bounds,
-    torch::Tensor tile_bounds,
-    torch::Tensor tile_experts) {
+    mfq_tensor_backend::Tensor out,
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale,
+    mfq_tensor_backend::Tensor ids_dst,
+    mfq_tensor_backend::Tensor expert_bounds,
+    mfq_tensor_backend::Tensor tile_bounds,
+    mfq_tensor_backend::Tensor tile_experts) {
     check_nepq_common(
         indices, aux, sub_scale, neuron_scale, table_pool, bank_ids,
         neuron_len, sub_bits, format);
     const int expected_grouped_stride = format == kNpq0S
         ? kNpq0STableBytes
         : static_cast<int>(table_pool.size(1));
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         grouped_table_pool.is_cuda() && grouped_table_pool.is_contiguous() &&
-        grouped_table_pool.scalar_type() == torch::kInt8 &&
+        grouped_table_pool.scalar_type() == mfq_tensor_backend::kInt8 &&
         grouped_table_pool.dim() == 2 &&
         grouped_table_pool.size(0) == table_pool.size(0) &&
         grouped_table_pool.size(1) == expected_grouped_stride,
         "NEPQ grouped table pool shape mismatch");
-    TORCH_CHECK(n_experts > 0 && n_experts <= 4096,
+    MFQ_RUNTIME_CHECK(n_experts > 0 && n_experts <= 4096,
                 "NEPQ expert count must be in [1,4096]");
-    TORCH_CHECK(out_per_expert > 0 &&
+    MFQ_RUNTIME_CHECK(out_per_expert > 0 &&
                 neuron_scale.numel() == n_experts * out_per_expert,
                 "NEPQ expert shape does not match the flattened row count");
-    TORCH_CHECK(ids.is_cuda() && ids.is_contiguous() &&
-                ids.scalar_type() == torch::kInt32 && ids.dim() == 2,
+    MFQ_RUNTIME_CHECK(ids.is_cuda() && ids.is_contiguous() &&
+                ids.scalar_type() == mfq_tensor_backend::kInt32 && ids.dim() == 2,
                 "NEPQ route IDs must be CUDA contiguous int32 [T,R]");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() &&
-                x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() &&
+                x.scalar_type() == mfq_tensor_backend::kFloat16 &&
                 (x.dim() == 2 || x.dim() == 3) && x.size(-1) == neuron_len,
                 "NEPQ routed input must be CUDA contiguous fp16 [T,K] or [T,R,K]");
     const int tokens = static_cast<int>(ids.size(0));
     const int routes = static_cast<int>(ids.size(1));
     const int pairs = tokens * routes;
     const bool routed_input = x.dim() == 3;
-    TORCH_CHECK(tokens > 0 && routes > 0, "NEPQ route dimensions must be nonzero");
-    TORCH_CHECK((!routed_input && x.size(0) == tokens) ||
+    MFQ_RUNTIME_CHECK(tokens > 0 && routes > 0, "NEPQ route dimensions must be nonzero");
+    MFQ_RUNTIME_CHECK((!routed_input && x.size(0) == tokens) ||
                 (routed_input && x.size(0) == tokens && x.size(1) == routes),
                 "NEPQ input leading dimensions do not match routes");
-    TORCH_CHECK(out.is_cuda() && out.is_contiguous() &&
-                out.scalar_type() == torch::kFloat16 && out.dim() == 3 &&
+    MFQ_RUNTIME_CHECK(out.is_cuda() && out.is_contiguous() &&
+                out.scalar_type() == mfq_tensor_backend::kFloat16 && out.dim() == 3 &&
                 out.size(0) == tokens && out.size(1) == routes &&
                 out.size(2) == out_per_expert,
                 "NEPQ output must be CUDA contiguous fp16 [T,R,O]");
@@ -5305,12 +5304,12 @@ torch::Tensor nepq_moe_grouped_matmul_ws_cuda(
     const int ng = (K + kGroupSize - 1) / kGroupSize;
     const int K_pad = ng * kGroupSize;
     const int input_rows = routed_input ? pairs : tokens;
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() &&
-                qx.scalar_type() == torch::kInt8 && qx.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() &&
+                qx.scalar_type() == mfq_tensor_backend::kInt8 && qx.dim() == 2 &&
                 qx.size(0) >= input_rows && qx.size(1) >= K_pad,
                 "NEPQ routed qx workspace mismatch");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() &&
-                xscale.scalar_type() == torch::kFloat32 && xscale.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() &&
+                xscale.scalar_type() == mfq_tensor_backend::kFloat32 && xscale.dim() == 2 &&
                 xscale.size(0) >= input_rows && xscale.size(1) >= ng,
                 "NEPQ routed xscale workspace mismatch");
     const int nvec = K / 8;
@@ -5320,9 +5319,9 @@ torch::Tensor nepq_moe_grouped_matmul_ws_cuda(
     const int table_stride = static_cast<int>(table_pool.size(1));
     const int grouped_table_stride =
         static_cast<int>(grouped_table_pool.size(1));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
     nvq_quantize_x_gs24_kernel<<<dim3(input_rows, ng), 32, 0, stream>>>(
-        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
         qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), input_rows, K, ng);
 
     if (tokens <= 8) {
@@ -5339,7 +5338,7 @@ torch::Tensor nepq_moe_grouped_matmul_ws_cuda(
             bank_ids.data_ptr<uint8_t>(), qx.data_ptr<int8_t>(),                 \
             xscale.data_ptr<float>(), ids.data_ptr<int32_t>(),                   \
             nullptr,                                                             \
-            reinterpret_cast<__half *>(out.data_ptr<at::Half>()),                \
+            reinterpret_cast<__half *>(out.data_ptr<mfq_half>()),                \
             pairs, routes, static_cast<int>(n_experts),                          \
             static_cast<int>(n_experts),                                         \
             static_cast<int>(out_per_expert), ng, nvec, nsign, nsuper,           \
@@ -5351,19 +5350,19 @@ torch::Tensor nepq_moe_grouped_matmul_ws_cuda(
         });
 #undef NEPQ_MOE_SMALL_LAUNCH
     } else {
-        TORCH_CHECK(ids_dst.is_cuda() && ids_dst.is_contiguous() &&
-                    ids_dst.scalar_type() == torch::kInt32 && ids_dst.numel() >= pairs,
+        MFQ_RUNTIME_CHECK(ids_dst.is_cuda() && ids_dst.is_contiguous() &&
+                    ids_dst.scalar_type() == mfq_tensor_backend::kInt32 && ids_dst.numel() >= pairs,
                     "NEPQ compact route map is missing");
-        TORCH_CHECK(expert_bounds.is_cuda() && expert_bounds.is_contiguous() &&
-                    expert_bounds.scalar_type() == torch::kInt32 &&
+        MFQ_RUNTIME_CHECK(expert_bounds.is_cuda() && expert_bounds.is_contiguous() &&
+                    expert_bounds.scalar_type() == mfq_tensor_backend::kInt32 &&
                     expert_bounds.numel() >= n_experts + 1,
                     "NEPQ expert bounds are missing");
-        TORCH_CHECK(tile_bounds.is_cuda() && tile_bounds.is_contiguous() &&
-                    tile_bounds.scalar_type() == torch::kInt32 &&
+        MFQ_RUNTIME_CHECK(tile_bounds.is_cuda() && tile_bounds.is_contiguous() &&
+                    tile_bounds.scalar_type() == mfq_tensor_backend::kInt32 &&
                     tile_bounds.numel() >= n_experts + 1,
                     "NEPQ tile bounds are missing");
-        TORCH_CHECK(tile_experts.is_cuda() && tile_experts.is_contiguous() &&
-                    tile_experts.scalar_type() == torch::kInt32 &&
+        MFQ_RUNTIME_CHECK(tile_experts.is_cuda() && tile_experts.is_contiguous() &&
+                    tile_experts.scalar_type() == mfq_tensor_backend::kInt32 &&
                     tile_experts.numel() >= pairs,
                     "NEPQ tile expert map is missing");
         constexpr int route_tile = 8;
@@ -5383,7 +5382,7 @@ torch::Tensor nepq_moe_grouped_matmul_ws_cuda(
             xscale.data_ptr<float>(), nullptr, ids_dst.data_ptr<int32_t>(),      \
             expert_bounds.data_ptr<int32_t>(), tile_bounds.data_ptr<int32_t>(),  \
             tile_experts.data_ptr<int32_t>(),                                    \
-            reinterpret_cast<__half *>(out.data_ptr<at::Half>()),                \
+            reinterpret_cast<__half *>(out.data_ptr<mfq_half>()),                \
             routes, static_cast<int>(n_experts),                                 \
             static_cast<int>(n_experts),                                         \
             static_cast<int>(out_per_expert), ng, nvec, nsign, nsuper,           \
@@ -5396,7 +5395,7 @@ torch::Tensor nepq_moe_grouped_matmul_ws_cuda(
         });
 #undef NEPQ_MOE_GROUPED_LAUNCH
     }
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess,
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess,
                 "NEPQ routed matmul kernel launch failed");
     return out;
 }
@@ -5777,19 +5776,19 @@ __global__ void __launch_bounds__(256, 1) nepq_moe_grouped_f16_kernel(
     }
 }
 
-torch::Tensor nvq_moe_grouped_matmul_pool_f16_cuda(
-    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
-    torch::Tensor neuron_scale, torch::Tensor codebook, torch::Tensor x,
-    torch::Tensor expert_local, int64_t n_experts, int64_t pool_experts,
+mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_pool_f16_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor codebook, mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor expert_local, int64_t n_experts, int64_t pool_experts,
     int64_t out_per_expert, int64_t neuron_len, int64_t gs,
     int64_t sub_bits, int64_t format, int64_t sign_mode,
-    torch::Tensor out, torch::Tensor ids_dst, torch::Tensor expert_bounds,
-    torch::Tensor tile_bounds, torch::Tensor tile_experts) {
+    mfq_tensor_backend::Tensor out, mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds,
+    mfq_tensor_backend::Tensor tile_bounds, mfq_tensor_backend::Tensor tile_experts) {
     check_common(indices, aux, sub_scale, neuron_scale, codebook,
                  neuron_len, gs, sub_bits, format, sign_mode);
-    TORCH_CHECK(gs == kGroupSize, "NVQ routed FP16 requires gs24");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() &&
-                x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(gs == kGroupSize, "NVQ routed FP16 requires gs24");
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() &&
+                x.scalar_type() == mfq_tensor_backend::kFloat16 &&
                 (x.dim() == 2 || x.dim() == 3) &&
                 x.size(-1) == neuron_len,
                 "NVQ routed FP16 input shape mismatch");
@@ -5805,18 +5804,18 @@ torch::Tensor nvq_moe_grouped_matmul_pool_f16_cuda(
     const int blocks = static_cast<int>(std::min<int64_t>(
         static_cast<int64_t>(max_tiles) * ntiles_n, 4096));
     const dim3 threads(32, 8);
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const cudaStream_t stream = mfq_current_cuda_stream();
 #define NVQ_MOE_F16_LAUNCH()                                                     \
     nvq_moe_grouped_f16_kernel<F><<<blocks, threads, 0, stream>>>(               \
         indices.data_ptr<uint8_t>(), indices.numel(),                            \
         aux.data_ptr<uint8_t>(), aux.numel(),                                    \
         sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),                        \
         neuron_scale.data_ptr<float>(), codebook.data_ptr<int8_t>(),             \
-        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),                \
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),                \
         expert_local.data_ptr<int32_t>(), ids_dst.data_ptr<int32_t>(),           \
         expert_bounds.data_ptr<int32_t>(), tile_bounds.data_ptr<int32_t>(),      \
         tile_experts.data_ptr<int32_t>(),                                        \
-        reinterpret_cast<__half *>(out.data_ptr<at::Half>()),                    \
+        reinterpret_cast<__half *>(out.data_ptr<mfq_half>()),                    \
         routes, static_cast<int>(n_experts), static_cast<int>(pool_experts),     \
         static_cast<int>(out_per_expert), K, ng, nvec, nsign,                   \
         static_cast<int>(sub_bits), static_cast<int>(sign_mode),                 \
@@ -5826,22 +5825,22 @@ torch::Tensor nvq_moe_grouped_matmul_pool_f16_cuda(
         NVQ_MOE_F16_LAUNCH();
     });
 #undef NVQ_MOE_F16_LAUNCH
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 
-torch::Tensor nepq_moe_grouped_matmul_pool_f16_cuda(
-    torch::Tensor indices, torch::Tensor aux, torch::Tensor sub_scale,
-    torch::Tensor neuron_scale, torch::Tensor table_pool,
-    torch::Tensor bank_ids, torch::Tensor x, torch::Tensor expert_local,
+mfq_tensor_backend::Tensor nepq_moe_grouped_matmul_pool_f16_cuda(
+    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor table_pool,
+    mfq_tensor_backend::Tensor bank_ids, mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor expert_local,
     int64_t n_experts, int64_t pool_experts, int64_t out_per_expert,
     int64_t neuron_len, int64_t sub_bits, int64_t format,
-    torch::Tensor out, torch::Tensor ids_dst, torch::Tensor expert_bounds,
-    torch::Tensor tile_bounds, torch::Tensor tile_experts) {
+    mfq_tensor_backend::Tensor out, mfq_tensor_backend::Tensor ids_dst, mfq_tensor_backend::Tensor expert_bounds,
+    mfq_tensor_backend::Tensor tile_bounds, mfq_tensor_backend::Tensor tile_experts) {
     check_nepq_common(indices, aux, sub_scale, neuron_scale, table_pool,
                       bank_ids, neuron_len, sub_bits, format);
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() &&
-                x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() &&
+                x.scalar_type() == mfq_tensor_backend::kFloat16 &&
                 (x.dim() == 2 || x.dim() == 3) &&
                 x.size(-1) == neuron_len,
                 "NEPQ routed FP16 input shape mismatch");
@@ -5859,7 +5858,7 @@ torch::Tensor nepq_moe_grouped_matmul_pool_f16_cuda(
     const int blocks = static_cast<int>(std::min<int64_t>(
         static_cast<int64_t>(max_tiles) * ntiles_n, 4096));
     const dim3 threads(32, 8);
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const cudaStream_t stream = mfq_current_cuda_stream();
 #define NEPQ_MOE_F16_LAUNCH()                                                    \
     nepq_moe_grouped_f16_kernel<F><<<blocks, threads, 0, stream>>>(              \
         indices.data_ptr<uint8_t>(), indices.numel(),                            \
@@ -5867,11 +5866,11 @@ torch::Tensor nepq_moe_grouped_matmul_pool_f16_cuda(
         sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),                        \
         neuron_scale.data_ptr<float>(), table_pool.data_ptr<int8_t>(),           \
         bank_ids.data_ptr<uint8_t>(),                                            \
-        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),                \
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),                \
         expert_local.data_ptr<int32_t>(), ids_dst.data_ptr<int32_t>(),           \
         expert_bounds.data_ptr<int32_t>(), tile_bounds.data_ptr<int32_t>(),      \
         tile_experts.data_ptr<int32_t>(),                                        \
-        reinterpret_cast<__half *>(out.data_ptr<at::Half>()),                    \
+        reinterpret_cast<__half *>(out.data_ptr<mfq_half>()),                    \
         routes, static_cast<int>(n_experts), static_cast<int>(pool_experts),     \
         static_cast<int>(out_per_expert), K, ng, nvec, nsign, nsuper,           \
         table_stride, static_cast<int>(sub_bits), max_tiles, x.dim() == 3)
@@ -5880,19 +5879,19 @@ torch::Tensor nepq_moe_grouped_matmul_pool_f16_cuda(
         NEPQ_MOE_F16_LAUNCH();
     });
 #undef NEPQ_MOE_F16_LAUNCH
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 
-torch::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
-    torch::Tensor indices,
-    torch::Tensor aux,
-    torch::Tensor sub_scale,
-    torch::Tensor neuron_scale,
-    torch::Tensor codebook,
-    torch::Tensor x,
-    torch::Tensor ids,
-    torch::Tensor expert_local,
+mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor aux,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor codebook,
+    mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor ids,
+    mfq_tensor_backend::Tensor expert_local,
     int64_t n_experts,
     int64_t pool_experts,
     int64_t out_per_expert,
@@ -5902,34 +5901,34 @@ torch::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
     int64_t format,
     int64_t sign_mode,
     bool input_quantized,
-    torch::Tensor out,
-    torch::Tensor qx,
-    torch::Tensor xscale,
-    torch::Tensor ids_dst,
-    torch::Tensor expert_bounds,
-    torch::Tensor tile_bounds,
-    torch::Tensor tile_experts) {
+    mfq_tensor_backend::Tensor out,
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale,
+    mfq_tensor_backend::Tensor ids_dst,
+    mfq_tensor_backend::Tensor expert_bounds,
+    mfq_tensor_backend::Tensor tile_bounds,
+    mfq_tensor_backend::Tensor tile_experts) {
     check_common(
         indices, aux, sub_scale, neuron_scale, codebook,
         neuron_len, gs, sub_bits, format, sign_mode);
-    TORCH_CHECK(n_experts > 0 && n_experts <= 4096,
+    MFQ_RUNTIME_CHECK(n_experts > 0 && n_experts <= 4096,
                 "NVQ global expert count must be in [1,4096]");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         pool_experts > 0 &&
         pool_experts <= static_cast<int64_t>(std::numeric_limits<int>::max()),
         "NVQ pool storage expert count must fit int32");
-    TORCH_CHECK(out_per_expert > 0 &&
+    MFQ_RUNTIME_CHECK(out_per_expert > 0 &&
                 neuron_scale.numel() == pool_experts * out_per_expert,
                 "NVQ pool shape does not match the flattened row count");
-    TORCH_CHECK(expert_local.is_cuda() && expert_local.is_contiguous() &&
-                expert_local.scalar_type() == torch::kInt32 &&
+    MFQ_RUNTIME_CHECK(expert_local.is_cuda() && expert_local.is_contiguous() &&
+                expert_local.scalar_type() == mfq_tensor_backend::kInt32 &&
                 expert_local.dim() == 1 && expert_local.numel() >= n_experts,
                 "NVQ expert-local map must be CUDA contiguous int32");
-    TORCH_CHECK(ids.is_cuda() && ids.is_contiguous() &&
-                ids.scalar_type() == torch::kInt32 && ids.dim() == 2,
+    MFQ_RUNTIME_CHECK(ids.is_cuda() && ids.is_contiguous() &&
+                ids.scalar_type() == mfq_tensor_backend::kInt32 && ids.dim() == 2,
                 "NVQ route IDs must be CUDA contiguous int32 [T,R]");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() &&
-                x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() &&
+                x.scalar_type() == mfq_tensor_backend::kFloat16 &&
                 (x.dim() == 2 || x.dim() == 3) &&
                 (input_quantized || x.size(-1) == neuron_len),
                 "NVQ routed input must be CUDA contiguous fp16 [T,K] or [T,R,K]");
@@ -5937,12 +5936,12 @@ torch::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
     const int routes = static_cast<int>(ids.size(1));
     const int pairs = tokens * routes;
     const bool routed_input = x.dim() == 3;
-    TORCH_CHECK(tokens > 0 && routes > 0, "NVQ route dimensions must be nonzero");
-    TORCH_CHECK((!routed_input && x.size(0) == tokens) ||
+    MFQ_RUNTIME_CHECK(tokens > 0 && routes > 0, "NVQ route dimensions must be nonzero");
+    MFQ_RUNTIME_CHECK((!routed_input && x.size(0) == tokens) ||
                 (routed_input && x.size(0) == tokens && x.size(1) == routes),
                 "NVQ input leading dimensions do not match routes");
-    TORCH_CHECK(out.is_cuda() && out.is_contiguous() &&
-                out.scalar_type() == torch::kFloat16 && out.dim() == 3 &&
+    MFQ_RUNTIME_CHECK(out.is_cuda() && out.is_contiguous() &&
+                out.scalar_type() == mfq_tensor_backend::kFloat16 && out.dim() == 3 &&
                 out.size(0) == tokens && out.size(1) == routes &&
                 out.size(2) == out_per_expert,
                 "NVQ output must be CUDA contiguous fp16 [T,R,O]");
@@ -5951,21 +5950,21 @@ torch::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
     const int ng = (K + static_cast<int>(gs) - 1) / static_cast<int>(gs);
     const int K_pad = ng * static_cast<int>(gs);
     const int input_rows = routed_input ? pairs : tokens;
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() &&
-                qx.scalar_type() == torch::kInt8 && qx.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() &&
+                qx.scalar_type() == mfq_tensor_backend::kInt8 && qx.dim() == 2 &&
                 qx.size(0) >= input_rows && qx.size(1) >= K_pad,
                 "NVQ routed qx workspace mismatch");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() &&
-                xscale.scalar_type() == torch::kFloat32 && xscale.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() &&
+                xscale.scalar_type() == mfq_tensor_backend::kFloat32 && xscale.dim() == 2 &&
                 xscale.size(0) >= input_rows && xscale.size(1) >= ng,
                 "NVQ routed xscale workspace mismatch");
     const int nvec = (K + (is_d4_format(format) ? 3 : 7)) /
         (is_d4_format(format) ? 4 : 8);
     const int nsign = (K + 7) / 8;
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
     if (!input_quantized) {
         nvq_quantize_x_gs24_kernel<<<dim3(input_rows, ng), 32, 0, stream>>>(
-            reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), input_rows, K, ng);
     }
 
@@ -6009,7 +6008,7 @@ torch::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
             neuron_scale.data_ptr<float>(), codebook.data_ptr<int8_t>(),         \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),                     \
             ids.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(),           \
-            reinterpret_cast<__half *>(out.data_ptr<at::Half>()),                \
+            reinterpret_cast<__half *>(out.data_ptr<mfq_half>()),                \
             pairs, routes, static_cast<int>(n_experts),                          \
             static_cast<int>(pool_experts), static_cast<int>(out_per_expert),    \
             ng, nvec, nsign, static_cast<int>(sub_bits),                         \
@@ -6037,7 +6036,7 @@ torch::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
             neuron_scale.data_ptr<float>(), codebook.data_ptr<int8_t>(),         \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),                     \
             ids.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(),           \
-            reinterpret_cast<__half *>(out.data_ptr<at::Half>()),                \
+            reinterpret_cast<__half *>(out.data_ptr<mfq_half>()),                \
             pairs, routes, static_cast<int>(n_experts),                          \
             static_cast<int>(pool_experts), static_cast<int>(out_per_expert),    \
             ng, nvec, nsign, static_cast<int>(sub_bits),                         \
@@ -6092,20 +6091,20 @@ torch::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
 #undef NVQ_MOE_SELECTED_LAUNCH
 #undef NVQ_MOE_SMALL_LAUNCH
     } else {
-        TORCH_CHECK(ids_dst.is_cuda() && ids_dst.is_contiguous() &&
-                    ids_dst.scalar_type() == torch::kInt32 &&
+        MFQ_RUNTIME_CHECK(ids_dst.is_cuda() && ids_dst.is_contiguous() &&
+                    ids_dst.scalar_type() == mfq_tensor_backend::kInt32 &&
                     ids_dst.numel() >= pairs,
                     "NVQ compact route map is missing");
-        TORCH_CHECK(expert_bounds.is_cuda() && expert_bounds.is_contiguous() &&
-                    expert_bounds.scalar_type() == torch::kInt32 &&
+        MFQ_RUNTIME_CHECK(expert_bounds.is_cuda() && expert_bounds.is_contiguous() &&
+                    expert_bounds.scalar_type() == mfq_tensor_backend::kInt32 &&
                     expert_bounds.numel() >= n_experts + 1,
                     "NVQ expert bounds are missing");
-        TORCH_CHECK(tile_bounds.is_cuda() && tile_bounds.is_contiguous() &&
-                    tile_bounds.scalar_type() == torch::kInt32 &&
+        MFQ_RUNTIME_CHECK(tile_bounds.is_cuda() && tile_bounds.is_contiguous() &&
+                    tile_bounds.scalar_type() == mfq_tensor_backend::kInt32 &&
                     tile_bounds.numel() >= n_experts + 1,
                     "NVQ tile bounds are missing");
-        TORCH_CHECK(tile_experts.is_cuda() && tile_experts.is_contiguous() &&
-                    tile_experts.scalar_type() == torch::kInt32 &&
+        MFQ_RUNTIME_CHECK(tile_experts.is_cuda() && tile_experts.is_contiguous() &&
+                    tile_experts.scalar_type() == mfq_tensor_backend::kInt32 &&
                     tile_experts.numel() >= pairs,
                     "NVQ tile expert map is missing");
         constexpr int route_tile = 8;
@@ -6126,7 +6125,7 @@ torch::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
             expert_local.data_ptr<int32_t>(), ids_dst.data_ptr<int32_t>(),       \
             expert_bounds.data_ptr<int32_t>(), tile_bounds.data_ptr<int32_t>(),  \
             tile_experts.data_ptr<int32_t>(),                                    \
-            reinterpret_cast<__half *>(out.data_ptr<at::Half>()),                \
+            reinterpret_cast<__half *>(out.data_ptr<mfq_half>()),                \
             routes, static_cast<int>(n_experts),                                 \
             static_cast<int>(pool_experts), static_cast<int>(out_per_expert),    \
             ng, nvec, nsign, static_cast<int>(sub_bits),                         \
@@ -6137,22 +6136,22 @@ torch::Tensor nvq_moe_grouped_matmul_pool_ws_cuda(
         });
 #undef NVQ_MOE_GROUPED_LAUNCH
     }
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess,
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess,
                 "NVQ routed pool matmul kernel launch failed");
     return out;
 }
 
-torch::Tensor nepq_moe_grouped_matmul_pool_ws_cuda(
-    torch::Tensor indices,
-    torch::Tensor aux,
-    torch::Tensor sub_scale,
-    torch::Tensor neuron_scale,
-    torch::Tensor table_pool,
-    torch::Tensor bank_ids,
-    torch::Tensor grouped_table_pool,
-    torch::Tensor x,
-    torch::Tensor ids,
-    torch::Tensor expert_local,
+mfq_tensor_backend::Tensor nepq_moe_grouped_matmul_pool_ws_cuda(
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor aux,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor table_pool,
+    mfq_tensor_backend::Tensor bank_ids,
+    mfq_tensor_backend::Tensor grouped_table_pool,
+    mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor ids,
+    mfq_tensor_backend::Tensor expert_local,
     int64_t n_experts,
     int64_t pool_experts,
     int64_t out_per_expert,
@@ -6160,54 +6159,54 @@ torch::Tensor nepq_moe_grouped_matmul_pool_ws_cuda(
     int64_t sub_bits,
     int64_t format,
     bool input_quantized,
-    torch::Tensor out,
-    torch::Tensor qx,
-    torch::Tensor xscale,
-    torch::Tensor ids_dst,
-    torch::Tensor expert_bounds,
-    torch::Tensor tile_bounds,
-    torch::Tensor tile_experts) {
+    mfq_tensor_backend::Tensor out,
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale,
+    mfq_tensor_backend::Tensor ids_dst,
+    mfq_tensor_backend::Tensor expert_bounds,
+    mfq_tensor_backend::Tensor tile_bounds,
+    mfq_tensor_backend::Tensor tile_experts) {
     check_nepq_common(
         indices, aux, sub_scale, neuron_scale, table_pool, bank_ids,
         neuron_len, sub_bits, format);
     const int expected_grouped_stride = format == kNpq0S
         ? kNpq0STableBytes
         : static_cast<int>(table_pool.size(1));
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         grouped_table_pool.is_cuda() && grouped_table_pool.is_contiguous() &&
-        grouped_table_pool.scalar_type() == torch::kInt8 &&
+        grouped_table_pool.scalar_type() == mfq_tensor_backend::kInt8 &&
         grouped_table_pool.dim() == 2 &&
         grouped_table_pool.size(0) == table_pool.size(0) &&
         grouped_table_pool.size(1) == expected_grouped_stride,
         "NEPQ grouped table pool shape mismatch");
-    TORCH_CHECK(n_experts > 0 && n_experts <= 4096,
+    MFQ_RUNTIME_CHECK(n_experts > 0 && n_experts <= 4096,
                 "NEPQ global expert count must be in [1,4096]");
-    TORCH_CHECK(pool_experts > 0 &&
+    MFQ_RUNTIME_CHECK(pool_experts > 0 &&
                 pool_experts <= static_cast<int64_t>(std::numeric_limits<int>::max()) &&
                 out_per_expert > 0 &&
                 neuron_scale.numel() == pool_experts * out_per_expert,
                 "NEPQ pool shape does not match the flattened row count");
-    TORCH_CHECK(expert_local.is_cuda() && expert_local.is_contiguous() &&
-                expert_local.scalar_type() == torch::kInt32 &&
+    MFQ_RUNTIME_CHECK(expert_local.is_cuda() && expert_local.is_contiguous() &&
+                expert_local.scalar_type() == mfq_tensor_backend::kInt32 &&
                 expert_local.dim() == 1 && expert_local.numel() >= n_experts,
                 "NEPQ expert-local map must be CUDA contiguous int32");
-    TORCH_CHECK(ids.is_cuda() && ids.is_contiguous() &&
-                ids.scalar_type() == torch::kInt32 && ids.dim() == 2,
+    MFQ_RUNTIME_CHECK(ids.is_cuda() && ids.is_contiguous() &&
+                ids.scalar_type() == mfq_tensor_backend::kInt32 && ids.dim() == 2,
                 "NEPQ route IDs must be CUDA contiguous int32 [T,R]");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() &&
-                x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() &&
+                x.scalar_type() == mfq_tensor_backend::kFloat16 &&
                 (x.dim() == 2 || x.dim() == 3) && x.size(-1) == neuron_len,
                 "NEPQ routed input must be CUDA contiguous fp16 [T,K] or [T,R,K]");
     const int tokens = static_cast<int>(ids.size(0));
     const int routes = static_cast<int>(ids.size(1));
     const int pairs = tokens * routes;
     const bool routed_input = x.dim() == 3;
-    TORCH_CHECK(tokens > 0 && routes > 0, "NEPQ route dimensions must be nonzero");
-    TORCH_CHECK((!routed_input && x.size(0) == tokens) ||
+    MFQ_RUNTIME_CHECK(tokens > 0 && routes > 0, "NEPQ route dimensions must be nonzero");
+    MFQ_RUNTIME_CHECK((!routed_input && x.size(0) == tokens) ||
                 (routed_input && x.size(0) == tokens && x.size(1) == routes),
                 "NEPQ input leading dimensions do not match routes");
-    TORCH_CHECK(out.is_cuda() && out.is_contiguous() &&
-                out.scalar_type() == torch::kFloat16 && out.dim() == 3 &&
+    MFQ_RUNTIME_CHECK(out.is_cuda() && out.is_contiguous() &&
+                out.scalar_type() == mfq_tensor_backend::kFloat16 && out.dim() == 3 &&
                 out.size(0) == tokens && out.size(1) == routes &&
                 out.size(2) == out_per_expert,
                 "NEPQ output must be CUDA contiguous fp16 [T,R,O]");
@@ -6216,12 +6215,12 @@ torch::Tensor nepq_moe_grouped_matmul_pool_ws_cuda(
     const int ng = (K + kGroupSize - 1) / kGroupSize;
     const int K_pad = ng * kGroupSize;
     const int input_rows = routed_input ? pairs : tokens;
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() &&
-                qx.scalar_type() == torch::kInt8 && qx.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() &&
+                qx.scalar_type() == mfq_tensor_backend::kInt8 && qx.dim() == 2 &&
                 qx.size(0) >= input_rows && qx.size(1) >= K_pad,
                 "NEPQ routed qx workspace mismatch");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() &&
-                xscale.scalar_type() == torch::kFloat32 && xscale.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() &&
+                xscale.scalar_type() == mfq_tensor_backend::kFloat32 && xscale.dim() == 2 &&
                 xscale.size(0) >= input_rows && xscale.size(1) >= ng,
                 "NEPQ routed xscale workspace mismatch");
     const int nvec = K / 8;
@@ -6231,10 +6230,10 @@ torch::Tensor nepq_moe_grouped_matmul_pool_ws_cuda(
     const int table_stride = static_cast<int>(table_pool.size(1));
     const int grouped_table_stride =
         static_cast<int>(grouped_table_pool.size(1));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
     if (!input_quantized) {
         nvq_quantize_x_gs24_kernel<<<dim3(input_rows, ng), 32, 0, stream>>>(
-            reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), input_rows, K, ng);
     }
 
@@ -6253,7 +6252,7 @@ torch::Tensor nepq_moe_grouped_matmul_pool_ws_cuda(
             bank_ids.data_ptr<uint8_t>(), qx.data_ptr<int8_t>(),                 \
             xscale.data_ptr<float>(), ids.data_ptr<int32_t>(),                   \
             expert_local.data_ptr<int32_t>(),                                    \
-            reinterpret_cast<__half *>(out.data_ptr<at::Half>()),                \
+            reinterpret_cast<__half *>(out.data_ptr<mfq_half>()),                \
             pairs, routes, static_cast<int>(n_experts),                          \
             static_cast<int>(pool_experts), static_cast<int>(out_per_expert),    \
             ng, nvec, nsign, nsuper, table_stride,                               \
@@ -6265,20 +6264,20 @@ torch::Tensor nepq_moe_grouped_matmul_pool_ws_cuda(
         });
 #undef NEPQ_MOE_POOL_SMALL_LAUNCH
     } else {
-        TORCH_CHECK(ids_dst.is_cuda() && ids_dst.is_contiguous() &&
-                    ids_dst.scalar_type() == torch::kInt32 &&
+        MFQ_RUNTIME_CHECK(ids_dst.is_cuda() && ids_dst.is_contiguous() &&
+                    ids_dst.scalar_type() == mfq_tensor_backend::kInt32 &&
                     ids_dst.numel() >= pairs,
                     "NEPQ compact route map is missing");
-        TORCH_CHECK(expert_bounds.is_cuda() && expert_bounds.is_contiguous() &&
-                    expert_bounds.scalar_type() == torch::kInt32 &&
+        MFQ_RUNTIME_CHECK(expert_bounds.is_cuda() && expert_bounds.is_contiguous() &&
+                    expert_bounds.scalar_type() == mfq_tensor_backend::kInt32 &&
                     expert_bounds.numel() >= n_experts + 1,
                     "NEPQ expert bounds are missing");
-        TORCH_CHECK(tile_bounds.is_cuda() && tile_bounds.is_contiguous() &&
-                    tile_bounds.scalar_type() == torch::kInt32 &&
+        MFQ_RUNTIME_CHECK(tile_bounds.is_cuda() && tile_bounds.is_contiguous() &&
+                    tile_bounds.scalar_type() == mfq_tensor_backend::kInt32 &&
                     tile_bounds.numel() >= n_experts + 1,
                     "NEPQ tile bounds are missing");
-        TORCH_CHECK(tile_experts.is_cuda() && tile_experts.is_contiguous() &&
-                    tile_experts.scalar_type() == torch::kInt32 &&
+        MFQ_RUNTIME_CHECK(tile_experts.is_cuda() && tile_experts.is_contiguous() &&
+                    tile_experts.scalar_type() == mfq_tensor_backend::kInt32 &&
                     tile_experts.numel() >= pairs,
                     "NEPQ tile expert map is missing");
         constexpr int route_tile = 8;
@@ -6299,7 +6298,7 @@ torch::Tensor nepq_moe_grouped_matmul_pool_ws_cuda(
             xscale.data_ptr<float>(), expert_local.data_ptr<int32_t>(),          \
             ids_dst.data_ptr<int32_t>(), expert_bounds.data_ptr<int32_t>(),      \
             tile_bounds.data_ptr<int32_t>(), tile_experts.data_ptr<int32_t>(),   \
-            reinterpret_cast<__half *>(out.data_ptr<at::Half>()),                \
+            reinterpret_cast<__half *>(out.data_ptr<mfq_half>()),                \
             routes, static_cast<int>(n_experts),                                 \
             static_cast<int>(pool_experts), static_cast<int>(out_per_expert),    \
             ng, nvec, nsign, nsuper, grouped_table_stride,                       \
@@ -6310,17 +6309,17 @@ torch::Tensor nepq_moe_grouped_matmul_pool_ws_cuda(
         });
 #undef NEPQ_MOE_POOL_GROUPED_LAUNCH
     }
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess,
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess,
                 "NEPQ routed pool matmul kernel launch failed");
     return out;
 }
 
-torch::Tensor nvq_dequant_cuda(
-    torch::Tensor indices,
-    torch::Tensor aux,
-    torch::Tensor sub_scale,
-    torch::Tensor neuron_scale,
-    torch::Tensor codebook,
+mfq_tensor_backend::Tensor nvq_dequant_cuda(
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor aux,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor codebook,
     int64_t neuron_len,
     int64_t gs,
     int64_t sub_bits,
@@ -6334,11 +6333,11 @@ torch::Tensor nvq_dequant_cuda(
     const int nvec = (K + (is_d4_format(format) ? 3 : 7)) /
                      (is_d4_format(format) ? 4 : 8);
     const int nsign = (K + 7) / 8;
-    auto output = torch::empty({N, K}, neuron_scale.options().dtype(torch::kFloat16));
+    auto output = mfq_tensor_backend::empty({N, K}, neuron_scale.options().dtype(mfq_tensor_backend::kFloat16));
     const int64_t total = static_cast<int64_t>(N) * nsign;
     const int block = 256;
     const int grid = static_cast<int>(std::min<int64_t>((total + block - 1) / block, 65535));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
     launch_by_format(static_cast<int>(format), [&](auto tag) {
         constexpr int F = decltype(tag)::value;
         nvq_dequant_kernel<F><<<grid, block, 0, stream>>>(
@@ -6346,20 +6345,20 @@ torch::Tensor nvq_dequant_cuda(
             aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),
             neuron_scale.data_ptr<float>(), codebook.data_ptr<int8_t>(),
-            reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
             N, K, ng, nvec, nsign, static_cast<int>(sub_bits), static_cast<int>(sign_mode));
     });
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NVQ dequant kernel launch failed");
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NVQ dequant kernel launch failed");
     return output;
 }
 
-torch::Tensor nvq_gemm_f16_cuda(
-    torch::Tensor indices,
-    torch::Tensor aux,
-    torch::Tensor sub_scale,
-    torch::Tensor neuron_scale,
-    torch::Tensor codebook,
-    torch::Tensor x,
+mfq_tensor_backend::Tensor nvq_gemm_f16_cuda(
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor aux,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor codebook,
+    mfq_tensor_backend::Tensor x,
     int64_t neuron_len,
     int64_t gs,
     int64_t sub_bits,
@@ -6367,20 +6366,20 @@ torch::Tensor nvq_gemm_f16_cuda(
     int64_t sign_mode) {
     check_common(indices, aux, sub_scale, neuron_scale, codebook,
                  neuron_len, gs, sub_bits, format, sign_mode);
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
                 x.is_contiguous() && x.dim() == 2,
                 "NVQ FP16 GEMM x must be CUDA contiguous fp16 rank-2");
     const int M = static_cast<int>(x.size(0));
     const int K = static_cast<int>(neuron_len);
     const int N = static_cast<int>(neuron_scale.numel());
     const int ng = (K + static_cast<int>(gs) - 1) / static_cast<int>(gs);
-    TORCH_CHECK(M >= 16, "NVQ FP16 GEMM requires M >= 16");
-    TORCH_CHECK(x.size(1) == K, "NVQ FP16 GEMM x width must equal neuron_len");
+    MFQ_RUNTIME_CHECK(M >= 16, "NVQ FP16 GEMM requires M >= 16");
+    MFQ_RUNTIME_CHECK(x.size(1) == K, "NVQ FP16 GEMM x width must equal neuron_len");
     const int nvec = (K + (is_d4_format(format) ? 3 : 7)) /
                      (is_d4_format(format) ? 4 : 8);
     const int nsign = (K + 7) / 8;
-    auto output = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto output = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     const dim3 block(32, 8);
 
 #define NVQ_F16_GEMM_LAUNCH(MTILES_VALUE, NEED_CHECK_VALUE)                       \
@@ -6392,8 +6391,8 @@ torch::Tensor nvq_gemm_f16_cuda(
         aux.data_ptr<uint8_t>(), aux.numel(),                                     \
         sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),                         \
         neuron_scale.data_ptr<float>(), codebook.data_ptr<int8_t>(),              \
-        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),                 \
-        reinterpret_cast<__half *>(output.data_ptr<at::Half>()),                  \
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),                 \
+        reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),                  \
         M, N, K, ng, nvec, nsign, static_cast<int>(sub_bits),                     \
         static_cast<int>(sign_mode))
 
@@ -6426,47 +6425,47 @@ torch::Tensor nvq_gemm_f16_cuda(
         }
     });
 #undef NVQ_F16_GEMM_LAUNCH
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NVQ FP16 GEMM kernel launch failed");
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NVQ FP16 GEMM kernel launch failed");
     return output;
 }
 
-torch::Tensor nvq_gemv_m1_vec8_ws_cuda(
-    torch::Tensor indices,
-    torch::Tensor aux,
-    torch::Tensor sub_scale,
-    torch::Tensor neuron_scale,
-    torch::Tensor codebook,
-    torch::Tensor x,
+mfq_tensor_backend::Tensor nvq_gemv_m1_vec8_ws_cuda(
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor aux,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor codebook,
+    mfq_tensor_backend::Tensor x,
     int64_t neuron_len,
     int64_t gs,
     int64_t sub_bits,
     int64_t format,
     int64_t sign_mode,
     int64_t nwarps,
-    torch::Tensor qx,
-    torch::Tensor xscale) {
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale) {
     check_common(indices, aux, sub_scale, neuron_scale, codebook,
                  neuron_len, gs, sub_bits, format, sign_mode);
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 && x.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 && x.is_contiguous() &&
                 x.dim() == 2 && x.size(0) == 1, "NVQ vec8 GEMV x must be CUDA contiguous fp16 [1,K]");
-    TORCH_CHECK(nwarps == 1 || nwarps == 2 || nwarps == 4 || nwarps == 8,
+    MFQ_RUNTIME_CHECK(nwarps == 1 || nwarps == 2 || nwarps == 4 || nwarps == 8,
                 "NVQ vec8 GEMV nwarps must be 1, 2, 4, or 8");
     const int K = static_cast<int>(neuron_len);
     const int N = static_cast<int>(neuron_scale.numel());
     const int ng = (K + static_cast<int>(gs) - 1) / static_cast<int>(gs);
     const int K_pad = ng * static_cast<int>(gs);
-    TORCH_CHECK(x.size(1) == K, "NVQ vec8 GEMV x width must equal neuron_len");
-    TORCH_CHECK(qx.is_cuda() && qx.scalar_type() == torch::kInt8 && qx.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(x.size(1) == K, "NVQ vec8 GEMV x width must equal neuron_len");
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.scalar_type() == mfq_tensor_backend::kInt8 && qx.is_contiguous() &&
                 qx.numel() >= K_pad, "NVQ vec8 GEMV qx workspace mismatch");
-    TORCH_CHECK(xscale.is_cuda() && xscale.scalar_type() == torch::kFloat32 && xscale.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.scalar_type() == mfq_tensor_backend::kFloat32 && xscale.is_contiguous() &&
                 xscale.numel() >= ng, "NVQ vec8 GEMV xscale workspace mismatch");
     const int nvec = (K + (is_d4_format(format) ? 3 : 7)) /
                      (is_d4_format(format) ? 4 : 8);
     const int nsign = (K + 7) / 8;
-    auto output = torch::empty({1, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto output = mfq_tensor_backend::empty({1, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     nvq_quantize_x_gs24_kernel<<<dim3(1, ng), 32, 0, stream>>>(
-        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()), qx.data_ptr<int8_t>(),
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), qx.data_ptr<int8_t>(),
         xscale.data_ptr<float>(), 1, K, ng);
     switch (static_cast<int>(nwarps)) {
         case 1:
@@ -6486,49 +6485,49 @@ torch::Tensor nvq_gemv_m1_vec8_ws_cuda(
                                         qx, xscale, output, N, ng, nvec, nsign, sub_bits, sign_mode, stream);
             break;
     }
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NVQ vec8 GEMV kernel launch failed");
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NVQ vec8 GEMV kernel launch failed");
     return output;
 }
 
-torch::Tensor nvq_gemv_batch_vec8_ws_cuda(
-    torch::Tensor indices,
-    torch::Tensor aux,
-    torch::Tensor sub_scale,
-    torch::Tensor neuron_scale,
-    torch::Tensor codebook,
-    torch::Tensor x,
+mfq_tensor_backend::Tensor nvq_gemv_batch_vec8_ws_cuda(
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor aux,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor codebook,
+    mfq_tensor_backend::Tensor x,
     int64_t neuron_len,
     int64_t gs,
     int64_t sub_bits,
     int64_t format,
     int64_t sign_mode,
     int64_t nwarps,
-    torch::Tensor qx,
-    torch::Tensor xscale) {
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale) {
     check_common(indices, aux, sub_scale, neuron_scale, codebook,
                  neuron_len, gs, sub_bits, format, sign_mode);
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 && x.is_contiguous() && x.dim() == 2,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 && x.is_contiguous() && x.dim() == 2,
                 "NVQ batch vec8 GEMV x must be CUDA contiguous fp16 rank-2");
-    TORCH_CHECK(nwarps == 2 || nwarps == 4 || nwarps == 8,
+    MFQ_RUNTIME_CHECK(nwarps == 2 || nwarps == 4 || nwarps == 8,
                 "NVQ batch vec8 GEMV nwarps must be 2, 4, or 8");
     const int M = static_cast<int>(x.size(0));
     const int K = static_cast<int>(neuron_len);
     const int N = static_cast<int>(neuron_scale.numel());
     const int ng = (K + static_cast<int>(gs) - 1) / static_cast<int>(gs);
     const int K_pad = ng * static_cast<int>(gs);
-    TORCH_CHECK(M >= 2 && M <= 16, "NVQ batch vec8 GEMV supports M in [2,16]");
-    TORCH_CHECK(x.size(1) == K, "NVQ batch vec8 GEMV x width must equal neuron_len");
-    TORCH_CHECK(qx.is_cuda() && qx.scalar_type() == torch::kInt8 && qx.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(M >= 2 && M <= 16, "NVQ batch vec8 GEMV supports M in [2,16]");
+    MFQ_RUNTIME_CHECK(x.size(1) == K, "NVQ batch vec8 GEMV x width must equal neuron_len");
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.scalar_type() == mfq_tensor_backend::kInt8 && qx.is_contiguous() &&
                 qx.numel() >= static_cast<int64_t>(M) * K_pad, "NVQ batch vec8 GEMV qx workspace mismatch");
-    TORCH_CHECK(xscale.is_cuda() && xscale.scalar_type() == torch::kFloat32 && xscale.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.scalar_type() == mfq_tensor_backend::kFloat32 && xscale.is_contiguous() &&
                 xscale.numel() >= static_cast<int64_t>(M) * ng, "NVQ batch vec8 GEMV xscale workspace mismatch");
     const int nvec = (K + (is_d4_format(format) ? 3 : 7)) /
                      (is_d4_format(format) ? 4 : 8);
     const int nsign = (K + 7) / 8;
-    auto output = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto output = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     nvq_quantize_x_gs24_kernel<<<dim3(M, ng), 32, 0, stream>>>(
-        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()), qx.data_ptr<int8_t>(),
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), qx.data_ptr<int8_t>(),
         xscale.data_ptr<float>(), M, K, ng);
 #define NVQ_LAUNCH_BATCH_VEC8(NW)                                                       \
     do {                                                                                \
@@ -6560,97 +6559,97 @@ torch::Tensor nvq_gemv_batch_vec8_ws_cuda(
         case 8: NVQ_LAUNCH_BATCH_VEC8(8); break;
     }
 #undef NVQ_LAUNCH_BATCH_VEC8
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NVQ batch vec8 GEMV kernel launch failed");
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NVQ batch vec8 GEMV kernel launch failed");
     return output;
 }
 
-torch::Tensor nvq_gemv_ws_cuda(
-    torch::Tensor indices,
-    torch::Tensor aux,
-    torch::Tensor sub_scale,
-    torch::Tensor neuron_scale,
-    torch::Tensor codebook,
-    torch::Tensor x,
+mfq_tensor_backend::Tensor nvq_gemv_ws_cuda(
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor aux,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor codebook,
+    mfq_tensor_backend::Tensor x,
     int64_t neuron_len,
     int64_t gs,
     int64_t sub_bits,
     int64_t format,
     int64_t sign_mode,
-    torch::Tensor qx,
-    torch::Tensor xscale) {
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale) {
     check_common(indices, aux, sub_scale, neuron_scale, codebook,
                  neuron_len, gs, sub_bits, format, sign_mode);
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 && x.is_contiguous() && x.dim() == 2,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 && x.is_contiguous() && x.dim() == 2,
                 "NVQ x must be CUDA contiguous fp16 rank-2");
     const int M = static_cast<int>(x.size(0));
     const int K = static_cast<int>(neuron_len);
     const int N = static_cast<int>(neuron_scale.numel());
     const int ng = (K + static_cast<int>(gs) - 1) / static_cast<int>(gs);
     const int K_pad = ng * static_cast<int>(gs);
-    TORCH_CHECK(x.size(1) == K, "NVQ x width must equal neuron_len");
-    TORCH_CHECK(M >= 1 && M <= 16, "NVQ direct GEMV supports M in [1,16]");
-    TORCH_CHECK(qx.is_cuda() && qx.scalar_type() == torch::kInt8 && qx.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(x.size(1) == K, "NVQ x width must equal neuron_len");
+    MFQ_RUNTIME_CHECK(M >= 1 && M <= 16, "NVQ direct GEMV supports M in [1,16]");
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.scalar_type() == mfq_tensor_backend::kInt8 && qx.is_contiguous() &&
                 qx.numel() >= static_cast<int64_t>(M) * K_pad, "NVQ qx workspace mismatch");
-    TORCH_CHECK(xscale.is_cuda() && xscale.scalar_type() == torch::kFloat32 && xscale.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.scalar_type() == mfq_tensor_backend::kFloat32 && xscale.is_contiguous() &&
                 xscale.numel() >= static_cast<int64_t>(M) * ng, "NVQ xscale workspace mismatch");
     const int nvec = (K + (is_d4_format(format) ? 3 : 7)) /
                      (is_d4_format(format) ? 4 : 8);
     const int nsign = (K + 7) / 8;
-    auto output = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto output = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     nvq_quantize_x_gs24_kernel<<<dim3(M, ng), 32, 0, stream>>>(
-        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()), qx.data_ptr<int8_t>(),
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), qx.data_ptr<int8_t>(),
         xscale.data_ptr<float>(), M, K, ng);
     if (M == 1) {
         launch_selected_m1_vec8(
             static_cast<int>(format), indices, aux, sub_scale, neuron_scale, codebook,
             qx, xscale, output, N, ng, nvec, nsign,
             static_cast<int>(sub_bits), static_cast<int>(sign_mode), stream);
-        TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NVQ vec8 GEMV kernel launch failed");
+        MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NVQ vec8 GEMV kernel launch failed");
         return output;
     }
     launch_selected_batch_vec8(
         static_cast<int>(format), indices, aux, sub_scale, neuron_scale, codebook,
         qx, xscale, output, M, N, ng, nvec, nsign,
         static_cast<int>(sub_bits), static_cast<int>(sign_mode), stream);
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NVQ batch vec8 GEMV kernel launch failed");
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NVQ batch vec8 GEMV kernel launch failed");
     return output;
 }
 
-torch::Tensor nvq_gemv_qx_ws_cuda(
-    torch::Tensor indices,
-    torch::Tensor aux,
-    torch::Tensor sub_scale,
-    torch::Tensor neuron_scale,
-    torch::Tensor codebook,
+mfq_tensor_backend::Tensor nvq_gemv_qx_ws_cuda(
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor aux,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor codebook,
     int64_t neuron_len,
     int64_t gs,
     int64_t sub_bits,
     int64_t format,
     int64_t sign_mode,
-    torch::Tensor qx,
-    torch::Tensor xscale) {
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale) {
     check_common(indices, aux, sub_scale, neuron_scale, codebook,
                  neuron_len, gs, sub_bits, format, sign_mode);
-    TORCH_CHECK(qx.is_cuda() && qx.scalar_type() == torch::kInt8 && qx.is_contiguous() && qx.dim() == 2,
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.scalar_type() == mfq_tensor_backend::kInt8 && qx.is_contiguous() && qx.dim() == 2,
                 "NVQ prequantized qx must be CUDA contiguous int8 rank-2");
-    TORCH_CHECK(xscale.is_cuda() && xscale.scalar_type() == torch::kFloat32 && xscale.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.scalar_type() == mfq_tensor_backend::kFloat32 && xscale.is_contiguous() &&
                 xscale.dim() == 2, "NVQ prequantized xscale must be CUDA contiguous fp32 rank-2");
     const int M = static_cast<int>(qx.size(0));
     const int K = static_cast<int>(neuron_len);
     const int N = static_cast<int>(neuron_scale.numel());
     const int ng = (K + static_cast<int>(gs) - 1) / static_cast<int>(gs);
     const int K_pad = ng * static_cast<int>(gs);
-    TORCH_CHECK(M >= 1 && M <= 16, "NVQ prequantized GEMV supports M in [1,16]");
-    TORCH_CHECK(qx.size(1) >= K_pad, "NVQ prequantized qx width mismatch");
-    TORCH_CHECK(xscale.size(0) >= M && xscale.size(1) >= ng,
+    MFQ_RUNTIME_CHECK(M >= 1 && M <= 16, "NVQ prequantized GEMV supports M in [1,16]");
+    MFQ_RUNTIME_CHECK(qx.size(1) >= K_pad, "NVQ prequantized qx width mismatch");
+    MFQ_RUNTIME_CHECK(xscale.size(0) >= M && xscale.size(1) >= ng,
                 "NVQ prequantized xscale shape mismatch");
     const int nvec = (K + (is_d4_format(format) ? 3 : 7)) /
                      (is_d4_format(format) ? 4 : 8);
     const int nsign = (K + 7) / 8;
-    auto output = torch::empty(
-        {M, N}, neuron_scale.options().dtype(torch::kFloat16));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto output = mfq_tensor_backend::empty(
+        {M, N}, neuron_scale.options().dtype(mfq_tensor_backend::kFloat16));
+    cudaStream_t stream = mfq_current_cuda_stream();
     if (M == 1) {
         launch_selected_m1_vec8(
             static_cast<int>(format), indices, aux, sub_scale, neuron_scale, codebook,
@@ -6662,45 +6661,45 @@ torch::Tensor nvq_gemv_qx_ws_cuda(
             qx, xscale, output, M, N, ng, nvec, nsign,
             static_cast<int>(sub_bits), static_cast<int>(sign_mode), stream);
     }
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NVQ prequantized GEMV kernel launch failed");
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NVQ prequantized GEMV kernel launch failed");
     return output;
 }
 
-torch::Tensor nvq_gemv_qx_residual_ws_cuda(
-    torch::Tensor indices,
-    torch::Tensor aux,
-    torch::Tensor sub_scale,
-    torch::Tensor neuron_scale,
-    torch::Tensor codebook,
+mfq_tensor_backend::Tensor nvq_gemv_qx_residual_ws_cuda(
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor aux,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor codebook,
     int64_t neuron_len,
     int64_t gs,
     int64_t sub_bits,
     int64_t format,
     int64_t sign_mode,
-    torch::Tensor qx,
-    torch::Tensor xscale,
-    torch::Tensor residual) {
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale,
+    mfq_tensor_backend::Tensor residual) {
     check_common(indices, aux, sub_scale, neuron_scale, codebook,
                  neuron_len, gs, sub_bits, format, sign_mode);
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         format == kNvq2JscXLGroupExec || format == kNvq3JscLGroupExec,
         "NVQ fused residual requires an aligned group execution format");
-    TORCH_CHECK(
-        qx.is_cuda() && qx.scalar_type() == torch::kInt8 &&
+    MFQ_RUNTIME_CHECK(
+        qx.is_cuda() && qx.scalar_type() == mfq_tensor_backend::kInt8 &&
         qx.is_contiguous() && qx.dim() == 2 && qx.size(0) == 1,
         "NVQ fused residual qx must be CUDA contiguous int8 [1,K]");
-    TORCH_CHECK(
-        xscale.is_cuda() && xscale.scalar_type() == torch::kFloat32 &&
+    MFQ_RUNTIME_CHECK(
+        xscale.is_cuda() && xscale.scalar_type() == mfq_tensor_backend::kFloat32 &&
         xscale.is_contiguous() && xscale.dim() == 2 && xscale.size(0) >= 1,
         "NVQ fused residual xscale must be CUDA contiguous fp32 [1,ng]");
     const int K = static_cast<int>(neuron_len);
     const int N = static_cast<int>(neuron_scale.numel());
     const int ng = (K + static_cast<int>(gs) - 1) / static_cast<int>(gs);
     const int K_pad = ng * static_cast<int>(gs);
-    TORCH_CHECK(qx.size(1) >= K_pad, "NVQ fused residual qx width mismatch");
-    TORCH_CHECK(xscale.size(1) >= ng, "NVQ fused residual xscale width mismatch");
-    TORCH_CHECK(
-        residual.is_cuda() && residual.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(qx.size(1) >= K_pad, "NVQ fused residual qx width mismatch");
+    MFQ_RUNTIME_CHECK(xscale.size(1) >= ng, "NVQ fused residual xscale width mismatch");
+    MFQ_RUNTIME_CHECK(
+        residual.is_cuda() && residual.scalar_type() == mfq_tensor_backend::kFloat16 &&
         residual.is_contiguous() && residual.dim() == 2 &&
         residual.size(0) == 1 && residual.size(1) == N,
         "NVQ fused residual must be CUDA contiguous fp16 [1,N]");
@@ -6709,12 +6708,12 @@ torch::Tensor nvq_gemv_qx_residual_ws_cuda(
         indices, aux, sub_scale, neuron_scale, codebook,
         K, static_cast<int>(gs), static_cast<int>(sub_bits),
         static_cast<int>(format), static_cast<int>(sign_mode));
-    auto output = torch::empty_like(residual);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto output = mfq_tensor_backend::empty_like(residual);
+    cudaStream_t stream = mfq_current_cuda_stream();
     const auto * residual_ptr = reinterpret_cast<const __half *>(
-        residual.data_ptr<at::Half>());
+        residual.data_ptr<mfq_half>());
     auto * output_ptr = reinterpret_cast<__half *>(
-        output.data_ptr<at::Half>());
+        output.data_ptr<mfq_half>());
     if (format == kNvq2JscXLGroupExec) {
         launch_aligned_group_m1<kNvq2JscXLGroupExec, true>(
             weight, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
@@ -6724,24 +6723,24 @@ torch::Tensor nvq_gemv_qx_residual_ws_cuda(
             weight, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
             output_ptr, stream, residual_ptr);
     }
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         cudaGetLastError() == cudaSuccess,
         "NVQ fused residual GEMV kernel launch failed");
     return output;
 }
 
-torch::Tensor nvq_gemv_multi2_ws_cuda(
-    torch::Tensor first_indices,
-    torch::Tensor first_aux,
-    torch::Tensor first_sub_scale,
-    torch::Tensor first_neuron_scale,
-    torch::Tensor first_codebook,
-    torch::Tensor second_indices,
-    torch::Tensor second_aux,
-    torch::Tensor second_sub_scale,
-    torch::Tensor second_neuron_scale,
-    torch::Tensor second_codebook,
-    torch::Tensor x,
+mfq_tensor_backend::Tensor nvq_gemv_multi2_ws_cuda(
+    mfq_tensor_backend::Tensor first_indices,
+    mfq_tensor_backend::Tensor first_aux,
+    mfq_tensor_backend::Tensor first_sub_scale,
+    mfq_tensor_backend::Tensor first_neuron_scale,
+    mfq_tensor_backend::Tensor first_codebook,
+    mfq_tensor_backend::Tensor second_indices,
+    mfq_tensor_backend::Tensor second_aux,
+    mfq_tensor_backend::Tensor second_sub_scale,
+    mfq_tensor_backend::Tensor second_neuron_scale,
+    mfq_tensor_backend::Tensor second_codebook,
+    mfq_tensor_backend::Tensor x,
     int64_t neuron_len,
     int64_t gs,
     int64_t first_sub_bits,
@@ -6750,26 +6749,26 @@ torch::Tensor nvq_gemv_multi2_ws_cuda(
     int64_t second_sub_bits,
     int64_t second_format,
     int64_t second_sign_mode,
-    torch::Tensor qx,
-    torch::Tensor xscale) {
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale) {
     check_common(first_indices, first_aux, first_sub_scale, first_neuron_scale, first_codebook,
                  neuron_len, gs, first_sub_bits, first_format, first_sign_mode);
     check_common(second_indices, second_aux, second_sub_scale, second_neuron_scale, second_codebook,
                  neuron_len, gs, second_sub_bits, second_format, second_sign_mode);
-    TORCH_CHECK(first_format == second_format,
+    MFQ_RUNTIME_CHECK(first_format == second_format,
                 "NVQ multi-projection requires the same NVQ format");
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 && x.is_contiguous() && x.dim() == 2,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 && x.is_contiguous() && x.dim() == 2,
                 "NVQ multi-projection x must be CUDA contiguous fp16 rank-2");
     const int M = static_cast<int>(x.size(0));
     const int K = static_cast<int>(neuron_len);
     const int ng = (K + static_cast<int>(gs) - 1) / static_cast<int>(gs);
     const int K_pad = ng * static_cast<int>(gs);
-    TORCH_CHECK(M >= 1 && M <= 8, "NVQ multi-projection supports M in [1,8]");
-    TORCH_CHECK(x.size(1) == K, "NVQ multi-projection x width mismatch");
-    TORCH_CHECK(qx.is_cuda() && qx.scalar_type() == torch::kInt8 && qx.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(M >= 1 && M <= 8, "NVQ multi-projection supports M in [1,8]");
+    MFQ_RUNTIME_CHECK(x.size(1) == K, "NVQ multi-projection x width mismatch");
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.scalar_type() == mfq_tensor_backend::kInt8 && qx.is_contiguous() &&
                 qx.numel() >= static_cast<int64_t>(M) * K_pad,
                 "NVQ multi-projection qx workspace mismatch");
-    TORCH_CHECK(xscale.is_cuda() && xscale.scalar_type() == torch::kFloat32 && xscale.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.scalar_type() == mfq_tensor_backend::kFloat32 && xscale.is_contiguous() &&
                 xscale.numel() >= static_cast<int64_t>(M) * ng,
                 "NVQ multi-projection xscale workspace mismatch");
     const auto first = make_device_weight(
@@ -6780,30 +6779,30 @@ torch::Tensor nvq_gemv_multi2_ws_cuda(
         second_indices, second_aux, second_sub_scale, second_neuron_scale, second_codebook,
         K, static_cast<int>(gs), static_cast<int>(second_sub_bits),
         static_cast<int>(second_format), static_cast<int>(second_sign_mode));
-    auto output = torch::empty(
+    auto output = mfq_tensor_backend::empty(
         {M, first.N + second.N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
     nvq_quantize_x_gs24_kernel<<<dim3(M, ng), 32, 0, stream>>>(
-        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()), qx.data_ptr<int8_t>(),
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), qx.data_ptr<int8_t>(),
         xscale.data_ptr<float>(), M, K, ng);
     launch_selected_multi2_vec8(
         static_cast<int>(first_format), first, second, qx, xscale, output, M, stream);
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NVQ multi-projection kernel launch failed");
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NVQ multi-projection kernel launch failed");
     return output;
 }
 
-torch::Tensor nvq_gemv_swiglu_ws_cuda(
-    torch::Tensor gate_indices,
-    torch::Tensor gate_aux,
-    torch::Tensor gate_sub_scale,
-    torch::Tensor gate_neuron_scale,
-    torch::Tensor gate_codebook,
-    torch::Tensor up_indices,
-    torch::Tensor up_aux,
-    torch::Tensor up_sub_scale,
-    torch::Tensor up_neuron_scale,
-    torch::Tensor up_codebook,
-    torch::Tensor x,
+mfq_tensor_backend::Tensor nvq_gemv_swiglu_ws_cuda(
+    mfq_tensor_backend::Tensor gate_indices,
+    mfq_tensor_backend::Tensor gate_aux,
+    mfq_tensor_backend::Tensor gate_sub_scale,
+    mfq_tensor_backend::Tensor gate_neuron_scale,
+    mfq_tensor_backend::Tensor gate_codebook,
+    mfq_tensor_backend::Tensor up_indices,
+    mfq_tensor_backend::Tensor up_aux,
+    mfq_tensor_backend::Tensor up_sub_scale,
+    mfq_tensor_backend::Tensor up_neuron_scale,
+    mfq_tensor_backend::Tensor up_codebook,
+    mfq_tensor_backend::Tensor x,
     int64_t neuron_len,
     int64_t gs,
     int64_t gate_sub_bits,
@@ -6812,23 +6811,23 @@ torch::Tensor nvq_gemv_swiglu_ws_cuda(
     int64_t up_sub_bits,
     int64_t up_format,
     int64_t up_sign_mode,
-    torch::Tensor qx,
-    torch::Tensor xscale) {
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale) {
     check_common(gate_indices, gate_aux, gate_sub_scale, gate_neuron_scale, gate_codebook,
                  neuron_len, gs, gate_sub_bits, gate_format, gate_sign_mode);
     check_common(up_indices, up_aux, up_sub_scale, up_neuron_scale, up_codebook,
                  neuron_len, gs, up_sub_bits, up_format, up_sign_mode);
-    TORCH_CHECK(gate_format == up_format, "NVQ SwiGLU requires matching NVQ formats");
-    TORCH_CHECK(gate_neuron_scale.numel() == up_neuron_scale.numel(),
+    MFQ_RUNTIME_CHECK(gate_format == up_format, "NVQ SwiGLU requires matching NVQ formats");
+    MFQ_RUNTIME_CHECK(gate_neuron_scale.numel() == up_neuron_scale.numel(),
                 "NVQ SwiGLU gate/up output widths must match");
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 && x.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 && x.is_contiguous() &&
                 x.dim() == 2 && x.size(0) == 1,
                 "NVQ SwiGLU x must be CUDA contiguous fp16 [1,K]");
     const int K = static_cast<int>(neuron_len);
     const int ng = (K + static_cast<int>(gs) - 1) / static_cast<int>(gs);
     const int K_pad = ng * static_cast<int>(gs);
-    TORCH_CHECK(x.size(1) == K, "NVQ SwiGLU x width mismatch");
-    TORCH_CHECK(qx.numel() >= K_pad && xscale.numel() >= ng,
+    MFQ_RUNTIME_CHECK(x.size(1) == K, "NVQ SwiGLU x width mismatch");
+    MFQ_RUNTIME_CHECK(qx.numel() >= K_pad && xscale.numel() >= ng,
                 "NVQ SwiGLU workspace mismatch");
     const auto gate = make_device_weight(
         gate_indices, gate_aux, gate_sub_scale, gate_neuron_scale, gate_codebook,
@@ -6838,67 +6837,67 @@ torch::Tensor nvq_gemv_swiglu_ws_cuda(
         up_indices, up_aux, up_sub_scale, up_neuron_scale, up_codebook,
         K, static_cast<int>(gs), static_cast<int>(up_sub_bits),
         static_cast<int>(up_format), static_cast<int>(up_sign_mode));
-    auto output = torch::empty({1, gate.N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto output = mfq_tensor_backend::empty({1, gate.N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     nvq_quantize_x_gs24_kernel<<<dim3(1, ng), 32, 0, stream>>>(
-        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()), qx.data_ptr<int8_t>(),
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), qx.data_ptr<int8_t>(),
         xscale.data_ptr<float>(), 1, K, ng);
     if (gate_format == kNvq2JscXLGroupExec &&
         gate_sub_bits == 4 && up_sub_bits == 4) {
         aligned_group_swiglu_pair_kernel<kNvq2JscXLGroupExec, 4>
             <<<gate.N, dim3(32, 4), 0, stream>>>(
                 gate, up, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-                reinterpret_cast<__half *>(output.data_ptr<at::Half>()), nullptr);
+                reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), nullptr);
     } else if (gate_format == kNvq3JscLGroupExec &&
                gate_sub_bits == 4 && up_sub_bits == 4) {
         aligned_group_swiglu_pair_kernel<kNvq3JscLGroupExec, 4>
             <<<gate.N, dim3(32, 4), 0, stream>>>(
                 gate, up, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-                reinterpret_cast<__half *>(output.data_ptr<at::Half>()), nullptr);
+                reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), nullptr);
     } else if (gate_format == kNvq2 && gate_sub_bits == 4 && up_sub_bits == 4) {
         nvq_gemv_swiglu_pair_kernel<kNvq2, 4, false, true>
             <<<gate.N, dim3(32, 4), 0, stream>>>(
                 gate, up, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-                reinterpret_cast<__half *>(output.data_ptr<at::Half>()), nullptr);
+                reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), nullptr);
     } else if (gate_format == kNvq2Exec && gate_sub_bits == 4 && up_sub_bits == 4) {
         nvq_gemv_swiglu_pair_kernel<kNvq2Exec, 4, false, true>
             <<<gate.N, dim3(32, 4), 0, stream>>>(
                 gate, up, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-                reinterpret_cast<__half *>(output.data_ptr<at::Half>()), nullptr);
+                reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), nullptr);
     } else if (gate_format == kNvq2Jsc && gate_sub_bits == 4 && up_sub_bits == 4) {
         nvq_gemv_swiglu_pair_kernel<kNvq2Jsc, 4, false, true>
             <<<gate.N, dim3(32, 4), 0, stream>>>(
                 gate, up, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-                reinterpret_cast<__half *>(output.data_ptr<at::Half>()), nullptr);
+                reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), nullptr);
     } else if (gate_format == kNvq2JscExec && gate_sub_bits == 4 && up_sub_bits == 4) {
         nvq_gemv_swiglu_pair_kernel<kNvq2JscExec, 4, false, true>
             <<<gate.N, dim3(32, 4), 0, stream>>>(
                 gate, up, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-                reinterpret_cast<__half *>(output.data_ptr<at::Half>()), nullptr);
+                reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), nullptr);
     } else {
         launch_by_format(static_cast<int>(gate_format), [&](auto tag) {
             constexpr int F = decltype(tag)::value;
             nvq_gemv_swiglu_pair_kernel<F, 4><<<gate.N, dim3(32, 4), 0, stream>>>(
                 gate, up, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-                reinterpret_cast<__half *>(output.data_ptr<at::Half>()), nullptr);
+                reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), nullptr);
         });
     }
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NVQ SwiGLU kernel launch failed");
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NVQ SwiGLU kernel launch failed");
     return output;
 }
 
-torch::Tensor nvq2_gemv_swiglu_vec4_ordered_ws_cuda(
-    torch::Tensor gate_indices,
-    torch::Tensor gate_aux,
-    torch::Tensor gate_sub_scale,
-    torch::Tensor gate_neuron_scale,
-    torch::Tensor gate_codebook,
-    torch::Tensor up_indices,
-    torch::Tensor up_aux,
-    torch::Tensor up_sub_scale,
-    torch::Tensor up_neuron_scale,
-    torch::Tensor up_codebook,
-    torch::Tensor x,
+mfq_tensor_backend::Tensor nvq2_gemv_swiglu_vec4_ordered_ws_cuda(
+    mfq_tensor_backend::Tensor gate_indices,
+    mfq_tensor_backend::Tensor gate_aux,
+    mfq_tensor_backend::Tensor gate_sub_scale,
+    mfq_tensor_backend::Tensor gate_neuron_scale,
+    mfq_tensor_backend::Tensor gate_codebook,
+    mfq_tensor_backend::Tensor up_indices,
+    mfq_tensor_backend::Tensor up_aux,
+    mfq_tensor_backend::Tensor up_sub_scale,
+    mfq_tensor_backend::Tensor up_neuron_scale,
+    mfq_tensor_backend::Tensor up_codebook,
+    mfq_tensor_backend::Tensor x,
     int64_t neuron_len,
     int64_t gs,
     int64_t gate_sub_bits,
@@ -6907,27 +6906,27 @@ torch::Tensor nvq2_gemv_swiglu_vec4_ordered_ws_cuda(
     int64_t up_sub_bits,
     int64_t up_format,
     int64_t up_sign_mode,
-    torch::Tensor qx,
-    torch::Tensor xscale) {
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale) {
     check_common(gate_indices, gate_aux, gate_sub_scale, gate_neuron_scale, gate_codebook,
                  neuron_len, gs, gate_sub_bits, gate_format, gate_sign_mode);
     check_common(up_indices, up_aux, up_sub_scale, up_neuron_scale, up_codebook,
                  neuron_len, gs, up_sub_bits, up_format, up_sign_mode);
-    TORCH_CHECK(gate_format == kNvq2 && up_format == kNvq2 &&
+    MFQ_RUNTIME_CHECK(gate_format == kNvq2 && up_format == kNvq2 &&
                 gate_sub_bits == 4 && up_sub_bits == 4,
                 "NVQ2 ordered vec4 SwiGLU requires NVQ2 sub_bits=4 weights");
-    TORCH_CHECK(gate_neuron_scale.numel() == up_neuron_scale.numel(),
+    MFQ_RUNTIME_CHECK(gate_neuron_scale.numel() == up_neuron_scale.numel(),
                 "NVQ2 ordered vec4 SwiGLU gate/up output widths must match");
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 && x.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 && x.is_contiguous() &&
                 x.dim() == 2 && x.size(0) == 1 && x.size(1) == neuron_len,
                 "NVQ2 ordered vec4 SwiGLU x must be CUDA contiguous fp16 [1,K]");
     const int K = static_cast<int>(neuron_len);
     const int ng = (K + static_cast<int>(gs) - 1) / static_cast<int>(gs);
     const int K_pad = ng * static_cast<int>(gs);
     const int nsign = (K + 7) / 8;
-    TORCH_CHECK(nsign % 4 == 0,
+    MFQ_RUNTIME_CHECK(nsign % 4 == 0,
                 "NVQ2 ordered vec4 SwiGLU requires a multiple of four 8-value vectors");
-    TORCH_CHECK(qx.numel() >= K_pad && xscale.numel() >= ng,
+    MFQ_RUNTIME_CHECK(qx.numel() >= K_pad && xscale.numel() >= ng,
                 "NVQ2 ordered vec4 SwiGLU workspace mismatch");
     const auto gate = make_device_weight(
         gate_indices, gate_aux, gate_sub_scale, gate_neuron_scale, gate_codebook,
@@ -6935,33 +6934,33 @@ torch::Tensor nvq2_gemv_swiglu_vec4_ordered_ws_cuda(
     const auto up = make_device_weight(
         up_indices, up_aux, up_sub_scale, up_neuron_scale, up_codebook,
         K, static_cast<int>(gs), 4, kNvq2, static_cast<int>(up_sign_mode));
-    auto output = torch::empty({1, gate.N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto output = mfq_tensor_backend::empty({1, gate.N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     nvq_quantize_x_gs24_kernel<<<dim3(1, ng), 32, 0, stream>>>(
-        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()), qx.data_ptr<int8_t>(),
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), qx.data_ptr<int8_t>(),
         xscale.data_ptr<float>(), 1, K, ng);
     const size_t shared_bytes = static_cast<size_t>(nsign) * sizeof(uint32_t);
     nvq2_gemv_swiglu_vec4_ordered_kernel<4>
         <<<gate.N, dim3(32, 4), shared_bytes, stream>>>(
             gate, up, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-            reinterpret_cast<__half *>(output.data_ptr<at::Half>()), nullptr);
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess,
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), nullptr);
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess,
                 "NVQ2 ordered vec4 SwiGLU kernel launch failed");
     return output;
 }
 
 void nvq_ffn_swiglu_quant_ws_cuda(
-    torch::Tensor gate_indices,
-    torch::Tensor gate_aux,
-    torch::Tensor gate_sub_scale,
-    torch::Tensor gate_neuron_scale,
-    torch::Tensor gate_codebook,
-    torch::Tensor up_indices,
-    torch::Tensor up_aux,
-    torch::Tensor up_sub_scale,
-    torch::Tensor up_neuron_scale,
-    torch::Tensor up_codebook,
-    torch::Tensor x,
+    mfq_tensor_backend::Tensor gate_indices,
+    mfq_tensor_backend::Tensor gate_aux,
+    mfq_tensor_backend::Tensor gate_sub_scale,
+    mfq_tensor_backend::Tensor gate_neuron_scale,
+    mfq_tensor_backend::Tensor gate_codebook,
+    mfq_tensor_backend::Tensor up_indices,
+    mfq_tensor_backend::Tensor up_aux,
+    mfq_tensor_backend::Tensor up_sub_scale,
+    mfq_tensor_backend::Tensor up_neuron_scale,
+    mfq_tensor_backend::Tensor up_codebook,
+    mfq_tensor_backend::Tensor x,
     int64_t neuron_len,
     int64_t gs,
     int64_t gate_sub_bits,
@@ -6971,22 +6970,22 @@ void nvq_ffn_swiglu_quant_ws_cuda(
     int64_t up_format,
     int64_t up_sign_mode,
     int64_t down_gs,
-    torch::Tensor input_qx,
-    torch::Tensor input_xscale,
-    torch::Tensor output_qx,
-    torch::Tensor output_xscale,
-    torch::Tensor swiglu_scratch) {
+    mfq_tensor_backend::Tensor input_qx,
+    mfq_tensor_backend::Tensor input_xscale,
+    mfq_tensor_backend::Tensor output_qx,
+    mfq_tensor_backend::Tensor output_xscale,
+    mfq_tensor_backend::Tensor swiglu_scratch) {
     check_common(gate_indices, gate_aux, gate_sub_scale, gate_neuron_scale, gate_codebook,
                  neuron_len, gs, gate_sub_bits, gate_format, gate_sign_mode);
     check_common(up_indices, up_aux, up_sub_scale, up_neuron_scale, up_codebook,
                  neuron_len, gs, up_sub_bits, up_format, up_sign_mode);
-    TORCH_CHECK(gate_format == up_format, "NVQ fused FFN requires matching gate/up formats");
-    TORCH_CHECK(gate_neuron_scale.numel() == up_neuron_scale.numel(),
+    MFQ_RUNTIME_CHECK(gate_format == up_format, "NVQ fused FFN requires matching gate/up formats");
+    MFQ_RUNTIME_CHECK(gate_neuron_scale.numel() == up_neuron_scale.numel(),
                 "NVQ fused FFN gate/up widths must match");
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 && x.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 && x.is_contiguous() &&
                 x.dim() == 2 && x.size(0) == 1 && x.size(1) == neuron_len,
                 "NVQ fused FFN x must be CUDA contiguous fp16 [1,K]");
-    TORCH_CHECK(down_gs == 24 || down_gs == 28 || down_gs == 32,
+    MFQ_RUNTIME_CHECK(down_gs == 24 || down_gs == 28 || down_gs == 32,
                 "NVQ fused FFN down gs must be 24, 28, or 32");
     const int K = static_cast<int>(neuron_len);
     const int ng = (K + static_cast<int>(gs) - 1) / static_cast<int>(gs);
@@ -6994,19 +6993,19 @@ void nvq_ffn_swiglu_quant_ws_cuda(
     const int N = static_cast<int>(gate_neuron_scale.numel());
     const int down_ng = (N + static_cast<int>(down_gs) - 1) / static_cast<int>(down_gs);
     const int down_k_pad = down_ng * static_cast<int>(down_gs);
-    TORCH_CHECK(input_qx.is_cuda() && input_qx.scalar_type() == torch::kInt8 &&
+    MFQ_RUNTIME_CHECK(input_qx.is_cuda() && input_qx.scalar_type() == mfq_tensor_backend::kInt8 &&
                 input_qx.is_contiguous() && input_qx.numel() >= K_pad,
                 "NVQ fused FFN input qx workspace mismatch");
-    TORCH_CHECK(input_xscale.is_cuda() && input_xscale.scalar_type() == torch::kFloat32 &&
+    MFQ_RUNTIME_CHECK(input_xscale.is_cuda() && input_xscale.scalar_type() == mfq_tensor_backend::kFloat32 &&
                 input_xscale.is_contiguous() && input_xscale.numel() >= ng,
                 "NVQ fused FFN input xscale workspace mismatch");
-    TORCH_CHECK(output_qx.is_cuda() && output_qx.scalar_type() == torch::kInt8 &&
+    MFQ_RUNTIME_CHECK(output_qx.is_cuda() && output_qx.scalar_type() == mfq_tensor_backend::kInt8 &&
                 output_qx.is_contiguous() && output_qx.numel() >= down_k_pad,
                 "NVQ fused FFN output qx workspace mismatch");
-    TORCH_CHECK(output_xscale.is_cuda() && output_xscale.scalar_type() == torch::kFloat32 &&
+    MFQ_RUNTIME_CHECK(output_xscale.is_cuda() && output_xscale.scalar_type() == mfq_tensor_backend::kFloat32 &&
                 output_xscale.is_contiguous() && output_xscale.numel() >= down_ng,
                 "NVQ fused FFN output xscale workspace mismatch");
-    TORCH_CHECK(swiglu_scratch.is_cuda() && swiglu_scratch.scalar_type() == torch::kFloat32 &&
+    MFQ_RUNTIME_CHECK(swiglu_scratch.is_cuda() && swiglu_scratch.scalar_type() == mfq_tensor_backend::kFloat32 &&
                 swiglu_scratch.is_contiguous() && swiglu_scratch.numel() >= N,
                 "NVQ fused FFN SwiGLU scratch mismatch");
     const auto gate = make_device_weight(
@@ -7017,9 +7016,9 @@ void nvq_ffn_swiglu_quant_ws_cuda(
         up_indices, up_aux, up_sub_scale, up_neuron_scale, up_codebook,
         K, static_cast<int>(gs), static_cast<int>(up_sub_bits),
         static_cast<int>(up_format), static_cast<int>(up_sign_mode));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
     nvq_quantize_x_gs24_kernel<<<dim3(1, ng), 32, 0, stream>>>(
-        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()), input_qx.data_ptr<int8_t>(),
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), input_qx.data_ptr<int8_t>(),
         input_xscale.data_ptr<float>(), 1, K, ng);
     bool aligned_independent_rows = false;
     const char * vec4_env = std::getenv("MFQ_NVQ_SWIGLU_VEC4");
@@ -7110,57 +7109,57 @@ void nvq_ffn_swiglu_quant_ws_cuda(
             }
             break;
     }
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NVQ fused FFN kernel launch failed");
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NVQ fused FFN kernel launch failed");
 }
 
-torch::Tensor nvq_gemv_gate_ws_cuda(
-    torch::Tensor indices,
-    torch::Tensor aux,
-    torch::Tensor sub_scale,
-    torch::Tensor neuron_scale,
-    torch::Tensor codebook,
-    torch::Tensor x,
-    torch::Tensor gate,
+mfq_tensor_backend::Tensor nvq_gemv_gate_ws_cuda(
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor aux,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor codebook,
+    mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor gate,
     int64_t neuron_len,
     int64_t gs,
     int64_t sub_bits,
     int64_t format,
     int64_t sign_mode,
     int64_t mode,
-    torch::Tensor qx,
-    torch::Tensor xscale) {
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale) {
     check_common(indices, aux, sub_scale, neuron_scale, codebook,
                  neuron_len, gs, sub_bits, format, sign_mode);
-    TORCH_CHECK(mode == 1 || mode == 2, "NVQ gate mode must be 1(sigmoid) or 2(silu)");
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 && x.is_contiguous() && x.dim() == 2,
+    MFQ_RUNTIME_CHECK(mode == 1 || mode == 2, "NVQ gate mode must be 1(sigmoid) or 2(silu)");
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 && x.is_contiguous() && x.dim() == 2,
                 "NVQ x must be CUDA contiguous fp16 rank-2");
-    TORCH_CHECK(gate.is_cuda() && gate.scalar_type() == torch::kFloat16 && gate.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(gate.is_cuda() && gate.scalar_type() == mfq_tensor_backend::kFloat16 && gate.is_contiguous() &&
                 gate.sizes() == x.sizes(), "NVQ gate must be CUDA contiguous fp16 with x shape");
     const int M = static_cast<int>(x.size(0));
     const int K = static_cast<int>(neuron_len);
     const int N = static_cast<int>(neuron_scale.numel());
     const int ng = (K + static_cast<int>(gs) - 1) / static_cast<int>(gs);
     const int K_pad = ng * static_cast<int>(gs);
-    TORCH_CHECK(x.size(1) == K, "NVQ x width must equal neuron_len");
-    TORCH_CHECK(M >= 1 && M <= 16, "NVQ gated direct GEMV supports M in [1,16]");
-    TORCH_CHECK(qx.is_cuda() && qx.scalar_type() == torch::kInt8 && qx.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(x.size(1) == K, "NVQ x width must equal neuron_len");
+    MFQ_RUNTIME_CHECK(M >= 1 && M <= 16, "NVQ gated direct GEMV supports M in [1,16]");
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.scalar_type() == mfq_tensor_backend::kInt8 && qx.is_contiguous() &&
                 qx.numel() >= static_cast<int64_t>(M) * K_pad, "NVQ qx workspace mismatch");
-    TORCH_CHECK(xscale.is_cuda() && xscale.scalar_type() == torch::kFloat32 && xscale.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.scalar_type() == mfq_tensor_backend::kFloat32 && xscale.is_contiguous() &&
                 xscale.numel() >= static_cast<int64_t>(M) * ng, "NVQ xscale workspace mismatch");
     const int nvec = (K + (is_d4_format(format) ? 3 : 7)) /
                      (is_d4_format(format) ? 4 : 8);
     const int nsign = (K + 7) / 8;
-    auto output = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto output = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     if (mode == 1) {
         nvq_quantize_x_gate_gs24_kernel<1><<<dim3(M, ng), 32, 0, stream>>>(
-            reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),
-            reinterpret_cast<const __half *>(gate.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
+            reinterpret_cast<const __half *>(gate.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), M, K, ng);
     } else {
         nvq_quantize_x_gate_gs24_kernel<2><<<dim3(M, ng), 32, 0, stream>>>(
-            reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),
-            reinterpret_cast<const __half *>(gate.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
+            reinterpret_cast<const __half *>(gate.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), M, K, ng);
     }
     if (M == 1) {
@@ -7168,53 +7167,53 @@ torch::Tensor nvq_gemv_gate_ws_cuda(
             static_cast<int>(format), indices, aux, sub_scale, neuron_scale, codebook,
             qx, xscale, output, N, ng, nvec, nsign,
             static_cast<int>(sub_bits), static_cast<int>(sign_mode), stream);
-        TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NVQ gated vec8 GEMV kernel launch failed");
+        MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NVQ gated vec8 GEMV kernel launch failed");
         return output;
     }
     launch_selected_batch_vec8(
         static_cast<int>(format), indices, aux, sub_scale, neuron_scale, codebook,
         qx, xscale, output, M, N, ng, nvec, nsign,
         static_cast<int>(sub_bits), static_cast<int>(sign_mode), stream);
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NVQ gated batch vec8 GEMV kernel launch failed");
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NVQ gated batch vec8 GEMV kernel launch failed");
     return output;
 }
 
-torch::Tensor nvq_mmq_ws_cuda(
-    torch::Tensor indices,
-    torch::Tensor aux,
-    torch::Tensor sub_scale,
-    torch::Tensor neuron_scale,
-    torch::Tensor codebook,
-    torch::Tensor x,
+mfq_tensor_backend::Tensor nvq_mmq_ws_cuda(
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor aux,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor codebook,
+    mfq_tensor_backend::Tensor x,
     int64_t neuron_len,
     int64_t gs,
     int64_t sub_bits,
     int64_t format,
     int64_t sign_mode,
-    torch::Tensor qx,
-    torch::Tensor xscale) {
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale) {
     check_common(indices, aux, sub_scale, neuron_scale, codebook,
                  neuron_len, gs, sub_bits, format, sign_mode);
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 && x.is_contiguous() && x.dim() == 2,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 && x.is_contiguous() && x.dim() == 2,
                 "NVQ x must be CUDA contiguous fp16 rank-2");
     const int M = static_cast<int>(x.size(0));
     const int K = static_cast<int>(neuron_len);
     const int N = static_cast<int>(neuron_scale.numel());
     const int ng = (K + static_cast<int>(gs) - 1) / static_cast<int>(gs);
     const int K_pad = ng * static_cast<int>(gs);
-    TORCH_CHECK(x.size(1) == K, "NVQ x width must equal neuron_len");
-    TORCH_CHECK(M >= 4 && M <= 64, "NVQ MMA MMQ supports M in [4,64]");
-    TORCH_CHECK(qx.is_cuda() && qx.scalar_type() == torch::kInt8 && qx.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(x.size(1) == K, "NVQ x width must equal neuron_len");
+    MFQ_RUNTIME_CHECK(M >= 4 && M <= 64, "NVQ MMA MMQ supports M in [4,64]");
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.scalar_type() == mfq_tensor_backend::kInt8 && qx.is_contiguous() &&
                 qx.numel() >= static_cast<int64_t>(M) * K_pad, "NVQ qx workspace mismatch");
-    TORCH_CHECK(xscale.is_cuda() && xscale.scalar_type() == torch::kFloat32 && xscale.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.scalar_type() == mfq_tensor_backend::kFloat32 && xscale.is_contiguous() &&
                 xscale.numel() >= static_cast<int64_t>(M) * ng, "NVQ xscale workspace mismatch");
     const int nvec = (K + (is_d4_format(format) ? 3 : 7)) /
                      (is_d4_format(format) ? 4 : 8);
     const int nsign = (K + 7) / 8;
-    auto output = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto output = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     nvq_quantize_x_gs24_kernel<<<dim3(M, ng), 32, 0, stream>>>(
-        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()), qx.data_ptr<int8_t>(),
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), qx.data_ptr<int8_t>(),
         xscale.data_ptr<float>(), M, K, ng);
     const dim3 block(32, 8);
 #define NVQ_MMQ_LAUNCH(MTILES_VALUE, NEED_CHECK_VALUE)                            \
@@ -7225,7 +7224,7 @@ torch::Tensor nvq_mmq_ws_cuda(
         sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),                        \
         neuron_scale.data_ptr<float>(), codebook.data_ptr<int8_t>(),             \
         qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),                         \
-        reinterpret_cast<__half *>(output.data_ptr<at::Half>()),                 \
+        reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),                 \
         M, N, ng, nvec, nsign, static_cast<int>(sub_bits),                       \
         static_cast<int>(sign_mode))
     launch_by_format(static_cast<int>(format), [&](auto tag) {
@@ -7245,58 +7244,58 @@ torch::Tensor nvq_mmq_ws_cuda(
         }
     });
 #undef NVQ_MMQ_LAUNCH
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NVQ MMA MMQ kernel launch failed");
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NVQ MMA MMQ kernel launch failed");
     return output;
 }
 
-torch::Tensor nvq_mmq_gate_ws_cuda(
-    torch::Tensor indices,
-    torch::Tensor aux,
-    torch::Tensor sub_scale,
-    torch::Tensor neuron_scale,
-    torch::Tensor codebook,
-    torch::Tensor x,
-    torch::Tensor gate,
+mfq_tensor_backend::Tensor nvq_mmq_gate_ws_cuda(
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor aux,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor codebook,
+    mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor gate,
     int64_t neuron_len,
     int64_t gs,
     int64_t sub_bits,
     int64_t format,
     int64_t sign_mode,
     int64_t mode,
-    torch::Tensor qx,
-    torch::Tensor xscale) {
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale) {
     check_common(indices, aux, sub_scale, neuron_scale, codebook,
                  neuron_len, gs, sub_bits, format, sign_mode);
-    TORCH_CHECK(mode == 1 || mode == 2, "NVQ gate mode must be 1(sigmoid) or 2(silu)");
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 && x.is_contiguous() && x.dim() == 2,
+    MFQ_RUNTIME_CHECK(mode == 1 || mode == 2, "NVQ gate mode must be 1(sigmoid) or 2(silu)");
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 && x.is_contiguous() && x.dim() == 2,
                 "NVQ x must be CUDA contiguous fp16 rank-2");
-    TORCH_CHECK(gate.is_cuda() && gate.scalar_type() == torch::kFloat16 && gate.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(gate.is_cuda() && gate.scalar_type() == mfq_tensor_backend::kFloat16 && gate.is_contiguous() &&
                 gate.sizes() == x.sizes(), "NVQ gate must be CUDA contiguous fp16 with x shape");
     const int M = static_cast<int>(x.size(0));
     const int K = static_cast<int>(neuron_len);
     const int N = static_cast<int>(neuron_scale.numel());
     const int ng = (K + static_cast<int>(gs) - 1) / static_cast<int>(gs);
     const int K_pad = ng * static_cast<int>(gs);
-    TORCH_CHECK(x.size(1) == K, "NVQ x width must equal neuron_len");
-    TORCH_CHECK(M >= 4 && M <= 64, "NVQ gated MMA MMQ supports M in [4,64]");
-    TORCH_CHECK(qx.is_cuda() && qx.scalar_type() == torch::kInt8 && qx.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(x.size(1) == K, "NVQ x width must equal neuron_len");
+    MFQ_RUNTIME_CHECK(M >= 4 && M <= 64, "NVQ gated MMA MMQ supports M in [4,64]");
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.scalar_type() == mfq_tensor_backend::kInt8 && qx.is_contiguous() &&
                 qx.numel() >= static_cast<int64_t>(M) * K_pad, "NVQ qx workspace mismatch");
-    TORCH_CHECK(xscale.is_cuda() && xscale.scalar_type() == torch::kFloat32 && xscale.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.scalar_type() == mfq_tensor_backend::kFloat32 && xscale.is_contiguous() &&
                 xscale.numel() >= static_cast<int64_t>(M) * ng, "NVQ xscale workspace mismatch");
     const int nvec = (K + (is_d4_format(format) ? 3 : 7)) /
                      (is_d4_format(format) ? 4 : 8);
     const int nsign = (K + 7) / 8;
-    auto output = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto output = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     if (mode == 1) {
         nvq_quantize_x_gate_gs24_kernel<1><<<dim3(M, ng), 32, 0, stream>>>(
-            reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),
-            reinterpret_cast<const __half *>(gate.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
+            reinterpret_cast<const __half *>(gate.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), M, K, ng);
     } else {
         nvq_quantize_x_gate_gs24_kernel<2><<<dim3(M, ng), 32, 0, stream>>>(
-            reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),
-            reinterpret_cast<const __half *>(gate.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
+            reinterpret_cast<const __half *>(gate.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), M, K, ng);
     }
     const dim3 block(32, 8);
@@ -7308,7 +7307,7 @@ torch::Tensor nvq_mmq_gate_ws_cuda(
         sub_scale.data_ptr<uint8_t>(), sub_scale.numel(),                        \
         neuron_scale.data_ptr<float>(), codebook.data_ptr<int8_t>(),             \
         qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),                         \
-        reinterpret_cast<__half *>(output.data_ptr<at::Half>()),                 \
+        reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),                 \
         M, N, ng, nvec, nsign, static_cast<int>(sub_bits),                       \
         static_cast<int>(sign_mode))
     launch_by_format(static_cast<int>(format), [&](auto tag) {
@@ -7328,17 +7327,17 @@ torch::Tensor nvq_mmq_gate_ws_cuda(
         }
     });
 #undef NVQ_GATED_MMQ_LAUNCH
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NVQ gated MMA MMQ kernel launch failed");
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NVQ gated MMA MMQ kernel launch failed");
     return output;
 }
 
-torch::Tensor nvq_embedding_lookup_cuda(
-    torch::Tensor indices,
-    torch::Tensor aux,
-    torch::Tensor sub_scale,
-    torch::Tensor neuron_scale,
-    torch::Tensor codebook,
-    torch::Tensor token_ids,
+mfq_tensor_backend::Tensor nvq_embedding_lookup_cuda(
+    mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor aux,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor codebook,
+    mfq_tensor_backend::Tensor token_ids,
     int64_t neuron_len,
     int64_t gs,
     int64_t sub_bits,
@@ -7346,7 +7345,7 @@ torch::Tensor nvq_embedding_lookup_cuda(
     int64_t sign_mode) {
     check_common(indices, aux, sub_scale, neuron_scale, codebook,
                  neuron_len, gs, sub_bits, format, sign_mode);
-    TORCH_CHECK(token_ids.is_cuda() && token_ids.scalar_type() == torch::kInt64 && token_ids.is_contiguous(),
+    MFQ_RUNTIME_CHECK(token_ids.is_cuda() && token_ids.scalar_type() == mfq_tensor_backend::kInt64 && token_ids.is_contiguous(),
                 "NVQ token_ids must be CUDA contiguous int64");
     const int tokens = static_cast<int>(token_ids.numel());
     const int vocab = static_cast<int>(neuron_scale.numel());
@@ -7357,20 +7356,20 @@ torch::Tensor nvq_embedding_lookup_cuda(
     const int nsign = (K + 7) / 8;
     auto shape = token_ids.sizes().vec();
     shape.push_back(K);
-    auto output = torch::empty(shape, neuron_scale.options().dtype(torch::kFloat16));
+    auto output = mfq_tensor_backend::empty(shape, neuron_scale.options().dtype(mfq_tensor_backend::kFloat16));
     const int64_t total = static_cast<int64_t>(tokens) * nsign;
     const int block = 256;
     const int grid = static_cast<int>(std::min<int64_t>((total + block - 1) / block, 65535));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
     launch_by_format(static_cast<int>(format), [&](auto tag) {
         constexpr int F = decltype(tag)::value;
         nvq_embedding_kernel<F><<<grid, block, 0, stream>>>(
             indices.data_ptr<uint8_t>(), indices.numel(), aux.data_ptr<uint8_t>(), aux.numel(),
             sub_scale.data_ptr<uint8_t>(), sub_scale.numel(), neuron_scale.data_ptr<float>(),
             codebook.data_ptr<int8_t>(), token_ids.data_ptr<int64_t>(),
-            reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
             tokens, vocab, K, ng, nvec, nsign, static_cast<int>(sub_bits), static_cast<int>(sign_mode));
     });
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "NVQ embedding kernel launch failed");
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess, "NVQ embedding kernel launch failed");
     return output;
 }

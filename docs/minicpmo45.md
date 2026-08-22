@@ -124,6 +124,12 @@ cross-attention does not depend on platform-specific sin/cos rounding.
 
 Each name above uses the `.pt` suffix. Run the graph with:
 
+The suffix is retained for CLI compatibility, but the self-contained CUDA
+runtime reads and writes MFQ's `MFQTNSR1` tensor envelope rather than a Python
+pickle. Files created by `torch.save` remain available through the optional
+`mfq-decode-torch` A/B runtime. Normal image, audio, and video requests through
+MFQd do not use this diagnostic file interface.
+
 ```bash
 mfq-decode \
   --mfq /models/MiniCPM-o-4_5-Q4KM-table.mfq \

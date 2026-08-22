@@ -1,6 +1,5 @@
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
 #include <cuda_fp16.h>
+#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <climits>
@@ -91,8 +90,8 @@ struct MfqLlamaFattnCache {
     int mask_stride = 0;
     int query_tile = 0;
     int kv_tile = 0;
-    torch::Tensor mask;
-    torch::Tensor kv_max;
+    mfq_tensor_backend::Tensor mask;
+    mfq_tensor_backend::Tensor kv_max;
 };
 
 static MfqLlamaFattnCache & mfq_llama_fattn_cache(
@@ -101,14 +100,14 @@ static MfqLlamaFattnCache & mfq_llama_fattn_cache(
     static MfqLlamaFattnCache cache;
     if (cache.B != B || cache.T != T || cache.query_tile != query_tile ||
         cache.kv_tile != kv_tile) {
-        auto cuda = torch::TensorOptions().device(torch::kCUDA);
+        auto cuda = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA);
         cache.mask_stride = ((T + kv_tile - 1) / kv_tile) * kv_tile;
-        cache.mask = torch::empty({T, cache.mask_stride}, cuda.dtype(torch::kFloat16));
+        cache.mask = mfq_tensor_backend::empty({T, cache.mask_stride}, cuda.dtype(mfq_tensor_backend::kFloat16));
         const int tiles = (T + query_tile - 1) / query_tile;
-        cache.kv_max = torch::empty({B, tiles}, cuda.dtype(torch::kInt32));
-        int blocks = min(65535, (T * cache.mask_stride + 255) / 256);
-        mfq_causal_mask_kernel<<<blocks, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-            reinterpret_cast<half*>(cache.mask.data_ptr<at::Half>()),
+        cache.kv_max = mfq_tensor_backend::empty({B, tiles}, cuda.dtype(mfq_tensor_backend::kInt32));
+        int blocks = std::min(65535, (T * cache.mask_stride + 255) / 256);
+        mfq_causal_mask_kernel<<<blocks, 256, 0, mfq_current_cuda_stream()>>>(
+            reinterpret_cast<half*>(cache.mask.data_ptr<mfq_half>()),
             cache.kv_max.data_ptr<int>(), B, T, cache.mask_stride, tiles,
             query_tile, kv_tile);
         cache.B = B;
@@ -126,14 +125,14 @@ static MfqLlamaFattnCache & mfq_llama_swa_fattn_cache(
     static int cache_window = 0;
     if (cache.B != B || cache.T != T || cache_window != window ||
         cache.query_tile != query_tile || cache.kv_tile != kv_tile) {
-        auto cuda = torch::TensorOptions().device(torch::kCUDA);
+        auto cuda = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA);
         cache.mask_stride = ((T + kv_tile - 1) / kv_tile) * kv_tile;
-        cache.mask = torch::empty({T, cache.mask_stride}, cuda.dtype(torch::kFloat16));
+        cache.mask = mfq_tensor_backend::empty({T, cache.mask_stride}, cuda.dtype(mfq_tensor_backend::kFloat16));
         const int tiles = (T + query_tile - 1) / query_tile;
-        cache.kv_max = torch::empty({B, tiles}, cuda.dtype(torch::kInt32));
-        const int blocks = min(65535, (T * cache.mask_stride + 255) / 256);
-        mfq_swa_causal_mask_kernel<<<blocks, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-            reinterpret_cast<half*>(cache.mask.data_ptr<at::Half>()),
+        cache.kv_max = mfq_tensor_backend::empty({B, tiles}, cuda.dtype(mfq_tensor_backend::kInt32));
+        const int blocks = std::min(65535, (T * cache.mask_stride + 255) / 256);
+        mfq_swa_causal_mask_kernel<<<blocks, 256, 0, mfq_current_cuda_stream()>>>(
+            reinterpret_cast<half*>(cache.mask.data_ptr<mfq_half>()),
             cache.kv_max.data_ptr<int>(), B, T, cache.mask_stride, tiles,
             window, query_tile, kv_tile);
         cache.B = B;
@@ -146,8 +145,8 @@ static MfqLlamaFattnCache & mfq_llama_swa_fattn_cache(
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2>
-static torch::Tensor mfq_llama_flash_launch(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale,
+static mfq_tensor_backend::Tensor mfq_llama_flash_launch(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale,
     bool sliding, int window)
 {
     constexpr int ncols = ncols1 * ncols2;
@@ -159,8 +158,8 @@ static torch::Tensor mfq_llama_flash_launch(
 
     int device = 0;
     cudaDeviceProp properties{};
-    TORCH_CHECK(cudaGetDevice(&device) == cudaSuccess, "llama_flash256: cudaGetDevice failed");
-    TORCH_CHECK(cudaGetDeviceProperties(&properties, device) == cudaSuccess,
+    MFQ_RUNTIME_CHECK(cudaGetDevice(&device) == cudaSuccess, "llama_flash256: cudaGetDevice failed");
+    MFQ_RUNTIME_CHECK(cudaGetDeviceProperties(&properties, device) == cudaSuccess,
                 "llama_flash256: cudaGetDeviceProperties failed");
     const int cc = properties.major * 100 + properties.minor * 10;
     const int nthreads = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols, cc);
@@ -187,15 +186,15 @@ static torch::Tensor mfq_llama_flash_launch(
     auto & cache = sliding
         ? mfq_llama_swa_fattn_cache(B, T, window, ncols1, nbatch_fa)
         : mfq_llama_fattn_cache(B, T, ncols1, nbatch_fa);
-    auto out = torch::empty({B, T, Hq, DV}, q.options());
+    auto out = mfq_tensor_backend::empty({B, T, Hq, DV}, q.options());
     using Kernel = decltype(&flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, false>);
     Kernel kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, false>;
     static bool shared_limit_set[32] = {};
-    TORCH_CHECK(device >= 0 && device < 32, "llama_flash256: unsupported CUDA device index");
+    MFQ_RUNTIME_CHECK(device >= 0 && device < 32, "llama_flash256: unsupported CUDA device index");
     if (!shared_limit_set[device]) {
         const auto status = cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shared_total);
-        TORCH_CHECK(status == cudaSuccess,
+        MFQ_RUNTIME_CHECK(status == cudaSuccess,
                     "llama_flash256: cudaFuncSetAttribute failed: ", cudaGetErrorString(status));
         shared_limit_set[device] = true;
     }
@@ -206,10 +205,10 @@ static torch::Tensor mfq_llama_flash_launch(
     const uint3 ne01 = init_fastdiv_values(T);
     const uint32_t n_head_log2 = 1u << (uint32_t)floorf(log2f((float)Hq));
     const dim3 block(32, nwarps, 1);
-    kernel<<<ntiles_dst, block, shared_total, at::cuda::getCurrentCUDAStream()>>>(
+    kernel<<<ntiles_dst, block, shared_total, mfq_current_cuda_stream()>>>(
         reinterpret_cast<const char*>(q.data_ptr<float>()),
-        reinterpret_cast<const char*>(k.data_ptr<at::Half>()),
-        reinterpret_cast<const char*>(v.data_ptr<at::Half>()),
+        reinterpret_cast<const char*>(k.data_ptr<mfq_half>()),
+        reinterpret_cast<const char*>(v.data_ptr<mfq_half>()),
         reinterpret_cast<const char*>(cache.mask.data_ptr()),
         nullptr, static_cast<int*>(cache.kv_max.data_ptr()), out.data_ptr<float>(), nullptr,
         (float)scale, 0.0f, 1.0f, 1.0f, n_head_log2, 0.0f,
@@ -223,28 +222,28 @@ static torch::Tensor mfq_llama_flash_launch(
         T * cache.mask_stride * (int)sizeof(half),
         (int64_t)T * cache.mask_stride * (int)sizeof(half));
     const auto status = cudaGetLastError();
-    TORCH_CHECK(status == cudaSuccess,
+    MFQ_RUNTIME_CHECK(status == cudaSuccess,
                 "llama_flash256 launch failed: ", cudaGetErrorString(status));
     return out;
 }
 
-torch::Tensor attention_llama_flash256_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale)
+mfq_tensor_backend::Tensor attention_llama_flash256_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale)
 {
-    TORCH_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == mfq_tensor_backend::kFloat32,
                 "llama_flash256: q must be contiguous CUDA f32");
-    TORCH_CHECK(k.is_cuda() && k.is_contiguous() && k.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(k.is_cuda() && k.is_contiguous() && k.scalar_type() == mfq_tensor_backend::kFloat16,
                 "llama_flash256: k must be contiguous CUDA f16");
-    TORCH_CHECK(v.is_cuda() && v.is_contiguous() && v.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(v.is_cuda() && v.is_contiguous() && v.scalar_type() == mfq_tensor_backend::kFloat16,
                 "llama_flash256: v must be contiguous CUDA f16");
-    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "llama_flash256: rank must be 4");
+    MFQ_RUNTIME_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "llama_flash256: rank must be 4");
     const int B = (int)q.size(0);
     const int Hq = (int)q.size(1);
     const int T = (int)q.size(2);
     const int D = (int)q.size(3);
     const int Hk = (int)k.size(1);
-    TORCH_CHECK(D == 256 && k.size(3) == D && v.size(3) == D, "llama_flash256: head_dim must be 256");
-    TORCH_CHECK(Hq == 4 * Hk && k.size(0) == B && v.size(0) == B &&
+    MFQ_RUNTIME_CHECK(D == 256 && k.size(3) == D && v.size(3) == D, "llama_flash256: head_dim must be 256");
+    MFQ_RUNTIME_CHECK(Hq == 4 * Hk && k.size(0) == B && v.size(0) == B &&
                 k.size(2) == T && v.size(2) == T && v.size(1) == Hk,
                 "llama_flash256: requires self-attention with GQA ratio 4");
     if (T % FATTN_KQ_STRIDE == 0) {
@@ -256,44 +255,44 @@ torch::Tensor attention_llama_flash256_cuda(
     return mfq_llama_flash_launch<256, 256, 64, 1>(q, k, v, scale, false, 0);
 }
 
-torch::Tensor attention_llama_flash512_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale)
+mfq_tensor_backend::Tensor attention_llama_flash512_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale)
 {
-    TORCH_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == mfq_tensor_backend::kFloat32,
                 "llama_flash512: q must be contiguous CUDA f32");
-    TORCH_CHECK(k.is_cuda() && k.is_contiguous() && k.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(k.is_cuda() && k.is_contiguous() && k.scalar_type() == mfq_tensor_backend::kFloat16,
                 "llama_flash512: k must be contiguous CUDA f16");
-    TORCH_CHECK(v.is_cuda() && v.is_contiguous() && v.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(v.is_cuda() && v.is_contiguous() && v.scalar_type() == mfq_tensor_backend::kFloat16,
                 "llama_flash512: v must be contiguous CUDA f16");
-    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+    MFQ_RUNTIME_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
                 "llama_flash512: rank must be 4");
     const int B = (int)q.size(0);
     const int Hq = (int)q.size(1);
     const int T = (int)q.size(2);
     const int D = (int)q.size(3);
     const int Hk = (int)k.size(1);
-    TORCH_CHECK(D == 512 && k.size(3) == D && v.size(3) == D,
+    MFQ_RUNTIME_CHECK(D == 512 && k.size(3) == D && v.size(3) == D,
                 "llama_flash512: head_dim must be 512");
-    TORCH_CHECK(Hq == 8 * Hk && k.size(0) == B && v.size(0) == B &&
+    MFQ_RUNTIME_CHECK(Hq == 8 * Hk && k.size(0) == B && v.size(0) == B &&
                 k.size(2) == T && v.size(2) == T && v.size(1) == Hk,
                 "llama_flash512: requires self-attention with GQA ratio 8");
-    TORCH_CHECK(T % FATTN_KQ_STRIDE == 0,
+    MFQ_RUNTIME_CHECK(T % FATTN_KQ_STRIDE == 0,
                 "llama_flash512: GQA path requires K length aligned to 64");
     return mfq_llama_flash_launch<512, 512, 8, 8>(q, k, v, scale, false, 0);
 }
 
-torch::Tensor attention_glm_mla576_cuda(
-    torch::Tensor q, torch::Tensor kv, double scale)
+mfq_tensor_backend::Tensor attention_glm_mla576_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv, double scale)
 {
-    TORCH_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == mfq_tensor_backend::kFloat32,
                 "glm_mla576: q must be contiguous CUDA f32");
-    TORCH_CHECK(kv.is_cuda() && kv.is_contiguous() && kv.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(kv.is_cuda() && kv.is_contiguous() && kv.scalar_type() == mfq_tensor_backend::kFloat16,
                 "glm_mla576: kv must be contiguous CUDA f16");
-    TORCH_CHECK(q.dim() == 4 && kv.dim() == 4,
+    MFQ_RUNTIME_CHECK(q.dim() == 4 && kv.dim() == 4,
                 "glm_mla576: expected q[B,64,T,576], kv[B,1,T,576]");
     const int B = (int)q.size(0);
     const int T = (int)q.size(2);
-    TORCH_CHECK(q.size(1) == 64 && q.size(3) == 576 &&
+    MFQ_RUNTIME_CHECK(q.size(1) == 64 && q.size(3) == 576 &&
                 kv.size(0) == B && kv.size(1) == 1 && kv.size(2) == T &&
                 kv.size(3) == 576,
                 "glm_mla576: unsupported shape");
@@ -307,9 +306,9 @@ torch::Tensor attention_glm_mla576_cuda(
 }
 
 template<int ncols1>
-static torch::Tensor attention_glm_mla576_cached_impl(
-    torch::Tensor q, torch::Tensor kv_cache, int64_t logical_len,
-    torch::Tensor mask, torch::Tensor kv_max, torch::Tensor meta,
+static mfq_tensor_backend::Tensor attention_glm_mla576_cached_impl(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv_cache, int64_t logical_len,
+    mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor kv_max, mfq_tensor_backend::Tensor meta,
     double scale)
 {
     constexpr int DKQ = 576;
@@ -323,9 +322,9 @@ static torch::Tensor attention_glm_mla576_cached_impl(
 
     int device = 0;
     cudaDeviceProp properties{};
-    TORCH_CHECK(cudaGetDevice(&device) == cudaSuccess,
+    MFQ_RUNTIME_CHECK(cudaGetDevice(&device) == cudaSuccess,
                 "glm_mla576_cached: cudaGetDevice failed");
-    TORCH_CHECK(cudaGetDeviceProperties(&properties, device) == cudaSuccess,
+    MFQ_RUNTIME_CHECK(cudaGetDeviceProperties(&properties, device) == cudaSuccess,
                 "glm_mla576_cached: cudaGetDeviceProperties failed");
     const int cc = properties.major * 100 + properties.minor * 10;
     const int nthreads = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols, cc);
@@ -354,12 +353,12 @@ static torch::Tensor attention_glm_mla576_cached_impl(
     using Kernel = decltype(&flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, true>);
     Kernel kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, true>;
     static bool shmem_set[32] = {};
-    TORCH_CHECK(device >= 0 && device < 32,
+    MFQ_RUNTIME_CHECK(device >= 0 && device < 32,
                 "glm_mla576_cached: unsupported CUDA device index");
     if (!shmem_set[device]) {
         const cudaError_t status = cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shmem));
-        TORCH_CHECK(status == cudaSuccess,
+        MFQ_RUNTIME_CHECK(status == cudaSuccess,
                     "glm_mla576_cached: shared-memory attribute failed: ",
                     cudaGetErrorString(status));
         shmem_set[device] = true;
@@ -372,7 +371,7 @@ static torch::Tensor attention_glm_mla576_cached_impl(
     int max_blocks_per_sm = 0;
     cudaError_t status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &max_blocks_per_sm, kernel, nthreads, shmem);
-    TORCH_CHECK(status == cudaSuccess && max_blocks_per_sm > 0,
+    MFQ_RUNTIME_CHECK(status == cudaSuccess && max_blocks_per_sm > 0,
                 "glm_mla576_cached: occupancy query failed: ",
                 cudaGetErrorString(status));
     const int resident_blocks = max_blocks_per_sm * properties.multiProcessorCount;
@@ -384,28 +383,28 @@ static torch::Tensor attention_glm_mla576_cached_impl(
         ncols * (2 + DV / 2);
     const int mask_stride = ((static_cast<int>(logical_len) + nbatch_fa - 1) /
                              nbatch_fa) * nbatch_fa;
-    TORCH_CHECK(mask.dim() == 2 && mask.size(0) >= M && mask.size(1) >= mask_stride &&
+    MFQ_RUNTIME_CHECK(mask.dim() == 2 && mask.size(0) >= M && mask.size(1) >= mask_stride &&
                 kv_max.numel() >= B * iter_j &&
                 (blocks_per_tile == 1 ||
                  static_cast<size_t>(meta.numel()) >= 2 * meta_float2),
                 "glm_mla576_cached: workspace too small");
 
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = mfq_current_cuda_stream();
     const int prep_blocks = std::min(
         65535, std::max(1, (M * mask_stride + 255) / 256));
     mfq_glm_mla_mask_kernel<<<prep_blocks, 256, 0, stream>>>(
-        reinterpret_cast<half *>(mask.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(mask.data_ptr<mfq_half>()),
         kv_max.data_ptr<int>(), B, M, static_cast<int>(logical_len),
         query_offset, static_cast<int>(mask.size(1)), iter_j,
         ncols1, nbatch_fa);
 
-    auto out = torch::empty({B, M, 64, DV}, q.options());
+    auto out = mfq_tensor_backend::empty({B, M, 64, DV}, q.options());
     const uint3 ne01 = init_fastdiv_values(M);
     kernel<<<rounded_blocks, dim3(32, nwarps, 1), shmem, stream>>>(
         reinterpret_cast<const char *>(q.data_ptr<float>()),
-        reinterpret_cast<const char *>(kv_cache.data_ptr<at::Half>()),
-        reinterpret_cast<const char *>(kv_cache.data_ptr<at::Half>()),
-        reinterpret_cast<const char *>(mask.data_ptr<at::Half>()),
+        reinterpret_cast<const char *>(kv_cache.data_ptr<mfq_half>()),
+        reinterpret_cast<const char *>(kv_cache.data_ptr<mfq_half>()),
+        reinterpret_cast<const char *>(mask.data_ptr<mfq_half>()),
         nullptr, kv_max.data_ptr<int>(), out.data_ptr<float>(),
         reinterpret_cast<float2 *>(meta.data_ptr<float>()),
         static_cast<float>(scale), 0.0f, 1.0f, 1.0f, 64, 0.0f,
@@ -425,7 +424,7 @@ static torch::Tensor attention_glm_mla576_cached_impl(
         M * static_cast<int>(mask.size(1)) * static_cast<int>(sizeof(half)),
         static_cast<int64_t>(M) * mask.size(1) * sizeof(half));
     status = cudaGetLastError();
-    TORCH_CHECK(status == cudaSuccess, "glm_mla576_cached launch failed: ",
+    MFQ_RUNTIME_CHECK(status == cudaSuccess, "glm_mla576_cached launch failed: ",
                 cudaGetErrorString(status));
 
     if (blocks_per_tile > 1) {
@@ -439,25 +438,25 @@ static torch::Tensor attention_glm_mla576_cached_impl(
                 M, 64, 1, rounded_blocks, 64, blocks_per_tile,
                 fd0, fd1, fd2);
         status = cudaGetLastError();
-        TORCH_CHECK(status == cudaSuccess, "glm_mla576_cached fixup failed: ",
+        MFQ_RUNTIME_CHECK(status == cudaSuccess, "glm_mla576_cached fixup failed: ",
                     cudaGetErrorString(status));
     }
     return out;
 }
 
-torch::Tensor attention_glm_mla576_cached_cuda(
-    torch::Tensor q, torch::Tensor kv_cache, int64_t logical_len,
-    torch::Tensor mask, torch::Tensor kv_max, torch::Tensor meta,
+mfq_tensor_backend::Tensor attention_glm_mla576_cached_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv_cache, int64_t logical_len,
+    mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor kv_max, mfq_tensor_backend::Tensor meta,
     double scale)
 {
-    TORCH_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == torch::kFloat32 &&
+    MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == mfq_tensor_backend::kFloat32 &&
                 kv_cache.is_cuda() && kv_cache.is_contiguous() &&
-                kv_cache.scalar_type() == torch::kFloat16 &&
-                mask.is_cuda() && mask.is_contiguous() && mask.scalar_type() == torch::kFloat16 &&
-                kv_max.is_cuda() && kv_max.is_contiguous() && kv_max.scalar_type() == torch::kInt32 &&
-                meta.is_cuda() && meta.is_contiguous() && meta.scalar_type() == torch::kFloat32,
+                kv_cache.scalar_type() == mfq_tensor_backend::kFloat16 &&
+                mask.is_cuda() && mask.is_contiguous() && mask.scalar_type() == mfq_tensor_backend::kFloat16 &&
+                kv_max.is_cuda() && kv_max.is_contiguous() && kv_max.scalar_type() == mfq_tensor_backend::kInt32 &&
+                meta.is_cuda() && meta.is_contiguous() && meta.scalar_type() == mfq_tensor_backend::kFloat32,
                 "glm_mla576_cached: unsupported dtype or placement");
-    TORCH_CHECK(q.dim() == 4 && q.size(1) == 64 && q.size(3) == 576 &&
+    MFQ_RUNTIME_CHECK(q.dim() == 4 && q.size(1) == 64 && q.size(3) == 576 &&
                 kv_cache.dim() == 4 && kv_cache.size(0) == q.size(0) &&
                 kv_cache.size(1) == 1 && kv_cache.size(3) == 576 &&
                 logical_len >= q.size(2) && logical_len <= kv_cache.size(2),
@@ -475,28 +474,28 @@ torch::Tensor attention_glm_mla576_cached_cuda(
         q, kv_cache, logical_len, mask, kv_max, meta, scale);
 }
 
-torch::Tensor attention_llama_flash256_swa_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale, int64_t window)
+mfq_tensor_backend::Tensor attention_llama_flash256_swa_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale, int64_t window)
 {
-    TORCH_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == mfq_tensor_backend::kFloat32,
                 "llama_flash256_swa: q must be contiguous CUDA f32");
-    TORCH_CHECK(k.is_cuda() && k.is_contiguous() && k.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(k.is_cuda() && k.is_contiguous() && k.scalar_type() == mfq_tensor_backend::kFloat16,
                 "llama_flash256_swa: k must be contiguous CUDA f16");
-    TORCH_CHECK(v.is_cuda() && v.is_contiguous() && v.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(v.is_cuda() && v.is_contiguous() && v.scalar_type() == mfq_tensor_backend::kFloat16,
                 "llama_flash256_swa: v must be contiguous CUDA f16");
-    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+    MFQ_RUNTIME_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
                 "llama_flash256_swa: rank must be 4");
     const int B = (int)q.size(0);
     const int Hq = (int)q.size(1);
     const int T = (int)q.size(2);
     const int D = (int)q.size(3);
     const int Hk = (int)k.size(1);
-    TORCH_CHECK(D == 256 && k.size(3) == D && v.size(3) == D,
+    MFQ_RUNTIME_CHECK(D == 256 && k.size(3) == D && v.size(3) == D,
                 "llama_flash256_swa: head_dim must be 256");
-    TORCH_CHECK(Hq == 2 * Hk && k.size(0) == B && v.size(0) == B &&
+    MFQ_RUNTIME_CHECK(Hq == 2 * Hk && k.size(0) == B && v.size(0) == B &&
                 k.size(2) == T && v.size(2) == T && v.size(1) == Hk,
                 "llama_flash256_swa: requires self-attention with GQA ratio 2");
-    TORCH_CHECK(window > 0 && window <= INT_MAX, "llama_flash256_swa: invalid window");
+    MFQ_RUNTIME_CHECK(window > 0 && window <= INT_MAX, "llama_flash256_swa: invalid window");
 
     if (T % FATTN_KQ_STRIDE == 0) {
         return mfq_llama_flash_launch<256, 256, 32, 2>(q, k, v, scale, true, (int)window);
@@ -509,31 +508,31 @@ torch::Tensor attention_llama_flash256_swa_cuda(
 
 template<int DKQ_EXPECTED, int DV_EXPECTED, int NCOLS1, int NCOLS2,
          bool V_IS_K_VIEW = false>
-static torch::Tensor attention_llama_flash_decode_impl(
-    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
-    torch::Tensor seq_len, double scale, int64_t planned_len,
-    torch::Tensor mask, torch::Tensor kv_max, torch::Tensor meta)
+static mfq_tensor_backend::Tensor attention_llama_flash_decode_impl(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    mfq_tensor_backend::Tensor seq_len, double scale, int64_t planned_len,
+    mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor kv_max, mfq_tensor_backend::Tensor meta)
 {
-    TORCH_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == mfq_tensor_backend::kFloat32,
                 "llama_flash_decode: q must be contiguous CUDA f32");
-    TORCH_CHECK(k_cache.is_cuda() && k_cache.is_contiguous() &&
-                k_cache.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(k_cache.is_cuda() && k_cache.is_contiguous() &&
+                k_cache.scalar_type() == mfq_tensor_backend::kFloat16,
                 "llama_flash_decode: k cache must be contiguous CUDA f16");
-    TORCH_CHECK(v_cache.is_cuda() && v_cache.is_contiguous() &&
-                v_cache.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(v_cache.is_cuda() && v_cache.is_contiguous() &&
+                v_cache.scalar_type() == mfq_tensor_backend::kFloat16,
                 "llama_flash_decode: v cache must be contiguous CUDA f16");
-    TORCH_CHECK(seq_len.is_cuda() && seq_len.is_contiguous() &&
-                seq_len.scalar_type() == torch::kInt64 && seq_len.numel() == 1,
+    MFQ_RUNTIME_CHECK(seq_len.is_cuda() && seq_len.is_contiguous() &&
+                seq_len.scalar_type() == mfq_tensor_backend::kInt64 && seq_len.numel() == 1,
                 "llama_flash_decode: seq_len must be contiguous CUDA int64[1]");
-    TORCH_CHECK(mask.is_cuda() && mask.is_contiguous() && mask.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(mask.is_cuda() && mask.is_contiguous() && mask.scalar_type() == mfq_tensor_backend::kFloat16 &&
                 mask.dim() == 2,
                 "llama_flash_decode: mask must be contiguous CUDA f16[B, stride]");
-    TORCH_CHECK(kv_max.is_cuda() && kv_max.is_contiguous() &&
-                kv_max.scalar_type() == torch::kInt32,
+    MFQ_RUNTIME_CHECK(kv_max.is_cuda() && kv_max.is_contiguous() &&
+                kv_max.scalar_type() == mfq_tensor_backend::kInt32,
                 "llama_flash_decode: kv_max must be contiguous CUDA int32[B]");
-    TORCH_CHECK(meta.is_cuda() && meta.is_contiguous() && meta.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(meta.is_cuda() && meta.is_contiguous() && meta.scalar_type() == mfq_tensor_backend::kFloat32,
                 "llama_flash_decode: meta must be contiguous CUDA f32");
-    TORCH_CHECK(q.dim() == 4 && q.size(2) == 1 && k_cache.dim() == 4 && v_cache.dim() == 4,
+    MFQ_RUNTIME_CHECK(q.dim() == 4 && q.size(2) == 1 && k_cache.dim() == 4 && v_cache.dim() == 4,
                 "llama_flash_decode: expected q[B,Hq,1,D], cache[B,Hk,max_seq,D]");
 
     const int B = (int)q.size(0);
@@ -541,19 +540,19 @@ static torch::Tensor attention_llama_flash_decode_impl(
     const int D = (int)q.size(3);
     const int Hk = (int)k_cache.size(1);
     const int max_seq = (int)k_cache.size(2);
-    TORCH_CHECK(D == DKQ_EXPECTED && k_cache.size(3) == DKQ_EXPECTED &&
+    MFQ_RUNTIME_CHECK(D == DKQ_EXPECTED && k_cache.size(3) == DKQ_EXPECTED &&
                 v_cache.size(3) ==
                     (V_IS_K_VIEW ? DKQ_EXPECTED : DV_EXPECTED),
                  "llama_flash_decode: unexpected head_dim");
-    TORCH_CHECK(Hq % Hk == 0 && Hq / Hk >= NCOLS2 &&
+    MFQ_RUNTIME_CHECK(Hq % Hk == 0 && Hq / Hk >= NCOLS2 &&
                 (Hq / Hk) % NCOLS2 == 0 &&
                 k_cache.size(0) == B && v_cache.size(0) == B &&
                  v_cache.size(1) == Hk && v_cache.size(2) == max_seq,
                  "llama_flash_decode: unsupported GQA ratio");
-    TORCH_CHECK(planned_len >= 1 && planned_len <= max_seq,
+    MFQ_RUNTIME_CHECK(planned_len >= 1 && planned_len <= max_seq,
                 "llama_flash_decode: planned_len is outside cache capacity");
     const int mask_stride = (int)mask.size(1);
-    TORCH_CHECK(mask.size(0) == B && mask_stride >= planned_len && kv_max.numel() >= B,
+    MFQ_RUNTIME_CHECK(mask.size(0) == B && mask_stride >= planned_len && kv_max.numel() >= B,
                 "llama_flash_decode: workspace shape mismatch");
 
     constexpr int ncols1 = NCOLS1;
@@ -562,10 +561,10 @@ static torch::Tensor attention_llama_flash_decode_impl(
     int device = 0;
     cudaDeviceProp properties{};
     auto status = cudaGetDevice(&device);
-    TORCH_CHECK(status == cudaSuccess, "llama_flash_decode: cudaGetDevice failed: ",
+    MFQ_RUNTIME_CHECK(status == cudaSuccess, "llama_flash_decode: cudaGetDevice failed: ",
                 cudaGetErrorString(status));
     status = cudaGetDeviceProperties(&properties, device);
-    TORCH_CHECK(status == cudaSuccess, "llama_flash_decode: cudaGetDeviceProperties failed: ",
+    MFQ_RUNTIME_CHECK(status == cudaSuccess, "llama_flash_decode: cudaGetDeviceProperties failed: ",
                 cudaGetErrorString(status));
     const int cc = properties.major * 100 + properties.minor * 10;
     const int nthreads = ggml_cuda_fattn_mma_get_nthreads(DKQ_EXPECTED, DV_EXPECTED, ncols, cc);
@@ -594,11 +593,11 @@ static torch::Tensor attention_llama_flash_decode_impl(
     Kernel kernel = flash_attn_ext_f16<
         DKQ_EXPECTED, DV_EXPECTED, ncols1, ncols2, false, V_IS_K_VIEW>;
     static bool shmem_set[32] = {};
-    TORCH_CHECK(device >= 0 && device < 32, "llama_flash_decode: unsupported CUDA device index");
+    MFQ_RUNTIME_CHECK(device >= 0 && device < 32, "llama_flash_decode: unsupported CUDA device index");
     if (!shmem_set[device]) {
         status = cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
-        TORCH_CHECK(status == cudaSuccess,
+        MFQ_RUNTIME_CHECK(status == cudaSuccess,
                     "llama_flash_decode: cudaFuncSetAttribute failed: ",
                     cudaGetErrorString(status));
         shmem_set[device] = true;
@@ -611,7 +610,7 @@ static torch::Tensor attention_llama_flash_decode_impl(
     int max_blocks_per_sm = 0;
     status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &max_blocks_per_sm, kernel, 32 * nwarps, shmem);
-    TORCH_CHECK(status == cudaSuccess && max_blocks_per_sm > 0,
+    MFQ_RUNTIME_CHECK(status == cudaSuccess && max_blocks_per_sm > 0,
                 "llama_flash_decode: occupancy query failed: ", cudaGetErrorString(status));
     const int resident_blocks = max_blocks_per_sm * properties.multiProcessorCount;
     const int tile_waves = (ntiles_dst + resident_blocks - 1) / resident_blocks;
@@ -620,28 +619,30 @@ static torch::Tensor attention_llama_flash_decode_impl(
     const char * stream_k_env = std::getenv("MFQ_LLAMA_FLASH_DECODE_STREAMK");
     if (stream_k_env != nullptr) stream_k = stream_k_env[0] != '0';
     const int raw_blocks = stream_k
-        ? min(resident_blocks, ntiles_dst * ntiles_kv)
+        ? std::min(resident_blocks, ntiles_dst * ntiles_kv)
         : ntiles_dst;
-    const int rounded_blocks = max(ntiles_dst, (raw_blocks / ntiles_dst) * ntiles_dst);
+    const int rounded_blocks = std::max(
+        ntiles_dst, (raw_blocks / ntiles_dst) * ntiles_dst);
     const int blocks_per_tile = rounded_blocks / ntiles_dst;
     const size_t meta_float2 = (size_t)rounded_blocks * ncols * (2 + DV_EXPECTED / 2);
-    TORCH_CHECK((size_t)meta.numel() >= 2 * meta_float2,
+    MFQ_RUNTIME_CHECK((size_t)meta.numel() >= 2 * meta_float2,
                 "llama_flash_decode: meta workspace too small");
 
-    auto stream = at::cuda::getCurrentCUDAStream();
-    const int prep_blocks = min(65535, max(1, (B * mask_stride + 255) / 256));
+    auto stream = mfq_current_cuda_stream();
+    const int prep_blocks = std::min(
+        65535, std::max(1, (B * mask_stride + 255) / 256));
     mfq_decode_mask_kernel<<<prep_blocks, 256, 0, stream>>>(
-        reinterpret_cast<half*>(mask.data_ptr<at::Half>()), kv_max.data_ptr<int>(),
+        reinterpret_cast<half*>(mask.data_ptr<mfq_half>()), kv_max.data_ptr<int>(),
         seq_len.data_ptr<int64_t>(), B, mask_stride, nbatch_fa);
 
-    auto out = torch::empty({B, 1, Hq, DV_EXPECTED}, q.options());
+    auto out = mfq_tensor_backend::empty({B, 1, Hq, DV_EXPECTED}, q.options());
     const uint3 ne01 = init_fastdiv_values(1);
     const uint32_t n_head_log2 = 1u << (uint32_t)floorf(log2f((float)Hq));
     kernel<<<rounded_blocks, dim3(32, nwarps, 1), shmem, stream>>>(
         reinterpret_cast<const char*>(q.data_ptr<float>()),
-        reinterpret_cast<const char*>(k_cache.data_ptr<at::Half>()),
-        reinterpret_cast<const char*>(v_cache.data_ptr<at::Half>()),
-        reinterpret_cast<const char*>(mask.data_ptr<at::Half>()),
+        reinterpret_cast<const char*>(k_cache.data_ptr<mfq_half>()),
+        reinterpret_cast<const char*>(v_cache.data_ptr<mfq_half>()),
+        reinterpret_cast<const char*>(mask.data_ptr<mfq_half>()),
         nullptr, kv_max.data_ptr<int>(), out.data_ptr<float>(),
         reinterpret_cast<float2*>(meta.data_ptr<float>()),
         (float)scale, 0.0f, 1.0f, 1.0f, n_head_log2, 0.0f,
@@ -656,7 +657,7 @@ static torch::Tensor attention_llama_flash_decode_impl(
         mask_stride * (int)sizeof(half), mask_stride * (int)sizeof(half),
         (int64_t)mask_stride * (int)sizeof(half));
     status = cudaGetLastError();
-    TORCH_CHECK(status == cudaSuccess, "llama_flash_decode launch failed: ",
+    MFQ_RUNTIME_CHECK(status == cudaSuccess, "llama_flash_decode launch failed: ",
                 cudaGetErrorString(status));
 
     if (blocks_per_tile > 1) {
@@ -668,43 +669,43 @@ static torch::Tensor attention_llama_flash_decode_impl(
                 out.data_ptr<float>(), reinterpret_cast<const float2*>(meta.data_ptr<float>()),
                 1, Hq, Hk, rounded_blocks, gqa_ratio, blocks_per_tile, fd0, fd1, fd2);
         status = cudaGetLastError();
-        TORCH_CHECK(status == cudaSuccess, "llama_flash_decode fixup launch failed: ",
+        MFQ_RUNTIME_CHECK(status == cudaSuccess, "llama_flash_decode fixup launch failed: ",
                     cudaGetErrorString(status));
     }
     return out;
 }
 
-torch::Tensor attention_llama_flash256_decode_cuda(
-    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
-    torch::Tensor seq_len, double scale, int64_t planned_len,
-    torch::Tensor mask, torch::Tensor kv_max, torch::Tensor meta)
+mfq_tensor_backend::Tensor attention_llama_flash256_decode_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    mfq_tensor_backend::Tensor seq_len, double scale, int64_t planned_len,
+    mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor kv_max, mfq_tensor_backend::Tensor meta)
 {
     return attention_llama_flash_decode_impl<256, 256, 1, 8>(
         q, k_cache, v_cache, seq_len, scale, planned_len, mask, kv_max, meta);
 }
 
-torch::Tensor attention_llama_flash512_decode_cuda(
-    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
-    torch::Tensor seq_len, double scale, int64_t planned_len,
-    torch::Tensor mask, torch::Tensor kv_max, torch::Tensor meta)
+mfq_tensor_backend::Tensor attention_llama_flash512_decode_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    mfq_tensor_backend::Tensor seq_len, double scale, int64_t planned_len,
+    mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor kv_max, mfq_tensor_backend::Tensor meta)
 {
     return attention_llama_flash_decode_impl<512, 512, 1, 8>(
         q, k_cache, v_cache, seq_len, scale, planned_len, mask, kv_max, meta);
 }
 
-torch::Tensor attention_glm_mla576_decode_cuda(
-    torch::Tensor q, torch::Tensor kv_cache, torch::Tensor seq_len,
-    double scale, int64_t planned_len, torch::Tensor mask,
-    torch::Tensor kv_max, torch::Tensor meta)
+mfq_tensor_backend::Tensor attention_glm_mla576_decode_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv_cache, mfq_tensor_backend::Tensor seq_len,
+    double scale, int64_t planned_len, mfq_tensor_backend::Tensor mask,
+    mfq_tensor_backend::Tensor kv_max, mfq_tensor_backend::Tensor meta)
 {
     return attention_llama_flash_decode_impl<576, 512, 1, 16, true>(
         q, kv_cache, kv_cache, seq_len, scale, planned_len, mask, kv_max, meta);
 }
 
-torch::Tensor attention_llama_flash256_swa_decode_cuda(
-    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
-    torch::Tensor seq_len, double scale, int64_t planned_len,
-    torch::Tensor mask, torch::Tensor kv_max, torch::Tensor meta)
+mfq_tensor_backend::Tensor attention_llama_flash256_swa_decode_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    mfq_tensor_backend::Tensor seq_len, double scale, int64_t planned_len,
+    mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor kv_max, mfq_tensor_backend::Tensor meta)
 {
     return attention_llama_flash_decode_impl<256, 256, 4, 2>(
         q, k_cache, v_cache, seq_len, scale, planned_len, mask, kv_max, meta);

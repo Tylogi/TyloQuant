@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -9,6 +10,9 @@ from types import SimpleNamespace
 import pytest
 
 from mfq.commands import build
+
+
+ROOT = Path(__file__).parents[1]
 
 
 def test_cli_parser_does_not_import_quantization_or_server_frameworks() -> None:
@@ -95,6 +99,115 @@ def test_build_plan_selects_only_the_metal_server_target_and_forwards_cmake_args
     assert "-DMFQ_BUILD_METAL_RUNTIME=ON" in plan.configure_command
     assert "-DMFQ_EXPERIMENTAL_KERNEL=ON" in plan.configure_command
     assert plan.build_command[-2:] == ("-j", "3")
+
+
+def test_cuda_build_plan_is_native_and_does_not_import_or_configure_torch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "source"
+    (root / "cpp_runtime").mkdir(parents=True)
+    (root / "cpp_runtime" / "CMakeLists.txt").write_text("", encoding="utf-8")
+    monkeypatch.setattr(build, "repository_root", lambda: root)
+    monkeypatch.setattr(build, "detect_backend", lambda _: "cuda")
+    monkeypatch.setattr(
+        build.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"cmake", "ninja"} else None,
+    )
+
+    plan = build.create_build_plan(
+        backend="cuda",
+        build_dir=tmp_path / "output",
+        jobs=2,
+    )
+
+    command = " ".join(plan.configure_command)
+    assert plan.target == "mfq-decode"
+    assert "MFQ_BUILD_TORCH_REFERENCE_RUNTIME=OFF" in command
+    assert "CMAKE_PREFIX_PATH" not in command
+    assert "Python_EXECUTABLE" not in command
+    source = (ROOT / "mfq" / "commands" / "build.py").read_text(encoding="utf-8")
+    assert "import torch" not in source
+    assert "from torch" not in source
+
+
+def test_default_cuda_cmake_target_has_no_python_or_libtorch_dependency() -> None:
+    cmake = (ROOT / "cpp_runtime" / "CMakeLists.txt").read_text(encoding="utf-8")
+    native_start = cmake.index("add_executable(mfq-decode\n")
+    reference_start = cmake.index("option(\n    MFQ_BUILD_TORCH_REFERENCE_RUNTIME")
+    native_target = cmake[native_start:reference_start]
+
+    assert "MFQ_NATIVE_CUDA_RUNTIME=1" in native_target
+    assert "mfq-cuda-core" in native_target
+    assert "mfq-cuda-native-kernels" in native_target
+    assert "TORCH_LIBRARIES" not in native_target
+    assert "Python::Python" not in native_target
+    assert "find_package(Torch" not in native_target
+    assert "find_package(Python" not in native_target
+
+    assert "MFQ_BUILD_TORCH_REFERENCE_RUNTIME" in cmake
+    assert "find_package(Torch REQUIRED)" in cmake[reference_start:]
+    assert "add_executable(mfq-decode-torch" in cmake[reference_start:]
+
+
+def test_native_cuda_runtime_compilation_units_do_not_include_torch() -> None:
+    cmake = (ROOT / "cpp_runtime" / "CMakeLists.txt").read_text(encoding="utf-8")
+    source_block = cmake.split("set(MFQ_CUDA_KERNEL_SOURCES", 1)[1].split(")", 1)[0]
+    sources = [
+        ROOT / "cpp_runtime" / "mfq_decode.cpp",
+        ROOT / "cpp_runtime" / "minicpmo45_runtime.inc",
+        *(
+            ROOT / "mfq" / "kernels" / "cuda" / name
+            for name in re.findall(r"\.\./mfq/kernels/cuda/([^\s]+\.cu)", source_block)
+        ),
+    ]
+    forbidden = ("<torch", "<ATen", "<c10", "torch::", "at::", "c10::")
+
+    assert len(sources) > 20
+    for source_path in sources:
+        source = source_path.read_text(encoding="utf-8")
+        assert not any(token in source for token in forbidden), source_path
+
+    native_start = cmake.index("add_executable(mfq-decode\n")
+    reference_start = cmake.index("option(\n    MFQ_BUILD_TORCH_REFERENCE_RUNTIME")
+    assert "mfq_cuda.cpp" not in cmake[native_start:reference_start]
+
+
+def test_native_cuda_cmake_uses_consistent_windows_cuda_settings() -> None:
+    cmake = (ROOT / "cpp_runtime" / "CMakeLists.txt").read_text(encoding="utf-8")
+
+    assert "--expt-relaxed-constexpr" in cmake
+    assert "--extended-lambda" in cmake
+    assert cmake.count("CUDA_RUNTIME_LIBRARY Shared") >= 7
+
+    activation_start = cmake.index("add_executable(mfq-cuda-activation-test")
+    activation_end = cmake.index(
+        "add_test(NAME mfq-cuda-activation-test", activation_start
+    )
+    activation_target = cmake[activation_start:activation_end]
+    assert "CUDA_STANDARD 20" in activation_target
+    assert "CUDA_STANDARD_REQUIRED ON" in activation_target
+
+
+def test_native_cuda_buffer_retains_its_selected_stream() -> None:
+    header = (ROOT / "cpp_runtime" / "cuda" / "mfq_cuda_context.h").read_text(
+        encoding="utf-8"
+    )
+    source = (ROOT / "cpp_runtime" / "cuda" / "mfq_cuda_context.cu").read_text(
+        encoding="utf-8"
+    )
+
+    stream_class = header[
+        header.index("class Stream final") : header.index("class StreamHandle final")
+    ]
+    buffer_class = header[
+        header.index("class Buffer final") : header.index("class HostBuffer final")
+    ]
+    assert "cudaStream_t stream_ = nullptr;" in stream_class
+    assert "StreamHandle stream_;" in buffer_class
+    assert "std::shared_ptr<Stream>(context, stream)" in source
+    assert "stream_ = current_stream(context_->device());" in source
+    assert "context_->release(data_, stream_.stream());" in source
 
 
 def test_double_dash_arguments_are_forwarded_without_the_separator(monkeypatch) -> None:

@@ -9,12 +9,10 @@
 // inputs use [tokens, K], while routed/down-projection inputs use
 // [tokens, routes, K]. ids_dst identifies either source row directly.
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAException.h>
 #include <cuda_fp16.h>
+#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
 #include <cuda_runtime.h>
 #include <mma.h>
-#include <torch/extension.h>
 
 #include <algorithm>
 #include <cfloat>
@@ -147,7 +145,7 @@ __device__ __forceinline__ const T * ptr_from_i64(int64_t value) {
 }
 
 template <>
-__device__ __forceinline__ float load_float<at::Half>(const at::Half * ptr, int index) {
+__device__ __forceinline__ float load_float<mfq_half>(const mfq_half * ptr, int index) {
     return __half2float(*reinterpret_cast<const __half *>(ptr + index));
 }
 
@@ -3075,38 +3073,38 @@ __global__ void moe_weighted_reduce_shared_gate_kernel(
     }
 }
 
-void check_same_device(const torch::Tensor & reference, const torch::Tensor & tensor, const char * name) {
-    TORCH_CHECK(tensor.device() == reference.device(), name, " must be on ", reference.device());
+void check_same_device(const mfq_tensor_backend::Tensor & reference, const mfq_tensor_backend::Tensor & tensor, const char * name) {
+    MFQ_RUNTIME_CHECK(tensor.device() == reference.device(), name, " must be on ", reference.device());
 }
 
 void check_nint_weight(
-        const torch::Tensor & q_packed,
-        const torch::Tensor & sub_scale,
-        const torch::Tensor & sub_min,
-        const torch::Tensor & neuron_scale,
-        const torch::Tensor & neuron_min,
+        const mfq_tensor_backend::Tensor & q_packed,
+        const mfq_tensor_backend::Tensor & sub_scale,
+        const mfq_tensor_backend::Tensor & sub_min,
+        const mfq_tensor_backend::Tensor & neuron_scale,
+        const mfq_tensor_backend::Tensor & neuron_min,
         int local_experts,
         int out_per_expert,
         int gs,
         int bits) {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.is_contiguous() && q_packed.scalar_type() == torch::kUInt8,
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.is_contiguous() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8,
         "q_packed must be contiguous CUDA uint8");
-    TORCH_CHECK(q_packed.dim() == 3, "q_packed must have [experts*out, groups, qbytes] shape");
+    MFQ_RUNTIME_CHECK(q_packed.dim() == 3, "q_packed must have [experts*out, groups, qbytes] shape");
     const int rows = local_experts * out_per_expert;
     const int groups = static_cast<int>(q_packed.size(1));
     const int qbytes = (gs * bits + 7) / 8;
-    TORCH_CHECK(q_packed.size(0) == rows && q_packed.size(2) == qbytes,
+    MFQ_RUNTIME_CHECK(q_packed.size(0) == rows && q_packed.size(2) == qbytes,
         "q_packed shape does not match experts/out/gs/bits");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.is_contiguous() && sub_scale.scalar_type() == torch::kUInt8 &&
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.is_contiguous() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 &&
         sub_scale.size(0) == rows && sub_scale.size(1) == groups,
         "sub_scale must have contiguous CUDA uint8 [experts*out, groups] shape");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.is_contiguous() && sub_min.scalar_type() == torch::kUInt8 &&
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.is_contiguous() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 &&
         sub_min.sizes() == sub_scale.sizes(), "sub_min shape mismatch");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.is_contiguous() &&
-        neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.numel() == rows,
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.is_contiguous() &&
+        neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.numel() == rows,
         "neuron_scale shape mismatch");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.is_contiguous() &&
-        neuron_min.scalar_type() == torch::kFloat32 && neuron_min.numel() == rows,
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.is_contiguous() &&
+        neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.numel() == rows,
         "neuron_min shape mismatch");
     check_same_device(q_packed, sub_scale, "sub_scale");
     check_same_device(q_packed, sub_min, "sub_min");
@@ -3115,31 +3113,31 @@ void check_nint_weight(
 }
 
 void build_expert_map(
-        const torch::Tensor & ids,
+        const mfq_tensor_backend::Tensor & ids,
         int experts,
         int tile_m,
-        torch::Tensor & counts,
-        torch::Tensor & cursors,
-        torch::Tensor & ids_dst,
-        torch::Tensor & expert_bounds,
-        torch::Tensor & tile_bounds,
-        torch::Tensor & tile_experts,
+        mfq_tensor_backend::Tensor & counts,
+        mfq_tensor_backend::Tensor & cursors,
+        mfq_tensor_backend::Tensor & ids_dst,
+        mfq_tensor_backend::Tensor & expert_bounds,
+        mfq_tensor_backend::Tensor & tile_bounds,
+        mfq_tensor_backend::Tensor & tile_experts,
         cudaStream_t stream) {
     const int pairs = static_cast<int>(ids.numel());
-    TORCH_CHECK(counts.is_cuda() && counts.is_contiguous() && counts.scalar_type() == torch::kInt32 &&
+    MFQ_RUNTIME_CHECK(counts.is_cuda() && counts.is_contiguous() && counts.scalar_type() == mfq_tensor_backend::kInt32 &&
         counts.numel() >= experts, "counts workspace is too small");
-    TORCH_CHECK(cursors.is_cuda() && cursors.is_contiguous() && cursors.scalar_type() == torch::kInt32 &&
+    MFQ_RUNTIME_CHECK(cursors.is_cuda() && cursors.is_contiguous() && cursors.scalar_type() == mfq_tensor_backend::kInt32 &&
         cursors.numel() >= experts, "cursors workspace is too small");
-    TORCH_CHECK(ids_dst.is_cuda() && ids_dst.is_contiguous() && ids_dst.scalar_type() == torch::kInt32 &&
+    MFQ_RUNTIME_CHECK(ids_dst.is_cuda() && ids_dst.is_contiguous() && ids_dst.scalar_type() == mfq_tensor_backend::kInt32 &&
         ids_dst.numel() >= pairs, "ids_dst workspace is too small");
-    TORCH_CHECK(expert_bounds.is_cuda() && expert_bounds.is_contiguous() &&
-        expert_bounds.scalar_type() == torch::kInt32 && expert_bounds.numel() >= experts + 1,
+    MFQ_RUNTIME_CHECK(expert_bounds.is_cuda() && expert_bounds.is_contiguous() &&
+        expert_bounds.scalar_type() == mfq_tensor_backend::kInt32 && expert_bounds.numel() >= experts + 1,
         "expert_bounds workspace is too small");
-    TORCH_CHECK(tile_bounds.is_cuda() && tile_bounds.is_contiguous() &&
-        tile_bounds.scalar_type() == torch::kInt32 && tile_bounds.numel() >= experts + 1,
+    MFQ_RUNTIME_CHECK(tile_bounds.is_cuda() && tile_bounds.is_contiguous() &&
+        tile_bounds.scalar_type() == mfq_tensor_backend::kInt32 && tile_bounds.numel() >= experts + 1,
         "tile_bounds workspace is too small");
-    TORCH_CHECK(tile_experts.is_cuda() && tile_experts.is_contiguous() &&
-        tile_experts.scalar_type() == torch::kInt32 && tile_experts.numel() >= pairs,
+    MFQ_RUNTIME_CHECK(tile_experts.is_cuda() && tile_experts.is_contiguous() &&
+        tile_experts.scalar_type() == mfq_tensor_backend::kInt32 && tile_experts.numel() >= pairs,
         "tile_experts workspace is too small");
     check_same_device(ids, counts, "counts");
     check_same_device(ids, cursors, "cursors");
@@ -3148,7 +3146,7 @@ void build_expert_map(
     check_same_device(ids, tile_bounds, "tile_bounds");
     check_same_device(ids, tile_experts, "tile_experts");
 
-    C10_CUDA_CHECK(cudaMemsetAsync(counts.data_ptr<int32_t>(), 0, experts * sizeof(int32_t), stream));
+    MFQ_CUDA_CHECK(cudaMemsetAsync(counts.data_ptr<int32_t>(), 0, experts * sizeof(int32_t), stream));
     const int block = 256;
     const int grid = std::min((pairs + block - 1) / block, 65535);
     count_experts_kernel<<<grid, block, 0, stream>>>(
@@ -3161,14 +3159,14 @@ void build_expert_map(
     scatter_routes_kernel<<<grid, block, 0, stream>>>(
         ids.data_ptr<int32_t>(), expert_bounds.data_ptr<int32_t>(), cursors.data_ptr<int32_t>(),
         ids_dst.data_ptr<int32_t>(), pairs, experts);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template <int GS>
 void launch_quantize(
-        const torch::Tensor & x,
-        torch::Tensor & qx,
-        torch::Tensor & xscale,
+        const mfq_tensor_backend::Tensor & x,
+        mfq_tensor_backend::Tensor & qx,
+        mfq_tensor_backend::Tensor & xscale,
         int rows,
         int k_real,
         int k_pad,
@@ -3176,15 +3174,15 @@ void launch_quantize(
         cudaStream_t stream) {
     constexpr int block = ((GS + 31) / 32) * 32;
     quantize_moe_input_kernel<GS, block><<<dim3(rows, groups), block, 0, stream>>>(
-        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
         qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), rows, k_real, k_pad);
 }
 
 template <int GS, bool GELU, bool CLAMPED = false>
 void launch_quantize_glu(
-        const torch::Tensor & gate_up,
-        torch::Tensor & qx,
-        torch::Tensor & xscale,
+        const mfq_tensor_backend::Tensor & gate_up,
+        mfq_tensor_backend::Tensor & qx,
+        mfq_tensor_backend::Tensor & xscale,
         int rows,
         int k_real,
         int k_pad,
@@ -3194,27 +3192,27 @@ void launch_quantize_glu(
     constexpr int block = ((GS + 31) / 32) * 32;
     quantize_moe_glu_input_kernel<GS, block, GELU, CLAMPED><<<
         dim3(rows, groups), block, 0, stream>>>(
-        reinterpret_cast<const __half *>(gate_up.data_ptr<at::Half>()),
+        reinterpret_cast<const __half *>(gate_up.data_ptr<mfq_half>()),
         qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
         rows, k_real, k_pad, limit);
 }
 
 template <int BITS, int GS>
 void launch_grouped_matmul(
-        const torch::Tensor & q_packed,
-        const torch::Tensor & sub_scale,
-        const torch::Tensor & sub_min,
-        const torch::Tensor & neuron_scale,
-        const torch::Tensor & neuron_min,
-        const torch::Tensor & qx,
-        const torch::Tensor & xscale,
-        const torch::Tensor & ids,
-        const torch::Tensor & expert_local,
-        const torch::Tensor & ids_dst,
-        const torch::Tensor & expert_bounds,
-        const torch::Tensor & tile_bounds,
-        const torch::Tensor & tile_experts,
-        torch::Tensor & out,
+        const mfq_tensor_backend::Tensor & q_packed,
+        const mfq_tensor_backend::Tensor & sub_scale,
+        const mfq_tensor_backend::Tensor & sub_min,
+        const mfq_tensor_backend::Tensor & neuron_scale,
+        const mfq_tensor_backend::Tensor & neuron_min,
+        const mfq_tensor_backend::Tensor & qx,
+        const mfq_tensor_backend::Tensor & xscale,
+        const mfq_tensor_backend::Tensor & ids,
+        const mfq_tensor_backend::Tensor & expert_local,
+        const mfq_tensor_backend::Tensor & ids_dst,
+        const mfq_tensor_backend::Tensor & expert_bounds,
+        const mfq_tensor_backend::Tensor & tile_bounds,
+        const mfq_tensor_backend::Tensor & tile_experts,
+        mfq_tensor_backend::Tensor & out,
         int tokens,
         int routes,
         int experts,
@@ -3243,7 +3241,7 @@ void launch_grouped_matmul(
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
                 xscale.data_ptr<float>(), ids_dst.data_ptr<int32_t>(), expert_bounds.data_ptr<int32_t>(),
                 tile_bounds.data_ptr<int32_t>(), tile_experts.data_ptr<int32_t>(),
-                expert_local.data_ptr<int32_t>(), reinterpret_cast<__half *>(out.data_ptr<at::Half>()),
+                expert_local.data_ptr<int32_t>(), reinterpret_cast<__half *>(out.data_ptr<mfq_half>()),
                 routes, experts, out_per_expert, groups, k_pad, routed_input);
             return;
         }
@@ -3256,7 +3254,7 @@ void launch_grouped_matmul(
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(),
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
                 xscale.data_ptr<float>(), ids.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(),
-                reinterpret_cast<__half *>(out.data_ptr<at::Half>()), tokens, routes, experts,
+                reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), tokens, routes, experts,
                 out_per_expert, groups, k_pad, routed_input);
         } else if (token_warps == 16) {
             nint_moe_mmvq_kernel<BITS, GS, 16><<<
@@ -3264,7 +3262,7 @@ void launch_grouped_matmul(
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(),
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
                 xscale.data_ptr<float>(), ids.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(),
-                reinterpret_cast<__half *>(out.data_ptr<at::Half>()), tokens, routes, experts,
+                reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), tokens, routes, experts,
                 out_per_expert, groups, k_pad, routed_input);
         } else {
             nint_moe_mmvq_kernel<BITS, GS, 32><<<
@@ -3272,7 +3270,7 @@ void launch_grouped_matmul(
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(),
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
                 xscale.data_ptr<float>(), ids.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(),
-                reinterpret_cast<__half *>(out.data_ptr<at::Half>()), tokens, routes, experts,
+                reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), tokens, routes, experts,
                 out_per_expert, groups, k_pad, routed_input);
         }
         return;
@@ -3304,7 +3302,7 @@ void launch_grouped_matmul(
                         q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(),
                         neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
                         xscale.data_ptr<float>(), ids.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(),
-                        reinterpret_cast<__half *>(out.data_ptr<at::Half>()), routes, experts,
+                        reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), routes, experts,
                         out_per_expert, groups, k_pad, routed_input);
                     return;
                 }
@@ -3314,7 +3312,7 @@ void launch_grouped_matmul(
                         q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(),
                         neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
                         xscale.data_ptr<float>(), ids.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(),
-                        reinterpret_cast<__half *>(out.data_ptr<at::Half>()), routes, experts,
+                        reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), routes, experts,
                         out_per_expert, groups, k_pad, routed_input);
                     return;
                 }
@@ -3324,7 +3322,7 @@ void launch_grouped_matmul(
                         q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(),
                         neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
                         xscale.data_ptr<float>(), ids.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(),
-                        reinterpret_cast<__half *>(out.data_ptr<at::Half>()), tokens, routes, experts,
+                        reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), tokens, routes, experts,
                         out_per_expert, groups, k_pad, routed_input);
                     return;
                 }
@@ -3333,28 +3331,28 @@ void launch_grouped_matmul(
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(),
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
                 xscale.data_ptr<float>(), ids.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(),
-                reinterpret_cast<__half *>(out.data_ptr<at::Half>()), tokens, routes, experts,
+                reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), tokens, routes, experts,
                 out_per_expert, groups, k_pad, routed_input);
         } else if (tokens <= 2) {
             nint_moe_mmvq_kernel<BITS, GS, 2><<<dim3(row_blocks, routes, 1), dim3(32, 2), 0, stream>>>(
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(),
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
                 xscale.data_ptr<float>(), ids.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(),
-                reinterpret_cast<__half *>(out.data_ptr<at::Half>()), tokens, routes, experts,
+                reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), tokens, routes, experts,
                 out_per_expert, groups, k_pad, routed_input);
         } else if (tokens <= 4) {
             nint_moe_mmvq_kernel<BITS, GS, 4><<<dim3(row_blocks, routes, 1), dim3(32, 4), 0, stream>>>(
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(),
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
                 xscale.data_ptr<float>(), ids.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(),
-                reinterpret_cast<__half *>(out.data_ptr<at::Half>()), tokens, routes, experts,
+                reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), tokens, routes, experts,
                 out_per_expert, groups, k_pad, routed_input);
         } else {
             nint_moe_mmvq_kernel<BITS, GS, 8><<<dim3(row_blocks, routes, 1), dim3(32, 8), 0, stream>>>(
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(),
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
                 xscale.data_ptr<float>(), ids.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(),
-                reinterpret_cast<__half *>(out.data_ptr<at::Half>()), tokens, routes, experts,
+                reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), tokens, routes, experts,
                 out_per_expert, groups, k_pad, routed_input);
         }
         return;
@@ -3376,33 +3374,33 @@ void launch_grouped_matmul(
             neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
             xscale.data_ptr<float>(), ids_dst.data_ptr<int32_t>(), expert_bounds.data_ptr<int32_t>(),
             tile_bounds.data_ptr<int32_t>(), tile_experts.data_ptr<int32_t>(),
-            expert_local.data_ptr<int32_t>(), reinterpret_cast<__half *>(out.data_ptr<at::Half>()),
+            expert_local.data_ptr<int32_t>(), reinterpret_cast<__half *>(out.data_ptr<mfq_half>()),
             routes, experts, out_per_expert, groups, routed_input);
         return;
     }
 
     const int max_tiles = (pairs + kRouteTile - 1) / kRouteTile + experts;
     const int64_t blocks = static_cast<int64_t>(row_tiles) * max_tiles;
-    TORCH_CHECK(blocks <= INT_MAX, "grouped NINT launch grid is too large");
+    MFQ_RUNTIME_CHECK(blocks <= INT_MAX, "grouped NINT launch grid is too large");
     nint_moe_grouped_tile_kernel<BITS, GS, kRouteTile><<<static_cast<int>(blocks), dim3(32, 4), 0, stream>>>(
         q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(),
         neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
         xscale.data_ptr<float>(), ids_dst.data_ptr<int32_t>(), expert_bounds.data_ptr<int32_t>(),
         tile_bounds.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(),
-        reinterpret_cast<__half *>(out.data_ptr<at::Half>()),
+        reinterpret_cast<__half *>(out.data_ptr<mfq_half>()),
         routes, experts, out_per_expert, groups, k_pad, max_tiles, routed_input);
 }
 
 void launch_nint8_zero_moe_mma(
-        const torch::Tensor & q,
-        const torch::Tensor & scale,
-        const torch::Tensor & expert_local,
-        const torch::Tensor & x,
-        const torch::Tensor & ids_dst,
-        const torch::Tensor & expert_bounds,
-        const torch::Tensor & tile_bounds,
-        const torch::Tensor & tile_experts,
-        torch::Tensor & out,
+        const mfq_tensor_backend::Tensor & q,
+        const mfq_tensor_backend::Tensor & scale,
+        const mfq_tensor_backend::Tensor & expert_local,
+        const mfq_tensor_backend::Tensor & x,
+        const mfq_tensor_backend::Tensor & ids_dst,
+        const mfq_tensor_backend::Tensor & expert_bounds,
+        const mfq_tensor_backend::Tensor & tile_bounds,
+        const mfq_tensor_backend::Tensor & tile_experts,
+        mfq_tensor_backend::Tensor & out,
         int tokens,
         int routes,
         int experts,
@@ -3435,12 +3433,12 @@ void launch_nint8_zero_moe_mma(
 #define MFQ_Q8_ZERO_MOE_MMA(BM_VALUE) \
     nint8_zero_moe_mma_kernel<BM_VALUE><<<blocks, threads, 0, stream>>>( \
         q.data_ptr<uint8_t>(), \
-        reinterpret_cast<const __half *>(scale.data_ptr<at::Half>()), \
+        reinterpret_cast<const __half *>(scale.data_ptr<mfq_half>()), \
         expert_local.data_ptr<int32_t>(), \
-        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()), \
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), \
         ids_dst.data_ptr<int32_t>(), expert_bounds.data_ptr<int32_t>(), \
         tile_bounds.data_ptr<int32_t>(), tile_experts.data_ptr<int32_t>(), \
-        reinterpret_cast<__half *>(out.data_ptr<at::Half>()), routes, experts, \
+        reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), routes, experts, \
         out_per_expert, groups, k_real, routed_input)
     if (bm == 16) {
         MFQ_Q8_ZERO_MOE_MMA(16);
@@ -3453,17 +3451,17 @@ void launch_nint8_zero_moe_mma(
 }
 
 void launch_nint8_zero_grouped_matmul(
-        const torch::Tensor & q,
-        const torch::Tensor & scale,
-        const torch::Tensor & qx,
-        const torch::Tensor & xscale,
-        const torch::Tensor & ids,
-        const torch::Tensor & expert_local,
-        const torch::Tensor & ids_dst,
-        const torch::Tensor & expert_bounds,
-        const torch::Tensor & tile_bounds,
-        const torch::Tensor & tile_experts,
-        torch::Tensor & out,
+        const mfq_tensor_backend::Tensor & q,
+        const mfq_tensor_backend::Tensor & scale,
+        const mfq_tensor_backend::Tensor & qx,
+        const mfq_tensor_backend::Tensor & xscale,
+        const mfq_tensor_backend::Tensor & ids,
+        const mfq_tensor_backend::Tensor & expert_local,
+        const mfq_tensor_backend::Tensor & ids_dst,
+        const mfq_tensor_backend::Tensor & expert_bounds,
+        const mfq_tensor_backend::Tensor & tile_bounds,
+        const mfq_tensor_backend::Tensor & tile_experts,
+        mfq_tensor_backend::Tensor & out,
         int tokens,
         int routes,
         int experts,
@@ -3489,10 +3487,10 @@ void launch_nint8_zero_grouped_matmul(
             dim3(row_blocks, routes, (tokens + ITEMS - 1) / ITEMS), \
             dim3(32, ITEMS), 0, stream>>>( \
                 q.data_ptr<uint8_t>(), \
-                reinterpret_cast<const __half *>(scale.data_ptr<at::Half>()), \
+                reinterpret_cast<const __half *>(scale.data_ptr<mfq_half>()), \
                 qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), \
                 ids.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(), \
-                reinterpret_cast<__half *>(out.data_ptr<at::Half>()), \
+                reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), \
                 tokens, routes, experts, out_per_expert, groups, k_pad, \
                 routed_input)
         switch (items) {
@@ -3530,14 +3528,14 @@ void launch_nint8_zero_grouped_matmul(
         nint8_zero_moe_grouped_tile_persistent_kernel<kRouteTile><<<
             blocks, dim3(32, 4), 0, stream>>>(
                 q.data_ptr<uint8_t>(),
-                reinterpret_cast<const __half *>(scale.data_ptr<at::Half>()),
+                reinterpret_cast<const __half *>(scale.data_ptr<mfq_half>()),
                 qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
                 ids_dst.data_ptr<int32_t>(),
                 expert_bounds.data_ptr<int32_t>(),
                 tile_bounds.data_ptr<int32_t>(),
                 tile_experts.data_ptr<int32_t>(),
                 expert_local.data_ptr<int32_t>(),
-                reinterpret_cast<__half *>(out.data_ptr<at::Half>()),
+                reinterpret_cast<__half *>(out.data_ptr<mfq_half>()),
                 routes, experts, out_per_expert, groups, routed_input);
         return;
     }
@@ -3546,18 +3544,18 @@ void launch_nint8_zero_grouped_matmul(
         (pairs + kRouteTile - 1) / kRouteTile + experts;
     const int64_t blocks =
         static_cast<int64_t>(row_tiles) * max_tiles;
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         blocks <= INT_MAX, "grouped NINT8-0 launch grid is too large");
     nint8_zero_moe_grouped_tile_kernel<kRouteTile><<<
         static_cast<int>(blocks), dim3(32, 4), 0, stream>>>(
             q.data_ptr<uint8_t>(),
-            reinterpret_cast<const __half *>(scale.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(scale.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
             ids_dst.data_ptr<int32_t>(),
             expert_bounds.data_ptr<int32_t>(),
             tile_bounds.data_ptr<int32_t>(),
             expert_local.data_ptr<int32_t>(),
-            reinterpret_cast<__half *>(out.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(out.data_ptr<mfq_half>()),
             routes, experts, out_per_expert, groups, max_tiles,
             routed_input);
 }
@@ -3569,14 +3567,14 @@ void mfq::moe_cache_scatter_cuda(
         std::int64_t descriptor_offset,
         int transfer_count,
         cudaStream_t stream) {
-    TORCH_CHECK(staging != nullptr, "MoE cache staging pointer is null");
-    TORCH_CHECK(descriptor_offset >= 0,
+    MFQ_RUNTIME_CHECK(staging != nullptr, "MoE cache staging pointer is null");
+    MFQ_RUNTIME_CHECK(descriptor_offset >= 0,
         "MoE cache descriptor offset must be non-negative");
-    TORCH_CHECK(transfer_count > 0,
+    MFQ_RUNTIME_CHECK(transfer_count > 0,
         "MoE cache scatter requires at least one transfer");
     moe_cache_scatter_kernel<<<transfer_count, 256, 0, stream>>>(
         staging, descriptor_offset, transfer_count);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void mfq::moe_cache_mapped_gather_cuda(
@@ -3584,98 +3582,98 @@ void mfq::moe_cache_mapped_gather_cuda(
         int transfer_count,
         int blocks_per_transfer,
         cudaStream_t stream) {
-    TORCH_CHECK(descriptors != nullptr,
+    MFQ_RUNTIME_CHECK(descriptors != nullptr,
         "MoE cache mapped-copy descriptor pointer is null");
-    TORCH_CHECK(transfer_count > 0,
+    MFQ_RUNTIME_CHECK(transfer_count > 0,
         "MoE cache mapped gather requires at least one transfer");
-    TORCH_CHECK(blocks_per_transfer >= 1 && blocks_per_transfer <= 128,
+    MFQ_RUNTIME_CHECK(blocks_per_transfer >= 1 && blocks_per_transfer <= 128,
         "MoE cache mapped gather blocks must be in [1, 128]");
     const dim3 grid(
         static_cast<unsigned int>(blocks_per_transfer),
         static_cast<unsigned int>(transfer_count));
     moe_cache_mapped_gather_kernel<<<grid, 256, 0, stream>>>(
         descriptors, transfer_count);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void nint_moe_set_small_mmq_cuda(int64_t mode) {
-    TORCH_CHECK(mode >= -1 && mode <= 1, "small-M MoE MMQ mode must be in [-1,1]");
+    MFQ_RUNTIME_CHECK(mode >= -1 && mode <= 1, "small-M MoE MMQ mode must be in [-1,1]");
     g_moe_small_mmq_override = static_cast<int>(mode);
 }
 
-std::vector<torch::Tensor> moe_topk_cuda(
-        torch::Tensor logits,
+std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
+        mfq_tensor_backend::Tensor logits,
         int64_t top_k,
         bool use_sigmoid,
         bool use_sqrt_softplus,
         bool normalize,
         bool delayed_softmax,
-        c10::optional<torch::Tensor> bias,
+        MfqOptional<mfq_tensor_backend::Tensor> bias,
         double norm_floor,
         double scale) {
-    TORCH_CHECK(logits.is_cuda() && logits.is_contiguous() && logits.dim() == 2,
+    MFQ_RUNTIME_CHECK(logits.is_cuda() && logits.is_contiguous() && logits.dim() == 2,
         "logits must be contiguous CUDA [tokens, experts]");
-    TORCH_CHECK(logits.scalar_type() == torch::kFloat32 || logits.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(logits.scalar_type() == mfq_tensor_backend::kFloat32 || logits.scalar_type() == mfq_tensor_backend::kFloat16,
         "logits must be float16 or float32");
     const int rows = static_cast<int>(logits.size(0));
     const int experts = static_cast<int>(logits.size(1));
-    TORCH_CHECK(rows > 0 && experts > 0, "logits dimensions must be nonzero");
-    TORCH_CHECK(top_k >= 1 && top_k <= 16 && top_k <= experts,
+    MFQ_RUNTIME_CHECK(rows > 0 && experts > 0, "logits dimensions must be nonzero");
+    MFQ_RUNTIME_CHECK(top_k >= 1 && top_k <= 16 && top_k <= experts,
         "top_k must be in [1, min(16, experts)]");
-    TORCH_CHECK(!(normalize && delayed_softmax),
+    MFQ_RUNTIME_CHECK(!(normalize && delayed_softmax),
         "selected-weight normalization and delayed softmax are mutually exclusive");
-    TORCH_CHECK(!(use_sigmoid && delayed_softmax),
+    MFQ_RUNTIME_CHECK(!(use_sigmoid && delayed_softmax),
         "sigmoid routing and delayed softmax are mutually exclusive");
-    TORCH_CHECK(!(use_sqrt_softplus && delayed_softmax),
+    MFQ_RUNTIME_CHECK(!(use_sqrt_softplus && delayed_softmax),
         "sqrt-softplus routing and delayed softmax are mutually exclusive");
-    TORCH_CHECK(!(use_sigmoid && use_sqrt_softplus),
+    MFQ_RUNTIME_CHECK(!(use_sigmoid && use_sqrt_softplus),
         "sigmoid and sqrt-softplus routing are mutually exclusive");
     const float * bias_ptr = nullptr;
     if (bias.has_value()) {
         auto & value = bias.value();
-        TORCH_CHECK(value.is_cuda() && value.is_contiguous() && value.scalar_type() == torch::kFloat32 &&
+        MFQ_RUNTIME_CHECK(value.is_cuda() && value.is_contiguous() && value.scalar_type() == mfq_tensor_backend::kFloat32 &&
             value.numel() == experts, "bias must be contiguous CUDA float32 [experts]");
         check_same_device(logits, value, "bias");
         bias_ptr = value.data_ptr<float>();
     }
 
-    auto ids = torch::empty({rows, top_k}, logits.options().dtype(torch::kInt32));
-    auto weights = torch::empty({rows, top_k}, logits.options().dtype(torch::kFloat32));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto ids = mfq_tensor_backend::empty({rows, top_k}, logits.options().dtype(mfq_tensor_backend::kInt32));
+    auto weights = mfq_tensor_backend::empty({rows, top_k}, logits.options().dtype(mfq_tensor_backend::kFloat32));
+    const cudaStream_t stream = mfq_current_cuda_stream();
     static const bool disable_topk_sort = [] {
         const char * value = std::getenv("MFQ_DISABLE_MOE_TOPK_SORT");
         return value != nullptr && std::atoi(value) != 0;
     }();
     if (!disable_topk_sort && rows == 1 && experts == 128 && top_k == 8 &&
-            logits.scalar_type() == torch::kFloat32 && bias_ptr == nullptr &&
+            logits.scalar_type() == mfq_tensor_backend::kFloat32 && bias_ptr == nullptr &&
             !use_sigmoid && !normalize && delayed_softmax && scale == 1.0) {
         moe_topk_1x128_8_kernel<<<1, 32, 0, stream>>>(
             logits.data_ptr<float>(), ids.data_ptr<int32_t>(), weights.data_ptr<float>());
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
         return {ids, weights};
     }
     if (!disable_topk_sort && rows == 1 && experts == 256 && top_k == 8 &&
-            logits.scalar_type() == torch::kFloat32 && bias_ptr == nullptr &&
+            logits.scalar_type() == mfq_tensor_backend::kFloat32 && bias_ptr == nullptr &&
             !use_sigmoid && !use_sqrt_softplus && !normalize && delayed_softmax && scale == 1.0) {
         moe_topk_1x256_8_kernel<<<1, 256, 0, stream>>>(
             logits.data_ptr<float>(), ids.data_ptr<int32_t>(), weights.data_ptr<float>());
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
         return {ids, weights};
     }
     if (!disable_topk_sort && rows == 1 && experts == 256 && top_k == 6 &&
-            logits.scalar_type() == torch::kFloat32 &&
+            logits.scalar_type() == mfq_tensor_backend::kFloat32 &&
             !use_sigmoid && use_sqrt_softplus && normalize && !delayed_softmax) {
         moe_topk_1x256_6_sqrtsoftplus_kernel<<<1, 256, 0, stream>>>(
             logits.data_ptr<float>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
             static_cast<float>(norm_floor), static_cast<float>(scale));
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
         return {ids, weights};
     }
     const dim3 block(32, 4);
     const int grid = (rows + 3) / 4;
-    if (logits.scalar_type() == torch::kFloat16) {
-        moe_topk_kernel<at::Half><<<grid, block, 0, stream>>>(
-            logits.data_ptr<at::Half>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
+    if (logits.scalar_type() == mfq_tensor_backend::kFloat16) {
+        moe_topk_kernel<mfq_half><<<grid, block, 0, stream>>>(
+            logits.data_ptr<mfq_half>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
             rows, experts, static_cast<int>(top_k), use_sigmoid, use_sqrt_softplus,
             normalize, delayed_softmax,
             static_cast<float>(norm_floor), static_cast<float>(scale));
@@ -3686,95 +3684,95 @@ std::vector<torch::Tensor> moe_topk_cuda(
             normalize, delayed_softmax,
             static_cast<float>(norm_floor), static_cast<float>(scale));
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return {ids, weights};
 }
 
-torch::Tensor moe_sqrtsoftplus_weights_cuda(
-        torch::Tensor logits,
-        torch::Tensor ids,
+mfq_tensor_backend::Tensor moe_sqrtsoftplus_weights_cuda(
+        mfq_tensor_backend::Tensor logits,
+        mfq_tensor_backend::Tensor ids,
         double norm_floor,
         double scale) {
-    TORCH_CHECK(logits.is_cuda() && logits.is_contiguous() && logits.dim() == 2,
+    MFQ_RUNTIME_CHECK(logits.is_cuda() && logits.is_contiguous() && logits.dim() == 2,
         "logits must be contiguous CUDA [tokens, experts]");
-    TORCH_CHECK(logits.scalar_type() == torch::kFloat32 || logits.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(logits.scalar_type() == mfq_tensor_backend::kFloat32 || logits.scalar_type() == mfq_tensor_backend::kFloat16,
         "logits must be float16 or float32");
-    TORCH_CHECK(ids.is_cuda() && ids.is_contiguous() && ids.dim() == 2 &&
-        ids.scalar_type() == torch::kInt32, "ids must be contiguous CUDA int32 [tokens, top_k]");
+    MFQ_RUNTIME_CHECK(ids.is_cuda() && ids.is_contiguous() && ids.dim() == 2 &&
+        ids.scalar_type() == mfq_tensor_backend::kInt32, "ids must be contiguous CUDA int32 [tokens, top_k]");
     check_same_device(logits, ids, "ids");
-    TORCH_CHECK(ids.size(0) == logits.size(0), "ids and logits must have the same token count");
+    MFQ_RUNTIME_CHECK(ids.size(0) == logits.size(0), "ids and logits must have the same token count");
     const int rows = static_cast<int>(logits.size(0));
     const int experts = static_cast<int>(logits.size(1));
     const int top_k = static_cast<int>(ids.size(1));
-    TORCH_CHECK(rows > 0 && experts > 0, "logits dimensions must be nonzero");
-    TORCH_CHECK(top_k >= 1 && top_k <= 16 && top_k <= experts,
+    MFQ_RUNTIME_CHECK(rows > 0 && experts > 0, "logits dimensions must be nonzero");
+    MFQ_RUNTIME_CHECK(top_k >= 1 && top_k <= 16 && top_k <= experts,
         "top_k must be in [1, min(16, experts)]");
 
-    auto weights = torch::empty(ids.sizes(), logits.options().dtype(torch::kFloat32));
+    auto weights = mfq_tensor_backend::empty(ids.sizes(), logits.options().dtype(mfq_tensor_backend::kFloat32));
     const dim3 block(32, 4);
     const int grid = (rows + 3) / 4;
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    if (logits.scalar_type() == torch::kFloat16) {
-        moe_sqrtsoftplus_weights_kernel<at::Half><<<grid, block, 0, stream>>>(
-            logits.data_ptr<at::Half>(), ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
+    const cudaStream_t stream = mfq_current_cuda_stream();
+    if (logits.scalar_type() == mfq_tensor_backend::kFloat16) {
+        moe_sqrtsoftplus_weights_kernel<mfq_half><<<grid, block, 0, stream>>>(
+            logits.data_ptr<mfq_half>(), ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
             rows, experts, top_k, static_cast<float>(norm_floor), static_cast<float>(scale));
     } else {
         moe_sqrtsoftplus_weights_kernel<float><<<grid, block, 0, stream>>>(
             logits.data_ptr<float>(), ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
             rows, experts, top_k, static_cast<float>(norm_floor), static_cast<float>(scale));
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return weights;
 }
 
-std::vector<torch::Tensor> moe_build_expert_map_cuda(
-        torch::Tensor ids,
+std::vector<mfq_tensor_backend::Tensor> moe_build_expert_map_cuda(
+        mfq_tensor_backend::Tensor ids,
         int64_t n_experts,
         int64_t tile_m) {
-    TORCH_CHECK(ids.is_cuda() && ids.is_contiguous() && ids.scalar_type() == torch::kInt32 && ids.dim() == 2,
+    MFQ_RUNTIME_CHECK(ids.is_cuda() && ids.is_contiguous() && ids.scalar_type() == mfq_tensor_backend::kInt32 && ids.dim() == 2,
         "ids must be contiguous CUDA int32 [tokens, routes]");
-    TORCH_CHECK(n_experts > 0 && n_experts <= 4096, "n_experts must be in [1, 4096]");
-    TORCH_CHECK(tile_m > 0 && tile_m <= 1024, "tile_m must be in [1, 1024]");
+    MFQ_RUNTIME_CHECK(n_experts > 0 && n_experts <= 4096, "n_experts must be in [1, 4096]");
+    MFQ_RUNTIME_CHECK(tile_m > 0 && tile_m <= 1024, "tile_m must be in [1, 1024]");
     const int experts = static_cast<int>(n_experts);
     const int pairs = static_cast<int>(ids.numel());
     auto options = ids.options();
-    auto counts = torch::empty({experts}, options);
-    auto cursors = torch::empty({experts}, options);
-    auto ids_dst = torch::empty({pairs}, options);
-    auto expert_bounds = torch::empty({experts + 1}, options);
-    auto tile_bounds = torch::empty({experts + 1}, options);
-    auto tile_experts = torch::empty({pairs}, options);
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto counts = mfq_tensor_backend::empty({experts}, options);
+    auto cursors = mfq_tensor_backend::empty({experts}, options);
+    auto ids_dst = mfq_tensor_backend::empty({pairs}, options);
+    auto expert_bounds = mfq_tensor_backend::empty({experts + 1}, options);
+    auto tile_bounds = mfq_tensor_backend::empty({experts + 1}, options);
+    auto tile_experts = mfq_tensor_backend::empty({pairs}, options);
+    const cudaStream_t stream = mfq_current_cuda_stream();
     build_expert_map(ids, experts, static_cast<int>(tile_m), counts, cursors, ids_dst,
         expert_bounds, tile_bounds, tile_experts, stream);
     return {ids_dst, expert_bounds, tile_bounds, tile_experts, counts};
 }
 
 void nint_moe_quantize_input_ws_cuda(
-        torch::Tensor x,
+        mfq_tensor_backend::Tensor x,
         int64_t gs,
-        torch::Tensor qx,
-        torch::Tensor xscale) {
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kFloat16 &&
+        mfq_tensor_backend::Tensor qx,
+        mfq_tensor_backend::Tensor xscale) {
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
         (x.dim() == 2 || x.dim() == 3),
         "x must be contiguous CUDA float16 [T,K] or [T,R,K]");
-    TORCH_CHECK(gs == 16 || gs == 24 || gs == 28 || gs == 48,
+    MFQ_RUNTIME_CHECK(gs == 16 || gs == 24 || gs == 28 || gs == 48,
         "heterogeneous NINT MoE quantization supports gs in {16,24,28,48}");
     const int k_real = static_cast<int>(x.size(-1));
     const int rows = static_cast<int>(x.numel() / k_real);
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == torch::kInt8 &&
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == mfq_tensor_backend::kInt8 &&
         qx.dim() == 2 && qx.size(0) >= rows,
         "qx must be contiguous CUDA int8 [rows,K_pad]");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() &&
-        xscale.scalar_type() == torch::kFloat32 && xscale.dim() == 2 && xscale.size(0) >= rows,
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() &&
+        xscale.scalar_type() == mfq_tensor_backend::kFloat32 && xscale.dim() == 2 && xscale.size(0) >= rows,
         "xscale must be contiguous CUDA float32 [rows,groups]");
     check_same_device(x, qx, "qx");
     check_same_device(x, xscale, "xscale");
     const int groups = static_cast<int>(xscale.size(1));
     const int k_pad = groups * static_cast<int>(gs);
-    TORCH_CHECK(qx.size(1) >= k_pad && k_real <= k_pad,
+    MFQ_RUNTIME_CHECK(qx.size(1) >= k_pad && k_real <= k_pad,
         "heterogeneous NINT MoE quantization workspace is too small");
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const cudaStream_t stream = mfq_current_cuda_stream();
     auto flat = x.reshape({rows, k_real});
     switch (static_cast<int>(gs)) {
         case 16: launch_quantize<16>(flat, qx, xscale, rows, k_real, k_pad, groups, stream); break;
@@ -3782,119 +3780,119 @@ void nint_moe_quantize_input_ws_cuda(
         case 28: launch_quantize<28>(flat, qx, xscale, rows, k_real, k_pad, groups, stream); break;
         case 48: launch_quantize<48>(flat, qx, xscale, rows, k_real, k_pad, groups, stream); break;
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void nint_moe_quantize_24_28_ws_cuda(
-        torch::Tensor x,
-        torch::Tensor qx24,
-        torch::Tensor xscale24,
-        torch::Tensor qx28,
-        torch::Tensor xscale28) {
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kFloat16 &&
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor qx24,
+        mfq_tensor_backend::Tensor xscale24,
+        mfq_tensor_backend::Tensor qx28,
+        mfq_tensor_backend::Tensor xscale28) {
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
         (x.dim() == 2 || x.dim() == 3),
         "x must be contiguous CUDA float16 [T,K] or [T,R,K]");
     const int k_real = static_cast<int>(x.size(-1));
     const int rows = static_cast<int>(x.numel() / k_real);
-    TORCH_CHECK(qx24.is_cuda() && qx24.is_contiguous() &&
-        qx24.scalar_type() == torch::kInt8 && qx24.dim() == 2 && qx24.size(0) >= rows,
+    MFQ_RUNTIME_CHECK(qx24.is_cuda() && qx24.is_contiguous() &&
+        qx24.scalar_type() == mfq_tensor_backend::kInt8 && qx24.dim() == 2 && qx24.size(0) >= rows,
         "qx24 must be contiguous CUDA int8 [rows,k_pad24]");
-    TORCH_CHECK(xscale24.is_cuda() && xscale24.is_contiguous() &&
-        xscale24.scalar_type() == torch::kFloat32 && xscale24.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(xscale24.is_cuda() && xscale24.is_contiguous() &&
+        xscale24.scalar_type() == mfq_tensor_backend::kFloat32 && xscale24.dim() == 2 &&
         xscale24.size(0) >= rows,
         "xscale24 must be contiguous CUDA float32 [rows,groups24]");
-    TORCH_CHECK(qx28.is_cuda() && qx28.is_contiguous() &&
-        qx28.scalar_type() == torch::kInt8 && qx28.dim() == 2 && qx28.size(0) >= rows,
+    MFQ_RUNTIME_CHECK(qx28.is_cuda() && qx28.is_contiguous() &&
+        qx28.scalar_type() == mfq_tensor_backend::kInt8 && qx28.dim() == 2 && qx28.size(0) >= rows,
         "qx28 must be contiguous CUDA int8 [rows,k_pad28]");
-    TORCH_CHECK(xscale28.is_cuda() && xscale28.is_contiguous() &&
-        xscale28.scalar_type() == torch::kFloat32 && xscale28.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(xscale28.is_cuda() && xscale28.is_contiguous() &&
+        xscale28.scalar_type() == mfq_tensor_backend::kFloat32 && xscale28.dim() == 2 &&
         xscale28.size(0) >= rows,
         "xscale28 must be contiguous CUDA float32 [rows,groups28]");
     const int groups24 = static_cast<int>(xscale24.size(1));
     const int groups28 = static_cast<int>(xscale28.size(1));
-    TORCH_CHECK(qx24.size(1) >= groups24 * 24 && k_real <= groups24 * 24,
+    MFQ_RUNTIME_CHECK(qx24.size(1) >= groups24 * 24 && k_real <= groups24 * 24,
         "gs24 activation workspace is too small");
-    TORCH_CHECK(qx28.size(1) >= groups28 * 28 && k_real <= groups28 * 28,
+    MFQ_RUNTIME_CHECK(qx28.size(1) >= groups28 * 28 && k_real <= groups28 * 28,
         "gs28 activation workspace is too small");
     check_same_device(x, qx24, "qx24");
     check_same_device(x, xscale24, "xscale24");
     check_same_device(x, qx28, "qx28");
     check_same_device(x, xscale28, "xscale28");
     quantize_moe_input_24_28_kernel<<<
-        dim3(rows, groups24 + groups28), 32, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),
+        dim3(rows, groups24 + groups28), 32, 0, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
         qx24.data_ptr<int8_t>(), xscale24.data_ptr<float>(),
         qx28.data_ptr<int8_t>(), xscale28.data_ptr<float>(),
         k_real, groups24, groups28);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void nint_moe_quantize_swiglu_input_ws_cuda(
-        torch::Tensor gate_up,
+        mfq_tensor_backend::Tensor gate_up,
         int64_t gs,
-        torch::Tensor qx,
-        torch::Tensor xscale) {
-    TORCH_CHECK(gate_up.is_cuda() && gate_up.is_contiguous() &&
-        gate_up.scalar_type() == torch::kFloat16 && gate_up.dim() == 3 &&
+        mfq_tensor_backend::Tensor qx,
+        mfq_tensor_backend::Tensor xscale) {
+    MFQ_RUNTIME_CHECK(gate_up.is_cuda() && gate_up.is_contiguous() &&
+        gate_up.scalar_type() == mfq_tensor_backend::kFloat16 && gate_up.dim() == 3 &&
         gate_up.size(2) > 0 && gate_up.size(2) % 2 == 0,
         "gate_up must be contiguous CUDA float16 [T,R,2*K]");
-    TORCH_CHECK(gs == 16 || gs == 24 || gs == 28 || gs == 48,
+    MFQ_RUNTIME_CHECK(gs == 16 || gs == 24 || gs == 28 || gs == 48,
         "heterogeneous NINT MoE SwiGLU quantization supports gs in {16,24,28,48}");
     const int k_real = static_cast<int>(gate_up.size(2) / 2);
     const int rows = static_cast<int>(gate_up.size(0) * gate_up.size(1));
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == torch::kInt8 &&
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == mfq_tensor_backend::kInt8 &&
         qx.dim() == 2 && qx.size(0) >= rows,
         "qx must be contiguous CUDA int8 [rows,k_pad]");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() &&
-        xscale.scalar_type() == torch::kFloat32 && xscale.dim() == 2 && xscale.size(0) >= rows,
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() &&
+        xscale.scalar_type() == mfq_tensor_backend::kFloat32 && xscale.dim() == 2 && xscale.size(0) >= rows,
         "xscale must be contiguous CUDA float32 [rows,groups]");
     check_same_device(gate_up, qx, "qx");
     check_same_device(gate_up, xscale, "xscale");
     const int groups = static_cast<int>(xscale.size(1));
     const int k_pad = groups * static_cast<int>(gs);
-    TORCH_CHECK(qx.size(1) >= k_pad && k_real <= k_pad,
+    MFQ_RUNTIME_CHECK(qx.size(1) >= k_pad && k_real <= k_pad,
         "heterogeneous NINT MoE SwiGLU quantization workspace is too small");
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const cudaStream_t stream = mfq_current_cuda_stream();
     switch (static_cast<int>(gs)) {
         case 16: launch_quantize_glu<16, false>(gate_up, qx, xscale, rows, k_real, k_pad, groups, stream); break;
         case 24: launch_quantize_glu<24, false>(gate_up, qx, xscale, rows, k_real, k_pad, groups, stream); break;
         case 28: launch_quantize_glu<28, false>(gate_up, qx, xscale, rows, k_real, k_pad, groups, stream); break;
         case 48: launch_quantize_glu<48, false>(gate_up, qx, xscale, rows, k_real, k_pad, groups, stream); break;
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void nint_moe_quantize_swiglu_clamped_input_ws_cuda(
-        torch::Tensor gate_up,
+        mfq_tensor_backend::Tensor gate_up,
         int64_t gs,
         double limit,
-        torch::Tensor qx,
-        torch::Tensor xscale) {
-    TORCH_CHECK(gate_up.is_cuda() && gate_up.is_contiguous() &&
-        gate_up.scalar_type() == torch::kFloat16 && gate_up.dim() == 3 &&
+        mfq_tensor_backend::Tensor qx,
+        mfq_tensor_backend::Tensor xscale) {
+    MFQ_RUNTIME_CHECK(gate_up.is_cuda() && gate_up.is_contiguous() &&
+        gate_up.scalar_type() == mfq_tensor_backend::kFloat16 && gate_up.dim() == 3 &&
         gate_up.size(2) > 0 && gate_up.size(2) % 2 == 0,
         "gate_up must be contiguous CUDA float16 [T,R,2*K]");
-    TORCH_CHECK(gs == 16 || gs == 24 || gs == 28 || gs == 48,
+    MFQ_RUNTIME_CHECK(gs == 16 || gs == 24 || gs == 28 || gs == 48,
         "clamped SwiGLU MoE quantization supports gs in {16,24,28,48}");
-    TORCH_CHECK(std::isfinite(limit) && limit > 0.0,
+    MFQ_RUNTIME_CHECK(std::isfinite(limit) && limit > 0.0,
         "clamped SwiGLU limit must be finite and positive");
     const int k_real = static_cast<int>(gate_up.size(2) / 2);
     const int rows = static_cast<int>(gate_up.size(0) * gate_up.size(1));
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() &&
-        qx.scalar_type() == torch::kInt8 && qx.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() &&
+        qx.scalar_type() == mfq_tensor_backend::kInt8 && qx.dim() == 2 &&
         qx.size(0) >= rows,
         "qx must be contiguous CUDA int8 [rows,k_pad]");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() &&
-        xscale.scalar_type() == torch::kFloat32 && xscale.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() &&
+        xscale.scalar_type() == mfq_tensor_backend::kFloat32 && xscale.dim() == 2 &&
         xscale.size(0) >= rows,
         "xscale must be contiguous CUDA float32 [rows,groups]");
     check_same_device(gate_up, qx, "qx");
     check_same_device(gate_up, xscale, "xscale");
     const int groups = static_cast<int>(xscale.size(1));
     const int k_pad = groups * static_cast<int>(gs);
-    TORCH_CHECK(qx.size(1) >= k_pad && k_real <= k_pad,
+    MFQ_RUNTIME_CHECK(qx.size(1) >= k_pad && k_real <= k_pad,
         "clamped SwiGLU MoE quantization workspace is too small");
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const cudaStream_t stream = mfq_current_cuda_stream();
     const float limit_f = static_cast<float>(limit);
     switch (static_cast<int>(gs)) {
         case 16:
@@ -3914,78 +3912,78 @@ void nint_moe_quantize_swiglu_clamped_input_ws_cuda(
                 gate_up, qx, xscale, rows, k_real, k_pad, groups, stream, limit_f);
             break;
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void nint_moe_quantize_geglu_input_ws_cuda(
-        torch::Tensor gate_up,
+        mfq_tensor_backend::Tensor gate_up,
         int64_t gs,
-        torch::Tensor qx,
-        torch::Tensor xscale) {
-    TORCH_CHECK(gate_up.is_cuda() && gate_up.is_contiguous() &&
-        gate_up.scalar_type() == torch::kFloat16 && gate_up.dim() == 3 &&
+        mfq_tensor_backend::Tensor qx,
+        mfq_tensor_backend::Tensor xscale) {
+    MFQ_RUNTIME_CHECK(gate_up.is_cuda() && gate_up.is_contiguous() &&
+        gate_up.scalar_type() == mfq_tensor_backend::kFloat16 && gate_up.dim() == 3 &&
         gate_up.size(2) > 0 && gate_up.size(2) % 2 == 0,
         "gate_up must be contiguous CUDA float16 [T,R,2*K]");
-    TORCH_CHECK(gs == 16 || gs == 24 || gs == 28 || gs == 48,
+    MFQ_RUNTIME_CHECK(gs == 16 || gs == 24 || gs == 28 || gs == 48,
         "heterogeneous NINT MoE GeGLU quantization supports gs in {16,24,28,48}");
     const int k_real = static_cast<int>(gate_up.size(2) / 2);
     const int rows = static_cast<int>(gate_up.size(0) * gate_up.size(1));
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == torch::kInt8 &&
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == mfq_tensor_backend::kInt8 &&
         qx.dim() == 2 && qx.size(0) >= rows,
         "qx must be contiguous CUDA int8 [rows,k_pad]");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() &&
-        xscale.scalar_type() == torch::kFloat32 && xscale.dim() == 2 && xscale.size(0) >= rows,
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() &&
+        xscale.scalar_type() == mfq_tensor_backend::kFloat32 && xscale.dim() == 2 && xscale.size(0) >= rows,
         "xscale must be contiguous CUDA float32 [rows,groups]");
     check_same_device(gate_up, qx, "qx");
     check_same_device(gate_up, xscale, "xscale");
     const int groups = static_cast<int>(xscale.size(1));
     const int k_pad = groups * static_cast<int>(gs);
-    TORCH_CHECK(qx.size(1) >= k_pad && k_real <= k_pad,
+    MFQ_RUNTIME_CHECK(qx.size(1) >= k_pad && k_real <= k_pad,
         "heterogeneous NINT MoE GeGLU quantization workspace is too small");
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const cudaStream_t stream = mfq_current_cuda_stream();
     switch (static_cast<int>(gs)) {
         case 16: launch_quantize_glu<16, true>(gate_up, qx, xscale, rows, k_real, k_pad, groups, stream); break;
         case 24: launch_quantize_glu<24, true>(gate_up, qx, xscale, rows, k_real, k_pad, groups, stream); break;
         case 28: launch_quantize_glu<28, true>(gate_up, qx, xscale, rows, k_real, k_pad, groups, stream); break;
         case 48: launch_quantize_glu<48, true>(gate_up, qx, xscale, rows, k_real, k_pad, groups, stream); break;
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template <bool GELU>
 static void nint_moe_quantize_glu_24_28_ws_cuda_impl(
-        torch::Tensor gate_up,
-        torch::Tensor qx24,
-        torch::Tensor xscale24,
-        torch::Tensor qx28,
-        torch::Tensor xscale28) {
-    TORCH_CHECK(gate_up.is_cuda() && gate_up.is_contiguous() &&
-        gate_up.scalar_type() == torch::kFloat16 && gate_up.dim() == 3 &&
+        mfq_tensor_backend::Tensor gate_up,
+        mfq_tensor_backend::Tensor qx24,
+        mfq_tensor_backend::Tensor xscale24,
+        mfq_tensor_backend::Tensor qx28,
+        mfq_tensor_backend::Tensor xscale28) {
+    MFQ_RUNTIME_CHECK(gate_up.is_cuda() && gate_up.is_contiguous() &&
+        gate_up.scalar_type() == mfq_tensor_backend::kFloat16 && gate_up.dim() == 3 &&
         gate_up.size(2) > 0 && gate_up.size(2) % 2 == 0,
         "gate_up must be contiguous CUDA float16 [T,R,2*K]");
     const int k_real = static_cast<int>(gate_up.size(2) / 2);
     const int rows = static_cast<int>(gate_up.size(0) * gate_up.size(1));
-    TORCH_CHECK(k_real <= 4096,
+    MFQ_RUNTIME_CHECK(k_real <= 4096,
         "fused gs24/gs28 SwiGLU quantization supports K <= 4096");
-    TORCH_CHECK(qx24.is_cuda() && qx24.is_contiguous() &&
-        qx24.scalar_type() == torch::kInt8 && qx24.dim() == 2 && qx24.size(0) >= rows,
+    MFQ_RUNTIME_CHECK(qx24.is_cuda() && qx24.is_contiguous() &&
+        qx24.scalar_type() == mfq_tensor_backend::kInt8 && qx24.dim() == 2 && qx24.size(0) >= rows,
         "qx24 must be contiguous CUDA int8 [rows,k_pad24]");
-    TORCH_CHECK(xscale24.is_cuda() && xscale24.is_contiguous() &&
-        xscale24.scalar_type() == torch::kFloat32 && xscale24.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(xscale24.is_cuda() && xscale24.is_contiguous() &&
+        xscale24.scalar_type() == mfq_tensor_backend::kFloat32 && xscale24.dim() == 2 &&
         xscale24.size(0) >= rows,
         "xscale24 must be contiguous CUDA float32 [rows,groups24]");
-    TORCH_CHECK(qx28.is_cuda() && qx28.is_contiguous() &&
-        qx28.scalar_type() == torch::kInt8 && qx28.dim() == 2 && qx28.size(0) >= rows,
+    MFQ_RUNTIME_CHECK(qx28.is_cuda() && qx28.is_contiguous() &&
+        qx28.scalar_type() == mfq_tensor_backend::kInt8 && qx28.dim() == 2 && qx28.size(0) >= rows,
         "qx28 must be contiguous CUDA int8 [rows,k_pad28]");
-    TORCH_CHECK(xscale28.is_cuda() && xscale28.is_contiguous() &&
-        xscale28.scalar_type() == torch::kFloat32 && xscale28.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(xscale28.is_cuda() && xscale28.is_contiguous() &&
+        xscale28.scalar_type() == mfq_tensor_backend::kFloat32 && xscale28.dim() == 2 &&
         xscale28.size(0) >= rows,
         "xscale28 must be contiguous CUDA float32 [rows,groups28]");
     const int groups24 = static_cast<int>(xscale24.size(1));
     const int groups28 = static_cast<int>(xscale28.size(1));
-    TORCH_CHECK(qx24.size(1) >= groups24 * 24 && k_real <= groups24 * 24,
+    MFQ_RUNTIME_CHECK(qx24.size(1) >= groups24 * 24 && k_real <= groups24 * 24,
         "gs24 activation workspace is too small");
-    TORCH_CHECK(qx28.size(1) >= groups28 * 28 && k_real <= groups28 * 28,
+    MFQ_RUNTIME_CHECK(qx28.size(1) >= groups28 * 28 && k_real <= groups28 * 28,
         "gs28 activation workspace is too small");
     check_same_device(gate_up, qx24, "qx24");
     check_same_device(gate_up, xscale24, "xscale24");
@@ -3994,84 +3992,84 @@ static void nint_moe_quantize_glu_24_28_ws_cuda_impl(
     constexpr int block = 256;
     const size_t shared_bytes = static_cast<size_t>(k_real) * sizeof(__half);
     quantize_moe_glu_24_28_kernel<GELU><<<
-        rows, block, shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const __half *>(gate_up.data_ptr<at::Half>()),
+        rows, block, shared_bytes, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const __half *>(gate_up.data_ptr<mfq_half>()),
         qx24.data_ptr<int8_t>(), xscale24.data_ptr<float>(),
         qx28.data_ptr<int8_t>(), xscale28.data_ptr<float>(),
         k_real, groups24, groups28);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void nint_moe_quantize_swiglu_24_28_ws_cuda(
-        torch::Tensor gate_up,
-        torch::Tensor qx24,
-        torch::Tensor xscale24,
-        torch::Tensor qx28,
-        torch::Tensor xscale28) {
+        mfq_tensor_backend::Tensor gate_up,
+        mfq_tensor_backend::Tensor qx24,
+        mfq_tensor_backend::Tensor xscale24,
+        mfq_tensor_backend::Tensor qx28,
+        mfq_tensor_backend::Tensor xscale28) {
     nint_moe_quantize_glu_24_28_ws_cuda_impl<false>(
         gate_up, qx24, xscale24, qx28, xscale28);
 }
 
 void nint_moe_quantize_geglu_24_28_ws_cuda(
-        torch::Tensor gate_up,
-        torch::Tensor qx24,
-        torch::Tensor xscale24,
-        torch::Tensor qx28,
-        torch::Tensor xscale28) {
+        mfq_tensor_backend::Tensor gate_up,
+        mfq_tensor_backend::Tensor qx24,
+        mfq_tensor_backend::Tensor xscale24,
+        mfq_tensor_backend::Tensor qx28,
+        mfq_tensor_backend::Tensor xscale28) {
     nint_moe_quantize_glu_24_28_ws_cuda_impl<true>(
         gate_up, qx24, xscale24, qx28, xscale28);
 }
 
-torch::Tensor nint_moe_grouped_matmul_hetero_qx_cuda(
-        torch::Tensor weight_ptrs,
-        torch::Tensor pool_params,
-        torch::Tensor activation_ptrs,
-        torch::Tensor expert_pool,
-        torch::Tensor expert_local,
-        torch::Tensor ids,
+mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_qx_cuda(
+        mfq_tensor_backend::Tensor weight_ptrs,
+        mfq_tensor_backend::Tensor pool_params,
+        mfq_tensor_backend::Tensor activation_ptrs,
+        mfq_tensor_backend::Tensor expert_pool,
+        mfq_tensor_backend::Tensor expert_local,
+        mfq_tensor_backend::Tensor ids,
         int64_t profile_mask,
         int64_t n_experts,
         int64_t out_per_expert,
         int64_t input_width,
         bool routed_input,
-        torch::Tensor out,
-        torch::Tensor ids_dst,
-        torch::Tensor expert_bounds,
-        torch::Tensor tile_bounds,
-        torch::Tensor tile_experts) {
-    TORCH_CHECK(n_experts > 0 && n_experts <= 4096, "n_experts must be in [1,4096]");
-    TORCH_CHECK(out_per_expert > 0 && out_per_expert <= INT_MAX,
+        mfq_tensor_backend::Tensor out,
+        mfq_tensor_backend::Tensor ids_dst,
+        mfq_tensor_backend::Tensor expert_bounds,
+        mfq_tensor_backend::Tensor tile_bounds,
+        mfq_tensor_backend::Tensor tile_experts) {
+    MFQ_RUNTIME_CHECK(n_experts > 0 && n_experts <= 4096, "n_experts must be in [1,4096]");
+    MFQ_RUNTIME_CHECK(out_per_expert > 0 && out_per_expert <= INT_MAX,
         "out_per_expert must be positive");
-    TORCH_CHECK(input_width > 0 && input_width <= INT_MAX, "input_width must be positive");
-    TORCH_CHECK(profile_mask > 0 && profile_mask < 128,
+    MFQ_RUNTIME_CHECK(input_width > 0 && input_width <= INT_MAX, "input_width must be positive");
+    MFQ_RUNTIME_CHECK(profile_mask > 0 && profile_mask < 128,
         "profile_mask must select at least one supported heterogeneous profile");
-    TORCH_CHECK(weight_ptrs.is_cuda() && weight_ptrs.is_contiguous() &&
-        weight_ptrs.scalar_type() == torch::kInt64 && weight_ptrs.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(weight_ptrs.is_cuda() && weight_ptrs.is_contiguous() &&
+        weight_ptrs.scalar_type() == mfq_tensor_backend::kInt64 && weight_ptrs.dim() == 2 &&
         weight_ptrs.size(0) > 0 && weight_ptrs.size(1) == 5,
         "weight_ptrs must be contiguous CUDA int64 [pools,5]");
     const int pools = static_cast<int>(weight_ptrs.size(0));
-    TORCH_CHECK(pool_params.is_cuda() && pool_params.is_contiguous() &&
-        pool_params.scalar_type() == torch::kInt32 && pool_params.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(pool_params.is_cuda() && pool_params.is_contiguous() &&
+        pool_params.scalar_type() == mfq_tensor_backend::kInt32 && pool_params.dim() == 2 &&
         pool_params.size(0) == pools && pool_params.size(1) == 2,
         "pool_params must be contiguous CUDA int32 [pools,2]");
-    TORCH_CHECK(activation_ptrs.is_cuda() && activation_ptrs.is_contiguous() &&
-        activation_ptrs.scalar_type() == torch::kInt64 && activation_ptrs.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(activation_ptrs.is_cuda() && activation_ptrs.is_contiguous() &&
+        activation_ptrs.scalar_type() == mfq_tensor_backend::kInt64 && activation_ptrs.dim() == 2 &&
         activation_ptrs.size(0) == pools && activation_ptrs.size(1) == 2,
         "activation_ptrs must be contiguous CUDA int64 [pools,2]");
     const int experts = static_cast<int>(n_experts);
-    TORCH_CHECK(expert_pool.is_cuda() && expert_pool.is_contiguous() &&
-        expert_pool.scalar_type() == torch::kInt32 && expert_pool.numel() == experts,
+    MFQ_RUNTIME_CHECK(expert_pool.is_cuda() && expert_pool.is_contiguous() &&
+        expert_pool.scalar_type() == mfq_tensor_backend::kInt32 && expert_pool.numel() == experts,
         "expert_pool must be contiguous CUDA int32 [experts]");
-    TORCH_CHECK(expert_local.is_cuda() && expert_local.is_contiguous() &&
-        expert_local.scalar_type() == torch::kInt32 && expert_local.numel() == experts,
+    MFQ_RUNTIME_CHECK(expert_local.is_cuda() && expert_local.is_contiguous() &&
+        expert_local.scalar_type() == mfq_tensor_backend::kInt32 && expert_local.numel() == experts,
         "expert_local must be contiguous CUDA int32 [experts]");
-    TORCH_CHECK(ids.is_cuda() && ids.is_contiguous() && ids.scalar_type() == torch::kInt32 &&
+    MFQ_RUNTIME_CHECK(ids.is_cuda() && ids.is_contiguous() && ids.scalar_type() == mfq_tensor_backend::kInt32 &&
         ids.dim() == 2, "ids must be contiguous CUDA int32 [tokens,routes]");
     const int tokens = static_cast<int>(ids.size(0));
     const int routes = static_cast<int>(ids.size(1));
-    TORCH_CHECK(tokens > 0 && routes > 0, "ids dimensions must be nonzero");
+    MFQ_RUNTIME_CHECK(tokens > 0 && routes > 0, "ids dimensions must be nonzero");
     const int output_width = static_cast<int>(out_per_expert);
-    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == mfq_tensor_backend::kFloat16 &&
         out.dim() == 3 && out.size(0) == tokens && out.size(1) == routes &&
         out.size(2) == output_width,
         "out must be contiguous CUDA float16 [tokens,routes,out_per_expert]");
@@ -4082,9 +4080,9 @@ torch::Tensor nint_moe_grouped_matmul_hetero_qx_cuda(
     check_same_device(weight_ptrs, expert_local, "expert_local");
     check_same_device(weight_ptrs, ids, "ids");
     check_same_device(weight_ptrs, out, "out");
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const cudaStream_t stream = mfq_current_cuda_stream();
 
-    TORCH_CHECK(tokens <= 8, "heterogeneous MoE launch only supports up to eight tokens");
+    MFQ_RUNTIME_CHECK(tokens <= 8, "heterogeneous MoE launch only supports up to eight tokens");
     const int row_blocks = (output_width + 1) / 2;
 #define MFQ_MOE_HETERO_GROUP4(PROFILE_MASK_VALUE) \
         nint_moe_hetero_mmvq_group_kernel<PROFILE_MASK_VALUE, 4><<< \
@@ -4092,7 +4090,7 @@ torch::Tensor nint_moe_grouped_matmul_hetero_qx_cuda(
             weight_ptrs.data_ptr<int64_t>(), pool_params.data_ptr<int32_t>(), \
             activation_ptrs.data_ptr<int64_t>(), expert_pool.data_ptr<int32_t>(), \
             expert_local.data_ptr<int32_t>(), ids.data_ptr<int32_t>(), \
-            reinterpret_cast<__half *>(out.data_ptr<at::Half>()), routes, experts, \
+            reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), routes, experts, \
             output_width, routed_input)
 #define MFQ_MOE_HETERO_GROUPWARP4(PROFILE_MASK_VALUE) \
         nint_moe_hetero_mmvq_groupwarp_kernel<PROFILE_MASK_VALUE, 4><<< \
@@ -4100,7 +4098,7 @@ torch::Tensor nint_moe_grouped_matmul_hetero_qx_cuda(
             weight_ptrs.data_ptr<int64_t>(), pool_params.data_ptr<int32_t>(), \
             activation_ptrs.data_ptr<int64_t>(), expert_pool.data_ptr<int32_t>(), \
             expert_local.data_ptr<int32_t>(), ids.data_ptr<int32_t>(), \
-            reinterpret_cast<__half *>(out.data_ptr<at::Half>()), routes, experts, \
+            reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), routes, experts, \
             output_width, routed_input)
 #define MFQ_MOE_HETERO_LEGACY(TOKEN_TILE, PROFILE_MASK_VALUE) \
         nint_moe_hetero_mmvq_kernel<TOKEN_TILE, PROFILE_MASK_VALUE><<< \
@@ -4108,10 +4106,10 @@ torch::Tensor nint_moe_grouped_matmul_hetero_qx_cuda(
             weight_ptrs.data_ptr<int64_t>(), pool_params.data_ptr<int32_t>(), \
             activation_ptrs.data_ptr<int64_t>(), expert_pool.data_ptr<int32_t>(), \
             expert_local.data_ptr<int32_t>(), ids.data_ptr<int32_t>(), \
-            reinterpret_cast<__half *>(out.data_ptr<at::Half>()), tokens, routes, experts, \
+            reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), tokens, routes, experts, \
             output_width, routed_input)
     if (tokens == 1) {
-        TORCH_CHECK(routes <= 8, "M=1 heterogeneous MoE supports at most eight routes");
+        MFQ_RUNTIME_CHECK(routes <= 8, "M=1 heterogeneous MoE supports at most eight routes");
 #define MFQ_MOE_HETERO_DISPATCH(PROFILE_MASK_VALUE) \
         do { \
             if (input_width >= 1024) { \
@@ -4143,49 +4141,49 @@ torch::Tensor nint_moe_grouped_matmul_hetero_qx_cuda(
 #undef MFQ_MOE_HETERO_LEGACY
 #undef MFQ_MOE_HETERO_GROUPWARP4
 #undef MFQ_MOE_HETERO_GROUP4
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 
-torch::Tensor nint_moe_grouped_matmul_hetero_glu_qx_cuda(
-        torch::Tensor weight_ptrs,
-        torch::Tensor pool_params,
-        torch::Tensor activation_ptrs,
-        torch::Tensor expert_pool,
-        torch::Tensor expert_local,
-        torch::Tensor ids,
+mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_glu_qx_cuda(
+        mfq_tensor_backend::Tensor weight_ptrs,
+        mfq_tensor_backend::Tensor pool_params,
+        mfq_tensor_backend::Tensor activation_ptrs,
+        mfq_tensor_backend::Tensor expert_pool,
+        mfq_tensor_backend::Tensor expert_local,
+        mfq_tensor_backend::Tensor ids,
         int64_t profile_mask,
         int64_t n_experts,
         int64_t hidden_width,
         bool gelu,
-        torch::Tensor out) {
-    TORCH_CHECK(profile_mask > 0 && profile_mask < 128,
+        mfq_tensor_backend::Tensor out) {
+    MFQ_RUNTIME_CHECK(profile_mask > 0 && profile_mask < 128,
         "profile_mask must select a supported heterogeneous profile");
-    TORCH_CHECK(n_experts > 0 && n_experts <= 4096, "n_experts must be in [1,4096]");
-    TORCH_CHECK(hidden_width > 0 && hidden_width <= INT_MAX, "hidden_width must be positive");
-    TORCH_CHECK(weight_ptrs.is_cuda() && weight_ptrs.is_contiguous() &&
-        weight_ptrs.scalar_type() == torch::kInt64 && weight_ptrs.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(n_experts > 0 && n_experts <= 4096, "n_experts must be in [1,4096]");
+    MFQ_RUNTIME_CHECK(hidden_width > 0 && hidden_width <= INT_MAX, "hidden_width must be positive");
+    MFQ_RUNTIME_CHECK(weight_ptrs.is_cuda() && weight_ptrs.is_contiguous() &&
+        weight_ptrs.scalar_type() == mfq_tensor_backend::kInt64 && weight_ptrs.dim() == 2 &&
         weight_ptrs.size(1) == 5, "weight_ptrs must be CUDA int64 [pools,5]");
     const int pools = static_cast<int>(weight_ptrs.size(0));
-    TORCH_CHECK(pool_params.is_cuda() && pool_params.is_contiguous() &&
-        pool_params.scalar_type() == torch::kInt32 && pool_params.sizes() ==
-            torch::IntArrayRef({pools, 2}), "pool_params must be CUDA int32 [pools,2]");
-    TORCH_CHECK(activation_ptrs.is_cuda() && activation_ptrs.is_contiguous() &&
-        activation_ptrs.scalar_type() == torch::kInt64 && activation_ptrs.sizes() ==
-            torch::IntArrayRef({pools, 2}), "activation_ptrs must be CUDA int64 [pools,2]");
-    TORCH_CHECK(expert_pool.is_cuda() && expert_pool.is_contiguous() &&
-        expert_pool.scalar_type() == torch::kInt32 && expert_pool.numel() == n_experts,
+    MFQ_RUNTIME_CHECK(pool_params.is_cuda() && pool_params.is_contiguous() &&
+        pool_params.scalar_type() == mfq_tensor_backend::kInt32 && pool_params.sizes() ==
+            mfq_tensor_backend::IntArrayRef({pools, 2}), "pool_params must be CUDA int32 [pools,2]");
+    MFQ_RUNTIME_CHECK(activation_ptrs.is_cuda() && activation_ptrs.is_contiguous() &&
+        activation_ptrs.scalar_type() == mfq_tensor_backend::kInt64 && activation_ptrs.sizes() ==
+            mfq_tensor_backend::IntArrayRef({pools, 2}), "activation_ptrs must be CUDA int64 [pools,2]");
+    MFQ_RUNTIME_CHECK(expert_pool.is_cuda() && expert_pool.is_contiguous() &&
+        expert_pool.scalar_type() == mfq_tensor_backend::kInt32 && expert_pool.numel() == n_experts,
         "expert_pool must be CUDA int32 [experts]");
-    TORCH_CHECK(expert_local.is_cuda() && expert_local.is_contiguous() &&
-        expert_local.scalar_type() == torch::kInt32 && expert_local.numel() == n_experts,
+    MFQ_RUNTIME_CHECK(expert_local.is_cuda() && expert_local.is_contiguous() &&
+        expert_local.scalar_type() == mfq_tensor_backend::kInt32 && expert_local.numel() == n_experts,
         "expert_local must be CUDA int32 [experts]");
-    TORCH_CHECK(ids.is_cuda() && ids.is_contiguous() && ids.scalar_type() == torch::kInt32 &&
+    MFQ_RUNTIME_CHECK(ids.is_cuda() && ids.is_contiguous() && ids.scalar_type() == mfq_tensor_backend::kInt32 &&
         ids.dim() == 2 && ids.size(0) > 0 && ids.size(0) <= 4 &&
         ids.size(1) > 0 && ids.size(1) <= 8,
         "ids must be CUDA int32 [tokens,routes] with at most four tokens and eight routes");
     const int tokens = static_cast<int>(ids.size(0));
     const int routes = static_cast<int>(ids.size(1));
-    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == mfq_tensor_backend::kFloat16 &&
         out.dim() == 3 && out.size(0) == tokens && out.size(1) == routes &&
         out.size(2) == hidden_width,
         "out must be CUDA float16 [tokens,routes,hidden_width]");
@@ -4196,7 +4194,7 @@ torch::Tensor nint_moe_grouped_matmul_hetero_glu_qx_cuda(
     check_same_device(weight_ptrs, ids, "ids");
     check_same_device(weight_ptrs, out, "out");
 
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const cudaStream_t stream = mfq_current_cuda_stream();
 #define MFQ_MOE_GLU_GROUP4(PROFILE_MASK_VALUE) \
     do { \
         if (gelu) { \
@@ -4205,7 +4203,7 @@ torch::Tensor nint_moe_grouped_matmul_hetero_glu_qx_cuda(
                 weight_ptrs.data_ptr<int64_t>(), pool_params.data_ptr<int32_t>(), \
                 activation_ptrs.data_ptr<int64_t>(), expert_pool.data_ptr<int32_t>(), \
                 expert_local.data_ptr<int32_t>(), ids.data_ptr<int32_t>(), \
-                reinterpret_cast<__half *>(out.data_ptr<at::Half>()), routes, \
+                reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), routes, \
                 static_cast<int>(n_experts), static_cast<int>(hidden_width)); \
         } else { \
             nint_moe_hetero_mmvq_glu_group_kernel<PROFILE_MASK_VALUE, 4, false><<< \
@@ -4213,7 +4211,7 @@ torch::Tensor nint_moe_grouped_matmul_hetero_glu_qx_cuda(
                 weight_ptrs.data_ptr<int64_t>(), pool_params.data_ptr<int32_t>(), \
                 activation_ptrs.data_ptr<int64_t>(), expert_pool.data_ptr<int32_t>(), \
                 expert_local.data_ptr<int32_t>(), ids.data_ptr<int32_t>(), \
-                reinterpret_cast<__half *>(out.data_ptr<at::Half>()), routes, \
+                reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), routes, \
                 static_cast<int>(n_experts), static_cast<int>(hidden_width)); \
         } \
     } while (0)
@@ -4228,81 +4226,81 @@ torch::Tensor nint_moe_grouped_matmul_hetero_glu_qx_cuda(
     }
 #undef MFQ_MOE_GLU_PROFILE_DISPATCH
 #undef MFQ_MOE_GLU_GROUP4
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 
-static torch::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
-        torch::Tensor weight_ptrs,
-        torch::Tensor pool_params,
-        torch::Tensor expert_pool,
-        torch::Tensor expert_local,
-        torch::Tensor x,
-        torch::Tensor ids,
+static mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
+        mfq_tensor_backend::Tensor weight_ptrs,
+        mfq_tensor_backend::Tensor pool_params,
+        mfq_tensor_backend::Tensor expert_pool,
+        mfq_tensor_backend::Tensor expert_local,
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor ids,
         int64_t n_experts,
         int64_t out_per_expert,
         int64_t input_width,
         bool routed_input,
-        torch::Tensor out,
-        torch::Tensor ids_dst,
-        torch::Tensor expert_bounds,
-        torch::Tensor tile_bounds,
-        torch::Tensor tile_experts,
+        mfq_tensor_backend::Tensor out,
+        mfq_tensor_backend::Tensor ids_dst,
+        mfq_tensor_backend::Tensor expert_bounds,
+        mfq_tensor_backend::Tensor tile_bounds,
+        mfq_tensor_backend::Tensor tile_experts,
         int64_t weight_out_stride,
         int64_t weight_row_offset) {
-    TORCH_CHECK(n_experts > 0 && n_experts <= 4096, "n_experts must be in [1,4096]");
-    TORCH_CHECK(out_per_expert > 0 && out_per_expert <= INT_MAX,
+    MFQ_RUNTIME_CHECK(n_experts > 0 && n_experts <= 4096, "n_experts must be in [1,4096]");
+    MFQ_RUNTIME_CHECK(out_per_expert > 0 && out_per_expert <= INT_MAX,
         "out_per_expert must be positive");
-    TORCH_CHECK(weight_out_stride > 0 && weight_out_stride <= INT_MAX,
+    MFQ_RUNTIME_CHECK(weight_out_stride > 0 && weight_out_stride <= INT_MAX,
         "weight_out_stride must be positive");
-    TORCH_CHECK(weight_row_offset >= 0 && weight_row_offset <= INT_MAX &&
+    MFQ_RUNTIME_CHECK(weight_row_offset >= 0 && weight_row_offset <= INT_MAX &&
         weight_row_offset + out_per_expert <= weight_out_stride,
         "weight row slice must fit within weight_out_stride");
-    TORCH_CHECK(input_width > 0 && input_width <= INT_MAX, "input_width must be positive");
-    TORCH_CHECK(weight_ptrs.is_cuda() && weight_ptrs.is_contiguous() &&
-        weight_ptrs.scalar_type() == torch::kInt64 && weight_ptrs.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(input_width > 0 && input_width <= INT_MAX, "input_width must be positive");
+    MFQ_RUNTIME_CHECK(weight_ptrs.is_cuda() && weight_ptrs.is_contiguous() &&
+        weight_ptrs.scalar_type() == mfq_tensor_backend::kInt64 && weight_ptrs.dim() == 2 &&
         weight_ptrs.size(0) > 0 && weight_ptrs.size(1) == 5,
         "weight_ptrs must be contiguous CUDA int64 [pools,5]");
     const int pools = static_cast<int>(weight_ptrs.size(0));
-    TORCH_CHECK(pool_params.is_cuda() && pool_params.is_contiguous() &&
-        pool_params.scalar_type() == torch::kInt32 && pool_params.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(pool_params.is_cuda() && pool_params.is_contiguous() &&
+        pool_params.scalar_type() == mfq_tensor_backend::kInt32 && pool_params.dim() == 2 &&
         pool_params.size(0) == pools && pool_params.size(1) == 2,
         "pool_params must be contiguous CUDA int32 [pools,2]");
     const int experts = static_cast<int>(n_experts);
-    TORCH_CHECK(expert_pool.is_cuda() && expert_pool.is_contiguous() &&
-        expert_pool.scalar_type() == torch::kInt32 && expert_pool.numel() == experts,
+    MFQ_RUNTIME_CHECK(expert_pool.is_cuda() && expert_pool.is_contiguous() &&
+        expert_pool.scalar_type() == mfq_tensor_backend::kInt32 && expert_pool.numel() == experts,
         "expert_pool must be contiguous CUDA int32 [experts]");
-    TORCH_CHECK(expert_local.is_cuda() && expert_local.is_contiguous() &&
-        expert_local.scalar_type() == torch::kInt32 && expert_local.numel() == experts,
+    MFQ_RUNTIME_CHECK(expert_local.is_cuda() && expert_local.is_contiguous() &&
+        expert_local.scalar_type() == mfq_tensor_backend::kInt32 && expert_local.numel() == experts,
         "expert_local must be contiguous CUDA int32 [experts]");
-    TORCH_CHECK(ids.is_cuda() && ids.is_contiguous() && ids.scalar_type() == torch::kInt32 &&
+    MFQ_RUNTIME_CHECK(ids.is_cuda() && ids.is_contiguous() && ids.scalar_type() == mfq_tensor_backend::kInt32 &&
         ids.dim() == 2, "ids must be contiguous CUDA int32 [tokens,routes]");
     const int tokens = static_cast<int>(ids.size(0));
     const int routes = static_cast<int>(ids.size(1));
     const int pairs = tokens * routes;
-    TORCH_CHECK(tokens > 8 && routes > 0, "grouped MMA requires more than eight tokens");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(tokens > 8 && routes > 0, "grouped MMA requires more than eight tokens");
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
         (x.dim() == 2 || x.dim() == 3) && x.size(-1) == input_width,
         "x must be contiguous CUDA float16 with exact input width");
-    TORCH_CHECK(routed_input == (x.dim() == 3), "routed_input does not match x rank");
-    TORCH_CHECK((!routed_input && x.size(0) == tokens) ||
+    MFQ_RUNTIME_CHECK(routed_input == (x.dim() == 3), "routed_input does not match x rank");
+    MFQ_RUNTIME_CHECK((!routed_input && x.size(0) == tokens) ||
         (routed_input && x.size(0) == tokens && x.size(1) == routes),
         "x leading dimensions do not match ids");
-    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == mfq_tensor_backend::kFloat16 &&
         out.dim() == 3 && out.size(0) == tokens && out.size(1) == routes &&
         out.size(2) == out_per_expert,
         "out must be contiguous CUDA float16 [tokens,routes,out_per_expert]");
-    TORCH_CHECK(ids_dst.is_cuda() && ids_dst.is_contiguous() &&
-        ids_dst.scalar_type() == torch::kInt32 && ids_dst.numel() >= pairs,
+    MFQ_RUNTIME_CHECK(ids_dst.is_cuda() && ids_dst.is_contiguous() &&
+        ids_dst.scalar_type() == mfq_tensor_backend::kInt32 && ids_dst.numel() >= pairs,
         "ids_dst workspace is too small");
-    TORCH_CHECK(expert_bounds.is_cuda() && expert_bounds.is_contiguous() &&
-        expert_bounds.scalar_type() == torch::kInt32 && expert_bounds.numel() >= experts + 1,
+    MFQ_RUNTIME_CHECK(expert_bounds.is_cuda() && expert_bounds.is_contiguous() &&
+        expert_bounds.scalar_type() == mfq_tensor_backend::kInt32 && expert_bounds.numel() >= experts + 1,
         "expert_bounds workspace is too small");
-    TORCH_CHECK(tile_bounds.is_cuda() && tile_bounds.is_contiguous() &&
-        tile_bounds.scalar_type() == torch::kInt32 && tile_bounds.numel() >= experts + 1,
+    MFQ_RUNTIME_CHECK(tile_bounds.is_cuda() && tile_bounds.is_contiguous() &&
+        tile_bounds.scalar_type() == mfq_tensor_backend::kInt32 && tile_bounds.numel() >= experts + 1,
         "tile_bounds workspace is too small");
-    TORCH_CHECK(tile_experts.is_cuda() && tile_experts.is_contiguous() &&
-        tile_experts.scalar_type() == torch::kInt32 && tile_experts.numel() >= pairs,
+    MFQ_RUNTIME_CHECK(tile_experts.is_cuda() && tile_experts.is_contiguous() &&
+        tile_experts.scalar_type() == mfq_tensor_backend::kInt32 && tile_experts.numel() >= pairs,
         "tile_experts workspace is too small");
     check_same_device(weight_ptrs, pool_params, "pool_params");
     check_same_device(weight_ptrs, expert_pool, "expert_pool");
@@ -4332,17 +4330,17 @@ static torch::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
     const int blocks = static_cast<int>(
         std::max<int64_t>(1, std::min<int64_t>(block_cap, max_tasks)));
     const dim3 threads(32, 8);
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const cudaStream_t stream = mfq_current_cuda_stream();
     const int bm = forced_bm != 0 ? forced_bm :
         (tokens <= 128 ? 64 : (tokens <= 512 ? 32 : 64));
     if (bm == 16) {
         nint_moe_hetero_mma_kernel<16><<<blocks, threads, 0, stream>>>(
             weight_ptrs.data_ptr<int64_t>(), pool_params.data_ptr<int32_t>(),
             expert_pool.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(),
-            reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
             ids_dst.data_ptr<int32_t>(), expert_bounds.data_ptr<int32_t>(),
             tile_bounds.data_ptr<int32_t>(), tile_experts.data_ptr<int32_t>(),
-            reinterpret_cast<__half *>(out.data_ptr<at::Half>()), routes, experts,
+            reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), routes, experts,
             output_width, static_cast<int>(weight_out_stride),
             static_cast<int>(weight_row_offset),
             static_cast<int>(input_width), routed_input);
@@ -4350,10 +4348,10 @@ static torch::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
         nint_moe_hetero_mma_kernel<32><<<blocks, threads, 0, stream>>>(
             weight_ptrs.data_ptr<int64_t>(), pool_params.data_ptr<int32_t>(),
             expert_pool.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(),
-            reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
             ids_dst.data_ptr<int32_t>(), expert_bounds.data_ptr<int32_t>(),
             tile_bounds.data_ptr<int32_t>(), tile_experts.data_ptr<int32_t>(),
-            reinterpret_cast<__half *>(out.data_ptr<at::Half>()), routes, experts,
+            reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), routes, experts,
             output_width, static_cast<int>(weight_out_stride),
             static_cast<int>(weight_row_offset),
             static_cast<int>(input_width), routed_input);
@@ -4361,34 +4359,34 @@ static torch::Tensor nint_moe_grouped_matmul_hetero_f16_impl(
         nint_moe_hetero_mma_kernel<64><<<blocks, threads, 0, stream>>>(
             weight_ptrs.data_ptr<int64_t>(), pool_params.data_ptr<int32_t>(),
             expert_pool.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(),
-            reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
             ids_dst.data_ptr<int32_t>(), expert_bounds.data_ptr<int32_t>(),
             tile_bounds.data_ptr<int32_t>(), tile_experts.data_ptr<int32_t>(),
-            reinterpret_cast<__half *>(out.data_ptr<at::Half>()), routes, experts,
+            reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), routes, experts,
             output_width, static_cast<int>(weight_out_stride),
             static_cast<int>(weight_row_offset),
             static_cast<int>(input_width), routed_input);
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 
-torch::Tensor nint_moe_grouped_matmul_hetero_f16_cuda(
-        torch::Tensor weight_ptrs,
-        torch::Tensor pool_params,
-        torch::Tensor expert_pool,
-        torch::Tensor expert_local,
-        torch::Tensor x,
-        torch::Tensor ids,
+mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_cuda(
+        mfq_tensor_backend::Tensor weight_ptrs,
+        mfq_tensor_backend::Tensor pool_params,
+        mfq_tensor_backend::Tensor expert_pool,
+        mfq_tensor_backend::Tensor expert_local,
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor ids,
         int64_t n_experts,
         int64_t out_per_expert,
         int64_t input_width,
         bool routed_input,
-        torch::Tensor out,
-        torch::Tensor ids_dst,
-        torch::Tensor expert_bounds,
-        torch::Tensor tile_bounds,
-        torch::Tensor tile_experts) {
+        mfq_tensor_backend::Tensor out,
+        mfq_tensor_backend::Tensor ids_dst,
+        mfq_tensor_backend::Tensor expert_bounds,
+        mfq_tensor_backend::Tensor tile_bounds,
+        mfq_tensor_backend::Tensor tile_experts) {
     return nint_moe_grouped_matmul_hetero_f16_impl(
         weight_ptrs, pool_params, expert_pool, expert_local, x, ids,
         n_experts, out_per_expert, input_width, routed_input, out,
@@ -4396,22 +4394,22 @@ torch::Tensor nint_moe_grouped_matmul_hetero_f16_cuda(
         out_per_expert, 0);
 }
 
-torch::Tensor nint_moe_grouped_matmul_hetero_f16_slice_cuda(
-        torch::Tensor weight_ptrs,
-        torch::Tensor pool_params,
-        torch::Tensor expert_pool,
-        torch::Tensor expert_local,
-        torch::Tensor x,
-        torch::Tensor ids,
+mfq_tensor_backend::Tensor nint_moe_grouped_matmul_hetero_f16_slice_cuda(
+        mfq_tensor_backend::Tensor weight_ptrs,
+        mfq_tensor_backend::Tensor pool_params,
+        mfq_tensor_backend::Tensor expert_pool,
+        mfq_tensor_backend::Tensor expert_local,
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor ids,
         int64_t n_experts,
         int64_t out_per_expert,
         int64_t input_width,
         bool routed_input,
-        torch::Tensor out,
-        torch::Tensor ids_dst,
-        torch::Tensor expert_bounds,
-        torch::Tensor tile_bounds,
-        torch::Tensor tile_experts,
+        mfq_tensor_backend::Tensor out,
+        mfq_tensor_backend::Tensor ids_dst,
+        mfq_tensor_backend::Tensor expert_bounds,
+        mfq_tensor_backend::Tensor tile_bounds,
+        mfq_tensor_backend::Tensor tile_experts,
         int64_t weight_out_stride,
         int64_t weight_row_offset) {
     return nint_moe_grouped_matmul_hetero_f16_impl(
@@ -4421,15 +4419,15 @@ torch::Tensor nint_moe_grouped_matmul_hetero_f16_slice_cuda(
         weight_out_stride, weight_row_offset);
 }
 
-torch::Tensor nint_moe_grouped_matmul_pool_ws_cuda(
-        torch::Tensor q_packed,
-        torch::Tensor sub_scale,
-        torch::Tensor sub_min,
-        torch::Tensor neuron_scale,
-        torch::Tensor neuron_min,
-        torch::Tensor x,
-        torch::Tensor ids,
-        torch::Tensor expert_local,
+mfq_tensor_backend::Tensor nint_moe_grouped_matmul_pool_ws_cuda(
+        mfq_tensor_backend::Tensor q_packed,
+        mfq_tensor_backend::Tensor sub_scale,
+        mfq_tensor_backend::Tensor sub_min,
+        mfq_tensor_backend::Tensor neuron_scale,
+        mfq_tensor_backend::Tensor neuron_min,
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor ids,
+        mfq_tensor_backend::Tensor expert_local,
         int64_t n_experts,
         int64_t n_local_experts,
         int64_t out_per_expert,
@@ -4437,22 +4435,22 @@ torch::Tensor nint_moe_grouped_matmul_pool_ws_cuda(
         int64_t bits,
         bool route_map_ready,
         bool input_quantized,
-        torch::Tensor out,
-        torch::Tensor qx,
-        torch::Tensor xscale,
-        torch::Tensor counts,
-        torch::Tensor cursors,
-        torch::Tensor ids_dst,
-        torch::Tensor expert_bounds,
-        torch::Tensor tile_bounds,
-        torch::Tensor tile_experts) {
-    TORCH_CHECK(n_experts > 0 && n_experts <= 4096, "n_experts must be in [1, 4096]");
-    TORCH_CHECK(n_local_experts > 0 && n_local_experts <= n_experts,
+        mfq_tensor_backend::Tensor out,
+        mfq_tensor_backend::Tensor qx,
+        mfq_tensor_backend::Tensor xscale,
+        mfq_tensor_backend::Tensor counts,
+        mfq_tensor_backend::Tensor cursors,
+        mfq_tensor_backend::Tensor ids_dst,
+        mfq_tensor_backend::Tensor expert_bounds,
+        mfq_tensor_backend::Tensor tile_bounds,
+        mfq_tensor_backend::Tensor tile_experts) {
+    MFQ_RUNTIME_CHECK(n_experts > 0 && n_experts <= 4096, "n_experts must be in [1, 4096]");
+    MFQ_RUNTIME_CHECK(n_local_experts > 0 && n_local_experts <= n_experts,
         "n_local_experts must be in [1, n_experts]");
-    TORCH_CHECK(out_per_expert > 0 && out_per_expert <= INT_MAX, "out_per_expert must be positive");
-    TORCH_CHECK(bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8,
+    MFQ_RUNTIME_CHECK(out_per_expert > 0 && out_per_expert <= INT_MAX, "out_per_expert must be positive");
+    MFQ_RUNTIME_CHECK(bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8,
         "NINT MoE supports bits in {2,3,4,5,6,8}");
-    TORCH_CHECK(gs == 16 || gs == 24 || gs == 26 || gs == 28 || gs == 32 || gs == 48,
+    MFQ_RUNTIME_CHECK(gs == 16 || gs == 24 || gs == 26 || gs == 28 || gs == 32 || gs == 48,
         "NINT MoE supports gs in {16,24,26,28,32,48}");
     const int experts = static_cast<int>(n_experts);
     const int local_experts = static_cast<int>(n_local_experts);
@@ -4460,26 +4458,26 @@ torch::Tensor nint_moe_grouped_matmul_pool_ws_cuda(
     check_nint_weight(q_packed, sub_scale, sub_min, neuron_scale, neuron_min,
         local_experts, output_width, static_cast<int>(gs), static_cast<int>(bits));
 
-    TORCH_CHECK(ids.is_cuda() && ids.is_contiguous() && ids.scalar_type() == torch::kInt32 && ids.dim() == 2,
+    MFQ_RUNTIME_CHECK(ids.is_cuda() && ids.is_contiguous() && ids.scalar_type() == mfq_tensor_backend::kInt32 && ids.dim() == 2,
         "ids must be contiguous CUDA int32 [tokens, routes]");
-    TORCH_CHECK(expert_local.is_cuda() && expert_local.is_contiguous() &&
-        expert_local.scalar_type() == torch::kInt32 && expert_local.dim() == 1 &&
+    MFQ_RUNTIME_CHECK(expert_local.is_cuda() && expert_local.is_contiguous() &&
+        expert_local.scalar_type() == mfq_tensor_backend::kInt32 && expert_local.dim() == 1 &&
         expert_local.numel() == experts,
         "expert_local must be contiguous CUDA int32 [n_experts]");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
         (x.dim() == 2 || x.dim() == 3), "x must be contiguous CUDA float16 [T,K] or [T,R,K]");
     check_same_device(q_packed, x, "x");
     check_same_device(q_packed, ids, "ids");
     check_same_device(q_packed, expert_local, "expert_local");
     const int tokens = static_cast<int>(ids.size(0));
     const int routes = static_cast<int>(ids.size(1));
-    TORCH_CHECK(tokens > 0 && routes > 0, "ids dimensions must be nonzero");
+    MFQ_RUNTIME_CHECK(tokens > 0 && routes > 0, "ids dimensions must be nonzero");
     const bool routed_input = x.dim() == 3;
     if (routed_input) {
-        TORCH_CHECK(x.size(0) == tokens && x.size(1) == routes,
+        MFQ_RUNTIME_CHECK(x.size(0) == tokens && x.size(1) == routes,
             "routed x must have [tokens, routes, K] leading dimensions");
     } else {
-        TORCH_CHECK(x.size(0) == tokens, "shared x must have one row per token");
+        MFQ_RUNTIME_CHECK(x.size(0) == tokens, "shared x must have one row per token");
     }
     const int input_rows = routed_input ? tokens * routes : tokens;
     const int groups = static_cast<int>(q_packed.size(1));
@@ -4487,29 +4485,29 @@ torch::Tensor nint_moe_grouped_matmul_pool_ws_cuda(
     const int k_real = input_quantized
         ? k_pad
         : static_cast<int>(x.size(-1));
-    TORCH_CHECK(k_real <= k_pad, "x K exceeds packed NINT K");
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == torch::kInt8 &&
+    MFQ_RUNTIME_CHECK(k_real <= k_pad, "x K exceeds packed NINT K");
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == mfq_tensor_backend::kInt8 &&
         qx.dim() == 2 && qx.size(0) >= input_rows && qx.size(1) >= k_pad,
         "qx workspace is too small");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == torch::kFloat32 &&
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == mfq_tensor_backend::kFloat32 &&
         xscale.dim() == 2 && xscale.size(0) >= input_rows && xscale.size(1) >= groups,
         "xscale workspace is too small");
     check_same_device(q_packed, qx, "qx");
     check_same_device(q_packed, xscale, "xscale");
 
-    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == mfq_tensor_backend::kFloat16 &&
         out.dim() == 3 && out.size(0) == tokens && out.size(1) == routes &&
         out.size(2) == output_width,
         "out must be contiguous CUDA float16 [tokens, routes, out_per_expert]");
     check_same_device(q_packed, out, "out");
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const cudaStream_t stream = mfq_current_cuda_stream();
     if (tokens > 8 && !route_map_ready) {
         build_expert_map(ids, experts, kRouteTile, counts, cursors, ids_dst,
             expert_bounds, tile_bounds, tile_experts, stream);
     }
     if (tokens > 8) {
-        TORCH_CHECK(tile_experts.is_cuda() && tile_experts.is_contiguous() &&
-            tile_experts.scalar_type() == torch::kInt32 && tile_experts.numel() >= tokens * routes,
+        MFQ_RUNTIME_CHECK(tile_experts.is_cuda() && tile_experts.is_contiguous() &&
+            tile_experts.scalar_type() == mfq_tensor_backend::kInt32 && tile_experts.numel() >= tokens * routes,
             "tile_experts workspace is too small");
         check_same_device(ids, tile_experts, "tile_experts");
     }
@@ -4545,70 +4543,70 @@ torch::Tensor nint_moe_grouped_matmul_pool_ws_cuda(
     }
 #undef MFQ_MOE_SWITCH_GS
 #undef MFQ_MOE_LAUNCH
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 
-torch::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
-        torch::Tensor q,
-        torch::Tensor scale,
-        torch::Tensor x,
-        torch::Tensor ids,
-        torch::Tensor expert_local,
+mfq_tensor_backend::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
+        mfq_tensor_backend::Tensor q,
+        mfq_tensor_backend::Tensor scale,
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor ids,
+        mfq_tensor_backend::Tensor expert_local,
         int64_t n_experts,
         int64_t n_local_experts,
         int64_t out_per_expert,
         bool route_map_ready,
         bool input_quantized,
         bool use_f16_mma,
-        torch::Tensor out,
-        torch::Tensor qx,
-        torch::Tensor xscale,
-        torch::Tensor counts,
-        torch::Tensor cursors,
-        torch::Tensor ids_dst,
-        torch::Tensor expert_bounds,
-        torch::Tensor tile_bounds,
-        torch::Tensor tile_experts) {
-    TORCH_CHECK(
+        mfq_tensor_backend::Tensor out,
+        mfq_tensor_backend::Tensor qx,
+        mfq_tensor_backend::Tensor xscale,
+        mfq_tensor_backend::Tensor counts,
+        mfq_tensor_backend::Tensor cursors,
+        mfq_tensor_backend::Tensor ids_dst,
+        mfq_tensor_backend::Tensor expert_bounds,
+        mfq_tensor_backend::Tensor tile_bounds,
+        mfq_tensor_backend::Tensor tile_experts) {
+    MFQ_RUNTIME_CHECK(
         n_experts > 0 && n_experts <= 4096,
         "n_experts must be in [1, 4096]");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         n_local_experts > 0 && n_local_experts <= n_experts,
         "n_local_experts must be in [1, n_experts]");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         out_per_expert > 0 && out_per_expert <= INT_MAX,
         "out_per_expert must be positive");
     const int experts = static_cast<int>(n_experts);
     const int local_experts = static_cast<int>(n_local_experts);
     const int output_width = static_cast<int>(out_per_expert);
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         q.is_cuda() && q.is_contiguous() &&
-        q.scalar_type() == torch::kUInt8 && q.dim() == 3 &&
+        q.scalar_type() == mfq_tensor_backend::kUInt8 && q.dim() == 3 &&
         q.size(0) == static_cast<int64_t>(local_experts) * output_width &&
         q.size(2) == 32,
         "NINT8-0 MoE q must be contiguous CUDA uint8 "
         "[local_experts*out,groups,32]");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         scale.is_cuda() && scale.is_contiguous() &&
-        scale.scalar_type() == torch::kFloat16 && scale.dim() == 2 &&
+        scale.scalar_type() == mfq_tensor_backend::kFloat16 && scale.dim() == 2 &&
         scale.size(0) == q.size(0) && scale.size(1) == q.size(1),
         "NINT8-0 MoE scale must be contiguous CUDA f16 "
         "[local_experts*out,groups]");
     check_same_device(q, scale, "scale");
 
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         ids.is_cuda() && ids.is_contiguous() &&
-        ids.scalar_type() == torch::kInt32 && ids.dim() == 2,
+        ids.scalar_type() == mfq_tensor_backend::kInt32 && ids.dim() == 2,
         "ids must be contiguous CUDA int32 [tokens, routes]");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         expert_local.is_cuda() && expert_local.is_contiguous() &&
-        expert_local.scalar_type() == torch::kInt32 &&
+        expert_local.scalar_type() == mfq_tensor_backend::kInt32 &&
         expert_local.dim() == 1 && expert_local.numel() == experts,
         "expert_local must be contiguous CUDA int32 [n_experts]");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         x.is_cuda() && x.is_contiguous() &&
-        x.scalar_type() == torch::kFloat16 &&
+        x.scalar_type() == mfq_tensor_backend::kFloat16 &&
         (x.dim() == 2 || x.dim() == 3),
         "x must be contiguous CUDA float16 [T,K] or [T,R,K]");
     check_same_device(q, x, "x");
@@ -4616,14 +4614,14 @@ torch::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
     check_same_device(q, expert_local, "expert_local");
     const int tokens = static_cast<int>(ids.size(0));
     const int routes = static_cast<int>(ids.size(1));
-    TORCH_CHECK(tokens > 0 && routes > 0, "ids dimensions must be nonzero");
+    MFQ_RUNTIME_CHECK(tokens > 0 && routes > 0, "ids dimensions must be nonzero");
     const bool routed_input = x.dim() == 3;
     if (routed_input) {
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             x.size(0) == tokens && x.size(1) == routes,
             "routed x must have [tokens, routes, K] leading dimensions");
     } else {
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             x.size(0) == tokens,
             "shared x must have one row per token");
     }
@@ -4633,49 +4631,49 @@ torch::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
     const int input_width = static_cast<int>(x.size(-1));
     const int k_real =
         input_quantized ? k_pad : static_cast<int>(x.size(-1));
-    TORCH_CHECK(input_width <= k_pad, "x K exceeds packed NINT8-0 K");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(input_width <= k_pad, "x K exceeds packed NINT8-0 K");
+    MFQ_RUNTIME_CHECK(
         qx.is_cuda() && qx.is_contiguous() &&
-        qx.scalar_type() == torch::kInt8 && qx.dim() == 2 &&
+        qx.scalar_type() == mfq_tensor_backend::kInt8 && qx.dim() == 2 &&
         qx.size(0) >= input_rows && qx.size(1) >= k_pad,
         "qx workspace is too small");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         xscale.is_cuda() && xscale.is_contiguous() &&
-        xscale.scalar_type() == torch::kFloat32 && xscale.dim() == 2 &&
+        xscale.scalar_type() == mfq_tensor_backend::kFloat32 && xscale.dim() == 2 &&
         xscale.size(0) >= input_rows && xscale.size(1) >= groups,
         "xscale workspace is too small");
     check_same_device(q, qx, "qx");
     check_same_device(q, xscale, "xscale");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         out.is_cuda() && out.is_contiguous() &&
-        out.scalar_type() == torch::kFloat16 && out.dim() == 3 &&
+        out.scalar_type() == mfq_tensor_backend::kFloat16 && out.dim() == 3 &&
         out.size(0) == tokens && out.size(1) == routes &&
         out.size(2) == output_width,
         "out must be contiguous CUDA float16 "
         "[tokens, routes, out_per_expert]");
     check_same_device(q, out, "out");
 
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const cudaStream_t stream = mfq_current_cuda_stream();
     if (tokens > 8 && !route_map_ready) {
         build_expert_map(
             ids, experts, kRouteTile, counts, cursors, ids_dst,
             expert_bounds, tile_bounds, tile_experts, stream);
     }
     if (tokens > 8) {
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             tile_experts.is_cuda() && tile_experts.is_contiguous() &&
-            tile_experts.scalar_type() == torch::kInt32 &&
+            tile_experts.scalar_type() == mfq_tensor_backend::kInt32 &&
             tile_experts.numel() >= tokens * routes,
             "tile_experts workspace is too small");
         check_same_device(ids, tile_experts, "tile_experts");
     }
     if (use_f16_mma) {
-        TORCH_CHECK(tokens > 8, "NINT8-0 grouped MMA requires more than eight tokens");
+        MFQ_RUNTIME_CHECK(tokens > 8, "NINT8-0 grouped MMA requires more than eight tokens");
         launch_nint8_zero_moe_mma(
             q, scale, expert_local, x, ids_dst, expert_bounds, tile_bounds,
             tile_experts, out, tokens, routes, experts, output_width, groups,
             input_width, routed_input, stream);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
         return out;
     }
     if (!input_quantized) {
@@ -4687,78 +4685,78 @@ torch::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
         q, scale, qx, xscale, ids, expert_local, ids_dst,
         expert_bounds, tile_bounds, tile_experts, out, tokens, routes,
         experts, output_width, groups, k_pad, routed_input, stream);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 
-torch::Tensor moe_weighted_reduce_cuda(torch::Tensor pair_output, torch::Tensor weights) {
-    TORCH_CHECK(pair_output.is_cuda() && pair_output.is_contiguous() &&
-        pair_output.scalar_type() == torch::kFloat16 && pair_output.dim() == 3,
+mfq_tensor_backend::Tensor moe_weighted_reduce_cuda(mfq_tensor_backend::Tensor pair_output, mfq_tensor_backend::Tensor weights) {
+    MFQ_RUNTIME_CHECK(pair_output.is_cuda() && pair_output.is_contiguous() &&
+        pair_output.scalar_type() == mfq_tensor_backend::kFloat16 && pair_output.dim() == 3,
         "pair_output must be contiguous CUDA float16 [tokens, routes, width]");
-    TORCH_CHECK(weights.is_cuda() && weights.is_contiguous() &&
-        weights.scalar_type() == torch::kFloat32 && weights.dim() == 2,
+    MFQ_RUNTIME_CHECK(weights.is_cuda() && weights.is_contiguous() &&
+        weights.scalar_type() == mfq_tensor_backend::kFloat32 && weights.dim() == 2,
         "weights must be contiguous CUDA float32 [tokens, routes]");
-    TORCH_CHECK(pair_output.size(0) == weights.size(0) && pair_output.size(1) == weights.size(1),
+    MFQ_RUNTIME_CHECK(pair_output.size(0) == weights.size(0) && pair_output.size(1) == weights.size(1),
         "pair_output and weights leading dimensions must match");
     check_same_device(pair_output, weights, "weights");
     const int tokens = static_cast<int>(pair_output.size(0));
     const int routes = static_cast<int>(pair_output.size(1));
     const int width = static_cast<int>(pair_output.size(2));
-    auto output = torch::empty({tokens, width}, pair_output.options());
+    auto output = mfq_tensor_backend::empty({tokens, width}, pair_output.options());
     const int block = 256;
     const int64_t total = static_cast<int64_t>(tokens) * width;
     const int grid = static_cast<int>((total + block - 1) / block);
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const cudaStream_t stream = mfq_current_cuda_stream();
     moe_weighted_reduce_kernel<<<grid, block, 0, stream>>>(
-        reinterpret_cast<const __half *>(pair_output.data_ptr<at::Half>()),
-        weights.data_ptr<float>(), reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+        reinterpret_cast<const __half *>(pair_output.data_ptr<mfq_half>()),
+        weights.data_ptr<float>(), reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
         tokens, routes, width);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
 
-torch::Tensor moe_swiglu_split_cuda(torch::Tensor gate_up) {
-    TORCH_CHECK(gate_up.is_cuda() && gate_up.is_contiguous() &&
-        gate_up.scalar_type() == torch::kFloat16 && gate_up.dim() == 3,
+mfq_tensor_backend::Tensor moe_swiglu_split_cuda(mfq_tensor_backend::Tensor gate_up) {
+    MFQ_RUNTIME_CHECK(gate_up.is_cuda() && gate_up.is_contiguous() &&
+        gate_up.scalar_type() == mfq_tensor_backend::kFloat16 && gate_up.dim() == 3,
         "gate_up must be contiguous CUDA float16 [tokens, routes, 2 * width]");
-    TORCH_CHECK(gate_up.size(2) > 0 && gate_up.size(2) % 2 == 0,
+    MFQ_RUNTIME_CHECK(gate_up.size(2) > 0 && gate_up.size(2) % 2 == 0,
         "gate_up width must be positive and even");
     const int tokens = static_cast<int>(gate_up.size(0));
     const int routes = static_cast<int>(gate_up.size(1));
     const int width = static_cast<int>(gate_up.size(2) / 2);
-    TORCH_CHECK(tokens > 0 && routes > 0, "gate_up leading dimensions must be nonzero");
-    auto output = torch::empty({tokens, routes, width}, gate_up.options());
+    MFQ_RUNTIME_CHECK(tokens > 0 && routes > 0, "gate_up leading dimensions must be nonzero");
+    auto output = mfq_tensor_backend::empty({tokens, routes, width}, gate_up.options());
     const int rows = tokens * routes;
     const int64_t total = static_cast<int64_t>(rows) * width;
     constexpr int block = 256;
     const int grid = static_cast<int>((total + block - 1) / block);
-    moe_glu_split_kernel<false><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const __half *>(gate_up.data_ptr<at::Half>()),
-        reinterpret_cast<__half *>(output.data_ptr<at::Half>()), rows, width);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    moe_glu_split_kernel<false><<<grid, block, 0, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const __half *>(gate_up.data_ptr<mfq_half>()),
+        reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), rows, width);
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
 
-torch::Tensor moe_geglu_split_cuda(torch::Tensor gate_up) {
-    TORCH_CHECK(gate_up.is_cuda() && gate_up.is_contiguous() &&
-        gate_up.scalar_type() == torch::kFloat16 && gate_up.dim() >= 2,
+mfq_tensor_backend::Tensor moe_geglu_split_cuda(mfq_tensor_backend::Tensor gate_up) {
+    MFQ_RUNTIME_CHECK(gate_up.is_cuda() && gate_up.is_contiguous() &&
+        gate_up.scalar_type() == mfq_tensor_backend::kFloat16 && gate_up.dim() >= 2,
         "gate_up must be contiguous CUDA float16 [..., 2 * width]");
-    TORCH_CHECK(gate_up.size(-1) > 0 && gate_up.size(-1) % 2 == 0,
+    MFQ_RUNTIME_CHECK(gate_up.size(-1) > 0 && gate_up.size(-1) % 2 == 0,
         "gate_up width must be positive and even");
     const int width = static_cast<int>(gate_up.size(-1) / 2);
     const int64_t rows64 = gate_up.numel() / (2 * width);
-    TORCH_CHECK(rows64 > 0 && rows64 <= INT_MAX, "gate_up row count is unsupported");
+    MFQ_RUNTIME_CHECK(rows64 > 0 && rows64 <= INT_MAX, "gate_up row count is unsupported");
     auto shape = gate_up.sizes().vec();
     shape.back() = width;
-    auto output = torch::empty(shape, gate_up.options());
+    auto output = mfq_tensor_backend::empty(shape, gate_up.options());
     constexpr int block = 256;
     const int64_t total = rows64 * width;
     const int grid = static_cast<int>((total + block - 1) / block);
-    moe_glu_split_kernel<true><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const __half *>(gate_up.data_ptr<at::Half>()),
-        reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+    moe_glu_split_kernel<true><<<grid, block, 0, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const __half *>(gate_up.data_ptr<mfq_half>()),
+        reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
         static_cast<int>(rows64), width);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
 
@@ -4774,79 +4772,79 @@ __global__ void moe_apply_expert_scale_kernel(
     }
 }
 
-torch::Tensor moe_apply_expert_scale_cuda(
-        torch::Tensor weights, torch::Tensor ids, torch::Tensor scales) {
-    TORCH_CHECK(weights.is_cuda() && weights.is_contiguous() &&
-        weights.scalar_type() == torch::kFloat32 && weights.dim() == 2,
+mfq_tensor_backend::Tensor moe_apply_expert_scale_cuda(
+        mfq_tensor_backend::Tensor weights, mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor scales) {
+    MFQ_RUNTIME_CHECK(weights.is_cuda() && weights.is_contiguous() &&
+        weights.scalar_type() == mfq_tensor_backend::kFloat32 && weights.dim() == 2,
         "weights must be contiguous CUDA float32 [tokens, routes]");
-    TORCH_CHECK(ids.is_cuda() && ids.is_contiguous() &&
-        ids.scalar_type() == torch::kInt32 && ids.sizes() == weights.sizes(),
+    MFQ_RUNTIME_CHECK(ids.is_cuda() && ids.is_contiguous() &&
+        ids.scalar_type() == mfq_tensor_backend::kInt32 && ids.sizes() == weights.sizes(),
         "ids must be contiguous CUDA int32 with the same shape as weights");
-    TORCH_CHECK(scales.is_cuda() && scales.is_contiguous() &&
-        scales.scalar_type() == torch::kFloat32 && scales.dim() == 1,
+    MFQ_RUNTIME_CHECK(scales.is_cuda() && scales.is_contiguous() &&
+        scales.scalar_type() == mfq_tensor_backend::kFloat32 && scales.dim() == 1,
         "scales must be contiguous CUDA float32 [experts]");
     check_same_device(weights, ids, "ids");
     check_same_device(weights, scales, "scales");
     const int64_t total64 = weights.numel();
-    TORCH_CHECK(total64 <= INT_MAX, "expert scale tensor is too large");
+    MFQ_RUNTIME_CHECK(total64 <= INT_MAX, "expert scale tensor is too large");
     constexpr int block = 256;
     const int grid = static_cast<int>((total64 + block - 1) / block);
-    moe_apply_expert_scale_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+    moe_apply_expert_scale_kernel<<<grid, block, 0, mfq_current_cuda_stream()>>>(
         weights.data_ptr<float>(), ids.data_ptr<int32_t>(), scales.data_ptr<float>(),
         static_cast<int>(total64));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return weights;
 }
 
-torch::Tensor moe_add_shared_gate_cuda(
-        torch::Tensor routed,
-        torch::Tensor shared,
-        torch::Tensor gate_logits) {
-    TORCH_CHECK(routed.is_cuda() && routed.is_contiguous() &&
-        routed.scalar_type() == torch::kFloat16 && routed.dim() == 2,
+mfq_tensor_backend::Tensor moe_add_shared_gate_cuda(
+        mfq_tensor_backend::Tensor routed,
+        mfq_tensor_backend::Tensor shared,
+        mfq_tensor_backend::Tensor gate_logits) {
+    MFQ_RUNTIME_CHECK(routed.is_cuda() && routed.is_contiguous() &&
+        routed.scalar_type() == mfq_tensor_backend::kFloat16 && routed.dim() == 2,
         "routed must be contiguous CUDA float16 [tokens, width]");
-    TORCH_CHECK(shared.is_cuda() && shared.is_contiguous() &&
-        shared.scalar_type() == torch::kFloat16 && shared.sizes() == routed.sizes(),
+    MFQ_RUNTIME_CHECK(shared.is_cuda() && shared.is_contiguous() &&
+        shared.scalar_type() == mfq_tensor_backend::kFloat16 && shared.sizes() == routed.sizes(),
         "shared must match routed as contiguous CUDA float16");
-    TORCH_CHECK(gate_logits.is_cuda() && gate_logits.is_contiguous() &&
-        gate_logits.scalar_type() == torch::kFloat32 && gate_logits.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(gate_logits.is_cuda() && gate_logits.is_contiguous() &&
+        gate_logits.scalar_type() == mfq_tensor_backend::kFloat32 && gate_logits.dim() == 2 &&
         gate_logits.size(0) == routed.size(0) && gate_logits.size(1) == 1,
         "gate_logits must be contiguous CUDA float32 [tokens, 1]");
     check_same_device(routed, shared, "shared");
     check_same_device(routed, gate_logits, "gate_logits");
     const int rows = static_cast<int>(routed.size(0));
     const int width = static_cast<int>(routed.size(1));
-    auto output = torch::empty_like(routed);
+    auto output = mfq_tensor_backend::empty_like(routed);
     const int64_t total = static_cast<int64_t>(rows) * width;
     constexpr int block = 256;
     const int grid = static_cast<int>((total + block - 1) / block);
-    moe_add_shared_gate_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const __half *>(routed.data_ptr<at::Half>()),
-        reinterpret_cast<const __half *>(shared.data_ptr<at::Half>()),
+    moe_add_shared_gate_kernel<<<grid, block, 0, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const __half *>(routed.data_ptr<mfq_half>()),
+        reinterpret_cast<const __half *>(shared.data_ptr<mfq_half>()),
         gate_logits.data_ptr<float>(),
-        reinterpret_cast<__half *>(output.data_ptr<at::Half>()), rows, width);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+        reinterpret_cast<__half *>(output.data_ptr<mfq_half>()), rows, width);
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
 
-torch::Tensor moe_weighted_reduce_shared_gate_cuda(
-        torch::Tensor pair_output,
-        torch::Tensor weights,
-        torch::Tensor shared,
-        torch::Tensor gate_logits) {
-    TORCH_CHECK(pair_output.is_cuda() && pair_output.is_contiguous() &&
-        pair_output.scalar_type() == torch::kFloat16 && pair_output.dim() == 3,
+mfq_tensor_backend::Tensor moe_weighted_reduce_shared_gate_cuda(
+        mfq_tensor_backend::Tensor pair_output,
+        mfq_tensor_backend::Tensor weights,
+        mfq_tensor_backend::Tensor shared,
+        mfq_tensor_backend::Tensor gate_logits) {
+    MFQ_RUNTIME_CHECK(pair_output.is_cuda() && pair_output.is_contiguous() &&
+        pair_output.scalar_type() == mfq_tensor_backend::kFloat16 && pair_output.dim() == 3,
         "pair_output must be contiguous CUDA float16 [tokens, routes, width]");
-    TORCH_CHECK(weights.is_cuda() && weights.is_contiguous() &&
-        weights.scalar_type() == torch::kFloat32 && weights.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(weights.is_cuda() && weights.is_contiguous() &&
+        weights.scalar_type() == mfq_tensor_backend::kFloat32 && weights.dim() == 2 &&
         pair_output.size(0) == weights.size(0) && pair_output.size(1) == weights.size(1),
         "weights must match pair_output as contiguous CUDA float32 [tokens, routes]");
-    TORCH_CHECK(shared.is_cuda() && shared.is_contiguous() &&
-        shared.scalar_type() == torch::kFloat16 && shared.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(shared.is_cuda() && shared.is_contiguous() &&
+        shared.scalar_type() == mfq_tensor_backend::kFloat16 && shared.dim() == 2 &&
         shared.size(0) == pair_output.size(0) && shared.size(1) == pair_output.size(2),
         "shared must be contiguous CUDA float16 [tokens, width]");
-    TORCH_CHECK(gate_logits.is_cuda() && gate_logits.is_contiguous() &&
-        gate_logits.scalar_type() == torch::kFloat32 && gate_logits.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(gate_logits.is_cuda() && gate_logits.is_contiguous() &&
+        gate_logits.scalar_type() == mfq_tensor_backend::kFloat32 && gate_logits.dim() == 2 &&
         gate_logits.size(0) == pair_output.size(0) && gate_logits.size(1) == 1,
         "gate_logits must be contiguous CUDA float32 [tokens, 1]");
     check_same_device(pair_output, weights, "weights");
@@ -4855,18 +4853,18 @@ torch::Tensor moe_weighted_reduce_shared_gate_cuda(
     const int tokens = static_cast<int>(pair_output.size(0));
     const int routes = static_cast<int>(pair_output.size(1));
     const int width = static_cast<int>(pair_output.size(2));
-    auto output = torch::empty({tokens, width}, pair_output.options());
+    auto output = mfq_tensor_backend::empty({tokens, width}, pair_output.options());
     constexpr int block = 256;
     const int64_t total = static_cast<int64_t>(tokens) * width;
     const int grid = static_cast<int>((total + block - 1) / block);
     moe_weighted_reduce_shared_gate_kernel<<<
-        grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const __half *>(pair_output.data_ptr<at::Half>()),
+        grid, block, 0, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const __half *>(pair_output.data_ptr<mfq_half>()),
         weights.data_ptr<float>(),
-        reinterpret_cast<const __half *>(shared.data_ptr<at::Half>()),
+        reinterpret_cast<const __half *>(shared.data_ptr<mfq_half>()),
         gate_logits.data_ptr<float>(),
-        reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+        reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
         tokens, routes, width);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }

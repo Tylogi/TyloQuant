@@ -9,10 +9,9 @@
 // q/k/v may be fp16 or fp32; dot/softmax accumulation stays fp32.
 
 #include <cuda_runtime.h>
+#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
 #include <cuda_fp16.h>
 #include <mma.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
 #include <cfloat>
 #include <climits>
 #include <cstdlib>
@@ -192,34 +191,34 @@ __global__ void attention_flash256_f16_kernel(
     }
 }
 
-torch::Tensor attention_flash256_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v, double scale)
+mfq_tensor_backend::Tensor attention_flash256_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale)
 {
-    TORCH_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == mfq_tensor_backend::kFloat16,
                 "attention_flash256: q must be contiguous CUDA fp16");
-    TORCH_CHECK(k.is_cuda() && k.is_contiguous() && k.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(k.is_cuda() && k.is_contiguous() && k.scalar_type() == mfq_tensor_backend::kFloat16,
                 "attention_flash256: k must be contiguous CUDA fp16");
-    TORCH_CHECK(v.is_cuda() && v.is_contiguous() && v.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(v.is_cuda() && v.is_contiguous() && v.scalar_type() == mfq_tensor_backend::kFloat16,
                 "attention_flash256: v must be contiguous CUDA fp16");
-    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "attention_flash256: q/k/v must be rank 4");
+    MFQ_RUNTIME_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "attention_flash256: q/k/v must be rank 4");
     const int B = (int)q.size(0);
     const int Hq = (int)q.size(1);
     const int T = (int)q.size(2);
     const int Hk = (int)k.size(1);
-    TORCH_CHECK(q.size(3) == 256 && k.size(3) == 256 && v.size(3) == 256,
+    MFQ_RUNTIME_CHECK(q.size(3) == 256 && k.size(3) == 256 && v.size(3) == 256,
                 "attention_flash256: head_dim must be 256");
-    TORCH_CHECK(k.size(0) == B && v.size(0) == B && k.size(2) == T && v.size(2) == T && v.size(1) == Hk,
+    MFQ_RUNTIME_CHECK(k.size(0) == B && v.size(0) == B && k.size(2) == T && v.size(2) == T && v.size(1) == Hk,
                 "attention_flash256: only self-attention with matching k/v shapes is supported");
-    TORCH_CHECK(Hq % Hk == 0, "attention_flash256: Hq must be divisible by Hkv");
-    auto out = torch::empty_like(q);
+    MFQ_RUNTIME_CHECK(Hq % Hk == 0, "attention_flash256: Hq must be divisible by Hkv");
+    auto out = mfq_tensor_backend::empty_like(q);
     const dim3 grid((T + 127) / 128, B * Hq);
     constexpr int shmem = 96 * 1024;
     cudaFuncSetAttribute(attention_flash256_f16_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
-    attention_flash256_f16_kernel<<<grid, 512, shmem, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
-        reinterpret_cast<const half*>(k.data_ptr<at::Half>()),
-        reinterpret_cast<const half*>(v.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+    attention_flash256_f16_kernel<<<grid, 512, shmem, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const half*>(q.data_ptr<mfq_half>()),
+        reinterpret_cast<const half*>(k.data_ptr<mfq_half>()),
+        reinterpret_cast<const half*>(v.data_ptr<mfq_half>()),
+        reinterpret_cast<half*>(out.data_ptr<mfq_half>()),
         Hq, Hk, T, (float)scale);
     return out;
 }
@@ -364,25 +363,25 @@ __global__ void attention_split_reduce_kernel(
     }
 }
 
-static torch::Tensor attention_impl_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+static mfq_tensor_backend::Tensor attention_impl_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
                                          double scale, bool causal, int window)
 {
-    TORCH_CHECK(q.is_cuda() && q.is_contiguous(), "attention: q must be cuda contiguous");
-    TORCH_CHECK(k.is_cuda() && k.is_contiguous(), "attention: k must be cuda contiguous");
-    TORCH_CHECK(v.is_cuda() && v.is_contiguous(), "attention: v must be cuda contiguous");
-    TORCH_CHECK(q.scalar_type() == k.scalar_type() && q.scalar_type() == v.scalar_type(),
+    MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous(), "attention: q must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(k.is_cuda() && k.is_contiguous(), "attention: k must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(v.is_cuda() && v.is_contiguous(), "attention: v must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(q.scalar_type() == k.scalar_type() && q.scalar_type() == v.scalar_type(),
                 "attention: q/k/v dtype mismatch");
-    TORCH_CHECK(q.scalar_type() == torch::kFloat16 || q.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(q.scalar_type() == mfq_tensor_backend::kFloat16 || q.scalar_type() == mfq_tensor_backend::kFloat32,
                 "attention: dtype must be f16 or f32");
     int B = (int)q.size(0), Hq = (int)q.size(1), T = (int)q.size(2), D = (int)q.size(3);
     int Hk = (int)k.size(1), Tk = (int)k.size(2);
-    TORCH_CHECK(D == (int)k.size(3) && D == (int)v.size(3), "q/k/v last dim must match");
-    TORCH_CHECK(Hq % Hk == 0, "GQA requires H_q % H_kv == 0");
+    MFQ_RUNTIME_CHECK(D == (int)k.size(3) && D == (int)v.size(3), "q/k/v last dim must match");
+    MFQ_RUNTIME_CHECK(Hq % Hk == 0, "GQA requires H_q % H_kv == 0");
     int rep = Hq / Hk;
-    auto out = torch::empty_like(q);
+    auto out = mfq_tensor_backend::empty_like(q);
     int total = B * Hq * T;
     int shmem = D * (int)sizeof(float);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
     int parts = 1;
     const int visible_keys = window > 0 ? std::min(Tk, window) : Tk;
     const char* split_env = std::getenv("MFQ_ATTENTION_SPLITK");
@@ -397,9 +396,9 @@ static torch::Tensor attention_impl_cuda(torch::Tensor q, torch::Tensor k, torch
     B, Hq, Hk, T, Tk, D, rep, (float)scale, (int)causal, window)
 #define ATT_SPLIT(BD)                                                                                 \
     do {                                                                                              \
-        auto po = torch::empty({total, parts, D}, q.options().dtype(torch::kFloat32));                 \
-        auto pm = torch::empty({total, parts}, q.options().dtype(torch::kFloat32));                    \
-        auto pl = torch::empty({total, parts}, q.options().dtype(torch::kFloat32));                    \
+        auto po = mfq_tensor_backend::empty({total, parts, D}, q.options().dtype(mfq_tensor_backend::kFloat32));                 \
+        auto pm = mfq_tensor_backend::empty({total, parts}, q.options().dtype(mfq_tensor_backend::kFloat32));                    \
+        auto pl = mfq_tensor_backend::empty({total, parts}, q.options().dtype(mfq_tensor_backend::kFloat32));                    \
         attention_split_part_kernel<BD, scalar_t><<<total * parts, BD, shmem, stream>>>(               \
             q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),                    \
             po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(),                          \
@@ -408,7 +407,7 @@ static torch::Tensor attention_impl_cuda(torch::Tensor q, torch::Tensor k, torch
             po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(),                          \
             out.data_ptr<scalar_t>(), total, parts, D);                                                \
     } while (0)
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(q.scalar_type(), "attention_cuda", [&] {
+    MFQ_DISPATCH_FLOATING_TYPES_AND_HALF(q.scalar_type(), "attention_cuda", [&] {
         if (D <= 64) {
             if (parts > 1) { ATT_SPLIT(64); } else { ATT(64); }
         } else if (D <= 128) {
@@ -418,7 +417,7 @@ static torch::Tensor attention_impl_cuda(torch::Tensor q, torch::Tensor k, torch
         } else if (D <= 512) {
             if (parts > 1) { ATT_SPLIT(512); } else { ATT(512); }
         } else {
-            TORCH_CHECK(false, "attention: D>512 unsupported, got ", D);
+            MFQ_RUNTIME_CHECK(false, "attention: D>512 unsupported, got ", D);
         }
     });
 #undef ATT
@@ -426,16 +425,16 @@ static torch::Tensor attention_impl_cuda(torch::Tensor q, torch::Tensor k, torch
     return out;
 }
 
-torch::Tensor attention_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+mfq_tensor_backend::Tensor attention_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
                              double scale, bool causal)
 {
     return attention_impl_cuda(q, k, v, scale, causal, 0);
 }
 
-torch::Tensor attention_swa_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+mfq_tensor_backend::Tensor attention_swa_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
                                  double scale, int64_t window)
 {
-    TORCH_CHECK(window > 0 && window <= INT_MAX, "attention_swa: window must be in [1, INT_MAX]");
+    MFQ_RUNTIME_CHECK(window > 0 && window <= INT_MAX, "attention_swa: window must be in [1, INT_MAX]");
     return attention_impl_cuda(q, k, v, scale, true, (int)window);
 }
 
@@ -492,46 +491,46 @@ __global__ void attention_cache_decode_kernel(
     }
 }
 
-torch::Tensor attention_cache_decode_cuda(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
-                                          torch::Tensor seq_len, double scale)
+mfq_tensor_backend::Tensor attention_cache_decode_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+                                          mfq_tensor_backend::Tensor seq_len, double scale)
 {
-    TORCH_CHECK(q.is_cuda() && q.is_contiguous(), "attention_cache_decode: q must be cuda contiguous");
-    TORCH_CHECK(k_cache.is_cuda() && k_cache.is_contiguous(), "attention_cache_decode: k_cache must be cuda contiguous");
-    TORCH_CHECK(v_cache.is_cuda() && v_cache.is_contiguous(), "attention_cache_decode: v_cache must be cuda contiguous");
-    TORCH_CHECK(seq_len.is_cuda() && seq_len.is_contiguous() && seq_len.scalar_type() == torch::kInt64 &&
+    MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous(), "attention_cache_decode: q must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(k_cache.is_cuda() && k_cache.is_contiguous(), "attention_cache_decode: k_cache must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(v_cache.is_cuda() && v_cache.is_contiguous(), "attention_cache_decode: v_cache must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(seq_len.is_cuda() && seq_len.is_contiguous() && seq_len.scalar_type() == mfq_tensor_backend::kInt64 &&
                 seq_len.numel() == 1, "attention_cache_decode: seq_len must be cuda int64[1]");
-    TORCH_CHECK(q.scalar_type() == k_cache.scalar_type() && q.scalar_type() == v_cache.scalar_type(),
+    MFQ_RUNTIME_CHECK(q.scalar_type() == k_cache.scalar_type() && q.scalar_type() == v_cache.scalar_type(),
                 "attention_cache_decode: q/k/v dtype mismatch");
-    TORCH_CHECK(q.scalar_type() == torch::kFloat16 || q.scalar_type() == torch::kBFloat16 ||
-                q.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(q.scalar_type() == mfq_tensor_backend::kFloat16 || q.scalar_type() == mfq_tensor_backend::kBFloat16 ||
+                q.scalar_type() == mfq_tensor_backend::kFloat32,
                 "attention_cache_decode: dtype must be f16, bf16, or f32");
-    TORCH_CHECK(q.dim() == 4 && q.size(2) == 1, "attention_cache_decode: q must be [B,Hq,1,D]");
-    TORCH_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4 && k_cache.sizes() == v_cache.sizes(),
+    MFQ_RUNTIME_CHECK(q.dim() == 4 && q.size(2) == 1, "attention_cache_decode: q must be [B,Hq,1,D]");
+    MFQ_RUNTIME_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4 && k_cache.sizes() == v_cache.sizes(),
                 "attention_cache_decode: caches must be [B,Hk,max_seq,D]");
     int B = (int)q.size(0);
     int Hq = (int)q.size(1);
     int D = (int)q.size(3);
     int Hk = (int)k_cache.size(1);
     int max_seq = (int)k_cache.size(2);
-    TORCH_CHECK(k_cache.size(0) == B && k_cache.size(3) == D, "attention_cache_decode: cache shape mismatch");
-    TORCH_CHECK(Hq % Hk == 0, "attention_cache_decode: GQA requires Hq % Hk == 0");
+    MFQ_RUNTIME_CHECK(k_cache.size(0) == B && k_cache.size(3) == D, "attention_cache_decode: cache shape mismatch");
+    MFQ_RUNTIME_CHECK(Hq % Hk == 0, "attention_cache_decode: GQA requires Hq % Hk == 0");
     int rep = Hq / Hk;
-    auto out = torch::empty_like(q);
+    auto out = mfq_tensor_backend::empty_like(q);
     int total = B * Hq;
     int shmem = D * (int)sizeof(float);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
 #define ATT_CACHE(BD) attention_cache_decode_kernel<BD, scalar_t><<<total, BD, shmem, stream>>>( \
     q.data_ptr<scalar_t>(), k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),          \
     seq_len.data_ptr<int64_t>(), out.data_ptr<scalar_t>(),                                       \
     B, Hq, Hk, max_seq, D, rep, (float)scale)
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
+    MFQ_DISPATCH_FLOATING_TYPES_AND2(
+        mfq_dispatch_half, mfq_dispatch_bfloat16,
         q.scalar_type(), "attention_cache_decode_cuda", [&] {
         if (D <= 64) { ATT_CACHE(64); }
         else if (D <= 128) { ATT_CACHE(128); }
         else if (D <= 256) { ATT_CACHE(256); }
         else if (D <= 512) { ATT_CACHE(512); }
-        else { TORCH_CHECK(false, "attention_cache_decode: D>512 unsupported, got ", D); }
+        else { MFQ_RUNTIME_CHECK(false, "attention_cache_decode: D>512 unsupported, got ", D); }
     });
 #undef ATT_CACHE
     return out;
@@ -718,29 +717,29 @@ __global__ void attention_cache_decode_split_reduce_kernel(
     }
 }
 
-torch::Tensor attention_cache_decode_split_cuda(
-    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
-    torch::Tensor seq_len, double scale,
-    torch::Tensor partial_o, torch::Tensor partial_m, torch::Tensor partial_l,
+mfq_tensor_backend::Tensor attention_cache_decode_split_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    mfq_tensor_backend::Tensor seq_len, double scale,
+    mfq_tensor_backend::Tensor partial_o, mfq_tensor_backend::Tensor partial_m, mfq_tensor_backend::Tensor partial_l,
     int64_t parts)
 {
-    TORCH_CHECK(q.is_cuda() && q.is_contiguous(), "attention_cache_decode_split: q must be cuda contiguous");
-    TORCH_CHECK(k_cache.is_cuda() && k_cache.is_contiguous(), "attention_cache_decode_split: k_cache must be cuda contiguous");
-    TORCH_CHECK(v_cache.is_cuda() && v_cache.is_contiguous(), "attention_cache_decode_split: v_cache must be cuda contiguous");
-    TORCH_CHECK(seq_len.is_cuda() && seq_len.is_contiguous() && seq_len.scalar_type() == torch::kInt64 &&
+    MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous(), "attention_cache_decode_split: q must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(k_cache.is_cuda() && k_cache.is_contiguous(), "attention_cache_decode_split: k_cache must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(v_cache.is_cuda() && v_cache.is_contiguous(), "attention_cache_decode_split: v_cache must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(seq_len.is_cuda() && seq_len.is_contiguous() && seq_len.scalar_type() == mfq_tensor_backend::kInt64 &&
                 seq_len.numel() == 1, "attention_cache_decode_split: seq_len must be cuda int64[1]");
-    TORCH_CHECK(q.scalar_type() == k_cache.scalar_type() && q.scalar_type() == v_cache.scalar_type(),
+    MFQ_RUNTIME_CHECK(q.scalar_type() == k_cache.scalar_type() && q.scalar_type() == v_cache.scalar_type(),
                 "attention_cache_decode_split: q/k/v dtype mismatch");
-    TORCH_CHECK(q.scalar_type() == torch::kFloat16 || q.scalar_type() == torch::kBFloat16 ||
-                q.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(q.scalar_type() == mfq_tensor_backend::kFloat16 || q.scalar_type() == mfq_tensor_backend::kBFloat16 ||
+                q.scalar_type() == mfq_tensor_backend::kFloat32,
                 "attention_cache_decode_split: dtype must be f16, bf16, or f32");
-    TORCH_CHECK(q.dim() == 4 && q.size(2) == 1, "attention_cache_decode_split: q must be [B,Hq,1,D]");
-    TORCH_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4 && k_cache.sizes() == v_cache.sizes(),
+    MFQ_RUNTIME_CHECK(q.dim() == 4 && q.size(2) == 1, "attention_cache_decode_split: q must be [B,Hq,1,D]");
+    MFQ_RUNTIME_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4 && k_cache.sizes() == v_cache.sizes(),
                 "attention_cache_decode_split: caches must be [B,Hk,max_seq,D]");
-    TORCH_CHECK(partial_o.is_cuda() && partial_o.is_contiguous() && partial_o.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(partial_o.is_cuda() && partial_o.is_contiguous() && partial_o.scalar_type() == mfq_tensor_backend::kFloat32,
                 "attention_cache_decode_split: partial_o must be contiguous CUDA f32");
-    TORCH_CHECK(partial_m.is_cuda() && partial_m.is_contiguous() && partial_m.scalar_type() == torch::kFloat32 &&
-                partial_l.is_cuda() && partial_l.is_contiguous() && partial_l.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(partial_m.is_cuda() && partial_m.is_contiguous() && partial_m.scalar_type() == mfq_tensor_backend::kFloat32 &&
+                partial_l.is_cuda() && partial_l.is_contiguous() && partial_l.scalar_type() == mfq_tensor_backend::kFloat32,
                 "attention_cache_decode_split: partial_m/l must be contiguous CUDA f32");
 
     const int B = (int)q.size(0);
@@ -749,19 +748,19 @@ torch::Tensor attention_cache_decode_split_cuda(
     const int Hk = (int)k_cache.size(1);
     const int max_seq = (int)k_cache.size(2);
     const int total = B * Hq;
-    TORCH_CHECK(k_cache.size(0) == B && k_cache.size(3) == D, "attention_cache_decode_split: cache shape mismatch");
-    TORCH_CHECK(Hq % Hk == 0, "attention_cache_decode_split: GQA requires Hq % Hk == 0");
-    TORCH_CHECK(partial_o.dim() == 3 && partial_o.size(0) == total && partial_o.size(2) == D,
+    MFQ_RUNTIME_CHECK(k_cache.size(0) == B && k_cache.size(3) == D, "attention_cache_decode_split: cache shape mismatch");
+    MFQ_RUNTIME_CHECK(Hq % Hk == 0, "attention_cache_decode_split: GQA requires Hq % Hk == 0");
+    MFQ_RUNTIME_CHECK(partial_o.dim() == 3 && partial_o.size(0) == total && partial_o.size(2) == D,
                 "attention_cache_decode_split: partial_o shape mismatch");
     const int workspace_parts = (int)partial_o.size(1);
-    TORCH_CHECK(parts >= 2 && parts <= workspace_parts, "attention_cache_decode_split: invalid parts");
-    TORCH_CHECK(partial_m.sizes() == torch::IntArrayRef({total, workspace_parts}) &&
+    MFQ_RUNTIME_CHECK(parts >= 2 && parts <= workspace_parts, "attention_cache_decode_split: invalid parts");
+    MFQ_RUNTIME_CHECK(partial_m.sizes() == mfq_tensor_backend::IntArrayRef({total, workspace_parts}) &&
                 partial_l.sizes() == partial_m.sizes(), "attention_cache_decode_split: partial_m/l shape mismatch");
 
-    auto out = torch::empty_like(q);
+    auto out = mfq_tensor_backend::empty_like(q);
     const int shmem = D * (int)sizeof(float);
     const int rep = Hq / Hk;
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
 #define ATT_CACHE_SPLIT(BD) do {                                                                    \
     if (D == 128 && rep == 4) {                                                                       \
         attention_cache_decode_split_gqa4_d128_part_kernel<scalar_t>                                 \
@@ -783,14 +782,14 @@ torch::Tensor attention_cache_decode_split_cuda(
         partial_o.data_ptr<float>(), partial_m.data_ptr<float>(), partial_l.data_ptr<float>(),          \
         out.data_ptr<scalar_t>(), total, (int)parts, workspace_parts, D);                              \
 } while (0)
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
+    MFQ_DISPATCH_FLOATING_TYPES_AND2(
+        mfq_dispatch_half, mfq_dispatch_bfloat16,
         q.scalar_type(), "attention_cache_decode_split_cuda", [&] {
         if (D <= 64) { ATT_CACHE_SPLIT(64); }
         else if (D <= 128) { ATT_CACHE_SPLIT(128); }
         else if (D <= 256) { ATT_CACHE_SPLIT(256); }
         else if (D <= 512) { ATT_CACHE_SPLIT(512); }
-        else { TORCH_CHECK(false, "attention_cache_decode_split: D>512 unsupported, got ", D); }
+        else { MFQ_RUNTIME_CHECK(false, "attention_cache_decode_split: D>512 unsupported, got ", D); }
     });
 #undef ATT_CACHE_SPLIT
     return out;
@@ -903,25 +902,25 @@ __global__ void attention_cache_swa_split_part_kernel(
     }
 }
 
-static torch::Tensor attention_cache_swa_impl_cuda(
-    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
-    torch::Tensor seq_len, double scale, int64_t window, int64_t planned_length)
+static mfq_tensor_backend::Tensor attention_cache_swa_impl_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    mfq_tensor_backend::Tensor seq_len, double scale, int64_t window, int64_t planned_length)
 {
-    TORCH_CHECK(q.is_cuda() && q.is_contiguous(), "attention_cache_swa: q must be cuda contiguous");
-    TORCH_CHECK(k_cache.is_cuda() && k_cache.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous(), "attention_cache_swa: q must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(k_cache.is_cuda() && k_cache.is_contiguous() &&
                 v_cache.is_cuda() && v_cache.is_contiguous(),
                 "attention_cache_swa: caches must be cuda contiguous");
-    TORCH_CHECK(seq_len.is_cuda() && seq_len.is_contiguous() &&
-                seq_len.scalar_type() == torch::kInt64 && seq_len.numel() == 1,
+    MFQ_RUNTIME_CHECK(seq_len.is_cuda() && seq_len.is_contiguous() &&
+                seq_len.scalar_type() == mfq_tensor_backend::kInt64 && seq_len.numel() == 1,
                 "attention_cache_swa: seq_len must be cuda int64[1]");
-    TORCH_CHECK(q.scalar_type() == k_cache.scalar_type() && q.scalar_type() == v_cache.scalar_type(),
+    MFQ_RUNTIME_CHECK(q.scalar_type() == k_cache.scalar_type() && q.scalar_type() == v_cache.scalar_type(),
                 "attention_cache_swa: q/k/v dtype mismatch");
-    TORCH_CHECK(q.scalar_type() == torch::kFloat16 || q.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(q.scalar_type() == mfq_tensor_backend::kFloat16 || q.scalar_type() == mfq_tensor_backend::kFloat32,
                 "attention_cache_swa: dtype must be f16 or f32");
-    TORCH_CHECK(q.dim() == 4 && k_cache.dim() == 4 && v_cache.dim() == 4 &&
+    MFQ_RUNTIME_CHECK(q.dim() == 4 && k_cache.dim() == 4 && v_cache.dim() == 4 &&
                 k_cache.sizes() == v_cache.sizes(),
                 "attention_cache_swa: expected q[B,Hq,T,D] and cache[B,Hk,capacity,D]");
-    TORCH_CHECK(window > 0 && window <= INT_MAX, "attention_cache_swa: invalid window");
+    MFQ_RUNTIME_CHECK(window > 0 && window <= INT_MAX, "attention_cache_swa: invalid window");
 
     const int B = (int)q.size(0);
     const int Hq = (int)q.size(1);
@@ -929,11 +928,11 @@ static torch::Tensor attention_cache_swa_impl_cuda(
     const int D = (int)q.size(3);
     const int Hk = (int)k_cache.size(1);
     const int capacity = (int)k_cache.size(2);
-    TORCH_CHECK(T > 0 && capacity >= window, "attention_cache_swa: cache capacity must cover the window");
-    TORCH_CHECK(k_cache.size(0) == B && k_cache.size(3) == D, "attention_cache_swa: cache shape mismatch");
-    TORCH_CHECK(Hq % Hk == 0, "attention_cache_swa: GQA requires Hq % Hk == 0");
+    MFQ_RUNTIME_CHECK(T > 0 && capacity >= window, "attention_cache_swa: cache capacity must cover the window");
+    MFQ_RUNTIME_CHECK(k_cache.size(0) == B && k_cache.size(3) == D, "attention_cache_swa: cache shape mismatch");
+    MFQ_RUNTIME_CHECK(Hq % Hk == 0, "attention_cache_swa: GQA requires Hq % Hk == 0");
 
-    auto out = torch::empty_like(q);
+    auto out = mfq_tensor_backend::empty_like(q);
     const int total = B * Hq * T;
     const int rep = Hq / Hk;
     const int shmem = D * (int)sizeof(float);
@@ -942,7 +941,7 @@ static torch::Tensor attention_cache_swa_impl_cuda(
         : static_cast<int>(window);
     int parts = total < 128 && visible_keys >= 512 ? (visible_keys + 255) / 256 : 1;
     parts = std::max(1, std::min(parts, 16));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
 
 #define ATT_CACHE_SWA(BD) do {                                                                  \
     if (parts == 1) {                                                                            \
@@ -951,9 +950,9 @@ static torch::Tensor attention_cache_swa_impl_cuda(
             seq_len.data_ptr<int64_t>(), out.data_ptr<scalar_t>(),                               \
             Hq, Hk, T, capacity, D, rep, (int)window, (float)scale);                             \
     } else {                                                                                     \
-        auto po = torch::empty({total, parts, D}, q.options().dtype(torch::kFloat32));            \
-        auto pm = torch::empty({total, parts}, q.options().dtype(torch::kFloat32));               \
-        auto pl = torch::empty({total, parts}, q.options().dtype(torch::kFloat32));               \
+        auto po = mfq_tensor_backend::empty({total, parts, D}, q.options().dtype(mfq_tensor_backend::kFloat32));            \
+        auto pm = mfq_tensor_backend::empty({total, parts}, q.options().dtype(mfq_tensor_backend::kFloat32));               \
+        auto pl = mfq_tensor_backend::empty({total, parts}, q.options().dtype(mfq_tensor_backend::kFloat32));               \
         attention_cache_swa_split_part_kernel<BD, scalar_t><<<total * parts, BD, shmem, stream>>>( \
             q.data_ptr<scalar_t>(), k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),  \
             seq_len.data_ptr<int64_t>(), po.data_ptr<float>(), pm.data_ptr<float>(),             \
@@ -963,30 +962,30 @@ static torch::Tensor attention_cache_swa_impl_cuda(
             out.data_ptr<scalar_t>(), total, parts, D);                                          \
     }                                                                                            \
 } while (0)
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(q.scalar_type(), "attention_cache_swa_cuda", [&] {
+    MFQ_DISPATCH_FLOATING_TYPES_AND_HALF(q.scalar_type(), "attention_cache_swa_cuda", [&] {
         if (D <= 64) { ATT_CACHE_SWA(64); }
         else if (D <= 128) { ATT_CACHE_SWA(128); }
         else if (D <= 256) { ATT_CACHE_SWA(256); }
         else if (D <= 512) { ATT_CACHE_SWA(512); }
-        else { TORCH_CHECK(false, "attention_cache_swa: D>512 unsupported, got ", D); }
+        else { MFQ_RUNTIME_CHECK(false, "attention_cache_swa: D>512 unsupported, got ", D); }
     });
 #undef ATT_CACHE_SWA
     return out;
 }
 
-torch::Tensor attention_cache_swa_cuda(
-    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
-    torch::Tensor seq_len, double scale, int64_t window)
+mfq_tensor_backend::Tensor attention_cache_swa_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    mfq_tensor_backend::Tensor seq_len, double scale, int64_t window)
 {
     return attention_cache_swa_impl_cuda(
         q, k_cache, v_cache, seq_len, scale, window, 0);
 }
 
-torch::Tensor attention_cache_swa_planned_cuda(
-    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
-    torch::Tensor seq_len, double scale, int64_t window, int64_t planned_length)
+mfq_tensor_backend::Tensor attention_cache_swa_planned_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
+    mfq_tensor_backend::Tensor seq_len, double scale, int64_t window, int64_t planned_length)
 {
-    TORCH_CHECK(planned_length > 0 && planned_length <= INT_MAX,
+    MFQ_RUNTIME_CHECK(planned_length > 0 && planned_length <= INT_MAX,
         "attention_cache_swa_planned: planned length must be in [1, INT_MAX]");
     return attention_cache_swa_impl_cuda(
         q, k_cache, v_cache, seq_len, scale, window, planned_length);

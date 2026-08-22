@@ -1,7 +1,6 @@
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
+#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
 #include <cuda_runtime.h>
-#include <torch/extension.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -168,10 +167,10 @@ __global__ void mxfp8_small_m_kernel(
 
 template <int TILE_M, typename Output>
 void launch_mxfp8_small_m(
-        const torch::Tensor & values,
-        const torch::Tensor & scales,
-        const torch::Tensor & x,
-        torch::Tensor & y,
+        const mfq_tensor_backend::Tensor & values,
+        const mfq_tensor_backend::Tensor & scales,
+        const mfq_tensor_backend::Tensor & x,
+        mfq_tensor_backend::Tensor & y,
         int groups,
         int outputs_per_group,
         cudaStream_t stream) {
@@ -190,7 +189,7 @@ void launch_mxfp8_small_m(
             grid, threads, shared_bytes, stream>>>( \
                 values.data_ptr<std::uint8_t>(), \
                 scales.data_ptr<std::uint8_t>(), \
-                reinterpret_cast<const __half *>(x.data_ptr<at::Half>()), \
+                reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()), \
                 reinterpret_cast<Output *>(y.data_ptr()), \
                 int(x.size(0)), outputs, int(values.size(1)), \
                 groups, outputs_per_group); \
@@ -325,55 +324,55 @@ __global__ void __launch_bounds__(256) mxfp8_matmul_kernel(
 }
 
 void validate_mxfp8(
-        const torch::Tensor & values,
-        const torch::Tensor & scales) {
-    TORCH_CHECK(values.is_cuda() && scales.is_cuda(),
+        const mfq_tensor_backend::Tensor & values,
+        const mfq_tensor_backend::Tensor & scales) {
+    MFQ_RUNTIME_CHECK(values.is_cuda() && scales.is_cuda(),
                 "MXFP8 values and scales must be CUDA tensors");
-    TORCH_CHECK(values.scalar_type() == torch::kUInt8 &&
-                    scales.scalar_type() == torch::kUInt8,
+    MFQ_RUNTIME_CHECK(values.scalar_type() == mfq_tensor_backend::kUInt8 &&
+                    scales.scalar_type() == mfq_tensor_backend::kUInt8,
                 "MXFP8 values and scales must be uint8");
-    TORCH_CHECK(values.is_contiguous() && scales.is_contiguous(),
+    MFQ_RUNTIME_CHECK(values.is_contiguous() && scales.is_contiguous(),
                 "MXFP8 values and scales must be contiguous");
-    TORCH_CHECK(values.dim() == 2 && scales.dim() == 2,
+    MFQ_RUNTIME_CHECK(values.dim() == 2 && scales.dim() == 2,
                 "MXFP8 values and scales must be rank-2");
-    TORCH_CHECK(values.size(0) > 0 && values.size(1) > 0 &&
+    MFQ_RUNTIME_CHECK(values.size(0) > 0 && values.size(1) > 0 &&
                     values.size(0) <= std::numeric_limits<int>::max() &&
                     values.size(1) <= std::numeric_limits<int>::max() &&
                     values.size(1) % 128 == 0,
                 "MXFP8 input width must be divisible by 128");
-    TORCH_CHECK(scales.size(0) == (values.size(0) + 127) / 128 &&
+    MFQ_RUNTIME_CHECK(scales.size(0) == (values.size(0) + 127) / 128 &&
                     scales.size(1) == values.size(1) / 128,
                 "MXFP8 scale geometry mismatch");
 }
 
 } // namespace
 
-torch::Tensor mxfp8_dequant_cuda(
-        torch::Tensor values,
-        torch::Tensor scales) {
+mfq_tensor_backend::Tensor mxfp8_dequant_cuda(
+        mfq_tensor_backend::Tensor values,
+        mfq_tensor_backend::Tensor scales) {
     validate_mxfp8(values, scales);
-    auto dense = torch::empty(
-        values.sizes(), values.options().dtype(torch::kFloat16));
+    auto dense = mfq_tensor_backend::empty(
+        values.sizes(), values.options().dtype(mfq_tensor_backend::kFloat16));
     const std::size_t count = std::size_t(values.numel());
     constexpr int threads = 256;
     const int blocks = int((count + threads - 1) / threads);
     mxfp8_dequant_kernel<<<
-        blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        blocks, threads, 0, mfq_current_cuda_stream()>>>(
             values.data_ptr<std::uint8_t>(),
             scales.data_ptr<std::uint8_t>(),
-            reinterpret_cast<__half *>(dense.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(dense.data_ptr<mfq_half>()),
             int(values.size(0)), int(values.size(1)));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return dense;
 }
 
-torch::Tensor mxfp8_embedding_lookup_cuda(
-        torch::Tensor values,
-        torch::Tensor scales,
-        torch::Tensor token_ids) {
+mfq_tensor_backend::Tensor mxfp8_embedding_lookup_cuda(
+        mfq_tensor_backend::Tensor values,
+        mfq_tensor_backend::Tensor scales,
+        mfq_tensor_backend::Tensor token_ids) {
     validate_mxfp8(values, scales);
-    TORCH_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() &&
-                    token_ids.scalar_type() == torch::kInt64 &&
+    MFQ_RUNTIME_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() &&
+                    token_ids.scalar_type() == mfq_tensor_backend::kInt64 &&
                     token_ids.get_device() == values.get_device() &&
                     token_ids.numel() <= std::numeric_limits<int>::max(),
                 "MXFP8 embedding ids must be contiguous CUDA int64 on the weight device");
@@ -382,38 +381,38 @@ torch::Tensor mxfp8_embedding_lookup_cuda(
     const int width = static_cast<int>(values.size(1));
     auto shape = token_ids.sizes().vec();
     shape.push_back(width);
-    auto output = torch::empty(shape, values.options().dtype(torch::kFloat16));
+    auto output = mfq_tensor_backend::empty(shape, values.options().dtype(mfq_tensor_backend::kFloat16));
     constexpr int threads = 256;
     const int64_t total = static_cast<int64_t>(count) * width;
     const int blocks = static_cast<int>(std::min<int64_t>(
         (total + threads - 1) / threads, 4096));
     if (blocks > 0) {
         mxfp8_embedding_kernel<<<
-            blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            blocks, threads, 0, mfq_current_cuda_stream()>>>(
                 values.data_ptr<std::uint8_t>(),
                 scales.data_ptr<std::uint8_t>(), token_ids.data_ptr<int64_t>(),
-                reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+                reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
                 count, vocab, width);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     }
     return output;
 }
 
-torch::Tensor mxfp8_small_m_cuda(
-        torch::Tensor values,
-        torch::Tensor scales,
-        torch::Tensor x) {
+mfq_tensor_backend::Tensor mxfp8_small_m_cuda(
+        mfq_tensor_backend::Tensor values,
+        mfq_tensor_backend::Tensor scales,
+        mfq_tensor_backend::Tensor x) {
     validate_mxfp8(values, scales);
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
                     x.is_contiguous() && x.dim() == 2,
                 "MXFP8 activation must be contiguous CUDA fp16 rank-2");
-    TORCH_CHECK(x.size(1) == values.size(1),
+    MFQ_RUNTIME_CHECK(x.size(1) == values.size(1),
                 "MXFP8 activation width mismatch");
-    TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 8,
+    MFQ_RUNTIME_CHECK(x.size(0) >= 1 && x.size(0) <= 8,
                 "MXFP8 small-M kernel supports M in [1, 8]");
-    auto y = torch::empty(
+    auto y = mfq_tensor_backend::empty(
         {x.size(0), values.size(0)}, x.options());
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const cudaStream_t stream = mfq_current_cuda_stream();
 #define MFQ_LAUNCH_MXFP8(TILE) \
     launch_mxfp8_small_m<TILE, __half>( \
         values, scales, x, y, 1, int(values.size(0)), stream)
@@ -427,16 +426,16 @@ torch::Tensor mxfp8_small_m_cuda(
         MFQ_LAUNCH_MXFP8(8);
     }
 #undef MFQ_LAUNCH_MXFP8
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }
 
-torch::Tensor mxfp8_matmul_f16_cuda(
-        torch::Tensor values,
-        torch::Tensor scales,
-        torch::Tensor input) {
+mfq_tensor_backend::Tensor mxfp8_matmul_f16_cuda(
+        mfq_tensor_backend::Tensor values,
+        mfq_tensor_backend::Tensor scales,
+        mfq_tensor_backend::Tensor input) {
     validate_mxfp8(values, scales);
-    TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.scalar_type() == mfq_tensor_backend::kFloat16 &&
                     input.is_contiguous() && input.dim() == 2 &&
                     input.size(0) > 0 && input.size(1) == values.size(1) &&
                     input.size(0) <= std::numeric_limits<int>::max(),
@@ -444,7 +443,7 @@ torch::Tensor mxfp8_matmul_f16_cuda(
     const int rows = static_cast<int>(input.size(0));
     const int outputs = static_cast<int>(values.size(0));
     const int width = static_cast<int>(input.size(1));
-    auto result = torch::empty({rows, outputs}, input.options());
+    auto result = mfq_tensor_backend::empty({rows, outputs}, input.options());
     constexpr int kRowsPerTile = 8;
     constexpr int kOutputsPerTile = 8;
     const int row_tiles = (rows + kRowsPerTile - 1) / kRowsPerTile;
@@ -454,31 +453,31 @@ torch::Tensor mxfp8_matmul_f16_cuda(
     const int blocks = static_cast<int>(std::min<int64_t>(tasks, 4096));
     const dim3 threads(32, kOutputsPerTile);
     mxfp8_matmul_kernel<__half><<<
-        blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        blocks, threads, 0, mfq_current_cuda_stream()>>>(
             values.data_ptr<std::uint8_t>(),
             scales.data_ptr<std::uint8_t>(),
-            reinterpret_cast<const __half *>(input.data_ptr<at::Half>()),
-            reinterpret_cast<__half *>(result.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
+            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
             rows, outputs, width, row_tiles, output_tiles);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
 }
 
-torch::Tensor mxfp8_small_m_f32_cuda(
-        torch::Tensor values,
-        torch::Tensor scales,
-        torch::Tensor x) {
+mfq_tensor_backend::Tensor mxfp8_small_m_f32_cuda(
+        mfq_tensor_backend::Tensor values,
+        mfq_tensor_backend::Tensor scales,
+        mfq_tensor_backend::Tensor x) {
     validate_mxfp8(values, scales);
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
                     x.is_contiguous() && x.dim() == 2 &&
                     x.size(1) == values.size(1),
                 "MXFP8 FP32-output activation geometry mismatch");
-    TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 8,
+    MFQ_RUNTIME_CHECK(x.size(0) >= 1 && x.size(0) <= 8,
                 "MXFP8 FP32-output small-M kernel supports M in [1, 8]");
-    auto y = torch::empty(
+    auto y = mfq_tensor_backend::empty(
         {x.size(0), values.size(0)},
-        x.options().dtype(torch::kFloat32));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        x.options().dtype(mfq_tensor_backend::kFloat32));
+    const cudaStream_t stream = mfq_current_cuda_stream();
 #define MFQ_LAUNCH_MXFP8_F32(TILE) \
     launch_mxfp8_small_m<TILE, float>( \
         values, scales, x, y, 1, int(values.size(0)), stream)
@@ -492,23 +491,23 @@ torch::Tensor mxfp8_small_m_f32_cuda(
         MFQ_LAUNCH_MXFP8_F32(8);
     }
 #undef MFQ_LAUNCH_MXFP8_F32
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }
 
-torch::Tensor mxfp8_gemm_f32_cuda(
-        torch::Tensor values,
-        torch::Tensor scales,
-        torch::Tensor x) {
+mfq_tensor_backend::Tensor mxfp8_gemm_f32_cuda(
+        mfq_tensor_backend::Tensor values,
+        mfq_tensor_backend::Tensor scales,
+        mfq_tensor_backend::Tensor x) {
     validate_mxfp8(values, scales);
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
                     x.is_contiguous() && x.dim() == 2 &&
                     x.size(1) == values.size(1),
                 "MXFP8 FP32-output GEMM activation geometry mismatch");
     const int M = int(x.size(0));
     const int N = int(values.size(0));
-    auto y = torch::empty(
-        {M, N}, x.options().dtype(torch::kFloat32));
+    auto y = mfq_tensor_backend::empty(
+        {M, N}, x.options().dtype(mfq_tensor_backend::kFloat32));
     constexpr int kRowsPerTile = 8;
     constexpr int kOutputsPerTile = 8;
     const int row_tiles = (M + kRowsPerTile - 1) / kRowsPerTile;
@@ -517,36 +516,36 @@ torch::Tensor mxfp8_gemm_f32_cuda(
     const int blocks = static_cast<int>(std::min<int64_t>(tasks, 4096));
     const dim3 threads(32, kOutputsPerTile);
     mxfp8_matmul_kernel<float><<<
-        blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        blocks, threads, 0, mfq_current_cuda_stream()>>>(
             values.data_ptr<std::uint8_t>(),
             scales.data_ptr<std::uint8_t>(),
-            reinterpret_cast<const __half *>(x.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
             y.data_ptr<float>(), M, N, int(x.size(1)),
             row_tiles, output_tiles);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }
 
-torch::Tensor mxfp8_groupwise_small_m_cuda(
-        torch::Tensor values,
-        torch::Tensor scales,
-        torch::Tensor x,
+mfq_tensor_backend::Tensor mxfp8_groupwise_small_m_cuda(
+        mfq_tensor_backend::Tensor values,
+        mfq_tensor_backend::Tensor scales,
+        mfq_tensor_backend::Tensor x,
         int64_t groups) {
     validate_mxfp8(values, scales);
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
                     x.is_contiguous() && x.dim() == 3,
                 "MXFP8 groupwise activation must be contiguous CUDA fp16 rank-3");
-    TORCH_CHECK(groups > 0 && x.size(1) == groups &&
+    MFQ_RUNTIME_CHECK(groups > 0 && x.size(1) == groups &&
                     values.size(0) % groups == 0 &&
                     x.size(2) == values.size(1),
                 "MXFP8 groupwise geometry mismatch");
-    TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 8,
+    MFQ_RUNTIME_CHECK(x.size(0) >= 1 && x.size(0) <= 8,
                 "MXFP8 groupwise small-M kernel supports M in [1, 8]");
     const int64_t outputs_per_group = values.size(0) / groups;
-    TORCH_CHECK(outputs_per_group % 32 == 0,
+    MFQ_RUNTIME_CHECK(outputs_per_group % 32 == 0,
                 "MXFP8 groupwise outputs per group must be divisible by 32");
-    auto y = torch::empty({x.size(0), values.size(0)}, x.options());
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto y = mfq_tensor_backend::empty({x.size(0), values.size(0)}, x.options());
+    const cudaStream_t stream = mfq_current_cuda_stream();
 #define MFQ_LAUNCH_GROUPED_MXFP8(TILE) \
     launch_mxfp8_small_m<TILE, __half>( \
         values, scales, x, y, int(groups), int(outputs_per_group), stream)
@@ -560,31 +559,31 @@ torch::Tensor mxfp8_groupwise_small_m_cuda(
         MFQ_LAUNCH_GROUPED_MXFP8(8);
     }
 #undef MFQ_LAUNCH_GROUPED_MXFP8
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }
 
-torch::Tensor mxfp8_groupwise_small_m_f32_cuda(
-        torch::Tensor values,
-        torch::Tensor scales,
-        torch::Tensor x,
+mfq_tensor_backend::Tensor mxfp8_groupwise_small_m_f32_cuda(
+        mfq_tensor_backend::Tensor values,
+        mfq_tensor_backend::Tensor scales,
+        mfq_tensor_backend::Tensor x,
         int64_t groups) {
     validate_mxfp8(values, scales);
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
                     x.is_contiguous() && x.dim() == 3 &&
                     groups > 0 && x.size(1) == groups &&
                     values.size(0) % groups == 0 &&
                     x.size(2) == values.size(1),
                 "MXFP8 groupwise FP32-output geometry mismatch");
-    TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 8,
+    MFQ_RUNTIME_CHECK(x.size(0) >= 1 && x.size(0) <= 8,
                 "MXFP8 groupwise FP32-output kernel supports M in [1, 8]");
     const int64_t outputs_per_group = values.size(0) / groups;
-    TORCH_CHECK(outputs_per_group % 32 == 0,
+    MFQ_RUNTIME_CHECK(outputs_per_group % 32 == 0,
                 "MXFP8 groupwise outputs per group must be divisible by 32");
-    auto y = torch::empty(
+    auto y = mfq_tensor_backend::empty(
         {x.size(0), values.size(0)},
-        x.options().dtype(torch::kFloat32));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        x.options().dtype(mfq_tensor_backend::kFloat32));
+    const cudaStream_t stream = mfq_current_cuda_stream();
 #define MFQ_LAUNCH_GROUPED_MXFP8_F32(TILE) \
     launch_mxfp8_small_m<TILE, float>( \
         values, scales, x, y, int(groups), int(outputs_per_group), stream)
@@ -598,7 +597,7 @@ torch::Tensor mxfp8_groupwise_small_m_f32_cuda(
         MFQ_LAUNCH_GROUPED_MXFP8_F32(8);
     }
 #undef MFQ_LAUNCH_GROUPED_MXFP8_F32
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }
 
@@ -722,16 +721,16 @@ __global__ void __launch_bounds__(256) mxfp4_matmul_f16_kernel(
 }
 
 void validate_mxfp4_dense(
-        const torch::Tensor & values,
-        const torch::Tensor & scales) {
-    TORCH_CHECK(values.is_cuda() && scales.is_cuda(),
+        const mfq_tensor_backend::Tensor & values,
+        const mfq_tensor_backend::Tensor & scales) {
+    MFQ_RUNTIME_CHECK(values.is_cuda() && scales.is_cuda(),
                 "MXFP4 values and scales must be CUDA tensors");
-    TORCH_CHECK(values.scalar_type() == torch::kUInt8 &&
-                    scales.scalar_type() == torch::kUInt8,
+    MFQ_RUNTIME_CHECK(values.scalar_type() == mfq_tensor_backend::kUInt8 &&
+                    scales.scalar_type() == mfq_tensor_backend::kUInt8,
                 "MXFP4 values and scales must be uint8");
-    TORCH_CHECK(values.is_contiguous() && scales.is_contiguous(),
+    MFQ_RUNTIME_CHECK(values.is_contiguous() && scales.is_contiguous(),
                 "MXFP4 values and scales must be contiguous");
-    TORCH_CHECK(values.dim() == 2 && scales.dim() == 2 &&
+    MFQ_RUNTIME_CHECK(values.dim() == 2 && scales.dim() == 2 &&
                     values.size(0) > 0 && values.size(1) > 0 &&
                     values.size(0) <= std::numeric_limits<int>::max() &&
                     values.size(1) <= std::numeric_limits<int>::max() / 2 &&
@@ -848,41 +847,41 @@ __global__ void __launch_bounds__(256) mxfp4_moe_grouped_f16_kernel(
 }
 
 void validate_mxfp4_moe(
-        const torch::Tensor & values,
-        const torch::Tensor & scales,
-        const torch::Tensor & input,
-        const torch::Tensor & ids,
-        const torch::Tensor & expert_local,
-        const torch::Tensor & output,
+        const mfq_tensor_backend::Tensor & values,
+        const mfq_tensor_backend::Tensor & scales,
+        const mfq_tensor_backend::Tensor & input,
+        const mfq_tensor_backend::Tensor & ids,
+        const mfq_tensor_backend::Tensor & expert_local,
+        const mfq_tensor_backend::Tensor & output,
         int64_t global_experts,
         int64_t pool_experts,
         int64_t out_per_expert,
         int64_t neuron_len) {
-    TORCH_CHECK(values.is_cuda() && scales.is_cuda() && input.is_cuda() &&
+    MFQ_RUNTIME_CHECK(values.is_cuda() && scales.is_cuda() && input.is_cuda() &&
                     ids.is_cuda() && expert_local.is_cuda() && output.is_cuda(),
                 "MXFP4 routed tensors must be CUDA tensors");
-    TORCH_CHECK(values.scalar_type() == torch::kUInt8 &&
-                    scales.scalar_type() == torch::kUInt8 &&
-                    input.scalar_type() == torch::kFloat16 &&
-                    ids.scalar_type() == torch::kInt32 &&
-                    expert_local.scalar_type() == torch::kInt32 &&
-                    output.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(values.scalar_type() == mfq_tensor_backend::kUInt8 &&
+                    scales.scalar_type() == mfq_tensor_backend::kUInt8 &&
+                    input.scalar_type() == mfq_tensor_backend::kFloat16 &&
+                    ids.scalar_type() == mfq_tensor_backend::kInt32 &&
+                    expert_local.scalar_type() == mfq_tensor_backend::kInt32 &&
+                    output.scalar_type() == mfq_tensor_backend::kFloat16,
                 "MXFP4 routed tensor dtypes are invalid");
-    TORCH_CHECK(values.is_contiguous() && scales.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(values.is_contiguous() && scales.is_contiguous() &&
                     input.is_contiguous() && ids.is_contiguous() &&
                     expert_local.is_contiguous() && output.is_contiguous(),
                 "MXFP4 routed tensors must be contiguous");
-    TORCH_CHECK(neuron_len > 0 && neuron_len % 32 == 0 &&
+    MFQ_RUNTIME_CHECK(neuron_len > 0 && neuron_len % 32 == 0 &&
                     values.dim() == 2 &&
                     values.size(0) == pool_experts * out_per_expert &&
                     values.size(1) == neuron_len / 2 &&
-                    scales.sizes() == torch::IntArrayRef(
+                    scales.sizes() == mfq_tensor_backend::IntArrayRef(
                         {pool_experts * out_per_expert, neuron_len / 32}),
                 "MXFP4 routed weight geometry mismatch");
-    TORCH_CHECK((input.dim() == 2 || input.dim() == 3) &&
+    MFQ_RUNTIME_CHECK((input.dim() == 2 || input.dim() == 3) &&
                     input.size(-1) == neuron_len && ids.dim() == 2 &&
                     input.size(0) == ids.size(0) &&
-                    output.sizes() == torch::IntArrayRef(
+                    output.sizes() == mfq_tensor_backend::IntArrayRef(
                         {ids.size(0), ids.size(1), out_per_expert}) &&
                     expert_local.numel() == global_experts,
                 "MXFP4 routed activation/route geometry mismatch");
@@ -890,34 +889,34 @@ void validate_mxfp4_moe(
 
 } // namespace
 
-torch::Tensor mxfp4_dequant_cuda(
-        torch::Tensor values,
-        torch::Tensor scales) {
+mfq_tensor_backend::Tensor mxfp4_dequant_cuda(
+        mfq_tensor_backend::Tensor values,
+        mfq_tensor_backend::Tensor scales) {
     validate_mxfp4_dense(values, scales);
     const int outputs = static_cast<int>(values.size(0));
     const int width = static_cast<int>(values.size(1) * 2);
-    auto dense = torch::empty(
-        {outputs, width}, values.options().dtype(torch::kFloat16));
+    auto dense = mfq_tensor_backend::empty(
+        {outputs, width}, values.options().dtype(mfq_tensor_backend::kFloat16));
     const std::size_t count = static_cast<std::size_t>(outputs) * width;
     constexpr int threads = 256;
     const int blocks = static_cast<int>((count + threads - 1) / threads);
     mxfp4_dequant_kernel<<<
-        blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        blocks, threads, 0, mfq_current_cuda_stream()>>>(
             values.data_ptr<std::uint8_t>(),
             scales.data_ptr<std::uint8_t>(),
-            reinterpret_cast<__half *>(dense.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(dense.data_ptr<mfq_half>()),
             outputs, width);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return dense;
 }
 
-torch::Tensor mxfp4_embedding_lookup_cuda(
-        torch::Tensor values,
-        torch::Tensor scales,
-        torch::Tensor token_ids) {
+mfq_tensor_backend::Tensor mxfp4_embedding_lookup_cuda(
+        mfq_tensor_backend::Tensor values,
+        mfq_tensor_backend::Tensor scales,
+        mfq_tensor_backend::Tensor token_ids) {
     validate_mxfp4_dense(values, scales);
-    TORCH_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() &&
-                    token_ids.scalar_type() == torch::kInt64 &&
+    MFQ_RUNTIME_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() &&
+                    token_ids.scalar_type() == mfq_tensor_backend::kInt64 &&
                     token_ids.get_device() == values.get_device() &&
                     token_ids.numel() <= std::numeric_limits<int>::max(),
                 "MXFP4 embedding ids must be contiguous CUDA int64 on the weight device");
@@ -926,29 +925,29 @@ torch::Tensor mxfp4_embedding_lookup_cuda(
     const int width = static_cast<int>(values.size(1) * 2);
     auto shape = token_ids.sizes().vec();
     shape.push_back(width);
-    auto output = torch::empty(shape, values.options().dtype(torch::kFloat16));
+    auto output = mfq_tensor_backend::empty(shape, values.options().dtype(mfq_tensor_backend::kFloat16));
     constexpr int threads = 256;
     const int64_t total = static_cast<int64_t>(count) * width;
     const int blocks = static_cast<int>(std::min<int64_t>(
         (total + threads - 1) / threads, 4096));
     if (blocks > 0) {
         mxfp4_embedding_kernel<<<
-            blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            blocks, threads, 0, mfq_current_cuda_stream()>>>(
                 values.data_ptr<std::uint8_t>(),
                 scales.data_ptr<std::uint8_t>(), token_ids.data_ptr<int64_t>(),
-                reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+                reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
                 count, vocab, width);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     }
     return output;
 }
 
-torch::Tensor mxfp4_matmul_f16_cuda(
-        torch::Tensor values,
-        torch::Tensor scales,
-        torch::Tensor input) {
+mfq_tensor_backend::Tensor mxfp4_matmul_f16_cuda(
+        mfq_tensor_backend::Tensor values,
+        mfq_tensor_backend::Tensor scales,
+        mfq_tensor_backend::Tensor input) {
     validate_mxfp4_dense(values, scales);
-    TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.scalar_type() == mfq_tensor_backend::kFloat16 &&
                     input.is_contiguous() && input.dim() == 2 &&
                     input.size(0) > 0 &&
                     input.size(0) <= std::numeric_limits<int>::max() &&
@@ -957,7 +956,7 @@ torch::Tensor mxfp4_matmul_f16_cuda(
     const int rows = static_cast<int>(input.size(0));
     const int outputs = static_cast<int>(values.size(0));
     const int width = static_cast<int>(input.size(1));
-    auto result = torch::empty({rows, outputs}, input.options());
+    auto result = mfq_tensor_backend::empty({rows, outputs}, input.options());
     constexpr int kRowsPerTile = 8;
     constexpr int kOutputsPerTile = 8;
     const int row_tiles = (rows + kRowsPerTile - 1) / kRowsPerTile;
@@ -967,31 +966,31 @@ torch::Tensor mxfp4_matmul_f16_cuda(
     const int blocks = static_cast<int>(std::min<int64_t>(tasks, 4096));
     const dim3 threads(32, kOutputsPerTile);
     mxfp4_matmul_f16_kernel<<<
-        blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        blocks, threads, 0, mfq_current_cuda_stream()>>>(
             values.data_ptr<std::uint8_t>(),
             scales.data_ptr<std::uint8_t>(),
-            reinterpret_cast<const __half *>(input.data_ptr<at::Half>()),
-            reinterpret_cast<__half *>(result.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
+            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
             rows, outputs, width, row_tiles, output_tiles);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
 }
 
-torch::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
-        torch::Tensor values,
-        torch::Tensor scales,
-        torch::Tensor input,
-        torch::Tensor ids,
-        torch::Tensor expert_local,
+mfq_tensor_backend::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
+        mfq_tensor_backend::Tensor values,
+        mfq_tensor_backend::Tensor scales,
+        mfq_tensor_backend::Tensor input,
+        mfq_tensor_backend::Tensor ids,
+        mfq_tensor_backend::Tensor expert_local,
         int64_t global_experts,
         int64_t pool_experts,
         int64_t out_per_expert,
         int64_t neuron_len,
-        torch::Tensor output,
-        torch::Tensor ids_dst,
-        torch::Tensor expert_bounds,
-        torch::Tensor tile_bounds,
-        torch::Tensor tile_experts) {
+        mfq_tensor_backend::Tensor output,
+        mfq_tensor_backend::Tensor ids_dst,
+        mfq_tensor_backend::Tensor expert_bounds,
+        mfq_tensor_backend::Tensor tile_bounds,
+        mfq_tensor_backend::Tensor tile_experts) {
     validate_mxfp4_moe(
         values, scales, input, ids, expert_local, output,
         global_experts, pool_experts, out_per_expert, neuron_len);
@@ -1001,13 +1000,13 @@ torch::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
     const int row_tiles =
         (static_cast<int>(out_per_expert) + 7) / 8;
     const dim3 threads(32, 8);
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const cudaStream_t stream = mfq_current_cuda_stream();
     if (ids_dst.numel() == ids.numel()) {
-        TORCH_CHECK(expert_bounds.is_cuda() && tile_bounds.is_cuda() &&
+        MFQ_RUNTIME_CHECK(expert_bounds.is_cuda() && tile_bounds.is_cuda() &&
                         tile_experts.is_cuda() &&
-                        expert_bounds.scalar_type() == torch::kInt32 &&
-                        tile_bounds.scalar_type() == torch::kInt32 &&
-                        tile_experts.scalar_type() == torch::kInt32 &&
+                        expert_bounds.scalar_type() == mfq_tensor_backend::kInt32 &&
+                        tile_bounds.scalar_type() == mfq_tensor_backend::kInt32 &&
+                        tile_experts.scalar_type() == mfq_tensor_backend::kInt32 &&
                         expert_bounds.is_contiguous() &&
                         tile_bounds.is_contiguous() && tile_experts.is_contiguous() &&
                         expert_bounds.numel() >= global_experts + 1 &&
@@ -1018,11 +1017,11 @@ torch::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
             static_cast<int64_t>(max_tiles) * row_tiles, 4096));
         mxfp4_moe_grouped_f16_kernel<true><<<blocks, threads, 0, stream>>>(
             values.data_ptr<std::uint8_t>(), scales.data_ptr<std::uint8_t>(),
-            reinterpret_cast<const __half *>(input.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
             ids.data_ptr<std::int32_t>(), expert_local.data_ptr<std::int32_t>(),
             ids_dst.data_ptr<std::int32_t>(), expert_bounds.data_ptr<std::int32_t>(),
             tile_bounds.data_ptr<std::int32_t>(), tile_experts.data_ptr<std::int32_t>(),
-            reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
             tokens, routes, static_cast<int>(global_experts),
             static_cast<int>(pool_experts), static_cast<int>(out_per_expert),
             static_cast<int>(neuron_len), max_tiles, row_tiles, input.dim() == 3);
@@ -1031,14 +1030,14 @@ torch::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
             static_cast<int64_t>(pairs) * row_tiles, 4096));
         mxfp4_moe_grouped_f16_kernel<false><<<blocks, threads, 0, stream>>>(
             values.data_ptr<std::uint8_t>(), scales.data_ptr<std::uint8_t>(),
-            reinterpret_cast<const __half *>(input.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
             ids.data_ptr<std::int32_t>(), expert_local.data_ptr<std::int32_t>(),
             nullptr, nullptr, nullptr, nullptr,
-            reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
             tokens, routes, static_cast<int>(global_experts),
             static_cast<int>(pool_experts), static_cast<int>(out_per_expert),
             static_cast<int>(neuron_len), 0, row_tiles, input.dim() == 3);
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }

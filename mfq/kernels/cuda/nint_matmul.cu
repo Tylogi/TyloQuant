@@ -16,11 +16,10 @@
 //   x[M, neuron_len] fp16 (glue zero-pads to neuron_len).
 
 #include <cuda_runtime.h>
+#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <mma.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
 #include <algorithm>
 #include <cfloat>
 #include <climits>
@@ -33,7 +32,7 @@
 #include "glu.cuh"
 using namespace nvcuda;
 
-#define MFQ_CUBLAS_CHECK(expr) TORCH_CHECK((expr) == CUBLAS_STATUS_SUCCESS, "cuBLAS call failed: ", #expr)
+#define MFQ_CUBLAS_CHECK(expr) MFQ_RUNTIME_CHECK((expr) == CUBLAS_STATUS_SUCCESS, "cuBLAS call failed: ", #expr)
 
 __global__ void nint8_one_quantize_reconstruct_kernel(
     const __half* __restrict__ x,
@@ -84,33 +83,33 @@ __global__ void nint8_one_quantize_reconstruct_kernel(
     }
 }
 
-std::vector<torch::Tensor> nint8_one_quantize_reconstruct_cuda(
-    torch::Tensor x)
+std::vector<mfq_tensor_backend::Tensor> nint8_one_quantize_reconstruct_cuda(
+    mfq_tensor_backend::Tensor x)
 {
-    TORCH_CHECK(
-        x.is_cuda() && x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(
+        x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
         x.is_contiguous() && x.dim() == 2,
         "NINT8-1 input must be CUDA contiguous fp16 rank-2");
     const int M = (int)x.size(0);
     const int K = (int)x.size(1);
-    TORCH_CHECK(M > 0 && K > 0, "NINT8-1 input must be non-empty");
+    MFQ_RUNTIME_CHECK(M > 0 && K > 0, "NINT8-1 input must be non-empty");
     const int groups = (K + 31) / 32;
-    auto q = torch::empty(
-        {M, groups, 32}, x.options().dtype(torch::kInt8));
-    auto d = torch::empty({M, groups}, x.options());
-    auto s = torch::empty({M, groups}, x.options());
-    auto reconstructed = torch::empty_like(x);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto q = mfq_tensor_backend::empty(
+        {M, groups, 32}, x.options().dtype(mfq_tensor_backend::kInt8));
+    auto d = mfq_tensor_backend::empty({M, groups}, x.options());
+    auto s = mfq_tensor_backend::empty({M, groups}, x.options());
+    auto reconstructed = mfq_tensor_backend::empty_like(x);
+    cudaStream_t stream = mfq_current_cuda_stream();
     nint8_one_quantize_reconstruct_kernel<<<
         M * groups, 32, 0, stream>>>(
-        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
         q.data_ptr<int8_t>(),
-        reinterpret_cast<__half*>(d.data_ptr<at::Half>()),
-        reinterpret_cast<__half*>(s.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(d.data_ptr<mfq_half>()),
+        reinterpret_cast<__half*>(s.data_ptr<mfq_half>()),
         reinterpret_cast<__half*>(
-            reconstructed.data_ptr<at::Half>()),
+            reconstructed.data_ptr<mfq_half>()),
         M, K, groups);
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         cudaGetLastError() == cudaSuccess,
         "NINT8-1 quantize/reconstruct kernel launch failed");
     return {q, d, s, reconstructed};
@@ -268,54 +267,54 @@ __global__ void dequant_wq_packed_kernel(
     }
 }
 
-torch::Tensor nint_dequant_wq_packed_cuda(
-    torch::Tensor q_packed, torch::Tensor d_eff, int64_t neuron_len, int64_t gs)
+mfq_tensor_backend::Tensor nint_dequant_wq_packed_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor d_eff, int64_t neuron_len, int64_t gs)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(d_eff.is_cuda() && d_eff.scalar_type() == torch::kFloat32 && d_eff.is_contiguous(),
+    MFQ_RUNTIME_CHECK(d_eff.is_cuda() && d_eff.scalar_type() == mfq_tensor_backend::kFloat32 && d_eff.is_contiguous(),
                 "d_eff must be cuda contiguous f32");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
-    TORCH_CHECK((int)d_eff.size(0) == N && (int)d_eff.size(1) == ng, "d_eff shape mismatch");
-    TORCH_CHECK(neuron_len <= (int64_t)ng * gs, "neuron_len must be <= ng * gs");
-    auto wq = torch::empty({N, neuron_len}, d_eff.options().dtype(torch::kHalf));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
+    MFQ_RUNTIME_CHECK((int)d_eff.size(0) == N && (int)d_eff.size(1) == ng, "d_eff shape mismatch");
+    MFQ_RUNTIME_CHECK(neuron_len <= (int64_t)ng * gs, "neuron_len must be <= ng * gs");
+    auto wq = mfq_tensor_backend::empty({N, neuron_len}, d_eff.options().dtype(mfq_tensor_backend::kHalf));
+    cudaStream_t stream = mfq_current_cuda_stream();
     int total = N * ng * ((int)gs / 2);
     int block = 256;
-    int grid = min((total + block - 1) / block, 65535);
+    int grid = std::min((total + block - 1) / block, 65535);
 
 #define DQWQLAUNCH(GSVAL)                                                           \
     dequant_wq_packed_kernel<GSVAL><<<grid, block, 0, stream>>>(                   \
         q_packed.data_ptr<uint8_t>(), d_eff.data_ptr<float>(),                     \
-        reinterpret_cast<__half*>(wq.data_ptr<at::Half>()), N, ng, (int)neuron_len)
+        reinterpret_cast<__half*>(wq.data_ptr<mfq_half>()), N, ng, (int)neuron_len)
 
     switch ((int)gs) {
         case 16: DQWQLAUNCH(16); break;
         case 24: DQWQLAUNCH(24); break;
         case 32: DQWQLAUNCH(32); break;
         case 48: DQWQLAUNCH(48); break;
-        default: TORCH_CHECK(false, "nint_dequant_wq_packed: gs must be in {16,24,32,48}, got ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "nint_dequant_wq_packed: gs must be in {16,24,32,48}, got ", gs);
     }
 #undef DQWQLAUNCH
     return wq;
 }
 
-torch::Tensor nint_cublas_gemm_nt_f32acc_cuda(torch::Tensor x, torch::Tensor w)
+mfq_tensor_backend::Tensor nint_cublas_gemm_nt_f32acc_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor w)
 {
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kHalf && x.is_contiguous(),
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kHalf && x.is_contiguous(),
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(w.is_cuda() && w.scalar_type() == torch::kHalf && w.is_contiguous(),
+    MFQ_RUNTIME_CHECK(w.is_cuda() && w.scalar_type() == mfq_tensor_backend::kHalf && w.is_contiguous(),
                 "w must be cuda contiguous fp16");
-    TORCH_CHECK(x.dim() == 2 && w.dim() == 2, "x and w must be rank-2");
+    MFQ_RUNTIME_CHECK(x.dim() == 2 && w.dim() == 2, "x and w must be rank-2");
     int M = (int)x.size(0);
     int K = (int)x.size(1);
     int N = (int)w.size(0);
-    TORCH_CHECK((int)w.size(1) == K, "w K mismatch");
+    MFQ_RUNTIME_CHECK((int)w.size(1) == K, "w K mismatch");
 
-    auto y = torch::empty({M, N}, x.options());
-    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto y = mfq_tensor_backend::empty({M, N}, x.options());
+    cublasHandle_t handle = mfq_current_cublas_handle();
+    cudaStream_t stream = mfq_current_cuda_stream();
     MFQ_CUBLAS_CHECK(cublasSetStream(handle, stream));
 
     const float alpha = 1.0f;
@@ -324,30 +323,30 @@ torch::Tensor nint_cublas_gemm_nt_f32acc_cuda(torch::Tensor x, torch::Tensor w)
         handle, CUBLAS_OP_T, CUBLAS_OP_N,
         N, M, K,
         &alpha,
-        w.data_ptr<at::Half>(), CUDA_R_16F, K,
-        x.data_ptr<at::Half>(), CUDA_R_16F, K,
+        w.data_ptr<mfq_half>(), CUDA_R_16F, K,
+        x.data_ptr<mfq_half>(), CUDA_R_16F, K,
         &beta,
-        y.data_ptr<at::Half>(), CUDA_R_16F, N,
+        y.data_ptr<mfq_half>(), CUDA_R_16F, N,
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     return y;
 }
 
-torch::Tensor nint_cublas_gemm_nt_f16acc_cuda(torch::Tensor x, torch::Tensor w)
+mfq_tensor_backend::Tensor nint_cublas_gemm_nt_f16acc_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor w)
 {
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kHalf && x.is_contiguous(),
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kHalf && x.is_contiguous(),
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(w.is_cuda() && w.scalar_type() == torch::kHalf && w.is_contiguous(),
+    MFQ_RUNTIME_CHECK(w.is_cuda() && w.scalar_type() == mfq_tensor_backend::kHalf && w.is_contiguous(),
                 "w must be cuda contiguous fp16");
-    TORCH_CHECK(x.dim() == 2 && w.dim() == 2, "x and w must be rank-2");
+    MFQ_RUNTIME_CHECK(x.dim() == 2 && w.dim() == 2, "x and w must be rank-2");
     int M = (int)x.size(0);
     int K = (int)x.size(1);
     int N = (int)w.size(0);
-    TORCH_CHECK((int)w.size(1) == K, "w K mismatch");
+    MFQ_RUNTIME_CHECK((int)w.size(1) == K, "w K mismatch");
 
-    auto y = torch::empty({M, N}, x.options());
-    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto y = mfq_tensor_backend::empty({M, N}, x.options());
+    cublasHandle_t handle = mfq_current_cublas_handle();
+    cudaStream_t stream = mfq_current_cuda_stream();
     MFQ_CUBLAS_CHECK(cublasSetStream(handle, stream));
 
     const __half alpha = __float2half(1.0f);
@@ -356,10 +355,10 @@ torch::Tensor nint_cublas_gemm_nt_f16acc_cuda(torch::Tensor x, torch::Tensor w)
         handle, CUBLAS_OP_T, CUBLAS_OP_N,
         N, M, K,
         &alpha,
-        w.data_ptr<at::Half>(), CUDA_R_16F, K,
-        x.data_ptr<at::Half>(), CUDA_R_16F, K,
+        w.data_ptr<mfq_half>(), CUDA_R_16F, K,
+        x.data_ptr<mfq_half>(), CUDA_R_16F, K,
         &beta,
-        y.data_ptr<at::Half>(), CUDA_R_16F, N,
+        y.data_ptr<mfq_half>(), CUDA_R_16F, N,
         CUBLAS_COMPUTE_16F,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     return y;
@@ -403,30 +402,30 @@ __global__ void dequant_full_packed_kernel(
     }
 }
 
-torch::Tensor nint_dequant_full_packed_cuda(
-    torch::Tensor q_packed, torch::Tensor d_eff, torch::Tensor m_eff, int64_t neuron_len, int64_t gs)
+mfq_tensor_backend::Tensor nint_dequant_full_packed_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor d_eff, mfq_tensor_backend::Tensor m_eff, int64_t neuron_len, int64_t gs)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(d_eff.is_cuda() && d_eff.scalar_type() == torch::kFloat32 && d_eff.is_contiguous(),
+    MFQ_RUNTIME_CHECK(d_eff.is_cuda() && d_eff.scalar_type() == mfq_tensor_backend::kFloat32 && d_eff.is_contiguous(),
                 "d_eff must be cuda contiguous f32");
-    TORCH_CHECK(m_eff.is_cuda() && m_eff.scalar_type() == torch::kFloat32 && m_eff.is_contiguous(),
+    MFQ_RUNTIME_CHECK(m_eff.is_cuda() && m_eff.scalar_type() == mfq_tensor_backend::kFloat32 && m_eff.is_contiguous(),
                 "m_eff must be cuda contiguous f32");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
-    TORCH_CHECK((int)d_eff.size(0) == N && (int)d_eff.size(1) == ng, "d_eff shape mismatch");
-    TORCH_CHECK((int)m_eff.size(0) == N && (int)m_eff.size(1) == ng, "m_eff shape mismatch");
-    TORCH_CHECK(neuron_len <= (int64_t)ng * gs, "neuron_len must be <= ng * gs");
-    auto w = torch::empty({N, neuron_len}, d_eff.options().dtype(torch::kHalf));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
+    MFQ_RUNTIME_CHECK((int)d_eff.size(0) == N && (int)d_eff.size(1) == ng, "d_eff shape mismatch");
+    MFQ_RUNTIME_CHECK((int)m_eff.size(0) == N && (int)m_eff.size(1) == ng, "m_eff shape mismatch");
+    MFQ_RUNTIME_CHECK(neuron_len <= (int64_t)ng * gs, "neuron_len must be <= ng * gs");
+    auto w = mfq_tensor_backend::empty({N, neuron_len}, d_eff.options().dtype(mfq_tensor_backend::kHalf));
+    cudaStream_t stream = mfq_current_cuda_stream();
     int total = N * ng * ((int)gs / 2);
     int block = 256;
-    int grid = min((total + block - 1) / block, 65535);
+    int grid = std::min((total + block - 1) / block, 65535);
 
 #define DQFULLLAUNCH(GSVAL)                                                        \
     dequant_full_packed_kernel<GSVAL><<<grid, block, 0, stream>>>(                \
         q_packed.data_ptr<uint8_t>(), d_eff.data_ptr<float>(),                    \
-        m_eff.data_ptr<float>(), reinterpret_cast<__half*>(w.data_ptr<at::Half>()), \
+        m_eff.data_ptr<float>(), reinterpret_cast<__half*>(w.data_ptr<mfq_half>()), \
         N, ng, (int)neuron_len)
 
     switch ((int)gs) {
@@ -434,7 +433,7 @@ torch::Tensor nint_dequant_full_packed_cuda(
         case 24: DQFULLLAUNCH(24); break;
         case 32: DQFULLLAUNCH(32); break;
         case 48: DQFULLLAUNCH(48); break;
-        default: TORCH_CHECK(false, "nint_dequant_full_packed: gs must be in {16,24,32,48}, got ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "nint_dequant_full_packed: gs must be in {16,24,32,48}, got ", gs);
     }
 #undef DQFULLLAUNCH
     return w;
@@ -559,37 +558,37 @@ __global__ void dequant_full_packed_compact_int6_gs24_vec4_kernel(
     }
 }
 
-torch::Tensor nint_dequant_full_packed_compact_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, int64_t neuron_len, int64_t gs)
+mfq_tensor_backend::Tensor nint_dequant_full_packed_compact_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, int64_t neuron_len, int64_t gs)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 && sub_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
                 "sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 && sub_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min.is_contiguous(),
                 "sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous f32");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
-    TORCH_CHECK((int)sub_scale.size(0) == N && (int)sub_scale.size(1) == ng, "sub_scale shape mismatch");
-    TORCH_CHECK(sub_min.sizes() == sub_scale.sizes(), "sub_min shape mismatch");
-    TORCH_CHECK((int)neuron_scale.size(0) == N && (int)neuron_min.size(0) == N, "neuron metadata shape mismatch");
-    TORCH_CHECK(neuron_len <= (int64_t)ng * gs, "neuron_len must be <= ng * gs");
-    auto w = torch::empty({N, neuron_len}, neuron_scale.options().dtype(torch::kHalf));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
+    MFQ_RUNTIME_CHECK((int)sub_scale.size(0) == N && (int)sub_scale.size(1) == ng, "sub_scale shape mismatch");
+    MFQ_RUNTIME_CHECK(sub_min.sizes() == sub_scale.sizes(), "sub_min shape mismatch");
+    MFQ_RUNTIME_CHECK((int)neuron_scale.size(0) == N && (int)neuron_min.size(0) == N, "neuron metadata shape mismatch");
+    MFQ_RUNTIME_CHECK(neuron_len <= (int64_t)ng * gs, "neuron_len must be <= ng * gs");
+    auto w = mfq_tensor_backend::empty({N, neuron_len}, neuron_scale.options().dtype(mfq_tensor_backend::kHalf));
+    cudaStream_t stream = mfq_current_cuda_stream();
     int total = N * ng * ((int)gs / 2);
     int block = 256;
-    int grid = min((total + block - 1) / block, 65535);
+    int grid = std::min((total + block - 1) / block, 65535);
 
 #define DQFULLCOMPACTLAUNCH(GSVAL)                                                 \
     dequant_full_packed_compact_kernel<GSVAL><<<grid, block, 0, stream>>>(        \
         q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
         sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
-        neuron_min.data_ptr<float>(), reinterpret_cast<__half*>(w.data_ptr<at::Half>()), \
+        neuron_min.data_ptr<float>(), reinterpret_cast<__half*>(w.data_ptr<mfq_half>()), \
         N, ng, (int)neuron_len)
 
     switch ((int)gs) {
@@ -598,11 +597,11 @@ torch::Tensor nint_dequant_full_packed_compact_cuda(
             const char* vec_env = std::getenv("MFQ_NINT4_GS24_DQ_VEC2");
             if (vec_env == nullptr || vec_env[0] != '0') {
                 int vec_total = N * ng * 6;
-                int vec_grid = min((vec_total + block - 1) / block, 65535);
+                int vec_grid = std::min((vec_total + block - 1) / block, 65535);
                 dequant_full_packed_compact_gs24_vec2_kernel<<<vec_grid, block, 0, stream>>>(
                     q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),
                     sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),
-                    neuron_min.data_ptr<float>(), reinterpret_cast<__half*>(w.data_ptr<at::Half>()),
+                    neuron_min.data_ptr<float>(), reinterpret_cast<__half*>(w.data_ptr<mfq_half>()),
                     N, ng, (int)neuron_len);
             } else {
                 DQFULLCOMPACTLAUNCH(24);
@@ -611,37 +610,37 @@ torch::Tensor nint_dequant_full_packed_compact_cuda(
         }
         case 32: DQFULLCOMPACTLAUNCH(32); break;
         case 48: DQFULLCOMPACTLAUNCH(48); break;
-        default: TORCH_CHECK(false, "nint_dequant_full_packed_compact: gs must be in {16,24,32,48}, got ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "nint_dequant_full_packed_compact: gs must be in {16,24,32,48}, got ", gs);
     }
 #undef DQFULLCOMPACTLAUNCH
     return w;
 }
 
-torch::Tensor nint_dequant_full_packed_compact_bits_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, int64_t neuron_len, int64_t gs, int64_t bits)
+mfq_tensor_backend::Tensor nint_dequant_full_packed_compact_bits_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, int64_t neuron_len, int64_t gs, int64_t bits)
 {
-    TORCH_CHECK(bits == 2 || bits == 3 || bits == 5 || bits == 6 || bits == 8,
+    MFQ_RUNTIME_CHECK(bits == 2 || bits == 3 || bits == 5 || bits == 6 || bits == 8,
                 "packed-bits full dequant supports bits in {2,3,5,6,8}, got ", bits);
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 && sub_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
                 "sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 && sub_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min.is_contiguous(),
                 "sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous f32");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) == (((int)gs * (int)bits + 7) / 8),
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) == (((int)gs * (int)bits + 7) / 8),
                 "q_packed last dim must equal ceil(gs*bits/8)");
-    TORCH_CHECK((int)sub_scale.size(0) == N && (int)sub_scale.size(1) == ng, "sub_scale shape mismatch");
-    TORCH_CHECK(sub_min.sizes() == sub_scale.sizes(), "sub_min shape mismatch");
-    TORCH_CHECK((int)neuron_scale.size(0) == N && (int)neuron_min.size(0) == N, "neuron metadata shape mismatch");
-    TORCH_CHECK(neuron_len <= (int64_t)ng * gs, "neuron_len must be <= ng * gs");
-    auto w = torch::empty({N, neuron_len}, neuron_scale.options().dtype(torch::kHalf));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)sub_scale.size(0) == N && (int)sub_scale.size(1) == ng, "sub_scale shape mismatch");
+    MFQ_RUNTIME_CHECK(sub_min.sizes() == sub_scale.sizes(), "sub_min shape mismatch");
+    MFQ_RUNTIME_CHECK((int)neuron_scale.size(0) == N && (int)neuron_min.size(0) == N, "neuron metadata shape mismatch");
+    MFQ_RUNTIME_CHECK(neuron_len <= (int64_t)ng * gs, "neuron_len must be <= ng * gs");
+    auto w = mfq_tensor_backend::empty({N, neuron_len}, neuron_scale.options().dtype(mfq_tensor_backend::kHalf));
+    cudaStream_t stream = mfq_current_cuda_stream();
     size_t total = (size_t)N * (size_t)neuron_len;
     int block = 256;
     int grid = (int)std::min<size_t>((total + block - 1) / block, 65535);
@@ -650,7 +649,7 @@ torch::Tensor nint_dequant_full_packed_compact_bits_cuda(
     dequant_full_packed_compact_bits_kernel_early<BITSVAL, GSVAL><<<grid, block, 0, stream>>>( \
         q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),                    \
         sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),                    \
-        neuron_min.data_ptr<float>(), reinterpret_cast<__half*>(w.data_ptr<at::Half>()), \
+        neuron_min.data_ptr<float>(), reinterpret_cast<__half*>(w.data_ptr<mfq_half>()), \
         N, ng, (int)neuron_len)
 
 #define DQFULLBITS_GS_SWITCH(BITSVAL)                                                   \
@@ -668,7 +667,7 @@ torch::Tensor nint_dequant_full_packed_compact_bits_cuda(
         case 40: DQFULLBITSLAUNCH(BITSVAL, 40); break;                                  \
         case 48: DQFULLBITSLAUNCH(BITSVAL, 48); break;                                  \
         case 64: DQFULLBITSLAUNCH(BITSVAL, 64); break;                                  \
-        default: TORCH_CHECK(false, "packed-bits full dequant unsupported gs ", gs);     \
+        default: MFQ_RUNTIME_CHECK(false, "packed-bits full dequant unsupported gs ", gs);     \
     }
 
     if (bits == 2) {
@@ -681,11 +680,11 @@ torch::Tensor nint_dequant_full_packed_compact_bits_cuda(
         const char* vec_env = std::getenv("MFQ_NINT6_GS24_DQ_VEC4");
         if (gs == 24 && (vec_env == nullptr || vec_env[0] != '0')) {
             int vec_total = N * ng * 6;
-            int vec_grid = min((vec_total + block - 1) / block, 65535);
+            int vec_grid = std::min((vec_total + block - 1) / block, 65535);
             dequant_full_packed_compact_int6_gs24_vec4_kernel<<<vec_grid, block, 0, stream>>>(
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),
-                neuron_min.data_ptr<float>(), reinterpret_cast<__half*>(w.data_ptr<at::Half>()),
+                neuron_min.data_ptr<float>(), reinterpret_cast<__half*>(w.data_ptr<mfq_half>()),
                 N, ng, (int)neuron_len);
         } else {
             DQFULLBITS_GS_SWITCH(6);
@@ -698,55 +697,55 @@ torch::Tensor nint_dequant_full_packed_compact_bits_cuda(
     return w;
 }
 
-torch::Tensor nint5_gs28_q5_repack_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min)
+mfq_tensor_backend::Tensor nint5_gs28_q5_repack_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(q_packed.dim() == 3 && q_packed.size(2) == 18,
+    MFQ_RUNTIME_CHECK(q_packed.dim() == 3 && q_packed.size(2) == 18,
                 "NINT5 gs28 q_packed must have shape [N,ng,18]");
     const int N = (int)q_packed.size(0);
     const int ng = (int)q_packed.size(1);
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 && sub_scale.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous() &&
                 sub_scale.dim() == 2 && sub_scale.size(0) == N && sub_scale.size(1) == ng,
                 "sub_scale must be cuda contiguous uint8 [N,ng]");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 && sub_min.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min.is_contiguous() &&
                 sub_min.sizes() == sub_scale.sizes(), "sub_min shape mismatch");
-    auto out = torch::empty({N, ng, 20}, q_packed.options());
+    auto out = mfq_tensor_backend::empty({N, ng, 20}, q_packed.options());
     const size_t groups = (size_t)N * (size_t)ng;
     constexpr int block = 256;
     const int grid = (int)std::min<size_t>((groups + block - 1) / block, 65535);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
     repack_q5_gs28_exec_kernel<<<grid, block, 0, stream>>>(
         q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(),
         out.data_ptr<uint8_t>(), groups);
     return out;
 }
 
-torch::Tensor nint5_gs28_q5_dequant_cuda(
-    torch::Tensor q_packed, torch::Tensor neuron_scale, torch::Tensor neuron_min,
+mfq_tensor_backend::Tensor nint5_gs28_q5_dequant_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
     int64_t neuron_len)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(q_packed.dim() == 3 && q_packed.size(2) == 20,
+    MFQ_RUNTIME_CHECK(q_packed.dim() == 3 && q_packed.size(2) == 20,
                 "NINT5 gs28 Q5 execution tensor must have shape [N,ng,20]");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous f32");
     const int N = (int)q_packed.size(0);
     const int ng = (int)q_packed.size(1);
-    TORCH_CHECK(neuron_scale.numel() == N && neuron_min.numel() == N, "neuron metadata shape mismatch");
-    TORCH_CHECK(neuron_len <= (int64_t)ng * 28, "neuron_len must be <= ng*28");
-    auto w = torch::empty({N, neuron_len}, neuron_scale.options().dtype(torch::kHalf));
+    MFQ_RUNTIME_CHECK(neuron_scale.numel() == N && neuron_min.numel() == N, "neuron metadata shape mismatch");
+    MFQ_RUNTIME_CHECK(neuron_len <= (int64_t)ng * 28, "neuron_len must be <= ng*28");
+    auto w = mfq_tensor_backend::empty({N, neuron_len}, neuron_scale.options().dtype(mfq_tensor_backend::kHalf));
     const size_t total = (size_t)N * (size_t)neuron_len;
     constexpr int block = 256;
     const int grid = (int)std::min<size_t>((total + block - 1) / block, 65535);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
     dequant_full_q5_gs28_exec_kernel<<<grid, block, 0, stream>>>(
         q_packed.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(),
-        reinterpret_cast<__half*>(w.data_ptr<at::Half>()), N, ng, (int)neuron_len);
+        reinterpret_cast<__half*>(w.data_ptr<mfq_half>()), N, ng, (int)neuron_len);
     return w;
 }
 
@@ -792,29 +791,29 @@ __global__ void dequant_full_packed_gs24_qbpt_kernel(
     }
 }
 
-torch::Tensor nint_dequant_full_packed_gs24_x2_cuda(
-    torch::Tensor q_packed, torch::Tensor d_eff, torch::Tensor m_eff, int64_t neuron_len)
+mfq_tensor_backend::Tensor nint_dequant_full_packed_gs24_x2_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor d_eff, mfq_tensor_backend::Tensor m_eff, int64_t neuron_len)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(d_eff.is_cuda() && d_eff.scalar_type() == torch::kFloat32 && d_eff.is_contiguous(),
+    MFQ_RUNTIME_CHECK(d_eff.is_cuda() && d_eff.scalar_type() == mfq_tensor_backend::kFloat32 && d_eff.is_contiguous(),
                 "d_eff must be cuda contiguous f32");
-    TORCH_CHECK(m_eff.is_cuda() && m_eff.scalar_type() == torch::kFloat32 && m_eff.is_contiguous(),
+    MFQ_RUNTIME_CHECK(m_eff.is_cuda() && m_eff.scalar_type() == mfq_tensor_backend::kFloat32 && m_eff.is_contiguous(),
                 "m_eff must be cuda contiguous f32");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) == 12, "q_packed last dim must be 12 for gs24");
-    TORCH_CHECK((int)d_eff.size(0) == N && (int)d_eff.size(1) == ng, "d_eff shape mismatch");
-    TORCH_CHECK((int)m_eff.size(0) == N && (int)m_eff.size(1) == ng, "m_eff shape mismatch");
-    TORCH_CHECK(neuron_len <= (int64_t)ng * 24, "neuron_len must be <= ng * 24");
-    auto w = torch::empty({N, neuron_len}, d_eff.options().dtype(torch::kHalf));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) == 12, "q_packed last dim must be 12 for gs24");
+    MFQ_RUNTIME_CHECK((int)d_eff.size(0) == N && (int)d_eff.size(1) == ng, "d_eff shape mismatch");
+    MFQ_RUNTIME_CHECK((int)m_eff.size(0) == N && (int)m_eff.size(1) == ng, "m_eff shape mismatch");
+    MFQ_RUNTIME_CHECK(neuron_len <= (int64_t)ng * 24, "neuron_len must be <= ng * 24");
+    auto w = mfq_tensor_backend::empty({N, neuron_len}, d_eff.options().dtype(mfq_tensor_backend::kHalf));
+    cudaStream_t stream = mfq_current_cuda_stream();
     constexpr int JOBS_PER_GROUP = 6;
     int total = N * ng * JOBS_PER_GROUP;
     int block = 256;
-    int grid = min((total + block - 1) / block, 65535);
+    int grid = std::min((total + block - 1) / block, 65535);
     dequant_full_packed_gs24_qbpt_kernel<2><<<grid, block, 0, stream>>>(
         q_packed.data_ptr<uint8_t>(), d_eff.data_ptr<float>(), m_eff.data_ptr<float>(),
-        reinterpret_cast<__half*>(w.data_ptr<at::Half>()), N, ng, (int)neuron_len);
+        reinterpret_cast<__half*>(w.data_ptr<mfq_half>()), N, ng, (int)neuron_len);
     return w;
 }
 
@@ -866,26 +865,26 @@ __global__ void dequant_full_packed_gs24_x2h2_kernel(
     }
 }
 
-torch::Tensor nint_dequant_full_packed_gs24_x2h2_cuda(
-    torch::Tensor q_packed, torch::Tensor eff_pair, int64_t neuron_len)
+mfq_tensor_backend::Tensor nint_dequant_full_packed_gs24_x2h2_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor eff_pair, int64_t neuron_len)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(eff_pair.is_cuda() && eff_pair.scalar_type() == torch::kHalf && eff_pair.is_contiguous(),
+    MFQ_RUNTIME_CHECK(eff_pair.is_cuda() && eff_pair.scalar_type() == mfq_tensor_backend::kHalf && eff_pair.is_contiguous(),
                 "eff_pair must be cuda contiguous fp16");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) == 12, "q_packed last dim must be 12 for gs24");
-    TORCH_CHECK(eff_pair.dim() == 3 && (int)eff_pair.size(0) == N && (int)eff_pair.size(1) == ng && (int)eff_pair.size(2) == 2,
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) == 12, "q_packed last dim must be 12 for gs24");
+    MFQ_RUNTIME_CHECK(eff_pair.dim() == 3 && (int)eff_pair.size(0) == N && (int)eff_pair.size(1) == ng && (int)eff_pair.size(2) == 2,
                 "eff_pair shape mismatch");
-    TORCH_CHECK(neuron_len <= (int64_t)ng * 24, "neuron_len must be <= ng * 24");
-    auto w = torch::empty({N, neuron_len}, eff_pair.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK(neuron_len <= (int64_t)ng * 24, "neuron_len must be <= ng * 24");
+    auto w = mfq_tensor_backend::empty({N, neuron_len}, eff_pair.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     int total = N * ng * 6;
     int block = 256;
-    int grid = min((total + block - 1) / block, 65535);
+    int grid = std::min((total + block - 1) / block, 65535);
     dequant_full_packed_gs24_x2h2_kernel<<<grid, block, 0, stream>>>(
-        q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<at::Half>()),
-        reinterpret_cast<__half*>(w.data_ptr<at::Half>()), N, ng, (int)neuron_len);
+        q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<mfq_half>()),
+        reinterpret_cast<__half*>(w.data_ptr<mfq_half>()), N, ng, (int)neuron_len);
     return w;
 }
 
@@ -927,35 +926,35 @@ __global__ void dequant_full_packed_h2_kernel(
     }
 }
 
-torch::Tensor nint_dequant_full_packed_h2_cuda(
-    torch::Tensor q_packed, torch::Tensor eff_pair, int64_t neuron_len, int64_t gs)
+mfq_tensor_backend::Tensor nint_dequant_full_packed_h2_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor eff_pair, int64_t neuron_len, int64_t gs)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(eff_pair.is_cuda() && eff_pair.scalar_type() == torch::kHalf && eff_pair.is_contiguous(),
+    MFQ_RUNTIME_CHECK(eff_pair.is_cuda() && eff_pair.scalar_type() == mfq_tensor_backend::kHalf && eff_pair.is_contiguous(),
                 "eff_pair must be cuda contiguous fp16");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
-    TORCH_CHECK(eff_pair.dim() == 3 && (int)eff_pair.size(0) == N && (int)eff_pair.size(1) == ng && (int)eff_pair.size(2) == 2,
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
+    MFQ_RUNTIME_CHECK(eff_pair.dim() == 3 && (int)eff_pair.size(0) == N && (int)eff_pair.size(1) == ng && (int)eff_pair.size(2) == 2,
                 "eff_pair shape mismatch");
-    TORCH_CHECK(neuron_len <= (int64_t)ng * gs, "neuron_len must be <= ng * gs");
-    auto w = torch::empty({N, neuron_len}, eff_pair.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK(neuron_len <= (int64_t)ng * gs, "neuron_len must be <= ng * gs");
+    auto w = mfq_tensor_backend::empty({N, neuron_len}, eff_pair.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     int total = N * ng * ((int)gs / 2);
     int block = 256;
-    int grid = min((total + block - 1) / block, 65535);
+    int grid = std::min((total + block - 1) / block, 65535);
 
 #define DQFULLH2LAUNCH(GSVAL)                                                      \
     dequant_full_packed_h2_kernel<GSVAL><<<grid, block, 0, stream>>>(             \
-        q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<at::Half>()), \
-        reinterpret_cast<__half*>(w.data_ptr<at::Half>()), N, ng, (int)neuron_len)
+        q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<mfq_half>()), \
+        reinterpret_cast<__half*>(w.data_ptr<mfq_half>()), N, ng, (int)neuron_len)
 
     switch ((int)gs) {
         case 16: DQFULLH2LAUNCH(16); break;
         case 24: DQFULLH2LAUNCH(24); break;
         case 32: DQFULLH2LAUNCH(32); break;
         case 48: DQFULLH2LAUNCH(48); break;
-        default: TORCH_CHECK(false, "nint_dequant_full_packed_h2: gs must be in {16,24,32,48}, got ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "nint_dequant_full_packed_h2: gs must be in {16,24,32,48}, got ", gs);
     }
 #undef DQFULLH2LAUNCH
     return w;
@@ -4095,29 +4094,29 @@ __global__ void __launch_bounds__(128) gemv_packed_batch_eff2_kernel(
     }
 }
 
-torch::Tensor nint_gemv_cuda(
-    torch::Tensor q, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
+mfq_tensor_backend::Tensor nint_gemv_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
     int64_t gs)
 {
-    TORCH_CHECK(q.is_cuda() && q.scalar_type() == torch::kUInt8 && q.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q.is_cuda() && q.scalar_type() == mfq_tensor_backend::kUInt8 && q.is_contiguous(),
                 "q must be cuda contiguous uint8");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
     int N = (int)q.size(0), ng = (int)q.size(1);
     int M = (int)x.size(0), K_real = (int)x.size(1);
     int K_pad = ng * (int)gs;
-    auto qx = torch::empty({M, K_pad}, x.options().dtype(torch::kInt8));
-    auto xscale = torch::empty({M, ng}, x.options().dtype(torch::kFloat32));
-    auto xsum = torch::empty({M, ng}, x.options().dtype(torch::kInt32));
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto qx = mfq_tensor_backend::empty({M, K_pad}, x.options().dtype(mfq_tensor_backend::kInt8));
+    auto xscale = mfq_tensor_backend::empty({M, ng}, x.options().dtype(mfq_tensor_backend::kFloat32));
+    auto xsum = mfq_tensor_backend::empty({M, ng}, x.options().dtype(mfq_tensor_backend::kInt32));
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
 
 #define QLAUNCH(GSVAL)                                                                  \
     do {                                                                                \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                    \
         quantize_x_kernel<GSVAL, BD><<<dim3(M, ng), BD, 0, stream>>>(                   \
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                    \
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                    \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),  \
             M, K_real, K_pad);                                                          \
         gemv_kernel<GSVAL><<<dim3((N + 3) / 4, M), dim3(32, 4), 0, stream>>>(           \
@@ -4125,7 +4124,7 @@ torch::Tensor nint_gemv_cuda(
             sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),                \
             neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                        \
             xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                         \
-            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);      \
+            reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);      \
     } while (0)
 
     switch ((int)gs) {
@@ -4133,7 +4132,7 @@ torch::Tensor nint_gemv_cuda(
         case 24: QLAUNCH(24); break;
         case 32: QLAUNCH(32); break;
         case 48: QLAUNCH(48); break;
-        default: TORCH_CHECK(false, "nint_gemv: gs must be in {16,24,32,48}, got ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "nint_gemv: gs must be in {16,24,32,48}, got ", gs);
     }
 #undef QLAUNCH
     return out;
@@ -4171,35 +4170,35 @@ static bool nint_gs24_group_enabled(const char* name, bool default_enabled)
     return env == nullptr ? default_enabled : env[0] != '0';
 }
 
-torch::Tensor nint_gemv_packed_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t gs, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_gemv_packed_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == torch::kInt8,
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == mfq_tensor_backend::kInt8,
                 "qx workspace must be cuda contiguous int8");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == mfq_tensor_backend::kFloat32,
                 "xscale workspace must be cuda contiguous f32");
-    TORCH_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == torch::kInt32,
+    MFQ_RUNTIME_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == mfq_tensor_backend::kInt32,
                 "xsum workspace must be cuda contiguous int32");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
     int M = (int)x.size(0), K_real = (int)x.size(1);
     int K_pad = ng * (int)gs;
-    TORCH_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    TORCH_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    MFQ_RUNTIME_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
 #define QPWSLAUNCH(GSVAL)                                                               \
     do {                                                                                \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                    \
         quantize_x_kernel<GSVAL, BD><<<dim3(M, ng), BD, 0, stream>>>(                   \
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                    \
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                    \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),  \
             M, K_real, K_pad);                                                          \
         if (GSVAL == 24 && M == 1 && nint_gs24_group_enabled("MFQ_NINT4_GS24_VEC_LOAD", true)) { \
@@ -4208,28 +4207,28 @@ torch::Tensor nint_gemv_packed_ws_cuda(
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                     \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);  \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);  \
         } else if (GSVAL == 24 && M == 1 && nint_gs24_group_enabled("MFQ_NINT4_GS24_GROUP", true)) { \
             gemv_packed_gs24_group_kernel<4><<<dim3(N, M), dim3(32, 4), 0, stream>>>(   \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                     \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);  \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);  \
         } else if (M == 1 && nint_use_multiwarp_gemv()) {                               \
             gemv_packed_multiwarp_kernel<GSVAL><<<dim3(N, M), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                     \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);  \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);  \
         } else {                                                                        \
             gemv_packed_kernel<GSVAL><<<dim3((N + 7) / 8, M), dim3(32, 8), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                     \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);  \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);  \
         }                                                                               \
     } while (0)
 
@@ -4238,50 +4237,50 @@ torch::Tensor nint_gemv_packed_ws_cuda(
         case 24: QPWSLAUNCH(24); break;
         case 32: QPWSLAUNCH(32); break;
         case 48: QPWSLAUNCH(48); break;
-        default: TORCH_CHECK(false, "nint_gemv_packed_ws: gs must be in {16,24,32,48}, got ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "nint_gemv_packed_ws: gs must be in {16,24,32,48}, got ", gs);
     }
 #undef QPWSLAUNCH
     return out;
 }
 
-torch::Tensor nint4_gs24_gemv_bf16_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale,
-    torch::Tensor sub_min, torch::Tensor neuron_scale,
-    torch::Tensor neuron_min, torch::Tensor x,
-    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint4_gs24_gemv_bf16_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor sub_min, mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         q_packed.is_cuda() && q_packed.is_contiguous() &&
-        q_packed.scalar_type() == torch::kUInt8 &&
+        q_packed.scalar_type() == mfq_tensor_backend::kUInt8 &&
         q_packed.dim() == 3 && q_packed.size(2) == 12,
         "direct BF16 NINT4 output requires CUDA packed gs24 weights");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         x.is_cuda() && x.is_contiguous() &&
-        (x.scalar_type() == torch::kFloat16 ||
-         x.scalar_type() == torch::kBFloat16) &&
+        (x.scalar_type() == mfq_tensor_backend::kFloat16 ||
+         x.scalar_type() == mfq_tensor_backend::kBFloat16) &&
         x.dim() == 2 && x.size(0) == 1,
         "direct BF16 NINT4 output requires CUDA contiguous FP16 or BF16 M=1 input");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         qx.is_cuda() && qx.is_contiguous() &&
-        qx.scalar_type() == torch::kInt8 &&
+        qx.scalar_type() == mfq_tensor_backend::kInt8 &&
         xscale.is_cuda() && xscale.is_contiguous() &&
-        xscale.scalar_type() == torch::kFloat32 &&
+        xscale.scalar_type() == mfq_tensor_backend::kFloat32 &&
         xsum.is_cuda() && xsum.is_contiguous() &&
-        xsum.scalar_type() == torch::kInt32,
+        xsum.scalar_type() == mfq_tensor_backend::kInt32,
         "direct BF16 NINT4 output workspace mismatch");
     const int N = (int)q_packed.size(0);
     const int ng = (int)q_packed.size(1);
     const int K_pad = ng * 24;
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         x.size(1) <= K_pad && qx.size(0) >= 1 &&
         qx.size(1) >= K_pad && xscale.size(0) >= 1 &&
         xscale.size(1) >= ng && xsum.size(0) >= 1 &&
         xsum.size(1) >= ng,
         "direct BF16 NINT4 output workspace is too small");
-    auto out = torch::empty(
-        {1, N}, x.options().dtype(torch::kBFloat16));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    if (x.scalar_type() == torch::kBFloat16) {
+    auto out = mfq_tensor_backend::empty(
+        {1, N}, x.options().dtype(mfq_tensor_backend::kBFloat16));
+    cudaStream_t stream = mfq_current_cuda_stream();
+    if (x.scalar_type() == mfq_tensor_backend::kBFloat16) {
         quantize_x_kernel<24, 32, false, true>
             <<<dim3(1, ng), 32, 0, stream>>>(
                 x.data_ptr(), qx.data_ptr<int8_t>(),
@@ -4310,40 +4309,40 @@ torch::Tensor nint4_gs24_gemv_bf16_ws_cuda(
 // NINT6 packed GEMV with caller workspace. Only valid for 4|gs (the kernel
 // assumes a lane's 4 consecutive elements stay within one group). Covers the
 // NINT6 catalog values 20/24/28/32/36/40/48/64.
-torch::Tensor nint_gemv_packed_int6_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t gs, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_gemv_packed_int6_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 && sub_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
                 "sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 && sub_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min.is_contiguous(),
                 "sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous f32");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == torch::kInt8,
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == mfq_tensor_backend::kInt8,
                 "qx workspace must be cuda contiguous int8");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == mfq_tensor_backend::kFloat32,
                 "xscale workspace must be cuda contiguous f32");
-    TORCH_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == torch::kInt32,
+    MFQ_RUNTIME_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == mfq_tensor_backend::kInt32,
                 "xsum workspace must be cuda contiguous int32");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
     int qbytes = ((int)gs * 6 + 7) / 8;
-    TORCH_CHECK((int)q_packed.size(2) == qbytes, "q_packed last dim must equal (gs*6+7)/8");
-    TORCH_CHECK((int)gs % 4 == 0, "nint_gemv_packed_int6_ws requires 4|gs, got ", gs);
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) == qbytes, "q_packed last dim must equal (gs*6+7)/8");
+    MFQ_RUNTIME_CHECK((int)gs % 4 == 0, "nint_gemv_packed_int6_ws requires 4|gs, got ", gs);
     int M = (int)x.size(0), K_real = (int)x.size(1);
     int K_pad = ng * (int)gs;
-    TORCH_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    TORCH_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    MFQ_RUNTIME_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     int nwarps6 = nint_multiwarp_count("MFQ_NINT6_GEMV_WARPS", 4);
     bool group6 = nint_gs24_group_enabled("MFQ_NINT6_GS24_GROUP", false);
     bool u16_group6 = nint_gs24_group_enabled("MFQ_NINT6_GS24_U16_GROUP", true);
@@ -4358,14 +4357,14 @@ torch::Tensor nint_gemv_packed_int6_ws_cuda(
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),             \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                     \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                      \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);   \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);   \
         } else {                                                                         \
             gemv_packed_int6_gs24_batch_group_kernel<MVAL, 1><<<dim3((N + 3) / 4, (M + (MVAL) - 1) / (MVAL)), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),             \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),             \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                     \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                      \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);   \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);   \
         }                                                                                \
     } while (0)
 #define QPWS6LAUNCH(GSVAL)                                                                \
@@ -4373,12 +4372,12 @@ torch::Tensor nint_gemv_packed_int6_ws_cuda(
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                      \
         if (GSVAL == 24 && M > 1 && batch_group6) {                                      \
             quantize_x_kernel<GSVAL, BD, true><<<dim3(M, ng), BD, 0, stream>>>(           \
-                reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                  \
+                reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                  \
                 qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), \
                 M, K_real, K_pad);                                                        \
         } else {                                                                          \
             quantize_x_kernel<GSVAL, BD><<<dim3(M, ng), BD, 0, stream>>>(                 \
-                reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                  \
+                reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                  \
                 qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), \
                 M, K_real, K_pad);                                                        \
         }                                                                                 \
@@ -4394,70 +4393,70 @@ torch::Tensor nint_gemv_packed_int6_ws_cuda(
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                      \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                       \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);    \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);    \
         } else if (GSVAL == 24 && M == 1 && u16_group6 && nwarps6 == 4) {                 \
             gemv_packed_int6_gs24_group_kernel<4, true><<<dim3(N, M), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                      \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                       \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);    \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);    \
         } else if (GSVAL == 24 && M == 1 && u16_group6 && nwarps6 == 2) {                 \
             gemv_packed_int6_gs24_group_kernel<2, true><<<dim3(N, M), dim3(32, 2), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                      \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                       \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);    \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);    \
         } else if (GSVAL == 24 && M == 1 && group6 && nwarps6 == 8) {                     \
             gemv_packed_int6_gs24_group_kernel<8><<<dim3(N, M), dim3(32, 8), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                      \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                       \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);    \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);    \
         } else if (GSVAL == 24 && M == 1 && group6 && nwarps6 == 4) {                     \
             gemv_packed_int6_gs24_group_kernel<4><<<dim3(N, M), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                      \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                       \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);    \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);    \
         } else if (GSVAL == 24 && M == 1 && group6 && nwarps6 == 2) {                     \
             gemv_packed_int6_gs24_group_kernel<2><<<dim3(N, M), dim3(32, 2), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                      \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                       \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);    \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);    \
         } else if (M == 1 && nwarps6 == 8) {                                              \
             gemv_packed_int6_multiwarp_kernel<GSVAL, false, 8><<<dim3(N, M), dim3(32, 8), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                      \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                       \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);    \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);    \
         } else if (M == 1 && nwarps6 == 4) {                                              \
             gemv_packed_int6_multiwarp_kernel<GSVAL><<<dim3(N, M), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                      \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                       \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);    \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);    \
         } else if (M == 1 && nwarps6 == 2) {                                              \
             gemv_packed_int6_multiwarp_kernel<GSVAL, false, 2><<<dim3(N, M), dim3(32, 2), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                      \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                       \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);    \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);    \
         } else {                                                                          \
             gemv_packed_int6_kernel<GSVAL><<<dim3((N + 7) / 8, M), dim3(32, 8), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                      \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                       \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);    \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);    \
         }                                                                                 \
     } while (0)
 
@@ -4470,43 +4469,43 @@ torch::Tensor nint_gemv_packed_int6_ws_cuda(
         case 40: QPWS6LAUNCH(40); break;
         case 48: QPWS6LAUNCH(48); break;
         case 64: QPWS6LAUNCH(64); break;
-        default: TORCH_CHECK(false, "nint_gemv_packed_int6_ws: 4|gs not in catalog, got ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "nint_gemv_packed_int6_ws: 4|gs not in catalog, got ", gs);
     }
 #undef QPWS6LAUNCH
 #undef QPWS6BATCH
     return out;
 }
 
-torch::Tensor nint_gemv_packed_qx_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, int64_t gs,
-    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_gemv_packed_qx_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, int64_t gs,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 && sub_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
                 "sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 && sub_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min.is_contiguous(),
                 "sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous f32");
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == torch::kInt8,
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == mfq_tensor_backend::kInt8,
                 "qx workspace must be cuda contiguous int8");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == mfq_tensor_backend::kFloat32,
                 "xscale workspace must be cuda contiguous f32");
-    TORCH_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == torch::kInt32,
+    MFQ_RUNTIME_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == mfq_tensor_backend::kInt32,
                 "xsum workspace must be cuda contiguous int32");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
     int M = (int)qx.size(0);
     int K_pad = ng * (int)gs;
-    TORCH_CHECK((int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    TORCH_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
-    auto out = torch::empty({M, N}, qx.options().dtype(torch::kFloat16));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    MFQ_RUNTIME_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
+    auto out = mfq_tensor_backend::empty({M, N}, qx.options().dtype(mfq_tensor_backend::kFloat16));
+    cudaStream_t stream = mfq_current_cuda_stream();
 
 #define QXLAUNCH(GSVAL)                                                                \
     do {                                                                               \
@@ -4516,28 +4515,28 @@ torch::Tensor nint_gemv_packed_qx_ws_cuda(
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),           \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                   \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                    \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (GSVAL == 24 && M == 1 && nint_gs24_group_enabled("MFQ_NINT4_GS24_GROUP", true)) { \
             gemv_packed_gs24_group_kernel<4><<<dim3(N, M), dim3(32, 4), 0, stream>>>(  \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),           \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),           \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                   \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                    \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 1 && nint_use_multiwarp_gemv()) {                              \
             gemv_packed_multiwarp_kernel<GSVAL><<<dim3(N, M), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),           \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),           \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                   \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                    \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else {                                                                       \
             gemv_packed_kernel<GSVAL><<<dim3((N + 7) / 8, M), dim3(32, 8), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),           \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),           \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                   \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                    \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         }                                                                              \
     } while (0)
 
@@ -4546,50 +4545,50 @@ torch::Tensor nint_gemv_packed_qx_ws_cuda(
         case 24: QXLAUNCH(24); break;
         case 32: QXLAUNCH(32); break;
         case 48: QXLAUNCH(48); break;
-        default: TORCH_CHECK(false, "nint_gemv_packed_qx_ws: gs must be in {16,24,32,48}, got ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "nint_gemv_packed_qx_ws: gs must be in {16,24,32,48}, got ", gs);
     }
 #undef QXLAUNCH
     return out;
 }
 
 void nint4_gs24_quantize_input_ws_cuda(
-    torch::Tensor x, torch::Tensor qx,
-    torch::Tensor xscale, torch::Tensor xsum)
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         x.is_cuda() && x.is_contiguous() &&
-        (x.scalar_type() == torch::kHalf ||
-         x.scalar_type() == torch::kBFloat16),
+        (x.scalar_type() == mfq_tensor_backend::kHalf ||
+         x.scalar_type() == mfq_tensor_backend::kBFloat16),
         "x must be CUDA contiguous FP16 or BF16");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         qx.is_cuda() && qx.is_contiguous() &&
-        qx.scalar_type() == torch::kInt8,
+        qx.scalar_type() == mfq_tensor_backend::kInt8,
         "qx workspace must be CUDA contiguous int8");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         xscale.is_cuda() && xscale.is_contiguous() &&
-        xscale.scalar_type() == torch::kFloat32,
+        xscale.scalar_type() == mfq_tensor_backend::kFloat32,
         "xscale workspace must be CUDA contiguous FP32");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         xsum.is_cuda() && xsum.is_contiguous() &&
-        xsum.scalar_type() == torch::kInt32,
+        xsum.scalar_type() == mfq_tensor_backend::kInt32,
         "xsum workspace must be CUDA contiguous int32");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         x.dim() == 2 && x.size(0) == 1,
         "shared NINT4 activation quantization requires M=1");
     const int ng = (int)xscale.size(1);
     const int K_pad = ng * 24;
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         qx.size(0) == 1 && qx.size(1) >= K_pad,
         "qx workspace shape mismatch");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         xscale.size(0) == 1 && xsum.size(0) == 1 &&
         xsum.size(1) >= ng,
         "activation scale workspace shape mismatch");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         x.size(1) <= K_pad,
         "activation width exceeds the padded NINT4 width");
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    if (x.scalar_type() == torch::kBFloat16) {
+    cudaStream_t stream = mfq_current_cuda_stream();
+    if (x.scalar_type() == mfq_tensor_backend::kBFloat16) {
         quantize_x_kernel<24, 32, false, true>
             <<<dim3(1, ng), 32, 0, stream>>>(
                 x.data_ptr(), qx.data_ptr<int8_t>(),
@@ -4604,74 +4603,74 @@ void nint4_gs24_quantize_input_ws_cuda(
     }
 }
 
-std::vector<torch::Tensor> nint4_gs24_gemv_multi_qx_ws_cuda(
-    const std::vector<torch::Tensor> & q_packed,
-    const std::vector<torch::Tensor> & sub_scale,
-    const std::vector<torch::Tensor> & sub_min,
-    const std::vector<torch::Tensor> & neuron_scale,
-    const std::vector<torch::Tensor> & neuron_min,
-    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum,
+std::vector<mfq_tensor_backend::Tensor> nint4_gs24_gemv_multi_qx_ws_cuda(
+    const std::vector<mfq_tensor_backend::Tensor> & q_packed,
+    const std::vector<mfq_tensor_backend::Tensor> & sub_scale,
+    const std::vector<mfq_tensor_backend::Tensor> & sub_min,
+    const std::vector<mfq_tensor_backend::Tensor> & neuron_scale,
+    const std::vector<mfq_tensor_backend::Tensor> & neuron_min,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum,
     bool output_bf16)
 {
     const size_t count = q_packed.size();
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         count == 2 || count == 3,
         "multi-projection NINT4 GEMV requires two or three projections");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         sub_scale.size() == count && sub_min.size() == count &&
         neuron_scale.size() == count && neuron_min.size() == count,
         "multi-projection NINT4 metadata count mismatch");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         qx.is_cuda() && qx.is_contiguous() &&
-        qx.scalar_type() == torch::kInt8 && qx.size(0) == 1,
+        qx.scalar_type() == mfq_tensor_backend::kInt8 && qx.size(0) == 1,
         "shared qx must be CUDA contiguous int8 with M=1");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         xscale.is_cuda() && xscale.is_contiguous() &&
-        xscale.scalar_type() == torch::kFloat32 && xscale.size(0) == 1,
+        xscale.scalar_type() == mfq_tensor_backend::kFloat32 && xscale.size(0) == 1,
         "shared xscale must be CUDA contiguous FP32 with M=1");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         xsum.is_cuda() && xsum.is_contiguous() &&
-        xsum.scalar_type() == torch::kInt32 && xsum.size(0) == 1,
+        xsum.scalar_type() == mfq_tensor_backend::kInt32 && xsum.size(0) == 1,
         "shared xsum must be CUDA contiguous int32 with M=1");
     const int ng = (int)xscale.size(1);
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         qx.size(1) >= (int64_t)ng * 24 && xsum.size(1) >= ng,
         "shared NINT4 workspace is too small");
 
-    std::vector<torch::Tensor> outputs;
+    std::vector<mfq_tensor_backend::Tensor> outputs;
     outputs.reserve(count);
     std::vector<Nint4Gs24Projection> projections;
     projections.reserve(count);
     int total_rows = 0;
     for (size_t index = 0; index < count; ++index) {
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             q_packed[index].is_cuda() &&
             q_packed[index].is_contiguous() &&
-            q_packed[index].scalar_type() == torch::kUInt8 &&
+            q_packed[index].scalar_type() == mfq_tensor_backend::kUInt8 &&
             q_packed[index].dim() == 3 &&
             q_packed[index].size(1) == ng &&
             q_packed[index].size(2) == 12,
             "multi-projection NINT4 packed-weight shape mismatch");
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             sub_scale[index].is_cuda() &&
             sub_scale[index].is_contiguous() &&
-            sub_scale[index].scalar_type() == torch::kUInt8 &&
+            sub_scale[index].scalar_type() == mfq_tensor_backend::kUInt8 &&
             sub_min[index].is_cuda() &&
             sub_min[index].is_contiguous() &&
-            sub_min[index].scalar_type() == torch::kUInt8,
+            sub_min[index].scalar_type() == mfq_tensor_backend::kUInt8,
             "multi-projection NINT4 sub-scale metadata mismatch");
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             neuron_scale[index].is_cuda() &&
             neuron_scale[index].is_contiguous() &&
-            neuron_scale[index].scalar_type() == torch::kFloat32 &&
+            neuron_scale[index].scalar_type() == mfq_tensor_backend::kFloat32 &&
             neuron_min[index].is_cuda() &&
             neuron_min[index].is_contiguous() &&
-            neuron_min[index].scalar_type() == torch::kFloat32,
+            neuron_min[index].scalar_type() == mfq_tensor_backend::kFloat32,
             "multi-projection NINT4 neuron metadata mismatch");
         const int rows = (int)q_packed[index].size(0);
-        outputs.push_back(torch::empty(
+        outputs.push_back(mfq_tensor_backend::empty(
             {1, rows}, qx.options().dtype(
-                output_bf16 ? torch::kBFloat16 : torch::kFloat16)));
+                output_bf16 ? mfq_tensor_backend::kBFloat16 : mfq_tensor_backend::kFloat16)));
         projections.push_back({
             q_packed[index].data_ptr<uint8_t>(),
             sub_scale[index].data_ptr<uint8_t>(),
@@ -4684,7 +4683,7 @@ std::vector<torch::Tensor> nint4_gs24_gemv_multi_qx_ws_cuda(
         total_rows += rows;
     }
     Nint4Gs24Projection third = projections.back();
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
     if (count == 2) {
         if (output_bf16) {
             gemv_packed_gs24_multi_group_kernel<2, true>
@@ -4713,48 +4712,48 @@ std::vector<torch::Tensor> nint4_gs24_gemv_multi_qx_ws_cuda(
     return outputs;
 }
 
-torch::Tensor nint_gemv_packed_gate_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x, torch::Tensor gate,
-    int64_t gs, int64_t mode, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_gemv_packed_gate_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate,
+    int64_t gs, int64_t mode, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
-    TORCH_CHECK(mode == 1 || mode == 2, "gate mode must be 1(sigmoid) or 2(silu)");
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(mode == 1 || mode == 2, "gate mode must be 1(sigmoid) or 2(silu)");
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(gate.is_cuda() && gate.is_contiguous() && gate.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(gate.is_cuda() && gate.is_contiguous() && gate.scalar_type() == mfq_tensor_backend::kHalf,
                 "gate must be cuda contiguous fp16");
-    TORCH_CHECK(x.sizes() == gate.sizes(), "x and gate must have the same shape");
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == torch::kInt8,
+    MFQ_RUNTIME_CHECK(x.sizes() == gate.sizes(), "x and gate must have the same shape");
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == mfq_tensor_backend::kInt8,
                 "qx workspace must be cuda contiguous int8");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == mfq_tensor_backend::kFloat32,
                 "xscale workspace must be cuda contiguous f32");
-    TORCH_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == torch::kInt32,
+    MFQ_RUNTIME_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == mfq_tensor_backend::kInt32,
                 "xsum workspace must be cuda contiguous int32");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
     int M = (int)x.size(0), K_real = (int)x.size(1);
     int K_pad = ng * (int)gs;
-    TORCH_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    TORCH_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    MFQ_RUNTIME_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
 
 #define QPGATEWSLAUNCH(GSVAL)                                                          \
     do {                                                                                \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                    \
         if (mode == 1) {                                                                \
             quantize_x_gate_kernel<GSVAL, BD, 1><<<dim3(M, ng), BD, 0, stream>>>(       \
-                reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                \
-                reinterpret_cast<const __half*>(gate.data_ptr<at::Half>()),             \
+                reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                \
+                reinterpret_cast<const __half*>(gate.data_ptr<mfq_half>()),             \
                 qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), \
                 M, K_real, K_pad);                                                      \
         } else {                                                                        \
             quantize_x_gate_kernel<GSVAL, BD, 2><<<dim3(M, ng), BD, 0, stream>>>(       \
-                reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                \
-                reinterpret_cast<const __half*>(gate.data_ptr<at::Half>()),             \
+                reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                \
+                reinterpret_cast<const __half*>(gate.data_ptr<mfq_half>()),             \
                 qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), \
                 M, K_real, K_pad);                                                      \
         }                                                                               \
@@ -4764,28 +4763,28 @@ torch::Tensor nint_gemv_packed_gate_ws_cuda(
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                     \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);  \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);  \
         } else if (GSVAL == 24 && M == 1 && nint_gs24_group_enabled("MFQ_NINT4_GS24_GROUP", true)) { \
             gemv_packed_gs24_group_kernel<4><<<dim3(N, M), dim3(32, 4), 0, stream>>>(   \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                     \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);  \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);  \
         } else if (M == 1 && nint_use_multiwarp_gemv()) {                               \
             gemv_packed_multiwarp_kernel<GSVAL><<<dim3(N, M), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                     \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);  \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);  \
         } else {                                                                        \
             gemv_packed_kernel<GSVAL><<<dim3((N + 7) / 8, M), dim3(32, 8), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                     \
-                reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);  \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);  \
         }                                                                               \
     } while (0)
 
@@ -4794,50 +4793,50 @@ torch::Tensor nint_gemv_packed_gate_ws_cuda(
         case 24: QPGATEWSLAUNCH(24); break;
         case 32: QPGATEWSLAUNCH(32); break;
         case 48: QPGATEWSLAUNCH(48); break;
-        default: TORCH_CHECK(false, "nint_gemv_packed_gate_ws: gs must be in {16,24,32,48}, got ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "nint_gemv_packed_gate_ws: gs must be in {16,24,32,48}, got ", gs);
     }
 #undef QPGATEWSLAUNCH
     return out;
 }
 
-static torch::Tensor nint_gemv_packed_glu_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t gs, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum,
+static mfq_tensor_backend::Tensor nint_gemv_packed_glu_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum,
     int activation)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 && sub_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
                 "sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 && sub_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min.is_contiguous(),
                 "sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous f32");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == torch::kInt8,
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == mfq_tensor_backend::kInt8,
                 "qx workspace must be cuda contiguous int8");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == mfq_tensor_backend::kFloat32,
                 "xscale workspace must be cuda contiguous f32");
-    TORCH_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == torch::kInt32,
+    MFQ_RUNTIME_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == mfq_tensor_backend::kInt32,
                 "xsum workspace must be cuda contiguous int32");
     int N2 = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((N2 & 1) == 0, "swiglu packed GEMV expects concatenated [gate, up] rows");
+    MFQ_RUNTIME_CHECK((N2 & 1) == 0, "swiglu packed GEMV expects concatenated [gate, up] rows");
     int N = N2 / 2;
-    TORCH_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
-    TORCH_CHECK((int)sub_scale.size(0) == N2 && (int)sub_scale.size(1) == ng, "sub_scale shape mismatch");
-    TORCH_CHECK(sub_min.sizes() == sub_scale.sizes(), "sub_min shape mismatch");
-    TORCH_CHECK((int)neuron_scale.size(0) == N2 && (int)neuron_min.size(0) == N2, "neuron metadata shape mismatch");
-    TORCH_CHECK(x.dim() == 2 && x.size(0) == 1, "swiglu packed GEMV fast path supports only M=1");
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
+    MFQ_RUNTIME_CHECK((int)sub_scale.size(0) == N2 && (int)sub_scale.size(1) == ng, "sub_scale shape mismatch");
+    MFQ_RUNTIME_CHECK(sub_min.sizes() == sub_scale.sizes(), "sub_min shape mismatch");
+    MFQ_RUNTIME_CHECK((int)neuron_scale.size(0) == N2 && (int)neuron_min.size(0) == N2, "neuron metadata shape mismatch");
+    MFQ_RUNTIME_CHECK(x.dim() == 2 && x.size(0) == 1, "swiglu packed GEMV fast path supports only M=1");
     int K_real = (int)x.size(1);
     int K_pad = ng * (int)gs;
-    TORCH_CHECK((int)qx.size(0) >= 1 && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= 1 && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    auto out = torch::empty({1, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= 1 && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= 1 && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    auto out = mfq_tensor_backend::empty({1, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     int swiglu_nwarps = nint_multiwarp_count("MFQ_NINT_SWIGLU_WARPS", 4);
     bool swiglu_group = nint_gs24_group_enabled("MFQ_NINT_SWIGLU_GS24_GROUP", true);
     bool swiglu_vec_load = nint_gs24_group_enabled("MFQ_NINT_SWIGLU_GS24_VEC_LOAD", true);
@@ -4846,7 +4845,7 @@ static torch::Tensor nint_gemv_packed_glu_ws_cuda(
     do {                                                                                \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                    \
         quantize_x_kernel<GSVAL, BD><<<dim3(1, ng), BD, 0, stream>>>(                   \
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                    \
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                    \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),  \
             1, K_real, K_pad);                                                          \
         if (GSVAL == 24 && swiglu_vec_load && swiglu_nwarps == 8) {                    \
@@ -4854,70 +4853,70 @@ static torch::Tensor nint_gemv_packed_glu_ws_cuda(
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 N, ng, K_pad, activation);                                              \
         } else if (GSVAL == 24 && swiglu_vec_load && swiglu_nwarps == 4) {             \
             gemv_packed_swiglu_gs24_group_kernel<4, true><<<N, dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 N, ng, K_pad, activation);                                              \
         } else if (GSVAL == 24 && swiglu_vec_load && swiglu_nwarps == 2) {             \
             gemv_packed_swiglu_gs24_group_kernel<2, true><<<N, dim3(32, 2), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 N, ng, K_pad, activation);                                              \
         } else if (GSVAL == 24 && swiglu_group && swiglu_nwarps == 8) {                \
             gemv_packed_swiglu_gs24_group_kernel<8><<<N, dim3(32, 8), 0, stream>>>(    \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 N, ng, K_pad, activation);                                              \
         } else if (GSVAL == 24 && swiglu_group && swiglu_nwarps == 4) {                \
             gemv_packed_swiglu_gs24_group_kernel<4><<<N, dim3(32, 4), 0, stream>>>(    \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 N, ng, K_pad, activation);                                              \
         } else if (GSVAL == 24 && swiglu_group && swiglu_nwarps == 2) {                \
             gemv_packed_swiglu_gs24_group_kernel<2><<<N, dim3(32, 2), 0, stream>>>(    \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 N, ng, K_pad, activation);                                              \
         } else if (swiglu_nwarps == 8) {                                               \
             gemv_packed_swiglu_multiwarp_kernel<GSVAL, 8><<<N, dim3(32, 8), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 N, ng, K_pad, activation);                                              \
         } else if (swiglu_nwarps == 4) {                                               \
             gemv_packed_swiglu_multiwarp_kernel<GSVAL><<<N, dim3(32, 4), 0, stream>>>(  \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 N, ng, K_pad, activation);                                              \
         } else if (swiglu_nwarps == 2) {                                               \
             gemv_packed_swiglu_multiwarp_kernel<GSVAL, 2><<<N, dim3(32, 2), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 N, ng, K_pad, activation);                                              \
         } else {                                                                        \
             gemv_packed_swiglu_pair_kernel<GSVAL><<<dim3((N + 3) / 4), dim3(32, 8), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 N, ng, K_pad, activation);                                              \
         }                                                                               \
     } while (0)
@@ -4927,40 +4926,40 @@ static torch::Tensor nint_gemv_packed_glu_ws_cuda(
         case 24: QPSWIGLULAUNCH(24); break;
         case 32: QPSWIGLULAUNCH(32); break;
         case 48: QPSWIGLULAUNCH(48); break;
-        default: TORCH_CHECK(false, "nint_gemv_packed_swiglu_ws: gs must be in {16,24,32,48}, got ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "nint_gemv_packed_swiglu_ws: gs must be in {16,24,32,48}, got ", gs);
     }
 #undef QPSWIGLULAUNCH
     return out;
 }
 
-torch::Tensor nint_gemv_packed_batch_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t gs, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_gemv_packed_batch_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == torch::kInt8,
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == mfq_tensor_backend::kInt8,
                 "qx workspace must be cuda contiguous int8");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == mfq_tensor_backend::kFloat32,
                 "xscale workspace must be cuda contiguous f32");
-    TORCH_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == torch::kInt32,
+    MFQ_RUNTIME_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == mfq_tensor_backend::kInt32,
                 "xsum workspace must be cuda contiguous int32");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
     int M = (int)x.size(0), K_real = (int)x.size(1);
     bool group24_batch = nint_gs24_group_enabled("MFQ_NINT4_GS24_BATCH_GROUP", true);
     const char* split24_env = std::getenv("MFQ_NINT4_GS24_BATCH_SPLIT");
     int group24_msplit = split24_env != nullptr ? std::atoi(split24_env) : 2;
-    TORCH_CHECK(M >= 1 && (M <= 8 || ((int)gs == 24 && group24_batch && M <= 16)),
+    MFQ_RUNTIME_CHECK(M >= 1 && (M <= 8 || ((int)gs == 24 && group24_batch && M <= 16)),
                 "batched packed GEMV supports M in [1, 8], or M <= 16 for gs24 group mode");
     int K_pad = ng * (int)gs;
-    TORCH_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
 
 #define QPBATCHLAUNCH(GSVAL, MVAL)                                                     \
     do {                                                                                \
@@ -4969,23 +4968,23 @@ torch::Tensor nint_gemv_packed_batch_ws_cuda(
                 gemv_packed_gs24_batch_group_kernel<MVAL, 4><<<dim3((N + 3) / 4, (M + (MVAL) - 1) / (MVAL)), dim3(32, 16), 0, stream>>>( \
                     q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                     neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                    xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                    xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
             } else if (group24_msplit >= 2 && (MVAL) >= 2) {                            \
                 gemv_packed_gs24_batch_group_kernel<MVAL, 2><<<dim3((N + 3) / 4, (M + (MVAL) - 1) / (MVAL)), dim3(32, 8), 0, stream>>>( \
                     q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                     neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                    xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                    xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
             } else {                                                                    \
                 gemv_packed_gs24_batch_group_kernel<MVAL, 1><<<dim3((N + 3) / 4, (M + (MVAL) - 1) / (MVAL)), dim3(32, 4), 0, stream>>>( \
                     q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                     neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                    xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                    xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
             }                                                                           \
         } else {                                                                        \
             gemv_packed_batch_kernel<GSVAL, MVAL><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         }                                                                               \
     } while (0)
 
@@ -4994,12 +4993,12 @@ torch::Tensor nint_gemv_packed_batch_ws_cuda(
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                    \
         if ((GSVAL) == 24 && group24_batch) {                                           \
             quantize_x_kernel<GSVAL, BD, true><<<dim3(M, ng), BD, 0, stream>>>(         \
-                reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                \
+                reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                \
                 qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), \
                 M, K_real, K_pad);                                                      \
         } else {                                                                        \
             quantize_x_kernel<GSVAL, BD><<<dim3(M, ng), BD, 0, stream>>>(               \
-                reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                \
+                reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                \
                 qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), \
                 M, K_real, K_pad);                                                      \
         }                                                                               \
@@ -5021,110 +5020,110 @@ torch::Tensor nint_gemv_packed_batch_ws_cuda(
         case 24: QPBWSLAUNCH(24); break;
         case 32: QPBWSLAUNCH(32); break;
         case 48: QPBWSLAUNCH(48); break;
-        default: TORCH_CHECK(false, "nint_gemv_packed_batch_ws: gs must be in {16,24,32,48}, got ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "nint_gemv_packed_batch_ws: gs must be in {16,24,32,48}, got ", gs);
     }
 #undef QPBWSLAUNCH
 #undef QPBATCHLAUNCH
     return out;
 }
 
-torch::Tensor nint_gemv_packed_swiglu_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t gs, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_gemv_packed_swiglu_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
     return nint_gemv_packed_glu_ws_cuda(
         q_packed, sub_scale, sub_min, neuron_scale, neuron_min, x,
         gs, qx, xscale, xsum, 0);
 }
 
-torch::Tensor nint_gemv_packed_geglu_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t gs, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_gemv_packed_geglu_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
     return nint_gemv_packed_glu_ws_cuda(
         q_packed, sub_scale, sub_min, neuron_scale, neuron_min, x,
         gs, qx, xscale, xsum, 1);
 }
 
-torch::Tensor nint_gemv_packed_bits_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t gs, int64_t bits, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_gemv_packed_bits_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t gs, int64_t bits, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
-    TORCH_CHECK(bits == 2 || bits == 3 || bits == 5 || bits == 6 || bits == 8,
+    MFQ_RUNTIME_CHECK(bits == 2 || bits == 3 || bits == 5 || bits == 6 || bits == 8,
                 "packed-bits GEMV supports bits in {2,3,5,6,8}, got ", bits);
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 && sub_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
                 "sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 && sub_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min.is_contiguous(),
                 "sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous f32");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == torch::kInt8,
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == mfq_tensor_backend::kInt8,
                 "qx workspace must be cuda contiguous int8");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == mfq_tensor_backend::kFloat32,
                 "xscale workspace must be cuda contiguous f32");
-    TORCH_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == torch::kInt32,
+    MFQ_RUNTIME_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == mfq_tensor_backend::kInt32,
                 "xsum workspace must be cuda contiguous int32");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) == (((int)gs * (int)bits + 7) / 8),
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) == (((int)gs * (int)bits + 7) / 8),
                 "q_packed last dim must equal ceil(gs*bits/8)");
-    TORCH_CHECK((int)sub_scale.size(0) == N && (int)sub_scale.size(1) == ng, "sub_scale shape mismatch");
-    TORCH_CHECK(sub_min.sizes() == sub_scale.sizes(), "sub_min shape mismatch");
-    TORCH_CHECK((int)neuron_scale.size(0) == N && (int)neuron_min.size(0) == N, "neuron metadata shape mismatch");
+    MFQ_RUNTIME_CHECK((int)sub_scale.size(0) == N && (int)sub_scale.size(1) == ng, "sub_scale shape mismatch");
+    MFQ_RUNTIME_CHECK(sub_min.sizes() == sub_scale.sizes(), "sub_min shape mismatch");
+    MFQ_RUNTIME_CHECK((int)neuron_scale.size(0) == N && (int)neuron_min.size(0) == N, "neuron metadata shape mismatch");
     int M = (int)x.size(0), K_real = (int)x.size(1);
-    TORCH_CHECK(M >= 1 && (M <= 8 || (bits == 3 && M <= 64)),
+    MFQ_RUNTIME_CHECK(M >= 1 && (M <= 8 || (bits == 3 && M <= 64)),
                 "packed-bits GEMV supports M in [1,8], or NINT3 M in [1,64]");
     int K_pad = ng * (int)gs;
-    TORCH_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
 
 #define QPBITSLAUNCH(BITSVAL, GSVAL)                                                   \
     do {                                                                                \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                    \
         quantize_x_kernel<GSVAL, BD><<<dim3(M, ng), BD, 0, stream>>>(                   \
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                    \
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                    \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),  \
             M, K_real, K_pad);                                                          \
         if (M == 1) {                                                                   \
             gemv_packed_bits_batch_kernel<BITSVAL, GSVAL, 1><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 2) {                                                            \
             gemv_packed_bits_batch_kernel<BITSVAL, GSVAL, 2><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 3) {                                                            \
             gemv_packed_bits_batch_kernel<BITSVAL, GSVAL, 3><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 4) {                                                            \
             gemv_packed_bits_batch_kernel<BITSVAL, GSVAL, 4><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 5) {                                                            \
             gemv_packed_bits_batch_kernel<BITSVAL, GSVAL, 5><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else {                                                                        \
             gemv_packed_bits_batch_kernel<BITSVAL, GSVAL, 8><<<dim3((N + 3) / 4, (M + 7) / 8), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         }                                                                               \
     } while (0)
 
@@ -5132,7 +5131,7 @@ torch::Tensor nint_gemv_packed_bits_ws_cuda(
     do {                                                                                \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                    \
         quantize_x_kernel<GSVAL, BD><<<dim3(M, ng), BD, 0, stream>>>(                   \
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                    \
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                    \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),  \
             M, K_real, K_pad);                                                          \
         if ((BITSVAL) == 5 && (GSVAL) == 28 && M > 1) {                                 \
@@ -5141,27 +5140,27 @@ torch::Tensor nint_gemv_packed_bits_ws_cuda(
                 gemv_nint5_gs28_batch_kernel<2><<<dim3((N + 3) / 4, (M + 1) / 2), dim3(32, 4), 0, stream>>>( \
                     q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                     neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
             } else if (mtile_env != nullptr && mtile_env[0] == '4') {                   \
                 gemv_nint5_gs28_batch_kernel<4><<<dim3((N + 3) / 4, (M + 3) / 4), dim3(32, 4), 0, stream>>>( \
                     q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                     neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
             } else if (mtile_env != nullptr && mtile_env[0] == '8') {                   \
                 gemv_nint5_gs28_batch_kernel<8><<<dim3((N + 3) / 4, (M + 7) / 8), dim3(32, 4), 0, stream>>>( \
                     q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                     neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
             } else if (M <= 4 || M == 8) {                                              \
                 gemv_nint5_gs28_batch_kernel<4><<<dim3((N + 3) / 4, (M + 3) / 4), dim3(32, 4), 0, stream>>>( \
                     q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                     neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
             } else {                                                                    \
                 gemv_nint5_gs28_batch_kernel<8><<<dim3((N + 3) / 4, (M + 7) / 8), dim3(32, 4), 0, stream>>>( \
                     q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                     neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
             }                                                                           \
         } else if ((BITSVAL) == 6 && (GSVAL) == 26) {                                   \
             const char* mtile_env = std::getenv("MFQ_NINT6_GS26_MTILE");                \
@@ -5169,63 +5168,63 @@ torch::Tensor nint_gemv_packed_bits_ws_cuda(
                 gemv_nint6_gs26_batch_kernel<2><<<dim3((N + 3) / 4, (M + 1) / 2), dim3(32, 4), 0, stream>>>( \
                     q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                     neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
             } else if (mtile_env != nullptr && mtile_env[0] == '4') {                   \
                 gemv_nint6_gs26_batch_kernel<4><<<dim3((N + 3) / 4, (M + 3) / 4), dim3(32, 4), 0, stream>>>( \
                     q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                     neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
             } else if (mtile_env != nullptr && mtile_env[0] == '8') {                   \
                 gemv_nint6_gs26_batch_kernel<8><<<dim3((N + 3) / 4, (M + 7) / 8), dim3(32, 4), 0, stream>>>( \
                     q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                     neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
             } else if (M <= 2) {                                                        \
                 gemv_nint6_gs26_batch_kernel<2><<<dim3((N + 3) / 4, (M + 1) / 2), dim3(32, 4), 0, stream>>>( \
                     q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                     neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
             } else if (M <= 4) {                                                        \
                 gemv_nint6_gs26_batch_kernel<4><<<dim3((N + 3) / 4, (M + 3) / 4), dim3(32, 4), 0, stream>>>( \
                     q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                     neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
             } else {                                                                    \
                 gemv_nint6_gs26_batch_kernel<8><<<dim3((N + 3) / 4, (M + 7) / 8), dim3(32, 4), 0, stream>>>( \
                     q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                     neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
             }                                                                           \
         } else if (M == 1) {                                                            \
             gemv_packed_bits_group4_batch_kernel<BITSVAL, GSVAL, 1><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 2) {                                                            \
             gemv_packed_bits_group4_batch_kernel<BITSVAL, GSVAL, 2><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 3) {                                                            \
             gemv_packed_bits_group4_batch_kernel<BITSVAL, GSVAL, 3><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 4) {                                                            \
             gemv_packed_bits_group4_batch_kernel<BITSVAL, GSVAL, 4><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 5) {                                                            \
             gemv_packed_bits_group4_batch_kernel<BITSVAL, GSVAL, 5><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else {                                                                        \
             gemv_packed_bits_group4_batch_kernel<BITSVAL, GSVAL, 8><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         }                                                                               \
     } while (0)
 
@@ -5244,7 +5243,7 @@ torch::Tensor nint_gemv_packed_bits_ws_cuda(
         case 40: QPBITSLAUNCH(BITSVAL, 40); break;                                      \
         case 48: QPBITSLAUNCH(BITSVAL, 48); break;                                      \
         case 64: QPBITSLAUNCH(BITSVAL, 64); break;                                      \
-        default: TORCH_CHECK(false, "packed-bits GEMV unsupported gs ", gs);             \
+        default: MFQ_RUNTIME_CHECK(false, "packed-bits GEMV unsupported gs ", gs);             \
     }
 
 #define QPBITS_FAST_GS_SWITCH(BITSVAL)                                                  \
@@ -5262,7 +5261,7 @@ torch::Tensor nint_gemv_packed_bits_ws_cuda(
         case 40: QPBITSFASTLAUNCH(BITSVAL, 40); break;                                  \
         case 48: QPBITSFASTLAUNCH(BITSVAL, 48); break;                                  \
         case 64: QPBITSFASTLAUNCH(BITSVAL, 64); break;                                  \
-        default: TORCH_CHECK(false, "packed-bits fast GEMV unsupported gs ", gs);        \
+        default: MFQ_RUNTIME_CHECK(false, "packed-bits fast GEMV unsupported gs ", gs);        \
     }
 
     const char* generic_env = std::getenv("MFQ_NINT_BITS_GEMV_GENERIC");
@@ -5291,41 +5290,41 @@ torch::Tensor nint_gemv_packed_bits_ws_cuda(
     return out;
 }
 
-torch::Tensor nint_gemv_packed_bits_qx_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, int64_t gs, int64_t bits,
-    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_gemv_packed_bits_qx_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, int64_t gs, int64_t bits,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
     (void)xsum;
-    TORCH_CHECK(bits == 2 || bits == 3 || bits == 5 || bits == 6 || bits == 8,
+    MFQ_RUNTIME_CHECK(bits == 2 || bits == 3 || bits == 5 || bits == 6 || bits == 8,
                 "packed-bits qx GEMV supports bits in {2,3,5,6,8}, got ", bits);
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 && sub_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
                 "sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 && sub_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min.is_contiguous(),
                 "sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous f32");
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == torch::kInt8,
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == mfq_tensor_backend::kInt8,
                 "qx workspace must be cuda contiguous int8");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == mfq_tensor_backend::kFloat32,
                 "xscale workspace must be cuda contiguous f32");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) == (((int)gs * (int)bits + 7) / 8),
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) == (((int)gs * (int)bits + 7) / 8),
                 "q_packed last dim must equal ceil(gs*bits/8)");
-    TORCH_CHECK((int)sub_scale.size(0) == N && (int)sub_scale.size(1) == ng, "sub_scale shape mismatch");
-    TORCH_CHECK(sub_min.sizes() == sub_scale.sizes(), "sub_min shape mismatch");
-    TORCH_CHECK((int)neuron_scale.size(0) == N && (int)neuron_min.size(0) == N, "neuron metadata shape mismatch");
+    MFQ_RUNTIME_CHECK((int)sub_scale.size(0) == N && (int)sub_scale.size(1) == ng, "sub_scale shape mismatch");
+    MFQ_RUNTIME_CHECK(sub_min.sizes() == sub_scale.sizes(), "sub_min shape mismatch");
+    MFQ_RUNTIME_CHECK((int)neuron_scale.size(0) == N && (int)neuron_min.size(0) == N, "neuron metadata shape mismatch");
     int M = (int)qx.size(0);
-    TORCH_CHECK(M >= 1 && M <= 8, "packed-bits qx GEMV supports M in [1, 8]");
+    MFQ_RUNTIME_CHECK(M >= 1 && M <= 8, "packed-bits qx GEMV supports M in [1, 8]");
     int K_pad = ng * (int)gs;
-    TORCH_CHECK((int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    auto out = torch::empty({M, N}, qx.options().dtype(torch::kFloat16));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    auto out = mfq_tensor_backend::empty({M, N}, qx.options().dtype(mfq_tensor_backend::kFloat16));
+    cudaStream_t stream = mfq_current_cuda_stream();
 
 #define QPBITSQXLAUNCH(BITSVAL, GSVAL)                                                 \
     do {                                                                                \
@@ -5334,21 +5333,21 @@ torch::Tensor nint_gemv_packed_bits_qx_ws_cuda(
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 M, N, ng, K_pad);                                                       \
         } else if ((BITSVAL) == 6 && (GSVAL) == 26) {                                   \
             gemv_nint6_gs26_batch_kernel<1><<<dim3((N + 3) / 4, M), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 M, N, ng, K_pad);                                                       \
         } else {                                                                        \
             gemv_packed_bits_group4_batch_kernel<BITSVAL, GSVAL, 1><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 M, N, ng, K_pad);                                                       \
         }                                                                               \
     } while (0)
@@ -5368,7 +5367,7 @@ torch::Tensor nint_gemv_packed_bits_qx_ws_cuda(
         case 40: QPBITSQXLAUNCH(BITSVAL, 40); break;                                    \
         case 48: QPBITSQXLAUNCH(BITSVAL, 48); break;                                    \
         case 64: QPBITSQXLAUNCH(BITSVAL, 64); break;                                    \
-        default: TORCH_CHECK(false, "packed-bits qx GEMV unsupported gs ", gs);         \
+        default: MFQ_RUNTIME_CHECK(false, "packed-bits qx GEMV unsupported gs ", gs);         \
     }
 
     if (bits == 2) {
@@ -5388,72 +5387,72 @@ torch::Tensor nint_gemv_packed_bits_qx_ws_cuda(
 }
 
 static void nint_ffn_gate_up_glu_quant_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
     int64_t gu_gs, int64_t gu_bits, int64_t down_gs,
-    torch::Tensor gu_qx, torch::Tensor gu_xscale, torch::Tensor gu_xsum,
-    torch::Tensor down_qx, torch::Tensor down_xscale, torch::Tensor down_xsum,
+    mfq_tensor_backend::Tensor gu_qx, mfq_tensor_backend::Tensor gu_xscale, mfq_tensor_backend::Tensor gu_xsum,
+    mfq_tensor_backend::Tensor down_qx, mfq_tensor_backend::Tensor down_xscale, mfq_tensor_backend::Tensor down_xsum,
     int activation)
 {
-    TORCH_CHECK(gu_bits == 2 || gu_bits == 3 || gu_bits == 4 || gu_bits == 5 || gu_bits == 6 || gu_bits == 8,
+    MFQ_RUNTIME_CHECK(gu_bits == 2 || gu_bits == 3 || gu_bits == 4 || gu_bits == 5 || gu_bits == 6 || gu_bits == 8,
                 "FFN gate/up quant fusion supports bits in {2,3,4,5,6,8}, got ", gu_bits);
-    TORCH_CHECK(down_gs >= 1 && down_gs <= 32,
+    MFQ_RUNTIME_CHECK(down_gs >= 1 && down_gs <= 32,
                 "FFN gate/up quant fusion requires down_gs <= 32, got ", down_gs);
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 && sub_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
                 "sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 && sub_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min.is_contiguous(),
                 "sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous f32");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(x.dim() == 2 && x.size(0) == 1, "FFN gate/up quant fusion supports only decode M=1");
-    TORCH_CHECK(gu_qx.is_cuda() && gu_qx.is_contiguous() && gu_qx.scalar_type() == torch::kInt8,
+    MFQ_RUNTIME_CHECK(x.dim() == 2 && x.size(0) == 1, "FFN gate/up quant fusion supports only decode M=1");
+    MFQ_RUNTIME_CHECK(gu_qx.is_cuda() && gu_qx.is_contiguous() && gu_qx.scalar_type() == mfq_tensor_backend::kInt8,
                 "gu_qx workspace must be cuda contiguous int8");
-    TORCH_CHECK(gu_xscale.is_cuda() && gu_xscale.is_contiguous() && gu_xscale.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(gu_xscale.is_cuda() && gu_xscale.is_contiguous() && gu_xscale.scalar_type() == mfq_tensor_backend::kFloat32,
                 "gu_xscale workspace must be cuda contiguous f32");
-    TORCH_CHECK(gu_xsum.is_cuda() && gu_xsum.is_contiguous() && gu_xsum.scalar_type() == torch::kInt32,
+    MFQ_RUNTIME_CHECK(gu_xsum.is_cuda() && gu_xsum.is_contiguous() && gu_xsum.scalar_type() == mfq_tensor_backend::kInt32,
                 "gu_xsum workspace must be cuda contiguous int32");
-    TORCH_CHECK(down_qx.is_cuda() && down_qx.is_contiguous() && down_qx.scalar_type() == torch::kInt8,
+    MFQ_RUNTIME_CHECK(down_qx.is_cuda() && down_qx.is_contiguous() && down_qx.scalar_type() == mfq_tensor_backend::kInt8,
                 "down_qx workspace must be cuda contiguous int8");
-    TORCH_CHECK(down_xscale.is_cuda() && down_xscale.is_contiguous() && down_xscale.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(down_xscale.is_cuda() && down_xscale.is_contiguous() && down_xscale.scalar_type() == mfq_tensor_backend::kFloat32,
                 "down_xscale workspace must be cuda contiguous f32");
-    TORCH_CHECK(down_xsum.is_cuda() && down_xsum.is_contiguous() && down_xsum.scalar_type() == torch::kInt32,
+    MFQ_RUNTIME_CHECK(down_xsum.is_cuda() && down_xsum.is_contiguous() && down_xsum.scalar_type() == mfq_tensor_backend::kInt32,
                 "down_xsum workspace must be cuda contiguous int32");
 
     int N2 = (int)q_packed.size(0), gu_ng = (int)q_packed.size(1);
-    TORCH_CHECK((N2 & 1) == 0, "FFN gate/up quant fusion expects concatenated [gate, up] rows");
+    MFQ_RUNTIME_CHECK((N2 & 1) == 0, "FFN gate/up quant fusion expects concatenated [gate, up] rows");
     int N = N2 / 2;
     if (gu_bits == 4) {
-        TORCH_CHECK((int)q_packed.size(2) * 2 == gu_gs, "q_packed last dim must equal gu_gs/2");
+        MFQ_RUNTIME_CHECK((int)q_packed.size(2) * 2 == gu_gs, "q_packed last dim must equal gu_gs/2");
     } else {
-        TORCH_CHECK((int)q_packed.size(2) == (((int)gu_gs * (int)gu_bits + 7) / 8),
+        MFQ_RUNTIME_CHECK((int)q_packed.size(2) == (((int)gu_gs * (int)gu_bits + 7) / 8),
                     "q_packed last dim must equal ceil(gu_gs*gu_bits/8)");
     }
-    TORCH_CHECK((int)sub_scale.size(0) == N2 && (int)sub_scale.size(1) == gu_ng, "sub_scale shape mismatch");
-    TORCH_CHECK(sub_min.sizes() == sub_scale.sizes(), "sub_min shape mismatch");
-    TORCH_CHECK((int)neuron_scale.size(0) == N2 && (int)neuron_min.size(0) == N2, "neuron metadata shape mismatch");
+    MFQ_RUNTIME_CHECK((int)sub_scale.size(0) == N2 && (int)sub_scale.size(1) == gu_ng, "sub_scale shape mismatch");
+    MFQ_RUNTIME_CHECK(sub_min.sizes() == sub_scale.sizes(), "sub_min shape mismatch");
+    MFQ_RUNTIME_CHECK((int)neuron_scale.size(0) == N2 && (int)neuron_min.size(0) == N2, "neuron metadata shape mismatch");
     int K_real = (int)x.size(1);
     int gu_K_pad = gu_ng * (int)gu_gs;
     int down_ng = (int)down_xscale.size(1);
     int down_K_pad = down_ng * (int)down_gs;
-    TORCH_CHECK((int)gu_qx.size(0) >= 1 && (int)gu_qx.size(1) >= gu_K_pad, "gu_qx workspace too small");
-    TORCH_CHECK((int)gu_xscale.size(0) >= 1 && (int)gu_xscale.size(1) >= gu_ng, "gu_xscale workspace too small");
-    TORCH_CHECK((int)gu_xsum.size(0) >= 1 && (int)gu_xsum.size(1) >= gu_ng, "gu_xsum workspace too small");
-    TORCH_CHECK((int)down_qx.size(0) >= 1 && (int)down_qx.size(1) >= down_K_pad, "down_qx workspace too small");
-    TORCH_CHECK((int)down_xsum.size(0) >= 1 && (int)down_xsum.size(1) >= down_ng, "down_xsum workspace too small");
-    TORCH_CHECK(N <= down_K_pad, "down workspace cannot hold intermediate activations");
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)gu_qx.size(0) >= 1 && (int)gu_qx.size(1) >= gu_K_pad, "gu_qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)gu_xscale.size(0) >= 1 && (int)gu_xscale.size(1) >= gu_ng, "gu_xscale workspace too small");
+    MFQ_RUNTIME_CHECK((int)gu_xsum.size(0) >= 1 && (int)gu_xsum.size(1) >= gu_ng, "gu_xsum workspace too small");
+    MFQ_RUNTIME_CHECK((int)down_qx.size(0) >= 1 && (int)down_qx.size(1) >= down_K_pad, "down_qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)down_xsum.size(0) >= 1 && (int)down_xsum.size(1) >= down_ng, "down_xsum workspace too small");
+    MFQ_RUNTIME_CHECK(N <= down_K_pad, "down workspace cannot hold intermediate activations");
+    cudaStream_t stream = mfq_current_cuda_stream();
 
 #define FFN_QUANT_LAUNCH(GU_GSVAL, DOWN_GSVAL)                                         \
     do {                                                                                \
         constexpr int BD = ((GU_GSVAL + 31) / 32) * 32;                                 \
         quantize_x_kernel<GU_GSVAL, BD><<<dim3(1, gu_ng), BD, 0, stream>>>(             \
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                    \
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                    \
             gu_qx.data_ptr<int8_t>(), gu_xscale.data_ptr<float>(), gu_xsum.data_ptr<int32_t>(), \
             1, K_real, gu_K_pad);                                                       \
         if (gu_bits == 2) {                                                             \
@@ -5517,7 +5516,7 @@ static void nint_ffn_gate_up_glu_quant_ws_cuda(
         case 28: FFN_QUANT_LAUNCH(GU_GSVAL, 28); break;                                 \
         case 30: FFN_QUANT_LAUNCH(GU_GSVAL, 30); break;                                 \
         case 32: FFN_QUANT_LAUNCH(GU_GSVAL, 32); break;                                 \
-        default: TORCH_CHECK(false, "FFN gate/up quant fusion unsupported down_gs ", down_gs); \
+        default: MFQ_RUNTIME_CHECK(false, "FFN gate/up quant fusion unsupported down_gs ", down_gs); \
     }
 
     switch ((int)gu_gs) {
@@ -5534,18 +5533,18 @@ static void nint_ffn_gate_up_glu_quant_ws_cuda(
         case 40: FFN_DOWN_GS_SWITCH(40); break;
         case 48: FFN_DOWN_GS_SWITCH(48); break;
         case 64: FFN_DOWN_GS_SWITCH(64); break;
-        default: TORCH_CHECK(false, "FFN gate/up quant fusion unsupported gu_gs ", gu_gs);
+        default: MFQ_RUNTIME_CHECK(false, "FFN gate/up quant fusion unsupported gu_gs ", gu_gs);
     }
 #undef FFN_DOWN_GS_SWITCH
 #undef FFN_QUANT_LAUNCH
 }
 
 void nint_ffn_gate_up_swiglu_quant_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
     int64_t gu_gs, int64_t gu_bits, int64_t down_gs,
-    torch::Tensor gu_qx, torch::Tensor gu_xscale, torch::Tensor gu_xsum,
-    torch::Tensor down_qx, torch::Tensor down_xscale, torch::Tensor down_xsum)
+    mfq_tensor_backend::Tensor gu_qx, mfq_tensor_backend::Tensor gu_xscale, mfq_tensor_backend::Tensor gu_xsum,
+    mfq_tensor_backend::Tensor down_qx, mfq_tensor_backend::Tensor down_xscale, mfq_tensor_backend::Tensor down_xsum)
 {
     nint_ffn_gate_up_glu_quant_ws_cuda(
         q_packed, sub_scale, sub_min, neuron_scale, neuron_min, x,
@@ -5554,11 +5553,11 @@ void nint_ffn_gate_up_swiglu_quant_ws_cuda(
 }
 
 void nint_ffn_gate_up_geglu_quant_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
     int64_t gu_gs, int64_t gu_bits, int64_t down_gs,
-    torch::Tensor gu_qx, torch::Tensor gu_xscale, torch::Tensor gu_xsum,
-    torch::Tensor down_qx, torch::Tensor down_xscale, torch::Tensor down_xsum)
+    mfq_tensor_backend::Tensor gu_qx, mfq_tensor_backend::Tensor gu_xscale, mfq_tensor_backend::Tensor gu_xsum,
+    mfq_tensor_backend::Tensor down_qx, mfq_tensor_backend::Tensor down_xscale, mfq_tensor_backend::Tensor down_xsum)
 {
     nint_ffn_gate_up_glu_quant_ws_cuda(
         q_packed, sub_scale, sub_min, neuron_scale, neuron_min, x,
@@ -5566,47 +5565,47 @@ void nint_ffn_gate_up_geglu_quant_ws_cuda(
         down_qx, down_xscale, down_xsum, 1);
 }
 
-static torch::Tensor nint_gemv_packed_bits_glu_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t gs, int64_t bits, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum,
+static mfq_tensor_backend::Tensor nint_gemv_packed_bits_glu_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t gs, int64_t bits, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum,
     int activation)
 {
-    TORCH_CHECK(bits == 2 || bits == 3 || bits == 5 || bits == 6 || bits == 8,
+    MFQ_RUNTIME_CHECK(bits == 2 || bits == 3 || bits == 5 || bits == 6 || bits == 8,
                 "packed-bits GLU GEMV supports bits in {2,3,5,6,8}, got ", bits);
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 && sub_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
                 "sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 && sub_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min.is_contiguous(),
                 "sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous f32");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == torch::kInt8,
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == mfq_tensor_backend::kInt8,
                 "qx workspace must be cuda contiguous int8");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == mfq_tensor_backend::kFloat32,
                 "xscale workspace must be cuda contiguous f32");
-    TORCH_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == torch::kInt32,
+    MFQ_RUNTIME_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == mfq_tensor_backend::kInt32,
                 "xsum workspace must be cuda contiguous int32");
     int N2 = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((N2 & 1) == 0, "packed-bits swiglu GEMV expects concatenated [gate, up] rows");
+    MFQ_RUNTIME_CHECK((N2 & 1) == 0, "packed-bits swiglu GEMV expects concatenated [gate, up] rows");
     int N = N2 / 2;
-    TORCH_CHECK((int)q_packed.size(2) == (((int)gs * (int)bits + 7) / 8),
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) == (((int)gs * (int)bits + 7) / 8),
                 "q_packed last dim must equal ceil(gs*bits/8)");
-    TORCH_CHECK((int)sub_scale.size(0) == N2 && (int)sub_scale.size(1) == ng, "sub_scale shape mismatch");
-    TORCH_CHECK(sub_min.sizes() == sub_scale.sizes(), "sub_min shape mismatch");
-    TORCH_CHECK((int)neuron_scale.size(0) == N2 && (int)neuron_min.size(0) == N2, "neuron metadata shape mismatch");
-    TORCH_CHECK(x.dim() == 2 && x.size(0) == 1, "packed-bits swiglu GEMV fast path supports only M=1");
+    MFQ_RUNTIME_CHECK((int)sub_scale.size(0) == N2 && (int)sub_scale.size(1) == ng, "sub_scale shape mismatch");
+    MFQ_RUNTIME_CHECK(sub_min.sizes() == sub_scale.sizes(), "sub_min shape mismatch");
+    MFQ_RUNTIME_CHECK((int)neuron_scale.size(0) == N2 && (int)neuron_min.size(0) == N2, "neuron metadata shape mismatch");
+    MFQ_RUNTIME_CHECK(x.dim() == 2 && x.size(0) == 1, "packed-bits swiglu GEMV fast path supports only M=1");
     int K_real = (int)x.size(1);
     int K_pad = ng * (int)gs;
-    TORCH_CHECK((int)qx.size(0) >= 1 && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= 1 && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    auto out = torch::empty({1, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= 1 && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= 1 && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    auto out = mfq_tensor_backend::empty({1, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
 
     const char* combined_env = std::getenv("MFQ_NINT_GLU_COMBINED");
     if (combined_env == nullptr && bits == 8 && gs == 48) {
@@ -5618,7 +5617,7 @@ static torch::Tensor nint_gemv_packed_bits_glu_ws_cuda(
     do {                                                                                \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                    \
         quantize_x_kernel<GSVAL, BD><<<dim3(1, ng), BD, 0, stream>>>(                   \
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                    \
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                    \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),  \
             1, K_real, K_pad);                                                          \
         if (use_combined) {                                                             \
@@ -5627,7 +5626,7 @@ static torch::Tensor nint_gemv_packed_bits_glu_ws_cuda(
                     q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),        \
                     sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),        \
                     neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                \
-                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), \
+                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                     N, ng, K_pad, activation);                                          \
         } else {                                                                        \
             gemv_packed_bits_swiglu_pair_kernel<BITSVAL, GSVAL>                         \
@@ -5635,7 +5634,7 @@ static torch::Tensor nint_gemv_packed_bits_glu_ws_cuda(
                     q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),        \
                     sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),        \
                     neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                \
-                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), \
+                    xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                     N, ng, K_pad, activation);                                          \
         }                                                                               \
     } while (0)
@@ -5655,7 +5654,7 @@ static torch::Tensor nint_gemv_packed_bits_glu_ws_cuda(
         case 40: QPBITSSWIGLULAUNCH(BITSVAL, 40); break;                                \
         case 48: QPBITSSWIGLULAUNCH(BITSVAL, 48); break;                                \
         case 64: QPBITSSWIGLULAUNCH(BITSVAL, 64); break;                                \
-        default: TORCH_CHECK(false, "packed-bits swiglu GEMV unsupported gs ", gs);      \
+        default: MFQ_RUNTIME_CHECK(false, "packed-bits swiglu GEMV unsupported gs ", gs);      \
     }
 
     if (bits == 2) {
@@ -5674,60 +5673,60 @@ static torch::Tensor nint_gemv_packed_bits_glu_ws_cuda(
     return out;
 }
 
-torch::Tensor nint_gemv_packed_bits_swiglu_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t gs, int64_t bits, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_gemv_packed_bits_swiglu_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t gs, int64_t bits, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
     return nint_gemv_packed_bits_glu_ws_cuda(
         q_packed, sub_scale, sub_min, neuron_scale, neuron_min, x,
         gs, bits, qx, xscale, xsum, 0);
 }
 
-torch::Tensor nint_gemv_packed_bits_geglu_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t gs, int64_t bits, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_gemv_packed_bits_geglu_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t gs, int64_t bits, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
     return nint_gemv_packed_bits_glu_ws_cuda(
         q_packed, sub_scale, sub_min, neuron_scale, neuron_min, x,
         gs, bits, qx, xscale, xsum, 1);
 }
 
-torch::Tensor nint5_gs28_q5_gemv_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor neuron_scale, torch::Tensor neuron_min,
-    torch::Tensor x,
-    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint5_gs28_q5_gemv_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
+    mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(q_packed.dim() == 3 && q_packed.size(2) == 20,
+    MFQ_RUNTIME_CHECK(q_packed.dim() == 3 && q_packed.size(2) == 20,
                 "NINT5 gs28 Q5 execution tensor must have shape [N,ng,20]");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous f32");
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kHalf && x.is_contiguous() && x.dim() == 2,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kHalf && x.is_contiguous() && x.dim() == 2,
                 "x must be cuda contiguous fp16 [M,K]");
-    TORCH_CHECK(qx.is_cuda() && qx.scalar_type() == torch::kInt8 && qx.is_contiguous(),
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.scalar_type() == mfq_tensor_backend::kInt8 && qx.is_contiguous(),
                 "qx must be cuda contiguous int8");
-    TORCH_CHECK(xscale.is_cuda() && xscale.scalar_type() == torch::kFloat32 && xscale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.scalar_type() == mfq_tensor_backend::kFloat32 && xscale.is_contiguous(),
                 "xscale must be cuda contiguous f32");
-    TORCH_CHECK(xsum.is_cuda() && xsum.scalar_type() == torch::kInt32 && xsum.is_contiguous(),
+    MFQ_RUNTIME_CHECK(xsum.is_cuda() && xsum.scalar_type() == mfq_tensor_backend::kInt32 && xsum.is_contiguous(),
                 "xsum must be cuda contiguous int32");
     const int N = (int)q_packed.size(0);
     const int ng = (int)q_packed.size(1);
     const int M = (int)x.size(0);
     const int K_real = (int)x.size(1);
     const int K_pad = ng * 28;
-    TORCH_CHECK(M >= 1 && M <= 8, "Q5 execution GEMV supports M in [1,8]");
-    TORCH_CHECK(neuron_scale.numel() == N && neuron_min.numel() == N, "neuron metadata shape mismatch");
-    TORCH_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK(M >= 1 && M <= 8, "Q5 execution GEMV supports M in [1,8]");
+    MFQ_RUNTIME_CHECK(neuron_scale.numel() == N && neuron_min.numel() == N, "neuron metadata shape mismatch");
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     quantize_x_kernel<28, 32><<<dim3(M, ng), 32, 0, stream>>>(
-        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
         qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),
         M, K_real, K_pad);
 
@@ -5741,46 +5740,46 @@ torch::Tensor nint5_gs28_q5_gemv_ws_cuda(
         gemv_nint5_gs28_q5_exec_kernel<4><<<dim3((N + 3) / 4, M), dim3(32, 4), 0, stream>>>(
             q_packed.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
             xscale.data_ptr<float>(),
-            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);
+            reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);
     } else if (wpb == 16) {
         gemv_nint5_gs28_q5_exec_kernel<16><<<dim3((N + 15) / 16, M), dim3(32, 16), 0, stream>>>(
             q_packed.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
             xscale.data_ptr<float>(),
-            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);
+            reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);
     } else {
         gemv_nint5_gs28_q5_exec_kernel<8><<<dim3((N + 7) / 8, M), dim3(32, 8), 0, stream>>>(
             q_packed.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
             xscale.data_ptr<float>(),
-            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);
+            reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);
     }
     return out;
 }
 
-torch::Tensor nint5_gs28_q5_argmax_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor neuron_scale, torch::Tensor neuron_min,
-    torch::Tensor x,
-    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum,
-    torch::Tensor block_vals, torch::Tensor block_idxs)
+mfq_tensor_backend::Tensor nint5_gs28_q5_argmax_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
+    mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum,
+    mfq_tensor_backend::Tensor block_vals, mfq_tensor_backend::Tensor block_idxs)
 {
-    TORCH_CHECK(x.dim() == 2 && x.size(0) == 1, "Q5 execution argmax expects x [1,K]");
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous() &&
+    MFQ_RUNTIME_CHECK(x.dim() == 2 && x.size(0) == 1, "Q5 execution argmax expects x [1,K]");
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous() &&
                 q_packed.dim() == 3 && q_packed.size(2) == 20,
                 "q_packed must be cuda contiguous uint8 [N,ng,20]");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous f32");
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kHalf && x.is_contiguous(),
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kHalf && x.is_contiguous(),
                 "x must be cuda contiguous fp16");
     const int N = (int)q_packed.size(0);
     const int ng = (int)q_packed.size(1);
     const int K_real = (int)x.size(1);
     const int K_pad = ng * 28;
-    TORCH_CHECK((int)qx.size(0) >= 1 && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= 1 && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= 1 && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= 1 && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    cudaStream_t stream = mfq_current_cuda_stream();
     quantize_x_kernel<28, 32><<<dim3(1, ng), 32, 0, stream>>>(
-        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
         qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),
         1, K_real, K_pad);
 
@@ -5791,11 +5790,11 @@ torch::Tensor nint5_gs28_q5_argmax_ws_cuda(
         else if (wpb_env[0] == '1' && wpb_env[1] == '6') wpb = 16;
     }
     const int nb = (N + wpb - 1) / wpb;
-    TORCH_CHECK(block_vals.is_cuda() && block_vals.scalar_type() == torch::kFloat32 &&
+    MFQ_RUNTIME_CHECK(block_vals.is_cuda() && block_vals.scalar_type() == mfq_tensor_backend::kFloat32 &&
                 block_vals.is_contiguous() && block_vals.numel() >= nb, "block_vals workspace too small");
-    TORCH_CHECK(block_idxs.is_cuda() && block_idxs.scalar_type() == torch::kInt32 &&
+    MFQ_RUNTIME_CHECK(block_idxs.is_cuda() && block_idxs.scalar_type() == mfq_tensor_backend::kInt32 &&
                 block_idxs.is_contiguous() && block_idxs.numel() >= nb, "block_idxs workspace too small");
-    auto out = torch::empty({1}, torch::TensorOptions().device(x.device()).dtype(torch::kInt64));
+    auto out = mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions().device(x.device()).dtype(mfq_tensor_backend::kInt64));
     if (wpb == 4) {
         gemv_nint5_gs28_q5_exec_argmax_stage1_kernel<4><<<nb, dim3(32, 4), 0, stream>>>(
             q_packed.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
@@ -5817,51 +5816,51 @@ torch::Tensor nint5_gs28_q5_argmax_ws_cuda(
     return out;
 }
 
-torch::Tensor nint_gemv_packed_bits_argmax_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t gs, int64_t bits, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum,
-    torch::Tensor block_vals, torch::Tensor block_idxs)
+mfq_tensor_backend::Tensor nint_gemv_packed_bits_argmax_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t gs, int64_t bits, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum,
+    mfq_tensor_backend::Tensor block_vals, mfq_tensor_backend::Tensor block_idxs)
 {
     const bool nint5_gs28 = bits == 5 && gs == 28;
     const bool nint6 = bits == 6 && (gs == 24 || gs == 26);
-    TORCH_CHECK(nint5_gs28 || nint6,
+    MFQ_RUNTIME_CHECK(nint5_gs28 || nint6,
                 "argmax fast path supports NINT5 gs28 and NINT6 gs24/gs26");
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 && sub_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
                 "sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 && sub_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min.is_contiguous(),
                 "sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous f32");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(x.dim() == 2 && x.size(0) == 1, "argmax fast path expects x [1,K]");
+    MFQ_RUNTIME_CHECK(x.dim() == 2 && x.size(0) == 1, "argmax fast path expects x [1,K]");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
     int K_real = (int)x.size(1);
     int K_pad = ng * (int)gs;
-    TORCH_CHECK((int)q_packed.size(2) == ((int)gs * (int)bits + 7) / 8,
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) == ((int)gs * (int)bits + 7) / 8,
                 "argmax q_packed last dim mismatch");
-    TORCH_CHECK((int)qx.size(0) >= 1 && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= 1 && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= 1 && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= 1 && (int)xscale.size(1) >= ng, "xscale workspace too small");
 
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
     if (nint5_gs28) {
         quantize_x_kernel<28, 32><<<dim3(1, ng), 32, 0, stream>>>(
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),
             1, K_real, K_pad);
     } else if (gs == 24) {
         quantize_x_kernel<24, 32><<<dim3(1, ng), 32, 0, stream>>>(
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),
             1, K_real, K_pad);
     } else {
         quantize_x_kernel<26, 32><<<dim3(1, ng), 32, 0, stream>>>(
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),
             1, K_real, K_pad);
     }
@@ -5878,11 +5877,11 @@ torch::Tensor nint_gemv_packed_bits_argmax_ws_cuda(
         }
     }
     int nb = (N + wpb - 1) / wpb;
-    TORCH_CHECK(block_vals.is_cuda() && block_vals.is_contiguous() && block_vals.scalar_type() == torch::kFloat32 &&
+    MFQ_RUNTIME_CHECK(block_vals.is_cuda() && block_vals.is_contiguous() && block_vals.scalar_type() == mfq_tensor_backend::kFloat32 &&
                 block_vals.numel() >= nb, "block_vals workspace too small");
-    TORCH_CHECK(block_idxs.is_cuda() && block_idxs.is_contiguous() && block_idxs.scalar_type() == torch::kInt32 &&
+    MFQ_RUNTIME_CHECK(block_idxs.is_cuda() && block_idxs.is_contiguous() && block_idxs.scalar_type() == mfq_tensor_backend::kInt32 &&
                 block_idxs.numel() >= nb, "block_idxs workspace too small");
-    auto out = torch::empty({1}, torch::TensorOptions().device(x.device()).dtype(torch::kInt64));
+    auto out = mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions().device(x.device()).dtype(mfq_tensor_backend::kInt64));
     if (nint5_gs28) {
         if (wpb == 4) {
             gemv_nint5_gs28_argmax_stage1_kernel<4><<<nb, dim3(32, 4), 0, stream>>>(
@@ -5940,44 +5939,44 @@ torch::Tensor nint_gemv_packed_bits_argmax_ws_cuda(
     return out;
 }
 
-torch::Tensor nint_gemv_packed_bits_m1_out_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t gs, int64_t bits, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum,
-    torch::Tensor out)
+mfq_tensor_backend::Tensor nint_gemv_packed_bits_m1_out_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t gs, int64_t bits, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum,
+    mfq_tensor_backend::Tensor out)
 {
-    TORCH_CHECK(bits == 6 && gs == 26, "m1 out fast path supports only NINT6 gs26");
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(bits == 6 && gs == 26, "m1 out fast path supports only NINT6 gs26");
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 && sub_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
                 "sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 && sub_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min.is_contiguous(),
                 "sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous f32");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(x.dim() == 2 && x.size(0) == 1, "m1 out fast path expects x [1,K]");
+    MFQ_RUNTIME_CHECK(x.dim() == 2 && x.size(0) == 1, "m1 out fast path expects x [1,K]");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
     int K_real = (int)x.size(1);
     int K_pad = ng * 26;
-    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == torch::kHalf &&
+    MFQ_RUNTIME_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == mfq_tensor_backend::kHalf &&
                 out.dim() == 2 && out.size(0) == 1 && out.size(1) == N, "out must be [1,N] fp16");
-    TORCH_CHECK((int)q_packed.size(2) == 20, "NINT6 gs26 q_packed last dim must be 20");
-    TORCH_CHECK((int)qx.size(0) >= 1 && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= 1 && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) == 20, "NINT6 gs26 q_packed last dim must be 20");
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= 1 && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= 1 && (int)xscale.size(1) >= ng, "xscale workspace too small");
 
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
     quantize_x_kernel<26, 32><<<dim3(1, ng), 32, 0, stream>>>(
-        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
         qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),
         1, K_real, K_pad);
     gemv_nint6_gs26_batch_kernel<2><<<dim3((N + 3) / 4, 1), dim3(32, 4), 0, stream>>>(
         q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(),
         neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
-        xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), 1, N, ng, K_pad);
+        xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), 1, N, ng, K_pad);
     return out;
 }
 
@@ -6212,48 +6211,48 @@ __global__ void nint8_zero_dequant_kernel(
     }
 }
 
-torch::Tensor nint8_zero_gemv_ws_cuda(
-    torch::Tensor q,
-    torch::Tensor scale,
-    torch::Tensor x,
-    torch::Tensor qx,
-    torch::Tensor xscale)
+mfq_tensor_backend::Tensor nint8_zero_gemv_ws_cuda(
+    mfq_tensor_backend::Tensor q,
+    mfq_tensor_backend::Tensor scale,
+    mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale)
 {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         q.is_cuda() && q.is_contiguous() &&
-            q.scalar_type() == torch::kUInt8 && q.dim() == 3 &&
+            q.scalar_type() == mfq_tensor_backend::kUInt8 && q.dim() == 3 &&
             q.size(2) == 32,
         "NINT8-0 q must be contiguous CUDA uint8 [N,ng,32]");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         scale.is_cuda() && scale.is_contiguous() &&
-            scale.scalar_type() == torch::kFloat16 && scale.dim() == 2 &&
+            scale.scalar_type() == mfq_tensor_backend::kFloat16 && scale.dim() == 2 &&
             scale.size(0) == q.size(0) && scale.size(1) == q.size(1),
         "NINT8-0 scale must be contiguous CUDA f16 [N,ng]");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         x.is_cuda() && x.is_contiguous() &&
-            x.scalar_type() == torch::kFloat16 && x.dim() == 2,
+            x.scalar_type() == mfq_tensor_backend::kFloat16 && x.dim() == 2,
         "NINT8-0 x must be contiguous CUDA f16 [M,K]");
     const int M = static_cast<int>(x.size(0));
     const int N = static_cast<int>(q.size(0));
     const int ng = static_cast<int>(q.size(1));
     const int K_real = static_cast<int>(x.size(1));
     const int K_pad = ng * 32;
-    TORCH_CHECK(M >= 1 && M <= 8 && K_real <= K_pad,
+    MFQ_RUNTIME_CHECK(M >= 1 && M <= 8 && K_real <= K_pad,
         "NINT8-0 GEMV expects M in [1,8] and K <= packed K");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         qx.is_cuda() && qx.is_contiguous() &&
-            qx.scalar_type() == torch::kInt8 &&
+            qx.scalar_type() == mfq_tensor_backend::kInt8 &&
             qx.size(0) >= M && qx.size(1) >= K_pad,
         "NINT8-0 qx workspace is too small");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         xscale.is_cuda() && xscale.is_contiguous() &&
-            xscale.scalar_type() == torch::kFloat32 &&
+            xscale.scalar_type() == mfq_tensor_backend::kFloat32 &&
             xscale.size(0) >= M && xscale.size(1) >= ng,
         "NINT8-0 xscale workspace is too small");
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     quantize_x_kernel<32, 32><<<dim3(M, ng), 32, 0, stream>>>(
-        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
         qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), nullptr,
         M, K_real, K_pad);
 #define NINT80_GEMV_CASE(M_VALUE) \
@@ -6261,9 +6260,9 @@ torch::Tensor nint8_zero_gemv_ws_cuda(
         nint8_zero_gemv_batch_kernel<M_VALUE><<< \
             dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
             reinterpret_cast<const int8_t*>(q.data_ptr<uint8_t>()), \
-            reinterpret_cast<const __half*>(scale.data_ptr<at::Half>()), \
+            reinterpret_cast<const __half*>(scale.data_ptr<mfq_half>()), \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), \
-            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), \
+            reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
             M, N, ng, K_pad); \
         break
     switch (M) {
@@ -6277,52 +6276,52 @@ torch::Tensor nint8_zero_gemv_ws_cuda(
         NINT80_GEMV_CASE(8);
     }
 #undef NINT80_GEMV_CASE
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 
-torch::Tensor nint8_zero_mmq_ws_cuda(
-    torch::Tensor q,
-    torch::Tensor scale,
-    torch::Tensor x,
-    torch::Tensor qx,
-    torch::Tensor xscale)
+mfq_tensor_backend::Tensor nint8_zero_mmq_ws_cuda(
+    mfq_tensor_backend::Tensor q,
+    mfq_tensor_backend::Tensor scale,
+    mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor qx,
+    mfq_tensor_backend::Tensor xscale)
 {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         q.is_cuda() && q.is_contiguous() &&
-            q.scalar_type() == torch::kUInt8 && q.dim() == 3 &&
+            q.scalar_type() == mfq_tensor_backend::kUInt8 && q.dim() == 3 &&
             q.size(2) == 32,
         "NINT8-0 q must be contiguous CUDA uint8 [N,ng,32]");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         scale.is_cuda() && scale.is_contiguous() &&
-            scale.scalar_type() == torch::kFloat16 && scale.dim() == 2 &&
+            scale.scalar_type() == mfq_tensor_backend::kFloat16 && scale.dim() == 2 &&
             scale.size(0) == q.size(0) && scale.size(1) == q.size(1),
         "NINT8-0 scale must be contiguous CUDA f16 [N,ng]");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         x.is_cuda() && x.is_contiguous() &&
-            x.scalar_type() == torch::kFloat16 && x.dim() == 2,
+            x.scalar_type() == mfq_tensor_backend::kFloat16 && x.dim() == 2,
         "NINT8-0 x must be contiguous CUDA f16 [M,K]");
     const int M = static_cast<int>(x.size(0));
     const int N = static_cast<int>(q.size(0));
     const int ng = static_cast<int>(q.size(1));
     const int K_real = static_cast<int>(x.size(1));
     const int K_pad = ng * 32;
-    TORCH_CHECK(M >= 9 && M <= 64 && K_real <= K_pad,
+    MFQ_RUNTIME_CHECK(M >= 9 && M <= 64 && K_real <= K_pad,
         "NINT8-0 MMQ expects M in [9,64] and K <= packed K");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         qx.is_cuda() && qx.is_contiguous() &&
-            qx.scalar_type() == torch::kInt8 &&
+            qx.scalar_type() == mfq_tensor_backend::kInt8 &&
             qx.size(0) >= M && qx.size(1) >= K_pad,
         "NINT8-0 qx workspace is too small");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         xscale.is_cuda() && xscale.is_contiguous() &&
-            xscale.scalar_type() == torch::kFloat32 &&
+            xscale.scalar_type() == mfq_tensor_backend::kFloat32 &&
             xscale.size(0) >= M && xscale.size(1) >= ng,
         "NINT8-0 xscale workspace is too small");
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     quantize_x_kernel<32, 32><<<dim3(M, ng), 32, 0, stream>>>(
-        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
         qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), nullptr,
         M, K_real, K_pad);
     constexpr int tile_n = 64;
@@ -6331,98 +6330,98 @@ torch::Tensor nint8_zero_mmq_ws_cuda(
             dim3((N + tile_n - 1) / tile_n, 1),
             dim3(32, 8), 0, stream>>>(
             reinterpret_cast<const int8_t*>(q.data_ptr<uint8_t>()),
-            reinterpret_cast<const __half*>(scale.data_ptr<at::Half>()),
+            reinterpret_cast<const __half*>(scale.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-            reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+            reinterpret_cast<__half*>(out.data_ptr<mfq_half>()),
             M, N, ng, K_pad);
     } else {
         nint8_zero_mmq_kernel<32><<<
             dim3((N + tile_n - 1) / tile_n, (M + 31) / 32),
             dim3(32, 8), 0, stream>>>(
             reinterpret_cast<const int8_t*>(q.data_ptr<uint8_t>()),
-            reinterpret_cast<const __half*>(scale.data_ptr<at::Half>()),
+            reinterpret_cast<const __half*>(scale.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
-            reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+            reinterpret_cast<__half*>(out.data_ptr<mfq_half>()),
             M, N, ng, K_pad);
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 
-torch::Tensor nint8_zero_dequant_cuda(
-    torch::Tensor q,
-    torch::Tensor scale,
+mfq_tensor_backend::Tensor nint8_zero_dequant_cuda(
+    mfq_tensor_backend::Tensor q,
+    mfq_tensor_backend::Tensor scale,
     int64_t neuron_len)
 {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         q.is_cuda() && q.is_contiguous() &&
-            q.scalar_type() == torch::kUInt8 && q.dim() == 3 &&
+            q.scalar_type() == mfq_tensor_backend::kUInt8 && q.dim() == 3 &&
             q.size(2) == 32,
         "NINT8-0 q must be contiguous CUDA uint8 [N,ng,32]");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         scale.is_cuda() && scale.is_contiguous() &&
-            scale.scalar_type() == torch::kFloat16 && scale.dim() == 2 &&
+            scale.scalar_type() == mfq_tensor_backend::kFloat16 && scale.dim() == 2 &&
             scale.size(0) == q.size(0) && scale.size(1) == q.size(1),
         "NINT8-0 scale must be contiguous CUDA f16 [N,ng]");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         neuron_len > 0 && neuron_len <= q.size(1) * 32,
         "NINT8-0 neuron_len is invalid");
     const int N = static_cast<int>(q.size(0));
     const int ng = static_cast<int>(q.size(1));
-    auto out = torch::empty(
-        {N, neuron_len}, q.options().dtype(torch::kFloat16));
+    auto out = mfq_tensor_backend::empty(
+        {N, neuron_len}, q.options().dtype(mfq_tensor_backend::kFloat16));
     constexpr int threads = 256;
     const size_t total = static_cast<size_t>(N) * neuron_len;
     int blocks = static_cast<int>((total + threads - 1) / threads);
     blocks = std::min(blocks, 4096);
     nint8_zero_dequant_kernel<<<
-        blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        blocks, threads, 0, mfq_current_cuda_stream()>>>(
         reinterpret_cast<const int8_t*>(q.data_ptr<uint8_t>()),
-        reinterpret_cast<const __half*>(scale.data_ptr<at::Half>()),
-        reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(scale.data_ptr<mfq_half>()),
+        reinterpret_cast<__half*>(out.data_ptr<mfq_half>()),
         N, ng, static_cast<int>(neuron_len));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 
-torch::Tensor nint_gemv_packed_u8_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t gs, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_gemv_packed_u8_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 && sub_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
                 "sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 && sub_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min.is_contiguous(),
                 "sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous f32");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) == (int)gs, "NINT8 q_packed last dim must equal gs");
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) == (int)gs, "NINT8 q_packed last dim must equal gs");
     int M = (int)x.size(0), K_real = (int)x.size(1);
-    TORCH_CHECK(M >= 1 && M <= 8, "NINT8 GEMV supports M in [1, 8]");
+    MFQ_RUNTIME_CHECK(M >= 1 && M <= 8, "NINT8 GEMV supports M in [1, 8]");
     int K_pad = ng * (int)gs;
-    TORCH_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    TORCH_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    MFQ_RUNTIME_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
 
     if (M == 1 && gs == 48 && N <= 64) {
         quantize_x_kernel<48, 64, true><<<dim3(1, ng), 64, 0, stream>>>(
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),
             1, K_real, K_pad);
         gemv_packed_u8_m1_row_kernel<48, 1><<<N, dim3(32, 1), 0, stream>>>(           \
             q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
             sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
             neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                      \
-            xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), \
+            xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
             N, ng, K_pad);
         return out;
     }
@@ -6431,39 +6430,39 @@ torch::Tensor nint_gemv_packed_u8_ws_cuda(
     do {                                                                                \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                    \
         quantize_x_kernel<GSVAL, BD, true><<<dim3(M, ng), BD, 0, stream>>>(             \
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                    \
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                    \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),  \
             M, K_real, K_pad);                                                          \
         if (M == 1) {                                                                   \
             gemv_packed_u8_batch_kernel<GSVAL, 1><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 2) {                                                            \
             gemv_packed_u8_batch_kernel<GSVAL, 2><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 3) {                                                            \
             gemv_packed_u8_batch_kernel<GSVAL, 3><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 4) {                                                            \
             gemv_packed_u8_batch_kernel<GSVAL, 4><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 5) {                                                            \
             gemv_packed_u8_batch_kernel<GSVAL, 5><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else {                                                                        \
             gemv_packed_u8_batch_kernel<GSVAL, 8><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         }                                                                               \
     } while (0)
 
@@ -6473,44 +6472,44 @@ torch::Tensor nint_gemv_packed_u8_ws_cuda(
         case 32: QPU8LAUNCH(32); break;
         case 48: QPU8LAUNCH(48); break;
         case 64: QPU8LAUNCH(64); break;
-        default: TORCH_CHECK(false, "NINT8 GEMV unsupported gs ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "NINT8 GEMV unsupported gs ", gs);
     }
 #undef QPU8LAUNCH
     return out;
 }
 
-torch::Tensor nint_gemv_packed_u8_groupwise_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t gs, int64_t groups, torch::Tensor qx, torch::Tensor xscale,
-    torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_gemv_packed_u8_groupwise_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t gs, int64_t groups, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale,
+    mfq_tensor_backend::Tensor xsum)
 {
-    TORCH_CHECK(
-        q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 &&
+    MFQ_RUNTIME_CHECK(
+        q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 &&
             q_packed.is_contiguous(),
         "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(
-        sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 &&
+    MFQ_RUNTIME_CHECK(
+        sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 &&
             sub_scale.is_contiguous(),
         "sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(
-        sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 &&
+    MFQ_RUNTIME_CHECK(
+        sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 &&
             sub_min.is_contiguous(),
         "sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(
-        neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 &&
+    MFQ_RUNTIME_CHECK(
+        neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 &&
             neuron_scale.is_contiguous(),
         "neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(
-        neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 &&
+    MFQ_RUNTIME_CHECK(
+        neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 &&
             neuron_min.is_contiguous(),
         "neuron_min must be cuda contiguous f32");
-    TORCH_CHECK(
-        x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf &&
+    MFQ_RUNTIME_CHECK(
+        x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf &&
             x.dim() == 3,
         "groupwise input must be contiguous cuda fp16 [B, groups, K]");
-    TORCH_CHECK(gs == 48, "groupwise NINT8 GEMV currently requires gs48");
-    TORCH_CHECK(groups > 0 && x.size(1) == groups, "groupwise input group mismatch");
+    MFQ_RUNTIME_CHECK(gs == 48, "groupwise NINT8 GEMV currently requires gs48");
+    MFQ_RUNTIME_CHECK(groups > 0 && x.size(1) == groups, "groupwise input group mismatch");
 
     const int B = (int)x.size(0);
     const int input_groups = (int)x.size(1);
@@ -6519,22 +6518,22 @@ torch::Tensor nint_gemv_packed_u8_groupwise_ws_cuda(
     const int ng = (int)q_packed.size(1);
     const int K_pad = ng * (int)gs;
     const int input_rows = B * input_groups;
-    TORCH_CHECK(B > 0 && N % input_groups == 0, "groupwise output rows must divide groups");
-    TORCH_CHECK((int)q_packed.size(2) == 48, "NINT8 gs48 q_packed layout mismatch");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(B > 0 && N % input_groups == 0, "groupwise output rows must divide groups");
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) == 48, "NINT8 gs48 q_packed layout mismatch");
+    MFQ_RUNTIME_CHECK(
         (int)qx.size(0) >= input_rows && (int)qx.size(1) >= K_pad,
         "groupwise qx workspace too small");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         (int)xscale.size(0) >= input_rows && (int)xscale.size(1) >= ng,
         "groupwise xscale workspace too small");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         (int)xsum.size(0) >= input_rows && (int)xsum.size(1) >= ng,
         "groupwise xsum workspace too small");
 
-    auto out = torch::empty({B, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto out = mfq_tensor_backend::empty({B, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     quantize_x_kernel<48, 64, true><<<dim3(input_rows, ng), 64, 0, stream>>>(
-        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
         qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),
         input_rows, K_real, K_pad);
     constexpr int kWarpsPerBlock = 4;
@@ -6545,113 +6544,113 @@ torch::Tensor nint_gemv_packed_u8_groupwise_ws_cuda(
         q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),
         sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),
         neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
-        xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+        xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()),
         B, input_groups, N / input_groups, N, ng, K_pad);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 
-torch::Tensor nint_gemv_packed_bits_linear_out_norm_gate_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min,
-    torch::Tensor y, torch::Tensor z, torch::Tensor norm_weight,
+mfq_tensor_backend::Tensor nint_gemv_packed_bits_linear_out_norm_gate_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
+    mfq_tensor_backend::Tensor y, mfq_tensor_backend::Tensor z, mfq_tensor_backend::Tensor norm_weight,
     int64_t gs, int64_t bits, int64_t dv, double eps,
-    torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum, torch::Tensor rinv)
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum, mfq_tensor_backend::Tensor rinv)
 {
-    TORCH_CHECK(bits == 5 && gs == 28, "linear_out_norm_gate fast path supports only NINT5 gs28");
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(bits == 5 && gs == 28, "linear_out_norm_gate fast path supports only NINT5 gs28");
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 && sub_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
                 "sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 && sub_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min.is_contiguous(),
                 "sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous f32");
-    TORCH_CHECK(y.is_cuda() && y.scalar_type() == torch::kFloat32 && y.is_contiguous(),
+    MFQ_RUNTIME_CHECK(y.is_cuda() && y.scalar_type() == mfq_tensor_backend::kFloat32 && y.is_contiguous(),
                 "y must be cuda contiguous f32");
-    TORCH_CHECK(z.is_cuda() && z.scalar_type() == torch::kHalf && z.is_contiguous(),
+    MFQ_RUNTIME_CHECK(z.is_cuda() && z.scalar_type() == mfq_tensor_backend::kHalf && z.is_contiguous(),
                 "z must be cuda contiguous f16");
-    TORCH_CHECK(norm_weight.is_cuda() && norm_weight.scalar_type() == torch::kFloat32 && norm_weight.is_contiguous(),
+    MFQ_RUNTIME_CHECK(norm_weight.is_cuda() && norm_weight.scalar_type() == mfq_tensor_backend::kFloat32 && norm_weight.is_contiguous(),
                 "norm_weight must be cuda contiguous f32");
-    TORCH_CHECK(qx.is_cuda() && qx.scalar_type() == torch::kInt8 && qx.is_contiguous(),
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.scalar_type() == mfq_tensor_backend::kInt8 && qx.is_contiguous(),
                 "qx workspace must be cuda contiguous int8");
-    TORCH_CHECK(xscale.is_cuda() && xscale.scalar_type() == torch::kFloat32 && xscale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.scalar_type() == mfq_tensor_backend::kFloat32 && xscale.is_contiguous(),
                 "xscale workspace must be cuda contiguous f32");
-    TORCH_CHECK(xsum.is_cuda() && xsum.scalar_type() == torch::kInt32 && xsum.is_contiguous(),
+    MFQ_RUNTIME_CHECK(xsum.is_cuda() && xsum.scalar_type() == mfq_tensor_backend::kInt32 && xsum.is_contiguous(),
                 "xsum workspace must be cuda contiguous int32");
-    TORCH_CHECK(rinv.is_cuda() && rinv.scalar_type() == torch::kFloat32 && rinv.is_contiguous(),
+    MFQ_RUNTIME_CHECK(rinv.is_cuda() && rinv.scalar_type() == mfq_tensor_backend::kFloat32 && rinv.is_contiguous(),
                 "rinv workspace must be cuda contiguous f32");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
     int K_real = (int)z.numel();
     int D = (int)dv;
-    TORCH_CHECK(D > 0 && K_real % D == 0, "linear_out_norm_gate: invalid dv");
+    MFQ_RUNTIME_CHECK(D > 0 && K_real % D == 0, "linear_out_norm_gate: invalid dv");
     int H = K_real / D;
     int K_pad = ng * (int)gs;
-    TORCH_CHECK((int)y.numel() == K_real, "linear_out_norm_gate: y/z size mismatch");
-    TORCH_CHECK((int)norm_weight.numel() == D, "linear_out_norm_gate: norm weight size mismatch");
-    TORCH_CHECK((int)q_packed.size(2) == 18, "linear_out_norm_gate: q_packed last dim must be 18");
-    TORCH_CHECK((int)qx.numel() >= K_pad, "linear_out_norm_gate: qx workspace too small");
-    TORCH_CHECK((int)xscale.numel() >= ng, "linear_out_norm_gate: xscale workspace too small");
-    TORCH_CHECK((int)rinv.numel() >= H, "linear_out_norm_gate: rinv workspace too small");
+    MFQ_RUNTIME_CHECK((int)y.numel() == K_real, "linear_out_norm_gate: y/z size mismatch");
+    MFQ_RUNTIME_CHECK((int)norm_weight.numel() == D, "linear_out_norm_gate: norm weight size mismatch");
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) == 18, "linear_out_norm_gate: q_packed last dim must be 18");
+    MFQ_RUNTIME_CHECK((int)qx.numel() >= K_pad, "linear_out_norm_gate: qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.numel() >= ng, "linear_out_norm_gate: xscale workspace too small");
+    MFQ_RUNTIME_CHECK((int)rinv.numel() >= H, "linear_out_norm_gate: rinv workspace too small");
 
-    auto out = torch::empty({1, N}, z.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto out = mfq_tensor_backend::empty({1, N}, z.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     linear_out_head_rinv_kernel<<<H, 128, 0, stream>>>(
         y.data_ptr<float>(), rinv.data_ptr<float>(), H, D, (float)eps);
     linear_out_norm_gate_quant_kernel<28, 32><<<ng, 32, 0, stream>>>(
-        y.data_ptr<float>(), reinterpret_cast<const __half*>(z.data_ptr<at::Half>()),
+        y.data_ptr<float>(), reinterpret_cast<const __half*>(z.data_ptr<mfq_half>()),
         norm_weight.data_ptr<float>(), rinv.data_ptr<float>(), qx.data_ptr<int8_t>(),
         xscale.data_ptr<float>(), H, D, K_real, K_pad);
     gemv_packed_bits_group4_batch_kernel<5, 28, 1><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>(
         q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(),
         neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),
-        xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), 1, N, ng, K_pad);
+        xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), 1, N, ng, K_pad);
     (void)xsum;
     return out;
 }
 
-torch::Tensor nint_gemv_packed_bits_gate_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x, torch::Tensor gate,
-    int64_t gs, int64_t bits, int64_t mode, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_gemv_packed_bits_gate_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate,
+    int64_t gs, int64_t bits, int64_t mode, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
-    TORCH_CHECK(mode == 1 || mode == 2, "gate mode must be 1(sigmoid) or 2(silu)");
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(mode == 1 || mode == 2, "gate mode must be 1(sigmoid) or 2(silu)");
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 && sub_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
                 "sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 && sub_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min.is_contiguous(),
                 "sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous f32");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(x.sizes() == gate.sizes(), "x and gate must have the same shape");
-    TORCH_CHECK(gate.is_cuda() && gate.is_contiguous() && gate.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.sizes() == gate.sizes(), "x and gate must have the same shape");
+    MFQ_RUNTIME_CHECK(gate.is_cuda() && gate.is_contiguous() && gate.scalar_type() == mfq_tensor_backend::kHalf,
                 "gate must be cuda contiguous fp16");
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == torch::kInt8,
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == mfq_tensor_backend::kInt8,
                 "qx workspace must be cuda contiguous int8");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == mfq_tensor_backend::kFloat32,
                 "xscale workspace must be cuda contiguous f32");
-    TORCH_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == torch::kInt32,
+    MFQ_RUNTIME_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == mfq_tensor_backend::kInt32,
                 "xsum workspace must be cuda contiguous int32");
 
     int N = (int)q_packed.size(0);
     int M = (int)x.size(0), K_real = (int)x.size(1);
-    TORCH_CHECK(M >= 1 && M <= 8, "packed-bits gated GEMV supports M in [1, 8]");
+    MFQ_RUNTIME_CHECK(M >= 1 && M <= 8, "packed-bits gated GEMV supports M in [1, 8]");
     int ng = (int)q_packed.size(1);
     int K_pad = ng * (int)gs;
-    TORCH_CHECK((int)q_packed.size(2) == (((int)gs * (int)bits + 7) / 8),
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) == (((int)gs * (int)bits + 7) / 8),
                 "q_packed last dim must equal ceil(gs*bits/8)");
-    TORCH_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    TORCH_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    auto out = torch::empty({M, N}, x.options());
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    MFQ_RUNTIME_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
+    cudaStream_t stream = mfq_current_cuda_stream();
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
 
     // NINT8 uses a byte-specialized GEMV with an affine correction from xsum.
     // The generic packed-bits kernel does not implement that execution layout.
@@ -6663,20 +6662,20 @@ torch::Tensor nint_gemv_packed_bits_gate_ws_cuda(
             sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),          \
             neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                  \
             xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                   \
-            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad)
+            reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad)
 #define QPU8_GATE_LAUNCH(GSVAL)                                                   \
         do {                                                                      \
             constexpr int BD = ((GSVAL + 31) / 32) * 32;                         \
             if (mode == 1) {                                                      \
                 quantize_x_gate_kernel<GSVAL, BD, 1><<<dim3(M, ng), BD, 0, stream>>>( \
-                    reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),      \
-                    reinterpret_cast<const __half*>(gate.data_ptr<at::Half>()),   \
+                    reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),      \
+                    reinterpret_cast<const __half*>(gate.data_ptr<mfq_half>()),   \
                     qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),              \
                     xsum.data_ptr<int32_t>(), M, K_real, K_pad);                  \
             } else {                                                              \
                 quantize_x_gate_kernel<GSVAL, BD, 2><<<dim3(M, ng), BD, 0, stream>>>( \
-                    reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),      \
-                    reinterpret_cast<const __half*>(gate.data_ptr<at::Half>()),   \
+                    reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),      \
+                    reinterpret_cast<const __half*>(gate.data_ptr<mfq_half>()),   \
                     qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),              \
                     xsum.data_ptr<int32_t>(), M, K_real, K_pad);                  \
             }                                                                     \
@@ -6693,7 +6692,7 @@ torch::Tensor nint_gemv_packed_bits_gate_ws_cuda(
             case 32: QPU8_GATE_LAUNCH(32); break;
             case 48: QPU8_GATE_LAUNCH(48); break;
             case 64: QPU8_GATE_LAUNCH(64); break;
-            default: TORCH_CHECK(false, "NINT8 gated GEMV unsupported gs ", gs);
+            default: MFQ_RUNTIME_CHECK(false, "NINT8 gated GEMV unsupported gs ", gs);
         }
 #undef QPU8_GATE_LAUNCH
 #undef QPU8_GATE_GEMV
@@ -6708,14 +6707,14 @@ torch::Tensor nint_gemv_packed_bits_gate_ws_cuda(
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                    \
         if (mode == 1) {                                                                \
             quantize_x_gate_nosum_kernel<GSVAL, BD, 1><<<dim3(M, ng), BD, 0, stream>>>( \
-                reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                \
-                reinterpret_cast<const __half*>(gate.data_ptr<at::Half>()),             \
+                reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                \
+                reinterpret_cast<const __half*>(gate.data_ptr<mfq_half>()),             \
                 qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),                        \
                 M, K_real, K_pad);                                                      \
         } else {                                                                        \
             quantize_x_gate_nosum_kernel<GSVAL, BD, 2><<<dim3(M, ng), BD, 0, stream>>>( \
-                reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                \
-                reinterpret_cast<const __half*>(gate.data_ptr<at::Half>()),             \
+                reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                \
+                reinterpret_cast<const __half*>(gate.data_ptr<mfq_half>()),             \
                 qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),                        \
                 M, K_real, K_pad);                                                      \
         }                                                                               \
@@ -6735,7 +6734,7 @@ torch::Tensor nint_gemv_packed_bits_gate_ws_cuda(
         case 40: QPBITS_GATE_QUANT(40); break;
         case 48: QPBITS_GATE_QUANT(48); break;
         case 64: QPBITS_GATE_QUANT(64); break;
-        default: TORCH_CHECK(false, "packed-bits gated GEMV unsupported gs ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "packed-bits gated GEMV unsupported gs ", gs);
     }
 #undef QPBITS_GATE_QUANT
 
@@ -6746,7 +6745,7 @@ torch::Tensor nint_gemv_packed_bits_gate_ws_cuda(
             q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),                \
             sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),                \
             neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                        \
-            xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), \
+            xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
             M, N, ng, K_pad)
         if (M == 2)      { QPFASTGATE6(2, 2); }
         else if (M == 3) { QPFASTGATE6(3, 2); }
@@ -6763,37 +6762,37 @@ torch::Tensor nint_gemv_packed_bits_gate_ws_cuda(
             gemv_nint6_gs26_batch_kernel<2><<<dim3((N + 3) / 4, (M + 1) / 2), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 1) {                                                            \
             gemv_packed_bits_group4_batch_kernel<BITSVAL, GSVAL, 1><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 2) {                                                            \
             gemv_packed_bits_group4_batch_kernel<BITSVAL, GSVAL, 2><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 3) {                                                            \
             gemv_packed_bits_group4_batch_kernel<BITSVAL, GSVAL, 3><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 4) {                                                            \
             gemv_packed_bits_group4_batch_kernel<BITSVAL, GSVAL, 4><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 5) {                                                            \
             gemv_packed_bits_group4_batch_kernel<BITSVAL, GSVAL, 5><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else {                                                                        \
             gemv_packed_bits_group4_batch_kernel<BITSVAL, GSVAL, 8><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(), \
-                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         }                                                                               \
     } while (0)
 
@@ -6812,7 +6811,7 @@ torch::Tensor nint_gemv_packed_bits_gate_ws_cuda(
         case 40: QPBITS_GATE_GEMV(BITSVAL, 40); break;                                  \
         case 48: QPBITS_GATE_GEMV(BITSVAL, 48); break;                                  \
         case 64: QPBITS_GATE_GEMV(BITSVAL, 64); break;                                  \
-        default: TORCH_CHECK(false, "packed-bits gated GEMV unsupported gs ", gs);       \
+        default: MFQ_RUNTIME_CHECK(false, "packed-bits gated GEMV unsupported gs ", gs);       \
     }
 
     if (bits == 2) {
@@ -6826,70 +6825,70 @@ torch::Tensor nint_gemv_packed_bits_gate_ws_cuda(
     } else if (bits == 8) {
         QPBITS_GATE_GS_SWITCH(8);
     } else {
-        TORCH_CHECK(false, "packed-bits gated GEMV supports bits in {2,3,5,6,8}, got ", bits);
+        MFQ_RUNTIME_CHECK(false, "packed-bits gated GEMV supports bits in {2,3,5,6,8}, got ", bits);
     }
 #undef QPBITS_GATE_GS_SWITCH
 #undef QPBITS_GATE_GEMV
     return out;
 }
 
-torch::Tensor nint_gemv_packed_batch_eff_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor d_eff, torch::Tensor m_eff, torch::Tensor x,
-    int64_t gs, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_gemv_packed_batch_eff_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor d_eff, mfq_tensor_backend::Tensor m_eff, mfq_tensor_backend::Tensor x,
+    int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(d_eff.is_cuda() && d_eff.scalar_type() == torch::kHalf && d_eff.is_contiguous(),
+    MFQ_RUNTIME_CHECK(d_eff.is_cuda() && d_eff.scalar_type() == mfq_tensor_backend::kHalf && d_eff.is_contiguous(),
                 "d_eff must be cuda contiguous fp16");
-    TORCH_CHECK(m_eff.is_cuda() && m_eff.scalar_type() == torch::kHalf && m_eff.is_contiguous(),
+    MFQ_RUNTIME_CHECK(m_eff.is_cuda() && m_eff.scalar_type() == mfq_tensor_backend::kHalf && m_eff.is_contiguous(),
                 "m_eff must be cuda contiguous fp16");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == torch::kInt8,
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == mfq_tensor_backend::kInt8,
                 "qx workspace must be cuda contiguous int8");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == mfq_tensor_backend::kFloat32,
                 "xscale workspace must be cuda contiguous f32");
-    TORCH_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == torch::kInt32,
+    MFQ_RUNTIME_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == mfq_tensor_backend::kInt32,
                 "xsum workspace must be cuda contiguous int32");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
-    TORCH_CHECK((int)d_eff.size(0) == N && (int)d_eff.size(1) == ng, "d_eff shape mismatch");
-    TORCH_CHECK(m_eff.sizes() == d_eff.sizes(), "m_eff shape mismatch");
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
+    MFQ_RUNTIME_CHECK((int)d_eff.size(0) == N && (int)d_eff.size(1) == ng, "d_eff shape mismatch");
+    MFQ_RUNTIME_CHECK(m_eff.sizes() == d_eff.sizes(), "m_eff shape mismatch");
     int M = (int)x.size(0), K_real = (int)x.size(1);
-    TORCH_CHECK(M >= 1 && M <= 8, "fused-metadata batched GEMV supports M in [1, 8]");
+    MFQ_RUNTIME_CHECK(M >= 1 && M <= 8, "fused-metadata batched GEMV supports M in [1, 8]");
     int K_pad = ng * (int)gs;
-    TORCH_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
 
 #define QPBEWSLAUNCH(GSVAL)                                                              \
     do {                                                                                 \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                     \
         quantize_x_kernel<GSVAL, BD><<<dim3(M, ng), BD, 0, stream>>>(                    \
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                     \
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                     \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),   \
             M, K_real, K_pad);                                                           \
         if (M == 2) {                                                                    \
             gemv_packed_batch_eff_kernel<GSVAL, 2><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
-                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half*>(d_eff.data_ptr<at::Half>()), reinterpret_cast<const __half*>(m_eff.data_ptr<at::Half>()), \
-                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half*>(d_eff.data_ptr<mfq_half>()), reinterpret_cast<const __half*>(m_eff.data_ptr<mfq_half>()), \
+                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 3) {                                                             \
             gemv_packed_batch_eff_kernel<GSVAL, 3><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
-                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half*>(d_eff.data_ptr<at::Half>()), reinterpret_cast<const __half*>(m_eff.data_ptr<at::Half>()), \
-                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half*>(d_eff.data_ptr<mfq_half>()), reinterpret_cast<const __half*>(m_eff.data_ptr<mfq_half>()), \
+                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 4) {                                                             \
             gemv_packed_batch_eff_kernel<GSVAL, 4><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
-                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half*>(d_eff.data_ptr<at::Half>()), reinterpret_cast<const __half*>(m_eff.data_ptr<at::Half>()), \
-                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half*>(d_eff.data_ptr<mfq_half>()), reinterpret_cast<const __half*>(m_eff.data_ptr<mfq_half>()), \
+                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 5) {                                                             \
             gemv_packed_batch_eff_kernel<GSVAL, 5><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
-                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half*>(d_eff.data_ptr<at::Half>()), reinterpret_cast<const __half*>(m_eff.data_ptr<at::Half>()), \
-                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half*>(d_eff.data_ptr<mfq_half>()), reinterpret_cast<const __half*>(m_eff.data_ptr<mfq_half>()), \
+                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else {                                                                         \
             gemv_packed_batch_eff_kernel<GSVAL, 8><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
-                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half*>(d_eff.data_ptr<at::Half>()), reinterpret_cast<const __half*>(m_eff.data_ptr<at::Half>()), \
-                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half*>(d_eff.data_ptr<mfq_half>()), reinterpret_cast<const __half*>(m_eff.data_ptr<mfq_half>()), \
+                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         }                                                                                \
     } while (0)
 
@@ -6898,67 +6897,67 @@ torch::Tensor nint_gemv_packed_batch_eff_ws_cuda(
         case 24: QPBEWSLAUNCH(24); break;
         case 32: QPBEWSLAUNCH(32); break;
         case 48: QPBEWSLAUNCH(48); break;
-        default: TORCH_CHECK(false, "nint_gemv_packed_batch_eff_ws: gs must be in {16,24,32,48}, got ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "nint_gemv_packed_batch_eff_ws: gs must be in {16,24,32,48}, got ", gs);
     }
 #undef QPBEWSLAUNCH
     return out;
 }
 
-torch::Tensor nint_gemv_packed_batch_eff2_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor eff_pair, torch::Tensor x,
-    int64_t gs, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_gemv_packed_batch_eff2_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor eff_pair, mfq_tensor_backend::Tensor x,
+    int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(eff_pair.is_cuda() && eff_pair.scalar_type() == torch::kHalf && eff_pair.is_contiguous(),
+    MFQ_RUNTIME_CHECK(eff_pair.is_cuda() && eff_pair.scalar_type() == mfq_tensor_backend::kHalf && eff_pair.is_contiguous(),
                 "eff_pair must be cuda contiguous fp16");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == torch::kInt8,
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == mfq_tensor_backend::kInt8,
                 "qx workspace must be cuda contiguous int8");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == mfq_tensor_backend::kFloat32,
                 "xscale workspace must be cuda contiguous f32");
-    TORCH_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == torch::kInt32,
+    MFQ_RUNTIME_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == mfq_tensor_backend::kInt32,
                 "xsum workspace must be cuda contiguous int32");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
-    TORCH_CHECK((int)eff_pair.size(0) == N && (int)eff_pair.size(1) == ng && (int)eff_pair.size(2) == 2,
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
+    MFQ_RUNTIME_CHECK((int)eff_pair.size(0) == N && (int)eff_pair.size(1) == ng && (int)eff_pair.size(2) == 2,
                 "eff_pair shape must be [N, ng, 2]");
     int M = (int)x.size(0), K_real = (int)x.size(1);
-    TORCH_CHECK(M >= 1 && M <= 8, "half2 fused-metadata batched GEMV supports M in [1, 8]");
+    MFQ_RUNTIME_CHECK(M >= 1 && M <= 8, "half2 fused-metadata batched GEMV supports M in [1, 8]");
     int K_pad = ng * (int)gs;
-    TORCH_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
 
 #define QPBE2WSLAUNCH(GSVAL)                                                             \
     do {                                                                                 \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                     \
         quantize_x_kernel<GSVAL, BD><<<dim3(M, ng), BD, 0, stream>>>(                    \
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                     \
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                     \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),   \
             M, K_real, K_pad);                                                           \
         if (M == 2) {                                                                    \
             gemv_packed_batch_eff2_kernel<GSVAL, 2><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
-                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<at::Half>()), \
-                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<mfq_half>()), \
+                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 3) {                                                             \
             gemv_packed_batch_eff2_kernel<GSVAL, 3><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
-                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<at::Half>()), \
-                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<mfq_half>()), \
+                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 4) {                                                             \
             gemv_packed_batch_eff2_kernel<GSVAL, 4><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
-                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<at::Half>()), \
-                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<mfq_half>()), \
+                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 5) {                                                             \
             gemv_packed_batch_eff2_kernel<GSVAL, 5><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
-                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<at::Half>()), \
-                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<mfq_half>()), \
+                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else {                                                                         \
             gemv_packed_batch_eff2_kernel<GSVAL, 8><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
-                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<at::Half>()), \
-                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<mfq_half>()), \
+                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         }                                                                                \
     } while (0)
 
@@ -6967,81 +6966,81 @@ torch::Tensor nint_gemv_packed_batch_eff2_ws_cuda(
         case 24: QPBE2WSLAUNCH(24); break;
         case 32: QPBE2WSLAUNCH(32); break;
         case 48: QPBE2WSLAUNCH(48); break;
-        default: TORCH_CHECK(false, "nint_gemv_packed_batch_eff2_ws: gs must be in {16,24,32,48}, got ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "nint_gemv_packed_batch_eff2_ws: gs must be in {16,24,32,48}, got ", gs);
     }
 #undef QPBE2WSLAUNCH
     return out;
 }
 
-torch::Tensor nint_gemv_packed_batch_eff2_gate_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor eff_pair, torch::Tensor x, torch::Tensor gate,
-    int64_t gs, int64_t mode, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_gemv_packed_batch_eff2_gate_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor eff_pair, mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate,
+    int64_t gs, int64_t mode, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
-    TORCH_CHECK(mode == 1 || mode == 2, "gate mode must be 1(sigmoid) or 2(silu)");
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(mode == 1 || mode == 2, "gate mode must be 1(sigmoid) or 2(silu)");
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(eff_pair.is_cuda() && eff_pair.scalar_type() == torch::kHalf && eff_pair.is_contiguous(),
+    MFQ_RUNTIME_CHECK(eff_pair.is_cuda() && eff_pair.scalar_type() == mfq_tensor_backend::kHalf && eff_pair.is_contiguous(),
                 "eff_pair must be cuda contiguous fp16");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(gate.is_cuda() && gate.is_contiguous() && gate.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(gate.is_cuda() && gate.is_contiguous() && gate.scalar_type() == mfq_tensor_backend::kHalf,
                 "gate must be cuda contiguous fp16");
-    TORCH_CHECK(x.sizes() == gate.sizes(), "x and gate must have the same shape");
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == torch::kInt8,
+    MFQ_RUNTIME_CHECK(x.sizes() == gate.sizes(), "x and gate must have the same shape");
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == mfq_tensor_backend::kInt8,
                 "qx workspace must be cuda contiguous int8");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == mfq_tensor_backend::kFloat32,
                 "xscale workspace must be cuda contiguous f32");
-    TORCH_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == torch::kInt32,
+    MFQ_RUNTIME_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == mfq_tensor_backend::kInt32,
                 "xsum workspace must be cuda contiguous int32");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
-    TORCH_CHECK((int)eff_pair.size(0) == N && (int)eff_pair.size(1) == ng && (int)eff_pair.size(2) == 2,
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
+    MFQ_RUNTIME_CHECK((int)eff_pair.size(0) == N && (int)eff_pair.size(1) == ng && (int)eff_pair.size(2) == 2,
                 "eff_pair shape must be [N, ng, 2]");
     int M = (int)x.size(0), K_real = (int)x.size(1);
-    TORCH_CHECK(M >= 1 && M <= 8, "half2 gated batched GEMV supports M in [1, 8]");
+    MFQ_RUNTIME_CHECK(M >= 1 && M <= 8, "half2 gated batched GEMV supports M in [1, 8]");
     int K_pad = ng * (int)gs;
-    TORCH_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    TORCH_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    MFQ_RUNTIME_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
 
 #define QPBE2GATEWSLAUNCH(GSVAL)                                                       \
     do {                                                                                \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                    \
         if (mode == 1) {                                                                \
             quantize_x_gate_kernel<GSVAL, BD, 1><<<dim3(M, ng), BD, 0, stream>>>(       \
-                reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                \
-                reinterpret_cast<const __half*>(gate.data_ptr<at::Half>()),             \
+                reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                \
+                reinterpret_cast<const __half*>(gate.data_ptr<mfq_half>()),             \
                 qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), \
                 M, K_real, K_pad);                                                      \
         } else {                                                                        \
             quantize_x_gate_kernel<GSVAL, BD, 2><<<dim3(M, ng), BD, 0, stream>>>(       \
-                reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                \
-                reinterpret_cast<const __half*>(gate.data_ptr<at::Half>()),             \
+                reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                \
+                reinterpret_cast<const __half*>(gate.data_ptr<mfq_half>()),             \
                 qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), \
                 M, K_real, K_pad);                                                      \
         }                                                                               \
         if (M == 2) {                                                                   \
             gemv_packed_batch_eff2_kernel<GSVAL, 2><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
-                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<at::Half>()), \
-                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<mfq_half>()), \
+                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 3) {                                                            \
             gemv_packed_batch_eff2_kernel<GSVAL, 3><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
-                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<at::Half>()), \
-                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<mfq_half>()), \
+                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 4) {                                                            \
             gemv_packed_batch_eff2_kernel<GSVAL, 4><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
-                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<at::Half>()), \
-                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<mfq_half>()), \
+                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else if (M == 5) {                                                            \
             gemv_packed_batch_eff2_kernel<GSVAL, 5><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
-                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<at::Half>()), \
-                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<mfq_half>()), \
+                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         } else {                                                                        \
             gemv_packed_batch_eff2_kernel<GSVAL, 8><<<dim3((N + 3) / 4), dim3(32, 4), 0, stream>>>( \
-                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<at::Half>()), \
-                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad); \
+                q_packed.data_ptr<uint8_t>(), reinterpret_cast<const __half2*>(eff_pair.data_ptr<mfq_half>()), \
+                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad); \
         }                                                                               \
     } while (0)
 
@@ -7050,7 +7049,7 @@ torch::Tensor nint_gemv_packed_batch_eff2_gate_ws_cuda(
         case 24: QPBE2GATEWSLAUNCH(24); break;
         case 32: QPBE2GATEWSLAUNCH(32); break;
         case 48: QPBE2GATEWSLAUNCH(48); break;
-        default: TORCH_CHECK(false, "nint_gemv_packed_batch_eff2_gate_ws: gs must be in {16,24,32,48}, got ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "nint_gemv_packed_batch_eff2_gate_ws: gs must be in {16,24,32,48}, got ", gs);
     }
 #undef QPBE2GATEWSLAUNCH
     return out;
@@ -7708,23 +7707,23 @@ __global__ void __launch_bounds__(256) mmq_u8_kernel(
     }
 }
 
-torch::Tensor nint_mmq_cuda(
-    torch::Tensor q, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
+mfq_tensor_backend::Tensor nint_mmq_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
     int64_t gs)
 {
-    TORCH_CHECK(q.is_cuda() && q.scalar_type() == torch::kUInt8 && q.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q.is_cuda() && q.scalar_type() == mfq_tensor_backend::kUInt8 && q.is_contiguous(),
                 "q must be cuda contiguous uint8");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
     int N = (int)q.size(0), ng = (int)q.size(1);
     int M = (int)x.size(0), K_real = (int)x.size(1);
     int K_pad = ng * (int)gs;
-    auto qx = torch::empty({M, K_pad}, x.options().dtype(torch::kInt8));
-    auto xscale = torch::empty({M, ng}, x.options().dtype(torch::kFloat32));
-    auto xsum = torch::empty({M, ng}, x.options().dtype(torch::kInt32));
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto qx = mfq_tensor_backend::empty({M, K_pad}, x.options().dtype(mfq_tensor_backend::kInt8));
+    auto xscale = mfq_tensor_backend::empty({M, ng}, x.options().dtype(mfq_tensor_backend::kFloat32));
+    auto xsum = mfq_tensor_backend::empty({M, ng}, x.options().dtype(mfq_tensor_backend::kInt32));
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     constexpr int MMQ_Y = 64;
     // pick batch tile to match M (avoid wasted batch slots, like llama.cpp mmq_x dispatch)
     int mmq_x = (M <= 8) ? 8 : (M <= 16 ? 16 : 32);
@@ -7733,7 +7732,7 @@ torch::Tensor nint_mmq_cuda(
     do {                                                                                    \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                        \
         quantize_x_kernel<GSVAL, BD, true><<<dim3(M, ng), BD, 0, stream>>>(                 \
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                        \
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                        \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),      \
             M, K_real, K_pad);                                                              \
         mmq_kernel<GSVAL, GPKVAL, MMQXVAL, false, false, true><<<dim3((N + MMQ_Y - 1) / MMQ_Y, \
@@ -7742,7 +7741,7 @@ torch::Tensor nint_mmq_cuda(
             sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),                    \
             neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                            \
             xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                             \
-            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);          \
+            reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);          \
     } while (0)
 
 #define MLAUNCH_GS(GSVAL, GPKVAL)                                       \
@@ -7755,37 +7754,37 @@ torch::Tensor nint_mmq_cuda(
         case 24: MLAUNCH_GS(24, 10); break;
         case 32: MLAUNCH_GS(32, 8);  break;
         case 48: MLAUNCH_GS(48, 5);  break;
-        default: TORCH_CHECK(false, "nint_mmq: gs must be in {16,24,32,48}, got ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "nint_mmq: gs must be in {16,24,32,48}, got ", gs);
     }
 #undef MLAUNCH_GS
 #undef MLAUNCH
     return out;
 }
 
-torch::Tensor nint_mmq_packed_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t gs, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_mmq_packed_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == torch::kInt8,
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == mfq_tensor_backend::kInt8,
                 "qx workspace must be cuda contiguous int8");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == mfq_tensor_backend::kFloat32,
                 "xscale workspace must be cuda contiguous f32");
-    TORCH_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == torch::kInt32,
+    MFQ_RUNTIME_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == mfq_tensor_backend::kInt32,
                 "xsum workspace must be cuda contiguous int32");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) * 2 == gs, "q_packed last dim must equal gs/2");
     int M = (int)x.size(0), K_real = (int)x.size(1);
     int K_pad = ng * (int)gs;
-    TORCH_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    TORCH_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    MFQ_RUNTIME_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     constexpr int MMQ_Y = 64;
     int mmq_x = (M <= 8) ? 8 : (M <= 16 ? 16 : 32);
 
@@ -7793,7 +7792,7 @@ torch::Tensor nint_mmq_packed_ws_cuda(
     do {                                                                                    \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                        \
         quantize_x_kernel<GSVAL, BD, true><<<dim3(M, ng), BD, 0, stream>>>(                 \
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                        \
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                        \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),      \
             M, K_real, K_pad);                                                              \
         mmq_kernel<GSVAL, GPKVAL, MMQXVAL, true, (MMQXVAL == 32), true><<<dim3((N + MMQ_Y - 1) / MMQ_Y, \
@@ -7802,13 +7801,13 @@ torch::Tensor nint_mmq_packed_ws_cuda(
             sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),                    \
             neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                            \
             xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                             \
-            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);          \
+            reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);          \
     } while (0)
 
 #define MPWSLAUNCH_SPLIT24(MMQXVAL)                                                         \
     do {                                                                                    \
         quantize_x_kernel<24, 32, true><<<dim3(M, ng), 32, 0, stream>>>(                    \
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                        \
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                        \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),      \
             M, K_real, K_pad);                                                              \
         mmq24_packed_ws_kernel<MMQXVAL><<<                                                   \
@@ -7818,13 +7817,13 @@ torch::Tensor nint_mmq_packed_ws_cuda(
             sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),                    \
             neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                            \
             xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                             \
-            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);          \
+            reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);          \
     } while (0)
 
 #define MPWSLAUNCH_SMALL24(MMQXVAL, WARPSVAL)                                               \
     do {                                                                                    \
         quantize_x_kernel<24, 32, true><<<dim3(M, ng), 32, 0, stream>>>(                    \
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                        \
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                        \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),      \
             M, K_real, K_pad);                                                              \
         mmq24_small_packed_ws_kernel<MMQXVAL, WARPSVAL><<<                                  \
@@ -7833,7 +7832,7 @@ torch::Tensor nint_mmq_packed_ws_cuda(
             sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),                    \
             neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                            \
             xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                             \
-            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);          \
+            reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);          \
     } while (0)
 
 #define MPWSLAUNCH_GS(GSVAL, GPKVAL)                                   \
@@ -7873,7 +7872,7 @@ torch::Tensor nint_mmq_packed_ws_cuda(
         case 24: MPWSLAUNCH_GS(24, 10); break;
         case 32: MPWSLAUNCH_GS(32, 8);  break;
         case 48: MPWSLAUNCH_GS(48, 5);  break;
-        default: TORCH_CHECK(false, "nint_mmq_packed_ws: gs must be in {16,24,32,48}, got ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "nint_mmq_packed_ws: gs must be in {16,24,32,48}, got ", gs);
     }
 #undef MPWSLAUNCH_GS
 #undef MPWSLAUNCH_SMALL24
@@ -7882,33 +7881,33 @@ torch::Tensor nint_mmq_packed_ws_cuda(
     return out;
 }
 
-torch::Tensor nint_mmq_packed_u8_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t gs, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_mmq_packed_u8_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 && sub_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
                 "sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 && sub_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min.is_contiguous(),
                 "sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous f32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous f32");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
     int N = (int)q_packed.size(0), ng = (int)q_packed.size(1);
-    TORCH_CHECK((int)q_packed.size(2) == (int)gs, "NINT8 q_packed last dim must equal gs");
+    MFQ_RUNTIME_CHECK((int)q_packed.size(2) == (int)gs, "NINT8 q_packed last dim must equal gs");
     int M = (int)x.size(0), K_real = (int)x.size(1);
-    TORCH_CHECK(M >= 1 && M <= 4096, "NINT8 MMQ supports M in [1, 4096]");
+    MFQ_RUNTIME_CHECK(M >= 1 && M <= 4096, "NINT8 MMQ supports M in [1, 4096]");
     int K_pad = ng * (int)gs;
-    TORCH_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    TORCH_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    MFQ_RUNTIME_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     constexpr int MMQ_Y = 64;
     int mmq_x = (M <= 8) ? 8 : (M <= 16 ? 16 : 32);
 
@@ -7916,7 +7915,7 @@ torch::Tensor nint_mmq_packed_u8_ws_cuda(
     do {                                                                                    \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                        \
         quantize_x_kernel<GSVAL, BD, true><<<dim3(M, ng), BD, 0, stream>>>(                 \
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                        \
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                        \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),      \
             M, K_real, K_pad);                                                              \
         mmq_u8_kernel<GSVAL, GPKVAL, MMQXVAL><<<                                            \
@@ -7926,7 +7925,7 @@ torch::Tensor nint_mmq_packed_u8_ws_cuda(
             sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),                    \
             neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                            \
             xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                             \
-            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);          \
+            reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);          \
     } while (0)
 
 #define MPU8LAUNCH_GS(GSVAL, GPKVAL)                                  \
@@ -7940,44 +7939,44 @@ torch::Tensor nint_mmq_packed_u8_ws_cuda(
         case 32: MPU8LAUNCH_GS(32, 8);  break;
         case 48: MPU8LAUNCH_GS(48, 5);  break;
         case 64: MPU8LAUNCH_GS(64, 4);  break;
-        default: TORCH_CHECK(false, "NINT8 MMQ unsupported gs ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "NINT8 MMQ unsupported gs ", gs);
     }
 #undef MPU8LAUNCH_GS
 #undef MPU8LAUNCH
     return out;
 }
 
-torch::Tensor nint_mmq_packed_exec_ws_cuda(
-    torch::Tensor q_mmq_packed, torch::Tensor sub_scale_mmq, torch::Tensor sub_min_mmq,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    int64_t ng_in, int64_t gs, torch::Tensor qx, torch::Tensor xscale, torch::Tensor xsum)
+mfq_tensor_backend::Tensor nint_mmq_packed_exec_ws_cuda(
+    mfq_tensor_backend::Tensor q_mmq_packed, mfq_tensor_backend::Tensor sub_scale_mmq, mfq_tensor_backend::Tensor sub_min_mmq,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    int64_t ng_in, int64_t gs, mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum)
 {
-    TORCH_CHECK(q_mmq_packed.is_cuda() && q_mmq_packed.scalar_type() == torch::kUInt8 && q_mmq_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_mmq_packed.is_cuda() && q_mmq_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_mmq_packed.is_contiguous(),
                 "q_mmq_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale_mmq.is_cuda() && sub_scale_mmq.scalar_type() == torch::kUInt8 && sub_scale_mmq.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_scale_mmq.is_cuda() && sub_scale_mmq.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale_mmq.is_contiguous(),
                 "sub_scale_mmq must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min_mmq.is_cuda() && sub_min_mmq.scalar_type() == torch::kUInt8 && sub_min_mmq.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_min_mmq.is_cuda() && sub_min_mmq.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min_mmq.is_contiguous(),
                 "sub_min_mmq must be cuda contiguous uint8");
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kHalf,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kHalf,
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == torch::kInt8,
+    MFQ_RUNTIME_CHECK(qx.is_cuda() && qx.is_contiguous() && qx.scalar_type() == mfq_tensor_backend::kInt8,
                 "qx workspace must be cuda contiguous int8");
-    TORCH_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(xscale.is_cuda() && xscale.is_contiguous() && xscale.scalar_type() == mfq_tensor_backend::kFloat32,
                 "xscale workspace must be cuda contiguous f32");
-    TORCH_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == torch::kInt32,
+    MFQ_RUNTIME_CHECK(xsum.is_cuda() && xsum.is_contiguous() && xsum.scalar_type() == mfq_tensor_backend::kInt32,
                 "xsum workspace must be cuda contiguous int32");
-    TORCH_CHECK(q_mmq_packed.dim() == 4 && sub_scale_mmq.dim() == 4 && sub_min_mmq.dim() == 4,
+    MFQ_RUNTIME_CHECK(q_mmq_packed.dim() == 4 && sub_scale_mmq.dim() == 4 && sub_min_mmq.dim() == 4,
                 "MMQ execution weights must be rank-4");
     int N = (int)neuron_scale.size(0);
     int ng = (int)ng_in;
     int M = (int)x.size(0), K_real = (int)x.size(1);
     int K_pad = ng * (int)gs;
-    TORCH_CHECK((int)neuron_min.size(0) == N, "neuron_min size mismatch");
-    TORCH_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    TORCH_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK((int)neuron_min.size(0) == N, "neuron_min size mismatch");
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    MFQ_RUNTIME_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     constexpr int MMQ_Y = 64;
     int mmq_x = (M <= 8) ? 8 : (M <= 16 ? 16 : 32);
 
@@ -7985,19 +7984,19 @@ torch::Tensor nint_mmq_packed_exec_ws_cuda(
     do {                                                                                    \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                        \
         int nchunks = (ng + GPKVAL - 1) / GPKVAL;                                          \
-        TORCH_CHECK((int)q_mmq_packed.size(0) >= (N + MMQ_Y - 1) / MMQ_Y,                  \
+        MFQ_RUNTIME_CHECK((int)q_mmq_packed.size(0) >= (N + MMQ_Y - 1) / MMQ_Y,                  \
                     "q_mmq_packed neuron tiles too small");                                \
-        TORCH_CHECK((int)q_mmq_packed.size(1) >= nchunks && (int)q_mmq_packed.size(2) == MMQ_Y && \
+        MFQ_RUNTIME_CHECK((int)q_mmq_packed.size(1) >= nchunks && (int)q_mmq_packed.size(2) == MMQ_Y && \
                     (int)q_mmq_packed.size(3) == (GSVAL * GPKVAL) / 2,                     \
                     "q_mmq_packed shape mismatch");                                       \
-        TORCH_CHECK((int)sub_scale_mmq.size(0) >= (N + MMQ_Y - 1) / MMQ_Y &&               \
+        MFQ_RUNTIME_CHECK((int)sub_scale_mmq.size(0) >= (N + MMQ_Y - 1) / MMQ_Y &&               \
                     (int)sub_scale_mmq.size(1) >= nchunks &&                               \
                     (int)sub_scale_mmq.size(2) == MMQ_Y &&                                 \
                     (int)sub_scale_mmq.size(3) == GPKVAL,                                  \
                     "sub_scale_mmq shape mismatch");                                      \
-        TORCH_CHECK(sub_min_mmq.sizes() == sub_scale_mmq.sizes(), "sub_min_mmq shape mismatch"); \
+        MFQ_RUNTIME_CHECK(sub_min_mmq.sizes() == sub_scale_mmq.sizes(), "sub_min_mmq shape mismatch"); \
         quantize_x_kernel<GSVAL, BD, true><<<dim3(M, ng), BD, 0, stream>>>(                 \
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                        \
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                        \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),      \
             M, K_real, K_pad);                                                              \
         mmq_kernel<GSVAL, GPKVAL, MMQXVAL, true, false, true, false, true><<<               \
@@ -8007,7 +8006,7 @@ torch::Tensor nint_mmq_packed_exec_ws_cuda(
             sub_min_mmq.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),                \
             neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                            \
             xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                             \
-            reinterpret_cast<__half*>(out.data_ptr<at::Half>()), M, N, ng, K_pad);          \
+            reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);          \
     } while (0)
 
 #define MPEXECWSLAUNCH_GS(GSVAL, GPKVAL)                            \
@@ -8020,7 +8019,7 @@ torch::Tensor nint_mmq_packed_exec_ws_cuda(
         case 24: MPEXECWSLAUNCH_GS(24, 10); break;
         case 32: MPEXECWSLAUNCH_GS(32, 8);  break;
         case 48: MPEXECWSLAUNCH_GS(48, 5);  break;
-        default: TORCH_CHECK(false, "nint_mmq_packed_exec_ws: gs must be in {16,24,32,48}, got ", gs);
+        default: MFQ_RUNTIME_CHECK(false, "nint_mmq_packed_exec_ws: gs must be in {16,24,32,48}, got ", gs);
     }
 #undef MPEXECWSLAUNCH_GS
 #undef MPEXECWSLAUNCH
@@ -8327,7 +8326,7 @@ static void configure_nint6_group32_128x128()
         (int)group32_mmq_shared_bytes<24, 8, 2>();
     static std::once_flag configured;
     std::call_once(configured, [=]() {
-        TORCH_CHECK(
+        MFQ_RUNTIME_CHECK(
             cudaFuncSetAttribute(
                 mmq_mma_group32_kernel<6, 24, 8, 2, NEED_CHECK>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -8353,19 +8352,19 @@ __global__ void reduce_mma24_splitk_kernel(
     }
 }
 
-torch::Tensor nint_mmq_gs24_group32_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    torch::Tensor qx_mmq, torch::Tensor xscale, torch::Tensor xsum,
-    int64_t split_k, torch::Tensor partial)
+mfq_tensor_backend::Tensor nint_mmq_gs24_group32_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor qx_mmq, mfq_tensor_backend::Tensor xscale, mfq_tensor_backend::Tensor xsum,
+    int64_t split_k, mfq_tensor_backend::Tensor partial)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kHalf && x.is_contiguous(),
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kHalf && x.is_contiguous(),
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(qx_mmq.is_cuda() && qx_mmq.scalar_type() == torch::kInt32 && qx_mmq.is_contiguous(),
+    MFQ_RUNTIME_CHECK(qx_mmq.is_cuda() && qx_mmq.scalar_type() == mfq_tensor_backend::kInt32 && qx_mmq.is_contiguous(),
                 "qx_mmq must be cuda contiguous int32");
-    TORCH_CHECK(split_k == 1 || split_k == 2,
+    MFQ_RUNTIME_CHECK(split_k == 1 || split_k == 2,
                 "nint_mmq_gs24_group32_ws split_k must be 1 or 2");
 
     const int N = (int)q_packed.size(0);
@@ -8380,33 +8379,33 @@ torch::Tensor nint_mmq_gs24_group32_ws_cuda(
     const bool bits6 = qbytes == 18;
     const int gs = bits2 ? 16 : 24;
     const int kstride = bits2 ? 36 : 68;
-    TORCH_CHECK(q_packed.dim() == 3 &&
+    MFQ_RUNTIME_CHECK(q_packed.dim() == 3 &&
                     (bits2 || bits3 || qbytes == 12 || bits6),
                 "q_packed must contain NINT2 gs16 or NINT3/NINT4/NINT6 gs24 groups");
-    TORCH_CHECK(M >= 9, "nint_mmq_gs24_group32_ws requires M>=9");
-    TORCH_CHECK(K_real <= ng * gs, "x K exceeds packed weight K");
-    TORCH_CHECK(qx_mmq.numel() >= (int64_t)nchunks * M_pad * kstride,
+    MFQ_RUNTIME_CHECK(M >= 9, "nint_mmq_gs24_group32_ws requires M>=9");
+    MFQ_RUNTIME_CHECK(K_real <= ng * gs, "x K exceeds packed weight K");
+    MFQ_RUNTIME_CHECK(qx_mmq.numel() >= (int64_t)nchunks * M_pad * kstride,
                 "qx_mmq workspace too small");
-    TORCH_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    TORCH_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    MFQ_RUNTIME_CHECK((int)xsum.size(0) >= M && (int)xsum.size(1) >= ng, "xsum workspace too small");
     if (split_k > 1) {
-        TORCH_CHECK(partial.is_cuda() && partial.scalar_type() == torch::kFloat32 && partial.is_contiguous(),
+        MFQ_RUNTIME_CHECK(partial.is_cuda() && partial.scalar_type() == mfq_tensor_backend::kFloat32 && partial.is_contiguous(),
                     "partial must be cuda contiguous float32 for split-K");
-        TORCH_CHECK(partial.numel() >= split_k * (int64_t)M * N, "partial workspace too small");
+        MFQ_RUNTIME_CHECK(partial.numel() >= split_k * (int64_t)M * N, "partial workspace too small");
     }
 
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
     if (bits2) {
         quantize_x_gs16_pair32_layout_kernel<<<
             dim3(M, (ng + 63) / 64), dim3(32, 8), 0, stream>>>(
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
             qx_mmq.data_ptr<int32_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),
             M, K_real, ng, M_pad);
     } else {
         quantize_x_group32_layout_kernel<24><<<
             dim3(M, (ng + 31) / 32), dim3(32, 8), 0, stream>>>(
-            reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),
             qx_mmq.data_ptr<int32_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),
             M, K_real, ng, M_pad);
     }
@@ -8422,7 +8421,7 @@ torch::Tensor nint_mmq_gs24_group32_ws_cuda(
         sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),                   \
         neuron_min.data_ptr<float>(), qx_mmq.data_ptr<int32_t>(),                      \
         xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                            \
-        reinterpret_cast<__half*>(out.data_ptr<at::Half>()), partial_ptr,              \
+        reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), partial_ptr,              \
         M, N, ng, M_pad)
 
 #define GROUP32_MMQ24_LAUNCH(BITSVAL, GSVAL, MTILESVAL, CHECKVAL)                      \
@@ -8472,7 +8471,7 @@ torch::Tensor nint_mmq_gs24_group32_ws_cuda(
         constexpr int block = 256;
         const int grid = std::min((total + block - 1) / block, 65535);
         reduce_mma24_splitk_kernel<<<grid, block, 0, stream>>>(
-            partial_ptr, reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+            partial_ptr, reinterpret_cast<__half*>(out.data_ptr<mfq_half>()),
             (int)split_k, total);
     }
     return out;
@@ -8718,21 +8717,21 @@ __global__ void __launch_bounds__(256) mmq_f16_packed_kernel(
     }
 }
 
-torch::Tensor nint_mmq_gs24_f16_nint3_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x)
+mfq_tensor_backend::Tensor nint_mmq_gs24_f16_nint3_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 && sub_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
                 "sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 && sub_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min.is_contiguous(),
                 "sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous float32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous float32");
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kHalf && x.is_contiguous(),
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kHalf && x.is_contiguous(),
                 "x must be cuda contiguous fp16");
     const int N = (int)q_packed.size(0);
     const int ng = (int)q_packed.size(1);
@@ -8742,16 +8741,16 @@ torch::Tensor nint_mmq_gs24_f16_nint3_cuda(
     const bool bits2 = qbytes == 4;
     const bool bits3 = qbytes == 9;
     const int gs = bits2 ? 16 : 24;
-    TORCH_CHECK(bits2 || bits3,
+    MFQ_RUNTIME_CHECK(bits2 || bits3,
                 "f16 packed MMQ requires NINT2 gs16 or NINT3 gs24");
-    TORCH_CHECK(M >= 9, "f16 packed MMQ requires M>=9");
-    TORCH_CHECK(K_real <= ng * gs, "x K exceeds packed weight K");
-    TORCH_CHECK(sub_scale.sizes() == q_packed.sizes().slice(0, 2), "sub_scale shape mismatch");
-    TORCH_CHECK(sub_min.sizes() == q_packed.sizes().slice(0, 2), "sub_min shape mismatch");
-    TORCH_CHECK(neuron_scale.numel() == N && neuron_min.numel() == N, "neuron metadata shape mismatch");
+    MFQ_RUNTIME_CHECK(M >= 9, "f16 packed MMQ requires M>=9");
+    MFQ_RUNTIME_CHECK(K_real <= ng * gs, "x K exceeds packed weight K");
+    MFQ_RUNTIME_CHECK(sub_scale.sizes() == q_packed.sizes().slice(0, 2), "sub_scale shape mismatch");
+    MFQ_RUNTIME_CHECK(sub_min.sizes() == q_packed.sizes().slice(0, 2), "sub_min shape mismatch");
+    MFQ_RUNTIME_CHECK(neuron_scale.numel() == N && neuron_min.numel() == N, "neuron metadata shape mismatch");
 
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
 
 #define F16_MMQ_NINT23_LAUNCH(BITSVAL, GSVAL, MTILESVAL)                                 \
     mmq_f16_packed_kernel<BITSVAL, GSVAL, MTILESVAL, false><<<                           \
@@ -8760,8 +8759,8 @@ torch::Tensor nint_mmq_gs24_f16_nint3_cuda(
         q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),                     \
         sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),                     \
         neuron_min.data_ptr<float>(),                                                     \
-        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                         \
-        reinterpret_cast<__half*>(out.data_ptr<at::Half>()), nullptr, M, N, ng, K_real)
+        reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                         \
+        reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), nullptr, M, N, ng, K_real)
 
     if (bits2) {
         if (M <= 16) F16_MMQ_NINT23_LAUNCH(2, 16, 1);
@@ -8778,36 +8777,36 @@ torch::Tensor nint_mmq_gs24_f16_nint3_cuda(
     return out;
 }
 
-torch::Tensor nint_mmq_gs24_f16_nint4_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x)
+mfq_tensor_backend::Tensor nint_mmq_gs24_f16_nint4_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 && sub_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
                 "sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 && sub_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min.is_contiguous(),
                 "sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous float32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous float32");
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kHalf && x.is_contiguous(),
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kHalf && x.is_contiguous(),
                 "x must be cuda contiguous fp16");
     int N = (int)q_packed.size(0);
     int ng = (int)q_packed.size(1);
     int M = (int)x.size(0);
     int K_real = (int)x.size(1);
-    TORCH_CHECK(q_packed.dim() == 3 && (int)q_packed.size(2) == 12,
+    MFQ_RUNTIME_CHECK(q_packed.dim() == 3 && (int)q_packed.size(2) == 12,
                 "nint_mmq_gs24_f16_nint4 requires packed NINT4 gs24");
-    TORCH_CHECK(M >= 16 && M <= 32, "nint_mmq_gs24_f16_nint4 supports M=16..32");
-    TORCH_CHECK(K_real <= ng * 24, "x K exceeds packed weight K");
-    TORCH_CHECK(sub_scale.sizes() == q_packed.sizes().slice(0, 2), "sub_scale shape mismatch");
-    TORCH_CHECK(sub_min.sizes() == q_packed.sizes().slice(0, 2), "sub_min shape mismatch");
-    TORCH_CHECK(neuron_scale.numel() == N && neuron_min.numel() == N, "neuron metadata shape mismatch");
+    MFQ_RUNTIME_CHECK(M >= 16 && M <= 32, "nint_mmq_gs24_f16_nint4 supports M=16..32");
+    MFQ_RUNTIME_CHECK(K_real <= ng * 24, "x K exceeds packed weight K");
+    MFQ_RUNTIME_CHECK(sub_scale.sizes() == q_packed.sizes().slice(0, 2), "sub_scale shape mismatch");
+    MFQ_RUNTIME_CHECK(sub_min.sizes() == q_packed.sizes().slice(0, 2), "sub_min shape mismatch");
+    MFQ_RUNTIME_CHECK(neuron_scale.numel() == N && neuron_min.numel() == N, "neuron metadata shape mismatch");
 
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
 
 #define F16_MMQ24_NINT4_LAUNCH(MTILESVAL)                                                 \
     mmq_f16_packed_kernel<4, 24, MTILESVAL, false><<<                                   \
@@ -8816,8 +8815,8 @@ torch::Tensor nint_mmq_gs24_f16_nint4_cuda(
         q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),                    \
         sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),                    \
         neuron_min.data_ptr<float>(),                                                    \
-        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),                        \
-        reinterpret_cast<__half*>(out.data_ptr<at::Half>()), nullptr, M, N, ng, K_real)
+        reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                        \
+        reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), nullptr, M, N, ng, K_real)
 
     if (M == 16) F16_MMQ24_NINT4_LAUNCH(1);
     else F16_MMQ24_NINT4_LAUNCH(2);
@@ -8836,40 +8835,40 @@ __global__ void reduce_f16_mmq_split4_kernel(
     }
 }
 
-torch::Tensor nint_mmq_gs24_f16_nint6_split4_ws_cuda(
-    torch::Tensor q_packed, torch::Tensor sub_scale, torch::Tensor sub_min,
-    torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x,
-    torch::Tensor partial)
+mfq_tensor_backend::Tensor nint_mmq_gs24_f16_nint6_split4_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min, mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor partial)
 {
-    TORCH_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == torch::kUInt8 && q_packed.is_contiguous(),
+    MFQ_RUNTIME_CHECK(q_packed.is_cuda() && q_packed.scalar_type() == mfq_tensor_backend::kUInt8 && q_packed.is_contiguous(),
                 "q_packed must be cuda contiguous uint8");
-    TORCH_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == torch::kUInt8 && sub_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_scale.is_cuda() && sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 && sub_scale.is_contiguous(),
                 "sub_scale must be cuda contiguous uint8");
-    TORCH_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == torch::kUInt8 && sub_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(sub_min.is_cuda() && sub_min.scalar_type() == mfq_tensor_backend::kUInt8 && sub_min.is_contiguous(),
                 "sub_min must be cuda contiguous uint8");
-    TORCH_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == torch::kFloat32 && neuron_scale.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_scale.is_cuda() && neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_scale.is_contiguous(),
                 "neuron_scale must be cuda contiguous float32");
-    TORCH_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == torch::kFloat32 && neuron_min.is_contiguous(),
+    MFQ_RUNTIME_CHECK(neuron_min.is_cuda() && neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 && neuron_min.is_contiguous(),
                 "neuron_min must be cuda contiguous float32");
-    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kHalf && x.is_contiguous(),
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kHalf && x.is_contiguous(),
                 "x must be cuda contiguous fp16");
-    TORCH_CHECK(partial.is_cuda() && partial.scalar_type() == torch::kFloat32 && partial.is_contiguous(),
+    MFQ_RUNTIME_CHECK(partial.is_cuda() && partial.scalar_type() == mfq_tensor_backend::kFloat32 && partial.is_contiguous(),
                 "partial workspace must be cuda contiguous float32");
     int N = (int)q_packed.size(0);
     int ng = (int)q_packed.size(1);
     int M = (int)x.size(0);
     int K_real = (int)x.size(1);
-    TORCH_CHECK(q_packed.dim() == 3 && (int)q_packed.size(2) == 18,
+    MFQ_RUNTIME_CHECK(q_packed.dim() == 3 && (int)q_packed.size(2) == 18,
                 "nint_mmq_gs24_f16_nint6_split4 requires packed NINT6 gs24");
-    TORCH_CHECK(M >= 16 && M <= 32, "nint_mmq_gs24_f16_nint6_split4 supports M=16..32");
-    TORCH_CHECK(K_real <= ng * 24, "x K exceeds packed weight K");
-    TORCH_CHECK(sub_scale.sizes() == q_packed.sizes().slice(0, 2), "sub_scale shape mismatch");
-    TORCH_CHECK(sub_min.sizes() == q_packed.sizes().slice(0, 2), "sub_min shape mismatch");
-    TORCH_CHECK(neuron_scale.numel() == N && neuron_min.numel() == N, "neuron metadata shape mismatch");
-    TORCH_CHECK(partial.numel() >= 4LL * M * N, "partial workspace too small");
+    MFQ_RUNTIME_CHECK(M >= 16 && M <= 32, "nint_mmq_gs24_f16_nint6_split4 supports M=16..32");
+    MFQ_RUNTIME_CHECK(K_real <= ng * 24, "x K exceeds packed weight K");
+    MFQ_RUNTIME_CHECK(sub_scale.sizes() == q_packed.sizes().slice(0, 2), "sub_scale shape mismatch");
+    MFQ_RUNTIME_CHECK(sub_min.sizes() == q_packed.sizes().slice(0, 2), "sub_min shape mismatch");
+    MFQ_RUNTIME_CHECK(neuron_scale.numel() == N && neuron_min.numel() == N, "neuron metadata shape mismatch");
+    MFQ_RUNTIME_CHECK(partial.numel() >= 4LL * M * N, "partial workspace too small");
 
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
 
 #define F16_MMQ24_SPLIT_LAUNCH(MTILESVAL)                                                 \
     mmq_f16_packed_kernel<6, 24, MTILESVAL, true><<<                                    \
@@ -8878,7 +8877,7 @@ torch::Tensor nint_mmq_gs24_f16_nint6_split4_ws_cuda(
         q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),                     \
         sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),                     \
         neuron_min.data_ptr<float>(),                                                     \
-        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()), nullptr,                \
+        reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()), nullptr,                \
         partial.data_ptr<float>(), M, N, ng, K_real)
 
     if (M <= 16) F16_MMQ24_SPLIT_LAUNCH(1);
@@ -8889,80 +8888,80 @@ torch::Tensor nint_mmq_gs24_f16_nint6_split4_ws_cuda(
     int block = 256;
     int grid = std::min((total + block - 1) / block, 65535);
     reduce_f16_mmq_split4_kernel<<<grid, block, 0, stream>>>(
-        partial.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()), total);
+        partial.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), total);
     return out;
 }
 
-torch::Tensor nint_mmq_f16_packed_cuda(
-    torch::Tensor q_packed,
-    torch::Tensor sub_scale,
-    torch::Tensor sub_min,
-    torch::Tensor neuron_scale,
-    torch::Tensor neuron_min,
-    torch::Tensor x,
+mfq_tensor_backend::Tensor nint_mmq_f16_packed_cuda(
+    mfq_tensor_backend::Tensor q_packed,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor neuron_min,
+    mfq_tensor_backend::Tensor x,
     int64_t gs,
     int64_t bits)
 {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         q_packed.is_cuda() &&
-        q_packed.scalar_type() == torch::kUInt8 &&
+        q_packed.scalar_type() == mfq_tensor_backend::kUInt8 &&
         q_packed.is_contiguous() && q_packed.dim() == 3,
         "common FP16 packed MMQ q_packed must be CUDA contiguous uint8 rank-3");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         sub_scale.is_cuda() &&
-        sub_scale.scalar_type() == torch::kUInt8 &&
+        sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 &&
         sub_scale.is_contiguous(),
         "common FP16 packed MMQ sub_scale must be CUDA contiguous uint8");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         sub_min.is_cuda() &&
-        sub_min.scalar_type() == torch::kUInt8 &&
+        sub_min.scalar_type() == mfq_tensor_backend::kUInt8 &&
         sub_min.is_contiguous(),
         "common FP16 packed MMQ sub_min must be CUDA contiguous uint8");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         neuron_scale.is_cuda() &&
-        neuron_scale.scalar_type() == torch::kFloat32 &&
+        neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 &&
         neuron_scale.is_contiguous(),
         "common FP16 packed MMQ neuron_scale must be CUDA contiguous float32");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         neuron_min.is_cuda() &&
-        neuron_min.scalar_type() == torch::kFloat32 &&
+        neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 &&
         neuron_min.is_contiguous(),
         "common FP16 packed MMQ neuron_min must be CUDA contiguous float32");
-    TORCH_CHECK(
-        x.is_cuda() && x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(
+        x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
         x.is_contiguous() && x.dim() == 2,
         "common FP16 packed MMQ x must be CUDA contiguous fp16 rank-2");
     const int N = (int)q_packed.size(0);
     const int ng = (int)q_packed.size(1);
     const int M = (int)x.size(0);
     const int K_real = (int)x.size(1);
-    TORCH_CHECK(M >= 16, "common FP16 packed MMQ requires M >= 16");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(M >= 16, "common FP16 packed MMQ requires M >= 16");
+    MFQ_RUNTIME_CHECK(
         bits == 2 || bits == 3 || bits == 4 ||
         bits == 5 || bits == 6 || bits == 8,
         "common FP16 packed MMQ unsupported NINT bits");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         (bits == 2 && gs == 16) ||
         ((bits == 3 || bits == 4 || bits == 6) && gs == 24) ||
         (bits == 5 && gs == 28) ||
         (bits == 8 && (gs == 24 || gs == 48)),
         "common FP16 packed MMQ unsupported NINT profile");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         q_packed.size(2) == (gs * bits + 7) / 8,
         "common FP16 packed MMQ q_packed width mismatch");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         sub_scale.sizes() == q_packed.sizes().slice(0, 2) &&
         sub_min.sizes() == q_packed.sizes().slice(0, 2),
         "common FP16 packed MMQ group metadata shape mismatch");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         neuron_scale.numel() == N && neuron_min.numel() == N,
         "common FP16 packed MMQ neuron metadata shape mismatch");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         K_real <= ng * gs,
         "common FP16 packed MMQ activation width exceeds packed weights");
 
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
 
 #define COMMON_F16_MMQ_LAUNCH(BITS_VALUE, GS_VALUE, GPC_VALUE, MTILES_VALUE) \
     mmq_f16_packed_kernel<                                                    \
@@ -8973,8 +8972,8 @@ torch::Tensor nint_mmq_f16_packed_cuda(
         q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),          \
         sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),          \
         neuron_min.data_ptr<float>(),                                         \
-        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),              \
-        reinterpret_cast<__half*>(out.data_ptr<at::Half>()), nullptr,         \
+        reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),              \
+        reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), nullptr,         \
         M, N, ng, K_real)
 
 #define COMMON_F16_MMQ_DISPATCH(BITS_VALUE, GS_VALUE, GPC_VALUE)       \
@@ -9014,83 +9013,83 @@ torch::Tensor nint_mmq_f16_packed_cuda(
 #undef COMMON_F16_MMQ_DISPATCH
 #undef COMMON_F16_MMQ_LAUNCH
 
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         cudaGetLastError() == cudaSuccess,
         "common FP16 packed MMQ kernel launch failed");
     return out;
 }
 
-torch::Tensor nint_mmq_f32_packed_cuda(
-    torch::Tensor q_packed,
-    torch::Tensor sub_scale,
-    torch::Tensor sub_min,
-    torch::Tensor neuron_scale,
-    torch::Tensor neuron_min,
-    torch::Tensor x,
+mfq_tensor_backend::Tensor nint_mmq_f32_packed_cuda(
+    mfq_tensor_backend::Tensor q_packed,
+    mfq_tensor_backend::Tensor sub_scale,
+    mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale,
+    mfq_tensor_backend::Tensor neuron_min,
+    mfq_tensor_backend::Tensor x,
     int64_t gs,
     int64_t bits)
 {
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         q_packed.is_cuda() &&
-        q_packed.scalar_type() == torch::kUInt8 &&
+        q_packed.scalar_type() == mfq_tensor_backend::kUInt8 &&
         q_packed.is_contiguous() && q_packed.dim() == 3,
         "common FP32-output packed MMQ q_packed must be CUDA contiguous uint8 rank-3");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         sub_scale.is_cuda() &&
-        sub_scale.scalar_type() == torch::kUInt8 &&
+        sub_scale.scalar_type() == mfq_tensor_backend::kUInt8 &&
         sub_scale.is_contiguous(),
         "common FP32-output packed MMQ sub_scale must be CUDA contiguous uint8");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         sub_min.is_cuda() &&
-        sub_min.scalar_type() == torch::kUInt8 &&
+        sub_min.scalar_type() == mfq_tensor_backend::kUInt8 &&
         sub_min.is_contiguous(),
         "common FP32-output packed MMQ sub_min must be CUDA contiguous uint8");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         neuron_scale.is_cuda() &&
-        neuron_scale.scalar_type() == torch::kFloat32 &&
+        neuron_scale.scalar_type() == mfq_tensor_backend::kFloat32 &&
         neuron_scale.is_contiguous(),
         "common FP32-output packed MMQ neuron_scale must be CUDA contiguous float32");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         neuron_min.is_cuda() &&
-        neuron_min.scalar_type() == torch::kFloat32 &&
+        neuron_min.scalar_type() == mfq_tensor_backend::kFloat32 &&
         neuron_min.is_contiguous(),
         "common FP32-output packed MMQ neuron_min must be CUDA contiguous float32");
-    TORCH_CHECK(
-        x.is_cuda() && x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(
+        x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
         x.is_contiguous() && x.dim() == 2,
         "common FP32-output packed MMQ x must be CUDA contiguous fp16 rank-2");
     const int N = (int)q_packed.size(0);
     const int ng = (int)q_packed.size(1);
     const int M = (int)x.size(0);
     const int K_real = (int)x.size(1);
-    TORCH_CHECK(M >= 16, "common FP32-output packed MMQ requires M >= 16");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(M >= 16, "common FP32-output packed MMQ requires M >= 16");
+    MFQ_RUNTIME_CHECK(
         bits == 2 || bits == 3 || bits == 4 ||
         bits == 5 || bits == 6 || bits == 8,
         "common FP32-output packed MMQ unsupported NINT bits");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         (bits == 2 && gs == 16) ||
         ((bits == 3 || bits == 4 || bits == 6) && gs == 24) ||
         (bits == 5 && gs == 28) ||
         (bits == 8 && (gs == 24 || gs == 48)),
         "common FP32-output packed MMQ unsupported NINT profile");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         q_packed.size(2) == (gs * bits + 7) / 8,
         "common FP32-output packed MMQ q_packed width mismatch");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         sub_scale.sizes() == q_packed.sizes().slice(0, 2) &&
         sub_min.sizes() == q_packed.sizes().slice(0, 2),
         "common FP32-output packed MMQ group metadata shape mismatch");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         neuron_scale.numel() == N && neuron_min.numel() == N,
         "common FP32-output packed MMQ neuron metadata shape mismatch");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         K_real <= ng * gs,
         "common FP32-output packed MMQ activation width exceeds packed weights");
 
-    auto out = torch::empty(
-        {M, N}, x.options().dtype(torch::kFloat32));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto out = mfq_tensor_backend::empty(
+        {M, N}, x.options().dtype(mfq_tensor_backend::kFloat32));
+    cudaStream_t stream = mfq_current_cuda_stream();
 
 #define COMMON_F32_MMQ_LAUNCH(BITS_VALUE, GS_VALUE, GPC_VALUE, MTILES_VALUE) \
     mmq_f16_packed_kernel<                                                    \
@@ -9101,7 +9100,7 @@ torch::Tensor nint_mmq_f32_packed_cuda(
         q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),          \
         sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),          \
         neuron_min.data_ptr<float>(),                                         \
-        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),              \
+        reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),              \
         nullptr, out.data_ptr<float>(), M, N, ng, K_real)
 
 #define COMMON_F32_MMQ_DISPATCH(BITS_VALUE, GS_VALUE, GPC_VALUE)       \
@@ -9141,7 +9140,7 @@ torch::Tensor nint_mmq_f32_packed_cuda(
 #undef COMMON_F32_MMQ_DISPATCH
 #undef COMMON_F32_MMQ_LAUNCH
 
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         cudaGetLastError() == cudaSuccess,
         "common FP32-output packed MMQ kernel launch failed");
     return out;
@@ -9306,44 +9305,44 @@ __global__ void __launch_bounds__(256) nint8_zero_mmq_f16_packed_kernel(
     }
 }
 
-torch::Tensor nint8_zero_mmq_f16_packed_cuda(
-    torch::Tensor q,
-    torch::Tensor scale,
-    torch::Tensor x,
+mfq_tensor_backend::Tensor nint8_zero_mmq_f16_packed_cuda(
+    mfq_tensor_backend::Tensor q,
+    mfq_tensor_backend::Tensor scale,
+    mfq_tensor_backend::Tensor x,
     int64_t neuron_len)
 {
-    TORCH_CHECK(
-        q.is_cuda() && q.scalar_type() == torch::kUInt8 &&
+    MFQ_RUNTIME_CHECK(
+        q.is_cuda() && q.scalar_type() == mfq_tensor_backend::kUInt8 &&
         q.is_contiguous() && q.dim() == 3 && q.size(2) == 32,
         "NINT8-0 common FP16 MMQ q must be CUDA contiguous uint8 [N,G,32]");
-    TORCH_CHECK(
-        scale.is_cuda() && scale.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(
+        scale.is_cuda() && scale.scalar_type() == mfq_tensor_backend::kFloat16 &&
         scale.is_contiguous() && scale.sizes() == q.sizes().slice(0, 2),
         "NINT8-0 common FP16 MMQ scale shape mismatch");
-    TORCH_CHECK(
-        x.is_cuda() && x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(
+        x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
         x.is_contiguous() && x.dim() == 2,
         "NINT8-0 common FP16 MMQ x must be CUDA contiguous fp16 rank-2");
     const int M = (int)x.size(0);
     const int K = (int)neuron_len;
     const int N = (int)q.size(0);
     const int groups = (int)q.size(1);
-    TORCH_CHECK(M >= 16, "NINT8-0 common FP16 MMQ requires M >= 16");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(M >= 16, "NINT8-0 common FP16 MMQ requires M >= 16");
+    MFQ_RUNTIME_CHECK(
         K > 0 && K <= groups * 32 && x.size(1) == K,
         "NINT8-0 common FP16 MMQ neuron_len mismatch");
 
-    auto out = torch::empty({M, N}, x.options());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
+    cudaStream_t stream = mfq_current_cuda_stream();
 #define NINT8_ZERO_F16_MMQ_LAUNCH(MTILES_VALUE)                        \
     nint8_zero_mmq_f16_packed_kernel<MTILES_VALUE, false><<<           \
         dim3((N + 63) / 64,                                            \
              (M + 16 * MTILES_VALUE - 1) / (16 * MTILES_VALUE)),      \
         dim3(32, 8), 0, stream>>>(                                     \
         q.data_ptr<uint8_t>(),                                         \
-        reinterpret_cast<const __half*>(scale.data_ptr<at::Half>()),   \
-        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),       \
-        reinterpret_cast<__half*>(out.data_ptr<at::Half>()), nullptr,  \
+        reinterpret_cast<const __half*>(scale.data_ptr<mfq_half>()),   \
+        reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),       \
+        reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), nullptr,  \
         M, N, groups, K)
     if (M <= 16) {
         NINT8_ZERO_F16_MMQ_LAUNCH(1);
@@ -9355,50 +9354,50 @@ torch::Tensor nint8_zero_mmq_f16_packed_cuda(
         NINT8_ZERO_F16_MMQ_LAUNCH(8);
     }
 #undef NINT8_ZERO_F16_MMQ_LAUNCH
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         cudaGetLastError() == cudaSuccess,
         "NINT8-0 common FP16 MMQ kernel launch failed");
     return out;
 }
 
-torch::Tensor nint8_zero_mmq_f32_packed_cuda(
-    torch::Tensor q,
-    torch::Tensor scale,
-    torch::Tensor x,
+mfq_tensor_backend::Tensor nint8_zero_mmq_f32_packed_cuda(
+    mfq_tensor_backend::Tensor q,
+    mfq_tensor_backend::Tensor scale,
+    mfq_tensor_backend::Tensor x,
     int64_t neuron_len)
 {
-    TORCH_CHECK(
-        q.is_cuda() && q.scalar_type() == torch::kUInt8 &&
+    MFQ_RUNTIME_CHECK(
+        q.is_cuda() && q.scalar_type() == mfq_tensor_backend::kUInt8 &&
         q.is_contiguous() && q.dim() == 3 && q.size(2) == 32,
         "NINT8-0 common FP32-output MMQ q must be CUDA contiguous uint8 [N,G,32]");
-    TORCH_CHECK(
-        scale.is_cuda() && scale.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(
+        scale.is_cuda() && scale.scalar_type() == mfq_tensor_backend::kFloat16 &&
         scale.is_contiguous() && scale.sizes() == q.sizes().slice(0, 2),
         "NINT8-0 common FP32-output MMQ scale shape mismatch");
-    TORCH_CHECK(
-        x.is_cuda() && x.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(
+        x.is_cuda() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
         x.is_contiguous() && x.dim() == 2,
         "NINT8-0 common FP32-output MMQ x must be CUDA contiguous fp16 rank-2");
     const int M = (int)x.size(0);
     const int K = (int)neuron_len;
     const int N = (int)q.size(0);
     const int groups = (int)q.size(1);
-    TORCH_CHECK(M >= 16, "NINT8-0 common FP32-output MMQ requires M >= 16");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(M >= 16, "NINT8-0 common FP32-output MMQ requires M >= 16");
+    MFQ_RUNTIME_CHECK(
         K > 0 && K <= groups * 32 && x.size(1) == K,
         "NINT8-0 common FP32-output MMQ neuron_len mismatch");
 
-    auto out = torch::empty(
-        {M, N}, x.options().dtype(torch::kFloat32));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto out = mfq_tensor_backend::empty(
+        {M, N}, x.options().dtype(mfq_tensor_backend::kFloat32));
+    cudaStream_t stream = mfq_current_cuda_stream();
 #define NINT8_ZERO_F32_MMQ_LAUNCH(MTILES_VALUE)                        \
     nint8_zero_mmq_f16_packed_kernel<MTILES_VALUE, true><<<            \
         dim3((N + 63) / 64,                                            \
              (M + 16 * MTILES_VALUE - 1) / (16 * MTILES_VALUE)),      \
         dim3(32, 8), 0, stream>>>(                                     \
         q.data_ptr<uint8_t>(),                                         \
-        reinterpret_cast<const __half*>(scale.data_ptr<at::Half>()),   \
-        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),       \
+        reinterpret_cast<const __half*>(scale.data_ptr<mfq_half>()),   \
+        reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),       \
         nullptr, out.data_ptr<float>(), M, N, groups, K)
     if (M <= 16) {
         NINT8_ZERO_F32_MMQ_LAUNCH(1);
@@ -9410,7 +9409,7 @@ torch::Tensor nint8_zero_mmq_f32_packed_cuda(
         NINT8_ZERO_F32_MMQ_LAUNCH(8);
     }
 #undef NINT8_ZERO_F32_MMQ_LAUNCH
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         cudaGetLastError() == cudaSuccess,
         "NINT8-0 common FP32-output MMQ kernel launch failed");
     return out;

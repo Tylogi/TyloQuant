@@ -1,6 +1,5 @@
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
 #include <cuda_fp16.h>
+#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
 #include <cuda_runtime.h>
 #include <mma.h>
 
@@ -353,9 +352,9 @@ __global__ void glm_sparse_mla_kernel(
 }
 
 template<int ncols1, int ncols2>
-torch::Tensor launch_glm_sparse_mla(
-    torch::Tensor q, torch::Tensor kv, torch::Tensor indices,
-    torch::Tensor meta, double scale)
+mfq_tensor_backend::Tensor launch_glm_sparse_mla(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv, mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor meta, double scale)
 {
     constexpr int ncols = ncols1 * ncols2;
     const int B = static_cast<int>(q.size(0));
@@ -364,8 +363,8 @@ torch::Tensor launch_glm_sparse_mla(
     const int topk = static_cast<int>(indices.size(2));
     int device = 0;
     cudaDeviceProp properties{};
-    TORCH_CHECK(cudaGetDevice(&device) == cudaSuccess, "glm_sparse_mla: cudaGetDevice failed");
-    TORCH_CHECK(cudaGetDeviceProperties(&properties, device) == cudaSuccess,
+    MFQ_RUNTIME_CHECK(cudaGetDevice(&device) == cudaSuccess, "glm_sparse_mla: cudaGetDevice failed");
+    MFQ_RUNTIME_CHECK(cudaGetDeviceProperties(&properties, device) == cudaSuccess,
                 "glm_sparse_mla: cudaGetDeviceProperties failed");
     const int cc = properties.major * 100 + properties.minor * 10;
     const int nthreads = ggml_cuda_fattn_mma_get_nthreads(kMlaDq, kMlaDv, ncols, cc);
@@ -390,11 +389,11 @@ torch::Tensor launch_glm_sparse_mla(
     using Kernel = decltype(&glm_sparse_mla_kernel<ncols1, ncols2>);
     Kernel kernel = glm_sparse_mla_kernel<ncols1, ncols2>;
     static bool shmem_set[32] = {};
-    TORCH_CHECK(device >= 0 && device < 32, "glm_sparse_mla: unsupported CUDA device index");
+    MFQ_RUNTIME_CHECK(device >= 0 && device < 32, "glm_sparse_mla: unsupported CUDA device index");
     if (!shmem_set[device]) {
         const cudaError_t status = cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shmem));
-        TORCH_CHECK(status == cudaSuccess, "glm_sparse_mla: shared-memory attribute failed: ",
+        MFQ_RUNTIME_CHECK(status == cudaSuccess, "glm_sparse_mla: shared-memory attribute failed: ",
                     cudaGetErrorString(status));
         shmem_set[device] = true;
     }
@@ -405,7 +404,7 @@ torch::Tensor launch_glm_sparse_mla(
     int max_blocks_per_sm = 0;
     cudaError_t status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &max_blocks_per_sm, kernel, nthreads, shmem);
-    TORCH_CHECK(status == cudaSuccess && max_blocks_per_sm > 0,
+    MFQ_RUNTIME_CHECK(status == cudaSuccess && max_blocks_per_sm > 0,
                 "glm_sparse_mla: occupancy query failed: ", cudaGetErrorString(status));
     const int resident_blocks = max_blocks_per_sm * properties.multiProcessorCount;
     const int raw_blocks = std::min(resident_blocks, ntiles_dst * ntiles_kv);
@@ -414,21 +413,21 @@ torch::Tensor launch_glm_sparse_mla(
     const int blocks_per_tile = rounded_blocks / ntiles_dst;
     const size_t meta_float2 = static_cast<size_t>(rounded_blocks) *
         ncols * (2 + kMlaDv / 2);
-    TORCH_CHECK(blocks_per_tile == 1 ||
+    MFQ_RUNTIME_CHECK(blocks_per_tile == 1 ||
                 static_cast<size_t>(meta.numel()) >= 2 * meta_float2,
                 "glm_sparse_mla: meta workspace too small, need ", 2 * meta_float2,
                 " float elements");
 
-    auto out = torch::empty({B, M, kMlaHeads, kMlaDv}, q.options());
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto out = mfq_tensor_backend::empty({B, M, kMlaHeads, kMlaDv}, q.options());
+    auto stream = mfq_current_cuda_stream();
     kernel<<<rounded_blocks, dim3(32, nwarps, 1), shmem, stream>>>(
-        q.data_ptr<float>(), reinterpret_cast<const half *>(kv.data_ptr<at::Half>()),
+        q.data_ptr<float>(), reinterpret_cast<const half *>(kv.data_ptr<mfq_half>()),
         indices.data_ptr<int>(), out.data_ptr<float>(),
         reinterpret_cast<float2 *>(meta.data_ptr<float>()),
         static_cast<float>(scale), B, M, max_seq, topk,
         init_fastdiv_values(M));
     status = cudaGetLastError();
-    TORCH_CHECK(status == cudaSuccess, "glm_sparse_mla launch failed: ",
+    MFQ_RUNTIME_CHECK(status == cudaSuccess, "glm_sparse_mla launch failed: ",
                 cudaGetErrorString(status));
 
     if (blocks_per_tile > 1) {
@@ -442,7 +441,7 @@ torch::Tensor launch_glm_sparse_mla(
                 M, kMlaHeads, 1, rounded_blocks, kMlaHeads,
                 blocks_per_tile, fd0, fd1, fd2);
         status = cudaGetLastError();
-        TORCH_CHECK(status == cudaSuccess, "glm_sparse_mla fixup failed: ",
+        MFQ_RUNTIME_CHECK(status == cudaSuccess, "glm_sparse_mla fixup failed: ",
                     cudaGetErrorString(status));
     }
     return out;
@@ -450,31 +449,31 @@ torch::Tensor launch_glm_sparse_mla(
 
 } // namespace
 
-torch::Tensor glm_interleaved_rope_cuda(
-    torch::Tensor x, torch::Tensor positions,
-    torch::Tensor cos, torch::Tensor sin, int64_t rotary_dim)
+mfq_tensor_backend::Tensor glm_interleaved_rope_cuda(
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor positions,
+    mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin, int64_t rotary_dim)
 {
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 4,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 4,
                 "glm_interleaved_rope: x must be contiguous CUDA [B,H,T,D]");
-    TORCH_CHECK((x.scalar_type() == torch::kFloat16 || x.scalar_type() == torch::kFloat32) &&
+    MFQ_RUNTIME_CHECK((x.scalar_type() == mfq_tensor_backend::kFloat16 || x.scalar_type() == mfq_tensor_backend::kFloat32) &&
                 positions.is_cuda() && positions.is_contiguous() &&
-                positions.scalar_type() == torch::kInt64 &&
+                positions.scalar_type() == mfq_tensor_backend::kInt64 &&
                 cos.is_cuda() && sin.is_cuda() && cos.is_contiguous() && sin.is_contiguous() &&
-                cos.scalar_type() == torch::kFloat32 && sin.scalar_type() == torch::kFloat32,
+                cos.scalar_type() == mfq_tensor_backend::kFloat32 && sin.scalar_type() == mfq_tensor_backend::kFloat32,
                 "glm_interleaved_rope: unsupported dtype or placement");
-    TORCH_CHECK(x.size(3) % 2 == 0 && rotary_dim > 0 && rotary_dim <= x.size(3) &&
+    MFQ_RUNTIME_CHECK(x.size(3) % 2 == 0 && rotary_dim > 0 && rotary_dim <= x.size(3) &&
                 rotary_dim % 2 == 0 && positions.numel() == x.size(2) &&
                 cos.dim() == 2 && sin.sizes() == cos.sizes() && cos.size(1) >= rotary_dim / 2,
                 "glm_interleaved_rope: shape mismatch");
-    auto out = torch::empty_like(x);
+    auto out = mfq_tensor_backend::empty_like(x);
     const int pairs = static_cast<int>(x.numel() / 2);
     const int blocks = std::min(65535, (pairs + 255) / 256);
-    auto stream = at::cuda::getCurrentCUDAStream();
-    if (x.scalar_type() == torch::kFloat16) {
+    auto stream = mfq_current_cuda_stream();
+    if (x.scalar_type() == mfq_tensor_backend::kFloat16) {
         glm_interleaved_rope_kernel<<<blocks, 256, 0, stream>>>(
-            reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
+            reinterpret_cast<const half *>(x.data_ptr<mfq_half>()),
             positions.data_ptr<int64_t>(), cos.data_ptr<float>(), sin.data_ptr<float>(),
-            reinterpret_cast<half *>(out.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(out.data_ptr<mfq_half>()),
             static_cast<int>(x.size(0)), static_cast<int>(x.size(1)),
             static_cast<int>(x.size(2)), static_cast<int>(x.size(3)),
             static_cast<int>(rotary_dim),
@@ -489,71 +488,71 @@ torch::Tensor glm_interleaved_rope_cuda(
             static_cast<int>(cos.size(1)));
     }
     const cudaError_t status = cudaGetLastError();
-    TORCH_CHECK(status == cudaSuccess, "glm_interleaved_rope launch failed: ",
+    MFQ_RUNTIME_CHECK(status == cudaSuccess, "glm_interleaved_rope launch failed: ",
                 cudaGetErrorString(status));
     return out;
 }
 
-torch::Tensor glm_dsa_indexer_layer_norm_cuda(
-    torch::Tensor x, torch::Tensor weight, torch::Tensor bias, double eps)
+mfq_tensor_backend::Tensor glm_dsa_indexer_layer_norm_cuda(
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, mfq_tensor_backend::Tensor bias, double eps)
 {
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kFloat16 &&
-                weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == torch::kFloat32 &&
-                bias.is_cuda() && bias.is_contiguous() && bias.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kFloat16 &&
+                weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == mfq_tensor_backend::kFloat32 &&
+                bias.is_cuda() && bias.is_contiguous() && bias.scalar_type() == mfq_tensor_backend::kFloat32,
                 "glm_indexer_layer_norm: tensors must be contiguous CUDA f16/f32/f32");
-    TORCH_CHECK(x.dim() >= 1 && x.size(-1) == kIndexerDim &&
+    MFQ_RUNTIME_CHECK(x.dim() >= 1 && x.size(-1) == kIndexerDim &&
                 weight.numel() == kIndexerDim && bias.numel() == kIndexerDim,
                 "glm_indexer_layer_norm: shape mismatch");
     const int64_t rows64 = x.numel() / kIndexerDim;
-    TORCH_CHECK(rows64 > 0 && rows64 <= INT_MAX,
+    MFQ_RUNTIME_CHECK(rows64 > 0 && rows64 <= INT_MAX,
                 "glm_indexer_layer_norm: invalid row count");
-    auto out = torch::empty_like(x);
+    auto out = mfq_tensor_backend::empty_like(x);
     glm_indexer_layer_norm_kernel<<<static_cast<int>(rows64), kIndexerDim, 0,
-        at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
+        mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const half *>(x.data_ptr<mfq_half>()),
         weight.data_ptr<float>(), bias.data_ptr<float>(),
-        reinterpret_cast<half *>(out.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(out.data_ptr<mfq_half>()),
         static_cast<int>(rows64), static_cast<float>(eps));
     const cudaError_t status = cudaGetLastError();
-    TORCH_CHECK(status == cudaSuccess, "glm_indexer_layer_norm launch failed: ",
+    MFQ_RUNTIME_CHECK(status == cudaSuccess, "glm_indexer_layer_norm launch failed: ",
                 cudaGetErrorString(status));
     return out;
 }
 
-torch::Tensor glm_dsa_cache_write_cuda(
-    torch::Tensor cache, torch::Tensor values, torch::Tensor positions)
+mfq_tensor_backend::Tensor glm_dsa_cache_write_cuda(
+    mfq_tensor_backend::Tensor cache, mfq_tensor_backend::Tensor values, mfq_tensor_backend::Tensor positions)
 {
-    TORCH_CHECK(cache.is_cuda() && cache.is_contiguous() && cache.scalar_type() == torch::kFloat16 &&
-                values.is_cuda() && values.is_contiguous() && values.scalar_type() == torch::kFloat16 &&
-                positions.is_cuda() && positions.is_contiguous() && positions.scalar_type() == torch::kInt64,
+    MFQ_RUNTIME_CHECK(cache.is_cuda() && cache.is_contiguous() && cache.scalar_type() == mfq_tensor_backend::kFloat16 &&
+                values.is_cuda() && values.is_contiguous() && values.scalar_type() == mfq_tensor_backend::kFloat16 &&
+                positions.is_cuda() && positions.is_contiguous() && positions.scalar_type() == mfq_tensor_backend::kInt64,
                 "glm_cache_write: tensors must be contiguous CUDA f16/f16/i64");
-    TORCH_CHECK(cache.dim() == 3 && values.dim() == 3 &&
+    MFQ_RUNTIME_CHECK(cache.dim() == 3 && values.dim() == 3 &&
                 cache.size(0) == values.size(0) && cache.size(2) == values.size(2) &&
                 positions.numel() == values.size(1),
                 "glm_cache_write: shape mismatch");
     const int64_t total = values.numel();
     const int blocks = std::min<int64_t>(65535, (total + 255) / 256);
-    glm_cache_write_kernel<<<blocks, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<half *>(cache.data_ptr<at::Half>()),
-        reinterpret_cast<const half *>(values.data_ptr<at::Half>()),
+    glm_cache_write_kernel<<<blocks, 256, 0, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<half *>(cache.data_ptr<mfq_half>()),
+        reinterpret_cast<const half *>(values.data_ptr<mfq_half>()),
         positions.data_ptr<int64_t>(), static_cast<int>(values.size(0)),
         static_cast<int>(values.size(1)), static_cast<int>(cache.size(1)),
         static_cast<int>(values.size(2)));
     const cudaError_t status = cudaGetLastError();
-    TORCH_CHECK(status == cudaSuccess, "glm_cache_write launch failed: ",
+    MFQ_RUNTIME_CHECK(status == cudaSuccess, "glm_cache_write launch failed: ",
                 cudaGetErrorString(status));
     return cache;
 }
 
-torch::Tensor glm_dsa_indexer_scores_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor weights,
+mfq_tensor_backend::Tensor glm_dsa_indexer_scores_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor weights,
     int64_t query_offset, int64_t logical_k)
 {
-    TORCH_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == torch::kFloat16 &&
-                k.is_cuda() && k.is_contiguous() && k.scalar_type() == torch::kFloat16 &&
-                weights.is_cuda() && weights.is_contiguous() && weights.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == mfq_tensor_backend::kFloat16 &&
+                k.is_cuda() && k.is_contiguous() && k.scalar_type() == mfq_tensor_backend::kFloat16 &&
+                weights.is_cuda() && weights.is_contiguous() && weights.scalar_type() == mfq_tensor_backend::kFloat32,
                 "glm_indexer_scores: tensors must be contiguous CUDA f16/f16/f32");
-    TORCH_CHECK(q.dim() == 4 && k.dim() == 3 && weights.dim() == 3 &&
+    MFQ_RUNTIME_CHECK(q.dim() == 4 && k.dim() == 3 && weights.dim() == 3 &&
                 q.size(2) == kIndexerHeads && q.size(3) == kIndexerDim &&
                 k.size(0) == q.size(0) && k.size(2) == kIndexerDim &&
                 weights.size(0) == q.size(0) && weights.size(1) == q.size(1) &&
@@ -563,33 +562,33 @@ torch::Tensor glm_dsa_indexer_scores_cuda(
     const int M = static_cast<int>(q.size(1));
     const int k_stride = static_cast<int>(k.size(1));
     const int K = logical_k < 0 ? k_stride : static_cast<int>(logical_k);
-    TORCH_CHECK(K > 0 && K <= k_stride, "glm_indexer_scores: invalid logical K");
-    TORCH_CHECK(query_offset >= 0 && query_offset + M <= K,
+    MFQ_RUNTIME_CHECK(K > 0 && K <= k_stride, "glm_indexer_scores: invalid logical K");
+    MFQ_RUNTIME_CHECK(query_offset >= 0 && query_offset + M <= K,
                 "glm_indexer_scores: invalid causal query offset");
-    auto out = torch::empty({B, M, K}, weights.options());
+    auto out = mfq_tensor_backend::empty({B, M, K}, weights.options());
     const dim3 grid((K + kIndexerKeysPerTile - 1) / kIndexerKeysPerTile, M, B);
-    glm_indexer_scores_kernel<<<grid, dim3(32, 8, 1), 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const half *>(q.data_ptr<at::Half>()),
-        reinterpret_cast<const half *>(k.data_ptr<at::Half>()),
+    glm_indexer_scores_kernel<<<grid, dim3(32, 8, 1), 0, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const half *>(q.data_ptr<mfq_half>()),
+        reinterpret_cast<const half *>(k.data_ptr<mfq_half>()),
         weights.data_ptr<float>(), out.data_ptr<float>(), B, M, K, k_stride,
         static_cast<int>(query_offset), nullptr, 1.0f / std::sqrt(128.0f),
         1.0f / std::sqrt(32.0f));
     const cudaError_t status = cudaGetLastError();
-    TORCH_CHECK(status == cudaSuccess, "glm_indexer_scores launch failed: ",
+    MFQ_RUNTIME_CHECK(status == cudaSuccess, "glm_indexer_scores launch failed: ",
                 cudaGetErrorString(status));
     return out;
 }
 
-torch::Tensor glm_dsa_indexer_scores_decode_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor weights,
-    torch::Tensor seq_len, int64_t planned_k)
+mfq_tensor_backend::Tensor glm_dsa_indexer_scores_decode_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor weights,
+    mfq_tensor_backend::Tensor seq_len, int64_t planned_k)
 {
-    TORCH_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == torch::kFloat16 &&
-                k.is_cuda() && k.is_contiguous() && k.scalar_type() == torch::kFloat16 &&
-                weights.is_cuda() && weights.is_contiguous() && weights.scalar_type() == torch::kFloat32 &&
-                seq_len.is_cuda() && seq_len.is_contiguous() && seq_len.scalar_type() == torch::kInt64,
+    MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == mfq_tensor_backend::kFloat16 &&
+                k.is_cuda() && k.is_contiguous() && k.scalar_type() == mfq_tensor_backend::kFloat16 &&
+                weights.is_cuda() && weights.is_contiguous() && weights.scalar_type() == mfq_tensor_backend::kFloat32 &&
+                seq_len.is_cuda() && seq_len.is_contiguous() && seq_len.scalar_type() == mfq_tensor_backend::kInt64,
                 "glm_indexer_scores_decode: unsupported dtype or placement");
-    TORCH_CHECK(q.dim() == 4 && q.size(1) == 1 &&
+    MFQ_RUNTIME_CHECK(q.dim() == 4 && q.size(1) == 1 &&
                 q.size(2) == kIndexerHeads && q.size(3) == kIndexerDim &&
                 k.dim() == 3 && k.size(0) == q.size(0) && k.size(2) == kIndexerDim &&
                 weights.dim() == 3 && weights.size(0) == q.size(0) &&
@@ -599,31 +598,31 @@ torch::Tensor glm_dsa_indexer_scores_decode_cuda(
     const int B = static_cast<int>(q.size(0));
     const int K = static_cast<int>(planned_k);
     const int k_stride = static_cast<int>(k.size(1));
-    auto out = torch::empty({B, 1, K}, weights.options());
+    auto out = mfq_tensor_backend::empty({B, 1, K}, weights.options());
     const dim3 grid((K + kIndexerKeysPerTile - 1) / kIndexerKeysPerTile, 1, B);
     glm_indexer_scores_kernel<<<grid, dim3(32, 8, 1), 0,
-        at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const half *>(q.data_ptr<at::Half>()),
-        reinterpret_cast<const half *>(k.data_ptr<at::Half>()),
+        mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const half *>(q.data_ptr<mfq_half>()),
+        reinterpret_cast<const half *>(k.data_ptr<mfq_half>()),
         weights.data_ptr<float>(), out.data_ptr<float>(), B, 1, K, k_stride,
         0, seq_len.data_ptr<int64_t>(), 1.0f / std::sqrt(128.0f),
         1.0f / std::sqrt(32.0f));
     const cudaError_t status = cudaGetLastError();
-    TORCH_CHECK(status == cudaSuccess, "glm_indexer_scores_decode launch failed: ",
+    MFQ_RUNTIME_CHECK(status == cudaSuccess, "glm_indexer_scores_decode launch failed: ",
                 cudaGetErrorString(status));
     return out;
 }
 
-torch::Tensor attention_glm_mla_sparse_cuda(
-    torch::Tensor q, torch::Tensor kv, torch::Tensor indices,
-    torch::Tensor meta, double scale)
+mfq_tensor_backend::Tensor attention_glm_mla_sparse_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv, mfq_tensor_backend::Tensor indices,
+    mfq_tensor_backend::Tensor meta, double scale)
 {
-    TORCH_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == torch::kFloat32 &&
-                kv.is_cuda() && kv.is_contiguous() && kv.scalar_type() == torch::kFloat16 &&
-                indices.is_cuda() && indices.is_contiguous() && indices.scalar_type() == torch::kInt32 &&
-                meta.is_cuda() && meta.is_contiguous() && meta.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == mfq_tensor_backend::kFloat32 &&
+                kv.is_cuda() && kv.is_contiguous() && kv.scalar_type() == mfq_tensor_backend::kFloat16 &&
+                indices.is_cuda() && indices.is_contiguous() && indices.scalar_type() == mfq_tensor_backend::kInt32 &&
+                meta.is_cuda() && meta.is_contiguous() && meta.scalar_type() == mfq_tensor_backend::kFloat32,
                 "glm_sparse_mla: tensors must be contiguous CUDA f32/f16/i32/f32");
-    TORCH_CHECK(q.dim() == 4 && q.size(1) == kMlaHeads && q.size(3) == kMlaDq &&
+    MFQ_RUNTIME_CHECK(q.dim() == 4 && q.size(1) == kMlaHeads && q.size(3) == kMlaDq &&
                 kv.dim() == 3 && kv.size(0) == q.size(0) && kv.size(2) == kMlaDq &&
                 indices.dim() == 3 && indices.size(0) == q.size(0) &&
                 indices.size(1) == q.size(2) && indices.size(2) > 0 &&

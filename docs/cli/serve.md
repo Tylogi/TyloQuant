@@ -14,8 +14,8 @@ cd /path/to/MFQ
 uv sync --extra daemon --extra metal
 ```
 
-On a CUDA host, use `uv sync --extra daemon --extra train` instead. Start with
-an initial model:
+On a CUDA host, use `uv sync --extra daemon` instead. Native CUDA inference
+does not require PyTorch or LibTorch. Then start with an initial model:
 
 ```shell
 uv run mfq serve

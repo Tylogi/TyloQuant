@@ -1,9 +1,8 @@
 // Native CUDA execution for TPQ symmetric int4 and learned product-VQ weights.
 
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
+#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
 #include <cuda_runtime.h>
-#include <torch/extension.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -391,12 +390,12 @@ __global__ void __launch_bounds__(256) tpq_pq_moe_kernel(
 }
 
 void validate_tpq_int4(
-        const torch::Tensor & packed,
-        const torch::Tensor & scales,
+        const mfq_tensor_backend::Tensor & packed,
+        const mfq_tensor_backend::Tensor & scales,
         int64_t group_size) {
-    TORCH_CHECK(packed.is_cuda() && scales.is_cuda() &&
-                    packed.scalar_type() == torch::kUInt8 &&
-                    scales.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(packed.is_cuda() && scales.is_cuda() &&
+                    packed.scalar_type() == mfq_tensor_backend::kUInt8 &&
+                    scales.scalar_type() == mfq_tensor_backend::kFloat16 &&
                     packed.is_contiguous() && scales.is_contiguous() &&
                     packed.dim() == 2 && scales.dim() == 2 &&
                     packed.size(0) > 0 && packed.size(1) > 0 &&
@@ -409,15 +408,15 @@ void validate_tpq_int4(
 }
 
 void validate_tpq_pq(
-        const torch::Tensor & indices,
-        const torch::Tensor & codebook,
+        const mfq_tensor_backend::Tensor & indices,
+        const mfq_tensor_backend::Tensor & codebook,
         int64_t outputs,
         int64_t width,
         int64_t vector_size,
         int64_t index_bits) {
-    TORCH_CHECK(indices.is_cuda() && codebook.is_cuda() &&
-                    indices.scalar_type() == torch::kUInt8 &&
-                    codebook.scalar_type() == torch::kFloat32 &&
+    MFQ_RUNTIME_CHECK(indices.is_cuda() && codebook.is_cuda() &&
+                    indices.scalar_type() == mfq_tensor_backend::kUInt8 &&
+                    codebook.scalar_type() == mfq_tensor_backend::kFloat32 &&
                     indices.is_contiguous() && codebook.is_contiguous() &&
                     indices.dim() == 1 && codebook.dim() == 2 &&
                     outputs > 0 && width > 0 && vector_size > 0 &&
@@ -428,137 +427,137 @@ void validate_tpq_pq(
                     codebook.size(0) <= std::numeric_limits<int>::max() &&
                     codebook.size(0) <= (1ll << index_bits),
                 "TPQ-PQ packed weight geometry is invalid");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         outputs <= std::numeric_limits<int>::max() &&
             width <= std::numeric_limits<int>::max() &&
             vector_size <= std::numeric_limits<int>::max() &&
             outputs <= std::numeric_limits<int64_t>::max() / (width / vector_size),
         "TPQ-PQ dimensions exceed supported integer ranges");
     const int64_t index_count = outputs * (width / vector_size);
-    TORCH_CHECK(indices.numel() == (index_count * index_bits + 7) / 8,
+    MFQ_RUNTIME_CHECK(indices.numel() == (index_count * index_bits + 7) / 8,
                 "TPQ-PQ packed index length is invalid");
 }
 
 } // namespace
 
-torch::Tensor tpq_int4_matmul_f16_cuda(
-        torch::Tensor packed,
-        torch::Tensor scales,
-        torch::Tensor input,
+mfq_tensor_backend::Tensor tpq_int4_matmul_f16_cuda(
+        mfq_tensor_backend::Tensor packed,
+        mfq_tensor_backend::Tensor scales,
+        mfq_tensor_backend::Tensor input,
         int64_t group_size) {
     validate_tpq_int4(packed, scales, group_size);
-    TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.scalar_type() == mfq_tensor_backend::kFloat16 &&
                     input.is_contiguous() && input.dim() == 2 &&
                     input.size(0) > 0 && input.size(1) == packed.size(1) * 2,
                 "TPQ-I4 activation geometry is invalid");
     const int rows = static_cast<int>(input.size(0));
     const int outputs = static_cast<int>(packed.size(0));
     const int width = static_cast<int>(input.size(1));
-    auto result = torch::empty({rows, outputs}, input.options());
+    auto result = mfq_tensor_backend::empty({rows, outputs}, input.options());
     const int row_tiles = (rows + 7) / 8;
     const int output_tiles = (outputs + 7) / 8;
     const int blocks = static_cast<int>(std::min<int64_t>(
         static_cast<int64_t>(row_tiles) * output_tiles, 4096));
     tpq_int4_matmul_kernel<<<
-        blocks, dim3(32, 8), 0, at::cuda::getCurrentCUDAStream()>>>(
+        blocks, dim3(32, 8), 0, mfq_current_cuda_stream()>>>(
             packed.data_ptr<std::uint8_t>(),
-            reinterpret_cast<const __half *>(scales.data_ptr<at::Half>()),
-            reinterpret_cast<const __half *>(input.data_ptr<at::Half>()),
-            reinterpret_cast<__half *>(result.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(scales.data_ptr<mfq_half>()),
+            reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
+            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
             rows, outputs, width, static_cast<int>(group_size),
             row_tiles, output_tiles);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
 }
 
-torch::Tensor tpq_int4_dequant_cuda(
-        torch::Tensor packed,
-        torch::Tensor scales,
+mfq_tensor_backend::Tensor tpq_int4_dequant_cuda(
+        mfq_tensor_backend::Tensor packed,
+        mfq_tensor_backend::Tensor scales,
         int64_t group_size) {
     validate_tpq_int4(packed, scales, group_size);
     const int outputs = static_cast<int>(packed.size(0));
     const int width = static_cast<int>(packed.size(1) * 2);
-    auto result = torch::empty(
-        {outputs, width}, packed.options().dtype(torch::kFloat16));
+    auto result = mfq_tensor_backend::empty(
+        {outputs, width}, packed.options().dtype(mfq_tensor_backend::kFloat16));
     const int64_t count = static_cast<int64_t>(outputs) * width;
     constexpr int threads = 256;
     const int blocks = static_cast<int>((count + threads - 1) / threads);
     tpq_int4_dequant_kernel<<<
-        blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        blocks, threads, 0, mfq_current_cuda_stream()>>>(
             packed.data_ptr<std::uint8_t>(),
-            reinterpret_cast<const __half *>(scales.data_ptr<at::Half>()),
-            reinterpret_cast<__half *>(result.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(scales.data_ptr<mfq_half>()),
+            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
             outputs, width, static_cast<int>(group_size));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
 }
 
-torch::Tensor tpq_pq_matmul_f16_cuda(
-        torch::Tensor indices,
-        torch::Tensor codebook,
-        torch::Tensor input,
+mfq_tensor_backend::Tensor tpq_pq_matmul_f16_cuda(
+        mfq_tensor_backend::Tensor indices,
+        mfq_tensor_backend::Tensor codebook,
+        mfq_tensor_backend::Tensor input,
         int64_t outputs,
         int64_t width,
         int64_t vector_size,
         int64_t index_bits) {
     validate_tpq_pq(
         indices, codebook, outputs, width, vector_size, index_bits);
-    TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.scalar_type() == mfq_tensor_backend::kFloat16 &&
                     input.is_contiguous() && input.dim() == 2 &&
                     input.size(0) > 0 && input.size(1) == width,
                 "TPQ-PQ activation geometry is invalid");
     const int rows = static_cast<int>(input.size(0));
-    auto result = torch::empty({rows, outputs}, input.options());
+    auto result = mfq_tensor_backend::empty({rows, outputs}, input.options());
     const int row_tiles = (rows + 7) / 8;
     const int output_tiles = (static_cast<int>(outputs) + 7) / 8;
     const int blocks = static_cast<int>(std::min<int64_t>(
         static_cast<int64_t>(row_tiles) * output_tiles, 4096));
     tpq_pq_matmul_kernel<<<
-        blocks, dim3(32, 8), 0, at::cuda::getCurrentCUDAStream()>>>(
+        blocks, dim3(32, 8), 0, mfq_current_cuda_stream()>>>(
             indices.data_ptr<std::uint8_t>(), indices.numel(),
             codebook.data_ptr<float>(), static_cast<int>(codebook.size(0)),
-            reinterpret_cast<const __half *>(input.data_ptr<at::Half>()),
-            reinterpret_cast<__half *>(result.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
+            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
             rows, static_cast<int>(outputs), static_cast<int>(width),
             static_cast<int>(vector_size), static_cast<int>(index_bits),
             row_tiles, output_tiles);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
 }
 
-torch::Tensor tpq_pq_dequant_cuda(
-        torch::Tensor indices,
-        torch::Tensor codebook,
+mfq_tensor_backend::Tensor tpq_pq_dequant_cuda(
+        mfq_tensor_backend::Tensor indices,
+        mfq_tensor_backend::Tensor codebook,
         int64_t outputs,
         int64_t width,
         int64_t vector_size,
         int64_t index_bits) {
     validate_tpq_pq(
         indices, codebook, outputs, width, vector_size, index_bits);
-    auto result = torch::empty(
-        {outputs, width}, indices.options().dtype(torch::kFloat16));
+    auto result = mfq_tensor_backend::empty(
+        {outputs, width}, indices.options().dtype(mfq_tensor_backend::kFloat16));
     const int64_t count = outputs * width;
     constexpr int threads = 256;
     const int blocks = static_cast<int>((count + threads - 1) / threads);
     tpq_pq_dequant_kernel<<<
-        blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        blocks, threads, 0, mfq_current_cuda_stream()>>>(
             indices.data_ptr<std::uint8_t>(), indices.numel(),
             codebook.data_ptr<float>(), static_cast<int>(codebook.size(0)),
-            reinterpret_cast<__half *>(result.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(result.data_ptr<mfq_half>()),
             static_cast<int>(outputs), static_cast<int>(width),
             static_cast<int>(vector_size), static_cast<int>(index_bits));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return result;
 }
 
-torch::Tensor tpq_int4_embedding_lookup_cuda(
-        torch::Tensor packed,
-        torch::Tensor scales,
-        torch::Tensor token_ids,
+mfq_tensor_backend::Tensor tpq_int4_embedding_lookup_cuda(
+        mfq_tensor_backend::Tensor packed,
+        mfq_tensor_backend::Tensor scales,
+        mfq_tensor_backend::Tensor token_ids,
         int64_t group_size) {
     validate_tpq_int4(packed, scales, group_size);
-    TORCH_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() &&
-                    token_ids.scalar_type() == torch::kInt64 &&
+    MFQ_RUNTIME_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() &&
+                    token_ids.scalar_type() == mfq_tensor_backend::kInt64 &&
                     token_ids.get_device() == packed.get_device() &&
                     token_ids.numel() <= std::numeric_limits<int>::max(),
                 "TPQ-I4 embedding ids must be contiguous CUDA int64");
@@ -567,92 +566,92 @@ torch::Tensor tpq_int4_embedding_lookup_cuda(
     const int count = static_cast<int>(token_ids.numel());
     auto shape = token_ids.sizes().vec();
     shape.push_back(width);
-    auto output = torch::empty(shape, packed.options().dtype(torch::kFloat16));
+    auto output = mfq_tensor_backend::empty(shape, packed.options().dtype(mfq_tensor_backend::kFloat16));
     constexpr int threads = 256;
     const int64_t total = static_cast<int64_t>(count) * width;
     const int blocks = static_cast<int>(std::min<int64_t>(
         (total + threads - 1) / threads, 4096));
     if (blocks > 0) {
         tpq_int4_embedding_kernel<<<
-            blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            blocks, threads, 0, mfq_current_cuda_stream()>>>(
                 packed.data_ptr<std::uint8_t>(),
-                reinterpret_cast<const __half *>(scales.data_ptr<at::Half>()),
+                reinterpret_cast<const __half *>(scales.data_ptr<mfq_half>()),
                 token_ids.data_ptr<int64_t>(),
-                reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+                reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
                 count, vocab, width, static_cast<int>(group_size));
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     }
     return output;
 }
 
-torch::Tensor tpq_pq_embedding_lookup_cuda(
-        torch::Tensor indices,
-        torch::Tensor codebook,
-        torch::Tensor token_ids,
+mfq_tensor_backend::Tensor tpq_pq_embedding_lookup_cuda(
+        mfq_tensor_backend::Tensor indices,
+        mfq_tensor_backend::Tensor codebook,
+        mfq_tensor_backend::Tensor token_ids,
         int64_t outputs,
         int64_t width,
         int64_t vector_size,
         int64_t index_bits) {
     validate_tpq_pq(
         indices, codebook, outputs, width, vector_size, index_bits);
-    TORCH_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() &&
-                    token_ids.scalar_type() == torch::kInt64 &&
+    MFQ_RUNTIME_CHECK(token_ids.is_cuda() && token_ids.is_contiguous() &&
+                    token_ids.scalar_type() == mfq_tensor_backend::kInt64 &&
                     token_ids.get_device() == indices.get_device() &&
                     token_ids.numel() <= std::numeric_limits<int>::max(),
                 "TPQ-PQ embedding ids must be contiguous CUDA int64");
     const int count = static_cast<int>(token_ids.numel());
     auto shape = token_ids.sizes().vec();
     shape.push_back(width);
-    auto output = torch::empty(shape, indices.options().dtype(torch::kFloat16));
+    auto output = mfq_tensor_backend::empty(shape, indices.options().dtype(mfq_tensor_backend::kFloat16));
     constexpr int threads = 256;
     const int64_t total = static_cast<int64_t>(count) * width;
     const int blocks = static_cast<int>(std::min<int64_t>(
         (total + threads - 1) / threads, 4096));
     if (blocks > 0) {
         tpq_pq_embedding_kernel<<<
-            blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            blocks, threads, 0, mfq_current_cuda_stream()>>>(
                 indices.data_ptr<std::uint8_t>(), indices.numel(),
                 codebook.data_ptr<float>(), static_cast<int>(codebook.size(0)),
                 token_ids.data_ptr<int64_t>(),
-                reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+                reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
                 count, static_cast<int>(outputs), static_cast<int>(width),
                 static_cast<int>(vector_size), static_cast<int>(index_bits));
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     }
     return output;
 }
 
-torch::Tensor tpq_pq_moe_grouped_matmul_pool_f16_cuda(
-        torch::Tensor indices,
-        torch::Tensor codebook,
-        torch::Tensor input,
-        torch::Tensor ids,
-        torch::Tensor expert_local,
+mfq_tensor_backend::Tensor tpq_pq_moe_grouped_matmul_pool_f16_cuda(
+        mfq_tensor_backend::Tensor indices,
+        mfq_tensor_backend::Tensor codebook,
+        mfq_tensor_backend::Tensor input,
+        mfq_tensor_backend::Tensor ids,
+        mfq_tensor_backend::Tensor expert_local,
         int64_t global_experts,
         int64_t pool_experts,
         int64_t out_per_expert,
         int64_t width,
         int64_t vector_size,
         int64_t index_bits,
-        torch::Tensor output,
-        torch::Tensor ids_dst,
-        torch::Tensor expert_bounds,
-        torch::Tensor tile_bounds,
-        torch::Tensor tile_experts) {
+        mfq_tensor_backend::Tensor output,
+        mfq_tensor_backend::Tensor ids_dst,
+        mfq_tensor_backend::Tensor expert_bounds,
+        mfq_tensor_backend::Tensor tile_bounds,
+        mfq_tensor_backend::Tensor tile_experts) {
     validate_tpq_pq(
         indices, codebook, pool_experts * out_per_expert,
         width, vector_size, index_bits);
-    TORCH_CHECK(input.is_cuda() && ids.is_cuda() && expert_local.is_cuda() &&
-                    output.is_cuda() && input.scalar_type() == torch::kFloat16 &&
-                    ids.scalar_type() == torch::kInt32 &&
-                    expert_local.scalar_type() == torch::kInt32 &&
-                    output.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(input.is_cuda() && ids.is_cuda() && expert_local.is_cuda() &&
+                    output.is_cuda() && input.scalar_type() == mfq_tensor_backend::kFloat16 &&
+                    ids.scalar_type() == mfq_tensor_backend::kInt32 &&
+                    expert_local.scalar_type() == mfq_tensor_backend::kInt32 &&
+                    output.scalar_type() == mfq_tensor_backend::kFloat16 &&
                     input.is_contiguous() && ids.is_contiguous() &&
                     expert_local.is_contiguous() && output.is_contiguous() &&
                     (input.dim() == 2 || input.dim() == 3) && ids.dim() == 2 &&
                     input.size(0) == ids.size(0) && input.size(-1) == width &&
                     expert_local.numel() == global_experts &&
-                    output.sizes() == torch::IntArrayRef(
+                    output.sizes() == mfq_tensor_backend::IntArrayRef(
                         {ids.size(0), ids.size(1), out_per_expert}),
                 "TPQ-PQ routed activation geometry is invalid");
     const int tokens = static_cast<int>(ids.size(0));
@@ -660,14 +659,14 @@ torch::Tensor tpq_pq_moe_grouped_matmul_pool_f16_cuda(
     const int pairs = tokens * routes;
     const int output_tiles = (static_cast<int>(out_per_expert) + 7) / 8;
     const dim3 threads(32, 8);
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const cudaStream_t stream = mfq_current_cuda_stream();
     if (ids_dst.numel() == ids.numel()) {
-        TORCH_CHECK(ids_dst.is_cuda() && expert_bounds.is_cuda() &&
+        MFQ_RUNTIME_CHECK(ids_dst.is_cuda() && expert_bounds.is_cuda() &&
                         tile_bounds.is_cuda() && tile_experts.is_cuda() &&
-                        ids_dst.scalar_type() == torch::kInt32 &&
-                        expert_bounds.scalar_type() == torch::kInt32 &&
-                        tile_bounds.scalar_type() == torch::kInt32 &&
-                        tile_experts.scalar_type() == torch::kInt32 &&
+                        ids_dst.scalar_type() == mfq_tensor_backend::kInt32 &&
+                        expert_bounds.scalar_type() == mfq_tensor_backend::kInt32 &&
+                        tile_bounds.scalar_type() == mfq_tensor_backend::kInt32 &&
+                        tile_experts.scalar_type() == mfq_tensor_backend::kInt32 &&
                         ids_dst.is_contiguous() && expert_bounds.is_contiguous() &&
                         tile_bounds.is_contiguous() && tile_experts.is_contiguous() &&
                         expert_bounds.numel() >= global_experts + 1 &&
@@ -679,11 +678,11 @@ torch::Tensor tpq_pq_moe_grouped_matmul_pool_f16_cuda(
         tpq_pq_moe_kernel<true><<<blocks, threads, 0, stream>>>(
             indices.data_ptr<std::uint8_t>(), indices.numel(),
             codebook.data_ptr<float>(), static_cast<int>(codebook.size(0)),
-            reinterpret_cast<const __half *>(input.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
             ids.data_ptr<std::int32_t>(), expert_local.data_ptr<std::int32_t>(),
             ids_dst.data_ptr<std::int32_t>(), expert_bounds.data_ptr<std::int32_t>(),
             tile_bounds.data_ptr<std::int32_t>(), tile_experts.data_ptr<std::int32_t>(),
-            reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
             tokens, routes, static_cast<int>(global_experts),
             static_cast<int>(pool_experts), static_cast<int>(out_per_expert),
             static_cast<int>(width), static_cast<int>(vector_size),
@@ -695,15 +694,15 @@ torch::Tensor tpq_pq_moe_grouped_matmul_pool_f16_cuda(
         tpq_pq_moe_kernel<false><<<blocks, threads, 0, stream>>>(
             indices.data_ptr<std::uint8_t>(), indices.numel(),
             codebook.data_ptr<float>(), static_cast<int>(codebook.size(0)),
-            reinterpret_cast<const __half *>(input.data_ptr<at::Half>()),
+            reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
             ids.data_ptr<std::int32_t>(), expert_local.data_ptr<std::int32_t>(),
             nullptr, nullptr, nullptr, nullptr,
-            reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
             tokens, routes, static_cast<int>(global_experts),
             static_cast<int>(pool_experts), static_cast<int>(out_per_expert),
             static_cast<int>(width), static_cast<int>(vector_size),
             static_cast<int>(index_bits), 0, output_tiles, input.dim() == 3);
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }

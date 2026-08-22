@@ -3,8 +3,7 @@
 // random uniforms are passed as a small GPU tensor.
 
 #include <cuda_runtime.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
+#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
 #include <cub/block/block_radix_sort.cuh>
 #include <float.h>
 #include <climits>
@@ -390,94 +389,94 @@ __global__ void sample_top_k_top_p_kernel(
     out[row] = chosen;
 }
 
-torch::Tensor sample_greedy_cuda(torch::Tensor logits)
+mfq_tensor_backend::Tensor sample_greedy_cuda(mfq_tensor_backend::Tensor logits)
 {
-    TORCH_CHECK(logits.is_cuda() && logits.is_contiguous(), "sample_greedy: logits must be cuda contiguous");
-    TORCH_CHECK(logits.dim() == 2, "sample_greedy: logits must be [B,V]");
-    TORCH_CHECK(
-        logits.scalar_type() == torch::kFloat32 ||
-        logits.scalar_type() == torch::kFloat16 ||
-        logits.scalar_type() == torch::kBFloat16,
+    MFQ_RUNTIME_CHECK(logits.is_cuda() && logits.is_contiguous(), "sample_greedy: logits must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(logits.dim() == 2, "sample_greedy: logits must be [B,V]");
+    MFQ_RUNTIME_CHECK(
+        logits.scalar_type() == mfq_tensor_backend::kFloat32 ||
+        logits.scalar_type() == mfq_tensor_backend::kFloat16 ||
+        logits.scalar_type() == mfq_tensor_backend::kBFloat16,
         "sample_greedy: logits dtype must be f32, f16, or bf16");
     int B = (int)logits.size(0);
     int V = (int)logits.size(1);
-    auto out = torch::empty({B}, logits.options().dtype(torch::kInt64));
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
+    auto out = mfq_tensor_backend::empty({B}, logits.options().dtype(mfq_tensor_backend::kInt64));
+    MFQ_DISPATCH_FLOATING_TYPES_AND2(
+        mfq_dispatch_half, mfq_dispatch_bfloat16,
         logits.scalar_type(), "sample_greedy_cuda", [&] {
-        sample_greedy_kernel<scalar_t><<<B, SAMPLE_BD, 0, at::cuda::getCurrentCUDAStream()>>>(
+        sample_greedy_kernel<scalar_t><<<B, SAMPLE_BD, 0, mfq_current_cuda_stream()>>>(
             logits.data_ptr<scalar_t>(), out.data_ptr<int64_t>(), B, V);
     });
     return out;
 }
 
-torch::Tensor sample_softmax_cuda(torch::Tensor logits, torch::Tensor random, double temperature)
+mfq_tensor_backend::Tensor sample_softmax_cuda(mfq_tensor_backend::Tensor logits, mfq_tensor_backend::Tensor random, double temperature)
 {
-    TORCH_CHECK(logits.is_cuda() && logits.is_contiguous(), "sample_softmax: logits must be cuda contiguous");
-    TORCH_CHECK(random.is_cuda() && random.is_contiguous() && random.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(logits.is_cuda() && logits.is_contiguous(), "sample_softmax: logits must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(random.is_cuda() && random.is_contiguous() && random.scalar_type() == mfq_tensor_backend::kFloat32,
                 "sample_softmax: random must be cuda contiguous f32");
-    TORCH_CHECK(logits.dim() == 2, "sample_softmax: logits must be [B,V]");
-    TORCH_CHECK(
-        logits.scalar_type() == torch::kFloat32 ||
-        logits.scalar_type() == torch::kFloat16 ||
-        logits.scalar_type() == torch::kBFloat16,
+    MFQ_RUNTIME_CHECK(logits.dim() == 2, "sample_softmax: logits must be [B,V]");
+    MFQ_RUNTIME_CHECK(
+        logits.scalar_type() == mfq_tensor_backend::kFloat32 ||
+        logits.scalar_type() == mfq_tensor_backend::kFloat16 ||
+        logits.scalar_type() == mfq_tensor_backend::kBFloat16,
         "sample_softmax: logits dtype must be f32, f16, or bf16");
     int B = (int)logits.size(0);
     int V = (int)logits.size(1);
-    TORCH_CHECK(random.numel() == B, "sample_softmax: random length must match B");
-    TORCH_CHECK(temperature > 0.0, "sample_softmax: temperature must be > 0");
-    auto out = torch::empty({B}, logits.options().dtype(torch::kInt64));
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
+    MFQ_RUNTIME_CHECK(random.numel() == B, "sample_softmax: random length must match B");
+    MFQ_RUNTIME_CHECK(temperature > 0.0, "sample_softmax: temperature must be > 0");
+    auto out = mfq_tensor_backend::empty({B}, logits.options().dtype(mfq_tensor_backend::kInt64));
+    MFQ_DISPATCH_FLOATING_TYPES_AND2(
+        mfq_dispatch_half, mfq_dispatch_bfloat16,
         logits.scalar_type(), "sample_softmax_cuda", [&] {
-        sample_softmax_kernel<scalar_t><<<B, SAMPLE_BD, 0, at::cuda::getCurrentCUDAStream()>>>(
+        sample_softmax_kernel<scalar_t><<<B, SAMPLE_BD, 0, mfq_current_cuda_stream()>>>(
             logits.data_ptr<scalar_t>(), random.data_ptr<float>(), out.data_ptr<int64_t>(),
             B, V, (float)temperature);
     });
     return out;
 }
 
-torch::Tensor sample_top_k_top_p_cuda(
-    torch::Tensor logits,
-    torch::Tensor random,
+mfq_tensor_backend::Tensor sample_top_k_top_p_cuda(
+    mfq_tensor_backend::Tensor logits,
+    mfq_tensor_backend::Tensor random,
     double temperature,
     int64_t top_k,
     double top_p)
 {
-    TORCH_CHECK(logits.is_cuda() && logits.is_contiguous(), "sample_top_k_top_p: logits must be cuda contiguous");
-    TORCH_CHECK(random.is_cuda() && random.is_contiguous() && random.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(logits.is_cuda() && logits.is_contiguous(), "sample_top_k_top_p: logits must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(random.is_cuda() && random.is_contiguous() && random.scalar_type() == mfq_tensor_backend::kFloat32,
                 "sample_top_k_top_p: random must be cuda contiguous f32");
-    TORCH_CHECK(logits.dim() == 2, "sample_top_k_top_p: logits must be [B,V]");
-    TORCH_CHECK(
-        logits.scalar_type() == torch::kFloat32 ||
-        logits.scalar_type() == torch::kFloat16 ||
-        logits.scalar_type() == torch::kBFloat16,
+    MFQ_RUNTIME_CHECK(logits.dim() == 2, "sample_top_k_top_p: logits must be [B,V]");
+    MFQ_RUNTIME_CHECK(
+        logits.scalar_type() == mfq_tensor_backend::kFloat32 ||
+        logits.scalar_type() == mfq_tensor_backend::kFloat16 ||
+        logits.scalar_type() == mfq_tensor_backend::kBFloat16,
         "sample_top_k_top_p: logits dtype must be f32, f16, or bf16");
     int B = (int)logits.size(0);
     int V = (int)logits.size(1);
-    TORCH_CHECK(random.numel() == B, "sample_top_k_top_p: random length must match B");
-    TORCH_CHECK(temperature > 0.0, "sample_top_k_top_p: temperature must be > 0");
-    TORCH_CHECK(top_k > 0 && top_k <= V && top_k <= SAMPLE_MAX_TOP_K,
+    MFQ_RUNTIME_CHECK(random.numel() == B, "sample_top_k_top_p: random length must match B");
+    MFQ_RUNTIME_CHECK(temperature > 0.0, "sample_top_k_top_p: temperature must be > 0");
+    MFQ_RUNTIME_CHECK(top_k > 0 && top_k <= V && top_k <= SAMPLE_MAX_TOP_K,
                 "sample_top_k_top_p: top_k must be in [1, min(V,1024)]");
-    auto out = torch::empty({B}, logits.options().dtype(torch::kInt64));
+    auto out = mfq_tensor_backend::empty({B}, logits.options().dtype(mfq_tensor_backend::kInt64));
 
     const char* radix_env = std::getenv("MFQ_SAMPLE_RADIX_TOPK");
     const bool use_radix = B == 1 && top_k <= SAMPLE_RADIX_MAX_TOP_K &&
         (radix_env == nullptr || radix_env[0] != '0');
     if (use_radix) {
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        cudaStream_t stream = mfq_current_cuda_stream();
         const int first_blocks = (V + SAMPLE_BD - 1) / SAMPLE_BD;
         const int64_t capacity = (int64_t)first_blocks * top_k;
-        auto vals_a = torch::empty(
-            {capacity}, logits.options().dtype(torch::kFloat32));
-        auto idxs_a = torch::empty(
-            {capacity}, logits.options().dtype(torch::kInt32));
-        auto vals_b = torch::empty(
-            {capacity}, logits.options().dtype(torch::kFloat32));
-        auto idxs_b = torch::empty(
-            {capacity}, logits.options().dtype(torch::kInt32));
-        AT_DISPATCH_FLOATING_TYPES_AND2(
-            at::ScalarType::Half, at::ScalarType::BFloat16,
+        auto vals_a = mfq_tensor_backend::empty(
+            {capacity}, logits.options().dtype(mfq_tensor_backend::kFloat32));
+        auto idxs_a = mfq_tensor_backend::empty(
+            {capacity}, logits.options().dtype(mfq_tensor_backend::kInt32));
+        auto vals_b = mfq_tensor_backend::empty(
+            {capacity}, logits.options().dtype(mfq_tensor_backend::kFloat32));
+        auto idxs_b = mfq_tensor_backend::empty(
+            {capacity}, logits.options().dtype(mfq_tensor_backend::kInt32));
+        MFQ_DISPATCH_FLOATING_TYPES_AND2(
+            mfq_dispatch_half, mfq_dispatch_bfloat16,
             logits.scalar_type(), "sample_top_k_radix_stage1", [&] {
             sample_top_k_radix_stage1_kernel<scalar_t><<<first_blocks, SAMPLE_BD, 0, stream>>>(
                 logits.data_ptr<scalar_t>(), vals_a.data_ptr<float>(), idxs_a.data_ptr<int>(),
@@ -512,58 +511,58 @@ torch::Tensor sample_top_k_top_p_cuda(
         return out;
     }
 
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
+    MFQ_DISPATCH_FLOATING_TYPES_AND2(
+        mfq_dispatch_half, mfq_dispatch_bfloat16,
         logits.scalar_type(), "sample_top_k_top_p_cuda", [&] {
-        sample_top_k_top_p_kernel<scalar_t><<<B, SAMPLE_BD, 0, at::cuda::getCurrentCUDAStream()>>>(
+        sample_top_k_top_p_kernel<scalar_t><<<B, SAMPLE_BD, 0, mfq_current_cuda_stream()>>>(
             logits.data_ptr<scalar_t>(), random.data_ptr<float>(), out.data_ptr<int64_t>(),
             B, V, (float)temperature, (int)top_k, (float)top_p);
     });
     return out;
 }
 
-void sample_token_counts_add_cuda(torch::Tensor counts, torch::Tensor tokens)
+void sample_token_counts_add_cuda(mfq_tensor_backend::Tensor counts, mfq_tensor_backend::Tensor tokens)
 {
-    TORCH_CHECK(counts.is_cuda() && counts.is_contiguous() && counts.scalar_type() == torch::kInt32,
+    MFQ_RUNTIME_CHECK(counts.is_cuda() && counts.is_contiguous() && counts.scalar_type() == mfq_tensor_backend::kInt32,
                 "sample_token_counts_add: counts must be contiguous CUDA int32");
-    TORCH_CHECK(tokens.is_cuda() && tokens.is_contiguous() && tokens.scalar_type() == torch::kInt64,
+    MFQ_RUNTIME_CHECK(tokens.is_cuda() && tokens.is_contiguous() && tokens.scalar_type() == mfq_tensor_backend::kInt64,
                 "sample_token_counts_add: tokens must be contiguous CUDA int64");
-    TORCH_CHECK(counts.dim() == 1, "sample_token_counts_add: counts must be [V]");
+    MFQ_RUNTIME_CHECK(counts.dim() == 1, "sample_token_counts_add: counts must be [V]");
     int64_t n = tokens.numel();
     if (n == 0) return;
     constexpr int bd = 256;
     int blocks = (int)((n + bd - 1) / bd);
-    sample_token_counts_add_kernel<<<blocks, bd, 0, at::cuda::getCurrentCUDAStream()>>>(
+    sample_token_counts_add_kernel<<<blocks, bd, 0, mfq_current_cuda_stream()>>>(
         counts.data_ptr<int32_t>(), tokens.data_ptr<int64_t>(), n, (int)counts.numel());
 }
 
-torch::Tensor sample_apply_penalties_cuda(
-    torch::Tensor logits,
-    torch::Tensor counts,
+mfq_tensor_backend::Tensor sample_apply_penalties_cuda(
+    mfq_tensor_backend::Tensor logits,
+    mfq_tensor_backend::Tensor counts,
     double presence_penalty,
     double frequency_penalty,
     double repetition_penalty)
 {
-    TORCH_CHECK(logits.is_cuda() && logits.is_contiguous(),
+    MFQ_RUNTIME_CHECK(logits.is_cuda() && logits.is_contiguous(),
                 "sample_apply_penalties: logits must be contiguous CUDA");
-    TORCH_CHECK(logits.dim() == 2 && logits.size(0) == 1,
+    MFQ_RUNTIME_CHECK(logits.dim() == 2 && logits.size(0) == 1,
                 "sample_apply_penalties: logits must be [1,V]");
-    TORCH_CHECK(
-        logits.scalar_type() == torch::kFloat32 ||
-        logits.scalar_type() == torch::kFloat16 ||
-        logits.scalar_type() == torch::kBFloat16,
+    MFQ_RUNTIME_CHECK(
+        logits.scalar_type() == mfq_tensor_backend::kFloat32 ||
+        logits.scalar_type() == mfq_tensor_backend::kFloat16 ||
+        logits.scalar_type() == mfq_tensor_backend::kBFloat16,
         "sample_apply_penalties: logits dtype must be f32, f16, or bf16");
-    TORCH_CHECK(counts.is_cuda() && counts.is_contiguous() && counts.scalar_type() == torch::kInt32,
+    MFQ_RUNTIME_CHECK(counts.is_cuda() && counts.is_contiguous() && counts.scalar_type() == mfq_tensor_backend::kInt32,
                 "sample_apply_penalties: counts must be contiguous CUDA int32");
-    TORCH_CHECK(counts.dim() == 1 && counts.numel() == logits.size(1),
+    MFQ_RUNTIME_CHECK(counts.dim() == 1 && counts.numel() == logits.size(1),
                 "sample_apply_penalties: counts must be [V]");
     int vocab_size = (int)logits.size(1);
     constexpr int bd = 256;
     int blocks = (vocab_size + bd - 1) / bd;
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
+    MFQ_DISPATCH_FLOATING_TYPES_AND2(
+        mfq_dispatch_half, mfq_dispatch_bfloat16,
         logits.scalar_type(), "sample_apply_penalties_cuda", [&] {
-        sample_apply_penalties_kernel<scalar_t><<<blocks, bd, 0, at::cuda::getCurrentCUDAStream()>>>(
+        sample_apply_penalties_kernel<scalar_t><<<blocks, bd, 0, mfq_current_cuda_stream()>>>(
             logits.data_ptr<scalar_t>(), counts.data_ptr<int32_t>(), vocab_size,
             (float)presence_penalty, (float)frequency_penalty, (float)repetition_penalty);
     });

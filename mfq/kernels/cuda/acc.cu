@@ -1,8 +1,7 @@
 // Residual add a + b (ggml acc.cu: ggml_acc). fp16/fp32, any shape flattened.
 
 #include <cuda_runtime.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
+#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
 #include <vector>
 
 #include "reduce.cuh"
@@ -16,19 +15,19 @@ __global__ void acc_kernel(const scalar_t* __restrict__ a, const scalar_t* __res
     }
 }
 
-torch::Tensor acc_cuda(torch::Tensor a, torch::Tensor b)
+mfq_tensor_backend::Tensor acc_cuda(mfq_tensor_backend::Tensor a, mfq_tensor_backend::Tensor b)
 {
-    TORCH_CHECK(a.is_cuda() && a.is_contiguous(), "acc: a must be cuda contiguous");
-    TORCH_CHECK(b.is_cuda() && b.is_contiguous(), "acc: b must be cuda contiguous");
-    TORCH_CHECK(a.scalar_type() == b.scalar_type(), "acc: a/b dtype mismatch");
-    TORCH_CHECK(a.scalar_type() == torch::kFloat16 || a.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(a.is_cuda() && a.is_contiguous(), "acc: a must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(b.is_cuda() && b.is_contiguous(), "acc: b must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(a.scalar_type() == b.scalar_type(), "acc: a/b dtype mismatch");
+    MFQ_RUNTIME_CHECK(a.scalar_type() == mfq_tensor_backend::kFloat16 || a.scalar_type() == mfq_tensor_backend::kFloat32,
                 "acc: dtype must be f16 or f32");
-    TORCH_CHECK(a.sizes() == b.sizes(), "acc: a/b shape mismatch");
+    MFQ_RUNTIME_CHECK(a.sizes() == b.sizes(), "acc: a/b shape mismatch");
     int n = (int)a.numel();
-    auto out = torch::empty_like(a);
+    auto out = mfq_tensor_backend::empty_like(a);
     constexpr int BD = 256;
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(a.scalar_type(), "acc_cuda", [&] {
-        acc_kernel<scalar_t><<<(n + BD - 1) / BD, BD, 0, at::cuda::getCurrentCUDAStream()>>>(
+    MFQ_DISPATCH_FLOATING_TYPES_AND_HALF(a.scalar_type(), "acc_cuda", [&] {
+        acc_kernel<scalar_t><<<(n + BD - 1) / BD, BD, 0, mfq_current_cuda_stream()>>>(
             a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), out.data_ptr<scalar_t>(), n);
     });
     return out;
@@ -74,27 +73,27 @@ __global__ void acc_rms_norm_kernel(const scalar_t* __restrict__ a,
     }
 }
 
-std::vector<torch::Tensor> acc_rms_norm_cuda(torch::Tensor a, torch::Tensor b,
-                                             torch::Tensor weight, double eps,
+std::vector<mfq_tensor_backend::Tensor> acc_rms_norm_cuda(mfq_tensor_backend::Tensor a, mfq_tensor_backend::Tensor b,
+                                             mfq_tensor_backend::Tensor weight, double eps,
                                              double weight_offset)
 {
-    TORCH_CHECK(a.is_cuda() && a.is_contiguous(), "acc_rms_norm: a must be cuda contiguous");
-    TORCH_CHECK(b.is_cuda() && b.is_contiguous(), "acc_rms_norm: b must be cuda contiguous");
-    TORCH_CHECK(weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(a.is_cuda() && a.is_contiguous(), "acc_rms_norm: a must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(b.is_cuda() && b.is_contiguous(), "acc_rms_norm: b must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == mfq_tensor_backend::kFloat32,
                 "acc_rms_norm: weight must be cuda contiguous f32");
-    TORCH_CHECK(a.scalar_type() == b.scalar_type(), "acc_rms_norm: a/b dtype mismatch");
-    TORCH_CHECK(a.scalar_type() == torch::kFloat16 || a.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(a.scalar_type() == b.scalar_type(), "acc_rms_norm: a/b dtype mismatch");
+    MFQ_RUNTIME_CHECK(a.scalar_type() == mfq_tensor_backend::kFloat16 || a.scalar_type() == mfq_tensor_backend::kFloat32,
                 "acc_rms_norm: dtype must be f16 or f32");
-    TORCH_CHECK(a.sizes() == b.sizes(), "acc_rms_norm: a/b shape mismatch");
-    TORCH_CHECK(a.dim() >= 1, "acc_rms_norm: a must have at least one dim");
+    MFQ_RUNTIME_CHECK(a.sizes() == b.sizes(), "acc_rms_norm: a/b shape mismatch");
+    MFQ_RUNTIME_CHECK(a.dim() >= 1, "acc_rms_norm: a must have at least one dim");
     int D = (int)a.size(-1);
     int N = (int)(a.numel() / D);
-    TORCH_CHECK(weight.numel() == D, "acc_rms_norm: weight length mismatch");
+    MFQ_RUNTIME_CHECK(weight.numel() == D, "acc_rms_norm: weight length mismatch");
 
-    auto sum = torch::empty_like(a);
-    auto norm = torch::empty(a.sizes(), a.options().dtype(torch::kFloat32));
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(a.scalar_type(), "acc_rms_norm_cuda", [&] {
-        acc_rms_norm_kernel<scalar_t, float, ACC_RMS_BD><<<N, ACC_RMS_BD, 0, at::cuda::getCurrentCUDAStream()>>>(
+    auto sum = mfq_tensor_backend::empty_like(a);
+    auto norm = mfq_tensor_backend::empty(a.sizes(), a.options().dtype(mfq_tensor_backend::kFloat32));
+    MFQ_DISPATCH_FLOATING_TYPES_AND_HALF(a.scalar_type(), "acc_rms_norm_cuda", [&] {
+        acc_rms_norm_kernel<scalar_t, float, ACC_RMS_BD><<<N, ACC_RMS_BD, 0, mfq_current_cuda_stream()>>>(
             a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), weight.data_ptr<float>(),
             sum.data_ptr<scalar_t>(), norm.data_ptr<float>(), N, D,
             (float)eps, (float)weight_offset);
@@ -102,43 +101,43 @@ std::vector<torch::Tensor> acc_rms_norm_cuda(torch::Tensor a, torch::Tensor b,
     return {sum, norm};
 }
 
-std::vector<torch::Tensor> acc_rms_norm_f16_cuda(torch::Tensor a, torch::Tensor b,
-                                                 torch::Tensor weight, double eps,
+std::vector<mfq_tensor_backend::Tensor> acc_rms_norm_f16_cuda(mfq_tensor_backend::Tensor a, mfq_tensor_backend::Tensor b,
+                                                 mfq_tensor_backend::Tensor weight, double eps,
                                                  double weight_offset)
 {
-    TORCH_CHECK(a.is_cuda() && a.is_contiguous(), "acc_rms_norm_f16: a must be cuda contiguous");
-    TORCH_CHECK(b.is_cuda() && b.is_contiguous(), "acc_rms_norm_f16: b must be cuda contiguous");
-    TORCH_CHECK(weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(a.is_cuda() && a.is_contiguous(), "acc_rms_norm_f16: a must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(b.is_cuda() && b.is_contiguous(), "acc_rms_norm_f16: b must be cuda contiguous");
+    MFQ_RUNTIME_CHECK(weight.is_cuda() && weight.is_contiguous() && weight.scalar_type() == mfq_tensor_backend::kFloat32,
                 "acc_rms_norm_f16: weight must be cuda contiguous f32");
-    TORCH_CHECK(a.scalar_type() == torch::kFloat16 && b.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(a.scalar_type() == mfq_tensor_backend::kFloat16 && b.scalar_type() == mfq_tensor_backend::kFloat16,
                 "acc_rms_norm_f16: a/b must be f16");
-    TORCH_CHECK(a.sizes() == b.sizes(), "acc_rms_norm_f16: a/b shape mismatch");
-    TORCH_CHECK(a.dim() >= 1, "acc_rms_norm_f16: a must have at least one dim");
+    MFQ_RUNTIME_CHECK(a.sizes() == b.sizes(), "acc_rms_norm_f16: a/b shape mismatch");
+    MFQ_RUNTIME_CHECK(a.dim() >= 1, "acc_rms_norm_f16: a must have at least one dim");
     int D = (int)a.size(-1);
     int N = (int)(a.numel() / D);
-    TORCH_CHECK(weight.numel() == D, "acc_rms_norm_f16: weight length mismatch");
+    MFQ_RUNTIME_CHECK(weight.numel() == D, "acc_rms_norm_f16: weight length mismatch");
 
-    auto sum = torch::empty_like(a);
-    auto norm = torch::empty_like(a);
-    acc_rms_norm_kernel<at::Half, at::Half, ACC_RMS_BD><<<N, ACC_RMS_BD, 0, at::cuda::getCurrentCUDAStream()>>>(
-        a.data_ptr<at::Half>(), b.data_ptr<at::Half>(), weight.data_ptr<float>(),
-        sum.data_ptr<at::Half>(), norm.data_ptr<at::Half>(), N, D,
+    auto sum = mfq_tensor_backend::empty_like(a);
+    auto norm = mfq_tensor_backend::empty_like(a);
+    acc_rms_norm_kernel<mfq_half, mfq_half, ACC_RMS_BD><<<N, ACC_RMS_BD, 0, mfq_current_cuda_stream()>>>(
+        a.data_ptr<mfq_half>(), b.data_ptr<mfq_half>(), weight.data_ptr<float>(),
+        sum.data_ptr<mfq_half>(), norm.data_ptr<mfq_half>(), N, D,
         (float)eps, (float)weight_offset);
     return {sum, norm};
 }
 
 template <int BD>
 __global__ void gemma4_attn_residual_pre_norms_f16_kernel(
-    const at::Half* __restrict__ residual,
-    const at::Half* __restrict__ attn,
+    const mfq_half* __restrict__ residual,
+    const mfq_half* __restrict__ attn,
     const float* __restrict__ attn_post_weight,
     const float* __restrict__ dense_pre_weight,
     const float* __restrict__ router_weight,
     const float* __restrict__ moe_pre_weight,
-    at::Half* __restrict__ residual_out,
-    at::Half* __restrict__ dense_out,
+    mfq_half* __restrict__ residual_out,
+    mfq_half* __restrict__ dense_out,
     float* __restrict__ router_out,
-    at::Half* __restrict__ moe_out,
+    mfq_half* __restrict__ moe_out,
     int N, int D, float eps)
 {
     const int row = blockIdx.x;
@@ -147,14 +146,14 @@ __global__ void gemma4_attn_residual_pre_norms_f16_kernel(
     }
 
     extern __shared__ unsigned char shared_bytes[];
-    auto* shared_x = reinterpret_cast<at::Half*>(shared_bytes);
+    auto* shared_x = reinterpret_cast<mfq_half*>(shared_bytes);
     const size_t row_offset = (size_t)row * D;
-    const at::Half* rr = residual + row_offset;
-    const at::Half* ar = attn + row_offset;
-    at::Half* xr = residual_out + row_offset;
-    at::Half* dr = dense_out + row_offset;
+    const mfq_half* rr = residual + row_offset;
+    const mfq_half* ar = attn + row_offset;
+    mfq_half* xr = residual_out + row_offset;
+    mfq_half* dr = dense_out + row_offset;
     float* router_r = router_out + row_offset;
-    at::Half* mr = moe_out + row_offset;
+    mfq_half* mr = moe_out + row_offset;
 
     float attn_ssq = 0.0f;
     for (int i = threadIdx.x; i < D; i += BD) {
@@ -166,9 +165,9 @@ __global__ void gemma4_attn_residual_pre_norms_f16_kernel(
 
     float x_ssq = 0.0f;
     for (int i = threadIdx.x; i < D; i += BD) {
-        const at::Half attn_norm = (at::Half)(
+        const mfq_half attn_norm = (mfq_half)(
             (float)ar[i] * attn_rinv * attn_post_weight[i]);
-        const at::Half x_value = (at::Half)((float)rr[i] + (float)attn_norm);
+        const mfq_half x_value = (mfq_half)((float)rr[i] + (float)attn_norm);
         xr[i] = x_value;
         shared_x[i] = x_value;
         const float value = (float)x_value;
@@ -179,62 +178,62 @@ __global__ void gemma4_attn_residual_pre_norms_f16_kernel(
 
     for (int i = threadIdx.x; i < D; i += BD) {
         const float value = (float)shared_x[i] * x_rinv;
-        dr[i] = (at::Half)(value * dense_pre_weight[i]);
+        dr[i] = (mfq_half)(value * dense_pre_weight[i]);
         router_r[i] = value * router_weight[i];
-        mr[i] = (at::Half)(value * moe_pre_weight[i]);
+        mr[i] = (mfq_half)(value * moe_pre_weight[i]);
     }
 }
 
-std::vector<torch::Tensor> gemma4_attn_residual_pre_norms_f16_cuda(
-    torch::Tensor residual, torch::Tensor attn,
-    torch::Tensor attn_post_weight, torch::Tensor dense_pre_weight,
-    torch::Tensor router_weight, torch::Tensor moe_pre_weight, double eps)
+std::vector<mfq_tensor_backend::Tensor> gemma4_attn_residual_pre_norms_f16_cuda(
+    mfq_tensor_backend::Tensor residual, mfq_tensor_backend::Tensor attn,
+    mfq_tensor_backend::Tensor attn_post_weight, mfq_tensor_backend::Tensor dense_pre_weight,
+    mfq_tensor_backend::Tensor router_weight, mfq_tensor_backend::Tensor moe_pre_weight, double eps)
 {
-    TORCH_CHECK(residual.is_cuda() && residual.is_contiguous() &&
-                    residual.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(residual.is_cuda() && residual.is_contiguous() &&
+                    residual.scalar_type() == mfq_tensor_backend::kFloat16,
                 "gemma4 fused pre norms: residual must be cuda contiguous f16");
-    TORCH_CHECK(attn.is_cuda() && attn.is_contiguous() &&
-                    attn.scalar_type() == torch::kFloat16,
+    MFQ_RUNTIME_CHECK(attn.is_cuda() && attn.is_contiguous() &&
+                    attn.scalar_type() == mfq_tensor_backend::kFloat16,
                 "gemma4 fused pre norms: attention output must be cuda contiguous f16");
-    TORCH_CHECK(residual.sizes() == attn.sizes(),
+    MFQ_RUNTIME_CHECK(residual.sizes() == attn.sizes(),
                 "gemma4 fused pre norms: activation shape mismatch");
-    TORCH_CHECK(residual.dim() >= 1,
+    MFQ_RUNTIME_CHECK(residual.dim() >= 1,
                 "gemma4 fused pre norms: activation must have at least one dimension");
     const int D = (int)residual.size(-1);
     const int N = (int)(residual.numel() / D);
     for (const auto& weight : {attn_post_weight, dense_pre_weight, router_weight, moe_pre_weight}) {
-        TORCH_CHECK(weight.is_cuda() && weight.is_contiguous() &&
-                        weight.scalar_type() == torch::kFloat32 && weight.numel() == D,
+        MFQ_RUNTIME_CHECK(weight.is_cuda() && weight.is_contiguous() &&
+                        weight.scalar_type() == mfq_tensor_backend::kFloat32 && weight.numel() == D,
                     "gemma4 fused pre norms: weights must be cuda contiguous f32[D]");
     }
 
-    auto residual_out = torch::empty_like(residual);
-    auto dense_out = torch::empty_like(residual);
-    auto router_out = torch::empty(residual.sizes(), residual.options().dtype(torch::kFloat32));
-    auto moe_out = torch::empty_like(residual);
+    auto residual_out = mfq_tensor_backend::empty_like(residual);
+    auto dense_out = mfq_tensor_backend::empty_like(residual);
+    auto router_out = mfq_tensor_backend::empty(residual.sizes(), residual.options().dtype(mfq_tensor_backend::kFloat32));
+    auto moe_out = mfq_tensor_backend::empty_like(residual);
     constexpr int BD = ACC_RMS_BD;
-    const size_t shared_bytes = (size_t)D * sizeof(at::Half);
+    const size_t shared_bytes = (size_t)D * sizeof(mfq_half);
     gemma4_attn_residual_pre_norms_f16_kernel<BD>
-        <<<N, BD, shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
-            residual.data_ptr<at::Half>(), attn.data_ptr<at::Half>(),
+        <<<N, BD, shared_bytes, mfq_current_cuda_stream()>>>(
+            residual.data_ptr<mfq_half>(), attn.data_ptr<mfq_half>(),
             attn_post_weight.data_ptr<float>(), dense_pre_weight.data_ptr<float>(),
             router_weight.data_ptr<float>(), moe_pre_weight.data_ptr<float>(),
-            residual_out.data_ptr<at::Half>(), dense_out.data_ptr<at::Half>(),
-            router_out.data_ptr<float>(), moe_out.data_ptr<at::Half>(),
+            residual_out.data_ptr<mfq_half>(), dense_out.data_ptr<mfq_half>(),
+            router_out.data_ptr<float>(), moe_out.data_ptr<mfq_half>(),
             N, D, (float)eps);
     return {residual_out, dense_out, router_out, moe_out};
 }
 
 template <int BD>
 __global__ void gemma4_ffn_merge_f16_kernel(
-    const at::Half* __restrict__ dense,
-    const at::Half* __restrict__ moe,
-    const at::Half* __restrict__ residual,
+    const mfq_half* __restrict__ dense,
+    const mfq_half* __restrict__ moe,
+    const mfq_half* __restrict__ residual,
     const float* __restrict__ dense_post_weight,
     const float* __restrict__ moe_post_weight,
     const float* __restrict__ final_post_weight,
-    const at::Half* __restrict__ layer_scale,
-    at::Half* __restrict__ out,
+    const mfq_half* __restrict__ layer_scale,
+    mfq_half* __restrict__ out,
     int N, int D, float eps)
 {
     const int row = blockIdx.x;
@@ -243,12 +242,12 @@ __global__ void gemma4_ffn_merge_f16_kernel(
     }
 
     extern __shared__ unsigned char shared_bytes[];
-    auto* combined = reinterpret_cast<at::Half*>(shared_bytes);
+    auto* combined = reinterpret_cast<mfq_half*>(shared_bytes);
     const size_t row_offset = (size_t)row * D;
-    const at::Half* dr = dense + row_offset;
-    const at::Half* mr = moe + row_offset;
-    const at::Half* rr = residual + row_offset;
-    at::Half* orow = out + row_offset;
+    const mfq_half* dr = dense + row_offset;
+    const mfq_half* mr = moe + row_offset;
+    const mfq_half* rr = residual + row_offset;
+    mfq_half* orow = out + row_offset;
 
     float dense_ssq = 0.0f;
     float moe_ssq = 0.0f;
@@ -265,11 +264,11 @@ __global__ void gemma4_ffn_merge_f16_kernel(
 
     float combined_ssq = 0.0f;
     for (int i = threadIdx.x; i < D; i += BD) {
-        const at::Half dense_norm = (at::Half)(
+        const mfq_half dense_norm = (mfq_half)(
             (float)dr[i] * dense_rinv * dense_post_weight[i]);
-        const at::Half moe_norm = (at::Half)(
+        const mfq_half moe_norm = (mfq_half)(
             (float)mr[i] * moe_rinv * moe_post_weight[i]);
-        const at::Half value = (at::Half)((float)dense_norm + (float)moe_norm);
+        const mfq_half value = (mfq_half)((float)dense_norm + (float)moe_norm);
         combined[i] = value;
         const float value_f = (float)value;
         combined_ssq += value_f * value_f;
@@ -279,47 +278,47 @@ __global__ void gemma4_ffn_merge_f16_kernel(
     const float scale = (float)layer_scale[0];
 
     for (int i = threadIdx.x; i < D; i += BD) {
-        const at::Half post = (at::Half)(
+        const mfq_half post = (mfq_half)(
             (float)combined[i] * combined_rinv * final_post_weight[i]);
-        const at::Half residual_sum = (at::Half)((float)rr[i] + (float)post);
-        orow[i] = (at::Half)((float)residual_sum * scale);
+        const mfq_half residual_sum = (mfq_half)((float)rr[i] + (float)post);
+        orow[i] = (mfq_half)((float)residual_sum * scale);
     }
 }
 
-torch::Tensor gemma4_ffn_merge_f16_cuda(
-    torch::Tensor dense, torch::Tensor moe, torch::Tensor residual,
-    torch::Tensor dense_post_weight, torch::Tensor moe_post_weight,
-    torch::Tensor final_post_weight, torch::Tensor layer_scale, double eps)
+mfq_tensor_backend::Tensor gemma4_ffn_merge_f16_cuda(
+    mfq_tensor_backend::Tensor dense, mfq_tensor_backend::Tensor moe, mfq_tensor_backend::Tensor residual,
+    mfq_tensor_backend::Tensor dense_post_weight, mfq_tensor_backend::Tensor moe_post_weight,
+    mfq_tensor_backend::Tensor final_post_weight, mfq_tensor_backend::Tensor layer_scale, double eps)
 {
     for (const auto& value : {dense, moe, residual}) {
-        TORCH_CHECK(value.is_cuda() && value.is_contiguous() &&
-                        value.scalar_type() == torch::kFloat16,
+        MFQ_RUNTIME_CHECK(value.is_cuda() && value.is_contiguous() &&
+                        value.scalar_type() == mfq_tensor_backend::kFloat16,
                     "gemma4 fused FFN merge: activations must be cuda contiguous f16");
     }
-    TORCH_CHECK(dense.sizes() == moe.sizes() && dense.sizes() == residual.sizes(),
+    MFQ_RUNTIME_CHECK(dense.sizes() == moe.sizes() && dense.sizes() == residual.sizes(),
                 "gemma4 fused FFN merge: activation shape mismatch");
-    TORCH_CHECK(dense.dim() >= 1,
+    MFQ_RUNTIME_CHECK(dense.dim() >= 1,
                 "gemma4 fused FFN merge: activation must have at least one dimension");
     const int D = (int)dense.size(-1);
     const int N = (int)(dense.numel() / D);
     for (const auto& weight : {dense_post_weight, moe_post_weight, final_post_weight}) {
-        TORCH_CHECK(weight.is_cuda() && weight.is_contiguous() &&
-                        weight.scalar_type() == torch::kFloat32 && weight.numel() == D,
+        MFQ_RUNTIME_CHECK(weight.is_cuda() && weight.is_contiguous() &&
+                        weight.scalar_type() == mfq_tensor_backend::kFloat32 && weight.numel() == D,
                     "gemma4 fused FFN merge: weights must be cuda contiguous f32[D]");
     }
-    TORCH_CHECK(layer_scale.is_cuda() && layer_scale.is_contiguous() &&
-                    layer_scale.scalar_type() == torch::kFloat16 && layer_scale.numel() == 1,
+    MFQ_RUNTIME_CHECK(layer_scale.is_cuda() && layer_scale.is_contiguous() &&
+                    layer_scale.scalar_type() == mfq_tensor_backend::kFloat16 && layer_scale.numel() == 1,
                 "gemma4 fused FFN merge: layer scale must be cuda contiguous f16[1]");
 
-    auto out = torch::empty_like(dense);
+    auto out = mfq_tensor_backend::empty_like(dense);
     constexpr int BD = ACC_RMS_BD;
-    const size_t shared_bytes = (size_t)D * sizeof(at::Half);
+    const size_t shared_bytes = (size_t)D * sizeof(mfq_half);
     gemma4_ffn_merge_f16_kernel<BD>
-        <<<N, BD, shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
-            dense.data_ptr<at::Half>(), moe.data_ptr<at::Half>(), residual.data_ptr<at::Half>(),
+        <<<N, BD, shared_bytes, mfq_current_cuda_stream()>>>(
+            dense.data_ptr<mfq_half>(), moe.data_ptr<mfq_half>(), residual.data_ptr<mfq_half>(),
             dense_post_weight.data_ptr<float>(), moe_post_weight.data_ptr<float>(),
-            final_post_weight.data_ptr<float>(), layer_scale.data_ptr<at::Half>(),
-            out.data_ptr<at::Half>(), N, D, (float)eps);
+            final_post_weight.data_ptr<float>(), layer_scale.data_ptr<mfq_half>(),
+            out.data_ptr<mfq_half>(), N, D, (float)eps);
     return out;
 }
 
@@ -339,22 +338,22 @@ __global__ void decode_graph_commit_kernel(const int64_t* __restrict__ next,
     step[0] = idx + 1;
 }
 
-void decode_graph_commit_cuda(torch::Tensor next, torch::Tensor generated, torch::Tensor step,
-                              torch::Tensor input, torch::Tensor pos, torch::Tensor len)
+void decode_graph_commit_cuda(mfq_tensor_backend::Tensor next, mfq_tensor_backend::Tensor generated, mfq_tensor_backend::Tensor step,
+                              mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor pos, mfq_tensor_backend::Tensor len)
 {
-    TORCH_CHECK(next.is_cuda() && next.is_contiguous() && next.scalar_type() == torch::kInt64,
+    MFQ_RUNTIME_CHECK(next.is_cuda() && next.is_contiguous() && next.scalar_type() == mfq_tensor_backend::kInt64,
                 "decode_graph_commit: next must be cuda int64 contiguous");
-    TORCH_CHECK(generated.is_cuda() && generated.is_contiguous() && generated.scalar_type() == torch::kInt64,
+    MFQ_RUNTIME_CHECK(generated.is_cuda() && generated.is_contiguous() && generated.scalar_type() == mfq_tensor_backend::kInt64,
                 "decode_graph_commit: generated must be cuda int64 contiguous");
-    TORCH_CHECK(step.is_cuda() && step.is_contiguous() && step.scalar_type() == torch::kInt64 && step.numel() == 1,
+    MFQ_RUNTIME_CHECK(step.is_cuda() && step.is_contiguous() && step.scalar_type() == mfq_tensor_backend::kInt64 && step.numel() == 1,
                 "decode_graph_commit: step must be cuda int64[1]");
-    TORCH_CHECK(input.is_cuda() && input.is_contiguous() && input.scalar_type() == torch::kInt64 && input.numel() == 1,
+    MFQ_RUNTIME_CHECK(input.is_cuda() && input.is_contiguous() && input.scalar_type() == mfq_tensor_backend::kInt64 && input.numel() == 1,
                 "decode_graph_commit: input must be cuda int64[1]");
-    TORCH_CHECK(pos.is_cuda() && pos.is_contiguous() && pos.scalar_type() == torch::kInt64 && pos.numel() == 1,
+    MFQ_RUNTIME_CHECK(pos.is_cuda() && pos.is_contiguous() && pos.scalar_type() == mfq_tensor_backend::kInt64 && pos.numel() == 1,
                 "decode_graph_commit: pos must be cuda int64[1]");
-    TORCH_CHECK(len.is_cuda() && len.is_contiguous() && len.scalar_type() == torch::kInt64 && len.numel() == 1,
+    MFQ_RUNTIME_CHECK(len.is_cuda() && len.is_contiguous() && len.scalar_type() == mfq_tensor_backend::kInt64 && len.numel() == 1,
                 "decode_graph_commit: len must be cuda int64[1]");
-    decode_graph_commit_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
+    decode_graph_commit_kernel<<<1, 1, 0, mfq_current_cuda_stream()>>>(
         next.data_ptr<int64_t>(), generated.data_ptr<int64_t>(), step.data_ptr<int64_t>(),
         input.data_ptr<int64_t>(), pos.data_ptr<int64_t>(), len.data_ptr<int64_t>());
 }

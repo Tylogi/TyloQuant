@@ -214,14 +214,6 @@ def _mlx_root() -> Path:
     return root
 
 
-def _torch_cmake_prefix() -> str:
-    try:
-        from torch.utils import cmake_prefix_path
-    except (ImportError, ModuleNotFoundError) as error:
-        raise BuildError("CUDA runtime compilation requires PyTorch") from error
-    return str(cmake_prefix_path)
-
-
 def runtime_executable(build_dir: Path, backend: str) -> Path:
     if backend == "metal":
         return build_dir / "metal" / "mfq-decode-metal"
@@ -283,8 +275,7 @@ def create_build_plan(
         configure.extend(
             [
                 "-DMFQ_BUILD_METAL_RUNTIME=OFF",
-                f"-DPython_EXECUTABLE={sys.executable}",
-                f"-DCMAKE_PREFIX_PATH={_torch_cmake_prefix()}",
+                "-DMFQ_BUILD_TORCH_REFERENCE_RUNTIME=OFF",
             ]
         )
     configure.extend(str(value) for value in cmake_args)

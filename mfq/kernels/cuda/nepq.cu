@@ -1,9 +1,7 @@
-#include <torch/extension.h>
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
 
 #include <cuda.h>
+#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -57,41 +55,41 @@ __global__ void nepq_hadamard_input_kernel(
 }  // namespace
 
 
-torch::Tensor nepq_hadamard_input_cuda(
-    torch::Tensor input,
-    torch::Tensor signs,
+mfq_tensor_backend::Tensor nepq_hadamard_input_cuda(
+    mfq_tensor_backend::Tensor input,
+    mfq_tensor_backend::Tensor signs,
     int64_t block_size) {
-    TORCH_CHECK(
-        input.is_cuda() && input.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(
+        input.is_cuda() && input.scalar_type() == mfq_tensor_backend::kFloat16 &&
         input.is_contiguous() && input.dim() == 2,
         "NEPQ Hadamard input must be CUDA contiguous fp16 rank-2");
-    TORCH_CHECK(
-        signs.is_cuda() && signs.scalar_type() == torch::kInt8 &&
+    MFQ_RUNTIME_CHECK(
+        signs.is_cuda() && signs.scalar_type() == mfq_tensor_backend::kInt8 &&
         signs.is_contiguous() && signs.dim() == 1,
         "NEPQ Hadamard signs must be CUDA contiguous int8 rank-1");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         block_size >= 2 && block_size <= 2048 &&
         (block_size & (block_size - 1)) == 0,
         "NEPQ Hadamard block must be a power of two in [2,2048]");
     const int rows = static_cast<int>(input.size(0));
     const int width = static_cast<int>(input.size(1));
-    TORCH_CHECK(signs.numel() == width, "NEPQ Hadamard sign width mismatch");
-    TORCH_CHECK(width % block_size == 0, "NEPQ Hadamard block must divide K");
-    c10::cuda::CUDAGuard guard(input.device());
-    auto output = torch::empty_like(input);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    MFQ_RUNTIME_CHECK(signs.numel() == width, "NEPQ Hadamard sign width mismatch");
+    MFQ_RUNTIME_CHECK(width % block_size == 0, "NEPQ Hadamard block must divide K");
+    MfqCudaGuard guard(input.device());
+    auto output = mfq_tensor_backend::empty_like(input);
+    cudaStream_t stream = mfq_current_cuda_stream();
     nepq_hadamard_input_kernel<<<
         dim3(width / block_size, rows),
         256,
         static_cast<size_t>(block_size) * sizeof(float),
         stream>>>(
-        reinterpret_cast<const __half *>(input.data_ptr<at::Half>()),
+        reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
         signs.data_ptr<int8_t>(),
-        reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+        reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
         rows,
         width,
         static_cast<int>(block_size));
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess,
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess,
                 "NEPQ Hadamard input kernel launch failed");
     return output;
 }

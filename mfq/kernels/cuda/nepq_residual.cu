@@ -1,9 +1,7 @@
-#include <torch/extension.h>
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
 
 #include <cuda.h>
+#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -205,153 +203,153 @@ __global__ void nepq_sparse_residual_grouped_kernel(
 }
 
 void validate_residual(
-    const torch::Tensor & dictionary,
-    const torch::Tensor & first,
-    const torch::Tensor & second,
+    const mfq_tensor_backend::Tensor & dictionary,
+    const mfq_tensor_backend::Tensor & first,
+    const mfq_tensor_backend::Tensor & second,
     int64_t width,
     int64_t position_bits,
     int64_t block_vectors) {
-    TORCH_CHECK(
-        dictionary.is_cuda() && dictionary.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(
+        dictionary.is_cuda() && dictionary.scalar_type() == mfq_tensor_backend::kFloat16 &&
         dictionary.is_contiguous() && dictionary.dim() == 2 &&
         dictionary.size(0) == 1024 && dictionary.size(1) == 8,
         "NEPQ-A dictionary must be CUDA contiguous fp16 [1024,8]");
-    TORCH_CHECK(
-        first.is_cuda() && first.scalar_type() == torch::kInt16 &&
+    MFQ_RUNTIME_CHECK(
+        first.is_cuda() && first.scalar_type() == mfq_tensor_backend::kInt16 &&
         first.is_contiguous() && first.dim() == 2,
         "NEPQ-A first records must be CUDA contiguous int16 rank-2");
-    TORCH_CHECK(
-        second.is_cuda() && second.scalar_type() == torch::kInt16 &&
+    MFQ_RUNTIME_CHECK(
+        second.is_cuda() && second.scalar_type() == mfq_tensor_backend::kInt16 &&
         second.is_contiguous() && second.sizes() == first.sizes(),
         "NEPQ-A second records must be int16 and match the first-record layout");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         dictionary.device() == first.device() &&
         dictionary.device() == second.device(),
         "NEPQ-A residual tensors must share one CUDA device");
-    TORCH_CHECK(width > 0 && width % 8 == 0, "NEPQ-A width must be divisible by 8");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(width > 0 && width % 8 == 0, "NEPQ-A width must be divisible by 8");
+    MFQ_RUNTIME_CHECK(
         position_bits >= 1 && position_bits <= 5 &&
         block_vectors >= 2 && block_vectors <= 32,
         "invalid NEPQ-A residual profile");
     const int64_t expected_blocks = (width / 8 + block_vectors - 1) / block_vectors;
-    TORCH_CHECK(first.size(1) == expected_blocks, "NEPQ-A block count mismatch");
+    MFQ_RUNTIME_CHECK(first.size(1) == expected_blocks, "NEPQ-A block count mismatch");
 }
 
 }  // namespace
 
 
-torch::Tensor nepq_sparse_residual_matmul_cuda(
-    torch::Tensor dictionary,
-    torch::Tensor first,
-    torch::Tensor second,
-    torch::Tensor input,
+mfq_tensor_backend::Tensor nepq_sparse_residual_matmul_cuda(
+    mfq_tensor_backend::Tensor dictionary,
+    mfq_tensor_backend::Tensor first,
+    mfq_tensor_backend::Tensor second,
+    mfq_tensor_backend::Tensor input,
     int64_t position_bits,
     int64_t block_vectors,
-    torch::Tensor output) {
-    TORCH_CHECK(
-        input.is_cuda() && input.scalar_type() == torch::kFloat16 &&
+    mfq_tensor_backend::Tensor output) {
+    MFQ_RUNTIME_CHECK(
+        input.is_cuda() && input.scalar_type() == mfq_tensor_backend::kFloat16 &&
         input.is_contiguous() && input.dim() == 2,
         "NEPQ-A input must be CUDA contiguous fp16 rank-2");
-    TORCH_CHECK(
-        output.is_cuda() && output.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(
+        output.is_cuda() && output.scalar_type() == mfq_tensor_backend::kFloat16 &&
         output.is_contiguous() && output.dim() == 2 &&
         output.size(0) == input.size(0) && output.size(1) == first.size(0),
         "NEPQ-A output must be CUDA contiguous fp16 [M,rows]");
     validate_residual(
         dictionary, first, second, input.size(1), position_bits, block_vectors);
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         dictionary.device() == input.device() && input.device() == output.device(),
         "NEPQ-A matmul tensors must share one CUDA device");
-    c10::cuda::CUDAGuard guard(input.device());
+    MfqCudaGuard guard(input.device());
     const int64_t total = input.size(0) * first.size(0);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
     nepq_sparse_residual_matmul_kernel<<<
         (total + kWarpsPerBlock - 1) / kWarpsPerBlock,
         kWarpSize * kWarpsPerBlock,
         0,
         stream>>>(
-        reinterpret_cast<const __half *>(dictionary.data_ptr<at::Half>()),
+        reinterpret_cast<const __half *>(dictionary.data_ptr<mfq_half>()),
         first.data_ptr<int16_t>(),
         second.data_ptr<int16_t>(),
-        reinterpret_cast<const __half *>(input.data_ptr<at::Half>()),
-        reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+        reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
+        reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
         static_cast<int>(first.size(0)),
         static_cast<int>(input.size(1)),
         static_cast<int>(input.size(0)),
         static_cast<int>(first.size(1)),
         static_cast<int>(position_bits),
         static_cast<int>(block_vectors));
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess,
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess,
                 "NEPQ-A residual matmul kernel launch failed");
     return output;
 }
 
 
-torch::Tensor nepq_sparse_residual_dequant_cuda(
-    torch::Tensor dictionary,
-    torch::Tensor first,
-    torch::Tensor second,
+mfq_tensor_backend::Tensor nepq_sparse_residual_dequant_cuda(
+    mfq_tensor_backend::Tensor dictionary,
+    mfq_tensor_backend::Tensor first,
+    mfq_tensor_backend::Tensor second,
     int64_t position_bits,
     int64_t block_vectors,
-    torch::Tensor weight) {
-    TORCH_CHECK(
-        weight.is_cuda() && weight.scalar_type() == torch::kFloat16 &&
+    mfq_tensor_backend::Tensor weight) {
+    MFQ_RUNTIME_CHECK(
+        weight.is_cuda() && weight.scalar_type() == mfq_tensor_backend::kFloat16 &&
         weight.is_contiguous() && weight.dim() == 2 &&
         weight.size(0) == first.size(0),
         "NEPQ-A weight must be CUDA contiguous fp16 [rows,K]");
     validate_residual(
         dictionary, first, second, weight.size(1), position_bits, block_vectors);
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         dictionary.device() == weight.device(),
         "NEPQ-A dequant tensors must share one CUDA device");
-    c10::cuda::CUDAGuard guard(weight.device());
+    MfqCudaGuard guard(weight.device());
     const int64_t total = first.numel();
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
     nepq_sparse_residual_dequant_kernel<<<
         (total + 255) / 256,
         256,
         0,
         stream>>>(
-        reinterpret_cast<const __half *>(dictionary.data_ptr<at::Half>()),
+        reinterpret_cast<const __half *>(dictionary.data_ptr<mfq_half>()),
         first.data_ptr<int16_t>(),
         second.data_ptr<int16_t>(),
-        reinterpret_cast<__half *>(weight.data_ptr<at::Half>()),
+        reinterpret_cast<__half *>(weight.data_ptr<mfq_half>()),
         static_cast<int>(weight.size(1)),
         static_cast<int>(first.size(1)),
         static_cast<int>(position_bits),
         static_cast<int>(block_vectors),
         total);
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess,
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess,
                 "NEPQ-A residual dequant kernel launch failed");
     return weight;
 }
 
 
-torch::Tensor nepq_sparse_residual_grouped_cuda(
-    torch::Tensor dictionary,
-    torch::Tensor first,
-    torch::Tensor second,
-    torch::Tensor input,
-    torch::Tensor route_ids,
-    torch::Tensor expert_local,
+mfq_tensor_backend::Tensor nepq_sparse_residual_grouped_cuda(
+    mfq_tensor_backend::Tensor dictionary,
+    mfq_tensor_backend::Tensor first,
+    mfq_tensor_backend::Tensor second,
+    mfq_tensor_backend::Tensor input,
+    mfq_tensor_backend::Tensor route_ids,
+    mfq_tensor_backend::Tensor expert_local,
     int64_t out_per_expert,
     int64_t position_bits,
     int64_t block_vectors,
-    torch::Tensor output) {
-    TORCH_CHECK(
-        input.is_cuda() && input.scalar_type() == torch::kFloat16 &&
+    mfq_tensor_backend::Tensor output) {
+    MFQ_RUNTIME_CHECK(
+        input.is_cuda() && input.scalar_type() == mfq_tensor_backend::kFloat16 &&
         input.is_contiguous() && (input.dim() == 2 || input.dim() == 3),
         "NEPQ-A routed input must be CUDA contiguous fp16 rank-2 or rank-3");
-    TORCH_CHECK(
-        route_ids.is_cuda() && route_ids.scalar_type() == torch::kInt32 &&
+    MFQ_RUNTIME_CHECK(
+        route_ids.is_cuda() && route_ids.scalar_type() == mfq_tensor_backend::kInt32 &&
         route_ids.is_contiguous() && route_ids.dim() == 2,
         "NEPQ-A route IDs must be CUDA contiguous int32 rank-2");
-    TORCH_CHECK(
-        expert_local.is_cuda() && expert_local.scalar_type() == torch::kInt32 &&
+    MFQ_RUNTIME_CHECK(
+        expert_local.is_cuda() && expert_local.scalar_type() == mfq_tensor_backend::kInt32 &&
         expert_local.is_contiguous() && expert_local.dim() == 1,
         "NEPQ-A expert map must be CUDA contiguous int32 rank-1");
-    TORCH_CHECK(
-        output.is_cuda() && output.scalar_type() == torch::kFloat16 &&
+    MFQ_RUNTIME_CHECK(
+        output.is_cuda() && output.scalar_type() == mfq_tensor_backend::kFloat16 &&
         output.is_contiguous() && output.dim() == 3 &&
         output.size(0) == route_ids.size(0) &&
         output.size(1) == route_ids.size(1) &&
@@ -359,34 +357,34 @@ torch::Tensor nepq_sparse_residual_grouped_cuda(
         "NEPQ-A grouped output shape mismatch");
     const int64_t width = input.size(-1);
     validate_residual(dictionary, first, second, width, position_bits, block_vectors);
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         dictionary.device() == input.device() &&
         input.device() == route_ids.device() &&
         input.device() == expert_local.device() &&
         input.device() == output.device(),
         "NEPQ-A grouped tensors must share one CUDA device");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         first.size(0) % out_per_expert == 0,
         "NEPQ-A expert row count is not divisible by output width");
-    TORCH_CHECK(
+    MFQ_RUNTIME_CHECK(
         input.size(0) == route_ids.size(0) &&
         (input.dim() == 2 || input.size(1) == route_ids.size(1)),
         "NEPQ-A routed input leading dimensions mismatch");
-    c10::cuda::CUDAGuard guard(input.device());
+    MfqCudaGuard guard(input.device());
     const int64_t total = route_ids.numel() * out_per_expert;
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = mfq_current_cuda_stream();
     nepq_sparse_residual_grouped_kernel<<<
         (total + kWarpsPerBlock - 1) / kWarpsPerBlock,
         kWarpSize * kWarpsPerBlock,
         0,
         stream>>>(
-        reinterpret_cast<const __half *>(dictionary.data_ptr<at::Half>()),
+        reinterpret_cast<const __half *>(dictionary.data_ptr<mfq_half>()),
         first.data_ptr<int16_t>(),
         second.data_ptr<int16_t>(),
-        reinterpret_cast<const __half *>(input.data_ptr<at::Half>()),
+        reinterpret_cast<const __half *>(input.data_ptr<mfq_half>()),
         route_ids.data_ptr<int32_t>(),
         expert_local.data_ptr<int32_t>(),
-        reinterpret_cast<__half *>(output.data_ptr<at::Half>()),
+        reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
         static_cast<int>(route_ids.size(0)),
         static_cast<int>(route_ids.size(1)),
         static_cast<int>(out_per_expert),
@@ -398,7 +396,7 @@ torch::Tensor nepq_sparse_residual_grouped_cuda(
         expert_local.numel() != 0,
         static_cast<int>(expert_local.numel()),
         static_cast<int>(first.size(0) / out_per_expert));
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess,
+    MFQ_RUNTIME_CHECK(cudaGetLastError() == cudaSuccess,
                 "NEPQ-A residual grouped kernel launch failed");
     return output;
 }

@@ -6,23 +6,22 @@
 //   out[t,j+half] = x1*cos + x0*sin
 
 #include <cuda_runtime.h>
+#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
 #include <cuda_bf16.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
 
 constexpr int ROPE_BD = 256;
 
-torch::Tensor rope_ext_cuda(torch::Tensor x, torch::Tensor pos, double base, int64_t rotary_dim, torch::Tensor sections);
-torch::Tensor rope_table_cuda(torch::Tensor x, torch::Tensor pos, torch::Tensor cos, torch::Tensor sin,
-                              int64_t rotary_dim, torch::Tensor sections);
-torch::Tensor rope_table_bf16_cuda(torch::Tensor x, torch::Tensor pos,
-                                   torch::Tensor cos, torch::Tensor sin,
+mfq_tensor_backend::Tensor rope_ext_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, double base, int64_t rotary_dim, mfq_tensor_backend::Tensor sections);
+mfq_tensor_backend::Tensor rope_table_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
+                              int64_t rotary_dim, mfq_tensor_backend::Tensor sections);
+mfq_tensor_backend::Tensor rope_table_bf16_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos,
+                                   mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
                                    int64_t rotary_dim);
-torch::Tensor minicpm_bf16_rope_cache_write_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v,
-    torch::Tensor rope_pos, torch::Tensor write_pos,
-    torch::Tensor cos, torch::Tensor sin,
-    torch::Tensor k_cache, torch::Tensor v_cache,
+mfq_tensor_backend::Tensor minicpm_bf16_rope_cache_write_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
+    mfq_tensor_backend::Tensor rope_pos, mfq_tensor_backend::Tensor write_pos,
+    mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
+    mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
     int64_t rotary_dim);
 
 __device__ int rope_axis_for_pair(int j, int s0, int s1, int s2)
@@ -231,184 +230,184 @@ __global__ void minicpm_bf16_rope_cache_write_kernel(
     }
 }
 
-torch::Tensor rope_cuda(torch::Tensor x, torch::Tensor pos, double base)
+mfq_tensor_backend::Tensor rope_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, double base)
 {
     return rope_ext_cuda(
         x, pos, base, x.size(-1),
-        torch::empty({0}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU)));
+        mfq_tensor_backend::empty({0}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCPU)));
 }
 
-torch::Tensor rope_ext_cuda(torch::Tensor x, torch::Tensor pos, double base, int64_t rotary_dim, torch::Tensor sections)
+mfq_tensor_backend::Tensor rope_ext_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, double base, int64_t rotary_dim, mfq_tensor_backend::Tensor sections)
 {
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kFloat32,
                 "rope: x must be cuda contiguous f32");
-    TORCH_CHECK(pos.is_cuda() && pos.is_contiguous() && pos.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(pos.is_cuda() && pos.is_contiguous() && pos.scalar_type() == mfq_tensor_backend::kFloat32,
                 "rope: pos must be cuda contiguous f32");
     int T = (int)x.size(-2);
     int D = (int)x.size(-1);
     int RD = (int)rotary_dim;
-    TORCH_CHECK(RD > 0 && RD <= D && RD % 2 == 0, "rope: rotary_dim must be positive even and <= D");
-    TORCH_CHECK(pos.dim() == 1 || pos.dim() == 2, "rope: pos must be [T] or [A,T]");
+    MFQ_RUNTIME_CHECK(RD > 0 && RD <= D && RD % 2 == 0, "rope: rotary_dim must be positive even and <= D");
+    MFQ_RUNTIME_CHECK(pos.dim() == 1 || pos.dim() == 2, "rope: pos must be [T] or [A,T]");
     int pos_axes = pos.dim() == 1 ? 1 : (int)pos.size(0);
-    TORCH_CHECK(pos.size(-1) == T, "rope: pos last dim must match T");
+    MFQ_RUNTIME_CHECK(pos.size(-1) == T, "rope: pos last dim must match T");
     int s0 = 0, s1 = 0, s2 = 0;
     if (sections.numel() > 0) {
-        TORCH_CHECK(!sections.is_cuda() && sections.is_contiguous() && sections.scalar_type() == torch::kInt64,
+        MFQ_RUNTIME_CHECK(!sections.is_cuda() && sections.is_contiguous() && sections.scalar_type() == mfq_tensor_backend::kInt64,
                     "rope: sections must be CPU contiguous int64");
-        TORCH_CHECK(sections.numel() == 3, "rope: sections must have 3 entries");
+        MFQ_RUNTIME_CHECK(sections.numel() == 3, "rope: sections must have 3 entries");
         const int64_t* sp = sections.data_ptr<int64_t>();
         s0 = (int)sp[0];
         s1 = (int)sp[1];
         s2 = (int)sp[2];
-        TORCH_CHECK(s0 + s1 + s2 == RD / 2, "rope: sections must sum to rotary_dim/2");
+        MFQ_RUNTIME_CHECK(s0 + s1 + s2 == RD / 2, "rope: sections must sum to rotary_dim/2");
     }
     int MT = (int)(x.numel() / ((size_t)T * D));
-    auto out = torch::empty_like(x);
-    rope_kernel<<<MT * T, ROPE_BD, 0, at::cuda::getCurrentCUDAStream()>>>(
+    auto out = mfq_tensor_backend::empty_like(x);
+    rope_kernel<<<MT * T, ROPE_BD, 0, mfq_current_cuda_stream()>>>(
         x.data_ptr<float>(), pos.data_ptr<float>(), out.data_ptr<float>(),
         MT * T, T, D, RD, pos_axes, s0, s1, s2, (float)base);
     return out;
 }
 
-torch::Tensor rope_table_cuda(torch::Tensor x, torch::Tensor pos, torch::Tensor cos, torch::Tensor sin,
-                              int64_t rotary_dim, torch::Tensor sections)
+mfq_tensor_backend::Tensor rope_table_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
+                              int64_t rotary_dim, mfq_tensor_backend::Tensor sections)
 {
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == mfq_tensor_backend::kFloat32,
                 "rope_table: x must be cuda contiguous f32");
-    TORCH_CHECK(pos.is_cuda() && pos.is_contiguous() && pos.scalar_type() == torch::kInt64,
+    MFQ_RUNTIME_CHECK(pos.is_cuda() && pos.is_contiguous() && pos.scalar_type() == mfq_tensor_backend::kInt64,
                 "rope_table: pos must be cuda contiguous int64");
-    TORCH_CHECK(cos.is_cuda() && cos.is_contiguous() && cos.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(cos.is_cuda() && cos.is_contiguous() && cos.scalar_type() == mfq_tensor_backend::kFloat32,
                 "rope_table: cos must be cuda contiguous f32");
-    TORCH_CHECK(sin.is_cuda() && sin.is_contiguous() && sin.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(sin.is_cuda() && sin.is_contiguous() && sin.scalar_type() == mfq_tensor_backend::kFloat32,
                 "rope_table: sin must be cuda contiguous f32");
     int T = (int)x.size(-2);
     int D = (int)x.size(-1);
     int RD = (int)rotary_dim;
     int half = RD / 2;
-    TORCH_CHECK(RD > 0 && RD <= D && RD % 2 == 0, "rope_table: rotary_dim must be positive even and <= D");
-    TORCH_CHECK(pos.dim() == 1 || pos.dim() == 2, "rope_table: pos must be [T] or [A,T]");
+    MFQ_RUNTIME_CHECK(RD > 0 && RD <= D && RD % 2 == 0, "rope_table: rotary_dim must be positive even and <= D");
+    MFQ_RUNTIME_CHECK(pos.dim() == 1 || pos.dim() == 2, "rope_table: pos must be [T] or [A,T]");
     int pos_axes = pos.dim() == 1 ? 1 : (int)pos.size(0);
-    TORCH_CHECK(pos.size(-1) == T, "rope_table: pos last dim must match T");
-    TORCH_CHECK(cos.dim() == 2 && sin.dim() == 2 && cos.sizes() == sin.sizes(),
+    MFQ_RUNTIME_CHECK(pos.size(-1) == T, "rope_table: pos last dim must match T");
+    MFQ_RUNTIME_CHECK(cos.dim() == 2 && sin.dim() == 2 && cos.sizes() == sin.sizes(),
                 "rope_table: cos/sin must be [table_len, rotary_dim/2]");
-    TORCH_CHECK(cos.size(1) == half, "rope_table: cos/sin width mismatch");
+    MFQ_RUNTIME_CHECK(cos.size(1) == half, "rope_table: cos/sin width mismatch");
     int table_len = (int)cos.size(0);
     int s0 = 0, s1 = 0, s2 = 0;
     if (sections.numel() > 0) {
-        TORCH_CHECK(!sections.is_cuda() && sections.is_contiguous() && sections.scalar_type() == torch::kInt64,
+        MFQ_RUNTIME_CHECK(!sections.is_cuda() && sections.is_contiguous() && sections.scalar_type() == mfq_tensor_backend::kInt64,
                     "rope_table: sections must be CPU contiguous int64");
-        TORCH_CHECK(sections.numel() == 3, "rope_table: sections must have 3 entries");
+        MFQ_RUNTIME_CHECK(sections.numel() == 3, "rope_table: sections must have 3 entries");
         const int64_t* sp = sections.data_ptr<int64_t>();
         s0 = (int)sp[0];
         s1 = (int)sp[1];
         s2 = (int)sp[2];
-        TORCH_CHECK(s0 + s1 + s2 == half, "rope_table: sections must sum to rotary_dim/2");
+        MFQ_RUNTIME_CHECK(s0 + s1 + s2 == half, "rope_table: sections must sum to rotary_dim/2");
     }
     int MT = (int)(x.numel() / ((size_t)T * D));
-    auto out = torch::empty_like(x);
-    rope_table_kernel<<<MT * T, ROPE_BD, 0, at::cuda::getCurrentCUDAStream()>>>(
+    auto out = mfq_tensor_backend::empty_like(x);
+    rope_table_kernel<<<MT * T, ROPE_BD, 0, mfq_current_cuda_stream()>>>(
         x.data_ptr<float>(), pos.data_ptr<int64_t>(), cos.data_ptr<float>(), sin.data_ptr<float>(),
         out.data_ptr<float>(), MT * T, T, D, RD, table_len, pos_axes, s0, s1, s2);
     return out;
 }
 
-torch::Tensor rope_table_bf16_cuda(torch::Tensor x, torch::Tensor pos,
-                                   torch::Tensor cos, torch::Tensor sin,
+mfq_tensor_backend::Tensor rope_table_bf16_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos,
+                                   mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
                                    int64_t rotary_dim)
 {
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous() &&
-                    x.scalar_type() == torch::kBFloat16,
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() &&
+                    x.scalar_type() == mfq_tensor_backend::kBFloat16,
                 "rope_table_bf16: x must be cuda contiguous bf16");
-    TORCH_CHECK(pos.is_cuda() && pos.is_contiguous() &&
-                    pos.scalar_type() == torch::kInt64 && pos.dim() == 1,
+    MFQ_RUNTIME_CHECK(pos.is_cuda() && pos.is_contiguous() &&
+                    pos.scalar_type() == mfq_tensor_backend::kInt64 && pos.dim() == 1,
                 "rope_table_bf16: pos must be cuda contiguous int64 [T]");
-    TORCH_CHECK(cos.is_cuda() && cos.is_contiguous() &&
-                    cos.scalar_type() == torch::kFloat32,
+    MFQ_RUNTIME_CHECK(cos.is_cuda() && cos.is_contiguous() &&
+                    cos.scalar_type() == mfq_tensor_backend::kFloat32,
                 "rope_table_bf16: cos must be cuda contiguous f32");
-    TORCH_CHECK(sin.is_cuda() && sin.is_contiguous() &&
-                    sin.scalar_type() == torch::kFloat32 &&
+    MFQ_RUNTIME_CHECK(sin.is_cuda() && sin.is_contiguous() &&
+                    sin.scalar_type() == mfq_tensor_backend::kFloat32 &&
                     cos.sizes() == sin.sizes(),
                 "rope_table_bf16: sin must match cos");
     const int T = (int)x.size(-2);
     const int D = (int)x.size(-1);
     const int RD = (int)rotary_dim;
-    TORCH_CHECK(pos.numel() == T,
+    MFQ_RUNTIME_CHECK(pos.numel() == T,
                 "rope_table_bf16: position count must match T");
-    TORCH_CHECK(RD > 0 && RD <= D && RD % 2 == 0 &&
+    MFQ_RUNTIME_CHECK(RD > 0 && RD <= D && RD % 2 == 0 &&
                     cos.dim() == 2 && cos.size(1) == RD / 2,
                 "rope_table_bf16: invalid rotary geometry");
     const int rows = (int)(x.numel() / D);
-    auto out = torch::empty_like(x);
+    auto out = mfq_tensor_backend::empty_like(x);
     rope_table_bf16_kernel<<<
-        rows, ROPE_BD, 0, at::cuda::getCurrentCUDAStream()>>>(
+        rows, ROPE_BD, 0, mfq_current_cuda_stream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(
-            x.data_ptr<at::BFloat16>()),
+            x.data_ptr<mfq_bfloat16>()),
         pos.data_ptr<int64_t>(), cos.data_ptr<float>(), sin.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(
-            out.data_ptr<at::BFloat16>()),
+            out.data_ptr<mfq_bfloat16>()),
         rows, T, D, RD, (int)cos.size(0));
     return out;
 }
 
-torch::Tensor minicpm_bf16_rope_cache_write_cuda(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v,
-    torch::Tensor rope_pos, torch::Tensor write_pos,
-    torch::Tensor cos, torch::Tensor sin,
-    torch::Tensor k_cache, torch::Tensor v_cache,
+mfq_tensor_backend::Tensor minicpm_bf16_rope_cache_write_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
+    mfq_tensor_backend::Tensor rope_pos, mfq_tensor_backend::Tensor write_pos,
+    mfq_tensor_backend::Tensor cos, mfq_tensor_backend::Tensor sin,
+    mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
     int64_t rotary_dim)
 {
-    const auto bf16 = torch::kBFloat16;
-    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() &&
+    const auto bf16 = mfq_tensor_backend::kBFloat16;
+    MFQ_RUNTIME_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() &&
                     q.is_contiguous() && k.is_contiguous() && v.is_contiguous() &&
                     q.scalar_type() == bf16 && k.scalar_type() == bf16 &&
                     v.scalar_type() == bf16,
                 "minicpm_rope_kv: q/k/v must be cuda contiguous bf16");
-    TORCH_CHECK(k_cache.is_cuda() && v_cache.is_cuda() &&
+    MFQ_RUNTIME_CHECK(k_cache.is_cuda() && v_cache.is_cuda() &&
                     k_cache.is_contiguous() && v_cache.is_contiguous() &&
                     k_cache.scalar_type() == bf16 && v_cache.scalar_type() == bf16,
                 "minicpm_rope_kv: caches must be cuda contiguous bf16");
-    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4 &&
+    MFQ_RUNTIME_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4 &&
                     k_cache.dim() == 4 && v_cache.dim() == 4,
                 "minicpm_rope_kv: tensors must be rank four");
-    TORCH_CHECK(k.sizes() == v.sizes() && k_cache.sizes() == v_cache.sizes(),
+    MFQ_RUNTIME_CHECK(k.sizes() == v.sizes() && k_cache.sizes() == v_cache.sizes(),
                 "minicpm_rope_kv: k/v shapes must match");
-    TORCH_CHECK(q.size(0) == k.size(0) && q.size(2) == 1 && k.size(2) == 1 &&
+    MFQ_RUNTIME_CHECK(q.size(0) == k.size(0) && q.size(2) == 1 && k.size(2) == 1 &&
                     q.size(1) == 32 && k.size(1) == 8 &&
                     q.size(3) == 128 && k.size(3) == 128,
                 "minicpm_rope_kv: expected Bx32x1x128 Q and Bx8x1x128 K/V");
-    TORCH_CHECK(k_cache.size(0) == k.size(0) &&
+    MFQ_RUNTIME_CHECK(k_cache.size(0) == k.size(0) &&
                     k_cache.size(1) == k.size(1) &&
                     k_cache.size(3) == k.size(3),
                 "minicpm_rope_kv: cache shape mismatch");
-    TORCH_CHECK(rope_pos.is_cuda() && write_pos.is_cuda() &&
+    MFQ_RUNTIME_CHECK(rope_pos.is_cuda() && write_pos.is_cuda() &&
                     rope_pos.is_contiguous() && write_pos.is_contiguous() &&
-                    rope_pos.scalar_type() == torch::kInt64 &&
-                    write_pos.scalar_type() == torch::kInt64 &&
+                    rope_pos.scalar_type() == mfq_tensor_backend::kInt64 &&
+                    write_pos.scalar_type() == mfq_tensor_backend::kInt64 &&
                     rope_pos.numel() == 1 && write_pos.numel() == 1,
                 "minicpm_rope_kv: positions must be cuda contiguous int64[1]");
-    TORCH_CHECK(cos.is_cuda() && sin.is_cuda() &&
+    MFQ_RUNTIME_CHECK(cos.is_cuda() && sin.is_cuda() &&
                     cos.is_contiguous() && sin.is_contiguous() &&
-                    cos.scalar_type() == torch::kFloat32 &&
-                    sin.scalar_type() == torch::kFloat32 &&
+                    cos.scalar_type() == mfq_tensor_backend::kFloat32 &&
+                    sin.scalar_type() == mfq_tensor_backend::kFloat32 &&
                     cos.sizes() == sin.sizes() && cos.dim() == 2,
                 "minicpm_rope_kv: cos/sin must be matching cuda contiguous f32 tables");
-    TORCH_CHECK(rotary_dim == 128 && cos.size(1) == 64,
+    MFQ_RUNTIME_CHECK(rotary_dim == 128 && cos.size(1) == 64,
                 "minicpm_rope_kv: expected rotary_dim 128");
 
-    auto q_out = torch::empty_like(q);
+    auto q_out = mfq_tensor_backend::empty_like(q);
     const int B = (int)q.size(0);
     const int Hq = (int)q.size(1);
     const int Hk = (int)k.size(1);
     minicpm_bf16_rope_cache_write_kernel<<<
-        B * Hq, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const __nv_bfloat16*>(k.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const __nv_bfloat16*>(v.data_ptr<at::BFloat16>()),
+        B * Hq, 128, 0, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<mfq_bfloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(k.data_ptr<mfq_bfloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(v.data_ptr<mfq_bfloat16>()),
         rope_pos.data_ptr<int64_t>(), write_pos.data_ptr<int64_t>(),
         cos.data_ptr<float>(), sin.data_ptr<float>(),
-        reinterpret_cast<__nv_bfloat16*>(q_out.data_ptr<at::BFloat16>()),
-        reinterpret_cast<__nv_bfloat16*>(k_cache.data_ptr<at::BFloat16>()),
-        reinterpret_cast<__nv_bfloat16*>(v_cache.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(q_out.data_ptr<mfq_bfloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(k_cache.data_ptr<mfq_bfloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(v_cache.data_ptr<mfq_bfloat16>()),
         Hq, Hk, 128, 64, (int)cos.size(0), (int)k_cache.size(2));
     return q_out;
 }
