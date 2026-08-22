@@ -62,6 +62,19 @@ int main() {
     require_close(reduced[0], 36.0f, 0.0f, "row reduction zero");
     require_close(reduced[1], 63.0f, 0.0f, "row reduction one");
 
+    auto bf16_argmax_input = tensor<float>({1, 5, 5, 2, 7, 3, 7, 7})
+        .reshape({2, 4})
+        .to(cuda_device)
+        .to(kBFloat16);
+    require(
+        host_int64_values(bf16_argmax_input.argmax(-1)) ==
+            std::vector<std::int64_t>({1, 0}),
+        "contiguous BF16 argmax first-index ties");
+    require(
+        host_int64_values(bf16_argmax_input.transpose(0, 1).argmax(-1)) ==
+            std::vector<std::int64_t>({1, 0, 1, 1}),
+        "non-contiguous BF16 argmax fallback");
+
     const auto transposed = host_values(input.transpose(0, 1).contiguous());
     const std::vector<float> expected_transposed{1, 4, 2, 5, 3, 6};
     require(transposed == expected_transposed, "non-contiguous materialization order");

@@ -704,6 +704,52 @@ __global__ void reduce_kernel(
     }
 }
 
+template <int Threads>
+__global__ void argmax_last_contiguous_bf16_kernel(
+    const __nv_bfloat16* input,
+    std::int64_t* output,
+    std::int64_t rows,
+    std::int64_t columns) {
+    __shared__ float values[Threads];
+    __shared__ std::int64_t indices[Threads];
+    constexpr std::int64_t invalid_index = 0x7fffffffffffffffLL;
+    const auto row = static_cast<std::int64_t>(blockIdx.x);
+    if (row >= rows) return;
+    const auto* row_input = input + row * columns;
+    float best_value = 0.0f;
+    std::int64_t best_index = invalid_index;
+    for (std::int64_t column = threadIdx.x;
+         column < columns;
+         column += Threads) {
+        const float value = __bfloat162float(row_input[column]);
+        if (best_index == invalid_index ||
+            value > best_value ||
+            (value == best_value && column < best_index)) {
+            best_value = value;
+            best_index = column;
+        }
+    }
+    values[threadIdx.x] = best_value;
+    indices[threadIdx.x] = best_index;
+    __syncthreads();
+    for (int offset = Threads / 2; offset > 0; offset /= 2) {
+        if (threadIdx.x < offset) {
+            const auto other_index = indices[threadIdx.x + offset];
+            const auto other_value = values[threadIdx.x + offset];
+            if (other_index != invalid_index &&
+                (indices[threadIdx.x] == invalid_index ||
+                 other_value > values[threadIdx.x] ||
+                 (other_value == values[threadIdx.x] &&
+                  other_index < indices[threadIdx.x]))) {
+                values[threadIdx.x] = other_value;
+                indices[threadIdx.x] = other_index;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) output[row] = indices[0];
+}
+
 ScalarType reduction_type(ScalarType input, int operation) {
     if (operation == 3) return kInt64;
     if (operation == 4 || operation == 5) return kBool;
@@ -844,6 +890,19 @@ Tensor reduce_cuda(
         reduction_type(source.scalar_type(), operation)));
     const auto outer = output.numel();
     const auto stream = current_stream(source.get_device()).stream();
+    if (operation == 3 &&
+        source.scalar_type() == kBFloat16 &&
+        source.is_contiguous() &&
+        outer <= std::numeric_limits<unsigned int>::max() &&
+        selected + 1 == static_cast<std::size_t>(source.dim())) {
+        constexpr int threads = 256;
+        argmax_last_contiguous_bf16_kernel<threads>
+            <<<static_cast<unsigned int>(outer), threads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(source.data_ptr()),
+                output.data_ptr<std::int64_t>(), outer, reduced);
+        MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
+        return output;
+    }
     auto launch = [&]<typename Input>() {
         launch_reduction_output<Input>(
             output, source, outer, reduced, static_cast<int>(selected), operation,

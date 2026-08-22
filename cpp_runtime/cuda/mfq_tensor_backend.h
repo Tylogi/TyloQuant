@@ -8,6 +8,7 @@
 #include <optional>
 #include <atomic>
 #include <algorithm>
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -102,6 +103,8 @@ using MfqCudaGraph = ::mfq::cuda::Graph;
 inline void mfq_prepare_cuda_graph_memory(MfqCudaGraph& graph) {
     graph.prepare_memory();
 }
+
+inline void mfq_debug_dump_cuda_graph(MfqCudaGraph&) {}
 
 inline MfqCudaStream mfq_get_current_cuda_stream(int device = -1) {
     return ::mfq::cuda::current_stream(device);
@@ -256,7 +259,19 @@ using MfqCudaStream = ::at::cuda::CUDAStream;
 using MfqCudaStreamGuard = ::c10::cuda::CUDAStreamGuard;
 using MfqCudaGraph = ::at::cuda::CUDAGraph;
 
-inline void mfq_prepare_cuda_graph_memory(MfqCudaGraph&) {}
+inline void mfq_prepare_cuda_graph_memory(MfqCudaGraph& graph) {
+    const char* debug_path = std::getenv("MFQ_TORCH_CUDA_GRAPH_DUMP");
+    if (debug_path != nullptr && debug_path[0] != '\0') {
+        graph.enable_debug_mode();
+    }
+}
+
+inline void mfq_debug_dump_cuda_graph(MfqCudaGraph& graph) {
+    const char* debug_path = std::getenv("MFQ_TORCH_CUDA_GRAPH_DUMP");
+    if (debug_path != nullptr && debug_path[0] != '\0') {
+        graph.debug_dump(debug_path);
+    }
+}
 
 inline MfqCudaStream mfq_get_current_cuda_stream(int device = -1) {
     return device < 0

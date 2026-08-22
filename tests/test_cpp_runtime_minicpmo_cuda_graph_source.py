@@ -8,6 +8,15 @@ SOURCE = (Path(__file__).parents[1] / "cpp_runtime" / "mfq_decode.cpp").read_tex
 ATTENTION_SOURCE = (
     Path(__file__).parents[1] / "mfq" / "kernels" / "cuda" / "attention.cu"
 ).read_text(encoding="utf-8")
+BACKEND_SOURCE = (
+    Path(__file__).parents[1] / "cpp_runtime" / "cuda" / "mfq_tensor_backend.h"
+).read_text(encoding="utf-8")
+CONTEXT_SOURCE = (
+    Path(__file__).parents[1] / "cpp_runtime" / "cuda" / "mfq_cuda_context.cu"
+).read_text(encoding="utf-8")
+NATIVE_OPS_SOURCE = (
+    Path(__file__).parents[1] / "cpp_runtime" / "cuda" / "mfq_native_tensor_ops.cu"
+).read_text(encoding="utf-8")
 
 
 def test_minicpmo_native_server_keeps_cuda_graph_enabled() -> None:
@@ -47,6 +56,65 @@ def test_graph_stage_events_start_after_decode_workspace_warmup() -> None:
     )
     capture = graph_path.index("graph.capture_begin();")
     assert warmup < profiler_reset < external_events < capture
+
+
+def test_graph_profile_covers_model_and_commit_boundaries() -> None:
+    graph_path = SOURCE.rsplit(
+        "MfqCudaGraph graph;", 1
+    )[1].split(
+        "graph.capture_end();", 1
+    )[0]
+    assert 'g_profiler.measure("decode.model_total"' in graph_path
+    assert 'g_profiler.measure("decode.commit"' in graph_path
+    assert graph_path.index('g_profiler.measure("decode.model_total"') < graph_path.index(
+        'g_profiler.measure("decode.commit"'
+    )
+
+
+def test_torch_reference_graph_can_emit_a_debug_dump() -> None:
+    assert 'std::getenv("MFQ_TORCH_CUDA_GRAPH_DUMP")' in BACKEND_SOURCE
+    assert "graph.enable_debug_mode();" in BACKEND_SOURCE
+    assert "graph.debug_dump(debug_path);" in BACKEND_SOURCE
+    assert "mfq_debug_dump_cuda_graph(graph);" in SOURCE
+
+
+def test_backend_bf16_add_check_covers_eager_and_graph_paths() -> None:
+    assert "run_backend_bf16_add_check" in SOURCE
+    assert 'a == "--check-backend-bf16-add"' in SOURCE
+    check = SOURCE.split("static int run_backend_bf16_add_check", 1)[1].split(
+        "static int64_t g_decode_graph_attention_parts", 1
+    )[0]
+    assert "eager = (left + right).contiguous();" in check
+    assert "graph.capture_begin();" in check
+    assert "graph.replay();" in check
+    assert '<< " max_abs=" << maximum' in check
+    assert "constexpr int chain_nodes = 512;" in check
+    assert "chain_graph.capture_begin();" in check
+    assert '<< " chain_node_us="' in check
+    assert "shared_result = silu_mul_cuda(left, right);" in check
+    assert "shared_graph.capture_begin();" in check
+    assert '<< " shared_chain_node_us="' in check
+
+
+def test_native_bf16_argmax_uses_bounded_contiguous_last_dimension_path() -> None:
+    assert "argmax_last_contiguous_bf16_kernel" in NATIVE_OPS_SOURCE
+    selection = NATIVE_OPS_SOURCE.split("if (operation == 3 &&", 1)[1].split(
+        "auto launch =", 1
+    )[0]
+    assert "source.scalar_type() == kBFloat16" in selection
+    assert "source.is_contiguous()" in selection
+    assert "outer <= std::numeric_limits<unsigned int>::max()" in selection
+    assert "selected + 1 == static_cast<std::size_t>(source.dim())" in selection
+
+
+def test_cuda_profiler_filter_supports_low_perturbation_eager_attribution() -> None:
+    assert 'std::getenv("MFQ_PROFILE_CUDA_FILTER")' in SOURCE
+    assert "if (!enabled || !selected(name)) return fn();" in SOURCE
+    eager_path = SOURCE.rsplit("} else {", 1)[1].split(
+        "mfq_cuda_synchronize();", 1
+    )[0]
+    assert 'g_profiler.measure("decode.eager_model"' in eager_path
+    assert 'g_profiler.measure("decode.eager_commit"' in eager_path
 
 
 def test_graph_attention_tracks_eager_split_count_from_device_length() -> None:
