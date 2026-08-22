@@ -109,7 +109,7 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
     assert 'std::getenv("MFQ_MINICPM_FUSED_BF16_RMSNORM")' in DECODE
     assert "qwen_rms_norm_bf16_cuda(" in DECODE
     assert "qwen_rms_norm_pair_bf16_cuda(" in DECODE
-    assert "qwen_rms_norm_bf16_finalize_kernel" in NORM
+    assert "qwen_rms_norm_bf16_kernel" in NORM
     assert "qwen_rms_norm_pair_bf16_finalize_kernel" in NORM
     assert "attention_cache_decode_split_gqa4_d128_part_kernel" in ATTENTION
     assert "mfq_dispatch_bfloat16" in ATTENTION

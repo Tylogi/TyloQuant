@@ -208,13 +208,40 @@ int main() {
     if (default_context(0)->supports_async_allocations()) {
         auto graph_stream = stream_from_pool(false, 0);
         StreamGuard graph_guard(graph_stream);
+        {
+            Graph cold_graph;
+            bool rejected_unwarmed_allocation = false;
+            try {
+                cold_graph.capture_begin();
+                (void)input.square();
+                cold_graph.capture_end();
+            } catch (const Error& error) {
+                rejected_unwarmed_allocation =
+                    std::string(error.what()).find("un-warmed allocation") !=
+                    std::string::npos;
+                cold_graph.reset();
+            }
+            require(
+                rejected_unwarmed_allocation,
+                "graph capture must reject an un-warmed allocation");
+            require_close(
+                host_values(input.square())[5], 36.0f, 0.0f,
+                "stream remains usable after rejected graph capture");
+        }
         Graph graph;
         Tensor graph_output;
+        graph.prepare_memory();
+        graph_output = input.square();
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(graph_stream.stream()));
+        graph_output = Tensor{};
         graph.capture_begin();
         graph_output = input.square();
         graph.capture_end();
         graph.replay();
+        graph.replay();
         MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(graph_stream.stream()));
-        require_close(host_values(graph_output)[5], 36.0f, 0.0f, "graph replay value");
+        require_close(
+            host_values(graph_output)[5], 36.0f, 0.0f,
+            "back-to-back graph replay value");
     }
 }

@@ -11,39 +11,34 @@
 
 constexpr int NORM_BD = 256;
 
-__global__ void qwen_rms_norm_bf16_square_kernel(
+template <int BD>
+__global__ void qwen_rms_norm_bf16_kernel(
     const __nv_bfloat16* __restrict__ input,
-    float* __restrict__ squared,
-    int64_t count)
-{
-    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-         i < count; i += (int64_t)blockDim.x * gridDim.x) {
-        const float value = __bfloat162float(input[i]);
-        squared[i] = value * value;
-    }
-}
-
-__global__ void qwen_rms_norm_bf16_finalize_kernel(
-    const __nv_bfloat16* __restrict__ input,
-    const float* __restrict__ mean,
     const float* __restrict__ weight,
     __nv_bfloat16* __restrict__ output,
-    int64_t count,
-    int D,
-    float eps,
-    float weight_offset)
+    int N, int D, float eps, float weight_offset)
 {
-    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-         i < count; i += (int64_t)blockDim.x * gridDim.x) {
-        const float inverse = rsqrtf(mean[i / D] + eps);
+    const int row = blockIdx.x;
+    if (row >= N) {
+        return;
+    }
+    const size_t row_offset = (size_t)row * D;
+    float square_sum = 0.0f;
+    for (int i = threadIdx.x; i < D; i += BD) {
+        const float value = __bfloat162float(input[row_offset + i]);
+        square_sum += value * value;
+    }
+    square_sum = block_sum<BD / 32>(square_sum);
+    const float inverse = rsqrtf(square_sum / (float)D + eps);
+    for (int i = threadIdx.x; i < D; i += BD) {
         const __nv_bfloat16 normalized = __float2bfloat16_rn(
-            __bfloat162float(input[i]) * inverse);
-        __nv_bfloat16 scale = __float2bfloat16_rn(weight[i % D]);
+            __bfloat162float(input[row_offset + i]) * inverse);
+        __nv_bfloat16 scale = __float2bfloat16_rn(weight[i]);
         if (weight_offset != 0.0f) {
             scale = __float2bfloat16_rn(
                 __bfloat162float(scale) + weight_offset);
         }
-        output[i] = __float2bfloat16_rn(
+        output[row_offset + i] = __float2bfloat16_rn(
             __bfloat162float(scale) * __bfloat162float(normalized));
     }
 }
@@ -116,7 +111,6 @@ __global__ void minicpm_qk_norm_rope_cache_write_bf16_kernel(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
-    const float* __restrict__ mean,
     const float* __restrict__ q_weight,
     const float* __restrict__ k_weight,
     const int64_t* __restrict__ rope_pos,
@@ -137,8 +131,17 @@ __global__ void minicpm_qk_norm_rope_cache_write_bf16_kernel(
     int64_t p = rope_pos[0];
     p = p < 0 ? 0 : (p >= table_len ? table_len - 1 : p);
     const int64_t wp = write_pos[0];
-    const float q_inverse = rsqrtf(mean[q_row] + eps);
     const size_t q_offset = (size_t)q_row * D;
+    const float q_value = __bfloat162float(q[q_offset + tid]);
+    const float q_square_sum = block_sum<4>(q_value * q_value);
+    const float q_inverse = rsqrtf(q_square_sum / (float)D + eps);
+
+    const int k_row = b * Hk + (hq < Hk ? hq : 0);
+    const size_t k_offset = (size_t)k_row * D;
+    const float k_value = hq < Hk
+        ? __bfloat162float(k[k_offset + tid]) : 0.0f;
+    const float k_square_sum = block_sum<4>(k_value * k_value);
+    const float k_inverse = rsqrtf(k_square_sum / (float)D + eps);
 
     if (tid < half) {
         const __nv_bfloat16 cs = __float2bfloat16_rn(
@@ -165,9 +168,7 @@ __global__ void minicpm_qk_norm_rope_cache_write_bf16_kernel(
     }
 
     if (hq < Hk && wp >= 0 && wp < max_seq) {
-        const int k_row = b * Hk + hq;
-        const float k_inverse = rsqrtf(mean[B * Hq + k_row] + eps);
-        const size_t src = (size_t)k_row * D;
+        const size_t src = k_offset;
         const size_t dst = ((size_t)k_row * max_seq + wp) * D;
         if (tid < half) {
             const __nv_bfloat16 cs = __float2bfloat16_rn(
@@ -375,19 +376,14 @@ mfq_tensor_backend::Tensor qwen_rms_norm_bf16_cuda(
     const int64_t count = input.numel();
     MFQ_RUNTIME_CHECK(D > 0 && weight.numel() == D,
                 "qwen_rms_norm_bf16: weight length mismatch");
-    auto squared = mfq_tensor_backend::empty(input.sizes(), input.options().dtype(mfq_tensor_backend::kFloat32));
-    const int blocks = (int)std::min<int64_t>((count + NORM_BD - 1) / NORM_BD, 65535);
+    const int N = (int)(count / D);
     auto stream = mfq_current_cuda_stream();
-    qwen_rms_norm_bf16_square_kernel<<<blocks, NORM_BD, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr<mfq_bfloat16>()),
-        squared.data_ptr<float>(), count);
-    auto mean = squared.mean(-1, true);
     auto output = mfq_tensor_backend::empty_like(input);
-    qwen_rms_norm_bf16_finalize_kernel<<<blocks, NORM_BD, 0, stream>>>(
+    qwen_rms_norm_bf16_kernel<NORM_BD><<<N, NORM_BD, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(input.data_ptr<mfq_bfloat16>()),
-        mean.data_ptr<float>(), weight.data_ptr<float>(),
+        weight.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(output.data_ptr<mfq_bfloat16>()),
-        count, D, (float)eps, (float)weight_offset);
+        N, D, (float)eps, (float)weight_offset);
     return output;
 }
 
@@ -483,20 +479,7 @@ mfq_tensor_backend::Tensor minicpm_qk_norm_rope_cache_write_bf16_cuda(
                 "minicpm_qk_norm_rope_kv: cos/sin must be matching f32 tables");
 
     constexpr int D = 128;
-    constexpr int block = 256;
-    const int64_t first_count = q.numel();
-    const int64_t total_count = first_count + k.numel();
-    const int64_t total_rows = total_count / D;
-    auto squared = mfq_tensor_backend::empty(
-        {total_rows, D}, q.options().dtype(mfq_tensor_backend::kFloat32));
-    const int blocks = (int)std::min<int64_t>(
-        (total_count + block - 1) / block, 65535);
     auto stream = mfq_current_cuda_stream();
-    qwen_rms_norm_pair_bf16_square_kernel<<<blocks, block, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<mfq_bfloat16>()),
-        reinterpret_cast<const __nv_bfloat16*>(k.data_ptr<mfq_bfloat16>()),
-        squared.data_ptr<float>(), first_count, total_count);
-    auto mean = squared.mean(-1, true);
     auto q_out = mfq_tensor_backend::empty_like(q);
     const int B = (int)q.size(0);
     minicpm_qk_norm_rope_cache_write_bf16_kernel<<<
@@ -504,7 +487,7 @@ mfq_tensor_backend::Tensor minicpm_qk_norm_rope_cache_write_bf16_cuda(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<mfq_bfloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(k.data_ptr<mfq_bfloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(v.data_ptr<mfq_bfloat16>()),
-        mean.data_ptr<float>(), q_weight.data_ptr<float>(),
+        q_weight.data_ptr<float>(),
         k_weight.data_ptr<float>(), rope_pos.data_ptr<int64_t>(),
         write_pos.data_ptr<int64_t>(), cos.data_ptr<float>(), sin.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(q_out.data_ptr<mfq_bfloat16>()),

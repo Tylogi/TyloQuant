@@ -6,10 +6,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace mfq::cuda {
 
@@ -115,6 +118,8 @@ private:
     std::optional<StreamHandle> previous_;
 };
 
+class Context;
+
 class Graph final {
 public:
     Graph() = default;
@@ -125,6 +130,7 @@ public:
     Graph(const Graph&) = delete;
     Graph& operator=(const Graph&) = delete;
 
+    void prepare_memory();
     void capture_begin();
     void capture_end();
     void replay();
@@ -133,6 +139,7 @@ public:
 private:
     int device_ = 0;
     StreamHandle stream_;
+    std::shared_ptr<Context> context_;
     cudaGraph_t graph_ = nullptr;
     cudaGraphExec_t executable_ = nullptr;
 };
@@ -166,15 +173,29 @@ public:
     bool supports_async_allocations() const noexcept { return async_allocations_; }
 
     void* allocate(std::size_t bytes, cudaStream_t stream = nullptr);
-    void release(void* pointer, cudaStream_t stream = nullptr) noexcept;
+    void release(
+        void* pointer,
+        std::size_t bytes,
+        cudaStream_t stream = nullptr) noexcept;
+    void begin_graph_pool(cudaStream_t stream);
+    void begin_graph_capture(cudaStream_t stream);
+    void end_graph_capture(cudaStream_t stream) noexcept;
+    void end_graph_pool(cudaStream_t stream) noexcept;
     void trim();
 
 private:
+    struct GraphPool {
+        bool capturing = false;
+        std::unordered_map<std::size_t, std::vector<void*>> available;
+    };
+
     int device_ = 0;
     Stream stream_;
     BlasHandle blas_;
     cudaMemPool_t pool_ = nullptr;
     bool async_allocations_ = false;
+    std::mutex graph_pool_mutex_;
+    std::unordered_map<cudaStream_t, GraphPool> graph_pools_;
 };
 
 std::shared_ptr<Context> default_context(int device = 0);

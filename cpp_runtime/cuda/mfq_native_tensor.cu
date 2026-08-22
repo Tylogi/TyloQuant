@@ -23,8 +23,8 @@ std::shared_ptr<TensorStorage> allocate_cuda_storage(
     auto context = default_context(device.index);
     const auto allocation_stream = current_stream(device.index);
     void* pointer = context->allocate(bytes, allocation_stream.stream());
-    auto owner = std::shared_ptr<void>(pointer, [context, allocation_stream](void* value) {
-        context->release(value, allocation_stream.stream());
+    auto owner = std::shared_ptr<void>(pointer, [context, allocation_stream, bytes](void* value) {
+        context->release(value, bytes, allocation_stream.stream());
     });
     auto storage = std::make_shared<TensorStorage>();
     storage->owner = std::move(owner);

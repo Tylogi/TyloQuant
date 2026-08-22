@@ -1,9 +1,12 @@
 #include "mfq_cuda_context.h"
 
 #include <limits>
+#include <cstdlib>
+#include <iostream>
 #include <mutex>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace mfq::cuda {
@@ -234,6 +237,7 @@ Graph::~Graph() noexcept {
 Graph::Graph(Graph&& other) noexcept
     : device_(other.device_),
       stream_(std::move(other.stream_)),
+      context_(std::move(other.context_)),
       graph_(std::exchange(other.graph_, nullptr)),
       executable_(std::exchange(other.executable_, nullptr)) {}
 
@@ -242,17 +246,33 @@ Graph& Graph::operator=(Graph&& other) noexcept {
         reset();
         device_ = other.device_;
         stream_ = std::move(other.stream_);
+        context_ = std::move(other.context_);
         graph_ = std::exchange(other.graph_, nullptr);
         executable_ = std::exchange(other.executable_, nullptr);
     }
     return *this;
 }
 
-void Graph::capture_begin() {
+void Graph::prepare_memory() {
     reset();
     stream_ = current_stream();
     device_ = stream_.device_index();
+    context_ = default_context(device_);
+    context_->begin_graph_pool(stream_.stream());
+}
+
+void Graph::capture_begin() {
+    if (!stream_) {
+        prepare_memory();
+    }
+    const auto active = current_stream();
+    if (active.device_index() != device_ ||
+            active.stream() != stream_.stream()) {
+        throw Error(
+            "CUDA graph capture stream differs from its prepared memory stream");
+    }
     DeviceGuard guard(device_);
+    context_->begin_graph_capture(stream_.stream());
     MFQ_NATIVE_CUDA_CHECK(cudaStreamBeginCapture(
         stream_.stream(), cudaStreamCaptureModeGlobal));
 }
@@ -262,8 +282,64 @@ void Graph::capture_end() {
         throw Error("CUDA graph capture_end called without capture_begin");
     }
     DeviceGuard guard(device_);
-    MFQ_NATIVE_CUDA_CHECK(cudaStreamEndCapture(stream_.stream(), &graph_));
+    const auto capture_status =
+        cudaStreamEndCapture(stream_.stream(), &graph_);
+    context_->end_graph_capture(stream_.stream());
+    MFQ_NATIVE_CUDA_CHECK(capture_status);
+    if (const char* dot_path = std::getenv("MFQ_NATIVE_CUDA_GRAPH_DOT");
+        dot_path != nullptr && dot_path[0] != '\0') {
+        MFQ_NATIVE_CUDA_CHECK(cudaGraphDebugDotPrint(
+            graph_, dot_path, cudaGraphDebugDotFlagsVerbose));
+    }
+    if (const char* trace = std::getenv("MFQ_TRACE_NATIVE_CUDA_GRAPH");
+        trace != nullptr && std::atoi(trace) != 0) {
+        std::size_t count = 0;
+        MFQ_NATIVE_CUDA_CHECK(cudaGraphGetNodes(graph_, nullptr, &count));
+        std::vector<cudaGraphNode_t> nodes(count);
+        MFQ_NATIVE_CUDA_CHECK(cudaGraphGetNodes(graph_, nodes.data(), &count));
+        std::unordered_set<void*> allocations;
+        std::unordered_set<void*> frees;
+        std::size_t kernels = 0;
+        std::size_t copies = 0;
+        for (auto node : nodes) {
+            cudaGraphNodeType type = cudaGraphNodeTypeEmpty;
+            MFQ_NATIVE_CUDA_CHECK(cudaGraphNodeGetType(node, &type));
+            if (type == cudaGraphNodeTypeKernel) {
+                ++kernels;
+            } else if (type == cudaGraphNodeTypeMemcpy) {
+                ++copies;
+            } else if (type == cudaGraphNodeTypeMemAlloc) {
+                cudaMemAllocNodeParams params{};
+                MFQ_NATIVE_CUDA_CHECK(cudaGraphMemAllocNodeGetParams(node, &params));
+                allocations.insert(reinterpret_cast<void*>(params.dptr));
+            } else if (type == cudaGraphNodeTypeMemFree) {
+                void* pointer = nullptr;
+                MFQ_NATIVE_CUDA_CHECK(cudaGraphMemFreeNodeGetParams(node, &pointer));
+                frees.insert(pointer);
+            }
+        }
+        std::size_t allocation_only = 0;
+        std::size_t free_only = 0;
+        for (auto pointer : allocations) {
+            allocation_only += frees.contains(pointer) ? 0 : 1;
+        }
+        for (auto pointer : frees) {
+            free_only += allocations.contains(pointer) ? 0 : 1;
+        }
+        std::cerr << "native_cuda_graph nodes=" << count
+                  << " kernels=" << kernels
+                  << " copies=" << copies
+                  << " allocations=" << allocations.size()
+                  << " frees=" << frees.size()
+                  << " allocation_only=" << allocation_only
+                  << " free_only=" << free_only << '\n';
+    }
     MFQ_NATIVE_CUDA_CHECK(cudaGraphInstantiate(&executable_, graph_, 0));
+    if (const char* upload = std::getenv("MFQ_NATIVE_CUDA_GRAPH_UPLOAD");
+        upload != nullptr && std::atoi(upload) != 0) {
+        MFQ_NATIVE_CUDA_CHECK(cudaGraphUpload(executable_, stream_.stream()));
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream_.stream()));
+    }
 }
 
 void Graph::replay() {
@@ -276,6 +352,23 @@ void Graph::replay() {
 
 void Graph::reset() noexcept {
     on_device_noexcept(device_, [&] {
+        if (stream_) {
+            cudaStreamCaptureStatus capture_status =
+                cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(
+                    stream_.stream(), &capture_status) == cudaSuccess &&
+                    capture_status != cudaStreamCaptureStatusNone) {
+                cudaGraph_t abandoned = nullptr;
+                if (cudaStreamEndCapture(
+                        stream_.stream(), &abandoned) == cudaSuccess &&
+                        abandoned != nullptr) {
+                    (void)cudaGraphDestroy(abandoned);
+                } else {
+                    (void)cudaGetLastError();
+                }
+            }
+            (void)cudaStreamSynchronize(stream_.stream());
+        }
         if (executable_ != nullptr) {
             (void)cudaGraphExecDestroy(executable_);
             executable_ = nullptr;
@@ -284,7 +377,12 @@ void Graph::reset() noexcept {
             (void)cudaGraphDestroy(graph_);
             graph_ = nullptr;
         }
+        if (context_ && stream_) {
+            context_->end_graph_capture(stream_.stream());
+            context_->end_graph_pool(stream_.stream());
+        }
     });
+    context_.reset();
     stream_ = {};
 }
 
@@ -351,30 +449,134 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
         return nullptr;
     }
     DeviceGuard guard(device_);
+    const auto allocation_stream =
+        stream != nullptr ? stream : stream_.get();
+    bool capture_pool_miss = false;
+    {
+        std::lock_guard lock(graph_pool_mutex_);
+        if (auto pool = graph_pools_.find(allocation_stream);
+            pool != graph_pools_.end()) {
+            auto available = pool->second.available.find(bytes);
+            if (available != pool->second.available.end() &&
+                    !available->second.empty()) {
+                void* pointer = available->second.back();
+                available->second.pop_back();
+                return pointer;
+            }
+            capture_pool_miss = pool->second.capturing;
+        }
+    }
+    if (capture_pool_miss) {
+        throw Error(
+            "CUDA graph capture requested an un-warmed allocation of " +
+            std::to_string(bytes) + " bytes");
+    }
     void* pointer = nullptr;
     if (async_allocations_) {
         MFQ_NATIVE_CUDA_CHECK(cudaMallocAsync(
-            &pointer, bytes, stream != nullptr ? stream : stream_.get()));
+            &pointer, bytes, allocation_stream));
     } else {
         MFQ_NATIVE_CUDA_CHECK(cudaMalloc(&pointer, bytes));
     }
     return pointer;
 }
 
-void Context::release(void* pointer, cudaStream_t stream) noexcept {
+void Context::release(
+        void* pointer,
+        std::size_t bytes,
+        cudaStream_t stream) noexcept {
     if (pointer == nullptr) {
         return;
     }
+    const auto allocation_stream =
+        stream != nullptr ? stream : stream_.get();
+    try {
+        std::lock_guard lock(graph_pool_mutex_);
+        if (auto pool = graph_pools_.find(allocation_stream);
+            pool != graph_pools_.end()) {
+            pool->second.available[bytes].push_back(pointer);
+            return;
+        }
+    } catch (...) {
+        // Tensor destruction is noexcept. A warm-up bookkeeping allocation
+        // failure must release the CUDA allocation instead of terminating or
+        // leaking it. During capture the size bucket already exists and the
+        // preceding pop leaves enough vector capacity for this push.
+    }
     on_device_noexcept(device_, [&] {
         if (async_allocations_) {
-            (void)cudaFreeAsync(pointer, stream != nullptr ? stream : stream_.get());
+            (void)cudaFreeAsync(pointer, allocation_stream);
         } else {
             (void)cudaFree(pointer);
         }
     });
 }
 
+void Context::begin_graph_pool(cudaStream_t stream) {
+    if (stream == nullptr) {
+        throw std::invalid_argument("CUDA graph memory pool requires a stream");
+    }
+    std::lock_guard lock(graph_pool_mutex_);
+    const auto [_, inserted] = graph_pools_.try_emplace(stream);
+    if (!inserted) {
+        throw Error("CUDA graph memory pool is already active on this stream");
+    }
+}
+
+void Context::begin_graph_capture(cudaStream_t stream) {
+    std::lock_guard lock(graph_pool_mutex_);
+    const auto pool = graph_pools_.find(stream);
+    if (pool == graph_pools_.end()) {
+        throw Error("CUDA graph capture requires a prepared memory pool");
+    }
+    if (pool->second.capturing) {
+        throw Error("CUDA graph memory pool is already capturing");
+    }
+    pool->second.capturing = true;
+}
+
+void Context::end_graph_capture(cudaStream_t stream) noexcept {
+    std::lock_guard lock(graph_pool_mutex_);
+    if (const auto pool = graph_pools_.find(stream);
+        pool != graph_pools_.end()) {
+        pool->second.capturing = false;
+    }
+}
+
+void Context::end_graph_pool(cudaStream_t stream) noexcept {
+    GraphPool pool;
+    {
+        std::lock_guard lock(graph_pool_mutex_);
+        const auto found = graph_pools_.find(stream);
+        if (found == graph_pools_.end()) {
+            return;
+        }
+        pool = std::move(found->second);
+        graph_pools_.erase(found);
+    }
+    on_device_noexcept(device_, [&] {
+        for (const auto& [_, pointers] : pool.available) {
+            for (void* pointer : pointers) {
+                if (async_allocations_) {
+                    (void)cudaFreeAsync(pointer, stream);
+                } else {
+                    (void)cudaFree(pointer);
+                }
+            }
+        }
+        if (async_allocations_) {
+            (void)cudaStreamSynchronize(stream);
+        }
+    });
+}
+
 void Context::trim() {
+    {
+        std::lock_guard lock(graph_pool_mutex_);
+        if (!graph_pools_.empty()) {
+            throw Error("cannot trim CUDA memory while a graph pool is active");
+        }
+    }
     stream_.synchronize();
     if (async_allocations_) {
         DeviceGuard guard(device_);
@@ -414,7 +616,7 @@ Buffer& Buffer::operator=(Buffer&& other) noexcept {
 
 void Buffer::reset() noexcept {
     if (context_ && data_ != nullptr) {
-        context_->release(data_, stream_.stream());
+        context_->release(data_, bytes_, stream_.stream());
     }
     data_ = nullptr;
     bytes_ = 0;

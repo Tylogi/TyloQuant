@@ -1,6 +1,7 @@
 // Residual add a + b (ggml acc.cu: ggml_acc). fp16/fp32, any shape flattened.
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
 #include <vector>
 
@@ -34,6 +35,44 @@ mfq_tensor_backend::Tensor acc_cuda(mfq_tensor_backend::Tensor a, mfq_tensor_bac
 }
 
 constexpr int ACC_RMS_BD = 256;
+
+template <int BD>
+__global__ void acc_rms_norm_bf16_kernel(
+    const __nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b,
+    const float* __restrict__ weight,
+    __nv_bfloat16* __restrict__ sum_out,
+    __nv_bfloat16* __restrict__ norm_out,
+    int N, int D, float eps, float weight_offset)
+{
+    const int row = blockIdx.x;
+    if (row >= N) {
+        return;
+    }
+    const size_t row_offset = (size_t)row * D;
+    float square_sum = 0.0f;
+    for (int i = threadIdx.x; i < D; i += BD) {
+        const __nv_bfloat16 stored = __float2bfloat16_rn(
+            __bfloat162float(a[row_offset + i]) +
+            __bfloat162float(b[row_offset + i]));
+        sum_out[row_offset + i] = stored;
+        const float value = __bfloat162float(stored);
+        square_sum += value * value;
+    }
+    square_sum = block_sum<BD / 32>(square_sum);
+    const float inverse = rsqrtf(square_sum / (float)D + eps);
+    for (int i = threadIdx.x; i < D; i += BD) {
+        const __nv_bfloat16 normalized = __float2bfloat16_rn(
+            __bfloat162float(sum_out[row_offset + i]) * inverse);
+        __nv_bfloat16 scale = __float2bfloat16_rn(weight[i]);
+        if (weight_offset != 0.0f) {
+            scale = __float2bfloat16_rn(
+                __bfloat162float(scale) + weight_offset);
+        }
+        norm_out[row_offset + i] = __float2bfloat16_rn(
+            __bfloat162float(normalized) * __bfloat162float(scale));
+    }
+}
 
 template <typename scalar_t, typename norm_t, int BD>
 __global__ void acc_rms_norm_kernel(const scalar_t* __restrict__ a,
@@ -123,6 +162,38 @@ std::vector<mfq_tensor_backend::Tensor> acc_rms_norm_f16_cuda(mfq_tensor_backend
         a.data_ptr<mfq_half>(), b.data_ptr<mfq_half>(), weight.data_ptr<float>(),
         sum.data_ptr<mfq_half>(), norm.data_ptr<mfq_half>(), N, D,
         (float)eps, (float)weight_offset);
+    return {sum, norm};
+}
+
+std::vector<mfq_tensor_backend::Tensor> acc_rms_norm_bf16_cuda(
+    mfq_tensor_backend::Tensor a, mfq_tensor_backend::Tensor b,
+    mfq_tensor_backend::Tensor weight, double eps, double weight_offset)
+{
+    MFQ_RUNTIME_CHECK(a.is_cuda() && a.is_contiguous() &&
+                    a.scalar_type() == mfq_tensor_backend::kBFloat16,
+                "acc_rms_norm_bf16: a must be cuda contiguous bf16");
+    MFQ_RUNTIME_CHECK(b.is_cuda() && b.is_contiguous() &&
+                    b.scalar_type() == mfq_tensor_backend::kBFloat16,
+                "acc_rms_norm_bf16: b must be cuda contiguous bf16");
+    MFQ_RUNTIME_CHECK(weight.is_cuda() && weight.is_contiguous() &&
+                    weight.scalar_type() == mfq_tensor_backend::kFloat32,
+                "acc_rms_norm_bf16: weight must be cuda contiguous f32");
+    MFQ_RUNTIME_CHECK(a.sizes() == b.sizes() && a.dim() >= 1,
+                "acc_rms_norm_bf16: a/b shape mismatch");
+    const int D = (int)a.size(-1);
+    const int N = (int)(a.numel() / D);
+    MFQ_RUNTIME_CHECK(D > 0 && weight.numel() == D,
+                "acc_rms_norm_bf16: weight length mismatch");
+    auto sum = mfq_tensor_backend::empty_like(a);
+    auto norm = mfq_tensor_backend::empty_like(a);
+    acc_rms_norm_bf16_kernel<ACC_RMS_BD><<<
+        N, ACC_RMS_BD, 0, mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(a.data_ptr<mfq_bfloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(b.data_ptr<mfq_bfloat16>()),
+        weight.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(sum.data_ptr<mfq_bfloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(norm.data_ptr<mfq_bfloat16>()),
+        N, D, (float)eps, (float)weight_offset);
     return {sum, norm};
 }
 

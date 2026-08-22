@@ -120,6 +120,9 @@ std::vector<mfq_tensor_backend::Tensor> acc_rms_norm_cuda(mfq_tensor_backend::Te
 std::vector<mfq_tensor_backend::Tensor> acc_rms_norm_f16_cuda(mfq_tensor_backend::Tensor a, mfq_tensor_backend::Tensor b,
                                                  mfq_tensor_backend::Tensor weight, double eps,
                                                  double weight_offset);
+std::vector<mfq_tensor_backend::Tensor> acc_rms_norm_bf16_cuda(
+    mfq_tensor_backend::Tensor a, mfq_tensor_backend::Tensor b,
+    mfq_tensor_backend::Tensor weight, double eps, double weight_offset);
 std::vector<mfq_tensor_backend::Tensor> gemma4_attn_residual_pre_norms_f16_cuda(
     mfq_tensor_backend::Tensor residual, mfq_tensor_backend::Tensor attn,
     mfq_tensor_backend::Tensor attn_post_weight, mfq_tensor_backend::Tensor dense_pre_weight,
@@ -234,6 +237,12 @@ mfq_tensor_backend::Tensor attention_cache_decode_split_cuda(
     mfq_tensor_backend::Tensor seq_len, double scale,
     mfq_tensor_backend::Tensor partial_o, mfq_tensor_backend::Tensor partial_m, mfq_tensor_backend::Tensor partial_l,
     int64_t parts);
+mfq_tensor_backend::Tensor attention_cache_decode_dynamic_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache,
+    mfq_tensor_backend::Tensor v_cache, mfq_tensor_backend::Tensor seq_len,
+    double scale, mfq_tensor_backend::Tensor partial_o,
+    mfq_tensor_backend::Tensor partial_m,
+    mfq_tensor_backend::Tensor partial_l, int64_t max_parts);
 mfq_tensor_backend::Tensor silu_mul_cuda(mfq_tensor_backend::Tensor gate, mfq_tensor_backend::Tensor up);
 mfq_tensor_backend::Tensor gelu_mul_cuda(mfq_tensor_backend::Tensor gate, mfq_tensor_backend::Tensor up);
 std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
@@ -15735,7 +15744,12 @@ struct FullBlock : Block {
                             parts = g_decode_graph_attention_parts;
                         }
                         parts = std::min<int64_t>(parts, kDecodeAttentionMaxParts);
-                        a = parts > 1
+                        a = g_decode_graph_attention_parts > 1
+                            ? attention_cache_decode_dynamic_cuda(
+                                qh, cache.k, cache.v, seq_len.value(), attn_scale,
+                                decode_partial_o, decode_partial_m, decode_partial_l,
+                                parts)
+                            : parts > 1
                             ? attention_cache_decode_split_cuda(
                                 qh, cache.k, cache.v, seq_len.value(), attn_scale,
                                 decode_partial_o, decode_partial_m, decode_partial_l, parts)
@@ -15986,13 +16000,16 @@ struct FullBlock : Block {
             }
             if (rr.scalar_type() == mfq_tensor_backend::kBFloat16 &&
                     oo2.scalar_type() == mfq_tensor_backend::kBFloat16) {
+                if (official_bf16) {
+                    return acc_rms_norm_bf16_cuda(
+                        rr, oo2, ffn_norm, c.rms_norm_eps,
+                        c.norm_weight_offset);
+                }
                 auto sum = (rr + oo2).contiguous();
-                auto norm = official_bf16
-                    ? qwen_rms_norm_bf16(sum, ffn_norm, c)
-                    : qwen_rms_norm(
-                        sum.to(mfq_tensor_backend::kFloat32), ffn_norm, c)
-                        .to(mfq_tensor_backend::kBFloat16)
-                        .contiguous();
+                auto norm = qwen_rms_norm(
+                    sum.to(mfq_tensor_backend::kFloat32), ffn_norm, c)
+                    .to(mfq_tensor_backend::kBFloat16)
+                    .contiguous();
                 return std::vector<mfq_tensor_backend::Tensor>{sum, norm};
             }
             return acc_rms_norm_cuda(rr, oo2, ffn_norm, c.rms_norm_eps, c.norm_weight_offset);
@@ -18033,7 +18050,8 @@ struct Model {
     mfq_tensor_backend::Tensor hidden_forward(mfq_tensor_backend::Tensor ids,
                                  MfqOptional<mfq_tensor_backend::Tensor> pos_override = mfq_nullopt,
                                  MfqOptional<mfq_tensor_backend::Tensor> seq_len = mfq_nullopt,
-                                 std::vector<mfq_tensor_backend::Tensor> * block_trace = nullptr) {
+                                 std::vector<mfq_tensor_backend::Tensor> * block_trace = nullptr,
+                                 MfqOptional<mfq_tensor_backend::Tensor> cache_positions_override = mfq_nullopt) {
         const int primary = g_layer_placement.primary_device();
         MfqCudaGuard primary_guard(primary);
         ids = tensor_to_cuda_device(
@@ -18041,7 +18059,8 @@ struct Model {
         if (ids.dim() == 1) ids = ids.unsqueeze(0);
         auto x = g_profiler.measure("model.embed", [&]() { return embed_forward(ids); });
         return hidden_forward_inputs(
-            ids, x, pos_override, seq_len, block_trace);
+            ids, x, pos_override, seq_len, block_trace,
+            mfq_nullopt, false, cache_positions_override);
     }
 
     mfq_tensor_backend::Tensor hidden_forward_inputs(
@@ -18051,7 +18070,8 @@ struct Model {
             MfqOptional<mfq_tensor_backend::Tensor> seq_len = mfq_nullopt,
             std::vector<mfq_tensor_backend::Tensor> * block_trace = nullptr,
             MfqOptional<mfq_tensor_backend::Tensor> attention_mask = mfq_nullopt,
-            bool advance_cache_with_position_ids = false) {
+            bool advance_cache_with_position_ids = false,
+            MfqOptional<mfq_tensor_backend::Tensor> cache_positions_override = mfq_nullopt) {
         const int primary = g_layer_placement.primary_device();
         MfqCudaGuard primary_guard(primary);
         ids = tensor_to_cuda_device(
@@ -18067,10 +18087,18 @@ struct Model {
         const int64_t B = ids.size(0);
         const int64_t T = ids.size(1);
         if (cache_pos == 0) reset(B);
-        auto cache_positions = mfq_tensor_backend::arange(
-            cache_pos, cache_pos + T,
-            mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA)
-                .dtype(mfq_tensor_backend::kInt64));
+        auto cache_positions = cache_positions_override.has_value()
+            ? tensor_to_cuda_device(
+                cache_positions_override.value(), primary)
+                .to(mfq_tensor_backend::kInt64).contiguous()
+            : mfq_tensor_backend::arange(
+                cache_pos, cache_pos + T,
+                mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA)
+                    .dtype(mfq_tensor_backend::kInt64));
+        if (cache_positions.dim() != 1 || cache_positions.numel() != T) {
+            throw std::runtime_error(
+                "cache_positions must have shape [tokens]");
+        }
         auto pos = pos_override.has_value()
             ? tensor_to_cuda_device(
                 pos_override.value(), primary).to(mfq_tensor_backend::kInt64).contiguous()
@@ -18233,7 +18261,7 @@ struct Model {
     }
 
     mfq_tensor_backend::Tensor last_logits_static(mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor pos, mfq_tensor_backend::Tensor seq_len) {
-        auto y = hidden_forward(ids, pos, seq_len);
+        auto y = hidden_forward(ids, pos, seq_len, nullptr, pos);
         auto last = y.index({Slice(), -1, Slice()});
         if (c.is_minicpmo45()) {
             return logits_from_hidden(
@@ -18262,7 +18290,7 @@ struct Model {
     }
 
     mfq_tensor_backend::Tensor next_token_static(mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor pos, mfq_tensor_backend::Tensor seq_len) {
-        auto y = hidden_forward(ids, pos, seq_len);
+        auto y = hidden_forward(ids, pos, seq_len, nullptr, pos);
         return next_token_from_hidden(y);
     }
 
@@ -19910,17 +19938,8 @@ static int32_t generate_server_tokens(
     }
 
     const char * graph_env = std::getenv("MFQ_SERVER_CUDA_GRAPH");
-#ifdef MFQ_NATIVE_CUDA_RUNTIME
-    // MiniCPM-o's composite BF16 decode path is not graph-safe in the native
-    // backend yet. Keep its eager path correct while preserving CUDA graphs
-    // for the other architectures and the Torch reference runtime.
-    const bool graph_architecture_supported = !model.c.is_minicpmo45();
-#else
-    const bool graph_architecture_supported = true;
-#endif
     const bool graph_enabled =
         (graph_env == nullptr || graph_env[0] != '0') &&
-        graph_architecture_supported &&
         mfq_cuda_graph_capture_supported() &&
         g_dsv4_cpu_offload_layers.empty() &&
         g_dense_cpu_layer_count == 0 &&
@@ -20007,12 +20026,17 @@ static int32_t generate_server_tokens(
             g_decode_graph_attention_parts = std::min<int64_t>(
                 g_decode_graph_attention_parts, FullBlock::kDecodeAttentionMaxParts);
             try {
-                if (model.c.is_gemma4() || model.c.is_glm_dsa()) {
+                graph_cache.graph = std::make_unique<MfqCudaGraph>();
+                mfq_prepare_cuda_graph_memory(*graph_cache.graph);
+                if (model.c.is_gemma4() || model.c.is_glm_dsa() ||
+                        model.c.is_minicpmo45()) {
+                    // Initialize persistent M=1 decode workspaces before
+                    // capture. The static position makes this warm-up write
+                    // the same KV slot that the captured pass overwrites.
                     (void)sample_static();
                     MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
                 }
 
-                graph_cache.graph = std::make_unique<MfqCudaGraph>();
                 graph_cache.graph->capture_begin();
                 graph_cache.static_next = sample_static();
                 if (has_penalties) {
@@ -21775,6 +21799,10 @@ static int run_linear_group_check(
         MfqCudaStreamGuard graph_guard(
             graph_stream);
         MfqCudaGraph graph;
+        mfq_prepare_cuda_graph_memory(graph);
+        graph_actual = group.forward(x);
+        MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_stream.stream()));
+        graph_actual.clear();
         graph.capture_begin();
         graph_actual = group.forward(x);
         graph.capture_end();
@@ -24040,7 +24068,7 @@ static int run_dsv4_attention_check(int reps) {
             .clamp_min(1e-4) / 448.0;
         ref_nope = (ref_nope / fp8_scale)
             .clamp(-448.0, 448.0)
-            .to(mfq_tensor_backend::kFloat8E4M3FN)
+            .to(mfq_float8_e4m3fn)
             .to(mfq_tensor_backend::kFloat32) * fp8_scale;
         ref.slice(-1, 0, D - RD).copy_(
             ref_nope.reshape({B, W, D - RD}));
@@ -26242,16 +26270,18 @@ int main(int argc, char ** argv) {
             MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
 
             MfqCudaGraph graph;
+            mfq_prepare_cuda_graph_memory(graph);
             mfq_tensor_backend::Tensor static_next;
             const int64_t planned_len = model.cache_pos + gen;
             g_decode_graph_attention_kv_len = planned_len;
             g_decode_graph_attention_parts = planned_len >= 192 ? (planned_len + 127) / 128 : 1;
             g_decode_graph_attention_parts = std::min<int64_t>(
                 g_decode_graph_attention_parts, FullBlock::kDecodeAttentionMaxParts);
-            if (model.c.is_gemma4() || model.c.is_glm_dsa()) {
-                // These graphs use M=1 expert and attention workspaces that differ
-                // from prefill. Initialize their pointer tables before capture; the
-                // captured pass overwrites the same KV position.
+            if (model.c.is_gemma4() || model.c.is_glm_dsa() ||
+                    model.c.is_minicpmo45()) {
+                // These graphs use persistent M=1 decode workspaces that differ
+                // from prefill. Initialize them before capture; the captured pass
+                // overwrites the same KV position.
                 (void)model.next_token_static(static_input, static_pos, static_len);
                 MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
             }

@@ -485,13 +485,15 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         mfq-server
     )
     target_compile_definitions(mfq-decode-torch PRIVATE NOMINMAX)
-    target_compile_features(mfq-decode-torch PRIVATE cxx_std_17)
+    target_compile_features(mfq-decode-torch PRIVATE cxx_std_20)
     target_compile_options(mfq-decode-torch PRIVATE
         "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>"
     )
     set_target_properties(mfq-decode-torch PROPERTIES
         CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
         CUDA_RUNTIME_LIBRARY Shared
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
     )
     if(OpenMP_CXX_FOUND)
         target_link_libraries(mfq-decode-torch PRIVATE OpenMP::OpenMP_CXX)

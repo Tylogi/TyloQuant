@@ -23,6 +23,7 @@ namespace mfq_tensor_backend = ::mfq::cuda;
 using mfq_half = __half;
 using mfq_bfloat16 = __nv_bfloat16;
 using MfqBackendError = ::mfq::cuda::Error;
+inline constexpr auto mfq_float8_e4m3fn = ::mfq::cuda::kFloat8E4M3FN;
 inline constexpr auto mfq_dispatch_half = ::mfq::cuda::ScalarType::float16;
 inline constexpr auto mfq_dispatch_bfloat16 = ::mfq::cuda::ScalarType::bfloat16;
 
@@ -97,6 +98,10 @@ private:
 using MfqCudaStream = ::mfq::cuda::StreamHandle;
 using MfqCudaStreamGuard = ::mfq::cuda::StreamGuard;
 using MfqCudaGraph = ::mfq::cuda::Graph;
+
+inline void mfq_prepare_cuda_graph_memory(MfqCudaGraph& graph) {
+    graph.prepare_memory();
+}
 
 inline MfqCudaStream mfq_get_current_cuda_stream(int device = -1) {
     return ::mfq::cuda::current_stream(device);
@@ -225,6 +230,7 @@ namespace mfq_tensor_backend = ::torch;
 using mfq_half = ::at::Half;
 using mfq_bfloat16 = ::at::BFloat16;
 using MfqBackendError = ::c10::Error;
+inline constexpr auto mfq_float8_e4m3fn = ::at::kFloat8_e4m3fn;
 inline constexpr auto mfq_dispatch_half = ::at::ScalarType::Half;
 inline constexpr auto mfq_dispatch_bfloat16 = ::at::ScalarType::BFloat16;
 
@@ -249,6 +255,8 @@ using MfqCudaGuard = ::c10::cuda::CUDAGuard;
 using MfqCudaStream = ::at::cuda::CUDAStream;
 using MfqCudaStreamGuard = ::c10::cuda::CUDAStreamGuard;
 using MfqCudaGraph = ::at::cuda::CUDAGraph;
+
+inline void mfq_prepare_cuda_graph_memory(MfqCudaGraph&) {}
 
 inline MfqCudaStream mfq_get_current_cuda_stream(int device = -1) {
     return device < 0

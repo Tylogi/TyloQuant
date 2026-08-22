@@ -15,6 +15,7 @@
 #include <cfloat>
 #include <climits>
 #include <cstdlib>
+#include <utility>
 
 #include "reduce.cuh"
 
@@ -445,7 +446,8 @@ __global__ void attention_cache_decode_kernel(
     const scalar_t* __restrict__ v,
     const int64_t* __restrict__ seq_len,
     scalar_t* __restrict__ out,
-    int B, int Hq, int Hk, int max_seq, int D, int rep, float scale)
+    int B, int Hq, int Hk, int max_seq, int D, int rep, float scale,
+    int maximum_cache_position)
 {
     constexpr int NW = BD / 32;
     int qv = blockIdx.x;
@@ -459,6 +461,13 @@ __global__ void attention_cache_decode_kernel(
     }
     if (Tk > max_seq) {
         Tk = max_seq;
+    }
+    if (maximum_cache_position >= 0 &&
+            Tk - 1 > maximum_cache_position) {
+        if (tid < D) {
+            out[((size_t)b * Hq + hq) * D + tid] = (scalar_t)0.0f;
+        }
+        return;
     }
 
     extern __shared__ float q_s[];
@@ -491,8 +500,10 @@ __global__ void attention_cache_decode_kernel(
     }
 }
 
-mfq_tensor_backend::Tensor attention_cache_decode_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
-                                          mfq_tensor_backend::Tensor seq_len, double scale)
+static mfq_tensor_backend::Tensor attention_cache_decode_impl_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache,
+    mfq_tensor_backend::Tensor v_cache, mfq_tensor_backend::Tensor seq_len,
+    double scale, int maximum_cache_position)
 {
     MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous(), "attention_cache_decode: q must be cuda contiguous");
     MFQ_RUNTIME_CHECK(k_cache.is_cuda() && k_cache.is_contiguous(), "attention_cache_decode: k_cache must be cuda contiguous");
@@ -522,7 +533,7 @@ mfq_tensor_backend::Tensor attention_cache_decode_cuda(mfq_tensor_backend::Tenso
 #define ATT_CACHE(BD) attention_cache_decode_kernel<BD, scalar_t><<<total, BD, shmem, stream>>>( \
     q.data_ptr<scalar_t>(), k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),          \
     seq_len.data_ptr<int64_t>(), out.data_ptr<scalar_t>(),                                       \
-    B, Hq, Hk, max_seq, D, rep, (float)scale)
+    B, Hq, Hk, max_seq, D, rep, (float)scale, maximum_cache_position)
     MFQ_DISPATCH_FLOATING_TYPES_AND2(
         mfq_dispatch_half, mfq_dispatch_bfloat16,
         q.scalar_type(), "attention_cache_decode_cuda", [&] {
@@ -536,6 +547,20 @@ mfq_tensor_backend::Tensor attention_cache_decode_cuda(mfq_tensor_backend::Tenso
     return out;
 }
 
+__device__ __forceinline__ int attention_decode_active_parts(
+    int token_count, int launch_parts, int dynamic_parts)
+{
+    if (!dynamic_parts) {
+        return launch_parts;
+    }
+    const int cache_position = token_count > 0 ? token_count - 1 : 0;
+    if (cache_position < 192) {
+        return 1;
+    }
+    const int active = (cache_position + 127) / 128;
+    return active < launch_parts ? active : launch_parts;
+}
+
 template <int BD, typename scalar_t>
 __global__ void attention_cache_decode_split_part_kernel(
     const scalar_t* __restrict__ q,
@@ -546,7 +571,7 @@ __global__ void attention_cache_decode_split_part_kernel(
     float* __restrict__ partial_m,
     float* __restrict__ partial_l,
     int B, int Hq, int Hk, int max_seq, int D, int rep,
-    int parts, int workspace_parts, float scale)
+    int parts, int workspace_parts, float scale, int dynamic_parts)
 {
     constexpr int NW = BD / 32;
     const int part = blockIdx.x % parts;
@@ -557,8 +582,21 @@ __global__ void attention_cache_decode_split_part_kernel(
     const int tid = threadIdx.x;
     int Tk = (int)seq_len[0];
     Tk = Tk < 0 ? 0 : (Tk > max_seq ? max_seq : Tk);
-    const int start = (int)(((int64_t)Tk * part) / parts);
-    const int end = (int)(((int64_t)Tk * (part + 1)) / parts);
+    const int active_parts = attention_decode_active_parts(
+        Tk, parts, dynamic_parts);
+    const size_t stat_idx = (size_t)qv * workspace_parts + part;
+    if (part >= active_parts) {
+        if (tid < D) {
+            partial_o[stat_idx * D + tid] = 0.0f;
+        }
+        if (tid == 0) {
+            partial_m[stat_idx] = -1e30f;
+            partial_l[stat_idx] = 0.0f;
+        }
+        return;
+    }
+    const int start = (int)(((int64_t)Tk * part) / active_parts);
+    const int end = (int)(((int64_t)Tk * (part + 1)) / active_parts);
 
     extern __shared__ float q_s[];
     if (tid < D) {
@@ -584,7 +622,6 @@ __global__ void attention_cache_decode_split_part_kernel(
         m = m_new;
     }
 
-    const size_t stat_idx = (size_t)qv * workspace_parts + part;
     if (tid < D) {
         partial_o[stat_idx * D + tid] = O;
     }
@@ -604,7 +641,7 @@ __global__ void attention_cache_decode_split_gqa4_d128_part_kernel(
     float* __restrict__ partial_m,
     float* __restrict__ partial_l,
     int B, int Hq, int Hk, int max_seq,
-    int parts, int workspace_parts, float scale)
+    int parts, int workspace_parts, float scale, int dynamic_parts)
 {
     constexpr int D = 128;
     constexpr int REP = 4;
@@ -619,8 +656,24 @@ __global__ void attention_cache_decode_split_gqa4_d128_part_kernel(
     const int hq0 = hk * REP;
     int Tk = (int)seq_len[0];
     Tk = Tk < 0 ? 0 : (Tk > max_seq ? max_seq : Tk);
-    const int start = (int)(((int64_t)Tk * part) / parts);
-    const int end = (int)(((int64_t)Tk * (part + 1)) / parts);
+    const int active_parts = attention_decode_active_parts(
+        Tk, parts, dynamic_parts);
+    if (part >= active_parts) {
+        #pragma unroll
+        for (int r = 0; r < REP; ++r) {
+            const int qv_idx = b * Hq + hq0 + r;
+            const size_t stat_idx =
+                (size_t)qv_idx * workspace_parts + part;
+            partial_o[stat_idx * D + tid] = 0.0f;
+            if (tid == 0) {
+                partial_m[stat_idx] = -1e30f;
+                partial_l[stat_idx] = 0.0f;
+            }
+        }
+        return;
+    }
+    const int start = (int)(((int64_t)Tk * part) / active_parts);
+    const int end = (int)(((int64_t)Tk * (part + 1)) / active_parts);
 
     float qv[REP];
     float m[REP];
@@ -688,8 +741,9 @@ __global__ void attention_cache_decode_split_reduce_kernel(
     const float* __restrict__ partial_o,
     const float* __restrict__ partial_m,
     const float* __restrict__ partial_l,
+    const int64_t* __restrict__ seq_len,
     scalar_t* __restrict__ out,
-    int total, int parts, int workspace_parts, int D)
+    int total, int parts, int workspace_parts, int D, int dynamic_parts)
 {
     const int qv = blockIdx.x;
     const int tid = threadIdx.x;
@@ -697,13 +751,16 @@ __global__ void attention_cache_decode_split_reduce_kernel(
         return;
     }
 
+    const int token_count = (int)seq_len[0];
+    const int active_parts = attention_decode_active_parts(
+        token_count, parts, dynamic_parts);
     float m = -1e30f;
-    for (int p = 0; p < parts; ++p) {
+    for (int p = 0; p < active_parts; ++p) {
         m = fmaxf(m, partial_m[(size_t)qv * workspace_parts + p]);
     }
     float l = 0.0f;
     float O = 0.0f;
-    for (int p = 0; p < parts; ++p) {
+    for (int p = 0; p < active_parts; ++p) {
         const size_t stat_idx = (size_t)qv * workspace_parts + p;
         const float lp = partial_l[stat_idx];
         const float w = lp > 0.0f ? expf(partial_m[stat_idx] - m) : 0.0f;
@@ -717,11 +774,11 @@ __global__ void attention_cache_decode_split_reduce_kernel(
     }
 }
 
-mfq_tensor_backend::Tensor attention_cache_decode_split_cuda(
+static mfq_tensor_backend::Tensor attention_cache_decode_split_impl_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
     mfq_tensor_backend::Tensor seq_len, double scale,
     mfq_tensor_backend::Tensor partial_o, mfq_tensor_backend::Tensor partial_m, mfq_tensor_backend::Tensor partial_l,
-    int64_t parts)
+    int64_t parts, bool dynamic_parts)
 {
     MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous(), "attention_cache_decode_split: q must be cuda contiguous");
     MFQ_RUNTIME_CHECK(k_cache.is_cuda() && k_cache.is_contiguous(), "attention_cache_decode_split: k_cache must be cuda contiguous");
@@ -769,18 +826,19 @@ mfq_tensor_backend::Tensor attention_cache_decode_split_cuda(
                 v_cache.data_ptr<scalar_t>(), seq_len.data_ptr<int64_t>(),                            \
                 partial_o.data_ptr<float>(), partial_m.data_ptr<float>(),                             \
                 partial_l.data_ptr<float>(), B, Hq, Hk, max_seq, (int)parts,                         \
-                workspace_parts, (float)scale);                                                       \
+                workspace_parts, (float)scale, dynamic_parts ? 1 : 0);                               \
     } else {                                                                                           \
         attention_cache_decode_split_part_kernel<BD, scalar_t>                                       \
             <<<total * (int)parts, BD, shmem, stream>>>(                                             \
                 q.data_ptr<scalar_t>(), k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),   \
                 seq_len.data_ptr<int64_t>(), partial_o.data_ptr<float>(), partial_m.data_ptr<float>(), \
                 partial_l.data_ptr<float>(), B, Hq, Hk, max_seq, D, rep, (int)parts, workspace_parts, \
-                (float)scale);                                                                         \
+                (float)scale, dynamic_parts ? 1 : 0);                                                 \
     }                                                                                                  \
     attention_cache_decode_split_reduce_kernel<BD, scalar_t><<<total, BD, 0, stream>>>(               \
         partial_o.data_ptr<float>(), partial_m.data_ptr<float>(), partial_l.data_ptr<float>(),          \
-        out.data_ptr<scalar_t>(), total, (int)parts, workspace_parts, D);                              \
+        seq_len.data_ptr<int64_t>(), out.data_ptr<scalar_t>(), total, (int)parts,                      \
+        workspace_parts, D, dynamic_parts ? 1 : 0);                                                   \
 } while (0)
     MFQ_DISPATCH_FLOATING_TYPES_AND2(
         mfq_dispatch_half, mfq_dispatch_bfloat16,
@@ -793,6 +851,42 @@ mfq_tensor_backend::Tensor attention_cache_decode_split_cuda(
     });
 #undef ATT_CACHE_SPLIT
     return out;
+}
+
+mfq_tensor_backend::Tensor attention_cache_decode_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache,
+    mfq_tensor_backend::Tensor v_cache, mfq_tensor_backend::Tensor seq_len,
+    double scale)
+{
+    return attention_cache_decode_impl_cuda(
+        std::move(q), std::move(k_cache), std::move(v_cache),
+        std::move(seq_len), scale, -1);
+}
+
+mfq_tensor_backend::Tensor attention_cache_decode_split_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache,
+    mfq_tensor_backend::Tensor v_cache, mfq_tensor_backend::Tensor seq_len,
+    double scale, mfq_tensor_backend::Tensor partial_o,
+    mfq_tensor_backend::Tensor partial_m,
+    mfq_tensor_backend::Tensor partial_l, int64_t parts)
+{
+    return attention_cache_decode_split_impl_cuda(
+        std::move(q), std::move(k_cache), std::move(v_cache),
+        std::move(seq_len), scale, std::move(partial_o),
+        std::move(partial_m), std::move(partial_l), parts, false);
+}
+
+mfq_tensor_backend::Tensor attention_cache_decode_dynamic_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache,
+    mfq_tensor_backend::Tensor v_cache, mfq_tensor_backend::Tensor seq_len,
+    double scale, mfq_tensor_backend::Tensor partial_o,
+    mfq_tensor_backend::Tensor partial_m,
+    mfq_tensor_backend::Tensor partial_l, int64_t max_parts)
+{
+    return attention_cache_decode_split_impl_cuda(
+        std::move(q), std::move(k_cache), std::move(v_cache),
+        std::move(seq_len), scale, std::move(partial_o),
+        std::move(partial_m), std::move(partial_l), max_parts, true);
 }
 
 template <int BD, typename scalar_t>
