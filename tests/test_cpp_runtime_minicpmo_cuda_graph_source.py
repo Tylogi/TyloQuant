@@ -135,6 +135,19 @@ def test_native_bf16_causal_scale_fusion_is_exactly_bounded() -> None:
     assert "load_number(source, linear) * factor" in NATIVE_OPS_SOURCE
 
 
+def test_native_bf16_softmax_preserves_serial_reduction_order() -> None:
+    selection = NATIVE_OPS_SOURCE.split(
+        'std::getenv("MFQ_DISABLE_NATIVE_EXACT_BF16_SOFTMAX")', 1
+    )[1].split("auto working =", 1)[0]
+    assert "input.scalar_type() == kBFloat16" in selection
+    assert "input.is_contiguous()" in selection
+    assert "selected + 1 == static_cast<std::size_t>(input.dim())" in selection
+    assert "exact_bf16_softmax_max_kernel" in NATIVE_OPS_SOURCE
+    assert "exact_bf16_softmax_numerator_kernel" in NATIVE_OPS_SOURCE
+    assert "exact_bf16_softmax_sum_kernel" in NATIVE_OPS_SOURCE
+    assert "exact_bf16_softmax_normalize_element_kernel" in NATIVE_OPS_SOURCE
+
+
 def test_cuda_profiler_filter_supports_low_perturbation_eager_attribution() -> None:
     assert 'std::getenv("MFQ_PROFILE_CUDA_FILTER")' in SOURCE
     assert "if (!enabled || !selected(name)) return fn();" in SOURCE

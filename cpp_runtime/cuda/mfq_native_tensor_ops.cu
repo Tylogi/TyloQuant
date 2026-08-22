@@ -431,6 +431,78 @@ __global__ void scale_causal_bf16_kernel(
     }
 }
 
+__global__ void exact_bf16_softmax_max_kernel(
+    const __nv_bfloat16* input,
+    float* maximum,
+    std::int64_t rows,
+    std::int64_t columns) {
+    for (std::int64_t row =
+             static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         row < rows;
+         row += static_cast<std::int64_t>(blockDim.x) * gridDim.x) {
+        float value = std::numeric_limits<float>::lowest();
+        const auto* row_input = input + row * columns;
+        for (std::int64_t column = 0; column < columns; ++column) {
+            const float candidate = __bfloat162float(row_input[column]);
+            if (candidate > value) value = candidate;
+        }
+        maximum[row] = value;
+    }
+}
+
+__global__ void exact_bf16_softmax_numerator_kernel(
+    const __nv_bfloat16* input,
+    const float* maximum,
+    float* numerator,
+    std::int64_t elements,
+    std::int64_t columns) {
+    for (std::int64_t linear =
+             static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         linear < elements;
+         linear += static_cast<std::int64_t>(blockDim.x) * gridDim.x) {
+        const auto row = linear / columns;
+        const float shifted = static_cast<float>(
+            static_cast<double>(__bfloat162float(input[linear])) -
+            static_cast<double>(maximum[row]));
+        numerator[linear] = static_cast<float>(
+            ::exp(static_cast<double>(shifted)));
+    }
+}
+
+__global__ void exact_bf16_softmax_sum_kernel(
+    const float* numerator,
+    float* denominator,
+    std::int64_t rows,
+    std::int64_t columns) {
+    for (std::int64_t row =
+             static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         row < rows;
+         row += static_cast<std::int64_t>(blockDim.x) * gridDim.x) {
+        const auto offset = row * columns;
+        float value = 0.0f;
+        for (std::int64_t column = 0; column < columns; ++column) {
+            value += numerator[offset + column];
+        }
+        denominator[row] = value;
+    }
+}
+
+__global__ void exact_bf16_softmax_normalize_element_kernel(
+    const float* numerator,
+    const float* denominator,
+    __nv_bfloat16* output,
+    std::int64_t elements,
+    std::int64_t columns) {
+    for (std::int64_t linear =
+             static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         linear < elements;
+         linear += static_cast<std::int64_t>(blockDim.x) * gridDim.x) {
+        output[linear] = store_number<__nv_bfloat16>(
+            static_cast<double>(numerator[linear]) /
+            static_cast<double>(denominator[linear / columns]));
+    }
+}
+
 bool matrix_layout_supported(const Tensor& tensor) {
     return tensor.stride(-1) == 1 || tensor.stride(-2) == 1;
 }
@@ -2302,6 +2374,49 @@ Tensor logsumexp(const Tensor& input, std::int64_t dimension, bool keep_dimensio
 }
 
 Tensor softmax(const Tensor& input, std::int64_t dimension) {
+    const auto selected = normalize_dimension(dimension, input.dim());
+    const char* exact_bf16_disabled =
+        std::getenv("MFQ_DISABLE_NATIVE_EXACT_BF16_SOFTMAX");
+    const bool exact_bf16 = input.is_cuda() &&
+        input.scalar_type() == kBFloat16 && input.is_contiguous() &&
+        selected + 1 == static_cast<std::size_t>(input.dim()) &&
+        input.size(-1) >= 32 &&
+        (exact_bf16_disabled == nullptr || exact_bf16_disabled[0] != '1');
+    if (exact_bf16) {
+        const auto columns = input.size(-1);
+        const auto rows = input.numel() / columns;
+        auto maximum = empty(
+            {rows}, input.options().dtype(kFloat32));
+        auto numerator = empty(
+            input.sizes(), input.options().dtype(kFloat32));
+        auto output = empty(input.sizes(), input.options());
+        const auto stream = current_stream(input.get_device()).stream();
+        const auto [row_blocks, row_threads] = launch_geometry(rows);
+        exact_bf16_softmax_max_kernel<<<
+            row_blocks, row_threads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(input.data_ptr()),
+            maximum.data_ptr<float>(), rows, columns);
+        const auto [element_blocks, element_threads] =
+            launch_geometry(input.numel());
+        exact_bf16_softmax_numerator_kernel<<<
+            element_blocks, element_threads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(input.data_ptr()),
+            maximum.data_ptr<float>(), numerator.data_ptr<float>(),
+            input.numel(), columns);
+        auto denominator = empty(
+            {rows}, input.options().dtype(kFloat32));
+        exact_bf16_softmax_sum_kernel<<<
+            row_blocks, row_threads, 0, stream>>>(
+            numerator.data_ptr<float>(), denominator.data_ptr<float>(),
+            rows, columns);
+        exact_bf16_softmax_normalize_element_kernel<<<
+            element_blocks, element_threads, 0, stream>>>(
+            numerator.data_ptr<float>(), denominator.data_ptr<float>(),
+            static_cast<__nv_bfloat16*>(output.data_ptr()),
+            input.numel(), columns);
+        MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
+        return output;
+    }
     auto working = input.scalar_type() == kFloat64
         ? input
         : input.to(kFloat32);

@@ -198,6 +198,20 @@ int main() {
         causal_scale_candidate == causal_scale_reference,
         "fused BF16 causal scale exactness");
 
+    set_test_environment("MFQ_DISABLE_NATIVE_EXACT_BF16_SOFTMAX", "1");
+    const auto softmax_reference = host_values(
+        scaled_dot_product_attention(
+            attention_left, attention_left, attention_left,
+            std::nullopt, 0.0, true, 0.08838834764831845, false));
+    set_test_environment("MFQ_DISABLE_NATIVE_EXACT_BF16_SOFTMAX", "0");
+    const auto softmax_candidate = host_values(
+        scaled_dot_product_attention(
+            attention_left, attention_left, attention_left,
+            std::nullopt, 0.0, true, 0.08838834764831845, false));
+    set_test_environment("MFQ_DISABLE_NATIVE_EXACT_BF16_SOFTMAX", "1");
+    require(
+        softmax_candidate == softmax_reference,
+        "exact BF16 softmax specialization");
     auto signal = tensor<float>({1, 2, 3, 4}).reshape({1, 1, 4}).to(cuda_device);
     auto filter = tensor<float>({1, 1}).reshape({1, 1, 2}).to(cuda_device);
     constexpr std::array<std::int64_t, 1> stride1{1};
