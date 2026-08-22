@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -35,6 +36,18 @@ std::vector<std::int64_t> host_int64_values(const mfq::cuda::Tensor& value) {
     return std::vector<std::int64_t>(
         host.data_ptr<std::int64_t>(),
         host.data_ptr<std::int64_t>() + host.numel());
+}
+
+void set_test_environment(const char* name, const char* value) {
+#ifdef _WIN32
+    if (_putenv_s(name, value) != 0) {
+        throw std::runtime_error("failed to set test environment variable");
+    }
+#else
+    if (setenv(name, value, 1) != 0) {
+        throw std::runtime_error("failed to set test environment variable");
+    }
+#endif
 }
 
 }  // namespace
@@ -121,6 +134,32 @@ int main() {
         host_values(matmul(batched_left, broadcast_right)) ==
             std::vector<float>({5, 11, 17, 23}),
         "batched matmul broadcasting");
+
+    std::vector<float> attention_left_values(4 * 32 * 128);
+    std::vector<float> attention_right_values(4 * 64 * 128);
+    for (std::size_t index = 0; index < attention_left_values.size(); ++index) {
+        attention_left_values[index] =
+            static_cast<float>(static_cast<int>(index % 31) - 15) / 32.0f;
+    }
+    for (std::size_t index = 0; index < attention_right_values.size(); ++index) {
+        attention_right_values[index] =
+            static_cast<float>(static_cast<int>(index % 29) - 14) / 32.0f;
+    }
+    auto attention_left = tensor<float>(attention_left_values)
+        .reshape({1, 4, 32, 128}).to(cuda_device).to(kBFloat16);
+    auto attention_right = tensor<float>(attention_right_values)
+        .reshape({1, 4, 64, 128}).to(cuda_device).to(kBFloat16)
+        .transpose(-2, -1);
+    set_test_environment("MFQ_DISABLE_NATIVE_PARALLEL_BATCH_MATMUL", "1");
+    const auto loop_batched_product = host_values(
+        matmul(attention_left, attention_right));
+    set_test_environment("MFQ_DISABLE_NATIVE_PARALLEL_BATCH_MATMUL", "0");
+    const auto parallel_batched_product = host_values(
+        matmul(attention_left, attention_right));
+    set_test_environment("MFQ_DISABLE_NATIVE_PARALLEL_BATCH_MATMUL", "1");
+    require(
+        parallel_batched_product == loop_batched_product,
+        "parallel batched matmul exactness");
 
     const auto probabilities = host_values(softmax(input, -1));
     require_close(probabilities[0], 0.09003057f, 1.0e-6f, "softmax first value");

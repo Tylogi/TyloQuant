@@ -10,13 +10,17 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string_view>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace mfq::cuda {
@@ -409,6 +413,42 @@ std::int64_t matmul_batch_offset(
 
 bool matrix_layout_supported(const Tensor& tensor) {
     return tensor.stride(-1) == 1 || tensor.stride(-2) == 1;
+}
+
+struct ParallelBatchMatmulContext {
+    static constexpr std::size_t kStreams = 4;
+
+    explicit ParallelBatchMatmulContext(int device) : ready() {
+        streams.reserve(kStreams);
+        handles.reserve(kStreams);
+        done.reserve(kStreams);
+        for (std::size_t index = 0; index < kStreams; ++index) {
+            streams.emplace_back(device);
+            handles.emplace_back(device);
+            handles.back().set_stream(streams.back().get());
+            done.emplace_back();
+        }
+    }
+
+    std::mutex mutex;
+    Event ready;
+    std::vector<Stream> streams;
+    std::vector<BlasHandle> handles;
+    std::vector<Event> done;
+};
+
+std::mutex parallel_batch_matmul_contexts_mutex;
+std::unordered_map<int, std::unique_ptr<ParallelBatchMatmulContext>>
+    parallel_batch_matmul_contexts;
+
+ParallelBatchMatmulContext& parallel_batch_matmul_context(int device) {
+    std::lock_guard<std::mutex> lock(parallel_batch_matmul_contexts_mutex);
+    auto& context = parallel_batch_matmul_contexts[device];
+    if (!context) {
+        DeviceGuard guard(device);
+        context = std::make_unique<ParallelBatchMatmulContext>(device);
+    }
+    return *context;
 }
 
 template <typename Value>
@@ -1811,6 +1851,86 @@ Tensor matmul(const Tensor& left_source, const Tensor& right_source) {
     }
     const int left_leading = static_cast<int>(left_row_major ? contraction : rows);
     const int right_leading = static_cast<int>(right_row_major ? columns : contraction);
+
+    const char* parallel_batch_disabled =
+        std::getenv("MFQ_DISABLE_NATIVE_PARALLEL_BATCH_MATMUL");
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    const bool parallel_batch_eligible =
+        batches >= static_cast<std::int64_t>(
+            ParallelBatchMatmulContext::kStreams) &&
+        rows >= 32 &&
+        (parallel_batch_disabled == nullptr ||
+         parallel_batch_disabled[0] != '1');
+    if (parallel_batch_eligible) {
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    }
+    const bool parallel_batch_enabled =
+        parallel_batch_eligible &&
+        capture_status == cudaStreamCaptureStatusNone;
+    if (parallel_batch_enabled) {
+        auto& parallel = parallel_batch_matmul_context(left.get_device());
+        std::lock_guard<std::mutex> lock(parallel.mutex);
+        parallel.ready.record(stream);
+        for (auto& worker : parallel.streams) {
+            worker.wait(parallel.ready);
+        }
+        for (std::int64_t batch = 0; batch < batches; ++batch) {
+            const auto coordinates = batch_coordinates(batch, batch_shape);
+            const auto left_offset =
+                matmul_batch_offset(left, batch_shape, coordinates);
+            const auto right_offset =
+                matmul_batch_offset(right, batch_shape, coordinates);
+            const auto* left_pointer =
+                static_cast<const std::byte*>(left.data_ptr()) +
+                left_offset * left.element_size();
+            const auto* right_pointer =
+                static_cast<const std::byte*>(right.data_ptr()) +
+                right_offset * right.element_size();
+            auto* output_pointer = static_cast<std::byte*>(output.data_ptr()) +
+                batch * rows * columns * output.element_size();
+            const auto worker = static_cast<std::size_t>(batch) %
+                ParallelBatchMatmulContext::kStreams;
+            const auto worker_handle = parallel.handles[worker].get();
+            if (left.scalar_type() == kFloat64) {
+                const double alpha = 1.0;
+                const double beta = 0.0;
+                MFQ_NATIVE_CUDA_CHECK(cublasGemmEx(
+                    worker_handle,
+                    right_operation, left_operation,
+                    static_cast<int>(columns), static_cast<int>(rows),
+                    static_cast<int>(contraction),
+                    &alpha,
+                    right_pointer, data_type, right_leading,
+                    left_pointer, data_type, left_leading,
+                    &beta,
+                    output_pointer, data_type, static_cast<int>(columns),
+                    CUBLAS_COMPUTE_64F, CUBLAS_GEMM_DEFAULT));
+            } else {
+                const float alpha = 1.0f;
+                const float beta = 0.0f;
+                MFQ_NATIVE_CUDA_CHECK(cublasGemmEx(
+                    worker_handle,
+                    right_operation, left_operation,
+                    static_cast<int>(columns), static_cast<int>(rows),
+                    static_cast<int>(contraction),
+                    &alpha,
+                    right_pointer, data_type, right_leading,
+                    left_pointer, data_type, left_leading,
+                    &beta,
+                    output_pointer, data_type, static_cast<int>(columns),
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            }
+        }
+        for (std::size_t worker = 0;
+             worker < ParallelBatchMatmulContext::kStreams; ++worker) {
+            parallel.done[worker].record(parallel.streams[worker].get());
+            MFQ_NATIVE_CUDA_CHECK(cudaStreamWaitEvent(
+                stream, parallel.done[worker].get(), 0));
+        }
+        if (left_vector) output = output.squeeze(-2);
+        if (right_vector) output = output.squeeze(-1);
+        return output;
+    }
 
     for (std::int64_t batch = 0; batch < batches; ++batch) {
         const auto coordinates = batch_coordinates(batch, batch_shape);

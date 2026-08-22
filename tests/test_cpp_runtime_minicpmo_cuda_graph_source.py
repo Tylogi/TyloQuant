@@ -110,6 +110,19 @@ def test_native_bf16_argmax_uses_bounded_contiguous_last_dimension_path() -> Non
     assert "selected + 1 == static_cast<std::size_t>(source.dim())" in selection
 
 
+def test_native_prefill_batched_matmul_preserves_per_matrix_gemm() -> None:
+    selection = NATIVE_OPS_SOURCE.split(
+        'std::getenv("MFQ_DISABLE_NATIVE_PARALLEL_BATCH_MATMUL")', 1
+    )[1].split("\n    for (std::int64_t batch = 0; batch < batches; ++batch)", 1)[0]
+    assert "rows >= 32" in NATIVE_OPS_SOURCE
+    assert "cudaStreamCaptureStatusNone" in NATIVE_OPS_SOURCE
+    assert "parallel.ready.record(stream);" in selection
+    assert "worker.wait(parallel.ready);" in selection
+    assert "cublasGemmEx(" in selection
+    assert "cublasGemmStridedBatchedEx(" not in selection
+    assert "cudaStreamWaitEvent(" in selection
+
+
 def test_cuda_profiler_filter_supports_low_perturbation_eager_attribution() -> None:
     assert 'std::getenv("MFQ_PROFILE_CUDA_FILTER")' in SOURCE
     assert "if (!enabled || !selected(name)) return fn();" in SOURCE
