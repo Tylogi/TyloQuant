@@ -7,6 +7,137 @@
 #define MFQ_LLAMA_FATTN_KERNEL_ONLY
 #include "llama_fattn_mma_f16.cuh"
 
+__global__ void minicpm_flash128_q_cast_kernel(
+    const __nv_bfloat16* source,
+    float* destination,
+    int64_t elements)
+{
+    for (int64_t index =
+             static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < elements;
+         index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        destination[index] = __bfloat162float(source[index]);
+    }
+}
+
+__global__ void minicpm_flash128_kv_cast_kernel(
+    const __nv_bfloat16* key_source,
+    const __nv_bfloat16* value_source,
+    half* key_destination,
+    half* value_destination,
+    int64_t elements)
+{
+    for (int64_t index =
+             static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < elements;
+         index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        key_destination[index] = __float2half_rn(
+            __bfloat162float(key_source[index]));
+        value_destination[index] = __float2half_rn(
+            __bfloat162float(value_source[index]));
+    }
+}
+
+__global__ void minicpm_flash128_output_cast_kernel(
+    const float* source,
+    __nv_bfloat16* destination,
+    int64_t elements)
+{
+    for (int64_t index =
+             static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < elements;
+         index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        destination[index] = __float2bfloat16_rn(source[index]);
+    }
+}
+
+static int minicpm_flash128_cast_blocks(int64_t elements)
+{
+    return std::min<int64_t>(65535, (elements + 255) / 256);
+}
+
+mfq_tensor_backend::Tensor minicpm_flash128_q_cast_cuda(
+    mfq_tensor_backend::Tensor q)
+{
+    MFQ_RUNTIME_CHECK(
+        q.is_cuda() && q.is_contiguous() &&
+            q.scalar_type() == mfq_tensor_backend::kBFloat16 &&
+            q.numel() > 0,
+        "MiniCPM Flash128 Q cast requires contiguous CUDA BF16");
+    auto output = mfq_tensor_backend::empty(
+        q.sizes(), q.options().dtype(mfq_tensor_backend::kFloat32));
+    minicpm_flash128_q_cast_kernel<<<
+        minicpm_flash128_cast_blocks(q.numel()), 256, 0,
+        mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(
+            q.data_ptr<mfq_bfloat16>()),
+        output.data_ptr<float>(), q.numel());
+    const auto status = cudaGetLastError();
+    MFQ_RUNTIME_CHECK(
+        status == cudaSuccess,
+        "MiniCPM Flash128 Q cast launch failed: ",
+        cudaGetErrorString(status));
+    return output;
+}
+
+std::vector<mfq_tensor_backend::Tensor> minicpm_flash128_kv_cast_cuda(
+    mfq_tensor_backend::Tensor k,
+    mfq_tensor_backend::Tensor v)
+{
+    MFQ_RUNTIME_CHECK(
+        k.is_cuda() && k.is_contiguous() &&
+            k.scalar_type() == mfq_tensor_backend::kBFloat16 &&
+            v.is_cuda() && v.is_contiguous() &&
+            v.scalar_type() == mfq_tensor_backend::kBFloat16 &&
+            k.sizes() == v.sizes() && k.numel() > 0,
+        "MiniCPM Flash128 KV cast requires matching contiguous CUDA BF16");
+    auto key = mfq_tensor_backend::empty(
+        k.sizes(), k.options().dtype(mfq_tensor_backend::kFloat16));
+    auto value = mfq_tensor_backend::empty(
+        v.sizes(), v.options().dtype(mfq_tensor_backend::kFloat16));
+    minicpm_flash128_kv_cast_kernel<<<
+        minicpm_flash128_cast_blocks(k.numel()), 256, 0,
+        mfq_current_cuda_stream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(
+            k.data_ptr<mfq_bfloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(
+            v.data_ptr<mfq_bfloat16>()),
+        reinterpret_cast<half*>(key.data_ptr<mfq_half>()),
+        reinterpret_cast<half*>(value.data_ptr<mfq_half>()),
+        k.numel());
+    const auto status = cudaGetLastError();
+    MFQ_RUNTIME_CHECK(
+        status == cudaSuccess,
+        "MiniCPM Flash128 KV cast launch failed: ",
+        cudaGetErrorString(status));
+    return {key, value};
+}
+
+mfq_tensor_backend::Tensor minicpm_flash128_output_cast_cuda(
+    mfq_tensor_backend::Tensor input)
+{
+    MFQ_RUNTIME_CHECK(
+        input.is_cuda() && input.is_contiguous() &&
+            input.scalar_type() == mfq_tensor_backend::kFloat32 &&
+            input.numel() > 0,
+        "MiniCPM Flash128 output cast requires contiguous CUDA F32");
+    auto output = mfq_tensor_backend::empty(
+        input.sizes(), input.options().dtype(mfq_tensor_backend::kBFloat16));
+    minicpm_flash128_output_cast_kernel<<<
+        minicpm_flash128_cast_blocks(input.numel()), 256, 0,
+        mfq_current_cuda_stream()>>>(
+        input.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(
+            output.data_ptr<mfq_bfloat16>()),
+        input.numel());
+    const auto status = cudaGetLastError();
+    MFQ_RUNTIME_CHECK(
+        status == cudaSuccess,
+        "MiniCPM Flash128 output cast launch failed: ",
+        cudaGetErrorString(status));
+    return output;
+}
+
 __global__ void mfq_causal_mask_kernel(
     half* mask, int* kv_max, int B, int T, int mask_stride, int tiles,
     int query_tile, int kv_tile)
@@ -254,6 +385,59 @@ mfq_tensor_backend::Tensor attention_llama_flash256_cuda(
     if (T <= 16) return mfq_llama_flash_launch<256, 256, 16, 1>(q, k, v, scale, false, 0);
     if (T <= 32) return mfq_llama_flash_launch<256, 256, 32, 1>(q, k, v, scale, false, 0);
     return mfq_llama_flash_launch<256, 256, 64, 1>(q, k, v, scale, false, 0);
+}
+
+mfq_tensor_backend::Tensor attention_llama_flash128_cuda(
+    mfq_tensor_backend::Tensor q,
+    mfq_tensor_backend::Tensor k,
+    mfq_tensor_backend::Tensor v,
+    double scale)
+{
+    MFQ_RUNTIME_CHECK(
+        q.is_cuda() && q.is_contiguous() &&
+            q.scalar_type() == mfq_tensor_backend::kFloat32,
+        "llama_flash128: q must be contiguous CUDA f32");
+    MFQ_RUNTIME_CHECK(
+        k.is_cuda() && k.is_contiguous() &&
+            k.scalar_type() == mfq_tensor_backend::kFloat16,
+        "llama_flash128: k must be contiguous CUDA f16");
+    MFQ_RUNTIME_CHECK(
+        v.is_cuda() && v.is_contiguous() &&
+            v.scalar_type() == mfq_tensor_backend::kFloat16,
+        "llama_flash128: v must be contiguous CUDA f16");
+    MFQ_RUNTIME_CHECK(
+        q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+        "llama_flash128: rank must be 4");
+    const int B = static_cast<int>(q.size(0));
+    const int Hq = static_cast<int>(q.size(1));
+    const int T = static_cast<int>(q.size(2));
+    const int D = static_cast<int>(q.size(3));
+    const int Hk = static_cast<int>(k.size(1));
+    MFQ_RUNTIME_CHECK(
+        D == 128 && k.size(3) == D && v.size(3) == D,
+        "llama_flash128: head_dim must be 128");
+    MFQ_RUNTIME_CHECK(
+        Hq == 4 * Hk && k.size(0) == B && v.size(0) == B &&
+            k.size(2) == T && v.size(2) == T && v.size(1) == Hk,
+        "llama_flash128: requires self-attention with GQA ratio 4");
+    if (T % FATTN_KQ_STRIDE == 0) {
+        return mfq_llama_flash_launch<128, 128, 16, 4>(
+            q, k, v, scale, false, 0);
+    }
+    if (T <= 8) {
+        return mfq_llama_flash_launch<128, 128, 8, 1>(
+            q, k, v, scale, false, 0);
+    }
+    if (T <= 16) {
+        return mfq_llama_flash_launch<128, 128, 16, 1>(
+            q, k, v, scale, false, 0);
+    }
+    if (T <= 32) {
+        return mfq_llama_flash_launch<128, 128, 32, 1>(
+            q, k, v, scale, false, 0);
+    }
+    return mfq_llama_flash_launch<128, 128, 64, 1>(
+        q, k, v, scale, false, 0);
 }
 
 mfq_tensor_backend::Tensor attention_llama_flash512_cuda(

@@ -157,6 +157,13 @@ mfq_tensor_backend::Tensor attention_cache_swa_planned_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
     mfq_tensor_backend::Tensor seq_len, double scale, int64_t window, int64_t planned_length);
 mfq_tensor_backend::Tensor attention_llama_flash256_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale);
+mfq_tensor_backend::Tensor attention_llama_flash128_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale);
+mfq_tensor_backend::Tensor minicpm_flash128_q_cast_cuda(
+    mfq_tensor_backend::Tensor q);
+std::vector<mfq_tensor_backend::Tensor> minicpm_flash128_kv_cast_cuda(
+    mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v);
+mfq_tensor_backend::Tensor minicpm_flash128_output_cast_cuda(
+    mfq_tensor_backend::Tensor output);
 mfq_tensor_backend::Tensor attention_llama_flash512_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale);
 mfq_tensor_backend::Tensor attention_llama_flash256_swa_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale, int64_t window);
@@ -15924,20 +15931,67 @@ struct FullBlock : Block {
             auto vh = v.to(attention_dtype).contiguous();
             if (cache_pos == 0 && T > 1) {
                 if (official_bf16) {
-                    auto repeated_k = kh;
-                    auto repeated_v = vh;
-                    if (nkh != nh) {
-                        MFQ_RUNTIME_CHECK(
-                            nh % nkh == 0,
-                            "MiniCPM-o Qwen3 attention head ratio is invalid");
-                        const int64_t repeat = nh / nkh;
-                        repeated_k = kh.repeat_interleave(repeat, 1).contiguous();
-                        repeated_v = vh.repeat_interleave(repeat, 1).contiguous();
+                    const char* bf16_flash128_disabled =
+                        std::getenv("MFQ_DISABLE_MINICPM_BF16_FLASH128");
+                    const bool bf16_flash128 = !sliding && hd == 128 &&
+                        nh == 4 * nkh && !seq_len.has_value() &&
+                        !attention_mask.has_value() &&
+                        (bf16_flash128_disabled == nullptr ||
+                         bf16_flash128_disabled[0] != '1');
+                    if (bf16_flash128) {
+                        const char* specialized_casts_disabled = std::getenv(
+                            "MFQ_DISABLE_MINICPM_FLASH128_SPECIALIZED_CASTS");
+                        const bool specialized_casts =
+                            specialized_casts_disabled == nullptr ||
+                            specialized_casts_disabled[0] != '1';
+                        auto flash_q = g_profiler.measure(
+                            "full.flash128_q_cast", [&]() {
+                                return specialized_casts
+                                    ? minicpm_flash128_q_cast_cuda(qh)
+                                    : qh.to(mfq_tensor_backend::kFloat32)
+                                        .contiguous();
+                            });
+                        auto flash_kv = g_profiler.measure(
+                            "full.flash128_kv_cast", [&]() {
+                                if (specialized_casts) {
+                                    return minicpm_flash128_kv_cast_cuda(kh, vh);
+                                }
+                                return std::vector<mfq_tensor_backend::Tensor>{
+                                    kh.to(mfq_tensor_backend::kFloat16)
+                                        .contiguous(),
+                                    vh.to(mfq_tensor_backend::kFloat16)
+                                        .contiguous()};
+                            });
+                        a = g_profiler.measure(
+                            "full.flash128_kernel", [&]() {
+                                return attention_llama_flash128_cuda(
+                                    flash_q, flash_kv[0], flash_kv[1],
+                                    attn_scale);
+                            });
+                        a = g_profiler.measure(
+                            "full.flash128_output_cast", [&]() {
+                                return specialized_casts
+                                    ? minicpm_flash128_output_cast_cuda(a)
+                                    : a.to(mfq_tensor_backend::kBFloat16)
+                                        .contiguous();
+                            });
+                        attention_token_major = true;
+                    } else {
+                        auto repeated_k = kh;
+                        auto repeated_v = vh;
+                        if (nkh != nh) {
+                            MFQ_RUNTIME_CHECK(
+                                nh % nkh == 0,
+                                "MiniCPM-o Qwen3 attention head ratio is invalid");
+                            const int64_t repeat = nh / nkh;
+                            repeated_k = kh.repeat_interleave(repeat, 1).contiguous();
+                            repeated_v = vh.repeat_interleave(repeat, 1).contiguous();
+                        }
+                        auto mask = minicpmo45_attention_mask(T, false);
+                        a = mfq_scaled_dot_product_attention(
+                            qh, repeated_k, repeated_v, mask,
+                            0.0, !mask.has_value(), attn_scale, false);
                     }
-                    auto mask = minicpmo45_attention_mask(T, false);
-                    a = mfq_scaled_dot_product_attention(
-                        qh, repeated_k, repeated_v, mask,
-                        0.0, !mask.has_value(), attn_scale, false);
                 } else {
                 const char * llama_flash_env = std::getenv("MFQ_LLAMA_FLASH256");
                 const bool llama_flash_enabled =
@@ -16385,6 +16439,12 @@ struct FullBlock : Block {
             }
             if (rr.scalar_type() == mfq_tensor_backend::kBFloat16 &&
                     ff2.scalar_type() == mfq_tensor_backend::kBFloat16) {
+                const char* specialized_acc_disabled =
+                    std::getenv("MFQ_DISABLE_MINICPM_BF16_RESIDUAL_ACC");
+                if (specialized_acc_disabled == nullptr ||
+                        specialized_acc_disabled[0] != '1') {
+                    return acc_cuda(rr, ff2).reshape({B, T, H});
+                }
                 return (rr + ff2).contiguous().reshape({B, T, H});
             }
             return acc_cuda(rr, ff2).reshape({B, T, H});
@@ -26522,10 +26582,12 @@ int main(int argc, char ** argv) {
         }
         if (compare_llama_flash) {
             mfq_set_env("MFQ_LLAMA_FLASH256", "0");
+            mfq_set_env("MFQ_DISABLE_MINICPM_BF16_FLASH128", "1");
             auto ref = model.last_logits(ids).to(mfq_tensor_backend::kFloat32);
             mfq_cuda_synchronize();
             model.reset(1);
             mfq_set_env("MFQ_LLAMA_FLASH256", "1");
+            mfq_set_env("MFQ_DISABLE_MINICPM_BF16_FLASH128", "0");
             auto test = model.last_logits(ids).to(mfq_tensor_backend::kFloat32);
             mfq_cuda_synchronize();
             auto ref_logp = mfq_tensor_backend::log_softmax(ref, -1);

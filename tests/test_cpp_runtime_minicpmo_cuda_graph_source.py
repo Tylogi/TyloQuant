@@ -8,6 +8,13 @@ SOURCE = (Path(__file__).parents[1] / "cpp_runtime" / "mfq_decode.cpp").read_tex
 ATTENTION_SOURCE = (
     Path(__file__).parents[1] / "mfq" / "kernels" / "cuda" / "attention.cu"
 ).read_text(encoding="utf-8")
+ATTENTION_LLAMA_SOURCE = (
+    Path(__file__).parents[1]
+    / "mfq"
+    / "kernels"
+    / "cuda"
+    / "attention_llama.cu"
+).read_text(encoding="utf-8")
 BACKEND_SOURCE = (
     Path(__file__).parents[1] / "cpp_runtime" / "cuda" / "mfq_tensor_backend.h"
 ).read_text(encoding="utf-8")
@@ -19,6 +26,9 @@ NATIVE_OPS_SOURCE = (
 ).read_text(encoding="utf-8")
 NATIVE_TENSOR_SOURCE = (
     Path(__file__).parents[1] / "cpp_runtime" / "cuda" / "mfq_native_tensor.cu"
+).read_text(encoding="utf-8")
+ACC_SOURCE = (
+    Path(__file__).parents[1] / "mfq" / "kernels" / "cuda" / "acc.cu"
 ).read_text(encoding="utf-8")
 
 
@@ -146,6 +156,51 @@ def test_native_bf16_softmax_preserves_serial_reduction_order() -> None:
     assert "exact_bf16_softmax_numerator_kernel" in NATIVE_OPS_SOURCE
     assert "exact_bf16_softmax_sum_kernel" in NATIVE_OPS_SOURCE
     assert "exact_bf16_softmax_normalize_element_kernel" in NATIVE_OPS_SOURCE
+
+
+def test_minicpmo_bf16_prefill_flash128_is_strictly_bounded() -> None:
+    selection = SOURCE.split(
+        'std::getenv("MFQ_DISABLE_MINICPM_BF16_FLASH128")', 1
+    )[1].split("if (bf16_flash128)", 1)[0]
+    assert "!sliding && hd == 128" in selection
+    assert "nh == 4 * nkh" in selection
+    assert "!seq_len.has_value()" in selection
+    assert "!attention_mask.has_value()" in selection
+    flash_path = SOURCE.split("if (bf16_flash128)", 1)[1].split("} else {", 1)[0]
+    assert "attention_llama_flash128_cuda" in flash_path
+    assert ".to(mfq_tensor_backend::kBFloat16)" in flash_path
+    assert "attention_llama_flash128_cuda" in ATTENTION_LLAMA_SOURCE
+    implementation = ATTENTION_LLAMA_SOURCE.split(
+        "attention_llama_flash128_cuda", 1
+    )[1].split("attention_llama_flash512_cuda", 1)[0]
+    assert "D == 128" in implementation
+    assert "Hq == 4 * Hk" in implementation
+    assert "mfq_llama_flash_launch<128, 128, 16, 4>" in implementation
+    casts = SOURCE.split(
+        '"MFQ_DISABLE_MINICPM_FLASH128_SPECIALIZED_CASTS"', 1
+    )[1].split("attention_token_major = true", 1)[0]
+    assert "minicpm_flash128_q_cast_cuda" in casts
+    assert "minicpm_flash128_kv_cast_cuda" in casts
+    assert "minicpm_flash128_output_cast_cuda" in casts
+    assert "minicpm_flash128_q_cast_kernel" in ATTENTION_LLAMA_SOURCE
+    assert "minicpm_flash128_kv_cast_kernel" in ATTENTION_LLAMA_SOURCE
+    assert "minicpm_flash128_output_cast_kernel" in ATTENTION_LLAMA_SOURCE
+    assert "__bfloat162float" in ATTENTION_LLAMA_SOURCE
+    assert "__float2half_rn" in ATTENTION_LLAMA_SOURCE
+    assert "__float2bfloat16_rn" in ATTENTION_LLAMA_SOURCE
+    assert ATTENTION_LLAMA_SOURCE.count("numel() > 0") >= 3
+
+
+def test_minicpmo_bf16_residual_uses_contiguous_specialized_add() -> None:
+    selection = SOURCE.split(
+        'std::getenv("MFQ_DISABLE_MINICPM_BF16_RESIDUAL_ACC")', 1
+    )[1].split("return acc_cuda(rr, ff2)", 1)[0]
+    assert "rr.scalar_type() == mfq_tensor_backend::kBFloat16" in SOURCE
+    assert "specialized_acc_disabled == nullptr" in selection
+    assert "acc_bf16_kernel" in ACC_SOURCE
+    assert "a.is_cuda() && a.is_contiguous()" in ACC_SOURCE
+    assert "a.sizes() == b.sizes()" in ACC_SOURCE
+    assert "__float2bfloat16_rn" in ACC_SOURCE
 
 
 def test_cuda_profiler_filter_supports_low_perturbation_eager_attribution() -> None:

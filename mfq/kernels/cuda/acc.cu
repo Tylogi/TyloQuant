@@ -1,4 +1,4 @@
-// Residual add a + b (ggml acc.cu: ggml_acc). fp16/fp32, any shape flattened.
+// Residual add a + b (ggml acc.cu: ggml_acc). fp16/fp32/bf16, any shape flattened.
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -16,21 +16,52 @@ __global__ void acc_kernel(const scalar_t* __restrict__ a, const scalar_t* __res
     }
 }
 
+__global__ void acc_bf16_kernel(
+    const __nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b,
+    __nv_bfloat16* __restrict__ out,
+    int n)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < n;
+         i += gridDim.x * blockDim.x) {
+        out[i] = __float2bfloat16_rn(
+            __bfloat162float(a[i]) + __bfloat162float(b[i]));
+    }
+}
+
 mfq_tensor_backend::Tensor acc_cuda(mfq_tensor_backend::Tensor a, mfq_tensor_backend::Tensor b)
 {
     MFQ_RUNTIME_CHECK(a.is_cuda() && a.is_contiguous(), "acc: a must be cuda contiguous");
     MFQ_RUNTIME_CHECK(b.is_cuda() && b.is_contiguous(), "acc: b must be cuda contiguous");
     MFQ_RUNTIME_CHECK(a.scalar_type() == b.scalar_type(), "acc: a/b dtype mismatch");
-    MFQ_RUNTIME_CHECK(a.scalar_type() == mfq_tensor_backend::kFloat16 || a.scalar_type() == mfq_tensor_backend::kFloat32,
-                "acc: dtype must be f16 or f32");
+    MFQ_RUNTIME_CHECK(
+        a.scalar_type() == mfq_tensor_backend::kFloat16 ||
+            a.scalar_type() == mfq_tensor_backend::kFloat32 ||
+            a.scalar_type() == mfq_tensor_backend::kBFloat16,
+        "acc: dtype must be f16, f32, or bf16");
     MFQ_RUNTIME_CHECK(a.sizes() == b.sizes(), "acc: a/b shape mismatch");
     int n = (int)a.numel();
     auto out = mfq_tensor_backend::empty_like(a);
     constexpr int BD = 256;
-    MFQ_DISPATCH_FLOATING_TYPES_AND_HALF(a.scalar_type(), "acc_cuda", [&] {
-        acc_kernel<scalar_t><<<(n + BD - 1) / BD, BD, 0, mfq_current_cuda_stream()>>>(
-            a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), out.data_ptr<scalar_t>(), n);
-    });
+    if (a.scalar_type() == mfq_tensor_backend::kBFloat16) {
+        acc_bf16_kernel<<<
+            (n + BD - 1) / BD, BD, 0, mfq_current_cuda_stream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(
+                a.data_ptr<mfq_bfloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(
+                b.data_ptr<mfq_bfloat16>()),
+            reinterpret_cast<__nv_bfloat16*>(
+                out.data_ptr<mfq_bfloat16>()),
+            n);
+    } else {
+        MFQ_DISPATCH_FLOATING_TYPES_AND_HALF(a.scalar_type(), "acc_cuda", [&] {
+            acc_kernel<scalar_t><<<(n + BD - 1) / BD, BD, 0,
+                mfq_current_cuda_stream()>>>(
+                a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(),
+                out.data_ptr<scalar_t>(), n);
+        });
+    }
     return out;
 }
 
