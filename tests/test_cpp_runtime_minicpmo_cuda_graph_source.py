@@ -27,6 +27,9 @@ NATIVE_OPS_SOURCE = (
 NATIVE_TENSOR_SOURCE = (
     Path(__file__).parents[1] / "cpp_runtime" / "cuda" / "mfq_native_tensor.cu"
 ).read_text(encoding="utf-8")
+KV_CACHE_SOURCE = (
+    Path(__file__).parents[1] / "mfq" / "kernels" / "cuda" / "kv_cache.cu"
+).read_text(encoding="utf-8")
 ACC_SOURCE = (
     Path(__file__).parents[1] / "mfq" / "kernels" / "cuda" / "acc.cu"
 ).read_text(encoding="utf-8")
@@ -229,6 +232,26 @@ def test_bf16_head_to_token_candidate_is_exactly_stride_bounded() -> None:
     assert "source.stride(2) == tokens * depth" in selection
     assert "source.stride(0) == heads * tokens * depth" in selection
     assert "alignof(uint4)" in selection
+
+
+def test_native_contiguous_bf16_to_f16_avoids_rank_decoding() -> None:
+    assert "convert_contiguous_bf16_to_f16_kernel" in NATIVE_TENSOR_SOURCE
+    selection = NATIVE_TENSOR_SOURCE.split(
+        'std::getenv("MFQ_DISABLE_NATIVE_CONTIGUOUS_BF16_TO_F16")', 1
+    )[1].split("if constexpr (", 1)[0]
+    assert "source.is_contiguous()" in selection
+    assert "destination.is_contiguous()" in selection
+    assert "__float2half_rn(__bfloat162float(input[linear]))" in NATIVE_TENSOR_SOURCE
+
+
+def test_native_bf16_kv_cache_uses_the_fused_writer() -> None:
+    append = SOURCE.split("struct KVCache", 1)[1].split("struct Dsv4RopeTable", 1)[0]
+    native_gate = append.split("#ifdef MFQ_NATIVE_CUDA_RUNTIME", 1)[1].split(
+        "#else", 1
+    )[0]
+    assert "k.scalar_type()" not in native_gate
+    assert "mfq_tensor_backend::kBFloat16" in KV_CACHE_SOURCE
+    assert KV_CACHE_SOURCE.count("MFQ_DISPATCH_FLOATING_TYPES_AND2") >= 3
 
 
 def test_graph_attention_tracks_eager_split_count_from_device_length() -> None:

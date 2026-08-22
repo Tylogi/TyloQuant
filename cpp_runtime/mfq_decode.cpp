@@ -14663,8 +14663,13 @@ struct KVCache {
         auto kh = kk.to(k.scalar_type()).contiguous();
         auto vh = vv.to(v.scalar_type()).contiguous();
         const char * aten_write_env = std::getenv("MFQ_KV_CACHE_WRITE_ATEN");
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+        const bool aten_write =
+            aten_write_env != nullptr && aten_write_env[0] == '1';
+#else
         const bool aten_write = k.scalar_type() != mfq_tensor_backend::kFloat16 ||
             (aten_write_env != nullptr && aten_write_env[0] == '1');
+#endif
         if (!k.is_cuda() || aten_write) {
             auto slots = ring ? mfq_tensor_backend::remainder(pos, k.size(2)) : pos;
             slots = slots.to(mfq_tensor_backend::kInt64).contiguous();

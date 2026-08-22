@@ -56,8 +56,10 @@ std::vector<mfq_tensor_backend::Tensor> kv_cache_write_cuda(
     MFQ_RUNTIME_CHECK(k_cache.scalar_type() == v_cache.scalar_type() && k_cache.scalar_type() == k.scalar_type()
                 && k_cache.scalar_type() == v.scalar_type(),
                 "kv_cache_write: k/v/cache dtype mismatch");
-    MFQ_RUNTIME_CHECK(k_cache.scalar_type() == mfq_tensor_backend::kFloat16 || k_cache.scalar_type() == mfq_tensor_backend::kFloat32,
-                "kv_cache_write: dtype must be f16 or f32");
+    MFQ_RUNTIME_CHECK(k_cache.scalar_type() == mfq_tensor_backend::kFloat16 ||
+                k_cache.scalar_type() == mfq_tensor_backend::kBFloat16 ||
+                k_cache.scalar_type() == mfq_tensor_backend::kFloat32,
+                "kv_cache_write: dtype must be f16, bf16 or f32");
     MFQ_RUNTIME_CHECK(positions.is_cuda() && positions.is_contiguous() && positions.scalar_type() == mfq_tensor_backend::kInt64,
                 "kv_cache_write: positions must be cuda contiguous int64");
     MFQ_RUNTIME_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4 && k.dim() == 4 && v.dim() == 4,
@@ -72,6 +74,7 @@ std::vector<mfq_tensor_backend::Tensor> kv_cache_write_cuda(
     int max_seq = (int)k_cache.size(2);
     MFQ_RUNTIME_CHECK(k_cache.size(0) == B && k_cache.size(1) == H && k_cache.size(3) == D,
                 "kv_cache_write: cache shape must be [B,H,max_seq,D]");
+    if (T == 0) return {k_cache, v_cache};
 
     int pos_dim = positions.dim();
     MFQ_RUNTIME_CHECK(pos_dim == 1 || pos_dim == 2, "kv_cache_write: positions must be [T] or [B,T]");
@@ -86,11 +89,14 @@ std::vector<mfq_tensor_backend::Tensor> kv_cache_write_cuda(
     size_t n = (size_t)B * H * T * D;
     int grid = (int)((n + BD - 1) / BD);
     grid = grid > 4096 ? 4096 : grid;
-    MFQ_DISPATCH_FLOATING_TYPES_AND_HALF(k_cache.scalar_type(), "kv_cache_write_cuda", [&] {
+    MFQ_DISPATCH_FLOATING_TYPES_AND2(
+        mfq_dispatch_half, mfq_dispatch_bfloat16,
+        k_cache.scalar_type(), "kv_cache_write_cuda", [&] {
         kv_cache_write_kernel<scalar_t><<<grid, BD, 0, mfq_current_cuda_stream()>>>(
             k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(), k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),
             positions.data_ptr<int64_t>(), B, H, T, D, max_seq, pos_dim);
     });
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return {k_cache, v_cache};
 }
 
@@ -139,8 +145,10 @@ std::vector<mfq_tensor_backend::Tensor> kv_cache_write_ring_cuda(
     MFQ_RUNTIME_CHECK(k_cache.scalar_type() == v_cache.scalar_type() &&
                 k_cache.scalar_type() == k.scalar_type() && k_cache.scalar_type() == v.scalar_type(),
                 "kv_cache_write_ring: k/v/cache dtype mismatch");
-    MFQ_RUNTIME_CHECK(k_cache.scalar_type() == mfq_tensor_backend::kFloat16 || k_cache.scalar_type() == mfq_tensor_backend::kFloat32,
-                "kv_cache_write_ring: dtype must be f16 or f32");
+    MFQ_RUNTIME_CHECK(k_cache.scalar_type() == mfq_tensor_backend::kFloat16 ||
+                k_cache.scalar_type() == mfq_tensor_backend::kBFloat16 ||
+                k_cache.scalar_type() == mfq_tensor_backend::kFloat32,
+                "kv_cache_write_ring: dtype must be f16, bf16 or f32");
     MFQ_RUNTIME_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4 && k.dim() == 4 && v.dim() == 4,
                 "kv_cache_write_ring: all tensors must be rank 4");
     MFQ_RUNTIME_CHECK(k_cache.sizes() == v_cache.sizes() && k.sizes() == v.sizes(),
@@ -161,12 +169,15 @@ std::vector<mfq_tensor_backend::Tensor> kv_cache_write_ring_cuda(
     const size_t n = (size_t)B * H * (T - source_start) * D;
     constexpr int block = 256;
     const int grid = (int)std::min<size_t>(4096, (n + block - 1) / block);
-    MFQ_DISPATCH_FLOATING_TYPES_AND_HALF(k_cache.scalar_type(), "kv_cache_write_ring_cuda", [&] {
+    MFQ_DISPATCH_FLOATING_TYPES_AND2(
+        mfq_dispatch_half, mfq_dispatch_bfloat16,
+        k_cache.scalar_type(), "kv_cache_write_ring_cuda", [&] {
         kv_cache_write_ring_kernel<scalar_t><<<grid, block, 0, mfq_current_cuda_stream()>>>(
             k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
             k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),
             position_start, B, H, T, D, capacity, source_start);
     });
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return {k_cache, v_cache};
 }
 
@@ -217,8 +228,10 @@ std::vector<mfq_tensor_backend::Tensor> kv_cache_write_ring_positions_cuda(
     MFQ_RUNTIME_CHECK(k_cache.scalar_type() == v_cache.scalar_type() &&
                 k_cache.scalar_type() == k.scalar_type() && k_cache.scalar_type() == v.scalar_type(),
                 "kv_cache_write_ring_positions: k/v/cache dtype mismatch");
-    MFQ_RUNTIME_CHECK(k_cache.scalar_type() == mfq_tensor_backend::kFloat16 || k_cache.scalar_type() == mfq_tensor_backend::kFloat32,
-                "kv_cache_write_ring_positions: dtype must be f16 or f32");
+    MFQ_RUNTIME_CHECK(k_cache.scalar_type() == mfq_tensor_backend::kFloat16 ||
+                k_cache.scalar_type() == mfq_tensor_backend::kBFloat16 ||
+                k_cache.scalar_type() == mfq_tensor_backend::kFloat32,
+                "kv_cache_write_ring_positions: dtype must be f16, bf16 or f32");
     MFQ_RUNTIME_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4 && k.dim() == 4 && v.dim() == 4,
                 "kv_cache_write_ring_positions: all tensors must be rank 4");
     MFQ_RUNTIME_CHECK(k_cache.sizes() == v_cache.sizes() && k.sizes() == v.sizes(),
@@ -239,12 +252,15 @@ std::vector<mfq_tensor_backend::Tensor> kv_cache_write_ring_positions_cuda(
     const size_t n = (size_t)B * H * (T - source_start) * D;
     constexpr int block = 256;
     const int grid = (int)std::min<size_t>(4096, (n + block - 1) / block);
-    MFQ_DISPATCH_FLOATING_TYPES_AND_HALF(k_cache.scalar_type(), "kv_cache_write_ring_positions_cuda", [&] {
+    MFQ_DISPATCH_FLOATING_TYPES_AND2(
+        mfq_dispatch_half, mfq_dispatch_bfloat16,
+        k_cache.scalar_type(), "kv_cache_write_ring_positions_cuda", [&] {
         kv_cache_write_ring_positions_kernel<scalar_t><<<
             grid, block, 0, mfq_current_cuda_stream()>>>(
             k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
             k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),
             positions.data_ptr<int64_t>(), B, H, T, D, capacity, source_start);
     });
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return {k_cache, v_cache};
 }

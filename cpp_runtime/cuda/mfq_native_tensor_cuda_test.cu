@@ -198,6 +198,20 @@ int main() {
         causal_scale_candidate == causal_scale_reference,
         "fused BF16 causal scale exactness");
 
+    const auto conversion_input = tensor<float>({
+        -65504.0f, -3.1415927f, -0.0f, 0.0f,
+        0.00006103515625f, 0.33333334f, 1.0f, 65504.0f})
+        .to(cuda_device).to(kBFloat16).contiguous();
+    set_test_environment("MFQ_DISABLE_NATIVE_CONTIGUOUS_BF16_TO_F16", "1");
+    const auto conversion_reference = host_values(
+        conversion_input.to(kFloat16));
+    set_test_environment("MFQ_DISABLE_NATIVE_CONTIGUOUS_BF16_TO_F16", "0");
+    const auto conversion_candidate = host_values(
+        conversion_input.to(kFloat16));
+    require(
+        conversion_candidate == conversion_reference,
+        "contiguous BF16 to F16 conversion exactness");
+
     set_test_environment("MFQ_DISABLE_NATIVE_EXACT_BF16_SOFTMAX", "1");
     const auto softmax_reference = host_values(
         scaled_dot_product_attention(
