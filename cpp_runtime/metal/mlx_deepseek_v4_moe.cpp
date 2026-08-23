@@ -898,7 +898,7 @@ MlxDeepseekV4Moe::forward_branches(
 
 std::optional<MlxDeepseekV4SsdPrefetchedLayer>
 MlxDeepseekV4Moe::prefetch_routed(std::size_t rows) const {
-    constexpr std::size_t kFullLayerPrefetchRows = 4096;
+    constexpr std::size_t kFullLayerPrefetchRows = 512;
     if (ssd_expert_cache_ && rows >= kFullLayerPrefetchRows &&
         ssd_expert_cache_->prefill_overlap_enabled()) {
         return ssd_expert_cache_->prefetch_layer(layer_);
