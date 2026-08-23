@@ -344,6 +344,7 @@ array typed_contiguous(
 array floating_contiguous(const array& input) {
     auto result = input;
     if (result.dtype() != mlx::core::float16 &&
+        result.dtype() != mlx::core::bfloat16 &&
         result.dtype() != mlx::core::float32) {
         result = mlx::core::astype(
             result,
@@ -1151,6 +1152,7 @@ MlxDeepseekV4PoolState::allocate(
         batch <= 0 ||
         max_context <= 0 ||
         (dtype != mlx::core::float16 &&
+         dtype != mlx::core::bfloat16 &&
          dtype != mlx::core::float32)) {
         throw std::invalid_argument(
             "invalid DeepSeek-V4 pool allocation");
@@ -2135,6 +2137,85 @@ MlxDeepseekV4Attention MlxDeepseekV4Attention::load(
             model,
             name(
                 "attn.indexer.compressor.norm.weight"));
+    }
+    return MlxDeepseekV4Attention(
+        config,
+        layer,
+        ratio,
+        max_context,
+        std::move(components),
+        std::move(rope_base),
+        std::move(rope_compressed));
+}
+
+MlxDeepseekV4Attention MlxDeepseekV4Attention::load(
+    const MlxHfTensorStore& model,
+    const DeepseekV4Config& config,
+    int layer,
+    int ratio,
+    int max_context,
+    std::pair<array, array> rope_base,
+    std::pair<array, array> rope_compressed) {
+    config.validate();
+    if (layer < 0 ||
+        layer >= config.n_layers ||
+        static_cast<std::size_t>(layer) >= config.compress_ratios.size() ||
+        config.compress_ratios[layer] != ratio ||
+        max_context <= 0 || max_context > config.max_position_embeddings) {
+        throw std::invalid_argument(
+            "invalid DeepSeek-V4 HF attention load schedule");
+    }
+    const auto name = [layer](std::string_view suffix) {
+        return DeepseekV4TensorNames::layer(
+            static_cast<std::size_t>(layer), suffix);
+    };
+    const auto load_float = [&model](const std::string& tensor) {
+        return typed_contiguous(
+            model.load_dense(tensor),
+            mlx::core::float32);
+    };
+    MlxDeepseekV4AttentionComponents components{
+        model.load_linear(name("attn.wq_a.weight")),
+        model.load_linear(name("attn.wkv.weight")),
+        model.load_linear(name("attn.wq_b.weight")),
+        model.load_linear(name("attn.wo_a.weight")),
+        model.load_linear(name("attn.wo_b.weight")),
+        load_float(name("attn.q_norm.weight")),
+        load_float(name("attn.kv_norm.weight")),
+        load_float(name("attn.attn_sink")),
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+    };
+    if (ratio != 0) {
+        components.main_kv.emplace(
+            model.load_linear(name("attn.compressor.wkv.weight")));
+        components.main_gate.emplace(
+            model.load_linear(name("attn.compressor.wgate.weight")));
+        components.main_ape = load_float(name("attn.compressor.ape"));
+        components.main_norm = load_float(
+            name("attn.compressor.norm.weight"));
+    }
+    if (ratio == 4) {
+        components.index_q_b.emplace(
+            model.load_linear(name("attn.indexer.wq_b.weight")));
+        components.index_kv.emplace(model.load_linear(
+            name("attn.indexer.compressor.wkv.weight")));
+        components.index_gate.emplace(model.load_linear(
+            name("attn.indexer.compressor.wgate.weight")));
+        components.index_weights.emplace(model.load_linear(
+            name("attn.indexer.weights_proj.weight")));
+        components.index_ape = load_float(
+            name("attn.indexer.compressor.ape"));
+        components.index_norm = load_float(
+            name("attn.indexer.compressor.norm.weight"));
     }
     return MlxDeepseekV4Attention(
         config,

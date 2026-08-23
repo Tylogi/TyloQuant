@@ -17,11 +17,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -33,6 +35,7 @@
 
 #include <mach-o/dyld.h>
 #include <malloc/malloc.h>
+#include <sys/sysctl.h>
 
 namespace {
 
@@ -210,9 +213,11 @@ void print_help() {
         << "  mfq-decode-metal --mfq MODEL.mfq --tensor NAME\n"
         << "  mfq-decode-metal --mfq MODEL.mfq --server "
            "[--host 127.0.0.1 --port 8080]\n"
+        << "  mfq-decode-metal --mfq HF_MODEL_DIR --server "
+           "--tokenizer-gguf TOKENIZER.gguf\n"
         << "  mfq-decode-metal --self-test-metal\n\n"
         << "Options:\n"
-        << "  --mfq PATH             MFQ model or any shard in a split model\n"
+        << "  --mfq PATH             MFQ model/shard, or a supported HF directory\n"
         << "  --check-mfq-container  validate headers, records, and shard set\n"
         << "  --list-tensors         print record dtype, bytes, and name\n"
         << "  --tensor NAME          load and execute one supported linear weight\n"
@@ -227,12 +232,67 @@ void print_help() {
         << "  --port PORT            server port (default 8080)\n"
         << "  --ctx-size TOKENS      runtime/API context limit (default 32768)\n"
         << "  --prefill-chunk-size N maximum prompt chunk (default 2048)\n"
-        << "  --moe-gpu-cache-gb N   bounded disk-backed NINTM expert cache\n"
-        << "                          default: full unified-memory residency\n"
+        << "  --moe-gpu-cache-gb N   unified-memory hot-expert cache\n"
+        << "                          MFQ default: full residency; HF default: auto\n"
         << "  --model-name NAME      API model name (default MFQ filename)\n"
         << "  --api-key KEY          optional bearer token\n"
         << "  --tokenizer-gguf PATH  external tokenizer GGUF when not embedded\n"
         << "  --sampling-profile P  explicit runtime sampling profile JSON\n";
+}
+
+std::string read_text(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("cannot open file: " + path.string());
+    }
+    std::ostringstream output;
+    output << input.rdbuf();
+    if (!input.good() && !input.eof()) {
+        throw std::runtime_error("cannot read file: " + path.string());
+    }
+    return output.str();
+}
+
+std::size_t physical_memory_bytes() {
+    std::uint64_t bytes = 0;
+    std::size_t size = sizeof(bytes);
+    if (sysctlbyname("hw.memsize", &bytes, &size, nullptr, 0) != 0 ||
+        bytes == 0 ||
+        bytes > std::numeric_limits<std::size_t>::max()) {
+        throw std::runtime_error("cannot determine physical memory size");
+    }
+    return static_cast<std::size_t>(bytes);
+}
+
+std::size_t requested_cache_bytes(
+    const std::optional<double>& cache_gb,
+    bool hf_streaming) {
+    constexpr long double bytes_per_gib =
+        static_cast<long double>(std::uint64_t{1} << 30);
+    if (cache_gb.has_value()) {
+        const long double requested =
+            static_cast<long double>(*cache_gb) * bytes_per_gib;
+        if (requested >
+            static_cast<long double>(
+                std::numeric_limits<std::size_t>::max())) {
+            throw std::runtime_error(
+                "DeepSeek-V4 expert cache exceeds addressable memory");
+        }
+        const auto bytes = static_cast<std::size_t>(requested);
+        if (hf_streaming && bytes == 0) {
+            throw std::runtime_error(
+                "HF SSD expert streaming requires a non-zero cache");
+        }
+        return bytes;
+    }
+    if (!hf_streaming) {
+        return 0;
+    }
+    // Leave one third of UMA for dense weights, KV, the OS, and request
+    // staging. On a 128-GiB machine this gives the expert LRU about 85 GiB.
+    return std::max<std::size_t>(
+        std::uint64_t{1} << 30,
+        physical_memory_bytes() * 2 / 3);
 }
 
 std::filesystem::path executable_path() {
@@ -765,7 +825,7 @@ std::int32_t generate_with_prefill_metrics(
 template <typename Runtime, typename Loader>
 int serve_loaded_runtime(
     const Arguments& arguments,
-    const mfq::metal::MfqContainer& container,
+    const mfq::metal::MfqContainer* container,
     Runtime runtime,
     Loader load_runtime,
     std::string model_type,
@@ -781,9 +841,9 @@ int serve_loaded_runtime(
         ? arguments.mfq.stem().string()
         : arguments.model_name;
     server.model_type = std::move(model_type);
-    if (container.contains(tokenizer_asset)) {
+    if (container != nullptr && container->contains(tokenizer_asset)) {
         server.tokenizer_gguf =
-            container.read(tokenizer_asset);
+            container->read(tokenizer_asset);
     } else {
         server.tokenizer_model =
             arguments.tokenizer_gguf.string();
@@ -796,19 +856,30 @@ int serve_loaded_runtime(
     server.vocab_size = vocabulary_size;
     constexpr const char* model_config_asset =
         "__mfq_asset__/model_config.json";
-    const auto embedded = container.header().extra_json.find(
-        "runtime.sampling.v1");
+    const auto embedded = container == nullptr
+        ? std::string()
+        : [&] {
+              const auto found = container->header().extra_json.find(
+                  "runtime.sampling.v1");
+              return found == container->header().extra_json.end()
+                  ? std::string()
+                  : found->second;
+          }();
+    const auto architecture = container == nullptr
+        ? std::string("deepseek_v4")
+        : container->header().architecture;
+    const auto model_config = container == nullptr
+        ? read_text(arguments.mfq / "config.json")
+        : container->contains(model_config_asset)
+        ? container->read_text(model_config_asset)
+        : std::string();
     server.runtime_profile = resolve_mfq_runtime_profile(
         arguments.mfq.string(),
-        container.header().architecture,
+        architecture,
         server.model_type,
         server.model_name,
-        embedded == container.header().extra_json.end()
-            ? std::string()
-            : embedded->second,
-        container.contains(model_config_asset)
-            ? container.read_text(model_config_asset)
-            : std::string(),
+        embedded,
+        model_config,
         arguments.sampling_profile.string());
 
     auto runtime_mutex = std::make_shared<std::mutex>();
@@ -1265,13 +1336,118 @@ int serve_loaded_runtime(
     return run_mfq_server(
         server, generate, reload, duplex, session_control,
         multimodal_generate,
-        [] {
-            return std::vector<std::pair<std::string, double>>{
+        [runtime_mutex, runtime_holder] {
+            std::vector<std::pair<std::string, double>> metrics{
                 {"mlx_active_bytes", static_cast<double>(mlx::core::get_active_memory())},
                 {"mlx_cache_bytes", static_cast<double>(mlx::core::get_cache_memory())},
                 {"mlx_peak_bytes", static_cast<double>(mlx::core::get_peak_memory())},
             };
+            std::unique_lock lock(*runtime_mutex, std::try_to_lock);
+            if constexpr (requires(Runtime& value) {
+                    value.ssd_expert_cache_stats();
+                }) {
+                if (lock.owns_lock() && runtime_holder->has_value()) {
+                    const auto stats =
+                        runtime_holder->value().ssd_expert_cache_stats();
+                    if (stats.has_value()) {
+                        metrics.emplace_back(
+                            "ssd_expert_requests",
+                            static_cast<double>(stats->requests));
+                        metrics.emplace_back(
+                            "ssd_expert_hits",
+                            static_cast<double>(stats->hits));
+                        metrics.emplace_back(
+                            "ssd_expert_hit_rate",
+                            stats->hit_rate());
+                        metrics.emplace_back(
+                            "ssd_expert_bytes_read",
+                            static_cast<double>(stats->bytes_read));
+                        metrics.emplace_back(
+                            "ssd_expert_resident_bytes",
+                            static_cast<double>(stats->resident_bytes));
+                        metrics.emplace_back(
+                            "ssd_expert_resident_count",
+                            static_cast<double>(stats->resident_experts));
+                        metrics.emplace_back(
+                            "ssd_expert_wait_seconds",
+                            stats->wait_seconds);
+                    }
+                }
+            }
+            return metrics;
         });
+}
+
+int run_native_hf_server(const Arguments& arguments) {
+    if (arguments.tokenizer_gguf.empty()) {
+        throw std::runtime_error(
+            "HF model directories currently require --tokenizer-gguf PATH");
+    }
+    const auto config = mfq::metal::DeepseekV4Config::from_json(
+        read_text(arguments.mfq / "config.json"));
+    const int context = static_cast<int>(
+        std::min<std::int64_t>(
+            arguments.context_size,
+            config.max_position_embeddings));
+    const auto expert_cache_bytes = requested_cache_bytes(
+        arguments.expert_cache_gb, true);
+    constexpr std::size_t prefill_buffers_minimum =
+        std::size_t{7} << 30;
+    const bool prefill_overlap =
+        expert_cache_bytes >= prefill_buffers_minimum;
+    const auto runtime_stream = mlx::core::new_thread_unsafe_stream(
+        mlx::core::Device::gpu);
+    mlx::core::set_default_stream(runtime_stream);
+    const auto started = std::chrono::steady_clock::now();
+    std::cout
+        << "Loading native-format DeepSeek-V4 HF weights with SSD expert "
+           "streaming on Apple UMA..."
+        << std::endl;
+    auto runtime = mfq::metal::MlxDeepseekV4CausalLm::load_hf(
+        arguments.mfq,
+        context,
+        expert_cache_bytes,
+        8,
+        prefill_overlap);
+    runtime.prewarm_ssd_expert_arena();
+    release_model_load_staging_memory();
+    const auto load_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    constexpr double gib = static_cast<double>(std::uint64_t{1} << 30);
+    std::cout
+        << "Loaded " << runtime.layer_count()
+        << " DeepSeek-V4 layers in " << load_seconds << " s"
+        << " expert_backing=hf-safetensors-ssd"
+        << " expert_cache_gib="
+        << static_cast<double>(runtime.expert_cache_limit_bytes()) / gib
+        << " prefill_double_buffer="
+        << static_cast<int>(prefill_overlap)
+        << std::endl;
+    const auto model_root = arguments.mfq;
+    const auto load_runtime =
+        [model_root, expert_cache_bytes, prefill_overlap](
+            std::int64_t requested_context) {
+            if (requested_context < 1 ||
+                requested_context > std::numeric_limits<int>::max()) {
+                throw std::invalid_argument(
+                    "Metal runtime context is out of range");
+            }
+            return mfq::metal::MlxDeepseekV4CausalLm::load_hf(
+                model_root,
+                static_cast<int>(requested_context),
+                expert_cache_bytes,
+                8,
+                prefill_overlap);
+        };
+    return serve_loaded_runtime(
+        arguments,
+        nullptr,
+        std::move(runtime),
+        load_runtime,
+        config.model_type,
+        config.max_position_embeddings,
+        config.vocab,
+        runtime_stream);
 }
 
 int run_native_server(
@@ -1368,7 +1544,7 @@ int run_native_server(
             };
         return serve_loaded_runtime(
             arguments,
-            container,
+            &container,
             std::move(runtime),
             load_runtime,
             config.model_type,
@@ -1409,7 +1585,7 @@ int run_native_server(
             };
         return serve_loaded_runtime(
             arguments,
-            container,
+            &container,
             std::move(runtime),
             load_runtime,
             "minicpmo",
@@ -1442,7 +1618,7 @@ int run_native_server(
         };
     return serve_loaded_runtime(
         arguments,
-        container,
+        &container,
         std::move(runtime),
         load_runtime,
         config.text_model_type.empty()
@@ -1474,6 +1650,20 @@ int main(int argc, char** argv) {
                 usage_error("--mfq is required");
             }
             return EXIT_SUCCESS;
+        }
+
+        if (std::filesystem::is_directory(arguments.mfq)) {
+            if (!arguments.server) {
+                usage_error("HF model directories currently support --server");
+            }
+            configure_mlx_metal();
+#ifdef MFQ_METAL_SERVER
+            return run_native_hf_server(arguments);
+#else
+            throw std::runtime_error(
+                "this build has no C++ server support; configure with "
+                "-DMFQ_BUILD_CPP_SERVER=ON and matching llama.cpp paths");
+#endif
         }
 
         const mfq::metal::MfqContainer model(arguments.mfq);

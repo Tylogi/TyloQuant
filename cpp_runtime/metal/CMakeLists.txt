@@ -149,10 +149,12 @@ configure_file(
 
 add_library(mfq-metal-runtime STATIC
     deepseek_v4_model.cpp
+    hf_safetensors_store.cpp
     mfq_container.cpp
     mlx_tpq.cpp
     mlx_tensor.cpp
     mlx_grouped_linear.cpp
+    mlx_hf_tensor.cpp
     mlx_deepseek_v4_attention.cpp
     mlx_deepseek_v4_causal_lm.cpp
     mlx_deepseek_v4_hc.cpp
@@ -170,6 +172,8 @@ add_library(mfq-metal-runtime STATIC
     mlx_qwen35_linear_attention.cpp
     mlx_qwen35_causal_lm.cpp
     mlx_sampling.cpp
+    mlx_ssd_expert_cache.cpp
+    mlx_ssd_expert_arena.cpp
     mlx_transformer.cpp
     qwen35_model.cpp
 )
@@ -497,6 +501,91 @@ set_target_properties(
 add_test(
     NAME mfq-metal-deepseek-v4-model-test
     COMMAND mfq-metal-deepseek-v4-model-test
+)
+
+add_executable(mfq-metal-hf-safetensors-store-test
+    hf_safetensors_store.cpp
+    hf_safetensors_store_test.cpp
+)
+target_compile_features(
+    mfq-metal-hf-safetensors-store-test PRIVATE cxx_std_20)
+add_test(
+    NAME mfq-metal-hf-safetensors-store-test
+    COMMAND mfq-metal-hf-safetensors-store-test
+)
+
+add_executable(mfq-metal-ssd-expert-benchmark
+    ssd_expert_benchmark.cpp
+)
+target_link_libraries(
+    mfq-metal-ssd-expert-benchmark PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(
+    mfq-metal-ssd-expert-benchmark PRIVATE cxx_std_20)
+set_target_properties(
+    mfq-metal-ssd-expert-benchmark PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+
+add_executable(mfq-metal-ssd-expert-arena-test
+    mlx_ssd_expert_arena_test.cpp
+)
+target_link_libraries(
+    mfq-metal-ssd-expert-arena-test PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(
+    mfq-metal-ssd-expert-arena-test PRIVATE cxx_std_20)
+set_target_properties(
+    mfq-metal-ssd-expert-arena-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+add_test(
+    NAME mfq-metal-ssd-expert-arena-test
+    COMMAND mfq-metal-ssd-expert-arena-test
+)
+
+add_executable(mfq-metal-ssd-expert-real-smoke
+    ssd_expert_real_smoke.cpp
+)
+target_link_libraries(
+    mfq-metal-ssd-expert-real-smoke PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(
+    mfq-metal-ssd-expert-real-smoke PRIVATE cxx_std_20)
+set_target_properties(
+    mfq-metal-ssd-expert-real-smoke PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+
+add_executable(mfq-metal-ssd-hf-model-smoke
+    ssd_hf_model_smoke.cpp
+)
+target_link_libraries(
+    mfq-metal-ssd-hf-model-smoke PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(
+    mfq-metal-ssd-hf-model-smoke PRIVATE cxx_std_20)
+set_target_properties(
+    mfq-metal-ssd-hf-model-smoke PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+
+add_executable(mfq-metal-ssd-hf-prefill-smoke
+    ssd_hf_prefill_smoke.cpp
+)
+target_link_libraries(
+    mfq-metal-ssd-hf-prefill-smoke PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(
+    mfq-metal-ssd-hf-prefill-smoke PRIVATE cxx_std_20)
+set_target_properties(
+    mfq-metal-ssd-hf-prefill-smoke PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
 )
 
 add_executable(mfq-metal-deepseek-v4-attention-test

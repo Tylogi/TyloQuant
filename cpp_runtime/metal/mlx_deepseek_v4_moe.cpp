@@ -362,6 +362,8 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
                 std::nullopt,
                 std::nullopt,
                 offload,
+                nullptr,
+                layer,
                 split_gate_up
                     ? std::string{}
                     : gate_up_name,
@@ -430,6 +432,56 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
         std::optional<MlxRoutedLinear>(
             load_routed(model, down_name)),
         nullptr,
+        nullptr,
+        layer,
+        {},
+        {},
+        {},
+        {},
+        std::move(router_bias),
+        std::move(token_experts),
+        available);
+}
+
+MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
+    const MlxHfTensorStore& model,
+    const DeepseekV4Config& config,
+    std::size_t layer,
+    std::shared_ptr<MlxDeepseekV4SsdExpertCache>
+        expert_cache,
+    const std::optional<array>& available) {
+    config.validate();
+    if (layer >= static_cast<std::size_t>(config.n_layers)) {
+        throw std::out_of_range(
+            "DeepSeek-V4 HF MoE layer index is out of range");
+    }
+    if (!expert_cache) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 HF MoE requires an SSD expert cache");
+    }
+    const auto name = [layer](std::string_view suffix) {
+        return DeepseekV4TensorNames::layer(layer, suffix);
+    };
+    std::optional<array> router_bias;
+    std::optional<array> token_experts;
+    if (layer < static_cast<std::size_t>(config.n_hash_layers)) {
+        token_experts = model.load_dense(name("ffn.gate.tid2eid"));
+    } else {
+        router_bias = model.load_dense(name("ffn.gate.bias"));
+    }
+    return MlxDeepseekV4Moe(
+        config,
+        model.load_linear(name("ffn.gate.weight")),
+        model.load_linear(name("ffn.shared_experts.w1.weight")),
+        model.load_linear(name("ffn.shared_experts.w3.weight")),
+        model.load_linear(name("ffn.shared_experts.w2.weight")),
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        nullptr,
+        std::move(expert_cache),
+        layer,
         {},
         {},
         {},
@@ -463,6 +515,8 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
           std::optional<MlxRoutedLinear>(
               std::move(routed_down)),
           nullptr,
+          nullptr,
+          0,
           {},
           {},
           {},
@@ -487,6 +541,9 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
         routed_down,
     std::shared_ptr<MlxNintMoeOffloadCache>
         expert_offload,
+    std::shared_ptr<MlxDeepseekV4SsdExpertCache>
+        ssd_expert_cache,
+    std::size_t layer,
     std::string streamed_gate_up_name,
     std::string streamed_gate_name,
     std::string streamed_up_name,
@@ -505,6 +562,9 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
       routed_down_(std::move(routed_down)),
       expert_offload_(
           std::move(expert_offload)),
+      ssd_expert_cache_(
+          std::move(ssd_expert_cache)),
+      layer_(layer),
       streamed_gate_up_name_(
           std::move(streamed_gate_up_name)),
       streamed_gate_name_(
@@ -562,13 +622,19 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
     const bool full_resident =
         routed_down_.has_value()
         && (combined_resident != split_resident);
-    const bool streamed =
+    const bool legacy_streamed =
         static_cast<bool>(expert_offload_);
+    const bool ssd_streamed =
+        static_cast<bool>(ssd_expert_cache_);
+    const int residency_modes =
+        static_cast<int>(full_resident)
+        + static_cast<int>(legacy_streamed)
+        + static_cast<int>(ssd_streamed);
     if (
         routed_down_.has_value()
             != (combined_resident || split_resident)
         || (combined_resident && split_resident)
-        || full_resident == streamed
+        || residency_modes != 1
     ) {
         throw std::invalid_argument(
             "DeepSeek-V4 MoE requires exactly one "
@@ -611,7 +677,7 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
                 "DeepSeek-V4 MoE routed component "
                 "dimensions mismatch");
         }
-    } else {
+    } else if (legacy_streamed) {
         const bool split_streamed =
             !streamed_gate_name_.empty()
             || !streamed_up_name_.empty();
@@ -664,6 +730,13 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
             throw std::invalid_argument(
                 "DeepSeek-V4 streamed routed component "
                 "dimensions mismatch");
+        }
+    } else {
+        if (config_.hidden != 4096 || config_.moe_inter != 2048 ||
+            config_.n_experts != 256 ||
+            layer_ >= static_cast<std::size_t>(config_.n_layers)) {
+            throw std::invalid_argument(
+                "DeepSeek-V4 SSD experts require official V4F geometry");
         }
     }
     const auto router_scale =
@@ -820,6 +893,24 @@ MlxDeepseekV4MoeBranches
 MlxDeepseekV4Moe::forward_branches(
     const array& input,
     const array& token_ids) const {
+    return forward_branches(input, token_ids, nullptr);
+}
+
+std::optional<MlxDeepseekV4SsdPrefetchedLayer>
+MlxDeepseekV4Moe::prefetch_routed(std::size_t rows) const {
+    constexpr std::size_t kFullLayerPrefetchRows = 4096;
+    if (ssd_expert_cache_ && rows >= kFullLayerPrefetchRows &&
+        ssd_expert_cache_->prefill_overlap_enabled()) {
+        return ssd_expert_cache_->prefetch_layer(layer_);
+    }
+    return std::nullopt;
+}
+
+MlxDeepseekV4MoeBranches
+MlxDeepseekV4Moe::forward_branches(
+    const array& input,
+    const array& token_ids,
+    MlxDeepseekV4SsdPrefetchedLayer* prefetched) const {
     const int hidden = checked_int(
         static_cast<std::size_t>(config_.hidden),
         "hidden width");
@@ -841,6 +932,10 @@ MlxDeepseekV4Moe::forward_branches(
         mlx::core::reshape(
             input,
             Shape{rows, hidden}));
+    if (prefetched != nullptr && prefetched->layer() != layer_) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 SSD prefetch layer mismatch");
+    }
     const auto* dense_router = router_.dense_weight_ref();
     const bool use_fused_dense_router =
         fused_dense_router_
@@ -856,6 +951,12 @@ MlxDeepseekV4Moe::forward_branches(
         source,
         static_cast<float>(config_.swiglu_limit),
         !use_fused_dense_router);
+    if (prefetched != nullptr) {
+        // The SSD workers are already reading the routed bank. Submit the
+        // independent shared/router projections while those reads are in
+        // flight, then wait only for the residual storage latency below.
+        detail::eval_with_timing(projections);
+    }
     if (detail::component_profile_active()) {
         detail::profile_eval(
             "moe.shared_router_projections",
@@ -980,18 +1081,34 @@ MlxDeepseekV4Moe::forward_branches(
     array routed = mlx::core::zeros(
         Shape{rows, hidden},
         source.dtype());
-    if (!expert_offload_) {
+    const auto run_resident = [
+        &source,
+        &expert_ids,
+        &expert_weights,
+        rows,
+        hidden,
+        this
+    ](
+        const MlxRoutedLinear* gate_up,
+        const MlxRoutedLinear* gate,
+        const MlxRoutedLinear* up,
+        const MlxRoutedLinear* down) {
         const bool split_resident =
-            routed_gate_.has_value();
+            gate != nullptr;
+        if ((gate == nullptr) != (up == nullptr) || down == nullptr ||
+            (split_resident == (gate_up != nullptr))) {
+            throw std::logic_error(
+                "DeepSeek-V4 routed weight set is incomplete");
+        }
         const bool gate_up_grouped =
             split_resident
-            ? routed_gate_->supports_grouped_vq_mmq()
-                && routed_up_->supports_grouped_vq_mmq()
-            : routed_gate_up_->supports_grouped_vq_mmq();
+            ? gate->supports_grouped_vq_mmq()
+                && up->supports_grouped_vq_mmq()
+            : gate_up->supports_grouped_vq_mmq();
         const bool grouped_prefill =
             rows >= 32
             && gate_up_grouped
-            && routed_down_->supports_grouped_vq_mmq();
+            && down->supports_grouped_vq_mmq();
         if (grouped_prefill) {
             const int routes = expert_ids.shape(1);
             auto route_order = mlx::core::contiguous(
@@ -1003,34 +1120,34 @@ MlxDeepseekV4Moe::forward_branches(
                     mlx::core::int32));
             auto block_plan =
                 split_resident
-                ? routed_gate_->build_grouped_vq_mmq_plan(
+                ? gate->build_grouped_vq_mmq_plan(
                       expert_ids,
                       route_order)
-                : routed_gate_up_->build_grouped_vq_mmq_plan(
+                : gate_up->build_grouped_vq_mmq_plan(
                       expert_ids,
                       route_order);
             array routed_hidden = [&]() {
                 if (split_resident) {
-                    auto gate = routed_gate_->forward_sorted(
+                    auto gate_output = gate->forward_sorted(
                         source,
                         expert_ids,
                         route_order,
                         false,
                         &block_plan);
-                    auto up = routed_up_->forward_sorted(
+                    auto up_output = up->forward_sorted(
                         source,
                         expert_ids,
                         route_order,
                         false,
                         &block_plan);
                     return limited_swiglu_pair(
-                        std::move(gate),
-                        std::move(up),
+                        std::move(gate_output),
+                        std::move(up_output),
                         static_cast<float>(
                             config_.swiglu_limit));
                 }
                 return moe_limited_swiglu_split(
-                    routed_gate_up_->forward_sorted(
+                    gate_up->forward_sorted(
                         source,
                         expert_ids,
                         route_order,
@@ -1045,7 +1162,7 @@ MlxDeepseekV4Moe::forward_branches(
                     routed_hidden);
             }
             auto down_sorted =
-                routed_down_->forward_sorted(
+                down->forward_sorted(
                     routed_hidden,
                     expert_ids,
                     route_order,
@@ -1062,28 +1179,29 @@ MlxDeepseekV4Moe::forward_branches(
                     mlx::core::argsort(route_order),
                     0),
                 Shape{rows, routes, hidden});
-            routed = moe_weighted_reduce(
+            auto output = moe_weighted_reduce(
                 routed_pairs,
                 expert_weights);
             if (detail::component_profile_active()) {
                 detail::profile_eval(
                     "moe.route_reduce",
-                    routed);
+                    output);
             }
+            return output;
         } else {
             array routed_hidden = [&]() {
                 if (split_resident) {
                     return limited_swiglu_pair(
-                        routed_gate_->forward(
+                        gate->forward(
                             source,
                             expert_ids),
-                        routed_up_->forward(
+                        up->forward(
                             source,
                             expert_ids),
                         static_cast<float>(
                             config_.swiglu_limit));
                 }
-                return routed_gate_up_->swiglu(
+                return gate_up->swiglu(
                     source,
                     expert_ids,
                     static_cast<float>(
@@ -1094,25 +1212,67 @@ MlxDeepseekV4Moe::forward_branches(
                     "moe.routed_gate_up_swiglu",
                     routed_hidden);
                 auto routed_pairs =
-                    routed_down_->forward(
+                    down->forward(
                         routed_hidden,
                         expert_ids);
                 detail::profile_eval(
                     "moe.routed_down",
                     routed_pairs);
-                routed = moe_weighted_reduce(
+                auto output = moe_weighted_reduce(
                     routed_pairs,
                     expert_weights);
                 detail::profile_eval(
                     "moe.route_reduce",
-                    routed);
+                    output);
+                return output;
             } else {
-                routed = routed_down_->combine(
+                return down->combine(
                     routed_hidden,
                     expert_ids,
                     expert_weights);
             }
         }
+    };
+    if (ssd_expert_cache_) {
+        if (prefetched != nullptr) {
+            const auto& weights = prefetched->wait();
+            routed = run_resident(
+                nullptr,
+                &weights.gate,
+                &weights.up,
+                &weights.down);
+            detail::eval_with_timing(routed);
+        } else {
+            auto host_ids = mlx::core::contiguous(
+                mlx::core::astype(expert_ids, mlx::core::int32));
+            detail::eval_with_timing(host_ids);
+            std::vector<std::int32_t> active(
+                host_ids.data<std::int32_t>(),
+                host_ids.data<std::int32_t>() + host_ids.size());
+            active.erase(
+                std::remove_if(
+                    active.begin(),
+                    active.end(),
+                    [](std::int32_t expert) { return expert < 0; }),
+                active.end());
+            std::sort(active.begin(), active.end());
+            active.erase(
+                std::unique(active.begin(), active.end()),
+                active.end());
+            auto prepared = ssd_expert_cache_->prepare(layer_, active);
+            const auto& weights = prepared.weights();
+            routed = run_resident(
+                nullptr,
+                &weights.gate,
+                &weights.up,
+                &weights.down);
+        }
+    } else if (!expert_offload_) {
+        routed = run_resident(
+            routed_gate_up_ ? &*routed_gate_up_ : nullptr,
+            routed_gate_ ? &*routed_gate_ : nullptr,
+            routed_up_ ? &*routed_up_ : nullptr,
+            routed_down_ ? &*routed_down_ : nullptr);
     } else {
         constexpr int kStreamRows = 16;
         auto host_ids =

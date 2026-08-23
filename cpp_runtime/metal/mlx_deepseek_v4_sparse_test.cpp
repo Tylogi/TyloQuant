@@ -483,46 +483,47 @@ void test_decode_pool_state_and_bounds() {
 }
 
 void test_fixed_cache_write() {
-    auto cache = mlx::core::zeros(
-        Shape{2, 5, 3},
-        mlx::core::float16);
-    cache.eval();
-    const void* allocation = cache.buffer().ptr();
-    auto updated = mfq::metal::dsv4_cache_write_inplace(
-        cache,
-        mlx::core::astype(
-            float_array(
-                {
-                    1.0f, 2.0f, 3.0f,
-                    4.0f, 5.0f, 6.0f,
-                    7.0f, 8.0f, 9.0f,
-                    10.0f, 11.0f, 12.0f,
-                },
-                Shape{2, 2, 3}),
-            mlx::core::float16),
-        int_array(
-            {1, 4, 0, 3},
-            Shape{2, 2}));
-    updated.eval();
-    require(
-        updated.buffer().ptr() == allocation,
-        "fixed cache update replaced the Metal allocation");
-    require_close(
-        evaluated_float(updated),
-        {
-            0.0f, 0.0f, 0.0f,
-            1.0f, 2.0f, 3.0f,
-            0.0f, 0.0f, 0.0f,
-            0.0f, 0.0f, 0.0f,
-            4.0f, 5.0f, 6.0f,
-            7.0f, 8.0f, 9.0f,
-            0.0f, 0.0f, 0.0f,
-            0.0f, 0.0f, 0.0f,
-            10.0f, 11.0f, 12.0f,
-            0.0f, 0.0f, 0.0f,
-        },
-        1e-3f,
-        "fixed cache update");
+    for (const auto dtype : {
+             mlx::core::float16,
+             mlx::core::bfloat16,
+         }) {
+        auto cache = mlx::core::zeros(Shape{2, 5, 3}, dtype);
+        cache.eval();
+        const void* allocation = cache.buffer().ptr();
+        auto updated = mfq::metal::dsv4_cache_write_inplace(
+            cache,
+            mlx::core::astype(
+                float_array(
+                    {
+                        1.0f, 2.0f, 3.0f,
+                        4.0f, 5.0f, 6.0f,
+                        7.0f, 8.0f, 9.0f,
+                        10.0f, 11.0f, 12.0f,
+                    },
+                    Shape{2, 2, 3}),
+                dtype),
+            int_array({1, 4, 0, 3}, Shape{2, 2}));
+        updated.eval();
+        require(
+            updated.buffer().ptr() == allocation,
+            "fixed cache update replaced the Metal allocation");
+        require_close(
+            evaluated_float(updated),
+            {
+                0.0f, 0.0f, 0.0f,
+                1.0f, 2.0f, 3.0f,
+                0.0f, 0.0f, 0.0f,
+                0.0f, 0.0f, 0.0f,
+                4.0f, 5.0f, 6.0f,
+                7.0f, 8.0f, 9.0f,
+                0.0f, 0.0f, 0.0f,
+                0.0f, 0.0f, 0.0f,
+                10.0f, 11.0f, 12.0f,
+                0.0f, 0.0f, 0.0f,
+            },
+            1e-3f,
+            "fixed cache update");
+    }
 }
 
 void test_fixed_cache_snapshot_copy() {

@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -51,6 +52,20 @@ public:
             rope_compressed,
         std::shared_ptr<MlxNintMoeOffloadCache> offload =
             nullptr);
+
+    static MlxDeepseekV4Layer load(
+        const MlxHfTensorStore& model,
+        const DeepseekV4Config& config,
+        std::size_t index,
+        int max_context,
+        std::pair<mlx::core::array, mlx::core::array>
+            rope_base,
+        std::pair<mlx::core::array, mlx::core::array>
+            rope_compressed,
+        std::shared_ptr<MlxDeepseekV4SsdExpertCache>
+            expert_cache,
+        const std::optional<mlx::core::array>& available =
+            std::nullopt);
 
     MlxDeepseekV4Layer(
         DeepseekV4Config config,
@@ -135,6 +150,17 @@ public:
         std::optional<std::size_t> expert_cache_bytes =
             std::nullopt);
 
+    // Load the released Hugging Face V4F checkpoint without rewriting it.
+    // Non-expert tensors retain their native storage dtype in UMA; official
+    // MXFP4 routed experts remain in Safetensors on SSD and enter the shared
+    // hot cache on demand.
+    static MlxDeepseekV4CausalLm load_hf(
+        const std::filesystem::path& model_root,
+        int max_context,
+        std::size_t expert_cache_bytes,
+        std::size_t io_workers = 8,
+        bool prefill_overlap = true);
+
     static MlxDeepseekV4CausalLm load(
         const MfqContainer& model,
         const DeepseekV4Config& config,
@@ -156,7 +182,9 @@ public:
         mlx::core::Dtype activation_dtype =
             mlx::core::float16,
         std::shared_ptr<MlxNintMoeOffloadCache>
-            expert_offload = nullptr);
+            expert_offload = nullptr,
+        std::shared_ptr<MlxDeepseekV4SsdExpertCache>
+            ssd_expert_cache = nullptr);
 
     // Accepts [tokens] or [batch,tokens]. Like the Python reference,
     // use_cache=false starts a fresh cache and still leaves that cache ready
@@ -226,6 +254,9 @@ public:
     std::size_t expert_cache_limit_bytes() const noexcept;
     std::size_t expert_resident_packed_bytes() const;
     std::size_t cached_expert_count() const;
+    std::optional<MlxDeepseekV4SsdCacheStats>
+    ssd_expert_cache_stats() const;
+    void prewarm_ssd_expert_arena();
     void clear_expert_cache();
     MlxDeepseekV4TextSessionState capture_text_session_state(
         const std::vector<std::int64_t>& tokens) const;
@@ -267,6 +298,8 @@ private:
     mlx::core::array hc_head_scale_;
     std::shared_ptr<MlxNintMoeOffloadCache>
         expert_offload_;
+    std::shared_ptr<MlxDeepseekV4SsdExpertCache>
+        ssd_expert_cache_;
     int max_context_;
     mlx::core::Dtype activation_dtype_;
     std::vector<MlxDeepseekV4LayerState> states_;

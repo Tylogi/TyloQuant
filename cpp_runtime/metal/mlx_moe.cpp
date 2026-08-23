@@ -561,7 +561,7 @@ constexpr const char* kMoeSource = R"METAL(
             group < groups;
             group += K_LANES
         ) {
-            uint outputs[MATRIX_ROWS];
+            ulong outputs[MATRIX_ROWS];
             float scales[MATRIX_ROWS];
             float minimums[MATRIX_ROWS];
             for (
@@ -1933,12 +1933,12 @@ constexpr const char* kMoeSource = R"METAL(
                             : row
                     ),
                     uint(MATRIX_OUT) - 1u);
-                uint pool_output =
-                    local_expert * uint(MATRIX_OUT) + output;
+                ulong pool_output =
+                    ulong(local_expert) * ulong(MATRIX_OUT) + ulong(output);
                 outputs[row] = pool_output;
                 scales[row] = mfq_moe_e8m0(mx_scales[
-                    scale_offset
-                    + pool_output * groups + group
+                    ulong(scale_offset)
+                    + pool_output * ulong(groups) + ulong(group)
                 ]);
             }
             for (
@@ -1959,9 +1959,9 @@ constexpr const char* kMoeSource = R"METAL(
                     ++row
                 ) {
                     uchar packed = mx_values[
-                        value_offset
-                        + outputs[row] * (uint(K) >> 1u)
-                        + (column >> 1u)
+                        ulong(value_offset)
+                        + outputs[row] * (ulong(K) >> 1u)
+                        + (ulong(column) >> 1u)
                     ];
                     accumulators[row] = fma(
                         activation0,
@@ -6361,6 +6361,114 @@ MlxNintMoeWeight MlxNintMoeWeight::from_blob(
     // caches their buffers and can retain almost another model-sized copy
     // while loading a fully resident MoE. Active arrays are unaffected.
     mlx::core::clear_cache();
+    return MlxNintMoeWeight(std::move(impl));
+}
+
+MlxNintMoeWeight MlxNintMoeWeight::from_mxfp4_slots(
+    int experts,
+    int out_per_expert,
+    int neuron_len,
+    const std::vector<std::int32_t>& slot_for_expert,
+    array packed_values,
+    array block_scales) {
+    if (experts <= 0 || out_per_expert <= 0 || neuron_len <= 0 ||
+        neuron_len % 32 != 0 ||
+        slot_for_expert.size() != static_cast<std::size_t>(experts)) {
+        throw std::invalid_argument("invalid MXFP4 slot-view dimensions");
+    }
+    if (packed_values.dtype() != mlx::core::uint8 ||
+        block_scales.dtype() != mlx::core::uint8 ||
+        !packed_values.flags().row_contiguous ||
+        !block_scales.flags().row_contiguous) {
+        throw std::invalid_argument(
+            "MXFP4 slot-view banks must be contiguous uint8 arrays");
+    }
+    const auto value_stride = checked_product(
+        static_cast<std::size_t>(out_per_expert),
+        static_cast<std::size_t>(neuron_len / 2),
+        "MXFP4 slot value stride");
+    const auto scale_stride = checked_product(
+        static_cast<std::size_t>(out_per_expert),
+        static_cast<std::size_t>(neuron_len / 32),
+        "MXFP4 slot scale stride");
+    if (packed_values.size() % value_stride != 0 ||
+        block_scales.size() % scale_stride != 0 ||
+        packed_values.size() / value_stride !=
+            block_scales.size() / scale_stride) {
+        throw std::invalid_argument(
+            "MXFP4 slot-view bank geometry mismatch");
+    }
+    const auto slots = packed_values.size() / value_stride;
+    if (slots == 0 || slots > static_cast<std::size_t>(
+        std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument("invalid MXFP4 arena slot count");
+    }
+    std::vector<std::int32_t> descriptors(
+        checked_product(
+            static_cast<std::size_t>(experts),
+            static_cast<std::size_t>(kDescriptorSize),
+            "MXFP4 slot descriptors"),
+        0);
+    for (int expert = 0; expert < experts; ++expert) {
+        const auto slot = slot_for_expert[static_cast<std::size_t>(expert)];
+        if (slot < 0 || static_cast<std::size_t>(slot) >= slots) {
+            throw std::invalid_argument(
+                "MXFP4 slot map contains an invalid arena slot");
+        }
+        const auto base = static_cast<std::size_t>(expert) * kDescriptorSize;
+        descriptors[base + kFamily] = kFamilyMxfp4;
+        descriptors[base + kLocalExpert] = slot;
+        descriptors[base + kOut] = out_per_expert;
+        descriptors[base + kInput] = neuron_len;
+        descriptors[base + kMxGroups] = neuron_len / 32;
+        descriptors[base + kMxValueOffset] = 0;
+        descriptors[base + kMxScaleOffset] = 0;
+    }
+
+    auto empty_u8 = [] {
+        return make_raw_array(std::vector<std::uint8_t>{}, mlx::core::uint8);
+    };
+    auto empty_i8 = [] {
+        return make_raw_array(std::vector<std::uint8_t>{}, mlx::core::int8);
+    };
+    auto empty_i16 = [] {
+        return make_raw_array(std::vector<std::uint8_t>{}, mlx::core::int16);
+    };
+    auto empty_f16 = [] {
+        return make_raw_array(std::vector<std::uint8_t>{}, mlx::core::float16);
+    };
+    auto empty_f32 = [] {
+        return make_raw_array(std::vector<std::uint8_t>{}, mlx::core::float32);
+    };
+    auto impl = std::make_shared<Impl>(
+        make_int32_array(descriptors, Shape{experts, kDescriptorSize}),
+        empty_u8(),
+        empty_u8(),
+        empty_u8(),
+        empty_f32(),
+        empty_f32(),
+        empty_i8(),
+        empty_f16(),
+        empty_u8(),
+        empty_u8(),
+        empty_u8(),
+        empty_f32(),
+        empty_i8(),
+        empty_f32(),
+        empty_u8(),
+        empty_u8(),
+        empty_f32(),
+        empty_f32(),
+        empty_i16(),
+        empty_i16(),
+        std::move(packed_values),
+        std::move(block_scales),
+        std::vector<RotationSpec>{},
+        std::move(descriptors),
+        experts,
+        out_per_expert,
+        neuron_len,
+        1);
     return MlxNintMoeWeight(std::move(impl));
 }
 

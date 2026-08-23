@@ -19,6 +19,12 @@ public:
     static MlxMxWeight from_blob(
         std::string_view dtype,
         std::span<const std::uint8_t> blob);
+    static MlxMxWeight from_arrays(
+        std::string_view dtype,
+        mlx::core::array values,
+        mlx::core::array scales,
+        int input_size,
+        int output_size);
 
     mlx::core::array matmul(const mlx::core::array& input) const;
     mlx::core::array dequantize(

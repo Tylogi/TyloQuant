@@ -138,6 +138,17 @@ public:
     static MlxNintMoeWeight concatenate_projections(
         const std::vector<MlxNintMoeWeight>& weights);
 
+    // Build a native MXFP4 routed view over a shared slot arena without
+    // copying packed values or scales. slot_for_expert maps each global
+    // expert ID to one arena row.
+    static MlxNintMoeWeight from_mxfp4_slots(
+        int experts,
+        int out_per_expert,
+        int neuron_len,
+        const std::vector<std::int32_t>& slot_for_expert,
+        mlx::core::array packed_values,
+        mlx::core::array block_scales);
+
     mlx::core::array routed_matmul(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids) const;

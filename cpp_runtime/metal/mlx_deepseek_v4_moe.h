@@ -2,7 +2,9 @@
 
 #include "deepseek_v4_model.h"
 #include "mlx_grouped_linear.h"
+#include "mlx_hf_tensor.h"
 #include "mlx_moe.h"
+#include "mlx_ssd_expert_cache.h"
 #include "mlx_tensor.h"
 
 #include <array>
@@ -43,6 +45,15 @@ public:
         std::shared_ptr<MlxNintMoeOffloadCache> offload =
             nullptr);
 
+    static MlxDeepseekV4Moe load(
+        const MlxHfTensorStore& model,
+        const DeepseekV4Config& config,
+        std::size_t layer,
+        std::shared_ptr<MlxDeepseekV4SsdExpertCache>
+            expert_cache,
+        const std::optional<mlx::core::array>& available =
+            std::nullopt);
+
     MlxDeepseekV4Moe(
         DeepseekV4Config config,
         MlxLinear router,
@@ -68,6 +79,16 @@ public:
         const mlx::core::array& input,
         const mlx::core::array& token_ids) const;
 
+    // Begin the full-layer native-expert read before the layer's attention
+    // work. The caller keeps the handle alive and passes it back to the
+    // three-argument forward_branches overload after submitting attention.
+    std::optional<MlxDeepseekV4SsdPrefetchedLayer> prefetch_routed(
+        std::size_t rows) const;
+    MlxDeepseekV4MoeBranches forward_branches(
+        const mlx::core::array& input,
+        const mlx::core::array& token_ids,
+        MlxDeepseekV4SsdPrefetchedLayer* prefetched) const;
+
     mlx::core::array forward(
         const mlx::core::array& input,
         const mlx::core::array& token_ids) const;
@@ -83,7 +104,8 @@ public:
             || grouped_shared_gate_up_.has_value();
     }
     bool uses_streamed_experts() const noexcept {
-        return static_cast<bool>(expert_offload_);
+        return static_cast<bool>(expert_offload_)
+            || static_cast<bool>(ssd_expert_cache_);
     }
 
 private:
@@ -99,6 +121,9 @@ private:
         std::optional<MlxRoutedLinear> routed_down,
         std::shared_ptr<MlxNintMoeOffloadCache>
             expert_offload,
+        std::shared_ptr<MlxDeepseekV4SsdExpertCache>
+            ssd_expert_cache,
+        std::size_t layer,
         std::string streamed_gate_up_name,
         std::string streamed_gate_name,
         std::string streamed_up_name,
@@ -123,6 +148,9 @@ private:
     std::optional<MlxRoutedLinear> routed_down_;
     std::shared_ptr<MlxNintMoeOffloadCache>
         expert_offload_;
+    std::shared_ptr<MlxDeepseekV4SsdExpertCache>
+        ssd_expert_cache_;
+    std::size_t layer_ = 0;
     std::string streamed_gate_up_name_;
     std::string streamed_gate_name_;
     std::string streamed_up_name_;

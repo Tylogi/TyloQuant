@@ -7,9 +7,11 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -57,10 +59,26 @@ array floating_contiguous(
     Dtype preferred = mlx::core::float16) {
     auto result = input;
     if (result.dtype() != mlx::core::float16 &&
+        result.dtype() != mlx::core::bfloat16 &&
         result.dtype() != mlx::core::float32) {
         result = mlx::core::astype(result, preferred);
     }
     return mlx::core::contiguous(result);
+}
+
+std::string read_text_file(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error(
+            "cannot open DeepSeek-V4 config: " + path.string());
+    }
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    if (!input.good() && !input.eof()) {
+        throw std::runtime_error(
+            "cannot read DeepSeek-V4 config: " + path.string());
+    }
+    return buffer.str();
 }
 
 array float32_contiguous(const array& input) {
@@ -506,6 +524,53 @@ MlxDeepseekV4Layer MlxDeepseekV4Layer::load(
         });
 }
 
+MlxDeepseekV4Layer MlxDeepseekV4Layer::load(
+    const MlxHfTensorStore& model,
+    const DeepseekV4Config& config,
+    std::size_t index,
+    int max_context,
+    std::pair<array, array> rope_base,
+    std::pair<array, array> rope_compressed,
+    std::shared_ptr<MlxDeepseekV4SsdExpertCache> expert_cache,
+    const std::optional<array>& available) {
+    config.validate();
+    if (index >= static_cast<std::size_t>(config.n_layers)) {
+        throw std::out_of_range(
+            "DeepSeek-V4 HF layer index is out of range");
+    }
+    const int ratio = static_cast<int>(config.compress_ratios[index]);
+    const auto name = [index](std::string_view suffix) {
+        return DeepseekV4TensorNames::layer(index, suffix);
+    };
+    return MlxDeepseekV4Layer(
+        config,
+        index,
+        {
+            MlxDeepseekV4Attention::load(
+                model,
+                config,
+                static_cast<int>(index),
+                ratio,
+                max_context,
+                std::move(rope_base),
+                std::move(rope_compressed)),
+            MlxDeepseekV4Moe::load(
+                model,
+                config,
+                index,
+                std::move(expert_cache),
+                available),
+            float32_contiguous(model.load_dense(name("attn_norm.weight"))),
+            float32_contiguous(model.load_dense(name("ffn_norm.weight"))),
+            model.load_linear(name("hc_attn_fn")),
+            float32_contiguous(model.load_dense(name("hc_attn_base"))),
+            float32_contiguous(model.load_dense(name("hc_attn_scale"))),
+            model.load_linear(name("hc_ffn_fn")),
+            float32_contiguous(model.load_dense(name("hc_ffn_base"))),
+            float32_contiguous(model.load_dense(name("hc_ffn_scale"))),
+        });
+}
+
 MlxDeepseekV4Layer::MlxDeepseekV4Layer(
     DeepseekV4Config config,
     std::size_t index,
@@ -590,7 +655,8 @@ MlxDeepseekV4Layer::hc_pre_norm(
     auto raw_mixes = mlx::core::astype(
         function(flat),
         mlx::core::float32);
-    if (config_.fast_hyper_connections()) {
+    if (config_.fast_hyper_connections() &&
+        residual.dtype() == mlx::core::float16) {
         return deepseek_v4_hc_pre_norm(
             residual,
             raw_mixes,
@@ -633,7 +699,8 @@ array MlxDeepseekV4Layer::hc_post(
     const array& residual,
     const array& post,
     const array& combination) const {
-    if (config_.fast_hyper_connections()) {
+    if (config_.fast_hyper_connections() &&
+        residual.dtype() == mlx::core::float16) {
         return deepseek_v4_hc_post(
             branch,
             residual,
@@ -671,6 +738,8 @@ array MlxDeepseekV4Layer::forward(
     }
 
     auto residual = source;
+    auto routed_prefetch = components_.moe.prefetch_routed(
+        source.size() / static_cast<std::size_t>(expected_hidden));
     auto attention_hc = hc_pre_norm(
         source,
         components_.hc_attention_fn,
@@ -694,6 +763,11 @@ array MlxDeepseekV4Layer::forward(
     detail::profile_eval(
         "layer.attention_hc_post",
         result);
+    if (routed_prefetch.has_value()) {
+        // Attention has no dependency on the expert banks. Materialize it
+        // while the SSD workers fill the alternating routed buffer.
+        detail::eval_with_timing(result);
+    }
 
     residual = result;
     auto ffn_hc = hc_pre_norm(
@@ -709,8 +783,10 @@ array MlxDeepseekV4Layer::forward(
         branch);
     auto moe_branches = components_.moe.forward_branches(
         branch,
-        token_ids);
-    auto output = config_.fast_hyper_connections()
+        token_ids,
+        routed_prefetch.has_value() ? &*routed_prefetch : nullptr);
+    auto output = config_.fast_hyper_connections() &&
+            residual.dtype() == mlx::core::float16
         ? deepseek_v4_hc_post_sum(
               moe_branches.routed,
               moe_branches.shared,
@@ -838,6 +914,70 @@ MlxDeepseekV4CausalLm::load(
         std::move(expert_offload));
 }
 
+MlxDeepseekV4CausalLm MlxDeepseekV4CausalLm::load_hf(
+    const std::filesystem::path& model_root,
+    int max_context,
+    std::size_t expert_cache_bytes,
+    std::size_t io_workers,
+    bool prefill_overlap) {
+    const auto config = DeepseekV4Config::from_json(
+        read_text_file(model_root / "config.json"));
+    const int context = std::min(
+        max_context,
+        checked_int(
+            config.max_position_embeddings,
+            "maximum context"));
+    if (context <= 0) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 HF max_context must be positive");
+    }
+    auto checkpoint = std::make_shared<HfSafetensorStore>(model_root);
+    MlxHfTensorStore model(std::move(checkpoint));
+    auto expert_cache =
+        std::make_shared<MlxDeepseekV4SsdExpertCache>(
+            model_root,
+            expert_cache_bytes,
+            io_workers,
+            prefill_overlap);
+    auto rope_base = deepseek_v4_yarn_tables(
+        checked_int(config.qk_rope_head_dim, "rotary dimension"),
+        context,
+        static_cast<float>(config.rope_theta));
+    auto rope_compressed = deepseek_v4_yarn_tables(
+        checked_int(config.qk_rope_head_dim, "rotary dimension"),
+        context,
+        static_cast<float>(config.compress_rope_theta),
+        config.rope_scaling);
+    std::vector<MlxDeepseekV4Layer> layers;
+    layers.reserve(static_cast<std::size_t>(config.n_layers));
+    for (std::size_t index = 0;
+         index < static_cast<std::size_t>(config.n_layers);
+         ++index) {
+        layers.push_back(MlxDeepseekV4Layer::load(
+            model,
+            config,
+            index,
+            context,
+            rope_base,
+            rope_compressed,
+            expert_cache));
+    }
+    const DeepseekV4TensorNames names;
+    return MlxDeepseekV4CausalLm(
+        config,
+        model.load_embedding(names.embedding),
+        std::move(layers),
+        float32_contiguous(model.load_dense(names.output_norm)),
+        model.load_linear(names.output),
+        model.load_linear(names.hc_head_fn),
+        float32_contiguous(model.load_dense(names.hc_head_base)),
+        float32_contiguous(model.load_dense(names.hc_head_scale)),
+        context,
+        mlx::core::bfloat16,
+        nullptr,
+        std::move(expert_cache));
+}
+
 MlxDeepseekV4CausalLm::MlxDeepseekV4CausalLm(
     DeepseekV4Config config,
     MlxEmbedding embedding,
@@ -850,7 +990,9 @@ MlxDeepseekV4CausalLm::MlxDeepseekV4CausalLm(
     int max_context,
     Dtype activation_dtype,
     std::shared_ptr<MlxNintMoeOffloadCache>
-        expert_offload)
+        expert_offload,
+    std::shared_ptr<MlxDeepseekV4SsdExpertCache>
+        ssd_expert_cache)
     : config_(std::move(config)),
       embedding_(std::move(embedding)),
       layers_(std::move(layers)),
@@ -868,6 +1010,8 @@ MlxDeepseekV4CausalLm::MlxDeepseekV4CausalLm(
               hc_head_scale)),
       expert_offload_(
           std::move(expert_offload)),
+      ssd_expert_cache_(
+          std::move(ssd_expert_cache)),
       max_context_(max_context),
       activation_dtype_(activation_dtype) {
     validate_components();
@@ -889,6 +1033,7 @@ void MlxDeepseekV4CausalLm::validate_components() const {
         max_context_ >
             config_.max_position_embeddings ||
         (activation_dtype_ != mlx::core::float16 &&
+         activation_dtype_ != mlx::core::bfloat16 &&
          activation_dtype_ != mlx::core::float32) ||
         embedding_.vocabulary_size() != vocab ||
         embedding_.hidden_size() != hidden ||
@@ -1179,6 +1324,9 @@ array MlxDeepseekV4CausalLm::forward_chunk(
             detail::eval_with_timing(
                 std::move(outputs));
         }
+        if (ssd_expert_cache_) {
+            ssd_expert_cache_->release_deferred();
+        }
     }
     return logits;
 }
@@ -1335,29 +1483,55 @@ bool MlxDeepseekV4CausalLm::uses_streamed_experts()
 std::size_t
 MlxDeepseekV4CausalLm::expert_cache_limit_bytes()
     const noexcept {
-    return expert_offload_
-        ? expert_offload_->cache_limit_bytes()
+    if (expert_offload_) {
+        return expert_offload_->cache_limit_bytes();
+    }
+    return ssd_expert_cache_
+        ? ssd_expert_cache_->cache_limit_bytes()
         : 0;
 }
 
 std::size_t
 MlxDeepseekV4CausalLm::expert_resident_packed_bytes()
     const {
-    return expert_offload_
-        ? expert_offload_->resident_packed_bytes()
+    if (expert_offload_) {
+        return expert_offload_->resident_packed_bytes();
+    }
+    return ssd_expert_cache_
+        ? ssd_expert_cache_->stats().resident_bytes
         : 0;
 }
 
 std::size_t
 MlxDeepseekV4CausalLm::cached_expert_count() const {
-    return expert_offload_
-        ? expert_offload_->cached_expert_count()
+    if (expert_offload_) {
+        return expert_offload_->cached_expert_count();
+    }
+    return ssd_expert_cache_
+        ? ssd_expert_cache_->stats().resident_experts
         : 0;
+}
+
+std::optional<MlxDeepseekV4SsdCacheStats>
+MlxDeepseekV4CausalLm::ssd_expert_cache_stats() const {
+    return ssd_expert_cache_
+        ? std::optional<MlxDeepseekV4SsdCacheStats>(
+              ssd_expert_cache_->stats())
+        : std::nullopt;
+}
+
+void MlxDeepseekV4CausalLm::prewarm_ssd_expert_arena() {
+    if (ssd_expert_cache_) {
+        ssd_expert_cache_->prewarm_metal();
+    }
 }
 
 void MlxDeepseekV4CausalLm::clear_expert_cache() {
     if (expert_offload_) {
         expert_offload_->clear();
+    }
+    if (ssd_expert_cache_) {
+        ssd_expert_cache_->clear();
     }
 }
 

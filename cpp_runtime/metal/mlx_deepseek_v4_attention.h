@@ -2,6 +2,7 @@
 
 #include "deepseek_v4_model.h"
 #include "mlx_deepseek_v4_sparse.h"
+#include "mlx_hf_tensor.h"
 #include "mlx_tensor.h"
 
 #include <memory>
@@ -228,6 +229,17 @@ public:
 
     static MlxDeepseekV4Attention load(
         const MfqContainer& model,
+        const DeepseekV4Config& config,
+        int layer,
+        int ratio,
+        int max_context,
+        std::pair<mlx::core::array, mlx::core::array>
+            rope_base,
+        std::pair<mlx::core::array, mlx::core::array>
+            rope_compressed);
+
+    static MlxDeepseekV4Attention load(
+        const MlxHfTensorStore& model,
         const DeepseekV4Config& config,
         int layer,
         int ratio,

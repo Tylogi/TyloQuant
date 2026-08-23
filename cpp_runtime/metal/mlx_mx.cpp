@@ -578,6 +578,45 @@ MlxMxWeight MlxMxWeight::from_blob(
         output_size);
 }
 
+MlxMxWeight MlxMxWeight::from_arrays(
+    std::string_view dtype,
+    array values,
+    array scales,
+    int input_size,
+    int output_size) {
+    if (!is_mx_dtype(dtype) || input_size <= 0 || output_size <= 0) {
+        throw std::invalid_argument("invalid MX array geometry");
+    }
+    const int bits = dtype == "MXFP4" ? 4 : 8;
+    if ((bits == 4 && input_size % 32 != 0) ||
+        (bits == 8 && input_size % 128 != 0) ||
+        values.dtype() != mlx::core::uint8 ||
+        scales.dtype() != mlx::core::uint8 ||
+        !values.flags().row_contiguous ||
+        !scales.flags().row_contiguous) {
+        throw std::invalid_argument("invalid MX packed arrays");
+    }
+    const auto expected_values = checked_product(
+        static_cast<std::uint64_t>(output_size),
+        static_cast<std::uint64_t>(bits == 4 ? input_size / 2 : input_size),
+        "array value byte count");
+    const auto expected_scales = checked_product(
+        static_cast<std::uint64_t>(
+            bits == 4 ? output_size : (output_size + 127) / 128),
+        static_cast<std::uint64_t>(
+            bits == 4 ? input_size / 32 : input_size / 128),
+        "array scale byte count");
+    if (values.size() != expected_values || scales.size() != expected_scales) {
+        throw std::invalid_argument("MX packed array size mismatch");
+    }
+    return MlxMxWeight(
+        std::move(values),
+        std::move(scales),
+        bits,
+        input_size,
+        output_size);
+}
+
 array MlxMxWeight::dequantize(Dtype dtype) const {
     if (dtype != mlx::core::float16 && dtype != mlx::core::float32) {
         throw std::runtime_error("MX dequantization requires float16 or float32");

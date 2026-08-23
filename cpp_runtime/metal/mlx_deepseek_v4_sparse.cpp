@@ -88,10 +88,12 @@ public:
         // after any earlier reader before the row write is dispatched.
         output.copy_shared_buffer(cache);
 
-        const bool half = cache.dtype() == mlx::core::float16;
-        const std::string kernel_name = half
-            ? "mfq_dsv4_cache_write_f16"
-            : "mfq_dsv4_cache_write_f32";
+        const std::string kernel_name =
+            cache.dtype() == mlx::core::float16
+                ? "mfq_dsv4_cache_write_f16"
+                : cache.dtype() == mlx::core::bfloat16
+                ? "mfq_dsv4_cache_write_bf16"
+                : "mfq_dsv4_cache_write_f32";
         auto& selected_stream = stream();
         auto& device = mlx::core::metal::device(
             selected_stream.device);
@@ -129,6 +131,9 @@ kernel void mfq_dsv4_cache_write(
 template [[host_name("mfq_dsv4_cache_write_f16")]]
 kernel decltype(mfq_dsv4_cache_write<half>)
     mfq_dsv4_cache_write<half>;
+template [[host_name("mfq_dsv4_cache_write_bf16")]]
+kernel decltype(mfq_dsv4_cache_write<bfloat>)
+    mfq_dsv4_cache_write<bfloat>;
 template [[host_name("mfq_dsv4_cache_write_f32")]]
 kernel decltype(mfq_dsv4_cache_write<float>)
     mfq_dsv4_cache_write<float>;
@@ -608,9 +613,10 @@ array dsv4_cache_write_inplace(
         cache.shape(2) <= 0 ||
         !cache.flags().row_contiguous ||
         (cache.dtype() != mlx::core::float16 &&
+         cache.dtype() != mlx::core::bfloat16 &&
          cache.dtype() != mlx::core::float32)) {
         throw std::invalid_argument(
-            "DSV4 fixed cache must be row-contiguous f16/f32 [B,C,D]");
+            "DSV4 fixed cache must be row-contiguous f16/bf16/f32 [B,C,D]");
     }
     auto update_values = typed_contiguous(
         values,
