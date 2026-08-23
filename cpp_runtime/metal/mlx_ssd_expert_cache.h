@@ -28,6 +28,9 @@ struct MlxDeepseekV4SsdCacheStats {
     double io_seconds = 0.0;
     double wait_seconds = 0.0;
     double prefill_wait_seconds = 0.0;
+    double route_sync_seconds = 0.0;
+    double prepare_seconds = 0.0;
+    double view_seconds = 0.0;
     std::size_t resident_experts = 0;
     std::size_t resident_bytes = 0;
     std::size_t cache_slots = 0;
@@ -113,7 +116,8 @@ public:
 
     MlxDeepseekV4SsdPreparedExperts prepare(
         std::size_t layer,
-        std::span<const std::int32_t> active_experts);
+        std::span<const std::int32_t> active_experts,
+        std::function<void()> overlap = {});
 
     // Start loading a complete routed-expert layer into one of two alternating
     // buffers. Resident LRU rows are pinned and reused in place; only misses
@@ -125,6 +129,8 @@ public:
     std::size_t cache_slots() const noexcept;
     bool prefill_overlap_enabled() const noexcept;
     MlxDeepseekV4SsdCacheStats stats() const;
+
+    void record_route_sync(double seconds) noexcept;
     void reset_stats();
     void prewarm_metal();
     // Release slots retained for a lazy Metal graph after that graph has

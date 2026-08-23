@@ -14,14 +14,14 @@
 namespace mfq::metal {
 
 struct MlxDeepseekV4SsdExpertWeights {
-    MlxRoutedLinear gate;
-    MlxRoutedLinear up;
+    MlxRoutedLinear gate_up;
     MlxRoutedLinear down;
 };
 
-// Six-bank unified-memory arena shared by SSD prefill buffers and the decode
+// Four-bank unified-memory arena shared by SSD prefill buffers and the decode
 // expert cache. The buffers are allocated by MLX, remain CPU writable, and are
-// consumed directly by Metal without a staging copy.
+// consumed directly by Metal without a staging copy. Gate and Up are adjacent
+// in each slot so one routed MXFP4 kernel can project and apply SwiGLU.
 class MlxDeepseekV4SsdExpertArena {
 public:
     explicit MlxDeepseekV4SsdExpertArena(std::size_t slots);
@@ -57,15 +57,15 @@ private:
     std::span<std::byte> bank_slot(Bank& bank, std::size_t slot);
     mlx::core::array bank_slot_array(
         const Bank& bank,
-        std::size_t slot) const;
+        std::size_t slot,
+        std::size_t offset = 0,
+        std::size_t bytes = 0) const;
 
     std::size_t slots_ = 0;
-    Bank w1_scale_;
+    Bank gate_up_scale_;
     Bank w2_scale_;
-    Bank w3_scale_;
-    Bank w1_weight_;
+    Bank gate_up_weight_;
     Bank w2_weight_;
-    Bank w3_weight_;
 };
 
 } // namespace mfq::metal

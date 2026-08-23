@@ -226,16 +226,13 @@ inline uint mfq_moe_nint_read_value(
         bits);
 }
 
+constant constexpr float mfq_moe_mxfp4_lut[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+};
+
 inline float mfq_moe_mxfp4_value(uchar code) {
-    uint magnitude = uint(code & 7u);
-    float value = magnitude == 0u ? 0.0f
-        : (magnitude == 1u ? 0.5f
-        : (magnitude == 2u ? 1.0f
-        : (magnitude == 3u ? 1.5f
-        : (magnitude == 4u ? 2.0f
-        : (magnitude == 5u ? 3.0f
-        : (magnitude == 6u ? 4.0f : 6.0f))))));
-    return (code & 8u) == 0u ? value : -value;
+    return mfq_moe_mxfp4_lut[uint(code & 15u)];
 }
 
 inline float mfq_moe_e8m0(uchar raw) {
@@ -1944,35 +1941,64 @@ constexpr const char* kMoeSource = R"METAL(
             for (
                 uint component = 0u;
                 component < 32u;
-                component += 2u
+                component += 16u
             ) {
                 uint column = column_base + component;
-                float activation0 = column < uint(K)
-                    ? float(x[x_offset + column])
-                    : 0.0f;
-                float activation1 = column + 1u < uint(K)
-                    ? float(x[x_offset + column + 1u])
-                    : 0.0f;
+                vec<T, 4> source0 = *reinterpret_cast<
+                    device const vec<T, 4>*>(
+                        x + x_offset + column);
+                vec<T, 4> source1 = *reinterpret_cast<
+                    device const vec<T, 4>*>(
+                        x + x_offset + column + 4u);
+                vec<T, 4> source2 = *reinterpret_cast<
+                    device const vec<T, 4>*>(
+                        x + x_offset + column + 8u);
+                vec<T, 4> source3 = *reinterpret_cast<
+                    device const vec<T, 4>*>(
+                        x + x_offset + column + 12u);
+                float activations[16] = {
+                    float(source0.x),
+                    float(source0.y),
+                    float(source0.z),
+                    float(source0.w),
+                    float(source1.x),
+                    float(source1.y),
+                    float(source1.z),
+                    float(source1.w),
+                    float(source2.x),
+                    float(source2.y),
+                    float(source2.z),
+                    float(source2.w),
+                    float(source3.x),
+                    float(source3.y),
+                    float(source3.z),
+                    float(source3.w),
+                };
                 for (
                     uint row = 0u;
                     row < MATRIX_ROWS;
                     ++row
                 ) {
-                    uchar packed = mx_values[
-                        ulong(value_offset)
+                    ulong packed_offset = ulong(value_offset)
                         + outputs[row] * (ulong(K) >> 1u)
-                        + (ulong(column) >> 1u)
-                    ];
-                    accumulators[row] = fma(
-                        activation0,
-                        scales[row]
-                            * mfq_moe_mxfp4_value(packed & 15u),
-                        accumulators[row]);
-                    accumulators[row] = fma(
-                        activation1,
-                        scales[row]
-                            * mfq_moe_mxfp4_value(packed >> 4u),
-                        accumulators[row]);
+                        + (ulong(column) >> 1u);
+                    uint2 packed = *reinterpret_cast<device const uint2*>(
+                        mx_values + packed_offset);
+                    for (uint pair = 0u; pair < 8u; ++pair) {
+                        uint word = pair < 4u ? packed.x : packed.y;
+                        uchar codes = uchar(
+                            word >> ((pair & 3u) * 8u));
+                        accumulators[row] = fma(
+                            activations[pair * 2u],
+                            scales[row]
+                                * mfq_moe_mxfp4_value(codes & 15u),
+                            accumulators[row]);
+                        accumulators[row] = fma(
+                            activations[pair * 2u + 1u],
+                            scales[row]
+                                * mfq_moe_mxfp4_value(codes >> 4u),
+                            accumulators[row]);
+                    }
                 }
             }
         }
@@ -7261,7 +7287,11 @@ array MlxNintMoeWeight::routed_matmul_impl(
 
     const int k_lanes = impl_->k_lanes_override != 0
         ? impl_->k_lanes_override
-        : (fused_swiglu ? 16 : 8);
+        : (fused_swiglu
+            && impl_->family_mask !=
+                (std::uint32_t{1} << kFamilyMxfp4)
+            ? 16
+            : 8);
     const auto rows_per_workgroup =
         static_cast<std::size_t>(64 / k_lanes);
     const auto output_tiles =

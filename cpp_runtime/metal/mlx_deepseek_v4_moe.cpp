@@ -1078,6 +1078,33 @@ MlxDeepseekV4Moe::forward_branches(
             });
     }
 
+    const auto build_shared = [&]() {
+        auto shared_hidden = [&]() {
+            if (fused_shared_hidden.has_value()) {
+                return std::move(*fused_shared_hidden);
+            }
+            auto shared_gate_up = mlx::core::concatenate(
+                {
+                    std::move(projections[shared_offset]),
+                    std::move(projections[shared_offset + 1]),
+                },
+                -1);
+            auto result = moe_limited_swiglu_split(
+                shared_gate_up,
+                static_cast<float>(config_.swiglu_limit));
+            detail::profile_eval(
+                "moe.shared_swiglu",
+                result);
+            return result;
+        }();
+        auto result = shared_down_(shared_hidden);
+        detail::profile_eval(
+            "moe.shared_down",
+            result);
+        return result;
+    };
+    std::optional<array> shared;
+
     array routed = mlx::core::zeros(
         Shape{rows, hidden},
         source.dtype());
@@ -1237,15 +1264,21 @@ MlxDeepseekV4Moe::forward_branches(
         if (prefetched != nullptr) {
             const auto& weights = prefetched->wait();
             routed = run_resident(
+                &weights.gate_up,
                 nullptr,
-                &weights.gate,
-                &weights.up,
+                nullptr,
                 &weights.down);
             detail::eval_with_timing(routed);
         } else {
             auto host_ids = mlx::core::contiguous(
                 mlx::core::astype(expert_ids, mlx::core::int32));
+            const auto route_sync_begin =
+                std::chrono::steady_clock::now();
             detail::eval_with_timing(host_ids);
+            ssd_expert_cache_->record_route_sync(
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() -
+                    route_sync_begin).count());
             std::vector<std::int32_t> active(
                 host_ids.data<std::int32_t>(),
                 host_ids.data<std::int32_t>() + host_ids.size());
@@ -1259,12 +1292,18 @@ MlxDeepseekV4Moe::forward_branches(
             active.erase(
                 std::unique(active.begin(), active.end()),
                 active.end());
-            auto prepared = ssd_expert_cache_->prepare(layer_, active);
+            shared.emplace(build_shared());
+            auto prepared = ssd_expert_cache_->prepare(
+                layer_,
+                active,
+                [&shared] {
+                    detail::eval_with_timing(*shared);
+                });
             const auto& weights = prepared.weights();
             routed = run_resident(
+                &weights.gate_up,
                 nullptr,
-                &weights.gate,
-                &weights.up,
+                nullptr,
                 &weights.down);
         }
     } else if (!expert_offload_) {
@@ -1413,29 +1452,9 @@ MlxDeepseekV4Moe::forward_branches(
                 std::move(chunks),
                 0);
     }
-    auto shared_hidden = [&]() {
-        if (fused_shared_hidden.has_value()) {
-            return std::move(*fused_shared_hidden);
-        }
-        auto shared_gate_up = mlx::core::concatenate(
-            {
-                std::move(projections[shared_offset]),
-                std::move(projections[shared_offset + 1]),
-            },
-            -1);
-        auto result = moe_limited_swiglu_split(
-            shared_gate_up,
-            static_cast<float>(
-                config_.swiglu_limit));
-        detail::profile_eval(
-            "moe.shared_swiglu",
-            result);
-        return result;
-    }();
-    auto shared = shared_down_(shared_hidden);
-    detail::profile_eval(
-        "moe.shared_down",
-        shared);
+    if (!shared.has_value()) {
+        shared.emplace(build_shared());
+    }
     Shape output_shape(
         input.shape().begin(),
         input.shape().end() - 1);
@@ -1445,7 +1464,7 @@ MlxDeepseekV4Moe::forward_branches(
             std::move(routed),
             output_shape),
         mlx::core::reshape(
-            std::move(shared),
+            std::move(*shared),
             std::move(output_shape)),
         std::move(expert_ids),
         std::move(expert_weights),

@@ -79,12 +79,10 @@ MlxDeepseekV4SsdExpertArena::allocate_bank(
 MlxDeepseekV4SsdExpertArena::MlxDeepseekV4SsdExpertArena(
     std::size_t slots)
     : slots_(slots),
-      w1_scale_(allocate_bank(slots, kScaleBytes)),
+      gate_up_scale_(allocate_bank(slots, 2 * kScaleBytes)),
       w2_scale_(allocate_bank(slots, kScaleBytes)),
-      w3_scale_(allocate_bank(slots, kScaleBytes)),
-      w1_weight_(allocate_bank(slots, kValueBytes)),
-      w2_weight_(allocate_bank(slots, kValueBytes)),
-      w3_weight_(allocate_bank(slots, kValueBytes)) {}
+      gate_up_weight_(allocate_bank(slots, 2 * kValueBytes)),
+      w2_weight_(allocate_bank(slots, kValueBytes)) {}
 
 std::size_t MlxDeepseekV4SsdExpertArena::slots() const noexcept {
     return slots_;
@@ -115,16 +113,14 @@ void MlxDeepseekV4SsdExpertArena::prewarm_metal() {
     auto weights = routed_weights(slots, active);
     const mlx::core::array expert_ids(
         active.data(), Shape{1, 1}, mlx::core::int32);
-    auto gate = weights.gate.forward(
+    auto gate_up = weights.gate_up.swiglu(
         mlx::core::zeros(Shape{1, 4096}, mlx::core::float16),
-        expert_ids);
-    auto up = weights.up.forward(
-        mlx::core::zeros(Shape{1, 4096}, mlx::core::float16),
-        expert_ids);
+        expert_ids,
+        0.0f);
     auto down = weights.down.forward(
         mlx::core::zeros(Shape{1, 2048}, mlx::core::float16),
         expert_ids);
-    mlx::core::eval({std::move(gate), std::move(up), std::move(down)});
+    mlx::core::eval({std::move(gate_up), std::move(down)});
 }
 
 std::span<std::byte> MlxDeepseekV4SsdExpertArena::bank_slot(
@@ -141,13 +137,15 @@ std::span<std::byte> MlxDeepseekV4SsdExpertArena::bank_slot(
 
 DeepseekV4NativeExpertDestination
 MlxDeepseekV4SsdExpertArena::destination(std::size_t slot) {
+    auto gate_up_scale = bank_slot(gate_up_scale_, slot);
+    auto gate_up_weight = bank_slot(gate_up_weight_, slot);
     return {
-        .w1_scale = bank_slot(w1_scale_, slot),
+        .w1_scale = gate_up_scale.first(kScaleBytes),
         .w2_scale = bank_slot(w2_scale_, slot),
-        .w3_scale = bank_slot(w3_scale_, slot),
-        .w1_weight = bank_slot(w1_weight_, slot),
+        .w3_scale = gate_up_scale.subspan(kScaleBytes, kScaleBytes),
+        .w1_weight = gate_up_weight.first(kValueBytes),
         .w2_weight = bank_slot(w2_weight_, slot),
-        .w3_weight = bank_slot(w3_weight_, slot),
+        .w3_weight = gate_up_weight.subspan(kValueBytes, kValueBytes),
     };
 }
 
@@ -181,22 +179,14 @@ MlxDeepseekV4SsdExpertArena::routed_weights(
     }
     const int experts = checked_dimension(complete.size(), "expert count");
     return {
-        .gate = MlxRoutedLinear(
+        .gate_up = MlxRoutedLinear(
             MlxNintMoeWeight::from_mxfp4_slots(
                 experts,
-                2048,
+                4096,
                 4096,
                 complete,
-                w1_weight_.array,
-                w1_scale_.array)),
-        .up = MlxRoutedLinear(
-            MlxNintMoeWeight::from_mxfp4_slots(
-                experts,
-                2048,
-                4096,
-                complete,
-                w3_weight_.array,
-                w3_scale_.array)),
+                gate_up_weight_.array,
+                gate_up_scale_.array)),
         .down = MlxRoutedLinear(
             MlxNintMoeWeight::from_mxfp4_slots(
                 experts,
@@ -210,19 +200,31 @@ MlxDeepseekV4SsdExpertArena::routed_weights(
 
 array MlxDeepseekV4SsdExpertArena::bank_slot_array(
     const Bank& bank,
-    std::size_t slot) const {
+    std::size_t slot,
+    std::size_t offset,
+    std::size_t bytes) const {
     if (slot >= slots_) {
         throw std::out_of_range("SSD expert arena slot out of range");
+    }
+    if (bytes == 0) {
+        bytes = bank.bytes_per_slot - offset;
+    }
+    if (offset > bank.bytes_per_slot ||
+        bytes > bank.bytes_per_slot - offset) {
+        throw std::out_of_range("SSD expert arena bank slice out of range");
     }
     return mlx::core::reshape(
         mlx::core::slice(
             bank.array,
-            Shape{checked_index(slot, "slot index"), 0},
+            Shape{
+                checked_index(slot, "slot index"),
+                checked_index(offset, "slot byte offset"),
+            },
             Shape{
                 checked_index(slot + 1, "slot end"),
-                checked_dimension(bank.bytes_per_slot, "slot stride"),
+                checked_index(offset + bytes, "slot byte end"),
             }),
-        Shape{checked_dimension(bank.bytes_per_slot, "slot stride")});
+        Shape{checked_dimension(bytes, "slot slice")});
 }
 
 MlxMxWeight MlxDeepseekV4SsdExpertArena::expert_weight(
@@ -231,8 +233,8 @@ MlxMxWeight MlxDeepseekV4SsdExpertArena::expert_weight(
     if (projection == '1') {
         return MlxMxWeight::from_arrays(
             "MXFP4",
-            bank_slot_array(w1_weight_, slot),
-            bank_slot_array(w1_scale_, slot),
+            bank_slot_array(gate_up_weight_, slot, 0, kValueBytes),
+            bank_slot_array(gate_up_scale_, slot, 0, kScaleBytes),
             4096,
             2048);
     }
@@ -247,8 +249,10 @@ MlxMxWeight MlxDeepseekV4SsdExpertArena::expert_weight(
     if (projection == '3') {
         return MlxMxWeight::from_arrays(
             "MXFP4",
-            bank_slot_array(w3_weight_, slot),
-            bank_slot_array(w3_scale_, slot),
+            bank_slot_array(
+                gate_up_weight_, slot, kValueBytes, kValueBytes),
+            bank_slot_array(
+                gate_up_scale_, slot, kScaleBytes, kScaleBytes),
             4096,
             2048);
     }

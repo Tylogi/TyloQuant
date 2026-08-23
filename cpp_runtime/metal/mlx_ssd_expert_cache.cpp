@@ -522,7 +522,9 @@ MlxDeepseekV4SsdExpertCache::~MlxDeepseekV4SsdExpertCache() = default;
 
 MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
     std::size_t layer,
-    std::span<const std::int32_t> active_experts) {
+    std::span<const std::int32_t> active_experts,
+    std::function<void()> overlap) {
+    const auto prepare_begin = std::chrono::steady_clock::now();
     // The caller has evaluated the current layer's routing IDs before this
     // point, which also completes the previous layer graph. Its arena rows can
     // now safely return to the LRU before acquiring this layer's experts.
@@ -540,6 +542,17 @@ MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
         for (const auto expert : unique) {
             acquisitions.push_back(impl_->acquire(layer, expert));
         }
+        const bool pending = std::any_of(
+            acquisitions.begin(),
+            acquisitions.end(),
+            [](const Impl::Acquisition& acquired) {
+                return acquired.ready.wait_for(
+                           std::chrono::seconds(0)) !=
+                    std::future_status::ready;
+            });
+        if (pending && overlap) {
+            overlap();
+        }
         const auto wait_begin = std::chrono::steady_clock::now();
         for (const auto& acquired : acquisitions) {
             acquired.ready.get();
@@ -556,7 +569,17 @@ MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
             std::scoped_lock lock(impl_->mutex);
             impl_->counters.wait_seconds += wait_seconds;
         }
+        const auto view_begin = std::chrono::steady_clock::now();
         auto weights = impl_->arena.routed_weights(slot_map, unique);
+        const auto view_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - view_begin).count();
+        const auto prepare_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - prepare_begin).count();
+        {
+            std::scoped_lock lock(impl_->mutex);
+            impl_->counters.view_seconds += view_seconds;
+            impl_->counters.prepare_seconds += prepare_seconds;
+        }
         auto impl = impl_;
         return MlxDeepseekV4SsdPreparedExperts(
             std::move(weights),
@@ -567,6 +590,12 @@ MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
         impl_->release(acquisitions);
         throw;
     }
+}
+
+void MlxDeepseekV4SsdExpertCache::record_route_sync(
+    double seconds) noexcept {
+    std::scoped_lock lock(impl_->mutex);
+    impl_->counters.route_sync_seconds += seconds;
 }
 
 MlxDeepseekV4SsdPrefetchedLayer

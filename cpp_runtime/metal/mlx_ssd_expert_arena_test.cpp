@@ -1,4 +1,5 @@
 #include "mlx_ssd_expert_arena.h"
+#include "mlx_moe_ops.h"
 
 #include <algorithm>
 #include <cmath>
@@ -83,25 +84,28 @@ int main() {
             Shape{2, 1});
 
         auto input = make_input(2, 4096);
-        auto gate = weights.gate.forward(input, ids);
+        auto gate_up = weights.gate_up.swiglu(input, ids, 0.0f);
         auto gate0 = arena.expert_weight(0, '1').matmul(
             mlx::core::slice(input, Shape{0, 0}, Shape{1, 4096}));
         auto gate1 = arena.expert_weight(1, '1').matmul(
             mlx::core::slice(input, Shape{1, 0}, Shape{2, 4096}));
-        auto gate_reference = mlx::core::expand_dims(
-            mlx::core::concatenate({gate0, gate1}, 0),
-            1);
-        compare(gate, gate_reference, "SSD MXFP4 gate");
-
-        auto up = weights.up.forward(input, ids);
         auto up0 = arena.expert_weight(0, '3').matmul(
             mlx::core::slice(input, Shape{0, 0}, Shape{1, 4096}));
         auto up1 = arena.expert_weight(1, '3').matmul(
             mlx::core::slice(input, Shape{1, 0}, Shape{2, 4096}));
+        auto gate_reference = mlx::core::expand_dims(
+            mlx::core::concatenate({gate0, gate1}, 0),
+            1);
         auto up_reference = mlx::core::expand_dims(
             mlx::core::concatenate({up0, up1}, 0),
             1);
-        compare(up, up_reference, "SSD MXFP4 up");
+        auto swiglu_reference =
+            mfq::metal::moe_limited_swiglu_split(
+                mlx::core::concatenate(
+                    {gate_reference, up_reference},
+                    -1),
+                0.0f);
+        compare(gate_up, swiglu_reference, "SSD MXFP4 Gate/Up SwiGLU");
 
         auto down_input = make_input(2, 2048);
         auto routed_down_input = mlx::core::expand_dims(down_input, 1);

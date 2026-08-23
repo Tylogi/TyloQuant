@@ -1,6 +1,7 @@
 #include "hf_safetensors_store.h"
 #include "mlx_ssd_expert_arena.h"
 #include "mlx_ssd_expert_cache.h"
+#include "mlx_moe_ops.h"
 
 #include <algorithm>
 #include <chrono>
@@ -94,16 +95,19 @@ int main(int argc, char** argv) {
             Shape{1, 1});
 
         auto hidden = input(4096);
-        const auto gate_error = maximum_error(
-            weights.gate.forward(hidden, ids),
-            mlx::core::expand_dims(
-                arena.expert_weight(0, '1').matmul(hidden),
-                1));
-        const auto up_error = maximum_error(
-            weights.up.forward(hidden, ids),
-            mlx::core::expand_dims(
-                arena.expert_weight(0, '3').matmul(hidden),
-                1));
+        auto gate_reference = mlx::core::expand_dims(
+            arena.expert_weight(0, '1').matmul(hidden),
+            1);
+        auto up_reference = mlx::core::expand_dims(
+            arena.expert_weight(0, '3').matmul(hidden),
+            1);
+        const auto gate_up_error = maximum_error(
+            weights.gate_up.swiglu(hidden, ids, 0.0f),
+            mfq::metal::moe_limited_swiglu_split(
+                mlx::core::concatenate(
+                    {gate_reference, up_reference},
+                    -1),
+                0.0f));
         auto intermediate = input(2048);
         const auto down_error = maximum_error(
             weights.down.forward(
@@ -119,10 +123,9 @@ int main(int argc, char** argv) {
                   << " read_calls=" << stats.read_calls
                   << " load_ms=" << std::fixed << std::setprecision(3)
                   << load_seconds * 1000.0
-                  << " gate_max_error=" << gate_error
-                  << " up_max_error=" << up_error
+                  << " gate_up_max_error=" << gate_up_error
                   << " down_max_error=" << down_error << '\n';
-        if (gate_error != 0.0f || up_error != 0.0f || down_error != 0.0f) {
+        if (gate_up_error != 0.0f || down_error != 0.0f) {
             throw std::runtime_error("official MXFP4 routed validation failed");
         }
 
@@ -141,7 +144,7 @@ int main(int argc, char** argv) {
                 static_cast<std::size_t>(layer),
                 cache_active);
             first = mlx::core::contiguous(
-                prepared.weights().gate.forward(hidden, cache_ids));
+                prepared.weights().gate_up.swiglu(hidden, cache_ids, 0.0f));
             first.eval();
         }
         array second = mlx::core::array(0.0f);
@@ -150,7 +153,7 @@ int main(int argc, char** argv) {
                 static_cast<std::size_t>(layer),
                 cache_active);
             second = mlx::core::contiguous(
-                prepared.weights().gate.forward(hidden, cache_ids));
+                prepared.weights().gate_up.swiglu(hidden, cache_ids, 0.0f));
             second.eval();
         }
         const auto cache_error = maximum_error(first, second);
@@ -181,10 +184,12 @@ int main(int argc, char** argv) {
         const auto current_wait_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - prefill_begin).count();
         const auto prefill_error = maximum_error(
-            current_weights.gate.forward(hidden, ids),
-            mlx::core::expand_dims(
-                arena.expert_weight(0, '1').matmul(hidden),
-                1));
+            current_weights.gate_up.swiglu(hidden, ids, 0.0f),
+            mfq::metal::moe_limited_swiglu_split(
+                mlx::core::concatenate(
+                    {gate_reference, up_reference},
+                    -1),
+                0.0f));
         const auto next_begin = std::chrono::steady_clock::now();
         static_cast<void>(next.wait());
         const auto next_wait_seconds = std::chrono::duration<double>(
