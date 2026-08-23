@@ -171,6 +171,7 @@ void test_grouped_mxfp8() {
                 expected_second.data<float>()[index]) < 2e-4f,
             "grouped MXFP8 second projection mismatch");
     }
+
 }
 
 void test_grouped_mxfp8_swiglu() {
@@ -210,6 +211,41 @@ void test_grouped_mxfp8_swiglu() {
         require(
             std::fabs(actual.data<float>()[index] - expected) < 2e-3f,
             "grouped MXFP8 SwiGLU value mismatch");
+    }
+
+    auto bfloat_input = astype(
+        array(values.begin(), Shape{1, inputs}),
+        bfloat16);
+    require(
+        grouped.supports_single_row_swiglu(bfloat_input),
+        "grouped MXFP8 BF16 SwiGLU fast path was not selected");
+    auto bfloat_gate_expected = astype(
+        gate.matmul(bfloat_input),
+        float32);
+    auto bfloat_up_expected = astype(
+        up.matmul(bfloat_input),
+        float32);
+    auto bfloat_actual = astype(
+        grouped.single_row_swiglu(bfloat_input, 0.0f),
+        float32);
+    eval(
+        bfloat_gate_expected,
+        bfloat_up_expected,
+        bfloat_actual);
+    for (std::size_t index = 0;
+         index < bfloat_actual.size();
+         ++index) {
+        const float gate_value =
+            bfloat_gate_expected.data<float>()[index];
+        const float up_value =
+            bfloat_up_expected.data<float>()[index];
+        const float expected =
+            gate_value / (1.0f + std::exp(-gate_value)) * up_value;
+        require(
+            std::fabs(
+                bfloat_actual.data<float>()[index] - expected)
+                < 2e-2f,
+            "grouped MXFP8 BF16 SwiGLU value mismatch");
     }
 }
 

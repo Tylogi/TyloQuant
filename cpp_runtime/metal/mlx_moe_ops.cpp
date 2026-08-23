@@ -162,9 +162,10 @@ constexpr const char* kDenseRouterTopKSource = R"METAL(
             column += 128u
         ) {
             float4 activation = float4(
-                *(device const half4*)(input + column));
+                *(device const activation4_t*)(input + column));
             float4 values = float4(
-                *(device const half4*)(weight + weight_base + column));
+                *(device const activation4_t*)(
+                    weight + weight_base + column));
             accumulator += dot(activation, values);
         }
         float raw = simd_sum(accumulator);
@@ -376,14 +377,14 @@ mlx::core::fast::CustomKernelFunction make_kernel(
     const char* name,
     std::vector<std::string> inputs,
     std::vector<std::string> outputs,
-    const char* source) {
+    std::string source) {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
     return mlx::core::fast::metal_kernel(
         name,
         std::move(inputs),
         std::move(outputs),
-        source,
+        std::move(source),
         "",
         true,
         false,
@@ -400,13 +401,22 @@ const mlx::core::fast::CustomKernelFunction& top_k_kernel() {
 }
 
 const mlx::core::fast::CustomKernelFunction&
-dense_router_top_k_kernel() {
-    static const auto kernel = make_kernel(
-        "mfq_cpp_moe_dense_router_topk",
+dense_router_top_k_kernel(mlx::core::Dtype dtype) {
+    static const auto fp16_kernel = make_kernel(
+        "mfq_cpp_moe_dense_router_topk_f16",
         {"input", "weight", "bias", "available", "params"},
         {"ids", "weights"},
-        kDenseRouterTopKSource);
-    return kernel;
+        std::string("using activation4_t = half4;\n") +
+            kDenseRouterTopKSource);
+    static const auto bf16_kernel = make_kernel(
+        "mfq_cpp_moe_dense_router_topk_bf16",
+        {"input", "weight", "bias", "available", "params"},
+        {"ids", "weights"},
+        std::string("using activation4_t = bfloat4;\n") +
+            kDenseRouterTopKSource);
+    return dtype == mlx::core::bfloat16
+        ? bf16_kernel
+        : fp16_kernel;
 }
 
 const mlx::core::fast::CustomKernelFunction&
@@ -698,14 +708,17 @@ MlxMoeTopKResult moe_topk(
 bool moe_dense_router_topk_supported(
     const array& input,
     const array& weight) noexcept {
+    const bool activation16 =
+        input.dtype() == mlx::core::float16 ||
+        input.dtype() == mlx::core::bfloat16;
     return input.ndim() > 0
-        && input.dtype() == mlx::core::float16
+        && activation16
         && input.size() == static_cast<std::size_t>(
             input.shape(-1))
         && input.shape(-1) > 0
         && (input.shape(-1) % 4) == 0
         && weight.ndim() == 2
-        && weight.dtype() == mlx::core::float16
+        && weight.dtype() == input.dtype()
         && weight.shape(0) == 256
         && weight.shape(1) == input.shape(-1);
 }
@@ -719,8 +732,8 @@ MlxMoeTopKResult moe_dense_router_topk(
     float scale) {
     if (!moe_dense_router_topk_supported(input, weight)) {
         throw std::invalid_argument(
-            "fused dense router requires one FP16 row and a "
-            "contiguous [256,K] FP16 weight with K divisible by four");
+            "fused dense router requires one FP16/BF16 row and a "
+            "matching contiguous [256,K] weight with K divisible by four");
     }
     if (!std::isfinite(norm_floor) || norm_floor < 0.0f ||
         !std::isfinite(scale)) {
@@ -760,7 +773,7 @@ MlxMoeTopKResult moe_dense_router_topk(
     const array params(
         {norm_floor, scale},
         mlx::core::float32);
-    auto outputs = dense_router_top_k_kernel()(
+    auto outputs = dense_router_top_k_kernel(source.dtype())(
         {
             source,
             weights,

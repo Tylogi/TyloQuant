@@ -301,6 +301,60 @@ void test_fused_dense_router_topk() {
             reference_weights[route],
             8e-4f);
     }
+
+    auto bfloat_input = mlx::core::contiguous(
+        mlx::core::astype(
+            array(input_values.begin(), Shape{1, width}),
+            mlx::core::bfloat16));
+    auto bfloat_weight = mlx::core::contiguous(
+        mlx::core::astype(
+            array(weight_values.begin(), Shape{experts, width}),
+            mlx::core::bfloat16));
+    require(
+        mfq::metal::moe_dense_router_topk_supported(
+            bfloat_input,
+            bfloat_weight),
+        "valid BF16 fused dense router shape was rejected");
+    auto bfloat_logits = mlx::core::matmul(
+        mlx::core::astype(
+            bfloat_input,
+            mlx::core::float32),
+        mlx::core::transpose(
+            mlx::core::astype(
+                bfloat_weight,
+                mlx::core::float32)));
+    auto bfloat_reference = mfq::metal::moe_topk(
+        bfloat_logits,
+        routes,
+        false,
+        true,
+        true,
+        false,
+        bias_array,
+        available_array,
+        1e-20f,
+        1.5f);
+    auto bfloat_fused = mfq::metal::moe_dense_router_topk(
+        bfloat_input,
+        bfloat_weight,
+        bias_array,
+        available_array,
+        1e-20f,
+        1.5f);
+    require(
+        integers(bfloat_fused.ids) ==
+            integers(bfloat_reference.ids),
+        "BF16 fused dense router selected different experts");
+    const auto bfloat_reference_weights =
+        floats(bfloat_reference.weights);
+    const auto bfloat_fused_weights =
+        floats(bfloat_fused.weights);
+    for (int route = 0; route < routes; ++route) {
+        require_close(
+            bfloat_fused_weights[route],
+            bfloat_reference_weights[route],
+            2e-3f);
+    }
 }
 
 void test_sqrtsoftplus_weights() {
