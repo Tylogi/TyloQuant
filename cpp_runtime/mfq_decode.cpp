@@ -9661,6 +9661,9 @@ static mfq_tensor_backend::Tensor dequant_nint8_zero_cpu(const Nint8ZeroCpu & so
     return result.contiguous();
 }
 
+static mfq_tensor_backend::Tensor dequant_nint_dense_f32(
+    const NintWeight & weight);
+
 static mfq_tensor_backend::Tensor load_dense_gpu(const MfqFile & mfq, const std::string & name) {
     MfqCudaGuard guard(
         active_weight_load_device());
@@ -9685,6 +9688,19 @@ static mfq_tensor_backend::Tensor load_dense_gpu(const MfqFile & mfq, const std:
                 "NINT8-0 dense tensor shape mismatch: " + name);
         }
         return dense;
+    }
+    if (rec.dtype != "NINTM" && rec.dtype.rfind("NINT", 0) == 0) {
+        auto dense = dequant_nint_dense_f32(load_nint_gpu(mfq, name));
+        return g_loading_cpu_layer
+            ? dense.cpu().contiguous()
+            : dense;
+    }
+    if (rec.dtype != "F32" && rec.dtype != "BF16" &&
+            rec.dtype != "F16" && rec.dtype != "I64" &&
+            rec.dtype != "I32") {
+        throw std::runtime_error(
+            "unsupported dense dtype for C++ runtime: " + rec.dtype +
+            " tensor " + name);
     }
     size_t off = 0;
     uint32_t ndim = read_u32_from(blob, off);
@@ -18009,6 +18025,321 @@ struct TextSessionState {
     uint64_t last_used = 0;
 };
 
+using CudaPagedPayload =
+    std::shared_ptr<const std::vector<uint8_t>>;
+
+class CudaPagedWriter {
+public:
+    template <typename T>
+    void scalar(T value) {
+        using Unsigned = std::make_unsigned_t<T>;
+        const auto converted = static_cast<Unsigned>(value);
+        for (size_t index = 0; index < sizeof(T); ++index) {
+            bytes_.push_back(static_cast<uint8_t>(
+                converted >> (index * 8)));
+        }
+    }
+
+    void raw(const void * data, size_t size) {
+        const auto * begin = static_cast<const uint8_t *>(data);
+        bytes_.insert(bytes_.end(), begin, begin + size);
+    }
+
+    void tensor(const mfq_tensor_backend::Tensor & source) {
+        if (!source.defined() || !source.is_cuda() ||
+                source.dim() <= 0 || source.dim() > 8) {
+            throw std::runtime_error(
+                "invalid CUDA paged cache tensor");
+        }
+        const auto dtype = source.scalar_type();
+        if (dtype != mfq_tensor_backend::kFloat16 &&
+                dtype != mfq_tensor_backend::kBFloat16 &&
+                dtype != mfq_tensor_backend::kFloat32) {
+            throw std::runtime_error(
+                "unsupported CUDA paged cache tensor dtype");
+        }
+        // Device-to-host copies require contiguous device storage. Cache
+        // blocks are narrow views along the sequence dimension, so stage the
+        // view on its source device before transferring it to host memory.
+        const auto cpu = source.contiguous().to(mfq_tensor_backend::kCPU);
+        scalar<int32_t>(static_cast<int32_t>(dtype));
+        scalar<int32_t>(source.get_device());
+        scalar<uint32_t>(static_cast<uint32_t>(cpu.dim()));
+        scalar<uint32_t>(0);
+        for (const auto dimension : cpu.sizes()) scalar<int64_t>(dimension);
+        const auto bytes = static_cast<uint64_t>(
+            cpu.numel() * cpu.element_size());
+        scalar<uint64_t>(bytes);
+        raw(cpu.data_ptr(), static_cast<size_t>(bytes));
+    }
+
+    CudaPagedPayload finish() && {
+        return std::make_shared<const std::vector<uint8_t>>(
+            std::move(bytes_));
+    }
+
+private:
+    std::vector<uint8_t> bytes_;
+};
+
+class CudaPagedReader {
+public:
+    explicit CudaPagedReader(const std::vector<uint8_t> & bytes)
+        : cursor_(bytes.data()), end_(bytes.data() + bytes.size()) {}
+
+    template <typename T>
+    T scalar(const char * name) {
+        if (remaining() < sizeof(T)) {
+            throw std::runtime_error(
+                std::string("truncated CUDA paged cache ") + name);
+        }
+        using Unsigned = std::make_unsigned_t<T>;
+        Unsigned value = 0;
+        for (size_t index = 0; index < sizeof(T); ++index) {
+            value |= static_cast<Unsigned>(cursor_[index]) << (index * 8);
+        }
+        cursor_ += sizeof(T);
+        return static_cast<T>(value);
+    }
+
+    void raw(void * destination, size_t size, const char * name) {
+        if (remaining() < size) {
+            throw std::runtime_error(
+                std::string("truncated CUDA paged cache ") + name);
+        }
+        std::memcpy(destination, cursor_, size);
+        cursor_ += size;
+    }
+
+    std::pair<mfq_tensor_backend::Tensor, int> tensor() {
+        const auto dtype_value = scalar<int32_t>("dtype");
+        const auto device = scalar<int32_t>("device");
+        const auto rank = scalar<uint32_t>("rank");
+        (void)scalar<uint32_t>("tensor flags");
+        if (rank == 0 || rank > 8 || device < 0) {
+            throw std::runtime_error(
+                "invalid CUDA paged cache tensor header");
+        }
+        const auto dtype = static_cast<mfq_tensor_backend::ScalarType>(dtype_value);
+        if (dtype != mfq_tensor_backend::kFloat16 &&
+                dtype != mfq_tensor_backend::kBFloat16 &&
+                dtype != mfq_tensor_backend::kFloat32) {
+            throw std::runtime_error(
+                "invalid CUDA paged cache tensor dtype");
+        }
+        std::vector<int64_t> shape;
+        shape.reserve(rank);
+        uint64_t elements = 1;
+        for (uint32_t index = 0; index < rank; ++index) {
+            const auto dimension = scalar<int64_t>("shape");
+            if (dimension <= 0 || elements >
+                    std::numeric_limits<uint64_t>::max() /
+                        static_cast<uint64_t>(dimension)) {
+                throw std::runtime_error(
+                    "invalid CUDA paged cache tensor shape");
+            }
+            shape.push_back(dimension);
+            elements *= static_cast<uint64_t>(dimension);
+        }
+        const auto bytes = scalar<uint64_t>("tensor size");
+        auto cpu = mfq_tensor_backend::empty(
+            shape,
+            mfq_tensor_backend::TensorOptions()
+                .device(mfq_tensor_backend::kCPU).dtype(dtype));
+        const auto expected = static_cast<uint64_t>(
+            cpu.numel() * cpu.element_size());
+        if (bytes != expected || bytes > remaining()) {
+            throw std::runtime_error(
+                "invalid CUDA paged cache tensor size");
+        }
+        raw(cpu.data_ptr(), static_cast<size_t>(bytes), "tensor");
+        return {std::move(cpu), device};
+    }
+
+    void expect_end() const {
+        if (cursor_ != end_) {
+            throw std::runtime_error(
+                "trailing CUDA paged cache payload bytes");
+        }
+    }
+
+private:
+    size_t remaining() const {
+        return static_cast<size_t>(end_ - cursor_);
+    }
+
+    const uint8_t * cursor_;
+    const uint8_t * end_;
+};
+
+struct CudaDecodedPagedLayer {
+    int64_t capacity = 0;
+    int device = -1;
+    mfq_tensor_backend::Tensor k;
+    mfq_tensor_backend::Tensor v;
+};
+
+struct CudaDecodedPagedBlock {
+    uint32_t start = 0;
+    uint32_t count = 0;
+    std::vector<CudaDecodedPagedLayer> layers;
+};
+
+static std::vector<CudaPagedPayload> encode_cuda_paged_session(
+        const TextSessionState & state,
+        size_t block_size,
+        size_t first_block) {
+    static constexpr std::array<uint8_t, 8> magic{
+        'M', 'F', 'Q', 'C', 'U', 'D', '1', 0};
+    if (state.kind != TextSessionStateKind::FullAttention ||
+            state.cache_pos <= 0 || state.blocks.empty() ||
+            state.tokens.size() != static_cast<size_t>(state.cache_pos)) {
+        throw std::runtime_error(
+            "CUDA session state is not block-sliceable");
+    }
+    const size_t full_blocks = state.tokens.size() / block_size;
+    if (first_block > full_blocks) {
+        throw std::runtime_error("invalid CUDA cache first block");
+    }
+    std::vector<CudaPagedPayload> result;
+    result.reserve(full_blocks - first_block);
+    for (size_t block_index = first_block;
+            block_index < full_blocks; ++block_index) {
+        const int64_t start = static_cast<int64_t>(block_index * block_size);
+        CudaPagedWriter writer;
+        writer.raw(magic.data(), magic.size());
+        writer.scalar<uint32_t>(1);
+        writer.scalar<uint32_t>(static_cast<uint32_t>(start));
+        writer.scalar<uint32_t>(static_cast<uint32_t>(block_size));
+        writer.scalar<uint32_t>(static_cast<uint32_t>(state.blocks.size()));
+        for (const auto & layer : state.blocks) {
+            if (layer.ring || layer.capacity <= 0 ||
+                    !layer.k.defined() || !layer.v.defined() ||
+                    layer.k.dim() != 4 || layer.v.sizes() != layer.k.sizes() ||
+                    layer.k.size(2) < start + static_cast<int64_t>(block_size)) {
+                throw std::runtime_error(
+                    "CUDA session layer cannot be block-sliced");
+            }
+            writer.scalar<int64_t>(layer.capacity);
+            writer.tensor(layer.k.narrow(
+                2, start, static_cast<int64_t>(block_size)));
+            writer.tensor(layer.v.narrow(
+                2, start, static_cast<int64_t>(block_size)));
+        }
+        result.push_back(std::move(writer).finish());
+    }
+    return result;
+}
+
+static CudaDecodedPagedBlock decode_cuda_paged_block(
+        const std::vector<uint8_t> & payload) {
+    static constexpr std::array<uint8_t, 8> magic{
+        'M', 'F', 'Q', 'C', 'U', 'D', '1', 0};
+    CudaPagedReader reader(payload);
+    std::array<uint8_t, 8> found_magic{};
+    reader.raw(found_magic.data(), found_magic.size(), "magic");
+    if (found_magic != magic || reader.scalar<uint32_t>("version") != 1) {
+        throw std::runtime_error(
+            "unsupported CUDA paged cache payload");
+    }
+    CudaDecodedPagedBlock block;
+    block.start = reader.scalar<uint32_t>("start");
+    block.count = reader.scalar<uint32_t>("count");
+    const auto layer_count = reader.scalar<uint32_t>("layer count");
+    if (block.count == 0 || layer_count == 0 || layer_count > 4096) {
+        throw std::runtime_error(
+            "invalid CUDA paged cache geometry");
+    }
+    block.layers.reserve(layer_count);
+    for (uint32_t index = 0; index < layer_count; ++index) {
+        CudaDecodedPagedLayer layer;
+        layer.capacity = reader.scalar<int64_t>("capacity");
+        auto key = reader.tensor();
+        auto value = reader.tensor();
+        if (key.second != value.second || key.first.dim() != 4 ||
+                value.first.sizes() != key.first.sizes() ||
+                key.first.size(2) != static_cast<int64_t>(block.count)) {
+            throw std::runtime_error(
+                "invalid CUDA paged cache layer");
+        }
+        layer.device = key.second;
+        layer.k = std::move(key.first);
+        layer.v = std::move(value.first);
+        block.layers.push_back(std::move(layer));
+    }
+    reader.expect_end();
+    return block;
+}
+
+static TextSessionState decode_cuda_paged_session(
+        const std::vector<std::vector<uint8_t>> & payloads,
+        const std::vector<int64_t> & tokens,
+        size_t block_size) {
+    if (payloads.empty() || tokens.size() != payloads.size() * block_size) {
+        throw std::runtime_error(
+            "CUDA paged cache chain length mismatch");
+    }
+    std::vector<CudaDecodedPagedBlock> blocks;
+    blocks.reserve(payloads.size());
+    size_t expected_start = 0;
+    size_t layer_count = 0;
+    for (const auto & payload : payloads) {
+        auto block = decode_cuda_paged_block(payload);
+        if (block.start != expected_start || block.count != block_size ||
+                (layer_count != 0 && block.layers.size() != layer_count)) {
+            throw std::runtime_error(
+                "incompatible CUDA paged cache chain");
+        }
+        expected_start += block.count;
+        layer_count = block.layers.size();
+        blocks.push_back(std::move(block));
+    }
+    TextSessionState state;
+    state.tokens = tokens;
+    state.kind = TextSessionStateKind::FullAttention;
+    state.cache_pos = static_cast<int64_t>(tokens.size());
+    state.blocks.reserve(layer_count);
+    for (size_t layer_index = 0; layer_index < layer_count; ++layer_index) {
+        const auto & final = blocks.back().layers[layer_index];
+        std::vector<mfq_tensor_backend::Tensor> keys;
+        std::vector<mfq_tensor_backend::Tensor> values;
+        keys.reserve(blocks.size());
+        values.reserve(blocks.size());
+        for (const auto & block : blocks) {
+            const auto & layer = block.layers[layer_index];
+            if (layer.capacity != final.capacity ||
+                    layer.device != final.device ||
+                    layer.k.scalar_type() != final.k.scalar_type() ||
+                    layer.k.size(0) != final.k.size(0) ||
+                    layer.k.size(1) != final.k.size(1) ||
+                    layer.k.size(3) != final.k.size(3)) {
+                throw std::runtime_error(
+                    "inconsistent CUDA paged cache topology");
+            }
+            keys.push_back(layer.k);
+            values.push_back(layer.v);
+        }
+        auto key = mfq_tensor_backend::cat(keys, 2).contiguous();
+        auto value = mfq_tensor_backend::cat(values, 2).contiguous();
+        MfqCudaGuard guard(final.device);
+        const auto options = key.options().device(
+            mfq_tensor_backend::Device(
+                mfq_tensor_backend::kCUDA, final.device));
+        key = key.to(options, true, false).contiguous();
+        value = value.to(options, true, false).contiguous();
+        state.bytes += static_cast<size_t>(
+            key.numel() * key.element_size() +
+            value.numel() * value.element_size());
+        state.blocks.push_back(FullBlockSessionState{
+            std::move(key),
+            std::move(value),
+            final.capacity,
+            false,
+        });
+    }
+    return state;
+}
+
 static size_t session_tensor_bytes(const mfq_tensor_backend::Tensor & tensor) {
     if (!tensor.defined()) return 0;
     return static_cast<size_t>(tensor.numel()) * tensor.element_size();
@@ -23074,10 +23405,13 @@ static int run_nintm_tensor_check(
         dense_reference_max_abs =
             difference.abs().max().item<double>();
     }
-    auto flat = output.to(mfq_tensor_backend::kFloat32).cpu().reshape({-1});
-    if (!mfq_tensor_backend::isfinite(flat).all().item<bool>()) {
+    auto output_f32 = output.to(mfq_tensor_backend::kFloat32);
+    if (!mfq_tensor_backend::isfinite(output_f32).all().item<bool>()) {
         throw std::runtime_error("NINTM tensor check produced a non-finite value");
     }
+    const double checksum = output_f32.sum().item<double>();
+    const double squared_checksum = output_f32.square().sum().item<double>();
+    auto flat = output_f32.cpu().reshape({-1});
     std::cout << std::fixed << std::setprecision(9)
               << "nintm_tensor_check"
               << " tensor=" << tensor_name
@@ -23094,8 +23428,8 @@ static int run_nintm_tensor_check(
               << " dense_reference_rel=" << dense_reference_rel
               << " dense_reference_mean_abs=" << dense_reference_mean_abs
               << " dense_reference_max_abs=" << dense_reference_max_abs
-              << " checksum=" << flat.sum().item<double>()
-              << " sqsum=" << flat.square().sum().item<double>()
+              << " checksum=" << checksum
+              << " sqsum=" << squared_checksum
               << " values=";
     const int64_t shown = std::min<int64_t>(flat.numel(), 128);
     const float * values = flat.data_ptr<float>();

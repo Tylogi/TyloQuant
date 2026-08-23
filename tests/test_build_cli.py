@@ -207,7 +207,7 @@ def test_native_cuda_buffer_retains_its_selected_stream() -> None:
     assert "StreamHandle stream_;" in buffer_class
     assert "std::shared_ptr<Stream>(context, stream)" in source
     assert "stream_ = current_stream(context_->device());" in source
-    assert "context_->release(data_, stream_.stream());" in source
+    assert "context_->release(data_, bytes_, stream_.stream());" in source
 
 
 def test_double_dash_arguments_are_forwarded_without_the_separator(monkeypatch) -> None:

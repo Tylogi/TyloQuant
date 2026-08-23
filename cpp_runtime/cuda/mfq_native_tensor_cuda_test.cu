@@ -63,6 +63,13 @@ int main() {
     using namespace mfq::cuda;
     const Device cuda_device{DeviceType::cuda, 0};
 
+    auto empty_host_blob = from_blob(
+        static_cast<void*>(nullptr), {0}, TensorOptions{}.dtype(kFloat32));
+    auto empty_device_blob = empty_host_blob.clone().to(cuda_device);
+    require(
+        empty_device_blob.defined() && empty_device_blob.numel() == 0,
+        "empty null blob CUDA transfer");
+
     auto input = tensor<float>({1, 2, 3, 4, 5, 6})
         .reshape({2, 3})
         .to(cuda_device);
@@ -74,6 +81,9 @@ int main() {
     const auto reduced = host_values(elementwise.sum(1));
     require_close(reduced[0], 36.0f, 0.0f, "row reduction zero");
     require_close(reduced[1], 63.0f, 0.0f, "row reduction one");
+    const auto row_means = host_values(elementwise.mean(1, true));
+    require_close(row_means[0], 12.0f, 0.0f, "row mean zero");
+    require_close(row_means[1], 21.0f, 0.0f, "row mean one");
 
     auto bf16_argmax_input = tensor<float>({1, 5, 5, 2, 7, 3, 7, 7})
         .reshape({2, 4})

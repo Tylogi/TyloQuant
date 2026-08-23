@@ -17,6 +17,20 @@ int main() {
     values.fill_(3.0);
     assert(values.data_ptr<float>()[17] == 3.0f);
 
+    auto empty_blob = from_blob(
+        static_cast<void*>(nullptr), {0}, TensorOptions{}.dtype(kFloat32));
+    assert(empty_blob.defined());
+    assert(empty_blob.numel() == 0);
+    assert(empty_blob.clone().numel() == 0);
+    bool rejected_null_nonempty = false;
+    try {
+        (void)from_blob(
+            static_cast<void*>(nullptr), {1}, TensorOptions{}.dtype(kFloat32));
+    } catch (const std::invalid_argument&) {
+        rejected_null_nonempty = true;
+    }
+    assert(rejected_null_nonempty);
+
     const auto reshaped = values.reshape({4, 6});
     assert(reshaped.size(0) == 4);
     assert(reshaped.size(1) == 6);

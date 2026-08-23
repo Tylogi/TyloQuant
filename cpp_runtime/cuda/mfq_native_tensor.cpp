@@ -171,6 +171,7 @@ void copy_contiguous_cpu(Tensor& destination, const Tensor& source) {
         destination.numel() != source.numel()) {
         throw std::invalid_argument("CPU copy shape mismatch");
     }
+    if (source.numel() == 0) return;
     if (destination.scalar_type() == source.scalar_type() &&
         destination.is_contiguous() && source.is_contiguous()) {
         std::memcpy(destination.data_ptr(), source.data_ptr(), destination.nbytes());
@@ -790,11 +791,11 @@ Tensor from_blob(
     void* data,
     std::span<const std::int64_t> shape,
     const TensorOptions& options) {
-    if (data == nullptr) {
-        throw std::invalid_argument("from_blob requires non-null storage");
-    }
     auto descriptor = make_contiguous_view(
         data, shape, options.scalar_type(), options.target_device());
+    if (data == nullptr && descriptor.nbytes() != 0) {
+        throw std::invalid_argument("from_blob requires non-null storage");
+    }
     auto storage = std::make_shared<TensorStorage>();
     storage->base = data;
     storage->bytes = descriptor.nbytes();

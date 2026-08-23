@@ -837,6 +837,34 @@ __global__ void reduce_kernel(
 }
 
 template <int Threads>
+__global__ void row_mean_last_contiguous_f32_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    std::int64_t rows,
+    std::int64_t columns) {
+    const auto row = static_cast<std::int64_t>(blockIdx.x);
+    if (row >= rows) return;
+    float accumulator = 0.0f;
+    for (std::int64_t column = threadIdx.x;
+         column < columns;
+         column += Threads) {
+        accumulator += input[row * columns + column];
+    }
+    __shared__ float partial[Threads];
+    partial[threadIdx.x] = accumulator;
+    __syncthreads();
+    for (int offset = Threads / 2; offset > 0; offset /= 2) {
+        if (threadIdx.x < offset) {
+            partial[threadIdx.x] += partial[threadIdx.x + offset];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        output[row] = partial[0] / static_cast<float>(columns);
+    }
+}
+
+template <int Threads>
 __global__ void argmax_last_contiguous_bf16_kernel(
     const __nv_bfloat16* input,
     std::int64_t* output,
@@ -1022,6 +1050,22 @@ Tensor reduce_cuda(
         reduction_type(source.scalar_type(), operation)));
     const auto outer = output.numel();
     const auto stream = current_stream(source.get_device()).stream();
+    const char* disable_parallel_f32_mean =
+        std::getenv("MFQ_DISABLE_NATIVE_PARALLEL_F32_MEAN");
+    if (operation == 1 &&
+        source.scalar_type() == kFloat32 &&
+        source.is_contiguous() &&
+        selected + 1 == static_cast<std::size_t>(source.dim()) &&
+        outer <= std::numeric_limits<unsigned int>::max() &&
+        (disable_parallel_f32_mean == nullptr ||
+         disable_parallel_f32_mean[0] != '1')) {
+        constexpr int threads = 256;
+        row_mean_last_contiguous_f32_kernel<threads>
+            <<<static_cast<unsigned int>(outer), threads, 0, stream>>>(
+                source.data_ptr<float>(), output.data_ptr<float>(), outer, reduced);
+        MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
+        return output;
+    }
     if (operation == 3 &&
         source.scalar_type() == kBFloat16 &&
         source.is_contiguous() &&

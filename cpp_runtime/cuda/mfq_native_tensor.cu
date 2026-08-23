@@ -364,6 +364,7 @@ void copy_cuda(Tensor& destination, const Tensor& source) {
     if (!destination.is_cuda() && !source.is_cuda()) {
         throw std::invalid_argument("copy_cuda requires at least one CUDA tensor");
     }
+    if (source.numel() == 0) return;
     const auto device = destination.is_cuda() ? destination.device().index : source.device().index;
     auto context = default_context(device);
     const auto stream = current_stream(device);
