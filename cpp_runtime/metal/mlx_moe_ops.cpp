@@ -143,77 +143,123 @@ constexpr const char* kDenseRouterTopKSource = R"METAL(
     constexpr uint EXPERTS = 256u;
     constexpr uint TOP_K = 6u;
     constexpr uint SIMD_GROUPS = 32u;
+    constexpr uint EXPERTS_PER_SIMD = 4u;
+    constexpr uint EXPERTS_PER_ROUND = SIMD_GROUPS * EXPERTS_PER_SIMD;
 
     uint tid = thread_index_in_threadgroup;
     uint lane = thread_index_in_simdgroup;
     uint simd_group = simdgroup_index_in_threadgroup;
+    threadgroup activation_t cached_input[K];
     threadgroup float route_weights[EXPERTS];
     threadgroup float scores[EXPERTS];
+    threadgroup float topk_weights[TOP_K];
+    threadgroup float partial_scores[8];
+    threadgroup uint partial_ids[8];
 
-    // One SIMD group consumes one row at a time.  Eight rounds cover all 256
-    // experts while every weight and activation load remains contiguous.
-    for (uint round = 0u; round < 8u; ++round) {
-        uint expert = round * SIMD_GROUPS + simd_group;
-        uint weight_base = expert * uint(K);
-        float accumulator = 0.0f;
+    // All 256 router rows consume the same activation. Load its 8 KiB once
+    // instead of issuing the identical device reads from every SIMD group.
+    for (uint column = tid * 4u; column < uint(K); column += 4096u) {
+        *(threadgroup activation4_t*)(cached_input + column) =
+            *(device const activation4_t*)(input + column);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each SIMD group consumes multiple rows at a time, and one cached
+    // activation load feeds every row accumulator in the tile.
+    for (uint round = 0u;
+         round < EXPERTS / EXPERTS_PER_ROUND;
+         ++round) {
+        uint expert_base = round * EXPERTS_PER_ROUND
+            + simd_group * EXPERTS_PER_SIMD;
+        float accumulators[EXPERTS_PER_SIMD] = {0.0f};
         for (
             uint column = lane * 4u;
             column < uint(K);
             column += 128u
         ) {
             float4 activation = float4(
-                *(device const activation4_t*)(input + column));
-            float4 values = float4(
-                *(device const activation4_t*)(
-                    weight + weight_base + column));
-            accumulator += dot(activation, values);
+                *(threadgroup activation4_t*)(cached_input + column));
+            for (uint local = 0u; local < EXPERTS_PER_SIMD; ++local) {
+                uint weight_base = (expert_base + local) * uint(K);
+                float4 values = float4(
+                    *(device const activation4_t*)(
+                        weight + weight_base + column));
+                accumulators[local] += dot(activation, values);
+            }
         }
-        float raw = simd_sum(accumulator);
-        if (lane == 0u) {
-            // DeepSeek-V4 routes from x.float() @ weight.float().  Keep the
-            // SIMD reduction in FP32: rounding router logits to FP16 here can
-            // change the discrete top-k expert set.
-            raw = isnan(raw) ? -FLT_MAX : raw;
-            float softplus = raw > 20.0f ? raw : log1p(exp(raw));
-            float route_weight = sqrt(softplus);
-            route_weights[expert] = route_weight;
-            scores[expert] = (
-                HAS_AVAILABLE == 0 || available[expert]
-            )
-                ? route_weight
-                    + (HAS_BIAS != 0 ? bias[expert] : 0.0f)
-                : -INFINITY;
+        for (uint local = 0u; local < EXPERTS_PER_SIMD; ++local) {
+            float raw = simd_sum(accumulators[local]);
+            if (lane == 0u) {
+                uint expert = expert_base + local;
+                // DeepSeek-V4 routes from x.float() @ weight.float(). Keep
+                // each expert's SIMD reduction in the original FP32 order.
+                raw = isnan(raw) ? -FLT_MAX : raw;
+                float softplus = raw > 20.0f ? raw : log1p(exp(raw));
+                float route_weight = sqrt(softplus);
+                route_weights[expert] = route_weight;
+                scores[expert] = (
+                    HAS_AVAILABLE == 0 || available[expert]
+                )
+                    ? route_weight
+                        + (HAS_BIAS != 0 ? bias[expert] : 0.0f)
+                    : -INFINITY;
+            }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid == 0u) {
-        float selected_weights[TOP_K];
-        for (uint rank = 0u; rank < TOP_K; ++rank) {
-            float best_score = -INFINITY;
-            uint best_expert = EXPERTS;
-            for (uint expert = 0u; expert < EXPERTS; ++expert) {
-                float score = scores[expert];
-                if (
-                    score > best_score
-                    || (score == best_score && expert < best_expert)
-                ) {
+    // The first eight SIMD groups reduce the 256 scores in parallel. The
+    // score/ID comparator exactly preserves the original stable tie-break.
+    for (uint rank = 0u; rank < TOP_K; ++rank) {
+        if (simd_group < 8u) {
+            uint candidate_id = tid;
+            float candidate_score = scores[candidate_id];
+            for (uint offset = 16u; offset > 0u; offset >>= 1u) {
+                float other_score = simd_shuffle_down(
+                    candidate_score, offset);
+                uint other_id = simd_shuffle_down(candidate_id, offset);
+                if (lane + offset < 32u &&
+                    (other_score > candidate_score ||
+                     (other_score == candidate_score &&
+                      other_id < candidate_id))) {
+                    candidate_score = other_score;
+                    candidate_id = other_id;
+                }
+            }
+            if (lane == 0u) {
+                partial_scores[simd_group] = candidate_score;
+                partial_ids[simd_group] = candidate_id;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            float best_score = partial_scores[0];
+            uint best_expert = partial_ids[0];
+            for (uint group = 1u; group < 8u; ++group) {
+                float score = partial_scores[group];
+                uint expert = partial_ids[group];
+                if (score > best_score ||
+                    (score == best_score && expert < best_expert)) {
                     best_score = score;
                     best_expert = expert;
                 }
             }
             ids[rank] = int(best_expert);
-            selected_weights[rank] = route_weights[best_expert];
+            topk_weights[rank] = route_weights[best_expert];
             scores[best_expert] = -INFINITY;
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
         float denominator = 0.0f;
         for (uint rank = 0u; rank < TOP_K; ++rank) {
-            denominator += selected_weights[rank];
+            denominator += topk_weights[rank];
         }
         denominator = max(denominator, params[0]);
         for (uint rank = 0u; rank < TOP_K; ++rank) {
             weights[rank] =
-                selected_weights[rank] / denominator * params[1];
+                topk_weights[rank] / denominator * params[1];
         }
     }
 )METAL";
@@ -406,13 +452,17 @@ dense_router_top_k_kernel(mlx::core::Dtype dtype) {
         "mfq_cpp_moe_dense_router_topk_f16",
         {"input", "weight", "bias", "available", "params"},
         {"ids", "weights"},
-        std::string("using activation4_t = half4;\n") +
+        std::string(
+            "using activation_t = half;\n"
+            "using activation4_t = half4;\n") +
             kDenseRouterTopKSource);
     static const auto bf16_kernel = make_kernel(
         "mfq_cpp_moe_dense_router_topk_bf16",
         {"input", "weight", "bias", "available", "params"},
         {"ids", "weights"},
-        std::string("using activation4_t = bfloat4;\n") +
+        std::string(
+            "using activation_t = bfloat;\n"
+            "using activation4_t = bfloat4;\n") +
             kDenseRouterTopKSource);
     return dtype == mlx::core::bfloat16
         ? bf16_kernel

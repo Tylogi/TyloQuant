@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -66,6 +67,7 @@ private:
 
     mlx::core::array values_;
     mlx::core::array scales_;
+    std::optional<mlx::core::array> expanded_mxfp8_scales_;
     int bits_ = 0;
     int input_size_ = 0;
     int output_size_ = 0;

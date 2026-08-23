@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -503,7 +504,26 @@ MlxMxWeight::MlxMxWeight(
       scales_(std::move(scales)),
       bits_(bits),
       input_size_(input_size),
-      output_size_(output_size) {}
+      output_size_(output_size) {
+    const auto* native_env = std::getenv("MFQ_METAL_MXFP8_NATIVE_QMV");
+    const bool native_enabled = native_env == nullptr ||
+        std::string_view(native_env) != "0";
+    if (bits_ == 8 && native_enabled) {
+        // MLX's native MXFP8 kernels use one E8M0 scale per output row and
+        // 32 input columns. Official block-FP8 checkpoints store the same
+        // scale on a 128x128 grid, so expand only the tiny scale sidecar once
+        // while leaving the FP8 payload zero-copy.
+        auto expanded = mlx::core::repeat(scales_, 4, 1);
+        expanded = mlx::core::repeat(expanded, 128, 0);
+        if (expanded.shape(0) != output_size_) {
+            expanded = mlx::core::slice(
+                expanded,
+                Shape{0, 0},
+                Shape{output_size_, input_size_ / 32});
+        }
+        expanded_mxfp8_scales_ = mlx::core::contiguous(std::move(expanded));
+    }
+}
 
 MlxMxWeight MlxMxWeight::from_blob(
     std::string_view dtype,
@@ -659,6 +679,23 @@ array MlxMxWeight::matmul(const array& input) const {
     source = mlx::core::reshape(
         source,
         Shape{static_cast<int>(rows), input_size_});
+    if (rows == 1 && bits_ == 8 &&
+        source.dtype() == mlx::core::float16 &&
+        expanded_mxfp8_scales_.has_value()) {
+        auto packed = mlx::core::reshape(
+            mlx::core::view(values_, mlx::core::uint32),
+            Shape{output_size_, input_size_ / 4});
+        auto result = mlx::core::quantized_matmul(
+            std::move(source),
+            std::move(packed),
+            *expanded_mxfp8_scales_,
+            std::nullopt,
+            true,
+            32,
+            8,
+            "mxfp8");
+        return mlx::core::reshape(std::move(result), std::move(output_shape));
+    }
     if (rows >= 64) {
         auto dense = dequantize(source.dtype());
         auto result = mlx::core::matmul(source, mlx::core::transpose(dense));

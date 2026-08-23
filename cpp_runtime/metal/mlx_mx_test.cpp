@@ -47,6 +47,20 @@ std::vector<std::uint8_t> make_blob(int bits, int outputs, int inputs) {
     return blob;
 }
 
+std::vector<std::uint8_t> make_block_scaled_mxfp8_blob() {
+    constexpr int outputs = 129;
+    constexpr int inputs = 256;
+    auto blob = make_blob(8, outputs, inputs);
+    constexpr std::size_t header_bytes = 4 + 1 + 1 + 2 + 8 * 6;
+    const std::size_t scale_offset =
+        header_bytes + static_cast<std::size_t>(outputs) * inputs;
+    blob[scale_offset + 0] = 126;
+    blob[scale_offset + 1] = 128;
+    blob[scale_offset + 2] = 127;
+    blob[scale_offset + 3] = 129;
+    return blob;
+}
+
 std::vector<std::uint8_t> make_q8_blob(int outputs, int inputs) {
     const int groups = inputs / 32;
     std::vector<std::uint8_t> blob{'N', 'I', '8', '0'};
@@ -126,6 +140,29 @@ void test_embedding(const std::string& dtype, int inputs) {
             output.data<float>()[index] == 1.0f,
             dtype + " Metal embedding value mismatch");
     }
+}
+
+void test_native_mxfp8_scale_expansion() {
+    using namespace mlx::core;
+    constexpr int outputs = 129;
+    constexpr int inputs = 256;
+    const auto weight = mfq::metal::MlxMxWeight::from_blob(
+        "MXFP8", make_block_scaled_mxfp8_blob());
+    std::vector<float> values(inputs, 1.0f);
+    auto output = astype(
+        weight.matmul(astype(
+            array(values.begin(), Shape{1, inputs}),
+            float16)),
+        float32);
+    eval(output);
+    require(
+        output.shape() == Shape{1, outputs},
+        "native MXFP8 scale expansion shape mismatch");
+    require(
+        output.data<float>()[0] == 320.0f &&
+            output.data<float>()[127] == 320.0f &&
+            output.data<float>()[128] == 640.0f,
+        "native MXFP8 scale expansion value mismatch");
 }
 
 void test_grouped_mxfp8() {
@@ -398,6 +435,7 @@ int main() {
         test_matmul("MXFP8", 128, 1, true);
         test_matmul("MXFP8", 128, 7);
         test_matmul("MXFP8", 128, 64);
+        test_native_mxfp8_scale_expansion();
         test_embedding("MXFP4", 96);
         test_embedding("MXFP8", 128);
         test_grouped_mxfp8();
