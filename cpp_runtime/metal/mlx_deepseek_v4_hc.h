@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include <mlx/mlx.h>
 
 namespace mfq::metal {
@@ -8,6 +10,7 @@ struct MlxDeepseekV4HcPreResult {
     mlx::core::array reduced;
     mlx::core::array post;
     mlx::core::array combination;
+    std::optional<mlx::core::array> packed_metadata;
 };
 
 // Reduce four DeepSeek-V4 hyper-connection streams to one branch input and
@@ -49,5 +52,18 @@ mlx::core::array deepseek_v4_hc_post_sum(
     const mlx::core::array& residual,
     const mlx::core::array& post,
     const mlx::core::array& combination);
+
+// Fast-path variant consuming the single packed FP32 metadata output from
+// deepseek_v4_hc_pre[_norm]. Layout: post[4], combination[4x4].
+mlx::core::array deepseek_v4_hc_post_packed(
+    const mlx::core::array& branch,
+    const mlx::core::array& residual,
+    const mlx::core::array& metadata);
+
+mlx::core::array deepseek_v4_hc_post_sum_packed(
+    const mlx::core::array& routed,
+    const mlx::core::array& shared,
+    const mlx::core::array& residual,
+    const mlx::core::array& metadata);
 
 } // namespace mfq::metal

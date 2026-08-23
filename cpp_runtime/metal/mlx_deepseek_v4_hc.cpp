@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -13,7 +14,6 @@ namespace mfq::metal {
 namespace {
 
 using mlx::core::CompileOptions;
-using mlx::core::MathMode;
 using mlx::core::Shape;
 using mlx::core::array;
 
@@ -33,6 +33,8 @@ constexpr const char* kHcPreSource = R"METAL(
     if (row >= uint(ROWS)) {
         return;
     }
+    device activation_t* reduced = (device activation_t*)packed;
+    device float* metadata = (device float*)(packed + uint(REDUCED_BYTES));
     threadgroup float pre[CONNECTIONS];
     threadgroup float reductions[8];
     threadgroup float mix_inverse_shared;
@@ -88,7 +90,7 @@ constexpr const char* kHcPreSource = R"METAL(
             2.0f / (1.0f + metal::fast::exp(-post_affine));
         if (lane < CONNECTIONS) {
             pre[lane] = pre_value;
-            post[row * CONNECTIONS + lane] = post_value;
+            metadata[row * 20u + lane] = post_value;
         }
 
         float4 normalized_values =
@@ -139,32 +141,32 @@ constexpr const char* kHcPreSource = R"METAL(
         }
         if (lane < CONNECTIONS) {
             *(device float4*)(
-                combination
-                    + row * CONNECTIONS * CONNECTIONS
+                metadata
+                    + row * 20u + CONNECTIONS
                     + lane * CONNECTIONS
             ) = probabilities;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    threadgroup half collapsed[HIDDEN];
+    threadgroup collapsed_t collapsed[HIDDEN];
     constexpr uint HIDDEN4 = uint(HIDDEN) / 4u;
-    const device half4* x0 = (const device half4*)(
+    const device activation4_t* x0 = (const device activation4_t*)(
         residual + (row * CONNECTIONS + 0u) * uint(HIDDEN)
     );
-    const device half4* x1 = (const device half4*)(
+    const device activation4_t* x1 = (const device activation4_t*)(
         residual + (row * CONNECTIONS + 1u) * uint(HIDDEN)
     );
-    const device half4* x2 = (const device half4*)(
+    const device activation4_t* x2 = (const device activation4_t*)(
         residual + (row * CONNECTIONS + 2u) * uint(HIDDEN)
     );
-    const device half4* x3 = (const device half4*)(
+    const device activation4_t* x3 = (const device activation4_t*)(
         residual + (row * CONNECTIONS + 3u) * uint(HIDDEN)
     );
-    device half4* reduced4 =
-        (device half4*)(reduced + row * uint(HIDDEN));
-    threadgroup half4* collapsed4 =
-        (threadgroup half4*)collapsed;
+    device activation4_t* reduced4 = (device activation4_t*)(
+        reduced + row * uint(HIDDEN));
+    threadgroup collapsed4_t* collapsed4 =
+        (threadgroup collapsed4_t*)collapsed;
     float square_sum = 0.0f;
     for (
         uint feature4 = local_thread;
@@ -181,11 +183,11 @@ constexpr const char* kHcPreSource = R"METAL(
                 )
             )
         );
-        half4 rounded = half4(value);
+        activation4_t rounded = activation4_t(value);
         if (NORMALIZE != 0) {
-            collapsed4[feature4] = rounded;
-            float4 rounded_float = float4(rounded);
-            square_sum += dot(rounded_float, rounded_float);
+            float4 norm_value = float4(rounded);
+            collapsed4[feature4] = collapsed4_t(norm_value);
+            square_sum += dot(norm_value, norm_value);
         } else {
             reduced4[feature4] = rounded;
         }
@@ -214,10 +216,9 @@ constexpr const char* kHcPreSource = R"METAL(
             feature4 < HIDDEN4;
             feature4 += 256u
         ) {
-            reduced4[feature4] = half4(
-                float4(collapsed4[feature4])
-                * inverse_rms
-                * norm4[feature4]);
+            float4 value = float4(collapsed4[feature4]);
+            reduced4[feature4] = activation4_t(
+                value * inverse_rms * norm4[feature4]);
         }
     }
 )METAL";
@@ -233,9 +234,12 @@ constexpr const char* kHcPostSource = R"METAL(
     uint row = destination_row / 4u;
     float residual_sum = 0.0f;
     for (uint source = 0u; source < 4u; ++source) {
-        residual_sum += combination[
-            (row * 4u + source) * 4u + destination
-        ] * float(residual[
+        uint combination_index =
+            (row * 4u + source) * 4u + destination;
+        float mixing = PACKED_META != 0
+            ? metadata[row * 20u + 4u + source * 4u + destination]
+            : combination[combination_index];
+        residual_sum += mixing * float(residual[
             (row * 4u + source) * uint(HIDDEN) + feature
         ]);
     }
@@ -247,51 +251,88 @@ constexpr const char* kHcPostSource = R"METAL(
             branch2[row * uint(HIDDEN) + feature]
         );
     }
-    float direct = post[row * 4u + destination]
+    float post_value = PACKED_META != 0
+        ? metadata[row * 20u + destination]
+        : post[row * 4u + destination];
+    float direct = post_value
         * branch_value;
-    output[index] = half(direct + residual_sum);
+    output[index] = output_activation_t(direct + residual_sum);
 )METAL";
 
 mlx::core::fast::CustomKernelFunction make_kernel(
     const char* name,
     std::vector<std::string> inputs,
     std::vector<std::string> outputs,
-    const char* source) {
+    std::string source) {
     CompileOptions options;
-    options.math_mode = MathMode::Fast;
+    options.math_mode = mlx::core::MathMode::Fast;
     return mlx::core::fast::metal_kernel(
         name,
         std::move(inputs),
         std::move(outputs),
-        source,
+        std::move(source),
         "",
         true,
         false,
         options);
 }
 
-const mlx::core::fast::CustomKernelFunction& hc_pre_kernel() {
-    static const auto kernel = make_kernel(
-        "mfq_cpp_dsv4_hc_pre",
+const mlx::core::fast::CustomKernelFunction& hc_pre_kernel(
+    mlx::core::Dtype dtype) {
+    static const auto fp16_kernel = make_kernel(
+        "mfq_cpp_dsv4_hc_pre_f16",
         {"residual", "mixes", "scale", "base", "norm", "params"},
-        {"reduced", "post", "combination"},
-        kHcPreSource);
-    return kernel;
+        {"packed"},
+        std::string(
+            "using activation_t = half;\n"
+            "using activation4_t = half4;\n"
+            "using collapsed_t = half;\n"
+            "using collapsed4_t = half4;\n") + kHcPreSource);
+    static const auto bf16_kernel = make_kernel(
+        "mfq_cpp_dsv4_hc_pre_bf16",
+        {"residual", "mixes", "scale", "base", "norm", "params"},
+        {"packed"},
+        std::string(
+            "using activation_t = bfloat;\n"
+            "using activation4_t = bfloat4;\n"
+            "using collapsed_t = bfloat;\n"
+            "using collapsed4_t = bfloat4;\n") + kHcPreSource);
+    return dtype == mlx::core::bfloat16
+        ? bf16_kernel
+        : fp16_kernel;
 }
 
-const mlx::core::fast::CustomKernelFunction& hc_post_kernel() {
-    static const auto kernel = make_kernel(
-        "mfq_cpp_dsv4_hc_post",
+const mlx::core::fast::CustomKernelFunction& hc_post_kernel(
+    mlx::core::Dtype dtype) {
+    static const auto fp16_kernel = make_kernel(
+        "mfq_cpp_dsv4_hc_post_f16",
         {
             "branch",
             "branch2",
             "residual",
             "post",
             "combination",
+            "metadata",
         },
         {"output"},
-        kHcPostSource);
-    return kernel;
+        std::string("using output_activation_t = half;\n") +
+            kHcPostSource);
+    static const auto bf16_kernel = make_kernel(
+        "mfq_cpp_dsv4_hc_post_bf16",
+        {
+            "branch",
+            "branch2",
+            "residual",
+            "post",
+            "combination",
+            "metadata",
+        },
+        {"output"},
+        std::string("using output_activation_t = bfloat;\n") +
+            kHcPostSource);
+    return dtype == mlx::core::bfloat16
+        ? bf16_kernel
+        : fp16_kernel;
 }
 
 int checked_int(std::size_t value, const char* name) {
@@ -305,9 +346,20 @@ int checked_int(std::size_t value, const char* name) {
     return static_cast<int>(value);
 }
 
-array float16_contiguous(const array& input) {
+array activation16_contiguous(const array& input) {
     auto result = input;
-    if (result.dtype() != mlx::core::float16) {
+    if (result.dtype() != mlx::core::float16 &&
+        result.dtype() != mlx::core::bfloat16) {
+        result = mlx::core::astype(result, mlx::core::float16);
+    }
+    return mlx::core::contiguous(result);
+}
+
+array floating_contiguous(const array& input) {
+    auto result = input;
+    if (result.dtype() != mlx::core::float16 &&
+        result.dtype() != mlx::core::bfloat16 &&
+        result.dtype() != mlx::core::float32) {
         result = mlx::core::astype(result, mlx::core::float16);
     }
     return mlx::core::contiguous(result);
@@ -327,15 +379,22 @@ array hc_post_impl(
     const array& residual,
     const array& post,
     const array& combination,
+    const std::optional<array>& packed_metadata,
     bool add_branch) {
-    auto branch_values = float16_contiguous(branch);
+    auto branch_values = floating_contiguous(branch);
     auto branch2_values = add_branch
-        ? float16_contiguous(branch2)
+        ? floating_contiguous(branch2)
         : branch_values;
-    auto residual_values = float16_contiguous(residual);
-    auto post_values = float32_contiguous(post);
-    auto combination_values =
-        float32_contiguous(combination);
+    auto residual_values = activation16_contiguous(residual);
+    auto metadata_values = packed_metadata.has_value()
+        ? float32_contiguous(*packed_metadata)
+        : float32_contiguous(post);
+    auto post_values = packed_metadata.has_value()
+        ? metadata_values
+        : float32_contiguous(post);
+    auto combination_values = packed_metadata.has_value()
+        ? metadata_values
+        : float32_contiguous(combination);
     if (branch_values.ndim() != 3 ||
         branch_values.shape(2) <= 0 ||
         branch2_values.shape() != branch_values.shape()) {
@@ -354,15 +413,18 @@ array hc_post_impl(
                 kConnections,
                 hidden,
             } ||
-        post_values.shape() !=
-            Shape{batch, tokens, kConnections} ||
-        combination_values.shape() !=
-            Shape{
-                batch,
-                tokens,
-                kConnections,
-                kConnections,
-            }) {
+        (packed_metadata.has_value()
+             ? metadata_values.shape() !=
+                   Shape{batch, tokens, kMixWidth - kConnections}
+             : post_values.shape() !=
+                       Shape{batch, tokens, kConnections} ||
+                   combination_values.shape() !=
+                       Shape{
+                           batch,
+                           tokens,
+                           kConnections,
+                           kConnections,
+                       })) {
         throw std::invalid_argument(
             "invalid DeepSeek-V4 HC post input");
     }
@@ -370,13 +432,14 @@ array hc_post_impl(
         static_cast<std::size_t>(batch)
             * tokens * kConnections * hidden,
         "output size");
-    auto outputs = hc_post_kernel()(
+    auto outputs = hc_post_kernel(residual_values.dtype())(
         {
             branch_values,
             branch2_values,
             residual_values,
             post_values,
             combination_values,
+            metadata_values,
         },
         {
             Shape{
@@ -386,13 +449,14 @@ array hc_post_impl(
                 hidden,
             },
         },
-        {mlx::core::float16},
+        {residual_values.dtype()},
         {size, 1, 1},
         {std::min(kThreads, size), 1, 1},
         {
             {"SIZE", size},
             {"HIDDEN", hidden},
             {"ADD_BRANCH", static_cast<int>(add_branch)},
+            {"PACKED_META", packed_metadata.has_value() ? 1 : 0},
         },
         std::nullopt,
         false,
@@ -409,7 +473,7 @@ MlxDeepseekV4HcPreResult deepseek_v4_hc_pre(
     const array& base,
     int sinkhorn_iterations,
     float eps) {
-    auto residual_values = float16_contiguous(residual);
+    auto residual_values = activation16_contiguous(residual);
     auto mix_values = float32_contiguous(mixes);
     auto scale_values = float32_contiguous(scale);
     auto base_values = float32_contiguous(base);
@@ -440,8 +504,18 @@ MlxDeepseekV4HcPreResult deepseek_v4_hc_pre(
     const int rows = checked_int(
         static_cast<std::size_t>(batch) * tokens,
         "row count");
+    const auto reduced_dtype = residual_values.dtype();
+    const std::size_t reduced_item_size = sizeof(std::uint16_t);
+    const int reduced_bytes = checked_int(
+        static_cast<std::size_t>(rows) * hidden * reduced_item_size,
+        "packed reduced bytes");
+    const int packed_bytes = checked_int(
+        static_cast<std::size_t>(reduced_bytes) +
+            static_cast<std::size_t>(rows) *
+                (kMixWidth - kConnections) * sizeof(float),
+        "packed output bytes");
     const array params({eps, eps, eps}, mlx::core::float32);
-    auto outputs = hc_pre_kernel()(
+    auto outputs = hc_pre_kernel(residual_values.dtype())(
         {
             residual_values,
             mix_values,
@@ -451,35 +525,55 @@ MlxDeepseekV4HcPreResult deepseek_v4_hc_pre(
             params,
         },
         {
-            Shape{batch, tokens, hidden},
-            Shape{batch, tokens, kConnections},
-            Shape{
-                batch,
-                tokens,
-                kConnections,
-                kConnections,
-            },
+            Shape{packed_bytes},
         },
         {
-            mlx::core::float16,
-            mlx::core::float32,
-            mlx::core::float32,
+            mlx::core::uint8,
         },
         {rows * kThreads, 1, 1},
         {kThreads, 1, 1},
         {
             {"ROWS", rows},
             {"HIDDEN", hidden},
+            {"REDUCED_BYTES", reduced_bytes},
             {"NORMALIZE", 0},
             {"SCALE_MIXES", 0},
         },
         std::nullopt,
         false,
         {});
+    auto packed = std::move(outputs.at(0));
+    auto reduced = mlx::core::reshape(
+        mlx::core::view(
+            mlx::core::slice(
+                packed,
+                Shape{0},
+                Shape{reduced_bytes}),
+            reduced_dtype),
+        Shape{batch, tokens, hidden});
+    auto metadata = mlx::core::reshape(
+        mlx::core::view(
+            mlx::core::slice(
+                packed,
+                Shape{reduced_bytes},
+                Shape{packed_bytes}),
+            mlx::core::float32),
+        Shape{batch, tokens, kMixWidth - kConnections});
+    auto post = mlx::core::contiguous(mlx::core::slice(
+        metadata,
+        Shape{0, 0, 0},
+        Shape{batch, tokens, kConnections}));
+    auto combination = mlx::core::reshape(
+        mlx::core::contiguous(mlx::core::slice(
+            metadata,
+            Shape{0, 0, kConnections},
+            Shape{batch, tokens, kMixWidth - kConnections})),
+        Shape{batch, tokens, kConnections, kConnections});
     return {
-        std::move(outputs.at(0)),
-        std::move(outputs.at(1)),
-        std::move(outputs.at(2)),
+        std::move(reduced),
+        std::move(post),
+        std::move(combination),
+        std::move(metadata),
     };
 }
 
@@ -493,7 +587,7 @@ MlxDeepseekV4HcPreResult deepseek_v4_hc_pre_norm(
     float hc_eps,
     float norm_eps,
     bool normalize_mixes_from_residual) {
-    auto residual_values = float16_contiguous(residual);
+    auto residual_values = activation16_contiguous(residual);
     auto mix_values = float32_contiguous(mixes);
     auto scale_values = float32_contiguous(scale);
     auto base_values = float32_contiguous(base);
@@ -530,10 +624,20 @@ MlxDeepseekV4HcPreResult deepseek_v4_hc_pre_norm(
     const int rows = checked_int(
         static_cast<std::size_t>(batch) * tokens,
         "row count");
+    const auto reduced_dtype = residual_values.dtype();
+    const std::size_t reduced_item_size = sizeof(std::uint16_t);
+    const int reduced_bytes = checked_int(
+        static_cast<std::size_t>(rows) * hidden * reduced_item_size,
+        "packed reduced bytes");
+    const int packed_bytes = checked_int(
+        static_cast<std::size_t>(reduced_bytes) +
+            static_cast<std::size_t>(rows) *
+                (kMixWidth - kConnections) * sizeof(float),
+        "packed output bytes");
     const array params(
         {hc_eps, norm_eps, norm_eps},
         mlx::core::float32);
-    auto outputs = hc_pre_kernel()(
+    auto outputs = hc_pre_kernel(residual_values.dtype())(
         {
             residual_values,
             mix_values,
@@ -543,25 +647,17 @@ MlxDeepseekV4HcPreResult deepseek_v4_hc_pre_norm(
             params,
         },
         {
-            Shape{batch, tokens, hidden},
-            Shape{batch, tokens, kConnections},
-            Shape{
-                batch,
-                tokens,
-                kConnections,
-                kConnections,
-            },
+            Shape{packed_bytes},
         },
         {
-            mlx::core::float16,
-            mlx::core::float32,
-            mlx::core::float32,
+            mlx::core::uint8,
         },
         {rows * kThreads, 1, 1},
         {kThreads, 1, 1},
         {
             {"ROWS", rows},
             {"HIDDEN", hidden},
+            {"REDUCED_BYTES", reduced_bytes},
             {"NORMALIZE", 1},
             {
                 "SCALE_MIXES",
@@ -571,10 +667,38 @@ MlxDeepseekV4HcPreResult deepseek_v4_hc_pre_norm(
         std::nullopt,
         false,
         {});
+    auto packed = std::move(outputs.at(0));
+    auto reduced = mlx::core::reshape(
+        mlx::core::view(
+            mlx::core::slice(
+                packed,
+                Shape{0},
+                Shape{reduced_bytes}),
+            reduced_dtype),
+        Shape{batch, tokens, hidden});
+    auto metadata = mlx::core::reshape(
+        mlx::core::view(
+            mlx::core::slice(
+                packed,
+                Shape{reduced_bytes},
+                Shape{packed_bytes}),
+            mlx::core::float32),
+        Shape{batch, tokens, kMixWidth - kConnections});
+    auto post = mlx::core::contiguous(mlx::core::slice(
+        metadata,
+        Shape{0, 0, 0},
+        Shape{batch, tokens, kConnections}));
+    auto combination = mlx::core::reshape(
+        mlx::core::contiguous(mlx::core::slice(
+            metadata,
+            Shape{0, 0, kConnections},
+            Shape{batch, tokens, kMixWidth - kConnections})),
+        Shape{batch, tokens, kConnections, kConnections});
     return {
-        std::move(outputs.at(0)),
-        std::move(outputs.at(1)),
-        std::move(outputs.at(2)),
+        std::move(reduced),
+        std::move(post),
+        std::move(combination),
+        std::move(metadata),
     };
 }
 
@@ -589,6 +713,7 @@ array deepseek_v4_hc_post(
         residual,
         post,
         combination,
+        std::nullopt,
         false);
 }
 
@@ -604,6 +729,36 @@ array deepseek_v4_hc_post_sum(
         residual,
         post,
         combination,
+        std::nullopt,
+        true);
+}
+
+array deepseek_v4_hc_post_packed(
+    const array& branch,
+    const array& residual,
+    const array& metadata) {
+    return hc_post_impl(
+        branch,
+        branch,
+        residual,
+        metadata,
+        metadata,
+        metadata,
+        false);
+}
+
+array deepseek_v4_hc_post_sum_packed(
+    const array& routed,
+    const array& shared,
+    const array& residual,
+    const array& metadata) {
+    return hc_post_impl(
+        routed,
+        shared,
+        residual,
+        metadata,
+        metadata,
+        metadata,
         true);
 }
 

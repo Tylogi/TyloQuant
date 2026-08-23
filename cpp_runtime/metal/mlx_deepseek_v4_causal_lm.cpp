@@ -244,6 +244,7 @@ MlxDeepseekV4HcPreResult hc_pre_generic(
         std::move(reduced),
         std::move(post),
         std::move(combination),
+        std::nullopt,
     };
 }
 
@@ -653,6 +654,31 @@ MlxDeepseekV4Layer::hc_pre_norm(
                 hidden,
                 "hyper-connection width"),
         });
+    if (config_.fast_hyper_connections() &&
+        residual.dtype() == mlx::core::bfloat16) {
+        auto flat_float = mlx::core::astype(
+            flat,
+            mlx::core::float32);
+        auto normalized_flat = mlx::core::fast::rms_norm(
+            flat_float,
+            std::nullopt,
+            static_cast<float>(config_.rms_eps));
+        auto mixes = mlx::core::astype(
+            function(normalized_flat),
+            mlx::core::float32);
+        return deepseek_v4_hc_pre_norm(
+            residual,
+            mixes,
+            scale,
+            base,
+            norm,
+            checked_int(
+                config_.hc_sinkhorn_iters,
+                "HC Sinkhorn iterations"),
+            static_cast<float>(config_.hc_eps),
+            static_cast<float>(config_.rms_eps),
+            false);
+    }
     auto raw_mixes = mlx::core::astype(
         function(flat),
         mlx::core::float32);
@@ -701,7 +727,8 @@ array MlxDeepseekV4Layer::hc_post(
     const array& post,
     const array& combination) const {
     if (config_.fast_hyper_connections() &&
-        residual.dtype() == mlx::core::float16) {
+        (residual.dtype() == mlx::core::float16 ||
+         residual.dtype() == mlx::core::bfloat16)) {
         return deepseek_v4_hc_post(
             branch,
             residual,
@@ -772,11 +799,16 @@ array MlxDeepseekV4Layer::forward(
         branch,
         state,
         pos0);
-    auto result = hc_post(
-        branch,
-        residual,
-        attention_hc.post,
-        attention_hc.combination);
+    auto result = attention_hc.packed_metadata.has_value()
+        ? deepseek_v4_hc_post_packed(
+              branch,
+              residual,
+              *attention_hc.packed_metadata)
+        : hc_post(
+              branch,
+              residual,
+              attention_hc.post,
+              attention_hc.combination);
     detail::profile_eval(
         "layer.attention_hc_post",
         result);
@@ -802,14 +834,12 @@ array MlxDeepseekV4Layer::forward(
         branch,
         token_ids,
         routed_prefetch);
-    auto output = config_.fast_hyper_connections() &&
-            residual.dtype() == mlx::core::float16
-        ? deepseek_v4_hc_post_sum(
+    auto output = ffn_hc.packed_metadata.has_value()
+        ? deepseek_v4_hc_post_sum_packed(
               moe_branches.routed,
               moe_branches.shared,
               residual,
-              ffn_hc.post,
-              ffn_hc.combination)
+              *ffn_hc.packed_metadata)
         : hc_post(
               moe_branches.routed + moe_branches.shared,
               residual,
@@ -1189,25 +1219,20 @@ array MlxDeepseekV4CausalLm::head(
             config_.hidden,
             "hidden size"),
         "hyper-connection width");
-    auto flat = mlx::core::reshape(
+    auto hidden_float = mlx::core::astype(
         hidden,
+        mlx::core::float32);
+    auto flat = mlx::core::reshape(
+        hidden_float,
         Shape{batch, tokens, width});
-    auto flat_float =
-        mlx::core::astype(
-            flat,
-            mlx::core::float32);
-    auto inverse = mlx::core::rsqrt(
-        mlx::core::mean(
-            flat_float * flat_float,
-            -1,
-            true) +
-        static_cast<float>(
-            config_.rms_eps));
+    auto normalized = mlx::core::fast::rms_norm(
+        flat,
+        std::nullopt,
+        static_cast<float>(config_.rms_eps));
     auto mixes =
         mlx::core::astype(
-            hc_head_fn_(flat),
-            mlx::core::float32) *
-        inverse;
+            hc_head_fn_(normalized),
+            mlx::core::float32);
     auto pre = mlx::core::sigmoid(
         mixes *
             mlx::core::reshape(
@@ -1220,8 +1245,14 @@ array MlxDeepseekV4CausalLm::head(
             config_.hc_eps);
     auto reduced = mlx::core::sum(
         mlx::core::expand_dims(pre, -1) *
-            hidden,
+            hidden_float,
         2);
+    if (hidden.dtype() == mlx::core::float16 ||
+        hidden.dtype() == mlx::core::bfloat16) {
+        reduced = mlx::core::astype(
+            reduced,
+            hidden.dtype());
+    }
     return output_norm_(reduced);
 }
 

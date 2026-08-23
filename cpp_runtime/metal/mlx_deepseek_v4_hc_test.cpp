@@ -424,6 +424,81 @@ void test_hc_pre_post() {
         1.5e-3f,
         "HC post fused branch sum");
 
+    auto residual_bfloat = mlx::core::astype(
+        residual_array,
+        mlx::core::bfloat16);
+    auto bfloat_pre = mfq::metal::deepseek_v4_hc_pre(
+        residual_bfloat,
+        mixes_array,
+        scale_array,
+        base_array,
+        20,
+        kEps);
+    require(
+        bfloat_pre.reduced.dtype() == mlx::core::bfloat16,
+        "BF16 HC collapse did not preserve the activation dtype");
+    require(
+        bfloat_pre.packed_metadata.has_value(),
+        "BF16 HC did not expose packed post metadata");
+    require_close(
+        evaluated_float(bfloat_pre.reduced),
+        expected_reduced,
+        8e-3f,
+        "BF16 HC pre reduced");
+    require_close(
+        evaluated_float(bfloat_pre.post),
+        expected_post,
+        2e-4f,
+        "BF16 HC pre post-gates");
+    require_close(
+        evaluated_float(bfloat_pre.combination),
+        expected_combination,
+        3e-4f,
+        "BF16 HC pre Sinkhorn");
+
+    auto bfloat_fused_norm =
+        mfq::metal::deepseek_v4_hc_pre_norm(
+            residual_bfloat,
+            mixes_array,
+            scale_array,
+            base_array,
+            norm_array,
+            20,
+            kEps,
+            kEps);
+    auto bfloat_separate_norm = separate_norm(
+        bfloat_pre.reduced);
+    require(
+        bfloat_fused_norm.reduced.dtype() ==
+            mlx::core::bfloat16,
+        "BF16 fused HC/RMSNorm changed the activation dtype");
+    require_close(
+        evaluated_float(bfloat_fused_norm.reduced),
+        evaluated_float(bfloat_separate_norm),
+        1.6e-2f,
+        "BF16 fused HC pre RMSNorm");
+
+    auto bfloat_branch = mlx::core::astype(
+        branch_array,
+        mlx::core::bfloat16);
+    auto bfloat_post = mfq::metal::deepseek_v4_hc_post(
+        bfloat_branch,
+        residual_bfloat,
+        bfloat_pre.post,
+        bfloat_pre.combination);
+    auto bfloat_packed_post =
+        mfq::metal::deepseek_v4_hc_post_packed(
+            bfloat_branch,
+            residual_bfloat,
+            *bfloat_pre.packed_metadata);
+    require(
+        bfloat_packed_post.dtype() == mlx::core::bfloat16,
+        "BF16 HC post changed the activation dtype");
+    require_close(
+        evaluated_float(bfloat_packed_post),
+        evaluated_float(bfloat_post),
+        0.0f,
+        "BF16 packed HC post");
 }
 
 void test_invalid_shapes() {
