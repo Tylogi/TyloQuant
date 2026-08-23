@@ -4,6 +4,7 @@
 #include "../../third_party/nlohmann/json.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -719,6 +720,15 @@ array MlxDeepseekV4Layer::forward(
     const array& token_ids,
     MlxDeepseekV4LayerState& state,
     int pos0) const {
+    return forward(hidden, token_ids, state, pos0, nullptr);
+}
+
+array MlxDeepseekV4Layer::forward(
+    const array& hidden,
+    const array& token_ids,
+    MlxDeepseekV4LayerState& state,
+    int pos0,
+    MlxDeepseekV4SsdPrefetchedLayer* prefetched) const {
     auto source = floating_contiguous(hidden);
     const int expected_hidden =
         checked_int(config_.hidden, "hidden size");
@@ -738,8 +748,15 @@ array MlxDeepseekV4Layer::forward(
     }
 
     auto residual = source;
-    auto routed_prefetch = components_.moe.prefetch_routed(
-        source.size() / static_cast<std::size_t>(expected_hidden));
+    auto owned_prefetch = prefetched == nullptr
+        ? components_.moe.prefetch_routed(
+              source.size() / static_cast<std::size_t>(expected_hidden))
+        : std::nullopt;
+    auto* routed_prefetch = prefetched != nullptr
+        ? prefetched
+        : owned_prefetch.has_value()
+            ? &*owned_prefetch
+            : nullptr;
     auto attention_hc = hc_pre_norm(
         source,
         components_.hc_attention_fn,
@@ -763,7 +780,7 @@ array MlxDeepseekV4Layer::forward(
     detail::profile_eval(
         "layer.attention_hc_post",
         result);
-    if (routed_prefetch.has_value()) {
+    if (routed_prefetch != nullptr) {
         // Attention has no dependency on the expert banks. Materialize it
         // while the SSD workers fill the alternating routed buffer.
         detail::eval_with_timing(result);
@@ -784,7 +801,7 @@ array MlxDeepseekV4Layer::forward(
     auto moe_branches = components_.moe.forward_branches(
         branch,
         token_ids,
-        routed_prefetch.has_value() ? &*routed_prefetch : nullptr);
+        routed_prefetch);
     auto output = config_.fast_hyper_connections() &&
             residual.dtype() == mlx::core::float16
         ? deepseek_v4_hc_post_sum(
@@ -1245,14 +1262,29 @@ array MlxDeepseekV4CausalLm::forward_chunk(
         "model.embedding_broadcast",
         hidden_values);
     const bool bounded_prefill = tokens > 1;
+    std::array<
+        std::optional<MlxDeepseekV4SsdPrefetchedLayer>,
+        2> routed_pipeline;
+    if (bounded_prefill && !layers_.empty()) {
+        const auto rows = static_cast<std::size_t>(batch) *
+            static_cast<std::size_t>(tokens);
+        routed_pipeline[0] = layers_[0].prefetch_routed(rows);
+        if (routed_pipeline[0].has_value() && layers_.size() > 1) {
+            routed_pipeline[1] = layers_[1].prefetch_routed(rows);
+        }
+    }
     for (std::size_t index = 0;
          index < layers_.size();
          ++index) {
-        hidden_values = layers_[index](
+        auto* prefetched = routed_pipeline[index % 2].has_value()
+            ? &*routed_pipeline[index % 2]
+            : nullptr;
+        hidden_values = layers_[index].forward(
             hidden_values,
             token_ids,
             states_[index],
-            pos0);
+            pos0,
+            prefetched);
         if (bounded_prefill) {
             // Hidden and cache branches share the layer projections. Submit
             // them together so prefill needs one GPU synchronization per
@@ -1266,6 +1298,18 @@ array MlxDeepseekV4CausalLm::forward_chunk(
                 layer_outputs);
             detail::eval_with_timing(
                 std::move(layer_outputs));
+        }
+        if (prefetched != nullptr) {
+            // The routed result and every state branch that can retain it have
+            // crossed an MLX evaluation boundary. Buffer parity is now safe to
+            // reuse for layer L+2 while layer L+1 consumes the other buffer.
+            routed_pipeline[index % 2].reset();
+            if (index + 2 < layers_.size()) {
+                const auto rows = static_cast<std::size_t>(batch) *
+                    static_cast<std::size_t>(tokens);
+                routed_pipeline[index % 2] =
+                    layers_[index + 2].prefetch_routed(rows);
+            }
         }
     }
     auto head_input = full_logits

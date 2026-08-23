@@ -78,6 +78,21 @@ public:
         MlxDeepseekV4LayerState& state,
         int pos0) const;
 
+    // The model-level prefill scheduler owns this handle when it pipelines
+    // layer L+1's SSD read with layer L's Metal work. Passing the handle into
+    // forward avoids starting a second, same-layer read.
+    mlx::core::array forward(
+        const mlx::core::array& hidden,
+        const mlx::core::array& token_ids,
+        MlxDeepseekV4LayerState& state,
+        int pos0,
+        MlxDeepseekV4SsdPrefetchedLayer* prefetched) const;
+
+    std::optional<MlxDeepseekV4SsdPrefetchedLayer>
+    prefetch_routed(std::size_t rows) const {
+        return components_.moe.prefetch_routed(rows);
+    }
+
     mlx::core::array operator()(
         const mlx::core::array& hidden,
         const mlx::core::array& token_ids,

@@ -90,10 +90,13 @@ private:
     friend class MlxDeepseekV4SsdExpertCache;
 };
 
-// Concurrent exact-expert LRU over the shared MLX arena. A prepare() call
-// issues all cold reads before waiting, so the configured IO workers expose
-// the SSD queue depth. The returned object pins its slots until destruction;
-// callers must materialize the lazy Metal graph before releasing it.
+// Concurrent exact-expert LRU over the shared MLX UMA arena. Safetensors on
+// SSD are the complete expert pool and the arena is the only physical cache:
+// CPU IO workers fill its pages and Metal consumes those same pages in place,
+// with no host-pool or host-to-device copy. A prepare() call issues all cold
+// reads before waiting, so the configured IO workers expose the SSD queue
+// depth. The returned object pins its slots until destruction; callers must
+// materialize the lazy Metal graph before releasing it.
 class MlxDeepseekV4SsdExpertCache {
 public:
     MlxDeepseekV4SsdExpertCache(

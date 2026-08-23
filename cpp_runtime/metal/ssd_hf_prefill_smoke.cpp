@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
@@ -18,9 +19,9 @@ int main(int argc, char** argv) {
     using mlx::core::Shape;
     using mlx::core::array;
 
-    if (argc != 5) {
+    if (argc != 5 && argc != 6) {
         std::cerr << "usage: " << argv[0]
-                  << " MODEL_DIR CACHE_MIB TOKENS PREFILL_BUFFER\n";
+                  << " MODEL_DIR CACHE_MIB TOKENS PREFILL_BUFFER [LOGITS_F32]\n";
         return 2;
     }
     try {
@@ -56,6 +57,16 @@ int main(int argc, char** argv) {
             throw std::runtime_error("unexpected prefill logits geometry");
         }
         const auto* values = logits.data<float>();
+        if (argc == 6) {
+            std::ofstream output(argv[5], std::ios::binary);
+            output.write(
+                reinterpret_cast<const char*>(values),
+                static_cast<std::streamsize>(
+                    logits.size() * sizeof(float)));
+            if (!output) {
+                throw std::runtime_error("cannot write prefill logits");
+            }
+        }
         double checksum = 0.0;
         double absolute = 0.0;
         for (std::size_t index = 0; index < logits.size(); ++index) {
