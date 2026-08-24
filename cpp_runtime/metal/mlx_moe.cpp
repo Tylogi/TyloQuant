@@ -14,6 +14,8 @@
 #include <mlx/memory.h>
 #include <mlx/primitives.h>
 
+#include <sys/sysctl.h>
+
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -75,6 +77,51 @@ constexpr int kFamilyMxfp4 = 3;
 constexpr int kMxGroups = 4;
 constexpr int kMxValueOffset = 5;
 constexpr int kMxScaleOffset = 6;
+
+bool apple_m5_family() noexcept {
+    static const bool is_m5 = [] {
+        std::size_t size = 0;
+        if (::sysctlbyname(
+                "machdep.cpu.brand_string",
+                nullptr,
+                &size,
+                nullptr,
+                0) != 0 || size <= 1) {
+            return false;
+        }
+        std::string name(size, '\0');
+        if (::sysctlbyname(
+                "machdep.cpu.brand_string",
+                name.data(),
+                &size,
+                nullptr,
+                0) != 0) {
+            return false;
+        }
+        return name.rfind("Apple M5", 0) == 0;
+    }();
+    return is_m5;
+}
+
+bool mxfp4_nax_prefill_enabled(int route_count) noexcept {
+    constexpr int kDefaultMinRoutes = 1024;
+    const char* value = std::getenv(
+        "MFQ_METAL_NINTM_PREFILL_NAX");
+    if (value == nullptr) {
+        return false;
+    }
+    const auto setting = std::string_view(value);
+    if (
+        setting == "1"
+        || setting == "true"
+        || setting == "on"
+    ) {
+        return true;
+    }
+    return setting == "auto"
+        && apple_m5_family()
+        && route_count >= kDefaultMinRoutes;
+}
 
 constexpr int kFamilyVq = 1;
 constexpr int kVqGroupSize = 4;
@@ -5897,6 +5944,8 @@ struct MlxNintMoeWeight::Impl {
     bool native_primitive = true;
     bool grouped_vq_mmq = false;
     bool has_nepq_residual = false;
+    std::optional<array> mxfp4_slot_ids;
+    bool mxfp4_slot_ids_sorted = false;
     int k_lanes_override = 0;
     std::size_t packed_bytes = 0;
 
@@ -6010,6 +6059,25 @@ struct MlxNintMoeWeight::Impl {
             ) {
                 jsc_execution_layout = true;
             }
+        }
+        if (
+            family_mask == (std::uint32_t{1} << kFamilyMxfp4)
+            && descriptor_values.size()
+                == static_cast<std::size_t>(experts) * kDescriptorSize
+        ) {
+            std::vector<std::int32_t> slots(
+                static_cast<std::size_t>(experts));
+            for (int expert = 0; expert < experts; ++expert) {
+                slots[static_cast<std::size_t>(expert)] =
+                    descriptor_values[
+                        static_cast<std::size_t>(expert) * kDescriptorSize
+                        + kLocalExpert];
+            }
+            mxfp4_slot_ids_sorted =
+                std::is_sorted(slots.begin(), slots.end());
+            mxfp4_slot_ids.emplace(make_int32_array(
+                slots,
+                Shape{experts}));
         }
         const char* specialize_env = std::getenv(
             "MFQ_METAL_NINTM_SPECIALIZE");
@@ -7169,6 +7237,109 @@ array MlxNintMoeWeight::routed_matmul_sorted(
                 std::move(variants),
                 0));
         shared_input = false;
+    }
+
+    // On M5, prefill-sized MXFP4 gather-QMM is substantially faster through
+    // MLX's NAX path than through the pre-NAX block-list kernel.  The SSD
+    // arena already stores native MXFP4 bytes and E8M0 scales, so this is a
+    // zero-conversion view over the same unified-memory banks.  Keep it
+    // available as an explicit experiment while its different reduction tree
+    // is validated against the established full-model numerical contract.
+    if (
+        mxfp4_nax_prefill_enabled(route_count)
+        && impl_->mxfp4_slot_ids.has_value()
+        && impl_->projections == 1
+        && impl_->rotations.empty()
+        && source.dtype() == mlx::core::float16
+    ) {
+        array sorted_source = [&]() {
+            if (input_is_sorted) {
+                return source;
+            }
+            if (shared_input) {
+                auto source_rows = mlx::core::floor_divide(
+                    route_order,
+                    array(routes, mlx::core::int32));
+                return mlx::core::take(
+                    source,
+                    source_rows,
+                    0);
+            }
+            return mlx::core::take(
+                mlx::core::reshape(
+                    source,
+                    Shape{route_count, impl_->neuron_len}),
+                route_order,
+                0);
+        }();
+        sorted_source = mlx::core::expand_dims(
+            mlx::core::contiguous(std::move(sorted_source)),
+            1);
+        auto sorted_expert_ids = mlx::core::take(
+            mlx::core::reshape(ids, Shape{route_count}),
+            route_order,
+            0);
+        auto sorted_slot_ids = mlx::core::take(
+            *impl_->mxfp4_slot_ids,
+            sorted_expert_ids,
+            0);
+        const auto value_stride = checked_product(
+            static_cast<std::size_t>(impl_->out_per_expert),
+            static_cast<std::size_t>(impl_->neuron_len / 2),
+            "MXFP4 NAX value stride");
+        const auto scale_stride = checked_product(
+            static_cast<std::size_t>(impl_->out_per_expert),
+            static_cast<std::size_t>(impl_->neuron_len / 32),
+            "MXFP4 NAX scale stride");
+        const auto slots = impl_->mx_values.size() / value_stride;
+        if (
+            slots == 0
+            || impl_->mx_values.size() % value_stride != 0
+            || impl_->mx_scales.size() != slots * scale_stride
+        ) {
+            throw std::runtime_error(
+                "MXFP4 NAX arena geometry is invalid");
+        }
+        auto packed = mlx::core::reshape(
+            mlx::core::view(impl_->mx_values, mlx::core::uint32),
+            Shape{
+                checked_int(slots, "MXFP4 NAX slot count"),
+                impl_->out_per_expert,
+                impl_->neuron_len / 8,
+            });
+        auto scales = mlx::core::reshape(
+            impl_->mx_scales,
+            Shape{
+                checked_int(slots, "MXFP4 NAX slot count"),
+                impl_->out_per_expert,
+                impl_->neuron_len / 32,
+            });
+        // MLX 0.32.0's sorted NAX kernel has row-offset overflow above 32768
+        // routes and assumes K is divisible by 64.  The unsorted dispatch is
+        // still valid for the already sorted rows and avoids both defects.
+        const bool safe_sorted_indices =
+            impl_->mxfp4_slot_ids_sorted
+            && impl_->neuron_len % 64 == 0
+            && route_count <= 32768;
+        auto projected = mlx::core::squeeze(
+            mlx::core::gather_qmm(
+                sorted_source,
+                packed,
+                scales,
+                std::nullopt,
+                std::nullopt,
+                sorted_slot_ids,
+                true,
+                32,
+                4,
+                "mxfp4",
+                safe_sorted_indices),
+            1);
+        return fused_swiglu
+            ? moe_limited_swiglu_split(
+                  std::move(projected),
+                  swiglu_limit)
+            : projected;
     }
 
     const array params({0.0f}, mlx::core::float32);

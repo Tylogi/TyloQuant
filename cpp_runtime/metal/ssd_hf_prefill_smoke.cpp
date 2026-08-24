@@ -1,4 +1,5 @@
 #include "mlx_deepseek_v4_causal_lm.h"
+#include "mlx_eval_timing.h"
 
 #include <mlx/mlx.h>
 
@@ -44,6 +45,11 @@ int main(int argc, char** argv) {
             ids[static_cast<std::size_t>(index)] =
                 static_cast<std::int32_t>((index * 17 + 3) % 129280);
         }
+        const bool profile_components =
+            mfq::metal::detail::component_profile_requested();
+        mfq::metal::detail::ComponentProfile component_profile;
+        mfq::metal::detail::ScopedComponentProfile component_scope(
+            profile_components ? &component_profile : nullptr);
         const auto started = std::chrono::steady_clock::now();
         auto logits = model.prefill(
             array(ids.data(), Shape{1, tokens}),
@@ -90,12 +96,32 @@ int main(int argc, char** argv) {
             std::cout << " requests=" << stats->requests
                       << " hits=" << stats->hits
                       << " bytes_read=" << stats->bytes_read
+                      << " prefill_layers=" << stats->prefill_layers
+                      << " prefill_cache_hits="
+                      << stats->prefill_cache_hits
                       << " prefill_expert_reads="
                       << stats->prefill_expert_reads
                       << " prefill_bytes_read="
-                      << stats->prefill_bytes_read;
+                      << stats->prefill_bytes_read
+                      << " prefill_wait_seconds="
+                      << stats->prefill_wait_seconds
+                      << " io_worker_seconds=" << stats->io_seconds;
         }
         std::cout << '\n';
+        if (profile_components) {
+            const auto evaluated_ms = component_profile.evaluated_ms();
+            for (const auto& [name, timing] : component_profile.timings()) {
+                std::cout << "component_cost phase=prefill"
+                          << " name=" << name
+                          << " ms=" << timing.elapsed_ms
+                          << " calls=" << timing.evaluations
+                          << " pct_evaluated="
+                          << (evaluated_ms > 0.0
+                                  ? 100.0 * timing.elapsed_ms / evaluated_ms
+                                  : 0.0)
+                          << '\n';
+            }
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "HF prefill smoke failed: " << error.what() << '\n';
