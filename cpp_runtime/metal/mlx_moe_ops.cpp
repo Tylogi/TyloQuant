@@ -244,7 +244,12 @@ constexpr const char* kDenseRouterTopKSource = R"METAL(
                     best_expert = expert;
                 }
             }
+#if MFQ_HAS_EXPERT_MAP
+            int slot = expert_map[best_expert];
+            ids[rank] = int(best_expert) | ((slot + 1) << 8);
+#else
             ids[rank] = int(best_expert);
+#endif
             topk_weights[rank] = route_weights[best_expert];
             scores[best_expert] = -INFINITY;
         }
@@ -447,12 +452,13 @@ const mlx::core::fast::CustomKernelFunction& top_k_kernel() {
 }
 
 const mlx::core::fast::CustomKernelFunction&
-dense_router_top_k_kernel(mlx::core::Dtype dtype) {
+dense_router_top_k_kernel(mlx::core::Dtype dtype, bool mapped) {
     static const auto fp16_kernel = make_kernel(
         "mfq_cpp_moe_dense_router_topk_f16",
         {"input", "weight", "bias", "available", "params"},
         {"ids", "weights"},
         std::string(
+            "#define MFQ_HAS_EXPERT_MAP 0\n"
             "using activation_t = half;\n"
             "using activation4_t = half4;\n") +
             kDenseRouterTopKSource);
@@ -461,12 +467,34 @@ dense_router_top_k_kernel(mlx::core::Dtype dtype) {
         {"input", "weight", "bias", "available", "params"},
         {"ids", "weights"},
         std::string(
+            "#define MFQ_HAS_EXPERT_MAP 0\n"
             "using activation_t = bfloat;\n"
             "using activation4_t = bfloat4;\n") +
             kDenseRouterTopKSource);
-    return dtype == mlx::core::bfloat16
-        ? bf16_kernel
-        : fp16_kernel;
+    static const auto mapped_fp16_kernel = make_kernel(
+        "mfq_cpp_moe_dense_router_topk_packed_f16",
+        {"input", "weight", "bias", "available", "params", "expert_map"},
+        {"ids", "weights"},
+        std::string(
+            "#define MFQ_HAS_EXPERT_MAP 1\n"
+            "using activation_t = half;\n"
+            "using activation4_t = half4;\n") +
+            kDenseRouterTopKSource);
+    static const auto mapped_bf16_kernel = make_kernel(
+        "mfq_cpp_moe_dense_router_topk_packed_bf16",
+        {"input", "weight", "bias", "available", "params", "expert_map"},
+        {"ids", "weights"},
+        std::string(
+            "#define MFQ_HAS_EXPERT_MAP 1\n"
+            "using activation_t = bfloat;\n"
+            "using activation4_t = bfloat4;\n") +
+            kDenseRouterTopKSource);
+    if (mapped) {
+        return dtype == mlx::core::bfloat16
+            ? mapped_bf16_kernel
+            : mapped_fp16_kernel;
+    }
+    return dtype == mlx::core::bfloat16 ? bf16_kernel : fp16_kernel;
 }
 
 const mlx::core::fast::CustomKernelFunction&
@@ -773,9 +801,10 @@ bool moe_dense_router_topk_supported(
         && weight.shape(1) == input.shape(-1);
 }
 
-MlxMoeTopKResult moe_dense_router_topk(
+MlxMoeTopKResult dense_router_topk_impl(
     const array& input,
     const array& weight,
+    const array* expert_map,
     const std::optional<array>& bias,
     const std::optional<array>& available,
     float norm_floor,
@@ -823,16 +852,42 @@ MlxMoeTopKResult moe_dense_router_topk(
     const array params(
         {norm_floor, scale},
         mlx::core::float32);
-    auto outputs = dense_router_top_k_kernel(source.dtype())(
-        {
-            source,
-            weights,
-            bias_values,
-            available_values,
-            params,
-        },
-        {Shape{1, 6}, Shape{1, 6}},
-        {mlx::core::int32, mlx::core::float32},
+    array expert_map_values = mlx::core::zeros(
+        Shape{1},
+        mlx::core::int32);
+    if (expert_map != nullptr) {
+        if (expert_map->dtype() != mlx::core::int32 ||
+            expert_map->shape() != Shape{256} ||
+            !expert_map->flags().row_contiguous) {
+            throw std::invalid_argument(
+                "fused dense router expert map must be contiguous int32[256]");
+        }
+        expert_map_values = *expert_map;
+    }
+    std::vector<array> kernel_inputs{
+        source,
+        weights,
+        bias_values,
+        available_values,
+        params,
+    };
+    std::vector<Shape> output_shapes{
+        Shape{1, 6},
+        Shape{1, 6},
+    };
+    std::vector<mlx::core::Dtype> output_dtypes{
+        mlx::core::int32,
+        mlx::core::float32,
+    };
+    if (expert_map != nullptr) {
+        kernel_inputs.push_back(expert_map_values);
+    }
+    auto outputs = dense_router_top_k_kernel(
+        source.dtype(),
+        expert_map != nullptr)(
+        std::move(kernel_inputs),
+        std::move(output_shapes),
+        std::move(output_dtypes),
         {1024, 1, 1},
         {1024, 1, 1},
         {
@@ -850,6 +905,41 @@ MlxMoeTopKResult moe_dense_router_topk(
         std::move(outputs.at(0)),
         std::move(outputs.at(1)),
     };
+}
+
+MlxMoeTopKResult moe_dense_router_topk(
+    const array& input,
+    const array& weight,
+    const std::optional<array>& bias,
+    const std::optional<array>& available,
+    float norm_floor,
+    float scale) {
+    return dense_router_topk_impl(
+        input,
+        weight,
+        nullptr,
+        bias,
+        available,
+        norm_floor,
+        scale);
+}
+
+MlxMoeTopKResult moe_dense_router_topk_packed(
+    const array& input,
+    const array& weight,
+    const array& expert_map,
+    const std::optional<array>& bias,
+    const std::optional<array>& available,
+    float norm_floor,
+    float scale) {
+    return dense_router_topk_impl(
+        input,
+        weight,
+        &expert_map,
+        bias,
+        available,
+        norm_floor,
+        scale);
 }
 
 array moe_selected_sqrtsoftplus_weights(

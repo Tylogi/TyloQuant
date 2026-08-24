@@ -142,6 +142,21 @@ int main(int argc, char** argv) {
                     step_stats->prepare_seconds - before.prepare_seconds;
                 const double delta_view =
                     step_stats->view_seconds - before.view_seconds;
+                const auto delta_device_route_layers =
+                    step_stats->device_route_layers -
+                    before.device_route_layers;
+                const auto delta_device_route_hits =
+                    step_stats->device_route_hits -
+                    before.device_route_hits;
+                const auto delta_device_route_misses =
+                    step_stats->device_route_misses -
+                    before.device_route_misses;
+                const double delta_device_route_eval =
+                    step_stats->device_route_eval_seconds -
+                    before.device_route_eval_seconds;
+                const double delta_device_route_host =
+                    step_stats->device_route_host_seconds -
+                    before.device_route_host_seconds;
                 std::cout << "expert_requests=" << step_stats->requests
                           << " expert_hits=" << step_stats->hits
                           << " expert_misses=" << step_stats->misses
@@ -165,6 +180,16 @@ int main(int argc, char** argv) {
                           << " expert_step_prepare_seconds="
                           << delta_prepare
                           << " expert_step_view_seconds=" << delta_view
+                          << " expert_step_device_route_layers="
+                          << delta_device_route_layers
+                          << " expert_step_device_route_hits="
+                          << delta_device_route_hits
+                          << " expert_step_device_route_misses="
+                          << delta_device_route_misses
+                          << " expert_step_device_route_eval_seconds="
+                          << delta_device_route_eval
+                          << " expert_step_device_route_host_seconds="
+                          << delta_device_route_host
                           << " expert_step_wait_gbps="
                           << (delta_wait > 0.0
                                   ? static_cast<double>(delta_bytes) /
@@ -210,6 +235,16 @@ int main(int argc, char** argv) {
         std::cout << "sequence_logit_hash=" << sequence_hash << '\n';
         const char* replay_value = std::getenv("MFQ_SSD_REPLAY_PROFILE");
         if (replay_value != nullptr && std::atoi(replay_value) != 0) {
+            const char* replay_device_route =
+                std::getenv("MFQ_SSD_REPLAY_DEVICE_ROUTE_TRANSACTION");
+            if (replay_device_route != nullptr &&
+                std::atoi(replay_device_route) != 0) {
+                setenv("MFQ_SSD_DEVICE_ROUTE_TRANSACTION", "1", 1);
+                setenv(
+                    "MFQ_SSD_DEVICE_ROUTE_FORCE_TRANSACTION",
+                    "1",
+                    1);
+            }
             const auto before = *model.ssd_expert_cache_stats();
             std::array<double, 4> window_seconds{};
             std::size_t replay_mismatches = 0;
@@ -300,6 +335,21 @@ int main(int argc, char** argv) {
                       << after.prepare_seconds - before.prepare_seconds
                       << " replay_view_seconds="
                       << after.view_seconds - before.view_seconds
+                      << " replay_device_route_layers="
+                      << after.device_route_layers -
+                             before.device_route_layers
+                      << " replay_device_route_hits="
+                      << after.device_route_hits -
+                             before.device_route_hits
+                      << " replay_device_route_misses="
+                      << after.device_route_misses -
+                             before.device_route_misses
+                      << " replay_device_route_eval_seconds="
+                      << after.device_route_eval_seconds -
+                             before.device_route_eval_seconds
+                      << " replay_device_route_host_seconds="
+                      << after.device_route_host_seconds -
+                             before.device_route_host_seconds
                       << " replay_logit_mismatches="
                       << replay_mismatches << '\n';
         }

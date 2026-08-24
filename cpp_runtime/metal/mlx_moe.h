@@ -152,9 +152,25 @@ public:
     mlx::core::array routed_matmul(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids) const;
+    mlx::core::array routed_matmul_mapped(
+        const mlx::core::array& input,
+        const mlx::core::array& expert_ids,
+        const mlx::core::array& expert_map) const;
+    mlx::core::array routed_matmul_packed(
+        const mlx::core::array& input,
+        const mlx::core::array& packed_expert_ids) const;
     mlx::core::array routed_swiglu(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
+        float limit = 0.0f) const;
+    mlx::core::array routed_swiglu_mapped(
+        const mlx::core::array& input,
+        const mlx::core::array& expert_ids,
+        const mlx::core::array& expert_map,
+        float limit = 0.0f) const;
+    mlx::core::array routed_swiglu_packed(
+        const mlx::core::array& input,
+        const mlx::core::array& packed_expert_ids,
         float limit = 0.0f) const;
     bool supports_grouped_vq_mmq() const noexcept;
     MlxGroupedVqMmqPlan build_grouped_vq_mmq_plan(
@@ -189,7 +205,9 @@ private:
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
         bool fused_swiglu,
-        float swiglu_limit) const;
+        float swiglu_limit,
+        const mlx::core::array* expert_map = nullptr,
+        bool packed_expert_ids = false) const;
     mlx::core::array routed_bf16_reference(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
@@ -212,13 +230,38 @@ public:
     mlx::core::array forward(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids) const;
+    mlx::core::array forward_mapped(
+        const mlx::core::array& input,
+        const mlx::core::array& expert_ids,
+        const mlx::core::array& expert_map) const;
+    mlx::core::array forward_packed(
+        const mlx::core::array& input,
+        const mlx::core::array& packed_expert_ids) const;
     mlx::core::array swiglu(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
         float limit = 0.0f) const;
+    mlx::core::array swiglu_mapped(
+        const mlx::core::array& input,
+        const mlx::core::array& expert_ids,
+        const mlx::core::array& expert_map,
+        float limit = 0.0f) const;
+    mlx::core::array swiglu_packed(
+        const mlx::core::array& input,
+        const mlx::core::array& packed_expert_ids,
+        float limit = 0.0f) const;
     mlx::core::array combine(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
+        const mlx::core::array& route_weights) const;
+    mlx::core::array combine_mapped(
+        const mlx::core::array& input,
+        const mlx::core::array& expert_ids,
+        const mlx::core::array& expert_map,
+        const mlx::core::array& route_weights) const;
+    mlx::core::array combine_packed(
+        const mlx::core::array& input,
+        const mlx::core::array& packed_expert_ids,
         const mlx::core::array& route_weights) const;
     bool supports_grouped_vq_mmq() const noexcept {
         return weight_.supports_grouped_vq_mmq();

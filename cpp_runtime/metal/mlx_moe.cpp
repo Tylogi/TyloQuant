@@ -490,8 +490,17 @@ constexpr const char* kMoeSource = R"METAL(
         output_tile * ROWS_PER_TG
         + simd_group * ROWS_PER_PHYSICAL_SIMD
         + lane_group * ROWS_PER_SIMD;
-    int expert =
+    int logical_expert =
         int(expert_ids[token * uint(ROUTES) + route]);
+    int expert = logical_expert;
+    if (PACKED_EXPERT_IDS != 0) {
+        expert = (logical_expert >> 8) - 1;
+    } else if (EXPERT_MAP_SIZE != 0) {
+        expert = logical_expert >= 0 &&
+                logical_expert < int(EXPERT_MAP_SIZE)
+            ? expert_map[logical_expert]
+            : -1;
+    }
     if (expert < 0 || expert >= int(EXPERTS)) {
         for (
             uint row = 0u;
@@ -2548,6 +2557,8 @@ struct NativeMoeConfig {
     int has_nepq_residual = 0;
     int npq_grouped_indices = 0;
     int sorted_routes = 0;
+    int expert_map_size = 0;
+    int packed_expert_ids = 0;
     int workgroups = 0;
 };
 
@@ -2761,12 +2772,15 @@ std::string native_moe_kernel_name(
         << "_nr" << config.has_nepq_residual
         << "_ni" << config.npq_grouped_indices;
     name << "_sr" << config.sorted_routes;
+    name << "_em" << config.expert_map_size;
+    name << "_pe" << config.packed_expert_ids;
     return name.str();
 }
 
 std::string make_native_moe_source(
     const NativeMoeConfig& config,
     const std::string& kernel_name) {
+    const bool has_expert_map = config.expert_map_size != 0;
     std::ostringstream source;
     source
         << "#include <metal_stdlib>\n"
@@ -2801,8 +2815,14 @@ std::string make_native_moe_source(
         << "device const T* x [[buffer(22)]],\n"
         << "device const int* expert_ids [[buffer(23)]],\n"
         << "device const int* route_order [[buffer(24)]],\n"
-        << "device const float* params [[buffer(25)]],\n"
-        << "device T* y [[buffer(26)]],\n"
+        << "device const float* params [[buffer(25)]],\n";
+    if (has_expert_map) {
+        source << "device const int* expert_map [[buffer(26)]],\n";
+    }
+    source
+        << "device T* y [[buffer("
+        << (has_expert_map ? 27 : 26)
+        << ")]],\n"
         << "uint thread_index_in_simdgroup "
            "[[thread_index_in_simdgroup]],\n"
         << "uint simdgroup_index_in_threadgroup "
@@ -2840,6 +2860,14 @@ std::string make_native_moe_source(
         << config.npq_grouped_indices << ";\n"
         << "constexpr int SORTED_ROUTES = "
         << config.sorted_routes << ";\n"
+        << "constexpr int EXPERT_MAP_SIZE = "
+        << config.expert_map_size << ";\n"
+        << "constexpr int PACKED_EXPERT_IDS = "
+        << config.packed_expert_ids << ";\n";
+    if (!has_expert_map) {
+        source << "device const int* expert_map = expert_ids;\n";
+    }
+    source
         << kMoeSource
         << "\n}\n";
     return source.str();
@@ -2865,7 +2893,9 @@ public:
     void eval_gpu(
         const std::vector<array>& inputs,
         array& output) override {
-        if (inputs.size() != 26) {
+        const int input_count =
+            config_.expert_map_size != 0 ? 27 : 26;
+        if (inputs.size() != static_cast<std::size_t>(input_count)) {
             throw std::logic_error(
                 "native NINTM primitive input count mismatch");
         }
@@ -2891,12 +2921,12 @@ public:
             mlx::core::metal::get_command_encoder(
                 selected_stream);
         encoder.set_compute_pipeline_state(kernel);
-        for (int index = 0; index < 26; ++index) {
+        for (int index = 0; index < input_count; ++index) {
             encoder.set_input_array(
                 inputs[static_cast<std::size_t>(index)],
                 index);
         }
-        encoder.set_output_array(output, 26);
+        encoder.set_output_array(output, input_count);
         encoder.dispatch_threadgroups(
             MTL::Size(config_.workgroups, 1, 1),
             MTL::Size(64, 1, 1));
@@ -3132,6 +3162,7 @@ make_moe_kernel() {
             "expert_ids",
             "route_order",
             "params",
+            "expert_map",
         },
         {"y"},
         kMoeSource,
@@ -6912,6 +6943,30 @@ array MlxNintMoeWeight::routed_matmul(
         0.0f);
 }
 
+array MlxNintMoeWeight::routed_matmul_mapped(
+    const array& input,
+    const array& expert_ids,
+    const array& expert_map) const {
+    return routed_matmul_impl(
+        input,
+        expert_ids,
+        false,
+        0.0f,
+        &expert_map);
+}
+
+array MlxNintMoeWeight::routed_matmul_packed(
+    const array& input,
+    const array& packed_expert_ids) const {
+    return routed_matmul_impl(
+        input,
+        packed_expert_ids,
+        false,
+        0.0f,
+        nullptr,
+        true);
+}
+
 array MlxNintMoeWeight::routed_swiglu(
     const array& input,
     const array& expert_ids,
@@ -6933,6 +6988,56 @@ array MlxNintMoeWeight::routed_swiglu(
         expert_ids,
         true,
         limit);
+}
+
+array MlxNintMoeWeight::routed_swiglu_mapped(
+    const array& input,
+    const array& expert_ids,
+    const array& expert_map,
+    float limit) const {
+    if (
+        impl_->projections != 1
+        || impl_->out_per_expert <= 0
+        || (impl_->out_per_expert & 1) != 0
+    ) {
+        throw std::invalid_argument(
+            "fused NINTM SwiGLU requires one even-width gate/up projection");
+    }
+    if (!std::isfinite(limit) || limit < 0.0f) {
+        throw std::invalid_argument(
+            "NINTM SwiGLU limit must be finite and non-negative");
+    }
+    return routed_matmul_impl(
+        input,
+        expert_ids,
+        true,
+        limit,
+        &expert_map);
+}
+
+array MlxNintMoeWeight::routed_swiglu_packed(
+    const array& input,
+    const array& packed_expert_ids,
+    float limit) const {
+    if (
+        impl_->projections != 1
+        || impl_->out_per_expert <= 0
+        || (impl_->out_per_expert & 1) != 0
+    ) {
+        throw std::invalid_argument(
+            "fused NINTM SwiGLU requires one even-width gate/up projection");
+    }
+    if (!std::isfinite(limit) || limit < 0.0f) {
+        throw std::invalid_argument(
+            "NINTM SwiGLU limit must be finite and non-negative");
+    }
+    return routed_matmul_impl(
+        input,
+        packed_expert_ids,
+        true,
+        limit,
+        nullptr,
+        true);
 }
 
 bool MlxNintMoeWeight::supports_grouped_vq_mmq() const noexcept {
@@ -7149,8 +7254,35 @@ array MlxNintMoeWeight::routed_matmul_impl(
     const array& input,
     const array& expert_ids,
     bool fused_swiglu,
-    float swiglu_limit) const {
+    float swiglu_limit,
+    const array* expert_map,
+    bool packed_expert_ids) const {
     if (mlx_reference_enabled()) {
+        if (expert_map != nullptr) {
+            auto mapped_ids = mlx::core::take(
+                mlx::core::contiguous(mlx::core::astype(
+                    *expert_map,
+                    mlx::core::int32)),
+                expert_ids,
+                0);
+            return routed_bf16_reference(
+                input,
+                mapped_ids,
+                fused_swiglu,
+                swiglu_limit);
+        }
+        if (packed_expert_ids) {
+            auto mapped_ids =
+                mlx::core::floor_divide(
+                    expert_ids,
+                    array(256, mlx::core::int32)) -
+                array(1, mlx::core::int32);
+            return routed_bf16_reference(
+                input,
+                mapped_ids,
+                fused_swiglu,
+                swiglu_limit);
+        }
         return routed_bf16_reference(
             input,
             expert_ids,
@@ -7161,6 +7293,17 @@ array MlxNintMoeWeight::routed_matmul_impl(
         mlx::core::astype(
             expert_ids,
             mlx::core::int32));
+    auto map = expert_map != nullptr
+        ? mlx::core::contiguous(
+              mlx::core::astype(*expert_map, mlx::core::int32))
+        : ids;
+    const int expert_map_size = expert_map != nullptr
+        ? checked_int(map.size(), "expert page-table size")
+        : 0;
+    if (expert_map != nullptr && map.ndim() != 1) {
+        throw std::invalid_argument(
+            "expert page table must be one-dimensional");
+    }
     if (ids.ndim() != 2) {
         throw std::invalid_argument(
             "routed expert IDs must have "
@@ -7409,6 +7552,9 @@ array MlxNintMoeWeight::routed_matmul_impl(
                 source.dtype()));
     }
     if (impl_->native_primitive) {
+        if (expert_map != nullptr) {
+            kernel_inputs.push_back(map);
+        }
         return native_moe_dispatch(
             std::move(kernel_inputs),
             NativeMoeConfig{
@@ -7437,9 +7583,12 @@ array MlxNintMoeWeight::routed_matmul_impl(
                     impl_->npq_grouped_indices),
                 .sorted_routes = static_cast<int>(
                     sorted_routes),
+                .expert_map_size = expert_map_size,
+                .packed_expert_ids = static_cast<int>(packed_expert_ids),
                 .workgroups = static_cast<int>(workgroups),
             });
     }
+    kernel_inputs.push_back(map);
     auto outputs = moe_kernel()(
         std::move(kernel_inputs),
         {output_shape},
@@ -7497,6 +7646,11 @@ array MlxNintMoeWeight::routed_matmul_impl(
             {
                 "SORTED_ROUTES",
                 static_cast<int>(sorted_routes),
+            },
+            {"EXPERT_MAP_SIZE", expert_map_size},
+            {
+                "PACKED_EXPERT_IDS",
+                static_cast<int>(packed_expert_ids),
             },
         },
         std::nullopt,
@@ -7670,6 +7824,24 @@ array MlxRoutedLinear::forward(
     return weight_.routed_matmul(input, expert_ids);
 }
 
+array MlxRoutedLinear::forward_mapped(
+    const array& input,
+    const array& expert_ids,
+    const array& expert_map) const {
+    return weight_.routed_matmul_mapped(
+        input,
+        expert_ids,
+        expert_map);
+}
+
+array MlxRoutedLinear::forward_packed(
+    const array& input,
+    const array& packed_expert_ids) const {
+    return weight_.routed_matmul_packed(
+        input,
+        packed_expert_ids);
+}
+
 array MlxRoutedLinear::swiglu(
     const array& input,
     const array& expert_ids,
@@ -7680,12 +7852,53 @@ array MlxRoutedLinear::swiglu(
         limit);
 }
 
+array MlxRoutedLinear::swiglu_mapped(
+    const array& input,
+    const array& expert_ids,
+    const array& expert_map,
+    float limit) const {
+    return weight_.routed_swiglu_mapped(
+        input,
+        expert_ids,
+        expert_map,
+        limit);
+}
+
+array MlxRoutedLinear::swiglu_packed(
+    const array& input,
+    const array& packed_expert_ids,
+    float limit) const {
+    return weight_.routed_swiglu_packed(
+        input,
+        packed_expert_ids,
+        limit);
+}
+
 array MlxRoutedLinear::combine(
     const array& input,
     const array& expert_ids,
     const array& route_weights) const {
     return moe_weighted_reduce(
         forward(input, expert_ids),
+        route_weights);
+}
+
+array MlxRoutedLinear::combine_mapped(
+    const array& input,
+    const array& expert_ids,
+    const array& expert_map,
+    const array& route_weights) const {
+    return moe_weighted_reduce(
+        forward_mapped(input, expert_ids, expert_map),
+        route_weights);
+}
+
+array MlxRoutedLinear::combine_packed(
+    const array& input,
+    const array& packed_expert_ids,
+    const array& route_weights) const {
+    return moe_weighted_reduce(
+        forward_packed(input, packed_expert_ids),
         route_weights);
 }
 

@@ -37,6 +37,15 @@ MlxMoeTopKResult moe_dense_router_topk(
     float norm_floor = 1e-20f,
     float scale = 1.0f);
 
+MlxMoeTopKResult moe_dense_router_topk_packed(
+    const mlx::core::array& input,
+    const mlx::core::array& weight,
+    const mlx::core::array& expert_map,
+    const std::optional<mlx::core::array>& bias = std::nullopt,
+    const std::optional<mlx::core::array>& available = std::nullopt,
+    float norm_floor = 1e-20f,
+    float scale = 1.0f);
+
 mlx::core::array moe_sqrtsoftplus_weights(
     const mlx::core::array& logits,
     const mlx::core::array& ids,

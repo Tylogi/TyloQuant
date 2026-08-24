@@ -26,6 +26,9 @@ struct MlxDeepseekV4SsdCacheStats {
     std::uint64_t prefill_cache_hits = 0;
     std::uint64_t prefill_expert_reads = 0;
     std::uint64_t prefill_bytes_read = 0;
+    std::uint64_t device_route_layers = 0;
+    std::uint64_t device_route_hits = 0;
+    std::uint64_t device_route_misses = 0;
     double io_seconds = 0.0;
     double wait_seconds = 0.0;
     double prefill_wait_seconds = 0.0;
@@ -34,6 +37,8 @@ struct MlxDeepseekV4SsdCacheStats {
     double route_host_seconds = 0.0;
     double prepare_seconds = 0.0;
     double view_seconds = 0.0;
+    double device_route_eval_seconds = 0.0;
+    double device_route_host_seconds = 0.0;
     std::size_t resident_experts = 0;
     std::size_t resident_bytes = 0;
     std::size_t cache_slots = 0;
@@ -44,6 +49,17 @@ struct MlxDeepseekV4SsdCacheStats {
             : static_cast<double>(hits) /
                 static_cast<double>(requests);
     }
+};
+
+struct MlxDeepseekV4SsdRouteSelection {
+    std::size_t layer = 0;
+    std::vector<std::int32_t> experts;
+    bool all_hit = false;
+};
+
+struct MlxDeepseekV4SsdRouteTransactionResult {
+    std::vector<MlxDeepseekV4SsdRouteSelection> routes;
+    bool all_hit = true;
 };
 
 class MlxDeepseekV4SsdPrefetchedLayer {
@@ -99,6 +115,50 @@ private:
     friend class MlxDeepseekV4SsdExpertCache;
 };
 
+// Immutable resident page-table view for one routed-expert layer. While this
+// handle is alive, cache slots present in the table cannot be evicted or
+// reused. Readiness is represented explicitly and a missing expert maps to
+// slot -1, which routed Metal kernels treat as a zero-output route. Call
+// finish() only after all arrays using the page table have been evaluated.
+class MlxDeepseekV4SsdPageTableSnapshot {
+public:
+    MlxDeepseekV4SsdPageTableSnapshot(
+        MlxDeepseekV4SsdPageTableSnapshot&&) noexcept;
+    MlxDeepseekV4SsdPageTableSnapshot& operator=(
+        MlxDeepseekV4SsdPageTableSnapshot&&) noexcept;
+    ~MlxDeepseekV4SsdPageTableSnapshot();
+
+    MlxDeepseekV4SsdPageTableSnapshot(
+        const MlxDeepseekV4SsdPageTableSnapshot&) = delete;
+    MlxDeepseekV4SsdPageTableSnapshot& operator=(
+        const MlxDeepseekV4SsdPageTableSnapshot&) = delete;
+
+    const MlxDeepseekV4SsdExpertWeights& weights() const noexcept;
+    const mlx::core::array& slot_ids() const noexcept;
+    const mlx::core::array& generations() const noexcept;
+    const mlx::core::array& readiness() const noexcept;
+    std::span<const std::int32_t> slot_for_expert() const noexcept;
+
+    void finish(
+        std::span<const std::int32_t> active_experts,
+        bool all_hit,
+        double eval_seconds,
+        double host_seconds);
+    void defer_finish(
+        std::span<const std::int32_t> active_experts,
+        double eval_seconds,
+        double host_seconds);
+    void defer_transaction(const mlx::core::array& packed_expert_ids);
+
+private:
+    struct Impl;
+    explicit MlxDeepseekV4SsdPageTableSnapshot(
+        std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+
+    friend class MlxDeepseekV4SsdExpertCache;
+};
+
 // Concurrent exact-expert LRU over the shared MLX UMA arena. Safetensors on
 // SSD are the complete expert pool and the arena is the only physical cache:
 // CPU IO workers fill its pages and Metal consumes those same pages in place,
@@ -132,6 +192,23 @@ public:
             std::span<const std::int32_t> pending_experts,
             std::span<const std::int32_t> slot_for_expert)> gate_up_ready = {});
 
+    // Freeze the current resident mapping for a layer and expose it as device
+    // arrays. This is the decode fast path: routing IDs can be remapped to
+    // arena slots without a host synchronization before routed MoE execution.
+    MlxDeepseekV4SsdPageTableSnapshot snapshot_page_table(
+        std::size_t layer);
+
+    // A decode route transaction keeps all page-table generations frozen
+    // while one complete lazy token graph runs. Packed route IDs are checked
+    // only at the final model evaluation boundary. A miss therefore never
+    // escapes as output: the model can pin the returned routes and replay the
+    // token from its lightweight cache checkpoint.
+    void begin_route_transaction();
+    bool route_transaction_active() const noexcept;
+    bool route_layer_likely_hit(std::size_t layer) const noexcept;
+    MlxDeepseekV4SsdRouteTransactionResult resolve_route_transaction();
+    void cancel_route_transaction() noexcept;
+
     // Start loading a complete routed-expert layer into one of two alternating
     // buffers. Resident LRU rows are pinned and reused in place; only misses
     // consume SSD bandwidth. Call wait() before submitting the layer's Metal
@@ -159,6 +236,7 @@ private:
     std::shared_ptr<Impl> impl_;
 
     friend class MlxDeepseekV4SsdPrefetchedLayer;
+    friend class MlxDeepseekV4SsdPageTableSnapshot;
 };
 
 } // namespace mfq::metal

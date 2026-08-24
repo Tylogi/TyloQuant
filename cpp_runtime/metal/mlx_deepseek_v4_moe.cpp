@@ -31,6 +31,11 @@ double current_thread_cpu_seconds() noexcept {
         static_cast<double>(value.tv_nsec) * 1.0e-9;
 }
 
+bool ssd_device_route_enabled() noexcept {
+    const char* value = std::getenv("MFQ_SSD_DEVICE_ROUTE");
+    return value != nullptr && std::string_view(value) != "0";
+}
+
 int checked_int(std::size_t value, const char* name) {
     if (value >
         static_cast<std::size_t>(
@@ -957,6 +962,17 @@ MlxDeepseekV4Moe::forward_branches(
         && moe_dense_router_topk_supported(
             source,
             *dense_router);
+    std::optional<MlxDeepseekV4SsdPageTableSnapshot>
+        device_route_snapshot;
+    const bool route_transaction =
+        ssd_expert_cache_ &&
+        ssd_expert_cache_->route_transaction_active();
+    if (ssd_expert_cache_ && prefetched == nullptr && rows == 1 &&
+        (route_transaction || ssd_device_route_enabled()) &&
+        (use_fused_dense_router || route_transaction)) {
+        device_route_snapshot.emplace(
+            ssd_expert_cache_->snapshot_page_table(layer_));
+    }
     auto projections = project_shared(
         source,
         static_cast<float>(config_.swiglu_limit),
@@ -999,16 +1015,31 @@ MlxDeepseekV4Moe::forward_branches(
     array expert_weights = mlx::core::zeros(
         expert_ids.shape(),
         mlx::core::float32);
+    bool packed_expert_ids = false;
     if (use_fused_dense_router) {
-        auto routing = moe_dense_router_topk(
-            source,
-            *dense_router,
-            router_bias_,
-            available_,
-            1e-20f,
-            static_cast<float>(config_.routed_scaling));
-        expert_ids = std::move(routing.ids);
-        expert_weights = std::move(routing.weights);
+        if (device_route_snapshot.has_value()) {
+            auto routing = moe_dense_router_topk_packed(
+                source,
+                *dense_router,
+                device_route_snapshot->slot_ids(),
+                router_bias_,
+                available_,
+                1e-20f,
+                static_cast<float>(config_.routed_scaling));
+            expert_ids = std::move(routing.ids);
+            expert_weights = std::move(routing.weights);
+            packed_expert_ids = true;
+        } else {
+            auto routing = moe_dense_router_topk(
+                source,
+                *dense_router,
+                router_bias_,
+                available_,
+                1e-20f,
+                static_cast<float>(config_.routed_scaling));
+            expert_ids = std::move(routing.ids);
+            expert_weights = std::move(routing.weights);
+        }
     } else if (token_experts_.has_value()) {
         auto ids = token_ids;
         if (ids.dtype() != mlx::core::int32 &&
@@ -1079,6 +1110,20 @@ MlxDeepseekV4Moe::forward_branches(
         expert_ids = std::move(routing.ids);
         expert_weights = std::move(routing.weights);
     }
+    if (device_route_snapshot.has_value() && !packed_expert_ids) {
+        const auto slots = mlx::core::take(
+            device_route_snapshot->slot_ids(),
+            expert_ids,
+            0);
+        expert_ids = mlx::core::bitwise_or(
+            expert_ids,
+            mlx::core::left_shift(
+                mlx::core::add(
+                    slots,
+                    array(1, mlx::core::int32)),
+                array(8, mlx::core::int32)));
+        packed_expert_ids = true;
+    }
     if (detail::component_profile_active()) {
         detail::profile_eval(
             "moe.routing",
@@ -1132,7 +1177,9 @@ MlxDeepseekV4Moe::forward_branches(
         const MlxRoutedLinear* down,
         const array* selected_ids = nullptr,
         const array* selected_weights = nullptr,
-        const array* precomputed_hidden = nullptr) {
+        const array* precomputed_hidden = nullptr,
+        const array* expert_map = nullptr,
+        bool packed_expert_ids = false) {
         const auto& route_ids = selected_ids != nullptr
             ? *selected_ids
             : expert_ids;
@@ -1240,29 +1287,62 @@ MlxDeepseekV4Moe::forward_branches(
                 : [&]() {
                     if (split_resident) {
                         return limited_swiglu_pair(
-                            gate->forward(
-                                source,
-                                route_ids),
-                            up->forward(
-                                source,
-                                route_ids),
+                            expert_map != nullptr
+                                ? gate->forward_mapped(
+                                      source,
+                                      route_ids,
+                                      *expert_map)
+                                : packed_expert_ids
+                                    ? gate->forward_packed(
+                                          source,
+                                          route_ids)
+                                    : gate->forward(source, route_ids),
+                            expert_map != nullptr
+                                ? up->forward_mapped(
+                                      source,
+                                      route_ids,
+                                      *expert_map)
+                                : packed_expert_ids
+                                    ? up->forward_packed(
+                                          source,
+                                          route_ids)
+                                    : up->forward(source, route_ids),
                             static_cast<float>(
                                 config_.swiglu_limit));
                     }
-                    return gate_up->swiglu(
-                        source,
-                        route_ids,
-                        static_cast<float>(
-                            config_.swiglu_limit));
+                    return expert_map != nullptr
+                        ? gate_up->swiglu_mapped(
+                              source,
+                              route_ids,
+                              *expert_map,
+                              static_cast<float>(
+                                  config_.swiglu_limit))
+                        : packed_expert_ids
+                            ? gate_up->swiglu_packed(
+                                  source,
+                                  route_ids,
+                                  static_cast<float>(
+                                      config_.swiglu_limit))
+                            : gate_up->swiglu(
+                                  source,
+                                  route_ids,
+                                  static_cast<float>(
+                                      config_.swiglu_limit));
                 }();
             if (detail::component_profile_active()) {
                 detail::profile_eval(
                     "moe.routed_gate_up_swiglu",
                     routed_hidden);
-                auto routed_pairs =
-                    down->forward(
-                        routed_hidden,
-                        route_ids);
+                auto routed_pairs = expert_map != nullptr
+                    ? down->forward_mapped(
+                          routed_hidden,
+                          route_ids,
+                          *expert_map)
+                    : packed_expert_ids
+                        ? down->forward_packed(
+                              routed_hidden,
+                              route_ids)
+                        : down->forward(routed_hidden, route_ids);
                 detail::profile_eval(
                     "moe.routed_down",
                     routed_pairs);
@@ -1274,10 +1354,21 @@ MlxDeepseekV4Moe::forward_branches(
                     output);
                 return output;
             } else {
-                return down->combine(
-                    routed_hidden,
-                    route_ids,
-                    route_weights);
+                return expert_map != nullptr
+                    ? down->combine_mapped(
+                          routed_hidden,
+                          route_ids,
+                          *expert_map,
+                          route_weights)
+                    : packed_expert_ids
+                        ? down->combine_packed(
+                              routed_hidden,
+                              route_ids,
+                              route_weights)
+                        : down->combine(
+                              routed_hidden,
+                              route_ids,
+                              route_weights);
             }
         }
     };
@@ -1291,43 +1382,145 @@ MlxDeepseekV4Moe::forward_branches(
                 &weights.down);
             detail::eval_with_timing(routed);
         } else {
-            auto host_ids = mlx::core::contiguous(
-                mlx::core::astype(expert_ids, mlx::core::int32));
-            const auto route_sync_begin =
-                std::chrono::steady_clock::now();
-            const double route_sync_cpu_begin =
-                current_thread_cpu_seconds();
-            detail::eval_with_timing(host_ids);
-            const double route_sync_cpu_seconds =
-                current_thread_cpu_seconds() - route_sync_cpu_begin;
-            const double route_sync_seconds =
-                std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() -
-                    route_sync_begin).count();
-            const auto route_host_begin =
-                std::chrono::steady_clock::now();
-            std::vector<std::int32_t> active(
-                host_ids.data<std::int32_t>(),
-                host_ids.data<std::int32_t>() + host_ids.size());
-            active.erase(
-                std::remove_if(
-                    active.begin(),
-                    active.end(),
-                    [](std::int32_t expert) { return expert < 0; }),
-                active.end());
-            std::sort(active.begin(), active.end());
-            active.erase(
-                std::unique(active.begin(), active.end()),
-                active.end());
-            const double route_host_seconds =
-                std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() -
-                    route_host_begin).count();
-            ssd_expert_cache_->record_route_timing(
-                route_sync_seconds,
-                route_sync_cpu_seconds,
-                route_host_seconds);
-            shared.emplace(build_shared());
+            bool device_route_hit = false;
+            std::optional<array> evaluated_host_ids;
+            std::optional<std::vector<std::int32_t>> evaluated_active;
+            if (device_route_snapshot.has_value() &&
+                packed_expert_ids && route_transaction) {
+                auto& snapshot = *device_route_snapshot;
+                shared.emplace(build_shared());
+                routed = run_resident(
+                    &snapshot.weights().gate_up,
+                    nullptr,
+                    nullptr,
+                    &snapshot.weights().down,
+                    &expert_ids,
+                    &expert_weights,
+                    nullptr,
+                    nullptr,
+                    true);
+                snapshot.defer_transaction(expert_ids);
+                device_route_hit = true;
+            }
+            if (device_route_snapshot.has_value() &&
+                packed_expert_ids && !device_route_hit) {
+                auto& snapshot = *device_route_snapshot;
+                auto host_ids = mlx::core::contiguous(
+                    mlx::core::astype(expert_ids, mlx::core::int32));
+                const auto eval_begin =
+                    std::chrono::steady_clock::now();
+                detail::eval_with_timing(
+                    std::vector<array>{
+                        host_ids,
+                        expert_weights,
+                    });
+                const double eval_seconds =
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() -
+                        eval_begin).count();
+                const auto host_begin =
+                    std::chrono::steady_clock::now();
+                std::vector<std::int32_t> global_ids(host_ids.size());
+                std::transform(
+                    host_ids.data<std::int32_t>(),
+                    host_ids.data<std::int32_t>() + host_ids.size(),
+                    global_ids.begin(),
+                    [](std::int32_t encoded) { return encoded & 0xff; });
+                std::vector<std::int32_t> active(global_ids);
+                active.erase(
+                    std::remove_if(
+                        active.begin(),
+                        active.end(),
+                        [](std::int32_t expert) { return expert < 0; }),
+                    active.end());
+                std::sort(active.begin(), active.end());
+                active.erase(
+                    std::unique(active.begin(), active.end()),
+                    active.end());
+                device_route_hit = std::all_of(
+                    host_ids.data<std::int32_t>(),
+                    host_ids.data<std::int32_t>() + host_ids.size(),
+                    [](std::int32_t encoded) {
+                        return (encoded >> 8) - 1 >= 0;
+                    });
+                const double host_seconds =
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() -
+                        host_begin).count();
+                if (device_route_hit) {
+                    shared.emplace(build_shared());
+                    routed = run_resident(
+                        &snapshot.weights().gate_up,
+                        nullptr,
+                        nullptr,
+                        &snapshot.weights().down,
+                        &expert_ids,
+                        &expert_weights,
+                        nullptr,
+                        nullptr,
+                        true);
+                    snapshot.defer_finish(
+                        active,
+                        eval_seconds,
+                        host_seconds);
+                } else {
+                    snapshot.finish(
+                        active,
+                        false,
+                        eval_seconds,
+                        host_seconds);
+                    evaluated_host_ids.emplace(
+                        array(global_ids.begin(), expert_ids.shape()));
+                    evaluated_active.emplace(std::move(active));
+                }
+            }
+            if (!device_route_hit) {
+            auto host_ids = evaluated_host_ids.has_value()
+                ? std::move(*evaluated_host_ids)
+                : mlx::core::contiguous(
+                      mlx::core::astype(expert_ids, mlx::core::int32));
+            std::vector<std::int32_t> active;
+            if (evaluated_active.has_value()) {
+                active = std::move(*evaluated_active);
+            } else {
+                const auto route_sync_begin =
+                    std::chrono::steady_clock::now();
+                const double route_sync_cpu_begin =
+                    current_thread_cpu_seconds();
+                detail::eval_with_timing(host_ids);
+                const double route_sync_cpu_seconds =
+                    current_thread_cpu_seconds() - route_sync_cpu_begin;
+                const double route_sync_seconds =
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() -
+                        route_sync_begin).count();
+                const auto route_host_begin =
+                    std::chrono::steady_clock::now();
+                active.assign(
+                    host_ids.data<std::int32_t>(),
+                    host_ids.data<std::int32_t>() + host_ids.size());
+                active.erase(
+                    std::remove_if(
+                        active.begin(),
+                        active.end(),
+                        [](std::int32_t expert) { return expert < 0; }),
+                    active.end());
+                std::sort(active.begin(), active.end());
+                active.erase(
+                    std::unique(active.begin(), active.end()),
+                    active.end());
+                const double route_host_seconds =
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() -
+                        route_host_begin).count();
+                ssd_expert_cache_->record_route_timing(
+                    route_sync_seconds,
+                    route_sync_cpu_seconds,
+                    route_host_seconds);
+            }
+            if (!shared.has_value()) {
+                shared.emplace(build_shared());
+            }
             std::optional<array> ready_gate_up;
             std::optional<array> ready_down;
             std::optional<array> pending_gate_up;
@@ -1508,6 +1701,7 @@ MlxDeepseekV4Moe::forward_branches(
                     &weights.down,
                     &resident_ids,
                     &expert_weights);
+            }
             }
         }
     } else if (!expert_offload_) {

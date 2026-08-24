@@ -111,6 +111,27 @@ int main() {
                 0.0f);
         compare(gate_up, swiglu_reference, "SSD MXFP4 Gate/Up SwiGLU");
         compare(slot_gate_up, gate_up, "SSD identity-slot Gate/Up SwiGLU");
+        const std::vector<std::int32_t> reversed_map{1, 0};
+        auto reversed_weights = arena.routed_weights(reversed_map, active);
+        auto mapped_gate_up = arena.slot_weights().gate_up.swiglu_mapped(
+            input,
+            ids,
+            array(reversed_map.begin(), Shape{2}),
+            0.0f);
+        compare(
+            mapped_gate_up,
+            reversed_weights.gate_up.swiglu(input, ids, 0.0f),
+            "SSD mapped-slot Gate/Up SwiGLU");
+        const array packed_ids(
+            std::vector<std::int32_t>{512, 257}.begin(),
+            Shape{2, 1});
+        compare(
+            arena.slot_weights().gate_up.swiglu_packed(
+                input,
+                packed_ids,
+                0.0f),
+            reversed_weights.gate_up.swiglu(input, ids, 0.0f),
+            "SSD packed-slot Gate/Up SwiGLU");
 
         auto down_input = make_input(2, 2048);
         auto routed_down_input = mlx::core::expand_dims(down_input, 1);
@@ -127,6 +148,20 @@ int main() {
             1);
         compare(down, down_reference, "SSD MXFP4 down");
         compare(slot_down, down, "SSD identity-slot down");
+        auto mapped_down = arena.slot_weights().down.forward_mapped(
+            routed_down_input,
+            ids,
+            array(reversed_map.begin(), Shape{2}));
+        compare(
+            mapped_down,
+            reversed_weights.down.forward(routed_down_input, ids),
+            "SSD mapped-slot down");
+        compare(
+            arena.slot_weights().down.forward_packed(
+                routed_down_input,
+                packed_ids),
+            reversed_weights.down.forward(routed_down_input, ids),
+            "SSD packed-slot down");
 
         std::cout << "MLX SSD expert arena passed\n";
         return 0;
