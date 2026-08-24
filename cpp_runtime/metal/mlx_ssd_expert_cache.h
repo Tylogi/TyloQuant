@@ -119,7 +119,10 @@ public:
         std::span<const std::int32_t> active_experts,
         std::function<void(
             const MlxDeepseekV4SsdExpertWeights&,
-            std::span<const std::int32_t>)> overlap = {});
+            std::span<const std::int32_t>)> overlap = {},
+        std::function<void(
+            const MlxDeepseekV4SsdExpertWeights&,
+            std::span<const std::int32_t>)> gate_up_ready = {});
 
     // Start loading a complete routed-expert layer into one of two alternating
     // buffers. Resident LRU rows are pinned and reused in place; only misses

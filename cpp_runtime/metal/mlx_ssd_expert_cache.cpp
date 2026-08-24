@@ -42,6 +42,7 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
         std::uint64_t generation = 0;
         std::uint64_t last_use = 0;
         std::size_t pins = 0;
+        std::shared_future<void> gate_up_ready;
         std::shared_future<void> ready;
     };
 
@@ -52,12 +53,14 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
         std::size_t layer = 0;
         std::int32_t expert = 0;
         bool cache_admission = true;
+        std::shared_ptr<std::promise<void>> gate_up_completion;
         std::shared_ptr<std::promise<void>> completion;
     };
 
     struct Acquisition {
         std::size_t slot = 0;
         std::uint64_t generation = 0;
+        std::shared_future<void> gate_up_ready;
         std::shared_future<void> ready;
     };
 
@@ -121,6 +124,7 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
                 return {
                     .slot = found->second,
                     .generation = slot.generation,
+                    .gate_up_ready = slot.gate_up_ready,
                     .ready = slot.ready,
                 };
             }
@@ -150,12 +154,16 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
             resident.erase(slot.key);
             ++counters.evictions;
         }
+        auto gate_up_completion =
+            std::make_shared<std::promise<void>>();
         auto completion = std::make_shared<std::promise<void>>();
         slot.state = State::loading;
         slot.key = key;
         ++slot.generation;
         slot.last_use = ++clock;
         slot.pins = 1;
+        slot.gate_up_ready =
+            gate_up_completion->get_future().share();
         slot.ready = completion->get_future().share();
         resident.emplace(key, victim);
         ++counters.misses;
@@ -166,11 +174,13 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
             .layer = layer,
             .expert = expert,
             .cache_admission = true,
+            .gate_up_completion = gate_up_completion,
             .completion = completion,
         });
         const auto result = Acquisition{
             .slot = victim,
             .generation = slot.generation,
+            .gate_up_ready = slot.gate_up_ready,
             .ready = slot.ready,
         };
         lock.unlock();
@@ -194,6 +204,7 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
         return Acquisition{
             .slot = found->second,
             .generation = slot.generation,
+            .gate_up_ready = slot.gate_up_ready,
             .ready = slot.ready,
         };
     }
@@ -213,6 +224,7 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
                 .layer = layer,
                 .expert = expert,
                 .cache_admission = false,
+                .gate_up_completion = {},
                 .completion = std::move(completion),
             });
         }
@@ -301,11 +313,29 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
                 tasks.pop_front();
             }
             const auto begin = std::chrono::steady_clock::now();
+            bool gate_up_completed = false;
             try {
-                const auto result = store.load_scatter(
-                    task.layer,
-                    static_cast<std::size_t>(task.expert),
-                    arena.destination(task.arena_slot));
+                DeepseekV4NativeExpertLoadStats result;
+                if (task.cache_admission) {
+                    const auto destination = arena.destination(task.arena_slot);
+                    const auto gate_up = store.load_gate_up_scatter(
+                        task.layer,
+                        static_cast<std::size_t>(task.expert),
+                        destination);
+                    task.gate_up_completion->set_value();
+                    gate_up_completed = true;
+                    const auto down = store.load_down_scatter(
+                        task.layer,
+                        static_cast<std::size_t>(task.expert),
+                        destination);
+                    result.bytes = gate_up.bytes + down.bytes;
+                    result.read_calls = gate_up.read_calls + down.read_calls;
+                } else {
+                    result = store.load_scatter(
+                        task.layer,
+                        static_cast<std::size_t>(task.expert),
+                        arena.destination(task.arena_slot));
+                }
                 const auto seconds = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - begin).count();
                 {
@@ -329,6 +359,7 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
                 }
                 task.completion->set_value();
             } catch (...) {
+                const auto error = std::current_exception();
                 {
                     std::scoped_lock lock(mutex);
                     if (task.cache_admission) {
@@ -339,8 +370,15 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
                     }
                     ++counters.failures;
                 }
+                if (!gate_up_completed && task.gate_up_completion) {
+                    try {
+                        task.gate_up_completion->set_exception(
+                            error);
+                    } catch (...) {
+                    }
+                }
                 try {
-                    task.completion->set_exception(std::current_exception());
+                    task.completion->set_exception(error);
                 } catch (...) {
                 }
             }
@@ -525,7 +563,10 @@ MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
     std::span<const std::int32_t> active_experts,
     std::function<void(
         const MlxDeepseekV4SsdExpertWeights&,
-        std::span<const std::int32_t>)> overlap) {
+        std::span<const std::int32_t>)> overlap,
+    std::function<void(
+        const MlxDeepseekV4SsdExpertWeights&,
+        std::span<const std::int32_t>)> gate_up_ready) {
     const auto prepare_begin = std::chrono::steady_clock::now();
     // The caller has evaluated the current layer's routing IDs before this
     // point, which also completes the previous layer graph. Its arena rows can
@@ -545,7 +586,9 @@ MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
             acquisitions.push_back(impl_->acquire(layer, expert));
         }
         std::vector<std::int32_t> ready_experts;
+        std::vector<std::int32_t> pending_experts;
         ready_experts.reserve(unique.size());
+        pending_experts.reserve(unique.size());
         bool pending = false;
         for (std::size_t index = 0; index < acquisitions.size(); ++index) {
             if (acquisitions[index].ready.wait_for(
@@ -554,6 +597,7 @@ MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
                 ready_experts.push_back(unique[index]);
             } else {
                 pending = true;
+                pending_experts.push_back(unique[index]);
             }
         }
         std::vector<std::int32_t> slot_map(impl_->store.num_experts(), -1);
@@ -569,6 +613,15 @@ MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
         if (pending && overlap) {
             overlap(weights, ready_experts);
         }
+        const auto gate_wait_begin = std::chrono::steady_clock::now();
+        for (const auto& acquired : acquisitions) {
+            acquired.gate_up_ready.get();
+        }
+        const auto gate_wait_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - gate_wait_begin).count();
+        if (pending && gate_up_ready) {
+            gate_up_ready(weights, pending_experts);
+        }
         const auto wait_begin = std::chrono::steady_clock::now();
         for (const auto& acquired : acquisitions) {
             acquired.ready.get();
@@ -577,7 +630,8 @@ MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
             std::chrono::steady_clock::now() - wait_begin).count();
         {
             std::scoped_lock lock(impl_->mutex);
-            impl_->counters.wait_seconds += wait_seconds;
+            impl_->counters.wait_seconds +=
+                gate_wait_seconds + wait_seconds;
         }
         const auto prepare_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - prepare_begin).count();

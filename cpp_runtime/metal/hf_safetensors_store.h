@@ -88,8 +88,9 @@ struct DeepseekV4NativeExpertLoadStats {
 
 // Exact, non-quantizing view of the official DeepSeek-V4 routed experts. Each
 // cache slot preserves the checkpoint's native MXFP4 I8 payload and F8_E8M0
-// scales. A cold expert is normally fetched with two pread calls: one contiguous
-// scale run and one contiguous packed-weight run.
+// scales. Full loads use one contiguous scale read and one contiguous packed-
+// weight read. Decode cache admission may instead expose Gate/Up before Down
+// with phased reads so Metal can consume one region while SSD fills another.
 class DeepseekV4NativeExpertStore {
 public:
     static constexpr std::size_t kParts = 6;
@@ -110,6 +111,14 @@ public:
         std::size_t expert,
         std::span<std::byte> slot) const;
     DeepseekV4NativeExpertLoadStats load_scatter(
+        std::size_t layer,
+        std::size_t expert,
+        const DeepseekV4NativeExpertDestination& destination) const;
+    DeepseekV4NativeExpertLoadStats load_gate_up_scatter(
+        std::size_t layer,
+        std::size_t expert,
+        const DeepseekV4NativeExpertDestination& destination) const;
+    DeepseekV4NativeExpertLoadStats load_down_scatter(
         std::size_t layer,
         std::size_t expert,
         const DeepseekV4NativeExpertDestination& destination) const;
