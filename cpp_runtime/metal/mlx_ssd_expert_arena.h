@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -40,6 +41,11 @@ public:
         const std::vector<std::int32_t>& slot_for_expert,
         std::span<const std::int32_t> active_experts) const;
 
+    // Immutable identity view used by decode after the six routed expert IDs
+    // have been remapped to arena slots on the host. It avoids rebuilding two
+    // descriptor tables at every layer boundary.
+    const MlxDeepseekV4SsdExpertWeights& slot_weights() const noexcept;
+
     MlxMxWeight expert_weight(
         std::size_t slot,
         char projection) const;
@@ -66,6 +72,7 @@ private:
     Bank w2_scale_;
     Bank gate_up_weight_;
     Bank w2_weight_;
+    std::unique_ptr<MlxDeepseekV4SsdExpertWeights> slot_weights_;
 };
 
 } // namespace mfq::metal

@@ -1307,6 +1307,7 @@ MlxDeepseekV4Moe::forward_branches(
             std::optional<array> ready_gate_up;
             std::optional<array> ready_down;
             std::optional<array> pending_gate_up;
+            std::optional<array> pending_slot_ids;
             std::vector<std::int32_t> ready_positions;
             std::vector<std::int32_t> pending_positions;
             auto prepared = ssd_expert_cache_->prepare(
@@ -1314,7 +1315,6 @@ MlxDeepseekV4Moe::forward_branches(
                 active,
                 [
                     &active,
-                    &expert_ids,
                     &host_ids,
                     &pending_positions,
                     &ready_gate_up,
@@ -1326,21 +1326,21 @@ MlxDeepseekV4Moe::forward_branches(
                     this
                 ](
                     const MlxDeepseekV4SsdExpertWeights& weights,
-                    std::span<const std::int32_t> ready_experts) {
+                    std::span<const std::int32_t> ready_experts,
+                    std::span<const std::int32_t> slot_for_expert) {
                     std::vector<array> overlap_values;
                     overlap_values.push_back(*shared);
                     if (rows == 1 &&
                         ready_experts.size() < active.size()) {
                         const auto* ids = host_ids.data<std::int32_t>();
-                        const auto routes = static_cast<std::size_t>(
-                            expert_ids.shape(1));
+                        const auto routes = host_ids.size();
                         ready_positions.reserve(routes);
                         pending_positions.reserve(routes);
                         for (std::size_t position = 0;
                              position < routes;
                              ++position) {
                             const auto expert = ids[position];
-                            if (std::binary_search(
+                            if (expert < 0 || std::binary_search(
                                     ready_experts.begin(),
                                     ready_experts.end(),
                                     expert)) {
@@ -1352,14 +1352,21 @@ MlxDeepseekV4Moe::forward_branches(
                             }
                         }
                         if (!ready_positions.empty()) {
-                            const array positions(
-                                ready_positions.begin(),
-                                Shape{static_cast<int>(
-                                    ready_positions.size())});
-                            auto ready_ids = mlx::core::take(
-                                expert_ids,
-                                positions,
-                                1);
+                            std::vector<std::int32_t> ready_slots;
+                            ready_slots.reserve(ready_positions.size());
+                            for (const auto position : ready_positions) {
+                                const auto expert = ids[position];
+                                ready_slots.push_back(expert < 0
+                                    ? -1
+                                    : slot_for_expert[
+                                          static_cast<std::size_t>(expert)]);
+                            }
+                            const array ready_ids(
+                                ready_slots.begin(),
+                                Shape{
+                                    1,
+                                    static_cast<int>(ready_slots.size()),
+                                });
                             ready_gate_up.emplace(
                                 weights.gate_up.swiglu(
                                     source,
@@ -1377,45 +1384,58 @@ MlxDeepseekV4Moe::forward_branches(
                         std::move(overlap_values));
                 },
                 [
-                    &expert_ids,
+                    &host_ids,
                     &pending_gate_up,
                     &pending_positions,
+                    &pending_slot_ids,
                     &source,
                     rows,
                     this
                 ](
                     const MlxDeepseekV4SsdExpertWeights& weights,
-                    std::span<const std::int32_t>) {
+                    std::span<const std::int32_t>,
+                    std::span<const std::int32_t> slot_for_expert) {
                     if (rows != 1 || pending_positions.empty()) {
                         return;
                     }
-                    const array positions(
-                        pending_positions.begin(),
-                        Shape{static_cast<int>(pending_positions.size())});
-                    auto pending_ids = mlx::core::take(
-                        expert_ids,
-                        positions,
-                        1);
+                    const auto* ids = host_ids.data<std::int32_t>();
+                    std::vector<std::int32_t> pending_slots;
+                    pending_slots.reserve(pending_positions.size());
+                    for (const auto position : pending_positions) {
+                        pending_slots.push_back(slot_for_expert[
+                            static_cast<std::size_t>(ids[position])]);
+                    }
+                    pending_slot_ids.emplace(
+                        pending_slots.begin(),
+                        Shape{
+                            1,
+                            static_cast<int>(pending_slots.size()),
+                        });
                     pending_gate_up.emplace(
                         weights.gate_up.swiglu(
                             source,
-                            pending_ids,
+                            *pending_slot_ids,
                             static_cast<float>(config_.swiglu_limit)));
                     detail::eval_with_timing(*pending_gate_up);
                 });
             const auto& weights = prepared.weights();
+            const auto slot_for_expert = prepared.slot_for_expert();
+            const auto* global_ids = host_ids.data<std::int32_t>();
+            std::vector<std::int32_t> resident_slot_values(host_ids.size());
+            for (std::size_t index = 0; index < host_ids.size(); ++index) {
+                const auto expert = global_ids[index];
+                resident_slot_values[index] = expert < 0
+                    ? -1
+                    : slot_for_expert[static_cast<std::size_t>(expert)];
+            }
+            const array resident_ids(
+                resident_slot_values.begin(),
+                expert_ids.shape());
             if (ready_down.has_value() &&
                 pending_gate_up.has_value()) {
-                const array pending_indices(
-                    pending_positions.begin(),
-                    Shape{static_cast<int>(pending_positions.size())});
-                auto pending_ids = mlx::core::take(
-                    expert_ids,
-                    pending_indices,
-                    1);
                 auto pending_down = weights.down.forward(
                     *pending_gate_up,
-                    pending_ids);
+                    *pending_slot_ids);
                 std::vector<std::int32_t> reorder(
                     ready_positions.size() + pending_positions.size());
                 for (std::size_t index = 0;
@@ -1453,7 +1473,7 @@ MlxDeepseekV4Moe::forward_branches(
                     nullptr,
                     nullptr,
                     &weights.down,
-                    &expert_ids,
+                    &resident_ids,
                     &expert_weights,
                     &*pending_gate_up);
             } else {
@@ -1461,7 +1481,9 @@ MlxDeepseekV4Moe::forward_branches(
                     &weights.gate_up,
                     nullptr,
                     nullptr,
-                    &weights.down);
+                    &weights.down,
+                    &resident_ids,
+                    &expert_weights);
             }
         }
     } else if (!expert_offload_) {

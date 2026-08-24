@@ -85,6 +85,10 @@ int main() {
 
         auto input = make_input(2, 4096);
         auto gate_up = weights.gate_up.swiglu(input, ids, 0.0f);
+        auto slot_gate_up = arena.slot_weights().gate_up.swiglu(
+            input,
+            ids,
+            0.0f);
         auto gate0 = arena.expert_weight(0, '1').matmul(
             mlx::core::slice(input, Shape{0, 0}, Shape{1, 4096}));
         auto gate1 = arena.expert_weight(1, '1').matmul(
@@ -106,10 +110,14 @@ int main() {
                     -1),
                 0.0f);
         compare(gate_up, swiglu_reference, "SSD MXFP4 Gate/Up SwiGLU");
+        compare(slot_gate_up, gate_up, "SSD identity-slot Gate/Up SwiGLU");
 
         auto down_input = make_input(2, 2048);
         auto routed_down_input = mlx::core::expand_dims(down_input, 1);
         auto down = weights.down.forward(routed_down_input, ids);
+        auto slot_down = arena.slot_weights().down.forward(
+            routed_down_input,
+            ids);
         auto down0 = arena.expert_weight(0, '2').matmul(
             mlx::core::slice(down_input, Shape{0, 0}, Shape{1, 2048}));
         auto down1 = arena.expert_weight(1, '2').matmul(
@@ -118,6 +126,7 @@ int main() {
             mlx::core::concatenate({down0, down1}, 0),
             1);
         compare(down, down_reference, "SSD MXFP4 down");
+        compare(slot_down, down, "SSD identity-slot down");
 
         std::cout << "MLX SSD expert arena passed\n";
         return 0;

@@ -6,6 +6,7 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -82,7 +83,30 @@ MlxDeepseekV4SsdExpertArena::MlxDeepseekV4SsdExpertArena(
       gate_up_scale_(allocate_bank(slots, 2 * kScaleBytes)),
       w2_scale_(allocate_bank(slots, kScaleBytes)),
       gate_up_weight_(allocate_bank(slots, 2 * kValueBytes)),
-      w2_weight_(allocate_bank(slots, kValueBytes)) {}
+      w2_weight_(allocate_bank(slots, kValueBytes)) {
+    std::vector<std::int32_t> identity(slots);
+    std::iota(identity.begin(), identity.end(), 0);
+    const auto experts = checked_dimension(slots, "slot count");
+    slot_weights_ = std::make_unique<MlxDeepseekV4SsdExpertWeights>(
+        MlxDeepseekV4SsdExpertWeights{
+            .gate_up = MlxRoutedLinear(
+                MlxNintMoeWeight::from_mxfp4_slots(
+                    experts,
+                    4096,
+                    4096,
+                    identity,
+                    gate_up_weight_.array,
+                    gate_up_scale_.array)),
+            .down = MlxRoutedLinear(
+                MlxNintMoeWeight::from_mxfp4_slots(
+                    experts,
+                    4096,
+                    2048,
+                    identity,
+                    w2_weight_.array,
+                    w2_scale_.array)),
+        });
+}
 
 std::size_t MlxDeepseekV4SsdExpertArena::slots() const noexcept {
     return slots_;
@@ -108,9 +132,8 @@ void MlxDeepseekV4SsdExpertArena::prewarm_metal() {
          }) {
         std::memset(bytes.data(), 0, bytes.size());
     }
-    std::vector<std::int32_t> slots(256, 0);
     constexpr std::array<std::int32_t, 1> active{0};
-    auto weights = routed_weights(slots, active);
+    const auto& weights = slot_weights();
     const mlx::core::array expert_ids(
         active.data(), Shape{1, 1}, mlx::core::int32);
     auto gate_up = weights.gate_up.swiglu(
@@ -121,6 +144,11 @@ void MlxDeepseekV4SsdExpertArena::prewarm_metal() {
         mlx::core::zeros(Shape{1, 2048}, mlx::core::float16),
         expert_ids);
     mlx::core::eval({std::move(gate_up), std::move(down)});
+}
+
+const MlxDeepseekV4SsdExpertWeights&
+MlxDeepseekV4SsdExpertArena::slot_weights() const noexcept {
+    return *slot_weights_;
 }
 
 std::span<std::byte> MlxDeepseekV4SsdExpertArena::bank_slot(

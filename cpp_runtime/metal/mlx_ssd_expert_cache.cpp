@@ -483,14 +483,17 @@ struct MlxDeepseekV4SsdPrefetchedLayer::Impl {
 
 MlxDeepseekV4SsdPreparedExperts::MlxDeepseekV4SsdPreparedExperts(
     MlxDeepseekV4SsdExpertWeights weights,
+    std::vector<std::int32_t> slot_for_expert,
     std::function<void()> release)
     : weights_(std::make_unique<MlxDeepseekV4SsdExpertWeights>(
           std::move(weights))),
+      slot_for_expert_(std::move(slot_for_expert)),
       release_(std::move(release)) {}
 
 MlxDeepseekV4SsdPreparedExperts::MlxDeepseekV4SsdPreparedExperts(
     MlxDeepseekV4SsdPreparedExperts&& other) noexcept
     : weights_(std::move(other.weights_)),
+      slot_for_expert_(std::move(other.slot_for_expert_)),
       release_(std::move(other.release_)) {
     other.release_ = {};
 }
@@ -503,6 +506,7 @@ MlxDeepseekV4SsdPreparedExperts::operator=(
             release_();
         }
         weights_ = std::move(other.weights_);
+        slot_for_expert_ = std::move(other.slot_for_expert_);
         release_ = std::move(other.release_);
         other.release_ = {};
     }
@@ -518,6 +522,11 @@ MlxDeepseekV4SsdPreparedExperts::~MlxDeepseekV4SsdPreparedExperts() {
 const MlxDeepseekV4SsdExpertWeights&
 MlxDeepseekV4SsdPreparedExperts::weights() const noexcept {
     return *weights_;
+}
+
+std::span<const std::int32_t>
+MlxDeepseekV4SsdPreparedExperts::slot_for_expert() const noexcept {
+    return slot_for_expert_;
 }
 
 MlxDeepseekV4SsdPrefetchedLayer::MlxDeepseekV4SsdPrefetchedLayer(
@@ -563,9 +572,11 @@ MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
     std::span<const std::int32_t> active_experts,
     std::function<void(
         const MlxDeepseekV4SsdExpertWeights&,
+        std::span<const std::int32_t>,
         std::span<const std::int32_t>)> overlap,
     std::function<void(
         const MlxDeepseekV4SsdExpertWeights&,
+        std::span<const std::int32_t>,
         std::span<const std::int32_t>)> gate_up_ready) {
     const auto prepare_begin = std::chrono::steady_clock::now();
     // The caller has evaluated the current layer's routing IDs before this
@@ -607,11 +618,11 @@ MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
                     impl_->prefill_slots + acquisitions[index].slot);
         }
         const auto view_begin = std::chrono::steady_clock::now();
-        auto weights = impl_->arena.routed_weights(slot_map, unique);
+        const auto& weights = impl_->arena.slot_weights();
         const auto view_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - view_begin).count();
         if (pending && overlap) {
-            overlap(weights, ready_experts);
+            overlap(weights, ready_experts, slot_map);
         }
         const auto gate_wait_begin = std::chrono::steady_clock::now();
         for (const auto& acquired : acquisitions) {
@@ -620,7 +631,7 @@ MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
         const auto gate_wait_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - gate_wait_begin).count();
         if (pending && gate_up_ready) {
-            gate_up_ready(weights, pending_experts);
+            gate_up_ready(weights, pending_experts, slot_map);
         }
         const auto wait_begin = std::chrono::steady_clock::now();
         for (const auto& acquired : acquisitions) {
@@ -642,7 +653,8 @@ MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
         }
         auto impl = impl_;
         return MlxDeepseekV4SsdPreparedExperts(
-            std::move(weights),
+            weights,
+            std::move(slot_map),
             [impl, acquisitions = std::move(acquisitions)]() mutable noexcept {
                 impl->defer_release(std::move(acquisitions));
             });

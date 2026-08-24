@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <vector>
 
 namespace mfq::metal {
 
@@ -81,13 +82,16 @@ public:
         const MlxDeepseekV4SsdPreparedExperts&) = delete;
 
     const MlxDeepseekV4SsdExpertWeights& weights() const noexcept;
+    std::span<const std::int32_t> slot_for_expert() const noexcept;
 
 private:
     MlxDeepseekV4SsdPreparedExperts(
         MlxDeepseekV4SsdExpertWeights weights,
+        std::vector<std::int32_t> slot_for_expert,
         std::function<void()> release);
 
     std::unique_ptr<MlxDeepseekV4SsdExpertWeights> weights_;
+    std::vector<std::int32_t> slot_for_expert_;
     std::function<void()> release_;
 
     friend class MlxDeepseekV4SsdExpertCache;
@@ -119,10 +123,12 @@ public:
         std::span<const std::int32_t> active_experts,
         std::function<void(
             const MlxDeepseekV4SsdExpertWeights&,
-            std::span<const std::int32_t>)> overlap = {},
+            std::span<const std::int32_t> ready_experts,
+            std::span<const std::int32_t> slot_for_expert)> overlap = {},
         std::function<void(
             const MlxDeepseekV4SsdExpertWeights&,
-            std::span<const std::int32_t>)> gate_up_ready = {});
+            std::span<const std::int32_t> pending_experts,
+            std::span<const std::int32_t> slot_for_expert)> gate_up_ready = {});
 
     // Start loading a complete routed-expert layer into one of two alternating
     // buffers. Resident LRU rows are pinned and reused in place; only misses
