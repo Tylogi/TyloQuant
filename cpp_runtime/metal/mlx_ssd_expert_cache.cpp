@@ -786,10 +786,14 @@ MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
     }
 }
 
-void MlxDeepseekV4SsdExpertCache::record_route_sync(
-    double seconds) noexcept {
+void MlxDeepseekV4SsdExpertCache::record_route_timing(
+    double sync_seconds,
+    double sync_cpu_seconds,
+    double host_seconds) noexcept {
     std::scoped_lock lock(impl_->mutex);
-    impl_->counters.route_sync_seconds += seconds;
+    impl_->counters.route_sync_seconds += sync_seconds;
+    impl_->counters.route_sync_cpu_seconds += sync_cpu_seconds;
+    impl_->counters.route_host_seconds += host_seconds;
 }
 
 MlxDeepseekV4SsdPrefetchedLayer

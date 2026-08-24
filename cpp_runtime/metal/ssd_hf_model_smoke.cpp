@@ -132,6 +132,12 @@ int main(int argc, char** argv) {
                 const double delta_route_sync =
                     step_stats->route_sync_seconds -
                     before.route_sync_seconds;
+                const double delta_route_sync_cpu =
+                    step_stats->route_sync_cpu_seconds -
+                    before.route_sync_cpu_seconds;
+                const double delta_route_host =
+                    step_stats->route_host_seconds -
+                    before.route_host_seconds;
                 const double delta_prepare =
                     step_stats->prepare_seconds - before.prepare_seconds;
                 const double delta_view =
@@ -152,6 +158,10 @@ int main(int argc, char** argv) {
                           << " expert_step_io_worker_seconds=" << delta_io
                           << " expert_step_route_sync_seconds="
                           << delta_route_sync
+                          << " expert_step_route_sync_cpu_seconds="
+                          << delta_route_sync_cpu
+                          << " expert_step_route_host_seconds="
+                          << delta_route_host
                           << " expert_step_prepare_seconds="
                           << delta_prepare
                           << " expert_step_view_seconds=" << delta_view
@@ -280,6 +290,12 @@ int main(int argc, char** argv) {
                       << " replay_route_sync_seconds="
                       << after.route_sync_seconds -
                              before.route_sync_seconds
+                      << " replay_route_sync_cpu_seconds="
+                      << after.route_sync_cpu_seconds -
+                             before.route_sync_cpu_seconds
+                      << " replay_route_host_seconds="
+                      << after.route_host_seconds -
+                             before.route_host_seconds
                       << " replay_prepare_seconds="
                       << after.prepare_seconds - before.prepare_seconds
                       << " replay_view_seconds="

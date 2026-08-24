@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <time.h>
 #include <utility>
 #include <vector>
 
@@ -20,6 +21,15 @@ namespace {
 
 using mlx::core::Shape;
 using mlx::core::array;
+
+double current_thread_cpu_seconds() noexcept {
+    timespec value{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) {
+        return 0.0;
+    }
+    return static_cast<double>(value.tv_sec) +
+        static_cast<double>(value.tv_nsec) * 1.0e-9;
+}
 
 int checked_int(std::size_t value, const char* name) {
     if (value >
@@ -1285,11 +1295,17 @@ MlxDeepseekV4Moe::forward_branches(
                 mlx::core::astype(expert_ids, mlx::core::int32));
             const auto route_sync_begin =
                 std::chrono::steady_clock::now();
+            const double route_sync_cpu_begin =
+                current_thread_cpu_seconds();
             detail::eval_with_timing(host_ids);
-            ssd_expert_cache_->record_route_sync(
+            const double route_sync_cpu_seconds =
+                current_thread_cpu_seconds() - route_sync_cpu_begin;
+            const double route_sync_seconds =
                 std::chrono::duration<double>(
                     std::chrono::steady_clock::now() -
-                    route_sync_begin).count());
+                    route_sync_begin).count();
+            const auto route_host_begin =
+                std::chrono::steady_clock::now();
             std::vector<std::int32_t> active(
                 host_ids.data<std::int32_t>(),
                 host_ids.data<std::int32_t>() + host_ids.size());
@@ -1303,6 +1319,14 @@ MlxDeepseekV4Moe::forward_branches(
             active.erase(
                 std::unique(active.begin(), active.end()),
                 active.end());
+            const double route_host_seconds =
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() -
+                    route_host_begin).count();
+            ssd_expert_cache_->record_route_timing(
+                route_sync_seconds,
+                route_sync_cpu_seconds,
+                route_host_seconds);
             shared.emplace(build_shared());
             std::optional<array> ready_gate_up;
             std::optional<array> ready_down;

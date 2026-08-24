@@ -30,6 +30,8 @@ struct MlxDeepseekV4SsdCacheStats {
     double wait_seconds = 0.0;
     double prefill_wait_seconds = 0.0;
     double route_sync_seconds = 0.0;
+    double route_sync_cpu_seconds = 0.0;
+    double route_host_seconds = 0.0;
     double prepare_seconds = 0.0;
     double view_seconds = 0.0;
     std::size_t resident_experts = 0;
@@ -141,7 +143,10 @@ public:
     bool prefill_overlap_enabled() const noexcept;
     MlxDeepseekV4SsdCacheStats stats() const;
 
-    void record_route_sync(double seconds) noexcept;
+    void record_route_timing(
+        double sync_seconds,
+        double sync_cpu_seconds,
+        double host_seconds) noexcept;
     void reset_stats();
     void prewarm_metal();
     // Release slots retained for a lazy Metal graph after that graph has
