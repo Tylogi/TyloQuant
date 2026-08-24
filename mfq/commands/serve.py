@@ -196,7 +196,7 @@ def _run(args: argparse.Namespace) -> int:
     from mfq.server.tool_jobs import ToolJobHandlers, ToolJobPaths
 
     model = args.model.expanduser().resolve() if args.model is not None else None
-    if model is not None and not model.is_file():
+    if model is not None and not (model.is_file() or model.is_dir()):
         raise FileNotFoundError(model)
     web_root = _prepare_web_root(args.web_root, disabled=args.no_web_ui)
     selected_backend = _select_backend(args.backend, args.running_executable)
@@ -207,8 +207,10 @@ def _run(args: argparse.Namespace) -> int:
     if not configured_roots:
         configured_roots = [args.work_dir.expanduser().resolve() / "models"]
     configured_roots = [path.expanduser().resolve() for path in configured_roots]
-    if model is not None and model.parent not in configured_roots:
-        configured_roots.append(model.parent)
+    if model is not None:
+        model_catalog_root = model if model.is_dir() else model.parent
+        if model_catalog_root not in configured_roots:
+            configured_roots.append(model_catalog_root)
     configured_roots[0].mkdir(parents=True, exist_ok=True)
     catalog = ModelCatalog(configured_roots)
     runtime = None

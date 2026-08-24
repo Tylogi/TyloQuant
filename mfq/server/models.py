@@ -746,7 +746,7 @@ class ModelArtifactResource(ProtocolModel):
     id: str = Field(pattern=r"^[0-9a-f]{32}$")
     name: str = Field(min_length=1, max_length=255)
     architecture: str = Field(min_length=1, max_length=128)
-    format: Literal["mfq"] = "mfq"
+    format: Literal["mfq", "hf"] = "mfq"
     shard_count: int = Field(ge=1)
     total_bytes: int = Field(ge=0)
     tensor_count: int = Field(ge=0)

@@ -274,26 +274,13 @@ private:
 };
 
 std::vector<std::uint8_t> read_record_prefix(
-    const MfqRecord& record,
+    const MfqContainer& model,
+    const std::string& name,
     std::size_t maximum = 128) {
+    const auto& record = model.record(name);
     const auto count = static_cast<std::size_t>(
         std::min<std::uint64_t>(record.nbytes, maximum));
-    std::vector<std::uint8_t> bytes(count);
-    std::ifstream stream(record.source_path, std::ios::binary);
-    if (!stream) {
-        throw std::runtime_error(
-            "cannot open MFQ tensor source: " +
-            record.source_path.string());
-    }
-    stream.seekg(static_cast<std::streamoff>(record.offset));
-    stream.read(
-        reinterpret_cast<char*>(bytes.data()),
-        static_cast<std::streamsize>(bytes.size()));
-    if (!stream) {
-        throw std::runtime_error(
-            "cannot read MFQ tensor header: " + record.name);
-    }
-    return bytes;
+    return model.read_range(name, 0, count);
 }
 
 std::vector<std::int64_t> read_shape(
@@ -680,7 +667,7 @@ Qwen35TensorMetadata inspect_qwen35_tensor_metadata(
     const MfqContainer& model,
     const std::string& name) {
     const auto& record = model.record(name);
-    const auto prefix = read_record_prefix(record);
+    const auto prefix = read_record_prefix(model, name);
     PrefixCursor cursor(prefix);
     Qwen35TensorMetadata metadata;
     metadata.dtype = record.dtype;

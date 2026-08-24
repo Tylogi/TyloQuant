@@ -1,7 +1,12 @@
 #include "mfq_container.h"
 
+#include "../../third_party/nlohmann/json.hpp"
+
+#include <algorithm>
+#include <array>
 #include <cctype>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -10,6 +15,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
+#include <unordered_set>
 #include <utility>
 
 #include <fcntl.h>
@@ -29,6 +36,154 @@ constexpr std::uint64_t kMinMetadataEntryBytes =
     2 * sizeof(std::uint32_t);
 constexpr std::uint64_t kMinRecordEntryBytes =
     2 * sizeof(std::uint32_t) + sizeof(std::uint64_t);
+constexpr std::string_view kModelConfigAsset =
+    "__mfq_asset__/model_config.json";
+constexpr std::string_view kMinicpmoResamplerAsset =
+    "__mfq_asset__/minicpmo45-resampler-pos-embed-v1.bf16";
+constexpr std::uint64_t kMxHeaderBytes = 56;
+
+using json = nlohmann::json;
+
+std::string read_file_text(const std::filesystem::path& path) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) {
+        throw std::runtime_error("cannot open " + path.string());
+    }
+    stream.seekg(0, std::ios::end);
+    const auto end = stream.tellg();
+    if (end < 0) {
+        throw std::runtime_error("cannot size " + path.string());
+    }
+    std::string result(static_cast<std::size_t>(end), '\0');
+    stream.seekg(0, std::ios::beg);
+    stream.read(result.data(), static_cast<std::streamsize>(result.size()));
+    if (!stream && !result.empty()) {
+        throw std::runtime_error("cannot read " + path.string());
+    }
+    return result;
+}
+
+template <typename T>
+void append_little(std::vector<std::uint8_t>& destination, T value) {
+    using Unsigned = std::make_unsigned_t<T>;
+    const auto bits = static_cast<Unsigned>(value);
+    for (std::size_t index = 0; index < sizeof(T); ++index) {
+        destination.push_back(static_cast<std::uint8_t>(
+            bits >> (index * 8)));
+    }
+}
+
+std::uint64_t checked_add(
+    std::uint64_t left,
+    std::uint64_t right,
+    std::string_view what) {
+    if (right > std::numeric_limits<std::uint64_t>::max() - left) {
+        throw std::overflow_error(std::string(what) + " byte size overflow");
+    }
+    return left + right;
+}
+
+std::uint64_t checked_product(
+    const std::vector<std::int64_t>& shape,
+    std::uint64_t item_size,
+    const std::string& name) {
+    std::uint64_t result = item_size;
+    if (shape.empty()) {
+        throw std::runtime_error("Safetensors tensor has empty shape: " + name);
+    }
+    for (const auto dimension : shape) {
+        if (dimension <= 0 ||
+            static_cast<std::uint64_t>(dimension) >
+                std::numeric_limits<std::uint64_t>::max() / result) {
+            throw std::runtime_error(
+                "invalid Safetensors tensor shape: " + name);
+        }
+        result *= static_cast<std::uint64_t>(dimension);
+    }
+    return result;
+}
+
+std::uint64_t dense_item_size(std::string_view dtype) {
+    if (dtype == "BF16" || dtype == "F16") {
+        return 2;
+    }
+    if (dtype == "F32" || dtype == "I32") {
+        return 4;
+    }
+    if (dtype == "I64") {
+        return 8;
+    }
+    return 0;
+}
+
+std::vector<std::uint8_t> dense_prefix(
+    const std::vector<std::int64_t>& shape) {
+    std::vector<std::uint8_t> result;
+    result.reserve(4 + shape.size() * 8);
+    append_little<std::uint32_t>(
+        result, static_cast<std::uint32_t>(shape.size()));
+    for (const auto dimension : shape) {
+        append_little<std::int64_t>(result, dimension);
+    }
+    return result;
+}
+
+std::vector<std::uint8_t> mx_prefix(
+    std::string_view dtype,
+    const std::vector<std::int64_t>& logical_shape,
+    const std::vector<std::int64_t>& storage_shape,
+    const std::vector<std::int64_t>& scale_shape,
+    const std::string& name) {
+    if (logical_shape.size() != 2 || storage_shape.size() != 2 ||
+        scale_shape.size() != 2) {
+        throw std::runtime_error("native MX tensor must be rank two: " + name);
+    }
+    const auto rows = logical_shape[0];
+    const auto columns = logical_shape[1];
+    if (rows <= 0 || columns <= 0) {
+        throw std::runtime_error("invalid native MX tensor shape: " + name);
+    }
+    std::vector<std::int64_t> expected_storage;
+    std::vector<std::int64_t> expected_scales;
+    std::uint8_t kind = 0;
+    if (dtype == "MXFP4") {
+        if (columns % 32 != 0) {
+            throw std::runtime_error("MXFP4 columns are not divisible by 32: " + name);
+        }
+        kind = 4;
+        expected_storage = {rows, columns / 2};
+        expected_scales = {rows, columns / 32};
+    } else {
+        if (columns % 128 != 0) {
+            throw std::runtime_error("MXFP8 columns are not divisible by 128: " + name);
+        }
+        kind = 8;
+        expected_storage = {rows, columns};
+        expected_scales = {(rows + 127) / 128, columns / 128};
+    }
+    if (storage_shape != expected_storage || scale_shape != expected_scales) {
+        throw std::runtime_error("invalid native MX storage geometry: " + name);
+    }
+    std::vector<std::uint8_t> result;
+    result.reserve(kMxHeaderBytes);
+    result.insert(result.end(), {'M', 'X', 'T', '1'});
+    result.push_back(1);
+    result.push_back(kind);
+    append_little<std::uint16_t>(result, 0);
+    for (const auto dimension : logical_shape) {
+        append_little<std::uint64_t>(
+            result, static_cast<std::uint64_t>(dimension));
+    }
+    for (const auto dimension : storage_shape) {
+        append_little<std::uint64_t>(
+            result, static_cast<std::uint64_t>(dimension));
+    }
+    for (const auto dimension : scale_shape) {
+        append_little<std::uint64_t>(
+            result, static_cast<std::uint64_t>(dimension));
+    }
+    return result;
+}
 
 std::string deepseek_v4_ew_alias(std::string_view name) {
     static const std::unordered_map<std::string_view, std::string_view>
@@ -421,7 +576,226 @@ std::vector<std::filesystem::path> MfqContainer::resolve_shards(
     return result;
 }
 
+void MfqContainer::load_hf_directory(
+    const std::filesystem::path& requested_path) {
+    std::error_code error;
+    const auto root = std::filesystem::canonical(requested_path, error);
+    if (error || !std::filesystem::is_directory(root)) {
+        throw std::runtime_error(
+            "cannot open HF model directory: " + requested_path.string());
+    }
+    const auto config_path = root / "config.json";
+    const auto config_text = read_file_text(config_path);
+    json config;
+    try {
+        config = json::parse(config_text);
+    } catch (const json::exception& exception) {
+        throw std::runtime_error(
+            "invalid HF config.json: " + std::string(exception.what()));
+    }
+    const auto model_type = config.find("model_type");
+    if (model_type == config.end() || !model_type->is_string() ||
+        model_type->get<std::string>().empty()) {
+        throw std::runtime_error("HF config.json has no model_type");
+    }
+
+    hf_store_ = std::make_shared<HfSafetensorStore>(root, false);
+    header_.version = 2;
+    header_.architecture = model_type->get<std::string>() + "-hf-full-mfq";
+    header_.extra_json.emplace("source.format", "hf-safetensors");
+    header_.extra_json.emplace("source.precision", "native");
+    const auto generation_path = root / "generation_config.json";
+    if (std::filesystem::is_regular_file(generation_path)) {
+        const auto generation_text = read_file_text(generation_path);
+        json generation;
+        try {
+            generation = json::parse(generation_text);
+        } catch (const json::exception& exception) {
+            throw std::runtime_error(
+                "invalid HF generation_config.json: " +
+                std::string(exception.what()));
+        }
+        if (!generation.is_object()) {
+            throw std::runtime_error(
+                "HF generation_config.json must be an object");
+        }
+        static const std::array<std::pair<std::string_view, std::string_view>, 7>
+            aliases{{
+                {"max_new_tokens", "max_tokens"},
+                {"temperature", "temperature"},
+                {"top_k", "top_k"},
+                {"top_p", "top_p"},
+                {"presence_penalty", "presence_penalty"},
+                {"frequency_penalty", "frequency_penalty"},
+                {"repetition_penalty", "repetition_penalty"},
+            }};
+        json chat = json::object();
+        for (const auto& [source, target] : aliases) {
+            const auto found = generation.find(std::string(source));
+            if (found != generation.end() && !found->is_null()) {
+                chat[std::string(target)] = *found;
+            }
+        }
+        if (!chat.empty()) {
+            header_.extra_json.emplace(
+                "runtime.sampling.v1",
+                json({
+                    {"schema", "mfq.runtime.sampling"},
+                    {"version", 1},
+                    {"chat", std::move(chat)},
+                    {"provenance", {{"source", "hf:generation_config.json"}}},
+                }).dump());
+        }
+    }
+    for (std::size_t shard = 0; shard < hf_store_->shard_count(); ++shard) {
+        source_paths_.push_back(hf_store_->shard_path(shard));
+    }
+
+    hf_assets_.emplace(
+        std::string(kModelConfigAsset),
+        std::vector<std::uint8_t>(config_text.begin(), config_text.end()));
+    MfqRecord config_record;
+    config_record.name = std::string(kModelConfigAsset);
+    config_record.dtype = "BLOB";
+    config_record.source_path = config_path;
+    config_record.nbytes = config_text.size();
+    records_.emplace(config_record.name, std::move(config_record));
+
+    if (model_type->get<std::string>().rfind("minicpmo", 0) == 0) {
+        std::filesystem::path position_path;
+        if (const auto* configured = std::getenv(
+                "MFQ_MINICPMO45_RESAMPLER_POSITION_ASSET");
+            configured != nullptr && *configured != '\0') {
+            position_path = configured;
+        } else {
+            position_path = root /
+                "minicpmo45-resampler-pos-embed-v1.bf16";
+        }
+        if (std::filesystem::is_regular_file(position_path)) {
+            const auto bytes = read_file_text(position_path);
+            hf_assets_.emplace(
+                std::string(kMinicpmoResamplerAsset),
+                std::vector<std::uint8_t>(bytes.begin(), bytes.end()));
+            MfqRecord asset_record;
+            asset_record.name = std::string(kMinicpmoResamplerAsset);
+            asset_record.dtype = "BLOB";
+            asset_record.source_path = std::filesystem::canonical(position_path);
+            asset_record.nbytes = bytes.size();
+            records_.emplace(asset_record.name, std::move(asset_record));
+        }
+    }
+
+    std::unordered_set<std::string> consumed_scales;
+    std::vector<std::string> names;
+    names.reserve(hf_store_->tensors().size());
+    for (const auto& [name, unused] : hf_store_->tensors()) {
+        static_cast<void>(unused);
+        names.push_back(name);
+    }
+    std::sort(names.begin(), names.end());
+    for (const auto& name : names) {
+        const auto& values = hf_store_->tensor(name);
+        if (values.dtype == "F8_E8M0") {
+            continue;
+        }
+
+        HfVirtualRecord virtual_record;
+        virtual_record.values_name = name;
+        MfqRecord record;
+        record.name = name;
+        record.source_path = hf_store_->shard_path(values.shard);
+        const auto item_size = dense_item_size(values.dtype);
+        if (item_size != 0) {
+            if (checked_product(values.shape, item_size, name) != values.nbytes) {
+                throw std::runtime_error(
+                    "dense Safetensors byte size mismatch: " + name);
+            }
+            record.dtype = values.dtype;
+            virtual_record.prefix = dense_prefix(values.shape);
+            virtual_record.values_offset = virtual_record.prefix.size();
+            record.nbytes = checked_add(
+                virtual_record.values_offset,
+                values.nbytes,
+                "dense tensor");
+        } else if (values.dtype == "I8" ||
+                   values.dtype == "F8_E4M3" ||
+                   values.dtype == "F8_E4M3FN") {
+            if (!name.ends_with(".weight")) {
+                throw std::runtime_error(
+                    "native MX tensor is not named *.weight: " + name);
+            }
+            const auto scale_name =
+                name.substr(0, name.size() - std::string_view(".weight").size()) +
+                ".scale";
+            const auto& scales = hf_store_->tensor(scale_name);
+            if (scales.dtype != "F8_E8M0") {
+                throw std::runtime_error(
+                    "native MX scale is not F8_E8M0: " + scale_name);
+            }
+            if (values.shard != scales.shard) {
+                throw std::runtime_error(
+                    "native MX weight and scale are in different shards: " + name);
+            }
+            std::vector<std::int64_t> logical_shape = values.shape;
+            if (values.dtype == "I8") {
+                if (logical_shape.size() != 2 ||
+                    logical_shape[1] >
+                        std::numeric_limits<std::int64_t>::max() / 2) {
+                    throw std::runtime_error(
+                        "invalid native MXFP4 tensor shape: " + name);
+                }
+                logical_shape[1] *= 2;
+                record.dtype = "MXFP4";
+            } else {
+                record.dtype = "MXFP8";
+            }
+            virtual_record.scales_name = scale_name;
+            virtual_record.prefix = mx_prefix(
+                record.dtype,
+                logical_shape,
+                values.shape,
+                scales.shape,
+                name);
+            virtual_record.values_offset = virtual_record.prefix.size();
+            virtual_record.scales_offset = checked_add(
+                virtual_record.values_offset,
+                values.nbytes,
+                "native MX tensor");
+            record.nbytes = checked_add(
+                virtual_record.scales_offset,
+                scales.nbytes,
+                "native MX tensor");
+            consumed_scales.insert(scale_name);
+        } else {
+            throw std::runtime_error(
+                "unsupported full-precision HF dtype " + values.dtype +
+                ": " + name);
+        }
+        if (!records_.emplace(name, std::move(record)).second ||
+            !hf_records_.emplace(name, std::move(virtual_record)).second) {
+            throw std::runtime_error("duplicate HF tensor: " + name);
+        }
+    }
+    for (const auto& name : names) {
+        const auto& record = hf_store_->tensor(name);
+        if (record.dtype == "F8_E8M0" &&
+            consumed_scales.find(name) == consumed_scales.end()) {
+            throw std::runtime_error("orphan E8M0 scale tensor: " + name);
+        }
+    }
+    if (records_.size() > kMaxRecordEntries) {
+        throw std::runtime_error("HF checkpoint has too many tensor records");
+    }
+    header_.record_count = static_cast<std::uint32_t>(records_.size());
+}
+
 MfqContainer::MfqContainer(std::filesystem::path path) {
+    std::error_code directory_error;
+    if (std::filesystem::is_directory(path, directory_error) &&
+        !directory_error) {
+        load_hf_directory(path);
+        return;
+    }
     path = stable_source_path(path);
     header_ = load_records(path, records_);
     const auto split_no = metadata_uint(header_, "split.no", 0);
@@ -538,6 +912,13 @@ MfqMappedBytes MfqContainer::map_record(
     if (value.nbytes == 0) {
         return {};
     }
+    if (hf_store_) {
+        auto bytes = std::make_shared<std::vector<std::uint8_t>>(read(name));
+        const auto* data = bytes->data();
+        const auto size = bytes->size();
+        std::shared_ptr<void> owner = bytes;
+        return MfqMappedBytes(std::move(owner), data, size);
+    }
     if (
         value.nbytes > static_cast<std::uint64_t>(
             std::numeric_limits<std::size_t>::max())
@@ -626,6 +1007,9 @@ std::vector<std::uint8_t> MfqContainer::read_range(
     if (nbytes == 0) {
         return {};
     }
+    if (hf_store_) {
+        return read_hf_range(name, relative_offset, nbytes);
+    }
     const auto absolute_offset =
         value.offset + relative_offset;
     if (
@@ -669,6 +1053,61 @@ std::vector<std::uint8_t> MfqContainer::read_range(
     if (!stream) {
         throw std::runtime_error(
             "failed reading MFQ record byte range: " + name);
+    }
+    return result;
+}
+
+std::vector<std::uint8_t> MfqContainer::read_hf_range(
+    const std::string& name,
+    std::uint64_t relative_offset,
+    std::uint64_t nbytes) const {
+    std::vector<std::uint8_t> result(static_cast<std::size_t>(nbytes));
+    if (const auto asset = hf_assets_.find(name); asset != hf_assets_.end()) {
+        std::copy_n(
+            asset->second.begin() + static_cast<std::ptrdiff_t>(relative_offset),
+            static_cast<std::size_t>(nbytes),
+            result.begin());
+        return result;
+    }
+    const auto found = hf_records_.find(name);
+    if (found == hf_records_.end()) {
+        throw std::runtime_error("missing virtual HF record: " + name);
+    }
+    const auto& logical = found->second;
+    const auto request_end = relative_offset + nbytes;
+    const auto copy_memory = [&](std::uint64_t logical_offset,
+                                 std::span<const std::uint8_t> source) {
+        const auto segment_end = logical_offset + source.size();
+        const auto begin = std::max(relative_offset, logical_offset);
+        const auto end = std::min(request_end, segment_end);
+        if (begin < end) {
+            std::copy_n(
+                source.begin() + static_cast<std::ptrdiff_t>(begin - logical_offset),
+                static_cast<std::size_t>(end - begin),
+                result.begin() + static_cast<std::ptrdiff_t>(begin - relative_offset));
+        }
+    };
+    const auto copy_tensor = [&](std::uint64_t logical_offset,
+                                 const std::string& tensor_name) {
+        const auto& source = hf_store_->tensor(tensor_name);
+        const auto segment_end = logical_offset + source.nbytes;
+        const auto begin = std::max(relative_offset, logical_offset);
+        const auto end = std::min(request_end, segment_end);
+        if (begin >= end) {
+            return;
+        }
+        auto destination = std::span<std::uint8_t>(result).subspan(
+            static_cast<std::size_t>(begin - relative_offset),
+            static_cast<std::size_t>(end - begin));
+        hf_store_->read_range(
+            source.shard,
+            source.offset + begin - logical_offset,
+            std::as_writable_bytes(destination));
+    };
+    copy_memory(0, logical.prefix);
+    copy_tensor(logical.values_offset, logical.values_name);
+    if (!logical.scales_name.empty()) {
+        copy_tensor(logical.scales_offset, logical.scales_name);
     }
     return result;
 }

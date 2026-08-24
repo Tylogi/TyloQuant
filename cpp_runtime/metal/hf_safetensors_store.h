@@ -27,7 +27,9 @@ struct HfSafetensorRecord {
 // without materializing or rewriting the checkpoint.
 class HfSafetensorStore {
 public:
-    explicit HfSafetensorStore(std::filesystem::path root);
+    explicit HfSafetensorStore(
+        std::filesystem::path root,
+        bool bypass_file_cache = true);
     ~HfSafetensorStore();
 
     HfSafetensorStore(const HfSafetensorStore&) = delete;
@@ -38,6 +40,7 @@ public:
     const std::filesystem::path& root() const noexcept;
     std::size_t tensor_count() const noexcept;
     std::size_t shard_count() const noexcept;
+    const std::unordered_map<std::string, HfSafetensorRecord>& tensors() const noexcept;
 
     const HfSafetensorRecord& tensor(std::string_view name) const;
     const std::filesystem::path& shard_path(std::size_t shard) const;

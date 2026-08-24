@@ -1,5 +1,7 @@
 #pragma once
 
+#include "hf_safetensors_store.h"
+
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -94,6 +96,14 @@ public:
 private:
     using RecordMap = std::unordered_map<std::string, MfqRecord>;
 
+    struct HfVirtualRecord {
+        std::string values_name;
+        std::string scales_name;
+        std::vector<std::uint8_t> prefix;
+        std::uint64_t values_offset = 0;
+        std::uint64_t scales_offset = 0;
+    };
+
     static MfqHeader load_records(
         const std::filesystem::path& path,
         RecordMap& destination);
@@ -105,10 +115,18 @@ private:
         const MfqHeader& header,
         const std::string& key,
         std::uint64_t default_value);
+    void load_hf_directory(const std::filesystem::path& path);
+    std::vector<std::uint8_t> read_hf_range(
+        const std::string& name,
+        std::uint64_t relative_offset,
+        std::uint64_t nbytes) const;
 
     MfqHeader header_;
     std::vector<std::filesystem::path> source_paths_;
     RecordMap records_;
+    std::shared_ptr<HfSafetensorStore> hf_store_;
+    std::unordered_map<std::string, HfVirtualRecord> hf_records_;
+    std::unordered_map<std::string, std::vector<std::uint8_t>> hf_assets_;
 };
 
 } // namespace mfq::metal

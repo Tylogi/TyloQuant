@@ -2603,8 +2603,11 @@
             "title": "Error"
           },
           "format": {
-            "const": "mfq",
             "default": "mfq",
+            "enum": [
+              "mfq",
+              "hf"
+            ],
             "title": "Format",
             "type": "string"
           },

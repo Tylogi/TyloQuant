@@ -93,9 +93,10 @@ void pread_exact(
     std::span<std::byte> destination) {
     std::size_t done = 0;
     while (done < destination.size()) {
+        constexpr std::size_t kMaximumReadBytes = std::size_t{32} << 20;
         const auto request = std::min<std::size_t>(
             destination.size() - done,
-            static_cast<std::size_t>(std::numeric_limits<ssize_t>::max()));
+            kMaximumReadBytes);
         const auto result = ::pread(
             fd,
             destination.data() + done,
@@ -215,6 +216,7 @@ struct HfSafetensorStore::Impl {
     struct Shard {
         std::filesystem::path path;
         std::uint64_t size = 0;
+        bool bypass_file_cache = true;
         mutable int fd = -1;
         mutable std::mutex mutex;
 
@@ -237,7 +239,7 @@ struct HfSafetensorStore::Impl {
                     "open " + path.string());
             }
 #if defined(__APPLE__) && defined(F_NOCACHE)
-            if (::fcntl(fd, F_NOCACHE, 1) != 0) {
+            if (bypass_file_cache && ::fcntl(fd, F_NOCACHE, 1) != 0) {
                 const auto saved = errno;
                 ::close(fd);
                 fd = -1;
@@ -256,32 +258,45 @@ struct HfSafetensorStore::Impl {
     std::unordered_map<std::string, HfSafetensorRecord> tensors;
 };
 
-HfSafetensorStore::HfSafetensorStore(std::filesystem::path root)
+HfSafetensorStore::HfSafetensorStore(
+    std::filesystem::path root,
+    bool bypass_file_cache)
     : impl_(std::make_unique<Impl>()) {
     impl_->root = std::filesystem::canonical(std::move(root));
     const auto index_path = impl_->root / "model.safetensors.index.json";
-    const auto index = parse_json(read_text_file(index_path), index_path);
-    const auto weight_map = index.find("weight_map");
-    if (weight_map == index.end() || !weight_map->is_object()) {
-        throw std::runtime_error(
-            "Safetensors index requires an object weight_map: " +
-            index_path.string());
-    }
-
     std::unordered_map<std::string, std::vector<std::string>> names_by_shard;
-    for (const auto& [name, shard] : weight_map->items()) {
-        if (!shard.is_string()) {
-            throw std::runtime_error(
-                "Safetensors weight_map value is not a string: " + name);
-        }
-        names_by_shard[shard.get<std::string>()].push_back(name);
-    }
-
     std::vector<std::string> shard_names;
-    shard_names.reserve(names_by_shard.size());
-    for (const auto& [name, unused] : names_by_shard) {
-        static_cast<void>(unused);
-        shard_names.push_back(name);
+    if (std::filesystem::is_regular_file(index_path)) {
+        const auto index = parse_json(read_text_file(index_path), index_path);
+        const auto weight_map = index.find("weight_map");
+        if (weight_map == index.end() || !weight_map->is_object() ||
+            weight_map->empty()) {
+            throw std::runtime_error(
+                "Safetensors index requires a non-empty object weight_map: " +
+                index_path.string());
+        }
+        for (const auto& [name, shard] : weight_map->items()) {
+            if (!shard.is_string()) {
+                throw std::runtime_error(
+                    "Safetensors weight_map value is not a string: " + name);
+            }
+            names_by_shard[shard.get<std::string>()].push_back(name);
+        }
+        shard_names.reserve(names_by_shard.size());
+        for (const auto& [name, unused] : names_by_shard) {
+            static_cast<void>(unused);
+            shard_names.push_back(name);
+        }
+    } else {
+        for (const auto& entry : std::filesystem::directory_iterator(impl_->root)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".safetensors") {
+                shard_names.push_back(entry.path().filename().string());
+            }
+        }
+        if (shard_names.empty()) {
+            throw std::runtime_error(
+                "no Safetensors weights found under " + impl_->root.string());
+        }
     }
     std::sort(shard_names.begin(), shard_names.end());
 
@@ -316,10 +331,24 @@ HfSafetensorStore::HfSafetensorStore(std::filesystem::path root)
         auto shard = std::make_unique<Impl::Shard>();
         shard->path = path;
         shard->size = file_size;
+        shard->bypass_file_cache = bypass_file_cache;
         impl_->shards.push_back(std::move(shard));
         const auto payload_base = checked_add(8, header_size);
 
-        for (const auto& name : names_by_shard.at(shard_name)) {
+        std::vector<std::string> tensor_names;
+        const auto indexed_names = names_by_shard.find(shard_name);
+        if (indexed_names != names_by_shard.end()) {
+            tensor_names = indexed_names->second;
+        } else {
+            tensor_names.reserve(metadata.size());
+            for (const auto& [name, value] : metadata.items()) {
+                static_cast<void>(value);
+                if (name != "__metadata__") {
+                    tensor_names.push_back(name);
+                }
+            }
+        }
+        for (const auto& name : tensor_names) {
             const auto found = metadata.find(name);
             if (found == metadata.end() || !found->is_object()) {
                 throw std::runtime_error(
@@ -350,7 +379,10 @@ HfSafetensorStore::HfSafetensorStore(std::filesystem::path root)
             record.shard = shard_index;
             record.offset = checked_add(payload_base, begin);
             record.nbytes = end - begin;
-            impl_->tensors.emplace(name, std::move(record));
+            if (!impl_->tensors.emplace(name, std::move(record)).second) {
+                throw std::runtime_error(
+                    "duplicate Safetensors tensor: " + name);
+            }
         }
     }
 }
@@ -370,6 +402,11 @@ std::size_t HfSafetensorStore::tensor_count() const noexcept {
 
 std::size_t HfSafetensorStore::shard_count() const noexcept {
     return impl_->shards.size();
+}
+
+const std::unordered_map<std::string, HfSafetensorRecord>&
+HfSafetensorStore::tensors() const noexcept {
+    return impl_->tensors;
 }
 
 const HfSafetensorRecord& HfSafetensorStore::tensor(

@@ -1,5 +1,8 @@
 #include "mfq_container.h"
 
+#include "../../third_party/nlohmann/json.hpp"
+
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -13,6 +16,8 @@
 #include <vector>
 
 namespace {
+
+using json = nlohmann::json;
 
 struct RecordFixture {
     std::string name;
@@ -39,6 +44,14 @@ void write_string(
     stream.write(
         value.data(),
         static_cast<std::streamsize>(value.size()));
+}
+
+void write_u64_little(std::ostream& stream, std::uint64_t value) {
+    std::array<char, 8> bytes{};
+    for (std::size_t index = 0; index < bytes.size(); ++index) {
+        bytes[index] = static_cast<char>((value >> (index * 8)) & 0xffu);
+    }
+    stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
 }
 
 void write_mfq(
@@ -384,6 +397,109 @@ void test_sharded_ranges_and_source_lifetime(
         "truncating one shard broke another source");
 }
 
+void test_hf_virtual_full_precision_container(
+    const std::filesystem::path& root) {
+    const auto hf = root / "hf-model";
+    std::filesystem::create_directories(hf);
+    const std::string config =
+        R"({"model_type":"qwen3_5","hidden_size":2})";
+    {
+        std::ofstream stream(hf / "config.json", std::ios::binary);
+        stream << config;
+    }
+    {
+        std::ofstream stream(
+            hf / "generation_config.json", std::ios::binary);
+        stream << R"({"temperature":1.0,"top_k":20,"top_p":0.95})";
+    }
+    json header = {
+        {"model.embed_tokens.weight", {
+            {"dtype", "BF16"},
+            {"shape", {2, 2}},
+            {"data_offsets", {0, 8}},
+        }},
+        {"model.layers.0.mlp.experts.0.gate_proj.weight", {
+            {"dtype", "I8"},
+            {"shape", {1, 16}},
+            {"data_offsets", {8, 24}},
+        }},
+        {"model.layers.0.mlp.experts.0.gate_proj.scale", {
+            {"dtype", "F8_E8M0"},
+            {"shape", {1, 1}},
+            {"data_offsets", {24, 25}},
+        }},
+    };
+    auto header_text = header.dump();
+    while ((8 + header_text.size()) % 8 != 0) {
+        header_text.push_back(' ');
+    }
+    {
+        std::ofstream stream(hf / "model.safetensors", std::ios::binary);
+        write_u64_little(stream, header_text.size());
+        stream.write(header_text.data(), static_cast<std::streamsize>(header_text.size()));
+        const std::array<unsigned char, 25> payload{
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+            0x7f,
+        };
+        stream.write(
+            reinterpret_cast<const char*>(payload.data()),
+            static_cast<std::streamsize>(payload.size()));
+    }
+
+    const mfq::metal::MfqContainer model(hf);
+    require(model.header().version == 2, "HF virtual version mismatch");
+    require(
+        model.header().architecture == "qwen3_5-hf-full-mfq",
+        "HF virtual architecture mismatch");
+    require(
+        model.header().extra_json.at("runtime.sampling.v1").find(
+            "\"top_k\":20") != std::string::npos,
+        "HF virtual runtime profile mismatch");
+    require(model.source_paths().size() == 1, "HF virtual shard count mismatch");
+    require(
+        model.read_text("__mfq_asset__/model_config.json") == config,
+        "HF virtual config asset mismatch");
+
+    const auto dense = model.read("model.embed_tokens.weight");
+    require(dense.size() == 28, "HF virtual dense record size mismatch");
+    require(dense[0] == 2 && dense[4] == 2 && dense[12] == 2,
+            "HF virtual dense shape prefix mismatch");
+    for (std::size_t index = 0; index < 8; ++index) {
+        require(
+            dense[20 + index] == index + 1,
+            "HF virtual dense payload mismatch");
+    }
+    const auto dense_cross = model.read_range(
+        "model.embed_tokens.weight", 18, 4);
+    require(
+        dense_cross == std::vector<std::uint8_t>({0, 0, 1, 2}),
+        "HF virtual prefix/payload range mismatch");
+    const auto dense_mapped = model.map_record("model.embed_tokens.weight");
+    require(
+        std::vector<std::uint8_t>(
+            dense_mapped.view().begin(), dense_mapped.view().end()) == dense,
+        "HF virtual mapped record mismatch");
+
+    const auto mx = model.read(
+        "model.layers.0.mlp.experts.0.gate_proj.weight");
+    require(mx.size() == 73, "HF virtual MX record size mismatch");
+    require(
+        std::string(mx.begin(), mx.begin() + 4) == "MXT1" &&
+            mx[4] == 1 && mx[5] == 4,
+        "HF virtual MX header mismatch");
+    for (std::size_t index = 0; index < 16; ++index) {
+        require(
+            mx[56 + index] == 0x10 + index,
+            "HF virtual MX values mismatch");
+    }
+    require(mx.back() == 0x7f, "HF virtual MX scale mismatch");
+    require(
+        !model.contains("model.layers.0.mlp.experts.0.gate_proj.scale"),
+        "HF virtual container exposed a consumed scale");
+}
+
 } // namespace
 
 int main() {
@@ -392,6 +508,8 @@ int main() {
         test_basic_container(root.path());
         test_malformed_tables(root.path());
         test_sharded_ranges_and_source_lifetime(
+            root.path());
+        test_hf_virtual_full_precision_container(
             root.path());
         std::cout << "MFQ Metal container test passed\n";
         return 0;

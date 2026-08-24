@@ -13,6 +13,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from mfq.server.hf_tokenizer import (
+    ensure_hf_tokenizer_gguf,
+    native_hf_asset_environment,
+)
+
 
 class NativeRuntimeError(RuntimeError):
     """Raised when the private native worker cannot be started."""
@@ -36,6 +41,7 @@ def native_runtime_environment(
     executable: str | Path,
     backend: str,
     base: Mapping[str, str] | None = None,
+    model: str | Path | None = None,
 ) -> dict[str, str]:
     """Return a worker environment with relocatable Metal resources resolved."""
 
@@ -53,6 +59,8 @@ def native_runtime_environment(
         )
         if video_library is not None:
             environment["MFQ_AVFOUNDATION_VIDEO_LIBRARY"] = str(video_library)
+    if model is not None:
+        environment.update(native_hf_asset_environment(model))
     return environment
 
 
@@ -60,6 +68,13 @@ def reserve_loopback_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
         return int(listener.getsockname()[1])
+
+
+def native_tokenizer_arguments(model: str | Path) -> list[str]:
+    model_path = Path(model).expanduser().resolve()
+    if not model_path.is_dir():
+        return []
+    return ["--tokenizer-gguf", str(ensure_hf_tokenizer_gguf(model_path))]
 
 
 @dataclass
@@ -97,6 +112,7 @@ class NativeRuntime:
             command.extend(["--prefill-chunk-size", str(self.prefill_chunk_size)])
         if self.context_size > 0:
             command.extend(["--ctx-size", str(self.context_size)])
+        command.extend(native_tokenizer_arguments(self.model))
         return command
 
     def start(self) -> None:
@@ -104,8 +120,8 @@ class NativeRuntime:
             raise NativeRuntimeError("native runtime is already running")
         if not self.executable.is_file():
             raise NativeRuntimeError(f"native runtime executable does not exist: {self.executable}")
-        if not self.model.is_file():
-            raise NativeRuntimeError(f"MFQ model does not exist: {self.model}")
+        if not (self.model.is_file() or self.model.is_dir()):
+            raise NativeRuntimeError(f"model does not exist: {self.model}")
         self.port = reserve_loopback_port()
         command = self.command(self.port)
         print(
@@ -116,7 +132,9 @@ class NativeRuntime:
         self.process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
-            env=native_runtime_environment(self.executable, self.backend),
+            env=native_runtime_environment(
+                self.executable, self.backend, model=self.model
+            ),
         )
         self._wait_until_ready()
 

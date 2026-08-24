@@ -30,7 +30,11 @@ from mfq.server.models import (
     ToolChoice,
     ToolDefinition,
 )
-from mfq.server.native import find_native_runtime_resource, native_runtime_environment
+from mfq.server.native import (
+    find_native_runtime_resource,
+    native_runtime_environment,
+    native_tokenizer_arguments,
+)
 
 
 class RuntimeManagementError(RuntimeError):
@@ -229,9 +233,12 @@ class ManagedRuntimePool:
         ]
         if self.backend == "metal":
             command.extend(["--prefill-chunk-size", str(request.prefill_chunk_size)])
+        command.extend(native_tokenizer_arguments(artifact.path))
         if request.moe_gpu_cache_gb is not None:
             command.extend(["--moe-gpu-cache-gb", str(request.moe_gpu_cache_gb)])
-        process_environment = native_runtime_environment(self.executable, self.backend)
+        process_environment = native_runtime_environment(
+            self.executable, self.backend, model=artifact.path
+        )
         cache_environment = {
             "MFQ_SERVER_MAX_KV_SESSIONS": request.prefix_cache_max_sessions,
             "MFQ_SERVER_MAX_KV_SNAPSHOTS_PER_SESSION": (

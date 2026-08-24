@@ -384,27 +384,13 @@ private:
 };
 
 std::vector<std::uint8_t> read_record_prefix(
-    const MfqRecord& record,
+    const MfqContainer& model,
+    const std::string& name,
     std::size_t maximum = 256) {
+    const auto& record = model.record(name);
     const auto count = static_cast<std::size_t>(
         std::min<std::uint64_t>(record.nbytes, maximum));
-    std::vector<std::uint8_t> result(count);
-    std::ifstream stream(record.source_path, std::ios::binary);
-    if (!stream) {
-        throw std::runtime_error(
-            "cannot open DeepSeek-V4 tensor source: " +
-            record.source_path.string());
-    }
-    stream.seekg(static_cast<std::streamoff>(record.offset));
-    stream.read(
-        reinterpret_cast<char*>(result.data()),
-        static_cast<std::streamsize>(result.size()));
-    if (!stream) {
-        throw std::runtime_error(
-            "cannot read DeepSeek-V4 tensor header: " +
-            record.name);
-    }
-    return result;
+    return model.read_range(name, 0, count);
 }
 
 std::vector<std::int64_t> read_shape(
@@ -1218,7 +1204,7 @@ inspect_deepseek_v4_tensor_metadata(
     const MfqContainer& model,
     const std::string& name) {
     const auto& record = model.record(name);
-    const auto prefix = read_record_prefix(record);
+    const auto prefix = read_record_prefix(model, name);
     PrefixCursor cursor(prefix);
     DeepseekV4TensorMetadata result;
     result.dtype = record.dtype;

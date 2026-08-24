@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import struct
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,7 +48,7 @@ class DiscoveredModel:
 
 
 class ModelCatalog:
-    """Discover complete MFQ containers under explicitly configured roots."""
+    """Discover complete MFQ containers and native HF checkpoints."""
 
     def __init__(
         self,
@@ -173,7 +174,7 @@ class ModelCatalog:
                 selected,
             )
             if not registration_paths:
-                raise ModelRegistrationError("selected directory contains no MFQ model files")
+                raise ModelRegistrationError("selected directory contains no supported models")
             index_path = self.roots[0] / MODEL_FILE_INDEX
             previous = index_path.read_bytes() if index_path.is_file() else None
             await asyncio.to_thread(self._write_registered_paths, index_path, registration_paths)
@@ -227,10 +228,15 @@ class ModelCatalog:
     @staticmethod
     def _immediate_model_count(path: Path) -> int:
         try:
-            return sum(
+            mfq_count = sum(
                 item.is_file() and item.suffix.casefold() == ".mfq"
                 for item in path.iterdir()
             )
+            hf_count = int(ModelCatalog._is_hf_model_directory(path)) + sum(
+                item.is_dir() and ModelCatalog._is_hf_model_directory(item)
+                for item in path.iterdir()
+            )
+            return mfq_count + hf_count
         except OSError:
             return 0
 
@@ -303,6 +309,14 @@ class ModelCatalog:
                     paths[0],
                 ).resolve()
             )
+        hf_directories = {
+            config.parent.resolve()
+            for config in directory.rglob("config.json")
+            if ModelCatalog._is_hf_model_directory(config.parent)
+        }
+        if ModelCatalog._is_hf_model_directory(directory):
+            hf_directories.add(directory.resolve())
+        result.extend(sorted(hf_directories))
         return result
 
     @staticmethod
@@ -369,6 +383,13 @@ class ModelCatalog:
                 continue
             grouped: dict[Path, list[Path]] = {}
             paths = {*root.rglob("*.mfq"), *self._registered_paths(root)}
+            paths.update(
+                config.parent
+                for config in root.rglob("config.json")
+                if self._is_hf_model_directory(config.parent)
+            )
+            if self._is_hf_model_directory(root):
+                paths.add(root)
             for path in sorted(paths):
                 try:
                     parsed = parse_shard_path(path)
@@ -415,11 +436,14 @@ class ModelCatalog:
             if not isinstance(value, str):
                 continue
             path = Path(value).expanduser()
-            if path.suffix.casefold() != ".mfq":
-                continue
             try:
                 resolved = path.resolve(strict=True)
             except OSError:
+                continue
+            if resolved.is_dir() and ModelCatalog._is_hf_model_directory(resolved):
+                result.add(resolved)
+                continue
+            if resolved.suffix.casefold() != ".mfq":
                 continue
             if resolved.is_file():
                 try:
@@ -434,6 +458,8 @@ class ModelCatalog:
 
     @staticmethod
     def _inspect(root: Path, path: Path) -> DiscoveredModel:
+        if path.is_dir():
+            return ModelCatalog._inspect_hf(root, path)
         try:
             parsed = parse_shard_path(path)
         except ValueError:
@@ -483,6 +509,115 @@ class ModelCatalog:
                 architecture="unknown",
                 shard_count=parsed[2] if parsed is not None else 1,
                 total_bytes=stat.st_size,
+                tensor_count=0,
+                record_count=0,
+                complete=False,
+                loadable=False,
+                modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc),
+                error=str(error).replace(str(root), "<model-root>"),
+            )
+        return DiscoveredModel(resource=resource, path=path)
+
+    @staticmethod
+    def _is_hf_model_directory(path: Path) -> bool:
+        if not (path / "config.json").is_file():
+            return False
+        if (path / "model.safetensors.index.json").is_file():
+            return True
+        try:
+            return any(item.is_file() for item in path.glob("*.safetensors"))
+        except OSError:
+            return False
+
+    @staticmethod
+    def _safetensors_header(path: Path) -> dict[str, object]:
+        with path.open("rb") as stream:
+            raw_size = stream.read(8)
+            if len(raw_size) != 8:
+                raise ValueError(f"truncated Safetensors header: {path.name}")
+            size = struct.unpack("<Q", raw_size)[0]
+            raw_header = stream.read(size)
+        if len(raw_header) != size:
+            raise ValueError(f"truncated Safetensors header: {path.name}")
+        header = json.loads(raw_header)
+        if not isinstance(header, dict):
+            raise ValueError(f"invalid Safetensors header: {path.name}")
+        return header
+
+    @staticmethod
+    def _inspect_hf(root: Path, path: Path) -> DiscoveredModel:
+        name = path.name
+        relative = path.relative_to(root).as_posix() if path.is_relative_to(root) else name
+        try:
+            config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+            model_type = config.get("model_type") if isinstance(config, dict) else None
+            if not isinstance(model_type, str) or not model_type:
+                raise ValueError("HF config.json has no model_type")
+            index_path = path / "model.safetensors.index.json"
+            indexed_names: set[str] | None = None
+            if index_path.is_file():
+                index = json.loads(index_path.read_text(encoding="utf-8"))
+                weight_map = index.get("weight_map") if isinstance(index, dict) else None
+                if not isinstance(weight_map, dict) or not weight_map:
+                    raise ValueError("invalid Safetensors weight_map")
+                if not all(isinstance(key, str) and isinstance(value, str)
+                           for key, value in weight_map.items()):
+                    raise ValueError("invalid Safetensors weight_map entry")
+                indexed_names = set(weight_map)
+                shard_paths = tuple(
+                    path / item for item in sorted(set(weight_map.values()))
+                )
+            else:
+                shard_paths = tuple(sorted(path.glob("*.safetensors")))
+            if not shard_paths or any(not item.is_file() for item in shard_paths):
+                raise ValueError("HF checkpoint is missing Safetensors shards")
+            tensors: set[str] = set()
+            dtypes: set[str] = set()
+            for shard in shard_paths:
+                for tensor_name, entry in ModelCatalog._safetensors_header(shard).items():
+                    if tensor_name == "__metadata__":
+                        continue
+                    if not isinstance(entry, dict) or not isinstance(entry.get("dtype"), str):
+                        raise ValueError(f"invalid Safetensors tensor: {tensor_name}")
+                    if tensor_name in tensors:
+                        raise ValueError(f"duplicate Safetensors tensor: {tensor_name}")
+                    tensors.add(tensor_name)
+                    dtypes.add(entry["dtype"])
+            if indexed_names is not None and not indexed_names.issubset(tensors):
+                raise ValueError("Safetensors index references missing tensors")
+            stats = tuple(item.stat() for item in shard_paths)
+            fingerprint = "\0".join(
+                [model_type, name, *(f"{item.name}:{stat.st_size}" for item, stat in zip(
+                    shard_paths, stats, strict=True
+                ))]
+            )
+            identifier = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:32]
+            resource = ModelArtifactResource(
+                id=identifier,
+                name=name,
+                architecture=f"{model_type}-hf-full-mfq",
+                format="hf",
+                shard_count=len(shard_paths),
+                total_bytes=sum(stat.st_size for stat in stats),
+                tensor_count=len(indexed_names if indexed_names is not None else tensors),
+                record_count=len(indexed_names if indexed_names is not None else tensors) + 1,
+                dtypes=sorted(dtypes),
+                complete=True,
+                loadable=True,
+                modified_at=datetime.fromtimestamp(
+                    max(stat.st_mtime for stat in stats), timezone.utc
+                ),
+            )
+        except Exception as error:
+            stat = path.stat()
+            identifier = hashlib.sha256(f"{relative}\0{stat.st_mtime_ns}".encode()).hexdigest()[:32]
+            resource = ModelArtifactResource(
+                id=identifier,
+                name=name,
+                architecture="unknown",
+                format="hf",
+                shard_count=0,
+                total_bytes=0,
                 tensor_count=0,
                 record_count=0,
                 complete=False,

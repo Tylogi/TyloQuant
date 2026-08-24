@@ -274,7 +274,7 @@ export interface ModelArtifact {
   id: string;
   name: string;
   architecture: string;
-  format: "mfq";
+  format: "mfq" | "hf";
   shard_count: number;
   total_bytes: number;
   tensor_count: number;

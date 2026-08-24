@@ -6,6 +6,8 @@
 #include "mlx_tensor.h"
 #include "qwen35_model.h"
 
+#include "../../third_party/nlohmann/json.hpp"
+
 #ifdef MFQ_METAL_SERVER
 #include "../mfq_server.h"
 #endif
@@ -1439,9 +1441,10 @@ int run_native_hf_server(const Arguments& arguments) {
                 8,
                 prefill_overlap);
         };
+    const mfq::metal::MfqContainer profile_container(model_root);
     return serve_loaded_runtime(
         arguments,
-        nullptr,
+        &profile_container,
         std::move(runtime),
         load_runtime,
         config.model_type,
@@ -1594,6 +1597,16 @@ int run_native_server(
             runtime_stream);
     }
 
+    const bool qwen35_family =
+        architecture.rfind("qwen35", 0) == 0 ||
+        architecture.rfind("qwen3_5", 0) == 0 ||
+        architecture.rfind("qwen3_6", 0) == 0 ||
+        architecture.rfind("qwen3_8", 0) == 0;
+    if (!qwen35_family) {
+        throw std::runtime_error(
+            "unsupported native Metal model architecture: " + architecture);
+    }
+
     const auto config =
         mfq::metal::Qwen35Config::from_mfq(container);
     std::cout
@@ -1653,17 +1666,21 @@ int main(int argc, char** argv) {
         }
 
         if (std::filesystem::is_directory(arguments.mfq)) {
-            if (!arguments.server) {
-                usage_error("HF model directories currently support --server");
-            }
-            configure_mlx_metal();
+            if (arguments.server) {
+                configure_mlx_metal();
 #ifdef MFQ_METAL_SERVER
-            return run_native_hf_server(arguments);
+                const auto config_path = arguments.mfq / "config.json";
+                const auto config = nlohmann::json::parse(read_text(config_path));
+                const auto model_type = config.value("model_type", std::string{});
+                if (model_type.rfind("deepseek_v4", 0) == 0) {
+                    return run_native_hf_server(arguments);
+                }
 #else
-            throw std::runtime_error(
-                "this build has no C++ server support; configure with "
-                "-DMFQ_BUILD_CPP_SERVER=ON and matching llama.cpp paths");
+                throw std::runtime_error(
+                    "this build has no C++ server support; configure with "
+                    "-DMFQ_BUILD_CPP_SERVER=ON and matching llama.cpp paths");
 #endif
+            }
         }
 
         const mfq::metal::MfqContainer model(arguments.mfq);
