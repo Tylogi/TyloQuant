@@ -523,7 +523,9 @@ MlxDeepseekV4SsdExpertCache::~MlxDeepseekV4SsdExpertCache() = default;
 MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
     std::size_t layer,
     std::span<const std::int32_t> active_experts,
-    std::function<void()> overlap) {
+    std::function<void(
+        const MlxDeepseekV4SsdExpertWeights&,
+        std::span<const std::int32_t>)> overlap) {
     const auto prepare_begin = std::chrono::steady_clock::now();
     // The caller has evaluated the current layer's routing IDs before this
     // point, which also completes the previous layer graph. Its arena rows can
@@ -542,16 +544,30 @@ MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
         for (const auto expert : unique) {
             acquisitions.push_back(impl_->acquire(layer, expert));
         }
-        const bool pending = std::any_of(
-            acquisitions.begin(),
-            acquisitions.end(),
-            [](const Impl::Acquisition& acquired) {
-                return acquired.ready.wait_for(
-                           std::chrono::seconds(0)) !=
-                    std::future_status::ready;
-            });
+        std::vector<std::int32_t> ready_experts;
+        ready_experts.reserve(unique.size());
+        bool pending = false;
+        for (std::size_t index = 0; index < acquisitions.size(); ++index) {
+            if (acquisitions[index].ready.wait_for(
+                    std::chrono::seconds(0)) ==
+                std::future_status::ready) {
+                ready_experts.push_back(unique[index]);
+            } else {
+                pending = true;
+            }
+        }
+        std::vector<std::int32_t> slot_map(impl_->store.num_experts(), -1);
+        for (std::size_t index = 0; index < unique.size(); ++index) {
+            slot_map[static_cast<std::size_t>(unique[index])] =
+                static_cast<std::int32_t>(
+                    impl_->prefill_slots + acquisitions[index].slot);
+        }
+        const auto view_begin = std::chrono::steady_clock::now();
+        auto weights = impl_->arena.routed_weights(slot_map, unique);
+        const auto view_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - view_begin).count();
         if (pending && overlap) {
-            overlap();
+            overlap(weights, ready_experts);
         }
         const auto wait_begin = std::chrono::steady_clock::now();
         for (const auto& acquired : acquisitions) {
@@ -559,20 +575,10 @@ MlxDeepseekV4SsdPreparedExperts MlxDeepseekV4SsdExpertCache::prepare(
         }
         const auto wait_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - wait_begin).count();
-        std::vector<std::int32_t> slot_map(impl_->store.num_experts(), -1);
-        for (std::size_t index = 0; index < unique.size(); ++index) {
-            slot_map[static_cast<std::size_t>(unique[index])] =
-                static_cast<std::int32_t>(
-                    impl_->prefill_slots + acquisitions[index].slot);
-        }
         {
             std::scoped_lock lock(impl_->mutex);
             impl_->counters.wait_seconds += wait_seconds;
         }
-        const auto view_begin = std::chrono::steady_clock::now();
-        auto weights = impl_->arena.routed_weights(slot_map, unique);
-        const auto view_seconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - view_begin).count();
         const auto prepare_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - prepare_begin).count();
         {

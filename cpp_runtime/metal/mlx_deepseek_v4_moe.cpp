@@ -1119,7 +1119,16 @@ MlxDeepseekV4Moe::forward_branches(
         const MlxRoutedLinear* gate_up,
         const MlxRoutedLinear* gate,
         const MlxRoutedLinear* up,
-        const MlxRoutedLinear* down) {
+        const MlxRoutedLinear* down,
+        const array* selected_ids = nullptr,
+        const array* selected_weights = nullptr,
+        const array* precomputed_hidden = nullptr) {
+        const auto& route_ids = selected_ids != nullptr
+            ? *selected_ids
+            : expert_ids;
+        const auto& route_weights = selected_weights != nullptr
+            ? *selected_weights
+            : expert_weights;
         const bool split_resident =
             gate != nullptr;
         if ((gate == nullptr) != (up == nullptr) || down == nullptr ||
@@ -1137,33 +1146,33 @@ MlxDeepseekV4Moe::forward_branches(
             && gate_up_grouped
             && down->supports_grouped_vq_mmq();
         if (grouped_prefill) {
-            const int routes = expert_ids.shape(1);
+            const int routes = route_ids.shape(1);
             auto route_order = mlx::core::contiguous(
                 mlx::core::astype(
                     mlx::core::argsort(
                         mlx::core::reshape(
-                            expert_ids,
+                            route_ids,
                             Shape{rows * routes})),
                     mlx::core::int32));
             auto block_plan =
                 split_resident
                 ? gate->build_grouped_vq_mmq_plan(
-                      expert_ids,
+                      route_ids,
                       route_order)
                 : gate_up->build_grouped_vq_mmq_plan(
-                      expert_ids,
+                      route_ids,
                       route_order);
             array routed_hidden = [&]() {
                 if (split_resident) {
                     auto gate_output = gate->forward_sorted(
                         source,
-                        expert_ids,
+                        route_ids,
                         route_order,
                         false,
                         &block_plan);
                     auto up_output = up->forward_sorted(
                         source,
-                        expert_ids,
+                        route_ids,
                         route_order,
                         false,
                         &block_plan);
@@ -1176,7 +1185,7 @@ MlxDeepseekV4Moe::forward_branches(
                 return moe_limited_swiglu_split(
                     gate_up->forward_sorted(
                         source,
-                        expert_ids,
+                        route_ids,
                         route_order,
                         false,
                         &block_plan),
@@ -1191,7 +1200,7 @@ MlxDeepseekV4Moe::forward_branches(
             auto down_sorted =
                 down->forward_sorted(
                     routed_hidden,
-                    expert_ids,
+                    route_ids,
                     route_order,
                     true,
                     &block_plan);
@@ -1208,7 +1217,7 @@ MlxDeepseekV4Moe::forward_branches(
                 Shape{rows, routes, hidden});
             auto output = moe_weighted_reduce(
                 routed_pairs,
-                expert_weights);
+                route_weights);
             if (detail::component_profile_active()) {
                 detail::profile_eval(
                     "moe.route_reduce",
@@ -1216,24 +1225,26 @@ MlxDeepseekV4Moe::forward_branches(
             }
             return output;
         } else {
-            array routed_hidden = [&]() {
-                if (split_resident) {
-                    return limited_swiglu_pair(
-                        gate->forward(
-                            source,
-                            expert_ids),
-                        up->forward(
-                            source,
-                            expert_ids),
+            array routed_hidden = precomputed_hidden != nullptr
+                ? *precomputed_hidden
+                : [&]() {
+                    if (split_resident) {
+                        return limited_swiglu_pair(
+                            gate->forward(
+                                source,
+                                route_ids),
+                            up->forward(
+                                source,
+                                route_ids),
+                            static_cast<float>(
+                                config_.swiglu_limit));
+                    }
+                    return gate_up->swiglu(
+                        source,
+                        route_ids,
                         static_cast<float>(
                             config_.swiglu_limit));
-                }
-                return gate_up->swiglu(
-                    source,
-                    expert_ids,
-                    static_cast<float>(
-                        config_.swiglu_limit));
-            }();
+                }();
             if (detail::component_profile_active()) {
                 detail::profile_eval(
                     "moe.routed_gate_up_swiglu",
@@ -1241,13 +1252,13 @@ MlxDeepseekV4Moe::forward_branches(
                 auto routed_pairs =
                     down->forward(
                         routed_hidden,
-                        expert_ids);
+                        route_ids);
                 detail::profile_eval(
                     "moe.routed_down",
                     routed_pairs);
                 auto output = moe_weighted_reduce(
                     routed_pairs,
-                    expert_weights);
+                    route_weights);
                 detail::profile_eval(
                     "moe.route_reduce",
                     output);
@@ -1255,8 +1266,8 @@ MlxDeepseekV4Moe::forward_branches(
             } else {
                 return down->combine(
                     routed_hidden,
-                    expert_ids,
-                    expert_weights);
+                    route_ids,
+                    route_weights);
             }
         }
     };
@@ -1293,18 +1304,128 @@ MlxDeepseekV4Moe::forward_branches(
                 std::unique(active.begin(), active.end()),
                 active.end());
             shared.emplace(build_shared());
+            std::optional<array> ready_gate_up;
+            std::vector<std::int32_t> ready_positions;
+            std::vector<std::int32_t> pending_positions;
             auto prepared = ssd_expert_cache_->prepare(
                 layer_,
                 active,
-                [&shared] {
-                    detail::eval_with_timing(*shared);
+                [
+                    &active,
+                    &expert_ids,
+                    &host_ids,
+                    &pending_positions,
+                    &ready_gate_up,
+                    &ready_positions,
+                    &shared,
+                    &source,
+                    rows,
+                    this
+                ](
+                    const MlxDeepseekV4SsdExpertWeights& weights,
+                    std::span<const std::int32_t> ready_experts) {
+                    std::vector<array> overlap_values;
+                    overlap_values.push_back(*shared);
+                    if (rows == 1 && !ready_experts.empty() &&
+                        ready_experts.size() < active.size()) {
+                        const auto* ids = host_ids.data<std::int32_t>();
+                        const auto routes = static_cast<std::size_t>(
+                            expert_ids.shape(1));
+                        ready_positions.reserve(routes);
+                        pending_positions.reserve(routes);
+                        for (std::size_t position = 0;
+                             position < routes;
+                             ++position) {
+                            const auto expert = ids[position];
+                            if (std::binary_search(
+                                    ready_experts.begin(),
+                                    ready_experts.end(),
+                                    expert)) {
+                                ready_positions.push_back(
+                                    static_cast<std::int32_t>(position));
+                            } else {
+                                pending_positions.push_back(
+                                    static_cast<std::int32_t>(position));
+                            }
+                        }
+                        if (!ready_positions.empty() &&
+                            !pending_positions.empty()) {
+                            const array positions(
+                                ready_positions.begin(),
+                                Shape{static_cast<int>(
+                                    ready_positions.size())});
+                            auto ready_ids = mlx::core::take(
+                                expert_ids,
+                                positions,
+                                1);
+                            ready_gate_up.emplace(
+                                weights.gate_up.swiglu(
+                                    source,
+                                    ready_ids,
+                                    static_cast<float>(
+                                        config_.swiglu_limit)));
+                            overlap_values.push_back(*ready_gate_up);
+                        }
+                    }
+                    detail::eval_with_timing(
+                        std::move(overlap_values));
                 });
             const auto& weights = prepared.weights();
-            routed = run_resident(
-                &weights.gate_up,
-                nullptr,
-                nullptr,
-                &weights.down);
+            if (ready_gate_up.has_value()) {
+                const array pending_indices(
+                    pending_positions.begin(),
+                    Shape{static_cast<int>(pending_positions.size())});
+                auto pending_ids = mlx::core::take(
+                    expert_ids,
+                    pending_indices,
+                    1);
+                auto pending_gate_up = weights.gate_up.swiglu(
+                    source,
+                    pending_ids,
+                    static_cast<float>(config_.swiglu_limit));
+                std::vector<std::int32_t> reorder(
+                    ready_positions.size() + pending_positions.size());
+                for (std::size_t index = 0;
+                     index < ready_positions.size();
+                     ++index) {
+                    reorder[static_cast<std::size_t>(
+                        ready_positions[index])] =
+                            static_cast<std::int32_t>(index);
+                }
+                for (std::size_t index = 0;
+                     index < pending_positions.size();
+                     ++index) {
+                    reorder[static_cast<std::size_t>(
+                        pending_positions[index])] =
+                            static_cast<std::int32_t>(
+                                ready_positions.size() + index);
+                }
+                auto reordered_hidden = mlx::core::take(
+                    mlx::core::concatenate(
+                        {
+                            std::move(*ready_gate_up),
+                            std::move(pending_gate_up),
+                        },
+                        1),
+                    array(
+                        reorder.begin(),
+                        Shape{static_cast<int>(reorder.size())}),
+                    1);
+                routed = run_resident(
+                    &weights.gate_up,
+                    nullptr,
+                    nullptr,
+                    &weights.down,
+                    &expert_ids,
+                    &expert_weights,
+                    &reordered_hidden);
+            } else {
+                routed = run_resident(
+                    &weights.gate_up,
+                    nullptr,
+                    nullptr,
+                    &weights.down);
+            }
         }
     } else if (!expert_offload_) {
         routed = run_resident(

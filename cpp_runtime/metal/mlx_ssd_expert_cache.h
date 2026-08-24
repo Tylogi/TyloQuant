@@ -117,7 +117,9 @@ public:
     MlxDeepseekV4SsdPreparedExperts prepare(
         std::size_t layer,
         std::span<const std::int32_t> active_experts,
-        std::function<void()> overlap = {});
+        std::function<void(
+            const MlxDeepseekV4SsdExpertWeights&,
+            std::span<const std::int32_t>)> overlap = {});
 
     // Start loading a complete routed-expert layer into one of two alternating
     // buffers. Resident LRU rows are pinned and reused in place; only misses
