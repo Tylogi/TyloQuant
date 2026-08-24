@@ -118,6 +118,18 @@ public:
         std::size_t layer,
         std::size_t expert,
         const DeepseekV4NativeExpertDestination& destination) const;
+    DeepseekV4NativeExpertLoadStats load_scales_scatter(
+        std::size_t layer,
+        std::size_t expert,
+        const DeepseekV4NativeExpertDestination& destination) const;
+    DeepseekV4NativeExpertLoadStats load_gate_scatter(
+        std::size_t layer,
+        std::size_t expert,
+        const DeepseekV4NativeExpertDestination& destination) const;
+    DeepseekV4NativeExpertLoadStats load_up_scatter(
+        std::size_t layer,
+        std::size_t expert,
+        const DeepseekV4NativeExpertDestination& destination) const;
     DeepseekV4NativeExpertLoadStats load_down_scatter(
         std::size_t layer,
         std::size_t expert,

@@ -638,6 +638,20 @@ DeepseekV4NativeExpertStore::load_gate_up_scatter(
     std::size_t layer,
     std::size_t expert,
     const DeepseekV4NativeExpertDestination& destination) const {
+    const auto scales = load_scales_scatter(layer, expert, destination);
+    const auto gate = load_gate_scatter(layer, expert, destination);
+    const auto up = load_up_scatter(layer, expert, destination);
+    return {
+        .bytes = scales.bytes + gate.bytes + up.bytes,
+        .read_calls = scales.read_calls + gate.read_calls + up.read_calls,
+    };
+}
+
+DeepseekV4NativeExpertLoadStats
+DeepseekV4NativeExpertStore::load_scales_scatter(
+    std::size_t layer,
+    std::size_t expert,
+    const DeepseekV4NativeExpertDestination& destination) const {
     const auto& record = expert_record(layer, expert);
     const std::array<std::span<std::byte>, 3> scales{
         destination.w1_scale,
@@ -651,28 +665,54 @@ DeepseekV4NativeExpertStore::load_gate_up_scatter(
                 record.parts[part]->name);
         }
     }
-    if (destination.w1_weight.size() != record.parts[3]->nbytes ||
-        destination.w3_weight.size() != record.parts[5]->nbytes) {
-        throw std::runtime_error(
-            "DeepSeek-V4 phased Gate/Up destination size mismatch");
-    }
     checkpoint_.readv_range(
         record.parts[0]->shard,
         record.parts[0]->offset,
         scales);
+    return {
+        .bytes = record.parts[0]->nbytes + record.parts[1]->nbytes +
+            record.parts[2]->nbytes,
+        .read_calls = 1,
+    };
+}
+
+DeepseekV4NativeExpertLoadStats
+DeepseekV4NativeExpertStore::load_gate_scatter(
+    std::size_t layer,
+    std::size_t expert,
+    const DeepseekV4NativeExpertDestination& destination) const {
+    const auto& record = expert_record(layer, expert);
+    if (destination.w1_weight.size() != record.parts[3]->nbytes) {
+        throw std::runtime_error(
+            "DeepSeek-V4 phased Gate destination size mismatch");
+    }
     checkpoint_.read_range(
         record.parts[3]->shard,
         record.parts[3]->offset,
         destination.w1_weight);
+    return {
+        .bytes = record.parts[3]->nbytes,
+        .read_calls = 1,
+    };
+}
+
+DeepseekV4NativeExpertLoadStats
+DeepseekV4NativeExpertStore::load_up_scatter(
+    std::size_t layer,
+    std::size_t expert,
+    const DeepseekV4NativeExpertDestination& destination) const {
+    const auto& record = expert_record(layer, expert);
+    if (destination.w3_weight.size() != record.parts[5]->nbytes) {
+        throw std::runtime_error(
+            "DeepSeek-V4 phased Up destination size mismatch");
+    }
     checkpoint_.read_range(
         record.parts[5]->shard,
         record.parts[5]->offset,
         destination.w3_weight);
     return {
-        .bytes = record.parts[0]->nbytes + record.parts[1]->nbytes +
-            record.parts[2]->nbytes + record.parts[3]->nbytes +
-            record.parts[5]->nbytes,
-        .read_calls = 3,
+        .bytes = record.parts[5]->nbytes,
+        .read_calls = 1,
     };
 }
 

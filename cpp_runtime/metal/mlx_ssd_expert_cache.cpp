@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -46,15 +47,39 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
         std::shared_future<void> ready;
     };
 
-    struct Task {
+    enum class TaskPart {
+        full,
+        scales,
+        gate,
+        up,
+        down,
+    };
+
+    struct ParallelLoad {
         std::size_t arena_slot = 0;
         std::size_t cache_slot = 0;
         std::uint64_t generation = 0;
         std::size_t layer = 0;
         std::int32_t expert = 0;
-        bool cache_admission = true;
         std::shared_ptr<std::promise<void>> gate_up_completion;
         std::shared_ptr<std::promise<void>> completion;
+        std::atomic<int> gate_parts{3};
+        std::atomic<std::uint64_t> bytes{0};
+        std::atomic<std::uint64_t> read_calls{0};
+        std::atomic<std::uint64_t> io_nanoseconds{0};
+        std::mutex error_mutex;
+        std::exception_ptr error;
+        std::once_flag failure_once;
+        std::atomic<bool> gate_published{false};
+    };
+
+    struct Task {
+        std::size_t arena_slot = 0;
+        std::size_t layer = 0;
+        std::int32_t expert = 0;
+        std::shared_ptr<std::promise<void>> completion;
+        TaskPart part = TaskPart::full;
+        std::shared_ptr<ParallelLoad> parallel;
     };
 
     struct Acquisition {
@@ -167,16 +192,24 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
         slot.ready = completion->get_future().share();
         resident.emplace(key, victim);
         ++counters.misses;
-        tasks.push_back({
-            .arena_slot = prefill_slots + victim,
-            .cache_slot = victim,
-            .generation = slot.generation,
-            .layer = layer,
-            .expert = expert,
-            .cache_admission = true,
-            .gate_up_completion = gate_up_completion,
-            .completion = completion,
-        });
+        auto load = std::make_shared<ParallelLoad>();
+        load->arena_slot = prefill_slots + victim;
+        load->cache_slot = victim;
+        load->generation = slot.generation;
+        load->layer = layer;
+        load->expert = expert;
+        load->gate_up_completion = gate_up_completion;
+        load->completion = completion;
+        for (const auto part : {
+                 TaskPart::scales,
+                 TaskPart::gate,
+                 TaskPart::up,
+             }) {
+            tasks.push_back({
+                .part = part,
+                .parallel = load,
+            });
+        }
         const auto result = Acquisition{
             .slot = victim,
             .generation = slot.generation,
@@ -184,7 +217,7 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
             .ready = slot.ready,
         };
         lock.unlock();
-        condition.notify_one();
+        condition.notify_all();
         return result;
     }
 
@@ -219,12 +252,8 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
             std::scoped_lock lock(mutex);
             tasks.push_back({
                 .arena_slot = arena_slot,
-                .cache_slot = 0,
-                .generation = 0,
                 .layer = layer,
                 .expert = expert,
-                .cache_admission = false,
-                .gate_up_completion = {},
                 .completion = std::move(completion),
             });
         }
@@ -298,6 +327,139 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
         deferred.clear();
     }
 
+    void fail_parallel(const std::shared_ptr<ParallelLoad>& load) noexcept {
+        std::call_once(load->failure_once, [&] {
+            std::exception_ptr error;
+            {
+                std::scoped_lock lock(load->error_mutex);
+                error = load->error;
+            }
+            if (!error) {
+                error = std::make_exception_ptr(std::runtime_error(
+                    "parallel SSD expert read failed"));
+            }
+            {
+                std::scoped_lock lock(mutex);
+                auto& slot = slots[load->cache_slot];
+                if (slot.generation == load->generation) {
+                    slot.state = State::failed;
+                }
+                ++counters.failures;
+            }
+            if (!load->gate_published.exchange(true)) {
+                try {
+                    load->gate_up_completion->set_exception(error);
+                } catch (...) {
+                }
+            }
+            try {
+                load->completion->set_exception(error);
+            } catch (...) {
+            }
+        });
+    }
+
+    void finish_gate_part(const std::shared_ptr<ParallelLoad>& load) {
+        if (load->gate_parts.fetch_sub(1) != 1) {
+            return;
+        }
+        bool failed = false;
+        {
+            std::scoped_lock lock(load->error_mutex);
+            failed = static_cast<bool>(load->error);
+        }
+        if (failed) {
+            fail_parallel(load);
+            return;
+        }
+        load->gate_published.store(true);
+        load->gate_up_completion->set_value();
+        {
+            std::scoped_lock lock(mutex);
+            tasks.push_back({
+                .part = TaskPart::down,
+                .parallel = load,
+            });
+        }
+        condition.notify_one();
+    }
+
+    void run_parallel_part(
+        TaskPart part,
+        const std::shared_ptr<ParallelLoad>& load) {
+        const auto begin = std::chrono::steady_clock::now();
+        try {
+            const auto destination = arena.destination(load->arena_slot);
+            DeepseekV4NativeExpertLoadStats result;
+            switch (part) {
+            case TaskPart::scales:
+                result = store.load_scales_scatter(
+                    load->layer,
+                    static_cast<std::size_t>(load->expert),
+                    destination);
+                break;
+            case TaskPart::gate:
+                result = store.load_gate_scatter(
+                    load->layer,
+                    static_cast<std::size_t>(load->expert),
+                    destination);
+                break;
+            case TaskPart::up:
+                result = store.load_up_scatter(
+                    load->layer,
+                    static_cast<std::size_t>(load->expert),
+                    destination);
+                break;
+            case TaskPart::down:
+                result = store.load_down_scatter(
+                    load->layer,
+                    static_cast<std::size_t>(load->expert),
+                    destination);
+                break;
+            case TaskPart::full:
+                throw std::logic_error("invalid parallel SSD task part");
+            }
+            const auto nanoseconds = std::chrono::duration_cast<
+                std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - begin).count();
+            load->bytes.fetch_add(result.bytes);
+            load->read_calls.fetch_add(result.read_calls);
+            load->io_nanoseconds.fetch_add(
+                static_cast<std::uint64_t>(nanoseconds));
+            if (part == TaskPart::down) {
+                {
+                    std::scoped_lock lock(mutex);
+                    auto& slot = slots[load->cache_slot];
+                    if (slot.generation != load->generation ||
+                        slot.state != State::loading) {
+                        throw std::logic_error(
+                            "SSD expert slot changed while loading");
+                    }
+                    slot.state = State::ready;
+                    ++counters.loads;
+                    counters.bytes_read += load->bytes.load();
+                    counters.read_calls += load->read_calls.load();
+                    counters.io_seconds += static_cast<double>(
+                        load->io_nanoseconds.load()) / 1.0e9;
+                }
+                load->completion->set_value();
+            }
+        } catch (...) {
+            {
+                std::scoped_lock lock(load->error_mutex);
+                if (!load->error) {
+                    load->error = std::current_exception();
+                }
+            }
+            if (part == TaskPart::down) {
+                fail_parallel(load);
+            }
+        }
+        if (part != TaskPart::down) {
+            finish_gate_part(load);
+        }
+    }
+
     void worker() {
         while (true) {
             Task task;
@@ -312,49 +474,22 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
                 task = std::move(tasks.front());
                 tasks.pop_front();
             }
+            if (task.parallel) {
+                run_parallel_part(task.part, task.parallel);
+                continue;
+            }
             const auto begin = std::chrono::steady_clock::now();
-            bool gate_up_completed = false;
             try {
-                DeepseekV4NativeExpertLoadStats result;
-                if (task.cache_admission) {
-                    const auto destination = arena.destination(task.arena_slot);
-                    const auto gate_up = store.load_gate_up_scatter(
-                        task.layer,
-                        static_cast<std::size_t>(task.expert),
-                        destination);
-                    task.gate_up_completion->set_value();
-                    gate_up_completed = true;
-                    const auto down = store.load_down_scatter(
-                        task.layer,
-                        static_cast<std::size_t>(task.expert),
-                        destination);
-                    result.bytes = gate_up.bytes + down.bytes;
-                    result.read_calls = gate_up.read_calls + down.read_calls;
-                } else {
-                    result = store.load_scatter(
-                        task.layer,
-                        static_cast<std::size_t>(task.expert),
-                        arena.destination(task.arena_slot));
-                }
+                const auto result = store.load_scatter(
+                    task.layer,
+                    static_cast<std::size_t>(task.expert),
+                    arena.destination(task.arena_slot));
                 const auto seconds = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - begin).count();
                 {
                     std::scoped_lock lock(mutex);
-                    if (task.cache_admission) {
-                        auto& slot = slots[task.cache_slot];
-                        if (slot.generation != task.generation ||
-                            slot.state != State::loading) {
-                            throw std::logic_error(
-                                "SSD expert slot changed while loading");
-                        }
-                        slot.state = State::ready;
-                        ++counters.loads;
-                        counters.bytes_read += result.bytes;
-                        counters.read_calls += result.read_calls;
-                    } else {
-                        ++counters.prefill_expert_reads;
-                        counters.prefill_bytes_read += result.bytes;
-                    }
+                    ++counters.prefill_expert_reads;
+                    counters.prefill_bytes_read += result.bytes;
                     counters.io_seconds += seconds;
                 }
                 task.completion->set_value();
@@ -362,20 +497,7 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
                 const auto error = std::current_exception();
                 {
                     std::scoped_lock lock(mutex);
-                    if (task.cache_admission) {
-                        auto& slot = slots[task.cache_slot];
-                        if (slot.generation == task.generation) {
-                            slot.state = State::failed;
-                        }
-                    }
                     ++counters.failures;
-                }
-                if (!gate_up_completed && task.gate_up_completion) {
-                    try {
-                        task.gate_up_completion->set_exception(
-                            error);
-                    } catch (...) {
-                    }
                 }
                 try {
                     task.completion->set_exception(error);

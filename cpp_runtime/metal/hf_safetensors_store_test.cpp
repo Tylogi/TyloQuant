@@ -153,6 +153,33 @@ int main() {
         require(scatter_stats.read_calls == 2, "scatter load was not coalesced");
         for (std::size_t part = 0; part < scattered.size(); ++part) {
             check_part(scattered[part], kParts[part]);
+            std::fill(scattered[part].begin(), scattered[part].end(), std::byte{0});
+        }
+
+        const mfq::metal::DeepseekV4NativeExpertDestination phased{
+            .w1_scale = scattered[0],
+            .w2_scale = scattered[1],
+            .w3_scale = scattered[2],
+            .w1_weight = scattered[3],
+            .w2_weight = scattered[4],
+            .w3_weight = scattered[5],
+        };
+        const auto scale_stats = store.load_scales_scatter(0, 0, phased);
+        const auto gate_stats = store.load_gate_scatter(0, 0, phased);
+        const auto up_stats = store.load_up_scatter(0, 0, phased);
+        const auto down_stats = store.load_down_scatter(0, 0, phased);
+        require(
+            scale_stats.read_calls + gate_stats.read_calls +
+                    up_stats.read_calls + down_stats.read_calls ==
+                4,
+            "phased expert read count mismatch");
+        require(
+            scale_stats.bytes + gate_stats.bytes + up_stats.bytes +
+                    down_stats.bytes ==
+                slot.size(),
+            "phased expert byte count mismatch");
+        for (std::size_t part = 0; part < scattered.size(); ++part) {
+            check_part(scattered[part], kParts[part]);
         }
 
         std::filesystem::remove_all(root);
