@@ -1305,6 +1305,7 @@ MlxDeepseekV4Moe::forward_branches(
                 active.end());
             shared.emplace(build_shared());
             std::optional<array> ready_gate_up;
+            std::optional<array> ready_down;
             std::optional<array> pending_gate_up;
             std::vector<std::int32_t> ready_positions;
             std::vector<std::int32_t> pending_positions;
@@ -1317,6 +1318,7 @@ MlxDeepseekV4Moe::forward_branches(
                     &host_ids,
                     &pending_positions,
                     &ready_gate_up,
+                    &ready_down,
                     &ready_positions,
                     &shared,
                     &source,
@@ -1364,7 +1366,11 @@ MlxDeepseekV4Moe::forward_branches(
                                     ready_ids,
                                     static_cast<float>(
                                         config_.swiglu_limit)));
-                            overlap_values.push_back(*ready_gate_up);
+                            ready_down.emplace(
+                                weights.down.forward(
+                                    *ready_gate_up,
+                                    ready_ids));
+                            overlap_values.push_back(*ready_down);
                         }
                     }
                     detail::eval_with_timing(
@@ -1398,8 +1404,18 @@ MlxDeepseekV4Moe::forward_branches(
                     detail::eval_with_timing(*pending_gate_up);
                 });
             const auto& weights = prepared.weights();
-            if (ready_gate_up.has_value() &&
+            if (ready_down.has_value() &&
                 pending_gate_up.has_value()) {
+                const array pending_indices(
+                    pending_positions.begin(),
+                    Shape{static_cast<int>(pending_positions.size())});
+                auto pending_ids = mlx::core::take(
+                    expert_ids,
+                    pending_indices,
+                    1);
+                auto pending_down = weights.down.forward(
+                    *pending_gate_up,
+                    pending_ids);
                 std::vector<std::int32_t> reorder(
                     ready_positions.size() + pending_positions.size());
                 for (std::size_t index = 0;
@@ -1417,25 +1433,20 @@ MlxDeepseekV4Moe::forward_branches(
                             static_cast<std::int32_t>(
                                 ready_positions.size() + index);
                 }
-                auto reordered_hidden = mlx::core::take(
+                auto routed_pairs = mlx::core::take(
                     mlx::core::concatenate(
                         {
-                            std::move(*ready_gate_up),
-                            std::move(*pending_gate_up),
+                            std::move(*ready_down),
+                            std::move(pending_down),
                         },
                         1),
                     array(
                         reorder.begin(),
                         Shape{static_cast<int>(reorder.size())}),
                     1);
-                routed = run_resident(
-                    &weights.gate_up,
-                    nullptr,
-                    nullptr,
-                    &weights.down,
-                    &expert_ids,
-                    &expert_weights,
-                    &reordered_hidden);
+                routed = moe_weighted_reduce(
+                    routed_pairs,
+                    expert_weights);
             } else if (pending_gate_up.has_value()) {
                 routed = run_resident(
                     &weights.gate_up,
