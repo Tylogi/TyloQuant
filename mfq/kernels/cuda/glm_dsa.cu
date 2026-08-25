@@ -422,7 +422,7 @@ mfq_tensor_backend::Tensor launch_glm_sparse_mla(
     auto stream = mfq_current_cuda_stream();
     kernel<<<rounded_blocks, dim3(32, nwarps, 1), shmem, stream>>>(
         q.data_ptr<float>(), reinterpret_cast<const half *>(kv.data_ptr<mfq_half>()),
-        indices.data_ptr<int>(), out.data_ptr<float>(),
+        indices.data_ptr<int>(), static_cast<float*>(out.data_ptr()),
         reinterpret_cast<float2 *>(meta.data_ptr<float>()),
         static_cast<float>(scale), B, M, max_seq, topk,
         init_fastdiv_values(M));
@@ -436,7 +436,7 @@ mfq_tensor_backend::Tensor launch_glm_sparse_mla(
         const uint3 fd2 = init_fastdiv_values(M);
         flash_attn_stream_k_fixup_uniform<kMlaDv, ncols1, ncols2>
             <<<dim3(ntiles_dst, ncols1, ncols2), kMlaDv, 0, stream>>>(
-                out.data_ptr<float>(),
+                static_cast<float*>(out.data_ptr()),
                 reinterpret_cast<const float2 *>(meta.data_ptr<float>()),
                 M, kMlaHeads, 1, rounded_blocks, kMlaHeads,
                 blocks_per_tile, fd0, fd1, fd2);

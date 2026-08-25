@@ -1085,7 +1085,7 @@ mfq_tensor_backend::Tensor launch_dsv4_sparse_attention(
         indices.data_ptr<int>(),
         reinterpret_cast<const half *>(mask.data_ptr<mfq_half>()),
         sinks.data_ptr<float>(),
-        out.data_ptr<float>(),
+        static_cast<float*>(out.data_ptr()),
         reinterpret_cast<float2 *>(meta.data_ptr<float>()),
         static_cast<float>(scale), B, M, max_seq, selected,
         init_fastdiv_values(M));
@@ -1102,7 +1102,7 @@ mfq_tensor_backend::Tensor launch_dsv4_sparse_attention(
         flash_attn_stream_k_fixup_uniform<
             kHeadDim, ncols1, ncols2>
             <<<dim3(ntiles_dst, ncols1, ncols2), kHeadDim, 0, stream>>>(
-                out.data_ptr<float>(),
+                static_cast<float*>(out.data_ptr()),
                 reinterpret_cast<const float2 *>(meta.data_ptr<float>()),
                 M, kHeads, 1, rounded_blocks, kHeads,
                 blocks_per_tile, fd0, fd1, fd2);

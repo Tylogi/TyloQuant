@@ -210,7 +210,8 @@ static mfq_tensor_backend::Tensor mfq_llama_flash_launch(
         reinterpret_cast<const char*>(k.data_ptr<mfq_half>()),
         reinterpret_cast<const char*>(v.data_ptr<mfq_half>()),
         reinterpret_cast<const char*>(cache.mask.data_ptr()),
-        nullptr, static_cast<int*>(cache.kv_max.data_ptr()), out.data_ptr<float>(), nullptr,
+        nullptr, static_cast<int*>(cache.kv_max.data_ptr()),
+        static_cast<float*>(out.data_ptr()), nullptr,
         (float)scale, 0.0f, 1.0f, 1.0f, n_head_log2, 0.0f,
         D, ne01, Hq, B,
         D * (int)sizeof(float), T * D * (int)sizeof(float), Hq * T * D * (int)sizeof(float),
@@ -405,7 +406,7 @@ static mfq_tensor_backend::Tensor attention_glm_mla576_cached_impl(
         reinterpret_cast<const char *>(kv_cache.data_ptr<mfq_half>()),
         reinterpret_cast<const char *>(kv_cache.data_ptr<mfq_half>()),
         reinterpret_cast<const char *>(mask.data_ptr<mfq_half>()),
-        nullptr, kv_max.data_ptr<int>(), out.data_ptr<float>(),
+        nullptr, kv_max.data_ptr<int>(), static_cast<float*>(out.data_ptr()),
         reinterpret_cast<float2 *>(meta.data_ptr<float>()),
         static_cast<float>(scale), 0.0f, 1.0f, 1.0f, 64, 0.0f,
         DKQ, ne01, 64, B,
@@ -433,7 +434,7 @@ static mfq_tensor_backend::Tensor attention_glm_mla576_cached_impl(
         const uint3 fd2 = init_fastdiv_values(iter_j);
         flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>
             <<<dim3(ntiles_dst, ncols1, ncols2), DV, 0, stream>>>(
-                out.data_ptr<float>(),
+                static_cast<float*>(out.data_ptr()),
                 reinterpret_cast<const float2 *>(meta.data_ptr<float>()),
                 M, 64, 1, rounded_blocks, 64, blocks_per_tile,
                 fd0, fd1, fd2);
@@ -643,7 +644,7 @@ static mfq_tensor_backend::Tensor attention_llama_flash_decode_impl(
         reinterpret_cast<const char*>(k_cache.data_ptr<mfq_half>()),
         reinterpret_cast<const char*>(v_cache.data_ptr<mfq_half>()),
         reinterpret_cast<const char*>(mask.data_ptr<mfq_half>()),
-        nullptr, kv_max.data_ptr<int>(), out.data_ptr<float>(),
+        nullptr, kv_max.data_ptr<int>(), static_cast<float*>(out.data_ptr()),
         reinterpret_cast<float2*>(meta.data_ptr<float>()),
         (float)scale, 0.0f, 1.0f, 1.0f, n_head_log2, 0.0f,
         DKQ_EXPECTED, ne01, Hq, B,
@@ -666,7 +667,8 @@ static mfq_tensor_backend::Tensor attention_llama_flash_decode_impl(
         const uint3 fd2 = init_fastdiv_values(1);
         flash_attn_stream_k_fixup_uniform<DV_EXPECTED, ncols1, ncols2>
             <<<dim3(ntiles_dst, ncols1, ncols2), DV_EXPECTED, 0, stream>>>(
-                out.data_ptr<float>(), reinterpret_cast<const float2*>(meta.data_ptr<float>()),
+                static_cast<float*>(out.data_ptr()),
+                reinterpret_cast<const float2*>(meta.data_ptr<float>()),
                 1, Hq, Hk, rounded_blocks, gqa_ratio, blocks_per_tile, fd0, fd1, fd2);
         status = cudaGetLastError();
         MFQ_RUNTIME_CHECK(status == cudaSuccess, "llama_flash_decode fixup launch failed: ",

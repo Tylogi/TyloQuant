@@ -306,6 +306,17 @@ if(NOT APPLE)
     target_compile_options(mfq-cuda-native-kernels PRIVATE
         "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>"
     )
+    if(MSVC)
+        # CUDA 13.2's CCCL headers require MSVC's conforming preprocessor.
+        # Use UTF-8 as well so nvcc does not emit C4819 for CUDA headers on
+        # Windows systems whose active code page cannot represent them.
+        foreach(mfq_cuda_target mfq-cuda-core mfq-cuda-native-kernels)
+            target_compile_options(${mfq_cuda_target} PRIVATE
+                "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>"
+                "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>"
+            )
+        endforeach()
+    endif()
     set_target_properties(mfq-cuda-native-kernels PROPERTIES
         CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
         CUDA_RUNTIME_LIBRARY Shared
@@ -417,7 +428,12 @@ if (MFQ_NCCL_LIBRARY AND MFQ_NCCL_INCLUDE_DIR)
     target_compile_definitions(mfq-decode PRIVATE MFQ_HAVE_NCCL=1)
 endif()
 if (MSVC)
-    target_compile_options(mfq-decode PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>" "$<$<COMPILE_LANGUAGE:CXX>:/EHsc>")
+    target_compile_options(mfq-decode PRIVATE
+        "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>"
+        "$<$<COMPILE_LANGUAGE:CXX>:/EHsc>"
+        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>"
+        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>"
+    )
 endif()
 
 option(

@@ -1,7 +1,8 @@
-# Build the Windows x64 MFQ Studio NSIS installer and its bundled CUDA sidecars.
+# Build the Windows x64 MFQ Studio serve-only NSIS installer and CUDA sidecar.
 #
-# The release Python environment is isolated from development environments and
-# excludes the MiniCPM-o extras, which are not part of the Studio distribution.
+# The release Python environment is isolated from development environments. It
+# contains only the daemon dependencies needed by `mfq serve`; training,
+# calibration, quantization, TPQ, MiniCPM-o, and PyTorch are not packaged.
 # The script imports the Visual Studio environment and adds all required tools to
 # its own PATH, so it can be run from ordinary PowerShell.
 
@@ -12,8 +13,6 @@ param(
     [string] $ReleaseVenv = $env:MFQ_RELEASE_VENV,
     [string] $OutputDirectory = $env:MFQ_RELEASE_OUTPUT_DIR,
     [string] $CudaArchitectures = $env:MFQ_RELEASE_CUDA_ARCHITECTURES,
-    [string] $TorchPackage = $env:MFQ_RELEASE_TORCH_PACKAGE,
-    [string] $TorchIndexUrl = $env:MFQ_RELEASE_TORCH_INDEX_URL,
     [int] $Jobs = 0
 )
 
@@ -123,6 +122,24 @@ function Find-CudaRoot {
     Fail "CUDA Toolkit with nvcc is required"
 }
 
+function Find-CudaRuntimeDirectory {
+    param([Parameter(Mandatory)][string] $CudaRoot)
+
+    foreach ($candidate in @(
+            (Join-Path $CudaRoot "bin\x64"),
+            (Join-Path $CudaRoot "bin"))) {
+        if (Test-Path -LiteralPath $candidate -PathType Container) {
+            $runtime = Get-ChildItem -LiteralPath $candidate -File `
+                -Filter "cudart64_*.dll" -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if ($null -ne $runtime) {
+                return $candidate
+            }
+        }
+    }
+    Fail "the CUDA Toolkit runtime DLL directory is missing from $CudaRoot"
+}
+
 function Copy-RuntimeDlls {
     param(
         [Parameter(Mandatory)][string] $SourceDirectory,
@@ -139,6 +156,34 @@ function Copy-RuntimeDlls {
                 Copy-Item -LiteralPath $_.FullName -Destination $DestinationDirectory -Force
             }
     }
+}
+
+function Copy-VisualCppRuntimeDlls {
+    param([Parameter(Mandatory)][string] $DestinationDirectory)
+
+    if ([string]::IsNullOrWhiteSpace($env:VCToolsRedistDir)) {
+        Fail "the Visual Studio environment did not provide VCToolsRedistDir"
+    }
+    $x64Directory = Join-Path $env:VCToolsRedistDir "x64"
+    if (-not (Test-Path -LiteralPath $x64Directory -PathType Container)) {
+        Fail "the Visual C++ x64 redistributable directory is missing from $env:VCToolsRedistDir"
+    }
+
+    $crtDirectory = Get-ChildItem -LiteralPath $x64Directory -Directory |
+        Where-Object { $_.Name -match '^Microsoft\.VC\d+\.CRT$' } |
+        Select-Object -First 1
+    if ($null -eq $crtDirectory) {
+        Fail "the Visual C++ x64 CRT redistributable is missing from $x64Directory"
+    }
+    Copy-RuntimeDlls $crtDirectory.FullName $DestinationDirectory
+
+    # CMake may enable OpenMP for mfq-decode when the VS workload provides it.
+    # Staging the runtime when present is harmless if OpenMP was not selected.
+    Get-ChildItem -LiteralPath $x64Directory -Directory |
+        Where-Object { $_.Name -match '^Microsoft\.VC\d+\.OpenMP$' } |
+        ForEach-Object {
+            Copy-RuntimeDlls $_.FullName $DestinationDirectory
+        }
 }
 
 function Reset-Directory {
@@ -160,8 +205,8 @@ function Get-ReleaseJobs {
         return [int] $env:MFQ_RELEASE_JOBS
     }
 
-    # nvcc's EDG frontend needs several GiB for each translation unit that
-    # includes torch's ATen headers, so bound parallelism by installed memory.
+    # The largest native CUDA translation units need several GiB each, so bound
+    # parallelism by installed memory.
     $memoryJobs = [math]::Floor((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 5GB)
     return [math]::Max(1, [math]::Min([int] $memoryJobs, [Environment]::ProcessorCount))
 }
@@ -198,7 +243,6 @@ function New-BuildContext {
         CudaRoot = $null
         Python = $null
         PyInstaller = $null
-        Torch = $null
         NativeOutput = $null
         Tools = @{ Uv = $null; CMake = $null; Npm = $null }
     }
@@ -245,9 +289,7 @@ function Initialize-ReleaseDirectories {
 function Initialize-PythonEnvironment {
     param(
         [Parameter(Mandatory)][hashtable] $Context,
-        [Parameter(Mandatory)][string] $Version,
-        [Parameter(Mandatory)][string] $CudaTorchPackage,
-        [Parameter(Mandatory)][string] $CudaTorchIndexUrl
+        [Parameter(Mandatory)][string] $Version
     )
 
     Invoke-Checked $Context.Tools.Uv @("venv", "--clear", "--python", $Version, $Context.VenvDirectory)
@@ -255,11 +297,9 @@ function Initialize-PythonEnvironment {
     Add-ToPath (Join-Path $Context.VenvDirectory "Scripts")
 
     $syncArguments = @(
-        "sync", "--locked", "--active", "--no-default-groups", "--no-editable", "--group", "release"
+        "sync", "--locked", "--active", "--no-default-groups", "--no-editable",
+        "--group", "release", "--extra", "daemon"
     )
-    foreach ($extra in @("daemon", "train", "calibration", "tpq")) {
-        $syncArguments += @("--extra", $extra)
-    }
     Invoke-Checked $Context.Tools.Uv $syncArguments
 
     $Context.Python = Join-Path $Context.VenvDirectory "Scripts\python.exe"
@@ -270,23 +310,6 @@ function Initialize-PythonEnvironment {
     if (-not (Test-Path -LiteralPath $Context.PyInstaller -PathType Leaf)) {
         Fail "uv did not install PyInstaller into the release environment"
     }
-
-    # uv.lock selects PyPI's CPU wheel on Windows. Replace only torch with the
-    # matching CUDA wheel after installing the locked dependency graph.
-    Invoke-Checked $Context.Tools.Uv @(
-        "pip", "install", "--python", $Context.Python,
-        "--index-url", $CudaTorchIndexUrl, "--no-deps", "--reinstall", $CudaTorchPackage
-    )
-
-    $detailsJson = (& $Context.Python -c 'import json, pathlib, sys, torch; p=pathlib.Path; name=f"python{sys.version_info.major}{sys.version_info.minor}.dll"; candidates=(p(sys.executable).parent / name, p(sys.base_prefix) / name, p(sys.prefix) / name); print(json.dumps({"cuda": torch.version.cuda, "cmake_prefix": torch.utils.cmake_prefix_path, "root": str(p(torch.__file__).parent), "python_dll": next((str(item) for item in candidates if item.is_file()), "")}))' | Select-Object -Last 1)
-    if ($LASTEXITCODE -ne 0) {
-        Fail "failed to inspect the release PyTorch installation"
-    }
-    $Context.Torch = $detailsJson | ConvertFrom-Json
-    if ([string]::IsNullOrWhiteSpace($Context.Torch.cuda)) {
-        Fail "the release PyTorch package has no CUDA runtime"
-    }
-    Write-Host "release PyTorch CUDA runtime: $($Context.Torch.cuda)"
 }
 
 function Build-NativeSidecar {
@@ -296,6 +319,9 @@ function Build-NativeSidecar {
         [Parameter(Mandatory)][int] $ParallelJobs
     )
 
+    # mfq-decode uses the native tensor backend and must remain independent of
+    # Python and LibTorch. Explicitly disable the optional A/B reference target
+    # so a reused CMake cache cannot pull those dependencies back into a release.
     Invoke-Checked $Context.Tools.CMake @(
         "-S", (Join-Path $Context.ProjectDirectory "cpp_runtime"),
         "-B", $Context.NativeBuildDirectory,
@@ -304,10 +330,10 @@ function Build-NativeSidecar {
         "-DCMAKE_CUDA_COMPILER=$([System.IO.Path]::Combine($Context.CudaRoot, 'bin', 'nvcc.exe'))",
         "-DCMAKE_CUDA_ARCHITECTURES=$Architectures",
         "-DMFQ_CUDA_ARCHITECTURES=$Architectures",
-        "-DCMAKE_PREFIX_PATH=$($Context.Torch.cmake_prefix)",
         "-DGGML_NATIVE=OFF",
         "-DMFQ_BUILD_CPP_SERVER=ON",
-        "-DMFQ_BUILD_METAL_RUNTIME=OFF"
+        "-DMFQ_BUILD_METAL_RUNTIME=OFF",
+        "-DMFQ_BUILD_TORCH_REFERENCE_RUNTIME=OFF"
     )
     Invoke-Checked $Context.Tools.CMake @(
         "--build", $Context.NativeBuildDirectory,
@@ -331,11 +357,15 @@ function Stage-WindowsRuntime {
 
     Reset-Directory $Context.WindowsRuntimeDirectory
     Copy-RuntimeDlls $Context.NativeOutput.DirectoryName $Context.WindowsRuntimeDirectory
-    Copy-RuntimeDlls (Join-Path $Context.Torch.root "lib") $Context.WindowsRuntimeDirectory
-    if (-not [string]::IsNullOrWhiteSpace($Context.Torch.python_dll)) {
-        Copy-Item -LiteralPath $Context.Torch.python_dll `
-            -Destination $Context.WindowsRuntimeDirectory -Force
+    $cudaRuntimeDirectory = Find-CudaRuntimeDirectory $Context.CudaRoot
+    foreach ($pattern in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")) {
+        Copy-RuntimeDlls $cudaRuntimeDirectory $Context.WindowsRuntimeDirectory @($pattern)
+        if (-not (Get-ChildItem -LiteralPath $Context.WindowsRuntimeDirectory `
+                -File -Filter $pattern -ErrorAction SilentlyContinue)) {
+            Fail "the CUDA Toolkit did not provide the native runtime DLL matching $pattern"
+        }
     }
+    Copy-VisualCppRuntimeDlls $Context.WindowsRuntimeDirectory
     if (-not (Get-ChildItem -LiteralPath $Context.WindowsRuntimeDirectory `
             -File -Filter "*.dll" -ErrorAction SilentlyContinue)) {
         Fail "no native runtime DLLs were staged"
@@ -352,11 +382,15 @@ function Build-PythonCli {
         "--collect-data", "mfq"
     )
     foreach ($package in @(
-            "fastapi", "uvicorn", "pydantic", "torch",
-            "transformers", "tokenizers", "safetensors")) {
+            "av", "fastapi", "httpx", "PIL", "pydantic", "pypdf",
+            "uvicorn", "websockets")) {
         $arguments += @("--collect-all", $package)
     }
     foreach ($module in @(
+            "torch", "transformers", "tokenizers", "safetensors",
+            "scipy", "pyarrow", "huggingface_hub", "tiktoken",
+            "mfq.calibration", "mfq.quantize", "mfq.runtime", "mfq.tools",
+            "mfq._vendor.tpq",
             "mfq.runtime.minicpmo45", "mfq.runtime.minicpmo45_realtime",
             "minicpmo_utils", "stepaudio2_minicpmo", "torchaudio", "onnxruntime",
             "s3tokenizer", "hyperpyyaml", "librosa")) {
@@ -374,9 +408,7 @@ function Build-PythonCli {
         Fail "PyInstaller did not create $($Context.CliArtifact)"
     }
     Invoke-Checked $Context.CliArtifact @("--version")
-    foreach ($command in @("serve", "quantize", "solve-ew", "calibrate", "tpq")) {
-        Invoke-Checked $Context.CliArtifact @($command, "--help")
-    }
+    Invoke-Checked $Context.CliArtifact @("serve", "--help")
     Write-Host "built $($Context.CliArtifact)"
     Write-Host "built $($Context.NativeArtifact)"
 }
@@ -431,12 +463,6 @@ if (-not [System.OperatingSystem]::IsWindows() -or -not [Environment]::Is64BitOp
 
 $PythonVersion = if ([string]::IsNullOrWhiteSpace($PythonVersion)) { "3.12" } else { $PythonVersion }
 $CudaArchitectures = if ([string]::IsNullOrWhiteSpace($CudaArchitectures)) { "86" } else { $CudaArchitectures }
-$TorchPackage = if ([string]::IsNullOrWhiteSpace($TorchPackage)) { "torch==2.13.0" } else { $TorchPackage }
-$TorchIndexUrl = if ([string]::IsNullOrWhiteSpace($TorchIndexUrl)) {
-    "https://download.pytorch.org/whl/cu132"
-} else {
-    $TorchIndexUrl
-}
 $Jobs = Get-ReleaseJobs $Jobs
 
 $venvDirectory = if ([string]::IsNullOrWhiteSpace($ReleaseVenv)) {
@@ -456,7 +482,7 @@ Initialize-ReleaseDirectories $context
 
 Push-Location $context.ProjectDirectory
 try {
-    Initialize-PythonEnvironment $context $PythonVersion $TorchPackage $TorchIndexUrl
+    Initialize-PythonEnvironment $context $PythonVersion
     Build-NativeSidecar $context $CudaArchitectures $Jobs
     Stage-WindowsRuntime $context
     Build-PythonCli $context
