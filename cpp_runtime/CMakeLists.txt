@@ -302,7 +302,10 @@ if(NOT APPLE)
         ${MFQ_LLAMA_SOURCE_DIR}/ggml/src
         ${MFQ_LLAMA_SOURCE_DIR}/ggml/src/ggml-cuda
     )
-    target_link_libraries(mfq-cuda-native-kernels PUBLIC mfq-cuda-core)
+    target_link_libraries(mfq-cuda-native-kernels PUBLIC
+        mfq-cuda-core
+        CUDA::cuda_driver
+    )
     target_compile_options(mfq-cuda-native-kernels PRIVATE
         "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>"
     )
