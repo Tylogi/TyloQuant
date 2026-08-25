@@ -81,6 +81,14 @@ function Import-VisualStudioEnvironment {
         -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
         -property installationPath | Select-Object -First 1
     if ([string]::IsNullOrWhiteSpace($installDirectory)) {
+        $installDirectory = & $vswhere -all -products * -property installationPath |
+            Where-Object {
+                Test-Path -LiteralPath (Join-Path $_ "Common7\Tools\VsDevCmd.bat") `
+                    -PathType Leaf
+            } |
+            Select-Object -First 1
+    }
+    if ([string]::IsNullOrWhiteSpace($installDirectory)) {
         Fail "Visual Studio C++ x64 tools are required"
     }
 
