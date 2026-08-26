@@ -371,6 +371,38 @@ set_target_properties(mfq-metal-mxfp4-sq2-benchmark PROPERTIES
     BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
 )
 
+add_executable(mfq-metal-mxfp4-sq2-eight-test
+    mlx_mxfp4_sq2_eight_test.cpp
+)
+target_link_libraries(mfq-metal-mxfp4-sq2-eight-test PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(mfq-metal-mxfp4-sq2-eight-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-mxfp4-sq2-eight-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+add_test(
+    NAME mfq-metal-mxfp4-sq2-eight-test
+    COMMAND mfq-metal-mxfp4-sq2-eight-test
+)
+
+add_executable(mfq-metal-mxfp4-sq2-eight-benchmark
+    mlx_mxfp4_sq2_benchmark.cpp
+)
+target_link_libraries(mfq-metal-mxfp4-sq2-eight-benchmark PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(
+    mfq-metal-mxfp4-sq2-eight-benchmark PRIVATE cxx_std_20
+)
+target_compile_definitions(
+    mfq-metal-mxfp4-sq2-eight-benchmark
+    PRIVATE MFQ_MXFP4_SQ2_EIGHT_BENCHMARK=1
+)
+set_target_properties(mfq-metal-mxfp4-sq2-eight-benchmark PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+
 add_executable(mfq-metal-mxfp4-sq3-test
     mlx_mxfp4_sq3_test.cpp
 )
