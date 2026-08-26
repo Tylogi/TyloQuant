@@ -163,6 +163,8 @@ add_library(mfq-metal-runtime STATIC
     mlx_moe.cpp
     mlx_moe_ops.cpp
     mlx_mx.cpp
+    mlx_mxfp4_sq2.cpp
+    mlx_mxfp4_sq3.cpp
     mlx_nint.cpp
     mlx_nint8_zero.cpp
     mlx_vq.cpp
@@ -342,6 +344,58 @@ set_target_properties(mfq-metal-mx-test PROPERTIES
     BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
 )
 add_test(NAME mfq-metal-mx-test COMMAND mfq-metal-mx-test)
+
+add_executable(mfq-metal-mxfp4-sq2-test
+    mlx_mxfp4_sq2_test.cpp
+)
+target_link_libraries(mfq-metal-mxfp4-sq2-test PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(mfq-metal-mxfp4-sq2-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-mxfp4-sq2-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+add_test(
+    NAME mfq-metal-mxfp4-sq2-test
+    COMMAND mfq-metal-mxfp4-sq2-test
+)
+
+add_executable(mfq-metal-mxfp4-sq2-benchmark
+    mlx_mxfp4_sq2_benchmark.cpp
+)
+target_link_libraries(mfq-metal-mxfp4-sq2-benchmark PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(mfq-metal-mxfp4-sq2-benchmark PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-mxfp4-sq2-benchmark PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+
+add_executable(mfq-metal-mxfp4-sq3-test
+    mlx_mxfp4_sq3_test.cpp
+)
+target_link_libraries(mfq-metal-mxfp4-sq3-test PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(mfq-metal-mxfp4-sq3-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-mxfp4-sq3-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+add_test(
+    NAME mfq-metal-mxfp4-sq3-test
+    COMMAND mfq-metal-mxfp4-sq3-test
+)
+
+add_executable(mfq-metal-mxfp4-sq3-benchmark
+    mlx_mxfp4_sq3_benchmark.cpp
+)
+target_link_libraries(mfq-metal-mxfp4-sq3-benchmark PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(mfq-metal-mxfp4-sq3-benchmark PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-mxfp4-sq3-benchmark PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
 
 add_executable(mfq-metal-mx-benchmark
     mlx_mx_benchmark.cpp
