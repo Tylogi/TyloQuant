@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Search an eight-state native-output MXFP4 two-bit scalar format.
+"""Search the native-output MXFP4-SQ2 scalar format.
 
 The XOR of the two-bit symbols in each native 32-weight block supplies two
 in-band state bits.  One explicit bit per block supplies the high state bit.
@@ -39,12 +39,7 @@ from bench.dsv4f_mxfp4_adaptive_sq import (
     _raw_gate_up_native,
     _unpack_source,
 )
-from bench.dsv4f_mxfp4_hybrid_sq import (
-    _pack_block_selectors,
-    _unpack_block_selectors,
-    hybrid_mxfp4_sq_rate,
-    quantize_hybrid_mxfp4_sq,
-)
+from bench.dsv4f_mxfp4_hybrid_sq import _pack_block_selectors, _unpack_block_selectors
 from bench.dsv4f_mxfp4_row_vq import (
     _git_identity,
     _metrics,
@@ -153,7 +148,7 @@ PALETTE_CATALOGS = {
 
 
 @dataclass(frozen=True)
-class EightSq2Rate:
+class Mxfp4Sq2Rate:
     bits_per_symbol: int
     native_block_size: int
     explicit_block_selector_bits: int
@@ -171,7 +166,7 @@ class EightSq2Rate:
 
 
 @dataclass(frozen=True)
-class EightSq2RowSolution:
+class Mxfp4Sq2RowSolution:
     error_sse: float
     state_scale_offsets: tuple[int, int, int, int, int, int, int, int]
     state_palette_ids: tuple[int, int, int, int, int, int, int, int]
@@ -180,7 +175,7 @@ class EightSq2RowSolution:
 
 
 @dataclass(frozen=True)
-class EightSq2Encoding:
+class Mxfp4Sq2Encoding:
     matrix_scale_base: int
     state_scale_offsets: np.ndarray
     packed_state_scales: np.ndarray
@@ -194,16 +189,16 @@ class EightSq2Encoding:
     searched_sse: float
 
 
-def eight_mxfp4_sq2_rate(
+def mxfp4_sq2_rate(
     rows: int,
     columns: int,
     *,
     palette_id_bits: int = 5,
-) -> EightSq2Rate:
+) -> Mxfp4Sq2Rate:
     if rows <= 0 or columns <= 0 or columns % 32:
-        raise ValueError("eight-state MXFP4-SQ2 requires positive block-32 matrices")
+        raise ValueError("MXFP4-SQ2 requires positive block-32 matrices")
     if palette_id_bits not in {4, 5}:
-        raise ValueError("eight-state MXFP4-SQ2 requires four- or five-bit palette IDs")
+        raise ValueError("MXFP4-SQ2 requires four- or five-bit palette IDs")
     weights = rows * columns
     blocks = weights // 32
     symbol_nbytes = (weights * 2 + 7) // 8
@@ -213,7 +208,7 @@ def eight_mxfp4_sq2_rate(
     payload_nbytes = (
         1 + symbol_nbytes + block_selector_nbytes + state_scale_nbytes + state_palette_nbytes
     )
-    return EightSq2Rate(
+    return Mxfp4Sq2Rate(
         bits_per_symbol=2,
         native_block_size=32,
         explicit_block_selector_bits=1,
@@ -264,7 +259,7 @@ def _refine_from_assignments(
         states = updated_states
         assignments = updated_assignments
     if best is None:
-        raise RuntimeError("eight-state SQ2 refinement produced no candidate")
+        raise RuntimeError("MXFP4-SQ2 refinement produced no candidate")
     return best[0], tuple(int(item) for item in best[1]), best[2], best[3]
 
 
@@ -294,17 +289,17 @@ def _tag_orders() -> tuple[tuple[int, ...], ...]:
     return tuple(result)
 
 
-EIGHT_STATE_TAG_ORDERS = _tag_orders()
+SQ2_TAG_ORDERS = _tag_orders()
 
 
-def _solve_eight_state_row(
+def _solve_sq2_row(
     source_nibbles_row: np.ndarray,
     source_scale_row: np.ndarray,
     *,
     matrix_scale_base: int,
     maximum_steps: int,
     palette_ids: np.ndarray,
-) -> EightSq2RowSolution:
+) -> Mxfp4Sq2RowSolution:
     scale_values = np.arange(
         matrix_scale_base,
         matrix_scale_base + 4,
@@ -321,7 +316,7 @@ def _solve_eight_state_row(
     target = NIBBLE_VALUES[source_nibbles_row] * np.exp2(
         source_scale_row[:, None].astype(np.int16) - 127
     )
-    starts = [_greedy_assignments(errors, order) for order in EIGHT_STATE_TAG_ORDERS]
+    starts = [_greedy_assignments(errors, order) for order in SQ2_TAG_ORDERS]
     for values in (
         source_scale_row,
         target.mean(axis=1),
@@ -348,7 +343,7 @@ def _solve_eight_state_row(
         candidates,
         key=lambda item: item[0],
     )
-    return EightSq2RowSolution(
+    return Mxfp4Sq2RowSolution(
         error_sse=error,
         state_scale_offsets=tuple(
             int(state_scales[index]) - matrix_scale_base for index in state_indices
@@ -359,7 +354,7 @@ def _solve_eight_state_row(
     )
 
 
-def decode_eight_mxfp4_sq2(
+def decode_mxfp4_sq2(
     packed_symbols: np.ndarray,
     packed_block_selectors: np.ndarray,
     matrix_scale_base: int,
@@ -372,7 +367,7 @@ def decode_eight_mxfp4_sq2(
     symbols = _unpack_two_bit_symbols(packed_symbols)
     rows, columns = symbols.shape
     if columns % 32 or not 0 <= matrix_scale_base <= 251:
-        raise ValueError("eight-state MXFP4-SQ2 payload geometry mismatch")
+        raise ValueError("MXFP4-SQ2 payload geometry mismatch")
     blocks = columns // 32
     block_symbols = symbols.reshape(rows, blocks, 32)
     explicit_high_bit = _unpack_block_selectors(
@@ -391,7 +386,7 @@ def decode_eight_mxfp4_sq2(
     catalog = np.asarray(palette_ids, dtype=np.int16)
     palette_id_bits = int(math.log2(len(catalog)))
     if len(catalog) not in {16, 32} or len(np.unique(catalog)) != len(catalog):
-        raise ValueError("eight-state SQ2 palette catalog must contain 16 or 32 unique entries")
+        raise ValueError("MXFP4-SQ2 palette catalog must contain 16 or 32 unique entries")
     palette_codes = _unpack_fixed_width(
         packed_state_palettes,
         palette_id_bits,
@@ -419,11 +414,11 @@ def decode_eight_mxfp4_sq2(
 def _materialize_encoding(
     source_nibbles: np.ndarray,
     source_scale_raw: np.ndarray,
-    solutions: list[EightSq2RowSolution],
+    solutions: list[Mxfp4Sq2RowSolution],
     *,
     matrix_scale_base: int,
     palette_ids: np.ndarray,
-) -> EightSq2Encoding:
+) -> Mxfp4Sq2Encoding:
     rows, blocks, block_size = source_nibbles.shape
     state_scale_offsets = np.asarray(
         [solution.state_scale_offsets for solution in solutions],
@@ -484,10 +479,10 @@ def _materialize_encoding(
         abs_tol=1e-10,
     ):
         raise RuntimeError(
-            "eight-state SQ2 search/materialization SSE mismatch: "
+            "MXFP4-SQ2 search/materialization SSE mismatch: "
             f"{searched_sse} != {measured_search_sse}"
         )
-    encoding = EightSq2Encoding(
+    encoding = Mxfp4Sq2Encoding(
         matrix_scale_base=matrix_scale_base,
         state_scale_offsets=state_scale_offsets,
         packed_state_scales=packed_state_scales,
@@ -500,7 +495,7 @@ def _materialize_encoding(
         native_scale_raw=native_scale_raw,
         searched_sse=searched_sse,
     )
-    _, decoded_mxfp4, decoded_scale, decoded_tags = decode_eight_mxfp4_sq2(
+    _, decoded_mxfp4, decoded_scale, decoded_tags = decode_mxfp4_sq2(
         encoding.packed_symbols,
         encoding.packed_block_selectors,
         encoding.matrix_scale_base,
@@ -510,11 +505,11 @@ def _materialize_encoding(
         device="cpu",
     )
     if not np.array_equal(decoded_mxfp4, packed_mxfp4):
-        raise RuntimeError("eight-state SQ2 physical payload changed nibbles")
+        raise RuntimeError("MXFP4-SQ2 physical payload changed nibbles")
     if not np.array_equal(decoded_scale, native_scale_raw):
-        raise RuntimeError("eight-state SQ2 physical payload changed scales")
+        raise RuntimeError("MXFP4-SQ2 physical payload changed scales")
     if not np.array_equal(decoded_tags, block_tags):
-        raise RuntimeError("eight-state SQ2 physical payload changed block tags")
+        raise RuntimeError("MXFP4-SQ2 physical payload changed block tags")
     return encoding
 
 
@@ -523,9 +518,9 @@ def _sha256_array(value: np.ndarray) -> str:
 
 
 def _metadata(
-    encoding: EightSq2Encoding,
+    encoding: Mxfp4Sq2Encoding,
     source_scale_raw: np.ndarray,
-    solutions: list[EightSq2RowSolution],
+    solutions: list[Mxfp4Sq2RowSolution],
     *,
     palette_ids: np.ndarray,
 ) -> dict[str, Any]:
@@ -581,7 +576,7 @@ def _metadata(
 
 
 @torch.inference_mode()
-def quantize_eight_mxfp4_sq2(
+def quantize_mxfp4_sq2(
     packed: np.ndarray,
     source_scale_raw: np.ndarray,
     *,
@@ -589,25 +584,25 @@ def quantize_eight_mxfp4_sq2(
     palette_ids: np.ndarray = FIXED32_PALETTE_IDS,
     maximum_refinement_steps: int = 10,
     progress: bool = False,
-) -> tuple[torch.Tensor, EightSq2Encoding, dict[str, Any]]:
+) -> tuple[torch.Tensor, Mxfp4Sq2Encoding, dict[str, Any]]:
     if maximum_refinement_steps <= 0:
         raise ValueError("maximum_refinement_steps must be positive")
     source_nibbles, _ = _unpack_source(packed, source_scale_raw)
     source_scales = np.asarray(source_scale_raw, dtype=np.uint8)
     catalog = np.asarray(palette_ids, dtype=np.int16)
     if len(catalog) not in {16, 32} or len(np.unique(catalog)) != len(catalog):
-        raise ValueError("eight-state SQ2 palette catalog must contain 16 or 32 unique entries")
+        raise ValueError("MXFP4-SQ2 palette catalog must contain 16 or 32 unique entries")
     if int(catalog.min()) < 0 or int(catalog.max()) >= len(PALETTE_VALUES):
-        raise ValueError("eight-state SQ2 palette catalog ID is out of range")
+        raise ValueError("MXFP4-SQ2 palette catalog ID is out of range")
     scale_base = int(source_scales.min()) if matrix_scale_base is None else matrix_scale_base
     if not 0 <= scale_base <= 251:
         raise ValueError("matrix_scale_base must leave room for four E8M0 values")
     if int(source_scales.max()) > scale_base + 3:
         raise ValueError("source E8M0 range exceeds the four-value matrix scale window")
-    solutions: list[EightSq2RowSolution] = []
+    solutions: list[Mxfp4Sq2RowSolution] = []
     for row in range(source_nibbles.shape[0]):
         solutions.append(
-            _solve_eight_state_row(
+            _solve_sq2_row(
                 source_nibbles[row],
                 source_scales[row],
                 matrix_scale_base=scale_base,
@@ -617,7 +612,7 @@ def quantize_eight_mxfp4_sq2(
         )
         if progress and ((row + 1) % 128 == 0 or row + 1 == source_nibbles.shape[0]):
             print(
-                f"SQ2 eight: solved {row + 1}/{source_nibbles.shape[0]} rows",
+                f"MXFP4-SQ2: solved {row + 1}/{source_nibbles.shape[0]} rows",
                 file=sys.stderr,
                 flush=True,
             )
@@ -644,7 +639,7 @@ def quantize_eight_mxfp4_sq2(
         abs_tol=1e-10,
     ):
         raise RuntimeError(
-            f"eight-state SQ2 physical decode SSE mismatch: {encoding.searched_sse} != {measured_sse}"
+            f"MXFP4-SQ2 physical decode SSE mismatch: {encoding.searched_sse} != {measured_sse}"
         )
     return (
         reconstruction,
@@ -709,35 +704,21 @@ def main() -> None:
     if str(torch.device(args.device)) == "mps":
         torch.mps.empty_cache()
 
-    print("searching current four-state SQ2 control...", file=sys.stderr, flush=True)
-    baseline_started = time.perf_counter()
-    old_reconstruction, _, old_metadata = quantize_hybrid_mxfp4_sq(
-        packed,
-        source_scale_raw,
-        exponent_radius=0,
-        maximum_refinement_steps=args.maximum_refinement_steps,
-        progress=True,
-    )
-    old_seconds = time.perf_counter() - baseline_started
-    old_rate = hybrid_mxfp4_sq_rate(rows, columns)
-    old_metrics = _metrics(source, old_reconstruction)
-    del old_reconstruction
-
     palette_ids = PALETTE_CATALOGS[args.palette_catalog]
-    rate = eight_mxfp4_sq2_rate(
+    rate = mxfp4_sq2_rate(
         rows,
         columns,
         palette_id_bits=int(math.log2(len(palette_ids))),
     )
     if rate.payload_nbytes > nvq2_budget:
-        raise RuntimeError("eight-state MXFP4-SQ2 exceeds NVQ2 payload")
+        raise RuntimeError("MXFP4-SQ2 exceeds NVQ2 payload")
     print(
-        f"searching SQ2 eight-state: {rate.payload_nbytes} bytes / {rate.payload_bpw:.9f} BPW...",
+        f"searching MXFP4-SQ2: {rate.payload_nbytes} bytes / {rate.payload_bpw:.9f} BPW...",
         file=sys.stderr,
         flush=True,
     )
     search_started = time.perf_counter()
-    reconstruction, _, metadata = quantize_eight_mxfp4_sq2(
+    reconstruction, _, metadata = quantize_mxfp4_sq2(
         packed,
         source_scale_raw,
         matrix_scale_base=args.matrix_scale_base,
@@ -748,25 +729,23 @@ def main() -> None:
     search_seconds = time.perf_counter() - search_started
     metrics = _metrics(source, reconstruction)
     candidate = {
-        "format": f"eight-state-native-MXFP4-SQ2-{args.palette_catalog}",
+        "format": f"native-MXFP4-SQ2-{args.palette_catalog}",
         **rate.__dict__,
         "budget_slack_vs_nvq2_nbytes": nvq2_budget - rate.payload_nbytes,
         "seconds": search_seconds,
         **metrics,
         "sse_delta_vs_nvq2_percent": 100.0
         * (float(metrics["error_sse"]) / float(nvq2_metrics["error_sse"]) - 1.0),
-        "sse_delta_vs_four_state_sq2_percent": 100.0
-        * (float(metrics["error_sse"]) / float(old_metrics["error_sse"]) - 1.0),
         **metadata,
     }
     print(
-        f"SQ2 eight: SSE={metrics['error_sse']:.9f}, SNR={metrics['snr_db']:.6f} dB",
+        f"MXFP4-SQ2: SSE={metrics['error_sse']:.9f}, SNR={metrics['snr_db']:.6f} dB",
         file=sys.stderr,
         flush=True,
     )
     result: dict[str, Any] = {
         "schema": 1,
-        "experiment": "dsv4f-eight-state-native-mxfp4-two-bit-scalar-transcoding",
+        "experiment": "dsv4f-native-mxfp4-sq2-transcoding",
         "created_unix": started,
         "workspace": _git_identity(script_root),
         "hardware": {
@@ -794,16 +773,8 @@ def main() -> None:
                 "seconds": nvq2_seconds,
                 **nvq2_metrics,
             },
-            {
-                "format": "hybrid-tagged-four-state-native-MXFP4-SQ-fixed16",
-                **old_rate.__dict__,
-                "budget_slack_vs_nvq2_nbytes": nvq2_budget - old_rate.payload_nbytes,
-                "seconds": old_seconds,
-                **old_metrics,
-                **old_metadata,
-            },
         ],
-        "eight_state_mxfp4_sq2": candidate,
+        "mxfp4_sq2": candidate,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")

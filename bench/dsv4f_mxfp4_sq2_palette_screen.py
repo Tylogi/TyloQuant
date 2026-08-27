@@ -18,9 +18,9 @@ from bench.dsv4f_mxfp4_adaptive_sq import (
     _unpack_source,
 )
 from bench.dsv4f_mxfp4_row_vq import _git_identity, _sha256
-from bench.dsv4f_mxfp4_sq2_eight import (
+from bench.dsv4f_mxfp4_sq2 import (
     SCREENED32_PALETTE_IDS,
-    _solve_eight_state_row,
+    _solve_sq2_row,
 )
 from bench.dsv4f_mxfp4_xor_sq import _candidate_xor_errors
 from mfq.quantize.v4f_source import V4FCheckpoint
@@ -85,7 +85,7 @@ def main() -> None:
     winner_counts = np.zeros(len(PALETTE_VALUES), dtype=np.int64)
     scale_values = np.arange(matrix_scale_base, matrix_scale_base + 4, dtype=np.uint8)
     for sample_index, row in enumerate(row_indices):
-        solution = _solve_eight_state_row(
+        solution = _solve_sq2_row(
             source_nibbles[row],
             source_scales[row],
             matrix_scale_base=matrix_scale_base,
@@ -129,7 +129,7 @@ def main() -> None:
     selected_error = float(errors_array[:, selected].min(axis=1).sum())
     result = {
         "schema": 1,
-        "experiment": "dsv4f-eight-state-sq2-palette-catalog-screen",
+        "experiment": "dsv4f-mxfp4-sq2-palette-catalog-screen",
         "created_unix": started,
         "workspace": _git_identity(script_root),
         "source": {
@@ -144,7 +144,7 @@ def main() -> None:
             "row_indices": row_indices.tolist(),
         },
         "screen": {
-            "source_partitions": "screened32-eight-state-SQ2",
+            "source_partitions": "screened32-MXFP4-SQ2",
             "full_palette_catalog_size": len(PALETTE_VALUES),
             "partition_count": len(partition_errors),
             "matrix_scale_base": matrix_scale_base,

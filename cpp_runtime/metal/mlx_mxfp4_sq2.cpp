@@ -21,8 +21,7 @@ using mlx::core::Dtype;
 using mlx::core::MathMode;
 using mlx::core::Shape;
 
-constexpr std::array<std::uint8_t, 4> kSq2Magic{'S', 'Q', '2', '1'};
-constexpr std::array<std::uint8_t, 4> kSq2EightMagic{'S', 'Q', '2', '2'};
+constexpr std::array<std::uint8_t, 4> kSq2Magic{'S', 'Q', '2', 0};
 constexpr std::uint8_t kVersion = 1;
 
 class Cursor {
@@ -75,82 +74,10 @@ template <typename T> array make_array(std::span<const T> values, Shape shape) {
   return array(values.begin(), std::move(shape));
 }
 
+// XOR-folding both symbol bit planes supplies two implicit tag bits; the
+// selector is the third. The scale stream begins with one matrix E8M0 base
+// byte followed by packed two-bit offsets.
 constexpr const char *kSq2Header = R"METAL(
-#include <metal_simdgroup_matrix>
-
-inline uint mfq_sq2_read_symbol(
-    device const uchar* symbols,
-    uint block_index,
-    uint lane
-) {
-    uchar packed = symbols[block_index * 8u + (lane >> 2u)];
-    return (uint(packed) >> ((lane & 3u) * 2u)) & 3u;
-}
-
-inline float mfq_sq2_e8m0(uchar raw) {
-    uint bits = raw == 0u ? 0x00400000u : uint(raw) << 23u;
-    return as_type<float>(bits);
-}
-
-constant float mfq_sq2_palette_values[64] = {
-    -6.0f, -3.0f, 0.0f, 3.0f,
-    -6.0f, -3.0f, 0.5f, 4.0f,
-    -6.0f, -2.0f, 1.0f, 4.0f,
-    -4.0f, -1.5f, 0.0f, 1.5f,
-    -4.0f, -1.5f, 0.5f, 3.0f,
-    -4.0f, -1.5f, 1.0f, 4.0f,
-    -4.0f, -1.0f, 0.5f, 2.0f,
-    -4.0f, -1.0f, 0.5f, 3.0f,
-    -4.0f, -1.0f, 1.5f, 4.0f,
-    -4.0f, -1.0f, 2.0f, 6.0f,
-    -4.0f, -0.5f, 3.0f, 6.0f,
-    -3.0f, -1.0f, 0.5f, 2.0f,
-    -3.0f, -0.5f, 1.5f, 4.0f,
-    -3.0f, 0.0f, 3.0f, 6.0f,
-    -2.0f, -0.5f, 1.0f, 3.0f,
-    -2.0f, -0.5f, 1.0f, 4.0f,
-};
-
-template <typename SelectorStream>
-inline uint mfq_sq2_scalar_block_tag(
-    device const uchar* symbols,
-    SelectorStream selectors,
-    uint block_index
-) {
-    device const uint* words =
-        (device const uint*)(symbols + block_index * 8u);
-    constexpr uint LOW_BITS = 0x55555555u;
-    uint low_count =
-        popcount(words[0] & LOW_BITS) + popcount(words[1] & LOW_BITS);
-    uint explicit_high =
-        (uint(selectors[block_index >> 3u])
-            >> (block_index & 7u)) & 1u;
-    return (low_count & 1u) | (explicit_high << 1u);
-}
-
-template <typename PaletteStream>
-inline uint mfq_sq2_read_palette(
-    PaletteStream state_palettes,
-    uint state_index
-) {
-    return (uint(state_palettes[state_index >> 1u])
-        >> ((state_index & 1u) * 4u)) & 15u;
-}
-
-template <typename ScaleStream>
-inline float mfq_sq2_read_scale(
-    ScaleStream state_scales,
-    uint state_index
-) {
-    return mfq_sq2_e8m0(state_scales[state_index]);
-}
-)METAL";
-
-// SQ22 keeps the same two-bit symbol hot loop as SQ21 but changes only the
-// state reconstruction.  XOR-folding both symbol bit planes supplies two
-// implicit tag bits; the selector is the third.  The scale stream begins with
-// one matrix E8M0 base byte followed by packed two-bit offsets.
-constexpr const char *kSq2EightHeader = R"METAL(
 #include <metal_simdgroup_matrix>
 
 template <typename Stream>
@@ -636,6 +563,17 @@ constexpr const char *kSq2Gemv = R"METAL(
     }
 )METAL";
 
+mlx::core::fast::CustomKernelFunction
+make_sq2_matmul_kernel(std::string name, const char *source,
+                       const char *header = kSq2Header) {
+  CompileOptions options;
+  options.math_mode = MathMode::Fast;
+  return mlx::core::fast::metal_kernel(
+      std::move(name),
+      {"symbols", "selectors", "state_scales", "state_palettes", "x"}, {"y"},
+      source, header, true, false, options);
+}
+
 const mlx::core::fast::CustomKernelFunction &sq2_dequantize_kernel() {
   static const auto kernel = [] {
     CompileOptions options;
@@ -660,102 +598,43 @@ const mlx::core::fast::CustomKernelFunction &sq2_gemv_kernel() {
   return kernel;
 }
 
-mlx::core::fast::CustomKernelFunction
-make_sq2_matmul_kernel(std::string name, const char *source,
-                       const char *header = kSq2Header) {
-  CompileOptions options;
-  options.math_mode = MathMode::Fast;
-  return mlx::core::fast::metal_kernel(
-      std::move(name),
-      {"symbols", "selectors", "state_scales", "state_palettes", "x"}, {"y"},
-      source, header, true, false, options);
-}
-
 const mlx::core::fast::CustomKernelFunction &sq2_mmq_2_6_kernel() {
-  static const auto kernel =
-      make_sq2_matmul_kernel("mfq_cpp_mxfp4_sq2_mmq_m2_6", kSq2Mmq);
+  static const auto kernel = make_sq2_matmul_kernel(
+      "mfq_cpp_mxfp4_sq2_mmq_m2_6", kSq2Mmq);
   return kernel;
 }
 
 const mlx::core::fast::CustomKernelFunction &sq2_mmq_7_16_kernel() {
-  static const auto kernel =
-      make_sq2_matmul_kernel("mfq_cpp_mxfp4_sq2_mmq_m7_16", kSq2Mmq);
+  static const auto kernel = make_sq2_matmul_kernel(
+      "mfq_cpp_mxfp4_sq2_mmq_m7_16", kSq2Mmq);
   return kernel;
 }
 
 const mlx::core::fast::CustomKernelFunction &sq2_mma_17_32_kernel() {
-  static const auto kernel =
-      make_sq2_matmul_kernel("mfq_cpp_mxfp4_sq2_mma_m17_32", kSq2Mma);
+  static const auto kernel = make_sq2_matmul_kernel(
+      "mfq_cpp_mxfp4_sq2_mma_m17_32", kSq2Mma);
   return kernel;
 }
 
 const mlx::core::fast::CustomKernelFunction &sq2_mma_33_64_kernel() {
-  static const auto kernel =
-      make_sq2_matmul_kernel("mfq_cpp_mxfp4_sq2_mma_m33_64", kSq2Mma);
-  return kernel;
-}
-
-const mlx::core::fast::CustomKernelFunction &sq2_eight_dequantize_kernel() {
-  static const auto kernel = [] {
-    CompileOptions options;
-    options.math_mode = MathMode::Fast;
-    return mlx::core::fast::metal_kernel(
-        "mfq_cpp_mxfp4_sq2_eight_dequantize",
-        {"symbols", "selectors", "state_scales", "state_palettes"}, {"y"},
-        kSq2Dequantize, kSq2EightHeader, true, false, options);
-  }();
-  return kernel;
-}
-
-const mlx::core::fast::CustomKernelFunction &sq2_eight_gemv_kernel() {
-  static const auto kernel = [] {
-    CompileOptions options;
-    options.math_mode = MathMode::Fast;
-    return mlx::core::fast::metal_kernel(
-        "mfq_cpp_mxfp4_sq2_eight_gemv",
-        {"symbols", "selectors", "state_scales", "state_palettes", "x"}, {"y"},
-        kSq2Gemv, kSq2EightHeader, true, false, options);
-  }();
-  return kernel;
-}
-
-const mlx::core::fast::CustomKernelFunction &sq2_eight_mmq_2_6_kernel() {
   static const auto kernel = make_sq2_matmul_kernel(
-      "mfq_cpp_mxfp4_sq2_eight_mmq_m2_6", kSq2Mmq, kSq2EightHeader);
-  return kernel;
-}
-
-const mlx::core::fast::CustomKernelFunction &sq2_eight_mmq_7_16_kernel() {
-  static const auto kernel = make_sq2_matmul_kernel(
-      "mfq_cpp_mxfp4_sq2_eight_mmq_m7_16", kSq2Mmq, kSq2EightHeader);
-  return kernel;
-}
-
-const mlx::core::fast::CustomKernelFunction &sq2_eight_mma_17_32_kernel() {
-  static const auto kernel = make_sq2_matmul_kernel(
-      "mfq_cpp_mxfp4_sq2_eight_mma_m17_32", kSq2Mma, kSq2EightHeader);
-  return kernel;
-}
-
-const mlx::core::fast::CustomKernelFunction &sq2_eight_mma_33_64_kernel() {
-  static const auto kernel = make_sq2_matmul_kernel(
-      "mfq_cpp_mxfp4_sq2_eight_mma_m33_64", kSq2Mma, kSq2EightHeader);
+      "mfq_cpp_mxfp4_sq2_mma_m33_64", kSq2Mma);
   return kernel;
 }
 
 std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
-templates(Dtype dtype, int input_size, int output_size, int states = 4) {
+templates(Dtype dtype, int input_size, int output_size) {
   return {
       {"T", dtype},         {"K", input_size},
       {"OUT", output_size}, {"BLOCKS", input_size / 32},
-      {"STATES", states},
+      {"STATES", 8},
   };
 }
 
 std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
 mmq_templates(Dtype dtype, int input_size, int output_size, int rows,
-              int tile_rows, int states = 4) {
-  auto values = templates(dtype, input_size, output_size, states);
+              int tile_rows) {
+  auto values = templates(dtype, input_size, output_size);
   values.emplace_back("M", rows);
   values.emplace_back("TILE_M", tile_rows);
   return values;
@@ -763,8 +642,8 @@ mmq_templates(Dtype dtype, int input_size, int output_size, int rows,
 
 std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
 mma_templates(Dtype dtype, int input_size, int output_size, int rows, int bm,
-              int bn, int bk, int threads, int states = 4) {
-  auto values = templates(dtype, input_size, output_size, states);
+              int bn, int bk, int threads) {
+  auto values = templates(dtype, input_size, output_size);
   values.emplace_back("M", rows);
   values.emplace_back("BM", bm);
   values.emplace_back("BN", bn);
@@ -777,14 +656,16 @@ mma_templates(Dtype dtype, int input_size, int output_size, int rows, int bm,
 
 } // namespace
 
-MlxMxfp4Sq2Weight::MlxMxfp4Sq2Weight(array symbols, array block_selectors,
-                                     array state_scales, array state_palettes,
-                                     int input_size, int output_size)
+MlxMxfp4Sq2Weight::MlxMxfp4Sq2Weight(
+    array symbols, array block_selectors, array state_scale_stream,
+    array state_palettes, std::uint8_t matrix_scale_base_value, int input_size,
+    int output_size)
     : symbols_(std::move(symbols)),
       block_selectors_(std::move(block_selectors)),
-      state_scales_(std::move(state_scales)),
-      state_palettes_(std::move(state_palettes)), input_size_(input_size),
-      output_size_(output_size) {}
+      state_scale_stream_(std::move(state_scale_stream)),
+      state_palettes_(std::move(state_palettes)),
+      matrix_scale_base_value_(matrix_scale_base_value),
+      input_size_(input_size), output_size_(output_size) {}
 
 MlxMxfp4Sq2Weight
 MlxMxfp4Sq2Weight::from_blob(const std::vector<std::uint8_t> &blob) {
@@ -800,11 +681,11 @@ MlxMxfp4Sq2Weight::from_blob(std::span<const std::uint8_t> blob) {
     }
   }
   const auto version = cursor.scalar<std::uint8_t>("version");
-  const auto reserved_byte = cursor.scalar<std::uint8_t>("reserved byte");
+  const auto matrix_scale_base = cursor.scalar<std::uint8_t>("scale base");
   const auto reserved = cursor.scalar<std::uint16_t>("reserved");
   const auto rows = cursor.scalar<std::uint64_t>("rows");
   const auto columns = cursor.scalar<std::uint64_t>("columns");
-  if (version != kVersion || reserved_byte != 0 || reserved != 0 ||
+  if (version != kVersion || reserved != 0 || matrix_scale_base > 251 ||
       columns % 32 != 0) {
     throw std::runtime_error("invalid MXFP4-SQ2 header or geometry");
   }
@@ -813,8 +694,8 @@ MlxMxfp4Sq2Weight::from_blob(std::span<const std::uint8_t> blob) {
   const auto blocks = weights / 32;
   const auto symbol_nbytes = weights / 4;
   const auto selector_nbytes = (blocks + 7) / 8;
-  const auto state_scale_nbytes = checked_product(rows, 4, "state scales");
-  const auto state_palette_nbytes = checked_product(rows, 2, "state palettes");
+  const auto state_scale_nbytes = checked_product(rows, 2, "state scales");
+  const auto state_palette_nbytes = checked_product(rows, 5, "state palettes");
 
   auto symbols = cursor.bytes(symbol_nbytes, "symbols");
   auto selectors = cursor.bytes(selector_nbytes, "selectors");
@@ -824,17 +705,26 @@ MlxMxfp4Sq2Weight::from_blob(std::span<const std::uint8_t> blob) {
     throw std::runtime_error("trailing bytes in MXFP4-SQ2 tensor");
   }
 
+  std::vector<std::uint8_t> state_scale_stream;
+  state_scale_stream.reserve(state_scale_nbytes + 1);
+  state_scale_stream.push_back(matrix_scale_base);
+  state_scale_stream.insert(state_scale_stream.end(), state_scales.begin(),
+                            state_scales.end());
   return MlxMxfp4Sq2Weight(
       make_array(symbols,
                  Shape{checked_dimension(symbol_nbytes, "symbol bytes")}),
       make_array(selectors,
                  Shape{checked_dimension(selector_nbytes, "selector bytes")}),
-      make_array(state_scales, Shape{checked_dimension(state_scale_nbytes,
-                                                       "state-scale bytes")}),
-      make_array(state_palettes,
-                 Shape{checked_dimension(state_palette_nbytes,
-                                         "state-palette bytes")}),
-      checked_dimension(columns, "input size"),
+      make_array<std::uint8_t>(
+          std::span<const std::uint8_t>(state_scale_stream),
+          Shape{checked_dimension(state_scale_stream.size(),
+                                  "state-scale stream bytes")}),
+      make_array(
+          state_palettes,
+          Shape{
+              checked_dimension(state_palette_nbytes, "state-palette bytes"),
+          }),
+      matrix_scale_base, checked_dimension(columns, "input size"),
       checked_dimension(rows, "output size"));
 }
 
@@ -850,7 +740,7 @@ array MlxMxfp4Sq2Weight::dequantize(Dtype dtype) const {
         "MXFP4-SQ2 dequantization grid exceeds MLX limits");
   }
   auto outputs = sq2_dequantize_kernel()(
-      {symbols_, block_selectors_, state_scales_, state_palettes_},
+      {symbols_, block_selectors_, state_scale_stream_, state_palettes_},
       {Shape{output_size_, input_size_}}, {dtype},
       {static_cast<int>(grid), 1, 1}, {32, 1, 1},
       templates(dtype, input_size_, output_size_), std::nullopt, false, {});
@@ -882,7 +772,8 @@ array MlxMxfp4Sq2Weight::matmul(const array &input) const {
       throw std::runtime_error("MXFP4-SQ2 GEMV grid exceeds MLX limits");
     }
     auto outputs = sq2_gemv_kernel()(
-        {symbols_, block_selectors_, state_scales_, state_palettes_, source},
+        {symbols_, block_selectors_, state_scale_stream_, state_palettes_,
+         source},
         {Shape{1, output_size_}}, {source.dtype()},
         {static_cast<int>(grid), 1, 1}, {64, 1, 1},
         templates(source.dtype(), input_size_, output_size_), std::nullopt,
@@ -891,9 +782,8 @@ array MlxMxfp4Sq2Weight::matmul(const array &input) const {
                               std::move(output_shape));
   }
 
-  // The vectorized MMQ/MMA loads are FP16-specialized.  Preserve FP32 through
-  // MLX, and use the measured-faster dense GEMM route beyond M=64.  The four
-  // M=2..64 FP16 buckets stay packed.
+  // The packed multi-row kernels remain FP16-specialized.  The validated
+  // dense fallback is retained for FP32 and M>64.
   if (rows > 64 || source.dtype() == mlx::core::float32) {
     auto dense = dequantize(source.dtype());
     auto result = mlx::core::matmul(source, mlx::core::transpose(dense));
@@ -921,9 +811,9 @@ array MlxMxfp4Sq2Weight::matmul(const array &input) const {
                               static_cast<int>(rows), tile_rows);
   } else {
     int bm = 32;
-    int bn = 32;
-    int bk = 32;
-    int threads = 128;
+    constexpr int bn = 32;
+    constexpr int bk = 32;
+    constexpr int threads = 128;
     if (rows <= 32) {
       kernel = &sq2_mma_17_32_kernel();
     } else {
@@ -943,197 +833,6 @@ array MlxMxfp4Sq2Weight::matmul(const array &input) const {
                               static_cast<int>(rows), bm, bn, bk, threads);
   }
 
-  auto outputs = (*kernel)(
-      {symbols_, block_selectors_, state_scales_, state_palettes_, source},
-      {Shape{static_cast<int>(rows), output_size_}}, {source.dtype()}, grid,
-      threadgroup, std::move(arguments), std::nullopt, false, {});
-  return mlx::core::reshape(std::move(outputs.front()),
-                            std::move(output_shape));
-}
-
-std::size_t MlxMxfp4Sq2Weight::packed_nbytes() const noexcept {
-  return symbols_.nbytes() + block_selectors_.nbytes() +
-         state_scales_.nbytes() + state_palettes_.nbytes();
-}
-
-MlxMxfp4Sq2EightWeight::MlxMxfp4Sq2EightWeight(
-    array symbols, array block_selectors, array state_scale_stream,
-    array state_palettes, std::uint8_t matrix_scale_base_value, int input_size,
-    int output_size)
-    : symbols_(std::move(symbols)),
-      block_selectors_(std::move(block_selectors)),
-      state_scale_stream_(std::move(state_scale_stream)),
-      state_palettes_(std::move(state_palettes)),
-      matrix_scale_base_value_(matrix_scale_base_value),
-      input_size_(input_size), output_size_(output_size) {}
-
-MlxMxfp4Sq2EightWeight
-MlxMxfp4Sq2EightWeight::from_blob(const std::vector<std::uint8_t> &blob) {
-  return from_blob(std::span<const std::uint8_t>(blob));
-}
-
-MlxMxfp4Sq2EightWeight
-MlxMxfp4Sq2EightWeight::from_blob(std::span<const std::uint8_t> blob) {
-  Cursor cursor(blob);
-  for (const auto expected : kSq2EightMagic) {
-    if (cursor.scalar<std::uint8_t>("magic") != expected) {
-      throw std::runtime_error("invalid MXFP4-SQ2-eight magic");
-    }
-  }
-  const auto version = cursor.scalar<std::uint8_t>("version");
-  const auto matrix_scale_base = cursor.scalar<std::uint8_t>("scale base");
-  const auto reserved = cursor.scalar<std::uint16_t>("reserved");
-  const auto rows = cursor.scalar<std::uint64_t>("rows");
-  const auto columns = cursor.scalar<std::uint64_t>("columns");
-  if (version != kVersion || reserved != 0 || matrix_scale_base > 251 ||
-      columns % 32 != 0) {
-    throw std::runtime_error("invalid MXFP4-SQ2-eight header or geometry");
-  }
-
-  const auto weights = checked_product(rows, columns, "weight count");
-  const auto blocks = weights / 32;
-  const auto symbol_nbytes = weights / 4;
-  const auto selector_nbytes = (blocks + 7) / 8;
-  const auto state_scale_nbytes = checked_product(rows, 2, "state scales");
-  const auto state_palette_nbytes = checked_product(rows, 5, "state palettes");
-
-  auto symbols = cursor.bytes(symbol_nbytes, "symbols");
-  auto selectors = cursor.bytes(selector_nbytes, "selectors");
-  auto state_scales = cursor.bytes(state_scale_nbytes, "state scales");
-  auto state_palettes = cursor.bytes(state_palette_nbytes, "state palettes");
-  if (cursor.remaining() != 0) {
-    throw std::runtime_error("trailing bytes in MXFP4-SQ2-eight tensor");
-  }
-
-  std::vector<std::uint8_t> state_scale_stream;
-  state_scale_stream.reserve(state_scale_nbytes + 1);
-  state_scale_stream.push_back(matrix_scale_base);
-  state_scale_stream.insert(state_scale_stream.end(), state_scales.begin(),
-                            state_scales.end());
-  return MlxMxfp4Sq2EightWeight(
-      make_array(symbols,
-                 Shape{checked_dimension(symbol_nbytes, "symbol bytes")}),
-      make_array(selectors,
-                 Shape{checked_dimension(selector_nbytes, "selector bytes")}),
-      make_array<std::uint8_t>(
-          std::span<const std::uint8_t>(state_scale_stream),
-          Shape{checked_dimension(state_scale_stream.size(),
-                                  "state-scale stream bytes")}),
-      make_array(
-          state_palettes,
-          Shape{
-              checked_dimension(state_palette_nbytes, "state-palette bytes"),
-          }),
-      matrix_scale_base, checked_dimension(columns, "input size"),
-      checked_dimension(rows, "output size"));
-}
-
-array MlxMxfp4Sq2EightWeight::dequantize(Dtype dtype) const {
-  if (dtype != mlx::core::float16 && dtype != mlx::core::float32) {
-    throw std::runtime_error(
-        "MXFP4-SQ2-eight dequantization requires float16 or float32");
-  }
-  const auto grid = checked_product(static_cast<std::uint64_t>(output_size_),
-                                    32, "dequantization grid");
-  if (grid > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-    throw std::runtime_error(
-        "MXFP4-SQ2-eight dequantization grid exceeds MLX limits");
-  }
-  auto outputs = sq2_eight_dequantize_kernel()(
-      {symbols_, block_selectors_, state_scale_stream_, state_palettes_},
-      {Shape{output_size_, input_size_}}, {dtype},
-      {static_cast<int>(grid), 1, 1}, {32, 1, 1},
-      templates(dtype, input_size_, output_size_, 8), std::nullopt, false, {});
-  return std::move(outputs.front());
-}
-
-array MlxMxfp4Sq2EightWeight::matmul(const array &input) const {
-  if (input.ndim() == 0 || input.shape(-1) != input_size_) {
-    throw std::runtime_error(
-        "MXFP4-SQ2-eight input width does not match packed weight");
-  }
-  const auto rows = input.size() / static_cast<std::size_t>(input_size_);
-  if (rows == 0 ||
-      rows > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-    throw std::runtime_error("unsupported MXFP4-SQ2-eight input row count");
-  }
-  Shape output_shape = input.shape();
-  output_shape.back() = output_size_;
-  auto source = input;
-  if (source.dtype() != mlx::core::float16 &&
-      source.dtype() != mlx::core::float32) {
-    source = mlx::core::astype(source, mlx::core::float16);
-  }
-  source =
-      mlx::core::reshape(source, Shape{static_cast<int>(rows), input_size_});
-  if (rows == 1) {
-    const auto grid = static_cast<std::size_t>((output_size_ + 7) / 8) * 64;
-    if (grid > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-      throw std::runtime_error("MXFP4-SQ2-eight GEMV grid exceeds MLX limits");
-    }
-    auto outputs = sq2_eight_gemv_kernel()(
-        {symbols_, block_selectors_, state_scale_stream_, state_palettes_,
-         source},
-        {Shape{1, output_size_}}, {source.dtype()},
-        {static_cast<int>(grid), 1, 1}, {64, 1, 1},
-        templates(source.dtype(), input_size_, output_size_, 8), std::nullopt,
-        false, {});
-    return mlx::core::reshape(std::move(outputs.front()),
-                              std::move(output_shape));
-  }
-
-  // The packed multi-row kernels remain FP16-specialized.  The validated
-  // dense fallback is retained for FP32 and M>64.
-  if (rows > 64 || source.dtype() == mlx::core::float32) {
-    auto dense = dequantize(source.dtype());
-    auto result = mlx::core::matmul(source, mlx::core::transpose(dense));
-    return mlx::core::reshape(std::move(result), std::move(output_shape));
-  }
-
-  const mlx::core::fast::CustomKernelFunction *kernel = nullptr;
-  std::tuple<int, int, int> grid;
-  std::tuple<int, int, int> threadgroup;
-  std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> arguments;
-  if (rows <= 16) {
-    const bool first_bucket = rows <= 6;
-    const int row_tiles = 1;
-    const int tile_rows = (static_cast<int>(rows) + row_tiles - 1) / row_tiles;
-    const auto grid_x = static_cast<std::size_t>(row_tiles) * 64;
-    const auto grid_y = static_cast<std::size_t>((output_size_ + 7) / 8);
-    if (grid_x > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
-        grid_y > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-      throw std::runtime_error("MXFP4-SQ2-eight MMQ grid exceeds MLX limits");
-    }
-    kernel = first_bucket ? &sq2_eight_mmq_2_6_kernel()
-                          : &sq2_eight_mmq_7_16_kernel();
-    grid = {static_cast<int>(grid_x), static_cast<int>(grid_y), 1};
-    threadgroup = {64, 1, 1};
-    arguments = mmq_templates(source.dtype(), input_size_, output_size_,
-                              static_cast<int>(rows), tile_rows, 8);
-  } else {
-    int bm = 32;
-    constexpr int bn = 32;
-    constexpr int bk = 32;
-    constexpr int threads = 128;
-    if (rows <= 32) {
-      kernel = &sq2_eight_mma_17_32_kernel();
-    } else {
-      kernel = &sq2_eight_mma_33_64_kernel();
-    }
-    const auto grid_x =
-        static_cast<std::size_t>((output_size_ + bn - 1) / bn) * threads;
-    const auto grid_y = (rows + static_cast<std::size_t>(bm) - 1) /
-                        static_cast<std::size_t>(bm);
-    if (grid_x > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
-        grid_y > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-      throw std::runtime_error("MXFP4-SQ2-eight MMA grid exceeds MLX limits");
-    }
-    grid = {static_cast<int>(grid_x), static_cast<int>(grid_y), 1};
-    threadgroup = {threads, 1, 1};
-    arguments = mma_templates(source.dtype(), input_size_, output_size_,
-                              static_cast<int>(rows), bm, bn, bk, threads, 8);
-  }
-
   auto outputs = (*kernel)({symbols_, block_selectors_, state_scale_stream_,
                             state_palettes_, source},
                            {Shape{static_cast<int>(rows), output_size_}},
@@ -1143,7 +842,7 @@ array MlxMxfp4Sq2EightWeight::matmul(const array &input) const {
                             std::move(output_shape));
 }
 
-std::size_t MlxMxfp4Sq2EightWeight::packed_nbytes() const noexcept {
+std::size_t MlxMxfp4Sq2Weight::packed_nbytes() const noexcept {
   return symbols_.nbytes() + block_selectors_.nbytes() +
          state_scale_stream_.nbytes() + state_palettes_.nbytes();
 }

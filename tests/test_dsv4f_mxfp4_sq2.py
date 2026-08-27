@@ -4,12 +4,12 @@ import numpy as np
 import pytest
 import torch
 
-from bench.dsv4f_mxfp4_sq2_eight import (
+from bench.dsv4f_mxfp4_sq2 import (
     FIXED32_PALETTE_IDS,
     SCREENED32_PALETTE_IDS,
-    decode_eight_mxfp4_sq2,
-    eight_mxfp4_sq2_rate,
-    quantize_eight_mxfp4_sq2,
+    decode_mxfp4_sq2,
+    mxfp4_sq2_rate,
+    quantize_mxfp4_sq2,
 )
 from bench.dsv4f_mxfp4_xor_sq import _unpack_two_bit_symbols
 from mfq.formats.nvq import NVQ2_E8
@@ -28,8 +28,8 @@ def _toy_native_mxfp4() -> tuple[np.ndarray, np.ndarray]:
     return packed, scale
 
 
-def test_eight_state_sq2_rate_stays_below_nvq2() -> None:
-    fixed16 = eight_mxfp4_sq2_rate(4096, 4096, palette_id_bits=4)
+def test_mxfp4_sq2_rate_stays_below_nvq2() -> None:
+    fixed16 = mxfp4_sq2_rate(4096, 4096, palette_id_bits=4)
     nvq2_nbytes = NVQ2_E8.payload_nbytes(4096, 4096)
 
     assert fixed16.symbol_nbytes == 4_194_304
@@ -42,7 +42,7 @@ def test_eight_state_sq2_rate_stays_below_nvq2() -> None:
     assert nvq2_nbytes == 4_290_560
     assert nvq2_nbytes - fixed16.payload_nbytes == 6_143
 
-    fixed32 = eight_mxfp4_sq2_rate(4096, 4096)
+    fixed32 = mxfp4_sq2_rate(4096, 4096)
     assert len(SCREENED32_PALETTE_IDS) == 32
     assert FIXED32_PALETTE_IDS.tolist() == [
         120,
@@ -85,15 +85,15 @@ def test_eight_state_sq2_rate_stays_below_nvq2() -> None:
     assert nvq2_nbytes - fixed32.payload_nbytes == 2_047
 
 
-def test_eight_state_sq2_roundtrips_tags_and_native_mxfp4() -> None:
+def test_mxfp4_sq2_roundtrips_tags_and_native_mxfp4() -> None:
     packed, scale = _toy_native_mxfp4()
     source = decode_mxfp4(packed, scale, device="cpu")
-    reconstruction, encoding, metadata = quantize_eight_mxfp4_sq2(
+    reconstruction, encoding, metadata = quantize_mxfp4_sq2(
         packed,
         scale,
         maximum_refinement_steps=4,
     )
-    decoded, packed_mxfp4, native_scale, block_tags = decode_eight_mxfp4_sq2(
+    decoded, packed_mxfp4, native_scale, block_tags = decode_mxfp4_sq2(
         encoding.packed_symbols,
         encoding.packed_block_selectors,
         encoding.matrix_scale_base,
@@ -119,11 +119,11 @@ def test_eight_state_sq2_roundtrips_tags_and_native_mxfp4() -> None:
     assert all(len(metadata[key]) == 64 for key in metadata if key.endswith("_sha256"))
 
 
-def test_eight_state_sq2_rejects_scale_ranges_outside_two_bits() -> None:
+def test_mxfp4_sq2_rejects_scale_ranges_outside_two_bits() -> None:
     packed, scale = _toy_native_mxfp4()
     scale = scale.copy()
     scale[0, 0] = 119
     scale[1, 1] = 123
 
     with pytest.raises(ValueError, match="four-value matrix scale window"):
-        quantize_eight_mxfp4_sq2(packed, scale, maximum_refinement_steps=1)
+        quantize_mxfp4_sq2(packed, scale, maximum_refinement_steps=1)

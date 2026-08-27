@@ -23,15 +23,8 @@ using mfq::metal::MlxMxWeight;
 using mlx::core::array;
 using mlx::core::Shape;
 
-#if defined(MFQ_MXFP4_SQ2_EIGHT_BENCHMARK)
-using Sq2Weight = mfq::metal::MlxMxfp4Sq2EightWeight;
-constexpr bool kEightState = true;
-constexpr const char *kSq2Format = "MXFP4-SQ2-EIGHT";
-#else
 using Sq2Weight = mfq::metal::MlxMxfp4Sq2Weight;
-constexpr bool kEightState = false;
 constexpr const char *kSq2Format = "MXFP4-SQ2";
-#endif
 
 template <typename T> void append(std::vector<std::uint8_t> &target, T value) {
   const auto *bytes = reinterpret_cast<const std::uint8_t *>(&value);
@@ -75,8 +68,8 @@ EncodedPair make_pair(int rows, int columns) {
   require(rows > 0 && columns > 0 && columns % 32 == 0,
           "invalid benchmark geometry");
   constexpr std::uint8_t matrix_scale_base = 124;
-  constexpr int states_per_row = kEightState ? 8 : 4;
-  constexpr std::uint8_t implicit_tag_mask = kEightState ? 3 : 1;
+  constexpr int states_per_row = 8;
+  constexpr std::uint8_t implicit_tag_mask = 3;
   const int blocks_per_row = columns / 32;
   const std::size_t weights = static_cast<std::size_t>(rows) * columns;
   const std::size_t blocks = static_cast<std::size_t>(rows) * blocks_per_row;
@@ -95,11 +88,9 @@ EncodedPair make_pair(int rows, int columns) {
       const std::size_t index =
           static_cast<std::size_t>(row) * states_per_row + state;
       state_scales[index] =
-          kEightState
-              ? static_cast<std::uint8_t>((row * 3 + state * 5) & 3)
-              : static_cast<std::uint8_t>(121 + ((row * 3 + state * 5) & 3));
+          static_cast<std::uint8_t>((row * 3 + state * 5) & 3);
       state_palettes[index] = static_cast<std::uint8_t>(
-          (row * 13 + state * 7) & (kEightState ? 31 : 15));
+          (row * 13 + state * 7) & 31);
     }
     for (int block = 0; block < blocks_per_row; ++block) {
       const std::size_t block_index =
@@ -120,29 +111,19 @@ EncodedPair make_pair(int rows, int columns) {
       const std::size_t last_index =
           static_cast<std::size_t>(row) * columns + block * 32 + 31;
       symbols[last_index] =
-          kEightState ? static_cast<std::uint8_t>(low_tag ^ required_low_tag)
-                      : static_cast<std::uint8_t>((((row + block) & 1) << 1) |
-                                                  (low_tag ^ required_low_tag));
+          static_cast<std::uint8_t>(low_tag ^ required_low_tag);
       const std::uint8_t tag = static_cast<std::uint8_t>(
-          required_low_tag |
-          (selectors[block_index] << (kEightState ? 2u : 1u)));
+          required_low_tag | (selectors[block_index] << 2u));
       const std::size_t state_index =
           static_cast<std::size_t>(row) * states_per_row + tag;
-      native_scales[block_index] =
-          kEightState ? static_cast<std::uint8_t>(matrix_scale_base +
-                                                  state_scales[state_index])
-                      : state_scales[state_index];
+      native_scales[block_index] = static_cast<std::uint8_t>(
+          matrix_scale_base + state_scales[state_index]);
       const auto palette = state_palettes[state_index];
       for (int lane = 0; lane < 32; ++lane) {
         const std::size_t value_index =
             static_cast<std::size_t>(row) * columns + block * 32 + lane;
-        const auto nibble = kEightState
-                                ? mfq::metal::kMxfp4Sq2EightPaletteNibbles
-                                      [static_cast<std::size_t>(palette) * 4 +
-                                       symbols[value_index]]
-                                : mfq::metal::kMxfp4Sq2PaletteNibbles
-                                      [static_cast<std::size_t>(palette) * 4 +
-                                       symbols[value_index]];
+        const auto nibble = mfq::metal::kMxfp4Sq2PaletteNibbles
+            [static_cast<std::size_t>(palette) * 4 + symbols[value_index]];
         const std::size_t byte_index = value_index / 2;
         if ((lane & 1) == 0) {
           native_values[byte_index] = nibble;
@@ -153,23 +134,16 @@ EncodedPair make_pair(int rows, int columns) {
     }
   }
 
-  std::vector<std::uint8_t> sq2_blob{
-      'S', 'Q', '2', kEightState ? std::uint8_t{'2'} : std::uint8_t{'1'}};
+  std::vector<std::uint8_t> sq2_blob{'S', 'Q', '2', 0};
   append<std::uint8_t>(sq2_blob, 1);
-  append<std::uint8_t>(sq2_blob,
-                       kEightState ? matrix_scale_base : std::uint8_t{0});
+  append<std::uint8_t>(sq2_blob, matrix_scale_base);
   append<std::uint16_t>(sq2_blob, 0);
   append<std::uint64_t>(sq2_blob, rows);
   append<std::uint64_t>(sq2_blob, columns);
   append_bytes(sq2_blob, pack_bits(symbols, 2));
   append_bytes(sq2_blob, pack_bits(selectors, 1));
-  if constexpr (kEightState) {
-    append_bytes(sq2_blob, pack_bits(state_scales, 2));
-    append_bytes(sq2_blob, pack_bits(state_palettes, 5));
-  } else {
-    append_bytes(sq2_blob, state_scales);
-    append_bytes(sq2_blob, pack_bits(state_palettes, 4));
-  }
+  append_bytes(sq2_blob, pack_bits(state_scales, 2));
+  append_bytes(sq2_blob, pack_bits(state_palettes, 5));
 
   std::vector<std::uint8_t> mxfp4_blob{'M', 'X', 'T', '1'};
   append<std::uint8_t>(mxfp4_blob, 1);
@@ -311,7 +285,7 @@ int main(int argc, char **argv) {
     const auto sq2 = Sq2Weight::from_blob(encoded.sq2_blob);
     const auto native = MlxMxWeight::from_blob("MXFP4", encoded.mxfp4_blob);
     const auto input = make_input(columns);
-    require(sq2.packed_nbytes() == (kEightState ? 4'288'513u : 4'284'416u),
+    require(sq2.packed_nbytes() == 4'288'513u,
             "unexpected SQ2 benchmark payload size");
     require(native.packed_nbytes() == 8'912'896,
             "unexpected MXFP4 benchmark payload size");
@@ -383,8 +357,8 @@ int main(int argc, char **argv) {
                         [&] { return native.matmul(multirow_input); });
           } else {
             print_trial(
-                kEightState ? "MXFP4-SQ2-EIGHT-DENSE" : "MXFP4-SQ2-DENSE",
-                "dequant_matmul_fp16", trial, input_rows, sq2.packed_nbytes(),
+                "MXFP4-SQ2-DENSE", "dequant_matmul_fp16", trial, input_rows,
+                sq2.packed_nbytes(),
                 output_nbytes, 2, multirow_repetitions, [&] {
                   return mlx::core::matmul(
                       multirow_input, mlx::core::transpose(sq2.dequantize()));

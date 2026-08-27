@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from bench.dsv4f_mxfp4_sq2_eight_palette_screen import _greedy_catalog
+from bench.dsv4f_mxfp4_sq2_palette_screen import _greedy_catalog
 
 
 def test_greedy_catalog_preserves_seed_and_improves_partition_coverage() -> None:
