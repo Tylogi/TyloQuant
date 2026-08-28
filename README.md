@@ -248,8 +248,7 @@ sampling-penalty kernels remain GPU-resident.
 - [MiniCPM-o 4.5 Python Runtime](./docs/minicpmo45.md)
 - [Expert-Wise Joint Budget Solver](./docs/ew-joint-solver.md)
 - [`mfq serve` and model management](./docs/cli/serve.md)
-- [Self-contained macOS release](./docs/release-macos.md)
-- [Self-contained Windows release](./docs/release-windows.md)
+- [Self-contained releases](./docs/release.md)
 
 ## Acknowledgements
 

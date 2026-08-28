@@ -32,7 +32,7 @@ pip install -e ".[metal,minicpmo45-realtime]"
 ## Convert
 
 ```bash
-python -m mfq.tools.quantize_hf_to_mfq \
+uv run -m mfq.tools.quantize_hf_to_mfq \
   --input /models/OpenBMB/MiniCPM-o-4_5 \
   --output /models/MiniCPM-o-4_5-NINT4.mfq \
   --bits 4 \
@@ -56,7 +56,7 @@ To reproduce the tensor precision allocation from an official language-model
 GGUF while keeping the complete MiniCPM-o graph, pass it as a recipe:
 
 ```bash
-python -m mfq.tools.quantize_hf_to_mfq \
+uv run -m mfq.tools.quantize_hf_to_mfq \
   --input /models/OpenBMB/MiniCPM-o-4_5 \
   --output /models/MiniCPM-o-4_5-Q4KM-table.mfq \
   --recipe-gguf /models/MiniCPM-o-4_5-Q4_K_M.gguf
