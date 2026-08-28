@@ -112,12 +112,12 @@ uv run mfq quantize model-full.mfq model-NINT3.mfq \
 
 # BF16 GGUF 来源，按混合 recipe 量化
 uv run mfq quantize model-bf16.gguf model-S4-L.mfq \
-  --recipe UD-Q4_K_XL.gguf --imatrix imatrix.gguf \
+  --recipe quantization-recipe.gguf --imatrix imatrix.gguf \
   --q8-mode nint8-0 --device cuda
 
 # HF 来源，叠加逐专家精度方案（EW）
 uv run mfq quantize model-hf model-EW.mfq \
-  --recipe UD-Q4_K_XL.gguf --ew-scheme expert-precision.json
+  --recipe quantization-recipe.gguf --ew-scheme expert-precision.json
 
 # 从原始 BF16 checkpoint 给既有量化模型补齐完整 MTP head。
 # 主干 blob 逐字节保持不变；每个 MTP decoder projection
@@ -138,7 +138,7 @@ uv run mfq calibrate imatrix \
 
 # Important Neurons（IN）；可从 recipe 自动读取层数
 uv run mfq quantize model-bf16.gguf model-IN.mfq \
-  --recipe UD-Q4_K_XL.gguf --imatrix imatrix.gguf \
+  --recipe quantization-recipe.gguf --imatrix imatrix.gguf \
   --important-neurons 1024 --target-size 15G
 ```
 

@@ -146,12 +146,12 @@ uv run mfq quantize model-full.mfq model-NINT3.mfq \
 
 # Mixed recipe from a BF16 GGUF source
 uv run mfq quantize model-bf16.gguf model-S4-L.mfq \
-  --recipe UD-Q4_K_XL.gguf --imatrix imatrix.gguf \
+  --recipe quantization-recipe.gguf --imatrix imatrix.gguf \
   --q8-mode nint8-0 --device cuda
 
 # HF source with an expert-wise precision scheme
 uv run mfq quantize model-hf model-EW.mfq \
-  --recipe UD-Q4_K_XL.gguf --ew-scheme expert-precision.json
+  --recipe quantization-recipe.gguf --ew-scheme expert-precision.json
 
 # Add the complete MTP head from the original BF16 checkpoint to an existing
 # quantized model. The backbone blobs stay byte-identical; each MTP decoder
@@ -172,7 +172,7 @@ uv run mfq calibrate imatrix \
 
 # Important Neurons (IN); layer count is read from the recipe when possible
 uv run mfq quantize model-bf16.gguf model-IN.mfq \
-  --recipe UD-Q4_K_XL.gguf --imatrix imatrix.gguf \
+  --recipe quantization-recipe.gguf --imatrix imatrix.gguf \
   --important-neurons 1024 --target-size 15G
 ```
 
