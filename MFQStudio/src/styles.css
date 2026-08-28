@@ -459,10 +459,17 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .tool-confirm { margin-top: 6px; }
 .tool-confirm button { border: 1px solid var(--line-strong); border-radius: 7px; padding: 5px 8px; color: var(--accent); background: var(--accent-soft); font-size: 9px; }
 .message-media { display: block; max-width: min(560px, 100%); max-height: 440px; border: 1px solid var(--line); border-radius: 10px; margin: 4px 0 10px; background: var(--surface-subtle); object-fit: contain; }
+.message-media-status { display: block; width: min(360px, 100%); border: 1px solid var(--line); border-radius: 9px; margin: 4px 0 10px; padding: 10px; color: var(--muted); background: var(--surface-subtle); font-size: 9px; }
+.fatal-error { min-height: 100vh; display: grid; place-items: center; padding: 32px; background: var(--canvas); color: var(--ink); }
+.fatal-error section { width: min(640px, 100%); padding: 28px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); box-shadow: var(--shadow-md); }
+.fatal-error h1 { margin: 8px 0 12px; font-size: 24px; }
+.fatal-error p { color: var(--muted); line-height: 1.6; }
+.fatal-error pre { overflow: auto; margin: 18px 0; padding: 14px; border-radius: 9px; background: var(--surface-subtle); white-space: pre-wrap; word-break: break-word; }
 .media-image { width: auto; }
 .media-video { width: min(560px, 100%); }
 .message-audio { width: min(420px, 100%); height: 34px; margin-top: 9px; }
-.message-document { display: flex; width: min(360px, 100%); align-items: center; gap: 9px; border: 1px solid var(--line); border-radius: 9px; margin: 5px 0; padding: 8px; color: inherit; background: var(--surface); text-decoration: none; }
+.message-document { display: flex; width: min(360px, 100%); align-items: center; gap: 9px; border: 1px solid var(--line); border-radius: 9px; margin: 5px 0; padding: 8px; color: inherit; background: var(--surface); font: inherit; text-align: left; cursor: pointer; }
+.message-document:disabled { cursor: progress; opacity: 0.7; }
 .message-document > span { display: grid; width: 31px; height: 31px; place-items: center; border-radius: 7px; color: var(--accent); background: var(--accent-soft); font-size: 8px; font-weight: 700; }
 .message-document div { display: grid; min-width: 0; gap: 2px; }
 .message-document strong { overflow: hidden; color: var(--ink); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }

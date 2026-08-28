@@ -729,22 +729,30 @@ def test_managed_runtime_reports_and_bounds_queued_requests(tmp_path: Path) -> N
         release = asyncio.Event()
 
         class BlockingBackend:
+            def __init__(self) -> None:
+                self.cancelled: list[object] = []
+
             async def stream(self, **options: object):
                 seen_models.append(str(options["model"]))
                 entered.set()
                 await release.wait()
                 yield BackendDelta(content_delta="ok", finish_reason="stop")
 
+            async def cancel_response(self, session_id: object) -> bool:
+                self.cancelled.append(session_id)
+                return True
+
         seen_models: list[str] = []
         model = tmp_path / "tiny.mfq"
         _model(model)
         catalog = ModelCatalog([tmp_path], cache_seconds=0)
         artifact = await catalog.resolve((await catalog.list()).data[0].id)
+        blocking_backend = BlockingBackend()
         instance = _ManagedRuntime(
             id=uuid4(),
             artifact=artifact,
             process=SimpleNamespace(returncode=None),
-            backend=BlockingBackend(),
+            backend=blocking_backend,
             port=0,
             context_size=4096,
             state=RuntimeInstanceState.READY,
@@ -760,11 +768,15 @@ def test_managed_runtime_reports_and_bounds_queued_requests(tmp_path: Path) -> N
                 model=artifact.resource.name,
                 messages=[{"role": "user", "content": "hello"}],
                 sampling=SamplingParams(),
+                session_id=session_id,
             ):
                 pass
 
+        session_id = uuid4()
         first = asyncio.create_task(consume())
         await entered.wait()
+        assert await pool.cancel_response(session_id)
+        assert blocking_backend.cancelled == [session_id]
         second = asyncio.create_task(consume())
         await asyncio.sleep(0)
         assert instance.active_requests == 1

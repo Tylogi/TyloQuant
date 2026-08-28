@@ -86,6 +86,8 @@ class ChatBackend(Protocol):
 
     async def close_session(self, session_id: UUID) -> bool: ...
 
+    async def cancel_response(self, session_id: UUID) -> bool: ...
+
     async def capabilities(self) -> RuntimeCapabilitiesResource: ...
 
     async def runtime_status(self) -> dict[str, Any]: ...
@@ -271,6 +273,21 @@ class OpenAIChatBackend:
             "DELETE",
             f"/api/runtime/sessions/{session_id}",
         )
+
+    async def cancel_response(self, session_id: UUID) -> bool:
+        # A stop can race the native request becoming visible after Python-side
+        # media preprocessing. Briefly retry so cancellation remains reliable
+        # at that boundary without delaying an already-active decode.
+        for attempt in range(20):
+            payload = await self._json_request(
+                "POST",
+                f"/api/runtime/sessions/{session_id}/cancel",
+            )
+            if payload.get("cancelled") is True:
+                return True
+            if attempt < 19:
+                await asyncio.sleep(0.025)
+        return False
 
     async def capabilities(self) -> RuntimeCapabilitiesResource:
         headers = {}

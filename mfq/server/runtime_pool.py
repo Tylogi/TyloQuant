@@ -510,6 +510,16 @@ class ManagedRuntimePool:
             return await self.fallback.close_session(session_id) if self.fallback else False
         return await instance.backend.close_session(session_id)
 
+    async def cancel_response(self, session_id: UUID) -> bool:
+        async with self._lock:
+            instance_id = self._session_routes.get(session_id)
+            instance = self._instances.get(instance_id) if instance_id is not None else None
+        backend = instance.backend if instance is not None else self.fallback
+        if backend is None:
+            return False
+        cancel = getattr(backend, "cancel_response", None)
+        return bool(await cancel(session_id)) if callable(cancel) else False
+
     async def capabilities(self) -> RuntimeCapabilitiesResource:
         backend = await self._current_backend()
         if backend is None:

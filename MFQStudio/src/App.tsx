@@ -253,6 +253,8 @@ const DOCUMENT_ACCEPT = [
   ".docx",
 ].join(",");
 const MAX_DOCUMENT_BYTES = 64 * 1024 * 1024;
+const LANGUAGE_CONSISTENCY_PROMPT =
+  "Follow any explicit language request. Otherwise, answer entirely in the language of the user's latest text. Do not mix languages, except when quoting or discussing foreign-language text.";
 const MODE_LABELS: Record<SessionMode, [string, string]> = {
   text: ["文本", "Text"],
   voice: ["语音", "Voice"],
@@ -591,15 +593,34 @@ async function mediaMetadata(
     return await new Promise<{ width: number; height: number; duration_ms: number }>(
       (resolve, reject) => {
         const video = document.createElement("video");
+        const finish = (
+          callback: () => void,
+        ) => {
+          window.clearTimeout(timeout);
+          video.onloadedmetadata = null;
+          video.onerror = null;
+          video.removeAttribute("src");
+          video.load();
+          callback();
+        };
+        const timeout = window.setTimeout(
+          () => finish(() => reject(new Error("Unable to read video metadata"))),
+          15_000,
+        );
         video.preload = "metadata";
-        video.onloadedmetadata = () =>
-          resolve({
-            width: video.videoWidth,
-            height: video.videoHeight,
-            duration_ms: Math.round(video.duration * 1000),
-          });
-        video.onerror = () => reject(new Error("Unable to read video metadata"));
+        video.onloadedmetadata = () => {
+          const width = video.videoWidth;
+          const height = video.videoHeight;
+          const durationMs = Math.round(video.duration * 1000);
+          if (!width || !height || !Number.isFinite(durationMs)) {
+            finish(() => reject(new Error("Unable to read video metadata")));
+            return;
+          }
+          finish(() => resolve({ width, height, duration_ms: durationMs }));
+        };
+        video.onerror = () => finish(() => reject(new Error("Unable to read video metadata")));
         video.src = url;
+        video.load();
       },
     );
   } finally {
@@ -629,6 +650,7 @@ function VideoWithFirstFrame({
     video.playsInline = true;
     video.preload = "auto";
     video.onloadeddata = () => {
+      video.onloadeddata = null;
       if (cancelled || !video.videoWidth || !video.videoHeight) return;
       const scale = Math.min(1, 1280 / video.videoWidth);
       const canvas = document.createElement("canvas");
@@ -658,17 +680,22 @@ function VideoWithFirstFrame({
 
 function MediaPartView({ part }: { part: Extract<ContentPart, { media: unknown }> }) {
   const [src, setSrc] = useState<string | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
     let objectUrl: string | null = null;
     setSrc(null);
+    setLoadFailed(false);
     void api.fetchMedia(part.media.id, controller.signal).then((blob) => {
       if (controller.signal.aborted) return;
       objectUrl = URL.createObjectURL(blob);
       setSrc(objectUrl);
     }).catch((error: unknown) => {
-      if (!controller.signal.aborted) console.error("Unable to load message media", error);
+      if (!controller.signal.aborted) {
+        console.error("Unable to load message media", error);
+        setLoadFailed(true);
+      }
     });
     return () => {
       controller.abort();
@@ -676,7 +703,10 @@ function MediaPartView({ part }: { part: Extract<ContentPart, { media: unknown }
     };
   }, [part.media.id]);
 
-  if (!src) return <span className="message-media-loading" aria-label="Loading media" />;
+  if (loadFailed) {
+    return <span className="message-media-status" role="alert">Unable to load attachment</span>;
+  }
+  if (!src) return <span className="message-media-status" aria-label="Loading media">Loading attachment…</span>;
   if (part.type === "image") {
     return <img alt="Attached image" className="message-media media-image" loading="lazy" src={src} />;
   }
@@ -687,7 +717,35 @@ function MediaPartView({ part }: { part: Extract<ContentPart, { media: unknown }
 }
 
 function DocumentPartView({ part }: { part: Extract<ContentPart, { type: "document" }> }) {
-  return <a className="message-document" download={part.name} href={api.mediaUrl(part.media.id)}><span>DOC</span><div><strong>{part.name}</strong><small>{formatNumber(part.media.byte_size)} B</small></div></a>;
+  const [downloadState, setDownloadState] = useState<"idle" | "loading" | "failed">("idle");
+
+  async function downloadDocument() {
+    if (downloadState === "loading") return;
+    setDownloadState("loading");
+    try {
+      const blob = await api.fetchMedia(part.media.id);
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = part.name;
+      anchor.hidden = true;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setDownloadState("idle");
+    } catch (error) {
+      console.error("Unable to download document", error);
+      setDownloadState("failed");
+    }
+  }
+
+  const detail = downloadState === "loading"
+    ? "Downloading…"
+    : downloadState === "failed"
+      ? "Download failed — click to retry"
+      : `${formatNumber(part.media.byte_size)} B`;
+  return <button className="message-document" disabled={downloadState === "loading"} onClick={() => void downloadDocument()} type="button"><span>DOC</span><div><strong>{part.name}</strong><small>{detail}</small></div></button>;
 }
 
 function documentMimeType(file: File): string {
@@ -1392,6 +1450,7 @@ export default function App() {
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [live, setLive] = useState<LiveOutput | null>(null);
   const [busy, setBusy] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [capabilities, setCapabilities] = useState<RuntimeCapabilities | null>(null);
@@ -2191,6 +2250,7 @@ export default function App() {
     abortRef.current = controller;
     setError(null);
     setBusy(true);
+    setStopping(false);
     setLive({ reasoning: "", text: "", tools: [] });
     if (optimistic) {
       if (inputRole !== "user") throw new Error("Only user input can be optimistic");
@@ -2214,7 +2274,9 @@ export default function App() {
           input,
           input_role: inputRole,
           sampling: samplingParams(),
-          system_prompt: effectiveSettings.systemPrompt || null,
+          system_prompt: [effectiveSettings.systemPrompt.trim(), LANGUAGE_CONSISTENCY_PROMPT]
+            .filter(Boolean)
+            .join("\n\n"),
           include_reasoning_history: !effectiveSettings.excludeReasoning,
           tools: mcpTools
             .filter((tool) => selectedTools.includes(tool.qualified_name))
@@ -2239,6 +2301,7 @@ export default function App() {
     } finally {
       abortRef.current = null;
       setBusy(false);
+      setStopping(false);
       setLive(null);
       try {
         const [persisted, persistedResponses, updated] = await Promise.all([
@@ -2259,6 +2322,22 @@ export default function App() {
         setError(errorMessage(cause));
       }
       void refreshRuntime(true);
+    }
+  }
+
+  async function stopGeneration() {
+    const controller = abortRef.current;
+    if (!active || !controller || stopping) return;
+    setStopping(true);
+    try {
+      await api.cancelResponse(active.id);
+    } catch (cause) {
+      if (!(cause instanceof ApiError && cause.status === 409)) {
+        setError(errorMessage(cause));
+      }
+    } finally {
+      controller.abort();
+      setStopping(false);
     }
   }
 
@@ -2305,10 +2384,8 @@ export default function App() {
             const document = await api.createDocument(uploaded.media.id, attachment.file.name);
             return { type: "document", media: document.media, name: document.name };
           }
-          const [resource, metadata] = await Promise.all([
-            api.uploadMedia(attachment.file),
-            mediaMetadata(attachment.file, attachment.kind),
-          ]);
+          const metadata = await mediaMetadata(attachment.file, attachment.kind);
+          const resource = await api.uploadMedia(attachment.file);
           if (attachment.kind === "image") {
             const image = metadata as { width: number; height: number };
             return { type: "image", media: resource.media, ...image };
@@ -3591,7 +3668,7 @@ export default function App() {
                   {active?.mode === "text" && <button aria-pressed={thinkingSupported && effectiveSettings.enableThinking} disabled={!thinkingSupported || roleOverridesInference} onClick={() => updateGlobalInference({ enableThinking: !effectiveSettings.enableThinking })} title={roleOverridesInference ? tr("该参数由当前角色覆盖", "This setting is overridden by the current role") : undefined} type="button"><Icon name="lightbulb" />{tr("思考", "Thinking")}</button>}
                   {active?.mode === "text" && thinkingSupported && effectiveSettings.enableThinking && reasoningValues.length > 0 && <select aria-label={tr("思考档位", "Reasoning effort")} disabled={roleOverridesInference} onChange={(event) => updateGlobalInference({ reasoningEffort: event.target.value })} value={effectiveSettings.reasoningEffort}><option value="">{tr("标准", "Standard")}</option>{reasoningValues.map((value) => <option key={value} value={value}>{value}</option>)}</select>}
                   <span className="composer-hint">{voiceState !== "idle" ? voiceState : tr("Enter 发送 · Shift+Enter 换行", "Enter to send · Shift+Enter for newline")}</span>
-                  {busy ? <button aria-label={tr("停止生成", "Stop generation")} className="send-button stop" onClick={() => abortRef.current?.abort()} type="button"><Icon name="stop" size={14} /></button> : <button aria-label={tr("发送", "Send")} className="send-button" disabled={!active || (!draft.trim() && !attachments.length)} type="submit"><Icon name="send" size={15} /></button>}
+                  {busy ? <button aria-label={stopping ? tr("正在停止生成", "Stopping generation") : tr("停止生成", "Stop generation")} className="send-button stop" disabled={stopping} onClick={() => void stopGeneration()} type="button"><Icon name="stop" size={14} /></button> : <button aria-label={tr("发送", "Send")} className="send-button" disabled={!active || (!draft.trim() && !attachments.length)} type="submit"><Icon name="send" size={15} /></button>}
                 </div>
               </form>
               <p>{tr("模型输出可能存在错误，请核对重要信息。", "Model output may be inaccurate. Verify important information.")}</p>

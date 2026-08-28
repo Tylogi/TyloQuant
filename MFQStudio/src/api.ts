@@ -683,6 +683,10 @@ export const api = {
     ).data;
   },
 
+  cancelResponse(id: string): Promise<ResponseResource> {
+    return request(`/api/v1/sessions/${id}/responses/cancel`, { method: "POST" });
+  },
+
   appendMessage(
     id: string,
     expectedRevision: number,

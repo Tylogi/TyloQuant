@@ -38,6 +38,20 @@ def test_regenerate_rewinds_to_the_preceding_user_message() -> None:
     assert "await generate(rewound, user.parts, false)" in APP
 
 
+def test_stop_generation_cancels_the_server_before_aborting_the_stream() -> None:
+    stop = APP.index("async function stopGeneration()")
+    cancel = APP.index("await api.cancelResponse(active.id);", stop)
+    abort = APP.index("controller.abort();", cancel)
+    assert cancel < abort
+    assert 'tr("正在停止生成", "Stopping generation")' in APP
+
+
+def test_generation_keeps_the_latest_user_language_consistent() -> None:
+    assert "LANGUAGE_CONSISTENCY_PROMPT" in APP
+    assert "answer entirely in the language of the user's latest text" in APP
+    assert ".join(\"\\n\\n\")" in APP
+
+
 def test_media_attachments_are_previewed_uploaded_and_sent_as_typed_parts() -> None:
     assert "const [attachments, setAttachments]" in APP
     assert "api.uploadMedia(attachment.file)" in APP

@@ -558,6 +558,28 @@ class ClusterBackend:
                 )
         return bool(removed) or await self.local.close_session(session_id)
 
+    async def cancel_response(self, session_id: UUID) -> bool:
+        for (node_id, local_session_id), remote in list(self._sessions.items()):
+            if local_session_id != session_id:
+                continue
+            state = self._states.get(node_id)
+            if state is None:
+                continue
+            response = await self._client.post(
+                f"{state.resource.url}/api/v1/sessions/{remote.remote_id}/responses/cancel",
+                headers=self._headers(state.resource),
+            )
+            if response.status_code == 200:
+                return True
+            raise BackendError(
+                "remote_node_cancel_failed",
+                response.text[:1024],
+                retryable=response.status_code >= 500,
+                status_code=response.status_code,
+            )
+        cancel = getattr(self.local, "cancel_response", None)
+        return bool(await cancel(session_id)) if callable(cancel) else False
+
     async def capabilities(self) -> RuntimeCapabilitiesResource:
         return await self.local.capabilities()
 

@@ -135,6 +135,7 @@ def test_openapi_contract_has_all_native_routes_and_realtime_extension() -> None
         "/api/v1/sessions/{session_id}/messages",
         "/api/v1/sessions/{session_id}/export",
         "/api/v1/sessions/{session_id}/responses",
+        "/api/v1/sessions/{session_id}/responses/cancel",
         "/api/v1/sessions/{session_id}/fork",
         "/api/v1/sessions/{session_id}/rewind",
         "/api/v1/sessions/{session_id}",

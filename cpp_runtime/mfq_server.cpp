@@ -29,6 +29,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -1132,6 +1133,58 @@ static bool valid_mfq_session_id(const std::string & session_id) {
             });
 }
 
+class RequestCancellationRegistry {
+public:
+    struct Lease {
+        std::shared_ptr<std::atomic<bool>> flag;
+        std::function<void()> release;
+
+        ~Lease() {
+            if (release) release();
+        }
+    };
+
+    std::shared_ptr<Lease> activate(const std::string & session_id) {
+        auto flag = std::make_shared<std::atomic<bool>>(false);
+        if (session_id.empty()) {
+            auto lease = std::make_shared<Lease>();
+            lease->flag = std::move(flag);
+            return lease;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto found = active_.find(session_id);
+            if (found != active_.end()) {
+                found->second->store(true, std::memory_order_release);
+            }
+            active_[session_id] = flag;
+        }
+        auto release = [this, session_id, flag]() {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto found = active_.find(session_id);
+            if (found != active_.end() && found->second == flag) {
+                active_.erase(found);
+            }
+        };
+        auto lease = std::make_shared<Lease>();
+        lease->flag = std::move(flag);
+        lease->release = std::move(release);
+        return lease;
+    }
+
+    bool cancel(const std::string & session_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = active_.find(session_id);
+        if (found == active_.end()) return false;
+        found->second->store(true, std::memory_order_release);
+        return true;
+    }
+
+private:
+    std::mutex mutex_;
+    std::unordered_map<std::string, std::shared_ptr<std::atomic<bool>>> active_;
+};
+
 static RequestWork parse_work(const json & body, bool chat, const LlamaTokenizer & tokenizer,
                               const common_chat_templates * templates,
                               int64_t max_context,
@@ -1499,6 +1552,7 @@ struct CompletionResult {
     std::string finish_reason = "length";
     int32_t completion_tokens = 0;
     bool client_connected = true;
+    bool cancelled = false;
 };
 
 struct RequestMetricValues {
@@ -1743,6 +1797,7 @@ private:
 static CompletionResult generate_text(const RequestWork & work, const LlamaTokenizer & tokenizer,
                                       const MfqGenerateFn & generate,
                                       const MfqMultimodalGenerateFn & multimodal_generate,
+                                      const std::shared_ptr<std::atomic<bool>> & cancel_requested,
                                       const std::function<bool(const common_chat_msg_diff &)> & emit,
                                       RequestMetrics * metrics,
                                       bool defer_token_parsing) {
@@ -1773,6 +1828,12 @@ static CompletionResult generate_text(const RequestWork & work, const LlamaToken
             static_cast<std::size_t>(std::max(work.sampling.max_tokens, 0)));
     }
     const auto on_token = [&](int64_t token) {
+            if (cancel_requested &&
+                cancel_requested->load(std::memory_order_acquire)) {
+                result.cancelled = true;
+                result.finish_reason = "cancelled";
+                return false;
+            }
             if (metrics != nullptr) metrics->mark_token();
             if (tokenizer.is_eog(token)) {
                 result.finish_reason = "stop";
@@ -1801,6 +1862,11 @@ static CompletionResult generate_text(const RequestWork & work, const LlamaToken
         : generate(
               work.prompt, work.sampling, on_token, on_prefill,
               work.cache_plan, work.token_constraint);
+    if (cancel_requested &&
+        cancel_requested->load(std::memory_order_acquire)) {
+        result.cancelled = true;
+        result.finish_reason = "cancelled";
+    }
     if (defer_tokens) {
         std::string deferred_text;
         deferred_text.reserve(deferred_tokens.size() * 8);
@@ -1822,8 +1888,10 @@ static CompletionResult generate_text(const RequestWork & work, const LlamaToken
         result.reasoning_text = message.reasoning_content;
         result.tool_calls = message.tool_calls;
     }
-    if (emitter.stopped()) result.finish_reason = "stop";
-    if (!result.tool_calls.empty()) result.finish_reason = "tool_calls";
+    if (emitter.stopped() && !result.cancelled) result.finish_reason = "stop";
+    if (!result.cancelled && !result.tool_calls.empty()) {
+        result.finish_reason = "tool_calls";
+    }
     return result;
 }
 
@@ -2624,6 +2692,7 @@ int run_mfq_server(
 
     httplib::Server server;
     ServerMetrics server_metrics;
+    RequestCancellationRegistry request_cancellations;
     std::atomic<int64_t> active_context{config.max_context};
     std::atomic<bool> reloading{false};
     std::mutex reload_gate;
@@ -3064,6 +3133,7 @@ int run_mfq_server(
                 "/api/runtime/cache/clear",
                 "/api/runtime/sessions/fork",
                 "/api/runtime/sessions/{id}",
+                "/api/runtime/sessions/{id}/cancel",
             }},
         });
     });
@@ -3162,6 +3232,17 @@ int run_mfq_server(
             set_json(res, error_body(error.what(), "server_error"), 500);
         }
     });
+
+    server.Post(
+        R"(/api/runtime/sessions/([A-Za-z0-9._:-]{1,128})/cancel)",
+        [&] (const httplib::Request & req, httplib::Response & res) {
+            if (!authorized(req, res, config.api_key)) return;
+            const std::string session_id = req.matches[1].str();
+            set_json(res, {
+                {"status", "ok"},
+                {"cancelled", request_cancellations.cancel(session_id)},
+            });
+        });
 
     server.Post("/api/runtime/sessions/fork", [&] (
             const httplib::Request & req, httplib::Response & res) {
@@ -3347,7 +3428,7 @@ int run_mfq_server(
                 }
                 work.vision = parse_mfq_vision(
                     body["mfq_multimodal"], work.prompt, *tokenizer);
-                work.cache_plan = {};
+                work.cache_plan.stable_prefix_tokens = 0;
             }
             const std::string id = request_id(chat ? "chatcmpl-" : "cmpl-");
             const int64_t created = unix_time_seconds();
@@ -3363,11 +3444,14 @@ int run_mfq_server(
                 active_request =
                     std::make_shared<ActiveRequest>(server_metrics);
             }
+            auto cancellation = request_cancellations.activate(
+                work.cache_plan.session_id);
 
             if (!work.stream) {
                 RequestMetrics metrics;
                 CompletionResult result = generate_text(
                     work, *tokenizer, generate, multimodal_generate,
+                    cancellation->flag,
                     [](const common_chat_msg_diff &) {
                         return true;
                     },
@@ -3419,7 +3503,8 @@ int run_mfq_server(
             res.set_chunked_content_provider(
                 "text/event-stream; charset=utf-8",
                 [work = std::move(work), id, created, &tokenizer, &generate,
-                 &multimodal_generate, &config, active_request, chat]
+                 &multimodal_generate, &config, active_request, cancellation,
+                 chat]
                 (size_t offset, httplib::DataSink & sink) mutable -> bool {
                     if (offset != 0) {
                         sink.done();
@@ -3433,7 +3518,7 @@ int run_mfq_server(
                         RequestMetrics metrics;
                         CompletionResult result = generate_text(
                             work, *tokenizer, generate,
-                            multimodal_generate,
+                            multimodal_generate, cancellation->flag,
                             [&](const common_chat_msg_diff & diff) {
                                 if (!chat) {
                                     if (diff.content_delta.empty()) {

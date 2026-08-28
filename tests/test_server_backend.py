@@ -163,6 +163,30 @@ def test_backend_stream_parses_cpp_sse_and_preserves_request_fields() -> None:
     assert payload["response_format"]["json_schema"]["schema"]["type"] == "object"
 
 
+def test_backend_explicit_cancel_retries_the_native_activation_boundary() -> None:
+    attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        assert request.method == "POST"
+        assert request.url.path == (
+            "/api/runtime/sessions/11111111-1111-4111-8111-111111111111/cancel"
+        )
+        attempts += 1
+        return httpx.Response(200, json={"status": "ok", "cancelled": attempts >= 2})
+
+    async def run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        backend = OpenAIChatBackend("http://backend", client=client)
+        assert await backend.cancel_response(
+            UUID("11111111-1111-4111-8111-111111111111")
+        )
+        await client.aclose()
+
+    asyncio.run(run())
+    assert attempts == 2
+
+
 def test_backend_proxies_runtime_console_resources() -> None:
     requests: list[tuple[str, str, dict[str, object] | None]] = []
 

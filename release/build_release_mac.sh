@@ -30,7 +30,7 @@ fail() {
 
 [[ "$(uname -s)" == "Darwin" ]] || fail "this release target requires macOS"
 [[ "$(uname -m)" == "arm64" ]] || fail "this release target requires native Apple Silicon"
-for mfq_command in uv cmake codesign install_name_tool lipo npm cargo; do
+for mfq_command in uv cmake codesign hdiutil install_name_tool lipo npm cargo; do
   command -v "${mfq_command}" >/dev/null 2>&1 || fail "${mfq_command} is required"
 done
 
@@ -171,15 +171,44 @@ codesign --verify --strict --verbose=2 "${mfq_cli_path}"
 cd "${mfq_studio_dir}"
 npm ci
 npm run check
-CI=true \
-APPLE_SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:-${mfq_signing_identity}}" \
-  npm run tauri -- build \
-    --config src-tauri/tauri.release-macos.conf.json \
-    --target "${mfq_tauri_target}"
+if [[ "${mfq_signing_identity}" != "-" ]]; then
+  CI=true \
+  APPLE_SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:-${mfq_signing_identity}}" \
+    npm run tauri -- build \
+      --config src-tauri/tauri.release-macos.conf.json \
+      --config '{"bundle":{"macOS":{"hardenedRuntime":true}}}' \
+      --target "${mfq_tauri_target}"
+else
+  CI=true \
+  APPLE_SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:-${mfq_signing_identity}}" \
+    npm run tauri -- build \
+      --config src-tauri/tauri.release-macos.conf.json \
+      --target "${mfq_tauri_target}"
+fi
 
 [[ -d "${mfq_dmg_dir}" ]] || fail "Tauri did not create a DMG directory"
 mfq_dmg_path="$(find "${mfq_dmg_dir}" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
 [[ -n "${mfq_dmg_path}" ]] || fail "Tauri did not create a DMG"
 mfq_release_dmg="${mfq_output_dir}/$(basename "${mfq_dmg_path}")"
 install -m 644 "${mfq_dmg_path}" "${mfq_release_dmg}"
+hdiutil verify "${mfq_release_dmg}"
+mfq_mount_dir="$(mktemp -d "${TMPDIR:-/tmp}/mfq-release-verify.XXXXXX")"
+mfq_mounted=false
+cleanup_release_mount() {
+  if [[ "${mfq_mounted}" == true ]]; then
+    hdiutil detach "${mfq_mount_dir}" >/dev/null
+  fi
+  rmdir "${mfq_mount_dir}" 2>/dev/null || true
+}
+trap cleanup_release_mount EXIT
+hdiutil attach -readonly -nobrowse -mountpoint "${mfq_mount_dir}" "${mfq_release_dmg}" >/dev/null
+mfq_mounted=true
+mfq_packaged_app="${mfq_mount_dir}/MFQ Studio.app"
+codesign --verify --deep --strict --verbose=2 "${mfq_packaged_app}"
+MFQ_MLX_METALLIB="${mfq_packaged_app}/Contents/Resources/mlx.metallib" \
+  "${mfq_packaged_app}/Contents/MacOS/mfq-decode-metal" --self-test-metal
+hdiutil detach "${mfq_mount_dir}" >/dev/null
+mfq_mounted=false
+rmdir "${mfq_mount_dir}"
+trap - EXIT
 printf 'built %s\n' "${mfq_release_dmg}"

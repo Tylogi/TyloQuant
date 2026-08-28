@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 from collections.abc import AsyncIterator, Sequence
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -19,6 +20,7 @@ from mfq.server.models import (
     CreateSessionRequest,
     MessageRole,
     ResponseStatus,
+    RewindSessionRequest,
     RuntimeCapabilitiesResource,
     SamplingParams,
     SessionState,
@@ -43,6 +45,7 @@ class FakeBackend:
         self.calls: list[dict[str, Any]] = []
         self.forks: list[tuple[UUID, UUID]] = []
         self.closed_sessions: list[UUID] = []
+        self.cancelled_sessions: list[UUID] = []
         self.cache_clears = 0
         self.closed = False
 
@@ -82,6 +85,10 @@ class FakeBackend:
 
     async def close_session(self, session_id: UUID) -> bool:
         self.closed_sessions.append(session_id)
+        return True
+
+    async def cancel_response(self, session_id: UUID) -> bool:
+        self.cancelled_sessions.append(session_id)
         return True
 
     async def capabilities(self) -> RuntimeCapabilitiesResource:
@@ -138,6 +145,81 @@ def completed_deltas() -> tuple[BackendDelta, ...]:
         ),
         BackendDelta(usage=TokenUsage(prompt_tokens=4, completion_tokens=5, total_tokens=9)),
     )
+
+
+def test_explicit_cancel_stops_a_response_and_allows_immediate_edited_retry(
+    tmp_path: Path,
+) -> None:
+    class BlockingBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block = True
+            self.started = asyncio.Event()
+
+        async def stream(self, **kwargs: Any) -> AsyncIterator[BackendDelta]:
+            self.calls.append(kwargs)
+            if self.block:
+                self.started.set()
+                await asyncio.Event().wait()
+            yield BackendDelta(content_delta="edited answer", finish_reason="stop")
+
+    async def run() -> None:
+        backend = BlockingBackend()
+        service = make_service(tmp_path, backend)
+        await asyncio.to_thread(
+            service.store.create_session,
+            CreateSessionRequest(model="model-a"),
+            session_id=SESSION_ID,
+        )
+        prepared = await service.prepare_response(
+            SESSION_ID,
+            CreateResponseRequest(
+                request_id=REQUEST_ID,
+                expected_revision=0,
+                input=[{"type": "text", "text": "original question"}],
+                stream=True,
+            ),
+        )
+
+        async def consume() -> None:
+            async for _ in service.stream_response(prepared):
+                pass
+
+        consumer = asyncio.create_task(consume())
+        await asyncio.wait_for(backend.started.wait(), timeout=1)
+        cancelled = await service.cancel_response(SESSION_ID)
+        assert cancelled.status == ResponseStatus.CANCELLED
+        with suppress(asyncio.CancelledError):
+            await consumer
+        assert backend.cancelled_sessions == [SESSION_ID]
+        session = await service.get_session(SESSION_ID)
+        assert session.state == SessionState.INTERRUPTED
+        assert session.revision == 1
+
+        original = (await service.list_messages(SESSION_ID)).data[0]
+        rewound = await service.rewind_session(
+            SESSION_ID,
+            RewindSessionRequest(
+                expected_revision=1,
+                at_message_id=original.id,
+                include_message=False,
+            ),
+        )
+        backend.block = False
+        retry = await service.prepare_response(
+            SESSION_ID,
+            CreateResponseRequest(
+                request_id=UUID("33333333-3333-4333-8333-333333333333"),
+                expected_revision=rewound.revision,
+                input=[{"type": "text", "text": "edited question"}],
+                stream=False,
+            ),
+        )
+        completed = await service.collect_response(retry)
+        assert completed.status == ResponseStatus.COMPLETED
+        assert completed.output[0].text == "edited answer"
+
+    asyncio.run(run())
 
 
 def test_media_upload_retrieval_and_multimodal_forwarding(tmp_path: Path) -> None:

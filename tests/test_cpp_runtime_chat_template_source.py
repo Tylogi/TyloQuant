@@ -65,6 +65,16 @@ def test_server_enforces_complete_chat_template_tool_calls() -> None:
     assert "!token_constraint &&" in DECODE
 
 
+def test_native_server_cancels_active_session_generation_per_token() -> None:
+    assert 'R"(/api/runtime/sessions/([A-Za-z0-9._:-]{1,128})/cancel)"' in SERVER
+    assert "request_cancellations.cancel(session_id)" in SERVER
+    assert "cancel_requested->load(std::memory_order_acquire)" in SERVER
+    assert 'result.finish_reason = "cancelled"' in SERVER
+    assert "!result.cancelled && !result.tool_calls.empty()" in SERVER
+    assert "work.cache_plan.stable_prefix_tokens = 0;" in SERVER
+    assert "work.cache_plan = {};" not in SERVER
+
+
 def test_server_links_matching_llama_common_runtime() -> None:
     assert 'set(MFQ_LLAMA_SOURCE_DIR' in CMAKE
     assert 'add_subdirectory(' in CMAKE

@@ -701,6 +701,15 @@ def create_app(
         return await daemon.collect_response(prepared)
 
     @app.post(
+        "/api/v1/sessions/{session_id}/responses/cancel",
+        response_model=ResponseResource,
+        responses=ERROR_RESPONSES,
+        tags=["sessions"],
+    )
+    async def cancel_response(session_id: UUID) -> ResponseResource:
+        return await require_service().cancel_response(session_id)
+
+    @app.post(
         "/api/v1/sessions/{session_id}/fork",
         response_model=SessionResource,
         status_code=201,

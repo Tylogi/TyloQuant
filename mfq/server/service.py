@@ -282,6 +282,7 @@ class ServerService:
         self.hub_catalog = hub_catalog or HubCatalog()
         self.tool_handlers = tool_handlers
         self.cluster = cluster
+        self._active_responses: dict[UUID, tuple[UUID, asyncio.Task[Any]]] = {}
         if runtime_manager is not None:
             runtime_manager.store = store
             self.jobs.register(
@@ -1301,6 +1302,7 @@ class ServerService:
     async def collect_response(self, prepared: PreparedResponse) -> ResponseResource:
         if not prepared.begin.started:
             return prepared.begin.response
+        response_task = self._track_active_response(prepared)
         accumulator = _OutputAccumulator()
         try:
             async for delta in self.backend.stream(
@@ -1342,6 +1344,8 @@ class ServerService:
                 str(error),
                 retryable=error.retryable,
             ) from error
+        finally:
+            self._untrack_active_response(prepared, response_task)
 
     async def list_responses(self, session_id: UUID, *, limit: int = 200) -> ResponseList:
         try:
@@ -1349,6 +1353,48 @@ class ServerService:
         except ValueError as error:
             raise ServiceError(422, "invalid_request", str(error)) from error
         return ResponseList(data=data)
+
+    async def cancel_response(self, session_id: UUID) -> ResponseResource:
+        active: tuple[UUID, asyncio.Task[Any]] | None = None
+        for _ in range(25):
+            active = self._active_responses.get(session_id)
+            if active is not None:
+                break
+            session = await self.get_session(session_id)
+            if session.state != SessionState.PROCESSING:
+                break
+            await asyncio.sleep(0.02)
+        if active is None:
+            raise ServiceError(
+                409,
+                "response_not_in_progress",
+                "the session has no active response to cancel",
+            )
+
+        response_id, task = active
+        cancel_backend = getattr(self.backend, "cancel_response", None)
+        if callable(cancel_backend):
+            try:
+                await cancel_backend(session_id)
+            except BackendError as error:
+                raise ServiceError(
+                    502,
+                    "backend_cancel_failed",
+                    str(error),
+                    retryable=error.retryable,
+                ) from error
+
+        cancelled = await asyncio.to_thread(
+            self.store.terminate_response,
+            response_id,
+            ErrorDetail(
+                code="client_cancelled",
+                message="response cancelled by the client",
+            ),
+            cancelled=True,
+        )
+        task.cancel()
+        return cancelled
 
     async def stream_response(self, prepared: PreparedResponse) -> AsyncIterator[str]:
         sequence = 0
@@ -1371,14 +1417,28 @@ class ServerService:
             )
             return
 
-        yield self._encode_sse(
-            SessionStateChanged(
-                state=SessionState.PROCESSING,
-                revision=prepared.begin.session.revision,
-            ),
-            sequence,
-            session_id=prepared.begin.session.id,
-        )
+        response_task = self._track_active_response(prepared)
+        try:
+            yield self._encode_sse(
+                SessionStateChanged(
+                    state=SessionState.PROCESSING,
+                    revision=prepared.begin.session.revision,
+                ),
+                sequence,
+                session_id=prepared.begin.session.id,
+            )
+        except (asyncio.CancelledError, GeneratorExit):
+            await asyncio.to_thread(
+                self.store.terminate_response,
+                prepared.begin.response.id,
+                ErrorDetail(
+                    code="client_cancelled",
+                    message="client disconnected before the response completed",
+                ),
+                cancelled=True,
+            )
+            self._untrack_active_response(prepared, response_task)
+            raise
         sequence += 1
         accumulator = _OutputAccumulator()
         try:
@@ -1452,6 +1512,27 @@ class ServerService:
                 sequence,
                 session_id=session.id,
             )
+        finally:
+            self._untrack_active_response(prepared, response_task)
+
+    def _track_active_response(self, prepared: PreparedResponse) -> asyncio.Task[Any]:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("response generation requires an asyncio task")
+        self._active_responses[prepared.begin.session.id] = (
+            prepared.begin.response.id,
+            task,
+        )
+        return task
+
+    def _untrack_active_response(
+        self,
+        prepared: PreparedResponse,
+        task: asyncio.Task[Any],
+    ) -> None:
+        active = self._active_responses.get(prepared.begin.session.id)
+        if active == (prepared.begin.response.id, task):
+            self._active_responses.pop(prepared.begin.session.id, None)
 
     async def _terminate_backend_failure(
         self,

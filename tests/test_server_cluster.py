@@ -90,6 +90,9 @@ def _remote_app():
             ]
             content = "".join(f"data: {json.dumps(frame)}\n\n" for frame in frames)
             return httpx.Response(200, text=content, headers={"content-type": "text/event-stream"})
+        if path.endswith("/responses/cancel"):
+            assert request.method == "POST"
+            return httpx.Response(200, json={"status": "cancelled"})
         if path.endswith("/fork"):
             return httpx.Response(
                 201,
@@ -161,6 +164,9 @@ def test_cluster_registers_probes_and_routes_matching_model(tmp_path: Path) -> N
                 chunks.append(delta)
             assert "".join(item.content_delta for item in chunks) == "remote"
             assert chunks[-1].finish_reason == "stop"
+            assert await cluster.cancel_response(
+                UUID("33333333-3333-4333-8333-333333333333")
+            )
             state = cluster._states[UUID(node_id)]
             tool_result = await cluster._message_parts(
                 state.resource,

@@ -8,15 +8,20 @@ RUST = (TAURI / "src" / "main.rs").read_text(encoding="utf-8")
 BUILD = (TAURI / "build.rs").read_text(encoding="utf-8")
 APP = (STUDIO / "src" / "App.tsx").read_text(encoding="utf-8")
 API = (STUDIO / "src" / "api.ts").read_text(encoding="utf-8")
+MAIN = (STUDIO / "src" / "main.tsx").read_text(encoding="utf-8")
 MARKDOWN = (STUDIO / "src" / "Markdown.tsx").read_text(encoding="utf-8")
 MARKDOWN_TEXT = (STUDIO / "src" / "markdownText.ts").read_text(encoding="utf-8")
 STUDIO_BRIDGE = (STUDIO / "src" / "studio.ts").read_text(encoding="utf-8")
 STYLES = (STUDIO / "src" / "styles.css").read_text(encoding="utf-8")
 REALTIME_AUDIO = (STUDIO / "src" / "realtimeAudio.ts").read_text(encoding="utf-8")
+RELEASE_SCRIPT = (ROOT / "release" / "build_release_mac.sh").read_text(encoding="utf-8")
 
 
 def test_studio_uses_one_package_for_web_and_desktop_clients():
     config = json.loads((TAURI / "tauri.conf.json").read_text(encoding="utf-8"))
+    release_config = json.loads(
+        (TAURI / "tauri.release-macos.conf.json").read_text(encoding="utf-8")
+    )
     package = json.loads((STUDIO / "package.json").read_text(encoding="utf-8"))
     assert not (STUDIO / "web").exists()
     assert not (STUDIO / "desktop").exists()
@@ -30,6 +35,10 @@ def test_studio_uses_one_package_for_web_and_desktop_clients():
     assert "IconDir::new" in BUILD
     assert "IconFamily::new" in BUILD
     assert "media-src 'self' asset: data: blob:" in config["app"]["security"]["csp"]
+    assert release_config["bundle"]["macOS"]["hardenedRuntime"] is False
+    assert 'if [[ "${mfq_signing_identity}" != "-" ]]' in RELEASE_SCRIPT
+    assert '"hardenedRuntime":true' in RELEASE_SCRIPT
+    assert 'mfq-decode-metal" --self-test-metal' in RELEASE_SCRIPT
 
 
 def test_assistant_markdown_recovers_fully_escaped_structural_line_breaks():
@@ -110,6 +119,13 @@ def test_studio_uses_native_confirmation_dialogs_for_destructive_actions():
     assert APP.count("await studioConfirm(") >= 7
 
 
+def test_studio_has_a_render_error_boundary_instead_of_a_blank_window():
+    assert "class AppErrorBoundary" in MAIN
+    assert "static getDerivedStateFromError" in MAIN
+    assert '<main className="fatal-error" role="alert">' in MAIN
+    assert "<AppErrorBoundary>" in MAIN
+
+
 def test_studio_loads_message_media_through_authenticated_blob_urls():
     assert "async fetchMedia(id: string, signal?: AbortSignal): Promise<Blob>" in API
     assert "headers: authorizedHeaders()" in API
@@ -128,6 +144,25 @@ def test_studio_renders_video_first_frame_posters():
     assert 'poster={poster ?? undefined}' in APP
     assert '<VideoWithFirstFrame className="message-media media-video" controls src={src} />' in APP
     assert '<VideoWithFirstFrame muted src={attachment.previewUrl} />' in APP
+
+
+def test_studio_validates_video_metadata_before_uploading_media():
+    assert "const timeout = window.setTimeout(" in APP
+    assert "video.load();" in APP
+    metadata = APP.index("const metadata = await mediaMetadata(attachment.file, attachment.kind);")
+    upload = APP.index("const resource = await api.uploadMedia(attachment.file);", metadata)
+    assert metadata < upload
+
+
+def test_studio_fetches_protected_message_media_and_documents():
+    assert "const [loadFailed, setLoadFailed] = useState(false);" in APP
+    assert "Unable to load attachment" in APP
+    document = APP.index("async function downloadDocument()")
+    assert "await api.fetchMedia(part.media.id)" in APP[document:]
+    assert "anchor.download = part.name" in APP[document:]
+    assert "document.body.appendChild(anchor)" in APP[document:]
+    assert "anchor.remove()" in APP[document:]
+    assert "href={api.mediaUrl(part.media.id)}" not in APP
 
 
 def test_studio_drains_duplex_output_after_microphone_capture_stops():
@@ -162,7 +197,7 @@ def test_studio_resolves_model_global_and_role_inference_settings_in_order():
     assert "roleGenerationSettings(resolvedGlobalSettings, activeRolePreset)" in APP
     assert "sampling: samplingParams()" in APP
     assert "max_tokens: effectiveSettings.maxTokens" in APP
-    assert "system_prompt: effectiveSettings.systemPrompt || null" in APP
+    assert "system_prompt: [effectiveSettings.systemPrompt.trim(), LANGUAGE_CONSISTENCY_PROMPT]" in APP
     assert "setSettings((current) => ({ ...current, ...rolePreset.settings" not in APP
 
 
