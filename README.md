@@ -20,43 +20,6 @@ NINT · NVQ/NPQ · NEPQ · TPQ · Expert-Wise MoE · CUDA · Metal · C++ Runtim
   <a href="https://huggingface.co/Tylogi">Hugging Face Models</a> · <a href="https://www.modelscope.cn/profile/Tylogi">ModelScope Models</a>
 </p>
 
-## Results
-
-### DeepSeek-V4-Flash-0731
-
-<img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ versus Unsloth Dynamic model size and Mean KLD" width="100%">
-
-**Evaluation:** Official 0731 weights on WikiText-2, covering 573 chunks and
-146,115 scored tokens at `ctx=512`.
-
-| Released tier |       Size |  Mean KLD ↓ |  Same-top ↑ |
-| ------------- | ---------: | -----------: | -----------: |
-| S             | 77.519 GiB | `0.313576` | `82.2913%` |
-| M             | 88.007 GiB | `0.244488` | `84.5300%` |
-| L             | 98.007 GiB | `0.201444` | `86.0753%` |
-
-**Nearest-size comparison:** Against the three closest-size Unsloth Dynamic
-(UD) baselines, MFQ reduces Mean KLD by **34.24–51.42%**.
-
-### Qwen3.5-9B: disk size vs. Mean KLD
-
-<img src="./docs/figures/qwen35-9b-mfq-vs-ud-size-kld.svg" alt="Qwen3.5-9B MFQ versus Unsloth Dynamic disk size and raw Mean KLD" width="100%">
-
-- **Evaluation:** Full WikiText-2 run with 145 chunks and 148,335 scored tokens;
-  all tiers use the same BF16 reference.
-- **Result:** MFQ achieves lower raw Mean KLD at every matched precision tier
-  shown above.
-
-### Qwen3.6-27B: disk size vs. quality
-
-<img src="./docs/figures/qwen36-27b-mfq-vs-ud-size-quality.png" alt="Qwen3.6-27B MFQ versus Unsloth Dynamic disk size, raw Mean KLD, and same-top accuracy" width="100%">
-
-- **Evaluation:** Complete 145-chunk runs aligned at `ubatch=2048`; every
-  plotted tier uses all chunks.
-- **Comparison:** Each MFQ file is paired with the corresponding matched-size
-  Unsloth Dynamic recipe.
-- **Metrics:** Lower Mean KLD and higher same-top accuracy are better.
-
 ## Overview
 
 **TyloQuant MFQ** (or **MFQ**) co-designs quantization formats, precision
@@ -221,6 +184,43 @@ The desktop Studio **Models and jobs** page loads any local `.mfq` file without
 copying it. Selecting one shard loads the full sibling shard family.
 
 <img src="./docs/figures/tyloquant-mfq-webui-english.png" alt="TyloQuant MFQ local inference WebUI in English" width="100%">
+
+## Results
+
+### DeepSeek-V4-Flash-0731
+
+<img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ versus Unsloth Dynamic model size and Mean KLD" width="100%">
+
+**Evaluation:** Official 0731 weights on WikiText-2, covering 573 chunks and
+146,115 scored tokens at `ctx=512`.
+
+| Released tier |       Size |  Mean KLD ↓ |  Same-top ↑ |
+| ------------- | ---------: | -----------: | -----------: |
+| S             | 77.519 GiB | `0.313576` | `82.2913%` |
+| M             | 88.007 GiB | `0.244488` | `84.5300%` |
+| L             | 98.007 GiB | `0.201444` | `86.0753%` |
+
+**Nearest-size comparison:** Against the three closest-size Unsloth Dynamic
+(UD) baselines, MFQ reduces Mean KLD by **34.24–51.42%**.
+
+### Qwen3.5-9B: disk size vs. Mean KLD
+
+<img src="./docs/figures/qwen35-9b-mfq-vs-ud-size-kld.svg" alt="Qwen3.5-9B MFQ versus Unsloth Dynamic disk size and raw Mean KLD" width="100%">
+
+- **Evaluation:** Full WikiText-2 run with 145 chunks and 148,335 scored tokens;
+  all tiers use the same BF16 reference.
+- **Result:** MFQ achieves lower raw Mean KLD at every matched precision tier
+  shown above.
+
+### Qwen3.6-27B: disk size vs. quality
+
+<img src="./docs/figures/qwen36-27b-mfq-vs-ud-size-quality.png" alt="Qwen3.6-27B MFQ versus Unsloth Dynamic disk size, raw Mean KLD, and same-top accuracy" width="100%">
+
+- **Evaluation:** Complete 145-chunk runs aligned at `ubatch=2048`; every
+  plotted tier uses all chunks.
+- **Comparison:** Each MFQ file is paired with the corresponding matched-size
+  Unsloth Dynamic recipe.
+- **Metrics:** Lower Mean KLD and higher same-top accuracy are better.
 
 ## How It Works
 

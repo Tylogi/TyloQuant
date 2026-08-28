@@ -20,37 +20,6 @@ NINT · NVQ/NPQ · NEPQ · TPQ · Expert-Wise MoE · CUDA · Metal · C++ Runtim
   <a href="https://huggingface.co/Tylogi">Hugging Face 模型主页</a> · <a href="https://www.modelscope.cn/profile/Tylogi">ModelScope 模型主页</a>
 </p>
 
-## 核心结果
-
-### DeepSeek-V4-Flash-0731
-
-<img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ 与 Unsloth Dynamic 模型大小和 Mean KLD 对比" width="100%">
-
-**评测：** 官方 0731 权重，WikiText-2 共 573 个 chunk、146,115 个计分 token，`ctx=512`。
-
-| 发布档位 | 大小 | Mean KLD ↓ | Same-top ↑ |
-|---|---:|---:|---:|
-| S | 77.519 GiB | `0.313576` | `82.2913%` |
-| M | 88.007 GiB | `0.244488` | `84.5300%` |
-| L | 98.007 GiB | `0.201444` | `86.0753%` |
-
-**同体积对比：** 与三组大小最接近的 Unsloth Dynamic（UD）基线相比，MFQ 将 Mean KLD 降低 **34.24–51.42%**。
-
-### Qwen3.5-9B：文件大小与 Mean KLD
-
-<img src="./docs/figures/qwen35-9b-mfq-vs-ud-size-kld.svg" alt="Qwen3.5-9B MFQ 与 Unsloth Dynamic 文件大小和原始 Mean KLD 对比" width="100%">
-
-- **评测：** 完整 WikiText-2，共 145 个 chunk、148,335 个计分 token；所有档位使用同一 BF16 参考模型。
-- **结果：** 上图每个匹配精度档位中，MFQ 的原始 Mean KLD 均更低。
-
-### Qwen3.6-27B：文件大小与质量
-
-<img src="./docs/figures/qwen36-27b-mfq-vs-ud-size-quality.png" alt="Qwen3.6-27B MFQ 与 Unsloth Dynamic 文件大小、原始 Mean KLD 和 same-top accuracy 对比" width="100%">
-
-- **评测：** 完整 145-chunk 评测，统一使用 `ubatch=2048`；图中每个档位均覆盖全部 chunk。
-- **对比：** 每个 MFQ 文件均与对应的同体积 Unsloth Dynamic recipe 配对。
-- **指标：** Mean KLD 越低越好，same-top accuracy 越高越好。
-
 ## 项目简介
 
 **TyloQuant MFQ**（简称 **MFQ**）联合设计量化格式、精度分配与推理 kernel，面向高保真 LLM 部署。项目支持 `0.84-8.30 bpw` 的自定义权重编码，可按计算组或 MoE 专家分配精度，并通过由 C++ runtime 支撑的原生 CUDA 与 Metal 路径直接执行 packed 权重。
@@ -188,6 +157,37 @@ uv run mfq serve --model-dir path/to/models --host 127.0.0.1 --port 8090
 桌面版 Studio 的 **Models and jobs** 页面可直接加载本地 `.mfq` 文件，不会复制模型。选择任一分片时会加载完整的 sibling shard family。
 
 <img src="./docs/figures/tyloquant-mfq-webui-zh.png" alt="TyloQuant MFQ 本地推理 WebUI" width="100%">
+
+## 核心结果
+
+### DeepSeek-V4-Flash-0731
+
+<img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ 与 Unsloth Dynamic 模型大小和 Mean KLD 对比" width="100%">
+
+**评测：** 官方 0731 权重，WikiText-2 共 573 个 chunk、146,115 个计分 token，`ctx=512`。
+
+| 发布档位 | 大小 | Mean KLD ↓ | Same-top ↑ |
+|---|---:|---:|---:|
+| S | 77.519 GiB | `0.313576` | `82.2913%` |
+| M | 88.007 GiB | `0.244488` | `84.5300%` |
+| L | 98.007 GiB | `0.201444` | `86.0753%` |
+
+**同体积对比：** 与三组大小最接近的 Unsloth Dynamic（UD）基线相比，MFQ 将 Mean KLD 降低 **34.24–51.42%**。
+
+### Qwen3.5-9B：文件大小与 Mean KLD
+
+<img src="./docs/figures/qwen35-9b-mfq-vs-ud-size-kld.svg" alt="Qwen3.5-9B MFQ 与 Unsloth Dynamic 文件大小和原始 Mean KLD 对比" width="100%">
+
+- **评测：** 完整 WikiText-2，共 145 个 chunk、148,335 个计分 token；所有档位使用同一 BF16 参考模型。
+- **结果：** 上图每个匹配精度档位中，MFQ 的原始 Mean KLD 均更低。
+
+### Qwen3.6-27B：文件大小与质量
+
+<img src="./docs/figures/qwen36-27b-mfq-vs-ud-size-quality.png" alt="Qwen3.6-27B MFQ 与 Unsloth Dynamic 文件大小、原始 Mean KLD 和 same-top accuracy 对比" width="100%">
+
+- **评测：** 完整 145-chunk 评测，统一使用 `ubatch=2048`；图中每个档位均覆盖全部 chunk。
+- **对比：** 每个 MFQ 文件均与对应的同体积 Unsloth Dynamic recipe 配对。
+- **指标：** Mean KLD 越低越好，same-top accuracy 越高越好。
 
 ## 工作原理
 
