@@ -25,7 +25,7 @@ Install the daemon extra only when serving through the HTTP API:
 uv sync --extra daemon
 ```
 
-Then let MFQ detect the backend and build it:
+Build with automatic backend detection:
 
 ```shell
 uv run mfq build
@@ -36,11 +36,8 @@ Automatic backend selection uses:
 - Metal on Apple silicon macOS;
 - CUDA on Linux or Windows when `nvcc` is available.
 
-Detection selects a backend; it does not prove that every build dependency is
-installed. The Metal and CUDA requirements are listed below.
-
-The command stops with an explanation if neither backend is available. Use an
-explicit backend when diagnosing detection or build problems:
+Backend detection does not check every compiler dependency. Requirements are
+listed below. Pass the backend explicitly when debugging a build:
 
 ```shell
 uv run mfq build --backend metal
@@ -49,8 +46,8 @@ uv run mfq build --backend cuda
 
 ## Output and build manifest
 
-The default CMake build directory is `<repo>/build/cpp_runtime`. The main
-executable is normally:
+The default CMake build directory is `<repo>/build/cpp_runtime`. Executable
+paths:
 
 | Backend | Executable |
 | --- | --- |
@@ -58,9 +55,8 @@ executable is normally:
 | CUDA | `<repo>/build/cpp_runtime/mfq-decode` |
 | CUDA on Windows | Usually `<repo>\build\cpp_runtime\mfq-decode.exe`; multi-configuration generators may add `Release\` |
 
-CMake generators may place the executable in a configuration subdirectory.
-MFQ searches the build tree after compilation and records the actual path,
-rather than assuming one fixed layout.
+MFQ searches the build tree after compilation, so generators may place the
+executable in a configuration subdirectory.
 
 A successful build writes `<repo>/build/mfq-runtime.json`. This location is
 fixed relative to the source checkout even when `--build-dir` points elsewhere.
@@ -110,8 +106,8 @@ uv run mfq build --backend cuda -- \
   -DGGML_CCACHE=OFF
 ```
 
-These arguments are saved in the build manifest and reused if MFQ must recreate
-a missing executable.
+The build manifest saves these arguments and reuses them when rebuilding a
+missing executable.
 
 ## Command options
 
@@ -150,11 +146,9 @@ uv run mfq build
 - a C++/CUDA toolchain with `nvcc`;
 - CUDA Toolkit 12 or newer, including `nvcc`, cuBLAS, and the CUDA runtime.
 
-The default CUDA inference runtime is self-contained and does not require
-Python, PyTorch, or LibTorch. Developers doing migration A/B validation may
-explicitly configure `-DMFQ_BUILD_TORCH_REFERENCE_RUNTIME=ON`; that optional
-reference target has its own Python and LibTorch requirements and is not part
-of the normal runtime build.
+The default CUDA runtime needs no Python, PyTorch, or LibTorch. Migration A/B
+builds may set `-DMFQ_BUILD_TORCH_REFERENCE_RUNTIME=ON`; that reference target
+has separate Python and LibTorch requirements.
 
 MFQ checks `CUDACXX`, `PATH`, `CUDA_HOME`, and `CUDA_PATH` when locating
 `nvcc`.
@@ -169,9 +163,9 @@ bypass platform and toolchain checks.
 
 ### CMake completed without producing the executable
 
-Read the printed configure and build commands first. If a custom generator uses
-an unexpected output layout, MFQ searches the build tree by executable name. A
-remaining error usually means the requested target was not produced.
+Check the printed configure and build commands. MFQ searches custom generator
+layouts by executable name; if the search still fails, the target was not
+produced.
 
 ### Inspect the exact commands
 
@@ -180,4 +174,4 @@ uv run mfq build --dry-run --backend cuda -- \
   -DCMAKE_CUDA_ARCHITECTURES=90
 ```
 
-After a successful build, continue with [`mfq serve`](serve.md).
+Next: [`mfq serve`](serve.md).

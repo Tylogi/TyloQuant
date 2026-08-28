@@ -1,8 +1,8 @@
-# Generic EW joint budget solver
+# Expert-Wise joint budget solver
 
-`mfq solve-ew` converts a standardized expert-importance table and an exact
-rate-distortion candidate table into an `mfq.calibration-scheme.v3` recipe.
-The existing `mfq quantize --ew-scheme` path consumes that recipe.
+`mfq solve-ew` converts an expert-importance table and a rate-distortion
+candidate table into an `mfq.calibration-scheme.v3` recipe.
+`mfq quantize --ew-scheme` reads that recipe.
 
 ```text
 mfq solve-ew \

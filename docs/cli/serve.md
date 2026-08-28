@@ -1,9 +1,7 @@
 # `mfq serve`
 
-`mfq serve` starts the MFQ API and Web UI. It may start with an initial model or
-with an empty model catalog. MFQ owns every native worker lifecycle: it selects
-the C++ executable, runs workers on private loopback ports, and stops them with
-the application server.
+`mfq serve` starts the API and Web UI, with or without an initial model. It
+selects the C++ executable and manages workers on private loopback ports.
 
 ## Quick start
 
@@ -15,37 +13,37 @@ uv sync --extra daemon --extra metal
 ```
 
 On a CUDA host, use `uv sync --extra daemon` instead. Native CUDA inference
-does not require PyTorch or LibTorch. Then start with an initial model:
+does not require PyTorch or LibTorch.
+
+Start an idle server:
 
 ```shell
 uv run mfq serve
 ```
 
-Or start an idle server and load a discovered model later through MFQ Studio or
-the model API:
-
 Open the model catalog in MFQ Studio or the Web UI to load a discovered model.
-Pass `--model /models/model.mfq` only when one model should be loaded before the
-server becomes available.
+To load one model before the server becomes available, pass its existing MFQ
+path:
 
-The public server listens on `http://127.0.0.1:8090` by default. Stop it with
-`Ctrl-C`; MFQ then stops every private native worker as part of server shutdown.
-When supplied, `--model` must point to an existing `.mfq` file.
+```shell
+uv run mfq serve --model /models/model.mfq
+```
 
-Without `--running-executable`, run the command through uv in the source checkout
-that contains the native runtime sources. MFQ derives that checkout from the
-installed Python package, not from the current working directory. This mode may
-compile the runtime on first use, so the backend requirements in
-[`mfq build`](build.md#backend-requirements) still apply. A packaged prebuilt
-runtime does not require CMake, `nvcc`, or the source tree.
+The server listens on `http://127.0.0.1:8090` by default. `Ctrl-C` stops the
+server and its private workers. `--model` must point to an existing `.mfq`
+file.
+
+Without `--running-executable`, run through uv from the checkout that supplies
+the installed `mfq` package. The first run may compile the runtime, so the
+[`mfq build` requirements](build.md#backend-requirements) apply. Packaged
+runtimes do not need CMake, `nvcc`, or a source tree.
 
 ## How the native runtime is selected
 
 `mfq serve` detects the host backend and selects the runtime in this order:
 
-1. `--running-executable` uses that prebuilt binary directly. This is intended
-   for packaged releases and skips managed-build lookup, compiler detection,
-   and compilation.
+1. `--running-executable` uses a prebuilt binary and skips managed-build
+   lookup, compiler detection, and compilation.
 2. If the recorded executable exists, MFQ uses it directly.
 3. If the manifest exists but the executable is missing, MFQ rebuilds it in the
    recorded build directory with the recorded generator, build type, and CMake
@@ -53,9 +51,8 @@ runtime does not require CMake, `nvcc`, or the source tree.
 4. If no matching manifest exists, MFQ performs a default build and creates the
    manifest.
 
-A manifest is accepted only for the same source checkout, operating system,
-machine architecture, and backend. This prevents a stale path from another
-checkout or host from being launched.
+A manifest must match the source checkout, operating system, machine
+architecture, and backend. Mismatched manifests are ignored.
 
 The manifest is always read from `<repo>/build/mfq-runtime.json`, where
 `<repo>` is the checkout supplying the running `mfq` command. A default build
@@ -63,11 +60,9 @@ uses `<repo>/cpp_runtime` as its source and `<repo>/build/cpp_runtime` as its
 build directory. `--build-dir` changes only the CMake build tree; the manifest
 remains under `<repo>/build`.
 
-Normal source installations do not pass the native executable to `mfq serve`.
-A custom directory selected earlier with `mfq build --build-dir` is resolved
-automatically. Self-contained distributions use `--running-executable` to bind
-the packaged server to its bundled native worker without compiling or consulting
-a source-tree build manifest.
+Source installations use the managed build automatically, including a custom
+`mfq build --build-dir`. Packaged distributions pass their bundled worker with
+`--running-executable`.
 
 ## Application and private listeners
 
@@ -134,17 +129,21 @@ When Web UI assets are available, open the listener root, such as
    absent.
 4. Otherwise, MFQ looks for `MFQStudio` in the source checkout.
 
-A prebuilt directory must contain `index.html` at its root. MFQ validates
-explicit and environment-provided directories before detecting or building the
-native backend and before loading the model. In automatic source mode, if the
-sources are newer than `dist/index.html`, `mfq serve` runs `npm ci` followed by
-`npm run build`. This requires a compatible Node.js/npm, write access to the
-source tree, and possibly network access for dependencies. If npm is
-unavailable, MFQ continues with the API only. If npm starts but the build
-command fails or does not produce `dist/index.html`, `mfq serve` stops with an
-error before loading the model.
+A prebuilt directory must contain `index.html`. MFQ checks explicit and
+environment-provided directories before starting the backend or loading a
+model.
 
-Choose one of the explicit modes when needed:
+In automatic source mode, MFQ rebuilds the UI when the sources are newer than
+`dist/index.html`:
+
+1. `npm ci`
+2. `npm run build`
+
+This needs Node.js/npm, write access to the checkout, and network access when
+npm must download packages. Without npm, the API still starts. A failed build
+or missing `dist/index.html` stops startup before model loading.
+
+Explicit Web UI modes:
 
 ```shell
 # Serve an existing Web UI build.
@@ -159,10 +158,9 @@ uv run mfq serve --model /models/model.mfq --no-web-ui
 
 ## Model discovery and runtime pool
 
-When present, the model passed through `--model` is loaded by the initial private
-worker and its parent directory is added to the model catalog. Without it, the
-server remains idle until a model is loaded through Studio, the Web UI, or the
-model-management API. Add discovery roots by repeating `--model-dir`:
+`--model` loads the initial model and adds its parent directory to the catalog.
+Without it, the server stays idle until Studio, the Web UI, or the model API
+loads a model. Repeat `--model-dir` to add discovery roots:
 
 ```shell
 uv run mfq serve \
@@ -184,16 +182,15 @@ curl -X POST http://127.0.0.1:8090/api/v1/models/load \
   -d '{"model":"model","context_size":32768}'
 ```
 
-The request returns `202 Accepted`; model loading continues as a background
-job whose identifier is returned as `operation_id`.
+The request returns `202 Accepted` and an `operation_id` for the background
+load job.
 
-The catalog name is the MFQ filename without its `.mfq` suffix. Split files
-such as `model-00001-of-00003.mfq` use `model` as the catalog name. Catalog
-names must be unique across every configured discovery root; startup and
-catalog refresh fail explicitly if two different MFQ artifacts have the same
-name. Runtime model IDs, worker identities, and inference routing use this
-catalog name. The hashed artifact ID remains separate and is used only to
-track the exact artifact and detect profile drift.
+The catalog name is the filename without `.mfq`. A shard such as
+`model-00001-of-00003.mfq` belongs to catalog entry `model`.
+
+Catalog names must be unique across discovery roots. Startup and refresh fail
+if two artifacts have the same name. Runtime model IDs and inference routing
+use the catalog name; a separate hash tracks the artifact and profile drift.
 
 ## Storage and workspace
 
@@ -207,9 +204,8 @@ uv run mfq serve \
   --work-dir /srv/mfq-work
 ```
 
-Use dedicated writable paths for long-running deployments. The database path,
-work directory, and model paths are resolved to absolute paths before the
-server starts.
+For long-running servers, place the database and work directory on writable,
+persistent paths. MFQ resolves database, work, and model paths before startup.
 
 ## Runtime controls
 

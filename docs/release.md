@@ -1,12 +1,11 @@
 # Self-contained releases
 
-MFQ provides self-contained desktop releases for macOS and Windows. Release build
-scripts live in `release/`; run them from that directory. Build artifacts are
-written to `release/dist/`.
-End users should not need a separate server, Python environment, CUDA Toolkit,
-quantizer CLI, inference CLI, llama.cpp checkout, MLX runtime, or shader library.
-Native runtime binaries are packaged as private sidecars and are managed by
-`mfq serve` or MFQ Studio.
+MFQ desktop releases support macOS and Windows. Build scripts live in
+`release/` and write artifacts to `release/dist/`.
+
+The packages include the server, Python environment, native runtime, and
+required runtime libraries. `mfq serve` or MFQ Studio manages the native
+sidecars.
 
 ## macOS
 
@@ -54,14 +53,13 @@ targets NVIDIA compute capability 8.6. Override release inputs when needed:
 .\build_release_windows.ps1 -CudaArchitectures 89 -Jobs 2
 ```
 
-The installer is intended for 64-bit Windows systems with a compatible NVIDIA
-GPU and driver. CUDA runtime DLLs are copied from the build machine's CUDA
-Toolkit; the Toolkit is not required on the end-user machine.
+The installer supports 64-bit Windows with a compatible NVIDIA GPU and driver.
+It bundles CUDA runtime DLLs from the build machine, so users do not need the
+CUDA Toolkit.
 
 ## Runtime behavior
 
-MFQ Studio starts a local `mfq serve` instance without loading a model. Users can
-select, load, unload, or replace `.mfq` models from the catalog or native file
-picker. Studio registers external model paths in its private application-data
-catalog without copying model files; selecting one shard registers the complete
-sibling shard family.
+MFQ Studio starts `mfq serve` locally without a model. The catalog and native
+file picker can load, unload, or replace `.mfq` models. Studio records external
+paths without copying files; selecting one shard registers the full sibling
+shard family.

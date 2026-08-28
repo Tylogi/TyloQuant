@@ -8,9 +8,7 @@
 
 **Every Bit. Maximum Fidelity.**
 
-**Carry more intelligence in fewer bits, enabling frontier models to run efficiently across hardware and on every device.**
-
-NINT · NVQ/NPQ · NEPQ · TPQ · Expert-Wise MoE · CUDA/C++ Runtime
+NINT · NVQ/NPQ · NEPQ · TPQ · Expert-Wise MoE · CUDA · Metal · C++ Runtime
 
 </div>
 
@@ -22,7 +20,7 @@ NINT · NVQ/NPQ · NEPQ · TPQ · Expert-Wise MoE · CUDA/C++ Runtime
   <a href="https://huggingface.co/Tylogi">Hugging Face Models</a> · <a href="https://www.modelscope.cn/profile/Tylogi">ModelScope Models</a>
 </p>
 
-## Results at a Glance
+## Results
 
 ### DeepSeek-V4-Flash-0731
 
@@ -31,11 +29,11 @@ NINT · NVQ/NPQ · NEPQ · TPQ · Expert-Wise MoE · CUDA/C++ Runtime
 **Evaluation:** Official 0731 weights on WikiText-2, covering 573 chunks and
 146,115 scored tokens at `ctx=512`.
 
-| Released tier | Size | Mean KLD ↓ | Same-top ↑ |
-|---|---:|---:|---:|
-| S | 77.519 GiB | `0.313576` | `82.2913%` |
-| M | 88.007 GiB | `0.244488` | `84.5300%` |
-| L | 98.007 GiB | `0.201444` | `86.0753%` |
+| Released tier |       Size |  Mean KLD ↓ |  Same-top ↑ |
+| ------------- | ---------: | -----------: | -----------: |
+| S             | 77.519 GiB | `0.313576` | `82.2913%` |
+| M             | 88.007 GiB | `0.244488` | `84.5300%` |
+| L             | 98.007 GiB | `0.201444` | `86.0753%` |
 
 **Nearest-size comparison:** Against the three closest-size Unsloth Dynamic
 (UD) baselines, MFQ reduces Mean KLD by **34.24–51.42%**.
@@ -64,8 +62,8 @@ NINT · NVQ/NPQ · NEPQ · TPQ · Expert-Wise MoE · CUDA/C++ Runtime
 **TyloQuant MFQ** (or **MFQ**) co-designs quantization formats, precision
 allocation, and inference kernels for high-fidelity LLM deployment. It supports
 custom weight encodings from `0.84-8.30 bpw`, allocates precision per compute
-group or MoE expert, and executes packed weights directly through CUDA kernels
-and a C++ runtime.
+group or MoE expert, and executes packed weights directly through native CUDA
+and Metal paths backed by a C++ runtime.
 
 Public MFQ models use a unified `V`/`S` naming scheme: vector-quantized models
 matched to llama.cpp `IQ*` use `V`, while scalar-quantized models matched to
@@ -76,34 +74,61 @@ matched to llama.cpp `IQ*` use `V`, while scalar-quantized models matched to
 
 ### Requirements
 
+#### Common
+
 - Git
 - [uv](https://docs.astral.sh/uv/)
-- CMake and a native C++ toolchain
-- Node.js and npm for the browser Web UI
-- NVIDIA GPU and CUDA toolkit for CUDA acceleration on Windows or Linux
-- Apple silicon for Metal acceleration on macOS
+- CMake `>=3.26` and a native C++ toolchain
+
+#### Inference backend (choose one)
+
+- **CUDA:** Linux or Windows, an NVIDIA GPU, and CUDA Toolkit `>=12` with
+  `nvcc`, cuBLAS, and the CUDA runtime.
+- **Metal:** Apple silicon and macOS; the `metal` extra supplies MLX and its
+  native runtime assets.
+
+#### Optional
+
+- Node.js and npm are needed only when MFQ builds the browser Web UI from
+  source. Without them, `mfq serve` can still expose the API.
+
+`uv` automatically provisions the Python `>=3.10` runtime required by MFQ when
+needed; no separate Python installation is required.
 
 ### Install from source
 
-`mfq` is the only public CLI. Use the same commands in Windows PowerShell,
-macOS Terminal, or a Linux shell:
+Use `mfq` for all CLI commands. In PowerShell, put multi-line commands on one
+line or replace each trailing `\` with a backtick.
 
 ```shell
-git clone https://github.com/mfq/mfq.git MFQ
+git clone https://github.com/Tylogi/TyloQuant.git MFQ
 cd MFQ
-# CUDA inference (Windows or Linux; no PyTorch/LibTorch required)
-uv sync --extra daemon
-
-# Metal inference (Apple silicon)
-uv sync --extra daemon --extra metal
-uv run mfq build
 ```
 
-Training and calibration are separate development workflows. Install their
-extras only on machines that use them:
+#### CUDA (Windows or Linux)
+
+Native CUDA inference does not require PyTorch or LibTorch.
 
 ```shell
-uv sync --extra train --extra calibration
+uv sync --extra daemon
+uv run mfq build --backend cuda
+```
+
+#### Metal (Apple silicon)
+
+```shell
+uv sync --extra daemon --extra metal
+uv run mfq build --backend metal
+```
+
+Add the offline workflow extras on machines that need them:
+
+```shell
+# CUDA
+uv sync --extra daemon --extra train --extra calibration
+
+# Apple silicon
+uv sync --extra daemon --extra metal --extra train --extra calibration
 ```
 
 `mfq build` detects the host OS and accelerator. To customize CMake
@@ -113,75 +138,75 @@ configuration, put extra arguments after `--`:
 uv run mfq build -- -DCMAKE_CUDA_ARCHITECTURES=90
 ```
 
-After a successful build, `mfq` records the actual artifact and build recipe in
-its managed manifest. `mfq serve` therefore finds builds made with a custom
-`--build-dir` automatically and can recreate a missing artifact with the same
-configuration.
+`mfq build` records the executable and CMake options in
+`build/mfq-runtime.json`. `mfq serve` reuses that build, including a custom
+`--build-dir`, and rebuilds it if the executable is missing.
 
 Verify the installation:
 
 ```shell
 uv run mfq --help
-uv run mfq quantize --help
+uv run mfq build --help
 ```
 
-### Quantization
+## Quick Start
 
-`mfq quantize` is the stable quantization entry point. It auto-detects an HF
-safetensors directory, a full-precision MFQ, or a full-precision GGUF and calls
-the existing production converter directly:
-
-`mfq calibrate` creates calibration artifacts, including reusable importance
-matrices for `mfq quantize --imatrix`.
+Start an empty server:
 
 ```shell
-# Copy HF native storage exactly into a full-precision MFQ. BF16 stays BF16;
-# block FP8/MXFP4 values and their E8M0 scales remain self-contained and exact.
-# This command performs no MFQ quantization.
-uv run mfq quantize model-hf model-full.mfq --full-precision
-
-# Quantize that full-precision MFQ through the same NINT/VQ/NPQ/NEPQ/TPQ path.
-uv run mfq quantize model-full.mfq model-NINT3.mfq \
-  --bits 3 --groupsize 24 --sub-bits 5 --backend cpu --device cpu
-
-# Mixed recipe from a BF16 GGUF source
-uv run mfq quantize model-bf16.gguf model-S4-L.mfq \
-  --recipe quantization-recipe.gguf --imatrix imatrix.gguf \
-  --q8-mode nint8-0 --device cuda
-
-# HF source with an expert-wise precision scheme
-uv run mfq quantize model-hf model-EW.mfq \
-  --recipe quantization-recipe.gguf --ew-scheme expert-precision.json
-
-# Add the complete MTP head from the original BF16 checkpoint to an existing
-# quantized model. The backbone blobs stay byte-identical; each MTP decoder
-# projection mirrors the corresponding final backbone layer precision.
-uv run mfq quantize model-hf model-with-MTP.mfq \
-  --base-mfq model-quantized.mfq --backend metal --device mps
-
-# Collect a reusable activation imatrix from the prepared corpus. CUDA uses
-# FP64 accumulation by default; Apple silicon uses BF16 forward + FP32 Metal
-# accumulation. The output is accepted directly by `mfq quantize --imatrix`.
-uv run mfq calibrate imatrix \
-  --model model-hf --corpus calibration-corpus \
-  --output calibration.imatrix --backend cuda
-
-uv run mfq calibrate imatrix \
-  --model model-hf --corpus calibration-corpus \
-  --output calibration.imatrix --backend metal
-
-# Important Neurons (IN); layer count is read from the recipe when possible
-uv run mfq quantize model-bf16.gguf model-IN.mfq \
-  --recipe quantization-recipe.gguf --imatrix imatrix.gguf \
-  --important-neurons 1024 --target-size 15G
+uv run mfq serve
 ```
+
+Open <http://127.0.0.1:8090/>. Check the API from another terminal:
+
+```shell
+curl http://127.0.0.1:8090/health
+```
+
+Download an MFQ file from [Hugging Face](https://huggingface.co/Tylogi) or
+[ModelScope](https://www.modelscope.cn/profile/Tylogi). Load it from the Studio
+model catalog, or restart the server with the model path:
+
+```shell
+uv run mfq serve --model /absolute/path/to/model.mfq
+```
+
+Open the Web UI after the model status changes to `ready`. The
+[`mfq serve` reference](./docs/cli/serve.md) covers model directories,
+authentication, and API access.
+
+## Quantization
+
+`mfq quantize` accepts an HF safetensors directory, a full-precision MFQ, or a
+full-precision GGUF. In a quantization-only checkout, install the `train`
+extra:
+
+```shell
+uv sync --extra train
+```
+
+Quantize an HF checkpoint to uniform NINT4:
+
+```shell
+uv run mfq quantize model-hf model-NINT4.mfq \
+  --bits 4 --groupsize 24 --sub-bits 6 --backend auto
+```
+
+Copy the source checkpoint into a full-precision MFQ without quantizing it:
+
+```shell
+uv run mfq quantize model-hf model-full.mfq --full-precision
+```
+
+[`mfq quantize`](./docs/cli/quantize.md) covers mixed GGUF recipes,
+Expert-Wise overrides, MTP augmentation, Important Neurons, sharding, and
+restart controls. [`mfq calibrate`](./docs/cli/calibrate.md) covers activation
+imatrices and calibration.
 
 ## Web UI
 
-`mfq serve` builds or updates the runtime when needed and starts the API and Web
-UI. It is the only server entry point; the native C++ worker stays private and
-is managed by the CLI. Start empty and load a model from the catalog, or provide
-an initial model on the command line:
+`mfq serve` runs the public API and Web UI and manages the private C++ worker.
+It can start empty or load a model at startup:
 
 ```shell
 uv run mfq serve
@@ -192,110 +217,93 @@ uv run mfq serve --model-dir path/to/models --host 127.0.0.1 --port 8090
 `--host` and `--port` control the public API listener and default to
 `127.0.0.1:8090`. Open the Web UI address printed by the command.
 
-The desktop Studio Models and jobs page can also select and load any local
-`.mfq` file. Studio registers the selected path in its private model catalog
-without copying the model; selecting one shard loads its complete sibling shard
-family.
+The desktop Studio **Models and jobs** page loads any local `.mfq` file without
+copying it. Selecting one shard loads the full sibling shard family.
 
-<img src="./docs/figures/tyloquant-mfq-webui-english.jpg" alt="TyloQuant MFQ local inference WebUI in English" width="100%">
+<img src="./docs/figures/tyloquant-mfq-webui-english.png" alt="TyloQuant MFQ local inference WebUI in English" width="100%">
 
 ## How It Works
 
-| Layer | Design | Purpose |
-|---|---|---|
-| Weight formats | NINT, NVQ, NPQ, NEPQ, TPQ | Quality tiers from 8 bit to below 1 bit |
-| Dense allocation | Importance-aware allocation | Select precision per compute group |
-| MoE allocation | Expert-Wise Precision | Spend bitrate on experts with higher expected output contribution |
-| Expert container | NINTM v2 | Store heterogeneous formats in one MoE tensor |
-| Runtime assets | Reserved `BLOB` records | Keep config, tokenizer, chat template, and special-token metadata in the MFQ file |
-| Inference | CUDA kernels + C++ runtime | Execute packed weights without materializing full FP16 weights |
+| Layer            | Design                           | Purpose                                                                           |
+| ---------------- | -------------------------------- | --------------------------------------------------------------------------------- |
+| Weight formats   | NINT, NVQ, NPQ, NEPQ, TPQ        | Quality tiers from 8 bit to below 1 bit                                           |
+| Dense allocation | Importance-aware allocation      | Select precision per compute group                                                |
+| MoE allocation   | Expert-Wise Precision            | Spend bitrate on experts with higher expected output contribution                 |
+| Expert container | NINTM v2                         | Store heterogeneous formats in one MoE tensor                                     |
+| Runtime assets   | Reserved `BLOB` records          | Keep config, tokenizer, chat template, and special-token metadata in the MFQ file |
+| Inference        | CUDA/Metal kernels + C++ runtime | Execute packed weights without materializing full FP16 weights                    |
 
-NINT shares high-level affine metadata along an output-neuron row and spends
-the saved budget on shorter local groups. Below 4 bit, NVQ, NPQ, and NEPQ use
-short vector codes and expert-aware codebook sharing. The allocator then chooses
-formats under a real byte budget, while NINTM groups compatible experts for
-direct packed execution.
+NINT shares affine metadata across each output row, leaving more space for
+short local groups. Below 4 bit, NVQ, NPQ, and NEPQ use short vector codes and
+expert-aware codebook sharing. The allocator works from serialized byte size,
+and NINTM groups compatible experts for packed execution.
 
 ## Current Scope
 
-### Models and architectures
-
-- Qwen3.5 full attention and linear attention/GDN
-- Qwen3.6 routed MoE
-- Gemma4 GeGLU, sliding-window attention, and routed MoE
-- DeepSeek-V4-Flash HCA/CSA/mHC and MoE
-- MiniCPM-o 4.5 official composite Python graph with MFQ-backed CUDA matrix
-  modules
-
-### Conversion, packaging, and serving
-
-- NINTM v2 mixed-family HF/GGUF streaming conversion
-- Self-contained MFQ files with embedded runtime config and GGUF tokenizer
-  metadata
-- Numbered MFQ shards with direct quantizer output and transparent Python/C++
-  loading
-- OpenAI-compatible chat/completions API with SSE
-
-### Runtime status
-
 > [!NOTE]
-> CUDA inference is currently a single-GPU research prototype.
+> Runtime support is experimental. CUDA uses one GPU by default.
 
-**Apple silicon / Metal**
+- `End-to-end`: native MFQ loading, prefill, decode, and generation.
+- `Partial`: architecture-specific components without a complete public model
+  runtime.
+- `Dedicated`: a separate TPQ/MFQ execution path.
 
-- **Matrix compute:** packed NINT/NVQ/NPQ/NEPQ group-vectorized GEMV;
-  `qmv_wide` small-M MMQ; online-decode `simdgroup_matrix` GEMM; and temporary
-  dequantization plus MLX GEMM beyond the measured large-M crossover.
-- **Fused and heterogeneous execution:** fused SwiGLU for compatible
-  NINT/VQ-family gate/up projections; single-dispatch heterogeneous NINTM/NEPQ
-  routing; and mixed-format QKV/FFN projection groups in one heterogeneous
-  Metal dispatch.
-- **Attention and state:** MHA/GQA/MQA, dynamic and sliding-window KV caches,
-  fused SSM/GDN kernels, GLM DSA/sparse MLA, and DeepSeek-V4
-  compression/indexer/sparse-attention/HC kernels.
-- **TPQ:** TPQ-I4G64, TPQ-X/W/V/VV, and three-projection TPQ-P kernels with
-  p8-p16 indices.
-- **Kimi-K3:** KDA/MLA, Attention-Residual, SiTU MoE, cache, and generation
-  graph.
-- **Sampling:** GPU-resident greedy, softmax, top-k/top-p, and sampling-penalty
-  kernels.
+| Model or family   | Conversion and packaging           | CUDA inference | Metal inference | Scope or current limitation                         |
+| ----------------- | ---------------------------------- | -------------- | --------------- | --------------------------------------------------- |
+| Qwen3.5           | HF/GGUF/full-precision MFQ         | End-to-end     | End-to-end      | Full/linear hybrid CausalLM                         |
+| Qwen3.6           | HF/GGUF/full-precision MFQ         | Partial        | Partial         | Routed-MoE components; no public end-to-end runtime |
+| Gemma4            | HF/GGUF and sharded MFQ            | End-to-end     | End-to-end      | Mixed full/sliding attention                        |
+| DeepSeek-V4-Flash | HF/GGUF, Expert-Wise MFQ, and TPQ  | End-to-end     | End-to-end      | Compression, indexer, and sparse-attention paths    |
+| MiniCPM-o 4.5     | Official composite HF graph to MFQ | End-to-end     | End-to-end      | Official model directory required at runtime        |
+| GLM-MoE-DSA       | Native MFQ and mixed precision     | End-to-end     | End-to-end      | Dense/sparse MLA paths                              |
+| Kimi-K3           | TPQ/MFQ packaging                  | Dedicated      | Dedicated       | TPQ/MFQ execution path only                         |
 
-**End-to-end model runtimes**
+Shared features:
 
-- **Qwen3.5:** full/linear hybrid CausalLM prefill, decode, and generation.
-- **DeepSeek-V4:** native MFQ loading; compressed, local, and indexer caches;
-  mmap-backed bounded expert residency; prefill; decode; and generation.
-- **Gemma4:** self-contained sharded-MFQ loading; mixed full/sliding attention;
-  fused norm/GeGLU/MoE; cache; and generation.
-- **GLM-MoE-DSA:** native loading, shared indexer state, dense/sparse MLA, cache,
-  and generation.
+- NINTM v2 streaming conversion;
+- self-contained and sharded MFQ files;
+- Python/C++ loading;
+- OpenAI-compatible APIs with SSE.
+
+Kernel and model details: [runtime support matrix](./docs/runtime-support.md).
 
 ## Documentation
 
-- [MiniCPM-o 4.5 Python Runtime](./docs/minicpmo45.md)
-- [Expert-Wise Joint Budget Solver](./docs/ew-joint-solver.md)
+### CLI and serving
+
+- [`mfq build`](./docs/cli/build.md)
+- [`mfq quantize`](./docs/cli/quantize.md)
+- [`mfq calibrate`](./docs/cli/calibrate.md)
 - [`mfq serve` and model management](./docs/cli/serve.md)
+- [HTTP API](./docs/api/http.md)
+- [WebSocket API](./docs/api/websocket.md)
+
+### Runtime and validation
+
+- [Runtime support matrix](./docs/runtime-support.md)
+- [Runtime sampling profiles](./docs/runtime-sampling-profiles.md)
+- [Native CUDA runtime validation](./docs/cuda-native-runtime-validation.md)
+
+### Quantization and model integrations
+
+- [Expert-Wise Joint Budget Solver](./docs/ew-joint-solver.md)
+- [MiniCPM-o 4.5 Runtime](./docs/minicpmo45.md)
 - [Self-contained releases](./docs/release.md)
 
 ## Acknowledgements
 
-MFQ benefits from the outstanding work of the open-source AI community. We
-especially thank:
+MFQ builds on:
 
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) for the GGUF ecosystem,
-  optimized inference backends, and evaluation tooling that underpin important
-  parts of MFQ interoperability and validation.
-- [oMLX](https://github.com/jundot/omlx) for its excellent Apple silicon
-  inference engineering and valuable performance and design references.
-- [MLX](https://github.com/ml-explore/mlx) for the Apple silicon array framework
-  and Metal runtime used by MFQ's native macOS path.
+- [llama.cpp](https://github.com/ggml-org/llama.cpp): GGUF interoperability,
+  inference backends, and evaluation tools.
+- [oMLX](https://github.com/jundot/omlx): Apple silicon performance and runtime
+  design references.
+- [MLX](https://github.com/ml-explore/mlx): the array framework and Metal
+  runtime used by the macOS path.
 - [PyTorch](https://github.com/pytorch/pytorch) and
-  [Transformers](https://github.com/huggingface/transformers) for core research,
-  model integration, and quantization infrastructure.
-- [Unsloth](https://github.com/unslothai/unsloth) for openly released Dynamic
-  quantization models and reproducible comparison baselines.
-
-We are grateful to their maintainers and contributors for making
-high-performance local inference more accessible.
+  [Transformers](https://github.com/huggingface/transformers): model integration
+  and quantization infrastructure.
+- [Unsloth](https://github.com/unslothai/unsloth): Dynamic quantization models
+  used as comparison baselines.
 
 License: [Apache License 2.0](./LICENSE).

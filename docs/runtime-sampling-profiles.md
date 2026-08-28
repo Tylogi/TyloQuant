@@ -1,8 +1,8 @@
 # Runtime sampling profiles
 
 MFQ runtime sampling profiles are versioned, partial JSON objects. Missing
-fields are not serialized as generic defaults. This lets a newer runtime add
-defaults without rewriting existing model files.
+fields are not serialized, so runtimes can add defaults without rewriting model
+files.
 
 The effective value of each field is resolved independently, from highest to
 lowest priority:
@@ -16,12 +16,12 @@ lowest priority:
 7. The runtime's generic default.
 
 An unsharded `model.mfq` accepts `model.runtime.json` and
-`model.mfq.runtime.json`. A sharded model such as
-`model-00001-of-00008.mfq` accepts the family sidecar `model.runtime.json` and
-an optional exact-shard sidecar. The exact sidecar wins over the family
-sidecar. Global embedded metadata is stored in shard zero, while both native
-loaders canonicalize shard zero even if another shard was passed on the
-command line.
+`model.mfq.runtime.json`.
+
+A sharded model such as `model-00001-of-00008.mfq` accepts the family sidecar
+`model.runtime.json` and an optional shard-specific sidecar. The shard-specific
+file wins. Embedded global metadata lives in shard zero; both native loaders
+find shard zero even when given another shard.
 
 Example:
 

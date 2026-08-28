@@ -7,13 +7,13 @@ replaces supported `Linear` and `Embedding` weights with packed operators. The
 native paths implement SigLIP, the Resampler, Whisper, the Qwen3-8B language
 backbone, TTS, attention masks, and streaming caches directly.
 
-This path requires the official model directory at runtime. The directory
-provides the tokenizer, processor, remote-code definitions, and Token2wav
-assets. These assets are not copied into the MFQ weight file.
+The runtime requires the official model directory for its tokenizer, processor,
+remote-code definitions, and Token2wav assets. MFQ does not copy those assets
+into the weight file.
 
 ## Environment
 
-Use the official dependency versions through the optional extra:
+Install the model-specific extra:
 
 ```bash
 pip install -e ".[minicpmo45]"
@@ -43,8 +43,8 @@ uv run -m mfq.tools.quantize_hf_to_mfq \
 The MiniCPM-o 4.5 policy keeps all six checkpoint roots: `llm`, `vpm`, `apm`,
 `resampler`, `audio_projection_layer`, and `tts`. In the official checkpoint,
 710 module matrices are quantized and 704 tensors retain their source BF16
-representation. The following raw matrices stay dense because the official
-graph accesses them directly:
+representation. These matrices stay dense because the official graph accesses
+them directly:
 
 - Whisper and SigLIP position embeddings
 - Resampler query, output projection, and packed MultiheadAttention projections
@@ -52,8 +52,8 @@ graph accesses them directly:
 
 The converter rejects unsupported compact raw parameters during runtime load.
 
-To reproduce the tensor precision allocation from an official language-model
-GGUF while keeping the complete MiniCPM-o graph, pass it as a recipe:
+Pass a language-model GGUF as a recipe to reuse its tensor precisions while
+keeping the full MiniCPM-o graph:
 
 ```bash
 uv run -m mfq.tools.quantize_hf_to_mfq \
@@ -93,42 +93,41 @@ Whisper, the audio projector, Qwen3, and the TTS code decoder. The same graph is
 available on Apple platforms through `MlxMiniCPMO45Runtime`; the Metal HTTP
 server loads the full visual graph for MiniCPM-o models.
 
-MFQd is the shared processor boundary for HTTP image and video input. It ports
-the official MiniCPM-o image processor exactly: optional 448-pixel slicing,
-bicubic resize, `[0, 1]` conversion, mean/std normalization, 14-pixel patch
-packing, contiguous patch masks, and 64-query placeholders. Video is decoded
-at one frame per second with no per-frame slicing. MFQd sends the same versioned
-`pixel_values`, `patch_mask`, and `target_sizes` package to CUDA and Metal. The
-native server applies the model chat template, tokenizes it, derives
-`image_bounds` from `<image>` and `<slice>` spans, and then injects Resampler
-outputs into the Qwen3 prefill graph. This keeps tokenizer behavior native while
-ensuring both device backends receive identical processor tensors.
+MFQd applies the MiniCPM-o image pipeline to HTTP input:
 
-The CUDA tensor interface reads tensors produced by the official processor
-from files sharing an input prefix:
+- optional 448-pixel slicing;
+- bicubic resize and `[0, 1]` conversion;
+- mean/std normalization;
+- 14-pixel patch packing and contiguous patch masks;
+- 64-query placeholders.
 
-The converter embeds the official NumPy-generated Resampler position table as
-a versioned BF16 runtime asset. The C++ graph requires this asset so
-cross-attention does not depend on platform-specific sin/cos rounding.
+Video is decoded at one frame per second without per-frame slicing. CUDA and
+Metal receive the same versioned `pixel_values`, `patch_mask`, and
+`target_sizes`. The native server applies the chat template, tokenizes it,
+derives `image_bounds` from `<image>` and `<slice>` spans, and injects Resampler
+outputs into Qwen3 prefill.
+
+The converter embeds the NumPy-generated Resampler position table as a
+versioned BF16 runtime asset, avoiding platform-dependent sin/cos rounding in
+cross-attention.
+
+The CUDA diagnostic interface reads files with a shared prefix:
 
 - `<prefix>.input_ids.pt` is required.
 - `<prefix>.position_ids.pt` and `<prefix>.attention_mask.pt` are optional.
-  Supplying them preserves the official per-batch RoPE positions and padding
-  mask; omitted position IDs use consecutive cache positions.
+  Supplying them preserves per-batch RoPE positions and the padding mask;
+  omitted position IDs use consecutive cache positions.
 - Image input uses `pixel_values`, `patch_mask`, `target_sizes`, and
   `image_bounds` files. Bounds have rows `[batch, source, begin, end]`.
 - Audio input uses `audio_features`, `audio_lengths`, and `audio_bounds` files
   with the same bound layout.
-- TTS accepts `tts_inputs_embeds` directly, or derives the condition from the
-  LLM hidden states selected by the two-element `tts_bound` tensor.
+- TTS accepts `tts_inputs_embeds` directly, or derives the condition from LLM
+  hidden states selected by the two-element `tts_bound` tensor.
 
-Each name above uses the `.pt` suffix. Run the graph with:
-
-The suffix is retained for CLI compatibility, but the self-contained CUDA
-runtime reads and writes MFQ's `MFQTNSR1` tensor envelope rather than a Python
-pickle. Files created by `torch.save` remain available through the optional
-`mfq-decode-torch` A/B runtime. Normal image, audio, and video requests through
-MFQd do not use this diagnostic file interface.
+The `.pt` suffix is kept for CLI compatibility. The self-contained CUDA runtime
+uses MFQ's `MFQTNSR1` envelope, not Python pickle. Files written by `torch.save`
+work only with the optional `mfq-decode-torch` A/B runtime. Normal MFQd image,
+audio, and video requests do not use this diagnostic interface.
 
 ```bash
 mfq-decode \
@@ -138,14 +137,12 @@ mfq-decode \
   --minicpmo-tts-steps 2
 ```
 
-The output prefix receives component states, merged input embeddings, Qwen3
-hidden states and logits, plus TTS code logits and generated codes when TTS is
-enabled. Qwen3 and TTS keep the official BF16 projection, SDPA, residual, and
-KV-cache boundaries. TTS code generation uses the official default
-temperature, top-p, top-k, 16-token repetition penalty, minimum length, and
-multinomial sampling. The native graph produces S3 audio codes. Token2wav
-waveform rendering still uses the assets supplied with the official model
-directory.
+The output prefix contains component states, merged input embeddings, Qwen3
+hidden states and logits, and—when enabled—TTS logits and generated codes.
+Qwen3 and TTS keep the BF16 projection, SDPA, residual, and KV-cache boundaries.
+TTS uses the model's default temperature, top-p, top-k, 16-token repetition
+penalty, minimum length, and multinomial sampling. The graph produces S3 audio
+codes; Token2wav renders them with assets from the official model directory.
 
 ## Native full-duplex session
 
@@ -225,32 +222,34 @@ mfq-minicpmo-realtime \
   --port 8090
 ```
 
-Open `http://127.0.0.1:8090/` for the standard MFQ WebUI. When the loaded model
-advertises realtime audio capability, a small voice control and a playback
-toggle appear in the existing chat composer. Text responses, when present, are
-added to the current conversation. Audio responses are always produced and
-delivered; the playback toggle only controls whether the browser plays them in
-real time. The gateway keeps the normal chat, monitoring, settings, and
-model-reload UI intact and proxies their HTTP API requests to the native worker.
-Voice sessions use the current official MiniCPM-o Demo defaults: one 16 kHz
-audio unit per second, three initial force-listen units, at most 20 generated
-text tokens per unit, temperature 0.7, top-k 20, top-p 0.8, repetition penalty
-1.05 over 512 tokens, and turn length penalty 1.05. The TTS decoder uses
-temperature 0.8 and repetition penalty 1.05; Token2wav uses 10 flow steps and
-the browser buffers 200 ms before playback. The WebUI uses the official
-language-specific Chinese or English duplex prompt unless the user supplies a
-custom system prompt. Generic chat sampling controls do not override these
-voice defaults. The gateway selects CUDA for Token2wav when available, followed
-by Apple MPS and CPU.
+Open `http://127.0.0.1:8090/`. Realtime-capable models add voice and playback
+controls to the chat composer. Text is added to the conversation. Audio is
+always generated; the playback toggle only controls browser playback. Other UI
+pages proxy their API requests to the native worker.
 
-Its additional public media protocol is
-`WS /v1/realtime?mode=audio`: clients send base64 float32 mono PCM at 16 kHz and
-receive independent text deltas and base64 float32 mono PCM at 24 kHz. The
-gateway uses the official exact streaming Mel geometry, including the 1030 ms
-first window and two-frame CNN boundary context. It renders S3 codes with the
-official Flow and HiFT weights on MPS, with CPU fallback when MPS is unavailable.
-The first TTS chunk follows the official early-flush path; later chunks retain
-three S3 lookahead codes and consume 25 codes at a time.
+Voice defaults match the MiniCPM-o demo:
+
+- one 16 kHz audio unit per second;
+- three initial force-listen units;
+- at most 20 generated text tokens per unit;
+- temperature 0.7, top-k 20, and top-p 0.8;
+- repetition penalty 1.05 over 512 tokens;
+- turn length penalty 1.05.
+
+TTS uses temperature 0.8 and repetition penalty 1.05. Token2wav uses 10 flow
+steps, and the browser buffers 200 ms before playback. The Web UI selects the
+Chinese or English duplex prompt unless the user sets a system prompt. Generic
+chat sampling options do not change these voice defaults. Token2wav prefers
+CUDA, then Apple MPS, then CPU.
+
+The media protocol is `WS /v1/realtime?mode=audio`. Clients send base64 float32
+mono PCM at 16 kHz and receive separate text deltas and base64 float32 mono PCM
+at 24 kHz.
+
+Streaming Mel uses a 1030 ms first window and two frames of CNN boundary
+context. Flow and HiFT render S3 codes on MPS, with CPU fallback. The first TTS
+chunk uses early flush; later chunks keep three S3 lookahead codes and consume
+25 codes at a time.
 
 The current public media gateway is audio-only. Native callers can still use
 the composite graph interfaces for image and mixed-modality requests. Quality

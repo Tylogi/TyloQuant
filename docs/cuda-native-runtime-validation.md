@@ -44,13 +44,11 @@ parameters. Start each executable in a fresh process.
 | Execution | eager, CUDA Graph capture/replay, one and multiple CUDA streams, one GPU, and tensor parallel when NCCL is present |
 | Media | text, image, video, audio, half duplex, and full duplex |
 
-Capture raw logits from both executables at prefill and at every decode step.
-Custom packed kernels should retain their existing numerical contract because
-their device bodies are unchanged. Generic tensor reductions and cuBLAS calls
-may use a different reduction tree than ATen, so acceptance is based on the
-model's established logit tolerance plus identical greedy tokens, not an
-unsupported claim of universal bit identity. Any token divergence must be
-explained before the candidate branches are merged.
+Capture raw logits from both executables at prefill and every decode step. The
+packed kernel bodies are unchanged and keep their existing numerical contract.
+Generic reductions and cuBLAS may use a different reduction tree from ATen.
+Accept results only when logits stay within the model's established tolerance
+and greedy tokens match. Explain any token divergence before merging.
 
 Also compare peak device memory, host memory, model-load time, prefill speed,
 and decode speed. The native runtime is rejected if it introduces a material

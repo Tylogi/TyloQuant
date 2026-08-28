@@ -1,95 +1,101 @@
-# 📖 MFQ Server WebSocket API 文档
+# MFQ Server WebSocket API
 
-MFQ Server 当前暴露两个 WebSocket 路径。用于原生实时音频的
-<code>/api/v1/runtime/realtime</code> 是一个双向透明代理；历史的
-<code>/api/v1/realtime</code> 已保留路由，但当前实现会明确拒绝连接。
+MFQ Server has two WebSocket paths. `/api/v1/runtime/realtime` proxies native
+realtime audio in both directions. The legacy `/api/v1/realtime` route remains
+registered but rejects connections.
 
-默认服务地址：
+Default server address:
 
-~~~
+```text
 ws://127.0.0.1:8090
-~~~
+```
 
-这两个路径没有作为 OpenAPI <code>paths</code> 操作描述。不过，已提交的 OpenAPI 契约在
-<code>x-mfq-websocket</code> 扩展中记录了旧
-<code>/api/v1/realtime</code> 的 RealtimeFrame schema 和事件集合；可用的
-<code>/api/v1/runtime/realtime</code> 是无类型透明代理，须以当前原生后端协议为准。
-HTTP 接口、普通 SSE 生成流和作业 SSE 请参阅 <code>docs/api/http.md</code>。
+OpenAPI does not list either path as an operation. Its `x-mfq-websocket`
+extension records the legacy `/api/v1/realtime` frame schema and events.
+`/api/v1/runtime/realtime` is an untyped proxy and follows the active native
+backend's protocol. HTTP endpoints and SSE are documented in the
+[HTTP API](http.md).
 
-## 1. 连接与认证
+## 1. Connection and authentication
 
-### 1.1 URL
+### 1.1 URLs
 
-| 路径 | 状态 | 用途 |
-| :--- | :--- | :--- |
-| <code>ws://127.0.0.1:8090/api/v1/runtime/realtime?mode=audio</code> | 可用（取决于后端） | 将浏览器或客户端的文本/二进制帧双向代理到当前原生运行时。 |
-| <code>ws://127.0.0.1:8090/api/v1/realtime</code> | 当前不可用 | 认证成功后服务端以 1013 关闭。不可作为实时客户端入口。 |
+| URL | Status | Purpose |
+|---|---|---|
+| `ws://127.0.0.1:8090/api/v1/runtime/realtime?mode=audio` | Backend-dependent | Proxies text and binary frames bidirectionally between the client and the active native runtime. |
+| `ws://127.0.0.1:8090/api/v1/realtime` | Currently unavailable | Closes with code 1013 after successful authentication; do not use it as a realtime client entry point. |
 
-生产环境使用 TLS 时，将 <code>ws</code> 替换为 <code>wss</code>。
+Use `wss` instead of `ws` when TLS terminates at the server or reverse proxy.
 
-### 1.2 认证
+### 1.2 Authentication
 
-没有配置 API 密钥时，两个路径均无需认证。配置 API 密钥后，客户端须提供具有
-<code>inference</code>（或 <code>admin</code>）scope 的凭据。优先使用 Header：
+When no API key is configured, neither path requires authentication. When API
+keys are enabled, the client must provide a credential with the `inference` or
+`admin` scope. Prefer the authorization header:
 
-~~~
+```http
 Authorization: Bearer <token>
-~~~
+```
 
-无法设置 WebSocket Header 的浏览器客户端可使用查询参数：
+Browser clients that cannot set WebSocket headers may use the query parameter:
 
-~~~
+```text
 ws://127.0.0.1:8090/api/v1/runtime/realtime?mode=audio&access_token=<token>
-~~~
+```
 
-仅在 Header 未提供 Bearer token 时，服务端才读取 <code>access_token</code>。因为查询字符串
-容易被日志和代理记录，应优先使用 Header 或短期凭据。
+The server reads `access_token` only when no bearer token is present in the
+header. Query strings are commonly recorded by logs and proxies, so prefer a
+header or a short-lived credential.
 
-认证失败时服务端关闭连接：
+Authentication failure closes the connection with:
 
-| close code | reason |
-| :--- | :--- |
-| <code>1008</code> | <code>invalid API credential</code> |
+| Close code | Reason |
+|---|---|
+| `1008` | `invalid API credential` |
 
-### 1.3 mode 参数和连接失败
+### 1.3 Mode and connection failures
 
-<code>/api/v1/runtime/realtime</code> 只接受 <code>mode=audio</code>；省略 mode 时默认值也是
-<code>audio</code>。任何其他值都会在 accept 前关闭：
+`/api/v1/runtime/realtime` accepts only `mode=audio`; omitting `mode` also
+defaults to `audio`. Any other value is rejected before the connection is
+accepted:
 
-| close code | reason |
-| :--- | :--- |
-| <code>1008</code> | <code>audio mode is required</code> |
+| Close code | Reason |
+|---|---|
+| `1008` | `audio mode is required` |
 
-当前后端没有实时传输能力、没有已加载模型，或代理过程发生未处理错误时，服务端尝试向客户端
-发送错误 JSON，然后以如下状态关闭：
+If no loaded backend can provide realtime transport, or if the proxy encounters
+an unhandled error, the server attempts to send an error JSON object and then
+closes with:
 
-| close code | reason |
-| :--- | :--- |
-| <code>1011</code> | <code>realtime proxy failed</code> |
+| Close code | Reason |
+|---|---|
+| `1011` | `realtime proxy failed` |
 
-客户端正常断开或任一代理方向先结束时，服务端会取消另一侧任务，并尽力以
-<code>1000</code> 关闭。
+When the client disconnects normally or either proxy direction finishes first,
+the server cancels the other direction and makes a best-effort close with code
+`1000`.
 
-## 2. 原生实时音频代理
+## 2. Native realtime audio proxy
 
-### 2.1 行为边界
+### 2.1 Proxy boundary
 
-成功鉴权并连接后，MFQ Server 调用当前运行时的实时连接器并执行以下规则：
+After authentication and connection setup, MFQ Server applies these rules:
 
-1. 客户端发送的 text WebSocket frame 原样转发给上游运行时。
-2. 客户端发送的 binary WebSocket frame 原样转发给上游运行时。
-3. 上游返回的 text 或 binary frame 也原样转发给客户端。
-4. HTTP 服务端不解析、不补序号、不重编码，也不会校验帧的 JSON Schema。
+1. Client text frames are forwarded unchanged to the upstream runtime.
+2. Client binary frames are forwarded unchanged to the upstream runtime.
+3. Upstream text and binary frames are forwarded unchanged to the client.
+4. The HTTP server does not parse, resequence, re-encode, or validate frame
+   payloads against a JSON Schema.
 
-因此，客户端和所选原生运行时必须使用相同的实时传输协议。请勿把 HTTP 的
-<code>ResponseResource</code> JSON 或 SSE 数据直接写入该 socket。
+The client and native runtime must use the same realtime protocol. Do not send
+HTTP `ResponseResource` objects or SSE records to this socket.
 
-### 2.2 规范化 RealtimeFrame
+### 2.2 Normalized `RealtimeFrame`
 
-MFQ 协议模型定义了用于 JSON 实时消息的规范化 envelope。支持该格式的客户端应以
-UTF-8 text frame 发送和接收：
+The MFQ protocol model defines a normalized envelope for JSON realtime
+messages. Clients using this format send and receive UTF-8 text frames:
 
-~~~
+```json
 {
   "protocol_version": "1.0",
   "session_id": "00000000-0000-0000-0000-000000000000",
@@ -100,77 +106,90 @@ UTF-8 text frame 发送和接收：
     "last_audio_sequence": 0
   }
 }
-~~~
+```
 
-| 外层字段 | 类型 | 必填 | 描述 |
-| :--- | :--- | :---: | :--- |
-| <code>protocol_version</code> | String | 否 | 固定 <code>1.0</code>；省略时默认为 <code>1.0</code>。 |
-| <code>session_id</code> | UUID | **是** | 此实时会话对应的 MFQ session。 |
-| <code>sequence</code> | Integer | **是** | 非负、单调递增的传输序号。 |
-| <code>timestamp</code> | DateTime | **是** | 含时区的消息时间。 |
-| <code>payload</code> | Object | **是** | 由 <code>type</code> 判别，见下节。 |
+| Envelope field | Type | Required | Description |
+|---|---|---:|---|
+| `protocol_version` | String | No | Fixed at `1.0`; defaults to `1.0` when omitted. |
+| `session_id` | UUID | Yes | MFQ session associated with the realtime connection. |
+| `sequence` | Integer | Yes | Non-negative, monotonically increasing transport sequence. |
+| `timestamp` | DateTime | Yes | Timezone-aware message timestamp. |
+| `payload` | Object | Yes | Discriminated by `type`. |
 
-代理层本身不会强制上述 envelope；它描述的是 MFQ 原生实时协议的公共模型。若上游运行时
-协商使用另一种帧格式，服务端仍会透明转发，客户端应以运行时实际协议为准。
+The proxy does not enforce this envelope. If the upstream runtime uses another
+frame format, the server forwards it unchanged and the client must follow that
+format.
 
-### 2.3 客户端到服务端事件
+### 2.3 Client-to-server events
 
-| <code>payload.type</code> | 字段 | 说明 |
-| :--- | :--- | :--- |
-| <code>input_audio.delta</code> | <code>audio_sequence</code>（非负 Integer）、<code>timestamp_ms</code>（非负 Integer）、<code>encoding</code>（固定 <code>pcm_s16le</code>）、<code>sample_rate_hz</code>（默认 16000，至少 1）、<code>channels</code>（默认 1，1–8）、<code>data_base64</code>（Base64 bytes）。 | 追加一段 PCM S16LE 音频。 |
-| <code>input_audio.commit</code> | <code>last_audio_sequence</code>（非负 Integer）。 | 表示当前输入音频段完成。 |
+| `payload.type` | Fields | Meaning |
+|---|---|---|
+| `input_audio.delta` | `audio_sequence` (non-negative Integer), `timestamp_ms` (non-negative Integer), `encoding` (fixed `pcm_s16le`), `sample_rate_hz` (default 16000, at least 1), `channels` (default 1, range 1–8), and `data_base64` (Base64 bytes) | Appends one PCM S16LE audio chunk. |
+| `input_audio.commit` | `last_audio_sequence` (non-negative Integer) | Marks the current input-audio segment complete. |
 
-推荐以连续的 <code>audio_sequence</code> 和单调的 <code>timestamp_ms</code> 发送音频。
-<code>data_base64</code> 是 mono 或多声道交错的 PCM S16LE 原始字节的 Base64 编码；
-采样率和声道数必须与实际字节内容一致。
+Send audio with contiguous `audio_sequence` values and monotonic
+`timestamp_ms` values. `data_base64` contains Base64-encoded raw mono or
+interleaved multichannel PCM S16LE bytes; the sample rate and channel count must
+match the actual byte stream.
 
-### 2.4 服务端到客户端事件
+### 2.4 Server-to-client events
 
-| <code>payload.type</code> | 字段 | 说明 |
-| :--- | :--- | :--- |
-| <code>response.text.delta</code> | <code>response_id</code> UUID、<code>delta</code> String。 | 增量文本。 |
-| <code>response.reasoning.delta</code> | <code>response_id</code> UUID、<code>delta</code> String。 | 增量 reasoning 内容。 |
-| <code>response.tool_call.delta</code> | <code>response_id</code> UUID、<code>index</code>（非负 Integer）、可选 <code>call_id</code>、<code>name</code>、<code>arguments_delta</code>（默认空字符串）。 | 增量工具调用。 |
-| <code>response.audio.delta</code> | <code>response_id</code> UUID、<code>audio_sequence</code>、<code>timestamp_ms</code>、<code>encoding: pcm_s16le</code>、<code>sample_rate_hz</code>、<code>channels</code>（1–8）、<code>data_base64</code>。 | 生成的 PCM 音频块。 |
-| <code>response.interrupted</code> | <code>response_id</code> UUID、<code>reason</code>。 | 中断原因：<code>client_cancelled</code>、<code>new_input</code>、<code>session_closed</code> 或 <code>runtime_error</code>。 |
-| <code>response.completed</code> | <code>response_id</code> UUID、<code>finish_reason</code>、可选 <code>usage</code>、<code>performance</code>。 | 本轮响应完成。 |
-| <code>session.state</code> | <code>state</code>、<code>revision</code>（非负 Integer）。 | 会话状态变化。 |
-| <code>runtime.metrics</code> | <code>instance_id</code> UUID、<code>queue_depth</code>、<code>resident_bytes</code>、<code>kv_bytes</code>、可选 <code>prefill_tokens_per_second</code>/<code>decode_tokens_per_second</code>。 | 运行时资源和吞吐信息。 |
-| <code>error</code> | <code>error</code>（ErrorDetail）。 | 协议或运行时错误。 |
+| `payload.type` | Fields | Meaning |
+|---|---|---|
+| `response.text.delta` | `response_id` UUID, `delta` String | Incremental text. |
+| `response.reasoning.delta` | `response_id` UUID, `delta` String | Incremental reasoning content. |
+| `response.tool_call.delta` | `response_id` UUID, non-negative `index`, optional `call_id`, `name`, and `arguments_delta` (default empty string) | Incremental tool call. |
+| `response.audio.delta` | `response_id` UUID, `audio_sequence`, `timestamp_ms`, `encoding: pcm_s16le`, `sample_rate_hz`, `channels` (1–8), and `data_base64` | Generated PCM audio chunk. |
+| `response.interrupted` | `response_id` UUID and `reason` | Interruption reason: `client_cancelled`, `new_input`, `session_closed`, or `runtime_error`. |
+| `response.completed` | `response_id` UUID, `finish_reason`, optional `usage`, and optional `performance` | Completes the current response. |
+| `session.state` | `state` and non-negative `revision` | Session-state transition. |
+| `runtime.metrics` | `instance_id` UUID, `queue_depth`, `resident_bytes`, `kv_bytes`, optional `prefill_tokens_per_second`, and optional `decode_tokens_per_second` | Runtime resource and throughput data. |
+| `error` | `error` (`ErrorDetail`) | Protocol or runtime error. |
 
-<code>session.state</code> 的值为 <code>idle</code>、<code>listening</code>、
-<code>processing</code>、<code>speaking</code>、<code>interrupted</code>、
-<code>reconnecting</code>、<code>error</code> 或 <code>closed</code>。
+`session.state` is one of `idle`, `listening`, `processing`, `speaking`,
+`interrupted`, `reconnecting`, `error`, or `closed`.
 
-<code>usage</code> 包含 <code>prompt_tokens</code>、<code>completion_tokens</code>、
-<code>total_tokens</code>（均为非负）。<code>performance</code> 包含预填充 token 数、
-TTFT、prefill/decode/generation 的毫秒数与 tokens/s，以及实际
-<code>sampling</code> 参数。<code>error</code> 采用
-<code>{"code": String, "message": String, "retryable": Boolean, "details": Object}</code>。
+`usage` contains non-negative `prompt_tokens`, `completion_tokens`, and
+`total_tokens`. `performance` contains prefill-token count, TTFT,
+prefill/decode/generation duration and throughput, and the effective `sampling`
+parameters. `error` has the form:
 
-## 3. 当前不可用的旧路径
+```json
+{
+  "code": "error_code",
+  "message": "human-readable message",
+  "retryable": false,
+  "details": {}
+}
+```
 
-<code>ws://127.0.0.1:8090/api/v1/realtime</code> 会先执行第 1 节的认证。认证通过后，
-实现立即关闭 socket：
+## 3. Unavailable legacy path
 
-| close code | reason |
-| :--- | :--- |
-| <code>1013</code> | <code>Realtime audio transport is not available</code> |
+`ws://127.0.0.1:8090/api/v1/realtime` performs the authentication described
+above and then immediately closes the socket:
 
-<code>1013</code> 表示服务暂时无法提供该路径的服务。客户端不得在该地址进行重连风暴；
-应先检查 <code>GET /api/v1/runtime/realtime/capabilities</code>，在已有可用原生实时后端时
-改连 <code>/api/v1/runtime/realtime?mode=audio</code>。
+| Close code | Reason |
+|---|---|
+| `1013` | `Realtime audio transport is not available` |
 
-## 4. 客户端实现建议
+Code `1013` means the service is temporarily unavailable on that path. Clients
+must not create a reconnect storm. Query
+`GET /api/v1/runtime/realtime/capabilities` first, and use
+`/api/v1/runtime/realtime?mode=audio` only when a compatible native realtime
+backend is available.
 
-1. 先建立或恢复 HTTP session，并保存它的 UUID；实时帧使用同一 <code>session_id</code>。
-2. 使用 Header 中的 Bearer token；查询 token 只作为受限浏览器环境的后备方案。
-3. 发送音频时维持本地 sequence，并在一个语音段结束后发送
-   <code>input_audio.commit</code>。
-4. 收到 <code>response.completed</code> 或 <code>response.interrupted</code> 后结束当前轮，
-   但不要假定 WebSocket 已关闭。
-5. 收到 <code>1008</code> 时刷新或修正凭据；<code>1011</code> 时按退避策略重试，并通过
-   HTTP runtime 状态接口诊断原生后端。
+## 4. Client implementation guidance
 
-HTTP 创建会话、媒体上传、会话响应 SSE 与错误模型的完整定义见
-<code>docs/api/http.md</code>。
+1. Create or restore an HTTP session first and retain its UUID; use the same
+   `session_id` in realtime frames.
+2. Prefer a bearer token in the header. Use a query token only as a fallback in
+   restricted browser environments.
+3. Maintain a local audio sequence and send `input_audio.commit` when an input
+   speech segment ends.
+4. End the current turn after `response.completed` or `response.interrupted`,
+   but do not assume the WebSocket itself has closed.
+5. Refresh or correct credentials after code `1008`. Back off after code `1011`
+   and inspect the HTTP runtime-status endpoints before reconnecting.
+
+Session creation, media upload, response SSE, and common errors are documented
+in the [HTTP API](http.md).

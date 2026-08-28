@@ -8,12 +8,13 @@ dynamic = ["version"]
 description = "Mixed Format Quantization: tensorwise mixed-precision quantization for CUDA (NVIDIA) and Metal (Apple Silicon)"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "TBD" }
+license = { file = "LICENSE" }
 authors = [{ name = "MFQ contributors" }]
 keywords = ["quantization", "llm", "cuda", "metal", "mlx", "int4", "nint", "mixed-precision"]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Science/Engineering",
+    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -109,7 +110,7 @@ release = [
 ]
 
 [project.urls]
-Repository = "https://github.com/mfq/mfq"
+Repository = "https://github.com/Tylogi/TyloQuant"
 
 [tool.setuptools.dynamic]
 version = { attr = "mfq._version.__version__" }
