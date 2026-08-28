@@ -22,34 +22,42 @@ NINT · NVQ/NPQ · NEPQ · TPQ · Expert-Wise MoE · CUDA/C++ Runtime
   <a href="https://huggingface.co/Tylogi">Hugging Face Models</a> · <a href="https://www.modelscope.cn/profile/Tylogi">ModelScope Models</a>
 </p>
 
-## Result at a Glance
+## Results at a Glance
 
 ### DeepSeek-V4-Flash-0731
 
 <img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ versus Unsloth Dynamic model size and Mean KLD" width="100%">
 
-The official-0731 WikiText-2 evaluation covers 573 chunks and 146,115 scored
-tokens at `ctx=512`. The released 77.519 GiB S tier records `0.313576` Mean
-KLD and `82.2913%` same-top. The 88.007 GiB M and 98.007 GiB L tiers record
-`0.244488` / `84.5300%` and `0.201444` / `86.0753%`, respectively. Across the
-three nearest-size UD comparisons, MFQ reduces Mean KLD by **34.24–51.42%**.
+**Evaluation:** Official 0731 weights on WikiText-2, covering 573 chunks and
+146,115 scored tokens at `ctx=512`.
+
+| Released tier | Size | Mean KLD ↓ | Same-top ↑ |
+|---|---:|---:|---:|
+| S | 77.519 GiB | `0.313576` | `82.2913%` |
+| M | 88.007 GiB | `0.244488` | `84.5300%` |
+| L | 98.007 GiB | `0.201444` | `86.0753%` |
+
+**Nearest-size comparison:** Against the three closest-size Unsloth Dynamic
+(UD) baselines, MFQ reduces Mean KLD by **34.24–51.42%**.
 
 ### Qwen3.5-9B: disk size vs. Mean KLD
 
 <img src="./docs/figures/qwen35-9b-mfq-vs-ud-size-kld.svg" alt="Qwen3.5-9B MFQ versus Unsloth Dynamic disk size and raw Mean KLD" width="100%">
 
-The full WikiText-2 evaluation uses 145 chunks and 148,335 scored tokens
-against the same BF16 reference. MFQ improves raw Mean KLD at every matched
-precision tier shown above.
+- **Evaluation:** Full WikiText-2 run with 145 chunks and 148,335 scored tokens;
+  all tiers use the same BF16 reference.
+- **Result:** MFQ achieves lower raw Mean KLD at every matched precision tier
+  shown above.
 
 ### Qwen3.6-27B: disk size vs. quality
 
 <img src="./docs/figures/qwen36-27b-mfq-vs-ud-size-quality.png" alt="Qwen3.6-27B MFQ versus Unsloth Dynamic disk size, raw Mean KLD, and same-top accuracy" width="100%">
 
-The aligned `ubatch=2048` evaluation compares current, matched-size MFQ files
-with their Unsloth Dynamic recipes. Lower Mean KLD and higher same-top are
-better. All plotted tiers use the complete 145-chunk evaluation of the current
-file.
+- **Evaluation:** Complete 145-chunk runs aligned at `ubatch=2048`; every
+  plotted tier uses all chunks.
+- **Comparison:** Each MFQ file is paired with the corresponding matched-size
+  Unsloth Dynamic recipe.
+- **Metrics:** Lower Mean KLD and higher same-top accuracy are better.
 
 ## Overview
 
@@ -68,7 +76,6 @@ matched to llama.cpp `IQ*` use `V`, while scalar-quantized models matched to
 
 ### Requirements
 
-- Python `>=3.10`
 - Git
 - [uv](https://docs.astral.sh/uv/)
 - CMake and a native C++ toolchain
@@ -211,37 +218,57 @@ direct packed execution.
 
 ## Current Scope
 
+### Models and architectures
+
 - Qwen3.5 full attention and linear attention/GDN
 - Qwen3.6 routed MoE
 - Gemma4 GeGLU, sliding-window attention, and routed MoE
 - DeepSeek-V4-Flash HCA/CSA/mHC and MoE
-- MiniCPM-o 4.5 official composite Python graph with MFQ-backed CUDA matrix modules
+- MiniCPM-o 4.5 official composite Python graph with MFQ-backed CUDA matrix
+  modules
+
+### Conversion, packaging, and serving
+
 - NINTM v2 mixed-family HF/GGUF streaming conversion
-- Self-contained MFQ files with embedded runtime config and GGUF tokenizer metadata
-- Numbered MFQ shards with direct quantizer output and transparent Python/C++ loading
+- Self-contained MFQ files with embedded runtime config and GGUF tokenizer
+  metadata
+- Numbered MFQ shards with direct quantizer output and transparent Python/C++
+  loading
 - OpenAI-compatible chat/completions API with SSE
 
-The current CUDA inference implementation remains a single-GPU research
-prototype. Apple
-silicon now has packed NINT/NVQ/NPQ/NEPQ group-vectorized GEMV, qmv_wide
-small-M MMQ, online-decode `simdgroup_matrix` GEMM, and CUDA-style temporary
-dequantize plus MLX GEMM at the measured large-M crossover. Compatible
-NINT/VQ-family gate/up projections fuse SwiGLU. MHA/GQA/MQA, dynamic and
-sliding-window KV caches, single-dispatch heterogeneous NINTM/NEPQ routing,
-fused SSM/GDN kernels, GLM DSA/sparse MLA, DeepSeek-V4 compression/indexer/
-sparse-attention/HC kernels, and a Qwen3.5 full/linear hybrid CausalLM
-prefill/decode/generation runtime are available. Ordinary mixed-format QKV and
-FFN projection groups execute in one heterogeneous Metal dispatch.
-TPQ-I4G64, TPQ-X/W/V/VV, and three-projection TPQ-P kernels with p8-p16
-indices plus the Kimi-K3 KDA/MLA,
-Attention-Residual,
-SiTU MoE, cache, and generation graph are also wired. DeepSeek-V4 now has
-native MFQ loading, compressed/local/indexer caches, mmap-backed bounded expert
-residency, prefill, decode, and generation. Gemma4 now has self-contained
-sharded-MFQ loading, mixed full/sliding attention, fused norm/GeGLU/MoE,
-cache, and generation. GLM-MoE-DSA has native loading, shared indexer state,
-dense/sparse MLA, cache, and generation. Greedy, softmax, top-k/top-p, and
-sampling-penalty kernels remain GPU-resident.
+### Runtime status
+
+> [!NOTE]
+> CUDA inference is currently a single-GPU research prototype.
+
+**Apple silicon / Metal**
+
+- **Matrix compute:** packed NINT/NVQ/NPQ/NEPQ group-vectorized GEMV;
+  `qmv_wide` small-M MMQ; online-decode `simdgroup_matrix` GEMM; and temporary
+  dequantization plus MLX GEMM beyond the measured large-M crossover.
+- **Fused and heterogeneous execution:** fused SwiGLU for compatible
+  NINT/VQ-family gate/up projections; single-dispatch heterogeneous NINTM/NEPQ
+  routing; and mixed-format QKV/FFN projection groups in one heterogeneous
+  Metal dispatch.
+- **Attention and state:** MHA/GQA/MQA, dynamic and sliding-window KV caches,
+  fused SSM/GDN kernels, GLM DSA/sparse MLA, and DeepSeek-V4
+  compression/indexer/sparse-attention/HC kernels.
+- **TPQ:** TPQ-I4G64, TPQ-X/W/V/VV, and three-projection TPQ-P kernels with
+  p8-p16 indices.
+- **Kimi-K3:** KDA/MLA, Attention-Residual, SiTU MoE, cache, and generation
+  graph.
+- **Sampling:** GPU-resident greedy, softmax, top-k/top-p, and sampling-penalty
+  kernels.
+
+**End-to-end model runtimes**
+
+- **Qwen3.5:** full/linear hybrid CausalLM prefill, decode, and generation.
+- **DeepSeek-V4:** native MFQ loading; compressed, local, and indexer caches;
+  mmap-backed bounded expert residency; prefill; decode; and generation.
+- **Gemma4:** self-contained sharded-MFQ loading; mixed full/sliding attention;
+  fused norm/GeGLU/MoE; cache; and generation.
+- **GLM-MoE-DSA:** native loading, shared indexer state, dense/sparse MLA, cache,
+  and generation.
 
 ## Documentation
 

@@ -14,19 +14,30 @@
 
 <img src="./docs/figures/deepseek-v4-flash-mfq-vs-ud-kld.svg" alt="DeepSeek-V4-Flash-0731 MFQ 与 Unsloth Dynamic 模型大小和 Mean KLD 对比" width="100%">
 
-官方 0731 权重的 WikiText-2 评测使用 `ctx=512`，覆盖 573 个 chunk 和 146,115 个计分 token。发布版 77.519 GiB S 档的 Mean KLD 为 `0.313576`，same-top 为 `82.2913%`；88.007 GiB M 档为 `0.244488` / `84.5300%`；98.007 GiB L 档为 `0.201444` / `86.0753%`。三组近似同体积 UD 对位中，MFQ 将 Mean KLD 降低 **34.24–51.42%**。
+**评测：** 官方 0731 权重，WikiText-2 共 573 个 chunk、146,115 个计分 token，`ctx=512`。
+
+| 发布档位 | 大小 | Mean KLD ↓ | Same-top ↑ |
+|---|---:|---:|---:|
+| S | 77.519 GiB | `0.313576` | `82.2913%` |
+| M | 88.007 GiB | `0.244488` | `84.5300%` |
+| L | 98.007 GiB | `0.201444` | `86.0753%` |
+
+**同体积对比：** 与三组大小最接近的 Unsloth Dynamic（UD）基线相比，MFQ 将 Mean KLD 降低 **34.24–51.42%**。
 
 ### Qwen3.5-9B：文件大小与 Mean KLD
 
 <img src="./docs/figures/qwen35-9b-mfq-vs-ud-size-kld.svg" alt="Qwen3.5-9B MFQ 与 Unsloth Dynamic 文件大小和原始 Mean KLD 对比" width="100%">
 
-完整 WikiText-2 评测包含 145 个 chunk、148,335 个计分 token，并使用同一 BF16 参考模型。上图所示的每个匹配精度档位中，MFQ 的原始 Mean KLD 均更低。
+- **评测：** 完整 WikiText-2，共 145 个 chunk、148,335 个计分 token；所有档位使用同一 BF16 参考模型。
+- **结果：** 上图每个匹配精度档位中，MFQ 的原始 Mean KLD 均更低。
 
 ### Qwen3.6-27B：文件大小与质量
 
 <img src="./docs/figures/qwen36-27b-mfq-vs-ud-size-quality.png" alt="Qwen3.6-27B MFQ 与 Unsloth Dynamic 文件大小、原始 Mean KLD 和 same-top accuracy 对比" width="100%">
 
-对齐的 `ubatch=2048` 评测比较当前同体积 MFQ 文件与对应 Unsloth Dynamic recipe。Mean KLD 越低越好，same-top 越高越好。图中所有档位均使用当前文件的完整 145-chunk 评测。
+- **评测：** 完整 145-chunk 评测，统一使用 `ubatch=2048`；图中每个档位均覆盖全部 chunk。
+- **对比：** 每个 MFQ 文件均与对应的同体积 Unsloth Dynamic recipe 配对。
+- **指标：** Mean KLD 越低越好，same-top accuracy 越高越好。
 
 ## 项目简介
 
@@ -38,7 +49,6 @@
 
 ### 环境要求
 
-- Python `>=3.10`
 - Git
 - [uv](https://docs.astral.sh/uv/)
 - CMake 与原生 C++ 工具链
@@ -163,17 +173,41 @@ NINT 沿输出神经元权重行共享顶层仿射元数据，并把节省的预
 
 ## 当前支持范围
 
+### 模型与架构
+
 - Qwen3.5 full attention 与 linear attention/GDN
 - Qwen3.6 routed MoE
 - Gemma4 GeGLU、sliding-window attention 与 routed MoE
 - DeepSeek-V4-Flash HCA/CSA/mHC 与 MoE
 - MiniCPM-o 4.5 official composite Python graph with MFQ-backed CUDA matrix modules
+
+### 转换、封装与服务
+
 - NINTM v2 mixed-family HF/GGUF 流式转换
 - 自包含 MFQ 文件，内嵌 runtime config 与 GGUF tokenizer metadata
 - 编号 MFQ 分片，支持量化器直接输出与 Python/C++ 透明加载
 - 支持 SSE 的 OpenAI 兼容 chat/completions API
 
-当前 CUDA 推理实现仍是单 GPU 研究原型。Apple silicon 现已提供 packed NINT/NVQ/NPQ/NEPQ group-vectorized GEMV、qmv_wide 小 M MMQ、在线解码 `simdgroup_matrix` GEMM，以及在测得的大 M 交叉点采用 CUDA 风格的临时反量化 + MLX GEMM。兼容 NINT/VQ-family gate/up projection 可融合 SwiGLU。MHA/GQA/MQA、动态和滑窗 KV cache、单次 dispatch 的异构 NINTM/NEPQ routing、融合 SSM/GDN kernel、GLM DSA/sparse MLA、DeepSeek-V4 compression/indexer/sparse-attention/HC kernel，以及 Qwen3.5 full/linear hybrid CausalLM prefill/decode/generation runtime 已可用。普通混合格式 QKV 和 FFN projection group 可在一次异构 Metal dispatch 中执行。TPQ-I4G64、TPQ-X/W/V/VV、带 p8-p16 index 的三投影 TPQ-P kernel，以及 Kimi-K3 KDA/MLA、Attention-Residual、SiTU MoE、cache 和 generation graph 也已接入。DeepSeek-V4 已支持原生 MFQ 加载、compressed/local/indexer cache、mmap-backed bounded expert residency、prefill、decode 和 generation。Gemma4 已支持自包含 sharded-MFQ 加载、mixed full/sliding attention、fused norm/GeGLU/MoE、cache 和 generation。GLM-MoE-DSA 已支持原生加载、shared indexer state、dense/sparse MLA、cache 和 generation。Greedy、softmax、top-k/top-p 与 sampling-penalty kernel 仍驻留在 GPU 上。
+### Runtime 状态
+
+> [!NOTE]
+> 当前 CUDA 推理实现仍是单 GPU 研究原型。
+
+**Apple silicon / Metal**
+
+- **矩阵计算：** packed NINT/NVQ/NPQ/NEPQ group-vectorized GEMV、`qmv_wide` 小 M MMQ、在线解码 `simdgroup_matrix` GEMM，以及超过实测大 M 交叉点后的临时反量化 + MLX GEMM。
+- **融合与异构执行：** 兼容 NINT/VQ-family gate/up projection 的融合 SwiGLU、单次 dispatch 的异构 NINTM/NEPQ routing，以及在一次异构 Metal dispatch 中执行的混合格式 QKV/FFN projection group。
+- **Attention 与状态管理：** MHA/GQA/MQA、动态和滑窗 KV cache、融合 SSM/GDN kernel、GLM DSA/sparse MLA，以及 DeepSeek-V4 compression/indexer/sparse-attention/HC kernel。
+- **TPQ：** TPQ-I4G64、TPQ-X/W/V/VV，以及带 p8-p16 index 的三投影 TPQ-P kernel。
+- **Kimi-K3：** KDA/MLA、Attention-Residual、SiTU MoE、cache 与 generation graph。
+- **采样：** Greedy、softmax、top-k/top-p 与 sampling-penalty kernel 均驻留在 GPU 上。
+
+**端到端模型 Runtime**
+
+- **Qwen3.5：** full/linear hybrid CausalLM prefill、decode 与 generation。
+- **DeepSeek-V4：** 原生 MFQ 加载、compressed/local/indexer cache、mmap-backed bounded expert residency、prefill、decode 与 generation。
+- **Gemma4：** 自包含 sharded-MFQ 加载、mixed full/sliding attention、fused norm/GeGLU/MoE、cache 与 generation。
+- **GLM-MoE-DSA：** 原生加载、shared indexer state、dense/sparse MLA、cache 与 generation。
 
 ## 文档
 
