@@ -92,6 +92,15 @@ def test_studio_supports_local_and_remote_server_connections_with_voice_controls
     assert "selectInteractionMode" in APP
 
 
+def test_voice_component_prompt_requires_an_explicit_full_duplex_selection():
+    assert 'const interactionMode = active?.mode ?? mode;' in APP
+    assert 'interactionMode === "full_duplex"' in APP
+    assert "const needsVoiceOutputComponent =" in APP
+    assert "{needsVoiceOutputComponent && voiceComponent &&" in APP
+    assert "capabilities?.model_capabilities.features.audio_output && !realtimeAvailable" not in APP
+    assert "capabilities.model_capabilities.features.full_duplex) && <select" in APP
+
+
 def test_studio_handles_a_running_server_without_a_loaded_model():
     assert 'useState("")' in APP
     assert 'tr("尚未加载模型", "No model loaded")' in APP

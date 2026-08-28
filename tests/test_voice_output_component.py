@@ -87,4 +87,3 @@ def test_voice_component_api_exposes_status_and_fixed_install_job(tmp_path: Path
         await jobs.close()
 
     asyncio.run(scenario())
-
