@@ -294,6 +294,22 @@ function Initialize-ReleaseDirectories {
     New-Item -ItemType Directory -Force -Path $directories | Out-Null
 }
 
+function Stage-LicenseNotices {
+    param([Parameter(Mandatory)][hashtable] $Context)
+
+    $licenseDirectory = Join-Path $Context.ResourceDirectory "licenses"
+    Reset-Directory $licenseDirectory
+    Copy-Item -LiteralPath (Join-Path $Context.ProjectDirectory "LICENSE") `
+        -Destination (Join-Path $licenseDirectory "MFQ-Apache-2.0.txt") -Force
+    Copy-Item -LiteralPath (Join-Path $Context.ProjectDirectory "NOTICE") `
+        -Destination (Join-Path $licenseDirectory "NOTICE.txt") -Force
+    Get-ChildItem -LiteralPath (Join-Path $Context.ProjectDirectory "LICENSES") `
+        -File -Filter "*.txt" |
+        ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $licenseDirectory -Force
+        }
+}
+
 function Initialize-PythonEnvironment {
     param(
         [Parameter(Mandatory)][hashtable] $Context,
@@ -338,7 +354,6 @@ function Build-NativeSidecar {
         "-DCMAKE_CUDA_COMPILER=$([System.IO.Path]::Combine($Context.CudaRoot, 'bin', 'nvcc.exe'))",
         "-DCMAKE_CUDA_ARCHITECTURES=$Architectures",
         "-DMFQ_CUDA_ARCHITECTURES=$Architectures",
-        "-DGGML_NATIVE=OFF",
         "-DMFQ_BUILD_CPP_SERVER=ON",
         "-DMFQ_BUILD_METAL_RUNTIME=OFF",
         "-DMFQ_BUILD_TORCH_REFERENCE_RUNTIME=OFF"
@@ -487,6 +502,7 @@ $releaseOutputDirectory = if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
 $context = New-BuildContext $venvDirectory $releaseOutputDirectory
 Initialize-BuildEnvironment $context
 Initialize-ReleaseDirectories $context
+Stage-LicenseNotices $context
 
 Push-Location $context.ProjectDirectory
 try {

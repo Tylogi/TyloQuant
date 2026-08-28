@@ -1,6 +1,6 @@
 #include "hf_safetensors_store.h"
 
-#include "../../third_party/nlohmann/json.hpp"
+#include "../json/nlohmann/json.hpp"
 
 #include <algorithm>
 #include <cerrno>

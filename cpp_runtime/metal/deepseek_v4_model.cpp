@@ -1,6 +1,6 @@
 #include "deepseek_v4_model.h"
 
-#include "../../third_party/nlohmann/json.hpp"
+#include "../json/nlohmann/json.hpp"
 
 #include <algorithm>
 #include <cmath>

@@ -5,7 +5,7 @@
 #include "mlx_transformer.h"
 #include "mlx_eval_timing.h"
 
-#include "../../third_party/nlohmann/json.hpp"
+#include "../json/nlohmann/json.hpp"
 
 #include <mlx/allocator.h>
 #include <mlx/backend/metal/device.h>

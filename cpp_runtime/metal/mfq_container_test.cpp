@@ -1,6 +1,6 @@
 #include "mfq_container.h"
 
-#include "../../third_party/nlohmann/json.hpp"
+#include "../json/nlohmann/json.hpp"
 
 #include <array>
 #include <chrono>

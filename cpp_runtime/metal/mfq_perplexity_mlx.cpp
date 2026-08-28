@@ -4,7 +4,7 @@
 #include "qwen35_model.h"
 
 #include "../mfq_server.h"
-#include "../../third_party/nlohmann/json.hpp"
+#include "../json/nlohmann/json.hpp"
 
 #include <algorithm>
 #include <chrono>

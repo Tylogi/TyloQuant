@@ -15,8 +15,8 @@
 #include <type_traits>
 #include <vector>
 
-#define MFQ_LLAMA_FATTN_KERNEL_ONLY
-#include "llama_fattn_mma_f16.cuh"
+#define MFQ_FATTN_KERNEL_ONLY
+#include "mfq_fattn_mma_f16.cuh"
 
 namespace {
 

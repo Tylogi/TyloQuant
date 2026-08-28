@@ -7,7 +7,8 @@
     ],
     "resources": {
       "../../release/Resources/mlx.metallib": "mlx.metallib",
-      "../../release/Resources/mfq-cli": "mfq-cli"
+      "../../release/Resources/mfq-cli": "mfq-cli",
+      "../../release/Resources/licenses": "licenses"
     },
     "macOS": {
       "minimumSystemVersion": "26.2",

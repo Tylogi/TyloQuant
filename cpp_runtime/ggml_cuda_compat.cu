@@ -3,8 +3,8 @@
 #include <cstdio>
 #include <cstdlib>
 
-// Custom kernels include llama.cpp CUDA helpers without linking the complete
-// ggml-cuda backend. Provide the two host-side symbols used by common.cuh.
+// MFQ's custom kernels use the integrated GGML CUDA helper headers without
+// linking the complete ggml-cuda backend. Provide the host symbols they need.
 void ggml_cuda_error(
     const char * statement,
     const char * function,
