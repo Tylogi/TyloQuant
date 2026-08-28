@@ -608,9 +608,28 @@ async function mediaMetadata(
 }
 
 function MediaPartView({ part }: { part: Extract<ContentPart, { media: unknown }> }) {
-  const src = api.mediaUrl(part.media.id);
+  const [src, setSrc] = useState<string | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let objectUrl: string | null = null;
+    setSrc(null);
+    void api.fetchMedia(part.media.id, controller.signal).then((blob) => {
+      if (controller.signal.aborted) return;
+      objectUrl = URL.createObjectURL(blob);
+      setSrc(objectUrl);
+    }).catch((error: unknown) => {
+      if (!controller.signal.aborted) console.error("Unable to load message media", error);
+    });
+    return () => {
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [part.media.id]);
+
+  if (!src) return <span className="message-media-loading" aria-label="Loading media" />;
   if (part.type === "image") {
-    return <img className="message-media media-image" loading="lazy" src={src} />;
+    return <img alt="Attached image" className="message-media media-image" loading="lazy" src={src} />;
   }
   if (part.type === "video") {
     return <video className="message-media media-video" controls preload="metadata" src={src} />;

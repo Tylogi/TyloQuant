@@ -772,6 +772,15 @@ export const api = {
     return apiUrl(`/api/v1/media/${id}`);
   },
 
+  async fetchMedia(id: string, signal?: AbortSignal): Promise<Blob> {
+    const response = await fetch(apiUrl(`/api/v1/media/${id}`), {
+      headers: authorizedHeaders(),
+      signal,
+    });
+    if (!response.ok) throw await errorFromResponse(response);
+    return response.blob();
+  },
+
   createDocument(mediaId: string, name: string): Promise<DocumentResource> {
     return request("/api/v1/documents", {
       method: "POST",

@@ -7,6 +7,7 @@ TAURI = STUDIO / "src-tauri"
 RUST = (TAURI / "src" / "main.rs").read_text(encoding="utf-8")
 BUILD = (TAURI / "build.rs").read_text(encoding="utf-8")
 APP = (STUDIO / "src" / "App.tsx").read_text(encoding="utf-8")
+API = (STUDIO / "src" / "api.ts").read_text(encoding="utf-8")
 MARKDOWN = (STUDIO / "src" / "Markdown.tsx").read_text(encoding="utf-8")
 MARKDOWN_TEXT = (STUDIO / "src" / "markdownText.ts").read_text(encoding="utf-8")
 STUDIO_BRIDGE = (STUDIO / "src" / "studio.ts").read_text(encoding="utf-8")
@@ -28,6 +29,7 @@ def test_studio_uses_one_package_for_web_and_desktop_clients():
     assert "icons/icon.icns" in config["bundle"]["icon"]
     assert "IconDir::new" in BUILD
     assert "IconFamily::new" in BUILD
+    assert "media-src 'self' asset: data: blob:" in config["app"]["security"]["csp"]
 
 
 def test_assistant_markdown_recovers_fully_escaped_structural_line_breaks():
@@ -106,6 +108,16 @@ def test_studio_uses_native_confirmation_dialogs_for_destructive_actions():
     assert 'tauri.invoke<boolean>("studio_confirm", { message })' in STUDIO_BRIDGE
     assert "window.confirm" not in APP
     assert APP.count("await studioConfirm(") >= 7
+
+
+def test_studio_loads_message_media_through_authenticated_blob_urls():
+    assert "async fetchMedia(id: string, signal?: AbortSignal): Promise<Blob>" in API
+    assert "headers: authorizedHeaders()" in API
+    assert "api.fetchMedia(part.media.id, controller.signal)" in APP
+    assert "URL.createObjectURL(blob)" in APP
+    assert "URL.revokeObjectURL(objectUrl)" in APP
+    assert 'alt="Attached image"' in APP
+    assert "const src = api.mediaUrl(part.media.id)" not in APP
 
 
 def test_studio_drains_duplex_output_after_microphone_capture_stops():
