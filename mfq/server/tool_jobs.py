@@ -10,7 +10,7 @@ import re
 import shutil
 import signal
 import sys
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +27,10 @@ from mfq.server.storage import StorageError
 
 class _Payload(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class VoiceOutputInstallPayload(_Payload):
+    pass
 
 
 class ModelScopeDownloadPayload(_Payload):
@@ -200,10 +204,19 @@ class ToolJobPaths:
 
 
 class ToolJobHandlers:
-    def __init__(self, catalog: ModelCatalog, paths: ToolJobPaths) -> None:
+    def __init__(
+        self,
+        catalog: ModelCatalog,
+        paths: ToolJobPaths,
+        *,
+        voice_component: Any | None = None,
+        activate_voice_output: Callable[[], Awaitable[dict[str, Any]]] | None = None,
+    ) -> None:
         self.catalog = catalog
         self.paths = paths
         self.root = paths.work_root.expanduser().resolve()
+        self.voice_component = voice_component
+        self.activate_voice_output = activate_voice_output
 
     def _mfq_command(self, *arguments: str) -> list[str]:
         command = [str(self.paths.python)]
@@ -219,6 +232,10 @@ class ToolJobHandlers:
             "model.validate": TypedJobHandler(self.validate_container, ContainerValidationPayload),
             "model.quantize": TypedJobHandler(self.quantize, QuantizePayload),
         }
+        if self.voice_component is not None:
+            result["component.voice_output.install"] = TypedJobHandler(
+                self.install_voice_output, VoiceOutputInstallPayload
+            )
         if self.paths.modelscope is not None:
             result["download.modelscope"] = TypedJobHandler(
                 self.download_modelscope, ModelScopeDownloadPayload
@@ -234,6 +251,21 @@ class ToolJobHandlers:
                 self.kernel_benchmark, KernelBenchmarkPayload
             )
         return result
+
+    async def install_voice_output(
+        self, context: JobContext, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        VoiceOutputInstallPayload.model_validate(payload)
+        result = await self.voice_component.install(context)
+        activation: dict[str, Any] = {"active": False, "reason": "model_not_loaded"}
+        if self.activate_voice_output is not None:
+            await context.progress(0.999, message="Enabling voice output")
+            try:
+                activation = await self.activate_voice_output()
+            except Exception as error:
+                activation = {"active": False, "reason": "activation_failed", "error": str(error)}
+                await context.log(f"Voice component installed but activation failed: {error}")
+        return {**result, "activation": activation}
 
     @staticmethod
     def _resolve_imatrix_backend(backend: str) -> str:

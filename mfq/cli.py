@@ -16,6 +16,21 @@ def _not_implemented(args: argparse.Namespace) -> int:
     return 2
 
 
+def _voice_runtime_check(_args: argparse.Namespace) -> int:
+    import onnxruntime  # noqa: F401
+    import s3tokenizer  # noqa: F401
+    import scipy  # noqa: F401
+    import soundfile  # noqa: F401
+    import torch  # noqa: F401
+    import torchaudio  # noqa: F401
+    from hyperpyyaml import load_hyperpyyaml  # noqa: F401
+    from stepaudio2.flashcosyvoice.modules.hifigan import HiFTGenerator  # noqa: F401
+    from stepaudio2.token2wav import _setup_cosyvoice2_alias  # noqa: F401
+
+    print(json.dumps({"voice_output_runtime": "ready"}))
+    return 0
+
+
 def _calibrate_data(args: argparse.Namespace) -> int:
     if args.proxy:
         os.environ["HTTP_PROXY"] = args.proxy
@@ -831,6 +846,10 @@ def _build_parser() -> argparse.ArgumentParser:
     add_solve_ew_parser(sub)
     _add_calibration_parsers(sub)
     _add_tpq_parsers(sub)
+    sub.add_parser(
+        "voice-runtime-check",
+        help="verify optional MiniCPM-o voice output dependencies",
+    ).set_defaults(_impl=_voice_runtime_check)
     sub.add_parser("inspect", help="inspect an MFQ file").set_defaults(_impl=_not_implemented)
     return parser
 

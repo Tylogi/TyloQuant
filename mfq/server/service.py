@@ -273,6 +273,7 @@ class ServerService:
         hub_catalog: HubCatalog | None = None,
         tool_handlers: Any | None = None,
         cluster: Any | None = None,
+        voice_component: Any | None = None,
     ) -> None:
         self.store = store
         self.backend = backend
@@ -282,6 +283,7 @@ class ServerService:
         self.hub_catalog = hub_catalog or HubCatalog()
         self.tool_handlers = tool_handlers
         self.cluster = cluster
+        self.voice_component = voice_component
         self._active_responses: dict[UUID, tuple[UUID, asyncio.Task[Any]]] = {}
         if runtime_manager is not None:
             runtime_manager.store = store
@@ -1172,6 +1174,47 @@ class ServerService:
 
     async def realtime_capabilities(self) -> dict[str, Any]:
         return await self._runtime_request("realtime_capabilities")
+
+    async def voice_output_component_status(self) -> dict[str, Any]:
+        if self.voice_component is None:
+            raise ServiceError(
+                501,
+                "voice_component_unavailable",
+                "voice output component management is not available",
+            )
+        result = dict(self.voice_component.status())
+        runtime_status = {"active": False, "supported_model_loaded": False}
+        if self.runtime_manager is not None:
+            runtime_status = await self.runtime_manager.voice_output_status()
+        result.update(runtime_status)
+        return result
+
+    async def install_voice_output_component(self) -> OperationAccepted:
+        if self.voice_component is None:
+            raise ServiceError(
+                501,
+                "voice_component_unavailable",
+                "voice output component management is not available",
+            )
+        job = await self.create_job(
+            CreateJobRequest(kind="component.voice_output.install", payload={})
+        )
+        return OperationAccepted(operation_id=job.id)
+
+    async def activate_voice_output_component(self) -> dict[str, Any]:
+        if self.runtime_manager is None:
+            raise ServiceError(
+                501,
+                "model_management_unavailable",
+                "managed model runtime is not available",
+            )
+        return await self.runtime_manager.enable_realtime()
+
+    async def realtime_serve(self, client: Any, *, mode: str = "audio") -> bool:
+        serve = getattr(self.backend, "realtime_serve", None)
+        if not callable(serve):
+            return False
+        return bool(await serve(client, mode=mode))
 
     async def reload_runtime(self, context_size: int) -> dict[str, Any]:
         return await self._runtime_request("reload_runtime", context_size)

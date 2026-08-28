@@ -33,6 +33,7 @@ import {
   SessionArchive,
   Session,
   SessionMode,
+  VoiceOutputComponentStatus,
   api,
   setApiBaseUrl,
   setApiToken,
@@ -1457,6 +1458,8 @@ export default function App() {
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [realtime, setRealtime] = useState<RealtimeCapabilities | null>(null);
   const [realtimeAvailable, setRealtimeAvailable] = useState(false);
+  const [voiceComponent, setVoiceComponent] = useState<VoiceOutputComponentStatus | null>(null);
+  const [voiceComponentBusy, setVoiceComponentBusy] = useState(false);
   const [metricSeries, setMetricSeries] = useState<number[]>([]);
   const [requestHistory, setRequestHistory] = useState<RuntimeRequestMetrics[]>([]);
   const [settings, setSettings] = useState<GenerationSettings>(loadSettings);
@@ -1600,6 +1603,7 @@ export default function App() {
           api.runtimeModels(),
           api.runtimeStatus(),
           api.realtimeCapabilities(),
+          api.voiceOutputComponent(),
         ]),
         Promise.all([
           api.runtimeMetrics(200),
@@ -1615,7 +1619,7 @@ export default function App() {
           api.remoteNodes(),
         ]),
       ]);
-      const [capabilityResult, modelResult, statusResult, realtimeResult] = runtimeResults;
+      const [capabilityResult, modelResult, statusResult, realtimeResult, voiceComponentResult] = runtimeResults;
       const [metricHistory, nextArtifacts, nextInstances, nextProfiles, nextJobs, nextLogs, nextKinds, nextLineage, nextDatasets, nextEvaluations, nextNodes] = management;
       if (capabilityResult.status === "fulfilled") {
         setCapabilities(capabilityResult.value);
@@ -1637,6 +1641,9 @@ export default function App() {
       } else {
         setRealtime(null);
         setRealtimeAvailable(false);
+      }
+      if (voiceComponentResult.status === "fulfilled") {
+        setVoiceComponent(voiceComponentResult.value);
       }
       setArtifacts(nextArtifacts);
       setInstances(nextInstances);
@@ -1860,6 +1867,7 @@ export default function App() {
           api.datasets(),
           api.evaluations(),
           api.remoteNodes(),
+          api.voiceOutputComponent(),
         ]);
         if (!current) return;
         if (results[0].status === "fulfilled") {
@@ -1911,6 +1919,7 @@ export default function App() {
         if (results[16].status === "fulfilled") setDatasets(results[16].value);
         if (results[17].status === "fulfilled") setEvaluations(results[17].value);
         if (results[18].status === "fulfilled") setRemoteNodes(results[18].value);
+        if (results[19].status === "fulfilled") setVoiceComponent(results[19].value);
         if (results[3].status === "fulfilled") {
           setRealtime(results[3].value);
           setRealtimeAvailable(results[3].value.available === true);
@@ -2687,6 +2696,28 @@ export default function App() {
       !voiceRef.current
     ) return;
     await voiceRef.current.toggleCapture(realtimeSessionConfig(active.id));
+  }
+
+  async function installOrEnableVoiceOutput() {
+    if (voiceComponentBusy) return;
+    setVoiceComponentBusy(true);
+    try {
+      if (voiceComponent?.ready) {
+        const result = await api.activateVoiceOutputComponent();
+        if (!result.active) {
+          throw new Error(result.error || result.reason || tr("语音输出启用失败", "Voice output activation failed"));
+        }
+      } else {
+        const accepted = await api.installVoiceOutputComponent();
+        setSelectedJobId(accepted.operation_id);
+        setVoiceComponent((current) => current && ({ ...current, state: "installing" }));
+      }
+      await refreshRuntime(false);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setVoiceComponentBusy(false);
+    }
   }
 
   async function selectInteractionMode(nextMode: SessionMode) {
@@ -3476,6 +3507,9 @@ export default function App() {
   const activeJobs = jobs.filter((job) =>
     ["queued", "running", "cancelling"].includes(job.status),
   );
+  const voiceComponentJob = activeJobs.find(
+    (job) => job.kind === "component.voice_output.install",
+  );
   const completedJobs = jobs.filter(isTerminalJob);
   const runtimeMemory = Number(
     runtime?.mlx_active_bytes ??
@@ -3654,6 +3688,7 @@ export default function App() {
             </div>
             {error && <div className="error-banner" role="alert"><span>{error}</span><button onClick={() => setError(null)} type="button">×</button></div>}
             <div className="composer-region">
+              {capabilities?.model_capabilities.features.audio_output && !realtimeAvailable && voiceComponent && <div className="voice-component-banner"><div><strong>{voiceComponent.ready ? tr("语音组件已下载", "Voice component downloaded") : tr("此模型还缺少语音输出组件", "This model needs the voice output component")}</strong><span>{voiceComponentJob ? tr(`正在下载并校验 · ${formatNumber(voiceComponentJob.progress * 100)}%`, `Downloading and verifying · ${formatNumber(voiceComponentJob.progress * 100)}%`) : voiceComponent.error ? voiceComponent.error : tr("Token2Wav 独立安装，不会重复占用每个模型的空间。", "Token2Wav is installed once and shared by all compatible models.")}</span></div>{voiceComponentJob && <progress max={1} value={voiceComponentJob.progress} />}<button disabled={voiceComponentBusy || Boolean(voiceComponentJob)} onClick={() => void installOrEnableVoiceOutput()} type="button">{voiceComponentJob ? tr("正在下载…", "Downloading…") : voiceComponent.ready ? tr("启用语音输出", "Enable voice output") : tr(`下载组件 · ${formatNumber(voiceComponent.total_bytes / 1e9, 2)} GB`, `Download · ${formatNumber(voiceComponent.total_bytes / 1e9, 2)} GB`)}</button></div>}
               <form className="composer" onSubmit={send}>
                 {attachments.length > 0 && <div className="attachment-tray">{attachments.map((attachment) => <div className="attachment-chip" key={attachment.id}>{attachment.kind === "image" ? <img alt="" src={attachment.previewUrl} /> : attachment.kind === "video" ? <VideoWithFirstFrame muted src={attachment.previewUrl} /> : <span>{attachment.kind === "document" ? "TXT" : "♫"}</span>}<div><strong>{attachment.file.name}</strong><small>{attachment.kind} · {formatNumber(attachment.file.size)} B</small></div><button aria-label={tr("移除附件", "Remove attachment")} onClick={() => removeAttachment(attachment.id)} type="button">×</button></div>)}</div>}
                 <textarea aria-label={tr("消息", "Message")} disabled={!active || busy} maxLength={32768} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} placeholder={active ? tr("向模型发送消息", "Message MFQ") : tr("请先创建会话", "Create a session first")} rows={1} value={draft} />

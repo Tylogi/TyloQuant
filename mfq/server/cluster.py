@@ -616,6 +616,15 @@ class ClusterBackend:
     async def realtime_capabilities(self) -> dict[str, Any]:
         return await self.local.realtime_capabilities()
 
+    async def voice_output_status(self) -> dict[str, Any]:
+        return await self.local.voice_output_status()
+
+    async def enable_realtime(self) -> dict[str, Any]:
+        return await self.local.enable_realtime()
+
+    async def realtime_serve(self, client: Any, *, mode: str = "audio") -> bool:
+        return await self.local.realtime_serve(client, mode=mode)
+
     async def reload_runtime(self, context_size: int) -> dict[str, Any]:
         return await self.local.reload_runtime(context_size)
 

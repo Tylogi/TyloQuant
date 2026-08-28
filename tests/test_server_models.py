@@ -790,3 +790,61 @@ def test_managed_runtime_reports_and_bounds_queued_requests(tmp_path: Path) -> N
         assert instance.queued_requests == 0
 
     asyncio.run(run())
+
+
+def test_minicpmo_voice_component_activates_in_the_managed_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        import mfq.runtime.minicpmo45_realtime as realtime
+
+        model = tmp_path / "voice.mfq"
+        _model(model, architecture="minicpmo45")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve((await catalog.list()).data[0].id)
+
+        class Component:
+            root = tmp_path / "voice-component"
+
+            @staticmethod
+            def ready() -> bool:
+                return True
+
+        class Gateway:
+            def __init__(self, backend_url, assets, *, token2wav_steps):
+                self.arguments = (backend_url, assets, token2wav_steps)
+                self.served = []
+
+            async def capabilities(self):
+                return {"available": True, "output": ["text", "audio"]}
+
+            async def serve(self, client):
+                self.served.append(client)
+
+        monkeypatch.setattr(realtime, "RealtimeGateway", Gateway)
+        monkeypatch.setattr(realtime, "_backend_token2wav_steps", lambda *_args: 10)
+        backend = SimpleNamespace(base_url="http://127.0.0.1:43123")
+        instance = _ManagedRuntime(
+            id=uuid4(),
+            artifact=artifact,
+            process=SimpleNamespace(returncode=None),
+            backend=backend,
+            port=43123,
+            context_size=4096,
+            state=RuntimeInstanceState.READY,
+        )
+        pool = ManagedRuntimePool(
+            catalog,
+            tmp_path / "runtime",
+            voice_component=Component(),
+        )
+        pool._instances[instance.id] = instance
+        pool._last_instance_id = instance.id
+
+        assert (await pool.enable_realtime())["active"] is True
+        assert (await pool.realtime_capabilities())["available"] is True
+        client = object()
+        assert await pool.realtime_serve(client)
+        assert instance.realtime_gateway.served == [client]
+
+    asyncio.run(run())

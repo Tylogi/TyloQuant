@@ -46,19 +46,27 @@ mkdir -p \
   "${mfq_output_dir}"
 
 cd "${mfq_project_dir}"
-uv venv --clear --python "${mfq_python_version}" "${mfq_venv_dir}"
+if [[ "${MFQ_RELEASE_REUSE_VENV:-0}" == "1" ]]; then
+  [[ -x "${mfq_venv_dir}/bin/python" ]] || fail "reused release environment has no Python"
+  [[ -x "${mfq_venv_dir}/bin/pyinstaller" ]] || fail "reused release environment has no PyInstaller"
+else
+  uv venv --clear --python "${mfq_python_version}" "${mfq_venv_dir}"
+fi
 source "${mfq_venv_dir}/bin/activate"
-uv sync \
-  --locked \
-  --active \
-  --no-default-groups \
-  --no-editable \
-  --group release \
-  --extra daemon \
-  --extra train \
-  --extra calibration \
-  --extra tpq \
-  --extra metal
+if [[ "${MFQ_RELEASE_REUSE_VENV:-0}" != "1" ]]; then
+  uv sync \
+    --locked \
+    --active \
+    --no-default-groups \
+    --no-editable \
+    --group release \
+    --extra daemon \
+    --extra train \
+    --extra calibration \
+    --extra minicpmo45-realtime \
+    --extra tpq \
+    --extra metal
+fi
 
 command -v ninja >/dev/null 2>&1 || fail "ninja is required"
 mfq_mlx_root="$("${mfq_venv_dir}/bin/python" -c 'import mlx; print(next(iter(mlx.__path__)))')"
@@ -133,15 +141,19 @@ mfq_pyinstaller_args=(
   --collect-all tokenizers
   --collect-all safetensors
   --collect-all mlx
+  --collect-all hyperpyyaml
+  --collect-all librosa
+  --collect-all onnxruntime
+  --collect-all s3tokenizer
+  --collect-all scipy
+  --collect-all soundfile
+  --collect-all stepaudio2
+  --collect-all torchaudio
+  --copy-metadata requests
+  --copy-metadata torchcodec
+  --hidden-import mfq.runtime.minicpmo45_realtime
   --exclude-module mfq.runtime.minicpmo45
-  --exclude-module mfq.runtime.minicpmo45_realtime
   --exclude-module minicpmo_utils
-  --exclude-module stepaudio2_minicpmo
-  --exclude-module torchaudio
-  --exclude-module onnxruntime
-  --exclude-module s3tokenizer
-  --exclude-module hyperpyyaml
-  --exclude-module librosa
   --distpath "${mfq_resource_dir}"
   --workpath "${mfq_pyinstaller_build_dir}"
   --specpath "${mfq_spec_dir}"
@@ -169,6 +181,7 @@ codesign --verify --strict --verbose=2 "${mfq_cli_path}"
 "${mfq_cli_path}" solve-ew --help >/dev/null
 "${mfq_cli_path}" calibrate --help >/dev/null
 "${mfq_cli_path}" tpq --help >/dev/null
+"${mfq_cli_path}" voice-runtime-check >/dev/null
 
 cd "${mfq_studio_dir}"
 npm ci

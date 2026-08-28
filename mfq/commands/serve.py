@@ -188,6 +188,7 @@ def _run(args: argparse.Namespace) -> int:
     from mfq.server.backend import OpenAIChatBackend
     from mfq.server.catalog import ModelCatalog
     from mfq.server.cluster import ClusterBackend
+    from mfq.server.components import VoiceOutputComponent
     from mfq.server.jobs import JobManager
     from mfq.server.native import NativeRuntime
     from mfq.server.runtime_pool import ManagedRuntimePool
@@ -213,6 +214,7 @@ def _run(args: argparse.Namespace) -> int:
             configured_roots.append(model_catalog_root)
     configured_roots[0].mkdir(parents=True, exist_ok=True)
     catalog = ModelCatalog(configured_roots)
+    voice_component = VoiceOutputComponent(args.work_dir.expanduser().resolve())
     runtime = None
     try:
         runtime_manager = ManagedRuntimePool(
@@ -222,6 +224,7 @@ def _run(args: argparse.Namespace) -> int:
             max_instances=args.max_runtime_instances,
             max_requests_per_instance=args.max_requests_per_runtime,
             backend=selected_backend,
+            voice_component=voice_component,
         )
         if model is not None:
             initial_artifact = asyncio.run(catalog.resolve_path(model))
@@ -265,6 +268,8 @@ def _run(args: argparse.Namespace) -> int:
                 perplexity=perplexity if perplexity.is_file() else None,
                 standalone_cli=bool(getattr(sys, "frozen", False)),
             ),
+            voice_component=voice_component,
+            activate_voice_output=runtime_manager.enable_realtime,
         )
         jobs = JobManager(store, handlers.handlers())
         service = ServerService(
@@ -275,6 +280,7 @@ def _run(args: argparse.Namespace) -> int:
             runtime_manager=runtime_manager,
             tool_handlers=handlers,
             cluster=backend,
+            voice_component=voice_component,
         )
         client_api_key = os.environ.get(args.api_key_env, "")
         api_keys = ApiKeyManager(store, client_api_key) if client_api_key else None

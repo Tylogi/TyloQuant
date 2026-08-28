@@ -518,6 +518,20 @@ export interface RealtimeCapabilities {
   model_capabilities?: ModelCapabilities;
 }
 
+export interface VoiceOutputComponentStatus {
+  id: string;
+  state: "missing" | "installing" | "ready";
+  ready: boolean;
+  installed_bytes: number;
+  total_bytes: number;
+  repository: string;
+  revision: string;
+  active: boolean;
+  supported_model_loaded: boolean;
+  model?: string | null;
+  error?: string | null;
+}
+
 export interface ApiErrorBody {
   error: {
     code: string;
@@ -1103,6 +1117,18 @@ export const api = {
 
   realtimeCapabilities(): Promise<RealtimeCapabilities> {
     return request("/api/v1/runtime/realtime/capabilities");
+  },
+
+  voiceOutputComponent(): Promise<VoiceOutputComponentStatus> {
+    return request("/api/v1/components/voice-output");
+  },
+
+  installVoiceOutputComponent(): Promise<{ operation_id: string; status: "accepted" }> {
+    return request("/api/v1/components/voice-output/install", { method: "POST" });
+  },
+
+  activateVoiceOutputComponent(): Promise<{ active: boolean; reason?: string; error?: string }> {
+    return request("/api/v1/components/voice-output/activate", { method: "POST" });
   },
 
   reloadRuntime(contextSize: number): Promise<RuntimeStatus> {

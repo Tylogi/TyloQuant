@@ -71,6 +71,8 @@ class _ManagedRuntime:
     error: ErrorDetail | None = None
     output_task: asyncio.Task[None] | None = None
     monitor_task: asyncio.Task[None] | None = None
+    realtime_gateway: Any | None = None
+    realtime_error: str | None = None
 
 
 class ManagedRuntimePool:
@@ -87,6 +89,7 @@ class ManagedRuntimePool:
         max_requests_per_instance: int = 1,
         metric_interval_seconds: float = 2.0,
         backend: str = "metal",
+        voice_component: Any | None = None,
     ) -> None:
         if max_instances < 1:
             raise ValueError("max_instances must be positive")
@@ -102,12 +105,14 @@ class ManagedRuntimePool:
         if backend not in {"cuda", "metal"}:
             raise ValueError(f"unsupported native backend: {backend}")
         self.backend = backend
+        self.voice_component = voice_component
         self.store = None
         self._instances: dict[UUID, _ManagedRuntime] = {}
         self._loading_model_names: set[str] = set()
         self._session_routes: dict[UUID, UUID] = {}
         self._last_instance_id: UUID | None = None
         self._lock = asyncio.Lock()
+        self._realtime_activation_lock = asyncio.Lock()
         self._closed = False
 
     async def start(self) -> None:
@@ -122,6 +127,11 @@ class ManagedRuntimePool:
                         self._monitor(instance),
                         name=f"mfq-server-runtime-monitor-{instance.id}",
                     )
+        if self.voice_component is not None and self.voice_component.ready():
+            asyncio.create_task(
+                self.enable_realtime(),
+                name="mfq-server-enable-voice-output",
+            )
 
     def register_started(
         self,
@@ -362,6 +372,9 @@ class ManagedRuntimePool:
         instance.monitor_task = asyncio.create_task(
             self._monitor(instance), name=f"mfq-server-runtime-monitor-{instance.id}"
         )
+        if self.voice_component is not None and self.voice_component.ready():
+            await context.progress(0.96, message="Enabling voice output")
+            await self.enable_realtime(instance.id)
         await context.progress(1.0, message="Model ready")
         return {
             "instance_id": str(instance.id),
@@ -579,10 +592,82 @@ class ManagedRuntimePool:
         return {"object": "list", "data": data}
 
     async def realtime_capabilities(self) -> dict[str, Any]:
-        backend = await self._current_backend()
-        if backend is None:
+        async with self._lock:
+            instance = self._current_instance_locked()
+        if instance is not None:
+            if instance.realtime_gateway is None:
+                return {"available": False, "modes": []}
+            return await instance.realtime_gateway.capabilities()
+        if self.fallback is None:
             return {"available": False, "modes": []}
-        return await backend.realtime_capabilities()
+        return await self.fallback.realtime_capabilities()
+
+    async def voice_output_status(self) -> dict[str, Any]:
+        async with self._lock:
+            instance = self._current_instance_locked()
+        architecture = instance.artifact.resource.architecture if instance is not None else ""
+        supported = self._supports_voice_output(architecture)
+        return {
+            "active": bool(instance is not None and instance.realtime_gateway is not None),
+            "supported_model_loaded": bool(instance is not None and supported),
+            "model": instance.artifact.resource.name if instance is not None else None,
+            "error": instance.realtime_error if instance is not None else None,
+        }
+
+    async def enable_realtime(self, instance_id: UUID | None = None) -> dict[str, Any]:
+        async with self._realtime_activation_lock:
+            async with self._lock:
+                instance = (
+                    self._instances.get(instance_id)
+                    if instance_id is not None
+                    else self._current_instance_locked()
+                )
+            if instance is None:
+                return {"active": False, "reason": "model_not_loaded"}
+            if not self._supports_voice_output(instance.artifact.resource.architecture):
+                return {"active": False, "reason": "model_not_supported"}
+            if self.voice_component is None or not self.voice_component.ready():
+                return {"active": False, "reason": "component_not_ready"}
+            if instance.realtime_gateway is not None:
+                return {"active": True, "model": instance.artifact.resource.name}
+            base_url = getattr(instance.backend, "base_url", None)
+            if not isinstance(base_url, str) or not base_url:
+                return {"active": False, "reason": "backend_not_supported"}
+            try:
+                from mfq.runtime.minicpmo45_realtime import (
+                    RealtimeGateway,
+                    _backend_token2wav_steps,
+                )
+
+                def create_gateway() -> Any:
+                    steps = _backend_token2wav_steps(base_url, "", None)
+                    return RealtimeGateway(
+                        base_url,
+                        self.voice_component.root,
+                        token2wav_steps=steps,
+                    )
+
+                gateway = await asyncio.to_thread(create_gateway)
+            except Exception as error:
+                instance.realtime_error = str(error)
+                return {"active": False, "reason": "activation_failed", "error": str(error)}
+            async with self._lock:
+                if self._instances.get(instance.id) is not instance:
+                    return {"active": False, "reason": "model_unloaded"}
+                instance.realtime_gateway = gateway
+                instance.realtime_error = None
+            return {"active": True, "model": instance.artifact.resource.name}
+
+    async def realtime_serve(self, client: Any, *, mode: str = "audio") -> bool:
+        if mode != "audio":
+            return False
+        async with self._lock:
+            instance = self._current_instance_locked()
+            gateway = instance.realtime_gateway if instance is not None else None
+        if gateway is None:
+            return False
+        await gateway.serve(client)
+        return True
 
     async def reload_runtime(self, context_size: int) -> dict[str, Any]:
         backend = await self._current_backend()
@@ -638,21 +723,29 @@ class ManagedRuntimePool:
 
     async def _current_backend(self) -> ChatBackend | None:
         async with self._lock:
-            instance = (
-                self._instances.get(self._last_instance_id)
-                if self._last_instance_id is not None
-                else None
-            )
-            if instance is None:
-                instance = next(
-                    (
-                        item
-                        for item in self._instances.values()
-                        if item.state in {RuntimeInstanceState.READY, RuntimeInstanceState.BUSY}
-                    ),
-                    None,
-                )
+            instance = self._current_instance_locked()
         return instance.backend if instance is not None else self.fallback
+
+    def _current_instance_locked(self) -> _ManagedRuntime | None:
+        instance = (
+            self._instances.get(self._last_instance_id)
+            if self._last_instance_id is not None
+            else None
+        )
+        if instance is None:
+            instance = next(
+                (
+                    item
+                    for item in self._instances.values()
+                    if item.state in {RuntimeInstanceState.READY, RuntimeInstanceState.BUSY}
+                ),
+                None,
+            )
+        return instance
+
+    @staticmethod
+    def _supports_voice_output(architecture: str) -> bool:
+        return "minicpmo" in architecture.casefold()
 
     async def _pump_output(self, instance: _ManagedRuntime, context: JobContext) -> None:
         process = instance.process
@@ -708,6 +801,7 @@ class ManagedRuntimePool:
 
     async def _stop_process(self, instance: _ManagedRuntime) -> None:
         instance.state = RuntimeInstanceState.UNLOADING
+        instance.realtime_gateway = None
         process = instance.process
         if isinstance(process, subprocess.Popen):
             await asyncio.to_thread(self._stop_popen, process)

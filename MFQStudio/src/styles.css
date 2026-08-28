@@ -493,6 +493,13 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
 .error-banner button { border: 0; color: inherit; background: transparent; }
 .composer-region { width: min(860px, 100%); margin: 0 auto; padding: 0 28px 11px; }
 .composer-region > p { margin: 6px 0 0; color: var(--muted-light); font-size: 8px; text-align: center; }
+.voice-component-banner { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 7px 12px; border: 1px solid var(--accent-border); border-radius: 10px; margin-bottom: 8px; padding: 9px 10px; color: var(--accent-ink); background: var(--accent-soft); }
+.voice-component-banner > div { display: grid; min-width: 0; gap: 2px; }
+.voice-component-banner strong { font-size: 10px; }
+.voice-component-banner span { overflow: hidden; color: var(--muted); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.voice-component-banner progress { width: 100%; height: 4px; grid-column: 1 / -1; accent-color: var(--accent); }
+.voice-component-banner button { grid-column: 2; grid-row: 1; border: 1px solid var(--accent-border); border-radius: 7px; padding: 6px 9px; color: var(--on-accent); background: var(--accent); font-size: 9px; font-weight: 650; }
+.voice-component-banner button:disabled { cursor: progress; opacity: 0.65; }
 .composer { overflow: hidden; border: 1px solid var(--line-strong); border-radius: 13px; background: var(--surface); box-shadow: var(--shadow-sm); }
 .composer:focus-within { border-color: #b98a69; box-shadow: 0 0 0 3px rgb(154 93 49 / 8%), 0 8px 26px rgb(25 28 28 / 8%); }
 .composer textarea { display: block; width: 100%; min-height: 42px; max-height: 180px; resize: none; border: 0; outline: 0; padding: 11px 12px 5px; color: var(--ink); background: transparent; font-size: 12px; line-height: 1.5; }

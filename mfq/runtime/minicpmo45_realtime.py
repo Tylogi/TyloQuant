@@ -470,6 +470,54 @@ class RealtimeGateway:
         self.default_reference_waveform: np.ndarray | None = None
         self.default_reference_mel: np.ndarray | None = None
 
+    async def capabilities(self) -> dict[str, Any]:
+        import httpx
+
+        headers = (
+            {"Authorization": f"Bearer {self.api_key}"}
+            if self.api_key
+            else None
+        )
+        health: dict[str, Any] = {}
+        try:
+            async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+                response = await client.get(
+                    f"{self.backend_url.rstrip('/')}/health",
+                    headers=headers,
+                )
+            health = response.json() if response.is_success else {}
+            available = health.get("duplex_available") is True
+        except Exception:
+            available = False
+        tts_defaults = health.get("tts_sampling_defaults", {})
+        if not isinstance(tts_defaults, dict):
+            tts_defaults = {}
+        model_capabilities = health.get("model_capabilities", {})
+        if not isinstance(model_capabilities, dict):
+            model_capabilities = {}
+        return {
+            "available": available,
+            "architecture_family": model_capabilities.get("architecture_family", "unknown"),
+            "model_capabilities": model_capabilities,
+            "input": ["audio"],
+            "output": ["text", "audio"],
+            "input_sample_rate": SAMPLE_RATE_IN,
+            "output_sample_rate": SAMPLE_RATE_OUT,
+            "defaults": {
+                **DEFAULT_DUPLEX_CONFIG,
+                **(
+                    health.get("duplex_sampling_defaults", {})
+                    if isinstance(health.get("duplex_sampling_defaults"), dict)
+                    else {}
+                ),
+                "max_new_speak_tokens_per_chunk": 20,
+                "tts_temperature": tts_defaults.get("temperature", 0.8),
+                "tts_repetition_penalty": tts_defaults.get("repetition_penalty", 1.05),
+                "token2wav_steps": self.renderer.n_timesteps,
+                "playback_delay_ms": 200,
+            },
+        }
+
     async def backend_runtime_defaults(self) -> dict[str, Any]:
         import httpx
 
@@ -821,58 +869,7 @@ def build_app(gateway: RealtimeGateway, web_root: Path | None = None) -> Any:
 
     @app.get("/realtime/capabilities")
     async def realtime_capabilities() -> dict[str, Any]:
-        headers = (
-            {"Authorization": f"Bearer {gateway.api_key}"}
-            if gateway.api_key
-            else None
-        )
-        health: dict[str, Any] = {}
-        try:
-            response = await backend_http.get(
-                f"{gateway.backend_url.rstrip('/')}/health",
-                headers=headers,
-            )
-            health = response.json() if response.is_success else {}
-            available = health.get("duplex_available") is True
-        except Exception:
-            available = False
-        tts_defaults = health.get("tts_sampling_defaults", {})
-        if not isinstance(tts_defaults, dict):
-            tts_defaults = {}
-        return {
-            "available": available,
-            "architecture_family": (
-                health.get("model_capabilities", {}).get(
-                    "architecture_family", "unknown"
-                )
-                if isinstance(health.get("model_capabilities"), dict)
-                else "unknown"
-            ),
-            "model_capabilities": (
-                health.get("model_capabilities", {})
-                if isinstance(health.get("model_capabilities"), dict)
-                else {}
-            ),
-            "input": ["audio"],
-            "output": ["text", "audio"],
-            "input_sample_rate": SAMPLE_RATE_IN,
-            "output_sample_rate": SAMPLE_RATE_OUT,
-            "defaults": {
-                **DEFAULT_DUPLEX_CONFIG,
-                **(
-                    health.get("duplex_sampling_defaults", {})
-                    if isinstance(health.get("duplex_sampling_defaults"), dict)
-                    else {}
-                ),
-                "max_new_speak_tokens_per_chunk": 20,
-                "tts_temperature": tts_defaults.get("temperature", 0.8),
-                "tts_repetition_penalty": tts_defaults.get(
-                    "repetition_penalty", 1.05
-                ),
-                "token2wav_steps": gateway.renderer.n_timesteps,
-                "playback_delay_ms": 200,
-            },
-        }
+        return await gateway.capabilities()
 
     @app.api_route(
         "/v1/{path:path}",

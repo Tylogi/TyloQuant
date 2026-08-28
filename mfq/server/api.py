@@ -1121,6 +1121,34 @@ def create_app(
     async def clear_runtime_cache() -> dict[str, Any]:
         return await require_service().clear_runtime_cache()
 
+    @app.get(
+        "/api/v1/components/voice-output",
+        response_model=dict[str, Any],
+        responses=ERROR_RESPONSES,
+        tags=["runtime"],
+    )
+    async def voice_output_component_status() -> dict[str, Any]:
+        return await require_service().voice_output_component_status()
+
+    @app.post(
+        "/api/v1/components/voice-output/install",
+        response_model=OperationAccepted,
+        status_code=202,
+        responses=ERROR_RESPONSES,
+        tags=["runtime"],
+    )
+    async def install_voice_output_component() -> OperationAccepted:
+        return await require_service().install_voice_output_component()
+
+    @app.post(
+        "/api/v1/components/voice-output/activate",
+        response_model=dict[str, Any],
+        responses=ERROR_RESPONSES,
+        tags=["runtime"],
+    )
+    async def activate_voice_output_component() -> dict[str, Any]:
+        return await require_service().activate_voice_output_component()
+
     @app.websocket("/api/v1/runtime/realtime")
     async def runtime_realtime(websocket: WebSocket) -> None:
         if not await authorize_websocket(websocket):
@@ -1130,10 +1158,11 @@ def create_app(
             await websocket.close(code=1008, reason="audio mode is required")
             return
         try:
+            await websocket.accept()
+            if await require_service().realtime_serve(websocket, mode=mode):
+                return
             connector = require_service().realtime_connect(mode=mode)
             async with connector as upstream:
-                await websocket.accept()
-
                 async def send_upstream() -> None:
                     while True:
                         message = await websocket.receive()
