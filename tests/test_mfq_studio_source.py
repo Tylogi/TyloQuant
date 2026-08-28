@@ -120,6 +120,16 @@ def test_studio_loads_message_media_through_authenticated_blob_urls():
     assert "const src = api.mediaUrl(part.media.id)" not in APP
 
 
+def test_studio_renders_video_first_frame_posters():
+    assert "function VideoWithFirstFrame" in APP
+    assert 'video.onloadeddata = () =>' in APP
+    assert 'drawImage(video, 0, 0, canvas.width, canvas.height)' in APP
+    assert 'canvas.toBlob((blob) =>' in APP
+    assert 'poster={poster ?? undefined}' in APP
+    assert '<VideoWithFirstFrame className="message-media media-video" controls src={src} />' in APP
+    assert '<VideoWithFirstFrame muted src={attachment.previewUrl} />' in APP
+
+
 def test_studio_drains_duplex_output_after_microphone_capture_stops():
     assert "MAX_RESPONSE_DRAIN_STEPS" in REALTIME_AUDIO
     assert "event.end_of_turn === true" in REALTIME_AUDIO

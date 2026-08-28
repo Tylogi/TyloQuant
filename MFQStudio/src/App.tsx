@@ -607,6 +607,55 @@ async function mediaMetadata(
   }
 }
 
+function VideoWithFirstFrame({
+  className,
+  controls = false,
+  muted = false,
+  src,
+}: {
+  className?: string;
+  controls?: boolean;
+  muted?: boolean;
+  src: string;
+}) {
+  const [poster, setPoster] = useState<string | null>(null);
+
+  useEffect(() => {
+    const video = document.createElement("video");
+    let cancelled = false;
+    let posterUrl: string | null = null;
+    setPoster(null);
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "auto";
+    video.onloadeddata = () => {
+      if (cancelled || !video.videoWidth || !video.videoHeight) return;
+      const scale = Math.min(1, 1280 / video.videoWidth);
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+      canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+      canvas.getContext("2d")?.drawImage(video, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob((blob) => {
+        if (cancelled || !blob) return;
+        posterUrl = URL.createObjectURL(blob);
+        setPoster(posterUrl);
+      }, "image/jpeg", 0.85);
+    };
+    video.src = src;
+    video.load();
+    return () => {
+      cancelled = true;
+      video.onloadeddata = null;
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+      if (posterUrl) URL.revokeObjectURL(posterUrl);
+    };
+  }, [src]);
+
+  return <video className={className} controls={controls} muted={muted} playsInline poster={poster ?? undefined} preload="metadata" src={src} />;
+}
+
 function MediaPartView({ part }: { part: Extract<ContentPart, { media: unknown }> }) {
   const [src, setSrc] = useState<string | null>(null);
 
@@ -632,7 +681,7 @@ function MediaPartView({ part }: { part: Extract<ContentPart, { media: unknown }
     return <img alt="Attached image" className="message-media media-image" loading="lazy" src={src} />;
   }
   if (part.type === "video") {
-    return <video className="message-media media-video" controls preload="metadata" src={src} />;
+    return <VideoWithFirstFrame className="message-media media-video" controls src={src} />;
   }
   return <audio className="message-audio" controls preload="metadata" src={src} />;
 }
@@ -3529,7 +3578,7 @@ export default function App() {
             {error && <div className="error-banner" role="alert"><span>{error}</span><button onClick={() => setError(null)} type="button">×</button></div>}
             <div className="composer-region">
               <form className="composer" onSubmit={send}>
-                {attachments.length > 0 && <div className="attachment-tray">{attachments.map((attachment) => <div className="attachment-chip" key={attachment.id}>{attachment.kind === "image" ? <img alt="" src={attachment.previewUrl} /> : attachment.kind === "video" ? <video muted src={attachment.previewUrl} /> : <span>{attachment.kind === "document" ? "TXT" : "♫"}</span>}<div><strong>{attachment.file.name}</strong><small>{attachment.kind} · {formatNumber(attachment.file.size)} B</small></div><button aria-label={tr("移除附件", "Remove attachment")} onClick={() => removeAttachment(attachment.id)} type="button">×</button></div>)}</div>}
+                {attachments.length > 0 && <div className="attachment-tray">{attachments.map((attachment) => <div className="attachment-chip" key={attachment.id}>{attachment.kind === "image" ? <img alt="" src={attachment.previewUrl} /> : attachment.kind === "video" ? <VideoWithFirstFrame muted src={attachment.previewUrl} /> : <span>{attachment.kind === "document" ? "TXT" : "♫"}</span>}<div><strong>{attachment.file.name}</strong><small>{attachment.kind} · {formatNumber(attachment.file.size)} B</small></div><button aria-label={tr("移除附件", "Remove attachment")} onClick={() => removeAttachment(attachment.id)} type="button">×</button></div>)}</div>}
                 <textarea aria-label={tr("消息", "Message")} disabled={!active || busy} maxLength={32768} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} placeholder={active ? tr("向模型发送消息", "Message MFQ") : tr("请先创建会话", "Create a session first")} rows={1} value={draft} />
                 <div className="composer-toolbar">
                   <input accept={attachmentAccept} hidden multiple onChange={(event) => selectAttachments(event.target.files)} ref={attachmentInputRef} type="file" />
