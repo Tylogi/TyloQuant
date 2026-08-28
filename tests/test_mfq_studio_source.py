@@ -38,6 +38,10 @@ def test_studio_uses_one_package_for_web_and_desktop_clients():
     assert release_config["bundle"]["macOS"]["hardenedRuntime"] is False
     assert 'if [[ "${mfq_signing_identity}" != "-" ]]' in RELEASE_SCRIPT
     assert '"hardenedRuntime":true' in RELEASE_SCRIPT
+    assert "--remap-path-prefix=${HOME}=/mfq-build/home" in RELEASE_SCRIPT
+    assert "--remap-path-prefix=${mfq_project_dir}=/mfq-src" in RELEASE_SCRIPT
+    assert 'RUSTFLAGS="${mfq_release_rustflags}"' in RELEASE_SCRIPT
+    assert "packaged Studio contains a private build path" in RELEASE_SCRIPT
     assert 'mfq-decode-metal" --self-test-metal' in RELEASE_SCRIPT
 
 

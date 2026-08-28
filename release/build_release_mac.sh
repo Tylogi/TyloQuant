@@ -22,6 +22,8 @@ mfq_cli_name="mfq-cli"
 mfq_runtime_name="mfq-decode-metal-aarch64-apple-darwin"
 mfq_perplexity_name="mfq-perplexity-aarch64-apple-darwin"
 mfq_macos_deployment_target="${MFQ_RELEASE_MACOS_DEPLOYMENT_TARGET:-26.2}"
+mfq_release_rustflags="${RUSTFLAGS:-}"
+mfq_release_rustflags="${mfq_release_rustflags:+${mfq_release_rustflags} }--remap-path-prefix=${HOME}=/mfq-build/home --remap-path-prefix=${mfq_project_dir}=/mfq-src"
 
 fail() {
   printf 'error: %s\n' "$*" >&2
@@ -30,7 +32,7 @@ fail() {
 
 [[ "$(uname -s)" == "Darwin" ]] || fail "this release target requires macOS"
 [[ "$(uname -m)" == "arm64" ]] || fail "this release target requires native Apple Silicon"
-for mfq_command in uv cmake codesign hdiutil install_name_tool lipo npm cargo; do
+for mfq_command in uv cmake codesign hdiutil install_name_tool lipo npm cargo strings; do
   command -v "${mfq_command}" >/dev/null 2>&1 || fail "${mfq_command} is required"
 done
 
@@ -174,6 +176,7 @@ npm run check
 if [[ "${mfq_signing_identity}" != "-" ]]; then
   CI=true \
   APPLE_SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:-${mfq_signing_identity}}" \
+  RUSTFLAGS="${mfq_release_rustflags}" \
     npm run tauri -- build \
       --config src-tauri/tauri.release-macos.conf.json \
       --config '{"bundle":{"macOS":{"hardenedRuntime":true}}}' \
@@ -181,6 +184,7 @@ if [[ "${mfq_signing_identity}" != "-" ]]; then
 else
   CI=true \
   APPLE_SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:-${mfq_signing_identity}}" \
+  RUSTFLAGS="${mfq_release_rustflags}" \
     npm run tauri -- build \
       --config src-tauri/tauri.release-macos.conf.json \
       --target "${mfq_tauri_target}"
@@ -205,6 +209,12 @@ hdiutil attach -readonly -nobrowse -mountpoint "${mfq_mount_dir}" "${mfq_release
 mfq_mounted=true
 mfq_packaged_app="${mfq_mount_dir}/MFQ Studio.app"
 codesign --verify --deep --strict --verbose=2 "${mfq_packaged_app}"
+for mfq_private_prefix in "${HOME}/" "${mfq_project_dir}/"; do
+  if strings -a "${mfq_packaged_app}/Contents/MacOS/mfq-studio" \
+      | grep -F "${mfq_private_prefix}" >/dev/null; then
+    fail "packaged Studio contains a private build path"
+  fi
+done
 MFQ_MLX_METALLIB="${mfq_packaged_app}/Contents/Resources/mlx.metallib" \
   "${mfq_packaged_app}/Contents/MacOS/mfq-decode-metal" --self-test-metal
 hdiutil detach "${mfq_mount_dir}" >/dev/null
