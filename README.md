@@ -33,6 +33,8 @@ matched to llama.cpp `IQ*` use `V`, while scalar-quantized models matched to
 `Q*_K*` use `S`. For example, `IQ3_XXS → V3-XXS` and
 `Q4_K_XL → S4-L`.
 
+<img src="./docs/figures/tyloquant-mfq-webui-english.png" alt="TyloQuant MFQ local inference WebUI in English" width="100%">
+
 ## Installation
 
 ### Requirements
@@ -138,6 +140,23 @@ Open the Web UI after the model status changes to `ready`. The
 [`mfq serve` reference](./docs/cli/serve.md) covers model directories,
 authentication, and API access.
 
+## Web UI
+
+`mfq serve` runs the public API and Web UI and manages the private C++ worker.
+It can start empty or load a model at startup:
+
+```shell
+uv run mfq serve
+uv run mfq serve --model path/to/model.mfq --host 127.0.0.1 --port 8090
+uv run mfq serve --model-dir path/to/models --host 127.0.0.1 --port 8090
+```
+
+`--host` and `--port` control the public API listener and default to
+`127.0.0.1:8090`. Open the Web UI address printed by the command.
+
+The desktop Studio **Models and jobs** page loads any local `.mfq` file without
+copying it. Selecting one shard loads the full sibling shard family.
+
 ## Quantization
 
 `mfq quantize` accepts an HF safetensors directory, a full-precision MFQ, or a
@@ -165,25 +184,6 @@ uv run mfq quantize model-hf model-full.mfq --full-precision
 Expert-Wise overrides, MTP augmentation, Important Neurons, sharding, and
 restart controls. [`mfq calibrate`](./docs/cli/calibrate.md) covers activation
 imatrices and calibration.
-
-## Web UI
-
-`mfq serve` runs the public API and Web UI and manages the private C++ worker.
-It can start empty or load a model at startup:
-
-```shell
-uv run mfq serve
-uv run mfq serve --model path/to/model.mfq --host 127.0.0.1 --port 8090
-uv run mfq serve --model-dir path/to/models --host 127.0.0.1 --port 8090
-```
-
-`--host` and `--port` control the public API listener and default to
-`127.0.0.1:8090`. Open the Web UI address printed by the command.
-
-The desktop Studio **Models and jobs** page loads any local `.mfq` file without
-copying it. Selecting one shard loads the full sibling shard family.
-
-<img src="./docs/figures/tyloquant-mfq-webui-english.png" alt="TyloQuant MFQ local inference WebUI in English" width="100%">
 
 ## Results
 

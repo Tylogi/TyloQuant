@@ -26,6 +26,8 @@ NINT · NVQ/NPQ · NEPQ · TPQ · Expert-Wise MoE · CUDA · Metal · C++ Runtim
 
 公开 MFQ 模型使用统一的 `V`/`S` 命名：与 llama.cpp `IQ*` 对齐的向量量化模型使用 `V`，与 `Q*_K*` 对齐的标量量化模型使用 `S`。例如：`IQ3_XXS → V3-XXS`，`Q4_K_XL → S4-L`。
 
+<img src="./docs/figures/tyloquant-mfq-webui-zh.png" alt="TyloQuant MFQ 本地推理 WebUI" width="100%">
+
 ## 安装
 
 ### 环境要求
@@ -119,6 +121,20 @@ uv run mfq serve --model /absolute/path/to/model.mfq
 
 模型状态变为 `ready` 后即可开始对话。模型目录、身份认证和 API 用法见 [`mfq serve`](./docs/cli/serve.md)。
 
+## Web UI
+
+`mfq serve` 启动公开 API 和 Web UI，并管理私有 C++ worker。可以空载启动，也可以直接加载模型：
+
+```shell
+uv run mfq serve
+uv run mfq serve --model path/to/model.mfq --host 127.0.0.1 --port 8090
+uv run mfq serve --model-dir path/to/models --host 127.0.0.1 --port 8090
+```
+
+`--host` 和 `--port` 控制公开 API 监听地址，默认是 `127.0.0.1:8090`。打开命令输出的 Web UI 地址即可。
+
+桌面版 Studio 的 **Models and jobs** 页面可直接加载本地 `.mfq` 文件，不会复制模型。选择任一分片时会加载完整的 sibling shard family。
+
 ## 量化
 
 `mfq quantize` 接受 HF safetensors 目录、满精度 MFQ 或满精度 GGUF。仅执行量化时，安装 `train` extra：
@@ -141,22 +157,6 @@ uv run mfq quantize model-hf model-full.mfq --full-precision
 ```
 
 混合 GGUF recipe、Expert-Wise override、MTP 补全、Important Neurons、分片和断点续作见 [`mfq quantize`](./docs/cli/quantize.md)；activation imatrix 和校准见 [`mfq calibrate`](./docs/cli/calibrate.md)。
-
-## Web UI
-
-`mfq serve` 启动公开 API 和 Web UI，并管理私有 C++ worker。可以空载启动，也可以直接加载模型：
-
-```shell
-uv run mfq serve
-uv run mfq serve --model path/to/model.mfq --host 127.0.0.1 --port 8090
-uv run mfq serve --model-dir path/to/models --host 127.0.0.1 --port 8090
-```
-
-`--host` 和 `--port` 控制公开 API 监听地址，默认是 `127.0.0.1:8090`。打开命令输出的 Web UI 地址即可。
-
-桌面版 Studio 的 **Models and jobs** 页面可直接加载本地 `.mfq` 文件，不会复制模型。选择任一分片时会加载完整的 sibling shard family。
-
-<img src="./docs/figures/tyloquant-mfq-webui-zh.png" alt="TyloQuant MFQ 本地推理 WebUI" width="100%">
 
 ## 核心结果
 
