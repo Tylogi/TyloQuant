@@ -209,44 +209,78 @@ class VoiceOutputComponent:
         )
         last_reported = -1
         last_report_time = 0.0
-        for attempt in range(2):
-            offset = partial.stat().st_size if partial.is_file() else 0
-            headers = {"Range": f"bytes={offset}-"} if offset else {}
-            async with client.stream("GET", url, headers=headers) as response:
-                if response.status_code == 416 and offset == item.size:
-                    os.replace(partial, target)
-                else:
-                    response.raise_for_status()
-                    append = response.status_code == 206 and offset > 0
-                    if not append:
-                        offset = 0
-                    with partial.open("ab" if append else "wb") as handle:
-                        downloaded = offset
-                        async for chunk in response.aiter_bytes(4 * 1024 * 1024):
-                            context.raise_if_cancelled()
-                            handle.write(chunk)
-                            downloaded += len(chunk)
-                            now = time.monotonic()
-                            overall = completed + min(downloaded, item.size)
-                            if overall - last_reported >= 16 * 1024 * 1024 or now - last_report_time >= 1:
-                                last_reported = overall
-                                last_report_time = now
-                                await context.progress(
-                                    min(0.999, overall / VOICE_OUTPUT_TOTAL_BYTES),
-                                    message=f"Downloading {Path(item.path).name}",
-                                    data={
-                                        "downloaded_bytes": overall,
-                                        "total_bytes": VOICE_OUTPUT_TOTAL_BYTES,
-                                    },
-                                )
-                    if partial.stat().st_size != item.size:
-                        raise OSError(
-                            f"{item.path} has {partial.stat().st_size} bytes; expected {item.size}"
-                        )
-                    os.replace(partial, target)
+        for verification_attempt in range(2):
+            for transfer_attempt in range(8):
+                context.raise_if_cancelled()
+                offset = partial.stat().st_size if partial.is_file() else 0
+                headers = {"Range": f"bytes={offset}-"} if offset else {}
+                try:
+                    async with client.stream("GET", url, headers=headers) as response:
+                        if response.status_code == 416:
+                            if offset == item.size:
+                                os.replace(partial, target)
+                                break
+                            partial.unlink(missing_ok=True)
+                            raise OSError(
+                                f"server rejected the partial range for {item.path}"
+                            )
+                        response.raise_for_status()
+                        append = response.status_code == 206 and offset > 0
+                        if not append:
+                            offset = 0
+                        with partial.open("ab" if append else "wb") as handle:
+                            downloaded = offset
+                            async for chunk in response.aiter_bytes(4 * 1024 * 1024):
+                                context.raise_if_cancelled()
+                                handle.write(chunk)
+                                downloaded += len(chunk)
+                                now = time.monotonic()
+                                overall = completed + min(downloaded, item.size)
+                                if (
+                                    overall - last_reported >= 16 * 1024 * 1024
+                                    or now - last_report_time >= 1
+                                ):
+                                    last_reported = overall
+                                    last_report_time = now
+                                    await context.progress(
+                                        min(0.999, overall / VOICE_OUTPUT_TOTAL_BYTES),
+                                        message=f"Downloading {Path(item.path).name}",
+                                        data={
+                                            "downloaded_bytes": overall,
+                                            "total_bytes": VOICE_OUTPUT_TOTAL_BYTES,
+                                        },
+                                    )
+                        actual_size = partial.stat().st_size
+                        if actual_size != item.size:
+                            raise OSError(
+                                f"{item.path} has {actual_size} bytes; expected {item.size}"
+                            )
+                        os.replace(partial, target)
+                        break
+                except (httpx.HTTPError, OSError) as error:
+                    if partial.is_file() and partial.stat().st_size > item.size:
+                        partial.unlink()
+                    if transfer_attempt == 7:
+                        raise
+                    resumed = partial.stat().st_size if partial.is_file() else 0
+                    await context.progress(
+                        min(
+                            0.999,
+                            (completed + min(resumed, item.size))
+                            / VOICE_OUTPUT_TOTAL_BYTES,
+                        ),
+                        message=f"Resuming {Path(item.path).name}",
+                        data={
+                            "downloaded_bytes": completed + min(resumed, item.size),
+                            "total_bytes": VOICE_OUTPUT_TOTAL_BYTES,
+                            "retry": transfer_attempt + 1,
+                            "error": str(error),
+                        },
+                    )
+                    await asyncio.sleep(min(0.5 * (2**transfer_attempt), 5.0))
             if await self._valid_file(target, item):
                 return
             target.unlink(missing_ok=True)
             partial.unlink(missing_ok=True)
-            if attempt == 1:
+            if verification_attempt == 1:
                 raise OSError(f"SHA-256 verification failed for {item.path}")

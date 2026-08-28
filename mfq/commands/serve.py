@@ -293,6 +293,7 @@ def _run(args: argparse.Namespace) -> int:
             host=args.host,
             port=args.port,
             log_level=args.log_level,
+            access_log=args.access_log,
         )
     finally:
         if runtime is not None:
@@ -339,5 +340,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--max-runtime-instances", type=_positive_int, default=2)
     parser.add_argument("--max-requests-per-runtime", type=_positive_int, default=1)
     parser.add_argument("--log-level", default="info")
+    parser.add_argument(
+        "--access-log",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="emit one HTTP access-log line per request (default: enabled)",
+    )
     parser.add_argument("--backend", choices=("auto", "cuda", "metal"), default="auto")
     parser.set_defaults(_impl=_run)

@@ -5493,10 +5493,20 @@ std::int32_t MlxMiniCPMO45Runtime::generate_multimodal(
         throw std::invalid_argument(
             "MiniCPM-o multimodal generation input is invalid");
     }
-    if (!inputs.pixel_values || !inputs.patch_mask ||
-        !inputs.target_sizes || !inputs.image_bounds) {
+    const bool has_any_image =
+        inputs.pixel_values || inputs.patch_mask ||
+        inputs.target_sizes || inputs.image_bounds;
+    const bool has_all_images =
+        inputs.pixel_values && inputs.patch_mask &&
+        inputs.target_sizes && inputs.image_bounds;
+    const bool has_any_audio =
+        inputs.audio_features || inputs.audio_lengths || inputs.audio_bounds;
+    const bool has_all_audio =
+        inputs.audio_features && inputs.audio_lengths && inputs.audio_bounds;
+    if (has_any_image != has_all_images || has_any_audio != has_all_audio ||
+        (!has_all_images && !has_all_audio)) {
         throw std::invalid_argument(
-            "MiniCPM-o multimodal generation requires image tensors");
+            "MiniCPM-o multimodal generation requires complete media tensors");
     }
     if (max_tokens == 0) {
         implementation_->language.reset_cache(1);

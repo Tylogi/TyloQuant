@@ -70,6 +70,7 @@ from mfq.server.models import (
 
 SCHEMA_VERSION = 17
 _CONTENT_PARTS = TypeAdapter(list[ContentPart])
+_MAX_RUNTIME_METRICS = 20_000
 
 
 class StorageError(RuntimeError):
@@ -2502,6 +2503,11 @@ class SessionStore:
                 ),
             )
             sequence = int(cursor.lastrowid)
+            if sequence > _MAX_RUNTIME_METRICS:
+                connection.execute(
+                    "DELETE FROM runtime_metrics WHERE sequence <= ?",
+                    (sequence - _MAX_RUNTIME_METRICS,),
+                )
         return RuntimeMetricSnapshot(
             sequence=sequence,
             instance_id=instance_id,

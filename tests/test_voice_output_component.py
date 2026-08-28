@@ -87,3 +87,58 @@ def test_voice_component_api_exposes_status_and_fixed_install_job(tmp_path: Path
         await jobs.close()
 
     asyncio.run(scenario())
+
+
+def test_voice_component_resumes_incomplete_transport_in_same_job(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    chunk_size = 4 * 1024 * 1024
+    payload = bytes(index % 251 for index in range(chunk_size + 97))
+    item = ComponentFile(
+        "assets/token2wav/resume.bin",
+        len(payload),
+        hashlib.sha256(payload).hexdigest(),
+    )
+    requested_ranges: list[str | None] = []
+
+    class InterruptedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield payload[:chunk_size]
+            raise httpx.ReadError("simulated connection loss")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested_range = request.headers.get("range")
+        requested_ranges.append(requested_range)
+        if requested_range is None:
+            return httpx.Response(200, stream=InterruptedStream())
+        assert requested_range == f"bytes={chunk_size}-"
+        return httpx.Response(
+            206,
+            headers={
+                "content-range": f"bytes {chunk_size}-{len(payload) - 1}/{len(payload)}"
+            },
+            content=payload[chunk_size:],
+        )
+
+    class Context:
+        def raise_if_cancelled(self) -> None:
+            return None
+
+        async def progress(self, *_args, **_kwargs) -> None:
+            return None
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    async def scenario() -> None:
+        component = VoiceOutputComponent(tmp_path)
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            await component._download_file(Context(), client, item, 0)
+        target = component.root / item.path
+        assert target.read_bytes() == payload
+        assert not target.with_name(target.name + ".part").exists()
+
+    monkeypatch.setattr(components.asyncio, "sleep", no_sleep)
+    asyncio.run(scenario())
+    assert requested_ranges == [None, f"bytes={chunk_size}-"]

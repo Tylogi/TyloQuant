@@ -20539,26 +20539,49 @@ static int32_t generate_server_multimodal_tokens(
         mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA);
     auto input_ids = mfq_tensor_backend::tensor(prompt, cuda_i64)
         .reshape({1, -1}).contiguous();
-    auto pixels = mfq_tensor_backend::from_blob(
-        const_cast<float *>(vision.pixel_values.data()),
-        vision.pixel_shape,
-        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32).device(mfq_tensor_backend::kCPU))
-        .clone();
-    auto patch_mask = mfq_tensor_backend::from_blob(
-        const_cast<uint8_t *>(vision.patch_mask.data()),
-        vision.patch_mask_shape,
-        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kUInt8).device(mfq_tensor_backend::kCPU))
-        .clone().to(mfq_tensor_backend::kBool);
-    auto target_sizes = mfq_tensor_backend::from_blob(
-        const_cast<int32_t *>(vision.target_sizes.data()),
-        vision.target_sizes_shape,
-        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32).device(mfq_tensor_backend::kCPU))
-        .clone();
-    auto image_bounds = mfq_tensor_backend::from_blob(
-        const_cast<int64_t *>(vision.image_bounds.data()),
-        std::vector<int64_t>{
-            static_cast<int64_t>(vision.image_bounds.size() / 4), 4},
-        cpu_i64).clone();
+    mfq_tensor_backend::Tensor pixels;
+    mfq_tensor_backend::Tensor patch_mask;
+    mfq_tensor_backend::Tensor target_sizes;
+    mfq_tensor_backend::Tensor image_bounds;
+    if (!vision.image_bounds.empty()) {
+        pixels = mfq_tensor_backend::from_blob(
+            const_cast<float *>(vision.pixel_values.data()),
+            vision.pixel_shape,
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32).device(mfq_tensor_backend::kCPU))
+            .clone();
+        patch_mask = mfq_tensor_backend::from_blob(
+            const_cast<uint8_t *>(vision.patch_mask.data()),
+            vision.patch_mask_shape,
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kUInt8).device(mfq_tensor_backend::kCPU))
+            .clone().to(mfq_tensor_backend::kBool);
+        target_sizes = mfq_tensor_backend::from_blob(
+            const_cast<int32_t *>(vision.target_sizes.data()),
+            vision.target_sizes_shape,
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32).device(mfq_tensor_backend::kCPU))
+            .clone();
+        image_bounds = mfq_tensor_backend::from_blob(
+            const_cast<int64_t *>(vision.image_bounds.data()),
+            std::vector<int64_t>{
+                static_cast<int64_t>(vision.image_bounds.size() / 4), 4},
+            cpu_i64).clone();
+    }
+    mfq_tensor_backend::Tensor audio_features;
+    mfq_tensor_backend::Tensor audio_lengths;
+    mfq_tensor_backend::Tensor audio_bounds;
+    if (!vision.audio_bounds.empty()) {
+        audio_features = mfq_tensor_backend::from_blob(
+            const_cast<float *>(vision.audio_features.data()),
+            vision.audio_features_shape,
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32).device(mfq_tensor_backend::kCPU))
+            .clone();
+        audio_lengths = mfq_tensor_backend::tensor(
+            vision.audio_lengths, cpu_i64).contiguous();
+        audio_bounds = mfq_tensor_backend::from_blob(
+            const_cast<int64_t *>(vision.audio_bounds.data()),
+            std::vector<int64_t>{
+                static_cast<int64_t>(vision.audio_bounds.size() / 4), 4},
+            cpu_i64).clone();
+    }
 
     const bool has_penalties = sampling_has_penalties(sampling);
     auto counts = has_penalties
@@ -20586,9 +20609,9 @@ static int32_t generate_server_multimodal_tokens(
         patch_mask,
         target_sizes,
         image_bounds,
-        mfq_tensor_backend::Tensor(),
-        mfq_tensor_backend::Tensor(),
-        mfq_tensor_backend::Tensor());
+        audio_features,
+        audio_lengths,
+        audio_bounds);
     auto logits = result.logits.index({Slice(), -1, Slice()})
         .contiguous().view({1, -1});
     MFQ_CUDA_CHECK(cudaEventRecord(

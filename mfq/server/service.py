@@ -285,6 +285,7 @@ class ServerService:
         self.cluster = cluster
         self.voice_component = voice_component
         self._active_responses: dict[UUID, tuple[UUID, asyncio.Task[Any]]] = {}
+        self._runtime_metric_state: dict[str, tuple[float, tuple[Any, ...]]] = {}
         if runtime_manager is not None:
             runtime_manager.store = store
             self.jobs.register(
@@ -1129,12 +1130,30 @@ class ServerService:
                 parsed_instance_id = UUID(instance_id)
             except ValueError:
                 parsed_instance_id = None
-        await asyncio.to_thread(
-            self.store.append_runtime_metric,
-            status,
-            instance_id=parsed_instance_id,
-            model=str(status.get("model")) if status.get("model") is not None else None,
+        metric_key = str(parsed_instance_id or status.get("model") or "runtime")
+        last_request = status.get("last_request")
+        last_request_id = (
+            last_request.get("id") if isinstance(last_request, dict) else None
         )
+        signature = (
+            status.get("runtime_state"),
+            status.get("active_requests"),
+            status.get("total_requests"),
+            status.get("failed_requests"),
+            status.get("duplex_active"),
+            status.get("reloading"),
+            last_request_id,
+        )
+        now = time.monotonic()
+        previous = self._runtime_metric_state.get(metric_key)
+        if previous is None or previous[1] != signature or now - previous[0] >= 60.0:
+            self._runtime_metric_state[metric_key] = (now, signature)
+            await asyncio.to_thread(
+                self.store.append_runtime_metric,
+                status,
+                instance_id=parsed_instance_id,
+                model=str(status.get("model")) if status.get("model") is not None else None,
+            )
         return status
 
     async def runtime_metrics(

@@ -1011,28 +1011,47 @@ int serve_loaded_runtime(
                     std::nullopt,
                     std::nullopt,
                 };
-                inputs.pixel_values = mlx::core::array(
-                    vision.pixel_values.begin(),
-                    checked_mlx_shape(
-                        vision.pixel_shape, "pixel_values"),
-                    mlx::core::float32);
-                inputs.patch_mask = mlx::core::astype(
-                    mlx::core::array(
-                        vision.patch_mask.begin(),
+                if (!vision.image_bounds.empty()) {
+                    inputs.pixel_values = mlx::core::array(
+                        vision.pixel_values.begin(),
                         checked_mlx_shape(
-                            vision.patch_mask_shape, "patch_mask"),
-                        mlx::core::uint8),
-                    mlx::core::bool_);
-                inputs.target_sizes = mlx::core::array(
-                    vision.target_sizes.begin(),
-                    checked_mlx_shape(
-                        vision.target_sizes_shape, "target_sizes"),
-                    mlx::core::int32);
-                inputs.image_bounds = mlx::core::array(
-                    vision.image_bounds.begin(),
-                    mlx::core::Shape{
-                        static_cast<int>(vision.image_bounds.size() / 4), 4},
-                    mlx::core::int64);
+                            vision.pixel_shape, "pixel_values"),
+                        mlx::core::float32);
+                    inputs.patch_mask = mlx::core::astype(
+                        mlx::core::array(
+                            vision.patch_mask.begin(),
+                            checked_mlx_shape(
+                                vision.patch_mask_shape, "patch_mask"),
+                            mlx::core::uint8),
+                        mlx::core::bool_);
+                    inputs.target_sizes = mlx::core::array(
+                        vision.target_sizes.begin(),
+                        checked_mlx_shape(
+                            vision.target_sizes_shape, "target_sizes"),
+                        mlx::core::int32);
+                    inputs.image_bounds = mlx::core::array(
+                        vision.image_bounds.begin(),
+                        mlx::core::Shape{
+                            static_cast<int>(vision.image_bounds.size() / 4), 4},
+                        mlx::core::int64);
+                }
+                if (!vision.audio_bounds.empty()) {
+                    inputs.audio_features = mlx::core::array(
+                        vision.audio_features.begin(),
+                        checked_mlx_shape(
+                            vision.audio_features_shape, "audio_features"),
+                        mlx::core::float32);
+                    inputs.audio_lengths = mlx::core::array(
+                        vision.audio_lengths.begin(),
+                        mlx::core::Shape{
+                            static_cast<int>(vision.audio_lengths.size())},
+                        mlx::core::int64);
+                    inputs.audio_bounds = mlx::core::array(
+                        vision.audio_bounds.begin(),
+                        mlx::core::Shape{
+                            static_cast<int>(vision.audio_bounds.size() / 4), 4},
+                        mlx::core::int64);
+                }
 
                 mfq::metal::MlxSamplingParams parameters;
                 parameters.temperature = sampling.temperature;

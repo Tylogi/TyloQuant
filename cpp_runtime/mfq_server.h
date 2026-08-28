@@ -76,6 +76,10 @@ struct MfqVisionInput {
     std::vector<int32_t> target_sizes;
     std::vector<int64_t> target_sizes_shape;
     std::vector<int64_t> image_bounds;
+    std::vector<float> audio_features;
+    std::vector<int64_t> audio_features_shape;
+    std::vector<int64_t> audio_lengths;
+    std::vector<int64_t> audio_bounds;
 };
 
 struct MfqServerConfig {

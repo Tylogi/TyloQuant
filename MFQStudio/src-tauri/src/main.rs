@@ -10,6 +10,7 @@ use url::Url;
 const CONFIG_FILE: &str = "studio.json";
 const DATABASE_FILE: &str = "mfq-server.sqlite3";
 const LOG_FILE: &str = "mfq-server.log";
+const LOG_ROTATE_BYTES: u64 = 16 * 1024 * 1024;
 const PID_FILE: &str = "mfq-server.pid";
 const MODEL_DIRECTORY: &str = "models";
 const CREDENTIAL_SERVICE: &str = "MFQ Studio";
@@ -138,6 +139,17 @@ async fn is_mfq_server(client: &reqwest::Client, base_url: &str) -> bool {
 }
 
 fn open_log(path: &Path) -> Result<File, String> {
+    if path
+        .metadata()
+        .map(|metadata| metadata.len() >= LOG_ROTATE_BYTES)
+        .unwrap_or(false)
+    {
+        let backup = path.with_extension("log.1");
+        if backup.exists() {
+            fs::remove_file(&backup).map_err(|error| error.to_string())?;
+        }
+        fs::rename(path, backup).map_err(|error| error.to_string())?;
+    }
     OpenOptions::new()
         .create(true)
         .append(true)
@@ -295,6 +307,7 @@ async fn start_local(app: &AppHandle, config: StudioConfig) -> Result<StudioStat
     command
         .arg("serve")
         .arg("--no-web-ui")
+        .arg("--no-access-log")
         .arg("--db")
         .arg(data_dir.join(DATABASE_FILE))
         .arg("--model-dir")

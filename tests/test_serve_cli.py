@@ -62,6 +62,7 @@ def test_serve_exposes_public_host_and_port_options(tmp_path: Path) -> None:
     assert defaults.port == 8090
     assert defaults.model is None
     assert defaults.running_executable is None
+    assert defaults.access_log is True
     assert args.host == "0.0.0.0"
     assert args.port == 9001
 
@@ -334,3 +335,4 @@ def test_serve_starts_without_loading_an_initial_model(tmp_path: Path, monkeypat
     assert _run(args) == 0
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8090
+    assert captured["access_log"] is True

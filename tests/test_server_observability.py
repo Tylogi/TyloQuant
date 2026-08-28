@@ -7,6 +7,7 @@ from uuid import UUID
 
 import httpx
 
+import mfq.server.storage as storage_module
 from mfq.server.api import create_app
 from mfq.server.models import RuntimeLogLevel
 from mfq.server.service import ServerService
@@ -46,10 +47,13 @@ def test_runtime_metrics_and_logs_persist_and_filter(tmp_path: Path) -> None:
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
                 status = await client.get("/api/v1/runtime/status")
                 assert status.status_code == 200
+                repeated_status = await client.get("/api/v1/runtime/status")
+                assert repeated_status.status_code == 200
                 metrics = await client.get(
                     "/api/v1/runtime/metrics", params={"instance_id": str(INSTANCE_ID)}
                 )
                 assert metrics.status_code == 200
+                assert len(metrics.json()["data"]) == 1
                 assert metrics.json()["data"][0]["values"]["total_requests"] == 3
                 assert metrics.json()["data"][0]["model"] == "model-a"
 
@@ -67,3 +71,14 @@ def test_runtime_metrics_and_logs_persist_and_filter(tmp_path: Path) -> None:
         assert len(reopened.list_runtime_logs()) == 2
 
     asyncio.run(run())
+
+
+def test_runtime_metric_history_has_a_bounded_retention_window(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(storage_module, "_MAX_RUNTIME_METRICS", 3)
+    store = SessionStore(tmp_path / "mfq.server.sqlite3")
+    for value in range(5):
+        store.append_runtime_metric({"value": value})
+
+    assert [entry.values["value"] for entry in store.list_runtime_metrics()] == [2, 3, 4]

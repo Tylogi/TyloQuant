@@ -1591,6 +1591,7 @@ static json request_metric_values_json(
             {"frequency_penalty", sampling.frequency_penalty},
             {"repetition_penalty", sampling.repetition_penalty},
             {"seed", sampling.seed},
+            {"enable_thinking", sampling.enable_thinking},
         }},
     };
 }
@@ -2394,108 +2395,227 @@ static MfqVisionInput parse_mfq_vision(
     if (value.contains("binary_file")) {
         file_reader = std::make_unique<TensorFileReader>(value);
     }
-    auto pixels = decode_tensor<float>(
-        value, "pixel_values", "float32", file_reader.get());
-    result.pixel_values = std::move(pixels.first);
-    result.pixel_shape = std::move(pixels.second);
-    auto mask = decode_tensor<uint8_t>(
-        value, "patch_mask", "uint8", file_reader.get());
-    result.patch_mask = std::move(mask.first);
-    result.patch_mask_shape = std::move(mask.second);
-    auto sizes = decode_tensor<int32_t>(
-        value, "target_sizes", "int32", file_reader.get());
-    result.target_sizes = std::move(sizes.first);
-    result.target_sizes_shape = std::move(sizes.second);
+    const bool has_any_image_tensor =
+        value.contains("pixel_values") || value.contains("patch_mask") ||
+        value.contains("target_sizes");
+    const bool has_all_image_tensors =
+        value.contains("pixel_values") && value.contains("patch_mask") &&
+        value.contains("target_sizes");
+    if (has_any_image_tensor != has_all_image_tensors) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "mfq_multimodal image tensors must be provided together",
+            "mfq_multimodal");
+    }
+    const bool has_any_audio_tensor =
+        value.contains("audio_features") || value.contains("audio_lengths");
+    const bool has_all_audio_tensors =
+        value.contains("audio_features") && value.contains("audio_lengths");
+    if (has_any_audio_tensor != has_all_audio_tensors) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "mfq_multimodal audio tensors must be provided together",
+            "mfq_multimodal");
+    }
+    if (!has_all_image_tensors && !has_all_audio_tensors) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "mfq_multimodal contains no media tensors", "mfq_multimodal");
+    }
 
-    if (result.pixel_shape.size() != 4 || result.pixel_shape[1] != 3 ||
-        result.pixel_shape[2] != 14 ||
-        result.patch_mask_shape.size() != 2 ||
-        result.target_sizes_shape.size() != 2 ||
-        result.target_sizes_shape[1] != 2 ||
-        result.pixel_shape[0] != result.patch_mask_shape[0] ||
-        result.pixel_shape[0] != result.target_sizes_shape[0] ||
-        result.pixel_shape[3] % 14 != 0 ||
-        result.patch_mask_shape[1] != result.pixel_shape[3] / 14) {
-        throw ApiError(
-            400, "invalid_request_error",
-            "mfq_multimodal tensor geometry is invalid", "mfq_multimodal");
-    }
-    const int64_t source_count = result.pixel_shape[0];
-    if (source_count > 576) {
-        throw ApiError(
-            400, "invalid_request_error",
-            "mfq_multimodal contains too many image slices",
-            "mfq_multimodal.pixel_values");
-    }
-    for (int64_t source = 0; source < source_count; ++source) {
-        const int64_t rows = result.target_sizes[2 * source];
-        const int64_t columns = result.target_sizes[2 * source + 1];
-        if (rows <= 0 || columns <= 0 ||
-            rows * columns > result.patch_mask_shape[1]) {
+    if (has_all_image_tensors) {
+        auto pixels = decode_tensor<float>(
+            value, "pixel_values", "float32", file_reader.get());
+        result.pixel_values = std::move(pixels.first);
+        result.pixel_shape = std::move(pixels.second);
+        auto mask = decode_tensor<uint8_t>(
+            value, "patch_mask", "uint8", file_reader.get());
+        result.patch_mask = std::move(mask.first);
+        result.patch_mask_shape = std::move(mask.second);
+        auto sizes = decode_tensor<int32_t>(
+            value, "target_sizes", "int32", file_reader.get());
+        result.target_sizes = std::move(sizes.first);
+        result.target_sizes_shape = std::move(sizes.second);
+
+        if (result.pixel_shape.size() != 4 || result.pixel_shape[1] != 3 ||
+            result.pixel_shape[2] != 14 ||
+            result.patch_mask_shape.size() != 2 ||
+            result.target_sizes_shape.size() != 2 ||
+            result.target_sizes_shape[1] != 2 ||
+            result.pixel_shape[0] != result.patch_mask_shape[0] ||
+            result.pixel_shape[0] != result.target_sizes_shape[0] ||
+            result.pixel_shape[3] % 14 != 0 ||
+            result.patch_mask_shape[1] != result.pixel_shape[3] / 14) {
             throw ApiError(
                 400, "invalid_request_error",
-                "mfq_multimodal target size disagrees with pixel geometry",
-                "mfq_multimodal.target_sizes");
+                "mfq_multimodal image tensor geometry is invalid",
+                "mfq_multimodal");
         }
-        for (int64_t patch = 0; patch < result.patch_mask_shape[1]; ++patch) {
-            const bool expected = patch < rows * columns;
-            const uint8_t actual = result.patch_mask[
-                static_cast<size_t>(source * result.patch_mask_shape[1] + patch)];
-            if (actual > 1 || static_cast<bool>(actual) != expected) {
+        const int64_t source_count = result.pixel_shape[0];
+        if (source_count <= 0 || source_count > 576) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "mfq_multimodal contains an invalid number of image slices",
+                "mfq_multimodal.pixel_values");
+        }
+        for (int64_t source = 0; source < source_count; ++source) {
+            const int64_t rows = result.target_sizes[2 * source];
+            const int64_t columns = result.target_sizes[2 * source + 1];
+            if (rows <= 0 || columns <= 0 ||
+                rows * columns > result.patch_mask_shape[1]) {
                 throw ApiError(
                     400, "invalid_request_error",
-                    "mfq_multimodal patch mask is not a contiguous active prefix",
-                    "mfq_multimodal.patch_mask");
+                    "mfq_multimodal target size disagrees with pixel geometry",
+                    "mfq_multimodal.target_sizes");
+            }
+            for (int64_t patch = 0; patch < result.patch_mask_shape[1]; ++patch) {
+                const bool expected = patch < rows * columns;
+                const uint8_t actual = result.patch_mask[
+                    static_cast<size_t>(source * result.patch_mask_shape[1] + patch)];
+                if (actual > 1 || static_cast<bool>(actual) != expected) {
+                    throw ApiError(
+                        400, "invalid_request_error",
+                        "mfq_multimodal patch mask is not a contiguous active prefix",
+                        "mfq_multimodal.patch_mask");
+                }
             }
         }
-    }
-    if (!std::all_of(
-            result.pixel_values.begin(), result.pixel_values.end(),
-            [](float item) { return std::isfinite(item); })) {
-        throw ApiError(
-            400, "invalid_request_error",
-            "mfq_multimodal pixel_values contains a non-finite value",
-            "mfq_multimodal.pixel_values");
+        if (!std::all_of(
+                result.pixel_values.begin(), result.pixel_values.end(),
+                [](float item) { return std::isfinite(item); })) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "mfq_multimodal pixel_values contains a non-finite value",
+                "mfq_multimodal.pixel_values");
+        }
+
+        const int64_t image_start = single_special_token(tokenizer, "<image>");
+        const int64_t image_end = single_special_token(tokenizer, "</image>");
+        const int64_t slice_start = single_special_token(tokenizer, "<slice>");
+        const int64_t slice_end = single_special_token(tokenizer, "</slice>");
+        for (size_t index = 0; index < prompt.size(); ++index) {
+            const int64_t token = prompt[index];
+            if (token != image_start && token != slice_start) continue;
+            const int64_t end_token = token == image_start ? image_end : slice_end;
+            const auto found = std::find(
+                prompt.begin() + static_cast<std::ptrdiff_t>(index + 1),
+                prompt.end(), end_token);
+            if (found == prompt.end()) {
+                throw ApiError(
+                    400, "invalid_request_error",
+                    "MiniCPM-o image placeholder is missing its end token",
+                    "messages");
+            }
+            const size_t end = static_cast<size_t>(found - prompt.begin());
+            if (end - index - 1 != 64) {
+                throw ApiError(
+                    400, "invalid_request_error",
+                    "MiniCPM-o image placeholder must contain 64 query tokens",
+                    "messages");
+            }
+            const int64_t source =
+                static_cast<int64_t>(result.image_bounds.size() / 4);
+            result.image_bounds.insert(
+                result.image_bounds.end(),
+                {0, source, static_cast<int64_t>(index + 1),
+                 static_cast<int64_t>(end)});
+            index = end;
+        }
+        if (result.image_bounds.size() / 4 !=
+            static_cast<size_t>(source_count)) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "MiniCPM-o image placeholders do not match processed image slices",
+                "messages");
+        }
     }
 
-    const int64_t image_start = single_special_token(tokenizer, "<image>");
-    const int64_t image_end = single_special_token(tokenizer, "</image>");
-    const int64_t slice_start = single_special_token(tokenizer, "<slice>");
-    const int64_t slice_end = single_special_token(tokenizer, "</slice>");
-    for (size_t index = 0; index < prompt.size(); ++index) {
-        const int64_t token = prompt[index];
-        if (token != image_start && token != slice_start) continue;
-        const int64_t end_token = token == image_start ? image_end : slice_end;
-        const auto found = std::find(
-            prompt.begin() + static_cast<std::ptrdiff_t>(index + 1),
-            prompt.end(), end_token);
-        if (found == prompt.end()) {
+    if (has_all_audio_tensors) {
+        auto features = decode_tensor<float>(
+            value, "audio_features", "float32", file_reader.get());
+        result.audio_features = std::move(features.first);
+        result.audio_features_shape = std::move(features.second);
+        auto lengths = decode_tensor<int64_t>(
+            value, "audio_lengths", "int64", file_reader.get());
+        result.audio_lengths = std::move(lengths.first);
+        const auto & length_shape = lengths.second;
+        if (result.audio_features_shape.size() != 3 ||
+            result.audio_features_shape[0] <= 0 ||
+            result.audio_features_shape[0] > 128 ||
+            result.audio_features_shape[1] != 80 ||
+            result.audio_features_shape[2] < 9 ||
+            result.audio_features_shape[2] > 3000 ||
+            length_shape.size() != 1 ||
+            length_shape[0] != result.audio_features_shape[0]) {
             throw ApiError(
                 400, "invalid_request_error",
-                "MiniCPM-o image placeholder is missing its end token",
-                "messages");
+                "mfq_multimodal audio tensor geometry is invalid",
+                "mfq_multimodal");
         }
-        const size_t end = static_cast<size_t>(found - prompt.begin());
-        if (end - index - 1 != 64) {
+        if (!std::all_of(
+                result.audio_features.begin(), result.audio_features.end(),
+                [](float item) { return std::isfinite(item); })) {
             throw ApiError(
                 400, "invalid_request_error",
-                "MiniCPM-o image placeholder must contain 64 query tokens",
+                "mfq_multimodal audio_features contains a non-finite value",
+                "mfq_multimodal.audio_features");
+        }
+        std::vector<int64_t> pooled_lengths;
+        pooled_lengths.reserve(result.audio_lengths.size());
+        for (const int64_t length : result.audio_lengths) {
+            if (length < 9 || length > result.audio_features_shape[2]) {
+                throw ApiError(
+                    400, "invalid_request_error",
+                    "mfq_multimodal audio length is out of range",
+                    "mfq_multimodal.audio_lengths");
+            }
+            const int64_t after_convolution = (length - 1) / 2 + 1;
+            const int64_t pooled = (after_convolution - 5) / 5 + 1;
+            if (pooled <= 0) {
+                throw ApiError(
+                    400, "invalid_request_error",
+                    "mfq_multimodal audio input is too short",
+                    "mfq_multimodal.audio_lengths");
+            }
+            pooled_lengths.push_back(pooled);
+        }
+
+        const int64_t audio_start =
+            single_special_token(tokenizer, "<|audio_start|>");
+        const int64_t audio_end =
+            single_special_token(tokenizer, "<|audio_end|>");
+        for (size_t index = 0; index < prompt.size(); ++index) {
+            if (prompt[index] != audio_start) continue;
+            const auto found = std::find(
+                prompt.begin() + static_cast<std::ptrdiff_t>(index + 1),
+                prompt.end(), audio_end);
+            if (found == prompt.end()) {
+                throw ApiError(
+                    400, "invalid_request_error",
+                    "MiniCPM-o audio placeholder is missing its end token",
+                    "messages");
+            }
+            const size_t end = static_cast<size_t>(found - prompt.begin());
+            const size_t source = result.audio_bounds.size() / 4;
+            if (source >= pooled_lengths.size() ||
+                static_cast<int64_t>(end - index - 1) != pooled_lengths[source]) {
+                throw ApiError(
+                    400, "invalid_request_error",
+                    "MiniCPM-o audio placeholder does not match pooled audio length",
+                    "messages");
+            }
+            result.audio_bounds.insert(
+                result.audio_bounds.end(),
+                {0, static_cast<int64_t>(source),
+                 static_cast<int64_t>(index + 1), static_cast<int64_t>(end)});
+            index = end;
+        }
+        if (result.audio_bounds.size() / 4 != pooled_lengths.size()) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "MiniCPM-o audio placeholders do not match processed audio chunks",
                 "messages");
         }
-        const int64_t source =
-            static_cast<int64_t>(result.image_bounds.size() / 4);
-        result.image_bounds.insert(
-            result.image_bounds.end(),
-            {0, source, static_cast<int64_t>(index + 1),
-             static_cast<int64_t>(end)});
-        index = end;
-    }
-    if (result.image_bounds.size() / 4 !=
-        static_cast<size_t>(source_count)) {
-        throw ApiError(
-            400, "invalid_request_error",
-            "MiniCPM-o image placeholders do not match processed image slices",
-            "messages");
     }
     return result;
 }

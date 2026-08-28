@@ -10,6 +10,7 @@ import os
 import platform
 import secrets
 import tempfile
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -197,14 +198,12 @@ class _AVFoundationVideoDecoder:
                 )
             return [frame for frame in frames if frame is not None]
         finally:
-            try:
+            with suppress(FileNotFoundError):
                 os.unlink(temporary_path)
-            except FileNotFoundError:
-                pass
 
 
 class MiniCPMO45VisionProcessor:
-    """Exact CPU port of the official MiniCPM-o 4.5 image processor."""
+    """Exact CPU port of the official MiniCPM-o 4.5 media processors."""
 
     patch_size = 14
     scale_resolution = 448
@@ -212,12 +211,17 @@ class MiniCPMO45VisionProcessor:
     maximum_image_slices = 9
     maximum_video_frames = 64
     video_fps = 1.0
+    audio_sample_rate = 16_000
+    audio_chunk_samples = 30 * audio_sample_rate
+    minimum_audio_samples = audio_sample_rate // 10
+    maximum_audio_samples = 30 * 60 * audio_sample_rate
 
     def __init__(self, avfoundation_library: str | Path | None = None) -> None:
         library = avfoundation_library or os.environ.get(
             "MFQ_AVFOUNDATION_VIDEO_LIBRARY"
         )
         self._avfoundation_decoder: _AVFoundationVideoDecoder | None = None
+        self._mel_extractor: Any | None = None
         if platform.system() == "Darwin" and library and Path(library).is_file():
             try:
                 self._avfoundation_decoder = _AVFoundationVideoDecoder(library)
@@ -377,6 +381,99 @@ class MiniCPMO45VisionProcessor:
         except Exception as error:
             raise VisionProcessingError(f"unable to decode image: {error}") from error
 
+    @staticmethod
+    def _decode_audio_data(value: Any) -> bytes:
+        if not isinstance(value, dict) or not isinstance(value.get("data"), str):
+            raise VisionProcessingError("input_audio content is missing its base64 data")
+        try:
+            data = base64.b64decode(value["data"], validate=True)
+        except ValueError as error:
+            raise VisionProcessingError("audio input contains invalid base64") from error
+        if not data:
+            raise VisionProcessingError("audio input is empty")
+        return data
+
+    @classmethod
+    def _decode_audio(cls, data: bytes) -> np.ndarray:
+        try:
+            import av
+        except ImportError as error:
+            raise VisionProcessingError(
+                "audio input requires the optional PyAV dependency"
+            ) from error
+
+        chunks: list[np.ndarray] = []
+        try:
+            with av.open(io.BytesIO(data), mode="r") as container:
+                streams = [stream for stream in container.streams if stream.type == "audio"]
+                if not streams:
+                    raise VisionProcessingError("audio contains no audio stream")
+                resampler = av.AudioResampler(
+                    format="fltp",
+                    layout="mono",
+                    rate=cls.audio_sample_rate,
+                )
+
+                def append_frames(frames: Any) -> None:
+                    if frames is None:
+                        return
+                    if not isinstance(frames, list):
+                        frames = [frames]
+                    for frame in frames:
+                        if frame is not None:
+                            chunks.append(
+                                np.ascontiguousarray(
+                                    frame.to_ndarray().reshape(-1),
+                                    dtype=np.float32,
+                                )
+                            )
+
+                for frame in container.decode(streams[0]):
+                    append_frames(resampler.resample(frame))
+                append_frames(resampler.resample(None))
+        except VisionProcessingError:
+            raise
+        except Exception as error:
+            raise VisionProcessingError(f"unable to decode audio: {error}") from error
+        if not chunks:
+            raise VisionProcessingError("audio contains no decodable samples")
+        waveform = np.ascontiguousarray(np.concatenate(chunks), dtype=np.float32)
+        if waveform.size > cls.maximum_audio_samples:
+            raise VisionProcessingError("audio input exceeds the 30 minute limit")
+        if not np.isfinite(waveform).all():
+            raise VisionProcessingError("audio input contains a non-finite sample")
+        return np.clip(waveform, -1.0, 1.0)
+
+    @staticmethod
+    def _audio_placeholder(frame_count: int) -> str:
+        after_convolution = (frame_count - 1) // 2 + 1
+        pooled = (after_convolution - 5) // 5 + 1
+        if frame_count <= 0 or pooled <= 0:
+            raise VisionProcessingError("audio input is too short")
+        return f"<|audio_start|>{'<unk>' * pooled}<|audio_end|>"
+
+    def _prepare_audio(self, data: bytes) -> list[np.ndarray]:
+        from mfq.runtime.minicpmo45_realtime import MiniCPMOMel
+
+        waveform = self._decode_audio(data)
+        if waveform.size < self.minimum_audio_samples:
+            waveform = np.pad(
+                waveform,
+                (0, self.minimum_audio_samples - waveform.size),
+            )
+        if self._mel_extractor is None:
+            self._mel_extractor = MiniCPMOMel()
+        result: list[np.ndarray] = []
+        for start in range(0, waveform.size, self.audio_chunk_samples):
+            chunk = waveform[start : start + self.audio_chunk_samples]
+            if chunk.size < self.minimum_audio_samples:
+                chunk = np.pad(chunk, (0, self.minimum_audio_samples - chunk.size))
+            features = self._mel_extractor.extract(chunk, fixed_floor=False)
+            if features.shape[0] != 80 or not 9 <= features.shape[1] <= 3000:
+                raise VisionProcessingError("processed audio tensor geometry is invalid")
+            result.append(np.ascontiguousarray(features, dtype=np.float32))
+        return result
+
     @classmethod
     def _decode_video(cls, data: bytes) -> list[Any]:
         try:
@@ -508,6 +605,7 @@ class MiniCPMO45VisionProcessor:
         little_endian = {
             "float32": "<f4",
             "int32": "<i4",
+            "int64": "<i8",
             "uint8": "u1",
         }[dtype]
         return np.ascontiguousarray(value, dtype=little_endian)
@@ -564,10 +662,8 @@ class MiniCPMO45VisionProcessor:
                 tensors["binary_file"]["size"] = stream.tell()
             return tensors, path
         except BaseException:
-            try:
+            with suppress(OSError):
                 os.close(descriptor)
-            except OSError:
-                pass
             path.unlink(missing_ok=True)
             raise
 
@@ -576,29 +672,57 @@ class MiniCPMO45VisionProcessor:
         cls,
         patches: list[np.ndarray],
         target_sizes: list[tuple[int, int]],
+        audio_features: list[np.ndarray],
         *,
         use_binary_file: bool = False,
     ) -> tuple[dict[str, Any], tuple[Path, ...]]:
-        if not patches or len(patches) != len(target_sizes):
-            raise VisionProcessingError("vision request contains no processed image patches")
-        sequences = [patch.reshape(3 * cls.patch_size, -1).T for patch in patches]
-        maximum_length = max(sequence.shape[0] for sequence in sequences)
-        padded = np.zeros((len(sequences), maximum_length, 3 * cls.patch_size), dtype=np.float32)
-        for index, sequence in enumerate(sequences):
-            padded[index, : sequence.shape[0]] = sequence
-        pixels = padded.transpose(0, 2, 1).reshape(
-            len(sequences), 3, cls.patch_size, maximum_length
-        )
-        sizes = np.asarray(target_sizes, dtype=np.int32)
-        maximum_patches = int(np.max(sizes[:, 0] * sizes[:, 1]))
-        mask = np.zeros((len(sequences), maximum_patches), dtype=np.uint8)
-        for index, (rows, columns) in enumerate(target_sizes):
-            mask[index, : rows * columns] = 1
-        values = [
-            ("pixel_values", pixels, "float32"),
-            ("patch_mask", mask, "uint8"),
-            ("target_sizes", sizes, "int32"),
-        ]
+        values: list[tuple[str, np.ndarray, str]] = []
+        if patches or target_sizes:
+            if not patches or len(patches) != len(target_sizes):
+                raise VisionProcessingError("processed image tensor geometry is invalid")
+            sequences = [patch.reshape(3 * cls.patch_size, -1).T for patch in patches]
+            maximum_length = max(sequence.shape[0] for sequence in sequences)
+            padded = np.zeros(
+                (len(sequences), maximum_length, 3 * cls.patch_size),
+                dtype=np.float32,
+            )
+            for index, sequence in enumerate(sequences):
+                padded[index, : sequence.shape[0]] = sequence
+            pixels = padded.transpose(0, 2, 1).reshape(
+                len(sequences), 3, cls.patch_size, maximum_length
+            )
+            sizes = np.asarray(target_sizes, dtype=np.int32)
+            maximum_patches = int(np.max(sizes[:, 0] * sizes[:, 1]))
+            mask = np.zeros((len(sequences), maximum_patches), dtype=np.uint8)
+            for index, (rows, columns) in enumerate(target_sizes):
+                mask[index, : rows * columns] = 1
+            values.extend(
+                [
+                    ("pixel_values", pixels, "float32"),
+                    ("patch_mask", mask, "uint8"),
+                    ("target_sizes", sizes, "int32"),
+                ]
+            )
+        if audio_features:
+            maximum_frames = max(features.shape[1] for features in audio_features)
+            padded_audio = np.zeros(
+                (len(audio_features), 80, maximum_frames),
+                dtype=np.float32,
+            )
+            lengths = np.empty(len(audio_features), dtype=np.int64)
+            for index, features in enumerate(audio_features):
+                if features.ndim != 2 or features.shape[0] != 80:
+                    raise VisionProcessingError("processed audio tensor geometry is invalid")
+                padded_audio[index, :, : features.shape[1]] = features
+                lengths[index] = features.shape[1]
+            values.extend(
+                [
+                    ("audio_features", padded_audio, "float32"),
+                    ("audio_lengths", lengths, "int64"),
+                ]
+            )
+        if not values:
+            raise VisionProcessingError("multimodal request contains no processed media")
         if use_binary_file:
             tensors, path = cls._binary_tensors(values)
             return tensors, (path,)
@@ -622,6 +746,7 @@ class MiniCPMO45VisionProcessor:
         prepared = copy.deepcopy(messages)
         patches: list[np.ndarray] = []
         target_sizes: list[tuple[int, int]] = []
+        audio_features: list[np.ndarray] = []
         source_count = 0
         frame_count = 0
         image_index = 0
@@ -663,9 +788,15 @@ class MiniCPMO45VisionProcessor:
                     source_count += 1
                     frame_count += len(images)
                 elif item_type == "input_audio":
-                    raise VisionProcessingError(
-                        "recorded audio preprocessing is not part of the native vision request"
+                    features_list = self._prepare_audio(
+                        self._decode_audio_data(item.get("input_audio"))
                     )
+                    source_count += 1
+                    found_media = True
+                    for features in features_list:
+                        pieces.append(self._audio_placeholder(features.shape[1]))
+                        audio_features.append(features)
+                    continue
                 else:
                     raise VisionProcessingError(f"unsupported multimodal content type: {item_type}")
                 found_media = True
@@ -692,6 +823,7 @@ class MiniCPMO45VisionProcessor:
         tensors, cleanup_paths = self._pack_tensors(
             patches,
             target_sizes,
+            audio_features,
             use_binary_file=use_binary_file,
         )
         return ProcessedVisionRequest(

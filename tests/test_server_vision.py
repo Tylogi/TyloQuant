@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import stat
+import wave
 from pathlib import Path
 
 import httpx
@@ -29,6 +30,7 @@ def _decode_tensor(tensor: dict[str, object]) -> np.ndarray:
     dtypes = {
         "float32": "<f4",
         "int32": "<i4",
+        "int64": "<i8",
         "uint8": "u1",
     }
     raw = base64.b64decode(str(tensor["data_base64"]), validate=True)
@@ -39,6 +41,7 @@ def _decode_binary_tensor(tensors: dict[str, object], name: str) -> np.ndarray:
     dtypes = {
         "float32": "<f4",
         "int32": "<i4",
+        "int64": "<i8",
         "uint8": "u1",
     }
     file_spec = tensors["binary_file"]
@@ -185,6 +188,49 @@ def test_video_request_samples_frames_and_uses_unsliced_placeholders() -> None:
     assert content.count("<image>") == result.frame_count
     assert "<slice>" not in content
     assert _decode_tensor(result.tensors["pixel_values"]).shape[0] == result.frame_count
+
+
+def test_audio_request_builds_exact_mel_and_placeholder_contract() -> None:
+    sample_rate = 16_000
+    samples = np.arange(sample_rate, dtype=np.float32)
+    waveform = np.sin(samples * np.float32(2.0 * np.pi * 220.0 / sample_rate))
+    pcm = np.rint(waveform * np.float32(12_000.0)).astype("<i2")
+    encoded_audio = io.BytesIO()
+    with wave.open(encoded_audio, "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(sample_rate)
+        output.writeframes(pcm.tobytes())
+    encoded = base64.b64encode(encoded_audio.getvalue()).decode("ascii")
+
+    result = MiniCPMO45VisionProcessor().prepare_openai_messages(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": encoded, "format": "wav"},
+                    },
+                    {"type": "text", "text": "Please answer the recording."},
+                ],
+            }
+        ]
+    )
+
+    assert result is not None
+    assert result.source_count == 1
+    assert result.frame_count == 0
+    content = result.messages[0]["content"]
+    features = _decode_tensor(result.tensors["audio_features"])
+    lengths = _decode_tensor(result.tensors["audio_lengths"])
+    assert features.shape == (1, 80, 100)
+    np.testing.assert_array_equal(lengths, [100])
+    pooled = (((int(lengths[0]) - 1) // 2 + 1) - 5) // 5 + 1
+    assert content.startswith("<|audio_start|>")
+    assert content.count("<unk>") == pooled
+    assert "<|audio_end|>\nPlease answer the recording." in content
+    assert np.isfinite(features).all()
 
 
 def test_binary_tensor_transport_matches_base64_and_uses_private_file() -> None:
