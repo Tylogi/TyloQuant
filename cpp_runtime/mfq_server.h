@@ -172,7 +172,7 @@ using MfqTokenCallback = std::function<bool(int64_t token)>;
 struct MfqPrefillTiming {
     size_t prompt_tokens = 0;
     // Language-model prompt evaluation only. This is the field comparable to
-    // llama.cpp's prompt-eval timing.
+    // the conventional prompt-evaluation timing metric.
     double llm_ms = 0.0;
     // Vision/audio encoder and multimodal projector work preceding the LLM.
     double multimodal_ms = 0.0;

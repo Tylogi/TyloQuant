@@ -1,7 +1,7 @@
 #include "mlx_deepseek_v4_causal_lm.h"
 #include "mlx_eval_timing.h"
 
-#include "../../third_party/nlohmann/json.hpp"
+#include "../json/nlohmann/json.hpp"
 
 #include <algorithm>
 #include <array>

@@ -215,20 +215,9 @@ set_target_properties(mfq-decode-metal PROPERTIES
     INSTALL_RPATH "@executable_path/lib"
 )
 
-set(_MFQ_LLAMA_RUNTIME_DYLIBS)
-if(TARGET mfq-server AND DEFINED MFQ_LLAMA_RUNTIME_DIR)
-    file(GLOB _MFQ_LLAMA_RUNTIME_DYLIBS
-        "${MFQ_LLAMA_RUNTIME_DIR}/*.dylib")
-    if(NOT _MFQ_LLAMA_RUNTIME_DYLIBS)
-        message(FATAL_ERROR
-            "No llama.cpp runtime dylibs found in "
-            "${MFQ_LLAMA_RUNTIME_DIR}")
-    endif()
-endif()
-
 # Both native executables live in this binary directory and use the same
-# relocatable runtime bundle.  A single dependency target prevents parallel
-# links from copying and running install_name_tool on the same dylibs at once.
+# relocatable MLX runtime bundle. A single dependency target prevents parallel
+# links from copying the same runtime files at once.
 set(_MFQ_METAL_RUNTIME_BUNDLE_DIR
     "${CMAKE_CURRENT_BINARY_DIR}/lib")
 set(_MFQ_METAL_RUNTIME_BUNDLE_STAMP
@@ -250,36 +239,9 @@ add_custom_command(
         "${MFQ_MLX_ROOT}/lib/libmlx.dylib"
         "${MFQ_MLX_ROOT}/lib/libjaccl.dylib"
         "${MFQ_MLX_ROOT}/lib/mlx.metallib"
-        ${_MFQ_LLAMA_RUNTIME_DYLIBS}
     COMMAND_EXPAND_LISTS
     COMMENT "Building the shared native Metal runtime bundle"
 )
-
-if(TARGET mfq-server AND _MFQ_LLAMA_RUNTIME_DYLIBS)
-    add_custom_command(
-        OUTPUT "${_MFQ_METAL_RUNTIME_BUNDLE_STAMP}"
-        APPEND
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${_MFQ_LLAMA_RUNTIME_DYLIBS}
-            "${_MFQ_METAL_RUNTIME_BUNDLE_DIR}"
-    )
-
-    foreach(_MFQ_LLAMA_RUNTIME_DYLIB
-            IN LISTS _MFQ_LLAMA_RUNTIME_DYLIBS)
-        get_filename_component(
-            _MFQ_LLAMA_RUNTIME_DYLIB_NAME
-            "${_MFQ_LLAMA_RUNTIME_DYLIB}"
-            NAME)
-        add_custom_command(
-            OUTPUT "${_MFQ_METAL_RUNTIME_BUNDLE_STAMP}"
-            APPEND
-            COMMAND ${CMAKE_COMMAND}
-                "-DMFQ_DYLIB=${_MFQ_METAL_RUNTIME_BUNDLE_DIR}/${_MFQ_LLAMA_RUNTIME_DYLIB_NAME}"
-                "-DMFQ_INSTALL_NAME_TOOL=${CMAKE_INSTALL_NAME_TOOL}"
-                -P "${CMAKE_CURRENT_SOURCE_DIR}/bundle_macos_dylib.cmake"
-        )
-    endforeach()
-endif()
 
 if(TARGET mfq-server)
     add_executable(mfq-perplexity

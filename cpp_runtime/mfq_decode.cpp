@@ -12,7 +12,7 @@
 #include "moe_cache_profile.h"
 #include "tensor_parallel.h"
 #include "nvq_codebooks.generated.h"
-#include "json.hpp"
+#include "nlohmann/json.hpp"
 
 #include <algorithm>
 #include <array>
@@ -156,22 +156,22 @@ mfq_tensor_backend::Tensor attention_cache_swa_cuda(
 mfq_tensor_backend::Tensor attention_cache_swa_planned_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
     mfq_tensor_backend::Tensor seq_len, double scale, int64_t window, int64_t planned_length);
-mfq_tensor_backend::Tensor attention_llama_flash256_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale);
-mfq_tensor_backend::Tensor attention_llama_flash128_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale);
+mfq_tensor_backend::Tensor mfq_attention_mma256_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale);
+mfq_tensor_backend::Tensor mfq_attention_mma128_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale);
 mfq_tensor_backend::Tensor minicpm_flash128_q_cast_cuda(
     mfq_tensor_backend::Tensor q);
 std::vector<mfq_tensor_backend::Tensor> minicpm_flash128_kv_cast_cuda(
     mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v);
 mfq_tensor_backend::Tensor minicpm_flash128_output_cast_cuda(
     mfq_tensor_backend::Tensor output);
-mfq_tensor_backend::Tensor attention_llama_flash512_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale);
-mfq_tensor_backend::Tensor attention_llama_flash256_swa_cuda(
+mfq_tensor_backend::Tensor mfq_attention_mma512_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale);
+mfq_tensor_backend::Tensor mfq_attention_mma256_swa_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v, double scale, int64_t window);
-mfq_tensor_backend::Tensor attention_llama_flash256_decode_cuda(
+mfq_tensor_backend::Tensor mfq_attention_mma256_decode_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
     mfq_tensor_backend::Tensor seq_len, double scale, int64_t planned_len,
     mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor kv_max, mfq_tensor_backend::Tensor meta);
-mfq_tensor_backend::Tensor attention_llama_flash512_decode_cuda(
+mfq_tensor_backend::Tensor mfq_attention_mma512_decode_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
     mfq_tensor_backend::Tensor seq_len, double scale, int64_t planned_len,
     mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor kv_max, mfq_tensor_backend::Tensor meta);
@@ -235,7 +235,7 @@ mfq_tensor_backend::Tensor attention_dsv4_sparse_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor kv, mfq_tensor_backend::Tensor indices,
     mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor sinks, mfq_tensor_backend::Tensor meta,
     double scale);
-mfq_tensor_backend::Tensor attention_llama_flash256_swa_decode_cuda(
+mfq_tensor_backend::Tensor mfq_attention_mma256_swa_decode_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k_cache, mfq_tensor_backend::Tensor v_cache,
     mfq_tensor_backend::Tensor seq_len, double scale, int64_t planned_len,
     mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor kv_max, mfq_tensor_backend::Tensor meta);
@@ -1146,7 +1146,7 @@ static int64_t g_kl_mmq_fallback_calls = 0;
 static int64_t g_kl_kv_cache_capacity = 0;
 static std::unordered_set<int> g_dsv4_cpu_offload_layers;
 static int64_t g_dsv4_cpu_offload_host_bytes = 0;
-// llama.cpp-style repeating-layer placement: the first layers stay on CPU and
+// Repeating-layer placement: the first layers stay on CPU and
 // the last n_gpu_layers stay on CUDA.  -1 keeps the historical all-CUDA path.
 static int g_n_gpu_layers = -1;
 static int g_dense_cpu_layer_count = 0;
@@ -15646,7 +15646,7 @@ struct FullBlock : Block {
     int gemma_top_k = 0;
     KVCache cache;
     mfq_tensor_backend::Tensor decode_partial_o, decode_partial_m, decode_partial_l;
-    mfq_tensor_backend::Tensor decode_llama_mask, decode_llama_kv_max, decode_llama_meta;
+    mfq_tensor_backend::Tensor decode_mma_mask, decode_mma_kv_max, decode_mma_meta;
 
     static constexpr int64_t kDecodeAttentionMaxParts = 16;
 
@@ -15656,9 +15656,9 @@ struct FullBlock : Block {
         decode_partial_o = mfq_tensor_backend::Tensor();
         decode_partial_m = mfq_tensor_backend::Tensor();
         decode_partial_l = mfq_tensor_backend::Tensor();
-        decode_llama_mask = mfq_tensor_backend::Tensor();
-        decode_llama_kv_max = mfq_tensor_backend::Tensor();
-        decode_llama_meta = mfq_tensor_backend::Tensor();
+        decode_mma_mask = mfq_tensor_backend::Tensor();
+        decode_mma_kv_max = mfq_tensor_backend::Tensor();
+        decode_mma_meta = mfq_tensor_backend::Tensor();
     }
 
     mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, int64_t cache_pos,
@@ -15985,7 +15985,7 @@ struct FullBlock : Block {
                             });
                         a = g_profiler.measure(
                             "full.flash128_kernel", [&]() {
-                                return attention_llama_flash128_cuda(
+                                return mfq_attention_mma128_cuda(
                                     flash_q, flash_kv[0], flash_kv[1],
                                     attn_scale);
                             });
@@ -16014,23 +16014,23 @@ struct FullBlock : Block {
                             0.0, !mask.has_value(), attn_scale, false);
                     }
                 } else {
-                const char * llama_flash_env = std::getenv("MFQ_LLAMA_FLASH256");
-                const bool llama_flash_enabled =
-                    llama_flash_env == nullptr || llama_flash_env[0] != '0';
+                const char * mma_attention_env = std::getenv("MFQ_MMA_ATTENTION");
+                const bool mma_attention_enabled =
+                    mma_attention_env == nullptr || mma_attention_env[0] != '0';
                 if (!sliding && T % 256 == 0 && hd == 512 && nh == 8 * nkh &&
-                    llama_flash_enabled) {
-                    a = attention_llama_flash512_cuda(
+                    mma_attention_enabled) {
+                    a = mfq_attention_mma512_cuda(
                         q.to(mfq_tensor_backend::kFloat32).contiguous(), kh, vh, attn_scale);
                     attention_token_major = true;
                 } else if (sliding && T >= 32 && hd == 256 && nh == 2 * nkh &&
-                    llama_flash_enabled) {
-                    a = attention_llama_flash256_swa_cuda(
+                    mma_attention_enabled) {
+                    a = mfq_attention_mma256_swa_cuda(
                         q.to(mfq_tensor_backend::kFloat32).contiguous(), kh, vh,
                         attn_scale, attention_window);
                     attention_token_major = true;
                 } else if (!sliding && T >= 32 && hd == 256 && nh == 4 * nkh &&
-                           llama_flash_enabled) {
-                    a = attention_llama_flash256_cuda(
+                           mma_attention_enabled) {
+                    a = mfq_attention_mma256_cuda(
                         q.to(mfq_tensor_backend::kFloat32).contiguous(), kh, vh, attn_scale);
                     attention_token_major = true;
                 } else if (sliding) {
@@ -16049,25 +16049,25 @@ struct FullBlock : Block {
                     (bf16_gqa_env == nullptr || bf16_gqa_env[0] != '0');
                 const bool aten_decode_enabled = (official_bf16 && !bf16_gqa_decode) ||
                     (aten_decode_env != nullptr && aten_decode_env[0] == '1');
-                const char * llama_decode_env = std::getenv("MFQ_LLAMA_FLASH_DECODE");
-                const bool llama_decode_enabled =
-                    llama_decode_env == nullptr || llama_decode_env[0] != '0';
-                auto prepare_llama_decode_workspace = [&](int64_t visible_len, int64_t kv_tile) {
+                const char * mma_decode_env = std::getenv("MFQ_MMA_ATTENTION_DECODE");
+                const bool mma_decode_enabled =
+                    mma_decode_env == nullptr || mma_decode_env[0] != '0';
+                auto prepare_mma_decode_workspace = [&](int64_t visible_len, int64_t kv_tile) {
                     const int64_t mask_stride = (visible_len + kv_tile - 1) / kv_tile * kv_tile;
                     const int64_t ntiles_kv = (visible_len + kv_tile - 1) / kv_tile;
                     const int64_t max_blocks = B * nkh * ntiles_kv;
                     const int64_t meta_float2 = max_blocks * 8 * (2 + hd / 2);
                     auto cuda = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA);
-                    if (!decode_llama_mask.defined() || decode_llama_mask.size(0) != B ||
-                        decode_llama_mask.size(1) < mask_stride) {
-                        decode_llama_mask = mfq_tensor_backend::empty(
+                    if (!decode_mma_mask.defined() || decode_mma_mask.size(0) != B ||
+                        decode_mma_mask.size(1) < mask_stride) {
+                        decode_mma_mask = mfq_tensor_backend::empty(
                             {B, mask_stride}, cuda.dtype(mfq_tensor_backend::kFloat16));
                     }
-                    if (!decode_llama_kv_max.defined() || decode_llama_kv_max.numel() < B) {
-                        decode_llama_kv_max = mfq_tensor_backend::empty({B}, cuda.dtype(mfq_tensor_backend::kInt32));
+                    if (!decode_mma_kv_max.defined() || decode_mma_kv_max.numel() < B) {
+                        decode_mma_kv_max = mfq_tensor_backend::empty({B}, cuda.dtype(mfq_tensor_backend::kInt32));
                     }
-                    if (!decode_llama_meta.defined() || decode_llama_meta.numel() < 2 * meta_float2) {
-                        decode_llama_meta = mfq_tensor_backend::empty(
+                    if (!decode_mma_meta.defined() || decode_mma_meta.numel() < 2 * meta_float2) {
+                        decode_mma_meta = mfq_tensor_backend::empty(
                             {2 * meta_float2}, cuda.dtype(mfq_tensor_backend::kFloat32));
                     }
                 };
@@ -16092,27 +16092,27 @@ struct FullBlock : Block {
                     a = mfq_scaled_dot_product_attention(
                         qh, cached_k, cached_v, mask,
                         0.0, false, attn_scale, !official_bf16);
-                } else if (sliding && T == 1 && llama_decode_enabled && hd == 256 && nh == 2 * nkh) {
+                } else if (sliding && T == 1 && mma_decode_enabled && hd == 256 && nh == 2 * nkh) {
                     const int64_t visible_len = std::min<int64_t>(attention_window, planned_len);
-                    prepare_llama_decode_workspace(visible_len, 64);
-                    a = attention_llama_flash256_swa_decode_cuda(
+                    prepare_mma_decode_workspace(visible_len, 64);
+                    a = mfq_attention_mma256_swa_decode_cuda(
                         q.to(mfq_tensor_backend::kFloat32).contiguous(), cache.k, cache.v,
                         seq_len.value(), attn_scale, visible_len,
-                        decode_llama_mask, decode_llama_kv_max, decode_llama_meta);
+                        decode_mma_mask, decode_mma_kv_max, decode_mma_meta);
                     attention_token_major = true;
-                } else if (!sliding && T == 1 && llama_decode_enabled &&
+                } else if (!sliding && T == 1 && mma_decode_enabled &&
                            nh == 8 * nkh && (hd == 256 || hd == 512)) {
                     const int64_t kv_tile = hd == 512 ? 32 : 64;
-                    prepare_llama_decode_workspace(planned_len, kv_tile);
+                    prepare_mma_decode_workspace(planned_len, kv_tile);
                     a = hd == 512
-                        ? attention_llama_flash512_decode_cuda(
+                        ? mfq_attention_mma512_decode_cuda(
                             q.to(mfq_tensor_backend::kFloat32).contiguous(), cache.k, cache.v,
                             seq_len.value(), attn_scale, planned_len,
-                            decode_llama_mask, decode_llama_kv_max, decode_llama_meta)
-                        : attention_llama_flash256_decode_cuda(
+                            decode_mma_mask, decode_mma_kv_max, decode_mma_meta)
+                        : mfq_attention_mma256_decode_cuda(
                             q.to(mfq_tensor_backend::kFloat32).contiguous(), cache.k, cache.v,
                             seq_len.value(), attn_scale, planned_len,
-                            decode_llama_mask, decode_llama_kv_max, decode_llama_meta);
+                            decode_mma_mask, decode_mma_kv_max, decode_mma_meta);
                     attention_token_major = true;
                 } else if (sliding) {
                     a = attention_cache_swa_planned_cuda(
@@ -20624,7 +20624,7 @@ static int32_t generate_server_multimodal_tokens(
         const double model_ms = prefill_timer.elapsed_ms();
         // The current CUDA composite timer covers both the multimodal encoder
         // and language prefill. Keep that total explicit instead of falsely
-        // presenting it as llama.cpp-comparable LLM-only time.
+        // presenting it as comparable language-model-only time.
         on_prefill(MfqPrefillTiming{
             prompt.size(),
             0.0,
@@ -20788,7 +20788,7 @@ static int run_kl_eval(
         for (int ci = 0; ci < n_chunks; ++ci) {
             auto begin = tokens.begin() + (size_t)ci * n_ctx;
             eval_chunks[(size_t)ci].tokens.assign(begin, begin + n_ctx);
-            // llama-perplexity temporarily replaces every Gemma context
+            // The reference perplexity evaluator temporarily replaces every Gemma context
             // chunk's first corpus token with BOS before evaluating it, then
             // serializes the original corpus tokens in this legacy header.
             // Qwen legacy references use the serialized token directly.
@@ -21343,7 +21343,7 @@ static int run_kl_eval_batched(
             "optimized KL requires --kl-n-batch to be at least n_ctx "
             "and exactly divisible by n_ctx");
     }
-    const int llama_kl_n_seq = std::max<int64_t>(
+    const int kl_n_seq = std::max<int64_t>(
         1, n_batch / n_ctx);
     validate_kl_execution_geometry(
         n_batch, n_batch, reference_contract, "optimized");
@@ -21394,7 +21394,7 @@ static int run_kl_eval_batched(
               << " graph=batched_contexts"
               << " n_batch=" << n_batch
               << " n_ctx=" << n_ctx
-              << " n_seq=" << llama_kl_n_seq
+              << " n_seq=" << kl_n_seq
               << " score_count=" << score_count
               << " score_count_override=" << score_override
               << " reference_n_batch=" << reference_contract.n_batch
@@ -21404,9 +21404,9 @@ static int run_kl_eval_batched(
               << " bos_replacements=" << bos_replacements
               << "\n";
 
-    for (int begin = 0; begin < chunks; begin += llama_kl_n_seq) {
+    for (int begin = 0; begin < chunks; begin += kl_n_seq) {
         const int n_seq_batch =
-            std::min(llama_kl_n_seq, chunks - begin);
+            std::min(kl_n_seq, chunks - begin);
         auto ids = streamed_kl_ids(
             input, begin, n_seq_batch, n_ctx);
         model.reset(n_seq_batch);
@@ -21471,7 +21471,7 @@ static int run_kl_eval_batched(
                << " graph=batched_contexts"
                << " n_ctx=" << n_ctx
                << " n_batch=" << n_batch
-               << " n_seq=" << llama_kl_n_seq
+               << " n_seq=" << kl_n_seq
                << " score_count=" << score_count
                << " score_count_override=" << score_override
                << " reference_n_batch=" << reference_contract.n_batch
@@ -23833,13 +23833,13 @@ static int run_attention_decode_check(int length, int reps, int D, bool sliding,
     };
     auto run_test = [&]() {
         if (sliding) {
-            return attention_llama_flash256_swa_decode_cuda(
+            return mfq_attention_mma256_swa_decode_cuda(
                 q, k, v, seq_len, scale, visible_len, mask, kv_max, meta);
         }
         return D == 512
-            ? attention_llama_flash512_decode_cuda(
+            ? mfq_attention_mma512_decode_cuda(
                 q, k, v, seq_len, scale, length, mask, kv_max, meta)
-            : attention_llama_flash256_decode_cuda(
+            : mfq_attention_mma256_decode_cuda(
                 q, k, v, seq_len, scale, length, mask, kv_max, meta);
     };
     mfq_tensor_backend::Tensor ref, test;
@@ -23909,7 +23909,7 @@ static int run_gemma4_swa_check(int reps) {
         auto v = mfq_tensor_backend::randn({B, Hk, shape.tokens, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
         auto ref = attention_swa_cuda(
             q, k.to(mfq_tensor_backend::kFloat32), v.to(mfq_tensor_backend::kFloat32), scale, shape.window);
-        auto test = attention_llama_flash256_swa_cuda(q, k, v, scale, shape.window)
+        auto test = mfq_attention_mma256_swa_cuda(q, k, v, scale, shape.window)
             .permute({0, 2, 1, 3}).contiguous();
         mfq_cuda_synchronize();
         auto diff = (test - ref).abs();
@@ -23939,7 +23939,7 @@ static int run_gemma4_swa_check(int reps) {
         auto v = mfq_tensor_backend::randn({B, full_hk, tokens, D}, cuda.dtype(mfq_tensor_backend::kFloat16));
         auto ref = attention_cuda(
             q, k.to(mfq_tensor_backend::kFloat32), v.to(mfq_tensor_backend::kFloat32), scale, true);
-        auto test = attention_llama_flash256_cuda(q, k, v, scale)
+        auto test = mfq_attention_mma256_cuda(q, k, v, scale)
             .permute({0, 2, 1, 3}).contiguous();
         mfq_cuda_synchronize();
         auto diff = (test - ref).abs();
@@ -23964,7 +23964,7 @@ static int run_gemma4_swa_check(int reps) {
         auto v = mfq_tensor_backend::randn({B, full_hk, tokens, full_d}, cuda.dtype(mfq_tensor_backend::kFloat16));
         auto ref = attention_cuda(
             q, k.to(mfq_tensor_backend::kFloat32), v.to(mfq_tensor_backend::kFloat32), 1.0, true);
-        auto test = attention_llama_flash512_cuda(q, k, v, 1.0)
+        auto test = mfq_attention_mma512_cuda(q, k, v, 1.0)
             .permute({0, 2, 1, 3}).contiguous();
         mfq_cuda_synchronize();
         auto diff = (test - ref).abs();
@@ -23989,7 +23989,7 @@ static int run_gemma4_swa_check(int reps) {
     auto vf = v.to(mfq_tensor_backend::kFloat32);
     auto run_ref = [&]() { return attention_swa_cuda(q, kf, vf, scale, bench_window); };
     auto run_test = [&]() {
-        return attention_llama_flash256_swa_cuda(q, k, v, scale, bench_window);
+        return mfq_attention_mma256_swa_cuda(q, k, v, scale, bench_window);
     };
     for (int i = 0; i < 10; ++i) {
         run_ref();
@@ -24016,7 +24016,7 @@ static int run_gemma4_swa_check(int reps) {
     std::cout << "gemma4_swa_bench tokens=" << bench_tokens
               << " window=" << bench_window
               << " generic_ms=" << ref_ms
-              << " llama_mma_ms=" << test_ms
+              << " mma_attention_ms=" << test_ms
               << " speedup=" << ref_ms / test_ms << "\n";
 
     std::cout << "gemma4_swa_worst_rel=" << worst_rel
@@ -25371,14 +25371,14 @@ int main(int argc, char ** argv) {
         int check_attention_reps = 200;
         int check_attention_head_dim = 256;
         int check_attention_window = 4096;
-        int compare_llama_decode_steps = 1;
-        int compare_llama_decode_planned_len = 0;
+        int compare_mma_decode_steps = 1;
+        int compare_mma_decode_planned_len = 0;
         bool profile = false;
         bool check_backend_bf16_add = false;
         bool check_backend_argmax = false;
-        bool compare_llama_flash = false;
+        bool compare_mma_attention = false;
         bool compare_decode_splitk = false;
-        bool compare_llama_decode = false;
+        bool compare_mma_decode = false;
         bool compare_nvq_vec4 = false;
         bool check_gemma4_swa = false;
         bool check_glm_dsa = false;
@@ -25624,11 +25624,11 @@ int main(int argc, char ** argv) {
                     check_backend_argmax = true;
                 }
             }
-            else if (a == "--compare-llama-flash") compare_llama_flash = true;
+            else if (a == "--compare-mma-attention") compare_mma_attention = true;
             else if (a == "--compare-decode-splitk") compare_decode_splitk = true;
-            else if (a == "--compare-llama-decode") compare_llama_decode = true;
-            else if (a == "--compare-llama-decode-steps" && i + 1 < argc) compare_llama_decode_steps = std::stoi(argv[++i]);
-            else if (a == "--compare-llama-decode-planned-len" && i + 1 < argc) compare_llama_decode_planned_len = std::stoi(argv[++i]);
+            else if (a == "--compare-mma-decode") compare_mma_decode = true;
+            else if (a == "--compare-mma-decode-steps" && i + 1 < argc) compare_mma_decode_steps = std::stoi(argv[++i]);
+            else if (a == "--compare-mma-decode-planned-len" && i + 1 < argc) compare_mma_decode_planned_len = std::stoi(argv[++i]);
             else if (a == "--compare-nvq-vec4" || a == "--compare-niq-vec4") compare_nvq_vec4 = true;
             else {
                 std::cerr << "usage: mfq-decode --mfq model.mfq [--config config.json] "
@@ -26457,20 +26457,20 @@ int main(int argc, char ** argv) {
                       << (ref.argmax(-1).eq(test.argmax(-1)).item<bool>() ? 1 : 0) << "\n";
             return 0;
         }
-        if (compare_llama_decode) {
-            if (compare_llama_decode_steps < 1) {
-                throw std::runtime_error("--compare-llama-decode-steps must be positive");
+        if (compare_mma_decode) {
+            if (compare_mma_decode_steps < 1) {
+                throw std::runtime_error("--compare-mma-decode-steps must be positive");
             }
             auto cuda_i64 = mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA);
             std::vector<mfq_tensor_backend::Tensor> reference_logits;
             std::vector<int64_t> teacher_tokens;
-            reference_logits.reserve(compare_llama_decode_steps);
-            teacher_tokens.reserve(compare_llama_decode_steps);
-            mfq_set_env("MFQ_LLAMA_FLASH256_DECODE", "0");
+            reference_logits.reserve(compare_mma_decode_steps);
+            teacher_tokens.reserve(compare_mma_decode_steps);
+            mfq_set_env("MFQ_MMA_ATTENTION_DECODE", "0");
             model.reset(1);
             auto input = model.next_token(ids).reshape({1, 1});
             const int64_t initial_teacher_token = input.item<int64_t>();
-            for (int step = 0; step < compare_llama_decode_steps; ++step) {
+            for (int step = 0; step < compare_mma_decode_steps; ++step) {
                 const int64_t decode_len = model.cache_pos + 1;
                 auto seq_len = mfq_tensor_backend::tensor({decode_len}, cuda_i64);
                 auto hidden = model.hidden_forward(input, mfq_nullopt, seq_len);
@@ -26481,10 +26481,10 @@ int main(int argc, char ** argv) {
                 teacher_tokens.push_back(next);
                 input = mfq_tensor_backend::tensor({next}, cuda_i64).reshape({1, 1});
             }
-            mfq_set_env("MFQ_LLAMA_FLASH256_DECODE", "1");
-            g_decode_graph_attention_kv_len = compare_llama_decode_planned_len > 0
-                ? compare_llama_decode_planned_len
-                : ids.size(1) + compare_llama_decode_steps;
+            mfq_set_env("MFQ_MMA_ATTENTION_DECODE", "1");
+            g_decode_graph_attention_kv_len = compare_mma_decode_planned_len > 0
+                ? compare_mma_decode_planned_len
+                : ids.size(1) + compare_mma_decode_steps;
             if (g_decode_graph_attention_kv_len > model.c.max_position_embeddings) {
                 throw std::runtime_error("decode comparison planned length exceeds context capacity");
             }
@@ -26500,7 +26500,7 @@ int main(int argc, char ** argv) {
             int same_top = 0;
             int first_top_difference = -1;
             int64_t values = 0;
-            for (int step = 0; step < compare_llama_decode_steps; ++step) {
+            for (int step = 0; step < compare_mma_decode_steps; ++step) {
                 const int64_t decode_len = model.cache_pos + 1;
                 auto seq_len = mfq_tensor_backend::tensor({decode_len}, cuda_i64);
                 auto hidden = model.hidden_forward(input, mfq_nullopt, seq_len);
@@ -26526,14 +26526,14 @@ int main(int argc, char ** argv) {
             mfq_cuda_synchronize();
             g_decode_graph_attention_kv_len = 0;
             std::cout << std::setprecision(10)
-                      << "llama_decode_compare_steps=" << compare_llama_decode_steps << "\n"
-                      << "llama_decode_compare_mean_kl=" << kl_sum / compare_llama_decode_steps << "\n"
-                      << "llama_decode_compare_max_kl=" << kl_max << "\n"
-                      << "llama_decode_compare_rel=" << std::sqrt(delta_sq_sum / reference_sq_sum) << "\n"
-                      << "llama_decode_compare_mean_abs=" << abs_sum / values << "\n"
-                      << "llama_decode_compare_max_abs=" << max_abs << "\n"
-                      << "llama_decode_compare_same_top=" << same_top << "\n"
-                      << "llama_decode_compare_first_top_difference=" << first_top_difference << "\n";
+                      << "mma_decode_compare_steps=" << compare_mma_decode_steps << "\n"
+                      << "mma_decode_compare_mean_kl=" << kl_sum / compare_mma_decode_steps << "\n"
+                      << "mma_decode_compare_max_kl=" << kl_max << "\n"
+                      << "mma_decode_compare_rel=" << std::sqrt(delta_sq_sum / reference_sq_sum) << "\n"
+                      << "mma_decode_compare_mean_abs=" << abs_sum / values << "\n"
+                      << "mma_decode_compare_max_abs=" << max_abs << "\n"
+                      << "mma_decode_compare_same_top=" << same_top << "\n"
+                      << "mma_decode_compare_first_top_difference=" << first_top_difference << "\n";
             return 0;
         }
         if (compare_nvq_vec4) {
@@ -26627,13 +26627,13 @@ int main(int argc, char ** argv) {
             }
             return 0;
         }
-        if (compare_llama_flash) {
-            mfq_set_env("MFQ_LLAMA_FLASH256", "0");
+        if (compare_mma_attention) {
+            mfq_set_env("MFQ_MMA_ATTENTION", "0");
             mfq_set_env("MFQ_DISABLE_MINICPM_BF16_FLASH128", "1");
             auto ref = model.last_logits(ids).to(mfq_tensor_backend::kFloat32);
             mfq_cuda_synchronize();
             model.reset(1);
-            mfq_set_env("MFQ_LLAMA_FLASH256", "1");
+            mfq_set_env("MFQ_MMA_ATTENTION", "1");
             mfq_set_env("MFQ_DISABLE_MINICPM_BF16_FLASH128", "0");
             auto test = model.last_logits(ids).to(mfq_tensor_backend::kFloat32);
             mfq_cuda_synchronize();

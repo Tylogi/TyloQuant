@@ -6,7 +6,7 @@
 #include "mlx_tensor.h"
 #include "qwen35_model.h"
 
-#include "../../third_party/nlohmann/json.hpp"
+#include "../json/nlohmann/json.hpp"
 
 #ifdef MFQ_METAL_SERVER
 #include "../mfq_server.h"
@@ -1697,7 +1697,7 @@ int main(int argc, char** argv) {
 #else
                 throw std::runtime_error(
                     "this build has no C++ server support; configure with "
-                    "-DMFQ_BUILD_CPP_SERVER=ON and matching llama.cpp paths");
+                    "-DMFQ_BUILD_CPP_SERVER=ON");
 #endif
             }
         }
@@ -1889,7 +1889,7 @@ int main(int argc, char** argv) {
 #else
             throw std::runtime_error(
                 "this build has no C++ server support; configure with "
-                "-DMFQ_BUILD_CPP_SERVER=ON and matching llama.cpp paths");
+                "-DMFQ_BUILD_CPP_SERVER=ON");
 #endif
         }
         if (!arguments.check_container &&

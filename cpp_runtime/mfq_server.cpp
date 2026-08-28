@@ -1,11 +1,12 @@
 #include "mfq_server.h"
 
 #include "httplib.h"
-#include "json.hpp"
-#include "gguf.h"
-#include "llama.h"
-#include "common/chat.h"
-#include "common/common.h"
+#include "nlohmann/json.hpp"
+#include "ggml.h"
+#include "mfq_text.h"
+#include "mfq_grammar.h"
+#include "chat.h"
+#include "common.h"
 
 #include <algorithm>
 #include <array>
@@ -79,99 +80,81 @@ static std::string request_id(const char * prefix) {
     return std::string(prefix) + std::to_string(unix_time_seconds()) + "-" + std::to_string(n);
 }
 
-static void llama_log_quiet(ggml_log_level level, const char * text, void *) {
+static void mfq_text_log_quiet(ggml_log_level level, const char * text, void *) {
     if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
-        std::cerr << "llama-tokenizer: " << text;
+        std::cerr << "mfq-text: " << text;
     }
 }
 
-class LlamaTokenizer {
+class MfqTokenizer {
 public:
-    explicit LlamaTokenizer(const std::string & path) {
+    explicit MfqTokenizer(const std::string & path) {
         load_from_file(path);
         finish_init();
     }
 
-    explicit LlamaTokenizer(const std::vector<uint8_t> & gguf) {
+    explicit MfqTokenizer(const std::vector<uint8_t> & gguf) {
         if (gguf.empty()) {
             throw std::runtime_error("embedded tokenizer GGUF is empty");
         }
-        llama_log_set(llama_log_quiet, nullptr);
-        gguf_init_params metadata_params = {
-            /*.no_alloc = */ true,
-            /*.ctx      = */ nullptr,
-        };
-        metadata_ = gguf_init_from_buffer(
-            gguf.data(), gguf.size(), metadata_params);
-        if (metadata_ == nullptr) {
-            throw std::runtime_error(
-                "cannot parse embedded tokenizer GGUF metadata");
-        }
-        auto params = llama_model_default_params();
-        params.vocab_only = true;
-        params.use_mmap = false;
-        params.progress_callback = [](float, void *) { return true; };
-        model_ = llama_model_init_from_user(
-            metadata_, nullptr, nullptr, params);
-        if (model_ == nullptr) {
-            gguf_free(metadata_);
-            metadata_ = nullptr;
+        ggml_log_set(mfq_text_log_quiet, nullptr);
+        context_ = mfq_text_load_buffer(gguf.data(), gguf.size());
+        if (context_ == nullptr) {
             throw std::runtime_error(
                 "cannot initialize tokenizer from embedded GGUF metadata");
         }
         finish_init();
     }
 
-    ~LlamaTokenizer() {
-        if (model_ != nullptr) llama_model_free(model_);
-        if (metadata_ != nullptr) gguf_free(metadata_);
+    ~MfqTokenizer() {
+        mfq_text_free(context_);
     }
 
-    LlamaTokenizer(const LlamaTokenizer &) = delete;
-    LlamaTokenizer & operator=(const LlamaTokenizer &) = delete;
+    MfqTokenizer(const MfqTokenizer &) = delete;
+    MfqTokenizer & operator=(const MfqTokenizer &) = delete;
 
     int32_t vocab_size() const {
-        return llama_vocab_n_tokens(vocab_);
+        return mfq_text_vocab_n_tokens(vocab_);
     }
 
     std::string chat_template() const {
-        const char * value = llama_model_chat_template(model_, nullptr);
+        const char * value = mfq_text_get_chat_template(context_, nullptr);
         return value == nullptr ? std::string() : std::string(value);
     }
 
-    const llama_model * model() const {
-        return model_;
+    const mfq_text_context * context() const {
+        return context_;
     }
 
     int32_t bos_token() const {
-        return llama_vocab_bos(vocab_);
+        return mfq_text_vocab_bos(vocab_);
     }
 
     int32_t eos_token() const {
-        return llama_vocab_eos(vocab_);
+        return mfq_text_vocab_eos(vocab_);
     }
 
     int32_t eot_token() const {
-        return llama_vocab_eot(vocab_);
+        return mfq_text_vocab_eot(vocab_);
     }
 
     int32_t pad_token() const {
-        return llama_vocab_pad(vocab_);
+        return mfq_text_vocab_pad(vocab_);
     }
 
     bool add_bos() const {
-        return llama_vocab_get_add_bos(vocab_);
+        return mfq_text_vocab_get_add_bos(vocab_);
     }
 
     bool add_eos() const {
-        return llama_vocab_get_add_eos(vocab_);
+        return mfq_text_vocab_get_add_eos(vocab_);
     }
 
     std::vector<int64_t> tokenize(
             const std::string & text,
             bool parse_special,
             bool add_special = false) const {
-        int32_t n = llama_tokenize(vocab_, text.data(), static_cast<int32_t>(text.size()),
+        int32_t n = mfq_text_tokenize(vocab_, text.data(), static_cast<int32_t>(text.size()),
                                    nullptr, 0, add_special, parse_special);
         if (n == std::numeric_limits<int32_t>::min()) {
             throw std::runtime_error("tokenized prompt exceeds the tokenizer limit");
@@ -180,8 +163,8 @@ public:
         if (n > 0) {
             throw std::runtime_error("tokenizer returned an invalid sizing result");
         }
-        std::vector<llama_token> tokens(static_cast<size_t>(-n));
-        n = llama_tokenize(vocab_, text.data(), static_cast<int32_t>(text.size()),
+        std::vector<mfq_text_token> tokens(static_cast<size_t>(-n));
+        n = mfq_text_tokenize(vocab_, text.data(), static_cast<int32_t>(text.size()),
                            tokens.data(), static_cast<int32_t>(tokens.size()), add_special, parse_special);
         if (n < 0) throw std::runtime_error("tokenizer buffer sizing changed unexpectedly");
         std::vector<int64_t> out;
@@ -201,16 +184,16 @@ public:
     }
 
     bool is_eog(int64_t token) const {
-        return llama_vocab_is_eog(vocab_, static_cast<llama_token>(token));
+        return mfq_text_vocab_is_eog(vocab_, static_cast<mfq_text_token>(token));
     }
 
     std::string piece(int64_t token, bool special = false) const {
         char local[128];
-        int32_t n = llama_token_to_piece(vocab_, static_cast<llama_token>(token),
+        int32_t n = mfq_text_token_to_piece(vocab_, static_cast<mfq_text_token>(token),
                                          local, static_cast<int32_t>(sizeof(local)), 0, special);
         if (n >= 0) return std::string(local, local + n);
         std::string out(static_cast<size_t>(-n), '\0');
-        n = llama_token_to_piece(vocab_, static_cast<llama_token>(token),
+        n = mfq_text_token_to_piece(vocab_, static_cast<mfq_text_token>(token),
                                  out.data(), static_cast<int32_t>(out.size()), 0, special);
         if (n < 0) throw std::runtime_error("token piece buffer sizing changed unexpectedly");
         out.resize(static_cast<size_t>(n));
@@ -219,43 +202,34 @@ public:
 
 private:
     void load_from_file(const std::string & path) {
-        llama_log_set(llama_log_quiet, nullptr);
-        auto params = llama_model_default_params();
-        params.vocab_only = true;
-        params.use_mmap = true;
-        params.progress_callback = [](float, void *) { return true; };
-        model_ = llama_model_load_from_file(path.c_str(), params);
-        if (model_ == nullptr) {
+        ggml_log_set(mfq_text_log_quiet, nullptr);
+        context_ = mfq_text_load_file(path.c_str());
+        if (context_ == nullptr) {
             throw std::runtime_error(
                 "cannot load tokenizer metadata from GGUF: " + path);
         }
     }
 
     void finish_init() {
-        vocab_ = llama_model_get_vocab(model_);
+        vocab_ = mfq_text_get_vocab(context_);
         if (vocab_ == nullptr) {
-            llama_model_free(model_);
-            model_ = nullptr;
-            if (metadata_ != nullptr) {
-                gguf_free(metadata_);
-                metadata_ = nullptr;
-            }
+            mfq_text_free(context_);
+            context_ = nullptr;
             throw std::runtime_error(
                 "GGUF does not contain a tokenizer vocabulary");
         }
     }
 
-    llama_model * model_ = nullptr;
-    const llama_vocab * vocab_ = nullptr;
-    gguf_context * metadata_ = nullptr;
+    mfq_text_context * context_ = nullptr;
+    const mfq_text_vocab * vocab_ = nullptr;
 };
 
-class LlamaGrammarConstraint {
+class MfqGrammarConstraint {
 public:
-    LlamaGrammarConstraint(
-            const LlamaTokenizer & tokenizer,
+    MfqGrammarConstraint(
+            const MfqTokenizer & tokenizer,
             const common_chat_params & params)
-        : vocab_(llama_model_get_vocab(tokenizer.model())),
+        : vocab_(mfq_text_get_vocab(tokenizer.context())),
           vocab_size_(tokenizer.vocab_size()) {
         if (vocab_ == nullptr || params.grammar.empty()) {
             throw std::invalid_argument(
@@ -263,7 +237,7 @@ public:
         }
 
         std::vector<std::string> trigger_patterns;
-        std::vector<llama_token> trigger_tokens;
+        std::vector<mfq_text_token> trigger_tokens;
         trigger_patterns.reserve(params.grammar_triggers.size());
         trigger_tokens.reserve(params.grammar_triggers.size());
         for (const auto & trigger : params.grammar_triggers) {
@@ -300,14 +274,10 @@ public:
             trigger_pattern_ptrs.push_back(pattern.c_str());
         }
 
-        grammar_ = params.grammar_lazy
-            ? llama_sampler_init_grammar_lazy_patterns(
-                  vocab_, params.grammar.c_str(), "root",
-                  trigger_pattern_ptrs.data(),
-                  trigger_pattern_ptrs.size(),
-                  trigger_tokens.data(), trigger_tokens.size())
-            : llama_sampler_init_grammar(
-                  vocab_, params.grammar.c_str(), "root");
+        grammar_ = mfq_text_grammar_init_impl(
+            vocab_, params.grammar.c_str(), "root", params.grammar_lazy,
+            trigger_pattern_ptrs.data(), trigger_pattern_ptrs.size(),
+            trigger_tokens.data(), trigger_tokens.size());
         if (grammar_ == nullptr) {
             throw std::runtime_error(
                 "failed to initialize chat-template grammar");
@@ -317,29 +287,29 @@ public:
             !params.generation_prompt.empty()) {
             for (const auto token : tokenizer.tokenize(
                      params.generation_prompt, true)) {
-                llama_sampler_accept(
-                    grammar_, static_cast<llama_token>(token));
+                mfq_text_grammar_accept_impl(
+                    *grammar_, static_cast<mfq_text_token>(token));
             }
         }
     }
 
-    ~LlamaGrammarConstraint() {
+    ~MfqGrammarConstraint() {
         if (grammar_ != nullptr) {
-            llama_sampler_free(grammar_);
+            mfq_text_grammar_free_impl(grammar_);
         }
     }
 
-    LlamaGrammarConstraint(const LlamaGrammarConstraint &) = delete;
-    LlamaGrammarConstraint & operator=(
-        const LlamaGrammarConstraint &) = delete;
+    MfqGrammarConstraint(const MfqGrammarConstraint &) = delete;
+    MfqGrammarConstraint & operator=(
+        const MfqGrammarConstraint &) = delete;
 
     bool allows(std::int64_t token) {
         if (token < 0 || token >= vocab_size_) return false;
-        llama_token_data candidate = {
-            static_cast<llama_token>(token), 0.0f, 0.0f};
-        llama_token_data_array candidates = {
+        mfq_text_token_data candidate = {
+            static_cast<mfq_text_token>(token), 0.0f, 0.0f};
+        mfq_text_token_data_array candidates = {
             &candidate, 1, -1, false};
-        llama_sampler_apply(grammar_, &candidates);
+        mfq_text_grammar_apply_impl(*grammar_, &candidates);
         return std::isfinite(candidate.logit);
     }
 
@@ -352,11 +322,11 @@ public:
         candidates_.resize(count);
         for (std::size_t index = 0; index < count; ++index) {
             candidates_[index] = {
-                static_cast<llama_token>(index), logits[index], 0.0f};
+                static_cast<mfq_text_token>(index), logits[index], 0.0f};
         }
-        llama_token_data_array candidates = {
+        mfq_text_token_data_array candidates = {
             candidates_.data(), candidates_.size(), -1, false};
-        llama_sampler_apply(grammar_, &candidates);
+        mfq_text_grammar_apply_impl(*grammar_, &candidates);
         bool has_candidate = false;
         for (std::size_t index = 0; index < count; ++index) {
             logits[index] = candidates_[index].logit;
@@ -374,23 +344,23 @@ public:
             throw std::out_of_range(
                 "grammar accepted token is out of range");
         }
-        llama_sampler_accept(
-            grammar_, static_cast<llama_token>(token));
+        mfq_text_grammar_accept_impl(
+            *grammar_, static_cast<mfq_text_token>(token));
     }
 
 private:
-    const llama_vocab * vocab_ = nullptr;
+    const mfq_text_vocab * vocab_ = nullptr;
     int32_t vocab_size_ = 0;
-    llama_sampler * grammar_ = nullptr;
-    std::vector<llama_token_data> candidates_;
+    mfq_text_grammar * grammar_ = nullptr;
+    std::vector<mfq_text_token_data> candidates_;
 };
 
 static MfqTokenConstraintPtr make_token_constraint(
-        const LlamaTokenizer & tokenizer,
+        const MfqTokenizer & tokenizer,
         const common_chat_params & params) {
     if (params.grammar.empty()) return {};
     auto implementation =
-        std::make_shared<LlamaGrammarConstraint>(tokenizer, params);
+        std::make_shared<MfqGrammarConstraint>(tokenizer, params);
     auto constraint = std::make_shared<MfqTokenConstraint>();
     constraint->allows = [implementation](std::int64_t token) {
         return implementation->allows(token);
@@ -1185,7 +1155,7 @@ private:
     std::unordered_map<std::string, std::shared_ptr<std::atomic<bool>>> active_;
 };
 
-static RequestWork parse_work(const json & body, bool chat, const LlamaTokenizer & tokenizer,
+static RequestWork parse_work(const json & body, bool chat, const MfqTokenizer & tokenizer,
                               const common_chat_templates * templates,
                               int64_t max_context,
                               const std::string & model_type,
@@ -1795,7 +1765,7 @@ private:
     bool completed_ = false;
 };
 
-static CompletionResult generate_text(const RequestWork & work, const LlamaTokenizer & tokenizer,
+static CompletionResult generate_text(const RequestWork & work, const MfqTokenizer & tokenizer,
                                       const MfqGenerateFn & generate,
                                       const MfqMultimodalGenerateFn & multimodal_generate,
                                       const std::shared_ptr<std::atomic<bool>> & cancel_requested,
@@ -2362,7 +2332,7 @@ static std::pair<std::vector<Value>, std::vector<int64_t>> decode_tensor(
 }
 
 static int64_t single_special_token(
-        const LlamaTokenizer & tokenizer,
+        const MfqTokenizer & tokenizer,
         const std::string & marker) {
     const auto tokens = tokenizer.tokenize(marker, true, false);
     if (tokens.size() != 1) {
@@ -2377,7 +2347,7 @@ static int64_t single_special_token(
 static MfqVisionInput parse_mfq_vision(
         const json & value,
         const std::vector<int64_t> & prompt,
-        const LlamaTokenizer & tokenizer) {
+        const MfqTokenizer & tokenizer) {
     if (!value.is_object()) {
         throw ApiError(
             400, "invalid_request_error",
@@ -2720,7 +2690,7 @@ MfqTokenizerProbe probe_mfq_tokenizer(
         const std::string & text,
         bool add_special,
         bool parse_special) {
-    LlamaTokenizer tokenizer(tokenizer_gguf);
+    MfqTokenizer tokenizer(tokenizer_gguf);
     return {
         tokenizer.vocab_size(),
         tokenizer.bos_token(),
@@ -2739,7 +2709,7 @@ MfqTokenizerProbe probe_mfq_tokenizer(
         const std::string & text,
         bool add_special,
         bool parse_special) {
-    LlamaTokenizer tokenizer(tokenizer_model);
+    MfqTokenizer tokenizer(tokenizer_model);
     return {
         tokenizer.vocab_size(),
         tokenizer.bos_token(),
@@ -2773,11 +2743,11 @@ int run_mfq_server(
     }
     if (config.port < 1 || config.port > 65535) throw std::runtime_error("server port must be in [1, 65535]");
 
-    std::unique_ptr<LlamaTokenizer> tokenizer =
+    std::unique_ptr<MfqTokenizer> tokenizer =
         config.tokenizer_gguf.empty()
-        ? std::make_unique<LlamaTokenizer>(
+        ? std::make_unique<MfqTokenizer>(
               config.tokenizer_model)
-        : std::make_unique<LlamaTokenizer>(
+        : std::make_unique<MfqTokenizer>(
               config.tokenizer_gguf);
     if (config.vocab_size > 0 && tokenizer->vocab_size() != config.vocab_size) {
         throw std::runtime_error("tokenizer/model vocabulary mismatch: tokenizer=" +
@@ -2789,7 +2759,7 @@ int run_mfq_server(
             "MFQ server requires tokenizer.chat_template");
     }
     common_chat_templates_ptr chat_templates =
-        common_chat_templates_init(tokenizer->model(), "");
+        common_chat_templates_init(tokenizer->context(), "");
     if (!chat_templates) {
         throw std::runtime_error(
             "cannot initialize tokenizer.chat_template");

@@ -81,7 +81,6 @@ cmake -S "${mfq_project_dir}/cpp_runtime" -B "${mfq_native_build_dir}" -G Ninja 
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_ARCHITECTURES=arm64 \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="${mfq_macos_deployment_target}" \
-  -DGGML_NATIVE=OFF \
   -DMFQ_BUILD_CPP_SERVER=ON \
   -DMFQ_BUILD_METAL_RUNTIME=ON \
   -DMFQ_MLX_ROOT="${mfq_mlx_root}" \
@@ -103,6 +102,15 @@ install -m 644 "${mfq_mlx_root}/lib/libmlx.dylib" "${mfq_framework_dir}/libmlx.d
 install -m 644 "${mfq_mlx_root}/lib/libjaccl.dylib" "${mfq_framework_dir}/libjaccl.dylib"
 install -m 755 "${mfq_video_source}" "${mfq_framework_dir}/libmfq_avfoundation_video.dylib"
 install -m 644 "${mfq_mlx_root}/lib/mlx.metallib" "${mfq_resource_dir}/mlx.metallib"
+
+mfq_license_dir="${mfq_resource_dir}/licenses"
+rm -rf "${mfq_license_dir}"
+mkdir -p "${mfq_license_dir}"
+install -m 644 "${mfq_project_dir}/LICENSE" \
+  "${mfq_license_dir}/MFQ-Apache-2.0.txt"
+install -m 644 "${mfq_project_dir}/NOTICE" \
+  "${mfq_license_dir}/NOTICE.txt"
+install -m 644 "${mfq_project_dir}"/LICENSES/*.txt "${mfq_license_dir}/"
 
 for mfq_native_binary in \
   "${mfq_sidecar_dir}/${mfq_runtime_name}" \

@@ -6,7 +6,8 @@
     ],
     "resources": {
       "../../release/windows-runtime/": "",
-      "../../release/Resources/mfq-cli": "mfq-cli"
+      "../../release/Resources/mfq-cli": "mfq-cli",
+      "../../release/Resources/licenses": "licenses"
     }
   }
 }

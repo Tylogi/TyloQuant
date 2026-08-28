@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = (ROOT / "cpp_runtime" / "mfq_server.cpp").read_text(
@@ -25,16 +26,44 @@ STUDIO_APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
 STUDIO_API = (ROOT / "MFQStudio" / "src" / "api.ts").read_text(
     encoding="utf-8"
 )
-LLAMA_CHAT = (
-    ROOT / "third_party" / "llama-runtime" / "common" / "chat.cpp"
+TEXT_CHAT = (
+    ROOT / "cpp_runtime" / "text" / "chat" / "chat.cpp"
 ).read_text(encoding="utf-8")
-LLAMA_CHAT_H = (
-    ROOT / "third_party" / "llama-runtime" / "common" / "chat.h"
+TEXT_CHAT_H = (
+    ROOT / "cpp_runtime" / "text" / "chat" / "chat.h"
 ).read_text(encoding="utf-8")
 def _section(text: str, start: str, end: str) -> str:
     start_index = text.index(start)
     end_index = text.index(end, start_index)
     return text[start_index:end_index]
+
+
+def test_cpp_runtime_dependencies_are_integrated() -> None:
+    assert not (ROOT / "third_party").exists()
+    assert not (ROOT / "cpp_runtime" / "llama").exists()
+    active_roots = [
+        ROOT / "cpp_runtime" / "text",
+        ROOT / "mfq" / "kernels" / "cuda",
+    ]
+    assert not [
+        path
+        for active_root in active_roots
+        for path in active_root.rglob("*llama*")
+    ]
+    active_source = "\n".join(
+        path.read_text(encoding="utf-8", errors="ignore")
+        for active_root in active_roots
+        for path in active_root.rglob("*")
+        if path.suffix in {".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp"}
+    )
+    assert re.search(r"\b(?:llama_|LLAMA_|MFQ_LLAMA)", active_source) is None
+    assert (ROOT / "cpp_runtime" / "text" / "include" / "mfq_text.h").is_file()
+    assert not (ROOT / "cpp_runtime" / "text" / "include" / "llama.h").exists()
+    assert (ROOT / "cpp_runtime" / "text" / "CMakeLists.txt").is_file()
+    assert (ROOT / "cpp_runtime" / "http" / "httplib.cpp").is_file()
+    assert (ROOT / "cpp_runtime" / "json" / "nlohmann" / "json.hpp").is_file()
+    assert (ROOT / "NOTICE").is_file()
+    assert "third_party" not in CMAKE
 
 
 def test_server_uses_native_gguf_jinja_template_and_common_parser() -> None:
@@ -50,13 +79,13 @@ def test_server_uses_native_gguf_jinja_template_and_common_parser() -> None:
 
 
 def test_server_enforces_complete_chat_template_tool_calls() -> None:
-    assert "LlamaGrammarConstraint" in SERVER
+    assert "MfqGrammarConstraint" in SERVER
     assert "make_token_constraint(tokenizer, chat_params)" in SERVER
     assert "work.token_constraint" in SERVER
     assert "if (partial)" in SERVER
     assert "parsed.tool_calls.clear()" in SERVER
-    assert 'uses_tool_calls ? "tool_calls" : "function_calls"' in LLAMA_CHAT
-    assert 'src.find("tool_calls") != std::string::npos' in LLAMA_CHAT
+    assert 'uses_tool_calls ? "tool_calls" : "function_calls"' in TEXT_CHAT
+    assert 'src.find("tool_calls") != std::string::npos' in TEXT_CHAT
     assert "token_constraint->apply" in METAL_DSV4
     assert "token_constraint->accept" in METAL_DSV4
     assert "token_constraint," in METAL_DECODE
@@ -75,12 +104,10 @@ def test_native_server_cancels_active_session_generation_per_token() -> None:
     assert "work.cache_plan = {};" not in SERVER
 
 
-def test_server_links_matching_llama_common_runtime() -> None:
-    assert 'set(MFQ_LLAMA_SOURCE_DIR' in CMAKE
-    assert 'add_subdirectory(' in CMAKE
-    assert "mfq_llama_common" in CMAKE
-    assert "common/chat.h" in CMAKE
-    assert "MFQ_LLAMA_RUNTIME_DYLIBS" in METAL_CMAKE
+def test_server_links_integrated_text_runtime() -> None:
+    assert 'set(MFQ_TEXT_SOURCE_DIR' in CMAKE
+    assert 'add_subdirectory(text EXCLUDE_FROM_ALL)' in CMAKE
+    assert "mfq-text-runtime" in CMAKE
     assert "BUILD_WITH_INSTALL_RPATH ON" in METAL_CMAKE
 
 
@@ -149,22 +176,22 @@ def test_server_supports_structured_output_and_named_tool_choice() -> None:
 
 
 def test_dsv4_template_preserves_message_extensions() -> None:
-    assert "std::map<std::string, std::string>        extra_fields;" in LLAMA_CHAT_H
-    assert 'for (const char * key : {"task", "tools", "response_format"})' in LLAMA_CHAT
-    assert "msg.extra_fields[key] = message.at(key).dump();" in LLAMA_CHAT
-    assert "for (const auto & [key, value] : extra_fields)" in LLAMA_CHAT
-    assert "jmsg[key] = json::parse(value);" in LLAMA_CHAT
-    assert "has_message_scoped_tools" in LLAMA_CHAT
+    assert "std::map<std::string, std::string>        extra_fields;" in TEXT_CHAT_H
+    assert 'for (const char * key : {"task", "tools", "response_format"})' in TEXT_CHAT
+    assert "msg.extra_fields[key] = message.at(key).dump();" in TEXT_CHAT
+    assert "for (const auto & [key, value] : extra_fields)" in TEXT_CHAT
+    assert "jmsg[key] = json::parse(value);" in TEXT_CHAT
+    assert "has_message_scoped_tools" in TEXT_CHAT
 
 
 def test_dsv4_template_uses_message_scoped_tools_and_schema() -> None:
     dsv4 = _section(
-        LLAMA_CHAT,
+        TEXT_CHAT,
         "static common_chat_params common_chat_params_init_deepseek_v3_2",
         "static common_chat_params common_chat_params_init_cohere2moe",
     )
     gpt_oss = _section(
-        LLAMA_CHAT,
+        TEXT_CHAT,
         "static common_chat_params common_chat_params_init_gpt_oss",
         "static common_chat_params common_chat_params_init_gemma4",
     )
@@ -187,7 +214,7 @@ def test_dsv4_template_uses_message_scoped_tools_and_schema() -> None:
 
 def test_dsv4_disabled_thinking_consumes_close_marker() -> None:
     dsv4 = _section(
-        LLAMA_CHAT,
+        TEXT_CHAT,
         "static common_chat_params common_chat_params_init_deepseek_v3_2",
         "static common_chat_params common_chat_params_init_cohere2moe",
     )

@@ -112,6 +112,9 @@ release = [
 [project.urls]
 Repository = "https://github.com/Tylogi/TyloQuant"
 
+[tool.setuptools]
+license-files = ["LICENSE", "NOTICE", "LICENSES/*.txt"]
+
 [tool.setuptools.dynamic]
 version = { attr = "mfq._version.__version__" }
 

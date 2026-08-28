@@ -8,12 +8,12 @@ SOURCE = (Path(__file__).parents[1] / "cpp_runtime" / "mfq_decode.cpp").read_tex
 ATTENTION_SOURCE = (
     Path(__file__).parents[1] / "mfq" / "kernels" / "cuda" / "attention.cu"
 ).read_text(encoding="utf-8")
-ATTENTION_LLAMA_SOURCE = (
+ATTENTION_MMA_SOURCE = (
     Path(__file__).parents[1]
     / "mfq"
     / "kernels"
     / "cuda"
-    / "attention_llama.cu"
+    / "attention_mma.cu"
 ).read_text(encoding="utf-8")
 BACKEND_SOURCE = (
     Path(__file__).parents[1] / "cpp_runtime" / "cuda" / "mfq_tensor_backend.h"
@@ -170,28 +170,28 @@ def test_minicpmo_bf16_prefill_flash128_is_strictly_bounded() -> None:
     assert "!seq_len.has_value()" in selection
     assert "!attention_mask.has_value()" in selection
     flash_path = SOURCE.split("if (bf16_flash128)", 1)[1].split("} else {", 1)[0]
-    assert "attention_llama_flash128_cuda" in flash_path
+    assert "mfq_attention_mma128_cuda" in flash_path
     assert ".to(mfq_tensor_backend::kBFloat16)" in flash_path
-    assert "attention_llama_flash128_cuda" in ATTENTION_LLAMA_SOURCE
-    implementation = ATTENTION_LLAMA_SOURCE.split(
-        "attention_llama_flash128_cuda", 1
-    )[1].split("attention_llama_flash512_cuda", 1)[0]
+    assert "mfq_attention_mma128_cuda" in ATTENTION_MMA_SOURCE
+    implementation = ATTENTION_MMA_SOURCE.split(
+        "mfq_attention_mma128_cuda", 1
+    )[1].split("mfq_attention_mma512_cuda", 1)[0]
     assert "D == 128" in implementation
     assert "Hq == 4 * Hk" in implementation
-    assert "mfq_llama_flash_launch<128, 128, 16, 4>" in implementation
+    assert "mfq_attention_mma_launch<128, 128, 16, 4>" in implementation
     casts = SOURCE.split(
         '"MFQ_DISABLE_MINICPM_FLASH128_SPECIALIZED_CASTS"', 1
     )[1].split("attention_token_major = true", 1)[0]
     assert "minicpm_flash128_q_cast_cuda" in casts
     assert "minicpm_flash128_kv_cast_cuda" in casts
     assert "minicpm_flash128_output_cast_cuda" in casts
-    assert "minicpm_flash128_q_cast_kernel" in ATTENTION_LLAMA_SOURCE
-    assert "minicpm_flash128_kv_cast_kernel" in ATTENTION_LLAMA_SOURCE
-    assert "minicpm_flash128_output_cast_kernel" in ATTENTION_LLAMA_SOURCE
-    assert "__bfloat162float" in ATTENTION_LLAMA_SOURCE
-    assert "__float2half_rn" in ATTENTION_LLAMA_SOURCE
-    assert "__float2bfloat16_rn" in ATTENTION_LLAMA_SOURCE
-    assert ATTENTION_LLAMA_SOURCE.count("numel() > 0") >= 3
+    assert "minicpm_flash128_q_cast_kernel" in ATTENTION_MMA_SOURCE
+    assert "minicpm_flash128_kv_cast_kernel" in ATTENTION_MMA_SOURCE
+    assert "minicpm_flash128_output_cast_kernel" in ATTENTION_MMA_SOURCE
+    assert "__bfloat162float" in ATTENTION_MMA_SOURCE
+    assert "__float2half_rn" in ATTENTION_MMA_SOURCE
+    assert "__float2bfloat16_rn" in ATTENTION_MMA_SOURCE
+    assert ATTENTION_MMA_SOURCE.count("numel() > 0") >= 3
 
 
 def test_minicpmo_bf16_residual_uses_contiguous_specialized_add() -> None:
