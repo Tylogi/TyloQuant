@@ -818,8 +818,8 @@ data: <JobEventResource JSON>
 服务端路由或协议模型变更后，重新生成并校验 OpenAPI：
 
 ~~~
-python -m mfq.server.openapi mfq/server/protocol/openapi.json
-python -m mfq.server.openapi --check mfq/server/protocol/openapi.json
+uv run -m mfq.server.openapi mfq/server/protocol/openapi.json
+uv run -m mfq.server.openapi --check mfq/server/protocol/openapi.json
 ~~~
 
 WebSocket 没有作为 OpenAPI <code>paths</code> 操作描述；契约的

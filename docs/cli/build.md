@@ -73,7 +73,7 @@ To inspect a generator-dependent path, read the `executable` field for the
 selected backend in the manifest:
 
 ```shell
-uv run python -m json.tool build/mfq-runtime.json
+uv run -m json.tool build/mfq-runtime.json
 ```
 
 `mfq serve` reads this manifest automatically. If the executable exists, it is
