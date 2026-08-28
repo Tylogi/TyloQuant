@@ -52,6 +52,7 @@ import {
   saveStudioCredential,
   selectLocalModelDirectory,
   startLocalStudio,
+  studioConfirm,
   studioCredential,
   studioStatus,
 } from "./studio";
@@ -2028,7 +2029,7 @@ export default function App() {
   }
 
   async function deleteSession(session: Session) {
-    if (busy || !window.confirm(tr("删除这个会话？", "Delete this session?"))) return;
+    if (busy || !await studioConfirm(tr("删除这个会话？", "Delete this session?"))) return;
     try {
       await api.deleteSession(session.id);
       setVoiceMessages((current) => current.filter((item) => item.sessionId !== session.id));
@@ -2043,7 +2044,7 @@ export default function App() {
   }
 
   async function clearSessions() {
-    if (busy || !assistantSessions.length || !window.confirm(tr("清空当前角色的全部会话？", "Clear all sessions for this role?"))) {
+    if (busy || !assistantSessions.length || !await studioConfirm(tr("清空当前角色的全部会话？", "Clear all sessions for this role?"))) {
       return;
     }
     try {
@@ -2683,7 +2684,7 @@ export default function App() {
 
   async function deleteStoredPreset() {
     if (!selectedStoredPreset) return;
-    if (!window.confirm(tr(`删除预设“${selectedStoredPreset}”？`, `Delete preset “${selectedStoredPreset}”?`))) return;
+    if (!await studioConfirm(tr(`删除预设“${selectedStoredPreset}”？`, `Delete preset “${selectedStoredPreset}”?`))) return;
     const selected = storedPresets.find((preset) => preset.name === selectedStoredPreset);
     try {
       if (selected?.id) await api.deleteGenerationPreset(selected.id);
@@ -2806,7 +2807,7 @@ export default function App() {
 
   async function reloadRuntime() {
     if (busy || voiceRef.current?.active) return;
-    if (!window.confirm(tr(`以 ${formatNumber(contextSize)} token 上下文重载模型？`, `Reload the model with a ${formatNumber(contextSize)} token context?`))) return;
+    if (!await studioConfirm(tr(`以 ${formatNumber(contextSize)} token 上下文重载模型？`, `Reload the model with a ${formatNumber(contextSize)} token context?`))) return;
     setBusy(true);
     try {
       const status = await api.reloadRuntime(contextSize);
@@ -2822,7 +2823,7 @@ export default function App() {
   async function clearRuntimeCache() {
     const snapshots = Number(runtime?.prefix_cache_snapshots || 0);
     if (busy || snapshots <= 0 || Number(runtime?.active_requests || 0) > 0) return;
-    if (!window.confirm(tr(
+    if (!await studioConfirm(tr(
       `清除 ${formatNumber(snapshots)} 个 prefix cache 快照？`,
       `Clear ${formatNumber(snapshots)} prefix-cache snapshots?`,
     ))) return;
@@ -3036,7 +3037,7 @@ export default function App() {
   async function removeSelectedArtifact() {
     const uri = String(selectedJob?.result?.artifact || "");
     if (!uri.startsWith("workspace://") || busy) return;
-    if (!window.confirm(tr("删除这个本地产物？", "Delete this local artifact?"))) return;
+    if (!await studioConfirm(tr("删除这个本地产物？", "Delete this local artifact?"))) return;
     setBusy(true);
     try {
       await api.removeWorkspaceArtifact(uri);
@@ -3275,7 +3276,7 @@ export default function App() {
 
   async function loadRuntimeProfile(profile: RuntimeProfile) {
     if (busy) return;
-    if (profile.drifted && !window.confirm(tr(
+    if (profile.drifted && !await studioConfirm(tr(
       "模型产物已变化。仍使用这个配置档案加载？",
       "The model artifact changed. Load this profile anyway?",
     ))) return;

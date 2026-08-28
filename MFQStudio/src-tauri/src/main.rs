@@ -435,6 +435,18 @@ async fn studio_select_model_directory(app: AppHandle) -> Result<Option<Vec<Stri
 }
 
 #[tauri::command]
+fn studio_confirm(message: String) -> bool {
+    matches!(
+        rfd::MessageDialog::new()
+            .set_title("MFQ Studio")
+            .set_description(message)
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show(),
+        rfd::MessageDialogResult::Yes
+    )
+}
+
+#[tauri::command]
 fn studio_credential_get() -> Result<String, String> {
     let entry = keyring::Entry::new(CREDENTIAL_SERVICE, CREDENTIAL_ACCOUNT)
         .map_err(|error| error.to_string())?;
@@ -468,6 +480,7 @@ fn main() {
             studio_configure,
             studio_start_local,
             studio_select_model_directory,
+            studio_confirm,
             studio_credential_get,
             studio_credential_set
         ])

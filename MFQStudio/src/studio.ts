@@ -54,6 +54,13 @@ export async function selectLocalModelDirectory(): Promise<string[] | null> {
   return tauri.invoke<string[] | null>("studio_select_model_directory");
 }
 
+export async function studioConfirm(message: string): Promise<boolean> {
+  const tauri = internals();
+  return tauri
+    ? tauri.invoke<boolean>("studio_confirm", { message })
+    : window.confirm(message);
+}
+
 export async function studioCredential(): Promise<string> {
   const tauri = internals();
   return tauri ? tauri.invoke<string>("studio_credential_get") : "";

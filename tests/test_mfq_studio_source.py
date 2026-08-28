@@ -99,6 +99,15 @@ def test_studio_can_select_and_load_an_external_mfq_directory_in_local_mode():
     assert 'tr("选择模型文件夹", "Choose model folder")' in APP
 
 
+def test_studio_uses_native_confirmation_dialogs_for_destructive_actions():
+    assert "fn studio_confirm(message: String) -> bool" in RUST
+    assert "rfd::MessageButtons::YesNo" in RUST
+    assert "studio_confirm," in RUST
+    assert 'tauri.invoke<boolean>("studio_confirm", { message })' in STUDIO_BRIDGE
+    assert "window.confirm" not in APP
+    assert APP.count("await studioConfirm(") >= 7
+
+
 def test_studio_drains_duplex_output_after_microphone_capture_stops():
     assert "MAX_RESPONSE_DRAIN_STEPS" in REALTIME_AUDIO
     assert "event.end_of_turn === true" in REALTIME_AUDIO
