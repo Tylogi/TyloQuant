@@ -28,6 +28,17 @@ NINT · NVQ/NPQ · NEPQ · TPQ · 逐专家 MoE · CUDA · Metal · C++ 运行�
 
 <img src="./docs/figures/tyloquant-mfq-webui-zh.png" alt="TyloQuant MFQ 本地推理网页界面" width="100%">
 
+## 可用模型
+
+Tylogi 的模型主页目前提供以下可下载的 `.mfq` 模型。
+
+| 模型 | 可用 MFQ 档位 | Hugging Face | ModelScope |
+|---|---|---|---|
+| DeepSeek-V4-Flash-0731 | `EW-V2-S`、`EW-V2-M`、`EW-V2-L` | [下载](https://huggingface.co/Tylogi/DeepSeek-V4-Flash-0731-EW-MFQ) | [下载](https://www.modelscope.cn/models/Tylogi/DeepSeek-V4-Flash-0731-EW-MFQ) |
+| Qwen3.8-27B | `V1-S`、`V1-M`、`V2-XXS`、`V2-S`、`V3-XXS`、`V3-S`、`V4-XS`、`S4-M`、`S5-M`、`S6-M` | — | [下载](https://www.modelscope.cn/models/Tylogi/Qwen3.8-27B-MFQ) |
+| Qwen3.6-27B | `V2-XXS`、`V2-M`、`V3-XXS`、`S2-L`、`S3-L`、`S4-L`、`S5-L`、`S6-L` | [下载](https://huggingface.co/Tylogi/Qwen3.6-27B-MFQ) | — |
+| MiniCPM-o 4.5 | `S4`、`S4-S`、`S4-M`、`S5-S`、`S5-M`、`S6`、`S8` | — | [下载](https://www.modelscope.cn/models/Tylogi/MiniCPM-o-4_5-MFQ) |
+
 ## 安装
 
 ### 环境要求

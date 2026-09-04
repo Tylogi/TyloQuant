@@ -35,6 +35,18 @@ matched to llama.cpp `IQ*` use `V`, while scalar-quantized models matched to
 
 <img src="./docs/figures/tyloquant-mfq-webui-english.png" alt="TyloQuant MFQ local inference WebUI in English" width="100%">
 
+## Available Models
+
+The Tylogi model hubs currently provide the following downloadable `.mfq`
+releases.
+
+| Model | Available MFQ tiers | Hugging Face | ModelScope |
+| ----- | ------------------- | ------------ | ---------- |
+| DeepSeek-V4-Flash-0731 | `EW-V2-S`, `EW-V2-M`, `EW-V2-L` | [Download](https://huggingface.co/Tylogi/DeepSeek-V4-Flash-0731-EW-MFQ) | [Download](https://www.modelscope.cn/models/Tylogi/DeepSeek-V4-Flash-0731-EW-MFQ) |
+| Qwen3.8-27B | `V1-S`, `V1-M`, `V2-XXS`, `V2-S`, `V3-XXS`, `V3-S`, `V4-XS`, `S4-M`, `S5-M`, `S6-M` | — | [Download](https://www.modelscope.cn/models/Tylogi/Qwen3.8-27B-MFQ) |
+| Qwen3.6-27B | `V2-XXS`, `V2-M`, `V3-XXS`, `S2-L`, `S3-L`, `S4-L`, `S5-L`, `S6-L` | [Download](https://huggingface.co/Tylogi/Qwen3.6-27B-MFQ) | — |
+| MiniCPM-o 4.5 | `S4`, `S4-S`, `S4-M`, `S5-S`, `S5-M`, `S6`, `S8` | — | [Download](https://www.modelscope.cn/models/Tylogi/MiniCPM-o-4_5-MFQ) |
+
 ## Installation
 
 ### Requirements
