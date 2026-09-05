@@ -131,6 +131,21 @@ dsv4_build_prefill_plan(
     int ratio,
     int window);
 
+// Vision-aware variant. left/right are [B,M] visible distances inside an
+// image sentinel span; ordinary text rows contain zero.  The local plan may
+// expand by max_image_tokens while pooled/indexer causality stays unchanged.
+std::pair<mlx::core::array, mlx::core::array>
+dsv4_build_prefill_plan_visible(
+    const mlx::core::array& topk,
+    const mlx::core::array& left,
+    const mlx::core::array& right,
+    int query_offset,
+    int local_history,
+    int pool_len,
+    int ratio,
+    int window,
+    int max_image_tokens);
+
 std::pair<mlx::core::array, mlx::core::array>
 dsv4_build_decode_plan(
     const mlx::core::array& topk,

@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import csv
+
 import pytest
 
-from mfq.quantize.v4f_source import V4FExpertSource
 from mfq.quantize.v4f_plan import (
     allocate_v4f_ew_nvq2j_nint4,
     routed_blob_bytes,
     routed_family_blob_bytes,
     routed_family_pool_bytes,
 )
+from mfq.quantize.v4f_source import V4FExpertSource
 from mfq.tools.quantize_v4f_to_mfq import (
     _layer_source_shards,
     _source_shards_ready,
@@ -83,20 +84,14 @@ def test_v4f_88g_allocator_uses_budget_and_is_deterministic(tmp_path) -> None:
     assert first.nint4_count > 0
     assert first.estimated_blob_bytes + reserve <= target
     minimum_upgrade = min(
-        routed_family_blob_bytes(
-            projection, {"NVQ2J": 254, "NINT4": 2}
-        )
-        - routed_family_blob_bytes(
-            projection, {"NVQ2J": 255, "NINT4": 1}
-        )
+        routed_family_blob_bytes(projection, {"NVQ2J": 254, "NINT4": 2})
+        - routed_family_blob_bytes(projection, {"NVQ2J": 255, "NINT4": 1})
         for projection in ("gate_up", "down")
     )
     assert target - first.estimated_blob_bytes < reserve + minimum_upgrade
     assert 0.0 <= first.gate_up_energy_fraction <= 1.0
     assert 0.0 <= first.down_energy_fraction <= 1.0
-    assert (
-        first.gate_up_energy_fraction + first.down_energy_fraction
-    ) > 0.0
+    assert (first.gate_up_energy_fraction + first.down_energy_fraction) > 0.0
 
 
 def test_v4f_incremental_training_tracks_exact_layer_shards(
@@ -146,3 +141,19 @@ def test_v4f_sample_start_rejects_oversized_or_empty_ranges() -> None:
             rows=1,
             total_rows=0,
         )
+
+
+def test_v4f_expert_source_addresses_dspark_namespace() -> None:
+    class Info:
+        dtype = "I8"
+        shape = (2048, 2048)
+
+    class Checkpoint:
+        def info(self, _name):
+            return Info()
+
+    source = V4FExpertSource(Checkpoint(), 2, "gate_up", namespace="mtp")
+    assert source._weight_name(17, "w3") == ("mtp.2.ffn.experts.17.w3.weight")
+
+    with pytest.raises(ValueError, match="namespace"):
+        V4FExpertSource(Checkpoint(), 0, "gate_up", namespace="other")

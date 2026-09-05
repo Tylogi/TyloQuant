@@ -971,7 +971,7 @@ int serve_loaded_runtime(
         multimodal_generate =
             [runtime_mutex, runtime_holder, runtime_stream](
                 const std::vector<std::int64_t>& prompt,
-                const MfqVisionInput& vision,
+                const MfqMultimodalInput& vision,
                 const MfqSamplingParams& sampling,
                 const MfqTokenCallback& callback,
                 const MfqPrefillCallback& on_prefill,
@@ -1077,6 +1077,146 @@ int serve_loaded_runtime(
                     inputs, parameters, sampling.max_tokens,
                     callback, report_prefill, token_constraint);
             };
+    } else if constexpr (std::is_same_v<
+            Runtime, mfq::metal::MlxDeepseekV4CausalLm>) {
+        if (runtime_holder->value().supports_multimodal()) {
+            multimodal_generate =
+                [runtime_mutex, runtime_holder, runtime_stream](
+                    const std::vector<std::int64_t>& prompt,
+                    const MfqMultimodalInput& media,
+                    const MfqSamplingParams& sampling,
+                    const MfqTokenCallback& callback,
+                    const MfqPrefillCallback& on_prefill,
+                    const MfqTokenConstraintPtr& token_constraint) {
+                    std::lock_guard<std::mutex> lock(*runtime_mutex);
+                    if (!runtime_holder->has_value()) {
+                        throw std::runtime_error(
+                            "DeepSeek-V4 runtime is unavailable after a failed reload");
+                    }
+                    if (media.processor !=
+                        MfqMultimodalProcessor::deepseek_v4) {
+                        throw std::invalid_argument(
+                            "DeepSeek-V4 received a foreign multimodal payload");
+                    }
+                    mlx::core::set_default_device(
+                        mlx::core::Device::gpu);
+                    mlx::core::set_default_stream(runtime_stream);
+                    const auto& config = runtime_holder->value().config();
+                    const auto pixel_shape = checked_mlx_shape(
+                        media.pixel_shape, "pixel_values");
+                    if (pixel_shape.size() != 3 ||
+                        media.image_bounds.size() % 4 != 0 ||
+                        media.image_permutation_offsets.size() !=
+                            media.image_bounds.size() / 4 + 1) {
+                        throw std::invalid_argument(
+                            "DeepSeek-V4 media payload geometry is invalid");
+                    }
+                    const auto pixels = mlx::core::array(
+                        media.pixel_values.begin(),
+                        pixel_shape,
+                        mlx::core::float32);
+                    std::vector<mfq::metal::MlxDeepseekV4ImageInput> images;
+                    const size_t count = media.image_bounds.size() / 4;
+                    images.reserve(count);
+                    for (size_t source = 0; source < count; ++source) {
+                        const int bound_source = static_cast<int>(
+                            media.image_bounds[4 * source + 1]);
+                        const int begin = static_cast<int>(
+                            media.image_bounds[4 * source + 2]);
+                        const int end = static_cast<int>(
+                            media.image_bounds[4 * source + 3]);
+                        if (bound_source != static_cast<int>(source) ||
+                            begin < 0 || end <= begin ||
+                            end > static_cast<int>(prompt.size())) {
+                            throw std::invalid_argument(
+                                "DeepSeek-V4 image bound is invalid");
+                        }
+                        const int vit_h = media.vision_grid[4 * source];
+                        const int vit_w = media.vision_grid[4 * source + 1];
+                        const int active = vit_h * vit_w;
+                        auto image_pixels = mlx::core::slice(
+                            pixels,
+                            mlx::core::Shape{
+                                static_cast<int>(source), 0, 0},
+                            mlx::core::Shape{
+                                static_cast<int>(source + 1),
+                                active,
+                                pixel_shape[2]});
+                        image_pixels = mlx::core::reshape(
+                            image_pixels,
+                            mlx::core::Shape{active, pixel_shape[2]});
+                        std::vector<std::int64_t> types;
+                        types.reserve(static_cast<size_t>(end - begin));
+                        for (int position = begin; position < end; ++position) {
+                            const auto type = prompt[static_cast<size_t>(position)] -
+                                config.vocab;
+                            if (type < 0 || type > 4) {
+                                throw std::invalid_argument(
+                                    "DeepSeek-V4 image span contains a text token");
+                            }
+                            types.push_back(type);
+                        }
+                        const auto perm_begin =
+                            media.image_permutation_offsets[source];
+                        const auto perm_end =
+                            media.image_permutation_offsets[source + 1];
+                        if (perm_begin < 0 || perm_end < perm_begin ||
+                            static_cast<size_t>(perm_end) >
+                                media.image_permutation.size()) {
+                            throw std::invalid_argument(
+                                "DeepSeek-V4 image permutation offset is invalid");
+                        }
+                        std::vector<std::int32_t> permutation;
+                        permutation.reserve(static_cast<size_t>(
+                            perm_end - perm_begin));
+                        for (auto index = perm_begin; index < perm_end; ++index) {
+                            const auto value = media.image_permutation[
+                                static_cast<size_t>(index)];
+                            if (value < 0 ||
+                                value > std::numeric_limits<std::int32_t>::max()) {
+                                throw std::invalid_argument(
+                                    "DeepSeek-V4 image permutation is invalid");
+                            }
+                            permutation.push_back(
+                                static_cast<std::int32_t>(value));
+                        }
+                        images.push_back({
+                            std::move(image_pixels),
+                            vit_h,
+                            vit_w,
+                            begin,
+                            end,
+                            std::move(types),
+                            std::move(permutation),
+                        });
+                    }
+                    mfq::metal::MlxSamplingParams parameters;
+                    parameters.temperature = sampling.temperature;
+                    parameters.top_k = sampling.top_k;
+                    parameters.top_p = sampling.top_p;
+                    parameters.presence_penalty = sampling.presence_penalty;
+                    parameters.frequency_penalty = sampling.frequency_penalty;
+                    parameters.repetition_penalty = sampling.repetition_penalty;
+                    parameters.seed = sampling.seed;
+                    std::function<void(std::size_t, double)> report_prefill;
+                    if (on_prefill) {
+                        report_prefill = [on_prefill](
+                            std::size_t tokens, double model_ms) {
+                            on_prefill(MfqPrefillTiming{
+                                tokens, model_ms, 0.0, model_ms});
+                        };
+                    }
+                    return runtime_holder->value().generate_multimodal(
+                        prompt,
+                        images,
+                        parameters,
+                        sampling.max_tokens,
+                        callback,
+                        std::nullopt,
+                        report_prefill,
+                        token_constraint);
+                };
+        }
     }
     const MfqReloadFn reload =
         [runtime_mutex, runtime_holder, loaded_context, session_cache,
@@ -1460,13 +1600,14 @@ int run_native_hf_server(const Arguments& arguments) {
                 8,
                 prefill_overlap);
         };
-    const mfq::metal::MfqContainer profile_container(model_root);
     return serve_loaded_runtime(
         arguments,
-        &profile_container,
+        nullptr,
         std::move(runtime),
         load_runtime,
-        config.model_type,
+        config.has_vision()
+            ? std::string("deepseek_v4_vision")
+            : config.model_type,
         config.max_position_embeddings,
         config.vocab,
         runtime_stream);
@@ -1569,7 +1710,9 @@ int run_native_server(
             &container,
             std::move(runtime),
             load_runtime,
-            config.model_type,
+            config.has_vision()
+                ? std::string("deepseek_v4_vision")
+                : config.model_type,
             config.max_position_embeddings,
             config.vocab,
             runtime_stream);

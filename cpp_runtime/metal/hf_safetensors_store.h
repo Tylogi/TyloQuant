@@ -102,6 +102,10 @@ public:
         std::filesystem::path root,
         std::size_t num_layers,
         std::size_t num_experts);
+    DeepseekV4NativeExpertStore(
+        std::filesystem::path root,
+        std::vector<std::string> layer_prefixes,
+        std::size_t num_experts);
     ~DeepseekV4NativeExpertStore();
 
     const HfSafetensorStore& checkpoint() const noexcept;

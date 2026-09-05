@@ -16,6 +16,8 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -3263,6 +3265,115 @@ void test_mxfp4_nintm_and_projection_offsets() {
     }
 }
 
+void test_mxfp4_smallm_nax_policy() {
+    constexpr int experts = 24;
+    constexpr int output = 8;
+    constexpr int input = 64;
+    constexpr int routes = 6;
+    std::vector<std::int32_t> slot_for_expert(experts);
+    std::iota(slot_for_expert.begin(), slot_for_expert.end(), 0);
+    std::vector<std::uint8_t> packed(
+        static_cast<std::size_t>(experts) * output * input / 2,
+        0x22);
+    std::vector<std::uint8_t> scales(
+        static_cast<std::size_t>(experts) * output * input / 32,
+        127);
+    const auto weight = mfq::metal::MlxMoeWeight::from_mxfp4_slots(
+        experts,
+        output,
+        input,
+        slot_for_expert,
+        mlx::core::array(
+            packed.begin(),
+            mlx::core::Shape{experts, output * input / 2}),
+        mlx::core::array(
+            scales.begin(),
+            mlx::core::Shape{experts, output * input / 32}));
+
+    std::vector<std::int32_t> repeated(4 * routes);
+    for (int row = 0; row < 4; ++row) {
+        for (int route = 0; route < routes; ++route) {
+            repeated[static_cast<std::size_t>(row) * routes + route] = route;
+        }
+    }
+    std::vector<std::int32_t> unique(4 * routes);
+    std::iota(unique.begin(), unique.end(), 0);
+    const mlx::core::array repeated_ids(
+        repeated.begin(),
+        mlx::core::Shape{4, routes});
+    const mlx::core::array unique_ids(
+        unique.begin(),
+        mlx::core::Shape{4, routes});
+    const mlx::core::array short_ids(
+        repeated.begin(),
+        mlx::core::Shape{3, routes});
+
+    const char* prior = std::getenv("MFQ_METAL_NINTM_SMALLM_NAX");
+    const std::optional<std::string> saved = prior == nullptr
+        ? std::nullopt
+        : std::optional<std::string>(prior);
+    setenv("MFQ_METAL_NINTM_SMALLM_NAX", "1", 1);
+    require(
+        weight.prefers_mxfp4_smallm_nax(repeated_ids),
+        "small-M MXFP4 NAX must accept repeated M=4 routes");
+    require(
+        !weight.prefers_mxfp4_smallm_nax(unique_ids),
+        "small-M MXFP4 NAX must preserve the unique-route kernel");
+    require(
+        !weight.prefers_mxfp4_smallm_nax(short_ids),
+        "small-M MXFP4 NAX must preserve the M<4 kernel");
+    setenv("MFQ_METAL_NINTM_SMALLM_NAX", "0", 1);
+    require(
+        !weight.prefers_mxfp4_smallm_nax(repeated_ids),
+        "small-M MXFP4 NAX disable override was ignored");
+
+    std::vector<float> input_values(4 * input);
+    for (std::size_t index = 0; index < input_values.size(); ++index) {
+        input_values[index] = static_cast<float>(
+            static_cast<int>((index * 11 + 3) % 31) - 15) / 256.0f;
+    }
+    const mlx::core::array input_array(
+        input_values.begin(),
+        mlx::core::Shape{4, input});
+    const auto route_order = mlx::core::contiguous(
+        mlx::core::astype(
+            mlx::core::argsort(
+                mlx::core::reshape(
+                    repeated_ids,
+                    mlx::core::Shape{4 * routes})),
+            mlx::core::int32));
+    const auto reference = evaluated_floats(
+        weight.routed_matmul(input_array, repeated_ids));
+    const auto forced_nax = evaluated_floats(
+        mlx::core::take(
+            weight.routed_matmul_sorted(
+                input_array,
+                repeated_ids,
+                route_order,
+                false,
+                false,
+                0.0f,
+                nullptr,
+                true),
+            mlx::core::argsort(route_order),
+            0));
+    require(
+        reference.size() == forced_nax.size(),
+        "small-M MXFP4 NAX output size mismatch");
+    for (std::size_t index = 0; index < reference.size(); ++index) {
+        require_close(reference[index], forced_nax[index], 4e-3f);
+    }
+
+    if (saved.has_value()) {
+        setenv(
+            "MFQ_METAL_NINTM_SMALLM_NAX",
+            saved->c_str(),
+            1);
+    } else {
+        unsetenv("MFQ_METAL_NINTM_SMALLM_NAX");
+    }
+}
+
 void test_vq_cohorts_and_ffn() {
     constexpr int tokens = 3;
     constexpr int routes = 3;
@@ -4444,6 +4555,7 @@ int main(int argc, char** argv) {
         test_all_families_and_projections();
         test_swiglu_ffn();
         test_mxfp4_nintm_and_projection_offsets();
+        test_mxfp4_smallm_nax_policy();
         test_vq_cohorts_and_ffn();
         test_nepq_a_routed_and_fused_swiglu();
         test_grouped_vq_mmq_prefill();

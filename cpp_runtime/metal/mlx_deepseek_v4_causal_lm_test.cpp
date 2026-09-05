@@ -25,6 +25,10 @@ using mfq::metal::DeepseekV4Config;
 using mfq::metal::MlxDeepseekV4Attention;
 using mfq::metal::MlxDeepseekV4AttentionComponents;
 using mfq::metal::MlxDeepseekV4CausalLm;
+using mfq::metal::MlxDeepseekV4DSpark;
+using mfq::metal::MlxDeepseekV4DSparkAttentionComponents;
+using mfq::metal::MlxDeepseekV4DSparkHeadComponents;
+using mfq::metal::MlxDeepseekV4DSparkStageComponents;
 using mfq::metal::MlxDeepseekV4Layer;
 using mfq::metal::MlxDeepseekV4LayerComponents;
 using mfq::metal::MlxDeepseekV4Moe;
@@ -819,7 +823,102 @@ MlxLinear make_output(bool zero) {
               kVocab,
               kHidden,
               0.025f,
-              11));
+            11));
+}
+
+MlxDeepseekV4DSpark make_dspark(
+    const DeepseekV4Config& config,
+    const MlxEmbedding& embedding,
+    const MlxLinear& output) {
+    const int heads = static_cast<int>(config.n_heads);
+    const int head_dim = static_cast<int>(config.head_dim);
+    const int attention = heads * head_dim;
+    const int q_rank = static_cast<int>(config.q_lora_rank);
+    const int groups = static_cast<int>(config.o_groups);
+    const int o_rank = static_cast<int>(config.o_lora_rank);
+    std::vector<MlxDeepseekV4DSparkStageComponents> stages;
+    stages.push_back({
+        MlxDeepseekV4DSparkAttentionComponents{
+            MlxLinear(zeros_matrix(q_rank, kHidden)),
+            MlxLinear(zeros_matrix(attention, q_rank)),
+            MlxLinear(zeros_matrix(head_dim, kHidden)),
+            MlxLinear(zeros_matrix(
+                groups * o_rank, attention / groups)),
+            MlxLinear(zeros_matrix(kHidden, groups * o_rank)),
+            ones_vector(q_rank),
+            ones_vector(head_dim),
+            mlx::core::zeros(Shape{heads}, mlx::core::float32),
+        },
+        make_moe(config),
+        ones_vector(kHidden),
+        ones_vector(kHidden),
+        MlxLinear(zeros_matrix(24, 4 * kHidden)),
+        mlx::core::zeros(Shape{24}, mlx::core::float32),
+        mlx::core::ones(Shape{3}, mlx::core::float32),
+        MlxLinear(zeros_matrix(24, 4 * kHidden)),
+        mlx::core::zeros(Shape{24}, mlx::core::float32),
+        mlx::core::ones(Shape{3}, mlx::core::float32),
+    });
+    return MlxDeepseekV4DSpark(
+        config,
+        embedding,
+        output,
+        MlxLinear(zeros_matrix(kHidden, kHidden)),
+        ones_vector(kHidden),
+        std::move(stages),
+        MlxDeepseekV4DSparkHeadComponents{
+            ones_vector(kHidden),
+            MlxLinear(zeros_matrix(4, 4 * kHidden)),
+            mlx::core::zeros(Shape{4}, mlx::core::float32),
+            mlx::core::ones(Shape{1}, mlx::core::float32),
+            MlxEmbedding(zeros_matrix(
+                kVocab,
+                static_cast<int>(config.dspark_markov_rank))),
+            MlxLinear(zeros_matrix(
+                kVocab,
+                static_cast<int>(config.dspark_markov_rank))),
+            MlxLinear(zeros_matrix(
+                1,
+                kHidden + static_cast<int>(config.dspark_markov_rank))),
+        },
+        kContext,
+        mfq::metal::deepseek_v4_yarn_tables(
+            static_cast<int>(config.qk_rope_head_dim),
+            kContext,
+            static_cast<float>(config.rope_theta)));
+}
+
+MlxDeepseekV4CausalLm make_dspark_model() {
+    auto config = test_config(false, {0, 0, 0});
+    config.n_mtp_layers = 1;
+    config.dspark_block_size = 2;
+    config.dspark_noise_token_id = kVocab - 1;
+    config.dspark_target_layer_ids = {2};
+    config.dspark_markov_rank = 4;
+    config.mtp_compress_ratios = {0};
+    config.validate();
+    std::vector<MlxDeepseekV4Layer> layers;
+    for (int layer = 0; layer < kLayers; ++layer) {
+        layers.push_back(make_layer(config, layer));
+    }
+    auto embedding = make_embedding();
+    auto output = make_output(true);
+    auto dspark = make_dspark(config, embedding, output);
+    return MlxDeepseekV4CausalLm(
+        config,
+        std::move(embedding),
+        std::move(layers),
+        ones_vector(kHidden),
+        std::move(output),
+        MlxLinear(zeros_matrix(4, 4 * kHidden)),
+        mlx::core::zeros(Shape{4}, mlx::core::float32),
+        mlx::core::ones(Shape{1}, mlx::core::float32),
+        kContext,
+        mlx::core::float32,
+        nullptr,
+        nullptr,
+        std::nullopt,
+        std::move(dspark));
 }
 
 MlxDeepseekV4CausalLm make_model(
@@ -1339,6 +1438,32 @@ void test_generation_eos_and_callback() {
                 model.cache_position() == 2,
             "DeepSeek-V4 callback stop performed an extra decode");
     }
+}
+
+void test_dspark_generation_verification_and_replay() {
+    auto model = make_dspark_model();
+    require(model.supports_mtp(), "DeepSeek-V4 DSpark was not attached");
+    mfq::metal::MlxSamplingParams sampling;
+    sampling.temperature = 0.0;
+    std::vector<std::int64_t> emitted;
+    const auto count = model.generate(
+        {1, 2},
+        sampling,
+        6,
+        [&](std::int64_t token) {
+            emitted.push_back(token);
+            return true;
+        },
+        std::vector<std::int64_t>{});
+    require(
+        count == 6 &&
+            emitted == std::vector<std::int64_t>({0, 0, 0, 0, 0, 0}),
+        "DeepSeek-V4 DSpark verification output mismatch");
+    // The final token is delivered without an unnecessary trailing decode;
+    // the preceding verified/replayed tokens must remain on one timeline.
+    require(
+        model.cache_position() >= 5 && model.cache_position() <= 8,
+        "DeepSeek-V4 DSpark replay cache position mismatch");
 }
 
 void test_generation_stable_prefix_cache() {
@@ -1870,6 +1995,7 @@ int main() {
         test_layer_schedule_and_manual_reference();
         test_prefill_decode_and_chunking();
         test_generation_eos_and_callback();
+        test_dspark_generation_verification_and_replay();
         test_generation_stable_prefix_cache();
         test_text_session_snapshot_restore();
         test_mfq_container_load();

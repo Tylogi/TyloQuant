@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace mfq::metal {
@@ -173,6 +174,13 @@ public:
         std::size_t cache_bytes,
         std::size_t io_workers = 8,
         bool prefill_overlap = false);
+    MlxDeepseekV4SsdExpertCache(
+        std::filesystem::path model_root,
+        std::vector<std::string> layer_prefixes,
+        std::size_t cache_bytes,
+        std::size_t io_workers = 8,
+        bool prefill_overlap = false,
+        std::size_t num_experts = 256);
     ~MlxDeepseekV4SsdExpertCache();
 
     MlxDeepseekV4SsdExpertCache(

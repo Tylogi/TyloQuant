@@ -1,5 +1,5 @@
-from pathlib import Path
 import re
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = (ROOT / "cpp_runtime" / "mfq_server.cpp").read_text(
@@ -148,7 +148,7 @@ def test_native_server_does_not_bundle_or_mount_a_webui() -> None:
 
 def test_dsv4_server_uses_exact_stable_prefix_kv_reuse() -> None:
     assert "MfqPromptCachePlan" in SERVER
-    assert 'model_type == "deepseek_v4"' in SERVER
+    assert 'normalized_identity(model_type).rfind("deepseek_v4", 0) == 0' in SERVER
     assert 'work.sampling.enable_thinking ? "<think>" : "</think>"' in SERVER
     assert "stable_prefix_tokens" in SERVER
     assert '{"prefill_tokens", values.prefill_tokens}' in SERVER

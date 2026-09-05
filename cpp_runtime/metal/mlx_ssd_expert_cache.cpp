@@ -14,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -25,6 +26,15 @@ namespace {
 std::uint64_t expert_key(std::size_t layer, std::int32_t expert) {
     return (static_cast<std::uint64_t>(layer) << 32u) |
         static_cast<std::uint32_t>(expert);
+}
+
+std::vector<std::string> main_layer_prefixes(std::size_t count) {
+    std::vector<std::string> result;
+    result.reserve(count);
+    for (std::size_t layer = 0; layer < count; ++layer) {
+        result.push_back("layers." + std::to_string(layer));
+    }
+    return result;
 }
 
 } // namespace
@@ -109,10 +119,15 @@ struct MlxDeepseekV4SsdExpertCache::Impl {
 
     Impl(
         std::filesystem::path root,
+        std::vector<std::string> layer_prefixes,
+        std::size_t num_experts,
         std::size_t bytes,
         std::size_t worker_count,
         bool overlap)
-        : store(std::move(root), 43, 256),
+        : store(
+              std::move(root),
+              std::move(layer_prefixes),
+              num_experts),
           slot_bytes(store.slot_bytes()),
           prefill_slots(overlap ? 2 * store.num_experts() : 0),
           total_slots(bytes / slot_bytes),
@@ -1152,6 +1167,23 @@ MlxDeepseekV4SsdExpertCache::MlxDeepseekV4SsdExpertCache(
     bool prefill_overlap)
     : impl_(std::make_shared<Impl>(
           std::move(model_root),
+          main_layer_prefixes(43),
+          256,
+          cache_bytes,
+          io_workers,
+          prefill_overlap)) {}
+
+MlxDeepseekV4SsdExpertCache::MlxDeepseekV4SsdExpertCache(
+    std::filesystem::path model_root,
+    std::vector<std::string> layer_prefixes,
+    std::size_t cache_bytes,
+    std::size_t io_workers,
+    bool prefill_overlap,
+    std::size_t num_experts)
+    : impl_(std::make_shared<Impl>(
+          std::move(model_root),
+          std::move(layer_prefixes),
+          num_experts,
           cache_bytes,
           io_workers,
           prefill_overlap)) {}

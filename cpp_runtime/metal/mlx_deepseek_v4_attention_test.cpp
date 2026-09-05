@@ -24,6 +24,7 @@ using mfq::metal::MlxDeepseekV4AttentionComponents;
 using mfq::metal::MlxDeepseekV4LayerState;
 using mfq::metal::MlxDeepseekV4PoolState;
 using mfq::metal::MlxLinear;
+using mfq::metal::deepseek_v4_image_visibility;
 using mlx::core::Shape;
 using mlx::core::array;
 
@@ -103,6 +104,40 @@ void require_close(
                 std::to_string(expected[index]));
         }
     }
+}
+
+void test_image_visibility_starts_at_image_start() {
+    constexpr std::int64_t vocab = 100;
+    auto visibility = deepseek_v4_image_visibility(
+        {
+            7,
+            vocab + 1,
+            vocab + 1,
+            vocab + 0,
+            vocab + 2,
+            vocab + 3,
+            vocab + 1,
+            vocab + 4,
+            8,
+            vocab + 0,
+            vocab + 4,
+        },
+        vocab,
+        384);
+    require(
+        evaluated_int(visibility.left) ==
+            std::vector<std::int32_t>{0, 0, 0, 0, 1, 2, 3, 4, 0, 0, 1},
+        "image visibility included pre-start alignment padding");
+    require(
+        evaluated_int(visibility.right) ==
+            std::vector<std::int32_t>{0, 0, 0, 4, 3, 2, 1, 0, 0, 1, 0},
+        "image visibility right distances mismatch");
+    require_invalid(
+        [&] {
+            (void)deepseek_v4_image_visibility(
+                {vocab, 3}, vocab, 384);
+        },
+        "unterminated image visibility span was accepted");
 }
 
 array token_slice(
@@ -1123,6 +1158,7 @@ void test_container_load_and_rejections() {
 
 int main() {
     try {
+        test_image_visibility_starts_at_image_start();
         test_yarn_rope_and_rms();
         test_pool_and_ratio_schedule();
         test_local_attention_cpu_reference();

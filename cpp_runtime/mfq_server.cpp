@@ -783,6 +783,11 @@ static MfqModelCapabilityProfile architecture_capability_profile(
     if (identity == "deepseek_v4") {
         return {"deepseek_v4"};
     }
+    if (identity == "deepseek_v4_vision") {
+        return {
+            "deepseek_v4", true, true, false, false, false, false,
+        };
+    }
     if (identity == "glm_moe_dsa") {
         return {"glm_dsa"};
     }
@@ -1309,7 +1314,7 @@ static RequestWork parse_work(const json & body, bool chat, const MfqTokenizer &
         }
         work.cache_plan.stable_prefix_tokens = work.prompt.size();
     }
-    if (chat && model_type == "deepseek_v4" &&
+    if (chat && normalized_identity(model_type).rfind("deepseek_v4", 0) == 0 &&
         boolean_field(body, "add_generation_prompt", true)) {
         const std::string stable_marker =
             work.sampling.enable_thinking ? "<think>" : "</think>";
@@ -2338,33 +2343,249 @@ static int64_t single_special_token(
     if (tokens.size() != 1) {
         throw ApiError(
             500, "server_error",
-            "MiniCPM-o tokenizer does not encode " + marker +
+            "model tokenizer does not encode " + marker +
                 " as one special token");
     }
     return tokens.front();
 }
 
-static MfqVisionInput parse_mfq_vision(
+struct DeepseekV4ImageBlock {
+    std::vector<int64_t> types;
+    std::vector<int64_t> permutation;
+};
+
+static DeepseekV4ImageBlock deepseek_v4_image_block(
+        int64_t height,
+        int64_t width,
+        size_t start_position) {
+    constexpr int64_t kImageStart = 0;
+    constexpr int64_t kImagePad = 1;
+    constexpr int64_t kImage = 2;
+    constexpr int64_t kImageNewLine = 3;
+    constexpr int64_t kImageEnd = 4;
+    if (height <= 0 || width <= 0) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "DeepSeek-V4 image grid must be positive",
+            "mfq_multimodal.vision_grid");
+    }
+    const int64_t padded_height = height + height % 2;
+    const int64_t row_length = width + 1;
+    const int64_t compress_pad =
+        3 - static_cast<int64_t>(start_position % 4);
+    const int64_t trailing_pad =
+        ((padded_height / 2 * row_length) % 2) * 2;
+    DeepseekV4ImageBlock result;
+    result.types.reserve(static_cast<size_t>(
+        compress_pad + 1 + padded_height * row_length +
+        trailing_pad + 1));
+    result.permutation.reserve(
+        static_cast<size_t>(height * width));
+    result.types.insert(
+        result.types.end(),
+        static_cast<size_t>(compress_pad),
+        kImagePad);
+    result.types.push_back(kImageStart);
+    // Official N-layout order: pairs of rows, then columns, then the two
+    // rows in each pair.  Newline/padded slots participate in the order but
+    // only real image slots contribute to the aligner permutation.
+    for (int64_t pair = 0; pair < padded_height / 2; ++pair) {
+        for (int64_t column = 0; column < row_length; ++column) {
+            for (int64_t within = 0; within < 2; ++within) {
+                const int64_t row = pair * 2 + within;
+                const bool real_row = row < height;
+                const bool real_column = column < width;
+                if (real_row && real_column) {
+                    result.types.push_back(kImage);
+                    result.permutation.push_back(row * width + column);
+                } else if (real_row) {
+                    result.types.push_back(kImageNewLine);
+                } else {
+                    result.types.push_back(kImagePad);
+                }
+            }
+        }
+    }
+    result.types.insert(
+        result.types.end(),
+        static_cast<size_t>(trailing_pad),
+        kImagePad);
+    result.types.push_back(kImageEnd);
+    return result;
+}
+
+static MfqMultimodalInput parse_deepseek_v4_multimodal(
         const json & value,
-        const std::vector<int64_t> & prompt,
-        const MfqTokenizer & tokenizer) {
+        std::vector<int64_t> & prompt,
+        const MfqTokenizer & tokenizer,
+        int64_t vocab_size,
+        TensorFileReader * file_reader) {
+    if (vocab_size <= 0) {
+        throw ApiError(
+            500, "server_error",
+            "DeepSeek-V4 multimodal runtime has no vocabulary size");
+    }
+    for (const char * name : {"pixel_values", "patch_mask", "vision_grid"}) {
+        if (!value.contains(name)) {
+            throw ApiError(
+                400, "invalid_request_error",
+                std::string("DeepSeek-V4 multimodal payload is missing ") + name,
+                "mfq_multimodal");
+        }
+    }
+    MfqMultimodalInput result;
+    result.processor = MfqMultimodalProcessor::deepseek_v4;
+    auto pixels = decode_tensor<float>(
+        value, "pixel_values", "float32", file_reader);
+    result.pixel_values = std::move(pixels.first);
+    result.pixel_shape = std::move(pixels.second);
+    auto mask = decode_tensor<uint8_t>(
+        value, "patch_mask", "uint8", file_reader);
+    result.patch_mask = std::move(mask.first);
+    result.patch_mask_shape = std::move(mask.second);
+    auto grid = decode_tensor<int32_t>(
+        value, "vision_grid", "int32", file_reader);
+    result.vision_grid = std::move(grid.first);
+    result.vision_grid_shape = std::move(grid.second);
+
+    if (result.pixel_shape.size() != 3 ||
+        result.pixel_shape[0] <= 0 || result.pixel_shape[0] > 128 ||
+        result.pixel_shape[2] != 3 * 14 * 14 ||
+        result.patch_mask_shape.size() != 2 ||
+        result.vision_grid_shape.size() != 2 ||
+        result.vision_grid_shape[1] != 4 ||
+        result.pixel_shape[0] != result.patch_mask_shape[0] ||
+        result.pixel_shape[0] != result.vision_grid_shape[0] ||
+        result.pixel_shape[1] != result.patch_mask_shape[1]) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "DeepSeek-V4 multimodal tensor geometry is invalid",
+            "mfq_multimodal");
+    }
+    if (!std::all_of(
+            result.pixel_values.begin(), result.pixel_values.end(),
+            [](float item) { return std::isfinite(item); })) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "mfq_multimodal pixel_values contains a non-finite value",
+            "mfq_multimodal.pixel_values");
+    }
+    const int64_t images = result.pixel_shape[0];
+    const int64_t padded_patches = result.pixel_shape[1];
+    for (int64_t image = 0; image < images; ++image) {
+        const int64_t vit_h = result.vision_grid[4 * image];
+        const int64_t vit_w = result.vision_grid[4 * image + 1];
+        const int64_t llm_h = result.vision_grid[4 * image + 2];
+        const int64_t llm_w = result.vision_grid[4 * image + 3];
+        if (vit_h <= 0 || vit_w <= 0 ||
+            vit_h > std::numeric_limits<int64_t>::max() / vit_w ||
+            vit_h * vit_w > padded_patches ||
+            llm_h != (vit_h + 2) / 3 ||
+            llm_w != (vit_w + 2) / 3) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "DeepSeek-V4 vision grid disagrees with patch geometry",
+                "mfq_multimodal.vision_grid");
+        }
+        const int64_t active = vit_h * vit_w;
+        for (int64_t patch = 0; patch < padded_patches; ++patch) {
+            const uint8_t actual = result.patch_mask[
+                static_cast<size_t>(image * padded_patches + patch)];
+            if (actual > 1 || static_cast<bool>(actual) != (patch < active)) {
+                throw ApiError(
+                    400, "invalid_request_error",
+                    "DeepSeek-V4 patch mask is not a contiguous active prefix",
+                    "mfq_multimodal.patch_mask");
+            }
+        }
+    }
+
+    const int64_t placeholder = single_special_token(
+        tokenizer, "<｜deepseek_image｜>");
+    std::vector<int64_t> expanded;
+    expanded.reserve(prompt.size() + static_cast<size_t>(images) * 384);
+    result.image_permutation_offsets.push_back(0);
+    int64_t source = 0;
+    for (const int64_t token : prompt) {
+        if (token != placeholder) {
+            expanded.push_back(token);
+            continue;
+        }
+        if (source >= images) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "DeepSeek-V4 image placeholders exceed processed images",
+                "messages");
+        }
+        const int64_t llm_h = result.vision_grid[4 * source + 2];
+        const int64_t llm_w = result.vision_grid[4 * source + 3];
+        auto block = deepseek_v4_image_block(
+            llm_h, llm_w, expanded.size());
+        const int64_t begin = static_cast<int64_t>(expanded.size());
+        for (const int64_t type : block.types) {
+            expanded.push_back(vocab_size + type);
+        }
+        result.image_bounds.insert(
+            result.image_bounds.end(),
+            {0, source, begin, static_cast<int64_t>(expanded.size())});
+        result.image_permutation.insert(
+            result.image_permutation.end(),
+            block.permutation.begin(), block.permutation.end());
+        result.image_permutation_offsets.push_back(
+            static_cast<int64_t>(result.image_permutation.size()));
+        ++source;
+    }
+    if (source != images) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "DeepSeek-V4 image placeholders do not match processed images",
+            "messages");
+    }
+    prompt = std::move(expanded);
+    return result;
+}
+
+static MfqMultimodalInput parse_mfq_vision(
+        const json & value,
+        std::vector<int64_t> & prompt,
+        const MfqTokenizer & tokenizer,
+        int64_t vocab_size) {
     if (!value.is_object()) {
         throw ApiError(
             400, "invalid_request_error",
             "mfq_multimodal must be an object", "mfq_multimodal");
     }
-    if (!value.contains("version") || !value["version"].is_number_integer() ||
-        value["version"].get<int>() != 1) {
+    if (!value.contains("version") || !value["version"].is_number_integer()) {
         throw ApiError(
             400, "invalid_request_error",
-            "mfq_multimodal.version must be 1", "mfq_multimodal.version");
+            "mfq_multimodal.version must be an integer", "mfq_multimodal.version");
     }
 
-    MfqVisionInput result;
     std::unique_ptr<TensorFileReader> file_reader;
     if (value.contains("binary_file")) {
         file_reader = std::make_unique<TensorFileReader>(value);
     }
+    const int version = value["version"].get<int>();
+    if (version == 2) {
+        if (!value.contains("processor") ||
+            !value["processor"].is_string() ||
+            value["processor"].get<std::string>() != "deepseek_v4") {
+            throw ApiError(
+                400, "invalid_request_error",
+                "mfq_multimodal version 2 requires processor=deepseek_v4",
+                "mfq_multimodal.processor");
+        }
+        return parse_deepseek_v4_multimodal(
+            value, prompt, tokenizer, vocab_size, file_reader.get());
+    }
+    if (version != 1) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "unsupported mfq_multimodal.version", "mfq_multimodal.version");
+    }
+
+    MfqMultimodalInput result;
+    result.processor = MfqMultimodalProcessor::minicpmo;
     const bool has_any_image_tensor =
         value.contains("pixel_values") || value.contains("patch_mask") ||
         value.contains("target_sizes");
@@ -3517,7 +3738,17 @@ int run_mfq_server(
                         "mfq_multimodal");
                 }
                 work.vision = parse_mfq_vision(
-                    body["mfq_multimodal"], work.prompt, *tokenizer);
+                    body["mfq_multimodal"], work.prompt, *tokenizer,
+                    config.vocab_size);
+                if (active_context.load() > 0 &&
+                    static_cast<int64_t>(work.prompt.size()) +
+                        work.sampling.max_tokens > active_context.load()) {
+                    throw ApiError(
+                        400, "context_length_exceeded",
+                        "expanded multimodal prompt plus max_tokens exceed "
+                        "the model context window",
+                        "max_tokens");
+                }
                 work.cache_plan.stable_prefix_tokens = 0;
             }
             const std::string id = request_id(chat ? "chatcmpl-" : "cmpl-");

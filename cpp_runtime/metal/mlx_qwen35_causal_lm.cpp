@@ -1,7 +1,9 @@
 #include "mlx_qwen35_causal_lm.h"
+#include "mlx_mtp.h"
 #include "mlx_eval_timing.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -1080,12 +1082,18 @@ std::int32_t MlxQwen35CausalLm::generate(
                     "Qwen3.5 MTP verification returned an invalid token");
             }
 
-            if (verify_token == draft) {
+            const std::array<std::int32_t, 1> drafts{draft};
+            const std::array<std::int32_t, 2> targets{
+                verify_token, bonus_token};
+            const auto verification = verify_greedy_mtp(
+                drafts, targets);
+            if (verification.accepted_drafts == 1) {
                 commit_speculative();
                 if (!emit(draft) || generated == generation_limit) {
                     return generated;
                 }
-                if (!emit(bonus_token) || generated == generation_limit) {
+                if (!emit(verification.next_token) ||
+                    generated == generation_limit) {
                     return generated;
                 }
                 auto draft_hidden = mlx::core::slice(
@@ -1093,11 +1101,12 @@ std::int32_t MlxQwen35CausalLm::generate(
                     Shape{0, 1, 0},
                     Shape{1, 2,
                           static_cast<int>(config_.hidden_size)});
-                pending_main = bonus_token;
+                pending_main = verification.next_token;
                 draft = make_draft(draft_hidden, pending_main);
             } else {
                 rollback_speculative(1);
-                if (!emit(verify_token) || generated == generation_limit) {
+                if (!emit(verification.next_token) ||
+                    generated == generation_limit) {
                     return generated;
                 }
                 auto confirmed_hidden = mlx::core::slice(
@@ -1105,7 +1114,7 @@ std::int32_t MlxQwen35CausalLm::generate(
                     Shape{0, 0, 0},
                     Shape{1, 1,
                           static_cast<int>(config_.hidden_size)});
-                pending_main = verify_token;
+                pending_main = verification.next_token;
                 draft = make_draft(confirmed_hidden, pending_main);
             }
         }

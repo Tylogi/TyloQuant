@@ -225,6 +225,7 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
         };
     std::optional<array> router_bias;
     std::optional<array> token_experts;
+    std::optional<array> visual_router_bias;
     if (layer <
         static_cast<std::size_t>(
             config.n_hash_layers)) {
@@ -236,6 +237,12 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
         router_bias = load_dense(
             model,
             name("ffn.gate.bias"),
+            mlx::core::float32);
+    }
+    if (config.has_vision()) {
+        visual_router_bias = load_dense(
+            model,
+            name("ffn.gate.bias_vl"),
             mlx::core::float32);
     }
     auto gate_up_name =
@@ -391,7 +398,8 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
                 down_name,
                 std::move(router_bias),
                 std::move(token_experts),
-                std::move(effective_available));
+                std::move(effective_available),
+                visual_router_bias);
         } catch (...) {
             for (const auto& routed_name :
                  routed_names) {
@@ -455,7 +463,179 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
         {},
         std::move(router_bias),
         std::move(token_experts),
-        available);
+        available,
+        std::move(visual_router_bias));
+}
+
+MlxDeepseekV4Moe MlxDeepseekV4Moe::load_named(
+    const MfqContainer& model,
+    const DeepseekV4Config& config,
+    const std::string& prefix,
+    const std::optional<array>& available,
+    std::shared_ptr<MlxNintMoeOffloadCache> offload,
+    std::size_t expert_cache_layer) {
+    config.validate();
+    if (prefix.empty()) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 named MoE prefix cannot be empty");
+    }
+    const auto name = [&prefix](std::string_view suffix) {
+        return prefix + "." + std::string(suffix);
+    };
+    auto gate_up_name = name("ffn.experts.gate_up.weight");
+    auto gate_name = name("ffn.experts.gate.weight");
+    auto up_name = name("ffn.experts.up.weight");
+    auto down_name = name("ffn.experts.down.weight");
+    const bool split = model.contains(gate_name);
+    if (split != model.contains(up_name)) {
+        throw std::runtime_error(
+            "DeepSeek-V4 named MoE has an incomplete split Gate/Up pair");
+    }
+    const std::vector<std::string> routed_names = split
+        ? std::vector<std::string>{gate_name, up_name, down_name}
+        : std::vector<std::string>{gate_up_name, down_name};
+    std::vector<bool> streamable(routed_names.size(), false);
+    if (offload) {
+        try {
+            for (std::size_t index = 0; index < routed_names.size(); ++index) {
+                streamable[index] = offload->can_offload(routed_names[index]);
+            }
+        } catch (...) {
+            for (std::size_t index = 0; index < routed_names.size(); ++index) {
+                if (streamable[index]) {
+                    offload->discard_record(routed_names[index]);
+                }
+            }
+            throw;
+        }
+    }
+    const bool stream_all = offload && std::all_of(
+        streamable.begin(),
+        streamable.end(),
+        [](bool value) { return value; });
+    std::optional<MlxRoutedLinear> gate_up;
+    std::optional<MlxRoutedLinear> gate;
+    std::optional<MlxRoutedLinear> up;
+    if (!stream_all && split) {
+        gate.emplace(load_routed(model, gate_name));
+        up.emplace(load_routed(model, up_name));
+    } else if (!stream_all) {
+        gate_up.emplace(load_routed(model, gate_up_name));
+    }
+    std::optional<array> visual_bias;
+    if (config.has_vision() &&
+        model.contains(name("ffn.gate.bias_vl"))) {
+        visual_bias = load_dense(
+            model, name("ffn.gate.bias_vl"), mlx::core::float32);
+    }
+    if (stream_all) {
+        try {
+            auto effective_available = streamed_availability(
+                available,
+                *offload,
+                routed_names,
+                checked_int(
+                    static_cast<std::size_t>(config.n_experts),
+                    "expert count"));
+            return MlxDeepseekV4Moe(
+                config,
+                MlxLinear::load(model, name("ffn.gate.weight")),
+                MlxLinear::load(model, name("ffn.shared_experts.w1.weight")),
+                MlxLinear::load(model, name("ffn.shared_experts.w3.weight")),
+                MlxLinear::load(model, name("ffn.shared_experts.w2.weight")),
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                offload,
+                nullptr,
+                expert_cache_layer,
+                split ? std::string{} : gate_up_name,
+                split ? gate_name : std::string{},
+                split ? up_name : std::string{},
+                down_name,
+                load_dense(model, name("ffn.gate.bias"), mlx::core::float32),
+                std::nullopt,
+                std::move(effective_available),
+                std::move(visual_bias));
+        } catch (...) {
+            for (const auto& routed_name : routed_names) {
+                offload->discard_record(routed_name);
+            }
+            throw;
+        }
+    }
+    if (offload) {
+        for (std::size_t index = 0; index < routed_names.size(); ++index) {
+            if (streamable[index]) {
+                offload->discard_record(routed_names[index]);
+            }
+        }
+    }
+    return MlxDeepseekV4Moe(
+        config,
+        MlxLinear::load(model, name("ffn.gate.weight")),
+        MlxLinear::load(model, name("ffn.shared_experts.w1.weight")),
+        MlxLinear::load(model, name("ffn.shared_experts.w3.weight")),
+        MlxLinear::load(model, name("ffn.shared_experts.w2.weight")),
+        std::move(gate_up),
+        std::move(gate),
+        std::move(up),
+        std::optional<MlxRoutedLinear>(load_routed(model, down_name)),
+        nullptr,
+        nullptr,
+        0,
+        {},
+        {},
+        {},
+        {},
+        load_dense(model, name("ffn.gate.bias"), mlx::core::float32),
+        std::nullopt,
+        available,
+        std::move(visual_bias));
+}
+
+MlxDeepseekV4Moe MlxDeepseekV4Moe::load_named(
+    const MlxHfTensorStore& model,
+    const DeepseekV4Config& config,
+    const std::string& prefix,
+    std::shared_ptr<MlxDeepseekV4SsdExpertCache> expert_cache,
+    std::size_t expert_cache_layer,
+    const std::optional<array>& available) {
+    config.validate();
+    if (prefix.empty() || !expert_cache) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 named HF MoE requires a prefix and SSD cache");
+    }
+    const auto name = [&prefix](std::string_view suffix) {
+        return prefix + "." + std::string(suffix);
+    };
+    std::optional<array> visual_bias;
+    const auto visual_name = name("ffn.gate.bias_vl");
+    if (model.checkpoint().tensors().contains(visual_name)) {
+        visual_bias = model.load_dense(visual_name);
+    }
+    return MlxDeepseekV4Moe(
+        config,
+        model.load_linear(name("ffn.gate.weight")),
+        model.load_linear(name("ffn.shared_experts.w1.weight")),
+        model.load_linear(name("ffn.shared_experts.w3.weight")),
+        model.load_linear(name("ffn.shared_experts.w2.weight")),
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        nullptr,
+        std::move(expert_cache),
+        expert_cache_layer,
+        {},
+        {},
+        {},
+        {},
+        model.load_dense(name("ffn.gate.bias")),
+        std::nullopt,
+        available,
+        std::move(visual_bias));
 }
 
 MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
@@ -479,10 +659,14 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
     };
     std::optional<array> router_bias;
     std::optional<array> token_experts;
+    std::optional<array> visual_router_bias;
     if (layer < static_cast<std::size_t>(config.n_hash_layers)) {
         token_experts = model.load_dense(name("ffn.gate.tid2eid"));
     } else {
         router_bias = model.load_dense(name("ffn.gate.bias"));
+    }
+    if (config.has_vision()) {
+        visual_router_bias = model.load_dense(name("ffn.gate.bias_vl"));
     }
     return MlxDeepseekV4Moe(
         config,
@@ -503,7 +687,8 @@ MlxDeepseekV4Moe MlxDeepseekV4Moe::load(
         {},
         std::move(router_bias),
         std::move(token_experts),
-        available);
+        available,
+        std::move(visual_router_bias));
 }
 
 MlxDeepseekV4Moe::MlxDeepseekV4Moe(
@@ -516,7 +701,8 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
     MlxRoutedLinear routed_down,
     std::optional<array> router_bias,
     std::optional<array> token_experts,
-    std::optional<array> available)
+    std::optional<array> available,
+    std::optional<array> visual_router_bias)
     : MlxDeepseekV4Moe(
           std::move(config),
           std::move(router),
@@ -538,7 +724,8 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
           {},
           std::move(router_bias),
           std::move(token_experts),
-          std::move(available)) {}
+          std::move(available),
+          std::move(visual_router_bias)) {}
 
 MlxDeepseekV4Moe::MlxDeepseekV4Moe(
     DeepseekV4Config config,
@@ -565,7 +752,8 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
     std::string streamed_down_name,
     std::optional<array> router_bias,
     std::optional<array> token_experts,
-    std::optional<array> available)
+    std::optional<array> available,
+    std::optional<array> visual_router_bias)
     : config_(std::move(config)),
       router_(std::move(router)),
       shared_gate_(std::move(shared_gate)),
@@ -589,6 +777,7 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
       streamed_down_name_(
           std::move(streamed_down_name)),
       router_bias_(std::move(router_bias)),
+      visual_router_bias_(std::move(visual_router_bias)),
       token_experts_(std::move(token_experts)),
       available_(bool_vector(
           available,
@@ -749,7 +938,8 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
     } else {
         if (config_.hidden != 4096 || config_.moe_inter != 2048 ||
             config_.n_experts != 256 ||
-            layer_ >= static_cast<std::size_t>(config_.n_layers)) {
+            layer_ >= static_cast<std::size_t>(
+                config_.n_layers + config_.n_mtp_layers)) {
             throw std::invalid_argument(
                 "DeepSeek-V4 SSD experts require official V4F geometry");
         }
@@ -787,6 +977,24 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
             throw std::invalid_argument(
                 "DeepSeek-V4 router bias shape mismatch");
         }
+    }
+    if (visual_router_bias_.has_value()) {
+        *visual_router_bias_ = mlx::core::contiguous(
+            mlx::core::reshape(
+                mlx::core::astype(
+                    *visual_router_bias_,
+                    mlx::core::float32),
+                Shape{checked_int(
+                    visual_router_bias_->size(),
+                    "visual router bias size")}));
+        if (visual_router_bias_->shape() != Shape{experts}) {
+            throw std::invalid_argument(
+                "DeepSeek-V4 visual router bias shape mismatch");
+        }
+    }
+    if (config_.has_vision() != visual_router_bias_.has_value()) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 visual routing bias does not match model config");
     }
     if (token_experts_.has_value()) {
         *token_experts_ = mlx::core::contiguous(
@@ -947,6 +1155,25 @@ MlxDeepseekV4Moe::forward_branches(
         mlx::core::reshape(
             input,
             Shape{rows, hidden}));
+    auto flat_token_ids = token_ids;
+    if (flat_token_ids.dtype() != mlx::core::int32 &&
+        flat_token_ids.dtype() != mlx::core::uint32) {
+        flat_token_ids = mlx::core::astype(
+            flat_token_ids,
+            mlx::core::int32);
+    }
+    flat_token_ids = mlx::core::reshape(
+        flat_token_ids, Shape{rows});
+    std::optional<array> image_mask;
+    if (visual_router_bias_.has_value()) {
+        image_mask = mlx::core::greater_equal(
+            flat_token_ids,
+            array(
+                checked_int(
+                    static_cast<std::size_t>(config_.vocab),
+                    "vocabulary size"),
+                mlx::core::int32));
+    }
     if (prefetched != nullptr && prefetched->layer() != layer_) {
         throw std::invalid_argument(
             "DeepSeek-V4 SSD prefetch layer mismatch");
@@ -955,6 +1182,7 @@ MlxDeepseekV4Moe::forward_branches(
     const bool use_fused_dense_router =
         fused_dense_router_
         && !token_experts_.has_value()
+        && !visual_router_bias_.has_value()
         && dense_router != nullptr
         && config_.n_experts == 256
         && config_.top_k == 6
@@ -1041,14 +1269,13 @@ MlxDeepseekV4Moe::forward_branches(
             expert_weights = std::move(routing.weights);
         }
     } else if (token_experts_.has_value()) {
-        auto ids = token_ids;
-        if (ids.dtype() != mlx::core::int32 &&
-            ids.dtype() != mlx::core::uint32) {
-            ids = mlx::core::astype(
-                ids,
-                mlx::core::int32);
+        auto ids = flat_token_ids;
+        if (image_mask.has_value()) {
+            ids = mlx::core::where(
+                *image_mask,
+                mlx::core::zeros_like(ids),
+                ids);
         }
-        ids = mlx::core::reshape(ids, Shape{rows});
         expert_ids = mlx::core::take(
             *token_experts_,
             ids,
@@ -1084,6 +1311,25 @@ MlxDeepseekV4Moe::forward_branches(
             expert_ids,
             candidates.ids,
             available_);
+        if (visual_router_bias_.has_value()) {
+            auto visual = moe_topk(
+                *logits,
+                checked_int(
+                    static_cast<std::size_t>(config_.top_k),
+                    "route count"),
+                false,
+                true,
+                config_.norm_topk_prob,
+                false,
+                visual_router_bias_,
+                available_,
+                1e-20f,
+                static_cast<float>(config_.routed_scaling));
+            expert_ids = mlx::core::where(
+                mlx::core::expand_dims(*image_mask, -1),
+                visual.ids,
+                expert_ids);
+        }
         expert_weights =
             moe_selected_sqrtsoftplus_weights(
                 *logits,
@@ -1109,6 +1355,27 @@ MlxDeepseekV4Moe::forward_branches(
                 config_.routed_scaling));
         expert_ids = std::move(routing.ids);
         expert_weights = std::move(routing.weights);
+        if (visual_router_bias_.has_value()) {
+            auto visual = moe_topk(
+                *logits,
+                checked_int(
+                    static_cast<std::size_t>(config_.top_k),
+                    "route count"),
+                false,
+                true,
+                config_.norm_topk_prob,
+                false,
+                visual_router_bias_,
+                available_,
+                1e-20f,
+                static_cast<float>(config_.routed_scaling));
+            const auto route_mask =
+                mlx::core::expand_dims(*image_mask, -1);
+            expert_ids = mlx::core::where(
+                route_mask, visual.ids, expert_ids);
+            expert_weights = mlx::core::where(
+                route_mask, visual.weights, expert_weights);
+        }
     }
     if (device_route_snapshot.has_value() && !packed_expert_ids) {
         const auto slots = mlx::core::take(
@@ -1202,7 +1469,61 @@ MlxDeepseekV4Moe::forward_branches(
             rows >= 32
             && gate_up_grouped
             && down->supports_grouped_vq_mmq();
-        if (grouped_prefill) {
+        const bool smallm_nax =
+            !split_resident
+            && precomputed_hidden == nullptr
+            && expert_map == nullptr
+            && !packed_expert_ids
+            && gate_up->prefers_mxfp4_smallm_nax(route_ids)
+            && down->prefers_mxfp4_smallm_nax(route_ids);
+        if (smallm_nax) {
+            const int routes = route_ids.shape(1);
+            auto route_order = mlx::core::contiguous(
+                mlx::core::astype(
+                    mlx::core::argsort(
+                        mlx::core::reshape(
+                            route_ids,
+                            Shape{rows * routes})),
+                    mlx::core::int32));
+            auto routed_hidden = gate_up->swiglu_sorted(
+                source,
+                route_ids,
+                route_order,
+                static_cast<float>(config_.swiglu_limit),
+                true);
+            if (detail::component_profile_active()) {
+                detail::profile_eval(
+                    "moe.routed_gate_up_swiglu",
+                    routed_hidden);
+            }
+            auto down_sorted = down->forward_sorted(
+                routed_hidden,
+                route_ids,
+                route_order,
+                true,
+                nullptr,
+                true);
+            if (detail::component_profile_active()) {
+                detail::profile_eval(
+                    "moe.routed_down",
+                    down_sorted);
+            }
+            auto routed_pairs = mlx::core::reshape(
+                mlx::core::take(
+                    std::move(down_sorted),
+                    mlx::core::argsort(route_order),
+                    0),
+                Shape{rows, routes, hidden});
+            auto output = moe_weighted_reduce(
+                routed_pairs,
+                route_weights);
+            if (detail::component_profile_active()) {
+                detail::profile_eval(
+                    "moe.route_reduce",
+                    output);
+            }
+            return output;
+        } else if (grouped_prefill) {
             const int routes = route_ids.shape(1);
             auto route_order = mlx::core::contiguous(
                 mlx::core::astype(

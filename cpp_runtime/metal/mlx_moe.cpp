@@ -123,6 +123,60 @@ bool mxfp4_nax_prefill_enabled(int route_count) noexcept {
         && route_count >= kDefaultMinRoutes;
 }
 
+bool mxfp4_nax_smallm_preferred(
+    const array& expert_ids,
+    int tokens,
+    int experts) noexcept {
+    const char* value = std::getenv(
+        "MFQ_METAL_NINTM_SMALLM_NAX");
+    const auto setting = value == nullptr
+        ? std::string_view("auto")
+        : std::string_view(value);
+    const bool force =
+        setting == "1"
+        || setting == "true"
+        || setting == "on";
+    if (
+        tokens < 4
+        || tokens > 6
+        || (!force && setting != "auto" && setting != "adaptive")
+        || (!force && !apple_m5_family())
+        || expert_ids.dtype() != mlx::core::int32
+        || !expert_ids.flags().row_contiguous
+        || !expert_ids.is_available()
+    ) {
+        return false;
+    }
+    const auto* ids = expert_ids.data<std::int32_t>();
+    for (std::size_t index = 0; index < expert_ids.size(); ++index) {
+        if (ids[index] < 0 || ids[index] >= experts) {
+            return false;
+        }
+        for (std::size_t previous = 0; previous < index; ++previous) {
+            if (ids[index] == ids[previous]) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool routed_sort_enabled(int tokens) noexcept {
+    if (tokens <= 1) {
+        return false;
+    }
+    const char* value = std::getenv(
+        "MFQ_METAL_NINTM_SORT_ROUTES");
+    if (value == nullptr) {
+        return true;
+    }
+    const auto setting = std::string_view(value);
+    return !(
+        setting == "0"
+        || setting == "false"
+        || setting == "off");
+}
+
 constexpr int kFamilyVq = 1;
 constexpr int kVqGroupSize = 4;
 constexpr int kVqGroups = 5;
@@ -7112,6 +7166,18 @@ bool MlxNintMoeWeight::supports_grouped_vq_mmq() const noexcept {
     return impl_->projections == 1 && impl_->grouped_vq_mmq;
 }
 
+bool MlxNintMoeWeight::prefers_mxfp4_smallm_nax(
+    const array& expert_ids) const noexcept {
+    return impl_->mxfp4_slot_ids.has_value()
+        && impl_->projections == 1
+        && impl_->rotations.empty()
+        && expert_ids.ndim() == 2
+        && mxfp4_nax_smallm_preferred(
+            expert_ids,
+            expert_ids.shape(0),
+            impl_->experts);
+}
+
 MlxGroupedVqMmqPlan MlxNintMoeWeight::build_grouped_vq_mmq_plan(
     const array& expert_ids,
     const array& route_order) const {
@@ -7132,7 +7198,8 @@ array MlxNintMoeWeight::routed_matmul_sorted(
     bool input_is_sorted,
     bool fused_swiglu,
     float swiglu_limit,
-    const MlxGroupedVqMmqPlan* plan) const {
+    const MlxGroupedVqMmqPlan* plan,
+    bool force_mxfp4_nax) const {
     if (!supports_grouped_vq_mmq()) {
         throw std::invalid_argument(
             "weight does not support grouped VQ MMQ");
@@ -7246,7 +7313,7 @@ array MlxNintMoeWeight::routed_matmul_sorted(
     // available as an explicit experiment while its different reduction tree
     // is validated against the established full-model numerical contract.
     if (
-        mxfp4_nax_prefill_enabled(route_count)
+        (mxfp4_nax_prefill_enabled(route_count) || force_mxfp4_nax)
         && impl_->mxfp4_slot_ids.has_value()
         && impl_->projections == 1
         && impl_->rotations.empty()
@@ -7544,7 +7611,7 @@ array MlxNintMoeWeight::routed_matmul_impl(
     const int variant_stride = checked_int(
         route_count_size,
         "rotation variant stride");
-    const bool sorted_routes = tokens > 1;
+    const bool sorted_routes = routed_sort_enabled(tokens);
     auto route_order = mlx::core::zeros(
         Shape{1},
         mlx::core::int32);

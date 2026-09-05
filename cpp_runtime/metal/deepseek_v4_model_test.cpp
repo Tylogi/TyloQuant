@@ -430,6 +430,24 @@ void test_manifest_and_hf_normalization() {
         default_ratios.compress_ratios ==
             std::vector<std::int64_t>({0}),
         "missing compression schedule did not default to zero");
+
+    auto dspark = hf_config();
+    dspark["compress_ratios"] = {0, 4, 128, 0, 0, 0};
+    dspark["num_nextn_predict_layers"] = 1;
+    dspark["dspark_block_size"] = 5;
+    dspark["dspark_noise_token_id"] = 7;
+    dspark["dspark_target_layer_ids"] = {0, 1, 2};
+    dspark["dspark_markov_rank"] = 8;
+    const auto dspark_model =
+        DeepseekV4Config::from_json(dspark.dump());
+    require(
+        dspark_model.n_mtp_layers == 3 &&
+            dspark_model.compress_ratios ==
+                std::vector<std::int64_t>({0, 4, 128}) &&
+            dspark_model.mtp_compress_ratios ==
+                std::vector<std::int64_t>({0, 0, 0}) &&
+            dspark_model.has_dspark(),
+        "DSpark stage count was not derived from the checkpoint schedule");
 }
 
 void test_config_validation() {

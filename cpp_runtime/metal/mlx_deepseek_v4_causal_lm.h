@@ -3,8 +3,10 @@
 #include "../mfq_token_constraint.h"
 #include "deepseek_v4_model.h"
 #include "mlx_deepseek_v4_attention.h"
+#include "mlx_deepseek_v4_dspark.h"
 #include "mlx_deepseek_v4_hc.h"
 #include "mlx_deepseek_v4_moe.h"
+#include "mlx_deepseek_v4_vision.h"
 #include "mlx_sampling.h"
 #include "mlx_tensor.h"
 #include "mlx_transformer.h"
@@ -87,6 +89,14 @@ public:
         MlxDeepseekV4LayerState& state,
         int pos0,
         MlxDeepseekV4SsdPrefetchedLayer* prefetched) const;
+
+    mlx::core::array forward(
+        const mlx::core::array& hidden,
+        const mlx::core::array& token_ids,
+        MlxDeepseekV4LayerState& state,
+        int pos0,
+        MlxDeepseekV4SsdPrefetchedLayer* prefetched,
+        const MlxDeepseekV4ImageVisibility* visibility) const;
 
     std::optional<MlxDeepseekV4SsdPrefetchedLayer>
     prefetch_routed(std::size_t rows) const {
@@ -199,7 +209,11 @@ public:
         std::shared_ptr<MlxNintMoeOffloadCache>
             expert_offload = nullptr,
         std::shared_ptr<MlxDeepseekV4SsdExpertCache>
-            ssd_expert_cache = nullptr);
+            ssd_expert_cache = nullptr,
+        std::optional<MlxDeepseekV4Vision> vision =
+            std::nullopt,
+        std::optional<MlxDeepseekV4DSpark> dspark =
+            std::nullopt);
 
     // Accepts [tokens] or [batch,tokens]. Like the Python reference,
     // use_cache=false starts a fresh cache and still leaves that cache ready
@@ -245,6 +259,18 @@ public:
             std::nullopt,
         const MfqTokenConstraintPtr& token_constraint = {});
 
+    std::int32_t generate_multimodal(
+        const std::vector<std::int64_t>& prompt,
+        const std::vector<MlxDeepseekV4ImageInput>& images,
+        const MlxSamplingParams& sampling,
+        std::int32_t max_tokens,
+        const MlxDeepseekV4TokenCallback& callback = {},
+        const std::optional<std::vector<std::int64_t>>&
+            eos_token_ids = std::nullopt,
+        const std::function<void(std::size_t, double)>&
+            prefill_callback = {},
+        const MfqTokenConstraintPtr& token_constraint = {});
+
     const DeepseekV4Config& config() const noexcept {
         return config_;
     }
@@ -280,6 +306,12 @@ public:
     bool supports_text_session_state() const noexcept {
         return true;
     }
+    bool supports_multimodal() const noexcept {
+        return vision_.has_value();
+    }
+    bool supports_mtp() const noexcept {
+        return dspark_.has_value();
+    }
 
 private:
     void validate_components() const;
@@ -289,7 +321,11 @@ private:
     mlx::core::array forward_chunk(
         const mlx::core::array& token_ids,
         int pos0,
-        bool full_logits);
+        bool full_logits,
+        const std::optional<mlx::core::array>& input_embeddings =
+            std::nullopt,
+        const MlxDeepseekV4ImageVisibility* visibility = nullptr,
+        mlx::core::array* dspark_hidden = nullptr);
     mlx::core::array prefill_impl(
         const mlx::core::array& token_ids,
         int chunk_size,
@@ -302,6 +338,17 @@ private:
     void append_state_arrays(
         const MlxDeepseekV4LayerState& state,
         std::vector<mlx::core::array>& arrays) const;
+    std::int32_t generate_impl(
+        const std::vector<std::int64_t>& prompt,
+        const std::vector<MlxDeepseekV4ImageInput>* images,
+        const MlxSamplingParams& sampling,
+        std::int32_t max_tokens,
+        const MlxDeepseekV4TokenCallback& callback,
+        const std::optional<std::vector<std::int64_t>>& eos_token_ids,
+        int chunk_size,
+        const std::function<void(std::size_t, double)>& prefill_callback,
+        std::optional<std::size_t> stable_prefix_tokens,
+        const MfqTokenConstraintPtr& token_constraint);
 
     DeepseekV4Config config_;
     MlxEmbedding embedding_;
@@ -315,6 +362,8 @@ private:
         expert_offload_;
     std::shared_ptr<MlxDeepseekV4SsdExpertCache>
         ssd_expert_cache_;
+    std::optional<MlxDeepseekV4Vision> vision_;
+    std::optional<MlxDeepseekV4DSpark> dspark_;
     int max_context_;
     mlx::core::Dtype activation_dtype_;
     std::vector<MlxDeepseekV4LayerState> states_;

@@ -432,6 +432,15 @@ const Kernel& prefill_plan_kernel() {
     return kernel;
 }
 
+const Kernel& visible_prefill_plan_kernel() {
+    static const auto kernel = make_kernel(
+        "mfq_cpp_dsv4_visible_prefill_plan",
+        {"topk", "left", "right"},
+        {"indices", "mask"},
+        kVisiblePrefillPlanSource);
+    return kernel;
+}
+
 const Kernel& decode_plan_kernel() {
     static const auto kernel = make_kernel(
         "mfq_cpp_dsv4_decode_plan",
@@ -1338,6 +1347,73 @@ std::pair<array, array> dsv4_build_prefill_plan(
         std::move(outputs.at(0)),
         std::move(outputs.at(1)),
     };
+}
+
+std::pair<array, array> dsv4_build_prefill_plan_visible(
+    const array& topk,
+    const array& left,
+    const array& right,
+    int query_offset,
+    int local_history,
+    int pool_len,
+    int ratio,
+    int window,
+    int max_image_tokens) {
+    auto selected_topk = typed_contiguous(topk, mlx::core::int32);
+    auto left_values = typed_contiguous(left, mlx::core::int32);
+    auto right_values = typed_contiguous(right, mlx::core::int32);
+    if (selected_topk.ndim() != 3 ||
+        selected_topk.shape(0) <= 0 || selected_topk.shape(1) <= 0 ||
+        left_values.shape() != Shape{
+            selected_topk.shape(0), selected_topk.shape(1)} ||
+        right_values.shape() != left_values.shape() || query_offset < 0 ||
+        local_history < 0 || pool_len < 0 || ratio <= 0 || window <= 0 ||
+        max_image_tokens <= 0) {
+        throw std::invalid_argument(
+            "invalid DSV4 visible prefill plan input");
+    }
+    const int batch = selected_topk.shape(0);
+    const int queries = selected_topk.shape(1);
+    const int topk_count = selected_topk.shape(2);
+    if (max_image_tokens >
+        std::numeric_limits<int>::max() - window ||
+        topk_count > std::numeric_limits<int>::max() -
+            window - max_image_tokens - 31) {
+        throw std::invalid_argument(
+            "DSV4 visible prefill plan width exceeds MLX limits");
+    }
+    const int local_width = std::min(
+        local_history + queries, window + max_image_tokens);
+    const int selected =
+        ((local_width + topk_count + 31) / 32) * 32;
+    const int total = checked_product(
+        {batch, queries, selected},
+        "visible prefill plan size");
+    auto outputs = visible_prefill_plan_kernel()(
+        {selected_topk, left_values, right_values},
+        {
+            Shape{batch, queries, selected},
+            Shape{batch, queries, selected},
+        },
+        {mlx::core::int32, mlx::core::float16},
+        {total, 1, 1},
+        {std::min(256, total), 1, 1},
+        {
+            {"TOTAL", total},
+            {"M", queries},
+            {"TOPK_COUNT", topk_count},
+            {"SELECTED", selected},
+            {"LOCAL_WIDTH", local_width},
+            {"QUERY_OFFSET", query_offset},
+            {"LOCAL_HISTORY", local_history},
+            {"POOL_LEN", pool_len},
+            {"RATIO", ratio},
+            {"WINDOW", window},
+        },
+        std::nullopt,
+        false,
+        {});
+    return {std::move(outputs.at(0)), std::move(outputs.at(1))};
 }
 
 std::pair<array, array> dsv4_build_decode_plan(

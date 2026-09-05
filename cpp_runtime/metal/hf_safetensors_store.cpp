@@ -192,10 +192,10 @@ void preadv_exact(
 }
 
 std::string expert_tensor_name(
-    std::size_t layer,
+    std::string_view layer_prefix,
     std::size_t expert,
     std::string_view suffix) {
-    return "layers." + std::to_string(layer) + ".ffn.experts." +
+    return std::string(layer_prefix) + ".ffn.experts." +
         std::to_string(expert) + "." + std::string(suffix);
 }
 
@@ -502,8 +502,24 @@ DeepseekV4NativeExpertStore::DeepseekV4NativeExpertStore(
     std::filesystem::path root,
     std::size_t num_layers,
     std::size_t num_experts)
+    : DeepseekV4NativeExpertStore(
+          std::move(root),
+          [&] {
+              std::vector<std::string> prefixes;
+              prefixes.reserve(num_layers);
+              for (std::size_t layer = 0; layer < num_layers; ++layer) {
+                  prefixes.push_back("layers." + std::to_string(layer));
+              }
+              return prefixes;
+          }(),
+          num_experts) {}
+
+DeepseekV4NativeExpertStore::DeepseekV4NativeExpertStore(
+    std::filesystem::path root,
+    std::vector<std::string> layer_prefixes,
+    std::size_t num_experts)
     : checkpoint_(std::move(root)),
-      num_layers_(num_layers),
+      num_layers_(layer_prefixes.size()),
       num_experts_(num_experts) {
     if (num_layers_ == 0 || num_experts_ == 0) {
         throw std::invalid_argument(
@@ -520,7 +536,8 @@ DeepseekV4NativeExpertStore::DeepseekV4NativeExpertStore(
             auto& record = experts_[layer * num_experts_ + expert];
             for (std::size_t part = 0; part < suffixes.size(); ++part) {
                 record.parts[part] = &checkpoint_.tensor(
-                    expert_tensor_name(layer, expert, suffixes[part]));
+                    expert_tensor_name(
+                        layer_prefixes[layer], expert, suffixes[part]));
             }
             require_tensor(*record.parts[0], "F8_E8M0", {2048, 128});
             require_tensor(*record.parts[1], "F8_E8M0", {4096, 64});

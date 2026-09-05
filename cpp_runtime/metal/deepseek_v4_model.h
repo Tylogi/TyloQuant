@@ -58,6 +58,27 @@ struct DeepseekV4Config {
     double compress_rope_theta = 160'000.0;
     std::vector<std::int64_t> compress_ratios;
 
+    // DSpark speculative decoder.  Unlike Qwen's dense MTP head, every stage
+    // is a complete DeepSeek hyper-connection + attention + MoE block.
+    std::int64_t n_mtp_layers = 0;
+    std::int64_t dspark_block_size = 0;
+    std::int64_t dspark_noise_token_id = 0;
+    std::vector<std::int64_t> dspark_target_layer_ids;
+    std::int64_t dspark_markov_rank = 256;
+    std::vector<std::int64_t> mtp_compress_ratios;
+
+    // Optional native DeepSeek-V4 vision tower and aligner.
+    std::int64_t vision_n_layers = 0;
+    std::int64_t vision_dim = 1024;
+    std::int64_t vision_n_heads = 16;
+    std::int64_t vision_inter_dim = 2816;
+    std::int64_t vision_patch_size = 14;
+    double vision_rope_theta = 10'000.0;
+    std::int64_t vision_downsample_ratio = 3;
+    std::int64_t vision_max_n_token = 384;
+    std::int64_t vision_min_pixels = 147'456;
+    std::int64_t vision_max_wh_ratio = 8;
+
     // Accepts a normalized manifest config, a complete TPQ manifest, or a
     // Hugging Face config. Alias fields are normalized to the members above.
     static DeepseekV4Config from_json(std::string_view payload);
@@ -86,6 +107,12 @@ struct DeepseekV4Config {
     bool fast_indexer() const noexcept {
         return index_n_heads == 64 &&
             index_head_dim == 128;
+    }
+    bool has_vision() const noexcept {
+        return vision_n_layers > 0;
+    }
+    bool has_dspark() const noexcept {
+        return n_mtp_layers > 0 && dspark_block_size > 0;
     }
 };
 

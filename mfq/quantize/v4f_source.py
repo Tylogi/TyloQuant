@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from mfq.formats.mx import MXFP4_DTYPE, mx_header_bytes
 from mfq.quantize.mxfp import (
     RawSafeTensorFile,
     decode_mxfp4,
@@ -16,8 +17,6 @@ from mfq.quantize.mxfp import (
     read_mxfp4_rows,
     read_mxfp8_rows,
 )
-from mfq.formats.mx import MXFP4_DTYPE, mx_header_bytes
-
 
 _GLOBAL_NAME_MAP = {
     "embed.weight": "token_embd.weight",
@@ -109,8 +108,19 @@ class V4FCheckpoint:
     def tensor_source(self, name: str) -> V4FTensorSource:
         return V4FTensorSource(self, name)
 
-    def expert_source(self, layer: int, projection: str) -> V4FExpertSource:
-        return V4FExpertSource(self, layer, projection)
+    def expert_source(
+        self,
+        layer: int,
+        projection: str,
+        *,
+        namespace: str = "layers",
+    ) -> V4FExpertSource:
+        return V4FExpertSource(
+            self,
+            layer,
+            projection,
+            namespace=namespace,
+        )
 
 
 class V4FTensorSource:
@@ -190,12 +200,17 @@ class V4FExpertSource:
         checkpoint: V4FCheckpoint,
         layer: int,
         projection: str,
+        *,
+        namespace: str = "layers",
     ) -> None:
         if projection not in {"gate_up", "down"}:
             raise ValueError(f"unsupported V4F expert projection: {projection}")
+        if namespace not in {"layers", "mtp"}:
+            raise ValueError(f"unsupported V4F expert namespace: {namespace}")
         self.checkpoint = checkpoint
         self.layer = int(layer)
         self.projection = projection
+        self.namespace = namespace
         self.n_experts = 256
         self.rows_per_expert = 4096
         self.columns = 4096 if projection == "gate_up" else 2048
@@ -212,7 +227,8 @@ class V4FExpertSource:
 
     def _weight_name(self, expert: int, part: str) -> str:
         return (
-            f"layers.{self.layer}.ffn.experts.{expert}.{part}.weight"
+            f"{self.namespace}.{self.layer}.ffn.experts."
+            f"{expert}.{part}.weight"
         )
 
     def _read_part(

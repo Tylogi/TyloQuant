@@ -1,4 +1,5 @@
 #include "mlx_minicpmo45.h"
+#include "mlx_multimodal.h"
 
 #include "mlx_sampling.h"
 #include "mlx_tensor.h"
@@ -4805,11 +4806,12 @@ MlxMiniCPMO45ForwardResult MlxMiniCPMO45Runtime::prepare_inputs(
                 Shape{bound.source + 1,
                       result.image_embeddings->shape(1),
                       result.image_embeddings->shape(2)});
-            result.input_embeddings = mlx::core::slice_update(
+            result.input_embeddings = replace_multimodal_embedding_span(
                 result.input_embeddings,
                 as_dtype(update, result.input_embeddings.dtype()),
-                Shape{bound.batch, bound.begin, 0},
-                Shape{bound.batch + 1, bound.end, 4096});
+                bound.batch,
+                bound.begin,
+                bound.end);
         }
     }
 
@@ -4839,11 +4841,12 @@ MlxMiniCPMO45ForwardResult MlxMiniCPMO45Runtime::prepare_inputs(
                 *result.audio_embeddings,
                 Shape{bound.source, 0, 0},
                 Shape{bound.source + 1, span, 4096});
-            result.input_embeddings = mlx::core::slice_update(
+            result.input_embeddings = replace_multimodal_embedding_span(
                 result.input_embeddings,
                 as_dtype(update, result.input_embeddings.dtype()),
-                Shape{bound.batch, bound.begin, 0},
-                Shape{bound.batch + 1, bound.end, 4096});
+                bound.batch,
+                bound.begin,
+                bound.end);
         }
     }
 

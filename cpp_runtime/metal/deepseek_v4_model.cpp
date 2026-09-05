@@ -662,6 +662,38 @@ DeepseekV4Config DeepseekV4Config::from_json(
         object,
         {"compress_rope_theta"},
         160'000.0);
+    config.n_mtp_layers = optional_integer(
+        object,
+        {"n_mtp_layers"},
+        0);
+    config.dspark_block_size = optional_integer(
+        object, {"dspark_block_size"}, 0);
+    config.dspark_noise_token_id = optional_integer(
+        object, {"dspark_noise_token_id"}, 0);
+    config.dspark_target_layer_ids =
+        integer_array(object, "dspark_target_layer_ids");
+    config.dspark_markov_rank = optional_integer(
+        object, {"dspark_markov_rank"}, 256);
+    config.vision_n_layers = optional_integer(
+        object, {"vision_n_layers"}, 0);
+    config.vision_dim = optional_integer(
+        object, {"vision_dim"}, 1024);
+    config.vision_n_heads = optional_integer(
+        object, {"vision_n_heads"}, 16);
+    config.vision_inter_dim = optional_integer(
+        object, {"vision_inter_dim"}, 2816);
+    config.vision_patch_size = optional_integer(
+        object, {"vision_patch_size"}, 14);
+    config.vision_rope_theta = optional_number(
+        object, {"vision_rope_theta"}, 10'000.0);
+    config.vision_downsample_ratio = optional_integer(
+        object, {"vision_downsample_ratio"}, 3);
+    config.vision_max_n_token = optional_integer(
+        object, {"vision_max_n_token"}, 384);
+    config.vision_min_pixels = optional_integer(
+        object, {"vision_min_pixels"}, 147'456);
+    config.vision_max_wh_ratio = optional_integer(
+        object, {"vision_max_wh_ratio"}, 8);
     config.compress_ratios =
         integer_array(object, "compress_ratios");
     if (config.compress_ratios.empty()) {
@@ -670,11 +702,32 @@ DeepseekV4Config DeepseekV4Config::from_json(
             0);
     } else if (config.compress_ratios.size() >
                static_cast<std::size_t>(config.n_layers)) {
-        // Released V4F configs may append DSpark/MTP layer ratios after the
-        // base decoder.  The native causal-LM runtime currently owns only
-        // num_hidden_layers base layers, so ignore those speculative tails.
+        config.mtp_compress_ratios.assign(
+            config.compress_ratios.begin() + config.n_layers,
+            config.compress_ratios.end());
         config.compress_ratios.resize(
             static_cast<std::size_t>(config.n_layers));
+    }
+    // Older 0731 text checkpoint configs call num_nextn_predict_layers=1 even
+    // though their tensor layout carries the released three-stage DSpark
+    // head.  The Vision release and reference runtime expose the real stage
+    // count directly, and the compress_ratios tail remains the authoritative
+    // structural fallback.  Retain the Transformers field for legacy dense
+    // MTP when no block-parallel head is declared.
+    if (config.dspark_block_size > 0 &&
+        !config.mtp_compress_ratios.empty()) {
+        config.n_mtp_layers = static_cast<std::int64_t>(
+            config.mtp_compress_ratios.size());
+    } else if (config.n_mtp_layers == 0) {
+        config.n_mtp_layers = optional_integer(
+            object,
+            {"num_nextn_predict_layers"},
+            0);
+    }
+    if (config.n_mtp_layers > 0 &&
+        config.mtp_compress_ratios.empty()) {
+        config.mtp_compress_ratios.assign(
+            static_cast<std::size_t>(config.n_mtp_layers), 0);
     }
     config.validate();
     return config;
@@ -819,6 +872,61 @@ void DeepseekV4Config::validate() const {
     if (n_hash_layers < 0 || n_hash_layers > n_layers) {
         throw std::runtime_error(
             "DeepSeek-V4 n_hash_layers is outside the layer range");
+    }
+    if (n_mtp_layers < 0 || vision_n_layers < 0 ||
+        dspark_block_size < 0) {
+        throw std::runtime_error(
+            "DeepSeek-V4 optional layer counts cannot be negative");
+    }
+    if (n_mtp_layers > 0) {
+        positive(n_mtp_layers, "n_mtp_layers");
+        positive(dspark_markov_rank, "dspark_markov_rank");
+        if (mtp_compress_ratios.size() !=
+            static_cast<std::size_t>(n_mtp_layers)) {
+            throw std::runtime_error(
+                "DeepSeek-V4 MTP compression schedule does not match "
+                "num_nextn_predict_layers");
+        }
+        for (const auto ratio : mtp_compress_ratios) {
+            if (ratio != 0 && ratio != 4 && ratio != 128) {
+                throw std::runtime_error(
+                    "DeepSeek-V4 MTP compression ratios must be 0, 4, or 128");
+            }
+        }
+    } else if (!mtp_compress_ratios.empty()) {
+        throw std::runtime_error(
+            "DeepSeek-V4 has MTP compression ratios but no MTP layers");
+    }
+    if (dspark_block_size > 0) {
+        if (n_mtp_layers <= 0 || dspark_block_size < 2 ||
+            dspark_noise_token_id < 0 || dspark_noise_token_id >= vocab ||
+            dspark_target_layer_ids.empty()) {
+            throw std::runtime_error(
+                "DeepSeek-V4 DSpark configuration is incomplete");
+        }
+        for (const auto layer : dspark_target_layer_ids) {
+            if (layer < 0 || layer >= n_layers) {
+                throw std::runtime_error(
+                    "DeepSeek-V4 DSpark target layer is out of range");
+            }
+        }
+    }
+    if (vision_n_layers > 0) {
+        positive(vision_n_layers, "vision_n_layers");
+        positive(vision_dim, "vision_dim");
+        positive(vision_n_heads, "vision_n_heads");
+        positive(vision_inter_dim, "vision_inter_dim");
+        positive(vision_patch_size, "vision_patch_size");
+        positive(vision_downsample_ratio, "vision_downsample_ratio");
+        positive(vision_max_n_token, "vision_max_n_token");
+        positive(vision_min_pixels, "vision_min_pixels");
+        positive(vision_max_wh_ratio, "vision_max_wh_ratio");
+        if (vision_dim % vision_n_heads != 0 ||
+            (vision_dim / vision_n_heads) % 4 != 0 ||
+            !std::isfinite(vision_rope_theta) || vision_rope_theta <= 0.0) {
+            throw std::runtime_error(
+                "invalid DeepSeek-V4 vision dimensions or RoPE base");
+        }
     }
     if (!std::isfinite(rms_eps) || rms_eps <= 0.0 ||
         !std::isfinite(hc_eps) || hc_eps <= 0.0 ||

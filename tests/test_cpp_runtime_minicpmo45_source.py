@@ -253,7 +253,9 @@ def test_minicpmo45_cuda_server_binds_the_realtime_backend():
 
 
 def test_minicpmo45_native_servers_share_mfqd_vision_tensors():
-    assert "struct MfqVisionInput" in SERVER_HEADER
+    assert "struct MfqMultimodalInput" in SERVER_HEADER
+    assert "using MfqVisionInput = MfqMultimodalInput" in SERVER_HEADER
+    assert "enum class MfqMultimodalProcessor" in SERVER_HEADER
     assert "MfqMultimodalGenerateFn" in SERVER_HEADER
     assert "parse_mfq_vision(" in SERVER_SOURCE
     assert "class TensorFileReader final" in SERVER_SOURCE

@@ -520,7 +520,7 @@ array rms_replace_last_rope(
     return std::move(outputs.front());
 }
 
-array kv_fp8_sim_prefix(
+array kv_fp8_sim_prefix_impl(
     const array& input,
     int rotary) {
     auto source = floating_contiguous(input);
@@ -893,6 +893,60 @@ void require_matrix(
 }
 
 } // namespace
+
+array deepseek_v4_kv_fp8_sim_prefix(
+    const array& input,
+    int rotary_dimension) {
+    return kv_fp8_sim_prefix_impl(input, rotary_dimension);
+}
+
+MlxDeepseekV4ImageVisibility deepseek_v4_image_visibility(
+    const std::vector<std::int64_t>& token_ids,
+    std::int64_t vocab_size,
+    int max_image_tokens) {
+    if (token_ids.empty() || vocab_size <= 0 || max_image_tokens <= 0) {
+        throw std::invalid_argument(
+            "invalid DeepSeek-V4 image visibility input");
+    }
+    std::vector<std::int32_t> left(token_ids.size(), 0);
+    std::vector<std::int32_t> right(token_ids.size(), 0);
+    std::optional<std::size_t> image_start;
+    for (std::size_t index = 0; index < token_ids.size(); ++index) {
+        const auto token = token_ids[index];
+        if (token == vocab_size) {
+            if (image_start.has_value()) {
+                throw std::invalid_argument(
+                    "DeepSeek-V4 image sentinel spans cannot nest");
+            }
+            image_start = index;
+            continue;
+        }
+        if (token != vocab_size + 4) continue;
+        if (!image_start.has_value()) {
+            throw std::invalid_argument(
+                "DeepSeek-V4 IMAGE_END has no IMAGE_START");
+        }
+        const auto begin = *image_start;
+        for (std::size_t position = begin; position <= index; ++position) {
+            left[position] = static_cast<std::int32_t>(std::min<std::size_t>(
+                position - begin,
+                static_cast<std::size_t>(max_image_tokens - 1)));
+            right[position] = static_cast<std::int32_t>(std::min<std::size_t>(
+                index - position,
+                static_cast<std::size_t>(max_image_tokens)));
+        }
+        image_start.reset();
+    }
+    if (image_start.has_value()) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 IMAGE_START has no IMAGE_END");
+    }
+    return {
+        array(left.begin(), Shape{1, static_cast<int>(left.size())}),
+        array(right.begin(), Shape{1, static_cast<int>(right.size())}),
+        max_image_tokens,
+    };
+}
 
 std::pair<array, array> deepseek_v4_yarn_tables(
     int dimension,
@@ -2249,6 +2303,14 @@ array MlxDeepseekV4Attention::operator()(
     const array& input,
     MlxDeepseekV4LayerState& state,
     int pos0) const {
+    return (*this)(input, state, pos0, nullptr);
+}
+
+array MlxDeepseekV4Attention::operator()(
+    const array& input,
+    MlxDeepseekV4LayerState& state,
+    int pos0,
+    const MlxDeepseekV4ImageVisibility* visibility) const {
     auto source = floating_contiguous(input);
     const auto& config = impl_->config;
     const int hidden = checked_int(
@@ -2285,6 +2347,13 @@ array MlxDeepseekV4Attention::operator()(
     }
     const int batch = source.shape(0);
     const int tokens = source.shape(1);
+    if (visibility != nullptr &&
+        (tokens == 1 || pos0 != 0 || visibility->max_image_tokens <= 0 ||
+         visibility->left.shape() != Shape{batch, tokens} ||
+         visibility->right.shape() != Shape{batch, tokens})) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 image visibility requires one full prefill chunk");
+    }
     auto positions = mlx::core::arange(
         pos0,
         pos0 + tokens,
@@ -2356,7 +2425,7 @@ array MlxDeepseekV4Attention::operator()(
     // the non-RoPE KV channels (64 values per UE8M0-scaled group).  Preserve
     // the RoPE channels verbatim and use this same fake-quantized KV for both
     // prefill and incremental cache writes.
-    kv = kv_fp8_sim_prefix(kv, rotary);
+    kv = deepseek_v4_kv_fp8_sim_prefix(kv, rotary);
     if (detail::component_profile_active()) {
         detail::profile_eval(
             profile_component("q_rms_rope"),
@@ -2603,15 +2672,24 @@ array MlxDeepseekV4Attention::operator()(
         unified = mlx::core::concatenate(
             std::move(parts),
             1);
-        plan = dsv4_build_prefill_plan(
-            topk,
-            pos0,
-            history,
-            pool_len,
-            impl_->ratio == 0
-                ? 1
-                : impl_->ratio,
-            window);
+        plan = visibility != nullptr
+            ? dsv4_build_prefill_plan_visible(
+                  topk,
+                  visibility->left,
+                  visibility->right,
+                  pos0,
+                  history,
+                  pool_len,
+                  impl_->ratio == 0 ? 1 : impl_->ratio,
+                  window,
+                  visibility->max_image_tokens)
+            : dsv4_build_prefill_plan(
+                  topk,
+                  pos0,
+                  history,
+                  pool_len,
+                  impl_->ratio == 0 ? 1 : impl_->ratio,
+                  window);
         const int recent = std::min(tokens, window);
         auto recent_values = slice_axis(
             kv,

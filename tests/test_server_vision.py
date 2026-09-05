@@ -16,7 +16,11 @@ from PIL import Image
 
 from mfq.server.backend import OpenAIChatBackend
 from mfq.server.models import SamplingParams
-from mfq.server.vision import MiniCPMO45VisionProcessor
+from mfq.server.vision import (
+    DeepseekV4VisionProcessor,
+    MiniCPMO45VisionProcessor,
+    multimodal_processor_for_architecture,
+)
 
 
 def _data_url(image: Image.Image) -> str:
@@ -71,6 +75,73 @@ def test_patch_layout_matches_official_torch_unfold() -> None:
 
     assert target == (3, 5)
     np.testing.assert_array_equal(actual, reference)
+
+
+def test_deepseek_v4_processor_matches_official_patch_layout() -> None:
+    class TinyProcessor(DeepseekV4VisionProcessor):
+        minimum_pixels = 0
+
+    height, width = 42, 70
+    pixels = np.arange(height * width * 3, dtype=np.uint32)
+    pixels = (pixels % 256).astype(np.uint8).reshape(height, width, 3)
+    image = Image.fromarray(pixels, mode="RGB")
+
+    actual, grid = TinyProcessor._prepare_image(image)
+    normalized = torch.from_numpy(pixels.astype(np.float32)).permute(2, 0, 1)
+    normalized = (normalized / 255 - 0.5) / 0.5
+    reference = (
+        normalized.reshape(3, 3, 14, 5, 14)
+        .permute(1, 3, 0, 2, 4)
+        .reshape(15, 3, 14, 14)
+        .numpy()
+    )
+
+    assert grid == (3, 5, 1, 2)
+    np.testing.assert_array_equal(actual, reference)
+
+
+def test_deepseek_v4_request_defers_position_dependent_image_block() -> None:
+    class TinyProcessor(DeepseekV4VisionProcessor):
+        minimum_pixels = 0
+
+    image = Image.new("RGB", (70, 42), (20, 40, 60))
+    result = TinyProcessor().prepare_openai_messages(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is in this image?"},
+                    {"type": "image_url", "image_url": {"url": _data_url(image)}},
+                ],
+            }
+        ]
+    )
+
+    assert result is not None
+    assert result.messages[0]["content"].endswith("<｜deepseek_image｜>")
+    assert result.tensors["version"] == 2
+    assert result.tensors["processor"] == "deepseek_v4"
+    assert _decode_tensor(result.tensors["pixel_values"]).shape == (1, 15, 588)
+    np.testing.assert_array_equal(
+        _decode_tensor(result.tensors["patch_mask"]).sum(axis=1),
+        [15],
+    )
+    np.testing.assert_array_equal(
+        _decode_tensor(result.tensors["vision_grid"]),
+        [[3, 5, 1, 2]],
+    )
+
+
+def test_multimodal_processor_registry_is_architecture_specific() -> None:
+    assert isinstance(
+        multimodal_processor_for_architecture("MiniCPMO"),
+        MiniCPMO45VisionProcessor,
+    )
+    assert isinstance(
+        multimodal_processor_for_architecture("deepseek-v4"),
+        DeepseekV4VisionProcessor,
+    )
+    assert multimodal_processor_for_architecture("qwen3_5") is None
 
 
 def test_image_request_matches_official_slice_and_tensor_contract() -> None:

@@ -960,7 +960,8 @@ MlxDeepseekV4Moe make_moe(
     bool packed_shared,
     const std::optional<std::vector<float>>& bias,
     const std::optional<std::vector<std::int32_t>>& token_experts,
-    const std::array<bool, kExperts>& available) {
+    const std::array<bool, kExperts>& available,
+    const std::optional<std::vector<float>>& visual_bias = std::nullopt) {
     std::optional<array> bias_array;
     if (bias.has_value()) {
         bias_array = array(bias->begin(), Shape{kExperts});
@@ -974,6 +975,11 @@ MlxDeepseekV4Moe make_moe(
         table_array = array(
             token_experts->begin(),
             Shape{kVocab, kTopK});
+    }
+    std::optional<array> visual_bias_array;
+    if (visual_bias.has_value()) {
+        visual_bias_array = array(
+            visual_bias->begin(), Shape{kExperts});
     }
     return MlxDeepseekV4Moe(
         std::move(config),
@@ -990,7 +996,8 @@ MlxDeepseekV4Moe make_moe(
             fixture.routed_down.blob),
         std::move(bias_array),
         std::move(table_array),
-        availability_array(available));
+        availability_array(available),
+        std::move(visual_bias_array));
 }
 
 struct MappedTensor {
@@ -1852,6 +1859,49 @@ void test_hash_repair_and_mixed_formats(
     compare(std::move(actual), expected, 3e-2f);
 }
 
+void test_visual_tokens_use_visual_router_bias(
+    const ModelFixture& fixture) {
+    constexpr int rows = 2;
+    auto config = test_config(true);
+    config.n_hash_layers = 0;
+    config.vision_n_layers = 1;
+    const std::vector<float> visual_bias{
+        -100.0f, 90.0f, -100.0f, 100.0f};
+    auto moe = make_moe(
+        fixture,
+        config,
+        true,
+        kBias,
+        std::nullopt,
+        kAvailable,
+        visual_bias);
+    const auto input = input_values(rows, 31);
+    const std::vector<std::int32_t> tokens{
+        0,
+        static_cast<std::int32_t>(config.vocab + 2),
+    };
+    auto actual = moe.forward_with_routing(
+        array(input.begin(), Shape{rows, kHidden}),
+        array(tokens.begin(), Shape{rows}));
+    const auto ids = evaluated_ids(actual.expert_ids);
+    const auto expected_text = reference(
+        fixture,
+        config,
+        std::vector<float>(input.begin(), input.begin() + kHidden),
+        1,
+        {0},
+        kBias,
+        std::nullopt,
+        kAvailable);
+    require(
+        ids[0] == expected_text.ids[0] &&
+            ids[1] == expected_text.ids[1],
+        "text row did not retain the ordinary router bias");
+    require(
+        ids[kTopK] == 3 && ids[kTopK + 1] == 1,
+        "visual row did not use bias_vl");
+}
+
 void test_split_gate_up_eager_load_and_forward() {
     const auto fixture = make_split_model_fixture(false);
     const TemporaryDeepseekMfq file(
@@ -2167,6 +2217,67 @@ void test_streamed_tpq_load_and_forward() {
         "batched streamed TPQ");
 }
 
+void test_named_dspark_moe_reuses_streamed_tpq_cache() {
+    auto fixture = make_model_fixture();
+    fixture.routed_gate_up = make_tpq_moe(
+        2 * kIntermediate,
+        kHidden,
+        71);
+    fixture.routed_down = make_tpq_moe(
+        kHidden,
+        kIntermediate,
+        73);
+    auto records = streamed_router_model_records(fixture, kBias);
+    for (auto& record : records) {
+        if (record.name.starts_with("layers.0.")) {
+            record.name.replace(0, 9, "mtp.0.");
+        }
+    }
+    const TemporaryDeepseekMfq file(
+        records,
+        "deepseek_v4-tpq-mfq");
+    const mfq::metal::MfqContainer model(file.path());
+    auto residency = std::make_shared<
+        mfq::metal::MlxNintMoeOffloadCache>(
+            model,
+            0,
+            kExperts);
+    auto config = test_config(true);
+    config.n_hash_layers = 0;
+    config.n_mtp_layers = 1;
+    config.mtp_compress_ratios = {0};
+    config.validate();
+    auto moe = MlxDeepseekV4Moe::load_named(
+        model,
+        config,
+        "mtp.0",
+        availability_array(kAvailable),
+        residency,
+        static_cast<std::size_t>(config.n_layers));
+    require(
+        moe.uses_streamed_experts(),
+        "named DSpark MoE did not reuse MFQ expert offload");
+
+    constexpr int rows = 5;
+    const auto input = input_values(rows, 41);
+    const std::vector<std::int32_t> tokens{0, 1, 2, 3, 4};
+    const auto expected = reference(
+        fixture,
+        config,
+        input,
+        rows,
+        tokens,
+        kBias,
+        std::nullopt,
+        kAvailable);
+    compare(
+        moe.forward_with_routing(
+            array(input.begin(), Shape{rows, kHidden}),
+            array(tokens.begin(), Shape{rows})),
+        expected,
+        3e-2f);
+}
+
 void test_streamed_router_availability_intersection() {
     constexpr std::array<bool, kExperts> gate_available{
         true,
@@ -2310,10 +2421,12 @@ int main() {
         test_grouped_and_fallbacks(fixture);
         test_unnormalized_bias_routing(fixture);
         test_hash_repair_and_mixed_formats(fixture);
+        test_visual_tokens_use_visual_router_bias(fixture);
         test_split_gate_up_eager_load_and_forward();
         test_split_gate_up_streamed_load_and_forward();
         test_split_gate_up_requires_pair();
         test_streamed_tpq_load_and_forward();
+        test_named_dspark_moe_reuses_streamed_tpq_cache();
         test_streamed_router_availability_intersection();
         test_availability_validation(fixture);
         std::cout

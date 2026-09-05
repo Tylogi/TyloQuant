@@ -173,6 +173,8 @@ public:
         const mlx::core::array& packed_expert_ids,
         float limit = 0.0f) const;
     bool supports_grouped_vq_mmq() const noexcept;
+    bool prefers_mxfp4_smallm_nax(
+        const mlx::core::array& expert_ids) const noexcept;
     MlxGroupedVqMmqPlan build_grouped_vq_mmq_plan(
         const mlx::core::array& expert_ids,
         const mlx::core::array& route_order) const;
@@ -183,7 +185,8 @@ public:
         bool input_is_sorted,
         bool fused_swiglu = false,
         float swiglu_limit = 0.0f,
-        const MlxGroupedVqMmqPlan* plan = nullptr) const;
+        const MlxGroupedVqMmqPlan* plan = nullptr,
+        bool force_mxfp4_nax = false) const;
     mlx::core::array operator()(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids) const {
@@ -266,6 +269,10 @@ public:
     bool supports_grouped_vq_mmq() const noexcept {
         return weight_.supports_grouped_vq_mmq();
     }
+    bool prefers_mxfp4_smallm_nax(
+        const mlx::core::array& expert_ids) const noexcept {
+        return weight_.prefers_mxfp4_smallm_nax(expert_ids);
+    }
     MlxGroupedVqMmqPlan build_grouped_vq_mmq_plan(
         const mlx::core::array& expert_ids,
         const mlx::core::array& route_order) const {
@@ -278,7 +285,8 @@ public:
         const mlx::core::array& expert_ids,
         const mlx::core::array& route_order,
         bool input_is_sorted,
-        const MlxGroupedVqMmqPlan* plan = nullptr) const {
+        const MlxGroupedVqMmqPlan* plan = nullptr,
+        bool force_mxfp4_nax = false) const {
         return weight_.routed_matmul_sorted(
             input,
             expert_ids,
@@ -286,13 +294,15 @@ public:
             input_is_sorted,
             false,
             0.0f,
-            plan);
+            plan,
+            force_mxfp4_nax);
     }
     mlx::core::array swiglu_sorted(
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
         const mlx::core::array& route_order,
-        float limit = 0.0f) const {
+        float limit = 0.0f,
+        bool force_mxfp4_nax = false) const {
         return weight_.routed_matmul_sorted(
             input,
             expert_ids,
@@ -300,7 +310,8 @@ public:
             false,
             true,
             limit,
-            nullptr);
+            nullptr,
+            force_mxfp4_nax);
     }
     mlx::core::array operator()(
         const mlx::core::array& input,

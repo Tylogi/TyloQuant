@@ -14,11 +14,6 @@ import numpy as np
 import torch
 
 from mfq.calibration.artifact import load_scheme
-from mfq.formats.tpq import (
-    tpq_int4_payload_nbytes,
-    pack_tpq_int4_prefix,
-)
-from mfq.formats.tpq import TPQ_PQ_SPECS
 from mfq.formats.header import FileHeader
 from mfq.formats.runtime_profile import (
     RUNTIME_SAMPLING_METADATA_KEY,
@@ -30,15 +25,19 @@ from mfq.formats.shards import (
     validate_split_limits,
     write_blob_record_shards,
 )
-from mfq.quantize.tpq import quantize_tpq_int4
+from mfq.formats.tpq import (
+    TPQ_PQ_SPECS,
+    pack_tpq_int4_prefix,
+    tpq_int4_payload_nbytes,
+)
 from mfq.quantize.mxfp import read_dense_rows, read_mxfp8_rows
+from mfq.quantize.tpq import quantize_tpq_int4
 from mfq.quantize.v4f_source import V4FCheckpoint
 from mfq.tools.quantize_hf_to_mfq import (
     BlobRecord,
     _mixed_moe_blob_nbytes,
     _write_mixed_moe_axis0_blob,
 )
-
 
 _TIER_CHARACTER = {
     "TPQ-X": "x",
@@ -61,8 +60,33 @@ def _tpq_config(root: Path) -> dict:
     eos = source.get("eos_token_id", [])
     if isinstance(eos, int):
         eos = [eos]
+    n_layers = int(source["num_hidden_layers"])
+    compress_ratios = [int(value) for value in (source.get("compress_ratios") or [])]
+    target_layers = [int(value) for value in (source.get("dspark_target_layer_ids") or [])]
+    structural_counts = {
+        count
+        for count in (
+            max(0, len(compress_ratios) - n_layers),
+            len(target_layers),
+            int(source.get("n_mtp_layers", 0) or 0),
+        )
+        if count > 0
+    }
+    if len(structural_counts) > 1:
+        raise ValueError(
+            f"DeepSeek DSpark config has inconsistent stage counts: {sorted(structural_counts)}"
+        )
+    n_mtp_layers = (
+        next(iter(structural_counts))
+        if structural_counts
+        else (
+            int(source.get("num_nextn_predict_layers", 0) or 0)
+            if int(source.get("dspark_block_size", 0) or 0) > 0
+            else 0
+        )
+    )
     return {
-        "n_layers": int(source["num_hidden_layers"]),
+        "n_layers": n_layers,
         "hidden": int(source["hidden_size"]),
         "n_experts": int(source["n_routed_experts"]),
         "top_k": int(source["num_experts_per_tok"]),
@@ -90,35 +114,47 @@ def _tpq_config(root: Path) -> dict:
         "eos_token_id": [int(value) for value in eos],
         "index_n_heads": int(source.get("index_n_heads", 64)),
         "index_head_dim": int(source.get("index_head_dim", 128)),
-        "max_position_embeddings": int(
-            source.get("max_position_embeddings", 0)
-        ),
-        "n_mtp_layers": int(source.get("num_nextn_predict_layers", 1)),
+        "max_position_embeddings": int(source.get("max_position_embeddings", 0)),
+        # Older 0731 text checkpoint configs report one next-token layer even
+        # though their tensors contain the three-stage DSpark head.  The
+        # compress-ratio tail and target list provide the structural count;
+        # newer Vision configs expose all three stages directly.
+        "n_mtp_layers": n_mtp_layers,
+        "dspark_block_size": int(source.get("dspark_block_size", 0) or 0),
+        "dspark_noise_token_id": int(source.get("dspark_noise_token_id", 0) or 0),
+        "dspark_target_layer_ids": target_layers,
+        "dspark_markov_rank": int(source.get("dspark_markov_rank", 256) or 256),
         "hc_mult": int(source.get("hc_mult", 4)),
         "hc_eps": float(source.get("hc_eps", 1e-6)),
         "hc_sinkhorn_iters": int(source.get("hc_sinkhorn_iters", 20)),
-        "compress_rope_theta": float(
-            source.get("compress_rope_theta", 160000.0)
-        ),
-        "compress_ratios": [
-            int(value) for value in (source.get("compress_ratios") or [])
-        ],
+        "compress_rope_theta": float(source.get("compress_rope_theta", 160000.0)),
+        "compress_ratios": compress_ratios,
+        "vision_n_layers": int(source.get("vision_n_layers", 0) or 0),
+        "vision_dim": int(source.get("vision_dim", 1024) or 1024),
+        "vision_n_heads": int(source.get("vision_n_heads", 16) or 16),
+        "vision_inter_dim": int(source.get("vision_inter_dim", 2816) or 2816),
+        "vision_patch_size": int(source.get("vision_patch_size", 14) or 14),
+        "vision_rope_theta": float(source.get("vision_rope_theta", 10000.0) or 10000.0),
+        "vision_downsample_ratio": int(source.get("vision_downsample_ratio", 3) or 3),
+        "vision_max_n_token": int(source.get("vision_max_n_token", 384) or 384),
+        "vision_min_pixels": int(source.get("vision_min_pixels", 147456) or 147456),
+        "vision_max_wh_ratio": int(source.get("vision_max_wh_ratio", 8) or 8),
     }
 
 
 def _is_dense_source(name: str) -> bool:
     return (
-        not name.startswith("mtp.")
-        and ".ffn.experts." not in name
-        and not name.endswith(".scale")
+        not name.startswith("mtp.") and ".ffn.experts." not in name and not name.endswith(".scale")
     )
+
+
+def _is_dspark_dense_source(name: str) -> bool:
+    return name.startswith("mtp.") and ".ffn.experts." not in name and not name.endswith(".scale")
 
 
 def _scale_name(checkpoint: V4FCheckpoint, name: str) -> str | None:
     candidate = (
-        name.removesuffix("weight") + "scale"
-        if name.endswith("weight")
-        else name + ".scale"
+        name.removesuffix("weight") + "scale" if name.endswith("weight") else name + ".scale"
     )
     return candidate if candidate in checkpoint.weight_map else None
 
@@ -235,13 +271,29 @@ def _write_int4_blob(
 
 
 def _expert_precisions(selection) -> tuple:
-    by_expert = {
-        int(item.expert_id): item.descriptor
-        for item in selection.selections
-    }
+    by_expert = {int(item.expert_id): item.descriptor for item in selection.selections}
     if sorted(by_expert) != list(range(selection.n_experts)):
         raise ValueError(f"incomplete TPQ expert selection: {selection.name}")
     return tuple(by_expert[expert] for expert in range(selection.n_experts))
+
+
+def _dspark_expert_plan(
+    config: dict,
+) -> tuple[tuple[int, str, str, str], ...]:
+    stages = int(config.get("n_mtp_layers", 0) or 0)
+    targets = [int(value) for value in (config.get("dspark_target_layer_ids") or [])]
+    if len(targets) != stages:
+        raise ValueError("DeepSeek DSpark target-layer count does not match its stages")
+    return tuple(
+        (
+            stage,
+            projection,
+            f"mtp.{stage}.ffn.experts.{projection}.weight",
+            f"blk.{target}.ffn_{projection}_exps.weight",
+        )
+        for stage, target in enumerate(targets)
+        for projection in ("gate_up", "down")
+    )
 
 
 def _tier_strings(scheme, n_layers: int, n_experts: int) -> dict[str, str]:
@@ -256,13 +308,9 @@ def _tier_strings(scheme, n_layers: int, n_experts: int) -> dict[str, str]:
         if len(families) != n_experts:
             raise ValueError(f"TPQ layer {layer} expert count differs")
         try:
-            result[str(layer)] = "".join(
-                _TIER_CHARACTER[item.family] for item in families
-            )
+            result[str(layer)] = "".join(_TIER_CHARACTER[item.family] for item in families)
         except KeyError as exc:
-            raise ValueError(
-                f"TPQ layer {layer} contains a non-TPQ precision"
-            ) from exc
+            raise ValueError(f"TPQ layer {layer} contains a non-TPQ precision") from exc
     return result
 
 
@@ -270,6 +318,9 @@ def _manifest(
     root: Path,
     scheme,
     config: dict,
+    *,
+    include_dspark: bool,
+    source_dspark_layers: int,
 ) -> dict:
     tiers = _tier_strings(
         scheme,
@@ -287,13 +338,7 @@ def _manifest(
         )
         if (root / name).is_file()
     ]
-    present_tiers = sorted(
-        {
-            character
-            for encoded in tiers.values()
-            for character in encoded
-        }
-    )
+    present_tiers = sorted({character for encoded in tiers.values() for character in encoded})
     return {
         "format": "tpq-1",
         "config": config,
@@ -309,17 +354,12 @@ def _manifest(
                 spec.tier: [spec.vector_size, spec.codebook_entries]
                 for spec in TPQ_PQ_SPECS.values()
             },
-            "profile": Path(
-                str(scheme.metadata.get("profile", "tiers_per_layer"))
-            ).name,
+            "profile": Path(str(scheme.metadata.get("profile", "tiers_per_layer"))).name,
         },
         "tiers_per_layer": tiers,
         "dense_file": "native-mfq",
-        "expert_files": {
-            str(layer): "native-mfq"
-            for layer in range(int(config["n_layers"]))
-        },
-        "skipped": ["dspark_layers_43_45(mtp.*)"],
+        "expert_files": {str(layer): "native-mfq" for layer in range(int(config["n_layers"]))},
+        "skipped": ([] if include_dspark or source_dspark_layers == 0 else ["dspark(mtp.*)"]),
         "tokenizer_files": tokenizer_files,
     }
 
@@ -336,6 +376,7 @@ def convert(
     overwrite: bool = False,
     split_max_size: int = 0,
     split_max_tensors: int = 0,
+    include_dspark: bool = True,
 ) -> Path:
     """Run TPQ's original dense/expert quantization into MFQ output."""
 
@@ -360,31 +401,45 @@ def convert(
         raise ValueError("TPQ quantization cannot consume an imatrix")
     checkpoint = V4FCheckpoint(root)
     config = _tpq_config(root)
-    manifest = _manifest(root, scheme, config)
+    source_dspark_layers = int(config.get("n_mtp_layers", 0))
+    if include_dspark and source_dspark_layers > 0:
+        missing_roots = [
+            f"mtp.{stage}.attn.wq_a.weight"
+            for stage in range(source_dspark_layers)
+            if f"mtp.{stage}.attn.wq_a.weight" not in checkpoint.weight_map
+        ]
+        if missing_roots:
+            raise ValueError(
+                "DeepSeek config advertises DSpark but checkpoint is missing: "
+                + ", ".join(missing_roots)
+            )
+    if not include_dspark:
+        config = dict(config)
+        config["n_mtp_layers"] = 0
+        config["dspark_block_size"] = 0
+        config["dspark_target_layer_ids"] = []
+        config["compress_ratios"] = list(config["compress_ratios"])[: int(config["n_layers"])]
+    manifest = _manifest(
+        root,
+        scheme,
+        config,
+        include_dspark=include_dspark,
+        source_dspark_layers=source_dspark_layers,
+    )
     artifact_root = scheme_file.parent
     progress_path = run_dir / "convert_progress.jsonl"
     records: list[BlobRecord] = []
     started = time.perf_counter()
     index = 0
 
-    dense_names = sorted(
-        name for name in checkpoint.weight_map if _is_dense_source(name)
-    )
+    dense_names = sorted(name for name in checkpoint.weight_map if _is_dense_source(name))
     for name in dense_names:
         index += 1
         info = checkpoint.info(name)
         shape = tuple(int(value) for value in info.shape)
-        use_int4 = (
-            len(shape) == 2
-            and math.prod(shape) >= 65_536
-            and shape[1] % 64 == 0
-        )
+        use_int4 = len(shape) == 2 and math.prod(shape) >= 65_536 and shape[1] % 64 == 0
         dtype = "TPQ-I4G64" if use_int4 else "F32"
-        expected = (
-            tpq_int4_payload_nbytes(shape, 64)
-            if use_int4
-            else _f32_blob_nbytes(shape)
-        )
+        expected = tpq_int4_payload_nbytes(shape, 64) if use_int4 else _f32_blob_nbytes(shape)
         blob = blobs / f"{index:05d}.blob"
         item_started = time.perf_counter()
         if blob.is_file() and blob.stat().st_size == expected:
@@ -413,8 +468,7 @@ def convert(
             )
             if actual != expected:
                 raise RuntimeError(
-                    f"TPQ dense blob size mismatch for {name}: "
-                    f"{actual} != {expected}"
+                    f"TPQ dense blob size mismatch for {name}: {actual} != {expected}"
                 )
             os.replace(temporary, blob)
             status = "written"
@@ -440,9 +494,7 @@ def convert(
             ("down", f"layers.{layer}.ffn.experts.down.weight"),
         ):
             index += 1
-            selection_name = (
-                f"blk.{layer}.ffn_{projection}_exps.weight"
-            )
+            selection_name = f"blk.{layer}.ffn_{projection}_exps.weight"
             selection = scheme.expert_selections[selection_name]
             precisions = _expert_precisions(selection)
             source = checkpoint.expert_source(layer, projection)
@@ -474,12 +526,133 @@ def convert(
                 )
                 if actual != expected:
                     raise RuntimeError(
-                        f"TPQ expert blob size mismatch for {target_name}: "
-                        f"{actual} != {expected}"
+                        f"TPQ expert blob size mismatch for {target_name}: {actual} != {expected}"
                     )
                 os.replace(temporary, blob)
                 status = "written"
             records.append(BlobRecord(target_name, "NINTM", expected, blob))
+            event = {
+                "completed": index,
+                "name": target_name,
+                "dtype": "NINTM",
+                "blob_bytes": expected,
+                "status": status,
+                "seconds": time.perf_counter() - item_started,
+            }
+            with progress_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event) + "\n")
+            print(json.dumps(event), flush=True)
+            del source
+
+    dspark_tensor_count = 0
+    if include_dspark and source_dspark_layers > 0:
+        # Append DSpark after every legacy/base tensor so an interrupted run
+        # can safely reuse the old ordinal blob cache.
+        for name in sorted(
+            value for value in checkpoint.weight_map if _is_dspark_dense_source(value)
+        ):
+            index += 1
+            info = checkpoint.info(name)
+            shape = tuple(int(value) for value in info.shape)
+            use_int4 = len(shape) == 2 and math.prod(shape) >= 65_536 and shape[1] % 64 == 0
+            dtype = "TPQ-I4G64" if use_int4 else "F32"
+            expected = tpq_int4_payload_nbytes(shape, 64) if use_int4 else _f32_blob_nbytes(shape)
+            blob = blobs / f"{index:05d}.blob"
+            item_started = time.perf_counter()
+            if blob.is_file() and blob.stat().st_size == expected:
+                status = "reused"
+            else:
+                if blob.exists():
+                    raise ValueError(f"TPQ blob has the wrong size: {blob}")
+                temporary = blob.with_suffix(".blob.partial")
+                temporary.unlink(missing_ok=True)
+                actual = (
+                    _write_int4_blob(
+                        checkpoint,
+                        name,
+                        temporary,
+                        row_chunk=row_chunk,
+                        device=device,
+                    )
+                    if use_int4
+                    else _write_f32_blob(
+                        checkpoint,
+                        name,
+                        temporary,
+                        row_chunk=row_chunk,
+                        device=device,
+                    )
+                )
+                if actual != expected:
+                    raise RuntimeError(
+                        f"TPQ dense blob size mismatch for {name}: {actual} != {expected}"
+                    )
+                os.replace(temporary, blob)
+                status = "written"
+            records.append(BlobRecord(name, dtype, expected, blob))
+            dspark_tensor_count += 1
+            event = {
+                "completed": index,
+                "name": name,
+                "dtype": dtype,
+                "blob_bytes": expected,
+                "status": status,
+                "seconds": time.perf_counter() - item_started,
+            }
+            with progress_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event) + "\n")
+            print(json.dumps(event), flush=True)
+
+        for stage, projection, target_name, selection_name in _dspark_expert_plan(config):
+            index += 1
+            try:
+                selection = scheme.expert_selections[selection_name]
+            except KeyError as exc:
+                raise ValueError(
+                    "TPQ scheme cannot supply DSpark stage "
+                    f"{stage}; missing analogue {selection_name}"
+                ) from exc
+            precisions = _expert_precisions(selection)
+            source = checkpoint.expert_source(
+                stage,
+                projection,
+                namespace="mtp",
+            )
+            expected = _mixed_moe_blob_nbytes(
+                source.shape,
+                precisions,
+                artifact_root,
+            )
+            blob = blobs / f"{index:05d}.blob"
+            item_started = time.perf_counter()
+            if blob.is_file() and blob.stat().st_size == expected:
+                status = "reused"
+            else:
+                if blob.exists():
+                    raise ValueError(f"TPQ blob has the wrong size: {blob}")
+                temporary = blob.with_suffix(".blob.partial")
+                temporary.unlink(missing_ok=True)
+                actual = _write_mixed_moe_axis0_blob(
+                    source,
+                    source.shape,
+                    source.shape,
+                    precisions,
+                    temporary,
+                    row_chunk,
+                    "cuda",
+                    device,
+                    artifact_root,
+                    importance=None,
+                )
+                if actual != expected:
+                    raise RuntimeError(
+                        "TPQ DSpark expert blob size mismatch for "
+                        f"{target_name}: {actual} != {expected}"
+                    )
+                os.replace(temporary, blob)
+                status = "written"
+            records.append(BlobRecord(target_name, "NINTM", expected, blob))
+            dspark_tensor_count += 1
             event = {
                 "completed": index,
                 "name": target_name,
@@ -505,16 +678,17 @@ def convert(
                 else {}
             ),
             "source_format": "tpq-1",
-            "source_index_sha256": _sha256(
-                root / "model.safetensors.index.json"
-            ),
+            "source_index_sha256": _sha256(root / "model.safetensors.index.json"),
             "scheme_sha256": _sha256(scheme_file),
             "tpq_manifest": manifest,
-            "tpq_index_storage": {
-                spec.tier: spec.index_bits
-                for spec in TPQ_PQ_SPECS.values()
+            "tpq_index_storage": {spec.tier: spec.index_bits for spec in TPQ_PQ_SPECS.values()},
+            "mtp_included": bool(dspark_tensor_count),
+            "mtp": {
+                "architecture": "deepseek_v4_dspark",
+                "included": bool(dspark_tensor_count),
+                "hidden_layers": (source_dspark_layers if dspark_tensor_count else 0),
+                "tensor_count": dspark_tensor_count,
             },
-            "mtp_included": False,
         },
     )
     outputs = write_blob_record_shards(
@@ -556,6 +730,11 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--row-chunk", type=int, default=512)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--no-dspark",
+        action="store_true",
+        help="omit the DeepSeek DSpark MoE speculative head",
+    )
     split = parser.add_mutually_exclusive_group()
     split.add_argument(
         "--split-max-size",
@@ -576,6 +755,7 @@ def main() -> None:
         overwrite=args.overwrite,
         split_max_size=args.split_max_size,
         split_max_tensors=args.split_max_tensors,
+        include_dspark=not args.no_dspark,
     )
 
 

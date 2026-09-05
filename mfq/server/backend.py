@@ -27,7 +27,11 @@ from mfq.server.models import (
     ToolChoice,
     ToolDefinition,
 )
-from mfq.server.vision import MiniCPMO45VisionProcessor, VisionProcessingError
+from mfq.server.vision import (
+    MiniCPMO45VisionProcessor,
+    VisionProcessingError,
+    multimodal_processor_for_architecture,
+)
 
 
 class BackendError(RuntimeError):
@@ -132,6 +136,7 @@ class OpenAIChatBackend:
         self._vision_processor = MiniCPMO45VisionProcessor(
             avfoundation_library=avfoundation_video_library
         )
+        self._avfoundation_video_library = avfoundation_video_library
         self._local_tensor_files = local_tensor_files and os.name == "posix"
         self._runtime_metric_overrides: dict[str, dict[str, float]] = {}
 
@@ -153,11 +158,19 @@ class OpenAIChatBackend:
         if self._contains_media(backend_messages):
             if self._model_type is None:
                 await self.capabilities()
-            if self._model_type == "minicpmo":
+            processor = (
+                self._vision_processor
+                if self._model_type == "minicpmo"
+                else multimodal_processor_for_architecture(
+                    self._model_type or "",
+                    avfoundation_library=self._avfoundation_video_library,
+                )
+            )
+            if processor is not None:
                 processor_started = time.perf_counter()
                 try:
                     processed = await asyncio.to_thread(
-                        self._vision_processor.prepare_openai_messages,
+                        processor.prepare_openai_messages,
                         backend_messages,
                         use_binary_file=self._local_tensor_files,
                     )

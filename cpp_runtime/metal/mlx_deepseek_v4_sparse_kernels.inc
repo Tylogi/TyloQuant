@@ -1103,6 +1103,46 @@ constexpr const char* kPrefillPlanSource = R"MFQ_METAL(
     mask[linear] = valid ? half(0.0f) : half(-INFINITY);
 )MFQ_METAL";
 
+constexpr const char* kVisiblePrefillPlanSource = R"MFQ_METAL(
+    uint linear = thread_position_in_grid.x;
+    if (linear >= uint(TOTAL)) {
+        return;
+    }
+    uint slot = linear % uint(SELECTED);
+    uint row = linear / uint(SELECTED);
+    uint query = row % uint(M);
+    uint raw_length = uint(LOCAL_HISTORY + M);
+    int index = 0;
+    bool valid = false;
+    if (slot < uint(LOCAL_WIDTH)) {
+        int absolute_query = QUERY_OFFSET + int(query);
+        int base = QUERY_OFFSET - LOCAL_HISTORY;
+        int left_count = max(left[row], 0);
+        int right_count = max(right[row], 0);
+        int left_add = max(left_count - (WINDOW - 1), 0);
+        int start = max(base, absolute_query - (WINDOW - 1) - left_add);
+        int end = min(QUERY_OFFSET + M - 1, absolute_query + right_count);
+        int count = max(end - start + 1, 0);
+        if (int(slot) < count) {
+            index = start - base + int(slot);
+            valid = true;
+        }
+    } else if (slot < uint(LOCAL_WIDTH + TOPK_COUNT)) {
+        int pooled = topk[
+            row * uint(TOPK_COUNT) + slot - uint(LOCAL_WIDTH)];
+        uint visible = min(
+            uint(POOL_LEN),
+            (uint(QUERY_OFFSET) + query + 1u) / uint(RATIO)
+        );
+        if (pooled >= 0 && uint(pooled) < visible) {
+            index = int(raw_length) + pooled;
+            valid = true;
+        }
+    }
+    indices[linear] = index;
+    mask[linear] = valid ? half(0.0f) : half(-INFINITY);
+)MFQ_METAL";
+
 constexpr const char* kDecodePlanSource = R"MFQ_METAL(
     uint linear = thread_position_in_grid.x;
     if (linear >= uint(TOTAL)) {

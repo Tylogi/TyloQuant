@@ -1,5 +1,6 @@
 #include "mlx_deepseek_v4_causal_lm.h"
 #include "mlx_eval_timing.h"
+#include "mlx_mtp.h"
 
 #include "../json/nlohmann/json.hpp"
 
@@ -768,7 +769,7 @@ array MlxDeepseekV4Layer::forward(
     const array& token_ids,
     MlxDeepseekV4LayerState& state,
     int pos0) const {
-    return forward(hidden, token_ids, state, pos0, nullptr);
+    return forward(hidden, token_ids, state, pos0, nullptr, nullptr);
 }
 
 array MlxDeepseekV4Layer::forward(
@@ -777,6 +778,17 @@ array MlxDeepseekV4Layer::forward(
     MlxDeepseekV4LayerState& state,
     int pos0,
     MlxDeepseekV4SsdPrefetchedLayer* prefetched) const {
+    return forward(
+        hidden, token_ids, state, pos0, prefetched, nullptr);
+}
+
+array MlxDeepseekV4Layer::forward(
+    const array& hidden,
+    const array& token_ids,
+    MlxDeepseekV4LayerState& state,
+    int pos0,
+    MlxDeepseekV4SsdPrefetchedLayer* prefetched,
+    const MlxDeepseekV4ImageVisibility* visibility) const {
     auto source = floating_contiguous(hidden);
     const int expected_hidden =
         checked_int(config_.hidden, "hidden size");
@@ -819,7 +831,8 @@ array MlxDeepseekV4Layer::forward(
     branch = components_.attention(
         branch,
         state,
-        pos0);
+        pos0,
+        visibility);
     auto result = attention_hc.packed_metadata.has_value()
         ? deepseek_v4_hc_post_packed(
               branch,
@@ -956,18 +969,28 @@ MlxDeepseekV4CausalLm::load(
                 rope_compressed,
                 expert_offload));
     }
+    std::optional<MlxDeepseekV4Vision> vision;
+    if (config.has_vision()) {
+        vision.emplace(MlxDeepseekV4Vision::load(model, config));
+    }
+    auto embedding = MlxEmbedding::load(model, names.embedding);
+    auto output = MlxLinear::load(model, names.output);
+    auto dspark = MlxDeepseekV4DSpark::load_if_present(
+        model,
+        config,
+        embedding,
+        output,
+        context,
+        expert_offload,
+        static_cast<std::size_t>(config.n_layers));
     return MlxDeepseekV4CausalLm(
         config,
-        MlxEmbedding::load(
-            model,
-            names.embedding),
+        std::move(embedding),
         std::move(layers),
         load_float_array(
             model,
             names.output_norm),
-        MlxLinear::load(
-            model,
-            names.output),
+        std::move(output),
         MlxLinear::load(
             model,
             names.hc_head_fn),
@@ -979,7 +1002,10 @@ MlxDeepseekV4CausalLm::load(
             names.hc_head_scale),
         context,
         mlx::core::float16,
-        std::move(expert_offload));
+        std::move(expert_offload),
+        nullptr,
+        std::move(vision),
+        std::move(dspark));
 }
 
 MlxDeepseekV4CausalLm MlxDeepseekV4CausalLm::load_hf(
@@ -1001,12 +1027,29 @@ MlxDeepseekV4CausalLm MlxDeepseekV4CausalLm::load_hf(
     }
     auto checkpoint = std::make_shared<HfSafetensorStore>(model_root);
     MlxHfTensorStore model(std::move(checkpoint));
+    std::vector<std::string> expert_prefixes;
+    expert_prefixes.reserve(
+        static_cast<std::size_t>(config.n_layers + config.n_mtp_layers));
+    for (std::size_t layer = 0;
+         layer < static_cast<std::size_t>(config.n_layers);
+         ++layer) {
+        expert_prefixes.push_back("layers." + std::to_string(layer));
+    }
+    if (config.has_dspark()) {
+        for (std::size_t stage = 0;
+             stage < static_cast<std::size_t>(config.n_mtp_layers);
+             ++stage) {
+            expert_prefixes.push_back("mtp." + std::to_string(stage));
+        }
+    }
     auto expert_cache =
         std::make_shared<MlxDeepseekV4SsdExpertCache>(
             model_root,
+            std::move(expert_prefixes),
             expert_cache_bytes,
             io_workers,
-            prefill_overlap);
+            prefill_overlap,
+            static_cast<std::size_t>(config.n_experts));
     auto rope_base = deepseek_v4_yarn_tables(
         checked_int(config.qk_rope_head_dim, "rotary dimension"),
         context,
@@ -1031,19 +1074,38 @@ MlxDeepseekV4CausalLm MlxDeepseekV4CausalLm::load_hf(
             expert_cache));
     }
     const DeepseekV4TensorNames names;
+    std::optional<MlxDeepseekV4Vision> vision;
+    if (config.has_vision()) {
+        vision.emplace(MlxDeepseekV4Vision::load(model, config));
+    }
+    auto embedding = model.load_embedding(names.embedding);
+    auto output = model.load_linear(names.output);
+    std::optional<MlxDeepseekV4DSpark> dspark;
+    if (config.has_dspark()) {
+        dspark.emplace(MlxDeepseekV4DSpark::load_hf(
+            model,
+            config,
+            embedding,
+            output,
+            context,
+            expert_cache,
+            static_cast<std::size_t>(config.n_layers)));
+    }
     return MlxDeepseekV4CausalLm(
         config,
-        model.load_embedding(names.embedding),
+        std::move(embedding),
         std::move(layers),
         float32_contiguous(model.load_dense(names.output_norm)),
-        model.load_linear(names.output),
+        std::move(output),
         model.load_linear(names.hc_head_fn),
         float32_contiguous(model.load_dense(names.hc_head_base)),
         float32_contiguous(model.load_dense(names.hc_head_scale)),
         context,
         mlx::core::bfloat16,
         nullptr,
-        std::move(expert_cache));
+        std::move(expert_cache),
+        std::move(vision),
+        std::move(dspark));
 }
 
 MlxDeepseekV4CausalLm::MlxDeepseekV4CausalLm(
@@ -1060,7 +1122,9 @@ MlxDeepseekV4CausalLm::MlxDeepseekV4CausalLm(
     std::shared_ptr<MlxNintMoeOffloadCache>
         expert_offload,
     std::shared_ptr<MlxDeepseekV4SsdExpertCache>
-        ssd_expert_cache)
+        ssd_expert_cache,
+    std::optional<MlxDeepseekV4Vision> vision,
+    std::optional<MlxDeepseekV4DSpark> dspark)
     : config_(std::move(config)),
       embedding_(std::move(embedding)),
       layers_(std::move(layers)),
@@ -1080,6 +1144,8 @@ MlxDeepseekV4CausalLm::MlxDeepseekV4CausalLm(
           std::move(expert_offload)),
       ssd_expert_cache_(
           std::move(ssd_expert_cache)),
+      vision_(std::move(vision)),
+      dspark_(std::move(dspark)),
       max_context_(max_context),
       activation_dtype_(activation_dtype) {
     validate_components();
@@ -1112,6 +1178,8 @@ void MlxDeepseekV4CausalLm::validate_components() const {
         hc_head_fn_.output_size() != kConnections ||
         hc_head_base_.size() != kConnections ||
         hc_head_scale_.size() != 1 ||
+        vision_.has_value() != config_.has_vision() ||
+        (dspark_.has_value() && !config_.has_dspark()) ||
         layers_.size() !=
             static_cast<std::size_t>(layers)) {
         throw std::invalid_argument(
@@ -1280,7 +1348,10 @@ array MlxDeepseekV4CausalLm::head(
 array MlxDeepseekV4CausalLm::forward_chunk(
     const array& token_ids,
     int pos0,
-    bool full_logits) {
+    bool full_logits,
+    const std::optional<array>& input_embeddings,
+    const MlxDeepseekV4ImageVisibility* visibility,
+    array* dspark_hidden) {
     if (cache_batch_ == 0 ||
         states_.size() != layers_.size() ||
         token_ids.ndim() != 2 ||
@@ -1294,10 +1365,13 @@ array MlxDeepseekV4CausalLm::forward_chunk(
     const int tokens = token_ids.shape(1);
     const int hidden =
         checked_int(config_.hidden, "hidden size");
-    auto embedded =
-        embedding_(
-            token_ids,
-            activation_dtype_);
+    auto embedded = input_embeddings.has_value()
+        ? *input_embeddings
+        : embedding_(token_ids, activation_dtype_);
+    if (embedded.shape() != Shape{batch, tokens, hidden}) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 input embedding geometry mismatch");
+    }
     auto streams = mlx::core::broadcast_to(
         mlx::core::expand_dims(
             embedded,
@@ -1310,6 +1384,28 @@ array MlxDeepseekV4CausalLm::forward_chunk(
         });
     auto hidden_values =
         mlx::core::contiguous(streams);
+    std::vector<std::optional<array>> target_hiddens;
+    if (dspark_hidden != nullptr) {
+        if (!dspark_.has_value() ||
+            config_.dspark_target_layer_ids.empty()) {
+            throw std::runtime_error(
+                "DeepSeek-V4 DSpark hidden capture is unavailable");
+        }
+        target_hiddens.resize(
+            config_.dspark_target_layer_ids.size());
+    }
+    const auto capture_target = [&](std::size_t layer) {
+        if (dspark_hidden == nullptr) return;
+        for (std::size_t target = 0;
+             target < config_.dspark_target_layer_ids.size();
+             ++target) {
+            if (config_.dspark_target_layer_ids[target] ==
+                static_cast<std::int64_t>(layer)) {
+                target_hiddens[target] = mlx::core::mean(
+                    hidden_values, 2);
+            }
+        }
+    };
     detail::profile_eval(
         "model.embedding_broadcast",
         hidden_values);
@@ -1327,7 +1423,8 @@ array MlxDeepseekV4CausalLm::forward_chunk(
     }
     const bool grouped_route_transaction =
         !bounded_prefill && ssd_expert_cache_ &&
-        ssd_route_transactions_enabled();
+        ssd_route_transactions_enabled() &&
+        dspark_hidden == nullptr;
     if (grouped_route_transaction) {
         const bool force_transactions = force_ssd_route_transactions();
         const auto group_layers = static_cast<std::size_t>(
@@ -1432,7 +1529,9 @@ array MlxDeepseekV4CausalLm::forward_chunk(
                 token_ids,
                 states_[index],
                 pos0,
-                prefetched);
+                prefetched,
+                visibility);
+            capture_target(index);
             if (bounded_prefill) {
                 // Hidden and cache branches share the layer projections.
                 std::vector<array> layer_outputs{hidden_values};
@@ -1450,6 +1549,20 @@ array MlxDeepseekV4CausalLm::forward_chunk(
                 }
             }
         }
+    }
+    if (dspark_hidden != nullptr) {
+        std::vector<array> captured;
+        captured.reserve(target_hiddens.size());
+        for (auto& value : target_hiddens) {
+            if (!value.has_value()) {
+                throw std::runtime_error(
+                    "DeepSeek-V4 DSpark target layer was not captured");
+            }
+            captured.push_back(std::move(*value));
+        }
+        *dspark_hidden = captured.size() == 1
+            ? std::move(captured.front())
+            : mlx::core::concatenate(std::move(captured), -1);
     }
     auto head_input = full_logits
         ? hidden_values
@@ -1807,6 +1920,52 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
         prefill_callback,
     std::optional<std::size_t> stable_prefix_tokens,
     const MfqTokenConstraintPtr& token_constraint) {
+    return generate_impl(
+        prompt,
+        nullptr,
+        sampling,
+        max_tokens,
+        callback,
+        eos_token_ids,
+        chunk_size,
+        prefill_callback,
+        stable_prefix_tokens,
+        token_constraint);
+}
+
+std::int32_t MlxDeepseekV4CausalLm::generate_multimodal(
+    const std::vector<std::int64_t>& prompt,
+    const std::vector<MlxDeepseekV4ImageInput>& images,
+    const MlxSamplingParams& sampling,
+    std::int32_t max_tokens,
+    const MlxDeepseekV4TokenCallback& callback,
+    const std::optional<std::vector<std::int64_t>>& eos_token_ids,
+    const std::function<void(std::size_t, double)>& prefill_callback,
+    const MfqTokenConstraintPtr& token_constraint) {
+    return generate_impl(
+        prompt,
+        &images,
+        sampling,
+        max_tokens,
+        callback,
+        eos_token_ids,
+        std::max(1, static_cast<int>(prompt.size())),
+        prefill_callback,
+        std::nullopt,
+        token_constraint);
+}
+
+std::int32_t MlxDeepseekV4CausalLm::generate_impl(
+    const std::vector<std::int64_t>& prompt,
+    const std::vector<MlxDeepseekV4ImageInput>* images,
+    const MlxSamplingParams& sampling,
+    std::int32_t max_tokens,
+    const MlxDeepseekV4TokenCallback& callback,
+    const std::optional<std::vector<std::int64_t>>& eos_token_ids,
+    int chunk_size,
+    const std::function<void(std::size_t, double)>& prefill_callback,
+    std::optional<std::size_t> stable_prefix_tokens,
+    const MfqTokenConstraintPtr& token_constraint) {
     if (prompt.empty()) {
         throw std::invalid_argument(
             "DeepSeek-V4 generation prompt cannot be empty");
@@ -1832,15 +1991,27 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
         throw std::invalid_argument(
             "DeepSeek-V4 generation exceeds max_context");
     }
+    const bool multimodal = images != nullptr;
+    if (multimodal && (!vision_.has_value() || images->empty())) {
+        throw std::invalid_argument(
+            "DeepSeek-V4 multimodal generation requires image inputs");
+    }
     std::vector<std::int32_t> prompt_values;
+    std::vector<std::int32_t> count_values;
     prompt_values.reserve(prompt.size());
+    count_values.reserve(prompt.size());
     for (const auto token : prompt) {
-        if (token < 0 || token >= vocab) {
+        if (token < 0 ||
+            (!multimodal && token >= vocab) ||
+            (multimodal && token >= vocab + 5)) {
             throw std::invalid_argument(
                 "DeepSeek-V4 generation prompt token is out of range");
         }
         prompt_values.push_back(
             static_cast<std::int32_t>(token));
+        if (token < vocab) {
+            count_values.push_back(static_cast<std::int32_t>(token));
+        }
     }
     const auto& eos = eos_token_ids.has_value()
         ? *eos_token_ids
@@ -1849,6 +2020,10 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
     if (max_tokens == 0) {
         return 0;
     }
+    const bool dspark_candidate =
+        dspark_.has_value() && sampling.greedy() &&
+        !sampling.has_penalties() && !token_constraint &&
+        max_tokens > 1;
 
     const int prompt_count =
         static_cast<int>(
@@ -1857,15 +2032,23 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
         prompt_values.begin(),
         Shape{1, prompt_count},
         mlx::core::int32);
-    auto counts = sample_token_counts_add(
-        mlx::core::zeros(
-            Shape{vocab},
-            mlx::core::int32),
-        prompt_ids);
+    auto counts = mlx::core::zeros(
+        Shape{vocab},
+        mlx::core::int32);
+    if (!count_values.empty()) {
+        counts = sample_token_counts_add(
+            counts,
+            array(
+                count_values.begin(),
+                Shape{1, static_cast<int>(count_values.size())},
+                mlx::core::int32));
+    }
     const std::size_t requested_stable_count = stable_prefix_tokens
         ? std::min(*stable_prefix_tokens, prompt.size())
         : 0;
-    const bool retain_stable_prefix = requested_stable_count > 0;
+    const bool retain_stable_prefix =
+        !multimodal && !dspark_candidate &&
+        requested_stable_count > 0;
     const std::size_t stable_count = retain_stable_prefix
         ? requested_stable_count
         : 0;
@@ -1968,6 +2151,14 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
         cache_batch_,
         stable_cache_tokens_);
 
+    const bool dspark_active =
+        dspark_candidate && reused_tokens == 0 && stable_count == 0;
+    std::optional<MlxDeepseekV4DSparkState> dspark_state;
+    if (dspark_active) {
+        dspark_state.emplace(
+            dspark_->make_state(1, activation_dtype_));
+    }
+
     const std::size_t evaluated_prompt_tokens =
         prompt.size() - reused_tokens;
     double prefill_evaluation_ms = 0.0;
@@ -1986,19 +2177,79 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
                 ? &prefill_evaluation_ms
                 : nullptr);
         const auto prefill_range = [&](std::size_t begin, std::size_t end) {
-            auto ids = mlx::core::slice(
-                prompt_ids,
-                Shape{0, static_cast<int>(begin)},
-                Shape{1, static_cast<int>(end)});
-            return prefill_impl(
-                ids,
-                chunk_size,
-                false,
-                false);
+            if (!dspark_active) {
+                auto ids = mlx::core::slice(
+                    prompt_ids,
+                    Shape{0, static_cast<int>(begin)},
+                    Shape{1, static_cast<int>(end)});
+                return prefill_impl(
+                    ids,
+                    chunk_size,
+                    false,
+                    false);
+            }
+            std::optional<array> last;
+            for (std::size_t start = begin;
+                 start < end;
+                 start += static_cast<std::size_t>(chunk_size)) {
+                const auto stop = std::min(
+                    end,
+                    start + static_cast<std::size_t>(chunk_size));
+                auto ids = mlx::core::slice(
+                    prompt_ids,
+                    Shape{0, static_cast<int>(start)},
+                    Shape{1, static_cast<int>(stop)});
+                array target_hidden(0.0f);
+                const int position = cache_position_;
+                auto chunk_logits = forward_chunk(
+                    ids,
+                    position,
+                    false,
+                    std::nullopt,
+                    nullptr,
+                    &target_hidden);
+                dspark_->append_context(
+                    target_hidden, *dspark_state, position);
+                cache_position_ += static_cast<int>(stop - start);
+                last = last_token_logits(chunk_logits, vocab);
+            }
+            if (!last) {
+                throw std::runtime_error(
+                    "DeepSeek-V4 DSpark prefill range is empty");
+            }
+            return std::move(*last);
         };
 
         std::optional<array> stable_logits;
         array value = [&]() {
+            if (multimodal) {
+                reset_cache(1);
+                for (const auto& state : states_) {
+                    materialize_state(state);
+                }
+                auto embeddings = vision_->embed_prompt(
+                    prompt, *images, embedding_, activation_dtype_);
+                auto visibility = deepseek_v4_image_visibility(
+                    prompt,
+                    config_.vocab,
+                    checked_int(
+                        config_.vision_max_n_token,
+                        "maximum image tokens"));
+                array target_hidden(0.0f);
+                auto output = forward_chunk(
+                    prompt_ids,
+                    0,
+                    false,
+                    embeddings,
+                    &visibility,
+                    dspark_active ? &target_hidden : nullptr);
+                if (dspark_active) {
+                    dspark_->append_context(
+                        target_hidden, *dspark_state, 0);
+                }
+                cache_position_ = prompt_count;
+                return output;
+            }
             if (!retain_stable_prefix) {
                 return prefill_range(0, prompt.size());
             }
@@ -2077,6 +2328,158 @@ std::int32_t MlxDeepseekV4CausalLm::generate(
             prefill_evaluation_ms);
     }
     MlxSampler sampler(sampling);
+
+    if (dspark_active) {
+        if (!dspark_state.has_value()) {
+            throw std::runtime_error(
+                "DeepSeek-V4 DSpark state was not initialized");
+        }
+        std::int32_t generated = 0;
+        const auto greedy_token = [&](const array& value) {
+            auto sampled = sample_greedy(value);
+            sampled.eval();
+            const auto token = sampled.data<std::int32_t>()[0];
+            if (token < 0 || token >= vocab) {
+                throw std::runtime_error(
+                    "DeepSeek-V4 DSpark sampler returned an invalid token");
+            }
+            return token;
+        };
+        const auto emit = [&](std::int32_t token) {
+            ++generated;
+            const bool delivered = !callback || callback(token);
+            return delivered && !contains_token(eos, token) &&
+                generated < max_tokens;
+        };
+        auto current_logits = logits;
+        while (generated < max_tokens) {
+            const auto anchor = greedy_token(current_logits);
+            if (!emit(anchor)) {
+                return generated;
+            }
+
+            const int remaining = max_tokens - generated;
+            const int cache_available = max_context_ - cache_position_;
+            const int width = std::min({
+                dspark_->block_size(),
+                remaining - 1,
+                cache_available - 2,
+            });
+            if (width <= 0) {
+                const array anchor_ids(
+                    {anchor}, Shape{1, 1}, mlx::core::int32);
+                array target_hidden(0.0f);
+                auto advanced = forward_chunk(
+                    anchor_ids,
+                    cache_position_,
+                    true,
+                    std::nullopt,
+                    nullptr,
+                    &target_hidden);
+                dspark_->append_context(
+                    target_hidden,
+                    *dspark_state,
+                    cache_position_);
+                ++cache_position_;
+                current_logits = last_token_logits(advanced, vocab);
+                continue;
+            }
+
+            const array anchor_ids(
+                {anchor}, Shape{1, 1}, mlx::core::int32);
+            auto proposal = dspark_->draft_greedy(
+                anchor_ids, *dspark_state, width);
+            proposal.tokens.eval();
+            std::vector<std::int32_t> drafts(
+                proposal.tokens.data<std::int32_t>(),
+                proposal.tokens.data<std::int32_t>() + width);
+            for (const auto token : drafts) {
+                if (token < 0 || token >= vocab) {
+                    throw std::runtime_error(
+                        "DeepSeek-V4 DSpark produced an invalid draft token");
+                }
+            }
+
+            std::vector<MlxDeepseekV4LayerState> checkpoint;
+            checkpoint.reserve(states_.size());
+            for (const auto& state : states_) {
+                checkpoint.push_back(state.snapshot());
+                materialize_state(checkpoint.back());
+            }
+            const int checkpoint_position = cache_position_;
+            std::vector<std::int32_t> verify_values;
+            verify_values.reserve(static_cast<std::size_t>(width + 1));
+            verify_values.push_back(anchor);
+            verify_values.insert(
+                verify_values.end(), drafts.begin(), drafts.end());
+            const array verify_ids(
+                verify_values.begin(),
+                Shape{1, width + 1},
+                mlx::core::int32);
+            auto verified_logits = forward_chunk(
+                verify_ids,
+                checkpoint_position,
+                true);
+            cache_position_ += width + 1;
+            auto target_tokens = sample_greedy(
+                mlx::core::reshape(
+                    verified_logits,
+                    Shape{width + 1, vocab}));
+            target_tokens.eval();
+            std::vector<std::int32_t> targets(
+                target_tokens.data<std::int32_t>(),
+                target_tokens.data<std::int32_t>() + width + 1);
+            for (const auto token : targets) {
+                if (token < 0 || token >= vocab) {
+                    throw std::runtime_error(
+                        "DeepSeek-V4 DSpark verification returned an invalid token");
+                }
+            }
+            const auto verification = verify_greedy_mtp(drafts, targets);
+
+            for (std::size_t index = 0; index < states_.size(); ++index) {
+                states_[index].restore_snapshot(
+                    std::move(checkpoint[index]));
+                materialize_state(states_[index]);
+            }
+            cache_position_ = checkpoint_position;
+
+            std::vector<std::int32_t> committed{anchor};
+            for (std::size_t index = 0;
+                 index < verification.accepted_drafts;
+                 ++index) {
+                const auto token = drafts[index];
+                if (!emit(token)) {
+                    return generated;
+                }
+                committed.push_back(token);
+            }
+            if (!emit(verification.next_token)) {
+                return generated;
+            }
+            committed.push_back(verification.next_token);
+
+            const array committed_ids(
+                committed.begin(),
+                Shape{1, static_cast<int>(committed.size())},
+                mlx::core::int32);
+            array committed_hidden(0.0f);
+            auto replayed = forward_chunk(
+                committed_ids,
+                cache_position_,
+                true,
+                std::nullopt,
+                nullptr,
+                &committed_hidden);
+            dspark_->append_context(
+                committed_hidden,
+                *dspark_state,
+                cache_position_);
+            cache_position_ += static_cast<int>(committed.size());
+            current_logits = last_token_logits(replayed, vocab);
+        }
+        return generated;
+    }
 
     std::int32_t generated = 0;
     while (generated < max_tokens) {

@@ -5,9 +5,11 @@
 #include "mlx_hf_tensor.h"
 #include "mlx_tensor.h"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <utility>
+#include <vector>
 
 #include <mlx/mlx.h>
 
@@ -31,6 +33,12 @@ mlx::core::array deepseek_v4_rope_adjacent(
 mlx::core::array deepseek_v4_unweighted_rms(
     const mlx::core::array& value,
     float eps);
+
+// Preserve the released QAT graph's dynamic MXFP8 simulation on non-RoPE
+// KV channels.  Shared by the main decoder and DSpark attention.
+mlx::core::array deepseek_v4_kv_fp8_sim_prefix(
+    const mlx::core::array& input,
+    int rotary_dimension);
 
 class MlxDeepseekV4PoolState {
 public:
@@ -218,6 +226,20 @@ struct MlxDeepseekV4AttentionComponents {
     std::optional<mlx::core::array> index_norm;
 };
 
+struct MlxDeepseekV4ImageVisibility {
+    mlx::core::array left;
+    mlx::core::array right;
+    int max_image_tokens = 0;
+};
+
+// Match the released get_image_visible() contract.  Alignment pads before
+// IMAGE_START are not visual; visibility begins at IMAGE_START and includes
+// IMAGE_END.  Sentinel IDs are vocab_size + {0..4}.
+MlxDeepseekV4ImageVisibility deepseek_v4_image_visibility(
+    const std::vector<std::int64_t>& token_ids,
+    std::int64_t vocab_size,
+    int max_image_tokens);
+
 class MlxDeepseekV4Attention {
 public:
     static MlxDeepseekV4Attention load(
@@ -264,6 +286,12 @@ public:
         const mlx::core::array& input,
         MlxDeepseekV4LayerState& state,
         int pos0) const;
+
+    mlx::core::array operator()(
+        const mlx::core::array& input,
+        MlxDeepseekV4LayerState& state,
+        int pos0,
+        const MlxDeepseekV4ImageVisibility* visibility) const;
 
     int ratio() const noexcept;
     int layer() const noexcept;

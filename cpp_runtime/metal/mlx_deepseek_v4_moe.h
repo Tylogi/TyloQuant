@@ -54,6 +54,28 @@ public:
         const std::optional<mlx::core::array>& available =
             std::nullopt);
 
+    // Load a complete eager MoE stored below an arbitrary namespace such as
+    // ``mtp.0``.  This is the shared small-M operator used by DSpark stages;
+    // routed experts retain their packed MFQ representation.
+    static MlxDeepseekV4Moe load_named(
+        const MfqContainer& model,
+        const DeepseekV4Config& config,
+        const std::string& prefix,
+        const std::optional<mlx::core::array>& available =
+            std::nullopt,
+        std::shared_ptr<MlxNintMoeOffloadCache> offload =
+            nullptr,
+        std::size_t expert_cache_layer = 0);
+
+    static MlxDeepseekV4Moe load_named(
+        const MlxHfTensorStore& model,
+        const DeepseekV4Config& config,
+        const std::string& prefix,
+        std::shared_ptr<MlxDeepseekV4SsdExpertCache> expert_cache,
+        std::size_t expert_cache_layer,
+        const std::optional<mlx::core::array>& available =
+            std::nullopt);
+
     MlxDeepseekV4Moe(
         DeepseekV4Config config,
         MlxLinear router,
@@ -67,6 +89,8 @@ public:
         std::optional<mlx::core::array> token_experts =
             std::nullopt,
         std::optional<mlx::core::array> available =
+            std::nullopt,
+        std::optional<mlx::core::array> visual_router_bias =
             std::nullopt);
 
     MlxDeepseekV4MoeResult forward_with_routing(
@@ -130,7 +154,8 @@ private:
         std::string streamed_down_name,
         std::optional<mlx::core::array> router_bias,
         std::optional<mlx::core::array> token_experts,
-        std::optional<mlx::core::array> available);
+        std::optional<mlx::core::array> available,
+        std::optional<mlx::core::array> visual_router_bias);
 
     std::vector<mlx::core::array> project_shared(
         const mlx::core::array& input,
@@ -161,6 +186,7 @@ private:
     bool fused_shared_swiglu_ = true;
     bool fused_dense_router_ = true;
     std::optional<mlx::core::array> router_bias_;
+    std::optional<mlx::core::array> visual_router_bias_;
     std::optional<mlx::core::array> token_experts_;
     mlx::core::array available_;
     int available_count_ = 0;

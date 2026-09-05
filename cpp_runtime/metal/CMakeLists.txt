@@ -157,9 +157,11 @@ add_library(mfq-metal-runtime STATIC
     mlx_hf_tensor.cpp
     mlx_deepseek_v4_attention.cpp
     mlx_deepseek_v4_causal_lm.cpp
+    mlx_deepseek_v4_dspark.cpp
     mlx_deepseek_v4_hc.cpp
     mlx_deepseek_v4_moe.cpp
     mlx_deepseek_v4_sparse.cpp
+    mlx_deepseek_v4_vision.cpp
     mlx_moe.cpp
     mlx_moe_ops.cpp
     mlx_mx.cpp
@@ -170,6 +172,8 @@ add_library(mfq-metal-runtime STATIC
     mlx_vq.cpp
     mlx_linear_attention.cpp
     mlx_minicpmo45.cpp
+    mlx_multimodal.cpp
+    mlx_mtp.cpp
     mlx_qwen35_full_attention.cpp
     mlx_qwen35_linear_attention.cpp
     mlx_qwen35_causal_lm.cpp
@@ -544,6 +548,20 @@ set_target_properties(
     BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
 )
 
+add_executable(mfq-metal-deepseek-v4-moe-smallm-benchmark
+    mlx_deepseek_v4_moe_smallm_benchmark.cpp
+)
+target_link_libraries(
+    mfq-metal-deepseek-v4-moe-smallm-benchmark PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(
+    mfq-metal-deepseek-v4-moe-smallm-benchmark PRIVATE cxx_std_20)
+set_target_properties(
+    mfq-metal-deepseek-v4-moe-smallm-benchmark PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+
 add_executable(mfq-metal-ssd-expert-arena-test
     mlx_ssd_expert_arena_test.cpp
 )
@@ -674,6 +692,50 @@ set_target_properties(
 add_test(
     NAME mfq-metal-deepseek-v4-moe-test
     COMMAND mfq-metal-deepseek-v4-moe-test
+)
+
+add_executable(mfq-metal-mtp-test mlx_mtp_test.cpp)
+target_link_libraries(mfq-metal-mtp-test PRIVATE mfq-metal-runtime)
+target_compile_features(mfq-metal-mtp-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-mtp-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+add_test(NAME mfq-metal-mtp-test COMMAND mfq-metal-mtp-test)
+
+add_executable(mfq-metal-deepseek-v4-dspark-test
+    mlx_deepseek_v4_dspark_test.cpp
+)
+target_link_libraries(
+    mfq-metal-deepseek-v4-dspark-test PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(
+    mfq-metal-deepseek-v4-dspark-test PRIVATE cxx_std_20)
+set_target_properties(
+    mfq-metal-deepseek-v4-dspark-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+add_test(
+    NAME mfq-metal-deepseek-v4-dspark-test
+    COMMAND mfq-metal-deepseek-v4-dspark-test
+)
+
+add_executable(mfq-metal-deepseek-v4-vision-test
+    mlx_deepseek_v4_vision_test.cpp
+)
+target_link_libraries(
+    mfq-metal-deepseek-v4-vision-test PRIVATE
+    mfq-metal-runtime
+)
+target_compile_features(
+    mfq-metal-deepseek-v4-vision-test PRIVATE cxx_std_20)
+set_target_properties(
+    mfq-metal-deepseek-v4-vision-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+add_test(
+    NAME mfq-metal-deepseek-v4-vision-test
+    COMMAND mfq-metal-deepseek-v4-vision-test
 )
 
 add_executable(mfq-metal-moe-ops-test

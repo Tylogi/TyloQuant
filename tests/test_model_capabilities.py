@@ -46,6 +46,19 @@ def test_text_architecture_families_do_not_advertise_media() -> None:
         )
 
 
+def test_deepseek_v4_vision_alias_advertises_only_image_input() -> None:
+    profile = capabilities_for_architecture("deepseek_v4_vision")
+    assert profile.architecture_family == "deepseek_v4"
+    assert profile.features.model_dump() == {
+        "text": True,
+        "image_input": True,
+        "video_input": False,
+        "audio_input": False,
+        "audio_output": False,
+        "full_duplex": False,
+    }
+
+
 def test_unknown_architecture_keeps_text_and_a_stable_family_key() -> None:
     profile = capabilities_for_architecture("Future Model/2")
     assert profile.architecture_family == "future_model_2"
@@ -57,6 +70,7 @@ def test_cpp_server_publishes_the_same_architecture_capability_contract() -> Non
     assert "architecture_capability_profile(" in SERVER
     assert 'identity == "minicpmo"' in SERVER
     assert 'identity == "deepseek_v4"' in SERVER
+    assert 'identity == "deepseek_v4_vision"' in SERVER
     assert 'identity == "glm_moe_dsa"' in SERVER
     for feature in (
         "text",

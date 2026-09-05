@@ -68,19 +68,35 @@ struct MfqPromptCachePlan {
     size_t stable_prefix_tokens = 0;
 };
 
-struct MfqVisionInput {
+enum class MfqMultimodalProcessor {
+    minicpmo,
+    deepseek_v4,
+};
+
+// Architecture-neutral named media payload.  Family-specific fields are
+// validated by mfqd before this reaches a runtime; prompt-position dependent
+// metadata (image_bounds and image_permutation) is produced after tokenizing.
+struct MfqMultimodalInput {
+    MfqMultimodalProcessor processor = MfqMultimodalProcessor::minicpmo;
     std::vector<float> pixel_values;
     std::vector<int64_t> pixel_shape;
     std::vector<uint8_t> patch_mask;
     std::vector<int64_t> patch_mask_shape;
     std::vector<int32_t> target_sizes;
     std::vector<int64_t> target_sizes_shape;
+    std::vector<int32_t> vision_grid;
+    std::vector<int64_t> vision_grid_shape;
     std::vector<int64_t> image_bounds;
+    std::vector<int64_t> image_permutation;
+    std::vector<int64_t> image_permutation_offsets;
     std::vector<float> audio_features;
     std::vector<int64_t> audio_features_shape;
     std::vector<int64_t> audio_lengths;
     std::vector<int64_t> audio_bounds;
 };
+
+// Source compatibility for out-of-tree MiniCPM-o integrations.
+using MfqVisionInput = MfqMultimodalInput;
 
 struct MfqServerConfig {
     std::string host = "127.0.0.1";
@@ -192,7 +208,7 @@ using MfqGenerateFn = std::function<int32_t(
     const MfqTokenConstraintPtr & token_constraint)>;
 using MfqMultimodalGenerateFn = std::function<int32_t(
     const std::vector<int64_t> & prompt,
-    const MfqVisionInput & vision,
+    const MfqMultimodalInput & media,
     const MfqSamplingParams & sampling,
     const MfqTokenCallback & on_token,
     const MfqPrefillCallback & on_prefill,
