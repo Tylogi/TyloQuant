@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="TyloQuant MFQ">
-  <rect x="1" y="1" width="62" height="62" rx="15" fill="#F4F4F0"/>
-  <rect x="1.5" y="1.5" width="61" height="61" rx="14.5" fill="none" stroke="#DEDFDA"/>
-  <path d="M16 44V20L32 37 48 20V44" fill="none" stroke="#202223" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="48" cy="44" r="3" fill="#B87343"/>
+  <rect x="1" y="1" width="62" height="62" rx="17" fill="#0E1010"/>
+  <rect x="1.5" y="1.5" width="61" height="61" rx="16.5" fill="none" stroke="#2D3030"/>
+  <path d="M16 44V20L32 37 48 20V44" fill="none" stroke="#F1F2EF" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="48" cy="44" r="3" fill="#67D5D7"/>
 </svg>

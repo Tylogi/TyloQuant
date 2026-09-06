@@ -76,13 +76,13 @@ def test_studio_supports_local_and_remote_server_connections_with_voice_controls
     assert "/api/v1/models/directories/register" in RUST
     assert ".mfq-files.json" not in RUST
     assert "canUseNativeModelPicker" in APP
-    assert 'tr("选择包含 MFQ 模型的文件夹", "Choose a folder containing MFQ models")' in APP
-    assert 'tr("从服务器文件夹加载模型，或连接已有模型服务。", "Load a model from a server folder or connect to an existing model server.")' in APP
+    assert 'tr("添加模型", "Add model")' in APP
+    assert 'tr("浏览 MFQ Server 所在设备上的文件夹。", "Browse folders on the MFQ Server host.")' in APP
     assert 'tr("选择模型文件夹", "Choose model folder")' in APP
     assert "访达" not in APP
     assert "Finder" not in APP
-    assert 'className="open-local-model"' in APP
-    assert APP.count("chooseModelDirectory()") >= 4
+    assert 'className="open-model-primary"' in APP
+    assert APP.count("chooseModelDirectory()") >= 3
     assert "registerCurrentModelDirectory" in APP
     assert "modelDirectoryPath" in APP
     assert "jumpToModelDirectory" in APP
@@ -106,7 +106,8 @@ def test_voice_component_prompt_requires_an_explicit_full_duplex_selection():
 def test_studio_handles_a_running_server_without_a_loaded_model():
     assert 'useState("")' in APP
     assert 'tr("尚未加载模型", "No model loaded")' in APP
-    assert 'disabled={!model}' in APP
+    assert "if (!selectedModel) return;" in APP
+    assert 'runtime?.model || "MFQ Server"' in APP
     assert 'statusResult.status === "fulfilled" ? statusResult.value : null' in APP
     assert "setRuntime(status)" in APP
     assert "Promise.allSettled([" in APP
@@ -131,7 +132,7 @@ def test_studio_uses_native_confirmation_dialogs_for_destructive_actions():
     assert "studio_confirm," in RUST
     assert 'tauri.invoke<boolean>("studio_confirm", { message })' in STUDIO_BRIDGE
     assert "window.confirm" not in APP
-    assert APP.count("await studioConfirm(") >= 7
+    assert APP.count("await studioConfirm(") >= 6
 
 
 def test_studio_has_a_render_error_boundary_instead_of_a_blank_window():
@@ -203,45 +204,46 @@ def test_studio_uses_the_model_bound_duplex_system_prompt():
     assert "submitText(text, realtimeSessionConfig(active.id))" in APP
 
 
-def test_studio_resolves_model_global_and_role_inference_settings_in_order():
+def test_studio_resolves_model_and_global_inference_settings_without_roles():
     assert "inheritModelDefaults: true" in APP
-    assert "function roleGenerationSettings" in APP
-    assert "if (role.inheritGlobalSettings)" in APP
     assert "const resolvedGlobalSettings = useMemo" in APP
-    assert "const effectiveSettings = useMemo" in APP
-    assert "roleGenerationSettings(resolvedGlobalSettings, activeRolePreset)" in APP
+    assert "const effectiveSettings = resolvedGlobalSettings" in APP
+    assert "function roleGenerationSettings" not in APP
+    assert "roleEditor" not in APP
+    assert "assistant_id" not in APP
+    assert "api.createSession(selectedModel, mode)" in APP
     assert "sampling: samplingParams()" in APP
     assert "max_tokens: effectiveSettings.maxTokens" in APP
-    assert "system_prompt: [effectiveSettings.systemPrompt.trim(), LANGUAGE_CONSISTENCY_PROMPT]" in APP
+    assert "const effectiveSystemPrompt = useMemo" in APP
+    assert "system_prompt: effectiveSystemPrompt" in APP
+    assert "systemPrompt: effectiveSystemPrompt" in APP
+    assert "Never insert Chinese words into an English answer" in APP
     assert "setSettings((current) => ({ ...current, ...rolePreset.settings" not in APP
 
 
-def test_studio_defaults_global_and_role_editors_to_inherited_parameters():
-    assert 'className="settings-inherited-fields" disabled={settingsDraft.inheritModelDefaults}' in APP
+def test_studio_defaults_global_settings_to_inherited_model_parameters():
+    assert 'className="settings-page-inherited" disabled={settingsDraft.inheritModelDefaults}' in APP
     assert 'checked={settingsDraft.inheritModelDefaults}' in APP
-    assert 'inheritGlobalSettings: preset?.inheritGlobalSettings ?? true' not in APP
-    assert "const inheritGlobalSettings = preset?.inheritGlobalSettings ?? true" in APP
-    assert 'className="role-inherited-fields" disabled={roleEditor.inheritGlobalSettings}' in APP
-    assert 'checked={roleEditor.inheritGlobalSettings}' in APP
     assert "inherit_global_settings: preset.inheritGlobalSettings" in APP
     assert 'typeof raw.inheritGlobalSettings === "boolean" ? raw.inheritGlobalSettings : true' in APP
     assert 'typeof preset.metadata?.inherit_global_settings === "boolean"' in APP
-    assert ".settings-inherited-fields:disabled section" in STYLES
-    assert ".role-inherited-fields:disabled" in STYLES
+    assert ".settings-page-inherited:disabled" in STYLES
+    assert 'className="role-inherited-fields"' not in APP
 
 
 def test_studio_exposes_theme_selection_without_using_sidebar_status_space():
-    assert 'className="theme-switcher"' in APP
-    assert 'onClick={() => setUiTheme("system")}' in APP
-    assert 'onClick={() => setUiTheme("light")}' in APP
-    assert 'onClick={() => setUiTheme("dark")}' in APP
+    assert 'settingsDraft.theme' in APP
+    assert '<option value="system">{tr("跟随系统", "System")}</option>' in APP
+    assert '<option value="light">{tr("浅色", "Light")}</option>' in APP
+    assert '<option value="dark">{tr("深色", "Dark")}</option>' in APP
+    assert 'className="theme-switcher"' not in APP
     assert "connection-card" not in APP
     assert ".connection-card" not in STYLES
 
 
 def test_studio_exposes_omlx_style_runtime_lifecycle_controls():
     assert 'className="runtime-hero"' in APP
-    assert 'tr("工作区", "Workspace")' in APP
+    assert 'tr("推理", "Inference")' in APP
     assert "MFQ Runtime" in APP
     assert 'tr("固定到内存", "Pin in memory")' in APP
     assert 'tr("空闲卸载", "Idle unload")' in APP
@@ -310,9 +312,28 @@ def test_closing_a_full_duplex_microphone_stops_instead_of_forcing_speech():
     assert "this.stopPlayback();" in REALTIME_AUDIO
 
 
-def test_dashboard_and_lab_use_subpages_and_reorderable_collapsible_panels():
-    assert 'type DashboardPage = "overview" | "cache" | "models" | "connections"' in APP
+def test_dashboard_uses_hivellm_style_static_backend_console_components():
+    assert 'type DashboardPage = "overview" | "models" | "connections" | "cache" | "logs" | "settings"' in APP
     assert 'type LabPage = "models" | "evaluations" | "quantization"' in APP
+    assert "function ScreenHeader" in APP
+    assert "function SectionLabel" in APP
+    assert "function TMPanel" in APP
+    assert "function MetricTile" in APP
+    assert "function SettingRow" in APP
+    assert "function UsageBar" in APP
+    assert "function EmptyPanel" in APP
+    assert '<details className="sidebar-more"' not in APP
+    assert 'className="overview-memory-panel"' in APP
+    assert 'className="overview-footer-grid"' in APP
+    assert 'label={tr("解码", "Decode")}' in APP and 'icon="waveform"' in APP
+    assert 'label={tr("首字延迟", "TTFT")}' in APP and 'icon="clock"' in APP
+    assert 'dashboardPage === "settings" && settingsPage' in APP
+    assert 'className="settings-panel"' not in APP
+    assert 'className="drawer-scrim"' not in APP
+    assert '<Icon name="gauge" />{tr("概览", "Overview")}' in APP
+    assert '<Icon name="server-rack" />{tr("服务器", "Server")}' in APP
+    assert '<Icon name="memory" />{tr("资源", "Resources")}' in APP
+    assert "const STATIC_PANEL_LAYOUT = true" in APP
     assert "function PanelDeck" in APP
     assert "PANEL_LAYOUT_KEY" in APP
     assert "PANEL_COLLAPSED_KEY" in APP
@@ -335,10 +356,8 @@ def test_dashboard_and_lab_use_subpages_and_reorderable_collapsible_panels():
     assert "width: placement?.width" in APP
     assert ".panel-item-clipped" in STYLES
     assert "@container (max-width: 620px)" in STYLES
-    assert 'aria-label={tr("重置当前布局", "Reset current layout")}' in APP
-    assert "delete updated[page]" in APP
-    assert "setDashboardLayoutReset((current) => current + 1)" in APP
-    assert "setLabLayoutReset((current) => current + 1)" in APP
+    assert 'aria-label={tr("重置当前布局", "Reset current layout")}' not in APP
+    assert "setDashboardLayoutReset" not in APP
     assert "overlapResettingRef.current = true" in APP
     assert "if (overlapResettingRef.current)" in APP
     assert "}, 180);" in APP
@@ -357,3 +376,25 @@ def test_dashboard_and_lab_use_subpages_and_reorderable_collapsible_panels():
     assert "api.clearCompletedJobs()" in APP
     assert "api.deleteJob(id)" in APP
     assert ".completed-jobs" in STYLES
+
+
+def test_server_page_matches_hivellm_information_architecture():
+    assert "const serverPage = (" in APP
+    assert 'title={tr("运行服务", "Runtime")}' in APP
+    assert 'title={tr("内存规划", "Memory plan")}' in APP
+    assert 'title={tr("持久化前缀缓存", "Persistent Prefix cache")}' in APP
+    assert 'title={tr("对话", "Chat")}' in APP
+    assert 'title={tr("自动化", "Automation")}' in APP
+    assert 'title={tr("Runtime 可执行文件", "Runtime executable")}' in APP
+    assert 'title={tr("模型 ID", "Model ID")}' in APP
+    assert 'title={tr("绑定地址", "Bind address")}' in APP
+    assert 'title={tr("模型总驻留", "Total model residency")}' in APP
+    assert 'title={tr("启用 SSD 层", "Enable SSD tier")}' in APP
+    assert 'title={tr("最大输出", "Maximum output")}' in APP
+    assert 'dashboardPage === "connections" && serverPage' in APP
+    assert "const toolsRoutingPanel = <>" in APP
+    assert "{toolsRoutingPanel}" in APP
+    assert "studioOpen" not in APP
+    assert "setStudioOpen" not in APP
+    assert 'className="server-active-notice"' in APP
+    assert ".server-active-notice" in STYLES

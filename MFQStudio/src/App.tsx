@@ -84,7 +84,7 @@ function schemaType(property: JsonSchemaProperty): string | undefined {
 }
 
 type ViewName = "chat" | "dashboard" | "lab";
-type DashboardPage = "overview" | "cache" | "models" | "connections";
+type DashboardPage = "overview" | "models" | "connections" | "cache" | "logs" | "settings";
 type LabPage = "models" | "evaluations" | "quantization";
 type UiLanguage = "system" | "zh-CN" | "en";
 type UiTheme = "system" | "light" | "dark";
@@ -139,23 +139,6 @@ interface StoredPreset {
   updatedAt: string;
 }
 
-interface AssistantRole {
-  id: string;
-  name: string;
-  preset?: StoredPreset;
-}
-
-interface RoleEditorDraft {
-  roleId: string;
-  name: string;
-  icon: string;
-  model: string;
-  mode: SessionMode;
-  contextSize: number;
-  inheritGlobalSettings: boolean;
-  settings: StoredPresetSettings;
-}
-
 interface VoiceMessage {
   id: string;
   sessionId: string;
@@ -187,39 +170,6 @@ interface PendingAttachment {
 const SETTINGS_KEY = "mfq.studio.generation.v1";
 const STORED_PRESETS_KEY = "mfq.studio.presets.v1";
 const VOICE_HISTORY_KEY = "mfq.studio.voice-history.v1";
-const DEFAULT_ASSISTANT_ID = "assistant:default";
-
-function assistantIdForPreset(preset: StoredPreset): string {
-  return preset.id
-    ? `assistant:preset:${preset.id}`
-    : `assistant:preset:${preset.name.trim().toLocaleLowerCase()}`;
-}
-
-function legacyAssistantIdForPreset(preset: StoredPreset): string {
-  return `assistant:preset:${preset.name.trim().toLocaleLowerCase()}`;
-}
-
-function sessionAssistantId(session: Session): string {
-  const identifier = session.metadata?.assistant_id;
-  return typeof identifier === "string" && identifier ? identifier : DEFAULT_ASSISTANT_ID;
-}
-
-function sessionAssistantName(session: Session): string | null {
-  const name = session.metadata?.assistant_name;
-  return typeof name === "string" && name.trim() ? name.trim() : null;
-}
-
-function canonicalSessionAssistantId(session: Session, presets: StoredPreset[]): string {
-  const identifier = sessionAssistantId(session);
-  if (identifier === DEFAULT_ASSISTANT_ID) return identifier;
-  const name = sessionAssistantName(session);
-  const preset = presets.find((candidate) =>
-    identifier === assistantIdForPreset(candidate)
-      || identifier === legacyAssistantIdForPreset(candidate)
-      || name === candidate.name
-  );
-  return preset ? assistantIdForPreset(preset) : identifier;
-}
 const DOCUMENT_ACCEPT = [
   ".txt",
   ".md",
@@ -255,7 +205,7 @@ const DOCUMENT_ACCEPT = [
 ].join(",");
 const MAX_DOCUMENT_BYTES = 64 * 1024 * 1024;
 const LANGUAGE_CONSISTENCY_PROMPT =
-  "Follow any explicit language request. Otherwise, answer entirely in the language of the user's latest text. Do not mix languages, except when quoting or discussing foreign-language text.";
+  "Before answering, identify the language of the user's latest message. Follow any explicit language request; otherwise use that language exclusively for every sentence and heading. Never insert Chinese words into an English answer or English prose into a Chinese answer. Keep only unavoidable proper nouns, code, quoted text, and technical identifiers in their original language.";
 const MODE_LABELS: Record<SessionMode, [string, string]> = {
   text: ["文本", "Text"],
   voice: ["语音", "Voice"],
@@ -324,37 +274,6 @@ function modeTemplateSettings(
     seed: null,
   };
 }
-
-function roleGenerationSettings(
-  globalSettings: GenerationSettings,
-  role: StoredPreset | undefined,
-): GenerationSettings {
-  if (!role) return globalSettings;
-  if (role.inheritGlobalSettings) {
-    return {
-      ...globalSettings,
-      systemPrompt: role.settings.systemPrompt.trim()
-        ? role.settings.systemPrompt
-        : globalSettings.systemPrompt,
-    };
-  }
-  return {
-    ...globalSettings,
-    ...role.settings,
-    preset: "custom",
-  };
-}
-const CAPABILITY_LABELS: Array<[
-  keyof RuntimeCapabilities["model_capabilities"]["features"],
-  [string, string],
-]> = [
-  ["text", ["文本", "Text"]],
-  ["image_input", ["图片", "Image"]],
-  ["video_input", ["视频", "Video"]],
-  ["audio_input", ["音频输入", "Audio in"]],
-  ["audio_output", ["音频输出", "Audio out"]],
-  ["full_duplex", ["全双工", "Full duplex"]],
-];
 
 function loadSettings(): GenerationSettings {
   try {
@@ -768,6 +687,15 @@ function formatNumber(value: unknown, digits = 0): string {
     : "--";
 }
 
+function formatBytes(value: unknown): string {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "--";
+  if (bytes >= 2 ** 40) return `${formatNumber(bytes / 2 ** 40, 1)} TB`;
+  if (bytes >= 2 ** 30) return `${formatNumber(bytes / 2 ** 30, 1)} GB`;
+  if (bytes >= 2 ** 20) return `${formatNumber(bytes / 2 ** 20, 0)} MB`;
+  return `${formatNumber(bytes / 2 ** 10, 0)} KB`;
+}
+
 interface PrefillMetricLike {
   prompt_tokens?: number;
   prefill_tokens?: number;
@@ -862,51 +790,41 @@ function AudioClip({ audioId }: { audioId: string }) {
   return url ? <audio className="message-audio" controls preload="metadata" src={url} /> : null;
 }
 
-function RuntimeChart({ values }: { values: number[] }) {
-  const points = useMemo(() => {
-    const source = values.length ? values : [0];
-    const maximum = Math.max(...source, 1);
-    return source
-      .map((value, index) => {
-        const x = source.length === 1 ? 50 : (index / (source.length - 1)) * 100;
-        const y = 94 - (value / maximum) * 82;
-        return `${x},${y}`;
-      })
-      .join(" ");
-  }, [values]);
-  return (
-    <svg className="runtime-chart" preserveAspectRatio="none" viewBox="0 0 100 100">
-      <line x1="0" x2="100" y1="94" y2="94" />
-      <line x1="0" x2="100" y1="53" y2="53" />
-      <line x1="0" x2="100" y1="12" y2="12" />
-      <polyline points={points} />
-    </svg>
-  );
-}
-
 type IconName =
   | "activity"
   | "chat"
+  | "chart"
+  | "clock"
+  | "copy"
   | "flask"
   | "download"
   | "edit"
   | "folder"
+  | "gauge"
+  | "info"
   | "lightbulb"
+  | "link"
+  | "memory"
   | "moon"
   | "menu"
   | "paperclip"
   | "play"
   | "plus"
+  | "queue"
   | "refresh"
+  | "reuse"
   | "send"
+  | "server-rack"
   | "settings"
   | "stop"
   | "sun"
   | "sun-moon"
+  | "text-forward"
   | "trash"
   | "upload"
   | "volume"
-  | "volume-off";
+  | "volume-off"
+  | "waveform";
 
 function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
   return (
@@ -920,27 +838,151 @@ function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
     >
       {name === "activity" && <><path d="M3 12h4l2.5-7 5 14 2.5-7h4" /></>}
       {name === "chat" && <><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" /></>}
+      {name === "chart" && <><path d="M4 19V5M4 19h16" /><path d="m7 15 4-4 3 2 5-6" /></>}
+      {name === "clock" && <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3.5 2" /></>}
+      {name === "copy" && <><rect height="13" rx="2" width="11" x="8" y="8" /><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" /></>}
       {name === "flask" && <><path d="M9 3h6M10 3v6l-5.7 9.2A1.8 1.8 0 0 0 5.8 21h12.4a1.8 1.8 0 0 0 1.5-2.8L14 9V3" /><path d="M7.5 15h9" /></>}
       {name === "download" && <><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></>}
       {name === "edit" && <><path d="M4 20h4l11-11a2.8 2.8 0 0 0-4-4L4 16z" /><path d="m13.5 6.5 4 4" /></>}
       {name === "folder" && <path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H10l2 2h6.5A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z" />}
+      {name === "gauge" && <><path d="M4.2 18a8.5 8.5 0 1 1 15.6 0" /><path d="M6.5 15.5h.01M7.8 11h.01M12 8.8h.01M16.2 11h.01M17.5 15.5h.01" /><path d="m12 14 4.2-5.2" /><circle cx="12" cy="14" r="1.45" /></>}
+      {name === "info" && <><circle cx="12" cy="12" r="9" /><path d="M12 10v6M12 7h.01" /></>}
       {name === "lightbulb" && <><path d="M9 18h6M10 22h4" /><path d="M8.4 14.7A6 6 0 1 1 15.6 14.7 4.1 4.1 0 0 0 14 18h-4a4.1 4.1 0 0 0-1.6-3.3z" /></>}
+      {name === "link" && <><path d="m9.5 14.5 5-5" /><path d="M7.5 17.5 5 20a3.5 3.5 0 0 1-5-5l4-4a3.5 3.5 0 0 1 5 0" transform="translate(2 -2)" /><path d="m16.5 6.5 2.5-2.5a3.5 3.5 0 0 1 5 5l-4 4a3.5 3.5 0 0 1-5 0" transform="translate(-2 2)" /></>}
+      {name === "memory" && <><rect height="14" rx="2" width="14" x="5" y="5" /><path d="M9 9h6v6H9zM9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3" /></>}
       {name === "moon" && <path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5 8.5 8.5 0 1 0 20.5 14.2z" />}
       {name === "menu" && <><path d="M4 7h16M4 12h16M4 17h16" /></>}
       {name === "paperclip" && <><path d="m20.5 11.5-8.8 8.8a6 6 0 0 1-8.5-8.5l9.5-9.5a4 4 0 0 1 5.7 5.7l-9.6 9.5a2 2 0 0 1-2.8-2.8l8.8-8.8" /></>}
       {name === "play" && <path d="m8 5 11 7-11 7z" fill="currentColor" stroke="none" />}
       {name === "plus" && <><path d="M12 5v14M5 12h14" /></>}
+      {name === "queue" && <><path d="M8 7h12M8 12h12M8 17h12" /><circle cx="4" cy="7" r="1" fill="currentColor" stroke="none" /><circle cx="4" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="4" cy="17" r="1" fill="currentColor" stroke="none" /></>}
       {name === "refresh" && <><path d="M20 6v5h-5" /><path d="M4 18v-5h5" /><path d="M18.5 9A7 7 0 0 0 6.1 6.1L4 8M5.5 15A7 7 0 0 0 17.9 17.9L20 16" /></>}
+      {name === "reuse" && <><path d="M20 7v5h-5M4 17v-5h5" /><path d="M18.3 9A7 7 0 0 0 6 6.5L4 9M5.7 15A7 7 0 0 0 18 17.5l2-2.5" /></>}
       {name === "send" && <><path d="m5 12 7-7 7 7M12 5v14" /></>}
+      {name === "server-rack" && <><rect height="7" rx="1.8" width="16" x="4" y="3" /><rect height="7" rx="1.8" width="16" x="4" y="14" /><path d="M8 6.5h.01M8 17.5h.01M12 6.5h5M12 17.5h5" /></>}
       {name === "settings" && <><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1z" /></>}
       {name === "stop" && <><rect height="9" rx="1" width="9" x="7.5" y="7.5" /></>}
       {name === "sun" && <><circle cx="12" cy="12" r="3.5" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></>}
       {name === "sun-moon" && <><path d="M8.5 3.5A6.5 6.5 0 1 0 15 10a5 5 0 0 1-6.5-6.5z" /><path d="M17 3v2M17 9v2M13 7h2M19 7h2" /></>}
+      {name === "text-forward" && <><path d="M4 6h10M4 10h8M4 14h6" /><path d="M13 17h7m-3-3 3 3-3 3" /></>}
       {name === "trash" && <><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5" /></>}
       {name === "upload" && <><path d="M12 21V9" /><path d="m7 14 5-5 5 5" /><path d="M5 3h14" /></>}
       {name === "volume" && <><path d="M11 5 6.5 9H3v6h3.5L11 19z" /><path d="M15 9a4 4 0 0 1 0 6M18 6a8 8 0 0 1 0 12" /></>}
       {name === "volume-off" && <><path d="M11 5 6.5 9H3v6h3.5L11 19zM16 10l5 5M21 10l-5 5" /></>}
+      {name === "waveform" && <path d="M3 12h2l2-6 3 12 3-12 2 6h6" />}
     </svg>
+  );
+}
+
+function ScreenHeader({
+  title,
+  subtitle,
+  trailing,
+}: {
+  title: string;
+  subtitle: string;
+  trailing?: ReactNode;
+}) {
+  return (
+    <header className="screen-header">
+      <div>
+        <h1>{title}</h1>
+        <p>{subtitle}</p>
+      </div>
+      {trailing && <div className="screen-header-trailing">{trailing}</div>}
+    </header>
+  );
+}
+
+function SectionLabel({ title, subtitle }: { title: string; subtitle?: string }) {
+  return (
+    <div className="section-label">
+      <strong>{title}</strong>
+      {subtitle && <span>{subtitle}</span>}
+    </div>
+  );
+}
+
+function TMPanel({
+  children,
+  className = "",
+}: {
+  children: ReactNode;
+  className?: string;
+}) {
+  return <section className={`tm-panel ${className}`.trim()}>{children}</section>;
+}
+
+function MetricTile({
+  label,
+  value,
+  detail,
+  icon,
+}: {
+  label: string;
+  value: string;
+  detail: string;
+  icon: IconName;
+}) {
+  return (
+    <TMPanel className="metric-tile">
+      <div className="metric-tile-label"><Icon name={icon} size={14} /><span>{label}</span></div>
+      <strong>{value}</strong>
+      <small>{detail}</small>
+    </TMPanel>
+  );
+}
+
+function SettingRow({
+  title,
+  detail,
+  trailing,
+}: {
+  title: string;
+  detail: string;
+  trailing: ReactNode;
+}) {
+  return (
+    <div className="setting-row">
+      <div><strong>{title}</strong><small>{detail}</small></div>
+      <div className="setting-row-trailing">{trailing}</div>
+    </div>
+  );
+}
+
+function UsageBar({
+  label,
+  used,
+  total,
+}: {
+  label: string;
+  used: number;
+  total: number;
+}) {
+  const ratio = total > 0 ? Math.min(Math.max(used / total, 0), 1) : 0;
+  return (
+    <div className="usage-bar">
+      <div><strong>{label}</strong><span>{formatNumber(used / 2 ** 30, 2)} / {formatNumber(total / 2 ** 30, 2)} GB</span></div>
+      <div className="usage-bar-track"><i style={{ width: `${ratio * 100}%` }} /></div>
+    </div>
+  );
+}
+
+function EmptyPanel({
+  icon,
+  title,
+  message,
+}: {
+  icon: IconName;
+  title: string;
+  message: string;
+}) {
+  return (
+    <TMPanel className="empty-panel">
+      <Icon name={icon} size={30} />
+      <strong>{title}</strong>
+      <p>{message}</p>
+    </TMPanel>
   );
 }
 
@@ -986,6 +1028,7 @@ interface PanelResizeState {
 const PANEL_RESIZE_INSET = 7;
 const PANEL_MIN_WIDTH = 180;
 const PANEL_MIN_HEIGHT = 72;
+const STATIC_PANEL_LAYOUT = true;
 
 function panelResizeEdges(node: HTMLElement, clientX: number, clientY: number): string {
   const rect = node.getBoundingClientRect();
@@ -1054,9 +1097,9 @@ function PanelDeck({ page, children, labels, resetVersion }: PanelDeckProps) {
   const overlapResettingRef = useRef(false);
   const dragRef = useRef<{ id: string; startClientX: number; startClientY: number; startX: number; startY: number } | null>(null);
   const resizeRef = useRef<PanelResizeState | null>(null);
-  const pageLayout = layouts[page] ?? {};
+  const pageLayout: Record<string, PanelPlacement> = STATIC_PANEL_LAYOUT ? {} : layouts[page] ?? {};
   const byId = new Map(panels.map((panel, index) => [panelKey(panel, index), panel]));
-  const panelClasses = `panel-deck page-${page}${panels.length === 1 ? " single" : ""}`;
+  const panelClasses = `panel-deck static page-${page}${panels.length === 1 ? " single" : ""}`;
   const defaultFullWidth: Record<string, string[]> = {
     "dashboard-overview": ["metrics"],
     "dashboard-cache": ["prefix-cache", "profiles"],
@@ -1259,7 +1302,7 @@ function PanelDeck({ page, children, labels, resetVersion }: PanelDeckProps) {
   }
 
   function beginPanelResize(event: React.PointerEvent<HTMLDivElement>, id: string, isCollapsed: boolean): boolean {
-    if (isCollapsed || window.matchMedia("(max-width: 860px)").matches || !event.isPrimary || event.button !== 0 || dragRef.current) return false;
+    if (STATIC_PANEL_LAYOUT || isCollapsed || window.matchMedia("(max-width: 860px)").matches || !event.isPrimary || event.button !== 0 || dragRef.current) return false;
     const node = event.currentTarget;
     const edges = panelResizeEdges(node, event.clientX, event.clientY);
     if (!edges) return false;
@@ -1294,7 +1337,7 @@ function PanelDeck({ page, children, labels, resetVersion }: PanelDeckProps) {
     const activeResize = resizeRef.current;
     if (!activeResize || activeResize.id !== id) {
       const narrowViewport = window.matchMedia("(max-width: 860px)").matches;
-      event.currentTarget.style.cursor = isCollapsed || narrowViewport ? "" : panelResizeCursor(panelResizeEdges(event.currentTarget, event.clientX, event.clientY));
+      event.currentTarget.style.cursor = STATIC_PANEL_LAYOUT || isCollapsed || narrowViewport ? "" : panelResizeCursor(panelResizeEdges(event.currentTarget, event.clientX, event.clientY));
       return;
     }
     event.preventDefault();
@@ -1442,17 +1485,15 @@ export default function App() {
   const [runtimeLogs, setRuntimeLogs] = useState<RuntimeLogEntry[]>([]);
   const [model, setModel] = useState("");
   const [mode, setMode] = useState<SessionMode>("text");
-  const [view, setView] = useState<ViewName>("chat");
+  const [view, setView] = useState<ViewName>("dashboard");
   const [dashboardPage, setDashboardPage] = useState<DashboardPage>("overview");
   const [labPage, setLabPage] = useState<LabPage>("models");
-  const [dashboardLayoutReset, setDashboardLayoutReset] = useState(0);
-  const [labLayoutReset, setLabLayoutReset] = useState(0);
+  const labLayoutReset = 0;
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [live, setLive] = useState<LiveOutput | null>(null);
   const [busy, setBusy] = useState(false);
   const [stopping, setStopping] = useState(false);
-  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [capabilities, setCapabilities] = useState<RuntimeCapabilities | null>(null);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
@@ -1460,7 +1501,6 @@ export default function App() {
   const [realtimeAvailable, setRealtimeAvailable] = useState(false);
   const [voiceComponent, setVoiceComponent] = useState<VoiceOutputComponentStatus | null>(null);
   const [voiceComponentBusy, setVoiceComponentBusy] = useState(false);
-  const [metricSeries, setMetricSeries] = useState<number[]>([]);
   const [requestHistory, setRequestHistory] = useState<RuntimeRequestMetrics[]>([]);
   const [settings, setSettings] = useState<GenerationSettings>(loadSettings);
   const [settingsDraft, setSettingsDraft] = useState<GenerationSettings>(settings);
@@ -1468,24 +1508,18 @@ export default function App() {
   const [selectedStoredPreset, setSelectedStoredPreset] = useState("");
   const [storedPresetName, setStoredPresetName] = useState("");
   const [presetStatus, setPresetStatus] = useState<{ error: boolean; text: string } | null>(null);
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [selectedAssistantId, setSelectedAssistantId] = useState(DEFAULT_ASSISTANT_ID);
-  const [roleEditor, setRoleEditor] = useState<RoleEditorDraft | null>(null);
   const [contextSize, setContextSize] = useState(32768);
   const [loadPinned, setLoadPinned] = useState(false);
   const [loadIdleTtl, setLoadIdleTtl] = useState<number | null>(null);
   const [profileName, setProfileName] = useState("");
   const [studio, setStudio] = useState<StudioStatus | null>(null);
   const [studioDraft, setStudioDraft] = useState<StudioConfig | null>(null);
-  const [studioOpen, setStudioOpen] = useState(false);
   const [modelBrowser, setModelBrowser] = useState<ModelDirectoryList | null>(null);
   const [modelBrowserOpen, setModelBrowserOpen] = useState(false);
   const [modelDirectoryPath, setModelDirectoryPath] = useState("");
   const [studioToken, setStudioToken] = useState("");
   const [editDraft, setEditDraft] = useState<EditDraft | null>(null);
-  const [renamingId, setRenamingId] = useState<string | null>(null);
-  const [renameValue, setRenameValue] = useState("");
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
   const [voiceLevel, setVoiceLevel] = useState(0);
   const [liveVoice, setLiveVoice] = useState<LiveVoiceOutput | null>(null);
@@ -1495,9 +1529,7 @@ export default function App() {
   const autoFollowOutputRef = useRef(true);
   const voiceRef = useRef<RealtimeAudioController | null>(null);
   const voiceClipWrites = useRef(new Map<string, Promise<void>>());
-  const lastMetricId = useRef("");
   const appliedModeTemplate = useRef("");
-  const settingsCloseRef = useRef<HTMLButtonElement | null>(null);
 
   const english =
     settings.language === "en" ||
@@ -1513,39 +1545,9 @@ export default function App() {
     () => sessions.find((session) => session.id === activeId) ?? null,
     [activeId, sessions],
   );
-  const assistantRoles = useMemo<AssistantRole[]>(() => {
-    const roles = new Map<string, AssistantRole>();
-    for (const preset of storedPresets) {
-      const id = assistantIdForPreset(preset);
-      roles.set(id, { id, name: preset.name, preset });
-    }
-    for (const session of sessions) {
-      const id = canonicalSessionAssistantId(session, storedPresets);
-      if (!roles.has(id)) {
-        roles.set(id, { id, name: sessionAssistantName(session) ?? tr("已删除的角色", "Removed role") });
-      }
-    }
-    if (!roles.size) {
-      roles.set(DEFAULT_ASSISTANT_ID, { id: DEFAULT_ASSISTANT_ID, name: tr("默认助手", "Default assistant") });
-    }
-    return [...roles.values()];
-  }, [sessions, storedPresets, tr]);
-  const assistantSessions = useMemo(
-    () => sessions.filter((session) => canonicalSessionAssistantId(session, storedPresets) === selectedAssistantId),
-    [selectedAssistantId, sessions, storedPresets],
-  );
   const currentVoiceMessages = useMemo(
     () => voiceMessages.filter((message) => message.sessionId === activeId),
     [activeId, voiceMessages],
-  );
-  const activeRolePreset = useMemo(
-    () => active
-      ? storedPresets.find(
-          (preset) =>
-            assistantIdForPreset(preset) === canonicalSessionAssistantId(active, storedPresets),
-        )
-      : undefined,
-    [active, storedPresets],
   );
   const resolvedGlobalSettings = useMemo(
     () => settings.inheritModelDefaults
@@ -1553,16 +1555,13 @@ export default function App() {
       : settings,
     [active?.mode, mode, realtime, runtime, settings],
   );
-  const effectiveSettings = useMemo(
-    () => roleGenerationSettings(resolvedGlobalSettings, activeRolePreset),
-    [activeRolePreset, resolvedGlobalSettings],
+  const effectiveSettings = resolvedGlobalSettings;
+  const effectiveSystemPrompt = useMemo(
+    () => [effectiveSettings.systemPrompt.trim(), LANGUAGE_CONSISTENCY_PROMPT]
+      .filter(Boolean)
+      .join("\n\n"),
+    [effectiveSettings.systemPrompt],
   );
-  const roleOverridesInference = Boolean(
-    activeRolePreset && !activeRolePreset.inheritGlobalSettings,
-  );
-  useEffect(() => {
-    if (active) setSelectedAssistantId(canonicalSessionAssistantId(active, storedPresets));
-  }, [active, storedPresets]);
   const reasoningValues = useMemo(() => {
     const values = runtime?.chat_template_capabilities?.reasoning_effort?.values;
     return Array.isArray(values) ? values : [];
@@ -1664,21 +1663,8 @@ export default function App() {
         .filter(
           (request, index, values) =>
             values.findIndex((candidate) => candidate.id === request.id) === index,
-        );
-      setRequestHistory(historicRequests.slice(-24).reverse());
-      setMetricSeries(
-        historicRequests
-          .map((request) => Number(request.decode_tps))
-          .filter(Number.isFinite)
-          .slice(-32),
       );
-      const request = status?.last_request;
-      const requestId = String(request?.id ?? "");
-      const decode = Number(request?.decode_tps);
-      if (request && requestId && requestId !== lastMetricId.current && Number.isFinite(decode)) {
-        lastMetricId.current = requestId;
-        setMetricSeries((current) => [...current, decode].slice(-32));
-      }
+      setRequestHistory(historicRequests.slice(-24).reverse());
       const currentContext = Number(status?.max_context);
       if (Number.isFinite(currentContext) && currentContext > 0) {
         setContextSize(Math.floor(currentContext));
@@ -1701,10 +1687,6 @@ export default function App() {
     voiceRef.current?.setPlayback(settings.playbackEnabled);
     document.documentElement.dataset.theme = settings.theme;
   }, [settings]);
-
-  useEffect(() => {
-    if (settingsOpen) settingsCloseRef.current?.focus();
-  }, [settingsOpen]);
 
   useEffect(() => {
     localStorage.setItem(STORED_PRESETS_KEY, JSON.stringify(storedPresets));
@@ -1847,7 +1829,10 @@ export default function App() {
           const token = await studioCredential();
           setApiToken(token);
           if (current) setStudioToken(token);
-          if (current) setStudio(status);
+          if (current) {
+            setStudio(status);
+            setStudioDraft({ ...status.config });
+          }
         }
         const results = await Promise.allSettled([
           api.runtimeCapabilities(),
@@ -1896,12 +1881,6 @@ export default function App() {
                 values.findIndex((candidate) => candidate.id === request.id) === index,
             );
           setRequestHistory(history.slice(-24).reverse());
-          setMetricSeries(
-            history
-              .map((request) => Number(request.decode_tps))
-              .filter(Number.isFinite)
-              .slice(-32),
-          );
         }
         if (results[9].status === "fulfilled") setRuntimeLogs(results[9].value);
         if (results[10].status === "fulfilled") {
@@ -1934,8 +1913,6 @@ export default function App() {
         }
       } catch (cause) {
         if (current) setError(errorMessage(cause));
-      } finally {
-        if (current) setLoading(false);
       }
     }
     void initialize();
@@ -2028,115 +2005,12 @@ export default function App() {
   function realtimeSessionConfig(sessionId: string) {
     return {
       sessionId,
-      systemPrompt: effectiveSettings.systemPrompt,
+      systemPrompt: effectiveSystemPrompt,
       temperature: effectiveSettings.temperature,
       topP: effectiveSettings.topP,
       topK: effectiveSettings.topK,
       repetitionPenalty: effectiveSettings.repetitionPenalty,
     };
-  }
-
-  function selectAssistant(role: AssistantRole) {
-    setSelectedAssistantId(role.id);
-    const nextSession = sessions.find((session) => canonicalSessionAssistantId(session, storedPresets) === role.id);
-    setActiveId(nextSession?.id ?? null);
-    if (role.preset) {
-      if (role.preset.model) setModel(role.preset.model);
-      if (role.preset.mode) setMode(role.preset.mode);
-    }
-    setView("chat");
-    setSidebarOpen(false);
-  }
-
-  function editRole(role: AssistantRole) {
-    const preset = role.preset;
-    const inheritGlobalSettings = preset?.inheritGlobalSettings ?? true;
-    const roleMode = preset?.mode || mode;
-    const roleGlobalSettings = settings.inheritModelDefaults
-      ? modeTemplateSettings(settings, roleMode, runtime, realtime)
-      : settings;
-    setRoleEditor({
-      roleId: role.id,
-      name: role.name,
-      icon: preset?.icon || role.name.slice(0, 1).toLocaleUpperCase(),
-      model: preset?.model || model,
-      mode: roleMode,
-      contextSize: preset?.contextSize || contextSize,
-      inheritGlobalSettings,
-      settings: inheritGlobalSettings
-        ? {
-            ...presetSnapshot(roleGlobalSettings),
-            systemPrompt: preset?.settings.systemPrompt ?? "",
-          }
-        : preset?.settings || presetSnapshot(roleGlobalSettings),
-    });
-  }
-
-  function createRole() {
-    const base = tr("新角色", "New role");
-    const used = new Set(assistantRoles.map((role) => role.name.toLocaleLowerCase()));
-    let name = base;
-    for (let suffix = 2; used.has(name.toLocaleLowerCase()); suffix += 1) name = `${base} ${suffix}`;
-    setRoleEditor({
-      roleId: "new",
-      name,
-      icon: name.slice(0, 1).toLocaleUpperCase(),
-      model,
-      mode,
-      contextSize,
-      inheritGlobalSettings: true,
-      settings: presetSnapshot(
-        settings.inheritModelDefaults
-          ? modeTemplateSettings(settings, mode, runtime, realtime)
-          : settings,
-      ),
-    });
-  }
-
-  async function saveRole(event: FormEvent) {
-    event.preventDefault();
-    if (!roleEditor) return;
-    const name = roleEditor.name.replace(/\s+/g, " ").trim().slice(0, 64);
-    if (!name) return;
-    if (assistantRoles.some((candidate) => candidate.id !== roleEditor.roleId && candidate.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
-      setError(tr("角色名已存在。", "A role with this name already exists."));
-      return;
-    }
-    const currentRole = assistantRoles.find((role) => role.id === roleEditor.roleId);
-    const preset: StoredPreset = {
-      id: currentRole?.preset?.id,
-      name,
-      icon: roleEditor.icon.trim().slice(0, 8) || name.slice(0, 1).toLocaleUpperCase(),
-      model: roleEditor.model || null,
-      mode: roleEditor.mode,
-      contextSize: Math.max(512, Math.floor(roleEditor.contextSize)),
-      inheritGlobalSettings: roleEditor.inheritGlobalSettings,
-      settings: roleEditor.settings,
-      updatedAt: new Date().toISOString(),
-    };
-    try {
-      const saved = storedPresetFromResource(currentRole?.preset?.id
-        ? await api.updateGenerationPreset(currentRole.preset.id, presetResourceBody(preset, model, mode))
-        : await api.createGenerationPreset(presetResourceBody(preset, model, mode)));
-      const nextId = assistantIdForPreset(saved);
-      const affected = currentRole
-        ? sessions.filter((session) => canonicalSessionAssistantId(session, storedPresets) === currentRole.id)
-        : [];
-      const updatedSessions = await Promise.all(affected.map((session) => api.updateSession(session.id, {
-        metadata: { ...session.metadata, assistant_id: nextId, assistant_name: name },
-      })));
-      const updates = new Map(updatedSessions.map((session) => [session.id, session]));
-      setSessions((current) => current.map((session) => updates.get(session.id) ?? session));
-      setStoredPresets((current) => currentRole?.preset
-        ? current.map((item) => item.id === currentRole.preset?.id ? saved : item)
-        : [...current, saved]);
-      setSelectedAssistantId(nextId);
-      setModel(saved.model || model);
-      setMode(saved.mode || mode);
-      setRoleEditor(null);
-    } catch (cause) {
-      setError(errorMessage(cause));
-    }
   }
 
   function openStudioPage(nextView: "dashboard" | "lab", page: DashboardPage | LabPage) {
@@ -2147,15 +2021,11 @@ export default function App() {
   }
 
   async function createSession() {
-    const role = assistantRoles.find((candidate) => candidate.id === selectedAssistantId);
     const selectedModel = model.trim();
     if (!selectedModel) return;
     setError(null);
     try {
-      const created = await api.createSession(selectedModel, mode, undefined, {
-        assistant_id: role?.id ?? DEFAULT_ASSISTANT_ID,
-        assistant_name: role?.name ?? tr("默认助手", "Default assistant"),
-      });
+      const created = await api.createSession(selectedModel, mode);
       setSessions((current) => [created, ...current]);
       setActiveId(created.id);
       setMessages([]);
@@ -2166,46 +2036,23 @@ export default function App() {
     }
   }
 
-  async function deleteSession(session: Session) {
-    if (busy || !await studioConfirm(tr("删除这个会话？", "Delete this session?"))) return;
+  async function clearActiveConversation() {
+    if (!active || busy || !await studioConfirm(tr("清空当前对话？", "Clear this conversation?"))) return;
+    setBusy(true);
+    setError(null);
     try {
-      await api.deleteSession(session.id);
-      setVoiceMessages((current) => current.filter((item) => item.sessionId !== session.id));
-      const next = await api.listSessions();
-      setSessions(next);
-      setActiveId(
-        next.find((candidate) => sessionAssistantId(candidate) === selectedAssistantId)?.id ?? null,
-      );
-    } catch (cause) {
-      setError(errorMessage(cause));
-    }
-  }
-
-  async function clearSessions() {
-    if (busy || !assistantSessions.length || !await studioConfirm(tr("清空当前角色的全部会话？", "Clear all sessions for this role?"))) {
-      return;
-    }
-    try {
-      const removed = new Set(assistantSessions.map((session) => session.id));
-      for (const session of assistantSessions) await api.deleteSession(session.id);
-      setSessions((current) => current.filter((session) => !removed.has(session.id)));
+      const replacement = await api.createSession(active.model, active.mode);
+      await api.deleteSession(active.id);
+      setSessions((current) => [replacement, ...current.filter((session) => session.id !== active.id)]);
+      setVoiceMessages((current) => current.filter((message) => message.sessionId !== active.id));
       setMessages([]);
-      setVoiceMessages((current) => current.filter((message) => !removed.has(message.sessionId)));
-      setActiveId(null);
+      setResponses({});
+      setActiveId(replacement.id);
     } catch (cause) {
       setError(errorMessage(cause));
       await refreshSessions();
-    }
-  }
-
-  async function saveRename(session: Session) {
-    const title = renameValue.replace(/\s+/g, " ").trim();
-    try {
-      const updated = await api.updateSession(session.id, { title: title || null });
-      setSessions((current) => current.map((item) => (item.id === updated.id ? updated : item)));
-      setRenamingId(null);
-    } catch (cause) {
-      setError(errorMessage(cause));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -2285,9 +2132,7 @@ export default function App() {
           input,
           input_role: inputRole,
           sampling: samplingParams(),
-          system_prompt: [effectiveSettings.systemPrompt.trim(), LANGUAGE_CONSISTENCY_PROMPT]
-            .filter(Boolean)
-            .join("\n\n"),
+          system_prompt: effectiveSystemPrompt,
           include_reasoning_history: !effectiveSettings.excludeReasoning,
           tools: mcpTools
             .filter((tool) => selectedTools.includes(tool.qualified_name))
@@ -2583,6 +2428,14 @@ export default function App() {
     await navigator.clipboard.writeText([parts.reasoning, parts.text].filter(Boolean).join("\n\n"));
   }
 
+  async function copyEndpoint() {
+    try {
+      await navigator.clipboard.writeText(studio?.service_url || "http://127.0.0.1:8090");
+    } catch (cause) {
+      setError(errorMessage(cause));
+    }
+  }
+
   async function executeToolCalls(message: Message) {
     if (!active || busy) return;
     const calls = message.parts.filter(
@@ -2666,29 +2519,6 @@ export default function App() {
     }
   }
 
-  function exportConversation() {
-    if (!active) return;
-    const lines = [`# ${active.title || tr("未命名会话", "Untitled session")}`, ""];
-    for (const message of messages) {
-      const parts = textParts(message);
-      lines.push(`## ${message.role === "assistant" ? "MFQ" : message.role}`, "");
-      if (parts.reasoning) {
-        lines.push("<details>", `<summary>${tr("思考过程", "Reasoning")}</summary>`, "", parts.reasoning, "", "</details>", "");
-      }
-      if (parts.text) lines.push(parts.text, "");
-    }
-    for (const message of currentVoiceMessages) {
-      lines.push(`## ${message.role === "assistant" ? "MFQ" : tr("用户", "User")}`, "", message.text, "");
-    }
-    const blob = new Blob([lines.join("\n")], { type: "text/markdown;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `${(active.title || "MFQ").replace(/[\\/:*?"<>|]/g, "_")}.md`;
-    link.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-  }
-
   async function toggleVoice() {
     if (
       !active ||
@@ -2741,21 +2571,17 @@ export default function App() {
     setSettingsDraft(resolvedGlobalSettings);
     const current = Number(runtime?.max_context);
     setContextSize(Number.isFinite(current) && current > 0 ? current : contextSize);
-    setSettingsOpen(true);
+    setPresetStatus(null);
+    openStudioPage("dashboard", "settings");
   }
 
   useEffect(() => {
     function handleKeydown(event: KeyboardEvent) {
       if (event.key === "Escape") {
-        setSettingsOpen(false);
-        setStudioOpen(false);
         setSidebarOpen(false);
       } else if ((event.metaKey || event.ctrlKey) && event.key === ",") {
         event.preventDefault();
         openSettings();
-      } else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "n") {
-        event.preventDefault();
-        void createSession();
       }
     }
     window.addEventListener("keydown", handleKeydown);
@@ -2964,12 +2790,6 @@ export default function App() {
 
   function saveSettings() {
     setSettings(settingsDraft);
-    setSettingsOpen(false);
-  }
-
-  function setUiTheme(theme: UiTheme) {
-    setSettings((current) => ({ ...current, theme }));
-    setSettingsDraft((current) => ({ ...current, theme }));
   }
 
   function updateGlobalInference(patch: Partial<GenerationSettings>) {
@@ -2990,7 +2810,6 @@ export default function App() {
     try {
       const status = await api.reloadRuntime(contextSize);
       setRuntime(status);
-      setSettingsOpen(false);
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -3024,14 +2843,12 @@ export default function App() {
     }
   }
 
-  function openStudioSettings() {
-    if (!studio) return;
-    setStudioDraft({ ...studio.config });
-    setStudioOpen(true);
+  function openServerPage() {
+    if (studio) setStudioDraft({ ...studio.config });
+    openStudioPage("dashboard", "connections");
   }
 
-  async function saveStudioSettings(event: FormEvent) {
-    event.preventDefault();
+  async function saveStudioSettings() {
     if (!studioDraft) return;
     setBusy(true);
     try {
@@ -3040,7 +2857,7 @@ export default function App() {
       setApiBaseUrl(status.service_url);
       setApiToken(studioToken);
       setStudio(status);
-      setStudioOpen(false);
+      setStudioDraft({ ...status.config });
       setMessages([]);
       setActiveId(null);
       await refreshSessions();
@@ -3515,11 +3332,6 @@ export default function App() {
   const last = runtime?.last_request;
   const lastPrefill = displayPrefillMetric(last);
   const lastTtftMs = preferPositiveMetric(last?.ttft_ms, last?.complete_prefill_ms);
-  const lastGenerationMs = preferPositiveMetric(
-    last?.generation_ms,
-    last?.complete_generation_ms,
-  );
-  const contextTokens = Number(last?.prompt_tokens || 0) + Number(last?.completion_tokens || 0);
   const activeJobs = jobs.filter((job) =>
     ["queued", "running", "cancelling"].includes(job.status),
   );
@@ -3540,6 +3352,9 @@ export default function App() {
       0,
   );
   const runtimeCache = Number(runtime?.mlx_cache_bytes ?? runtime?.cuda_reserved_bytes ?? 0);
+  const runtimeMemoryCapacity = Number(runtime?.device_total_bytes || 0)
+    || Math.max(runtimeMemory + runtimeCache, 1);
+  const runtimeDeviceFree = Number(runtime?.device_free_bytes || 0);
   const prefixCacheQueries = Number(runtime?.prefix_cache_queries || 0);
   const prefixCacheHits = Number(runtime?.prefix_cache_hits || 0);
   const prefixCacheSnapshots = Number(runtime?.prefix_cache_snapshots || 0);
@@ -3563,7 +3378,7 @@ export default function App() {
   );
   const selectedJob = jobs.find((item) => item.id === selectedJobId) ?? null;
   const clusterPanel = (
-    <section className="dashboard-panel cluster-panel">
+    <TMPanel className="cluster-panel">
       <div className="panel-heading">
         <div><h2>{tr("远程节点", "Remote nodes")}</h2><p>{tr("按模型和负载路由到健康的 MFQ Server", "Route by model and load across healthy MFQ Server nodes")}</p></div>
         <b>{remoteNodes.filter((node) => node.healthy).length} / {remoteNodes.length}</b>
@@ -3574,8 +3389,157 @@ export default function App() {
         <input onChange={(event) => setNodeDraft((current) => ({ ...current, api_key_env: event.target.value }))} placeholder={tr("密钥环境变量（可选）", "Credential environment variable (optional)")} value={nodeDraft.api_key_env} />
         <button disabled={busy} type="submit">{tr("添加", "Add")}</button>
       </form>
-      <div className="node-list">{remoteNodes.map((node) => <div key={node.id}><span className={node.healthy ? "model-state active" : "model-state failed"} /><div><strong>{node.name}</strong><small>{node.url} · {node.models.length} models · {node.active_requests} active{typeof node.metrics.total_requests === "number" ? ` · ${formatNumber(node.metrics.total_requests)} requests` : ""}{node.error ? ` · ${node.error}` : ""}</small></div><button onClick={() => void api.deleteRemoteNode(node.id).then(() => setRemoteNodes((current) => current.filter((item) => item.id !== node.id))).catch((cause) => setError(errorMessage(cause)))} type="button">{tr("删除", "Delete")}</button></div>)}</div>
-    </section>
+      <div className="node-list">{remoteNodes.map((node) => <div key={node.id}><span className={node.healthy ? "model-state active" : "model-state failed"} /><div><strong>{node.name}</strong><small>{node.url} · {tr(`${node.models.length} 个模型`, `${node.models.length} models`)} · {tr(`${node.active_requests} 个活动请求`, `${node.active_requests} active`)}{typeof node.metrics.total_requests === "number" ? tr(` · ${formatNumber(node.metrics.total_requests)} 个请求`, ` · ${formatNumber(node.metrics.total_requests)} requests`) : ""}{node.error ? ` · ${node.error}` : ""}</small></div><button onClick={() => void api.deleteRemoteNode(node.id).then(() => setRemoteNodes((current) => current.filter((item) => item.id !== node.id))).catch((cause) => setError(errorMessage(cause)))} type="button">{tr("删除", "Delete")}</button></div>)}</div>
+    </TMPanel>
+  );
+
+  const toolsRoutingPanel = <>
+    <SectionLabel title={tr("工具与路由", "Tools and routing")} subtitle={tr("可选的 MCP 与远程节点", "Optional MCP and remote nodes")} />
+    <div className="dashboard-grid server-tools-grid">
+      <TMPanel className="mcp-panel">
+        <div className="panel-heading"><div><h2>MCP</h2><p>{tr("工具服务器与模型可见工具", "Tool servers and model-visible tools")}</p></div><b>{tr(`${mcpTools.length} 个工具`, `${mcpTools.length} tools`)}</b></div>
+        <form className="mcp-form" onSubmit={createMcpServer}><input aria-label={tr("服务器名称", "Server name")} onChange={(event) => setMcpDraft((current) => ({ ...current, name: event.target.value }))} placeholder={tr("名称", "Name")} value={mcpDraft.name} /><select aria-label={tr("传输方式", "Transport")} onChange={(event) => setMcpDraft((current) => ({ ...current, transport: event.target.value as "stdio" | "streamable_http" }))} value={mcpDraft.transport}><option value="streamable_http">HTTP</option><option value="stdio">stdio</option></select><input aria-label={mcpDraft.transport === "streamable_http" ? "Streamable HTTP URL" : tr("可执行文件", "Executable")} onChange={(event) => setMcpDraft((current) => ({ ...current, endpoint: event.target.value }))} placeholder={mcpDraft.transport === "streamable_http" ? "https://host/mcp" : tr("可执行文件路径", "Executable path")} type={mcpDraft.transport === "streamable_http" ? "url" : "text"} value={mcpDraft.endpoint} /><button className="primary" disabled={busy || !mcpDraft.name.trim() || !mcpDraft.endpoint.trim()} type="submit">{tr("添加", "Add")}</button></form>
+        <div className="mcp-server-list">{mcpServers.map((server) => <div className="mcp-server" key={server.id}><span className={server.enabled ? "model-state active" : "model-state"} /><div><strong>{server.name}</strong><small>{server.transport} · {server.url || server.command}</small></div><button onClick={() => void toggleMcpServer(server)} type="button">{server.enabled ? tr("停用", "Disable") : tr("启用", "Enable")}</button><button onClick={() => void deleteMcpServer(server.id)} type="button">{tr("删除", "Delete")}</button></div>)}</div>
+      </TMPanel>
+      {clusterPanel}
+    </div>
+  </>;
+
+  const serverDraft = studioDraft ?? studio?.config ?? null;
+  const serverActive = Boolean(studio?.reachable);
+  const serverPage = (
+    <div className="server-page">
+      {serverActive && <div className="server-active-notice">
+        <Icon name="info" size={15} />
+        <span>{tr("服务器正在运行；网络设置保存后会立即重新连接。", "The server is active. Network changes reconnect as soon as they are saved.")}</span>
+      </div>}
+
+      <SectionLabel title={tr("运行服务", "Runtime")} />
+      <TMPanel className="server-settings-panel">
+        <div className="setting-list">
+          <SettingRow
+            title={tr("Runtime 可执行文件", "Runtime executable")}
+            detail={tr("应用已包含推理服务，并自动使用本机 Metal Runtime。", "The packaged app includes the inference server and discovers the local Metal runtime automatically.")}
+            trailing={<div className="server-row-actions"><code>mfq-cli → mfq-decode-metal</code><span className={`runtime-status-pill ${serverActive ? "running" : "stopped"}`}><i />{serverActive ? tr("已连接", "Connected") : tr("离线", "Offline")}</span></div>}
+          />
+          <SettingRow
+            title={tr("模型 ID", "Model ID")}
+            detail={tr("由 /v1/models 公布，并用于对话补全请求。", "Advertised by /v1/models and accepted by chat completions.")}
+            trailing={<div className="server-row-actions server-model-control"><strong title={runtime?.model || active?.model || model}>{runtime?.model || active?.model || model || tr("尚未加载", "Not loaded")}</strong><button onClick={() => openStudioPage("dashboard", "models")} type="button">{tr("选择…", "Choose…")}</button></div>}
+          />
+          <SettingRow
+            title={tr("绑定地址", "Bind address")}
+            detail={tr("本地模式仅监听 127.0.0.1；远程模式连接另一台 MFQ Server。", "Local mode stays on 127.0.0.1; remote mode connects to another MFQ Server.")}
+            trailing={<select aria-label={tr("绑定地址", "Bind address")} disabled={busy || !serverDraft} onChange={(event) => setStudioDraft((current) => current && ({ ...current, mode: event.target.value as StudioConfig["mode"] }))} value={serverDraft?.mode ?? "local"}><option value="local">{tr("仅本机 · 127.0.0.1", "Local only · 127.0.0.1")}</option><option value="remote">{tr("远程 MFQ Server", "Remote MFQ Server")}</option></select>}
+          />
+          {serverDraft?.mode === "remote" ? <>
+            <SettingRow
+              title={tr("远程端点", "Remote endpoint")}
+              detail={tr("远程 MFQ Server 的 OpenAI 兼容基础 URL。", "OpenAI-compatible base URL for the remote MFQ Server.")}
+              trailing={<input aria-label={tr("远程端点", "Remote endpoint")} className="server-wide-input" disabled={busy} onChange={(event) => setStudioDraft((current) => current && ({ ...current, remote_url: event.target.value }))} placeholder="https://host:port" type="url" value={serverDraft.remote_url} />}
+            />
+            <SettingRow
+              title={tr("API 密钥", "API key")}
+              detail={tr("凭据只保存在系统凭据库中。", "The credential is stored only in the system credential vault.")}
+              trailing={<input aria-label={tr("API 密钥", "API key")} autoComplete="off" className="server-wide-input" disabled={busy} onChange={(event) => setStudioToken(event.target.value)} placeholder={tr("可选", "Optional")} type="password" value={studioToken} />}
+            />
+          </> : <SettingRow
+            title={tr("端口", "Port")}
+            detail={tr("OpenAI 兼容 HTTP 服务使用的 TCP 端口。", "TCP port used by the OpenAI-compatible HTTP server.")}
+            trailing={<input aria-label={tr("端口", "Port")} className="server-number-input" disabled={busy || !serverDraft} max={65535} min={1} onChange={(event) => setStudioDraft((current) => current && ({ ...current, local_service_port: Number(event.target.value) }))} type="number" value={serverDraft?.local_service_port ?? 8090} />}
+          />}
+        </div>
+      </TMPanel>
+
+      <SectionLabel title={tr("内存规划", "Memory plan")} />
+      <TMPanel className="server-settings-panel">
+        <div className="setting-list">
+          <SettingRow
+            title={tr("模型总驻留", "Total model residency")}
+            detail={tr("MFQ 根据模型、专家缓存和设备可用内存自动规划驻留。", "MFQ plans model, expert-cache, and device residency from the available memory automatically.")}
+            trailing={<strong>{runtimeMemory + runtimeCache > 0 ? formatBytes(runtimeMemory + runtimeCache) : tr("自动", "Automatic")}</strong>}
+          />
+          <SettingRow
+            title={tr("前缀 RAM 配额", "Prefix RAM allowance")}
+            detail={tr("RAM 热层从统一内存预算中分配，剩余空间可用于模型和专家缓存。", "The RAM hot tier is allocated inside the unified budget, leaving the remainder for model and expert caching.")}
+            trailing={<strong>{prefixCacheHotBytes > 0 ? formatBytes(prefixCacheHotBytes) : tr("自动", "Automatic")}</strong>}
+          />
+          <SettingRow
+            title={tr("启动时预热专家缓存", "Warm expert cache on launch")}
+            detail={tr("MFQ 会依据架构和当前内存压力自动预热可用专家槽位。", "MFQ warms available expert slots according to the architecture and current memory pressure.")}
+            trailing={<span className="server-managed-value">{tr("自动", "Automatic")}</span>}
+          />
+          <SettingRow
+            title={tr("前缀块大小", "Prefix block size")}
+            detail={tr("较大的块有利于长提示词吞吐，较小的块提供更细粒度的部分前缀复用。", "Larger blocks favor long-prompt throughput; smaller blocks allow finer partial-prefix reuse.")}
+            trailing={<div className="server-unit-value"><strong>{formatNumber(runtime?.prefix_cache_block_tokens || 256)}</strong><span>tokens</span></div>}
+          />
+          <SettingRow
+            title={tr("最大上下文", "Maximum context")}
+            detail={tr("修改后重载当前模型；未加载模型时会作为下一次加载的默认值。", "Reloads the active model after a change; otherwise it becomes the next load default.")}
+            trailing={<div className="server-row-actions"><div className="server-input-unit"><input aria-label={tr("最大上下文", "Maximum context")} className="server-number-input" max={1048576} min={512} onChange={(event) => setContextSize(Number(event.target.value))} type="number" value={contextSize} /><span>tokens</span></div><button disabled={busy || !runtime?.model} onClick={() => void reloadRuntime()} type="button">{tr("重载", "Reload")}</button></div>}
+          />
+        </div>
+      </TMPanel>
+
+      <SectionLabel title={tr("持久化前缀缓存", "Persistent Prefix cache")} />
+      <TMPanel className="server-settings-panel">
+        <div className="setting-list">
+          <SettingRow
+            title={tr("启用 SSD 层", "Enable SSD tier")}
+            detail={tr("保存经过校验的增量前缀块，并允许服务重启后继续复用。", "Persist incremental, checksummed Prefix blocks and recover them after restart.")}
+            trailing={<input aria-label={tr("启用 SSD 层", "Enable SSD tier")} checked={prefixCachePersistent && !prefixCacheHotOnly} disabled readOnly type="checkbox" />}
+          />
+          <SettingRow
+            title={tr("目录", "Directory")}
+            detail={tr("MFQ 自动选择应用数据目录中的本地缓存位置。", "MFQ automatically uses a local cache location inside the application data directory.")}
+            trailing={<code>{tr("由 MFQ 管理", "Managed by MFQ")}</code>}
+          />
+          <SettingRow
+            title={tr("SSD 配额", "SSD budget")}
+            detail={tr("基于 LRU 的回收策略会将磁盘占用控制在此上限内。", "Leaf-aware LRU keeps disk usage within this ceiling.")}
+            trailing={<div className="server-unit-value"><strong>{prefixCacheDiskBudget > 0 ? formatNumber(prefixCacheDiskBudget / 2 ** 30, 0) : "--"}</strong><span>GiB</span></div>}
+          />
+        </div>
+      </TMPanel>
+
+      <SectionLabel title={tr("对话", "Chat")} />
+      <TMPanel className="server-settings-panel">
+        <div className="setting-list">
+          <SettingRow
+            title={tr("系统提示词", "System prompt")}
+            detail={tr("添加到内置对话中新请求的开头。", "Prepended to new requests in the built-in playground.")}
+            trailing={<textarea aria-label={tr("系统提示词", "System prompt")} className="server-prompt-input" onChange={(event) => updateGlobalInference({ systemPrompt: event.target.value })} placeholder={tr("系统提示词", "System prompt")} rows={2} value={settings.systemPrompt} />}
+          />
+          <SettingRow
+            title={tr("最大输出", "Maximum output")}
+            detail={tr("内置对话的最大生成长度。", "Completion limit for the built-in chat.")}
+            trailing={<div className="server-input-unit"><input aria-label={tr("最大输出", "Maximum output")} className="server-number-input" max={65536} min={1} onChange={(event) => updateGlobalInference({ maxTokens: Number(event.target.value) })} type="number" value={settings.maxTokens} /><span>tokens</span></div>}
+          />
+          <SettingRow
+            title={tr("温度", "Temperature")}
+            detail={tr("采样温度范围为 0 到 2。", "Sampling temperature between 0 and 2.")}
+            trailing={<div className="server-temperature-control"><input aria-label={tr("温度", "Temperature")} max={2} min={0} onChange={(event) => updateGlobalInference({ temperature: Number(event.target.value) })} step={0.05} type="range" value={settings.temperature} /><strong>{formatNumber(settings.temperature, 2)}</strong></div>}
+          />
+        </div>
+      </TMPanel>
+
+      <SectionLabel title={tr("自动化", "Automation")} />
+      <TMPanel className="server-settings-panel">
+        <div className="setting-list">
+          <SettingRow
+            title={tr("MFQ Studio 打开时启动服务器", "Start server when MFQ Studio opens")}
+            detail={tr("本地模式会自动恢复服务，并使用当前模型和已保存的运行配置。", "Local mode restores the server automatically with the current model and saved runtime configuration.")}
+            trailing={<input aria-label={tr("MFQ Studio 打开时启动服务器", "Start server when MFQ Studio opens")} checked={serverDraft?.mode !== "remote"} disabled readOnly type="checkbox" />}
+          />
+        </div>
+      </TMPanel>
+
+      <div className="server-page-footer">
+        <span>{tr("对话默认值会自动保存。", "Chat defaults are saved automatically.")}</span>
+        <button className="primary" disabled={busy || !serverDraft} onClick={() => void saveStudioSettings()} type="button">{tr("保存服务器设置", "Save server settings")}</button>
+      </div>
+    </div>
   );
 
   const renderMarkdown = (text: string, live = false, normalizeEscapedLineBreaks = false) => (
@@ -3584,6 +3548,161 @@ export default function App() {
     </Suspense>
   );
 
+  const resetSettingsDraft = () => setSettingsDraft({
+    ...modeTemplateSettings({
+      ...DEFAULT_SETTINGS,
+      language: settingsDraft.language,
+      theme: settingsDraft.theme,
+      playbackEnabled: settingsDraft.playbackEnabled,
+    }, active?.mode ?? mode, runtime, realtime),
+    inheritModelDefaults: true,
+  });
+
+  const settingsPage = (
+    <div className="settings-page">
+      <SectionLabel title={tr("推理默认值", "Generation defaults")} />
+      <TMPanel className="settings-page-panel settings-defaults-panel">
+        <SettingRow
+          title={tr("使用模型或架构默认值", "Use model or architecture defaults")}
+          detail={tr(
+            "优先读取模型元数据，缺失参数由模型型号或架构默认值补齐。",
+            "Read model metadata first, then fill missing values from model or architecture defaults.",
+          )}
+          trailing={<input aria-label={tr("使用模型或架构默认值", "Use model or architecture defaults")} checked={settingsDraft.inheritModelDefaults} onChange={(event) => setModelDefaultInheritance(event.target.checked)} type="checkbox" />}
+        />
+      </TMPanel>
+
+      <fieldset className="settings-page-inherited" disabled={settingsDraft.inheritModelDefaults}>
+        <div className="settings-page-grid">
+          <div className="settings-page-section">
+            <SectionLabel title={tr("预设与提示词", "Presets and prompt")} />
+            <TMPanel className="settings-page-panel settings-form-panel">
+              <div className="settings-control-block">
+                <label>{tr("生成预设", "Generation preset")}</label>
+                <div className="segmented">
+                  {(["precise", "balanced", "creative"] as const).map((name) => (
+                    <button aria-pressed={settingsDraft.preset === name} key={name} onClick={() => applyPreset(name)} type="button">
+                      {name === "precise" ? tr("精确", "Precise") : name === "balanced" ? tr("均衡", "Balanced") : tr("创意", "Creative")}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              {presetManager}
+              <div className="settings-control-block">
+                <label htmlFor="settings-system-prompt">{tr("系统提示词", "System prompt")}</label>
+                <textarea id="settings-system-prompt" onChange={(event) => setSettingsDraft((current) => ({ ...current, systemPrompt: event.target.value }))} rows={5} value={settingsDraft.systemPrompt} />
+              </div>
+              <SettingRow
+                title={tr("排除历史思考", "Exclude reasoning history")}
+                detail={tr("后续请求不再发送已保存的思考内容。", "Do not send saved reasoning in later requests.")}
+                trailing={<input aria-label={tr("排除历史思考", "Exclude reasoning history")} checked={settingsDraft.excludeReasoning} onChange={(event) => setSettingsDraft((current) => ({ ...current, excludeReasoning: event.target.checked }))} type="checkbox" />}
+              />
+              <SettingRow
+                title={tr("最大生成 token 数", "Maximum output tokens")}
+                detail={tr("限制单次回答可生成的 token 数。", "Limit the number of tokens generated in one response.")}
+                trailing={<input className="settings-number-input" max={65536} min={1} onChange={(event) => setSettingsDraft((current) => ({ ...current, maxTokens: Number(event.target.value) }))} type="number" value={settingsDraft.maxTokens} />}
+              />
+            </TMPanel>
+          </div>
+
+          <div className="settings-page-section">
+            <SectionLabel title={tr("采样", "Sampling")} />
+            <TMPanel className="settings-page-panel settings-form-panel settings-sampling-panel">
+              {([
+                [tr("温度", "Temperature"), "temperature", 0, 2, 0.05],
+                [tr("核采样概率", "Top P"), "topP", 0.05, 1, 0.05],
+                [tr("重复惩罚", "Repetition penalty"), "repetitionPenalty", 0.5, 2, 0.01],
+                [tr("存在惩罚", "Presence penalty"), "presencePenalty", -2, 2, 0.05],
+                [tr("频率惩罚", "Frequency penalty"), "frequencyPenalty", -2, 2, 0.05],
+              ] as const).map(([label, key, min, max, step]) => (
+                <label className="settings-range" key={key}>
+                  <span>{label}<output>{settingsDraft[key].toFixed(2)}</output></span>
+                  <input max={max} min={min} onChange={(event) => setSettingsDraft((current) => ({ ...current, [key]: Number(event.target.value), preset: "custom" }))} step={step} type="range" value={settingsDraft[key]} />
+                </label>
+              ))}
+              <div className="settings-inline-fields">
+                <label><span>{tr("候选词数", "Top K")}</span><input max={1024} min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, topK: Number(event.target.value), preset: "custom" }))} type="number" value={settingsDraft.topK} /></label>
+                <label><span>{tr("随机种子", "Seed")}</span><input min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, seed: event.target.value ? Number(event.target.value) : null }))} placeholder={tr("随机", "Random")} type="number" value={settingsDraft.seed ?? ""} /></label>
+              </div>
+            </TMPanel>
+          </div>
+        </div>
+      </fieldset>
+
+      <div className="settings-page-grid">
+        <div className="settings-page-section">
+          <SectionLabel title={tr("上下文", "Context")} />
+          <TMPanel className="settings-page-panel">
+            <SettingRow
+              title={tr("上下文窗口", "Context window")}
+              detail={tr("更改后需要重新加载当前模型。", "Changing this value requires reloading the current model.")}
+              trailing={<input className="settings-number-input settings-context-input" max={Number(runtime?.context_capacity) || 1048576} min={512} onChange={(event) => setContextSize(Number(event.target.value))} step={512} type="number" value={contextSize} />}
+            />
+            <div className="settings-panel-actions"><button className="secondary" disabled={busy} onClick={() => void reloadRuntime()} type="button">{tr("按此上下文重载模型", "Reload model with this context")}</button></div>
+          </TMPanel>
+        </div>
+
+        <div className="settings-page-section">
+          <SectionLabel title={tr("外观", "Appearance")} />
+          <TMPanel className="settings-page-panel">
+            <SettingRow
+              title={tr("界面语言", "Interface language")}
+              detail={tr("选择 MFQ Studio 的显示语言。", "Choose the display language for MFQ Studio.")}
+              trailing={<select onChange={(event) => setSettingsDraft((current) => ({ ...current, language: event.target.value as UiLanguage }))} value={settingsDraft.language}><option value="system">{tr("跟随系统", "System")}</option><option value="zh-CN">简体中文</option><option value="en">English</option></select>}
+            />
+            <SettingRow
+              title={tr("主题", "Theme")}
+              detail={tr("跟随系统，或固定使用浅色或深色外观。", "Follow the system or use a fixed light or dark appearance.")}
+              trailing={<select onChange={(event) => setSettingsDraft((current) => ({ ...current, theme: event.target.value as UiTheme }))} value={settingsDraft.theme}><option value="system">{tr("跟随系统", "System")}</option><option value="light">{tr("浅色", "Light")}</option><option value="dark">{tr("深色", "Dark")}</option></select>}
+            />
+          </TMPanel>
+        </div>
+      </div>
+
+      <SectionLabel title={tr("数据与连接", "Data and connection")} />
+      <TMPanel className="settings-page-panel settings-data-panel">
+        <SettingRow
+          title={tr("本地设置数据", "Local settings data")}
+          detail={tr("导出或导入界面设置、生成预设和对话数据。", "Export or import interface settings, generation presets, and conversation data.")}
+          trailing={<div className="portable-actions"><button onClick={exportStudioData} type="button">{tr("导出", "Export")}</button><label>{tr("导入", "Import")}<input accept="application/json,.json" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importStudioData(file); event.target.value = ""; }} type="file" /></label></div>}
+        />
+        {studio && <SettingRow title={tr("服务器连接", "Server connection")} detail={tr("配置本地或远程 MFQ Server。", "Configure a local or remote MFQ Server.")} trailing={<button className="secondary" onClick={openServerPage} type="button">{tr("打开服务器设置", "Open server settings")}</button>} />}
+      </TMPanel>
+
+      <div className="settings-page-actions">
+        <button onClick={resetSettingsDraft} type="button">{tr("恢复默认", "Reset")}</button>
+        <button className="primary" onClick={saveSettings} type="button">{tr("应用设置", "Apply settings")}</button>
+      </div>
+    </div>
+  );
+
+  const dashboardCopy: Record<DashboardPage, { title: string; subtitle: string }> = {
+    overview: {
+      title: tr("概览", "Overview"),
+      subtitle: tr("启动服务、查看内存层级并复制 API 端点。", "Start the server, watch the memory hierarchy, and copy the API endpoint."),
+    },
+    models: {
+      title: tr("模型", "Models"),
+      subtitle: tr("管理本地检查点和已加载实例。", "Manage local checkpoints and loaded instances."),
+    },
+    connections: {
+      title: tr("服务器", "Server"),
+      subtitle: tr("配置原生 Runtime、内存规划、持久化前缀缓存与内置对话默认值。", "Configure the native runtime, memory plan, persistent Prefix cache, and built-in chat defaults."),
+    },
+    cache: {
+      title: tr("资源与缓存", "Resources"),
+      subtitle: tr("检查内存层级、前缀缓存与运行配置。", "Inspect memory, prefix caching, and runtime profiles."),
+    },
+    logs: {
+      title: tr("日志", "Logs"),
+      subtitle: tr("查看请求、后台任务和服务事件。", "Inspect requests, background jobs, and server events."),
+    },
+    settings: {
+      title: tr("设置", "Settings"),
+      subtitle: tr("配置界面与全局推理默认值。", "Configure the interface and global inference defaults."),
+    },
+  };
+
   return (
     <div className="app-shell">
       <aside className={`sidebar ${sidebarOpen ? "open" : ""}`} id="studio-sidebar">
@@ -3591,78 +3710,30 @@ export default function App() {
           <img src="/mfq-mark.svg" alt="" />
           <div><strong>MFQ</strong><span>Studio</span></div>
         </div>
-        <div className="sidebar-group-label">{tr("工作区", "Workspace")}</div>
-        <nav className="primary-nav">
-          <button className={view === "chat" ? "active" : ""} onClick={() => { setView("chat"); setSidebarOpen(false); }} type="button"><Icon name="chat" />{tr("对话", "Chat")}</button>
-          <button className={view === "dashboard" ? "active" : ""} onClick={() => { setView("dashboard"); setSidebarOpen(false); }} type="button"><Icon name="activity" />{tr("仪表盘", "Dashboard")}<span>{formatNumber(runtime?.active_requests || 0)}</span></button>
-          <button className={view === "lab" ? "active" : ""} onClick={() => { setView("lab"); setSidebarOpen(false); }} type="button"><Icon name="flask" />{tr("实验室", "Lab")}</button>
-        </nav>
-        <div className="sidebar-divider" />
-        <div className={`chat-sidebar-section ${view === "chat" ? "visible" : ""}`}>
-        <div className="assistant-heading"><span>{tr("角色", "Roles")}</span><small>{assistantRoles.length}</small></div>
-        <nav className="assistant-list" aria-label={tr("角色", "Roles")}>
-          {assistantRoles.map((role) => {
-            const count = sessions.filter((session) => canonicalSessionAssistantId(session, storedPresets) === role.id).length;
-            return <div className={`assistant-row ${selectedAssistantId === role.id ? "active" : ""}`} key={role.id}><button className="assistant-main" onClick={() => selectAssistant(role)} type="button"><span>{role.preset?.icon || role.name.slice(0, 1).toLocaleUpperCase()}</span><div><strong>{role.name}</strong><small>{count} {tr("个会话", "sessions")}</small></div></button><button aria-label={tr("编辑角色", "Edit role")} className="assistant-edit" onClick={() => editRole(role)} title={tr("编辑角色", "Edit role")} type="button"><Icon name="edit" size={12} /></button></div>;
-          })}
-        </nav>
-        <button className="new-session" onClick={createRole} type="button"><Icon name="plus" size={14} />{tr("新角色", "New role")}</button>
-        <details className="session-create" open={!model}>
-          <summary>{tr("新会话默认设置", "New session defaults")}</summary>
-          <button className="open-local-model" disabled={busy} onClick={() => void chooseModelDirectory()} type="button"><Icon name="folder" size={14} />{tr("打开模型文件夹", "Open model folder")}</button>
-          <label htmlFor="new-model">{tr("模型", "Model")}</label>
-          <select id="new-model" value={model} onChange={(event) => setModel(event.target.value)}>
-            {!models.length && <option value="">{tr("尚未加载模型", "No model loaded")}</option>}
-            {models.map((item) => <option key={item.id} value={item.id}>{item.id}</option>)}
-          </select>
-          <div className="mode-picker">
-            {(["text", "voice", "full_duplex"] as SessionMode[]).map((item) => {
-              const feature = capabilities?.model_capabilities.features;
-              const disabled = item === "voice" ? !feature?.audio_input : item === "full_duplex" ? !feature?.full_duplex : false;
-              return <button aria-pressed={mode === item} disabled={disabled} key={item} onClick={() => setMode(item)} type="button">{MODE_LABELS[item][english ? 1 : 0]}</button>;
-            })}
-          </div>
-        </details>
-        <div className="history-heading"><span>{tr("会话", "Sessions")}</span><div><button aria-label={tr("新会话", "New session")} disabled={!model} onClick={() => void createSession()} title={model ? tr("新会话", "New session") : tr("请先加载模型", "Load a model first")} type="button"><Icon name="plus" size={14} /></button><button aria-label={tr("清空当前角色会话", "Clear role sessions")} onClick={clearSessions} title={tr("清空当前角色会话", "Clear role sessions")} type="button"><Icon name="trash" size={14} /></button></div></div>
-        <nav className="session-list" aria-label="Sessions">
-          {loading && <span className="empty-note">{tr("加载中…", "Loading…")}</span>}
-          {!loading && assistantSessions.length === 0 && <span className="empty-note">{tr("这个角色还没有会话", "No sessions for this role")}</span>}
-          {assistantSessions.map((session) => (
-            <div className={`session-row ${activeId === session.id ? "active" : ""}`} key={session.id}>
-              {renamingId === session.id ? (
-                <input autoFocus onBlur={() => void saveRename(session)} onChange={(event) => setRenameValue(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void saveRename(session); if (event.key === "Escape") setRenamingId(null); }} value={renameValue} />
-              ) : (
-                <button className="session-main" onClick={() => { setActiveId(session.id); setView("chat"); setSidebarOpen(false); }} type="button"><span>{session.title || tr("未命名会话", "Untitled session")}</span><small>{MODE_LABELS[session.mode][english ? 1 : 0]} · r{session.revision}</small></button>
-              )}
-              <div className="session-actions">
-                <button aria-label={tr("重命名", "Rename")} onClick={() => { setRenamingId(session.id); setRenameValue(session.title || ""); }} title={tr("重命名", "Rename")} type="button"><Icon name="edit" size={13} /></button>
-                <button aria-label={tr("删除", "Delete")} onClick={() => void deleteSession(session)} title={tr("删除", "Delete")} type="button"><Icon name="trash" size={13} /></button>
-              </div>
-            </div>
-          ))}
-        </nav>
-        </div>
-        <div className={`context-sidebar-section ${view === "dashboard" ? "visible" : ""}`}>
-          <div className="context-sidebar-heading"><strong>{tr("仪表盘", "Dashboard")}</strong><small>{tr("运行与服务", "Runtime and service")}</small></div>
-          <nav className="context-nav">
-            <button className={dashboardPage === "overview" ? "active" : ""} onClick={() => openStudioPage("dashboard", "overview")} type="button"><Icon name="activity" size={14} />{tr("概览", "Overview")}</button>
-            <button className={dashboardPage === "cache" ? "active" : ""} onClick={() => openStudioPage("dashboard", "cache")} type="button">{tr("缓存与配置", "Cache and profiles")}</button>
-            <button className={dashboardPage === "models" ? "active" : ""} onClick={() => openStudioPage("dashboard", "models")} type="button">{tr("模型与任务", "Models and jobs")}</button>
-            <button className={dashboardPage === "connections" ? "active" : ""} onClick={() => openStudioPage("dashboard", "connections")} type="button">{tr("工具与连接", "Tools and connections")}</button>
-          </nav>
-        </div>
-        <div className={`context-sidebar-section ${view === "lab" ? "visible" : ""}`}>
-          <div className="context-sidebar-heading"><strong>{tr("实验室", "Lab")}</strong><small>{tr("数据与量化工作流", "Data and quantization")}</small></div>
-          <nav className="context-nav">
-            <button className={labPage === "models" ? "active" : ""} onClick={() => openStudioPage("lab", "models")} type="button">{tr("模型仓库", "Model hubs")}</button>
-            <button className={labPage === "evaluations" ? "active" : ""} onClick={() => openStudioPage("lab", "evaluations")} type="button">{tr("评测与数据集", "Evaluation and datasets")}</button>
-            <button className={labPage === "quantization" ? "active" : ""} onClick={() => openStudioPage("lab", "quantization")} type="button">{tr("量化工作台", "Quantization workspace")}</button>
+        <div className="sidebar-scroll">
+          <nav className="sectioned-nav" aria-label={tr("推理", "Inference")}>
+            <section>
+              <div className="sidebar-group-label">{tr("推理", "Inference")}</div>
+              <button className={view === "dashboard" && dashboardPage === "overview" ? "active" : ""} onClick={() => openStudioPage("dashboard", "overview")} type="button"><Icon name="gauge" />{tr("概览", "Overview")}<span>{formatNumber(runtime?.active_requests || 0)}</span></button>
+              <button className={view === "dashboard" && dashboardPage === "models" ? "active" : ""} onClick={() => openStudioPage("dashboard", "models")} type="button"><Icon name="folder" />{tr("模型", "Models")}</button>
+              <button className={view === "dashboard" && dashboardPage === "connections" ? "active" : ""} onClick={openServerPage} type="button"><Icon name="server-rack" />{tr("服务器", "Server")}</button>
+              <button className={view === "dashboard" && dashboardPage === "cache" ? "active" : ""} onClick={() => openStudioPage("dashboard", "cache")} type="button"><Icon name="memory" />{tr("资源", "Resources")}</button>
+            </section>
+            <section>
+              <div className="sidebar-group-label">{tr("交互", "Playground")}</div>
+              <button className={view === "chat" ? "active" : ""} onClick={() => { setView("chat"); setSidebarOpen(false); }} type="button"><Icon name="chat" />{tr("对话", "Chat")}</button>
+            </section>
+            <section>
+              <div className="sidebar-group-label">{tr("系统", "System")}</div>
+              <button className={view === "dashboard" && dashboardPage === "logs" ? "active" : ""} onClick={() => openStudioPage("dashboard", "logs")} type="button"><Icon name="activity" />{tr("日志", "Logs")}</button>
+              <button className={view === "dashboard" && dashboardPage === "settings" ? "active" : ""} onClick={openSettings} type="button"><Icon name="settings" />{tr("设置", "Settings")}</button>
+            </section>
           </nav>
         </div>
         <button className="sidebar-runtime-card" onClick={() => openStudioPage("dashboard", "overview")} type="button">
           <span className={`runtime-dot ${Number(runtime?.active_requests || 0) > 0 ? "busy" : runtime?.model ? "ready" : "idle"}`} />
           <span>
-            <strong>{runtime?.model || tr("Runtime 空闲", "Runtime idle")}</strong>
+            <strong>{runtime?.model || tr("服务空闲", "Server idle")}</strong>
             <small>{runtime?.model ? `${formatNumber(runtime?.active_requests || 0)} ${tr("个活动请求", "active requests")}` : tr("选择模型以开始", "Choose a model to begin")}</small>
           </span>
           <Icon name="activity" size={14} />
@@ -3671,30 +3742,24 @@ export default function App() {
       <button aria-label={tr("关闭侧栏", "Close sidebar")} className={`mobile-scrim ${sidebarOpen ? "open" : ""}`} onClick={() => setSidebarOpen(false)} type="button" />
 
       <main className="workspace">
-        <header className="topbar">
-          <div className="topbar-identity">
-            <button aria-controls="studio-sidebar" aria-expanded={sidebarOpen} aria-label={tr("打开侧栏", "Open sidebar")} className="sidebar-toggle" onClick={() => setSidebarOpen(true)} type="button"><Icon name="menu" /></button>
-            <div className="topbar-model"><span>{active?.model || model || tr("尚未加载模型", "No model loaded")}</span><small>{capabilities?.model_type || runtime?.model_type || "runtime"}</small></div>
-          </div>
-          <div className="topbar-actions">
-            {capabilities && <div className="capabilities">{CAPABILITY_LABELS.filter(([feature]) => capabilities.model_capabilities.features[feature]).map(([feature, label]) => <span className={feature === "full_duplex" && !realtimeAvailable ? "muted" : ""} key={feature}>{label[english ? 1 : 0]}</span>)}</div>}
-            <div className="quick-metrics"><span><b>{lastTtftMs == null ? "--" : `${formatNumber(lastTtftMs, 1)} ms`}</b> TTFT</span><span><b>{last ? formatNumber(contextTokens) : "--"}</b> context</span><span><b>{last?.decode_tps == null ? "--" : formatNumber(last.decode_tps, 1)}</b> tok/s</span></div>
-            <div aria-label={tr("外观", "Appearance")} className="theme-switcher" role="group">
-              <button aria-label={tr("自动主题", "Auto theme")} aria-pressed={settings.theme === "system"} onClick={() => setUiTheme("system")} title={tr("跟随系统", "Auto")} type="button"><Icon name="sun-moon" size={13} /><span>Auto</span></button>
-              <button aria-label={tr("浅色主题", "Light theme")} aria-pressed={settings.theme === "light"} onClick={() => setUiTheme("light")} title={tr("浅色", "Light")} type="button"><Icon name="sun" size={13} /><span>Light</span></button>
-              <button aria-label={tr("深色主题", "Dark theme")} aria-pressed={settings.theme === "dark"} onClick={() => setUiTheme("dark")} title={tr("深色", "Dark")} type="button"><Icon name="moon" size={13} /><span>Dark</span></button>
-            </div>
-            <button aria-label={tr("打开模型文件夹", "Open model folder")} disabled={busy} onClick={() => void chooseModelDirectory()} title={tr("选择包含 MFQ 模型的文件夹", "Choose a folder containing MFQ models")} type="button"><Icon name="folder" /></button>
-            <button aria-label={tr("导出会话", "Export chat")} disabled={!active} onClick={exportConversation} title={tr("导出会话", "Export chat")} type="button"><Icon name="download" /></button>
-            <button aria-label={tr("推理设置", "Inference settings")} onClick={openSettings} title={tr("推理设置", "Inference settings")} type="button"><Icon name="settings" /></button>
-          </div>
-        </header>
-
         {view === "chat" ? (
           <section className="chat-view">
+            <header className="chat-screen-header">
+              <div className="chat-screen-title">
+                <h1>{tr("对话", "Chat")}</h1>
+              </div>
+              <div className="chat-screen-actions">
+                <div className="chat-model-summary">
+                  <strong>{active?.model || model || tr("尚未加载模型", "No model loaded")}</strong>
+                  <small>{tr(`最多 ${formatNumber(effectiveSettings.maxTokens)} tokens`, `${formatNumber(effectiveSettings.maxTokens)} max tokens`)} · {tr("温度", "temperature")} {formatNumber(effectiveSettings.temperature, 2)} · {tr("流式", "streaming")}</small>
+                </div>
+                <span className={`runtime-status-pill ${runtime?.model ? "running" : "stopped"}`}><i />{runtime?.model ? tr("就绪", "Ready") : tr("空闲", "Idle")}</span>
+                <button aria-label={tr("清空对话", "Clear conversation")} className="chat-icon-button" disabled={!active || busy || (!messages.length && !currentVoiceMessages.length)} onClick={() => void clearActiveConversation()} title={tr("清空对话", "Clear conversation")} type="button"><Icon name="trash" size={14} /></button>
+              </div>
+            </header>
             <div className="message-scroller" onScroll={handleMessageScroll} ref={messageScrollerRef}>
               <div className="message-list" aria-live="polite">
-                {!active && <div className="welcome"><img src="/mfq-mark.svg" alt="" />{!model ? <><h1>{tr("加载模型", "Load a model")}</h1><p>{tr("从服务器文件夹加载模型，或连接已有模型服务。", "Load a model from a server folder or connect to an existing model server.")}</p><button className="open-model-primary" disabled={busy} onClick={() => void chooseModelDirectory()} type="button"><Icon name="folder" />{tr("选择模型文件夹", "Choose model folder")}</button></> : <><h1>MFQ Studio</h1><p>{tr("创建会话后即可开始本地推理。", "Create a session to start local inference.")}</p><div className="prompt-grid"><button onClick={() => setDraft(tr("介绍一下这个模型。", "Introduce this model."))} type="button">{tr("介绍模型", "Introduce the model")}</button><button onClick={() => setDraft(tr("写一段 Python 示例。", "Write a Python example."))} type="button">{tr("代码示例", "Code example")}</button></div></>}</div>}
+                {!messages.length && !currentVoiceMessages.length && !live && <div className="welcome"><Icon name="chat" size={34} />{!model ? <><h1>{tr("尚未加载模型", "No model loaded")}</h1><p>{tr("选择本地检查点后即可开始对话。", "Choose a local checkpoint to use the inference playground.")}</p><button className="open-model-primary" disabled={busy} onClick={() => void chooseModelDirectory()} type="button"><Icon name="folder" />{tr("选择模型", "Choose model")}</button></> : !active ? <><h1>{tr("本机私密对话", "A private conversation on your Mac")}</h1><p>{tr("请求直接发送到本机 MFQ 服务，不经过云端中转。", "Requests go directly to the local MFQ Runtime with no cloud relay.")}</p><button className="open-model-primary" disabled={busy} onClick={() => void createSession()} type="button">{tr("开始对话", "Start chat")}</button></> : <><h1>{tr("本机私密对话", "A private conversation on your Mac")}</h1><p>{tr("请求直接发送到本机 MFQ 服务，不经过云端中转。", "Requests go directly to the local MFQ Runtime with no cloud relay.")}</p></>}</div>}
                 {messages.map((message) => {
                   const parts = textParts(message);
                   const editing = editDraft?.messageId === message.id;
@@ -3730,13 +3795,11 @@ export default function App() {
                 <div className="composer-toolbar">
                   <input accept={attachmentAccept} hidden multiple onChange={(event) => selectAttachments(event.target.files)} ref={attachmentInputRef} type="file" />
                   <button aria-label={tr("添加附件", "Add attachment")} disabled={!active || busy} onClick={() => attachmentInputRef.current?.click()} title={tr("添加文档或媒体", "Add document or media")} type="button"><Icon name="paperclip" /></button>
-                  {mcpTools.length > 0 && <select aria-label={tr("可用工具", "Available tools")} onChange={(event) => { const name = event.target.value; if (name && !selectedTools.includes(name)) setSelectedTools((current) => [...current, name]); event.target.value = ""; }} defaultValue=""><option value="">{selectedTools.length ? `${selectedTools.length} ${tr("个工具", "tools")}` : tr("工具", "Tools")}</option>{mcpTools.filter((tool) => !selectedTools.includes(tool.qualified_name)).map((tool) => <option key={tool.qualified_name} value={tool.qualified_name}>{tool.qualified_name}</option>)}</select>}
-                  {selectedTools.length > 0 && <button aria-label={tr("清空工具", "Clear tools")} onClick={() => setSelectedTools([])} type="button">× {selectedTools.length}</button>}
                   {capabilities && (capabilities.model_capabilities.features.audio_input || capabilities.model_capabilities.features.full_duplex) && <select aria-label={tr("交互模式", "Interaction mode")} disabled={!active || busy || voiceState !== "idle"} onChange={(event) => void selectInteractionMode(event.target.value as SessionMode)} value={active?.mode ?? mode}>{(["text", "voice", "full_duplex"] as SessionMode[]).map((item) => { const feature = capabilities.model_capabilities.features; const disabled = item === "voice" ? !feature.audio_input : item === "full_duplex" ? !feature.full_duplex : false; return <option disabled={disabled} key={item} value={item}>{MODE_LABELS[item][english ? 1 : 0]}</option>; })}</select>}
                   {realtimeAvailable && <button aria-label={tr("语音输入", "Voice input")} aria-pressed={voiceState !== "idle" && voiceState !== "error"} className="voice-button" disabled={!active || active.mode === "text" || busy} onClick={() => void toggleVoice()} style={{ "--voice-level": voiceLevel } as React.CSSProperties} title={active?.mode === "text" ? tr("请先选择语音或全双工模式", "Select voice or full duplex mode first") : voiceState === "processing" ? tr("语音处理中", "Processing voice") : tr("语音输入", "Voice input")} type="button"><span /></button>}
                   {realtimeAvailable && active?.mode !== "text" && <button aria-label={tr("语音播放", "Voice playback")} aria-pressed={settings.playbackEnabled} onClick={() => setSettings((current) => ({ ...current, playbackEnabled: !current.playbackEnabled }))} title={tr("语音播放", "Voice playback")} type="button"><Icon name={settings.playbackEnabled ? "volume" : "volume-off"} /></button>}
-                  {active?.mode === "text" && <button aria-pressed={thinkingSupported && effectiveSettings.enableThinking} disabled={!thinkingSupported || roleOverridesInference} onClick={() => updateGlobalInference({ enableThinking: !effectiveSettings.enableThinking })} title={roleOverridesInference ? tr("该参数由当前角色覆盖", "This setting is overridden by the current role") : undefined} type="button"><Icon name="lightbulb" />{tr("思考", "Thinking")}</button>}
-                  {active?.mode === "text" && thinkingSupported && effectiveSettings.enableThinking && reasoningValues.length > 0 && <select aria-label={tr("思考档位", "Reasoning effort")} disabled={roleOverridesInference} onChange={(event) => updateGlobalInference({ reasoningEffort: event.target.value })} value={effectiveSettings.reasoningEffort}><option value="">{tr("标准", "Standard")}</option>{reasoningValues.map((value) => <option key={value} value={value}>{value}</option>)}</select>}
+                  {active?.mode === "text" && <button aria-pressed={thinkingSupported && effectiveSettings.enableThinking} disabled={!thinkingSupported} onClick={() => updateGlobalInference({ enableThinking: !effectiveSettings.enableThinking })} type="button"><Icon name="lightbulb" />{tr("思考", "Thinking")}</button>}
+                  {active?.mode === "text" && thinkingSupported && effectiveSettings.enableThinking && reasoningValues.length > 0 && <select aria-label={tr("思考档位", "Reasoning effort")} onChange={(event) => updateGlobalInference({ reasoningEffort: event.target.value })} value={effectiveSettings.reasoningEffort}><option value="">{tr("标准", "Standard")}</option>{reasoningValues.map((value) => <option key={value} value={value}>{value}</option>)}</select>}
                   <span className="composer-hint">{voiceState !== "idle" ? voiceState : tr("Enter 发送 · Shift+Enter 换行", "Enter to send · Shift+Enter for newline")}</span>
                   {busy ? <button aria-label={stopping ? tr("正在停止生成", "Stopping generation") : tr("停止生成", "Stop generation")} className="send-button stop" disabled={stopping} onClick={() => void stopGeneration()} type="button"><Icon name="stop" size={14} /></button> : <button aria-label={tr("发送", "Send")} className="send-button" disabled={!active || (!draft.trim() && !attachments.length)} type="submit"><Icon name="send" size={15} /></button>}
                 </div>
@@ -3746,27 +3809,71 @@ export default function App() {
           </section>
         ) : view === "dashboard" ? (
           <section className="dashboard-view" id="dashboard-overview">
-            <div className="page-heading"><div><p>MFQ Runtime</p><h1>{dashboardPage === "overview" ? tr("状态", "Status") : dashboardPage === "cache" ? tr("缓存与配置", "Cache and profiles") : dashboardPage === "models" ? tr("模型与任务", "Models and jobs") : tr("工具与连接", "Tools and connections")}</h1></div><button aria-label={tr("重置当前布局", "Reset current layout")} onClick={() => setDashboardLayoutReset((current) => current + 1)} title={tr("重置当前布局", "Reset current layout")} type="button"><Icon name="refresh" /></button></div>
-            {dashboardPage === "overview" && <section className="runtime-hero">
+            <ScreenHeader
+              title={dashboardCopy[dashboardPage].title}
+              subtitle={dashboardCopy[dashboardPage].subtitle}
+              trailing={dashboardPage === "overview" ? <button disabled={busy} onClick={() => void refreshRuntime()} type="button"><Icon name="refresh" size={14} />{tr("刷新", "Refresh")}</button> : dashboardPage === "models" ? <button disabled={busy} onClick={() => void chooseModelDirectory()} type="button"><Icon name="plus" size={14} />{tr("添加模型", "Add model")}</button> : dashboardPage === "settings" ? <button className="primary" onClick={saveSettings} type="button">{tr("应用设置", "Apply settings")}</button> : undefined}
+            />
+            {dashboardPage === "overview" && <TMPanel className="runtime-hero">
               <img src="/mfq-mark.svg" alt="" />
               <div className="runtime-hero-copy">
                 <div><h2>{runtime?.model || "MFQ Server"}</h2><span className={`runtime-status-pill ${runtime?.model ? "running" : "stopped"}`}><i />{runtime?.model ? tr("运行中", "Running") : tr("空闲", "Idle")}</span></div>
-                <p>{runtime?.model ? `${runtime?.model_type || "MFQ"} · ${formatNumber(runtime?.max_context)} ${tr("上下文", "context")}` : tr("加载本地模型后即可开始推理。", "Load a local model to begin inference.")}</p>
+                <p className="runtime-endpoint">{studio?.service_url || "http://127.0.0.1:8090"}</p>
+                <small>{runtime?.model ? `${runtime?.model_type || "MFQ"} · ${formatNumber(runtime?.max_context)} ${tr("上下文", "context")} · ${formatDuration(runtime?.uptime_seconds)}` : tr("加载本地模型后即可开始推理。", "Load a local model to begin inference.")}</small>
               </div>
               <div className="runtime-hero-actions">
                 <button onClick={() => openStudioPage("dashboard", "models")} type="button"><Icon name="folder" size={15} />{tr("模型", "Models")}</button>
-                <button className="primary" onClick={openSettings} type="button"><Icon name="settings" size={15} />{tr("推理设置", "Inference settings")}</button>
+                <button className="primary" onClick={() => { setView("chat"); setSidebarOpen(false); }} type="button"><Icon name="chat" size={15} />{tr("对话", "Chat")}</button>
               </div>
-            </section>}
-            {dashboardPage === "overview" && <PanelDeck labels={panelLabels} page="dashboard-overview" resetVersion={dashboardLayoutReset}>
-              <div className="metric-grid" key="metrics"><article><span>Prefill</span><strong>{formatNumber(lastPrefill.tokensPerSecond, 1)}</strong><small>tokens / second</small></article><article><span>Decode</span><strong>{formatNumber(last?.decode_tps, 1)}</strong><small>tokens / second</small></article><article><span>TTFT</span><strong>{formatNumber(lastTtftMs, 1)}</strong><small>milliseconds</small></article><article><span>{tr("内存", "Memory")}</span><strong>{runtimeMemory ? `${formatNumber(runtimeMemory / 2 ** 30, 1)} GB` : "--"}</strong><small>{runtimeCache ? `${formatNumber(runtimeCache / 2 ** 30, 1)} GB cache` : tr("未上报缓存", "cache unavailable")}</small></article><article><span>{tr("任务", "Jobs")}</span><strong>{activeJobs.length}</strong><small>{formatNumber(runtime?.active_requests || 0)} active requests</small></article></div>
-              <section className="dashboard-panel chart-panel" key="throughput"><div className="panel-heading"><div><h2>{tr("生成吞吐", "Decode throughput")}</h2><p>{tr("MFQ Server 保存的已完成请求", "Completed requests retained by MFQ Server")}</p></div><b>{formatNumber(last?.decode_tps, 1)} tok/s</b></div><RuntimeChart values={metricSeries} /></section>
-              <section className="dashboard-panel" key="runtime"><div className="panel-heading"><div><h2>Runtime</h2><p>{instances.length ? `${instances.length} ${tr("个托管实例", "managed instances")}` : runtime?.model ? tr("外部 Runtime", "External runtime") : tr("尚未加载模型", "No model loaded")}</p></div></div><dl><div><dt>{tr("模型", "Model")}</dt><dd>{runtime?.model || model || "--"}</dd></div><div><dt>{tr("架构", "Architecture")}</dt><dd>{runtime?.model_type || "--"}</dd></div><div><dt>{tr("状态", "State")}</dt><dd>{runtime?.runtime_state || (runtime?.reloading ? "loading" : "unavailable")}</dd></div><div><dt>{tr("上下文", "Context")}</dt><dd>{formatNumber(runtime?.max_context)} / {formatNumber(runtime?.context_capacity)}</dd></div><div><dt>{tr("运行时间", "Uptime")}</dt><dd>{formatDuration(runtime?.uptime_seconds)}</dd></div><div><dt>{tr("失败请求", "Failed")}</dt><dd>{formatNumber(runtime?.failed_requests || 0)}</dd></div></dl><button className="panel-action" disabled={!runtime?.model} onClick={openSettings} type="button">{tr("调整上下文与推理设置", "Context and inference settings")}</button></section>
-              <section className="dashboard-panel request-panel" key="request"><div className="panel-heading"><div><h2>{tr("最近请求性能", "Last request performance")}</h2><p>{last?.id || tr("还没有完成的请求", "No completed requests")}</p></div>{(last?.finish_reason || Number(runtime?.active_requests || 0) > 0) && <b>{last?.finish_reason || "Running"}</b>}</div><div className="request-stats"><div><span>{tr("输入", "Input")}</span><strong>{formatNumber(last?.prompt_tokens)}</strong><small>tokens</small></div><div><span>{tr("输出", "Output")}</span><strong>{formatNumber(last?.completion_tokens)}</strong><small>tokens</small></div><div><span>TTFT</span><strong>{formatNumber(lastTtftMs, 1)}</strong><small>ms</small></div><div><span>Prefill</span><strong>{formatNumber(lastPrefill.tokensPerSecond, 1)}</strong><small>{formatNumber(lastPrefill.milliseconds, 1)} ms</small></div><div><span>Decode</span><strong>{formatNumber(last?.decode_tps, 1)}</strong><small>{formatNumber(last?.decode_ms, 1)} ms</small></div><div><span>{tr("总耗时", "Total")}</span><strong>{formatNumber(lastGenerationMs, 1)}</strong><small>ms</small></div></div></section>
-            </PanelDeck>}
-            {dashboardPage === "cache" && <PanelDeck labels={panelLabels} page="dashboard-cache" resetVersion={dashboardLayoutReset}>
-              {prefixCacheSupported && (
-                <section className="dashboard-panel cache-panel" key="prefix-cache">
+            </TMPanel>}
+            {dashboardPage === "overview" && <>
+              <SectionLabel title={tr("实时性能", "Live performance")} subtitle={tr("最近请求吞吐与累计缓存复用", "Latest request throughput · cumulative cache reuse")} />
+              <div className="metric-grid">
+                <MetricTile label={tr("预填充", "Prefill")} value={`${formatNumber(lastPrefill.tokensPerSecond, 1)} tok/s`} detail={tr("输入处理", "Prompt processing")} icon="text-forward" />
+                <MetricTile label={tr("解码", "Decode")} value={`${formatNumber(last?.decode_tps, 1)} tok/s`} detail={tr("输出生成", "Token generation")} icon="waveform" />
+                <MetricTile label={tr("首字延迟", "TTFT")} value={`${formatNumber(lastTtftMs, 1)} ms`} detail={tr("首次输出耗时", "Time to first token")} icon="clock" />
+                <MetricTile label={tr("前缀复用", "Prefix reuse")} value={prefixCacheQueries > 0 ? `${formatNumber(prefixCacheHitRate, 1)}%` : "--"} detail={tr(`已恢复 ${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens`, `${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens restored`)} icon="reuse" />
+                <MetricTile label={tr("内存", "Memory")} value={formatBytes(runtimeMemory)} detail={runtimeCache ? tr(`分配器缓存 ${formatBytes(runtimeCache)}`, `${formatBytes(runtimeCache)} allocator cache`) : tr("模型驻留", "Runtime residency")} icon="memory" />
+              </div>
+              <SectionLabel title={tr("内存层级", "Memory hierarchy")} />
+              {runtime ? <TMPanel className="overview-memory-panel">
+                <div className="overview-memory-heading">
+                  <div><h2>{tr("推理内存", "Runtime memory")}</h2><p>{tr("模型驻留、分配器缓存与可复用前缀共享统一内存。", "Model residency, allocator cache, and reusable prefixes share unified memory.")}</p></div>
+                  <strong>{formatBytes(runtimeMemory + runtimeCache)}</strong>
+                </div>
+                <div className="overview-memory-bars">
+                  <UsageBar label={tr("模型与活动张量", "Model and active tensors")} used={runtimeMemory} total={runtimeMemoryCapacity} />
+                  <UsageBar label={tr("分配器缓存", "Allocator cache")} used={runtimeCache} total={runtimeMemoryCapacity} />
+                </div>
+                <div className="overview-memory-facts">
+                  <span><Icon name="memory" size={13} />{formatBytes(runtimeDeviceFree)} {tr("设备可用", "device free")}</span>
+                  <span><Icon name="reuse" size={13} />{formatNumber(runtime?.prefix_cache_snapshots || 0)} {tr("个前缀快照", "prefix snapshots")}</span>
+                  <span><Icon name="text-forward" size={13} />{tr(`已复用 ${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens`, `${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens reused`)}</span>
+                  <span><Icon name="queue" size={13} />{formatNumber(runtime?.active_requests || 0)} {tr("个活动请求", "active requests")}</span>
+                </div>
+              </TMPanel> : <EmptyPanel icon="memory" title={tr("推理内存尚未上报", "Runtime memory is unavailable")} message={tr("服务器就绪后会显示模型驻留与缓存状态。", "Memory residency and cache state appear when the server is ready.")} />}
+              <div className="overview-footer-grid">
+                <TMPanel className="overview-endpoint-panel">
+                  <div className="overview-panel-title"><Icon name="link" size={15} /><h2>{tr("OpenAI 兼容端点", "OpenAI-compatible endpoint")}</h2><button aria-label={tr("复制端点", "Copy endpoint")} onClick={() => void copyEndpoint()} title={tr("复制端点", "Copy endpoint")} type="button"><Icon name="copy" size={14} /></button></div>
+                  <code>{studio?.service_url || "http://127.0.0.1:8090"}</code>
+                  <p>{tr("可直接用于 OpenAI SDK；默认回环地址不经过云端。", "Use this base URL with OpenAI SDKs. The default loopback address sends no traffic to the cloud.")}</p>
+                </TMPanel>
+                <TMPanel className="overview-session-panel">
+                  <div className="overview-panel-title"><Icon name="chart" size={15} /><h2>{tr("会话统计", "Session")}</h2><span>{formatDuration(runtime?.uptime_seconds)}</span></div>
+                  <div className="overview-session-stats">
+                    <div><strong>{formatNumber(runtime?.total_requests || 0)}</strong><small>{tr("已完成", "Completed")}</small></div>
+                    <div><strong>{formatNumber(runtime?.total_prompt_tokens || 0)}</strong><small>{tr("提示词", "Prompt")}</small></div>
+                    <div><strong>{formatNumber(runtime?.total_completion_tokens || 0)}</strong><small>{tr("已生成", "Generated")}</small></div>
+                  </div>
+                  <p>{formatNumber(runtime?.failed_requests || 0)} {tr("个失败请求", "failed requests")} · {formatNumber(runtime?.active_requests || 0)} {tr("个活动请求", "active")}</p>
+                </TMPanel>
+              </div>
+            </>}
+            {dashboardPage === "settings" && settingsPage}
+            {dashboardPage === "cache" && <>
+              <SectionLabel title={tr("内存层级", "Memory hierarchy")} subtitle={tr("设备、内存与持久缓存", "Device, memory, and persistent cache")} />
+              {prefixCacheSupported ? (
+                <TMPanel className="cache-panel">
                   <div className="panel-heading">
                     <div>
                       <h2>Session KV cache</h2>
@@ -3777,6 +3884,8 @@ export default function App() {
                     <b>{prefixCacheQueries > 0 ? `${formatNumber(prefixCacheHitRate, 1)}% hit` : tr("暂无查询", "No queries")}</b>
                   </div>
                   {prefixCacheHotOnly ? (
+                    <>
+                    <UsageBar label={tr("RAM 热前缀", "RAM hot prefix")} used={prefixCacheHotBytes} total={Math.max(prefixCacheHotBytes, runtimeCache || 0)} />
                     <div className="cache-stats">
                       <div><span>{tr("活动会话", "Active sessions")}</span><strong>{formatNumber(runtime?.prefix_cache_sessions)}</strong></div>
                       <div><span>{tr("设备热前缀", "Device-hot prefix")}</span><strong>{formatNumber(prefixCacheSnapshots)}</strong><small>{tr("单物理快照", "one physical snapshot")}</small></div>
@@ -3785,7 +3894,13 @@ export default function App() {
                       <div><span>{tr("命中 / 查询", "Hits / queries")}</span><strong>{formatNumber(prefixCacheHits)} / {formatNumber(prefixCacheQueries)}</strong></div>
                       <div><span>{tr("持久性", "Persistence")}</span><strong>{tr("进程生命周期", "Process lifetime")}</strong><small>{tr("不落盘", "not stored on disk")}</small></div>
                     </div>
+                    </>
                   ) : (
+                    <>
+                    <div className="cache-usage-bars">
+                      <UsageBar label={tr("SSD 前缀缓存", "SSD prefix cache")} used={prefixCacheDiskBytes} total={Math.max(prefixCacheDiskBudget, prefixCacheDiskBytes)} />
+                      <UsageBar label={tr("RAM 热层", "RAM hot tier")} used={prefixCacheHotBytes} total={Math.max(prefixCacheHotBytes, runtimeCache || 0)} />
+                    </div>
                     <div className="cache-stats">
                       <div><span>{tr("活动会话", "Active sessions")}</span><strong>{formatNumber(runtime?.prefix_cache_sessions)}</strong></div>
                       <div><span>{tr("SSD 块", "SSD blocks")}</span><strong>{formatNumber(runtime?.prefix_cache_disk_blocks ?? prefixCacheSnapshots)}</strong></div>
@@ -3796,45 +3911,52 @@ export default function App() {
                       <div><span>{tr("SSD 命中", "SSD hits")}</span><strong>{formatNumber(runtime?.prefix_cache_disk_hits)}</strong><small>{formatNumber(runtime?.prefix_cache_hot_hits)} RAM hits</small></div>
                       <div><span>{tr("回收", "Evictions")}</span><strong>{formatNumber(runtime?.prefix_cache_evictions)}</strong><small>{formatNumber(runtime?.prefix_cache_corrupt_blocks)} corrupt</small></div>
                     </div>
+                    </>
                   )}
                   {prefixCacheSnapshots > 0 && <button className="panel-action danger" disabled={busy || Number(runtime?.active_requests || 0) > 0} onClick={() => void clearRuntimeCache()} type="button">{tr("清除 Session KV 缓存", "Clear Session KV cache")}</button>}
-                </section>
-              )}
-              <section className="dashboard-panel profile-panel" key="profiles"><div className="panel-heading"><div><h2>{tr("运行配置档案", "Runtime profiles")}</h2><p>{tr("将加载参数和采样默认值绑定到模型产物", "Bind load and sampling defaults to a model artifact")}</p></div><b>{runtimeProfiles.length}</b></div><div className="profile-create"><input maxLength={64} onChange={(event) => setProfileName(event.target.value)} placeholder={tr("当前配置名称", "Current configuration name")} value={profileName} /><button disabled={busy || !profileName.trim() || !artifacts.some((item) => item.name === runtime?.model)} onClick={() => void saveRuntimeProfile()} type="button">{tr("保存当前配置", "Save current")}</button></div>{runtimeProfiles.length > 0 && <div className="profile-list">{runtimeProfiles.map((profile) => <div className={`profile-row ${profile.drifted ? "drifted" : ""}`} key={profile.id}><div><strong>{profile.name}</strong><small>{profile.load.context_size.toLocaleString()} ctx · {profile.load.prefill_chunk_size.toLocaleString()} chunk{profile.drifted ? ` · ${tr("模型已变化", "artifact changed")}` : ""}</small></div><button disabled={busy} onClick={() => void loadRuntimeProfile(profile)} type="button">{tr("加载", "Load")}</button><button aria-label={tr("删除配置档案", "Delete profile")} disabled={busy} onClick={() => void deleteRuntimeProfile(profile.id)} type="button"><Icon name="trash" size={14} /></button></div>)}</div>}</section>
-            </PanelDeck>}
-            {dashboardPage === "models" && <PanelDeck labels={panelLabels} page="dashboard-models" resetVersion={dashboardLayoutReset}>
-              <section className="dashboard-panel model-catalog-panel" key="catalog">
-                <div className="panel-heading"><div><h2>{tr("模型目录", "Model catalog")}</h2><p>{tr("空闲模型按 LRU 自动让出内存；固定模型永不自动卸载", "Idle models yield memory by LRU; pinned models stay resident")}</p></div><div className="panel-heading-actions"><button disabled={busy} onClick={() => void chooseModelDirectory()} type="button">{tr("添加模型文件夹", "Add model folder")}</button><b>{artifacts.length}</b></div></div>
-                <div className="model-load-policy">
-                  <label><input checked={loadPinned} onChange={(event) => setLoadPinned(event.target.checked)} type="checkbox" /><span><strong>{tr("固定到内存", "Pin in memory")}</strong><small>{tr("跳过 LRU 与空闲卸载", "Skip LRU and idle eviction")}</small></span></label>
-                  <label><span><strong>{tr("空闲卸载", "Idle unload")}</strong><small>{loadPinned ? tr("固定模型不使用 TTL", "Ignored while pinned") : tr("每次使用后重新计时", "Resets after each use")}</small></span><select disabled={loadPinned} onChange={(event) => setLoadIdleTtl(event.target.value ? Number(event.target.value) : null)} value={loadIdleTtl ?? ""}><option value="">{tr("永不", "Never")}</option><option value="300">5 min</option><option value="900">15 min</option><option value="3600">1 h</option></select></label>
+                </TMPanel>
+              ) : <EmptyPanel icon="settings" title={tr("Runtime 诊断未启用", "Runtime diagnostics are offline")} message={tr("加载模型后可查看内存与前缀缓存状态。", "Load a model to inspect memory and prefix-cache state.")} />}
+              <SectionLabel title={tr("运行配置", "Runtime profiles")} />
+              <TMPanel className="profile-panel"><div className="panel-heading"><div><h2>{tr("已保存配置", "Saved profiles")}</h2><p>{tr("将加载参数和采样默认值绑定到模型产物", "Bind load and sampling defaults to a model artifact")}</p></div><b>{runtimeProfiles.length}</b></div><div className="profile-create"><input maxLength={64} onChange={(event) => setProfileName(event.target.value)} placeholder={tr("当前配置名称", "Current configuration name")} value={profileName} /><button disabled={busy || !profileName.trim() || !artifacts.some((item) => item.name === runtime?.model)} onClick={() => void saveRuntimeProfile()} type="button">{tr("保存当前配置", "Save current")}</button></div>{runtimeProfiles.length > 0 ? <div className="profile-list">{runtimeProfiles.map((profile) => <div className={`profile-row ${profile.drifted ? "drifted" : ""}`} key={profile.id}><div><strong>{profile.name}</strong><small>{profile.load.context_size.toLocaleString()} ctx · {profile.load.prefill_chunk_size.toLocaleString()} chunk{profile.drifted ? ` · ${tr("模型已变化", "artifact changed")}` : ""}</small></div><button disabled={busy} onClick={() => void loadRuntimeProfile(profile)} type="button">{tr("加载", "Load")}</button><button aria-label={tr("删除配置档案", "Delete profile")} disabled={busy} onClick={() => void deleteRuntimeProfile(profile.id)} type="button"><Icon name="trash" size={14} /></button></div>)}</div> : <div className="inline-empty">{tr("尚未保存运行配置。", "No runtime profiles saved yet.")}</div>}</TMPanel>
+              {toolsRoutingPanel}
+            </>}
+            {dashboardPage === "models" && <>
+              <SectionLabel title={tr("模型库", "Model library")} subtitle={`${artifacts.length} ${tr("个本地模型", "local models")}`} />
+              <TMPanel className="model-catalog-panel">
+                <div className="panel-heading"><div><h2>{tr("加载策略", "Load policy")}</h2><p>{tr("控制模型的驻留与自动卸载。", "Control model residency and automatic unloading.")}</p></div></div>
+                <div className="setting-list model-policy-panel">
+                  <SettingRow title={tr("固定到内存", "Pin in memory")} detail={tr("跳过 LRU 与空闲卸载", "Skip LRU and idle eviction")} trailing={<input aria-label={tr("固定到内存", "Pin in memory")} checked={loadPinned} onChange={(event) => setLoadPinned(event.target.checked)} type="checkbox" />} />
+                  <SettingRow title={tr("空闲卸载", "Idle unload")} detail={loadPinned ? tr("固定模型不使用 TTL", "Ignored while pinned") : tr("每次使用后重新计时", "Resets after each use")} trailing={<select disabled={loadPinned} onChange={(event) => setLoadIdleTtl(event.target.value ? Number(event.target.value) : null)} value={loadIdleTtl ?? ""}><option value="">{tr("永不", "Never")}</option><option value="300">5 min</option><option value="900">15 min</option><option value="3600">1 h</option></select>} />
                 </div>
-                {artifacts.length > 0 && <div className="model-list">{artifacts.slice(0, 8).map((item) => {
+              </TMPanel>
+              <SectionLabel title={tr("本地检查点", "Local checkpoints")} />
+              {artifacts.length > 0 ? <TMPanel className="model-catalog-panel model-library-panel"><div className="model-list">{artifacts.slice(0, 8).map((item) => {
                   const instance = instances.find((candidate) => candidate.model === item.name && candidate.state !== "failed");
                   const loaded = Boolean(instance) || item.name === runtime?.model;
                   const policy = instance?.pinned ? tr("固定", "Pinned") : instance?.idle_ttl_seconds != null ? `TTL ${instance.idle_ttl_seconds}s` : null;
                   return <div className="model-row" key={item.id}><span className={loaded ? "model-state active" : item.loadable ? "model-state" : "model-state failed"} /><div><strong>{item.name}</strong><small>{item.architecture} · {item.shard_count} shards · {formatNumber(item.total_bytes / 2 ** 30, 1)} GB{policy ? ` · ${policy}` : ""}</small></div>{instance ? <button disabled={busy || instance.state === "busy"} onClick={() => void unloadInstance(instance.id)} type="button">{tr("卸载", "Unload")}</button> : loaded ? <em>{tr("已加载", "Loaded")}</em> : !item.loadable ? <em className="failed" title={item.error || undefined}>{item.complete && item.format === "hf" ? tr("需先转换", "Convert first") : tr("不可用", "Invalid")}</em> : <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">{tr("加载", "Load")}</button>}</div>;
-                })}</div>}
-              </section>
-              <section className="dashboard-panel" key="requests"><div className="panel-heading"><div><h2>{tr("最近请求", "Recent requests")}</h2></div></div>{requestHistory.length > 0 && <div className="request-table">{requestHistory.slice(0, 8).map((request) => <div className="request-row" key={request.id}><div><strong>{request.id}</strong><small>{request.completed_at ? new Date(request.completed_at * 1000).toLocaleTimeString() : request.endpoint || "completion"}</small></div><span>{formatNumber(request.prompt_tokens)} → {formatNumber(request.completion_tokens)}</span><b>{formatNumber(request.decode_tps, 1)} tok/s</b></div>)}</div>}</section>
-              <section className="dashboard-panel" key="jobs">
+                })}</div></TMPanel> : <EmptyPanel icon="folder" title={tr("还没有本地模型", "No local models yet")} message={tr("添加一个模型文件夹即可开始。", "Add a model folder to get started.")} />}
+            </>}
+            {dashboardPage === "logs" && <>
+              <SectionLabel title={tr("Runtime 活动", "Runtime activity")} subtitle={tr("请求、任务与事件", "Requests, jobs, and events")} />
+              <div className="dashboard-grid logs-grid">
+              <TMPanel><div className="panel-heading"><div><h2>{tr("最近请求", "Recent requests")}</h2></div></div>{requestHistory.length > 0 ? <div className="request-table">{requestHistory.slice(0, 8).map((request) => <div className="request-row" key={request.id}><div><strong>{request.id}</strong><small>{request.completed_at ? new Date(request.completed_at * 1000).toLocaleTimeString() : request.endpoint || "completion"}</small></div><span>{formatNumber(request.prompt_tokens)} → {formatNumber(request.completion_tokens)}</span><b>{formatNumber(request.decode_tps, 1)} tok/s</b></div>)}</div> : <div className="inline-empty">{tr("还没有完成的请求。", "No completed requests yet.")}</div>}</TMPanel>
+              <TMPanel>
                 <div className="panel-heading"><div><h2>{tr("后台任务", "Background jobs")}</h2></div><b>{activeJobs.length}</b></div>
                 {activeJobs.length > 0 && <div className="request-table">{activeJobs.slice(0, 8).map((job) => <div className="job-row" key={job.id}><div><strong>{job.kind}</strong><small>{new Date(job.updated_at).toLocaleTimeString()} · {job.status}</small></div><progress max={1} value={job.progress} /><b>{formatNumber(job.progress * 100)}%</b></div>)}</div>}
                 {completedJobs.length > 0 && <details className="completed-jobs">
                   <summary><span>{tr("已完成", "Completed")} <b>{completedJobs.length}</b></span><button disabled={jobCleanupBusy} onClick={(event) => { event.preventDefault(); void clearCompletedJobRecords(); }} type="button">{tr("清理已完成", "Clear completed")}</button></summary>
                   <div className="request-table">{completedJobs.slice(0, 8).map((job) => <div className="job-row completed" key={job.id}><div><strong>{job.kind}</strong><small>{new Date(job.updated_at).toLocaleTimeString()} · {job.status}</small></div><progress max={1} value={job.progress} /><b>{formatNumber(job.progress * 100)}%</b><button aria-label={tr("移出任务历史", "Remove from job history")} disabled={jobCleanupBusy} onClick={() => void deleteJobRecord(job.id)} type="button"><Icon name="trash" size={12} /></button></div>)}</div>
                 </details>}
-              </section>
-              <section className="dashboard-panel" key="logs"><div className="panel-heading"><div><h2>{tr("Runtime 日志", "Runtime logs")}</h2></div><b>{runtimeLogs.length}</b></div>{runtimeLogs.length > 0 && <div className="runtime-log-list">{runtimeLogs.slice(-8).reverse().map((entry) => <div className={`runtime-log ${entry.level}`} key={entry.sequence}><span>{new Date(entry.created_at).toLocaleTimeString()}</span><p>{entry.message}</p></div>)}</div>}</section>
-            </PanelDeck>}
-            {dashboardPage === "connections" && <PanelDeck labels={panelLabels} page="dashboard-connections" resetVersion={dashboardLayoutReset}>
-              <section className="dashboard-panel mcp-panel" key="mcp"><div className="panel-heading"><div><h2>MCP</h2><p>{tr("工具服务器与模型可见工具", "Tool servers and model-visible tools")}</p></div><b>{mcpTools.length} tools</b></div><form className="mcp-form" onSubmit={createMcpServer}><input aria-label={tr("服务器名称", "Server name")} onChange={(event) => setMcpDraft((current) => ({ ...current, name: event.target.value }))} placeholder={tr("名称", "Name")} value={mcpDraft.name} /><select aria-label={tr("传输方式", "Transport")} onChange={(event) => setMcpDraft((current) => ({ ...current, transport: event.target.value as "stdio" | "streamable_http" }))} value={mcpDraft.transport}><option value="streamable_http">HTTP</option><option value="stdio">stdio</option></select><input aria-label={mcpDraft.transport === "streamable_http" ? "Streamable HTTP URL" : tr("可执行文件", "Executable")} onChange={(event) => setMcpDraft((current) => ({ ...current, endpoint: event.target.value }))} placeholder={mcpDraft.transport === "streamable_http" ? "https://host/mcp" : tr("可执行文件路径", "Executable path")} type={mcpDraft.transport === "streamable_http" ? "url" : "text"} value={mcpDraft.endpoint} /><button className="primary" disabled={busy || !mcpDraft.name.trim() || !mcpDraft.endpoint.trim()} type="submit">{tr("添加", "Add")}</button></form><div className="mcp-server-list">{mcpServers.map((server) => <div className="mcp-server" key={server.id}><span className={server.enabled ? "model-state active" : "model-state"} /><div><strong>{server.name}</strong><small>{server.transport} · {server.url || server.command}</small></div><button onClick={() => void toggleMcpServer(server)} type="button">{server.enabled ? tr("停用", "Disable") : tr("启用", "Enable")}</button><button onClick={() => void deleteMcpServer(server.id)} type="button">{tr("删除", "Delete")}</button></div>)}</div></section>
-              <div key="nodes">{clusterPanel}</div>
-            </PanelDeck>}
+              </TMPanel>
+              <TMPanel className="runtime-log-panel"><div className="panel-heading"><div><h2>{tr("Runtime 日志", "Runtime logs")}</h2></div><b>{runtimeLogs.length}</b></div>{runtimeLogs.length > 0 ? <div className="runtime-log-list">{runtimeLogs.slice(-8).reverse().map((entry) => <div className={`runtime-log ${entry.level}`} key={entry.sequence}><span>{new Date(entry.created_at).toLocaleTimeString()}</span><p>{entry.message}</p></div>)}</div> : <div className="inline-empty">{tr("暂无 Runtime 事件。", "No runtime events yet.")}</div>}</TMPanel>
+              </div>
+            </>}
+            {dashboardPage === "connections" && serverPage}
           </section>
         ) : (
           <section aria-label="Lab" className="lab-view">
-            <div className="page-heading"><div><h1>{labPage === "models" ? tr("模型仓库", "Model hubs") : labPage === "evaluations" ? tr("评测与数据集", "Evaluation and datasets") : tr("量化工作台", "Quantization workspace")}</h1></div><button aria-label={tr("重置当前布局", "Reset current layout")} onClick={() => setLabLayoutReset((current) => current + 1)} title={tr("重置当前布局", "Reset current layout")} type="button"><Icon name="refresh" /></button></div>
+            <div className="page-heading"><div><h1>{labPage === "models" ? tr("模型仓库", "Model hubs") : labPage === "evaluations" ? tr("评测与数据集", "Evaluations") : tr("量化工作台", "Quantization workspace")}</h1><p>{labPage === "models" ? tr("浏览模型来源并登记本地资产。", "Browse model sources and register local assets.") : labPage === "evaluations" ? tr("组织数据集、评测结果与可复现实验。", "Organize datasets, evaluations, and reproducible experiments.") : tr("配置并运行 MFQ 量化流程。", "Configure and run MFQ quantization workflows.")}</p></div></div>
             {labPage === "models" && <PanelDeck labels={panelLabels} page="lab-models" resetVersion={labLayoutReset}><div key="hubs"><section className="dashboard-panel hub-panel"><div className="panel-heading"><div><h2>{tr("模型仓库", "Model hubs")}</h2><p>{tr("搜索、检查大小并启动可续传下载", "Search, inspect size, and start resumable downloads")}</p></div></div><form className="hub-search" onSubmit={searchHub}><select onChange={(event) => setHubProvider(event.target.value as HubModelSummary["provider"])} value={hubProvider}><option value="modelscope">ModelScope</option><option value="huggingface">Hugging Face</option></select><input onChange={(event) => setHubQuery(event.target.value)} placeholder={tr("模型名称或仓库", "Model or repository")} value={hubQuery} /><button disabled={busy || !hubQuery.trim()} type="submit">{tr("搜索", "Search")}</button></form>{hubResults.length > 0 && <div className="hub-results">{hubResults.map((item) => <button className={hubModel?.repo_id === item.repo_id ? "active" : ""} key={`${item.provider}:${item.repo_id}`} onClick={() => void inspectHubModel(item)} type="button"><div><strong>{item.repo_id}</strong><small>{formatNumber(item.downloads)} downloads · {formatNumber(item.likes)} likes</small></div><span>{item.total_bytes ? `${formatNumber(item.total_bytes / 2 **30, 1)} GB` : "--"}</span></button>)}</div>}{hubModel && <div className="hub-detail"><div><strong>{hubModel.repo_id}</strong><small>{hubModel.revision} · {hubModel.files.length} files · {formatNumber(hubModel.total_bytes / 2 ** 30, 2)} GB</small></div><button disabled={busy || !jobKinds.some((item) => item.kind === `download.${hubModel.provider}`)} onClick={() => void downloadHubModel()} type="button"><Icon name="download" size={14} />{tr("下载", "Download")}</button></div>}</section></div></PanelDeck>}
             {labPage === "evaluations" && <PanelDeck labels={panelLabels} page="lab-evaluations" resetVersion={labLayoutReset}>
               <section className="dashboard-panel evaluation-panel" key="results">
@@ -3899,254 +4021,8 @@ export default function App() {
         )}
       </main>
 
-      {settingsOpen && <>
-        <div className="drawer-scrim" onClick={() => setSettingsOpen(false)} />
-        <aside className="settings-panel">
-          <header>
-            <div><p>Generation</p><h2>{tr("推理设置", "Inference settings")}</h2></div>
-            <button onClick={() => setSettingsOpen(false)} ref={settingsCloseRef} type="button">×</button>
-          </header>
-          <div className="settings-scroll">
-            <section className="settings-inheritance">
-              <label className="check-field inheritance-toggle">
-                <span>
-                  <strong>{tr("随模型 / 架构默认值", "Use model / architecture defaults")}</strong>
-                  <small>{tr(
-                    "优先读取模型元数据，缺失字段由模型型号或架构默认值补齐。",
-                    "Read model metadata first, then fill missing fields from model or architecture defaults.",
-                  )}</small>
-                </span>
-                <input
-                  checked={settingsDraft.inheritModelDefaults}
-                  onChange={(event) => setModelDefaultInheritance(event.target.checked)}
-                  type="checkbox"
-                />
-              </label>
-            </section>
-            <fieldset className="settings-inherited-fields" disabled={settingsDraft.inheritModelDefaults}>
-              <section>
-                <h3>{tr("预设", "Presets")}</h3>
-                <div className="segmented">
-                  {(["precise", "balanced", "creative"] as const).map((name) => (
-                    <button
-                      aria-pressed={settingsDraft.preset === name}
-                      key={name}
-                      onClick={() => applyPreset(name)}
-                      type="button"
-                    >
-                      {name === "precise"
-                        ? tr("精确", "Precise")
-                        : name === "balanced"
-                          ? tr("均衡", "Balanced")
-                          : tr("创意", "Creative")}
-                    </button>
-                  ))}
-                </div>
-                {presetManager}
-              </section>
-              <section>
-                <h3>{tr("提示与输出", "Prompt and output")}</h3>
-                <label>
-                  <span>{tr("系统提示词", "System prompt")}</span>
-                  <textarea
-                    onChange={(event) => setSettingsDraft((current) => ({ ...current, systemPrompt: event.target.value }))}
-                    rows={4}
-                    value={settingsDraft.systemPrompt}
-                  />
-                </label>
-                <label className="check-field">
-                  <span>
-                    <strong>{tr("排除历史思考", "Exclude reasoning history")}</strong>
-                    <small>{tr("后续请求不再发送已保存的思考内容。", "Do not send saved reasoning in later requests.")}</small>
-                  </span>
-                  <input
-                    checked={settingsDraft.excludeReasoning}
-                    onChange={(event) => setSettingsDraft((current) => ({ ...current, excludeReasoning: event.target.checked }))}
-                    type="checkbox"
-                  />
-                </label>
-                <label>
-                  <span>{tr("最大生成 tokens", "Maximum output tokens")}</span>
-                  <input
-                    max={65536}
-                    min={1}
-                    onChange={(event) => setSettingsDraft((current) => ({ ...current, maxTokens: Number(event.target.value) }))}
-                    type="number"
-                    value={settingsDraft.maxTokens}
-                  />
-                </label>
-              </section>
-              <section>
-                <h3>{tr("采样", "Sampling")}</h3>
-                <label>
-                  <span>Temperature <output>{settingsDraft.temperature.toFixed(2)}</output></span>
-                  <input max={2} min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, temperature: Number(event.target.value), preset: "custom" }))} step={0.05} type="range" value={settingsDraft.temperature} />
-                </label>
-                <label>
-                  <span>Top P <output>{settingsDraft.topP.toFixed(2)}</output></span>
-                  <input max={1} min={0.05} onChange={(event) => setSettingsDraft((current) => ({ ...current, topP: Number(event.target.value), preset: "custom" }))} step={0.05} type="range" value={settingsDraft.topP} />
-                </label>
-                <label><span>Top K</span><input max={1024} min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, topK: Number(event.target.value), preset: "custom" }))} type="number" value={settingsDraft.topK} /></label>
-                <label><span>Seed</span><input min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, seed: event.target.value ? Number(event.target.value) : null }))} placeholder={tr("随机", "Random")} type="number" value={settingsDraft.seed ?? ""} /></label>
-              </section>
-              <section>
-                <h3>{tr("惩罚", "Penalties")}</h3>
-                {([["Repetition", "repetitionPenalty", 0.5, 2, 0.01], ["Presence", "presencePenalty", -2, 2, 0.05], ["Frequency", "frequencyPenalty", -2, 2, 0.05]] as const).map(([label, key, min, max, step]) => (
-                  <label key={key}>
-                    <span>{label} <output>{settingsDraft[key].toFixed(2)}</output></span>
-                    <input max={max} min={min} onChange={(event) => setSettingsDraft((current) => ({ ...current, [key]: Number(event.target.value), preset: "custom" }))} step={step} type="range" value={settingsDraft[key]} />
-                  </label>
-                ))}
-              </section>
-            </fieldset>
-            <section>
-              <h3>{tr("上下文", "Context")}</h3>
-              <label><span>{tr("上下文窗口 tokens", "Context window tokens")}</span><input max={Number(runtime?.context_capacity) || 1048576} min={512} onChange={(event) => setContextSize(Number(event.target.value))} step={512} type="number" value={contextSize} /></label>
-              <button className="secondary wide" disabled={busy} onClick={() => void reloadRuntime()} type="button">{tr("按此上下文重载模型", "Reload model with this context")}</button>
-            </section>
-            <section>
-              <h3>{tr("界面与连接", "Interface and connection")}</h3>
-              <label><span>{tr("界面语言", "Interface language")}</span><select onChange={(event) => setSettingsDraft((current) => ({ ...current, language: event.target.value as UiLanguage }))} value={settingsDraft.language}><option value="system">{tr("跟随系统", "System")}</option><option value="zh-CN">简体中文</option><option value="en">English</option></select></label>
-              <label>
-                <span>{tr("主题", "Theme")}</span>
-                <select onChange={(event) => setSettingsDraft((current) => ({ ...current, theme: event.target.value as UiTheme }))} value={settingsDraft.theme}>
-                  <option value="system">{tr("跟随系统", "System")}</option>
-                  <option value="light">{tr("浅色", "Light")}</option>
-                  <option value="dark">{tr("深色", "Dark")}</option>
-                </select>
-              </label>
-              <div className="portable-actions">
-                <button onClick={exportStudioData} type="button">{tr("导出", "Export")}</button>
-                <label>
-                  {tr("导入", "Import")}
-                  <input
-                    accept="application/json,.json"
-                    onChange={(event) => {
-                      const file = event.target.files?.[0];
-                      if (file) void importStudioData(file);
-                      event.target.value = "";
-                    }}
-                    type="file"
-                  />
-                </label>
-              </div>
-              {studio && <button className="secondary wide" onClick={openStudioSettings} type="button">{tr("配置 MFQ Server 连接", "Configure MFQ Server connection")}</button>}
-            </section>
-          </div>
-          <footer>
-            <button onClick={() => setSettingsDraft({
-              ...modeTemplateSettings({
-                ...DEFAULT_SETTINGS,
-                language: settingsDraft.language,
-                theme: settingsDraft.theme,
-                playbackEnabled: settingsDraft.playbackEnabled,
-              }, active?.mode ?? mode, runtime, realtime),
-              inheritModelDefaults: true,
-            })} type="button">{tr("恢复默认", "Reset")}</button>
-            <button className="primary" onClick={saveSettings} type="button">{tr("应用", "Apply")}</button>
-          </footer>
-        </aside>
-      </>}
-
       {modelBrowserOpen && modelBrowser && <div className="dialog-backdrop"><section className="studio-dialog model-browser-dialog"><header><div><h2>{tr("选择模型文件夹", "Choose model folder")}</h2><p>{tr("浏览 MFQ Server 所在设备上的文件夹。", "Browse folders on the MFQ Server host.")}</p></div><button onClick={() => setModelBrowserOpen(false)} type="button">×</button></header><form className="model-browser-location" onSubmit={jumpToModelDirectory}><button disabled={busy || !modelBrowser.current_id} onClick={() => void openModelDirectory(modelBrowser.parent_id)} type="button">{tr("上一级", "Up")}</button><input aria-label={tr("当前目录", "Current directory")} onChange={(event) => setModelDirectoryPath(event.target.value)} placeholder={tr("输入服务器上的完整目录", "Enter a full directory on the server")} spellCheck={false} value={modelDirectoryPath} /><button disabled={busy || !modelDirectoryPath.trim()} type="submit">{tr("前往", "Go")}</button>{modelBrowser.current_id && <span>{modelBrowser.model_file_count} MFQ</span>}</form><div className="model-browser-list">{modelBrowser.data.map((directory) => <button disabled={busy} key={directory.id} onClick={() => void openModelDirectory(directory.id)} type="button"><Icon name="folder" /><span>{directory.name}</span>{directory.model_file_count > 0 && <b>{directory.model_file_count} MFQ</b>}</button>)}{modelBrowser.data.length === 0 && <p>{tr("这个文件夹中没有子文件夹。", "This folder has no subfolders.")}</p>}</div><footer><button onClick={() => setModelBrowserOpen(false)} type="button">{tr("取消", "Cancel")}</button><button className="primary" disabled={busy || !modelBrowser.current_id} onClick={() => void registerCurrentModelDirectory()} type="button">{tr("使用此文件夹", "Use this folder")}</button></footer></section></div>}
-      {studioOpen && studioDraft && <div className="dialog-backdrop"><form className="studio-dialog" onSubmit={saveStudioSettings}><header><div><h2>{tr("Runtime 连接", "Runtime connection")}</h2><p>{tr("MFQ Studio 关闭后，MFQ Server 会继续运行。", "MFQ Server keeps running after MFQ Studio closes.")}</p></div><button onClick={() => setStudioOpen(false)} type="button">×</button></header><div className="segmented">{(["local", "remote"] as const).map((item) => <button aria-pressed={studioDraft.mode === item} key={item} onClick={() => setStudioDraft((current) => current && ({ ...current, mode: item }))} type="button">{item === "local" ? "Local MFQ Server" : "Remote MFQ Server"}</button>)}</div>{studioDraft.mode === "local" ? <><label><span>MFQ Server port</span><input max={65535} min={1} onChange={(event) => setStudioDraft((current) => current && ({ ...current, local_service_port: Number(event.target.value) }))} required type="number" value={studioDraft.local_service_port} /></label></> : <><label><span>Remote MFQ Server URL</span><input onChange={(event) => setStudioDraft((current) => current && ({ ...current, remote_url: event.target.value }))} required type="url" value={studioDraft.remote_url} /></label><label><span>Remote MFQ Server API key</span><input autoComplete="off" onChange={(event) => setStudioToken(event.target.value)} placeholder={tr("保存在系统凭据库", "Stored in the system credential vault")} type="password" value={studioToken} /></label></>}<div className="dialog-status"><span className={studio?.reachable ? "online" : "offline"} />{studio?.reachable ? `${tr("已连接", "Connected")}: ${studio.service_url}` : tr("MFQ Server 离线", "MFQ Server is offline")}</div><footer><button onClick={() => setStudioOpen(false)} type="button">{tr("取消", "Cancel")}</button><button className="primary" disabled={busy} type="submit">{tr("应用", "Apply")}</button></footer></form></div>}
 
-      {roleEditor && <div className="dialog-backdrop role-dialog-backdrop" onMouseDown={(event) => {
-        if (event.currentTarget === event.target) setRoleEditor(null);
-      }}>
-        <form className="role-dialog" onSubmit={(event) => void saveRole(event)}>
-          <header>
-            <div>
-              <p>{tr("角色", "Assistant")}</p>
-              <h2>{roleEditor.roleId === "new" ? tr("新建角色", "New role") : tr("编辑角色", "Edit role")}</h2>
-            </div>
-            <button aria-label={tr("关闭", "Close")} onClick={() => setRoleEditor(null)} type="button">×</button>
-          </header>
-          <div className="role-dialog-scroll">
-            <section className="role-identity-grid">
-              <label className="role-icon-field">
-                <span>{tr("图标", "Icon")}</span>
-                <div><output>{roleEditor.icon || roleEditor.name.slice(0, 1).toLocaleUpperCase()}</output><input maxLength={8} onChange={(event) => setRoleEditor((current) => current && ({ ...current, icon: event.target.value }))} placeholder="MFQ" value={roleEditor.icon} /></div>
-              </label>
-              <label>
-                <span>{tr("名称", "Name")}</span>
-                <input autoFocus maxLength={64} onChange={(event) => setRoleEditor((current) => current && ({ ...current, name: event.target.value }))} required value={roleEditor.name} />
-              </label>
-            </section>
-            <section>
-              <h3>{tr("对话默认值", "Conversation defaults")}</h3>
-              <div className="role-form-grid">
-                <label><span>{tr("模型", "Model")}</span><input onChange={(event) => setRoleEditor((current) => current && ({ ...current, model: event.target.value }))} value={roleEditor.model} /></label>
-                <label><span>{tr("交互模式", "Interaction mode")}</span><select onChange={(event) => {
-                  const nextMode = event.target.value as SessionMode;
-                  setRoleEditor((current) => current && ({
-                    ...current,
-                    mode: nextMode,
-                    settings: current.inheritGlobalSettings
-                      ? {
-                          ...presetSnapshot(settings.inheritModelDefaults
-                            ? modeTemplateSettings(settings, nextMode, runtime, realtime)
-                            : settings),
-                          systemPrompt: current.settings.systemPrompt,
-                        }
-                      : current.settings,
-                  }));
-                }} value={roleEditor.mode}>{(["text", "voice", "full_duplex"] as SessionMode[]).map((item) => <option key={item} value={item}>{MODE_LABELS[item][english ? 1 : 0]}</option>)}</select></label>
-                <label><span>{tr("上下文 tokens", "Context tokens")}</span><input min={512} onChange={(event) => setRoleEditor((current) => current && ({ ...current, contextSize: Number(event.target.value) }))} step={512} type="number" value={roleEditor.contextSize} /></label>
-              </div>
-            </section>
-            <section>
-              <h3>{tr("系统提示词", "System prompt")}</h3>
-              <label><textarea onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, systemPrompt: event.target.value } }))} placeholder={tr("该角色开始新会话时使用的默认提示词", "Default instructions for new sessions with this role")} rows={6} value={roleEditor.settings.systemPrompt} /></label>
-            </section>
-            <section>
-              <div className="role-section-heading">
-                <h3>{tr("推理参数", "Inference parameters")}</h3>
-                <label className="role-inheritance-toggle">
-                  <input
-                    checked={roleEditor.inheritGlobalSettings}
-                    onChange={(event) => {
-                      const enabled = event.target.checked;
-                      setRoleEditor((current) => current && ({
-                        ...current,
-                        inheritGlobalSettings: enabled,
-                        settings: enabled
-                          ? {
-                              ...presetSnapshot(settings.inheritModelDefaults
-                                ? modeTemplateSettings(settings, current.mode, runtime, realtime)
-                                : settings),
-                              systemPrompt: current.settings.systemPrompt,
-                            }
-                          : current.settings,
-                      }));
-                    }}
-                    type="checkbox"
-                  />
-                  <span>{tr("随全局设置", "Use global settings")}</span>
-                </label>
-              </div>
-              <fieldset className="role-inherited-fields" disabled={roleEditor.inheritGlobalSettings}>
-                <div className="role-form-grid">
-                  <label><span>{tr("最大生成 tokens", "Maximum output tokens")}</span><input min={1} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, maxTokens: Number(event.target.value) } }))} type="number" value={roleEditor.settings.maxTokens} /></label>
-                  <label><span>Temperature</span><input max={2} min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, temperature: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.temperature} /></label>
-                  <label><span>Top P</span><input max={1} min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, topP: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.topP} /></label>
-                  <label><span>Top K</span><input min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, topK: Number(event.target.value) } }))} type="number" value={roleEditor.settings.topK} /></label>
-                  <label><span>Repetition penalty</span><input min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, repetitionPenalty: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.repetitionPenalty} /></label>
-                  <label><span>Presence penalty</span><input max={2} min={-2} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, presencePenalty: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.presencePenalty} /></label>
-                  <label><span>Frequency penalty</span><input max={2} min={-2} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, frequencyPenalty: Number(event.target.value) } }))} step={0.01} type="number" value={roleEditor.settings.frequencyPenalty} /></label>
-                  <label><span>Seed</span><input min={0} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, seed: event.target.value ? Number(event.target.value) : null } }))} placeholder={tr("随机", "Random")} type="number" value={roleEditor.settings.seed ?? ""} /></label>
-                  <label><span>{tr("思考档位", "Reasoning effort")}</span><select onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, reasoningEffort: event.target.value } }))} value={roleEditor.settings.reasoningEffort}><option value="">{tr("自动", "Auto")}</option>{reasoningValues.map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
-                </div>
-                <div className="role-checks">
-                  <label><input checked={thinkingSupported && roleEditor.settings.enableThinking} disabled={!thinkingSupported} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, enableThinking: event.target.checked } }))} type="checkbox" /><span>{tr("默认开启思考", "Enable thinking by default")}</span></label>
-                  <label><input checked={roleEditor.settings.excludeReasoning} onChange={(event) => setRoleEditor((current) => current && ({ ...current, settings: { ...current.settings, excludeReasoning: event.target.checked } }))} type="checkbox" /><span>{tr("排除历史思考", "Exclude reasoning history")}</span></label>
-                </div>
-              </fieldset>
-            </section>
-          </div>
-          <footer><button onClick={() => setRoleEditor(null)} type="button">{tr("取消", "Cancel")}</button><button className="primary" disabled={busy || !roleEditor.name.trim()} type="submit">{tr("保存角色", "Save role")}</button></footer>
-        </form>
-      </div>}
     </div>
   );
 }
