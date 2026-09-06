@@ -21712,6 +21712,7 @@ static int run_qwen35_mtp_check(Model& model, CudaQwen35Mtp& mtp) {
     auto ids = [&](const std::vector<int64_t>& tokens) {
         return mfq_tensor_backend::tensor(tokens, options).reshape({1, -1});
     };
+    bool numerical_mismatch = false;
     auto compare = [&](const Tensor& actual, const Tensor& reference, double tolerance,
                        const char* name) {
         MFQ_RUNTIME_CHECK(actual.sizes() == reference.sizes(), "MTP gate tensor shape mismatch");
@@ -21726,7 +21727,7 @@ static int run_qwen35_mtp_check(Model& model, CudaQwen35Mtp& mtp) {
         }
         const double rel = std::sqrt(squared / std::max(norm, 1.e-30));
         std::cout << "mtp_check " << name << " relative_l2=" << rel << '\n';
-        MFQ_RUNTIME_CHECK(rel <= tolerance, "MTP gate numerical mismatch");
+        numerical_mismatch = numerical_mismatch || rel > tolerance;
     };
     const std::vector<int64_t> prompt{100, 200, 300, 400, 500, 600, 700};
     // Explicitly test BOTH resolutions, regardless of the real predictor's
@@ -21734,8 +21735,9 @@ static int run_qwen35_mtp_check(Model& model, CudaQwen35Mtp& mtp) {
     for (bool accepted : {false, true}) {
         model.reset(1);
         (void)model.hidden_forward(ids(prompt));
+        std::vector<Tensor> verify_trace;
         (void)model.hidden_forward(ids({37, 41}), mfq_nullopt, mfq_nullopt,
-            nullptr, mfq_nullopt, nullptr, 1);
+            &verify_trace, mfq_nullopt, nullptr, 1);
         if (accepted) model.commit_speculative();
         else model.rollback_speculative();
         MFQ_RUNTIME_CHECK(model.cache_pos == static_cast<int64_t>(prompt.size()) + (accepted ? 2 : 1),
@@ -21748,19 +21750,31 @@ static int run_qwen35_mtp_check(Model& model, CudaQwen35Mtp& mtp) {
         }
         model.reset(1);
         (void)model.hidden_forward(ids(prompt));
-        (void)model.hidden_forward(ids({37}));
+        std::vector<Tensor> serial_trace;
+        (void)model.hidden_forward(ids({37}), mfq_nullopt, mfq_nullopt,
+            &serial_trace);
+        MFQ_RUNTIME_CHECK(verify_trace.size() == serial_trace.size(),
+            "MTP diagnostic block trace size mismatch");
+        for (size_t layer = 0; layer < verify_trace.size(); ++layer) {
+            const auto label = "confirmed_prefix_block_" + std::to_string(layer);
+            compare(verify_trace[layer].narrow(1, 0, 1), serial_trace[layer], .005,
+                label.c_str());
+        }
         if (accepted) (void)model.hidden_forward(ids({41}));
         auto reference = model.last_logits(ids({43}));
         compare(actual, reference, .005, accepted ? "commit_logits" : "rollback_logits");
         size_t state = 0;
         for (auto& block : model.blocks) {
             if (auto* linear = dynamic_cast<LinearBlock*>(block.get())) {
-                compare(states[state].first, linear->conv_state, .002, "conv_continuation");
-                compare(states[state].second, linear->gdn_state, .002, "gdn_continuation");
+                const auto conv_label = "conv_continuation_" + std::to_string(state);
+                const auto gdn_label = "gdn_continuation_" + std::to_string(state);
+                compare(states[state].first, linear->conv_state, .002, conv_label.c_str());
+                compare(states[state].second, linear->gdn_state, .002, gdn_label.c_str());
                 ++state;
             }
         }
     }
+    MFQ_RUNTIME_CHECK(!numerical_mismatch, "MTP gate numerical mismatch (see per-layer diagnostics)");
     model.reset(1);
     Tensor raw;
     (void)model.hidden_forward(ids(prompt), mfq_nullopt, mfq_nullopt, nullptr, mfq_nullopt, &raw);
@@ -21774,6 +21788,7 @@ static int run_qwen35_mtp_check(Model& model, CudaQwen35Mtp& mtp) {
             serial.push_back(mtp.forward(model, raw.narrow(1, t, 1), next.narrow(1, t, 1)));
         compare(batched, mfq_tensor_backend::cat(serial, 1), .005, "predictor_batched_vs_serial");
     }
+    MFQ_RUNTIME_CHECK(!numerical_mismatch, "MTP predictor gate numerical mismatch");
     uint64_t total_cycles = 0;
     for (const auto& input : std::vector<std::vector<int64_t>>{{1, 2, 3}, prompt, std::vector<int64_t>(17, 10)}) {
         MfqSamplingParams params;
