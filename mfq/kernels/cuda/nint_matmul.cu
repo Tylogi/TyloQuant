@@ -4204,17 +4204,29 @@ mfq_tensor_backend::Tensor nint_gemv_packed_ws_cuda(
 #define QPWSLAUNCH(GSVAL)                                                               \
     do {                                                                                \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                    \
+        const bool small_m_sum = GSVAL == 24 && M >= 2 && M <= 6 &&                    \
+            nint_gs24_group_enabled("MFQ_NINT4_GS24_SMALL_M_REUSE", true) &&             \
+            nint_gs24_group_enabled("MFQ_NINT4_GS24_VEC_LOAD", true) &&                  \
+            nint_gs24_group_enabled("MFQ_NINT4_SMALL_M_XSUM", false);                   \
+        if (small_m_sum) {                                                             \
+            quantize_x_kernel<GSVAL, BD, true><<<dim3(M, ng), BD, 0, stream>>>(          \
+                reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                \
+                qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), \
+                M, K_real, K_pad);                                                      \
+        } else {                                                                       \
         quantize_x_kernel<GSVAL, BD><<<dim3(M, ng), BD, 0, stream>>>(                   \
             reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                    \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),  \
             M, K_real, K_pad);                                                          \
+        }                                                                               \
         if (GSVAL == 24 && M >= 2 && M <= 6 && \
                 nint_gs24_group_enabled("MFQ_NINT4_GS24_SMALL_M_REUSE", true) && \
                 nint_gs24_group_enabled("MFQ_NINT4_GS24_VEC_LOAD", true)) { \
             Nint4Gs24Projection projection{q_packed.data_ptr<uint8_t>(), \
                 sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), \
-                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), N}; \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), N, \
+                small_m_sum ? xsum.data_ptr<int32_t>() : nullptr}; \
             launch_nint4_gs24_small_m_reuse(projection, qx.data_ptr<int8_t>(), \
                 xscale.data_ptr<float>(), M, ng, K_pad, stream); \
         } else if (GSVAL == 24 && M <= 6 && nint_gs24_group_enabled("MFQ_NINT4_GS24_VEC_LOAD", true)) { \
@@ -4779,7 +4791,9 @@ mfq_tensor_backend::Tensor nint_gemv_packed_gate_ws_cuda(
             Nint4Gs24Projection projection{q_packed.data_ptr<uint8_t>(), \
                 sub_scale.data_ptr<uint8_t>(), sub_min.data_ptr<uint8_t>(), \
                 neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(), \
-                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), N}; \
+                reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), N, \
+                nint_gs24_group_enabled("MFQ_NINT4_SMALL_M_XSUM", false) \
+                    ? xsum.data_ptr<int32_t>() : nullptr}; \
             launch_nint4_gs24_small_m_reuse(projection, qx.data_ptr<int8_t>(), \
                 xscale.data_ptr<float>(), M, ng, K_pad, stream); \
         } else if (GSVAL == 24 && M <= 6 && nint_gs24_group_enabled("MFQ_NINT4_GS24_VEC_LOAD", true)) { \

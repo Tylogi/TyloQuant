@@ -7,7 +7,7 @@
 #include <vector>
 
 using mfq_tensor_backend::Tensor;
-Tensor nint4_gs24_small_m_f32_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor);
+Tensor nint4_gs24_small_m_f32_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor);
 
 #define DECLARE_GLU(name) \
 Tensor name(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, int64_t, Tensor, Tensor, Tensor)
@@ -161,7 +161,7 @@ void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs,
         auto float_input = x.to(kFloat32) + .000123;
         auto reference = invoke(float_input.to(kFloat16), 2).to(kFloat32);
         auto invoke_float = [&](const Tensor& input) {
-            return nint4_gs24_small_m_f32_ws_cuda(q, s, sm, ns, nm, input, qx, xs);
+            return nint4_gs24_small_m_f32_ws_cuda(q, s, sm, ns, nm, input, qx, xs, xm);
         };
         for (int m = 2; m <= batch; ++m) {
             exact(invoke_float(float_input.narrow(0, 0, m)), reference.narrow(0, 0, m));

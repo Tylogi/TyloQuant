@@ -169,7 +169,7 @@ std::vector<torch::Tensor> linear_conv_qkv_decode_cuda(
 // nint_matmul.cu (decode / small-batch path)
 torch::Tensor nint4_gs24_small_m_f32_ws_cuda(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor);
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor);
 torch::Tensor nint_gemv_cuda(
     torch::Tensor q, torch::Tensor sub_scale, torch::Tensor sub_min,
     torch::Tensor neuron_scale, torch::Tensor neuron_min, torch::Tensor x, int64_t gs);

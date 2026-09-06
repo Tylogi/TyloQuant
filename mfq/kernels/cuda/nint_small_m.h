@@ -11,6 +11,7 @@ struct Nint4Gs24Projection {
     const float* neuron_min;
     void* out;
     int n;
+    const int32_t* xsum = nullptr;
 };
 
 void launch_nint4_gs24_small_m_reuse(
