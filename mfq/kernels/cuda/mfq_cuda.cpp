@@ -7,6 +7,7 @@
 #include <torch/extension.h>
 #include <vector>
 #include <optional>
+#include "mxfp4_sq.h"
 
 std::vector<torch::Tensor> nint8_one_quantize_reconstruct_cuda(
     torch::Tensor x);
@@ -700,6 +701,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "MXFP8 packed FP32-output matmul (CUDA)");
     m.def("mxfp4_dequant_cuda", &mxfp4_dequant_cuda,
           "MXFP4 full dequantization (CUDA)");
+    m.def("mxfp4_sq_dequant_cuda", &mxfp4_sq_dequant_cuda,
+          "Frozen SQ2/SQ3 packed dequantization (CUDA)");
+    m.def("mxfp4_sq_matmul_cuda", &mxfp4_sq_matmul_cuda,
+          "Frozen SQ2/SQ3 packed matmul (CUDA)");
     m.def("mxfp4_embedding_lookup_cuda", &mxfp4_embedding_lookup_cuda,
           "MXFP4 selected-row embedding decode (CUDA)");
     m.def("mxfp4_matmul_f16_cuda", &mxfp4_matmul_f16_cuda,
