@@ -13331,6 +13331,8 @@ struct Config {
     double rms_norm_eps = 1e-6;
     bool tie_word_embeddings = false;
     bool qwen35_attn_q_gate = false;
+    int64_t mtp_num_hidden_layers = 0;
+    bool mtp_use_dedicated_embeddings = false;
     int64_t linear_conv_kernel_dim = 4, linear_key_head_dim = 128, linear_value_head_dim = 128;
     int64_t linear_num_key_heads = 0, linear_num_value_heads = 0;
     int64_t num_experts = 0, num_experts_per_tok = 0;
@@ -13550,6 +13552,8 @@ static Config parse_config_json(
     c.attention_k_eq_v = json_bool(s, "attention_k_eq_v", false);
     c.final_logit_softcapping = json_float(s, "final_logit_softcapping", 0.0);
     c.qwen35_attn_q_gate = json_bool(s, "attn_output_gate", false);
+    c.mtp_num_hidden_layers = json_int(s, "mtp_num_hidden_layers", 0);
+    c.mtp_use_dedicated_embeddings = json_bool(s, "mtp_use_dedicated_embeddings", false);
     c.linear_conv_kernel_dim = json_int(s, "linear_conv_kernel_dim", 4);
     c.linear_key_head_dim = json_int(s, "linear_key_head_dim", 128);
     c.linear_value_head_dim = json_int(s, "linear_value_head_dim", 128);
@@ -16935,8 +16939,53 @@ struct LinearBlock : Block {
     mfq_tensor_backend::Tensor out_proj_dense;
     FFN ffn;
     mfq_tensor_backend::Tensor conv_state, gdn_state;
+    mfq_tensor_backend::Tensor speculative_conv, speculative_gdn;
+    bool speculative_pending = false;
+
+    void commit_speculative() noexcept { speculative_pending = false; }
+
+    void rollback_speculative() {
+        MFQ_RUNTIME_CHECK(speculative_pending,
+            "Qwen speculative recurrent checkpoint is unavailable");
+        // Preserve storage addresses used by ordinary decode graphs.
+        conv_state.copy_(speculative_conv);
+        gdn_state.copy_(speculative_gdn);
+        speculative_pending = false;
+    }
+
+    mfq_tensor_backend::Tensor forward_speculative(
+            mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos,
+            int64_t cache_pos, const Config& c, const RopeCache& rope,
+            int64_t confirmed) {
+        MFQ_RUNTIME_CHECK(!speculative_pending && confirmed > 0 && confirmed < x.size(1),
+            "invalid Qwen speculative linear-attention transaction");
+        const int64_t tokens = x.size(1);
+        const int position_dim = pos.dim() == 1 ? 0 : 1;
+        auto prefix = forward(x.narrow(1, 0, confirmed),
+            pos.narrow(position_dim, 0, confirmed), cache_pos, mfq_nullopt, c, rope);
+        MFQ_RUNTIME_CHECK(conv_state.defined() && gdn_state.defined(),
+            "Qwen recurrent state missing after confirmed prefix");
+        if (!speculative_conv.defined() || speculative_conv.sizes() != conv_state.sizes()) {
+            speculative_conv = conv_state.clone();
+            speculative_gdn = gdn_state.clone();
+        } else {
+            speculative_conv.copy_(conv_state);
+            speculative_gdn.copy_(gdn_state);
+        }
+        speculative_pending = true;
+        try {
+            auto suffix = forward(x.narrow(1, confirmed, tokens - confirmed),
+                pos.narrow(position_dim, confirmed, tokens - confirmed),
+                cache_pos + confirmed, mfq_nullopt, c, rope);
+            return mfq_tensor_backend::cat({prefix, suffix}, 1);
+        } catch (...) {
+            rollback_speculative();
+            throw;
+        }
+    }
 
     void reset(int64_t B) override {
+        speculative_pending = false;
         if (conv_state.defined() && gdn_state.defined() &&
             conv_state.size(0) == B && gdn_state.size(0) == B) {
             conv_state.zero_();
@@ -18571,6 +18620,41 @@ struct Model {
     mfq_tensor_backend::Tensor dsv4_hc_head_scale;
     mfq_tensor_backend::Tensor dsv4_hc_head_base;
     int64_t cache_pos = 0;
+    int64_t speculative_start = -1;
+    int64_t speculative_confirmed = 0;
+
+    bool supports_qwen_speculation() const {
+        return c.runtime_plan.backbone == mfq::cuda::MfqCudaBackbone::generic_qwen &&
+            !blocks.empty() && std::all_of(blocks.begin(), blocks.end(), [](const auto& block) {
+                const auto* full = dynamic_cast<const FullBlock*>(block.get());
+                return (full != nullptr && !full->sliding) ||
+                    dynamic_cast<const LinearBlock*>(block.get()) != nullptr;
+            });
+    }
+
+    void commit_speculative() {
+        MFQ_RUNTIME_CHECK(speculative_start >= 0, "no speculative transaction to commit");
+        for (auto& block : blocks) {
+            if (auto* linear = dynamic_cast<LinearBlock*>(block.get())) linear->commit_speculative();
+        }
+        speculative_start = -1;
+        speculative_confirmed = 0;
+    }
+
+    void rollback_speculative() {
+        MFQ_RUNTIME_CHECK(speculative_start >= 0, "no speculative transaction to roll back");
+        for (auto& block : blocks) {
+            if (auto* linear = dynamic_cast<LinearBlock*>(block.get())) {
+                MfqCudaGuard guard(block->cuda_device);
+                linear->rollback_speculative();
+            }
+        }
+        // Full-attention KV slots beyond this logical length are overwritten
+        // by the next pass; no history-sized cache copy is needed.
+        cache_pos = speculative_start + speculative_confirmed;
+        speculative_start = -1;
+        speculative_confirmed = 0;
+    }
 
     mfq_tensor_backend::Tensor embed_forward(mfq_tensor_backend::Tensor ids) const {
         auto token_ids = ids.contiguous().to(mfq_tensor_backend::kCUDA, mfq_tensor_backend::kInt64);
@@ -18582,6 +18666,8 @@ struct Model {
 
     void reset(int64_t B) {
         cache_pos = 0;
+        speculative_start = -1;
+        speculative_confirmed = 0;
         for (auto & b : blocks) {
             MfqCudaGuard guard(b->cuda_device);
             b->reset(B);
@@ -18864,7 +18950,9 @@ struct Model {
                                  MfqOptional<mfq_tensor_backend::Tensor> pos_override = mfq_nullopt,
                                  MfqOptional<mfq_tensor_backend::Tensor> seq_len = mfq_nullopt,
                                  std::vector<mfq_tensor_backend::Tensor> * block_trace = nullptr,
-                                 MfqOptional<mfq_tensor_backend::Tensor> cache_positions_override = mfq_nullopt) {
+                                 MfqOptional<mfq_tensor_backend::Tensor> cache_positions_override = mfq_nullopt,
+                                 mfq_tensor_backend::Tensor* raw_hidden = nullptr,
+                                 int64_t confirmed_prefix = 0) {
         const int primary = g_layer_placement.primary_device();
         MfqCudaGuard primary_guard(primary);
         ids = tensor_to_cuda_device(
@@ -18873,7 +18961,7 @@ struct Model {
         auto x = g_profiler.measure("model.embed", [&]() { return embed_forward(ids); });
         return hidden_forward_inputs(
             ids, x, pos_override, seq_len, block_trace,
-            mfq_nullopt, false, cache_positions_override);
+            mfq_nullopt, false, cache_positions_override, raw_hidden, confirmed_prefix);
     }
 
     mfq_tensor_backend::Tensor hidden_forward_inputs(
@@ -18884,7 +18972,9 @@ struct Model {
             std::vector<mfq_tensor_backend::Tensor> * block_trace = nullptr,
             MfqOptional<mfq_tensor_backend::Tensor> attention_mask = mfq_nullopt,
             bool advance_cache_with_position_ids = false,
-            MfqOptional<mfq_tensor_backend::Tensor> cache_positions_override = mfq_nullopt) {
+            MfqOptional<mfq_tensor_backend::Tensor> cache_positions_override = mfq_nullopt,
+            mfq_tensor_backend::Tensor* raw_hidden = nullptr,
+            int64_t confirmed_prefix = 0) {
         const int primary = g_layer_placement.primary_device();
         MfqCudaGuard primary_guard(primary);
         ids = tensor_to_cuda_device(
@@ -18899,6 +18989,19 @@ struct Model {
         }
         const int64_t B = ids.size(0);
         const int64_t T = ids.size(1);
+        MFQ_RUNTIME_CHECK(speculative_start < 0,
+            "commit or roll back the pending speculative pass before forwarding");
+        MFQ_RUNTIME_CHECK(confirmed_prefix >= 0 &&
+            (confirmed_prefix == 0 || (confirmed_prefix < T && B == 1 && cache_pos > 0 &&
+                !pos_override.has_value() && !cache_positions_override.has_value() &&
+                !attention_mask.has_value() && supports_qwen_speculation())),
+            "unsupported speculative backbone geometry");
+        if (confirmed_prefix > 0) {
+            MFQ_RUNTIME_CHECK(cache_pos + T <= c.max_position_embeddings,
+                "speculative pass exceeds context capacity");
+            speculative_start = cache_pos;
+            speculative_confirmed = confirmed_prefix;
+        }
         if (cache_pos == 0) reset(B);
         auto cache_positions = cache_positions_override.has_value()
             ? tensor_to_cuda_device(
@@ -19006,11 +19109,17 @@ struct Model {
                 ? cpu_rope
                 : (device_ropes.empty()
                     ? rope : device_ropes.at(b->cuda_device));
-            x = b->forward(
-                x, local_pos, cache_pos, local_seq_len, c, active_rope,
-                local_cache_positions,
-                c.is_minicpmo45()
-                    ? local_attention_mask : mfq_nullopt);
+            if (auto* linear = confirmed_prefix > 0 ? dynamic_cast<LinearBlock*>(b.get()) : nullptr;
+                    linear != nullptr) {
+                x = linear->forward_speculative(x, local_pos, cache_pos, c, active_rope,
+                    confirmed_prefix);
+            } else {
+                x = b->forward(
+                    x, local_pos, cache_pos, local_seq_len, c, active_rope,
+                    local_cache_positions,
+                    c.is_minicpmo45()
+                        ? local_attention_mask : mfq_nullopt);
+            }
             if (block_trace != nullptr) {
                 block_trace->push_back(
                     tensor_to_cuda_device(x, primary)
@@ -19021,6 +19130,7 @@ struct Model {
             cache_pos += T;
         }
         x = tensor_to_cuda_device(x, primary);
+        if (raw_hidden != nullptr) *raw_hidden = x;
         return finalize_hidden(x, B, T);
     }
 
@@ -19328,10 +19438,88 @@ static Model load_model(const std::string & mfq_path, const std::string & config
 
 #include "minicpmo45_runtime.inc"
 
+// Qwen3.5's predictor shares the main embedding/output head and owns only
+// its fusion/norm/attention/FFN weights and an independent attention history.
+struct CudaQwen35Mtp {
+    Config c;
+    QuantLinear fusion;
+    mfq_tensor_backend::Tensor hidden_norm, embedding_norm, output_norm;
+    std::vector<std::unique_ptr<Block>> blocks;
+    int64_t cache_pos = 0;
+
+    static std::optional<CudaQwen35Mtp> load_if_present(const MfqFile& file, const Config& main) {
+        const bool fusion_present = file.has_record("predictor.fusion.weight");
+        const bool any = fusion_present || file.has_record("predictor.hidden_norm.weight") ||
+            file.has_record("predictor.embedding_norm.weight") ||
+            file.has_record("predictor.output_norm.weight") ||
+            file.has_record("predictor.block.0.attention.query.weight");
+        if (!fusion_present) {
+            MFQ_RUNTIME_CHECK(!any, "Qwen MFQ contains an incomplete MTP head");
+            return std::nullopt;
+        }
+        MFQ_RUNTIME_CHECK(main.mtp_num_hidden_layers > 0 && !main.mtp_use_dedicated_embeddings,
+            "Qwen MTP requires declared predictor layers and shared embeddings");
+        CudaQwen35Mtp result;
+        result.c = main;
+        result.c.tensor_root = "predictor";
+        result.c.num_hidden_layers = main.mtp_num_hidden_layers;
+        result.c.layer_types.assign(static_cast<size_t>(main.mtp_num_hidden_layers), "full_attention");
+        result.hidden_norm = load_dense_gpu(file, "predictor.hidden_norm.weight");
+        result.embedding_norm = load_dense_gpu(file, "predictor.embedding_norm.weight");
+        result.output_norm = load_dense_gpu(file, "predictor.output_norm.weight");
+        result.fusion = load_quant_linear(file, "predictor.fusion.weight");
+        MFQ_RUNTIME_CHECK(result.fusion.neuron_len() == 2 * main.hidden_size &&
+            result.fusion.out() == main.hidden_size && result.hidden_norm.numel() == main.hidden_size &&
+            result.embedding_norm.numel() == main.hidden_size && result.output_norm.numel() == main.hidden_size,
+            "Qwen MTP component dimensions disagree with the backbone");
+        for (int layer = 0; layer < main.mtp_num_hidden_layers; ++layer) {
+            auto block = load_block(file, result.c, layer, "full_attention");
+            block->cuda_device = g_layer_placement.primary_device();
+            result.blocks.push_back(std::move(block));
+        }
+        return result;
+    }
+
+    void reset(int64_t batch = 1) {
+        cache_pos = 0;
+        for (auto& block : blocks) block->reset(batch);
+    }
+
+    mfq_tensor_backend::Tensor forward(Model& main, mfq_tensor_backend::Tensor hidden,
+                                      mfq_tensor_backend::Tensor next_ids) {
+        MFQ_RUNTIME_CHECK(hidden.dim() == 3 && next_ids.dim() == 2 && hidden.size(0) == next_ids.size(0) &&
+            hidden.size(1) == next_ids.size(1) && hidden.size(2) == c.hidden_size && hidden.size(1) > 0,
+            "Qwen MTP inputs must be matching [B,T,H] hidden states and [B,T] next-token IDs");
+        const auto batch = hidden.size(0), tokens = hidden.size(1);
+        MFQ_RUNTIME_CHECK(cache_pos + tokens <= c.max_position_embeddings,
+            "Qwen MTP history exceeds context capacity");
+        auto embedded = main.embed_forward(next_ids).to(hidden.scalar_type());
+        auto e = qwen_rms_norm(embedded.reshape({batch * tokens, c.hidden_size})
+            .to(mfq_tensor_backend::kFloat32), embedding_norm, c).reshape_as(hidden);
+        auto h = qwen_rms_norm(hidden.reshape({batch * tokens, c.hidden_size})
+            .to(mfq_tensor_backend::kFloat32), hidden_norm, c).reshape_as(hidden);
+        // Frozen Metal fusion order: normalized next-token embedding, then
+        // normalized RAW backbone hidden (before the backbone output norm).
+        auto x = fusion.forward(mfq_tensor_backend::cat({e, h}, -1));
+        auto pos = mfq_tensor_backend::arange(cache_pos, cache_pos + tokens,
+            mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt64));
+        MfqOptional<mfq_tensor_backend::Tensor> length = mfq_nullopt;
+        if (tokens == 1 && cache_pos > 0) {
+            length = mfq_tensor_backend::full({batch}, cache_pos + 1, pos.options());
+        }
+        for (auto& block : blocks) x = block->forward(x, pos, cache_pos, length, c, main.rope);
+        cache_pos += tokens;
+        return qwen_rms_norm(x.reshape({batch * tokens, c.hidden_size})
+            .to(mfq_tensor_backend::kFloat32), output_norm, c)
+            .reshape({batch, tokens, c.hidden_size});
+    }
+};
+
 struct CudaRuntimeComponents {
     mfq::MfqModelGraph graph;
     mfq::cuda::MfqCudaModelPlan plan;
     std::optional<MiniCPMO45Runtime> minicpmo;
+    std::optional<CudaQwen35Mtp> qwen_mtp;
     bool vision_available = false;
     bool mtp_available = false;
 
