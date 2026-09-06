@@ -1,11 +1,31 @@
 import re
 import struct
 import unittest
+import importlib.util
+import sys
+import types
+from unittest import mock
 
 from bench.cuda_mxfp4_sq_fixtures import ROOT, fixture, pack, palette_nibbles
 
 
 class SqWireTest(unittest.TestCase):
+    def test_torch_loader_uses_native_header_language_standard(self):
+        spec = importlib.util.spec_from_file_location("sq_test_ext", ROOT / "mfq/kernels/cuda/_ext.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        extension = types.ModuleType("torch.utils.cpp_extension")
+        extension.load = mock.Mock(return_value=object())
+        with mock.patch.object(module, "_ensure_msvc"), mock.patch.dict(sys.modules, {
+            "torch": types.ModuleType("torch"),
+            "torch.utils": types.ModuleType("torch.utils"),
+            "torch.utils.cpp_extension": extension,
+        }):
+            module.ext()
+        kwargs = extension.load.call_args.kwargs
+        self.assertTrue(any("std:c++20" in flag or "std=c++20" in flag for flag in kwargs["extra_cflags"]))
+        self.assertIn("-std=c++20", kwargs["extra_cuda_cflags"])
+
     def test_frozen_palette_parity(self):
         source = (ROOT / "mfq/kernels/cuda/mxfp4_sq.cu").read_text()
         for bits in (2, 3):

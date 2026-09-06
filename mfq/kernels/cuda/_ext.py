@@ -89,7 +89,9 @@ def ext():
             name="mfq_cuda",
             sources=_SOURCES,
             extra_include_paths=[_REPOSITORY_ROOT, _CUDA_RUNTIME_INCLUDE],
-            extra_cuda_cflags=["-O3", "--use_fast_math"],
+            # Shared native tensor views require C++20 (span and comparisons).
+            extra_cflags=["/std:c++20"] if os.name == "nt" else ["-std=c++20"],
+            extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++20"],
             extra_ldflags=["cublas.lib"] if os.name == "nt" else ["-lcublas"],
             verbose=False,
         )
