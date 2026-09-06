@@ -1,5 +1,7 @@
 #include "mfq_tensor_backend.h"
 #include "nint_small_m.h"
+#include "reduce.cuh"
+#include <climits>
 
 __device__ __forceinline__ int small_m_unpack_int4(uint32_t packed)
 {
@@ -9,7 +11,7 @@ __device__ __forceinline__ int small_m_unpack_int4(uint32_t packed)
            ((int)(packed & 0xf000) << 12);
 }
 
-template <int MROWS>
+template <int MROWS, bool FLOAT_OUTPUT = false>
 __global__ void __launch_bounds__(128) nint4_gs24_small_m_reuse_kernel(
     Nint4Gs24Projection weight,
     const int8_t* __restrict__ qx,
@@ -71,18 +73,23 @@ __global__ void __launch_bounds__(128) nint4_gs24_small_m_reuse_kernel(
                 d += __shfl_xor_sync(0xffffffff, d, offset);
                 b += __shfl_xor_sync(0xffffffff, b, offset);
             }
-            if (lane == 0) reinterpret_cast<__half*>(weight.out)[(size_t)m * weight.n + row] =
-                __float2half(weight.neuron_scale[row] * d - weight.neuron_min[row] * b);
+            if (lane == 0) {
+                const __half rounded = __float2half(weight.neuron_scale[row] * d - weight.neuron_min[row] * b);
+                if constexpr (FLOAT_OUTPUT)
+                    reinterpret_cast<float*>(weight.out)[(size_t)m * weight.n + row] = __half2float(rounded);
+                else reinterpret_cast<__half*>(weight.out)[(size_t)m * weight.n + row] = rounded;
+            }
         }
     }
 }
 
-void launch_nint4_gs24_small_m_reuse(
+template <bool FLOAT_OUTPUT>
+static void launch_small_m(
     Nint4Gs24Projection weight, const int8_t* qx, const float* xs,
     int m, int ng, int kpad, cudaStream_t stream)
 {
 #define MFQ_NINT4_SMALL_M_CASE(M) \
-    case M: nint4_gs24_small_m_reuse_kernel<M><<<weight.n, 128, 0, stream>>>(weight, qx, xs, ng, kpad); break
+    case M: nint4_gs24_small_m_reuse_kernel<M, FLOAT_OUTPUT><<<weight.n, 128, 0, stream>>>(weight, qx, xs, ng, kpad); break
     switch (m) {
         MFQ_NINT4_SMALL_M_CASE(2);
         MFQ_NINT4_SMALL_M_CASE(3);
@@ -92,4 +99,68 @@ void launch_nint4_gs24_small_m_reuse(
         default: MFQ_RUNTIME_CHECK(false, "NINT4 small-M reuse requires M2-6");
     }
 #undef MFQ_NINT4_SMALL_M_CASE
+}
+
+void launch_nint4_gs24_small_m_reuse(
+    Nint4Gs24Projection weight, const int8_t* qx, const float* xs,
+    int m, int ng, int kpad, cudaStream_t stream)
+{
+    launch_small_m<false>(weight, qx, xs, m, ng, kpad, stream);
+}
+
+__global__ void small_m_quantize_f32_half_rn_kernel(
+    const float* __restrict__ input, int8_t* __restrict__ qx,
+    float* __restrict__ scales, int k, int kpad)
+{
+    const int m = blockIdx.x, g = blockIdx.y, lane = threadIdx.x;
+    const bool valid = lane < 24 && g * 24 + lane < k;
+    const float x = valid ? __half2float(__float2half_rn(input[(size_t)m * k + g * 24 + lane])) : 0.f;
+    const float amax = block_max<1>(fabsf(x));
+    const float scale = amax > 0.f ? amax / 127.f : 1.f;
+    int code = 0;
+    if (valid) code = (int)fminf(fmaxf(roundf(x / scale), -127.f), 127.f);
+    if (lane == 0) scales[(size_t)m * gridDim.y + g] = scale;
+    if (lane < 24) qx[(size_t)m * kpad + g * 24 + lane] = (int8_t)code;
+}
+
+mfq_tensor_backend::Tensor nint4_gs24_small_m_f32_ws_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor s, mfq_tensor_backend::Tensor sm,
+    mfq_tensor_backend::Tensor ns, mfq_tensor_backend::Tensor nm, mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xs)
+{
+    using namespace mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == kFloat32 && x.dim() == 2,
+        "NINT4 small-M F32 boundary requires contiguous CUDA F32 [M,K]");
+    MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == kUInt8 &&
+        q.dim() == 3 && q.size(2) == 12 && q.size(0) > 0 && q.size(1) > 0,
+        "NINT4 small-M F32 weights require packed GS24 [N,ng,12]");
+    const int64_t rows = x.size(0), columns = q.size(0), groups = q.size(1);
+    MFQ_RUNTIME_CHECK(rows >= 2 && rows <= 6 && x.size(1) > 0 &&
+        groups <= INT_MAX / 24 && columns <= INT_MAX && x.size(1) <= groups * 24,
+        "NINT4 small-M F32 geometry exceeds supported bounds");
+    for (const auto* value : {&q, &s, &sm, &ns, &nm, &qx, &xs}) {
+        MFQ_RUNTIME_CHECK(value->is_cuda() && value->device() == x.device() && value->is_contiguous(),
+            "NINT4 small-M F32 tensors must be contiguous on one CUDA device");
+    }
+    for (const auto* value : {&s, &sm}) MFQ_RUNTIME_CHECK(value->scalar_type() == kUInt8 &&
+        value->dim() == 2 && value->size(0) == columns && value->size(1) == groups,
+        "NINT4 small-M F32 submetadata shape or dtype mismatch");
+    for (const auto* value : {&ns, &nm}) MFQ_RUNTIME_CHECK(value->scalar_type() == kFloat32 &&
+        value->dim() == 1 && value->size(0) == columns,
+        "NINT4 small-M F32 neuron metadata shape or dtype mismatch");
+    MFQ_RUNTIME_CHECK(qx.scalar_type() == kInt8 && qx.dim() == 2 &&
+        qx.size(0) >= rows && qx.size(1) == groups * 24 &&
+        xs.scalar_type() == kFloat32 && xs.dim() == 2 && xs.size(0) >= rows && xs.size(1) == groups,
+        "NINT4 small-M F32 workspace shape or dtype mismatch");
+    MfqCudaGuard guard(x.device());
+    auto output = mfq_tensor_backend::empty({rows, columns}, x.options());
+    auto stream = mfq_current_cuda_stream();
+    small_m_quantize_f32_half_rn_kernel<<<dim3(rows, groups), 32, 0, stream>>>(
+        x.data_ptr<float>(), qx.data_ptr<int8_t>(), xs.data_ptr<float>(), (int)x.size(1), (int)(groups * 24));
+    Nint4Gs24Projection weight{q.data_ptr<uint8_t>(), s.data_ptr<uint8_t>(), sm.data_ptr<uint8_t>(),
+        ns.data_ptr<float>(), nm.data_ptr<float>(), output.data_ptr<float>(), (int)columns};
+    launch_small_m<true>(weight, qx.data_ptr<int8_t>(), xs.data_ptr<float>(),
+        (int)rows, (int)groups, (int)(groups * 24), stream);
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
 }

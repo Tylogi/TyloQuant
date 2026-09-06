@@ -7,6 +7,7 @@
 #include <vector>
 
 using mfq_tensor_backend::Tensor;
+Tensor nint4_gs24_small_m_f32_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor);
 
 #define DECLARE_GLU(name) \
 Tensor name(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, int64_t, Tensor, Tensor, Tensor)
@@ -37,12 +38,12 @@ void require(bool ok, const char* message) {
 void exact(const Tensor& actual, const Tensor& expected) {
     auto a = actual.contiguous().cpu();
     auto e = expected.contiguous().cpu();
-    require(a.sizes() == e.sizes(), "small-M shape mismatch");
-    require(std::memcmp(a.data_ptr<__half>(), e.data_ptr<__half>(), a.numel() * 2) == 0,
+    require(a.sizes() == e.sizes() && a.scalar_type() == e.scalar_type(), "small-M shape or dtype mismatch");
+    require(std::memcmp(a.data_ptr(), e.data_ptr(), a.nbytes()) == 0,
         "small-M output differs from serial M=1 bits");
 }
 
-void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs) {
+void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs, int& f32_cases) {
     constexpr int rows = 17;
     constexpr int batch = 6;
     const int groups = (width + gs - 1) / gs, kpad = groups * gs;
@@ -156,6 +157,35 @@ void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs)
             ++graphs;
         }
     }
+    if (bits == 4) {
+        auto float_input = x.to(kFloat32) + .000123;
+        auto reference = invoke(float_input.to(kFloat16), 2).to(kFloat32);
+        auto invoke_float = [&](const Tensor& input) {
+            return nint4_gs24_small_m_f32_ws_cuda(q, s, sm, ns, nm, input, qx, xs);
+        };
+        for (int m = 2; m <= batch; ++m) {
+            exact(invoke_float(float_input.narrow(0, 0, m)), reference.narrow(0, 0, m));
+            ++f32_cases;
+        }
+        bool rejected = false;
+        try { (void)invoke_float(float_input.narrow(0, 0, 1)); }
+        catch (const std::exception&) { rejected = true; }
+        require(rejected, "F32 small-M accepted unsupported M1");
+        if (width == 257) {
+            Graph graph;
+            graph.prepare_memory();
+            Tensor output = invoke_float(float_input);
+            MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream().stream()));
+            output = Tensor{};
+            graph.capture_begin();
+            output = invoke_float(float_input);
+            graph.capture_end();
+            graph.replay();
+            graph.replay();
+            exact(output, reference);
+            ++graphs;
+        }
+    }
     std::cout << "PASS NINT" << bits << " GS=" << gs << " K=" << width << '\n';
 }
 } // namespace
@@ -166,11 +196,12 @@ int main() {
     try {
         auto stream = mfq::cuda::stream_from_pool(false, 0);
         mfq::cuda::StreamGuard guard(stream);
-        int cases = 0, graphs = 0;
+        int cases = 0, graphs = 0, f32_cases = 0;
         for (const auto profile : std::vector<std::vector<int>>{{2,16,5},{3,24,5},{4,24,6},{5,28,7},{6,24,7},{8,48,7}})
-            for (int width : {47, 257, 4096}) check(profile[0], profile[1], profile[2], width, cases, graphs);
-        require(cases == 324 && graphs == 18, "incomplete small-M coverage");
-        std::cout << "PASS small_m_cases=" << cases << " graphs=" << graphs << '\n';
+            for (int width : {47, 257, 4096}) check(profile[0], profile[1], profile[2], width, cases, graphs, f32_cases);
+        require(cases == 324 && graphs == 19 && f32_cases == 15, "incomplete small-M coverage");
+        std::cout << "PASS small_m_cases=" << cases << " f32_boundary_cases=" << f32_cases
+            << " graphs=" << graphs << '\n';
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         return 1;

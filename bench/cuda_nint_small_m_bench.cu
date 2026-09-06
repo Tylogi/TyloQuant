@@ -7,6 +7,7 @@
 #include <random>
 
 using mfq_tensor_backend::Tensor;
+Tensor nint4_gs24_small_m_f32_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor);
 Tensor nint_gemv_packed_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
     int64_t, Tensor, Tensor, Tensor);
 Tensor nint_gemv_packed_int6_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
@@ -75,6 +76,8 @@ int main(int argc, char** argv) {
         for (int m = 2; m <= 6; ++m) {
             auto input = x.narrow(0, 0, m);
             auto invoke = [&]() {
+                if (bits == 4 && boundary == "f32")
+                    return nint4_gs24_small_m_f32_ws_cuda(q, s, sm, ns, nm, input, qx, xs);
                 auto half_input = input.to(kFloat16);
                 auto half_output = bits == 4
                     ? nint_gemv_packed_ws_cuda(q, s, sm, ns, nm, half_input, gs, qx, xs, xm)
