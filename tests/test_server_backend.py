@@ -153,6 +153,8 @@ def test_backend_stream_parses_cpp_sse_and_preserves_request_fields() -> None:
     assert payload["stream_options"] == {"include_usage": True}
     assert payload["max_tokens"] == 12
     assert payload["seed"] == 7
+    assert payload["enable_vision"] is True
+    assert payload["enable_mtp"] is True
     assert payload["mfq_session_id"] == "11111111-1111-4111-8111-111111111111"
     assert payload["chat_template_kwargs"] == {
         "enable_thinking": True,

@@ -361,11 +361,11 @@ class _VisionAttention:
     ) -> None:
         self.config = config
         self.qkv = _VisionLinear(model, prefix + ".qkv")
-        self.output = _VisionLinear(model, prefix + ".proj")
+        self.output = _VisionLinear(model, prefix + ".output")
         dimension = config.hidden_size // config.num_heads
         self.q_norm = (
             MlxRMSNorm(
-                _dense_vector(model, prefix + ".q_norm.weight"),
+                _dense_vector(model, prefix + ".query_norm.weight"),
                 config.rms_norm_eps,
             )
             if normalize_qk
@@ -373,7 +373,7 @@ class _VisionAttention:
         )
         self.k_norm = (
             MlxRMSNorm(
-                _dense_vector(model, prefix + ".k_norm.weight"),
+                _dense_vector(model, prefix + ".key_norm.weight"),
                 config.rms_norm_eps,
             )
             if normalize_qk
@@ -414,12 +414,12 @@ class _QwenVisionBlock:
         self.attention = _VisionAttention(
             model,
             config,
-            prefix + ".attn",
+            prefix + ".attention",
             normalize_qk=False,
         )
         self.norm2 = _LayerNorm(model, prefix + ".norm2", eps=1e-6)
-        self.fc1 = _VisionLinear(model, prefix + ".mlp.linear_fc1")
-        self.fc2 = _VisionLinear(model, prefix + ".mlp.linear_fc2")
+        self.fc1 = _VisionLinear(model, prefix + ".mlp.up")
+        self.fc2 = _VisionLinear(model, prefix + ".mlp.down")
 
     def __call__(
         self,
@@ -445,16 +445,16 @@ class _GlmVisionBlock:
         self.attention = _VisionAttention(
             model,
             config,
-            prefix + ".attn",
+            prefix + ".attention",
             normalize_qk=True,
         )
         self.norm2 = MlxRMSNorm(
             _dense_vector(model, prefix + ".norm2.weight"),
             config.rms_norm_eps,
         )
-        self.gate = _VisionLinear(model, prefix + ".mlp.gate_proj")
-        self.up = _VisionLinear(model, prefix + ".mlp.up_proj")
-        self.down = _VisionLinear(model, prefix + ".mlp.down_proj")
+        self.gate = _VisionLinear(model, prefix + ".mlp.gate")
+        self.up = _VisionLinear(model, prefix + ".mlp.up")
+        self.down = _VisionLinear(model, prefix + ".mlp.down")
 
     def __call__(
         self,
@@ -507,26 +507,27 @@ class _PatchEmbedding:
         return output + self.bias.astype(output.dtype)
 
 
-class MlxQwen4ExpVision:
-    """Qwen3.8-Flash-Next vision tower, including learned-position merger."""
+class MlxQwenVision:
+    """Shared Qwen vision tower with learned positions and patch merger."""
 
     def __init__(
         self,
         tensors: Mapping[str, MfqTensor] | MlxNintModel,
-        config: Qwen4ExpConfig,
+        config: Qwen4ExpConfig | VisionTowerConfig,
         *,
-        prefix: str = "model.visual",
+        prefix: str = "vision",
     ) -> None:
-        if config.vision is None:
-            raise ValueError("Qwen4-Exp config does not contain a vision tower")
+        vision = config if isinstance(config, VisionTowerConfig) else config.vision
+        if vision is None:
+            raise ValueError("Qwen config does not contain a vision tower")
         self.model = tensors if isinstance(tensors, MlxNintModel) else MlxNintModel(tensors)
-        self.config = config.vision
+        self.config = vision
         self.patch_embedding = _PatchEmbedding(
             self.model,
             self.config,
-            prefix + ".patch_embed.proj",
+            prefix + ".patch_embedding",
         )
-        self.position_embedding = _dense_array(self.model, prefix + ".pos_embed.weight")
+        self.position_embedding = _dense_array(self.model, prefix + ".position_embedding.weight")
         positions = self.config.num_position_embeddings
         if positions is None or int(math.isqrt(positions)) ** 2 != positions:
             raise ValueError("Qwen4-Exp learned vision position table must be square")
@@ -535,13 +536,34 @@ class MlxQwen4ExpVision:
             _QwenVisionBlock(
                 self.model,
                 self.config,
-                f"{prefix}.blocks.{index}",
+                f"{prefix}.block.{index}",
             )
             for index in range(self.config.depth)
         )
         self.merger_norm = _LayerNorm(self.model, prefix + ".merger.norm", eps=1e-6)
-        self.merger_fc1 = _VisionLinear(self.model, prefix + ".merger.linear_fc1")
-        self.merger_fc2 = _VisionLinear(self.model, prefix + ".merger.linear_fc2")
+        self.merger_fc1 = _VisionLinear(self.model, prefix + ".merger.mlp.up")
+        self.merger_fc2 = _VisionLinear(self.model, prefix + ".merger.mlp.down")
+
+    @classmethod
+    def load_if_present(
+        cls,
+        causal_lm: object,
+        config: object,
+        *,
+        prefix: str = "vision",
+    ) -> MlxQwenVision | None:
+        """Attach the shared Qwen vision tower when the loaded artifact has one."""
+
+        model = causal_lm.model
+        tensors = model.tensors
+        has_config = getattr(config, "vision", None) is not None
+        has_any_weight = any(name.startswith(prefix + ".") for name in tensors)
+        probe = prefix + ".patch_embedding.weight"
+        if not has_config or probe not in tensors:
+            if has_any_weight:
+                raise ValueError("Qwen MFQ contains an incomplete or unconfigured vision tower")
+            return None
+        return cls(model, config, prefix=prefix)
 
     @classmethod
     def from_mfq(
@@ -549,7 +571,7 @@ class MlxQwen4ExpVision:
         path: str | Path,
         config: Qwen4ExpConfig | Mapping[str, object] | None = None,
         *,
-        prefix: str = "model.visual",
+        prefix: str = "vision",
         mmap: bool = True,
     ) -> MlxQwen4ExpVision:
         """Load the Qwen vision tower from a converted MFQ model."""
@@ -614,6 +636,9 @@ class MlxQwen4ExpVision:
         self.model.close()
 
 
+MlxQwen4ExpVision = MlxQwenVision
+
+
 class MlxGlm5NextVision:
     """GLM-5.3-Flash vision tower, downsampler, and bounded-SwiGLU merger."""
 
@@ -622,7 +647,7 @@ class MlxGlm5NextVision:
         tensors: Mapping[str, MfqTensor] | MlxNintModel,
         config: Glm5NextConfig,
         *,
-        prefix: str = "model.visual",
+        prefix: str = "vision",
     ) -> None:
         if config.vision is None:
             raise ValueError("GLM-5-Next config does not contain a vision tower")
@@ -631,18 +656,18 @@ class MlxGlm5NextVision:
         self.patch_embedding = _PatchEmbedding(
             self.model,
             self.config,
-            prefix + ".patch_embed.proj",
+            prefix + ".patch_embedding",
         )
         self.blocks = tuple(
             _GlmVisionBlock(
                 self.model,
                 self.config,
-                f"{prefix}.blocks.{index}",
+                f"{prefix}.block.{index}",
             )
             for index in range(self.config.depth)
         )
         self.post_norm = MlxRMSNorm(
-            _dense_vector(self.model, prefix + ".post_layernorm.weight"),
+            _dense_vector(self.model, prefix + ".output_norm.weight"),
             self.config.rms_norm_eps,
         )
         self.downsample_weight = _dense_array(self.model, prefix + ".downsample.weight")
@@ -655,15 +680,36 @@ class MlxGlm5NextVision:
         )
         if tuple(self.downsample_weight.shape) != expected_downsample:
             raise ValueError("GLM-5-Next vision downsampler shape disagrees with config")
-        self.merger_projection = _VisionLinear(self.model, prefix + ".merger.proj")
+        self.merger_projection = _VisionLinear(self.model, prefix + ".merger.projection")
         self.merger_norm = _LayerNorm(
             self.model,
-            prefix + ".merger.post_projection_norm",
+            prefix + ".merger.norm",
             eps=1e-5,
         )
-        self.merger_gate = _VisionLinear(self.model, prefix + ".merger.gate_proj")
-        self.merger_up = _VisionLinear(self.model, prefix + ".merger.up_proj")
-        self.merger_down = _VisionLinear(self.model, prefix + ".merger.down_proj")
+        self.merger_gate = _VisionLinear(self.model, prefix + ".merger.mlp.gate")
+        self.merger_up = _VisionLinear(self.model, prefix + ".merger.mlp.up")
+        self.merger_down = _VisionLinear(self.model, prefix + ".merger.mlp.down")
+
+    @classmethod
+    def load_if_present(
+        cls,
+        causal_lm: object,
+        config: Glm5NextConfig,
+        *,
+        prefix: str = "vision",
+    ) -> MlxGlm5NextVision | None:
+        """Attach the GLM vision tower when the loaded artifact has one."""
+
+        model = causal_lm.model
+        tensors = model.tensors
+        has_config = config.vision is not None
+        has_any_weight = any(name.startswith(prefix + ".") for name in tensors)
+        probe = prefix + ".patch_embedding.weight"
+        if not has_config or probe not in tensors:
+            if has_any_weight:
+                raise ValueError("GLM MFQ contains an incomplete or unconfigured vision tower")
+            return None
+        return cls(model, config, prefix=prefix)
 
     @classmethod
     def from_mfq(
@@ -671,7 +717,7 @@ class MlxGlm5NextVision:
         path: str | Path,
         config: Glm5NextConfig | Mapping[str, object] | None = None,
         *,
-        prefix: str = "model.visual",
+        prefix: str = "vision",
         mmap: bool = True,
     ) -> MlxGlm5NextVision:
         """Load the GLM vision tower from a converted MFQ model."""
@@ -790,6 +836,7 @@ def inject_vision_embeddings(
 __all__ = [
     "MlxGlm5NextVision",
     "MlxQwen4ExpVision",
+    "MlxQwenVision",
     "inject_vision_embeddings",
     "qwen4_multimodal_positions",
     "vision_layout",

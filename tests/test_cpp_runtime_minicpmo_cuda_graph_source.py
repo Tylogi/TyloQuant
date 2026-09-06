@@ -2,7 +2,7 @@ from pathlib import Path
 import re
 
 
-SOURCE = (Path(__file__).parents[1] / "cpp_runtime" / "mfq_decode.cpp").read_text(
+SOURCE = (Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp").read_text(
     encoding="utf-8"
 )
 ATTENTION_SOURCE = (
@@ -16,16 +16,16 @@ ATTENTION_MMA_SOURCE = (
     / "attention_mma.cu"
 ).read_text(encoding="utf-8")
 BACKEND_SOURCE = (
-    Path(__file__).parents[1] / "cpp_runtime" / "cuda" / "mfq_tensor_backend.h"
+    Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda" / "include" / "mfq_tensor_backend.h"
 ).read_text(encoding="utf-8")
 CONTEXT_SOURCE = (
-    Path(__file__).parents[1] / "cpp_runtime" / "cuda" / "mfq_cuda_context.cu"
+    Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda" / "src" / "mfq_cuda_context.cu"
 ).read_text(encoding="utf-8")
 NATIVE_OPS_SOURCE = (
-    Path(__file__).parents[1] / "cpp_runtime" / "cuda" / "mfq_native_tensor_ops.cu"
+    Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda" / "src" / "mfq_native_tensor_ops.cu"
 ).read_text(encoding="utf-8")
 NATIVE_TENSOR_SOURCE = (
-    Path(__file__).parents[1] / "cpp_runtime" / "cuda" / "mfq_native_tensor.cu"
+    Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda" / "src" / "mfq_native_tensor.cu"
 ).read_text(encoding="utf-8")
 KV_CACHE_SOURCE = (
     Path(__file__).parents[1] / "mfq" / "kernels" / "cuda" / "kv_cache.cu"

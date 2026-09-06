@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -20,6 +22,7 @@ from mfq.runtime.mlx_causal_lm import (  # noqa: E402
     MlxCausalLM,
     MlxCausalLMConfig,
     MlxQwen35LinearAttentionBlock,
+    MlxQwen35Mtp,
 )
 from mfq.tools.split_mfq import split_mfq  # noqa: E402
 
@@ -49,18 +52,18 @@ def _model() -> MlxCausalLM:
         return quantize(dense, spec)
 
     tensors = {
-        "token_embd.weight": weight(config.vocab_size, config.hidden_size),
-        "blk.0.attn_norm.weight": np.ones(config.hidden_size, dtype=np.float32),
-        "blk.0.attn_q.weight": weight(config.attention_size, config.hidden_size),
-        "blk.0.attn_k.weight": weight(config.kv_size, config.hidden_size),
-        "blk.0.attn_v.weight": weight(config.kv_size, config.hidden_size),
-        "blk.0.attn_output.weight": weight(config.hidden_size, config.attention_size),
-        "blk.0.ffn_norm.weight": np.ones(config.hidden_size, dtype=np.float32),
-        "blk.0.ffn_gate.weight": weight(config.intermediate_size, config.hidden_size),
-        "blk.0.ffn_up.weight": weight(config.intermediate_size, config.hidden_size),
-        "blk.0.ffn_down.weight": weight(config.hidden_size, config.intermediate_size),
-        "output_norm.weight": np.ones(config.hidden_size, dtype=np.float32),
-        "output.weight": weight(config.vocab_size, config.hidden_size),
+        "model.token_embedding.weight": weight(config.vocab_size, config.hidden_size),
+        "model.block.0.attention.norm.weight": np.ones(config.hidden_size, dtype=np.float32),
+        "model.block.0.attention.query.weight": weight(config.attention_size, config.hidden_size),
+        "model.block.0.attention.key.weight": weight(config.kv_size, config.hidden_size),
+        "model.block.0.attention.value.weight": weight(config.kv_size, config.hidden_size),
+        "model.block.0.attention.output.weight": weight(config.hidden_size, config.attention_size),
+        "model.block.0.mlp.norm.weight": np.ones(config.hidden_size, dtype=np.float32),
+        "model.block.0.mlp.gate.weight": weight(config.intermediate_size, config.hidden_size),
+        "model.block.0.mlp.up.weight": weight(config.intermediate_size, config.hidden_size),
+        "model.block.0.mlp.down.weight": weight(config.hidden_size, config.intermediate_size),
+        "model.output_norm.weight": np.ones(config.hidden_size, dtype=np.float32),
+        "model.output.weight": weight(config.vocab_size, config.hidden_size),
     }
     return MlxCausalLM(tensors, config)
 
@@ -90,27 +93,27 @@ def _linear_attention_model() -> MlxCausalLM:
         return quantize(dense, spec)
 
     tensors = {
-        "token_embd.weight": weight(config.vocab_size, config.hidden_size),
-        "blk.0.attn_norm.weight": np.ones(config.hidden_size, dtype=np.float32),
-        "blk.0.ssm_qkv.weight": weight(96, config.hidden_size),
-        "blk.0.ssm_z.weight": weight(32, config.hidden_size),
-        "blk.0.ssm_alpha.weight": weight(1, config.hidden_size),
-        "blk.0.ssm_beta.weight": weight(1, config.hidden_size),
-        "blk.0.ssm_conv1d.weight": rng.normal(
+        "model.token_embedding.weight": weight(config.vocab_size, config.hidden_size),
+        "model.block.0.attention.norm.weight": np.ones(config.hidden_size, dtype=np.float32),
+        "model.block.0.linear_attention.qkv.weight": weight(96, config.hidden_size),
+        "model.block.0.linear_attention.gate.weight": weight(32, config.hidden_size),
+        "model.block.0.linear_attention.alpha.weight": weight(1, config.hidden_size),
+        "model.block.0.linear_attention.beta.weight": weight(1, config.hidden_size),
+        "model.block.0.linear_attention.conv.weight": rng.normal(
             0,
             0.05,
             size=(96, 1, 4),
         ).astype(np.float32),
-        "blk.0.ssm_dt.bias": np.zeros(1, dtype=np.float32),
-        "blk.0.ssm_a": np.full(1, -1.0, dtype=np.float32),
-        "blk.0.ssm_norm.weight": np.ones(32, dtype=np.float32),
-        "blk.0.ssm_out.weight": weight(config.hidden_size, 32),
-        "blk.0.ffn_norm.weight": np.ones(config.hidden_size, dtype=np.float32),
-        "blk.0.ffn_gate.weight": weight(config.intermediate_size, config.hidden_size),
-        "blk.0.ffn_up.weight": weight(config.intermediate_size, config.hidden_size),
-        "blk.0.ffn_down.weight": weight(config.hidden_size, config.intermediate_size),
-        "output_norm.weight": np.ones(config.hidden_size, dtype=np.float32),
-        "output.weight": weight(config.vocab_size, config.hidden_size),
+        "model.block.0.linear_attention.dt_bias": np.zeros(1, dtype=np.float32),
+        "model.block.0.linear_attention.a": np.full(1, -1.0, dtype=np.float32),
+        "model.block.0.linear_attention.norm.weight": np.ones(32, dtype=np.float32),
+        "model.block.0.linear_attention.output.weight": weight(config.hidden_size, 32),
+        "model.block.0.mlp.norm.weight": np.ones(config.hidden_size, dtype=np.float32),
+        "model.block.0.mlp.gate.weight": weight(config.intermediate_size, config.hidden_size),
+        "model.block.0.mlp.up.weight": weight(config.intermediate_size, config.hidden_size),
+        "model.block.0.mlp.down.weight": weight(config.hidden_size, config.intermediate_size),
+        "model.output_norm.weight": np.ones(config.hidden_size, dtype=np.float32),
+        "model.output.weight": weight(config.vocab_size, config.hidden_size),
     }
     return MlxCausalLM(tensors, config)
 
@@ -216,6 +219,172 @@ def test_mlx_qwen35_config_adapter_selects_hybrid_layers():
     assert config.linear_key_head_dim == 32
 
 
+def test_mlx_qwen35_config_adapter_preserves_multimodal_contract():
+    config = MlxCausalLMConfig.from_qwen35_hf_config(
+        {
+            "model_type": "qwen3_5",
+            "image_token_id": 101,
+            "video_token_id": 102,
+            "vision_start_token_id": 103,
+            "vision_end_token_id": 104,
+            "vision_config": {
+                "model_type": "qwen3_5",
+                "hidden_size": 64,
+                "intermediate_size": 96,
+                "depth": 2,
+                "num_heads": 4,
+                "in_channels": 3,
+                "patch_size": 16,
+                "temporal_patch_size": 2,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 64,
+                "num_position_embeddings": 64,
+            },
+            "text_config": {
+                "vocab_size": 128,
+                "hidden_size": 64,
+                "intermediate_size": 96,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "max_position_embeddings": 1024,
+                "head_dim": 32,
+                "partial_rotary_factor": 0.5,
+                "eos_token_id": [105, 106],
+                "layer_types": ["linear_attention", "full_attention"],
+                "linear_key_head_dim": 32,
+                "linear_value_head_dim": 32,
+                "rope_parameters": {
+                    "mrope_section": [2, 2, 4],
+                    "mrope_interleaved": True,
+                },
+            },
+        }
+    )
+
+    assert config.family == "qwen3_5"
+    assert config.mrope_interleaved
+    assert config.eos_token_ids == (105, 106)
+    assert config.image_token_id == 101
+    assert config.video_token_id == 102
+    assert config.vision is not None
+    assert config.vision.out_hidden_size == config.hidden_size
+
+
+def test_mlx_qwen35_config_adapter_registers_optional_mtp_contract():
+    config = MlxCausalLMConfig.from_qwen35_hf_config(
+        {
+            "model_type": "qwen3_5",
+            "text_config": {
+                "vocab_size": 32,
+                "hidden_size": 16,
+                "intermediate_size": 24,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 64,
+                "mtp_num_hidden_layers": 1,
+                "mtp_use_dedicated_embeddings": False,
+            },
+        }
+    )
+
+    assert config.mtp_num_hidden_layers == 1
+    assert not config.mtp_use_dedicated_embeddings
+
+
+def test_mlx_qwen35_mtp_loads_shared_head_and_produces_logits():
+    source = _model()
+    config = replace(source.config, mtp_num_hidden_layers=1)
+    tensors = dict(source.model.tensors)
+    layer_names = {
+        "attention.norm.weight": "attention.norm.weight",
+        "attention.query.weight": "attention.query.weight",
+        "attention.key.weight": "attention.key.weight",
+        "attention.value.weight": "attention.value.weight",
+        "attention.output.weight": "attention.output.weight",
+        "attention.query_norm.weight": "attention.query_norm.weight",
+        "attention.key_norm.weight": "attention.key_norm.weight",
+        "mlp.norm.weight": "mlp.norm.weight",
+        "mlp.gate.weight": "mlp.gate.weight",
+        "mlp.up.weight": "mlp.up.weight",
+        "mlp.down.weight": "mlp.down.weight",
+    }
+    for target, source_name in layer_names.items():
+        if f"model.block.0.{source_name}" in tensors:
+            tensors[f"predictor.block.0.{target}"] = tensors[
+                f"model.block.0.{source_name}"
+            ]
+    rng = np.random.default_rng(20260906)
+    spec = NintSpec(4, 24, 6)
+    tensors["predictor.fusion.weight"] = quantize(
+        rng.normal(0, 0.04, size=(16, 32)).astype(np.float32),
+        spec,
+    )
+    tensors["predictor.embedding_norm.weight"] = np.ones(16, dtype=np.float32)
+    tensors["predictor.hidden_norm.weight"] = np.ones(16, dtype=np.float32)
+    tensors["predictor.output_norm.weight"] = np.ones(16, dtype=np.float32)
+    model = MlxCausalLM(tensors, config)
+    mtp = MlxQwen35Mtp.load_if_present(model)
+    assert mtp is not None
+
+    _logits, hidden = model.forward_with_hidden(
+        np.asarray([[1, 2]], dtype=np.int32),
+        use_cache=True,
+    )
+    mtp.reset_cache(1)
+    mtp_hidden = mtp.forward(
+        np.asarray([[3]], dtype=np.int32),
+        hidden[:, -1:],
+        use_cache=True,
+    )
+    logits = _array(mtp.compute_logits(mtp_hidden))
+
+    assert logits.shape == (1, 1, 32)
+    assert np.isfinite(logits).all()
+    assert mtp.position == 1
+
+
+@pytest.mark.parametrize("factory", [_model, _linear_attention_model])
+def test_mlx_qwen35_speculative_reject_retains_only_confirmed_token(factory):
+    speculative = factory()
+    reference = factory()
+    prefix = np.asarray([[1, 2]], dtype=np.int32)
+    speculative.forward(prefix, use_cache=True)
+    speculative.forward_with_hidden(
+        np.asarray([[3, 4]], dtype=np.int32),
+        use_cache=True,
+        n_confirmed=1,
+    )
+    assert speculative.position == 4
+    speculative.rollback_speculative_cache()
+    assert speculative.position == 3
+    actual = _array(speculative.forward(np.asarray([[5]], dtype=np.int32), use_cache=True))
+
+    reference.forward(np.asarray([[1, 2, 3]], dtype=np.int32), use_cache=True)
+    expected = _array(reference.forward(np.asarray([[5]], dtype=np.int32), use_cache=True))
+    np.testing.assert_allclose(actual, expected, rtol=8e-3, atol=8e-3)
+
+
+def test_mlx_causal_lm_accepts_precomputed_prompt_embeddings():
+    model = _model()
+    ids = mx.array([[2, 5, 8]], dtype=mx.int32)
+    embeddings = model.embedding(ids)
+    logits = _array(
+        model.forward_embeddings(
+            embeddings,
+            ids,
+            np.asarray([0, 1, 2], dtype=np.int32),
+            use_cache=True,
+        )
+    )
+
+    assert logits.shape == (1, 3, 32)
+    assert model.position == 3
+    _array(model.decode(np.asarray([[4]], dtype=np.int32)))
+    assert model.position == 4
+
+
 def test_mlx_causal_lm_loads_embedded_config_from_any_mfq_shard(
     tmp_path,
 ):
@@ -235,9 +404,6 @@ def test_mlx_causal_lm_loads_embedded_config_from_any_mfq_shard(
     config_asset = model_config_asset(config)
     source = tmp_path / "causal-assets.mfq"
     tensors = dict(source_model.model.tensors)
-    tensors["blk.0.post_attention_norm.weight"] = tensors.pop(
-        "blk.0.ffn_norm.weight"
-    )
     io.save(
         source,
         FileHeader(version=2, model_arch="qwen35", num_tensors=0),
@@ -254,8 +420,8 @@ def test_mlx_causal_lm_loads_embedded_config_from_any_mfq_shard(
     assert len(shards) > 1
     with MlxCausalLM.from_mfq(shards[-1]) as model:
         assert model.config.hidden_size == 16
-        assert model.config.norm_weight_offset == 0.0
-        assert model.config.linear_a_is_log is False
+        assert model.config.norm_weight_offset == 1.0
+        assert model.config.linear_a_is_log is True
         logits = _array(model(np.asarray([[1, 2, 3]], dtype=np.int32)))
         assert logits.shape == (1, 3, 32)
         assert np.isfinite(logits).all()

@@ -10,6 +10,7 @@ state production in one dispatch.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -426,6 +427,46 @@ def _conv_bias(
     return result, True
 
 
+@dataclass(frozen=True)
+class MetalLinearConvQkvParameters:
+    """Materialized constants shared by repeated linear-convolution calls."""
+
+    weight: mx.array
+    bias: mx.array
+    eps: mx.array
+    channels: int
+    kernel: int
+    has_bias: bool
+
+
+def prepare_linear_conv_qkv(
+    weight: mx.array | np.ndarray,
+    bias: mx.array | np.ndarray | None,
+    *,
+    channels: int,
+    eps: float = 1e-5,
+) -> MetalLinearConvQkvParameters:
+    """Normalize and materialize constant convolution inputs once at load time."""
+
+    selected_channels = int(channels)
+    if selected_channels <= 0:
+        raise ValueError("linear_conv_qkv channels must be positive")
+    if not math.isfinite(eps) or eps <= 0:
+        raise ValueError("linear_conv_qkv eps must be finite and positive")
+    packed_weight, kernel = _conv_weight(weight, selected_channels)
+    bias_values, has_bias = _conv_bias(bias, selected_channels)
+    params = mx.array([float(eps)], dtype=mx.float32)
+    mx.eval(packed_weight, bias_values, params)
+    return MetalLinearConvQkvParameters(
+        weight=packed_weight,
+        bias=bias_values,
+        eps=params,
+        channels=selected_channels,
+        kernel=kernel,
+        has_bias=has_bias,
+    )
+
+
 def ssm_conv_silu(
     conv_input: mx.array | np.ndarray,
     weight: mx.array | np.ndarray,
@@ -469,7 +510,7 @@ def linear_conv_qkv(
     state: mx.array | np.ndarray,
     qk: mx.array | np.ndarray,
     v: mx.array | np.ndarray,
-    weight: mx.array | np.ndarray,
+    weight: mx.array | np.ndarray | MetalLinearConvQkvParameters,
     *,
     num_key_heads: int,
     num_value_heads: int,
@@ -510,12 +551,23 @@ def linear_conv_qkv(
     kernel = int(state_values.shape[1]) + 1
     if kernel <= 1:
         raise ValueError("linear_conv_qkv requires a convolution kernel width of at least 2")
-    packed_weight, weight_kernel = _conv_weight(weight, channels)
-    if weight_kernel != kernel:
-        raise ValueError(f"state implies K={kernel}, but weight uses K={weight_kernel}")
-    bias_values, has_bias = _conv_bias(bias, channels)
-    if not math.isfinite(eps) or eps <= 0:
-        raise ValueError("linear_conv_qkv eps must be finite and positive")
+    if isinstance(weight, MetalLinearConvQkvParameters):
+        if bias is not None:
+            raise ValueError("prepared linear_conv_qkv parameters already contain bias")
+        if weight.channels != channels or weight.kernel != kernel:
+            raise ValueError("prepared linear_conv_qkv parameters have incompatible dimensions")
+        packed_weight = weight.weight
+        bias_values = weight.bias
+        has_bias = weight.has_bias
+        params = weight.eps
+    else:
+        packed_weight, weight_kernel = _conv_weight(weight, channels)
+        if weight_kernel != kernel:
+            raise ValueError(f"state implies K={kernel}, but weight uses K={weight_kernel}")
+        bias_values, has_bias = _conv_bias(bias, channels)
+        if not math.isfinite(eps) or eps <= 0:
+            raise ValueError("linear_conv_qkv eps must be finite and positive")
+        params = mx.array([float(eps)], dtype=mx.float32)
 
     qk_tasks = batch * tokens * 2 * nk
     v_groups = (expected_v + 31) // 32
@@ -523,7 +575,6 @@ def linear_conv_qkv(
     state_size = int(state_values.size)
     state_tasks = (state_size + 31) // 32
     workgroups = qk_tasks + v_tasks + state_tasks
-    params = mx.array([float(eps)], dtype=mx.float32)
     outputs = _LINEAR_CONV_QKV_KERNEL(
         inputs=[
             state_values,
@@ -560,7 +611,9 @@ def linear_conv_qkv(
 
 
 __all__ = [
+    "MetalLinearConvQkvParameters",
     "gated_delta_net",
     "linear_conv_qkv",
+    "prepare_linear_conv_qkv",
     "ssm_conv_silu",
 ]

@@ -153,6 +153,8 @@ message SamplingParams {
   double frequency_penalty = 6;
   double repetition_penalty = 7;
   optional uint64 seed = 8;
+  optional bool enable_vision = 9;
+  optional bool enable_mtp = 10;
 }
 
 message HandshakeRequest {

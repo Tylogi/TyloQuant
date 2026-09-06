@@ -190,10 +190,12 @@ class MlxGlmDsaConfig:
 
 @dataclass(frozen=True)
 class MlxGlmDsaNames:
-    token_embedding: str = "model.embed_tokens.weight"
-    output_norm: str = "model.norm.weight"
-    output: str = "lm_head.weight"
-    layer_prefix: str = "model.layers.{i}"
+    """Canonical MFQ names; checkpoint spellings are import-only."""
+
+    token_embedding: str = "model.token_embedding.weight"
+    output_norm: str = "model.output_norm.weight"
+    output: str = "model.output.weight"
+    layer_prefix: str = "model.block.{i}"
 
     def layer(self, index: int) -> str:
         return self.layer_prefix.format(i=index)
@@ -227,9 +229,9 @@ def _nint_moe(model: MlxNintModel, name: str) -> NintMoeTensor:
 class MlxGlmDsaDenseFFN:
     def __init__(self, model: MlxNintModel, prefix: str) -> None:
         self.ffn = model.ffn(
-            f"{prefix}.gate_proj.weight",
-            f"{prefix}.up_proj.weight",
-            f"{prefix}.down_proj.weight",
+            f"{prefix}.gate.weight",
+            f"{prefix}.up.weight",
+            f"{prefix}.down.weight",
         )
 
     def __call__(self, value: mx.array) -> mx.array:
@@ -245,8 +247,8 @@ class MlxGlmDsaMoE:
         config: MlxGlmDsaConfig,
         prefix: str,
     ) -> None:
-        gate_up = _nint_moe(model, f"{prefix}.experts.gate_up_proj")
-        down = _nint_moe(model, f"{prefix}.experts.down_proj")
+        gate_up = _nint_moe(model, f"{prefix}.experts.gate_up.weight")
+        down = _nint_moe(model, f"{prefix}.experts.down.weight")
         if (
             gate_up.n_experts != config.num_experts
             or down.n_experts != config.num_experts
@@ -258,14 +260,14 @@ class MlxGlmDsaMoE:
             raise ValueError("GLM DSA MoE tensor shapes disagree with config")
         self.gate_up = MlxRoutedLinear(gate_up)
         self.down = MlxRoutedLinear(down)
-        self.router = model.linear(f"{prefix}.gate.weight")
+        self.router = model.linear(f"{prefix}.router.weight")
         self.router_bias = _dense_vector(
             model,
-            f"{prefix}.gate.e_score_correction_bias",
+            f"{prefix}.router.bias",
         )
         self.shared = MlxGlmDsaDenseFFN(
             model,
-            f"{prefix}.shared_experts",
+            f"{prefix}.shared_expert",
         )
         self.config = config
 
@@ -320,43 +322,43 @@ class MlxGlmDsaLayer:
         self.max_context = int(max_context)
         self.rope = rope
         prefix = names.layer(index)
-        attention_prefix = f"{prefix}.self_attn"
+        attention_prefix = f"{prefix}.attention"
         self.attn_norm = MlxRMSNorm(
-            _dense_vector(model, f"{prefix}.input_layernorm.weight"),
+            _dense_vector(model, f"{attention_prefix}.norm.weight"),
             config.rms_norm_eps,
         )
         self.ffn_norm_weight = _dense_vector(
             model,
-            f"{prefix}.post_attention_layernorm.weight",
+            f"{prefix}.mlp.norm.weight",
         )
         self.q_a_norm = MlxRMSNorm(
-            _dense_vector(model, f"{attention_prefix}.q_a_layernorm.weight"),
+            _dense_vector(model, f"{attention_prefix}.query_a_norm.weight"),
             1e-6,
         )
         self.kv_a_norm = MlxRMSNorm(
-            _dense_vector(model, f"{attention_prefix}.kv_a_layernorm.weight"),
+            _dense_vector(model, f"{attention_prefix}.key_value_a_norm.weight"),
             1e-6,
         )
         first_names = [
-            f"{attention_prefix}.q_a_proj.weight",
-            f"{attention_prefix}.kv_a_proj_with_mqa.weight",
+            f"{attention_prefix}.query_a.weight",
+            f"{attention_prefix}.key_value_a.weight",
         ]
-        second_names = [f"{attention_prefix}.q_b_proj.weight"]
+        second_names = [f"{attention_prefix}.query_b.weight"]
         if self.full_indexer:
             first_names.extend(
                 (
-                    f"{attention_prefix}.indexer.wk.weight",
-                    f"{attention_prefix}.indexer.weights_proj.weight",
+                    f"{attention_prefix}.indexer.key.weight",
+                    f"{attention_prefix}.indexer.score.weight",
                 )
             )
-            second_names.append(f"{attention_prefix}.indexer.wq_b.weight")
+            second_names.append(f"{attention_prefix}.indexer.query.weight")
             self.index_k_norm = _dense_vector(
                 model,
-                f"{attention_prefix}.indexer.k_norm.weight",
+                f"{attention_prefix}.indexer.key_norm.weight",
             )
             self.index_k_bias = _dense_vector(
                 model,
-                f"{attention_prefix}.indexer.k_norm.bias",
+                f"{attention_prefix}.indexer.key_norm.bias",
             )
         else:
             self.index_k_norm = None
@@ -364,8 +366,14 @@ class MlxGlmDsaLayer:
         self.input_projection = MlxLinearGroup(tuple(model.linear(name) for name in first_names))
         q_layers = tuple(model.linear(name) for name in second_names)
         self.q_projection = MlxLinearGroup(q_layers) if len(q_layers) > 1 else q_layers[0]
-        embed = _nint_moe(model, f"{attention_prefix}.embed_q")
-        unembed = _nint_moe(model, f"{attention_prefix}.unembed_out")
+        embed = _nint_moe(
+            model,
+            f"{attention_prefix}.latent.query_embedding.weight",
+        )
+        unembed = _nint_moe(
+            model,
+            f"{attention_prefix}.latent.output_unembedding.weight",
+        )
         if (
             embed.n_experts != config.num_attention_heads
             or embed.neuron_len != config.qk_nope_head_dim
@@ -377,7 +385,7 @@ class MlxGlmDsaLayer:
             raise ValueError(f"GLM DSA head-wise tensor shapes disagree at layer {index}")
         self.embed_q = MlxRoutedLinear(embed)
         self.unembed_out = MlxRoutedLinear(unembed)
-        self.output = model.linear(f"{attention_prefix}.o_proj.weight")
+        self.output = model.linear(f"{attention_prefix}.output.weight")
         mlp_prefix = f"{prefix}.mlp"
         self.ffn = (
             MlxGlmDsaMoE(model, config, mlp_prefix)

@@ -6,7 +6,7 @@
 //   out[t,j+half] = x1*cos + x0*sin
 
 #include <cuda_runtime.h>
-#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
+#include "mfq_tensor_backend.h"
 #include <cuda_bf16.h>
 
 constexpr int ROPE_BD = 256;

@@ -11,6 +11,7 @@ try:
 except RuntimeError:
     pytest.skip("Metal device unavailable", allow_module_level=True)
 
+from mfq.architectures.tensor_schema import map_source_tensor_name  # noqa: E402
 from mfq.runtime.mlx_flash_next_vision import (  # noqa: E402
     MlxGlm5NextVision,
     MlxQwen4ExpVision,
@@ -19,6 +20,19 @@ from mfq.runtime.mlx_flash_next_vision import (  # noqa: E402
     vision_layout,
 )
 from mfq.runtime.mlx_linear import MlxNintModel  # noqa: E402
+
+
+def _canonical_tensors(
+    tensors: dict[str, np.ndarray],
+    model_type: str,
+) -> dict[str, np.ndarray]:
+    config = {"model_type": model_type, "vision_config": {"depth": 1}}
+    mapped: dict[str, np.ndarray] = {}
+    for name, value in tensors.items():
+        resolved = map_source_tensor_name(name, config, require_registered=True)
+        assert resolved is not None
+        mapped[resolved.canonical_name] = value
+    return mapped
 
 
 def _random(
@@ -83,7 +97,7 @@ def _qwen_vision_fixture() -> tuple[SimpleNamespace, dict[str, np.ndarray]]:
         prefix + ".merger.linear_fc2.weight": _random(rng, (output, 4 * hidden)),
         prefix + ".merger.linear_fc2.bias": _random(rng, (output,)),
     }
-    return SimpleNamespace(vision=config), tensors
+    return SimpleNamespace(vision=config), _canonical_tensors(tensors, "qwen4_exp")
 
 
 def _glm_vision_fixture() -> tuple[SimpleNamespace, dict[str, np.ndarray]]:
@@ -146,7 +160,7 @@ def _glm_vision_fixture() -> tuple[SimpleNamespace, dict[str, np.ndarray]]:
         prefix + ".merger.up_proj.weight": _random(rng, (projection, output)),
         prefix + ".merger.down_proj.weight": _random(rng, (output, projection)),
     }
-    return SimpleNamespace(vision=config), tensors
+    return SimpleNamespace(vision=config), _canonical_tensors(tensors, "glm5_next")
 
 
 def test_vision_layout_uses_spatial_merge_block_order_and_frame_segments() -> None:

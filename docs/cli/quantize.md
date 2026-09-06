@@ -48,6 +48,21 @@ uv run mfq quantize model-hf model-NINT4.mfq \
 `--backend auto` prefers CUDA, then Metal, then CPU. Pass an explicit backend
 to pin the execution path.
 
+Vision encoders and MTP/draft predictors remain at their source precision by
+default, independently of the text quantization policy. Quantize either scope
+only when that tradeoff is intentional:
+
+```shell
+uv run mfq quantize model-hf model-NINT4-all.mfq \
+  --bits 4 --quantize-vision --quantize-mtp
+```
+
+Built-in standard mixtures are available without supplying a recipe GGUF:
+
+```shell
+uv run mfq quantize model-hf model-S4-M.mfq --preset Q4_K_M
+```
+
 ## Full-precision MFQ
 
 Copy native HF storage without MFQ quantization. BF16 remains BF16; supported

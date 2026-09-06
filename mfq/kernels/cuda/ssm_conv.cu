@@ -2,7 +2,7 @@
 // conv_input [B, K - 1 + T, C], weight [C,1,K], [C,K], or [K,C], output [B,T,C].
 
 #include <cuda_runtime.h>
-#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
+#include "mfq_tensor_backend.h"
 #include <cuda_fp16.h>
 #include <vector>
 

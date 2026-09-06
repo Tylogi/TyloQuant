@@ -16,7 +16,7 @@
 //   x[M, neuron_len] fp16 (glue zero-pads to neuron_len).
 
 #include <cuda_runtime.h>
-#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
+#include "mfq_tensor_backend.h"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <mma.h>

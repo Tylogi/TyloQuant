@@ -7,11 +7,11 @@ API = (WEB / "src" / "api.ts").read_text(encoding="utf-8")
 MARKDOWN = (WEB / "src" / "Markdown.tsx").read_text(encoding="utf-8")
 CSS = (WEB / "src" / "styles.css").read_text(encoding="utf-8")
 PACKAGE = (WEB / "package.json").read_text(encoding="utf-8")
-SERVER_HEADER = (ROOT / "cpp_runtime" / "mfq_server.h").read_text(
+SERVER_HEADER = (ROOT / "cpp_runtime" / "server" / "include" / "mfq" / "server.h").read_text(
     encoding="utf-8"
 )
-SERVER = (ROOT / "cpp_runtime" / "mfq_server.cpp").read_text(encoding="utf-8")
-RUNTIME = (ROOT / "cpp_runtime" / "mfq_decode.cpp").read_text(encoding="utf-8")
+SERVER = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(encoding="utf-8")
+RUNTIME = (ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp").read_text(encoding="utf-8")
 
 
 def test_studio_bundles_markdown_sanitization_and_latex_dependencies() -> None:

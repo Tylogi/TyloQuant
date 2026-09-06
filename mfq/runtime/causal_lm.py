@@ -76,6 +76,7 @@ class TorchNintCausalLMConfig:
     linear_num_key_heads: int = 0
     linear_num_value_heads: int = 0
     linear_a_is_log: bool = True
+    linear_attention_tiled_heads: bool = False
     norm_weight_offset: float = 0.0
 
     @property
@@ -101,7 +102,7 @@ class TorchNintCausalLMConfig:
         return self.head_dim
 
     @classmethod
-    def from_qwen35_hf_config(cls, cfg: dict) -> "TorchNintCausalLMConfig":
+    def from_qwen35_hf_config(cls, cfg: dict) -> TorchNintCausalLMConfig:
         text = cfg.get("text_config", cfg)
         rope_params = text.get("rope_parameters", {})
         return cls(
@@ -165,93 +166,40 @@ class TorchNintCausalLMConfig:
 
 @dataclass(frozen=True)
 class TorchNintCausalLMNames:
-    token_embd: str = "token_embd.weight"
-    attn_norm: str = "blk.{i}.attn_norm.weight"
-    attn_q: str = "blk.{i}.attn_q.weight"
-    attn_k: str = "blk.{i}.attn_k.weight"
-    attn_v: str = "blk.{i}.attn_v.weight"
-    attn_out: str = "blk.{i}.attn_output.weight"
-    ffn_norm: str = "blk.{i}.ffn_norm.weight"
-    ffn_gate: str = "blk.{i}.ffn_gate.weight"
-    ffn_up: str = "blk.{i}.ffn_up.weight"
-    ffn_down: str = "blk.{i}.ffn_down.weight"
-    output_norm: str = "output_norm.weight"
-    output: str = "output.weight"
-    attn_q_norm: str = "blk.{i}.attn_q_norm.weight"
-    attn_k_norm: str = "blk.{i}.attn_k_norm.weight"
-    linear_qkv: str = "blk.{i}.ssm_qkv.weight"
-    linear_qk: str | None = "blk.{i}.ssm_qk.weight"
-    linear_v: str | None = "blk.{i}.ssm_v.weight"
-    linear_z: str = "blk.{i}.ssm_z.weight"
-    linear_alpha: str = "blk.{i}.ssm_alpha.weight"
-    linear_beta: str = "blk.{i}.ssm_beta.weight"
-    linear_conv: str = "blk.{i}.ssm_conv1d.weight"
-    linear_conv_bias: str | None = None
-    linear_dt_bias: str = "blk.{i}.ssm_dt.bias"
-    linear_a: str = "blk.{i}.ssm_a"
-    linear_norm: str = "blk.{i}.ssm_norm.weight"
-    linear_out: str = "blk.{i}.ssm_out.weight"
+    """The sole tensor vocabulary consumed by the Torch runtime."""
+
+    token_embd: str = "model.token_embedding.weight"
+    attn_norm: str = "model.block.{i}.attention.norm.weight"
+    attn_q: str = "model.block.{i}.attention.query.weight"
+    attn_k: str = "model.block.{i}.attention.key.weight"
+    attn_v: str = "model.block.{i}.attention.value.weight"
+    attn_out: str = "model.block.{i}.attention.output.weight"
+    ffn_norm: str = "model.block.{i}.mlp.norm.weight"
+    ffn_gate: str = "model.block.{i}.mlp.gate.weight"
+    ffn_up: str = "model.block.{i}.mlp.up.weight"
+    ffn_down: str = "model.block.{i}.mlp.down.weight"
+    output_norm: str = "model.output_norm.weight"
+    output: str = "model.output.weight"
+    attn_q_norm: str = "model.block.{i}.attention.query_norm.weight"
+    attn_k_norm: str = "model.block.{i}.attention.key_norm.weight"
+    linear_qkv: str = "model.block.{i}.linear_attention.qkv.weight"
+    linear_qk: str | None = "model.block.{i}.linear_attention.qk.weight"
+    linear_v: str | None = "model.block.{i}.linear_attention.value.weight"
+    linear_z: str = "model.block.{i}.linear_attention.gate.weight"
+    linear_alpha: str = "model.block.{i}.linear_attention.alpha.weight"
+    linear_beta: str = "model.block.{i}.linear_attention.beta.weight"
+    linear_conv: str = "model.block.{i}.linear_attention.conv.weight"
+    linear_conv_bias: str | None = "model.block.{i}.linear_attention.conv.bias"
+    linear_dt_bias: str = "model.block.{i}.linear_attention.dt_bias"
+    linear_a: str = "model.block.{i}.linear_attention.a"
+    linear_norm: str = "model.block.{i}.linear_attention.norm.weight"
+    linear_out: str = "model.block.{i}.linear_attention.output.weight"
 
     def layer(self, template: str, i: int) -> str:
         return template.format(i=i)
 
-    @classmethod
-    def qwen35_gguf(cls) -> "TorchNintCausalLMNames":
-        return cls(
-            ffn_norm="blk.{i}.post_attention_norm.weight",
-            linear_qkv="blk.{i}.attn_qkv.weight",
-            linear_z="blk.{i}.attn_gate.weight",
-        )
 
-    @classmethod
-    def qwen35_hf(cls) -> "TorchNintCausalLMNames":
-        return cls(
-            token_embd="model.language_model.embed_tokens.weight",
-            attn_norm="model.language_model.layers.{i}.input_layernorm.weight",
-            attn_q="model.language_model.layers.{i}.self_attn.q_proj.weight",
-            attn_k="model.language_model.layers.{i}.self_attn.k_proj.weight",
-            attn_v="model.language_model.layers.{i}.self_attn.v_proj.weight",
-            attn_out="model.language_model.layers.{i}.self_attn.o_proj.weight",
-            attn_q_norm="model.language_model.layers.{i}.self_attn.q_norm.weight",
-            attn_k_norm="model.language_model.layers.{i}.self_attn.k_norm.weight",
-            ffn_norm="model.language_model.layers.{i}.post_attention_layernorm.weight",
-            ffn_gate="model.language_model.layers.{i}.mlp.gate_proj.weight",
-            ffn_up="model.language_model.layers.{i}.mlp.up_proj.weight",
-            ffn_down="model.language_model.layers.{i}.mlp.down_proj.weight",
-            output_norm="model.language_model.norm.weight",
-            output="lm_head.weight",
-            linear_qkv="model.language_model.layers.{i}.linear_attn.in_proj_qkv.weight",
-            linear_qk="model.language_model.layers.{i}.linear_attn.in_proj_qk.weight",
-            linear_v="model.language_model.layers.{i}.linear_attn.in_proj_v.weight",
-            linear_z="model.language_model.layers.{i}.linear_attn.in_proj_z.weight",
-            linear_alpha="model.language_model.layers.{i}.linear_attn.in_proj_a.weight",
-            linear_beta="model.language_model.layers.{i}.linear_attn.in_proj_b.weight",
-            linear_conv="model.language_model.layers.{i}.linear_attn.conv1d.weight",
-            linear_conv_bias="model.language_model.layers.{i}.linear_attn.conv1d.bias",
-            linear_dt_bias="model.language_model.layers.{i}.linear_attn.dt_bias",
-            linear_a="model.language_model.layers.{i}.linear_attn.A_log",
-            linear_norm="model.language_model.layers.{i}.linear_attn.norm.weight",
-            linear_out="model.language_model.layers.{i}.linear_attn.out_proj.weight",
-        )
-
-    @classmethod
-    def minicpmo45_hf(cls) -> TorchNintCausalLMNames:
-        return cls(
-            token_embd="llm.model.embed_tokens.weight",
-            attn_norm="llm.model.layers.{i}.input_layernorm.weight",
-            attn_q="llm.model.layers.{i}.self_attn.q_proj.weight",
-            attn_k="llm.model.layers.{i}.self_attn.k_proj.weight",
-            attn_v="llm.model.layers.{i}.self_attn.v_proj.weight",
-            attn_out="llm.model.layers.{i}.self_attn.o_proj.weight",
-            attn_q_norm="llm.model.layers.{i}.self_attn.q_norm.weight",
-            attn_k_norm="llm.model.layers.{i}.self_attn.k_norm.weight",
-            ffn_norm="llm.model.layers.{i}.post_attention_layernorm.weight",
-            ffn_gate="llm.model.layers.{i}.mlp.gate_proj.weight",
-            ffn_up="llm.model.layers.{i}.mlp.up_proj.weight",
-            ffn_down="llm.model.layers.{i}.mlp.down_proj.weight",
-            output_norm="llm.model.norm.weight",
-            output="llm.lm_head.weight",
-        )
+_CANONICAL_NAMES = TorchNintCausalLMNames()
 
 
 class TorchFullAttentionBlock:
@@ -259,10 +207,10 @@ class TorchFullAttentionBlock:
         self,
         tensors: TensorMapping,
         config: TorchNintCausalLMConfig,
-        names: TorchNintCausalLMNames,
         layer_idx: int,
         device: str | torch.device,
     ) -> None:
+        names = _CANONICAL_NAMES
         self.config = config
         self.device = device
         self.attn_norm = _dense(tensors, names.layer(names.attn_norm, layer_idx), device)
@@ -376,14 +324,14 @@ class TorchQwen35LinearAttentionBlock:
         self,
         tensors: TensorMapping,
         config: TorchNintCausalLMConfig,
-        names: TorchNintCausalLMNames,
         layer_idx: int,
         device: str | torch.device,
     ) -> None:
+        names = _CANONICAL_NAMES
         self.config = config
         self.device = device
         self.layer_idx = layer_idx
-        self.gguf_layout = names.linear_qkv == "blk.{i}.attn_qkv.weight"
+        self.tiled_heads = bool(config.linear_attention_tiled_heads)
         self.attn_norm = _dense(tensors, names.layer(names.attn_norm, layer_idx), device)
         self.ffn_norm = _dense(tensors, names.layer(names.ffn_norm, layer_idx), device)
         linear_qk_name = (
@@ -578,7 +526,7 @@ class TorchQwen35LinearAttentionBlock:
             ).reshape_as(k)
         if self.linear_num_key_heads != self.linear_num_value_heads:
             rep = self.linear_num_value_heads // self.linear_num_key_heads
-            if self.gguf_layout:
+            if self.tiled_heads:
                 q = q.repeat(1, rep, 1, 1)
                 k = k.repeat(1, rep, 1, 1)
             else:
@@ -628,22 +576,12 @@ class TorchNintCausalLM:
         self,
         tensors: TensorMapping,
         config: TorchNintCausalLMConfig,
-        names: TorchNintCausalLMNames | None = None,
         device: str | torch.device = "cuda",
     ) -> None:
         self.tensors = tensors
-        if names is None:
-            names = (
-                TorchNintCausalLMNames.qwen35_gguf()
-                if "blk.0.post_attention_norm.weight" in tensors
-                else TorchNintCausalLMNames()
-            )
-        if names.linear_qkv == "blk.{i}.attn_qkv.weight":
-            config = replace(config, linear_a_is_log=False, norm_weight_offset=0.0)
         self.config = config
-        self.names = names
         self.device = device
-        embed_tensor = _require_quantized(tensors, self.names.token_embd)
+        embed_tensor = _require_quantized(tensors, _CANONICAL_NAMES.token_embd)
         if isinstance(embed_tensor, NintTensor):
             self.embed = TorchNintEmbedding(embed_tensor, device)
         elif isinstance(embed_tensor, Nint8ZeroTensor):
@@ -660,14 +598,14 @@ class TorchNintCausalLM:
         if len(layer_types) != config.num_hidden_layers:
             raise ValueError("layer_types length must match num_hidden_layers")
         self.blocks = [
-            _make_block(tensors, config, self.names, i, layer_types[i], device)
+            _make_block(tensors, config, i, layer_types[i], device)
             for i in range(config.num_hidden_layers)
         ]
-        self.output_norm = _dense(tensors, self.names.output_norm, device)
+        self.output_norm = _dense(tensors, _CANONICAL_NAMES.output_norm, device)
         if config.tie_word_embeddings:
-            self.lm_head = _linear(tensors, self.names.token_embd, device)
+            self.lm_head = _linear(tensors, _CANONICAL_NAMES.token_embd, device)
         else:
-            self.lm_head = _linear(tensors, self.names.output, device)
+            self.lm_head = _linear(tensors, _CANONICAL_NAMES.output, device)
         self.cache_pos = 0
 
     @classmethod
@@ -675,12 +613,36 @@ class TorchNintCausalLM:
         cls,
         path: str | Path,
         config: TorchNintCausalLMConfig,
-        names: TorchNintCausalLMNames | None = None,
         device: str | torch.device = "cuda",
         mmap: bool = False,
-    ) -> "TorchNintCausalLM":
-        _header, tensors = io.load_mmap(path) if mmap else io.load(path)
-        return cls(tensors, config, names, device)
+    ) -> TorchNintCausalLM:
+        from mfq.compat.legacy_tensor_names import canonical_tensor_view
+
+        _header, stored = io.load_mmap(path)
+        closed = False
+        try:
+            tensors = canonical_tensor_view(stored)
+            # The compatibility adapter owns source-format interpretation.
+            # Convert its one legacy marker into source-independent execution
+            # semantics here, before the canonical tensor mapping enters the
+            # model implementation.
+            if getattr(tensors, "legacy_semantics", None) == "qwen35_gguf":
+                config = replace(
+                    config,
+                    linear_a_is_log=False,
+                    linear_attention_tiled_heads=True,
+                    norm_weight_offset=0.0,
+                )
+            if mmap:
+                return cls(tensors, config, device)
+            materialized = {name: tensors[name] for name in tensors}
+            tensors.close()
+            closed = True
+            return cls(materialized, config, device)
+        except BaseException:
+            if not closed:
+                stored.close()
+            raise
 
     def reset_cache(self, batch: int) -> None:
         for block in self.blocks:
@@ -847,15 +809,14 @@ def _qwen_rms_norm(
 def _make_block(
     tensors: TensorMapping,
     config: TorchNintCausalLMConfig,
-    names: TorchNintCausalLMNames,
     layer_idx: int,
     layer_type: str,
     device: str | torch.device,
 ):
     if layer_type == "linear_attention":
-        return TorchQwen35LinearAttentionBlock(tensors, config, names, layer_idx, device)
+        return TorchQwen35LinearAttentionBlock(tensors, config, layer_idx, device)
     if layer_type == "full_attention":
-        return TorchFullAttentionBlock(tensors, config, names, layer_idx, device)
+        return TorchFullAttentionBlock(tensors, config, layer_idx, device)
     raise ValueError(f"unsupported layer type: {layer_type!r}")
 
 

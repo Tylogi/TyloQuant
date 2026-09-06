@@ -13,7 +13,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
         "MFQ's MLX runtime requires MLX; install with `pip install -e '.[metal]'`"
     ) from exc
 
-from mfq.kernels.metal.ops import residual_rms_norm, rms_norm, rope, rope_tables
+from mfq.kernels.metal.ops import residual_rms_norm, rope, rope_tables
 
 
 class MlxRMSNorm:
@@ -32,14 +32,19 @@ class MlxRMSNorm:
         self.weight = mx.contiguous(scale.astype(mx.float32))
         self.eps = float(eps)
         self.weight_offset = float(weight_offset)
+        self._effective_weight = (
+            self.weight
+            if self.weight_offset == 0.0
+            else mx.contiguous(self.weight + self.weight_offset)
+        )
+        mx.eval(self._effective_weight)
 
     def forward(self, x: mx.array | np.ndarray) -> mx.array:
-        return rms_norm(
-            x,
-            self.weight,
-            self.eps,
-            weight_offset=self.weight_offset,
-        )
+        source = x if isinstance(x, mx.array) else mx.array(x)
+        if source.dtype not in (mx.float16, mx.bfloat16, mx.float32):
+            source = source.astype(mx.float16)
+        normalized = mx.fast.rms_norm(source, self._effective_weight, self.eps)
+        return normalized if normalized.dtype == source.dtype else normalized.astype(source.dtype)
 
     def add_and_forward(
         self,
@@ -109,6 +114,40 @@ class MlxRoPE:
             active_pairs=self.active_pairs,
             mrope_interleaved=self.mrope_interleaved,
         )
+
+    def forward_contiguous(
+        self,
+        x: mx.array | np.ndarray,
+        offset: int,
+        *,
+        sequence_axis: int = -2,
+    ) -> mx.array:
+        """Apply the MLX fused RoPE path for ordinary contiguous text positions."""
+
+        if int(offset) < 0:
+            raise ValueError("RoPE offset cannot be negative")
+        source = x if isinstance(x, mx.array) else mx.array(x)
+        if source.dtype not in (mx.float16, mx.bfloat16, mx.float32):
+            source = source.astype(mx.float16)
+        axis = int(sequence_axis) % source.ndim
+        if axis == source.ndim - 1:
+            raise ValueError("RoPE sequence axis cannot be the final feature axis")
+        moved = axis != source.ndim - 2
+        canonical = mx.moveaxis(source, axis, -2) if moved else source
+        if self.frequency_dim is not None or self.active_pairs is not None:
+            tokens = int(canonical.shape[-2])
+            positions = mx.arange(offset, offset + tokens, dtype=mx.int32)
+            output = self.forward(canonical, positions)
+        else:
+            output = mx.fast.rope(
+                canonical,
+                self.rotary_dim,
+                traditional=False,
+                base=self.base,
+                scale=1.0,
+                offset=int(offset),
+            )
+        return mx.moveaxis(output, -2, axis) if moved else output
 
     def __call__(
         self,

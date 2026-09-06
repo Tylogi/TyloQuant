@@ -11,6 +11,7 @@ try:
 except RuntimeError:
     pytest.skip("Metal device unavailable", allow_module_level=True)
 
+from mfq.architectures.tensor_schema import map_source_tensor_name  # noqa: E402
 from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
 from mfq.formats.nint import NintSpec  # noqa: E402
 from mfq.quantize.nint_quant import quantize  # noqa: E402
@@ -49,6 +50,20 @@ def _expert(weight: np.ndarray) -> NintMoeTensor:
     )
 
 
+def _canonical_tensors(tensors: dict, *, text_layers: int = 1) -> dict:
+    config = {
+        "model_type": "qwen4_exp",
+        "num_hidden_layers": text_layers,
+        "mtp_num_hidden_layers": 1,
+    }
+    mapped = {}
+    for name, value in tensors.items():
+        resolved = map_source_tensor_name(name, config, require_registered=True)
+        assert resolved is not None
+        mapped[resolved.canonical_name] = value
+    return tensors.__class__(mapped)
+
+
 def test_qwen4_gdn_cached_chunks_match_full_sequence() -> None:
     rng = np.random.default_rng(3801)
     hidden = dimension = 128
@@ -56,7 +71,7 @@ def test_qwen4_gdn_cached_chunks_match_full_sequence() -> None:
     key_width = key_heads * dimension
     value_width = value_heads * dimension
     conv_width = 2 * key_width + value_width
-    prefix = "layer.linear_attn"
+    prefix = "model.language_model.layers.0.linear_attn"
     tensors: dict[str, np.ndarray] = {
         prefix + ".in_proj_qkv.weight": _random(rng, (conv_width, hidden)),
         prefix + ".in_proj_z.weight": _random(rng, (value_width, hidden)),
@@ -71,6 +86,8 @@ def test_qwen4_gdn_cached_chunks_match_full_sequence() -> None:
     conv[:, 0, -1] = 0.8
     conv[:, 0, -2] = 0.1
     tensors[prefix + ".conv1d.weight"] = conv
+    tensors = _canonical_tensors(tensors)
+    prefix = "model.block.0.linear_attention"
     config = SimpleNamespace(
         linear_num_key_heads=key_heads,
         linear_num_value_heads=value_heads,
@@ -181,7 +198,7 @@ def test_qwen4_sharded_ple_hash_matches_reference_and_cache() -> None:
             self.reads[key] = self.reads.get(key, 0) + 1
             return super().__getitem__(key)
 
-    prefix = "layer.ple"
+    prefix = "model.language_model.layers.0.ple"
     embedding_prefix = prefix + ".ple_embedding.ngram_embedding"
     global_embedding = np.arange(16 * 2, dtype=np.float32).reshape(16, 2)
     tensors = CountingDict({
@@ -191,6 +208,9 @@ def test_qwen4_sharded_ple_hash_matches_reference_and_cache() -> None:
         prefix + ".ple_embedding.ngram_heads_offsets": np.asarray([0, 8], dtype=np.int64),
         prefix + ".ple_embedding.ngram_heads_vocab_sizes": np.asarray([5, 7], dtype=np.int64),
     })
+    tensors = _canonical_tensors(tensors)
+    prefix = "model.block.0.position_embedding"
+    embedding_prefix = prefix + ".ngram.shard"
     config = SimpleNamespace(
         split_ngram_parts=2,
         ngram_size=3,
@@ -200,8 +220,8 @@ def test_qwen4_sharded_ple_hash_matches_reference_and_cache() -> None:
     )
     ids = np.asarray([[1, 2, 99, 3, 4]], dtype=np.int32)
     embedding = MlxQwen4ExpNgramEmbedding(MlxNintModel(tensors), config, prefix)
-    assert tensors.reads[embedding_prefix + ".shard_0.weight"] == 1
-    assert tensors.reads[embedding_prefix + ".shard_1.weight"] == 1
+    assert tensors.reads[embedding_prefix + ".0.weight"] == 1
+    assert tensors.reads[embedding_prefix + ".1.weight"] == 1
 
     expected_ids = _reference_ngram_ids(
         ids,
@@ -228,7 +248,7 @@ def test_qwen4_sharded_ple_hash_matches_reference_and_cache() -> None:
 
 def test_qwen4_ple_reject_rollback_restores_convolution_and_ngram_history() -> None:
     rng = np.random.default_rng(3804)
-    prefix = "layer.ple"
+    prefix = "model.language_model.layers.0.ple"
     embedding_prefix = prefix + ".ple_embedding.ngram_embedding"
     hidden, streams = 8, 2
     width = hidden * streams
@@ -245,6 +265,8 @@ def test_qwen4_ple_reject_rollback_restores_convolution_and_ngram_history() -> N
         prefix + ".norm_conv.weight": np.zeros((width,), dtype=np.float32),
         prefix + ".conv1d.weight": _random(rng, (width, 1, 3)),
     }
+    tensors = _canonical_tensors(tensors)
+    prefix = "model.block.0.position_embedding"
     config = SimpleNamespace(
         split_ngram_parts=2,
         ngram_size=3,
@@ -300,7 +322,7 @@ def test_qwen4_qsa_cached_chunks_match_full_sparse_sequence() -> None:
     rng = np.random.default_rng(3802)
     hidden = dimension = 128
     heads, kv_heads, index_heads = 2, 1, 2
-    prefix = "layer.self_attn"
+    prefix = "model.language_model.layers.0.self_attn"
     tensors = {
         prefix + ".q_proj.weight": _random(rng, (heads * 2 * dimension, hidden)),
         prefix + ".k_proj.weight": _random(rng, (kv_heads * dimension, hidden)),
@@ -314,6 +336,8 @@ def test_qwen4_qsa_cached_chunks_match_full_sparse_sequence() -> None:
         prefix + ".indexer.q_layernorm.weight": np.zeros((dimension,), dtype=np.float32),
         prefix + ".indexer.k_layernorm.weight": np.zeros((dimension,), dtype=np.float32),
     }
+    tensors = _canonical_tensors(tensors)
+    prefix = "model.block.0.attention"
     config = SimpleNamespace(
         hidden_size=hidden,
         num_attention_heads=heads,
@@ -436,6 +460,7 @@ def test_qwen4_mtp_cached_chunks_match_full_multistream_sequence() -> None:
     tensors[final + ".hc_norm.weight"] = np.zeros((width,), dtype=np.float32)
     tensors[final + ".input_mix_weight_down.weight"] = _random(rng, (16, width))
     tensors[final + ".input_mix_weight_up.weight"] = _random(rng, (width, 16))
+    tensors = _canonical_tensors(tensors)
     config = SimpleNamespace(
         mtp_num_hidden_layers=1,
         max_position_embeddings=16,

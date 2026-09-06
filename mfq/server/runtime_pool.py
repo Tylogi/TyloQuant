@@ -32,10 +32,10 @@ from mfq.server.models import (
 )
 from mfq.server.native import (
     find_native_runtime_resource,
-    flash_next_runtime_command,
-    is_flash_next_architecture,
     native_runtime_environment,
     native_tokenizer_arguments,
+    python_mlx_runtime_command,
+    resolve_runtime_route,
 )
 
 
@@ -213,22 +213,25 @@ class ManagedRuntimePool:
                 ),
                 artifact.resource.error or "model artifact is incomplete",
             )
-        flash_next = is_flash_next_architecture(artifact.resource.architecture)
-        if flash_next and artifact.resource.format != "mfq":
+        runtime_route = resolve_runtime_route(
+            artifact.resource.architecture,
+            artifact.path,
+        )
+        python_mlx_worker = runtime_route.python_mlx_worker
+        if runtime_route.requires_mfq and artifact.resource.format != "mfq":
             raise _job_error(
                 "model_conversion_required",
-                "Qwen3.8-Flash-Next and GLM-5.3-Flash HF checkpoints must be "
-                "converted to MFQ before inference",
+                "this Python MLX architecture must be converted to MFQ before inference",
             )
-        if flash_next and self.backend != "metal":
+        if python_mlx_worker and self.backend != "metal":
             raise _job_error(
                 "unsupported_device",
-                "Flash-Next MFQ inference currently requires Metal",
+                "this MFQ model's Python MLX worker currently requires Metal",
             )
-        if flash_next and not self.controller_command:
+        if python_mlx_worker and not self.controller_command:
             raise _job_error(
                 "runtime_launcher_missing",
-                "Flash-Next runtime has no MFQ CLI launcher",
+                "the Python MLX worker has no MFQ CLI launcher",
             )
         evicted: _ManagedRuntime | None = None
         async with self._lock:
@@ -277,8 +280,8 @@ class ManagedRuntimePool:
                     self._loading_model_names.discard(model_name)
                 raise
 
-        if flash_next:
-            command = flash_next_runtime_command(
+        if python_mlx_worker:
+            command = python_mlx_runtime_command(
                 self.controller_command,
                 model=artifact.path,
                 model_name=artifact.resource.name,

@@ -16,11 +16,13 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
         "MFQ's MLX runtime requires MLX; install with `pip install -e '.[metal]'`"
     ) from exc
 
+from mfq.architectures.flash_next import VisionTowerConfig
 from mfq.formats.assets import MODEL_CONFIG_ASSET
 from mfq.formats.io import MfqTensor
 from mfq.kernels.metal.linear_attention import (
     gated_delta_net,
     linear_conv_qkv,
+    prepare_linear_conv_qkv,
 )
 from mfq.kernels.metal.sampling import sample as _sample
 from mfq.runtime.mlx_attention import MlxKVCache, attention
@@ -57,6 +59,16 @@ class MlxCausalLMConfig:
     linear_num_key_heads: int = 0
     linear_num_value_heads: int = 0
     linear_a_is_log: bool = True
+    mrope_interleaved: bool = False
+    mtp_num_hidden_layers: int = 0
+    mtp_use_dedicated_embeddings: bool = False
+    family: str = "generic"
+    eos_token_ids: tuple[int, ...] = ()
+    image_token_id: int | None = None
+    video_token_id: int | None = None
+    vision_start_token_id: int | None = None
+    vision_end_token_id: int | None = None
+    vision: VisionTowerConfig | None = None
 
     @property
     def head_dim(self) -> int:
@@ -84,6 +96,22 @@ class MlxCausalLMConfig:
 
         text = config.get("text_config", config)
         rope_parameters = text.get("rope_parameters", {})
+        raw_eos = text.get("eos_token_id")
+        eos_token_ids = (
+            ()
+            if raw_eos is None
+            else (
+                (int(raw_eos),)
+                if isinstance(raw_eos, int)
+                else tuple(int(value) for value in raw_eos)
+            )
+        )
+        raw_vision = config.get("vision_config")
+        vision = (
+            VisionTowerConfig.from_mapping(raw_vision)
+            if isinstance(raw_vision, Mapping)
+            else None
+        )
         head_dim = int(
             text.get(
                 "head_dim",
@@ -96,7 +124,7 @@ class MlxCausalLMConfig:
                 rope_parameters.get("partial_rotary_factor", 1.0),
             )
         )
-        return cls(
+        result = cls(
             vocab_size=int(text["vocab_size"]),
             hidden_size=int(text["hidden_size"]),
             intermediate_size=int(text["intermediate_size"]),
@@ -125,79 +153,68 @@ class MlxCausalLMConfig:
             linear_num_key_heads=int(text.get("linear_num_key_heads", 0)),
             linear_num_value_heads=int(text.get("linear_num_value_heads", 0)),
             linear_a_is_log=True,
+            mrope_interleaved=bool(rope_parameters.get("mrope_interleaved", False)),
+            mtp_num_hidden_layers=int(text.get("mtp_num_hidden_layers", 0) or 0),
+            mtp_use_dedicated_embeddings=bool(
+                text.get("mtp_use_dedicated_embeddings", False)
+            ),
+            family="qwen3_5",
+            eos_token_ids=eos_token_ids,
+            image_token_id=(
+                None if config.get("image_token_id") is None else int(config["image_token_id"])
+            ),
+            video_token_id=(
+                None if config.get("video_token_id") is None else int(config["video_token_id"])
+            ),
+            vision_start_token_id=(
+                None
+                if config.get("vision_start_token_id") is None
+                else int(config["vision_start_token_id"])
+            ),
+            vision_end_token_id=(
+                None
+                if config.get("vision_end_token_id") is None
+                else int(config["vision_end_token_id"])
+            ),
+            vision=vision,
         )
+        if vision is not None and vision.out_hidden_size != result.hidden_size:
+            raise ValueError("Qwen3.5 vision output width must match hidden_size")
+        return result
 
 
 @dataclass(frozen=True)
 class MlxCausalLMNames:
-    token_embd: str = "token_embd.weight"
-    attn_norm: str = "blk.{i}.attn_norm.weight"
-    attn_q: str = "blk.{i}.attn_q.weight"
-    attn_k: str = "blk.{i}.attn_k.weight"
-    attn_v: str = "blk.{i}.attn_v.weight"
-    attn_out: str = "blk.{i}.attn_output.weight"
-    attn_q_norm: str = "blk.{i}.attn_q_norm.weight"
-    attn_k_norm: str = "blk.{i}.attn_k_norm.weight"
-    ffn_norm: str = "blk.{i}.ffn_norm.weight"
-    ffn_gate: str = "blk.{i}.ffn_gate.weight"
-    ffn_up: str = "blk.{i}.ffn_up.weight"
-    ffn_down: str = "blk.{i}.ffn_down.weight"
-    output_norm: str = "output_norm.weight"
-    output: str = "output.weight"
-    linear_qkv: str = "blk.{i}.ssm_qkv.weight"
-    linear_qk: str | None = "blk.{i}.ssm_qk.weight"
-    linear_v: str | None = "blk.{i}.ssm_v.weight"
-    linear_z: str = "blk.{i}.ssm_z.weight"
-    linear_alpha: str = "blk.{i}.ssm_alpha.weight"
-    linear_beta: str = "blk.{i}.ssm_beta.weight"
-    linear_conv: str = "blk.{i}.ssm_conv1d.weight"
-    linear_conv_bias: str | None = None
-    linear_dt_bias: str = "blk.{i}.ssm_dt.bias"
-    linear_a: str = "blk.{i}.ssm_a"
-    linear_norm: str = "blk.{i}.ssm_norm.weight"
-    linear_out: str = "blk.{i}.ssm_out.weight"
+    token_embd: str = "model.token_embedding.weight"
+    attn_norm: str = "model.block.{i}.attention.norm.weight"
+    attn_q: str = "model.block.{i}.attention.query.weight"
+    attn_k: str = "model.block.{i}.attention.key.weight"
+    attn_v: str = "model.block.{i}.attention.value.weight"
+    attn_out: str = "model.block.{i}.attention.output.weight"
+    attn_q_norm: str = "model.block.{i}.attention.query_norm.weight"
+    attn_k_norm: str = "model.block.{i}.attention.key_norm.weight"
+    ffn_norm: str = "model.block.{i}.mlp.norm.weight"
+    ffn_gate: str = "model.block.{i}.mlp.gate.weight"
+    ffn_up: str = "model.block.{i}.mlp.up.weight"
+    ffn_down: str = "model.block.{i}.mlp.down.weight"
+    output_norm: str = "model.output_norm.weight"
+    output: str = "model.output.weight"
+    linear_qkv: str = "model.block.{i}.linear_attention.qkv.weight"
+    linear_qk: str | None = "model.block.{i}.linear_attention.qk.weight"
+    linear_v: str | None = "model.block.{i}.linear_attention.value.weight"
+    linear_z: str = "model.block.{i}.linear_attention.gate.weight"
+    linear_alpha: str = "model.block.{i}.linear_attention.alpha.weight"
+    linear_beta: str = "model.block.{i}.linear_attention.beta.weight"
+    linear_conv: str = "model.block.{i}.linear_attention.conv.weight"
+    linear_conv_bias: str | None = "model.block.{i}.linear_attention.conv.bias"
+    linear_dt_bias: str = "model.block.{i}.linear_attention.dt_bias"
+    linear_a: str = "model.block.{i}.linear_attention.a"
+    linear_norm: str = "model.block.{i}.linear_attention.norm.weight"
+    linear_out: str = "model.block.{i}.linear_attention.output.weight"
 
     def layer(self, template: str, index: int) -> str:
         return template.format(i=index)
 
-    @classmethod
-    def qwen35_gguf(cls) -> MlxCausalLMNames:
-        return cls(
-            ffn_norm="blk.{i}.post_attention_norm.weight",
-            linear_qkv="blk.{i}.attn_qkv.weight",
-            linear_z="blk.{i}.attn_gate.weight",
-        )
-
-    @classmethod
-    def qwen35_hf(cls) -> MlxCausalLMNames:
-        return cls(
-            token_embd="model.language_model.embed_tokens.weight",
-            attn_norm="model.language_model.layers.{i}.input_layernorm.weight",
-            attn_q="model.language_model.layers.{i}.self_attn.q_proj.weight",
-            attn_k="model.language_model.layers.{i}.self_attn.k_proj.weight",
-            attn_v="model.language_model.layers.{i}.self_attn.v_proj.weight",
-            attn_out="model.language_model.layers.{i}.self_attn.o_proj.weight",
-            attn_q_norm="model.language_model.layers.{i}.self_attn.q_norm.weight",
-            attn_k_norm="model.language_model.layers.{i}.self_attn.k_norm.weight",
-            ffn_norm="model.language_model.layers.{i}.post_attention_layernorm.weight",
-            ffn_gate="model.language_model.layers.{i}.mlp.gate_proj.weight",
-            ffn_up="model.language_model.layers.{i}.mlp.up_proj.weight",
-            ffn_down="model.language_model.layers.{i}.mlp.down_proj.weight",
-            output_norm="model.language_model.norm.weight",
-            output="lm_head.weight",
-            linear_qkv=("model.language_model.layers.{i}.linear_attn.in_proj_qkv.weight"),
-            linear_qk="model.language_model.layers.{i}.linear_attn.in_proj_qk.weight",
-            linear_v="model.language_model.layers.{i}.linear_attn.in_proj_v.weight",
-            linear_z="model.language_model.layers.{i}.linear_attn.in_proj_z.weight",
-            linear_alpha="model.language_model.layers.{i}.linear_attn.in_proj_a.weight",
-            linear_beta="model.language_model.layers.{i}.linear_attn.in_proj_b.weight",
-            linear_conv="model.language_model.layers.{i}.linear_attn.conv1d.weight",
-            linear_conv_bias="model.language_model.layers.{i}.linear_attn.conv1d.bias",
-            linear_dt_bias="model.language_model.layers.{i}.linear_attn.dt_bias",
-            linear_a="model.language_model.layers.{i}.linear_attn.A_log",
-            linear_norm="model.language_model.layers.{i}.linear_attn.norm.weight",
-            linear_out="model.language_model.layers.{i}.linear_attn.out_proj.weight",
-        )
 
 
 def _dense_vector(model: MlxNintModel, name: str) -> mx.array:
@@ -268,7 +285,11 @@ class MlxFullAttentionBlock:
                 model.linear(names.layer(names.attn_q, layer_index)),
                 model.linear(names.layer(names.attn_k, layer_index)),
                 model.linear(names.layer(names.attn_v, layer_index)),
-            )
+            ),
+            # The heterogeneous grouped projection saves launches during
+            # prefill, but its descriptor/branching overhead makes M=1 much
+            # slower than the tuned per-weight GEMVs used for decode.
+            grouped_min_rows=2,
         )
         self.output = model.linear(names.layer(names.attn_out, layer_index))
         self.ffn = model.ffn(
@@ -281,6 +302,7 @@ class MlxFullAttentionBlock:
             config.max_position_embeddings,
             base=config.rope_base,
             sections=config.rope_sections,
+            mrope_interleaved=config.mrope_interleaved,
         )
         self.cache: MlxKVCache | None = None
 
@@ -296,9 +318,10 @@ class MlxFullAttentionBlock:
     def forward(
         self,
         x: mx.array,
-        positions: mx.array,
+        positions: mx.array | None,
         *,
         use_cache: bool,
+        position_offset: int = 0,
     ) -> mx.array:
         config = self.config
         batch, tokens, hidden = (int(item) for item in x.shape)
@@ -343,19 +366,21 @@ class MlxFullAttentionBlock:
             query = self.q_norm(query)
         if self.k_norm is not None:
             key = self.k_norm(key)
-        query = self.rope(query, positions)
-        key = self.rope(key, positions)
+        if positions is None:
+            query = self.rope.forward_contiguous(query, position_offset)
+            key = self.rope.forward_contiguous(key, position_offset)
+        else:
+            query = self.rope(query, positions)
+            key = self.rope(key, positions)
 
         if use_cache:
             if self.cache is None:
                 self.reset_cache(batch)
             assert self.cache is not None
-            cache_positions = positions[0] if positions.ndim == 2 else positions
-            key_cache, value_cache = self.cache.append(
-                key,
-                value,
-                cache_positions,
-            )
+            # Multimodal RoPE coordinates are logical attention positions,
+            # not physical KV slots.  Cache storage always follows prompt
+            # order even when the three MRoPE axes repeat within an image.
+            key_cache, value_cache = self.cache.append(key, value)
         else:
             key_cache, value_cache = key, value
         attended = attention(query, key_cache, value_cache, causal=True)
@@ -376,11 +401,17 @@ class MlxFullAttentionBlock:
     def __call__(
         self,
         x: mx.array,
-        positions: mx.array,
+        positions: mx.array | None,
         *,
         use_cache: bool,
+        position_offset: int = 0,
     ) -> mx.array:
-        return self.forward(x, positions, use_cache=use_cache)
+        return self.forward(
+            x,
+            positions,
+            use_cache=use_cache,
+            position_offset=position_offset,
+        )
 
 
 class MlxQwen35LinearAttentionBlock:
@@ -394,7 +425,7 @@ class MlxQwen35LinearAttentionBlock:
         layer_index: int,
     ) -> None:
         self.config = config
-        self.gguf_layout = names.linear_qkv == "blk.{i}.attn_qkv.weight"
+        self.gguf_layout = model.legacy_semantics == "qwen35_gguf"
         self.attn_norm = MlxRMSNorm(
             _dense_vector(model, names.layer(names.attn_norm, layer_index)),
             config.rms_norm_eps,
@@ -415,7 +446,10 @@ class MlxQwen35LinearAttentionBlock:
         )
         if self.split_input:
             assert qk_name is not None and v_name is not None
-            self.qk_v = MlxLinearGroup((model.linear(qk_name), model.linear(v_name)))
+            self.qk_v = MlxLinearGroup(
+                (model.linear(qk_name), model.linear(v_name)),
+                grouped_min_rows=2,
+            )
             self.qkv = None
         else:
             self.qk_v = None
@@ -425,13 +459,14 @@ class MlxQwen35LinearAttentionBlock:
                 model.linear(names.layer(names.linear_z, layer_index)),
                 model.linear(names.layer(names.linear_alpha, layer_index)),
                 model.linear(names.layer(names.linear_beta, layer_index)),
-            )
+            ),
+            grouped_min_rows=2,
         )
-        self.conv_weight = _dense_array(
+        conv_weight = _dense_array(
             model,
             names.layer(names.linear_conv, layer_index),
         )
-        self.conv_bias = (
+        conv_bias = (
             None
             if names.linear_conv_bias is None
             or names.layer(names.linear_conv_bias, layer_index) not in model.tensors
@@ -440,11 +475,25 @@ class MlxQwen35LinearAttentionBlock:
                 names.layer(names.linear_conv_bias, layer_index),
             )
         )
-        self.dt_bias = _dense_vector(
-            model,
-            names.layer(names.linear_dt_bias, layer_index),
+        self.conv_parameters = prepare_linear_conv_qkv(
+            conv_weight,
+            conv_bias,
+            channels=2 * self.key_size + self.value_size,
+            eps=config.rms_norm_eps,
         )
-        self.a = _dense_vector(model, names.layer(names.linear_a, layer_index))
+        self.dt_bias = mx.contiguous(
+            _dense_vector(
+                model,
+                names.layer(names.linear_dt_bias, layer_index),
+            ).reshape(1, 1, -1)
+        )
+        a = _dense_vector(model, names.layer(names.linear_a, layer_index))
+        # A is a model constant. Rebuilding Exp/Negative in every decode
+        # graph adds one primitive per linear-attention layer and token.
+        self.a = mx.contiguous(
+            (-mx.exp(a) if config.linear_a_is_log else a).reshape(1, 1, -1)
+        )
+        mx.eval(self.dt_bias, self.a)
         self.linear_norm = MlxRMSNorm(
             _dense_vector(model, names.layer(names.linear_norm, layer_index)),
             config.rms_norm_eps,
@@ -458,6 +507,7 @@ class MlxQwen35LinearAttentionBlock:
         self.conv_state: mx.array | None = None
         self.gdn_state: mx.array | None = None
         self._cache_position = 0
+        self._speculative_rollback: tuple[mx.array, mx.array, int] | None = None
 
     @property
     def key_heads(self) -> int:
@@ -495,8 +545,9 @@ class MlxQwen35LinearAttentionBlock:
             dtype=mx.float32,
         )
         self._cache_position = 0
+        self._speculative_rollback = None
 
-    def forward(
+    def _forward_impl(
         self,
         x: mx.array,
         positions: mx.array,
@@ -530,10 +581,9 @@ class MlxQwen35LinearAttentionBlock:
             tokens,
             self.value_heads,
         )
-        gate_input = alpha + self.dt_bias.reshape(1, 1, -1)
+        gate_input = alpha + self.dt_bias
         gate = mx.maximum(gate_input, 0.0) + mx.log1p(mx.exp(-mx.abs(gate_input)))
-        a = -mx.exp(self.a) if config.linear_a_is_log else self.a
-        gate = gate * a.reshape(1, 1, -1)
+        gate = gate * self.a
 
         if use_cache:
             if self.conv_state is None or self.gdn_state is None:
@@ -555,12 +605,11 @@ class MlxQwen35LinearAttentionBlock:
             conv_state,
             qk,
             value_input,
-            self.conv_weight,
+            self.conv_parameters,
             num_key_heads=self.key_heads,
             num_value_heads=self.value_heads,
             key_head_dim=config.linear_key_head_dim,
             value_head_dim=config.linear_value_head_dim,
-            bias=self.conv_bias,
             eps=config.rms_norm_eps,
         )
         if config.linear_key_head_dim != config.linear_value_head_dim:
@@ -603,14 +652,67 @@ class MlxQwen35LinearAttentionBlock:
             raise ValueError("linear-attention block changed hidden width")
         return x
 
+    def forward(
+        self,
+        x: mx.array,
+        positions: mx.array | None,
+        *,
+        use_cache: bool,
+        n_confirmed: int = 0,
+        position_offset: int = 0,
+    ) -> mx.array:
+        del position_offset
+        confirmed = int(n_confirmed)
+        tokens = int(x.shape[1])
+        if confirmed == 0:
+            return self._forward_impl(x, positions, use_cache=use_cache)
+        if not use_cache or confirmed <= 0 or confirmed >= tokens:
+            raise ValueError("Qwen3.5 speculative linear-attention window is invalid")
+        if self._speculative_rollback is not None:
+            raise RuntimeError("Qwen3.5 speculative linear-attention window is unresolved")
+        accepted = self._forward_impl(
+            x[:, :confirmed],
+            None if positions is None else positions[..., :confirmed],
+            use_cache=True,
+        )
+        assert self.conv_state is not None and self.gdn_state is not None
+        self._speculative_rollback = (
+            self.conv_state,
+            self.gdn_state,
+            self._cache_position,
+        )
+        speculative = self._forward_impl(
+            x[:, confirmed:],
+            None if positions is None else positions[..., confirmed:],
+            use_cache=True,
+        )
+        return mx.concatenate((accepted, speculative), axis=1)
+
+    def commit_speculative_cache(self) -> None:
+        self._speculative_rollback = None
+
+    def rollback_speculative_cache(self) -> None:
+        if self._speculative_rollback is None:
+            raise RuntimeError("Qwen3.5 linear attention has no speculative window")
+        self.conv_state, self.gdn_state, self._cache_position = self._speculative_rollback
+        self._speculative_rollback = None
+
     def __call__(
         self,
         x: mx.array,
-        positions: mx.array,
+        positions: mx.array | None,
         *,
         use_cache: bool,
+        n_confirmed: int = 0,
+        position_offset: int = 0,
     ) -> mx.array:
-        return self.forward(x, positions, use_cache=use_cache)
+        return self.forward(
+            x,
+            positions,
+            use_cache=use_cache,
+            n_confirmed=n_confirmed,
+            position_offset=position_offset,
+        )
 
 
 class MlxCausalLM:
@@ -621,9 +723,21 @@ class MlxCausalLM:
         tensors: Mapping[str, MfqTensor] | MlxNintModel,
         config: MlxCausalLMConfig,
         names: MlxCausalLMNames | None = None,
+        *,
+        max_context: int | None = None,
     ) -> None:
+        selected_context = (
+            config.max_position_embeddings
+            if max_context is None or int(max_context) <= 0
+            else min(int(max_context), config.max_position_embeddings)
+        )
+        if selected_context <= 0:
+            raise ValueError("causal LM max_context must be positive")
+        if selected_context != config.max_position_embeddings:
+            config = replace(config, max_position_embeddings=selected_context)
         self.model = tensors if isinstance(tensors, MlxNintModel) else MlxNintModel(tensors)
         self.config = config
+        self.max_context = selected_context
         self.names = MlxCausalLMNames() if names is None else names
         self.embedding = self.model.embedding(self.names.token_embd)
         layer_types = config.layer_types or (("full_attention",) * config.num_hidden_layers)
@@ -659,6 +773,7 @@ class MlxCausalLM:
             self.output = MlxNintLinear.from_packed_weight(self.embedding.packed_weight)
         else:
             self.output = self.model.linear(self.names.output)
+        self._speculative_checkpoint: tuple[int, int, int] | None = None
 
     @classmethod
     def from_mfq(
@@ -668,6 +783,7 @@ class MlxCausalLM:
         names: MlxCausalLMNames | None = None,
         *,
         mmap: bool = True,
+        max_context: int | None = None,
     ) -> MlxCausalLM:
         model = MlxNintModel.from_mfq(path, mmap=mmap)
         try:
@@ -684,26 +800,122 @@ class MlxCausalLM:
                     raise ValueError("embedded MFQ model config must be a JSON object")
                 config = MlxCausalLMConfig.from_qwen35_hf_config(parsed)
             if names is None:
-                if "model.language_model.embed_tokens.weight" in model.tensors:
-                    names = MlxCausalLMNames.qwen35_hf()
-                elif "blk.0.post_attention_norm.weight" in model.tensors:
-                    names = MlxCausalLMNames.qwen35_gguf()
-                else:
-                    names = MlxCausalLMNames()
-            if names.linear_qkv == "blk.{i}.attn_qkv.weight":
+                names = MlxCausalLMNames()
+            if model.legacy_semantics == "qwen35_gguf":
                 config = replace(
                     config,
                     norm_weight_offset=0.0,
                     linear_a_is_log=False,
                 )
-            return cls(model, config, names)
+            return cls(model, config, names, max_context=max_context)
         except BaseException:
             model.close()
             raise
 
-    def reset_cache(self, batch: int) -> None:
+    @property
+    def position(self) -> int:
+        if not self.layers:
+            return 0
+        first = self.layers[0]
+        if isinstance(first, MlxFullAttentionBlock):
+            return 0 if first.cache is None else int(first.cache.pos)
+        return int(first.cache_pos)
+
+    def reset_cache(self, batch: int = 1) -> None:
         for layer in self.layers:
             layer.reset_cache(batch)
+        self._speculative_checkpoint = None
+
+    @staticmethod
+    def _positions(
+        positions: mx.array | np.ndarray | None,
+        start: int,
+        tokens: int,
+    ) -> mx.array:
+        if positions is None:
+            return mx.arange(start, start + tokens, dtype=mx.int32)
+        value = positions if isinstance(positions, mx.array) else mx.array(positions)
+        if value.ndim not in (1, 2, 3) or int(value.shape[-1]) != tokens:
+            raise ValueError(
+                "causal LM positions must have [T], [3,T], or [3,B,T] shape"
+            )
+        return value.astype(mx.int32)
+
+    def forward_embeddings_with_hidden(
+        self,
+        embeddings: mx.array | np.ndarray,
+        input_ids: mx.array | np.ndarray,
+        positions: mx.array | np.ndarray | None = None,
+        *,
+        use_cache: bool = False,
+        n_confirmed: int = 0,
+    ) -> tuple[mx.array, mx.array]:
+        hidden = embeddings if isinstance(embeddings, mx.array) else mx.array(embeddings)
+        ids = input_ids if isinstance(input_ids, mx.array) else mx.array(input_ids)
+        if ids.ndim == 1:
+            ids = ids[None]
+        if (
+            hidden.ndim != 3
+            or ids.ndim != 2
+            or tuple(hidden.shape[:2]) != tuple(ids.shape)
+            or int(hidden.shape[-1]) != self.config.hidden_size
+        ):
+            raise ValueError("causal LM embeddings/IDs have incompatible shapes")
+        batch, tokens = (int(item) for item in ids.shape)
+        start = self.position if use_cache else 0
+        if start + tokens > self.max_context:
+            raise ValueError("causal LM input exceeds max_context")
+        confirmed = int(n_confirmed)
+        if confirmed < 0 or confirmed >= tokens or (confirmed > 0 and not use_cache):
+            raise ValueError("causal LM speculative confirmation window is invalid")
+        if confirmed > 0 and self._speculative_checkpoint is not None:
+            raise RuntimeError("causal LM speculative window is unresolved")
+        position_array = (
+            None if positions is None else self._positions(positions, start, tokens)
+        )
+        if (
+            position_array is not None
+            and position_array.ndim == 3
+            and int(position_array.shape[1]) != batch
+        ):
+            raise ValueError("causal LM position batch does not match input batch")
+        for layer in self.layers:
+            if confirmed > 0 and isinstance(layer, MlxQwen35LinearAttentionBlock):
+                hidden = layer(
+                    hidden,
+                    position_array,
+                    use_cache=True,
+                    n_confirmed=confirmed,
+                    position_offset=start,
+                )
+            else:
+                hidden = layer(
+                    hidden,
+                    position_array,
+                    use_cache=use_cache,
+                    position_offset=start,
+                )
+        if confirmed > 0:
+            self._speculative_checkpoint = (start, confirmed, tokens)
+        logits = self.output(self.output_norm(hidden))
+        if tuple(int(item) for item in logits.shape[:2]) != (batch, tokens):
+            raise ValueError("causal LM output leading dimensions are invalid")
+        return logits, hidden
+
+    def forward_embeddings(
+        self,
+        embeddings: mx.array | np.ndarray,
+        input_ids: mx.array | np.ndarray,
+        positions: mx.array | np.ndarray | None = None,
+        *,
+        use_cache: bool = False,
+    ) -> mx.array:
+        return self.forward_embeddings_with_hidden(
+            embeddings,
+            input_ids,
+            positions,
+            use_cache=use_cache,
+        )[0]
 
     def forward(
         self,
@@ -717,28 +929,57 @@ class MlxCausalLM:
             raise ValueError("causal LM input IDs must have [batch,tokens] shape")
         if ids.dtype not in (mx.int32, mx.uint32):
             ids = ids.astype(mx.int32)
-        batch, tokens = (int(item) for item in ids.shape)
-        if positions is None:
-            start = 0
-            if use_cache and self.layers:
-                first_layer = self.layers[0]
-                if isinstance(first_layer, MlxFullAttentionBlock):
-                    if first_layer.cache is not None:
-                        start = first_layer.cache.pos
-                else:
-                    start = first_layer.cache_pos
-            position_array = mx.arange(start, start + tokens, dtype=mx.int32)
-        else:
-            position_array = positions if isinstance(positions, mx.array) else mx.array(positions)
-            if position_array.dtype not in (mx.int32, mx.uint32):
-                position_array = position_array.astype(mx.int32)
-        hidden = self.embedding(ids)
+        return self.forward_embeddings(
+            self.embedding(ids),
+            ids,
+            positions,
+            use_cache=use_cache,
+        )
+
+    def forward_with_hidden(
+        self,
+        input_ids: mx.array | np.ndarray,
+        positions: mx.array | np.ndarray | None = None,
+        *,
+        use_cache: bool = False,
+        n_confirmed: int = 0,
+    ) -> tuple[mx.array, mx.array]:
+        ids = input_ids if isinstance(input_ids, mx.array) else mx.array(input_ids)
+        if ids.ndim != 2:
+            raise ValueError("causal LM input IDs must have [batch,tokens] shape")
+        if ids.dtype not in (mx.int32, mx.uint32):
+            ids = ids.astype(mx.int32)
+        return self.forward_embeddings_with_hidden(
+            self.embedding(ids),
+            ids,
+            positions,
+            use_cache=use_cache,
+            n_confirmed=n_confirmed,
+        )
+
+    def commit_speculative_cache(self) -> None:
+        if self._speculative_checkpoint is None:
+            raise RuntimeError("causal LM has no speculative window")
         for layer in self.layers:
-            hidden = layer(hidden, position_array, use_cache=use_cache)
-        logits = self.output(self.output_norm(hidden))
-        if tuple(int(item) for item in logits.shape[:2]) != (batch, tokens):
-            raise ValueError("causal LM output leading dimensions are invalid")
-        return logits
+            if isinstance(layer, MlxQwen35LinearAttentionBlock):
+                layer.commit_speculative_cache()
+        self._speculative_checkpoint = None
+
+    def rollback_speculative_cache(self, accepted_drafts: int = 0) -> None:
+        if self._speculative_checkpoint is None:
+            raise RuntimeError("causal LM has no speculative window")
+        start, confirmed, tokens = self._speculative_checkpoint
+        if int(accepted_drafts) != 0 or confirmed <= 0 or tokens != confirmed + 1:
+            raise ValueError("causal LM currently rolls back one rejected draft")
+        keep = start + confirmed
+        for layer in self.layers:
+            if isinstance(layer, MlxQwen35LinearAttentionBlock):
+                layer.rollback_speculative_cache()
+            else:
+                if layer.cache is None:
+                    raise RuntimeError("full-attention cache is not initialized")
+                layer.cache.pos = keep
+        self._speculative_checkpoint = None
 
     def __call__(
         self,
@@ -748,6 +989,21 @@ class MlxCausalLM:
         use_cache: bool = False,
     ) -> mx.array:
         return self.forward(input_ids, positions, use_cache=use_cache)
+
+    def prefill(self, input_ids: mx.array | np.ndarray) -> mx.array:
+        ids = input_ids if isinstance(input_ids, mx.array) else mx.array(input_ids)
+        if ids.ndim == 1:
+            ids = ids[None]
+        self.reset_cache(int(ids.shape[0]))
+        return self.forward(ids, use_cache=True)
+
+    def decode(self, input_ids: mx.array | np.ndarray) -> mx.array:
+        ids = input_ids if isinstance(input_ids, mx.array) else mx.array(input_ids)
+        if ids.ndim == 1:
+            ids = ids[None]
+        if ids.ndim != 2 or int(ids.shape[1]) != 1:
+            raise ValueError("causal LM decode accepts one token per batch")
+        return self.forward(ids, use_cache=True)
 
     def generate(
         self,
@@ -811,10 +1067,161 @@ class MlxCausalLM:
         self.close()
 
 
+class MlxQwen35Mtp:
+    """Optional Qwen3.5 depth-one MTP head sharing a loaded backbone store."""
+
+    def __init__(self, causal_lm: MlxCausalLM) -> None:
+        self.causal_lm = causal_lm
+        self.model = causal_lm.model
+        self.config = causal_lm.config
+        self.embedding = causal_lm.embedding
+        self.output = causal_lm.output
+        config = self.config
+        if config.mtp_num_hidden_layers <= 0:
+            raise ValueError("Qwen3.5 config does not declare MTP layers")
+        if config.mtp_use_dedicated_embeddings:
+            raise ValueError("Qwen3.5 dedicated MTP embeddings are not supported")
+
+        names = MlxCausalLMNames(
+            attn_norm="predictor.block.{i}.attention.norm.weight",
+            attn_q="predictor.block.{i}.attention.query.weight",
+            attn_k="predictor.block.{i}.attention.key.weight",
+            attn_v="predictor.block.{i}.attention.value.weight",
+            attn_out="predictor.block.{i}.attention.output.weight",
+            attn_q_norm="predictor.block.{i}.attention.query_norm.weight",
+            attn_k_norm="predictor.block.{i}.attention.key_norm.weight",
+            ffn_norm="predictor.block.{i}.mlp.norm.weight",
+            ffn_gate="predictor.block.{i}.mlp.gate.weight",
+            ffn_up="predictor.block.{i}.mlp.up.weight",
+            ffn_down="predictor.block.{i}.mlp.down.weight",
+        )
+        first_layer = 0
+        hidden_norm = "predictor.hidden_norm.weight"
+        embedding_norm = "predictor.embedding_norm.weight"
+        fusion = "predictor.fusion.weight"
+        output_norm = "predictor.output_norm.weight"
+
+        mtp_config = replace(
+            config,
+            num_hidden_layers=config.mtp_num_hidden_layers,
+            layer_types=("full_attention",) * config.mtp_num_hidden_layers,
+        )
+        self.hidden_norm = MlxRMSNorm(
+            _dense_vector(self.model, hidden_norm),
+            config.rms_norm_eps,
+            weight_offset=config.norm_weight_offset,
+        )
+        self.embedding_norm = MlxRMSNorm(
+            _dense_vector(self.model, embedding_norm),
+            config.rms_norm_eps,
+            weight_offset=config.norm_weight_offset,
+        )
+        self.fusion = self.model.linear(fusion)
+        self.layers = tuple(
+            MlxFullAttentionBlock(
+                self.model,
+                mtp_config,
+                names,
+                first_layer + index,
+            )
+            for index in range(config.mtp_num_hidden_layers)
+        )
+        self.output_norm = MlxRMSNorm(
+            _dense_vector(self.model, output_norm),
+            config.rms_norm_eps,
+            weight_offset=config.norm_weight_offset,
+        )
+
+    @classmethod
+    def load_if_present(
+        cls,
+        causal_lm: MlxCausalLM,
+        _config: MlxCausalLMConfig | None = None,
+        *,
+        max_context: int | None = None,
+    ) -> MlxQwen35Mtp | None:
+        del max_context
+        tensors = causal_lm.model.tensors
+        fusion = "predictor.fusion.weight"
+        has_any = any(
+            name.startswith("predictor.")
+            for name in tensors
+        )
+        if fusion not in tensors:
+            if has_any:
+                raise ValueError("Qwen3.5 MFQ contains an incomplete MTP head")
+            return None
+        return cls(causal_lm)
+
+    @property
+    def position(self) -> int:
+        if not self.layers or self.layers[0].cache is None:
+            return 0
+        return int(self.layers[0].cache.pos)
+
+    def reset_cache(self, batch: int = 1) -> None:
+        for layer in self.layers:
+            layer.reset_cache(int(batch))
+
+    def forward(
+        self,
+        input_ids: mx.array | np.ndarray,
+        previous_hidden_states: mx.array | np.ndarray,
+        positions: mx.array | np.ndarray | None = None,
+        *,
+        inputs_embeds: mx.array | np.ndarray | None = None,
+        use_cache: bool = False,
+    ) -> mx.array:
+        ids = input_ids if isinstance(input_ids, mx.array) else mx.array(input_ids)
+        if ids.ndim == 1:
+            ids = ids[None]
+        if ids.ndim != 2:
+            raise ValueError("Qwen3.5 MTP IDs must have [batch,tokens] shape")
+        hidden = (
+            previous_hidden_states
+            if isinstance(previous_hidden_states, mx.array)
+            else mx.array(previous_hidden_states)
+        )
+        batch, tokens = (int(item) for item in ids.shape)
+        if tuple(hidden.shape) != (batch, tokens, self.config.hidden_size):
+            raise ValueError("Qwen3.5 MTP previous hidden has an incompatible shape")
+        embeds = self.embedding(ids.astype(mx.int32)) if inputs_embeds is None else inputs_embeds
+        embeds = embeds if isinstance(embeds, mx.array) else mx.array(embeds)
+        if tuple(embeds.shape) != tuple(hidden.shape):
+            raise ValueError("Qwen3.5 MTP embeddings have an incompatible shape")
+        start = self.position if use_cache else 0
+        position_array = (
+            None
+            if positions is None
+            else MlxCausalLM._positions(positions, start, tokens)
+        )
+        fused = self.fusion(
+            mx.concatenate(
+                (self.embedding_norm(embeds), self.hidden_norm(hidden)),
+                axis=-1,
+            )
+        )
+        for layer in self.layers:
+            fused = layer(
+                fused,
+                position_array,
+                use_cache=use_cache,
+                position_offset=start,
+            )
+        return self.output_norm(fused)
+
+    def compute_logits(self, hidden: mx.array | np.ndarray) -> mx.array:
+        value = hidden if isinstance(hidden, mx.array) else mx.array(hidden)
+        if value.ndim != 3 or int(value.shape[-1]) != self.config.hidden_size:
+            raise ValueError("Qwen3.5 MTP hidden has an incompatible shape")
+        return self.output(value)
+
+
 __all__ = [
     "MlxCausalLM",
     "MlxCausalLMConfig",
     "MlxCausalLMNames",
     "MlxFullAttentionBlock",
+    "MlxQwen35Mtp",
     "MlxQwen35LinearAttentionBlock",
 ]

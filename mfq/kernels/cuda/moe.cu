@@ -10,7 +10,7 @@
 // [tokens, routes, K]. ids_dst identifies either source row directly.
 
 #include <cuda_fp16.h>
-#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
+#include "mfq_tensor_backend.h"
 #include <cuda_runtime.h>
 #include <mma.h>
 
@@ -22,7 +22,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "cpp_runtime/moe_cache_transfer.h"
+#include "moe_cache_transfer.h"
 #include "glu.cuh"
 
 namespace {

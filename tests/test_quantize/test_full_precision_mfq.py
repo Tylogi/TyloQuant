@@ -145,7 +145,7 @@ def test_full_precision_mfq_quantizes_bf16_fp8_and_mxfp4(tmp_path):
     )
 
     with open_mmap(output) as store:
-        assert store.records["norm.weight"].dtype == "F32"
+        assert store.records["model.output_norm.weight"].dtype == "F32"
         assert store.records["fp8.weight"].dtype == "NINT3"
         assert store.records["fp4.weight"].dtype == "NINT3"
         assert MODEL_CONFIG_ASSET in store.records

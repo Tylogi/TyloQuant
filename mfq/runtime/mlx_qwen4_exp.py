@@ -39,10 +39,10 @@ from mfq.runtime.mlx_ops import MlxRMSNorm, MlxRoPE
 
 @dataclass(frozen=True)
 class MlxQwen4ExpNames:
-    token_embedding: str = "model.language_model.embed_tokens.weight"
-    output: str = "lm_head.weight"
-    final_mixer: str = "model.language_model.hyper_connection_mixer"
-    layer_prefix: str = "model.language_model.layers.{i}"
+    token_embedding: str = "model.token_embedding.weight"
+    output: str = "model.output.weight"
+    final_mixer: str = "model.mhc.pre"
+    layer_prefix: str = "model.block.{i}"
 
     def layer(self, index: int) -> str:
         return self.layer_prefix.format(i=index)
@@ -165,10 +165,10 @@ class MlxQwen4ExpGatedResidual:
         combine: bool = True,
     ) -> None:
         self.config = config
-        self.norm = _dense_vector(model, prefix + ".hc_norm.weight")
-        self.down = _dense_array(model, prefix + ".input_mix_weight_down.weight")
-        self.up = _dense_array(model, prefix + ".input_mix_weight_up.weight")
-        injection_name = prefix + ".block_inject_weight.weight"
+        self.norm = _dense_vector(model, prefix + ".norm.weight")
+        self.down = _dense_array(model, prefix + ".down.weight")
+        self.up = _dense_array(model, prefix + ".up.weight")
+        injection_name = prefix.removesuffix(".pre") + ".post.inject.weight"
         if combine and injection_name not in model.tensors:
             raise KeyError(f"Qwen4-Exp gated residual lacks {injection_name!r}")
         self.injection = _dense_array(model, injection_name) if combine else None
@@ -210,9 +210,9 @@ class MlxQwen4ExpGatedResidual:
 class MlxQwen4ExpDenseFFN:
     def __init__(self, model: MlxNintModel, prefix: str) -> None:
         self.ffn = model.ffn(
-            prefix + ".gate_proj.weight",
-            prefix + ".up_proj.weight",
-            prefix + ".down_proj.weight",
+            prefix + ".gate.weight",
+            prefix + ".up.weight",
+            prefix + ".down.weight",
         )
 
     def __call__(self, value: mx.array) -> mx.array:
@@ -228,8 +228,8 @@ class MlxQwen4ExpMoE:
         config: Qwen4ExpConfig,
         prefix: str,
     ) -> None:
-        gate_up = model.routed(prefix + ".experts.gate_up_proj")
-        down = model.routed(prefix + ".experts.down_proj")
+        gate_up = model.routed(prefix + ".experts.gate_up.weight")
+        down = model.routed(prefix + ".experts.down.weight")
         if (
             gate_up.n_experts != config.num_experts
             or down.n_experts != config.num_experts
@@ -241,9 +241,9 @@ class MlxQwen4ExpMoE:
             raise ValueError("Qwen4-Exp routed expert tensor shapes disagree")
         self.gate_up = gate_up
         self.down = down
-        self.router = model.linear(prefix + ".gate.weight")
+        self.router = model.linear(prefix + ".router.weight")
         self.shared = MlxQwen4ExpDenseFFN(model, prefix + ".shared_expert")
-        self.shared_gate = model.linear(prefix + ".shared_expert_gate.weight")
+        self.shared_gate = model.linear(prefix + ".shared_expert.router.weight")
         self.config = config
 
     def __call__(self, value: mx.array) -> mx.array:
@@ -273,22 +273,22 @@ class MlxQwen4ExpGdn:
         prefix: str,
     ) -> None:
         self.config = config
-        self.qkv = model.linear(prefix + ".in_proj_qkv.weight")
+        self.qkv = model.linear(prefix + ".qkv.weight")
         self.zab = MlxLinearGroup(
             (
-                model.linear(prefix + ".in_proj_z.weight"),
-                model.linear(prefix + ".in_proj_a.weight"),
-                model.linear(prefix + ".in_proj_b.weight"),
+                model.linear(prefix + ".gate.weight"),
+                model.linear(prefix + ".alpha.weight"),
+                model.linear(prefix + ".beta.weight"),
             )
         )
-        self.conv_weight = _dense_array(model, prefix + ".conv1d.weight")
+        self.conv_weight = _dense_array(model, prefix + ".conv.weight")
         self.dt_bias = _dense_vector(model, prefix + ".dt_bias")
-        self.a_log = _dense_vector(model, prefix + ".A_log")
+        self.a_log = _dense_vector(model, prefix + ".a")
         self.output_norm = MlxRMSNorm(
             _dense_vector(model, prefix + ".norm.weight"),
             config.rms_norm_eps,
         )
-        self.output = model.linear(prefix + ".out_proj.weight")
+        self.output = model.linear(prefix + ".output.weight")
         self.conv_state: mx.array | None = None
         self.recurrent_state: mx.array | None = None
         self.rollback_state: tuple[mx.array, mx.array] | None = None
@@ -445,30 +445,30 @@ class MlxQwen4ExpQsa:
         self.config = config
         self.qkv = MlxLinearGroup(
             (
-                model.linear(prefix + ".q_proj.weight"),
-                model.linear(prefix + ".k_proj.weight"),
-                model.linear(prefix + ".v_proj.weight"),
+                model.linear(prefix + ".query.weight"),
+                model.linear(prefix + ".key.weight"),
+                model.linear(prefix + ".value.weight"),
             )
         )
         self.q_norm = MlxRMSNorm(
-            _dense_vector(model, prefix + ".q_norm.weight"),
+            _dense_vector(model, prefix + ".query_norm.weight"),
             config.rms_norm_eps,
             weight_offset=1.0,
         )
         self.k_norm = MlxRMSNorm(
-            _dense_vector(model, prefix + ".k_norm.weight"),
+            _dense_vector(model, prefix + ".key_norm.weight"),
             config.rms_norm_eps,
             weight_offset=1.0,
         )
-        self.output = model.linear(prefix + ".o_proj.weight")
-        self.index_qk = model.linear(prefix + ".indexer.index_qk_proj.weight")
+        self.output = model.linear(prefix + ".output.weight")
+        self.index_qk = model.linear(prefix + ".indexer.query_key.weight")
         self.index_q_norm = MlxRMSNorm(
-            _dense_vector(model, prefix + ".indexer.q_layernorm.weight"),
+            _dense_vector(model, prefix + ".indexer.query_norm.weight"),
             config.rms_norm_eps,
             weight_offset=1.0,
         )
         self.index_k_norm = MlxRMSNorm(
-            _dense_vector(model, prefix + ".indexer.k_layernorm.weight"),
+            _dense_vector(model, prefix + ".indexer.key_norm.weight"),
             config.rms_norm_eps,
             weight_offset=1.0,
         )
@@ -684,10 +684,10 @@ class MlxQwen4ExpNgramEmbedding:
         config: Qwen4ExpConfig,
         prefix: str,
     ) -> None:
-        metadata_prefix = prefix + ".ple_embedding"
-        embedding_prefix = metadata_prefix + ".ngram_embedding"
+        metadata_prefix = prefix + ".ngram"
+        embedding_prefix = metadata_prefix + ".shard"
         self.embeddings = tuple(
-            model.embedding(f"{embedding_prefix}.shard_{index}.weight")
+            model.embedding(f"{embedding_prefix}.{index}.weight")
             for index in range(config.split_ngram_parts)
         )
         shapes = tuple(_embedding_shape(embedding) for embedding in self.embeddings)
@@ -701,11 +701,11 @@ class MlxQwen4ExpNgramEmbedding:
         self.layer_multipliers_u64 = self.layer_multipliers.view(np.uint64)
         self.head_offsets = _numpy_integer_array(
             model,
-            metadata_prefix + ".ngram_heads_offsets",
+            metadata_prefix + ".head_offsets",
         ).astype(np.int64)
         self.head_vocab_sizes = _numpy_integer_array(
             model,
-            metadata_prefix + ".ngram_heads_vocab_sizes",
+            metadata_prefix + ".head_vocab_sizes",
         ).astype(np.int64)
         self.config = config
         self.context: np.ndarray | None = None
@@ -815,12 +815,12 @@ class MlxQwen4ExpPle:
     ) -> None:
         self.config = config
         self.embedding = MlxQwen4ExpNgramEmbedding(model, config, prefix)
-        self.key = model.linear(prefix + ".key_proj.weight")
-        self.value = model.linear(prefix + ".value_proj.weight")
-        self.norm_key = _dense_vector(model, prefix + ".norm_key.weight")
-        self.norm_query = _dense_vector(model, prefix + ".norm_query.weight")
-        self.norm_conv = _dense_vector(model, prefix + ".norm_conv.weight")
-        self.conv_weight = _dense_array(model, prefix + ".conv1d.weight")
+        self.key = model.linear(prefix + ".key.weight")
+        self.value = model.linear(prefix + ".value.weight")
+        self.norm_key = _dense_vector(model, prefix + ".key_norm.weight")
+        self.norm_query = _dense_vector(model, prefix + ".query_norm.weight")
+        self.norm_conv = _dense_vector(model, prefix + ".conv_norm.weight")
+        self.conv_weight = _dense_array(model, prefix + ".conv.weight")
         self.conv_state: mx.array | None = None
         self.rollback_state: tuple[mx.array | None, np.ndarray | None] | None = None
         self.batch = 0
@@ -920,26 +920,26 @@ class MlxQwen4ExpLayer:
         self.attention_gr = MlxQwen4ExpGatedResidual(
             model,
             config,
-            prefix + ".attn_hyper_connection",
+            prefix + ".attention.mhc.pre",
         )
         self.ffn_gr = MlxQwen4ExpGatedResidual(
             model,
             config,
-            prefix + ".mlp_hyper_connection",
+            prefix + ".mlp.mhc.pre",
         )
         self.attention = (
-            MlxQwen4ExpGdn(model, config, prefix + ".linear_attn")
+            MlxQwen4ExpGdn(model, config, prefix + ".linear_attention")
             if config.layer_types[index] == "linear_attention"
             else MlxQwen4ExpQsa(
                 model,
                 config,
-                prefix + ".self_attn",
+                prefix + ".attention",
                 max_context,
             )
         )
         self.moe = MlxQwen4ExpMoE(model, config, prefix + ".mlp")
         self.ple = (
-            MlxQwen4ExpPle(model, config, prefix + ".ple")
+            MlxQwen4ExpPle(model, config, prefix + ".position_embedding")
             if index + 1 in config.ple_layer_ids
             else None
         )
@@ -999,17 +999,17 @@ class MlxQwen4ExpMtpLayer:
         self.attention_gr = MlxQwen4ExpGatedResidual(
             model,
             config,
-            prefix + ".attn_hyper_connection",
+            prefix + ".attention.mhc.pre",
         )
         self.ffn_gr = MlxQwen4ExpGatedResidual(
             model,
             config,
-            prefix + ".mlp_hyper_connection",
+            prefix + ".mlp.mhc.pre",
         )
         self.attention = MlxQwen4ExpQsa(
             model,
             config,
-            prefix + ".self_attn",
+            prefix + ".attention",
             max_context,
         )
         self.moe = MlxQwen4ExpMoE(model, config, prefix + ".mlp")
@@ -1064,22 +1064,22 @@ class MlxQwen4ExpMtp:
             else self.names.output
         )
         self.embedding_norm = MlxRMSNorm(
-            _dense_vector(self.model, "mtp.pre_fc_norm_embedding.weight"),
+            _dense_vector(self.model, "predictor.embedding_norm.weight"),
             config.rms_norm_eps,
             weight_offset=1.0,
         )
         self.hidden_norm = MlxRMSNorm(
-            _dense_vector(self.model, "mtp.pre_fc_norm_hidden.weight"),
+            _dense_vector(self.model, "predictor.hidden_norm.weight"),
             config.rms_norm_eps,
             weight_offset=1.0,
         )
-        self.fc_embedding = self.model.linear("mtp.fc_embedding.weight")
-        self.fc_hidden = self.model.linear("mtp.fc_hidden.weight")
+        self.fc_embedding = self.model.linear("predictor.fusion.embedding.weight")
+        self.fc_hidden = self.model.linear("predictor.fusion.hidden.weight")
         self.layers = tuple(
             MlxQwen4ExpMtpLayer(
                 self.model,
                 config,
-                f"mtp.layers.{index}",
+                f"predictor.block.{index}",
                 self.max_context,
             )
             for index in range(config.mtp_num_hidden_layers)
@@ -1087,12 +1087,31 @@ class MlxQwen4ExpMtp:
         self.final_mixer = MlxQwen4ExpGatedResidual(
             self.model,
             config,
-            "mtp.hyper_connection_mixer",
+            "predictor.mhc.pre",
             combine=False,
         )
         self.batch = 0
         self.layer_positions = [0] * len(self.layers)
         self.position_caches: list[mx.array | None] = [None] * len(self.layers)
+
+    @classmethod
+    def load_if_present(
+        cls,
+        causal_lm: MlxQwen4Exp,
+        config: Qwen4ExpConfig,
+        *,
+        max_context: int,
+    ) -> MlxQwen4ExpMtp | None:
+        """Attach the native MTP head when the loaded artifact contains it."""
+
+        tensors = causal_lm.model.tensors
+        has_any_weight = any(name.startswith("predictor.") for name in tensors)
+        probe = "predictor.embedding_norm.weight"
+        if config.mtp_num_hidden_layers <= 0 or probe not in tensors:
+            if has_any_weight:
+                raise ValueError("Qwen4-Exp MFQ contains an incomplete or undeclared MTP head")
+            return None
+        return cls(causal_lm.model, config, max_context=max_context)
 
     @classmethod
     def from_mfq(

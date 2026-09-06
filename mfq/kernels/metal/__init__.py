@@ -17,19 +17,6 @@ from mfq.kernels.metal.deepseek_v4 import (
     dsv4_topk512,
 )
 from mfq.kernels.metal.deepseek_v4_hc import dsv4_hc_post, dsv4_hc_pre
-from mfq.kernels.metal.gemma4 import (
-    gemma4_attn_residual_pre_norms,
-    gemma4_ffn_merge,
-)
-from mfq.kernels.metal.glm_dsa import (
-    attention_glm_mla_dense,
-    attention_glm_mla_sparse,
-    glm_dsa_cache_write,
-    glm_dsa_indexer_layer_norm,
-    glm_dsa_indexer_scores,
-    glm_dsa_indexer_scores_decode,
-    glm_interleaved_rope,
-)
 from mfq.kernels.metal.flash_next import (
     glm5_dense_mla_attention,
     glm5_kda_forget_gate,
@@ -46,6 +33,19 @@ from mfq.kernels.metal.flash_next import (
     qwen4_ple_dilated_conv_silu,
     qwen4_sparse_gqa_attention,
 )
+from mfq.kernels.metal.gemma4 import (
+    gemma4_attn_residual_pre_norms,
+    gemma4_ffn_merge,
+)
+from mfq.kernels.metal.glm_dsa import (
+    attention_glm_mla_dense,
+    attention_glm_mla_sparse,
+    glm_dsa_cache_write,
+    glm_dsa_indexer_layer_norm,
+    glm_dsa_indexer_scores,
+    glm_dsa_indexer_scores_decode,
+    glm_interleaved_rope,
+)
 from mfq.kernels.metal.grouped_linear import (
     MetalLinearGroupWeight,
     grouped_linear_matmul,
@@ -60,8 +60,10 @@ from mfq.kernels.metal.kimi_k3 import (
     situ_split,
 )
 from mfq.kernels.metal.linear_attention import (
+    MetalLinearConvQkvParameters,
     gated_delta_net,
     linear_conv_qkv,
+    prepare_linear_conv_qkv,
     ssm_conv_silu,
 )
 from mfq.kernels.metal.moe import (
@@ -161,6 +163,7 @@ __all__ = [
     "MetalTpqMoeWeight",
     "MetalTpqPqWeight",
     "MetalLinearGroupWeight",
+    "MetalLinearConvQkvParameters",
     "MetalMoeWeight",
     "MetalMxWeight",
     "MetalNint8ZeroWeight",
@@ -241,6 +244,7 @@ __all__ = [
     "nint8_zero_mmq",
     "nint8_zero_packed_matmul",
     "nint8_one_quantize_reconstruct",
+    "prepare_linear_conv_qkv",
     "residual_add",
     "residual_rms_norm",
     "rms_norm",

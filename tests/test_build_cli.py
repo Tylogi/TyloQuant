@@ -11,7 +11,6 @@ import pytest
 
 from mfq.commands import build
 
-
 ROOT = Path(__file__).parents[1]
 
 
@@ -132,9 +131,11 @@ def test_cuda_build_plan_is_native_and_does_not_import_or_configure_torch(
 
 
 def test_default_cuda_cmake_target_has_no_python_or_libtorch_dependency() -> None:
-    cmake = (ROOT / "cpp_runtime" / "CMakeLists.txt").read_text(encoding="utf-8")
+    cmake = (ROOT / "cpp_runtime" / "cmake" / "CudaRuntime.cmake").read_text(
+        encoding="utf-8"
+    )
     native_start = cmake.index("add_executable(mfq-decode\n")
-    reference_start = cmake.index("option(\n    MFQ_BUILD_TORCH_REFERENCE_RUNTIME")
+    reference_start = cmake.index("option(MFQ_BUILD_TORCH_REFERENCE_RUNTIME")
     native_target = cmake[native_start:reference_start]
 
     assert "MFQ_NATIVE_CUDA_RUNTIME=1" in native_target
@@ -151,14 +152,16 @@ def test_default_cuda_cmake_target_has_no_python_or_libtorch_dependency() -> Non
 
 
 def test_native_cuda_runtime_compilation_units_do_not_include_torch() -> None:
-    cmake = (ROOT / "cpp_runtime" / "CMakeLists.txt").read_text(encoding="utf-8")
+    cmake = (ROOT / "cpp_runtime" / "cmake" / "CudaRuntime.cmake").read_text(
+        encoding="utf-8"
+    )
     source_block = cmake.split("set(MFQ_CUDA_KERNEL_SOURCES", 1)[1].split(")", 1)[0]
     sources = [
-        ROOT / "cpp_runtime" / "mfq_decode.cpp",
-        ROOT / "cpp_runtime" / "minicpmo45_runtime.inc",
+        ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp",
+        ROOT / "cpp_runtime" / "backends" / "cuda" / "models" / "minicpmo45_runtime.inc",
         *(
             ROOT / "mfq" / "kernels" / "cuda" / name
-            for name in re.findall(r"\.\./mfq/kernels/cuda/([^\s]+\.cu)", source_block)
+            for name in re.findall(r"MFQ_CUDA_KERNEL_ROOT}/([^\s]+\.cu)", source_block)
         ),
     ]
     forbidden = ("<torch", "<ATen", "<c10", "torch::", "at::", "c10::")
@@ -169,31 +172,33 @@ def test_native_cuda_runtime_compilation_units_do_not_include_torch() -> None:
         assert not any(token in source for token in forbidden), source_path
 
     native_start = cmake.index("add_executable(mfq-decode\n")
-    reference_start = cmake.index("option(\n    MFQ_BUILD_TORCH_REFERENCE_RUNTIME")
+    reference_start = cmake.index("option(MFQ_BUILD_TORCH_REFERENCE_RUNTIME")
     assert "mfq_cuda.cpp" not in cmake[native_start:reference_start]
 
 
 def test_native_cuda_cmake_uses_consistent_windows_cuda_settings() -> None:
-    cmake = (ROOT / "cpp_runtime" / "CMakeLists.txt").read_text(encoding="utf-8")
+    cmake = (ROOT / "cpp_runtime" / "cmake" / "CudaRuntime.cmake").read_text(
+        encoding="utf-8"
+    )
 
     assert "--expt-relaxed-constexpr" in cmake
     assert "--extended-lambda" in cmake
-    assert cmake.count("CUDA_RUNTIME_LIBRARY Shared") >= 7
+    assert "function(mfq_add_cuda_test target source)" in cmake
+    assert cmake.count("mfq_add_cuda_test(") >= 3
 
-    activation_start = cmake.index("add_executable(mfq-cuda-activation-test")
-    activation_end = cmake.index(
-        "add_test(NAME mfq-cuda-activation-test", activation_start
-    )
-    activation_target = cmake[activation_start:activation_end]
-    assert "CUDA_STANDARD 20" in activation_target
-    assert "CUDA_STANDARD_REQUIRED ON" in activation_target
+    helper_start = cmake.index("function(mfq_add_cuda_test target source)")
+    helper_end = cmake.index("endfunction()", helper_start)
+    helper = cmake[helper_start:helper_end]
+    assert "CUDA_RUNTIME_LIBRARY Shared" in helper
+    assert "CUDA_STANDARD 20" in helper
+    assert "CUDA_STANDARD_REQUIRED ON" in helper
 
 
 def test_native_cuda_buffer_retains_its_selected_stream() -> None:
-    header = (ROOT / "cpp_runtime" / "cuda" / "mfq_cuda_context.h").read_text(
+    header = (ROOT / "cpp_runtime" / "backends" / "cuda" / "include" / "mfq_cuda_context.h").read_text(
         encoding="utf-8"
     )
-    source = (ROOT / "cpp_runtime" / "cuda" / "mfq_cuda_context.cu").read_text(
+    source = (ROOT / "cpp_runtime" / "backends" / "cuda" / "src" / "mfq_cuda_context.cu").read_text(
         encoding="utf-8"
     )
 

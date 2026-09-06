@@ -21,6 +21,8 @@ from mfq.formats.assets import (
     HF_GENERATION_CONFIG_ASSET,
     HF_TOKENIZER_CONFIG_ASSET,
     HF_TOKENIZER_JSON_ASSET,
+    MODEL_CONFIG_ASSET,
+    MODEL_GRAPH_ASSET,
 )
 from mfq.formats.header import FileHeader
 from mfq.runtime.flash_next_worker import (
@@ -37,7 +39,11 @@ from mfq.runtime.flash_next_worker import (
 )
 from mfq.server.backend import OpenAIChatBackend
 from mfq.server.models import SamplingParams
-from mfq.server.native import NativeRuntime, flash_next_runtime_command
+from mfq.server.native import (
+    NativeRuntime,
+    python_mlx_runtime_command,
+    resolve_runtime_route,
+)
 
 
 def _tiny_tokenizer() -> bytes:
@@ -192,6 +198,8 @@ def _prepare_worker() -> FlashNextTextWorker:
         ("repetition_penalty", 0, "repetition_penalty must be finite"),
         ("seed", -1, "seed must be non-negative"),
         ("seed", 1.25, "seed must be an integer"),
+        ("enable_vision", 1, "enable_vision must be a boolean"),
+        ("enable_mtp", "yes", "enable_mtp must be a boolean"),
     ],
 )
 def test_flash_next_prepare_rejects_invalid_sampling_as_request_errors(
@@ -228,6 +236,8 @@ def test_flash_next_prepare_preserves_default_and_explicit_sampling_values() -> 
             "frequency_penalty": 0.5,
             "repetition_penalty": 1.1,
             "seed": 7,
+            "enable_vision": False,
+            "enable_mtp": False,
         }
     )
 
@@ -242,6 +252,33 @@ def test_flash_next_prepare_preserves_default_and_explicit_sampling_values() -> 
     assert explicit.presence_penalty == -0.25
     assert explicit.frequency_penalty == 0.5
     assert explicit.repetition_penalty == 1.1
+    assert default.enable_vision and default.enable_mtp
+    assert not explicit.enable_vision and not explicit.enable_mtp
+
+
+def test_flash_next_prepare_rejects_media_when_vision_is_manually_disabled() -> None:
+    worker = _prepare_worker()
+    with pytest.raises(FlashNextWorkerError, match="vision is disabled"):
+        worker.prepare(
+            {
+                "model": "Flash",
+                "messages": [{"role": "user", "content": "hello"}],
+                "enable_vision": False,
+                "mfq_multimodal": {},
+            }
+        )
+
+
+def test_worker_family_registry_assigns_every_optional_component_once() -> None:
+    families = {item.family: item for item in worker_module._WORKER_FAMILY_REGISTRY}
+    assert set(families) == {"qwen3_5", "qwen4_exp", "glm5_next"}
+    for registration in families.values():
+        assert callable(registration.parse_config)
+        assert callable(registration.load)
+        assert callable(registration.model_type.from_mfq)
+        assert callable(registration.vision_type.load_if_present)
+        assert callable(registration.mtp_type.load_if_present)
+        assert registration.mtp_supported
 
 
 def test_flash_next_http_rejects_bad_json_and_sampling_with_400() -> None:
@@ -539,7 +576,7 @@ def test_flash_next_multimodal_tensor_contract_rejects_wrong_family_and_nan() ->
 
     payload = {
         "version": 3,
-        "processor": "glm5_next",
+        "processor": "grid_vision.v1",
         "pixel_values": tensor(pixels, "float32"),
         "image_grid_thw": tensor(grid, "int32"),
     }
@@ -547,7 +584,7 @@ def test_flash_next_multimodal_tensor_contract_rejects_wrong_family_and_nan() ->
     np.testing.assert_array_equal(parsed.pixel_values, pixels)
     np.testing.assert_array_equal(parsed.image_grid_thw, grid)
 
-    wrong_family = dict(payload, processor="qwen4_exp")
+    wrong_family = dict(payload, processor="foreign_grid.v1")
     with pytest.raises(RuntimeError, match="does not match"):
         _parse_multimodal_images(wrong_family, config)
     invalid_pixels = pixels.copy()
@@ -586,7 +623,7 @@ def test_flash_next_multimodal_tensor_contract_preserves_mixed_media_order() -> 
 
     payload = {
         "version": 3,
-        "processor": "glm5_next",
+        "processor": "grid_vision.v1",
         "pixel_values": tensor(pixels, "float32"),
         "image_grid_thw": tensor(image_grid, "int32"),
         "video_grid_thw": tensor(video_grid, "int32"),
@@ -742,24 +779,39 @@ def test_flash_next_worker_closes_text_model_when_vision_initialization_fails(
 
     loaded = FakeModel()
 
-    class FakeTextFactory:
-        @staticmethod
-        def from_mfq(*_args, **_kwargs):
+    class FakeModelType:
+        @classmethod
+        def from_mfq(cls, *_args, **_kwargs):
             return loaded
 
-    def fail_vision(*_args, **_kwargs):
-        raise RuntimeError("broken vision fixture")
+    class FailingVision:
+        @classmethod
+        def load_if_present(cls, *_args, **_kwargs):
+            raise RuntimeError("broken vision fixture")
+
+    class EmptyMtp:
+        @classmethod
+        def load_if_present(cls, *_args, **_kwargs):
+            return None
+
+    registration = worker_module._WorkerFamilyRegistration(
+        family="qwen4_exp",
+        aliases=("qwen4_exp",),
+        config_parser=lambda _payload: FakeConfig(),
+        config_type=FakeConfig,
+        model_type=FakeModelType,
+        vision_type=FailingVision,
+        mtp_type=EmptyMtp,
+    )
 
     monkeypatch.setattr(worker_module, "open_mmap", lambda _path: FakeStore())
-    monkeypatch.setattr(worker_module, "parse_flash_next_config", lambda _payload: FakeConfig())
     monkeypatch.setattr(
         worker_module,
         "load_flash_next_tokenizer",
         lambda *_args: (SimpleNamespace(), {}),
     )
-    monkeypatch.setattr(worker_module, "Qwen4ExpConfig", FakeConfig)
-    monkeypatch.setattr(worker_module, "MlxQwen4Exp", FakeTextFactory)
-    monkeypatch.setattr(worker_module, "MlxQwen4ExpVision", fail_vision)
+    monkeypatch.setattr(worker_module, "_worker_family_for_payload", lambda _payload: registration)
+    monkeypatch.setattr(worker_module, "_worker_family_for_config", lambda _config: registration)
 
     with pytest.raises(RuntimeError, match="broken vision fixture"):
         FlashNextTextWorker.from_mfq(
@@ -771,8 +823,8 @@ def test_flash_next_worker_closes_text_model_when_vision_initialization_fails(
     assert loaded.closed
 
 
-def test_flash_next_runtime_command_reenters_mfq_cli() -> None:
-    command = flash_next_runtime_command(
+def test_python_mlx_runtime_command_reenters_mfq_cli(tmp_path: Path) -> None:
+    command = python_mlx_runtime_command(
         ("python", "-m", "mfq.cli"),
         model="model.mfq",
         model_name="Flash",
@@ -798,9 +850,35 @@ def test_flash_next_runtime_command_reenters_mfq_cli() -> None:
         "--prefill-chunk-size",
         "2048",
     ]
+    model = tmp_path / "glm5.mfq"
+    io.save(
+        model,
+        FileHeader(version=2, model_arch="legacy-name-is-ignored"),
+        {
+            MODEL_GRAPH_ASSET: json.dumps(
+                {
+                    "schema_version": 1,
+                    "architecture": "glm5_next",
+                    "graph": {"kind": "causal_lm", "backbone": "glm5_next"},
+                    "components": [
+                        {
+                            "kind": "text",
+                            "tensor_root": "model",
+                            "implementation": "glm5_next",
+                        }
+                    ],
+                    "canonical_naming": {
+                        "namespace": "mfq.tensor",
+                        "version": 1,
+                        "component_roots": ["model"],
+                    },
+                }
+            ).encode(),
+        },
+    )
     runtime = NativeRuntime(
         executable=Path("/runtime/mfq-decode-metal"),
-        model=Path("/models/flash.mfq"),
+        model=model,
         model_name="Flash",
         backend="metal",
         context_size=4096,
@@ -809,6 +887,63 @@ def test_flash_next_runtime_command_reenters_mfq_cli() -> None:
     )
     assert runtime.command(9001)[0:2] == ["mfq-cli", "_flash-next-worker"]
     assert "--server" not in runtime.command(9001)
+
+
+def test_runtime_route_uses_graph_backbone_and_native_qwen_components(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "qwen35-vl.mfq"
+    io.save(
+        model,
+        FileHeader(version=2, model_arch="qwen3_5-hf-full-mfq"),
+        {
+            MODEL_CONFIG_ASSET: json.dumps(
+                {
+                    "model_type": "qwen3_5",
+                    "language_model_only": False,
+                    "vision_config": {"model_type": "qwen3_5"},
+                }
+            ).encode(),
+            "model.visual.patch_embed.proj.weight": np.ones((1,), dtype=np.float16),
+        },
+    )
+
+    route = resolve_runtime_route("qwen3_5-hf-full-mfq", model)
+    assert route.architecture_family == "qwen3_5"
+    assert route.backbone == "qwen3_5"
+    assert route.vision_available
+    assert not route.python_mlx_worker
+    assert not route.requires_mfq
+    runtime = NativeRuntime(
+        executable=Path("/runtime/mfq-decode-metal"),
+        model=model,
+        model_name="Qwen3.5-VL",
+        backend="metal",
+        context_size=4096,
+        architecture="qwen3_5-hf-full-mfq",
+        controller_command=("mfq-cli",),
+    )
+    assert runtime.command(9002)[0] == "/runtime/mfq-decode-metal"
+    assert "--server" in runtime.command(9002)
+
+    text_only = tmp_path / "qwen35-text.mfq"
+    io.save(
+        text_only,
+        FileHeader(version=2, model_arch="qwen3_5-hf-full-mfq"),
+        {
+            MODEL_CONFIG_ASSET: b'{"model_type":"qwen3_5","language_model_only":true}',
+            "weight": np.ones((1,), dtype=np.float16),
+        },
+    )
+    route = resolve_runtime_route("qwen3_5-hf-full-mfq", text_only)
+    assert not route.vision_available
+    assert not route.python_mlx_worker
+    assert not route.requires_mfq
+
+    flash_next = resolve_runtime_route("glm5_next-hf-mfq-nint-recipe", text_only)
+    assert flash_next.architecture_family == "qwen3_5"
+    assert not flash_next.python_mlx_worker
+    assert not flash_next.requires_mfq
 
 
 class _FakeWorker:
@@ -874,6 +1009,15 @@ class _FakeWorker:
             "generation_ms": 3.0,
             "complete_generation_ms": 3.0,
             "generation_tps": 333.3,
+            "mtp_available": True,
+            "mtp_used": True,
+            "mtp_cycles": 1,
+            "mtp_drafted_tokens": 1,
+            "mtp_accepted_tokens": 1,
+            "mtp_acceptance_rate": 1.0,
+            "mtp_target_ms": 0.4,
+            "mtp_head_ms": 0.2,
+            "mtp_rollback_ms": 0.0,
             "sampling": sampling,
         }
         return _GenerationSummary(
@@ -923,6 +1067,9 @@ def test_flash_next_worker_protocol_matches_common_backend() -> None:
             assert (
                 next(delta.performance for delta in deltas if delta.performance).decode_tps == 1000
             )
+            performance = next(delta.performance for delta in deltas if delta.performance)
+            assert performance.mtp_used
+            assert performance.mtp_accepted_tokens == 1
             assert await backend.cancel_response("session")
         finally:
             await client.aclose()

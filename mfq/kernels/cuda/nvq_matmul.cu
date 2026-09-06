@@ -10,7 +10,7 @@
 // path expands only one 64x96 fp16 weight tile at a time for Tensor Core GEMM.
 
 #include <cuda_runtime.h>
-#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
+#include "mfq_tensor_backend.h"
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <algorithm>

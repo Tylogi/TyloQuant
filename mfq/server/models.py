@@ -196,6 +196,8 @@ class SamplingParams(ProtocolModel):
     repetition_penalty: float = Field(default=1.0, gt=0.0)
     seed: int | None = Field(default=None, ge=0)
     enable_thinking: bool = True
+    enable_vision: bool = True
+    enable_mtp: bool = True
     reasoning_effort: str | None = Field(default=None, min_length=1, max_length=32)
 
 
@@ -380,6 +382,15 @@ class ResponsePerformance(ProtocolModel):
     generation_ms: float = Field(ge=0.0)
     complete_generation_ms: float = Field(default=0.0, ge=0.0)
     generation_tps: float = Field(ge=0.0)
+    mtp_available: bool = False
+    mtp_used: bool = False
+    mtp_cycles: int = Field(default=0, ge=0)
+    mtp_drafted_tokens: int = Field(default=0, ge=0)
+    mtp_accepted_tokens: int = Field(default=0, ge=0)
+    mtp_acceptance_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    mtp_target_ms: float = Field(default=0.0, ge=0.0)
+    mtp_head_ms: float = Field(default=0.0, ge=0.0)
+    mtp_rollback_ms: float = Field(default=0.0, ge=0.0)
     sampling: SamplingParams
 
 
@@ -916,6 +927,7 @@ class ModelFeatureSet(ProtocolModel):
     audio_input: bool = False
     audio_output: bool = False
     full_duplex: bool = False
+    mtp: bool = False
 
 
 class ModelCapabilities(ProtocolModel):
@@ -928,6 +940,8 @@ class RuntimeCapabilitiesResource(ProtocolModel):
     model: str = Field(min_length=1, max_length=255)
     model_type: str = Field(min_length=1, max_length=128)
     model_capabilities: ModelCapabilities
+    vision_available: bool = False
+    mtp_available: bool = False
     duplex_available: bool = False
 
 

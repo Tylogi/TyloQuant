@@ -9,12 +9,12 @@ APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
 )
 
 
-def test_conversation_titles_can_be_renamed_and_persisted() -> None:
-    assert "const [renamingId, setRenamingId]" in APP
-    assert "const [renameValue, setRenameValue]" in APP
-    assert "async function saveRename(session: Session)" in APP
-    assert "api.updateSession(session.id, { title: title || null })" in APP
-    assert "setRenamingId(null)" in APP
+def test_simplified_chat_can_clear_and_replace_the_active_session() -> None:
+    assert "async function clearActiveConversation()" in APP
+    assert "const replacement = await api.createSession(active.model, active.mode)" in APP
+    assert "await api.deleteSession(active.id)" in APP
+    assert "setActiveId(replacement.id)" in APP
+    assert "setMessages([])" in APP
 
 
 def test_user_and_assistant_messages_can_be_edited() -> None:
@@ -48,7 +48,8 @@ def test_stop_generation_cancels_the_server_before_aborting_the_stream() -> None
 
 def test_generation_keeps_the_latest_user_language_consistent() -> None:
     assert "LANGUAGE_CONSISTENCY_PROMPT" in APP
-    assert "answer entirely in the language of the user's latest text" in APP
+    assert "use that language exclusively for every sentence and heading" in APP
+    assert "Never insert Chinese words into an English answer" in APP
     assert ".join(\"\\n\\n\")" in APP
 
 

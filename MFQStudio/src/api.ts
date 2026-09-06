@@ -97,6 +97,8 @@ export interface SamplingParams {
   repetition_penalty: number;
   seed?: number | null;
   enable_thinking: boolean;
+  enable_vision: boolean;
+  enable_mtp: boolean;
   reasoning_effort?: string | null;
 }
 
@@ -115,6 +117,15 @@ export interface ResponsePerformance {
   generation_ms: number;
   complete_generation_ms: number;
   generation_tps: number;
+  mtp_available?: boolean;
+  mtp_used?: boolean;
+  mtp_cycles?: number;
+  mtp_drafted_tokens?: number;
+  mtp_accepted_tokens?: number;
+  mtp_acceptance_rate?: number;
+  mtp_target_ms?: number;
+  mtp_head_ms?: number;
+  mtp_rollback_ms?: number;
   sampling: SamplingParams;
 }
 
@@ -168,6 +179,7 @@ export interface ModelFeatureSet {
   audio_input: boolean;
   audio_output: boolean;
   full_duplex: boolean;
+  mtp: boolean;
 }
 
 export interface ModelCapabilities {
@@ -180,6 +192,8 @@ export interface RuntimeCapabilities {
   model: string;
   model_type: string;
   model_capabilities: ModelCapabilities;
+  vision_available: boolean;
+  mtp_available: boolean;
   duplex_available: boolean;
 }
 

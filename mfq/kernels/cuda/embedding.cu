@@ -3,7 +3,7 @@
 // NINT path: selected-row dequant from compressed token embedding rows.
 
 #include <cuda_fp16.h>
-#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
+#include "mfq_tensor_backend.h"
 #include <cuda_runtime.h>
 
 template <int BITS>

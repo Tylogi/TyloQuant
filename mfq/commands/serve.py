@@ -224,7 +224,7 @@ def _run(args: argparse.Namespace) -> int:
     from mfq.server.cluster import ClusterBackend
     from mfq.server.components import VoiceOutputComponent
     from mfq.server.jobs import JobManager
-    from mfq.server.native import NativeRuntime, is_flash_next_architecture
+    from mfq.server.native import NativeRuntime, resolve_runtime_route
     from mfq.server.runtime_pool import ManagedRuntimePool
     from mfq.server.service import ServerService
     from mfq.server.storage import SessionStore
@@ -283,13 +283,16 @@ def _run(args: argparse.Namespace) -> int:
         )
         if model is not None:
             initial_artifact = asyncio.run(catalog.resolve_path(model))
+            runtime_route = resolve_runtime_route(
+                initial_artifact.resource.architecture,
+                initial_artifact.path,
+            )
             if (
-                is_flash_next_architecture(initial_artifact.resource.architecture)
+                runtime_route.requires_mfq
                 and initial_artifact.resource.format != "mfq"
             ):
                 raise RuntimeError(
-                    "Qwen3.8-Flash-Next and GLM-5.3-Flash HF checkpoints must be "
-                    "converted to MFQ before inference"
+                    "this Python MLX architecture must be converted to MFQ before inference"
                 )
             runtime = NativeRuntime(
                 executable=executable,

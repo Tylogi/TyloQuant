@@ -36,12 +36,12 @@ _REGISTRY = (
     _CapabilityRegistration(
         family="deepseek_v4",
         aliases=("deepseek_v4",),
-        features=ModelFeatureSet(text=True),
+        features=ModelFeatureSet(text=True, mtp=True),
     ),
     _CapabilityRegistration(
         family="deepseek_v4",
         aliases=("deepseek_v4_vision",),
-        features=ModelFeatureSet(text=True, image_input=True),
+        features=ModelFeatureSet(text=True, image_input=True, mtp=True),
     ),
     _CapabilityRegistration(
         family="glm_dsa",
@@ -55,18 +55,37 @@ _REGISTRY = (
     ),
     _CapabilityRegistration(
         family="qwen3_5",
-        aliases=("qwen3_5", "qwen3_5_text"),
-        features=ModelFeatureSet(),
+        aliases=("qwen3_5", "qwen35"),
+        features=ModelFeatureSet(
+            image_input=True,
+            video_input=True,
+            mtp=True,
+        ),
+    ),
+    _CapabilityRegistration(
+        family="qwen3_5",
+        aliases=("qwen3_5_text",),
+        features=ModelFeatureSet(mtp=True),
     ),
     _CapabilityRegistration(
         family="qwen4_exp",
         aliases=("qwen4_exp", "qwen4_exp_text"),
-        features=ModelFeatureSet(text=True, image_input=True, video_input=True),
+        features=ModelFeatureSet(
+            text=True,
+            image_input=True,
+            video_input=True,
+            mtp=True,
+        ),
     ),
     _CapabilityRegistration(
         family="glm5_next",
         aliases=("glm5_next", "glm5_next_text"),
-        features=ModelFeatureSet(text=True, image_input=True, video_input=True),
+        features=ModelFeatureSet(
+            text=True,
+            image_input=True,
+            video_input=True,
+            mtp=True,
+        ),
     ),
 )
 

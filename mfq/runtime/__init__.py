@@ -39,6 +39,7 @@ if TYPE_CHECKING:
         MlxCausalLMNames,
         MlxFullAttentionBlock,
         MlxQwen35LinearAttentionBlock,
+        MlxQwen35Mtp,
     )
     from mfq.runtime.mlx_deepseek_v4 import (
         MlxDeepseekV4,
@@ -179,6 +180,7 @@ _MLX_CAUSAL_LM_EXPORTS = {
     "MlxCausalLMConfig",
     "MlxCausalLMNames",
     "MlxFullAttentionBlock",
+    "MlxQwen35Mtp",
     "MlxQwen35LinearAttentionBlock",
 }
 _MLX_TPQ_EXPORTS = {
@@ -391,6 +393,7 @@ __all__ = [
     "MlxGlm5NextNames",
     "MlxGlm5NextSparseAttention",
     "MlxQwen35LinearAttentionBlock",
+    "MlxQwen35Mtp",
     "MlxQwen4Exp",
     "MlxQwen4ExpDenseFFN",
     "MlxQwen4ExpGatedResidual",

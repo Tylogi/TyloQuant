@@ -1,29 +1,29 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DECODE = (ROOT / "cpp_runtime" / "mfq_decode.cpp").read_text(encoding="utf-8")
-METAL_DECODE = (ROOT / "cpp_runtime" / "metal" / "mfq_decode_mlx.cpp").read_text(
+DECODE = (ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp").read_text(encoding="utf-8")
+METAL_DECODE = (ROOT / "cpp_runtime" / "backends" / "metal" / "apps" / "mfq_decode_mlx.cpp").read_text(
     encoding="utf-8"
 )
 METAL_QWEN = (
-    ROOT / "cpp_runtime" / "metal" / "mlx_qwen35_causal_lm.cpp"
+    ROOT / "cpp_runtime" / "backends" / "metal" / "models/qwen35" / "mlx_qwen35_causal_lm.cpp"
 ).read_text(encoding="utf-8")
 METAL_DSV4 = (
-    ROOT / "cpp_runtime" / "metal" / "mlx_deepseek_v4_causal_lm.cpp"
+    ROOT / "cpp_runtime" / "backends" / "metal" / "models/deepseek_v4" / "mlx_deepseek_v4_causal_lm.cpp"
 ).read_text(encoding="utf-8")
 METAL_MINICPM = (
-    ROOT / "cpp_runtime" / "metal" / "mlx_minicpmo45.cpp"
+    ROOT / "cpp_runtime" / "backends" / "metal" / "models/minicpmo45" / "mlx_minicpmo45.cpp"
 ).read_text(encoding="utf-8")
-SERVER = (ROOT / "cpp_runtime" / "mfq_server.cpp").read_text(encoding="utf-8")
-HEADER = (ROOT / "cpp_runtime" / "mfq_server.h").read_text(encoding="utf-8")
-PAGED_HEADER = (ROOT / "cpp_runtime" / "mfq_paged_prefix_cache.h").read_text(
+SERVER = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(encoding="utf-8")
+HEADER = (ROOT / "cpp_runtime" / "server" / "include" / "mfq" / "server.h").read_text(encoding="utf-8")
+PAGED_HEADER = (ROOT / "cpp_runtime" / "core" / "mfq_paged_prefix_cache.h").read_text(
     encoding="utf-8"
 )
-PAGED_SOURCE = (ROOT / "cpp_runtime" / "mfq_paged_prefix_cache.cpp").read_text(
+PAGED_SOURCE = (ROOT / "cpp_runtime" / "core" / "mfq_paged_prefix_cache.cpp").read_text(
     encoding="utf-8"
 )
 METAL_PAGED_CODEC = (
-    ROOT / "cpp_runtime" / "metal" / "mlx_paged_session_codec.cpp"
+    ROOT / "cpp_runtime" / "backends" / "metal" / "runtime" / "mlx_paged_session_codec.cpp"
 ).read_text(encoding="utf-8")
 
 

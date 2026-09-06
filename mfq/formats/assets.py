@@ -18,14 +18,13 @@ import numpy as np
 
 ASSET_PREFIX = "__mfq_asset__/"
 MODEL_CONFIG_ASSET = ASSET_PREFIX + "model_config.json"
+MODEL_GRAPH_ASSET = ASSET_PREFIX + "model_graph.json"
 TOKENIZER_GGUF_ASSET = ASSET_PREFIX + "tokenizer.gguf"
 HF_TOKENIZER_JSON_ASSET = ASSET_PREFIX + "hf/tokenizer.json"
 HF_TOKENIZER_CONFIG_ASSET = ASSET_PREFIX + "hf/tokenizer_config.json"
 HF_CHAT_TEMPLATE_ASSET = ASSET_PREFIX + "hf/chat_template.jinja"
 HF_GENERATION_CONFIG_ASSET = ASSET_PREFIX + "hf/generation_config.json"
-MINICPMO45_RESAMPLER_POS_EMBED_ASSET = (
-    ASSET_PREFIX + "minicpmo45-resampler-pos-embed-v1.bf16"
-)
+MINICPMO45_RESAMPLER_POS_EMBED_ASSET = ASSET_PREFIX + "minicpmo45-resampler-pos-embed-v1.bf16"
 ASSET_DTYPE = "BLOB"
 ASSET_MANIFEST_KEY = "runtime_assets"
 
@@ -54,9 +53,7 @@ def is_asset_record(name: str) -> bool:
 
 def model_config_asset(config: dict[str, Any] | bytes | str) -> RuntimeAsset:
     if isinstance(config, dict):
-        data = json.dumps(
-            config, ensure_ascii=False, separators=(",", ":")
-        ).encode("utf-8")
+        data = json.dumps(config, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     elif isinstance(config, str):
         data = config.encode("utf-8")
     else:
@@ -67,8 +64,33 @@ def model_config_asset(config: dict[str, Any] | bytes | str) -> RuntimeAsset:
     return RuntimeAsset(MODEL_CONFIG_ASSET, "application/json", data)
 
 
+def model_graph_asset(graph: dict[str, Any] | bytes | str) -> RuntimeAsset:
+    """Serialize the canonical, source-name-free runtime graph contract."""
+
+    if isinstance(graph, dict):
+        data = json.dumps(
+            graph,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    elif isinstance(graph, str):
+        data = graph.encode("utf-8")
+    else:
+        data = bytes(graph)
+    parsed = json.loads(data)
+    if not isinstance(parsed, dict):
+        raise ValueError("model graph must be a JSON object")
+    if int(parsed.get("schema_version", 0) or 0) <= 0:
+        raise ValueError("model graph must declare a positive schema_version")
+    naming = parsed.get("canonical_naming")
+    if not isinstance(naming, dict) or not naming.get("namespace"):
+        raise ValueError("model graph must declare canonical_naming.namespace")
+    return RuntimeAsset(MODEL_GRAPH_ASSET, "application/vnd.mfq.model-graph+json", data)
+
+
 def hf_runtime_assets(source: str | Path) -> tuple[RuntimeAsset, ...]:
-    """Embed the dependency-light HF files needed by Python MLX workers.
+    """Embed dependency-light HF tokenizer and generation metadata.
 
     The native C++ runtime consumes the compact tokenizer-only GGUF. New
     architecture workers use the original Tokenizers JSON and chat template,
@@ -111,13 +133,11 @@ def hf_runtime_assets(source: str | Path) -> tuple[RuntimeAsset, ...]:
         path = root / filename
         if not path.is_file():
             if required:
-                raise FileNotFoundError(
-                    f"Flash-Next runtime asset is missing: {path}"
-                )
+                raise FileNotFoundError(f"HF runtime asset is missing: {path}")
             continue
         data = path.read_bytes()
         if not data:
-            raise ValueError(f"Flash-Next runtime asset is empty: {path}")
+            raise ValueError(f"HF runtime asset is empty: {path}")
         if filename.endswith(".json"):
             json.loads(data)
         else:
@@ -183,16 +203,11 @@ def gguf_metadata_asset(reader: Any) -> RuntimeAsset:
     is changed to zero and the tensor-info/data sections are omitted.
     """
 
-    fields = [
-        field
-        for name, field in reader.fields.items()
-        if not str(name).startswith("GGUF.")
-    ]
+    fields = [field for name, field in reader.fields.items() if not str(name).startswith("GGUF.")]
     if not fields:
         raise ValueError("GGUF contains no metadata fields")
     kv_end = max(
-        int(field.offset) + sum(int(part.nbytes) for part in field.parts)
-        for field in fields
+        int(field.offset) + sum(int(part.nbytes) for part in field.parts) for field in fields
     )
     if kv_end <= 24:
         raise ValueError(f"invalid GGUF metadata boundary: {kv_end}")
@@ -212,8 +227,7 @@ def runtime_asset_manifest(
     return {
         "version": 1,
         "assets": {
-            asset.name.removeprefix(ASSET_PREFIX): asset.manifest_entry()
-            for asset in assets
+            asset.name.removeprefix(ASSET_PREFIX): asset.manifest_entry() for asset in assets
         },
     }
 
@@ -228,5 +242,7 @@ def discover_model_config(
             raise FileNotFoundError(f"model config does not exist: {path}")
         return path
     source_path = Path(source).resolve()
-    candidate = source_path / "config.json" if source_path.is_dir() else source_path.parent / "config.json"
+    candidate = (
+        source_path / "config.json" if source_path.is_dir() else source_path.parent / "config.json"
+    )
     return candidate if candidate.is_file() else None

@@ -2,7 +2,7 @@
 // Layout: k/v input [B, H, T, D], cache [B, H, max_seq, D].
 
 #include <cuda_runtime.h>
-#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
+#include "mfq_tensor_backend.h"
 #include <algorithm>
 #include <cstdint>
 #include <vector>

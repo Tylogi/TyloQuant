@@ -473,9 +473,10 @@ def test_executable_api_persists_nonstream_text_responses(tmp_path: Path) -> Non
                 "image_input": True,
                 "video_input": True,
                 "audio_input": True,
-                "audio_output": True,
-                "full_duplex": True,
-            }
+                    "audio_output": True,
+                    "full_duplex": True,
+                    "mtp": False,
+                }
             assert capabilities.json()["duplex_available"] is True
             status = await client.get("/api/v1/runtime/status")
             assert status.json()["max_context"] == 8192

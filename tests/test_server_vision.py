@@ -21,6 +21,7 @@ from mfq.server.vision import (
     Glm5NextVisionProcessor,
     MiniCPMO45VisionProcessor,
     Qwen4ExpVisionProcessor,
+    Qwen35VisionProcessor,
     _DecodedVideo,
     _PreparedVideoFrame,
     multimodal_processor_for_architecture,
@@ -443,7 +444,10 @@ def test_multimodal_processor_registry_is_architecture_specific() -> None:
         multimodal_processor_for_architecture("glm5-next"),
         Glm5NextVisionProcessor,
     )
-    assert multimodal_processor_for_architecture("qwen3_5") is None
+    assert isinstance(
+        multimodal_processor_for_architecture("qwen3_5"),
+        Qwen35VisionProcessor,
+    )
 
 
 def test_image_request_matches_official_slice_and_tensor_contract() -> None:

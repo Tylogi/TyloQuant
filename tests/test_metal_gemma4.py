@@ -11,6 +11,7 @@ try:
 except RuntimeError:
     pytest.skip("Metal device unavailable", allow_module_level=True)
 
+from mfq.architectures.tensor_schema import map_source_tensor_name  # noqa: E402
 from mfq.formats import io  # noqa: E402
 from mfq.formats.assets import MODEL_CONFIG_ASSET, model_config_asset  # noqa: E402
 from mfq.formats.header import FileHeader  # noqa: E402
@@ -298,7 +299,20 @@ def _gemma4_model() -> MlxGemma4:
                 kv_heads * head_dim,
                 config.hidden_size,
             )
-    return MlxGemma4(tensors, config)
+    source_config = {
+        "model_type": "gemma4_text",
+        "num_hidden_layers": config.num_hidden_layers,
+    }
+    canonical = {}
+    for source_name, value in tensors.items():
+        mapping = map_source_tensor_name(
+            source_name,
+            source_config,
+            require_registered=True,
+        )
+        assert mapping is not None
+        canonical[mapping.canonical_name] = value
+    return MlxGemma4(canonical, config)
 
 
 def test_gemma4_full_graph_prefill_decode_and_generation():

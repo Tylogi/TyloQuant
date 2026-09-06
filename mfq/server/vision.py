@@ -23,6 +23,8 @@ from typing import Any, Protocol
 
 import numpy as np
 
+from mfq.architectures.tensor_schema import GRID_VISION_INPUT_CONTRACT
+
 
 class VisionProcessingError(ValueError):
     pass
@@ -932,6 +934,9 @@ class _FlashNextImageProcessor:
     """Dependency-light image/video preprocessing for the new VLM families."""
 
     processor_name = ""
+    # Normalized patches and THW grids share one wire contract even though
+    # image normalization and prompt markers remain family adapters.
+    input_contract = GRID_VISION_INPUT_CONTRACT
     patch_size = 0
     temporal_patch_size = 2
     merge_size = 2
@@ -1209,12 +1214,12 @@ class _FlashNextImageProcessor:
         if use_binary_file:
             tensors, path = MiniCPMO45VisionProcessor._binary_tensors(values)
             tensors["version"] = 3
-            tensors["processor"] = cls.processor_name
+            tensors["processor"] = cls.input_contract
             return tensors, (path,)
         return (
             {
                 "version": 3,
-                "processor": cls.processor_name,
+                "processor": cls.input_contract,
                 **{
                     name: MiniCPMO45VisionProcessor._tensor(value, dtype)
                     for name, value, dtype in values
@@ -1470,6 +1475,12 @@ class Qwen4ExpVisionProcessor(_FlashNextImageProcessor):
         if len(timestamps) != grid[0]:
             raise VisionProcessingError("Qwen4-Exp video timestamps disagree with temporal grid")
         return pixel_values, grid, placeholder
+
+
+class Qwen35VisionProcessor(Qwen4ExpVisionProcessor):
+    """Qwen3.5-VL media contract; tensor geometry matches Qwen's shared tower."""
+
+    processor_name = "qwen3_5"
 
 
 class Glm5NextVisionProcessor(_FlashNextImageProcessor):
@@ -1964,6 +1975,8 @@ def multimodal_processor_for_architecture(
         return DeepseekV4VisionProcessor()
     if identity in {"qwen4_exp", "qwen4_exp_text"}:
         return Qwen4ExpVisionProcessor(avfoundation_library=avfoundation_library)
+    if identity in {"qwen3_5", "qwen3_5_text", "qwen35"}:
+        return Qwen35VisionProcessor(avfoundation_library=avfoundation_library)
     if identity in {"glm5_next", "glm5_next_text"}:
         return Glm5NextVisionProcessor(avfoundation_library=avfoundation_library)
     return None
@@ -1976,6 +1989,7 @@ __all__ = [
     "MultimodalProcessor",
     "ProcessedVisionRequest",
     "Qwen4ExpVisionProcessor",
+    "Qwen35VisionProcessor",
     "VisionProcessingError",
     "multimodal_processor_for_architecture",
 ]

@@ -2,23 +2,29 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SERVER = (ROOT / "cpp_runtime" / "mfq_server.cpp").read_text(
+SERVER = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(
     encoding="utf-8"
 )
-DECODE = (ROOT / "cpp_runtime" / "mfq_decode.cpp").read_text(
+DECODE = (ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp").read_text(
     encoding="utf-8"
 )
 CMAKE = (ROOT / "cpp_runtime" / "CMakeLists.txt").read_text(
     encoding="utf-8"
 )
+TOKENIZER_CMAKE = (
+    ROOT / "cpp_runtime" / "components" / "tokenizer" / "CMakeLists.txt"
+).read_text(encoding="utf-8")
+SERVER_CMAKE = (
+    ROOT / "cpp_runtime" / "server" / "CMakeLists.txt"
+).read_text(encoding="utf-8")
 METAL_CMAKE = (
-    ROOT / "cpp_runtime" / "metal" / "CMakeLists.txt"
+    ROOT / "cpp_runtime" / "backends" / "metal" / "CMakeLists.txt"
 ).read_text(encoding="utf-8")
 METAL_DECODE = (
-    ROOT / "cpp_runtime" / "metal" / "mfq_decode_mlx.cpp"
+    ROOT / "cpp_runtime" / "backends" / "metal" / "apps" / "mfq_decode_mlx.cpp"
 ).read_text(encoding="utf-8")
 METAL_DSV4 = (
-    ROOT / "cpp_runtime" / "metal" / "mlx_deepseek_v4_causal_lm.cpp"
+    ROOT / "cpp_runtime" / "backends" / "metal" / "models/deepseek_v4" / "mlx_deepseek_v4_causal_lm.cpp"
 ).read_text(encoding="utf-8")
 STUDIO_APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
     encoding="utf-8"
@@ -27,10 +33,10 @@ STUDIO_API = (ROOT / "MFQStudio" / "src" / "api.ts").read_text(
     encoding="utf-8"
 )
 TEXT_CHAT = (
-    ROOT / "cpp_runtime" / "text" / "chat" / "chat.cpp"
+    ROOT / "cpp_runtime" / "components" / "tokenizer" / "chat" / "chat.cpp"
 ).read_text(encoding="utf-8")
 TEXT_CHAT_H = (
-    ROOT / "cpp_runtime" / "text" / "chat" / "chat.h"
+    ROOT / "cpp_runtime" / "components" / "tokenizer" / "chat" / "chat.h"
 ).read_text(encoding="utf-8")
 def _section(text: str, start: str, end: str) -> str:
     start_index = text.index(start)
@@ -42,7 +48,7 @@ def test_cpp_runtime_dependencies_are_integrated() -> None:
     assert not (ROOT / "third_party").exists()
     assert not (ROOT / "cpp_runtime" / "llama").exists()
     active_roots = [
-        ROOT / "cpp_runtime" / "text",
+        ROOT / "cpp_runtime" / "components" / "tokenizer",
         ROOT / "mfq" / "kernels" / "cuda",
     ]
     assert not [
@@ -57,11 +63,11 @@ def test_cpp_runtime_dependencies_are_integrated() -> None:
         if path.suffix in {".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp"}
     )
     assert re.search(r"\b(?:llama_|LLAMA_|MFQ_LLAMA)", active_source) is None
-    assert (ROOT / "cpp_runtime" / "text" / "include" / "mfq_text.h").is_file()
-    assert not (ROOT / "cpp_runtime" / "text" / "include" / "llama.h").exists()
-    assert (ROOT / "cpp_runtime" / "text" / "CMakeLists.txt").is_file()
-    assert (ROOT / "cpp_runtime" / "http" / "httplib.cpp").is_file()
-    assert (ROOT / "cpp_runtime" / "json" / "nlohmann" / "json.hpp").is_file()
+    assert (ROOT / "cpp_runtime" / "components" / "tokenizer" / "include" / "mfq_text.h").is_file()
+    assert not (ROOT / "cpp_runtime" / "components" / "tokenizer" / "include" / "llama.h").exists()
+    assert (ROOT / "cpp_runtime" / "components" / "tokenizer" / "CMakeLists.txt").is_file()
+    assert (ROOT / "cpp_runtime" / "components" / "http" / "httplib.cpp").is_file()
+    assert (ROOT / "cpp_runtime" / "components" / "json" / "nlohmann" / "json.hpp").is_file()
     assert (ROOT / "NOTICE").is_file()
     assert "third_party" not in CMAKE
 
@@ -105,9 +111,10 @@ def test_native_server_cancels_active_session_generation_per_token() -> None:
 
 
 def test_server_links_integrated_text_runtime() -> None:
-    assert 'set(MFQ_TEXT_SOURCE_DIR' in CMAKE
-    assert 'add_subdirectory(text EXCLUDE_FROM_ALL)' in CMAKE
-    assert "mfq-text-runtime" in CMAKE
+    assert "add_subdirectory(components/tokenizer)" in CMAKE
+    assert "add_library(mfq-tokenizer STATIC" in TOKENIZER_CMAKE
+    assert "add_library(mfq-text-runtime ALIAS mfq-tokenizer)" in TOKENIZER_CMAKE
+    assert "mfq-tokenizer" in SERVER_CMAKE
     assert "BUILD_WITH_INSTALL_RPATH ON" in METAL_CMAKE
 
 

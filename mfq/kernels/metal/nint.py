@@ -312,6 +312,126 @@ _NINT4_SWIGLU_SOURCE = r"""
     }
 """
 
+# Single-row NINT4 SwiGLU tuned for the byte-aligned GS24 decode path. Eight
+# SIMD groups produce sixteen output rows per threadgroup and reuse each
+# activation load across both gate/up and two output rows.
+_NINT4_SWIGLU_DECODE_SOURCE = r"""
+    constexpr uint SIMD_GROUPS = 8u;
+    constexpr uint OUTPUTS_PER_SIMD = 2u;
+    constexpr uint OUTPUTS_PER_TG = SIMD_GROUPS * OUTPUTS_PER_SIMD;
+
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint output_base =
+        threadgroup_position_in_grid.x * OUTPUTS_PER_TG
+        + simd_group * OUTPUTS_PER_SIMD;
+
+    float gate_acc[OUTPUTS_PER_SIMD] = {0.0f};
+    float up_acc[OUTPUTS_PER_SIMD] = {0.0f};
+    uint outputs[OUTPUTS_PER_SIMD];
+    for (uint row = 0u; row < OUTPUTS_PER_SIMD; ++row) {
+        outputs[row] = min(output_base + row, uint(OUT) - 1u);
+    }
+
+    for (uint group = lane; group < uint(NG); group += 32u) {
+        uint column_base = group * uint(GS);
+        float activation_sum = 0.0f;
+        float gate_quantized_dots[OUTPUTS_PER_SIMD] = {0.0f};
+        float up_quantized_dots[OUTPUTS_PER_SIMD] = {0.0f};
+        for (uint element = 0u; element < uint(GS); element += 8u) {
+            uint column = column_base + element;
+            float4 activation0 = float4(0.0f);
+            float4 activation1 = float4(0.0f);
+            if (column + 7u < uint(K)) {
+                activation0 = float4(*(device const half4*)(x + column));
+                activation1 = float4(*(device const half4*)(x + column + 4u));
+            } else {
+                activation0.x = column < uint(K) ? float(x[column]) : 0.0f;
+                activation0.y = column + 1u < uint(K)
+                    ? float(x[column + 1u]) : 0.0f;
+                activation0.z = column + 2u < uint(K)
+                    ? float(x[column + 2u]) : 0.0f;
+                activation0.w = column + 3u < uint(K)
+                    ? float(x[column + 3u]) : 0.0f;
+                activation1.x = column + 4u < uint(K)
+                    ? float(x[column + 4u]) : 0.0f;
+                activation1.y = column + 5u < uint(K)
+                    ? float(x[column + 5u]) : 0.0f;
+                activation1.z = column + 6u < uint(K)
+                    ? float(x[column + 6u]) : 0.0f;
+                activation1.w = column + 7u < uint(K)
+                    ? float(x[column + 7u]) : 0.0f;
+            }
+            activation_sum += activation0.x + activation0.y;
+            activation_sum += activation0.z + activation0.w;
+            activation_sum += activation1.x + activation1.y;
+            activation_sum += activation1.z + activation1.w;
+            for (uint row = 0u; row < OUTPUTS_PER_SIMD; ++row) {
+                uint metadata_index = outputs[row] * uint(NG) + group;
+                uint quantized_index = metadata_index * uint(GS) + element;
+                uint gate_packed = *(device const uint*)(
+                    gate_q + (quantized_index >> 1));
+                uint up_packed = *(device const uint*)(
+                    up_q + (quantized_index >> 1));
+                gate_quantized_dots[row] +=
+                    activation0.x * float(gate_packed & 15u)
+                    + activation0.y * float((gate_packed >> 4u) & 15u);
+                gate_quantized_dots[row] +=
+                    activation0.z * float((gate_packed >> 8u) & 15u)
+                    + activation0.w * float((gate_packed >> 12u) & 15u);
+                gate_quantized_dots[row] +=
+                    activation1.x * float((gate_packed >> 16u) & 15u)
+                    + activation1.y * float((gate_packed >> 20u) & 15u);
+                gate_quantized_dots[row] +=
+                    activation1.z * float((gate_packed >> 24u) & 15u)
+                    + activation1.w * float(gate_packed >> 28u);
+                up_quantized_dots[row] +=
+                    activation0.x * float(up_packed & 15u)
+                    + activation0.y * float((up_packed >> 4u) & 15u);
+                up_quantized_dots[row] +=
+                    activation0.z * float((up_packed >> 8u) & 15u)
+                    + activation0.w * float((up_packed >> 12u) & 15u);
+                up_quantized_dots[row] +=
+                    activation1.x * float((up_packed >> 16u) & 15u)
+                    + activation1.y * float((up_packed >> 20u) & 15u);
+                up_quantized_dots[row] +=
+                    activation1.z * float((up_packed >> 24u) & 15u)
+                    + activation1.w * float(up_packed >> 28u);
+            }
+        }
+        for (uint row = 0u; row < OUTPUTS_PER_SIMD; ++row) {
+            uint output = outputs[row];
+            uint metadata_index = output * uint(NG) + group;
+            float gate_scale = gate_neuron_scale[output]
+                * float(gate_sub_scale[metadata_index]);
+            float gate_minimum = gate_neuron_min[output]
+                * float(gate_sub_min[metadata_index]);
+            float up_scale = up_neuron_scale[output]
+                * float(up_sub_scale[metadata_index]);
+            float up_minimum = up_neuron_min[output]
+                * float(up_sub_min[metadata_index]);
+            gate_acc[row] = fma(
+                gate_scale,
+                gate_quantized_dots[row],
+                fma(-gate_minimum, activation_sum, gate_acc[row]));
+            up_acc[row] = fma(
+                up_scale,
+                up_quantized_dots[row],
+                fma(-up_minimum, activation_sum, up_acc[row]));
+        }
+    }
+
+    for (uint row = 0u; row < OUTPUTS_PER_SIMD; ++row) {
+        float gate = float(T(simd_sum(gate_acc[row])));
+        float up = float(T(simd_sum(up_acc[row])));
+        uint output = output_base + row;
+        if (lane == 0u && output < uint(OUT)) {
+            float silu = gate / (1.0f + metal::exp(-gate));
+            y[output] = T(silu * up);
+        }
+    }
+"""
+
 _NINT_GEMV_FAST_SOURCE = r"""
     constexpr uint SIMD_GROUPS = 2u;
     constexpr uint ROWS_PER_SIMD = 4u;
@@ -633,6 +753,15 @@ _NINT6_GS24_GEMV_SOURCE = r"""
     for (uint group = lane; group < uint(NG); group += 32u) {
         float activation_sum = 0.0f;
         float quantized_dots[ROWS_PER_SIMD] = {0.0f};
+        ushort packed_words[ROWS_PER_SIMD][9];
+        for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+            uint metadata_index = metadata_bases[row] + group;
+            device const ushort* words = (device const ushort*)(
+                q_packed + metadata_index * GROUP_BYTES);
+            for (uint word = 0u; word < 9u; ++word) {
+                packed_words[row][word] = words[word];
+            }
+        }
         for (uint chunk = 0u; chunk < 6u; ++chunk) {
             uint column = group * 24u + chunk * 4u;
             float4 activation = float4(0.0f);
@@ -657,15 +786,14 @@ _NINT6_GS24_GEMV_SOURCE = r"""
                 + activation.z + activation.w;
 
             for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
-                uint metadata_index = metadata_bases[row] + group;
-                // Form a byte offset directly. Large-vocabulary tensors can
-                // cross 2^32 packed bits, so value_index*6 is unsafe.
                 uint byte_index =
-                    metadata_index * GROUP_BYTES + chunk * 3u;
+                    chunk * 3u;
+                uint word_index = byte_index >> 1u;
+                uint shift = (byte_index & 1u) * 8u;
                 uint packed =
-                    uint(q_packed[byte_index])
-                    | (uint(q_packed[byte_index + 1u]) << 8u)
-                    | (uint(q_packed[byte_index + 2u]) << 16u);
+                    (uint(packed_words[row][word_index]) >> shift)
+                    | (uint(packed_words[row][word_index + 1u])
+                       << (16u - shift));
                 float4 quantized = float4(
                     float(packed & 63u),
                     float((packed >> 6u) & 63u),
@@ -732,6 +860,15 @@ _NINT4_GS24_GEMV_SOURCE = r"""
     for (uint group = lane; group < uint(NG); group += 32u) {
         float activation_sum = 0.0f;
         float quantized_dots[ROWS_PER_SIMD] = {0.0f};
+        uint packed_words[ROWS_PER_SIMD][3];
+        for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+            uint metadata_index = metadata_bases[row] + group;
+            device const uint* words = (device const uint*)(
+                q_packed + metadata_index * GROUP_BYTES);
+            packed_words[row][0] = words[0];
+            packed_words[row][1] = words[1];
+            packed_words[row][2] = words[2];
+        }
         for (uint chunk = 0u; chunk < 6u; ++chunk) {
             uint column = group * 24u + chunk * 4u;
             float4 activation = float4(0.0f);
@@ -756,14 +893,9 @@ _NINT4_GS24_GEMV_SOURCE = r"""
                 + activation.z + activation.w;
 
             for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
-                uint metadata_index = metadata_bases[row] + group;
-                // Direct byte addressing avoids first materializing a packed
-                // bit index and remains safe for large output matrices.
-                uint byte_index =
-                    metadata_index * GROUP_BYTES + chunk * 2u;
                 uint packed =
-                    uint(q_packed[byte_index])
-                    | (uint(q_packed[byte_index + 1u]) << 8u);
+                    packed_words[row][chunk >> 1u]
+                    >> ((chunk & 1u) * 16u);
                 float4 quantized = float4(
                     float(packed & 15u),
                     float((packed >> 4u) & 15u),
@@ -1485,6 +1617,10 @@ _NINT4_SWIGLU_KERNEL = _nint_pair_kernel(
     "mfq_nint4_packed_swiglu",
     _NINT4_SWIGLU_SOURCE,
 )
+_NINT4_SWIGLU_DECODE_KERNEL = _nint_pair_kernel(
+    "mfq_nint4_packed_swiglu_decode",
+    _NINT4_SWIGLU_DECODE_SOURCE,
+)
 
 
 _NINT_EMBEDDING_KERNEL = mx.fast.metal_kernel(
@@ -1825,7 +1961,7 @@ def _prepare_matmul_input(
             f"NINT matmul input width {source.shape[-1]} != weight width {weight.neuron_len}"
         )
     prefix = tuple(int(value) for value in source.shape[:-1])
-    rows = int(np.prod(prefix, dtype=np.int64)) if prefix else 1
+    rows = int(source.size) // weight.neuron_len
     return source.reshape((rows, weight.neuron_len)), prefix, rows
 
 
@@ -2068,11 +2204,8 @@ def nint_matmul(
     source = x if isinstance(x, mx.array) else mx.array(x)
     if source.ndim < 1:
         raise ValueError("NINT matmul input must have at least one dimension")
-    rows = (
-        int(np.prod(tuple(int(value) for value in source.shape[:-1]), dtype=np.int64))
-        if source.ndim > 1
-        else 1
-    )
+    width = int(source.shape[-1])
+    rows = int(source.size) // width
     if (
         dequantize_threshold is not None
         and rows >= int(dequantize_threshold)
@@ -2141,7 +2274,17 @@ def nint_swiglu(
         up_value = nint_matmul(up, source)
         return (mx.sigmoid(gate_value) * gate_value * up_value).reshape((*prefix, gate.out))
 
-    kernel = _NINT4_SWIGLU_KERNEL if gate.bits == 4 else _NINT_SWIGLU_KERNEL
+    decode_nint4 = (
+        rows == 1
+        and gate.bits == 4
+        and gate.groupsize % 8 == 0
+        and source.dtype == mx.float16
+    )
+    kernel = (
+        _NINT4_SWIGLU_DECODE_KERNEL
+        if decode_nint4
+        else (_NINT4_SWIGLU_KERNEL if gate.bits == 4 else _NINT_SWIGLU_KERNEL)
+    )
     output = kernel(
         inputs=[
             gate.q_packed,
@@ -2167,8 +2310,12 @@ def nint_swiglu(
             ("TILE_M", rows),
             ("Q5_EXEC", int(gate.q5_exec)),
         ],
-        grid=(gate.out * 32, 1, 1),
-        threadgroup=(32, 1, 1),
+        grid=(
+            (((gate.out + 15) // 16) * 256, 1, 1)
+            if decode_nint4
+            else (gate.out * 32, 1, 1)
+        ),
+        threadgroup=(256, 1, 1) if decode_nint4 else (32, 1, 1),
         output_shapes=[(rows, gate.out)],
         output_dtypes=[source.dtype],
     )[0]

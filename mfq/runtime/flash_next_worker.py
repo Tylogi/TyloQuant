@@ -45,6 +45,7 @@ from mfq.architectures.flash_next import (
     Qwen4ExpConfig,
     parse_flash_next_config,
 )
+from mfq.architectures.tensor_schema import GRID_VISION_INPUT_CONTRACT
 from mfq.formats.assets import (
     HF_CHAT_TEMPLATE_ASSET,
     HF_GENERATION_CONFIG_ASSET,
@@ -58,9 +59,15 @@ from mfq.kernels.metal.sampling import (
     sample_apply_penalties,
     sample_token_counts_add,
 )
+from mfq.runtime.mlx_causal_lm import (
+    MlxCausalLM,
+    MlxCausalLMConfig,
+    MlxQwen35Mtp,
+)
 from mfq.runtime.mlx_flash_next_vision import (
     MlxGlm5NextVision,
     MlxQwen4ExpVision,
+    MlxQwenVision,
     inject_vision_embeddings,
     qwen4_multimodal_positions,
 )
@@ -83,6 +90,134 @@ _SPECIAL_TOKEN_FIELDS = (
 
 class FlashNextWorkerError(RuntimeError):
     """A request or self-contained model asset is invalid."""
+
+
+@dataclass(frozen=True)
+class _WorkerFamilyRegistration:
+    family: str
+    aliases: tuple[str, ...]
+    config_parser: Callable[[Mapping[str, Any]], Any]
+    config_type: type[Any]
+    model_type: type[Any]
+    vision_type: type[Any] | None = None
+    mtp_type: type[Any] | None = None
+
+    def parse_config(self, payload: Mapping[str, Any]) -> Any:
+        config = self.config_parser(payload)
+        if not isinstance(config, self.config_type):  # pragma: no cover - invariant
+            raise TypeError(f"{self.family} registry returned a foreign config")
+        return config
+
+    def load(
+        self,
+        path: Path,
+        config: Any,
+        max_context: int,
+    ) -> tuple[Any, Any | None, Any | None]:
+        """Load a family through one architecture-neutral component path."""
+
+        model = self.model_type.from_mfq(path, config, max_context=max_context)
+        try:
+            vision = (
+                None
+                if self.vision_type is None
+                else self.vision_type.load_if_present(model, config)
+            )
+            mtp = (
+                None
+                if self.mtp_type is None
+                else self.mtp_type.load_if_present(
+                    model,
+                    config,
+                    max_context=max_context,
+                )
+            )
+        except Exception:
+            model.close()
+            raise
+        return model, vision, mtp
+
+    def vision_supported(self, config: Any) -> bool:
+        return self.vision_type is not None and getattr(config, "vision", None) is not None
+
+    @property
+    def mtp_supported(self) -> bool:
+        return self.mtp_type is not None
+
+
+def _normalized_model_type(payload: Mapping[str, Any]) -> str:
+    text = payload.get("text_config")
+    text_type = text.get("model_type") if isinstance(text, Mapping) else None
+    return str(text_type or payload.get("model_type", "")).strip().lower().replace("-", "_")
+
+
+def _parse_qwen35_config(payload: Mapping[str, Any]) -> MlxCausalLMConfig:
+    return MlxCausalLMConfig.from_qwen35_hf_config(dict(payload))
+
+
+_WORKER_FAMILY_REGISTRY = (
+    _WorkerFamilyRegistration(
+        family="qwen3_5",
+        aliases=("qwen3_5", "qwen3_5_text", "qwen35"),
+        config_parser=_parse_qwen35_config,
+        config_type=MlxCausalLMConfig,
+        model_type=MlxCausalLM,
+        vision_type=MlxQwenVision,
+        mtp_type=MlxQwen35Mtp,
+    ),
+    _WorkerFamilyRegistration(
+        family="qwen4_exp",
+        aliases=("qwen4_exp", "qwen4_exp_text"),
+        config_parser=parse_flash_next_config,
+        config_type=Qwen4ExpConfig,
+        model_type=MlxQwen4Exp,
+        vision_type=MlxQwen4ExpVision,
+        mtp_type=MlxQwen4ExpMtp,
+    ),
+    _WorkerFamilyRegistration(
+        family="glm5_next",
+        aliases=("glm5_next", "glm5_next_text"),
+        config_parser=parse_flash_next_config,
+        config_type=Glm5NextConfig,
+        model_type=MlxGlm5Next,
+        vision_type=MlxGlm5NextVision,
+        mtp_type=MlxGlm5NextMtp,
+    ),
+)
+
+_WORKER_FAMILY_BY_ALIAS = {
+    alias: registration
+    for registration in _WORKER_FAMILY_REGISTRY
+    for alias in registration.aliases
+}
+_WORKER_FAMILY_BY_NAME = {
+    registration.family: registration for registration in _WORKER_FAMILY_REGISTRY
+}
+
+
+def _worker_family_for_payload(payload: Mapping[str, Any]) -> _WorkerFamilyRegistration:
+    identity = _normalized_model_type(payload)
+    try:
+        return _WORKER_FAMILY_BY_ALIAS[identity]
+    except KeyError as error:
+        raise ValueError(f"unsupported MLX worker architecture: {identity!r}") from error
+
+
+def _worker_family_for_config(config: Any) -> _WorkerFamilyRegistration:
+    family = str(getattr(config, "family", ""))
+    try:
+        return _WORKER_FAMILY_BY_NAME[family]
+    except KeyError as error:
+        raise ValueError(f"unregistered MLX worker family: {family!r}") from error
+
+
+def _parse_worker_config(payload: Mapping[str, Any]):
+    registration = _worker_family_for_payload(payload)
+    return registration.parse_config(payload)
+
+
+def _is_qwen_worker_config(config: object) -> bool:
+    return isinstance(config, (Qwen4ExpConfig, MlxCausalLMConfig))
 
 
 def _request_integer(value: Any, name: str) -> int:
@@ -111,6 +246,12 @@ def _request_float(value: Any, name: str) -> float:
         raise FlashNextWorkerError(f"{name} must be a number") from error
 
 
+def _request_boolean(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise FlashNextWorkerError(f"{name} must be a boolean")
+    return value
+
+
 @dataclass(frozen=True)
 class _PreparedRequest:
     request_id: str
@@ -126,6 +267,8 @@ class _PreparedRequest:
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
+    enable_vision: bool = True
+    enable_mtp: bool = True
     multimodal: _MultimodalInput | None = None
     positions: np.ndarray | None = None
     position_delta: int | None = None
@@ -409,13 +552,16 @@ def _multimodal_tensor(
 
 def _parse_multimodal_images(
     payload: Any,
-    config: Qwen4ExpConfig | Glm5NextConfig,
+    config: Qwen4ExpConfig | Glm5NextConfig | MlxCausalLMConfig,
 ) -> _MultimodalInput:
     if not isinstance(payload, Mapping):
         raise FlashNextWorkerError("mfq_multimodal must be an object")
-    if payload.get("version") != 3 or payload.get("processor") != config.family:
+    if (
+        payload.get("version") != 3
+        or payload.get("processor") != GRID_VISION_INPUT_CONTRACT
+    ):
         raise FlashNextWorkerError(
-            f"mfq_multimodal does not match the loaded {config.family} processor"
+            "mfq_multimodal does not match the grid-vision input contract"
         )
     if config.vision is None or config.image_token_id is None:
         raise FlashNextWorkerError("the loaded Flash-Next config has no vision contract")
@@ -483,7 +629,7 @@ def _parse_multimodal_images(
     if sum(math.prod(int(value) for value in row) for row in grid) != pixel_values.shape[0]:
         raise FlashNextWorkerError("Flash-Next pixel count disagrees with media grids")
     if len(videos):
-        if isinstance(config, Qwen4ExpConfig):
+        if _is_qwen_worker_config(config):
             if config.video_token_id is None:
                 raise FlashNextWorkerError("Qwen4-Exp config has no video token")
         elif config.video_start_token_id is None or config.video_end_token_id is None:
@@ -594,18 +740,20 @@ def load_flash_next_tokenizer(
 
 
 class FlashNextTextWorker:
-    """Own one converted Flash-Next model and serialize generation on it."""
+    """Own one converted MLX model and serialize generation on it."""
 
     def __init__(
         self,
-        model: MlxQwen4Exp | MlxGlm5Next,
+        model: MlxQwen4Exp | MlxGlm5Next | MlxCausalLM,
         tokenizer: Any,
         *,
         model_name: str,
         model_type: str,
         generation_config: Mapping[str, Any] | None = None,
-        vision: MlxQwen4ExpVision | MlxGlm5NextVision | None = None,
-        mtp: MlxQwen4ExpMtp | MlxGlm5NextMtp | None = None,
+        vision: MlxQwen4ExpVision | MlxQwenVision | MlxGlm5NextVision | None = None,
+        mtp: MlxQwen35Mtp | MlxQwen4ExpMtp | MlxGlm5NextMtp | None = None,
+        vision_supported: bool | None = None,
+        mtp_supported: bool | None = None,
         prefill_chunk_size: int = 2_048,
     ) -> None:
         self.model = model
@@ -615,6 +763,24 @@ class FlashNextTextWorker:
         self.generation_config = dict(generation_config or {})
         self.vision = vision
         self.mtp = mtp
+        registration = next(
+            (
+                item
+                for item in _WORKER_FAMILY_REGISTRY
+                if item.family == model_type
+            ),
+            None,
+        )
+        self.vision_supported = bool(
+            vision_supported
+            if vision_supported is not None
+            else registration is not None and vision is not None
+        )
+        self.mtp_supported = bool(
+            mtp_supported
+            if mtp_supported is not None
+            else registration is not None and registration.mtp_supported
+        )
         self.prefill_chunk_size = max(1, int(prefill_chunk_size))
         self._generation_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -651,57 +817,15 @@ class FlashNextTextWorker:
             payload = store[MODEL_CONFIG_ASSET]
             if not isinstance(payload, bytes):
                 raise FlashNextWorkerError("embedded model config is not a BLOB")
-            config = parse_flash_next_config(_json_object(payload, "model_config.json"))
+            config = _parse_worker_config(_json_object(payload, "model_config.json"))
             tokenizer, generation_config = load_flash_next_tokenizer(store, model_path)
+        registration = _worker_family_for_config(config)
         selected_context = int(max_context)
         if selected_context <= 0:
             selected_context = min(32_768, config.max_position_embeddings)
         selected_context = min(selected_context, config.max_position_embeddings)
         with mx.stream(_GENERATION_STREAM):
-            if isinstance(config, Qwen4ExpConfig):
-                model = MlxQwen4Exp.from_mfq(
-                    model_path,
-                    config,
-                    max_context=selected_context,
-                )
-            elif isinstance(config, Glm5NextConfig):
-                model = MlxGlm5Next.from_mfq(
-                    model_path,
-                    config,
-                    max_context=selected_context,
-                )
-            else:  # pragma: no cover - exhaustive parse contract
-                raise FlashNextWorkerError(f"unsupported Flash-Next config: {type(config)!r}")
-            vision: MlxQwen4ExpVision | MlxGlm5NextVision | None = None
-            mtp: MlxQwen4ExpMtp | MlxGlm5NextMtp | None = None
-            vision_probe = "model.visual.patch_embed.proj.weight"
-            try:
-                if config.vision is not None and vision_probe in model.model.tensors:
-                    if isinstance(config, Qwen4ExpConfig):
-                        vision = MlxQwen4ExpVision(model.model, config)
-                    else:
-                        vision = MlxGlm5NextVision(model.model, config)
-                if isinstance(config, Qwen4ExpConfig):
-                    mtp_probe = "mtp.pre_fc_norm_embedding.weight"
-                    if config.mtp_num_hidden_layers > 0 and mtp_probe in model.model.tensors:
-                        mtp = MlxQwen4ExpMtp(
-                            model.model,
-                            config,
-                            max_context=selected_context,
-                        )
-                else:
-                    mtp_probe = (
-                        f"model.language_model.layers.{config.num_hidden_layers}.enorm.weight"
-                    )
-                    if config.num_nextn_predict_layers > 0 and mtp_probe in model.model.tensors:
-                        mtp = MlxGlm5NextMtp(
-                            model.model,
-                            config,
-                            max_context=selected_context,
-                        )
-            except Exception:
-                model.close()
-                raise
+            model, vision, mtp = registration.load(model_path, config, selected_context)
         return cls(
             model,
             tokenizer,
@@ -710,6 +834,8 @@ class FlashNextTextWorker:
             generation_config=generation_config,
             vision=vision,
             mtp=mtp,
+            vision_supported=registration.vision_supported(config),
+            mtp_supported=registration.mtp_supported,
             prefill_chunk_size=prefill_chunk_size,
         )
 
@@ -768,7 +894,7 @@ class FlashNextTextWorker:
             vision_token_ids: int | tuple[int, ...] = image_token_id
             video_grids = prepared.multimodal.video_grid_thw
             if (
-                isinstance(self.model.config, Qwen4ExpConfig)
+                _is_qwen_worker_config(self.model.config)
                 and video_grids is not None
                 and len(video_grids)
             ):
@@ -786,7 +912,7 @@ class FlashNextTextWorker:
             for start in range(0, len(prompt), self.prefill_chunk_size):
                 end = min(start + self.prefill_chunk_size, len(prompt))
                 chunk_embeddings = embeddings[:, start:end]
-                if isinstance(self.model.config, Qwen4ExpConfig):
+                if _is_qwen_worker_config(self.model.config):
                     chunk_positions = (
                         None
                         if prepared.positions is None
@@ -867,10 +993,12 @@ class FlashNextTextWorker:
     def _decode_token(self, prepared: _PreparedRequest, token: int) -> mx.array:
         input_ids = np.asarray([[token]], dtype=np.int32)
         if prepared.position_delta is None:
-            return self.model.decode(input_ids)
-        position = int(self.model.position) + prepared.position_delta
-        positions = np.full((3, 1, 1), position, dtype=np.int32)
-        return self.model.forward(input_ids, positions, use_cache=True)
+            logits = self.model.decode(input_ids)
+        else:
+            position = int(self.model.position) + prepared.position_delta
+            positions = np.full((3, 1, 1), position, dtype=np.int32)
+            logits = self.model.forward(input_ids, positions, use_cache=True)
+        return logits
 
     @staticmethod
     def _initial_penalty_counts(
@@ -916,7 +1044,7 @@ class FlashNextTextWorker:
         n_confirmed: int = 0,
     ) -> tuple[mx.array, mx.array]:
         input_ids = np.asarray([tuple(int(token) for token in tokens)], dtype=np.int32)
-        if isinstance(self.model.config, Qwen4ExpConfig):
+        if _is_qwen_worker_config(self.model.config):
             positions: np.ndarray | None = None
             if prepared.position_delta is not None:
                 start = int(self.model.position) + prepared.position_delta
@@ -1215,7 +1343,19 @@ class FlashNextTextWorker:
         multimodal: _MultimodalInput | None = None
         positions: np.ndarray | None = None
         position_delta: int | None = None
+        enable_vision = _request_boolean(
+            request.get("enable_vision", True),
+            "enable_vision",
+        )
+        enable_mtp = _request_boolean(
+            request.get("enable_mtp", True),
+            "enable_mtp",
+        )
         if request.get("mfq_multimodal") is not None:
+            if not enable_vision:
+                raise FlashNextWorkerError(
+                    "vision is disabled for this request; set enable_vision=true"
+                )
             if self.vision is None:
                 raise FlashNextWorkerError(
                     "the loaded MFQ artifact does not contain a Flash-Next vision tower"
@@ -1236,7 +1376,7 @@ class FlashNextTextWorker:
             )
             image_token_id = self.model.config.image_token_id
             assert image_token_id is not None
-            if isinstance(self.model.config, Qwen4ExpConfig):
+            if _is_qwen_worker_config(self.model.config):
                 ids = np.asarray(input_ids, dtype=np.int32)[None]
                 video_token_id = self.model.config.video_token_id
                 actual_images = int(np.count_nonzero(ids == image_token_id))
@@ -1341,6 +1481,8 @@ class FlashNextTextWorker:
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
             repetition_penalty=repetition_penalty,
+            enable_vision=enable_vision,
+            enable_mtp=enable_mtp,
             sampling_payload={
                 "max_tokens": max_tokens,
                 "temperature": temperature,
@@ -1351,6 +1493,8 @@ class FlashNextTextWorker:
                 "repetition_penalty": repetition_penalty,
                 "seed": seed,
                 "enable_thinking": bool(template_options.get("enable_thinking", True)),
+                "enable_vision": enable_vision,
+                "enable_mtp": enable_mtp,
                 "reasoning_effort": template_options.get("reasoning_effort"),
             },
             multimodal=multimodal,
@@ -1387,7 +1531,9 @@ class FlashNextTextWorker:
         emit: Callable[[dict[str, Any]], None],
     ) -> _GenerationSummary:
         cancellation = self._register_cancel(prepared)
-        started = time.perf_counter()
+        queued_at = time.perf_counter()
+        started = queued_at
+        queue_ms = 0.0
         parser = _ReasoningParser(prepared.prompt_ends_in_thinking)
         generated: list[int] = []
         prefill_ms = 0.0
@@ -1400,6 +1546,8 @@ class FlashNextTextWorker:
         mtp_stats: _MtpDecodeStats | None = None
         try:
             with self._generation_lock, mx.stream(_GENERATION_STREAM):
+                started = time.perf_counter()
+                queue_ms = max(0.0, (started - queued_at) * 1000.0)
                 if cancellation.is_set():
                     finish_reason = "stop"
                 else:
@@ -1429,7 +1577,11 @@ class FlashNextTextWorker:
                             for kind, text in parser.feed(piece):
                                 emit({kind: text})
 
-                    if self.mtp is not None and prepared.max_tokens >= 3:
+                    if (
+                        self.mtp is not None
+                        and prepared.enable_mtp
+                        and prepared.max_tokens >= 3
+                    ):
                         generated, finish_reason, first_token_at, mtp_stats = (
                             self._generate_with_mtp(
                                 prepared,
@@ -1495,6 +1647,7 @@ class FlashNextTextWorker:
                 "multimodal_ms": multimodal_ms,
                 "model_prefill_ms": model_prefill_ms,
                 "processor_ms": 0.0,
+                "queue_ms": queue_ms,
                 "complete_prefill_ms": ttft_ms,
                 "complete_prefill_tps": (
                     1000.0 * len(prepared.input_ids) / ttft_ms if ttft_ms > 0.0 else 0.0
@@ -1597,7 +1750,11 @@ class FlashNextTextWorker:
             "model_type": self.model_type,
             "vision_available": self.vision is not None,
             "video_available": self.vision is not None,
+            "vision_supported": self.vision_supported,
             "mtp_available": self.mtp is not None,
+            "mtp_supported": self.mtp_supported,
+            "vision_enabled_default": True,
+            "mtp_enabled_default": True,
             "max_context": self.model.max_context,
             "context_capacity": self.model.max_context,
             "prefill_chunk_size": self.prefill_chunk_size,
@@ -1640,16 +1797,26 @@ def create_app(worker: FlashNextTextWorker) -> FastAPI:
     def health() -> dict[str, Any]:
         status = worker.status()
         image_available = getattr(worker, "vision", None) is not None
+        vision_supported = bool(
+            getattr(worker, "vision_supported", image_available)
+        )
         status["model_capabilities"] = {
             "architecture_family": worker.model_type,
             "source": f"architecture-registry:{worker.model_type}",
             "features": {
                 "text": True,
-                "image_input": image_available,
-                "video_input": image_available,
+                "image_input": vision_supported,
+                "video_input": vision_supported,
                 "audio_input": False,
                 "audio_output": False,
                 "full_duplex": False,
+                "mtp": bool(
+                    getattr(
+                        worker,
+                        "mtp_supported",
+                        getattr(worker, "mtp", None) is not None,
+                    )
+                ),
             },
         }
         status["duplex_available"] = False

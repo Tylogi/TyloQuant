@@ -632,7 +632,7 @@ def grouped_linear_matmul(
         source = source.astype(mx.float16)
     source = mx.contiguous(source)
     prefix = tuple(int(value) for value in source.shape[:-1])
-    rows = int(np.prod(prefix, dtype=np.int64)) if prefix else 1
+    rows = int(source.size) // weight.neuron_len
     if rows == 0:
         return tuple(
             mx.zeros((*prefix, *shape), dtype=source.dtype) for shape in weight.output_shapes

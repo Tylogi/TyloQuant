@@ -60,23 +60,25 @@ def test_glm5_kda_cached_chunks_match_full_sequence() -> None:
     hidden = dimension = 128
     heads = 1
     width = heads * dimension
-    prefix = "layer.self_attn"
+    prefix = "model.block.0.linear_attention"
     tensors: dict[str, np.ndarray] = {}
-    for projection in ("q", "k", "v"):
-        tensors[f"{prefix}.{projection}_proj.weight"] = _random(rng, (width, hidden))
+    for projection in ("query", "key", "value"):
+        tensors[f"{prefix}.{projection}.weight"] = _random(rng, (width, hidden))
         conv = np.zeros((width, 1, 4), dtype=np.float32)
         conv[:, 0, -1] = 0.8
         conv[:, 0, -2] = 0.1
-        tensors[f"{prefix}.{projection}_conv1d.weight"] = conv
-    tensors[prefix + ".f_a_proj.weight"] = _random(rng, (dimension, hidden))
-    tensors[prefix + ".f_b_proj.weight"] = _random(rng, (width, dimension))
+        tensors[f"{prefix}.{projection}_conv.weight"] = conv
+    tensors[prefix + ".forget_a.weight"] = _random(rng, (dimension, hidden))
+    tensors[prefix + ".forget_b.weight"] = _random(rng, (width, dimension))
     tensors[prefix + ".dt_bias"] = _random(rng, (width,), 0.02)
-    tensors[prefix + ".A_log"] = _random(rng, (heads,), 0.02)
-    tensors[prefix + ".b_proj.weight"] = _random(rng, (heads, hidden))
-    tensors[prefix + ".g_a_proj.weight"] = _random(rng, (dimension, hidden))
-    tensors[prefix + ".g_b_proj.weight"] = _random(rng, (width, dimension))
-    tensors[prefix + ".o_norm.weight"] = np.ones((dimension,), dtype=np.float32)
-    tensors[prefix + ".o_proj.weight"] = _random(rng, (hidden, width))
+    tensors[prefix + ".a"] = _random(rng, (heads,), 0.02)
+    tensors[prefix + ".beta.weight"] = _random(rng, (heads, hidden))
+    tensors[prefix + ".gate_a.weight"] = _random(rng, (dimension, hidden))
+    tensors[prefix + ".gate_b.weight"] = _random(rng, (width, dimension))
+    tensors[prefix + ".output_norm.weight"] = np.ones(
+        (dimension,), dtype=np.float32
+    )
+    tensors[prefix + ".output.weight"] = _random(rng, (hidden, width))
     config = SimpleNamespace(
         kda_num_heads=heads,
         kda_head_dim=dimension,
@@ -140,23 +142,33 @@ def test_glm5_absorbed_sparse_mla_cached_chunks_match_full_sequence() -> None:
     rng = np.random.default_rng(5302)
     hidden = rank = nope = value_dim = index_dim = 128
     heads = index_heads = 2
-    prefix = "layer.self_attn"
+    prefix = "model.block.0.attention"
     tensors: dict[str, np.ndarray | NintMoeTensor] = {
-        prefix + ".q_a_proj.weight": _random(rng, (rank, hidden)),
-        prefix + ".kv_a_proj_with_mqa.weight": _random(rng, (rank, hidden)),
-        prefix + ".q_a_layernorm.weight": np.ones((rank,), dtype=np.float32),
-        prefix + ".kv_a_layernorm.weight": np.ones((rank,), dtype=np.float32),
-        prefix + ".q_b_proj.weight": _random(rng, (heads * nope, rank)),
-        prefix + ".o_proj.weight": _random(rng, (hidden, heads * value_dim)),
-        prefix + ".indexer.wq_b.weight": _random(rng, (index_heads * index_dim, rank)),
-        prefix + ".indexer.wk.weight": _random(rng, (index_dim, hidden)),
-        prefix + ".indexer.weights_proj.weight": _random(rng, (index_heads, hidden)),
-        prefix + ".indexer.k_norm.weight": np.ones((index_dim,), dtype=np.float32),
-        prefix + ".indexer.k_norm.bias": np.zeros((index_dim,), dtype=np.float32),
-        prefix + ".indexer.index_kpool_compress_gate": _random(rng, (index_dim, hidden)),
-        prefix + ".indexer.index_kpool_compress_ape": _random(rng, (2, index_dim)),
-        prefix + ".embed_q": _expert(_random(rng, (heads, rank, nope))),
-        prefix + ".unembed_out": _expert(_random(rng, (heads, value_dim, rank))),
+        prefix + ".query_a.weight": _random(rng, (rank, hidden)),
+        prefix + ".key_value_a.weight": _random(rng, (rank, hidden)),
+        prefix + ".query_a_norm.weight": np.ones((rank,), dtype=np.float32),
+        prefix + ".key_value_a_norm.weight": np.ones((rank,), dtype=np.float32),
+        prefix + ".query_b.weight": _random(rng, (heads * nope, rank)),
+        prefix + ".output.weight": _random(rng, (hidden, heads * value_dim)),
+        prefix + ".indexer.query.weight": _random(
+            rng, (index_heads * index_dim, rank)
+        ),
+        prefix + ".indexer.key.weight": _random(rng, (index_dim, hidden)),
+        prefix + ".indexer.score.weight": _random(rng, (index_heads, hidden)),
+        prefix + ".indexer.key_norm.weight": np.ones(
+            (index_dim,), dtype=np.float32
+        ),
+        prefix + ".indexer.key_norm.bias": np.zeros(
+            (index_dim,), dtype=np.float32
+        ),
+        prefix + ".indexer.pool.gate": _random(rng, (index_dim, hidden)),
+        prefix + ".indexer.pool.position": _random(rng, (2, index_dim)),
+        prefix + ".latent.query_embedding.weight": _expert(
+            _random(rng, (heads, rank, nope))
+        ),
+        prefix + ".latent.output_unembedding.weight": _expert(
+            _random(rng, (heads, value_dim, rank))
+        ),
     }
     config = SimpleNamespace(
         hidden_size=hidden,
@@ -197,77 +209,79 @@ def test_glm5_mtp_cached_chunks_match_full_appended_layer() -> None:
     hidden = rank = nope = value_dim = index_dim = 128
     heads = index_heads = experts = 2
     intermediate = 64
-    prefix = "model.language_model.layers.1"
+    prefix = "predictor.block.0"
     tensors: dict[str, np.ndarray | NintMoeTensor] = {
-        "model.language_model.embed_tokens.weight": _bfloat16(
-            _random(rng, (32, hidden))
-        ),
-        prefix + ".enorm.weight": np.ones((hidden,), dtype=np.float32),
-        prefix + ".hnorm.weight": np.ones((hidden,), dtype=np.float32),
-        prefix + ".eh_proj.weight": _bfloat16(
+        "model.token_embedding.weight": _bfloat16(_random(rng, (32, hidden))),
+        "predictor.embedding_norm.weight": np.ones((hidden,), dtype=np.float32),
+        "predictor.hidden_norm.weight": np.ones((hidden,), dtype=np.float32),
+        "predictor.fusion.weight": _bfloat16(
             _random(rng, (hidden, 2 * hidden))
         ),
-        prefix + ".input_layernorm.weight": np.ones((hidden,), dtype=np.float32),
-        prefix + ".post_attention_layernorm.weight": np.ones(
+        prefix + ".attention.norm.weight": np.ones(
             (hidden,), dtype=np.float32
         ),
-        prefix + ".shared_head.norm.weight": np.ones((hidden,), dtype=np.float32),
-        prefix + ".self_attn.q_a_proj.weight": _random(rng, (rank, hidden)),
-        prefix + ".self_attn.kv_a_proj_with_mqa.weight": _random(
+        prefix + ".mlp.norm.weight": np.ones(
+            (hidden,), dtype=np.float32
+        ),
+        "predictor.output_norm.weight": np.ones((hidden,), dtype=np.float32),
+        prefix + ".attention.query_a.weight": _random(rng, (rank, hidden)),
+        prefix + ".attention.key_value_a.weight": _random(
             rng, (rank, hidden)
         ),
-        prefix + ".self_attn.q_a_layernorm.weight": np.ones(
+        prefix + ".attention.query_a_norm.weight": np.ones(
             (rank,), dtype=np.float32
         ),
-        prefix + ".self_attn.kv_a_layernorm.weight": np.ones(
+        prefix + ".attention.key_value_a_norm.weight": np.ones(
             (rank,), dtype=np.float32
         ),
-        prefix + ".self_attn.q_b_proj.weight": _random(
+        prefix + ".attention.query_b.weight": _random(
             rng, (heads * nope, rank)
         ),
-        prefix + ".self_attn.o_proj.weight": _random(
+        prefix + ".attention.output.weight": _random(
             rng, (hidden, heads * value_dim)
         ),
-        prefix + ".self_attn.indexer.wq_b.weight": _random(
+        prefix + ".attention.indexer.query.weight": _random(
             rng, (index_heads * index_dim, rank)
         ),
-        prefix + ".self_attn.indexer.wk.weight": _random(rng, (index_dim, hidden)),
-        prefix + ".self_attn.indexer.weights_proj.weight": _random(
-            rng, (index_heads, hidden)
-        ),
-        prefix + ".self_attn.indexer.k_norm.weight": np.ones(
-            (index_dim,), dtype=np.float32
-        ),
-        prefix + ".self_attn.indexer.k_norm.bias": np.zeros(
-            (index_dim,), dtype=np.float32
-        ),
-        prefix + ".self_attn.indexer.index_kpool_compress_gate": _random(
+        prefix + ".attention.indexer.key.weight": _random(
             rng, (index_dim, hidden)
         ),
-        prefix + ".self_attn.indexer.index_kpool_compress_ape": _random(
+        prefix + ".attention.indexer.score.weight": _random(
+            rng, (index_heads, hidden)
+        ),
+        prefix + ".attention.indexer.key_norm.weight": np.ones(
+            (index_dim,), dtype=np.float32
+        ),
+        prefix + ".attention.indexer.key_norm.bias": np.zeros(
+            (index_dim,), dtype=np.float32
+        ),
+        prefix + ".attention.indexer.pool.gate": _random(
+            rng, (index_dim, hidden)
+        ),
+        prefix + ".attention.indexer.pool.position": _random(
             rng, (2, index_dim)
         ),
-        prefix + ".self_attn.embed_q": _expert(
+        prefix + ".attention.latent.query_embedding.weight": _expert(
             _random(rng, (heads, rank, nope))
         ),
-        prefix + ".self_attn.unembed_out": _expert(
+        prefix + ".attention.latent.output_unembedding.weight": _expert(
             _random(rng, (heads, value_dim, rank))
         ),
-        prefix + ".mlp.experts.gate_up_proj": _expert(
+        prefix + ".mlp.experts.gate_up.weight": _expert(
             _random(rng, (experts, 2 * intermediate, hidden))
         ),
-        prefix + ".mlp.experts.down_proj": _expert(
+        prefix + ".mlp.experts.down.weight": _expert(
             _random(rng, (experts, hidden, intermediate))
         ),
-        prefix + ".mlp.gate.weight": _random(rng, (experts, hidden)),
-        prefix + ".mlp.gate.e_score_correction_bias": _random(rng, (experts,)),
-        prefix + ".mlp.shared_experts.gate_proj.weight": _random(
+        prefix + ".mlp.router.weight": _random(rng, (experts, hidden)),
+        prefix + ".mlp.router.bias": _random(rng, (experts,)),
+        prefix + ".mlp.shared_expert.gate.weight": _random(
             rng, (intermediate, hidden)
         ),
-        prefix + ".mlp.shared_experts.up_proj.weight": _random(
+        prefix + ".mlp.shared_expert.up.weight": _random(
             rng, (intermediate, hidden)
         ),
-        prefix + ".mlp.shared_experts.down_proj.weight": _random(
+        prefix + ".mlp.shared_expert.down.weight": _random(
             rng, (hidden, intermediate)
         ),
     }
@@ -317,8 +331,8 @@ def test_glm5_mtp_cached_chunks_match_full_appended_layer() -> None:
     reference = layer.shared_head_norm((residual + feed_forward).astype(fused.dtype))
     mx.eval(expected, reference)
     np.testing.assert_allclose(
-        np.asarray(expected),
-        np.asarray(reference),
+        np.asarray(expected.astype(mx.float32)),
+        np.asarray(reference.astype(mx.float32)),
         rtol=3e-2,
         atol=3e-2,
     )
@@ -331,8 +345,8 @@ def test_glm5_mtp_cached_chunks_match_full_appended_layer() -> None:
     mx.eval(expected, actual)
 
     np.testing.assert_allclose(
-        np.asarray(actual),
-        np.asarray(expected),
+        np.asarray(actual.astype(mx.float32)),
+        np.asarray(expected.astype(mx.float32)),
         rtol=3e-2,
         atol=3e-2,
     )

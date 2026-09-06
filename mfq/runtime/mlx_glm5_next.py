@@ -39,10 +39,10 @@ from mfq.runtime.mlx_ops import MlxRMSNorm
 
 @dataclass(frozen=True)
 class MlxGlm5NextNames:
-    token_embedding: str = "model.language_model.embed_tokens.weight"
-    output_norm: str = "model.language_model.norm.weight"
-    output: str = "lm_head.weight"
-    layer_prefix: str = "model.language_model.layers.{i}"
+    token_embedding: str = "model.token_embedding.weight"
+    output_norm: str = "model.output_norm.weight"
+    output: str = "model.output.weight"
+    layer_prefix: str = "model.block.{i}"
 
     def layer(self, index: int) -> str:
         return self.layer_prefix.format(i=index)
@@ -143,10 +143,10 @@ class MlxGlm5NextMhc:
         layer_prefix: str,
         site: str,
     ) -> None:
-        prefix = f"{layer_prefix}.hc_{site}"
-        self.function = _dense_array(model, prefix + "_fn")
-        self.base = _dense_vector(model, prefix + "_base")
-        self.scale = _dense_vector(model, prefix + "_scale")
+        prefix = f"{layer_prefix}.{site}.mhc.pre"
+        self.function = _dense_array(model, prefix + ".function")
+        self.base = _dense_vector(model, prefix + ".base")
+        self.scale = _dense_vector(model, prefix + ".scale")
         self.config = config
 
     def pre(self, hidden_streams: mx.array) -> tuple[mx.array, mx.array, mx.array]:
@@ -181,11 +181,11 @@ class MlxGlm5NextDenseFFN:
     ) -> None:
         self.gate_up = MlxLinearGroup(
             (
-                model.linear(prefix + ".gate_proj.weight"),
-                model.linear(prefix + ".up_proj.weight"),
+                model.linear(prefix + ".gate.weight"),
+                model.linear(prefix + ".up.weight"),
             )
         )
-        self.down = model.linear(prefix + ".down_proj.weight")
+        self.down = model.linear(prefix + ".down.weight")
         self.limit = float(swiglu_limit)
 
     def __call__(self, value: mx.array) -> mx.array:
@@ -204,8 +204,8 @@ class MlxGlm5NextMoE:
         config: Glm5NextConfig,
         prefix: str,
     ) -> None:
-        gate_up = model.routed(prefix + ".experts.gate_up_proj")
-        down = model.routed(prefix + ".experts.down_proj")
+        gate_up = model.routed(prefix + ".experts.gate_up.weight")
+        down = model.routed(prefix + ".experts.down.weight")
         if (
             gate_up.n_experts != config.num_experts
             or down.n_experts != config.num_experts
@@ -217,14 +217,14 @@ class MlxGlm5NextMoE:
             raise ValueError("GLM-5-Next routed expert tensor shapes disagree")
         self.gate_up = gate_up
         self.down = down
-        self.router = model.linear(prefix + ".gate.weight")
+        self.router = model.linear(prefix + ".router.weight")
         self.router_bias = _dense_vector(
             model,
-            prefix + ".gate.e_score_correction_bias",
+            prefix + ".router.bias",
         )
         self.shared = MlxGlm5NextDenseFFN(
             model,
-            prefix + ".shared_experts",
+            prefix + ".shared_expert",
             config.swiglu_limit,
         )
         self.config = config
@@ -263,28 +263,28 @@ class MlxGlm5NextKda:
         self.config = config
         self.qkv = MlxLinearGroup(
             tuple(
-                model.linear(f"{prefix}.{projection}_proj.weight") for projection in ("q", "k", "v")
+                model.linear(f"{prefix}.{projection}.weight") for projection in ("query", "key", "value")
             )
         )
         self.conv_weight = mx.concatenate(
             tuple(
-                _dense_array(model, f"{prefix}.{projection}_conv1d.weight")
-                for projection in ("q", "k", "v")
+                _dense_array(model, f"{prefix}.{projection}_conv.weight")
+                for projection in ("query", "key", "value")
             ),
             axis=0,
         )
-        self.f_a = _dense_array(model, prefix + ".f_a_proj.weight")
-        self.f_b = _dense_array(model, prefix + ".f_b_proj.weight")
+        self.f_a = _dense_array(model, prefix + ".forget_a.weight")
+        self.f_b = _dense_array(model, prefix + ".forget_b.weight")
         self.dt_bias = _dense_vector(model, prefix + ".dt_bias")
-        self.a_log = _dense_vector(model, prefix + ".A_log")
-        self.beta = model.linear(prefix + ".b_proj.weight")
-        self.gate_a = model.linear(prefix + ".g_a_proj.weight")
-        self.gate_b = model.linear(prefix + ".g_b_proj.weight")
+        self.a_log = _dense_vector(model, prefix + ".a")
+        self.beta = model.linear(prefix + ".beta.weight")
+        self.gate_a = model.linear(prefix + ".gate_a.weight")
+        self.gate_b = model.linear(prefix + ".gate_b.weight")
         self.output_norm = MlxRMSNorm(
-            _dense_vector(model, prefix + ".o_norm.weight"),
+            _dense_vector(model, prefix + ".output_norm.weight"),
             config.rms_norm_eps,
         )
-        self.output = model.linear(prefix + ".o_proj.weight")
+        self.output = model.linear(prefix + ".output.weight")
         self.conv_state: mx.array | None = None
         self.recurrent_state: mx.array | None = None
         self.rollback_state: tuple[mx.array, mx.array] | None = None
@@ -428,21 +428,21 @@ class MlxGlm5NextSparseAttention:
         self.max_context = int(max_context)
         self.first = MlxLinearGroup(
             (
-                model.linear(prefix + ".q_a_proj.weight"),
-                model.linear(prefix + ".kv_a_proj_with_mqa.weight"),
+                model.linear(prefix + ".query_a.weight"),
+                model.linear(prefix + ".key_value_a.weight"),
             )
         )
         self.q_a_norm = MlxRMSNorm(
-            _dense_vector(model, prefix + ".q_a_layernorm.weight"),
+            _dense_vector(model, prefix + ".query_a_norm.weight"),
             config.rms_norm_eps,
         )
         self.kv_a_norm = MlxRMSNorm(
-            _dense_vector(model, prefix + ".kv_a_layernorm.weight"),
+            _dense_vector(model, prefix + ".key_value_a_norm.weight"),
             config.rms_norm_eps,
         )
-        self.q_b = model.linear(prefix + ".q_b_proj.weight")
-        embed = model.routed(prefix + ".embed_q")
-        unembed = model.routed(prefix + ".unembed_out")
+        self.q_b = model.linear(prefix + ".query_b.weight")
+        embed = model.routed(prefix + ".latent.query_embedding.weight")
+        unembed = model.routed(prefix + ".latent.output_unembedding.weight")
         if (
             embed.n_experts != config.num_attention_heads
             or embed.neuron_len != config.qk_nope_head_dim
@@ -454,25 +454,25 @@ class MlxGlm5NextSparseAttention:
             raise ValueError("GLM-5-Next absorbed MLA tensor shapes disagree")
         self.embed_query = embed
         self.unembed_output = unembed
-        self.output = model.linear(prefix + ".o_proj.weight")
-        self.index_query = model.linear(prefix + ".indexer.wq_b.weight")
-        self.index_key = model.linear(prefix + ".indexer.wk.weight")
-        self.index_weights = model.linear(prefix + ".indexer.weights_proj.weight")
+        self.output = model.linear(prefix + ".output.weight")
+        self.index_query = model.linear(prefix + ".indexer.query.weight")
+        self.index_key = model.linear(prefix + ".indexer.key.weight")
+        self.index_weights = model.linear(prefix + ".indexer.score.weight")
         self.index_norm_weight = _dense_vector(
             model,
-            prefix + ".indexer.k_norm.weight",
+            prefix + ".indexer.key_norm.weight",
         )
         self.index_norm_bias = _dense_vector(
             model,
-            prefix + ".indexer.k_norm.bias",
+            prefix + ".indexer.key_norm.bias",
         )
         self.index_gate = _dense_array(
             model,
-            prefix + ".indexer.index_kpool_compress_gate",
+            prefix + ".indexer.pool.gate",
         )
         self.index_ape = _dense_array(
             model,
-            prefix + ".indexer.index_kpool_compress_ape",
+            prefix + ".indexer.pool.position",
         )
         self.latent_cache = _MlxSequenceCache(max_context, config.kv_lora_rank)
         self.index_cache = _MlxSequenceCache(max_context, 2 * config.index_head_dim)
@@ -677,17 +677,21 @@ class MlxGlm5NextLayer:
     ) -> None:
         self.config = config
         prefix = names.layer(index)
-        self.attention_hc = MlxGlm5NextMhc(model, config, prefix, "attn")
-        self.ffn_hc = MlxGlm5NextMhc(model, config, prefix, "ffn")
+        self.attention_hc = MlxGlm5NextMhc(model, config, prefix, "attention")
+        self.ffn_hc = MlxGlm5NextMhc(model, config, prefix, "mlp")
         self.attention_norm = MlxRMSNorm(
-            _dense_vector(model, prefix + ".input_layernorm.weight"),
+            _dense_vector(model, prefix + ".attention.norm.weight"),
             config.rms_norm_eps,
         )
         self.ffn_norm = MlxRMSNorm(
-            _dense_vector(model, prefix + ".post_attention_layernorm.weight"),
+            _dense_vector(model, prefix + ".mlp.norm.weight"),
             config.rms_norm_eps,
         )
-        attention_prefix = prefix + ".self_attn"
+        attention_prefix = (
+            prefix + ".linear_attention"
+            if config.layer_types[index] == "linear_attention"
+            else prefix + ".attention"
+        )
         self.attention = (
             MlxGlm5NextKda(model, config, attention_prefix)
             if config.layer_types[index] == "linear_attention"
@@ -751,31 +755,31 @@ class MlxGlm5NextMtpLayer:
     ) -> None:
         self.config = config
         self.enorm = MlxRMSNorm(
-            _dense_vector(model, prefix + ".enorm.weight"),
+            _dense_vector(model, "predictor.embedding_norm.weight"),
             config.rms_norm_eps,
         )
         self.hnorm = MlxRMSNorm(
-            _dense_vector(model, prefix + ".hnorm.weight"),
+            _dense_vector(model, "predictor.hidden_norm.weight"),
             config.rms_norm_eps,
         )
-        self.eh_projection = model.linear(prefix + ".eh_proj.weight")
+        self.eh_projection = model.linear("predictor.fusion.weight")
         self.input_norm = MlxRMSNorm(
-            _dense_vector(model, prefix + ".input_layernorm.weight"),
+            _dense_vector(model, prefix + ".attention.norm.weight"),
             config.rms_norm_eps,
         )
         self.post_attention_norm = MlxRMSNorm(
-            _dense_vector(model, prefix + ".post_attention_layernorm.weight"),
+            _dense_vector(model, prefix + ".mlp.norm.weight"),
             config.rms_norm_eps,
         )
         self.attention = MlxGlm5NextSparseAttention(
             model,
             config,
-            prefix + ".self_attn",
+            prefix + ".attention",
             max_context,
         )
         self.ffn = MlxGlm5NextMoE(model, config, prefix + ".mlp")
         self.shared_head_norm = MlxRMSNorm(
-            _dense_vector(model, prefix + ".shared_head.norm.weight"),
+            _dense_vector(model, "predictor.output_norm.weight"),
             config.rms_norm_eps,
         )
 
@@ -857,13 +861,33 @@ class MlxGlm5NextMtp:
             MlxGlm5NextMtpLayer(
                 self.model,
                 config,
-                self.names.layer(config.num_hidden_layers + index),
+                f"predictor.block.{index}",
                 self.max_context,
             )
             for index in range(config.num_nextn_predict_layers)
         )
         self.batch = 0
         self.layer_positions = [0] * len(self.layers)
+
+    @classmethod
+    def load_if_present(
+        cls,
+        causal_lm: MlxGlm5Next,
+        config: Glm5NextConfig,
+        *,
+        max_context: int,
+    ) -> MlxGlm5NextMtp | None:
+        """Attach the appended MTP layer when the loaded artifact contains it."""
+
+        tensors = causal_lm.model.tensors
+        prefix = "predictor."
+        has_any_weight = any(name.startswith(prefix) for name in tensors)
+        probe = "predictor.embedding_norm.weight"
+        if config.num_nextn_predict_layers <= 0 or probe not in tensors:
+            if has_any_weight:
+                raise ValueError("GLM-5-Next MFQ contains an incomplete or undeclared MTP head")
+            return None
+        return cls(causal_lm.model, config, max_context=max_context)
 
     @classmethod
     def from_mfq(

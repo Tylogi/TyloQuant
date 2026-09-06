@@ -7,7 +7,8 @@ The following integrated components retain their original MIT terms.
 llama.cpp / GGML
 ----------------
 MFQ's GGUF reader, tokenizer, grammar, chat-template/Jinja implementation, and
-CUDA MMA support in `cpp_runtime/text/` are adapted from ggml-org/llama.cpp,
+CUDA MMA support in `cpp_runtime/components/ggml/` are adapted from
+ggml-org/llama.cpp,
 based on commit 25a1d63f4346b472e508c6dbd9ab2ed1d81ace2e, with MFQ-specific
 modifications.
 
@@ -17,7 +18,7 @@ Source: https://github.com/ggml-org/llama.cpp
 
 cpp-httplib
 -----------
-The HTTP/WebSocket implementation in `cpp_runtime/http/` is cpp-httplib
+The HTTP/WebSocket implementation in `cpp_runtime/components/http/` is cpp-httplib
 version 0.48.0.
 
 Copyright (c) 2017 yhirose
@@ -26,7 +27,7 @@ Source: https://github.com/yhirose/cpp-httplib
 
 JSON for Modern C++
 -------------------
-The JSON implementation in `cpp_runtime/json/nlohmann/` is nlohmann/json
+The JSON implementation in `cpp_runtime/components/json/nlohmann/` is nlohmann/json
 version 3.12.0. Its amalgamated headers retain their embedded SPDX copyright
 notices for incorporated MIT-licensed portions.
 

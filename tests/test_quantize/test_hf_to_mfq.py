@@ -17,6 +17,7 @@ from mfq.formats.assets import (
     HF_TOKENIZER_CONFIG_ASSET,
     HF_TOKENIZER_JSON_ASSET,
     MODEL_CONFIG_ASSET,
+    MODEL_GRAPH_ASSET,
     is_asset_record,
 )
 from mfq.formats.header import FileHeader
@@ -55,6 +56,141 @@ def _plan(name: str, spec: NintSpec) -> TensorPlan:
         target_dtype=f"NINT{spec.bits}",
         target_spec=spec,
     )
+
+
+def _standard_plan(name: str, shape: tuple[int, ...] = (16, 48)) -> TensorPlan:
+    return TensorPlan(
+        name=name,
+        shard="model.safetensors",
+        shape=shape,
+        source_dtype="BF16",
+        target_dtype="NINT4" if len(shape) == 2 else "F16",
+    )
+
+
+def test_standard_preset_aliases_match_llamacpp() -> None:
+    assert hf_to_mfq._normalize_standard_preset("q3-k") == "Q3_K_M"
+    assert hf_to_mfq._normalize_standard_preset("Q4_K") == "Q4_K_M"
+    assert hf_to_mfq._normalize_standard_preset("q5_k") == "Q5_K_M"
+    with pytest.raises(ValueError, match="unsupported standard quantization preset"):
+        hf_to_mfq._normalize_standard_preset("Q7_K")
+
+
+def test_q4_k_m_standard_preset_raises_sensitive_text_matrices() -> None:
+    plans = [
+        _standard_plan("model.language_model.embed_tokens.weight"),
+        _standard_plan("lm_head.weight"),
+        _standard_plan("model.language_model.layers.0.mlp.down_proj.weight"),
+        _standard_plan("model.language_model.layers.8.mlp.down_proj.weight"),
+        _standard_plan("model.language_model.layers.10.mlp.down_proj.weight"),
+        _standard_plan("model.language_model.layers.10.self_attn.o_proj.weight"),
+    ]
+    mapped = hf_to_mfq._apply_standard_preset(
+        plans,
+        "Q4_K_M",
+        {
+            "text_config": {
+                "num_hidden_layers": 64,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 4,
+            }
+        },
+    )
+    by_name = {item.name: item for item in mapped}
+
+    assert by_name["model.language_model.embed_tokens.weight"].target_dtype == "NINT4"
+    assert by_name["lm_head.weight"].target_dtype == "NINT6"
+    assert by_name["model.language_model.layers.0.mlp.down_proj.weight"].target_dtype == "NINT6"
+    assert by_name["model.language_model.layers.8.mlp.down_proj.weight"].target_dtype == "NINT4"
+    assert by_name["model.language_model.layers.10.mlp.down_proj.weight"].target_dtype == "NINT6"
+    assert by_name["model.language_model.layers.10.self_attn.o_proj.weight"].target_dtype == "NINT4"
+
+
+def test_q3_k_m_standard_preset_matches_attention_v_mixture() -> None:
+    plans = [
+        _standard_plan(f"model.language_model.layers.{layer}.self_attn.v_proj.weight")
+        for layer in range(3)
+    ]
+    mapped = hf_to_mfq._apply_standard_preset(
+        plans,
+        "Q3_K_M",
+        {
+            "num_hidden_layers": 3,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+        },
+    )
+
+    assert [item.target_dtype for item in mapped] == ["NINT5", "NINT5", "NINT4"]
+
+
+def test_q2_k_standard_preset_uses_gqa_sensitive_types() -> None:
+    plans = [
+        _standard_plan("model.language_model.layers.7.self_attn.v_proj.weight"),
+        _standard_plan("model.language_model.layers.7.self_attn.o_proj.weight"),
+        _standard_plan("model.language_model.layers.7.mlp.down_proj.weight"),
+    ]
+    mapped = hf_to_mfq._apply_standard_preset(
+        plans,
+        "Q2_K",
+        {
+            "num_hidden_layers": 8,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+        },
+    )
+
+    assert [item.target_dtype for item in mapped] == ["NINT4", "NINT3", "NINT3"]
+
+
+def test_standard_preset_keeps_all_vision_and_predictor_tensors_native_by_default() -> None:
+    plans = [
+        _standard_plan("model.visual.blocks.0.attn.qkv.weight"),
+        _standard_plan("model.visual.pos_embed.weight"),
+        _standard_plan("model.visual.merger.linear_fc2.weight"),
+        _standard_plan("model.visual.patch_embed.proj.weight", (8, 3, 2, 2, 2)),
+        _standard_plan("mtp.fc.weight"),
+    ]
+    mapped = hf_to_mfq._apply_standard_preset(
+        plans,
+        "Q4_K_M",
+        {
+            "text_config": {"num_hidden_layers": 64},
+            "vision_config": {"depth": 27},
+        },
+    )
+    by_name = {item.name: item for item in mapped}
+
+    assert by_name["model.visual.blocks.0.attn.qkv.weight"].target_dtype == "BF16"
+    assert by_name["model.visual.pos_embed.weight"].target_dtype == "BF16"
+    assert by_name["model.visual.merger.linear_fc2.weight"].target_dtype == "BF16"
+    assert by_name["model.visual.patch_embed.proj.weight"].target_dtype == "BF16"
+    assert by_name["mtp.fc.weight"].target_dtype == "BF16"
+
+
+def test_standard_preset_quantizes_vision_and_predictor_only_with_opt_in() -> None:
+    plans = [
+        _standard_plan("model.visual.blocks.0.attn.qkv.weight"),
+        _standard_plan("model.visual.merger.linear_fc2.weight"),
+        _standard_plan("mtp.layers.0.self_attn.q_proj.weight"),
+        _standard_plan("mtp.fc.weight"),
+    ]
+    mapped = hf_to_mfq._apply_standard_preset(
+        plans,
+        "Q4_K_M",
+        {
+            "text_config": {"num_hidden_layers": 64},
+            "vision_config": {"depth": 27},
+        },
+        quantize_vision=True,
+        quantize_mtp=True,
+    )
+    by_name = {item.name: item for item in mapped}
+
+    assert by_name["model.visual.blocks.0.attn.qkv.weight"].target_dtype == "NINT6"
+    assert by_name["mtp.layers.0.self_attn.q_proj.weight"].target_dtype == "NINT4"
+    assert by_name["model.visual.merger.linear_fc2.weight"].target_dtype == "BF16"
+    assert by_name["mtp.fc.weight"].target_dtype == "BF16"
 
 
 def test_normalize_hf_expert_storage_preserves_mixed_nintm_plan() -> None:
@@ -168,9 +304,7 @@ def test_scaled_fp8_tensor_slice_applies_shared_ngram_scale(tmp_path):
         path,
     )
     inventory = hf_to_mfq._hf_source_inventory(tmp_path)
-    quantization = _source_quantization(
-        "ple.ngram_embedding.shard_0.weight", inventory
-    )
+    quantization = _source_quantization("ple.ngram_embedding.shard_0.weight", inventory)
     assert quantization is not None
     assert quantization.scheme == "fp8_tensor_scale"
     source = _ScaledFp8TensorSlice(
@@ -233,10 +367,7 @@ def test_runtime_fused_pairs_accept_identical_precision_layout():
     ],
 )
 def test_qwen35_moe_hf_to_gguf_name_mapping(suffix, gguf_suffix):
-    assert (
-        _hf_to_gguf_name(f"model.language_model.layers.17.{suffix}")
-        == f"blk.17.{gguf_suffix}"
-    )
+    assert _hf_to_gguf_name(f"model.language_model.layers.17.{suffix}") == f"blk.17.{gguf_suffix}"
 
 
 @pytest.mark.parametrize(
@@ -259,13 +390,14 @@ def test_qwen35_mtp_hf_to_gguf_name_mapping(name, gguf_name):
 
 
 def test_qwen35_mtp_mapping_uses_dynamic_backbone_layer_count():
-    assert _hf_to_gguf_name(
-        "mtp.fc.weight", mtp_layer_index=64
-    ) == "blk.64.nextn.eh_proj.weight"
-    assert _hf_to_gguf_name(
-        "mtp.layers.0.self_attn.o_proj.weight",
-        mtp_layer_index=64,
-    ) == "blk.64.attn_output.weight"
+    assert _hf_to_gguf_name("mtp.fc.weight", mtp_layer_index=64) == "blk.64.nextn.eh_proj.weight"
+    assert (
+        _hf_to_gguf_name(
+            "mtp.layers.0.self_attn.o_proj.weight",
+            mtp_layer_index=64,
+        )
+        == "blk.64.attn_output.weight"
+    )
 
 
 def test_qwen35_mtp_inventory_is_all_or_nothing():
@@ -287,15 +419,11 @@ def test_qwen35_mtp_inventory_is_all_or_nothing():
         }
     )
     inventory = {name: None for name in names}
-    assert hf_to_mfq._mtp_inventory_status(
-        inventory, {"mtp_num_hidden_layers": 1}
-    ) == (True, 1)
+    assert hf_to_mfq._mtp_inventory_status(inventory, {"mtp_num_hidden_layers": 1}) == (True, 1)
 
     inventory.pop("mtp.fc.weight")
     with pytest.raises(ValueError, match="incomplete Qwen MTP head"):
-        hf_to_mfq._mtp_inventory_status(
-            inventory, {"mtp_num_hidden_layers": 1}
-        )
+        hf_to_mfq._mtp_inventory_status(inventory, {"mtp_num_hidden_layers": 1})
 
 
 def test_qwen35_mtp_plan_preserves_complete_head_and_protected_weights(tmp_path):
@@ -343,14 +471,13 @@ def test_qwen35_mtp_plan_preserves_complete_head_and_protected_weights(tmp_path)
     )
 
     by_name = {item.name: item for item in plan}
-    assert set(by_name) == names
-    assert by_name["mtp.fc.weight"].target_dtype == "BF16"
-    assert by_name["mtp.pre_fc_norm_hidden.weight"].target_dtype == "F32"
-    assert by_name[prefix + "self_attn.q_proj.weight"].target_dtype == "NINT4"
-    assert (
-        by_name[prefix + "self_attn.q_proj.weight"].gguf_name
-        == "blk.64.attn_q.weight"
-    )
+    by_source = {item.source_name: item for item in plan}
+    assert set(by_source) == names
+    assert all(name.startswith("predictor.") for name in by_name)
+    assert by_source["mtp.fc.weight"].target_dtype == "BF16"
+    assert by_source["mtp.pre_fc_norm_hidden.weight"].target_dtype == "F32"
+    assert by_source[prefix + "self_attn.q_proj.weight"].target_dtype == "BF16"
+    assert by_source[prefix + "self_attn.q_proj.weight"].gguf_name == "blk.64.attn_q.weight"
 
 
 def test_qwen35_mtp_augmentation_copies_base_and_mirrors_backbone_policy(tmp_path):
@@ -378,18 +505,10 @@ def test_qwen35_mtp_augmentation_copies_base_and_mirrors_backbone_policy(tmp_pat
         "mlp.down_proj.weight",
     )
     source_tensors = {
-        "mtp.fc.weight": torch.arange(32, dtype=torch.float32)
-        .reshape(4, 8)
-        .to(torch.bfloat16),
-        "mtp.pre_fc_norm_embedding.weight": torch.arange(
-            4, dtype=torch.float32
-        ).to(torch.bfloat16),
-        "mtp.pre_fc_norm_hidden.weight": torch.arange(
-            4, dtype=torch.float32
-        ).to(torch.bfloat16),
-        "mtp.norm.weight": torch.arange(4, dtype=torch.float32).to(
-            torch.bfloat16
-        ),
+        "mtp.fc.weight": torch.arange(32, dtype=torch.float32).reshape(4, 8).to(torch.bfloat16),
+        "mtp.pre_fc_norm_embedding.weight": torch.arange(4, dtype=torch.float32).to(torch.bfloat16),
+        "mtp.pre_fc_norm_hidden.weight": torch.arange(4, dtype=torch.float32).to(torch.bfloat16),
+        "mtp.norm.weight": torch.arange(4, dtype=torch.float32).to(torch.bfloat16),
     }
     base_tensors = {
         "sentinel.weight": np.arange(6, dtype=np.float32).reshape(2, 3),
@@ -400,9 +519,9 @@ def test_qwen35_mtp_augmentation_copies_base_and_mirrors_backbone_policy(tmp_pat
     for suffix in layer_suffixes:
         is_norm = "norm" in suffix
         shape = (4,) if is_norm else (4, 4)
-        source_tensors[f"mtp.layers.0.{suffix}"] = torch.arange(
-            int(np.prod(shape)), dtype=torch.float32
-        ).reshape(shape).to(torch.bfloat16)
+        source_tensors[f"mtp.layers.0.{suffix}"] = (
+            torch.arange(int(np.prod(shape)), dtype=torch.float32).reshape(shape).to(torch.bfloat16)
+        )
         base_tensors[f"model.language_model.layers.0.{suffix}"] = (
             np.arange(int(np.prod(shape)), dtype=np.float32).reshape(shape)
             if is_norm
@@ -445,21 +564,19 @@ def test_qwen35_mtp_augmentation_copies_base_and_mirrors_backbone_policy(tmp_pat
         assert after.header.extra["custom_base_metadata"] == "preserved"
         assert after.header.extra["mtp"]["included"] is True
         assert after.header.extra["mtp"]["tensor_count"] == 15
-        assert after.read_blob("sentinel.weight") == before.read_blob(
-            "sentinel.weight"
-        )
-        mtp_names = {name for name in after if name.startswith("mtp.")}
+        assert after.read_blob("sentinel.weight") == before.read_blob("sentinel.weight")
+        mtp_names = {name for name in after if name.startswith("predictor.")}
         assert len(mtp_names) == 15
-        assert after.records["mtp.fc.weight"].dtype == "BF16"
-        assert after.records["mtp.norm.weight"].dtype == "BF16"
-        assert (
-            after.records["mtp.layers.0.self_attn.q_proj.weight"].dtype
-            == "F16"
-        )
-        assert (
-            after.records["mtp.layers.0.input_layernorm.weight"].dtype
-            == "F32"
-        )
+        assert after.records["predictor.fusion.weight"].dtype == "BF16"
+        assert after.records["predictor.output_norm.weight"].dtype == "BF16"
+        assert after.records["predictor.block.0.attention.query.weight"].dtype == "F16"
+        assert after.records["predictor.block.0.attention.norm.weight"].dtype == "F32"
+        assert "model.language_model.layers.0.self_attn.q_proj.weight" not in after
+        assert "model.block.0.attention.query.weight" in after
+        graph = json.loads(after.read_blob(MODEL_GRAPH_ASSET))
+        assert graph["schema_version"] == 1
+        assert graph["architecture"] == "qwen3_5"
+        assert graph["optional_components"]["predictor"] is True
 
 
 def test_qwen4_mtp_plan_mirrors_mixed_nintm_expert_policy(tmp_path):
@@ -581,15 +698,11 @@ def test_qwen4_mtp_plan_mirrors_mixed_nintm_expert_policy(tmp_path):
 
     base_tensors: dict[str, object] = {
         MODEL_CONFIG_ASSET: json.dumps(config).encode(),
-        "model.language_model.layers.0.mlp.experts.gate_up_proj": mixed(
-            gate_up_shape
-        ),
+        "model.language_model.layers.0.mlp.experts.gate_up_proj": mixed(gate_up_shape),
         "model.language_model.layers.0.mlp.experts.down_proj": mixed(down_shape),
     }
     for suffix, shape in layer_shapes.items():
-        base_tensors["model.language_model.layers.0." + suffix] = np.zeros(
-            shape, dtype=np.float16
-        )
+        base_tensors["model.language_model.layers.0." + suffix] = np.zeros(shape, dtype=np.float16)
     base = tmp_path / "qwen4-base.mfq"
     save(base, FileHeader(version=2, model_arch="qwen4-exp"), base_tensors)
 
@@ -712,10 +825,7 @@ def test_hf_and_gguf_recipe_family_tables_cannot_diverge():
 
 
 def test_artifact_provenance_omits_local_directories(tmp_path):
-    assert (
-        hf_to_mfq._artifact_provenance_name(str(tmp_path / "Q4_0.gguf"))
-        == "Q4_0.gguf"
-    )
+    assert hf_to_mfq._artifact_provenance_name(str(tmp_path / "Q4_0.gguf")) == "Q4_0.gguf"
 
 
 @pytest.mark.parametrize(
@@ -735,10 +845,7 @@ def test_artifact_provenance_omits_local_directories(tmp_path):
     ],
 )
 def test_gemma4_hf_to_gguf_name_mapping(suffix, gguf_suffix):
-    assert (
-        _hf_to_gguf_name(f"model.language_model.layers.29.{suffix}")
-        == f"blk.29.{gguf_suffix}"
-    )
+    assert _hf_to_gguf_name(f"model.language_model.layers.29.{suffix}") == f"blk.29.{gguf_suffix}"
 
 
 def test_minicpmo45_hf_to_gguf_name_mapping():
@@ -746,9 +853,7 @@ def test_minicpmo45_hf_to_gguf_name_mapping():
     assert _hf_to_gguf_name("llm.model.norm.weight") == "output_norm.weight"
     assert _hf_to_gguf_name("llm.lm_head.weight") == "output.weight"
     assert (
-        _hf_to_gguf_name(
-            "llm.model.layers.3.post_attention_layernorm.weight"
-        )
+        _hf_to_gguf_name("llm.model.layers.3.post_attention_layernorm.weight")
         == "blk.3.ffn_norm.weight"
     )
     assert _hf_to_gguf_name("llm.model.layers.3.self_attn.q_proj.weight") == "blk.3.attn_q.weight"
@@ -800,30 +905,42 @@ def test_minicpmo45_plan_preserves_raw_graph_matrices(tmp_path):
 
     plan = build_hf_plan(root, False, None, "F16")
     targets = {item.name: item.target_dtype for item in plan}
+    names_by_source = {item.source_name: item.name for item in plan}
 
-    assert targets["llm.model.layers.0.self_attn.q_proj.weight"] == "NINT4"
-    assert targets["vpm.encoder.layers.0.self_attn.q_proj.weight"] == "NINT4"
-    for name in tensors:
-        if name not in {
+    text_name = "model.block.0.attention.query.weight"
+    vision_name = "vision.block.0.attention.query.weight"
+    assert names_by_source["llm.model.layers.0.self_attn.q_proj.weight"] == text_name
+    assert names_by_source["vpm.encoder.layers.0.self_attn.q_proj.weight"] == vision_name
+    assert targets[text_name] == "NINT4"
+    assert targets[vision_name] == "BF16"
+    for source_name in tensors:
+        if source_name not in {
             "llm.model.layers.0.self_attn.q_proj.weight",
             "vpm.encoder.layers.0.self_attn.q_proj.weight",
         }:
-            assert targets[name] == "BF16"
+            assert targets[names_by_source[source_name]] == "BF16"
 
     text_plan = build_hf_plan(root, True, None, "F16")
-    assert [item.name for item in text_plan] == ["llm.model.layers.0.self_attn.q_proj.weight"]
+    assert [item.name for item in text_plan] == [text_name]
+
+    all_quantized = build_hf_plan(
+        root,
+        False,
+        None,
+        "F16",
+        quantize_vision=True,
+    )
+    assert {item.name: item.target_dtype for item in all_quantized}[
+        vision_name
+    ] == "NINT4"
 
 
 def test_minicpmo45_llm_recipe_keeps_other_components_at_source_precision(tmp_path):
     root = tmp_path / "minicpmo45-recipe"
     root.mkdir()
     tensors = {
-        "llm.model.layers.0.self_attn.q_proj.weight": torch.zeros(
-            (8, 8), dtype=torch.bfloat16
-        ),
-        "vpm.encoder.layers.0.self_attn.q_proj.weight": torch.zeros(
-            (8, 8), dtype=torch.bfloat16
-        ),
+        "llm.model.layers.0.self_attn.q_proj.weight": torch.zeros((8, 8), dtype=torch.bfloat16),
+        "vpm.encoder.layers.0.self_attn.q_proj.weight": torch.zeros((8, 8), dtype=torch.bfloat16),
         "tts.emb_text.weight": torch.zeros((8, 8), dtype=torch.bfloat16),
     }
     save_file(tensors, root / "model.safetensors")
@@ -841,9 +958,9 @@ def test_minicpmo45_llm_recipe_keeps_other_components_at_source_precision(tmp_pa
     targets = {item.name: item.target_dtype for item in plan}
 
     assert targets == {
-        "llm.model.layers.0.self_attn.q_proj.weight": "NINT5",
-        "tts.emb_text.weight": "BF16",
-        "vpm.encoder.layers.0.self_attn.q_proj.weight": "BF16",
+        "model.block.0.attention.query.weight": "NINT5",
+        "tts.text_embedding.weight": "BF16",
+        "vision.block.0.attention.query.weight": "BF16",
     }
 
 
@@ -951,9 +1068,7 @@ def test_hf_imatrix_binds_expert_wise_entries(tmp_path):
     binding = _bind_hf_imatrix(imatrix, [item])[item.name]
 
     np.testing.assert_array_equal(binding.rows(2, 5), values[[0, 1, 1]])
-    np.testing.assert_array_equal(
-        binding.selected(np.asarray([0, 3], dtype=np.int64)), values
-    )
+    np.testing.assert_array_equal(binding.selected(np.asarray([0, 3], dtype=np.int64)), values)
 
 
 def test_hf_imatrix_binds_an_ordinary_vq_tensor(tmp_path):
@@ -996,15 +1111,13 @@ def test_hf_convert_passes_imatrix_rows_to_nint_writer(
     tensor_name = "model.language_model.layers.0.mlp.down_proj.weight"
     save_file(
         {
-            tensor_name: torch.linspace(
-                -2.0, 2.0, steps=4 * 24, dtype=torch.float32
-            ).reshape(4, 24).to(torch.bfloat16)
+            tensor_name: torch.linspace(-2.0, 2.0, steps=4 * 24, dtype=torch.float32)
+            .reshape(4, 24)
+            .to(torch.bfloat16)
         },
         root / "model.safetensors",
     )
-    (root / "config.json").write_text(
-        json.dumps({"model_type": "qwen3_5"}), encoding="utf-8"
-    )
+    (root / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}), encoding="utf-8")
     imatrix_path = tmp_path / "imatrix.gguf"
     imatrix_path.write_bytes(b"test")
     importance = np.linspace(0.25, 2.0, 24, dtype=np.float32).reshape(1, 24)
@@ -1057,7 +1170,7 @@ def test_hf_convert_passes_imatrix_rows_to_nint_writer(
     header, store = load_mmap(output)
     try:
         assert header.extra["imatrix"]["bindings"] == {
-            tensor_name: "blk.0.ffn_down.weight"
+            "model.block.0.mlp.down.weight": "blk.0.ffn_down.weight"
         }
     finally:
         store.close()
@@ -1076,7 +1189,9 @@ def test_hf_convert_writes_an_ordinary_vq_tensor_via_precision_override(
                 2.0,
                 steps=8 * 24,
                 dtype=torch.float32,
-            ).reshape(8, 24).to(torch.bfloat16)
+            )
+            .reshape(8, 24)
+            .to(torch.bfloat16)
         },
         root / "model.safetensors",
     )
@@ -1113,11 +1228,9 @@ def test_hf_convert_writes_an_ordinary_vq_tensor_via_precision_override(
 
     header, store = load_mmap(output)
     try:
-        assert store.records[tensor_name].dtype == "NVQ2"
+        assert store.records["model.block.0.mlp.down.weight"].dtype == "NVQ2"
         assert header.extra["target_counts"] == {"NVQ2": 1}
-        assert header.extra["tensor_precision_overrides"] == {
-            "blk.0.ffn_down.weight": "NVQ2"
-        }
+        assert header.extra["tensor_precision_overrides"] == {"blk.0.ffn_down.weight": "NVQ2"}
     finally:
         store.close()
 
@@ -1129,9 +1242,9 @@ def test_hf_convert_trains_and_writes_tensorwise_jsc_vq(tmp_path):
     generator = torch.Generator().manual_seed(17)
     save_file(
         {
-            tensor_name: torch.randn(
-                (16, 24), generator=generator, dtype=torch.float32
-            ).to(torch.bfloat16)
+            tensor_name: torch.randn((16, 24), generator=generator, dtype=torch.float32).to(
+                torch.bfloat16
+            )
         },
         root / "model.safetensors",
     )
@@ -1174,8 +1287,8 @@ def test_hf_convert_trains_and_writes_tensorwise_jsc_vq(tmp_path):
 
     header, store = load_mmap(output)
     try:
-        assert store.records[tensor_name].dtype == "NVQ2J"
-        result = header.extra["nvq_codebooks"][tensor_name]
+        assert store.records["model.block.0.mlp.down.weight"].dtype == "NVQ2J"
+        result = header.extra["nvq_codebooks"]["model.block.0.mlp.down.weight"]
         assert result["loaded"] is False
         assert Path(result["artifact"]).is_file()
     finally:
@@ -1193,21 +1306,15 @@ def test_hf_convert_matches_llamacpp_mostly_bf16_policy(tmp_path):
         "model.language_model.embed_tokens.weight": torch.tensor(
             [[1.0, -2.5], [3.25, 0.125]], dtype=torch.bfloat16
         ),
-        "model.language_model.norm.weight": torch.tensor(
-            [0.75, 1.5], dtype=torch.float32
-        ),
+        "model.language_model.norm.weight": torch.tensor([0.75, 1.5], dtype=torch.float32),
         "lm_head.weight": f32_matrix,
         "model.language_model.layers.0.linear_attn.conv1d.weight": torch.tensor(
             [[0.125, -0.25], [0.5, 2.0]], dtype=torch.float32
         ),
-        "model.language_model.position_ids": torch.tensor(
-            [0, 1], dtype=torch.int64
-        ),
+        "model.language_model.position_ids": torch.tensor([0, 1], dtype=torch.int64),
     }
     save_file(tensors, root / "model.safetensors")
-    (root / "config.json").write_text(
-        json.dumps({"model_type": "qwen3_5"}), encoding="utf-8"
-    )
+    (root / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}), encoding="utf-8")
     output = tmp_path / "model-bf16.mfq"
     args = hf_to_mfq.build_parser().parse_args(
         [
@@ -1230,17 +1337,12 @@ def test_hf_convert_matches_llamacpp_mostly_bf16_policy(tmp_path):
         assert "quant_backend" not in header.extra
         assert "device" not in header.extra
         assert header.extra["target_counts"] == {"BF16": 2, "F32": 2, "I64": 1}
-        assert store.records["model.language_model.embed_tokens.weight"].dtype == "BF16"
-        assert store.records["lm_head.weight"].dtype == "BF16"
-        assert store.records["model.language_model.norm.weight"].dtype == "F32"
-        assert (
-            store.records[
-                "model.language_model.layers.0.linear_attn.conv1d.weight"
-            ].dtype
-            == "F32"
-        )
-        assert store.records["model.language_model.position_ids"].dtype == "I64"
-        restored = store["model.language_model.embed_tokens.weight"]
+        assert store.records["model.token_embedding.weight"].dtype == "BF16"
+        assert store.records["model.output.weight"].dtype == "BF16"
+        assert store.records["model.output_norm.weight"].dtype == "F32"
+        assert store.records["model.block.0.linear_attention.conv.weight"].dtype == "F32"
+        assert store.records["model.position_ids"].dtype == "I64"
+        restored = store["model.token_embedding.weight"]
         assert is_bfloat16_array(restored)
         np.testing.assert_array_equal(
             restored,
@@ -1254,23 +1356,16 @@ def test_hf_convert_matches_llamacpp_mostly_bf16_policy(tmp_path):
             source_bits,
         )
         expected_bf16 = (
-            (
-                source_bits.astype(np.uint64)
-                + np.uint64(0x7FFF)
-                + ((source_bits >> 16) & 1)
-            )
-            >> 16
+            (source_bits.astype(np.uint64) + np.uint64(0x7FFF) + ((source_bits >> 16) & 1)) >> 16
         ).astype(np.uint16)
-        np.testing.assert_array_equal(store["lm_head.weight"], expected_bf16)
+        np.testing.assert_array_equal(store["model.output.weight"], expected_bf16)
         np.testing.assert_array_equal(
-            store["model.language_model.norm.weight"],
+            store["model.output_norm.weight"],
             tensors["model.language_model.norm.weight"].numpy(),
         )
         np.testing.assert_array_equal(
-            store["model.language_model.layers.0.linear_attn.conv1d.weight"],
-            tensors[
-                "model.language_model.layers.0.linear_attn.conv1d.weight"
-            ].numpy(),
+            store["model.block.0.linear_attention.conv.weight"],
+            tensors["model.language_model.layers.0.linear_attn.conv1d.weight"].numpy(),
         )
     finally:
         store.close()
@@ -1301,24 +1396,21 @@ def test_glm_dsa_plan_derives_headwise_mla_and_streamed_experts(tmp_path):
     }
     for expert in range(3):
         base = f"model.layers.1.mlp.experts.{expert}."
-        tensors[base + "gate_proj.weight"] = torch.full(
-            (24, 24), float(10 * expert + 1)
-        )
-        tensors[base + "up_proj.weight"] = torch.full(
-            (24, 24), float(10 * expert + 2)
-        )
-        tensors[base + "down_proj.weight"] = torch.full(
-            (24, 24), float(10 * expert + 3)
-        )
+        tensors[base + "gate_proj.weight"] = torch.full((24, 24), float(10 * expert + 1))
+        tensors[base + "up_proj.weight"] = torch.full((24, 24), float(10 * expert + 2))
+        tensors[base + "down_proj.weight"] = torch.full((24, 24), float(10 * expert + 3))
     save_file(tensors, root / "model.safetensors")
     (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
     plan = build_hf_plan(root, True, None, "F16")
     by_name = {item.name: item for item in plan}
     assert len(plan) == 6
-    assert not any(name.startswith("model.layers.2.") for name in by_name)
-    embed = by_name["model.layers.0.self_attn.embed_q"]
-    unembed = by_name["model.layers.0.self_attn.unembed_out"]
+    assert not any(name.startswith("model.block.2.") for name in by_name)
+    embed_name = "model.block.0.attention.latent.query_embedding.weight"
+    unembed_name = "model.block.0.attention.latent.output_unembedding.weight"
+    gate_up_name = "model.block.1.mlp.experts.gate_up.weight"
+    embed = by_name[embed_name]
+    unembed = by_name[unembed_name]
     assert embed.expert_shape == (2, 24, 8)
     assert unembed.expert_shape == (2, 12, 24)
 
@@ -1329,7 +1421,7 @@ def test_glm_dsa_plan_derives_headwise_mla_and_streamed_experts(tmp_path):
     assert torch.equal(embed_weight, source_heads[:, :8].transpose(1, 2))
     assert torch.equal(unembed_weight, source_heads[:, 8:])
 
-    gate_up = by_name["model.layers.1.mlp.experts.gate_up_proj"]
+    gate_up = by_name[gate_up_name]
     stream = _GlmExpertRowSource(
         root,
         gate_up.expert_shape,
@@ -1341,12 +1433,8 @@ def test_glm_dsa_plan_derives_headwise_mla_and_streamed_experts(tmp_path):
     finally:
         stream.close()
     assert expert_one.shape == (48, 24)
-    assert torch.equal(expert_one[:24], tensors[
-        "model.layers.1.mlp.experts.1.gate_proj.weight"
-    ])
-    assert torch.equal(expert_one[24:], tensors[
-        "model.layers.1.mlp.experts.1.up_proj.weight"
-    ])
+    assert torch.equal(expert_one[:24], tensors["model.layers.1.mlp.experts.1.gate_proj.weight"])
+    assert torch.equal(expert_one[24:], tensors["model.layers.1.mlp.experts.1.up_proj.weight"])
 
     output = tmp_path / "tiny-glm.mfq"
     args = argparse.Namespace(
@@ -1372,16 +1460,14 @@ def test_glm_dsa_plan_derives_headwise_mla_and_streamed_experts(tmp_path):
     convert(args)
     _header, store = load_mmap(output)
     try:
-        assert {
-            name for name in store.records if not is_asset_record(name)
-        } == set(by_name)
+        assert {name for name in store.records if not is_asset_record(name)} == set(by_name)
         assert all(
             record.dtype == "NINTM"
             for record in store.records.values()
             if not is_asset_record(record.name)
         )
-        assert store["model.layers.0.self_attn.embed_q"].shape == (2, 24, 8)
-        assert store["model.layers.1.mlp.experts.gate_up_proj"].shape == (
+        assert store[embed_name].shape == (2, 24, 8)
+        assert store[gate_up_name].shape == (
             3,
             48,
             24,
@@ -1399,12 +1485,8 @@ def test_glm_dsa_plan_derives_headwise_mla_and_streamed_experts(tmp_path):
     _header, split_store = load_mmap(last_shard)
     try:
         assert len(split_store.paths) == 3
-        assert {
-            name for name in split_store.records if not is_asset_record(name)
-        } == set(by_name)
-        assert split_store[
-            "model.layers.1.mlp.experts.gate_up_proj"
-        ].shape == (3, 48, 24)
+        assert {name for name in split_store.records if not is_asset_record(name)} == set(by_name)
+        assert split_store[gate_up_name].shape == (3, 48, 24)
     finally:
         split_store.close()
 
@@ -1462,20 +1544,24 @@ def test_flash_next_plan_dequantizes_and_fuses_separate_fp8_experts(
     )
 
     plan = build_hf_plan(root, True, None, "F16")
+    canonical_prefix = f"model.block.{layer}.mlp.experts"
+    canonical_metadata = "model.runtime.hash_metadata"
     assert {item.name for item in plan} == {
-        prefix + ".gate_up_proj",
-        prefix + ".down_proj",
-        integer_metadata,
+        canonical_prefix + ".gate_up.weight",
+        canonical_prefix + ".down.weight",
+        canonical_metadata,
     }
     assert all(
         item.target_dtype == "NINTM"
         for item in plan
-        if item.name != integer_metadata
+        if item.name != canonical_metadata
     )
-    assert next(item for item in plan if item.name == integer_metadata).target_dtype == "I64"
+    assert next(
+        item for item in plan if item.name == canonical_metadata
+    ).target_dtype == "I64"
     assert not any("scale_inv" in item.name for item in plan)
 
-    gate_up = next(item for item in plan if item.name.endswith("gate_up_proj"))
+    gate_up = next(item for item in plan if item.name.endswith("gate_up.weight"))
     stream = _GlmExpertRowSource(
         root,
         gate_up.expert_shape,
@@ -1595,6 +1681,20 @@ def test_glm5_next_plan_derives_scaled_fp8_mla_for_backbone_and_mtp(tmp_path):
             ("down_proj", (hidden, expert_hidden)),
         ):
             tensors[f"{expert}.{projection}.weight"] = torch.ones(shape)
+    predictor = "model.language_model.layers.4."
+    for suffix, shape in {
+        "enorm.weight": (hidden,),
+        "hnorm.weight": (hidden,),
+        "eh_proj.weight": (hidden, 2 * hidden),
+        "input_layernorm.weight": (hidden,),
+        "post_attention_layernorm.weight": (hidden,),
+        "self_attn.q_a_proj.weight": (hidden, hidden),
+        "self_attn.kv_a_proj_with_mqa.weight": (hidden, hidden),
+        "self_attn.o_proj.weight": (hidden, hidden),
+        "mlp.gate.weight": (1, hidden),
+        "shared_head.norm.weight": (hidden,),
+    }.items():
+        tensors[predictor + suffix] = torch.ones(shape)
     save_file(tensors, root / "model.safetensors")
     (root / "config.json").write_text(
         json.dumps({"model_type": "glm5_next", "text_config": text_config}),
@@ -1606,8 +1706,13 @@ def test_glm5_next_plan_derives_scaled_fp8_mla_for_backbone_and_mtp(tmp_path):
     for layer, multiplier in ((3, 0.25), (4, 0.5)):
         attention = f"model.language_model.layers.{layer}.self_attn"
         assert attention + ".kv_b_proj.weight" not in by_name
-        embed = by_name[attention + ".embed_q"]
-        unembed = by_name[attention + ".unembed_out"]
+        canonical = (
+            "model.block.3.attention"
+            if layer == 3
+            else "predictor.block.0.attention"
+        )
+        embed = by_name[canonical + ".latent.query_embedding.weight"]
+        unembed = by_name[canonical + ".latent.output_unembedding.weight"]
         assert embed.expert_shape == (heads, kv_rank, nope)
         assert unembed.expert_shape == (heads, value, kv_rank)
         assert embed.source_quantization == "fp8_block128_inv"
@@ -1621,10 +1726,10 @@ def test_glm5_next_plan_derives_scaled_fp8_mla_for_backbone_and_mtp(tmp_path):
             expected_heads[:, :nope].transpose(1, 2),
         )
 
-    assert sum(name.endswith(".embed_q") for name in by_name) == 2
-    assert sum(name.endswith(".unembed_out") for name in by_name) == 2
-    assert sum(name.endswith(".experts.gate_up_proj") for name in by_name) == 2
-    assert sum(name.endswith(".experts.down_proj") for name in by_name) == 2
+    assert sum(name.endswith(".latent.query_embedding.weight") for name in by_name) == 2
+    assert sum(name.endswith(".latent.output_unembedding.weight") for name in by_name) == 2
+    assert sum(name.endswith(".experts.gate_up.weight") for name in by_name) == 2
+    assert sum(name.endswith(".experts.down.weight") for name in by_name) == 2
 
 
 def test_glm_expert_row_source_streams_across_shards(tmp_path):

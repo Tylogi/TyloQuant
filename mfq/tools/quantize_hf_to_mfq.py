@@ -1,8 +1,9 @@
-"""Convert a HF safetensors checkpoint to MFQ.
+"""Convert an HF safetensors checkpoint to MFQ.
 
-Default policy for the first Qwen3.5/3.6 smoke:
-- all 2D tensors -> NINT4, axis=0
-- all other tensors -> dense F16
+Besides explicit GGUF recipes and calibration schemes, the converter exposes
+llama.cpp-style standard presets.  The latter reproduce the useful part of
+the upstream K-quant policy (sensitive tensor classes receive more bits)
+while selecting the equivalent native MFQ NINT storage families.
 """
 
 from __future__ import annotations
@@ -24,6 +25,11 @@ import numpy as np
 import torch
 from safetensors import safe_open
 
+from mfq.architectures.tensor_schema import (
+    graph_spec_for_plan,
+    map_source_tensor_name,
+    tensor_schema_for_config,
+)
 from mfq.calibration.artifact import (
     CalibrationScheme,
     ExpertPrecision,
@@ -37,6 +43,7 @@ from mfq.formats.assets import (
     HF_TOKENIZER_JSON_ASSET,
     MINICPMO45_RESAMPLER_POS_EMBED_ASSET,
     MODEL_CONFIG_ASSET,
+    MODEL_GRAPH_ASSET,
     TOKENIZER_GGUF_ASSET,
     RuntimeAsset,
     gguf_metadata_asset,
@@ -44,6 +51,7 @@ from mfq.formats.assets import (
     is_asset_record,
     minicpmo45_resampler_pos_embed_asset,
     model_config_asset,
+    model_graph_asset,
     runtime_asset_manifest,
 )
 from mfq.formats.header import MFQ_MAGIC, FileHeader
@@ -217,6 +225,17 @@ from mfq.quantize.nint_quant_torch import quantize_axis0 as nint_quantize_axis0_
 from mfq.quantize.npq0_l import Npq0LConfig, Npq0LTables, quantize_npq0_l_fixed
 from mfq.quantize.npq0_s import Npq0SConfig, Npq0STables, quantize_npq0_s_fixed
 from mfq.quantize.nvq_jsc import NvqJscConfig, NvqJscTables, initial_jsc_tables
+from mfq.quantize.standard_presets import (
+    STANDARD_PRESET_NAMES,
+    ModelTopology,
+    TensorRole,
+    TensorScope,
+    describe_tensor,
+    select_recipe_type,
+)
+from mfq.quantize.standard_presets import (
+    normalize_preset as _normalize_standard_preset,
+)
 from mfq.quantize.tpq import quantize_tpq_pq_fixed
 
 
@@ -252,9 +271,7 @@ class TensorPlan:
         if any(value.nint_spec is None for value in self.expert_precisions):
             return None
         return tuple(
-            value.nint_spec
-            for value in self.expert_precisions
-            if value.nint_spec is not None
+            value.nint_spec for value in self.expert_precisions if value.nint_spec is not None
         )
 
 
@@ -334,16 +351,10 @@ class _RawSafeTensorSlice:
             raise KeyError(f"safetensors tensor is absent: {self.name}")
         dtype_name = str(entry.get("dtype", ""))
         if dtype_name not in self._NUMPY_DTYPES:
-            raise ValueError(
-                f"unsupported raw safetensors dtype {dtype_name}: {self.name}"
-            )
+            raise ValueError(f"unsupported raw safetensors dtype {dtype_name}: {self.name}")
         shape = entry.get("shape")
         offsets = entry.get("data_offsets")
-        if (
-            not isinstance(shape, list)
-            or not isinstance(offsets, list)
-            or len(offsets) != 2
-        ):
+        if not isinstance(shape, list) or not isinstance(offsets, list) or len(offsets) != 2:
             raise ValueError(f"invalid safetensors entry: {self.name}")
         self.dtype_name = dtype_name
         self.numpy_dtype = self._NUMPY_DTYPES[dtype_name]
@@ -385,12 +396,8 @@ class _RawSafeTensorSlice:
     ) -> torch.Tensor:
         if end is None:
             indices = np.asarray(start, dtype=np.int64).reshape(-1)
-            if indices.size and (
-                int(indices.min()) < 0 or int(indices.max()) >= self.rows
-            ):
-                raise IndexError(
-                    f"safetensors row indices fall outside [0, {self.rows})"
-                )
+            if indices.size and (int(indices.min()) < 0 or int(indices.max()) >= self.rows):
+                raise IndexError(f"safetensors row indices fall outside [0, {self.rows})")
             mapped = np.memmap(
                 self.path,
                 mode="r",
@@ -412,22 +419,15 @@ class _RawSafeTensorSlice:
             return tensor.to(device=device)
         start = int(start)
         if start < 0 or end < start or end > self.rows:
-            raise IndexError(
-                f"invalid safetensors row slice {start}:{end} of {self.rows}"
-            )
+            raise IndexError(f"invalid safetensors row slice {start}:{end} of {self.rows}")
         row_nbytes = self.columns * self.numpy_dtype.itemsize
         nbytes = (end - start) * row_nbytes
         with self.path.open("rb", buffering=0) as handle:
             handle.seek(self.data_offset + start * row_nbytes)
             raw = handle.read(nbytes)
         if len(raw) != nbytes:
-            raise EOFError(
-                f"short safetensors row read for {self.name}: "
-                f"{len(raw)} != {nbytes}"
-            )
-        return self._decode(raw, (end - start, self.columns)).to(
-            device=device
-        )
+            raise EOFError(f"short safetensors row read for {self.name}: {len(raw)} != {nbytes}")
+        return self._decode(raw, (end - start, self.columns)).to(device=device)
 
     def read_expert_rows(
         self,
@@ -438,20 +438,10 @@ class _RawSafeTensorSlice:
         device: str | torch.device,
     ) -> torch.Tensor:
         if len(self.shape) != 3:
-            raise ValueError(
-                f"expert row reads require rank 3, got {self.shape}"
-            )
+            raise ValueError(f"expert row reads require rank 3, got {self.shape}")
         n_experts, rows_per_expert, _ = self.shape
-        if (
-            expert < 0
-            or expert >= n_experts
-            or start < 0
-            or end < start
-            or end > rows_per_expert
-        ):
-            raise IndexError(
-                f"invalid expert slice expert={expert} rows={start}:{end}"
-            )
+        if expert < 0 or expert >= n_experts or start < 0 or end < start or end > rows_per_expert:
+            raise IndexError(f"invalid expert slice expert={expert} rows={start}:{end}")
         row0 = expert * rows_per_expert + start
         row1 = expert * rows_per_expert + end
         return self.read_rows(row0, row1, device=device)
@@ -462,8 +452,7 @@ class _RawSafeTensorSlice:
             raw = handle.read(self.data_nbytes)
         if len(raw) != self.data_nbytes:
             raise EOFError(
-                f"short safetensors tensor read for {self.name}: "
-                f"{len(raw)} != {self.data_nbytes}"
+                f"short safetensors tensor read for {self.name}: {len(raw)} != {self.data_nbytes}"
             )
         return self._decode(raw, self.shape)
 
@@ -491,9 +480,7 @@ class _ScaledFp8TensorSlice:
         scheme: str,
     ) -> None:
         if weight.dtype_name not in {"F8_E4M3", "F8_E5M2"}:
-            raise ValueError(
-                f"scaled float8 source requires float8 weights: {weight.name}"
-            )
+            raise ValueError(f"scaled float8 source requires float8 weights: {weight.name}")
         if len(weight.shape) != 2:
             raise ValueError(
                 f"scaled float8 source requires a matrix: {weight.name} {weight.shape}"
@@ -517,9 +504,7 @@ class _ScaledFp8TensorSlice:
                 )
         elif scheme == "fp8_tensor_scale":
             if self._scale.numel() != 1:
-                raise ValueError(
-                    f"float8 tensor scale must be scalar for {weight.name}"
-                )
+                raise ValueError(f"float8 tensor scale must be scalar for {weight.name}")
         else:
             raise ValueError(f"unsupported float8 source scheme: {scheme}")
 
@@ -599,17 +584,13 @@ class _HfPlanRowSource:
         item: TensorPlan,
     ) -> None:
         if len(item.shape) != 2:
-            raise ValueError(
-                f"flat HF row source requires rank 2, got {item.shape}"
-            )
+            raise ValueError(f"flat HF row source requires rank 2, got {item.shape}")
         self.source = source
         self.offset = int(item.row_start or 0)
         self.rows = int(item.shape[0])
         self.columns = int(item.shape[1])
         if self.offset + self.rows > source.rows:
-            raise ValueError(
-                f"HF row range exceeds source tensor for {item.name}"
-            )
+            raise ValueError(f"HF row range exceeds source tensor for {item.name}")
 
     def read_rows(
         self,
@@ -690,9 +671,7 @@ def _source_quantization(
     if metadata.dtype not in _HF_FP8_DTYPES:
         return None
     if len(metadata.shape) != 2:
-        raise ValueError(
-            f"float8 HF source must be a matrix: {name} {metadata.shape}"
-        )
+        raise ValueError(f"float8 HF source must be a matrix: {name} {metadata.shape}")
 
     block_scale_name = name + "_scale_inv"
     block_scale = inventory.get(block_scale_name)
@@ -703,8 +682,7 @@ def _source_quantization(
         )
         if block_scale.shape != expected:
             raise ValueError(
-                f"float8 block scale shape differs for {name}: "
-                f"{block_scale.shape} != {expected}"
+                f"float8 block scale shape differs for {name}: {block_scale.shape} != {expected}"
             )
         return _SourceQuantization(
             "fp8_block128_inv",
@@ -722,17 +700,14 @@ def _source_quantization(
             continue
         if int(np.prod(scale.shape)) != 1:
             raise ValueError(
-                f"float8 tensor scale must contain one value for {name}: "
-                f"{scale.shape}"
+                f"float8 tensor scale must contain one value for {name}: {scale.shape}"
             )
         return _SourceQuantization(
             "fp8_tensor_scale",
             scale_name,
             scale.shard,
         )
-    raise ValueError(
-        f"float8 HF tensor has no supported scale multiplier: {name}"
-    )
+    raise ValueError(f"float8 HF tensor has no supported scale multiplier: {name}")
 
 
 def _source_quantizations(
@@ -757,9 +732,7 @@ def _raw_source_for_plan(root: Path, item: TensorPlan):
     if item.source_quantization is None:
         return weight
     if item.source_scale_name is None or item.source_scale_shard is None:
-        raise ValueError(
-            f"scaled source plan lacks scale metadata: {item.name}"
-        )
+        raise ValueError(f"scaled source plan lacks scale metadata: {item.name}")
     scale = _RawSafeTensorSlice(
         root / item.source_scale_shard,
         item.source_scale_name,
@@ -992,6 +965,17 @@ def _hf_to_gguf_name(
     *,
     mtp_layer_index: int = 40,
 ) -> str | None:
+    # Recipe aliases belong to the HF import boundary.  MFQ record names use
+    # the separate canonical namespace from ``tensor_schema``.
+    mapped = map_source_tensor_name(
+        name,
+        {
+            "model_type": "qwen3_5_text",
+            "num_hidden_layers": mtp_layer_index,
+        },
+    )
+    if mapped is not None and mapped.recipe_name is not None:
+        return mapped.recipe_name
     if name == "llm.lm_head.weight":
         return "output.weight"
     if name == "llm.model.embed_tokens.weight":
@@ -1015,7 +999,7 @@ def _hf_to_gguf_name(
 
     prefix = "model.language_model.layers."
     if name.startswith(prefix):
-        rest = name[len(prefix):]
+        rest = name[len(prefix) :]
         layer, _, suffix = rest.partition(".")
         mapped = _LAYER_NAME_MAP.get(suffix)
         if mapped is None and suffix.endswith(".weight"):
@@ -1038,11 +1022,7 @@ def _hf_to_gguf_name(
         layer = mtp_layer_index + int(mtp_match.group(1))
         suffix = mtp_match.group(2)
         mapped = _LAYER_NAME_MAP.get(suffix)
-        return (
-            f"blk.{layer}.{mapped}"
-            if mapped is not None
-            else None
-        )
+        return f"blk.{layer}.{mapped}" if mapped is not None else None
     return None
 
 
@@ -1065,21 +1045,66 @@ def _mtp_inventory_status(
     inventory: dict[str, SourceTensorMetadata],
     model_config: dict[str, object],
 ) -> tuple[bool, int]:
-    """Validate that a Qwen MTP head is either complete or absent."""
+    """Validate that an optional predictor component is complete or absent."""
 
-    count = int(model_config.get("mtp_num_hidden_layers", 0) or 0)
-    names = {name for name in inventory if name.startswith("mtp.")}
+    count = int(
+        model_config.get(
+            "mtp_num_hidden_layers",
+            model_config.get("num_nextn_predict_layers", 0),
+        )
+        or 0
+    )
+    model_type = str(model_config.get("model_type", "")).lower()
+    if model_type == "glm5_next_text":
+        base = int(model_config.get("num_hidden_layers", 0) or 0)
+        predictor_prefixes = tuple(
+            f"model.language_model.layers.{base + index}."
+            for index in range(max(0, count))
+        )
+        names = {
+            name
+            for name in inventory
+            if any(name.startswith(prefix) for prefix in predictor_prefixes)
+        }
+    else:
+        names = {name for name in inventory if name.startswith("mtp.")}
     if count <= 0:
         if names:
             raise ValueError(
-                "checkpoint contains mtp.* tensors but "
-                "mtp_num_hidden_layers is not positive"
+                "checkpoint contains predictor tensors but its configured layer count is not positive"
             )
         return False, 0
     if not names:
         return False, count
 
-    model_type = str(model_config.get("model_type", "")).lower()
+    if model_type == "glm5_next_text":
+        base = int(model_config.get("num_hidden_layers", 0) or 0)
+        required: set[str] = set()
+        for index in range(count):
+            prefix = f"model.language_model.layers.{base + index}."
+            required.update(
+                {
+                    prefix + "enorm.weight",
+                    prefix + "hnorm.weight",
+                    prefix + "eh_proj.weight",
+                    prefix + "input_layernorm.weight",
+                    prefix + "post_attention_layernorm.weight",
+                    prefix + "self_attn.q_a_proj.weight",
+                    prefix + "self_attn.kv_a_proj_with_mqa.weight",
+                    prefix + "self_attn.kv_b_proj.weight",
+                    prefix + "self_attn.o_proj.weight",
+                    prefix + "mlp.gate.weight",
+                    prefix + "shared_head.norm.weight",
+                }
+            )
+        missing = sorted(required - names)
+        if missing:
+            raise ValueError(
+                "incomplete GLM-5-Next predictor; missing tensors: "
+                + ", ".join(missing[:8])
+            )
+        return True, count
+
     if model_type == "qwen4_exp_text":
         required = {
             "mtp.fc_embedding.weight",
@@ -1111,8 +1136,7 @@ def _mtp_inventory_status(
         missing = sorted(required - names)
         if missing:
             raise ValueError(
-                "incomplete Qwen4-Exp MTP head; missing tensors: "
-                + ", ".join(missing[:8])
+                "incomplete Qwen4-Exp MTP head; missing tensors: " + ", ".join(missing[:8])
             )
         return True, count
 
@@ -1141,10 +1165,7 @@ def _mtp_inventory_status(
         )
     missing = sorted(required - names)
     if missing:
-        raise ValueError(
-            "incomplete Qwen MTP head; missing tensors: "
-            + ", ".join(missing[:8])
-        )
+        raise ValueError("incomplete Qwen MTP head; missing tensors: " + ", ".join(missing[:8]))
     return True, count
 
 
@@ -1201,9 +1222,7 @@ def _base_nintm_expert_precisions(
     finally:
         blob.release()
     if tuple(shape) != tuple(expected_shape):
-        raise ValueError(
-            f"MTP/base shape mismatch: {name} {expected_shape} != {name} {shape}"
-        )
+        raise ValueError(f"MTP/base shape mismatch: {name} {expected_shape} != {name} {shape}")
 
     precisions: list[ExpertPrecision | None] = [None] * int(shape[0])
     for pool in pools:
@@ -1215,9 +1234,7 @@ def _base_nintm_expert_precisions(
             precisions[int(expert)] = precision
     if any(precision is None for precision in precisions):  # pragma: no cover
         raise ValueError(f"base NINTM tensor has an incomplete expert policy: {name}")
-    return tuple(
-        precision for precision in precisions if precision is not None
-    )
+    return tuple(precision for precision in precisions if precision is not None)
 
 
 def _mtp_plan_from_base(
@@ -1240,9 +1257,7 @@ def _mtp_plan_from_base(
     source_type = str(source_text.get("model_type", ""))
     base_type = str(base_text.get("model_type", ""))
     if source_type and base_type and source_type != base_type:
-        raise ValueError(
-            f"MTP source/base model_type mismatch: {source_type} != {base_type}"
-        )
+        raise ValueError(f"MTP source/base model_type mismatch: {source_type} != {base_type}")
     base_layers = int(base_text.get("num_hidden_layers", 0) or 0)
     if base_layers and base_layers != backbone_layers:
         raise ValueError(
@@ -1258,14 +1273,8 @@ def _mtp_plan_from_base(
     ):
         source_value = source_text.get(key)
         base_value = base_text.get(key)
-        if (
-            source_value is not None
-            and base_value is not None
-            and source_value != base_value
-        ):
-            raise ValueError(
-                f"MTP source/base {key} mismatch: {source_value} != {base_value}"
-            )
+        if source_value is not None and base_value is not None and source_value != base_value:
+            raise ValueError(f"MTP source/base {key} mismatch: {source_value} != {base_value}")
 
     hidden_size = int(source_text.get("hidden_size", 0) or 0)
     expected_root_shapes = (
@@ -1279,26 +1288,32 @@ def _mtp_plan_from_base(
         else {}
     )
 
+    # DELETE with ``mfq.compat.legacy_tensor_names`` after schema-v1 migration.
+    # Compatibility is resolved once at the container boundary; the policy
+    # below continues to operate on canonical names only.
+    from mfq.compat.legacy_tensor_names import qwen35_legacy_name_map
+
+    legacy_to_canonical = qwen35_legacy_name_map(base_store.records, source_config)
+    legacy_by_canonical = {canonical: legacy for legacy, canonical in legacy_to_canonical.items()}
+
     selected: list[TensorPlan] = []
     for item in plan:
-        if not item.name.startswith("mtp."):
+        source_name = item.source_name or item.name
+        if not source_name.startswith("mtp."):
             continue
         analogue = _mtp_backbone_analogue(
-            item.name,
+            source_name,
             backbone_layers=backbone_layers,
             mtp_layers=mtp_layers,
         )
         if analogue is None:
-            expected_shape = expected_root_shapes.get(item.name)
+            expected_shape = expected_root_shapes.get(source_name)
             if expected_shape is not None and item.shape != expected_shape:
                 raise ValueError(
-                    f"invalid MTP root tensor shape: {item.name} "
-                    f"{item.shape} != {expected_shape}"
+                    f"invalid MTP root tensor shape: {item.name} {item.shape} != {expected_shape}"
                 )
             target_dtype = (
-                item.source_dtype
-                if item.source_dtype in {"BF16", "F16", "F32"}
-                else "F16"
+                item.source_dtype if item.source_dtype in {"BF16", "F16", "F32"} else "F16"
             )
             selected.append(
                 replace(
@@ -1310,10 +1325,19 @@ def _mtp_plan_from_base(
             )
             continue
 
-        base_record = base_store.records.get(analogue)
+        analogue_mapping = map_source_tensor_name(analogue, source_config)
+        canonical_analogue = (
+            analogue_mapping.canonical_name if analogue_mapping is not None else analogue
+        )
+        base_name = (
+            canonical_analogue
+            if canonical_analogue in base_store.records
+            else legacy_by_canonical.get(canonical_analogue, canonical_analogue)
+        )
+        base_record = base_store.records.get(base_name)
         if base_record is None:
             raise ValueError(
-                f"base MFQ lacks the backbone tensor required for MTP policy: {analogue}"
+                f"base MFQ lacks the backbone tensor required for MTP policy: {canonical_analogue}"
             )
         source_analogue = inventory.get(analogue)
         if source_analogue is not None and source_analogue.shape != item.shape:
@@ -1324,7 +1348,7 @@ def _mtp_plan_from_base(
         if base_record.dtype == "NINTM":
             expert_precisions = _base_nintm_expert_precisions(
                 base_store,
-                analogue,
+                base_name,
                 item.shape,
             )
             selected.append(
@@ -1338,12 +1362,11 @@ def _mtp_plan_from_base(
                 )
             )
             continue
-        base_tensor = base_store[analogue]
+        base_tensor = base_store[base_name]
         base_shape = tuple(int(value) for value in base_tensor.shape)
         if base_shape != item.shape:
             raise ValueError(
-                f"MTP/base shape mismatch: {item.name} {item.shape} != "
-                f"{analogue} {base_shape}"
+                f"MTP/base shape mismatch: {item.name} {item.shape} != {analogue} {base_shape}"
             )
         target_spec = None
         if base_record.dtype.startswith("NINT") and base_record.dtype != "NINT8-0":
@@ -1360,7 +1383,9 @@ def _mtp_plan_from_base(
         )
 
     selected_names = {item.name for item in selected}
-    expected_names = {item.name for item in plan if item.name.startswith("mtp.")}
+    expected_names = {
+        item.name for item in plan if (item.source_name or item.name).startswith("mtp.")
+    }
     if selected_names != expected_names:  # pragma: no cover - planner invariant
         raise ValueError("MTP conversion plan did not preserve the complete head")
     return selected
@@ -1406,9 +1431,7 @@ def _hf_imatrix_shapes(
 ) -> tuple[tuple[int, ...], tuple[int, int]]:
     original_shape = item.expert_shape or item.shape
     if len(original_shape) < 2:
-        raise ValueError(
-            f"imatrix binding requires a matrix tensor: {item.name} {original_shape}"
-        )
+        raise ValueError(f"imatrix binding requires a matrix tensor: {item.name} {original_shape}")
     storage_shape = (
         int(np.prod(original_shape[:-1])),
         int(original_shape[-1]),
@@ -1417,10 +1440,7 @@ def _hf_imatrix_shapes(
 
 
 def _hf_plan_supports_imatrix(item: TensorPlan) -> bool:
-    if (
-        item.target_dtype.startswith("NVQ")
-        or item.target_dtype in _IMATRIX_NINT_DTYPES
-    ):
+    if item.target_dtype.startswith("NVQ") or item.target_dtype in _IMATRIX_NINT_DTYPES:
         return True
     return bool(
         item.target_dtype == "NINTM"
@@ -1475,9 +1495,7 @@ def _bind_hf_imatrix(
                 slice(start, end),
             )
             if resolved is None:
-                raise RuntimeError(
-                    f"imatrix binding disappeared for {_item.name}"
-                )
+                raise RuntimeError(f"imatrix binding disappeared for {_item.name}")
             return resolved[1]
 
         def selected(
@@ -1495,18 +1513,14 @@ def _bind_hf_imatrix(
                 np.asarray(row_ids, dtype=np.int64),
             )
             if resolved is None:
-                raise RuntimeError(
-                    f"imatrix binding disappeared for {_item.name}"
-                )
+                raise RuntimeError(f"imatrix binding disappeared for {_item.name}")
             return resolved[1]
 
         bindings[item.name] = HfImatrixBinding(entry_name, rows, selected)
     if missing:
         preview = ", ".join(missing[:8])
         suffix = "" if len(missing) <= 8 else f" ... ({len(missing)} total)"
-        raise ValueError(
-            f"imatrix is missing required HF NINT/NVQ tensors: {preview}{suffix}"
-        )
+        raise ValueError(f"imatrix is missing required HF NINT/NVQ tensors: {preview}{suffix}")
     return bindings
 
 
@@ -1519,9 +1533,7 @@ def _hf_expert_importance(
     if item.expert_shape is None:
         raise ValueError(f"NINTM plan lacks expert shape: {item.name}")
     n_experts, rows_per_expert, _ = item.expert_shape
-    return binding.selected(
-        np.arange(n_experts, dtype=np.int64) * rows_per_expert
-    )
+    return binding.selected(np.arange(n_experts, dtype=np.int64) * rows_per_expert)
 
 
 def _dtype_for_recipe_type(gguf_type: str, dense_dtype: str) -> str:
@@ -1529,9 +1541,7 @@ def _dtype_for_recipe_type(gguf_type: str, dense_dtype: str) -> str:
     try:
         return _RECIPE_TARGETS[gguf_type]
     except KeyError as exc:
-        raise ValueError(
-            f"unsupported GGUF recipe tensor type: {gguf_type}"
-        ) from exc
+        raise ValueError(f"unsupported GGUF recipe tensor type: {gguf_type}") from exc
 
 
 def _load_tensor_precision_overrides(path: str | Path) -> dict[str, str]:
@@ -1549,9 +1559,7 @@ def _load_tensor_precision_overrides(path: str | Path) -> dict[str, str]:
         if not name:
             raise ValueError("tensor precision override contains an empty name")
         if dtype not in _TENSOR_OVERRIDE_DTYPES:
-            raise ValueError(
-                f"unsupported tensor precision override for {name}: {dtype}"
-            )
+            raise ValueError(f"unsupported tensor precision override for {name}: {dtype}")
         result[name] = dtype
     if not result:
         raise ValueError("tensor precision override document is empty")
@@ -1571,7 +1579,11 @@ def _apply_tensor_precision_overrides(
     for item in plan:
         candidates = tuple(
             value
-            for value in (item.gguf_name, _hf_to_gguf_name(item.name), item.name)
+            for value in (
+                item.gguf_name,
+                _hf_to_gguf_name(item.source_name or item.name),
+                item.name,
+            )
             if value
         )
         matched = [name for name in candidates if name in overrides]
@@ -1588,14 +1600,11 @@ def _apply_tensor_precision_overrides(
         used.update(matched)
         if _is_compact_dtype(target) and len(item.shape) not in (2, 3):
             raise ValueError(
-                f"tensor precision override maps a non-matrix tensor to "
-                f"{target}: {item.name}"
+                f"tensor precision override maps a non-matrix tensor to {target}: {item.name}"
             )
         if len(item.shape) == 3 and _is_compact_dtype(target):
             precision = (
-                nint_expert_precision(
-                    _spec_for_target(target, NintSpec())
-                )
+                nint_expert_precision(_spec_for_target(target, NintSpec()))
                 if target.startswith("NINT")
                 else ExpertPrecision(family=target)
             )
@@ -1625,8 +1634,7 @@ def _apply_tensor_precision_overrides(
     missing = sorted(set(overrides) - used)
     if missing:
         raise ValueError(
-            "tensor precision overrides are absent from the HF conversion "
-            f"plan: {missing[:8]}"
+            f"tensor precision overrides are absent from the HF conversion plan: {missing[:8]}"
         )
     return result
 
@@ -1642,10 +1650,7 @@ def _apply_recipe_family_mappings(
     q8_to_nint8_zero: bool,
 ) -> list[TensorPlan]:
     if sum((nvq3_jsc, nvq3_jsc_512, nvq3_to_nint3)) > 1:
-        raise ValueError(
-            "--nvq3-jsc, --nvq3-jsc-512, and --nvq3-to-nint3 "
-            "are mutually exclusive"
-        )
+        raise ValueError("--nvq3-jsc, --nvq3-jsc-512, and --nvq3-to-nint3 are mutually exclusive")
     result: list[TensorPlan] = []
     for item in plan:
         target = item.target_dtype
@@ -1656,17 +1661,9 @@ def _apply_recipe_family_mappings(
                 target = "NVQ3J-512" if nvq3_jsc_512 else "NVQ3J"
             elif nvq3_to_nint3:
                 target = "NINT3"
-        if (
-            iq2_s_to_nint2
-            and item.gguf_type == "IQ2_S"
-            and target.startswith("NVQ2J")
-        ):
+        if iq2_s_to_nint2 and item.gguf_type == "IQ2_S" and target.startswith("NVQ2J"):
             target = "NINT2"
-        if (
-            q8_to_nint8_zero
-            and item.gguf_type == "Q8_0"
-            and target == "NINT8"
-        ):
+        if q8_to_nint8_zero and item.gguf_type == "Q8_0" and target == "NINT8":
             target = "NINT8-0"
         result.append(
             item
@@ -1709,9 +1706,7 @@ def _normalize_hf_expert_storage(
             result.append(item)
             continue
         precision = (
-            nint_expert_precision(
-                _spec_for_target(item.target_dtype, NintSpec())
-            )
+            nint_expert_precision(_spec_for_target(item.target_dtype, NintSpec()))
             if item.target_dtype.startswith("NINT")
             else ExpertPrecision(family=item.target_dtype)
         )
@@ -1728,9 +1723,7 @@ def _normalize_hf_expert_storage(
     return result
 
 
-_HF_FLOAT_DTYPES = frozenset(
-    {"F16", "BF16", "F32", "F64", "F8_E4M3", "F8_E5M2"}
-)
+_HF_FLOAT_DTYPES = frozenset({"F16", "BF16", "F32", "F64", "F8_E4M3", "F8_E5M2"})
 _HF_INTEGER_DTYPES = frozenset({"I32", "I64"})
 _MOSTLY_BF16_F32_WEIGHT_MARKERS = (
     # Match llama.cpp's tensors which are deliberately excluded from ordinary
@@ -1769,10 +1762,7 @@ def _mostly_bf16_target(
     if source_dtype in _HF_INTEGER_DTYPES:
         return source_dtype
     if source_dtype not in _HF_FLOAT_DTYPES:
-        raise ValueError(
-            f"unsupported HF dtype for dense BF16 conversion: "
-            f"{name} {source_dtype}"
-        )
+        raise ValueError(f"unsupported HF dtype for dense BF16 conversion: {name} {source_dtype}")
 
     gguf_name = _hf_to_gguf_name(name)
     logical_name = gguf_name or name
@@ -1790,7 +1780,7 @@ def _layer_prefix_suffix(name: str) -> tuple[str, str] | None:
     for prefix in ("model.language_model.layers.", "model.layers."):
         if not name.startswith(prefix):
             continue
-        rest = name[len(prefix):]
+        rest = name[len(prefix) :]
         layer, sep, suffix = rest.partition(".")
         if not sep:
             return None
@@ -1827,9 +1817,7 @@ def _target_for_recipe_name(
 ) -> tuple[str, str | None, str | None]:
     anchor = _recipe_group_anchor(name) if recipe_types is not None else None
     anchor_gguf_name = (
-        _hf_to_gguf_name(anchor, mtp_layer_index=mtp_layer_index)
-        if anchor is not None
-        else None
+        _hf_to_gguf_name(anchor, mtp_layer_index=mtp_layer_index) if anchor is not None else None
     )
     if anchor_gguf_name is not None and anchor_gguf_name in recipe_types:
         anchor_type = recipe_types[anchor_gguf_name]
@@ -1878,6 +1866,128 @@ def _spec_for_target(target_dtype: str, default_spec: NintSpec) -> NintSpec:
     return default_spec
 
 
+def _apply_standard_preset(
+    plan: list[TensorPlan],
+    preset: str,
+    model_config: dict[str, object],
+    *,
+    quantize_vision: bool = False,
+    quantize_mtp: bool = False,
+) -> list[TensorPlan]:
+    """Apply a standard K-quant mixture to enabled semantic tensor scopes."""
+
+    preset = _normalize_standard_preset(preset)
+    topology = ModelTopology.from_hf_config(model_config)
+    details = {}
+    text_attention: list[tuple[int, str]] = []
+    vision_attention: list[tuple[int, str]] = []
+    for item in plan:
+        gguf_name = item.gguf_name or _hf_to_gguf_name(
+            item.name,
+            mtp_layer_index=topology.text_layers,
+        )
+        descriptor = describe_tensor(
+            item.name,
+            item.shape,
+            item.source_dtype,
+            canonical_name=gguf_name,
+        )
+        scope_enabled = not (
+            descriptor.scope is TensorScope.VISION
+            and not quantize_vision
+            or descriptor.scope is TensorScope.PREDICTOR
+            and not quantize_mtp
+        )
+        layer = descriptor.layer_index
+        if descriptor.scope is TensorScope.PREDICTOR and layer is not None:
+            layer = max(0, topology.text_layers - 1)
+        details[item.name] = (gguf_name, descriptor, layer, scope_enabled)
+        if descriptor.quantizable and scope_enabled and descriptor.role is TensorRole.ATTENTION_V:
+            order = descriptor.layer_index if descriptor.layer_index is not None else 1 << 30
+            if descriptor.scope is TensorScope.PREDICTOR:
+                order += topology.text_layers
+            destination = (
+                vision_attention if descriptor.scope is TensorScope.VISION else text_attention
+            )
+            destination.append((order, item.name))
+
+    text_attention.sort(key=lambda value: (value[0], value[1]))
+    vision_attention.sort(key=lambda value: (value[0], value[1]))
+    text_attention_indices = {name: index for index, (_layer, name) in enumerate(text_attention)}
+    vision_attention_indices = {
+        name: index for index, (_layer, name) in enumerate(vision_attention)
+    }
+    has_output = any(
+        descriptor.role is TensorRole.OUTPUT
+        for _gguf, descriptor, _layer, _enabled in details.values()
+    )
+
+    result: list[TensorPlan] = []
+    for item in plan:
+        gguf_name, descriptor, layer, scope_enabled = details[item.name]
+        if not descriptor.quantizable or not scope_enabled:
+            result.append(
+                replace(
+                    item,
+                    target_dtype=(
+                        item.source_dtype
+                        if item.source_dtype in {"BF16", "F16", "F32", "I32", "I64"}
+                        else "F16"
+                    ),
+                    gguf_name=gguf_name,
+                    gguf_type=None,
+                    target_spec=None,
+                    expert_shape=None,
+                    expert_precisions=None,
+                )
+            )
+            continue
+        role = descriptor.role
+        if role is TensorRole.TOKEN_EMBEDDING and not has_output:
+            role = TensorRole.OUTPUT
+        is_vision = descriptor.scope is TensorScope.VISION
+        attention_indices = vision_attention_indices if is_vision else text_attention_indices
+        attention_count = len(vision_attention) if is_vision else len(text_attention)
+        recipe_type = select_recipe_type(
+            preset,
+            role,
+            layer_index=layer,
+            layer_count=(topology.vision_layers if is_vision else topology.text_layers),
+            attention_index=attention_indices.get(item.name),
+            attention_count=attention_count,
+            gqa=topology.vision_gqa if is_vision else topology.text_gqa,
+        )
+        target = _dtype_for_recipe_type(recipe_type, "F16")
+        spec = _spec_for_target(target, NintSpec())
+        if len(item.shape) == 3:
+            expert_shape = tuple(int(value) for value in item.shape)
+            precision = nint_expert_precision(spec)
+            result.append(
+                replace(
+                    item,
+                    target_dtype="NINTM",
+                    gguf_name=gguf_name,
+                    gguf_type=recipe_type,
+                    target_spec=None,
+                    expert_shape=expert_shape,
+                    expert_precisions=(precision,) * expert_shape[0],
+                )
+            )
+        else:
+            result.append(
+                replace(
+                    item,
+                    target_dtype=target,
+                    gguf_name=gguf_name,
+                    gguf_type=recipe_type,
+                    target_spec=spec,
+                    expert_shape=None,
+                    expert_precisions=None,
+                )
+            )
+    return result
+
+
 def _spec_for_plan(item: TensorPlan, default_spec: NintSpec) -> NintSpec:
     return item.target_spec or _spec_for_target(item.target_dtype, default_spec)
 
@@ -1897,7 +2007,9 @@ def _validate_runtime_fused_pairs(plan: list[TensorPlan]) -> None:
     by_name = {item.name: item for item in plan}
     pairs = (
         ("self_attn.q_proj.weight", "self_attn.k_proj.weight", "Q/K"),
+        ("attention.query.weight", "attention.key.weight", "Q/K"),
         ("mlp.gate_proj.weight", "mlp.up_proj.weight", "gate/up"),
+        ("mlp.gate.weight", "mlp.up.weight", "gate/up"),
         (
             "mlp.shared_expert.gate_proj.weight",
             "mlp.shared_expert.up_proj.weight",
@@ -2076,9 +2188,7 @@ def _flash_next_expert_plans(
     hidden = int(config.get("hidden_size", 0) or 0)
     expert_hidden = int(config.get("moe_intermediate_size", 0) or 0)
     if expected_experts <= 0 or hidden <= 0 or expert_hidden <= 0:
-        raise ValueError(
-            f"incomplete {model_type} expert dimensions in model config"
-        )
+        raise ValueError(f"incomplete {model_type} expert dimensions in model config")
 
     groups: dict[str, dict[int, dict[str, str]]] = {}
     for name in inventory:
@@ -2086,13 +2196,9 @@ def _flash_next_expert_plans(
         if match is None:
             continue
         prefix, expert_raw, projection = match.groups()
-        groups.setdefault(prefix, {}).setdefault(int(expert_raw), {})[
-            projection
-        ] = name
+        groups.setdefault(prefix, {}).setdefault(int(expert_raw), {})[projection] = name
     if not groups:
-        raise ValueError(
-            f"{model_type} checkpoint contains no separate routed experts"
-        )
+        raise ValueError(f"{model_type} checkpoint contains no separate routed experts")
 
     plans: list[TensorPlan] = []
     consumed: set[str] = set()
@@ -2110,12 +2216,8 @@ def _flash_next_expert_plans(
         for names in tuples:
             values = [source_quantizations.get(name) for name in names]
             schemes.append(tuple(value.scheme if value else None for value in values))
-            scale_names.append(
-                tuple(value.scale_name if value else None for value in values)
-            )
-            scale_shards.append(
-                tuple(value.scale_shard if value else None for value in values)
-            )
+            scale_names.append(tuple(value.scale_name if value else None for value in values))
+            scale_shards.append(tuple(value.scale_shard if value else None for value in values))
         return tuple(schemes), tuple(scale_names), tuple(scale_shards)
 
     for prefix, experts in sorted(groups.items()):
@@ -2124,8 +2226,7 @@ def _flash_next_expert_plans(
             missing = sorted(expected_ids - set(experts))
             extra = sorted(set(experts) - expected_ids)
             raise ValueError(
-                f"incomplete expert set under {prefix}: "
-                f"missing={missing[:8]} extra={extra[:8]}"
+                f"incomplete expert set under {prefix}: missing={missing[:8]} extra={extra[:8]}"
             )
         gate_up_names: list[tuple[str, ...]] = []
         gate_up_shards: list[tuple[str, ...]] = []
@@ -2135,8 +2236,7 @@ def _flash_next_expert_plans(
             projections = experts[expert]
             if set(projections) != {"gate_proj", "up_proj", "down_proj"}:
                 raise ValueError(
-                    f"incomplete expert {expert} under {prefix}: "
-                    f"{sorted(projections)}"
+                    f"incomplete expert {expert} under {prefix}: {sorted(projections)}"
                 )
             gate = projections["gate_proj"]
             up = projections["up_proj"]
@@ -2152,20 +2252,25 @@ def _flash_next_expert_plans(
                         f"{inventory[name].shape} != {expected_shape}"
                     )
             gate_up_names.append((gate, up))
-            gate_up_shards.append(
-                (inventory[gate].shard, inventory[up].shard)
-            )
+            gate_up_shards.append((inventory[gate].shard, inventory[up].shard))
             down_names.append((down,))
             down_shards.append((inventory[down].shard,))
             consumed.update((gate, up, down))
 
         gate_up_shape = (expected_experts, 2 * expert_hidden, hidden)
         down_shape = (expected_experts, hidden, expert_hidden)
-        gate_up_target = prefix + ".gate_up_proj"
-        down_target = prefix + ".down_proj"
-        gate_up_q, gate_up_scale_names, gate_up_scale_shards = source_fields(
-            gate_up_names
+        gate_up_source_target = prefix + ".gate_up_proj"
+        down_source_target = prefix + ".down_proj"
+        gate_up_mapping = map_source_tensor_name(
+            gate_up_source_target, config, require_registered=True
         )
+        down_mapping = map_source_tensor_name(
+            down_source_target, config, require_registered=True
+        )
+        assert gate_up_mapping is not None and down_mapping is not None
+        gate_up_target = gate_up_mapping.canonical_name
+        down_target = down_mapping.canonical_name
+        gate_up_q, gate_up_scale_names, gate_up_scale_shards = source_fields(gate_up_names)
         down_q, down_scale_names, down_scale_shards = source_fields(down_names)
         plans.extend(
             (
@@ -2233,9 +2338,7 @@ def _glm_derived_plans(
     moe_freq = max(1, int(config.get("moe_layer_freq", 1)))
     mlp_types = list(config.get("mlp_layer_types") or [])
     if mlp_types and len(mlp_types) != layers:
-        raise ValueError(
-            "GLM mlp_layer_types length does not match num_hidden_layers"
-        )
+        raise ValueError("GLM mlp_layer_types length does not match num_hidden_layers")
     invalid_mlp_types = sorted(set(mlp_types) - {"dense", "sparse"})
     if invalid_mlp_types:
         raise ValueError(f"unsupported GLM MLP layer types: {invalid_mlp_types}")
@@ -2257,7 +2360,14 @@ def _glm_derived_plans(
             ("embed_q", "glm_kv_b_embed_q", (heads, kv_rank, nope)),
             ("unembed_out", "glm_kv_b_unembed_out", (heads, value, kv_rank)),
         ):
-            target = ap + target_suffix
+            source_target = ap + target_suffix
+            mapping = map_source_tensor_name(
+                source_target,
+                config,
+                require_registered=True,
+            )
+            assert mapping is not None
+            target = mapping.canonical_name
             plans.append(
                 TensorPlan(
                     name=target,
@@ -2267,9 +2377,7 @@ def _glm_derived_plans(
                     target_dtype="NINTM",
                     source_name=kv_source,
                     expert_shape=shape,
-                    expert_precisions=_glm_expert_precisions(
-                        target, shape, calibration_scheme
-                    ),
+                    expert_precisions=_glm_expert_precisions(target, shape, calibration_scheme),
                     transform=transform,
                 )
             )
@@ -2282,8 +2390,21 @@ def _glm_derived_plans(
         if not sparse:
             continue
         mp = f"model.layers.{layer}.mlp."
-        gate_up_target = mp + "experts.gate_up_proj"
-        down_target = mp + "experts.down_proj"
+        gate_up_source_target = mp + "experts.gate_up_proj"
+        down_source_target = mp + "experts.down_proj"
+        gate_up_mapping = map_source_tensor_name(
+            gate_up_source_target,
+            config,
+            require_registered=True,
+        )
+        down_mapping = map_source_tensor_name(
+            down_source_target,
+            config,
+            require_registered=True,
+        )
+        assert gate_up_mapping is not None and down_mapping is not None
+        gate_up_target = gate_up_mapping.canonical_name
+        down_target = down_mapping.canonical_name
         gate_up_shape = (experts, 2 * expert_hidden, hidden)
         down_shape = (experts, hidden, expert_hidden)
         gate_up_names: list[tuple[str, ...]] = []
@@ -2391,7 +2512,12 @@ def _glm5_next_mla_derived_plans(
             ("embed_q", "glm_kv_b_embed_q", (heads, kv_rank, nope)),
             ("unembed_out", "glm_kv_b_unembed_out", (heads, value, kv_rank)),
         ):
-            target = prefix + suffix
+            source_target = prefix + suffix
+            target_mapping = map_source_tensor_name(
+                source_target, config, require_registered=True
+            )
+            assert target_mapping is not None
+            target = target_mapping.canonical_name
             plans.append(
                 TensorPlan(
                     name=target,
@@ -2421,6 +2547,8 @@ def _plan(
     dense_dtype: str,
     calibration_scheme: CalibrationScheme | None = None,
     mostly_bf16: bool = False,
+    quantize_vision: bool = False,
+    quantize_mtp: bool = False,
     *,
     source_inventory: dict[str, SourceTensorMetadata] | None = None,
     source_config: dict[str, object] | None = None,
@@ -2431,12 +2559,15 @@ def _plan(
     if source_config is None:
         config_path = root / "config.json"
         raw_config = (
-            json.loads(config_path.read_text(encoding="utf-8"))
-            if config_path.exists()
-            else {}
+            json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
         )
     else:
         raw_config = source_config
+    # Full-precision MFQ v2 files may predate canonical tensor names. Keep this
+    # compatibility at the import boundary only; newly written artifacts still
+    # use canonical names whenever a registered mapping exists.
+    legacy_mfq_input = root.is_file() and source_inventory is not None
+    canonical_schema = tensor_schema_for_config(raw_config)
     model_config = raw_config.get("text_config", raw_config)
     if not isinstance(model_config, dict):
         raise ValueError("HF text_config must be an object")
@@ -2449,15 +2580,9 @@ def _plan(
     is_glm5_next = model_config.get("model_type") == "glm5_next_text"
     is_flash_next = model_config.get("model_type") in _FLASH_NEXT_TEXT_TYPES
     is_minicpmo45 = _is_minicpmo45_config(raw_config)
-    source_exclusions = (
-        _source_quantization_exclusions(raw_config)
-        if is_flash_next
-        else ()
-    )
+    source_exclusions = _source_quantization_exclusions(raw_config) if is_flash_next else ()
     if is_glm_dsa and recipe_types is not None:
-        raise ValueError(
-            "GLM DSA GGUF recipe mapping is not implemented; use a calibration scheme"
-        )
+        raise ValueError("GLM DSA GGUF recipe mapping is not implemented; use a calibration scheme")
     if is_flash_next and recipe_types is not None:
         raise ValueError(
             "Qwen4-Exp/GLM-5-Next GGUF recipe mapping is not implemented; "
@@ -2497,11 +2622,43 @@ def _plan(
             if layer_index is not None and layer_index >= glm_layers:
                 continue
         if recipe_types is not None:
-            gguf_name = _hf_to_gguf_name(
-                name,
-                mtp_layer_index=mtp_layer_index,
+            canonical_mapping = map_source_tensor_name(name, raw_config)
+            if (
+                canonical_schema is not None
+                and canonical_mapping is None
+                and not legacy_mfq_input
+            ):
+                raise KeyError(
+                    f"{canonical_schema.architecture} source tensor has no "
+                    f"canonical mapping: {name}"
+                )
+            gguf_name = (
+                canonical_mapping.recipe_name
+                if canonical_mapping is not None
+                else _hf_to_gguf_name(name, mtp_layer_index=mtp_layer_index)
             )
-            if is_minicpmo45 and not name.startswith("llm."):
+            metadata = inventory[name]
+            scope = describe_tensor(
+                name,
+                metadata.shape,
+                metadata.dtype,
+                canonical_name=(
+                    canonical_mapping.canonical_name
+                    if canonical_mapping is not None
+                    else gguf_name
+                ),
+            ).scope
+            preserve_scope = (
+                scope is TensorScope.VISION
+                and not quantize_vision
+                or scope is TensorScope.PREDICTOR
+                and not quantize_mtp
+            )
+            if preserve_scope:
+                # A standard text recipe must not strip auxiliary inference
+                # scopes. Keep them in the artifact at source precision.
+                pass
+            elif is_minicpmo45 and not name.startswith("llm."):
                 # The official MiniCPM-o 4.5 Q4_K_M GGUF contains only the
                 # language model.  Keep every other official component at its
                 # source precision so the resulting MFQ still represents the
@@ -2522,15 +2679,19 @@ def _plan(
         by_shard.setdefault(shard, []).append(name)
 
     out: list[TensorPlan] = []
+    consumed_calibration_names: set[str] = set()
     source_shapes: dict[str, tuple[int, ...]] = {}
     source_dtypes: dict[str, str] = {}
     for shard in sorted(by_shard):
         for name in sorted(by_shard[shard]):
-                metadata = inventory[name]
-                shape = metadata.shape
-                source_dtype = metadata.dtype
-                source_quantization = source_quantizations.get(name)
-                if (is_glm_dsa or is_glm5_next) and not mostly_bf16 and (
+            metadata = inventory[name]
+            shape = metadata.shape
+            source_dtype = metadata.dtype
+            source_quantization = source_quantizations.get(name)
+            if (
+                (is_glm_dsa or is_glm5_next)
+                and not mostly_bf16
+                and (
                     name.endswith(".self_attn.kv_b_proj.weight")
                     or is_glm_dsa
                     and re.match(
@@ -2538,232 +2699,165 @@ def _plan(
                         r"(?:gate_proj|up_proj|down_proj)\.weight$",
                         name,
                     )
-                ):
-                    source_shapes[name] = shape
-                    source_dtypes[name] = source_dtype
-                    continue
-                gguf_name = (
-                    _hf_to_gguf_name(
+                )
+            ):
+                source_shapes[name] = shape
+                source_dtypes[name] = source_dtype
+                continue
+            canonical_mapping = map_source_tensor_name(name, raw_config)
+            if (
+                canonical_schema is not None
+                and canonical_mapping is None
+                and not legacy_mfq_input
+            ):
+                raise KeyError(
+                    f"{canonical_schema.architecture} source tensor has no "
+                    f"canonical mapping: {name}"
+                )
+            canonical_name = (
+                canonical_mapping.canonical_name if canonical_mapping is not None else name
+            )
+            gguf_name = (
+                (
+                    canonical_mapping.recipe_name
+                    if canonical_mapping is not None
+                    else _hf_to_gguf_name(name, mtp_layer_index=mtp_layer_index)
+                )
+                if recipe_types is not None
+                else None
+            )
+            gguf_type = (
+                recipe_types.get(gguf_name)
+                if gguf_name is not None and recipe_types is not None
+                else None
+            )
+            descriptor = describe_tensor(
+                name,
+                shape,
+                source_dtype,
+                canonical_name=canonical_name,
+            )
+            preserve_scope = (
+                descriptor.scope is TensorScope.VISION
+                and not quantize_vision
+                or descriptor.scope is TensorScope.PREDICTOR
+                and not quantize_mtp
+            )
+            if source_dtype in _HF_INTEGER_DTYPES:
+                # Hash tables, offsets, token maps, and similar runtime
+                # metadata must remain exact.  In particular, Qwen4-Exp
+                # PLE multipliers exceed float32's integer precision.
+                target = source_dtype
+            elif preserve_scope or name in _MTP_PROTECTED_TENSORS:
+                target = source_dtype if source_dtype in {"BF16", "F16", "F32"} else dense_dtype
+            elif mostly_bf16:
+                target = _mostly_bf16_target(name, shape, source_dtype)
+            elif is_flash_next and _source_precision_protected(name, source_exclusions):
+                target = (
+                    source_dtype
+                    if source_dtype in {"BF16", "F16", "F32", "I32", "I64"}
+                    else dense_dtype
+                )
+            elif recipe_types is not None:
+                if is_minicpmo45 and not name.startswith("llm."):
+                    target = (
+                        source_dtype
+                        if source_dtype in {"BF16", "F16", "F32", "I32", "I64"}
+                        else dense_dtype
+                    )
+                elif name.startswith("mtp.") and gguf_type is None:
+                    target = default_nint_dtype if len(shape) in (2, 3) else dense_dtype
+                else:
+                    target, anchor_gguf_name, anchor_type = _target_for_recipe_name(
                         name,
+                        gguf_type,
+                        recipe_types,
+                        dense_dtype,
                         mtp_layer_index=mtp_layer_index,
                     )
-                    if recipe_types is not None
-                    else None
-                )
-                gguf_type = (
-                    recipe_types.get(gguf_name)
-                    if gguf_name is not None and recipe_types is not None
-                    else None
-                )
-                if source_dtype in _HF_INTEGER_DTYPES:
-                    # Hash tables, offsets, token maps, and similar runtime
-                    # metadata must remain exact.  In particular, Qwen4-Exp
-                    # PLE multipliers exceed float32's integer precision.
-                    target = source_dtype
-                elif name in _MTP_PROTECTED_TENSORS:
-                    target = (
+                    if anchor_gguf_name is not None:
+                        gguf_name = anchor_gguf_name
+                        gguf_type = anchor_type
+            elif is_minicpmo45:
+                target = (
+                    default_nint_dtype
+                    if _minicpmo45_quantizable_matrix(name, shape)
+                    else (
                         source_dtype
-                        if source_dtype in {"BF16", "F16", "F32"}
+                        if source_dtype in {"BF16", "F16", "F32", "I32", "I64"}
                         else dense_dtype
                     )
-                elif mostly_bf16:
-                    target = _mostly_bf16_target(name, shape, source_dtype)
-                elif (
-                    is_flash_next
-                    and _source_precision_protected(name, source_exclusions)
-                ):
-                    target = (
-                        source_dtype
-                        if source_dtype
-                        in {"BF16", "F16", "F32", "I32", "I64"}
-                        else dense_dtype
-                    )
-                elif recipe_types is not None:
-                    if is_minicpmo45 and not name.startswith("llm."):
-                        target = (
-                            source_dtype
-                            if source_dtype
-                            in {"BF16", "F16", "F32", "I32", "I64"}
-                            else dense_dtype
-                        )
-                    elif name.startswith("mtp.") and gguf_type is None:
-                        target = (
-                            default_nint_dtype
-                            if len(shape) in (2, 3)
-                            else dense_dtype
-                        )
-                    else:
-                        target, anchor_gguf_name, anchor_type = (
-                            _target_for_recipe_name(
-                                name,
-                                gguf_type,
-                                recipe_types,
-                                dense_dtype,
-                                mtp_layer_index=mtp_layer_index,
-                            )
-                        )
-                        if anchor_gguf_name is not None:
-                            gguf_name = anchor_gguf_name
-                            gguf_type = anchor_type
-                elif is_minicpmo45:
-                    target = (
-                        default_nint_dtype
-                        if _minicpmo45_quantizable_matrix(name, shape)
-                        else (
-                            source_dtype
-                            if source_dtype in {"BF16", "F16", "F32", "I32", "I64"}
-                            else dense_dtype
-                        )
-                    )
-                else:
-                    target = default_nint_dtype if len(shape) == 2 else dense_dtype
-                    if is_glm_dsa and name.endswith(".mlp.gate.weight"):
-                        target = "F16"
-                if _is_compact_dtype(target) and len(shape) not in (2, 3):
-                    raise ValueError(f"recipe maps non-matrix tensor to {target}: {name} {shape}")
-                parsed = _layer_prefix_suffix(name)
-                if (
-                    (recipe_types is not None or calibration_scheme is not None)
-                    and parsed is not None
-                    and parsed[1] == "linear_attn.in_proj_qkv.weight"
-                    and linear_qkv_split is not None
-                ):
-                    qk_end, qkv_end = linear_qkv_split
-                    if len(shape) != 2 or shape[0] < qkv_end:
-                        raise ValueError(f"cannot split linear attention qkv tensor: {name} {shape}")
-                    lp, _suffix = parsed
-                    qk_name = lp + "linear_attn.in_proj_qk.weight"
-                    v_name = lp + "linear_attn.in_proj_v.weight"
-                    qk_selection = (
-                        calibration_scheme.selections.get(qk_name)
-                        if calibration_scheme is not None
-                        else None
-                    )
-                    v_selection = (
-                        calibration_scheme.selections.get(v_name)
-                        if calibration_scheme is not None
-                        else None
-                    )
-                    if qk_selection is not None and (qk_selection.rows, qk_selection.columns) != (
-                        qk_end,
-                        shape[1],
-                    ):
-                        raise ValueError(
-                            f"calibration scheme shape mismatch for {qk_name}: "
-                            f"checkpoint={(qk_end, shape[1])}, "
-                            f"scheme={(qk_selection.rows, qk_selection.columns)}"
-                        )
-                    if v_selection is not None and (v_selection.rows, v_selection.columns) != (
-                        qkv_end - qk_end,
-                        shape[1],
-                    ):
-                        raise ValueError(
-                            f"calibration scheme shape mismatch for {v_name}: "
-                            f"checkpoint={(qkv_end - qk_end, shape[1])}, "
-                            f"scheme={(v_selection.rows, v_selection.columns)}"
-                        )
-                    out.append(
-                        TensorPlan(
-                            qk_name,
-                            shard,
-                            (qk_end, shape[1]),
-                            source_dtype,
-                            f"NINT{qk_selection.spec.bits}" if qk_selection else target,
-                            gguf_name,
-                            gguf_type,
-                            source_name=name,
-                            row_start=0,
-                            row_end=qk_end,
-                            target_spec=qk_selection.spec if qk_selection else None,
-                            source_quantization=(
-                                source_quantization.scheme
-                                if source_quantization is not None
-                                else None
-                            ),
-                            source_scale_name=(
-                                source_quantization.scale_name
-                                if source_quantization is not None
-                                else None
-                            ),
-                            source_scale_shard=(
-                                source_quantization.scale_shard
-                                if source_quantization is not None
-                                else None
-                            ),
-                        )
-                    )
-                    out.append(
-                        TensorPlan(
-                            v_name,
-                            shard,
-                            (qkv_end - qk_end, shape[1]),
-                            source_dtype,
-                            f"NINT{v_selection.spec.bits}" if v_selection else target,
-                            gguf_name,
-                            gguf_type,
-                            source_name=name,
-                            row_start=qk_end,
-                            row_end=qkv_end,
-                            target_spec=v_selection.spec if v_selection else None,
-                            source_quantization=(
-                                source_quantization.scheme
-                                if source_quantization is not None
-                                else None
-                            ),
-                            source_scale_name=(
-                                source_quantization.scale_name
-                                if source_quantization is not None
-                                else None
-                            ),
-                            source_scale_shard=(
-                                source_quantization.scale_shard
-                                if source_quantization is not None
-                                else None
-                            ),
-                        )
-                    )
-                    continue
-                selection = (
-                    calibration_scheme.selections.get(name)
+                )
+            else:
+                target = default_nint_dtype if len(shape) == 2 else dense_dtype
+                if is_glm_dsa and name.endswith(".mlp.gate.weight"):
+                    target = "F16"
+            if _is_compact_dtype(target) and len(shape) not in (2, 3):
+                raise ValueError(f"recipe maps non-matrix tensor to {target}: {name} {shape}")
+            parsed = _layer_prefix_suffix(name)
+            if (
+                (recipe_types is not None or calibration_scheme is not None)
+                and parsed is not None
+                and parsed[1] == "linear_attn.in_proj_qkv.weight"
+                and linear_qkv_split is not None
+            ):
+                qk_end, qkv_end = linear_qkv_split
+                if len(shape) != 2 or shape[0] < qkv_end:
+                    raise ValueError(f"cannot split linear attention qkv tensor: {name} {shape}")
+                lp, _suffix = parsed
+                qk_source_name = lp + "linear_attn.in_proj_qk.weight"
+                v_source_name = lp + "linear_attn.in_proj_v.weight"
+                qk_mapping = map_source_tensor_name(qk_source_name, raw_config)
+                v_mapping = map_source_tensor_name(v_source_name, raw_config)
+                qk_name = qk_mapping.canonical_name if qk_mapping is not None else qk_source_name
+                v_name = v_mapping.canonical_name if v_mapping is not None else v_source_name
+                qk_selection = (
+                    calibration_scheme.selections.get(qk_source_name)
                     if calibration_scheme is not None
                     else None
                 )
-                expert_selection = (
-                    calibration_scheme.expert_selections.get(name)
+                v_selection = (
+                    calibration_scheme.selections.get(v_source_name)
                     if calibration_scheme is not None
                     else None
                 )
-                if selection is not None and expert_selection is not None:
-                    raise ValueError(f"tensor {name} has both uniform and expert-wise selections")
-                expert_shape: tuple[int, int, int] | None = None
-                expert_precisions: tuple[ExpertPrecision, ...] | None = None
-                if selection is not None:
-                    if tuple(shape) != (selection.rows, selection.columns):
-                        raise ValueError(
-                            f"calibration scheme shape mismatch for {name}: "
-                            f"checkpoint={shape}, scheme={(selection.rows, selection.columns)}"
-                        )
-                    target = f"NINT{selection.spec.bits}"
-                elif expert_selection is not None:
-                    expert_shape = _expert_plan_shape(shape, expert_selection)
-                    expert_precisions = expert_selection.precisions
-                    target = "NINTM"
+                if qk_selection is not None:
+                    consumed_calibration_names.add(qk_source_name)
+                if v_selection is not None:
+                    consumed_calibration_names.add(v_source_name)
+                if qk_selection is not None and (qk_selection.rows, qk_selection.columns) != (
+                    qk_end,
+                    shape[1],
+                ):
+                    raise ValueError(
+                        f"calibration scheme shape mismatch for {qk_name}: "
+                        f"checkpoint={(qk_end, shape[1])}, "
+                        f"scheme={(qk_selection.rows, qk_selection.columns)}"
+                    )
+                if v_selection is not None and (v_selection.rows, v_selection.columns) != (
+                    qkv_end - qk_end,
+                    shape[1],
+                ):
+                    raise ValueError(
+                        f"calibration scheme shape mismatch for {v_name}: "
+                        f"checkpoint={(qkv_end - qk_end, shape[1])}, "
+                        f"scheme={(v_selection.rows, v_selection.columns)}"
+                    )
                 out.append(
                     TensorPlan(
-                        name,
+                        qk_name,
                         shard,
-                        shape,
+                        (qk_end, shape[1]),
                         source_dtype,
-                        target,
+                        f"NINT{qk_selection.spec.bits}" if qk_selection else target,
                         gguf_name,
                         gguf_type,
-                        target_spec=selection.spec if selection else None,
-                        expert_shape=expert_shape,
-                        expert_precisions=expert_precisions,
+                        source_name=name,
+                        row_start=0,
+                        row_end=qk_end,
+                        target_spec=qk_selection.spec if qk_selection else None,
                         source_quantization=(
-                            source_quantization.scheme
-                            if source_quantization is not None
-                            else None
+                            source_quantization.scheme if source_quantization is not None else None
                         ),
                         source_scale_name=(
                             source_quantization.scale_name
@@ -2777,6 +2871,84 @@ def _plan(
                         ),
                     )
                 )
+                out.append(
+                    TensorPlan(
+                        v_name,
+                        shard,
+                        (qkv_end - qk_end, shape[1]),
+                        source_dtype,
+                        f"NINT{v_selection.spec.bits}" if v_selection else target,
+                        gguf_name,
+                        gguf_type,
+                        source_name=name,
+                        row_start=qk_end,
+                        row_end=qkv_end,
+                        target_spec=v_selection.spec if v_selection else None,
+                        source_quantization=(
+                            source_quantization.scheme if source_quantization is not None else None
+                        ),
+                        source_scale_name=(
+                            source_quantization.scale_name
+                            if source_quantization is not None
+                            else None
+                        ),
+                        source_scale_shard=(
+                            source_quantization.scale_shard
+                            if source_quantization is not None
+                            else None
+                        ),
+                    )
+                )
+                continue
+            selection = (
+                calibration_scheme.selections.get(name) if calibration_scheme is not None else None
+            )
+            expert_selection = (
+                calibration_scheme.expert_selections.get(name)
+                if calibration_scheme is not None
+                else None
+            )
+            if selection is not None and expert_selection is not None:
+                raise ValueError(f"tensor {name} has both uniform and expert-wise selections")
+            if selection is not None or expert_selection is not None:
+                consumed_calibration_names.add(name)
+            expert_shape: tuple[int, int, int] | None = None
+            expert_precisions: tuple[ExpertPrecision, ...] | None = None
+            if selection is not None:
+                if tuple(shape) != (selection.rows, selection.columns):
+                    raise ValueError(
+                        f"calibration scheme shape mismatch for {name}: "
+                        f"checkpoint={shape}, scheme={(selection.rows, selection.columns)}"
+                    )
+                target = f"NINT{selection.spec.bits}"
+            elif expert_selection is not None:
+                expert_shape = _expert_plan_shape(shape, expert_selection)
+                expert_precisions = expert_selection.precisions
+                target = "NINTM"
+            out.append(
+                TensorPlan(
+                    canonical_name,
+                    shard,
+                    shape,
+                    source_dtype,
+                    target,
+                    gguf_name,
+                    gguf_type,
+                    source_name=name,
+                    target_spec=selection.spec if selection else None,
+                    expert_shape=expert_shape,
+                    expert_precisions=expert_precisions,
+                    source_quantization=(
+                        source_quantization.scheme if source_quantization is not None else None
+                    ),
+                    source_scale_name=(
+                        source_quantization.scale_name if source_quantization is not None else None
+                    ),
+                    source_scale_shard=(
+                        source_quantization.scale_shard if source_quantization is not None else None
+                    ),
+                )
+            )
     if is_glm_dsa and not mostly_bf16:
         out.extend(
             _glm_derived_plans(
@@ -2799,11 +2971,11 @@ def _plan(
         )
     out.extend(flash_expert_plans)
     if calibration_scheme is not None:
-        planned = {item.name for item in out}
+        planned = {item.source_name or item.name for item in out}
         selected_names = set(calibration_scheme.selections) | set(
             calibration_scheme.expert_selections
         )
-        missing = sorted(selected_names - planned)
+        missing = sorted(selected_names - planned - consumed_calibration_names)
         if missing:
             raise ValueError(
                 f"calibration scheme tensors are absent from the conversion plan: {missing[:8]}"
@@ -2820,13 +2992,7 @@ def _dense_blob_from_tensor(t: torch.Tensor, blob_path: Path, dtype: str) -> int
         arr = t.to(torch.float16).contiguous().cpu().numpy()
         arr = np.ascontiguousarray(arr, dtype=np.float16)
     elif dtype == "BF16":
-        arr = (
-            t.to(torch.bfloat16)
-            .contiguous()
-            .cpu()
-            .view(torch.uint16)
-            .numpy()
-        )
+        arr = t.to(torch.bfloat16).contiguous().cpu().view(torch.uint16).numpy()
         arr = np.ascontiguousarray(arr, dtype="<u2")
     elif dtype == "I32":
         arr = t.to(torch.int32).contiguous().cpu().numpy()
@@ -2887,17 +3053,13 @@ def _write_nint_axis0_blob(
 
         for start in range(0, out, row_chunk):
             end = min(start + row_chunk, out)
-            importance = (
-                None if importance_rows is None else importance_rows(start, end)
-            )
+            importance = None if importance_rows is None else importance_rows(start, end)
             if quant_backend in ACCELERATOR_BACKENDS and hasattr(sl, "read_rows"):
                 chunk = sl.read_rows(start, end, device=device)
             else:
                 chunk = sl[start:end]
             if quant_backend in ACCELERATOR_BACKENDS:
-                nt = nint_quantize_axis0_torch(
-                    chunk, spec, device=device, importance=importance
-                )
+                nt = nint_quantize_axis0_torch(chunk, spec, device=device, importance=importance)
             elif quant_backend == "cpu":
                 nt = nint_quantize(
                     chunk.float().cpu().numpy(),
@@ -2909,7 +3071,9 @@ def _write_nint_axis0_blob(
                 raise ValueError(f"unsupported quant backend: {quant_backend}")
             rows = end - start
             if nt.neuron_len != neuron_len or nt.q.shape != (rows, ng, gs):
-                raise ValueError(f"unexpected NINT chunk shape: {nt.q.shape}, neuron_len={nt.neuron_len}")
+                raise ValueError(
+                    f"unexpected NINT chunk shape: {nt.q.shape}, neuron_len={nt.neuron_len}"
+                )
             f.seek(scale_off + start * 2)
             f.write(np.ascontiguousarray(nt.neuron_scale, dtype=np.float16).tobytes())
             f.seek(min_off + start * 2)
@@ -2961,9 +3125,7 @@ class _ExpertPoolRowSource:
 
     def _read_expert_rows(self, expert: int, start: int, end: int) -> torch.Tensor:
         if hasattr(self.source, "read_expert_rows"):
-            return self.source.read_expert_rows(
-                expert, start, end, device="cpu"
-            )
+            return self.source.read_expert_rows(expert, start, end, device="cpu")
         if len(self.source_shape) == 2:
             row0 = expert * self.rows_per_expert + start
             row1 = expert * self.rows_per_expert + end
@@ -2998,15 +3160,13 @@ class _ExpertPoolRowSource:
                     device=device,
                 )
             else:
-                value = self._read_expert_rows(
-                    expert, local_row, local_row + take
-                ).to(device=device)
+                value = self._read_expert_rows(expert, local_row, local_row + take).to(
+                    device=device
+                )
             pieces.append(value)
             cursor += take
         if not pieces:
-            return torch.empty(
-                (0, self.columns), device=device, dtype=torch.float32
-            )
+            return torch.empty((0, self.columns), device=device, dtype=torch.float32)
         return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
 
     def __getitem__(self, key: slice) -> torch.Tensor:
@@ -3024,9 +3184,7 @@ class _ExpertPoolRowSource:
             local_row = cursor % self.rows_per_expert
             take = min(end - cursor, self.rows_per_expert - local_row)
             pieces.append(
-                self._read_expert_rows(
-                    self.expert_ids[local_expert], local_row, local_row + take
-                )
+                self._read_expert_rows(self.expert_ids[local_expert], local_row, local_row + take)
             )
             cursor += take
         if not pieces:
@@ -3053,10 +3211,7 @@ class _GlmExpertRowSource:
         self.source_shards = source_shards
         if len(source_names) != self.n_experts or len(source_shards) != self.n_experts:
             raise ValueError("HF expert source count does not match expert shape")
-        empty = tuple(
-            tuple(None for _ in names)
-            for names in source_names
-        )
+        empty = tuple(tuple(None for _ in names) for names in source_names)
         self.source_quantizations = source_quantizations or empty
         self.source_scale_names = source_scale_names or empty
         self.source_scale_shards = source_scale_shards or empty
@@ -3066,8 +3221,7 @@ class _GlmExpertRowSource:
             self.source_scale_shards,
         ):
             if len(values) != self.n_experts or any(
-                len(row) != len(names)
-                for row, names in zip(values, source_names, strict=True)
+                len(row) != len(names) for row, names in zip(values, source_names, strict=True)
             ):
                 raise ValueError("invalid HF expert source quantization metadata")
         self._reader_key: tuple[int, int] | None = None
@@ -3091,9 +3245,7 @@ class _GlmExpertRowSource:
             scale_name = self.source_scale_names[expert][index]
             scale_shard = self.source_scale_shards[expert][index]
             if scale_name is None or scale_shard is None:
-                raise ValueError(
-                    f"scaled expert source lacks scale metadata: {name}"
-                )
+                raise ValueError(f"scaled expert source lacks scale metadata: {name}")
             reader = _ScaledFp8TensorSlice(
                 weight,
                 _RawSafeTensorSlice(self.root / scale_shard, scale_name),
@@ -3237,9 +3389,7 @@ def _transform_glm_kv_b(source: torch.Tensor, item: TensorPlan) -> torch.Tensor:
         raise ValueError("GLM kv_b transform lacks target metadata")
     heads, rows, columns = item.expert_shape
     if source.ndim != 2 or source.shape[0] % heads != 0:
-        raise ValueError(
-            f"GLM kv_b source shape mismatch: {tuple(source.shape)}"
-        )
+        raise ValueError(f"GLM kv_b source shape mismatch: {tuple(source.shape)}")
     per_head = source.shape[0] // heads
     if item.transform == "glm_kv_b_embed_q":
         if source.shape[1] != rows or columns > per_head:
@@ -3269,9 +3419,7 @@ def _write_nint_moe_axis0_blob(
 
     n_experts, rows_per_expert, columns = expert_shape
     if len(expert_specs) != n_experts:
-        raise ValueError(
-            f"received {len(expert_specs)} expert specs for {n_experts} experts"
-        )
+        raise ValueError(f"received {len(expert_specs)} expert specs for {n_experts} experts")
     cohorts: dict[NintSpec, list[int]] = {}
     for expert, profile in enumerate(expert_specs):
         cohorts.setdefault(profile, []).append(expert)
@@ -3313,14 +3461,10 @@ def _write_nint_moe_axis0_blob(
                 ) -> np.ndarray | None:
                     if _importance is None or _importance.ndim == 1:
                         return _importance
-                    expert_rows = (
-                        np.arange(start, end, dtype=np.int64) // rows_per_expert
-                    )
+                    expert_rows = np.arange(start, end, dtype=np.int64) // rows_per_expert
                     return np.ascontiguousarray(_importance[expert_rows])
 
-                pool_source = _ExpertPoolRowSource(
-                    source, source_shape, expert_shape, expert_ids
-                )
+                pool_source = _ExpertPoolRowSource(source, source_shape, expert_shape, expert_ids)
                 pool_path = blob_path.with_name(f"{blob_path.name}.pool{pool_index}.tmp")
                 pool_paths.append(pool_path)
                 pool_shape = (len(expert_ids) * rows_per_expert, columns)
@@ -3332,9 +3476,7 @@ def _write_nint_moe_axis0_blob(
                     row_chunk,
                     quant_backend,
                     device,
-                    importance_rows=(
-                        importance_rows if profile.bits in {2, 3, 4, 5, 6} else None
-                    ),
+                    importance_rows=(importance_rows if profile.bits in {2, 3, 4, 5, 6} else None),
                 )
                 dtype = f"NINT{profile.bits}".encode("ascii")
                 output.write(
@@ -3358,9 +3500,7 @@ def _write_nint_moe_axis0_blob(
 def _check_row_stream_alignment(row_chunk: int, bits_per_row: Sequence[int]) -> None:
     for bits in bits_per_row:
         if row_chunk * int(bits) % 8:
-            raise ValueError(
-                f"row_chunk={row_chunk} does not byte-align a {bits}-bit row stream"
-            )
+            raise ValueError(f"row_chunk={row_chunk} does not byte-align a {bits}-bit row stream")
 
 
 def _quantize_flat_stream_chunk(
@@ -3374,9 +3514,7 @@ def _quantize_flat_stream_chunk(
 ):
     family = precision.family
     weight_tensor = (
-        weight
-        if isinstance(weight, torch.Tensor)
-        else torch.as_tensor(weight, dtype=torch.float32)
+        weight if isinstance(weight, torch.Tensor) else torch.as_tensor(weight, dtype=torch.float32)
     )
     if quant_backend in ACCELERATOR_BACKENDS and family in {"NVQ1-L", "NVQ2", "NVQ3"}:
         from mfq.quantize.nvq_quant_torch import quantize_axis0
@@ -3399,24 +3537,20 @@ def _quantize_flat_stream_chunk(
             weight_tensor,
             device=device,
             importance=importance,
-            codebook=(
-                NVQ1_S_SYNTHETIC_BANKS
-                if artifact is None
-                else np.asarray(artifact)
-            ),
+            codebook=(NVQ1_S_SYNTHETIC_BANKS if artifact is None else np.asarray(artifact)),
             anchor_multipliers=tuple(
                 float(value)
-                for value in str(
-                    precision.option(
-                        "anchor_multipliers", "0.75,1.0,1.25"
-                    )
-                ).split(",")
+                for value in str(precision.option("anchor_multipliers", "0.75,1.0,1.25")).split(",")
             ),
             refine_steps=int(precision.option("refine_steps", 2)),
         )
     if quant_backend in ACCELERATOR_BACKENDS and family in {
-        "NVQ2J", "NVQ2J-L", "NVQ2J-XL",
-        "NVQ3J", "NVQ3J-512", "NVQ3J-L",
+        "NVQ2J",
+        "NVQ2J-L",
+        "NVQ2J-XL",
+        "NVQ3J",
+        "NVQ3J-512",
+        "NVQ3J-L",
     }:
         from mfq.quantize.nvq_jsc import quantize_nvq_jsc_fixed
 
@@ -3426,9 +3560,7 @@ def _quantize_flat_stream_chunk(
             weight_tensor,
             artifact,
             importance=importance,
-            assignment_refine_steps=int(
-                precision.option("assignment_refine_steps", 2)
-            ),
+            assignment_refine_steps=int(precision.option("assignment_refine_steps", 2)),
             search_steps=int(precision.option("search_steps", 19)),
             group_chunk=int(precision.option("group_chunk", 1024)),
             device=device,
@@ -3441,9 +3573,7 @@ def _quantize_flat_stream_chunk(
             TPQ_PQ_SPECS_BY_LABEL[family],
             np.asarray(artifact, dtype=np.float32),
             device=device,
-            distance_bytes=int(
-                precision.option("distance_bytes", 1 << 30)
-            ),
+            distance_bytes=int(precision.option("distance_bytes", 1 << 30)),
         )
     if quant_backend in ACCELERATOR_BACKENDS and family in {"NPQ0-L", "NPQ0-S"}:
         if family == "NPQ0-L":
@@ -3454,9 +3584,7 @@ def _quantize_flat_stream_chunk(
                 artifact,
                 importance=importance,
                 config=Npq0LConfig(
-                    fixed_refine_steps=int(
-                        precision.option("fixed_refine_steps", 3)
-                    ),
+                    fixed_refine_steps=int(precision.option("fixed_refine_steps", 3)),
                     group_chunk=int(precision.option("group_chunk", 512)),
                 ),
                 device=device,
@@ -3468,9 +3596,7 @@ def _quantize_flat_stream_chunk(
             artifact,
             importance=importance,
             config=Npq0SConfig(
-                fixed_refine_steps=int(
-                    precision.option("fixed_refine_steps", 3)
-                ),
+                fixed_refine_steps=int(precision.option("fixed_refine_steps", 3)),
                 group_chunk=int(precision.option("group_chunk", 256)),
             ),
             device=device,
@@ -3501,20 +3627,20 @@ def _write_flat_family_axis0_blob(
     if family.startswith("NINT") or family.startswith("NEPQ"):
         raise ValueError(f"{family} is not a flat compact-family stream")
     out, neuron_len = (int(value) for value in shape)
-    artifact = resolve_precision_artifact(
-        precision, artifact_root=artifact_root
-    )
+    artifact = resolve_precision_artifact(precision, artifact_root=artifact_root)
     if artifact is None and family in {
-        "NVQ2J", "NVQ2J-L", "NVQ2J-XL",
-        "NVQ3J", "NVQ3J-512", "NVQ3J-L",
+        "NVQ2J",
+        "NVQ2J-L",
+        "NVQ2J-XL",
+        "NVQ3J",
+        "NVQ3J-512",
+        "NVQ3J-L",
     }:
         artifact = initial_jsc_tables(
             NvqJscConfig(
                 banks=int(precision.option("banks", 4)),
                 iterations=int(precision.option("iterations", 4)),
-                assignment_refine_steps=int(
-                    precision.option("assignment_refine_steps", 2)
-                ),
+                assignment_refine_steps=int(precision.option("assignment_refine_steps", 2)),
                 search_steps=int(precision.option("search_steps", 19)),
                 group_chunk=int(precision.option("group_chunk", 1024)),
                 spec=_NVQ_SPECS[family],
@@ -3552,9 +3678,7 @@ def _write_flat_family_axis0_blob(
         codebook = np.ascontiguousarray(artifact, dtype=np.float32)
         header = pack_tpq_pq_prefix(spec, shape, codebook)
         table_payload = b""
-        stream_bits = (
-            (neuron_len // spec.vector_size) * spec.index_bits,
-        )
+        stream_bits = ((neuron_len // spec.vector_size) * spec.index_bits,)
         packer = pack_tpq_indices
         fields = ("indices",)
         anchor_bytes_per_row = 0
@@ -3562,11 +3686,7 @@ def _write_flat_family_axis0_blob(
         spec = NVQ1_L_T8_S3
         ng = (neuron_len + spec.groupsize - 1) // spec.groupsize
         nvec = (neuron_len + spec.vector_size - 1) // spec.vector_size
-        profile = (
-            _PROFILE_IQ1S_GRID
-            if artifact is None
-            else _PROFILE_CUSTOM_TERNARY
-        )
+        profile = _PROFILE_IQ1S_GRID if artifact is None else _PROFILE_CUSTOM_TERNARY
         header = _NVQ1_L_HEADER.pack(
             _NVQ1_L_MAGIC,
             profile,
@@ -3576,9 +3696,7 @@ def _write_flat_family_axis0_blob(
             neuron_len,
             len(shape),
         )
-        table_payload = (
-            b"" if artifact is None else pack_ternary_codebook(np.asarray(artifact))
-        )
+        table_payload = b"" if artifact is None else pack_ternary_codebook(np.asarray(artifact))
         stream_bits = (ng * spec.sub_bits, nvec * spec.index_bits, ng)
         packer = _pack_nvq1_l_bits
         fields = ("sub_scale", "indices", "delta_sign")
@@ -3649,8 +3767,12 @@ def _write_flat_family_axis0_blob(
         nvec = (neuron_len + spec.vector_size - 1) // spec.vector_size
         nsign = (neuron_len + 7) // 8
         if family in {
-            "NVQ2J", "NVQ2J-L", "NVQ2J-XL",
-            "NVQ3J", "NVQ3J-512", "NVQ3J-L",
+            "NVQ2J",
+            "NVQ2J-L",
+            "NVQ2J-XL",
+            "NVQ3J",
+            "NVQ3J-512",
+            "NVQ3J-L",
         }:
             if not isinstance(artifact, NvqJscTables):
                 raise TypeError(f"{family} stream artifact must contain NvqJscTables")
@@ -3668,9 +3790,7 @@ def _write_flat_family_axis0_blob(
                 encoded_codebook |= _INDEX_PARITY_FLAG
             if artifact is not None:
                 encoded_codebook |= _CUSTOM_CODEBOOK_FLAG
-            table_payload = (
-                b"" if artifact is None else pack_codebook(spec, np.asarray(artifact))
-            )
+            table_payload = b"" if artifact is None else pack_codebook(spec, np.asarray(artifact))
         header = _NVQ_HEADER.pack(
             _NVQ_MAGIC,
             encoded_codebook,
@@ -3680,10 +3800,18 @@ def _write_flat_family_axis0_blob(
             neuron_len,
             len(shape),
         )
-        if family in {
-            "NVQ2J", "NVQ2J-L", "NVQ2J-XL",
-            "NVQ3J", "NVQ3J-512", "NVQ3J-L",
-        } and storage_layout == "group64":
+        if (
+            family
+            in {
+                "NVQ2J",
+                "NVQ2J-L",
+                "NVQ2J-XL",
+                "NVQ3J",
+                "NVQ3J-512",
+                "NVQ3J-L",
+            }
+            and storage_layout == "group64"
+        ):
             stream_bits = (ng * 64,)
             packer = None
             fields = ("group64",)
@@ -3732,9 +3860,7 @@ def _write_flat_family_axis0_blob(
                 importance_shape = tuple(int(value) for value in importance.shape)
                 if importance_rows_per_entry is not None:
                     if importance_rows_per_entry <= 0:
-                        raise ValueError(
-                            "importance_rows_per_entry must be positive"
-                        )
+                        raise ValueError("importance_rows_per_entry must be positive")
                     expected_entries = (
                         out + importance_rows_per_entry - 1
                     ) // importance_rows_per_entry
@@ -3744,15 +3870,13 @@ def _write_flat_family_axis0_blob(
                             f"{importance_shape}, expected "
                             f"{(expected_entries, neuron_len)}"
                         )
-                    entry_ids = torch.arange(
-                        start, end, device=device, dtype=torch.int64
-                    ).div(importance_rows_per_entry, rounding_mode="floor")
+                    entry_ids = torch.arange(start, end, device=device, dtype=torch.int64).div(
+                        importance_rows_per_entry, rounding_mode="floor"
+                    )
                     objective = (
                         device_importance
                         if device_importance is not None
-                        else torch.as_tensor(
-                            importance, device=device, dtype=torch.float32
-                        )
+                        else torch.as_tensor(importance, device=device, dtype=torch.float32)
                     )
                     chunk_importance = objective.index_select(0, entry_ids)
                 elif importance_shape == (neuron_len,):
@@ -3761,8 +3885,7 @@ def _write_flat_family_axis0_blob(
                     chunk_importance = importance[start:end]
                 else:
                     raise ValueError(
-                        f"streaming importance has unsupported shape "
-                        f"{importance_shape}"
+                        f"streaming importance has unsupported shape {importance_shape}"
                     )
             tensor = _quantize_flat_stream_chunk(
                 chunk,
@@ -3774,14 +3897,8 @@ def _write_flat_family_axis0_blob(
             )
             if anchor_bytes_per_row:
                 output.seek(anchor_offset + start * anchor_bytes_per_row)
-                output.write(
-                    np.ascontiguousarray(
-                        tensor.neuron_scale, dtype="<f2"
-                    ).tobytes()
-                )
-            for stream_offset, bits, field in zip(
-                stream_offsets, stream_bits, fields, strict=True
-            ):
+                output.write(np.ascontiguousarray(tensor.neuron_scale, dtype="<f2").tobytes())
+            for stream_offset, bits, field in zip(stream_offsets, stream_bits, fields, strict=True):
                 output.seek(stream_offset + (start * bits) // 8)
                 if field == "group64":
                     output.write(
@@ -3818,18 +3935,12 @@ def _write_nepq_cohort_blob(
     artifact_root: str | Path | None,
     importance: np.ndarray | torch.Tensor | None = None,
 ) -> tuple[int, bytes]:
-    tables = resolve_precision_artifact(
-        precision, artifact_root=artifact_root
-    )
+    tables = resolve_precision_artifact(precision, artifact_root=artifact_root)
     if tables is None:
-        raise ValueError(
-            f"{precision.family} requires a frozen cross-expert table artifact"
-        )
+        raise ValueError(f"{precision.family} requires a frozen cross-expert table artifact")
     anchor_multipliers = tuple(
         float(value)
-        for value in str(
-            precision.option("anchor_multipliers", "0.75,1.0,1.25")
-        ).split(",")
+        for value in str(precision.option("anchor_multipliers", "0.75,1.0,1.25")).split(",")
     )
     base_config = NepqQuantConfig(
         anchor_multipliers=anchor_multipliers,
@@ -3841,9 +3952,7 @@ def _write_nepq_cohort_blob(
     )
     if precision.family.endswith("-A"):
         if not isinstance(tables, NepqAArtifact):
-            raise TypeError(
-                f"{precision.family} artifact must contain NepqAArtifact"
-            )
+            raise TypeError(f"{precision.family} artifact must contain NepqAArtifact")
         tensor = quantize_nepq_a_fixed(
             source,
             precision.family,
@@ -3868,12 +3977,8 @@ def _write_nepq_cohort_blob(
             ),
             config=NepqAQuantConfig(
                 base=base_config,
-                residual_row_chunk=int(
-                    precision.option("residual_row_chunk", 128)
-                ),
-                residual_block_chunk=int(
-                    precision.option("residual_block_chunk", 1024)
-                ),
+                residual_row_chunk=int(precision.option("residual_row_chunk", 128)),
+                residual_block_chunk=int(precision.option("residual_block_chunk", 1024)),
             ),
             device=device,
         )
@@ -3891,11 +3996,7 @@ def _write_nepq_cohort_blob(
     ng, nvec, nsuper, bank_count, rows = validate_nepq(tensor)
     spec = tensor.spec
     n_experts, out_per_expert, neuron_len = tensor.shape
-    aux = (
-        np.empty(0, dtype=np.uint8)
-        if tensor.aux is None
-        else np.asarray(tensor.aux)
-    )
+    aux = np.empty(0, dtype=np.uint8) if tensor.aux is None else np.asarray(tensor.aux)
     with blob_path.open("wb") as output:
         output.write(
             _NEPQ_HEADER.pack(
@@ -3912,12 +4013,8 @@ def _write_nepq_cohort_blob(
                 int(tensor.rotation_seed),
             )
         )
-        output.write(
-            np.ascontiguousarray(tensor.table_payloads, dtype=np.uint8).tobytes()
-        )
-        output.write(
-            np.ascontiguousarray(tensor.neuron_scale, dtype="<f2").tobytes()
-        )
+        output.write(np.ascontiguousarray(tensor.table_payloads, dtype=np.uint8).tobytes())
+        output.write(np.ascontiguousarray(tensor.neuron_scale, dtype="<f2").tobytes())
         for values, columns, bits in (
             (tensor.state, ng, spec.state_bits),
             (tensor.indices, nvec, spec.index_bits),
@@ -3954,11 +4051,7 @@ def _write_nepq_cohort_blob(
                     0,
                 )
             )
-            output.write(
-                np.ascontiguousarray(
-                    tensor.residual_codebook, dtype="<f2"
-                ).tobytes()
-            )
+            output.write(np.ascontiguousarray(tensor.residual_codebook, dtype="<f2").tobytes())
             output.write(
                 _pack_nepq_bits(
                     np.asarray(tensor.residual_first),
@@ -3966,22 +4059,15 @@ def _write_nepq_cohort_blob(
                 )
             )
             if spec.residual_second:
-                output.write(
-                    _pack_nepq_bits(
-                        np.asarray(tensor.residual_second_mask), 1
-                    )
-                )
-                output.write(
-                    _pack_nepq_bits(second, spec.residual_record_bits)
-                )
+                output.write(_pack_nepq_bits(np.asarray(tensor.residual_second_mask), 1))
+                output.write(_pack_nepq_bits(second, spec.residual_record_bits))
             if tensor.residual_padding_nbytes:
                 output.write(bytes(int(tensor.residual_padding_nbytes)))
     payload_nbytes = blob_path.stat().st_size
     expected_nbytes = _NEPQ_HEADER.size + tensor.payload_nbytes
     if payload_nbytes != expected_nbytes:
         raise RuntimeError(
-            f"{precision.family} stream size mismatch: "
-            f"{payload_nbytes} != {expected_nbytes}"
+            f"{precision.family} stream size mismatch: {payload_nbytes} != {expected_nbytes}"
         )
     runtime_payload = _pack_nint_moe_runtime(tensor)
     return payload_nbytes, runtime_payload
@@ -4007,9 +4093,7 @@ def _write_mixed_moe_axis0_blob(
             f"received {len(expert_precisions)} expert precisions for {n_experts} experts"
         )
     importance_shape = (
-        None
-        if importance is None
-        else tuple(int(value) for value in importance.shape)
+        None if importance is None else tuple(int(value) for value in importance.shape)
     )
     if importance_shape not in {
         None,
@@ -4021,11 +4105,7 @@ def _write_mixed_moe_axis0_blob(
             f"[{columns}] or [{n_experts},{columns}], got {importance_shape}"
         )
     if all(value.nint_spec is not None for value in expert_precisions):
-        specs = tuple(
-            value.nint_spec
-            for value in expert_precisions
-            if value.nint_spec is not None
-        )
+        specs = tuple(value.nint_spec for value in expert_precisions if value.nint_spec is not None)
         return _write_nint_moe_axis0_blob(
             source,
             source_shape,
@@ -4070,12 +4150,11 @@ def _write_mixed_moe_axis0_blob(
                     pool_importance = np.ascontiguousarray(
                         np.asarray(importance)[np.asarray(expert_ids)]
                     )
-                pool_source = _ExpertPoolRowSource(
-                    source, source_shape, expert_shape, expert_ids
-                )
+                pool_source = _ExpertPoolRowSource(source, source_shape, expert_shape, expert_ids)
                 pool_path = blob_path.with_name(f"{blob_path.name}.pool{pool_index}.tmp")
                 pool_paths.append(pool_path)
                 if precision.nint_spec is not None:
+
                     def importance_rows(
                         start: int,
                         end: int,
@@ -4106,9 +4185,7 @@ def _write_mixed_moe_axis0_blob(
                         quant_backend,
                         device,
                         importance_rows=(
-                            importance_rows
-                            if precision.nint_spec.bits in {2, 3, 4, 5, 6}
-                            else None
+                            importance_rows if precision.nint_spec.bits in {2, 3, 4, 5, 6} else None
                         ),
                     )
                     runtime_payload = b""
@@ -4116,8 +4193,7 @@ def _write_mixed_moe_axis0_blob(
                     exact_writer = getattr(source, "write_mxfp4_expert_pool", None)
                     if exact_writer is None:
                         raise TypeError(
-                            "MXFP4 expert preservation requires an exact native "
-                            "MXFP4 source"
+                            "MXFP4 expert preservation requires an exact native MXFP4 source"
                         )
                     pool_nbytes = exact_writer(expert_ids, pool_path)
                     runtime_payload = b""
@@ -4142,9 +4218,7 @@ def _write_mixed_moe_axis0_blob(
                         artifact_root,
                         importance=pool_importance,
                         importance_rows_per_entry=(
-                            rows_per_expert
-                            if importance_shape == (n_experts, columns)
-                            else None
+                            rows_per_expert if importance_shape == (n_experts, columns) else None
                         ),
                     )
                     runtime_payload = b""
@@ -4234,11 +4308,7 @@ def _nint_moe_blob_nbytes(
     total = _NINT_MOE_HDR.size
     for profile, count in cohorts.items():
         dtype_nbytes = len(f"NINT{profile.bits}".encode("ascii"))
-        total += (
-            _NINT_MOE_POOL_V2_HDR.size
-            + count * np.dtype(np.int32).itemsize
-            + dtype_nbytes
-        )
+        total += _NINT_MOE_POOL_V2_HDR.size + count * np.dtype(np.int32).itemsize + dtype_nbytes
         total += _nint_blob_nbytes(count * rows_per_expert, columns, profile)
     return int(total)
 
@@ -4252,11 +4322,7 @@ def _mixed_moe_blob_nbytes(
     if len(expert_precisions) != n_experts:
         raise ValueError("expert precision count does not match expert tensor shape")
     if all(value.nint_spec is not None for value in expert_precisions):
-        specs = tuple(
-            value.nint_spec
-            for value in expert_precisions
-            if value.nint_spec is not None
-        )
+        specs = tuple(value.nint_spec for value in expert_precisions if value.nint_spec is not None)
         return _nint_moe_blob_nbytes(expert_shape, specs)
 
     cohorts: dict[ExpertPrecision, int] = {}
@@ -4266,14 +4332,10 @@ def _mixed_moe_blob_nbytes(
     flat_shape_header = 2 * 8 + 4
     for precision, expert_count in cohorts.items():
         rows = expert_count * rows_per_expert
-        artifact = resolve_precision_artifact(
-            precision, artifact_root=artifact_root
-        )
+        artifact = resolve_precision_artifact(precision, artifact_root=artifact_root)
         runtime_nbytes = 0
         if precision.nint_spec is not None:
-            payload_nbytes = _nint_blob_nbytes(
-                rows, columns, precision.nint_spec
-            )
+            payload_nbytes = _nint_blob_nbytes(rows, columns, precision.nint_spec)
         elif precision.family == "MXFP4":
             payload_nbytes = len(
                 mx_header_bytes(
@@ -4292,25 +4354,19 @@ def _mixed_moe_blob_nbytes(
             )
         elif precision.family == "NVQ1-S":
             payload_nbytes = (
-                _NVQ1_S_HEADER.size
-                + flat_shape_header
-                + NVQ1_S.payload_nbytes(rows, columns)
+                _NVQ1_S_HEADER.size + flat_shape_header + NVQ1_S.payload_nbytes(rows, columns)
             )
         elif precision.family == "NPQ0-L":
             if not isinstance(artifact, Npq0LTables):
                 raise ValueError("NPQ0-L size estimation requires its table artifact")
             payload_nbytes = (
-                _NPQ0_L_HEADER.size
-                + flat_shape_header
-                + NPQ0_L.payload_nbytes(rows, columns)
+                _NPQ0_L_HEADER.size + flat_shape_header + NPQ0_L.payload_nbytes(rows, columns)
             )
         elif precision.family == "NPQ0-S":
             if not isinstance(artifact, Npq0STables):
                 raise ValueError("NPQ0-S size estimation requires its table artifact")
             payload_nbytes = (
-                _NPQ0_S_HEADER.size
-                + flat_shape_header
-                + NPQ0_S.payload_nbytes(rows, columns)
+                _NPQ0_S_HEADER.size + flat_shape_header + NPQ0_S.payload_nbytes(rows, columns)
             )
         elif precision.family in TPQ_PQ_SPECS_BY_LABEL:
             if artifact is None:
@@ -4325,8 +4381,12 @@ def _mixed_moe_blob_nbytes(
             spec = _NVQ_SPECS[precision.family]
             table_nbytes = 0
             if precision.family in {
-                "NVQ2J", "NVQ2J-L", "NVQ2J-XL",
-                "NVQ3J", "NVQ3J-512", "NVQ3J-L",
+                "NVQ2J",
+                "NVQ2J-L",
+                "NVQ2J-XL",
+                "NVQ3J",
+                "NVQ3J-512",
+                "NVQ3J-L",
             }:
                 if artifact is None:
                     artifact = initial_jsc_tables(
@@ -4354,27 +4414,26 @@ def _mixed_moe_blob_nbytes(
                 + table_nbytes
                 + (
                     jsc_payload_nbytes(spec, rows, columns)
-                    if precision.family in {
-                        "NVQ2J", "NVQ2J-L", "NVQ2J-XL",
-                        "NVQ3J", "NVQ3J-512", "NVQ3J-L",
+                    if precision.family
+                    in {
+                        "NVQ2J",
+                        "NVQ2J-L",
+                        "NVQ2J-XL",
+                        "NVQ3J",
+                        "NVQ3J-512",
+                        "NVQ3J-L",
                     }
                     else spec.payload_nbytes(rows, columns)
                 )
             )
         elif precision.family in _NEPQ_SPECS:
             if artifact is None:
-                raise ValueError(
-                    f"{precision.family} size estimation requires its table artifact"
-                )
+                raise ValueError(f"{precision.family} size estimation requires its table artifact")
             tables = np.asarray(
-                artifact.table_payloads
-                if isinstance(artifact, NepqAArtifact)
-                else artifact
+                artifact.table_payloads if isinstance(artifact, NepqAArtifact) else artifact
             )
             if tables.ndim != 2:
-                raise ValueError(
-                    f"{precision.family} table artifact must be a 2D byte pool"
-                )
+                raise ValueError(f"{precision.family} table artifact must be a 2D byte pool")
             nepq_spec = _NEPQ_SPECS[precision.family]
             payload_nbytes = (
                 nepq_spec.payload_nbytes(
@@ -4386,16 +4445,17 @@ def _mixed_moe_blob_nbytes(
                 + _NEPQ_HEADER.size
             )
             if nepq_spec.is_residual:
-                block_count = expert_count * rows_per_expert * math.ceil(
-                    (columns // nepq_spec.vector_size)
-                    / nepq_spec.residual_block_vectors
+                block_count = (
+                    expert_count
+                    * rows_per_expert
+                    * math.ceil(
+                        (columns // nepq_spec.vector_size) / nepq_spec.residual_block_vectors
+                    )
                 )
                 payload_nbytes += (
                     _RESIDUAL_HEADER.size
                     + _RESIDUAL_DICTIONARY_ENTRIES * nepq_spec.vector_size * 2
-                    + math.ceil(
-                        block_count * nepq_spec.residual_record_bits / 8
-                    )
+                    + math.ceil(block_count * nepq_spec.residual_record_bits / 8)
                 )
                 if nepq_spec.residual_second:
                     weights = expert_count * rows_per_expert * columns
@@ -4411,9 +4471,7 @@ def _mixed_moe_blob_nbytes(
                         )
                     )
                     if supplied > 1:
-                        raise ValueError(
-                            "NEPQ1-A accepts one residual budget option"
-                        )
+                        raise ValueError("NEPQ1-A accepts one residual budget option")
                     if requested_nbytes is not None:
                         payload_nbytes = int(requested_nbytes)
                     elif requested_bpw is not None or supplied == 0:
@@ -4421,15 +4479,9 @@ def _mixed_moe_blob_nbytes(
                         payload_nbytes = int(round(bpw * weights / 8.0))
                     else:
                         payload_nbytes += math.ceil(block_count / 8) + math.ceil(
-                            int(requested_records)
-                            * nepq_spec.residual_record_bits
-                            / 8
+                            int(requested_records) * nepq_spec.residual_record_bits / 8
                         )
-            if int(
-                precision.option(
-                    "rotation_block", 2048 if nepq_spec.is_residual else 0
-                )
-            ):
+            if int(precision.option("rotation_block", 2048 if nepq_spec.is_residual else 0)):
                 runtime_nbytes = _NINT_MOE_ROTATION_HDR.size + columns
         else:
             raise ValueError(f"unsupported expert precision: {precision.family}")
@@ -4480,9 +4532,7 @@ def _estimate_bytes(
                 nvq_jsc_banks=nvq_jsc_banks,
             )
         else:
-            item_size = {"BF16": 2, "F16": 2, "F32": 4, "I32": 4, "I64": 8}[
-                item.target_dtype
-            ]
+            item_size = {"BF16": 2, "F16": 2, "F32": 4, "I32": 4, "I64": 8}[item.target_dtype]
             dense_total += 4 + 8 * len(item.shape) + n * item_size
     return nint_total, dense_total
 
@@ -4549,9 +4599,7 @@ def _plan_blob_nbytes(
             jsc_banks=jsc_banks,
             expert_artifact_root=artifact_root,
         )
-    item_size = {"BF16": 2, "F16": 2, "F32": 4, "I32": 4, "I64": 8}[
-        item.target_dtype
-    ]
+    item_size = {"BF16": 2, "F16": 2, "F32": 4, "I32": 4, "I64": 8}[item.target_dtype]
     return 4 + 8 * len(item.shape) + n * item_size
 
 
@@ -4604,6 +4652,10 @@ def convert(args: argparse.Namespace) -> None:
     row_chunk = resolve_row_chunk(args.row_chunk, quant_backend)
     recipe_gguf = getattr(args, "recipe_gguf", "")
     recipe_types = _load_gguf_recipe(Path(recipe_gguf).resolve()) if recipe_gguf else None
+    standard_preset_arg = getattr(args, "standard_preset", "")
+    standard_preset = _normalize_standard_preset(standard_preset_arg) if standard_preset_arg else ""
+    quantize_vision = bool(getattr(args, "quantize_vision", False))
+    quantize_mtp = bool(getattr(args, "quantize_mtp", False))
     calibration_scheme_path = getattr(args, "calibration_scheme", "")
     calibration_scheme = (
         load_scheme(Path(calibration_scheme_path).resolve()) if calibration_scheme_path else None
@@ -4621,9 +4673,22 @@ def convert(args: argparse.Namespace) -> None:
     dense_dtype = getattr(args, "dense_dtype", "f16").upper()
     if mostly_bf16 and (recipe_types is not None or calibration_scheme is not None):
         raise ValueError("--bf16 cannot be combined with a recipe or calibration scheme")
+    if standard_preset and recipe_types is not None:
+        raise ValueError("--standard-preset cannot be combined with --recipe-gguf")
+    if standard_preset and calibration_scheme is not None:
+        raise ValueError("--standard-preset cannot be combined with a calibration scheme")
+    if standard_preset and mostly_bf16:
+        raise ValueError("--standard-preset cannot be combined with --bf16")
+    if standard_preset and (args.bits, args.groupsize, args.sub_bits) != (4, 24, 6):
+        raise ValueError("--bits, --groupsize, and --sub-bits cannot override a standard preset")
+    if args.text_only and quantize_vision:
+        raise ValueError("--quantize-vision cannot be combined with --text-only")
+    if mostly_bf16 and (quantize_vision or quantize_mtp):
+        raise ValueError("--quantize-vision and --quantize-mtp do not apply to --bf16")
     if base_store is not None and (
         mostly_bf16
         or recipe_types is not None
+        or standard_preset
         or calibration_scheme is not None
         or getattr(args, "imatrix", "")
         or getattr(args, "tensor_precision_overrides", "")
@@ -4639,10 +4704,25 @@ def convert(args: argparse.Namespace) -> None:
         dense_dtype=dense_dtype,
         calibration_scheme=calibration_scheme,
         mostly_bf16=mostly_bf16,
+        quantize_vision=quantize_vision,
+        quantize_mtp=quantize_mtp,
         source_inventory=source_inventory,
         source_config=source_config,
         default_nint_dtype=f"NINT{spec.bits}",
     )
+    if standard_preset:
+        if source_config is None:
+            config_path = root / "config.json"
+            source_config = (
+                json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+            )
+        plan = _apply_standard_preset(
+            plan,
+            standard_preset,
+            source_config,
+            quantize_vision=quantize_vision,
+            quantize_mtp=quantize_mtp,
+        )
     plan = _apply_recipe_family_mappings(
         plan,
         npq0_l=bool(getattr(args, "npq0_l", False)),
@@ -4652,9 +4732,7 @@ def convert(args: argparse.Namespace) -> None:
         iq2_s_to_nint2=bool(getattr(args, "iq2_s_to_nint2", False)),
         q8_to_nint8_zero=bool(getattr(args, "q8_to_nint8_zero", False)),
     )
-    tensor_precision_overrides_arg = getattr(
-        args, "tensor_precision_overrides", ""
-    )
+    tensor_precision_overrides_arg = getattr(args, "tensor_precision_overrides", "")
     tensor_precision_overrides = (
         _load_tensor_precision_overrides(tensor_precision_overrides_arg)
         if tensor_precision_overrides_arg
@@ -4686,14 +4764,8 @@ def convert(args: argparse.Namespace) -> None:
     imatrix_path_arg = getattr(args, "imatrix", "")
     if mostly_bf16 and imatrix_path_arg:
         raise ValueError("--bf16 cannot be combined with an imatrix")
-    imatrix = (
-        load_importance_matrix(Path(imatrix_path_arg).resolve())
-        if imatrix_path_arg
-        else None
-    )
-    imatrix_bindings = (
-        {} if imatrix is None else _bind_hf_imatrix(imatrix, plan)
-    )
+    imatrix = load_importance_matrix(Path(imatrix_path_arg).resolve()) if imatrix_path_arg else None
+    imatrix_bindings = {} if imatrix is None else _bind_hf_imatrix(imatrix, plan)
     requested_calibration = getattr(args, "nvq_calibration", "auto")
     calibration_mode = (
         "gain"
@@ -4703,9 +4775,7 @@ def convert(args: argparse.Namespace) -> None:
         else requested_calibration
     )
     if calibration_mode != "none" and imatrix is None:
-        raise ValueError(
-            f"NVQ calibration mode {calibration_mode} requires --imatrix"
-        )
+        raise ValueError(f"NVQ calibration mode {calibration_mode} requires --imatrix")
     nvq_codebook_scope = getattr(args, "nvq_codebook_scope", "tensor")
     if bool(getattr(args, "npq0_l", False)) and nvq_codebook_scope != "tensor":
         raise ValueError("--npq0-l requires --nvq-codebook-scope tensor")
@@ -4724,11 +4794,7 @@ def convert(args: argparse.Namespace) -> None:
             if source_inventory is None
             else source_inventory.get(item.source_name or item.name)
         )
-        total_src += (
-            metadata.nbytes
-            if metadata is not None
-            else int(np.prod(item.shape)) * 2
-        )
+        total_src += metadata.nbytes if metadata is not None else int(np.prod(item.shape)) * 2
     target_counts: dict[str, int] = {}
     target_bytes_est: dict[str, int] = {}
     for p in plan:
@@ -4749,11 +4815,20 @@ def convert(args: argparse.Namespace) -> None:
                 "output": str(output),
                 "tensors": len(plan),
                 "target_counts": target_counts,
-                "target_estimated_gb": {k: round(v / 1e9, 3) for k, v in sorted(target_bytes_est.items())},
+                "target_estimated_gb": {
+                    k: round(v / 1e9, 3) for k, v in sorted(target_bytes_est.items())
+                },
                 "source_full_precision_gb": round(total_src / 1e9, 3),
                 "estimated_mfq_gb": round((nint_est + dense_est) / 1e9, 3),
-                "default_spec": {"bits": spec.bits, "groupsize": spec.groupsize, "sub_bits": spec.sub_bits},
+                "default_spec": {
+                    "bits": spec.bits,
+                    "groupsize": spec.groupsize,
+                    "sub_bits": spec.sub_bits,
+                },
                 "recipe": _artifact_provenance_name(recipe_gguf),
+                "standard_preset": standard_preset or None,
+                "quantize_vision": quantize_vision,
+                "quantize_mtp": quantize_mtp,
                 "calibration_scheme": (
                     _artifact_provenance_name(calibration_scheme_path)
                     if calibration_scheme_path
@@ -4781,9 +4856,7 @@ def convert(args: argparse.Namespace) -> None:
                 "mapping": dict(sorted(_RECIPE_TARGETS.items())),
                 "nvq_calibration": calibration_mode,
                 "nvq_codebook_scope": nvq_codebook_scope,
-                "tensor_precision_overrides": dict(
-                    sorted(tensor_precision_overrides.items())
-                ),
+                "tensor_precision_overrides": dict(sorted(tensor_precision_overrides.items())),
             },
             ensure_ascii=False,
         ),
@@ -4808,17 +4881,13 @@ def convert(args: argparse.Namespace) -> None:
     )
     codebook_config = gguf_quantizer.TensorCodebookTrainingConfig(
         iterations=int(getattr(args, "nvq_codebook_iterations", 4)),
-        projection_candidates=int(
-            getattr(args, "nvq_codebook_projection_candidates", 48)
-        ),
+        projection_candidates=int(getattr(args, "nvq_codebook_projection_candidates", 48)),
         quant_backend=quant_backend,
         device=quant_device,
         group_chunk=int(getattr(args, "nvq_group_chunk", 32768)),
         row_chunk=int(getattr(args, "nvq_codebook_row_chunk", 512)),
         search_steps=int(getattr(args, "nvq_search_steps", 19)),
-        nvq1_l_anchor_multipliers=tuple(
-            getattr(args, "nvq1_l_anchor_multipliers", (0.75,))
-        ),
+        nvq1_l_anchor_multipliers=tuple(getattr(args, "nvq1_l_anchor_multipliers", (0.75,))),
         nvq1_l_refine_steps=int(getattr(args, "nvq1_l_refine_steps", 2)),
         nvq_native_assignment=(
             quant_backend in {"cuda", "metal"}
@@ -4828,16 +4897,12 @@ def convert(args: argparse.Namespace) -> None:
             quant_backend in {"cuda", "metal"}
             and getattr(args, "nvq1_l_assignment", "native") == "native"
         ),
-        min_validation_improvement=float(
-            getattr(args, "nvq_codebook_min_improvement", 0.0)
-        ),
+        min_validation_improvement=float(getattr(args, "nvq_codebook_min_improvement", 0.0)),
     )
     jsc_config = gguf_quantizer.NvqJscConfig(
         banks=int(getattr(args, "nvq_jsc_banks", 4)),
         iterations=int(getattr(args, "nvq_jsc_iterations", 4)),
-        assignment_refine_steps=int(
-            getattr(args, "nvq_jsc_assignment_refine_steps", 2)
-        ),
+        assignment_refine_steps=int(getattr(args, "nvq_jsc_assignment_refine_steps", 2)),
         search_steps=int(getattr(args, "nvq_search_steps", 19)),
         raw_multiplier=int(getattr(args, "nvq_jsc_raw_multiplier", 8)),
         learned_scale_lut=True,
@@ -4847,9 +4912,7 @@ def convert(args: argparse.Namespace) -> None:
     )
     npq0_l_config = gguf_quantizer.Npq0LConfig(
         iterations=int(getattr(args, "npq0_l_iterations", 4)),
-        assignment_refine_steps=int(
-            getattr(args, "npq0_l_assignment_refine_steps", 2)
-        ),
+        assignment_refine_steps=int(getattr(args, "npq0_l_assignment_refine_steps", 2)),
         fixed_refine_steps=int(getattr(args, "npq0_l_fixed_refine_steps", 3)),
         kmeans_iterations=int(getattr(args, "npq0_l_kmeans_iterations", 8)),
         group_chunk=int(getattr(args, "npq0_l_group_chunk", 512)),
@@ -4864,13 +4927,10 @@ def convert(args: argparse.Namespace) -> None:
     if row_importance is not None:
         if imatrix is None or calibration_mode != "group24":
             raise ValueError(
-                "--nvq-jsc-row-importance requires --imatrix and "
-                "--nvq-calibration group24"
+                "--nvq-jsc-row-importance requires --imatrix and --nvq-calibration group24"
             )
         if nvq_codebook_scope != "tensor":
-            raise ValueError(
-                "--nvq-jsc-row-importance requires --nvq-codebook-scope tensor"
-            )
+            raise ValueError("--nvq-jsc-row-importance requires --nvq-codebook-scope tensor")
         for item in plan:
             if item.target_dtype in _JSC_DTYPES:
                 row_importance.require(item.name, int(item.shape[0]))
@@ -4909,18 +4969,16 @@ def convert(args: argparse.Namespace) -> None:
                     nvq3_jsc_banks=int(getattr(args, "nvq3_jsc_banks", 2)),
                     nvq_jsc_banks=int(getattr(args, "nvq_jsc_banks", 4)),
                 )
-                variable_codebook_size = (
-                    nvq_codebook_scope == "tensor"
-                    and item.target_dtype in {"NVQ1-L", "NVQ2", "NVQ3"}
-                )
+                variable_codebook_size = nvq_codebook_scope == "tensor" and item.target_dtype in {
+                    "NVQ1-L",
+                    "NVQ2",
+                    "NVQ3",
+                }
                 if (
                     resume_temp
                     and blob_path.is_file()
                     and blob_path.stat().st_size > 0
-                    and (
-                        variable_codebook_size
-                        or blob_path.stat().st_size == expected_nbytes
-                    )
+                    and (variable_codebook_size or blob_path.stat().st_size == expected_nbytes)
                 ):
                     reused_nbytes = blob_path.stat().st_size
                     records.append(
@@ -4952,8 +5010,11 @@ def convert(args: argparse.Namespace) -> None:
                 # multi-gigabyte shard open across all tensors lets touched
                 # pages accumulate in the process working set on Windows.
                 if item.target_dtype == "NINTM" and item.expert_source_names is not None:
-                    if item.expert_shape is None or item.expert_precisions is None or \
-                            item.expert_source_shards is None:
+                    if (
+                        item.expert_shape is None
+                        or item.expert_precisions is None
+                        or item.expert_source_shards is None
+                    ):
                         raise ValueError(f"NINTM plan lacks HF expert metadata: {item.name}")
                     source = (
                         _MfqGlmExpertRowSource(
@@ -5006,9 +5067,7 @@ def convert(args: argparse.Namespace) -> None:
                         if item.expert_shape is None or item.expert_precisions is None:
                             raise ValueError(f"NINTM plan lacks expert metadata: {item.name}")
                         if item.transform is not None:
-                            source = _transform_glm_kv_b(
-                                raw_source.tensor(), item
-                            )
+                            source = _transform_glm_kv_b(raw_source.tensor(), item)
                         else:
                             source = raw_source
                         expert_importance = _hf_expert_importance(
@@ -5053,10 +5112,7 @@ def convert(args: argparse.Namespace) -> None:
                                 else imatrix_bindings[item.name].rows
                             ),
                         )
-                    elif (
-                        item.target_dtype.startswith("NVQ")
-                        or item.target_dtype == "NPQ0-L"
-                    ):
+                    elif item.target_dtype.startswith("NVQ") or item.target_dtype == "NPQ0-L":
                         source = _HfPlanRowSource(raw_source, item)
                         imatrix_binding = imatrix_bindings.get(item.name)
                         shared_plan = gguf_quantizer.GgufTensorPlan(
@@ -5069,11 +5125,7 @@ def convert(args: argparse.Namespace) -> None:
                             recipe_type=item.gguf_type or item.target_dtype,
                             target_dtype=item.target_dtype,
                         )
-                        source_identity = (
-                            root
-                            if mfq_checkpoint is not None
-                            else root / shard
-                        )
+                        source_identity = root if mfq_checkpoint is not None else root / shard
                         recipe_identity = (
                             Path(recipe_gguf).resolve()
                             if recipe_gguf
@@ -5092,14 +5144,12 @@ def convert(args: argparse.Namespace) -> None:
                                 spec=_NVQ_SPECS[item.target_dtype],
                                 banks=(
                                     int(getattr(args, "nvq3_jsc_banks", 2))
-                                    if item.target_dtype
-                                    in {"NVQ3J", "NVQ3J-512", "NVQ3J-L"}
+                                    if item.target_dtype in {"NVQ3J", "NVQ3J-512", "NVQ3J-L"}
                                     else jsc_config.banks
                                 ),
                                 learned_scale_lut=(
                                     bool(getattr(args, "nvq3_jsc_learned_scale", False))
-                                    if item.target_dtype
-                                    in {"NVQ3J", "NVQ3J-512", "NVQ3J-L"}
+                                    if item.target_dtype in {"NVQ3J", "NVQ3J-512", "NVQ3J-L"}
                                     else jsc_config.learned_scale_lut
                                 ),
                             )
@@ -5107,64 +5157,53 @@ def convert(args: argparse.Namespace) -> None:
                             else jsc_config
                         )
                         if item.target_dtype == "NPQ0-L":
-                            npq0_l_tables, metrics = (
-                                gguf_quantizer._train_or_load_npq0_l_tables(
-                                    source,
-                                    shared_plan,
-                                    source_identity,
-                                    recipe_identity,
-                                    codebook_artifact_root,
-                                    npq0_l_config,
-                                    int(getattr(args, "nvq_codebook_train_rows", 2048)),
-                                    int(getattr(args, "nvq_codebook_validation_rows", 512)),
-                                    int(getattr(args, "nvq_codebook_seed", 20260716)),
-                                    quant_device,
-                                    imatrix,
-                                    imatrix_binding,
-                                )
+                            npq0_l_tables, metrics = gguf_quantizer._train_or_load_npq0_l_tables(
+                                source,
+                                shared_plan,
+                                source_identity,
+                                recipe_identity,
+                                codebook_artifact_root,
+                                npq0_l_config,
+                                int(getattr(args, "nvq_codebook_train_rows", 2048)),
+                                int(getattr(args, "nvq_codebook_validation_rows", 512)),
+                                int(getattr(args, "nvq_codebook_seed", 20260716)),
+                                quant_device,
+                                imatrix,
+                                imatrix_binding,
                             )
                             codebook_results[item.name] = metrics
-                        elif (
-                            item.target_dtype in _JSC_DTYPES
-                            and nvq_codebook_scope == "tensor"
-                        ):
-                            jsc_tables, metrics = (
-                                gguf_quantizer._train_or_load_jsc_tables(
-                                    source,
-                                    shared_plan,
-                                    source_identity,
-                                    recipe_identity,
-                                    codebook_artifact_root,
-                                    item_jsc_config,
-                                    int(getattr(args, "nvq_codebook_train_rows", 2048)),
-                                    int(getattr(args, "nvq_codebook_validation_rows", 512)),
-                                    int(getattr(args, "nvq_codebook_seed", 20260716)),
-                                    quant_device,
-                                    imatrix,
-                                    imatrix_binding,
-                                    row_importance,
-                                )
+                        elif item.target_dtype in _JSC_DTYPES and nvq_codebook_scope == "tensor":
+                            jsc_tables, metrics = gguf_quantizer._train_or_load_jsc_tables(
+                                source,
+                                shared_plan,
+                                source_identity,
+                                recipe_identity,
+                                codebook_artifact_root,
+                                item_jsc_config,
+                                int(getattr(args, "nvq_codebook_train_rows", 2048)),
+                                int(getattr(args, "nvq_codebook_validation_rows", 512)),
+                                int(getattr(args, "nvq_codebook_seed", 20260716)),
+                                quant_device,
+                                imatrix,
+                                imatrix_binding,
+                                row_importance,
                             )
                             codebook_results[item.name] = metrics
                         elif item.target_dtype in _JSC_DTYPES:
-                            jsc_tables = gguf_quantizer.initial_jsc_tables(
-                                item_jsc_config
-                            )
+                            jsc_tables = gguf_quantizer.initial_jsc_tables(item_jsc_config)
                         elif nvq_codebook_scope == "tensor":
-                            codebook, metrics = (
-                                gguf_quantizer._train_or_load_tensor_codebook(
-                                    source,
-                                    shared_plan,
-                                    source_identity,
-                                    recipe_identity,
-                                    codebook_artifact_root,
-                                    codebook_config,
-                                    int(getattr(args, "nvq_codebook_train_rows", 2048)),
-                                    int(getattr(args, "nvq_codebook_validation_rows", 512)),
-                                    int(getattr(args, "nvq_codebook_seed", 20260716)),
-                                    imatrix,
-                                    imatrix_binding,
-                                )
+                            codebook, metrics = gguf_quantizer._train_or_load_tensor_codebook(
+                                source,
+                                shared_plan,
+                                source_identity,
+                                recipe_identity,
+                                codebook_artifact_root,
+                                codebook_config,
+                                int(getattr(args, "nvq_codebook_train_rows", 2048)),
+                                int(getattr(args, "nvq_codebook_validation_rows", 512)),
+                                int(getattr(args, "nvq_codebook_seed", 20260716)),
+                                imatrix,
+                                imatrix_binding,
                             )
                             codebook_results[item.name] = metrics
                         nvq_result = gguf_quantizer._write_nvq_blob(
@@ -5180,9 +5219,7 @@ def convert(args: argparse.Namespace) -> None:
                             nvq1_l_anchor_multipliers=tuple(
                                 getattr(args, "nvq1_l_anchor_multipliers", (0.75,))
                             ),
-                            nvq1_l_refine_steps=int(
-                                getattr(args, "nvq1_l_refine_steps", 2)
-                            ),
+                            nvq1_l_refine_steps=int(getattr(args, "nvq1_l_refine_steps", 2)),
                             importance_rows=(
                                 None if imatrix_binding is None else imatrix_binding.rows
                             ),
@@ -5197,15 +5234,11 @@ def convert(args: argparse.Namespace) -> None:
                                 and getattr(args, "nvq1_l_assignment", "native") == "native"
                             ),
                             jsc_tables=jsc_tables,
-                            jsc_assignment_refine_steps=(
-                                item_jsc_config.assignment_refine_steps
-                            ),
+                            jsc_assignment_refine_steps=(item_jsc_config.assignment_refine_steps),
                             npq0_l_tables=npq0_l_tables,
                             npq0_l_config=npq0_l_config,
                             calibration_mode=(
-                                calibration_mode
-                                if imatrix_binding is not None
-                                else "none"
+                                calibration_mode if imatrix_binding is not None else "none"
                             ),
                         )
                         nbytes = nvq_result.nbytes
@@ -5214,7 +5247,7 @@ def convert(args: argparse.Namespace) -> None:
                     else:
                         source = raw_source.tensor()
                         if item.row_start is not None or item.row_end is not None:
-                            source = source[item.row_start:item.row_end]
+                            source = source[item.row_start : item.row_end]
                         nbytes = _dense_blob_from_tensor(source, blob_path, item.target_dtype)
                     del source, raw_source
                 if not variable_codebook_size and nbytes != expected_nbytes:
@@ -5250,14 +5283,23 @@ def convert(args: argparse.Namespace) -> None:
         else:
             config_path = root / "config.json"
             config = (
-                json.loads(config_path.read_text(encoding="utf-8"))
-                if config_path.exists()
-                else {}
+                json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
             )
         config_text = config.get("text_config", config)
-        mtp_plan_names = [item.name for item in plan if item.name.startswith("mtp.")]
+        mtp_plan_names = [
+            item.name
+            for item in plan
+            if item.name.startswith("predictor.")
+            or (item.source_name or item.name).startswith("mtp.")
+        ]
         mtp_config_layers = (
-            int(config_text.get("mtp_num_hidden_layers", 0) or 0)
+            int(
+                config_text.get(
+                    "mtp_num_hidden_layers",
+                    config_text.get("num_nextn_predict_layers", 0),
+                )
+                or 0
+            )
             if isinstance(config_text, dict)
             else 0
         )
@@ -5268,22 +5310,19 @@ def convert(args: argparse.Namespace) -> None:
             config = json.loads(json.dumps(config))
             config_text = config.get("text_config", config)
             if isinstance(config_text, dict):
-                config_text["mtp_num_hidden_layers"] = 0
-                config_text["mtp_use_dedicated_embeddings"] = False
+                if "num_nextn_predict_layers" in config_text:
+                    config_text["num_nextn_predict_layers"] = 0
+                else:
+                    config_text["mtp_num_hidden_layers"] = 0
+                    config_text["mtp_use_dedicated_embeddings"] = False
         model_type = str(config.get("model_type", "unknown"))
         runtime_assets: list[RuntimeAsset] = []
-        asset_store = base_store or (
-            mfq_checkpoint.store if mfq_checkpoint is not None else None
-        )
+        asset_store = base_store or (mfq_checkpoint.store if mfq_checkpoint is not None else None)
         if asset_store is not None:
             manifest = asset_store.header.extra.get(ASSET_MANIFEST_KEY, {})
-            manifest_assets = (
-                manifest.get("assets", {}) if isinstance(manifest, dict) else {}
-            )
+            manifest_assets = manifest.get("assets", {}) if isinstance(manifest, dict) else {}
             media_by_record = {
-                str(value.get("record")): str(
-                    value.get("media_type", "application/octet-stream")
-                )
+                str(value.get("record")): str(value.get("media_type", "application/octet-stream"))
                 for value in manifest_assets.values()
                 if isinstance(value, dict) and value.get("record")
             }
@@ -5304,28 +5343,42 @@ def convert(args: argparse.Namespace) -> None:
             or MODEL_CONFIG_ASSET not in assets_by_name
         ):
             assets_by_name[MODEL_CONFIG_ASSET] = model_config_asset(config)
+        graph_spec = graph_spec_for_plan(
+            config,
+            [item.name for item in plan],
+        )
+        if graph_spec is not None:
+            assets_by_name[MODEL_GRAPH_ASSET] = model_graph_asset(graph_spec.as_dict())
         if (
             _is_minicpmo45_config(config)
             and MINICPMO45_RESAMPLER_POS_EMBED_ASSET not in assets_by_name
         ):
             position_asset = minicpmo45_resampler_pos_embed_asset()
             assets_by_name[position_asset.name] = position_asset
-        if (
-            model_type in {"qwen4_exp", "qwen4_exp_text", "glm5_next", "glm5_next_text"}
-            and mfq_checkpoint is None
+        if mfq_checkpoint is None and (
+            (root / "tokenizer.json").is_file() or (root / "tokenizer_config.json").is_file()
         ):
             for asset in hf_runtime_assets(root):
                 assets_by_name[asset.name] = asset
         tokenizer_gguf_arg = getattr(args, "tokenizer_gguf", "")
-        tokenizer_gguf = (
-            Path(tokenizer_gguf_arg).resolve()
-            if tokenizer_gguf_arg
-            else (
-                Path(recipe_gguf).resolve()
-                if recipe_gguf and TOKENIZER_GGUF_ASSET not in assets_by_name
-                else None
-            )
-        )
+        tokenizer_gguf = Path(tokenizer_gguf_arg).resolve() if tokenizer_gguf_arg else None
+        if tokenizer_gguf is None and recipe_gguf and TOKENIZER_GGUF_ASSET not in assets_by_name:
+            tokenizer_gguf = Path(recipe_gguf).resolve()
+        if (
+            tokenizer_gguf is None
+            and mfq_checkpoint is None
+            and (root / "tokenizer.json").is_file()
+            and (root / "tokenizer_config.json").is_file()
+        ):
+            try:
+                from mfq.server.hf_tokenizer import ensure_hf_tokenizer_gguf
+
+                tokenizer_gguf = ensure_hf_tokenizer_gguf(root)
+            except Exception as error:
+                warnings.warn(
+                    f"could not build the native tokenizer GGUF from HF metadata: {error}",
+                    stacklevel=2,
+                )
         if tokenizer_gguf is not None:
             tokenizer_asset = gguf_metadata_asset(_gguf_reader(tokenizer_gguf))
             assets_by_name[tokenizer_asset.name] = tokenizer_asset
@@ -5341,9 +5394,7 @@ def convert(args: argparse.Namespace) -> None:
         for index, asset in enumerate(runtime_assets):
             asset_path = tmp_root / f"runtime-asset-{index:02d}.blob"
             asset_path.write_bytes(asset.data)
-            records.append(
-                BlobRecord(asset.name, ASSET_DTYPE, len(asset.data), asset_path)
-            )
+            records.append(BlobRecord(asset.name, ASSET_DTYPE, len(asset.data), asset_path))
         inherited_profile = (
             asset_store.header.extra.get(RUNTIME_SAMPLING_METADATA_KEY)
             if asset_store is not None
@@ -5353,30 +5404,40 @@ def convert(args: argparse.Namespace) -> None:
             root if mfq_checkpoint is None else None,
             config,
             explicit_profile=getattr(args, "sampling_profile", "") or None,
-            inherited_profile=(
-                inherited_profile if isinstance(inherited_profile, dict) else None
-            ),
+            inherited_profile=(inherited_profile if isinstance(inherited_profile, dict) else None),
         )
         header_extra = {
-                "source": root.name,
-                "source_format": "mfq" if mfq_checkpoint is not None else "hf",
-                "policy": (
-                    "mostly-BF16;1d-and-special=F32"
-                    if mostly_bf16
+            "source": root.name,
+            "source_format": "mfq" if mfq_checkpoint is not None else "hf",
+            "policy": (
+                "mostly-BF16;1d-and-special=F32"
+                if mostly_bf16
+                else (
+                    "gguf-recipe-split-qkv"
+                    if recipe_gguf
                     else (
-                        "gguf-recipe-split-qkv"
-                        if recipe_gguf
+                        f"llama.cpp-style-standard-preset:{standard_preset};"
+                        f"vision={'quantized' if quantize_vision else 'source'};"
+                        f"mtp={'quantized' if quantize_mtp else 'source'}"
+                        if standard_preset
                         else (
                             "minicpmo45-module-matrices=NINT-axis0,raw-parameters=source-dtype"
                             if _is_minicpmo45_config(config)
                             else "2d=NINT-axis0,other=dense"
                         )
                     )
-                ),
+                )
+            ),
         }
         if runtime_profile is not None:
             header_extra[RUNTIME_SAMPLING_METADATA_KEY] = runtime_profile
         if base_store is not None:
+            from mfq.compat.legacy_tensor_names import qwen35_legacy_name_map
+
+            base_legacy_names = qwen35_legacy_name_map(
+                base_store.records,
+                config,
+            )
             header_extra = {
                 key: value
                 for key, value in base_store.header.extra.items()
@@ -5390,15 +5451,11 @@ def convert(args: argparse.Namespace) -> None:
                 }
             )
 
-            generated_tensors = [
-                record for record in records if not is_asset_record(record.name)
-            ]
-            generated_assets = [
-                record for record in records if is_asset_record(record.name)
-            ]
+            generated_tensors = [record for record in records if not is_asset_record(record.name)]
+            generated_assets = [record for record in records if is_asset_record(record.name)]
             copied_tensors = [
                 BlobRecord(
-                    record.name,
+                    base_legacy_names.get(record.name, record.name),
                     record.dtype,
                     record.nbytes,
                     base_store.paths[record.source_index],
@@ -5406,7 +5463,7 @@ def convert(args: argparse.Namespace) -> None:
                 )
                 for record in base_store.records.values()
                 if not is_asset_record(record.name)
-                and not record.name.startswith("mtp.")
+                and not base_legacy_names.get(record.name, record.name).startswith("predictor.")
             ]
             records = copied_tensors + generated_tensors + generated_assets
 
@@ -5428,13 +5485,11 @@ def convert(args: argparse.Namespace) -> None:
                 }
             )
             for record in base_store.records.values():
-                if record.name.startswith("mtp."):
+                if base_legacy_names.get(record.name, record.name).startswith("predictor."):
                     merged_counts[record.dtype] = int(merged_counts.get(record.dtype, 0)) - 1
             for record in generated_tensors:
                 merged_counts[record.dtype] = int(merged_counts.get(record.dtype, 0)) + 1
-            target_counts = {
-                key: value for key, value in merged_counts.items() if int(value) > 0
-            }
+            target_counts = {key: value for key, value in merged_counts.items() if int(value) > 0}
             inherited_codebooks = header_extra.get("nvq_codebooks", {})
             header_extra["nvq_codebooks"] = {
                 **(inherited_codebooks if isinstance(inherited_codebooks, dict) else {}),
@@ -5451,9 +5506,10 @@ def convert(args: argparse.Namespace) -> None:
             "hidden_layers": mtp_config_layers if mtp_included else 0,
             "tensor_count": len(mtp_plan_names),
             "protected_full_precision": sorted(
-                name
-                for name in mtp_plan_names
-                if name in _MTP_PROTECTED_TENSORS
+                item.name
+                for item in plan
+                if item.name in mtp_plan_names
+                and (item.source_name or item.name) in _MTP_PROTECTED_TENSORS
             ),
         }
         if base_store is not None:
@@ -5495,7 +5551,9 @@ def convert(args: argparse.Namespace) -> None:
                     "full_attention": "qk_group,v_separate",
                     "linear_attention": "qk_group,v_separate,z_separate,ab_recipe_group",
                     "ffn": "gate_up_group,down_separate",
-                } if recipe_gguf else None,
+                }
+                if recipe_gguf
+                else None,
                 "default_spec": {
                     "bits": spec.bits,
                     "groupsize": spec.groupsize,
@@ -5511,6 +5569,14 @@ def convert(args: argparse.Namespace) -> None:
                     "Q6_K": {"bits": 6, "groupsize": 24, "sub_bits": 7},
                     "Q8_0": {"bits": 8, "groupsize": 48, "sub_bits": 7},
                 },
+                "standard_preset": standard_preset or None,
+                "standard_preset_policy": (
+                    "llama.cpp/src/llama-quant.cpp tensor categories translated to MFQ NINT"
+                    if standard_preset
+                    else None
+                ),
+                "quantize_vision": quantize_vision,
+                "quantize_mtp": quantize_mtp,
                 "dense_dtype": "MOSTLY_BF16" if mostly_bf16 else dense_dtype,
                 "mostly_bf16": mostly_bf16,
                 "text_only": bool(args.text_only),
@@ -5519,9 +5585,7 @@ def convert(args: argparse.Namespace) -> None:
                 ASSET_MANIFEST_KEY: runtime_asset_manifest(runtime_assets),
                 "target_counts": target_counts,
                 "recipe_mapping": dict(sorted(_RECIPE_TARGETS.items())),
-                "tensor_precision_overrides": dict(
-                    sorted(tensor_precision_overrides.items())
-                ),
+                "tensor_precision_overrides": dict(sorted(tensor_precision_overrides.items())),
                 "nvq_calibration": calibration_mode,
                 "nvq_codebook_scope": nvq_codebook_scope,
                 "nvq_codebooks": codebook_results,
@@ -5532,8 +5596,7 @@ def convert(args: argparse.Namespace) -> None:
             model_arch=(
                 base_store.header.model_arch
                 if base_store is not None
-                else
-                f"{model_type}-hf-mfq-bf16"
+                else f"{model_type}-hf-mfq-bf16"
                 if mostly_bf16
                 else (
                     f"{model_type}-full-mfq-nint-recipe"
@@ -5562,9 +5625,7 @@ def convert(args: argparse.Namespace) -> None:
                     "output": str(outputs[0]),
                     "outputs": [str(path) for path in outputs],
                     "shard_count": len(outputs),
-                    "output_gb": round(
-                        sum(path.stat().st_size for path in outputs) / 1e9, 3
-                    ),
+                    "output_gb": round(sum(path.stat().st_size for path in outputs) / 1e9, 3),
                     "elapsed_sec": round(time.time() - start_time, 2),
                 },
                 ensure_ascii=False,
@@ -5608,8 +5669,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--row-chunk", type=int, default=0)
     parser.add_argument("--quant-backend", choices=QUANT_BACKENDS, default="auto")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--text-only", action="store_true", help="only convert language_model + lm_head tensors")
-    parser.add_argument("--recipe-gguf", default="", help="GGUF file whose tensor types define the MFQ mixed-NINT recipe")
+    parser.add_argument(
+        "--text-only", action="store_true", help="only convert language_model + lm_head tensors"
+    )
+    parser.add_argument(
+        "--recipe-gguf",
+        default="",
+        help="GGUF file whose tensor types define the MFQ mixed-NINT recipe",
+    )
+    parser.add_argument(
+        "--standard-preset",
+        "--preset",
+        dest="standard_preset",
+        default="",
+        help=("built-in llama.cpp-style tensor mixture: " + ", ".join(STANDARD_PRESET_NAMES)),
+    )
+    parser.add_argument(
+        "--quantize-vision",
+        action="store_true",
+        help="opt in to quantizing Vision tensors; source precision is kept by default",
+    )
+    parser.add_argument(
+        "--quantize-mtp",
+        action="store_true",
+        help="opt in to quantizing MTP/draft tensors; source precision is kept by default",
+    )
     parser.add_argument(
         "--tokenizer-gguf",
         default="",
@@ -5629,17 +5713,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--imatrix",
         default="",
-        help=(
-            "optional llama.cpp GGUF or legacy importance matrix for "
-            "HF NINT/NINTM calibration"
-        ),
+        help=("optional llama.cpp GGUF or legacy importance matrix for HF NINT/NINTM calibration"),
     )
     parser.add_argument(
         "--tensor-precision-overrides",
         default="",
-        help=(
-            "JSON mapping exact GGUF or HF tensor names to final MFQ dtypes"
-        ),
+        help=("JSON mapping exact GGUF or HF tensor names to final MFQ dtypes"),
     )
     parser.add_argument(
         "--nvq-calibration",
@@ -5648,9 +5727,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--nvq-group-chunk", type=int, default=32768)
     parser.add_argument("--nvq-search-steps", type=int, default=19)
-    parser.add_argument(
-        "--nvq-assignment", choices=("native", "torch"), default="native"
-    )
+    parser.add_argument("--nvq-assignment", choices=("native", "torch"), default="native")
     parser.add_argument("--nvq-jsc-banks", type=int, choices=(1, 2, 4), default=4)
     parser.add_argument("--nvq-jsc-iterations", type=int, default=4)
     parser.add_argument("--nvq-jsc-assignment-refine-steps", type=int, default=2)
@@ -5677,12 +5754,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=(0.75,),
     )
     parser.add_argument("--nvq1-l-refine-steps", type=int, default=2)
-    parser.add_argument(
-        "--nvq1-l-assignment", choices=("native", "torch"), default="native"
-    )
-    parser.add_argument(
-        "--nvq-codebook-scope", choices=("fixed", "tensor"), default="tensor"
-    )
+    parser.add_argument("--nvq1-l-assignment", choices=("native", "torch"), default="native")
+    parser.add_argument("--nvq-codebook-scope", choices=("fixed", "tensor"), default="tensor")
     parser.add_argument("--nvq-codebook-artifact-dir", default="")
     parser.add_argument("--nvq-codebook-train-rows", type=int, default=2048)
     parser.add_argument("--nvq-codebook-validation-rows", type=int, default=512)
@@ -5699,9 +5772,20 @@ def build_parser() -> argparse.ArgumentParser:
             "1D/norm/special tensors as F32, matching llama.cpp MOSTLY_BF16"
         ),
     )
-    parser.add_argument("--dense-dtype", choices=("f16", "f32"), default="f32", help="dense dtype for non-quantized recipe tensors")
-    parser.add_argument("--limit-tensors", type=int, default=0, help="debug/smoke: convert first N planned tensors")
-    parser.add_argument("--dry-run", action="store_true", help="print plan and estimated size without writing output")
+    parser.add_argument(
+        "--dense-dtype",
+        choices=("f16", "f32"),
+        default="f32",
+        help="dense dtype for non-quantized recipe tensors",
+    )
+    parser.add_argument(
+        "--limit-tensors", type=int, default=0, help="debug/smoke: convert first N planned tensors"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print plan and estimated size without writing output",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--keep-temp", action="store_true")
     split = parser.add_mutually_exclusive_group()

@@ -103,6 +103,8 @@ interface GenerationSettings {
   presencePenalty: number;
   frequencyPenalty: number;
   enableThinking: boolean;
+  enableVision: boolean;
+  enableMtp: boolean;
   reasoningEffort: string;
   excludeReasoning: boolean;
   playbackEnabled: boolean;
@@ -122,6 +124,8 @@ type StoredPresetSettings = Pick<
   | "presencePenalty"
   | "frequencyPenalty"
   | "enableThinking"
+  | "enableVision"
+  | "enableMtp"
   | "reasoningEffort"
   | "excludeReasoning"
   | "seed"
@@ -224,6 +228,8 @@ const DEFAULT_SETTINGS: GenerationSettings = {
   presencePenalty: 0,
   frequencyPenalty: 0,
   enableThinking: true,
+  enableVision: true,
+  enableMtp: true,
   reasoningEffort: "",
   excludeReasoning: false,
   playbackEnabled: true,
@@ -269,6 +275,14 @@ function modeTemplateSettings(
       : typeof defaults.enable_thinking === "boolean"
         ? defaults.enable_thinking
         : current.enableThinking,
+    enableVision:
+      typeof defaults.enable_vision === "boolean"
+        ? defaults.enable_vision
+        : current.enableVision,
+    enableMtp:
+      typeof defaults.enable_mtp === "boolean"
+        ? defaults.enable_mtp
+        : current.enableMtp,
     fullDuplex: mode === "full_duplex",
     preset: "custom",
     seed: null,
@@ -294,6 +308,8 @@ function presetSnapshot(settings: GenerationSettings): StoredPresetSettings {
     presencePenalty: settings.presencePenalty,
     frequencyPenalty: settings.frequencyPenalty,
     enableThinking: settings.enableThinking,
+    enableVision: settings.enableVision,
+    enableMtp: settings.enableMtp,
     reasoningEffort: settings.reasoningEffort,
     excludeReasoning: settings.excludeReasoning,
     seed: settings.seed,
@@ -336,6 +352,14 @@ function loadStoredPresets(): StoredPreset[] {
             typeof source.enableThinking === "boolean"
               ? source.enableThinking
               : fallback.enableThinking,
+          enableVision:
+            typeof source.enableVision === "boolean"
+              ? source.enableVision
+              : fallback.enableVision,
+          enableMtp:
+            typeof source.enableMtp === "boolean"
+              ? source.enableMtp
+              : fallback.enableMtp,
           reasoningEffort:
             typeof source.reasoningEffort === "string"
               ? source.reasoningEffort
@@ -385,6 +409,8 @@ function storedPresetFromResource(preset: GenerationPresetResource): StoredPrese
       presencePenalty: sampling.presence_penalty,
       frequencyPenalty: sampling.frequency_penalty,
       enableThinking: sampling.enable_thinking,
+      enableVision: sampling.enable_vision,
+      enableMtp: sampling.enable_mtp,
       reasoningEffort: sampling.reasoning_effort ?? "",
       excludeReasoning: !preset.settings.include_reasoning_history,
       seed: sampling.seed ?? null,
@@ -421,6 +447,8 @@ function presetResourceBody(
         repetition_penalty: preset.settings.repetitionPenalty,
         seed: preset.settings.seed,
         enable_thinking: preset.settings.enableThinking,
+        enable_vision: preset.settings.enableVision,
+        enable_mtp: preset.settings.enableMtp,
         reasoning_effort: preset.settings.reasoningEffort || null,
       },
       system_prompt: preset.settings.systemPrompt || null,
@@ -802,6 +830,7 @@ type IconName =
   | "folder"
   | "gauge"
   | "info"
+  | "image"
   | "lightbulb"
   | "link"
   | "memory"
@@ -847,6 +876,7 @@ function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
       {name === "folder" && <path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H10l2 2h6.5A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z" />}
       {name === "gauge" && <><path d="M4.2 18a8.5 8.5 0 1 1 15.6 0" /><path d="M6.5 15.5h.01M7.8 11h.01M12 8.8h.01M16.2 11h.01M17.5 15.5h.01" /><path d="m12 14 4.2-5.2" /><circle cx="12" cy="14" r="1.45" /></>}
       {name === "info" && <><circle cx="12" cy="12" r="9" /><path d="M12 10v6M12 7h.01" /></>}
+      {name === "image" && <><rect height="16" rx="2" width="18" x="3" y="4" /><circle cx="8.5" cy="9" r="1.5" /><path d="m4.5 18 5-5 3 3 2.5-2.5 4.5 4.5" /></>}
       {name === "lightbulb" && <><path d="M9 18h6M10 22h4" /><path d="M8.4 14.7A6 6 0 1 1 15.6 14.7 4.1 4.1 0 0 0 14 18h-4a4.1 4.1 0 0 0-1.6-3.3z" /></>}
       {name === "link" && <><path d="m9.5 14.5 5-5" /><path d="M7.5 17.5 5 20a3.5 3.5 0 0 1-5-5l4-4a3.5 3.5 0 0 1 5 0" transform="translate(2 -2)" /><path d="m16.5 6.5 2.5-2.5a3.5 3.5 0 0 1 5 5l-4 4a3.5 3.5 0 0 1-5 0" transform="translate(-2 2)" /></>}
       {name === "memory" && <><rect height="14" rx="2" width="14" x="5" y="5" /><path d="M9 9h6v6H9zM9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3" /></>}
@@ -1568,17 +1598,26 @@ export default function App() {
   }, [runtime]);
   const thinkingSupported =
     runtime?.chat_template_capabilities?.thinking?.supported === true;
+  const visionSupported = Boolean(
+    capabilities?.model_capabilities.features.image_input
+      || capabilities?.model_capabilities.features.video_input,
+  );
+  const visionAvailable = Boolean(
+    capabilities?.vision_available || visionSupported,
+  );
+  const mtpSupported = capabilities?.model_capabilities.features.mtp === true;
+  const mtpAvailable = capabilities?.mtp_available === true;
   const attachmentAccept = useMemo(() => {
     const features = capabilities?.model_capabilities.features;
     return [
-      features?.image_input ? "image/*" : "",
-      features?.video_input ? "video/*" : "",
+      effectiveSettings.enableVision && features?.image_input ? "image/*" : "",
+      effectiveSettings.enableVision && features?.video_input ? "video/*" : "",
       features?.audio_input ? "audio/*" : "",
       DOCUMENT_ACCEPT,
     ]
       .filter(Boolean)
       .join(",");
-  }, [capabilities]);
+  }, [capabilities, effectiveSettings.enableVision]);
 
   const refreshSessions = useCallback(async (preferredId?: string) => {
     const next = await api.listSessions();
@@ -1998,6 +2037,8 @@ export default function App() {
       repetition_penalty: effectiveSettings.repetitionPenalty,
       seed: effectiveSettings.seed,
       enable_thinking: thinkingSupported && effectiveSettings.enableThinking,
+      enable_vision: effectiveSettings.enableVision,
+      enable_mtp: effectiveSettings.enableMtp,
       reasoning_effort: effectiveSettings.reasoningEffort || null,
     };
   }
@@ -2651,6 +2692,8 @@ export default function App() {
           repetition_penalty: next.settings.repetitionPenalty,
           seed: next.settings.seed,
           enable_thinking: thinkingSupported && next.settings.enableThinking,
+          enable_vision: next.settings.enableVision,
+          enable_mtp: next.settings.enableMtp,
           reasoning_effort: next.settings.reasoningEffort || null,
         },
         system_prompt: next.settings.systemPrompt || null,
@@ -3270,6 +3313,8 @@ export default function App() {
             repetition_penalty: resolvedGlobalSettings.repetitionPenalty,
             seed: resolvedGlobalSettings.seed,
             enable_thinking: thinkingSupported && resolvedGlobalSettings.enableThinking,
+            enable_vision: resolvedGlobalSettings.enableVision,
+            enable_mtp: resolvedGlobalSettings.enableMtp,
             reasoning_effort: resolvedGlobalSettings.reasoningEffort || null,
           },
         },
@@ -3570,6 +3615,16 @@ export default function App() {
           )}
           trailing={<input aria-label={tr("使用模型或架构默认值", "Use model or architecture defaults")} checked={settingsDraft.inheritModelDefaults} onChange={(event) => setModelDefaultInheritance(event.target.checked)} type="checkbox" />}
         />
+        <SettingRow
+          title={tr("视觉输入", "Vision input")}
+          detail={tr("默认启用；关闭后图片和视频请求会被明确拒绝。", "On by default; when off, image and video requests are rejected explicitly.")}
+          trailing={<input aria-label={tr("视觉输入", "Vision input")} checked={settingsDraft.enableVision} onChange={(event) => setSettingsDraft((current) => ({ ...current, enableVision: event.target.checked, inheritModelDefaults: false }))} type="checkbox" />}
+        />
+        <SettingRow
+          title="MTP"
+          detail={tr("默认启用；模型不含完整 MTP 权重时自动回退普通 Decode。", "On by default; models without a complete MTP head fall back to ordinary Decode.")}
+          trailing={<input aria-label="MTP" checked={settingsDraft.enableMtp} onChange={(event) => setSettingsDraft((current) => ({ ...current, enableMtp: event.target.checked, inheritModelDefaults: false }))} type="checkbox" />}
+        />
       </TMPanel>
 
       <fieldset className="settings-page-inherited" disabled={settingsDraft.inheritModelDefaults}>
@@ -3798,6 +3853,8 @@ export default function App() {
                   {capabilities && (capabilities.model_capabilities.features.audio_input || capabilities.model_capabilities.features.full_duplex) && <select aria-label={tr("交互模式", "Interaction mode")} disabled={!active || busy || voiceState !== "idle"} onChange={(event) => void selectInteractionMode(event.target.value as SessionMode)} value={active?.mode ?? mode}>{(["text", "voice", "full_duplex"] as SessionMode[]).map((item) => { const feature = capabilities.model_capabilities.features; const disabled = item === "voice" ? !feature.audio_input : item === "full_duplex" ? !feature.full_duplex : false; return <option disabled={disabled} key={item} value={item}>{MODE_LABELS[item][english ? 1 : 0]}</option>; })}</select>}
                   {realtimeAvailable && <button aria-label={tr("语音输入", "Voice input")} aria-pressed={voiceState !== "idle" && voiceState !== "error"} className="voice-button" disabled={!active || active.mode === "text" || busy} onClick={() => void toggleVoice()} style={{ "--voice-level": voiceLevel } as React.CSSProperties} title={active?.mode === "text" ? tr("请先选择语音或全双工模式", "Select voice or full duplex mode first") : voiceState === "processing" ? tr("语音处理中", "Processing voice") : tr("语音输入", "Voice input")} type="button"><span /></button>}
                   {realtimeAvailable && active?.mode !== "text" && <button aria-label={tr("语音播放", "Voice playback")} aria-pressed={settings.playbackEnabled} onClick={() => setSettings((current) => ({ ...current, playbackEnabled: !current.playbackEnabled }))} title={tr("语音播放", "Voice playback")} type="button"><Icon name={settings.playbackEnabled ? "volume" : "volume-off"} /></button>}
+                  {active?.mode === "text" && visionSupported && <button aria-label={tr("视觉输入", "Vision input")} aria-pressed={visionAvailable && effectiveSettings.enableVision} disabled={!visionAvailable} onClick={() => updateGlobalInference({ enableVision: !effectiveSettings.enableVision })} title={visionAvailable ? tr("视觉输入", "Vision input") : tr("当前模型文件没有视觉权重", "The current model artifact has no vision weights")} type="button"><Icon name="image" />{tr("视觉", "Vision")}</button>}
+                  {active?.mode === "text" && mtpSupported && <button aria-label="MTP" aria-pressed={mtpAvailable && effectiveSettings.enableMtp} disabled={!mtpAvailable} onClick={() => updateGlobalInference({ enableMtp: !effectiveSettings.enableMtp })} title={mtpAvailable ? "MTP" : tr("当前模型文件没有完整 MTP 权重", "The current model artifact has no complete MTP head")} type="button"><Icon name="text-forward" />MTP</button>}
                   {active?.mode === "text" && <button aria-pressed={thinkingSupported && effectiveSettings.enableThinking} disabled={!thinkingSupported} onClick={() => updateGlobalInference({ enableThinking: !effectiveSettings.enableThinking })} type="button"><Icon name="lightbulb" />{tr("思考", "Thinking")}</button>}
                   {active?.mode === "text" && thinkingSupported && effectiveSettings.enableThinking && reasoningValues.length > 0 && <select aria-label={tr("思考档位", "Reasoning effort")} onChange={(event) => updateGlobalInference({ reasoningEffort: event.target.value })} value={effectiveSettings.reasoningEffort}><option value="">{tr("标准", "Standard")}</option>{reasoningValues.map((value) => <option key={value} value={value}>{value}</option>)}</select>}
                   <span className="composer-hint">{voiceState !== "idle" ? voiceState : tr("Enter 发送 · Shift+Enter 换行", "Enter to send · Shift+Enter for newline")}</span>
@@ -3829,7 +3886,7 @@ export default function App() {
             {dashboardPage === "overview" && <>
               <SectionLabel title={tr("实时性能", "Live performance")} subtitle={tr("最近请求吞吐与累计缓存复用", "Latest request throughput · cumulative cache reuse")} />
               <div className="metric-grid">
-                <MetricTile label={tr("预填充", "Prefill")} value={`${formatNumber(lastPrefill.tokensPerSecond, 1)} tok/s`} detail={tr("输入处理", "Prompt processing")} icon="text-forward" />
+                <MetricTile label={tr("预填充", "Prefill")} value={`${formatNumber(lastPrefill.tokensPerSecond, 1)} tok/s`} detail={`${formatNumber(lastPrefill.milliseconds, 1)} ms · ${tr("输入处理", "Prompt processing")}`} icon="text-forward" />
                 <MetricTile label={tr("解码", "Decode")} value={`${formatNumber(last?.decode_tps, 1)} tok/s`} detail={tr("输出生成", "Token generation")} icon="waveform" />
                 <MetricTile label={tr("首字延迟", "TTFT")} value={`${formatNumber(lastTtftMs, 1)} ms`} detail={tr("首次输出耗时", "Time to first token")} icon="clock" />
                 <MetricTile label={tr("前缀复用", "Prefix reuse")} value={prefixCacheQueries > 0 ? `${formatNumber(prefixCacheHitRate, 1)}%` : "--"} detail={tr(`已恢复 ${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens`, `${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens restored`)} icon="reuse" />

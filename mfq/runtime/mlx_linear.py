@@ -337,6 +337,7 @@ class MlxLinearGroup:
             | MlxDenseLinear
         ],
         *,
+        grouped_min_rows: int = 1,
         grouped_max_rows: int | None = 16,
     ) -> None:
         if len(tensors) < 2:
@@ -367,8 +368,13 @@ class MlxLinearGroup:
             if len(packed) == len(self.layers) and not residual_vq
             else None
         )
+        if int(grouped_min_rows) <= 0:
+            raise ValueError("grouped_min_rows must be positive")
         if grouped_max_rows is not None and int(grouped_max_rows) <= 0:
             raise ValueError("grouped_max_rows must be positive or None")
+        if grouped_max_rows is not None and int(grouped_min_rows) > int(grouped_max_rows):
+            raise ValueError("grouped_min_rows must not exceed grouped_max_rows")
+        self.grouped_min_rows = int(grouped_min_rows)
         self.grouped_max_rows = None if grouped_max_rows is None else int(grouped_max_rows)
 
     @property
@@ -378,17 +384,10 @@ class MlxLinearGroup:
     def forward(self, x: mx.array | np.ndarray) -> tuple[mx.array, ...]:
         if self.grouped_weight is not None:
             source = x if isinstance(x, mx.array) else mx.array(x)
-            rows = (
-                int(
-                    np.prod(
-                        tuple(int(value) for value in source.shape[:-1]),
-                        dtype=np.int64,
-                    )
-                )
-                if source.ndim > 1
-                else 1
-            )
-            if self.grouped_max_rows is None or rows <= self.grouped_max_rows:
+            rows = int(source.size) // int(source.shape[-1])
+            if rows >= self.grouped_min_rows and (
+                self.grouped_max_rows is None or rows <= self.grouped_max_rows
+            ):
                 return grouped_linear_matmul(self.grouped_weight, source)
         return tuple(layer(x) for layer in self.layers)
 
@@ -437,10 +436,33 @@ class MlxNintModel:
 
     def __init__(self, tensors: Mapping[str, MfqTensor]) -> None:
         self.tensors = tensors
+        self.legacy_semantics = getattr(tensors, "legacy_semantics", None)
 
     @classmethod
     def from_mfq(cls, path: str | Path, *, mmap: bool = True) -> MlxNintModel:
         _header, tensors = io.load_mmap(path) if mmap else io.load(path)
+        if mmap:
+            # This is the sole runtime migration hook. Model implementations
+            # below consume canonical names regardless of the source artifact.
+            from mfq.compat.legacy_tensor_names import canonical_tensor_view
+
+            tensors = canonical_tensor_view(tensors)
+        else:
+            from mfq.compat.legacy_tensor_names import legacy_tensor_name_map
+            from mfq.formats.assets import MODEL_CONFIG_ASSET, MODEL_GRAPH_ASSET
+
+            if MODEL_GRAPH_ASSET not in tensors and MODEL_CONFIG_ASSET in tensors:
+                payload = tensors[MODEL_CONFIG_ASSET]
+                if isinstance(payload, bytes):
+                    import json
+
+                    config = json.loads(payload)
+                    if isinstance(config, Mapping):
+                        aliases = legacy_tensor_name_map(tensors, config)
+                        tensors = {
+                            aliases.get(name, name): value
+                            for name, value in tensors.items()
+                        }
         return cls(tensors)
 
     def linear(
@@ -536,7 +558,7 @@ class MlxNintModel:
         from mfq.kernels.metal.moe import UnsupportedGroupedMoeError
         from mfq.runtime.mlx_moe import MlxRoutedLinear
 
-        if isinstance(self.tensors, io.MMapTensorStore):
+        if hasattr(self.tensors, "records") and hasattr(self.tensors, "blob_view"):
             if name not in self.tensors.records:
                 raise KeyError(f"tensor {name!r} is not present in the MFQ model")
             record = self.tensors.records[name]
@@ -566,7 +588,7 @@ class MlxNintModel:
         self.close()
 
     def _packed_nint(self, name: str) -> MetalNintWeight | None:
-        if not isinstance(self.tensors, io.MMapTensorStore):
+        if not hasattr(self.tensors, "records") or not hasattr(self.tensors, "read_blob"):
             return None
         if name not in self.tensors.records:
             raise KeyError(f"tensor {name!r} is not present in the MFQ model")
@@ -576,7 +598,7 @@ class MlxNintModel:
         return MetalNintWeight.from_blob(self.tensors.read_blob(name))
 
     def _packed_mx(self, name: str) -> MetalMxWeight | None:
-        if not isinstance(self.tensors, io.MMapTensorStore):
+        if not hasattr(self.tensors, "records") or not hasattr(self.tensors, "read_blob"):
             return None
         if name not in self.tensors.records:
             raise KeyError(f"tensor {name!r} is not present in the MFQ model")
@@ -589,7 +611,7 @@ class MlxNintModel:
         self,
         name: str,
     ) -> MetalNint8ZeroWeight | None:
-        if not isinstance(self.tensors, io.MMapTensorStore):
+        if not hasattr(self.tensors, "records") or not hasattr(self.tensors, "read_blob"):
             return None
         if name not in self.tensors.records:
             raise KeyError(f"tensor {name!r} is not present in the MFQ model")
@@ -599,7 +621,7 @@ class MlxNintModel:
         return MetalNint8ZeroWeight.from_blob(self.tensors.read_blob(name))
 
     def _packed_vq(self, name: str) -> MetalVqWeight | None:
-        if not isinstance(self.tensors, io.MMapTensorStore):
+        if not hasattr(self.tensors, "records") or not hasattr(self.tensors, "read_blob"):
             return None
         if name not in self.tensors.records:
             raise KeyError(f"tensor {name!r} is not present in the MFQ model")

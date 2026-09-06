@@ -2,15 +2,14 @@
 
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
-DECODE = (ROOT / "cpp_runtime" / "mfq_decode.cpp").read_text(
+DECODE = (ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp").read_text(
     encoding="utf-8"
 )
-SERVER = (ROOT / "cpp_runtime" / "mfq_server.cpp").read_text(
+SERVER = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(
     encoding="utf-8"
 )
-METAL_VQ = (ROOT / "cpp_runtime" / "metal" / "mlx_vq.cpp").read_text(
+METAL_VQ = (ROOT / "cpp_runtime" / "backends" / "metal" / "ops" / "mlx_vq.cpp").read_text(
     encoding="utf-8"
 )
 NVQ2J_CUDA = (ROOT / "mfq" / "quantize" / "cuda" / "nvq2j_assign.cu").read_text(
@@ -63,4 +62,5 @@ def test_cuda_kl_rejects_context_larger_than_model_capacity() -> None:
 
 def test_unified_cuda_extension_can_include_runtime_headers() -> None:
     assert "_REPOSITORY_ROOT" in UNIFIED_CUDA_EXT
-    assert "extra_include_paths=[_REPOSITORY_ROOT]" in UNIFIED_CUDA_EXT
+    assert "_CUDA_RUNTIME_INCLUDE" in UNIFIED_CUDA_EXT
+    assert "extra_include_paths=[_REPOSITORY_ROOT, _CUDA_RUNTIME_INCLUDE]" in UNIFIED_CUDA_EXT

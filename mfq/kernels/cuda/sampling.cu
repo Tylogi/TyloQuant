@@ -3,7 +3,7 @@
 // random uniforms are passed as a small GPU tensor.
 
 #include <cuda_runtime.h>
-#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
+#include "mfq_tensor_backend.h"
 #include <cub/block/block_radix_sort.cuh>
 #include <float.h>
 #include <climits>

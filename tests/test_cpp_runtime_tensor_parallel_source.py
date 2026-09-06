@@ -1,11 +1,10 @@
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = (ROOT / "cpp_runtime" / "mfq_decode.cpp").read_text(
+SOURCE = (ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp").read_text(
     encoding="utf-8"
 )
-CMAKE = (ROOT / "cpp_runtime" / "CMakeLists.txt").read_text(
+CMAKE = (ROOT / "cpp_runtime" / "tests" / "CMakeLists.txt").read_text(
     encoding="utf-8"
 )
 
@@ -54,8 +53,8 @@ def test_tensor_parallel_disables_single_device_cuda_graphs():
 
 
 def test_deepseek_v4_split_gate_up_uses_existing_moe_runtime_and_cache():
-    assert 'p + "ffn_gate_exps.weight"' in SOURCE
-    assert 'p + "ffn_up_exps.weight"' in SOURCE
+    assert 'p + "mlp.experts.gate.weight"' in SOURCE
+    assert 'p + "mlp.experts.up.weight"' in SOURCE
     assert "has_split_gate != has_split_up" in SOURCE
     assert "moe_split_gate_up" in SOURCE
     assert 'true, i, "gate"' in SOURCE

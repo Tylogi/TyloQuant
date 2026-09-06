@@ -155,6 +155,11 @@ class OpenAIChatBackend:
         multimodal: dict[str, Any] | None = None
         cleanup_paths: tuple[Path, ...] = ()
         processor_ms = 0.0
+        if self._contains_visual_media(backend_messages) and not sampling.enable_vision:
+            raise BackendError(
+                "vision_disabled",
+                "vision is disabled for this request; enable Vision to send images or video",
+            )
         if self._contains_media(backend_messages):
             if self._model_type is None:
                 await self.capabilities()
@@ -196,6 +201,8 @@ class OpenAIChatBackend:
             "presence_penalty": sampling.presence_penalty,
             "frequency_penalty": sampling.frequency_penalty,
             "repetition_penalty": sampling.repetition_penalty,
+            "enable_vision": sampling.enable_vision,
+            "enable_mtp": sampling.enable_mtp,
             "stream": True,
             "stream_options": {"include_usage": True},
             "reasoning_format": "auto",
@@ -342,6 +349,11 @@ class OpenAIChatBackend:
             model=model,
             model_type=model_type,
             model_capabilities=capabilities,
+            vision_available=bool(
+                payload.get("vision_available", False)
+                or payload.get("video_available", False)
+            ),
+            mtp_available=bool(payload.get("mtp_available", False)),
             duplex_available=payload.get("duplex_available") is True,
         )
 
@@ -354,6 +366,20 @@ class OpenAIChatBackend:
             if any(
                 isinstance(item, dict)
                 and item.get("type") in {"image_url", "video_url", "input_audio"}
+                for item in content
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _contains_visual_media(messages: Sequence[dict[str, Any]]) -> bool:
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            if any(
+                isinstance(item, dict)
+                and item.get("type") in {"image_url", "video_url"}
                 for item in content
             ):
                 return True

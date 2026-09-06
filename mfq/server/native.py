@@ -13,6 +13,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from mfq.compat.legacy_model_graph import legacy_model_graph
+from mfq.formats.assets import MODEL_CONFIG_ASSET, MODEL_GRAPH_ASSET
+from mfq.formats.io import open_mmap
 from mfq.server.hf_tokenizer import (
     ensure_hf_tokenizer_gguf,
     native_hf_asset_environment,
@@ -23,14 +26,116 @@ class NativeRuntimeError(RuntimeError):
     """Raised when the private native worker cannot be started."""
 
 
-def is_flash_next_architecture(architecture: str) -> bool:
-    """Return whether an MFQ artifact uses the dedicated Python MLX worker."""
+@dataclass(frozen=True)
+class RuntimeRoute:
+    """Resolved runtime ownership for one model artifact."""
 
-    identity = architecture.strip().lower().replace("-", "_")
-    return identity.startswith(("qwen4_exp", "glm5_next"))
+    architecture_family: str
+    backbone: str = ""
+    python_mlx_worker: bool = False
+    requires_mfq: bool = False
+    vision_available: bool = False
 
 
-def flash_next_runtime_command(
+@dataclass(frozen=True)
+class _RuntimeImplementationRegistration:
+    backbone: str
+    python_mlx_worker: bool = False
+    python_mlx_requires_mfq: bool = False
+
+
+_RUNTIME_IMPLEMENTATION_REGISTRY = (
+    _RuntimeImplementationRegistration(
+        backbone="qwen3_5",
+    ),
+    _RuntimeImplementationRegistration(
+        backbone="qwen4_exp",
+        python_mlx_worker=True,
+        python_mlx_requires_mfq=True,
+    ),
+    _RuntimeImplementationRegistration(
+        backbone="glm5_next",
+        python_mlx_worker=True,
+        python_mlx_requires_mfq=True,
+    ),
+)
+
+
+def _normalize_architecture(architecture: str) -> str:
+    return architecture.strip().lower().replace("-", "_")
+
+
+def _runtime_implementation(
+    backbone: str,
+) -> _RuntimeImplementationRegistration | None:
+    return next(
+        (
+            registration
+            for registration in _RUNTIME_IMPLEMENTATION_REGISTRY
+            if backbone == registration.backbone
+        ),
+        None,
+    )
+
+
+def _runtime_graph(architecture: str, model: str | Path) -> dict[str, object] | None:
+    model_path = Path(model).expanduser().resolve()
+    if not model_path.is_file():
+        return None
+    try:
+        with open_mmap(model_path) as store:
+            if MODEL_GRAPH_ASSET in store.records:
+                value = json.loads(store.read_blob(MODEL_GRAPH_ASSET))
+                return value if isinstance(value, dict) else None
+            config = None
+            if MODEL_CONFIG_ASSET in store.records:
+                candidate = json.loads(store.read_blob(MODEL_CONFIG_ASSET))
+                if isinstance(candidate, dict):
+                    config = candidate
+            return legacy_model_graph(architecture, store.records, config)
+    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def resolve_runtime_route(architecture: str, model: str | Path) -> RuntimeRoute:
+    """Resolve runtime ownership from component/backbone implementation IDs."""
+
+    graph = _runtime_graph(architecture, model)
+    if graph is None:
+        return RuntimeRoute(architecture_family=_normalize_architecture(architecture))
+    graph_descriptor = graph.get("graph")
+    backbone = (
+        str(graph_descriptor.get("backbone") or "")
+        if isinstance(graph_descriptor, Mapping)
+        else ""
+    )
+    family = str(graph.get("architecture") or backbone)
+    components = graph.get("components")
+    component_kinds = {
+        str(component.get("kind"))
+        for component in components
+        if isinstance(component, Mapping)
+    } if isinstance(components, list) else set()
+    registration = _runtime_implementation(backbone)
+    if registration is None:
+        return RuntimeRoute(
+            architecture_family=family,
+            backbone=backbone,
+            vision_available="vision" in component_kinds,
+        )
+    return RuntimeRoute(
+        architecture_family=family,
+        backbone=backbone,
+        python_mlx_worker=registration.python_mlx_worker,
+        requires_mfq=(
+            registration.python_mlx_worker
+            and registration.python_mlx_requires_mfq
+        ),
+        vision_available="vision" in component_kinds,
+    )
+
+
+def python_mlx_runtime_command(
     controller_command: Sequence[str],
     *,
     model: str | Path,
@@ -41,7 +146,7 @@ def flash_next_runtime_command(
     prefill_chunk_size: int = 2_048,
 ) -> list[str]:
     if not controller_command:
-        raise NativeRuntimeError("Flash-Next runtime has no MFQ CLI launcher")
+        raise NativeRuntimeError("the Python MLX runtime has no MFQ CLI launcher")
     return [
         *(str(value) for value in controller_command),
         "_flash-next-worker",
@@ -136,10 +241,11 @@ class NativeRuntime:
         return f"http://127.0.0.1:{self.port}"
 
     def command(self, port: int) -> list[str]:
-        if is_flash_next_architecture(self.architecture):
+        route = resolve_runtime_route(self.architecture, self.model)
+        if route.python_mlx_worker:
             if self.backend != "metal":
-                raise NativeRuntimeError("Flash-Next MFQ inference currently requires Metal")
-            return flash_next_runtime_command(
+                raise NativeRuntimeError("the Python MLX worker currently requires Metal")
+            return python_mlx_runtime_command(
                 self.controller_command,
                 model=self.model,
                 model_name=self.model_name,

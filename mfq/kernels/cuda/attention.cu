@@ -9,7 +9,7 @@
 // q/k/v may be fp16 or fp32; dot/softmax accumulation stays fp32.
 
 #include <cuda_runtime.h>
-#include "../../../cpp_runtime/cuda/mfq_tensor_backend.h"
+#include "mfq_tensor_backend.h"
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <cfloat>

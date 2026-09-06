@@ -165,14 +165,14 @@ class MlxGemma4Config:
 
 @dataclass(frozen=True)
 class MlxGemma4Names:
-    """HF tensor-name mapping used by native Gemma4 MFQ artifacts."""
+    """Canonical MFQ names; checkpoint spellings are import-only."""
 
-    token_embedding: str = "model.language_model.embed_tokens.weight"
-    output_norm: str = "model.language_model.norm.weight"
-    output: str = "lm_head.weight"
-    layer_prefix: str = "model.language_model.layers.{i}"
-    expert_gate_up: str = "model.language_model.layers.{i}.experts.gate_up_proj"
-    expert_down: str = "model.language_model.layers.{i}.experts.down_proj"
+    token_embedding: str = "model.token_embedding.weight"
+    output_norm: str = "model.output_norm.weight"
+    output: str = "model.output.weight"
+    layer_prefix: str = "model.block.{i}"
+    expert_gate_up: str = "model.block.{i}.mlp.experts.gate_up.weight"
+    expert_down: str = "model.block.{i}.mlp.experts.down.weight"
 
     def layer(self, index: int) -> str:
         return self.layer_prefix.format(i=index)
@@ -212,11 +212,11 @@ class MlxGemma4DenseFFN:
     def __init__(self, model: MlxNintModel, prefix: str) -> None:
         self.gate_up = MlxLinearGroup(
             (
-                model.linear(f"{prefix}.gate_proj.weight"),
-                model.linear(f"{prefix}.up_proj.weight"),
+                model.linear(f"{prefix}.gate.weight"),
+                model.linear(f"{prefix}.up.weight"),
             )
         )
-        self.down = model.linear(f"{prefix}.down_proj.weight")
+        self.down = model.linear(f"{prefix}.down.weight")
 
     def forward(self, value: mx.array) -> mx.array:
         gate, up = self.gate_up(value)
@@ -256,10 +256,10 @@ class MlxGemma4MoE:
             raise ValueError(f"Gemma4 expert shapes disagree with config at layer {layer}")
         self.gate_up = MlxRoutedLinear(gate_up)
         self.down = MlxRoutedLinear(down)
-        self.router = model.linear(f"{prefix}.router.proj.weight")
+        self.router = model.linear(f"{prefix}.mlp.router.weight")
         self.expert_scale = _dense_vector(
             model,
-            f"{prefix}.router.per_expert_scale",
+            f"{prefix}.mlp.router.expert_scale",
         )
         if int(self.expert_scale.size) != config.num_experts:
             raise ValueError("Gemma4 expert-scale length disagrees with config")
@@ -311,21 +311,21 @@ class MlxGemma4Layer:
         )
         self.value_equals_key = not self.sliding and config.attention_k_eq_v
         prefix = names.layer(index)
-        attention_prefix = f"{prefix}.self_attn"
+        attention_prefix = f"{prefix}.attention"
         self.input_norm = MlxRMSNorm(
-            _dense_vector(model, f"{prefix}.input_layernorm.weight"),
+            _dense_vector(model, f"{attention_prefix}.norm.weight"),
             config.rms_norm_eps,
         )
         self.attention_post_weight = _dense_vector(
             model,
-            f"{prefix}.post_attention_layernorm.weight",
+            f"{attention_prefix}.output_norm.weight",
         )
         self.q_norm = MlxRMSNorm(
-            _dense_vector(model, f"{attention_prefix}.q_norm.weight"),
+            _dense_vector(model, f"{attention_prefix}.query_norm.weight"),
             config.rms_norm_eps,
         )
         self.k_norm = MlxRMSNorm(
-            _dense_vector(model, f"{attention_prefix}.k_norm.weight"),
+            _dense_vector(model, f"{attention_prefix}.key_norm.weight"),
             config.rms_norm_eps,
         )
         self.v_norm = MlxRMSNorm(
@@ -333,13 +333,13 @@ class MlxGemma4Layer:
             config.rms_norm_eps,
         )
         projection_names = [
-            f"{attention_prefix}.q_proj.weight",
-            f"{attention_prefix}.k_proj.weight",
+            f"{attention_prefix}.query.weight",
+            f"{attention_prefix}.key.weight",
         ]
         if not self.value_equals_key:
-            projection_names.append(f"{attention_prefix}.v_proj.weight")
+            projection_names.append(f"{attention_prefix}.value.weight")
         self.qkv = MlxLinearGroup(tuple(model.linear(name) for name in projection_names))
-        self.attention_output = model.linear(f"{attention_prefix}.o_proj.weight")
+        self.attention_output = model.linear(f"{attention_prefix}.output.weight")
         active_pairs = (
             None
             if self.sliding
@@ -354,30 +354,30 @@ class MlxGemma4Layer:
         )
         self.dense_pre_weight = _dense_vector(
             model,
-            f"{prefix}.pre_feedforward_layernorm.weight",
+            f"{prefix}.mlp.dense.input_norm.weight",
         )
         self.final_post_weight = _dense_vector(
             model,
-            f"{prefix}.post_feedforward_layernorm.weight",
+            f"{prefix}.mlp.output_norm.weight",
         )
         self.dense_post_weight = _dense_vector(
             model,
-            f"{prefix}.post_feedforward_layernorm_1.weight",
+            f"{prefix}.mlp.dense.output_norm.weight",
         )
         self.moe_pre_weight = _dense_vector(
             model,
-            f"{prefix}.pre_feedforward_layernorm_2.weight",
+            f"{prefix}.mlp.experts.input_norm.weight",
         )
         self.moe_post_weight = _dense_vector(
             model,
-            f"{prefix}.post_feedforward_layernorm_2.weight",
+            f"{prefix}.mlp.experts.output_norm.weight",
         )
         self.layer_scale = mx.contiguous(
-            _dense_array(model, f"{prefix}.layer_scalar").astype(mx.float16)
+            _dense_array(model, f"{prefix}.output_scale").astype(mx.float16)
         )
         if int(self.layer_scale.size) != 1:
-            raise ValueError("Gemma4 layer_scalar must contain one value")
-        router_scale = _dense_vector(model, f"{prefix}.router.scale")
+            raise ValueError("Gemma4 output scale must contain one value")
+        router_scale = _dense_vector(model, f"{prefix}.mlp.router.norm.weight")
         if int(router_scale.size) != config.hidden_size:
             raise ValueError("Gemma4 router scale length disagrees with config")
         self.router_norm_weight = mx.contiguous(router_scale / math.sqrt(config.hidden_size))

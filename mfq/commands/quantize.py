@@ -47,6 +47,16 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="GGUF whose tensor types define the mixed-precision recipe",
     )
     precision.add_argument(
+        "--standard-preset",
+        "--preset",
+        dest="standard_preset",
+        default="",
+        help=(
+            "built-in llama.cpp-style tensor mixture "
+            "(Q2_K[_S], Q3_K_[S/M/L], Q4_K_[S/M], Q5_K_[S/M], Q6_K, Q8_0)"
+        ),
+    )
+    precision.add_argument(
         "--base-mfq",
         default="",
         help=(
@@ -130,6 +140,16 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     source.add_argument("--text-only", action="store_true", help="omit non-language tensors")
     source.add_argument("--exclude-mtp", action="store_true", help="omit recipe-only MTP blocks")
+    precision.add_argument(
+        "--quantize-vision",
+        action="store_true",
+        help="opt in to quantizing Vision tensors; source precision is kept by default",
+    )
+    precision.add_argument(
+        "--quantize-mtp",
+        action="store_true",
+        help="opt in to quantizing MTP/draft tensors; source precision is kept by default",
+    )
     important.add_argument(
         "--important-neurons",
         "--in-top-k",
@@ -395,6 +415,7 @@ def _hf_arguments(
         args.dense_dtype,
     ]
     _append_value(argv, "--recipe-gguf", args.recipe)
+    _append_value(argv, "--standard-preset", args.standard_preset)
     _append_value(argv, "--base-mfq", args.base_mfq)
     _append_value(argv, "--tokenizer-gguf", args.tokenizer)
     _append_value(argv, "--model-config", args.model_config)
@@ -406,6 +427,8 @@ def _hf_arguments(
     _append_value(argv, "--split-max-tensors", args.split_max_tensors)
     _append_value(argv, "--temp-dir", args.temp_dir)
     _append_flag(argv, "--text-only", args.text_only)
+    _append_flag(argv, "--quantize-vision", args.quantize_vision)
+    _append_flag(argv, "--quantize-mtp", args.quantize_mtp)
     _append_flag(argv, "--bf16", args.bf16)
     _append_flag(argv, "--q8-to-nint8-zero", args.q8_mode == "nint8-0")
     _append_vq_arguments(argv, args)
@@ -483,19 +506,34 @@ def _validate(args: argparse.Namespace, source_format: str) -> None:
     if args.base_mfq:
         if source_format not in {"hf", "mfq"}:
             raise ValueError("--base-mfq requires an HF or full-precision MFQ source")
-        if args.bf16 or args.recipe or args.scheme or args.imatrix or args.tensor_overrides:
+        if (
+            args.bf16
+            or args.recipe
+            or args.standard_preset
+            or args.scheme
+            or args.imatrix
+            or args.tensor_overrides
+        ):
             raise ValueError(
                 "--base-mfq derives MTP precision from the base and cannot use "
-                "full-precision, recipe, scheme, imatrix, or tensor overrides"
+                "full-precision, recipe, standard preset, scheme, imatrix, "
+                "or tensor overrides"
             )
     if args.bf16 and source_format != "hf":
         raise ValueError("--full-precision requires an HF safetensors source")
-    if args.bf16 and (args.recipe or args.scheme or args.imatrix):
+    if args.bf16 and (
+        args.recipe or args.standard_preset or args.scheme or args.imatrix
+    ):
         raise ValueError(
-            "--full-precision cannot be combined with --recipe, --scheme, or --imatrix"
+            "--full-precision cannot be combined with --recipe, "
+            "--standard-preset, --scheme, or --imatrix"
         )
     if args.bf16 and args.tensor_overrides:
         raise ValueError("--tensor-overrides do not apply to --full-precision")
+    if args.bf16 and (args.quantize_vision or args.quantize_mtp):
+        raise ValueError(
+            "--quantize-vision and --quantize-mtp do not apply to --full-precision"
+        )
     if args.bf16 and args.important_neurons:
         raise ValueError("--full-precision cannot be combined with important-neuron quantization")
     if args.bf16 and (args.bits, args.groupsize, args.sub_bits) != (4, 24, 6):
@@ -504,8 +542,25 @@ def _validate(args: argparse.Namespace, source_format: str) -> None:
         raise ValueError("--dense-dtype does not apply to --full-precision")
     if source_format == "gguf" and not args.recipe:
         raise ValueError("GGUF quantization requires --recipe")
+    if source_format == "gguf" and args.standard_preset:
+        raise ValueError("--standard-preset requires an HF or full-precision MFQ source")
+    if args.standard_preset and args.recipe:
+        raise ValueError("--standard-preset cannot be combined with --recipe")
+    if args.standard_preset and args.scheme:
+        raise ValueError("--standard-preset cannot be combined with --scheme")
+    if args.standard_preset and (args.bits, args.groupsize, args.sub_bits) != (4, 24, 6):
+        raise ValueError(
+            "--bits, --groupsize, and --sub-bits cannot override a standard preset"
+        )
     if source_format == "gguf" and args.text_only:
         raise ValueError("--text-only is only valid for an HF source")
+    if source_format == "gguf" and (args.quantize_vision or args.quantize_mtp):
+        raise ValueError(
+            "--quantize-vision and --quantize-mtp require an HF or "
+            "full-precision MFQ source"
+        )
+    if args.text_only and args.quantize_vision:
+        raise ValueError("--quantize-vision cannot be combined with --text-only")
     if source_format == "gguf" and (args.bits != 4 or args.groupsize != 24 or args.sub_bits != 6):
         raise ValueError("--bits/--groupsize/--sub-bits are only valid for an HF source")
     if source_format == "gguf" and args.dense_dtype != "f32":
@@ -546,9 +601,12 @@ def run(args: argparse.Namespace) -> int:
                 "input": str(source),
                 "output": str(output),
                 "recipe": str(Path(args.recipe).resolve()) if args.recipe else None,
+                "standard_preset": args.standard_preset or None,
                 "scheme": str(Path(args.scheme).resolve()) if args.scheme else None,
                 "imatrix": str(Path(args.imatrix).resolve()) if args.imatrix else None,
                 "full_precision": args.bf16,
+                "quantize_vision": args.quantize_vision,
+                "quantize_mtp": args.quantize_mtp,
                 "important_neurons": args.important_neurons or None,
             },
             ensure_ascii=False,
