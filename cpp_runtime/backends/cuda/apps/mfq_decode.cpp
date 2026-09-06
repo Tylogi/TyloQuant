@@ -20396,6 +20396,51 @@ struct ServerDecodeGraphCache {
     }
 };
 
+static void prepare_decode_graph_memory(Model& model, MfqCudaGraph& graph,
+        const std::function<void()>& warmup) {
+    using Tensor = mfq_tensor_backend::Tensor;
+    struct SavedRecurrentState {
+        LinearBlock* block;
+        Tensor conv, gdn;
+        const void* conv_address;
+        const void* gdn_address;
+    };
+    // Snapshot before entering the private graph allocator. These copies are
+    // temporary and must not become retained allocations in the captured pool.
+    std::vector<SavedRecurrentState> saved;
+    for (const auto& block : model.blocks) {
+        if (auto* linear = dynamic_cast<LinearBlock*>(block.get())) {
+            MFQ_RUNTIME_CHECK(!linear->speculative_pending && linear->conv_state.defined() &&
+                linear->gdn_state.defined(), "decode warmup requires confirmed recurrent state");
+            saved.push_back({linear, linear->conv_state.clone(), linear->gdn_state.clone(),
+                linear->conv_state.data_ptr(), linear->gdn_state.data_ptr()});
+        }
+    }
+    const int64_t saved_position = model.cache_pos;
+    auto restore = [&]() {
+        for (const auto& state : saved) {
+            MFQ_RUNTIME_CHECK(state.block->conv_state.data_ptr() == state.conv_address &&
+                state.block->gdn_state.data_ptr() == state.gdn_address,
+                "decode warmup changed recurrent storage addresses");
+            state.block->conv_state.copy_(state.conv);
+            state.block->gdn_state.copy_(state.gdn);
+        }
+        MFQ_RUNTIME_CHECK(model.cache_pos == saved_position, "static decode warmup changed cache position");
+        MFQ_CUDA_CHECK(cudaStreamSynchronize(mfq_get_current_cuda_stream()));
+    };
+    mfq_prepare_cuda_graph_memory(graph);
+    if (!saved.empty() || model.c.is_gemma4() || model.c.is_glm_dsa() || model.c.is_minicpmo45()) {
+        try {
+            // The replay overwrites this same, still-unconfirmed KV position.
+            warmup();
+            restore();
+        } catch (...) {
+            restore();
+            throw;
+        }
+    }
+}
+
 static int64_t server_decode_graph_bucket(int64_t planned_len, int64_t context_capacity) {
     const int64_t quantum = planned_len <= 4096 ? 512 :
         (planned_len <= 16384 ? 1024 : 2048);
@@ -21695,15 +21740,7 @@ static int32_t generate_server_tokens(
                 g_decode_graph_attention_parts, FullBlock::kDecodeAttentionMaxParts);
             try {
                 graph_cache.graph = std::make_unique<MfqCudaGraph>();
-                mfq_prepare_cuda_graph_memory(*graph_cache.graph);
-                if (model.c.is_gemma4() || model.c.is_glm_dsa() ||
-                        model.c.is_minicpmo45()) {
-                    // Initialize persistent M=1 decode workspaces before
-                    // capture. The static position makes this warm-up write
-                    // the same KV slot that the captured pass overwrites.
-                    (void)sample_static();
-                    MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
-                }
+                prepare_decode_graph_memory(model, *graph_cache.graph, [&]() { (void)sample_static(); });
 
                 graph_cache.graph->capture_begin();
                 graph_cache.static_next = sample_static();
@@ -28345,21 +28382,15 @@ int main(int argc, char ** argv) {
             MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
 
             MfqCudaGraph graph;
-            mfq_prepare_cuda_graph_memory(graph);
             mfq_tensor_backend::Tensor static_next;
             const int64_t planned_len = model.cache_pos + gen;
             g_decode_graph_attention_kv_len = planned_len;
             g_decode_graph_attention_parts = planned_len >= 192 ? (planned_len + 127) / 128 : 1;
             g_decode_graph_attention_parts = std::min<int64_t>(
                 g_decode_graph_attention_parts, FullBlock::kDecodeAttentionMaxParts);
-            if (model.c.is_gemma4() || model.c.is_glm_dsa() ||
-                    model.c.is_minicpmo45()) {
-                // These graphs use persistent M=1 decode workspaces that differ
-                // from prefill. Initialize them before capture; the captured pass
-                // overwrites the same KV position.
+            prepare_decode_graph_memory(model, graph, [&]() {
                 (void)model.next_token_static(static_input, static_pos, static_len);
-                MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
-            }
+            });
             g_profiler.reset();
             g_profiler.graph_events = profile_cuda_graph;
             graph.capture_begin();
