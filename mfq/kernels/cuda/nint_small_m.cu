@@ -3,6 +3,80 @@
 #include "reduce.cuh"
 #include <climits>
 
+template <int BITS, int GS, int MROWS>
+__global__ void __launch_bounds__(128) nint23_group4_small_m_kernel(
+    NintSmallMProjection weight, const int8_t* __restrict__ qx,
+    const float* __restrict__ xs, int ng, int kpad)
+{
+    constexpr int CHUNKS = GS / 4, GPW = 32 / CHUNKS;
+    constexpr int QBYTES = GS * BITS / 8;
+    const int row = blockIdx.x * 4 + threadIdx.y, lane = threadIdx.x;
+    if (row >= weight.n) return;
+    const int relg = lane / CHUNKS, chunk = lane % CHUNKS;
+    const auto* qrow = weight.q_packed + (size_t)row * ng * QBYTES;
+    const auto* ssrow = weight.sub_scale + (size_t)row * ng;
+    const auto* smrow = weight.sub_min + (size_t)row * ng;
+    const float ns = weight.neuron_scale[row], nm = weight.neuron_min[row];
+    float acc[MROWS] = {};
+    for (int gb = 0; gb < ng; gb += GPW) {
+        const int g = gb + relg;
+        if (relg >= GPW || g >= ng) continue;
+        const auto* packed = qrow + (size_t)g * QBYTES;
+        int qv;
+        if constexpr (BITS == 2) {
+            const unsigned v = packed[chunk];
+            qv = int((v & 3u) | ((v & 12u) << 6) | ((v & 48u) << 12) | ((v & 192u) << 18));
+        } else {
+            // Four 3-bit values occupy 12 bits. Both nibble alignments fit
+            // exactly two bytes, including the last chunk of a GS24 group.
+            const int byte = chunk * 3 / 2;
+            const unsigned v = (unsigned(packed[byte]) | (unsigned(packed[byte + 1]) << 8))
+                >> ((chunk & 1) * 4);
+            qv = int((v & 7u) | ((v & 56u) << 5) | ((v & 448u) << 10) | ((v & 3584u) << 15));
+        }
+        const float ss = ssrow[g], sm = smrow[g];
+        #pragma unroll
+        for (int m = 0; m < MROWS; ++m) {
+            // CUDA storage, Kpad and g*GS+chunk*4 are all 4-byte aligned.
+            const int xv = *reinterpret_cast<const int*>(qx + (size_t)m * kpad + g * GS + chunk * 4);
+            const int di = __dp4a(qv, xv, 0), mi = __dp4a(0x01010101, xv, 0);
+            // Keep the original group4 lane assignment, expression and sum tree.
+            acc[m] += xs[(size_t)m * ng + g] * (ns * ss * float(di) - nm * sm * float(mi));
+        }
+    }
+    #pragma unroll
+    for (int m = 0; m < MROWS; ++m) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            acc[m] += __shfl_xor_sync(0xffffffff, acc[m], offset);
+        if (lane == 0)
+            reinterpret_cast<__half*>(weight.out)[(size_t)m * weight.n + row] = __float2half(acc[m]);
+    }
+}
+
+void launch_nint23_group4_small_m(
+    NintSmallMProjection weight, const int8_t* qx, const float* xs,
+    int bits, int m, int ng, int kpad, cudaStream_t stream)
+{
+#define MFQ_NINT23_CASE(M) \
+    case M: \
+        if (bits == 2) nint23_group4_small_m_kernel<2, 16, M> \
+            <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad); \
+        else nint23_group4_small_m_kernel<3, 24, M> \
+            <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad); \
+        break
+    MFQ_RUNTIME_CHECK(bits == 2 || bits == 3, "NINT23 small-M bits must be 2 or 3");
+    switch (m) {
+        MFQ_NINT23_CASE(2);
+        MFQ_NINT23_CASE(3);
+        MFQ_NINT23_CASE(4);
+        MFQ_NINT23_CASE(5);
+        MFQ_NINT23_CASE(6);
+        default: MFQ_RUNTIME_CHECK(false, "NINT23 small-M requires M2-6");
+    }
+#undef MFQ_NINT23_CASE
+}
+
 __device__ __forceinline__ int small_m_unpack_int4(uint32_t packed, unsigned selector)
 {
     // Interleave low/high nibbles into signed dp4a's positive byte lanes.

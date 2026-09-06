@@ -23,6 +23,8 @@ Tensor nint_gemv_packed_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
     int64_t, Tensor, Tensor, Tensor);
 Tensor nint_gemv_packed_int6_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
     int64_t, Tensor, Tensor, Tensor);
+Tensor nint_gemv_packed_bits_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
+    int64_t, int64_t, Tensor, Tensor, Tensor);
 Tensor nint_gemv_packed_gate_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
     int64_t, int64_t, Tensor, Tensor, Tensor);
 Tensor nint_gemv_packed_bits_gate_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
@@ -82,6 +84,8 @@ void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs,
     auto xs = empty({batch, groups}, TensorOptions{}.device(gpu).dtype(kFloat32));
     auto xm = empty({batch, groups}, TensorOptions{}.device(gpu).dtype(kInt32));
     auto invoke = [&](const Tensor& input, int operation) {
+        if (operation == 2 && (bits == 2 || bits == 3))
+            return nint_gemv_packed_bits_ws_cuda(q, s, sm, ns, nm, input, gs, bits, qx, xs, xm);
         if (operation == 2) return (bits == 4 ? nint_gemv_packed_ws_cuda
             : nint_gemv_packed_int6_ws_cuda)(q, s, sm, ns, nm, input,
             gs, qx, xs, xm);
@@ -94,7 +98,8 @@ void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs,
         return (operation == 0 ? nint_gemv_packed_bits_swiglu_ws_cuda
             : nint_gemv_packed_bits_geglu_ws_cuda)(q, s, sm, ns, nm, input, gs, bits, qx, xs, xm);
     };
-    for (int operation = 0; operation < (bits == 4 || bits == 6 ? 5 : 2); ++operation) {
+    const int operations = bits == 4 || bits == 6 ? 5 : (bits == 2 || bits == 3 ? 3 : 2);
+    for (int operation = 0; operation < operations; ++operation) {
         std::vector<Tensor> serial;
         for (int m = 0; m < batch; ++m) serial.push_back(invoke(x.narrow(0, m, 1), operation));
         auto reference = cat(serial, 0);
@@ -138,6 +143,34 @@ void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs,
                     const double actual = y.data_ptr<float>()[m * rows + r];
                     require(std::isfinite(actual) && std::abs(actual - expected) <= .002 + .002 * std::abs(expected),
                         "small-M GLU CPU projection oracle mismatch");
+                }
+            }
+        }
+        if (operation == 2 && (bits == 2 || bits == 3)) {
+            auto actual = invoke(x, operation).to(kFloat32).cpu();
+            auto aq = qx.cpu(), as = xs.cpu();
+            for (int m = 0; m < batch; ++m) {
+                for (int row = 0; row < 2 * rows; ++row) {
+                    double value = 0.;
+                    for (int g = 0; g < groups; ++g) {
+                        for (int k = 0; k < gs; ++k) {
+                            unsigned code = 0;
+                            for (int bit = 0; bit < bits; ++bit) {
+                                const int offset = k * bits + bit;
+                                code |= ((qh.data_ptr<uint8_t>()[(row * groups + g) * bytes + offset / 8]
+                                    >> (offset % 8)) & 1) << bit;
+                            }
+                            const double weight = double(nh.data_ptr<float>()[row])
+                                * sh.data_ptr<uint8_t>()[row * groups + g] * code
+                                - double(bh.data_ptr<float>()[row]) * mh.data_ptr<uint8_t>()[row * groups + g];
+                            value += weight * as.data_ptr<float>()[m * groups + g]
+                                * aq.data_ptr<int8_t>()[m * kpad + g * gs + k];
+                        }
+                    }
+                    const double expected = __half2float(__float2half_rn(float(value)));
+                    const double got = actual.data_ptr<float>()[m * (2 * rows) + row];
+                    require(std::isfinite(got) && std::abs(got - expected) <= .002 + .002 * std::abs(expected),
+                        "small-M NINT23 plain CPU projection oracle mismatch");
                 }
             }
         }
@@ -199,7 +232,7 @@ int main() {
         int cases = 0, graphs = 0, f32_cases = 0;
         for (const auto profile : std::vector<std::vector<int>>{{2,16,5},{3,24,5},{4,24,6},{5,28,7},{6,24,7},{8,48,7}})
             for (int width : {47, 257, 4096}) check(profile[0], profile[1], profile[2], width, cases, graphs, f32_cases);
-        require(cases == 324 && graphs == 19 && f32_cases == 15, "incomplete small-M coverage");
+        require(cases == 360 && graphs == 21 && f32_cases == 15, "incomplete small-M coverage");
         std::cout << "PASS small_m_cases=" << cases << " f32_boundary_cases=" << f32_cases
             << " graphs=" << graphs << '\n';
     } catch (const std::exception& error) {

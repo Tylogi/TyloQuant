@@ -61,6 +61,9 @@ def test_nint_small_m_bridge(profile, width, monkeypatch):
 
     def invoke(value, operation):
         if operation == 2:
+            if bits in (2, 3):
+                return module.nint_gemv_packed_bits_ws_cuda(
+                    *tensors, value, gs, bits, qx, xs, xm)
             function = (module.nint_gemv_packed_ws_cuda if bits == 4
                         else module.nint_gemv_packed_int6_ws_cuda)
             return function(*tensors, value, gs, qx, xs, xm)
@@ -78,7 +81,7 @@ def test_nint_small_m_bridge(profile, width, monkeypatch):
             *tensors, value, gs, bits, qx, xs, xm)
 
     with torch.cuda.stream(stream):
-        for operation in range(5 if bits in (4, 6) else 2):
+        for operation in range(5 if bits in (4, 6) else (3 if bits in (2, 3) else 2)):
             reference = torch.cat([invoke(x[m:m + 1], operation) for m in range(6)])
             for m in range(1, 7):
                 _exact(invoke(x[:m], operation), reference[:m])
@@ -93,6 +96,11 @@ def test_nint_small_m_bridge(profile, width, monkeypatch):
                     value = up * .5 * gate * (1. + torch.tanh(
                         .7978845608028654 * gate * (1. + .044715 * gate * gate)))
                 expected = value.float().half().double()
+                torch.testing.assert_close(actual, expected, atol=.002, rtol=.002)
+            if operation == 2 and bits in (2, 3):
+                actual = invoke(x, operation).double().cpu()
+                grouped = qx.double().reshape(6, -1, gs) * xs.double()[:, :, None]
+                expected = (grouped.flatten(1).cpu() @ weights.T).float().half().double()
                 torch.testing.assert_close(actual, expected, atol=.002, rtol=.002)
             if width == 257:
                 for _ in range(3):
