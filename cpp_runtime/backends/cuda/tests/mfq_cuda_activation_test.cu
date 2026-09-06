@@ -28,7 +28,7 @@ void check_glu(std::int64_t elements, ScalarType dtype, bool gelu) {
         host.data_ptr<float>()[i] = static_cast<float>((i * 13) % 1024 - 512) / 97.0f;
         host.data_ptr<float>()[elements + i] = static_cast<float>((i * 17) % 101 - 50) / 23.0f;
     }
-    auto input = host.to(gpu, dtype);
+    auto input = host.to(gpu).to(dtype);
     auto gate = input.select(0, 0);
     auto up = input.select(0, 1);
     auto output = empty({elements}, TensorOptions{}.dtype(dtype).device(gpu));
@@ -37,8 +37,8 @@ void check_glu(std::int64_t elements, ScalarType dtype, bool gelu) {
     fn(gate.view_descriptor(), up.view_descriptor(), output.view_descriptor(),
        context->stream().get());
     context->stream().synchronize();
-    auto got = output.to(kCPU, kFloat32);
-    auto rounded = input.to(kCPU, kFloat32);
+    auto got = output.to(kFloat32).cpu();
+    auto rounded = input.to(kFloat32).cpu();
     for (std::int64_t i = 0; i < elements; ++i) {
         const double g = rounded.data_ptr<float>()[i];
         const double u = rounded.data_ptr<float>()[elements + i];
@@ -69,8 +69,8 @@ void check_gate_beta(std::int64_t tokens, ScalarType dtype) {
         log_host.data_ptr<float>()[i] = static_cast<float>(i - 3) / 7.f;
     }
     // Deliberately different alpha/beta strides, with FP16 inputs and FP32 parameters/output.
-    auto alpha = alpha_host.to(gpu, dtype).transpose(1, 2);
-    auto beta = beta_host.to(gpu, dtype);
+    auto alpha = alpha_host.to(gpu).to(dtype).transpose(1, 2);
+    auto beta = beta_host.to(gpu).to(dtype);
     auto dt = dt_host.to(gpu);
     auto log_a = log_host.to(gpu);
     auto gates = empty({batch, width, tokens}, TensorOptions{}.dtype(kFloat32).device(gpu));
@@ -80,8 +80,8 @@ void check_gate_beta(std::int64_t tokens, ScalarType dtype) {
         dt.view_descriptor(), log_a.view_descriptor(), gates.view_descriptor(),
         betas.view_descriptor(), context->stream().get());
     context->stream().synchronize();
-    auto a_ref = alpha.to(kCPU, kFloat32).contiguous();
-    auto b_ref = beta.to(kCPU, kFloat32).contiguous();
+    auto a_ref = alpha.contiguous().to(kFloat32).cpu();
+    auto b_ref = beta.contiguous().to(kFloat32).cpu();
     auto g_got = gates.cpu();
     auto b_got = betas.cpu();
     for (std::int64_t b = 0; b < batch; ++b) {
@@ -105,13 +105,13 @@ void check_half_saturation() {
     auto host = empty({2, 3}, TensorOptions{}.dtype(kFloat32));
     const float values[] = {200.f, 200.f, -200.f, 400.f, -400.f, 400.f};
     std::copy(std::begin(values), std::end(values), host.data_ptr<float>());
-    auto input = host.to(gpu, kFloat16);
+    auto input = host.to(gpu).to(kFloat16);
     auto output = empty({3}, TensorOptions{}.dtype(kFloat16).device(gpu));
     const auto context = default_context(0);
     kernels::gelu_mul(input.select(0, 0).view_descriptor(), input.select(0, 1).view_descriptor(),
         output.view_descriptor(), context->stream().get());
     context->stream().synchronize();
-    const auto got = output.to(kCPU, kFloat32);
+    const auto got = output.to(kFloat32).cpu();
     close(got.data_ptr<float>()[0], 65504.f, 0.f, 0.f);
     close(got.data_ptr<float>()[1], -65504.f, 0.f, 0.f);
     close(got.data_ptr<float>()[2], 0.f, 0.f, 0.f);

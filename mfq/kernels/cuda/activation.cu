@@ -13,6 +13,11 @@
 #include "glu.cuh"
 #include "mfq_cuda_kernels.h"
 
+// Calling libdevice explicitly keeps standalone FP32 GeGLU within its FP32
+// tolerance even when Torch compiles the extension with --use_fast_math.
+// Ordinary tanhf is rewritten to the lower-accuracy tanh.approx instruction.
+extern "C" __device__ float __nv_tanhf(float);
+
 template <typename T>
 __device__ __forceinline__ float activation_as_float(T value) {
     if constexpr (std::is_same_v<T, half>) return __half2float(value);
@@ -116,7 +121,17 @@ __global__ void gelu_mul_kernel(
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
          i < n;
          i += (size_t)gridDim.x * blockDim.x) {
-        float value = mfq_glu<true>(activation_as_float(gate[i]), activation_as_float(up[i]));
+        const float g = activation_as_float(gate[i]);
+        const float u = activation_as_float(up[i]);
+        float value;
+        if constexpr (std::is_same_v<scalar_t, float>) {
+            constexpr float kGeluA = 0.044715f;
+            constexpr float kSqrt2OverPi = 0.79788456080286535587989211986876f;
+            value = u * (0.5f * g *
+                (1.0f + __nv_tanhf(kSqrt2OverPi * g * (1.0f + kGeluA * g * g))));
+        } else {
+            value = mfq_glu<true>(g, u);
+        }
         if constexpr (!std::is_same_v<scalar_t, float>) {
             value = fminf(65504.0f, fmaxf(-65504.0f, value));
         }
