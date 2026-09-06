@@ -158,14 +158,21 @@ mfq_pyinstaller_args=(
   --collect-all stepaudio2
   --collect-all torchaudio
   --copy-metadata requests
-  --copy-metadata torchcodec
   --hidden-import mfq.runtime.minicpmo45_realtime
+  --hidden-import mfq.runtime.flash_next_worker
+  --hidden-import mfq.runtime.mlx_qwen4_exp
+  --hidden-import mfq.runtime.mlx_glm5_next
   --exclude-module mfq.runtime.minicpmo45
   --exclude-module minicpmo_utils
   --distpath "${mfq_resource_dir}"
   --workpath "${mfq_pyinstaller_build_dir}"
   --specpath "${mfq_spec_dir}"
 )
+if "${mfq_venv_dir}/bin/python" -c \
+  'import importlib.metadata; importlib.metadata.distribution("torchcodec")' \
+  >/dev/null 2>&1; then
+  mfq_pyinstaller_args+=(--copy-metadata torchcodec)
+fi
 if [[ "${mfq_signing_identity}" != "-" ]]; then
   mfq_pyinstaller_args+=(--codesign-identity "${mfq_signing_identity}")
 fi
@@ -174,6 +181,19 @@ mfq_pyinstaller_args+=("${mfq_project_dir}/mfq/cli.py")
 
 mfq_cli_path="${mfq_resource_dir}/${mfq_cli_name}/${mfq_cli_name}"
 [[ -x "${mfq_cli_path}" ]] || fail "PyInstaller did not create the unified mfq CLI"
+mfq_cli_internal_dir="${mfq_resource_dir}/${mfq_cli_name}/_internal"
+mfq_cli_mlx_metallib="${mfq_cli_internal_dir}/mlx/lib/mlx.metallib"
+mfq_cli_colocated_metallib="${mfq_cli_internal_dir}/mlx.metallib"
+[[ -f "${mfq_cli_mlx_metallib}" ]] \
+  || fail "PyInstaller did not collect the MLX Metal library"
+# MLX resolves its default library relative to the loaded libmlx.dylib.  Once
+# the frozen CLI lives inside a .app bundle that directory is _internal, not
+# mlx/lib, so preserve a relative alias at the lookup location.
+[[ ! -e "${mfq_cli_colocated_metallib}" && ! -L "${mfq_cli_colocated_metallib}" ]] \
+  || fail "unexpected pre-existing colocated MLX Metal library"
+ln -s "mlx/lib/mlx.metallib" "${mfq_cli_colocated_metallib}"
+[[ -r "${mfq_cli_colocated_metallib}" ]] \
+  || fail "colocated MLX Metal library alias is unreadable"
 for mfq_arm64_file in \
   "${mfq_cli_path}" \
   "${mfq_sidecar_dir}/${mfq_runtime_name}" \
@@ -184,6 +204,8 @@ done
 codesign --verify --strict --verbose=2 "${mfq_cli_path}"
 
 "${mfq_cli_path}" --version
+"${mfq_cli_path}" _mlx-runtime-check >/dev/null
+"${mfq_cli_path}" _flash-next-worker --help >/dev/null
 "${mfq_cli_path}" serve --help >/dev/null
 "${mfq_cli_path}" quantize --help >/dev/null
 "${mfq_cli_path}" solve-ew --help >/dev/null
@@ -238,6 +260,8 @@ for mfq_private_prefix in "${HOME}/" "${mfq_project_dir}/"; do
 done
 MFQ_MLX_METALLIB="${mfq_packaged_app}/Contents/Resources/mlx.metallib" \
   "${mfq_packaged_app}/Contents/MacOS/mfq-decode-metal" --self-test-metal
+"${mfq_packaged_app}/Contents/Resources/mfq-cli/mfq-cli" \
+  _mlx-runtime-check >/dev/null
 hdiutil detach "${mfq_mount_dir}" >/dev/null
 mfq_mounted=false
 rmdir "${mfq_mount_dir}"

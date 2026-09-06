@@ -157,6 +157,13 @@ class MlxRoutedLinear:
         self.pools = tuple(pools)
 
     @classmethod
+    def from_blob(cls, blob: bytes | memoryview) -> MlxRoutedLinear:
+        """Construct a grouped routed layer from a still-packed NIM2 blob."""
+
+        weight = MetalMoeWeight.from_blob(blob)
+        return cls._from_grouped_projection(weight, 0)
+
+    @classmethod
     def _from_grouped_projection(
         cls,
         weight: MetalMoeWeight,

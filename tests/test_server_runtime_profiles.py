@@ -47,6 +47,7 @@ def test_runtime_profiles_persist_and_detect_artifact_drift(tmp_path: Path) -> N
                         "prefill_chunk_size": 4096,
                         "prefix_cache_max_sessions": 8,
                         "prefix_cache_max_bytes": 1073741824,
+                        "prefix_cache_pending_bytes": 268435456,
                         "sampling_defaults": {
                             "temperature": 0.7,
                             "top_p": 0.8,
@@ -58,6 +59,7 @@ def test_runtime_profiles_persist_and_detect_artifact_drift(tmp_path: Path) -> N
             assert created.status_code == 201, created.text
             profile = created.json()
             assert profile["load"]["context_size"] == 65536
+            assert profile["load"]["prefix_cache_pending_bytes"] == 268435456
             assert profile["load"]["sampling_defaults"]["repetition_penalty"] == 1.05
             assert not profile["drifted"]
 

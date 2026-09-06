@@ -8,6 +8,7 @@ Default policy for the first Qwen3.5/3.6 smoke:
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import math
 import re
@@ -33,11 +34,13 @@ from mfq.calibration.artifact import (
 from mfq.formats.assets import (
     ASSET_DTYPE,
     ASSET_MANIFEST_KEY,
+    HF_TOKENIZER_JSON_ASSET,
     MINICPMO45_RESAMPLER_POS_EMBED_ASSET,
     MODEL_CONFIG_ASSET,
     TOKENIZER_GGUF_ASSET,
     RuntimeAsset,
     gguf_metadata_asset,
+    hf_runtime_assets,
     is_asset_record,
     minicpmo45_resampler_pos_embed_asset,
     model_config_asset,
@@ -53,6 +56,7 @@ from mfq.formats.io import (
     _NINT_MOE_ROTATION_HDR,
     _pack_nint_moe_runtime,
     _u32,
+    inspect_nint_moe_header,
     open_mmap,
     pack_bits,
 )
@@ -232,8 +236,14 @@ class TensorPlan:
     expert_shape: tuple[int, int, int] | None = None
     expert_precisions: tuple[ExpertPrecision, ...] | None = None
     transform: str | None = None
+    source_quantization: str | None = None
+    source_scale_name: str | None = None
+    source_scale_shard: str | None = None
     expert_source_names: tuple[tuple[str, ...], ...] | None = None
     expert_source_shards: tuple[tuple[str, ...], ...] | None = None
+    expert_source_quantizations: tuple[tuple[str | None, ...], ...] | None = None
+    expert_source_scale_names: tuple[tuple[str | None, ...], ...] | None = None
+    expert_source_scale_shards: tuple[tuple[str | None, ...], ...] | None = None
 
     @property
     def expert_specs(self) -> tuple[NintSpec, ...] | None:
@@ -309,6 +319,10 @@ class _RawSafeTensorSlice:
         "BF16": np.dtype("<u2"),
         "F32": np.dtype("<f4"),
         "F64": np.dtype("<f8"),
+        # Safetensors stores both float8 encodings as their raw byte payload.
+        # NumPy has no portable float8 dtype, so decode through Torch below.
+        "F8_E4M3": np.dtype("u1"),
+        "F8_E5M2": np.dtype("u1"),
     }
 
     def __init__(self, path: str | Path, name: str) -> None:
@@ -327,7 +341,6 @@ class _RawSafeTensorSlice:
         offsets = entry.get("data_offsets")
         if (
             not isinstance(shape, list)
-            or not shape
             or not isinstance(offsets, list)
             or len(offsets) != 2
         ):
@@ -357,6 +370,10 @@ class _RawSafeTensorSlice:
         tensor = torch.from_numpy(values)
         if self.dtype_name == "BF16":
             tensor = tensor.view(torch.bfloat16)
+        elif self.dtype_name == "F8_E4M3":
+            tensor = tensor.view(torch.float8_e4m3fn)
+        elif self.dtype_name == "F8_E5M2":
+            tensor = tensor.view(torch.float8_e5m2)
         return tensor.reshape(shape)
 
     def read_rows(
@@ -388,6 +405,10 @@ class _RawSafeTensorSlice:
             tensor = torch.from_numpy(values)
             if self.dtype_name == "BF16":
                 tensor = tensor.view(torch.bfloat16)
+            elif self.dtype_name == "F8_E4M3":
+                tensor = tensor.view(torch.float8_e4m3fn)
+            elif self.dtype_name == "F8_E5M2":
+                tensor = tensor.view(torch.float8_e5m2)
             return tensor.to(device=device)
         start = int(start)
         if start < 0 or end < start or end > self.rows:
@@ -452,6 +473,121 @@ class _RawSafeTensorSlice:
         start = 0 if key.start is None else int(key.start)
         end = self.rows if key.stop is None else int(key.stop)
         return self.read_rows(start, end, device="cpu")
+
+
+class _ScaledFp8TensorSlice:
+    """Expose a ModelOpt float8 tensor as dequantized floating-point rows.
+
+    Current Qwen4-Exp and GLM-5-Next checkpoints use ordinary E4M3 bytes
+    together with either a 128x128 block multiplier named
+    ``weight_scale_inv`` or one shared per-tensor multiplier.  These are not
+    MXFP8/E8M0 tensors and must be multiplied out before MFQ quantization.
+    """
+
+    def __init__(
+        self,
+        weight: _RawSafeTensorSlice,
+        scale: _RawSafeTensorSlice,
+        scheme: str,
+    ) -> None:
+        if weight.dtype_name not in {"F8_E4M3", "F8_E5M2"}:
+            raise ValueError(
+                f"scaled float8 source requires float8 weights: {weight.name}"
+            )
+        if len(weight.shape) != 2:
+            raise ValueError(
+                f"scaled float8 source requires a matrix: {weight.name} {weight.shape}"
+            )
+        self.weight = weight
+        self.scale_source = scale
+        self.scheme = scheme
+        self.shape = weight.shape
+        self.rows = weight.rows
+        self.columns = weight.columns
+        self._scale = scale.tensor().to(torch.float32)
+        if scheme == "fp8_block128_inv":
+            expected = (
+                math.ceil(self.rows / 128),
+                math.ceil(self.columns / 128),
+            )
+            if tuple(self._scale.shape) != expected:
+                raise ValueError(
+                    f"float8 block scale shape differs for {weight.name}: "
+                    f"{tuple(self._scale.shape)} != {expected}"
+                )
+        elif scheme == "fp8_tensor_scale":
+            if self._scale.numel() != 1:
+                raise ValueError(
+                    f"float8 tensor scale must be scalar for {weight.name}"
+                )
+        else:
+            raise ValueError(f"unsupported float8 source scheme: {scheme}")
+
+    def _dequantize(
+        self,
+        value: torch.Tensor,
+        row_ids: torch.Tensor,
+        *,
+        device: str | torch.device,
+    ) -> torch.Tensor:
+        # Apple's MPS backend can store some float8 tensors but does not
+        # implement their cast to float32.  Decode the raw E4M3/E5M2 values on
+        # CPU first, then transfer ordinary FP32 rows to the quantizer device.
+        output = value.to(device="cpu", dtype=torch.float32).to(device=device)
+        scale = self._scale.to(device=device)
+        if self.scheme == "fp8_tensor_scale":
+            return output * scale.reshape(())
+        row_blocks = torch.div(row_ids.to(device=device), 128, rounding_mode="floor")
+        column_blocks = torch.div(
+            torch.arange(self.columns, device=device),
+            128,
+            rounding_mode="floor",
+        )
+        return output * scale[row_blocks[:, None], column_blocks[None, :]]
+
+    def read_rows(
+        self,
+        start: int | np.ndarray,
+        end: int | None = None,
+        *,
+        device: str | torch.device = "cpu",
+    ) -> torch.Tensor:
+        if end is None:
+            indices = np.asarray(start, dtype=np.int64).reshape(-1)
+            value = self.weight.read_rows(indices, device="cpu")
+            row_ids = torch.as_tensor(indices, dtype=torch.int64, device=device)
+        else:
+            begin = int(start)
+            value = self.weight.read_rows(begin, int(end), device="cpu")
+            row_ids = torch.arange(begin, int(end), dtype=torch.int64, device=device)
+        return self._dequantize(value, row_ids, device=device)
+
+    def read_expert_rows(
+        self,
+        expert: int,
+        start: int,
+        end: int,
+        *,
+        device: str | torch.device,
+    ) -> torch.Tensor:
+        if len(self.shape) != 3:
+            raise ValueError("scaled float8 expert rows require rank 3 weights")
+        rows_per_expert = int(self.shape[1])
+        return self.read_rows(
+            expert * rows_per_expert + start,
+            expert * rows_per_expert + end,
+            device=device,
+        )
+
+    def tensor(self) -> torch.Tensor:
+        return self.read_rows(0, self.rows).reshape(self.shape)
+
+    def __getitem__(self, key: slice) -> torch.Tensor:
+        if not isinstance(key, slice) or key.step not in (None, 1):
+            raise TypeError("scaled float8 source accepts contiguous slices")
+        start = 0 if key.start is None else int(key.start)
+        end = self.rows if key.stop is None else int(key.stop)
+        return self.read_rows(start, end)
 
 
 class _HfPlanRowSource:
@@ -532,6 +668,103 @@ def _hf_source_inventory(root: Path) -> dict[str, SourceTensorMetadata]:
                     dtype=str(tensor.get_dtype()),
                 )
     return inventory
+
+
+_HF_FP8_DTYPES = frozenset({"F8_E4M3", "F8_E5M2"})
+
+
+@dataclass(frozen=True)
+class _SourceQuantization:
+    scheme: str
+    scale_name: str
+    scale_shard: str
+
+
+def _source_quantization(
+    name: str,
+    inventory: dict[str, SourceTensorMetadata],
+) -> _SourceQuantization | None:
+    """Resolve the scale contract of one standard HF/ModelOpt float8 tensor."""
+
+    metadata = inventory[name]
+    if metadata.dtype not in _HF_FP8_DTYPES:
+        return None
+    if len(metadata.shape) != 2:
+        raise ValueError(
+            f"float8 HF source must be a matrix: {name} {metadata.shape}"
+        )
+
+    block_scale_name = name + "_scale_inv"
+    block_scale = inventory.get(block_scale_name)
+    if block_scale is not None:
+        expected = (
+            math.ceil(metadata.shape[0] / 128),
+            math.ceil(metadata.shape[1] / 128),
+        )
+        if block_scale.shape != expected:
+            raise ValueError(
+                f"float8 block scale shape differs for {name}: "
+                f"{block_scale.shape} != {expected}"
+            )
+        return _SourceQuantization(
+            "fp8_block128_inv",
+            block_scale_name,
+            block_scale.shard,
+        )
+
+    tensor_scale_names = [name + "_scale"]
+    ngram_match = re.match(r"^(.+\.ngram_embedding)\.shard_\d+\.weight$", name)
+    if ngram_match is not None:
+        tensor_scale_names.insert(0, ngram_match.group(1) + ".weight_scale")
+    for scale_name in tensor_scale_names:
+        scale = inventory.get(scale_name)
+        if scale is None:
+            continue
+        if int(np.prod(scale.shape)) != 1:
+            raise ValueError(
+                f"float8 tensor scale must contain one value for {name}: "
+                f"{scale.shape}"
+            )
+        return _SourceQuantization(
+            "fp8_tensor_scale",
+            scale_name,
+            scale.shard,
+        )
+    raise ValueError(
+        f"float8 HF tensor has no supported scale multiplier: {name}"
+    )
+
+
+def _source_quantizations(
+    inventory: dict[str, SourceTensorMetadata],
+) -> tuple[dict[str, _SourceQuantization], set[str]]:
+    resolved: dict[str, _SourceQuantization] = {}
+    auxiliaries: set[str] = set()
+    for name, metadata in inventory.items():
+        if metadata.dtype not in _HF_FP8_DTYPES:
+            continue
+        value = _source_quantization(name, inventory)
+        if value is None:  # pragma: no cover - guarded by dtype above
+            continue
+        resolved[name] = value
+        auxiliaries.add(value.scale_name)
+    return resolved, auxiliaries
+
+
+def _raw_source_for_plan(root: Path, item: TensorPlan):
+    source_name = item.source_name or item.name
+    weight = _RawSafeTensorSlice(root / item.shard, source_name)
+    if item.source_quantization is None:
+        return weight
+    if item.source_scale_name is None or item.source_scale_shard is None:
+        raise ValueError(
+            f"scaled source plan lacks scale metadata: {item.name}"
+        )
+    scale = _RawSafeTensorSlice(
+        root / item.source_scale_shard,
+        item.source_scale_name,
+    )
+    return _ScaledFp8TensorSlice(weight, scale, item.source_quantization)
 
 
 _RECIPE_SPECS = {
@@ -818,6 +1051,13 @@ _MTP_PROTECTED_TENSORS = {
     "mtp.pre_fc_norm_embedding.weight",
     "mtp.pre_fc_norm_hidden.weight",
     "mtp.norm.weight",
+    # Qwen4-Exp / Qwen3.8-Flash-Next uses two independent fusion matrices
+    # and a gated-residual collapse instead of the older Qwen3.5 MTP roots.
+    "mtp.fc_embedding.weight",
+    "mtp.fc_hidden.weight",
+    "mtp.hyper_connection_mixer.hc_norm.weight",
+    "mtp.hyper_connection_mixer.input_mix_weight_down.weight",
+    "mtp.hyper_connection_mixer.input_mix_weight_up.weight",
 }
 
 
@@ -839,7 +1079,49 @@ def _mtp_inventory_status(
     if not names:
         return False, count
 
-    required = set(_MTP_PROTECTED_TENSORS)
+    model_type = str(model_config.get("model_type", "")).lower()
+    if model_type == "qwen4_exp_text":
+        required = {
+            "mtp.fc_embedding.weight",
+            "mtp.fc_hidden.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+            "mtp.hyper_connection_mixer.hc_norm.weight",
+            "mtp.hyper_connection_mixer.input_mix_weight_down.weight",
+            "mtp.hyper_connection_mixer.input_mix_weight_up.weight",
+        }
+        for index in range(count):
+            prefix = f"mtp.layers.{index}."
+            required.update(
+                {
+                    prefix + "attn_hyper_connection.hc_norm.weight",
+                    prefix + "attn_hyper_connection.block_inject_weight.weight",
+                    prefix + "mlp_hyper_connection.hc_norm.weight",
+                    prefix + "mlp_hyper_connection.block_inject_weight.weight",
+                    prefix + "self_attn.q_proj.weight",
+                    prefix + "self_attn.k_proj.weight",
+                    prefix + "self_attn.v_proj.weight",
+                    prefix + "self_attn.o_proj.weight",
+                    prefix + "mlp.gate.weight",
+                    prefix + "mlp.experts.0.gate_proj.weight",
+                    prefix + "mlp.experts.0.up_proj.weight",
+                    prefix + "mlp.experts.0.down_proj.weight",
+                }
+            )
+        missing = sorted(required - names)
+        if missing:
+            raise ValueError(
+                "incomplete Qwen4-Exp MTP head; missing tensors: "
+                + ", ".join(missing[:8])
+            )
+        return True, count
+
+    required = {
+        "mtp.fc.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.norm.weight",
+    }
     for index in range(count):
         prefix = f"mtp.layers.{index}."
         required.update(
@@ -904,6 +1186,38 @@ def _base_model_config(store) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError("base MFQ model config is not a JSON object")
     return value
+
+
+def _base_nintm_expert_precisions(
+    store,
+    name: str,
+    expected_shape: tuple[int, ...],
+) -> tuple[ExpertPrecision, ...]:
+    """Recover an expert-wise NINTM policy without decoding its weight payload."""
+
+    blob = store.blob_view(name)
+    try:
+        shape, pools = inspect_nint_moe_header(blob)
+    finally:
+        blob.release()
+    if tuple(shape) != tuple(expected_shape):
+        raise ValueError(
+            f"MTP/base shape mismatch: {name} {expected_shape} != {name} {shape}"
+        )
+
+    precisions: list[ExpertPrecision | None] = [None] * int(shape[0])
+    for pool in pools:
+        precision = ExpertPrecision(
+            family=pool.dtype,
+            nint_spec=pool.nint_spec,
+        )
+        for expert in pool.expert_ids:
+            precisions[int(expert)] = precision
+    if any(precision is None for precision in precisions):  # pragma: no cover
+        raise ValueError(f"base NINTM tensor has an incomplete expert policy: {name}")
+    return tuple(
+        precision for precision in precisions if precision is not None
+    )
 
 
 def _mtp_plan_from_base(
@@ -1007,16 +1321,29 @@ def _mtp_plan_from_base(
                 f"MTP/backbone shape mismatch: {item.name} {item.shape} != "
                 f"{analogue} {source_analogue.shape}"
             )
+        if base_record.dtype == "NINTM":
+            expert_precisions = _base_nintm_expert_precisions(
+                base_store,
+                analogue,
+                item.shape,
+            )
+            selected.append(
+                replace(
+                    item,
+                    target_dtype="NINTM",
+                    target_spec=None,
+                    gguf_type="NINTM",
+                    expert_shape=item.shape,
+                    expert_precisions=expert_precisions,
+                )
+            )
+            continue
         base_tensor = base_store[analogue]
         base_shape = tuple(int(value) for value in base_tensor.shape)
         if base_shape != item.shape:
             raise ValueError(
                 f"MTP/base shape mismatch: {item.name} {item.shape} != "
                 f"{analogue} {base_shape}"
-            )
-        if base_record.dtype == "NINTM":
-            raise ValueError(
-                f"MTP decoder policy cannot currently mirror NINTM: {analogue}"
             )
         target_spec = None
         if base_record.dtype.startswith("NINT") and base_record.dtype != "NINT8-0":
@@ -1033,10 +1360,9 @@ def _mtp_plan_from_base(
         )
 
     selected_names = {item.name for item in selected}
-    _mtp_inventory_status(
-        {name: inventory[name] for name in selected_names},
-        source_text,
-    )
+    expected_names = {item.name for item in plan if item.name.startswith("mtp.")}
+    if selected_names != expected_names:  # pragma: no cover - planner invariant
+        raise ValueError("MTP conversion plan did not preserve the complete head")
     return selected
 
 
@@ -1402,7 +1728,9 @@ def _normalize_hf_expert_storage(
     return result
 
 
-_HF_FLOAT_DTYPES = frozenset({"F16", "BF16", "F32", "F64"})
+_HF_FLOAT_DTYPES = frozenset(
+    {"F16", "BF16", "F32", "F64", "F8_E4M3", "F8_E5M2"}
+)
 _HF_INTEGER_DTYPES = frozenset({"I32", "I64"})
 _MOSTLY_BF16_F32_WEIGHT_MARKERS = (
     # Match llama.cpp's tensors which are deliberately excluded from ordinary
@@ -1663,8 +1991,9 @@ def _glm_expert_precisions(
     name: str,
     shape: tuple[int, int, int],
     calibration_scheme: CalibrationScheme | None,
+    default: NintSpec | None = None,
 ) -> tuple[ExpertPrecision, ...]:
-    default = NintSpec(4, 24, 6)
+    default = default or NintSpec(4, 24, 6)
     if calibration_scheme is None:
         return (nint_expert_precision(default),) * shape[0]
     uniform = calibration_scheme.selections.get(name)
@@ -1683,6 +2012,206 @@ def _glm_expert_precisions(
             )
         return (nint_expert_precision(uniform.spec),) * shape[0]
     return (nint_expert_precision(default),) * shape[0]
+
+
+_FLASH_NEXT_TEXT_TYPES = frozenset({"qwen4_exp_text", "glm5_next_text"})
+_SEPARATE_EXPERT_RE = re.compile(
+    r"^((?:model\.language_model\.layers\.\d+|mtp\.layers\.\d+)"
+    r"\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
+)
+
+
+def _source_quantization_exclusions(
+    config: dict[str, object],
+) -> tuple[str, ...]:
+    quantization = config.get("quantization_config")
+    if not isinstance(quantization, dict):
+        return ()
+    raw = quantization.get("modules_to_not_convert", ())
+    if not isinstance(raw, list):
+        return ()
+    return tuple(str(value) for value in raw if isinstance(value, str))
+
+
+def _source_precision_protected(
+    name: str,
+    exclusions: tuple[str, ...],
+) -> bool:
+    """Match ModelOpt module exclusions against stored parameter names."""
+
+    aliases = [name]
+    if name.startswith("model.language_model."):
+        aliases.append("model." + name[len("model.language_model.") :])
+    for pattern in exclusions:
+        for alias in aliases:
+            if (
+                alias == pattern
+                or alias.startswith(pattern + ".")
+                or fnmatch.fnmatchcase(alias, pattern)
+                or fnmatch.fnmatchcase(alias, pattern + ".*")
+            ):
+                return True
+    return False
+
+
+def _flash_next_expert_plans(
+    config: dict[str, object],
+    inventory: dict[str, SourceTensorMetadata],
+    source_quantizations: dict[str, _SourceQuantization],
+    calibration_scheme: CalibrationScheme | None,
+    default_spec: NintSpec,
+) -> tuple[list[TensorPlan], set[str]]:
+    """Fuse separate per-expert HF matrices into runtime NINTM tensors."""
+
+    model_type = str(config.get("model_type", ""))
+    if model_type not in _FLASH_NEXT_TEXT_TYPES:
+        return [], set()
+    expected_experts = int(
+        config.get(
+            "num_experts" if model_type == "qwen4_exp_text" else "n_routed_experts",
+            0,
+        )
+        or 0
+    )
+    hidden = int(config.get("hidden_size", 0) or 0)
+    expert_hidden = int(config.get("moe_intermediate_size", 0) or 0)
+    if expected_experts <= 0 or hidden <= 0 or expert_hidden <= 0:
+        raise ValueError(
+            f"incomplete {model_type} expert dimensions in model config"
+        )
+
+    groups: dict[str, dict[int, dict[str, str]]] = {}
+    for name in inventory:
+        match = _SEPARATE_EXPERT_RE.match(name)
+        if match is None:
+            continue
+        prefix, expert_raw, projection = match.groups()
+        groups.setdefault(prefix, {}).setdefault(int(expert_raw), {})[
+            projection
+        ] = name
+    if not groups:
+        raise ValueError(
+            f"{model_type} checkpoint contains no separate routed experts"
+        )
+
+    plans: list[TensorPlan] = []
+    consumed: set[str] = set()
+
+    def source_fields(
+        tuples: list[tuple[str, ...]],
+    ) -> tuple[
+        tuple[tuple[str | None, ...], ...],
+        tuple[tuple[str | None, ...], ...],
+        tuple[tuple[str | None, ...], ...],
+    ]:
+        schemes: list[tuple[str | None, ...]] = []
+        scale_names: list[tuple[str | None, ...]] = []
+        scale_shards: list[tuple[str | None, ...]] = []
+        for names in tuples:
+            values = [source_quantizations.get(name) for name in names]
+            schemes.append(tuple(value.scheme if value else None for value in values))
+            scale_names.append(
+                tuple(value.scale_name if value else None for value in values)
+            )
+            scale_shards.append(
+                tuple(value.scale_shard if value else None for value in values)
+            )
+        return tuple(schemes), tuple(scale_names), tuple(scale_shards)
+
+    for prefix, experts in sorted(groups.items()):
+        expected_ids = set(range(expected_experts))
+        if set(experts) != expected_ids:
+            missing = sorted(expected_ids - set(experts))
+            extra = sorted(set(experts) - expected_ids)
+            raise ValueError(
+                f"incomplete expert set under {prefix}: "
+                f"missing={missing[:8]} extra={extra[:8]}"
+            )
+        gate_up_names: list[tuple[str, ...]] = []
+        gate_up_shards: list[tuple[str, ...]] = []
+        down_names: list[tuple[str, ...]] = []
+        down_shards: list[tuple[str, ...]] = []
+        for expert in range(expected_experts):
+            projections = experts[expert]
+            if set(projections) != {"gate_proj", "up_proj", "down_proj"}:
+                raise ValueError(
+                    f"incomplete expert {expert} under {prefix}: "
+                    f"{sorted(projections)}"
+                )
+            gate = projections["gate_proj"]
+            up = projections["up_proj"]
+            down = projections["down_proj"]
+            for name, expected_shape in (
+                (gate, (expert_hidden, hidden)),
+                (up, (expert_hidden, hidden)),
+                (down, (hidden, expert_hidden)),
+            ):
+                if inventory[name].shape != expected_shape:
+                    raise ValueError(
+                        f"expert source shape differs for {name}: "
+                        f"{inventory[name].shape} != {expected_shape}"
+                    )
+            gate_up_names.append((gate, up))
+            gate_up_shards.append(
+                (inventory[gate].shard, inventory[up].shard)
+            )
+            down_names.append((down,))
+            down_shards.append((inventory[down].shard,))
+            consumed.update((gate, up, down))
+
+        gate_up_shape = (expected_experts, 2 * expert_hidden, hidden)
+        down_shape = (expected_experts, hidden, expert_hidden)
+        gate_up_target = prefix + ".gate_up_proj"
+        down_target = prefix + ".down_proj"
+        gate_up_q, gate_up_scale_names, gate_up_scale_shards = source_fields(
+            gate_up_names
+        )
+        down_q, down_scale_names, down_scale_shards = source_fields(down_names)
+        plans.extend(
+            (
+                TensorPlan(
+                    name=gate_up_target,
+                    shard=gate_up_shards[0][0],
+                    shape=gate_up_shape,
+                    source_dtype=inventory[gate_up_names[0][0]].dtype,
+                    target_dtype="NINTM",
+                    expert_shape=gate_up_shape,
+                    expert_precisions=_glm_expert_precisions(
+                        gate_up_target,
+                        gate_up_shape,
+                        calibration_scheme,
+                        default_spec,
+                    ),
+                    transform="hf_expert_gate_up",
+                    expert_source_names=tuple(gate_up_names),
+                    expert_source_shards=tuple(gate_up_shards),
+                    expert_source_quantizations=gate_up_q,
+                    expert_source_scale_names=gate_up_scale_names,
+                    expert_source_scale_shards=gate_up_scale_shards,
+                ),
+                TensorPlan(
+                    name=down_target,
+                    shard=down_shards[0][0],
+                    shape=down_shape,
+                    source_dtype=inventory[down_names[0][0]].dtype,
+                    target_dtype="NINTM",
+                    expert_shape=down_shape,
+                    expert_precisions=_glm_expert_precisions(
+                        down_target,
+                        down_shape,
+                        calibration_scheme,
+                        default_spec,
+                    ),
+                    transform="hf_expert_down",
+                    expert_source_names=tuple(down_names),
+                    expert_source_shards=tuple(down_shards),
+                    expert_source_quantizations=down_q,
+                    expert_source_scale_names=down_scale_names,
+                    expert_source_scale_shards=down_scale_shards,
+                ),
+            )
+        )
+    return plans, consumed
 
 
 def _glm_derived_plans(
@@ -1808,6 +2337,83 @@ def _glm_derived_plans(
     return plans
 
 
+def _glm5_next_mla_derived_plans(
+    config: dict[str, object],
+    inventory: dict[str, SourceTensorMetadata],
+    source_quantizations: dict[str, _SourceQuantization],
+    calibration_scheme: CalibrationScheme | None,
+    default_spec: NintSpec,
+) -> list[TensorPlan]:
+    """Absorb GLM-5-Next ``kv_b_proj`` into head-wise MLA projections.
+
+    The runtime never needs to materialize the checkpoint's
+    ``[heads * (qk + value), kv_rank]`` matrix.  Splitting it into an
+    ``embed_q`` and ``unembed_out`` NINTM pair keeps the cache in the
+    512-wide MLA latent space and also covers the appended MTP layer.
+    """
+
+    pattern = re.compile(
+        r"^(model\.language_model\.layers\.\d+\.self_attn\.)"
+        r"kv_b_proj\.weight$"
+    )
+    plans: list[TensorPlan] = []
+    sources = sorted(name for name in inventory if pattern.match(name))
+    if not sources:
+        return plans
+    heads = int(config.get("num_attention_heads", 0) or 0)
+    kv_rank = int(config.get("kv_lora_rank", 0) or 0)
+    nope = int(config.get("qk_nope_head_dim", 0) or 0)
+    value = int(config.get("v_head_dim", 0) or 0)
+    if min(heads, kv_rank, nope, value) <= 0:
+        raise ValueError("incomplete GLM-5-Next MLA dimensions in model config")
+    expected = (heads * (nope + value), kv_rank)
+    for source_name in sources:
+        metadata = inventory[source_name]
+        if metadata.shape != expected:
+            raise ValueError(
+                f"GLM-5-Next source tensor shape mismatch for {source_name}: "
+                f"checkpoint={metadata.shape}, expected={expected}"
+            )
+        prefix = pattern.match(source_name).group(1)  # type: ignore[union-attr]
+        source_quantization = source_quantizations.get(source_name)
+        source_fields = {
+            "source_quantization": (
+                source_quantization.scheme if source_quantization is not None else None
+            ),
+            "source_scale_name": (
+                source_quantization.scale_name if source_quantization is not None else None
+            ),
+            "source_scale_shard": (
+                source_quantization.scale_shard if source_quantization is not None else None
+            ),
+        }
+        for suffix, transform, shape in (
+            ("embed_q", "glm_kv_b_embed_q", (heads, kv_rank, nope)),
+            ("unembed_out", "glm_kv_b_unembed_out", (heads, value, kv_rank)),
+        ):
+            target = prefix + suffix
+            plans.append(
+                TensorPlan(
+                    name=target,
+                    shard=metadata.shard,
+                    shape=shape,
+                    source_dtype=metadata.dtype,
+                    target_dtype="NINTM",
+                    source_name=source_name,
+                    expert_shape=shape,
+                    expert_precisions=_glm_expert_precisions(
+                        target,
+                        shape,
+                        calibration_scheme,
+                        default_spec,
+                    ),
+                    transform=transform,
+                    **source_fields,
+                )
+            )
+    return plans
+
+
 def _plan(
     root: Path,
     text_only: bool,
@@ -1840,10 +2446,33 @@ def _plan(
     )
     mtp_layer_index = int(model_config.get("num_hidden_layers", 0) or 0)
     is_glm_dsa = model_config.get("model_type") == "glm_moe_dsa"
+    is_glm5_next = model_config.get("model_type") == "glm5_next_text"
+    is_flash_next = model_config.get("model_type") in _FLASH_NEXT_TEXT_TYPES
     is_minicpmo45 = _is_minicpmo45_config(raw_config)
+    source_exclusions = (
+        _source_quantization_exclusions(raw_config)
+        if is_flash_next
+        else ()
+    )
     if is_glm_dsa and recipe_types is not None:
         raise ValueError(
             "GLM DSA GGUF recipe mapping is not implemented; use a calibration scheme"
+        )
+    if is_flash_next and recipe_types is not None:
+        raise ValueError(
+            "Qwen4-Exp/GLM-5-Next GGUF recipe mapping is not implemented; "
+            "use the native HF conversion policy or a calibration scheme"
+        )
+    source_quantizations, source_auxiliaries = _source_quantizations(inventory)
+    flash_expert_plans: list[TensorPlan] = []
+    flash_expert_sources: set[str] = set()
+    if is_flash_next and not mostly_bf16:
+        flash_expert_plans, flash_expert_sources = _flash_next_expert_plans(
+            model_config,
+            inventory,
+            source_quantizations,
+            calibration_scheme,
+            _spec_for_target(default_nint_dtype, NintSpec()),
         )
     glm_layers = int(model_config.get("num_hidden_layers", 0)) if is_glm_dsa else 0
     linear_qkv_split = (
@@ -1853,6 +2482,8 @@ def _plan(
     )
     by_shard: dict[str, list[str]] = {}
     for name, shard in weight_map.items():
+        if name in source_auxiliaries or name in flash_expert_sources:
+            continue
         if text_only and not (
             name.startswith("model.language_model.")
             or (mtp_included and name.startswith("mtp."))
@@ -1898,9 +2529,11 @@ def _plan(
                 metadata = inventory[name]
                 shape = metadata.shape
                 source_dtype = metadata.dtype
-                if is_glm_dsa and not mostly_bf16 and (
+                source_quantization = source_quantizations.get(name)
+                if (is_glm_dsa or is_glm5_next) and not mostly_bf16 and (
                     name.endswith(".self_attn.kv_b_proj.weight")
-                    or re.match(
+                    or is_glm_dsa
+                    and re.match(
                         r"model\.layers\.\d+\.mlp\.experts\.\d+\."
                         r"(?:gate_proj|up_proj|down_proj)\.weight$",
                         name,
@@ -1922,7 +2555,12 @@ def _plan(
                     if gguf_name is not None and recipe_types is not None
                     else None
                 )
-                if name in _MTP_PROTECTED_TENSORS:
+                if source_dtype in _HF_INTEGER_DTYPES:
+                    # Hash tables, offsets, token maps, and similar runtime
+                    # metadata must remain exact.  In particular, Qwen4-Exp
+                    # PLE multipliers exceed float32's integer precision.
+                    target = source_dtype
+                elif name in _MTP_PROTECTED_TENSORS:
                     target = (
                         source_dtype
                         if source_dtype in {"BF16", "F16", "F32"}
@@ -1930,6 +2568,16 @@ def _plan(
                     )
                 elif mostly_bf16:
                     target = _mostly_bf16_target(name, shape, source_dtype)
+                elif (
+                    is_flash_next
+                    and _source_precision_protected(name, source_exclusions)
+                ):
+                    target = (
+                        source_dtype
+                        if source_dtype
+                        in {"BF16", "F16", "F32", "I32", "I64"}
+                        else dense_dtype
+                    )
                 elif recipe_types is not None:
                     if is_minicpmo45 and not name.startswith("llm."):
                         target = (
@@ -2027,6 +2675,21 @@ def _plan(
                             row_start=0,
                             row_end=qk_end,
                             target_spec=qk_selection.spec if qk_selection else None,
+                            source_quantization=(
+                                source_quantization.scheme
+                                if source_quantization is not None
+                                else None
+                            ),
+                            source_scale_name=(
+                                source_quantization.scale_name
+                                if source_quantization is not None
+                                else None
+                            ),
+                            source_scale_shard=(
+                                source_quantization.scale_shard
+                                if source_quantization is not None
+                                else None
+                            ),
                         )
                     )
                     out.append(
@@ -2042,6 +2705,21 @@ def _plan(
                             row_start=qk_end,
                             row_end=qkv_end,
                             target_spec=v_selection.spec if v_selection else None,
+                            source_quantization=(
+                                source_quantization.scheme
+                                if source_quantization is not None
+                                else None
+                            ),
+                            source_scale_name=(
+                                source_quantization.scale_name
+                                if source_quantization is not None
+                                else None
+                            ),
+                            source_scale_shard=(
+                                source_quantization.scale_shard
+                                if source_quantization is not None
+                                else None
+                            ),
                         )
                     )
                     continue
@@ -2082,6 +2760,21 @@ def _plan(
                         target_spec=selection.spec if selection else None,
                         expert_shape=expert_shape,
                         expert_precisions=expert_precisions,
+                        source_quantization=(
+                            source_quantization.scheme
+                            if source_quantization is not None
+                            else None
+                        ),
+                        source_scale_name=(
+                            source_quantization.scale_name
+                            if source_quantization is not None
+                            else None
+                        ),
+                        source_scale_shard=(
+                            source_quantization.scale_shard
+                            if source_quantization is not None
+                            else None
+                        ),
                     )
                 )
     if is_glm_dsa and not mostly_bf16:
@@ -2094,6 +2787,17 @@ def _plan(
                 calibration_scheme,
             )
         )
+    if is_glm5_next and not mostly_bf16:
+        out.extend(
+            _glm5_next_mla_derived_plans(
+                model_config,
+                inventory,
+                source_quantizations,
+                calibration_scheme,
+                _spec_for_target(default_nint_dtype, NintSpec()),
+            )
+        )
+    out.extend(flash_expert_plans)
     if calibration_scheme is not None:
         planned = {item.name for item in out}
         selected_names = set(calibration_scheme.selections) | set(
@@ -2331,7 +3035,7 @@ class _ExpertPoolRowSource:
 
 
 class _GlmExpertRowSource:
-    """Read one GLM expert slice at a time without stacking the expert layer."""
+    """Read separate HF expert matrices without stacking a complete layer."""
 
     def __init__(
         self,
@@ -2339,42 +3043,73 @@ class _GlmExpertRowSource:
         expert_shape: tuple[int, int, int],
         source_names: tuple[tuple[str, ...], ...],
         source_shards: tuple[tuple[str, ...], ...],
+        source_quantizations: tuple[tuple[str | None, ...], ...] | None = None,
+        source_scale_names: tuple[tuple[str | None, ...], ...] | None = None,
+        source_scale_shards: tuple[tuple[str | None, ...], ...] | None = None,
     ) -> None:
         self.root = root
         self.n_experts, self.rows_per_expert, self.columns = expert_shape
         self.source_names = source_names
         self.source_shards = source_shards
         if len(source_names) != self.n_experts or len(source_shards) != self.n_experts:
-            raise ValueError("GLM expert source count does not match expert shape")
-        self._context = None
-        self._handle = None
-        self._shard: str | None = None
+            raise ValueError("HF expert source count does not match expert shape")
+        empty = tuple(
+            tuple(None for _ in names)
+            for names in source_names
+        )
+        self.source_quantizations = source_quantizations or empty
+        self.source_scale_names = source_scale_names or empty
+        self.source_scale_shards = source_scale_shards or empty
+        for values in (
+            self.source_quantizations,
+            self.source_scale_names,
+            self.source_scale_shards,
+        ):
+            if len(values) != self.n_experts or any(
+                len(row) != len(names)
+                for row, names in zip(values, source_names, strict=True)
+            ):
+                raise ValueError("invalid HF expert source quantization metadata")
+        self._reader_key: tuple[int, int] | None = None
+        self._reader = None
 
     def close(self) -> None:
-        if self._context is not None:
-            self._context.__exit__(None, None, None)
-        self._context = None
-        self._handle = None
-        self._shard = None
+        self._reader_key = None
+        self._reader = None
 
-    def _open(self, shard: str):
-        if self._shard == shard and self._handle is not None:
-            return self._handle
-        self.close()
-        self._context = safe_open(
-            str(self.root / shard), framework="pt", device="cpu"
-        )
-        self._handle = self._context.__enter__()
-        self._shard = shard
-        return self._handle
+    def _source(self, expert: int, index: int):
+        key = (expert, index)
+        if self._reader_key == key and self._reader is not None:
+            return self._reader
+        name = self.source_names[expert][index]
+        shard = self.source_shards[expert][index]
+        weight = _RawSafeTensorSlice(self.root / shard, name)
+        scheme = self.source_quantizations[expert][index]
+        if scheme is None:
+            reader = weight
+        else:
+            scale_name = self.source_scale_names[expert][index]
+            scale_shard = self.source_scale_shards[expert][index]
+            if scale_name is None or scale_shard is None:
+                raise ValueError(
+                    f"scaled expert source lacks scale metadata: {name}"
+                )
+            reader = _ScaledFp8TensorSlice(
+                weight,
+                _RawSafeTensorSlice(self.root / scale_shard, scale_name),
+                scheme,
+            )
+        self._reader_key = key
+        self._reader = reader
+        return reader
 
     def _read(self, expert: int, start: int, end: int) -> torch.Tensor:
         names = self.source_names[expert]
         shards = self.source_shards[expert]
         if len(names) == 0 or len(names) != len(shards):
-            raise ValueError("invalid GLM expert source tuple")
+            raise ValueError("invalid HF expert source tuple")
         if self.rows_per_expert % len(names) != 0:
-            raise ValueError("GLM fused expert rows do not split evenly")
+            raise ValueError("HF fused expert rows do not split evenly")
         rows_per_source = self.rows_per_expert // len(names)
         pieces: list[torch.Tensor] = []
         cursor = start
@@ -2382,23 +3117,24 @@ class _GlmExpertRowSource:
             source_index = cursor // rows_per_source
             local_row = cursor % rows_per_source
             take = min(end - cursor, rows_per_source - local_row)
-            handle = self._open(shards[source_index])
             pieces.append(
-                handle.get_slice(names[source_index])[
-                    local_row : local_row + take
-                ]
+                self._source(expert, source_index).read_rows(
+                    local_row,
+                    local_row + take,
+                    device="cpu",
+                )
             )
             cursor += take
         return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
 
     def __getitem__(self, key: slice) -> torch.Tensor:
         if not isinstance(key, slice) or key.step not in (None, 1):
-            raise TypeError("GLM expert source accepts contiguous slices only")
+            raise TypeError("HF expert source accepts contiguous slices only")
         total_rows = self.n_experts * self.rows_per_expert
         start = 0 if key.start is None else int(key.start)
         end = total_rows if key.stop is None else int(key.stop)
         if start < 0 or end < start or end > total_rows:
-            raise IndexError(f"invalid GLM expert row slice {start}:{end}")
+            raise IndexError(f"invalid HF expert row slice {start}:{end}")
         pieces: list[torch.Tensor] = []
         cursor = start
         while cursor < end:
@@ -4218,7 +4954,7 @@ def convert(args: argparse.Namespace) -> None:
                 if item.target_dtype == "NINTM" and item.expert_source_names is not None:
                     if item.expert_shape is None or item.expert_precisions is None or \
                             item.expert_source_shards is None:
-                        raise ValueError(f"NINTM plan lacks GLM expert metadata: {item.name}")
+                        raise ValueError(f"NINTM plan lacks HF expert metadata: {item.name}")
                     source = (
                         _MfqGlmExpertRowSource(
                             mfq_checkpoint,
@@ -4231,6 +4967,9 @@ def convert(args: argparse.Namespace) -> None:
                             item.expert_shape,
                             item.expert_source_names,
                             item.expert_source_shards,
+                            item.expert_source_quantizations,
+                            item.expert_source_scale_names,
+                            item.expert_source_scale_shards,
                         )
                     )
                     try:
@@ -4261,7 +5000,7 @@ def convert(args: argparse.Namespace) -> None:
                     raw_source = (
                         mfq_checkpoint.tensor_source(source_name)
                         if mfq_checkpoint is not None
-                        else _RawSafeTensorSlice(root / shard, source_name)
+                        else _raw_source_for_plan(root, item)
                     )
                     if item.target_dtype == "NINTM":
                         if item.expert_shape is None or item.expert_precisions is None:
@@ -4571,6 +5310,12 @@ def convert(args: argparse.Namespace) -> None:
         ):
             position_asset = minicpmo45_resampler_pos_embed_asset()
             assets_by_name[position_asset.name] = position_asset
+        if (
+            model_type in {"qwen4_exp", "qwen4_exp_text", "glm5_next", "glm5_next_text"}
+            and mfq_checkpoint is None
+        ):
+            for asset in hf_runtime_assets(root):
+                assets_by_name[asset.name] = asset
         tokenizer_gguf_arg = getattr(args, "tokenizer_gguf", "")
         tokenizer_gguf = (
             Path(tokenizer_gguf_arg).resolve()
@@ -4584,7 +5329,10 @@ def convert(args: argparse.Namespace) -> None:
         if tokenizer_gguf is not None:
             tokenizer_asset = gguf_metadata_asset(_gguf_reader(tokenizer_gguf))
             assets_by_name[tokenizer_asset.name] = tokenizer_asset
-        if TOKENIZER_GGUF_ASSET not in assets_by_name:
+        if not {
+            TOKENIZER_GGUF_ASSET,
+            HF_TOKENIZER_JSON_ASSET,
+        }.intersection(assets_by_name):
             warnings.warn(
                 "output MFQ has no embedded tokenizer; pass --tokenizer-gguf",
                 stacklevel=2,

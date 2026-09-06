@@ -52,6 +52,20 @@ endif()
 
 if(MFQ_BUILD_CPP_SERVER)
     find_package(Threads REQUIRED)
+
+    add_library(mfq-paged-prefix-cache STATIC
+        mfq_paged_prefix_cache.cpp
+        mfq_paged_prefix_cache.h
+    )
+    target_include_directories(mfq-paged-prefix-cache PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(mfq-paged-prefix-cache PRIVATE Threads::Threads)
+    target_compile_features(mfq-paged-prefix-cache PUBLIC cxx_std_17)
+    set_target_properties(mfq-paged-prefix-cache PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+    )
+
     set(MFQ_TEXT_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/text")
     if(NOT EXISTS "${MFQ_TEXT_SOURCE_DIR}/chat/chat.h")
         message(FATAL_ERROR
@@ -105,6 +119,7 @@ if(MFQ_BUILD_CPP_SERVER)
     target_link_libraries(mfq-server PRIVATE
         mfq_httplib
         mfq-text-runtime
+        mfq-paged-prefix-cache
         Threads::Threads
     )
     target_compile_definitions(mfq-server PRIVATE NOMINMAX)
@@ -115,6 +130,19 @@ if(MFQ_BUILD_CPP_SERVER)
     if(MSVC)
         target_compile_options(mfq-server PRIVATE /utf-8 /EHsc)
     endif()
+
+    add_executable(mfq-paged-prefix-cache-test
+        mfq_paged_prefix_cache_test.cpp
+    )
+    target_link_libraries(mfq-paged-prefix-cache-test PRIVATE
+        mfq-paged-prefix-cache
+        Threads::Threads
+    )
+    target_compile_features(mfq-paged-prefix-cache-test PRIVATE cxx_std_17)
+    add_test(
+        NAME mfq-paged-prefix-cache-test
+        COMMAND mfq-paged-prefix-cache-test
+    )
 endif()
 
 if(MFQ_BUILD_METAL_RUNTIME)

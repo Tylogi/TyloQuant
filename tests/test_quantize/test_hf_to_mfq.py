@@ -11,12 +11,21 @@ from safetensors.torch import save_file
 
 import mfq.tools.quantize_hf_to_mfq as hf_to_mfq
 from mfq.calibration.artifact import ExpertPrecision
-from mfq.formats.assets import MODEL_CONFIG_ASSET, is_asset_record
+from mfq.formats.assets import (
+    HF_CHAT_TEMPLATE_ASSET,
+    HF_GENERATION_CONFIG_ASSET,
+    HF_TOKENIZER_CONFIG_ASSET,
+    HF_TOKENIZER_JSON_ASSET,
+    MODEL_CONFIG_ASSET,
+    is_asset_record,
+)
 from mfq.formats.header import FileHeader
 from mfq.formats.io import is_bfloat16_array, load_mmap, open_mmap, save
+from mfq.formats.moe import NintMoePool, NintMoeTensor
 from mfq.formats.nint import NintSpec
 from mfq.formats.shards import format_shard_path
 from mfq.quantize.imatrix import ImportanceEntry, ImportanceMatrix
+from mfq.quantize.nint_quant import quantize as quantize_nint
 from mfq.tools.quantize_hf_to_mfq import (
     TensorPlan,
     _bind_hf_imatrix,
@@ -26,6 +35,8 @@ from mfq.tools.quantize_hf_to_mfq import (
     _minicpmo45_quantizable_matrix,
     _normalize_hf_expert_storage,
     _RawSafeTensorSlice,
+    _ScaledFp8TensorSlice,
+    _source_quantization,
     _transform_glm_kv_b,
     _validate_runtime_fused_pairs,
     convert,
@@ -85,6 +96,89 @@ def test_raw_safetensor_slice_streams_bfloat16_rows_and_expert_rows(tmp_path):
         expected[1, 1:3],
     )
     assert torch.equal(source[2:4], expected.reshape(6, 4)[2:4])
+
+
+def test_scaled_fp8_tensor_slice_applies_modelopt_block_multipliers(tmp_path):
+    path = tmp_path / "model.safetensors"
+    base = torch.linspace(-4, 4, 260 * 260, dtype=torch.float32).reshape(260, 260)
+    weight = base.to(torch.float8_e4m3fn)
+    scale = torch.tensor(
+        [[0.25, 0.5, 0.75], [1.0, 1.25, 1.5], [1.75, 2.0, 2.25]],
+        dtype=torch.float32,
+    )
+    save_file(
+        {"proj.weight": weight, "proj.weight_scale_inv": scale},
+        path,
+    )
+    source = _ScaledFp8TensorSlice(
+        _RawSafeTensorSlice(path, "proj.weight"),
+        _RawSafeTensorSlice(path, "proj.weight_scale_inv"),
+        "fp8_block128_inv",
+    )
+
+    rows = np.asarray([0, 127, 128, 259])
+    actual = source.read_rows(rows)
+    expected_scale = scale[
+        torch.as_tensor(rows // 128)[:, None],
+        (torch.arange(260) // 128)[None, :],
+    ]
+    torch.testing.assert_close(actual, weight[rows].float() * expected_scale)
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(),
+    reason="requires the Apple MPS backend",
+)
+def test_scaled_fp8_tensor_slice_stages_float8_cast_on_cpu_for_mps(tmp_path):
+    path = tmp_path / "model.safetensors"
+    weight = torch.tensor(
+        [[-4.0, -1.0, 2.0], [3.0, 0.5, -0.25]],
+        dtype=torch.float8_e4m3fn,
+    )
+    save_file(
+        {
+            "proj.weight": weight,
+            "proj.weight_scale": torch.tensor([0.125]),
+        },
+        path,
+    )
+    source = _ScaledFp8TensorSlice(
+        _RawSafeTensorSlice(path, "proj.weight"),
+        _RawSafeTensorSlice(path, "proj.weight_scale"),
+        "fp8_tensor_scale",
+    )
+
+    actual = source.read_rows(0, 2, device="mps")
+
+    assert actual.device.type == "mps"
+    torch.testing.assert_close(actual.cpu(), weight.float() * 0.125)
+
+
+def test_scaled_fp8_tensor_slice_applies_shared_ngram_scale(tmp_path):
+    path = tmp_path / "model.safetensors"
+    weight = torch.tensor(
+        [[-4.0, -1.0, 2.0], [3.0, 0.5, -0.25]],
+        dtype=torch.float8_e4m3fn,
+    )
+    save_file(
+        {
+            "ple.ngram_embedding.shard_0.weight": weight,
+            "ple.ngram_embedding.weight_scale": torch.tensor([0.125]),
+        },
+        path,
+    )
+    inventory = hf_to_mfq._hf_source_inventory(tmp_path)
+    quantization = _source_quantization(
+        "ple.ngram_embedding.shard_0.weight", inventory
+    )
+    assert quantization is not None
+    assert quantization.scheme == "fp8_tensor_scale"
+    source = _ScaledFp8TensorSlice(
+        _RawSafeTensorSlice(path, "ple.ngram_embedding.shard_0.weight"),
+        _RawSafeTensorSlice(path, quantization.scale_name),
+        quantization.scheme,
+    )
+    torch.testing.assert_close(source.tensor(), weight.float() * 0.125)
 
 
 @pytest.mark.parametrize(
@@ -366,6 +460,154 @@ def test_qwen35_mtp_augmentation_copies_base_and_mirrors_backbone_policy(tmp_pat
             after.records["mtp.layers.0.input_layernorm.weight"].dtype
             == "F32"
         )
+
+
+def test_qwen4_mtp_plan_mirrors_mixed_nintm_expert_policy(tmp_path):
+    hidden = 8
+    expert_hidden = 4
+    experts = 2
+    config = {
+        "model_type": "qwen4_exp_text",
+        "hidden_size": hidden,
+        "moe_intermediate_size": expert_hidden,
+        "num_experts": experts,
+        "num_hidden_layers": 1,
+        "mtp_num_hidden_layers": 1,
+    }
+    root_names = {
+        "mtp.fc_embedding.weight",
+        "mtp.fc_hidden.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.hyper_connection_mixer.hc_norm.weight",
+        "mtp.hyper_connection_mixer.input_mix_weight_down.weight",
+        "mtp.hyper_connection_mixer.input_mix_weight_up.weight",
+    }
+    layer_shapes = {
+        "attn_hyper_connection.hc_norm.weight": (hidden,),
+        "attn_hyper_connection.block_inject_weight.weight": (hidden, hidden),
+        "mlp_hyper_connection.hc_norm.weight": (hidden,),
+        "mlp_hyper_connection.block_inject_weight.weight": (hidden, hidden),
+        "self_attn.q_proj.weight": (hidden, hidden),
+        "self_attn.k_proj.weight": (hidden, hidden),
+        "self_attn.v_proj.weight": (hidden, hidden),
+        "self_attn.o_proj.weight": (hidden, hidden),
+        "mlp.gate.weight": (experts, hidden),
+    }
+    inventory: dict[str, hf_to_mfq.SourceTensorMetadata] = {}
+    for name in root_names:
+        shape = (hidden,) if "norm" in name else (hidden, hidden)
+        inventory[name] = hf_to_mfq.SourceTensorMetadata(
+            name=name,
+            shard="model.safetensors",
+            shape=shape,
+            dtype="BF16",
+        )
+    for suffix, shape in layer_shapes.items():
+        name = "mtp.layers.0." + suffix
+        inventory[name] = hf_to_mfq.SourceTensorMetadata(
+            name=name,
+            shard="model.safetensors",
+            shape=shape,
+            dtype="BF16",
+        )
+    for expert in range(experts):
+        for projection, shape in (
+            ("gate_proj", (expert_hidden, hidden)),
+            ("up_proj", (expert_hidden, hidden)),
+            ("down_proj", (hidden, expert_hidden)),
+        ):
+            name = f"mtp.layers.0.mlp.experts.{expert}.{projection}.weight"
+            inventory[name] = hf_to_mfq.SourceTensorMetadata(
+                name=name,
+                shard="model.safetensors",
+                shape=shape,
+                dtype="F8_E4M3",
+            )
+
+    plan = [
+        TensorPlan(
+            name=name,
+            shard="model.safetensors",
+            shape=metadata.shape,
+            source_dtype=metadata.dtype,
+            target_dtype="F16",
+        )
+        for name, metadata in inventory.items()
+        if ".mlp.experts." not in name
+    ]
+    gate_up_name = "mtp.layers.0.mlp.experts.gate_up_proj"
+    down_name = "mtp.layers.0.mlp.experts.down_proj"
+    gate_up_shape = (experts, 2 * expert_hidden, hidden)
+    down_shape = (experts, hidden, expert_hidden)
+    plan.extend(
+        (
+            TensorPlan(
+                name=gate_up_name,
+                shard="model.safetensors",
+                shape=gate_up_shape,
+                source_dtype="F8_E4M3",
+                target_dtype="NINTM",
+                expert_shape=gate_up_shape,
+                expert_precisions=(ExpertPrecision("NINT4", NintSpec(4, 8, 6)),) * experts,
+            ),
+            TensorPlan(
+                name=down_name,
+                shard="model.safetensors",
+                shape=down_shape,
+                source_dtype="F8_E4M3",
+                target_dtype="NINTM",
+                expert_shape=down_shape,
+                expert_precisions=(ExpertPrecision("NINT4", NintSpec(4, 4, 6)),) * experts,
+            ),
+        )
+    )
+
+    low = NintSpec(2, 8, 5)
+    high = NintSpec(4, 8, 6)
+
+    def mixed(shape: tuple[int, int, int]) -> NintMoeTensor:
+        rng = np.random.default_rng(sum(shape))
+        pools = []
+        for expert, spec in enumerate((low, high)):
+            values = rng.normal(size=(shape[1], shape[2])).astype(np.float32)
+            pools.append(
+                NintMoePool(
+                    np.asarray([expert], dtype=np.int32),
+                    quantize_nint(values, spec),
+                )
+            )
+        return NintMoeTensor(shape, tuple(pools))
+
+    base_tensors: dict[str, object] = {
+        MODEL_CONFIG_ASSET: json.dumps(config).encode(),
+        "model.language_model.layers.0.mlp.experts.gate_up_proj": mixed(
+            gate_up_shape
+        ),
+        "model.language_model.layers.0.mlp.experts.down_proj": mixed(down_shape),
+    }
+    for suffix, shape in layer_shapes.items():
+        base_tensors["model.language_model.layers.0." + suffix] = np.zeros(
+            shape, dtype=np.float16
+        )
+    base = tmp_path / "qwen4-base.mfq"
+    save(base, FileHeader(version=2, model_arch="qwen4-exp"), base_tensors)
+
+    with open_mmap(base) as store:
+        selected = hf_to_mfq._mtp_plan_from_base(
+            plan,
+            inventory,
+            {"text_config": config},
+            store,
+        )
+
+    selected_by_name = {item.name: item for item in selected}
+    assert set(selected_by_name) == {item.name for item in plan}
+    for name in (gate_up_name, down_name):
+        item = selected_by_name[name]
+        assert item.target_dtype == "NINTM"
+        assert item.expert_precisions is not None
+        assert tuple(value.nint_spec for value in item.expert_precisions) == (low, high)
 
 
 def test_recipe_dense_types_preserve_bf16_separately_from_f16():
@@ -1165,6 +1407,224 @@ def test_glm_dsa_plan_derives_headwise_mla_and_streamed_experts(tmp_path):
         ].shape == (3, 48, 24)
     finally:
         split_store.close()
+
+
+@pytest.mark.parametrize(
+    "outer_type,text_type,expert_key,layer",
+    [
+        ("qwen4_exp", "qwen4_exp_text", "num_experts", 0),
+        ("glm5_next", "glm5_next_text", "n_routed_experts", 3),
+    ],
+)
+def test_flash_next_plan_dequantizes_and_fuses_separate_fp8_experts(
+    tmp_path,
+    outer_type,
+    text_type,
+    expert_key,
+    layer,
+):
+    root = tmp_path / outer_type
+    root.mkdir()
+    hidden = 24
+    expert_hidden = 24
+    experts = 2
+    text_config = {
+        "model_type": text_type,
+        "hidden_size": hidden,
+        "moe_intermediate_size": expert_hidden,
+        expert_key: experts,
+        "num_hidden_layers": layer + 1,
+        "mtp_num_hidden_layers": 0,
+    }
+    tensors = {}
+    prefix = f"model.language_model.layers.{layer}.mlp.experts"
+    integer_metadata = "model.language_model.runtime_hash_metadata"
+    tensors[integer_metadata] = torch.tensor(
+        [23703573157769, 20109073645365],
+        dtype=torch.int64,
+    )
+    for expert in range(experts):
+        for projection, multiplier, shape in (
+            ("gate_proj", 0.01, (expert_hidden, hidden)),
+            ("up_proj", 0.02, (expert_hidden, hidden)),
+            ("down_proj", 0.03, (hidden, expert_hidden)),
+        ):
+            name = f"{prefix}.{expert}.{projection}.weight"
+            tensors[name] = torch.full(
+                shape,
+                float(10 * expert + {"gate_proj": 1, "up_proj": 2, "down_proj": 3}[projection]),
+            ).to(torch.float8_e4m3fn)
+            tensors[name + "_scale_inv"] = torch.tensor([[multiplier]])
+    save_file(tensors, root / "model.safetensors")
+    (root / "config.json").write_text(
+        json.dumps({"model_type": outer_type, "text_config": text_config}),
+        encoding="utf-8",
+    )
+
+    plan = build_hf_plan(root, True, None, "F16")
+    assert {item.name for item in plan} == {
+        prefix + ".gate_up_proj",
+        prefix + ".down_proj",
+        integer_metadata,
+    }
+    assert all(
+        item.target_dtype == "NINTM"
+        for item in plan
+        if item.name != integer_metadata
+    )
+    assert next(item for item in plan if item.name == integer_metadata).target_dtype == "I64"
+    assert not any("scale_inv" in item.name for item in plan)
+
+    gate_up = next(item for item in plan if item.name.endswith("gate_up_proj"))
+    stream = _GlmExpertRowSource(
+        root,
+        gate_up.expert_shape,
+        gate_up.expert_source_names,
+        gate_up.expert_source_shards,
+        gate_up.expert_source_quantizations,
+        gate_up.expert_source_scale_names,
+        gate_up.expert_source_scale_shards,
+    )
+    try:
+        expert_one = stream[2 * expert_hidden : 4 * expert_hidden]
+    finally:
+        stream.close()
+    assert expert_one.shape == (2 * expert_hidden, hidden)
+    torch.testing.assert_close(
+        expert_one[:expert_hidden],
+        tensors[f"{prefix}.1.gate_proj.weight"].float() * 0.01,
+    )
+    torch.testing.assert_close(
+        expert_one[expert_hidden:],
+        tensors[f"{prefix}.1.up_proj.weight"].float() * 0.02,
+    )
+
+
+def test_flash_next_conversion_embeds_self_contained_python_runtime_assets(tmp_path):
+    root = tmp_path / "qwen4-exp"
+    root.mkdir()
+    save_file(
+        {"lm_head.weight": torch.ones((2, 2), dtype=torch.bfloat16)},
+        root / "model.safetensors",
+    )
+    (root / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen4_exp",
+                "text_config": {"model_type": "qwen4_exp_text"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    expected = {
+        HF_TOKENIZER_JSON_ASSET: b'{"model":{"type":"BPE"}}',
+        HF_TOKENIZER_CONFIG_ASSET: b'{"eos_token":"<eos>"}',
+        HF_CHAT_TEMPLATE_ASSET: b"{{ messages }}",
+        HF_GENERATION_CONFIG_ASSET: b'{"max_new_tokens":32}',
+    }
+    for name, record in (
+        ("tokenizer.json", HF_TOKENIZER_JSON_ASSET),
+        ("tokenizer_config.json", HF_TOKENIZER_CONFIG_ASSET),
+        ("chat_template.jinja", HF_CHAT_TEMPLATE_ASSET),
+        ("generation_config.json", HF_GENERATION_CONFIG_ASSET),
+    ):
+        (root / name).write_bytes(expected[record])
+    output = tmp_path / "qwen4-exp.mfq"
+    args = hf_to_mfq.build_parser().parse_args(
+        [
+            "--input",
+            str(root),
+            "--output",
+            str(output),
+            "--bf16",
+            "--quant-backend",
+            "cpu",
+            "--device",
+            "cpu",
+        ]
+    )
+
+    convert(args)
+
+    with open_mmap(output) as store:
+        for record, payload in expected.items():
+            assert store[record] == payload
+            manifest = store.header.extra["runtime_assets"]["assets"]
+            assert record.removeprefix("__mfq_asset__/") in manifest
+
+
+def test_glm5_next_plan_derives_scaled_fp8_mla_for_backbone_and_mtp(tmp_path):
+    root = tmp_path / "glm5-next"
+    root.mkdir()
+    hidden = 24
+    heads = 2
+    kv_rank = 24
+    nope = 8
+    value = 12
+    expert_hidden = 24
+    text_config = {
+        "model_type": "glm5_next_text",
+        "hidden_size": hidden,
+        "num_hidden_layers": 4,
+        "num_attention_heads": heads,
+        "kv_lora_rank": kv_rank,
+        "qk_nope_head_dim": nope,
+        "v_head_dim": value,
+        "n_routed_experts": 1,
+        "num_experts_per_tok": 1,
+        "moe_intermediate_size": expert_hidden,
+        "num_nextn_predict_layers": 1,
+    }
+    tensors: dict[str, torch.Tensor] = {}
+    source_names = []
+    for layer, multiplier in ((3, 0.25), (4, 0.5)):
+        attention = f"model.language_model.layers.{layer}.self_attn"
+        source_name = attention + ".kv_b_proj.weight"
+        source_names.append(source_name)
+        source = torch.arange(
+            heads * (nope + value) * kv_rank,
+            dtype=torch.float32,
+        ).reshape(heads * (nope + value), kv_rank)
+        source = ((source % 17) - 8).to(torch.float8_e4m3fn)
+        tensors[source_name] = source
+        tensors[source_name + "_scale_inv"] = torch.tensor([[multiplier]])
+        expert = f"model.language_model.layers.{layer}.mlp.experts.0"
+        for projection, shape in (
+            ("gate_proj", (expert_hidden, hidden)),
+            ("up_proj", (expert_hidden, hidden)),
+            ("down_proj", (hidden, expert_hidden)),
+        ):
+            tensors[f"{expert}.{projection}.weight"] = torch.ones(shape)
+    save_file(tensors, root / "model.safetensors")
+    (root / "config.json").write_text(
+        json.dumps({"model_type": "glm5_next", "text_config": text_config}),
+        encoding="utf-8",
+    )
+
+    plan = build_hf_plan(root, True, None, "F16")
+    by_name = {item.name: item for item in plan}
+    for layer, multiplier in ((3, 0.25), (4, 0.5)):
+        attention = f"model.language_model.layers.{layer}.self_attn"
+        assert attention + ".kv_b_proj.weight" not in by_name
+        embed = by_name[attention + ".embed_q"]
+        unembed = by_name[attention + ".unembed_out"]
+        assert embed.expert_shape == (heads, kv_rank, nope)
+        assert unembed.expert_shape == (heads, value, kv_rank)
+        assert embed.source_quantization == "fp8_block128_inv"
+        dequantized = hf_to_mfq._raw_source_for_plan(root, embed)[:]
+        expected = tensors[source_names[layer == 4]].float() * multiplier
+        torch.testing.assert_close(dequantized, expected)
+        transformed = _transform_glm_kv_b(dequantized, embed)
+        expected_heads = expected.reshape(heads, nope + value, kv_rank)
+        torch.testing.assert_close(
+            transformed,
+            expected_heads[:, :nope].transpose(1, 2),
+        )
+
+    assert sum(name.endswith(".embed_q") for name in by_name) == 2
+    assert sum(name.endswith(".unembed_out") for name in by_name) == 2
+    assert sum(name.endswith(".experts.gate_up_proj") for name in by_name) == 2
+    assert sum(name.endswith(".experts.down_proj") for name in by_name) == 2
 
 
 def test_glm_expert_row_source_streams_across_shards(tmp_path):

@@ -31,6 +31,22 @@ def _voice_runtime_check(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _flash_next_worker(args: argparse.Namespace) -> int:
+    from mfq.runtime.flash_next_worker import run_worker
+
+    return run_worker(args)
+
+
+def _mlx_runtime_check(_args: argparse.Namespace) -> int:
+    """Touch the bundled MLX Metal runtime without loading a model."""
+    import mlx.core as mx
+
+    value = mx.array([1.0], dtype=mx.float32)
+    mx.eval(value)
+    print(json.dumps({"mlx_metal_runtime": "ready"}))
+    return 0
+
+
 def _calibrate_data(args: argparse.Namespace) -> int:
     if args.proxy:
         os.environ["HTTP_PROXY"] = args.proxy
@@ -850,6 +866,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "voice-runtime-check",
         help="verify optional MiniCPM-o voice output dependencies",
     ).set_defaults(_impl=_voice_runtime_check)
+    flash_next_worker = sub.add_parser("_flash-next-worker", help=argparse.SUPPRESS)
+    flash_next_worker.add_argument("--mfq", type=Path, required=True)
+    flash_next_worker.add_argument("--host", default="127.0.0.1")
+    flash_next_worker.add_argument("--port", type=int, required=True)
+    flash_next_worker.add_argument("--model-name", required=True)
+    flash_next_worker.add_argument("--ctx-size", dest="context_size", type=int, default=0)
+    flash_next_worker.add_argument("--prefill-chunk-size", type=int, default=2_048)
+    flash_next_worker.set_defaults(_impl=_flash_next_worker)
+    sub.add_parser("_mlx-runtime-check", help=argparse.SUPPRESS).set_defaults(
+        _impl=_mlx_runtime_check
+    )
     sub.add_parser("inspect", help="inspect an MFQ file").set_defaults(_impl=_not_implemented)
     return parser
 

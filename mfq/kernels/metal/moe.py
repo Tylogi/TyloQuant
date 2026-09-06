@@ -19,6 +19,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
         "MFQ's Metal backend requires MLX; install with `pip install -e '.[metal]'`"
     ) from exc
 
+from mfq.formats.io import view_nint_moe_blob
 from mfq.formats.moe import NintMoeTensor
 from mfq.formats.mx import MXFP4_DTYPE, MxTensor
 from mfq.formats.nepq import NepqTensor
@@ -49,6 +50,7 @@ _FAMILY_VQ = 1
 _FAMILY_NINT8_ZERO = 2
 _FAMILY_MXFP4 = 3
 _DESCRIPTOR_SIZE = 32
+_MAX_METAL_GRID_X = (1 << 31) - 1
 
 # Common descriptor fields.
 _FAMILY = 0
@@ -211,13 +213,13 @@ _GROUPED_HEADER = (
 template <typename StreamPtr>
 inline uint mfq_grouped_nint_read_bits(
     StreamPtr stream,
-    uint value_index,
+    ulong value_index,
     uint bits
 ) {
-    uint residual_bits = (value_index & 7u) * bits;
-    uint byte_index =
-        (value_index >> 3) * bits + (residual_bits >> 3);
-    uint shift = residual_bits & 7u;
+    ulong residual_bits = (value_index & 7ul) * ulong(bits);
+    ulong byte_index =
+        (value_index >> 3) * ulong(bits) + (residual_bits >> 3);
+    uint shift = uint(residual_bits & 7ul);
     uint packed = uint(stream[byte_index]);
     if (shift + bits > 8u) {
         packed |= uint(stream[byte_index + 1u]) << 8;
@@ -228,17 +230,17 @@ inline uint mfq_grouped_nint_read_bits(
 template <typename StreamPtr>
 inline uint mfq_grouped_nint_read_value(
     StreamPtr stream,
-    uint value_index,
+    ulong value_index,
     uint bits,
     uint group_size,
     uint q5_exec
 ) {
     if (q5_exec != 0u && bits == 5u) {
-        uint metadata_index = value_index / group_size;
-        uint element = value_index - metadata_index * group_size;
+        ulong metadata_index = value_index / ulong(group_size);
+        uint element = uint(value_index - metadata_index * ulong(group_size));
         uint low_bytes = (group_size + 1u) >> 1;
         uint high_bytes = (group_size + 7u) >> 3;
-        uint group_offset = metadata_index * (low_bytes + high_bytes);
+        ulong group_offset = metadata_index * ulong(low_bytes + high_bytes);
         uint low_packed = uint(stream[group_offset + (element >> 1)]);
         uint low = (low_packed >> ((element & 1u) * 4u)) & 15u;
         uint high = (
@@ -253,15 +255,15 @@ inline uint mfq_grouped_nint_read_value(
 template <typename StreamPtr>
 inline uint mfq_grouped_nint_read_octet(
     StreamPtr stream,
-    uint value_index,
+    ulong value_index,
     uint bits
 ) {
     // Eight 2/3/4-bit values occupy exactly bits bytes.  Loading that packet
     // once avoids repeating byte-address and cross-byte work for every value
     // when an MMA weight tile is materialized in threadgroup memory.
-    uint residual_bits = (value_index & 7u) * bits;
-    uint byte_index =
-        (value_index >> 3) * bits + (residual_bits >> 3);
+    ulong residual_bits = (value_index & 7ul) * ulong(bits);
+    ulong byte_index =
+        (value_index >> 3) * ulong(bits) + (residual_bits >> 3);
     uint packed = 0u;
     for (uint byte = 0u; byte < bits; ++byte) {
         packed |= uint(stream[byte_index + byte]) << (byte * 8u);
@@ -331,7 +333,7 @@ inline float mfq_grouped_decode_weight(
     MxValuePtr mx_values,
     MxScalePtr mx_scales,
     uint descriptor_base,
-    uint pool_output,
+    ulong pool_output,
     uint column,
     uint K
 ) {
@@ -342,8 +344,8 @@ inline float mfq_grouped_decode_weight(
         uint groups = uint(descriptors[descriptor_base + 6u]);
         uint group = column / groupsize;
         uint element = column - group * groupsize;
-        uint metadata_index = pool_output * groups + group;
-        uint quantized_index = metadata_index * groupsize + element;
+        ulong metadata_index = pool_output * ulong(groups) + ulong(group);
+        ulong quantized_index = metadata_index * ulong(groupsize) + ulong(element);
         uint quantized = mfq_grouped_nint_read_value(
             nint_q + uint(descriptors[descriptor_base + 7u]),
             quantized_index,
@@ -404,7 +406,7 @@ inline float mfq_grouped_decode_weight(
         vq_state_to_codebank + uint(descriptors[descriptor_base + 24u]),
         vq_banks + uint(descriptors[descriptor_base + 25u]),
         vq_parameters + uint(descriptors[descriptor_base + 26u]),
-        pool_output,
+        uint(pool_output),
         column,
         groupsize,
         groups,
@@ -492,7 +494,7 @@ _GROUPED_SOURCE = r"""
             for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
                 uint output = min(output_base + row, uint(OUT) - 1u);
                 uint pool_output = local_expert * uint(OUT) + output;
-                uint metadata_index = pool_output * groups + group;
+                ulong metadata_index = ulong(pool_output) * ulong(groups) + ulong(group);
                 outputs[row] = pool_output;
                 scales[row] =
                     nint_anchor_scale[anchor_offset + pool_output]
@@ -512,9 +514,9 @@ _GROUPED_SOURCE = r"""
                             ? float(x[x_offset + column]) : 0.0f;
                     }
                     for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
-                        uint quantized_index =
-                            (outputs[row] * groups + group) * groupsize
-                            + element;
+                        ulong quantized_index =
+                            (ulong(outputs[row]) * ulong(groups) + ulong(group))
+                            * ulong(groupsize) + ulong(element);
                         uint packed =
                             uint(nint_q[q_offset + (quantized_index >> 2)]);
                         for (
@@ -539,12 +541,12 @@ _GROUPED_SOURCE = r"""
                             ? float(x[x_offset + column]) : 0.0f;
                     }
                     for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
-                        uint quantized_index =
-                            (outputs[row] * groups + group) * groupsize
-                            + element;
-                        uint byte_index =
-                            (quantized_index >> 3) * 3u
-                            + (((quantized_index & 7u) * 3u) >> 3);
+                        ulong quantized_index =
+                            (ulong(outputs[row]) * ulong(groups) + ulong(group))
+                            * ulong(groupsize) + ulong(element);
+                        ulong byte_index =
+                            (quantized_index >> 3) * 3ul
+                            + (((quantized_index & 7ul) * 3ul) >> 3);
                         uint packed = uint(nint_q[q_offset + byte_index])
                             | (uint(nint_q[q_offset + byte_index + 1u]) << 8)
                             | (uint(nint_q[q_offset + byte_index + 2u]) << 16);
@@ -568,9 +570,9 @@ _GROUPED_SOURCE = r"""
                     float activation1 = column + 1u < uint(K)
                         ? float(x[x_offset + column + 1u]) : 0.0f;
                     for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
-                        uint quantized_index =
-                            (outputs[row] * groups + group) * groupsize
-                            + element;
+                        ulong quantized_index =
+                            (ulong(outputs[row]) * ulong(groups) + ulong(group))
+                            * ulong(groupsize) + ulong(element);
                         uint packed =
                             uint(nint_q[q_offset + (quantized_index >> 1)]);
                         accumulators[row] += activation0 * (
@@ -592,10 +594,10 @@ _GROUPED_SOURCE = r"""
                             ? float(x[x_offset + column]) : 0.0f;
                     }
                     for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
-                        uint metadata_index =
-                            outputs[row] * groups + group;
-                        uint group_offset =
-                            q_offset + metadata_index * exec_bytes;
+                        ulong metadata_index =
+                            ulong(outputs[row]) * ulong(groups) + ulong(group);
+                        ulong group_offset =
+                            ulong(q_offset) + metadata_index * ulong(exec_bytes);
                         uint high = uint(nint_q[
                             group_offset + low_bytes + (element >> 3)
                         ]);
@@ -632,12 +634,12 @@ _GROUPED_SOURCE = r"""
                             ? float(x[x_offset + column]) : 0.0f;
                     }
                     for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
-                        uint quantized_index =
-                            (outputs[row] * groups + group) * groupsize
-                            + element;
-                        uint byte_index =
-                            (quantized_index >> 3) * 6u
-                            + (((quantized_index & 7u) * 6u) >> 3);
+                        ulong quantized_index =
+                            (ulong(outputs[row]) * ulong(groups) + ulong(group))
+                            * ulong(groupsize) + ulong(element);
+                        ulong byte_index =
+                            (quantized_index >> 3) * 6ul
+                            + (((quantized_index & 7ul) * 6ul) >> 3);
                         uint packed = uint(nint_q[q_offset + byte_index])
                             | (uint(nint_q[q_offset + byte_index + 1u]) << 8)
                             | (uint(nint_q[q_offset + byte_index + 2u]) << 16);
@@ -659,9 +661,9 @@ _GROUPED_SOURCE = r"""
                     float activation = column < uint(K)
                         ? float(x[x_offset + column]) : 0.0f;
                     for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
-                        uint quantized_index =
-                            (outputs[row] * groups + group) * groupsize
-                            + element;
+                        ulong quantized_index =
+                            (ulong(outputs[row]) * ulong(groups) + ulong(group))
+                            * ulong(groupsize) + ulong(element);
                         uint quantized =
                             uint(nint_q[q_offset + quantized_index]);
                         accumulators[row] += activation * (
@@ -674,9 +676,9 @@ _GROUPED_SOURCE = r"""
                     float activation = column < uint(K)
                         ? float(x[x_offset + column]) : 0.0f;
                     for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
-                        uint quantized_index =
-                            (outputs[row] * groups + group) * groupsize
-                            + element;
+                        ulong quantized_index =
+                            (ulong(outputs[row]) * ulong(groups) + ulong(group))
+                            * ulong(groupsize) + ulong(element);
                         uint quantized = mfq_grouped_nint_read_value(
                             nint_q + q_offset,
                             quantized_index,
@@ -993,7 +995,8 @@ _GROUPED_COMPACT_SOURCE = r"""
             uint q5_exec = uint(descriptors[descriptor_base + 10u]);
 
             for (uint group = k_lane; group < groups; group += K_LANES) {
-                uint metadata_index = pool_output * groups + group;
+                ulong metadata_index =
+                    ulong(pool_output) * ulong(groups) + ulong(group);
                 float scale =
                     nint_anchor_scale[anchor_offset + pool_output]
                     * float(nint_sub_scale[sub_offset + metadata_index]);
@@ -1007,8 +1010,8 @@ _GROUPED_COMPACT_SOURCE = r"""
                         element += 2u
                     ) {
                         uint column = group * groupsize + element;
-                        uint quantized_index =
-                            metadata_index * groupsize + element;
+                        ulong quantized_index =
+                            metadata_index * ulong(groupsize) + ulong(element);
                         uint packed =
                             uint(nint_q[q_offset + (quantized_index >> 1)]);
                         float weight0 =
@@ -1040,8 +1043,8 @@ _GROUPED_COMPACT_SOURCE = r"""
                     uint low_bytes = (groupsize + 1u) >> 1;
                     uint exec_bytes =
                         low_bytes + ((groupsize + 7u) >> 3);
-                    uint group_offset =
-                        q_offset + metadata_index * exec_bytes;
+                    ulong group_offset =
+                        ulong(q_offset) + metadata_index * ulong(exec_bytes);
                     for (
                         uint element = 0u;
                         element < groupsize;
@@ -1101,8 +1104,8 @@ _GROUPED_COMPACT_SOURCE = r"""
                         if (column >= uint(K)) {
                             break;
                         }
-                        uint quantized_index =
-                            metadata_index * groupsize + element;
+                        ulong quantized_index =
+                            metadata_index * ulong(groupsize) + ulong(element);
                         uint quantized = mfq_grouped_nint_read_value(
                             nint_q + q_offset,
                             quantized_index,
@@ -1446,7 +1449,8 @@ _GROUPED_MMA_SOURCE = r"""
                 uint pool_output = local_expert * uint(OUT) + output;
                 float scale = 0.0f;
                 float minimum = 0.0f;
-                uint metadata_index = pool_output * groups + group;
+                ulong metadata_index =
+                    ulong(pool_output) * ulong(groups) + ulong(group);
                 if (valid && family == 0u) {
                     scale = nint_anchor_scale[
                         uint(descriptors[descriptor_base + 9u])
@@ -1471,7 +1475,7 @@ _GROUPED_MMA_SOURCE = r"""
                 uint nint_bits = family == 0u
                     ? uint(descriptors[descriptor_base + 4u])
                     : 0u;
-                uint quantized_base = metadata_index * groupsize;
+                ulong quantized_base = metadata_index * ulong(groupsize);
                 uint packed_octet = 0u;
                 for (
                     uint element = 0u;
@@ -1760,7 +1764,8 @@ _GROUPED_EXPERT_MMA_SOURCE = r"""
                 uint group = first_column / groupsize;
                 uint element_base = nint_element_base;
                 uint pool_output = local_expert * uint(OUT) + output;
-                uint metadata_index = pool_output * groups + group;
+                ulong metadata_index =
+                    ulong(pool_output) * ulong(groups) + ulong(group);
                 float scale = nint_anchor_scale[
                     uint(descriptors[descriptor_base + 9u]) + pool_output
                 ] * float(nint_sub_scale[
@@ -1776,7 +1781,7 @@ _GROUPED_EXPERT_MMA_SOURCE = r"""
                 );
                 uint packed_octet = mfq_grouped_nint_read_octet(
                     quantized_stream,
-                    metadata_index * groupsize + element_base,
+                    metadata_index * ulong(groupsize) + ulong(element_base),
                     nint_bits
                 );
                 uint mask = (1u << nint_bits) - 1u;
@@ -2166,6 +2171,103 @@ class MetalMoeWeight:
     out_per_expert: int
     neuron_len: int
     projections: int
+
+    @classmethod
+    def from_blob(cls, blob: bytes | memoryview) -> MetalMoeWeight:
+        """Upload an all-NINT NIM2 tensor without expanding its q bitstreams."""
+
+        shape, pools = view_nint_moe_blob(blob)
+        experts, out_per_expert, neuron_len = shape
+        descriptors = np.zeros((experts, _DESCRIPTOR_SIZE), dtype=np.int32)
+        weights: list[MetalNintWeight] = []
+        q_offset = 0
+        sub_offset = 0
+        anchor_offset = 0
+        for pool in pools:
+            if not (pool.dtype.startswith("NINT") and pool.dtype[4:].isdigit()):
+                raise UnsupportedGroupedMoeError(
+                    "zero-expand NINTM loading currently requires all-NINT cohorts"
+                )
+            if len(pool.runtime_payload):
+                raise ValueError("NINT cohorts cannot carry NINTM runtime metadata")
+            weight = MetalNintWeight.from_blob(pool.tensor_payload)
+            expert_ids = np.asarray(pool.expert_ids, dtype=np.int32).reshape(-1)
+            if (
+                weight.out != expert_ids.size * out_per_expert
+                or weight.neuron_len != neuron_len
+            ):
+                raise ValueError("NINTM NINT cohort dimensions are inconsistent")
+            for local_expert, expert in enumerate(expert_ids):
+                descriptor = descriptors[int(expert)]
+                descriptor[_FAMILY] = _FAMILY_NINT
+                descriptor[_LOCAL_EXPERT] = local_expert
+                descriptor[_OUT] = out_per_expert
+                descriptor[_K] = neuron_len
+                descriptor[_NINT_BITS] = weight.bits
+                descriptor[_NINT_GS] = weight.groupsize
+                descriptor[_NINT_NG] = weight.groups
+                descriptor[_NINT_Q_OFFSET] = q_offset
+                descriptor[_NINT_SUB_OFFSET] = sub_offset
+                descriptor[_NINT_ANCHOR_OFFSET] = anchor_offset
+                descriptor[_NINT_Q5_EXEC] = int(weight.q5_exec)
+            weights.append(weight)
+            q_offset += _size(weight.q_packed)
+            sub_offset += _size(weight.sub_scale)
+            anchor_offset += _size(weight.neuron_scale)
+
+        if len(weights) == 1:
+            # Shape is irrelevant to Metal pointer access.  Preserve the safe
+            # two-dimensional representation used for buffers above INT32_MAX.
+            nint_q = mx.contiguous(weights[0].q_packed)
+        else:
+            if q_offset > (1 << 31) - 1:
+                raise UnsupportedGroupedMoeError(
+                    "multi-cohort NINTM packed buffers above INT32_MAX require sharding"
+                )
+            nint_q = _join([weight.q_packed for weight in weights], dtype=mx.uint8)
+
+        return cls(
+            descriptors=mx.array(descriptors),
+            nint_q=nint_q,
+            nint_sub_scale=_join(
+                [weight.sub_scale for weight in weights],
+                dtype=mx.uint8,
+            ),
+            nint_sub_min=_join(
+                [weight.sub_min for weight in weights],
+                dtype=mx.uint8,
+            ),
+            nint_anchor_scale=_join(
+                [weight.neuron_scale for weight in weights],
+                dtype=mx.float32,
+            ),
+            nint_anchor_min=_join(
+                [weight.neuron_min for weight in weights],
+                dtype=mx.float32,
+            ),
+            q8_q=_join([], dtype=mx.int8),
+            q8_scales=_join([], dtype=mx.float16),
+            vq_indices=_join([], dtype=mx.uint8, padding=2),
+            vq_state=_join([], dtype=mx.uint8, padding=2),
+            vq_aux=_join([], dtype=mx.uint8, padding=2),
+            vq_anchors=_join([], dtype=mx.float32),
+            vq_codebooks=_join([], dtype=mx.int8),
+            vq_scales=_join([], dtype=mx.float32),
+            vq_state_to_codebank=_join([], dtype=mx.uint8),
+            vq_banks=_join([], dtype=mx.uint8),
+            vq_parameters=_join([], dtype=mx.float32),
+            mx_values=_join([], dtype=mx.uint8),
+            mx_scales=_join([], dtype=mx.uint8),
+            residual_codebooks=_join([], dtype=mx.float16),
+            residual_first=_join([], dtype=mx.int16),
+            residual_second=_join([], dtype=mx.int16),
+            descriptor_values=descriptors,
+            rotation_specs=(),
+            experts=experts,
+            out_per_expert=out_per_expert,
+            neuron_len=neuron_len,
+            projections=1,
+        )
 
     @classmethod
     def from_tensor(cls, tensor: NintMoeTensor) -> MetalMoeWeight:
@@ -2647,6 +2749,42 @@ def grouped_moe_matmul(
             dtype=source.dtype,
         )
 
+    route_count = tokens * routes
+    # MLX's fast Metal-kernel ABI represents grid dimensions as signed
+    # 32-bit integers.  Head-wise absorbed MLA can flatten a long prompt into
+    # millions of routes, overflowing grid.x before the kernel is launched.
+    # Chunk by complete token rows so route order and expert ownership remain
+    # unchanged.  The direct-kernel bound is conservative for compact/MMA.
+    maximum_grid_x = _MAX_METAL_GRID_X
+    threads_per_route = (
+        weight.projections * ((weight.out_per_expert + 7) // 8) * 64
+    )
+    maximum_routes = maximum_grid_x // threads_per_route
+    profiles = weight.descriptor_values[:, _VQ_PROFILE]
+    if bool(np.any((profiles >> 8) != 0)):
+        maximum_residual_outputs = (maximum_grid_x // 128) * 4
+        maximum_routes = min(
+            maximum_routes,
+            maximum_residual_outputs
+            // (weight.projections * weight.out_per_expert),
+        )
+    if route_count > maximum_routes:
+        chunk_tokens = maximum_routes // routes
+        if chunk_tokens <= 0:
+            raise OverflowError("Metal routed output width exceeds the launch-grid limit")
+        chunks = [
+            grouped_moe_matmul(
+                weight,
+                source[start : min(start + chunk_tokens, tokens)],
+                ids[start : min(start + chunk_tokens, tokens)],
+                compact_threshold=compact_threshold,
+                matrix_threshold=matrix_threshold,
+                expert_matrix_threshold=expert_matrix_threshold,
+            )
+            for start in range(0, tokens, chunk_tokens)
+        ]
+        return mx.concatenate(chunks, axis=0)
+
     if weight.rotation_specs:
         flattened = source.reshape((tokens * routes, weight.neuron_len))
         variants = [source]
@@ -2716,7 +2854,6 @@ def grouped_moe_matmul(
         weight.mx_values,
         weight.mx_scales,
     ]
-    route_count = tokens * routes
     descriptor_families = weight.descriptor_values[:, _FAMILY]
     only_low_bit_nint = bool(
         np.all(descriptor_families == _FAMILY_NINT)

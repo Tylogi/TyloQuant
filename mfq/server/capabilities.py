@@ -58,6 +58,16 @@ _REGISTRY = (
         aliases=("qwen3_5", "qwen3_5_text"),
         features=ModelFeatureSet(),
     ),
+    _CapabilityRegistration(
+        family="qwen4_exp",
+        aliases=("qwen4_exp", "qwen4_exp_text"),
+        features=ModelFeatureSet(text=True, image_input=True, video_input=True),
+    ),
+    _CapabilityRegistration(
+        family="glm5_next",
+        aliases=("glm5_next", "glm5_next_text"),
+        features=ModelFeatureSet(text=True, image_input=True, video_input=True),
+    ),
 )
 
 

@@ -242,6 +242,21 @@ export interface RuntimeStatus {
   prefix_cache_max_sessions?: number;
   prefix_cache_max_snapshots_per_session?: number;
   prefix_cache_max_bytes?: number;
+  prefix_cache_disk_blocks?: number;
+  prefix_cache_disk_bytes?: number;
+  prefix_cache_disk_max_bytes?: number;
+  prefix_cache_hot_blocks?: number;
+  prefix_cache_hot_bytes?: number;
+  prefix_cache_pending_writes?: number;
+  prefix_cache_pending_bytes?: number;
+  prefix_cache_pending_max_bytes?: number;
+  prefix_cache_writes?: number;
+  prefix_cache_deduplicated_writes?: number;
+  prefix_cache_disk_hits?: number;
+  prefix_cache_hot_hits?: number;
+  prefix_cache_evictions?: number;
+  prefix_cache_corrupt_blocks?: number;
+  prefix_cache_mode?: string;
   sampling_defaults?: Partial<SamplingParams>;
   duplex_sampling_defaults?: {
     system_prompt?: string;
@@ -313,6 +328,8 @@ export interface RuntimeInstance {
   context_size?: number | null;
   started_at?: string | null;
   last_used_at?: string | null;
+  idle_ttl_seconds?: number | null;
+  pinned?: boolean;
   error?: ApiErrorBody["error"] | null;
 }
 
@@ -331,6 +348,11 @@ export interface RuntimeProfile {
     prefix_cache_max_sessions?: number | null;
     prefix_cache_max_snapshots_per_session?: number | null;
     prefix_cache_max_bytes?: number | null;
+    prefix_cache_enabled?: boolean;
+    prefix_cache_disk_bytes?: number | null;
+    prefix_cache_hot_bytes?: number | null;
+    prefix_cache_block_tokens?: number | null;
+    prefix_cache_pending_bytes?: number | null;
     sampling_defaults?: SamplingParams | null;
   };
   artifact_id: string;
@@ -982,6 +1004,7 @@ export const api = {
     model: string,
     contextSize: number,
     prefillChunkSize = 2048,
+    policy: { pin?: boolean; idle_ttl_seconds?: number | null } = {},
   ): Promise<{ operation_id: string; status: "accepted" }> {
     return request("/api/v1/models/load", {
       method: "POST",
@@ -989,6 +1012,8 @@ export const api = {
         model,
         context_size: contextSize,
         prefill_chunk_size: prefillChunkSize,
+        pin: policy.pin ?? false,
+        idle_ttl_seconds: policy.pin ? null : (policy.idle_ttl_seconds ?? null),
       }),
     });
   },

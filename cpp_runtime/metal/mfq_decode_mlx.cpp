@@ -9,7 +9,9 @@
 #include "../json/nlohmann/json.hpp"
 
 #ifdef MFQ_METAL_SERVER
+#include "../mfq_paged_prefix_cache.h"
 #include "../mfq_server.h"
+#include "mlx_paged_session_codec.h"
 #endif
 
 #include <algorithm>
@@ -352,20 +354,152 @@ void self_test_metal() {
 }
 
 #ifdef MFQ_METAL_SERVER
+std::uint64_t cache_bytes_from_environment(
+    const char* name,
+    std::uint64_t fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') return fallback;
+    char* end = nullptr;
+    const auto parsed = std::strtoull(value, &end, 10);
+    if (end == value || *end != '\0') {
+        throw std::runtime_error(std::string("invalid ") + name);
+    }
+    return parsed;
+}
+
+std::filesystem::path default_prefix_cache_directory() {
+    if (const char* configured =
+            std::getenv("MFQ_SERVER_PREFIX_CACHE_DIR")) {
+        if (configured[0] != '\0') return configured;
+    }
+    if (const char* home = std::getenv("HOME")) {
+        if (home[0] != '\0') {
+            return std::filesystem::path(home) / "Library" / "Caches" /
+                "TyloQuant" / "MFQ" / "prefix-cache";
+        }
+    }
+    return std::filesystem::temp_directory_path() /
+        "tyloquant-mfq-prefix-cache";
+}
+
+std::string metal_prefix_cache_compatibility_key(
+    const mfq::metal::MfqContainer& container,
+    std::string_view codec,
+    std::int64_t context_size) {
+    std::vector<const mfq::metal::MfqRecord*> records;
+    records.reserve(container.records().size());
+    for (const auto& [name, record] : container.records()) {
+        (void)name;
+        records.push_back(&record);
+    }
+    std::sort(
+        records.begin(), records.end(),
+        [](const auto* left, const auto* right) {
+            return left->name < right->name;
+        });
+
+    std::ostringstream key;
+    key << "mfq-metal-prefix-v1\n"
+        << "codec=" << codec << '\n'
+        << "context=" << context_size << '\n'
+        << "header=" << container.header().version << '\n'
+        << "architecture=" << container.header().architecture << '\n';
+    for (std::size_t index = 0;
+         index < container.source_paths().size(); ++index) {
+        const auto& path = container.source_paths()[index];
+        std::error_code error;
+        const auto size = std::filesystem::file_size(path, error);
+        if (error) {
+            throw std::runtime_error(
+                "cannot identify MFQ shard for prefix cache: " +
+                error.message());
+        }
+        const auto modified = std::filesystem::last_write_time(path, error);
+        if (error) {
+            throw std::runtime_error(
+                "cannot identify MFQ shard timestamp: " +
+                error.message());
+        }
+        const auto modified_ns = std::chrono::duration_cast<
+            std::chrono::nanoseconds>(modified.time_since_epoch()).count();
+        key << "shard=" << index << ':' << path.filename().string() << ':'
+            << size << ':' << modified_ns << '\n';
+    }
+    for (const auto* record : records) {
+        key << "tensor=" << record->name << ':' << record->dtype << ':'
+            << record->offset << ':' << record->nbytes << '\n';
+    }
+    return key.str();
+}
+
+template <typename Runtime>
+std::shared_ptr<mfq::cache::PagedPrefixCache> make_metal_paged_cache(
+    const mfq::metal::MfqContainer& container,
+    std::int64_t context_size) {
+    using SessionState = decltype(
+        std::declval<const Runtime&>().capture_text_session_state(
+            std::declval<const std::vector<std::int64_t>&>()));
+    using Codec = mfq::metal::MlxPagedSessionCodec<SessionState>;
+    if constexpr (!Codec::available) {
+        (void)container;
+        (void)context_size;
+        return {};
+    } else {
+        if (const char* disabled =
+                std::getenv("MFQ_SERVER_DISABLE_PREFIX_CACHE")) {
+            if (disabled[0] == '1') return {};
+        }
+        const auto block_size = cache_bytes_from_environment(
+            "MFQ_SERVER_PREFIX_CACHE_BLOCK_TOKENS", 256);
+        if (block_size == 0 || block_size > 65536) {
+            throw std::runtime_error(
+                "MFQ_SERVER_PREFIX_CACHE_BLOCK_TOKENS must be in [1, 65536]");
+        }
+        mfq::cache::PagedPrefixCacheConfig config;
+        config.cache_dir = default_prefix_cache_directory();
+        config.compatibility_key = metal_prefix_cache_compatibility_key(
+            container, Codec::name, context_size);
+        config.block_size_tokens = static_cast<std::size_t>(block_size);
+        config.max_disk_bytes = cache_bytes_from_environment(
+            "MFQ_SERVER_PREFIX_CACHE_DISK_BYTES",
+            100ULL * 1024ULL * 1024ULL * 1024ULL);
+        config.max_hot_bytes = cache_bytes_from_environment(
+            "MFQ_SERVER_PREFIX_CACHE_HOT_BYTES",
+            2ULL * 1024ULL * 1024ULL * 1024ULL);
+        config.max_pending_writes = static_cast<std::size_t>(
+            cache_bytes_from_environment(
+                "MFQ_SERVER_PREFIX_CACHE_PENDING_WRITES", 64));
+        config.max_pending_bytes = cache_bytes_from_environment(
+            "MFQ_SERVER_PREFIX_CACHE_PENDING_BYTES",
+            512ULL * 1024ULL * 1024ULL);
+        return std::make_shared<mfq::cache::PagedPrefixCache>(
+            std::move(config));
+    }
+}
+
 template <typename Runtime>
 class MlxServerTextSessionCache {
 private:
     using SessionState = decltype(
         std::declval<const Runtime&>().capture_text_session_state(
             std::declval<const std::vector<std::int64_t>&>()));
+    using Codec = mfq::metal::MlxPagedSessionCodec<SessionState>;
 
     struct Entry {
         SessionState state;
         std::uint64_t last_used = 0;
     };
 
+    struct PagedBinding {
+        std::vector<mfq::cache::BlockHash> blocks;
+        std::size_t tokens = 0;
+        std::uint64_t last_used = 0;
+    };
+
 public:
-    MlxServerTextSessionCache() {
+    explicit MlxServerTextSessionCache(
+        std::shared_ptr<mfq::cache::PagedPrefixCache> paged_cache = {})
+        : paged_cache_(std::move(paged_cache)) {
         if (const char* value =
                 std::getenv("MFQ_SERVER_MAX_KV_SESSIONS")) {
             max_sessions_ = static_cast<std::size_t>(
@@ -385,6 +519,14 @@ public:
                 std::getenv("MFQ_SERVER_TRACE_SESSION_CACHE")) {
             trace_ = value[0] == '1';
         }
+        if (paged_cache_) {
+            paged_disk_budget_ = cache_bytes_from_environment(
+                "MFQ_SERVER_PREFIX_CACHE_DISK_BYTES",
+                100ULL * 1024ULL * 1024ULL * 1024ULL);
+            paged_hot_budget_ = cache_bytes_from_environment(
+                "MFQ_SERVER_PREFIX_CACHE_HOT_BYTES",
+                2ULL * 1024ULL * 1024ULL * 1024ULL);
+        }
     }
 
     std::size_t restore_best(
@@ -392,6 +534,15 @@ public:
         const std::string& requested_session,
         const std::vector<std::int64_t>& prompt,
         std::size_t maximum_prefix_tokens) {
+        if constexpr (Codec::available) {
+            if (paged_cache_) {
+                return restore_paged(
+                    runtime,
+                    requested_session,
+                    prompt,
+                    maximum_prefix_tokens);
+            }
+        }
         if (requested_session.empty() || max_sessions_ == 0 ||
             max_snapshots_per_session_ == 0 || max_bytes_ == 0 ||
             !runtime.supports_text_session_state()) {
@@ -441,6 +592,7 @@ public:
         } catch (const std::exception& error) {
             erase_snapshot(
                 selected_session, selected_snapshot, "invalidate");
+            reset_runtime(runtime);
             std::cerr
                 << "server_session_cache backend=metal action=invalidate "
                 << "session=" << selected_session
@@ -450,6 +602,12 @@ public:
     }
 
     void store(const std::string& session_id, SessionState state) {
+        if constexpr (Codec::available) {
+            if (paged_cache_) {
+                store_paged(session_id, state);
+                return;
+            }
+        }
         if (session_id.empty() || max_sessions_ == 0 ||
             max_snapshots_per_session_ == 0 || max_bytes_ == 0) {
             return;
@@ -513,6 +671,21 @@ public:
     std::size_t fork_session(
         const std::string& source_session,
         const std::string& target_session) {
+        if constexpr (Codec::available) {
+            if (paged_cache_) {
+                const auto source = paged_bindings_.find(source_session);
+                if (source == paged_bindings_.end() ||
+                    source_session.empty() || target_session.empty() ||
+                    source_session == target_session) {
+                    return 0;
+                }
+                bind_paged_session(
+                    target_session,
+                    source->second.blocks,
+                    source->second.tokens);
+                return source->second.blocks.size();
+            }
+        }
         if (source_session.empty() || target_session.empty() ||
             source_session == target_session || max_sessions_ == 0 ||
             max_snapshots_per_session_ == 0 || max_bytes_ == 0) {
@@ -547,6 +720,9 @@ public:
     }
 
     std::size_t close_session(const std::string& session_id) {
+        if constexpr (Codec::available) {
+            if (paged_cache_) return close_paged_session(session_id);
+        }
         auto found = states_.find(session_id);
         if (found == states_.end()) return 0;
         const std::size_t released = found->second.size();
@@ -568,6 +744,37 @@ public:
     }
 
     std::vector<std::pair<std::string, double>> metrics() const {
+        if constexpr (Codec::available) {
+            if (paged_cache_) {
+                const auto value = paged_cache_->metrics();
+                return {
+                    {"prefix_cache_queries", static_cast<double>(value.queries)},
+                    {"prefix_cache_hits", static_cast<double>(value.hits)},
+                    {"prefix_cache_hit_tokens", static_cast<double>(value.hit_tokens)},
+                    {"prefix_cache_sessions", static_cast<double>(metric_sessions_.load())},
+                    {"prefix_cache_snapshots", static_cast<double>(value.disk_blocks)},
+                    {"prefix_cache_tokens", static_cast<double>(metric_tokens_.load())},
+                    {"prefix_cache_bytes", static_cast<double>(value.hot_bytes)},
+                    {"prefix_cache_max_sessions", static_cast<double>(max_sessions_)},
+                    {"prefix_cache_max_snapshots_per_session", 1.0},
+                    {"prefix_cache_max_bytes", static_cast<double>(paged_hot_budget_)},
+                    {"prefix_cache_disk_blocks", static_cast<double>(value.disk_blocks)},
+                    {"prefix_cache_disk_bytes", static_cast<double>(value.disk_bytes)},
+                    {"prefix_cache_disk_max_bytes", static_cast<double>(paged_disk_budget_)},
+                    {"prefix_cache_hot_blocks", static_cast<double>(value.hot_blocks)},
+                    {"prefix_cache_hot_bytes", static_cast<double>(value.hot_bytes)},
+                    {"prefix_cache_pending_writes", static_cast<double>(value.pending_writes)},
+                    {"prefix_cache_pending_bytes", static_cast<double>(value.pending_bytes)},
+                    {"prefix_cache_pending_max_bytes", static_cast<double>(value.pending_max_bytes)},
+                    {"prefix_cache_writes", static_cast<double>(value.writes)},
+                    {"prefix_cache_deduplicated_writes", static_cast<double>(value.deduplicated_writes)},
+                    {"prefix_cache_disk_hits", static_cast<double>(value.disk_hits)},
+                    {"prefix_cache_hot_hits", static_cast<double>(value.hot_hits)},
+                    {"prefix_cache_evictions", static_cast<double>(value.evictions)},
+                    {"prefix_cache_corrupt_blocks", static_cast<double>(value.corrupt_blocks)},
+                };
+            }
+        }
         return {
             {"prefix_cache_queries", static_cast<double>(queries_.load())},
             {"prefix_cache_hits", static_cast<double>(hits_.load())},
@@ -583,7 +790,19 @@ public:
         };
     }
 
-    std::size_t clear() noexcept {
+    std::size_t clear_live_sessions() noexcept {
+        if constexpr (Codec::available) {
+            if (paged_cache_) {
+                const auto sessions = paged_bindings_.size();
+                for (const auto& [session, binding] : paged_bindings_) {
+                    (void)session;
+                    paged_cache_->unpin(binding.blocks);
+                }
+                paged_bindings_.clear();
+                sync_paged_telemetry();
+                return sessions;
+            }
+        }
         std::size_t snapshots = 0;
         for (const auto& [session_id, history] : states_) {
             (void)session_id;
@@ -595,7 +814,192 @@ public:
         return snapshots;
     }
 
+    std::size_t clear() {
+        if constexpr (Codec::available) {
+            if (paged_cache_) {
+                clear_live_sessions();
+                return paged_cache_->clear();
+            }
+        }
+        return clear_live_sessions();
+    }
+
+    void replace_paged_cache(
+        std::shared_ptr<mfq::cache::PagedPrefixCache> cache,
+        std::uint64_t disk_budget,
+        std::uint64_t hot_budget) {
+        clear_live_sessions();
+        paged_cache_ = std::move(cache);
+        paged_disk_budget_ = disk_budget;
+        paged_hot_budget_ = hot_budget;
+        sync_paged_telemetry();
+    }
+
 private:
+    static void reset_runtime(Runtime& runtime) {
+        if constexpr (requires { runtime.reset_cache(1); }) {
+            runtime.reset_cache(1);
+        } else if constexpr (requires { runtime.reset(); }) {
+            runtime.reset();
+        }
+    }
+
+    std::size_t restore_paged(
+        Runtime& runtime,
+        const std::string& requested_session,
+        const std::vector<std::int64_t>& prompt,
+        std::size_t maximum_prefix_tokens) {
+        if (requested_session.empty() || max_sessions_ == 0 ||
+            !runtime.supports_text_session_state() || prompt.size() < 2) {
+            return 0;
+        }
+        const auto limit = std::min(
+            maximum_prefix_tokens, prompt.size() - 1);
+        std::vector<std::int64_t> candidate(
+            prompt.begin(),
+            prompt.begin() + static_cast<std::ptrdiff_t>(limit));
+        auto match = paged_cache_->match(candidate);
+        if (match.matched_tokens == 0) return 0;
+
+        std::vector<std::vector<std::uint8_t>> payloads;
+        payloads.reserve(match.blocks.size());
+        for (std::size_t index = 0; index < match.blocks.size(); ++index) {
+            auto payload = paged_cache_->load(match.blocks[index]);
+            if (!payload) {
+                match.blocks.resize(index);
+                match.matched_tokens =
+                    index * paged_cache_->block_size_tokens();
+                break;
+            }
+            payloads.push_back(std::move(*payload));
+        }
+        if (payloads.empty()) return 0;
+        if (payloads.size() != match.blocks.size()) {
+            payloads.resize(match.blocks.size());
+        }
+        std::vector<std::int64_t> matched_tokens(
+            prompt.begin(),
+            prompt.begin() + static_cast<std::ptrdiff_t>(
+                match.matched_tokens));
+        try {
+            auto state = Codec::decode(
+                payloads,
+                matched_tokens,
+                paged_cache_->block_size_tokens());
+            runtime.restore_text_session_state(state);
+            bind_paged_session(
+                requested_session, match.blocks, match.matched_tokens);
+            if (trace_) {
+                std::cerr
+                    << "server_session_cache backend=metal action=paged_hit "
+                    << "session=" << requested_session
+                    << " reused_tokens=" << match.matched_tokens
+                    << " prefill_tokens="
+                    << prompt.size() - match.matched_tokens << std::endl;
+            }
+            return match.matched_tokens;
+        } catch (const std::exception& error) {
+            reset_runtime(runtime);
+            std::cerr
+                << "server_session_cache backend=metal action=paged_invalidate "
+                << "session=" << requested_session
+                << " error=" << error.what() << std::endl;
+            return 0;
+        }
+    }
+
+    void store_paged(
+        const std::string& session_id,
+        const SessionState& state) {
+        if (session_id.empty() || max_sessions_ == 0 ||
+            state.tokens.empty()) {
+            return;
+        }
+        const auto block_size = paged_cache_->block_size_tokens();
+        const auto full_blocks = state.tokens.size() / block_size;
+        if (full_blocks == 0) return;
+
+        auto existing = paged_cache_->match(state.tokens, {}, false);
+        if (existing.blocks.size() > full_blocks) {
+            throw std::runtime_error(
+                "paged prefix match exceeds the session state");
+        }
+        const auto first_block = existing.blocks.size();
+        auto payloads = Codec::encode(
+            state, block_size, first_block);
+        if (payloads.size() != full_blocks - first_block) {
+            throw std::runtime_error(
+                "paged Metal session codec returned the wrong block count");
+        }
+        auto blocks = std::move(existing.blocks);
+        mfq::cache::BlockHash parent{};
+        if (!blocks.empty()) parent = blocks.back();
+        for (std::size_t index = blocks.size(); index < full_blocks; ++index) {
+            const auto token_offset = index * block_size;
+            parent = paged_cache_->store(
+                parent,
+                state.tokens.data() + token_offset,
+                block_size,
+                payloads[index - first_block]);
+            blocks.push_back(parent);
+        }
+        bind_paged_session(
+            session_id,
+            std::move(blocks),
+            full_blocks * block_size);
+        if (trace_) {
+            std::cerr
+                << "server_session_cache backend=metal action=paged_store "
+                << "session=" << session_id
+                << " tokens=" << full_blocks * block_size
+                << " blocks=" << full_blocks << std::endl;
+        }
+    }
+
+    void bind_paged_session(
+        const std::string& session_id,
+        std::vector<mfq::cache::BlockHash> blocks,
+        std::size_t tokens) {
+        close_paged_session(session_id);
+        paged_cache_->pin(blocks);
+        paged_bindings_[session_id] = PagedBinding{
+            std::move(blocks), tokens, ++clock_};
+        while (paged_bindings_.size() > max_sessions_) {
+            auto victim = paged_bindings_.end();
+            for (auto iterator = paged_bindings_.begin();
+                 iterator != paged_bindings_.end(); ++iterator) {
+                if (iterator->first == session_id) continue;
+                if (victim == paged_bindings_.end() ||
+                    iterator->second.last_used < victim->second.last_used) {
+                    victim = iterator;
+                }
+            }
+            if (victim == paged_bindings_.end()) break;
+            close_paged_session(victim->first);
+        }
+        sync_paged_telemetry();
+    }
+
+    std::size_t close_paged_session(const std::string& session_id) {
+        auto found = paged_bindings_.find(session_id);
+        if (found == paged_bindings_.end()) return 0;
+        const auto blocks = found->second.blocks.size();
+        paged_cache_->unpin(found->second.blocks);
+        paged_bindings_.erase(found);
+        sync_paged_telemetry();
+        return blocks;
+    }
+
+    void sync_paged_telemetry() noexcept {
+        std::size_t tokens = 0;
+        for (const auto& [session, binding] : paged_bindings_) {
+            (void)session;
+            tokens += binding.tokens;
+        }
+        metric_sessions_.store(paged_bindings_.size());
+        metric_tokens_.store(tokens);
+    }
+
     void sync_telemetry() noexcept {
         std::size_t snapshots = 0;
         std::size_t tokens = 0;
@@ -704,6 +1108,10 @@ private:
     }
 
     std::unordered_map<std::string, std::vector<Entry>> states_;
+    std::unordered_map<std::string, PagedBinding> paged_bindings_;
+    std::shared_ptr<mfq::cache::PagedPrefixCache> paged_cache_;
+    std::uint64_t paged_disk_budget_ = 0;
+    std::uint64_t paged_hot_budget_ = 0;
     std::size_t max_sessions_ = 4;
     std::size_t max_snapshots_per_session_ = 4;
     std::size_t max_bytes_ = 2ULL * 1024ULL * 1024ULL * 1024ULL;
@@ -888,8 +1296,16 @@ int serve_loaded_runtime(
     auto runtime_holder =
         std::make_shared<std::optional<Runtime>>(
             std::move(runtime));
+    const auto paged_cache_factory =
+        [container](std::int64_t context_size)
+            -> std::shared_ptr<mfq::cache::PagedPrefixCache> {
+            if (container == nullptr) return {};
+            return make_metal_paged_cache<Runtime>(
+                *container, context_size);
+        };
     auto session_cache =
-        std::make_shared<MlxServerTextSessionCache<Runtime>>();
+        std::make_shared<MlxServerTextSessionCache<Runtime>>(
+            paged_cache_factory(server.max_context));
     auto loaded_context =
         std::make_shared<std::int64_t>(server.max_context);
     const MfqGenerateFn generate =
@@ -1220,7 +1636,7 @@ int serve_loaded_runtime(
     }
     const MfqReloadFn reload =
         [runtime_mutex, runtime_holder, loaded_context, session_cache,
-         load_runtime, runtime_stream](
+         load_runtime, paged_cache_factory, runtime_stream](
             std::int64_t requested_context) mutable {
             std::lock_guard<std::mutex> lock(*runtime_mutex);
             mlx::core::set_default_device(
@@ -1229,7 +1645,7 @@ int serve_loaded_runtime(
             mlx::core::synchronize();
 
             const auto previous_context = *loaded_context;
-            session_cache->clear();
+            session_cache->clear_live_sessions();
             runtime_holder->reset();
             release_model_load_staging_memory();
             const auto started =
@@ -1240,6 +1656,14 @@ int serve_loaded_runtime(
             try {
                 runtime_holder->emplace(
                     load_runtime(requested_context));
+                session_cache->replace_paged_cache(
+                    paged_cache_factory(requested_context),
+                    cache_bytes_from_environment(
+                        "MFQ_SERVER_PREFIX_CACHE_DISK_BYTES",
+                        100ULL * 1024ULL * 1024ULL * 1024ULL),
+                    cache_bytes_from_environment(
+                        "MFQ_SERVER_PREFIX_CACHE_HOT_BYTES",
+                        2ULL * 1024ULL * 1024ULL * 1024ULL));
                 release_model_load_staging_memory();
                 *loaded_context = requested_context;
                 const auto seconds =
@@ -1259,6 +1683,14 @@ int serve_loaded_runtime(
                 try {
                     runtime_holder->emplace(
                         load_runtime(previous_context));
+                    session_cache->replace_paged_cache(
+                        paged_cache_factory(previous_context),
+                        cache_bytes_from_environment(
+                            "MFQ_SERVER_PREFIX_CACHE_DISK_BYTES",
+                            100ULL * 1024ULL * 1024ULL * 1024ULL),
+                        cache_bytes_from_environment(
+                            "MFQ_SERVER_PREFIX_CACHE_HOT_BYTES",
+                            2ULL * 1024ULL * 1024ULL * 1024ULL));
                     release_model_load_staging_memory();
                     *loaded_context = previous_context;
                 } catch (const std::exception& restore_error) {

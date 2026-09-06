@@ -2899,6 +2899,48 @@
             "title": "Prefill Chunk Size",
             "type": "integer"
           },
+          "prefix_cache_block_tokens": {
+            "anyOf": [
+              {
+                "maximum": 65536.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Cache Block Tokens"
+          },
+          "prefix_cache_disk_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Cache Disk Bytes"
+          },
+          "prefix_cache_enabled": {
+            "default": true,
+            "title": "Prefix Cache Enabled",
+            "type": "boolean"
+          },
+          "prefix_cache_hot_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Cache Hot Bytes"
+          },
           "prefix_cache_max_bytes": {
             "anyOf": [
               {
@@ -2934,6 +2976,18 @@
               }
             ],
             "title": "Prefix Cache Max Snapshots Per Session"
+          },
+          "prefix_cache_pending_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Cache Pending Bytes"
           },
           "sampling_defaults": {
             "anyOf": [
@@ -4206,6 +4260,18 @@
               }
             ]
           },
+          "idle_ttl_seconds": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idle Ttl Seconds"
+          },
           "kv_bytes": {
             "anyOf": [
               {
@@ -4233,6 +4299,11 @@
           "model": {
             "title": "Model",
             "type": "string"
+          },
+          "pinned": {
+            "default": false,
+            "title": "Pinned",
+            "type": "boolean"
           },
           "queued_requests": {
             "minimum": 0.0,

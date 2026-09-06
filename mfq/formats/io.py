@@ -281,6 +281,94 @@ class NintMoePoolMetadata:
     nint_spec: NintSpec | None
 
 
+@dataclass(frozen=True)
+class NintMoePoolBlob:
+    """Zero-copy view of one NIM2 cohort payload.
+
+    The returned memoryviews borrow the lifetime of the input blob.  This is
+    primarily used by deployment runtimes so multi-gigabyte expert tensors can
+    stay bit-packed instead of passing through :func:`unpack_nint_moe`.
+    """
+
+    expert_ids: np.ndarray
+    dtype: str
+    runtime_payload: memoryview
+    tensor_payload: memoryview
+
+
+def view_nint_moe_blob(
+    blob: bytes | memoryview,
+) -> tuple[tuple[int, int, int], tuple[NintMoePoolBlob, ...]]:
+    """Return validated zero-copy cohort views for a NIM2 container."""
+
+    view = blob if isinstance(blob, memoryview) else memoryview(blob)
+    if len(view) < _NINT_MOE_HDR.size:
+        raise ValueError("truncated NINTM header")
+    magic, n_experts, out_per_expert, neuron_len, pool_count = (
+        _NINT_MOE_HDR.unpack_from(view, 0)
+    )
+    if magic != _NINT_MOE_MAGIC_V2:
+        raise ValueError("NINTM blob views require the NIM2 format")
+    if pool_count == 0 or pool_count > n_experts:
+        raise ValueError("invalid NINTM pool count")
+
+    off = _NINT_MOE_HDR.size
+    owners = np.full(int(n_experts), -1, dtype=np.int32)
+    pools: list[NintMoePoolBlob] = []
+    for pool_index in range(int(pool_count)):
+        if off + _NINT_MOE_POOL_V2_HDR.size > len(view):
+            raise ValueError("truncated NINTM v2 pool header")
+        expert_count, dtype_nbytes, payload_nbytes, runtime_nbytes = (
+            _NINT_MOE_POOL_V2_HDR.unpack_from(view, off)
+        )
+        off += _NINT_MOE_POOL_V2_HDR.size
+        if expert_count == 0 or dtype_nbytes == 0 or dtype_nbytes > 32:
+            raise ValueError("invalid NINTM v2 pool metadata")
+        ids_nbytes = int(expert_count) * np.dtype(np.int32).itemsize
+        dtype_end = off + ids_nbytes + int(dtype_nbytes)
+        runtime_end = dtype_end + int(runtime_nbytes)
+        payload_end = runtime_end + int(payload_nbytes)
+        if payload_end > len(view):
+            raise ValueError("truncated NINTM v2 pool payload")
+        expert_ids = np.frombuffer(
+            view,
+            dtype=np.int32,
+            count=int(expert_count),
+            offset=off,
+        ).copy()
+        if (
+            np.any(expert_ids < 0)
+            or np.any(expert_ids >= n_experts)
+            or np.unique(expert_ids).size != expert_ids.size
+            or np.any(owners[expert_ids] >= 0)
+        ):
+            raise ValueError("invalid or repeated NINTM expert id")
+        owners[expert_ids] = pool_index
+        off += ids_nbytes
+        try:
+            dtype = bytes(view[off:dtype_end]).decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ValueError("NINTM cohort dtype must be ASCII") from exc
+        pools.append(
+            NintMoePoolBlob(
+                expert_ids=expert_ids,
+                dtype=dtype,
+                runtime_payload=view[dtype_end:runtime_end],
+                tensor_payload=view[runtime_end:payload_end],
+            )
+        )
+        off = payload_end
+    if off != len(view):
+        raise ValueError(f"invalid NINTM tail: {len(view) - off} extra bytes")
+    missing = np.flatnonzero(owners < 0)
+    if missing.size:
+        raise ValueError(f"NINTM pools do not cover experts {missing[:16].tolist()}")
+    return (
+        (int(n_experts), int(out_per_expert), int(neuron_len)),
+        tuple(pools),
+    )
+
+
 def inspect_nint_moe_header(
     blob: bytes | memoryview,
 ) -> tuple[tuple[int, int, int], tuple[NintMoePoolMetadata, ...]]:

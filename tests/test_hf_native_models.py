@@ -5,10 +5,13 @@ import json
 import struct
 from pathlib import Path
 
+import numpy as np
 import pytest
 from gguf import GGUFReader
 
-from mfq.server.catalog import ModelCatalog
+from mfq.formats.header import FileHeader
+from mfq.formats.io import save
+from mfq.server.catalog import ModelCatalog, native_hf_model_type_supported
 from mfq.server.hf_tokenizer import (
     ensure_hf_tokenizer_gguf,
     native_hf_asset_environment,
@@ -86,6 +89,53 @@ def test_catalog_discovers_native_hf_checkpoint(tmp_path: Path) -> None:
     assert artifacts.data[0].loadable
 
 
+@pytest.mark.parametrize("model_type", ["qwen4_exp", "glm5_next"])
+def test_catalog_recognizes_flash_next_hf_as_conversion_source_only(
+    tmp_path: Path,
+    model_type: str,
+) -> None:
+    model = tmp_path / model_type
+    _hf_fixture(model)
+    (model / "config.json").write_text(
+        json.dumps({"model_type": model_type}),
+        encoding="utf-8",
+    )
+
+    artifact = asyncio.run(ModelCatalog([tmp_path], cache_seconds=0).list()).data[0]
+
+    assert artifact.complete
+    assert artifact.format == "hf"
+    assert artifact.architecture == f"{model_type}-hf-full-mfq"
+    assert not artifact.loadable
+    assert "convert it to MFQ" in (artifact.error or "")
+
+
+def test_catalog_prefers_same_name_mfq_over_its_hf_source(tmp_path: Path) -> None:
+    source = tmp_path / "same-name"
+    _hf_fixture(source)
+    converted = tmp_path / "same-name.mfq"
+    save(
+        converted,
+        FileHeader(version=2, model_arch="qwen4_exp-test"),
+        {"weight": np.ones((1,), dtype=np.float16)},
+    )
+
+    artifacts = asyncio.run(ModelCatalog([tmp_path], cache_seconds=0).list())
+
+    assert len(artifacts.data) == 1
+    assert artifacts.data[0].name == "same-name"
+    assert artifacts.data[0].format == "mfq"
+    assert artifacts.data[0].loadable
+
+
+def test_native_hf_support_matches_cpp_dispatch_families() -> None:
+    assert native_hf_model_type_supported("deepseek_v4_vision")
+    assert native_hf_model_type_supported("minicpmo")
+    assert native_hf_model_type_supported("qwen3_8")
+    assert not native_hf_model_type_supported("qwen4_exp")
+    assert not native_hf_model_type_supported("glm5_next")
+
+
 def test_hf_tokenizer_cache_is_reusable_and_runtime_selected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -100,7 +150,12 @@ def test_hf_tokenizer_cache_is_reusable_and_runtime_selected(
     assert reader.get_field("tokenizer.ggml.model").contents() == "gpt2"
     assert reader.get_field("tokenizer.ggml.pre").contents() == "qwen35"
     assert reader.get_field("tokenizer.ggml.tokens").contents() == [
-        "a", "b", "ab", "<bos>", "<eos>", "[PAD5]"
+        "a",
+        "b",
+        "ab",
+        "<bos>",
+        "<eos>",
+        "[PAD5]",
     ]
     assert reader.get_field("tokenizer.ggml.bos_token_id").contents() == 3
     assert reader.get_field("tokenizer.ggml.eos_token_id").contents() == 4

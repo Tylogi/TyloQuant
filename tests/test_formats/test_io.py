@@ -190,6 +190,24 @@ def test_nintm_file_and_mmap_roundtrip(tmp_path: Path):
         store.close()
 
 
+def test_nintm_blob_view_exposes_packed_cohorts_without_decoding():
+    rng = np.random.default_rng(770)
+    weight = rng.normal(0, 0.05, size=(4, 3, 48)).astype(np.float32)
+    tensor = quantize_expertwise(
+        weight,
+        [NintSpec(4, 24, 6), NintSpec(6, 24, 6)] * 2,
+    )
+    blob = io.pack_nint_moe(tensor)
+
+    shape, pools = io.view_nint_moe_blob(blob)
+
+    assert shape == tensor.shape
+    assert tuple(tuple(pool.expert_ids) for pool in pools) == ((0, 2), (1, 3))
+    assert tuple(pool.dtype for pool in pools) == ("NINT4", "NINT6")
+    assert all(not pool.runtime_payload for pool in pools)
+    assert all(pool.tensor_payload.obj is not None for pool in pools)
+
+
 def test_file_roundtrip(tmp_path: Path):
     t0 = _mk(1, (8, 96))
     t1 = _mk(2, (16, 48))

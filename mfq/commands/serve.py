@@ -43,8 +43,42 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+def _byte_size(value: str) -> int:
+    text = value.strip().lower()
+    multipliers = {
+        "": 1,
+        "k": 1 << 10,
+        "kb": 1 << 10,
+        "m": 1 << 20,
+        "mb": 1 << 20,
+        "g": 1 << 30,
+        "gb": 1 << 30,
+        "t": 1 << 40,
+        "tb": 1 << 40,
+    }
+    suffix = ""
+    while text and text[-1].isalpha():
+        suffix = text[-1] + suffix
+        text = text[:-1]
+    try:
+        number = float(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("invalid byte size") from error
+    if suffix not in multipliers or not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("invalid byte size")
+    return int(number * multipliers[suffix])
+
+
 def _console_script_dir(executable: str | Path) -> Path:
     return Path(executable).parent
+
+
+def _controller_command() -> tuple[str, ...]:
+    """Command prefix that re-enters this CLI in source and frozen builds."""
+
+    if bool(getattr(sys, "frozen", False)):
+        return (sys.executable,)
+    return (sys.executable, "-m", "mfq.cli")
 
 
 def _environment_paths(name: str) -> list[Path]:
@@ -190,7 +224,7 @@ def _run(args: argparse.Namespace) -> int:
     from mfq.server.cluster import ClusterBackend
     from mfq.server.components import VoiceOutputComponent
     from mfq.server.jobs import JobManager
-    from mfq.server.native import NativeRuntime
+    from mfq.server.native import NativeRuntime, is_flash_next_architecture
     from mfq.server.runtime_pool import ManagedRuntimePool
     from mfq.server.service import ServerService
     from mfq.server.storage import SessionStore
@@ -202,6 +236,25 @@ def _run(args: argparse.Namespace) -> int:
     web_root = _prepare_web_root(args.web_root, disabled=args.no_web_ui)
     selected_backend = _select_backend(args.backend, args.running_executable)
     executable = _resolve_runtime_executable(selected_backend, args.running_executable)
+    runtime_environment: dict[str, str] = {}
+    if args.no_prefix_cache:
+        runtime_environment["MFQ_SERVER_DISABLE_PREFIX_CACHE"] = "1"
+    if args.prefix_cache_dir is not None:
+        runtime_environment["MFQ_SERVER_PREFIX_CACHE_DIR"] = str(
+            args.prefix_cache_dir.expanduser().resolve()
+        )
+    if args.prefix_cache_disk_size is not None:
+        runtime_environment["MFQ_SERVER_PREFIX_CACHE_DISK_BYTES"] = str(
+            args.prefix_cache_disk_size
+        )
+    if args.prefix_cache_hot_size is not None:
+        runtime_environment["MFQ_SERVER_PREFIX_CACHE_HOT_BYTES"] = str(
+            args.prefix_cache_hot_size
+        )
+    if args.prefix_cache_block_tokens is not None:
+        runtime_environment["MFQ_SERVER_PREFIX_CACHE_BLOCK_TOKENS"] = str(
+            args.prefix_cache_block_tokens
+        )
     configured_roots = [path.expanduser().resolve() for path in args.model_dir]
     if not configured_roots:
         configured_roots = _environment_paths("MFQ_SERVER_MODEL_DIRS")
@@ -225,9 +278,19 @@ def _run(args: argparse.Namespace) -> int:
             max_requests_per_instance=args.max_requests_per_runtime,
             backend=selected_backend,
             voice_component=voice_component,
+            runtime_environment=runtime_environment,
+            controller_command=_controller_command(),
         )
         if model is not None:
             initial_artifact = asyncio.run(catalog.resolve_path(model))
+            if (
+                is_flash_next_architecture(initial_artifact.resource.architecture)
+                and initial_artifact.resource.format != "mfq"
+            ):
+                raise RuntimeError(
+                    "Qwen3.8-Flash-Next and GLM-5.3-Flash HF checkpoints must be "
+                    "converted to MFQ before inference"
+                )
             runtime = NativeRuntime(
                 executable=executable,
                 model=model,
@@ -236,6 +299,9 @@ def _run(args: argparse.Namespace) -> int:
                 context_size=args.context_size,
                 prefill_chunk_size=args.prefill_chunk_size,
                 startup_timeout=args.runtime_startup_timeout,
+                environment=runtime_environment,
+                architecture=initial_artifact.resource.architecture,
+                controller_command=_controller_command(),
             )
             runtime.start()
             if runtime.process is None or runtime.port is None:
@@ -329,6 +395,31 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     parser.add_argument("--context-size", type=_nonnegative_int, default=0)
     parser.add_argument("--prefill-chunk-size", type=_positive_int, default=2048)
+    parser.add_argument(
+        "--prefix-cache-dir",
+        type=Path,
+        help="persistent Session KV cache directory",
+    )
+    parser.add_argument(
+        "--prefix-cache-disk-size",
+        type=_byte_size,
+        help="maximum persistent Session KV cache size, such as 100G",
+    )
+    parser.add_argument(
+        "--prefix-cache-hot-size",
+        type=_byte_size,
+        help="maximum RAM hot-cache size, such as 2G",
+    )
+    parser.add_argument(
+        "--prefix-cache-block-tokens",
+        type=_positive_int,
+        help="tokens per content-addressed Session KV block",
+    )
+    parser.add_argument(
+        "--no-prefix-cache",
+        action="store_true",
+        help="disable persistent Session KV caching",
+    )
     parser.add_argument("--runtime-startup-timeout", type=_positive_float, default=1800.0)
     parser.add_argument("--db", type=Path, default=Path("mfq-server.sqlite3"))
     web = parser.add_mutually_exclusive_group()

@@ -132,15 +132,30 @@ _ROPE_SOURCE = r"""
     uint row = index / uint(DIM);
     uint token = row % uint(TOKENS);
     uint pair = column < half_width ? column : column - half_width;
+    uint leading_row = row / uint(TOKENS);
+    uint position_batch = leading_row / uint(ROWS_PER_POS_BATCH);
     uint axis = 0u;
     if (S0 + S1 + S2 > 0) {
-        axis = pair < uint(S0) ? 0u : (pair < uint(S0 + S1) ? 1u : 2u);
+        if (INTERLEAVED != 0) {
+            uint residue = pair % 3u;
+            axis = residue == 1u && pair < uint(S1 * 3)
+                ? 1u
+                : (residue == 2u && pair < uint(S2 * 3) ? 2u : 0u);
+        } else {
+            axis = pair < uint(S0)
+                ? 0u
+                : (pair < uint(S0 + S1) ? 1u : 2u);
+        }
         if (axis >= uint(POS_AXES)) {
             axis = 0u;
         }
     }
 
-    int position = positions[(POS_AXES == 1 ? 0u : axis) * uint(TOKENS) + token];
+    uint position_axis = POS_AXES == 1 ? 0u : axis;
+    uint position_index =
+        (position_axis * uint(POS_BATCHES) + position_batch) * uint(TOKENS)
+        + token;
+    int position = positions[position_index];
     position = max(0, min(position, TABLE_LEN - 1));
     uint table_index = uint(position) * half_width + pair;
     float cosine = cos_table[table_index];
@@ -433,8 +448,8 @@ def rope_tables(
 
 def _position_array(positions: mx.array | np.ndarray) -> mx.array:
     result = positions if isinstance(positions, mx.array) else mx.array(positions)
-    if result.ndim not in (1, 2):
-        raise ValueError("RoPE positions must have [T] or [axes, T] shape")
+    if result.ndim not in (1, 2, 3):
+        raise ValueError("RoPE positions must have [T], [axes,T], or [axes,batch,T] shape")
     return mx.contiguous(result.astype(mx.int32))
 
 
@@ -449,6 +464,7 @@ def rope(
     sequence_axis: int = -2,
     frequency_dim: int | None = None,
     active_pairs: int | None = None,
+    mrope_interleaved: bool = False,
 ) -> mx.array:
     """Apply rotate-half RoPE, including partial RoPE and three-axis MRoPE."""
 
@@ -473,6 +489,11 @@ def rope(
             f"RoPE position length {position_ids.shape[-1]} != sequence length {tokens}"
         )
     position_axes = 1 if position_ids.ndim == 1 else int(position_ids.shape[0])
+    position_batches = 1 if position_ids.ndim < 3 else int(position_ids.shape[1])
+    leading_rows = int(canonical.size) // (tokens * dimension)
+    if position_batches <= 0 or leading_rows % position_batches:
+        raise ValueError("RoPE position batches do not divide the input's leading rows")
+    rows_per_position_batch = leading_rows // position_batches
     section_values = (0, 0, 0)
     if sections is not None:
         if len(sections) != 3:
@@ -480,6 +501,8 @@ def rope(
         section_values = tuple(int(value) for value in sections)
         if any(value < 0 for value in section_values) or sum(section_values) != rotary // 2:
             raise ValueError("MRoPE sections must be nonnegative and sum to rotary_dim / 2")
+    elif mrope_interleaved:
+        raise ValueError("interleaved MRoPE requires three section sizes")
 
     if tokens == 0 or int(canonical.size) == 0:
         output = mx.zeros(shape, dtype=canonical.dtype)
@@ -505,10 +528,13 @@ def rope(
             ("DIM", dimension),
             ("ROTARY_DIM", rotary),
             ("POS_AXES", position_axes),
+            ("POS_BATCHES", position_batches),
+            ("ROWS_PER_POS_BATCH", rows_per_position_batch),
             ("TABLE_LEN", int(table_len)),
             ("S0", section_values[0]),
             ("S1", section_values[1]),
             ("S2", section_values[2]),
+            ("INTERLEAVED", int(mrope_interleaved)),
         ],
         grid=(size, 1, 1),
         threadgroup=_threadgroup_size(size),

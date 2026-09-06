@@ -24,6 +24,22 @@ from mfq.server.models import (
 
 MODEL_FILE_INDEX = ".mfq-files.json"
 
+_NATIVE_HF_MODEL_TYPE_PREFIXES = (
+    "deepseek_v4",
+    "minicpmo",
+    "qwen35",
+    "qwen3_5",
+    "qwen3_6",
+    "qwen3_8",
+)
+
+
+def native_hf_model_type_supported(model_type: str) -> bool:
+    """Match exactly the raw-HF families dispatched by native workers."""
+
+    identity = model_type.strip().lower()
+    return any(identity.startswith(prefix) for prefix in _NATIVE_HF_MODEL_TYPE_PREFIXES)
+
 
 class ModelArtifactNotFoundError(LookupError):
     pass
@@ -122,7 +138,43 @@ class ModelCatalog:
     async def resolve_path(self, path: str | Path) -> DiscoveredModel:
         """Resolve a configured model path to the catalog artifact that owns it."""
 
-        target = self._canonical_model_path(Path(path).expanduser().resolve())
+        requested = Path(path).expanduser().resolve()
+        target = self._canonical_model_path(requested)
+
+        # ``mfq serve --model /exact/path`` is already a trusted, configured
+        # local path. Resolve it before enumerating sibling artifacts so an HF
+        # source directory and its converted MFQ (or two quantized variants)
+        # may share a display name without preventing exact-path startup.
+        privacy_root = next(
+            (root for root in self.roots if requested.is_relative_to(root)),
+            None,
+        )
+        if privacy_root is not None:
+            inspect_path = requested
+            if requested.is_file():
+                try:
+                    parsed = parse_shard_path(requested)
+                except ValueError:
+                    parsed = None
+                if parsed is not None:
+                    first = next(
+                        (
+                            candidate
+                            for candidate in matching_shard_paths(parsed[0])
+                            if parse_shard_path(candidate)[1] == 1
+                        ),
+                        None,
+                    )
+                    if first is not None:
+                        inspect_path = first
+            supported_path = (
+                inspect_path.is_file() and inspect_path.suffix.casefold() == ".mfq"
+            ) or (inspect_path.is_dir() and self._is_hf_model_directory(inspect_path))
+            if supported_path:
+                direct = await asyncio.to_thread(self._inspect, privacy_root, inspect_path)
+                if self._canonical_model_path(direct.path) == target:
+                    return direct
+
         for refresh in (False, True):
             models = await self._snapshot(refresh=refresh)
             matches = [
@@ -196,9 +248,7 @@ class ModelCatalog:
 
     def _directory_id(self, path: Path) -> str:
         resolved = path.resolve()
-        identifier = hashlib.sha256(
-            self._directory_secret + os.fsencode(resolved)
-        ).hexdigest()[:32]
+        identifier = hashlib.sha256(self._directory_secret + os.fsencode(resolved)).hexdigest()[:32]
         self._directory_ids[identifier] = resolved
         return identifier
 
@@ -229,8 +279,7 @@ class ModelCatalog:
     def _immediate_model_count(path: Path) -> int:
         try:
             mfq_count = sum(
-                item.is_file() and item.suffix.casefold() == ".mfq"
-                for item in path.iterdir()
+                item.is_file() and item.suffix.casefold() == ".mfq" for item in path.iterdir()
             )
             hf_count = int(ModelCatalog._is_hf_model_directory(path)) + sum(
                 item.is_dir() and ModelCatalog._is_hf_model_directory(item)
@@ -332,13 +381,20 @@ class ModelCatalog:
                 raise ModelRegistrationError("the model catalog index version is unsupported")
             document = loaded
         existing = document.get("files")
-        files = {value for value in existing if isinstance(value, str)} if isinstance(existing, list) else set()
+        files = (
+            {value for value in existing if isinstance(value, str)}
+            if isinstance(existing, list)
+            else set()
+        )
         files.update(str(path) for path in paths)
-        payload = json.dumps(
-            {"version": 1, "files": sorted(files)},
-            ensure_ascii=False,
-            indent=2,
-        ).encode("utf-8") + b"\n"
+        payload = (
+            json.dumps(
+                {"version": 1, "files": sorted(files)},
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8")
+            + b"\n"
+        )
         temporary = index.with_name(f".{index.name}.{os.getpid()}.tmp")
         try:
             temporary.write_bytes(payload)
@@ -378,6 +434,7 @@ class ModelCatalog:
     def _scan(self) -> dict[str, DiscoveredModel]:
         result: dict[str, DiscoveredModel] = {}
         model_paths: dict[str, Path] = {}
+        models_by_name: dict[str, DiscoveredModel] = {}
         for root in self.roots:
             if not root.is_dir():
                 continue
@@ -410,10 +467,25 @@ class ModelCatalog:
                 canonical_path = self._canonical_model_path(discovered.path)
                 previous_path = model_paths.get(discovered.resource.name)
                 if previous_path is not None and previous_path != canonical_path:
-                    raise DuplicateModelNameError(
-                        f"duplicate catalog model name: {discovered.resource.name}"
-                    )
+                    previous_named = models_by_name[discovered.resource.name]
+                    formats = {
+                        previous_named.resource.format,
+                        discovered.resource.format,
+                    }
+                    if formats != {"hf", "mfq"}:
+                        raise DuplicateModelNameError(
+                            f"duplicate catalog model name: {discovered.resource.name}"
+                        )
+                    # Converters commonly place ``name.mfq`` beside their
+                    # ``name/`` HF source.  They are two representations of
+                    # one logical model, not an ambiguous pair for Studio's
+                    # model picker.  Prefer the portable/loadable MFQ while
+                    # retaining strict duplicate detection within a format.
+                    if discovered.resource.format == "hf":
+                        continue
+                    result.pop(previous_named.resource.id, None)
                 model_paths[discovered.resource.name] = canonical_path
+                models_by_name[discovered.resource.name] = discovered
                 previous = result.get(discovered.resource.id)
                 if previous is None or str(path) < str(previous.path):
                     result[discovered.resource.id] = discovered
@@ -560,13 +632,13 @@ class ModelCatalog:
                 weight_map = index.get("weight_map") if isinstance(index, dict) else None
                 if not isinstance(weight_map, dict) or not weight_map:
                     raise ValueError("invalid Safetensors weight_map")
-                if not all(isinstance(key, str) and isinstance(value, str)
-                           for key, value in weight_map.items()):
+                if not all(
+                    isinstance(key, str) and isinstance(value, str)
+                    for key, value in weight_map.items()
+                ):
                     raise ValueError("invalid Safetensors weight_map entry")
                 indexed_names = set(weight_map)
-                shard_paths = tuple(
-                    path / item for item in sorted(set(weight_map.values()))
-                )
+                shard_paths = tuple(path / item for item in sorted(set(weight_map.values())))
             else:
                 shard_paths = tuple(sorted(path.glob("*.safetensors")))
             if not shard_paths or any(not item.is_file() for item in shard_paths):
@@ -587,11 +659,17 @@ class ModelCatalog:
                 raise ValueError("Safetensors index references missing tensors")
             stats = tuple(item.stat() for item in shard_paths)
             fingerprint = "\0".join(
-                [model_type, name, *(f"{item.name}:{stat.st_size}" for item, stat in zip(
-                    shard_paths, stats, strict=True
-                ))]
+                [
+                    model_type,
+                    name,
+                    *(
+                        f"{item.name}:{stat.st_size}"
+                        for item, stat in zip(shard_paths, stats, strict=True)
+                    ),
+                ]
             )
             identifier = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:32]
+            loadable = native_hf_model_type_supported(model_type)
             resource = ModelArtifactResource(
                 id=identifier,
                 name=name,
@@ -603,9 +681,17 @@ class ModelCatalog:
                 record_count=len(indexed_names if indexed_names is not None else tensors) + 1,
                 dtypes=sorted(dtypes),
                 complete=True,
-                loadable=True,
+                loadable=loadable,
                 modified_at=datetime.fromtimestamp(
                     max(stat.st_mtime for stat in stats), timezone.utc
+                ),
+                error=(
+                    None
+                    if loadable
+                    else (
+                        f"recognized {model_type} HF source checkpoint; convert it to MFQ "
+                        "before inference"
+                    )
                 ),
             )
         except Exception as error:

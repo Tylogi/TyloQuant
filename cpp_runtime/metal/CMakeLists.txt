@@ -213,6 +213,27 @@ target_link_libraries(mfq-decode-metal PRIVATE
 )
 target_compile_features(mfq-decode-metal PRIVATE cxx_std_20)
 
+if(TARGET mfq-paged-prefix-cache)
+    target_sources(mfq-decode-metal PRIVATE
+        mlx_paged_session_codec.cpp
+    )
+
+    add_executable(mfq-metal-paged-session-codec-test
+        mlx_paged_session_codec.cpp
+        mlx_paged_session_codec_test.cpp
+    )
+    target_link_libraries(mfq-metal-paged-session-codec-test PRIVATE
+        mfq-metal-runtime
+        mfq-paged-prefix-cache
+    )
+    target_compile_features(
+        mfq-metal-paged-session-codec-test PRIVATE cxx_std_20)
+    add_test(
+        NAME mfq-metal-paged-session-codec-test
+        COMMAND mfq-metal-paged-session-codec-test
+    )
+endif()
+
 set_target_properties(mfq-decode-metal PROPERTIES
     BUILD_RPATH "@executable_path/lib"
     BUILD_WITH_INSTALL_RPATH ON

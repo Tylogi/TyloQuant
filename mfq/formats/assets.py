@@ -19,6 +19,10 @@ import numpy as np
 ASSET_PREFIX = "__mfq_asset__/"
 MODEL_CONFIG_ASSET = ASSET_PREFIX + "model_config.json"
 TOKENIZER_GGUF_ASSET = ASSET_PREFIX + "tokenizer.gguf"
+HF_TOKENIZER_JSON_ASSET = ASSET_PREFIX + "hf/tokenizer.json"
+HF_TOKENIZER_CONFIG_ASSET = ASSET_PREFIX + "hf/tokenizer_config.json"
+HF_CHAT_TEMPLATE_ASSET = ASSET_PREFIX + "hf/chat_template.jinja"
+HF_GENERATION_CONFIG_ASSET = ASSET_PREFIX + "hf/generation_config.json"
 MINICPMO45_RESAMPLER_POS_EMBED_ASSET = (
     ASSET_PREFIX + "minicpmo45-resampler-pos-embed-v1.bf16"
 )
@@ -61,6 +65,65 @@ def model_config_asset(config: dict[str, Any] | bytes | str) -> RuntimeAsset:
     if not isinstance(parsed, dict):
         raise ValueError("model config must be a JSON object")
     return RuntimeAsset(MODEL_CONFIG_ASSET, "application/json", data)
+
+
+def hf_runtime_assets(source: str | Path) -> tuple[RuntimeAsset, ...]:
+    """Embed the dependency-light HF files needed by Python MLX workers.
+
+    The native C++ runtime consumes the compact tokenizer-only GGUF. New
+    architecture workers use the original Tokenizers JSON and chat template,
+    so a converted model remains self-contained after leaving its HF source
+    directory. Only metadata/tokenizer files are copied; executable remote
+    model code is neither embedded nor trusted.
+    """
+
+    root = Path(source).expanduser().resolve()
+    if not root.is_dir():
+        return ()
+    specifications = (
+        (
+            "tokenizer.json",
+            HF_TOKENIZER_JSON_ASSET,
+            "application/vnd.huggingface.tokenizer+json",
+            True,
+        ),
+        (
+            "tokenizer_config.json",
+            HF_TOKENIZER_CONFIG_ASSET,
+            "application/json",
+            True,
+        ),
+        (
+            "chat_template.jinja",
+            HF_CHAT_TEMPLATE_ASSET,
+            "text/x-jinja2; charset=utf-8",
+            False,
+        ),
+        (
+            "generation_config.json",
+            HF_GENERATION_CONFIG_ASSET,
+            "application/json",
+            False,
+        ),
+    )
+    assets: list[RuntimeAsset] = []
+    for filename, record, media_type, required in specifications:
+        path = root / filename
+        if not path.is_file():
+            if required:
+                raise FileNotFoundError(
+                    f"Flash-Next runtime asset is missing: {path}"
+                )
+            continue
+        data = path.read_bytes()
+        if not data:
+            raise ValueError(f"Flash-Next runtime asset is empty: {path}")
+        if filename.endswith(".json"):
+            json.loads(data)
+        else:
+            data.decode("utf-8")
+        assets.append(RuntimeAsset(record, media_type, data))
+    return tuple(assets)
 
 
 def minicpmo45_resampler_pos_embed_asset(

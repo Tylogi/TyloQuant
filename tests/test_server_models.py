@@ -116,6 +116,88 @@ def _fake_runtime(path: Path) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
+def _fake_flash_next_controller(path: Path) -> None:
+    path.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import argparse
+            import json
+            import os
+            from http.server import BaseHTTPRequestHandler, HTTPServer
+            from pathlib import Path
+
+            parser = argparse.ArgumentParser()
+            parser.add_argument('command')
+            parser.add_argument('--mfq')
+            parser.add_argument('--host')
+            parser.add_argument('--port', type=int)
+            parser.add_argument('--ctx-size', type=int)
+            parser.add_argument('--prefill-chunk-size', type=int)
+            parser.add_argument('--model-name')
+            args = parser.parse_args()
+            assert args.command == '_flash-next-worker'
+            marker = os.environ.get('MFQ_TEST_FLASH_NEXT_MARKER')
+            if marker:
+                Path(marker).write_text(json.dumps(vars(args)), encoding='utf-8')
+
+            class Handler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    if self.path == '/health':
+                        payload = {
+                            'status': 'ok',
+                            'ready': True,
+                            'model': args.model_name,
+                            'model_type': 'qwen4_exp',
+                            'max_context': args.ctx_size,
+                            'model_capabilities': {
+                                'architecture_family': 'qwen4_exp',
+                                'source': 'test',
+                                'features': {'text': True},
+                            },
+                        }
+                    elif self.path == '/v1/models':
+                        payload = {
+                            'object': 'list',
+                            'data': [{'id': args.model_name}],
+                        }
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+                        return
+                    body = json.dumps(payload).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *args):
+                    pass
+
+            HTTPServer((args.host, args.port), Handler).serve_forever()
+            """
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+async def _wait_for_job(
+    client: httpx.AsyncClient,
+    operation_id: str,
+    *,
+    attempts: int = 300,
+) -> dict[str, object]:
+    job: dict[str, object] = {}
+    for _ in range(attempts):
+        job = (await client.get(f"/api/v1/jobs/{operation_id}")).json()
+        if job.get("status") in {"succeeded", "failed", "cancelled"}:
+            return job
+        await asyncio.sleep(0.025)
+    return job
+
+
 def test_catalog_validates_complete_and_incomplete_shards(tmp_path: Path) -> None:
     async def run() -> None:
         source = tmp_path / "source.mfq"
@@ -397,6 +479,30 @@ def test_catalog_rejects_duplicate_mfq_file_stems(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
+def test_catalog_exact_path_resolves_before_duplicate_name_enumeration(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        first = tmp_path / "first"
+        second = tmp_path / "second"
+        first.mkdir()
+        second.mkdir()
+        selected = first / "same-name.mfq"
+        _model(selected, architecture="selected")
+        _model(second / "same-name.mfq", architecture="other")
+
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve_path(selected)
+
+        assert artifact.path == selected
+        assert artifact.resource.name == "same-name"
+        assert artifact.resource.architecture == "selected"
+        with pytest.raises(DuplicateModelNameError, match="duplicate catalog model name"):
+            await catalog.list()
+
+    asyncio.run(run())
+
+
 def test_catalog_discovers_a_registered_external_mfq_without_exposing_its_path(
     tmp_path: Path,
 ) -> None:
@@ -535,6 +641,60 @@ def test_managed_runtime_loads_and_unloads_through_persistent_jobs(tmp_path: Pat
     asyncio.run(run())
 
 
+def test_managed_runtime_dispatches_flash_next_mfq_to_controller(tmp_path: Path) -> None:
+    async def run() -> None:
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        model = model_dir / "Qwen3.8-Flash-Next.mfq"
+        _model(model, architecture="qwen4_exp-hf-mfq-nint-recipe")
+        native_executable = tmp_path / "native-runtime-must-not-run"
+        native_executable.write_text("not executable", encoding="utf-8")
+        controller = tmp_path / "fake-mfq"
+        _fake_flash_next_controller(controller)
+        marker = tmp_path / "flash-next-command.json"
+        catalog = ModelCatalog([model_dir], cache_seconds=0)
+        pool = ManagedRuntimePool(
+            catalog,
+            native_executable,
+            startup_timeout_seconds=5,
+            max_instances=1,
+            controller_command=(str(controller),),
+            runtime_environment={"MFQ_TEST_FLASH_NEXT_MARKER": str(marker)},
+        )
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        service = ServerService(store, pool, catalog=catalog, runtime_manager=pool)
+        transport = httpx.ASGITransport(app=create_app(service))
+        try:
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                artifact = (await client.get("/api/v1/models")).json()["data"][0]
+                accepted = await client.post(
+                    "/api/v1/models/load",
+                    json={"model": artifact["name"], "context_size": 8192},
+                )
+                assert accepted.status_code == 202
+                job = await _wait_for_job(client, accepted.json()["operation_id"])
+                assert job["status"] == "succeeded", job
+                command = json.loads(marker.read_text(encoding="utf-8"))
+                assert command["command"] == "_flash-next-worker"
+                assert command["mfq"] == str(model)
+                assert command["host"] == "127.0.0.1"
+                assert isinstance(command["port"], int)
+                assert command["ctx_size"] == 8192
+                assert command["prefill_chunk_size"] == 2048
+                assert command["model_name"] == artifact["name"]
+                instance_id = job["result"]["instance_id"]
+                unload = await client.post(
+                    "/api/v1/models/unload",
+                    json={"instance_id": instance_id},
+                )
+                unload_job = await _wait_for_job(client, unload.json()["operation_id"])
+                assert unload_job["status"] == "succeeded", unload_job
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
+
+
 def test_concurrent_loads_reserve_the_catalog_name(tmp_path: Path) -> None:
     async def run() -> None:
         model_dir = tmp_path / "models"
@@ -576,6 +736,150 @@ def test_concurrent_loads_reserve_the_catalog_name(tmp_path: Path) -> None:
                 assert len((await pool.instances()).data) == 1
         finally:
             await service.aclose()
+
+    asyncio.run(run())
+
+
+def test_runtime_pool_evicts_idle_lru_but_preserves_pinned_models(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        _model(model_dir / "older.mfq", architecture="qwen35")
+        _model(model_dir / "newer.mfq", architecture="qwen35")
+        executable = tmp_path / "fake-runtime"
+        _fake_runtime(executable)
+        catalog = ModelCatalog([model_dir], cache_seconds=0)
+        pool = ManagedRuntimePool(
+            catalog,
+            executable,
+            startup_timeout_seconds=5,
+            max_instances=1,
+        )
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        service = ServerService(store, pool, catalog=catalog, runtime_manager=pool)
+        app = create_app(service)
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                accepted = await client.post(
+                    "/api/v1/models/load",
+                    json={"model": "older", "pin": False},
+                )
+                first = await _wait_for_job(client, accepted.json()["operation_id"])
+                assert first["status"] == "succeeded", first
+
+                accepted = await client.post(
+                    "/api/v1/models/load",
+                    json={"model": "newer", "pin": True},
+                )
+                second = await _wait_for_job(client, accepted.json()["operation_id"])
+                assert second["status"] == "succeeded", second
+                listed = (await client.get("/api/v1/runtime/instances")).json()["data"]
+                assert [item["model"] for item in listed] == ["newer"]
+                assert listed[0]["pinned"] is True
+
+                accepted = await client.post(
+                    "/api/v1/models/load",
+                    json={"model": "older"},
+                )
+                blocked = await _wait_for_job(client, accepted.json()["operation_id"])
+                assert blocked["status"] == "failed", blocked
+                assert blocked["error"]["code"] == "runtime_instance_limit"
+
+    asyncio.run(run())
+
+
+def test_runtime_pool_unloads_an_idle_ttl_model(tmp_path: Path) -> None:
+    async def run() -> None:
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        _model(model_dir / "ephemeral.mfq", architecture="qwen35")
+        executable = tmp_path / "fake-runtime"
+        _fake_runtime(executable)
+        catalog = ModelCatalog([model_dir], cache_seconds=0)
+        pool = ManagedRuntimePool(
+            catalog,
+            executable,
+            startup_timeout_seconds=5,
+            max_instances=1,
+            metric_interval_seconds=0.25,
+        )
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        service = ServerService(store, pool, catalog=catalog, runtime_manager=pool)
+        app = create_app(service)
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                accepted = await client.post(
+                    "/api/v1/models/load",
+                    json={"model": "ephemeral", "idle_ttl_seconds": 0},
+                )
+                loaded = await _wait_for_job(client, accepted.json()["operation_id"])
+                assert loaded["status"] == "succeeded", loaded
+                for _ in range(80):
+                    listed = (await client.get("/api/v1/runtime/instances")).json()["data"]
+                    if not listed:
+                        break
+                    await asyncio.sleep(0.025)
+                assert listed == []
+
+    asyncio.run(run())
+
+
+def test_runtime_pool_close_waits_for_an_inflight_idle_unload(tmp_path: Path) -> None:
+    async def run() -> None:
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        _model(model_dir / "ephemeral.mfq", architecture="qwen35")
+        executable = tmp_path / "fake-runtime"
+        _fake_runtime(executable)
+        catalog = ModelCatalog([model_dir], cache_seconds=0)
+        pool = ManagedRuntimePool(
+            catalog,
+            executable,
+            startup_timeout_seconds=5,
+            max_instances=1,
+            metric_interval_seconds=0.25,
+        )
+        stop_started = asyncio.Event()
+        allow_stop = asyncio.Event()
+        stop_was_cancelled = False
+        original_stop_process = pool._stop_process
+
+        async def controlled_stop(instance: object) -> None:
+            nonlocal stop_was_cancelled
+            stop_started.set()
+            try:
+                await allow_stop.wait()
+            except asyncio.CancelledError:
+                stop_was_cancelled = True
+                raise
+            await original_stop_process(instance)  # type: ignore[arg-type]
+
+        pool._stop_process = controlled_stop  # type: ignore[method-assign]
+        store = SessionStore(tmp_path / "mfq.server.sqlite3")
+        service = ServerService(store, pool, catalog=catalog, runtime_manager=pool)
+        app = create_app(service)
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                accepted = await client.post(
+                    "/api/v1/models/load",
+                    json={"model": "ephemeral", "idle_ttl_seconds": 0},
+                )
+                loaded = await _wait_for_job(client, accepted.json()["operation_id"])
+                assert loaded["status"] == "succeeded", loaded
+                await asyncio.wait_for(stop_started.wait(), timeout=2)
+
+                closing = asyncio.create_task(pool.aclose())
+                await asyncio.sleep(0)
+                assert not closing.done()
+                assert not stop_was_cancelled
+                allow_stop.set()
+                await asyncio.wait_for(closing, timeout=5)
+                assert not stop_was_cancelled
 
     asyncio.run(run())
 

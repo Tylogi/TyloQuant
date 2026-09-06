@@ -800,6 +800,122 @@ _NINT4_GS24_GEMV_SOURCE = r"""
     }
 """
 
+_NINT4_GS24_M2_SOURCE = r"""
+    constexpr uint INPUT_ROWS = 2u;
+    constexpr uint SIMD_GROUPS = 8u;
+    constexpr uint ROWS_PER_SIMD = 2u;
+    constexpr uint ROWS_PER_TG = SIMD_GROUPS * ROWS_PER_SIMD;
+    constexpr uint GROUP_BYTES = 12u;
+
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint output_base =
+        threadgroup_position_in_grid.x * ROWS_PER_TG
+        + simd_group * ROWS_PER_SIMD;
+
+    uint metadata_bases[ROWS_PER_SIMD];
+    float neuron_scales[ROWS_PER_SIMD];
+    float neuron_minimums[ROWS_PER_SIMD];
+    float accumulators[INPUT_ROWS][ROWS_PER_SIMD];
+    for (uint input_row = 0u; input_row < INPUT_ROWS; ++input_row) {
+        for (uint output_row = 0u; output_row < ROWS_PER_SIMD; ++output_row) {
+            accumulators[input_row][output_row] = 0.0f;
+        }
+    }
+    for (uint output_row = 0u; output_row < ROWS_PER_SIMD; ++output_row) {
+        uint output = min(output_base + output_row, uint(OUT) - 1u);
+        metadata_bases[output_row] = output * uint(NG);
+        neuron_scales[output_row] = neuron_scale[output];
+        neuron_minimums[output_row] = neuron_min[output];
+    }
+
+    // Fuse the two-token verification tile into one launch. Each packed
+    // NINT4 vector is decoded once, then reused across both activation rows;
+    // activations are in turn shared across two output rows per SIMD group.
+    for (uint group = lane; group < uint(NG); group += 32u) {
+        float activation_sums[INPUT_ROWS] = {0.0f, 0.0f};
+        float quantized_dots[INPUT_ROWS][ROWS_PER_SIMD];
+        for (uint input_row = 0u; input_row < INPUT_ROWS; ++input_row) {
+            for (uint output_row = 0u; output_row < ROWS_PER_SIMD; ++output_row) {
+                quantized_dots[input_row][output_row] = 0.0f;
+            }
+        }
+
+        for (uint chunk = 0u; chunk < 6u; ++chunk) {
+            uint column = group * 24u + chunk * 4u;
+            float4 activations[INPUT_ROWS];
+            for (uint input_row = 0u; input_row < INPUT_ROWS; ++input_row) {
+                device const T* row_x = x + input_row * uint(K);
+                activations[input_row] = float4(0.0f);
+                if (column + 3u < uint(K)) {
+                    activations[input_row] =
+                        float4(*(device const half4*)(row_x + column));
+                } else {
+                    activations[input_row].x =
+                        column < uint(K) ? float(row_x[column]) : 0.0f;
+                    activations[input_row].y =
+                        column + 1u < uint(K)
+                        ? float(row_x[column + 1u]) : 0.0f;
+                    activations[input_row].z =
+                        column + 2u < uint(K)
+                        ? float(row_x[column + 2u]) : 0.0f;
+                    activations[input_row].w =
+                        column + 3u < uint(K)
+                        ? float(row_x[column + 3u]) : 0.0f;
+                }
+                activation_sums[input_row] +=
+                    activations[input_row].x + activations[input_row].y
+                    + activations[input_row].z + activations[input_row].w;
+            }
+
+            for (uint output_row = 0u; output_row < ROWS_PER_SIMD; ++output_row) {
+                uint metadata_index = metadata_bases[output_row] + group;
+                uint byte_index =
+                    metadata_index * GROUP_BYTES + chunk * 2u;
+                uint packed =
+                    uint(q_packed[byte_index])
+                    | (uint(q_packed[byte_index + 1u]) << 8u);
+                float4 quantized = float4(
+                    float(packed & 15u),
+                    float((packed >> 4u) & 15u),
+                    float((packed >> 8u) & 15u),
+                    float((packed >> 12u) & 15u));
+                for (uint input_row = 0u; input_row < INPUT_ROWS; ++input_row) {
+                    quantized_dots[input_row][output_row] +=
+                        dot(activations[input_row], quantized);
+                }
+            }
+        }
+
+        for (uint output_row = 0u; output_row < ROWS_PER_SIMD; ++output_row) {
+            uint metadata_index = metadata_bases[output_row] + group;
+            float scale =
+                neuron_scales[output_row] * float(sub_scale[metadata_index]);
+            float minimum =
+                neuron_minimums[output_row] * float(sub_min[metadata_index]);
+            for (uint input_row = 0u; input_row < INPUT_ROWS; ++input_row) {
+                accumulators[input_row][output_row] = fma(
+                    scale,
+                    quantized_dots[input_row][output_row],
+                    fma(
+                        -minimum,
+                        activation_sums[input_row],
+                        accumulators[input_row][output_row]));
+            }
+        }
+    }
+
+    for (uint input_row = 0u; input_row < INPUT_ROWS; ++input_row) {
+        for (uint output_row = 0u; output_row < ROWS_PER_SIMD; ++output_row) {
+            float total = simd_sum(accumulators[input_row][output_row]);
+            uint output = output_base + output_row;
+            if (lane == 0u && output < uint(OUT)) {
+                y[input_row * uint(OUT) + output] = T(total);
+            }
+        }
+    }
+"""
+
 _NINT_MMQ_WIDE_SOURCE = r"""
     constexpr uint SIMD_GROUPS = 2u;
     constexpr uint K_LANES = 8u;
@@ -1341,6 +1457,10 @@ _NINT4_GS24_GEMV_KERNEL = _nint_kernel(
     "mfq_nint4_gs24_packed_gemv",
     _NINT4_GS24_GEMV_SOURCE,
 )
+_NINT4_GS24_M2_KERNEL = _nint_kernel(
+    "mfq_nint4_gs24_packed_m2",
+    _NINT4_GS24_M2_SOURCE,
+)
 _NINT6_GS24_GEMV_KERNEL = _nint_kernel(
     "mfq_nint6_gs24_packed_gemv",
     _NINT6_GS24_GEMV_SOURCE,
@@ -1400,6 +1520,13 @@ def _pack_qbits(values: np.ndarray, bits: int) -> np.ndarray:
     if int(bits) == 8:
         return flat
 
+    if int(bits) == 4:
+        packed = np.empty((flat.size + 1) // 2, dtype=np.uint8)
+        packed[:] = flat[0::2] & 15
+        odd = flat[1::2]
+        packed[: odd.size] |= (odd & 15) << 4
+        return packed
+
     bit_rows = np.unpackbits(flat[:, None], axis=-1, bitorder="little")[:, :bits]
     packed = np.packbits(bit_rows.reshape(-1), bitorder="little")
     return np.ascontiguousarray(packed, dtype=np.uint8)
@@ -1443,11 +1570,70 @@ def _unpack_metadata(
     packed = np.frombuffer(blob, dtype=np.uint8, count=nbytes, offset=offset)
     if int(bits) == 8:
         return packed.copy(), end
-    bitstream = np.unpackbits(packed, bitorder="little")[: count * bits]
-    bitstream = bitstream.reshape(count, bits)
-    shifts = 1 << np.arange(bits, dtype=np.uint16)
-    values = (bitstream.astype(np.uint16) * shifts).sum(axis=1).astype(np.uint8)
+    # Eight sub-byte values always occupy exactly ``bits`` bytes.  Decode in
+    # bounded chunks rather than expanding the complete stream to one bit per
+    # byte; the latter needs multiple gigabytes for full-size MoE cohorts.
+    values = np.empty(int(count), dtype=np.uint8)
+    full_blocks = int(count) // 8
+    blocks_per_chunk = 1 << 20
+    mask = (1 << int(bits)) - 1
+    for block_start in range(0, full_blocks, blocks_per_chunk):
+        block_end = min(full_blocks, block_start + blocks_per_chunk)
+        byte_start = block_start * int(bits)
+        byte_end = block_end * int(bits)
+        blocks = packed[byte_start:byte_end].reshape(-1, int(bits))
+        value_start = block_start * 8
+        value_end = block_end * 8
+        for value_index in range(8):
+            bit_position = value_index * int(bits)
+            byte_index, shift = divmod(bit_position, 8)
+            decoded = blocks[:, byte_index].astype(np.uint16) >> shift
+            if shift + int(bits) > 8:
+                decoded |= blocks[:, byte_index + 1].astype(np.uint16) << (8 - shift)
+            values[value_start + value_index : value_end : 8] = decoded & mask
+    tail = int(count) - full_blocks * 8
+    if tail:
+        tail_offset = full_blocks * int(bits)
+        accumulator = int.from_bytes(
+            packed[tail_offset:].tobytes(),
+            byteorder="little",
+        )
+        for value_index in range(tail):
+            values[full_blocks * 8 + value_index] = (
+                accumulator >> (value_index * int(bits))
+            ) & mask
     return values, end
+
+
+_MLX_MAX_DIMENSION = (1 << 31) - 1
+
+
+def _mlx_safe_buffer_shape(
+    values: np.ndarray,
+    *,
+    preferred_rows: int | None = None,
+) -> np.ndarray:
+    """Keep large buffers contiguous without creating an oversized MLX axis."""
+
+    source = np.ascontiguousarray(values)
+    if all(int(value) <= _MLX_MAX_DIMENSION for value in source.shape):
+        return source
+    size = int(source.size)
+    candidates: list[int] = []
+    if preferred_rows is not None and int(preferred_rows) > 1:
+        candidates.append(int(preferred_rows))
+    minimum_rows = (size + _MLX_MAX_DIMENSION - 1) // _MLX_MAX_DIMENSION
+    candidates.extend(range(max(2, minimum_rows), max(2, minimum_rows) + 1024))
+    for rows in candidates:
+        if (
+            rows <= _MLX_MAX_DIMENSION
+            and size % rows == 0
+            and size // rows <= _MLX_MAX_DIMENSION
+        ):
+            return source.reshape((rows, size // rows))
+    raise OverflowError(
+        f"packed buffer with {size} values cannot be represented by safe MLX dimensions"
+    )
 
 
 def _metadata_u8(values: np.ndarray, name: str) -> np.ndarray:
@@ -1490,10 +1676,9 @@ class MetalNintWeight:
             raise ValueError("NINT neuron metadata shape mismatch")
 
         bits = int(tensor.spec.bits)
+        q_packed = _pack_q5_exec(tensor.q) if bits == 5 else _pack_qbits(tensor.q, bits)
         return cls(
-            q_packed=mx.array(
-                _pack_q5_exec(tensor.q) if bits == 5 else _pack_qbits(tensor.q, bits)
-            ),
+            q_packed=mx.array(_mlx_safe_buffer_shape(q_packed, preferred_rows=out)),
             sub_scale=mx.array(_metadata_u8(tensor.sub_scale, "sub_scale")),
             sub_min=mx.array(_metadata_u8(tensor.sub_min, "sub_min")),
             neuron_scale=mx.array(np.ascontiguousarray(tensor.neuron_scale, dtype=np.float32)),
@@ -1556,7 +1741,7 @@ class MetalNintWeight:
             sub_min, offset = _unpack_metadata(blob, offset, metadata_count, int(sub_bits))
             q_packed = np.frombuffer(
                 blob, dtype=np.uint8, count=packed_q_nbytes, offset=offset
-            ).copy()
+            )
             offset += packed_q_nbytes
         elif remaining == old_tail_nbytes:
             sub_scale = np.frombuffer(
@@ -1585,7 +1770,12 @@ class MetalNintWeight:
             q_packed = _pack_q5_exec(q_values.reshape(out, groups, int(groupsize)))
 
         return cls(
-            q_packed=mx.array(np.ascontiguousarray(q_packed, dtype=np.uint8)),
+            q_packed=mx.array(
+                _mlx_safe_buffer_shape(
+                    np.ascontiguousarray(q_packed, dtype=np.uint8),
+                    preferred_rows=out,
+                )
+            ),
             sub_scale=mx.array(_metadata_u8(sub_scale, "sub_scale")),
             sub_min=mx.array(_metadata_u8(sub_min, "sub_min")),
             neuron_scale=mx.array(neuron_scale),
@@ -1671,6 +1861,23 @@ def _can_use_nint4_gs24_decode(
     )
 
 
+def _can_use_nint4_gs24_m2_decode(
+    weight: MetalNintWeight,
+    source: mx.array,
+    rows: int,
+) -> bool:
+    """Return whether the fused two-row NINT4/GS24 kernel is valid."""
+
+    return (
+        int(rows) == 2
+        and weight.bits == 4
+        and weight.groupsize == 24
+        and weight.neuron_len % 4 == 0
+        and not weight.q5_exec
+        and source.dtype == mx.float16
+    )
+
+
 def _can_use_nint6_gs24_decode(
     weight: MetalNintWeight,
     source: mx.array,
@@ -1685,6 +1892,19 @@ def _can_use_nint6_gs24_decode(
         and not weight.q5_exec
         and source.dtype == mx.float16
     )
+
+
+def _maximum_scalar_gemm_rows(out_features: int, tile_rows: int) -> int:
+    """Largest M whose one-dimensional Metal grid fits MLX's signed ABI."""
+
+    output = int(out_features)
+    tile = int(tile_rows)
+    if output <= 0 or tile <= 0:
+        raise ValueError("NINT scalar GEMM dimensions must be positive")
+    maximum_row_tiles = ((1 << 31) - 1) // (output * 32)
+    if maximum_row_tiles <= 0:
+        raise OverflowError("Metal NINT output width exceeds the launch-grid limit")
+    return maximum_row_tiles * tile
 
 
 def _nint_matmul_path(
@@ -1732,7 +1952,14 @@ def _nint_matmul_path(
         if not 2 <= rows <= 16:
             raise ValueError("NINT MMQ requires 2 to 16 input rows")
         tile_rows = rows
-        if weight.q5_exec:
+        if _can_use_nint4_gs24_m2_decode(weight, source_2d, rows):
+            # One launch decodes each packed weight once and reuses it across
+            # both verification rows, while retaining the tuned 16-output
+            # threadgroup geometry of the single-row GS24 path.
+            kernel = _NINT4_GS24_M2_KERNEL
+            grid = (((weight.out + 15) // 16) * 256, 1, 1)
+            threadgroup = (256, 1, 1)
+        elif weight.q5_exec:
             # The NINT5 low4/high1 group layout is decoded by eight K lanes and
             # reused across the complete small-M tile.
             kernel = _NINT_MMQ_WIDE_KERNEL
@@ -1762,6 +1989,26 @@ def _nint_matmul_path(
             threadgroup = (32, 1, 1)
     else:
         raise ValueError(f"unknown Metal NINT matmul path: {path}")
+
+    # MLX exposes the Metal grid dimensions through signed 32-bit integers.
+    # The scalar GEMM maps one 32-thread SIMD group to every output row/tile;
+    # a long multimodal prefill can therefore overflow grid.x even though each
+    # tensor dimension itself is valid.  Keep the packed path and split only
+    # the M dimension at that launch boundary.
+    maximum_grid_x = (1 << 31) - 1
+    if int(grid[0]) > maximum_grid_x:
+        if path != "gemm" or kernel is _NINT_GEMM_MATRIX_KERNEL:
+            raise OverflowError("Metal NINT launch grid exceeds the signed 32-bit limit")
+        chunk_rows = _maximum_scalar_gemm_rows(weight.out, tile_rows)
+        chunks = [
+            _nint_matmul_path(
+                weight,
+                source_2d[start : min(start + chunk_rows, rows)],
+                path="gemm",
+            )
+            for start in range(0, rows, chunk_rows)
+        ]
+        return mx.concatenate(chunks, axis=0).reshape((*prefix, weight.out))
 
     output = kernel(
         inputs=[

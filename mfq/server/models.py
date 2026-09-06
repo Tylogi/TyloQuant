@@ -579,6 +579,11 @@ class ModelLoadRequest(ProtocolModel):
     prefix_cache_max_sessions: int | None = Field(default=None, ge=0)
     prefix_cache_max_snapshots_per_session: int | None = Field(default=None, ge=0)
     prefix_cache_max_bytes: int | None = Field(default=None, ge=0)
+    prefix_cache_enabled: bool = True
+    prefix_cache_disk_bytes: int | None = Field(default=None, ge=0)
+    prefix_cache_hot_bytes: int | None = Field(default=None, ge=0)
+    prefix_cache_block_tokens: int | None = Field(default=None, ge=1, le=65536)
+    prefix_cache_pending_bytes: int | None = Field(default=None, ge=0)
     sampling_defaults: SamplingParams | None = None
 
 class CreateRuntimeProfileRequest(ProtocolModel):
@@ -702,6 +707,8 @@ class RuntimeInstanceResource(ProtocolModel):
     context_size: int | None = Field(default=None, ge=1)
     started_at: AwareDatetime | None = None
     last_used_at: AwareDatetime | None = None
+    idle_ttl_seconds: int | None = Field(default=None, ge=0)
+    pinned: bool = False
     identity: RuntimeIdentity | None = None
     error: ErrorDetail | None = None
 

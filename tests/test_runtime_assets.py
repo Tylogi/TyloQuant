@@ -6,16 +6,22 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from mfq.formats import io
 from mfq.formats.assets import (
     ASSET_MANIFEST_KEY,
+    HF_CHAT_TEMPLATE_ASSET,
+    HF_GENERATION_CONFIG_ASSET,
+    HF_TOKENIZER_CONFIG_ASSET,
+    HF_TOKENIZER_JSON_ASSET,
     MINICPMO45_RESAMPLER_POS_EMBED_ASSET,
     MODEL_CONFIG_ASSET,
-    RuntimeAsset,
     TOKENIZER_GGUF_ASSET,
+    RuntimeAsset,
     gguf_metadata_asset,
+    hf_runtime_assets,
     minicpmo45_resampler_pos_embed_asset,
     model_config_asset,
     runtime_asset_manifest,
@@ -85,6 +91,32 @@ def test_gguf_metadata_asset_removes_tensor_table() -> None:
     assert struct.unpack_from("<Q", asset.data, 8)[0] == 0
     assert struct.unpack_from("<Q", asset.data, 16)[0] == 2
     assert len(asset.data) == 64
+
+
+def test_hf_runtime_assets_are_self_contained_and_validate_json(tmp_path: Path) -> None:
+    root = tmp_path / "hf"
+    root.mkdir()
+    (root / "tokenizer.json").write_text('{"model":{"type":"BPE"}}')
+    (root / "tokenizer_config.json").write_text('{"eos_token":"<eos>"}')
+    (root / "chat_template.jinja").write_text("{{ messages }}")
+    (root / "generation_config.json").write_text('{"temperature":0.7}')
+
+    assets = {asset.name: asset for asset in hf_runtime_assets(root)}
+
+    assert set(assets) == {
+        HF_TOKENIZER_JSON_ASSET,
+        HF_TOKENIZER_CONFIG_ASSET,
+        HF_CHAT_TEMPLATE_ASSET,
+        HF_GENERATION_CONFIG_ASSET,
+    }
+    assert assets[HF_CHAT_TEMPLATE_ASSET].data == b"{{ messages }}"
+    assert json.loads(assets[HF_GENERATION_CONFIG_ASSET].data)["temperature"] == 0.7
+
+
+def test_hf_runtime_assets_require_tokenizer_pair(tmp_path: Path) -> None:
+    (tmp_path / "tokenizer.json").write_text("{}")
+    with pytest.raises(FileNotFoundError, match="tokenizer_config.json"):
+        hf_runtime_assets(tmp_path)
 
 
 def test_minicpmo45_resampler_position_asset_matches_official_numpy_bf16() -> None:

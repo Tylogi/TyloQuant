@@ -32,6 +32,8 @@ from mfq.server.models import (
 )
 from mfq.server.native import (
     find_native_runtime_resource,
+    flash_next_runtime_command,
+    is_flash_next_architecture,
     native_runtime_environment,
     native_tokenizer_arguments,
 )
@@ -62,6 +64,8 @@ class _ManagedRuntime:
     port: int
     context_size: int
     sampling_defaults: SamplingParams | None = None
+    idle_ttl_seconds: int | None = None
+    pinned: bool = False
     state: RuntimeInstanceState = RuntimeInstanceState.LOADING
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_used_at: datetime | None = None
@@ -90,6 +94,8 @@ class ManagedRuntimePool:
         metric_interval_seconds: float = 2.0,
         backend: str = "metal",
         voice_component: Any | None = None,
+        runtime_environment: dict[str, str] | None = None,
+        controller_command: Sequence[str] = (),
     ) -> None:
         if max_instances < 1:
             raise ValueError("max_instances must be positive")
@@ -106,6 +112,8 @@ class ManagedRuntimePool:
             raise ValueError(f"unsupported native backend: {backend}")
         self.backend = backend
         self.voice_component = voice_component
+        self.runtime_environment = dict(runtime_environment or {})
+        self.controller_command = tuple(str(value) for value in controller_command)
         self.store = None
         self._instances: dict[UUID, _ManagedRuntime] = {}
         self._loading_model_names: set[str] = set()
@@ -113,6 +121,8 @@ class ManagedRuntimePool:
         self._last_instance_id: UUID | None = None
         self._lock = asyncio.Lock()
         self._realtime_activation_lock = asyncio.Lock()
+        self._idle_reaper_task: asyncio.Task[None] | None = None
+        self._idle_reaper_wakeup = asyncio.Event()
         self._closed = False
 
     async def start(self) -> None:
@@ -127,6 +137,12 @@ class ManagedRuntimePool:
                         self._monitor(instance),
                         name=f"mfq-server-runtime-monitor-{instance.id}",
                     )
+            if self._idle_reaper_task is None or self._idle_reaper_task.done():
+                self._idle_reaper_wakeup.clear()
+                self._idle_reaper_task = asyncio.create_task(
+                    self._idle_reaper(),
+                    name="mfq-server-runtime-idle-reaper",
+                )
         if self.voice_component is not None and self.voice_component.ready():
             asyncio.create_task(
                 self.enable_realtime(),
@@ -182,11 +198,6 @@ class ManagedRuntimePool:
             raise _job_error("unsupported_device", "the Metal runtime accepts device 'metal'")
         if self.backend == "cuda" and any(not value.isdecimal() for value in request.device_ids):
             raise _job_error("unsupported_device", "CUDA device IDs must be non-negative integers")
-        if request.idle_ttl_seconds is not None or request.pin:
-            raise _job_error(
-                "unsupported_model_policy",
-                "runtime pinning and idle eviction are not implemented yet",
-            )
         try:
             artifact = await self.catalog.resolve(request.model, request.artifact_uri)
         except ModelArtifactNotFoundError as error:
@@ -195,9 +206,31 @@ class ManagedRuntimePool:
             ) from error
         if not artifact.resource.loadable:
             raise _job_error(
-                "model_artifact_incomplete",
+                (
+                    "model_conversion_required"
+                    if artifact.resource.complete and artifact.resource.format == "hf"
+                    else "model_artifact_incomplete"
+                ),
                 artifact.resource.error or "model artifact is incomplete",
             )
+        flash_next = is_flash_next_architecture(artifact.resource.architecture)
+        if flash_next and artifact.resource.format != "mfq":
+            raise _job_error(
+                "model_conversion_required",
+                "Qwen3.8-Flash-Next and GLM-5.3-Flash HF checkpoints must be "
+                "converted to MFQ before inference",
+            )
+        if flash_next and self.backend != "metal":
+            raise _job_error(
+                "unsupported_device",
+                "Flash-Next MFQ inference currently requires Metal",
+            )
+        if flash_next and not self.controller_command:
+            raise _job_error(
+                "runtime_launcher_missing",
+                "Flash-Next runtime has no MFQ CLI launcher",
+            )
+        evicted: _ManagedRuntime | None = None
         async with self._lock:
             if self._closed:
                 raise RuntimeManagementError("runtime pool is closed")
@@ -223,38 +256,82 @@ class ManagedRuntimePool:
                 item.state != RuntimeInstanceState.FAILED for item in self._instances.values()
             ) + len(self._loading_model_names)
             if active_count >= self.max_instances:
-                raise _job_error("runtime_instance_limit", "managed runtime instance limit reached")
+                evicted = self._detach_lru_instance_locked()
+                if evicted is None:
+                    raise _job_error(
+                        "runtime_instance_limit",
+                        "managed runtime instance limit reached; all instances are pinned or busy",
+                    )
             port = self._free_port()
             self._loading_model_names.add(model_name)
 
-        command = [
-            str(self.executable),
-            "--mfq",
-            str(artifact.path),
-            "--server",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--ctx-size",
-            str(request.context_size),
-            "--model-name",
-            artifact.resource.name,
-        ]
-        if self.backend == "metal":
-            command.extend(["--prefill-chunk-size", str(request.prefill_chunk_size)])
-        command.extend(native_tokenizer_arguments(artifact.path))
-        if request.moe_gpu_cache_gb is not None:
-            command.extend(["--moe-gpu-cache-gb", str(request.moe_gpu_cache_gb)])
+        if evicted is not None:
+            try:
+                await context.log(
+                    f"Evicting idle runtime {evicted.artifact.resource.name} "
+                    f"before loading {model_name}"
+                )
+                await self._stop_process(evicted)
+            except BaseException:
+                async with self._lock:
+                    self._loading_model_names.discard(model_name)
+                raise
+
+        if flash_next:
+            command = flash_next_runtime_command(
+                self.controller_command,
+                model=artifact.path,
+                model_name=artifact.resource.name,
+                host="127.0.0.1",
+                port=port,
+                context_size=request.context_size,
+                prefill_chunk_size=request.prefill_chunk_size,
+            )
+        else:
+            command = [
+                str(self.executable),
+                "--mfq",
+                str(artifact.path),
+                "--server",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--ctx-size",
+                str(request.context_size),
+                "--model-name",
+                artifact.resource.name,
+            ]
+            if self.backend == "metal":
+                command.extend(["--prefill-chunk-size", str(request.prefill_chunk_size)])
+            command.extend(native_tokenizer_arguments(artifact.path))
+            if request.moe_gpu_cache_gb is not None:
+                command.extend(["--moe-gpu-cache-gb", str(request.moe_gpu_cache_gb)])
         process_environment = native_runtime_environment(
             self.executable, self.backend, model=artifact.path
         )
+        process_environment.update(self.runtime_environment)
         cache_environment = {
             "MFQ_SERVER_MAX_KV_SESSIONS": request.prefix_cache_max_sessions,
             "MFQ_SERVER_MAX_KV_SNAPSHOTS_PER_SESSION": (
                 request.prefix_cache_max_snapshots_per_session
             ),
             "MFQ_SERVER_KV_SESSION_BYTES": request.prefix_cache_max_bytes,
+            "MFQ_SERVER_DISABLE_PREFIX_CACHE": (
+                None if request.prefix_cache_enabled else 1
+            ),
+            "MFQ_SERVER_PREFIX_CACHE_DISK_BYTES": request.prefix_cache_disk_bytes,
+            "MFQ_SERVER_PREFIX_CACHE_HOT_BYTES": (
+                request.prefix_cache_hot_bytes
+                if request.prefix_cache_hot_bytes is not None
+                else request.prefix_cache_max_bytes
+            ),
+            "MFQ_SERVER_PREFIX_CACHE_BLOCK_TOKENS": (
+                request.prefix_cache_block_tokens
+            ),
+            "MFQ_SERVER_PREFIX_CACHE_PENDING_BYTES": (
+                request.prefix_cache_pending_bytes
+            ),
         }
         for name, value in cache_environment.items():
             if value is not None:
@@ -303,6 +380,8 @@ class ManagedRuntimePool:
             port=port,
             context_size=request.context_size,
             sampling_defaults=request.sampling_defaults,
+            idle_ttl_seconds=request.idle_ttl_seconds,
+            pinned=request.pin,
             request_slots=asyncio.Semaphore(self.max_requests_per_instance),
         )
         try:
@@ -393,8 +472,12 @@ class ManagedRuntimePool:
                 "runtime_instance_not_found",
                 f"runtime instance was not found: {request.instance_id}",
             )
-        if instance.active_requests and not request.force:
-            raise _job_error("runtime_busy", "runtime has active requests", retryable=True)
+        if (instance.active_requests or instance.queued_requests) and not request.force:
+            raise _job_error(
+                "runtime_busy",
+                "runtime has active or queued requests",
+                retryable=True,
+            )
         instance.state = RuntimeInstanceState.UNLOADING
         await context.progress(0.2, message="Stopping runtime")
         await self._stop_process(instance)
@@ -431,6 +514,8 @@ class ManagedRuntimePool:
                     context_size=item.context_size,
                     started_at=item.started_at,
                     last_used_at=item.last_used_at,
+                    idle_ttl_seconds=item.idle_ttl_seconds,
+                    pinned=item.pinned,
                     error=item.error,
                 )
                 for item in values
@@ -463,23 +548,36 @@ class ManagedRuntimePool:
             ):
                 yield delta
             return
-        if instance.state not in {RuntimeInstanceState.READY, RuntimeInstanceState.BUSY}:
-            raise BackendError("model_not_ready", f"model runtime is {instance.state.value}")
         assert instance.request_slots is not None
         acquired = False
-        instance.queued_requests += 1
+        async with self._lock:
+            if self._instances.get(instance.id) is not instance or instance.state not in {
+                RuntimeInstanceState.READY,
+                RuntimeInstanceState.BUSY,
+            }:
+                raise BackendError("model_not_ready", f"model runtime is {instance.state.value}")
+            instance.queued_requests += 1
         try:
             await instance.request_slots.acquire()
             acquired = True
-        finally:
-            instance.queued_requests = max(0, instance.queued_requests - 1)
-        instance.active_requests += 1
-        instance.state = RuntimeInstanceState.BUSY
-        instance.last_used_at = datetime.now(timezone.utc)
-        if session_id is not None:
+        except BaseException:
             async with self._lock:
+                instance.queued_requests = max(0, instance.queued_requests - 1)
+            raise
+        async with self._lock:
+            instance.queued_requests = max(0, instance.queued_requests - 1)
+            if self._instances.get(instance.id) is not instance or instance.state not in {
+                RuntimeInstanceState.READY,
+                RuntimeInstanceState.BUSY,
+            }:
+                instance.request_slots.release()
+                raise BackendError("model_not_ready", f"model runtime is {instance.state.value}")
+            instance.active_requests += 1
+            instance.state = RuntimeInstanceState.BUSY
+            instance.last_used_at = datetime.now(timezone.utc)
+            if session_id is not None:
                 self._session_routes[session_id] = instance.id
-                self._last_instance_id = instance.id
+            self._last_instance_id = instance.id
         try:
             async for delta in instance.backend.stream(
                 model=instance.artifact.resource.name,
@@ -492,12 +590,13 @@ class ManagedRuntimePool:
             ):
                 yield delta
         finally:
-            instance.active_requests = max(0, instance.active_requests - 1)
-            if acquired:
-                instance.request_slots.release()
-            if instance.state == RuntimeInstanceState.BUSY and instance.active_requests == 0:
-                instance.state = RuntimeInstanceState.READY
-            instance.last_used_at = datetime.now(timezone.utc)
+            async with self._lock:
+                instance.active_requests = max(0, instance.active_requests - 1)
+                if acquired:
+                    instance.request_slots.release()
+                if instance.state == RuntimeInstanceState.BUSY and instance.active_requests == 0:
+                    instance.state = RuntimeInstanceState.READY
+                instance.last_used_at = datetime.now(timezone.utc)
 
     async def fork_session(self, source_session_id: UUID, target_session_id: UUID) -> bool:
         async with self._lock:
@@ -697,6 +796,11 @@ class ManagedRuntimePool:
         async with self._lock:
             self._closed = True
             instances = list(self._instances.values())
+            idle_reaper = self._idle_reaper_task
+            self._idle_reaper_task = None
+            self._idle_reaper_wakeup.set()
+        if idle_reaper is not None and idle_reaper is not asyncio.current_task():
+            await idle_reaper
         for instance in instances:
             await self._stop_process(instance)
         async with self._lock:
@@ -742,6 +846,95 @@ class ManagedRuntimePool:
                 None,
             )
         return instance
+
+    def _detach_lru_instance_locked(self) -> _ManagedRuntime | None:
+        candidates = [
+            item
+            for item in self._instances.values()
+            if not item.pinned
+            and item.state == RuntimeInstanceState.READY
+            and item.active_requests == 0
+            and item.queued_requests == 0
+        ]
+        if not candidates:
+            return None
+        victim = min(
+            candidates,
+            key=lambda item: (item.last_used_at or item.started_at, item.started_at),
+        )
+        victim.state = RuntimeInstanceState.UNLOADING
+        self._detach_instance_locked(victim)
+        return victim
+
+    def _detach_instance_locked(self, instance: _ManagedRuntime) -> None:
+        self._instances.pop(instance.id, None)
+        self._session_routes = {
+            session_id: instance_id
+            for session_id, instance_id in self._session_routes.items()
+            if instance_id != instance.id
+        }
+        if self._last_instance_id == instance.id:
+            self._last_instance_id = next(
+                (
+                    item.id
+                    for item in self._instances.values()
+                    if item.state in {RuntimeInstanceState.READY, RuntimeInstanceState.BUSY}
+                ),
+                None,
+            )
+
+    async def _idle_reaper(self) -> None:
+        while True:
+            with suppress(TimeoutError):
+                await asyncio.wait_for(
+                    self._idle_reaper_wakeup.wait(),
+                    timeout=self.metric_interval_seconds,
+                )
+            self._idle_reaper_wakeup.clear()
+            victims: list[_ManagedRuntime] = []
+            now = datetime.now(timezone.utc)
+            async with self._lock:
+                if self._closed:
+                    return
+                for instance in list(self._instances.values()):
+                    if (
+                        instance.idle_ttl_seconds is None
+                        or instance.pinned
+                        or instance.state != RuntimeInstanceState.READY
+                        or instance.active_requests != 0
+                        or instance.queued_requests != 0
+                        or instance.last_used_at is None
+                    ):
+                        continue
+                    idle_seconds = (now - instance.last_used_at).total_seconds()
+                    if idle_seconds < instance.idle_ttl_seconds:
+                        continue
+                    instance.state = RuntimeInstanceState.UNLOADING
+                    self._detach_instance_locked(instance)
+                    victims.append(instance)
+            for instance in victims:
+                try:
+                    await self._stop_process(instance)
+                    if self.store is not None:
+                        await asyncio.to_thread(
+                            self.store.append_runtime_log,
+                            RuntimeLogLevel.INFO,
+                            (
+                                f"runtime unloaded after {instance.idle_ttl_seconds}s "
+                                "of inactivity"
+                            ),
+                            instance_id=instance.id,
+                            fields={"source": "runtime.lifecycle", "reason": "idle_ttl"},
+                        )
+                except Exception as error:
+                    if self.store is not None:
+                        await asyncio.to_thread(
+                            self.store.append_runtime_log,
+                            RuntimeLogLevel.ERROR,
+                            f"idle runtime unload failed: {error}",
+                            instance_id=instance.id,
+                            fields={"source": "runtime.lifecycle", "reason": "idle_ttl"},
+                        )
 
     @staticmethod
     def _supports_voice_output(architecture: str) -> bool:

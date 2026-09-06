@@ -73,6 +73,7 @@ class MlxRoPE:
         sections: Sequence[int] | None = None,
         frequency_dim: int | None = None,
         active_pairs: int | None = None,
+        mrope_interleaved: bool = False,
     ) -> None:
         self.rotary_dim = int(rotary_dim)
         self.max_position_embeddings = int(max_position_embeddings)
@@ -80,6 +81,7 @@ class MlxRoPE:
         self.sections = None if sections is None else tuple(int(value) for value in sections)
         self.frequency_dim = None if frequency_dim is None else int(frequency_dim)
         self.active_pairs = None if active_pairs is None else int(active_pairs)
+        self.mrope_interleaved = bool(mrope_interleaved)
         rope_tables(
             self.base,
             self.rotary_dim,
@@ -105,6 +107,7 @@ class MlxRoPE:
             sequence_axis=sequence_axis,
             frequency_dim=self.frequency_dim,
             active_pairs=self.active_pairs,
+            mrope_interleaved=self.mrope_interleaved,
         )
 
     def __call__(

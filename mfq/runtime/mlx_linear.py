@@ -21,6 +21,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
 
 from mfq.formats import io
 from mfq.formats.io import MfqTensor
+from mfq.formats.moe import NintMoeTensor
 from mfq.formats.mx import MxTensor
 from mfq.formats.nepq import NepqTensor
 from mfq.formats.nint import NintTensor
@@ -528,6 +529,30 @@ class MlxNintModel:
             self.linear(down_name),
             important_neurons=high,
         )
+
+    def routed(self, name: str):
+        """Load one NINTM routed projection, preserving mmap bit-packing."""
+
+        from mfq.kernels.metal.moe import UnsupportedGroupedMoeError
+        from mfq.runtime.mlx_moe import MlxRoutedLinear
+
+        if isinstance(self.tensors, io.MMapTensorStore):
+            if name not in self.tensors.records:
+                raise KeyError(f"tensor {name!r} is not present in the MFQ model")
+            record = self.tensors.records[name]
+            if record.dtype == "NINTM":
+                view = self.tensors.blob_view(record)
+                try:
+                    try:
+                        return MlxRoutedLinear.from_blob(view)
+                    except UnsupportedGroupedMoeError:
+                        pass
+                finally:
+                    view.release()
+        tensor = self._require(name)
+        if not isinstance(tensor, NintMoeTensor):
+            raise TypeError(f"tensor {name!r} must use NINTM")
+        return MlxRoutedLinear(tensor)
 
     def close(self) -> None:
         close = getattr(self.tensors, "close", None)

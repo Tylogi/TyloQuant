@@ -52,6 +52,15 @@ class MultimodalProcessor(Protocol):
 class _PreparedVideoFrame:
     image: Any
     source_size: tuple[int, int]
+    presentation_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class _DecodedVideo:
+    frames: tuple[_PreparedVideoFrame, ...]
+    frame_indices: tuple[int, ...]
+    frames_per_second: float
+    duration_seconds: float
 
 
 class _AVFoundationVideoDecoder:
@@ -88,14 +97,13 @@ class _AVFoundationVideoDecoder:
         function.restype = ctypes.c_int
         self._sample = function
 
-    def decode(
+    def _decode_selected(
         self,
         data: bytes,
         *,
-        frames_per_second: float,
-        maximum_frames: int,
+        select_indices: Any,
         resize: Any,
-    ) -> list[_PreparedVideoFrame]:
+    ) -> _DecodedVideo:
         import av
 
         descriptor, temporary_path = tempfile.mkstemp(prefix="mfq-video-", suffix=".mp4")
@@ -110,6 +118,17 @@ class _AVFoundationVideoDecoder:
                 if stream.time_base is None:
                     raise VisionProcessingError("video stream has no time base")
                 time_base = stream.time_base
+                frames_per_second = (
+                    float(stream.average_rate) if stream.average_rate else 30.0
+                )
+                if not math.isfinite(frames_per_second) or frames_per_second <= 0.0:
+                    frames_per_second = 30.0
+                if stream.duration is not None:
+                    duration_seconds = float(stream.duration * time_base)
+                elif container.duration is not None:
+                    duration_seconds = float(container.duration) / 1_000_000.0
+                else:
+                    duration_seconds = 0.0
                 codec = stream.codec_context
                 color_metadata = {
                     name: getattr(codec, name)
@@ -123,18 +142,24 @@ class _AVFoundationVideoDecoder:
                 packet_pts = sorted(
                     packet.pts for packet in container.demux(stream) if packet.pts is not None
                 )
-            selected_pts: list[int] = []
-            next_timestamp: float | None = None
-            for pts in packet_pts:
-                timestamp = float(pts * time_base)
-                if next_timestamp is not None and timestamp + 1.0e-9 < next_timestamp:
-                    continue
-                selected_pts.append(pts)
-                next_timestamp = timestamp + 1.0 / frames_per_second
-                if len(selected_pts) >= maximum_frames:
-                    break
-            if not selected_pts:
+            if not packet_pts:
                 raise VisionProcessingError("video contains no decodable frames")
+            if duration_seconds <= 0.0:
+                duration_seconds = len(packet_pts) / frames_per_second
+            selected_indices = tuple(
+                int(value)
+                for value in select_indices(
+                    tuple(packet_pts),
+                    time_base,
+                    frames_per_second,
+                    duration_seconds,
+                )
+            )
+            if not selected_indices:
+                raise VisionProcessingError("video sampling selected no frames")
+            if any(value < 0 or value >= len(packet_pts) for value in selected_indices):
+                raise VisionProcessingError("video sampling selected an invalid frame index")
+            selected_pts = [packet_pts[value] for value in selected_indices]
 
             ctypes = self._ctypes
             targets = (ctypes.c_int64 * len(selected_pts))(*selected_pts)
@@ -150,7 +175,7 @@ class _AVFoundationVideoDecoder:
                 uv_stride: int,
                 width: int,
                 height: int,
-                _presentation_seconds: float,
+                presentation_seconds: float,
             ) -> int:
                 try:
                     if target_index < 0 or target_index >= len(frames):
@@ -172,6 +197,7 @@ class _AVFoundationVideoDecoder:
                     frames[target_index] = _PreparedVideoFrame(
                         image=resize(image),
                         source_size=image.size,
+                        presentation_seconds=float(presentation_seconds),
                     )
                     return 0
                 except BaseException as error:
@@ -203,10 +229,77 @@ class _AVFoundationVideoDecoder:
                 )
             if any(frame is None for frame in frames):
                 raise VisionProcessingError("AVFoundation omitted a selected video frame")
-            return [frame for frame in frames if frame is not None]
+            return _DecodedVideo(
+                frames=tuple(frame for frame in frames if frame is not None),
+                frame_indices=selected_indices,
+                frames_per_second=frames_per_second,
+                duration_seconds=duration_seconds,
+            )
         finally:
             with suppress(FileNotFoundError):
                 os.unlink(temporary_path)
+
+    def decode(
+        self,
+        data: bytes,
+        *,
+        frames_per_second: float,
+        maximum_frames: int,
+        resize: Any,
+    ) -> list[_PreparedVideoFrame]:
+        def select(
+            packet_pts: tuple[int, ...],
+            time_base: Any,
+            _source_fps: float,
+            _duration_seconds: float,
+        ) -> tuple[int, ...]:
+            selected: list[int] = []
+            next_timestamp: float | None = None
+            for index, pts in enumerate(packet_pts):
+                timestamp = float(pts * time_base)
+                if next_timestamp is not None and timestamp + 1.0e-9 < next_timestamp:
+                    continue
+                selected.append(index)
+                next_timestamp = timestamp + 1.0 / frames_per_second
+                if len(selected) >= maximum_frames:
+                    break
+            return tuple(selected)
+
+        return list(
+            self._decode_selected(
+                data,
+                select_indices=select,
+                resize=resize,
+            ).frames
+        )
+
+    def decode_sampled(
+        self,
+        data: bytes,
+        *,
+        sample_indices: Any,
+        resize: Any,
+    ) -> _DecodedVideo:
+        def select(
+            packet_pts: tuple[int, ...],
+            _time_base: Any,
+            source_fps: float,
+            duration_seconds: float,
+        ) -> tuple[int, ...]:
+            return tuple(
+                int(value)
+                for value in sample_indices(
+                    len(packet_pts),
+                    source_fps,
+                    duration_seconds,
+                )
+            )
+
+        return self._decode_selected(
+            data,
+            select_indices=select,
+            resize=resize,
+        )
 
 
 class MiniCPMO45VisionProcessor:
@@ -654,13 +747,13 @@ class MiniCPMO45VisionProcessor:
                     if padding:
                         stream.write(bytes(padding))
                         offset += padding
-                    raw = packed.tobytes()
+                    raw = memoryview(packed).cast("B")
                     stream.write(raw)
                     tensors[name] = {
                         "dtype": dtype,
                         "shape": list(packed.shape),
                         "data_offset": offset,
-                        "data_length": len(raw),
+                        "data_length": packed.nbytes,
                     }
                 tensors["binary_file"]["size"] = stream.tell()
             return tensors, path
@@ -833,6 +926,769 @@ class MiniCPMO45VisionProcessor:
             frame_count=frame_count,
             cleanup_paths=cleanup_paths,
         )
+
+
+class _FlashNextImageProcessor:
+    """Dependency-light image/video preprocessing for the new VLM families."""
+
+    processor_name = ""
+    patch_size = 0
+    temporal_patch_size = 2
+    merge_size = 2
+    image_mean: tuple[float, float, float]
+    image_std: tuple[float, float, float]
+    forbidden_text_tokens: tuple[str, ...]
+    video_fps = 2.0
+    maximum_video_frames = 0
+
+    def __init__(self, avfoundation_library: str | Path | None = None) -> None:
+        library = avfoundation_library or os.environ.get("MFQ_AVFOUNDATION_VIDEO_LIBRARY")
+        self._avfoundation_decoder: _AVFoundationVideoDecoder | None = None
+        if platform.system() == "Darwin" and library and Path(library).is_file():
+            try:
+                self._avfoundation_decoder = _AVFoundationVideoDecoder(library)
+            except OSError:
+                self._avfoundation_decoder = None
+
+    @classmethod
+    def _normalize(cls, pixels: np.ndarray) -> np.ndarray:
+        value = np.asarray(pixels, dtype=np.float32) / np.float32(255.0)
+        mean = np.asarray(cls.image_mean, dtype=np.float32)[:, None, None]
+        standard_deviation = np.asarray(cls.image_std, dtype=np.float32)[:, None, None]
+        return np.ascontiguousarray((value - mean) / standard_deviation)
+
+    @classmethod
+    def _patchify(cls, image: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int]]:
+        channel, height, width = image.shape
+        patch = cls.patch_size
+        merge = cls.merge_size
+        grid_height = height // patch
+        grid_width = width // patch
+        if grid_height % merge or grid_width % merge:
+            raise VisionProcessingError("Flash-Next image dimensions do not divide merge geometry")
+        patches = image.reshape(
+            channel,
+            grid_height // merge,
+            merge,
+            patch,
+            grid_width // merge,
+            merge,
+            patch,
+        )
+        patches = patches.transpose(1, 4, 2, 5, 0, 3, 6)
+        patches = np.broadcast_to(
+            patches[:, :, :, :, :, None, :, :],
+            (*patches.shape[:5], cls.temporal_patch_size, *patches.shape[5:]),
+        )
+        flattened = patches.reshape(
+            grid_height * grid_width,
+            channel * cls.temporal_patch_size * patch * patch,
+        )
+        return (
+            np.ascontiguousarray(flattened, dtype=np.float32),
+            (1, grid_height, grid_width),
+        )
+
+    @classmethod
+    def _patchify_video(
+        cls,
+        frames: np.ndarray,
+    ) -> tuple[np.ndarray, tuple[int, int, int]]:
+        if frames.ndim != 4:
+            raise VisionProcessingError("Flash-Next video frames must have [T,C,H,W] shape")
+        frame_count, channel, height, width = frames.shape
+        patch = cls.patch_size
+        temporal = cls.temporal_patch_size
+        merge = cls.merge_size
+        if frame_count <= 0:
+            raise VisionProcessingError("Flash-Next video contains no frames")
+        if padding := -frame_count % temporal:
+            frames = np.concatenate(
+                (frames, np.repeat(frames[-1:], padding, axis=0)),
+                axis=0,
+            )
+            frame_count += padding
+        grid_time = frame_count // temporal
+        grid_height = height // patch
+        grid_width = width // patch
+        if grid_height % merge or grid_width % merge:
+            raise VisionProcessingError("Flash-Next video dimensions do not divide merge geometry")
+        patches = frames.reshape(
+            grid_time,
+            temporal,
+            channel,
+            grid_height // merge,
+            merge,
+            patch,
+            grid_width // merge,
+            merge,
+            patch,
+        )
+        flattened = patches.transpose(0, 3, 6, 4, 7, 2, 1, 5, 8).reshape(
+            grid_time * grid_height * grid_width,
+            channel * temporal * patch * patch,
+        )
+        return (
+            np.ascontiguousarray(flattened, dtype=np.float32),
+            (grid_time, grid_height, grid_width),
+        )
+
+    @classmethod
+    def _prepare_image(cls, image: Any) -> tuple[np.ndarray, tuple[int, int, int]]:
+        raise NotImplementedError
+
+    @classmethod
+    def _placeholder(cls, merged_tokens: int) -> str:
+        raise NotImplementedError
+
+    @classmethod
+    def _sample_video_indices(
+        cls,
+        total_frames: int,
+        frames_per_second: float,
+        duration_seconds: float,
+    ) -> tuple[int, ...]:
+        raise NotImplementedError
+
+    @classmethod
+    def _prepare_video(
+        cls,
+        decoded: _DecodedVideo,
+    ) -> tuple[np.ndarray, tuple[int, int, int], str]:
+        raise NotImplementedError
+
+    @classmethod
+    def _decode_video_pyav(cls, data: bytes) -> _DecodedVideo:
+        try:
+            import av
+        except ImportError as error:
+            raise VisionProcessingError(
+                "video input requires the optional PyAV dependency"
+            ) from error
+
+        try:
+            with av.open(io.BytesIO(data), mode="r") as container:
+                streams = [stream for stream in container.streams if stream.type == "video"]
+                if not streams:
+                    raise VisionProcessingError("video contains no video stream")
+                stream = streams[0]
+                stream.thread_type = "FRAME"
+                source_fps = float(stream.average_rate) if stream.average_rate else 30.0
+                if not math.isfinite(source_fps) or source_fps <= 0.0:
+                    source_fps = 30.0
+                if stream.duration is not None and stream.time_base is not None:
+                    duration_seconds = float(stream.duration * stream.time_base)
+                elif container.duration is not None:
+                    duration_seconds = float(container.duration) / 1_000_000.0
+                else:
+                    duration_seconds = 0.0
+                declared_frames = int(stream.frames or 0)
+                if declared_frames > 0:
+                    selected_indices = cls._sample_video_indices(
+                        declared_frames,
+                        source_fps,
+                        duration_seconds,
+                    )
+                    selected_at: dict[int, list[int]] = {}
+                    for output_index, source_index in enumerate(selected_indices):
+                        selected_at.setdefault(int(source_index), []).append(output_index)
+                    frames: list[_PreparedVideoFrame | None] = [None] * len(selected_indices)
+                    last_selected = max(selected_at, default=-1)
+                    for index, frame in enumerate(container.decode(stream)):
+                        if index in selected_at:
+                            image = frame.to_image().convert("RGB")
+                            prepared = _PreparedVideoFrame(
+                                image=image,
+                                source_size=image.size,
+                                presentation_seconds=(
+                                    float(frame.time)
+                                    if frame.time is not None
+                                    else index / source_fps
+                                ),
+                            )
+                            for output_index in selected_at[index]:
+                                frames[output_index] = prepared
+                        if index >= last_selected:
+                            break
+                    if any(frame is None for frame in frames):
+                        raise VisionProcessingError(
+                            "video ended before every selected frame was decoded"
+                        )
+                    if duration_seconds <= 0.0:
+                        duration_seconds = declared_frames / source_fps
+                    return _DecodedVideo(
+                        frames=tuple(frame for frame in frames if frame is not None),
+                        frame_indices=tuple(int(value) for value in selected_indices),
+                        frames_per_second=source_fps,
+                        duration_seconds=duration_seconds,
+                    )
+
+                all_frames: list[_PreparedVideoFrame] = []
+                for index, frame in enumerate(container.decode(stream)):
+                    image = frame.to_image().convert("RGB")
+                    all_frames.append(
+                        _PreparedVideoFrame(
+                            image=image,
+                            source_size=image.size,
+                            presentation_seconds=(
+                                float(frame.time)
+                                if frame.time is not None
+                                else index / source_fps
+                            ),
+                        )
+                    )
+                if not all_frames:
+                    raise VisionProcessingError("video contains no decodable frames")
+                if duration_seconds <= 0.0:
+                    duration_seconds = len(all_frames) / source_fps
+                selected_indices = cls._sample_video_indices(
+                    len(all_frames),
+                    source_fps,
+                    duration_seconds,
+                )
+                return _DecodedVideo(
+                    frames=tuple(all_frames[index] for index in selected_indices),
+                    frame_indices=tuple(int(value) for value in selected_indices),
+                    frames_per_second=source_fps,
+                    duration_seconds=duration_seconds,
+                )
+        except VisionProcessingError:
+            raise
+        except Exception as error:
+            raise VisionProcessingError(f"unable to decode video: {error}") from error
+
+    def _decode_video_for_request(self, data: bytes) -> _DecodedVideo:
+        decoder = self._avfoundation_decoder
+        if decoder is not None:
+            try:
+                return decoder.decode_sampled(
+                    data,
+                    sample_indices=self._sample_video_indices,
+                    resize=lambda image: image,
+                )
+            except (OSError, RuntimeError, VisionProcessingError, ValueError):
+                pass
+        return self._decode_video_pyav(data)
+
+    @classmethod
+    def _pack_tensors(
+        cls,
+        patches: list[np.ndarray],
+        grids: list[tuple[int, int, int]],
+        media_types: list[int],
+        *,
+        use_binary_file: bool,
+    ) -> tuple[dict[str, Any], tuple[Path, ...]]:
+        if not patches or len(patches) != len(grids) or len(grids) != len(media_types):
+            raise VisionProcessingError("Flash-Next media tensor geometry is invalid")
+        if any(value not in (1, 2) for value in media_types):
+            raise VisionProcessingError("Flash-Next media type is invalid")
+        image_grids = [
+            grid
+            for grid, media_type in zip(grids, media_types, strict=True)
+            if media_type == 1
+        ]
+        video_grids = [
+            grid
+            for grid, media_type in zip(grids, media_types, strict=True)
+            if media_type == 2
+        ]
+        values = [
+            ("pixel_values", np.concatenate(patches, axis=0), "float32"),
+            ("vision_grid_thw", np.asarray(grids, dtype=np.int32), "int32"),
+            ("vision_types", np.asarray(media_types, dtype=np.int32), "int32"),
+        ]
+        if image_grids:
+            values.append(
+                ("image_grid_thw", np.asarray(image_grids, dtype=np.int32), "int32")
+            )
+        if video_grids:
+            values.append(
+                ("video_grid_thw", np.asarray(video_grids, dtype=np.int32), "int32")
+            )
+        if use_binary_file:
+            tensors, path = MiniCPMO45VisionProcessor._binary_tensors(values)
+            tensors["version"] = 3
+            tensors["processor"] = cls.processor_name
+            return tensors, (path,)
+        return (
+            {
+                "version": 3,
+                "processor": cls.processor_name,
+                **{
+                    name: MiniCPMO45VisionProcessor._tensor(value, dtype)
+                    for name, value, dtype in values
+                },
+            },
+            (),
+        )
+
+    def prepare_openai_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        use_binary_file: bool = False,
+    ) -> ProcessedVisionRequest | None:
+        prepared = copy.deepcopy(messages)
+        patches: list[np.ndarray] = []
+        grids: list[tuple[int, int, int]] = []
+        media_types: list[int] = []
+        sources = 0
+        frame_count = 0
+        for message in prepared:
+            content = message.get("content")
+            if isinstance(content, str):
+                if any(token in content for token in self.forbidden_text_tokens):
+                    raise VisionProcessingError(
+                        "Flash-Next vision placeholder tokens cannot be supplied as text"
+                    )
+                continue
+            if not isinstance(content, list):
+                continue
+            pieces: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    raise VisionProcessingError("multimodal content item must be an object")
+                item_type = item.get("type")
+                if item_type == "text":
+                    value = str(item.get("text", ""))
+                    if any(token in value for token in self.forbidden_text_tokens):
+                        raise VisionProcessingError(
+                            "Flash-Next vision placeholder tokens cannot be supplied as text"
+                        )
+                    pieces.append(value)
+                    continue
+                if item_type not in {"image_url", "video_url"}:
+                    raise VisionProcessingError(
+                        f"{self.processor_name} does not yet support {item_type or 'unknown'} input"
+                    )
+                if self.processor_name == "qwen4_exp" and message.get("role") == "system":
+                    raise VisionProcessingError("Qwen4-Exp system messages cannot contain media")
+                if item_type == "image_url":
+                    image_spec = item.get("image_url")
+                    if not isinstance(image_spec, dict) or not isinstance(
+                        image_spec.get("url"), str
+                    ):
+                        raise VisionProcessingError("image_url content is missing its URL")
+                    image = MiniCPMO45VisionProcessor._decode_image(
+                        MiniCPMO45VisionProcessor._decode_data_url(
+                            image_spec["url"],
+                            "image/",
+                        )
+                    )
+                    pixel_values, grid = self._prepare_image(image)
+                    merged_tokens = math.prod(grid) // (self.merge_size**2)
+                    placeholder = self._placeholder(merged_tokens)
+                    media_type = 1
+                else:
+                    video_spec = item.get("video_url")
+                    if not isinstance(video_spec, dict) or not isinstance(
+                        video_spec.get("url"), str
+                    ):
+                        raise VisionProcessingError("video_url content is missing its URL")
+                    decoded = self._decode_video_for_request(
+                        MiniCPMO45VisionProcessor._decode_data_url(
+                            video_spec["url"],
+                            "video/",
+                        )
+                    )
+                    pixel_values, grid, placeholder = self._prepare_video(decoded)
+                    media_type = 2
+                    frame_count += len(decoded.frames)
+                patches.append(pixel_values)
+                grids.append(grid)
+                media_types.append(media_type)
+                pieces.append(placeholder)
+                sources += 1
+            message["content"] = "".join(pieces)
+        if not patches:
+            return None
+        tensors, cleanup_paths = self._pack_tensors(
+            patches,
+            grids,
+            media_types,
+            use_binary_file=use_binary_file,
+        )
+        return ProcessedVisionRequest(
+            messages=prepared,
+            tensors=tensors,
+            source_count=sources,
+            frame_count=frame_count,
+            cleanup_paths=cleanup_paths,
+        )
+
+
+class Qwen4ExpVisionProcessor(_FlashNextImageProcessor):
+    """Qwen3.8-Flash-Next media path matching its Qwen3-VL processor."""
+
+    processor_name = "qwen4_exp"
+    patch_size = 16
+    image_mean = (0.5, 0.5, 0.5)
+    image_std = (0.5, 0.5, 0.5)
+    minimum_pixels = 65_536
+    maximum_pixels = 16_777_216
+    minimum_video_pixels = 4_096
+    maximum_video_pixels = 25_165_824
+    minimum_video_frames = 4
+    maximum_video_frames = 768
+    forbidden_text_tokens = (
+        "<|vision_start|>",
+        "<|image_pad|>",
+        "<|video_pad|>",
+        "<|vision_end|>",
+    )
+
+    @classmethod
+    def _smart_resize(cls, height: int, width: int) -> tuple[int, int]:
+        factor = cls.patch_size * cls.merge_size
+        if min(height, width) <= 0 or max(height, width) / min(height, width) > 200:
+            raise VisionProcessingError("Qwen4-Exp image aspect ratio is invalid")
+        resized_height = round(height / factor) * factor
+        resized_width = round(width / factor) * factor
+        if resized_height * resized_width > cls.maximum_pixels:
+            beta = math.sqrt((height * width) / cls.maximum_pixels)
+            resized_height = max(factor, math.floor(height / beta / factor) * factor)
+            resized_width = max(factor, math.floor(width / beta / factor) * factor)
+        elif resized_height * resized_width < cls.minimum_pixels:
+            beta = math.sqrt(cls.minimum_pixels / (height * width))
+            resized_height = math.ceil(height * beta / factor) * factor
+            resized_width = math.ceil(width * beta / factor) * factor
+        return resized_height, resized_width
+
+    @classmethod
+    def _prepare_image(cls, image: Any) -> tuple[np.ndarray, tuple[int, int, int]]:
+        from PIL import Image
+
+        image = image.convert("RGB")
+        resized_height, resized_width = cls._smart_resize(image.height, image.width)
+        if image.size != (resized_width, resized_height):
+            image = image.resize(
+                (resized_width, resized_height),
+                resample=Image.Resampling.BICUBIC,
+            )
+        pixels = np.asarray(image, dtype=np.uint8).transpose(2, 0, 1)
+        return cls._patchify(cls._normalize(pixels))
+
+    @classmethod
+    def _placeholder(cls, merged_tokens: int) -> str:
+        return "<|vision_start|>" + "<|image_pad|>" * merged_tokens + "<|vision_end|>"
+
+    @classmethod
+    def _sample_video_indices(
+        cls,
+        total_frames: int,
+        frames_per_second: float,
+        _duration_seconds: float,
+    ) -> tuple[int, ...]:
+        if total_frames <= 0:
+            raise VisionProcessingError("Qwen4-Exp video contains no frames")
+        requested = int(total_frames / frames_per_second * cls.video_fps)
+        requested = min(
+            max(requested, cls.minimum_video_frames),
+            cls.maximum_video_frames,
+            total_frames,
+        )
+        indices = np.linspace(0, total_frames - 1, requested).round().astype(np.int64)
+        return tuple(int(value) for value in indices)
+
+    @classmethod
+    def _smart_resize_video(
+        cls,
+        frames: int,
+        height: int,
+        width: int,
+    ) -> tuple[int, int]:
+        factor = cls.patch_size * cls.merge_size
+        if height < factor or width < factor:
+            raise VisionProcessingError(
+                "Qwen4-Exp video height and width must be at least one merged patch"
+            )
+        if max(height, width) / min(height, width) > 200:
+            raise VisionProcessingError("Qwen4-Exp video aspect ratio is invalid")
+        resized_height = round(height / factor) * factor
+        resized_width = round(width / factor) * factor
+        aligned_frames = math.ceil(frames / cls.temporal_patch_size) * cls.temporal_patch_size
+        budget = aligned_frames * resized_height * resized_width
+        if budget > cls.maximum_video_pixels:
+            beta = math.sqrt((frames * height * width) / cls.maximum_video_pixels)
+            resized_height = max(factor, math.floor(height / beta / factor) * factor)
+            resized_width = max(factor, math.floor(width / beta / factor) * factor)
+        elif budget < cls.minimum_video_pixels:
+            beta = math.sqrt(cls.minimum_video_pixels / (frames * height * width))
+            resized_height = math.ceil(height * beta / factor) * factor
+            resized_width = math.ceil(width * beta / factor) * factor
+        return resized_height, resized_width
+
+    @classmethod
+    def _prepare_video(
+        cls,
+        decoded: _DecodedVideo,
+    ) -> tuple[np.ndarray, tuple[int, int, int], str]:
+        from PIL import Image
+
+        if not decoded.frames:
+            raise VisionProcessingError("Qwen4-Exp video contains no decoded frames")
+        width, height = decoded.frames[0].source_size
+        if any(frame.source_size != (width, height) for frame in decoded.frames):
+            raise VisionProcessingError("Qwen4-Exp video changes dimensions between frames")
+        resized_height, resized_width = cls._smart_resize_video(
+            len(decoded.frames),
+            height,
+            width,
+        )
+        frames: list[np.ndarray] = []
+        for prepared in decoded.frames:
+            image = prepared.image.convert("RGB")
+            if image.size != (resized_width, resized_height):
+                image = image.resize(
+                    (resized_width, resized_height),
+                    resample=Image.Resampling.BICUBIC,
+                )
+            pixels = np.asarray(image, dtype=np.uint8).transpose(2, 0, 1)
+            frames.append(cls._normalize(pixels))
+        pixel_values, grid = cls._patchify_video(np.stack(frames, axis=0))
+        frame_tokens = grid[1] * grid[2] // (cls.merge_size**2)
+        indices = list(decoded.frame_indices)
+        if padding := -len(indices) % cls.temporal_patch_size:
+            indices.extend(indices[-1] for _ in range(padding))
+        timestamps = [value / decoded.frames_per_second for value in indices]
+        timestamps = [
+            (
+                timestamps[index]
+                + timestamps[index + cls.temporal_patch_size - 1]
+            )
+            / cls.temporal_patch_size
+            for index in range(0, len(timestamps), cls.temporal_patch_size)
+        ]
+        placeholder = "".join(
+            f"<{timestamp:.1f} seconds>"
+            + "<|vision_start|>"
+            + "<|video_pad|>" * frame_tokens
+            + "<|vision_end|>"
+            for timestamp in timestamps
+        )
+        if len(timestamps) != grid[0]:
+            raise VisionProcessingError("Qwen4-Exp video timestamps disagree with temporal grid")
+        return pixel_values, grid, placeholder
+
+
+class Glm5NextVisionProcessor(_FlashNextImageProcessor):
+    """GLM-5.3-Flash media path matching Transformers 5.16.1."""
+
+    processor_name = "glm5_next"
+    patch_size = 14
+    image_mean = (0.48145466, 0.4578275, 0.40821073)
+    image_std = (0.26862954, 0.26130258, 0.27577711)
+    minimum_tokens = 16
+    maximum_tokens = 8_000
+    maximum_video_tokens = 240_000
+    maximum_video_frames = 2_048
+    forbidden_text_tokens = (
+        "<|begin_of_image|>",
+        "<|image|>",
+        "<|end_of_image|>",
+        "<|begin_of_video|>",
+        "<|video|>",
+        "<|end_of_video|>",
+    )
+
+    @classmethod
+    def _smart_resize(
+        cls,
+        frames: int,
+        height: int,
+        width: int,
+        *,
+        maximum_tokens: int | None = None,
+    ) -> tuple[int, int]:
+        temporal = cls.temporal_patch_size
+        factor = cls.patch_size * cls.merge_size
+        pixels_per_token = temporal * factor * factor
+        minimum_pixels = cls.minimum_tokens * pixels_per_token
+        maximum_pixels = (
+            cls.maximum_tokens if maximum_tokens is None else maximum_tokens
+        ) * pixels_per_token
+
+        def align(value: int) -> int:
+            return math.ceil(value / factor) * factor
+
+        aligned_frames = max(temporal, round(frames / temporal) * temporal)
+        aligned_height = align(height)
+        aligned_width = align(width)
+        budget = aligned_frames * aligned_height * aligned_width
+        if budget < minimum_pixels:
+            scale = math.sqrt(minimum_pixels / (frames * height * width))
+            aligned_height = align(max(1, math.ceil(height * scale)))
+            aligned_width = align(max(1, math.ceil(width * scale)))
+            budget = aligned_frames * aligned_height * aligned_width
+        if budget > maximum_pixels:
+            if maximum_pixels < aligned_frames * factor * factor:
+                raise VisionProcessingError("GLM-5-Next image token budget is too small")
+            low, high = 1, height
+            best_height = best_width = factor
+            while low <= high:
+                content_height = (low + high) // 2
+                content_width = max(1, math.floor(width * content_height / height))
+                candidate_height = align(content_height)
+                candidate_width = align(content_width)
+                if aligned_frames * candidate_height * candidate_width <= maximum_pixels:
+                    best_height, best_width = candidate_height, candidate_width
+                    low = content_height + 1
+                else:
+                    high = content_height - 1
+            aligned_height, aligned_width = best_height, best_width
+        return aligned_height, aligned_width
+
+    @classmethod
+    def _prepare_image(cls, image: Any) -> tuple[np.ndarray, tuple[int, int, int]]:
+        from PIL import Image
+
+        image = image.convert("RGB")
+        height, width = image.height, image.width
+        if height <= 0 or width <= 0:
+            raise VisionProcessingError("GLM-5-Next image dimensions must be positive")
+        target_height, target_width = cls._smart_resize(
+            cls.temporal_patch_size,
+            height,
+            width,
+        )
+        factor = cls.patch_size * cls.merge_size
+        pixels_per_token = cls.temporal_patch_size * factor * factor
+        scale = min(target_height / height, target_width / width)
+        if cls.temporal_patch_size * height * width >= pixels_per_token * cls.minimum_tokens:
+            scale = min(1.0, scale)
+        content_height = max(1, min(target_height, math.floor(height * scale)))
+        content_width = max(1, min(target_width, math.floor(width * scale)))
+        if image.size != (content_width, content_height):
+            image = image.resize(
+                (content_width, content_height),
+                resample=Image.Resampling.BICUBIC,
+            )
+        pixels = np.asarray(image, dtype=np.uint8).transpose(2, 0, 1)
+        pixels = np.pad(
+            pixels,
+            (
+                (0, 0),
+                (0, target_height - content_height),
+                (0, target_width - content_width),
+            ),
+            mode="constant",
+        )
+        return cls._patchify(cls._normalize(pixels))
+
+    @classmethod
+    def _placeholder(cls, merged_tokens: int) -> str:
+        return "<|begin_of_image|>" + "<|image|>" * merged_tokens + "<|end_of_image|>"
+
+    @classmethod
+    def _sample_video_indices(
+        cls,
+        total_frames: int,
+        frames_per_second: float,
+        duration_seconds: float,
+    ) -> tuple[int, ...]:
+        if total_frames <= 0:
+            raise VisionProcessingError("GLM-5-Next video contains no frames")
+        maximum_index = total_frames - 1
+        duration = (
+            duration_seconds
+            if duration_seconds > 0.0
+            else round(maximum_index / frames_per_second) + 1
+        )
+        maximum_seconds = int(duration)
+        requested = max(1, int(duration * cls.video_fps))
+        requested = min(requested, cls.maximum_video_frames)
+        timestamps = [index / frames_per_second for index in range(total_frames)]
+        if total_frames < requested:
+            indices = np.linspace(0, total_frames - 1, requested, dtype=int).tolist()
+        else:
+            indices = []
+            current_second = 0.0
+            increment = 1.0 / cls.video_fps
+            for index, timestamp in enumerate(timestamps):
+                if timestamp >= current_second:
+                    current_second += increment
+                    indices.append(index)
+                    if current_second >= maximum_seconds:
+                        break
+        if len(indices) < requested:
+            start = indices[0] if indices else 0
+            end = indices[-1] if indices else max(total_frames - 1, 0)
+            indices = np.linspace(start, end, requested, dtype=int).tolist()
+        elif len(indices) > requested:
+            indices = np.linspace(0, total_frames - 1, requested, dtype=int).tolist()
+        unique: list[int] = []
+        seen: set[int] = set()
+        for value in indices:
+            if value not in seen:
+                seen.add(value)
+                unique.append(int(value))
+        if len(unique) % cls.temporal_patch_size:
+            unique.extend(unique[-1] for _ in range(cls.temporal_patch_size - len(unique) % cls.temporal_patch_size))
+        return tuple(unique)
+
+    @classmethod
+    def _prepare_video(
+        cls,
+        decoded: _DecodedVideo,
+    ) -> tuple[np.ndarray, tuple[int, int, int], str]:
+        from PIL import Image
+
+        if not decoded.frames:
+            raise VisionProcessingError("GLM-5-Next video contains no decoded frames")
+        width, height = decoded.frames[0].source_size
+        if any(frame.source_size != (width, height) for frame in decoded.frames):
+            raise VisionProcessingError("GLM-5-Next video changes dimensions between frames")
+        frame_count = len(decoded.frames)
+        target_height, target_width = cls._smart_resize(
+            frame_count,
+            height,
+            width,
+            maximum_tokens=cls.maximum_video_tokens,
+        )
+        factor = cls.patch_size * cls.merge_size
+        pixels_per_token = cls.temporal_patch_size * factor * factor
+        scale = min(target_height / height, target_width / width)
+        if frame_count * height * width >= pixels_per_token * cls.minimum_tokens:
+            scale = min(1.0, scale)
+        content_height = max(1, min(target_height, math.floor(height * scale)))
+        content_width = max(1, min(target_width, math.floor(width * scale)))
+        frames: list[np.ndarray] = []
+        for prepared in decoded.frames:
+            image = prepared.image.convert("RGB")
+            if image.size != (content_width, content_height):
+                image = image.resize(
+                    (content_width, content_height),
+                    resample=Image.Resampling.BICUBIC,
+                )
+            pixels = np.asarray(image, dtype=np.uint8).transpose(2, 0, 1)
+            pixels = np.pad(
+                pixels,
+                (
+                    (0, 0),
+                    (0, target_height - content_height),
+                    (0, target_width - content_width),
+                ),
+                mode="constant",
+            )
+            frames.append(cls._normalize(pixels))
+        pixel_values, grid = cls._patchify_video(np.stack(frames, axis=0))
+        frame_tokens = grid[1] * grid[2] // (cls.merge_size**2)
+        timestamps = [
+            value / decoded.frames_per_second
+            for value in decoded.frame_indices[:: cls.temporal_patch_size]
+        ]
+        timestamps = timestamps[: grid[0]]
+        while len(timestamps) < grid[0]:
+            timestamps.append(timestamps[-1] if timestamps else 0.0)
+        placeholder = "<|begin_of_video|>" + "".join(
+            "<|begin_of_image|>"
+            + "<|image|>" * frame_tokens
+            + "<|end_of_image|>"
+            + f"{timestamp:.1f} seconds"
+            for timestamp in timestamps
+        ) + "<|end_of_video|>"
+        return pixel_values, grid, placeholder
 
 
 class DeepseekV4VisionProcessor:
@@ -1106,14 +1962,20 @@ def multimodal_processor_for_architecture(
         "deepseek_v4_vision",
     }:
         return DeepseekV4VisionProcessor()
+    if identity in {"qwen4_exp", "qwen4_exp_text"}:
+        return Qwen4ExpVisionProcessor(avfoundation_library=avfoundation_library)
+    if identity in {"glm5_next", "glm5_next_text"}:
+        return Glm5NextVisionProcessor(avfoundation_library=avfoundation_library)
     return None
 
 
 __all__ = [
     "DeepseekV4VisionProcessor",
+    "Glm5NextVisionProcessor",
     "MiniCPMO45VisionProcessor",
     "MultimodalProcessor",
     "ProcessedVisionRequest",
+    "Qwen4ExpVisionProcessor",
     "VisionProcessingError",
     "multimodal_processor_for_architecture",
 ]

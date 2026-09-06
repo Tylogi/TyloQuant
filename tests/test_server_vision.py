@@ -18,7 +18,11 @@ from mfq.server.backend import OpenAIChatBackend
 from mfq.server.models import SamplingParams
 from mfq.server.vision import (
     DeepseekV4VisionProcessor,
+    Glm5NextVisionProcessor,
     MiniCPMO45VisionProcessor,
+    Qwen4ExpVisionProcessor,
+    _DecodedVideo,
+    _PreparedVideoFrame,
     multimodal_processor_for_architecture,
 )
 
@@ -55,9 +59,7 @@ def _decode_binary_tensor(tensors: dict[str, object], name: str) -> np.ndarray:
     with open(str(file_spec["path"]), "rb") as stream:
         stream.seek(int(tensor["data_offset"]))
         raw = stream.read(int(tensor["data_length"]))
-    return np.frombuffer(raw, dtype=dtypes[str(tensor["dtype"])]).reshape(
-        tuple(tensor["shape"])
-    )
+    return np.frombuffer(raw, dtype=dtypes[str(tensor["dtype"])]).reshape(tuple(tensor["shape"]))
 
 
 def test_patch_layout_matches_official_torch_unfold() -> None:
@@ -90,10 +92,7 @@ def test_deepseek_v4_processor_matches_official_patch_layout() -> None:
     normalized = torch.from_numpy(pixels.astype(np.float32)).permute(2, 0, 1)
     normalized = (normalized / 255 - 0.5) / 0.5
     reference = (
-        normalized.reshape(3, 3, 14, 5, 14)
-        .permute(1, 3, 0, 2, 4)
-        .reshape(15, 3, 14, 14)
-        .numpy()
+        normalized.reshape(3, 3, 14, 5, 14).permute(1, 3, 0, 2, 4).reshape(15, 3, 14, 14).numpy()
     )
 
     assert grid == (3, 5, 1, 2)
@@ -132,6 +131,301 @@ def test_deepseek_v4_request_defers_position_dependent_image_block() -> None:
     )
 
 
+def test_qwen4_exp_image_processor_matches_official_block_major_layout() -> None:
+    class TinyProcessor(Qwen4ExpVisionProcessor):
+        minimum_pixels = 0
+
+    height, width = 64, 96
+    pixels = np.arange(height * width * 3, dtype=np.uint32)
+    pixels = (pixels % 256).astype(np.uint8).reshape(height, width, 3)
+    image = Image.fromarray(pixels, mode="RGB")
+    result = TinyProcessor().prepare_openai_messages(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": _data_url(image)}},
+                    {"type": "text", "text": "Describe it."},
+                ],
+            }
+        ]
+    )
+
+    assert result is not None
+    actual = _decode_tensor(result.tensors["pixel_values"])
+    normalized = pixels.astype(np.float32).transpose(2, 0, 1) / 127.5 - 1.0
+    reference = np.stack((normalized, normalized), axis=0)[None]
+    reference = reference.reshape(1, 1, 2, 3, 2, 2, 16, 3, 2, 16)
+    reference = reference.transpose(0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
+    reference = reference.reshape(24, 3 * 2 * 16 * 16)
+    np.testing.assert_allclose(actual, reference, rtol=0.0, atol=1e-7)
+    np.testing.assert_array_equal(
+        _decode_tensor(result.tensors["image_grid_thw"]),
+        [[1, 4, 6]],
+    )
+    assert result.messages[0]["content"].count("<|image_pad|>") == 6
+    assert result.messages[0]["content"].endswith("<|vision_end|>Describe it.")
+
+
+def test_glm5_next_image_processor_matches_official_padded_patch_layout() -> None:
+    class TinyProcessor(Glm5NextVisionProcessor):
+        minimum_tokens = 0
+
+    height, width = 56, 84
+    pixels = np.arange(height * width * 3, dtype=np.uint32)
+    pixels = (pixels % 256).astype(np.uint8).reshape(height, width, 3)
+    image = Image.fromarray(pixels, mode="RGB")
+    result = TinyProcessor().prepare_openai_messages(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Look: "},
+                    {"type": "image_url", "image_url": {"url": _data_url(image)}},
+                ],
+            }
+        ]
+    )
+
+    assert result is not None
+    actual = _decode_tensor(result.tensors["pixel_values"])
+    channel_first = pixels.astype(np.float32).transpose(2, 0, 1) / 255.0
+    mean = np.asarray(TinyProcessor.image_mean, dtype=np.float32)[:, None, None]
+    standard_deviation = np.asarray(
+        TinyProcessor.image_std,
+        dtype=np.float32,
+    )[:, None, None]
+    normalized = (channel_first - mean) / standard_deviation
+    reference = normalized.reshape(3, 2, 2, 14, 3, 2, 14)
+    reference = reference.transpose(1, 4, 2, 5, 0, 3, 6)
+    reference = np.broadcast_to(
+        reference[:, :, :, :, :, None, :, :],
+        (*reference.shape[:5], 2, *reference.shape[5:]),
+    ).reshape(24, 3 * 2 * 14 * 14)
+    np.testing.assert_allclose(actual, reference, rtol=0.0, atol=1e-6)
+    np.testing.assert_array_equal(
+        _decode_tensor(result.tensors["image_grid_thw"]),
+        [[1, 4, 6]],
+    )
+    assert result.messages[0]["content"].count("<|image|>") == 6
+    assert result.messages[0]["content"].startswith("Look: <|begin_of_image|>")
+
+
+def _decoded_video(
+    frames: list[np.ndarray],
+    *,
+    frame_indices: tuple[int, ...],
+    frames_per_second: float,
+) -> _DecodedVideo:
+    prepared = tuple(
+        _PreparedVideoFrame(
+            image=Image.fromarray(frame, mode="RGB"),
+            source_size=(frame.shape[1], frame.shape[0]),
+            presentation_seconds=source_index / frames_per_second,
+        )
+        for frame, source_index in zip(frames, frame_indices, strict=True)
+    )
+    return _DecodedVideo(
+        frames=prepared,
+        frame_indices=frame_indices,
+        frames_per_second=frames_per_second,
+        duration_seconds=(frame_indices[-1] + 1) / frames_per_second,
+    )
+
+
+def _official_video_patch_layout(
+    frames: np.ndarray,
+    *,
+    patch_size: int,
+    temporal_patch_size: int,
+    merge_size: int,
+) -> np.ndarray:
+    if padding := -len(frames) % temporal_patch_size:
+        frames = np.concatenate((frames, np.repeat(frames[-1:], padding, axis=0)))
+    frame_count, channels, height, width = frames.shape
+    grid_time = frame_count // temporal_patch_size
+    grid_height = height // patch_size
+    grid_width = width // patch_size
+    return frames.reshape(
+        grid_time,
+        temporal_patch_size,
+        channels,
+        grid_height // merge_size,
+        merge_size,
+        patch_size,
+        grid_width // merge_size,
+        merge_size,
+        patch_size,
+    ).transpose(0, 3, 6, 4, 7, 2, 1, 5, 8).reshape(
+        grid_time * grid_height * grid_width,
+        channels * temporal_patch_size * patch_size * patch_size,
+    )
+
+
+def test_qwen4_exp_video_matches_official_sampling_layout_and_timestamps() -> None:
+    class TinyProcessor(Qwen4ExpVisionProcessor):
+        patch_size = 2
+        minimum_video_pixels = 0
+        maximum_video_pixels = 1_000_000
+
+    raw_frames = [
+        np.full((4, 8, 3), (index * 31, index * 17, index * 7), dtype=np.uint8)
+        for index in range(3)
+    ]
+    decoded = _decoded_video(
+        raw_frames,
+        frame_indices=(0, 3, 6),
+        frames_per_second=3.0,
+    )
+
+    actual, grid, placeholder = TinyProcessor._prepare_video(decoded)
+    normalized = np.stack(
+        [frame.astype(np.float32).transpose(2, 0, 1) / 127.5 - 1.0 for frame in raw_frames]
+    )
+    reference = _official_video_patch_layout(
+        normalized,
+        patch_size=2,
+        temporal_patch_size=2,
+        merge_size=2,
+    )
+
+    assert grid == (2, 2, 4)
+    np.testing.assert_allclose(actual, reference, rtol=0.0, atol=1e-7)
+    assert placeholder == (
+        "<0.5 seconds><|vision_start|><|video_pad|><|video_pad|><|vision_end|>"
+        "<2.0 seconds><|vision_start|><|video_pad|><|video_pad|><|vision_end|>"
+    )
+    expected_indices = np.linspace(0, 299, 20).round().astype(np.int64)
+    np.testing.assert_array_equal(
+        TinyProcessor._sample_video_indices(300, 30.0, 10.0),
+        expected_indices,
+    )
+
+
+def test_glm5_next_video_matches_official_sampling_layout_and_timestamps() -> None:
+    class TinyProcessor(Glm5NextVisionProcessor):
+        patch_size = 2
+        minimum_tokens = 0
+        maximum_video_tokens = 1_000_000
+        image_mean = (0.0, 0.0, 0.0)
+        image_std = (1.0, 1.0, 1.0)
+
+    raw_frames = [
+        np.full((4, 8, 3), (index * 29, index * 13, index * 5), dtype=np.uint8)
+        for index in range(4)
+    ]
+    decoded = _decoded_video(
+        raw_frames,
+        frame_indices=(0, 2, 4, 6),
+        frames_per_second=2.0,
+    )
+
+    actual, grid, placeholder = TinyProcessor._prepare_video(decoded)
+    normalized = np.stack(
+        [frame.astype(np.float32).transpose(2, 0, 1) / 255.0 for frame in raw_frames]
+    )
+    reference = _official_video_patch_layout(
+        normalized,
+        patch_size=2,
+        temporal_patch_size=2,
+        merge_size=2,
+    )
+
+    assert grid == (2, 2, 4)
+    np.testing.assert_allclose(actual, reference, rtol=0.0, atol=1e-7)
+    assert placeholder == (
+        "<|begin_of_video|>"
+        "<|begin_of_image|><|image|><|image|><|end_of_image|>0.0 seconds"
+        "<|begin_of_image|><|image|><|image|><|end_of_image|>2.0 seconds"
+        "<|end_of_video|>"
+    )
+    assert TinyProcessor._sample_video_indices(31, 10.0, 3.1) == (
+        0,
+        5,
+        10,
+        15,
+        20,
+        25,
+    )
+
+
+def test_flash_next_mixed_image_video_preserves_media_order_and_binary_transport() -> None:
+    class TinyProcessor(Qwen4ExpVisionProcessor):
+        patch_size = 2
+        minimum_pixels = 0
+        maximum_pixels = 1_000_000
+        minimum_video_pixels = 0
+        maximum_video_pixels = 1_000_000
+
+    image_pixels = np.arange(4 * 8 * 3, dtype=np.uint8).reshape(4, 8, 3)
+    video_frames = [
+        np.full((4, 8, 3), index * 40, dtype=np.uint8) for index in range(3)
+    ]
+    decoded = _decoded_video(
+        video_frames,
+        frame_indices=(0, 3, 6),
+        frames_per_second=3.0,
+    )
+    processor = TinyProcessor()
+    processor._decode_video_for_request = lambda data: decoded
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": _data_url(Image.fromarray(image_pixels))},
+                },
+                {"type": "text", "text": " Then watch: "},
+                {
+                    "type": "video_url",
+                    "video_url": {"url": "data:video/mp4;base64,AA=="},
+                },
+            ],
+        }
+    ]
+
+    encoded = processor.prepare_openai_messages(messages)
+    binary = processor.prepare_openai_messages(messages, use_binary_file=True)
+    assert encoded is not None and binary is not None
+    assert encoded.messages == binary.messages
+    assert (encoded.source_count, encoded.frame_count) == (2, 3)
+    np.testing.assert_array_equal(
+        _decode_tensor(encoded.tensors["vision_types"]),
+        [1, 2],
+    )
+    np.testing.assert_array_equal(
+        _decode_tensor(encoded.tensors["vision_grid_thw"]),
+        [[1, 2, 4], [2, 2, 4]],
+    )
+    np.testing.assert_array_equal(
+        _decode_tensor(encoded.tensors["image_grid_thw"]),
+        [[1, 2, 4]],
+    )
+    np.testing.assert_array_equal(
+        _decode_tensor(encoded.tensors["video_grid_thw"]),
+        [[2, 2, 4]],
+    )
+    assert encoded.messages[0]["content"].index("<|image_pad|>") < encoded.messages[0][
+        "content"
+    ].index("<|video_pad|>")
+    try:
+        for name in (
+            "pixel_values",
+            "vision_grid_thw",
+            "vision_types",
+            "image_grid_thw",
+            "video_grid_thw",
+        ):
+            np.testing.assert_array_equal(
+                _decode_binary_tensor(binary.tensors, name),
+                _decode_tensor(encoded.tensors[name]),
+            )
+    finally:
+        for path in binary.cleanup_paths:
+            path.unlink(missing_ok=True)
+
+
 def test_multimodal_processor_registry_is_architecture_specific() -> None:
     assert isinstance(
         multimodal_processor_for_architecture("MiniCPMO"),
@@ -140,6 +434,14 @@ def test_multimodal_processor_registry_is_architecture_specific() -> None:
     assert isinstance(
         multimodal_processor_for_architecture("deepseek-v4"),
         DeepseekV4VisionProcessor,
+    )
+    assert isinstance(
+        multimodal_processor_for_architecture("qwen4_exp"),
+        Qwen4ExpVisionProcessor,
+    )
+    assert isinstance(
+        multimodal_processor_for_architecture("glm5-next"),
+        Glm5NextVisionProcessor,
     )
     assert multimodal_processor_for_architecture("qwen3_5") is None
 
@@ -214,9 +516,7 @@ def test_video_request_samples_frames_and_uses_unsliced_placeholders() -> None:
         average_rate = float(stream.average_rate) if stream.average_rate else 30.0
         for index, frame in enumerate(container.decode(stream)):
             timestamp = (
-                float(frame.time)
-                if frame.time is not None
-                else index / max(average_rate, 1.0)
+                float(frame.time) if frame.time is not None else index / max(average_rate, 1.0)
             )
             if reference and timestamp + 1.0e-9 < next_timestamp:
                 continue
@@ -226,9 +526,7 @@ def test_video_request_samples_frames_and_uses_unsliced_placeholders() -> None:
     assert len(optimized) == len(reference)
     for actual, expected in zip(optimized, reference, strict=True):
         np.testing.assert_array_equal(np.asarray(actual), expected)
-    prepared = MiniCPMO45VisionProcessor()._decode_video_for_request(
-        output.getvalue()
-    )
+    prepared = MiniCPMO45VisionProcessor()._decode_video_for_request(output.getvalue())
     assert [frame.source_size for frame in prepared] == [
         (image.shape[1], image.shape[0]) for image in reference
     ]
@@ -313,9 +611,7 @@ def test_binary_tensor_transport_matches_base64_and_uses_private_file() -> None:
     messages = [
         {
             "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": _data_url(image)}}
-            ],
+            "content": [{"type": "image_url", "image_url": {"url": _data_url(image)}}],
         }
     ]
     processor = TinyProcessor()
@@ -555,10 +851,7 @@ def test_backend_reports_product_level_multimodal_prefill() -> None:
         )
         status = await backend.runtime_status()
         assert status["last_request"]["processor_ms"] == performance.processor_ms
-        assert (
-            status["last_request"]["complete_prefill_tps"]
-            == performance.complete_prefill_tps
-        )
+        assert status["last_request"]["complete_prefill_tps"] == performance.complete_prefill_tps
         await client.aclose()
 
     asyncio.run(run())

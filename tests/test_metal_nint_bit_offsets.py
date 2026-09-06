@@ -39,16 +39,22 @@ _PACKED_METAL_SOURCES = (
 )
 
 _ADDRESS_PATTERN = re.compile(
-    r"uint residual_bits = \(value_index & 7u\) \* bits;\s*"
+    r"(?:uint residual_bits = \(value_index & 7u\) \* bits;\s*"
     r"uint byte_index =\s*"
     r"\(value_index >> 3\) \* bits \+ \(residual_bits >> 3\);\s*"
     r"uint shift = residual_bits & 7u;"
+    r"|ulong residual_bits = \(value_index & 7ul\) \* ulong\(bits\);\s*"
+    r"ulong byte_index =\s*"
+    r"\(value_index >> 3\) \* ulong\(bits\) \+ "
+    r"\(residual_bits >> 3\);\s*"
+    r"uint shift = uint\(residual_bits & 7ul\);)"
 )
 
 _UNSAFE_ADDRESS_PATTERN = re.compile(
-    r"uint\s+(?:bit_index|bit_offset)\s*=\s*"
+    r"(?:uint|ulong)\s+(?:bit_index|bit_offset)\s*=\s*"
     r"(?:value_index|index)\s*\*\s*bits"
-    r"|\((?:value_index|quantized_index|index)\s*\*\s*[1-8]u\)\s*>>\s*3"
+    r"|\((?:value_index|quantized_index|index)\s*\*\s*[1-8]u(?:l)?\)"
+    r"\s*>>\s*3"
 )
 
 _BASED_ADDRESS_PATTERN = re.compile(
@@ -116,9 +122,11 @@ def test_specialized_nint3_nint6_addresses_do_not_multiply_before_shift(
     source = path.read_text()
     for bits in (3, 6):
         assert f"(quantized_index * {bits}u) >> 3" not in source
+        assert f"(quantized_index * {bits}ul) >> 3" not in source
         expected = re.compile(
-            rf"\(quantized_index >> 3\) \* {bits}u\s*"
-            rf"\+ \(\(\(quantized_index & 7u\) \* {bits}u\) >> 3\)"
+            rf"\(quantized_index >> 3\) \* {bits}u(?:l)?\s*"
+            rf"\+ \(\(\(quantized_index & 7u(?:l)?\) "
+            rf"\* {bits}u(?:l)?\) >> 3\)"
         )
         assert expected.search(source)
 

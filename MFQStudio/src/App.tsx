@@ -1473,6 +1473,8 @@ export default function App() {
   const [selectedAssistantId, setSelectedAssistantId] = useState(DEFAULT_ASSISTANT_ID);
   const [roleEditor, setRoleEditor] = useState<RoleEditorDraft | null>(null);
   const [contextSize, setContextSize] = useState(32768);
+  const [loadPinned, setLoadPinned] = useState(false);
+  const [loadIdleTtl, setLoadIdleTtl] = useState<number | null>(null);
   const [profileName, setProfileName] = useState("");
   const [studio, setStudio] = useState<StudioStatus | null>(null);
   const [studioDraft, setStudioDraft] = useState<StudioConfig | null>(null);
@@ -2999,10 +3001,17 @@ export default function App() {
   async function clearRuntimeCache() {
     const snapshots = Number(runtime?.prefix_cache_snapshots || 0);
     if (busy || snapshots <= 0 || Number(runtime?.active_requests || 0) > 0) return;
-    if (!await studioConfirm(tr(
-      `清除 ${formatNumber(snapshots)} 个 prefix cache 快照？`,
-      `Clear ${formatNumber(snapshots)} prefix-cache snapshots?`,
-    ))) return;
+    const hotPrefixOnly = runtime?.prefix_cache_mode === "single_device_hot_prefix";
+    const confirmation = hotPrefixOnly
+      ? tr(
+          `清除当前设备热前缀（${formatNumber(snapshots)} 个）？此操作不会删除聊天记录。`,
+          `Clear ${formatNumber(snapshots)} device-hot prefix? Chat history will be kept.`,
+        )
+      : tr(
+          `清除 ${formatNumber(snapshots)} 个 Session KV SSD 缓存块？此操作不会删除聊天记录。`,
+          `Clear ${formatNumber(snapshots)} Session KV SSD cache blocks? Chat history will be kept.`,
+        );
+    if (!await studioConfirm(confirmation)) return;
     setBusy(true);
     try {
       const status = await api.clearRuntimeCache();
@@ -3325,7 +3334,10 @@ export default function App() {
     if (busy) return;
     setBusy(true);
     try {
-      const accepted = await api.loadModel(name, contextSize);
+      const accepted = await api.loadModel(name, contextSize, 2048, {
+        pin: loadPinned,
+        idle_ttl_seconds: loadIdleTtl,
+      });
       setSelectedJobId(accepted.operation_id);
       setView("lab");
       await refreshRuntime(false);
@@ -3351,7 +3363,10 @@ export default function App() {
       const loaded = instances.some((item) => item.model === artifact.name && item.state !== "failed")
         || runtime?.model === artifact.name;
       if (!loaded) {
-        const accepted = await api.loadModel(artifact.name, contextSize);
+        const accepted = await api.loadModel(artifact.name, contextSize, 2048, {
+          pin: loadPinned,
+          idle_ttl_seconds: loadIdleTtl,
+        });
         setSelectedJobId(accepted.operation_id);
       }
     }
@@ -3424,7 +3439,8 @@ export default function App() {
         load: {
           model: artifact.name,
           device_ids: [],
-          pin: false,
+          idle_ttl_seconds: loadPinned ? null : loadIdleTtl,
+          pin: loadPinned,
           context_size: contextSize,
           prefill_chunk_size: 2048,
           sampling_defaults: {
@@ -3528,10 +3544,15 @@ export default function App() {
   const prefixCacheHits = Number(runtime?.prefix_cache_hits || 0);
   const prefixCacheSnapshots = Number(runtime?.prefix_cache_snapshots || 0);
   const prefixCacheBytes = Number(runtime?.prefix_cache_bytes || 0);
+  const prefixCacheDiskBytes = Number(runtime?.prefix_cache_disk_bytes || 0);
+  const prefixCacheDiskBudget = Number(runtime?.prefix_cache_disk_max_bytes || 0);
+  const prefixCacheHotBytes = Number(runtime?.prefix_cache_hot_bytes ?? prefixCacheBytes);
   const prefixCacheHitRate = prefixCacheQueries > 0
     ? (prefixCacheHits / prefixCacheQueries) * 100
     : 0;
-  const prefixCacheSupported = typeof runtime?.prefix_cache_max_bytes === "number";
+  const prefixCacheHotOnly = runtime?.prefix_cache_mode === "single_device_hot_prefix";
+  const prefixCachePersistent = typeof runtime?.prefix_cache_max_bytes === "number";
+  const prefixCacheSupported = prefixCachePersistent || prefixCacheHotOnly;
   const genericJobKinds = jobKinds;
   const selectedKind = genericJobKinds.find((item) => item.kind === selectedJobKind);
   const imatrixArtifacts = lineage.filter((item) =>
@@ -3570,7 +3591,7 @@ export default function App() {
           <img src="/mfq-mark.svg" alt="" />
           <div><strong>MFQ</strong><span>Studio</span></div>
         </div>
-        <div className="sidebar-divider" />
+        <div className="sidebar-group-label">{tr("工作区", "Workspace")}</div>
         <nav className="primary-nav">
           <button className={view === "chat" ? "active" : ""} onClick={() => { setView("chat"); setSidebarOpen(false); }} type="button"><Icon name="chat" />{tr("对话", "Chat")}</button>
           <button className={view === "dashboard" ? "active" : ""} onClick={() => { setView("dashboard"); setSidebarOpen(false); }} type="button"><Icon name="activity" />{tr("仪表盘", "Dashboard")}<span>{formatNumber(runtime?.active_requests || 0)}</span></button>
@@ -3638,6 +3659,14 @@ export default function App() {
             <button className={labPage === "quantization" ? "active" : ""} onClick={() => openStudioPage("lab", "quantization")} type="button">{tr("量化工作台", "Quantization workspace")}</button>
           </nav>
         </div>
+        <button className="sidebar-runtime-card" onClick={() => openStudioPage("dashboard", "overview")} type="button">
+          <span className={`runtime-dot ${Number(runtime?.active_requests || 0) > 0 ? "busy" : runtime?.model ? "ready" : "idle"}`} />
+          <span>
+            <strong>{runtime?.model || tr("Runtime 空闲", "Runtime idle")}</strong>
+            <small>{runtime?.model ? `${formatNumber(runtime?.active_requests || 0)} ${tr("个活动请求", "active requests")}` : tr("选择模型以开始", "Choose a model to begin")}</small>
+          </span>
+          <Icon name="activity" size={14} />
+        </button>
       </aside>
       <button aria-label={tr("关闭侧栏", "Close sidebar")} className={`mobile-scrim ${sidebarOpen ? "open" : ""}`} onClick={() => setSidebarOpen(false)} type="button" />
 
@@ -3717,7 +3746,18 @@ export default function App() {
           </section>
         ) : view === "dashboard" ? (
           <section className="dashboard-view" id="dashboard-overview">
-            <div className="page-heading"><div><h1>{dashboardPage === "overview" ? tr("概览", "Overview") : dashboardPage === "cache" ? tr("缓存与配置", "Cache and profiles") : dashboardPage === "models" ? tr("模型与任务", "Models and jobs") : tr("工具与连接", "Tools and connections")}</h1></div><button aria-label={tr("重置当前布局", "Reset current layout")} onClick={() => setDashboardLayoutReset((current) => current + 1)} title={tr("重置当前布局", "Reset current layout")} type="button"><Icon name="refresh" /></button></div>
+            <div className="page-heading"><div><p>MFQ Runtime</p><h1>{dashboardPage === "overview" ? tr("状态", "Status") : dashboardPage === "cache" ? tr("缓存与配置", "Cache and profiles") : dashboardPage === "models" ? tr("模型与任务", "Models and jobs") : tr("工具与连接", "Tools and connections")}</h1></div><button aria-label={tr("重置当前布局", "Reset current layout")} onClick={() => setDashboardLayoutReset((current) => current + 1)} title={tr("重置当前布局", "Reset current layout")} type="button"><Icon name="refresh" /></button></div>
+            {dashboardPage === "overview" && <section className="runtime-hero">
+              <img src="/mfq-mark.svg" alt="" />
+              <div className="runtime-hero-copy">
+                <div><h2>{runtime?.model || "MFQ Server"}</h2><span className={`runtime-status-pill ${runtime?.model ? "running" : "stopped"}`}><i />{runtime?.model ? tr("运行中", "Running") : tr("空闲", "Idle")}</span></div>
+                <p>{runtime?.model ? `${runtime?.model_type || "MFQ"} · ${formatNumber(runtime?.max_context)} ${tr("上下文", "context")}` : tr("加载本地模型后即可开始推理。", "Load a local model to begin inference.")}</p>
+              </div>
+              <div className="runtime-hero-actions">
+                <button onClick={() => openStudioPage("dashboard", "models")} type="button"><Icon name="folder" size={15} />{tr("模型", "Models")}</button>
+                <button className="primary" onClick={openSettings} type="button"><Icon name="settings" size={15} />{tr("推理设置", "Inference settings")}</button>
+              </div>
+            </section>}
             {dashboardPage === "overview" && <PanelDeck labels={panelLabels} page="dashboard-overview" resetVersion={dashboardLayoutReset}>
               <div className="metric-grid" key="metrics"><article><span>Prefill</span><strong>{formatNumber(lastPrefill.tokensPerSecond, 1)}</strong><small>tokens / second</small></article><article><span>Decode</span><strong>{formatNumber(last?.decode_tps, 1)}</strong><small>tokens / second</small></article><article><span>TTFT</span><strong>{formatNumber(lastTtftMs, 1)}</strong><small>milliseconds</small></article><article><span>{tr("内存", "Memory")}</span><strong>{runtimeMemory ? `${formatNumber(runtimeMemory / 2 ** 30, 1)} GB` : "--"}</strong><small>{runtimeCache ? `${formatNumber(runtimeCache / 2 ** 30, 1)} GB cache` : tr("未上报缓存", "cache unavailable")}</small></article><article><span>{tr("任务", "Jobs")}</span><strong>{activeJobs.length}</strong><small>{formatNumber(runtime?.active_requests || 0)} active requests</small></article></div>
               <section className="dashboard-panel chart-panel" key="throughput"><div className="panel-heading"><div><h2>{tr("生成吞吐", "Decode throughput")}</h2><p>{tr("MFQ Server 保存的已完成请求", "Completed requests retained by MFQ Server")}</p></div><b>{formatNumber(last?.decode_tps, 1)} tok/s</b></div><RuntimeChart values={metricSeries} /></section>
@@ -3725,11 +3765,57 @@ export default function App() {
               <section className="dashboard-panel request-panel" key="request"><div className="panel-heading"><div><h2>{tr("最近请求性能", "Last request performance")}</h2><p>{last?.id || tr("还没有完成的请求", "No completed requests")}</p></div>{(last?.finish_reason || Number(runtime?.active_requests || 0) > 0) && <b>{last?.finish_reason || "Running"}</b>}</div><div className="request-stats"><div><span>{tr("输入", "Input")}</span><strong>{formatNumber(last?.prompt_tokens)}</strong><small>tokens</small></div><div><span>{tr("输出", "Output")}</span><strong>{formatNumber(last?.completion_tokens)}</strong><small>tokens</small></div><div><span>TTFT</span><strong>{formatNumber(lastTtftMs, 1)}</strong><small>ms</small></div><div><span>Prefill</span><strong>{formatNumber(lastPrefill.tokensPerSecond, 1)}</strong><small>{formatNumber(lastPrefill.milliseconds, 1)} ms</small></div><div><span>Decode</span><strong>{formatNumber(last?.decode_tps, 1)}</strong><small>{formatNumber(last?.decode_ms, 1)} ms</small></div><div><span>{tr("总耗时", "Total")}</span><strong>{formatNumber(lastGenerationMs, 1)}</strong><small>ms</small></div></div></section>
             </PanelDeck>}
             {dashboardPage === "cache" && <PanelDeck labels={panelLabels} page="dashboard-cache" resetVersion={dashboardLayoutReset}>
-              {prefixCacheSupported && <section className="dashboard-panel cache-panel" key="prefix-cache"><div className="panel-heading"><div><h2>Prefix cache</h2><p>{tr("跨轮次复用稳定前缀的 KV 快照", "Reusable KV snapshots for stable conversation prefixes")}</p></div><b>{prefixCacheQueries > 0 ? `${formatNumber(prefixCacheHitRate, 1)}% hit` : tr("暂无查询", "No queries")}</b></div><div className="cache-stats"><div><span>{tr("会话", "Sessions")}</span><strong>{formatNumber(runtime?.prefix_cache_sessions)}</strong></div><div><span>{tr("快照", "Snapshots")}</span><strong>{formatNumber(prefixCacheSnapshots)}</strong></div><div><span>{tr("复用 tokens", "Reused tokens")}</span><strong>{formatNumber(runtime?.prefix_cache_hit_tokens)}</strong></div><div><span>{tr("占用", "Memory")}</span><strong>{formatNumber(prefixCacheBytes / 2 ** 20, 1)} MB</strong></div><div><span>{tr("预算", "Budget")}</span><strong>{formatNumber(Number(runtime?.prefix_cache_max_bytes || 0) / 2 ** 30, 1)} GB</strong></div></div>{prefixCacheSnapshots > 0 && <button className="panel-action danger" disabled={busy || Number(runtime?.active_requests || 0) > 0} onClick={() => void clearRuntimeCache()} type="button">{tr("清除 prefix cache", "Clear prefix cache")}</button>}</section>}
+              {prefixCacheSupported && (
+                <section className="dashboard-panel cache-panel" key="prefix-cache">
+                  <div className="panel-heading">
+                    <div>
+                      <h2>Session KV cache</h2>
+                      <p>{prefixCacheHotOnly
+                        ? tr("当前进程内的单条设备热前缀；切换会话或编辑 prompt 会重新 prefill", "One device-hot prefix in this process; switching sessions or editing the prompt triggers a fresh prefill")
+                        : tr("RAM 热缓存与可跨重启复用的 SSD 前缀块", "RAM hot cache with persistent SSD prefix blocks")}</p>
+                    </div>
+                    <b>{prefixCacheQueries > 0 ? `${formatNumber(prefixCacheHitRate, 1)}% hit` : tr("暂无查询", "No queries")}</b>
+                  </div>
+                  {prefixCacheHotOnly ? (
+                    <div className="cache-stats">
+                      <div><span>{tr("活动会话", "Active sessions")}</span><strong>{formatNumber(runtime?.prefix_cache_sessions)}</strong></div>
+                      <div><span>{tr("设备热前缀", "Device-hot prefix")}</span><strong>{formatNumber(prefixCacheSnapshots)}</strong><small>{tr("单物理快照", "one physical snapshot")}</small></div>
+                      <div><span>{tr("缓存 tokens", "Cached tokens")}</span><strong>{formatNumber(runtime?.prefix_cache_tokens)}</strong></div>
+                      <div><span>{tr("复用 tokens", "Reused tokens")}</span><strong>{formatNumber(runtime?.prefix_cache_hit_tokens)}</strong></div>
+                      <div><span>{tr("命中 / 查询", "Hits / queries")}</span><strong>{formatNumber(prefixCacheHits)} / {formatNumber(prefixCacheQueries)}</strong></div>
+                      <div><span>{tr("持久性", "Persistence")}</span><strong>{tr("进程生命周期", "Process lifetime")}</strong><small>{tr("不落盘", "not stored on disk")}</small></div>
+                    </div>
+                  ) : (
+                    <div className="cache-stats">
+                      <div><span>{tr("活动会话", "Active sessions")}</span><strong>{formatNumber(runtime?.prefix_cache_sessions)}</strong></div>
+                      <div><span>{tr("SSD 块", "SSD blocks")}</span><strong>{formatNumber(runtime?.prefix_cache_disk_blocks ?? prefixCacheSnapshots)}</strong></div>
+                      <div><span>{tr("复用 tokens", "Reused tokens")}</span><strong>{formatNumber(runtime?.prefix_cache_hit_tokens)}</strong></div>
+                      <div><span>{tr("SSD 占用", "SSD usage")}</span><strong>{formatNumber(prefixCacheDiskBytes / 2 ** 30, 2)} GB</strong><small>{prefixCacheDiskBudget > 0 ? `${formatNumber(prefixCacheDiskBudget / 2 ** 30, 0)} GB ${tr("上限", "limit")}` : ""}</small></div>
+                      <div><span>{tr("RAM 热层", "RAM hot tier")}</span><strong>{formatNumber(prefixCacheHotBytes / 2 ** 20, 1)} MB</strong><small>{formatNumber(runtime?.prefix_cache_hot_blocks)} blocks</small></div>
+                      <div><span>{tr("待写入", "Pending writes")}</span><strong>{formatNumber(runtime?.prefix_cache_pending_writes)}</strong><small>{formatNumber(Number(runtime?.prefix_cache_pending_bytes || 0) / 2 ** 20, 1)} / {formatNumber(Number(runtime?.prefix_cache_pending_max_bytes || 0) / 2 ** 20, 0)} MB · {formatNumber(runtime?.prefix_cache_deduplicated_writes)} deduplicated</small></div>
+                      <div><span>{tr("SSD 命中", "SSD hits")}</span><strong>{formatNumber(runtime?.prefix_cache_disk_hits)}</strong><small>{formatNumber(runtime?.prefix_cache_hot_hits)} RAM hits</small></div>
+                      <div><span>{tr("回收", "Evictions")}</span><strong>{formatNumber(runtime?.prefix_cache_evictions)}</strong><small>{formatNumber(runtime?.prefix_cache_corrupt_blocks)} corrupt</small></div>
+                    </div>
+                  )}
+                  {prefixCacheSnapshots > 0 && <button className="panel-action danger" disabled={busy || Number(runtime?.active_requests || 0) > 0} onClick={() => void clearRuntimeCache()} type="button">{tr("清除 Session KV 缓存", "Clear Session KV cache")}</button>}
+                </section>
+              )}
               <section className="dashboard-panel profile-panel" key="profiles"><div className="panel-heading"><div><h2>{tr("运行配置档案", "Runtime profiles")}</h2><p>{tr("将加载参数和采样默认值绑定到模型产物", "Bind load and sampling defaults to a model artifact")}</p></div><b>{runtimeProfiles.length}</b></div><div className="profile-create"><input maxLength={64} onChange={(event) => setProfileName(event.target.value)} placeholder={tr("当前配置名称", "Current configuration name")} value={profileName} /><button disabled={busy || !profileName.trim() || !artifacts.some((item) => item.name === runtime?.model)} onClick={() => void saveRuntimeProfile()} type="button">{tr("保存当前配置", "Save current")}</button></div>{runtimeProfiles.length > 0 && <div className="profile-list">{runtimeProfiles.map((profile) => <div className={`profile-row ${profile.drifted ? "drifted" : ""}`} key={profile.id}><div><strong>{profile.name}</strong><small>{profile.load.context_size.toLocaleString()} ctx · {profile.load.prefill_chunk_size.toLocaleString()} chunk{profile.drifted ? ` · ${tr("模型已变化", "artifact changed")}` : ""}</small></div><button disabled={busy} onClick={() => void loadRuntimeProfile(profile)} type="button">{tr("加载", "Load")}</button><button aria-label={tr("删除配置档案", "Delete profile")} disabled={busy} onClick={() => void deleteRuntimeProfile(profile.id)} type="button"><Icon name="trash" size={14} /></button></div>)}</div>}</section>
             </PanelDeck>}
             {dashboardPage === "models" && <PanelDeck labels={panelLabels} page="dashboard-models" resetVersion={dashboardLayoutReset}>
-              <section className="dashboard-panel" key="catalog"><div className="panel-heading"><div><h2>{tr("模型目录", "Model catalog")}</h2></div><div className="panel-heading-actions"><button disabled={busy} onClick={() => void chooseModelDirectory()} type="button">{tr("添加模型文件夹", "Add model folder")}</button><b>{artifacts.length}</b></div></div>{artifacts.length > 0 && <div className="model-list">{artifacts.slice(0, 8).map((item) => { const instance = instances.find((candidate) => candidate.model === item.name && candidate.state !== "failed"); const loaded = Boolean(instance) || item.name === runtime?.model; return <div className="model-row" key={item.id}><span className={loaded ? "model-state active" : item.loadable ? "model-state" : "model-state failed"} /><div><strong>{item.name}</strong><small>{item.architecture} · {item.shard_count} shards · {formatNumber(item.total_bytes / 2 ** 30, 1)} GB</small></div>{instance ? <button disabled={busy || instance.state === "busy"} onClick={() => void unloadInstance(instance.id)} type="button">{tr("卸载", "Unload")}</button> : loaded ? <em>{tr("已加载", "Loaded")}</em> : !item.loadable ? <em className="failed">{tr("不可用", "Invalid")}</em> : <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">{tr("加载", "Load")}</button>}</div>; })}</div>}</section>
+              <section className="dashboard-panel model-catalog-panel" key="catalog">
+                <div className="panel-heading"><div><h2>{tr("模型目录", "Model catalog")}</h2><p>{tr("空闲模型按 LRU 自动让出内存；固定模型永不自动卸载", "Idle models yield memory by LRU; pinned models stay resident")}</p></div><div className="panel-heading-actions"><button disabled={busy} onClick={() => void chooseModelDirectory()} type="button">{tr("添加模型文件夹", "Add model folder")}</button><b>{artifacts.length}</b></div></div>
+                <div className="model-load-policy">
+                  <label><input checked={loadPinned} onChange={(event) => setLoadPinned(event.target.checked)} type="checkbox" /><span><strong>{tr("固定到内存", "Pin in memory")}</strong><small>{tr("跳过 LRU 与空闲卸载", "Skip LRU and idle eviction")}</small></span></label>
+                  <label><span><strong>{tr("空闲卸载", "Idle unload")}</strong><small>{loadPinned ? tr("固定模型不使用 TTL", "Ignored while pinned") : tr("每次使用后重新计时", "Resets after each use")}</small></span><select disabled={loadPinned} onChange={(event) => setLoadIdleTtl(event.target.value ? Number(event.target.value) : null)} value={loadIdleTtl ?? ""}><option value="">{tr("永不", "Never")}</option><option value="300">5 min</option><option value="900">15 min</option><option value="3600">1 h</option></select></label>
+                </div>
+                {artifacts.length > 0 && <div className="model-list">{artifacts.slice(0, 8).map((item) => {
+                  const instance = instances.find((candidate) => candidate.model === item.name && candidate.state !== "failed");
+                  const loaded = Boolean(instance) || item.name === runtime?.model;
+                  const policy = instance?.pinned ? tr("固定", "Pinned") : instance?.idle_ttl_seconds != null ? `TTL ${instance.idle_ttl_seconds}s` : null;
+                  return <div className="model-row" key={item.id}><span className={loaded ? "model-state active" : item.loadable ? "model-state" : "model-state failed"} /><div><strong>{item.name}</strong><small>{item.architecture} · {item.shard_count} shards · {formatNumber(item.total_bytes / 2 ** 30, 1)} GB{policy ? ` · ${policy}` : ""}</small></div>{instance ? <button disabled={busy || instance.state === "busy"} onClick={() => void unloadInstance(instance.id)} type="button">{tr("卸载", "Unload")}</button> : loaded ? <em>{tr("已加载", "Loaded")}</em> : !item.loadable ? <em className="failed" title={item.error || undefined}>{item.complete && item.format === "hf" ? tr("需先转换", "Convert first") : tr("不可用", "Invalid")}</em> : <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">{tr("加载", "Load")}</button>}</div>;
+                })}</div>}
+              </section>
               <section className="dashboard-panel" key="requests"><div className="panel-heading"><div><h2>{tr("最近请求", "Recent requests")}</h2></div></div>{requestHistory.length > 0 && <div className="request-table">{requestHistory.slice(0, 8).map((request) => <div className="request-row" key={request.id}><div><strong>{request.id}</strong><small>{request.completed_at ? new Date(request.completed_at * 1000).toLocaleTimeString() : request.endpoint || "completion"}</small></div><span>{formatNumber(request.prompt_tokens)} → {formatNumber(request.completion_tokens)}</span><b>{formatNumber(request.decode_tps, 1)} tok/s</b></div>)}</div>}</section>
               <section className="dashboard-panel" key="jobs">
                 <div className="panel-heading"><div><h2>{tr("后台任务", "Background jobs")}</h2></div><b>{activeJobs.length}</b></div>

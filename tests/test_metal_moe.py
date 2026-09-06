@@ -11,6 +11,7 @@ try:
 except RuntimeError:
     pytest.skip("Metal device unavailable", allow_module_level=True)
 
+from mfq.formats import io  # noqa: E402
 from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
 from mfq.formats.mx import MxTensor  # noqa: E402
 from mfq.formats.nepq import (  # noqa: E402
@@ -31,6 +32,7 @@ from mfq.formats.nvq import (  # noqa: E402
     NVQ3_D4,
     NVQ3_D4_1024,
 )
+from mfq.kernels.metal import moe as metal_moe  # noqa: E402
 from mfq.kernels.metal.moe import grouped_moe_matmul  # noqa: E402
 from mfq.quantize.nint_quant import dequantize, quantize  # noqa: E402
 from mfq.runtime.mlx_moe import MlxRoutedLinear, MlxRoutedSwiGLUFFN  # noqa: E402
@@ -88,6 +90,40 @@ def _decode_nint_moe(tensor: NintMoeTensor) -> np.ndarray:
         )
         result[np.asarray(pool.expert_ids)] = decoded
     return result
+
+
+def test_grouped_moe_chunks_routes_before_metal_grid_overflow(monkeypatch) -> None:
+    dense = np.random.default_rng(1201).normal(
+        scale=0.1,
+        size=(4, 8, 16),
+    ).astype(np.float32)
+    layer = MlxRoutedLinear(_nint_moe(dense, ((0, 1, 2, 3),)))
+    assert layer.grouped_weight is not None
+    source = np.random.default_rng(1202).normal(
+        scale=0.1,
+        size=(5, 16),
+    ).astype(np.float32)
+    ids = np.asarray([[0], [1], [2], [3], [0]], dtype=np.int32)
+    expected = _array(
+        grouped_moe_matmul(
+            layer.grouped_weight,
+            source,
+            ids,
+            compact_threshold=None,
+        )
+    )
+
+    monkeypatch.setattr(metal_moe, "_MAX_METAL_GRID_X", 128)
+    actual = _array(
+        grouped_moe_matmul(
+            layer.grouped_weight,
+            source,
+            ids,
+            compact_threshold=None,
+        )
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=3e-5)
 
 
 def _mxfp4_rows(rows: int, width: int, seed: int) -> tuple[MxTensor, np.ndarray]:
@@ -235,6 +271,32 @@ def test_routed_grouped_nint_bit_widths(bits: int, width: int):
     layer = MlxRoutedLinear(tensor)
     assert layer.uses_grouped_kernel
     actual = _array(layer(source, ids))
+    expected = np.stack(
+        [
+            np.stack([source[token] @ decoded[expert].T for expert in row])
+            for token, row in enumerate(ids)
+        ]
+    )
+    np.testing.assert_allclose(actual, expected, rtol=5e-5, atol=5e-5)
+
+
+@pytest.mark.parametrize(
+    ("cohorts", "bits"),
+    [(((0, 1, 2, 3),), (4,)), (((0, 2), (1, 3)), (4, 6))],
+)
+def test_routed_nintm_blob_keeps_nint_cohorts_packed(cohorts, bits):
+    rng = np.random.default_rng(20260905)
+    dense = rng.normal(0, 0.1, size=(4, 7, 48)).astype(np.float32)
+    tensor = _nint_moe(dense, cohorts, bits=bits)
+    source = rng.normal(0, 0.1, size=(3, 48)).astype(np.float32)
+    ids = np.asarray([[0, 3], [2, 1], [3, 0]], dtype=np.int32)
+
+    layer = MlxRoutedLinear.from_blob(io.pack_nint_moe(tensor))
+    assert layer.uses_grouped_kernel
+    assert layer.grouped_weight.nint_q.dtype == mx.uint8
+    actual = _array(layer(source, ids))
+
+    decoded = _decode_nint_moe(tensor)
     expected = np.stack(
         [
             np.stack([source[token] @ decoded[expert].T for expert in row])

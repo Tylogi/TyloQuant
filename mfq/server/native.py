@@ -9,7 +9,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,6 +21,43 @@ from mfq.server.hf_tokenizer import (
 
 class NativeRuntimeError(RuntimeError):
     """Raised when the private native worker cannot be started."""
+
+
+def is_flash_next_architecture(architecture: str) -> bool:
+    """Return whether an MFQ artifact uses the dedicated Python MLX worker."""
+
+    identity = architecture.strip().lower().replace("-", "_")
+    return identity.startswith(("qwen4_exp", "glm5_next"))
+
+
+def flash_next_runtime_command(
+    controller_command: Sequence[str],
+    *,
+    model: str | Path,
+    model_name: str,
+    host: str,
+    port: int,
+    context_size: int,
+    prefill_chunk_size: int = 2_048,
+) -> list[str]:
+    if not controller_command:
+        raise NativeRuntimeError("Flash-Next runtime has no MFQ CLI launcher")
+    return [
+        *(str(value) for value in controller_command),
+        "_flash-next-worker",
+        "--mfq",
+        str(model),
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--model-name",
+        model_name,
+        "--ctx-size",
+        str(context_size),
+        "--prefill-chunk-size",
+        str(prefill_chunk_size),
+    ]
 
 
 def find_native_runtime_resource(executable: str | Path, name: str) -> Path | None:
@@ -86,6 +123,9 @@ class NativeRuntime:
     context_size: int = 0
     prefill_chunk_size: int = 2048
     startup_timeout: float = 1800.0
+    environment: Mapping[str, str] | None = None
+    architecture: str = ""
+    controller_command: Sequence[str] = ()
     process: subprocess.Popen[bytes] | None = None
     port: int | None = None
 
@@ -96,6 +136,18 @@ class NativeRuntime:
         return f"http://127.0.0.1:{self.port}"
 
     def command(self, port: int) -> list[str]:
+        if is_flash_next_architecture(self.architecture):
+            if self.backend != "metal":
+                raise NativeRuntimeError("Flash-Next MFQ inference currently requires Metal")
+            return flash_next_runtime_command(
+                self.controller_command,
+                model=self.model,
+                model_name=self.model_name,
+                host="127.0.0.1",
+                port=port,
+                context_size=self.context_size,
+                prefill_chunk_size=self.prefill_chunk_size,
+            )
         command = [
             str(self.executable),
             "--mfq",
@@ -133,7 +185,10 @@ class NativeRuntime:
             command,
             stdin=subprocess.DEVNULL,
             env=native_runtime_environment(
-                self.executable, self.backend, model=self.model
+                self.executable,
+                self.backend,
+                base={**os.environ, **dict(self.environment or {})},
+                model=self.model,
             ),
         )
         self._wait_until_ready()

@@ -43,6 +43,8 @@ def test_studio_uses_one_package_for_web_and_desktop_clients():
     assert 'RUSTFLAGS="${mfq_release_rustflags}"' in RELEASE_SCRIPT
     assert "packaged Studio contains a private build path" in RELEASE_SCRIPT
     assert 'mfq-decode-metal" --self-test-metal' in RELEASE_SCRIPT
+    assert 'ln -s "mlx/lib/mlx.metallib"' in RELEASE_SCRIPT
+    assert "_mlx-runtime-check" in RELEASE_SCRIPT
 
 
 def test_assistant_markdown_recovers_fully_escaped_structural_line_breaks():
@@ -118,7 +120,7 @@ def test_studio_can_select_and_load_an_external_mfq_directory_in_local_mode():
     assert 'tauri.invoke<string[] | null>("studio_select_model_directory")' in STUDIO_BRIDGE
     assert "selectLocalModelDirectory" in APP
     assert "api.modelArtifacts(true)" in APP
-    assert "api.loadModel(artifact.name, contextSize)" in APP
+    assert "api.loadModel(artifact.name, contextSize, 2048, {" in APP
     assert "canUseNativeModelPicker" in APP
     assert 'tr("选择模型文件夹", "Choose model folder")' in APP
 
@@ -235,6 +237,34 @@ def test_studio_exposes_theme_selection_without_using_sidebar_status_space():
     assert 'onClick={() => setUiTheme("dark")}' in APP
     assert "connection-card" not in APP
     assert ".connection-card" not in STYLES
+
+
+def test_studio_exposes_omlx_style_runtime_lifecycle_controls():
+    assert 'className="runtime-hero"' in APP
+    assert 'tr("工作区", "Workspace")' in APP
+    assert "MFQ Runtime" in APP
+    assert 'tr("固定到内存", "Pin in memory")' in APP
+    assert 'tr("空闲卸载", "Idle unload")' in APP
+    assert "const [loadPinned, setLoadPinned] = useState(false)" in APP
+    assert "const [loadIdleTtl, setLoadIdleTtl] = useState<number | null>(null)" in APP
+    assert "pin: loadPinned" in APP
+    assert "idle_ttl_seconds: loadIdleTtl" in APP
+    assert "idle_ttl_seconds?: number | null" in API
+    assert "pin?: boolean" in API
+    assert ".runtime-hero {" in STYLES
+    assert "--accent: #0a84ff" in STYLES
+
+
+def test_studio_adapts_prefix_cache_panel_to_flash_next_hot_cache():
+    assert 'prefix_cache_mode?: string;' in API
+    assert 'prefix_cache_pending_bytes?: number;' in API
+    assert 'prefix_cache_pending_max_bytes?: number;' in API
+    assert 'runtime?.prefix_cache_mode === "single_device_hot_prefix"' in APP
+    assert "const prefixCachePersistent" in APP
+    assert "const prefixCacheSupported = prefixCachePersistent || prefixCacheHotOnly" in APP
+    assert 'tr("设备热前缀", "Device-hot prefix")' in APP
+    assert 'tr("进程生命周期", "Process lifetime")' in APP
+    assert "device-hot prefix? Chat history will be kept." in APP
 
 
 def test_studio_uses_theme_aware_model_actions_and_readable_errors():

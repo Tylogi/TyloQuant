@@ -48,6 +48,13 @@ if TYPE_CHECKING:
         MlxDeepseekV4Names,
         MlxDeepseekV4PoolState,
     )
+    from mfq.runtime.mlx_flash_next_vision import (
+        MlxGlm5NextVision,
+        MlxQwen4ExpVision,
+        inject_vision_embeddings,
+        qwen4_multimodal_positions,
+        vision_layout,
+    )
     from mfq.runtime.mlx_gemma4 import (
         MlxGemma4,
         MlxGemma4Config,
@@ -55,6 +62,18 @@ if TYPE_CHECKING:
         MlxGemma4Layer,
         MlxGemma4MoE,
         MlxGemma4Names,
+    )
+    from mfq.runtime.mlx_glm5_next import (
+        MlxGlm5Next,
+        MlxGlm5NextDenseFFN,
+        MlxGlm5NextKda,
+        MlxGlm5NextLayer,
+        MlxGlm5NextMhc,
+        MlxGlm5NextMoE,
+        MlxGlm5NextMtp,
+        MlxGlm5NextMtpLayer,
+        MlxGlm5NextNames,
+        MlxGlm5NextSparseAttention,
     )
     from mfq.runtime.mlx_glm_dsa import (
         MlxGlmDsa,
@@ -92,6 +111,20 @@ if TYPE_CHECKING:
         MlxRoutedSwiGLUFFN,
     )
     from mfq.runtime.mlx_ops import MlxRMSNorm, MlxRoPE
+    from mfq.runtime.mlx_qwen4_exp import (
+        MlxQwen4Exp,
+        MlxQwen4ExpDenseFFN,
+        MlxQwen4ExpGatedResidual,
+        MlxQwen4ExpGdn,
+        MlxQwen4ExpLayer,
+        MlxQwen4ExpMoE,
+        MlxQwen4ExpMtp,
+        MlxQwen4ExpMtpLayer,
+        MlxQwen4ExpNames,
+        MlxQwen4ExpNgramEmbedding,
+        MlxQwen4ExpPle,
+        MlxQwen4ExpQsa,
+    )
     from mfq.runtime.mlx_tpq import (
         MlxTpqInt4Embedding,
         MlxTpqInt4Linear,
@@ -169,6 +202,13 @@ _MLX_GEMMA4_EXPORTS = {
     "MlxGemma4MoE",
     "MlxGemma4Names",
 }
+_MLX_FLASH_NEXT_VISION_EXPORTS = {
+    "MlxGlm5NextVision",
+    "MlxQwen4ExpVision",
+    "inject_vision_embeddings",
+    "qwen4_multimodal_positions",
+    "vision_layout",
+}
 _MLX_GLM_DSA_EXPORTS = {
     "MlxGlmDsa",
     "MlxGlmDsaConfig",
@@ -176,6 +216,18 @@ _MLX_GLM_DSA_EXPORTS = {
     "MlxGlmDsaLayer",
     "MlxGlmDsaMoE",
     "MlxGlmDsaNames",
+}
+_MLX_GLM5_NEXT_EXPORTS = {
+    "MlxGlm5Next",
+    "MlxGlm5NextDenseFFN",
+    "MlxGlm5NextKda",
+    "MlxGlm5NextLayer",
+    "MlxGlm5NextMhc",
+    "MlxGlm5NextMoE",
+    "MlxGlm5NextMtp",
+    "MlxGlm5NextMtpLayer",
+    "MlxGlm5NextNames",
+    "MlxGlm5NextSparseAttention",
 }
 _MLX_KIMI_EXPORTS = {
     "MlxKimiK3",
@@ -185,6 +237,20 @@ _MLX_KIMI_EXPORTS = {
     "MlxKimiMLA",
     "MlxKimiMoE",
     "MlxKimiSiTUFFN",
+}
+_MLX_QWEN4_EXP_EXPORTS = {
+    "MlxQwen4Exp",
+    "MlxQwen4ExpDenseFFN",
+    "MlxQwen4ExpGatedResidual",
+    "MlxQwen4ExpGdn",
+    "MlxQwen4ExpLayer",
+    "MlxQwen4ExpMoE",
+    "MlxQwen4ExpMtp",
+    "MlxQwen4ExpMtpLayer",
+    "MlxQwen4ExpNames",
+    "MlxQwen4ExpNgramEmbedding",
+    "MlxQwen4ExpPle",
+    "MlxQwen4ExpQsa",
 }
 _MLX_MOE_EXPORTS = {
     "MlxRoutedLinear",
@@ -226,6 +292,10 @@ def __getattr__(name: str):
         from mfq.runtime import mlx_deepseek_v4
 
         value = getattr(mlx_deepseek_v4, name)
+    elif name in _MLX_FLASH_NEXT_VISION_EXPORTS:
+        from mfq.runtime import mlx_flash_next_vision
+
+        value = getattr(mlx_flash_next_vision, name)
     elif name in _MLX_GEMMA4_EXPORTS:
         from mfq.runtime import mlx_gemma4
 
@@ -234,10 +304,18 @@ def __getattr__(name: str):
         from mfq.runtime import mlx_glm_dsa
 
         value = getattr(mlx_glm_dsa, name)
+    elif name in _MLX_GLM5_NEXT_EXPORTS:
+        from mfq.runtime import mlx_glm5_next
+
+        value = getattr(mlx_glm5_next, name)
     elif name in _MLX_KIMI_EXPORTS:
         from mfq.runtime import mlx_kimi_k3
 
         value = getattr(mlx_kimi_k3, name)
+    elif name in _MLX_QWEN4_EXP_EXPORTS:
+        from mfq.runtime import mlx_qwen4_exp
+
+        value = getattr(mlx_qwen4_exp, name)
     elif name in _MLX_MOE_EXPORTS:
         from mfq.runtime import mlx_moe
 
@@ -285,6 +363,7 @@ __all__ = [
     "MlxDeepseekV4MoE",
     "MlxDeepseekV4Names",
     "MlxDeepseekV4PoolState",
+    "MlxGlm5NextVision",
     "MlxCausalLM",
     "MlxCausalLMConfig",
     "MlxCausalLMNames",
@@ -301,7 +380,31 @@ __all__ = [
     "MlxGlmDsaLayer",
     "MlxGlmDsaMoE",
     "MlxGlmDsaNames",
+    "MlxGlm5Next",
+    "MlxGlm5NextDenseFFN",
+    "MlxGlm5NextKda",
+    "MlxGlm5NextLayer",
+    "MlxGlm5NextMhc",
+    "MlxGlm5NextMoE",
+    "MlxGlm5NextMtp",
+    "MlxGlm5NextMtpLayer",
+    "MlxGlm5NextNames",
+    "MlxGlm5NextSparseAttention",
     "MlxQwen35LinearAttentionBlock",
+    "MlxQwen4Exp",
+    "MlxQwen4ExpDenseFFN",
+    "MlxQwen4ExpGatedResidual",
+    "MlxQwen4ExpGdn",
+    "MlxQwen4ExpLayer",
+    "MlxQwen4ExpMoE",
+    "MlxQwen4ExpMtp",
+    "MlxQwen4ExpMtpLayer",
+    "MlxQwen4ExpNames",
+    "MlxQwen4ExpNgramEmbedding",
+    "MlxQwen4ExpPle",
+    "MlxQwen4ExpQsa",
+    "MlxQwen4ExpVision",
+    "qwen4_multimodal_positions",
     "MlxKVCache",
     "MlxKimiK3",
     "MlxKimiK3Config",
@@ -327,4 +430,6 @@ __all__ = [
     "MlxSlidingWindowKVCache",
     "MlxVqEmbedding",
     "MlxVqLinear",
+    "inject_vision_embeddings",
+    "vision_layout",
 ]

@@ -156,6 +156,7 @@ def _rope_reference(
     *,
     frequency_dim: int | None = None,
     active_pairs: int | None = None,
+    mrope_interleaved: bool = False,
 ) -> np.ndarray:
     output = source.copy()
     half = rotary_dim // 2
@@ -168,10 +169,27 @@ def _rope_reference(
             for pair in range(half):
                 axis = 0
                 if sections is not None:
-                    axis = 0 if pair < sections[0] else (1 if pair < sum(sections[:2]) else 2)
+                    if mrope_interleaved:
+                        residue = pair % 3
+                        axis = (
+                            1
+                            if residue == 1 and pair < sections[1] * 3
+                            else (2 if residue == 2 and pair < sections[2] * 3 else 0)
+                        )
+                    else:
+                        axis = (
+                            0
+                            if pair < sections[0]
+                            else (1 if pair < sum(sections[:2]) else 2)
+                        )
                     if positions.ndim == 1 or axis >= positions.shape[0]:
                         axis = 0
-                position = positions[token] if positions.ndim == 1 else positions[axis, token]
+                if positions.ndim == 1:
+                    position = positions[token]
+                elif positions.ndim == 2:
+                    position = positions[axis, token]
+                else:
+                    position = positions[axis, index[0], token]
                 angle = float(position) * frequencies[pair]
                 cosine, sine = np.cos(angle), np.sin(angle)
                 first = float(source[index + (token, pair)])
@@ -222,6 +240,68 @@ def test_mrope_sections_match_reference():
         )
     )
     expected = _rope_reference(source, positions, 1_000.0, 12, sections)
+    np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
+
+
+def test_interleaved_mrope_sections_match_qwen4_reference():
+    source = _random(72, (1, 2, 3, 16))
+    positions = np.asarray(
+        [[0, 1, 2], [3, 4, 5], [6, 7, 8]],
+        dtype=np.int32,
+    )
+    sections = (2, 2, 2)
+    actual = _array(
+        rope(
+            source,
+            positions,
+            base=1_000.0,
+            rotary_dim=12,
+            sections=sections,
+            table_len=16,
+            mrope_interleaved=True,
+        )
+    )
+    expected = _rope_reference(
+        source,
+        positions,
+        1_000.0,
+        12,
+        sections,
+        mrope_interleaved=True,
+    )
+    np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
+
+
+def test_interleaved_mrope_supports_per_batch_multimodal_positions():
+    source = _random(73, (2, 3, 4, 16))
+    positions = np.asarray(
+        [
+            [[0, 1, 2, 3], [4, 5, 6, 7]],
+            [[1, 2, 3, 4], [8, 9, 10, 11]],
+            [[2, 3, 4, 5], [12, 13, 14, 15]],
+        ],
+        dtype=np.int32,
+    )
+    sections = (2, 2, 2)
+    actual = _array(
+        rope(
+            source,
+            positions,
+            base=1_000.0,
+            rotary_dim=12,
+            sections=sections,
+            table_len=16,
+            mrope_interleaved=True,
+        )
+    )
+    expected = _rope_reference(
+        source,
+        positions,
+        1_000.0,
+        12,
+        sections,
+        mrope_interleaved=True,
+    )
     np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
 
 

@@ -16,6 +16,15 @@ METAL_MINICPM = (
 ).read_text(encoding="utf-8")
 SERVER = (ROOT / "cpp_runtime" / "mfq_server.cpp").read_text(encoding="utf-8")
 HEADER = (ROOT / "cpp_runtime" / "mfq_server.h").read_text(encoding="utf-8")
+PAGED_HEADER = (ROOT / "cpp_runtime" / "mfq_paged_prefix_cache.h").read_text(
+    encoding="utf-8"
+)
+PAGED_SOURCE = (ROOT / "cpp_runtime" / "mfq_paged_prefix_cache.cpp").read_text(
+    encoding="utf-8"
+)
+METAL_PAGED_CODEC = (
+    ROOT / "cpp_runtime" / "metal" / "mlx_paged_session_codec.cpp"
+).read_text(encoding="utf-8")
 
 
 def test_native_session_identifier_reaches_the_cuda_runtime() -> None:
@@ -94,3 +103,44 @@ def test_all_metal_text_graphs_capture_and_restore_prefix_state() -> None:
         assert "capture_text_session_state" in source
         assert "restore_text_session_state" in source
         assert "prompt.size() - reused_tokens" in source
+
+
+def test_persistent_prefix_cache_is_content_addressed_and_restart_safe() -> None:
+    assert "class PagedPrefixCache" in PAGED_HEADER
+    assert "BlockHash block_hash(" in PAGED_HEADER
+    assert "const BlockHash& parent" in PAGED_HEADER
+    assert "compatibility_key" in PAGED_HEADER
+    assert "payload_hash" in PAGED_SOURCE
+    assert "std::filesystem::rename(temporary, final_path" in PAGED_SOURCE
+    assert "worker_ = std::thread" in PAGED_SOURCE
+    assert "max_pending_bytes" in PAGED_HEADER
+    assert "pending_max_bytes" in PAGED_HEADER
+    assert "pending_write_bytes_" in PAGED_SOURCE
+    assert "enforce_disk_budget_locked" in PAGED_SOURCE
+    assert "void pin(" in PAGED_HEADER
+    assert "void unpin(" in PAGED_HEADER
+
+
+def test_metal_paged_codec_preserves_raw_kv_tensor_storage() -> None:
+    assert "encode_state(" in METAL_PAGED_CODEC
+    assert "decode_blocks(" in METAL_PAGED_CODEC
+    assert "value.data<std::uint8_t>()" in METAL_PAGED_CODEC
+    assert "MlxMiniCPMO45TextSessionState" in METAL_PAGED_CODEC
+    assert "make_metal_paged_cache<Runtime>" in METAL_DECODE
+    assert "replace_paged_cache(" in METAL_DECODE
+    assert "prefix_cache_disk_blocks" in METAL_DECODE
+    assert "MFQ_SERVER_PREFIX_CACHE_PENDING_BYTES" in METAL_DECODE
+    assert "prefix_cache_pending_max_bytes" in METAL_DECODE
+
+
+def test_cuda_paged_cache_only_accepts_linear_full_attention_kv() -> None:
+    assert "supports_paged_text_session_state" in DECODE
+    assert "return full != nullptr && !full->sliding" in DECODE
+    assert "encode_cuda_paged_session(" in DECODE
+    assert "decode_cuda_paged_session(" in DECODE
+    assert "if (layer.ring" in DECODE
+    assert "make_cuda_paged_prefix_cache(" in DECODE
+    assert "backend=cuda action=paged_hit" in DECODE
+    assert "prefix_cache_disk_blocks" in DECODE
+    assert "MFQ_SERVER_PREFIX_CACHE_PENDING_BYTES" in DECODE
+    assert "prefix_cache_pending_max_bytes" in DECODE

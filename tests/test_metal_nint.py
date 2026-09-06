@@ -16,11 +16,14 @@ except RuntimeError:
 from mfq.formats import io  # noqa: E402
 from mfq.formats.header import FileHeader  # noqa: E402
 from mfq.formats.nint import NINT2_SPEC, NintSpec  # noqa: E402
+from mfq.kernels.metal import nint as metal_nint  # noqa: E402
 from mfq.kernels.metal.nint import (  # noqa: E402
     MetalNintWeight,
     _can_use_nint4_gs24_decode,
+    _can_use_nint4_gs24_m2_decode,
     _can_use_nint5_gs28_decode,
     _can_use_nint6_gs24_decode,
+    _maximum_scalar_gemm_rows,
     nint_dequantize,
     nint_dequantize_matmul,
     nint_embedding,
@@ -37,6 +40,21 @@ from mfq.runtime.mlx_linear import MlxNintLinear, MlxNintModel, MlxSwiGLUFFN  # 
 def _array(value: mx.array) -> np.ndarray:
     mx.eval(value)
     return np.asarray(value)
+
+
+def test_large_packed_buffer_uses_multiple_mlx_dimensions(monkeypatch):
+    monkeypatch.setattr(metal_nint, "_MLX_MAX_DIMENSION", 31)
+    source = np.arange(96, dtype=np.uint8)
+    shaped = metal_nint._mlx_safe_buffer_shape(source, preferred_rows=6)
+    assert shaped.shape == (6, 16)
+    assert np.shares_memory(shaped, source)
+
+
+def test_scalar_gemm_chunk_limit_keeps_long_multimodal_prefill_grid_in_range():
+    assert _maximum_scalar_gemm_rows(16_384, 8) == 32_760
+    maximum_rows = _maximum_scalar_gemm_rows(6_144, 8)
+    assert ((maximum_rows + 7) // 8) * 6_144 * 32 <= (1 << 31) - 1
+    assert ((maximum_rows + 15) // 8) * 6_144 * 32 > (1 << 31) - 1
 
 
 def _random(seed: int, shape: tuple[int, ...], scale: float = 0.1) -> np.ndarray:
@@ -318,6 +336,28 @@ def test_nint4_gs24_decode_compatibility_keeps_fallbacks():
         rtol=2e-3,
         atol=2e-3,
     )
+
+
+def test_nint4_gs24_m2_decode_reuses_weights_across_both_rows():
+    tensor = _nint4_gs24_fixture(out=37, width=96, seed=179)
+    packed = MetalNintWeight.from_tensor(tensor)
+    source = _random(180, (2, 96)).astype(np.float16)
+    source_mx = mx.array(source)
+
+    assert tensor.shape[0] % 16 != 0
+    assert _can_use_nint4_gs24_m2_decode(packed, source_mx, 2)
+    assert not _can_use_nint4_gs24_m2_decode(packed, source_mx, 1)
+    assert not _can_use_nint4_gs24_m2_decode(
+        packed,
+        mx.array(source.astype(np.float32)),
+        2,
+    )
+
+    actual = _array(nint_mmq(packed, source_mx))
+    expected = source.astype(np.float32) @ nint_quant.dequantize(tensor).T
+    assert actual.dtype == np.float16
+    assert actual.shape == (2, 37)
+    np.testing.assert_allclose(actual, expected, rtol=2e-3, atol=2e-3)
 
 
 def test_nint4_gs24_decode_large_output_tail():
