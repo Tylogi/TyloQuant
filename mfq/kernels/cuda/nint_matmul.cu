@@ -4385,7 +4385,7 @@ mfq_tensor_backend::Tensor nint_gemv_packed_int6_ws_cuda(
 #define QPWS6LAUNCH(GSVAL)                                                                \
     do {                                                                                  \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                      \
-        if (GSVAL == 24 && M > 1 && batch_group6) {                                      \
+        if (GSVAL == 24 && M > 6 && batch_group6) {                                      \
             quantize_x_kernel<GSVAL, BD, true><<<dim3(M, ng), BD, 0, stream>>>(           \
                 reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                  \
                 qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), \
@@ -4396,69 +4396,69 @@ mfq_tensor_backend::Tensor nint_gemv_packed_int6_ws_cuda(
                 qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), \
                 M, K_real, K_pad);                                                        \
         }                                                                                 \
-        if (GSVAL == 24 && M > 1 && batch_group6) {                                      \
+        if (GSVAL == 24 && M > 6 && batch_group6) {                                      \
             if (M == 2) { QPWS6BATCH(2); }                                               \
             else if (M == 3) { QPWS6BATCH(3); }                                          \
             else if (M == 4) { QPWS6BATCH(4); }                                          \
             else if (M == 5) { QPWS6BATCH(5); }                                          \
             else { QPWS6BATCH(8); }                                                      \
-        } else if (GSVAL == 24 && M == 1 && u16_group6 && nwarps6 == 8) {                \
+        } else if (GSVAL == 24 && M <= 6 && u16_group6 && nwarps6 == 8) {                \
             gemv_packed_int6_gs24_group_kernel<8, true><<<dim3(N, M), dim3(32, 8), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                      \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                       \
                 reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);    \
-        } else if (GSVAL == 24 && M == 1 && u16_group6 && nwarps6 == 4) {                 \
+        } else if (GSVAL == 24 && M <= 6 && u16_group6 && nwarps6 == 4) {                 \
             gemv_packed_int6_gs24_group_kernel<4, true><<<dim3(N, M), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                      \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                       \
                 reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);    \
-        } else if (GSVAL == 24 && M == 1 && u16_group6 && nwarps6 == 2) {                 \
+        } else if (GSVAL == 24 && M <= 6 && u16_group6 && nwarps6 == 2) {                 \
             gemv_packed_int6_gs24_group_kernel<2, true><<<dim3(N, M), dim3(32, 2), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                      \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                       \
                 reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);    \
-        } else if (GSVAL == 24 && M == 1 && group6 && nwarps6 == 8) {                     \
+        } else if (GSVAL == 24 && M <= 6 && group6 && nwarps6 == 8) {                     \
             gemv_packed_int6_gs24_group_kernel<8><<<dim3(N, M), dim3(32, 8), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                      \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                       \
                 reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);    \
-        } else if (GSVAL == 24 && M == 1 && group6 && nwarps6 == 4) {                     \
+        } else if (GSVAL == 24 && M <= 6 && group6 && nwarps6 == 4) {                     \
             gemv_packed_int6_gs24_group_kernel<4><<<dim3(N, M), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                      \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                       \
                 reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);    \
-        } else if (GSVAL == 24 && M == 1 && group6 && nwarps6 == 2) {                     \
+        } else if (GSVAL == 24 && M <= 6 && group6 && nwarps6 == 2) {                     \
             gemv_packed_int6_gs24_group_kernel<2><<<dim3(N, M), dim3(32, 2), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                      \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                       \
                 reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);    \
-        } else if (M == 1 && nwarps6 == 8) {                                              \
+        } else if (M <= 6 && nwarps6 == 8) {                                              \
             gemv_packed_int6_multiwarp_kernel<GSVAL, false, 8><<<dim3(N, M), dim3(32, 8), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                      \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                       \
                 reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);    \
-        } else if (M == 1 && nwarps6 == 4) {                                              \
+        } else if (M <= 6 && nwarps6 == 4) {                                              \
             gemv_packed_int6_multiwarp_kernel<GSVAL><<<dim3(N, M), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                      \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                       \
                 reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);    \
-        } else if (M == 1 && nwarps6 == 2) {                                              \
+        } else if (M <= 6 && nwarps6 == 2) {                                              \
             gemv_packed_int6_multiwarp_kernel<GSVAL, false, 2><<<dim3(N, M), dim3(32, 2), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),              \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),              \

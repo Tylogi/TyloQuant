@@ -15815,6 +15815,13 @@ struct FullBlock : Block {
                           const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
                           const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override {
         int64_t B = x.size(0), T = x.size(1), H = x.size(2);
+        auto trace_qwen_stage = [&](const char* name, const mfq_tensor_backend::Tensor& value,
+                                    int token_axis = 1) {
+            if (!c.qwen35_attn_q_gate || g_gemma_stage_trace == nullptr ||
+                    layer != g_gemma_trace_layer) return;
+            auto ordered = token_axis == 1 ? value : value.transpose(1, token_axis).contiguous();
+            trace_gemma_stage(layer, name, ordered.reshape({B, T, -1}));
+        };
         const bool official_bf16 = c.uses_minicpmo45_bf16_graph();
         if (official_bf16 && x.scalar_type() != mfq_tensor_backend::kBFloat16) {
             x = x.to(mfq_tensor_backend::kBFloat16).contiguous();
@@ -15852,12 +15859,16 @@ struct FullBlock : Block {
                     x.reshape({B * T, H}).to(mfq_tensor_backend::kFloat32), attn_norm, c)
                     .reshape({B, T, H});
         });
+        trace_qwen_stage("qwen.attn_norm", xn);
         auto parts = g_profiler.measure("full.qkv", [&]() { return qkv.forward(xn); });
         if (parts.size() != (value_equals_key ? 2u : 3u)) {
             throw std::runtime_error("attention projection group has the wrong output count");
         }
         auto q_full = parts[0], k_full = parts[1];
         auto v_full = value_equals_key ? k_full : parts[2];
+        trace_qwen_stage("qwen.q_projection", q_full);
+        trace_qwen_stage("qwen.k_projection", k_full);
+        trace_qwen_stage("qwen.v_projection", v_full);
         if (official_bf16) {
             q_full = q_full.to(mfq_tensor_backend::kBFloat16).contiguous();
             k_full = k_full.to(mfq_tensor_backend::kBFloat16).contiguous();
@@ -15996,6 +16007,8 @@ struct FullBlock : Block {
             });
         }
         }
+        trace_qwen_stage("qwen.q_rope", q, 2);
+        trace_qwen_stage("qwen.k_rope", k, 2);
         auto minicpmo45_attention_mask = [&](int64_t visible_len,
                                               bool explicit_causal) {
             MfqOptional<mfq_tensor_backend::Tensor> result = mfq_nullopt;
@@ -16320,6 +16333,7 @@ struct FullBlock : Block {
         });
         mfq_tensor_backend::Tensor oo;
         if (q_gate.defined()) {
+            trace_qwen_stage("qwen.attention", a, attention_token_major ? 1 : 2);
             auto af = g_profiler.measure("full.attn_out_view", [&]() {
                 return attention_token_major ? a.reshape({B, T, attn_width}) :
                     a.transpose(1, 2).contiguous().reshape({B, T, attn_width});
@@ -16337,6 +16351,7 @@ struct FullBlock : Block {
                     : o.forward(af);
             });
         }
+        trace_qwen_stage("qwen.o_projection", oo);
         if (official_bf16) {
             oo = oo.to(mfq_tensor_backend::kBFloat16).contiguous();
         }
@@ -16549,6 +16564,7 @@ struct FullBlock : Block {
         x = attn_pair[0].reshape({B, T, H});
         residual = x;
         xn = attn_pair[1].reshape({B, T, H});
+        trace_qwen_stage("qwen.ffn_norm", xn);
         if (!official_bf16) {
             auto ffn_input = xn.reshape({B * T, H});
             auto residual_flat = residual.reshape({B * T, H});
@@ -16592,6 +16608,7 @@ struct FullBlock : Block {
         } else {
             ff = ffn.forward(xn.reshape({B * T, H})).reshape({B, T, H});
         }
+        trace_qwen_stage("qwen.ffn_output", ff);
         auto output = g_profiler.measure("full.ffn_residual", [&]() {
             auto rr = residual.reshape({-1, H});
             auto ff2 = ff.reshape({-1, H});
@@ -21738,8 +21755,12 @@ static int run_qwen35_mtp_check(Model& model, CudaQwen35Mtp& mtp) {
         model.reset(1);
         (void)model.hidden_forward(ids(prompt));
         std::vector<Tensor> verify_trace;
+        std::vector<std::pair<std::string, Tensor>> verify_stages;
+        g_gemma_trace_layer = 3;
+        g_gemma_stage_trace = &verify_stages;
         (void)model.hidden_forward(ids({37, 41}), mfq_nullopt, mfq_nullopt,
             &verify_trace, mfq_nullopt, nullptr, 1);
+        g_gemma_stage_trace = nullptr;
         if (accepted) model.commit_speculative();
         else model.rollback_speculative();
         MFQ_RUNTIME_CHECK(model.cache_pos == static_cast<int64_t>(prompt.size()) + (accepted ? 2 : 1),
@@ -21753,8 +21774,19 @@ static int run_qwen35_mtp_check(Model& model, CudaQwen35Mtp& mtp) {
         model.reset(1);
         (void)model.hidden_forward(ids(prompt));
         std::vector<Tensor> serial_trace;
+        std::vector<std::pair<std::string, Tensor>> serial_stages;
+        g_gemma_stage_trace = &serial_stages;
         (void)model.hidden_forward(ids({37}), mfq_nullopt, mfq_nullopt,
             &serial_trace);
+        g_gemma_stage_trace = nullptr;
+        MFQ_RUNTIME_CHECK(verify_stages.size() == serial_stages.size() && !verify_stages.empty(),
+            "MTP full-attention stage trace mismatch");
+        for (size_t stage = 0; stage < verify_stages.size(); ++stage) {
+            MFQ_RUNTIME_CHECK(verify_stages[stage].first == serial_stages[stage].first,
+                "MTP full-attention stage names differ");
+            compare(verify_stages[stage].second.narrow(1, 0, 1), serial_stages[stage].second,
+                .005, verify_stages[stage].first.c_str());
+        }
         MFQ_RUNTIME_CHECK(verify_trace.size() == serial_trace.size(),
             "MTP diagnostic block trace size mismatch");
         for (size_t layer = 0; layer < verify_trace.size(); ++layer) {

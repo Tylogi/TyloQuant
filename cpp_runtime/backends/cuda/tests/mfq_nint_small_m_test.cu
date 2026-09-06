@@ -20,8 +20,12 @@ DECLARE_BITS_GLU(nint_gemv_packed_bits_geglu_ws_cuda);
 #undef DECLARE_BITS_GLU
 Tensor nint_gemv_packed_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
     int64_t, Tensor, Tensor, Tensor);
+Tensor nint_gemv_packed_int6_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
+    int64_t, Tensor, Tensor, Tensor);
 Tensor nint_gemv_packed_gate_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
     int64_t, int64_t, Tensor, Tensor, Tensor);
+Tensor nint_gemv_packed_bits_gate_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
+    int64_t, int64_t, int64_t, Tensor, Tensor, Tensor);
 
 namespace {
 using namespace mfq::cuda;
@@ -77,8 +81,11 @@ void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs)
     auto xs = empty({batch, groups}, TensorOptions{}.device(gpu).dtype(kFloat32));
     auto xm = empty({batch, groups}, TensorOptions{}.device(gpu).dtype(kInt32));
     auto invoke = [&](const Tensor& input, int operation) {
-        if (operation == 2) return nint_gemv_packed_ws_cuda(q, s, sm, ns, nm, input,
+        if (operation == 2) return (bits == 4 ? nint_gemv_packed_ws_cuda
+            : nint_gemv_packed_int6_ws_cuda)(q, s, sm, ns, nm, input,
             gs, qx, xs, xm);
+        if (operation >= 3 && bits != 4) return nint_gemv_packed_bits_gate_ws_cuda(
+            q, s, sm, ns, nm, input, input, gs, bits, operation - 2, qx, xs, xm);
         if (operation >= 3) return nint_gemv_packed_gate_ws_cuda(q, s, sm, ns, nm,
             input, input, gs, operation - 2, qx, xs, xm);
         if (bits == 4) return (operation == 0 ? nint_gemv_packed_swiglu_ws_cuda
@@ -86,7 +93,7 @@ void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs)
         return (operation == 0 ? nint_gemv_packed_bits_swiglu_ws_cuda
             : nint_gemv_packed_bits_geglu_ws_cuda)(q, s, sm, ns, nm, input, gs, bits, qx, xs, xm);
     };
-    for (int operation = 0; operation < (bits == 4 ? 5 : 2); ++operation) {
+    for (int operation = 0; operation < (bits == 4 || bits == 6 ? 5 : 2); ++operation) {
         std::vector<Tensor> serial;
         for (int m = 0; m < batch; ++m) serial.push_back(invoke(x.narrow(0, m, 1), operation));
         auto reference = cat(serial, 0);
@@ -162,7 +169,7 @@ int main() {
         int cases = 0, graphs = 0;
         for (const auto profile : std::vector<std::vector<int>>{{2,16,5},{3,24,5},{4,24,6},{5,28,7},{6,24,7},{8,48,7}})
             for (int width : {47, 257, 4096}) check(profile[0], profile[1], profile[2], width, cases, graphs);
-        require(cases == 270 && graphs == 15, "incomplete small-M coverage");
+        require(cases == 324 && graphs == 18, "incomplete small-M coverage");
         std::cout << "PASS small_m_cases=" << cases << " graphs=" << graphs << '\n';
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
