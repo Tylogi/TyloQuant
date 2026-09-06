@@ -16984,6 +16984,7 @@ struct LinearBlock : Block {
     mfq_tensor_backend::Tensor conv_state, gdn_state;
     mfq_tensor_backend::Tensor speculative_conv, speculative_gdn;
     bool speculative_pending = false;
+    int64_t speculative_ffn_batches = 0;
 
     void commit_speculative() noexcept { speculative_pending = false; }
 
@@ -17004,8 +17005,17 @@ struct LinearBlock : Block {
             "invalid Qwen speculative linear-attention transaction");
         const int64_t tokens = x.size(1);
         const int position_dim = pos.dim() == 1 ? 0 : 1;
-        auto prefix = forward(x.narrow(1, 0, confirmed),
-            pos.narrow(position_dim, 0, confirmed), cache_pos, mfq_nullopt, c, rope);
+        const char* batch_env = std::getenv("MFQ_QWEN_MTP_BATCH_FFN");
+        const bool batch_ffn = x.is_cuda() && batch_env != nullptr && batch_env[0] == '1';
+        mfq_tensor_backend::Tensor prefix, prefix_norm;
+        if (batch_ffn) {
+            auto attention = forward_attention_cuda(x.narrow(1, 0, confirmed), c);
+            prefix = std::move(attention[0]);
+            prefix_norm = std::move(attention[1]);
+        } else {
+            prefix = forward(x.narrow(1, 0, confirmed),
+                pos.narrow(position_dim, 0, confirmed), cache_pos, mfq_nullopt, c, rope);
+        }
         MFQ_RUNTIME_CHECK(conv_state.defined() && gdn_state.defined(),
             "Qwen recurrent state missing after confirmed prefix");
         if (!speculative_conv.defined() || speculative_conv.sizes() != conv_state.sizes()) {
@@ -17017,6 +17027,18 @@ struct LinearBlock : Block {
         }
         speculative_pending = true;
         try {
+            if (batch_ffn) {
+                auto suffix = forward_attention_cuda(
+                    x.narrow(1, confirmed, tokens - confirmed), c);
+                // FFN is stateless; recurrent updates and checkpoint order stay serial.
+                auto residual = mfq_tensor_backend::cat({prefix, suffix[0]}, 1);
+                auto normalized = mfq_tensor_backend::cat({prefix_norm, suffix[1]}, 1);
+                auto result = g_profiler.measure("linear.mtp_batch_ffn", [&]() {
+                    return forward_ffn_cuda(residual, normalized);
+                });
+                ++speculative_ffn_batches;
+                return result;
+            }
             auto suffix = forward(x.narrow(1, confirmed, tokens - confirmed),
                 pos.narrow(position_dim, confirmed, tokens - confirmed),
                 cache_pos + confirmed, mfq_nullopt, c, rope);
@@ -17206,16 +17228,8 @@ struct LinearBlock : Block {
             .to(residual.scalar_type()).contiguous();
     }
 
-    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, int64_t cache_pos,
-                          const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
-                          const Config & c, const RopeCache & rope,
-                          const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
-                          const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override {
-        (void)cache_positions;
-        (void)attention_mask;
-        if (!x.is_cuda()) return forward_cpu(std::move(x), c);
-        (void)seq_len;
-        (void)pos; (void)cache_pos; (void)rope;
+    std::array<mfq_tensor_backend::Tensor, 2> forward_attention_cuda(
+            mfq_tensor_backend::Tensor x, const Config& c) {
         int64_t B = x.size(0), T = x.size(1), H = x.size(2);
         int64_t nk = c.linear_num_key_heads, nv = c.linear_num_value_heads;
         int64_t dk = c.linear_key_head_dim, dv = c.linear_value_head_dim;
@@ -17407,9 +17421,13 @@ struct LinearBlock : Block {
             }
             return acc_rms_norm_cuda(rr, oo2, ffn_norm, c.rms_norm_eps, c.norm_weight_offset);
         });
-        x = attn_pair[0].reshape({B, T, H});
-        residual = x;
-        xn = attn_pair[1].reshape({B, T, H});
+        return {attn_pair[0].reshape({B, T, H}),
+                attn_pair[1].reshape({B, T, H})};
+    }
+
+    mfq_tensor_backend::Tensor forward_ffn_cuda(
+            mfq_tensor_backend::Tensor residual, mfq_tensor_backend::Tensor xn) {
+        const int64_t B = residual.size(0), T = residual.size(1), H = residual.size(2);
         auto ffn_input = xn.reshape({B * T, H});
         auto residual_flat = residual.reshape({B * T, H});
         if (ffn.can_forward_fused_residual(ffn_input, residual_flat)) {
@@ -17431,6 +17449,20 @@ struct LinearBlock : Block {
             }
             return acc_cuda(rr, ff2).reshape({B, T, H});
         });
+    }
+
+    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, int64_t cache_pos,
+                          const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
+                          const Config & c, const RopeCache & rope,
+                          const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
+                          const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override {
+        (void)cache_positions;
+        (void)attention_mask;
+        if (!x.is_cuda()) return forward_cpu(std::move(x), c);
+        (void)seq_len;
+        (void)pos; (void)cache_pos; (void)rope;
+        auto attention = forward_attention_cuda(std::move(x), c);
+        return forward_ffn_cuda(std::move(attention[0]), std::move(attention[1]));
     }
 };
 
@@ -21949,6 +21981,20 @@ static int run_qwen35_mtp_check(Model& model, CudaQwen35Mtp& mtp) {
         [](int64_t) { return true; }, {});
     MFQ_RUNTIME_CHECK(produced == 8 && mtp.last_cycles > 0 && total_cycles > 0,
         "MTP runtime gate did not execute speculative cycles");
+    const char* batch_env = std::getenv("MFQ_QWEN_MTP_BATCH_FFN");
+    if (batch_env != nullptr && batch_env[0] == '1') {
+        int64_t layers = 0, calls = 0;
+        for (const auto& block : model.blocks) {
+            if (auto* linear = dynamic_cast<const LinearBlock*>(block.get())) {
+                MFQ_RUNTIME_CHECK(linear->speculative_ffn_batches > 0,
+                    "MTP gate did not exercise requested batched FFN route");
+                ++layers;
+                calls += linear->speculative_ffn_batches;
+            }
+        }
+        MFQ_RUNTIME_CHECK(layers > 0, "MTP batched FFN gate found no recurrent layers");
+        std::cout << "mtp_check batched_ffn_layers=" << layers << " calls=" << calls << '\n';
+    }
     std::cout << "mtp_check PASS full_chain=1 greedy_tokens=96 stochastic_smoke_tokens=8\n";
     return 0;
 }
