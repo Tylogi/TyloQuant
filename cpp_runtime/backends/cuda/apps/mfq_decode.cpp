@@ -26954,7 +26954,7 @@ int main(int argc, char ** argv) {
             else if (a == "--compare-nvq-vec4" || a == "--compare-niq-vec4") compare_nvq_vec4 = true;
             else {
                 std::cerr << "usage: mfq-decode --mfq model.mfq [--config config.json] "
-                             "(--ids 1,2,3 --gen 128 | --server "
+                             "(--ids 1,2,3 --gen 128 | --check-qwen35-mtp | --server "
                              "[--host 127.0.0.1 --port 8080 --ctx-size 32768 --model-name name "
                              "--tensor-parallel 0,1 --tensor-split 1,1 "
                              "--layer-parallel 0,1 --layer-split 1,1 "
@@ -27321,10 +27321,10 @@ int main(int argc, char ** argv) {
                 context_size, minicpmo_tts_steps);
         }
         if (mfq_path.empty() ||
-            (!server_mode && ids_arg.empty() && ids_file.empty() &&
+            (!server_mode && !check_qwen35_mtp && ids_arg.empty() && ids_file.empty() &&
                 kl_base.empty() && prefill_sweep_arg.empty())) {
             std::cerr << "usage: mfq-decode --mfq model.mfq [--config config.json] "
-                         "(--ids 1,2,3 --gen 128 | --minicpmo-eval-batch "
+                         "(--ids 1,2,3 --gen 128 | --check-qwen35-mtp | --minicpmo-eval-batch "
                          "[--minicpmo-eval-vision-batch-size 16] | --server "
                          "[--host 127.0.0.1 --port 8080 --ctx-size 32768 --model-name name "
                          "--api-key key] | --kl-base reference.bin "
@@ -27337,6 +27337,11 @@ int main(int argc, char ** argv) {
         }
         if (context_size < 0) throw std::runtime_error("--ctx-size must be positive");
         if (server_mode && context_size == 0) context_size = 32768;
+        if (check_qwen35_mtp) {
+            if (context_size == 0) context_size = 512;
+            if (context_size < 64) throw std::runtime_error("MTP correctness gate requires --ctx-size >= 64");
+            std::cout << std::unitbuf;
+        }
         if (!cpu_offload_layers_arg.empty()) {
             g_dsv4_cpu_offload_layers =
                 parse_layer_ranges(cpu_offload_layers_arg);
