@@ -10920,7 +10920,9 @@ static mfq_tensor_backend::Tensor nint_matmul(const NintWeight & w, mfq_tensor_b
         });
         return g_profiler.measure("nint.gemm_hi", [&]() { return mfq_tensor_backend::matmul(x, ww.transpose(0, 1)); });
     }
-    if (M == 1) {
+    // Small verification batches must use the decode reduction order. Tiny
+    // projection differences can cross INT8 rounding boundaries in later layers.
+    if (M == 1 || (w.gs == 24 && M >= 2 && M <= 6)) {
         Workspace & ws = w.workspace(M);
         return nint_gemv_packed_ws_cuda(w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
                                         x, w.gs, ws.qx, ws.xscale, ws.xsum);
@@ -11069,7 +11071,7 @@ static mfq_tensor_backend::Tensor nint_matmul_input_mul(const NintWeight & w, mf
         if (mode == 1) return nint_matmul(w, x * mfq_tensor_backend::sigmoid(gate));
         return nint_matmul(w, x * mfq_tensor_backend::silu(gate));
     }
-    if (w.bits == 4 && M == 1) {
+    if (w.bits == 4 && M >= 1 && M <= 6) {
         Workspace & ws = w.workspace(M);
         return nint_gemv_packed_gate_ws_cuda(w.q_packed, w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
                                              x, gate, w.gs, mode, ws.qx, ws.xscale, ws.xsum);
@@ -11109,8 +11111,8 @@ static mfq_tensor_backend::Tensor nint_matmul_swiglu(const NintWeight & w, mfq_t
         auto parts = nint_matmul(w, x).chunk(2, -1);
         return mfq_tensor_backend::silu(parts[0]) * parts[1];
     }
-    if (M != 1) {
-        throw std::runtime_error("NINT SwiGLU fusion supports only decode M=1");
+    if (M < 1 || M > 6) {
+        throw std::runtime_error("NINT SwiGLU fusion supports M in [1,6]");
     }
     Workspace & ws = w.workspace(M);
     if (w.bits == 4) {
@@ -14723,7 +14725,7 @@ struct FFN {
         }
         const char* disable_swiglu = std::getenv("MFQ_DISABLE_FFN_SWIGLU_FUSION");
         if ((disable_swiglu == nullptr || disable_swiglu[0] != '1') &&
-            xh.numel() / xh.size(-1) == 1 &&
+            xh.numel() / xh.size(-1) >= 1 && xh.numel() / xh.size(-1) <= 6 &&
             gate_up.nint_grouped && gate_up.nint.split_w.empty() &&
             gate_up.outs.size() == 2 && gate_up.outs[0] == gate_up.outs[1]) {
             auto act = g_profiler.measure("ffn.gate_up_swiglu", [&]() { return gate_up.forward_swiglu(xh); });

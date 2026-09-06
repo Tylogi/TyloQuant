@@ -1524,6 +1524,9 @@ __global__ void __launch_bounds__(256) gemv_packed_bits_swiglu_pair_kernel(
     __half* __restrict__ out,                // [1, N]
     int N, int ng, int K_pad, int activation)
 {
+    qx += static_cast<size_t>(blockIdx.y) * K_pad;
+    xscale += static_cast<size_t>(blockIdx.y) * ng;
+    out += static_cast<size_t>(blockIdx.y) * N;
     constexpr int PPB = 4;
     constexpr int QBYTES = (GS * BITS + 7) / 8;
     constexpr int CHUNKS = (GS + 3) / 4;
@@ -1613,6 +1616,9 @@ __global__ void __launch_bounds__(WPB * 32) gemv_packed_bits_glu_combined_pair_k
     __half* __restrict__ out,
     int N, int ng, int K_pad, int activation)
 {
+    qx += static_cast<size_t>(blockIdx.y) * K_pad;
+    xscale += static_cast<size_t>(blockIdx.y) * ng;
+    out += static_cast<size_t>(blockIdx.y) * N;
     constexpr int QBYTES = (GS * BITS + 7) / 8;
     constexpr int CHUNKS = (GS + 3) / 4;
     constexpr int GPW = 32 / CHUNKS;
@@ -3223,6 +3229,9 @@ __global__ void __launch_bounds__(256) gemv_packed_swiglu_pair_kernel(
     __half* __restrict__ out,                // [1, N]
     int N, int ng, int K_pad, int activation)
 {
+    qx += static_cast<size_t>(blockIdx.y) * K_pad;
+    xscale += static_cast<size_t>(blockIdx.y) * ng;
+    out += static_cast<size_t>(blockIdx.y) * N;
     constexpr int PPB = 4;
     int pair = blockIdx.x * PPB + (threadIdx.y >> 1);
     int half_id = threadIdx.y & 1;
@@ -3284,6 +3293,9 @@ __global__ void __launch_bounds__(256) gemv_packed_swiglu_multiwarp_kernel(
     __half* __restrict__ out,
     int N, int ng, int K_pad, int activation)
 {
+    qx += static_cast<size_t>(blockIdx.y) * K_pad;
+    xscale += static_cast<size_t>(blockIdx.y) * ng;
+    out += static_cast<size_t>(blockIdx.y) * N;
     int pair = blockIdx.x;
     int lane = threadIdx.x;
     int warp = threadIdx.y;
@@ -3365,6 +3377,9 @@ __global__ void __launch_bounds__(256) gemv_packed_swiglu_gs24_group_kernel(
     __half* __restrict__ out,
     int N, int ng, int K_pad, int activation)
 {
+    qx += static_cast<size_t>(blockIdx.y) * K_pad;
+    xscale += static_cast<size_t>(blockIdx.y) * ng;
+    out += static_cast<size_t>(blockIdx.y) * N;
     constexpr int GS = 24;
     int pair = blockIdx.x;
     int lane = threadIdx.x;
@@ -4201,14 +4216,14 @@ mfq_tensor_backend::Tensor nint_gemv_packed_ws_cuda(
             reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                    \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),  \
             M, K_real, K_pad);                                                          \
-        if (GSVAL == 24 && M == 1 && nint_gs24_group_enabled("MFQ_NINT4_GS24_VEC_LOAD", true)) { \
+        if (GSVAL == 24 && M <= 6 && nint_gs24_group_enabled("MFQ_NINT4_GS24_VEC_LOAD", true)) { \
             gemv_packed_gs24_group_kernel<4, true><<<dim3(N, M), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                     \
                 reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);  \
-        } else if (GSVAL == 24 && M == 1 && nint_gs24_group_enabled("MFQ_NINT4_GS24_GROUP", true)) { \
+        } else if (GSVAL == 24 && M <= 6 && nint_gs24_group_enabled("MFQ_NINT4_GS24_GROUP", true)) { \
             gemv_packed_gs24_group_kernel<4><<<dim3(N, M), dim3(32, 4), 0, stream>>>(   \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
@@ -4757,14 +4772,14 @@ mfq_tensor_backend::Tensor nint_gemv_packed_gate_ws_cuda(
                 qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), \
                 M, K_real, K_pad);                                                      \
         }                                                                               \
-        if (GSVAL == 24 && M == 1 && nint_gs24_group_enabled("MFQ_NINT4_GS24_VEC_LOAD", true)) { \
+        if (GSVAL == 24 && M <= 6 && nint_gs24_group_enabled("MFQ_NINT4_GS24_VEC_LOAD", true)) { \
             gemv_packed_gs24_group_kernel<4, true><<<dim3(N, M), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
                 xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),                     \
                 reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), M, N, ng, K_pad);  \
-        } else if (GSVAL == 24 && M == 1 && nint_gs24_group_enabled("MFQ_NINT4_GS24_GROUP", true)) { \
+        } else if (GSVAL == 24 && M <= 6 && nint_gs24_group_enabled("MFQ_NINT4_GS24_GROUP", true)) { \
             gemv_packed_gs24_group_kernel<4><<<dim3(N, M), dim3(32, 4), 0, stream>>>(   \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
@@ -4830,12 +4845,13 @@ static mfq_tensor_backend::Tensor nint_gemv_packed_glu_ws_cuda(
     MFQ_RUNTIME_CHECK((int)sub_scale.size(0) == N2 && (int)sub_scale.size(1) == ng, "sub_scale shape mismatch");
     MFQ_RUNTIME_CHECK(sub_min.sizes() == sub_scale.sizes(), "sub_min shape mismatch");
     MFQ_RUNTIME_CHECK((int)neuron_scale.size(0) == N2 && (int)neuron_min.size(0) == N2, "neuron metadata shape mismatch");
-    MFQ_RUNTIME_CHECK(x.dim() == 2 && x.size(0) == 1, "swiglu packed GEMV fast path supports only M=1");
+    MFQ_RUNTIME_CHECK(x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 6, "swiglu packed GEMV supports M in [1,6]");
+    const int M = static_cast<int>(x.size(0));
     int K_real = (int)x.size(1);
     int K_pad = ng * (int)gs;
-    MFQ_RUNTIME_CHECK((int)qx.size(0) >= 1 && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= 1 && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    auto out = mfq_tensor_backend::empty({1, N}, x.options());
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
     cudaStream_t stream = mfq_current_cuda_stream();
     int swiglu_nwarps = nint_multiwarp_count("MFQ_NINT_SWIGLU_WARPS", 4);
     bool swiglu_group = nint_gs24_group_enabled("MFQ_NINT_SWIGLU_GS24_GROUP", true);
@@ -4844,75 +4860,75 @@ static mfq_tensor_backend::Tensor nint_gemv_packed_glu_ws_cuda(
 #define QPSWIGLULAUNCH(GSVAL)                                                          \
     do {                                                                                \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                    \
-        quantize_x_kernel<GSVAL, BD><<<dim3(1, ng), BD, 0, stream>>>(                   \
+        quantize_x_kernel<GSVAL, BD><<<dim3(M, ng), BD, 0, stream>>>(                   \
             reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                    \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),  \
-            1, K_real, K_pad);                                                          \
+            M, K_real, K_pad);                                                          \
         if (GSVAL == 24 && swiglu_vec_load && swiglu_nwarps == 8) {                    \
-            gemv_packed_swiglu_gs24_group_kernel<8, true><<<N, dim3(32, 8), 0, stream>>>( \
+            gemv_packed_swiglu_gs24_group_kernel<8, true><<<dim3(N, M), dim3(32, 8), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
                 xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 N, ng, K_pad, activation);                                              \
         } else if (GSVAL == 24 && swiglu_vec_load && swiglu_nwarps == 4) {             \
-            gemv_packed_swiglu_gs24_group_kernel<4, true><<<N, dim3(32, 4), 0, stream>>>( \
+            gemv_packed_swiglu_gs24_group_kernel<4, true><<<dim3(N, M), dim3(32, 4), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
                 xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 N, ng, K_pad, activation);                                              \
         } else if (GSVAL == 24 && swiglu_vec_load && swiglu_nwarps == 2) {             \
-            gemv_packed_swiglu_gs24_group_kernel<2, true><<<N, dim3(32, 2), 0, stream>>>( \
+            gemv_packed_swiglu_gs24_group_kernel<2, true><<<dim3(N, M), dim3(32, 2), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
                 xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 N, ng, K_pad, activation);                                              \
         } else if (GSVAL == 24 && swiglu_group && swiglu_nwarps == 8) {                \
-            gemv_packed_swiglu_gs24_group_kernel<8><<<N, dim3(32, 8), 0, stream>>>(    \
+            gemv_packed_swiglu_gs24_group_kernel<8><<<dim3(N, M), dim3(32, 8), 0, stream>>>(    \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
                 xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 N, ng, K_pad, activation);                                              \
         } else if (GSVAL == 24 && swiglu_group && swiglu_nwarps == 4) {                \
-            gemv_packed_swiglu_gs24_group_kernel<4><<<N, dim3(32, 4), 0, stream>>>(    \
+            gemv_packed_swiglu_gs24_group_kernel<4><<<dim3(N, M), dim3(32, 4), 0, stream>>>(    \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
                 xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 N, ng, K_pad, activation);                                              \
         } else if (GSVAL == 24 && swiglu_group && swiglu_nwarps == 2) {                \
-            gemv_packed_swiglu_gs24_group_kernel<2><<<N, dim3(32, 2), 0, stream>>>(    \
+            gemv_packed_swiglu_gs24_group_kernel<2><<<dim3(N, M), dim3(32, 2), 0, stream>>>(    \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
                 xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 N, ng, K_pad, activation);                                              \
         } else if (swiglu_nwarps == 8) {                                               \
-            gemv_packed_swiglu_multiwarp_kernel<GSVAL, 8><<<N, dim3(32, 8), 0, stream>>>( \
+            gemv_packed_swiglu_multiwarp_kernel<GSVAL, 8><<<dim3(N, M), dim3(32, 8), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
                 xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 N, ng, K_pad, activation);                                              \
         } else if (swiglu_nwarps == 4) {                                               \
-            gemv_packed_swiglu_multiwarp_kernel<GSVAL><<<N, dim3(32, 4), 0, stream>>>(  \
+            gemv_packed_swiglu_multiwarp_kernel<GSVAL><<<dim3(N, M), dim3(32, 4), 0, stream>>>(  \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
                 xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 N, ng, K_pad, activation);                                              \
         } else if (swiglu_nwarps == 2) {                                               \
-            gemv_packed_swiglu_multiwarp_kernel<GSVAL, 2><<<N, dim3(32, 2), 0, stream>>>( \
+            gemv_packed_swiglu_multiwarp_kernel<GSVAL, 2><<<dim3(N, M), dim3(32, 2), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
                 xscale.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<mfq_half>()), \
                 N, ng, K_pad, activation);                                              \
         } else {                                                                        \
-            gemv_packed_swiglu_pair_kernel<GSVAL><<<dim3((N + 3) / 4), dim3(32, 8), 0, stream>>>( \
+            gemv_packed_swiglu_pair_kernel<GSVAL><<<dim3((N + 3) / 4, M), dim3(32, 8), 0, stream>>>( \
                 q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),            \
                 sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),            \
                 neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                    \
@@ -5599,12 +5615,13 @@ static mfq_tensor_backend::Tensor nint_gemv_packed_bits_glu_ws_cuda(
     MFQ_RUNTIME_CHECK((int)sub_scale.size(0) == N2 && (int)sub_scale.size(1) == ng, "sub_scale shape mismatch");
     MFQ_RUNTIME_CHECK(sub_min.sizes() == sub_scale.sizes(), "sub_min shape mismatch");
     MFQ_RUNTIME_CHECK((int)neuron_scale.size(0) == N2 && (int)neuron_min.size(0) == N2, "neuron metadata shape mismatch");
-    MFQ_RUNTIME_CHECK(x.dim() == 2 && x.size(0) == 1, "packed-bits swiglu GEMV fast path supports only M=1");
+    MFQ_RUNTIME_CHECK(x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 6, "packed-bits swiglu GEMV supports M in [1,6]");
+    const int M = static_cast<int>(x.size(0));
     int K_real = (int)x.size(1);
     int K_pad = ng * (int)gs;
-    MFQ_RUNTIME_CHECK((int)qx.size(0) >= 1 && (int)qx.size(1) >= K_pad, "qx workspace too small");
-    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= 1 && (int)xscale.size(1) >= ng, "xscale workspace too small");
-    auto out = mfq_tensor_backend::empty({1, N}, x.options());
+    MFQ_RUNTIME_CHECK((int)qx.size(0) >= M && (int)qx.size(1) >= K_pad, "qx workspace too small");
+    MFQ_RUNTIME_CHECK((int)xscale.size(0) >= M && (int)xscale.size(1) >= ng, "xscale workspace too small");
+    auto out = mfq_tensor_backend::empty({M, N}, x.options());
     cudaStream_t stream = mfq_current_cuda_stream();
 
     const char* combined_env = std::getenv("MFQ_NINT_GLU_COMBINED");
@@ -5616,13 +5633,13 @@ static mfq_tensor_backend::Tensor nint_gemv_packed_bits_glu_ws_cuda(
 #define QPBITSSWIGLULAUNCH(BITSVAL, GSVAL)                                             \
     do {                                                                                \
         constexpr int BD = ((GSVAL + 31) / 32) * 32;                                    \
-        quantize_x_kernel<GSVAL, BD><<<dim3(1, ng), BD, 0, stream>>>(                   \
+        quantize_x_kernel<GSVAL, BD><<<dim3(M, ng), BD, 0, stream>>>(                   \
             reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()),                    \
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(),  \
-            1, K_real, K_pad);                                                          \
+            M, K_real, K_pad);                                                          \
         if (use_combined) {                                                             \
             gemv_packed_bits_glu_combined_pair_kernel<BITSVAL, GSVAL, 16>               \
-                <<<dim3((N + 15) / 16), dim3(32, 16), 0, stream>>>(                    \
+                <<<dim3((N + 15) / 16, M), dim3(32, 16), 0, stream>>>(                    \
                     q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),        \
                     sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),        \
                     neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                \
@@ -5630,7 +5647,7 @@ static mfq_tensor_backend::Tensor nint_gemv_packed_bits_glu_ws_cuda(
                     N, ng, K_pad, activation);                                          \
         } else {                                                                        \
             gemv_packed_bits_swiglu_pair_kernel<BITSVAL, GSVAL>                         \
-                <<<dim3((N + 3) / 4), dim3(32, 8), 0, stream>>>(                        \
+                <<<dim3((N + 3) / 4, M), dim3(32, 8), 0, stream>>>(                        \
                     q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),        \
                     sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(),        \
                     neuron_min.data_ptr<float>(), qx.data_ptr<int8_t>(),                \
