@@ -12036,6 +12036,7 @@ struct QuantLinear {
     Mxfp8Linear mxfp8;
     TpqLinear tpq;
     mfq_tensor_backend::Tensor dense;
+    bool dense_small_m_rowwise = false;
     TensorParallelAxis tensor_parallel_axis =
         TensorParallelAxis::Mirrored;
     std::vector<QuantLinearShard> tensor_parallel_shards;
@@ -12125,6 +12126,20 @@ struct QuantLinear {
             : reduced;
     }
 
+    mfq_tensor_backend::Tensor forward_dense(mfq_tensor_backend::Tensor x) const {
+        auto input = x.to(dense.scalar_type());
+        const int64_t rows = input.numel() / input.size(-1);
+        if (dense_small_m_rowwise && rows > 1 && rows <= 6) {
+            auto shape = input.sizes().vec();
+            shape.back() = dense.size(0);
+            // Native matmul issues the same M=1 cuBLAS operation per row.
+            return mfq_tensor_backend::matmul(
+                input.reshape({rows, 1, input.size(-1)}), dense.transpose(0, 1))
+                .reshape(shape);
+        }
+        return mfq_tensor_backend::matmul(input, dense.transpose(0, 1));
+    }
+
     mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x) const {
         if (tensor_parallel()) {
             auto shape = x.sizes().vec();
@@ -12138,11 +12153,7 @@ struct QuantLinear {
         if (is_nvq()) return nvq.forward(x);
         if (is_mxfp4()) return mxfp4.forward(x);
         if (is_tpq()) return tpq.forward(x);
-        if (is_dense()) {
-            return mfq_tensor_backend::matmul(
-                x.to(dense.scalar_type()),
-                dense.transpose(0, 1));
-        }
+        if (is_dense()) return forward_dense(x);
         return mxfp8.forward(x);
     }
     mfq_tensor_backend::Tensor forward_bf16_output(mfq_tensor_backend::Tensor x) const {
@@ -12204,7 +12215,7 @@ struct QuantLinear {
             auto gated = mode == 1
                 ? local * mfq_tensor_backend::sigmoid(local_gate)
                 : local * mfq_tensor_backend::silu(local_gate);
-            return mfq_tensor_backend::matmul(gated, dense.transpose(0, 1));
+            return forward_dense(gated);
         }
         throw std::runtime_error(
             "MXFP4/MXFP8/TPQ linear does not support input gating");
@@ -12903,6 +12914,7 @@ static QuantLinear load_quant_linear(
         }
     } else if (dtype == "BF16" || dtype == "F16" || dtype == "F32") {
         result.kind = QuantLinearKind::Dense;
+        result.dense_small_m_rowwise = name.rfind("predictor.", 0) == 0;
         auto cpu = load_dense_linear_cpu(mfq, name);
         result.logical_out = cpu.size(0);
         result.logical_neuron_len = cpu.size(1);
@@ -21757,6 +21769,7 @@ static int run_qwen35_mtp_check(Model& model, CudaQwen35Mtp& mtp) {
                        mfq_tensor_backend::kBFloat16}) {
         QuantLinear linear;
         linear.kind = QuantLinearKind::Dense;
+        linear.dense_small_m_rowwise = true;
         linear.dense = mfq_tensor_backend::tensor(identity, float_options)
             .reshape({33, 33}).to(dtype);
         const double tolerance = dtype == mfq_tensor_backend::kBFloat16 ? .008
