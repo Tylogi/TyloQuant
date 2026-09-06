@@ -21999,6 +21999,91 @@ static int run_qwen35_mtp_check(Model& model, CudaQwen35Mtp& mtp) {
     return 0;
 }
 
+// Fixed synthetic-ID latency probe through the actual server dispatch. Model
+// loading and the independent serial oracle are outside every timed request.
+static int run_qwen35_mtp_bench(Model& model, CudaQwen35Mtp& mtp,
+        bool enable_mtp, int generated_tokens, int repetitions) {
+    using Clock = std::chrono::steady_clock;
+    using Tensor = mfq_tensor_backend::Tensor;
+    MFQ_RUNTIME_CHECK(generated_tokens >= 2 && repetitions > 0 && repetitions <= 100 &&
+        model.c.max_position_embeddings >= generated_tokens + 17,
+        "MTP benchmark requires gen>=2, reps1-100 and context>=gen+17");
+    ServerDecodeGraphCache graph_cache(model.c.max_position_embeddings);
+    ServerTextSessionCache session_cache;
+    std::mutex model_mutex;
+    MfqSamplingParams params;
+    params.max_tokens = generated_tokens;
+    params.temperature = 0.;
+    params.top_k = 1;
+    params.top_p = 1.;
+    params.enable_mtp = enable_mtp;
+    params.seed = 20260907;
+    const auto options = mfq_tensor_backend::TensorOptions()
+        .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt64);
+    const char* batch_env = std::getenv("MFQ_QWEN_MTP_BATCH_FFN");
+    const char* graph_env = std::getenv("MFQ_SERVER_CUDA_GRAPH");
+    std::cout << "mtp_bench config mode=" << (enable_mtp ? "mtp" : "ordinary")
+        << " batch_ffn=" << (batch_env != nullptr && batch_env[0] == '1')
+        << " server_graph=" << (graph_env == nullptr ? "default" : graph_env)
+        << " gen=" << generated_tokens << " reps=" << repetitions
+        << " warmup=1 seed=20260907 synthetic_ids=1 eos_stop=0 session_cache=0\n";
+    const auto ms_between = [](Clock::time_point first, Clock::time_point last) {
+        return std::chrono::duration<double, std::milli>(last - first).count();
+    };
+    for (const auto& prompt : std::vector<std::vector<int64_t>>{
+            {1, 2, 3}, {100, 200, 300, 400, 500, 600, 700}, std::vector<int64_t>(17, 10)}) {
+        model.reset(1);
+        Tensor input = mfq_tensor_backend::tensor(prompt, options).reshape({1, -1}).contiguous();
+        std::vector<int64_t> reference;
+        reference.reserve(generated_tokens);
+        for (int step = 0; step < generated_tokens; ++step) {
+            auto next = model.next_token(input);
+            reference.push_back(next.item<int64_t>());
+            input = next.reshape({1, 1});
+        }
+        mfq_cuda_synchronize();
+        for (int repeat = -1; repeat < repetitions; ++repeat) {
+            std::vector<int64_t> output;
+            output.reserve(generated_tokens);
+            MfqPrefillTiming prefill;
+            Clock::time_point first_token;
+            mfq_cuda_synchronize();
+            const auto started = Clock::now();
+            const int produced = generate_server_tokens(model, model_mutex, graph_cache,
+                session_cache, prompt, params, [&](int64_t token) {
+                    if (output.empty()) first_token = Clock::now();
+                    output.push_back(token);
+                    return true;
+                }, [&](const MfqPrefillTiming& timing) { prefill = timing; }, {}, {}, &mtp);
+            mfq_cuda_synchronize();
+            const auto finished = Clock::now();
+            MFQ_RUNTIME_CHECK(produced == generated_tokens && output == reference,
+                "MTP benchmark server output differs from ordinary serial oracle");
+            MFQ_RUNTIME_CHECK(!enable_mtp || mtp.last_cycles > 0,
+                "MTP benchmark did not execute speculative cycles");
+            const double total_ms = ms_between(started, finished);
+            const double first_ms = ms_between(started, first_token);
+            const double decode_ms = ms_between(first_token, finished);
+            MFQ_RUNTIME_CHECK(std::isfinite(total_ms) && total_ms > 0. &&
+                std::isfinite(decode_ms) && decode_ms > 0., "invalid benchmark clock interval");
+            std::cout << "mtp_bench sample mode=" << (enable_mtp ? "mtp" : "ordinary")
+                << " prompt=" << prompt.size() << " gen=" << produced
+                << " repeat=" << repeat << " warmup=" << (repeat < 0)
+                << " total_ms=" << total_ms << " ttft_ms=" << first_ms
+                << " decode_ms=" << decode_ms << " prefill_gpu_ms=" << prefill.llm_ms
+                << " total_tps=" << produced * 1000. / total_ms
+                << " decode_tps=" << (produced - 1) * 1000. / decode_ms
+                << " exact=1 cycles=" << (enable_mtp ? mtp.last_cycles : 0)
+                << " accepted=" << (enable_mtp ? mtp.last_accepted : 0)
+                << " rejected=" << (enable_mtp ? mtp.last_rejected : 0)
+                << " graph_captures=" << graph_cache.captures
+                << " graph_reuses=" << graph_cache.reuses << '\n';
+        }
+    }
+    std::cout << "mtp_bench PASS samples=" << repetitions * 3 << '\n';
+    return 0;
+}
+
 static int32_t generate_server_multimodal_tokens(
     MiniCPMO45Runtime & runtime,
     std::mutex & model_mutex,
@@ -26820,6 +26905,8 @@ int main(int argc, char ** argv) {
         std::string layer_split_arg;
         double moe_gpu_cache_gb = 0.0;
         int gen = 16;
+        std::string bench_qwen35_mtp;
+        int bench_qwen35_mtp_reps = 3;
         int cpu_threads = 0;
         int server_port = 8080;
         int64_t context_size = 0;
@@ -27010,6 +27097,8 @@ int main(int argc, char ** argv) {
                 check_text_session_state = true;
             }
             else if (a == "--check-qwen35-mtp") check_qwen35_mtp = true;
+            else if (a == "--bench-qwen35-mtp" && i + 1 < argc) bench_qwen35_mtp = argv[++i];
+            else if (a == "--bench-qwen35-mtp-reps" && i + 1 < argc) bench_qwen35_mtp_reps = std::stoi(argv[++i]);
             else if (a == "--compare-dsv4-hc-ops") compare_dsv4_hc_ops = true;
             else if (a == "--compare-dsv4-hc-model") compare_dsv4_hc_model = true;
             else if (a == "--kl-base" && i + 1 < argc) kl_base = argv[++i];
@@ -27130,7 +27219,7 @@ int main(int argc, char ** argv) {
             else if (a == "--compare-nvq-vec4" || a == "--compare-niq-vec4") compare_nvq_vec4 = true;
             else {
                 std::cerr << "usage: mfq-decode --mfq model.mfq [--config config.json] "
-                             "(--ids 1,2,3 --gen 128 | --check-qwen35-mtp | --server "
+                             "(--ids 1,2,3 --gen 128 | --check-qwen35-mtp | --bench-qwen35-mtp ordinary|mtp | --server "
                              "[--host 127.0.0.1 --port 8080 --ctx-size 32768 --model-name name "
                              "--tensor-parallel 0,1 --tensor-split 1,1 "
                              "--layer-parallel 0,1 --layer-split 1,1 "
@@ -27497,10 +27586,10 @@ int main(int argc, char ** argv) {
                 context_size, minicpmo_tts_steps);
         }
         if (mfq_path.empty() ||
-            (!server_mode && !check_qwen35_mtp && ids_arg.empty() && ids_file.empty() &&
+            (!server_mode && !check_qwen35_mtp && bench_qwen35_mtp.empty() && ids_arg.empty() && ids_file.empty() &&
                 kl_base.empty() && prefill_sweep_arg.empty())) {
             std::cerr << "usage: mfq-decode --mfq model.mfq [--config config.json] "
-                         "(--ids 1,2,3 --gen 128 | --check-qwen35-mtp | --minicpmo-eval-batch "
+                         "(--ids 1,2,3 --gen 128 | --check-qwen35-mtp | --bench-qwen35-mtp ordinary|mtp | --minicpmo-eval-batch "
                          "[--minicpmo-eval-vision-batch-size 16] | --server "
                          "[--host 127.0.0.1 --port 8080 --ctx-size 32768 --model-name name "
                          "--api-key key] | --kl-base reference.bin "
@@ -27513,6 +27602,17 @@ int main(int argc, char ** argv) {
         }
         if (context_size < 0) throw std::runtime_error("--ctx-size must be positive");
         if (server_mode && context_size == 0) context_size = 32768;
+        if (!bench_qwen35_mtp.empty()) {
+            MFQ_RUNTIME_CHECK(bench_qwen35_mtp == "ordinary" || bench_qwen35_mtp == "mtp",
+                "--bench-qwen35-mtp expects ordinary or mtp");
+            MFQ_RUNTIME_CHECK(!server_mode && !check_qwen35_mtp && ids_arg.empty() && ids_file.empty() &&
+                kl_base.empty() && prefill_sweep_arg.empty(), "MTP benchmark cannot combine execution modes");
+            if (context_size == 0) context_size = 512;
+            MFQ_RUNTIME_CHECK(gen >= 2 && context_size >= static_cast<int64_t>(gen) + 17 &&
+                bench_qwen35_mtp_reps > 0 && bench_qwen35_mtp_reps <= 100,
+                "MTP benchmark requires gen>=2, reps1-100 and context>=gen+17");
+            std::cout << std::unitbuf;
+        }
         if (check_qwen35_mtp) {
             if (context_size == 0) context_size = 512;
             if (context_size < 64) throw std::runtime_error("MTP correctness gate requires --ctx-size >= 64");
@@ -27711,7 +27811,8 @@ int main(int argc, char ** argv) {
         auto t0 = std::chrono::steady_clock::now();
         Model model = load_model(mfq_path, config_path, context_size);
         CudaRuntimeComponents server_components =
-            load_cuda_runtime_components(model, mfq_path, server_mode || check_qwen35_mtp, config_path);
+            load_cuda_runtime_components(model, mfq_path,
+                server_mode || check_qwen35_mtp || !bench_qwen35_mtp.empty(), config_path);
         mfq_cuda_synchronize();
         auto t1 = std::chrono::steady_clock::now();
         report_cuda_memory("loaded");
@@ -27719,6 +27820,12 @@ int main(int argc, char ** argv) {
             MFQ_RUNTIME_CHECK(server_components.qwen_mtp.has_value(),
                 "--check-qwen35-mtp requires a supported model containing MTP weights");
             return run_qwen35_mtp_check(model, *server_components.qwen_mtp);
+        }
+        if (!bench_qwen35_mtp.empty()) {
+            MFQ_RUNTIME_CHECK(server_components.qwen_mtp.has_value(),
+                "--bench-qwen35-mtp requires a supported model containing MTP weights");
+            return run_qwen35_mtp_bench(model, *server_components.qwen_mtp,
+                bench_qwen35_mtp == "mtp", gen, bench_qwen35_mtp_reps);
         }
         if (server_mode) {
             Model & server_model = server_components.language(model);
