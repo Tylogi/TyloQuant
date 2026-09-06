@@ -21703,6 +21703,126 @@ static int32_t generate_server_tokens(
     return generated;
 }
 
+// Real-weight correctness gate; does not require a tokenizer or start a server.
+// It calls the same MTP generator used by the server, with synthetic token IDs.
+static int run_qwen35_mtp_check(Model& model, CudaQwen35Mtp& mtp) {
+    using Tensor = mfq_tensor_backend::Tensor;
+    const auto options = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA)
+        .dtype(mfq_tensor_backend::kInt64);
+    auto ids = [&](const std::vector<int64_t>& tokens) {
+        return mfq_tensor_backend::tensor(tokens, options).reshape({1, -1});
+    };
+    auto compare = [&](const Tensor& actual, const Tensor& reference, double tolerance,
+                       const char* name) {
+        MFQ_RUNTIME_CHECK(actual.sizes() == reference.sizes(), "MTP gate tensor shape mismatch");
+        auto a = actual.contiguous().to(mfq_tensor_backend::kFloat32).cpu();
+        auto r = reference.contiguous().to(mfq_tensor_backend::kFloat32).cpu();
+        double squared = 0., norm = 0.;
+        for (int64_t i = 0; i < a.numel(); ++i) {
+            const double av = a.data_ptr<float>()[i], rv = r.data_ptr<float>()[i];
+            MFQ_RUNTIME_CHECK(std::isfinite(av) && std::isfinite(rv), "nonfinite MTP gate value");
+            squared += (av - rv) * (av - rv);
+            norm += rv * rv;
+        }
+        const double rel = std::sqrt(squared / std::max(norm, 1.e-30));
+        std::cout << "mtp_check " << name << " relative_l2=" << rel << '\n';
+        MFQ_RUNTIME_CHECK(rel <= tolerance, "MTP gate numerical mismatch");
+    };
+    const std::vector<int64_t> prompt{100, 200, 300, 400, 500, 600, 700};
+    // Explicitly test BOTH resolutions, regardless of the real predictor's
+    // acceptance rate. Only the confirmed prefix may remain after rollback.
+    for (bool accepted : {false, true}) {
+        model.reset(1);
+        (void)model.hidden_forward(ids(prompt));
+        (void)model.hidden_forward(ids({37, 41}), mfq_nullopt, mfq_nullopt,
+            nullptr, mfq_nullopt, nullptr, 1);
+        if (accepted) model.commit_speculative();
+        else model.rollback_speculative();
+        MFQ_RUNTIME_CHECK(model.cache_pos == static_cast<int64_t>(prompt.size()) + (accepted ? 2 : 1),
+            "MTP resolution retained an incorrect logical cache length");
+        auto actual = model.last_logits(ids({43})).clone();
+        std::vector<std::pair<Tensor, Tensor>> states;
+        for (auto& block : model.blocks) {
+            if (auto* linear = dynamic_cast<LinearBlock*>(block.get()))
+                states.emplace_back(linear->conv_state.clone(), linear->gdn_state.clone());
+        }
+        model.reset(1);
+        (void)model.hidden_forward(ids(prompt));
+        (void)model.hidden_forward(ids({37}));
+        if (accepted) (void)model.hidden_forward(ids({41}));
+        auto reference = model.last_logits(ids({43}));
+        compare(actual, reference, .005, accepted ? "commit_logits" : "rollback_logits");
+        size_t state = 0;
+        for (auto& block : model.blocks) {
+            if (auto* linear = dynamic_cast<LinearBlock*>(block.get())) {
+                compare(states[state].first, linear->conv_state, .002, "conv_continuation");
+                compare(states[state].second, linear->gdn_state, .002, "gdn_continuation");
+                ++state;
+            }
+        }
+    }
+    model.reset(1);
+    Tensor raw;
+    (void)model.hidden_forward(ids(prompt), mfq_nullopt, mfq_nullopt, nullptr, mfq_nullopt, &raw);
+    for (int tokens = 2; tokens <= 6; ++tokens) {
+        auto next = ids(prompt).narrow(1, 1, tokens);
+        mtp.reset();
+        auto batched = mtp.forward(model, raw.narrow(1, 0, tokens), next).clone();
+        mtp.reset();
+        std::vector<Tensor> serial;
+        for (int t = 0; t < tokens; ++t)
+            serial.push_back(mtp.forward(model, raw.narrow(1, t, 1), next.narrow(1, t, 1)));
+        compare(batched, mfq_tensor_backend::cat(serial, 1), .005, "predictor_batched_vs_serial");
+    }
+    uint64_t total_cycles = 0;
+    for (const auto& input : std::vector<std::vector<int64_t>>{{1, 2, 3}, prompt, std::vector<int64_t>(17, 10)}) {
+        MfqSamplingParams params;
+        params.max_tokens = 32;
+        params.temperature = 0.;
+        params.top_k = 1;
+        params.seed = 20260907;
+        model.reset(1);
+        auto current = ids(input);
+        std::vector<int64_t> expected;
+        for (int step = 0; step < params.max_tokens; ++step) {
+            auto next = model.next_token(current);
+            expected.push_back(next.item<int64_t>());
+            current = next.reshape({1, 1});
+        }
+        std::vector<int64_t> got;
+        const int produced = generate_qwen35_mtp_tokens(model, mtp, input, params,
+            [&](int64_t token) { got.push_back(token); return true; }, {});
+        total_cycles += mtp.last_cycles;
+        std::cout << "mtp_check greedy_prompt_tokens=" << input.size() << " produced=" << produced
+            << " exact=" << (got == expected) << " accepted=" << mtp.last_accepted
+            << " rejected=" << mtp.last_rejected << '\n';
+        MFQ_RUNTIME_CHECK(produced == params.max_tokens && got == expected,
+            "MTP greedy generation differs from ordinary incremental decode");
+        // Callback stop then a fresh request exercises state reset after an
+        // early return, including stopping before a computed bonus is emitted.
+        got.clear();
+        const int stopped = generate_qwen35_mtp_tokens(model, mtp, input, params,
+            [&](int64_t token) { got.push_back(token); return got.size() < 3; }, {});
+        MFQ_RUNTIME_CHECK(stopped == 3 && got == std::vector<int64_t>(expected.begin(), expected.begin() + 3),
+            "MTP callback emitted extra or incorrect tokens");
+    }
+    MfqSamplingParams stochastic;
+    stochastic.max_tokens = 8;
+    stochastic.temperature = .8;
+    stochastic.top_k = 100;
+    stochastic.top_p = .95;
+    stochastic.presence_penalty = .2;
+    stochastic.frequency_penalty = .1;
+    stochastic.repetition_penalty = 1.05;
+    stochastic.seed = 20260907;
+    const int produced = generate_qwen35_mtp_tokens(model, mtp, prompt, stochastic,
+        [](int64_t) { return true; }, {});
+    MFQ_RUNTIME_CHECK(produced == 8 && mtp.last_cycles > 0 && total_cycles > 0,
+        "MTP runtime gate did not execute speculative cycles");
+    std::cout << "mtp_check PASS full_chain=1 greedy_tokens=96 stochastic_smoke_tokens=8\n";
+    return 0;
+}
+
 static int32_t generate_server_multimodal_tokens(
     MiniCPMO45Runtime & runtime,
     std::mutex & model_mutex,
@@ -26585,6 +26705,7 @@ int main(int argc, char ** argv) {
         bool check_dsv4_attention = false;
         bool check_dsv4_hc = false;
         bool check_text_session_state = false;
+        bool check_qwen35_mtp = false;
         bool compare_dsv4_hc_ops = false;
         bool compare_dsv4_hc_model = false;
         bool check_attention_swa_decode = false;
@@ -26712,6 +26833,7 @@ int main(int argc, char ** argv) {
             else if (a == "--check-text-session-state") {
                 check_text_session_state = true;
             }
+            else if (a == "--check-qwen35-mtp") check_qwen35_mtp = true;
             else if (a == "--compare-dsv4-hc-ops") compare_dsv4_hc_ops = true;
             else if (a == "--compare-dsv4-hc-model") compare_dsv4_hc_model = true;
             else if (a == "--kl-base" && i + 1 < argc) kl_base = argv[++i];
@@ -27408,10 +27530,15 @@ int main(int argc, char ** argv) {
         auto t0 = std::chrono::steady_clock::now();
         Model model = load_model(mfq_path, config_path, context_size);
         CudaRuntimeComponents server_components =
-            load_cuda_runtime_components(model, mfq_path, server_mode, config_path);
+            load_cuda_runtime_components(model, mfq_path, server_mode || check_qwen35_mtp, config_path);
         mfq_cuda_synchronize();
         auto t1 = std::chrono::steady_clock::now();
         report_cuda_memory("loaded");
+        if (check_qwen35_mtp) {
+            MFQ_RUNTIME_CHECK(server_components.qwen_mtp.has_value(),
+                "--check-qwen35-mtp requires a supported model containing MTP weights");
+            return run_qwen35_mtp_check(model, *server_components.qwen_mtp);
+        }
         if (server_mode) {
             Model & server_model = server_components.language(model);
             if (server_api_key.empty()) {
