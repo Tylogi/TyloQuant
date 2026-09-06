@@ -44,6 +44,13 @@ target_link_libraries(mfq-cuda-model-plan-test PRIVATE mfq-core)
 target_compile_features(mfq-cuda-model-plan-test PRIVATE cxx_std_20)
 add_test(NAME mfq-cuda-model-plan-test COMMAND mfq-cuda-model-plan-test)
 
+add_executable(mfq-cuda-mtp-test
+    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/mfq_cuda_mtp_test.cpp)
+target_include_directories(mfq-cuda-mtp-test PRIVATE
+    ${PROJECT_SOURCE_DIR}/backends/cuda/include)
+target_compile_features(mfq-cuda-mtp-test PRIVATE cxx_std_20)
+add_test(NAME mfq-cuda-mtp-test COMMAND mfq-cuda-mtp-test)
+
 add_executable(mfq-moe-cache-profile-test moe_cache_profile_test.cpp)
 target_link_libraries(mfq-moe-cache-profile-test PRIVATE mfq-core mfq-json)
 target_compile_features(mfq-moe-cache-profile-test PRIVATE cxx_std_17)

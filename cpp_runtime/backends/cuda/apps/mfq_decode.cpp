@@ -1,5 +1,6 @@
 #include "mfq_tensor_backend.h"
 #include "mfq_cuda_model_plan.h"
+#include "mfq_cuda_mtp.h"
 #include <cuda_profiler_api.h>
 #include <cuda_runtime_api.h>
 
@@ -19446,6 +19447,7 @@ struct CudaQwen35Mtp {
     mfq_tensor_backend::Tensor hidden_norm, embedding_norm, output_norm;
     std::vector<std::unique_ptr<Block>> blocks;
     int64_t cache_pos = 0;
+    uint64_t last_cycles = 0, last_accepted = 0, last_rejected = 0;
 
     static std::optional<CudaQwen35Mtp> load_if_present(const MfqFile& file, const Config& main) {
         const bool fusion_present = file.has_record("predictor.fusion.weight");
@@ -19539,7 +19541,8 @@ struct CudaRuntimeComponents {
 static CudaRuntimeComponents load_cuda_runtime_components(
         Model& model,
         const std::string& mfq_path,
-        bool server_mode) {
+        bool server_mode,
+        const std::string& config_path = {}) {
     CudaRuntimeComponents result;
     result.graph = model.c.model_graph;
     result.plan = model.c.runtime_plan;
@@ -19554,6 +19557,18 @@ static CudaRuntimeComponents load_cuda_runtime_components(
                     std::move(model), mfq_path));
             result.vision_available = true;
             break;
+    }
+    if (result.plan.predictor == mfq::cuda::MfqCudaPredictorAdapter::qwen35) {
+        const bool single_device = !g_tensor_parallel.enabled() && !g_layer_placement.enabled() &&
+            g_dense_cpu_layer_count == 0 && g_dsv4_cpu_offload_layers.empty() && !g_moe_expert_cache;
+        if (single_device && model.c.num_experts == 0 && model.supports_qwen_speculation()) {
+            MfqFile predictor_file(mfq_path);
+            (void)load_config(predictor_file, config_path);  // installs canonical legacy aliases
+            result.qwen_mtp = CudaQwen35Mtp::load_if_present(predictor_file, model.c);
+            result.mtp_available = result.qwen_mtp.has_value();
+        } else {
+            std::cerr << "qwen_mtp unavailable: initial CUDA adapter requires dense single-GPU Qwen blocks\n";
+        }
     }
     return result;
 }
@@ -21181,6 +21196,142 @@ private:
     bool trace_ = false;
 };
 
+static int32_t generate_qwen35_mtp_tokens(
+        Model& model, CudaQwen35Mtp& mtp,
+        const std::vector<int64_t>& prompt, const MfqSamplingParams& sampling,
+        const MfqTokenCallback& on_token, const MfqPrefillCallback& on_prefill) {
+    using Tensor = mfq_tensor_backend::Tensor;
+    namespace policy = mfq::cuda::mtp;
+    MFQ_RUNTIME_CHECK(!prompt.empty() && prompt.size() <= static_cast<size_t>(model.c.max_position_embeddings),
+        "invalid Qwen MTP prompt length");
+    for (auto token : prompt) MFQ_RUNTIME_CHECK(token >= 0 && token < model.c.vocab_size,
+        "Qwen MTP prompt token outside vocabulary");
+    mtp.last_cycles = mtp.last_accepted = mtp.last_rejected = 0;
+    const int32_t limit = static_cast<int32_t>(std::min<int64_t>(sampling.max_tokens,
+        model.c.max_position_embeddings - static_cast<int64_t>(prompt.size())));
+    if (limit <= 0) return 0;
+    const auto options = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA)
+        .dtype(mfq_tensor_backend::kInt64);
+    auto ids_for = [&](std::vector<int64_t> tokens) {
+        return mfq_tensor_backend::tensor(tokens, options).reshape({1, -1}).contiguous();
+    };
+    auto input_ids = ids_for(prompt);
+    const bool penalties = sampling_has_penalties(sampling);
+    auto counts = penalties ? mfq_tensor_backend::zeros({model.c.vocab_size},
+        options.dtype(mfq_tensor_backend::kInt32)) : Tensor{};
+    if (penalties) sample_token_counts_add_cuda(counts, input_ids);
+    auto random_host = mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions()
+        .device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat32).pinned_memory(true));
+    auto random_gpu = mfq_tensor_backend::empty({1}, options.dtype(mfq_tensor_backend::kFloat32));
+    std::mt19937_64 rng(sampling.seed);
+    std::uniform_real_distribution<double> uniform(0., 1.);
+    const bool greedy = sampling.temperature <= 0. || sampling.top_k == 1;
+    auto sample_normal = [&](Tensor logits, Tensor token_counts) {
+        return static_cast<int32_t>(sample_server_logits(logits, sampling, token_counts,
+            random_host, random_gpu, rng, {}).item<int64_t>());
+    };
+    auto probabilities = [&](Tensor logits, Tensor token_counts) {
+        logits = logits.contiguous().reshape({1, -1});
+        if (penalties) sample_apply_penalties_cuda(logits, token_counts,
+            sampling.presence_penalty, sampling.frequency_penalty, sampling.repetition_penalty);
+        auto host = logits.to(mfq_tensor_backend::kFloat32).cpu().contiguous();
+        return policy::distribution(std::span<const float>(host.data_ptr<float>(), host.numel()),
+            sampling.temperature, sampling.top_k, sampling.top_p);
+    };
+    auto logits_for = [&](Tensor normalized) {
+        return model.logits_from_hidden(normalized.to(mfq_tensor_backend::kFloat16).contiguous());
+    };
+    int32_t generated = 0;
+    auto emit = [&](int32_t token) {
+        MFQ_RUNTIME_CHECK(token >= 0 && token < model.c.vocab_size, "MTP sampled token outside vocabulary");
+        ++generated;
+        if (penalties) sample_token_counts_add_cuda(counts, ids_for({token}));
+        return !on_token || on_token(token);
+    };
+    struct Draft { int32_t token; std::vector<float> probabilities; };
+    auto make_draft = [&](Tensor raw_hidden, int32_t pending) {
+        auto hidden = mtp.forward(model, raw_hidden, ids_for({pending}));
+        auto logits = logits_for(hidden).reshape({1, -1});
+        if (greedy) return Draft{sample_normal(logits, counts), {}};
+        auto q = probabilities(logits, counts);
+        auto token = policy::sample(q, uniform(rng));
+        return Draft{token, std::move(q)};
+    };
+    auto generate = [&]() {
+        model.reset(1);
+        mtp.reset(1);
+        ServerPrefillCudaTimer timer;
+        Tensor raw;
+        auto hidden = model.hidden_forward(input_ids, mfq_nullopt, mfq_nullopt, nullptr,
+            mfq_nullopt, &raw);
+        auto logits = logits_for(hidden.narrow(1, hidden.size(1) - 1, 1));
+        MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
+        int32_t pending = sample_normal(logits, counts);
+        const double prefill_ms = timer.elapsed_ms();
+        if (on_prefill) on_prefill(MfqPrefillTiming{prompt.size(), prefill_ms, 0., prefill_ms});
+        if (!emit(pending) || generated == limit) return generated;
+        // Match Metal's teacher-forced prompt priming, reserving the final
+        // backbone row for the first live next-token proposal.
+        if (prompt.size() > 1) {
+            (void)mtp.forward(model, raw.narrow(1, 0, raw.size(1) - 1),
+                input_ids.narrow(1, 1, input_ids.size(1) - 1));
+        }
+        auto draft = make_draft(raw.narrow(1, raw.size(1) - 1, 1), pending);
+        raw = Tensor{};
+        while (generated < limit) {
+            if (limit - generated == 1 || model.cache_pos + 2 > model.c.max_position_embeddings) {
+                auto next = sample_server_token(model, ids_for({pending}), sampling, counts,
+                    random_host, random_gpu, rng, {});
+                emit(static_cast<int32_t>(next.item<int64_t>()));
+                return generated;
+            }
+            Tensor verified_raw;
+            auto verified = model.hidden_forward(ids_for({pending, draft.token}), mfq_nullopt,
+                mfq_nullopt, nullptr, mfq_nullopt, &verified_raw, 1);
+            auto targets = logits_for(verified).reshape({2, model.c.vocab_size});
+            ++mtp.last_cycles;
+            auto bonus_counts = penalties ? counts.clone() : Tensor{};
+            if (penalties) sample_token_counts_add_cuda(bonus_counts, ids_for({draft.token}));
+            policy::Verification result;
+            if (greedy) {
+                const auto expected = sample_normal(targets.narrow(0, 0, 1), counts);
+                const bool accepted = expected == draft.token;
+                result = {accepted, accepted ? sample_normal(targets.narrow(0, 1, 1), bonus_counts) : expected};
+            } else {
+                auto target = probabilities(targets.narrow(0, 0, 1), counts);
+                auto bonus = probabilities(targets.narrow(0, 1, 1), bonus_counts);
+                const double acceptance_uniform = uniform(rng);
+                const double sample_uniform = uniform(rng);
+                result = policy::verify(draft.token, draft.probabilities, target, bonus,
+                    acceptance_uniform, sample_uniform);
+            }
+            if (result.accepted) {
+                ++mtp.last_accepted;
+                model.commit_speculative();
+                if (!emit(draft.token) || generated == limit) return generated;
+                if (!emit(result.next_token) || generated == limit) return generated;
+            } else {
+                ++mtp.last_rejected;
+                model.rollback_speculative();
+                if (!emit(result.next_token) || generated == limit) return generated;
+            }
+            pending = result.next_token;
+            draft = make_draft(verified_raw.narrow(1, result.accepted ? 1 : 0, 1), pending);
+        }
+        return generated;
+    };
+    try {
+        const auto result = generate();
+        std::cerr << "qwen_mtp generated=" << result << " cycles=" << mtp.last_cycles
+            << " accepted=" << mtp.last_accepted << " rejected=" << mtp.last_rejected << '\n';
+        return result;
+    } catch (...) {
+        // A failed partial pass must never become the next request's history.
+        try { model.reset(1); mtp.reset(1); } catch (...) {}
+        throw;
+    }
+}
+
 static int32_t generate_server_tokens(
     Model & model,
     std::mutex & model_mutex,
@@ -21191,9 +21342,18 @@ static int32_t generate_server_tokens(
     const MfqTokenCallback & on_token,
     const MfqPrefillCallback & on_prefill,
     const MfqPromptCachePlan & cache_plan,
-    const MfqTokenConstraintPtr & token_constraint)
+    const MfqTokenConstraintPtr & token_constraint,
+    CudaQwen35Mtp* mtp = nullptr)
 {
     std::lock_guard<std::mutex> lock(model_mutex);
+    const char* mtp_reprefill = std::getenv("MFQ_SERVER_REPREFILL");
+    const char* mtp_trace = std::getenv("MFQ_SERVER_TRACE_INCREMENTAL");
+    if (mtp != nullptr && sampling.enable_mtp && sampling.max_tokens > 1 && !token_constraint &&
+        !(mtp_reprefill != nullptr && mtp_reprefill[0] == '1') &&
+        !(mtp_trace != nullptr && mtp_trace[0] == '1')) {
+        // Predictor state is not in the persistent session snapshot contract.
+        return generate_qwen35_mtp_tokens(model, *mtp, prompt, sampling, on_token, on_prefill);
+    }
     auto options = mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA);
     const size_t stable_prefix_tokens = std::min(
         cache_plan.stable_prefix_tokens, prompt.size());
@@ -27248,7 +27408,7 @@ int main(int argc, char ** argv) {
         auto t0 = std::chrono::steady_clock::now();
         Model model = load_model(mfq_path, config_path, context_size);
         CudaRuntimeComponents server_components =
-            load_cuda_runtime_components(model, mfq_path, server_mode);
+            load_cuda_runtime_components(model, mfq_path, server_mode, config_path);
         mfq_cuda_synchronize();
         auto t1 = std::chrono::steady_clock::now();
         report_cuda_memory("loaded");
@@ -27354,7 +27514,8 @@ int main(int argc, char ** argv) {
                 return generate_server_tokens(
                     server_model, model_mutex, decode_graph_cache,
                     text_session_cache, prompt, sampling,
-                    on_token, on_prefill, cache_plan, token_constraint);
+                    on_token, on_prefill, cache_plan, token_constraint,
+                    server_components.qwen_mtp ? &*server_components.qwen_mtp : nullptr);
             }, {}, duplex_backend, {
                 [&](const std::string & source_session_id,
                         const std::string & target_session_id) {

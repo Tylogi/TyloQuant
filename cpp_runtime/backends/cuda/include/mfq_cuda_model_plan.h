@@ -27,6 +27,7 @@ enum class MfqCudaVisionAdapter {
 
 enum class MfqCudaPredictorAdapter {
     none,
+    qwen35,
 };
 
 struct MfqCudaModelPlan {
@@ -82,8 +83,12 @@ inline MfqCudaModelPlan mfq_cuda_model_plan(
         tts->implementation == "minicpmo45_tts") {
         result.vision = MfqCudaVisionAdapter::minicpmo45;
     }
-    // Predictor implementations are deliberately not inferred from a family
-    // name. Add an adapter here only when the CUDA execution path exists.
+    const auto* predictor = graph.component("predictor");
+    if (graph.backbone == "qwen3_5" && predictor != nullptr &&
+        predictor->implementation == "next_token_prediction" &&
+        predictor->tensor_root == "predictor") {
+        result.predictor = MfqCudaPredictorAdapter::qwen35;
+    }
     return result;
 }
 

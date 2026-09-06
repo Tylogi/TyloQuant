@@ -47,9 +47,15 @@ int main() {
             qwen_state.vision_declared && qwen_state.mtp_declared,
             "graph components were not preserved");
         require(
-            !qwen_state.vision_supported && !qwen_state.mtp_supported &&
-                !qwen_state.vision_available && !qwen_state.mtp_available,
-            "unimplemented CUDA adapters were reported as available");
+            !qwen_state.vision_supported && qwen_state.mtp_supported &&
+                !qwen_state.vision_available && qwen_state.mtp_available,
+            "Qwen predictor/vision availability did not match execution adapters");
+        const auto qwen_unloaded = mfq_cuda_component_state(qwen, qwen_plan, false, false);
+        require(qwen_unloaded.mtp_supported && !qwen_unloaded.mtp_available && !qwen_unloaded.mtp_enabled,
+            "unloaded Qwen predictor was reported available");
+        const auto unknown_predictor = graph_with("qwen3_5", {}, "experimental_draft");
+        require(mfq_cuda_model_plan(unknown_predictor).predictor == MfqCudaPredictorAdapter::none,
+            "unknown predictor implementation was inferred from backbone name");
 
         auto minicpm = graph_with("minicpmo45", "minicpmo45_vision");
         minicpm.components.push_back({
