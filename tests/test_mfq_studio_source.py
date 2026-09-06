@@ -107,7 +107,8 @@ def test_studio_handles_a_running_server_without_a_loaded_model():
     assert 'useState("")' in APP
     assert 'tr("尚未加载模型", "No model loaded")' in APP
     assert "if (!selectedModel) return;" in APP
-    assert 'runtime?.model || "MFQ Server"' in APP
+    assert 'runtime?.model || "Empty"' in APP
+    assert 'runtime?.model || "MFQ Server"' not in APP
     assert 'statusResult.status === "fulfilled" ? statusResult.value : null' in APP
     assert "setRuntime(status)" in APP
     assert "Promise.allSettled([" in APP

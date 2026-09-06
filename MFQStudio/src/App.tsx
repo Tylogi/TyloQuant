@@ -3817,7 +3817,7 @@ export default function App() {
             {dashboardPage === "overview" && <TMPanel className="runtime-hero">
               <img src="/mfq-mark.svg" alt="" />
               <div className="runtime-hero-copy">
-                <div><h2>{runtime?.model || "MFQ Server"}</h2><span className={`runtime-status-pill ${runtime?.model ? "running" : "stopped"}`}><i />{runtime?.model ? tr("运行中", "Running") : tr("空闲", "Idle")}</span></div>
+                <div><h2>{runtime?.model || "Empty"}</h2><span className={`runtime-status-pill ${runtime?.model ? "running" : "stopped"}`}><i />{runtime?.model ? tr("运行中", "Running") : tr("空闲", "Idle")}</span></div>
                 <p className="runtime-endpoint">{studio?.service_url || "http://127.0.0.1:8090"}</p>
                 <small>{runtime?.model ? `${runtime?.model_type || "MFQ"} · ${formatNumber(runtime?.max_context)} ${tr("上下文", "context")} · ${formatDuration(runtime?.uptime_seconds)}` : tr("加载本地模型后即可开始推理。", "Load a local model to begin inference.")}</small>
               </div>
