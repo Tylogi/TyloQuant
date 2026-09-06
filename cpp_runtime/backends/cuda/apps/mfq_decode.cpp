@@ -16996,6 +16996,21 @@ struct LinearBlock : Block {
     mfq_tensor_backend::Tensor speculative_conv, speculative_gdn;
     bool speculative_pending = false;
     int64_t speculative_ffn_batches = 0;
+    int64_t speculative_projection_batches = 0;
+
+    void checkpoint_recurrent() {
+        MFQ_RUNTIME_CHECK(conv_state.defined() && gdn_state.defined(),
+            "Qwen recurrent state missing after confirmed prefix");
+        if (!speculative_conv.defined() || speculative_conv.sizes() != conv_state.sizes() ||
+                !speculative_gdn.defined() || speculative_gdn.sizes() != gdn_state.sizes()) {
+            speculative_conv = conv_state.clone();
+            speculative_gdn = gdn_state.clone();
+        } else {
+            speculative_conv.copy_(conv_state);
+            speculative_gdn.copy_(gdn_state);
+        }
+        speculative_pending = true;
+    }
 
     void commit_speculative() noexcept { speculative_pending = false; }
 
@@ -17018,6 +17033,21 @@ struct LinearBlock : Block {
         const int position_dim = pos.dim() == 1 ? 0 : 1;
         const char* batch_env = std::getenv("MFQ_QWEN_MTP_BATCH_FFN");
         const bool batch_ffn = x.is_cuda() && batch_env != nullptr && batch_env[0] == '1';
+        const char* projection_env = std::getenv("MFQ_QWEN_MTP_BATCH_PROJECTIONS");
+        if (x.is_cuda() && projection_env != nullptr && projection_env[0] == '1') {
+            MFQ_RUNTIME_CHECK(x.size(0) == 1 && tokens == 2 && confirmed == 1,
+                "MTP batched projections currently require B1,T2,confirmed1");
+            try {
+                auto attention = forward_attention_cuda(x, c, confirmed);
+                auto result = forward_ffn_cuda(std::move(attention[0]), std::move(attention[1]));
+                ++speculative_ffn_batches;
+                ++speculative_projection_batches;
+                return result;
+            } catch (...) {
+                if (speculative_pending) rollback_speculative();
+                throw;
+            }
+        }
         mfq_tensor_backend::Tensor prefix, prefix_norm;
         if (batch_ffn) {
             auto attention = forward_attention_cuda(x.narrow(1, 0, confirmed), c);
@@ -17027,16 +17057,7 @@ struct LinearBlock : Block {
             prefix = forward(x.narrow(1, 0, confirmed),
                 pos.narrow(position_dim, 0, confirmed), cache_pos, mfq_nullopt, c, rope);
         }
-        MFQ_RUNTIME_CHECK(conv_state.defined() && gdn_state.defined(),
-            "Qwen recurrent state missing after confirmed prefix");
-        if (!speculative_conv.defined() || speculative_conv.sizes() != conv_state.sizes()) {
-            speculative_conv = conv_state.clone();
-            speculative_gdn = gdn_state.clone();
-        } else {
-            speculative_conv.copy_(conv_state);
-            speculative_gdn.copy_(gdn_state);
-        }
-        speculative_pending = true;
+        checkpoint_recurrent();
         try {
             if (batch_ffn) {
                 auto suffix = forward_attention_cuda(
@@ -17240,7 +17261,7 @@ struct LinearBlock : Block {
     }
 
     std::array<mfq_tensor_backend::Tensor, 2> forward_attention_cuda(
-            mfq_tensor_backend::Tensor x, const Config& c) {
+            mfq_tensor_backend::Tensor x, const Config& c, int64_t confirmed = 0) {
         int64_t B = x.size(0), T = x.size(1), H = x.size(2);
         int64_t nk = c.linear_num_key_heads, nv = c.linear_num_value_heads;
         int64_t dk = c.linear_key_head_dim, dv = c.linear_value_head_dim;
@@ -17295,10 +17316,57 @@ struct LinearBlock : Block {
         auto gate_t = gates[0];
         auto beta_t = gates[1];
         auto bias = conv_bias.defined() ? conv_bias : mfq_tensor_backend::empty({0}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
-        mfq_tensor_backend::Tensor q, k, v;
+        auto recurrent_step = [&](mfq_tensor_backend::Tensor rq, mfq_tensor_backend::Tensor rk,
+                mfq_tensor_backend::Tensor rv, mfq_tensor_backend::Tensor rg,
+                mfq_tensor_backend::Tensor rb) {
+            const char* transposed_env = std::getenv("MFQ_GDN_TRANSPOSED_STATE");
+            const bool transposed = transposed_env == nullptr || transposed_env[0] != '0';
+            if (transposed) {
+                if (tiled_v_heads) return gdn_inplace_transposed_tiled_cuda(
+                    rq.contiguous(), rk.contiguous(), rv.contiguous(), rg, rb, gdn_state);
+                return gdn_inplace_transposed_cuda(
+                    rq.contiguous(), rk.contiguous(), rv.contiguous(), rg, rb, gdn_state);
+            }
+            if (tiled_v_heads) return gdn_inplace_tiled_cuda(
+                rq.contiguous(), rk.contiguous(), rv.contiguous(), rg, rb, gdn_state);
+            return gdn_inplace_cuda(rq.contiguous(), rk.contiguous(), rv.contiguous(), rg, rb, gdn_state);
+        };
+        mfq_tensor_backend::Tensor q, k, v, recurrent_y;
         const char * fused_prefill_env = std::getenv("MFQ_LINEAR_CONV_PREFILL_FUSED");
         bool fused_prefill = T >= 256 && (fused_prefill_env == nullptr || fused_prefill_env[0] != '0');
-        if (T > 1 && split_in_proj && fused_prefill) {
+        if (confirmed > 0) {
+            MFQ_RUNTIME_CHECK(B == 1 && T == 2 && confirmed == 1,
+                "MTP batched attention requires B1,T2,confirmed1");
+            std::vector<mfq_tensor_backend::Tensor> rows;
+            for (int64_t t = 0; t < T; ++t) {
+                if (split_in_proj) {
+                    auto step = g_profiler.measure("linear.mtp_conv_step", [&]() {
+                        return linear_conv_qkv_decode_cuda(conv_state,
+                            qk_part.narrow(1, t, 1).contiguous(), v_part.narrow(1, t, 1).contiguous(),
+                            conv_weight, bias, nk, nv, dk, dv, c.rms_norm_eps);
+                    });
+                    q = step[0]; k = step[1]; v = step[2];
+                } else {
+                    auto conv = g_profiler.measure("linear.mtp_conv_step", [&]() {
+                        return ssm_conv_silu_decode_cuda(conv_state,
+                            qkv.narrow(1, t, 1).contiguous(), conv_weight, bias);
+                    });
+                    q = conv.narrow(2, 0, ksz).reshape({B, 1, nk, dk}).transpose(1, 2);
+                    k = conv.narrow(2, ksz, ksz).reshape({B, 1, nk, dk}).transpose(1, 2);
+                    v = conv.narrow(2, 2 * ksz, vsz).reshape({B, 1, nv, dv}).transpose(1, 2);
+                    q = l2_norm_cuda(q.contiguous().reshape({-1, dk}), c.rms_norm_eps).reshape_as(q);
+                    k = l2_norm_cuda(k.contiguous().reshape({-1, dk}), c.rms_norm_eps).reshape_as(k);
+                }
+                auto gd = g_profiler.measure("linear.mtp_gdn_step", [&]() {
+                    return recurrent_step(q, k, v, gate_t.narrow(1, t, 1).contiguous(),
+                        beta_t.narrow(1, t, 1).contiguous());
+                });
+                gdn_state = gd[1];
+                rows.push_back(gd[0]);
+                if (t + 1 == confirmed) checkpoint_recurrent();
+            }
+            recurrent_y = mfq_tensor_backend::cat(rows, 2);
+        } else if (T > 1 && split_in_proj && fused_prefill) {
             auto qkv_fast = g_profiler.measure("linear.conv_qkv_prefill", [&]() {
                 return linear_conv_qkv_prefill_cuda(
                     conv_state,
@@ -17358,23 +17426,8 @@ struct LinearBlock : Block {
             k = g_profiler.measure("linear.k_l2", [&]() { return l2_norm_cuda(k.contiguous().reshape({-1, dk}), c.rms_norm_eps).reshape_as(k); });
         }
         auto gd = g_profiler.measure("linear.gdn", [&]() {
-            const char* transposed_env = std::getenv("MFQ_GDN_TRANSPOSED_STATE");
-            bool transposed = transposed_env == nullptr || transposed_env[0] != '0';
-            if (transposed) {
-                if (tiled_v_heads) {
-                    return gdn_inplace_transposed_tiled_cuda(
-                        q.contiguous(), k.contiguous(), v.contiguous(),
-                        gate_t, beta_t, gdn_state);
-                }
-                return gdn_inplace_transposed_cuda(q.contiguous(), k.contiguous(), v.contiguous(),
-                                                   gate_t, beta_t, gdn_state);
-            }
-            if (tiled_v_heads) {
-                return gdn_inplace_tiled_cuda(q.contiguous(), k.contiguous(), v.contiguous(),
-                                              gate_t, beta_t, gdn_state);
-            }
-            return gdn_inplace_cuda(q.contiguous(), k.contiguous(), v.contiguous(),
-                                    gate_t, beta_t, gdn_state);
+            if (recurrent_y.defined()) return std::vector<mfq_tensor_backend::Tensor>{recurrent_y, gdn_state};
+            return recurrent_step(q, k, v, gate_t, beta_t);
         });
         auto y = gd[0];
         gdn_state = gd[1];
@@ -22044,6 +22097,20 @@ static int run_qwen35_mtp_check(Model& model, CudaQwen35Mtp& mtp) {
         MFQ_RUNTIME_CHECK(layers > 0, "MTP batched FFN gate found no recurrent layers");
         std::cout << "mtp_check batched_ffn_layers=" << layers << " calls=" << calls << '\n';
     }
+    const char* projection_env = std::getenv("MFQ_QWEN_MTP_BATCH_PROJECTIONS");
+    if (projection_env != nullptr && projection_env[0] == '1') {
+        int64_t layers = 0, calls = 0;
+        for (const auto& block : model.blocks) {
+            if (auto* linear = dynamic_cast<const LinearBlock*>(block.get())) {
+                MFQ_RUNTIME_CHECK(linear->speculative_projection_batches > 0,
+                    "MTP gate did not exercise requested batched projections");
+                ++layers;
+                calls += linear->speculative_projection_batches;
+            }
+        }
+        MFQ_RUNTIME_CHECK(layers > 0, "MTP batched projection gate found no recurrent layers");
+        std::cout << "mtp_check batched_projection_layers=" << layers << " calls=" << calls << '\n';
+    }
     std::cout << "mtp_check PASS full_chain=1 greedy_tokens=96 stochastic_smoke_tokens=8\n";
     return 0;
 }
@@ -22070,9 +22137,11 @@ static int run_qwen35_mtp_bench(Model& model, CudaQwen35Mtp& mtp,
     const auto options = mfq_tensor_backend::TensorOptions()
         .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt64);
     const char* batch_env = std::getenv("MFQ_QWEN_MTP_BATCH_FFN");
+    const char* projection_env = std::getenv("MFQ_QWEN_MTP_BATCH_PROJECTIONS");
     const char* graph_env = std::getenv("MFQ_SERVER_CUDA_GRAPH");
     std::cout << "mtp_bench config mode=" << (enable_mtp ? "mtp" : "ordinary")
         << " batch_ffn=" << (batch_env != nullptr && batch_env[0] == '1')
+        << " batch_projections=" << (projection_env != nullptr && projection_env[0] == '1')
         << " server_graph=" << (graph_env == nullptr ? "default" : graph_env)
         << " gen=" << generated_tokens << " reps=" << repetitions
         << " warmup=1 seed=20260907 synthetic_ids=1 eos_stop=0 session_cache=0\n";
