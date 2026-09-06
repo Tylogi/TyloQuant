@@ -11187,10 +11187,21 @@ struct NintLinear {
     }
 };
 
+static thread_local bool g_decode_graph_serial_branches = false;
+
+struct DecodeGraphBranchScope {
+    bool previous = g_decode_graph_serial_branches;
+    DecodeGraphBranchScope() { g_decode_graph_serial_branches = true; }
+    ~DecodeGraphBranchScope() { g_decode_graph_serial_branches = previous; }
+};
+
 static bool decode_branch_parallel_enabled(int64_t rows) {
     const char * disabled =
         std::getenv("MFQ_DISABLE_DECODE_BRANCH_PARALLEL");
-    return rows == 1 &&
+    // Branch output storage belongs to its allocating stream. Keep graph
+    // warmup/capture on the graph pool's stream until cross-stream allocation
+    // lifetime tracking supports a fully rejoined capture. Eager is unchanged.
+    return rows == 1 && !g_decode_graph_serial_branches &&
         (disabled == nullptr || disabled[0] != '1');
 }
 
@@ -21739,6 +21750,7 @@ static int32_t generate_server_tokens(
             g_decode_graph_attention_parts = std::min<int64_t>(
                 g_decode_graph_attention_parts, FullBlock::kDecodeAttentionMaxParts);
             try {
+                DecodeGraphBranchScope branch_scope;
                 graph_cache.graph = std::make_unique<MfqCudaGraph>();
                 prepare_decode_graph_memory(model, *graph_cache.graph, [&]() { (void)sample_static(); });
 
@@ -28388,22 +28400,25 @@ int main(int argc, char ** argv) {
             g_decode_graph_attention_parts = planned_len >= 192 ? (planned_len + 127) / 128 : 1;
             g_decode_graph_attention_parts = std::min<int64_t>(
                 g_decode_graph_attention_parts, FullBlock::kDecodeAttentionMaxParts);
-            prepare_decode_graph_memory(model, graph, [&]() {
-                (void)model.next_token_static(static_input, static_pos, static_len);
-            });
-            g_profiler.reset();
-            g_profiler.graph_events = profile_cuda_graph;
-            graph.capture_begin();
-            static_next = g_profiler.measure("decode.model_total", [&]() {
-                return model.next_token_static(static_input, static_pos, static_len);
-            });
-            g_profiler.measure("decode.commit", [&]() {
-                decode_graph_commit_cuda(
-                    static_next, generated_cuda, static_step,
-                    static_input, static_pos, static_len);
-                return 0;
-            });
-            graph.capture_end();
+            {
+                DecodeGraphBranchScope branch_scope;
+                prepare_decode_graph_memory(model, graph, [&]() {
+                    (void)model.next_token_static(static_input, static_pos, static_len);
+                });
+                g_profiler.reset();
+                g_profiler.graph_events = profile_cuda_graph;
+                graph.capture_begin();
+                static_next = g_profiler.measure("decode.model_total", [&]() {
+                    return model.next_token_static(static_input, static_pos, static_len);
+                });
+                g_profiler.measure("decode.commit", [&]() {
+                    decode_graph_commit_cuda(
+                        static_next, generated_cuda, static_step,
+                        static_input, static_pos, static_len);
+                    return 0;
+                });
+                graph.capture_end();
+            }
             mfq_debug_dump_cuda_graph(graph);
             report_cuda_memory("graph_captured");
             g_decode_graph_attention_kv_len = 0;
