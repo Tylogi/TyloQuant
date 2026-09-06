@@ -58,6 +58,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/nepq.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nepq_residual.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nint_matmul.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/nint_small_m.cu
     ${MFQ_CUDA_KERNEL_ROOT}/norm.cu
     ${MFQ_CUDA_KERNEL_ROOT}/nvq_matmul.cu
     ${MFQ_CUDA_KERNEL_ROOT}/rope.cu
