@@ -19530,9 +19530,12 @@ struct CudaQwen35Mtp {
             .to(mfq_tensor_backend::kFloat32), embedding_norm, c).reshape_as(hidden);
         auto h = qwen_rms_norm(hidden.reshape({batch * tokens, c.hidden_size})
             .to(mfq_tensor_backend::kFloat32), hidden_norm, c).reshape_as(hidden);
+        trace_gemma_stage(0, "mtp.embedding_norm", e);
+        trace_gemma_stage(0, "mtp.hidden_norm", h);
         // Frozen Metal fusion order: normalized next-token embedding, then
         // normalized RAW backbone hidden (before the backbone output norm).
         auto x = fusion.forward(mfq_tensor_backend::cat({e, h}, -1));
+        trace_gemma_stage(0, "mtp.fusion", x);
         auto pos = mfq_tensor_backend::arange(cache_pos, cache_pos + tokens,
             mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt64));
         MfqOptional<mfq_tensor_backend::Tensor> length = mfq_nullopt;
@@ -19541,9 +19544,11 @@ struct CudaQwen35Mtp {
         }
         for (auto& block : blocks) x = block->forward(x, pos, cache_pos, length, c, main.rope);
         cache_pos += tokens;
-        return qwen_rms_norm(x.reshape({batch * tokens, c.hidden_size})
+        auto output = qwen_rms_norm(x.reshape({batch * tokens, c.hidden_size})
             .to(mfq_tensor_backend::kFloat32), output_norm, c)
             .reshape({batch, tokens, c.hidden_size});
+        trace_gemma_stage(0, "mtp.output_norm", output);
+        return output;
     }
 };
 
@@ -21861,12 +21866,28 @@ static int run_qwen35_mtp_check(Model& model, CudaQwen35Mtp& mtp) {
     (void)model.hidden_forward(ids(prompt), mfq_nullopt, mfq_nullopt, nullptr, mfq_nullopt, &raw);
     for (int tokens = 2; tokens <= 6; ++tokens) {
         auto next = ids(prompt).narrow(1, 1, tokens);
+        std::vector<std::pair<std::string, Tensor>> batch_stages, row_stages;
+        g_gemma_trace_layer = 0;
+        if (tokens == 2) g_gemma_stage_trace = &batch_stages;
         mtp.reset();
         auto batched = mtp.forward(model, raw.narrow(1, 0, tokens), next).clone();
         mtp.reset();
+        if (tokens == 2) g_gemma_stage_trace = &row_stages;
         std::vector<Tensor> serial;
         for (int t = 0; t < tokens; ++t)
             serial.push_back(mtp.forward(model, raw.narrow(1, t, 1), next.narrow(1, t, 1)));
+        g_gemma_stage_trace = nullptr;
+        if (tokens == 2) {
+            MFQ_RUNTIME_CHECK(row_stages.size() == 2 * batch_stages.size(),
+                "MTP predictor diagnostic stage count mismatch");
+            for (size_t stage = 0; stage < batch_stages.size(); ++stage) {
+                auto reference = mfq_tensor_backend::cat({row_stages[stage].second,
+                    row_stages[stage + batch_stages.size()].second}, 1);
+                const auto label = "predictor_stage_" + batch_stages[stage].first;
+                compare(batch_stages[stage].second, reference,
+                    std::numeric_limits<double>::infinity(), label.c_str());
+            }
+        }
         compare(batched, mfq_tensor_backend::cat(serial, 1), .005, "predictor_batched_vs_serial");
     }
     MFQ_RUNTIME_CHECK(!numerical_mismatch, "MTP predictor gate numerical mismatch");
