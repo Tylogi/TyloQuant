@@ -13,6 +13,18 @@
 #include "glu.cuh"
 #include "mfq_cuda_kernels.h"
 
+template <typename T>
+__device__ __forceinline__ float activation_as_float(T value) {
+    if constexpr (std::is_same_v<T, half>) return __half2float(value);
+    else return static_cast<float>(value);
+}
+
+template <typename T>
+__device__ __forceinline__ T activation_from_float(float value) {
+    if constexpr (std::is_same_v<T, half>) return __float2half_rn(value);
+    else return static_cast<T>(value);
+}
+
 __global__ void silu_mul_f32_kernel(
     const float* __restrict__ gate,
     const float* __restrict__ up,
@@ -104,11 +116,11 @@ __global__ void gelu_mul_kernel(
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
          i < n;
          i += (size_t)gridDim.x * blockDim.x) {
-        float value = mfq_glu<true>((float)gate[i], (float)up[i]);
+        float value = mfq_glu<true>(activation_as_float(gate[i]), activation_as_float(up[i]));
         if constexpr (!std::is_same_v<scalar_t, float>) {
             value = fminf(65504.0f, fmaxf(-65504.0f, value));
         }
-        out[i] = (scalar_t)value;
+        out[i] = activation_from_float<scalar_t>(value);
     }
 }
 
@@ -160,10 +172,10 @@ __global__ void linear_gate_beta_kernel(
         int64_t v = (int64_t)(idx % (size_t)V);
         int64_t t = (int64_t)((idx / (size_t)V) % (size_t)T);
         int64_t b = (int64_t)(idx / ((size_t)T * (size_t)V));
-        float a = (float)alpha[b * as0 + t * as1 + v * as2] + dt_bias[v];
+        float a = activation_as_float(alpha[b * as0 + t * as1 + v * as2]) + dt_bias[v];
         float sp = a > 20.0f ? a : log1pf(expf(a));
         float g = sp * -expf(a_log[v]);
-        float bv = (float)beta[b * bs0 + t * bs1 + v * bs2];
+        float bv = activation_as_float(beta[b * bs0 + t * bs1 + v * bs2]);
         float sig = 1.0f / (1.0f + expf(-bv));
         size_t out = ((size_t)b * (size_t)V + (size_t)v) * (size_t)T + (size_t)t;
         gate_t[out] = g;
