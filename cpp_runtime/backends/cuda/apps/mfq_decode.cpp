@@ -12456,7 +12456,7 @@ struct QuantLinearGroup {
     mfq_tensor_backend::Tensor forward_swiglu(mfq_tensor_backend::Tensor x) const {
         if (g_kl_mmq_mode == KlMmqMode::Default &&
                 nint_grouped && nint.split_w.empty() &&
-                x.numel() / x.size(-1) == 1) {
+                x.numel() / x.size(-1) >= 1 && x.numel() / x.size(-1) <= 6) {
             return nint.forward_swiglu(x);
         }
         if (g_kl_mmq_mode == KlMmqMode::Default &&
