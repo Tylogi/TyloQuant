@@ -12195,8 +12195,19 @@ struct QuantLinear {
         }
         if (is_nint()) return nint.forward_input_mul(x, gate, mode);
         if (is_nvq()) return nvq.forward_input_mul(x, gate, mode);
+        if (is_dense()) {
+            MFQ_RUNTIME_CHECK(mode == 1 || mode == 2,
+                "dense input gate mode must be sigmoid or SiLU");
+            // Match the existing dense shard path, including dtype rounding.
+            auto local = x.to(dense.scalar_type());
+            auto local_gate = gate.to(dense.scalar_type());
+            auto gated = mode == 1
+                ? local * mfq_tensor_backend::sigmoid(local_gate)
+                : local * mfq_tensor_backend::silu(local_gate);
+            return mfq_tensor_backend::matmul(gated, dense.transpose(0, 1));
+        }
         throw std::runtime_error(
-            "MXFP4/MXFP8/TPQ/dense linear does not support input gating");
+            "MXFP4/MXFP8/TPQ linear does not support input gating");
     }
     mfq_tensor_backend::Tensor forward_input_mul_f32_kld(
             mfq_tensor_backend::Tensor x,
@@ -21726,6 +21737,42 @@ static int32_t generate_server_tokens(
 // It calls the same MTP generator used by the server, with synthetic token IDs.
 static int run_qwen35_mtp_check(Model& model, CudaQwen35Mtp& mtp) {
     using Tensor = mfq_tensor_backend::Tensor;
+    // Identity projection isolates both dense gate modes and their dtype casts.
+    const auto float_options = mfq_tensor_backend::TensorOptions()
+        .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32);
+    std::vector<float> identity(33 * 33, 0.f), input(6 * 33), gate(6 * 33);
+    for (int i = 0; i < 33; ++i) identity[i * 33 + i] = 1.f;
+    for (int i = 0; i < 6 * 33; ++i) {
+        input[i] = static_cast<float>(i % 33 - 16) / 16.f;
+        gate[i] = static_cast<float>(i % 31 - 15) / 4.f;
+    }
+    auto test_input = mfq_tensor_backend::tensor(input, float_options).reshape({1, 6, 33});
+    auto test_gate = mfq_tensor_backend::tensor(gate, float_options).reshape({1, 6, 33});
+    for (auto dtype : {mfq_tensor_backend::kFloat32, mfq_tensor_backend::kFloat16,
+                       mfq_tensor_backend::kBFloat16}) {
+        QuantLinear linear;
+        linear.kind = QuantLinearKind::Dense;
+        linear.dense = mfq_tensor_backend::tensor(identity, float_options)
+            .reshape({33, 33}).to(dtype);
+        const double tolerance = dtype == mfq_tensor_backend::kBFloat16 ? .008
+            : dtype == mfq_tensor_backend::kFloat16 ? .001 : 2.e-6;
+        for (int m = 1; m <= 6; ++m) for (int mode : {1, 2}) {
+            auto actual = linear.forward_input_mul(test_input.narrow(1, 0, m),
+                test_gate.narrow(1, 0, m), mode);
+            MFQ_RUNTIME_CHECK(actual.scalar_type() == dtype && actual.size(1) == m,
+                "dense gate output dtype or shape mismatch");
+            auto values = actual.to(mfq_tensor_backend::kFloat32).cpu();
+            for (int i = 0; i < m * 33; ++i) {
+                const double activated = (mode == 1 ? 1. : gate[i]) / (1. + std::exp(-double(gate[i])));
+                const double reference = double(input[i]) * activated;
+                const double value = values.data_ptr<float>()[i];
+                MFQ_RUNTIME_CHECK(std::isfinite(value) &&
+                    std::abs(value - reference) <= tolerance * (1. + std::abs(reference)),
+                    "dense gate differs from CPU double identity oracle");
+            }
+        }
+    }
+    std::cout << "mtp_check dense_gate_cases=36 PASS\n";
     const auto options = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA)
         .dtype(mfq_tensor_backend::kInt64);
     auto ids = [&](const std::vector<int64_t>& tokens) {
