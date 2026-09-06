@@ -3,12 +3,10 @@
 #include "reduce.cuh"
 #include <climits>
 
-__device__ __forceinline__ int small_m_unpack_int4(uint32_t packed)
+__device__ __forceinline__ int small_m_unpack_int4(uint32_t packed, unsigned selector)
 {
-    return ((int)(packed & 0x000f)) |
-           ((int)(packed & 0x00f0) << 4) |
-           ((int)(packed & 0x0f00) << 8) |
-           ((int)(packed & 0xf000) << 12);
+    // Interleave low/high nibbles into signed dp4a's positive byte lanes.
+    return (int)(__byte_perm(packed, packed >> 4, selector) & 0x0f0f0f0fu);
 }
 
 template <int MROWS, bool FLOAT_OUTPUT = false, bool PRECOMPUTED_SUM = false>
@@ -32,7 +30,7 @@ __global__ void __launch_bounds__(128) nint4_gs24_small_m_reuse_kernel(
         #pragma unroll
         for (int chunk = 0; chunk < 6; ++chunk) {
             const uint32_t qw = chunk < 2 ? qw0 : (chunk < 4 ? qw1 : qw2);
-            const int qv = small_m_unpack_int4(qw >> ((chunk & 1) * 16));
+            const int qv = small_m_unpack_int4(qw, (chunk & 1) ? 0x7362u : 0x5140u);
             #pragma unroll
             for (int m = 0; m < MROWS; ++m) {
                 const int xv = *reinterpret_cast<const int*>(qx + (size_t)m * kpad + g * 24 + chunk * 4);
