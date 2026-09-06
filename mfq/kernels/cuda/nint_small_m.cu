@@ -83,13 +83,83 @@ __global__ void __launch_bounds__(128) nint4_gs24_small_m_reuse_kernel(
     }
 }
 
+// One warp owns an output row while retaining the original four-part sum tree.
+template <int MROWS, bool FLOAT_OUTPUT>
+__global__ void __launch_bounds__(128) nint4_gs24_small_m_warp_rows_kernel(
+    Nint4Gs24Projection weight, const int8_t* __restrict__ qx,
+    const float* __restrict__ xscale, int ng, int kpad)
+{
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (row >= weight.n) return;
+    const auto* qrow = weight.q_packed + (size_t)row * ng * 12;
+    const auto* ssrow = weight.sub_scale + (size_t)row * ng;
+    const auto* smrow = weight.sub_min + (size_t)row * ng;
+    float partial_d[4][MROWS], partial_m[4][MROWS];
+    #pragma unroll
+    for (int part = 0; part < 4; ++part) {
+        float pd[MROWS] = {}, pm[MROWS] = {};
+        for (int g = part * 32 + lane; g < ng; g += 128) {
+            const auto* qwords = reinterpret_cast<const uint32_t*>(qrow + g * 12);
+            const uint32_t qw0 = qwords[0], qw1 = qwords[1], qw2 = qwords[2];
+            int dsum[MROWS] = {}, msum[MROWS] = {};
+            #pragma unroll
+            for (int chunk = 0; chunk < 6; ++chunk) {
+                const uint32_t qw = chunk < 2 ? qw0 : (chunk < 4 ? qw1 : qw2);
+                const int qv = small_m_unpack_int4(qw >> ((chunk & 1) * 16));
+                #pragma unroll
+                for (int m = 0; m < MROWS; ++m) {
+                    const int xv = *reinterpret_cast<const int*>(qx + (size_t)m * kpad + g * 24 + chunk * 4);
+                    dsum[m] = __dp4a(qv, xv, dsum[m]);
+                    msum[m] = __dp4a(0x01010101, xv, msum[m]);
+                }
+            }
+            const float ss = ssrow[g], sm = smrow[g];
+            #pragma unroll
+            for (int m = 0; m < MROWS; ++m) {
+                const float xs = xscale[(size_t)m * ng + g];
+                pd[m] += xs * ss * (float)dsum[m];
+                pm[m] += xs * sm * (float)msum[m];
+            }
+        }
+        #pragma unroll
+        for (int m = 0; m < MROWS; ++m) {
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                pd[m] += __shfl_xor_sync(0xffffffff, pd[m], offset);
+                pm[m] += __shfl_xor_sync(0xffffffff, pm[m], offset);
+            }
+            partial_d[part][m] = pd[m];
+            partial_m[part][m] = pm[m];
+        }
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (int m = 0; m < MROWS; ++m) {
+            const float d = (partial_d[0][m] + partial_d[2][m]) + (partial_d[1][m] + partial_d[3][m]);
+            const float b = (partial_m[0][m] + partial_m[2][m]) + (partial_m[1][m] + partial_m[3][m]);
+            const __half rounded = __float2half(weight.neuron_scale[row] * d - weight.neuron_min[row] * b);
+            if constexpr (FLOAT_OUTPUT)
+                reinterpret_cast<float*>(weight.out)[(size_t)m * weight.n + row] = __half2float(rounded);
+            else reinterpret_cast<__half*>(weight.out)[(size_t)m * weight.n + row] = rounded;
+        }
+    }
+}
+
 template <bool FLOAT_OUTPUT>
 static void launch_small_m(
     Nint4Gs24Projection weight, const int8_t* qx, const float* xs,
     int m, int ng, int kpad, cudaStream_t stream)
 {
+    const char* warp_rows_env = std::getenv("MFQ_NINT4_SMALL_M_WARP_ROWS");
+    const bool warp_rows = warp_rows_env != nullptr && warp_rows_env[0] == '1';
 #define MFQ_NINT4_SMALL_M_CASE(M) \
-    case M: nint4_gs24_small_m_reuse_kernel<M, FLOAT_OUTPUT><<<weight.n, 128, 0, stream>>>(weight, qx, xs, ng, kpad); break
+    case M: \
+        if (warp_rows) nint4_gs24_small_m_warp_rows_kernel<M, FLOAT_OUTPUT> \
+            <<<weight.n / 4 + (weight.n % 4 != 0), 128, 0, stream>>>(weight, qx, xs, ng, kpad); \
+        else nint4_gs24_small_m_reuse_kernel<M, FLOAT_OUTPUT> \
+            <<<weight.n, 128, 0, stream>>>(weight, qx, xs, ng, kpad); \
+        break
     switch (m) {
         MFQ_NINT4_SMALL_M_CASE(2);
         MFQ_NINT4_SMALL_M_CASE(3);
