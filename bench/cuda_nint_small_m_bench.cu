@@ -12,6 +12,8 @@ Tensor nint_gemv_packed_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
     int64_t, Tensor, Tensor, Tensor);
 Tensor nint_gemv_packed_int6_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
     int64_t, Tensor, Tensor, Tensor);
+Tensor nint_gemv_packed_u8_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
+    int64_t, Tensor, Tensor, Tensor);
 Tensor nint_gemv_packed_bits_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
     int64_t, int64_t, Tensor, Tensor, Tensor);
 
@@ -69,8 +71,11 @@ int main(int argc, char** argv) {
         auto xm = empty({6, groups}, options.dtype(kInt32));
         const uint64_t weight_bytes = q.nbytes() + s.nbytes() + sm.nbytes() + ns.nbytes() + nm.nbytes();
         std::cout << std::setprecision(10) << std::unitbuf;
+        const char* entry = bits == 4 ? (boundary == "f32" ? "small_m_f32_ws" : "packed_ws")
+            : bits == 6 ? "packed_int6_ws" : bits == 8 ? "packed_u8_ws" : "packed_bits_ws";
         std::cout << "profile=NINT" << bits << " gs=" << gs << " scale_bits=" << scale_bits
             << " N=" << n << " K=" << k << " input_output=" << boundary
+            << " entry=" << entry
             << " weight_gpu_bytes=" << weight_bytes << " gpu_bpw=" << 8. * weight_bytes / (double(n) * k)
             << " seed=20260907 boundary_casts_included=1 input_quantization_included=1\n";
         for (int m = 2; m <= 6; ++m) {
@@ -83,6 +88,8 @@ int main(int argc, char** argv) {
                     ? nint_gemv_packed_ws_cuda(q, s, sm, ns, nm, half_input, gs, qx, xs, xm)
                     : bits == 6
                     ? nint_gemv_packed_int6_ws_cuda(q, s, sm, ns, nm, half_input, gs, qx, xs, xm)
+                    : bits == 8
+                    ? nint_gemv_packed_u8_ws_cuda(q, s, sm, ns, nm, half_input, gs, qx, xs, xm)
                     : nint_gemv_packed_bits_ws_cuda(q, s, sm, ns, nm, half_input, gs, bits, qx, xs, xm);
                 return half_output.to(input.scalar_type());
             };
