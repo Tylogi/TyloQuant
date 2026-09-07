@@ -16,6 +16,7 @@ enum class MfqCudaBackbone {
     minicpmo_tts,
     gemma4,
     glm_dsa,
+    glm5_next,
     deepseek_v4,
     unsupported,
 };
@@ -61,6 +62,7 @@ inline constexpr MfqCudaBackbone mfq_cuda_backbone(
     }
     if (implementation == "gemma4") return MfqCudaBackbone::gemma4;
     if (implementation == "glm_dsa") return MfqCudaBackbone::glm_dsa;
+    if (implementation == "glm5_next") return MfqCudaBackbone::glm5_next;
     if (implementation == "deepseek_v4") {
         return MfqCudaBackbone::deepseek_v4;
     }

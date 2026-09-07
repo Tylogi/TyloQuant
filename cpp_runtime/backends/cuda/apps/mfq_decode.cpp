@@ -1,6 +1,8 @@
 #include "mfq_tensor_backend.h"
 #include "mfq_cuda_model_plan.h"
 #include "mfq_cuda_mtp.h"
+#include "mfq_flash_next_config.h"
+#include "mfq_flash_next_runtime.h"
 #include <cuda_profiler_api.h>
 #include <cuda_runtime_api.h>
 
@@ -13395,6 +13397,10 @@ struct Config {
     std::vector<std::string> indexer_types;
     std::vector<std::string> mlp_layer_types;
     std::vector<int64_t> compress_ratios;
+    std::optional<mfq::flash_next::GlmConfig> glm5_next;
+    bool is_glm5_next() const {
+        return runtime_plan.backbone == mfq::cuda::MfqCudaBackbone::glm5_next;
+    }
     bool is_gemma4() const {
         return runtime_plan.backbone == mfq::cuda::MfqCudaBackbone::gemma4;
     }
@@ -13556,6 +13562,21 @@ static Config parse_config_json(
     Config c;
     c.model_graph = model_graph;
     c.runtime_plan = runtime_plan;
+    if (runtime_plan.backbone == mfq::cuda::MfqCudaBackbone::glm5_next) {
+        const auto parsed=mfq::flash_next::GlmConfig::parse(document);
+        c.glm5_next=parsed; c.model_type="glm5_next";
+        c.vocab_size=parsed.vocab; c.hidden_size=parsed.hidden;
+        c.intermediate_size=parsed.intermediate; c.num_hidden_layers=parsed.layers;
+        c.max_position_embeddings=parsed.maximum; c.num_attention_heads=parsed.heads;
+        c.num_key_value_heads=1; c.head_dim=parsed.nope;
+        c.hc_mult=parsed.streams; c.rms_norm_eps=parsed.eps; c.norm_weight_offset=0;
+        c.tie_word_embeddings=parsed.tied_embeddings;
+        c.layer_types=parsed.layer_types; c.mlp_layer_types=parsed.mlp_types;
+        c.num_experts=parsed.experts; c.num_experts_per_tok=parsed.topk;
+        c.moe_intermediate_size=parsed.moe_intermediate;
+        c.mtp_num_hidden_layers=parsed.predictor_layers;
+        return c;
+    }
     c.model_type = json_string(s, "model_type");
     if (c.runtime_plan.backbone ==
             mfq::cuda::MfqCudaBackbone::unsupported) {
@@ -17722,6 +17743,8 @@ static FFN load_ffn(const MfqFile & mfq, const Config & c, int i) {
     return f;
 }
 
+#include "flash_next_runtime.inc"
+
 static std::unique_ptr<Block> load_block(
     const MfqFile & mfq,
     const Config & c,
@@ -17729,6 +17752,10 @@ static std::unique_ptr<Block> load_block(
     const std::string & type,
     const std::shared_ptr<GlmDsaSharedState> & glm_state = nullptr,
     const std::shared_ptr<Dsv4SharedState> & dsv4_state = nullptr) {
+    if (c.is_glm5_next()) {
+        MFQ_RUNTIME_CHECK(c.glm5_next.has_value(), "missing GLM Flash-Next configuration");
+        return std::make_unique<Glm5NextBlock>(mfq,*c.glm5_next,i);
+    }
     if (c.is_dsv4()) {
         if (type != "deepseek_v4" || !dsv4_state) {
             throw std::runtime_error(
@@ -18764,6 +18791,10 @@ struct Model {
     int64_t speculative_confirmed = 0;
 
     bool supports_qwen_speculation() const {
+        if (c.is_glm5_next()) return !blocks.empty() &&
+            std::all_of(blocks.begin(),blocks.end(),[](const auto& block) {
+                return dynamic_cast<const Glm5NextBlock*>(block.get()) != nullptr;
+            });
         return c.runtime_plan.backbone == mfq::cuda::MfqCudaBackbone::generic_qwen &&
             !blocks.empty() && std::all_of(blocks.begin(), blocks.end(), [](const auto& block) {
                 const auto* full = dynamic_cast<const FullBlock*>(block.get());
@@ -18776,6 +18807,7 @@ struct Model {
         MFQ_RUNTIME_CHECK(speculative_start >= 0, "no speculative transaction to commit");
         for (auto& block : blocks) {
             if (auto* linear = dynamic_cast<LinearBlock*>(block.get())) linear->commit_speculative();
+            if (auto* flash = dynamic_cast<Glm5NextBlock*>(block.get())) flash->commit_speculative();
         }
         speculative_start = -1;
         speculative_confirmed = 0;
@@ -18784,6 +18816,10 @@ struct Model {
     void rollback_speculative() {
         MFQ_RUNTIME_CHECK(speculative_start >= 0, "no speculative transaction to roll back");
         for (auto& block : blocks) {
+            if (auto* flash = dynamic_cast<Glm5NextBlock*>(block.get())) {
+                MfqCudaGuard guard(block->cuda_device);
+                flash->rollback_speculative(speculative_start + speculative_confirmed);
+            }
             if (auto* linear = dynamic_cast<LinearBlock*>(block.get())) {
                 MfqCudaGuard guard(block->cuda_device);
                 linear->rollback_speculative();
@@ -19058,6 +19094,9 @@ struct Model {
     }
 
     mfq_tensor_backend::Tensor finalize_hidden(mfq_tensor_backend::Tensor x, int64_t B, int64_t T) {
+        if (c.is_glm5_next()) {
+            return mfq::flash_next::rms_norm(x.mean(2),output_norm,c.rms_norm_eps);
+        }
         if (c.is_dsv4()) {
             x = g_profiler.measure("model.dsv4_hc_head", [&]() {
                 auto flat = x.flatten(2).to(mfq_tensor_backend::kFloat32);
@@ -19129,6 +19168,11 @@ struct Model {
         }
         const int64_t B = ids.size(0);
         const int64_t T = ids.size(1);
+        if (c.is_glm5_next()) {
+            MFQ_RUNTIME_CHECK(T > 0 && cache_pos + T <= c.max_position_embeddings &&
+                !pos_override.has_value() && !cache_positions_override.has_value() && !attention_mask.has_value(),
+                "GLM Flash-Next currently requires contiguous causal cache positions without an external mask");
+        }
         MFQ_RUNTIME_CHECK(speculative_start < 0,
             "commit or roll back the pending speculative pass before forwarding");
         MFQ_RUNTIME_CHECK(confirmed_prefix >= 0 &&
@@ -19205,7 +19249,7 @@ struct Model {
                 return x * c.embed_scale;
             });
         }
-        if (c.is_dsv4()) {
+        if (c.is_dsv4() || c.is_glm5_next()) {
             x = x.to(mfq_tensor_backend::kFloat16)
                 .unsqueeze(2)
                 .expand({B, T, c.hc_mult, c.hidden_size})
@@ -19253,6 +19297,9 @@ struct Model {
                     linear != nullptr) {
                 x = linear->forward_speculative(x, local_pos, cache_pos, c, active_rope,
                     confirmed_prefix);
+            } else if (auto* flash = confirmed_prefix > 0 ? dynamic_cast<Glm5NextBlock*>(b.get()) : nullptr;
+                    flash != nullptr) {
+                x = flash->execute(x,cache_pos,confirmed_prefix);
             } else {
                 x = b->forward(
                     x, local_pos, cache_pos, local_seq_len, c, active_rope,
@@ -19310,6 +19357,7 @@ struct Model {
         }
         auto y = hidden_forward(ids, mfq_nullopt, seq_len);
         auto last = y.index({Slice(), -1, Slice()});
+        if (c.is_glm5_next()) return logits_from_hidden(last);
         if (c.is_minicpmo45()) {
             return logits_from_hidden(
                 last.to(mfq_tensor_backend::kBFloat16).contiguous());
@@ -19411,6 +19459,10 @@ static Model load_model(const std::string & mfq_path, const std::string & config
     Model m;
     MfqFile mfq(mfq_path);
     m.c = load_config(mfq, config_path);
+    if (m.c.is_glm5_next() && (g_tensor_parallel.enabled() || g_layer_placement.enabled() ||
+            g_n_gpu_layers >= 0 || g_moe_expert_cache)) {
+        throw std::runtime_error("GLM Flash-Next native adapter currently requires single-device resident weights");
+    }
     g_layer_placement.prepare(m.c.num_hidden_layers);
     g_dense_cpu_layer_count = 0;
     if (g_n_gpu_layers >= 0) {
@@ -19466,8 +19518,9 @@ static Model load_model(const std::string & mfq_path, const std::string & config
             throw std::runtime_error("--ctx-size exceeds max_position_embeddings");
         }
         m.c.max_position_embeddings = context_size_override;
+        if (m.c.glm5_next) m.c.glm5_next->maximum=context_size_override;
     }
-    if (!m.c.is_gemma4() && !m.c.is_dsv4()) {
+    if (!m.c.is_gemma4() && !m.c.is_dsv4() && !m.c.is_glm5_next()) {
         m.rope = RopeCache(m.c);
         if (g_dense_cpu_layer_count > 0) {
             m.cpu_rope = RopeCache(
@@ -19481,7 +19534,7 @@ static Model load_model(const std::string & mfq_path, const std::string & config
         }
     }
     m.c.norm_weight_offset =
-        (m.c.is_gemma4() || m.c.is_glm_dsa() || m.c.is_minicpmo45())
+        (m.c.is_gemma4() || m.c.is_glm_dsa() || m.c.is_minicpmo45() || m.c.is_glm5_next())
         ? 0.0 : m.c.legacy_tensor_layout.norm_weight_offset;
     const std::string embed_name = "model.token_embedding.weight";
     const std::string norm_name = "model.output_norm.weight";
@@ -21718,6 +21771,7 @@ static int32_t generate_server_tokens(
     const char * graph_env = std::getenv("MFQ_SERVER_CUDA_GRAPH");
     const bool graph_enabled =
         (graph_env == nullptr || graph_env[0] != '0') &&
+        !model.c.is_glm5_next() &&
         mfq_cuda_graph_capture_supported() &&
         g_dsv4_cpu_offload_layers.empty() &&
         g_dense_cpu_layer_count == 0 &&
@@ -27000,6 +27054,46 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
     return backend;
 }
 
+static int run_flash_next_check(Model& model) {
+    namespace tb=mfq_tensor_backend;
+    MFQ_RUNTIME_CHECK(model.c.is_glm5_next() && model.c.vocab_size>=8 && model.c.max_position_embeddings>=16,
+        "Flash-Next diagnostic requires a GLM text graph, vocab>=8 and context>=16");
+    auto ids=tb::tensor(std::vector<int64_t>{1,2,3,4,5,6,7},
+        tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt64)).reshape({1,7});
+    const auto json_tensor=[](const tb::Tensor& value) {
+        auto host=value.to(tb::kFloat32).contiguous().cpu();
+        return nlohmann::json{{"shape",host.sizes().vec()},
+            {"data",std::vector<float>(host.data_ptr<float>(),host.data_ptr<float>()+host.numel())}};
+    };
+    nlohmann::json result;
+    model.reset(1);
+    result["full"]=json_tensor(model.forward(ids));
+    model.reset(1);
+    std::vector<tb::Tensor> pieces;
+    for (auto [begin,count] : std::vector<std::pair<int64_t,int64_t>>{{0,2},{2,1},{3,4}})
+        pieces.push_back(model.forward(ids.narrow(1,begin,count)));
+    result["chunked"]=json_tensor(tb::cat(pieces,1));
+    for (bool accept : {false,true}) {
+        const std::string name=accept ? "committed" : "rejected";
+        model.reset(1);
+        model.forward(ids.narrow(1,0,2));
+        auto hidden=model.hidden_forward(ids.narrow(1,2,2),mfq_nullopt,mfq_nullopt,nullptr,mfq_nullopt,nullptr,1);
+        result[name+"_verify"]=json_tensor(model.logits_from_hidden(hidden));
+        if (accept) model.commit_speculative(); else model.rollback_speculative();
+        MFQ_RUNTIME_CHECK(model.cache_pos==(accept?4:3),"Flash-Next transaction cache position mismatch");
+        result[name]=json_tensor(model.forward(ids.narrow(1,5,1)));
+        model.reset(1);
+        model.forward(ids.narrow(1,0,2));
+        model.forward(ids.narrow(1,2,accept?2:1));
+        result[name+"_reference"]=json_tensor(model.forward(ids.narrow(1,5,1)));
+    }
+    model.reset(1);
+    result["reset"]=json_tensor(model.forward(ids));
+    result["architecture"]=model.c.model_graph.backbone;
+    std::cout << "flash_next_check " << result.dump() << '\n';
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     struct TensorParallelCollectiveCleanup {
         ~TensorParallelCollectiveCleanup() {
@@ -27103,6 +27197,7 @@ int main(int argc, char ** argv) {
         bool check_dsv4_hc = false;
         bool check_text_session_state = false;
         bool check_qwen35_mtp = false;
+        bool check_flash_next = false;
         bool compare_dsv4_hc_ops = false;
         bool compare_dsv4_hc_model = false;
         bool check_attention_swa_decode = false;
@@ -27231,6 +27326,7 @@ int main(int argc, char ** argv) {
                 check_text_session_state = true;
             }
             else if (a == "--check-qwen35-mtp") check_qwen35_mtp = true;
+            else if (a == "--check-flash-next") check_flash_next = true;
             else if (a == "--bench-qwen35-mtp" && i + 1 < argc) bench_qwen35_mtp = argv[++i];
             else if (a == "--bench-qwen35-mtp-reps" && i + 1 < argc) bench_qwen35_mtp_reps = std::stoi(argv[++i]);
             else if (a == "--compare-dsv4-hc-ops") compare_dsv4_hc_ops = true;
@@ -27720,7 +27816,7 @@ int main(int argc, char ** argv) {
                 context_size, minicpmo_tts_steps);
         }
         if (mfq_path.empty() ||
-            (!server_mode && !check_qwen35_mtp && bench_qwen35_mtp.empty() && ids_arg.empty() && ids_file.empty() &&
+            (!server_mode && !check_qwen35_mtp && !check_flash_next && bench_qwen35_mtp.empty() && ids_arg.empty() && ids_file.empty() &&
                 kl_base.empty() && prefill_sweep_arg.empty())) {
             std::cerr << "usage: mfq-decode --mfq model.mfq [--config config.json] "
                          "(--ids 1,2,3 --gen 128 | --check-qwen35-mtp | --bench-qwen35-mtp ordinary|mtp | --minicpmo-eval-batch "
@@ -27950,6 +28046,7 @@ int main(int argc, char ** argv) {
         mfq_cuda_synchronize();
         auto t1 = std::chrono::steady_clock::now();
         report_cuda_memory("loaded");
+        if (check_flash_next) return run_flash_next_check(model);
         if (check_qwen35_mtp) {
             MFQ_RUNTIME_CHECK(server_components.qwen_mtp.has_value(),
                 "--check-qwen35-mtp requires a supported model containing MTP weights");
@@ -28445,6 +28542,7 @@ int main(int argc, char ** argv) {
             std::atoi(profile_graph_env) != 0;
         bool use_cuda_graph =
             (graph_env == nullptr || graph_env[0] != '0') &&
+            !model.c.is_glm5_next() &&
             mfq_cuda_graph_capture_supported() &&
             g_dsv4_cpu_offload_layers.empty() &&
             g_dense_cpu_layer_count == 0 &&

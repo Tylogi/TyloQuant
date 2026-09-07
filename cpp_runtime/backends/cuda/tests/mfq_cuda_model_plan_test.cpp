@@ -93,6 +93,14 @@ int main() {
                 MfqCudaBackbone::unsupported,
             "unimplemented CUDA backbone was accepted");
 
+        const auto glm_next = graph_with("glm5_next", "grid_vit", "next_token_prediction");
+        const auto glm_plan = mfq_cuda_model_plan(glm_next);
+        require(glm_plan.backbone == MfqCudaBackbone::glm5_next,
+            "GLM Flash-Next text adapter was not selected");
+        require(glm_plan.vision == MfqCudaVisionAdapter::none &&
+            glm_plan.predictor == MfqCudaPredictorAdapter::none,
+            "text support incorrectly advertised unimplemented optional components");
+
         std::cout << "MFQ CUDA model plan tests passed\n";
         return 0;
     } catch (const std::exception& error) {

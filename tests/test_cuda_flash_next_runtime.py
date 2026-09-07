@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from pathlib import Path
 import subprocess
 
 import numpy as np
@@ -99,7 +100,7 @@ def kda_reference(inputs, heads, width, kernel):
     attended = np.stack(outputs,axis=2)
     normalized = attended / np.sqrt(np.mean(attended**2,axis=-1,keepdims=True)+1e-5)*norm
     gate = ((x@ga.T)@gb.T).reshape(b,t,heads,width).transpose(0,2,1,3)
-    y = (normalized*sigmoid(gate)).transpose(0,2,1,3).reshape(b,t,heads*width)@ow.T
+    y = (normalized*sigmoid(gate)).transpose(0,2,1,3).reshape(b,t,heads*width).astype(x.dtype).astype(ow.dtype)@ow.T
     return y, joined[:,-(kernel-1):],state
 
 
@@ -197,3 +198,221 @@ def test_sequence_cache_growth_truncate_overwrite_reset(native):
                   [dict(truncate=1)], [dict(begin=0,count=2),dict(truncate=-1)]]:
         with pytest.raises(RuntimeError):
             native("runtime_sequence_cache",[x],maximum=35,steps=steps)
+
+
+def glm_model_fixture(attention_types, sparse_ffn):
+    from mfq.architectures.flash_next import Glm5NextConfig
+    rng=np.random.default_rng(5303)
+    h,d,heads,rank,nope,vwidth,index=32,32,2,16,16,16,128
+    layers=len(attention_types)
+    def rand(shape,scale=.05): return rng.normal(scale=scale,size=shape).astype(np.float32)
+    c=dict(model_type="glm5_next_text",vocab_size=32,hidden_size=h,intermediate_size=32,
+        num_hidden_layers=layers,max_position_embeddings=32,rms_norm_eps=1e-5,
+        layer_types=list(attention_types),mlp_layer_types=["sparse" if sparse_ffn else "dense"]*layers,
+        mhc=True,mla_use_nope=True,hc_mult=2,hc_eps=1e-6,hc_sinkhorn_iters=5,
+        linear_attn_config=dict(num_heads=heads,head_dim=d,short_conv_kernel_size=4,gate_lower_bound=-5,
+            kda_layers=[i for i,t in enumerate(attention_types) if t=="linear_attention"],
+            full_attn_layers=[i for i,t in enumerate(attention_types) if t!="linear_attention"]),
+        q_lora_rank=rank,kv_lora_rank=rank,num_attention_heads=heads,qk_nope_head_dim=nope,qk_rope_head_dim=0,
+        v_head_dim=vwidth,index_n_heads=heads,index_head_dim=index,index_topk=4,index_kpool=2,
+        index_kpool_always_select_tail=True,indexer_types=["full"]*layers,n_routed_experts=3,
+        num_experts_per_tok=2,moe_intermediate_size=16,n_shared_experts=1,routed_scaling_factor=2.5,
+        swiglu_limit=10.0,scoring_func="sigmoid",norm_topk_prob=True,num_nextn_predict_layers=0,
+        tie_word_embeddings=False,eos_token_id=[0])
+    outer=dict(model_type="glm5_next",text_config=c)
+    Glm5NextConfig.from_hf_config(outer)
+    w={"model.token_embedding.weight":rand((32,h),.2),"model.output.weight":rand((32,h)),
+       "model.output_norm.weight":np.ones(h,np.float32)}
+    def dense_ffn(p,inner):
+        w[p+".gate.weight"]=rand((inner,h));w[p+".up.weight"]=rand((inner,h));w[p+".down.weight"]=rand((h,inner))
+    for i,kind in enumerate(attention_types):
+        p=f"model.block.{i}"
+        for site in ("attention","mlp"):
+            prefix=p+f".{site}.mhc.pre"
+            w[prefix+".function"]=rand((8,2*h),.02)
+            w[prefix+".base"]=rand((8,),.02)
+            w[prefix+".scale"]=np.array([.2,.3,.4],np.float32)
+            w[p+f".{site}.norm.weight"]=np.ones(h,np.float32)
+        if kind=="linear_attention":
+            a=p+".linear_attention"
+            for proj in ("query","key","value"):
+                w[a+f".{proj}.weight"]=rand((heads*d,h))
+                conv=np.zeros((heads*d,1,4),np.float32);conv[:,0,-1]=.8;conv[:,0,-2]=.1
+                w[a+f".{proj}_conv.weight"]=conv
+            for key,shape in {"forget_a":(d,h),"forget_b":(heads*d,d),"beta":(heads,h),
+                              "gate_a":(d,h),"gate_b":(heads*d,d),"output":(h,heads*d)}.items():
+                w[a+f".{key}.weight"]=rand(shape)
+            w[a+".dt_bias"]=rand((heads*d,),.02);w[a+".a"]=rand((heads,),.02)
+            w[a+".output_norm.weight"]=np.ones(d,np.float32)
+        else:
+            a=p+".attention"
+            for key,shape in {"query_a":(rank,h),"key_value_a":(rank,h),"query_b":(heads*nope,rank),
+                              "output":(h,heads*vwidth),"indexer.query":(heads*index,rank),
+                              "indexer.key":(index,h),"indexer.score":(heads,h),
+                              "latent.query_embedding":(heads,rank,nope),
+                              "latent.output_unembedding":(heads,vwidth,rank)}.items():
+                w[a+f".{key}.weight"]=rand(shape)
+            for key,size in [("query_a_norm",rank),("key_value_a_norm",rank),("indexer.key_norm",index)]:
+                w[a+f".{key}.weight"]=np.ones(size,np.float32)
+            w[a+".indexer.key_norm.bias"]=np.zeros(index,np.float32)
+            w[a+".indexer.pool.gate"]=rand((index,h))
+            w[a+".indexer.pool.position"]=rand((2,index))
+        if sparse_ffn:
+            w[p+".mlp.experts.gate_up.weight"]=rand((3,32,h))
+            w[p+".mlp.experts.down.weight"]=rand((3,h,16))
+            w[p+".mlp.router.weight"]=rand((3,h));w[p+".mlp.router.bias"]=rand((3,),.02)
+            dense_ffn(p+".mlp.shared_expert",16)
+        else: dense_ffn(p+".mlp",32)
+    return outer,w
+
+
+def glm_model_reference(config,w):
+    c=config["text_config"]
+    def sm(x,axis=-1):
+        e=np.exp(x-np.max(x,axis=axis,keepdims=True));return e/e.sum(axis=axis,keepdims=True)
+    def norm(x,weight):
+        f=x.astype(np.float32)
+        return (f/np.sqrt(np.mean(f*f,axis=-1,keepdims=True)+c["rms_norm_eps"])*weight).astype(x.dtype)
+    def lin(x,p):
+        weight=w[p+".weight"]
+        return x.astype(weight.dtype)@weight.T
+    def hc_pre(x,p):
+        f=x.astype(np.float32).reshape(*x.shape[:2],-1)
+        f=f/np.sqrt(np.mean(f*f,axis=-1,keepdims=True)+c["rms_norm_eps"])
+        logits=f@w[p+".function"].T;base=w[p+".base"];scale=w[p+".scale"]
+        pre=sigmoid(logits[...,:2]*scale[0]+base[:2])+c["hc_eps"]
+        post=2*sigmoid(logits[...,2:4]*scale[1]+base[2:4])
+        mix=sm(logits[...,4:].reshape(*x.shape[:2],2,2)*scale[2]+base[4:].reshape(2,2))+c["hc_eps"]
+        mix=mix/(mix.sum(axis=-2,keepdims=True)+c["hc_eps"])
+        for _ in range(1,c["hc_sinkhorn_iters"]):
+            mix=mix/(mix.sum(axis=-1,keepdims=True)+c["hc_eps"])
+            mix=mix/(mix.sum(axis=-2,keepdims=True)+c["hc_eps"])
+        return (pre[...,None]*x).sum(axis=-2).astype(x.dtype),post,mix
+    def hc_post(branch,x,post,mix):
+        return post.astype(x.dtype)[...,None]*branch[...,None,:]+np.swapaxes(mix,-1,-2)@x
+    def dense(x,p):
+        g=np.minimum(lin(x,p+".gate"),c["swiglu_limit"])
+        u=np.clip(lin(x,p+".up"),-c["swiglu_limit"],c["swiglu_limit"])
+        return lin(g*sigmoid(g)*u,p+".down")
+    def ffn(x,p,kind):
+        if kind=="dense":return dense(x,p)
+        source=x.reshape(-1,c["hidden_size"]).astype(np.float16)
+        scores=sigmoid(lin(source.astype(np.float32),p+".router"))
+        ids=np.argsort(-(scores+w[p+".router.bias"]),axis=-1)[:,:c["num_experts_per_tok"]]
+        weight=np.take_along_axis(scores,ids,axis=-1)
+        weight=weight/np.maximum(weight.sum(axis=-1,keepdims=True),1e-20)*c["routed_scaling_factor"]
+        gu=np.einsum("troi,ti->tro",w[p+".experts.gate_up.weight"][ids],source.astype(np.float32))
+        g,u=np.split(gu,2,axis=-1);g=np.minimum(g,c["swiglu_limit"]);u=np.clip(u,-c["swiglu_limit"],c["swiglu_limit"])
+        pairs=np.einsum("troi,tri->tro",w[p+".experts.down.weight"][ids],g*sigmoid(g)*u)
+        return ((pairs*weight[...,None]).sum(axis=1)+dense(source,p+".shared_expert")).reshape(x.shape)
+    def kda(x,p):
+        inputs=[x]+[w[p+f".{n}.weight"] for n in ("query","key","value","beta","gate_a","gate_b","output")]
+        inputs += [np.concatenate([w[p+f".{n}_conv.weight"] for n in ("query","key","value")],axis=0),
+                   w[p+".forget_a.weight"],w[p+".forget_b.weight"],w[p+".dt_bias"],w[p+".a"],w[p+".output_norm.weight"]]
+        a=c["linear_attn_config"]
+        return kda_reference(inputs,a["num_heads"],a["head_dim"],a["short_conv_kernel_size"])[0]
+    def mla(x,p):
+        b,t,_=x.shape;heads=c["num_attention_heads"];rank=c["kv_lora_rank"];index=c["index_head_dim"]
+        qr=norm(lin(x,p+".query_a"),w[p+".query_a_norm.weight"])
+        q=lin(qr,p+".query_b").reshape(b,t,heads,c["qk_nope_head_dim"])
+        latent=norm(lin(x,p+".key_value_a"),w[p+".key_value_a_norm.weight"]).astype(np.float16).astype(np.float32)
+        absorbed=np.einsum("bthi,hoi->btho",q,w[p+".latent.query_embedding.weight"])
+        ik=lin(x,p+".indexer.key").astype(np.float16).astype(np.float32)
+        centered=ik-ik.mean(axis=-1,keepdims=True)
+        ik=(centered/np.sqrt(np.mean(centered**2,axis=-1,keepdims=True)+1e-6)*w[p+".indexer.key_norm.weight"]+
+            w[p+".indexer.key_norm.bias"]).astype(np.float16).astype(np.float32)
+        gates=(x@w[p+".indexer.pool.gate"].T).astype(np.float16).astype(np.float32)
+        pool=c["index_kpool"];pools=t//pool
+        probability=sm(gates[:,:pools*pool].reshape(b,pools,pool,index)+w[p+".indexer.pool.position"],axis=-2)
+        # The Metal pool rounds probabilities to its cached keys' dtype first.
+        probability=probability.astype(np.float16).astype(np.float32)
+        pooled=(ik[:,:pools*pool].reshape(b,pools,pool,index)*probability).astype(np.float16)
+        pooled=pooled.sum(axis=-2,dtype=np.float32).astype(np.float16).astype(np.float32)
+        iq=lin(qr,p+".indexer.query").reshape(b,t,c["index_n_heads"],index)
+        dots=np.maximum(np.einsum("bthi,bpi->bthp",iq,pooled),0)/math.sqrt(index)
+        scores=(dots*(lin(x,p+".indexer.score")/math.sqrt(c["index_n_heads"]))[...,None]).sum(axis=-2)
+        attended=np.zeros((b,t,heads,rank),np.float32)
+        for bi in range(b):
+            for token in range(t):
+                if t<=c["index_topk"]: selected=list(range(token+1))
+                else:
+                    visible=np.arange((token+1)//pool)
+                    chosen=visible[np.argsort(scores[bi,token,visible])[-(c["index_topk"]//pool):]]
+                    selected=[int(p*pool+j) for p in chosen for j in range(pool)]
+                    selected+=list(range(token+1-(token+1)%pool,token+1))
+                if selected:
+                    keys=latent[bi,selected]
+                    logits=absorbed[bi,token]@keys.T/math.sqrt(c["qk_nope_head_dim"])
+                    attended[bi,token]=sm(logits)@keys
+        value=np.einsum("bthi,hoi->btho",attended.astype(np.float16).astype(np.float32),w[p+".latent.output_unembedding.weight"])
+        return lin(value.reshape(b,t,-1),p+".output")
+    hidden=w["model.token_embedding.weight"][np.arange(1,8)[None]].astype(np.float16)
+    x=np.broadcast_to(hidden[...,None,:],(*hidden.shape[:2],2,hidden.shape[-1])).copy()
+    for i,kind in enumerate(c["layer_types"]):
+        p=f"model.block.{i}"
+        branch,post,mix=hc_pre(x,p+".attention.mhc.pre")
+        branch=norm(branch,w[p+".attention.norm.weight"])
+        branch=kda(branch,p+".linear_attention") if kind=="linear_attention" else mla(branch,p+".attention")
+        x=hc_post(branch,x,post,mix)
+        branch,post,mix=hc_pre(x,p+".mlp.mhc.pre")
+        branch=ffn(norm(branch,w[p+".mlp.norm.weight"]),p+".mlp",c["mlp_layer_types"][i])
+        x=hc_post(branch,x,post,mix)
+    return lin(norm(x.mean(axis=-2),w["model.output_norm.weight"]),"model.output")
+
+
+def write_glm_fixture(path,config,weights):
+    from mfq.formats.io import save
+    from mfq.formats.header import FileHeader
+    from mfq.formats.assets import MODEL_CONFIG_ASSET,MODEL_GRAPH_ASSET
+    graph=dict(schema_version=1,architecture="glm5_next",
+        canonical_naming=dict(namespace="mfq.tensor",version=1,component_roots=["model"]),
+        topology=dict(text_layers=config["text_config"]["num_hidden_layers"]),
+        graph=dict(kind="causal_lm",backbone="glm5_next"),
+        components=[dict(kind="text",tensor_root="model",implementation="glm5_next",policy="decoder")],
+        capabilities=["text"])
+    save(path,FileHeader(version=2,model_arch="glm5_next"),
+         {**weights,MODEL_CONFIG_ASSET:json.dumps(config).encode(),MODEL_GRAPH_ASSET:json.dumps(graph).encode()})
+
+
+def run_glm_fixture(path):
+    bridge=os.environ.get("MFQ_FLASH_NEXT_NATIVE_TEST")
+    if not bridge:pytest.skip("MFQ_FLASH_NEXT_NATIVE_TEST required")
+    binary=Path(bridge).with_name("mfq-decode")
+    return subprocess.run([str(binary),"--mfq",str(path),"--ctx-size","32","--check-flash-next"],
+                          text=True,capture_output=True,timeout=90)
+
+
+@pytest.mark.parametrize("types",[("linear_attention",)*2,("deepseek_sparse_attention",)*2,
+                                  ("linear_attention","deepseek_sparse_attention")])
+@pytest.mark.parametrize("sparse_ffn",[False,True])
+def test_glm_native_complete_graph(tmp_path,types,sparse_ffn):
+    config,weights=glm_model_fixture(types,sparse_ffn)
+    expected=glm_model_reference(config,weights)
+    path=tmp_path/"glm-graph.mfq";write_glm_fixture(path,config,weights)
+    process=run_glm_fixture(path)
+    assert process.returncode==0,process.stdout+process.stderr
+    raw=json.loads(next(line.removeprefix("flash_next_check ") for line in process.stdout.splitlines()
+                        if line.startswith("flash_next_check ")))
+    assert raw.pop("architecture")=="glm5_next"
+    actual={k:np.asarray(v["data"],np.float32).reshape(v["shape"]) for k,v in raw.items()}
+    np.testing.assert_allclose(actual["full"],expected,atol=2e-3,rtol=2e-3)
+    np.testing.assert_allclose(actual["full"],actual["chunked"],atol=2e-2,rtol=2e-2)
+    np.testing.assert_array_equal(actual["full"],actual["reset"])
+    for action in ("committed","rejected"):
+        np.testing.assert_allclose(actual[action],actual[action+"_reference"],atol=2e-3,rtol=2e-3)
+
+
+@pytest.mark.parametrize("error",["schedule","rope","mhc","pool","norm","topk"])
+def test_glm_native_rejects_inconsistent_config(tmp_path,error):
+    config,weights=glm_model_fixture(("linear_attention","deepseek_sparse_attention"),False)
+    c=config["text_config"]
+    if error=="schedule":c["linear_attn_config"]["kda_layers"]=[1]
+    elif error=="rope":c["qk_rope_head_dim"]=4
+    elif error=="mhc":c["mhc"]=False
+    elif error=="pool":c["index_topk"]=3
+    elif error=="norm":c["rms_norm_eps"]=0
+    elif error=="topk":c["num_experts_per_tok"]=4
+    path=tmp_path/"invalid.mfq";write_glm_fixture(path,config,weights)
+    result=run_glm_fixture(path)
+    assert result.returncode!=0
+    assert "flash_next_check " not in result.stdout

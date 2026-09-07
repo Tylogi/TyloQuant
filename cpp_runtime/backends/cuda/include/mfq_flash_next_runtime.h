@@ -197,4 +197,78 @@ private:
     double lower_bound_, eps_;
     Tensor conv_, recurrent_, rollback_conv_, rollback_recurrent_;
 };
+
+struct MlaWeights {
+    Linear query_a, key_value_a, query_b, output, index_query, index_key, index_score;
+    // Head-wise absorbed projections accept/return [B,T,heads,width].
+    Linear embed_query, unembed_output;
+    Tensor query_norm, latent_norm, index_norm, index_bias, index_gate, index_position;
+};
+
+struct MlaConfig {
+    int64_t heads, nope, latent, value_width, index_heads, index_width, pool, budget, maximum;
+    bool tail;
+    double eps;
+};
+
+class SparseMla {
+public:
+    SparseMla(MlaWeights weights, MlaConfig config)
+        : w_(std::move(weights)), c_(config), latent_(config.maximum, config.latent),
+          index_(config.maximum, 2 * config.index_width) {
+        MFQ_RUNTIME_CHECK(c_.heads > 0 && c_.nope > 0 && c_.value_width > 0 &&
+            c_.index_heads > 0 && c_.pool > 0 && c_.budget > 0 && c_.budget % c_.pool == 0,
+            "invalid Flash-Next MLA configuration");
+    }
+    void reset() { latent_.reset(); index_.reset(); }
+    int64_t position() const { return latent_.position(); }
+    void truncate(int64_t keep) {
+        MFQ_RUNTIME_CHECK(keep >= 0 && keep <= latent_.position() && keep <= index_.position(),
+            "invalid Flash-Next MLA cache truncation");
+        latent_.truncate(keep); index_.truncate(keep);
+    }
+    Tensor forward(const Tensor& hidden, bool use_cache) {
+        MFQ_RUNTIME_CHECK(hidden.is_cuda() && hidden.dim() == 3 && hidden.size(0) > 0 && hidden.size(1) > 0,
+            "GLM MLA requires nonempty [B,T,H] input");
+        const auto b = hidden.size(0), t = hidden.size(1), offset = use_cache ? position() : 0;
+        MFQ_RUNTIME_CHECK(offset == (use_cache ? index_.position() : 0) && t <= c_.maximum - offset,
+            "GLM MLA cache position/capacity mismatch");
+        auto qr = rms_norm(w_.query_a(hidden), w_.query_norm, c_.eps);
+        auto query = w_.query_b(qr).reshape({b,t,c_.heads,c_.nope});
+        auto latent = rms_norm(w_.key_value_a(hidden).narrow(-1, 0, c_.latent), w_.latent_norm, c_.eps);
+        // Metal's indexer LayerNorm explicitly casts the source/output to F16.
+        auto ik = w_.index_key(hidden).to(tb::kFloat16).to(tb::kFloat32);
+        auto centered = ik - ik.mean(-1, true);
+        ik = (centered * tb::rsqrt((centered * centered).mean(-1, true) + 1e-6) *
+            w_.index_norm.to(tb::kFloat32) + w_.index_bias.to(tb::kFloat32)).to(tb::kFloat16);
+        auto gate_dtype = hidden.scalar_type() == w_.index_gate.scalar_type() ? hidden.scalar_type() : tb::kFloat32;
+        auto gates = tb::matmul(hidden.to(gate_dtype), w_.index_gate.to(gate_dtype).transpose(-1,-2));
+        auto packed = tb::cat({ik.to(gates.scalar_type()), gates}, -1);
+        try {
+            if (use_cache) { latent = latent_.append(latent); packed = index_.append(packed); }
+            auto absorbed = w_.embed_query(query).permute({0,2,1,3}).to(tb::kFloat32);
+            Tensor attended;
+            const double scale = 1.0 / std::sqrt(double(c_.nope));
+            if (latent.size(1) <= c_.budget) {
+                attended = mfq_flash_next::glm5_dense_mla_attention(absorbed, latent, offset, scale);
+            } else {
+                auto pooled = mfq_flash_next::glm5_kpool_states(packed.narrow(-1,0,c_.index_width),
+                    packed.narrow(-1,c_.index_width,c_.index_width), w_.index_position, c_.pool);
+                auto iq = w_.index_query(qr).reshape({b,t,c_.index_heads,c_.index_width});
+                auto scores = mfq_flash_next::glm5_kpool_scores(iq, pooled, w_.index_score(hidden));
+                auto selected = select_pooled_blocks(scores, offset, latent.size(1), c_.pool, c_.budget, c_.tail);
+                attended = mfq_flash_next::glm5_sparse_mla_attention(absorbed, latent, selected, scale);
+            }
+            auto value = w_.unembed_output(attended.to(tb::kFloat16));
+            return w_.output(value.reshape({b,t,c_.heads*c_.value_width}));
+        } catch (...) {
+            if (use_cache) { latent_.truncate(offset); index_.truncate(offset); }
+            throw;
+        }
+    }
+private:
+    MlaWeights w_;
+    MlaConfig c_;
+    SequenceCache latent_, index_;
+};
 } // namespace mfq::flash_next
