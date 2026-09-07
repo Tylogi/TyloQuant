@@ -2,12 +2,14 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <random>
 
 using mfq_tensor_backend::Tensor;
 Tensor nint4_gs24_small_m_f32_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor);
+Tensor nint6_gs24_small_m_f32_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor);
 Tensor nint_gemv_packed_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
     int64_t, Tensor, Tensor, Tensor);
 Tensor nint_gemv_packed_int6_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
@@ -71,7 +73,9 @@ int main(int argc, char** argv) {
         auto xm = empty({6, groups}, options.dtype(kInt32));
         const uint64_t weight_bytes = q.nbytes() + s.nbytes() + sm.nbytes() + ns.nbytes() + nm.nbytes();
         std::cout << std::setprecision(10) << std::unitbuf;
-        const char* entry = bits == 4 ? (boundary == "f32" ? "small_m_f32_ws" : "packed_ws")
+        const char* fuse6_env = std::getenv("MFQ_NINT6_SMALL_M_F32_FUSE");
+        const bool fuse6 = bits == 6 && boundary == "f32" && fuse6_env != nullptr && fuse6_env[0] == '1';
+        const char* entry = fuse6 ? "small_m_f32_ws" : bits == 4 ? (boundary == "f32" ? "small_m_f32_ws" : "packed_ws")
             : bits == 6 ? "packed_int6_ws" : bits == 8 ? "packed_u8_ws" : "packed_bits_ws";
         std::cout << "profile=NINT" << bits << " gs=" << gs << " scale_bits=" << scale_bits
             << " N=" << n << " K=" << k << " input_output=" << boundary
@@ -81,6 +85,8 @@ int main(int argc, char** argv) {
         for (int m = 2; m <= 6; ++m) {
             auto input = x.narrow(0, 0, m);
             auto invoke = [&]() {
+                if (fuse6)
+                    return nint6_gs24_small_m_f32_ws_cuda(q, s, sm, ns, nm, input, qx, xs, xm);
                 if (bits == 4 && boundary == "f32")
                     return nint4_gs24_small_m_f32_ws_cuda(q, s, sm, ns, nm, input, qx, xs, xm);
                 auto half_input = input.to(kFloat16);

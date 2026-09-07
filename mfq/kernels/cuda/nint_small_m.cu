@@ -204,16 +204,16 @@ __global__ void __launch_bounds__(128) nint_gs24_small_m_reuse_kernel(
     }
 }
 
-template <bool FLOAT_OUTPUT>
+template <bool FLOAT_OUTPUT, int BITS = 4>
 static void launch_small_m(
     Nint4Gs24Projection weight, const int8_t* qx, const float* xs,
     int m, int ng, int kpad, cudaStream_t stream)
 {
 #define MFQ_NINT4_SMALL_M_CASE(M) \
     case M: \
-        if (weight.xsum != nullptr) nint_gs24_small_m_reuse_kernel<M, FLOAT_OUTPUT, true> \
+        if (weight.xsum != nullptr) nint_gs24_small_m_reuse_kernel<M, FLOAT_OUTPUT, true, BITS> \
             <<<weight.n, 128, 0, stream>>>(weight, qx, xs, ng, kpad); \
-        else nint_gs24_small_m_reuse_kernel<M, FLOAT_OUTPUT> \
+        else nint_gs24_small_m_reuse_kernel<M, FLOAT_OUTPUT, false, BITS> \
             <<<weight.n, 128, 0, stream>>>(weight, qx, xs, ng, kpad); \
         break
     switch (m) {
@@ -272,47 +272,64 @@ __global__ void small_m_quantize_f32_half_rn_kernel(
     if (lane < 24) qx[(size_t)m * kpad + g * 24 + lane] = (int8_t)code;
 }
 
-mfq_tensor_backend::Tensor nint4_gs24_small_m_f32_ws_cuda(
+template <int BITS>
+static mfq_tensor_backend::Tensor nint_gs24_small_m_f32_ws_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor s, mfq_tensor_backend::Tensor sm,
     mfq_tensor_backend::Tensor ns, mfq_tensor_backend::Tensor nm, mfq_tensor_backend::Tensor x,
     mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xs, mfq_tensor_backend::Tensor xm)
 {
     using namespace mfq_tensor_backend;
     MFQ_RUNTIME_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == kFloat32 && x.dim() == 2,
-        "NINT4 small-M F32 boundary requires contiguous CUDA F32 [M,K]");
+        "NINT GS24 small-M F32 boundary requires contiguous CUDA F32 [M,K]");
     MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous() && q.scalar_type() == kUInt8 &&
-        q.dim() == 3 && q.size(2) == 12 && q.size(0) > 0 && q.size(1) > 0,
-        "NINT4 small-M F32 weights require packed GS24 [N,ng,12]");
+        q.dim() == 3 && q.size(2) == 24 * BITS / 8 && q.size(0) > 0 && q.size(1) > 0,
+        "NINT GS24 small-M F32 weights require canonical packed GS24 groups");
     const int64_t rows = x.size(0), columns = q.size(0), groups = q.size(1);
     MFQ_RUNTIME_CHECK(rows >= 2 && rows <= 6 && x.size(1) > 0 &&
         groups <= INT_MAX / 24 && columns <= INT_MAX && x.size(1) <= groups * 24,
-        "NINT4 small-M F32 geometry exceeds supported bounds");
+        "NINT GS24 small-M F32 geometry exceeds supported bounds");
     for (const auto* value : {&q, &s, &sm, &ns, &nm, &qx, &xs, &xm}) {
         MFQ_RUNTIME_CHECK(value->is_cuda() && value->device() == x.device() && value->is_contiguous(),
-            "NINT4 small-M F32 tensors must be contiguous on one CUDA device");
+            "NINT GS24 small-M F32 tensors must be contiguous on one CUDA device");
     }
     for (const auto* value : {&s, &sm}) MFQ_RUNTIME_CHECK(value->scalar_type() == kUInt8 &&
         value->dim() == 2 && value->size(0) == columns && value->size(1) == groups,
-        "NINT4 small-M F32 submetadata shape or dtype mismatch");
+        "NINT GS24 small-M F32 submetadata shape or dtype mismatch");
     for (const auto* value : {&ns, &nm}) MFQ_RUNTIME_CHECK(value->scalar_type() == kFloat32 &&
         value->dim() == 1 && value->size(0) == columns,
-        "NINT4 small-M F32 neuron metadata shape or dtype mismatch");
+        "NINT GS24 small-M F32 neuron metadata shape or dtype mismatch");
     MFQ_RUNTIME_CHECK(qx.scalar_type() == kInt8 && qx.dim() == 2 &&
         qx.size(0) >= rows && qx.size(1) == groups * 24 &&
         xs.scalar_type() == kFloat32 && xs.dim() == 2 && xs.size(0) >= rows && xs.size(1) == groups &&
         xm.scalar_type() == kInt32 && xm.dim() == 2 && xm.size(0) >= rows && xm.size(1) == groups,
-        "NINT4 small-M F32 workspace shape or dtype mismatch");
+        "NINT GS24 small-M F32 workspace shape or dtype mismatch");
     MfqCudaGuard guard(x.device());
     auto output = mfq_tensor_backend::empty({rows, columns}, x.options());
     auto stream = mfq_current_cuda_stream();
     const char* sum_env = std::getenv("MFQ_NINT4_SMALL_M_XSUM");
-    auto* sums = sum_env != nullptr && sum_env[0] == '1' ? xm.data_ptr<int32_t>() : nullptr;
+    auto* sums = BITS == 4 && sum_env != nullptr && sum_env[0] == '1' ? xm.data_ptr<int32_t>() : nullptr;
     small_m_quantize_f32_half_rn_kernel<<<dim3(rows, groups), 32, 0, stream>>>(
         x.data_ptr<float>(), qx.data_ptr<int8_t>(), xs.data_ptr<float>(), sums, (int)x.size(1), (int)(groups * 24));
     Nint4Gs24Projection weight{q.data_ptr<uint8_t>(), s.data_ptr<uint8_t>(), sm.data_ptr<uint8_t>(),
         ns.data_ptr<float>(), nm.data_ptr<float>(), output.data_ptr<float>(), (int)columns, sums};
-    launch_small_m<true>(weight, qx.data_ptr<int8_t>(), xs.data_ptr<float>(),
+    launch_small_m<true, BITS>(weight, qx.data_ptr<int8_t>(), xs.data_ptr<float>(),
         (int)rows, (int)groups, (int)(groups * 24), stream);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
+}
+
+mfq_tensor_backend::Tensor nint4_gs24_small_m_f32_ws_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor s, mfq_tensor_backend::Tensor sm,
+    mfq_tensor_backend::Tensor ns, mfq_tensor_backend::Tensor nm, mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xs, mfq_tensor_backend::Tensor xm)
+{
+    return nint_gs24_small_m_f32_ws_cuda<4>(q, s, sm, ns, nm, x, qx, xs, xm);
+}
+
+mfq_tensor_backend::Tensor nint6_gs24_small_m_f32_ws_cuda(
+    mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor s, mfq_tensor_backend::Tensor sm,
+    mfq_tensor_backend::Tensor ns, mfq_tensor_backend::Tensor nm, mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xs, mfq_tensor_backend::Tensor xm)
+{
+    return nint_gs24_small_m_f32_ws_cuda<6>(q, s, sm, ns, nm, x, qx, xs, xm);
 }

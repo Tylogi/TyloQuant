@@ -8,6 +8,7 @@
 
 using mfq_tensor_backend::Tensor;
 Tensor nint4_gs24_small_m_f32_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor);
+Tensor nint6_gs24_small_m_f32_ws_cuda(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor);
 
 #define DECLARE_GLU(name) \
 Tensor name(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, int64_t, Tensor, Tensor, Tensor)
@@ -190,11 +191,12 @@ void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs,
             ++graphs;
         }
     }
-    if (bits == 4) {
+    if (bits == 4 || bits == 6) {
         auto float_input = x.to(kFloat32) + .000123;
         auto reference = invoke(float_input.to(kFloat16), 2).to(kFloat32);
         auto invoke_float = [&](const Tensor& input) {
-            return nint4_gs24_small_m_f32_ws_cuda(q, s, sm, ns, nm, input, qx, xs, xm);
+            auto function = bits == 4 ? nint4_gs24_small_m_f32_ws_cuda : nint6_gs24_small_m_f32_ws_cuda;
+            return function(q, s, sm, ns, nm, input, qx, xs, xm);
         };
         for (int m = 2; m <= batch; ++m) {
             exact(invoke_float(float_input.narrow(0, 0, m)), reference.narrow(0, 0, m));
@@ -232,7 +234,7 @@ int main() {
         int cases = 0, graphs = 0, f32_cases = 0;
         for (const auto profile : std::vector<std::vector<int>>{{2,16,5},{3,24,5},{4,24,6},{5,28,7},{6,24,7},{8,48,7}})
             for (int width : {47, 257, 4096}) check(profile[0], profile[1], profile[2], width, cases, graphs, f32_cases);
-        require(cases == 378 && graphs == 22 && f32_cases == 15, "incomplete small-M coverage");
+        require(cases == 378 && graphs == 23 && f32_cases == 30, "incomplete small-M coverage");
         std::cout << "PASS small_m_cases=" << cases << " f32_boundary_cases=" << f32_cases
             << " graphs=" << graphs << '\n';
     } catch (const std::exception& error) {

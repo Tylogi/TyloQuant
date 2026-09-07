@@ -112,15 +112,15 @@ def test_nint_small_m_bridge(profile, width, monkeypatch):
                 graph.replay()
                 _exact(output, reference)
 
-        if bits == 4:
+        if bits in (4, 6):
             float_input = x.float() + .000123
             reference = invoke(float_input.half(), 2).float()
+            float_function = getattr(module, f"nint{bits}_gs24_small_m_f32_ws_cuda")
 
             def invoke_float(value):
-                return module.nint4_gs24_small_m_f32_ws_cuda(
-                    *tensors, value, qx, xs, xm)
+                return float_function(*tensors, value, qx, xs, xm)
 
-            for sum_flag in ("0", "1"):
+            for sum_flag in (("0", "1") if bits == 4 else ("0",)):
                 monkeypatch.setenv("MFQ_NINT4_SMALL_M_XSUM", sum_flag)
                 for m in range(2, 7):
                     _exact(invoke_float(float_input[:m]), reference[:m])
@@ -128,8 +128,7 @@ def test_nint_small_m_bridge(profile, width, monkeypatch):
             with pytest.raises(RuntimeError):
                 invoke_float(float_input[:1])
             with pytest.raises(RuntimeError):
-                module.nint4_gs24_small_m_f32_ws_cuda(
-                    *tensors, float_input, qx, xs, xm.float())
+                float_function(*tensors, float_input, qx, xs, xm.float())
             if width == 257:
                 for _ in range(3):
                     invoke_float(float_input)
