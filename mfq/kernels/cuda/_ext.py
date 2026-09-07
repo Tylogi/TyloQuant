@@ -29,6 +29,7 @@ _SOURCES = [
     os.path.join(_DIR, "kv_cache.cu"),
     os.path.join(_DIR, "activation.cu"),
     os.path.join(_DIR, "embedding.cu"),
+    os.path.join(_DIR, "flash_next.cu"),
     os.path.join(_DIR, "sampling.cu"),
     os.path.join(_DIR, "ssm_conv.cu"),
     os.path.join(_DIR, "moe.cu"),

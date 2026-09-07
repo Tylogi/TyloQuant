@@ -49,6 +49,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/deepseek_v4_attention.cu
     ${MFQ_CUDA_KERNEL_ROOT}/deepseek_v4_hc.cu
     ${MFQ_CUDA_KERNEL_ROOT}/embedding.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/flash_next.cu
     ${MFQ_CUDA_KERNEL_ROOT}/gated_delta_net.cu
     ${MFQ_CUDA_KERNEL_ROOT}/glm_dsa.cu
     ${MFQ_CUDA_KERNEL_ROOT}/kv_cache.cu
@@ -143,6 +144,11 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-nint-small-m-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     mfq_add_cuda_test(mfq-native-tensor-cuda-test
         ${MFQ_CUDA_ROOT}/tests/mfq_native_tensor_cuda_test.cu)
+    mfq_add_cuda_test(mfq-flash-next-test
+        ${MFQ_CUDA_ROOT}/tests/mfq_flash_next_test.cu
+        mfq-cuda-native-kernels mfq-json)
+    target_compile_definitions(mfq-flash-next-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
+    target_include_directories(mfq-flash-next-test PRIVATE ${MFQ_REPOSITORY_ROOT})
 endif()
 
 set(MFQ_NCCL_ROOT "" CACHE PATH

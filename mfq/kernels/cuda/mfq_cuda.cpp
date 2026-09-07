@@ -8,6 +8,7 @@
 #include <vector>
 #include <optional>
 #include "mxfp4_sq.h"
+#include "flash_next.h"
 
 std::vector<torch::Tensor> nint8_one_quantize_reconstruct_cuda(
     torch::Tensor x);
@@ -558,6 +559,38 @@ torch::Tensor nvq_embedding_lookup_cuda(
     int64_t neuron_len, int64_t gs, int64_t sub_bits, int64_t format, int64_t sign_mode);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    namespace fn = mfq_flash_next;
+    using pybind11::arg;
+    m.def("qwen4_grouped_rms_norm", &fn::qwen4_grouped_rms_norm,
+        arg("value"), arg("weight"), arg("group_size"), arg("eps") = 1e-6);
+    m.def("qwen4_gated_residual_pre", &fn::qwen4_gated_residual_pre,
+        arg("hyper_input"), arg("norm_weight"), arg("down_weight"), arg("up_weight"),
+        arg("inject_weight"), arg("hidden_size"), arg("hc_count") = 4, arg("eps") = 1e-6);
+    m.def("qwen4_gated_residual_post", &fn::qwen4_gated_residual_post,
+        arg("branch"), arg("residual"), arg("injection"), arg("hc_count") = 4);
+    m.def("glm5_mhc_pre", &fn::glm5_mhc_pre,
+        arg("hidden_streams"), arg("function_weight"), arg("base"), arg("scale"),
+        arg("sinkhorn_iterations") = 20, arg("hc_eps") = 1e-6, arg("rms_eps") = 1e-5);
+    m.def("glm5_mhc_post", &fn::glm5_mhc_post,
+        arg("branch"), arg("residual"), arg("post"), arg("combination"));
+    m.def("glm5_kda_forget_gate", &fn::glm5_kda_forget_gate,
+        arg("hidden_states"), arg("f_a_weight"), arg("f_b_weight"), arg("dt_bias"),
+        arg("a_log"), arg("num_heads"), arg("head_dim"), arg("lower_bound") = -5.0);
+    m.def("qsa_block_scores", &fn::qsa_block_scores, arg("query"), arg("pooled_keys"));
+    m.def("glm5_kpool_scores", &fn::glm5_kpool_scores,
+        arg("query"), arg("pooled_keys"), arg("head_weights"));
+    m.def("glm5_kpool_states", &fn::glm5_kpool_states,
+        arg("keys"), arg("gate_scores"), arg("ape"), arg("pool_size") = 4);
+    m.def("qwen4_ple_dilated_conv_silu", &fn::qwen4_ple_dilated_conv_silu,
+        arg("value"), arg("weight"), arg("state"), arg("dilation"));
+    m.def("qwen4_dense_gqa_attention", &fn::qwen4_dense_gqa_attention,
+        arg("query"), arg("key"), arg("value"), arg("query_offset"));
+    m.def("qwen4_sparse_gqa_attention", &fn::qwen4_sparse_gqa_attention,
+        arg("query"), arg("key"), arg("value"), arg("indices"));
+    m.def("glm5_dense_mla_attention", &fn::glm5_dense_mla_attention,
+        arg("query"), arg("cache"), arg("query_offset"), arg("scale") = pybind11::none());
+    m.def("glm5_sparse_mla_attention", &fn::glm5_sparse_mla_attention,
+        arg("query"), arg("cache"), arg("indices"), arg("scale") = pybind11::none());
     m.def("nint8_one_quantize_reconstruct_cuda",
           &nint8_one_quantize_reconstruct_cuda,
           "Q8_1-compatible activation quantize/reconstruct (CUDA)");
