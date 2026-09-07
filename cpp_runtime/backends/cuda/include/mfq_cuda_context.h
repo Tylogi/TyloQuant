@@ -131,6 +131,8 @@ public:
     Graph& operator=(const Graph&) = delete;
 
     void prepare_memory();
+    void prepare_memory(
+        const std::vector<StreamHandle>& participant_streams);
     void capture_begin();
     void capture_end();
     void replay();
@@ -140,6 +142,8 @@ private:
     int device_ = 0;
     StreamHandle stream_;
     std::shared_ptr<Context> context_;
+    std::vector<StreamHandle> pool_streams_;
+    std::vector<std::shared_ptr<Context>> pool_contexts_;
     cudaGraph_t graph_ = nullptr;
     cudaGraphExec_t executable_ = nullptr;
 };

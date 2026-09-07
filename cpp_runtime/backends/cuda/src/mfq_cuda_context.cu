@@ -238,6 +238,8 @@ Graph::Graph(Graph&& other) noexcept
     : device_(other.device_),
       stream_(std::move(other.stream_)),
       context_(std::move(other.context_)),
+      pool_streams_(std::move(other.pool_streams_)),
+      pool_contexts_(std::move(other.pool_contexts_)),
       graph_(std::exchange(other.graph_, nullptr)),
       executable_(std::exchange(other.executable_, nullptr)) {}
 
@@ -247,6 +249,8 @@ Graph& Graph::operator=(Graph&& other) noexcept {
         device_ = other.device_;
         stream_ = std::move(other.stream_);
         context_ = std::move(other.context_);
+        pool_streams_ = std::move(other.pool_streams_);
+        pool_contexts_ = std::move(other.pool_contexts_);
         graph_ = std::exchange(other.graph_, nullptr);
         executable_ = std::exchange(other.executable_, nullptr);
     }
@@ -254,11 +258,43 @@ Graph& Graph::operator=(Graph&& other) noexcept {
 }
 
 void Graph::prepare_memory() {
+    prepare_memory({});
+}
+
+void Graph::prepare_memory(
+        const std::vector<StreamHandle>& participant_streams) {
     reset();
     stream_ = current_stream();
     device_ = stream_.device_index();
     context_ = default_context(device_);
-    context_->begin_graph_pool(stream_.stream());
+    const auto add_pool = [&](const StreamHandle& candidate) {
+        if (!candidate) return;
+        const auto duplicate = std::find_if(
+            pool_streams_.begin(), pool_streams_.end(),
+            [&](const StreamHandle& existing) {
+                return existing.device_index() == candidate.device_index() &&
+                    existing.stream() == candidate.stream();
+            });
+        if (duplicate != pool_streams_.end()) return;
+        auto participant_context =
+            default_context(candidate.device_index());
+        if (!participant_context->supports_async_allocations()) {
+            throw Error(
+                "CUDA graph participant does not support async allocations");
+        }
+        participant_context->begin_graph_pool(candidate.stream());
+        pool_streams_.push_back(candidate);
+        pool_contexts_.push_back(std::move(participant_context));
+    };
+    try {
+        add_pool(stream_);
+        for (const auto& participant : participant_streams) {
+            add_pool(participant);
+        }
+    } catch (...) {
+        reset();
+        throw;
+    }
 }
 
 void Graph::capture_begin() {
@@ -272,9 +308,20 @@ void Graph::capture_begin() {
             "CUDA graph capture stream differs from its prepared memory stream");
     }
     DeviceGuard guard(device_);
-    context_->begin_graph_capture(stream_.stream());
-    MFQ_NATIVE_CUDA_CHECK(cudaStreamBeginCapture(
-        stream_.stream(), cudaStreamCaptureModeGlobal));
+    try {
+        for (std::size_t index = 0; index < pool_streams_.size(); ++index) {
+            pool_contexts_[index]->begin_graph_capture(
+                pool_streams_[index].stream());
+        }
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamBeginCapture(
+            stream_.stream(), cudaStreamCaptureModeGlobal));
+    } catch (...) {
+        for (std::size_t index = 0; index < pool_streams_.size(); ++index) {
+            pool_contexts_[index]->end_graph_capture(
+                pool_streams_[index].stream());
+        }
+        throw;
+    }
 }
 
 void Graph::capture_end() {
@@ -284,7 +331,10 @@ void Graph::capture_end() {
     DeviceGuard guard(device_);
     const auto capture_status =
         cudaStreamEndCapture(stream_.stream(), &graph_);
-    context_->end_graph_capture(stream_.stream());
+    for (std::size_t index = 0; index < pool_streams_.size(); ++index) {
+        pool_contexts_[index]->end_graph_capture(
+            pool_streams_[index].stream());
+    }
     MFQ_NATIVE_CUDA_CHECK(capture_status);
     if (const char* dot_path = std::getenv("MFQ_NATIVE_CUDA_GRAPH_DOT");
         dot_path != nullptr && dot_path[0] != '\0') {
@@ -377,11 +427,15 @@ void Graph::reset() noexcept {
             (void)cudaGraphDestroy(graph_);
             graph_ = nullptr;
         }
-        if (context_ && stream_) {
-            context_->end_graph_capture(stream_.stream());
-            context_->end_graph_pool(stream_.stream());
+        for (std::size_t index = 0; index < pool_streams_.size(); ++index) {
+            pool_contexts_[index]->end_graph_capture(
+                pool_streams_[index].stream());
+            pool_contexts_[index]->end_graph_pool(
+                pool_streams_[index].stream());
         }
     });
+    pool_contexts_.clear();
+    pool_streams_.clear();
     context_.reset();
     stream_ = {};
 }

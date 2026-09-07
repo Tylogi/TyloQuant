@@ -104,6 +104,12 @@ inline void mfq_prepare_cuda_graph_memory(MfqCudaGraph& graph) {
     graph.prepare_memory();
 }
 
+inline void mfq_prepare_cuda_graph_memory(
+        MfqCudaGraph& graph,
+        const std::vector<MfqCudaStream>& participant_streams) {
+    graph.prepare_memory(participant_streams);
+}
+
 inline void mfq_debug_dump_cuda_graph(MfqCudaGraph&) {}
 
 inline MfqCudaStream mfq_get_current_cuda_stream(int device = -1) {
@@ -264,6 +270,12 @@ inline void mfq_prepare_cuda_graph_memory(MfqCudaGraph& graph) {
     if (debug_path != nullptr && debug_path[0] != '\0') {
         graph.enable_debug_mode();
     }
+}
+
+inline void mfq_prepare_cuda_graph_memory(
+        MfqCudaGraph& graph,
+        const std::vector<MfqCudaStream>&) {
+    mfq_prepare_cuda_graph_memory(graph);
 }
 
 inline void mfq_debug_dump_cuda_graph(MfqCudaGraph& graph) {

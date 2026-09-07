@@ -54,10 +54,26 @@ def test_tensor_parallel_rejects_silent_moe_cache_bypass():
     assert '"--tensor-parallel"' in SOURCE
 
 
-def test_tensor_parallel_disables_single_device_cuda_graphs():
-    assert SOURCE.count("!g_tensor_parallel.enabled()") >= 2
+def test_tensor_parallel_graph_capture_registers_all_participant_streams():
+    assert 'std::getenv("MFQ_TP_CUDA_GRAPH")' in SOURCE
+    assert "tensor_parallel_cuda_graph_enabled()" in SOURCE
+    assert "environment == nullptr || environment[0] != '0'" in SOURCE
+    assert "graph_participant_streams" in SOURCE
+    assert "g_tensor_parallel_collectives.streams.begin()" in SOURCE
+    assert "graph_cache.compute_streams" in SOURCE
+    assert "participant_streams" in SOURCE
     assert "const bool graph_enabled" in SOURCE
     assert "bool use_cuda_graph" in SOURCE
+
+
+def test_tensor_parallel_graph_primes_and_captures_nccl_peer_transfers():
+    assert "p2p_warmup_buffers" in SOURCE
+    assert "ncclSend(" in SOURCE
+    assert "ncclRecv(" in SOURCE
+    assert "runtime.streams[destination_rank].stream()" in SOURCE
+    assert "runtime.ready[source_rank]" in SOURCE
+    assert "cudaStreamSynchronize(\n                participant.stream())" in SOURCE
+    assert "for (int pass = 0; pass < 2; ++pass)" in SOURCE
 
 
 def test_qwen35_mtp_accepts_dense_tensor_parallel_placement():

@@ -1268,12 +1268,57 @@ struct TensorParallelCollectiveRuntime {
             communicators.data(),
             static_cast<int>(devices.size()),
             devices.data()));
+        // NCCL initializes peer transports lazily.  That initialization can
+        // allocate shared-memory control state, which CUDA forbids once graph
+        // capture has started.  Exercise both directions between the primary
+        // rank and every peer while ordinary stream execution is still active.
+        std::vector<mfq_tensor_backend::Tensor> p2p_warmup_buffers;
+        p2p_warmup_buffers.reserve(devices.size());
+        for (const int device : devices) {
+            MfqCudaGuard guard(device);
+            p2p_warmup_buffers.push_back(mfq_tensor_backend::empty(
+                {1}, mfq_tensor_backend::TensorOptions()
+                    .device(mfq_tensor_backend::Device(
+                        mfq_tensor_backend::kCUDA, device))
+                    .dtype(mfq_tensor_backend::kUInt8)));
+        }
+        for (size_t peer = 1; peer < devices.size(); ++peer) {
+            MFQ_NCCL_CHECK(ncclGroupStart());
+            MFQ_NCCL_CHECK(ncclSend(
+                p2p_warmup_buffers[0].data_ptr(), 1, ncclUint8,
+                static_cast<int>(peer), communicators[0],
+                streams[0].stream()));
+            MFQ_NCCL_CHECK(ncclRecv(
+                p2p_warmup_buffers[peer].data_ptr(), 1, ncclUint8,
+                0, communicators[peer], streams[peer].stream()));
+            MFQ_NCCL_CHECK(ncclSend(
+                p2p_warmup_buffers[peer].data_ptr(), 1, ncclUint8,
+                0, communicators[peer], streams[peer].stream()));
+            MFQ_NCCL_CHECK(ncclRecv(
+                p2p_warmup_buffers[0].data_ptr(), 1, ncclUint8,
+                static_cast<int>(peer), communicators[0],
+                streams[0].stream()));
+            MFQ_NCCL_CHECK(ncclGroupEnd());
+        }
+        for (size_t index = 0; index < devices.size(); ++index) {
+            MfqCudaGuard guard(devices[index]);
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(streams[index].stream()));
+        }
         collectives_enabled = true;
 #endif
     }
 };
 
 static TensorParallelCollectiveRuntime g_tensor_parallel_collectives;
+
+static bool tensor_parallel_cuda_graph_enabled() {
+    if (!g_tensor_parallel.enabled()) {
+        return true;
+    }
+    const char * environment = std::getenv("MFQ_TP_CUDA_GRAPH");
+    return g_tensor_parallel_collectives.collectives_enabled &&
+           (environment == nullptr || environment[0] != '0');
+}
 
 struct LayerPlacementConfig {
     std::vector<int> devices;
@@ -11954,6 +11999,101 @@ static mfq_tensor_backend::Tensor tensor_to_cuda_device(
     if (value.is_cuda() && value.get_device() == device) {
         return value.contiguous();
     }
+#if defined(MFQ_NATIVE_CUDA_RUNTIME) && defined(MFQ_HAVE_NCCL)
+    if (value.is_cuda() &&
+            g_tensor_parallel_collectives.collectives_enabled) {
+        const int source_device = value.get_device();
+        const auto source_rank_it = std::find(
+            g_tensor_parallel_collectives.devices.begin(),
+            g_tensor_parallel_collectives.devices.end(),
+            source_device);
+        const auto destination_rank_it = std::find(
+            g_tensor_parallel_collectives.devices.begin(),
+            g_tensor_parallel_collectives.devices.end(),
+            device);
+        if (source_rank_it !=
+                g_tensor_parallel_collectives.devices.end() &&
+                destination_rank_it !=
+                g_tensor_parallel_collectives.devices.end()) {
+            const auto source_stream =
+                mfq_get_current_cuda_stream(source_device);
+            cudaStreamCaptureStatus capture_status =
+                cudaStreamCaptureStatusNone;
+            {
+                MfqCudaGuard source_guard(source_device);
+                MFQ_CUDA_CHECK(cudaStreamIsCapturing(
+                    source_stream.stream(), &capture_status));
+            }
+            if (capture_status != cudaStreamCaptureStatusNone) {
+                auto source = value.contiguous();
+                mfq_tensor_backend::Tensor destination;
+                {
+                    MfqCudaGuard destination_guard(device);
+                    destination = mfq_tensor_backend::empty(
+                        source.sizes(),
+                        source.options().device(
+                            mfq_tensor_backend::Device(
+                                mfq_tensor_backend::kCUDA, device)));
+                }
+                auto& runtime = g_tensor_parallel_collectives;
+                const auto source_rank = static_cast<size_t>(
+                    source_rank_it - runtime.devices.begin());
+                const auto destination_rank = static_cast<size_t>(
+                    destination_rank_it - runtime.devices.begin());
+                {
+                    MfqCudaGuard source_guard(source_device);
+                    MFQ_CUDA_CHECK(cudaEventRecord(
+                        runtime.ready[source_rank],
+                        source_stream.stream()));
+                    MFQ_CUDA_CHECK(cudaStreamWaitEvent(
+                        runtime.streams[source_rank].stream(),
+                        runtime.ready[source_rank], 0));
+                }
+                {
+                    MfqCudaGuard destination_guard(device);
+                    // Cross-device event waits make the receiving NCCL stream
+                    // participate in the same capture before ncclRecv runs.
+                    MFQ_CUDA_CHECK(cudaStreamWaitEvent(
+                        runtime.streams[destination_rank].stream(),
+                        runtime.ready[source_rank], 0));
+                }
+                MFQ_NCCL_CHECK(ncclGroupStart());
+                MFQ_NCCL_CHECK(ncclSend(
+                    source.data_ptr(), source.nbytes(), ncclUint8,
+                    static_cast<int>(destination_rank),
+                    runtime.communicators[source_rank],
+                    runtime.streams[source_rank].stream()));
+                MFQ_NCCL_CHECK(ncclRecv(
+                    destination.data_ptr(), destination.nbytes(), ncclUint8,
+                    static_cast<int>(source_rank),
+                    runtime.communicators[destination_rank],
+                    runtime.streams[destination_rank].stream()));
+                MFQ_NCCL_CHECK(ncclGroupEnd());
+                {
+                    MfqCudaGuard source_guard(source_device);
+                    MFQ_CUDA_CHECK(cudaEventRecord(
+                        runtime.completed[source_rank],
+                        runtime.streams[source_rank].stream()));
+                    MFQ_CUDA_CHECK(cudaStreamWaitEvent(
+                        source_stream.stream(),
+                        runtime.completed[source_rank], 0));
+                }
+                {
+                    MfqCudaGuard destination_guard(device);
+                    const auto destination_stream =
+                        mfq_get_current_cuda_stream(device);
+                    MFQ_CUDA_CHECK(cudaEventRecord(
+                        runtime.completed[destination_rank],
+                        runtime.streams[destination_rank].stream()));
+                    MFQ_CUDA_CHECK(cudaStreamWaitEvent(
+                        destination_stream.stream(),
+                        runtime.completed[destination_rank], 0));
+                }
+                return destination;
+            }
+        }
+    }
+#endif
     MfqCudaGuard guard(device);
     return value.to(
         value.options().device(mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA, device)),
@@ -20451,8 +20591,47 @@ static bool sampling_has_penalties(const MfqSamplingParams & sampling) {
            sampling.repetition_penalty != 1.0;
 }
 
+static std::vector<MfqCudaStream> make_cuda_graph_compute_streams(
+        const MfqCudaStream& primary_stream) {
+    if (!g_tensor_parallel.enabled()) {
+        return {primary_stream};
+    }
+    std::vector<MfqCudaStream> streams;
+    streams.reserve(g_tensor_parallel.devices.size());
+    for (const int device : g_tensor_parallel.devices) {
+        streams.push_back(
+            device == primary_stream.device_index()
+                ? primary_stream
+                : mfq_get_stream_from_pool(false, device));
+    }
+    return streams;
+}
+
+static std::vector<MfqCudaStream> cuda_graph_participant_streams(
+        const std::vector<MfqCudaStream>& compute_streams) {
+    auto participants = compute_streams;
+    participants.insert(
+        participants.end(),
+        g_tensor_parallel_collectives.streams.begin(),
+        g_tensor_parallel_collectives.streams.end());
+    return participants;
+}
+
+static std::vector<std::unique_ptr<MfqCudaStreamGuard>>
+activate_cuda_graph_compute_streams(
+        const std::vector<MfqCudaStream>& compute_streams) {
+    std::vector<std::unique_ptr<MfqCudaStreamGuard>> guards;
+    guards.reserve(compute_streams.size());
+    for (const auto& stream : compute_streams) {
+        guards.push_back(
+            std::make_unique<MfqCudaStreamGuard>(stream));
+    }
+    return guards;
+}
+
 struct ServerDecodeGraphCache {
     decltype(mfq_get_stream_from_pool(false)) stream;
+    std::vector<MfqCudaStream> compute_streams;
     std::unique_ptr<MfqCudaGraph> graph;
     mfq_tensor_backend::Tensor static_input;
     mfq_tensor_backend::Tensor static_pos;
@@ -20478,6 +20657,16 @@ struct ServerDecodeGraphCache {
     explicit ServerDecodeGraphCache(int64_t context_capacity)
         : stream(mfq_get_stream_from_pool(false)),
           generated_capacity(std::max<int64_t>(context_capacity, 2048)) {}
+
+    void ensure_compute_streams() {
+        if (!compute_streams.empty()) return;
+        compute_streams =
+            make_cuda_graph_compute_streams(stream);
+    }
+
+    std::vector<MfqCudaStream> graph_participant_streams() const {
+        return cuda_graph_participant_streams(compute_streams);
+    }
 
     bool matches(int64_t candidate_len, const MfqSamplingParams & sampling,
                  bool candidate_greedy) const {
@@ -20529,7 +20718,8 @@ struct ServerDecodeGraphCache {
 };
 
 static void prepare_decode_graph_memory(Model& model, MfqCudaGraph& graph,
-        const std::function<void()>& warmup) {
+        const std::function<void()>& warmup,
+        const std::vector<MfqCudaStream>& participant_streams = {}) {
     using Tensor = mfq_tensor_backend::Tensor;
     struct SavedRecurrentState {
         LinearBlock* block;
@@ -20558,17 +20748,31 @@ static void prepare_decode_graph_memory(Model& model, MfqCudaGraph& graph,
             state.block->gdn_state.copy_(state.gdn);
         }
         MFQ_RUNTIME_CHECK(model.cache_pos == saved_position, "static decode warmup changed cache position");
-        MFQ_CUDA_CHECK(cudaStreamSynchronize(mfq_get_current_cuda_stream()));
+        if (participant_streams.empty()) {
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(
+                mfq_get_current_cuda_stream().stream()));
+            return;
+        }
+        for (const auto& participant : participant_streams) {
+            MfqCudaGuard guard(participant.device_index());
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(
+                participant.stream()));
+        }
     };
-    mfq_prepare_cuda_graph_memory(graph);
+    mfq_prepare_cuda_graph_memory(graph, participant_streams);
     if (!saved.empty() || model.c.is_gemma4() || model.c.is_glm_dsa() || model.c.is_minicpmo45()) {
-        try {
-            // The replay overwrites this same, still-unconfirmed KV position.
-            warmup();
-            restore();
-        } catch (...) {
-            restore();
-            throw;
+        // The first pass may initialize persistent CUDA/NCCL workspace state.
+        // A second pass then records the complete set of reusable temporaries
+        // needed by capture after those persistent allocations exist.
+        for (int pass = 0; pass < 2; ++pass) {
+            try {
+                // Replay overwrites this same, still-unconfirmed KV position.
+                warmup();
+                restore();
+            } catch (...) {
+                restore();
+                throw;
+            }
         }
     }
 }
@@ -21796,7 +22000,7 @@ static int32_t generate_server_tokens(
         g_dsv4_cpu_offload_layers.empty() &&
         g_dense_cpu_layer_count == 0 &&
         !g_moe_expert_cache &&
-        !g_tensor_parallel.enabled();
+        tensor_parallel_cuda_graph_enabled();
     const char * graph_min_env = std::getenv("MFQ_SERVER_CUDA_GRAPH_MIN_TOKENS");
     const int32_t graph_min_tokens = graph_min_env != nullptr
         ? std::max<int32_t>(2, std::atoi(graph_min_env))
@@ -21814,7 +22018,12 @@ static int32_t generate_server_tokens(
         int32_t generated = 1;
         if (!on_token(first_token) || generated >= sampling.max_tokens) return generated;
 
-        MfqCudaStreamGuard graph_guard(graph_cache.stream);
+        graph_cache.ensure_compute_streams();
+        MfqCudaGuard graph_device_guard(
+            graph_cache.stream.device_index());
+        auto graph_stream_guards =
+            activate_cuda_graph_compute_streams(
+                graph_cache.compute_streams);
         cudaStream_t graph_raw_stream = graph_cache.stream.stream();
         if (has_penalties) {
             sample_token_counts_add_cuda(graph_cache.counts, first.contiguous());
@@ -21880,7 +22089,9 @@ static int32_t generate_server_tokens(
             try {
                 DecodeGraphBranchScope branch_scope;
                 graph_cache.graph = std::make_unique<MfqCudaGraph>();
-                prepare_decode_graph_memory(model, *graph_cache.graph, [&]() { (void)sample_static(); });
+                prepare_decode_graph_memory(model, *graph_cache.graph,
+                    [&]() { (void)sample_static(); },
+                    graph_cache.graph_participant_streams());
 
                 graph_cache.graph->capture_begin();
                 graph_cache.static_next = sample_static();
@@ -28664,7 +28875,7 @@ int main(int argc, char ** argv) {
             g_dsv4_cpu_offload_layers.empty() &&
             g_dense_cpu_layer_count == 0 &&
             !g_moe_expert_cache &&
-            !g_tensor_parallel.enabled() &&
+            tensor_parallel_cuda_graph_enabled() &&
             (!profile || profile_cuda_graph) && gen > 1;
         const char * cuda_profiler_env = std::getenv("MFQ_CUDA_PROFILER_RANGE");
         const bool cuda_profiler_range = cuda_profiler_env != nullptr &&
@@ -28677,7 +28888,13 @@ int main(int argc, char ** argv) {
             auto static_len = mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
             auto static_step = mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
             auto graph_stream = mfq_get_stream_from_pool(false);
-            MfqCudaStreamGuard graph_guard(graph_stream);
+            MfqCudaGuard graph_device_guard(
+                graph_stream.device_index());
+            auto graph_compute_streams =
+                make_cuda_graph_compute_streams(graph_stream);
+            auto graph_stream_guards =
+                activate_cuda_graph_compute_streams(
+                    graph_compute_streams);
             cudaStream_t graph_raw_stream = graph_stream.stream();
 
             int64_t pos_h = model.cache_pos;
@@ -28704,7 +28921,8 @@ int main(int argc, char ** argv) {
                 DecodeGraphBranchScope branch_scope;
                 prepare_decode_graph_memory(model, graph, [&]() {
                     (void)model.next_token_static(static_input, static_pos, static_len);
-                });
+                }, cuda_graph_participant_streams(
+                    graph_compute_streams));
                 g_profiler.reset();
                 g_profiler.graph_events = profile_cuda_graph;
                 graph.capture_begin();
