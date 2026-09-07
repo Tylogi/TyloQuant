@@ -22,6 +22,9 @@ ATTENTION = (ROOT / "mfq" / "kernels" / "cuda" / "attention.cu").read_text(
 ATTENTION_MMA = (
     ROOT / "mfq" / "kernels" / "cuda" / "attention_mma.cu"
 ).read_text(encoding="utf-8")
+KV_CACHE = (ROOT / "mfq" / "kernels" / "cuda" / "kv_cache.cu").read_text(
+    encoding="utf-8"
+)
 
 
 def test_continuous_batching_is_an_explicit_server_mode():
@@ -52,6 +55,8 @@ def test_qwen_decode_accepts_independent_batch_positions():
     assert "seq_len.numel() == B" in ATTENTION
     assert "seq_len[batch]" in ATTENTION_MMA
     assert "seq_len.numel() == B" in ATTENTION_MMA
+    assert "positions[(size_t)b * T + t]" in KV_CACHE
+    assert "kv_cache_write_cuda(k, v, kh, vh, pos)" in DECODE
 
 
 def test_real_weight_gate_exercises_join_and_compaction():
@@ -59,3 +64,5 @@ def test_real_weight_gate_exercises_join_and_compaction():
     assert "batcher.queued_requests()" in BATCHING
     assert 'metric("continuous_batching_max_batch") >= 2.0' in BATCHING
     assert 'metric("continuous_batching_compactions") >= 1.0' in BATCHING
+    assert "std::vector<int64_t> first_prompt(193)" in BATCHING
+    assert '" prompt_lengths=193,17 split_k=1"' in BATCHING

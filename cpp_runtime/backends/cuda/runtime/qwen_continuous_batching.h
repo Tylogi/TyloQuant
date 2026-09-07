@@ -720,23 +720,29 @@ static int run_qwen_continuous_batching_check(Model & model) {
         qwen_continuous_batching_incompatibility(model);
     MFQ_RUNTIME_CHECK(incompatibility.empty(), incompatibility);
     MFQ_RUNTIME_CHECK(model.c.vocab_size > 1024 &&
-        model.c.max_position_embeddings >= 32,
-        "continuous batching check requires vocab>1024 and context>=32");
+        model.c.max_position_embeddings >= 208,
+        "continuous batching check requires vocab>1024 and context>=208");
 
     MfqSamplingParams first_params;
-    first_params.max_tokens = 12;
+    first_params.max_tokens = 5;
     first_params.temperature = 0.0;
     first_params.top_k = 1;
     first_params.top_p = 1.0;
     first_params.enable_mtp = false;
     first_params.seed = 20260907;
     auto second_params = first_params;
-    second_params.max_tokens = 4;
+    second_params.max_tokens = 3;
     second_params.seed += 1;
-    const std::vector<int64_t> first_prompt{
-        101, 203, 307, 409, 503, 607, 709, 811, 907};
-    const std::vector<int64_t> second_prompt{
-        113, 227, 331, 443, 557};
+    std::vector<int64_t> first_prompt(193);
+    std::vector<int64_t> second_prompt(17);
+    for (size_t index = 0; index < first_prompt.size(); ++index) {
+        first_prompt[index] = 101 +
+            static_cast<int64_t>((index * 37) % 900);
+    }
+    for (size_t index = 0; index < second_prompt.size(); ++index) {
+        second_prompt[index] = 113 +
+            static_cast<int64_t>((index * 53) % 880);
+    }
 
     auto serial = [&](const std::vector<int64_t> & prompt,
                       const MfqSamplingParams & params) {
@@ -844,6 +850,7 @@ static int run_qwen_continuous_batching_check(Model & model) {
         "continuous batching check did not exercise join and retire");
     std::cout << "continuous_batching_check PASS requests=2 max_batch="
               << metric("continuous_batching_max_batch")
+              << " prompt_lengths=193,17 split_k=1"
               << " decode_batches="
               << metric("continuous_batching_decode_batches")
               << " compactions="
@@ -852,4 +859,3 @@ static int run_qwen_continuous_batching_check(Model & model) {
 }
 
 } // namespace mfq::cuda::continuous
-

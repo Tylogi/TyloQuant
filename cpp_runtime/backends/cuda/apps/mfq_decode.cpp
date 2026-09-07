@@ -14945,28 +14945,33 @@ struct KVCache {
         const bool aten_write = k.scalar_type() != mfq_tensor_backend::kFloat16 ||
             (aten_write_env != nullptr && aten_write_env[0] == '1');
 #endif
-        const int64_t batches = pos.dim() == 1 ? 1 : pos.size(0);
-        for (int64_t batch = 0; batch < batches; ++batch) {
-            auto cache_k = pos.dim() == 1 ? k : k.narrow(0, batch, 1);
-            auto cache_v = pos.dim() == 1 ? v : v.narrow(0, batch, 1);
-            auto source_k = pos.dim() == 1 ? kh : kh.narrow(0, batch, 1);
-            auto source_v = pos.dim() == 1 ? vh : vh.narrow(0, batch, 1);
-            auto write_pos = pos.dim() == 1
-                ? pos : pos.narrow(0, batch, 1).reshape({-1});
-            if (!k.is_cuda() || aten_write) {
-                auto slots = ring
-                    ? mfq_tensor_backend::remainder(write_pos, k.size(2))
-                    : write_pos;
-                slots = slots.to(mfq_tensor_backend::kInt64).contiguous();
-                cache_k.index_copy_(2, slots, source_k);
-                cache_v.index_copy_(2, slots, source_v);
-            } else {
-                auto out = ring
-                    ? kv_cache_write_ring_positions_cuda(
-                        cache_k, cache_v, source_k, source_v, write_pos)
-                    : kv_cache_write_cuda(
-                        cache_k, cache_v, source_k, source_v, write_pos);
-                (void)out;
+        if (k.is_cuda() && !aten_write && !ring) {
+            auto out = kv_cache_write_cuda(k, v, kh, vh, pos);
+            (void)out;
+        } else {
+            const int64_t batches = pos.dim() == 1 ? 1 : pos.size(0);
+            for (int64_t batch = 0; batch < batches; ++batch) {
+                auto cache_k = pos.dim() == 1 ? k : k.narrow(0, batch, 1);
+                auto cache_v = pos.dim() == 1 ? v : v.narrow(0, batch, 1);
+                auto source_k = pos.dim() == 1 ? kh : kh.narrow(0, batch, 1);
+                auto source_v = pos.dim() == 1 ? vh : vh.narrow(0, batch, 1);
+                auto write_pos = pos.dim() == 1
+                    ? pos : pos.narrow(0, batch, 1).reshape({-1});
+                if (!k.is_cuda() || aten_write) {
+                    auto slots = ring
+                        ? mfq_tensor_backend::remainder(write_pos, k.size(2))
+                        : write_pos;
+                    slots = slots.to(mfq_tensor_backend::kInt64).contiguous();
+                    cache_k.index_copy_(2, slots, source_k);
+                    cache_v.index_copy_(2, slots, source_v);
+                } else {
+                    auto out = ring
+                        ? kv_cache_write_ring_positions_cuda(
+                            cache_k, cache_v, source_k, source_v, write_pos)
+                        : kv_cache_write_cuda(
+                            cache_k, cache_v, source_k, source_v, write_pos);
+                    (void)out;
+                }
             }
         }
         if (ring) return {k, v};
