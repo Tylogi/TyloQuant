@@ -140,10 +140,60 @@ __global__ void __launch_bounds__(128) nint8_gs48_small_m_kernel(
     }
 }
 
+__global__ void __launch_bounds__(192) nint8_gs48_small_m_shared_weight_kernel(
+    NintSmallMProjection weight, const int8_t* __restrict__ qx,
+    const float* __restrict__ xs, int ng, int kpad)
+{
+    const int row = blockIdx.x, lane = threadIdx.x, m = threadIdx.y;
+    const int tid = m * 32 + lane, threads = blockDim.y * 32;
+    if (row >= weight.n) return;
+    const auto* qrow = weight.q_packed + (size_t)row * ng * 48;
+    const auto* ssrow = weight.sub_scale + (size_t)row * ng;
+    const auto* smrow = weight.sub_min + (size_t)row * ng;
+    extern __shared__ uint32_t shared_q[];
+    auto* shared_ss = reinterpret_cast<uint8_t*>(shared_q) + kpad;
+    auto* shared_sm = shared_ss + ng;
+    // Each global weight/metadata value is read once per output row. Tokens
+    // use independent warps while sharing these immutable, fully staged bytes.
+    for (int i = tid; i < kpad / 4; i += threads)
+        shared_q[i] = reinterpret_cast<const uint32_t*>(qrow)[i];
+    for (int g = tid; g < ng; g += threads) {
+        shared_ss[g] = ssrow[g];
+        shared_sm[g] = smrow[g];
+    }
+    __syncthreads();
+    const float ns = weight.neuron_scale[row], nm = weight.neuron_min[row];
+    float acc = 0.f;
+    for (int base = lane * 4; base < kpad; base += 128) {
+        const uint32_t qv = shared_q[base / 4];
+        const int g = base / 48;
+        const float de = ns * float(shared_ss[g]), me = nm * float(shared_sm[g]);
+        const int xv = *reinterpret_cast<const int*>(qx + (size_t)m * kpad + base);
+        int di;
+        asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(di) : "r"(qv), "r"(xv), "r"(0));
+        const int sumi = __dp4a(0x01010101, xv, 0);
+        // Preserve every output's original lane K order, expression and tree.
+        acc += xs[(size_t)m * ng + g] * (de * float(di) - me * float(sumi));
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_xor_sync(0xffffffff, acc, offset);
+    if (lane == 0)
+        reinterpret_cast<__half*>(weight.out)[(size_t)m * weight.n + row] = __float2half(acc);
+}
+
 void launch_nint8_gs48_small_m(
     NintSmallMProjection weight, const int8_t* qx, const float* xs,
     int m, int ng, int kpad, cudaStream_t stream)
 {
+    const char* shared_env = std::getenv("MFQ_NINT8_GS48_SMALL_M_SHARED_W");
+    const size_t shared_bytes = (size_t)kpad + 2 * (size_t)ng;
+    if (shared_env != nullptr && shared_env[0] == '1' && shared_bytes <= 32768) {
+        MFQ_RUNTIME_CHECK(m >= 2 && m <= 6, "NINT8 GS48 shared weights require M2-6");
+        nint8_gs48_small_m_shared_weight_kernel
+            <<<weight.n, dim3(32, m), shared_bytes, stream>>>(weight, qx, xs, ng, kpad);
+        return;
+    }
 #define MFQ_NINT8_CASE(M) \
     case M: nint8_gs48_small_m_kernel<M> \
         <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad); break

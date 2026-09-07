@@ -149,3 +149,39 @@ def test_nint_small_m_bridge(profile, rows, width, monkeypatch):
                 graph.replay()
                 _exact(output, expected)
     stream.synchronize()
+
+
+@pytest.mark.parametrize("width", [31440, 31441])
+@torch.inference_mode()
+def test_nint8_shared_weight_capacity_boundary(width):
+    """Canonical GS48 sizes immediately below/above the 32-KiB staging cap."""
+    groups = (width + 47) // 48
+    assert groups * 50 in (32750, 32800)
+    module = ext()
+    tensors, x, qx, xs, xm, weights = _fixture(8, 48, 7, width, 66)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+
+    def invoke(value):
+        return module.nint_gemv_packed_u8_ws_cuda(*tensors, value, 48, qx, xs, xm)
+
+    with torch.cuda.stream(stream):
+        reference = torch.cat([invoke(x[m:m + 1]) for m in range(6)])
+        for m in range(2, 7):
+            _exact(invoke(x[:m]), reference[:m])
+        actual = invoke(x).double().cpu()
+        grouped = qx.double().reshape(6, -1, 48) * xs.double()[:, :, None]
+        expected = (grouped.flatten(1).cpu() @ weights.T).float().half().double()
+        torch.testing.assert_close(actual, expected, atol=.002, rtol=.002)
+        for _ in range(3):
+            invoke(x)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            output = invoke(x)
+        graph.replay()
+        _exact(output, reference)
+        x.add_(.25)
+        changed = torch.cat([invoke(x[m:m + 1]) for m in range(6)])
+        graph.replay()
+        _exact(output, changed)
+    stream.synchronize()
