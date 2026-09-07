@@ -1,9 +1,9 @@
 #include "mfq_tensor_backend.h"
 #include "mfq_cuda_model_plan.h"
 #include "mfq_cuda_mtp.h"
-#include "mfq_flash_next_config.h"
-#include "mfq_flash_next_runtime.h"
-#include "mfq_qwen4_runtime.h"
+#include "flash_next/config.h"
+#include "flash_next/state.h"
+#include "flash_next/qwen4.h"
 #include <cuda_profiler_api.h>
 #include <cuda_runtime_api.h>
 
@@ -15062,16 +15062,40 @@ struct Dsv4SharedState {
 };
 
 struct Block {
+    struct Context {
+        mfq_tensor_backend::Tensor token_ids;
+        mfq_tensor_backend::Tensor positions;
+        mfq_tensor_backend::Tensor full_positions;
+        int64_t cache_position = 0;
+        int64_t confirmed_prefix = 0;
+        MfqOptional<mfq_tensor_backend::Tensor> sequence_lengths = mfq_nullopt;
+        MfqOptional<mfq_tensor_backend::Tensor> cache_positions = mfq_nullopt;
+        MfqOptional<mfq_tensor_backend::Tensor> attention_mask = mfq_nullopt;
+    };
     int cuda_device = 0;
     bool cpu_offloaded = false;
     virtual ~Block() = default;
     virtual void reset(int64_t B) = 0;
     virtual void set_token_ids(const mfq_tensor_backend::Tensor &) {}
+    virtual bool supports_speculation() const noexcept { return false; }
+    virtual void commit_speculative() {}
+    virtual void rollback_speculative(int64_t) {}
     virtual mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, int64_t cache_pos,
                                   const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
                                   const Config & c, const RopeCache & rope,
                                   const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
                                   const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) = 0;
+    virtual mfq_tensor_backend::Tensor forward_context(
+            mfq_tensor_backend::Tensor x,
+            const Context & context,
+            const Config & c,
+            const RopeCache & rope) {
+        MFQ_RUNTIME_CHECK(context.confirmed_prefix == 0,
+            "block does not support speculative verification");
+        return forward(std::move(x), context.positions, context.cache_position,
+            context.sequence_lengths, c, rope, context.cache_positions,
+            context.attention_mask);
+    }
 };
 
 struct Dsv4PoolState {
@@ -15849,6 +15873,8 @@ struct FullBlock : Block {
     int64_t attention_window = 0;
     double attention_scale = 0.0;
     RopeCache attention_rope;
+
+    bool supports_speculation() const noexcept override { return !sliding; }
     mfq_tensor_backend::Tensor attn_norm, ffn_norm, q_norm, k_norm;
     mfq_tensor_backend::Tensor v_norm, attn_post_norm;
     mfq_tensor_backend::Tensor ffn_post_norm, ffn_post_norm_1, ffn_pre_norm_2, ffn_post_norm_2;
@@ -17048,9 +17074,10 @@ struct LinearBlock : Block {
         speculative_pending = true;
     }
 
-    void commit_speculative() noexcept { speculative_pending = false; }
+    bool supports_speculation() const noexcept override { return true; }
+    void commit_speculative() noexcept override { speculative_pending = false; }
 
-    void rollback_speculative() {
+    void rollback_speculative(int64_t) override {
         MFQ_RUNTIME_CHECK(speculative_pending,
             "Qwen speculative recurrent checkpoint is unavailable");
         // Preserve storage addresses used by ordinary decode graphs.
@@ -17080,7 +17107,7 @@ struct LinearBlock : Block {
                 ++speculative_projection_batches;
                 return result;
             } catch (...) {
-                if (speculative_pending) rollback_speculative();
+                if (speculative_pending) rollback_speculative(0);
                 throw;
             }
         }
@@ -17112,9 +17139,23 @@ struct LinearBlock : Block {
                 cache_pos + confirmed, mfq_nullopt, c, rope);
             return mfq_tensor_backend::cat({prefix, suffix}, 1);
         } catch (...) {
-            rollback_speculative();
+            rollback_speculative(0);
             throw;
         }
+    }
+
+    mfq_tensor_backend::Tensor forward_context(
+            mfq_tensor_backend::Tensor x,
+            const Context & context,
+            const Config & c,
+            const RopeCache & rope) override {
+        if (context.confirmed_prefix > 0) {
+            return forward_speculative(std::move(x), context.positions,
+                context.cache_position, c, rope, context.confirmed_prefix);
+        }
+        return forward(std::move(x), context.positions, context.cache_position,
+            context.sequence_lengths, c, rope, context.cache_positions,
+            context.attention_mask);
     }
 
     void reset(int64_t B) override {
@@ -17758,7 +17799,7 @@ static FFN load_ffn(const MfqFile & mfq, const Config & c, int i) {
     return f;
 }
 
-#include "flash_next_runtime.inc"
+#include "flash_next/flash_next_layers.h"
 
 static std::unique_ptr<Block> load_block(
     const MfqFile & mfq,
@@ -18813,26 +18854,16 @@ struct Model {
     int64_t qwen4_batch=0;
 
     bool supports_qwen_speculation() const {
-        if (c.is_qwen4()) return !blocks.empty() &&
-            std::all_of(blocks.begin(),blocks.end(),[](const auto& block) {return dynamic_cast<const Qwen4Block*>(block.get())!=nullptr;});
-        if (c.is_glm5_next()) return !blocks.empty() &&
-            std::all_of(blocks.begin(),blocks.end(),[](const auto& block) {
-                return dynamic_cast<const Glm5NextBlock*>(block.get()) != nullptr;
-            });
-        return c.runtime_plan.backbone == mfq::cuda::MfqCudaBackbone::generic_qwen &&
-            !blocks.empty() && std::all_of(blocks.begin(), blocks.end(), [](const auto& block) {
-                const auto* full = dynamic_cast<const FullBlock*>(block.get());
-                return (full != nullptr && !full->sliding) ||
-                    dynamic_cast<const LinearBlock*>(block.get()) != nullptr;
-            });
+        return (c.runtime_plan.backbone==mfq::cuda::MfqCudaBackbone::generic_qwen || c.is_flash_next()) &&
+            !blocks.empty() && std::all_of(blocks.begin(),blocks.end(),
+                [](const auto& block) {return block->supports_speculation();});
     }
 
     void commit_speculative() {
         MFQ_RUNTIME_CHECK(speculative_start >= 0, "no speculative transaction to commit");
         for (auto& block : blocks) {
-            if (auto* linear = dynamic_cast<LinearBlock*>(block.get())) linear->commit_speculative();
-            if (auto* flash = dynamic_cast<Glm5NextBlock*>(block.get())) flash->commit_speculative();
-            if (auto* qwen = dynamic_cast<Qwen4Block*>(block.get())) qwen->commit_speculative();
+            MfqCudaGuard guard(block->cuda_device);
+            block->commit_speculative();
         }
         speculative_start = -1;
         speculative_confirmed = 0;
@@ -18841,15 +18872,8 @@ struct Model {
     void rollback_speculative() {
         MFQ_RUNTIME_CHECK(speculative_start >= 0, "no speculative transaction to roll back");
         for (auto& block : blocks) {
-            if (auto* qwen = dynamic_cast<Qwen4Block*>(block.get())) qwen->rollback_speculative(speculative_start+speculative_confirmed);
-            if (auto* flash = dynamic_cast<Glm5NextBlock*>(block.get())) {
-                MfqCudaGuard guard(block->cuda_device);
-                flash->rollback_speculative(speculative_start + speculative_confirmed);
-            }
-            if (auto* linear = dynamic_cast<LinearBlock*>(block.get())) {
-                MfqCudaGuard guard(block->cuda_device);
-                linear->rollback_speculative();
-            }
+            MfqCudaGuard guard(block->cuda_device);
+            block->rollback_speculative(speculative_start+speculative_confirmed);
         }
         // Full-attention KV slots beyond this logical length are overwritten
         // by the next pass; no history-sized cache copy is needed.
@@ -19336,22 +19360,18 @@ struct Model {
                 ? cpu_rope
                 : (device_ropes.empty()
                     ? rope : device_ropes.at(b->cuda_device));
-            if (auto* qwen = dynamic_cast<Qwen4Block*>(b.get()); qwen!=nullptr) {
-                x=qwen->execute(x,local_ids,local_pos,qwen4_full_positions,confirmed_prefix);
-            } else if (auto* linear = confirmed_prefix > 0 ? dynamic_cast<LinearBlock*>(b.get()) : nullptr;
-                    linear != nullptr) {
-                x = linear->forward_speculative(x, local_pos, cache_pos, c, active_rope,
-                    confirmed_prefix);
-            } else if (auto* flash = confirmed_prefix > 0 ? dynamic_cast<Glm5NextBlock*>(b.get()) : nullptr;
-                    flash != nullptr) {
-                x = flash->execute(x,cache_pos,confirmed_prefix);
-            } else {
-                x = b->forward(
-                    x, local_pos, cache_pos, local_seq_len, c, active_rope,
-                    local_cache_positions,
-                    c.is_minicpmo45()
-                        ? local_attention_mask : mfq_nullopt);
-            }
+            Block::Context context;
+            context.token_ids=local_ids;
+            context.positions=local_pos;
+            context.full_positions=c.is_qwen4()
+                ? tensor_to_cuda_device(qwen4_full_positions,b->cuda_device)
+                : local_pos;
+            context.cache_position=cache_pos;
+            context.confirmed_prefix=confirmed_prefix;
+            context.sequence_lengths=local_seq_len;
+            context.cache_positions=local_cache_positions;
+            context.attention_mask=c.is_minicpmo45()?local_attention_mask:mfq_nullopt;
+            x=b->forward_context(std::move(x),context,c,active_rope);
             if (block_trace != nullptr) {
                 block_trace->push_back(
                     tensor_to_cuda_device(x, primary)
@@ -19681,154 +19701,10 @@ static Model load_model(const std::string & mfq_path, const std::string & config
 
 #include "minicpmo45_runtime.inc"
 
-// Qwen3.5's predictor shares the main embedding/output head and owns only
-// its fusion/norm/attention/FFN weights and an independent attention history.
-struct CudaQwen35Mtp {
-    Config c;
-    QuantLinear fusion;
-    mfq_tensor_backend::Tensor hidden_norm, embedding_norm, output_norm;
-    std::vector<std::unique_ptr<Block>> blocks;
-    int64_t cache_pos = 0;
-    uint64_t last_cycles = 0, last_accepted = 0, last_rejected = 0;
-
-    static std::optional<CudaQwen35Mtp> load_if_present(const MfqFile& file, const Config& main) {
-        const bool fusion_present = file.has_record("predictor.fusion.weight");
-        const bool any = fusion_present || file.has_record("predictor.hidden_norm.weight") ||
-            file.has_record("predictor.embedding_norm.weight") ||
-            file.has_record("predictor.output_norm.weight") ||
-            file.has_record("predictor.block.0.attention.query.weight");
-        if (!fusion_present) {
-            MFQ_RUNTIME_CHECK(!any, "Qwen MFQ contains an incomplete MTP head");
-            return std::nullopt;
-        }
-        MFQ_RUNTIME_CHECK(main.mtp_num_hidden_layers > 0 && !main.mtp_use_dedicated_embeddings,
-            "Qwen MTP requires declared predictor layers and shared embeddings");
-        CudaQwen35Mtp result;
-        result.c = main;
-        result.c.tensor_root = "predictor";
-        result.c.num_hidden_layers = main.mtp_num_hidden_layers;
-        result.c.layer_types.assign(static_cast<size_t>(main.mtp_num_hidden_layers), "full_attention");
-        result.hidden_norm = load_dense_gpu(file, "predictor.hidden_norm.weight");
-        result.embedding_norm = load_dense_gpu(file, "predictor.embedding_norm.weight");
-        result.output_norm = load_dense_gpu(file, "predictor.output_norm.weight");
-        result.fusion = load_quant_linear(file, "predictor.fusion.weight");
-        MFQ_RUNTIME_CHECK(result.fusion.neuron_len() == 2 * main.hidden_size &&
-            result.fusion.out() == main.hidden_size && result.hidden_norm.numel() == main.hidden_size &&
-            result.embedding_norm.numel() == main.hidden_size && result.output_norm.numel() == main.hidden_size,
-            "Qwen MTP component dimensions disagree with the backbone");
-        for (int layer = 0; layer < main.mtp_num_hidden_layers; ++layer) {
-            auto block = load_block(file, result.c, layer, "full_attention");
-            block->cuda_device = g_layer_placement.primary_device();
-            result.blocks.push_back(std::move(block));
-        }
-        return result;
-    }
-
-    void reset(int64_t batch = 1) {
-        cache_pos = 0;
-        for (auto& block : blocks) block->reset(batch);
-    }
-
-    mfq_tensor_backend::Tensor forward(Model& main, mfq_tensor_backend::Tensor hidden,
-                                      mfq_tensor_backend::Tensor next_ids) {
-        MFQ_RUNTIME_CHECK(hidden.dim() == 3 && next_ids.dim() == 2 && hidden.size(0) == next_ids.size(0) &&
-            hidden.size(1) == next_ids.size(1) && hidden.size(2) == c.hidden_size && hidden.size(1) > 0,
-            "Qwen MTP inputs must be matching [B,T,H] hidden states and [B,T] next-token IDs");
-        const auto batch = hidden.size(0), tokens = hidden.size(1);
-        MFQ_RUNTIME_CHECK(cache_pos + tokens <= c.max_position_embeddings,
-            "Qwen MTP history exceeds context capacity");
-        auto embedded = main.embed_forward(next_ids).to(hidden.scalar_type());
-        auto e = qwen_rms_norm(embedded.reshape({batch * tokens, c.hidden_size})
-            .to(mfq_tensor_backend::kFloat32), embedding_norm, c).reshape_as(hidden);
-        auto h = qwen_rms_norm(hidden.reshape({batch * tokens, c.hidden_size})
-            .to(mfq_tensor_backend::kFloat32), hidden_norm, c).reshape_as(hidden);
-        trace_gemma_stage(0, "mtp.embedding_norm", e);
-        trace_gemma_stage(0, "mtp.hidden_norm", h);
-        // Frozen Metal fusion order: normalized next-token embedding, then
-        // normalized RAW backbone hidden (before the backbone output norm).
-        auto x = fusion.forward(mfq_tensor_backend::cat({e, h}, -1));
-        trace_gemma_stage(0, "mtp.fusion", x);
-        auto pos = mfq_tensor_backend::arange(cache_pos, cache_pos + tokens,
-            mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt64));
-        MfqOptional<mfq_tensor_backend::Tensor> length = mfq_nullopt;
-        if (tokens == 1 && cache_pos > 0) {
-            length = mfq_tensor_backend::full({batch}, cache_pos + 1, pos.options());
-        }
-        for (auto& block : blocks) x = block->forward(x, pos, cache_pos, length, c, main.rope);
-        cache_pos += tokens;
-        auto output = qwen_rms_norm(x.reshape({batch * tokens, c.hidden_size})
-            .to(mfq_tensor_backend::kFloat32), output_norm, c)
-            .reshape({batch, tokens, c.hidden_size});
-        trace_gemma_stage(0, "mtp.output_norm", output);
-        return output;
-    }
-};
-
-#include "flash_next_mtp.inc"
-
-struct CudaRuntimeComponents {
-    mfq::MfqModelGraph graph;
-    mfq::cuda::MfqCudaModelPlan plan;
-    std::optional<MiniCPMO45Runtime> minicpmo;
-    std::optional<CudaQwen35Mtp> qwen_mtp;
-    std::optional<CudaFlashNextMtp> flash_mtp;
-    bool vision_available = false;
-    bool mtp_available = false;
-
-    Model& language(Model& fallback) {
-        return minicpmo ? minicpmo->language : fallback;
-    }
-
-    mfq::cuda::MfqCudaComponentState state() const noexcept {
-        return mfq::cuda::mfq_cuda_component_state(
-            graph,
-            plan,
-            vision_available,
-            mtp_available);
-    }
-};
-
-static CudaRuntimeComponents load_cuda_runtime_components(
-        Model& model,
-        const std::string& mfq_path,
-        bool server_mode,
-        const std::string& config_path = {}) {
-    CudaRuntimeComponents result;
-    result.graph = model.c.model_graph;
-    result.plan = model.c.runtime_plan;
-    if (!server_mode) return result;
-
-    switch (result.plan.vision) {
-        case mfq::cuda::MfqCudaVisionAdapter::none:
-            break;
-        case mfq::cuda::MfqCudaVisionAdapter::minicpmo45:
-            result.minicpmo.emplace(
-                MiniCPMO45Runtime::load_with_language(
-                    std::move(model), mfq_path));
-            result.vision_available = true;
-            break;
-    }
-    if (result.plan.predictor == mfq::cuda::MfqCudaPredictorAdapter::qwen35) {
-        const bool single_device = !g_tensor_parallel.enabled() && !g_layer_placement.enabled() &&
-            g_dense_cpu_layer_count == 0 && g_dsv4_cpu_offload_layers.empty() && !g_moe_expert_cache;
-        if (single_device && model.c.num_experts == 0 && model.supports_qwen_speculation()) {
-            MfqFile predictor_file(mfq_path);
-            (void)load_config(predictor_file, config_path);  // installs canonical legacy aliases
-            result.qwen_mtp = CudaQwen35Mtp::load_if_present(predictor_file, model.c);
-            result.mtp_available = result.qwen_mtp.has_value();
-        } else {
-            std::cerr << "qwen_mtp unavailable: initial CUDA adapter requires dense single-GPU Qwen blocks\n";
-        }
-    }
-    if (result.plan.predictor == mfq::cuda::MfqCudaPredictorAdapter::flash_next) {
-        MFQ_RUNTIME_CHECK(model.c.is_flash_next() && model.supports_qwen_speculation(),"invalid Flash-Next predictor backbone");
-        MfqFile predictor_file(mfq_path);
-        (void)load_config(predictor_file,config_path);
-        result.flash_mtp=CudaFlashNextMtp::load_if_present(predictor_file,model.c);
-        result.mtp_available=result.flash_mtp.has_value();
-    }
-    return result;
-}
+#include "../runtime/mtp.h"
+#include "qwen35/mtp.h"
+#include "flash_next/flash_next_mtp.h"
+#include "../runtime/server_components.h"
 
 static std::vector<int64_t> parse_ids(const std::string & s) {
     std::vector<int64_t> ids;
@@ -21498,9 +21374,8 @@ private:
     bool trace_ = false;
 };
 
-template<class Predictor>
-static int32_t generate_qwen35_mtp_tokens(
-        Model& model, Predictor& mtp,
+static int32_t generate_mtp_tokens(
+        Model& model, CudaMtpModule& mtp,
         const std::vector<int64_t>& prompt, const MfqSamplingParams& sampling,
         const MfqTokenCallback& on_token, const MfqPrefillCallback& on_prefill) {
     using Tensor = mfq_tensor_backend::Tensor;
@@ -21542,7 +21417,7 @@ static int32_t generate_qwen35_mtp_tokens(
             sampling.temperature, sampling.top_k, sampling.top_p);
     };
     auto logits_for = [&](Tensor normalized) {
-        return model.logits_from_hidden((model.c.is_flash_next()?normalized:
+        return model.logits_from_hidden((mtp.preserve_output_dtype()?normalized:
             normalized.to(mfq_tensor_backend::kFloat16)).contiguous());
     };
     int32_t generated = 0;
@@ -21574,7 +21449,7 @@ static int32_t generate_qwen35_mtp_tokens(
         const double prefill_ms = timer.elapsed_ms();
         if (on_prefill) on_prefill(MfqPrefillTiming{prompt.size(), prefill_ms, 0., prefill_ms});
         if (!emit(pending) || generated == limit) return generated;
-        if (model.c.is_flash_next()) {
+        if (!mtp.teacher_forced_prompt_prime()) {
             // Flash-Next starts an empty draft cache after the first target
             // decode. This differs from Qwen3.5's teacher-forced prompt prime.
             auto next_hidden=model.hidden_forward(ids_for({pending}),mfq_nullopt,mfq_nullopt,
@@ -21631,7 +21506,7 @@ static int32_t generate_qwen35_mtp_tokens(
     };
     try {
         const auto result = generate();
-        std::cerr << "qwen_mtp generated=" << result << " cycles=" << mtp.last_cycles
+        std::cerr << "mtp generated=" << result << " cycles=" << mtp.last_cycles
             << " accepted=" << mtp.last_accepted << " rejected=" << mtp.last_rejected << '\n';
         return result;
     } catch (...) {
@@ -21652,18 +21527,16 @@ static int32_t generate_server_tokens(
     const MfqPrefillCallback & on_prefill,
     const MfqPromptCachePlan & cache_plan,
     const MfqTokenConstraintPtr & token_constraint,
-    CudaQwen35Mtp* mtp = nullptr,
-    CudaFlashNextMtp* flash_mtp = nullptr)
+    CudaMtpModule* mtp = nullptr)
 {
     std::lock_guard<std::mutex> lock(model_mutex);
     const char* mtp_reprefill = std::getenv("MFQ_SERVER_REPREFILL");
     const char* mtp_trace = std::getenv("MFQ_SERVER_TRACE_INCREMENTAL");
-    if ((mtp != nullptr || flash_mtp != nullptr) && sampling.enable_mtp && sampling.max_tokens > 1 && !token_constraint &&
+    if (mtp != nullptr && sampling.enable_mtp && sampling.max_tokens > 1 && !token_constraint &&
         !(mtp_reprefill != nullptr && mtp_reprefill[0] == '1') &&
         !(mtp_trace != nullptr && mtp_trace[0] == '1')) {
         // Predictor state is not in the persistent session snapshot contract.
-        if (flash_mtp) return generate_qwen35_mtp_tokens(model,*flash_mtp,prompt,sampling,on_token,on_prefill);
-        return generate_qwen35_mtp_tokens(model, *mtp, prompt, sampling, on_token, on_prefill);
+        return generate_mtp_tokens(model, *mtp, prompt, sampling, on_token, on_prefill);
     }
     auto options = mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA);
     const size_t stable_prefix_tokens = std::min(
@@ -22178,7 +22051,7 @@ static int run_qwen35_mtp_check(Model& model, CudaQwen35Mtp& mtp) {
             current = next.reshape({1, 1});
         }
         std::vector<int64_t> got;
-        const int produced = generate_qwen35_mtp_tokens(model, mtp, input, params,
+        const int produced = generate_mtp_tokens(model, mtp, input, params,
             [&](int64_t token) { got.push_back(token); return true; }, {});
         total_cycles += mtp.last_cycles;
         std::cout << "mtp_check greedy_prompt_tokens=" << input.size() << " produced=" << produced
@@ -22189,7 +22062,7 @@ static int run_qwen35_mtp_check(Model& model, CudaQwen35Mtp& mtp) {
         // Callback stop then a fresh request exercises state reset after an
         // early return, including stopping before a computed bonus is emitted.
         got.clear();
-        const int stopped = generate_qwen35_mtp_tokens(model, mtp, input, params,
+        const int stopped = generate_mtp_tokens(model, mtp, input, params,
             [&](int64_t token) { got.push_back(token); return got.size() < 3; }, {});
         MFQ_RUNTIME_CHECK(stopped == 3 && got == std::vector<int64_t>(expected.begin(), expected.begin() + 3),
             "MTP callback emitted extra or incorrect tokens");
@@ -22203,7 +22076,7 @@ static int run_qwen35_mtp_check(Model& model, CudaQwen35Mtp& mtp) {
     stochastic.frequency_penalty = .1;
     stochastic.repetition_penalty = 1.05;
     stochastic.seed = 20260907;
-    const int produced = generate_qwen35_mtp_tokens(model, mtp, prompt, stochastic,
+    const int produced = generate_mtp_tokens(model, mtp, prompt, stochastic,
         [](int64_t) { return true; }, {});
     MFQ_RUNTIME_CHECK(produced == 8 && mtp.last_cycles > 0 && total_cycles > 0,
         "MTP runtime gate did not execute speculative cycles");
@@ -27123,7 +26996,7 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
     return backend;
 }
 
-#include "flash_next_mtp_check.inc"
+#include "diagnostics/flash_next_mtp.h"
 
 static int run_flash_next_check(Model& model) {
     namespace tb=mfq_tensor_backend;
@@ -28135,18 +28008,25 @@ int main(int argc, char ** argv) {
         report_cuda_memory("loaded");
         if (check_flash_next) return run_flash_next_check(model);
         if (check_flash_next_mtp) {
-            MFQ_RUNTIME_CHECK(server_components.flash_mtp.has_value(),"Flash-Next MTP diagnostic requires a loaded predictor component");
-            return run_flash_next_mtp_check(model,*server_components.flash_mtp);
+            auto * predictor = dynamic_cast<CudaFlashNextMtp *>(
+                server_components.mtp.get());
+            MFQ_RUNTIME_CHECK(predictor != nullptr,
+                "Flash-Next MTP diagnostic requires a loaded predictor component");
+            return run_flash_next_mtp_check(model, *predictor);
         }
         if (check_qwen35_mtp) {
-            MFQ_RUNTIME_CHECK(server_components.qwen_mtp.has_value(),
+            auto * predictor = dynamic_cast<CudaQwen35Mtp *>(
+                server_components.mtp.get());
+            MFQ_RUNTIME_CHECK(predictor != nullptr,
                 "--check-qwen35-mtp requires a supported model containing MTP weights");
-            return run_qwen35_mtp_check(model, *server_components.qwen_mtp);
+            return run_qwen35_mtp_check(model, *predictor);
         }
         if (!bench_qwen35_mtp.empty()) {
-            MFQ_RUNTIME_CHECK(server_components.qwen_mtp.has_value(),
+            auto * predictor = dynamic_cast<CudaQwen35Mtp *>(
+                server_components.mtp.get());
+            MFQ_RUNTIME_CHECK(predictor != nullptr,
                 "--bench-qwen35-mtp requires a supported model containing MTP weights");
-            return run_qwen35_mtp_bench(model, *server_components.qwen_mtp,
+            return run_qwen35_mtp_bench(model, *predictor,
                 bench_qwen35_mtp == "mtp", gen, bench_qwen35_mtp_reps);
         }
         if (server_mode) {
@@ -28252,8 +28132,7 @@ int main(int argc, char ** argv) {
                     server_model, model_mutex, decode_graph_cache,
                     text_session_cache, prompt, sampling,
                     on_token, on_prefill, cache_plan, token_constraint,
-                    server_components.qwen_mtp ? &*server_components.qwen_mtp : nullptr,
-                    server_components.flash_mtp ? &*server_components.flash_mtp : nullptr);
+                    server_components.mtp.get());
             }, {}, duplex_backend, {
                 [&](const std::string & source_session_id,
                         const std::string & target_session_id) {

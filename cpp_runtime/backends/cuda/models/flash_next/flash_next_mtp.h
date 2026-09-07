@@ -1,6 +1,8 @@
+#pragma once
+
 // Appended predictors share the target's embedding and output projection.
 // Each depth selects one predictor layer with its own attention/position cache.
-struct CudaFlashNextMtp {
+struct CudaFlashNextMtp final : CudaMtpModule {
     using Tensor=mfq_tensor_backend::Tensor;
     using Linear=mfq::flash_next::Linear;
     struct GlmLayer {
@@ -17,7 +19,6 @@ struct CudaFlashNextMtp {
     std::vector<Tensor> positions;
     std::vector<int64_t> lengths;
     int64_t batch=0;
-    uint64_t last_cycles=0,last_accepted=0,last_rejected=0;
 
     static std::optional<CudaFlashNextMtp> load_if_present(const MfqFile& file,const Config& main) {
         using namespace flash_runtime;
@@ -68,7 +69,7 @@ struct CudaFlashNextMtp {
         result.positions.resize(layers);result.lengths.resize(layers,0);
         return result;
     }
-    void reset(int64_t next_batch=1) {
+    void reset(int64_t next_batch=1) override {
         MFQ_RUNTIME_CHECK(next_batch>0,"Flash-Next MTP batch must be positive");
         for (auto& layer:qwen_layers) layer->reset(next_batch);
         for (auto& layer:glm_layers) layer.attention->reset();
@@ -129,5 +130,7 @@ struct CudaFlashNextMtp {
         if (cache) {batch=b;lengths[layer]=start+t;}
         return {output,multi};
     }
-    Tensor forward(Model& main,const Tensor& hidden,const Tensor& ids) {return evaluate(main,hidden,ids).first;}
+    Tensor forward(Model& main,Tensor hidden,Tensor ids) override {return evaluate(main,hidden,ids).first;}
+    bool teacher_forced_prompt_prime() const noexcept override {return false;}
+    bool preserve_output_dtype() const noexcept override {return true;}
 };

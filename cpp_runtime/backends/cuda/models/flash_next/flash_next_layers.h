@@ -1,5 +1,7 @@
-// Included after the common CUDA model/quantized-loader definitions.
-// These adapters execute inside the same Model and server as existing families.
+#pragma once
+
+// Flash-Next layers use the shared CUDA model loader and the common Block
+// context. Architecture-specific execution stays out of the CLI/model loop.
 namespace flash_runtime {
 namespace tb = mfq_tensor_backend;
 using Tensor = tb::Tensor;
@@ -200,8 +202,9 @@ struct Glm5NextBlock final : Block {
         }
     }
     void reset(int64_t) override { if (kda) kda->reset(); if (mla) mla->reset(); }
-    void commit_speculative() { if (kda) kda->commit(); }
-    void rollback_speculative(int64_t keep) { if (kda) kda->rollback(); if (mla) mla->truncate(keep); }
+    bool supports_speculation() const noexcept override {return true;}
+    void commit_speculative() override { if (kda) kda->commit(); }
+    void rollback_speculative(int64_t keep) override { if (kda) kda->rollback(); if (mla) mla->truncate(keep); }
     Tensor execute(const Tensor& x,int64_t position,int64_t confirmed=0) {
         if (mla) MFQ_RUNTIME_CHECK(mla->position()==position,"GLM MLA/model cache positions diverged");
         auto first=attention_hc.pre(x,config);
@@ -217,6 +220,9 @@ struct Glm5NextBlock final : Block {
         const MfqOptional<Tensor>& mask = mfq_nullopt) override {
         MFQ_RUNTIME_CHECK(!mask.has_value(),"GLM Flash-Next requires its causal unpadded attention geometry");
         return execute(x,position);
+    }
+    Tensor forward_context(Tensor x,const Context& context,const Config&,const RopeCache&) override {
+        return execute(x,context.cache_position,context.confirmed_prefix);
     }
 };
 
@@ -251,8 +257,9 @@ struct Qwen4Block final : Block {
         if (root=="model" && std::find(c.ple_layers.begin(),c.ple_layers.end(),i+1)!=c.ple_layers.end()) ple=qwen_ple(file,c,p+".position_embedding");
     }
     void reset(int64_t) override {if (gdn) gdn->reset();if (qsa) qsa->reset();if (ple) ple->reset();}
-    void commit_speculative() {if (gdn) gdn->commit();if (ple) ple->commit();}
-    void rollback_speculative(int64_t keep) {if (gdn) gdn->rollback();if (qsa) qsa->truncate(keep);if (ple) ple->rollback();}
+    bool supports_speculation() const noexcept override {return true;}
+    void commit_speculative() override {if (gdn) gdn->commit();if (ple) ple->commit();}
+    void rollback_speculative(int64_t keep) override {if (gdn) gdn->rollback();if (qsa) qsa->truncate(keep);if (ple) ple->rollback();}
     Tensor execute(Tensor x,const Tensor& ids,const Tensor& positions,const Tensor& full_positions,int64_t confirmed=0) {
         if (ple) x=x+ple->forward(x,ids,true,confirmed);
         auto first=attention_gr.pre(x);
@@ -265,5 +272,9 @@ struct Qwen4Block final : Block {
         const Config&,const RopeCache&,const MfqOptional<Tensor>& = mfq_nullopt,
         const MfqOptional<Tensor>& = mfq_nullopt) override {
         throw std::runtime_error("Qwen4 block requires the unified model position/PLE input lifecycle");
+    }
+    Tensor forward_context(Tensor x,const Context& context,const Config&,const RopeCache&) override {
+        return execute(std::move(x),context.token_ids,context.positions,
+            context.full_positions,context.confirmed_prefix);
     }
 };

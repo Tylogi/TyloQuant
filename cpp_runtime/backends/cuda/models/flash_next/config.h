@@ -1,4 +1,6 @@
 #pragma once
+
+// Native configuration parsers for the Flash-Next model family.
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cmath>

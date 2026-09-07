@@ -148,7 +148,9 @@ if(BUILD_TESTING)
         ${MFQ_CUDA_ROOT}/tests/mfq_flash_next_test.cu
         mfq-cuda-native-kernels mfq-json)
     target_compile_definitions(mfq-flash-next-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
-    target_include_directories(mfq-flash-next-test PRIVATE ${MFQ_REPOSITORY_ROOT})
+    target_include_directories(mfq-flash-next-test PRIVATE
+        ${MFQ_REPOSITORY_ROOT}
+        ${MFQ_CUDA_ROOT}/models)
 endif()
 
 set(MFQ_NCCL_ROOT "" CACHE PATH

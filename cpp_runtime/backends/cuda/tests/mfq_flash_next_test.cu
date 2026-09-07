@@ -1,8 +1,8 @@
 // Native ABI numerical-test bridge: tests/test_cuda_flash_next.py supplies the
 // same NumPy oracle cases to this executable and the production Torch module.
 #include "mfq/kernels/cuda/flash_next.h"
-#include "mfq_flash_next_runtime.h"
-#include "mfq_qwen4_runtime.h"
+#include "flash_next/state.h"
+#include "flash_next/qwen4.h"
 #include "mfq_cuda_context.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
