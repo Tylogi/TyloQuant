@@ -104,6 +104,46 @@ void launch_nint5_gs28_small_m(
 }
 
 template <int MROWS>
+struct Nint8SmallMStage {
+    uint32_t qv;
+    float de, me;
+    int xv[MROWS];
+    float scale[MROWS];
+};
+
+template <int MROWS>
+__device__ __forceinline__ Nint8SmallMStage<MROWS> nint8_small_m_load_stage(
+    const uint8_t* qrow, const uint8_t* ssrow, const uint8_t* smrow,
+    const int8_t* qx, const float* xs, float ns, float nm, int base, int ng, int kpad)
+{
+    Nint8SmallMStage<MROWS> stage;
+    stage.qv = *reinterpret_cast<const uint32_t*>(qrow + base);
+    const int g = base / 48;
+    stage.de = ns * float(ssrow[g]);
+    stage.me = nm * float(smrow[g]);
+    #pragma unroll
+    for (int m = 0; m < MROWS; ++m) {
+        stage.xv[m] = *reinterpret_cast<const int*>(qx + (size_t)m * kpad + base);
+        stage.scale[m] = xs[(size_t)m * ng + g];
+    }
+    return stage;
+}
+
+template <int MROWS>
+__device__ __forceinline__ void nint8_small_m_consume_stage(
+    const Nint8SmallMStage<MROWS>& stage, float (&acc)[MROWS])
+{
+    #pragma unroll
+    for (int m = 0; m < MROWS; ++m) {
+        int di;
+        asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(di)
+            : "r"(stage.qv), "r"(stage.xv[m]), "r"(0));
+        const int sumi = __dp4a(0x01010101, stage.xv[m], 0);
+        acc[m] += stage.scale[m] * (stage.de * float(di) - stage.me * float(sumi));
+    }
+}
+
+template <int MROWS, bool PIPELINED = false>
 __global__ void __launch_bounds__(128) nint8_gs48_small_m_kernel(
     NintSmallMProjection weight, const int8_t* __restrict__ qx,
     const float* __restrict__ xs, int ng, int kpad)
@@ -115,19 +155,36 @@ __global__ void __launch_bounds__(128) nint8_gs48_small_m_kernel(
     const auto* smrow = weight.sub_min + (size_t)row * ng;
     const float ns = weight.neuron_scale[row], nm = weight.neuron_min[row];
     float acc[MROWS] = {};
-    for (int base = lane * 4; base < kpad; base += 128) {
-        const uint32_t qv = *reinterpret_cast<const uint32_t*>(qrow + base);
-        const int g = base / 48;
-        const float de = ns * float(ssrow[g]), me = nm * float(smrow[g]);
-        #pragma unroll
-        for (int m = 0; m < MROWS; ++m) {
-            const int xv = *reinterpret_cast<const int*>(qx + (size_t)m * kpad + base);
-            int di;
-            // The full unsigned-weight dot is exactly the old signed dot plus
-            // 128*xsum. Its four-term integer range is exact in FP32.
-            asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(di) : "r"(qv), "r"(xv), "r"(0));
-            const int sumi = __dp4a(0x01010101, xv, 0);
-            acc[m] += xs[(size_t)m * ng + g] * (de * float(di) - me * float(sumi));
+    if constexpr (PIPELINED) {
+        int base = lane * 4;
+        Nint8SmallMStage<MROWS> current = {};
+        if (base < kpad)
+            current = nint8_small_m_load_stage<MROWS>(qrow, ssrow, smrow, qx, xs, ns, nm, base, ng, kpad);
+        for (; base < kpad; base += 128) {
+            // Issue the next K slice's independent loads before consuming this
+            // slice. Weights remain shared across tokens; each lane accumulates
+            // in exactly the original K order. Guard the entire padded tail.
+            Nint8SmallMStage<MROWS> next = {};
+            if (base + 128 < kpad)
+                next = nint8_small_m_load_stage<MROWS>(qrow, ssrow, smrow, qx, xs, ns, nm, base + 128, ng, kpad);
+            nint8_small_m_consume_stage(current, acc);
+            current = next;
+        }
+    } else {
+        for (int base = lane * 4; base < kpad; base += 128) {
+            const uint32_t qv = *reinterpret_cast<const uint32_t*>(qrow + base);
+            const int g = base / 48;
+            const float de = ns * float(ssrow[g]), me = nm * float(smrow[g]);
+            #pragma unroll
+            for (int m = 0; m < MROWS; ++m) {
+                const int xv = *reinterpret_cast<const int*>(qx + (size_t)m * kpad + base);
+                int di;
+                // The full unsigned-weight dot is exactly the old signed dot plus
+                // 128*xsum. Its four-term integer range is exact in FP32.
+                asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(di) : "r"(qv), "r"(xv), "r"(0));
+                const int sumi = __dp4a(0x01010101, xv, 0);
+                acc[m] += xs[(size_t)m * ng + g] * (de * float(di) - me * float(sumi));
+            }
         }
     }
     #pragma unroll
@@ -144,9 +201,14 @@ void launch_nint8_gs48_small_m(
     NintSmallMProjection weight, const int8_t* qx, const float* xs,
     int m, int ng, int kpad, cudaStream_t stream)
 {
+    const char* pipeline_env = std::getenv("MFQ_NINT8_GS48_SMALL_M_PIPELINE");
+    const bool pipeline = pipeline_env != nullptr && pipeline_env[0] == '1';
 #define MFQ_NINT8_CASE(M) \
-    case M: nint8_gs48_small_m_kernel<M> \
-        <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad); break
+    case M: \
+        if (pipeline) nint8_gs48_small_m_kernel<M, true> \
+            <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad); \
+        else nint8_gs48_small_m_kernel<M, false> \
+            <<<dim3((weight.n + 3) / 4), dim3(32, 4), 0, stream>>>(weight, qx, xs, ng, kpad); break
     switch (m) {
         MFQ_NINT8_CASE(2);
         MFQ_NINT8_CASE(3);
