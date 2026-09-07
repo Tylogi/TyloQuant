@@ -43,6 +43,10 @@ def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
     assert "request->token_constraint" in BATCHING
     assert "pending_" in BATCHING
     assert "active_" in BATCHING
+    assert "output_tokens" in BATCHING
+    assert "publish_token" in BATCHING
+    assert "cancel_requested" in BATCHING
+    assert "retire_cancelled_requests" in BATCHING
 
 
 def test_qwen_decode_accepts_independent_batch_positions():
@@ -61,7 +65,7 @@ def test_qwen_decode_accepts_independent_batch_positions():
 
 def test_real_weight_gate_exercises_join_and_compaction():
     assert "run_qwen_continuous_batching_check" in BATCHING
-    assert "batcher.queued_requests()" in BATCHING
+    assert "a blocked response callback stalled the scheduler" in BATCHING
     assert 'metric("continuous_batching_max_batch") >= 2.0' in BATCHING
     assert 'metric("continuous_batching_compactions") >= 1.0' in BATCHING
     assert "std::vector<int64_t> first_prompt(193)" in BATCHING
