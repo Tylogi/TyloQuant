@@ -114,7 +114,7 @@ public:
     Tensor forward(const Tensor& ids,bool cache,Tensor* hashed_ids=nullptr) {
         MFQ_RUNTIME_CHECK(ids.dim()==2 && ids.size(0)>0 && ids.size(1)>0,"Qwen4 ngram IDs must be [B,T]");
         const auto b=ids.size(0),t=ids.size(1),prefix=ngram_-1,length=prefix+t,nh=(ngram_-1)*heads_;
-        auto host=ids.to(tb::kCPU,tb::kInt64).contiguous();
+        auto host=ids.to(tb::kInt64).contiguous().cpu();
         const auto* source=host.data_ptr<int64_t>();
         std::vector<int64_t> global(b*t*nh),history(b*length,eos_);
         for (int64_t bi=0;bi<b;++bi) {
