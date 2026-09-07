@@ -153,8 +153,8 @@ def test_nint_small_m_bridge(profile, rows, width, monkeypatch):
 
 @pytest.mark.parametrize("width", [31440, 31441])
 @torch.inference_mode()
-def test_nint8_shared_weight_capacity_boundary(width):
-    """Canonical GS48 sizes immediately below/above the 32-KiB staging cap."""
+def test_nint8_large_k_and_padding(width):
+    """Preserve long-K and adjacent GS48 padding regressions after shared-W rejection."""
     groups = (width + 47) // 48
     assert groups * 50 in (32750, 32800)
     module = ext()
