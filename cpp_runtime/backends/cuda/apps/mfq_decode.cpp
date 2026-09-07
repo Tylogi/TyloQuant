@@ -1332,6 +1332,12 @@ static bool tensor_parallel_shared_linear_attention_input_enabled() {
     return environment == nullptr || std::atoi(environment) != 0;
 }
 
+static bool tensor_parallel_mirror_linear_attention_scalars_enabled() {
+    const char * environment = std::getenv(
+        "MFQ_TP_MIRROR_LINEAR_ATTENTION_SCALARS");
+    return environment == nullptr || std::atoi(environment) != 0;
+}
+
 struct LayerPlacementConfig {
     std::vector<int> devices;
     std::vector<double> split;
@@ -17710,13 +17716,19 @@ struct LinearBlock : Block {
             if (!split_dense_zab && ab_is_nint &&
                     tensor_parallel_grouped_projections_enabled() &&
                     tensor_parallel_shared_linear_attention_input_enabled() &&
-                    qkv_proj.layers.size() == 2 &&
-                    ab_nint_proj.layers.size() == 2) {
+                    qkv_proj.layers.size() == 2) {
                 QuantLinearProjectionRefs projections = {
                     &qkv_proj.layers[0], &qkv_proj.layers[1],
                     &z_proj,
-                    &ab_nint_proj.layers[0], &ab_nint_proj.layers[1],
                 };
+                const bool shared_tp_ab =
+                    ab_nint_proj.layers.size() == 2 &&
+                    ab_nint_proj.layers[0].tensor_parallel() &&
+                    ab_nint_proj.layers[1].tensor_parallel();
+                if (shared_tp_ab) {
+                    projections.push_back(&ab_nint_proj.layers[0]);
+                    projections.push_back(&ab_nint_proj.layers[1]);
+                }
                 if (tensor_parallel_output_projections_compatible(
                         projections)) {
                     auto parts = g_profiler.measure(
@@ -17727,8 +17739,17 @@ struct LinearBlock : Block {
                     qk_part = parts[0];
                     v_part = parts[1];
                     z = parts[2];
-                    alpha_raw = parts[3];
-                    beta_raw = parts[4];
+                    if (shared_tp_ab) {
+                        alpha_raw = parts[3];
+                        beta_raw = parts[4];
+                    } else {
+                        auto ab = g_profiler.measure(
+                            "linear.ab_proj", [&]() {
+                                return ab_nint_proj.forward(xn);
+                            });
+                        alpha_raw = ab[0];
+                        beta_raw = ab[1];
+                    }
                     shared_tp_projection_input = true;
                 }
             }
@@ -18653,8 +18674,15 @@ static std::unique_ptr<Block> load_block(
                 if (a_nint != b_nint) throw std::runtime_error("linear_attn a/b must use the same storage kind");
                 b->ab_is_nint = a_nint;
                 if (b->ab_is_nint) {
-                    b->ab_nint_proj = load_quant_group(
-                        mfq, {alpha_name, beta_name});
+                    const auto scalar_axis =
+                        tensor_parallel_mirror_linear_attention_scalars_enabled()
+                            ? std::optional<TensorParallelAxis>(
+                                TensorParallelAxis::Mirrored)
+                            : std::nullopt;
+                    b->ab_nint_proj = make_quant_group({
+                        load_quant_linear(mfq, alpha_name, scalar_axis),
+                        load_quant_linear(mfq, beta_name, scalar_axis),
+                    });
                 } else {
                     b->ab_proj = make_dense_group({
                         load_dense_gpu(mfq, alpha_name),
