@@ -95,7 +95,7 @@ int main() {
         const auto qwen4 = graph_with("qwen4_exp", "grid_vit", "next_token_prediction");
         const auto qwen4_plan = mfq_cuda_model_plan(qwen4);
         require(qwen4_plan.backbone == MfqCudaBackbone::qwen4_exp &&
-            qwen4_plan.vision == MfqCudaVisionAdapter::none && qwen4_plan.predictor == MfqCudaPredictorAdapter::none,
+            qwen4_plan.vision == MfqCudaVisionAdapter::none && qwen4_plan.predictor == MfqCudaPredictorAdapter::flash_next,
             "Qwen4 text/optional-component selection mismatch");
 
         const auto glm_next = graph_with("glm5_next", "grid_vit", "next_token_prediction");
@@ -103,8 +103,15 @@ int main() {
         require(glm_plan.backbone == MfqCudaBackbone::glm5_next,
             "GLM Flash-Next text adapter was not selected");
         require(glm_plan.vision == MfqCudaVisionAdapter::none &&
-            glm_plan.predictor == MfqCudaPredictorAdapter::none,
-            "text support incorrectly advertised unimplemented optional components");
+            glm_plan.predictor == MfqCudaPredictorAdapter::flash_next,
+            "GLM optional component selection mismatch");
+        for (const auto& graph:{qwen4,glm_next}) {
+            const auto plan=mfq_cuda_model_plan(graph);
+            const auto absent=mfq_cuda_component_state(graph,plan,false,false);
+            const auto loaded=mfq_cuda_component_state(graph,plan,false,true);
+            require(absent.mtp_supported && !absent.mtp_available && loaded.mtp_enabled,
+                "Flash-Next predictor declaration was confused with loaded weights");
+        }
 
         std::cout << "MFQ CUDA model plan tests passed\n";
         return 0;

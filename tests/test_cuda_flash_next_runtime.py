@@ -269,7 +269,7 @@ def glm_model_fixture(attention_types, sparse_ffn):
     return outer,w
 
 
-def glm_model_reference(config,w):
+def glm_model_reference(config,w,mtp=None,return_hidden=False):
     c=config["text_config"]
     def sm(x,axis=-1):
         e=np.exp(x-np.max(x,axis=axis,keepdims=True));return e/e.sum(axis=axis,keepdims=True)
@@ -349,6 +349,19 @@ def glm_model_reference(config,w):
                     attended[bi,token]=sm(logits)@keys
         value=np.einsum("bthi,hoi->btho",attended.astype(np.float16).astype(np.float32),w[p+".latent.output_unembedding.weight"])
         return lin(value.reshape(b,t,-1),p+".output")
+    if mtp is not None:
+        ids,previous,layer,positions=mtp
+        positions=np.arange(ids.shape[1]) if positions is None else positions
+        embeds=w["model.token_embedding.weight"][ids]
+        embeds=np.where((positions==0)[...,None],np.zeros_like(embeds),embeds)
+        x=lin(np.concatenate((norm(embeds,w["predictor.embedding_norm.weight"]),
+            norm(previous,w["predictor.hidden_norm.weight"])),axis=-1),"predictor.fusion")
+        p=f"predictor.block.{layer}"
+        residual=x.astype(np.float32)+mla(norm(x,w[p+".attention.norm.weight"]),p+".attention").astype(np.float32)
+        dtype=np.float32 if x.dtype==np.float32 else np.float16
+        branch=norm(residual,w[p+".mlp.norm.weight"]).astype(dtype)
+        multi=residual+ffn(branch,p+".mlp","sparse").astype(np.float32)
+        return norm(multi,w["predictor.output_norm.weight"]).astype(dtype),multi
     hidden=w["model.token_embedding.weight"][np.arange(1,8)[None]].astype(np.float16)
     x=np.broadcast_to(hidden[...,None,:],(*hidden.shape[:2],2,hidden.shape[-1])).copy()
     for i,kind in enumerate(c["layer_types"]):
@@ -360,10 +373,11 @@ def glm_model_reference(config,w):
         branch,post,mix=hc_pre(x,p+".mlp.mhc.pre")
         branch=ffn(norm(branch,w[p+".mlp.norm.weight"]),p+".mlp",c["mlp_layer_types"][i])
         x=hc_post(branch,x,post,mix)
-    return lin(norm(x.mean(axis=-2),w["model.output_norm.weight"]),"model.output")
+    normalized=norm(x.mean(axis=-2),w["model.output_norm.weight"])
+    return (normalized,normalized) if return_hidden else lin(normalized,"model.output")
 
 
-def write_glm_fixture(path,config,weights):
+def write_glm_fixture(path,config,weights,predictor=False):
     from mfq.formats.io import save
     from mfq.formats.header import FileHeader
     from mfq.formats.assets import MODEL_CONFIG_ASSET,MODEL_GRAPH_ASSET
@@ -373,6 +387,10 @@ def write_glm_fixture(path,config,weights):
         graph=dict(kind="causal_lm",backbone="glm5_next"),
         components=[dict(kind="text",tensor_root="model",implementation="glm5_next",policy="decoder")],
         capabilities=["text"])
+    if predictor:
+        graph["components"].append(dict(kind="predictor",tensor_root="predictor",implementation="next_token_prediction",policy="optional"))
+        graph["canonical_naming"]["component_roots"].append("predictor")
+        graph["capabilities"].append("mtp")
     save(path,FileHeader(version=2,model_arch="glm5_next"),
          {**weights,MODEL_CONFIG_ASSET:json.dumps(config).encode(),MODEL_GRAPH_ASSET:json.dumps(graph).encode()})
 
@@ -723,9 +741,9 @@ def qwen_model_fixture(interval=2,silu_gate=False,ple=True):
     return outer,w
 
 
-def qwen_model_reference(config,w,positions=None):
+def qwen_model_reference(config,w,positions=None,mtp=None,return_hidden=False):
     c=config["text_config"];h=c["hidden_size"];streams=c["hc_count"]
-    ids=np.arange(1,8,dtype=np.int64)[None];b,t=ids.shape
+    ids=np.arange(1,8,dtype=np.int64)[None] if mtp is None else mtp[0];b,t=ids.shape
     x=np.tile(w["model.token_embedding.weight"][ids].astype(np.float16),(1,1,streams))
     def lin(x,p):return x.astype(w[p+".weight"].dtype)@w[p+".weight"].T
     def gr(x,p,combine=True):
@@ -736,9 +754,17 @@ def qwen_model_reference(config,w,positions=None):
         mixed=(mixing.reshape(b,t,streams,h)*normalized.reshape(b,t,streams,h)).mean(-2)
         inject=2*sigmoid(lin(normalized,p.removesuffix(".pre")+".post.inject")/streams) if combine else None
         return mixed,inject
-    for i,kind in enumerate(c["layer_types"]):
-        p=f"model.block.{i}"
-        if i+1 in c["ple_layer_ids"]:
+    if mtp is not None:
+        def norm(x,p):
+            f=x.astype(np.float32)
+            return (f/np.sqrt((f*f).mean(-1,keepdims=True)+c["rms_norm_eps"])*(1+w[p+".weight"])).astype(x.dtype)
+        e=lin(norm(w["model.token_embedding.weight"][ids],"predictor.embedding_norm"),"predictor.fusion.embedding")
+        hidden=norm(mtp[1],"predictor.hidden_norm").reshape(b,t,streams,h)
+        x=(lin(hidden,"predictor.fusion.hidden")+e[:,:,None,:]).reshape(b,t,streams*h)
+    layers=list(enumerate(c["layer_types"])) if mtp is None else [(mtp[2],"full_attention")]
+    for i,kind in layers:
+        p=f"{'model' if mtp is None else 'predictor'}.block.{i}"
+        if mtp is None and i+1 in c["ple_layer_ids"]:
             a=p+".position_embedding"
             metadata=dict(ngram=3,heads_per_ngram=2,eos=c["eos_token_id"],hidden=h,streams=streams,
                 multipliers=w[a+".ngram.layer_multipliers"].tolist(),offsets=w[a+".ngram.head_offsets"].tolist(),vocab=w[a+".ngram.head_vocab_sizes"].tolist())
@@ -769,16 +795,21 @@ def qwen_model_reference(config,w,positions=None):
         shared=sigmoid(lin(source,a+".shared_expert.router"))*lin(g*sigmoid(g)*u,a+".shared_expert.down")
         branch=(np.stack(routed)+shared).reshape(b,t,h)
         x=x+(branch[:,:,None]*inject[...,None]).reshape(x.shape)
-    return lin(gr(x,"model.mhc.pre",False)[0],"model.output")
+    sample=gr(x,"model.mhc.pre" if mtp is None else "predictor.mhc.pre",False)[0]
+    return (sample,x) if mtp is not None or return_hidden else lin(sample,"model.output")
 
 
-def write_qwen_fixture(path,config,weights):
+def write_qwen_fixture(path,config,weights,predictor=False):
     from mfq.formats.io import save
     from mfq.formats.header import FileHeader
     from mfq.formats.assets import MODEL_CONFIG_ASSET,MODEL_GRAPH_ASSET
     graph=dict(schema_version=1,architecture="qwen4_exp",canonical_naming=dict(namespace="mfq.tensor",version=1,component_roots=["model"]),
         topology=dict(text_layers=2),graph=dict(kind="causal_lm",backbone="qwen4_exp"),
         components=[dict(kind="text",tensor_root="model",implementation="qwen4_exp",policy="decoder")],capabilities=["text"])
+    if predictor:
+        graph["components"].append(dict(kind="predictor",tensor_root="predictor",implementation="next_token_prediction",policy="optional"))
+        graph["canonical_naming"]["component_roots"].append("predictor")
+        graph["capabilities"].append("mtp")
     save(path,FileHeader(version=2,model_arch="qwen4_exp"),{**weights,MODEL_CONFIG_ASSET:json.dumps(config).encode(),MODEL_GRAPH_ASSET:json.dumps(graph).encode()})
 
 
@@ -818,3 +849,79 @@ def test_qwen_native_rejects_inconsistent_config(tmp_path,error):
     elif error=="mtp":c["mtp"]={"num_hidden_layers":1}
     path=tmp_path/"invalid-qwen.mfq";write_qwen_fixture(path,config,w)
     result=run_glm_fixture(path);assert result.returncode!=0 and "flash_next_check " not in result.stdout
+
+
+def mtp_fixture(family,layers=2):
+    rng=np.random.default_rng(3811 if family=="qwen" else 5311)
+    rand=lambda shape:rng.normal(scale=.05,size=shape).astype(np.float32)
+    if family=="qwen":
+        config,w=qwen_model_fixture(2,True,True)
+        _,head=qwen_model_fixture(1,True,False)
+        h=config["text_config"]["hidden_size"];streams=config["text_config"]["hc_count"]
+        config["text_config"]["mtp_num_hidden_layers"]=layers
+        w["predictor.embedding_norm.weight"]=rand((h,));w["predictor.hidden_norm.weight"]=rand((streams*h,))
+        w["predictor.fusion.embedding.weight"]=rand((h,h));w["predictor.fusion.hidden.weight"]=rand((h,h))
+        for name,value in head.items():
+            if name.startswith("model.mhc.pre."):w[name.replace("model.","predictor.",1)]=value.copy()
+    else:
+        config,w=glm_model_fixture(("linear_attention","deepseek_sparse_attention"),True)
+        _,head=glm_model_fixture(("deepseek_sparse_attention",)*2,True)
+        h=config["text_config"]["hidden_size"]
+        config["text_config"]["num_nextn_predict_layers"]=layers
+        for name in ("embedding_norm","hidden_norm","output_norm"):w[f"predictor.{name}.weight"]=1+rand((h,))
+        w["predictor.fusion.weight"]=rand((h,2*h))
+    for layer in range(layers):
+        prefix=f"model.block.{layer}."
+        for name,value in head.items():
+            if name.startswith(prefix):w[name.replace("model.","predictor.",1)]=value.copy()
+    return config,w
+
+
+def run_mtp_fixture(path):
+    bridge=os.environ.get("MFQ_FLASH_NEXT_NATIVE_TEST")
+    if not bridge:pytest.skip("MFQ_FLASH_NEXT_NATIVE_TEST required")
+    return subprocess.run([str(Path(bridge).with_name("mfq-decode")),"--mfq",str(path),"--ctx-size","32","--check-flash-next-mtp"],
+        text=True,capture_output=True,timeout=90)
+
+
+@pytest.mark.parametrize("family",["qwen","glm"])
+@pytest.mark.parametrize("layers",[1,2])
+def test_flash_next_mtp_native_equation_and_server_generation(tmp_path,family,layers):
+    config,w=mtp_fixture(family,layers);path=tmp_path/"predictor.mfq"
+    (write_qwen_fixture if family=="qwen" else write_glm_fixture)(path,config,w,True)
+    process=run_mtp_fixture(path);assert process.returncode==0,process.stdout+process.stderr
+    raw=json.loads(next(line.removeprefix("flash_next_mtp_check ") for line in process.stdout.splitlines() if line.startswith("flash_next_mtp_check ")))
+    array=lambda row:np.array(row["data"],np.float32).reshape(row["shape"])
+    previous=array(raw["previous"]);ids=np.arange(1,8,dtype=np.int64)[None]
+    reference=qwen_model_reference if family=="qwen" else glm_model_reference
+    for i,row in enumerate(raw["layers"]):
+        expected=reference(config,w,mtp=(ids,previous,i,None))
+        for name,value in zip(("full","multi"),expected):np.testing.assert_allclose(array(row[name]),value,atol=2e-3,rtol=2e-3)
+        np.testing.assert_allclose(array(row["logits"]),expected[0]@w["model.output.weight"].T,atol=2e-3,rtol=2e-3)
+        for name in ("reset","batch_reset","independent","uncached"):np.testing.assert_array_equal(array(row[name]),array(row["full"]))
+        np.testing.assert_allclose(array(row["chunked"]),array(row["full"]),atol=1.5e-2,rtol=1.5e-2)
+        np.testing.assert_allclose(array(row["batch"]),np.repeat(array(row["full"]),2,axis=0),atol=2e-3,rtol=2e-3)
+        positions=np.arange(7)+3
+        if family=="qwen":
+            positions=np.stack((positions,positions+2,positions+4))
+            axis=reference(config,w,positions=positions,mtp=(ids,previous,i,None))[0]
+        else:axis=reference(config,w,mtp=(ids,previous,i,positions))[0]
+        np.testing.assert_allclose(array(row["axis"]),axis,atol=2e-3,rtol=2e-3)
+    target=reference(config,w,return_hidden=True)
+    np.testing.assert_allclose(array(raw["target_normalized"]),target[0],atol=2e-3,rtol=2e-3)
+    np.testing.assert_allclose(array(raw["target_raw"]),target[1],atol=2e-3,rtol=2e-3)
+    assert len(raw["layers"])==layers and len(raw["greedy"])==12 and raw["cycles"]>0
+
+
+@pytest.mark.parametrize("family",["qwen","glm"])
+@pytest.mark.parametrize("error",["missing_norm","undeclared","partial_layer","wrong_width"])
+def test_flash_next_mtp_rejects_incomplete_head(tmp_path,family,error):
+    config,w=mtp_fixture(family)
+    if error=="missing_norm":del w["predictor.embedding_norm.weight"]
+    elif error=="undeclared":config["text_config"]["mtp_num_hidden_layers" if family=="qwen" else "num_nextn_predict_layers"]=0
+    elif error=="partial_layer":del w["predictor.block.1.attention.output.weight"]
+    else:w["predictor.hidden_norm.weight"]=np.ones(5,np.float32)
+    path=tmp_path/"bad-predictor.mfq"
+    (write_qwen_fixture if family=="qwen" else write_glm_fixture)(path,config,w,True)
+    result=run_mtp_fixture(path)
+    assert result.returncode!=0 and "flash_next_mtp_check " not in result.stdout

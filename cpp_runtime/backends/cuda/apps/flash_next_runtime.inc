@@ -59,9 +59,9 @@ static Linear dense_ffn(const MfqFile& file,const std::string& p,double limit) {
     };
 }
 
-static Linear glm_ffn(const MfqFile& file,const mfq::flash_next::GlmConfig& c,int i) {
-    const auto p="model.block."+std::to_string(i)+".mlp";
-    if (c.mlp_types.at(i)=="dense") return dense_ffn(file,p,c.swiglu_limit);
+static Linear glm_ffn(const MfqFile& file,const mfq::flash_next::GlmConfig& c,int i,const std::string& root="model") {
+    const auto p=root+".block."+std::to_string(i)+".mlp";
+    if (root=="model" && c.mlp_types.at(i)=="dense") return dense_ffn(file,p,c.swiglu_limit);
     auto gate_up=routed(file,p+".experts.gate_up.weight",i,c.experts,2*c.moe_intermediate,c.hidden);
     auto down=routed(file,p+".experts.down.weight",i,c.experts,c.hidden,c.moe_intermediate);
     auto router=linear(file,p+".router.weight"),shared=dense_ffn(file,p+".shared_expert",c.swiglu_limit);
@@ -100,8 +100,8 @@ struct Gr {
     }
 };
 
-static Linear qwen_ffn(const MfqFile& file,const mfq::flash_next::QwenConfig& c,int i) {
-    const auto p="model.block."+std::to_string(i)+".mlp";
+static Linear qwen_ffn(const MfqFile& file,const mfq::flash_next::QwenConfig& c,int i,const std::string& root="model") {
+    const auto p=root+".block."+std::to_string(i)+".mlp";
     auto gate_up=routed(file,p+".experts.gate_up.weight",i,c.experts,2*c.moe_width,c.hidden);
     auto down=routed(file,p+".experts.down.weight",i,c.experts,c.hidden,c.moe_width);
     auto router=linear(file,p+".router.weight"),shared_gate=linear(file,p+".shared_expert.router.weight");
@@ -125,7 +125,7 @@ static Linear qwen_ffn(const MfqFile& file,const mfq::flash_next::QwenConfig& c,
 static std::vector<int64_t> integers(const MfqFile& file,const std::string& name) {
     const auto& type=file.record(name).dtype;
     MFQ_RUNTIME_CHECK(type=="I64" || type=="I32","Qwen4 PLE metadata must be a dense integer array: ",name);
-    auto host=load_dense_gpu(file,name).to(tb::kCPU,tb::kInt64).contiguous();
+    auto host=load_dense_gpu(file,name).to(tb::kInt64).contiguous().cpu();
     MFQ_RUNTIME_CHECK(host.dim()==1,"Qwen4 PLE metadata must be a vector");
     return {host.data_ptr<int64_t>(),host.data_ptr<int64_t>()+host.numel()};
 }
@@ -228,12 +228,12 @@ struct Qwen4Block final : Block {
     std::unique_ptr<mfq::flash_next::Gdn> gdn;
     std::unique_ptr<mfq::flash_next::Qsa> qsa;
     std::unique_ptr<mfq::flash_next::Ple> ple;
-    Qwen4Block(const MfqFile& file,const mfq::flash_next::QwenConfig& c,int i)
-        : config(c),attention_gr(file,c,"model.block."+std::to_string(i)+".attention.mhc.pre"),
-          ffn_gr(file,c,"model.block."+std::to_string(i)+".mlp.mhc.pre"),ffn(flash_runtime::qwen_ffn(file,c,i)) {
+    Qwen4Block(const MfqFile& file,const mfq::flash_next::QwenConfig& c,int i,const std::string& root="model")
+        : config(c),attention_gr(file,c,root+".block."+std::to_string(i)+".attention.mhc.pre"),
+          ffn_gr(file,c,root+".block."+std::to_string(i)+".mlp.mhc.pre"),ffn(flash_runtime::qwen_ffn(file,c,i,root)) {
         using namespace flash_runtime;
-        const auto p="model.block."+std::to_string(i);
-        if (c.layer_types.at(i)=="linear_attention") {
+        const auto p=root+".block."+std::to_string(i);
+        if (root=="model" && c.layer_types.at(i)=="linear_attention") {
             const auto a=p+".linear_attention";
             mfq::flash_next::GdnWeights w{linear(file,a+".qkv.weight"),linear(file,a+".gate.weight"),
                 linear(file,a+".alpha.weight"),linear(file,a+".beta.weight"),linear(file,a+".output.weight"),
@@ -248,7 +248,7 @@ struct Qwen4Block final : Block {
             auto rotary=std::make_shared<mfq::flash_next::Rotary>(c.rotary,c.maximum,c.rope_base,c.sections,c.interleaved);
             qsa=std::make_unique<mfq::flash_next::Qsa>(std::move(w),qc,std::move(rotary));
         }
-        if (std::find(c.ple_layers.begin(),c.ple_layers.end(),i+1)!=c.ple_layers.end()) ple=qwen_ple(file,c,p+".position_embedding");
+        if (root=="model" && std::find(c.ple_layers.begin(),c.ple_layers.end(),i+1)!=c.ple_layers.end()) ple=qwen_ple(file,c,p+".position_embedding");
     }
     void reset(int64_t) override {if (gdn) gdn->reset();if (qsa) qsa->reset();if (ple) ple->reset();}
     void commit_speculative() {if (gdn) gdn->commit();if (ple) ple->commit();}

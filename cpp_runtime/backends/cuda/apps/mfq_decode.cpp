@@ -19363,8 +19363,9 @@ struct Model {
             cache_pos += T;
         }
         x = tensor_to_cuda_device(x, primary);
-        if (raw_hidden != nullptr) *raw_hidden = x;
-        return finalize_hidden(x, B, T);
+        auto finalized=finalize_hidden(x, B, T);
+        if (raw_hidden != nullptr) *raw_hidden = c.is_glm5_next()?finalized:x;
+        return finalized;
     }
 
     mfq_tensor_backend::Tensor forward_inputs(
@@ -19453,6 +19454,7 @@ struct Model {
 
     mfq_tensor_backend::Tensor next_token_from_hidden(mfq_tensor_backend::Tensor y) {
         auto last = y.index({Slice(), -1, Slice()});
+        if (c.is_flash_next()) return mfq_tensor_backend::argmax(logits_from_hidden(last),-1).to(mfq_tensor_backend::kInt64);
         if (c.is_minicpmo45()) {
             auto logits = logits_from_hidden(
                 last.to(mfq_tensor_backend::kBFloat16).contiguous());
@@ -19762,11 +19764,14 @@ struct CudaQwen35Mtp {
     }
 };
 
+#include "flash_next_mtp.inc"
+
 struct CudaRuntimeComponents {
     mfq::MfqModelGraph graph;
     mfq::cuda::MfqCudaModelPlan plan;
     std::optional<MiniCPMO45Runtime> minicpmo;
     std::optional<CudaQwen35Mtp> qwen_mtp;
+    std::optional<CudaFlashNextMtp> flash_mtp;
     bool vision_available = false;
     bool mtp_available = false;
 
@@ -19814,6 +19819,13 @@ static CudaRuntimeComponents load_cuda_runtime_components(
         } else {
             std::cerr << "qwen_mtp unavailable: initial CUDA adapter requires dense single-GPU Qwen blocks\n";
         }
+    }
+    if (result.plan.predictor == mfq::cuda::MfqCudaPredictorAdapter::flash_next) {
+        MFQ_RUNTIME_CHECK(model.c.is_flash_next() && model.supports_qwen_speculation(),"invalid Flash-Next predictor backbone");
+        MfqFile predictor_file(mfq_path);
+        (void)load_config(predictor_file,config_path);
+        result.flash_mtp=CudaFlashNextMtp::load_if_present(predictor_file,model.c);
+        result.mtp_available=result.flash_mtp.has_value();
     }
     return result;
 }
@@ -21486,8 +21498,9 @@ private:
     bool trace_ = false;
 };
 
+template<class Predictor>
 static int32_t generate_qwen35_mtp_tokens(
-        Model& model, CudaQwen35Mtp& mtp,
+        Model& model, Predictor& mtp,
         const std::vector<int64_t>& prompt, const MfqSamplingParams& sampling,
         const MfqTokenCallback& on_token, const MfqPrefillCallback& on_prefill) {
     using Tensor = mfq_tensor_backend::Tensor;
@@ -21529,7 +21542,8 @@ static int32_t generate_qwen35_mtp_tokens(
             sampling.temperature, sampling.top_k, sampling.top_p);
     };
     auto logits_for = [&](Tensor normalized) {
-        return model.logits_from_hidden(normalized.to(mfq_tensor_backend::kFloat16).contiguous());
+        return model.logits_from_hidden((model.c.is_flash_next()?normalized:
+            normalized.to(mfq_tensor_backend::kFloat16)).contiguous());
     };
     int32_t generated = 0;
     auto emit = [&](int32_t token) {
@@ -21560,9 +21574,14 @@ static int32_t generate_qwen35_mtp_tokens(
         const double prefill_ms = timer.elapsed_ms();
         if (on_prefill) on_prefill(MfqPrefillTiming{prompt.size(), prefill_ms, 0., prefill_ms});
         if (!emit(pending) || generated == limit) return generated;
-        // Match Metal's teacher-forced prompt priming, reserving the final
-        // backbone row for the first live next-token proposal.
-        if (prompt.size() > 1) {
+        if (model.c.is_flash_next()) {
+            // Flash-Next starts an empty draft cache after the first target
+            // decode. This differs from Qwen3.5's teacher-forced prompt prime.
+            auto next_hidden=model.hidden_forward(ids_for({pending}),mfq_nullopt,mfq_nullopt,
+                nullptr,mfq_nullopt,&raw);
+            pending=sample_normal(logits_for(next_hidden),counts);
+            if (!emit(pending) || generated==limit) return generated;
+        } else if (prompt.size() > 1) {
             (void)mtp.forward(model, raw.narrow(1, 0, raw.size(1) - 1),
                 input_ids.narrow(1, 1, input_ids.size(1) - 1));
         }
@@ -21633,15 +21652,17 @@ static int32_t generate_server_tokens(
     const MfqPrefillCallback & on_prefill,
     const MfqPromptCachePlan & cache_plan,
     const MfqTokenConstraintPtr & token_constraint,
-    CudaQwen35Mtp* mtp = nullptr)
+    CudaQwen35Mtp* mtp = nullptr,
+    CudaFlashNextMtp* flash_mtp = nullptr)
 {
     std::lock_guard<std::mutex> lock(model_mutex);
     const char* mtp_reprefill = std::getenv("MFQ_SERVER_REPREFILL");
     const char* mtp_trace = std::getenv("MFQ_SERVER_TRACE_INCREMENTAL");
-    if (mtp != nullptr && sampling.enable_mtp && sampling.max_tokens > 1 && !token_constraint &&
+    if ((mtp != nullptr || flash_mtp != nullptr) && sampling.enable_mtp && sampling.max_tokens > 1 && !token_constraint &&
         !(mtp_reprefill != nullptr && mtp_reprefill[0] == '1') &&
         !(mtp_trace != nullptr && mtp_trace[0] == '1')) {
         // Predictor state is not in the persistent session snapshot contract.
+        if (flash_mtp) return generate_qwen35_mtp_tokens(model,*flash_mtp,prompt,sampling,on_token,on_prefill);
         return generate_qwen35_mtp_tokens(model, *mtp, prompt, sampling, on_token, on_prefill);
     }
     auto options = mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA);
@@ -27102,6 +27123,8 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
     return backend;
 }
 
+#include "flash_next_mtp_check.inc"
+
 static int run_flash_next_check(Model& model) {
     namespace tb=mfq_tensor_backend;
     MFQ_RUNTIME_CHECK(model.c.is_flash_next() && model.c.vocab_size>=8 && model.c.max_position_embeddings>=16,
@@ -27260,6 +27283,7 @@ int main(int argc, char ** argv) {
         bool check_text_session_state = false;
         bool check_qwen35_mtp = false;
         bool check_flash_next = false;
+        bool check_flash_next_mtp = false;
         bool compare_dsv4_hc_ops = false;
         bool compare_dsv4_hc_model = false;
         bool check_attention_swa_decode = false;
@@ -27389,6 +27413,7 @@ int main(int argc, char ** argv) {
             }
             else if (a == "--check-qwen35-mtp") check_qwen35_mtp = true;
             else if (a == "--check-flash-next") check_flash_next = true;
+            else if (a == "--check-flash-next-mtp") check_flash_next_mtp = true;
             else if (a == "--bench-qwen35-mtp" && i + 1 < argc) bench_qwen35_mtp = argv[++i];
             else if (a == "--bench-qwen35-mtp-reps" && i + 1 < argc) bench_qwen35_mtp_reps = std::stoi(argv[++i]);
             else if (a == "--compare-dsv4-hc-ops") compare_dsv4_hc_ops = true;
@@ -27878,7 +27903,7 @@ int main(int argc, char ** argv) {
                 context_size, minicpmo_tts_steps);
         }
         if (mfq_path.empty() ||
-            (!server_mode && !check_qwen35_mtp && !check_flash_next && bench_qwen35_mtp.empty() && ids_arg.empty() && ids_file.empty() &&
+            (!server_mode && !check_qwen35_mtp && !check_flash_next && !check_flash_next_mtp && bench_qwen35_mtp.empty() && ids_arg.empty() && ids_file.empty() &&
                 kl_base.empty() && prefill_sweep_arg.empty())) {
             std::cerr << "usage: mfq-decode --mfq model.mfq [--config config.json] "
                          "(--ids 1,2,3 --gen 128 | --check-qwen35-mtp | --bench-qwen35-mtp ordinary|mtp | --minicpmo-eval-batch "
@@ -28104,11 +28129,15 @@ int main(int argc, char ** argv) {
         Model model = load_model(mfq_path, config_path, context_size);
         CudaRuntimeComponents server_components =
             load_cuda_runtime_components(model, mfq_path,
-                server_mode || check_qwen35_mtp || !bench_qwen35_mtp.empty(), config_path);
+                server_mode || check_qwen35_mtp || check_flash_next_mtp || !bench_qwen35_mtp.empty(), config_path);
         mfq_cuda_synchronize();
         auto t1 = std::chrono::steady_clock::now();
         report_cuda_memory("loaded");
         if (check_flash_next) return run_flash_next_check(model);
+        if (check_flash_next_mtp) {
+            MFQ_RUNTIME_CHECK(server_components.flash_mtp.has_value(),"Flash-Next MTP diagnostic requires a loaded predictor component");
+            return run_flash_next_mtp_check(model,*server_components.flash_mtp);
+        }
         if (check_qwen35_mtp) {
             MFQ_RUNTIME_CHECK(server_components.qwen_mtp.has_value(),
                 "--check-qwen35-mtp requires a supported model containing MTP weights");
@@ -28223,7 +28252,8 @@ int main(int argc, char ** argv) {
                     server_model, model_mutex, decode_graph_cache,
                     text_session_cache, prompt, sampling,
                     on_token, on_prefill, cache_plan, token_constraint,
-                    server_components.qwen_mtp ? &*server_components.qwen_mtp : nullptr);
+                    server_components.qwen_mtp ? &*server_components.qwen_mtp : nullptr,
+                    server_components.flash_mtp ? &*server_components.flash_mtp : nullptr);
             }, {}, duplex_backend, {
                 [&](const std::string & source_session_id,
                         const std::string & target_session_id) {

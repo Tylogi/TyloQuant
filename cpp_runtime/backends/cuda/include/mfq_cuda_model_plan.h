@@ -30,6 +30,7 @@ enum class MfqCudaVisionAdapter {
 enum class MfqCudaPredictorAdapter {
     none,
     qwen35,
+    flash_next,
 };
 
 struct MfqCudaModelPlan {
@@ -92,6 +93,10 @@ inline MfqCudaModelPlan mfq_cuda_model_plan(
         predictor->implementation == "next_token_prediction" &&
         predictor->tensor_root == "predictor") {
         result.predictor = MfqCudaPredictorAdapter::qwen35;
+    }
+    if ((graph.backbone=="qwen4_exp" || graph.backbone=="glm5_next") && predictor!=nullptr &&
+        predictor->implementation=="next_token_prediction" && predictor->tensor_root=="predictor") {
+        result.predictor=MfqCudaPredictorAdapter::flash_next;
     }
     return result;
 }
