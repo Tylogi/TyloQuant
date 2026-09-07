@@ -1338,6 +1338,12 @@ static bool tensor_parallel_mirror_linear_attention_scalars_enabled() {
     return environment == nullptr || std::atoi(environment) != 0;
 }
 
+static bool tensor_parallel_mirror_qwen35_attention_kv_enabled() {
+    const char * environment = std::getenv(
+        "MFQ_TP_MIRROR_QWEN35_ATTENTION_KV");
+    return environment == nullptr || std::atoi(environment) != 0;
+}
+
 struct LayerPlacementConfig {
     std::vector<int> devices;
     std::vector<double> split;
@@ -16215,6 +16221,10 @@ struct FullBlock : Block {
     mfq_tensor_backend::Tensor ffn_post_norm, ffn_post_norm_1, ffn_pre_norm_2, ffn_post_norm_2;
     mfq_tensor_backend::Tensor layer_scale;
     QuantLinearGroup qkv;
+    bool split_q_kv_projections = false;
+    QuantLinear q_projection;
+    QuantLinear k_projection;
+    QuantLinear v_projection;
     QuantLinear o;
     FFN ffn;
     NintMoeWeight gemma_moe_gate_up;
@@ -16300,7 +16310,15 @@ struct FullBlock : Block {
                     .reshape({B, T, H});
         });
         trace_qwen_stage("qwen.attn_norm", xn);
-        auto parts = g_profiler.measure("full.qkv", [&]() { return qkv.forward(xn); });
+        auto parts = g_profiler.measure("full.qkv", [&]() {
+            if (!split_q_kv_projections) return qkv.forward(xn);
+            std::vector<mfq_tensor_backend::Tensor> result;
+            result.reserve(3);
+            result.push_back(q_projection.forward(xn));
+            result.push_back(k_projection.forward(xn));
+            result.push_back(v_projection.forward(xn));
+            return result;
+        });
         if (parts.size() != (value_equals_key ? 2u : 3u)) {
             throw std::runtime_error("attention projection group has the wrong output count");
         }
@@ -18641,9 +18659,28 @@ static std::unique_ptr<Block> load_block(
         b->attn_norm = load_dense_gpu(mfq, lp + "attention.norm.weight");
         b->ffn_norm = load_dense_gpu(mfq, lp + "mlp.norm.weight");
         const std::string ap = lp + "attention.";
-        b->qkv = load_quant_group(mfq, {
-            ap + "query.weight", ap + "key.weight", ap + "value.weight"},
+        const std::string query_name = ap + "query.weight";
+        const std::string key_name = ap + "key.weight";
+        const std::string value_name = ap + "value.weight";
+        const bool mirror_qwen35_kv =
+            c.qwen35_attn_q_gate &&
+            tensor_parallel_mirror_qwen35_attention_kv_enabled() &&
+            is_quant_dtype(mfq.record(key_name).dtype) &&
+            is_quant_dtype(mfq.record(value_name).dtype);
+        if (mirror_qwen35_kv) {
+            b->split_q_kv_projections = true;
+            b->q_projection = load_quant_linear(mfq, query_name);
+            const auto mirrored = std::optional<TensorParallelAxis>(
+                TensorParallelAxis::Mirrored);
+            b->k_projection = load_quant_linear(
+                mfq, key_name, mirrored);
+            b->v_projection = load_quant_linear(
+                mfq, value_name, mirrored);
+        } else {
+            b->qkv = load_quant_group(mfq, {
+                ap + "query.weight", ap + "key.weight", ap + "value.weight"},
             2, nullptr, c.is_minicpmo45());
+        }
         b->o = load_quant_linear(mfq, ap + "output.weight");
         if (mfq.has_record(ap + "query_norm.weight")) {
             b->q_norm = load_dense_gpu(mfq, ap + "query_norm.weight");
