@@ -403,6 +403,10 @@ public:
         };
     }
 
+    int64_t queued_requests() const {
+        return queued_.load(std::memory_order_relaxed);
+    }
+
 private:
     struct Request {
         Request(
@@ -594,6 +598,7 @@ private:
 
     void retire_cancelled_requests() {
         std::vector<std::shared_ptr<Request>> survivors;
+        std::vector<std::shared_ptr<Request>> cancelled;
         std::vector<int64_t> survivor_rows;
         int64_t survivor_max_position = 0;
         survivors.reserve(active_.size());
@@ -602,7 +607,7 @@ private:
             const auto & request = active_[row];
             if (request->cancel_requested.load(
                     std::memory_order_acquire)) {
-                complete_request(request);
+                cancelled.push_back(request);
                 continue;
             }
             survivors.push_back(request);
@@ -622,6 +627,9 @@ private:
         active_count_.store(
             static_cast<int64_t>(active_.size()),
             std::memory_order_relaxed);
+        for (const auto & request : cancelled) {
+            complete_request(request);
+        }
     }
 
     void decode_active() {
@@ -677,6 +685,8 @@ private:
         ++decode_batches_;
         decode_tokens_.fetch_add(batch);
         std::vector<std::shared_ptr<Request>> survivors;
+        std::vector<std::pair<std::shared_ptr<Request>,
+            std::exception_ptr>> completions;
         std::vector<int64_t> survivor_rows;
         survivors.reserve(active_.size());
         survivor_rows.reserve(active_.size());
@@ -686,7 +696,7 @@ private:
             request->cache_length += 1;
             if (request->cancel_requested.load(
                     std::memory_order_acquire)) {
-                complete_request(request);
+                completions.emplace_back(request, std::exception_ptr{});
                 continue;
             }
             try {
@@ -702,7 +712,8 @@ private:
                 if (request->cancel_requested.load(
                             std::memory_order_acquire) ||
                         request->produced >= request->generation_limit) {
-                    complete_request(request);
+                    completions.emplace_back(
+                        request, std::exception_ptr{});
                     continue;
                 }
                 if (request->counts.defined()) {
@@ -714,7 +725,8 @@ private:
                 survivor_max_position = std::max(
                     survivor_max_position, request->cache_length);
             } catch (...) {
-                complete_request(request, std::current_exception());
+                completions.emplace_back(
+                    request, std::current_exception());
             }
         }
         if (survivors.empty()) {
@@ -730,6 +742,9 @@ private:
         active_count_.store(
             static_cast<int64_t>(active_.size()),
             std::memory_order_relaxed);
+        for (const auto & completion : completions) {
+            complete_request(completion.first, completion.second);
+        }
     }
 
     void worker_main() noexcept {
@@ -866,7 +881,7 @@ static int run_qwen_continuous_batching_check(Model & model) {
 
     std::mutex model_mutex;
     CudaContinuousBatcher batcher(
-        model, model_mutex, 4, std::chrono::microseconds(2000));
+        model, model_mutex, 4, std::chrono::milliseconds(100));
     std::mutex gate_mutex;
     std::condition_variable gate_ready;
     bool first_prefilled = false;
@@ -897,9 +912,13 @@ static int run_qwen_continuous_batching_check(Model & model) {
             first_error = std::current_exception();
         }
     });
-    {
-        std::unique_lock<std::mutex> lock(gate_mutex);
-        gate_ready.wait(lock, [&] { return first_prefilled; });
+    bool first_queued = false;
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        if (batcher.queued_requests() > 0) {
+            first_queued = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     std::thread second_thread([&] {
         try {
@@ -918,10 +937,15 @@ static int run_qwen_continuous_batching_check(Model & model) {
             second_error = std::current_exception();
         }
     });
+    bool first_callback_started = false;
     bool callback_isolated = false;
     {
         std::unique_lock<std::mutex> lock(gate_mutex);
-        callback_isolated = gate_ready.wait_for(
+        first_callback_started = gate_ready.wait_for(
+            lock, std::chrono::seconds(10), [&] {
+                return first_prefilled;
+            });
+        callback_isolated = first_callback_started && gate_ready.wait_for(
             lock, std::chrono::seconds(10), [&] {
                 return second_delivered;
             });
@@ -932,7 +956,8 @@ static int run_qwen_continuous_batching_check(Model & model) {
     second_thread.join();
     if (first_error) std::rethrow_exception(first_error);
     if (second_error) std::rethrow_exception(second_error);
-    MFQ_RUNTIME_CHECK(callback_isolated,
+    MFQ_RUNTIME_CHECK(first_queued && first_callback_started &&
+        callback_isolated,
         "a blocked response callback stalled the scheduler");
     MFQ_RUNTIME_CHECK(first_produced == first_params.max_tokens &&
         second_produced == second_params.max_tokens,
@@ -961,6 +986,14 @@ static int run_qwen_continuous_batching_check(Model & model) {
             });
         return found == values.end() ? 0.0 : found->second;
     };
+    std::cout << "continuous_batching_check metrics max_batch="
+              << metric("continuous_batching_max_batch")
+              << " compactions="
+              << metric("continuous_batching_compactions")
+              << " active="
+              << metric("continuous_batching_active")
+              << " queued="
+              << metric("continuous_batching_queued") << '\n';
     MFQ_RUNTIME_CHECK(metric("continuous_batching_max_batch") >= 2.0 &&
         metric("continuous_batching_compactions") >= 1.0 &&
         metric("continuous_batching_active") == 0.0 &&
