@@ -181,15 +181,19 @@ __global__ void mfq_decode_mask_kernel(
     half* mask, int* kv_max, const int64_t* seq_len,
     int B, int mask_stride, int kv_tile)
 {
-    const int length = max(0, min(mask_stride, (int)seq_len[0]));
     const size_t total = (size_t)B * mask_stride;
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
          i < total; i += (size_t)gridDim.x * blockDim.x) {
+        const int batch = (int)(i / mask_stride);
+        const int length = max(
+            0, min(mask_stride, (int)seq_len[batch]));
         const int key = (int)(i % mask_stride);
         mask[i] = key < length ? __float2half(0.0f) : __float2half(-INFINITY);
     }
     for (int i = blockIdx.x * blockDim.x + threadIdx.x;
          i < B; i += gridDim.x * blockDim.x) {
+        const int length = max(
+            0, min(mask_stride, (int)seq_len[i]));
         kv_max[i] = ((length + kv_tile - 1) / kv_tile) * kv_tile;
     }
 }
@@ -707,8 +711,8 @@ static mfq_tensor_backend::Tensor mfq_attention_mma_decode_impl(
                 v_cache.scalar_type() == mfq_tensor_backend::kFloat16,
                 "mfq_attention_mma_decode: v cache must be contiguous CUDA f16");
     MFQ_RUNTIME_CHECK(seq_len.is_cuda() && seq_len.is_contiguous() &&
-                seq_len.scalar_type() == mfq_tensor_backend::kInt64 && seq_len.numel() == 1,
-                "mfq_attention_mma_decode: seq_len must be contiguous CUDA int64[1]");
+                seq_len.scalar_type() == mfq_tensor_backend::kInt64,
+                "mfq_attention_mma_decode: seq_len must be contiguous CUDA int64[B]");
     MFQ_RUNTIME_CHECK(mask.is_cuda() && mask.is_contiguous() && mask.scalar_type() == mfq_tensor_backend::kFloat16 &&
                 mask.dim() == 2,
                 "mfq_attention_mma_decode: mask must be contiguous CUDA f16[B, stride]");
@@ -725,6 +729,8 @@ static mfq_tensor_backend::Tensor mfq_attention_mma_decode_impl(
     const int D = (int)q.size(3);
     const int Hk = (int)k_cache.size(1);
     const int max_seq = (int)k_cache.size(2);
+    MFQ_RUNTIME_CHECK(seq_len.numel() == B,
+                "mfq_attention_mma_decode: seq_len must contain one value per batch row");
     MFQ_RUNTIME_CHECK(D == DKQ_EXPECTED && k_cache.size(3) == DKQ_EXPECTED &&
                 v_cache.size(3) ==
                     (V_IS_K_VIEW ? DKQ_EXPECTED : DV_EXPECTED),

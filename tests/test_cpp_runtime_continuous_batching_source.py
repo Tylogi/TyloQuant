@@ -16,6 +16,12 @@ BATCHING = (
 ROPE = (ROOT / "mfq" / "kernels" / "cuda" / "rope.cu").read_text(
     encoding="utf-8"
 )
+ATTENTION = (ROOT / "mfq" / "kernels" / "cuda" / "attention.cu").read_text(
+    encoding="utf-8"
+)
+ATTENTION_MMA = (
+    ROOT / "mfq" / "kernels" / "cuda" / "attention_mma.cu"
+).read_text(encoding="utf-8")
 
 
 def test_continuous_batching_is_an_explicit_server_mode():
@@ -42,6 +48,10 @@ def test_qwen_decode_accepts_independent_batch_positions():
     assert "cache_positions_override.has_value()" in DECODE
     assert "pos_batches" in ROPE
     assert "rows_per_batch" in ROPE
+    assert ATTENTION.count("seq_len[b]") >= 5
+    assert "seq_len.numel() == B" in ATTENTION
+    assert "seq_len[batch]" in ATTENTION_MMA
+    assert "seq_len.numel() == B" in ATTENTION_MMA
 
 
 def test_real_weight_gate_exercises_join_and_compaction():
@@ -49,4 +59,3 @@ def test_real_weight_gate_exercises_join_and_compaction():
     assert "batcher.queued_requests()" in BATCHING
     assert 'metric("continuous_batching_max_batch") >= 2.0' in BATCHING
     assert 'metric("continuous_batching_compactions") >= 1.0' in BATCHING
-

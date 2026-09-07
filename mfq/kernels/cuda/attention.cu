@@ -455,7 +455,7 @@ __global__ void attention_cache_decode_kernel(
     int b = qv / Hq;
     int hk = hq / rep;
     int tid = threadIdx.x;
-    int Tk = (int)seq_len[0];
+    int Tk = (int)seq_len[b];
     if (Tk < 0) {
         Tk = 0;
     }
@@ -508,8 +508,9 @@ static mfq_tensor_backend::Tensor attention_cache_decode_impl_cuda(
     MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous(), "attention_cache_decode: q must be cuda contiguous");
     MFQ_RUNTIME_CHECK(k_cache.is_cuda() && k_cache.is_contiguous(), "attention_cache_decode: k_cache must be cuda contiguous");
     MFQ_RUNTIME_CHECK(v_cache.is_cuda() && v_cache.is_contiguous(), "attention_cache_decode: v_cache must be cuda contiguous");
-    MFQ_RUNTIME_CHECK(seq_len.is_cuda() && seq_len.is_contiguous() && seq_len.scalar_type() == mfq_tensor_backend::kInt64 &&
-                seq_len.numel() == 1, "attention_cache_decode: seq_len must be cuda int64[1]");
+    MFQ_RUNTIME_CHECK(seq_len.is_cuda() && seq_len.is_contiguous() &&
+                seq_len.scalar_type() == mfq_tensor_backend::kInt64,
+                "attention_cache_decode: seq_len must be cuda int64[B]");
     MFQ_RUNTIME_CHECK(q.scalar_type() == k_cache.scalar_type() && q.scalar_type() == v_cache.scalar_type(),
                 "attention_cache_decode: q/k/v dtype mismatch");
     MFQ_RUNTIME_CHECK(q.scalar_type() == mfq_tensor_backend::kFloat16 || q.scalar_type() == mfq_tensor_backend::kBFloat16 ||
@@ -523,6 +524,8 @@ static mfq_tensor_backend::Tensor attention_cache_decode_impl_cuda(
     int D = (int)q.size(3);
     int Hk = (int)k_cache.size(1);
     int max_seq = (int)k_cache.size(2);
+    MFQ_RUNTIME_CHECK(seq_len.numel() == B,
+                "attention_cache_decode: seq_len must contain one value per batch row");
     MFQ_RUNTIME_CHECK(k_cache.size(0) == B && k_cache.size(3) == D, "attention_cache_decode: cache shape mismatch");
     MFQ_RUNTIME_CHECK(Hq % Hk == 0, "attention_cache_decode: GQA requires Hq % Hk == 0");
     int rep = Hq / Hk;
@@ -580,7 +583,7 @@ __global__ void attention_cache_decode_split_part_kernel(
     const int b = qv / Hq;
     const int hk = hq / rep;
     const int tid = threadIdx.x;
-    int Tk = (int)seq_len[0];
+    int Tk = (int)seq_len[b];
     Tk = Tk < 0 ? 0 : (Tk > max_seq ? max_seq : Tk);
     const int active_parts = attention_decode_active_parts(
         Tk, parts, dynamic_parts);
@@ -654,7 +657,7 @@ __global__ void attention_cache_decode_split_gqa4_d128_part_kernel(
     const int lane = tid & 31;
     const int warp = tid >> 5;
     const int hq0 = hk * REP;
-    int Tk = (int)seq_len[0];
+    int Tk = (int)seq_len[b];
     Tk = Tk < 0 ? 0 : (Tk > max_seq ? max_seq : Tk);
     const int active_parts = attention_decode_active_parts(
         Tk, parts, dynamic_parts);
@@ -743,7 +746,8 @@ __global__ void attention_cache_decode_split_reduce_kernel(
     const float* __restrict__ partial_l,
     const int64_t* __restrict__ seq_len,
     scalar_t* __restrict__ out,
-    int total, int parts, int workspace_parts, int D, int dynamic_parts)
+    int total, int Hq, int parts, int workspace_parts,
+    int D, int dynamic_parts)
 {
     const int qv = blockIdx.x;
     const int tid = threadIdx.x;
@@ -751,7 +755,8 @@ __global__ void attention_cache_decode_split_reduce_kernel(
         return;
     }
 
-    const int token_count = (int)seq_len[0];
+    const int b = qv / Hq;
+    const int token_count = (int)seq_len[b];
     const int active_parts = attention_decode_active_parts(
         token_count, parts, dynamic_parts);
     float m = -1e30f;
@@ -783,8 +788,9 @@ static mfq_tensor_backend::Tensor attention_cache_decode_split_impl_cuda(
     MFQ_RUNTIME_CHECK(q.is_cuda() && q.is_contiguous(), "attention_cache_decode_split: q must be cuda contiguous");
     MFQ_RUNTIME_CHECK(k_cache.is_cuda() && k_cache.is_contiguous(), "attention_cache_decode_split: k_cache must be cuda contiguous");
     MFQ_RUNTIME_CHECK(v_cache.is_cuda() && v_cache.is_contiguous(), "attention_cache_decode_split: v_cache must be cuda contiguous");
-    MFQ_RUNTIME_CHECK(seq_len.is_cuda() && seq_len.is_contiguous() && seq_len.scalar_type() == mfq_tensor_backend::kInt64 &&
-                seq_len.numel() == 1, "attention_cache_decode_split: seq_len must be cuda int64[1]");
+    MFQ_RUNTIME_CHECK(seq_len.is_cuda() && seq_len.is_contiguous() &&
+                seq_len.scalar_type() == mfq_tensor_backend::kInt64,
+                "attention_cache_decode_split: seq_len must be cuda int64[B]");
     MFQ_RUNTIME_CHECK(q.scalar_type() == k_cache.scalar_type() && q.scalar_type() == v_cache.scalar_type(),
                 "attention_cache_decode_split: q/k/v dtype mismatch");
     MFQ_RUNTIME_CHECK(q.scalar_type() == mfq_tensor_backend::kFloat16 || q.scalar_type() == mfq_tensor_backend::kBFloat16 ||
@@ -805,6 +811,8 @@ static mfq_tensor_backend::Tensor attention_cache_decode_split_impl_cuda(
     const int Hk = (int)k_cache.size(1);
     const int max_seq = (int)k_cache.size(2);
     const int total = B * Hq;
+    MFQ_RUNTIME_CHECK(seq_len.numel() == B,
+                "attention_cache_decode_split: seq_len must contain one value per batch row");
     MFQ_RUNTIME_CHECK(k_cache.size(0) == B && k_cache.size(3) == D, "attention_cache_decode_split: cache shape mismatch");
     MFQ_RUNTIME_CHECK(Hq % Hk == 0, "attention_cache_decode_split: GQA requires Hq % Hk == 0");
     MFQ_RUNTIME_CHECK(partial_o.dim() == 3 && partial_o.size(0) == total && partial_o.size(2) == D,
@@ -837,7 +845,7 @@ static mfq_tensor_backend::Tensor attention_cache_decode_split_impl_cuda(
     }                                                                                                  \
     attention_cache_decode_split_reduce_kernel<BD, scalar_t><<<total, BD, 0, stream>>>(               \
         partial_o.data_ptr<float>(), partial_m.data_ptr<float>(), partial_l.data_ptr<float>(),          \
-        seq_len.data_ptr<int64_t>(), out.data_ptr<scalar_t>(), total, (int)parts,                      \
+        seq_len.data_ptr<int64_t>(), out.data_ptr<scalar_t>(), total, Hq, (int)parts,                 \
         workspace_parts, D, dynamic_parts ? 1 : 0);                                                   \
 } while (0)
     MFQ_DISPATCH_FLOATING_TYPES_AND2(
@@ -907,7 +915,7 @@ __global__ void attention_cache_swa_kernel(
     const int b = rem / Hq;
     const int hk = hq / rep;
     const int tid = threadIdx.x;
-    const int64_t length = seq_len[0] > 0 ? seq_len[0] : 0;
+    const int64_t length = seq_len[b] > 0 ? seq_len[b] : 0;
     const int64_t qpos = length - T + tq;
     const int64_t end = qpos + 1 < length ? qpos + 1 : length;
     const int64_t start = end > window ? end - window : 0;
@@ -958,7 +966,7 @@ __global__ void attention_cache_swa_split_part_kernel(
     const int b = rem / Hq;
     const int hk = hq / rep;
     const int tid = threadIdx.x;
-    const int64_t length = seq_len[0] > 0 ? seq_len[0] : 0;
+    const int64_t length = seq_len[b] > 0 ? seq_len[b] : 0;
     const int64_t qpos = length - T + tq;
     const int64_t visible_end = qpos + 1 < length ? qpos + 1 : length;
     const int64_t visible_start = visible_end > window ? visible_end - window : 0;
@@ -1005,8 +1013,8 @@ static mfq_tensor_backend::Tensor attention_cache_swa_impl_cuda(
                 v_cache.is_cuda() && v_cache.is_contiguous(),
                 "attention_cache_swa: caches must be cuda contiguous");
     MFQ_RUNTIME_CHECK(seq_len.is_cuda() && seq_len.is_contiguous() &&
-                seq_len.scalar_type() == mfq_tensor_backend::kInt64 && seq_len.numel() == 1,
-                "attention_cache_swa: seq_len must be cuda int64[1]");
+                seq_len.scalar_type() == mfq_tensor_backend::kInt64,
+                "attention_cache_swa: seq_len must be cuda int64[B]");
     MFQ_RUNTIME_CHECK(q.scalar_type() == k_cache.scalar_type() && q.scalar_type() == v_cache.scalar_type(),
                 "attention_cache_swa: q/k/v dtype mismatch");
     MFQ_RUNTIME_CHECK(q.scalar_type() == mfq_tensor_backend::kFloat16 || q.scalar_type() == mfq_tensor_backend::kFloat32,
@@ -1022,6 +1030,8 @@ static mfq_tensor_backend::Tensor attention_cache_swa_impl_cuda(
     const int D = (int)q.size(3);
     const int Hk = (int)k_cache.size(1);
     const int capacity = (int)k_cache.size(2);
+    MFQ_RUNTIME_CHECK(seq_len.numel() == B,
+                "attention_cache_swa: seq_len must contain one value per batch row");
     MFQ_RUNTIME_CHECK(T > 0 && capacity >= window, "attention_cache_swa: cache capacity must cover the window");
     MFQ_RUNTIME_CHECK(k_cache.size(0) == B && k_cache.size(3) == D, "attention_cache_swa: cache shape mismatch");
     MFQ_RUNTIME_CHECK(Hq % Hk == 0, "attention_cache_swa: GQA requires Hq % Hk == 0");
