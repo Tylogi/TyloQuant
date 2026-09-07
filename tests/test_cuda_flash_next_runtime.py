@@ -388,6 +388,7 @@ def write_glm_fixture(path,config,weights,predictor=False):
         components=[dict(kind="text",tensor_root="model",implementation="glm5_next",policy="decoder")],
         capabilities=["text"])
     if predictor:
+        graph["topology"]["predictor_layers"]=config["text_config"]["num_nextn_predict_layers"]
         graph["components"].append(dict(kind="predictor",tensor_root="predictor",implementation="next_token_prediction",policy="optional"))
         graph["canonical_naming"]["component_roots"].append("predictor")
         graph["capabilities"].append("mtp")
@@ -807,6 +808,7 @@ def write_qwen_fixture(path,config,weights,predictor=False):
         topology=dict(text_layers=2),graph=dict(kind="causal_lm",backbone="qwen4_exp"),
         components=[dict(kind="text",tensor_root="model",implementation="qwen4_exp",policy="decoder")],capabilities=["text"])
     if predictor:
+        graph["topology"]["predictor_layers"]=config["text_config"]["mtp_num_hidden_layers"]
         graph["components"].append(dict(kind="predictor",tensor_root="predictor",implementation="next_token_prediction",policy="optional"))
         graph["canonical_naming"]["component_roots"].append("predictor")
         graph["capabilities"].append("mtp")
