@@ -97,7 +97,7 @@ def test_nint_small_m_bridge(profile, width, monkeypatch):
                         .7978845608028654 * gate * (1. + .044715 * gate * gate)))
                 expected = value.float().half().double()
                 torch.testing.assert_close(actual, expected, atol=.002, rtol=.002)
-            if operation == 2 and bits in (2, 3, 5):
+            if operation == 2 and bits in (2, 3, 5, 6):
                 actual = invoke(x, operation).double().cpu()
                 grouped = qx.double().reshape(6, -1, gs) * xs.double()[:, :, None]
                 expected = (grouped.flatten(1).cpu() @ weights.T).float().half().double()

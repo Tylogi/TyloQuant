@@ -109,28 +109,48 @@ __device__ __forceinline__ int small_m_unpack_int4(uint32_t packed, unsigned sel
     return (int)(__byte_perm(packed, packed >> 4, selector) & 0x0f0f0f0fu);
 }
 
-template <int MROWS, bool FLOAT_OUTPUT = false, bool PRECOMPUTED_SUM = false>
-__global__ void __launch_bounds__(128) nint4_gs24_small_m_reuse_kernel(
+template <int MROWS, bool FLOAT_OUTPUT = false, bool PRECOMPUTED_SUM = false, int BITS = 4>
+__global__ void __launch_bounds__(128) nint_gs24_small_m_reuse_kernel(
     Nint4Gs24Projection weight,
     const int8_t* __restrict__ qx,
     const float* __restrict__ xscale,
     int ng, int kpad)
 {
-    constexpr int NWARPS = 4;
+    static_assert(BITS == 4 || BITS == 6);
+    constexpr int NWARPS = 4, QBYTES = 24 * BITS / 8;
     const int row = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     if (row >= weight.n) return;
-    const auto* qrow = weight.q_packed + (size_t)row * ng * 12;
+    const auto* qrow = weight.q_packed + (size_t)row * ng * QBYTES;
     const auto* ssrow = weight.sub_scale + (size_t)row * ng;
     const auto* smrow = weight.sub_min + (size_t)row * ng;
     float pd[MROWS] = {}, pm[MROWS] = {};
     for (int g = warp * 32 + lane; g < ng; g += NWARPS * 32) {
-        const auto* qwords = reinterpret_cast<const uint32_t*>(qrow + g * 12);
-        const uint32_t qw0 = qwords[0], qw1 = qwords[1], qw2 = qwords[2];
+        const auto* qgroup = qrow + g * QBYTES;
+        uint32_t qw0 = 0, qw1 = 0, qw2 = 0;
+        uint16_t q6[9];
+        if constexpr (BITS == 4) {
+            const auto* qwords = reinterpret_cast<const uint32_t*>(qgroup);
+            qw0 = qwords[0]; qw1 = qwords[1]; qw2 = qwords[2];
+        } else {
+            const auto* qwords = reinterpret_cast<const uint16_t*>(qgroup);
+            #pragma unroll
+            for (int i = 0; i < 9; ++i) q6[i] = qwords[i];
+        }
         int dsum[MROWS] = {}, msum[MROWS] = {};
         #pragma unroll
         for (int chunk = 0; chunk < 6; ++chunk) {
-            const uint32_t qw = chunk < 2 ? qw0 : (chunk < 4 ? qw1 : qw2);
-            const int qv = small_m_unpack_int4(qw, (chunk & 1) ? 0x7362u : 0x5140u);
+            int qv;
+            if constexpr (BITS == 4) {
+                const uint32_t qw = chunk < 2 ? qw0 : (chunk < 4 ? qw1 : qw2);
+                qv = small_m_unpack_int4(qw, (chunk & 1) ? 0x7362u : 0x5140u);
+            } else {
+                const uint32_t w0 = q6[(chunk / 2) * 3], w1 = q6[(chunk / 2) * 3 + 1];
+                const uint32_t w2 = q6[(chunk / 2) * 3 + 2];
+                const uint32_t packed = (chunk & 1) ? ((w1 >> 8) | (w2 << 8))
+                    : (w0 | ((w1 & 255u) << 16));
+                qv = int((packed & 63u) | ((packed & 4032u) << 2)
+                    | ((packed & 258048u) << 4) | ((packed & 16515072u) << 6));
+            }
             #pragma unroll
             for (int m = 0; m < MROWS; ++m) {
                 const int xv = *reinterpret_cast<const int*>(qx + (size_t)m * kpad + g * 24 + chunk * 4);
@@ -191,9 +211,9 @@ static void launch_small_m(
 {
 #define MFQ_NINT4_SMALL_M_CASE(M) \
     case M: \
-        if (weight.xsum != nullptr) nint4_gs24_small_m_reuse_kernel<M, FLOAT_OUTPUT, true> \
+        if (weight.xsum != nullptr) nint_gs24_small_m_reuse_kernel<M, FLOAT_OUTPUT, true> \
             <<<weight.n, 128, 0, stream>>>(weight, qx, xs, ng, kpad); \
-        else nint4_gs24_small_m_reuse_kernel<M, FLOAT_OUTPUT> \
+        else nint_gs24_small_m_reuse_kernel<M, FLOAT_OUTPUT> \
             <<<weight.n, 128, 0, stream>>>(weight, qx, xs, ng, kpad); \
         break
     switch (m) {
@@ -212,6 +232,25 @@ void launch_nint4_gs24_small_m_reuse(
     int m, int ng, int kpad, cudaStream_t stream)
 {
     launch_small_m<false>(weight, qx, xs, m, ng, kpad, stream);
+}
+
+void launch_nint6_gs24_small_m_reuse(
+    NintSmallMProjection weight, const int8_t* qx, const float* xs,
+    int m, int ng, int kpad, cudaStream_t stream)
+{
+    MFQ_RUNTIME_CHECK(weight.xsum == nullptr, "NINT6 small-M keeps the original integer reduction");
+#define MFQ_NINT6_CASE(M) \
+    case M: nint_gs24_small_m_reuse_kernel<M, false, false, 6> \
+        <<<weight.n, 128, 0, stream>>>(weight, qx, xs, ng, kpad); break
+    switch (m) {
+        MFQ_NINT6_CASE(2);
+        MFQ_NINT6_CASE(3);
+        MFQ_NINT6_CASE(4);
+        MFQ_NINT6_CASE(5);
+        MFQ_NINT6_CASE(6);
+        default: MFQ_RUNTIME_CHECK(false, "NINT6 GS24 small-M requires M2-6");
+    }
+#undef MFQ_NINT6_CASE
 }
 
 __global__ void small_m_quantize_f32_half_rn_kernel(

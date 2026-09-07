@@ -4377,6 +4377,20 @@ mfq_tensor_backend::Tensor nint_gemv_packed_int6_ws_cuda(
     bool batch_group6 = nint_gs24_group_enabled("MFQ_NINT6_GS24_BATCH_GROUP", true);
     const char* split6_env = std::getenv("MFQ_NINT6_GS24_BATCH_SPLIT");
     int batch_group6_split = split6_env != nullptr ? std::atoi(split6_env) : (M >= 4 ? 2 : 1);
+    const char* reuse6_env = std::getenv("MFQ_NINT6_GS24_SMALL_M_REUSE");
+    if (gs == 24 && M >= 2 && M <= 6 && nwarps6 == 4 && u16_group6 &&
+            reuse6_env != nullptr && reuse6_env[0] == '1') {
+        quantize_x_kernel<24, 32><<<dim3(M, ng), 32, 0, stream>>>(
+            reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()), qx.data_ptr<int8_t>(),
+            xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), M, K_real, K_pad);
+        NintSmallMProjection weight{q_packed.data_ptr<uint8_t>(), sub_scale.data_ptr<uint8_t>(),
+            sub_min.data_ptr<uint8_t>(), neuron_scale.data_ptr<float>(), neuron_min.data_ptr<float>(),
+            out.data_ptr<mfq_half>(), N};
+        launch_nint6_gs24_small_m_reuse(weight, qx.data_ptr<int8_t>(), xscale.data_ptr<float>(),
+            M, ng, K_pad, stream);
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return out;
+    }
 #define QPWS6BATCH(MVAL)                                                                \
     do {                                                                                 \
         if (batch_group6_split >= 2) {                                                   \
@@ -5129,7 +5143,7 @@ mfq_tensor_backend::Tensor nint_gemv_packed_bits_ws_cuda(
 
     const char* nint23_env = std::getenv("MFQ_NINT23_SMALL_M");
     const char* nint5_env = std::getenv("MFQ_NINT5_GS28_SMALL_M");
-    if (nint5_env != nullptr && nint5_env[0] == '1' && bits == 5 && gs == 28 && M >= 2 && M <= 6) {
+    if ((nint5_env == nullptr || nint5_env[0] == '1') && bits == 5 && gs == 28 && M >= 2 && M <= 6) {
         quantize_x_kernel<28, 32><<<dim3(M, ng), 32, 0, stream>>>(
             reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()), qx.data_ptr<int8_t>(),
             xscale.data_ptr<float>(), xsum.data_ptr<int32_t>(), M, K_real, K_pad);
@@ -5141,7 +5155,7 @@ mfq_tensor_backend::Tensor nint_gemv_packed_bits_ws_cuda(
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
         return out;
     }
-    if (nint23_env != nullptr && nint23_env[0] == '1' && M >= 2 && M <= 6 &&
+    if ((nint23_env == nullptr || nint23_env[0] == '1') && M >= 2 && M <= 6 &&
             ((bits == 2 && gs == 16) || (bits == 3 && gs == 24))) {
         if (bits == 2) quantize_x_kernel<16, 32><<<dim3(M, ng), 32, 0, stream>>>(
             reinterpret_cast<const __half*>(x.data_ptr<mfq_half>()), qx.data_ptr<int8_t>(),

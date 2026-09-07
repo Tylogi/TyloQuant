@@ -146,7 +146,7 @@ void check(int bits, int gs, int scale_bits, int width, int& cases, int& graphs,
                 }
             }
         }
-        if (operation == 2 && (bits == 2 || bits == 3 || bits == 5)) {
+        if (operation == 2 && (bits == 2 || bits == 3 || bits == 5 || bits == 6)) {
             auto actual = invoke(x, operation).to(kFloat32).cpu();
             auto aq = qx.cpu(), as = xs.cpu();
             for (int m = 0; m < batch; ++m) {
