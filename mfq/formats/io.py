@@ -35,7 +35,9 @@ Version 2 and later use bitstream storage; the loader retains read compatibility
 from __future__ import annotations
 
 import json
+import math
 import mmap
+import os
 import struct
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
@@ -100,8 +102,16 @@ class BFloat16Array(np.ndarray):
     """
 
 
+class Float8E4M3Array(np.ndarray):
+    """Tagged raw E4M3FN bytes retained without widening to F16/BF16."""
+
+
 def is_bfloat16_array(value: object) -> bool:
     return isinstance(value, BFloat16Array)
+
+
+def is_float8_e4m3_array(value: object) -> bool:
+    return isinstance(value, Float8E4M3Array)
 
 
 def bfloat16_to_float32(value: np.ndarray) -> np.ndarray:
@@ -644,13 +654,16 @@ def unpack_nint_moe(blob: bytes | memoryview) -> NintMoeTensor:
 
 _DENSE_DTYPES = {
     "BF16": np.dtype("<u2"),
+    "F8_E4M3": np.dtype(np.uint8),
     "F16": np.dtype(np.float16),
     "F32": np.dtype(np.float32),
     "I32": np.dtype(np.int32),
     "I64": np.dtype(np.int64),
 }
 _DENSE_NAMES = {
-    value: name for name, value in _DENSE_DTYPES.items() if name != "BF16"
+    value: name
+    for name, value in _DENSE_DTYPES.items()
+    if name not in {"BF16", "F8_E4M3"}
 }
 
 
@@ -658,8 +671,15 @@ def pack_dense(tensor: np.ndarray) -> tuple[str, bytes]:
     """Pack a small dense tensor, used for norm weights and metadata-like arrays."""
 
     bfloat16 = is_bfloat16_array(tensor)
+    float8_e4m3 = is_float8_e4m3_array(tensor)
     arr = np.ascontiguousarray(tensor)
-    dtype = "BF16" if bfloat16 else _DENSE_NAMES.get(arr.dtype)
+    dtype = (
+        "BF16"
+        if bfloat16
+        else "F8_E4M3"
+        if float8_e4m3
+        else _DENSE_NAMES.get(arr.dtype)
+    )
     if dtype is None:
         raise ValueError(f"unsupported dense dtype: {arr.dtype}")
     parts = [struct.pack("<I", arr.ndim)]
@@ -678,7 +698,11 @@ def unpack_dense(dtype: str, blob: bytes) -> np.ndarray:
     off += 8 * ndim
     arr = np.frombuffer(blob, dtype=_DENSE_DTYPES[dtype], offset=off).copy()
     result = arr.reshape(shape)
-    return result.view(BFloat16Array) if dtype == "BF16" else result
+    if dtype == "BF16":
+        return result.view(BFloat16Array)
+    if dtype == "F8_E4M3":
+        return result.view(Float8E4M3Array)
+    return result
 
 
 def _unpack_tensor(dtype: str, blob: bytes | memoryview) -> MfqTensor:
@@ -974,6 +998,11 @@ class MMapTensorStore(Mapping[str, MfqTensor]):
             self.mmap_for(rec)[rec.offset : rec.offset + rec.nbytes]
         )
 
+    def embedding_reader(self, name: str) -> MMapEmbeddingReader:
+        """Open a row-selective reader without copying the tensor payload."""
+
+        return MMapEmbeddingReader(self, name)
+
     def close(self) -> None:
         self._cache.clear()
         for mm in self._mmaps:
@@ -986,6 +1015,376 @@ class MMapTensorStore(Mapping[str, MfqTensor]):
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+
+class MMapEmbeddingReader:
+    """Read selected rows from a dense or NINT embedding stored in an MFQ mmap.
+
+    The reader retains only tensor geometry and byte offsets.  Calls to
+    :meth:`read_rows` fault and copy the requested rows, leaving the complete
+    embedding payload file-backed and reclaimable by the operating system.
+    This is the MFQ equivalent of oMLX's disk-backed PLE embedding path, but it
+    is deliberately format-generic rather than tied to a model architecture.
+    """
+
+    _DENSE_ROW_DTYPES = {
+        "BF16": np.dtype("<u2"),
+        "F8_E4M3": np.dtype("u1"),
+        "F16": np.dtype("<f2"),
+        "F32": np.dtype("<f4"),
+    }
+
+    def __init__(self, store: object, name: str) -> None:
+        records = getattr(store, "records", None)
+        mmap_for = getattr(store, "mmap_for", None)
+        if not isinstance(records, Mapping) or not callable(mmap_for):
+            raise TypeError("row-selective embeddings require an mmap-backed tensor store")
+        if name not in records:
+            raise KeyError(f"tensor {name!r} is not present in the MFQ model")
+
+        record = records[name]
+        self.name = name
+        self.dtype = str(record.dtype)
+        self._mapping = mmap_for(record)
+        self._blob_start = int(record.offset)
+        self._blob_end = self._blob_start + int(record.nbytes)
+        self.mapped_nbytes = int(record.nbytes)
+        self.last_rows_read = 0
+        self.total_rows_read = 0
+        self.last_logical_bytes = 0
+        self.total_logical_bytes = 0
+
+        if self.dtype in self._DENSE_ROW_DTYPES:
+            self._init_dense()
+        elif self.dtype.startswith("NINT") and self.dtype[4:].isdigit():
+            self._init_nint()
+        else:
+            raise TypeError(
+                f"mmap row lookup does not support MFQ dtype {self.dtype!r}"
+            )
+        self._advise_random()
+
+    def _require(self, offset: int, nbytes: int, what: str) -> None:
+        if offset < self._blob_start or nbytes < 0 or offset + nbytes > self._blob_end:
+            raise ValueError(f"truncated {what} for mmap embedding {self.name!r}")
+
+    def _init_dense(self) -> None:
+        offset = self._blob_start
+        self._require(offset, 4, "dense shape header")
+        ndim = int(struct.unpack_from("<I", self._mapping, offset)[0])
+        offset += 4
+        shape_nbytes = ndim * 8
+        self._require(offset, shape_nbytes, "dense shape")
+        shape = tuple(
+            int(value)
+            for value in struct.unpack_from(f"<{ndim}q", self._mapping, offset)
+        )
+        offset += shape_nbytes
+        if len(shape) != 2 or shape[0] <= 0 or shape[1] <= 0:
+            raise ValueError(
+                f"mmap embedding {self.name!r} must be a non-empty matrix, got {shape}"
+            )
+        item_size = self._DENSE_ROW_DTYPES[self.dtype].itemsize
+        payload_nbytes = math.prod(shape) * item_size
+        self._require(offset, payload_nbytes, "dense payload")
+        if offset + payload_nbytes != self._blob_end:
+            raise ValueError(f"invalid trailing bytes in dense tensor {self.name!r}")
+        self.shape = shape
+        self.out, self.neuron_len = shape
+        self._dense_offset = offset
+        self._dense_row_nbytes = self.neuron_len * item_size
+        self._storage_kind = "dense"
+
+    def _init_nint(self) -> None:
+        offset = self._blob_start
+        self._require(offset, _NINT_HDR.size + 4, "NINT header")
+        bits, sub_bits, groupsize, axis, neuron_len = _NINT_HDR.unpack_from(
+            self._mapping, offset
+        )
+        offset += _NINT_HDR.size
+        ndim = int(struct.unpack_from("<I", self._mapping, offset)[0])
+        offset += 4
+        shape_nbytes = ndim * 8
+        self._require(offset, shape_nbytes + 8, "NINT shape")
+        shape = tuple(
+            int(value)
+            for value in struct.unpack_from(f"<{ndim}q", self._mapping, offset)
+        )
+        offset += shape_nbytes
+        out, groups = (
+            int(value)
+            for value in struct.unpack_from("<II", self._mapping, offset)
+        )
+        offset += 8
+        if (
+            len(shape) != 2
+            or int(axis) != 0
+            or shape[0] != out
+            or shape[1] != int(neuron_len)
+            or out <= 0
+            or groups <= 0
+            or int(groupsize) <= 0
+            or int(neuron_len) <= 0
+            or int(neuron_len) > groups * int(groupsize)
+        ):
+            raise ValueError(f"invalid NINT embedding geometry for {self.name!r}")
+        if not 0 < int(bits) <= 8 or not 0 < int(sub_bits) <= 8:
+            raise TypeError(
+                f"mmap NINT embedding requires 1-8 bit fields, got "
+                f"bits={bits}, sub_bits={sub_bits}"
+            )
+        if self.dtype != f"NINT{int(bits)}":
+            raise ValueError(
+                f"MFQ dtype/blob mismatch for {self.name!r}: "
+                f"{self.dtype} contains NINT{int(bits)}"
+            )
+
+        anchors_nbytes = out * np.dtype("<f2").itemsize
+        self._require(offset, 2 * anchors_nbytes, "NINT neuron metadata")
+        self._neuron_scale_offset = offset
+        self._neuron_min_offset = offset + anchors_nbytes
+        offset += 2 * anchors_nbytes
+
+        metadata_count = out * groups
+        q_count = metadata_count * int(groupsize)
+        packed_metadata_nbytes = (metadata_count * int(sub_bits) + 7) // 8
+        packed_q_nbytes = (q_count * int(bits) + 7) // 8
+        packed_tail_nbytes = 2 * packed_metadata_nbytes + packed_q_nbytes
+        old_sub_dtype = np.dtype(
+            np.uint8 if (1 << int(sub_bits)) - 1 <= 255 else np.uint16
+        )
+        old_q_dtype = np.dtype(
+            np.uint8 if (1 << int(bits)) - 1 <= 255 else np.uint16
+        )
+        old_tail_nbytes = (
+            2 * metadata_count * old_sub_dtype.itemsize
+            + q_count * old_q_dtype.itemsize
+        )
+        remaining = self._blob_end - offset
+        if remaining == packed_tail_nbytes:
+            self._packed = True
+            self._sub_scale_offset = offset
+            self._sub_min_offset = offset + packed_metadata_nbytes
+            self._q_offset = self._sub_min_offset + packed_metadata_nbytes
+            self._sub_stream_nbytes = packed_metadata_nbytes
+            self._q_stream_nbytes = packed_q_nbytes
+        elif remaining == old_tail_nbytes:
+            self._packed = False
+            self._sub_scale_offset = offset
+            self._sub_min_offset = offset + metadata_count * old_sub_dtype.itemsize
+            self._q_offset = self._sub_min_offset + metadata_count * old_sub_dtype.itemsize
+            self._sub_stream_nbytes = metadata_count * old_sub_dtype.itemsize
+            self._q_stream_nbytes = q_count * old_q_dtype.itemsize
+        else:
+            raise ValueError(
+                f"invalid NINT blob tail for {self.name!r}: "
+                f"remaining={remaining}, packed={packed_tail_nbytes}, old={old_tail_nbytes}"
+            )
+
+        self.shape = shape
+        self.out = out
+        self.neuron_len = int(neuron_len)
+        self.bits = int(bits)
+        self.sub_bits = int(sub_bits)
+        self.groupsize = int(groupsize)
+        self.groups = groups
+        self._metadata_count = metadata_count
+        self._q_count = q_count
+        self._old_sub_dtype = old_sub_dtype
+        self._old_q_dtype = old_q_dtype
+        self._storage_kind = "nint"
+
+    def _advise_random(self) -> None:
+        advice = getattr(mmap, "MADV_RANDOM", None)
+        if advice is None or not hasattr(self._mapping, "madvise"):
+            return
+        try:
+            page = int(getattr(mmap, "PAGESIZE", os.sysconf("SC_PAGE_SIZE")))
+            start = self._blob_start - self._blob_start % page
+            end = min(
+                len(self._mapping),
+                ((self._blob_end + page - 1) // page) * page,
+            )
+            self._mapping.madvise(advice, start, end - start)
+        except (OSError, TypeError, ValueError):
+            # Range advice is an optimization. Older Darwin/Python pairs can
+            # reject it even though the mapping itself is perfectly usable.
+            pass
+
+    @staticmethod
+    def _normalized_rows(rows: np.ndarray, out: int) -> tuple[np.ndarray, np.ndarray]:
+        requested = np.asarray(rows)
+        if not np.issubdtype(requested.dtype, np.integer):
+            raise TypeError("embedding row indices must be integers")
+        flat = np.ascontiguousarray(requested, dtype=np.int64).reshape(-1)
+        if np.any(flat < 0) or np.any(flat >= out):
+            raise IndexError("embedding row index is outside the stored matrix")
+        if flat.size == 0:
+            return flat, flat
+        unique, inverse = np.unique(flat, return_inverse=True)
+        return unique, inverse
+
+    def _packed_values(
+        self,
+        offset: int,
+        stream_nbytes: int,
+        value_indices: np.ndarray,
+        bits: int,
+    ) -> np.ndarray:
+        stream = np.ndarray(
+            (stream_nbytes,),
+            dtype=np.uint8,
+            buffer=self._mapping,
+            offset=offset,
+        )
+        flat = np.asarray(value_indices, dtype=np.int64).reshape(-1)
+        if bits == 8:
+            return np.asarray(stream[flat], dtype=np.uint8).reshape(value_indices.shape)
+        bit_offsets = flat * bits
+        byte_offsets = bit_offsets >> 3
+        shifts = bit_offsets & 7
+        values = stream[byte_offsets].astype(np.uint16) >> shifts
+        crosses = shifts + bits > 8
+        if np.any(crosses):
+            values[crosses] |= (
+                stream[byte_offsets[crosses] + 1].astype(np.uint16)
+                << (8 - shifts[crosses])
+            )
+        values &= (1 << bits) - 1
+        return values.astype(np.uint8).reshape(value_indices.shape)
+
+    def _old_values(
+        self,
+        offset: int,
+        count: int,
+        dtype: np.dtype,
+        value_indices: np.ndarray,
+    ) -> np.ndarray:
+        stream = np.ndarray(
+            (count,),
+            dtype=dtype,
+            buffer=self._mapping,
+            offset=offset,
+        )
+        return np.asarray(stream[value_indices], dtype=np.uint8)
+
+    def _read_dense(self, unique: np.ndarray) -> np.ndarray:
+        storage_dtype = self._DENSE_ROW_DTYPES[self.dtype]
+        table = np.ndarray(
+            self.shape,
+            dtype=storage_dtype,
+            buffer=self._mapping,
+            offset=self._dense_offset,
+        )
+        copied = np.array(table[unique], copy=True)
+        if self.dtype == "BF16":
+            return (copied.astype(np.uint32) << np.uint32(16)).view(np.float32)
+        if self.dtype == "F8_E4M3":
+            raw = copied.astype(np.uint8, copy=False)
+            sign = np.where(raw & 0x80, -1.0, 1.0).astype(np.float32)
+            exponent = ((raw >> 3) & 0x0F).astype(np.int16)
+            mantissa = (raw & 0x07).astype(np.float32)
+            subnormal = np.ldexp(mantissa, -9)
+            normal = np.ldexp(1.0 + mantissa / 8.0, exponent - 7)
+            decoded = sign * np.where(exponent == 0, subnormal, normal)
+            decoded[(raw & 0x7F) == 0x7F] = np.nan
+            return decoded
+        return copied
+
+    def _read_nint(self, unique: np.ndarray) -> np.ndarray:
+        count = int(unique.size)
+        neuron_scale_table = np.ndarray(
+            (self.out,),
+            dtype="<f2",
+            buffer=self._mapping,
+            offset=self._neuron_scale_offset,
+        )
+        neuron_min_table = np.ndarray(
+            (self.out,),
+            dtype="<f2",
+            buffer=self._mapping,
+            offset=self._neuron_min_offset,
+        )
+        neuron_scale = neuron_scale_table[unique].astype(np.float32)
+        neuron_min = neuron_min_table[unique].astype(np.float32)
+
+        metadata_indices = (
+            unique[:, None] * self.groups
+            + np.arange(self.groups, dtype=np.int64)[None, :]
+        )
+        row_values = self.groups * self.groupsize
+        q_indices = (
+            unique[:, None] * row_values
+            + np.arange(row_values, dtype=np.int64)[None, :]
+        )
+        if self._packed:
+            sub_scale = self._packed_values(
+                self._sub_scale_offset,
+                self._sub_stream_nbytes,
+                metadata_indices,
+                self.sub_bits,
+            )
+            sub_min = self._packed_values(
+                self._sub_min_offset,
+                self._sub_stream_nbytes,
+                metadata_indices,
+                self.sub_bits,
+            )
+            q = self._packed_values(
+                self._q_offset,
+                self._q_stream_nbytes,
+                q_indices,
+                self.bits,
+            )
+        else:
+            sub_scale = self._old_values(
+                self._sub_scale_offset,
+                self._metadata_count,
+                self._old_sub_dtype,
+                metadata_indices,
+            )
+            sub_min = self._old_values(
+                self._sub_min_offset,
+                self._metadata_count,
+                self._old_sub_dtype,
+                metadata_indices,
+            )
+            q = self._old_values(
+                self._q_offset,
+                self._q_count,
+                self._old_q_dtype,
+                q_indices,
+            )
+        scales = neuron_scale[:, None] * sub_scale.astype(np.float32)
+        minima = neuron_min[:, None] * sub_min.astype(np.float32)
+        values = (
+            scales[..., None] * q.reshape(count, self.groups, self.groupsize)
+            - minima[..., None]
+        )
+        return values.reshape(count, row_values)[:, : self.neuron_len]
+
+    def read_rows(self, rows: np.ndarray) -> np.ndarray:
+        """Return requested rows while touching only their mmap-backed pages."""
+
+        unique, inverse = self._normalized_rows(rows, self.out)
+        if unique.size == 0:
+            return np.empty((0, self.neuron_len), dtype=np.float32)
+        if self._storage_kind == "dense":
+            selected = self._read_dense(unique)
+            logical_bytes = int(unique.size) * self._dense_row_nbytes
+        else:
+            selected = self._read_nint(unique)
+            logical_bits = int(unique.size) * (
+                32
+                + 2 * self.groups * self.sub_bits
+                + self.groups * self.groupsize * self.bits
+            )
+            logical_bytes = (logical_bits + 7) // 8
+        self.last_rows_read = int(unique.size)
+        self.total_rows_read += self.last_rows_read
+        self.last_logical_bytes = logical_bytes
+        self.total_logical_bytes += logical_bytes
+        return np.ascontiguousarray(selected[inverse])
 
 
 def _open_single_mmap(

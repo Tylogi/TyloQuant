@@ -50,6 +50,7 @@ _DEFAULT_TYPE = {
 
 class TensorRole(str, Enum):
     TOKEN_EMBEDDING = "token_embedding"
+    PLE_EMBEDDING = "ple_embedding"
     OUTPUT = "output"
     ATTENTION_Q = "attention_q"
     ATTENTION_K = "attention_k"
@@ -169,6 +170,11 @@ def _scope(name: str) -> TensorScope:
 
 def _role(name: str, canonical_name: str | None) -> TensorRole:
     canonical = canonical_name or name
+    if (
+        ".position_embedding.ngram.shard." in canonical
+        or ".ngram_embedding.shard_" in name
+    ) and canonical.endswith(".weight"):
+        return TensorRole.PLE_EMBEDDING
     if canonical in {"output.weight", "model.output.weight"} or name.endswith("lm_head.weight"):
         return TensorRole.OUTPUT
     if canonical in {

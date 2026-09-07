@@ -33,7 +33,12 @@ from mfq.kernels.metal.linear_attention import gated_delta_net, linear_conv_qkv
 from mfq.kernels.metal.moe_ops import moe_topk, weighted_reduce
 from mfq.kernels.metal.sampling import sample as _sample
 from mfq.runtime.mlx_attention import MlxKVCache
-from mfq.runtime.mlx_linear import MlxLinearGroup, MlxNintModel, mlx_dense_array
+from mfq.runtime.mlx_linear import (
+    MlxLinearGroup,
+    MlxNintModel,
+    MlxShardedEmbedding,
+    mlx_dense_array,
+)
 from mfq.runtime.mlx_ops import MlxRMSNorm, MlxRoPE
 
 
@@ -79,6 +84,10 @@ def _numpy_integer_array(model: MlxNintModel, name: str) -> np.ndarray:
 
 
 def _embedding_shape(embedding: object) -> tuple[int, int]:
+    out = getattr(embedding, "out", None)
+    width = getattr(embedding, "neuron_len", None)
+    if out is not None and width is not None:
+        return int(out), int(width)
     packed = getattr(embedding, "packed_weight", None)
     if packed is not None:
         out = getattr(packed, "out", None)
@@ -676,7 +685,7 @@ class MlxQwen4ExpQsa:
 
 
 class MlxQwen4ExpNgramEmbedding:
-    """Lookup Qwen's 128-way sharded, hashed PLE embedding without merging it."""
+    """Lookup Qwen's sharded PLE table with row-selective mmap residency."""
 
     def __init__(
         self,
@@ -687,13 +696,31 @@ class MlxQwen4ExpNgramEmbedding:
         metadata_prefix = prefix + ".ngram"
         embedding_prefix = metadata_prefix + ".shard"
         self.embeddings = tuple(
-            model.embedding(f"{embedding_prefix}.{index}.weight")
+            model.embedding(
+                f"{embedding_prefix}.{index}.weight",
+                residency="mmap",
+            )
             for index in range(config.split_ngram_parts)
         )
         shapes = tuple(_embedding_shape(embedding) for embedding in self.embeddings)
         if len(set(shapes)) != 1 or len(shapes[0]) != 2:
             raise ValueError("Qwen4-Exp PLE embedding shards must have one common shape")
         self.rows_per_shard, self.head_dimension = shapes[0]
+        self.embedding_table = MlxShardedEmbedding(self.embeddings)
+        storage_dtypes = {
+            getattr(embedding, "storage_dtype", None)
+            for embedding in self.embeddings
+        }
+        if "F8_E4M3" in storage_dtypes and storage_dtypes != {"F8_E4M3"}:
+            raise ValueError("Qwen4-Exp PLE shards cannot mix raw E4M3 and other dtypes")
+        self.raw_e4m3 = storage_dtypes == {"F8_E4M3"}
+        self.weight_scale = (
+            _dense_vector(model, metadata_prefix + ".weight_scale")
+            if self.raw_e4m3
+            else None
+        )
+        if self.weight_scale is not None and int(self.weight_scale.size) != 1:
+            raise ValueError("Qwen4-Exp PLE E4M3 scale must contain one value")
         self.layer_multipliers = _numpy_integer_array(
             model,
             metadata_prefix + ".layer_multipliers",
@@ -709,6 +736,9 @@ class MlxQwen4ExpNgramEmbedding:
         ).astype(np.int64)
         self.config = config
         self.context: np.ndarray | None = None
+        self.last_touched_shards: tuple[int, ...] = ()
+        self.rows_read = 0
+        self.logical_bytes_read = 0
         expected_heads = (config.ngram_size - 1) * config.heads_per_ngram
         if (
             self.layer_multipliers.shape != (config.ngram_size,)
@@ -785,22 +815,12 @@ class MlxQwen4ExpNgramEmbedding:
         mx.eval(input_ids)
         host_ids = np.asarray(input_ids, dtype=np.int64)
         global_ids = self._ids(host_ids, use_cache=use_cache)
-        shard_ids = global_ids // self.rows_per_shard
-        if np.any(shard_ids < 0) or np.any(shard_ids >= len(self.embeddings)):
-            raise ValueError("Qwen4-Exp PLE hash resolved outside embedding shards")
-        result: mx.array | None = None
-        for shard in np.unique(shard_ids):
-            mask = shard_ids == shard
-            local_ids = np.where(
-                mask,
-                global_ids - int(shard) * self.rows_per_shard,
-                0,
-            ).astype(np.int32)
-            values = self.embeddings[int(shard)](mx.array(local_ids))
-            values = values * mx.array(mask[..., None]).astype(values.dtype)
-            result = values if result is None else result + values
-        if result is None:  # pragma: no cover - non-empty n-gram contract
-            raise RuntimeError("Qwen4-Exp PLE produced no embedding IDs")
+        result = self.embedding_table(global_ids)
+        if self.weight_scale is not None:
+            result = result * self.weight_scale.astype(result.dtype).reshape(())
+        self.last_touched_shards = self.embedding_table.last_touched_shards
+        self.rows_read = self.embedding_table.rows_read
+        self.logical_bytes_read = self.embedding_table.logical_bytes_read
         return result.reshape((*global_ids.shape[:2], -1))
 
 

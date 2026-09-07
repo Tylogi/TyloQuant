@@ -17,10 +17,11 @@ from mfq.formats.mx import MX_DTYPES, MXFP4_DTYPE, parse_mx_layout
 from mfq.quantize.mxfp import decode_mxfp4, decode_mxfp8
 
 FULL_PRECISION_MFQ_DTYPES = frozenset(
-    {"BF16", "F16", "F32", "I32", "I64", *MX_DTYPES}
+    {"BF16", "F8_E4M3", "F16", "F32", "I32", "I64", *MX_DTYPES}
 )
 _DENSE_DTYPES = {
     "BF16": np.dtype("<u2"),
+    "F8_E4M3": np.dtype("u1"),
     "F16": np.dtype("<f2"),
     "F32": np.dtype("<f4"),
     "I32": np.dtype("<i4"),
@@ -203,6 +204,8 @@ class FullPrecisionMfqTensorSource:
         tensor = torch.from_numpy(values)
         if self.dtype_name == "BF16":
             tensor = tensor.view(torch.bfloat16)
+        elif self.dtype_name == "F8_E4M3":
+            tensor = tensor.view(torch.float8_e4m3fn)
         return tensor
 
     def _mx_arrays(self) -> tuple[np.ndarray, np.ndarray]:

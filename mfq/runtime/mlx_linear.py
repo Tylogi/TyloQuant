@@ -113,6 +113,9 @@ def mlx_dense_array(
     if io.is_bfloat16_array(tensor):
         bits = mx.array(np.ascontiguousarray(tensor, dtype=np.uint16))
         value = bits.view(mx.bfloat16)
+    elif io.is_float8_e4m3_array(tensor):
+        bits = mx.array(np.ascontiguousarray(tensor, dtype=np.uint8))
+        value = mx.from_fp8(bits, dtype=mx.float16)
     else:
         source_dtype = mx.float32 if tensor.dtype == np.float32 else mx.float16
         value = mx.array(np.ascontiguousarray(tensor)).astype(source_dtype)
@@ -175,11 +178,216 @@ class MlxDenseEmbedding:
     def __init__(self, tensor: np.ndarray) -> None:
         if tensor.ndim != 2:
             raise ValueError(f"MlxDenseEmbedding expects a 2D tensor, got {tensor.shape}")
+        self.storage_dtype = (
+            "F8_E4M3" if io.is_float8_e4m3_array(tensor) else str(tensor.dtype)
+        )
         self.weight = mlx_dense_array(tensor)
 
     def forward(self, token_ids: mx.array | np.ndarray) -> mx.array:
         ids = token_ids if isinstance(token_ids, mx.array) else mx.array(token_ids)
         return self.weight[ids.astype(mx.int32)]
+
+    def __call__(self, token_ids: mx.array | np.ndarray) -> mx.array:
+        return self.forward(token_ids)
+
+
+class MlxMMapEmbedding:
+    """Embedding whose complete weight stays file-backed in an MFQ mmap."""
+
+    def __init__(self, reader: io.MMapEmbeddingReader) -> None:
+        self.reader = reader
+        self.storage_dtype = reader.dtype
+        self.out = int(reader.out)
+        self.neuron_len = int(reader.neuron_len)
+        self.shape = (self.out, self.neuron_len)
+        self.output_dtype = {
+            "BF16": mx.bfloat16,
+            "F16": mx.float16,
+            "F32": mx.float32,
+        }.get(reader.dtype, mx.float16)
+
+    @property
+    def mapped_nbytes(self) -> int:
+        return self.reader.mapped_nbytes
+
+    @property
+    def last_rows_read(self) -> int:
+        return self.reader.last_rows_read
+
+    @property
+    def total_rows_read(self) -> int:
+        return self.reader.total_rows_read
+
+    @property
+    def last_logical_bytes(self) -> int:
+        return self.reader.last_logical_bytes
+
+    def forward(
+        self,
+        token_ids: mx.array | np.ndarray,
+        *,
+        dtype: mx.Dtype | None = None,
+    ) -> mx.array:
+        if isinstance(token_ids, mx.array):
+            mx.eval(token_ids)
+            host_ids = np.asarray(token_ids)
+        else:
+            host_ids = np.asarray(token_ids)
+        if not np.issubdtype(host_ids.dtype, np.integer):
+            raise TypeError("embedding row indices must be integers")
+        shape = tuple(int(value) for value in host_ids.shape)
+        target_dtype = self.output_dtype if dtype is None else dtype
+        if host_ids.size == 0:
+            return mx.zeros((*shape, self.neuron_len), dtype=target_dtype)
+        values = self.reader.read_rows(host_ids)
+        return mx.array(values).astype(target_dtype).reshape(
+            (*shape, self.neuron_len)
+        )
+
+    def __call__(self, token_ids: mx.array | np.ndarray) -> mx.array:
+        return self.forward(token_ids)
+
+
+def _embedding_matrix_shape(embedding: object) -> tuple[int, int]:
+    shape = getattr(embedding, "shape", None)
+    if isinstance(shape, tuple) and len(shape) == 2:
+        return int(shape[0]), int(shape[1])
+    packed = getattr(embedding, "packed_weight", None)
+    if packed is not None:
+        rows = getattr(packed, "out", None)
+        width = getattr(packed, "neuron_len", None)
+        if width is None:
+            width = getattr(packed, "in_features", None)
+        if rows is not None and width is not None:
+            return int(rows), int(width)
+    weight = getattr(embedding, "weight", None)
+    if isinstance(weight, mx.array) and weight.ndim == 2:
+        return int(weight.shape[0]), int(weight.shape[1])
+    raise TypeError("embedding runtime does not expose a matrix shape")
+
+
+class MlxShardedEmbedding:
+    """One logical embedding assembled from arbitrary row shards.
+
+    mmap-backed shards are gathered and assembled on the host before one MLX
+    transfer. Resident shards use selected-row device gathers. Both paths read
+    only the shards and rows addressed by the input IDs.
+    """
+
+    def __init__(self, shards: Sequence[object]) -> None:
+        self.shards = tuple(shards)
+        if not self.shards:
+            raise ValueError("a sharded embedding requires at least one shard")
+        shapes = tuple(_embedding_matrix_shape(shard) for shard in self.shards)
+        widths = {shape[1] for shape in shapes}
+        if len(widths) != 1:
+            raise ValueError("embedding shards must have one common width")
+        self.shard_sizes = tuple(shape[0] for shape in shapes)
+        offsets = [0]
+        for size in self.shard_sizes:
+            offsets.append(offsets[-1] + size)
+        self.shard_offsets = tuple(offsets)
+        self.out = offsets[-1]
+        self.neuron_len = widths.pop()
+        self.shape = (self.out, self.neuron_len)
+        self.mmap_backed = all(
+            isinstance(shard, MlxMMapEmbedding) for shard in self.shards
+        )
+        self.last_touched_shards: tuple[int, ...] = ()
+        self.rows_read = 0
+        self.logical_bytes_read = 0
+
+    def _host_ids(self, token_ids: mx.array | np.ndarray) -> np.ndarray:
+        if isinstance(token_ids, mx.array):
+            mx.eval(token_ids)
+            values = np.asarray(token_ids)
+        else:
+            values = np.asarray(token_ids)
+        if not np.issubdtype(values.dtype, np.integer):
+            raise TypeError("embedding row indices must be integers")
+        return np.ascontiguousarray(values, dtype=np.int64)
+
+    def _lookup_plan(
+        self,
+        flat_ids: np.ndarray,
+    ) -> tuple[np.ndarray, tuple[int, ...]]:
+        if np.any(flat_ids < 0) or np.any(flat_ids >= self.out):
+            raise IndexError("embedding row index is outside the sharded matrix")
+        shard_ids = np.searchsorted(
+            np.asarray(self.shard_offsets[1:], dtype=np.int64),
+            flat_ids,
+            side="right",
+        )
+        touched = tuple(int(value) for value in np.unique(shard_ids))
+        return shard_ids, touched
+
+    def _mmap_lookup(
+        self,
+        shape: tuple[int, ...],
+        flat_ids: np.ndarray,
+        shard_ids: np.ndarray,
+        touched: tuple[int, ...],
+    ) -> mx.array:
+        first = self.shards[0]
+        assert isinstance(first, MlxMMapEmbedding)
+        target_dtype = first.output_dtype
+        host_dtype = np.float32 if target_dtype in {mx.float32, mx.bfloat16} else np.float16
+        result = np.empty((flat_ids.size, self.neuron_len), dtype=host_dtype)
+        for shard_index in touched:
+            positions = np.flatnonzero(shard_ids == shard_index)
+            local_ids = flat_ids[positions] - self.shard_offsets[shard_index]
+            shard = self.shards[shard_index]
+            assert isinstance(shard, MlxMMapEmbedding)
+            result[positions] = shard.reader.read_rows(local_ids)
+            self.rows_read += shard.last_rows_read
+            self.logical_bytes_read += shard.last_logical_bytes
+        return mx.array(result).astype(target_dtype).reshape((*shape, self.neuron_len))
+
+    def _resident_lookup(
+        self,
+        shape: tuple[int, ...],
+        flat_ids: np.ndarray,
+        shard_ids: np.ndarray,
+        touched: tuple[int, ...],
+    ) -> mx.array:
+        result: mx.array | None = None
+        for shard_index in touched:
+            positions = np.flatnonzero(shard_ids == shard_index).astype(np.int32)
+            local_ids = (
+                flat_ids[positions] - self.shard_offsets[shard_index]
+            ).astype(np.int32)
+            values = self.shards[shard_index](local_ids).reshape(
+                (-1, self.neuron_len)
+            )
+            if result is None:
+                result = mx.zeros(
+                    (flat_ids.size, self.neuron_len),
+                    dtype=values.dtype,
+                )
+            result = result.at[mx.array(positions)].add(values)
+            self.rows_read += int(local_ids.size)
+        if result is None:  # pragma: no cover - non-empty lookup contract
+            raise RuntimeError("sharded embedding produced no rows")
+        return result.reshape((*shape, self.neuron_len))
+
+    def forward(self, token_ids: mx.array | np.ndarray) -> mx.array:
+        ids = self._host_ids(token_ids)
+        shape = tuple(int(value) for value in ids.shape)
+        if ids.size == 0:
+            dtype = (
+                self.shards[0].output_dtype
+                if self.mmap_backed
+                else mx.float16
+            )
+            return mx.zeros((*shape, self.neuron_len), dtype=dtype)
+        flat_ids = ids.reshape(-1)
+        shard_ids, touched = self._lookup_plan(flat_ids)
+        self.last_touched_shards = touched
+        self.rows_read = 0
+        self.logical_bytes_read = 0
+        if self.mmap_backed:
+            return self._mmap_lookup(shape, flat_ids, shard_ids, touched)
+        return self._resident_lookup(shape, flat_ids, shard_ids, touched)
 
     def __call__(self, token_ids: mx.array | np.ndarray) -> mx.array:
         return self.forward(token_ids)
@@ -494,6 +702,8 @@ class MlxNintModel:
     def embedding(
         self,
         name: str,
+        *,
+        residency: str = "resident",
     ) -> (
         MlxNintEmbedding
         | MlxNint8ZeroEmbedding
@@ -501,7 +711,13 @@ class MlxNintModel:
         | MlxTpqInt4Embedding
         | MlxMxEmbedding
         | MlxDenseEmbedding
+        | MlxMMapEmbedding
     ):
+        if residency not in {"resident", "mmap"}:
+            raise ValueError("embedding residency must be 'resident' or 'mmap'")
+        embedding_reader = getattr(self.tensors, "embedding_reader", None)
+        if residency == "mmap" and callable(embedding_reader):
+            return MlxMMapEmbedding(embedding_reader(name))
         packed_mx = self._packed_mx(name)
         if packed_mx is not None:
             return MlxMxEmbedding.from_packed_weight(packed_mx)
@@ -701,6 +917,7 @@ __all__ = [
     "MlxDenseEmbedding",
     "MlxDenseLinear",
     "MlxLinearGroup",
+    "MlxMMapEmbedding",
     "MlxMxEmbedding",
     "MlxMxLinear",
     "MlxNintEmbedding",
@@ -708,6 +925,7 @@ __all__ = [
     "MlxNint8ZeroLinear",
     "MlxNintLinear",
     "MlxNintModel",
+    "MlxShardedEmbedding",
     "MlxSwiGLUFFN",
     "MlxVqLinear",
     "MlxVqEmbedding",

@@ -693,8 +693,17 @@ def _source_quantization(
 
     tensor_scale_names = [name + "_scale"]
     ngram_match = re.match(r"^(.+\.ngram_embedding)\.shard_\d+\.weight$", name)
+    canonical_ngram_match = re.match(
+        r"^(.+\.position_embedding\.ngram)\.shard\.\d+\.weight$",
+        name,
+    )
     if ngram_match is not None:
         tensor_scale_names.insert(0, ngram_match.group(1) + ".weight_scale")
+    elif canonical_ngram_match is not None:
+        tensor_scale_names.insert(
+            0,
+            canonical_ngram_match.group(1) + ".weight_scale",
+        )
     for scale_name in tensor_scale_names:
         scale = inventory.get(scale_name)
         if scale is None:
@@ -1874,6 +1883,7 @@ def _apply_standard_preset(
     *,
     quantize_vision: bool = False,
     quantize_mtp: bool = False,
+    quantize_ple: bool = False,
 ) -> list[TensorPlan]:
     """Apply a standard K-quant mixture to enabled semantic tensor scopes."""
 
@@ -1898,6 +1908,8 @@ def _apply_standard_preset(
             and not quantize_vision
             or descriptor.scope is TensorScope.PREDICTOR
             and not quantize_mtp
+            or descriptor.role is TensorRole.PLE_EMBEDDING
+            and not quantize_ple
         )
         layer = descriptor.layer_index
         if descriptor.scope is TensorScope.PREDICTOR and layer is not None:
@@ -1931,8 +1943,11 @@ def _apply_standard_preset(
                 replace(
                     item,
                     target_dtype=(
-                        item.source_dtype
-                        if item.source_dtype in {"BF16", "F16", "F32", "I32", "I64"}
+                        item.target_dtype
+                        if descriptor.role is TensorRole.PLE_EMBEDDING
+                        else item.source_dtype
+                        if item.source_dtype
+                        in {"BF16", "F16", "F32", "I32", "I64"}
                         else "F16"
                     ),
                     gguf_name=gguf_name,
@@ -2550,6 +2565,7 @@ def _plan(
     mostly_bf16: bool = False,
     quantize_vision: bool = False,
     quantize_mtp: bool = False,
+    quantize_ple: bool = False,
     *,
     source_inventory: dict[str, SourceTensorMetadata] | None = None,
     source_config: dict[str, object] | None = None,
@@ -2590,6 +2606,27 @@ def _plan(
             "use the native HF conversion policy or a calibration scheme"
         )
     source_quantizations, source_auxiliaries = _source_quantizations(inventory)
+    preserved_ple_scale_names: set[str] = set()
+    if not quantize_ple:
+        for source_name, source_quantization in source_quantizations.items():
+            metadata = inventory[source_name]
+            canonical_mapping = map_source_tensor_name(source_name, raw_config)
+            descriptor = describe_tensor(
+                source_name,
+                metadata.shape,
+                metadata.dtype,
+                canonical_name=(
+                    canonical_mapping.canonical_name
+                    if canonical_mapping is not None
+                    else source_name
+                ),
+            )
+            if (
+                descriptor.role is TensorRole.PLE_EMBEDDING
+                and metadata.dtype == "F8_E4M3"
+                and source_quantization.scheme == "fp8_tensor_scale"
+            ):
+                preserved_ple_scale_names.add(source_quantization.scale_name)
     flash_expert_plans: list[TensorPlan] = []
     flash_expert_sources: set[str] = set()
     if is_flash_next and not mostly_bf16:
@@ -2608,7 +2645,11 @@ def _plan(
     )
     by_shard: dict[str, list[str]] = {}
     for name, shard in weight_map.items():
-        if name in source_auxiliaries or name in flash_expert_sources:
+        if (
+            name in source_auxiliaries
+            and name not in preserved_ple_scale_names
+            or name in flash_expert_sources
+        ):
             continue
         if text_only and not (
             name.startswith("model.language_model.")
@@ -2639,7 +2680,7 @@ def _plan(
                 else _hf_to_gguf_name(name, mtp_layer_index=mtp_layer_index)
             )
             metadata = inventory[name]
-            scope = describe_tensor(
+            descriptor = describe_tensor(
                 name,
                 metadata.shape,
                 metadata.dtype,
@@ -2648,12 +2689,15 @@ def _plan(
                     if canonical_mapping is not None
                     else gguf_name
                 ),
-            ).scope
+            )
             preserve_scope = (
-                scope is TensorScope.VISION
+                descriptor.scope is TensorScope.VISION
                 and not quantize_vision
-                or scope is TensorScope.PREDICTOR
+                or descriptor.scope is TensorScope.PREDICTOR
                 and not quantize_mtp
+                or descriptor.role is TensorRole.PLE_EMBEDDING
+                and not quantize_ple
+                or name in preserved_ple_scale_names
             )
             if preserve_scope:
                 # A standard text recipe must not strip auxiliary inference
@@ -2744,13 +2788,25 @@ def _plan(
                 or descriptor.scope is TensorScope.PREDICTOR
                 and not quantize_mtp
             )
-            if source_dtype in _HF_INTEGER_DTYPES:
+            if name in preserved_ple_scale_names:
+                target = source_dtype
+            elif source_dtype in _HF_INTEGER_DTYPES:
                 # Hash tables, offsets, token maps, and similar runtime
                 # metadata must remain exact.  In particular, Qwen4-Exp
                 # PLE multipliers exceed float32's integer precision.
                 target = source_dtype
             elif preserve_scope or name in _MTP_PROTECTED_TENSORS:
                 target = source_dtype if source_dtype in {"BF16", "F16", "F32"} else dense_dtype
+            elif descriptor.role is TensorRole.PLE_EMBEDDING and not quantize_ple:
+                target = (
+                    "F8_E4M3"
+                    if source_dtype == "F8_E4M3"
+                    and source_quantization is not None
+                    and source_quantization.scheme == "fp8_tensor_scale"
+                    else source_dtype
+                    if source_dtype in {"BF16", "F16", "F32"}
+                    else dense_dtype
+                )
             elif mostly_bf16:
                 target = _mostly_bf16_target(name, shape, source_dtype)
             elif is_flash_next and _source_precision_protected(name, source_exclusions):
@@ -2995,6 +3051,14 @@ def _dense_blob_from_tensor(t: torch.Tensor, blob_path: Path, dtype: str) -> int
     elif dtype == "BF16":
         arr = t.to(torch.bfloat16).contiguous().cpu().view(torch.uint16).numpy()
         arr = np.ascontiguousarray(arr, dtype="<u2")
+    elif dtype == "F8_E4M3":
+        arr = (
+            t.to(device="cpu", dtype=torch.float8_e4m3fn)
+            .contiguous()
+            .view(torch.uint8)
+            .numpy()
+        )
+        arr = np.ascontiguousarray(arr, dtype=np.uint8)
     elif dtype == "I32":
         arr = t.to(torch.int32).contiguous().cpu().numpy()
         arr = np.ascontiguousarray(arr, dtype=np.int32)
@@ -3010,6 +3074,37 @@ def _dense_blob_from_tensor(t: torch.Tensor, blob_path: Path, dtype: str) -> int
         f.write(struct.pack("<I", arr.ndim))
         f.write(struct.pack(f"<{arr.ndim}q", *arr.shape))
         f.write(arr.tobytes())
+    return blob_path.stat().st_size
+
+
+def _write_float8_e4m3_axis0_blob(
+    source,
+    shape: tuple[int, ...],
+    blob_path: Path,
+    row_chunk: int,
+) -> int:
+    """Stream source-exact E4M3 rows without materializing a giant PLE table."""
+
+    if len(shape) != 2:
+        raise ValueError(f"raw E4M3 stream writer requires a matrix, got {shape}")
+    rows, columns = (int(value) for value in shape)
+    with blob_path.open("wb") as target:
+        target.write(struct.pack("<I", len(shape)))
+        target.write(struct.pack(f"<{len(shape)}q", *shape))
+        for start in range(0, rows, row_chunk):
+            end = min(start + row_chunk, rows)
+            chunk = source.read_rows(start, end, device="cpu")
+            if chunk.dtype != torch.float8_e4m3fn:
+                raise TypeError(
+                    "raw E4M3 preservation requires float8_e4m3fn source rows"
+                )
+            if tuple(chunk.shape) != (end - start, columns):
+                raise ValueError(
+                    f"raw E4M3 row source returned {tuple(chunk.shape)}, "
+                    f"expected {(end - start, columns)}"
+                )
+            raw = chunk.contiguous().view(torch.uint8).numpy()
+            target.write(np.ascontiguousarray(raw, dtype=np.uint8).tobytes())
     return blob_path.stat().st_size
 
 
@@ -4533,7 +4628,14 @@ def _estimate_bytes(
                 nvq_jsc_banks=nvq_jsc_banks,
             )
         else:
-            item_size = {"BF16": 2, "F16": 2, "F32": 4, "I32": 4, "I64": 8}[item.target_dtype]
+            item_size = {
+                "BF16": 2,
+                "F8_E4M3": 1,
+                "F16": 2,
+                "F32": 4,
+                "I32": 4,
+                "I64": 8,
+            }[item.target_dtype]
             dense_total += 4 + 8 * len(item.shape) + n * item_size
     return nint_total, dense_total
 
@@ -4600,7 +4702,14 @@ def _plan_blob_nbytes(
             jsc_banks=jsc_banks,
             expert_artifact_root=artifact_root,
         )
-    item_size = {"BF16": 2, "F16": 2, "F32": 4, "I32": 4, "I64": 8}[item.target_dtype]
+    item_size = {
+        "BF16": 2,
+        "F8_E4M3": 1,
+        "F16": 2,
+        "F32": 4,
+        "I32": 4,
+        "I64": 8,
+    }[item.target_dtype]
     return 4 + 8 * len(item.shape) + n * item_size
 
 
@@ -4664,6 +4773,7 @@ def convert(args: argparse.Namespace) -> None:
     standard_preset = _normalize_standard_preset(standard_preset_arg) if standard_preset_arg else ""
     quantize_vision = bool(getattr(args, "quantize_vision", False))
     quantize_mtp = bool(getattr(args, "quantize_mtp", False))
+    quantize_ple = bool(getattr(args, "quantize_ple", False))
     calibration_scheme_path = getattr(args, "calibration_scheme", "")
     calibration_scheme = (
         load_scheme(Path(calibration_scheme_path).resolve()) if calibration_scheme_path else None
@@ -4691,8 +4801,10 @@ def convert(args: argparse.Namespace) -> None:
         raise ValueError("--bits, --groupsize, and --sub-bits cannot override a standard preset")
     if args.text_only and quantize_vision:
         raise ValueError("--quantize-vision cannot be combined with --text-only")
-    if mostly_bf16 and (quantize_vision or quantize_mtp):
-        raise ValueError("--quantize-vision and --quantize-mtp do not apply to --bf16")
+    if mostly_bf16 and (quantize_vision or quantize_mtp or quantize_ple):
+        raise ValueError(
+            "--quantize-vision, --quantize-mtp, and --quantize-ple do not apply to --bf16"
+        )
     if base_store is not None and (
         mostly_bf16
         or recipe_types is not None
@@ -4700,10 +4812,12 @@ def convert(args: argparse.Namespace) -> None:
         or calibration_scheme is not None
         or getattr(args, "imatrix", "")
         or getattr(args, "tensor_precision_overrides", "")
+        or quantize_ple
     ):
         raise ValueError(
             "--base-mfq derives the complete MTP precision policy from the base; "
-            "it cannot be combined with BF16, recipe, scheme, imatrix, or tensor overrides"
+            "it cannot be combined with BF16, recipe, scheme, imatrix, PLE "
+            "requantization, or tensor overrides"
         )
     plan = _plan(
         root,
@@ -4714,6 +4828,7 @@ def convert(args: argparse.Namespace) -> None:
         mostly_bf16=mostly_bf16,
         quantize_vision=quantize_vision,
         quantize_mtp=quantize_mtp,
+        quantize_ple=quantize_ple,
         source_inventory=source_inventory,
         source_config=source_config,
         default_nint_dtype=f"NINT{spec.bits}",
@@ -4730,6 +4845,7 @@ def convert(args: argparse.Namespace) -> None:
             source_config,
             quantize_vision=quantize_vision,
             quantize_mtp=quantize_mtp,
+            quantize_ple=quantize_ple,
         )
     plan = _apply_recipe_family_mappings(
         plan,
@@ -4841,6 +4957,7 @@ def convert(args: argparse.Namespace) -> None:
                 "standard_preset": standard_preset or None,
                 "quantize_vision": quantize_vision,
                 "quantize_mtp": quantize_mtp,
+                "quantize_ple": quantize_ple,
                 "calibration_scheme": (
                     _artifact_provenance_name(calibration_scheme_path)
                     if calibration_scheme_path
@@ -5078,11 +5195,28 @@ def convert(args: argparse.Namespace) -> None:
                     del source
                 else:
                     source_name = item.source_name or item.name
-                    raw_source = (
-                        mfq_checkpoint.tensor_source(source_name)
-                        if mfq_checkpoint is not None
-                        else _raw_source_for_plan(root, item)
-                    )
+                    preserve_raw_e4m3 = item.target_dtype == "F8_E4M3"
+                    if mfq_checkpoint is not None:
+                        raw_source = mfq_checkpoint.tensor_source(source_name)
+                        if item.source_quantization is not None and not preserve_raw_e4m3:
+                            if (
+                                item.source_scale_name is None
+                                or item.source_scale_shard is None
+                            ):
+                                raise ValueError(
+                                    f"scaled MFQ source lacks scale metadata: {item.name}"
+                                )
+                            raw_source = _ScaledFp8TensorSlice(
+                                raw_source,
+                                mfq_checkpoint.tensor_source(item.source_scale_name),
+                                item.source_quantization,
+                            )
+                    else:
+                        raw_source = (
+                            _RawSafeTensorSlice(root / item.shard, source_name)
+                            if preserve_raw_e4m3
+                            else _raw_source_for_plan(root, item)
+                        )
                     if item.target_dtype == "NINTM":
                         if item.expert_shape is None or item.expert_precisions is None:
                             raise ValueError(f"NINTM plan lacks expert metadata: {item.name}")
@@ -5105,6 +5239,22 @@ def convert(args: argparse.Namespace) -> None:
                             artifact_root,
                             importance=expert_importance,
                         )
+                    elif preserve_raw_e4m3:
+                        if item.source_dtype != "F8_E4M3":
+                            raise TypeError(
+                                f"cannot preserve {item.source_dtype} as raw E4M3: {item.name}"
+                            )
+                        if item.row_start is not None or item.row_end is not None:
+                            raise ValueError(
+                                f"raw E4M3 preservation does not support split rows: {item.name}"
+                            )
+                        nbytes = _write_float8_e4m3_axis0_blob(
+                            raw_source,
+                            item.shape,
+                            blob_path,
+                            row_chunk,
+                        )
+                        source = raw_source
                     elif item.target_dtype == "NINT8-0":
                         source = _HfPlanRowSource(raw_source, item)
                         nbytes = gguf_quantizer._write_nint8_zero_axis0_blob(
@@ -5441,7 +5591,8 @@ def convert(args: argparse.Namespace) -> None:
                     else (
                         f"llama.cpp-style-standard-preset:{standard_preset};"
                         f"vision={'quantized' if quantize_vision else 'source'};"
-                        f"mtp={'quantized' if quantize_mtp else 'source'}"
+                        f"mtp={'quantized' if quantize_mtp else 'source'};"
+                        f"ple={'quantized' if quantize_ple else 'source'}"
                         if standard_preset
                         else (
                             "minicpmo45-module-matrices=NINT-axis0,raw-parameters=source-dtype"
@@ -5611,6 +5762,7 @@ def convert(args: argparse.Namespace) -> None:
                 ),
                 "quantize_vision": quantize_vision,
                 "quantize_mtp": quantize_mtp,
+                "quantize_ple": quantize_ple,
                 "dense_dtype": "MOSTLY_BF16" if mostly_bf16 else dense_dtype,
                 "mostly_bf16": mostly_bf16,
                 "text_only": bool(args.text_only),
@@ -5741,6 +5893,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--quantize-mtp",
         action="store_true",
         help="opt in to quantizing MTP/draft tensors; source precision is kept by default",
+    )
+    parser.add_argument(
+        "--quantize-ple",
+        action="store_true",
+        help=(
+            "opt in to quantizing random-access PLE tables; native FP8/source "
+            "precision is kept for SSD mmap by default"
+        ),
     )
     parser.add_argument(
         "--tokenizer-gguf",

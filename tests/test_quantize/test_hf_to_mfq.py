@@ -315,6 +315,81 @@ def test_scaled_fp8_tensor_slice_applies_shared_ngram_scale(tmp_path):
     torch.testing.assert_close(source.tensor(), weight.float() * 0.125)
 
 
+def test_qwen4_ple_defaults_to_raw_fp8_and_requires_explicit_quantization(tmp_path):
+    weight_name = (
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding."
+        "shard_0.weight"
+    )
+    scale_name = (
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding."
+        "weight_scale"
+    )
+    inventory = {
+        weight_name: hf_to_mfq.SourceTensorMetadata(
+            name=weight_name,
+            shard="model.safetensors",
+            shape=(32, 16),
+            dtype="F8_E4M3",
+        ),
+        scale_name: hf_to_mfq.SourceTensorMetadata(
+            name=scale_name,
+            shard="model.safetensors",
+            shape=(1,),
+            dtype="BF16",
+        ),
+    }
+    for projection, shape in (
+        ("gate_proj", (16, 16)),
+        ("up_proj", (16, 16)),
+        ("down_proj", (16, 16)),
+    ):
+        name = f"model.language_model.layers.0.mlp.experts.0.{projection}.weight"
+        inventory[name] = hf_to_mfq.SourceTensorMetadata(
+            name=name,
+            shard="model.safetensors",
+            shape=shape,
+            dtype="BF16",
+        )
+    config = {
+        "model_type": "qwen4_exp",
+        "text_config": {
+            "model_type": "qwen4_exp_text",
+            "num_hidden_layers": 2,
+            "mtp_num_hidden_layers": 0,
+            "num_experts": 1,
+            "hidden_size": 16,
+            "moe_intermediate_size": 16,
+        },
+    }
+
+    preserved = build_hf_plan(
+        tmp_path,
+        text_only=True,
+        recipe_types=None,
+        dense_dtype="F16",
+        source_inventory=inventory,
+        source_config=config,
+    )
+    preserved_by_name = {item.name: item for item in preserved}
+    canonical_weight = "model.block.1.position_embedding.ngram.shard.0.weight"
+    canonical_scale = "model.block.1.position_embedding.ngram.weight_scale"
+    assert preserved_by_name[canonical_weight].target_dtype == "F8_E4M3"
+    assert preserved_by_name[canonical_scale].target_dtype == "BF16"
+
+    quantized = build_hf_plan(
+        tmp_path,
+        text_only=True,
+        recipe_types=None,
+        dense_dtype="F16",
+        quantize_ple=True,
+        source_inventory=inventory,
+        source_config=config,
+    )
+    quantized_by_name = {item.name: item for item in quantized}
+    assert quantized_by_name[canonical_weight].target_dtype == "NINT4"
+    assert canonical_scale not in quantized_by_name
+
+
 @pytest.mark.parametrize(
     "left_suffix,right_suffix",
     [

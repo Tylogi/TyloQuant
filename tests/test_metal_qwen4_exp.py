@@ -12,10 +12,12 @@ except RuntimeError:
     pytest.skip("Metal device unavailable", allow_module_level=True)
 
 from mfq.architectures.tensor_schema import map_source_tensor_name  # noqa: E402
+from mfq.formats import io  # noqa: E402
+from mfq.formats.header import FileHeader  # noqa: E402
 from mfq.formats.moe import NintMoePool, NintMoeTensor  # noqa: E402
 from mfq.formats.nint import NintSpec  # noqa: E402
-from mfq.quantize.nint_quant import quantize  # noqa: E402
-from mfq.runtime.mlx_linear import MlxNintModel  # noqa: E402
+from mfq.quantize.nint_quant import dequantize, quantize  # noqa: E402
+from mfq.runtime.mlx_linear import MlxMMapEmbedding, MlxNintModel  # noqa: E402
 from mfq.runtime.mlx_qwen4_exp import (  # noqa: E402
     MlxQwen4ExpGdn,
     MlxQwen4ExpMtp,
@@ -244,6 +246,177 @@ def test_qwen4_sharded_ple_hash_matches_reference_and_cache() -> None:
     cached_values = mx.concatenate((first, second), axis=1)
     mx.eval(cached_values)
     np.testing.assert_array_equal(np.asarray(cached_values), expected_values)
+
+
+def test_qwen4_ple_keeps_nint_shards_mmap_backed(tmp_path) -> None:
+    rng = np.random.default_rng(3810)
+    prefix = "model.block.0.position_embedding"
+    embedding_prefix = prefix + ".ngram.shard"
+    source = _random(rng, (16, 2), 0.5)
+    shards = (
+        quantize(source[:8], NintSpec(4, 24, 6)),
+        quantize(source[8:], NintSpec(4, 24, 6)),
+    )
+    tensors = {
+        embedding_prefix + ".0.weight": shards[0],
+        embedding_prefix + ".1.weight": shards[1],
+        prefix + ".ngram.layer_multipliers": np.asarray([3, 5, 7], dtype=np.int64),
+        prefix + ".ngram.head_offsets": np.asarray([0, 8], dtype=np.int64),
+        prefix + ".ngram.head_vocab_sizes": np.asarray([5, 7], dtype=np.int64),
+    }
+    path = tmp_path / "qwen4-ple.mfq"
+    io.save(
+        path,
+        FileHeader(model_arch="qwen4_exp", num_tensors=len(tensors)),
+        tensors,
+    )
+    config = SimpleNamespace(
+        split_ngram_parts=2,
+        ngram_size=3,
+        heads_per_ngram=1,
+        ple_embed_dim=4,
+        eos_token_ids=(99,),
+    )
+    ids = np.asarray([[1, 2, 99, 3, 4]], dtype=np.int32)
+
+    with MlxNintModel.from_mfq(path) as model:
+        copied_blobs: list[str] = []
+        original_read_blob = model.tensors.read_blob
+
+        def tracked_read_blob(name: str) -> bytes:
+            copied_blobs.append(name)
+            return original_read_blob(name)
+
+        model.tensors.read_blob = tracked_read_blob
+        embedding = MlxQwen4ExpNgramEmbedding(model, config, prefix)
+        assert all(
+            isinstance(shard, MlxMMapEmbedding) for shard in embedding.embeddings
+        )
+        assert not copied_blobs
+
+        expected_ids = _reference_ngram_ids(
+            ids,
+            eos=99,
+            multipliers=(3, 5, 7),
+            vocab_sizes=(5, 7),
+            offsets=(0, 8),
+        )
+        decoded = np.concatenate(tuple(dequantize(shard) for shard in shards))
+        expected = decoded[expected_ids].reshape(1, 5, 4).astype(np.float16)
+        actual = embedding(mx.array(ids), use_cache=False)
+        mx.eval(actual)
+
+        np.testing.assert_allclose(np.asarray(actual), expected, rtol=0, atol=0)
+        assert not copied_blobs
+        assert embedding.last_touched_shards == (0, 1)
+        expected_unique_rows = sum(
+            np.unique(
+                expected_ids.reshape(-1)[
+                    expected_ids.reshape(-1) // 8 == shard_index
+                ]
+                - shard_index * 8
+            ).size
+            for shard_index in range(2)
+        )
+        assert embedding.rows_read == expected_unique_rows
+        assert embedding.logical_bytes_read < sum(
+            shard.mapped_nbytes for shard in embedding.embeddings
+        )
+        assert not model.tensors._cache
+
+
+def test_qwen4_ple_preserves_raw_e4m3_and_applies_shared_scale(tmp_path) -> None:
+    prefix = "model.block.0.position_embedding"
+    embedding_prefix = prefix + ".ngram.shard"
+    decoded = np.asarray(
+        [
+            [1.0, -1.0],
+            [0.5, -0.5],
+            [2.0, -2.0],
+            [4.0, -4.0],
+            [0.25, -0.25],
+            [8.0, -8.0],
+            [16.0, -16.0],
+            [32.0, -32.0],
+            [64.0, -64.0],
+            [128.0, -128.0],
+            [256.0, -256.0],
+            [448.0, -448.0],
+            [0.125, -0.125],
+            [0.0625, -0.0625],
+            [0.03125, -0.03125],
+            [0.015625, -0.015625],
+        ],
+        dtype=np.float32,
+    )
+    codes = np.asarray(
+        [
+            [0x38, 0xB8],
+            [0x30, 0xB0],
+            [0x40, 0xC0],
+            [0x48, 0xC8],
+            [0x28, 0xA8],
+            [0x50, 0xD0],
+            [0x58, 0xD8],
+            [0x60, 0xE0],
+            [0x68, 0xE8],
+            [0x70, 0xF0],
+            [0x78, 0xF8],
+            [0x7E, 0xFE],
+            [0x20, 0xA0],
+            [0x18, 0x98],
+            [0x10, 0x90],
+            [0x08, 0x88],
+        ],
+        dtype=np.uint8,
+    ).view(io.Float8E4M3Array)
+    tensors = {
+        embedding_prefix + ".0.weight": codes[:8],
+        embedding_prefix + ".1.weight": codes[8:],
+        prefix + ".ngram.weight_scale": np.asarray(
+            [0x3E00], dtype=np.uint16
+        ).view(io.BFloat16Array),
+        prefix + ".ngram.layer_multipliers": np.asarray([3, 5, 7], dtype=np.int64),
+        prefix + ".ngram.head_offsets": np.asarray([0, 8], dtype=np.int64),
+        prefix + ".ngram.head_vocab_sizes": np.asarray([5, 7], dtype=np.int64),
+    }
+    path = tmp_path / "qwen4-ple-fp8.mfq"
+    io.save(
+        path,
+        FileHeader(model_arch="qwen4_exp", num_tensors=len(tensors)),
+        tensors,
+    )
+    config = SimpleNamespace(
+        split_ngram_parts=2,
+        ngram_size=3,
+        heads_per_ngram=1,
+        ple_embed_dim=4,
+        eos_token_ids=(99,),
+    )
+    ids = np.asarray([[1, 2, 99, 3, 4]], dtype=np.int32)
+
+    with MlxNintModel.from_mfq(path) as model:
+        embedding = MlxQwen4ExpNgramEmbedding(model, config, prefix)
+        expected_ids = _reference_ngram_ids(
+            ids,
+            eos=99,
+            multipliers=(3, 5, 7),
+            vocab_sizes=(5, 7),
+            offsets=(0, 8),
+        )
+        actual = embedding(mx.array(ids), use_cache=False)
+        mx.eval(actual)
+
+        np.testing.assert_array_equal(
+            np.asarray(actual),
+            (decoded[expected_ids] * 0.125).reshape(1, 5, 4).astype(np.float16),
+        )
+        assert embedding.raw_e4m3
+        assert embedding.rows_read > 0
+        assert all(
+            isinstance(shard, MlxMMapEmbedding) for shard in embedding.embeddings
+        )
+        assert not model.tensors._cache
 
 
 def test_qwen4_ple_reject_rollback_restores_convolution_and_ngram_history() -> None:

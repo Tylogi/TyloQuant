@@ -192,6 +192,9 @@ class LegacyCanonicalTensorView(Mapping[str, Any]):
     def read_blob(self, name: str) -> bytes:
         return self._store.read_blob(self._stored(name))
 
+    def embedding_reader(self, name: str) -> Any:
+        return self._store.embedding_reader(self._stored(name))
+
     def blob_view(self, record: Any) -> memoryview:
         if isinstance(record, str):
             record = self._stored(record)
