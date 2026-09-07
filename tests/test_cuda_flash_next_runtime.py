@@ -493,6 +493,9 @@ def qsa_reference(inputs,p,selected=None):
     for bi in range(b):
         for token in range(t):
             visible=np.arange((token+1)//p["pool"])
+            if p.get("assert_distinct_cutoff",False) and len(visible)>p["budget"]//p["pool"]:
+                ordered=np.sort(scores[bi,token,visible]);cut=p["budget"]//p["pool"]
+                assert ordered[-cut]-ordered[-cut-1]>1e-4,"full-model fixture has an ambiguous sparse cutoff"
             chosen=visible[np.argsort(scores[bi,token,visible])[-(p["budget"]//p["pool"]):]]
             indices=[int(i*p["pool"]+j) for i in chosen for j in range(p["pool"])]
             indices+=list(range(token+1-(token+1)%p["pool"],token+1))
@@ -530,3 +533,285 @@ def test_qsa_equation_chunks_and_cache_rejection(native,axes,interleaved):
     rejected=native("runtime_qsa",inputs,**p,steps=[dict(begin=0,count=4),dict(truncate=3),dict(begin=5,count=1)])[-1]
     expected=native("runtime_qsa",inputs,**p,steps=[dict(begin=0,count=3),dict(begin=5,count=1)])[-1]
     np.testing.assert_allclose(rejected,expected,atol=2e-5,rtol=2e-5)
+
+
+def gdn_fixture(width,silu_gate):
+    rng=np.random.default_rng(3801)
+    rand=lambda shape:rng.normal(scale=.05,size=shape).astype(np.float32)
+    h,nk,nv,kernel=16,1,2,4
+    x=rand((2,7,h))*4;channels=(2*nk+nv)*width
+    conv=np.zeros((channels,1,kernel),np.float32);conv[:,0,-1]=.8;conv[:,0,-2]=.1
+    a=[x,rand((channels,h)),rand((nv*width,h)),rand((nv,h)),rand((nv,h)),rand((h,nv*width)),
+       conv,rand((nv,)),rand((nv,)),np.ones(width,np.float32)]
+    return a,dict(key_heads=nk,value_heads=nv,width=width,kernel=kernel,silu_gate=silu_gate)
+
+
+def gdn_reference(a,p):
+    x,qkv,z,alpha,beta,out,conv,dt,alog,norm=a
+    b,t,_=x.shape;nk=p["key_heads"];nv=p["value_heads"];d=p["width"];kernel=p["kernel"]
+    raw=x@qkv.T;history=np.pad(raw,((0,0),(kernel-1,0),(0,0)))
+    convolved=sum(history[:,j:j+t]*conv[:,0,j] for j in range(kernel))
+    convolved=convolved*sigmoid(convolved)
+    q,k,v=np.split(convolved,[nk*d,2*nk*d],axis=-1)
+    q=q.reshape(b,t,nk,d).transpose(0,2,1,3);k=k.reshape(b,t,nk,d).transpose(0,2,1,3)
+    q=q/np.maximum(np.sqrt((q*q).sum(-1,keepdims=True)),1e-6)
+    k=k/np.maximum(np.sqrt((k*k).sum(-1,keepdims=True)),1e-6)
+    q=np.repeat(q,nv//nk,axis=1);k=np.repeat(k,nv//nk,axis=1)
+    v=v.reshape(b,t,nv,d).transpose(0,2,1,3)
+    gate=x@alpha.T+dt
+    rate=np.exp(-np.exp(alog)*(np.maximum(gate,0)+np.log1p(np.exp(-np.abs(gate)))))
+    beta=sigmoid(x@beta.T)
+    state=np.zeros((b,nv,d,d),np.float32);attended=[]
+    for token in range(t):
+        kt=k[:,:,token];decay=rate[:,token,:,None]
+        projected=(state*kt[...,None]).sum(-2)
+        delta=(v[:,:,token]-decay*projected)*beta[:,token,:,None]
+        state=decay[...,None]*state+kt[...,None]*delta[...,None,:]
+        attended.append((state*q[:,:,token,:,None]).sum(-2)/math.sqrt(d))
+    attended=np.stack(attended,axis=2)
+    normalized=attended/np.sqrt(np.mean(attended**2,axis=-1,keepdims=True)+1e-6)*norm
+    z=(x@z.T).reshape(b,t,nv,d).transpose(0,2,1,3)
+    gate=sigmoid(z)*(z if p["silu_gate"] else 1)
+    output=(normalized*gate).transpose(0,2,1,3).reshape(b,t,nv*d)@out.T
+    return output,history[:,-(kernel-1):],state
+
+
+@pytest.mark.parametrize("width",[4,32,64,128])
+@pytest.mark.parametrize("silu_gate",[False,True])
+def test_qwen_gdn_equation_chunk_and_transactions(native,width,silu_gate):
+    a,p=gdn_fixture(width,silu_gate)
+    full=native("runtime_gdn",a,**p,steps=[dict(begin=0,count=7)])
+    for actual,expected in zip(full,gdn_reference(a,p)):
+        np.testing.assert_allclose(actual,expected,atol=2e-5,rtol=2e-5)
+    chunks=native("runtime_gdn",a,**p,steps=[dict(begin=0,count=2),dict(begin=2,count=1),dict(begin=3,count=4)])
+    np.testing.assert_allclose(np.concatenate(chunks[::3],axis=1),full[0],atol=8e-3,rtol=8e-3)
+    for action in ("rollback","commit"):
+        steps=[dict(begin=0,count=2),dict(begin=2,count=2,confirmed=1),{action:True},dict(begin=5,count=1)]
+        got=native("runtime_gdn",a,**p,steps=steps)[-3:]
+        ref=native("runtime_gdn",a,**p,steps=[dict(begin=0,count=2),dict(begin=2,count=1 if action=="rollback" else 2),dict(begin=5,count=1)])[-3:]
+        for actual,expected in zip(got,ref):np.testing.assert_allclose(actual,expected,atol=8e-3,rtol=8e-3)
+
+
+def ngram_reference(ids,p):
+    b,t=ids.shape;prefix=p["ngram"]-1;heads=p["heads_per_ngram"]
+    history=np.pad(ids,((0,0),(prefix,0)),constant_values=p["eos"])
+    result=np.empty((b,t,prefix*heads),np.int64)
+    for bi in range(b):
+        segment=0
+        for token in range(t+prefix):
+            for ngram in range(2,p["ngram"]+1):
+                mixed=0
+                for shift in range(ngram):
+                    value=int(history[bi,token-shift]) if token-shift>=segment else p["eos"]
+                    mixed^=(value*p["multipliers"][shift])&((1<<64)-1)
+                signed=mixed if mixed<(1<<63) else mixed-(1<<64)
+                if token>=prefix:
+                    for head in range(heads):
+                        h=(ngram-2)*heads+head
+                        result[bi,token-prefix,h]=signed%p["vocab"][h]+p["offsets"][h]
+            if history[bi,token]==p["eos"]:segment=token+1
+    return result
+
+
+def ngram_fixture(heads=2):
+    p=dict(ngram=3,heads_per_ngram=heads,eos=15,
+           multipliers=[-7046029254386353131,6364136223846793005,-4658895280553007687],
+           offsets=list(range(0,16*heads,8)),vocab=[5,7]*heads)
+    ids=np.array([[1,2,15,3,4,5,6],[8,15,9,10,15,11,12]],np.int64)
+    weights=np.arange(heads*2*8*2,dtype=np.float32).reshape(heads*2,8,2)/64
+    return ids,weights,p
+
+
+@pytest.mark.parametrize("heads",[1,2])
+def test_qwen_ngram_shards_signed_hash_eos_and_chunks(native,heads):
+    ids,weights,p=ngram_fixture(heads)
+    expected=ngram_reference(ids,p)
+    full,hashed=native("runtime_ngram",[ids,weights],**p,steps=[dict(begin=0,count=7)])
+    np.testing.assert_array_equal(hashed,expected)
+    np.testing.assert_array_equal(full,weights.reshape(-1,2)[expected].reshape(2,7,-1))
+    chunks=native("runtime_ngram",[ids,weights],**p,steps=[dict(begin=0,count=3),dict(begin=3,count=1),dict(begin=4,count=3)])
+    np.testing.assert_array_equal(np.concatenate(chunks[::2],axis=1),full)
+    np.testing.assert_array_equal(np.concatenate(chunks[1::2],axis=1),expected)
+
+
+def ple_fixture():
+    ids,weights,p=ngram_fixture()
+    rng=np.random.default_rng(3804);rand=lambda shape:rng.normal(scale=.05,size=shape).astype(np.float32)
+    p.update(hidden=8,streams=2)
+    x=rand((2,7,16))*4
+    return [x,ids,weights,rand((16,8)),rand((8,8)),rand((16,)),rand((16,)),rand((16,)),rand((3,16))],p
+
+
+def ple_reference(a,p):
+    x,ids,shards,key,value,kn,qn,cn,conv=a;b,t,_=x.shape;h=p["hidden"];c=p["streams"]
+    def norm(x,w):
+        f=x.astype(np.float32).reshape(b,t,c,h)
+        return ((f/np.sqrt(np.mean(f*f,axis=-1,keepdims=True)+1e-6)).reshape(b,t,c*h)*(1+w)).astype(x.dtype)
+    embeddings=shards.reshape(-1,shards.shape[-1])[ngram_reference(ids,p)].reshape(b,t,h)
+    k=norm(embeddings@key.T,kn).reshape(b,t,c,h);q=norm(x,qn).reshape(b,t,c,h)
+    score=(k*q).sum(-1)/math.sqrt(h)
+    root=np.sign(score)*np.sqrt(np.maximum(np.abs(score),1e-6))
+    gated=(sigmoid(root)[...,None]*(embeddings@value.T)[:,:,None]).reshape(b,t,c*h)
+    normalized=norm(gated,cn);context=(conv.shape[0]-1)*p["ngram"]
+    history=np.pad(normalized,((0,0),(context,0),(0,0)))
+    convolved=sum(history[:,j*p["ngram"]:j*p["ngram"]+t]*conv[j] for j in range(conv.shape[0]))
+    return (gated+convolved*sigmoid(convolved)).astype(x.dtype),history[:,-context:]
+
+
+@pytest.mark.parametrize("action",["rollback","commit"])
+def test_qwen_ple_equation_eos_chunks_and_transactions(native,action):
+    a,p=ple_fixture()
+    full=native("runtime_ple",a,**p,steps=[dict(begin=0,count=7)])
+    for actual,expected in zip(full,ple_reference(a,p)):
+        np.testing.assert_allclose(actual,expected,atol=2e-5,rtol=2e-5)
+    chunks=native("runtime_ple",a,**p,steps=[dict(begin=0,count=3),dict(begin=3,count=4)])
+    np.testing.assert_allclose(np.concatenate(chunks[::2],axis=1),full[0],atol=1e-3,rtol=1e-3)
+    got=native("runtime_ple",a,**p,steps=[dict(begin=0,count=2),dict(begin=2,count=2,confirmed=1),{action:True},dict(begin=5,count=1)])[-2:]
+    ref=native("runtime_ple",a,**p,steps=[dict(begin=0,count=2),dict(begin=2,count=1 if action=="rollback" else 2),dict(begin=5,count=1)])[-2:]
+    for actual,expected in zip(got,ref):np.testing.assert_allclose(actual,expected,atol=1e-3,rtol=1e-3)
+
+
+def qwen_model_fixture(interval=2,silu_gate=False,ple=True):
+    from mfq.architectures.flash_next import Qwen4ExpConfig
+    rng=np.random.default_rng(3805);rand=lambda shape,s=.05:rng.normal(scale=s,size=shape).astype(np.float32)
+    h,streams,d,heads,kv,ih=16,2,32,2,1,8
+    kinds=["full_attention" if (i+1)%interval==0 else "linear_attention" for i in range(2)]
+    ple_layers=[i+1 for i,kind in enumerate(kinds) if kind=="linear_attention"] if ple else []
+    c=dict(model_type="qwen4_exp_text",vocab_size=32,hidden_size=h,num_hidden_layers=2,
+        max_position_embeddings=32,num_attention_heads=heads,num_key_value_heads=kv,head_dim=d,
+        partial_rotary_factor=.25,rope_parameters=dict(rope_theta=1e7,mrope_section=[2,1,1],mrope_interleaved=silu_gate),
+        rms_norm_eps=1e-6,layer_types=kinds,full_attention_interval=interval,hc_count=streams,hc_lowrank=4,
+        linear_num_key_heads=1,linear_num_value_heads=2,linear_key_head_dim=d,linear_value_head_dim=d,
+        linear_conv_kernel_dim=4,num_experts=3,num_experts_per_tok=2,moe_intermediate_size=16,
+        shared_expert_intermediate_size=16,norm_topk_prob=silu_gate,output_gate_type="silu" if silu_gate else "sigmoid",
+        hidden_act="silu",attention_bias=False,indexer_n_heads=ih,indexer_kv_heads=1,indexer_head_dim=d,
+        indexer_budget=4,indexer_compress_ratio=2,ple_layer_ids=ple_layers,ple_embed_dim=h,ple_conv_kernel_size=3,
+        ngram_size=3,heads_per_ngram=2,ngram_vocab_size_base=8,split_ngram_parts=4,
+        make_ngram_vocab_size_divisible_by=1,seed=3805,mtp_num_hidden_layers=0,tie_word_embeddings=False,eos_token_id=3)
+    outer=dict(model_type="qwen4_exp",text_config=c);Qwen4ExpConfig.from_hf_config(outer)
+    w={"model.token_embedding.weight":rand((32,h),.2),"model.output.weight":rand((32,h))}
+    def gr(p,combine=True):
+        w[p+".norm.weight"]=rand((streams*h,),.02);w[p+".down.weight"]=rand((4,streams*h));w[p+".up.weight"]=rand((streams*h,4))
+        if combine:w[p.removesuffix(".pre")+".post.inject.weight"]=rand((streams,streams*h))
+    gr("model.mhc.pre",False)
+    for i,kind in enumerate(kinds):
+        p=f"model.block.{i}"
+        gr(p+".attention.mhc.pre");gr(p+".mlp.mhc.pre")
+        m=p+".mlp"
+        w[m+".experts.gate_up.weight"]=rand((3,32,h));w[m+".experts.down.weight"]=rand((3,h,16));w[m+".router.weight"]=rand((3,h))
+        for key,shape in {"gate":(16,h),"up":(16,h),"down":(h,16),"router":(1,h)}.items():w[m+f".shared_expert.{key}.weight"]=rand(shape)
+        if kind=="linear_attention":
+            a=p+".linear_attention"
+            for key,shape in {"qkv":(4*d,h),"gate":(2*d,h),"alpha":(2,h),"beta":(2,h),"output":(h,2*d)}.items():w[a+f".{key}.weight"]=rand(shape)
+            conv=np.zeros((4*d,1,4),np.float32);conv[:,0,-1]=.8;conv[:,0,-2]=.1
+            w[a+".conv.weight"]=conv;w[a+".dt_bias"]=rand((2,));w[a+".a"]=rand((2,));w[a+".norm.weight"]=np.ones(d,np.float32)
+        else:
+            a=p+".attention"
+            for key,shape in {"query":(heads*2*d,h),"key":(kv*d,h),"value":(kv*d,h),"output":(h,heads*d),"indexer.query_key":((ih+1)*d,h)}.items():w[a+f".{key}.weight"]=rand(shape)
+            for key in ["query_norm","key_norm","indexer.query_norm","indexer.key_norm"]:w[a+f".{key}.weight"]=rand((d,),.02)
+        if i+1 in ple_layers:
+            a=p+".position_embedding"
+            for shard in range(4):w[a+f".ngram.shard.{shard}.weight"]=rand((8,4),.2)
+            w[a+".ngram.layer_multipliers"]=np.array([-7046029254386353131,6364136223846793005,-4658895280553007687],np.int64)
+            w[a+".ngram.head_offsets"]=np.array([0,8,16,24],np.int64);w[a+".ngram.head_vocab_sizes"]=np.array([5,7,5,7],np.int64)
+            w[a+".key.weight"]=rand((streams*h,h));w[a+".value.weight"]=rand((h,h))
+            for key in ["key_norm","query_norm","conv_norm"]:w[a+f".{key}.weight"]=rand((streams*h,),.02)
+            w[a+".conv.weight"]=rand((3,streams*h))
+    return outer,w
+
+
+def qwen_model_reference(config,w,positions=None):
+    c=config["text_config"];h=c["hidden_size"];streams=c["hc_count"]
+    ids=np.arange(1,8,dtype=np.int64)[None];b,t=ids.shape
+    x=np.tile(w["model.token_embedding.weight"][ids].astype(np.float16),(1,1,streams))
+    def lin(x,p):return x.astype(w[p+".weight"].dtype)@w[p+".weight"].T
+    def gr(x,p,combine=True):
+        f=x.astype(np.float32).reshape(b,t,streams,h)
+        normalized=((f/np.sqrt((f*f).mean(-1,keepdims=True)+1e-6)).reshape(x.shape)*(1+w[p+".norm.weight"])).astype(x.dtype)
+        low=lin(normalized,p+".down")/streams;low=low*sigmoid(low)
+        mixing=sigmoid(lin(low,p+".up"))
+        mixed=(mixing.reshape(b,t,streams,h)*normalized.reshape(b,t,streams,h)).mean(-2)
+        inject=2*sigmoid(lin(normalized,p.removesuffix(".pre")+".post.inject")/streams) if combine else None
+        return mixed,inject
+    for i,kind in enumerate(c["layer_types"]):
+        p=f"model.block.{i}"
+        if i+1 in c["ple_layer_ids"]:
+            a=p+".position_embedding"
+            metadata=dict(ngram=3,heads_per_ngram=2,eos=c["eos_token_id"],hidden=h,streams=streams,
+                multipliers=w[a+".ngram.layer_multipliers"].tolist(),offsets=w[a+".ngram.head_offsets"].tolist(),vocab=w[a+".ngram.head_vocab_sizes"].tolist())
+            args=[x,ids,np.stack([w[a+f".ngram.shard.{j}.weight"] for j in range(4)])]+[w[a+f".{key}.weight"] for key in ["key","value","key_norm","query_norm","conv_norm","conv"]]
+            x=x+ple_reference(args,metadata)[0]
+        branch,inject=gr(x,p+".attention.mhc.pre")
+        if kind=="linear_attention":
+            a=p+".linear_attention"
+            args=[branch]+[w[a+f".{key}.weight"] for key in ["qkv","gate","alpha","beta","output","conv"]]+[w[a+".dt_bias"],w[a+".a"],w[a+".norm.weight"]]
+            branch=gdn_reference(args,dict(key_heads=1,value_heads=2,width=32,kernel=4,silu_gate=c["output_gate_type"]=="silu"))[0]
+        else:
+            a=p+".attention"
+            args=[branch]+[w[a+f".{key}.weight"] for key in ["query","key","value","output","indexer.query_key","query_norm","key_norm","indexer.query_norm","indexer.key_norm"]]+[np.arange(t) if positions is None else positions]
+            branch=qsa_reference(args,dict(heads=2,kv_heads=1,width=32,index_heads=8,index_width=32,pool=2,budget=4,maximum=32,rotary=8,sections=[2,1,1],interleaved=c["rope_parameters"]["mrope_interleaved"],assert_distinct_cutoff=True))
+        x=x+(branch[:,:,None]*inject[...,None]).reshape(x.shape)
+        branch,inject=gr(x,p+".mlp.mhc.pre");source=branch.reshape(-1,h).astype(np.float16)
+        a=p+".mlp";logits=lin(source,a+".router");probs=np.exp(logits-logits.max(-1,keepdims=True));probs/=probs.sum(-1,keepdims=True)
+        selected=np.argsort(-probs,axis=-1)[:,:2];route=np.take_along_axis(probs,selected,axis=-1)
+        if c["norm_topk_prob"]:route/=route.sum(-1,keepdims=True)
+        routed=[]
+        for row in range(b*t):
+            value=np.zeros(h,np.float32)
+            for rank,expert in enumerate(selected[row]):
+                gu=w[a+".experts.gate_up.weight"][expert]@source[row].astype(np.float32);g,u=np.split(gu,2)
+                value+=((g*sigmoid(g)*u)@w[a+".experts.down.weight"][expert].T)*route[row,rank]
+            routed.append(value)
+        g=lin(source,a+".shared_expert.gate");u=lin(source,a+".shared_expert.up")
+        shared=sigmoid(lin(source,a+".shared_expert.router"))*lin(g*sigmoid(g)*u,a+".shared_expert.down")
+        branch=(np.stack(routed)+shared).reshape(b,t,h)
+        x=x+(branch[:,:,None]*inject[...,None]).reshape(x.shape)
+    return lin(gr(x,"model.mhc.pre",False)[0],"model.output")
+
+
+def write_qwen_fixture(path,config,weights):
+    from mfq.formats.io import save
+    from mfq.formats.header import FileHeader
+    from mfq.formats.assets import MODEL_CONFIG_ASSET,MODEL_GRAPH_ASSET
+    graph=dict(schema_version=1,architecture="qwen4_exp",canonical_naming=dict(namespace="mfq.tensor",version=1,component_roots=["model"]),
+        topology=dict(text_layers=2),graph=dict(kind="causal_lm",backbone="qwen4_exp"),
+        components=[dict(kind="text",tensor_root="model",implementation="qwen4_exp",policy="decoder")],capabilities=["text"])
+    save(path,FileHeader(version=2,model_arch="qwen4_exp"),{**weights,MODEL_CONFIG_ASSET:json.dumps(config).encode(),MODEL_GRAPH_ASSET:json.dumps(graph).encode()})
+
+
+@pytest.mark.parametrize("interval,ple",[(1,False),(2,False),(2,True),(3,True)])
+@pytest.mark.parametrize("silu_gate",[False,True])
+def test_qwen_native_complete_graph(tmp_path,interval,ple,silu_gate):
+    c,w=qwen_model_fixture(interval,silu_gate,ple);expected=qwen_model_reference(c,w)
+    positions=np.stack((np.arange(7),np.arange(7)+2,np.arange(7)+4))
+    axis_expected=qwen_model_reference(c,w,positions)
+    path=tmp_path/"qwen-graph.mfq";write_qwen_fixture(path,c,w)
+    process=run_glm_fixture(path);assert process.returncode==0,process.stdout+process.stderr
+    raw=json.loads(next(line.removeprefix("flash_next_check ") for line in process.stdout.splitlines() if line.startswith("flash_next_check ")))
+    assert raw.pop("architecture")=="qwen4_exp"
+    got={k:np.asarray(v["data"],np.float32).reshape(v["shape"]) for k,v in raw.items()}
+    np.testing.assert_allclose(got["full"],expected,atol=2e-3,rtol=2e-3)
+    np.testing.assert_allclose(got["axis_full"],axis_expected,atol=2e-3,rtol=2e-3)
+    for key in ("chunked","axis_chunked"):
+        np.testing.assert_allclose(got[key],got["axis_full" if key.startswith("axis") else "full"],atol=1.5e-2,rtol=1.5e-2)
+    np.testing.assert_array_equal(got["full"],got["reset"])
+    np.testing.assert_array_equal(got["full"],got["batch_reset"])
+    np.testing.assert_allclose(got["batch"],np.repeat(got["full"],2,axis=0),atol=2e-3,rtol=2e-3)
+    np.testing.assert_allclose(got["last"],got["full"][:,-1],atol=2e-5,rtol=2e-5)
+    for action in ("committed","rejected"):
+        np.testing.assert_allclose(got[action],got[action+"_reference"],atol=2e-3,rtol=2e-3)
+
+
+@pytest.mark.parametrize("error",["schedule","rotary","ple","linear_width","pool","norm","topk","mtp"])
+def test_qwen_native_rejects_inconsistent_config(tmp_path,error):
+    config,w=qwen_model_fixture();c=config["text_config"]
+    if error=="schedule":c["full_attention_interval"]=1
+    elif error=="rotary":c["rope_parameters"]["mrope_section"]=[2,2,2]
+    elif error=="ple":c["ple_layer_ids"]=[2]
+    elif error=="linear_width":c["linear_value_head_dim"]=64
+    elif error=="pool":c["indexer_budget"]=3
+    elif error=="norm":c["rms_norm_eps"]=0
+    elif error=="topk":c["num_experts_per_tok"]=4
+    elif error=="mtp":c["mtp"]={"num_hidden_layers":1}
+    path=tmp_path/"invalid-qwen.mfq";write_qwen_fixture(path,config,w)
+    result=run_glm_fixture(path);assert result.returncode!=0 and "flash_next_check " not in result.stdout

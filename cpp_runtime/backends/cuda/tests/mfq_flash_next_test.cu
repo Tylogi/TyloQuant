@@ -43,6 +43,67 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
     };
     std::optional<double> scale;
     if (p.contains("scale") && !p.at("scale").is_null()) scale = p.at("scale").get<double>();
+    if (op == "runtime_gdn") {
+        const auto linear = [&](int index) -> mfq::flash_next::Linear {
+            auto w=a.at(index);return [w](const Tensor& x) {return matmul(x.to(w.scalar_type()),w.transpose(-1,-2));};
+        };
+        mfq::flash_next::GdnWeights w{linear(1),linear(2),linear(3),linear(4),linear(5),a.at(6),a.at(7),a.at(8),a.at(9)};
+        mfq::flash_next::Gdn block(std::move(w),p.at("key_heads"),p.at("value_heads"),p.at("width"),
+            p.at("kernel"),p.value("eps",1e-6),p.value("silu_gate",false));
+        std::vector<Tensor> out;
+        for (const auto& step:p.at("steps")) {
+            if (step.value("reset",false)) block.reset();
+            else if (step.value("commit",false)) block.commit();
+            else if (step.value("rollback",false)) block.rollback();
+            else {
+                out.push_back(block.forward(a.at(0).narrow(1,step.at("begin"),step.at("count")),step.value("cache",true),step.value("confirmed",0)));
+                out.push_back(block.conv_state());out.push_back(block.recurrent_state());
+            }
+        }
+        return out;
+    }
+    if (op == "runtime_ngram" || op == "runtime_ple") {
+        const auto weights=a.at(op=="runtime_ngram"?1:2);
+        std::vector<mfq::flash_next::Linear> shards;
+        for (int64_t i=0;i<weights.size(0);++i) {
+            auto w=weights.select(0,i);
+            shards.push_back([w](const Tensor& ids) {
+                auto shape=ids.sizes().vec();shape.push_back(w.size(1));
+                return w.index_select(0,ids.reshape({-1}).to(kInt64)).reshape(shape);
+            });
+        }
+        mfq::flash_next::NgramEmbedding embedding(std::move(shards),weights.size(1),weights.size(2),p.at("ngram"),
+            p.at("heads_per_ngram"),p.at("eos"),p.at("multipliers").get<std::vector<int64_t>>(),
+            p.at("offsets").get<std::vector<int64_t>>(),p.at("vocab").get<std::vector<int64_t>>());
+        std::vector<Tensor> out;
+        if (op=="runtime_ngram") {
+            for (const auto& step:p.at("steps")) {
+                if (step.value("reset",false)) embedding.reset();
+                else {
+                    Tensor ids;
+                    out.push_back(embedding.forward(a.at(0).narrow(1,step.at("begin"),step.at("count")),step.value("cache",true),&ids));
+                    out.push_back(ids);
+                }
+            }
+        } else {
+            const auto linear=[&](int i)->mfq::flash_next::Linear {
+                auto w=a.at(i);return [w](const Tensor& x) {return matmul(x.to(w.scalar_type()),w.transpose(-1,-2));};
+            };
+            mfq::flash_next::PleWeights w{linear(3),linear(4),a.at(5),a.at(6),a.at(7),a.at(8)};
+            mfq::flash_next::Ple block(std::move(embedding),std::move(w),p.at("hidden"),p.at("streams"),p.at("ngram"),p.value("eps",1e-6));
+            for (const auto& step:p.at("steps")) {
+                if (step.value("reset",false)) block.reset();
+                else if (step.value("commit",false)) block.commit();
+                else if (step.value("rollback",false)) block.rollback();
+                else {
+                    const int64_t begin=step.at("begin"),count=step.at("count");
+                    out.push_back(block.forward(a.at(0).narrow(1,begin,count),a.at(1).narrow(1,begin,count),step.value("cache",true),step.value("confirmed",0)));
+                    out.push_back(block.conv_state());
+                }
+            }
+        }
+        return out;
+    }
     if (op == "runtime_rotary") {
         mfq::flash_next::Rotary rotary(p.at("rotary"),p.at("maximum"),p.value("base",1e7),
             p.value("sections",std::vector<int64_t>{}),p.value("interleaved",false));

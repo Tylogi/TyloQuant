@@ -87,11 +87,16 @@ int main() {
                 MfqCudaVisionAdapter::none,
             "partial MiniCPM graph selected a composite CUDA adapter");
 
-        const auto unsupported = graph_with("qwen4_exp", "grid_vit");
+        const auto unsupported = graph_with("unknown_experimental", "grid_vit");
         require(
             mfq_cuda_model_plan(unsupported).backbone ==
                 MfqCudaBackbone::unsupported,
             "unimplemented CUDA backbone was accepted");
+        const auto qwen4 = graph_with("qwen4_exp", "grid_vit", "next_token_prediction");
+        const auto qwen4_plan = mfq_cuda_model_plan(qwen4);
+        require(qwen4_plan.backbone == MfqCudaBackbone::qwen4_exp &&
+            qwen4_plan.vision == MfqCudaVisionAdapter::none && qwen4_plan.predictor == MfqCudaPredictorAdapter::none,
+            "Qwen4 text/optional-component selection mismatch");
 
         const auto glm_next = graph_with("glm5_next", "grid_vit", "next_token_prediction");
         const auto glm_plan = mfq_cuda_model_plan(glm_next);
