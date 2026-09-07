@@ -1,6 +1,7 @@
 // Native ABI numerical-test bridge: tests/test_cuda_flash_next.py supplies the
 // same NumPy oracle cases to this executable and the production Torch module.
 #include "mfq/kernels/cuda/flash_next.h"
+#include "mfq_flash_next_runtime.h"
 #include "mfq_cuda_context.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -41,6 +42,41 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
     };
     std::optional<double> scale;
     if (p.contains("scale") && !p.at("scale").is_null()) scale = p.at("scale").get<double>();
+    if (op == "runtime_select_pooled_blocks") return {mfq::flash_next::select_pooled_blocks(
+        a.at(0), p.at("query_offset"), p.at("logical_length"), p.at("pool"), p.at("budget"), p.at("tail"))};
+    if (op == "runtime_sequence_cache") {
+        mfq::flash_next::SequenceCache cache(p.at("maximum"), a.at(0).size(-1));
+        std::vector<Tensor> out;
+        for (const auto& step : p.at("steps")) {
+            if (step.contains("truncate")) cache.truncate(step.at("truncate"));
+            else if (step.value("reset", false)) cache.reset();
+            else out.push_back(cache.append(a.at(0).narrow(1, step.at("begin"), step.at("count"))).clone());
+        }
+        return out;
+    }
+    if (op == "runtime_kda") {
+        const auto linear = [&](int index) -> mfq::flash_next::Linear {
+            auto weight = a.at(index);
+            return [weight](const Tensor& x) { return matmul(x.to(weight.scalar_type()), weight.transpose(-1,-2)); };
+        };
+        mfq::flash_next::KdaWeights weights{linear(1),linear(2),linear(3),linear(4),linear(5),linear(6),linear(7),
+            a.at(8),a.at(9),a.at(10),a.at(11),a.at(12),a.at(13)};
+        mfq::flash_next::Kda block(std::move(weights), p.at("heads"), p.at("width"), p.at("kernel"),
+            p.value("lower_bound", -5.0), p.value("eps", 1e-5));
+        std::vector<Tensor> out;
+        for (const auto& step : p.at("steps")) {
+            if (step.value("rollback", false)) block.rollback();
+            else if (step.value("commit", false)) block.commit();
+            else if (step.value("reset", false)) block.reset();
+            else {
+                out.push_back(block.forward(a.at(0).narrow(1, step.at("begin"), step.at("count")),
+                    step.value("cache", true), step.value("confirmed", 0)));
+                out.push_back(block.conv_state());
+                out.push_back(block.recurrent_state());
+            }
+        }
+        return out;
+    }
     if (op == "qwen4_grouped_rms_norm") return {qwen4_grouped_rms_norm(a.at(0), a.at(1), p.at("group_size"), p.value("eps", 1e-6))};
     if (op == "qwen4_gated_residual_pre") return qwen4_gated_residual_pre(a.at(0), a.at(1), a.at(2), a.at(3), optional(4), p.at("hidden_size"), p.value("hc_count", 4), p.value("eps", 1e-6));
     if (op == "qwen4_gated_residual_post") return {qwen4_gated_residual_post(a.at(0), a.at(1), a.at(2), p.value("hc_count", 4))};
