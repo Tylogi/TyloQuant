@@ -15090,7 +15090,8 @@ struct Block {
             const Context & context,
             const Config & c,
             const RopeCache & rope) {
-        MFQ_RUNTIME_CHECK(context.confirmed_prefix == 0,
+        MFQ_RUNTIME_CHECK(
+            context.confirmed_prefix == 0 || supports_speculation(),
             "block does not support speculative verification");
         return forward(std::move(x), context.positions, context.cache_position,
             context.sequence_lengths, c, rope, context.cache_positions,
