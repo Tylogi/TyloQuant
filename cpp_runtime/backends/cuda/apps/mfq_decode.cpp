@@ -21954,7 +21954,7 @@ static int32_t generate_server_tokens(
     return generated;
 }
 
-#include "runtime/qwen_continuous_batching.h"
+#include "../runtime/qwen_continuous_batching.h"
 
 // Real-weight correctness gate; does not require a tokenizer or start a server.
 // It calls the same MTP generator used by the server, with synthetic token IDs.
