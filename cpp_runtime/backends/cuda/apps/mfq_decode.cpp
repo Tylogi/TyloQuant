@@ -1326,6 +1326,12 @@ static bool tensor_parallel_grouped_projections_enabled() {
     return environment == nullptr || std::atoi(environment) != 0;
 }
 
+static bool tensor_parallel_shared_linear_attention_input_enabled() {
+    const char * environment = std::getenv(
+        "MFQ_TP_SHARED_LINEAR_ATTENTION_INPUT");
+    return environment == nullptr || std::atoi(environment) != 0;
+}
+
 struct LayerPlacementConfig {
     std::vector<int> devices;
     std::vector<double> split;
@@ -12501,6 +12507,98 @@ static mfq_tensor_backend::Tensor quant_embedding_lookup(
         embedding.tpq.weight.index_bits);
 }
 
+using QuantLinearProjectionRefs =
+    std::vector<const QuantLinear *>;
+
+static bool tensor_parallel_output_projections_compatible(
+        const QuantLinearProjectionRefs & projections) {
+    if (projections.size() < 2 ||
+            !std::all_of(
+                projections.begin(), projections.end(),
+                [](const QuantLinear * layer) {
+                    return layer != nullptr &&
+                        layer->tensor_parallel() &&
+                        layer->tensor_parallel_axis ==
+                            TensorParallelAxis::Output;
+                })) {
+        return false;
+    }
+    const size_t shard_count =
+        projections.front()->tensor_parallel_shards.size();
+    if (shard_count < 2) return false;
+    for (const auto * layer : projections) {
+        if (layer->tensor_parallel_shards.size() != shard_count) {
+            return false;
+        }
+        for (size_t shard = 0; shard < shard_count; ++shard) {
+            const auto & candidate =
+                layer->tensor_parallel_shards[shard];
+            const auto & reference =
+                projections.front()->tensor_parallel_shards[shard];
+            if (candidate.device != reference.device ||
+                    candidate.input_begin != reference.input_begin ||
+                    candidate.input_end != reference.input_end) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static std::vector<mfq_tensor_backend::Tensor>
+forward_tensor_parallel_output_projections(
+        mfq_tensor_backend::Tensor x,
+        const QuantLinearProjectionRefs & projections) {
+    MFQ_RUNTIME_CHECK(
+        tensor_parallel_output_projections_compatible(projections),
+        "tensor-parallel output projections are incompatible");
+    auto output_shape = x.sizes().vec();
+    auto flat = x.reshape({-1, x.size(-1)});
+    const size_t shard_count =
+        projections.front()->tensor_parallel_shards.size();
+    std::vector<std::vector<mfq_tensor_backend::Tensor>>
+        local_outputs(projections.size());
+    for (auto & outputs : local_outputs) {
+        outputs.reserve(shard_count);
+    }
+    for (size_t shard = 0; shard < shard_count; ++shard) {
+        const int device =
+            projections.front()->tensor_parallel_shards[shard].device;
+        MfqCudaGuard guard(device);
+        // All projections consume the same immutable activation. Transfer it
+        // once per rank, then keep the independent local projection work on
+        // that rank before gathering each output.
+        auto local_x = tensor_to_cuda_device(flat, device);
+        for (size_t projection = 0;
+                projection < projections.size(); ++projection) {
+            local_outputs[projection].push_back(
+                run_quant_linear_shard(
+                    projections[projection]
+                        ->tensor_parallel_shards[shard],
+                    local_x));
+        }
+    }
+
+    const int primary = g_tensor_parallel.primary_device();
+    MfqCudaGuard primary_guard(primary);
+    std::vector<mfq_tensor_backend::Tensor> result;
+    result.reserve(projections.size());
+    for (auto & projection_outputs : local_outputs) {
+        std::vector<mfq_tensor_backend::Tensor> gathered;
+        gathered.reserve(shard_count);
+        for (auto & output : projection_outputs) {
+            gathered.push_back(
+                tensor_to_cuda_device(output, primary));
+        }
+        auto combined = mfq_tensor_backend::cat(
+            gathered, -1).contiguous();
+        auto shape = output_shape;
+        shape.back() = combined.size(-1);
+        result.push_back(combined.reshape(shape));
+    }
+    return result;
+}
+
 struct QuantLinearGroup {
     bool nint_grouped = false;
     bool nvq_prefix2 = false;
@@ -12518,87 +12616,25 @@ struct QuantLinearGroup {
         branch_executor =
             std::make_shared<CudaIndependentBranchExecutor>();
 
-    bool tensor_parallel_output_compatible() const {
-        if (layers.size() < 2 ||
-                !std::all_of(
-                    layers.begin(), layers.end(),
-                    [](const QuantLinear & layer) {
-                        return layer.tensor_parallel() &&
-                            layer.tensor_parallel_axis ==
-                                TensorParallelAxis::Output;
-                    })) {
-            return false;
-        }
-        const size_t shard_count =
-            layers.front().tensor_parallel_shards.size();
-        if (shard_count < 2) return false;
+    QuantLinearProjectionRefs tensor_parallel_output_projections() const {
+        QuantLinearProjectionRefs projections;
+        projections.reserve(layers.size());
         for (const auto & layer : layers) {
-            if (layer.tensor_parallel_shards.size() != shard_count) {
-                return false;
-            }
-            for (size_t shard = 0; shard < shard_count; ++shard) {
-                const auto & candidate =
-                    layer.tensor_parallel_shards[shard];
-                const auto & reference =
-                    layers.front().tensor_parallel_shards[shard];
-                if (candidate.device != reference.device ||
-                        candidate.input_begin != reference.input_begin ||
-                        candidate.input_end != reference.input_end) {
-                    return false;
-                }
-            }
+            projections.push_back(&layer);
         }
-        return true;
+        return projections;
+    }
+
+    bool tensor_parallel_output_compatible() const {
+        return tensor_parallel_output_projections_compatible(
+            tensor_parallel_output_projections());
     }
 
     std::vector<mfq_tensor_backend::Tensor>
     forward_tensor_parallel_output_group(
             mfq_tensor_backend::Tensor x) const {
-        auto output_shape = x.sizes().vec();
-        auto flat = x.reshape({-1, x.size(-1)});
-        const size_t shard_count =
-            layers.front().tensor_parallel_shards.size();
-        std::vector<std::vector<mfq_tensor_backend::Tensor>>
-            local_outputs(layers.size());
-        for (auto & outputs : local_outputs) {
-            outputs.reserve(shard_count);
-        }
-        for (size_t shard = 0; shard < shard_count; ++shard) {
-            const int device =
-                layers.front().tensor_parallel_shards[shard].device;
-            MfqCudaGuard guard(device);
-            // Every projection in the group consumes the same activation.
-            // Transfer it once per rank, then keep all local projection work
-            // on that rank before gathering the independent outputs.
-            auto local_x = tensor_to_cuda_device(flat, device);
-            for (size_t projection = 0;
-                    projection < layers.size(); ++projection) {
-                local_outputs[projection].push_back(
-                    run_quant_linear_shard(
-                        layers[projection]
-                            .tensor_parallel_shards[shard],
-                        local_x));
-            }
-        }
-
-        const int primary = g_tensor_parallel.primary_device();
-        MfqCudaGuard primary_guard(primary);
-        std::vector<mfq_tensor_backend::Tensor> result;
-        result.reserve(layers.size());
-        for (auto & projection_outputs : local_outputs) {
-            std::vector<mfq_tensor_backend::Tensor> gathered;
-            gathered.reserve(shard_count);
-            for (auto & output : projection_outputs) {
-                gathered.push_back(
-                    tensor_to_cuda_device(output, primary));
-            }
-            auto combined = mfq_tensor_backend::cat(
-                gathered, -1).contiguous();
-            auto shape = output_shape;
-            shape.back() = combined.size(-1);
-            result.push_back(combined.reshape(shape));
-        }
-        return result;
+        return forward_tensor_parallel_output_projections(
+            x, tensor_parallel_output_projections());
     }
 
     std::vector<mfq_tensor_backend::Tensor> forward(mfq_tensor_backend::Tensor x) const {
@@ -17670,24 +17706,52 @@ struct LinearBlock : Block {
             alpha_raw = ab[0];
             beta_raw = ab[1];
         } else if (split_in_proj) {
-            if (split_dense_zab) {
-                auto qkv_parts = g_profiler.measure("linear.qkv_proj", [&]() { return qkv_proj.forward(xn); });
-                qk_part = qkv_parts[0];
-                v_part = qkv_parts[1];
-                auto zab = g_profiler.measure("linear.zab_proj", [&]() { return zab_proj.forward(xn); });
-                z = zab[0];
-                alpha_raw = zab[1];
-                beta_raw = zab[2];
-            } else {
-                auto qkv_parts = g_profiler.measure("linear.qkv_proj", [&]() { return qkv_proj.forward(xn); });
-                qk_part = qkv_parts[0];
-                v_part = qkv_parts[1];
-                z = g_profiler.measure("linear.z_proj", [&]() { return z_proj.forward(xn); });
-                auto ab = g_profiler.measure("linear.ab_proj", [&]() {
-                    return ab_is_nint ? ab_nint_proj.forward(xn) : ab_proj.forward(xn);
-                });
-                alpha_raw = ab[0];
-                beta_raw = ab[1];
+            bool shared_tp_projection_input = false;
+            if (!split_dense_zab && ab_is_nint &&
+                    tensor_parallel_grouped_projections_enabled() &&
+                    tensor_parallel_shared_linear_attention_input_enabled() &&
+                    qkv_proj.layers.size() == 2 &&
+                    ab_nint_proj.layers.size() == 2) {
+                QuantLinearProjectionRefs projections = {
+                    &qkv_proj.layers[0], &qkv_proj.layers[1],
+                    &z_proj,
+                    &ab_nint_proj.layers[0], &ab_nint_proj.layers[1],
+                };
+                if (tensor_parallel_output_projections_compatible(
+                        projections)) {
+                    auto parts = g_profiler.measure(
+                        "linear.split_projections", [&]() {
+                            return forward_tensor_parallel_output_projections(
+                                xn, projections);
+                        });
+                    qk_part = parts[0];
+                    v_part = parts[1];
+                    z = parts[2];
+                    alpha_raw = parts[3];
+                    beta_raw = parts[4];
+                    shared_tp_projection_input = true;
+                }
+            }
+            if (!shared_tp_projection_input) {
+                if (split_dense_zab) {
+                    auto qkv_parts = g_profiler.measure("linear.qkv_proj", [&]() { return qkv_proj.forward(xn); });
+                    qk_part = qkv_parts[0];
+                    v_part = qkv_parts[1];
+                    auto zab = g_profiler.measure("linear.zab_proj", [&]() { return zab_proj.forward(xn); });
+                    z = zab[0];
+                    alpha_raw = zab[1];
+                    beta_raw = zab[2];
+                } else {
+                    auto qkv_parts = g_profiler.measure("linear.qkv_proj", [&]() { return qkv_proj.forward(xn); });
+                    qk_part = qkv_parts[0];
+                    v_part = qkv_parts[1];
+                    z = g_profiler.measure("linear.z_proj", [&]() { return z_proj.forward(xn); });
+                    auto ab = g_profiler.measure("linear.ab_proj", [&]() {
+                        return ab_is_nint ? ab_nint_proj.forward(xn) : ab_proj.forward(xn);
+                    });
+                    alpha_raw = ab[0];
+                    beta_raw = ab[1];
+                }
             }
         } else {
             auto parts = g_profiler.measure("linear.in_proj", [&]() { return in_proj.forward(xn); });
