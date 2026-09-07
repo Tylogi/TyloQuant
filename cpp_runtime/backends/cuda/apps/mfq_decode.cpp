@@ -27868,10 +27868,13 @@ int main(int argc, char ** argv) {
                 context_size, minicpmo_tts_steps);
         }
         if (mfq_path.empty() ||
-            (!server_mode && !check_qwen35_mtp && !check_flash_next && !check_flash_next_mtp && bench_qwen35_mtp.empty() && ids_arg.empty() && ids_file.empty() &&
+            (!server_mode && !check_qwen35_mtp &&
+                !check_continuous_batching && !check_flash_next &&
+                !check_flash_next_mtp && bench_qwen35_mtp.empty() &&
+                ids_arg.empty() && ids_file.empty() &&
                 kl_base.empty() && prefill_sweep_arg.empty())) {
             std::cerr << "usage: mfq-decode --mfq model.mfq [--config config.json] "
-                         "(--ids 1,2,3 --gen 128 | --check-qwen35-mtp | --bench-qwen35-mtp ordinary|mtp | --minicpmo-eval-batch "
+                         "(--ids 1,2,3 --gen 128 | --check-qwen35-mtp | --check-continuous-batching | --bench-qwen35-mtp ordinary|mtp | --minicpmo-eval-batch "
                          "[--minicpmo-eval-vision-batch-size 16] | --server "
                          "[--host 127.0.0.1 --port 8080 --ctx-size 32768 --model-name name "
                          "--api-key key] | --kl-base reference.bin "
@@ -27898,6 +27901,21 @@ int main(int argc, char ** argv) {
         if (check_qwen35_mtp) {
             if (context_size == 0) context_size = 512;
             if (context_size < 64) throw std::runtime_error("MTP correctness gate requires --ctx-size >= 64");
+            std::cout << std::unitbuf;
+        }
+        if (check_continuous_batching) {
+            MFQ_RUNTIME_CHECK(
+                !server_mode && !check_qwen35_mtp &&
+                !check_flash_next && !check_flash_next_mtp &&
+                bench_qwen35_mtp.empty() && ids_arg.empty() &&
+                ids_file.empty() && kl_base.empty() &&
+                prefill_sweep_arg.empty(),
+                "continuous batching check cannot combine execution modes");
+            if (context_size == 0) context_size = 512;
+            if (context_size < 32) {
+                throw std::runtime_error(
+                    "continuous batching check requires --ctx-size >= 32");
+            }
             std::cout << std::unitbuf;
         }
         if (!cpu_offload_layers_arg.empty()) {
