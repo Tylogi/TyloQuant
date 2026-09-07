@@ -80,6 +80,16 @@ static bool qwen_continuous_batch_packed_metadata_enabled() {
     return environment == nullptr || std::atoi(environment) != 0;
 }
 
+static bool qwen_continuous_batch_cuda_graph_enabled(const Model & model) {
+    const char * environment = std::getenv(
+        "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH");
+    const char * server_environment = std::getenv("MFQ_SERVER_CUDA_GRAPH");
+    return (environment == nullptr || std::atoi(environment) != 0) &&
+        (server_environment == nullptr || server_environment[0] != '0') &&
+        !model.c.is_flash_next() && mfq_cuda_graph_capture_supported() &&
+        tensor_parallel_cuda_graph_enabled();
+}
+
 static QwenBatchState take_qwen_batch_state(Model & model, int64_t batch) {
     MFQ_RUNTIME_CHECK(model.speculative_start < 0,
         "continuous batching cannot detach speculative state");
@@ -252,6 +262,70 @@ static Tensor qwen_logits_from_last_hidden(Model & model, Tensor hidden) {
     return logits;
 }
 
+static std::vector<const void *> qwen_decode_state_addresses(Model & model) {
+    std::vector<const void *> addresses;
+    addresses.reserve(2 * model.blocks.size());
+    for (auto & block : model.blocks) {
+        if (auto * full = dynamic_cast<FullBlock *>(block.get())) {
+            addresses.push_back(full->cache.k.data_ptr());
+            addresses.push_back(full->cache.v.data_ptr());
+        } else if (auto * linear = dynamic_cast<LinearBlock *>(block.get())) {
+            addresses.push_back(linear->conv_state.data_ptr());
+            addresses.push_back(linear->gdn_state.data_ptr());
+        }
+    }
+    return addresses;
+}
+
+struct QwenContinuousDecodeGraph {
+    decltype(mfq_get_stream_from_pool(false)) stream;
+    std::vector<MfqCudaStream> compute_streams;
+    std::unique_ptr<MfqCudaGraph> graph;
+    Tensor static_next;
+    std::vector<const void *> state_addresses;
+    int64_t batch = 0;
+    int64_t planned_len = 0;
+    bool valid = false;
+
+    QwenContinuousDecodeGraph()
+        : stream(mfq_get_stream_from_pool(false)) {}
+
+    void ensure_compute_streams() {
+        if (compute_streams.empty()) {
+            compute_streams = make_cuda_graph_compute_streams(stream);
+        }
+    }
+
+    std::vector<MfqCudaStream> participant_streams() const {
+        return cuda_graph_participant_streams(compute_streams);
+    }
+
+    bool matches(
+            int64_t candidate_batch, int64_t candidate_len,
+            const std::vector<const void *> & candidate_addresses) const {
+        return valid && batch == candidate_batch &&
+            planned_len == candidate_len &&
+            state_addresses == candidate_addresses;
+    }
+
+    void set_key(
+            int64_t candidate_batch, int64_t candidate_len,
+            std::vector<const void *> candidate_addresses) {
+        batch = candidate_batch;
+        planned_len = candidate_len;
+        state_addresses = std::move(candidate_addresses);
+        valid = true;
+    }
+
+    void invalidate() {
+        if (graph) graph->reset();
+        graph.reset();
+        static_next = Tensor();
+        state_addresses.clear();
+        valid = false;
+    }
+};
+
 class CudaContinuousBatcher {
 public:
     CudaContinuousBatcher(
@@ -412,6 +486,10 @@ public:
                 static_cast<double>(batched_greedy_batches_.load())},
             {"continuous_batching_packed_metadata_batches",
                 static_cast<double>(packed_metadata_batches_.load())},
+            {"continuous_batching_cuda_graph_captures",
+                static_cast<double>(cuda_graph_captures_.load())},
+            {"continuous_batching_cuda_graph_replays",
+                static_cast<double>(cuda_graph_replays_.load())},
             {"continuous_batching_mtp_target_only_requests",
                 static_cast<double>(mtp_bypasses_.load())},
             {"continuous_batching_prefix_cache_bypasses",
@@ -531,6 +609,7 @@ private:
             const std::vector<std::shared_ptr<Request>> & incoming) {
         if (incoming.empty()) return;
         std::lock_guard<std::mutex> model_lock(model_mutex_);
+        invalidate_decode_graph();
         const int primary = g_layer_placement.primary_device();
         MfqCudaGuard primary_guard(primary);
         std::vector<QwenBatchState> states;
@@ -632,6 +711,7 @@ private:
                 survivor_max_position, request->cache_length);
         }
         if (survivors.size() == active_.size()) return;
+        invalidate_decode_graph();
         if (survivors.empty()) {
             model_.reset(1);
         } else {
@@ -663,6 +743,10 @@ private:
                     mfq_tensor_backend::kCUDA, primary)));
     }
 
+    void invalidate_decode_graph() {
+        if (decode_graph_) decode_graph_->invalidate();
+    }
+
     void decode_active() {
         if (active_.empty()) return;
         std::lock_guard<std::mutex> model_lock(model_mutex_);
@@ -671,10 +755,63 @@ private:
         retire_cancelled_requests();
         if (active_.empty()) return;
         const int64_t batch = static_cast<int64_t>(active_.size());
+        const bool batch_greedy = std::all_of(
+            active_.begin(), active_.end(),
+            [](const std::shared_ptr<Request> & request) {
+                const bool greedy =
+                    request->sampling.temperature <= 0.0 ||
+                    request->sampling.top_k == 1;
+                return greedy &&
+                    !sampling_has_penalties(request->sampling) &&
+                    !request->token_constraint;
+            });
+        int64_t requested_len = 0;
+        int64_t minimum_remaining =
+            active_.front()->generation_limit - active_.front()->produced;
+        for (const auto & request : active_) {
+            const int64_t remaining =
+                request->generation_limit - request->produced;
+            minimum_remaining = std::min(minimum_remaining, remaining);
+            requested_len = std::max(
+                requested_len, request->cache_length + remaining);
+        }
+        const int64_t planned_len = server_decode_graph_bucket(
+            requested_len, model_.c.max_position_embeddings);
+        const char * graph_min_environment = std::getenv(
+            "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH_MIN_TOKENS");
+        const int64_t graph_min_tokens = graph_min_environment != nullptr
+            ? std::max<int64_t>(2, std::atoi(graph_min_environment)) : 16;
+        std::vector<const void *> graph_state_addresses;
+        bool graph_cache_hit = false;
+        bool graph_decode = false;
+        if (batch >= 2 && batch_greedy &&
+                qwen_continuous_batch_greedy_enabled() &&
+                qwen_continuous_batch_cuda_graph_enabled(model_)) {
+            graph_state_addresses = qwen_decode_state_addresses(model_);
+            graph_cache_hit = decode_graph_ && decode_graph_->matches(
+                batch, planned_len, graph_state_addresses);
+            graph_decode = graph_cache_hit ||
+                minimum_remaining >= graph_min_tokens;
+            if (graph_decode && !decode_graph_) {
+                decode_graph_ =
+                    std::make_unique<QwenContinuousDecodeGraph>();
+            }
+        }
+        std::unique_ptr<MfqCudaStreamGuard> graph_stream_guard;
+        std::vector<std::unique_ptr<MfqCudaStreamGuard>>
+            graph_compute_stream_guards;
+        if (graph_decode) {
+            decode_graph_->ensure_compute_streams();
+            graph_stream_guard = std::make_unique<MfqCudaStreamGuard>(
+                decode_graph_->stream);
+            graph_compute_stream_guards =
+                activate_cuda_graph_compute_streams(
+                    decode_graph_->compute_streams);
+        }
         std::vector<int64_t> input_tokens;
         std::vector<int64_t> positions;
         std::vector<int64_t> sequence_lengths;
-        const bool packed_metadata =
+        const bool packed_metadata = graph_decode ||
             qwen_continuous_batch_packed_metadata_enabled();
         int64_t * packed_metadata_data = nullptr;
         if (packed_metadata) {
@@ -730,15 +867,67 @@ private:
                 sequence_lengths, options).contiguous();
         }
         Tensor logits;
+        Tensor graph_tokens;
         try {
             model_.cache_pos = max_position;
-            auto hidden = model_.hidden_forward(
-                ids, pos, lengths, nullptr, pos);
+            if (graph_decode) {
+                const auto invoke = [&]() {
+                    auto hidden = model_.hidden_forward(
+                        ids, pos, lengths, nullptr, pos);
+                    auto current_logits = qwen_logits_from_last_hidden(
+                        model_, std::move(hidden));
+                    return sample_greedy_cuda(
+                        current_logits.contiguous().view({batch, -1}));
+                };
+                if (!graph_cache_hit) {
+                    decode_graph_->invalidate();
+                    mfq_cuda_empty_cache();
+                    g_decode_graph_attention_kv_len = planned_len;
+                    g_decode_graph_attention_parts = planned_len >= 192
+                        ? (planned_len + 127) / 128 : 1;
+                    g_decode_graph_attention_parts = std::min<int64_t>(
+                        g_decode_graph_attention_parts,
+                        FullBlock::kDecodeAttentionMaxParts);
+                    try {
+                        DecodeGraphBranchScope branch_scope;
+                        DecodeGraphTpProjectionScope tp_projection_scope;
+                        decode_graph_->graph =
+                            std::make_unique<MfqCudaGraph>();
+                        prepare_decode_graph_memory(
+                            model_, *decode_graph_->graph,
+                            [&]() { (void)invoke(); },
+                            decode_graph_->participant_streams());
+                        decode_graph_->graph->capture_begin();
+                        decode_graph_->static_next = invoke();
+                        decode_graph_->graph->capture_end();
+                        decode_graph_->set_key(
+                            batch, planned_len,
+                            qwen_decode_state_addresses(model_));
+                        ++cuda_graph_captures_;
+                    } catch (...) {
+                        decode_graph_->invalidate();
+                        g_decode_graph_attention_kv_len = 0;
+                        g_decode_graph_attention_parts = 0;
+                        throw;
+                    }
+                    g_decode_graph_attention_kv_len = 0;
+                    g_decode_graph_attention_parts = 0;
+                }
+                decode_graph_->graph->replay();
+                graph_tokens = decode_graph_->static_next;
+                ++cuda_graph_replays_;
+            } else {
+                auto hidden = model_.hidden_forward(
+                    ids, pos, lengths, nullptr, pos);
+                logits = qwen_logits_from_last_hidden(
+                    model_, std::move(hidden));
+            }
             model_.cache_pos = max_sequence_length;
-            logits = qwen_logits_from_last_hidden(
-                model_, std::move(hidden));
         } catch (...) {
             auto error = std::current_exception();
+            invalidate_decode_graph();
+            g_decode_graph_attention_kv_len = 0;
+            g_decode_graph_attention_parts = 0;
             try { model_.reset(1); } catch (...) {}
             fail_requests(active_, error);
             active_.clear();
@@ -749,19 +938,18 @@ private:
         decode_tokens_.fetch_add(batch);
         Tensor batched_greedy_tokens;
         const int64_t * batched_greedy_data = nullptr;
-        const bool batch_greedy =
-            qwen_continuous_batch_greedy_enabled() &&
-            std::all_of(
-                active_.begin(), active_.end(),
-                [](const std::shared_ptr<Request> & request) {
-                    const bool greedy =
-                        request->sampling.temperature <= 0.0 ||
-                        request->sampling.top_k == 1;
-                    return greedy &&
-                        !sampling_has_penalties(request->sampling) &&
-                        !request->token_constraint;
-                });
-        if (batch_greedy) {
+        if (graph_tokens.defined()) {
+            batched_greedy_tokens = graph_tokens
+                .to(mfq_tensor_backend::kCPU).contiguous();
+            MFQ_RUNTIME_CHECK(
+                batched_greedy_tokens.scalar_type() ==
+                    mfq_tensor_backend::kInt64 &&
+                batched_greedy_tokens.numel() == batch,
+                "continuous batching CUDA Graph sampler returned the wrong shape");
+            batched_greedy_data =
+                batched_greedy_tokens.data_ptr<int64_t>();
+            ++batched_greedy_batches_;
+        } else if (qwen_continuous_batch_greedy_enabled() && batch_greedy) {
             batched_greedy_tokens = sample_greedy_cuda(
                     logits.contiguous().view({batch, -1}))
                 .to(mfq_tensor_backend::kCPU).contiguous();
@@ -828,8 +1016,10 @@ private:
             }
         }
         if (survivors.empty()) {
+            invalidate_decode_graph();
             model_.reset(1);
         } else if (survivors.size() != active_.size()) {
+            invalidate_decode_graph();
             compact_qwen_batch_state(
                 model_, survivor_rows, survivor_max_position);
             ++compactions_;
@@ -923,10 +1113,13 @@ private:
     std::atomic<int64_t> compactions_{0};
     std::atomic<int64_t> batched_greedy_batches_{0};
     std::atomic<int64_t> packed_metadata_batches_{0};
+    std::atomic<int64_t> cuda_graph_captures_{0};
+    std::atomic<int64_t> cuda_graph_replays_{0};
     std::atomic<int64_t> mtp_bypasses_{0};
     std::atomic<int64_t> prefix_cache_bypasses_{0};
     Tensor decode_metadata_host_;
     Tensor decode_metadata_cuda_;
+    std::unique_ptr<QwenContinuousDecodeGraph> decode_graph_;
 };
 
 static int run_qwen_continuous_batching_check(Model & model) {
@@ -1096,6 +1289,10 @@ static int run_qwen_continuous_batching_check(Model & model) {
               << metric("continuous_batching_batched_greedy_batches")
               << " packed_metadata_batches="
               << metric("continuous_batching_packed_metadata_batches")
+              << " cuda_graph_captures="
+              << metric("continuous_batching_cuda_graph_captures")
+              << " cuda_graph_replays="
+              << metric("continuous_batching_cuda_graph_replays")
               << " active="
               << metric("continuous_batching_active")
               << " queued="
@@ -1106,6 +1303,9 @@ static int run_qwen_continuous_batching_check(Model & model) {
             metric("continuous_batching_batched_greedy_batches") >= 1.0) &&
         (!qwen_continuous_batch_packed_metadata_enabled() ||
             metric("continuous_batching_packed_metadata_batches") >= 1.0) &&
+        (!qwen_continuous_batch_cuda_graph_enabled(model) ||
+            (metric("continuous_batching_cuda_graph_captures") >= 1.0 &&
+             metric("continuous_batching_cuda_graph_replays") >= 2.0)) &&
         metric("continuous_batching_active") == 0.0 &&
         metric("continuous_batching_queued") == 0.0,
         "continuous batching check did not exercise join and retire");

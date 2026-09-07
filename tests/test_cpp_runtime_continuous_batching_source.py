@@ -54,9 +54,14 @@ def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
     assert "MFQ_CONTINUOUS_BATCH_PACKED_METADATA" in BATCHING
     assert BATCHING.count(
         "environment == nullptr || std::atoi(environment) != 0"
-    ) >= 2
+    ) >= 3
     assert "continuous_batching_packed_metadata_batches" in BATCHING
     assert "ensure_decode_metadata_buffers" in BATCHING
+    assert "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH" in BATCHING
+    assert "QwenContinuousDecodeGraph" in BATCHING
+    assert "continuous_batching_cuda_graph_captures" in BATCHING
+    assert "continuous_batching_cuda_graph_replays" in BATCHING
+    assert "DecodeGraphTpProjectionScope tp_projection_scope" in BATCHING
 
 
 def test_qwen_decode_accepts_independent_batch_positions():

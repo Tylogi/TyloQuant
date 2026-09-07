@@ -84,6 +84,13 @@ def test_tensor_parallel_projection_groups_share_each_rank_input_transfer():
     assert "auto local_x = tensor_to_cuda_device(flat, device);" in SOURCE
 
 
+def test_batched_decode_graph_orders_tp_groups_by_projection():
+    assert "g_decode_graph_tp_projection_major" in SOURCE
+    assert "DecodeGraphTpProjectionScope" in SOURCE
+    assert "std::vector<mfq_tensor_backend::Tensor> local_inputs" in SOURCE
+    assert "local_inputs.push_back(tensor_to_cuda_device(flat, device))" in SOURCE
+
+
 def test_qwen35_mtp_accepts_dense_tensor_parallel_placement():
     assert "const bool supported_placement" in COMPONENTS
     assert "!g_layer_placement.enabled()" in COMPONENTS

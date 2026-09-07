@@ -11289,11 +11289,22 @@ struct NintLinear {
 };
 
 static thread_local bool g_decode_graph_serial_branches = false;
+static thread_local bool g_decode_graph_tp_projection_major = false;
 
 struct DecodeGraphBranchScope {
     bool previous = g_decode_graph_serial_branches;
     DecodeGraphBranchScope() { g_decode_graph_serial_branches = true; }
     ~DecodeGraphBranchScope() { g_decode_graph_serial_branches = previous; }
+};
+
+struct DecodeGraphTpProjectionScope {
+    bool previous = g_decode_graph_tp_projection_major;
+    DecodeGraphTpProjectionScope() {
+        g_decode_graph_tp_projection_major = true;
+    }
+    ~DecodeGraphTpProjectionScope() {
+        g_decode_graph_tp_projection_major = previous;
+    }
 };
 
 static bool decode_branch_parallel_enabled(int64_t rows) {
@@ -12587,6 +12598,43 @@ forward_tensor_parallel_output_projections(
     auto flat = x.reshape({-1, x.size(-1)});
     const size_t shard_count =
         projections.front()->tensor_parallel_shards.size();
+    if (g_decode_graph_tp_projection_major) {
+        std::vector<mfq_tensor_backend::Tensor> local_inputs;
+        local_inputs.reserve(shard_count);
+        for (size_t shard = 0; shard < shard_count; ++shard) {
+            const int device =
+                projections.front()->tensor_parallel_shards[shard].device;
+            MfqCudaGuard guard(device);
+            local_inputs.push_back(tensor_to_cuda_device(flat, device));
+        }
+
+        const int primary = g_tensor_parallel.primary_device();
+        std::vector<mfq_tensor_backend::Tensor> result;
+        result.reserve(projections.size());
+        for (const auto * projection : projections) {
+            std::vector<mfq_tensor_backend::Tensor> local_outputs;
+            local_outputs.reserve(shard_count);
+            for (size_t shard = 0; shard < shard_count; ++shard) {
+                const auto & weight =
+                    projection->tensor_parallel_shards[shard];
+                MfqCudaGuard guard(weight.device);
+                local_outputs.push_back(run_quant_linear_shard(
+                    weight, local_inputs[shard]));
+            }
+            MfqCudaGuard primary_guard(primary);
+            std::vector<mfq_tensor_backend::Tensor> gathered;
+            gathered.reserve(shard_count);
+            for (auto & output : local_outputs) {
+                gathered.push_back(tensor_to_cuda_device(output, primary));
+            }
+            auto combined = mfq_tensor_backend::cat(
+                gathered, -1).contiguous();
+            auto shape = output_shape;
+            shape.back() = combined.size(-1);
+            result.push_back(combined.reshape(shape));
+        }
+        return result;
+    }
     std::vector<std::vector<mfq_tensor_backend::Tensor>>
         local_outputs(projections.size());
     for (auto & outputs : local_outputs) {
