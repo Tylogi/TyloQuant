@@ -1320,6 +1320,12 @@ static bool tensor_parallel_cuda_graph_enabled() {
            (environment == nullptr || environment[0] != '0');
 }
 
+static bool tensor_parallel_grouped_projections_enabled() {
+    const char * environment = std::getenv(
+        "MFQ_TP_GROUPED_PROJECTIONS");
+    return environment == nullptr || std::atoi(environment) != 0;
+}
+
 struct LayerPlacementConfig {
     std::vector<int> devices;
     std::vector<double> split;
@@ -12512,6 +12518,89 @@ struct QuantLinearGroup {
         branch_executor =
             std::make_shared<CudaIndependentBranchExecutor>();
 
+    bool tensor_parallel_output_compatible() const {
+        if (layers.size() < 2 ||
+                !std::all_of(
+                    layers.begin(), layers.end(),
+                    [](const QuantLinear & layer) {
+                        return layer.tensor_parallel() &&
+                            layer.tensor_parallel_axis ==
+                                TensorParallelAxis::Output;
+                    })) {
+            return false;
+        }
+        const size_t shard_count =
+            layers.front().tensor_parallel_shards.size();
+        if (shard_count < 2) return false;
+        for (const auto & layer : layers) {
+            if (layer.tensor_parallel_shards.size() != shard_count) {
+                return false;
+            }
+            for (size_t shard = 0; shard < shard_count; ++shard) {
+                const auto & candidate =
+                    layer.tensor_parallel_shards[shard];
+                const auto & reference =
+                    layers.front().tensor_parallel_shards[shard];
+                if (candidate.device != reference.device ||
+                        candidate.input_begin != reference.input_begin ||
+                        candidate.input_end != reference.input_end) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    std::vector<mfq_tensor_backend::Tensor>
+    forward_tensor_parallel_output_group(
+            mfq_tensor_backend::Tensor x) const {
+        auto output_shape = x.sizes().vec();
+        auto flat = x.reshape({-1, x.size(-1)});
+        const size_t shard_count =
+            layers.front().tensor_parallel_shards.size();
+        std::vector<std::vector<mfq_tensor_backend::Tensor>>
+            local_outputs(layers.size());
+        for (auto & outputs : local_outputs) {
+            outputs.reserve(shard_count);
+        }
+        for (size_t shard = 0; shard < shard_count; ++shard) {
+            const int device =
+                layers.front().tensor_parallel_shards[shard].device;
+            MfqCudaGuard guard(device);
+            // Every projection in the group consumes the same activation.
+            // Transfer it once per rank, then keep all local projection work
+            // on that rank before gathering the independent outputs.
+            auto local_x = tensor_to_cuda_device(flat, device);
+            for (size_t projection = 0;
+                    projection < layers.size(); ++projection) {
+                local_outputs[projection].push_back(
+                    run_quant_linear_shard(
+                        layers[projection]
+                            .tensor_parallel_shards[shard],
+                        local_x));
+            }
+        }
+
+        const int primary = g_tensor_parallel.primary_device();
+        MfqCudaGuard primary_guard(primary);
+        std::vector<mfq_tensor_backend::Tensor> result;
+        result.reserve(layers.size());
+        for (auto & projection_outputs : local_outputs) {
+            std::vector<mfq_tensor_backend::Tensor> gathered;
+            gathered.reserve(shard_count);
+            for (auto & output : projection_outputs) {
+                gathered.push_back(
+                    tensor_to_cuda_device(output, primary));
+            }
+            auto combined = mfq_tensor_backend::cat(
+                gathered, -1).contiguous();
+            auto shape = output_shape;
+            shape.back() = combined.size(-1);
+            result.push_back(combined.reshape(shape));
+        }
+        return result;
+    }
+
     std::vector<mfq_tensor_backend::Tensor> forward(mfq_tensor_backend::Tensor x) const {
         if (!x.is_cuda()) {
             MFQ_RUNTIME_CHECK(
@@ -12523,6 +12612,10 @@ struct QuantLinearGroup {
                 result.push_back(layer.forward(x));
             }
             return result;
+        }
+        if (tensor_parallel_grouped_projections_enabled() &&
+                tensor_parallel_output_compatible()) {
+            return forward_tensor_parallel_output_group(x);
         }
         if (nint_grouped) return nint.forward(x);
         const char * disable_qx_reuse =

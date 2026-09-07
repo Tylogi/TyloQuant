@@ -76,6 +76,14 @@ def test_tensor_parallel_graph_primes_and_captures_nccl_peer_transfers():
     assert "for (int pass = 0; pass < 2; ++pass)" in SOURCE
 
 
+def test_tensor_parallel_projection_groups_share_each_rank_input_transfer():
+    assert 'std::getenv(\n        "MFQ_TP_GROUPED_PROJECTIONS")' in SOURCE
+    assert "environment == nullptr || std::atoi(environment) != 0" in SOURCE
+    assert "tensor_parallel_output_compatible()" in SOURCE
+    assert "forward_tensor_parallel_output_group(x)" in SOURCE
+    assert "auto local_x = tensor_to_cuda_device(flat, device);" in SOURCE
+
+
 def test_qwen35_mtp_accepts_dense_tensor_parallel_placement():
     assert "const bool supported_placement" in COMPONENTS
     assert "!g_layer_placement.enabled()" in COMPONENTS
