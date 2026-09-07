@@ -47,6 +47,10 @@ def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
     assert "publish_token" in BATCHING
     assert "cancel_requested" in BATCHING
     assert "retire_cancelled_requests" in BATCHING
+    assert "MFQ_CONTINUOUS_BATCH_GREEDY" in BATCHING
+    assert "environment == nullptr || std::atoi(environment) != 0" in BATCHING
+    assert "continuous_batching_batched_greedy_batches" in BATCHING
+    assert "sample_greedy_cuda(" in BATCHING
 
 
 def test_qwen_decode_accepts_independent_batch_positions():

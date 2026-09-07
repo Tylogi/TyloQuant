@@ -68,6 +68,12 @@ static std::string qwen_continuous_batching_incompatibility(
     return {};
 }
 
+static bool qwen_continuous_batch_greedy_enabled() {
+    const char * environment = std::getenv(
+        "MFQ_CONTINUOUS_BATCH_GREEDY");
+    return environment == nullptr || std::atoi(environment) != 0;
+}
+
 static QwenBatchState take_qwen_batch_state(Model & model, int64_t batch) {
     MFQ_RUNTIME_CHECK(model.speculative_start < 0,
         "continuous batching cannot detach speculative state");
@@ -396,6 +402,8 @@ public:
                 static_cast<double>(admissions_.load())},
             {"continuous_batching_compactions",
                 static_cast<double>(compactions_.load())},
+            {"continuous_batching_batched_greedy_batches",
+                static_cast<double>(batched_greedy_batches_.load())},
             {"continuous_batching_mtp_target_only_requests",
                 static_cast<double>(mtp_bypasses_.load())},
             {"continuous_batching_prefix_cache_bypasses",
@@ -684,6 +692,33 @@ private:
         }
         ++decode_batches_;
         decode_tokens_.fetch_add(batch);
+        Tensor batched_greedy_tokens;
+        const int64_t * batched_greedy_data = nullptr;
+        const bool batch_greedy =
+            qwen_continuous_batch_greedy_enabled() &&
+            std::all_of(
+                active_.begin(), active_.end(),
+                [](const std::shared_ptr<Request> & request) {
+                    const bool greedy =
+                        request->sampling.temperature <= 0.0 ||
+                        request->sampling.top_k == 1;
+                    return greedy &&
+                        !sampling_has_penalties(request->sampling) &&
+                        !request->token_constraint;
+                });
+        if (batch_greedy) {
+            batched_greedy_tokens = sample_greedy_cuda(
+                    logits.contiguous().view({batch, -1}))
+                .to(mfq_tensor_backend::kCPU).contiguous();
+            MFQ_RUNTIME_CHECK(
+                batched_greedy_tokens.scalar_type() ==
+                    mfq_tensor_backend::kInt64 &&
+                batched_greedy_tokens.numel() == batch,
+                "continuous batching greedy sampler returned the wrong shape");
+            batched_greedy_data =
+                batched_greedy_tokens.data_ptr<int64_t>();
+            ++batched_greedy_batches_;
+        }
         std::vector<std::shared_ptr<Request>> survivors;
         std::vector<std::pair<std::shared_ptr<Request>,
             std::exception_ptr>> completions;
@@ -700,12 +735,18 @@ private:
                 continue;
             }
             try {
-                auto next = sample_server_logits(
-                    logits.narrow(0, static_cast<int64_t>(row), 1),
-                    request->sampling, request->counts,
-                    request->random_host, request->random_cuda,
-                    request->rng, request->token_constraint);
-                const int64_t token = next.item<int64_t>();
+                Tensor next;
+                int64_t token = 0;
+                if (batched_greedy_data != nullptr) {
+                    token = batched_greedy_data[row];
+                } else {
+                    next = sample_server_logits(
+                        logits.narrow(0, static_cast<int64_t>(row), 1),
+                        request->sampling, request->counts,
+                        request->random_host, request->random_cuda,
+                        request->rng, request->token_constraint);
+                    token = next.item<int64_t>();
+                }
                 request->pending_token = token;
                 ++request->produced;
                 publish_token(request, token);
@@ -717,6 +758,8 @@ private:
                     continue;
                 }
                 if (request->counts.defined()) {
+                    MFQ_RUNTIME_CHECK(next.defined(),
+                        "batched greedy sampling cannot update token penalties");
                     sample_token_counts_add_cuda(
                         request->counts, next.contiguous());
                 }
@@ -823,6 +866,7 @@ private:
     std::atomic<int64_t> max_batch_seen_{0};
     std::atomic<int64_t> admissions_{0};
     std::atomic<int64_t> compactions_{0};
+    std::atomic<int64_t> batched_greedy_batches_{0};
     std::atomic<int64_t> mtp_bypasses_{0};
     std::atomic<int64_t> prefix_cache_bypasses_{0};
 };
@@ -990,12 +1034,16 @@ static int run_qwen_continuous_batching_check(Model & model) {
               << metric("continuous_batching_max_batch")
               << " compactions="
               << metric("continuous_batching_compactions")
+              << " batched_greedy_batches="
+              << metric("continuous_batching_batched_greedy_batches")
               << " active="
               << metric("continuous_batching_active")
               << " queued="
               << metric("continuous_batching_queued") << '\n';
     MFQ_RUNTIME_CHECK(metric("continuous_batching_max_batch") >= 2.0 &&
         metric("continuous_batching_compactions") >= 1.0 &&
+        (!qwen_continuous_batch_greedy_enabled() ||
+            metric("continuous_batching_batched_greedy_batches") >= 1.0) &&
         metric("continuous_batching_active") == 0.0 &&
         metric("continuous_batching_queued") == 0.0,
         "continuous batching check did not exercise join and retire");
