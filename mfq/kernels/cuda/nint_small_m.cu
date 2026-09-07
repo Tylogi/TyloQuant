@@ -35,10 +35,12 @@ __global__ void __launch_bounds__(128) nint_group4_small_m_kernel(
                 >> ((chunk & 1) * 4);
             qv = int((v & 7u) | ((v & 56u) << 5) | ((v & 448u) << 10) | ((v & 3584u) << 15));
         } else {
-            // Four 5-bit values fit three bytes, including GS28's final chunk.
-            const int byte = chunk * 5 / 2;
-            const unsigned v = (unsigned(packed[byte]) | (unsigned(packed[byte + 1]) << 8)
-                | (unsigned(packed[byte + 2]) << 16)) >> ((chunk & 1) * 4);
+            // A GS28 group is exactly nine aligned uint16 words. Each four-code
+            // window spans at most two words, including the final chunk.
+            const auto* words = reinterpret_cast<const uint16_t*>(packed);
+            const int word = chunk * 5 / 4;
+            const unsigned v = (unsigned(words[word]) | (unsigned(words[word + 1]) << 16))
+                >> ((chunk * 4) & 15);
             qv = int((v & 31u) | ((v & 992u) << 3) | ((v & 31744u) << 6)
                 | ((v & 1015808u) << 9));
         }
