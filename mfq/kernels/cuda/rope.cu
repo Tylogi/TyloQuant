@@ -1,6 +1,6 @@
 // Rotary Position Embedding, rotate-half (HF/GPT-J style, Qwen convention).
-// Supports full RoPE, partial RoPE, and MRoPE position sections.
-// x [..., T, D], pos [T] or [A,T]. rotary_dim <= D.
+// Supports full RoPE, partial RoPE, per-batch positions, and MRoPE sections.
+// x [..., T, D], pos [T], [B,T], or [A,T]. rotary_dim <= D.
 // freq_j = base^(-2j/rotary_dim). One block per (m, t) row, threads cover j in [0, rotary_dim/2):
 //   out[t,j]      = x0*cos - x1*sin
 //   out[t,j+half] = x1*cos + x0*sin
@@ -40,7 +40,8 @@ __device__ int rope_axis_for_pair(int j, int s0, int s1, int s2)
 
 __global__ void rope_kernel(const float* __restrict__ x, const float* __restrict__ pos,
                             float* __restrict__ out, int MT, int T, int D, int rotary_dim,
-                            int pos_axes, int s0, int s1, int s2, float base)
+                            int pos_axes, int pos_batches,
+                            int s0, int s1, int s2, float base)
 {
     int mt = blockIdx.x;
     if (mt >= MT) {
@@ -58,11 +59,19 @@ __global__ void rope_kernel(const float* __restrict__ x, const float* __restrict
     __syncthreads();
 
     for (int j = tid; j < half; j += ROPE_BD) {
-        int axis = rope_axis_for_pair(j, s0, s1, s2);
-        if (axis >= pos_axes) {
-            axis = 0;
+        float p;
+        if (pos_batches > 0) {
+            const int leading_rows = MT / T;
+            const int rows_per_batch = leading_rows / pos_batches;
+            const int batch = m / rows_per_batch;
+            p = pos[(size_t)batch * T + t];
+        } else {
+            int axis = rope_axis_for_pair(j, s0, s1, s2);
+            if (axis >= pos_axes) {
+                axis = 0;
+            }
+            p = pos_axes == 1 ? pos[t] : pos[(size_t)axis * T + t];
         }
-        float p = pos_axes == 1 ? pos[t] : pos[(size_t)axis * T + t];
         float freq = powf(base, -2.0f * (float)j / (float)rotary_dim);
         float ang = p * freq;
         float cs = cosf(ang);
@@ -77,7 +86,8 @@ __global__ void rope_kernel(const float* __restrict__ x, const float* __restrict
 __global__ void rope_table_kernel(const float* __restrict__ x, const int64_t* __restrict__ pos,
                                   const float* __restrict__ cos, const float* __restrict__ sin,
                                   float* __restrict__ out, int MT, int T, int D, int rotary_dim,
-                                  int table_len, int pos_axes, int s0, int s1, int s2)
+                                  int table_len, int pos_axes, int pos_batches,
+                                  int s0, int s1, int s2)
 {
     int mt = blockIdx.x;
     if (mt >= MT) {
@@ -95,11 +105,19 @@ __global__ void rope_table_kernel(const float* __restrict__ x, const int64_t* __
     __syncthreads();
 
     for (int j = tid; j < half; j += ROPE_BD) {
-        int axis = rope_axis_for_pair(j, s0, s1, s2);
-        if (axis >= pos_axes) {
-            axis = 0;
+        int64_t p;
+        if (pos_batches > 0) {
+            const int leading_rows = MT / T;
+            const int rows_per_batch = leading_rows / pos_batches;
+            const int batch = m / rows_per_batch;
+            p = pos[(size_t)batch * T + t];
+        } else {
+            int axis = rope_axis_for_pair(j, s0, s1, s2);
+            if (axis >= pos_axes) {
+                axis = 0;
+            }
+            p = pos_axes == 1 ? pos[t] : pos[(size_t)axis * T + t];
         }
-        int64_t p = pos_axes == 1 ? pos[t] : pos[(size_t)axis * T + t];
         if (p < 0) {
             p = 0;
         }
@@ -262,10 +280,14 @@ mfq_tensor_backend::Tensor rope_ext_cuda(mfq_tensor_backend::Tensor x, mfq_tenso
         MFQ_RUNTIME_CHECK(s0 + s1 + s2 == RD / 2, "rope: sections must sum to rotary_dim/2");
     }
     int MT = (int)(x.numel() / ((size_t)T * D));
+    const int pos_batches = sections.numel() == 0 && pos.dim() == 2
+        ? (int)pos.size(0) : 0;
+    MFQ_RUNTIME_CHECK(pos_batches == 0 || MT % pos_batches == 0,
+                "rope: batch positions do not match x leading dimensions");
     auto out = mfq_tensor_backend::empty_like(x);
     rope_kernel<<<MT * T, ROPE_BD, 0, mfq_current_cuda_stream()>>>(
         x.data_ptr<float>(), pos.data_ptr<float>(), out.data_ptr<float>(),
-        MT * T, T, D, RD, pos_axes, s0, s1, s2, (float)base);
+        MT * T, T, D, RD, pos_axes, pos_batches, s0, s1, s2, (float)base);
     return out;
 }
 
@@ -304,10 +326,15 @@ mfq_tensor_backend::Tensor rope_table_cuda(mfq_tensor_backend::Tensor x, mfq_ten
         MFQ_RUNTIME_CHECK(s0 + s1 + s2 == half, "rope_table: sections must sum to rotary_dim/2");
     }
     int MT = (int)(x.numel() / ((size_t)T * D));
+    const int pos_batches = sections.numel() == 0 && pos.dim() == 2
+        ? (int)pos.size(0) : 0;
+    MFQ_RUNTIME_CHECK(pos_batches == 0 || MT % pos_batches == 0,
+                "rope_table: batch positions do not match x leading dimensions");
     auto out = mfq_tensor_backend::empty_like(x);
     rope_table_kernel<<<MT * T, ROPE_BD, 0, mfq_current_cuda_stream()>>>(
         x.data_ptr<float>(), pos.data_ptr<int64_t>(), cos.data_ptr<float>(), sin.data_ptr<float>(),
-        out.data_ptr<float>(), MT * T, T, D, RD, table_len, pos_axes, s0, s1, s2);
+        out.data_ptr<float>(), MT * T, T, D, RD, table_len, pos_axes, pos_batches,
+        s0, s1, s2);
     return out;
 }
 

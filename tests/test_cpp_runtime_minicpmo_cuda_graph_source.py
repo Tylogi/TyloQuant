@@ -48,7 +48,10 @@ def test_minicpmo_native_server_keeps_cuda_graph_enabled() -> None:
 def test_static_decode_uses_dynamic_position_for_kv_writes() -> None:
     assert SOURCE.count("hidden_forward(ids, pos, seq_len, nullptr, pos)") == 2
     assert "cache_positions_override.value(), primary" in SOURCE
-    assert '"cache_positions must have shape [tokens]"' in SOURCE
+    assert (
+        '"cache_positions must have shape [tokens] or [batch,tokens]"'
+        in SOURCE
+    )
 
 
 def test_minicpmo_persistent_decode_workspaces_are_warmed_before_capture() -> None:

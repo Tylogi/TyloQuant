@@ -29,9 +29,11 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -49,6 +51,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -13983,6 +13986,15 @@ struct RopeCache {
             if (positions.dim() == 1) {
                 selected_cos = cos.index_select(0, positions);
                 selected_sin = sin.index_select(0, positions);
+            } else if (sections.numel() == 0 && positions.dim() == 2) {
+                const int64_t batches = positions.size(0);
+                const int64_t tokens = positions.size(1);
+                selected_cos = cos.index_select(0, positions.reshape({-1}))
+                    .reshape({batches, tokens, rotary_dim / 2})
+                    .unsqueeze(1);
+                selected_sin = sin.index_select(0, positions.reshape({-1}))
+                    .reshape({batches, tokens, rotary_dim / 2})
+                    .unsqueeze(1);
             } else if (sections.numel() == 3) {
                 const int64_t * section = sections.data_ptr<int64_t>();
                 std::vector<mfq_tensor_backend::Tensor> cos_parts;
@@ -14914,8 +14926,17 @@ struct KVCache {
     std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> append(
             mfq_tensor_backend::Tensor kk, mfq_tensor_backend::Tensor vv, mfq_tensor_backend::Tensor pos,
             int64_t start_pos, int64_t end_pos) {
+        (void)start_pos;
         auto kh = kk.to(k.scalar_type()).contiguous();
         auto vh = vv.to(v.scalar_type()).contiguous();
+        MFQ_RUNTIME_CHECK(
+            kh.dim() == 4 && vh.sizes() == kh.sizes() &&
+            kh.size(0) == k.size(0) && kh.size(1) == k.size(1) &&
+            kh.size(3) == k.size(3) &&
+            ((pos.dim() == 1 && pos.numel() == kh.size(2)) ||
+             (pos.dim() == 2 && pos.size(0) == kh.size(0) &&
+              pos.size(1) == kh.size(2))),
+            "KV cache write requires positions [T] or [B,T]");
         const char * aten_write_env = std::getenv("MFQ_KV_CACHE_WRITE_ATEN");
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
         const bool aten_write =
@@ -14924,16 +14945,29 @@ struct KVCache {
         const bool aten_write = k.scalar_type() != mfq_tensor_backend::kFloat16 ||
             (aten_write_env != nullptr && aten_write_env[0] == '1');
 #endif
-        if (!k.is_cuda() || aten_write) {
-            auto slots = ring ? mfq_tensor_backend::remainder(pos, k.size(2)) : pos;
-            slots = slots.to(mfq_tensor_backend::kInt64).contiguous();
-            k.index_copy_(2, slots, kh);
-            v.index_copy_(2, slots, vh);
-        } else {
-            auto out = ring
-                ? kv_cache_write_ring_positions_cuda(k, v, kh, vh, pos)
-                : kv_cache_write_cuda(k, v, kh, vh, pos);
-            (void)out;
+        const int64_t batches = pos.dim() == 1 ? 1 : pos.size(0);
+        for (int64_t batch = 0; batch < batches; ++batch) {
+            auto cache_k = pos.dim() == 1 ? k : k.narrow(0, batch, 1);
+            auto cache_v = pos.dim() == 1 ? v : v.narrow(0, batch, 1);
+            auto source_k = pos.dim() == 1 ? kh : kh.narrow(0, batch, 1);
+            auto source_v = pos.dim() == 1 ? vh : vh.narrow(0, batch, 1);
+            auto write_pos = pos.dim() == 1
+                ? pos : pos.narrow(0, batch, 1).reshape({-1});
+            if (!k.is_cuda() || aten_write) {
+                auto slots = ring
+                    ? mfq_tensor_backend::remainder(write_pos, k.size(2))
+                    : write_pos;
+                slots = slots.to(mfq_tensor_backend::kInt64).contiguous();
+                cache_k.index_copy_(2, slots, source_k);
+                cache_v.index_copy_(2, slots, source_v);
+            } else {
+                auto out = ring
+                    ? kv_cache_write_ring_positions_cuda(
+                        cache_k, cache_v, source_k, source_v, write_pos)
+                    : kv_cache_write_cuda(
+                        cache_k, cache_v, source_k, source_v, write_pos);
+                (void)out;
+            }
         }
         if (ring) return {k, v};
         return {k.index({Slice(), Slice(), Slice(0, end_pos), Slice()}),
@@ -15958,12 +15992,21 @@ struct FullBlock : Block {
             cache = KVCache(
                 B, nkh, cache_capacity, hd, sliding, x.device(),
                 official_bf16 ? mfq_tensor_backend::kBFloat16 : mfq_tensor_backend::kFloat16);
-            if (x.is_cuda()) {
-                const int64_t total = B * nh;
-                auto opts = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32);
-                decode_partial_o = mfq_tensor_backend::empty({total, kDecodeAttentionMaxParts, hd}, opts);
-                decode_partial_m = mfq_tensor_backend::empty({total, kDecodeAttentionMaxParts}, opts);
-                decode_partial_l = mfq_tensor_backend::empty({total, kDecodeAttentionMaxParts}, opts);
+        }
+        if (x.is_cuda()) {
+            const int64_t total = B * nh;
+            if (!decode_partial_o.defined() ||
+                    decode_partial_o.size(0) < total ||
+                    decode_partial_o.size(1) != kDecodeAttentionMaxParts ||
+                    decode_partial_o.size(2) != hd) {
+                auto opts = mfq_tensor_backend::TensorOptions()
+                    .device(x.device()).dtype(mfq_tensor_backend::kFloat32);
+                decode_partial_o = mfq_tensor_backend::empty(
+                    {total, kDecodeAttentionMaxParts, hd}, opts);
+                decode_partial_m = mfq_tensor_backend::empty(
+                    {total, kDecodeAttentionMaxParts}, opts);
+                decode_partial_l = mfq_tensor_backend::empty(
+                    {total, kDecodeAttentionMaxParts}, opts);
             }
         }
         auto residual = x;
@@ -16009,13 +16052,16 @@ struct FullBlock : Block {
         auto write_positions = cache_positions.has_value()
             ? cache_positions.value().to(x.device(), mfq_tensor_backend::kInt64).contiguous()
             : pos.to(x.device(), mfq_tensor_backend::kInt64).contiguous();
-        if (write_positions.dim() != 1 || write_positions.numel() != T) {
+        if (!((write_positions.dim() == 1 && write_positions.numel() == T) ||
+              (write_positions.dim() == 2 && write_positions.size(0) == B &&
+               write_positions.size(1) == T))) {
             throw std::runtime_error(
-                "KV cache positions must have shape [tokens]");
+                "KV cache positions must have shape [tokens] or [batch,tokens]");
         }
         const char * fused_qk_rope_kv_env =
             std::getenv("MFQ_MINICPM_FUSED_QK_NORM_ROPE_KV");
         const bool fused_qk_rope_kv = official_bf16 && x.is_cuda() &&
+            write_positions.dim() == 1 && pos.dim() == 1 &&
             T == 1 && !cache.ring && !v_norm.defined() &&
             q_norm.defined() && k_norm.defined() &&
             active_rope.rotary_dim == 128 &&
@@ -16092,6 +16138,7 @@ struct FullBlock : Block {
         const char * fused_rope_kv_env =
             std::getenv("MFQ_MINICPM_FUSED_ROPE_KV");
         const bool fused_rope_kv = official_bf16 && x.is_cuda() &&
+            write_positions.dim() == 1 && pos.dim() == 1 &&
             T == 1 && !cache.ring && active_rope.rotary_dim == 128 &&
             active_rope.sections.numel() == 0 && nh == 32 && nkh == 8 &&
             hd == 128 && cache.k.scalar_type() == mfq_tensor_backend::kBFloat16 &&
@@ -16138,8 +16185,11 @@ struct FullBlock : Block {
                 .device(x.device()).dtype(mfq_tensor_backend::kInt64);
             auto key_positions = mfq_tensor_backend::arange(visible_len, options);
             auto query_positions = write_positions
-                .to(x.device(), mfq_tensor_backend::kInt64)
-                .reshape({1, T}).expand({B, T});
+                .to(x.device(), mfq_tensor_backend::kInt64);
+            if (query_positions.dim() == 1) {
+                query_positions = query_positions
+                    .reshape({1, T}).expand({B, T});
+            }
             auto allowed = key_positions.reshape({1, 1, visible_len}) <=
                 query_positions.unsqueeze(-1);
             if (seq_len.has_value()) {
@@ -19275,9 +19325,11 @@ struct Model {
                 cache_pos, cache_pos + T,
                 mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA)
                     .dtype(mfq_tensor_backend::kInt64));
-        if (cache_positions.dim() != 1 || cache_positions.numel() != T) {
+        if (!((cache_positions.dim() == 1 && cache_positions.numel() == T) ||
+              (cache_positions.dim() == 2 && cache_positions.size(0) == B &&
+               cache_positions.size(1) == T))) {
             throw std::runtime_error(
-                "cache_positions must have shape [tokens]");
+                "cache_positions must have shape [tokens] or [batch,tokens]");
         }
         auto pos = pos_override.has_value()
             ? tensor_to_cuda_device(
@@ -19353,7 +19405,7 @@ struct Model {
                 ? cpu_pos
                 : tensor_to_cuda_device(pos, b->cuda_device);
             MfqOptional<mfq_tensor_backend::Tensor> local_cache_positions = mfq_nullopt;
-            if (c.is_minicpmo45()) {
+            if (c.is_minicpmo45() || cache_positions_override.has_value()) {
                 local_cache_positions = b->cpu_offloaded
                     ? cpu_cache_positions
                     : tensor_to_cuda_device(
@@ -21901,6 +21953,8 @@ static int32_t generate_server_tokens(
     }
     return generated;
 }
+
+#include "runtime/qwen_continuous_batching.h"
 
 // Real-weight correctness gate; does not require a tokenizer or start a server.
 // It calls the same MTP generator used by the server, with synthetic token IDs.
@@ -27116,6 +27170,7 @@ int main(int argc, char ** argv) {
         int bench_qwen35_mtp_reps = 3;
         int cpu_threads = 0;
         int server_port = 8080;
+        int continuous_batching = 0;
         int64_t context_size = 0;
         int64_t minicpmo_tts_steps = 0;
         int64_t minicpmo_duplex_steps = 0;
@@ -27176,6 +27231,7 @@ int main(int argc, char ** argv) {
         bool check_dsv4_hc = false;
         bool check_text_session_state = false;
         bool check_qwen35_mtp = false;
+        bool check_continuous_batching = false;
         bool check_flash_next = false;
         bool check_flash_next_mtp = false;
         bool compare_dsv4_hc_ops = false;
@@ -27372,6 +27428,12 @@ int main(int argc, char ** argv) {
             else if (a == "--server") server_mode = true;
             else if (a == "--host" && i + 1 < argc) server_host = argv[++i];
             else if (a == "--port" && i + 1 < argc) server_port = std::stoi(argv[++i]);
+            else if (a == "--continuous-batching" && i + 1 < argc) {
+                continuous_batching = std::stoi(argv[++i]);
+            }
+            else if (a == "--check-continuous-batching") {
+                check_continuous_batching = true;
+            }
             else if (a == "--ctx-size" && i + 1 < argc) context_size = std::stoll(argv[++i]);
             else if (a == "--cpu-offload-layers" && i + 1 < argc) {
                 cpu_offload_layers_arg = argv[++i];
@@ -27430,8 +27492,9 @@ int main(int argc, char ** argv) {
             else if (a == "--compare-nvq-vec4" || a == "--compare-niq-vec4") compare_nvq_vec4 = true;
             else {
                 std::cerr << "usage: mfq-decode --mfq model.mfq [--config config.json] "
-                             "(--ids 1,2,3 --gen 128 | --check-qwen35-mtp | --bench-qwen35-mtp ordinary|mtp | --server "
+                             "(--ids 1,2,3 --gen 128 | --check-qwen35-mtp | --check-continuous-batching | --bench-qwen35-mtp ordinary|mtp | --server "
                              "[--host 127.0.0.1 --port 8080 --ctx-size 32768 --model-name name "
+                             "--continuous-batching 8 "
                              "--tensor-parallel 0,1 --tensor-split 1,1 "
                              "--layer-parallel 0,1 --layer-split 1,1 "
                              "--n-gpu-layers 60 --threads 32 --cpu-offload-layers 0-7,12 --moe-gpu-cache-gb 8 "
@@ -27450,6 +27513,14 @@ int main(int argc, char ** argv) {
             parse_nint6_mmq_mode(nint6_mmq_arg);
         if (cpu_threads_set && cpu_threads <= 0) {
             throw std::runtime_error("--threads must be positive");
+        }
+        if (continuous_batching < 0) {
+            throw std::runtime_error(
+                "--continuous-batching cannot be negative");
+        }
+        if (continuous_batching > 0 && !server_mode) {
+            throw std::runtime_error(
+                "--continuous-batching requires --server");
         }
         if (cpu_threads > 0) {
             mfq_set_num_threads(cpu_threads);
@@ -28027,6 +28098,10 @@ int main(int argc, char ** argv) {
         mfq_cuda_synchronize();
         auto t1 = std::chrono::steady_clock::now();
         report_cuda_memory("loaded");
+        if (check_continuous_batching) {
+            return mfq::cuda::continuous::
+                run_qwen_continuous_batching_check(model);
+        }
         if (check_flash_next) return run_flash_next_check(model);
         if (check_flash_next_mtp) {
             auto * predictor = dynamic_cast<CudaFlashNextMtp *>(
@@ -28081,7 +28156,8 @@ int main(int argc, char ** argv) {
                 server_components.graph.has_component("audio_output");
             model_capabilities.full_duplex = composite_loaded &&
                 server_components.graph.has_component("duplex");
-            model_capabilities.mtp = component_state.mtp_available;
+            model_capabilities.mtp = component_state.mtp_available &&
+                continuous_batching == 0;
             server_config.model_capabilities = std::move(model_capabilities);
             MfqFile runtime_assets(mfq_path);
             if (!runtime_assets.has_record(MFQ_TOKENIZER_GGUF_ASSET)) {
@@ -28114,6 +28190,20 @@ int main(int argc, char ** argv) {
             ServerTextSessionCache text_session_cache(
                 make_cuda_paged_prefix_cache(
                     runtime_assets, server_model));
+            std::unique_ptr<
+                mfq::cuda::continuous::CudaContinuousBatcher>
+                continuous_batcher;
+            if (continuous_batching > 0) {
+                continuous_batcher = std::make_unique<
+                    mfq::cuda::continuous::CudaContinuousBatcher>(
+                        server_model, model_mutex,
+                        continuous_batching);
+                std::cerr
+                    << "continuous_batching enabled=1 max_sequences="
+                    << continuous_batching
+                    << " decode=target_only mtp=disabled"
+                    << " prefix_cache=fresh_prefill\n";
+            }
             std::optional<MiniCPMO45DuplexSession> minicpmo_duplex_session;
             MfqDuplexBackend duplex_backend;
             if (server_components.minicpmo) {
@@ -28149,6 +28239,11 @@ int main(int argc, char ** argv) {
                                    const MfqPrefillCallback & on_prefill,
                                    const MfqPromptCachePlan & cache_plan,
                                    const MfqTokenConstraintPtr & token_constraint) {
+                if (continuous_batcher) {
+                    return continuous_batcher->submit(
+                        prompt, sampling, on_token, on_prefill,
+                        cache_plan, token_constraint);
+                }
                 return generate_server_tokens(
                     server_model, model_mutex, decode_graph_cache,
                     text_session_cache, prompt, sampling,
@@ -28172,14 +28267,15 @@ int main(int argc, char ** argv) {
                     std::lock_guard<std::mutex> lock(model_mutex);
                     return text_session_cache.clear();
                 },
-            }, multimodal_generate, [&server_components] {
+            }, multimodal_generate,
+            [&server_components, &continuous_batcher] {
                 size_t free_bytes = 0;
                 size_t total_bytes = 0;
                 MFQ_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
                 const auto stats = mfq_cuda_memory_stats(
                     mfq_current_cuda_device());
                 const auto components = server_components.state();
-                return std::vector<std::pair<std::string, double>>{
+                std::vector<std::pair<std::string, double>> result{
                     {"device_free_bytes", static_cast<double>(free_bytes)},
                     {"device_total_bytes", static_cast<double>(total_bytes)},
                     {"cuda_allocated_bytes", static_cast<double>(
@@ -28193,6 +28289,12 @@ int main(int argc, char ** argv) {
                     {"mtp_supported", components.mtp_supported ? 1.0 : 0.0},
                     {"mtp_available", components.mtp_available ? 1.0 : 0.0},
                 };
+                if (continuous_batcher) {
+                    auto batching = continuous_batcher->metrics();
+                    result.insert(
+                        result.end(), batching.begin(), batching.end());
+                }
+                return result;
             });
             if (g_moe_expert_cache) {
                 g_moe_expert_cache->print_stats(std::cout);
