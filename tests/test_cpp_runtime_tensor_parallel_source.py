@@ -7,6 +7,14 @@ SOURCE = (ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp"
 CMAKE = (ROOT / "cpp_runtime" / "tests" / "CMakeLists.txt").read_text(
     encoding="utf-8"
 )
+COMPONENTS = (
+    ROOT
+    / "cpp_runtime"
+    / "backends"
+    / "cuda"
+    / "runtime"
+    / "server_components.h"
+).read_text(encoding="utf-8")
 
 
 def test_tensor_parallel_cli_and_weighted_split_are_wired():
@@ -50,6 +58,13 @@ def test_tensor_parallel_disables_single_device_cuda_graphs():
     assert SOURCE.count("!g_tensor_parallel.enabled()") >= 2
     assert "const bool graph_enabled" in SOURCE
     assert "bool use_cuda_graph" in SOURCE
+
+
+def test_qwen35_mtp_accepts_dense_tensor_parallel_placement():
+    assert "const bool supported_placement" in COMPONENTS
+    assert "!g_layer_placement.enabled()" in COMPONENTS
+    assert "!g_tensor_parallel.enabled()" not in COMPONENTS
+    assert "dense GPU-resident Qwen blocks" in COMPONENTS
 
 
 def test_deepseek_v4_split_gate_up_uses_existing_moe_runtime_and_cache():

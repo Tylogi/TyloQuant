@@ -41,9 +41,9 @@ static CudaRuntimeComponents load_cuda_runtime_components(
             break;
     }
     if (result.plan.predictor == mfq::cuda::MfqCudaPredictorAdapter::qwen35) {
-        const bool single_device = !g_tensor_parallel.enabled() && !g_layer_placement.enabled() &&
+        const bool supported_placement = !g_layer_placement.enabled() &&
             g_dense_cpu_layer_count == 0 && g_dsv4_cpu_offload_layers.empty() && !g_moe_expert_cache;
-        if (single_device && model.c.num_experts == 0 && model.supports_qwen_speculation()) {
+        if (supported_placement && model.c.num_experts == 0 && model.supports_qwen_speculation()) {
             MfqFile predictor_file(mfq_path);
             (void)load_config(predictor_file, config_path);
             auto predictor = CudaQwen35Mtp::load_if_present(predictor_file, model.c);
@@ -52,7 +52,7 @@ static CudaRuntimeComponents load_cuda_runtime_components(
             }
             result.mtp_available = static_cast<bool>(result.mtp);
         } else {
-            std::cerr << "qwen_mtp unavailable: initial CUDA adapter requires dense single-GPU Qwen blocks\n";
+            std::cerr << "qwen_mtp unavailable: CUDA adapter requires dense GPU-resident Qwen blocks\n";
         }
     }
     if (result.plan.predictor == mfq::cuda::MfqCudaPredictorAdapter::flash_next) {
