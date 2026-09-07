@@ -338,25 +338,65 @@ void launch_nint6_gs24_small_m_reuse(
 #undef MFQ_NINT6_CASE
 }
 
-template <int GS>
+template <int GS, int MROWS>
 __global__ void small_m_quantize_f32_half_rn_kernel(
     const float* __restrict__ input, int8_t* __restrict__ qx,
     float* __restrict__ scales, int32_t* __restrict__ sums, int k, int kpad)
 {
-    const int m = blockIdx.x, g = blockIdx.y, lane = threadIdx.x;
-    constexpr int WARPS = (GS + 31) / 32;
-    const bool valid = lane < GS && g * GS + lane < k;
-    const float x = valid ? __half2float(__float2half_rn(input[(size_t)m * k + g * GS + lane])) : 0.f;
-    const float amax = block_max<WARPS>(fabsf(x));
+    static_assert(GS > 0 && GS <= 64);
+    const int g = blockIdx.x;
+    const int m = threadIdx.y;
+    const int lane = threadIdx.x;
+    const int group_begin = g * GS;
+    const int first_column = group_begin + lane;
+    const int second_column = first_column + 32;
+    const bool first_valid = lane < GS && first_column < k;
+    const bool second_valid = lane + 32 < GS && second_column < k;
+    const float first = first_valid
+        ? __half2float(__float2half_rn(input[(size_t)m * k + first_column]))
+        : 0.f;
+    const float second = second_valid
+        ? __half2float(__float2half_rn(input[(size_t)m * k + second_column]))
+        : 0.f;
+    const float amax = warp_max(fmaxf(fabsf(first), fabsf(second)));
     const float scale = amax > 0.f ? amax / 127.f : 1.f;
-    int code = 0;
-    if (valid) code = (int)fminf(fmaxf(roundf(x / scale), -127.f), 127.f);
+    const int first_code = first_valid
+        ? (int)fminf(fmaxf(roundf(first / scale), -127.f), 127.f)
+        : 0;
+    const int second_code = second_valid
+        ? (int)fminf(fmaxf(roundf(second / scale), -127.f), 127.f)
+        : 0;
     if (sums != nullptr) {
-        const int sum = (int)block_sum<WARPS>((float)code);
-        if (lane == 0) sums[(size_t)m * gridDim.y + g] = sum;
+        int sum = first_code + second_code;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_xor_sync(0xffffffff, sum, offset);
+        if (lane == 0) sums[(size_t)m * gridDim.x + g] = sum;
     }
-    if (lane == 0) scales[(size_t)m * gridDim.y + g] = scale;
-    if (lane < GS) qx[(size_t)m * kpad + g * GS + lane] = (int8_t)code;
+    if (lane == 0) scales[(size_t)m * gridDim.x + g] = scale;
+    if (lane < GS)
+        qx[(size_t)m * kpad + first_column] = (int8_t)first_code;
+    if (lane + 32 < GS)
+        qx[(size_t)m * kpad + second_column] = (int8_t)second_code;
+}
+
+template <int GS>
+static void launch_small_m_quantize_f32_half_rn(
+    const float* input, int8_t* qx, float* scales, int32_t* sums,
+    int rows, int groups, int k, int kpad, cudaStream_t stream)
+{
+#define MFQ_NINT_QUANTIZE_CASE(M) \
+    case M: small_m_quantize_f32_half_rn_kernel<GS, M> \
+        <<<groups, dim3(32, M), 0, stream>>>(input, qx, scales, sums, k, kpad); break
+    switch (rows) {
+        MFQ_NINT_QUANTIZE_CASE(2);
+        MFQ_NINT_QUANTIZE_CASE(3);
+        MFQ_NINT_QUANTIZE_CASE(4);
+        MFQ_NINT_QUANTIZE_CASE(5);
+        MFQ_NINT_QUANTIZE_CASE(6);
+        default: MFQ_RUNTIME_CHECK(false, "NINT small-M quantization requires M2-6");
+    }
+#undef MFQ_NINT_QUANTIZE_CASE
 }
 
 template <int BITS, int GS = 24>
@@ -396,9 +436,9 @@ static mfq_tensor_backend::Tensor nint_canonical_small_m_f32_ws_cuda(
     const char* sum_env = std::getenv("MFQ_NINT4_SMALL_M_XSUM");
     auto* sums = BITS == 8 || (BITS == 4 && sum_env != nullptr && sum_env[0] == '1')
         ? xm.data_ptr<int32_t>() : nullptr;
-    constexpr int THREADS = ((GS + 31) / 32) * 32;
-    small_m_quantize_f32_half_rn_kernel<GS><<<dim3(rows, groups), THREADS, 0, stream>>>(
-        x.data_ptr<float>(), qx.data_ptr<int8_t>(), xs.data_ptr<float>(), sums, (int)x.size(1), (int)(groups * GS));
+    launch_small_m_quantize_f32_half_rn<GS>(
+        x.data_ptr<float>(), qx.data_ptr<int8_t>(), xs.data_ptr<float>(), sums,
+        (int)rows, (int)groups, (int)x.size(1), (int)(groups * GS), stream);
     Nint4Gs24Projection weight{q.data_ptr<uint8_t>(), s.data_ptr<uint8_t>(), sm.data_ptr<uint8_t>(),
         ns.data_ptr<float>(), nm.data_ptr<float>(), output.data_ptr<float>(), (int)columns, sums};
     if constexpr (BITS == 4 || BITS == 6)
